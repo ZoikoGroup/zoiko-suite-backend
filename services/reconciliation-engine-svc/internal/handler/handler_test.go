@@ -10,6 +10,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
+	"zoiko.io/reconciliation-engine-svc/internal/authz"
 	"zoiko.io/reconciliation-engine-svc/internal/domain"
 	customMiddleware "zoiko.io/reconciliation-engine-svc/internal/middleware"
 	"zoiko.io/reconciliation-engine-svc/internal/source"
@@ -21,11 +22,20 @@ const (
 	entityA = "aaaaaaaa-0000-0000-0000-00000000000a"
 )
 
-// recordingAuthz grants everything and records the entity each check was made against.
-type recordingAuthz struct{ entities []string }
+// recordingAuthz grants everything (except the actions in deny) and records
+// the entity and action of each check.
+type recordingAuthz struct {
+	entities []string
+	actions  []string
+	deny     map[string]bool
+}
 
-func (a *recordingAuthz) CheckAllowed(_ context.Context, _, legalEntityID, _ string) error {
+func (a *recordingAuthz) CheckAllowed(_ context.Context, _, legalEntityID, action string) error {
 	a.entities = append(a.entities, legalEntityID)
+	a.actions = append(a.actions, action)
+	if a.deny[action] {
+		return authz.ErrAuthorizationDenied
+	}
 	return nil
 }
 
@@ -33,10 +43,20 @@ func (a *recordingAuthz) CheckAllowed(_ context.Context, _, legalEntityID, _ str
 // other call panics through the nil embedded interface.
 type fakeStore struct {
 	store.Store
-	def        *domain.ReconciliationDefinition
-	run        *domain.ReconciliationRun
-	startCalls int
-	failures   []domain.RunFailure
+	def         *domain.ReconciliationDefinition
+	run         *domain.ReconciliationRun
+	startCalls  int
+	failures    []domain.RunFailure
+	transitions []domain.TransitionExceptionRequest
+}
+
+func (s *fakeStore) GetException(context.Context, string, string) (*domain.ReconciliationException, error) {
+	return &domain.ReconciliationException{ExceptionID: "rex_1", RunID: "rcr_1"}, nil
+}
+func (s *fakeStore) TransitionException(_ context.Context, _, _ string, req domain.TransitionExceptionRequest, _ string,
+	_ domain.IdempotencyClaim) (*domain.ReconciliationException, error) {
+	s.transitions = append(s.transitions, req)
+	return &domain.ReconciliationException{ExceptionID: "rex_1", Status: req.ToState}, nil
 }
 
 func (s *fakeStore) GetDefinition(context.Context, string, string) (*domain.ReconciliationDefinition, error) {
@@ -197,5 +217,34 @@ func TestDefine_RefusesUnknownFields(t *testing.T) {
 		`{"legal_entity_id":"`+entityA+`","name":"n","tolerance_amount_minor_units":5}`)
 	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "tolerance_amount_minor_units") || len(az.entities) != 0 {
 		t.Fatalf("legacy tolerance field: %d %s, authz calls %v", w.Code, w.Body, az.entities)
+	}
+}
+
+// DQC-05 / scenario 24: accepting risk is checked against its own permission,
+// on the run's entity; without it the command is rejected and nothing changes.
+func TestTransitionException_AcceptRiskNeedsItsOwnPermission(t *testing.T) {
+	run := &domain.ReconciliationRun{RunID: "rcr_1", LegalEntityID: entityA}
+	accept := `{"to_state":"ACCEPTED_RISK","reason":"immaterial","authority_ref":"controller-approval-7"}`
+
+	az := &recordingAuthz{}
+	st := &fakeStore{run: run}
+	w := serve(NewHandler(st, az, failingFetcher{}, zap.NewNop()), http.MethodPost, "/v1/reconciliation/exceptions/rex_1:transition", accept)
+	if w.Code != http.StatusOK || len(az.actions) != 1 || az.actions[0] != ActionReconciliationAcceptRisk || az.entities[0] != entityA {
+		t.Fatalf("accept: %d %s, checks %v on %v", w.Code, w.Body, az.actions, az.entities)
+	}
+
+	az = &recordingAuthz{deny: map[string]bool{ActionReconciliationAcceptRisk: true}}
+	st = &fakeStore{run: run}
+	w = serve(NewHandler(st, az, failingFetcher{}, zap.NewNop()), http.MethodPost, "/v1/reconciliation/exceptions/rex_1:transition", accept)
+	if w.Code != http.StatusForbidden || len(st.transitions) != 0 {
+		t.Fatalf("accept without authority: %d %s, store calls %v", w.Code, w.Body, st.transitions)
+	}
+
+	az = &recordingAuthz{deny: map[string]bool{ActionReconciliationAcceptRisk: true}}
+	st = &fakeStore{run: run}
+	w = serve(NewHandler(st, az, failingFetcher{}, zap.NewNop()), http.MethodPost, "/v1/reconciliation/exceptions/rex_1:transition",
+		`{"to_state":"INVESTIGATING","reason":"looking"}`)
+	if w.Code != http.StatusOK || az.actions[0] != ActionReconciliationManage {
+		t.Fatalf("investigate needs only MANAGE: %d %s, checks %v", w.Code, w.Body, az.actions)
 	}
 }

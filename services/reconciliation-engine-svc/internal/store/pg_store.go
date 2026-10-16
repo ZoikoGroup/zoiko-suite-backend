@@ -49,6 +49,12 @@ type Store interface {
 	GetExceptions(ctx context.Context, tenantID, runID string) ([]domain.ReconciliationException, error)
 	GetCertification(ctx context.Context, tenantID, runID string) (*domain.Certification, error)
 	GetTransitions(ctx context.Context, tenantID, runID string) ([]domain.RunTransition, error)
+
+	AssignException(ctx context.Context, tenantID, exceptionID string, req domain.AssignExceptionRequest, actor string, claim domain.IdempotencyClaim) (*domain.ReconciliationException, error)
+	TransitionException(ctx context.Context, tenantID, exceptionID string, req domain.TransitionExceptionRequest, actor string, claim domain.IdempotencyClaim) (*domain.ReconciliationException, error)
+	GetException(ctx context.Context, tenantID, exceptionID string) (*domain.ReconciliationException, error)
+	GetExceptionTransitions(ctx context.Context, tenantID, exceptionID string) ([]domain.ExceptionTransition, error)
+	GetAssessment(ctx context.Context, tenantID, runID string) (*domain.RunAssessment, error)
 }
 
 type PgStore struct {
@@ -131,16 +137,19 @@ func abs64(n int64) int64 {
 // ── ReconciliationDefinition ────────────────────────────────────────────────
 
 const definitionColumns = `definition_id, tenant_id, legal_entity_id::text, name, populations, match_key_fields, balance_dimensions,
-	amount_scale, tolerance_policy, materiality_amount_minor_units, version, created_at, created_by, updated_at`
+	amount_scale, tolerance_policy, materiality_policy, exception_policy, certification_profile, version, created_at, created_by, updated_at`
 
 func scanDefinition(row pgx.Row) (*domain.ReconciliationDefinition, error) {
 	var d domain.ReconciliationDefinition
 	var entity *string
 	var scale *int
-	var pops, tol []byte
+	var pops, tol, mat, exPol, profile []byte
 	if err := row.Scan(&d.DefinitionID, &d.TenantID, &entity, &d.Name, &pops, &d.MatchKeyFields, &d.BalanceDimensions, &scale,
-		&tol, &d.MaterialityAmountMinorUnits, &d.Version, &d.CreatedAt, &d.CreatedBy, &d.UpdatedAt); err != nil {
+		&tol, &mat, &exPol, &profile, &d.Version, &d.CreatedAt, &d.CreatedBy, &d.UpdatedAt); err != nil {
 		return nil, err
+	}
+	if err := decodePolicies(mat, exPol, profile, &d.Materiality, &d.ExceptionPolicy, &d.CertificationProfile); err != nil {
+		return nil, fmt.Errorf("decode definition policies: %w", err)
 	}
 	if len(tol) > 0 {
 		if err := json.Unmarshal(tol, &d.Tolerance); err != nil {
@@ -178,6 +187,10 @@ func (s *PgStore) DefineReconciliation(ctx context.Context, tenantID string, req
 	if err != nil {
 		return nil, fmt.Errorf("encode tolerance: %w", err)
 	}
+	mat, exPol, profile, err := encodePolicies(&req.Materiality, req.ExceptionPolicy, &req.CertificationProfile)
+	if err != nil {
+		return nil, err
+	}
 	dims := req.BalanceDimensions
 	if dims == nil {
 		dims = []string{}
@@ -187,20 +200,23 @@ func (s *PgStore) DefineReconciliation(ctx context.Context, tenantID string, req
 		id := newID(domain.PrefixDefinition)
 		got, err := scanDefinition(tx.QueryRow(ctx, `
 			INSERT INTO reconciliation_definitions (definition_id, tenant_id, legal_entity_id, name, populations, match_key_fields,
-				balance_dimensions, amount_scale, tolerance_policy, materiality_amount_minor_units, created_by)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+				balance_dimensions, amount_scale, tolerance_policy, materiality_policy, exception_policy, certification_profile, created_by)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 			ON CONFLICT (tenant_id, legal_entity_id, name) DO UPDATE SET
 				populations = EXCLUDED.populations,
 				match_key_fields = EXCLUDED.match_key_fields,
 				balance_dimensions = EXCLUDED.balance_dimensions,
 				amount_scale = EXCLUDED.amount_scale,
 				tolerance_policy = EXCLUDED.tolerance_policy,
-				materiality_amount_minor_units = EXCLUDED.materiality_amount_minor_units
+				materiality_policy = EXCLUDED.materiality_policy,
+				exception_policy = EXCLUDED.exception_policy,
+				certification_profile = EXCLUDED.certification_profile,
+				materiality_amount_minor_units = NULL
 				-- version and updated_at are owned by trigger_definition_versioning:
 				-- bumped only when a rule column changes.
 			RETURNING `+definitionColumns,
 			id, tenantID, req.LegalEntityID, req.Name, pops, req.MatchKeyFields, dims, *req.AmountScale,
-			tol, req.MaterialityAmountMinorUnits, actor))
+			tol, mat, exPol, profile, actor))
 		if err != nil {
 			return fmt.Errorf("upsert reconciliation definition: %w", err)
 		}
@@ -208,6 +224,51 @@ func (s *PgStore) DefineReconciliation(ctx context.Context, tenantID string, req
 		return nil
 	})
 	return out, err
+}
+
+// encodePolicies / decodePolicies carry the governance policies (A4, A7) in
+// and out of their JSONB columns; NULL (a row written before 000007) decodes
+// to nil.
+func encodePolicies(mat *domain.MaterialityPolicy, exPol *domain.ExceptionPolicy, profile *domain.CertificationProfile) ([]byte, []byte, []byte, error) {
+	if mat.Currencies == nil {
+		mat = &domain.MaterialityPolicy{Currencies: map[string]int64{}}
+	}
+	m, err := json.Marshal(mat)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("encode materiality: %w", err)
+	}
+	e, err := json.Marshal(exPol)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("encode exception policy: %w", err)
+	}
+	p, err := json.Marshal(profile)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("encode certification profile: %w", err)
+	}
+	return m, e, p, nil
+}
+
+func decodePolicies(mat, exPol, profile []byte, matOut **domain.MaterialityPolicy, exOut **domain.ExceptionPolicy,
+	profOut **domain.CertificationProfile) error {
+	if len(mat) > 0 {
+		*matOut = &domain.MaterialityPolicy{}
+		if err := json.Unmarshal(mat, *matOut); err != nil {
+			return err
+		}
+	}
+	if len(exPol) > 0 {
+		*exOut = &domain.ExceptionPolicy{}
+		if err := json.Unmarshal(exPol, *exOut); err != nil {
+			return err
+		}
+	}
+	if len(profile) > 0 {
+		*profOut = &domain.CertificationProfile{}
+		if err := json.Unmarshal(profile, *profOut); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func loadDefinition(ctx context.Context, tx pgx.Tx, tenantID, definitionID string, lock bool) (*domain.ReconciliationDefinition, error) {
@@ -236,22 +297,26 @@ func (s *PgStore) GetDefinition(ctx context.Context, tenantID, definitionID stri
 
 const runColumns = `run_id, tenant_id, legal_entity_id::text, definition_id, definition_version, status, result_state,
 	certification_state, failure_code, failure_reason, period_id, scope,
-	amount_scale, match_key_fields, balance_dimensions, tolerance_policy, materiality_amount_minor_units, supersedes_run_id, superseded_by_run_id,
+	amount_scale, match_key_fields, balance_dimensions, tolerance_policy, materiality_policy, exception_policy, certification_profile,
+	supersedes_run_id, superseded_by_run_id,
 	superseded_reason, superseded_by, superseded_at, started_at, started_by, certified_at, certified_by`
 
 func scanRun(row pgx.Row) (*domain.ReconciliationRun, error) {
 	var r domain.ReconciliationRun
 	var certifiedBy, entity, period *string
 	var scale *int
-	var scope, tol []byte
+	var scope, tol, mat, exPol, profile []byte
 	if err := row.Scan(&r.RunID, &r.TenantID, &entity, &r.DefinitionID, &r.DefinitionVersion, &r.Status, &r.ResultState,
 		&r.CertificationState, &r.FailureCode, &r.FailureReason, &period, &scope,
-		&scale, &r.MatchKeyFields, &r.BalanceDimensions, &tol, &r.MaterialityAmountMinorUnits, &r.SupersedesRunID, &r.SupersededByRunID,
+		&scale, &r.MatchKeyFields, &r.BalanceDimensions, &tol, &mat, &exPol, &profile, &r.SupersedesRunID, &r.SupersededByRunID,
 		&r.SupersededReason, &r.SupersededBy, &r.SupersededAt, &r.StartedAt, &r.StartedBy, &r.CertifiedAt, &certifiedBy); err != nil {
 		return nil, err
 	}
 	if certifiedBy != nil {
 		r.CertifiedBy = *certifiedBy
+	}
+	if err := decodePolicies(mat, exPol, profile, &r.Materiality, &r.ExceptionPolicy, &r.CertificationProfile); err != nil {
+		return nil, fmt.Errorf("decode run policies: %w", err)
 	}
 	if entity != nil {
 		r.LegalEntityID = *entity
@@ -295,8 +360,18 @@ func (s *PgStore) GetRun(ctx context.Context, tenantID, runID string) (*domain.R
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.ErrRunNotFound
 		}
+		if err != nil {
+			return err
+		}
+		// What the result rests on — including every accepted risk — is part of
+		// reading the run (DQC-05: accepted risk is never silent).
+		a, err := assessRun(ctx, tx, r)
+		if err != nil {
+			return err
+		}
+		r.Assessment = &a
 		out = r
-		return err
+		return nil
 	})
 	return out, err
 }
@@ -406,7 +481,7 @@ func createRun(ctx context.Context, tx pgx.Tx, tenantID string, req domain.Start
 	if err != nil {
 		return nil, err
 	}
-	if def.Legacy() {
+	if def.Legacy() || def.Ungoverned() {
 		return nil, domain.ErrLegacyRecord
 	}
 	if def.Version != expectedVersion {
@@ -443,14 +518,18 @@ func createRun(ctx context.Context, tx pgx.Tx, tenantID string, req domain.Start
 	if dims == nil {
 		dims = []string{}
 	}
+	mat, exPol, profile, err := encodePolicies(def.Materiality, def.ExceptionPolicy, def.CertificationProfile)
+	if err != nil {
+		return nil, err
+	}
 	run, err := scanRun(tx.QueryRow(ctx, `
 		INSERT INTO reconciliation_runs (run_id, tenant_id, legal_entity_id, definition_id, definition_version, status,
 			period_id, scope, amount_scale, match_key_fields, balance_dimensions, tolerance_policy,
-			materiality_amount_minor_units, started_by)
-		VALUES ($1, $2, $3, $4, $5, 'Planned', $6, $7, $8, $9, $10, $11, $12, $13)
+			materiality_policy, exception_policy, certification_profile, started_by)
+		VALUES ($1, $2, $3, $4, $5, 'Planned', $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 		RETURNING `+runColumns,
 		runID, tenantID, def.LegalEntityID, def.DefinitionID, def.Version, period, scope, def.AmountScale,
-		def.MatchKeyFields, dims, tol, def.MaterialityAmountMinorUnits, actor))
+		def.MatchKeyFields, dims, tol, mat, exPol, profile, actor))
 	if err != nil {
 		return nil, fmt.Errorf("create reconciliation run: %w", err)
 	}
@@ -470,6 +549,9 @@ type runAdvance struct {
 	CertifiedBy  *string
 	Supersession *supersession
 	Failure      *domain.RunFailure
+	// AcceptedRiskCertifiable: the run's VARIANCE is only accepted risk its
+	// profile permits (domain.Assess), so it may be ELIGIBLE / CERTIFIED.
+	AcceptedRiskCertifiable bool
 }
 
 type supersession struct {
@@ -488,7 +570,7 @@ func advanceRun(ctx context.Context, tx pgx.Tx, tenantID string, cur *domain.Rec
 	if err := domain.ValidateCertificationTransition(cur.CertificationState, a.Cert); err != nil {
 		return nil, err
 	}
-	if err := domain.ValidateLifecycleTransition(cur.Status, a.To, a.Result, a.Cert); err != nil {
+	if err := domain.ValidateLifecycleTransition(cur.Status, a.To, a.Result, a.Cert, a.AcceptedRiskCertifiable); err != nil {
 		return nil, err
 	}
 	if (a.To == domain.RunFailed) != (a.Failure != nil) {
@@ -531,22 +613,30 @@ func advanceRun(ctx context.Context, tx pgx.Tx, tenantID string, cur *domain.Rec
 	return updated, nil
 }
 
-// settleResult re-evaluates an open run's result from its open exceptions —
-// MATCH with none open, VARIANCE otherwise — sets the certification state that
-// result implies, and moves the run to `to`. A run asked to be Running with
-// exceptions open is ExceptionsOpen instead.
+// settleResult re-evaluates an open run's result from its exceptions — MATCH
+// with none unresolved, VARIANCE otherwise (an accepted risk is unresolved:
+// INV-19) — sets the certification state its assessment implies, and moves
+// the run to `to`. A run asked to be Running while an exception is still being
+// worked is ExceptionsOpen instead.
 func settleResult(ctx context.Context, tx pgx.Tx, tenantID string, run *domain.ReconciliationRun, to domain.RunStatus,
 	reason, actor string) (*domain.ReconciliationRun, error) {
-	open, err := openExceptionCount(ctx, tx, run.RunID)
+	a, err := assessRun(ctx, tx, run)
 	if err != nil {
 		return nil, err
 	}
-	result := domain.EvaluatedResult(open)
-	if to == domain.RunRunning && result == domain.ResultVariance {
+	working := 0
+	for st, n := range a.Unresolved {
+		if st.Working() {
+			working += n
+		}
+	}
+	if to == domain.RunRunning && working > 0 {
 		to = domain.RunExceptionsOpen
 	}
-	return advanceRun(ctx, tx, tenantID, run, runAdvance{To: to, Result: result, Cert: domain.CertificationFor(result),
-		Reason: fmt.Sprintf("%s: %d open exception(s)", reason, open), Actor: actor})
+	return advanceRun(ctx, tx, tenantID, run, runAdvance{To: to, Result: a.ResultState, Cert: domain.CertificationFor(a),
+		Reason:                  fmt.Sprintf("%s: %d exception(s) being worked, %d accepted as risk", reason, working, len(a.AcceptedRiskIDs)),
+		Actor:                   actor,
+		AcceptedRiskCertifiable: a.Certifiable && a.ResultState == domain.ResultVariance})
 }
 
 // checkPopulationsMatchDefinition refuses populations that are not exactly the
@@ -687,23 +777,28 @@ func runSides(ctx context.Context, tx pgx.Tx, runID string) (string, string, err
 	return sides[0], sides[1], nil
 }
 
-func insertItemException(ctx context.Context, tx pgx.Tx, tenantID, runID, actor string, e domain.ItemException) error {
+func insertItemException(ctx context.Context, tx pgx.Tx, tenantID string, run *domain.ReconciliationRun, actor string, e domain.ItemException) error {
 	detail, err := json.Marshal(e.Detail)
 	if err != nil {
 		return fmt.Errorf("encode exception detail: %w", err)
 	}
+	cat, assertion := domain.RuleClassification(e.Detail.Rule)
+	g, err := governanceFor(run, e.Item.Currency, domain.ItemExposure(e), cat, assertion)
+	if err != nil {
+		return err
+	}
+	args := append([]any{newID(domain.PrefixException), tenantID, run.RunID, e.Item.ItemID, e.Item.Side, e.Item.RefID,
+		e.Item.Currency, e.Reason, e.Item.Amount, detail, actor}, g.values()...)
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO reconciliation_exceptions (exception_id, tenant_id, run_id, kind, item_id, side, ref_id, currency, reason,
-			amount_minor_units, detail, raised_by)
-		VALUES ($1, $2, $3, 'ITEM', $4, $5, $6, $7, $8, $9, $10, $11)`,
-		newID(domain.PrefixException), tenantID, runID, e.Item.ItemID, e.Item.Side, e.Item.RefID, e.Item.Currency, e.Reason,
-		e.Item.Amount, detail, actor); err != nil {
+			amount_minor_units, detail, raised_by, `+governanceInsertColumns+`)
+		VALUES ($1, $2, $3, 'ITEM', $4, $5, $6, $7, $8, $9, $10, $11, `+governancePlaceholders(12)+`)`, args...); err != nil {
 		return fmt.Errorf("raise auto exception: %w", err)
 	}
 	return nil
 }
 
-func insertBalanceException(ctx context.Context, tx pgx.Tx, tenantID, runID, actor, sideA, sideB string, v domain.BalanceVariance) error {
+func insertBalanceException(ctx context.Context, tx pgx.Tx, tenantID string, run *domain.ReconciliationRun, actor, sideA, sideB string, v domain.BalanceVariance) error {
 	scope := "population"
 	if v.Dimension != "" {
 		scope = fmt.Sprintf("%s=%q", v.Dimension, v.DimensionValue)
@@ -716,13 +811,19 @@ func insertBalanceException(ctx context.Context, tx pgx.Tx, tenantID, runID, act
 	if err != nil {
 		return fmt.Errorf("encode balance detail: %w", err)
 	}
+	cat, assertion := domain.RuleClassification(domain.RuleBalance)
+	g, err := governanceFor(run, v.Currency, domain.ExposureOf(v.Difference), cat, assertion)
+	if err != nil {
+		return err
+	}
+	args := append([]any{newID(domain.PrefixException), tenantID, run.RunID, v.Currency, v.Dimension, v.DimensionValue, reason,
+		v.Difference, detail, actor}, g.values()...)
 	// Raised once per run, currency and bucket however often matching is re-run.
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO reconciliation_exceptions (exception_id, tenant_id, run_id, kind, currency, dimension, dimension_value, reason,
-			amount_minor_units, detail, raised_by)
-		VALUES ($1, $2, $3, 'BALANCE', $4, $5, $6, $7, $8, $9, $10)
-		ON CONFLICT (run_id, currency, dimension, dimension_value) WHERE kind = 'BALANCE' DO NOTHING`,
-		newID(domain.PrefixException), tenantID, runID, v.Currency, v.Dimension, v.DimensionValue, reason, v.Difference, detail, actor); err != nil {
+			amount_minor_units, detail, raised_by, `+governanceInsertColumns+`)
+		VALUES ($1, $2, $3, 'BALANCE', $4, $5, $6, $7, $8, $9, $10, `+governancePlaceholders(11)+`)
+		ON CONFLICT (run_id, currency, dimension, dimension_value) WHERE kind = 'BALANCE' DO NOTHING`, args...); err != nil {
 		return fmt.Errorf("raise balance exception: %w", err)
 	}
 	return nil
@@ -737,7 +838,8 @@ func insertBalanceException(ctx context.Context, tx pgx.Tx, tenantID, runID, act
 // exceptions" true; the balance check is what stops a balanced aggregate
 // hiding an unbalanced sub-dimension.
 func runAutoMatch(ctx context.Context, tx pgx.Tx, tenantID, actor string, run *domain.ReconciliationRun) error {
-	if run.Tolerance == nil || len(run.MatchKeyFields) == 0 {
+	if run.Tolerance == nil || len(run.MatchKeyFields) == 0 || run.ExceptionPolicy == nil || run.Materiality == nil ||
+		run.CertificationProfile == nil {
 		return domain.ErrLegacyRecord
 	}
 	sideA, sideB, err := runSides(ctx, tx, run.RunID)
@@ -766,7 +868,7 @@ func runAutoMatch(ctx context.Context, tx pgx.Tx, tenantID, actor string, run *d
 		}
 	}
 	for _, e := range excs {
-		if err := insertItemException(ctx, tx, tenantID, run.RunID, actor, e); err != nil {
+		if err := insertItemException(ctx, tx, tenantID, run, actor, e); err != nil {
 			return err
 		}
 	}
@@ -785,17 +887,11 @@ func runAutoMatch(ctx context.Context, tx pgx.Tx, tenantID, actor string, run *d
 		return err
 	}
 	for _, v := range variances {
-		if err := insertBalanceException(ctx, tx, tenantID, run.RunID, actor, sideA, sideB, v); err != nil {
+		if err := insertBalanceException(ctx, tx, tenantID, run, actor, sideA, sideB, v); err != nil {
 			return err
 		}
 	}
 	return nil
-}
-
-func openExceptionCount(ctx context.Context, tx pgx.Tx, runID string) (int64, error) {
-	var n int64
-	err := tx.QueryRow(ctx, `SELECT count(*) FROM reconciliation_exceptions WHERE run_id = $1 AND status = 'Open'`, runID).Scan(&n)
-	return n, err
 }
 
 func openRunStatuses() map[domain.RunStatus]bool {
@@ -900,33 +996,10 @@ func applyManualMatch(ctx context.Context, tx pgx.Tx, tenantID, runID, actor str
 		return fmt.Errorf("insert manual match: %w", err)
 	}
 
-	if _, err := tx.Exec(ctx, `
-		UPDATE reconciliation_exceptions SET status = 'Resolved', resolved_by_match_id = $1
-		WHERE item_id IN ($2, $3) AND status = 'Open'`, mrID, m.ItemAID, m.ItemBID); err != nil {
-		return fmt.Errorf("resolve exceptions for manual match: %w", err)
-	}
-	return nil
+	return closeExceptionsForMatch(ctx, tx, tenantID, mrID, actor, m.Reason, m.ItemAID, m.ItemBID)
 }
 
 // ── RaiseException ───────────────────────────────────────────────────────────
-
-const exceptionColumns = `exception_id, tenant_id, run_id, kind, COALESCE(item_id, ''), COALESCE(side, ''), COALESCE(ref_id, ''),
-	COALESCE(currency, ''), dimension, dimension_value, reason, amount_minor_units, detail, status,
-	raised_at, raised_by, resolved_at, resolved_by_match_id`
-
-func scanException(row pgx.Row) (*domain.ReconciliationException, error) {
-	var e domain.ReconciliationException
-	var detail []byte
-	if err := row.Scan(&e.ExceptionID, &e.TenantID, &e.RunID, &e.Kind, &e.ItemID, &e.Side, &e.RefID, &e.Currency, &e.Dimension,
-		&e.DimensionValue, &e.Reason, &e.AmountMinorUnits, &detail, &e.Status, &e.RaisedAt, &e.RaisedBy, &e.ResolvedAt,
-		&e.ResolvedByMatchID); err != nil {
-		return nil, err
-	}
-	if len(detail) > 0 {
-		e.Detail = json.RawMessage(detail)
-	}
-	return &e, nil
-}
 
 func (s *PgStore) RaiseException(ctx context.Context, tenantID, runID string, req domain.RaiseExceptionRequest, actor string, claim domain.IdempotencyClaim) (*domain.ReconciliationException, error) {
 	if err := req.Validate(); err != nil {
@@ -965,13 +1038,17 @@ func (s *PgStore) RaiseException(ctx context.Context, tenantID, runID string, re
 			return err
 		}
 
+		g, err := governanceFor(run, it.Currency, domain.ExposureOf(it.Amount), req.Category, req.Assertion)
+		if err != nil {
+			return err
+		}
 		exID := newID(domain.PrefixException)
+		args := append([]any{exID, tenantID, runID, it.ItemID, it.Side, it.RefID, it.Currency, req.Reason, it.Amount, actor}, g.values()...)
 		got, err := scanException(tx.QueryRow(ctx, `
 			INSERT INTO reconciliation_exceptions (exception_id, tenant_id, run_id, kind, item_id, side, ref_id, currency, reason,
-				amount_minor_units, detail, raised_by)
-			VALUES ($1, $2, $3, 'ITEM', $4, $5, $6, $7, $8, $9, '{"rule":"RAISED_MANUALLY"}', $10)
-			RETURNING `+exceptionColumns,
-			exID, tenantID, runID, it.ItemID, it.Side, it.RefID, it.Currency, req.Reason, it.Amount, actor))
+				amount_minor_units, detail, raised_by, `+governanceInsertColumns+`)
+			VALUES ($1, $2, $3, 'ITEM', $4, $5, $6, $7, $8, $9, '{"rule":"RAISED_MANUALLY"}', $10, `+governancePlaceholders(11)+`)
+			RETURNING `+exceptionColumns, args...))
 		if err != nil {
 			var pgErr *pgconn.PgError
 			if errors.As(err, &pgErr) && pgErr.Code == "23505" {
@@ -1000,11 +1077,13 @@ func (s *PgStore) GetExceptions(ctx context.Context, tenantID, runID string) ([]
 			return err
 		}
 		defer rows.Close()
+		now := time.Now()
 		for rows.Next() {
 			e, err := scanException(rows)
 			if err != nil {
 				return err
 			}
+			e.Derive(now)
 			out = append(out, *e)
 		}
 		return rows.Err()
@@ -1055,14 +1134,20 @@ func (s *PgStore) Reperform(ctx context.Context, tenantID, runID string, actor s
 // ── Certify ──────────────────────────────────────────────────────────────────
 
 const certificationColumns = `certification_id, tenant_id, run_id, definition_version, matched_count, exception_count,
-	total_asserted_minor_units, control_totals, manifest_sha256, sealed_at, sealed_by`
+	total_asserted_minor_units, control_totals, result_state, assessment, manifest_sha256, sealed_at, sealed_by`
 
 func scanCertification(row pgx.Row) (*domain.Certification, error) {
 	var c domain.Certification
-	var totals []byte
+	var totals, assessment []byte
 	if err := row.Scan(&c.CertificationID, &c.TenantID, &c.RunID, &c.DefinitionVersion, &c.MatchedCount, &c.ExceptionCount,
-		&c.TotalAssertedMinor, &totals, &c.ManifestSHA256, &c.SealedAt, &c.SealedBy); err != nil {
+		&c.TotalAssertedMinor, &totals, &c.ResultState, &assessment, &c.ManifestSHA256, &c.SealedAt, &c.SealedBy); err != nil {
 		return nil, err
+	}
+	if len(assessment) > 0 {
+		c.Assessment = &domain.RunAssessment{}
+		if err := json.Unmarshal(assessment, c.Assessment); err != nil {
+			return nil, fmt.Errorf("decode certification assessment: %w", err)
+		}
 	}
 	if len(totals) > 0 {
 		if err := json.Unmarshal(totals, &c.ControlTotals); err != nil {
@@ -1073,18 +1158,20 @@ func scanCertification(row pgx.Row) (*domain.Certification, error) {
 }
 
 type certificationManifest struct {
-	RunID                       string                            `json:"run_id"`
-	DefinitionVersion           int64                             `json:"definition_version"`
-	AmountScale                 int                               `json:"amount_scale"`
-	Tolerance                   *domain.TolerancePolicy           `json:"tolerance"`
-	MatchKeyFields              []string                          `json:"match_key_fields"`
-	BalanceDimensions           []string                          `json:"balance_dimensions"`
-	MaterialityAmountMinorUnits int64                             `json:"materiality_amount_minor_units"`
-	ResultState                 domain.ResultState                `json:"result_state"`
-	MatchedCount                int64                             `json:"matched_count"`
-	ExceptionCount              int64                             `json:"exception_count"`
-	ControlTotals               map[string][]domain.CurrencyTotal `json:"control_totals"`
-	SealedAt                    time.Time                         `json:"sealed_at"`
+	RunID                string                            `json:"run_id"`
+	DefinitionVersion    int64                             `json:"definition_version"`
+	AmountScale          int                               `json:"amount_scale"`
+	Tolerance            *domain.TolerancePolicy           `json:"tolerance"`
+	MatchKeyFields       []string                          `json:"match_key_fields"`
+	BalanceDimensions    []string                          `json:"balance_dimensions"`
+	Materiality          *domain.MaterialityPolicy         `json:"materiality"`
+	CertificationProfile *domain.CertificationProfile      `json:"certification_profile"`
+	ResultState          domain.ResultState                `json:"result_state"`
+	Assessment           domain.RunAssessment              `json:"assessment"`
+	MatchedCount         int64                             `json:"matched_count"`
+	ExceptionCount       int64                             `json:"exception_count"`
+	ControlTotals        map[string][]domain.CurrencyTotal `json:"control_totals"`
+	SealedAt             time.Time                         `json:"sealed_at"`
 }
 
 // sideControlTotals returns each side's per-currency control totals. They are
@@ -1138,17 +1225,24 @@ func (s *PgStore) Certify(ctx context.Context, tenantID, runID string, actor str
 		if !openRunStatuses()[run.Status] {
 			return domain.ErrRunNotOpen
 		}
-		openCount, err := openExceptionCount(ctx, tx, runID)
+		// Re-assessed under the run's lock: a MATCH, or a VARIANCE that is only
+		// accepted risk the pinned profile permits and that is immaterial in
+		// aggregate (domain.Assess). An exception still being worked blocks.
+		assessment, err := assessRun(ctx, tx, run)
 		if err != nil {
 			return err
 		}
-		if openCount > 0 {
-			return domain.ErrOpenExceptionsRemain
+		for st, n := range assessment.Unresolved {
+			if st.Working() && n > 0 {
+				return domain.ErrOpenExceptionsRemain
+			}
 		}
-		// Only a MATCH is certifiable (DQC-03, INV-26); the result is settled in
-		// the same transaction as every exception change, so ELIGIBLE is current.
-		if run.CertificationState != domain.CertEligible {
-			return domain.ErrRunNotEligible
+		if !assessment.Certifiable || run.CertificationState != domain.CertEligible {
+			return fmt.Errorf("%w: %s", domain.ErrRunNotEligible, strings.Join(assessment.CertificationBlocks, "; "))
+		}
+		assessmentJSON, err := json.Marshal(assessment)
+		if err != nil {
+			return fmt.Errorf("encode assessment: %w", err)
 		}
 
 		claim.ResourceID = runID
@@ -1176,7 +1270,8 @@ func (s *PgStore) Certify(ctx context.Context, tenantID, runID string, actor str
 		manifest, err := json.Marshal(certificationManifest{
 			RunID: runID, DefinitionVersion: run.DefinitionVersion, AmountScale: run.AmountScale, Tolerance: run.Tolerance,
 			MatchKeyFields: run.MatchKeyFields, BalanceDimensions: run.BalanceDimensions,
-			MaterialityAmountMinorUnits: run.MaterialityAmountMinorUnits, ResultState: run.ResultState,
+			Materiality: run.Materiality, CertificationProfile: run.CertificationProfile, ResultState: run.ResultState,
+			Assessment:   assessment,
 			MatchedCount: matchedCount, ExceptionCount: exceptionCount, ControlTotals: totals, SealedAt: sealedAt,
 		})
 		if err != nil {
@@ -1186,16 +1281,22 @@ func (s *PgStore) Certify(ctx context.Context, tenantID, runID string, actor str
 		certID := newID(domain.PrefixCertification)
 		cert, err := scanCertification(tx.QueryRow(ctx, `
 			INSERT INTO certifications (certification_id, tenant_id, run_id, definition_version, matched_count,
-				exception_count, control_totals, manifest_sha256, sealed_at, sealed_by)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+				exception_count, control_totals, result_state, assessment, manifest_sha256, sealed_at, sealed_by)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 			RETURNING `+certificationColumns,
-			certID, tenantID, runID, run.DefinitionVersion, matchedCount, exceptionCount, totalsJSON, sha256Hex(manifest), sealedAt, actor))
+			certID, tenantID, runID, run.DefinitionVersion, matchedCount, exceptionCount, totalsJSON, string(run.ResultState),
+			assessmentJSON, sha256Hex(manifest), sealedAt, actor))
 		if err != nil {
 			return fmt.Errorf("seal certification: %w", err)
 		}
 
-		if _, err := advanceRun(ctx, tx, tenantID, run, runAdvance{To: domain.RunCertified, Result: domain.ResultMatch,
-			Cert: domain.CertCertified, Reason: "certified", Actor: actor, CertifiedBy: &actor}); err != nil {
+		reason := "certified"
+		if run.ResultState == domain.ResultVariance {
+			reason = fmt.Sprintf("certified as VARIANCE with %d accepted risk(s)", len(assessment.AcceptedRiskIDs))
+		}
+		if _, err := advanceRun(ctx, tx, tenantID, run, runAdvance{To: domain.RunCertified, Result: run.ResultState,
+			Cert: domain.CertCertified, Reason: reason, Actor: actor, CertifiedBy: &actor,
+			AcceptedRiskCertifiable: run.ResultState == domain.ResultVariance}); err != nil {
 			return err
 		}
 

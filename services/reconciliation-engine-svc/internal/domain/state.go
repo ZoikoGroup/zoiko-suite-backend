@@ -91,8 +91,10 @@ func TerminalStatus(s RunStatus) bool {
 
 // ValidateLifecycleTransition rejects illegal edges (from == to is "no move"
 // and always allowed) and enforces the cross-dimension invariants of the
-// target state.
-func ValidateLifecycleTransition(from, to RunStatus, result ResultState, cert CertificationState) error {
+// target state. acceptedRiskCertifiable says the run's VARIANCE consists only
+// of accepted risk its certification profile permits (Assess); only then may a
+// VARIANCE be ELIGIBLE or CERTIFIED — still as a VARIANCE, never relabeled.
+func ValidateLifecycleTransition(from, to RunStatus, result ResultState, cert CertificationState, acceptedRiskCertifiable bool) error {
 	allowed, known := lifecycleEdges[from]
 	if !known {
 		return fmt.Errorf("%w: unknown run status %q", ErrInvalidTransition, from)
@@ -109,9 +111,11 @@ func ValidateLifecycleTransition(from, to RunStatus, result ResultState, cert Ce
 			return fmt.Errorf("%w: status %s -> %s", ErrInvalidTransition, from, to)
 		}
 	}
-	// INV-26 / DQC-03: only a MATCH can be eligible for or carry certification.
-	if (cert == CertEligible || cert == CertCertified) && result != ResultMatch {
-		return fmt.Errorf("%w: certification %s requires result MATCH, not %s", ErrInvalidTransition, cert, result)
+	// INV-26 / DQC-03 / DQC-05: only a MATCH, or a VARIANCE of permitted
+	// accepted risk, can be eligible for or carry certification.
+	if (cert == CertEligible || cert == CertCertified) && result != ResultMatch &&
+		!(result == ResultVariance && acceptedRiskCertifiable) {
+		return fmt.Errorf("%w: certification %s requires result MATCH (or permitted accepted risk), not %s", ErrInvalidTransition, cert, result)
 	}
 	switch to {
 	case RunPlanned:
@@ -200,10 +204,10 @@ func EvaluatedResult(openExceptions int64) ResultState {
 	return ResultMatch
 }
 
-// CertificationFor is the certification state an open run's result implies:
-// ELIGIBLE exactly while the result is MATCH.
-func CertificationFor(result ResultState) CertificationState {
-	if result == ResultMatch {
+// CertificationFor is the certification state an open run's assessment
+// implies: ELIGIBLE exactly while it is certifiable (Assess).
+func CertificationFor(a RunAssessment) CertificationState {
+	if a.Certifiable {
 		return CertEligible
 	}
 	return CertUncertified

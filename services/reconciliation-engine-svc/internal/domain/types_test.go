@@ -12,7 +12,12 @@ func spec(side string) PopulationSpec {
 func defineReq(pops ...PopulationSpec) DefineReconciliationRequest {
 	scale := 2
 	return DefineReconciliationRequest{LegalEntityID: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", Name: "n", Populations: pops,
-		MatchKeyFields: []string{"ref_id"}, AmountScale: &scale}
+		MatchKeyFields: []string{"ref_id"}, AmountScale: &scale, ExceptionPolicy: testExceptionPolicy()}
+}
+
+func testExceptionPolicy() *ExceptionPolicy {
+	return &ExceptionPolicy{OwnerRole: "recon-owner",
+		SLADays: map[Severity]int{SeverityBlocker: 1, SeverityError: 3, SeverityWarning: 10}}
 }
 
 // The matcher compares two sides only; a third population would be frozen but

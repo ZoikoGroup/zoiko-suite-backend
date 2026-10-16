@@ -35,6 +35,10 @@ import (
 const (
 	ActionReconciliationManage = "RECONCILIATION_MANAGE"
 	ActionReconciliationRead   = "RECONCILIATION_READ"
+	// ActionReconciliationAcceptRisk is the authority path for accepting an
+	// exception as risk (ZS-SVC-Z-001 DQC-05; ZS-CONTROL-001 scenario 24 "waived
+	// without authority — command rejected"). It is separate from MANAGE.
+	ActionReconciliationAcceptRisk = "RECONCILIATION_ACCEPT_RISK"
 )
 
 // populationReadTimeout bounds reading both populations of a StartRun. The
@@ -98,6 +102,11 @@ func (h *Handler) routes(r chi.Router) {
 	r.Get("/runs/{runID}/exceptions", h.GetExceptions)
 	r.Get("/runs/{runID}/certification", h.GetCertification)
 	r.Get("/runs/{runID}/transitions", h.GetTransitions)
+	r.Get("/runs/{runID}/assessment", h.GetAssessment)
+	r.Get("/exceptions/{exceptionID}", h.GetException)
+	r.Get("/exceptions/{exceptionID}/transitions", h.GetExceptionTransitions)
+	r.Post("/exceptions/{exceptionID}:assign", h.AssignException)
+	r.Post("/exceptions/{exceptionID}:transition", h.TransitionException)
 }
 
 func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
@@ -132,6 +141,30 @@ func (h *Handler) authorizeRun(w http.ResponseWriter, r *http.Request, action st
 		return "", "", false
 	}
 	run, err := h.store.GetRun(r.Context(), tenantID, chi.URLParam(r, "runID"))
+	if err != nil {
+		h.respondFromError(w, err)
+		return "", "", false
+	}
+	if !h.authorize(w, r, principalID, run.LegalEntityID, action) {
+		return "", "", false
+	}
+	return tenantID, principalID, true
+}
+
+// authorizeException resolves an exception's run, and through it the legal
+// entity, and authorizes the caller against that entity.
+func (h *Handler) authorizeException(w http.ResponseWriter, r *http.Request, action string) (tenantID, principalID string, ok bool) {
+	tenantID = customMiddleware.GetTenantID(r.Context())
+	principalID, ok = h.requirePrincipal(w, r)
+	if !ok {
+		return "", "", false
+	}
+	e, err := h.store.GetException(r.Context(), tenantID, chi.URLParam(r, "exceptionID"))
+	if err != nil {
+		h.respondFromError(w, err)
+		return "", "", false
+	}
+	run, err := h.store.GetRun(r.Context(), tenantID, e.RunID)
 	if err != nil {
 		h.respondFromError(w, err)
 		return "", "", false
@@ -458,6 +491,104 @@ func (h *Handler) GetTransitions(w http.ResponseWriter, r *http.Request) {
 	h.respondJSON(w, http.StatusOK, map[string]interface{}{"data": items, "count": len(items)})
 }
 
+// GetAssessment is what the run's result rests on: unresolved exceptions by
+// state, every accepted risk, aggregate materiality per currency, and whether
+// (and why not) the run can be certified.
+func (h *Handler) GetAssessment(w http.ResponseWriter, r *http.Request) {
+	tenantID, _, ok := h.authorizeRun(w, r, ActionReconciliationRead)
+	if !ok {
+		return
+	}
+	got, err := h.store.GetAssessment(r.Context(), tenantID, chi.URLParam(r, "runID"))
+	if err != nil {
+		h.respondFromError(w, err)
+		return
+	}
+	h.respondJSON(w, http.StatusOK, got)
+}
+
+func (h *Handler) GetException(w http.ResponseWriter, r *http.Request) {
+	tenantID, _, ok := h.authorizeException(w, r, ActionReconciliationRead)
+	if !ok {
+		return
+	}
+	got, err := h.store.GetException(r.Context(), tenantID, chi.URLParam(r, "exceptionID"))
+	if err != nil {
+		h.respondFromError(w, err)
+		return
+	}
+	h.respondJSON(w, http.StatusOK, got)
+}
+
+func (h *Handler) GetExceptionTransitions(w http.ResponseWriter, r *http.Request) {
+	tenantID, _, ok := h.authorizeException(w, r, ActionReconciliationRead)
+	if !ok {
+		return
+	}
+	items, err := h.store.GetExceptionTransitions(r.Context(), tenantID, chi.URLParam(r, "exceptionID"))
+	if err != nil {
+		h.respondFromError(w, err)
+		return
+	}
+	if items == nil {
+		items = []domain.ExceptionTransition{}
+	}
+	h.respondJSON(w, http.StatusOK, map[string]interface{}{"data": items, "count": len(items)})
+}
+
+func (h *Handler) AssignException(w http.ResponseWriter, r *http.Request) {
+	var req domain.AssignExceptionRequest
+	reqHash, err := h.readBody(r, &req)
+	if err != nil {
+		h.respondError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	tenantID, principalID, ok := h.authorizeException(w, r, ActionReconciliationManage)
+	if !ok {
+		return
+	}
+	exceptionID := chi.URLParam(r, "exceptionID")
+	claim := h.idempotencyClaim(principalID, "AssignException", exceptionID, reqHash, r.Header.Get("Idempotency-Key"))
+	got, err := h.store.AssignException(r.Context(), tenantID, exceptionID, req, principalID, claim)
+	if err != nil {
+		h.respondFromError(w, err)
+		return
+	}
+	h.respondJSON(w, http.StatusOK, got)
+}
+
+// TransitionException moves an exception along its lifecycle. Accepting risk
+// needs the separate RECONCILIATION_ACCEPT_RISK permission; the store also
+// requires the acceptor to be neither the exception's owner nor its raiser.
+func (h *Handler) TransitionException(w http.ResponseWriter, r *http.Request) {
+	var req domain.TransitionExceptionRequest
+	reqHash, err := h.readBody(r, &req)
+	if err != nil {
+		h.respondError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if err := req.Validate(); err != nil {
+		h.respondFromError(w, err)
+		return
+	}
+	action := ActionReconciliationManage
+	if req.ToState == domain.ExceptionAcceptedRisk {
+		action = ActionReconciliationAcceptRisk
+	}
+	tenantID, principalID, ok := h.authorizeException(w, r, action)
+	if !ok {
+		return
+	}
+	exceptionID := chi.URLParam(r, "exceptionID")
+	claim := h.idempotencyClaim(principalID, "TransitionException", exceptionID, reqHash, r.Header.Get("Idempotency-Key"))
+	got, err := h.store.TransitionException(r.Context(), tenantID, exceptionID, req, principalID, claim)
+	if err != nil {
+		h.respondFromError(w, err)
+		return
+	}
+	h.respondJSON(w, http.StatusOK, got)
+}
+
 // ── Response helpers ─────────────────────────────────────────────────────────
 
 func (h *Handler) respondJSON(w http.ResponseWriter, code int, payload interface{}) {
@@ -506,8 +637,10 @@ func (h *Handler) respondFromError(w http.ResponseWriter, err error) {
 		return
 	}
 	switch {
+	case errors.Is(err, domain.ErrNotExceptionOwner), errors.Is(err, domain.ErrNotIndependent):
+		h.respondError(w, http.StatusForbidden, err.Error())
 	case errors.Is(err, domain.ErrDefinitionNotFound), errors.Is(err, domain.ErrRunNotFound),
-		errors.Is(err, domain.ErrItemNotFound):
+		errors.Is(err, domain.ErrItemNotFound), errors.Is(err, domain.ErrExceptionNotFound):
 		h.respondError(w, http.StatusNotFound, err.Error())
 	case errors.Is(err, domain.ErrRunNotOpen), errors.Is(err, domain.ErrOpenExceptionsRemain),
 		errors.Is(err, domain.ErrRunImmutable), errors.Is(err, domain.ErrExceptionAlreadyClosed),

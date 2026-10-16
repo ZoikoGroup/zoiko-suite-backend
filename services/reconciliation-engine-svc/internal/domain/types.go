@@ -60,20 +60,24 @@ const SellerScope = "seller"
 // authorization is evaluated against it (A10). It is fixed for the life of
 // the definition.
 type ReconciliationDefinition struct {
-	DefinitionID                string           `json:"definition_id"`
-	TenantID                    string           `json:"tenant_id"`
-	LegalEntityID               string           `json:"legal_entity_id"`
-	Name                        string           `json:"name"`
-	Populations                 []PopulationSpec `json:"populations"`
-	MatchKeyFields              []string         `json:"match_key_fields"`
-	BalanceDimensions           []string         `json:"balance_dimensions"`
-	AmountScale                 int              `json:"amount_scale"`
-	Tolerance                   TolerancePolicy  `json:"tolerance"`
-	MaterialityAmountMinorUnits int64            `json:"materiality_amount_minor_units"`
-	Version                     int64            `json:"version"`
-	CreatedAt                   time.Time        `json:"created_at"`
-	CreatedBy                   string           `json:"created_by"`
-	UpdatedAt                   time.Time        `json:"updated_at"`
+	DefinitionID      string           `json:"definition_id"`
+	TenantID          string           `json:"tenant_id"`
+	LegalEntityID     string           `json:"legal_entity_id"`
+	Name              string           `json:"name"`
+	Populations       []PopulationSpec `json:"populations"`
+	MatchKeyFields    []string         `json:"match_key_fields"`
+	BalanceDimensions []string         `json:"balance_dimensions"`
+	AmountScale       int              `json:"amount_scale"`
+	Tolerance         TolerancePolicy  `json:"tolerance"`
+	// Materiality, ExceptionPolicy and CertificationProfile are nil only on
+	// definitions written before migration 000007, which cannot start runs.
+	Materiality          *MaterialityPolicy    `json:"materiality,omitempty"`
+	ExceptionPolicy      *ExceptionPolicy      `json:"exception_policy,omitempty"`
+	CertificationProfile *CertificationProfile `json:"certification_profile,omitempty"`
+	Version              int64                 `json:"version"`
+	CreatedAt            time.Time             `json:"created_at"`
+	CreatedBy            string                `json:"created_by"`
+	UpdatedAt            time.Time             `json:"updated_at"`
 }
 
 // Legacy reports a definition created before migration 000004: it has no
@@ -81,20 +85,32 @@ type ReconciliationDefinition struct {
 // against an entity nor run.
 func (d ReconciliationDefinition) Legacy() bool { return d.LegalEntityID == "" }
 
+// Ungoverned reports a definition written before migration 000007: it has no
+// materiality, exception or certification policy, so its runs could raise
+// exceptions with no owner, severity or due date (A7). It cannot start runs.
+func (d ReconciliationDefinition) Ungoverned() bool {
+	return d.Materiality == nil || d.ExceptionPolicy == nil || d.CertificationProfile == nil
+}
+
 // DefineReconciliationRequest. Amounts (tolerance, materiality and every
 // population amount) are integers in units of 10^-amount_scale.
 // amount_scale is required, with no default, because the scale is part of
 // what "balanced" means (ZS-SVC-Z-001 INV-09, TC-05). Tolerance is per
 // currency (A2, A5); a currency without one must match exactly.
 type DefineReconciliationRequest struct {
-	LegalEntityID               string           `json:"legal_entity_id"`
-	Name                        string           `json:"name"`
-	Populations                 []PopulationSpec `json:"populations"`
-	MatchKeyFields              []string         `json:"match_key_fields"`
-	BalanceDimensions           []string         `json:"balance_dimensions,omitempty"`
-	AmountScale                 *int             `json:"amount_scale"`
-	Tolerance                   TolerancePolicy  `json:"tolerance"`
-	MaterialityAmountMinorUnits int64            `json:"materiality_amount_minor_units"`
+	LegalEntityID     string           `json:"legal_entity_id"`
+	Name              string           `json:"name"`
+	Populations       []PopulationSpec `json:"populations"`
+	MatchKeyFields    []string         `json:"match_key_fields"`
+	BalanceDimensions []string         `json:"balance_dimensions,omitempty"`
+	AmountScale       *int             `json:"amount_scale"`
+	Tolerance         TolerancePolicy  `json:"tolerance"`
+	// Materiality is per currency (A4); a currency without a threshold is
+	// UNASSESSED. ExceptionPolicy is required (A7). CertificationProfile
+	// defaults to permitting no accepted risk.
+	Materiality          MaterialityPolicy    `json:"materiality"`
+	ExceptionPolicy      *ExceptionPolicy     `json:"exception_policy"`
+	CertificationProfile CertificationProfile `json:"certification_profile"`
 }
 
 func (r DefineReconciliationRequest) Validate() error {
@@ -122,8 +138,14 @@ func (r DefineReconciliationRequest) Validate() error {
 	if *r.AmountScale < 0 || *r.AmountScale > MaxAmountScale {
 		return fmt.Errorf("%w: amount_scale must be between 0 and %d", ErrInvalidArgument, MaxAmountScale)
 	}
-	if r.MaterialityAmountMinorUnits < 0 {
-		return fmt.Errorf("materiality_amount_minor_units cannot be negative")
+	if err := r.Materiality.Validate(); err != nil {
+		return err
+	}
+	if r.ExceptionPolicy == nil {
+		return fmt.Errorf("%w: exception_policy is required", ErrInvalidArgument)
+	}
+	if err := r.ExceptionPolicy.Validate(); err != nil {
+		return err
 	}
 	return nil
 }
@@ -148,32 +170,37 @@ const (
 // ResultState and CertificationState are the other two state dimensions
 // (state.go). A Failed run carries why it could not determine a result.
 type ReconciliationRun struct {
-	RunID                       string             `json:"run_id"`
-	TenantID                    string             `json:"tenant_id"`
-	LegalEntityID               string             `json:"legal_entity_id"`
-	DefinitionID                string             `json:"definition_id"`
-	DefinitionVersion           int64              `json:"definition_version"`
-	Status                      RunStatus          `json:"status"`
-	ResultState                 ResultState        `json:"result_state"`
-	CertificationState          CertificationState `json:"certification_state"`
-	FailureCode                 *FailureCode       `json:"failure_code,omitempty"`
-	FailureReason               *string            `json:"failure_reason,omitempty"`
-	PeriodID                    string             `json:"period_id,omitempty"`
-	Scope                       map[string]string  `json:"scope,omitempty"`
-	AmountScale                 int                `json:"amount_scale"`
-	MatchKeyFields              []string           `json:"match_key_fields,omitempty"`
-	BalanceDimensions           []string           `json:"balance_dimensions,omitempty"`
-	Tolerance                   *TolerancePolicy   `json:"tolerance,omitempty"`
-	MaterialityAmountMinorUnits int64              `json:"materiality_amount_minor_units"`
-	SupersedesRunID             *string            `json:"supersedes_run_id,omitempty"`
-	SupersededByRunID           *string            `json:"superseded_by_run_id,omitempty"`
-	SupersededReason            *string            `json:"superseded_reason,omitempty"`
-	SupersededBy                *string            `json:"superseded_by,omitempty"`
-	SupersededAt                *time.Time         `json:"superseded_at,omitempty"`
-	StartedAt                   time.Time          `json:"started_at"`
-	StartedBy                   string             `json:"started_by"`
-	CertifiedAt                 *time.Time         `json:"certified_at,omitempty"`
-	CertifiedBy                 string             `json:"certified_by,omitempty"`
+	RunID                string                `json:"run_id"`
+	TenantID             string                `json:"tenant_id"`
+	LegalEntityID        string                `json:"legal_entity_id"`
+	DefinitionID         string                `json:"definition_id"`
+	DefinitionVersion    int64                 `json:"definition_version"`
+	Status               RunStatus             `json:"status"`
+	ResultState          ResultState           `json:"result_state"`
+	CertificationState   CertificationState    `json:"certification_state"`
+	FailureCode          *FailureCode          `json:"failure_code,omitempty"`
+	FailureReason        *string               `json:"failure_reason,omitempty"`
+	PeriodID             string                `json:"period_id,omitempty"`
+	Scope                map[string]string     `json:"scope,omitempty"`
+	AmountScale          int                   `json:"amount_scale"`
+	MatchKeyFields       []string              `json:"match_key_fields,omitempty"`
+	BalanceDimensions    []string              `json:"balance_dimensions,omitempty"`
+	Tolerance            *TolerancePolicy      `json:"tolerance,omitempty"`
+	Materiality          *MaterialityPolicy    `json:"materiality,omitempty"`
+	ExceptionPolicy      *ExceptionPolicy      `json:"exception_policy,omitempty"`
+	CertificationProfile *CertificationProfile `json:"certification_profile,omitempty"`
+	// Assessment is derived on read by GetRun (never stored): what the result
+	// rests on, including every accepted risk.
+	Assessment        *RunAssessment `json:"assessment,omitempty"`
+	SupersedesRunID   *string        `json:"supersedes_run_id,omitempty"`
+	SupersededByRunID *string        `json:"superseded_by_run_id,omitempty"`
+	SupersededReason  *string        `json:"superseded_reason,omitempty"`
+	SupersededBy      *string        `json:"superseded_by,omitempty"`
+	SupersededAt      *time.Time     `json:"superseded_at,omitempty"`
+	StartedAt         time.Time      `json:"started_at"`
+	StartedBy         string         `json:"started_by"`
+	CertifiedAt       *time.Time     `json:"certified_at,omitempty"`
+	CertifiedBy       string         `json:"certified_by,omitempty"`
 }
 
 // PopulationSnapshot is one frozen side of a run's comparison (e.g.
@@ -316,24 +343,19 @@ const (
 	ExceptionKindBalance ExceptionKind = "BALANCE"
 )
 
-const (
-	ExceptionOpen     ExceptionStatus = "Open"
-	ExceptionResolved ExceptionStatus = "Resolved"
-)
-
-// ReconciliationException is raised for any item that didn't reconcile
-// — unmatched, or matched-by-key but outside tolerance. Its only
-// legitimate transition is Open -> Resolved, and that transition only
-// ever happens as the side effect of a manual match consuming the
-// exact item it was raised for (see store.resolveExceptionsForItem) —
-// never a bare "resolve" command with no evidence behind it.
+// ReconciliationException is raised for any item or balance that didn't
+// reconcile. Its lifecycle and governance fields are in governance.go: it is
+// resolved (CLOSED) only as the side effect of a manual match consuming the
+// item it was raised for — never a bare "resolve" with no evidence — and it
+// can be accepted as risk under a named authority, which leaves it unresolved.
 //
 // Kind ITEM is about one frozen item (unmatched, outside tolerance, currency
 // or timing mismatch, missing key). Kind BALANCE is about a per-currency side
 // total — of the whole population (Dimension "") or of one value of a
 // declared balance dimension — that does not balance; it has no item, and its
 // amount is the signed difference side A minus side B. Detail carries the
-// observed values and the threshold that was applied.
+// observed values and the threshold that was applied. The governance fields
+// are nil only on exceptions raised before migration 000007.
 type ReconciliationException struct {
 	ExceptionID       string          `json:"exception_id"`
 	TenantID          string          `json:"tenant_id"`
@@ -353,11 +375,35 @@ type ReconciliationException struct {
 	RaisedBy          string          `json:"raised_by"`
 	ResolvedAt        *time.Time      `json:"resolved_at,omitempty"`
 	ResolvedByMatchID *string         `json:"resolved_by_match_id,omitempty"`
+
+	Category      *string           `json:"category,omitempty"`
+	Assertion     *string           `json:"assertion,omitempty"`
+	Severity      *Severity         `json:"severity,omitempty"`
+	Materiality   *MaterialityClass `json:"materiality,omitempty"`
+	ExposureMinor *int64            `json:"exposure_minor_units,omitempty"`
+	OwnerRole     *string           `json:"owner_role,omitempty"`
+	Owner         *string           `json:"owner_principal_id,omitempty"`
+	DueAt         *time.Time        `json:"due_at,omitempty"`
+	AuthorityRef  *string           `json:"authority_ref,omitempty"`
+	EvidenceRef   *string           `json:"evidence_ref,omitempty"`
+	RootCauseCode *string           `json:"root_cause_code,omitempty"`
+	RootCauseNote *string           `json:"root_cause_note,omitempty"`
+	AcceptedBy    *string           `json:"accepted_by,omitempty"`
+	AcceptedAt    *time.Time        `json:"accepted_at,omitempty"`
+	// Derived on read, never stored (§7 attention signals, §20 aging).
+	AgeDays   *int     `json:"age_days,omitempty"`
+	Attention []string `json:"attention,omitempty"`
 }
 
+// RaiseExceptionRequest raises an exception by hand. The raiser names what
+// kind of failure it is (category) and which assertion it impacts — a human
+// finding has no rule to derive them from; severity is still derived from the
+// item's exposure against the run's materiality, never chosen.
 type RaiseExceptionRequest struct {
-	ItemID string `json:"item_id"`
-	Reason string `json:"reason"`
+	ItemID    string `json:"item_id"`
+	Reason    string `json:"reason"`
+	Category  string `json:"category"`
+	Assertion string `json:"assertion"`
 }
 
 func (r RaiseExceptionRequest) Validate() error {
@@ -366,6 +412,12 @@ func (r RaiseExceptionRequest) Validate() error {
 	}
 	if r.Reason == "" {
 		return fmt.Errorf("reason is required")
+	}
+	if !exceptionCategories[r.Category] {
+		return fmt.Errorf("%w: category must be one of ZS-CONTROL-001 §21's categories", ErrInvalidArgument)
+	}
+	if !exceptionAssertions[r.Assertion] {
+		return fmt.Errorf("%w: assertion must be one of ZS-CONTROL-001 §21's assertions", ErrInvalidArgument)
 	}
 	return nil
 }
@@ -386,9 +438,14 @@ type Certification struct {
 	// 000005, where it added both sides and every currency together.
 	TotalAssertedMinor *int64                     `json:"total_asserted_minor_units,omitempty"`
 	ControlTotals      map[string][]CurrencyTotal `json:"control_totals,omitempty"`
-	ManifestSHA256     string                     `json:"manifest_sha256"`
-	SealedAt           time.Time                  `json:"sealed_at"`
-	SealedBy           string                     `json:"sealed_by"`
+	// ResultState and Assessment are set on certifications sealed from
+	// migration 000007 on: a certification over accepted risk says so — the
+	// result stays VARIANCE and every accepted exception is listed.
+	ResultState    *ResultState   `json:"result_state,omitempty"`
+	Assessment     *RunAssessment `json:"assessment,omitempty"`
+	ManifestSHA256 string         `json:"manifest_sha256"`
+	SealedAt       time.Time      `json:"sealed_at"`
+	SealedBy       string         `json:"sealed_by"`
 }
 
 type SupersedeRunRequest struct {
@@ -430,5 +487,8 @@ var (
 	ErrReplacementAlreadyUsed       = errorString("the replacement run already supersedes another run")
 	ErrInvalidTransition            = errorString("invalid state transition")
 	ErrRunNotEvaluated              = errorString("the run has not been matched yet; match it before raising exceptions or certifying")
-	ErrRunNotEligible               = errorString("the run's result is not a MATCH and it is not eligible for certification")
+	ErrRunNotEligible               = errorString("the run is not eligible for certification")
+	ErrExceptionNotFound            = errorString("reconciliation exception not found")
+	ErrNotExceptionOwner            = errorString("only the exception's assigned owner can work it; assign it first")
+	ErrNotIndependent               = errorString("risk must be accepted by someone other than the exception's owner and its raiser")
 )

@@ -189,7 +189,7 @@ func TestReconciliation_ManualMatchRequiresReasonAndIsAuditable(t *testing.T) {
 		t.Fatalf("get exceptions after manual match: %v", err)
 	}
 	for _, e := range afterExceptions {
-		if e.Status != domain.ExceptionResolved || e.ResolvedByMatchID == nil || *e.ResolvedByMatchID != mr.MatchResultID {
+		if e.Status != domain.ExceptionClosed || e.ResolvedByMatchID == nil || *e.ResolvedByMatchID != mr.MatchResultID {
 			t.Fatalf("exception not resolved by the manual match: %+v", e)
 		}
 	}
