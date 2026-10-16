@@ -155,16 +155,9 @@ func (s *PgStore) DefineReconciliation(ctx context.Context, tenantID string, req
 			ON CONFLICT (tenant_id, name) DO UPDATE SET
 				match_key_fields = EXCLUDED.match_key_fields,
 				tolerance_amount_minor_units = EXCLUDED.tolerance_amount_minor_units,
-				materiality_amount_minor_units = EXCLUDED.materiality_amount_minor_units,
-				-- A rule change is a new version: runs and certifications pin
-				-- definition_version, so it must identify the rules that applied.
-				version = reconciliation_definitions.version + CASE
-					WHEN (reconciliation_definitions.match_key_fields, reconciliation_definitions.tolerance_amount_minor_units,
-					      reconciliation_definitions.materiality_amount_minor_units)
-					  IS DISTINCT FROM (EXCLUDED.match_key_fields, EXCLUDED.tolerance_amount_minor_units,
-					      EXCLUDED.materiality_amount_minor_units)
-					THEN 1 ELSE 0 END,
-				updated_at = NOW()
+				materiality_amount_minor_units = EXCLUDED.materiality_amount_minor_units
+				-- version and updated_at are owned by trigger_definition_versioning
+				-- (migration 000003): bumped only when a rule column changes.
 			RETURNING `+definitionColumns,
 			id, tenantID, req.Name, req.MatchKeyFields, req.ToleranceAmountMinorUnits, req.MaterialityAmountMinorUnits, actor))
 		if err != nil {
