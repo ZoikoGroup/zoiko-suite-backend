@@ -14,11 +14,7 @@ func (f *fixture) defineWith(name string, mutate func(*domain.DefineReconciliati
 	f.t.Helper()
 	req := defineRequest(name, 0)
 	mutate(&req)
-	d, err := f.s.DefineReconciliation(f.ctx, orgA, req, "test-operator")
-	if err != nil {
-		f.t.Fatalf("define %s: %v", name, err)
-	}
-	return d
+	return f.defineApproved(orgA, req)
 }
 
 func (f *fixture) match(runID string) *domain.ReconciliationRun {
@@ -272,20 +268,17 @@ func TestDefinition_RulesValidatedAndVersioned(t *testing.T) {
 	f := newFixture(t)
 	bad := defineRequest("bad-key", 0)
 	bad.MatchKeyFields = []string{"reference"}
-	if _, err := f.s.DefineReconciliation(f.ctx, orgA, bad, "test-operator"); !errors.Is(err, domain.ErrInvalidArgument) {
+	if _, err := f.s.DefineReconciliation(f.ctx, orgA, bad, "test-operator", f.claim("Define", "bad")); !errors.Is(err, domain.ErrInvalidArgument) {
 		t.Fatalf("unknown match key accepted: %v", err)
 	}
 	first := f.defineReconciliation(orgA, "rules-v", 0)
-	withDim := f.defineWith("rules-v", func(r *domain.DefineReconciliationRequest) { r.BalanceDimensions = []string{"entity"} })
-	if withDim.Version != first.Version+1 {
+	withDim := f.publish(first, func(r *domain.RulesInput) { r.BalanceDimensions = []string{"entity"} })
+	if withDim.Version != first.Version+1 || len(withDim.BalanceDimensions) != 1 {
 		t.Fatalf("balance dimension change: version %d, want %d", withDim.Version, first.Version+1)
 	}
 	days := 1
-	withDate := f.defineWith("rules-v", func(r *domain.DefineReconciliationRequest) {
-		r.BalanceDimensions = []string{"entity"}
-		r.Tolerance.DateDays = &days
-	})
-	if withDate.Version != withDim.Version+1 {
+	withDate := f.publish(withDim, func(r *domain.RulesInput) { r.Tolerance.DateDays = &days })
+	if withDate.Version != withDim.Version+1 || withDate.Tolerance.DateDays == nil || withDate.RulesSHA256 == withDim.RulesSHA256 {
 		t.Fatalf("tolerance policy change: version %d, want %d", withDate.Version, withDim.Version+1)
 	}
 }

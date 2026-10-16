@@ -30,7 +30,10 @@ import (
 
 // Store is the DATA-07 persistence contract.
 type Store interface {
-	DefineReconciliation(ctx context.Context, tenantID string, req domain.DefineReconciliationRequest, actor string) (*domain.ReconciliationDefinition, error)
+	DefineReconciliation(ctx context.Context, tenantID string, req domain.DefineReconciliationRequest, actor string, claim domain.IdempotencyClaim) (*domain.ReconciliationDefinition, error)
+	CreateRuleVersion(ctx context.Context, tenantID, definitionID string, req domain.CreateRuleVersionRequest, actor string, claim domain.IdempotencyClaim) (*domain.RuleVersion, error)
+	ApproveRuleVersion(ctx context.Context, tenantID, definitionID string, version int64, approver string, claim domain.IdempotencyClaim) (*domain.RuleVersion, error)
+	ListRuleVersions(ctx context.Context, tenantID, definitionID string) ([]domain.RuleVersion, error)
 	GetDefinition(ctx context.Context, tenantID, definitionID string) (*domain.ReconciliationDefinition, error)
 	CheckIdempotency(ctx context.Context, tenantID string, claim domain.IdempotencyClaim) error
 	StartRun(ctx context.Context, tenantID string, req domain.StartRunRequest, expectedDefinitionVersion int64,
@@ -136,96 +139,6 @@ func abs64(n int64) int64 {
 
 // ── ReconciliationDefinition ────────────────────────────────────────────────
 
-const definitionColumns = `definition_id, tenant_id, legal_entity_id::text, name, populations, match_key_fields, balance_dimensions,
-	amount_scale, tolerance_policy, materiality_policy, exception_policy, certification_profile, version, created_at, created_by, updated_at`
-
-func scanDefinition(row pgx.Row) (*domain.ReconciliationDefinition, error) {
-	var d domain.ReconciliationDefinition
-	var entity *string
-	var scale *int
-	var pops, tol, mat, exPol, profile []byte
-	if err := row.Scan(&d.DefinitionID, &d.TenantID, &entity, &d.Name, &pops, &d.MatchKeyFields, &d.BalanceDimensions, &scale,
-		&tol, &mat, &exPol, &profile, &d.Version, &d.CreatedAt, &d.CreatedBy, &d.UpdatedAt); err != nil {
-		return nil, err
-	}
-	if err := decodePolicies(mat, exPol, profile, &d.Materiality, &d.ExceptionPolicy, &d.CertificationProfile); err != nil {
-		return nil, fmt.Errorf("decode definition policies: %w", err)
-	}
-	if len(tol) > 0 {
-		if err := json.Unmarshal(tol, &d.Tolerance); err != nil {
-			return nil, fmt.Errorf("decode definition tolerance: %w", err)
-		}
-	}
-	if entity != nil {
-		d.LegalEntityID = *entity
-	}
-	if scale != nil {
-		d.AmountScale = *scale
-	}
-	if len(pops) > 0 {
-		if err := json.Unmarshal(pops, &d.Populations); err != nil {
-			return nil, fmt.Errorf("decode definition populations: %w", err)
-		}
-	}
-	return &d, nil
-}
-
-// DefineReconciliation upserts a definition by (tenant, legal entity, name).
-// The version is bumped server-side only when a rule column changes (see the
-// versioning trigger); a run copies the current version's values onto itself
-// and never reads this table again, so an edit here never reaches back into
-// an already-started run.
-func (s *PgStore) DefineReconciliation(ctx context.Context, tenantID string, req domain.DefineReconciliationRequest, actor string) (*domain.ReconciliationDefinition, error) {
-	if err := req.Validate(); err != nil {
-		return nil, err
-	}
-	pops, err := json.Marshal(req.Populations)
-	if err != nil {
-		return nil, fmt.Errorf("encode populations: %w", err)
-	}
-	tol, err := json.Marshal(req.Tolerance)
-	if err != nil {
-		return nil, fmt.Errorf("encode tolerance: %w", err)
-	}
-	mat, exPol, profile, err := encodePolicies(&req.Materiality, req.ExceptionPolicy, &req.CertificationProfile)
-	if err != nil {
-		return nil, err
-	}
-	dims := req.BalanceDimensions
-	if dims == nil {
-		dims = []string{}
-	}
-	var out *domain.ReconciliationDefinition
-	err = s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
-		id := newID(domain.PrefixDefinition)
-		got, err := scanDefinition(tx.QueryRow(ctx, `
-			INSERT INTO reconciliation_definitions (definition_id, tenant_id, legal_entity_id, name, populations, match_key_fields,
-				balance_dimensions, amount_scale, tolerance_policy, materiality_policy, exception_policy, certification_profile, created_by)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-			ON CONFLICT (tenant_id, legal_entity_id, name) DO UPDATE SET
-				populations = EXCLUDED.populations,
-				match_key_fields = EXCLUDED.match_key_fields,
-				balance_dimensions = EXCLUDED.balance_dimensions,
-				amount_scale = EXCLUDED.amount_scale,
-				tolerance_policy = EXCLUDED.tolerance_policy,
-				materiality_policy = EXCLUDED.materiality_policy,
-				exception_policy = EXCLUDED.exception_policy,
-				certification_profile = EXCLUDED.certification_profile,
-				materiality_amount_minor_units = NULL
-				-- version and updated_at are owned by trigger_definition_versioning:
-				-- bumped only when a rule column changes.
-			RETURNING `+definitionColumns,
-			id, tenantID, req.LegalEntityID, req.Name, pops, req.MatchKeyFields, dims, *req.AmountScale,
-			tol, mat, exPol, profile, actor))
-		if err != nil {
-			return fmt.Errorf("upsert reconciliation definition: %w", err)
-		}
-		out = got
-		return nil
-	})
-	return out, err
-}
-
 // encodePolicies / decodePolicies carry the governance policies (A4, A7) in
 // and out of their JSONB columns; NULL (a row written before 000007) decodes
 // to nil.
@@ -271,31 +184,9 @@ func decodePolicies(mat, exPol, profile []byte, matOut **domain.MaterialityPolic
 	return nil
 }
 
-func loadDefinition(ctx context.Context, tx pgx.Tx, tenantID, definitionID string, lock bool) (*domain.ReconciliationDefinition, error) {
-	q := `SELECT ` + definitionColumns + ` FROM reconciliation_definitions WHERE tenant_id = $1 AND definition_id = $2`
-	if lock {
-		q += ` FOR SHARE`
-	}
-	d, err := scanDefinition(tx.QueryRow(ctx, q, tenantID, definitionID))
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, domain.ErrDefinitionNotFound
-	}
-	return d, err
-}
-
-func (s *PgStore) GetDefinition(ctx context.Context, tenantID, definitionID string) (*domain.ReconciliationDefinition, error) {
-	var out *domain.ReconciliationDefinition
-	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
-		d, err := loadDefinition(ctx, tx, tenantID, definitionID, false)
-		out = d
-		return err
-	})
-	return out, err
-}
-
 // ── ReconciliationRun ────────────────────────────────────────────────────────
 
-const runColumns = `run_id, tenant_id, legal_entity_id::text, definition_id, definition_version, status, result_state,
+const runColumns = `run_id, tenant_id, legal_entity_id::text, definition_id, definition_version, COALESCE(rules_sha256, ''), status, result_state,
 	certification_state, failure_code, failure_reason, period_id, scope,
 	amount_scale, match_key_fields, balance_dimensions, tolerance_policy, materiality_policy, exception_policy, certification_profile,
 	supersedes_run_id, superseded_by_run_id,
@@ -306,7 +197,7 @@ func scanRun(row pgx.Row) (*domain.ReconciliationRun, error) {
 	var certifiedBy, entity, period *string
 	var scale *int
 	var scope, tol, mat, exPol, profile []byte
-	if err := row.Scan(&r.RunID, &r.TenantID, &entity, &r.DefinitionID, &r.DefinitionVersion, &r.Status, &r.ResultState,
+	if err := row.Scan(&r.RunID, &r.TenantID, &entity, &r.DefinitionID, &r.DefinitionVersion, &r.RulesSHA256, &r.Status, &r.ResultState,
 		&r.CertificationState, &r.FailureCode, &r.FailureReason, &period, &scope,
 		&scale, &r.MatchKeyFields, &r.BalanceDimensions, &tol, &mat, &exPol, &profile, &r.SupersedesRunID, &r.SupersededByRunID,
 		&r.SupersededReason, &r.SupersededBy, &r.SupersededAt, &r.StartedAt, &r.StartedBy, &r.CertifiedAt, &certifiedBy); err != nil {
@@ -470,7 +361,8 @@ type createdRun struct {
 	run *domain.ReconciliationRun
 }
 
-// createRun inserts a Planned run pinned to the definition's current rules,
+// createRun inserts a Planned run pinned to the definition's effective rule
+// version — its rules copied onto the run, its digest pinned beside them —
 // under a share lock on the definition, after claiming the idempotency key.
 // The run is refused if the definition changed since its populations were
 // read for expectedVersion (ErrDefinitionChanged); check, when given, vets the
@@ -481,8 +373,8 @@ func createRun(ctx context.Context, tx pgx.Tx, tenantID string, req domain.Start
 	if err != nil {
 		return nil, err
 	}
-	if def.Legacy() || def.Ungoverned() {
-		return nil, domain.ErrLegacyRecord
+	if err := def.Runnable(); err != nil {
+		return nil, err
 	}
 	if def.Version != expectedVersion {
 		return nil, domain.ErrDefinitionChanged
@@ -525,11 +417,11 @@ func createRun(ctx context.Context, tx pgx.Tx, tenantID string, req domain.Start
 	run, err := scanRun(tx.QueryRow(ctx, `
 		INSERT INTO reconciliation_runs (run_id, tenant_id, legal_entity_id, definition_id, definition_version, status,
 			period_id, scope, amount_scale, match_key_fields, balance_dimensions, tolerance_policy,
-			materiality_policy, exception_policy, certification_profile, started_by)
-		VALUES ($1, $2, $3, $4, $5, 'Planned', $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+			materiality_policy, exception_policy, certification_profile, rules_sha256, started_by)
+		VALUES ($1, $2, $3, $4, $5, 'Planned', $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
 		RETURNING `+runColumns,
 		runID, tenantID, def.LegalEntityID, def.DefinitionID, def.Version, period, scope, def.AmountScale,
-		def.MatchKeyFields, dims, tol, mat, exPol, profile, actor))
+		def.MatchKeyFields, dims, tol, mat, exPol, profile, def.RulesSHA256, actor))
 	if err != nil {
 		return nil, fmt.Errorf("create reconciliation run: %w", err)
 	}
@@ -1160,6 +1052,7 @@ func scanCertification(row pgx.Row) (*domain.Certification, error) {
 type certificationManifest struct {
 	RunID                string                            `json:"run_id"`
 	DefinitionVersion    int64                             `json:"definition_version"`
+	RulesSHA256          string                            `json:"rules_sha256"`
 	AmountScale          int                               `json:"amount_scale"`
 	Tolerance            *domain.TolerancePolicy           `json:"tolerance"`
 	MatchKeyFields       []string                          `json:"match_key_fields"`
@@ -1268,7 +1161,7 @@ func (s *PgStore) Certify(ctx context.Context, tenantID, runID string, actor str
 
 		sealedAt := time.Now().UTC()
 		manifest, err := json.Marshal(certificationManifest{
-			RunID: runID, DefinitionVersion: run.DefinitionVersion, AmountScale: run.AmountScale, Tolerance: run.Tolerance,
+			RunID: runID, DefinitionVersion: run.DefinitionVersion, RulesSHA256: run.RulesSHA256, AmountScale: run.AmountScale, Tolerance: run.Tolerance,
 			MatchKeyFields: run.MatchKeyFields, BalanceDimensions: run.BalanceDimensions,
 			Materiality: run.Materiality, CertificationProfile: run.CertificationProfile, ResultState: run.ResultState,
 			Assessment:   assessment,

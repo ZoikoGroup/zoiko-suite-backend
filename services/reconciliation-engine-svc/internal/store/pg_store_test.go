@@ -394,16 +394,13 @@ func TestReconciliation_ManualMatchCannotHideAmountDifference(t *testing.T) {
 
 // Changing a definition's rules is a new version, so runs and certifications
 // that pin definition_version identify the rules that actually applied.
-func TestReconciliation_RedefiningRulesBumpsVersion(t *testing.T) {
+// A11: re-posting a definition never rewrites its rules in place.
+func TestReconciliation_DefinitionCannotBeRedefinedInPlace(t *testing.T) {
 	f := newFixture(t)
-	first := f.defineReconciliation(orgA, "versioned", 0)
-	same := f.defineReconciliation(orgA, "versioned", 0)
-	if same.Version != first.Version {
-		t.Fatalf("re-posting identical rules changed the version: %d -> %d", first.Version, same.Version)
-	}
-	widened := f.defineReconciliation(orgA, "versioned", 500)
-	if widened.Version != first.Version+1 {
-		t.Fatalf("tolerance change: version %d, want %d", widened.Version, first.Version+1)
+	f.defineReconciliation(orgA, "versioned", 0)
+	if _, err := f.s.DefineReconciliation(f.ctx, orgA, defineRequest("versioned", 500), "test-operator",
+		f.claim("DefineReconciliation", "versioned-again")); !errors.Is(err, domain.ErrDefinitionExists) {
+		t.Fatalf("re-define with wider tolerance: %v, want ErrDefinitionExists", err)
 	}
 }
 

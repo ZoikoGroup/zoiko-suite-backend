@@ -48,6 +48,13 @@ type fakeStore struct {
 	startCalls  int
 	failures    []domain.RunFailure
 	transitions []domain.TransitionExceptionRequest
+	approvals   []string
+}
+
+func (s *fakeStore) ApproveRuleVersion(_ context.Context, _, definitionID string, version int64, approver string,
+	_ domain.IdempotencyClaim) (*domain.RuleVersion, error) {
+	s.approvals = append(s.approvals, approver)
+	return &domain.RuleVersion{DefinitionID: definitionID, RuleVersion: version, Status: "APPROVED", ApprovedBy: &approver}, nil
 }
 
 func (s *fakeStore) GetException(context.Context, string, string) (*domain.ReconciliationException, error) {
@@ -91,15 +98,23 @@ func (s *fakeStore) RecordFailedRun(_ context.Context, _ string, _ domain.StartR
 		ResultState: domain.ResultIndeterminate, CertificationState: domain.CertUncertified, FailureCode: &code}, nil
 }
 
-type failingFetcher struct{ err error }
+type failingFetcher struct {
+	err   error
+	calls *int
+}
 
 func (f failingFetcher) Fetch(context.Context, domain.PopulationSpec, source.Scope) (*source.Fetched, error) {
+	if f.calls != nil {
+		*f.calls++
+	}
 	return nil, f.err
 }
 
 func definition() *domain.ReconciliationDefinition {
 	return &domain.ReconciliationDefinition{DefinitionID: "rdf_1", LegalEntityID: entityA, AmountScale: 2, Version: 3,
-		Populations: []domain.PopulationSpec{{Side: "A", System: "ar", Population: "p"}, {Side: "B", System: "gl", Population: "p"}}}
+		Populations: []domain.PopulationSpec{{Side: "A", System: "ar", Population: "p"}, {Side: "B", System: "gl", Population: "p"}},
+		Materiality: &domain.MaterialityPolicy{}, ExceptionPolicy: &domain.ExceptionPolicy{OwnerRole: "o"},
+		CertificationProfile: &domain.CertificationProfile{}}
 }
 
 func serve(h *Handler, method, path, body string) *httptest.ResponseRecorder {
@@ -246,5 +261,53 @@ func TestTransitionException_AcceptRiskNeedsItsOwnPermission(t *testing.T) {
 		`{"to_state":"INVESTIGATING","reason":"looking"}`)
 	if w.Code != http.StatusOK || az.actions[0] != ActionReconciliationManage {
 		t.Fatalf("investigate needs only MANAGE: %d %s, checks %v", w.Code, w.Body, az.actions)
+	}
+}
+
+// A11: approving a rule version is its own permission, checked on the
+// definition's entity at the moment of approval; publishing is not enough.
+func TestApproveRuleVersion_NeedsApprovalPermission(t *testing.T) {
+	az := &recordingAuthz{}
+	st := &fakeStore{def: definition()}
+	w := serve(NewHandler(st, az, failingFetcher{}, zap.NewNop()), http.MethodPost, "/v1/reconciliation/definitions/rdf_1/rule-versions/2/approve", "")
+	if w.Code != http.StatusOK || len(az.actions) != 1 || az.actions[0] != ActionReconciliationApproveRules || az.entities[0] != entityA ||
+		len(st.approvals) != 1 || st.approvals[0] != "alice" {
+		t.Fatalf("approve: %d %s, checks %v on %v, approvals %v", w.Code, w.Body, az.actions, az.entities, st.approvals)
+	}
+
+	az = &recordingAuthz{deny: map[string]bool{ActionReconciliationApproveRules: true}}
+	st = &fakeStore{def: definition()}
+	w = serve(NewHandler(st, az, failingFetcher{}, zap.NewNop()), http.MethodPost, "/v1/reconciliation/definitions/rdf_1/rule-versions/2/approve", "")
+	if w.Code != http.StatusForbidden || len(st.approvals) != 0 {
+		t.Fatalf("approve without permission: %d %s, approvals %v", w.Code, w.Body, st.approvals)
+	}
+
+	w = serve(NewHandler(&fakeStore{def: definition()}, &recordingAuthz{}, failingFetcher{}, zap.NewNop()), http.MethodPost,
+		"/v1/reconciliation/definitions/rdf_1/rule-versions/zero/approve", "")
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("bad version: %d", w.Code)
+	}
+}
+
+func TestGetDefinition_AuthorizesReadOnItsEntity(t *testing.T) {
+	az := &recordingAuthz{}
+	w := serve(NewHandler(&fakeStore{def: definition()}, az, failingFetcher{}, zap.NewNop()), http.MethodGet, "/v1/reconciliation/definitions/rdf_1", "")
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"definition_id":"rdf_1"`) ||
+		len(az.actions) != 1 || az.actions[0] != ActionReconciliationRead || az.entities[0] != entityA {
+		t.Fatalf("get definition: %d %s, checks %v on %v", w.Code, w.Body, az.actions, az.entities)
+	}
+}
+
+// A definition with no approved rule version in effect starts nothing and
+// reads no source.
+func TestStartRun_RefusesUnapprovedRulesBeforeReadingSources(t *testing.T) {
+	def := definition()
+	def.Version, def.Materiality, def.ExceptionPolicy, def.CertificationProfile = 0, nil, nil, nil
+	calls := 0
+	st := &fakeStore{def: def}
+	w := serve(NewHandler(st, &recordingAuthz{}, failingFetcher{err: source.ErrSourceUnavailable, calls: &calls}, zap.NewNop()),
+		http.MethodPost, "/v1/reconciliation/runs", `{"definition_id":"rdf_1","period_id":"2026-09"}`)
+	if w.Code != http.StatusConflict || calls != 0 || st.startCalls != 0 || len(st.failures) != 0 {
+		t.Fatalf("unapproved rules: %d %s, source reads %d, starts %d, failed runs %d", w.Code, w.Body, calls, st.startCalls, len(st.failures))
 	}
 }
