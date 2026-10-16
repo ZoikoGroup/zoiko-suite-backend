@@ -43,6 +43,12 @@ const (
 // its retry with the same Idempotency-Key replays the run instead.
 const populationReadTimeout = 3 * time.Minute
 
+// persistTimeout bounds the write that follows the population read — the
+// frozen run, or the Failed one. It gets its own detached budget, so a read
+// that used all of populationReadTimeout can still be recorded. Read plus
+// write stays inside the server's WriteTimeout.
+const persistTimeout = 30 * time.Second
+
 // Authorizer is the authorization-svc check this handler needs.
 type Authorizer interface {
 	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
@@ -91,6 +97,7 @@ func (h *Handler) routes(r chi.Router) {
 	r.Get("/runs/{runID}/matches", h.GetMatchResults)
 	r.Get("/runs/{runID}/exceptions", h.GetExceptions)
 	r.Get("/runs/{runID}/certification", h.GetCertification)
+	r.Get("/runs/{runID}/transitions", h.GetTransitions)
 }
 
 func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
@@ -201,9 +208,11 @@ func (h *Handler) DefineReconciliation(w http.ResponseWriter, r *http.Request) {
 
 // StartRun reads the definition's two populations from their owning services
 // and freezes them (A1). Nothing is frozen unless both populations are proven
-// complete and reproducible: a missing watermark, absent or untied declared
-// totals, an unreachable source or an amount the definition's scale cannot
-// represent refuses the request, and no run exists afterwards.
+// complete and reproducible. When they cannot be — a missing watermark, absent
+// or untied declared totals, an unreachable source, an amount the definition's
+// scale cannot represent — the attempt is still recorded, as a Failed run with
+// result INDETERMINATE and the failure's code (A6), and the response is 502
+// (source unreachable) or 422 with that run.
 func (h *Handler) StartRun(w http.ResponseWriter, r *http.Request) {
 	tenantID := customMiddleware.GetTenantID(r.Context())
 	principalID, ok := h.requirePrincipal(w, r)
@@ -234,13 +243,20 @@ func (h *Handler) StartRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), populationReadTimeout)
-	defer cancel()
+	readCtx, cancelRead := context.WithTimeout(context.WithoutCancel(r.Context()), populationReadTimeout)
+	defer cancelRead()
 	scope := source.Scope{TenantID: tenantID, PrincipalID: principalID, LegalEntityID: def.LegalEntityID,
 		PeriodID: req.PeriodID, CorrelationID: r.Header.Get("X-Correlation-ID")}
-	pops, err := source.BuildPopulations(ctx, h.fetcher, *def, req, scope)
+	pops, err := source.BuildPopulations(readCtx, h.fetcher, *def, req, scope)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), persistTimeout)
+	defer cancel()
+	var popErr *source.PopulationError
+	if errors.As(err, &popErr) {
+		h.recordFailedRun(ctx, w, tenantID, req, def.Version, popErr, principalID, claim)
+		return
+	}
 	if err != nil {
-		h.respondPopulationError(w, err)
+		h.respondFromError(w, err)
 		return
 	}
 	got, err := h.store.StartRun(ctx, tenantID, req, def.Version, pops, principalID, claim)
@@ -424,6 +440,24 @@ func (h *Handler) GetCertification(w http.ResponseWriter, r *http.Request) {
 	h.respondJSON(w, http.StatusOK, got)
 }
 
+// GetTransitions returns the run's append-only state history: every change to
+// its lifecycle, result or certification, with reason and actor.
+func (h *Handler) GetTransitions(w http.ResponseWriter, r *http.Request) {
+	tenantID, _, ok := h.authorizeRun(w, r, ActionReconciliationRead)
+	if !ok {
+		return
+	}
+	items, err := h.store.GetTransitions(r.Context(), tenantID, chi.URLParam(r, "runID"))
+	if err != nil {
+		h.respondFromError(w, err)
+		return
+	}
+	if items == nil {
+		items = []domain.RunTransition{}
+	}
+	h.respondJSON(w, http.StatusOK, map[string]interface{}{"data": items, "count": len(items)})
+}
+
 // ── Response helpers ─────────────────────────────────────────────────────────
 
 func (h *Handler) respondJSON(w http.ResponseWriter, code int, payload interface{}) {
@@ -436,20 +470,31 @@ func (h *Handler) respondError(w http.ResponseWriter, code int, message string) 
 	h.respondJSON(w, code, map[string]string{"error": message})
 }
 
-// respondPopulationError answers a StartRun whose populations could not be
-// proven complete and reproducible. No run was created. An unreachable source
-// is a gateway failure (502); a source that answered with something that does
-// not hold together is 422.
-func (h *Handler) respondPopulationError(w http.ResponseWriter, err error) {
-	h.logger.Warn("reconciliation populations could not be built; no run started", zap.Error(err))
+// recordFailedRun answers a StartRun whose populations could not be proven
+// complete and reproducible: the attempt is recorded as a Failed /
+// INDETERMINATE run, and the response carries it. An unreachable source is a
+// gateway failure (502); a source that answered with something that does not
+// hold together is 422. If even the failed run cannot be recorded (the
+// definition changed meanwhile, the database is down), that error is returned
+// instead and no run exists.
+func (h *Handler) recordFailedRun(ctx context.Context, w http.ResponseWriter, tenantID string, req domain.StartRunRequest,
+	definitionVersion int64, popErr *source.PopulationError, principalID string, claim domain.IdempotencyClaim) {
+	h.logger.Warn("reconciliation populations could not be proven complete; recording a failed run", zap.Error(popErr))
+	failure := domain.RunFailure{Code: popErr.Code(), Reason: popErr.Error()}
+	run, err := h.store.RecordFailedRun(ctx, tenantID, req, definitionVersion, failure, principalID, claim)
+	if err != nil {
+		h.respondFromError(w, err)
+		return
+	}
 	code := http.StatusUnprocessableEntity
-	if errors.Is(err, source.ErrSourceUnavailable) {
+	if failure.Code == domain.FailureSourceUnavailable {
 		code = http.StatusBadGateway
 	}
-	h.respondJSON(w, code, map[string]string{
-		"error":  err.Error(),
-		"result": "INDETERMINATE",
-		"detail": "the populations could not be proven complete and reproducible; no run was started",
+	h.respondJSON(w, code, map[string]interface{}{
+		"error":        popErr.Error(),
+		"result_state": run.ResultState,
+		"failure_code": failure.Code,
+		"run":          run,
 	})
 }
 
@@ -468,7 +513,9 @@ func (h *Handler) respondFromError(w http.ResponseWriter, err error) {
 		errors.Is(err, domain.ErrRunImmutable), errors.Is(err, domain.ErrExceptionAlreadyClosed),
 		errors.Is(err, domain.ErrIdempotencyKeyReused), errors.Is(err, domain.ErrDefinitionChanged),
 		errors.Is(err, domain.ErrLegacyRecord), errors.Is(err, domain.ErrSupersedeDifferentDefinition),
-		errors.Is(err, domain.ErrReplacementNotTerminal), errors.Is(err, domain.ErrReplacementAlreadyUsed):
+		errors.Is(err, domain.ErrReplacementNotTerminal), errors.Is(err, domain.ErrReplacementAlreadyUsed),
+		errors.Is(err, domain.ErrInvalidTransition), errors.Is(err, domain.ErrRunNotEvaluated),
+		errors.Is(err, domain.ErrRunNotEligible):
 		h.respondError(w, http.StatusConflict, err.Error())
 	default:
 		h.logger.Error("reconciliation-engine-svc request failed", zap.Error(err))

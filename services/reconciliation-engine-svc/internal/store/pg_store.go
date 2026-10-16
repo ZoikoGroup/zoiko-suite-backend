@@ -35,6 +35,8 @@ type Store interface {
 	CheckIdempotency(ctx context.Context, tenantID string, claim domain.IdempotencyClaim) error
 	StartRun(ctx context.Context, tenantID string, req domain.StartRunRequest, expectedDefinitionVersion int64,
 		pops []domain.FrozenPopulation, actor string, claim domain.IdempotencyClaim) (*domain.ReconciliationRun, error)
+	RecordFailedRun(ctx context.Context, tenantID string, req domain.StartRunRequest, expectedDefinitionVersion int64,
+		failure domain.RunFailure, actor string, claim domain.IdempotencyClaim) (*domain.ReconciliationRun, error)
 	Match(ctx context.Context, tenantID, runID string, req domain.MatchRequest, actor string, claim domain.IdempotencyClaim) (*domain.ReconciliationRun, error)
 	RaiseException(ctx context.Context, tenantID, runID string, req domain.RaiseExceptionRequest, actor string, claim domain.IdempotencyClaim) (*domain.ReconciliationException, error)
 	Reperform(ctx context.Context, tenantID, runID string, actor string, claim domain.IdempotencyClaim) (*domain.ReconciliationRun, error)
@@ -46,6 +48,7 @@ type Store interface {
 	GetMatchResults(ctx context.Context, tenantID, runID string) ([]domain.MatchResult, error)
 	GetExceptions(ctx context.Context, tenantID, runID string) ([]domain.ReconciliationException, error)
 	GetCertification(ctx context.Context, tenantID, runID string) (*domain.Certification, error)
+	GetTransitions(ctx context.Context, tenantID, runID string) ([]domain.RunTransition, error)
 }
 
 type PgStore struct {
@@ -231,7 +234,8 @@ func (s *PgStore) GetDefinition(ctx context.Context, tenantID, definitionID stri
 
 // ── ReconciliationRun ────────────────────────────────────────────────────────
 
-const runColumns = `run_id, tenant_id, legal_entity_id::text, definition_id, definition_version, status, period_id, scope,
+const runColumns = `run_id, tenant_id, legal_entity_id::text, definition_id, definition_version, status, result_state,
+	certification_state, failure_code, failure_reason, period_id, scope,
 	amount_scale, match_key_fields, balance_dimensions, tolerance_policy, materiality_amount_minor_units, supersedes_run_id, superseded_by_run_id,
 	superseded_reason, superseded_by, superseded_at, started_at, started_by, certified_at, certified_by`
 
@@ -240,7 +244,8 @@ func scanRun(row pgx.Row) (*domain.ReconciliationRun, error) {
 	var certifiedBy, entity, period *string
 	var scale *int
 	var scope, tol []byte
-	if err := row.Scan(&r.RunID, &r.TenantID, &entity, &r.DefinitionID, &r.DefinitionVersion, &r.Status, &period, &scope,
+	if err := row.Scan(&r.RunID, &r.TenantID, &entity, &r.DefinitionID, &r.DefinitionVersion, &r.Status, &r.ResultState,
+		&r.CertificationState, &r.FailureCode, &r.FailureReason, &period, &scope,
 		&scale, &r.MatchKeyFields, &r.BalanceDimensions, &tol, &r.MaterialityAmountMinorUnits, &r.SupersedesRunID, &r.SupersededByRunID,
 		&r.SupersededReason, &r.SupersededBy, &r.SupersededAt, &r.StartedAt, &r.StartedBy, &r.CertifiedAt, &certifiedBy); err != nil {
 		return nil, err
@@ -334,68 +339,214 @@ func (s *PgStore) StartRun(ctx context.Context, tenantID string, req domain.Star
 	}
 	var out *domain.ReconciliationRun
 	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
-		def, err := loadDefinition(ctx, tx, tenantID, req.DefinitionID, true)
+		created, err := createRun(ctx, tx, tenantID, req, expectedVersion, actor, &claim, func(def *domain.ReconciliationDefinition) error {
+			return checkPopulationsMatchDefinition(def, pops)
+		})
 		if err != nil {
 			return err
 		}
-		if def.Legacy() {
-			return domain.ErrLegacyRecord
-		}
-		if def.Version != expectedVersion {
-			return domain.ErrDefinitionChanged
-		}
-		if err := checkPopulationsMatchDefinition(def, pops); err != nil {
-			return err
-		}
-
-		runID := newID(domain.PrefixRun)
-		claim.ResourceID = runID
-		if err := claimIdempotency(ctx, tx, claim); err != nil {
-			return err
-		}
-
-		scope, err := json.Marshal(req.Scope)
-		if err != nil {
-			return fmt.Errorf("encode run scope: %w", err)
-		}
-		if req.Scope == nil {
-			scope = []byte("{}")
-		}
-		var period *string
-		if req.PeriodID != "" {
-			period = &req.PeriodID
-		}
-		tol, err := json.Marshal(def.Tolerance)
-		if err != nil {
-			return fmt.Errorf("encode run tolerance: %w", err)
-		}
-		dims := def.BalanceDimensions
-		if dims == nil {
-			dims = []string{}
-		}
-		run, err := scanRun(tx.QueryRow(ctx, `
-			INSERT INTO reconciliation_runs (run_id, tenant_id, legal_entity_id, definition_id, definition_version, status,
-				period_id, scope, amount_scale, match_key_fields, balance_dimensions, tolerance_policy,
-				materiality_amount_minor_units, started_by)
-			VALUES ($1, $2, $3, $4, $5, 'Planned', $6, $7, $8, $9, $10, $11, $12, $13)
-			RETURNING `+runColumns,
-			runID, tenantID, def.LegalEntityID, def.DefinitionID, def.Version, period, scope, def.AmountScale,
-			def.MatchKeyFields, dims, tol, def.MaterialityAmountMinorUnits, actor))
-		if err != nil {
-			return fmt.Errorf("create reconciliation run: %w", err)
-		}
-
 		for _, pop := range pops {
-			if err := freezePopulation(ctx, tx, tenantID, runID, def.AmountScale, pop); err != nil {
+			if err := freezePopulation(ctx, tx, tenantID, created.run.RunID, created.def.AmountScale, pop); err != nil {
 				return err
 			}
 		}
-
-		out = run
-		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "reconciliation_run", AggregateID: run.RunID,
-			EventType: "CONTROL.ReconciliationStarted", TenantID: &tenantID, Payload: run})
+		out = created.run
+		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "reconciliation_run", AggregateID: out.RunID,
+			EventType: "CONTROL.ReconciliationStarted", TenantID: &tenantID, Payload: out})
 	})
 	return out, err
+}
+
+// RecordFailedRun records a run whose populations could not be proven
+// complete and reproducible (A6): the run exists, pinned to the definition
+// version it was attempted against, with no frozen population, lifecycle
+// Failed, result INDETERMINATE (never a MATCH — INV-05, scenario 09) and the
+// failure's code and reason. A retry under the same Idempotency-Key replays
+// this run; a new attempt is a new run, which may later supersede this one.
+func (s *PgStore) RecordFailedRun(ctx context.Context, tenantID string, req domain.StartRunRequest, expectedVersion int64,
+	failure domain.RunFailure, actor string, claim domain.IdempotencyClaim) (*domain.ReconciliationRun, error) {
+	if err := req.Validate(); err != nil {
+		return nil, err
+	}
+	if err := failure.Validate(); err != nil {
+		return nil, err
+	}
+	var out *domain.ReconciliationRun
+	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
+		created, err := createRun(ctx, tx, tenantID, req, expectedVersion, actor, &claim, nil)
+		if err != nil {
+			return err
+		}
+		failed, err := advanceRun(ctx, tx, tenantID, created.run, runAdvance{
+			To: domain.RunFailed, Result: domain.ResultIndeterminate, Cert: domain.CertUncertified,
+			Reason: "populations could not be proven complete: " + string(failure.Code), Actor: actor, Failure: &failure})
+		if err != nil {
+			return err
+		}
+		out = failed
+		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "reconciliation_run", AggregateID: out.RunID,
+			EventType: "CONTROL.ReconciliationFailed", TenantID: &tenantID, Payload: out})
+	})
+	return out, err
+}
+
+type createdRun struct {
+	def *domain.ReconciliationDefinition
+	run *domain.ReconciliationRun
+}
+
+// createRun inserts a Planned run pinned to the definition's current rules,
+// under a share lock on the definition, after claiming the idempotency key.
+// The run is refused if the definition changed since its populations were
+// read for expectedVersion (ErrDefinitionChanged); check, when given, vets the
+// definition before anything is written.
+func createRun(ctx context.Context, tx pgx.Tx, tenantID string, req domain.StartRunRequest, expectedVersion int64, actor string,
+	claim *domain.IdempotencyClaim, check func(*domain.ReconciliationDefinition) error) (*createdRun, error) {
+	def, err := loadDefinition(ctx, tx, tenantID, req.DefinitionID, true)
+	if err != nil {
+		return nil, err
+	}
+	if def.Legacy() {
+		return nil, domain.ErrLegacyRecord
+	}
+	if def.Version != expectedVersion {
+		return nil, domain.ErrDefinitionChanged
+	}
+	if check != nil {
+		if err := check(def); err != nil {
+			return nil, err
+		}
+	}
+
+	runID := newID(domain.PrefixRun)
+	claim.ResourceID = runID
+	if err := claimIdempotency(ctx, tx, *claim); err != nil {
+		return nil, err
+	}
+
+	scope, err := json.Marshal(req.Scope)
+	if err != nil {
+		return nil, fmt.Errorf("encode run scope: %w", err)
+	}
+	if req.Scope == nil {
+		scope = []byte("{}")
+	}
+	var period *string
+	if req.PeriodID != "" {
+		period = &req.PeriodID
+	}
+	tol, err := json.Marshal(def.Tolerance)
+	if err != nil {
+		return nil, fmt.Errorf("encode run tolerance: %w", err)
+	}
+	dims := def.BalanceDimensions
+	if dims == nil {
+		dims = []string{}
+	}
+	run, err := scanRun(tx.QueryRow(ctx, `
+		INSERT INTO reconciliation_runs (run_id, tenant_id, legal_entity_id, definition_id, definition_version, status,
+			period_id, scope, amount_scale, match_key_fields, balance_dimensions, tolerance_policy,
+			materiality_amount_minor_units, started_by)
+		VALUES ($1, $2, $3, $4, $5, 'Planned', $6, $7, $8, $9, $10, $11, $12, $13)
+		RETURNING `+runColumns,
+		runID, tenantID, def.LegalEntityID, def.DefinitionID, def.Version, period, scope, def.AmountScale,
+		def.MatchKeyFields, dims, tol, def.MaterialityAmountMinorUnits, actor))
+	if err != nil {
+		return nil, fmt.Errorf("create reconciliation run: %w", err)
+	}
+	return &createdRun{def: def, run: run}, nil
+}
+
+// ── Run state movement ──────────────────────────────────────────────────────
+
+// runAdvance is one governed movement of a run's three state dimensions.
+type runAdvance struct {
+	To     domain.RunStatus
+	Result domain.ResultState
+	Cert   domain.CertificationState
+	Reason string
+	Actor  string
+
+	CertifiedBy  *string
+	Supersession *supersession
+	Failure      *domain.RunFailure
+}
+
+type supersession struct {
+	ByRunID, Reason, By string
+}
+
+// advanceRun is the only way a run's status, result or certification changes
+// (the pattern of financial-control-svc's advanceTx). It validates the three
+// dimensions' edges and the invariants between them, writes the row, and
+// appends one transition per dimension that changed. The lifecycle trigger
+// enforces the same rules again in the database.
+func advanceRun(ctx context.Context, tx pgx.Tx, tenantID string, cur *domain.ReconciliationRun, a runAdvance) (*domain.ReconciliationRun, error) {
+	if err := domain.ValidateResultTransition(cur.Status, cur.ResultState, a.Result); err != nil {
+		return nil, err
+	}
+	if err := domain.ValidateCertificationTransition(cur.CertificationState, a.Cert); err != nil {
+		return nil, err
+	}
+	if err := domain.ValidateLifecycleTransition(cur.Status, a.To, a.Result, a.Cert); err != nil {
+		return nil, err
+	}
+	if (a.To == domain.RunFailed) != (a.Failure != nil) {
+		return nil, fmt.Errorf("%w: a run fails with, and only with, a failure code", domain.ErrInvalidTransition)
+	}
+	var supBy, supReason, supActor, failCode, failReason *string
+	if a.Supersession != nil {
+		supBy, supReason, supActor = &a.Supersession.ByRunID, &a.Supersession.Reason, &a.Supersession.By
+	}
+	if a.Failure != nil {
+		code := string(a.Failure.Code)
+		failCode, failReason = &code, &a.Failure.Reason
+	}
+	updated, err := scanRun(tx.QueryRow(ctx, `
+		UPDATE reconciliation_runs SET status = $2, result_state = $3, certification_state = $4,
+			certified_by = COALESCE($5, certified_by),
+			superseded_by_run_id = COALESCE($6, superseded_by_run_id), superseded_reason = COALESCE($7, superseded_reason),
+			superseded_by = COALESCE($8, superseded_by),
+			failure_code = COALESCE($9, failure_code), failure_reason = COALESCE($10, failure_reason)
+		WHERE tenant_id = $11 AND run_id = $1 RETURNING `+runColumns,
+		cur.RunID, string(a.To), string(a.Result), string(a.Cert), a.CertifiedBy, supBy, supReason, supActor,
+		failCode, failReason, tenantID))
+	if err != nil {
+		return nil, fmt.Errorf("advance reconciliation run: %w", err)
+	}
+	for _, d := range []struct{ dim, from, to string }{
+		{"LIFECYCLE", string(cur.Status), string(updated.Status)},
+		{"RESULT", string(cur.ResultState), string(updated.ResultState)},
+		{"CERTIFICATION", string(cur.CertificationState), string(updated.CertificationState)},
+	} {
+		if d.from == d.to {
+			continue
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO reconciliation_run_transitions (tenant_id, run_id, dimension, from_state, to_state, reason, actor)
+			VALUES ($1, $2, $3, $4, $5, $6, $7)`, tenantID, cur.RunID, d.dim, d.from, d.to, a.Reason, a.Actor); err != nil {
+			return nil, fmt.Errorf("record run transition: %w", err)
+		}
+	}
+	return updated, nil
+}
+
+// settleResult re-evaluates an open run's result from its open exceptions —
+// MATCH with none open, VARIANCE otherwise — sets the certification state that
+// result implies, and moves the run to `to`. A run asked to be Running with
+// exceptions open is ExceptionsOpen instead.
+func settleResult(ctx context.Context, tx pgx.Tx, tenantID string, run *domain.ReconciliationRun, to domain.RunStatus,
+	reason, actor string) (*domain.ReconciliationRun, error) {
+	open, err := openExceptionCount(ctx, tx, run.RunID)
+	if err != nil {
+		return nil, err
+	}
+	result := domain.EvaluatedResult(open)
+	if to == domain.RunRunning && result == domain.ResultVariance {
+		to = domain.RunExceptionsOpen
+	}
+	return advanceRun(ctx, tx, tenantID, run, runAdvance{To: to, Result: result, Cert: domain.CertificationFor(result),
+		Reason: fmt.Sprintf("%s: %d open exception(s)", reason, open), Actor: actor})
 }
 
 // checkPopulationsMatchDefinition refuses populations that are not exactly the
@@ -680,8 +831,9 @@ func (s *PgStore) Match(ctx context.Context, tenantID, runID string, req domain.
 		}
 
 		if run.Status == domain.RunPlanned {
-			if _, err := tx.Exec(ctx, `UPDATE reconciliation_runs SET status = 'Running' WHERE run_id = $1`, runID); err != nil {
-				return fmt.Errorf("start matching: %w", err)
+			if run, err = advanceRun(ctx, tx, tenantID, run, runAdvance{To: domain.RunRunning, Result: run.ResultState,
+				Cert: run.CertificationState, Reason: "matching started", Actor: actor}); err != nil {
+				return err
 			}
 		}
 
@@ -695,20 +847,13 @@ func (s *PgStore) Match(ctx context.Context, tenantID, runID string, req domain.
 			}
 		}
 
-		openCount, err := openExceptionCount(ctx, tx, runID)
+		updated, err := settleResult(ctx, tx, tenantID, run, domain.RunRunning, "matched", actor)
 		if err != nil {
 			return err
 		}
-		target := domain.RunRunning
 		eventType := "CONTROL.ReconciliationCompleted"
-		if openCount > 0 {
-			target = domain.RunExceptionsOpen
+		if updated.ResultState == domain.ResultVariance {
 			eventType = "CONTROL.ExceptionRaised"
-		}
-
-		updated, err := scanRun(tx.QueryRow(ctx, `UPDATE reconciliation_runs SET status = $2 WHERE run_id = $1 RETURNING `+runColumns, runID, target))
-		if err != nil {
-			return fmt.Errorf("finalize match status: %w", err)
 		}
 		out = updated
 		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "reconciliation_run", AggregateID: runID,
@@ -796,6 +941,11 @@ func (s *PgStore) RaiseException(ctx context.Context, tenantID, runID string, re
 		if !openRunStatuses()[run.Status] {
 			return domain.ErrRunNotOpen
 		}
+		// No result is recorded before the run is evaluated: a Planned run has
+		// none to turn into a VARIANCE.
+		if run.Status == domain.RunPlanned {
+			return domain.ErrRunNotEvaluated
+		}
 
 		rows, err := tx.Query(ctx, matchItemSelect+` WHERE ps.run_id = $1 AND pi.item_id = $2`, runID, req.ItemID)
 		if err != nil {
@@ -830,8 +980,8 @@ func (s *PgStore) RaiseException(ctx context.Context, tenantID, runID string, re
 			return fmt.Errorf("raise exception: %w", err)
 		}
 
-		if _, err := tx.Exec(ctx, `UPDATE reconciliation_runs SET status = 'ExceptionsOpen' WHERE run_id = $1`, runID); err != nil {
-			return fmt.Errorf("mark run exceptions open: %w", err)
+		if _, err := settleResult(ctx, tx, tenantID, run, domain.RunRunning, "exception raised", actor); err != nil {
+			return err
 		}
 
 		out = got
@@ -891,9 +1041,9 @@ func (s *PgStore) Reperform(ctx context.Context, tenantID, runID string, actor s
 			return err
 		}
 
-		updated, err := scanRun(tx.QueryRow(ctx, `UPDATE reconciliation_runs SET status = 'Reperformed' WHERE run_id = $1 RETURNING `+runColumns, runID))
+		updated, err := settleResult(ctx, tx, tenantID, run, domain.RunReperformed, "reperformed", actor)
 		if err != nil {
-			return fmt.Errorf("mark run reperformed: %w", err)
+			return err
 		}
 		out = updated
 		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "reconciliation_run", AggregateID: runID,
@@ -930,6 +1080,7 @@ type certificationManifest struct {
 	MatchKeyFields              []string                          `json:"match_key_fields"`
 	BalanceDimensions           []string                          `json:"balance_dimensions"`
 	MaterialityAmountMinorUnits int64                             `json:"materiality_amount_minor_units"`
+	ResultState                 domain.ResultState                `json:"result_state"`
 	MatchedCount                int64                             `json:"matched_count"`
 	ExceptionCount              int64                             `json:"exception_count"`
 	ControlTotals               map[string][]domain.CurrencyTotal `json:"control_totals"`
@@ -981,7 +1132,10 @@ func (s *PgStore) Certify(ctx context.Context, tenantID, runID string, actor str
 		if err != nil {
 			return err
 		}
-		if run.Status != domain.RunRunning && run.Status != domain.RunReperformed && run.Status != domain.RunExceptionsOpen {
+		if run.Status == domain.RunPlanned {
+			return domain.ErrRunNotEvaluated
+		}
+		if !openRunStatuses()[run.Status] {
 			return domain.ErrRunNotOpen
 		}
 		openCount, err := openExceptionCount(ctx, tx, runID)
@@ -990,6 +1144,11 @@ func (s *PgStore) Certify(ctx context.Context, tenantID, runID string, actor str
 		}
 		if openCount > 0 {
 			return domain.ErrOpenExceptionsRemain
+		}
+		// Only a MATCH is certifiable (DQC-03, INV-26); the result is settled in
+		// the same transaction as every exception change, so ELIGIBLE is current.
+		if run.CertificationState != domain.CertEligible {
+			return domain.ErrRunNotEligible
 		}
 
 		claim.ResourceID = runID
@@ -1017,8 +1176,8 @@ func (s *PgStore) Certify(ctx context.Context, tenantID, runID string, actor str
 		manifest, err := json.Marshal(certificationManifest{
 			RunID: runID, DefinitionVersion: run.DefinitionVersion, AmountScale: run.AmountScale, Tolerance: run.Tolerance,
 			MatchKeyFields: run.MatchKeyFields, BalanceDimensions: run.BalanceDimensions,
-			MaterialityAmountMinorUnits: run.MaterialityAmountMinorUnits,
-			MatchedCount:                matchedCount, ExceptionCount: exceptionCount, ControlTotals: totals, SealedAt: sealedAt,
+			MaterialityAmountMinorUnits: run.MaterialityAmountMinorUnits, ResultState: run.ResultState,
+			MatchedCount: matchedCount, ExceptionCount: exceptionCount, ControlTotals: totals, SealedAt: sealedAt,
 		})
 		if err != nil {
 			return fmt.Errorf("marshal certification manifest: %w", err)
@@ -1035,8 +1194,9 @@ func (s *PgStore) Certify(ctx context.Context, tenantID, runID string, actor str
 			return fmt.Errorf("seal certification: %w", err)
 		}
 
-		if _, err := tx.Exec(ctx, `UPDATE reconciliation_runs SET status = 'Certified', certified_by = $2 WHERE run_id = $1`, runID, actor); err != nil {
-			return fmt.Errorf("certify run: %w", err)
+		if _, err := advanceRun(ctx, tx, tenantID, run, runAdvance{To: domain.RunCertified, Result: domain.ResultMatch,
+			Cert: domain.CertCertified, Reason: "certified", Actor: actor, CertifiedBy: &actor}); err != nil {
+			return err
 		}
 
 		out = cert
@@ -1117,12 +1277,17 @@ func (s *PgStore) SupersedeRun(ctx context.Context, tenantID, runID string, req 
 			return err
 		}
 
-		updated, err := scanRun(tx.QueryRow(ctx, `
-			UPDATE reconciliation_runs SET status = 'Superseded', superseded_by_run_id = $2, superseded_reason = $3, superseded_by = $4
-			WHERE run_id = $1 RETURNING `+runColumns,
-			runID, req.NewRunID, req.Reason, actor))
+		// The run's own result stays in its transition history and, if it was
+		// certified, in its sealed certification; only its current state moves.
+		cert := run.CertificationState
+		if cert == domain.CertCertified {
+			cert = domain.CertSuperseded
+		}
+		updated, err := advanceRun(ctx, tx, tenantID, run, runAdvance{To: domain.RunSuperseded, Result: domain.ResultSuperseded,
+			Cert: cert, Reason: "superseded by " + req.NewRunID + ": " + req.Reason, Actor: actor,
+			Supersession: &supersession{ByRunID: req.NewRunID, Reason: req.Reason, By: actor}})
 		if err != nil {
-			return fmt.Errorf("supersede run: %w", err)
+			return err
 		}
 		out = updated
 		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "reconciliation_run", AggregateID: runID,
@@ -1214,6 +1379,29 @@ func (s *PgStore) GetMatchResults(ctx context.Context, tenantID, runID string) (
 				return err
 			}
 			out = append(out, *m)
+		}
+		return rows.Err()
+	})
+	return out, err
+}
+
+func (s *PgStore) GetTransitions(ctx context.Context, tenantID, runID string) ([]domain.RunTransition, error) {
+	var out []domain.RunTransition
+	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT transition_id, run_id, dimension, from_state, to_state, reason, actor, occurred_at
+			FROM reconciliation_run_transitions WHERE tenant_id = $1 AND run_id = $2 ORDER BY transition_id`, tenantID, runID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var t domain.RunTransition
+			if err := rows.Scan(&t.TransitionID, &t.RunID, &t.Dimension, &t.FromState, &t.ToState, &t.Reason, &t.Actor,
+				&t.OccurredAt); err != nil {
+				return err
+			}
+			out = append(out, t)
 		}
 		return rows.Err()
 	})
