@@ -362,13 +362,10 @@ func TestGovernance_DatabaseRefusesIllegalWrites(t *testing.T) {
 		}
 	}
 
-	// Governance policies are rules: changing one is a new definition version.
-	req := defineRequest("gov-db", 0)
-	req.Materiality = domain.MaterialityPolicy{Currencies: map[string]int64{"USD": 1000}}
-	req.CertificationProfile = domain.CertificationProfile{PermitAcceptedRisk: true}
-	next, err := f.s.DefineReconciliation(f.ctx, orgA, req, "test-operator")
-	if err != nil || next.Version != def.Version+1 {
-		t.Fatalf("profile change: version %d (err=%v), want %d", next.Version, err, def.Version+1)
+	// Governance policies are rules: changing one is a new rule version.
+	next := f.publish(def, func(r *domain.RulesInput) { r.CertificationProfile.PermitAcceptedRisk = true })
+	if next.Version != def.Version+1 || !next.CertificationProfile.PermitAcceptedRisk {
+		t.Fatalf("profile change: version %d, want %d", next.Version, def.Version+1)
 	}
 }
 

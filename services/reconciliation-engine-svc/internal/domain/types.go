@@ -11,6 +11,7 @@ package domain
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -49,12 +50,16 @@ const SellerScope = "seller"
 
 // ── ReconciliationDefinition ────────────────────────────────────────────────
 
-// ReconciliationDefinition is the versioned, seller-managed rule set a
-// run is executed against — which two populations are compared (and where
-// they are read from), match keys, the fixed-point amount scale, tolerance
-// and materiality. A new StartRun copies the definition's CURRENT values
-// onto the run itself (frozen there), so editing a definition never reaches
-// back into a run already started against an earlier version.
+// ReconciliationDefinition is a reconciliation's stable identity — tenant,
+// legal entity and name — and the rule set currently in force for it.
+//
+// Rules live in immutable rule versions (rules.go, A11): a version is created
+// as a draft, approved by someone other than its creator, and governs runs
+// from its effective date. The rule fields below are the EFFECTIVE version's —
+// the latest approved version whose effective date has arrived — and Version
+// is its number; with no effective version they are empty and Version is 0,
+// and the definition cannot start a run. A run copies the effective version's
+// rules onto itself, so a later version never reaches back into it.
 //
 // LegalEntityID is the entity the definition and every run of it belong to;
 // authorization is evaluated against it (A10). It is fixed for the life of
@@ -64,20 +69,26 @@ type ReconciliationDefinition struct {
 	TenantID          string           `json:"tenant_id"`
 	LegalEntityID     string           `json:"legal_entity_id"`
 	Name              string           `json:"name"`
-	Populations       []PopulationSpec `json:"populations"`
-	MatchKeyFields    []string         `json:"match_key_fields"`
-	BalanceDimensions []string         `json:"balance_dimensions"`
+	Populations       []PopulationSpec `json:"populations,omitempty"`
+	MatchKeyFields    []string         `json:"match_key_fields,omitempty"`
+	BalanceDimensions []string         `json:"balance_dimensions,omitempty"`
 	AmountScale       int              `json:"amount_scale"`
 	Tolerance         TolerancePolicy  `json:"tolerance"`
-	// Materiality, ExceptionPolicy and CertificationProfile are nil only on
-	// definitions written before migration 000007, which cannot start runs.
+	// Materiality, ExceptionPolicy and CertificationProfile are nil when no
+	// rule version is effective.
 	Materiality          *MaterialityPolicy    `json:"materiality,omitempty"`
 	ExceptionPolicy      *ExceptionPolicy      `json:"exception_policy,omitempty"`
 	CertificationProfile *CertificationProfile `json:"certification_profile,omitempty"`
-	Version              int64                 `json:"version"`
-	CreatedAt            time.Time             `json:"created_at"`
-	CreatedBy            string                `json:"created_by"`
-	UpdatedAt            time.Time             `json:"updated_at"`
+	// Version is the effective rule version (0: none). RulesSHA256 and
+	// EffectiveFrom are that version's; LatestRuleVersion is the newest version
+	// in any state, which a new version must be based on.
+	Version           int64     `json:"version"`
+	RulesSHA256       string    `json:"rules_sha256,omitempty"`
+	EffectiveFrom     string    `json:"effective_from,omitempty"`
+	LatestRuleVersion int64     `json:"latest_rule_version"`
+	CreatedAt         time.Time `json:"created_at"`
+	CreatedBy         string    `json:"created_by"`
+	UpdatedAt         time.Time `json:"updated_at"`
 }
 
 // Legacy reports a definition created before migration 000004: it has no
@@ -85,69 +96,56 @@ type ReconciliationDefinition struct {
 // against an entity nor run.
 func (d ReconciliationDefinition) Legacy() bool { return d.LegalEntityID == "" }
 
-// Ungoverned reports a definition written before migration 000007: it has no
-// materiality, exception or certification policy, so its runs could raise
-// exceptions with no owner, severity or due date (A7). It cannot start runs.
-func (d ReconciliationDefinition) Ungoverned() bool {
-	return d.Materiality == nil || d.ExceptionPolicy == nil || d.CertificationProfile == nil
+// Runnable reports why the definition cannot start a run, if it cannot.
+func (d ReconciliationDefinition) Runnable() error {
+	if d.Legacy() {
+		return ErrLegacyRecord
+	}
+	if d.Version == 0 || d.Materiality == nil || d.ExceptionPolicy == nil || d.CertificationProfile == nil {
+		return ErrNoEffectiveRules
+	}
+	return nil
 }
 
-// DefineReconciliationRequest. Amounts (tolerance, materiality and every
-// population amount) are integers in units of 10^-amount_scale.
-// amount_scale is required, with no default, because the scale is part of
-// what "balanced" means (ZS-SVC-Z-001 INV-09, TC-05). Tolerance is per
-// currency (A2, A5); a currency without one must match exactly.
+// RuleSet returns the effective rules as a rule set (zero if none).
+func (d ReconciliationDefinition) RuleSet() RuleSet {
+	r := RuleSet{Populations: d.Populations, MatchKeyFields: d.MatchKeyFields, BalanceDimensions: d.BalanceDimensions,
+		AmountScale: d.AmountScale, Tolerance: d.Tolerance}
+	if d.Materiality != nil {
+		r.Materiality = *d.Materiality
+	}
+	if d.ExceptionPolicy != nil {
+		r.ExceptionPolicy = *d.ExceptionPolicy
+	}
+	if d.CertificationProfile != nil {
+		r.CertificationProfile = *d.CertificationProfile
+	}
+	return r
+}
+
+// DefineReconciliationRequest creates a definition and its first rule version,
+// as a draft awaiting approval. It never changes an existing definition: a
+// name already defined in the entity is refused (ErrDefinitionExists); new
+// rules for it are a new rule version.
 type DefineReconciliationRequest struct {
-	LegalEntityID     string           `json:"legal_entity_id"`
-	Name              string           `json:"name"`
-	Populations       []PopulationSpec `json:"populations"`
-	MatchKeyFields    []string         `json:"match_key_fields"`
-	BalanceDimensions []string         `json:"balance_dimensions,omitempty"`
-	AmountScale       *int             `json:"amount_scale"`
-	Tolerance         TolerancePolicy  `json:"tolerance"`
-	// Materiality is per currency (A4); a currency without a threshold is
-	// UNASSESSED. ExceptionPolicy is required (A7). CertificationProfile
-	// defaults to permitting no accepted risk.
-	Materiality          MaterialityPolicy    `json:"materiality"`
-	ExceptionPolicy      *ExceptionPolicy     `json:"exception_policy"`
-	CertificationProfile CertificationProfile `json:"certification_profile"`
+	LegalEntityID string `json:"legal_entity_id"`
+	Name          string `json:"name"`
+	RulesInput
+	EffectiveFrom string `json:"effective_from,omitempty"`
 }
 
 func (r DefineReconciliationRequest) Validate() error {
 	if !ValidUUID(r.LegalEntityID) {
 		return fmt.Errorf("%w: legal_entity_id must be a UUID", ErrInvalidArgument)
 	}
-	if r.Name == "" {
-		return fmt.Errorf("name is required")
+	if strings.TrimSpace(r.Name) == "" || len(r.Name) > 256 {
+		return fmt.Errorf("%w: name is required (at most 256 characters)", ErrInvalidArgument)
 	}
-	if err := ValidatePopulationSpecs(r.Populations); err != nil {
+	if err := ValidateEffectiveFrom(r.EffectiveFrom); err != nil {
 		return err
 	}
-	if err := ValidateMatchKeyFields(r.MatchKeyFields); err != nil {
-		return err
-	}
-	if err := ValidateBalanceDimensions(r.BalanceDimensions); err != nil {
-		return err
-	}
-	if err := r.Tolerance.Validate([]string{r.Populations[0].Side, r.Populations[1].Side}); err != nil {
-		return err
-	}
-	if r.AmountScale == nil {
-		return fmt.Errorf("%w: amount_scale is required", ErrInvalidArgument)
-	}
-	if *r.AmountScale < 0 || *r.AmountScale > MaxAmountScale {
-		return fmt.Errorf("%w: amount_scale must be between 0 and %d", ErrInvalidArgument, MaxAmountScale)
-	}
-	if err := r.Materiality.Validate(); err != nil {
-		return err
-	}
-	if r.ExceptionPolicy == nil {
-		return fmt.Errorf("%w: exception_policy is required", ErrInvalidArgument)
-	}
-	if err := r.ExceptionPolicy.Validate(); err != nil {
-		return err
-	}
-	return nil
+	_, err := r.RulesInput.RuleSet()
+	return err
 }
 
 // ── ReconciliationRun / PopulationSnapshot ──────────────────────────────────
@@ -170,11 +168,14 @@ const (
 // ResultState and CertificationState are the other two state dimensions
 // (state.go). A Failed run carries why it could not determine a result.
 type ReconciliationRun struct {
-	RunID                string                `json:"run_id"`
-	TenantID             string                `json:"tenant_id"`
-	LegalEntityID        string                `json:"legal_entity_id"`
-	DefinitionID         string                `json:"definition_id"`
-	DefinitionVersion    int64                 `json:"definition_version"`
+	RunID             string `json:"run_id"`
+	TenantID          string `json:"tenant_id"`
+	LegalEntityID     string `json:"legal_entity_id"`
+	DefinitionID      string `json:"definition_id"`
+	DefinitionVersion int64  `json:"definition_version"`
+	// RulesSHA256 is the digest of the rule version the run pinned (A11);
+	// empty on runs started before migration 000008.
+	RulesSHA256          string                `json:"rules_sha256,omitempty"`
 	Status               RunStatus             `json:"status"`
 	ResultState          ResultState           `json:"result_state"`
 	CertificationState   CertificationState    `json:"certification_state"`

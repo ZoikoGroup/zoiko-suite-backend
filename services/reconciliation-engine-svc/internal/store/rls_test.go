@@ -45,6 +45,7 @@ func openAdminPool(t *testing.T) *pgxpool.Pool {
 	t.Cleanup(pool.Close)
 
 	_, _ = pool.Exec(ctx, `
+		DROP TABLE IF EXISTS reconciliation_rule_versions CASCADE;
 		DROP TABLE IF EXISTS reconciliation_exception_transitions CASCADE;
 		DROP TABLE IF EXISTS reconciliation_run_transitions CASCADE;
 		DROP TABLE IF EXISTS outbox_events CASCADE;
@@ -61,6 +62,7 @@ func openAdminPool(t *testing.T) *pgxpool.Pool {
 		DROP FUNCTION IF EXISTS enforce_run_lifecycle() CASCADE;
 		DROP FUNCTION IF EXISTS enforce_run_creation() CASCADE;
 		DROP FUNCTION IF EXISTS enforce_run_governance_pinned() CASCADE;
+		DROP FUNCTION IF EXISTS guard_rule_version() CASCADE;
 		DROP FUNCTION IF EXISTS enforce_definition_versioning() CASCADE;`)
 
 	_, thisFile, _, _ := runtime.Caller(0)
@@ -172,22 +174,67 @@ func testSpecs() []domain.PopulationSpec {
 
 func defineRequest(name string, toleranceMinor int64) domain.DefineReconciliationRequest {
 	scale := 2
-	return domain.DefineReconciliationRequest{
-		LegalEntityID: entityA, Name: name, Populations: testSpecs(), MatchKeyFields: []string{"ref_id"},
+	return domain.DefineReconciliationRequest{LegalEntityID: entityA, Name: name, RulesInput: domain.RulesInput{
+		Populations: testSpecs(), MatchKeyFields: []string{"ref_id"},
 		AmountScale: &scale, Materiality: domain.MaterialityPolicy{Currencies: map[string]int64{"USD": 100000}},
 		ExceptionPolicy: &domain.ExceptionPolicy{OwnerRole: "recon-owner",
 			SLADays: map[domain.Severity]int{domain.SeverityBlocker: 1, domain.SeverityError: 3, domain.SeverityWarning: 10}},
 		Tolerance: domain.TolerancePolicy{Currencies: map[string]domain.CurrencyTolerance{"USD": {AbsoluteMinorUnits: &toleranceMinor}}},
-	}
+	}}
 }
 
 func (f *fixture) defineReconciliation(org, name string, toleranceMinor int64) *domain.ReconciliationDefinition {
 	f.t.Helper()
-	d, err := f.s.DefineReconciliation(f.ctx, org, defineRequest(name, toleranceMinor), "test-operator")
+	return f.defineApproved(org, defineRequest(name, toleranceMinor))
+}
+
+// defineApproved defines a reconciliation and has a second principal approve
+// its first rule version, so it can run.
+func (f *fixture) defineApproved(org string, req domain.DefineReconciliationRequest) *domain.ReconciliationDefinition {
+	f.t.Helper()
+	d, err := f.s.DefineReconciliation(f.ctx, org, req, "test-operator", f.claim("DefineReconciliation", req.Name))
 	if err != nil {
-		f.t.Fatalf("define reconciliation %s: %v", name, err)
+		f.t.Fatalf("define reconciliation %s: %v", req.Name, err)
+	}
+	return f.approve(org, d.DefinitionID, 1)
+}
+
+func (f *fixture) approve(org, definitionID string, version int64) *domain.ReconciliationDefinition {
+	f.t.Helper()
+	if _, err := f.s.ApproveRuleVersion(f.ctx, org, definitionID, version, "rule-approver",
+		f.claim("ApproveRuleVersion", definitionID)); err != nil {
+		f.t.Fatalf("approve rule version %d: %v", version, err)
+	}
+	d, err := f.s.GetDefinition(f.ctx, org, definitionID)
+	if err != nil {
+		f.t.Fatal(err)
 	}
 	return d
+}
+
+// publish creates the next rule version from the definition's current rules
+// changed by mutate, and has it approved; it returns the definition after.
+func (f *fixture) publish(def *domain.ReconciliationDefinition, mutate func(*domain.RulesInput)) *domain.ReconciliationDefinition {
+	f.t.Helper()
+	v, err := f.s.CreateRuleVersion(f.ctx, orgA, def.DefinitionID, f.nextVersion(def, mutate), "test-operator",
+		f.claim("CreateRuleVersion", def.DefinitionID))
+	if err != nil {
+		f.t.Fatalf("create rule version: %v", err)
+	}
+	return f.approve(orgA, def.DefinitionID, v.RuleVersion)
+}
+
+func (f *fixture) nextVersion(def *domain.ReconciliationDefinition, mutate func(*domain.RulesInput)) domain.CreateRuleVersionRequest {
+	rs := def.RuleSet()
+	scale, pol := rs.AmountScale, rs.ExceptionPolicy
+	in := domain.RulesInput{Populations: rs.Populations, MatchKeyFields: rs.MatchKeyFields, BalanceDimensions: rs.BalanceDimensions,
+		AmountScale: &scale, Tolerance: rs.Tolerance, Materiality: rs.Materiality, ExceptionPolicy: &pol,
+		CertificationProfile: rs.CertificationProfile}
+	if mutate != nil {
+		mutate(&in)
+	}
+	based := def.LatestRuleVersion
+	return domain.CreateRuleVersionRequest{BasedOnVersion: &based, RulesInput: in, Reason: "test change"}
 }
 
 // testPop is one side's items as a test writes them; frozen() turns it into

@@ -10,6 +10,7 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -17,6 +18,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -39,6 +41,9 @@ const (
 	// exception as risk (ZS-SVC-Z-001 DQC-05; ZS-CONTROL-001 scenario 24 "waived
 	// without authority — command rejected"). It is separate from MANAGE.
 	ActionReconciliationAcceptRisk = "RECONCILIATION_ACCEPT_RISK"
+	// ActionReconciliationApproveRules approves a rule version — separate from
+	// publishing it (DATA-07 "rule publication separated from … approval").
+	ActionReconciliationApproveRules = "RECONCILIATION_APPROVE_RULES"
 )
 
 // populationReadTimeout bounds reading both populations of a StartRun. The
@@ -90,6 +95,10 @@ func NewRouter(h *Handler) http.Handler {
 
 func (h *Handler) routes(r chi.Router) {
 	r.Post("/definitions", h.DefineReconciliation)
+	r.Get("/definitions/{definitionID}", h.GetDefinition)
+	r.Post("/definitions/{definitionID}/rule-versions", h.CreateRuleVersion)
+	r.Get("/definitions/{definitionID}/rule-versions", h.ListRuleVersions)
+	r.Post("/definitions/{definitionID}/rule-versions/{version}/approve", h.ApproveRuleVersion)
 	r.Post("/runs", h.StartRun)
 	r.Get("/runs/{runID}", h.GetRun)
 	r.Post("/runs/{runID}:match", h.Match)
@@ -207,18 +216,35 @@ func (h *Handler) idempotencyClaim(principalID, operation, resourceID, requestSH
 
 // ── Commands ─────────────────────────────────────────────────────────────────
 
+// readStrict decodes the body refusing unknown fields — a client still
+// sending a removed field (tolerance_amount_minor_units, materiality_amount_
+// minor_units) is told so instead of silently getting a different rule — and
+// returns the body's hash for the idempotency claim.
+func (h *Handler) readStrict(r *http.Request, v interface{}) (string, error) {
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
+		return "", err
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+// DefineReconciliation creates a definition and its first rule version as a
+// draft; it cannot run until someone else approves that version.
 func (h *Handler) DefineReconciliation(w http.ResponseWriter, r *http.Request) {
 	tenantID := customMiddleware.GetTenantID(r.Context())
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
 	}
-	// Unknown fields are refused: a client still sending the pre-000005
-	// tolerance_amount_minor_units would otherwise get exact matching silently.
 	var req domain.DefineReconciliationRequest
-	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&req); err != nil {
+	reqHash, err := h.readStrict(r, &req)
+	if err != nil {
 		h.respondError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 		return
 	}
@@ -231,7 +257,101 @@ func (h *Handler) DefineReconciliation(w http.ResponseWriter, r *http.Request) {
 	if !h.authorize(w, r, principalID, req.LegalEntityID, ActionReconciliationManage) {
 		return
 	}
-	got, err := h.store.DefineReconciliation(r.Context(), tenantID, req, principalID)
+	claim := h.idempotencyClaim(principalID, "DefineReconciliation", req.LegalEntityID+"|"+req.Name, reqHash, r.Header.Get("Idempotency-Key"))
+	got, err := h.store.DefineReconciliation(r.Context(), tenantID, req, principalID, claim)
+	if err != nil {
+		h.respondFromError(w, err)
+		return
+	}
+	h.respondJSON(w, http.StatusCreated, got)
+}
+
+// authorizeDefinition loads the definition and authorizes the caller against
+// its legal entity.
+func (h *Handler) authorizeDefinition(w http.ResponseWriter, r *http.Request, action string) (*domain.ReconciliationDefinition, string, string, bool) {
+	tenantID := customMiddleware.GetTenantID(r.Context())
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return nil, "", "", false
+	}
+	def, err := h.store.GetDefinition(r.Context(), tenantID, chi.URLParam(r, "definitionID"))
+	if err != nil {
+		h.respondFromError(w, err)
+		return nil, "", "", false
+	}
+	if !h.authorize(w, r, principalID, def.LegalEntityID, action) {
+		return nil, "", "", false
+	}
+	return def, tenantID, principalID, true
+}
+
+// GetDefinition returns the definition with its effective rules (the latest
+// approved version in effect; none → version 0) and its latest version number.
+func (h *Handler) GetDefinition(w http.ResponseWriter, r *http.Request) {
+	def, _, _, ok := h.authorizeDefinition(w, r, ActionReconciliationRead)
+	if !ok {
+		return
+	}
+	h.respondJSON(w, http.StatusOK, def)
+}
+
+// CreateRuleVersion publishes a draft rule version based on the definition's
+// latest version.
+func (h *Handler) CreateRuleVersion(w http.ResponseWriter, r *http.Request) {
+	var req domain.CreateRuleVersionRequest
+	reqHash, err := h.readStrict(r, &req)
+	if err != nil {
+		h.respondError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	if err := req.Validate(); err != nil {
+		h.respondFromError(w, err)
+		return
+	}
+	def, tenantID, principalID, ok := h.authorizeDefinition(w, r, ActionReconciliationManage)
+	if !ok {
+		return
+	}
+	claim := h.idempotencyClaim(principalID, "CreateRuleVersion", def.DefinitionID, reqHash, r.Header.Get("Idempotency-Key"))
+	got, err := h.store.CreateRuleVersion(r.Context(), tenantID, def.DefinitionID, req, principalID, claim)
+	if err != nil {
+		h.respondFromError(w, err)
+		return
+	}
+	h.respondJSON(w, http.StatusCreated, got)
+}
+
+func (h *Handler) ListRuleVersions(w http.ResponseWriter, r *http.Request) {
+	def, tenantID, _, ok := h.authorizeDefinition(w, r, ActionReconciliationRead)
+	if !ok {
+		return
+	}
+	items, err := h.store.ListRuleVersions(r.Context(), tenantID, def.DefinitionID)
+	if err != nil {
+		h.respondFromError(w, err)
+		return
+	}
+	if items == nil {
+		items = []domain.RuleVersion{}
+	}
+	h.respondJSON(w, http.StatusOK, map[string]interface{}{"data": items, "count": len(items)})
+}
+
+// ApproveRuleVersion records the independent approval of a draft. Authority is
+// evaluated at the moment of approval, against the definition's entity.
+func (h *Handler) ApproveRuleVersion(w http.ResponseWriter, r *http.Request) {
+	version, err := strconv.ParseInt(chi.URLParam(r, "version"), 10, 64)
+	if err != nil || version < 1 {
+		h.respondError(w, http.StatusBadRequest, "version must be a positive integer")
+		return
+	}
+	def, tenantID, principalID, ok := h.authorizeDefinition(w, r, ActionReconciliationApproveRules)
+	if !ok {
+		return
+	}
+	claim := h.idempotencyClaim(principalID, "ApproveRuleVersion", def.DefinitionID+"|"+chi.URLParam(r, "version"), "",
+		r.Header.Get("Idempotency-Key"))
+	got, err := h.store.ApproveRuleVersion(r.Context(), tenantID, def.DefinitionID, version, principalID, claim)
 	if err != nil {
 		h.respondFromError(w, err)
 		return
@@ -268,6 +388,10 @@ func (h *Handler) StartRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !h.authorize(w, r, principalID, def.LegalEntityID, ActionReconciliationManage) {
+		return
+	}
+	if err := def.Runnable(); err != nil {
+		h.respondFromError(w, err)
 		return
 	}
 	claim := h.idempotencyClaim(principalID, "StartRun", req.DefinitionID, reqHash, r.Header.Get("Idempotency-Key"))
@@ -637,10 +761,10 @@ func (h *Handler) respondFromError(w http.ResponseWriter, err error) {
 		return
 	}
 	switch {
-	case errors.Is(err, domain.ErrNotExceptionOwner), errors.Is(err, domain.ErrNotIndependent):
+	case errors.Is(err, domain.ErrNotExceptionOwner), errors.Is(err, domain.ErrNotIndependent), errors.Is(err, domain.ErrSelfApproval):
 		h.respondError(w, http.StatusForbidden, err.Error())
 	case errors.Is(err, domain.ErrDefinitionNotFound), errors.Is(err, domain.ErrRunNotFound),
-		errors.Is(err, domain.ErrItemNotFound), errors.Is(err, domain.ErrExceptionNotFound):
+		errors.Is(err, domain.ErrItemNotFound), errors.Is(err, domain.ErrExceptionNotFound), errors.Is(err, domain.ErrRuleVersionNotFound):
 		h.respondError(w, http.StatusNotFound, err.Error())
 	case errors.Is(err, domain.ErrRunNotOpen), errors.Is(err, domain.ErrOpenExceptionsRemain),
 		errors.Is(err, domain.ErrRunImmutable), errors.Is(err, domain.ErrExceptionAlreadyClosed),
@@ -648,7 +772,9 @@ func (h *Handler) respondFromError(w http.ResponseWriter, err error) {
 		errors.Is(err, domain.ErrLegacyRecord), errors.Is(err, domain.ErrSupersedeDifferentDefinition),
 		errors.Is(err, domain.ErrReplacementNotTerminal), errors.Is(err, domain.ErrReplacementAlreadyUsed),
 		errors.Is(err, domain.ErrInvalidTransition), errors.Is(err, domain.ErrRunNotEvaluated),
-		errors.Is(err, domain.ErrRunNotEligible):
+		errors.Is(err, domain.ErrRunNotEligible), errors.Is(err, domain.ErrNoEffectiveRules),
+		errors.Is(err, domain.ErrDefinitionExists), errors.Is(err, domain.ErrRuleVersionConflict),
+		errors.Is(err, domain.ErrRuleVersionApproved), errors.Is(err, domain.ErrBackdatedRuleVersion):
 		h.respondError(w, http.StatusConflict, err.Error())
 	default:
 		h.logger.Error("reconciliation-engine-svc request failed", zap.Error(err))

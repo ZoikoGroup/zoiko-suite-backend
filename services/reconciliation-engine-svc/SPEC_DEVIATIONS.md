@@ -27,12 +27,18 @@ Failed / INDETERMINATE (B18–B19). Exceptions are owned, classified,
 severity-graded against a per-currency materiality, due by an SLA and follow
 a governed lifecycle; accepted risk is a separate, authorized path that keeps
 the result VARIANCE, and unresolved exposure is assessed in aggregate
-(B21–B24). Still missing: rounding and business-day tolerance and reconciling
-items (A5), maker-checker beyond accepting risk (A9), recurrence and
-qualitative materiality (A4 remainder), and any defined meaning for a PARTIAL
-result (A16). Defects fixed: B1–B4; Stage 1 closed A1, A10, A13 and A14
-(B7–B12); Stage 2 closed A2 and A3 and most of A5 (B13–B17); Stage 3 closed
-A6 (B18–B20) and A7 and most of A4 (B21–B25).
+(B21–B24). Rules are immutable, digest-sealed rule versions, approved by
+someone other than their author and in effect from their effective date; a
+run pins the version in effect (B26). Still missing: rounding and
+business-day tolerance and reconciling items (A5), maker-checker beyond
+accepting risk and approving rules (A9), recurrence and
+qualitative materiality (A4 remainder), a meaningful reperformance (A8),
+certification evidence and revocation (A12, out of scope for this change),
+and two questions the specs leave open: how absolute and percentage
+tolerance combine (A15) and what defines a PARTIAL result (A16). Defects
+fixed: B1–B4; Stage 1 closed A1, A10, A13 and A14 (B7–B12); Stage 2
+closed A2 and A3 and most of A5 (B13–B17); Stage 3 closed A6 (B18–B20) and A7
+and most of A4 (B21–B25); Stage 4 closed A11 (B26–B27).
 
 ## A. Not implemented / weaker than the spec
 
@@ -74,7 +80,9 @@ A6 (B18–B20) and A7 and most of A4 (B21–B25).
   linked to this one. Scope: define reperformance as "start a linked run and
   supersede on certification", or remove the command.
 - **A9. No maker-checker or separated permissions** (except accepting risk,
-  which has its own action and independence rule — B22). Every other command
+  which has its own action and independence rule — B22 — and approving a rule
+  version, which has its own action and may not be done by the version's
+  author — B26). Every other command
   uses one action, `RECONCILIATION_MANAGE`, so the same principal can define the
   rules, start the run, manually match, and certify it (ZS-CONTROL-001
   Invariant 12, §27; DATA-07 "configuration/rule publication separated from
@@ -82,16 +90,12 @@ A6 (B18–B20) and A7 and most of A4 (B21–B25).
   match, certify) and refuse a certifier who started the run or made a manual
   match in it, under the run's row lock.
 - **A10. Closed** — definitions and runs carry `legal_entity_id`; see B9.
-- **A11. Definitions are upserted in place, without history or approval.**
-  Re-posting a name (within its legal entity) overwrites its rules, now
-  including its populations and amount scale (the version increments on a rule change — B4 —
-  but the previous rules are not kept, so a run's `definition_version` can be
-  matched only against the copy frozen on the run itself). No approval step,
-  no effective dating (ZS-SVC-Z-001 INV-01/22, ZS-CONTROL-001 Invariant 4).
-  There is also no read endpoint for definitions.
+- **A11. Closed** — rule versions with independent approval and effective
+  dating, and definition reads; see B26.
 - **A12. Certification is thin.** The sealed manifest records counts, the
-  pinned tolerance/materiality, the definition version and (since B22) the
-  result and the assessment with every accepted risk — not the
+  pinned tolerance/materiality, the definition (rule) version and its rules
+  digest (B26), and (since B22) the result and the assessment with every
+  accepted risk — not the
   population hashes, the manual matches with their reasons, or the certifier's
   authority (ZS-SVC-Z-001 INV-21, DQC-05 "certification binds exact
   evidence"; ZS-CONTROL-001 Invariant 9). No revocation.
@@ -543,3 +547,71 @@ A6 (B18–B20) and A7 and most of A4 (B21–B25).
   definition. Migration 000007 was round-tripped on a database holding
   exceptions, with the down refusal exercised and the status renames checked
   both ways.
+- **B26. Rule versions with independent approval and effective dating
+  (closes A11).** Copied from financial-control-svc's control rule versions
+  (`CreateRuleVersion` / `ApproveRuleVersion`). A definition row is now its
+  identity only — tenant, legal entity, name — and is immutable (trigger); its
+  rules are an append-only series in `reconciliation_rule_versions`, each a
+  complete rule document (populations, match key, balance dimensions, amount
+  scale, tolerance, materiality, exception policy, certification profile)
+  sealed with the SHA-256 of its canonical encoding. Endpoints:
+  `POST /definitions` creates the definition and its rule version 1 as a
+  draft (a name already defined in the entity is now refused with 409 —
+  rules are never overwritten in place); `GET /definitions/{id}` returns the
+  definition with the rules *in effect*, their version, digest and effective
+  date, and `latest_rule_version`; `POST /definitions/{id}/rule-versions`
+  publishes a draft and must carry `based_on_version` = the latest version
+  (DATA-07 "optimistic version checks on … rule … changes"; stale → 409) and a
+  reason; `GET /definitions/{id}/rule-versions` lists the history;
+  `POST /definitions/{id}/rule-versions/{version}/approve` approves a draft.
+  Approval needs the separate action `RECONCILIATION_APPROVE_RULES`, checked on
+  the definition's entity at the moment of approval (DATA-07 "rule
+  publication separated from evaluation/release approval"; ZS-CONTROL-001
+  Invariant 11), may not be given by the version's author (domain check and a
+  CHECK constraint), happens once, and makes the version immutable (trigger;
+  versions are never deleted). The version *in effect* is the approved one
+  with the latest `effective_from` that is not in the future (the database's
+  current date), and among equal dates the highest version; StartRun refuses a
+  definition with none (409, before any source is read), pins that version's
+  number as `definition_version` and its digest as `rules_sha256` (pinned by
+  trigger; also in the certification manifest), and is refused if another
+  version took effect while its populations were read (ErrDefinitionChanged,
+  as before). Two deviations from the reference a reviewer may want to undo:
+  (a) the reference picks the highest approved version among those
+  effective, whatever its date; here the latest effective *date* governs, so
+  a version can be scheduled ahead without displacing the one in force — and,
+  so that no approved version is silently unreachable, a version dated before
+  the version in effect is refused at creation and at approval (409); (b) the
+  effective date is evaluated when a run starts, not against the run's
+  period, as in the reference — the specs do not say which. Every load
+  re-hashes the stored rules and refuses a version whose digest no longer
+  matches (tamper evidence below the trigger). Definitions from before
+  migration 000008 get **no** rule version: their rules were never approved
+  and an approval cannot be invented, so they cannot run until a version is
+  published (numbering continues above their old in-place version) and
+  approved by someone else — which is also the way out for the pre-000007
+  definitions B24 made unrunnable. Runs already started keep what they pinned.
+  Version-change events: `CONTROL.RuleVersionPublished`,
+  `CONTROL.RuleVersionApproved` (names mirror the reference; DATA-07 lists no
+  definition events).
+- **B27. Verification of B26.** Unit tests in `internal/domain` for the
+  canonical digest (absent vs. empty collections, map order, a JSON round
+  trip, a rule change), request validation and runnability; handler tests
+  that approval is checked against `RECONCILIATION_APPROVE_RULES` on the
+  definition's entity and a denial approves nothing, that a definition read
+  is authorized on its entity, and that a definition with no approved rules
+  starts nothing and reads no source. Integration tests: a draft-only
+  definition cannot run; self-approval, double approval and approving a
+  missing version are refused; a run pins the approved digest; a draft does
+  not displace the version in effect and a stale `based_on_version` is
+  refused; a future-dated version does not take effect early, a backdated one
+  is refused, and a same-day one takes over once approved; history is kept
+  with distinct digests and a run keeps the version it started under; a
+  pre-000008 definition's numbering continues; direct SQL refused for editing
+  an approved or draft version, self-approving, deleting a version, editing a
+  definition row and changing a run's pinned digest; tampering below the
+  trigger caught by the digest on read; rule versions tenant-isolated. Tests
+  that relied on in-place redefinition now publish and approve versions; the
+  redefinition test now asserts the refusal. Migration 000008 was applied over
+  a 000007 database holding a definition with in-place rules (left untouched,
+  given no version), round-tripped, and its down refusal exercised.

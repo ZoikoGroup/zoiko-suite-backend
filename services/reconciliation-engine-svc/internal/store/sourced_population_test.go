@@ -63,7 +63,10 @@ func TestStartRun_PinsSourceEvidence(t *testing.T) {
 func TestStartRun_RefusesWhenDefinitionChangedDuringRead(t *testing.T) {
 	f := newFixture(t)
 	def := f.defineReconciliation(orgA, "moving", 0)
-	f.defineReconciliation(orgA, "moving", 50) // rule change: version + 1
+	tol := int64(50)
+	f.publish(def, func(r *domain.RulesInput) { // v2 approved and in effect
+		r.Tolerance.Currencies["USD"] = domain.CurrencyTolerance{AbsoluteMinorUnits: &tol}
+	})
 	if _, err := f.startRunE(orgA, def, cleanPops()); !errors.Is(err, domain.ErrDefinitionChanged) {
 		t.Fatalf("start against a stale definition version: %v", err)
 	}
@@ -142,10 +145,7 @@ func TestLegalEntity_ScopesDefinitionsAndRuns(t *testing.T) {
 	a := f.defineReconciliation(orgA, "shared-name", 0)
 	reqB := defineRequest("shared-name", 0)
 	reqB.LegalEntityID = entityB
-	b, err := f.s.DefineReconciliation(f.ctx, orgA, reqB, "test-operator")
-	if err != nil {
-		t.Fatalf("define in entity B: %v", err)
-	}
+	b := f.defineApproved(orgA, reqB)
 	if a.DefinitionID == b.DefinitionID || a.LegalEntityID != entityA || b.LegalEntityID != entityB {
 		t.Fatalf("one name in two entities must be two definitions: %+v / %+v", a, b)
 	}
@@ -182,22 +182,38 @@ func TestLegalEntity_ScopesDefinitionsAndRuns(t *testing.T) {
 	}
 }
 
-// Populations and the amount scale are rules: changing them is a new version.
-func TestDefinitionVersion_CoversPopulationsAndScale(t *testing.T) {
+// A11: every rule change is a new, immutable version; earlier versions are
+// kept, each with its own digest, and a run pins the version it started under.
+func TestRuleVersions_HistoryIsKept(t *testing.T) {
 	f := newFixture(t)
 	first := f.defineReconciliation(orgA, "rules", 0)
+	run := f.startRun(orgA, first, cleanPops())
 
-	req := defineRequest("rules", 0)
-	req.Populations[1].Params = map[string]string{"account_codes": "1100,1200"}
-	second, err := f.s.DefineReconciliation(f.ctx, orgA, req, "test-operator")
-	if err != nil || second.Version != first.Version+1 {
-		t.Fatalf("population change: version %d (err=%v), want %d", second.Version, err, first.Version+1)
-	}
+	second := f.publish(first, func(r *domain.RulesInput) {
+		r.Populations[1].Params = map[string]string{"account_codes": "1100,1200"}
+	})
 	scale := 3
-	req.AmountScale = &scale
-	third, err := f.s.DefineReconciliation(f.ctx, orgA, req, "test-operator")
-	if err != nil || third.Version != second.Version+1 {
-		t.Fatalf("scale change: version %d (err=%v), want %d", third.Version, err, second.Version+1)
+	third := f.publish(second, func(r *domain.RulesInput) { r.AmountScale = &scale })
+	if second.Version != 2 || third.Version != 3 || third.AmountScale != 3 || second.Populations[1].Params["account_codes"] != "1100,1200" {
+		t.Fatalf("versions: %d / %d %+v", second.Version, third.Version, third)
+	}
+	versions, err := f.s.ListRuleVersions(f.ctx, orgA, first.DefinitionID)
+	if err != nil || len(versions) != 3 {
+		t.Fatalf("history: %d versions (err=%v)", len(versions), err)
+	}
+	digests := map[string]bool{}
+	for _, v := range versions {
+		digests[v.RulesSHA256] = true
+		if v.Status != "APPROVED" || v.ApprovedBy == nil || *v.ApprovedBy == v.CreatedBy {
+			t.Fatalf("version %d approval: %+v", v.RuleVersion, v)
+		}
+	}
+	if len(digests) != 3 || versions[0].Rules.AmountScale != 2 {
+		t.Fatalf("earlier versions must be kept as they were: %+v", versions)
+	}
+	pinned, _ := f.s.GetRun(f.ctx, orgA, run.RunID)
+	if pinned.DefinitionVersion != 1 || pinned.RulesSHA256 != versions[0].RulesSHA256 || pinned.AmountScale != 2 {
+		t.Fatalf("the run must keep the version it started under: %+v", pinned)
 	}
 }
 

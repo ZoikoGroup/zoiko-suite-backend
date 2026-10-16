@@ -11,8 +11,8 @@ func spec(side string) PopulationSpec {
 
 func defineReq(pops ...PopulationSpec) DefineReconciliationRequest {
 	scale := 2
-	return DefineReconciliationRequest{LegalEntityID: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", Name: "n", Populations: pops,
-		MatchKeyFields: []string{"ref_id"}, AmountScale: &scale, ExceptionPolicy: testExceptionPolicy()}
+	return DefineReconciliationRequest{LegalEntityID: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", Name: "n", RulesInput: RulesInput{
+		Populations: pops, MatchKeyFields: []string{"ref_id"}, AmountScale: &scale, ExceptionPolicy: testExceptionPolicy()}}
 }
 
 func testExceptionPolicy() *ExceptionPolicy {
