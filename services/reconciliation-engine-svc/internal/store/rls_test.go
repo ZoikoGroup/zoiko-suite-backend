@@ -170,7 +170,8 @@ func defineRequest(name string, toleranceMinor int64) domain.DefineReconciliatio
 	scale := 2
 	return domain.DefineReconciliationRequest{
 		LegalEntityID: entityA, Name: name, Populations: testSpecs(), MatchKeyFields: []string{"ref_id"},
-		AmountScale: &scale, ToleranceAmountMinorUnits: toleranceMinor, MaterialityAmountMinorUnits: 100000,
+		AmountScale: &scale, MaterialityAmountMinorUnits: 100000,
+		Tolerance: domain.TolerancePolicy{Currencies: map[string]domain.CurrencyTolerance{"USD": {AbsoluteMinorUnits: &toleranceMinor}}},
 	}
 }
 

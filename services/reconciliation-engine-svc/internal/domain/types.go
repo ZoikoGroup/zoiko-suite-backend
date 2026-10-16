@@ -9,6 +9,7 @@
 package domain
 
 import (
+	"encoding/json"
 	"fmt"
 	"time"
 )
@@ -65,8 +66,9 @@ type ReconciliationDefinition struct {
 	Name                        string           `json:"name"`
 	Populations                 []PopulationSpec `json:"populations"`
 	MatchKeyFields              []string         `json:"match_key_fields"`
+	BalanceDimensions           []string         `json:"balance_dimensions"`
 	AmountScale                 int              `json:"amount_scale"`
-	ToleranceAmountMinorUnits   int64            `json:"tolerance_amount_minor_units"`
+	Tolerance                   TolerancePolicy  `json:"tolerance"`
 	MaterialityAmountMinorUnits int64            `json:"materiality_amount_minor_units"`
 	Version                     int64            `json:"version"`
 	CreatedAt                   time.Time        `json:"created_at"`
@@ -82,14 +84,16 @@ func (d ReconciliationDefinition) Legacy() bool { return d.LegalEntityID == "" }
 // DefineReconciliationRequest. Amounts (tolerance, materiality and every
 // population amount) are integers in units of 10^-amount_scale.
 // amount_scale is required, with no default, because the scale is part of
-// what "balanced" means (ZS-SVC-Z-001 INV-09, TC-05).
+// what "balanced" means (ZS-SVC-Z-001 INV-09, TC-05). Tolerance is per
+// currency (A2, A5); a currency without one must match exactly.
 type DefineReconciliationRequest struct {
 	LegalEntityID               string           `json:"legal_entity_id"`
 	Name                        string           `json:"name"`
 	Populations                 []PopulationSpec `json:"populations"`
 	MatchKeyFields              []string         `json:"match_key_fields"`
+	BalanceDimensions           []string         `json:"balance_dimensions,omitempty"`
 	AmountScale                 *int             `json:"amount_scale"`
-	ToleranceAmountMinorUnits   int64            `json:"tolerance_amount_minor_units"`
+	Tolerance                   TolerancePolicy  `json:"tolerance"`
 	MaterialityAmountMinorUnits int64            `json:"materiality_amount_minor_units"`
 }
 
@@ -103,17 +107,20 @@ func (r DefineReconciliationRequest) Validate() error {
 	if err := ValidatePopulationSpecs(r.Populations); err != nil {
 		return err
 	}
-	if len(r.MatchKeyFields) == 0 {
-		return fmt.Errorf("match_key_fields is required")
+	if err := ValidateMatchKeyFields(r.MatchKeyFields); err != nil {
+		return err
+	}
+	if err := ValidateBalanceDimensions(r.BalanceDimensions); err != nil {
+		return err
+	}
+	if err := r.Tolerance.Validate([]string{r.Populations[0].Side, r.Populations[1].Side}); err != nil {
+		return err
 	}
 	if r.AmountScale == nil {
 		return fmt.Errorf("%w: amount_scale is required", ErrInvalidArgument)
 	}
 	if *r.AmountScale < 0 || *r.AmountScale > MaxAmountScale {
 		return fmt.Errorf("%w: amount_scale must be between 0 and %d", ErrInvalidArgument, MaxAmountScale)
-	}
-	if r.ToleranceAmountMinorUnits < 0 {
-		return fmt.Errorf("tolerance_amount_minor_units cannot be negative")
 	}
 	if r.MaterialityAmountMinorUnits < 0 {
 		return fmt.Errorf("materiality_amount_minor_units cannot be negative")
@@ -142,8 +149,8 @@ const (
 // be widened during a certified run" acceptance test — enforced as a
 // strict subset of "nothing about a certified run can change at all").
 type ReconciliationRun struct {
-	RunID                       string     `json:"run_id"`
-	TenantID                    string     `json:"tenant_id"`
+	RunID                       string            `json:"run_id"`
+	TenantID                    string            `json:"tenant_id"`
 	LegalEntityID               string            `json:"legal_entity_id"`
 	DefinitionID                string            `json:"definition_id"`
 	DefinitionVersion           int64             `json:"definition_version"`
@@ -151,17 +158,19 @@ type ReconciliationRun struct {
 	PeriodID                    string            `json:"period_id,omitempty"`
 	Scope                       map[string]string `json:"scope,omitempty"`
 	AmountScale                 int               `json:"amount_scale"`
-	ToleranceAmountMinorUnits   int64             `json:"tolerance_amount_minor_units"`
+	MatchKeyFields              []string          `json:"match_key_fields,omitempty"`
+	BalanceDimensions           []string          `json:"balance_dimensions,omitempty"`
+	Tolerance                   *TolerancePolicy  `json:"tolerance,omitempty"`
 	MaterialityAmountMinorUnits int64             `json:"materiality_amount_minor_units"`
 	SupersedesRunID             *string           `json:"supersedes_run_id,omitempty"`
 	SupersededByRunID           *string           `json:"superseded_by_run_id,omitempty"`
 	SupersededReason            *string           `json:"superseded_reason,omitempty"`
 	SupersededBy                *string           `json:"superseded_by,omitempty"`
 	SupersededAt                *time.Time        `json:"superseded_at,omitempty"`
-	StartedAt                   time.Time  `json:"started_at"`
-	StartedBy                   string     `json:"started_by"`
-	CertifiedAt                 *time.Time `json:"certified_at,omitempty"`
-	CertifiedBy                 string     `json:"certified_by,omitempty"`
+	StartedAt                   time.Time         `json:"started_at"`
+	StartedBy                   string            `json:"started_by"`
+	CertifiedAt                 *time.Time        `json:"certified_at,omitempty"`
+	CertifiedBy                 string            `json:"certified_by,omitempty"`
 }
 
 // PopulationSnapshot is one frozen side of a run's comparison (e.g.
@@ -172,16 +181,18 @@ type ReconciliationRun struct {
 // own declared totals it was verified against. The optional fields are empty
 // only on snapshots frozen before migration 000004.
 type PopulationSnapshot struct {
-	SnapshotID            string            `json:"snapshot_id"`
-	TenantID              string            `json:"tenant_id"`
-	RunID                 string            `json:"run_id"`
-	Side                  string            `json:"side"`
-	SourceSystem          string            `json:"source_system"`
-	SpecRef               string            `json:"spec_ref,omitempty"`
-	SourceWatermark       string            `json:"source_watermark,omitempty"`
-	ItemCount             int64             `json:"item_count"`
-	AmountScale           *int              `json:"amount_scale,omitempty"`
-	TotalAmountMinorUnits int64             `json:"total_amount_minor_units"`
+	SnapshotID      string `json:"snapshot_id"`
+	TenantID        string `json:"tenant_id"`
+	RunID           string `json:"run_id"`
+	Side            string `json:"side"`
+	SourceSystem    string `json:"source_system"`
+	SpecRef         string `json:"spec_ref,omitempty"`
+	SourceWatermark string `json:"source_watermark,omitempty"`
+	ItemCount       int64  `json:"item_count"`
+	AmountScale     *int   `json:"amount_scale,omitempty"`
+	// TotalAmountMinorUnits is set only on snapshots frozen before migration
+	// 000005, where it added every currency together. Use ControlTotals.
+	TotalAmountMinorUnits *int64            `json:"total_amount_minor_units,omitempty"`
 	ControlTotals         []CurrencyTotal   `json:"control_totals,omitempty"`
 	DeclaredRowCount      *int64            `json:"declared_row_count,omitempty"`
 	DeclaredTotals        map[string]string `json:"declared_totals,omitempty"`
@@ -274,21 +285,19 @@ func (r MatchRequest) Validate() error {
 }
 
 // ValidateManualMatch checks a manual pairing against the run's frozen rules.
-// The two items must come from different populations, and their amounts must
-// agree within the run's pinned tolerance: a manual match records a reason and
-// an authority, but it can never hide an amount difference (ZS-CONTROL-001 §10,
-// scenario 06 — "narrative alone cannot force pass"). An out-of-tolerance pair
-// stays an exception.
-func ValidateManualMatch(sideA, sideB string, amountA, amountB, toleranceMinor int64) error {
-	if sideA == sideB {
+// The two items must come from different populations and must reconcile under
+// the run's pinned tolerance policy exactly as an automatic pair would: same
+// currency, amount within that currency's tolerance, dates within the date
+// tolerance. A manual match overrides only the match KEY; it records a reason
+// and an authority, but it can never hide an amount, currency or timing
+// difference (ZS-CONTROL-001 §10, scenario 06 — "narrative alone cannot force
+// pass"). A pair that does not reconcile stays an exception.
+func ValidateManualMatch(a, b MatchItem, p TolerancePolicy) error {
+	if a.Side == b.Side {
 		return ErrManualMatchSameSide
 	}
-	diff := amountA - amountB
-	if diff < 0 {
-		diff = -diff
-	}
-	if diff > toleranceMinor {
-		return fmt.Errorf("%w: difference %d exceeds tolerance %d", ErrManualMatchOutsideTolerance, diff, toleranceMinor)
+	if reason, _ := Compare(a, b, p); reason != "" {
+		return fmt.Errorf("%w: %s", ErrManualMatchOutsideTolerance, reason)
 	}
 	return nil
 }
@@ -296,6 +305,13 @@ func ValidateManualMatch(sideA, sideB string, amountA, amountB, toleranceMinor i
 // ── ReconciliationException ─────────────────────────────────────────────────
 
 type ExceptionStatus string
+
+type ExceptionKind string
+
+const (
+	ExceptionKindItem    ExceptionKind = "ITEM"
+	ExceptionKindBalance ExceptionKind = "BALANCE"
+)
 
 const (
 	ExceptionOpen     ExceptionStatus = "Open"
@@ -308,15 +324,27 @@ const (
 // ever happens as the side effect of a manual match consuming the
 // exact item it was raised for (see store.resolveExceptionsForItem) —
 // never a bare "resolve" command with no evidence behind it.
+//
+// Kind ITEM is about one frozen item (unmatched, outside tolerance, currency
+// or timing mismatch, missing key). Kind BALANCE is about a per-currency side
+// total — of the whole population (Dimension "") or of one value of a
+// declared balance dimension — that does not balance; it has no item, and its
+// amount is the signed difference side A minus side B. Detail carries the
+// observed values and the threshold that was applied.
 type ReconciliationException struct {
 	ExceptionID       string          `json:"exception_id"`
 	TenantID          string          `json:"tenant_id"`
 	RunID             string          `json:"run_id"`
-	ItemID            string          `json:"item_id"`
-	Side              string          `json:"side"`
-	RefID             string          `json:"ref_id"`
+	Kind              ExceptionKind   `json:"kind"`
+	ItemID            string          `json:"item_id,omitempty"`
+	Side              string          `json:"side,omitempty"`
+	RefID             string          `json:"ref_id,omitempty"`
+	Currency          string          `json:"currency,omitempty"`
+	Dimension         *string         `json:"dimension,omitempty"`
+	DimensionValue    *string         `json:"dimension_value,omitempty"`
 	Reason            string          `json:"reason"`
 	AmountMinorUnits  int64           `json:"amount_minor_units"`
+	Detail            json.RawMessage `json:"detail,omitempty"`
 	Status            ExceptionStatus `json:"status"`
 	RaisedAt          time.Time       `json:"raised_at"`
 	RaisedBy          string          `json:"raised_by"`
@@ -345,16 +373,19 @@ func (r RaiseExceptionRequest) Validate() error {
 // — the run's frozen rule version, its final match/exception counts
 // and totals, hashed into one addressable manifest.
 type Certification struct {
-	CertificationID    string    `json:"certification_id"`
-	TenantID           string    `json:"tenant_id"`
-	RunID              string    `json:"run_id"`
-	DefinitionVersion  int64     `json:"definition_version"`
-	MatchedCount       int64     `json:"matched_count"`
-	ExceptionCount     int64     `json:"exception_count"`
-	TotalAssertedMinor int64     `json:"total_asserted_minor_units"`
-	ManifestSHA256     string    `json:"manifest_sha256"`
-	SealedAt           time.Time `json:"sealed_at"`
-	SealedBy           string    `json:"sealed_by"`
+	CertificationID   string `json:"certification_id"`
+	TenantID          string `json:"tenant_id"`
+	RunID             string `json:"run_id"`
+	DefinitionVersion int64  `json:"definition_version"`
+	MatchedCount      int64  `json:"matched_count"`
+	ExceptionCount    int64  `json:"exception_count"`
+	// TotalAssertedMinor is set only on certifications sealed before migration
+	// 000005, where it added both sides and every currency together.
+	TotalAssertedMinor *int64                     `json:"total_asserted_minor_units,omitempty"`
+	ControlTotals      map[string][]CurrencyTotal `json:"control_totals,omitempty"`
+	ManifestSHA256     string                     `json:"manifest_sha256"`
+	SealedAt           time.Time                  `json:"sealed_at"`
+	SealedBy           string                     `json:"sealed_by"`
 }
 
 type SupersedeRunRequest struct {

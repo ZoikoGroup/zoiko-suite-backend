@@ -173,9 +173,13 @@ func (h *Handler) DefineReconciliation(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// Unknown fields are refused: a client still sending the pre-000005
+	// tolerance_amount_minor_units would otherwise get exact matching silently.
 	var req domain.DefineReconciliationRequest
-	if _, err := h.readBody(r, &req); err != nil {
-		h.respondError(w, http.StatusBadRequest, "invalid request body")
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		h.respondError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 		return
 	}
 	// The entity is checked to be well-formed before it is used as the scope of
