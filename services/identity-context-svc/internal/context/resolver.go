@@ -111,6 +111,10 @@ type Resolver struct {
 	// would reappear.
 	support SupportContextVerifier
 
+	// tokenChecks runs on every verified access token before resolution: a
+	// revoked jti or an ended login session resolves nothing (AU-01).
+	tokenChecks func(ctx context.Context, vc *domain.VerifiedClaims) error
+
 	// entitlements resolves §4's entitlement context reference. Nil means no
 	// entitlement read model is wired — true of every deployment until COM-03
 	// exists — and is recorded as UPSTREAM_NOT_CONFIGURED, never as a failure.
@@ -136,6 +140,12 @@ func (r *Resolver) WithMetrics(m *telemetry.GovMetrics) *Resolver {
 // Wired from cmd/server after SupportService is built, rather than taken by
 // NewResolver, because SupportService depends on the publisher and SoD checker
 // that are constructed later than the resolver.
+// WithAccessTokenChecks installs the revocation checks for access tokens.
+func (r *Resolver) WithAccessTokenChecks(f func(ctx context.Context, vc *domain.VerifiedClaims) error) *Resolver {
+	r.tokenChecks = f
+	return r
+}
+
 func (r *Resolver) WithSupportVerifier(v SupportContextVerifier) *Resolver {
 	r.support = v
 	return r
@@ -513,7 +523,11 @@ func (r *Resolver) Resolve(ctx context.Context, req domain.ResolveRequest) (*Res
 			MFAVerified:       claims.MFADone,
 			AdaptiveRiskScore: riskScore,
 			SessionContextID:  sessionContextID,
+			AssuranceLevel:    assuranceOf(claims),
 		},
+		// The login session this envelope descends from; ending it ends the
+		// envelope at every relying party (AU-01).
+		SID: claims.SID,
 		// Verified by verifySupportContext above — an unverified assertion
 		// never reaches here, because it returns before this point. Carrying
 		// it on the envelope is what lets a downstream service see that it is
@@ -521,6 +535,16 @@ func (r *Resolver) Resolve(ctx context.Context, req domain.ResolveRequest) (*Res
 		// that fact inside this service's database.
 		SupportContextID: req.SupportContextID,
 		SourceChannel:    envelopeChannel,
+
+		// From the VERIFIED login token: when the person authenticated and how
+		// (a password, or a TOTP step-up), and the client they authenticated
+		// through. iat above is when this envelope was minted, which a
+		// re-resolve refreshes; auth_time does not move until the person
+		// authenticates again (Group 1 register R-2).
+		AuthTime:        unixOrZero(claims.AuthTime),
+		AMR:             claims.AMR,
+		AuthorizedParty: claims.ClientID,
+		Cnf:             confirmationOf(claims),
 
 		CorrelationID: req.CorrelationID,
 		SchemaVersion: "1.0",
@@ -561,6 +585,7 @@ func (r *Resolver) Resolve(ctx context.Context, req domain.ResolveRequest) (*Res
 		AdaptiveRiskScore:  riskScore,
 		RiskSignalSource:   riskSource,
 		EnvelopeJWTJTI:     jti,
+		AuthSessionID:      claims.SID,
 		IssuedAt:           now,
 		ExpiresAt:          exp,
 		InvalidatedAt:      nil,
@@ -757,9 +782,39 @@ func (r *Resolver) InvalidateSession(
 
 // ── Private helpers ──────────────────────────────────────────────────────────
 
+func assuranceOf(vc *domain.VerifiedClaims) string {
+	if vc.AssuranceLevel != "" {
+		return vc.AssuranceLevel
+	}
+	return domain.AssuranceFor(vc.AMR)
+}
+
+// confirmationOf carries a DPoP binding from the access token to the
+// envelope, so the envelope is as sender-constrained as the token was.
+func confirmationOf(vc *domain.VerifiedClaims) *domain.Confirmation {
+	if vc.CnfJKT == "" {
+		return nil
+	}
+	return &domain.Confirmation{JKT: vc.CnfJKT}
+}
+
 func (r *Resolver) verifyToken(ctx context.Context, req domain.ResolveRequest) (*domain.VerifiedClaims, error) {
 	if req.BearerToken != "" {
-		return r.verifier.VerifyBearer(ctx, req.BearerToken)
+		vc, err := r.verifier.VerifyBearer(ctx, req.BearerToken)
+		if err != nil {
+			return nil, err
+		}
+		// A DPoP-bound token resolves only with a proof by its key (AU-27):
+		// a stolen bound token is useless without the private key.
+		if vc.CnfJKT != "" && vc.CnfJKT != req.DPoPJKT {
+			return nil, errors.New("access token is DPoP-bound and no matching DPoP proof was presented")
+		}
+		if r.tokenChecks != nil {
+			if err := r.tokenChecks(ctx, vc); err != nil {
+				return nil, err
+			}
+		}
+		return vc, nil
 	}
 	// Refused at the edge rather than half-attempted. Implementing this needs a
 	// chosen IdP, its metadata and signing certificates, plus xmlsec1 or an
@@ -970,3 +1025,12 @@ func detach(ctx context.Context) (context.Context, context.CancelFunc) {
 // broker round trip including a metadata refresh, short enough that Drain's
 // budget is not consumed by one stuck write.
 const eventPublishTimeout = 5 * time.Second
+
+// unixOrZero is t in Unix seconds, or 0 (omitted from the envelope) for the
+// zero time, so an unknown authentication time is absent rather than 1970.
+func unixOrZero(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	return t.Unix()
+}

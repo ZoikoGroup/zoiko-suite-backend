@@ -80,6 +80,19 @@ func main() {
 		}
 	}
 
+	// Plain clients for a peer whose mTLS is off. Both constructors keep the
+	// client exactly as given, so the nil left above for a non-mTLS peer
+	// panicked on the first /verify (found live, 14 Oct 2026): every gated
+	// request answered 500 on any deployment with IDENTITY_JWKS_MTLS_ENABLED
+	// unset, and every tenant resolution would have done the same with
+	// TENANT_REGISTRY_URL set and TENANT_REGISTRY_MTLS_ENABLED unset.
+	if jwksHTTPClient == nil {
+		jwksHTTPClient = &http.Client{Timeout: 5 * time.Second}
+	}
+	if tenantRegistryHTTPClient == nil {
+		tenantRegistryHTTPClient = &http.Client{Timeout: 5 * time.Second}
+	}
+
 	jwksClient := jwks.NewClientWithHTTPClient(cfg.JWKSURL, cfg.JWKSCacheTTL, jwksHTTPClient)
 	cartaClient := carta.New(cfg.CartaServiceURL, log)
 	siemClient := siem.New(cfg.SIEMServiceURL, "gateway-auth-svc", log)

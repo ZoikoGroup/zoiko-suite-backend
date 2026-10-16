@@ -78,10 +78,10 @@ func Load() (*Config, error) {
 			GroupID: env("KAFKA_GROUP_ID", "workflow-svc"),
 			Topic:   env("KAFKA_EVENTS_TOPIC", "zoiko.workflow.events"),
 		},
-		AuthorizationServiceURL: env("AUTHORIZATION_SERVICE_URL", "http://authorization-svc:8089"),
-		DocumentVaultServiceURL: env("DOCUMENT_VAULT_SERVICE_URL", "http://document-vault-svc:8094"),
+		AuthorizationServiceURL:         env("AUTHORIZATION_SERVICE_URL", "http://authorization-svc:8089"),
+		DocumentVaultServiceURL:         env("DOCUMENT_VAULT_SERVICE_URL", "http://document-vault-svc:8094"),
 		GovernanceDecisionLogServiceURL: env("GOVERNANCE_DECISION_LOG_SERVICE_URL", "http://governance-decision-log-svc:8083"),
-		OTELExporterEndpoint:    env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
+		OTELExporterEndpoint:            env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 	}, nil
 }
 

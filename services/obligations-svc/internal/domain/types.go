@@ -23,6 +23,9 @@ import "time"
 // mandate, or jurisdiction rule reference). SourceReference is required for
 // exactly this reason and must never be empty.
 //
+// Spec §8.5: "Owns: obligation-to-workflow mappings" — workflow_id links to
+// a workflow & approvals service instance.
+//
 // No hard-delete: an obligation is closed via an ObligationStatus transition
 // to CLOSED (ClosedAt stamped), never deleted.
 type Obligation struct {
@@ -30,6 +33,11 @@ type Obligation struct {
 
 	LegalEntityID  string `json:"legal_entity_id"`
 	JurisdictionID string `json:"jurisdiction_id"`
+
+	// WorkflowID links this obligation to a workflow instance in the
+	// workflow & approvals service. Optional — not all obligations are
+	// workflow-driven.
+	WorkflowID *string `json:"workflow_id,omitempty"`
 
 	// ObligationSourceType/ObligationSourceID identify the originating
 	// record (e.g. "CONTRACT_CLAUSE", "FILING_RULE", "POLICY_MANDATE",
@@ -75,6 +83,10 @@ type Obligation struct {
 	// ClosedAt is nil until the obligation transitions to CLOSED, set
 	// exactly once, never unset or overwritten afterwards.
 	ClosedAt *time.Time `json:"closed_at"`
+
+	// Version is the optimistic locking version. Incremented on every
+	// successful update. Used with If-Match header for concurrency control.
+	Version int `json:"version"`
 }
 
 // FilingRequirement is a filing obligation scoped under a parent Obligation.
@@ -106,6 +118,7 @@ type CreateObligationParams struct {
 	ResponsibleFunction  string    `json:"responsible_function"`
 	SourceReference      string    `json:"source_reference"`
 	CreatedByPrincipalID string    `json:"created_by_principal_id"`
+	WorkflowID           *string   `json:"workflow_id,omitempty"`
 }
 
 // ListObligationsFilter holds optional filters for querying obligations.
@@ -177,6 +190,59 @@ var ErrAuthorizationUnavailable = errorString("authorization service unavailable
 // driver as SQLSTATE 22P02 before any row is examined — and used to surface as
 // 503 store_unavailable, an outage status for a typo in a URL.
 var ErrInvalidIdentifier = errorString("identifier is not a valid UUID")
+
+// ErrVersionMismatch is returned when an optimistic locking check fails
+// (expected_version/If-Match header value doesn't match current version).
+var ErrVersionMismatch = errorString("version mismatch: the resource has been modified by another request")
+
+// ErrIdempotencyKeyConflict is returned when an Idempotency-Key is reused
+// with a different request payload.
+var ErrIdempotencyKeyConflict = errorString("idempotency key conflict: key already used with different request")
+
+// ErrIdentityMissing is returned when a request carries no X-Principal-Id.
+var ErrIdentityMissing = errorString("identity missing")
+
+// ErrForbidden is returned when authorization check fails (403).
+var ErrForbidden = errorString("forbidden")
+
+// ErrMissingField is returned when a required field is missing from the request.
+var ErrMissingField = errorString("missing field")
+
+// ErrInvalidField is returned when a field value is invalid.
+var ErrInvalidField = errorString("invalid field")
+
+// ErrInvalidJSON is returned when the request body is not valid JSON.
+var ErrInvalidJSON = errorString("invalid JSON")
+
+// ErrUnknownField is returned when the request contains unknown fields.
+var ErrUnknownField = errorString("unknown field")
+
+// ErrRequestTooLarge is returned when the request body exceeds the size limit.
+var ErrRequestTooLarge = errorString("request too large")
+
+// ErrInvalidLimit is returned when the limit query parameter is invalid.
+var ErrInvalidLimit = errorString("invalid limit")
+
+// ErrInvalidOffset is returned when the offset query parameter is invalid.
+var ErrInvalidOffset = errorString("invalid offset")
+
+// ErrInvalidIfMatch is returned when the If-Match header is invalid.
+var ErrInvalidIfMatch = errorString("invalid If-Match header")
+
+// ErrEnvelopeIncomplete is returned when the envelope validation fails.
+var ErrEnvelopeIncomplete = errorString("envelope incomplete")
+
+// ErrWorkflowAlreadyLinked is returned when an obligation is already linked to a workflow.
+var ErrWorkflowAlreadyLinked = errorString("workflow already linked")
+
+// ErrWorkflowNotLinked is returned when an obligation is not linked to a workflow.
+var ErrWorkflowNotLinked = errorString("workflow not linked")
+
+// ErrCreatedByMismatch is returned when created_by_principal_id doesn't match the authenticated principal.
+var ErrCreatedByMismatch = errorString("created_by mismatch")
+
+// ErrLegalEntityMismatch is returned when X-Legal-Entity-Id doesn't match body legal_entity_id.
+var ErrLegalEntityMismatch = errorString("legal entity mismatch")
 
 type errorString string
 

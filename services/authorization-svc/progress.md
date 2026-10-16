@@ -2478,3 +2478,31 @@ Governance audit file, "Fresh audit, 13 October 2026"). All the local ones are f
 - outside local, set `AUTHZ_ENTITY_REGISTRY_URL`, or the service will not start;
 - outside compose, set `AUTHZ_STEP_UP_UNKNOWN_AGE=permit` until PEPs forward the
   authentication age, or financial-close-svc's `PERIOD_REOPEN_APPROVE` gets `STEP_UP`.
+
+## 14 Oct: auth plane closure — A-01, A-03 / S-3, B-01 / S-4 closed — 85 ✅ / 0 ⚠️ / 0 ❌ of 85
+
+Done together with identity-context-svc (TOTP second factor, `auth_time`, confidential login
+clients), gateway-auth-svc (`X-Authn-Age-Seconds` from `auth_time`) and access-control-svc
+(envelope forwarding, mTLS admin calls, 000020 registry entries). Decisions (user, 14 Oct):
+whole auth plane; TOTP as the step-up factor; caps 8 h / 2 h / 4 h; confidential client at
+login.
+
+| Row | Before | After | Change |
+|---|---|---|---|
+| A-01 "subject_id and tenant are authenticated and server-resolved" | ⚠️ | ✅ | `internal/identity`: every non-evaluation route takes principal and tenant from the verified envelope (JWKS, RS256, iss/aud/exp); contradicting headers 403; failed envelope 401 in every mode; delegates only by verified mTLS CN; `require` default outside local. |
+| S-3 step-up before JIT / break-glass issue | ❌ | ✅ | `requireSessionStepUp` on JIT issue, JIT approval, break-glass issue: MFA + `auth_time` ≤ 900 s, from the verified assertion only; recorded as `iam.session.step_up.*`; evidence stored (000033). |
+| S-4 session maximums | ⚠️ | ✅ | `AUTHZ_MAX_*` (8 h / 2 h / 4 h); over-long → 400 in handler and store (never clamped). Numbers await Security sign-off (§31). |
+
+**Proof.** Unit (identity gate 7, step-up/caps 4 + updated session tests, config, store
+helpers); IT as NOBYPASSRLS `zoiko_app` 29/29 incl. 3 new 000033 tests; legacy owner suite
+68/68 (000033 added to its list); 18/18 mutants killed across the plane; live E2E 41/41 with
+native binaries (identity-context, gateway-auth, authorization in `require` mode) on scratch
+Postgres — login → resolve → JIT refused single-factor → TOTP enrol/activate → step-up →
+JIT/break-glass issued with evidence → approval refused until the approver stepped up →
+admin MFA reset. Evidence rows confirmed in both databases.
+
+**Deploy.** 000033 after 000032. Set `AUTHZ_IDENTITY_JWKS_URL` (production:
+`https://identity-context-svc:8449/.well-known/jwks.json`, which needs `MTLS_ENABLED`; the
+certificate must carry clientAuth — not exercised live because the compose override turns
+mTLS off). Compose runs `AUTHZ_IDENTITY_ASSERTION=warn` until the console forwards the
+envelope. Everyone who issues or approves sessions must enrol a TOTP factor first.

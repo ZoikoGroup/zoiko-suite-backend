@@ -14,13 +14,12 @@
 package authz
 
 import (
-	svcenvelope "zoiko.io/policy-svc/internal/envelope"
-	"github.com/go-chi/chi/v5/middleware"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/go-chi/chi/v5/middleware"
 	"io"
 	"net"
 	"net/http"
@@ -28,6 +27,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	svcenvelope "zoiko.io/policy-svc/internal/envelope"
 
 	"go.uber.org/zap"
 
@@ -60,6 +60,23 @@ const (
 	// global version by simply omitting tenant_id.
 	ActionPolicyVersionCreateGlobal   = "POLICY_VERSION_CREATE_GLOBAL"
 	ActionPolicyVersionActivateGlobal = "POLICY_VERSION_ACTIVATE_GLOBAL"
+
+	// GOV-05 separates authors, reviewers and the privileged emergency
+	// suspension by permission ("policy owners/authors/reviewers separated
+	// by class; emergency suspension privileged"), and V-001 §25 makes
+	// draft, approve, publish and activate separate capabilities.
+	ActionPolicyCreateGlobal         = "POLICY_CREATE_GLOBAL"
+	ActionPolicyVersionApprove       = "POLICY_VERSION_APPROVE"
+	ActionPolicyVersionApproveGlobal = "POLICY_VERSION_APPROVE_GLOBAL"
+	ActionPolicyVersionSuspend       = "POLICY_VERSION_SUSPEND"
+	ActionPolicyVersionSuspendGlobal = "POLICY_VERSION_SUSPEND_GLOBAL"
+	ActionPolicyVersionRetire        = "POLICY_VERSION_RETIRE"
+	ActionPolicyVersionRetireGlobal  = "POLICY_VERSION_RETIRE_GLOBAL"
+
+	// Reads and evaluation (GCP §2 invariant #1; V-001 §14.1 step 1
+	// "authenticate/authorize caller").
+	ActionPolicyRead     = "POLICY_READ"
+	ActionPolicyEvaluate = "POLICY_EVALUATE"
 
 	ActionControlTestDefinitionCreate = "CONTROL_TEST_DEFINITION_CREATE"
 	ActionControlTestExecutionRecord  = "CONTROL_TEST_EXECUTION_RECORD"
@@ -133,6 +150,24 @@ type authorizeRequest struct {
 	LegalEntityID string `json:"legal_entity_id"`
 	ActionType    string `json:"action_type"`
 	TenantID      string `json:"tenant_id,omitempty"`
+	// ResourceOwnerPrincipalID is who prepared the object acted on, so
+	// authorization-svc's own-object SoD rules (§10.2) apply centrally too.
+	ResourceOwnerPrincipalID string `json:"resource_owner_principal_id,omitempty"`
+}
+
+type resourceOwnerKey struct{}
+
+// WithResourceOwner names the principal who prepared the object the next
+// authorization check acts on (a version's author for approve and activate,
+// its suspender for a suspension review). Without it, an own-object SoD rule
+// added for one of these actions would answer REQUIRE_APPROVAL to every call.
+func WithResourceOwner(ctx context.Context, principalID string) context.Context {
+	return context.WithValue(ctx, resourceOwnerKey{}, principalID)
+}
+
+func resourceOwner(ctx context.Context) string {
+	v, _ := ctx.Value(resourceOwnerKey{}).(string)
+	return v
 }
 
 // authorizeResponse matches authorization-svc's response. Both GRANTED and
@@ -145,7 +180,7 @@ type authorizeResponse struct {
 }
 
 func (c *HTTPClient) CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType, tenantID string) error {
-	key := principalID + "|" + legalEntityID + "|" + actionType + "|" + tenantID
+	key := principalID + "|" + legalEntityID + "|" + actionType + "|" + tenantID + "|" + resourceOwner(ctx)
 
 	if decision, hit := c.lookupCache(key); hit {
 		return decision
@@ -207,6 +242,8 @@ func (c *HTTPClient) checkAllowedLive(ctx context.Context, principalID, legalEnt
 		LegalEntityID: legalEntityID,
 		ActionType:    actionType,
 		TenantID:      tenantID,
+
+		ResourceOwnerPrincipalID: resourceOwner(ctx),
 	})
 	if err != nil {
 		return fmt.Errorf("marshal authorize request: %w", err)

@@ -63,6 +63,11 @@ const (
 var exemptPaths = map[string]bool{
 	"/v1/authenticate":    true,
 	"/v1/context/resolve": true,
+	// Step-up mints a login token; enrolment returns a TOTP shared secret. A
+	// recorded response would store either one in Postgres in the clear and
+	// replay it to whoever repeats the key.
+	"/v1/authenticate/step-up": true,
+	"/v1/mfa/totp/enroll":      true,
 }
 
 // Middleware answers a repeated command from its first response.

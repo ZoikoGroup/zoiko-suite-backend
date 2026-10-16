@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"time"
 
+	svcenvelope "zoiko.io/workflow-svc/internal/envelope"
 	"go.uber.org/zap"
 )
 
@@ -24,24 +25,24 @@ type Client interface {
 }
 
 type RecordDecisionParams struct {
-	TenantID            string
-	LegalEntityID       string
-	ActorPrincipalID    string
-	ActionType          string      // e.g. "WORKFLOW_APPROVED", "WORKFLOW_REJECTED", "WORKFLOW_ESCALATED", "WORKFLOW_CANCELLED", "WORKFLOW_INVALIDATED"
-	ResourceType        string      // "workflow_instance"
-	ResourceID          string
-	Outcome             string      // "APPROVED", "REJECTED", "ESCALATED", "CANCELLED", "INVALIDATED"
-	Rationale           *string
-	CorrelationID       string
-	CausationID         *string
-	WorkflowType        string
-	WorkflowDefinitionID *string
+	TenantID                  string
+	LegalEntityID             string
+	ActorPrincipalID          string
+	ActionType                string // e.g. "WORKFLOW_APPROVED", "WORKFLOW_REJECTED", "WORKFLOW_ESCALATED", "WORKFLOW_CANCELLED", "WORKFLOW_INVALIDATED"
+	ResourceType              string // "workflow_instance"
+	ResourceID                string
+	Outcome                   string // "APPROVED", "REJECTED", "ESCALATED", "CANCELLED", "INVALIDATED"
+	Rationale                 *string
+	CorrelationID             string
+	CausationID               *string
+	WorkflowType              string
+	WorkflowDefinitionID      *string
 	WorkflowDefinitionVersion *int
-	EvidenceRefs        []string
-	SubjectType         *string
-	SubjectID           *string
-	SubjectVersion      *int
-	SubjectFingerprint  *string
+	EvidenceRefs              []string
+	SubjectType               *string
+	SubjectID                 *string
+	SubjectVersion            *int
+	SubjectFingerprint        *string
 }
 
 type decisionLogResponse struct {
@@ -77,6 +78,9 @@ func (c *HTTPClient) RecordDecision(ctx context.Context, params RecordDecisionPa
 	if params.CausationID != nil {
 		req.Header.Set("X-Causation-Id", *params.CausationID)
 	}
+
+	// Forward the caller's canonical envelope for downstream traceability
+	svcenvelope.ForwardTo(ctx, req)
 
 	resp, err := c.http.Do(req)
 	if err != nil {

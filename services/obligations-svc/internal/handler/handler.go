@@ -1,11 +1,14 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -13,9 +16,11 @@ import (
 
 	"zoiko.io/obligations-svc/internal/authz"
 	"zoiko.io/obligations-svc/internal/domain"
+	svcerrors "zoiko.io/obligations-svc/internal/errors"
 	"zoiko.io/obligations-svc/internal/envelope"
 	"zoiko.io/obligations-svc/internal/jurisdiction"
 	"zoiko.io/obligations-svc/internal/middleware"
+	"zoiko.io/obligations-svc/internal/store"
 )
 
 // ObligationStore is the narrow interface the handler depends on.
@@ -24,9 +29,14 @@ type ObligationStore interface {
 	CreateObligation(ctx context.Context, params domain.CreateObligationParams) (*domain.Obligation, bool, error)
 	FindObligationByID(ctx context.Context, obligationID string) (*domain.Obligation, error)
 	ListObligations(ctx context.Context, filter domain.ListObligationsFilter) ([]*domain.Obligation, error)
-	UpdateObligationStatus(ctx context.Context, obligationID, newStatus string) (*domain.Obligation, bool, error)
+	UpdateObligationStatus(ctx context.Context, obligationID, newStatus string, expectedVersion int) (*domain.Obligation, bool, error)
+	UpdateObligationWorkflow(ctx context.Context, obligationID, workflowID string) (*domain.Obligation, error)
 	CreateFilingRequirement(ctx context.Context, params domain.CreateFilingRequirementParams) (*domain.FilingRequirement, error)
 	ListFilingRequirements(ctx context.Context, obligationID string) ([]*domain.FilingRequirement, error)
+
+	// Idempotency key methods
+	CheckIdempotencyKey(ctx context.Context, idempotencyKey, requestHash string) (bool, string, string, error)
+	StoreIdempotencyKey(ctx context.Context, idempotencyKey, requestHash, resourceID, resourceType string) error
 
 	// ── Chunk 10: applicability decisions ────────────────────────────────────
 	CreateApplicabilityDecision(ctx context.Context, params domain.CreateApplicabilityDecisionParams) (*domain.ApplicabilityDecision, error)
@@ -162,18 +172,53 @@ func parsePaging(w http.ResponseWriter, r *http.Request) (limit, offset int, ok 
 
 // writeStoreErr maps a store failure to the status it deserves.
 func (h *Handler) writeStoreErr(w http.ResponseWriter, what string, err error) {
+	code := svcerrors.GetCode(err)
+	if code != "" {
+		writeJSON(w, h.statusForCode(code), map[string]string{"error": string(code), "detail": err.Error()})
+		return
+	}
 	switch {
 	case errors.Is(err, domain.ErrTenantMissing):
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "tenant_missing"})
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": string(svcerrors.ErrCodeTenantMissing)})
 	case errors.Is(err, domain.ErrObligationNotFound):
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "obligation_not_found"})
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": string(svcerrors.ErrCodeObligationNotFound)})
 	case errors.Is(err, domain.ErrInvalidIdentifier):
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_identifier"})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": string(svcerrors.ErrCodeInvalidIdentifier)})
 	case errors.Is(err, domain.ErrInvalidTransition):
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "invalid_transition"})
+		writeJSON(w, http.StatusConflict, map[string]string{"error": string(svcerrors.ErrCodeInvalidTransition)})
+	case errors.Is(err, domain.ErrVersionMismatch):
+		writeJSON(w, http.StatusPreconditionFailed, map[string]string{"error": string(svcerrors.ErrCodeVersionMismatch), "detail": err.Error()})
 	default:
 		h.log.Error(what, zap.Error(err))
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": string(svcerrors.ErrCodeStoreUnavailable)})
+	}
+}
+
+// statusForCode returns the appropriate HTTP status code for a stable error code.
+func (h *Handler) statusForCode(code svcerrors.ErrorCode) int {
+	switch code {
+	case svcerrors.ErrCodeIdentityMissing, svcerrors.ErrCodeTenantMissing, svcerrors.ErrCodeEnvelopeIncomplete:
+		return http.StatusUnauthorized
+	case svcerrors.ErrCodeForbidden:
+		return http.StatusForbidden
+	case svcerrors.ErrCodeMissingField, svcerrors.ErrCodeInvalidField, svcerrors.ErrCodeInvalidJSON,
+		svcerrors.ErrCodeUnknownField, svcerrors.ErrCodeRequestTooLarge, svcerrors.ErrCodeInvalidLimit,
+		svcerrors.ErrCodeInvalidOffset, svcerrors.ErrCodeInvalidIfMatch, svcerrors.ErrCodeInvalidIdentifier:
+		return http.StatusBadRequest
+	case svcerrors.ErrCodeObligationNotFound, svcerrors.ErrCodeJurisdictionNotFound:
+		return http.StatusNotFound
+	case svcerrors.ErrCodeConflict, svcerrors.ErrCodeObligationConflict, svcerrors.ErrCodeIdempotencyKeyConflict,
+		svcerrors.ErrCodeWorkflowAlreadyLinked, svcerrors.ErrCodeWorkflowNotLinked:
+		return http.StatusConflict
+	case svcerrors.ErrCodeInvalidTransition:
+		return http.StatusConflict
+	case svcerrors.ErrCodeVersionMismatch:
+		return http.StatusPreconditionFailed
+	case svcerrors.ErrCodeJurisdictionServiceUnavailable, svcerrors.ErrCodeAuthorizationUnavailable,
+		svcerrors.ErrCodeStoreUnavailable:
+		return http.StatusServiceUnavailable
+	default:
+		return http.StatusInternalServerError
 	}
 }
 
@@ -188,6 +233,8 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Get("/v1/obligations", h.ListObligations)
 	r.Get("/v1/obligations/{obligation_id}", h.GetObligation)
 	r.Post("/v1/obligations/{obligation_id}/status", h.UpdateObligationStatus)
+	r.Post("/v1/obligations/{obligation_id}/workflow", h.LinkWorkflow)
+	r.Delete("/v1/obligations/{obligation_id}/workflow", h.UnlinkWorkflow)
 	r.Post("/v1/obligations/{obligation_id}/filing-requirements", h.CreateFilingRequirement)
 	r.Get("/v1/obligations/{obligation_id}/filing-requirements", h.ListFilingRequirements)
 }
@@ -218,6 +265,7 @@ type createObligationRequest struct {
 	ResponsibleFunction  string    `json:"responsible_function"`
 	SourceReference      string    `json:"source_reference"`
 	CreatedByPrincipalID string    `json:"created_by_principal_id"`
+	WorkflowID           *string   `json:"workflow_id,omitempty"`
 }
 
 func (req createObligationRequest) missingField() string {
@@ -267,10 +315,10 @@ func (req createObligationRequest) missingField() string {
 // Response:
 //
 //	201 → obligation created for the first time
-//	200 → obligation_code already existed with identical attributes; no-op
+//	200 → obligation_code already existed with identical attributes; no-op, OR idempotent replay
 //	400 → missing required field
 //	404 → jurisdiction_id does not exist
-//	409 → obligation_code already exists with differing attributes
+//	409 → obligation_code already exists with differing attributes, OR idempotency key conflict
 //	503 → store or jurisdiction-rules-svc unavailable
 func (h *Handler) CreateObligation(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
@@ -281,6 +329,50 @@ func (h *Handler) CreateObligation(w http.ResponseWriter, r *http.Request) {
 	}
 	if _, ok := h.requireTenant(w, r); !ok {
 		return
+	}
+
+	// Read raw body for idempotency key hash computation
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		h.writeStoreErr(w, "CreateObligation: failed to read body", err)
+		return
+	}
+	r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+
+	env, _ := envelope.FromContext(r.Context())
+	idempotencyKey := env.IdempotencyKey
+
+	// Check idempotency key if present
+	if idempotencyKey != "" {
+		requestHash := store.ComputeRequestHash(bodyBytes)
+		alreadyProcessed, existingResourceID, existingResourceType, err := h.store.CheckIdempotencyKey(r.Context(), idempotencyKey, requestHash)
+		if err != nil {
+			h.writeStoreErr(w, "CreateObligation: idempotency check failed", err)
+			return
+		}
+		if alreadyProcessed && existingResourceType == "obligation" {
+			// Replay: fetch and return the existing obligation
+			existing, err := h.store.FindObligationByID(r.Context(), existingResourceID)
+			if err != nil {
+				h.writeStoreErr(w, "CreateObligation: replay lookup failed", err)
+				return
+			}
+			h.log.Info("idempotent replay: obligation already exists",
+				zap.String("obligation_id", existing.ObligationID),
+				zap.String("idempotency_key", idempotencyKey),
+				zap.String("correlation_id", correlationID),
+			)
+			writeJSON(w, http.StatusOK, existing)
+			return
+		}
+		if alreadyProcessed && existingResourceType != "obligation" {
+			// Key used for different resource type
+			writeJSON(w, http.StatusConflict, map[string]string{
+				"error": "idempotency_key_conflict",
+				"detail": "idempotency key already used for different resource type",
+			})
+			return
+		}
 	}
 
 	var req createObligationRequest
@@ -298,7 +390,6 @@ func (h *Handler) CreateObligation(w http.ResponseWriter, r *http.Request) {
 	// body's legal_entity_id. The envelope is required on writes (contract.go:
 	// LegalEntityID: RequiredOnWrite) and the body field is required by the
 	// request schema. A mismatch indicates a confused or malicious caller.
-	env, _ := envelope.FromContext(r.Context())
 	if env.LegalEntityID != "" && env.LegalEntityID != req.LegalEntityID {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"error":           "legal_entity_mismatch",
@@ -358,6 +449,7 @@ func (h *Handler) CreateObligation(w http.ResponseWriter, r *http.Request) {
 		ResponsibleFunction:  req.ResponsibleFunction,
 		SourceReference:      req.SourceReference,
 		CreatedByPrincipalID: principalID,
+		WorkflowID:           req.WorkflowID,
 	}
 
 	o, created, err := h.store.CreateObligation(r.Context(), params)
@@ -368,10 +460,28 @@ func (h *Handler) CreateObligation(w http.ResponseWriter, r *http.Request) {
 				"error":           "obligation_conflict",
 				"obligation_code": req.ObligationCode,
 			})
+		case errors.Is(err, domain.ErrIdempotencyKeyConflict):
+			writeJSON(w, http.StatusConflict, map[string]string{
+				"error": "idempotency_key_conflict",
+				"detail": "idempotency key already used with different request",
+			})
 		default:
 			h.writeStoreErr(w, "CreateObligation: store unavailable", err)
 		}
 		return
+	}
+
+	// Store idempotency key after successful creation
+	if idempotencyKey != "" {
+		requestHash := store.ComputeRequestHash(bodyBytes)
+		if err := h.store.StoreIdempotencyKey(r.Context(), idempotencyKey, requestHash, o.ObligationID, "obligation"); err != nil {
+			h.log.Error("CreateObligation: failed to store idempotency key",
+				zap.String("obligation_id", o.ObligationID),
+				zap.String("idempotency_key", idempotencyKey),
+				zap.Error(err),
+			)
+			// Non-fatal: log but continue
+		}
 	}
 
 	status := http.StatusOK
@@ -545,6 +655,7 @@ type updateStatusRequest struct {
 //	400 → missing/invalid obligation_status
 //	404 → obligation_id not found
 //	409 → illegal transition
+//	412 → version mismatch (If-Match/expected_version)
 //	503 → store unavailable
 func (h *Handler) UpdateObligationStatus(w http.ResponseWriter, r *http.Request) {
 	obligationID := chi.URLParam(r, "obligation_id")
@@ -570,6 +681,24 @@ func (h *Handler) UpdateObligationStatus(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Parse If-Match header for optimistic locking (expected_version).
+	// If-Match: "123" or If-Match: W/"123" (weak etag not supported, treat as strong).
+	expectedVersion := 0
+	if match := r.Header.Get("If-Match"); match != "" {
+		// Strip weak prefix if present
+		match = strings.TrimPrefix(match, "W/")
+		match = strings.Trim(match, `"`)
+		if v, err := strconv.Atoi(match); err == nil {
+			expectedVersion = v
+		} else {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error": "invalid_if_match",
+				"detail": "If-Match must be an integer version",
+			})
+			return
+		}
+	}
+
 	// The obligation is read before the write purely to learn its legal
 	// entity, which is the authorization scope. The transition itself is still
 	// decided under a row lock inside the store — this read is not the check.
@@ -582,7 +711,7 @@ func (h *Handler) UpdateObligationStatus(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	updated, transitioned, err := h.store.UpdateObligationStatus(r.Context(), obligationID, req.ObligationStatus)
+	updated, transitioned, err := h.store.UpdateObligationStatus(r.Context(), obligationID, req.ObligationStatus, expectedVersion)
 	if err != nil {
 		h.writeStoreErr(w, "UpdateObligationStatus: store unavailable", err)
 		return
@@ -620,6 +749,152 @@ func (h *Handler) UpdateObligationStatus(w http.ResponseWriter, r *http.Request)
 		zap.String("obligation_id", obligationID),
 		zap.String("new_status", req.ObligationStatus),
 		zap.Bool("transitioned", transitioned),
+		zap.String("correlation_id", correlationID),
+	)
+	writeJSON(w, http.StatusOK, updated)
+}
+
+// ── POST /v1/obligations/{obligation_id}/workflow ───────────────────────────
+
+type linkWorkflowRequest struct {
+	WorkflowID string `json:"workflow_id"`
+}
+
+func (req linkWorkflowRequest) missingField() string {
+	if req.WorkflowID == "" {
+		return "workflow_id"
+	}
+	return ""
+}
+
+// LinkWorkflow handles POST /v1/obligations/{obligation_id}/workflow.
+// Links an obligation to a workflow instance.
+//
+// Response:
+//
+//	200 → obligation updated with workflow_id
+//	400 → missing workflow_id
+//	404 → obligation_id not found
+//	409 → obligation already linked to a workflow
+//	503 → store unavailable
+func (h *Handler) LinkWorkflow(w http.ResponseWriter, r *http.Request) {
+	obligationID := chi.URLParam(r, "obligation_id")
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+
+	var req linkWorkflowRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if missing := req.missingField(); missing != "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "missing_field",
+			"field": missing,
+		})
+		return
+	}
+
+	existing, err := h.store.FindObligationByID(r.Context(), obligationID)
+	if err != nil {
+		h.writeStoreErr(w, "LinkWorkflow: lookup failed", err)
+		return
+	}
+	if !h.authorize(w, r, principalID, existing.LegalEntityID, authz.ActionObligationStatusUpdate) {
+		return
+	}
+
+	if existing.WorkflowID != nil && *existing.WorkflowID != "" {
+		writeJSON(w, http.StatusConflict, map[string]string{
+			"error":        "workflow_already_linked",
+			"workflow_id":  *existing.WorkflowID,
+		})
+		return
+	}
+
+	updated, err := h.store.UpdateObligationWorkflow(r.Context(), obligationID, req.WorkflowID)
+	if err != nil {
+		h.writeStoreErr(w, "LinkWorkflow: store unavailable", err)
+		return
+	}
+
+	if pubErr := h.publisher.PublishObligationUpdated(r.Context(), *updated, principalID, correlationID); pubErr != nil {
+		h.log.Error("LinkWorkflow: failed to publish obligation.updated",
+			zap.String("obligation_id", updated.ObligationID),
+			zap.String("correlation_id", correlationID),
+			zap.Error(pubErr),
+		)
+	}
+
+	h.log.Info("obligation linked to workflow",
+		zap.String("obligation_id", obligationID),
+		zap.String("workflow_id", req.WorkflowID),
+		zap.String("correlation_id", correlationID),
+	)
+	writeJSON(w, http.StatusOK, updated)
+}
+
+// ── DELETE /v1/obligations/{obligation_id}/workflow ─────────────────────────
+
+// UnlinkWorkflow handles DELETE /v1/obligations/{obligation_id}/workflow.
+// Removes the workflow link from an obligation.
+//
+// Response:
+//
+//	200 → obligation updated with workflow_id cleared
+//	404 → obligation_id not found
+//	409 → obligation not linked to a workflow
+//	503 → store unavailable
+func (h *Handler) UnlinkWorkflow(w http.ResponseWriter, r *http.Request) {
+	obligationID := chi.URLParam(r, "obligation_id")
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+
+	existing, err := h.store.FindObligationByID(r.Context(), obligationID)
+	if err != nil {
+		h.writeStoreErr(w, "UnlinkWorkflow: lookup failed", err)
+		return
+	}
+	if !h.authorize(w, r, principalID, existing.LegalEntityID, authz.ActionObligationStatusUpdate) {
+		return
+	}
+
+	if existing.WorkflowID == nil || *existing.WorkflowID == "" {
+		writeJSON(w, http.StatusConflict, map[string]string{
+			"error": "workflow_not_linked",
+		})
+		return
+	}
+
+	updated, err := h.store.UpdateObligationWorkflow(r.Context(), obligationID, "")
+	if err != nil {
+		h.writeStoreErr(w, "UnlinkWorkflow: store unavailable", err)
+		return
+	}
+
+	if pubErr := h.publisher.PublishObligationUpdated(r.Context(), *updated, principalID, correlationID); pubErr != nil {
+		h.log.Error("UnlinkWorkflow: failed to publish obligation.updated",
+			zap.String("obligation_id", updated.ObligationID),
+			zap.String("correlation_id", correlationID),
+			zap.Error(pubErr),
+		)
+	}
+
+	h.log.Info("obligation unlinked from workflow",
+		zap.String("obligation_id", obligationID),
 		zap.String("correlation_id", correlationID),
 	)
 	writeJSON(w, http.StatusOK, updated)

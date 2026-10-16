@@ -95,6 +95,14 @@ $SEED_ADMIN_ROLE_ID = "5eed0000-0000-4000-8000-00000000a002"
 $ACS_SERVICE_ID      = "svc-access-control"
 $ACS_SERVICE_ROLE_ID = "5eed0000-0000-4000-8000-00000000a003"
 
+# policy-svc's own identity (POLICY_LEDGER_PRINCIPAL_ID). Its evidence relay
+# writes every policy evaluation to governance-decision-log-svc as this
+# principal (decision D-02), so it holds GOVERNANCE_DECISION_RECORD and nothing
+# else: on the platform scope (evaluations no entity scopes) and on the legal
+# entity (evaluations scoped to it).
+$POLICY_SERVICE_ID      = "svc-policy"
+$POLICY_SERVICE_ROLE_ID = "5eed0000-0000-4000-8000-00000000a004"
+
 $ROLE_CODE = "CONSOLE_DEMO_OPERATOR"
 
 # Platform-scope records (decisions, config, flags, secret policies, policy
@@ -412,14 +420,32 @@ $BUNDLES = @(
         Actions = @("GOVERNANCE_DECISION_RECORD")
     },
     @{
-        # policy-svc checks POLICY_CREATE / POLICY_VERSION_CREATE /
-        # POLICY_VERSION_ACTIVATE against the legal entity when the policy is
-        # entity-scoped and against authzPlatformScopeID when it is not. The
-        # console always creates entity-scoped policies, but the platform-scope
-        # assignment below also carries these so both paths are granted.
+        # policy-svc checks its actions against the legal entity when the
+        # policy is entity-scoped and against authzPlatformScopeID when it is
+        # not, so the platform-scope assignment below carries them too. The
+        # GOV-05 lifecycle (14 Oct 2026) added review, approval, suspension,
+        # retirement, the _GLOBAL variants, reads and evaluation. Both demo
+        # principals hold this role; policy-svc itself refuses the author
+        # approving or activating, and the suspender reviewing, so the
+        # maker-checker paths stay testable with $PRINCIPAL_ID and $APPROVER_ID.
         Code    = "POLICY_FULL"
         Service = "policy-svc"
-        Actions = @("POLICY_CREATE", "POLICY_VERSION_CREATE", "POLICY_VERSION_ACTIVATE")
+        Actions = @("POLICY_CREATE", "POLICY_CREATE_GLOBAL", "POLICY_READ", "POLICY_EVALUATE",
+                    "POLICY_VERSION_CREATE", "POLICY_VERSION_CREATE_GLOBAL",
+                    "POLICY_VERSION_APPROVE", "POLICY_VERSION_APPROVE_GLOBAL",
+                    "POLICY_VERSION_ACTIVATE", "POLICY_VERSION_ACTIVATE_GLOBAL",
+                    "POLICY_VERSION_SUSPEND", "POLICY_VERSION_SUSPEND_GLOBAL",
+                    "POLICY_VERSION_RETIRE", "POLICY_VERSION_RETIRE_GLOBAL")
+    },
+    @{
+        # policy-svc's control tests and attestations (doc7 E3/E6) authorize
+        # against the platform scope.
+        Code    = "CONTROL_TESTS_FULL"
+        Service = "policy-svc"
+        Actions = @("CONTROL_TEST_DEFINITION_CREATE", "CONTROL_TEST_DEFINITION_READ",
+                    "CONTROL_TEST_EXECUTION_RECORD", "CONTROL_TEST_EXECUTION_READ",
+                    "CONTROL_EFFECTIVENESS_READ", "ATTESTATION_CREATE", "ATTESTATION_READ",
+                    "ATTESTATION_REVOKE")
     },
     @{
         # configuration-feature-flag-svc authorizes config and flag writes
@@ -841,7 +867,7 @@ $ALL_ACTIONS = $BUNDLES | ForEach-Object { $_.Actions } | Sort-Object -Unique
 # missing, and the run would skip the bundles entirely -- never granting the
 # platform scope. It then reported success and had granted nothing.
 $PLATFORM_SCOPED_ACTION_CODES = @(
-    "GOVERNANCE_FULL", "CONFIG_FULL", "VAULT_FULL", "POLICY_FULL",
+    "GOVERNANCE_FULL", "CONFIG_FULL", "VAULT_FULL", "POLICY_FULL", "CONTROL_TESTS_FULL",
     "SCHEMA_FULL", "JURISDICTION_FULL", "JURISDICTION_PACK_REGISTRY_FULL", "JURISDICTION_RESOLVER_CALLER",
     # retention-registry-svc falls back to the platform scope when a hold or
     # policy names no tenant -- the console offers that as a "platform-wide"
@@ -1166,6 +1192,33 @@ try {
     } else {
         throw
     }
+}
+
+# -- policy-svc's ledger writer -----------------------------------------------------
+#
+# Runs on every invocation, like the SoD approver above: it is one role with one
+# bundle and two assignments, written idempotently. Direct SQL, as for the other
+# service identities in the bootstrap block -- DEVELOPMENT ONLY.
+if ((Get-Decision -Action "GOVERNANCE_DECISION_RECORD" -Scope $PLATFORM_SCOPE -Principal $POLICY_SERVICE_ID).decision_outcome -ne "GRANTED" -or
+    (Get-Decision -Action "GOVERNANCE_DECISION_RECORD" -Scope $LEGAL_ENTITY -Principal $POLICY_SERVICE_ID).decision_outcome -ne "GRANTED") {
+    Write-Host "grant $POLICY_SERVICE_ID GOVERNANCE_DECISION_RECORD (policy evidence relay)" -NoNewline
+    $sql = @"
+INSERT INTO roles (role_id, tenant_id, role_code, role_name, role_scope_type, active_flag, created_by_principal_id)
+VALUES ('$POLICY_SERVICE_ROLE_ID', '$TENANT_ID', 'SVC_POLICY_LEDGER', 'policy-svc evidence relay', 'LEGAL_ENTITY', true, 'seed-bootstrap')
+ON CONFLICT DO NOTHING;
+INSERT INTO permission_bundles (role_id, bundle_code, permitted_actions, active_flag)
+VALUES ('$POLICY_SERVICE_ROLE_ID', 'LEDGER_WRITE', '["GOVERNANCE_DECISION_RECORD"]'::jsonb, true)
+ON CONFLICT (role_id, bundle_code) DO UPDATE SET permitted_actions = EXCLUDED.permitted_actions, active_flag = true;
+INSERT INTO principal_role_assignments (principal_id, role_id, legal_entity_id, effective_from, assigned_by)
+SELECT '$POLICY_SERVICE_ID', '$POLICY_SERVICE_ROLE_ID', scope, now() - interval '1 minute', 'seed-bootstrap'
+FROM (VALUES ('$PLATFORM_SCOPE'::uuid), ('$LEGAL_ENTITY'::uuid)) AS s(scope)
+WHERE NOT EXISTS (SELECT 1 FROM principal_role_assignments
+                  WHERE principal_id = '$POLICY_SERVICE_ID' AND role_id = '$POLICY_SERVICE_ROLE_ID' AND legal_entity_id = s.scope);
+"@
+    $sql | docker exec -i $PgContainer psql -U postgres -d authorization_svc -v ON_ERROR_STOP=1 -q | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "policy-svc ledger grant into authorization_svc failed (container $PgContainer)" }
+    Start-Sleep -Seconds 6
+    Write-Host "  -> done" -ForegroundColor Green
 }
 
 # -- REF-04 / REF-05 maker-checker roles -------------------------------------------

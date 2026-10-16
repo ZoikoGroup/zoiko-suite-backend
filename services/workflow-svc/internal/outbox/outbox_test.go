@@ -489,7 +489,6 @@ func TestRelay_StartAndCancel(t *testing.T) {
 	}
 }
 
-
 func containsStr(haystack, needle string) bool {
 	return len(haystack) >= len(needle) && (haystack == needle || (len(needle) > 0 && len(haystack) > 0 && (stringSearch(haystack, needle))))
 }

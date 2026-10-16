@@ -225,7 +225,7 @@ func correlationIDMiddleware(next http.Handler) http.Handler {
 }
 
 // runOverdueScheduler periodically checks for obligations past their due_date
-// and transitions them to OVERDUE status.
+// and transitions them to OVERDUE status across all tenants.
 func runOverdueScheduler(ctx context.Context, pgStore *store.PgStore, publisher *events.Publisher, log *zap.Logger) {
 	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
@@ -237,35 +237,47 @@ func runOverdueScheduler(ctx context.Context, pgStore *store.PgStore, publisher 
 			log.Info("overdue scheduler stopped")
 			return
 		case <-ticker.C:
-			// Create a background context with tenant for the store
-			// Note: In a multi-tenant setup, we'd need to iterate tenants.
-			// For now, we use a system context that the store will scope.
-			bgCtx := context.Background()
-
-			overdue, err := pgStore.FindOverdueObligations(bgCtx)
+			// Get all tenant IDs that have obligations
+			tenantIDs, err := pgStore.GetTenantIDsWithObligations(ctx)
 			if err != nil {
-				log.Error("overdue scheduler: failed to find overdue obligations", zap.Error(err))
+				log.Error("overdue scheduler: failed to get tenant IDs", zap.Error(err))
 				continue
 			}
 
-			for _, o := range overdue {
-				updated, transitioned, err := pgStore.TransitionOverdue(bgCtx, o.ObligationID)
+			for _, tenantID := range tenantIDs {
+				// Create a tenant-scoped context for each tenant
+				tenantCtx := svcmiddleware.WithTenant(ctx, tenantID)
+
+				overdue, err := pgStore.FindOverdueObligations(tenantCtx, tenantID)
 				if err != nil {
-					log.Error("overdue scheduler: failed to transition obligation",
-						zap.String("obligation_id", o.ObligationID),
+					log.Error("overdue scheduler: failed to find overdue obligations",
+						zap.String("tenant_id", tenantID),
 						zap.Error(err))
 					continue
 				}
-				if transitioned {
-					// Publish the overdue event
-					if pubErr := publisher.PublishObligationOverdue(bgCtx, *updated, "system", ""); pubErr != nil {
-						log.Error("overdue scheduler: failed to publish obligation.overdue",
-							zap.String("obligation_id", updated.ObligationID),
-							zap.Error(pubErr))
+
+				for _, o := range overdue {
+					updated, transitioned, err := pgStore.TransitionOverdue(tenantCtx, o.ObligationID)
+					if err != nil {
+						log.Error("overdue scheduler: failed to transition obligation",
+							zap.String("tenant_id", tenantID),
+							zap.String("obligation_id", o.ObligationID),
+							zap.Error(err))
+						continue
 					}
-					log.Info("overdue scheduler: transitioned obligation to OVERDUE",
-						zap.String("obligation_id", updated.ObligationID),
-						zap.String("due_date", updated.DueDate.Format(time.RFC3339)))
+					if transitioned {
+						// Publish the overdue event with tenant context
+						if pubErr := publisher.PublishObligationOverdue(tenantCtx, *updated, "system", ""); pubErr != nil {
+							log.Error("overdue scheduler: failed to publish obligation.overdue",
+								zap.String("tenant_id", tenantID),
+								zap.String("obligation_id", updated.ObligationID),
+								zap.Error(pubErr))
+						}
+						log.Info("overdue scheduler: transitioned obligation to OVERDUE",
+							zap.String("tenant_id", tenantID),
+							zap.String("obligation_id", updated.ObligationID),
+							zap.String("due_date", updated.DueDate.Format(time.RFC3339)))
+					}
 				}
 			}
 		}

@@ -657,8 +657,26 @@ services:
       MTLS_MANAGEMENT_SERVICE_URL: "http://mtls-management-svc:8140"
       MTLS_BOOTSTRAP_TOKEN_PATH: "/bootstrap/token"
       MTLS_ALLOWED_CLIENTS: "gateway-auth-svc,authorization-svc"
+      # ── Auth plane closure (14 Oct 2026) ───────────────────────────────────
+      # Login clients (Group 1 register R-1). The console's SERVER tier logs
+      # in as client "zoiko-console" with its secret (local value:
+      # local-dev-console-client-secret; the file holds only its SHA-256), so
+      # the token carries a verified azp and a human session gets a VERIFIED
+      # source channel. "optional" until the console sends the client; then
+      # "required".
+      IDP_CLIENT_SECRETS_FILE: "/idp-clients/clients.json"
+      IDP_CLIENT_CHANNELS: "zoiko-console=web"
+      IDP_CLIENT_AUTH: "optional"
+      # The TOTP second factor (migration 000012): secrets are AES-256-GCM
+      # encrypted under this key. LOCAL VALUE ONLY — staging and production
+      # refuse to start without their own (from the secret store), and a
+      # factor enrolled under one key cannot be used under another.
+      MFA_SECRET_KEY: "bG9jYWwtZGV2LW1mYS1rZXktMzItYnl0ZXMtbG9uZyE="
+      MFA_SECRET_KEY_ID: "local-1"
+      MFA_RECENT_AUTH_SECONDS: "900"
     volumes:
       - identity_jwt_keys:/keys:ro
+      - ./identity/idp-clients.local.json:/idp-clients/clients.json:ro
       # Only this service's own bootstrap token (register M-01): the
       # sub-directory identity-context-svc/ of the keygen volume, so /bootstrap/token
       # here is a token mtls-management-svc binds to identity-context-svc alone.
@@ -1049,6 +1067,11 @@ services:
       DB_PASSWORD: "${DB_PASSWORD:-postgres}"
       DB_SSLMODE: disable
       GOVERNANCE_DECISION_LOG_SERVICE_URL: "http://governance-svc:8083"
+      # The principal policy-svc writes evaluation evidence to the governance
+      # ledger as (decision D-02). It needs GOVERNANCE_DECISION_RECORD; until
+      # it has it, evaluations still succeed and their evidence waits, durable,
+      # in policy_evidence_outbox.
+      POLICY_LEDGER_PRINCIPAL_ID: "${POLICY_LEDGER_PRINCIPAL_ID:-svc-policy}"
       # Authorization gate. policy-svc had none: anyone able to reach the
       # port could define a policy, publish a version and activate it.
       # Role assignments granting POLICY_CREATE / POLICY_VERSION_CREATE /
@@ -1056,6 +1079,24 @@ services:
       # legal_entity_id for policies that are not entity-scoped.
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       AUTHZ_PLATFORM_SCOPE_ID: "00000000-0000-0000-0000-00000000f001"
+      # POLICY_EVALUATE and POLICY_READ gates. Enforced: access-control-svc
+      # registers both actions (its 000019), seed-demo-rbac.ps1 grants them,
+      # and every caller forwards X-Principal-Id (expense-claim-svc and
+      # payment-authorization-svc since 14 Oct; governance-decision-log-svc's
+      # replay through its envelope).
+      POLICY_EVALUATE_AUTHZ: "${POLICY_EVALUATE_AUTHZ:-enforce}"
+      POLICY_READ_AUTHZ: "${POLICY_READ_AUTHZ:-enforce}"
+      # Identity headers (X5): enforce needs identity-context-svc's signed
+      # envelope (Authorization, verified against its JWKS) agreeing with
+      # X-Tenant-Id / X-Principal-Id, or a peer certificate on the :8449 mTLS
+      # listener. warn until governance-decision-log-svc's replay forwards the
+      # envelope (its generated ForwardTo carries no Authorization) and the
+      # peers call over mTLS; the code default is enforce.
+      POLICY_IDENTITY_VERIFY: "${POLICY_IDENTITY_VERIFY:-warn}"
+      IDENTITY_JWKS_URL: "http://identity-svc:8080/.well-known/jwks.json"
+      EXPECTED_ISSUER: "identity-context-svc"
+      EXPECTED_AUDIENCE: "zoiko-internal"
+      EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_GROUP_ID: "policy-svc"
@@ -1360,6 +1401,29 @@ services:
       # would answer STEP_UP to financial-close-svc's PERIOD_REOPEN_APPROVE.
       # "permit" keeps the old reading here until PEPs forward the age.
       AUTHZ_STEP_UP_UNKNOWN_AGE: "permit"
+      # Who is calling the admin, session and console routes (register A-01):
+      # the identity envelope in Authorization, verified against
+      # identity-context-svc's JWKS, or a registered delegate's client
+      # certificate. "warn" locally (admitted on X-Principal-Id, logged and
+      # marked X-Identity-Assertion: missing) so a console that does not yet
+      # forward the envelope keeps working; outside ENV=local the default is
+      # "require". A PRESENTED envelope that fails is refused in every mode.
+      # Plaintext JWKS here because docker-compose.override.yml turns this
+      # service's mTLS off; production points at
+      # https://identity-context-svc:8449/.well-known/jwks.json, which
+      # allow-lists authorization-svc and is fetched with its own certificate.
+      AUTHZ_IDENTITY_ASSERTION: "warn"
+      AUTHZ_IDENTITY_JWKS_URL: "http://identity-svc:8080/.well-known/jwks.json"
+      AUTHZ_ADMIN_DELEGATES: "access-control-svc"
+      # Issuing or approving a JIT or break-glass session needs a TOTP step-up
+      # no older than this (register A-03, ZS-IAM-001 §13/§14). Enforced here
+      # too: there is deliberately no local opt-out in this file.
+      AUTHZ_SESSION_STEP_UP_MAX_AGE_SECONDS: "900"
+      # Session maximums (register B-01), refused rather than shortened.
+      # Chosen 14 Oct 2026; "numeric limits require Security approval".
+      AUTHZ_MAX_JIT_SECONDS: "28800"
+      AUTHZ_MAX_BREAK_GLASS_SECONDS: "7200"
+      AUTHZ_MAX_SUPPORT_SECONDS: "14400"
     volumes:
       # Only this service's own bootstrap token (register M-01): the
       # sub-directory authorization-svc/ of the keygen volume, so /bootstrap/token

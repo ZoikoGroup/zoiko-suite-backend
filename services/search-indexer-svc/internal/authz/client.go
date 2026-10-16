@@ -220,6 +220,9 @@ func (c *HTTPClient) checkAllowedLive(ctx context.Context, principalID, legalEnt
 	// exactly the per-resource audit trail TC-05 asks for.
 	req.Header.Set("Idempotency-Key", authzRequestID+":"+actionType+":"+legalEntityID)
 
+	// Forward the caller's canonical envelope for downstream traceability
+	svcenvelope.ForwardTo(ctx, req)
+
 	resp, err := c.http.Do(req)
 	if err != nil {
 		c.log.Error("authorization-svc unreachable — failing closed",

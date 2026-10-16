@@ -16,6 +16,7 @@ const (
 	WorkflowStatusEscalated   = "ESCALATED"
 	WorkflowStatusCancelled   = "CANCELLED"
 	WorkflowStatusInvalidated = "INVALIDATED"
+	WorkflowStatusExpired     = "EXPIRED"
 )
 
 // WorkflowInstance is one approval request moving through an ordered chain
@@ -37,8 +38,8 @@ type WorkflowInstance struct {
 	SubjectVersion     *int    `json:"subject_version,omitempty"`
 	SubjectFingerprint *string `json:"subject_fingerprint,omitempty"`
 
-	// WorkflowStatus: PENDING | APPROVED | REJECTED | ESCALATED | CANCELLED | INVALIDATED.
-	// APPROVED/REJECTED/CANCELLED/INVALIDATED are terminal.
+	// WorkflowStatus: PENDING | APPROVED | REJECTED | ESCALATED | CANCELLED | INVALIDATED | EXPIRED.
+	// APPROVED/REJECTED/CANCELLED/INVALIDATED/EXPIRED are terminal.
 	WorkflowStatus string `json:"workflow_status"`
 
 	// CurrentStage is the 1-based stage_order currently awaiting action.
@@ -56,9 +57,12 @@ type WorkflowInstance struct {
 	InvalidationNarrative    *string    `json:"invalidation_narrative,omitempty"`
 	InvalidationEvidenceRefs []string   `json:"invalidation_evidence_refs,omitempty"`
 
-	// Deadline tracking for SLA/escalation per GOV-06 NFR
+	// Deadline tracking for SLA/escalation per GOV-06 NFR / R-001 §4.4
 	DueAt        *time.Time `json:"due_at,omitempty"`
 	NextActionAt *time.Time `json:"next_action_at,omitempty"`
+
+	// Escalation target per R-001 §4.2
+	EscalationTarget *string `json:"escalation_target,omitempty"`
 
 	// R-001 §9.1 common columns for optimistic concurrency and audit
 	RowVersion      int       `json:"row_version"`
@@ -164,6 +168,7 @@ type CreateWorkflowParams struct {
 	InitiatedBy        string
 	CorrelationID      string
 	IdempotencyKey     string
+	EscalationTarget   *string
 	Stages             []CreateWorkflowStageInput
 }
 
@@ -190,6 +195,16 @@ type InvalidateWorkflowParams struct {
 	EvidenceRefs       []string
 	CorrelationID      string
 	CausationID        *string
+}
+
+// EscalateToWorkflowParams holds input for escalating a workflow to a different target.
+type EscalateToWorkflowParams struct {
+	WorkflowInstanceID string
+	ActorPrincipalID   string
+	EscalationTarget   string
+	ReasonCode         string
+	Narrative          *string
+	CorrelationID      string
 }
 
 // VerifyReleaseParams holds input for verifying an approval before release.

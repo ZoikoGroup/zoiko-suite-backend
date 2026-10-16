@@ -118,8 +118,8 @@ func insertSessionContextTx(ctx context.Context, tx pgx.Tx, sc domain.SessionCon
 			source_channel, workload_id, causation_id, entitlement_context_ref,
 			ingress_binding_version,
 			source_channel_basis, workload_id_basis, ingress_cache_state,
-			entitlement_context_status)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31)
+			entitlement_context_status, auth_session_id)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32)
 		ON CONFLICT (session_context_id) DO NOTHING`,
 		sc.SessionContextID, sc.PrincipalID, sc.TenantID, legalEntityID,
 		sc.CorrelationID, string(sc.TrustPosture), sc.MFAVerified, sc.DeviceTrustScore,
@@ -133,6 +133,7 @@ func insertSessionContextTx(ctx context.Context, tx pgx.Tx, sc domain.SessionCon
 		nullIfEmpty(sc.IngressBindingVersion),
 		nullIfEmpty(string(sc.SourceChannelBasis)), nullIfEmpty(string(sc.WorkloadIDBasis)),
 		nullIfEmpty(string(sc.IngressCacheState)), nullIfEmpty(string(sc.EntitlementContextStatus)),
+		nullIfEmpty(sc.AuthSessionID),
 	)
 	if err != nil {
 		return fmt.Errorf("insert session_context: %w", err)

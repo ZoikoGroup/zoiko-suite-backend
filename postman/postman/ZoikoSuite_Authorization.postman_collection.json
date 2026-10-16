@@ -4,7 +4,18 @@
     "description": "Every endpoint on authorization-svc (:8089), ordered as a runnable flow.\n\nRun the folders top to bottom with the Collection Runner. Ids are captured by\ntest scripts, so nothing needs pasting by hand.\n\nTHE ENVELOPE IS SET FOR YOU\nA collection-level pre-request script adds the canonical input contract\n(ZS-ARCH-SVC-001 section 4) to every request: X-Tenant-Id, X-Principal-Id,\nX-Legal-Entity-Id, X-Request-Id, X-Correlation-ID, X-Source-Channel and, on\nmaterial writes only, Idempotency-Key. Without it every /v1/admin/* write here\nanswers 401 envelope_incomplete, because the service enforces write-strict by\ndefault. Open the collection's Pre-request Script tab to see it.\n\nKEY FACTS\n- /v1/authorize returns HTTP 200 for BOTH grant and deny. The verdict is in\n  decision_outcome, not the status code. 200 means the evaluation succeeded.\n- Evaluation order: principal status (layer 0), RBAC, delegated authority,\n  static SoD, own-object SoD, then attribute conditions. Every layer after the\n  first can only ever REMOVE access the earlier ones conferred.\n- Every evaluation is written to access_decision_log before responding. The\n  three pre-flight routes in folder 10 write nothing at all, which is what\n  makes them safe to call while somebody is still deciding.\n- legal_entity_id and tenant_id MUST be UUIDs \u2014 they are uuid columns. A\n  malformed one now answers 400 invalid_scope naming the field. It used to\n  answer 503 store_unavailable, which read to a caller as this service being\n  down; that is fixed, and this collection no longer documents it as a defect\n  you have to live with.\n- principal_id is free text and deliberately NOT validated: it is TEXT in every\n  table, and service-account ids are not UUIDs.\n- legal_entity_id accepts the literal PLATFORM for an act that belongs to no\n  single legal entity. It resolves to AUTHZ_PLATFORM_SCOPE_ENTITY_ID.\n- Purchase actions consumed by purchase-order-svc: PO_ISSUE, PO_AMEND, PO_CLOSE.\n\nNOT REACHABLE FROM HERE, BY DESIGN\nLayer 0 (principal status) has no HTTP route. identity-context-svc is\nauthoritative for whether an account is active, and this service consumes\nprincipal.status.changed from zoiko.identity.events into a read-model. An admin\nroute that could override it would let two services disagree about who is\nsuspended. Folder 11 explains how to exercise it.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      { "key": "token", "value": "{{identityEnvelope}}", "type": "string" }
+    ]
+  },
   "variable": [
+    {
+      "key": "identityEnvelope",
+      "value": "",
+      "description": "14 Oct 2026 (register A-01): the caller's identity envelope from identity-context-svc /v1/context/resolve. Required on every admin, session and console route when AUTHZ_IDENTITY_ASSERTION=require; it must name the same principal and tenant as X-Principal-Id / X-Tenant-Id. Issuing or approving a JIT or break-glass session needs an envelope minted after a TOTP step-up (/v1/authenticate/step-up) in the last 15 minutes. Empty works only in warn mode (compose)."
+    },
     {
       "key": "authzUrl",
       "value": "http://localhost:8089"

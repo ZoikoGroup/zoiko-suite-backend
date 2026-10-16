@@ -666,7 +666,12 @@ func (h *Handler) SubmitExpenseClaim(w http.ResponseWriter, r *http.Request) {
 	for _, l := range lines {
 		total += l.Amount
 	}
-	policyResult, policyVersionID, perr := h.Policy.EvaluateApprovalThreshold(ctx, principalID, verifiedTenant, claim.LegalEntityID, total)
+	policyResult, policyVersionID, perr := h.Policy.EvaluateApprovalThreshold(ctx, policy.Caller{
+		PrincipalID:   principalID,
+		Authorization: r.Header.Get("Authorization"),
+		RequestID:     r.Header.Get("X-Request-Id"),
+		CorrelationID: corr,
+	}, verifiedTenant, claim.LegalEntityID, total)
 	if perr != nil {
 		controlled := h.anyControlled(lines)
 		switch {

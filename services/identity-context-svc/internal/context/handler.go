@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"strings"
 
@@ -14,9 +15,11 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/identity-context-svc/internal/domain"
+	"zoiko.io/identity-context-svc/internal/ratelimit"
 	svcenvelope "zoiko.io/identity-context-svc/internal/envelope"
 	"zoiko.io/identity-context-svc/internal/session"
 	"zoiko.io/identity-context-svc/internal/store"
+	idenv "zoiko.io/identity-envelope"
 )
 
 // Action constants passed to authorization-svc as action_type.
@@ -62,6 +65,68 @@ type Handler struct {
 
 	// cache backs RefreshTenantContextCache and InvalidateTenantContext.
 	cache *ContextCacheService
+
+	// mfa backs the second-factor routes. Nil answers 501, like support.
+	mfa *MFAService
+
+	// ── Auth plane closure (AU-04, AU-06, AU-01) ─────────────────────────────
+	limiter      *ratelimit.Limiter
+	trusted      []*net.IPNet
+	authEndpoint string
+	peerName     func(*http.Request) string
+	endLogin     func(ctx context.Context, tenantID, sid, reason, actor, correlationID string) error
+	dpop         *idenv.DPoPVerifier
+}
+
+// WithDPoP verifies DPoP proofs at resolve, so a DPoP-bound access token
+// resolves only for the holder of its key (AU-27).
+func (h *Handler) WithDPoP(d *idenv.DPoPVerifier) *Handler {
+	h.dpop = d
+	return h
+}
+
+// WithLoginThrottle installs source-level throttling on the credential
+// routes (AU-04). trusted are the proxies whose X-Forwarded-For is believed.
+func (h *Handler) WithLoginThrottle(l *ratelimit.Limiter, trusted []*net.IPNet) *Handler {
+	h.limiter, h.trusted = l, trusted
+	return h
+}
+
+// WithAuthenticateEndpoint sets the /v1/authenticate mode: "internal" (mTLS
+// peers only), "open" (local), "disabled" (AU-06; IAM §18 prohibits the
+// password grant for clients — they use the authorization code flow).
+func (h *Handler) WithAuthenticateEndpoint(mode string, peerName func(*http.Request) string) *Handler {
+	h.authEndpoint, h.peerName = mode, peerName
+	return h
+}
+
+// WithLoginSessionEnder lets a LOGOUT invalidation end the login session
+// too, so a refresh token cannot mint a replacement envelope (AU-01).
+func (h *Handler) WithLoginSessionEnder(f func(ctx context.Context, tenantID, sid, reason, actor, correlationID string) error) *Handler {
+	h.endLogin = f
+	return h
+}
+
+// throttle applies the source limits; false means a 429 was written.
+func (h *Handler) throttle(w http.ResponseWriter, r *http.Request, endpoint, tenantID string) (string, bool) {
+	ip := ratelimit.ClientIP(r, h.trusted)
+	if h.limiter == nil {
+		return ip, true
+	}
+	if d := h.limiter.Attempt(r.Context(), endpoint, ip, tenantID); !d.Allowed {
+		h.log.Warn("credential endpoint throttled", zap.String("endpoint", endpoint), zap.String("reason", d.Reason),
+			zap.String("client_ip_hash", ratelimit.HashIP(ip)))
+		w.Header().Set("Retry-After", d.RetryAfterSeconds())
+		writeCoded(w, http.StatusTooManyRequests, "too_many_attempts", "too many attempts; retry later")
+		return ip, false
+	}
+	return ip, true
+}
+
+// WithMFA wires the TOTP second factor and step-up routes.
+func (h *Handler) WithMFA(m *MFAService) *Handler {
+	h.mfa = m
+	return h
 }
 
 func NewHandler(
@@ -233,6 +298,16 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Route("/v1", func(r chi.Router) {
 		r.Post("/authenticate", h.Authenticate)
 
+		// ── Second factor (TOTP) and step-up ─────────────────────────────────
+		// Each identifies its caller by the session envelope in Authorization,
+		// never by X-Principal-Id. See handler_mfa.go.
+		r.Post("/authenticate/step-up", h.StepUp)
+		r.Post("/mfa/totp/enroll", h.EnrollTOTP)
+		r.Post("/mfa/totp/activate", h.ActivateTOTP)
+		r.Post("/mfa/totp/revoke", h.RevokeTOTP)
+		r.Get("/mfa/factors", h.ListMFAFactors)
+		r.Post("/principals/{principalID}/mfa/reset", h.ResetPrincipalMFA)
+
 		// ── GOV-01 queries ───────────────────────────────────────────────────
 		// ResolveTenantContext
 		r.Post("/context/resolve", h.ResolveContext)
@@ -299,6 +374,15 @@ func (h *Handler) ResolveContext(w http.ResponseWriter, r *http.Request) {
 		req.SourceChannel = string(env.SourceChannel)
 		req.WorkloadID = env.WorkloadID
 		req.CausationID = env.CausationID
+	}
+	if proof := r.Header.Get(idenv.HeaderDPoP); proof != "" && h.dpop != nil {
+		pf, err := h.dpop.Verify(proof, idenv.RequestMethod(r), idenv.RequestHTU(r), req.BearerToken)
+		if err != nil {
+			w.Header().Set("WWW-Authenticate", `DPoP error="invalid_dpop_proof"`)
+			writeCoded(w, http.StatusUnauthorized, "invalid_dpop_proof", err.Error())
+			return
+		}
+		req.DPoPJKT = pf.JKT
 	}
 
 	// ResolveTenantContext is a GOV-01 query: "correlation required" (S1-3 /
@@ -497,6 +581,14 @@ func (h *Handler) InvalidateSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to invalidate session")
 		return
 	}
+	// A logout ends the login session the envelope came from, so a refresh
+	// token cannot mint a replacement (AU-01). An administrative revoke of one
+	// session leaves the person's other sessions alone.
+	if req.Reason == domain.InvalidationReasonLogout && sc.AuthSessionID != "" && h.endLogin != nil {
+		if err := h.endLogin(r.Context(), tenantID, sc.AuthSessionID, domain.SessionEndLogout, callerPrincipalID, correlationID); err != nil {
+			h.log.Error("login session not ended with its session", zap.Error(err))
+		}
+	}
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -641,12 +733,39 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 }
 
 func writeError(w http.ResponseWriter, status int, msg string) {
-	writeJSON(w, status, errorResponse{Error: msg})
+	writeCoded(w, status, "", msg)
 }
 
 // writeCoded is writeError with one of the spec's stable error classes.
+//
+// The body is an RFC 9457 problem document (ZS-API-001 §12, AU-24): type,
+// title, status, detail and the lower_snake_case code clients branch on.
+// error and error_code keep their old meaning (the message, and the spec's
+// upper-case class) until every consumer reads code.
 func writeCoded(w http.ResponseWriter, status int, code, msg string) {
-	writeJSON(w, status, errorResponse{Error: msg, ErrorCode: code})
+	slug := strings.ToLower(code)
+	if slug == "" {
+		slug = strings.ToLower(strings.ReplaceAll(http.StatusText(status), " ", "_"))
+	}
+	body := map[string]any{
+		"type":      "https://api.zoikosuite.com/problems/" + strings.ReplaceAll(slug, "_", "-"),
+		"title":     http.StatusText(status),
+		"status":    status,
+		"detail":    msg,
+		"code":      slug,
+		"retryable": status == http.StatusServiceUnavailable || status == http.StatusTooManyRequests,
+		"error":     msg,
+	}
+	if code != "" {
+		body["error_code"] = code
+	}
+	if rid := w.Header().Get("Zoiko-Request-Id"); rid != "" {
+		body["request_id"] = rid
+		body["instance"] = "urn:zoikosuite:problem:" + rid
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(body)
 }
 
 // Ensure the interfaces defined in interfaces.go are satisfied at compile time.
@@ -680,6 +799,20 @@ var _ RiskSignalCache = (*session.RiskSignalCache)(nil)
 // Response: 200 with a bearer token / 400 missing field / 401 invalid
 // credentials / 503 unavailable.
 func (h *Handler) Authenticate(w http.ResponseWriter, r *http.Request) {
+	switch h.authEndpoint {
+	case "disabled":
+		writeCoded(w, http.StatusNotFound, "endpoint_disabled",
+			"password login is disabled; use the OAuth authorization code flow at /oauth2/authorize")
+		return
+	case "internal":
+		// IAM §18 prohibits the resource-owner password grant for clients.
+		// This route stays for platform tooling over mTLS only (AU-06).
+		if h.peerName == nil || h.peerName(r) == "" {
+			writeCoded(w, http.StatusForbidden, "password_grant_prohibited",
+				"clients sign in with the OAuth authorization code flow (/oauth2/authorize); this route is for mTLS platform tooling")
+			return
+		}
+	}
 	var req domain.AuthenticateRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
@@ -688,12 +821,24 @@ func (h *Handler) Authenticate(w http.ResponseWriter, r *http.Request) {
 	if req.CorrelationID == "" {
 		req.CorrelationID = r.Header.Get("X-Correlation-ID")
 	}
+	ip, ok := h.throttle(w, r, "authenticate", req.TenantID)
+	if !ok {
+		return
+	}
 
 	resp, err := h.auth.Authenticate(r.Context(), req)
+	if err != nil && h.limiter != nil && (errors.Is(err, ErrInvalidCredentials) || errors.Is(err, ErrInvalidClient)) {
+		h.limiter.Failure(r.Context(), ip, req.TenantID)
+	}
 	if err != nil {
 		switch {
 		case errors.Is(err, ErrRequestInvalid):
 			writeError(w, http.StatusBadRequest, err.Error())
+		case errors.Is(err, ErrInvalidClient):
+			// The OAuth client did not authenticate (R-1). Distinct from a wrong
+			// password: it says nothing about the account, and was decided
+			// before the account was touched.
+			writeCoded(w, http.StatusUnauthorized, "invalid_client", "invalid client credentials")
 		case errors.Is(err, ErrInvalidCredentials):
 			// One message for every rejection reason. See ErrInvalidCredentials
 			// — the reason is in access_decision_log and the event stream, not

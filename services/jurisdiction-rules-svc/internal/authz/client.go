@@ -319,6 +319,9 @@ func (c *HTTPAuthZClient) authorizeLive(ctx context.Context, principalID, scopeI
 	// several actions, and each is its own decision to record.
 	req.Header.Set("Idempotency-Key", authzRequestID+":"+actionType)
 
+	// Forward the caller's canonical envelope for downstream traceability
+	svcenvelope.ForwardTo(ctx, req)
+
 	resp, err := c.client.Do(req)
 	if err != nil {
 		c.log.Error("authorization-svc unreachable — failing closed",

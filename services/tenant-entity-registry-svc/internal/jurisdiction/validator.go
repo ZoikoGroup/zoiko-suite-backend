@@ -19,6 +19,8 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+
+	svcenvelope "zoiko.io/tenant-entity-registry-svc/internal/envelope"
 )
 
 // JurisdictionValidator validates that a jurisdiction_id exists in the
@@ -110,6 +112,9 @@ func (v *HTTPJurisdictionValidator) Lookup(ctx context.Context, jurisdictionID s
 	if err != nil {
 		return nil, ErrValidatorUnavailable
 	}
+	// Forward the caller's canonical envelope for §4 contract propagation
+	svcenvelope.ForwardTo(ctx, req)
+
 	resp, err := v.client.Do(req)
 	if err != nil {
 		v.log.Error("jurisdiction rules service unreachable — failing closed",

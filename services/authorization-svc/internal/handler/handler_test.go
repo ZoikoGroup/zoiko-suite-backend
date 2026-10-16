@@ -551,7 +551,7 @@ func privilegedStatusFor(p domain.CreatePrivilegedSessionParams) string {
 	return domain.PrivilegedSessionStatusActive
 }
 
-func (s *stubStore) DecidePrivilegedSession(_ context.Context, sessionID, tenantID, approver string, approve bool) (*domain.PrivilegedSession, error) {
+func (s *stubStore) DecidePrivilegedSession(_ context.Context, sessionID, tenantID, approver string, approve bool, _ *domain.StepUpEvidence) (*domain.PrivilegedSession, error) {
 	s.decidedBy, s.decidedApprove = approver, approve
 	if s.sessionDecideErr != nil {
 		return nil, s.sessionDecideErr

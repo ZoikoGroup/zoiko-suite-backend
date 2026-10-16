@@ -57,4 +57,7 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260526163538-3dc84a4a5aaa // indirect
 	google.golang.org/grpc v1.81.1 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
+	zoiko.io/identity-envelope v0.0.0
 )
+
+replace zoiko.io/identity-envelope => ../identity-envelope

@@ -35,10 +35,24 @@ type stubStore struct {
 	transitioned bool
 	updateErr    error
 
+	workflowUpdated *domain.Obligation
+	workflowErr     error
+
 	filingReq     *domain.FilingRequirement
 	filingErr     error
 	filingList    []*domain.FilingRequirement
 	filingListErr error
+
+	// Idempotency key methods
+	idempotencyChecked bool
+	idempotencyResult  struct {
+		alreadyProcessed    bool
+		existingResourceID  string
+		existingResourceType string
+		err                 error
+	}
+	idempotencyStored bool
+	idempotencyStoreErr error
 
 	// Chunk 10: applicability decisions.
 	applicabilityDecision   *domain.ApplicabilityDecision
@@ -78,8 +92,12 @@ func (s *stubStore) ListObligations(_ context.Context, _ domain.ListObligationsF
 	return s.list, s.listErr
 }
 
-func (s *stubStore) UpdateObligationStatus(_ context.Context, _, _ string) (*domain.Obligation, bool, error) {
+func (s *stubStore) UpdateObligationStatus(_ context.Context, _, _ string, _ int) (*domain.Obligation, bool, error) {
 	return s.updated, s.transitioned, s.updateErr
+}
+
+func (s *stubStore) UpdateObligationWorkflow(_ context.Context, _, _ string) (*domain.Obligation, error) {
+	return s.workflowUpdated, s.workflowErr
 }
 
 func (s *stubStore) CreateFilingRequirement(_ context.Context, _ domain.CreateFilingRequirementParams) (*domain.FilingRequirement, error) {
@@ -88,6 +106,15 @@ func (s *stubStore) CreateFilingRequirement(_ context.Context, _ domain.CreateFi
 
 func (s *stubStore) ListFilingRequirements(_ context.Context, _ string) ([]*domain.FilingRequirement, error) {
 	return s.filingList, s.filingListErr
+}
+
+func (s *stubStore) CheckIdempotencyKey(_ context.Context, _, _ string) (bool, string, string, error) {
+	return s.idempotencyResult.alreadyProcessed, s.idempotencyResult.existingResourceID, s.idempotencyResult.existingResourceType, s.idempotencyResult.err
+}
+
+func (s *stubStore) StoreIdempotencyKey(_ context.Context, _, _, _, _ string) error {
+	s.idempotencyStored = true
+	return s.idempotencyStoreErr
 }
 
 // ── Chunk 10: applicability decisions ───────────────────────────────────────

@@ -73,6 +73,11 @@ spec:
           value: "zoiko.policy.events"
         - name: GOVERNANCE_DECISION_LOG_SERVICE_URL
           value: "http://governance-svc.zoiko-governance.svc.cluster.local:8083"
+        # The local kind cluster runs no identity-context-svc to verify the
+        # signed envelope against; the code default (enforce) would refuse
+        # every request here.
+        - name: POLICY_IDENTITY_VERIFY
+          value: "warn"
         livenessProbe:
           httpGet:
             path: /healthz

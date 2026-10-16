@@ -35,6 +35,8 @@ import (
 	"zoiko.io/identity-context-svc/internal/events"
 	"zoiko.io/identity-context-svc/internal/health"
 	"zoiko.io/identity-context-svc/internal/idempotency"
+	"zoiko.io/identity-context-svc/internal/keys"
+	"zoiko.io/identity-context-svc/internal/mfa"
 	"zoiko.io/identity-context-svc/internal/mtlslistener"
 	"zoiko.io/identity-context-svc/internal/outbox"
 	"zoiko.io/identity-context-svc/internal/retention"
@@ -263,12 +265,21 @@ func main() {
 	// replaced, which is exactly the case worth alerting on.
 	go telemetry.SampleOutbox(relayCtx, relay, govMetrics, 30*time.Second, log)
 
-	verifier := auth.NewJWTVerifier(cfg)
-	signer, err := auth.NewJWTSigner(cfg)
-
+	// ── Signing keyring (AU-05) ──────────────────────────────────────────────
+	// Load the active signing key and any verify-only keys from config/env.
+	// The keyring is shared by JWTVerifier, JWTSigner, IdPTokenIssuer and JWKSHandler.
+	keyring, err := keys.Load(keys.Options{
+		Signing: []keys.Spec{
+			{Kid: cfg.JWTKeyID, Source: cfg.JWTSigningPrivateKeyPath},
+		},
+		ActiveKid: cfg.JWTKeyID,
+	})
 	if err != nil {
-		log.Fatal("failed to initialise JWT signer", zap.Error(err))
+		log.Fatal("failed to load signing keyring", zap.Error(err))
 	}
+
+	verifier := auth.NewJWTVerifier(cfg, keyring)
+	signer := auth.NewJWTSigner(keyring)
 
 	// ── Password hashing ───────────────────────────────────────────────────
 	// Built before the server starts listening: NewHasher performs one
@@ -292,7 +303,7 @@ func main() {
 		zap.Int("peak_memory_mib", (cfg.ArgonMemoryKiB*cfg.ArgonMaxConcurrent)/1024),
 	)
 
-	idpIssuer, err := auth.NewIdPTokenIssuer(cfg)
+	idpIssuer, err := auth.NewIdPTokenIssuer(cfg, keyring)
 	if err != nil {
 		log.Fatal("failed to initialise IdP token issuer", zap.Error(err))
 	}
@@ -375,7 +386,42 @@ func main() {
 			MaxFailedAttempts: cfg.AuthMaxFailedAttempts,
 			LockDuration:      time.Duration(cfg.AuthLockDurationSeconds) * time.Second,
 		},
-	)
+	).WithMFAStatus(principalRepo)
+
+	// ── Login clients (Group 1 register R-1) ──────────────────────────────
+	// A confidential client proving its secret at /v1/authenticate is what
+	// puts a VERIFIED azp on the token, so IDP_CLIENT_CHANNELS can turn a human
+	// login into a verified source channel.
+	clientRegistry, err := auth.LoadClientRegistry(cfg.IDPClientSecretsFile, cfg.IDPClientAuth == "required")
+	if err != nil {
+		log.Fatal("failed to load login client registry", zap.Error(err))
+	}
+	authenticator.WithClients(clientRegistry)
+	log.Info("login client authentication",
+		zap.String("mode", cfg.IDPClientAuth), zap.Int("clients", clientRegistry.Count()))
+
+	// ── Second factor (TOTP) and step-up ──────────────────────────────────
+	// Without a key the routes answer 503 (local only: config.Load refuses a
+	// staging or production boot without MFA_SECRET_KEY).
+	var mfaKeys *mfa.Keyring
+	if len(cfg.MFASecretKeys) > 0 {
+		mfaKeys, err = mfa.NewKeyring(cfg.MFASecretKeyID, cfg.MFASecretKeys)
+		if err != nil {
+			log.Fatal("failed to initialise MFA keyring", zap.Error(err))
+		}
+	} else {
+		log.Warn("MFA_SECRET_KEY unset: TOTP enrolment and step-up are unavailable, so no privileged session can be issued")
+	}
+	mfaService := identityctx.NewMFAService(log, principalRepo, mfaKeys,
+		auth.NewEnvelopeVerifier(keyring, cfg.JWTIssuer, cfg.JWTAudienceInternal),
+		idpIssuer, publisher, siemClient,
+		identityctx.MFAPolicy{
+			MaxFailedAttempts: cfg.MFAMaxFailedAttempts,
+			LockDuration:      time.Duration(cfg.MFALockDurationSeconds) * time.Second,
+			RecentAuth:        time.Duration(cfg.MFARecentAuthSeconds) * time.Second,
+			SkewSteps:         cfg.MFATOTPSkewSteps,
+			IssuerLabel:       cfg.MFAIssuerLabel,
+		})
 
 	// ── HTTP router ───────────────────────────────────────────────────────
 	r := chi.NewRouter()
@@ -468,7 +514,7 @@ func main() {
 	))
 	r.Handle("/metrics", promhttp.Handler())
 
-	r.Get("/.well-known/jwks.json", auth.NewJWKSHandler(signer.PublicKey(), cfg.JWTKeyID))
+	r.Get("/.well-known/jwks.json", auth.NewJWKSHandler(keyring))
 
 	// ── GOV-01 command services ───────────────────────────────────────────
 	supportService := identityctx.NewSupportService(
@@ -532,7 +578,8 @@ func main() {
 	h := identityctx.NewHandler(resolver, authenticator, sessionCache, principalRepo, authzClient, log).
 		WithEnvironment(domain.Environment(cfg.Environment)).
 		WithSupport(supportService).
-		WithContextCache(cacheService)
+		WithContextCache(cacheService).
+		WithMFA(mfaService)
 	identityctx.RegisterRoutes(r, h)
 
 	// ── Retention / disposition sweep (GOV-09) ────────────────────────────
@@ -651,6 +698,9 @@ func main() {
 	}
 	if err := authenticator.Drain(drainCtx); err != nil {
 		log.Warn("authenticator drain incomplete", zap.Error(err))
+	}
+	if err := mfaService.Drain(drainCtx); err != nil {
+		log.Warn("mfa drain incomplete", zap.Error(err))
 	}
 	log.Info("identity-context-svc stopped")
 }

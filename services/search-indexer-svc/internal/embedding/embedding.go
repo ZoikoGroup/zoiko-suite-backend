@@ -36,7 +36,7 @@ import (
 	"golang.org/x/text/unicode/norm"
 
 	"zoiko.io/search-indexer-svc/internal/domain"
-	"zoiko.io/search-indexer-svc/internal/envelope"
+	svcenvelope "zoiko.io/search-indexer-svc/internal/envelope"
 )
 
 var (
@@ -214,18 +214,8 @@ func (p *HTTPProvider) Embed(ctx context.Context, spec domain.EmbeddingSpec, inp
 	if p.token != "" {
 		req.Header.Set("Authorization", "Bearer "+p.token)
 	}
-	// Trace headers only, and only when there is a request behind this call.
-	// NOT the caller's identity: the provider is a processor of text, not a
-	// party to the authorization decision, and handing it principal ids would
-	// widen what it learns about who searches for what (§9.2).
-	if env, ok := envelope.FromContext(ctx); ok {
-		if env.RequestID != "" {
-			req.Header.Set(envelope.HeaderRequestID, env.RequestID)
-		}
-		if env.CorrelationID != "" {
-			req.Header.Set(envelope.HeaderCorrelationID, env.CorrelationID)
-		}
-	}
+	// Forward the caller's canonical envelope for downstream traceability
+	svcenvelope.ForwardTo(ctx, req)
 
 	resp, err := p.http.Do(req)
 	if err != nil {

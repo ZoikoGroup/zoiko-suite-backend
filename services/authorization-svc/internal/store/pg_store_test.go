@@ -130,6 +130,7 @@ func setupTestDB(t *testing.T, pool *pgxpool.Pool) {
 		"000030_session_controls.up.sql",
 		"000031_purge_outbox_and_idempotency.up.sql",
 		"000032_regrant_definer_functions.up.sql",
+		"000033_session_step_up_evidence.up.sql",
 	}
 	// Three migrations have now been missed from this list. Refuse to run
 	// against a schema the list does not fully describe.

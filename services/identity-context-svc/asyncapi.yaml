@@ -73,6 +73,11 @@ channels:
           - $ref: "#/components/messages/PrincipalStatusChanged"
           - $ref: "#/components/messages/AuthenticationSucceeded"
           - $ref: "#/components/messages/AuthenticationFailed"
+          - $ref: "#/components/messages/MFAFactorEnrolled"
+          - $ref: "#/components/messages/MFAFactorRevoked"
+          - $ref: "#/components/messages/MFAFactorReset"
+          - $ref: "#/components/messages/StepUpSucceeded"
+          - $ref: "#/components/messages/StepUpFailed"
           - $ref: "#/components/messages/TenantContextCacheInvalidated"
           - $ref: "#/components/messages/TenantContextInvalidated"
           - $ref: "#/components/messages/SupportContextAttached"
@@ -279,6 +284,66 @@ components:
         failures against addresses that do not exist is the signature of an
         enumeration sweep, and dropping those would hide exactly the attack the
         constant-time verification path defends against.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+
+    MFAFactorEnrolled:
+      name: identity.mfa_factor.enrolled
+      title: A TOTP factor was proven and is now active
+      summary: |
+        Written through the outbox in the transaction that activates the
+        factor (and retires any previous one). Payload: principal_id,
+        tenant_id, factor_id, factor_type, correlation_id. Never any secret.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+
+    MFAFactorRevoked:
+      name: identity.mfa_factor.revoked
+      title: A principal revoked its own TOTP factor
+      summary: |
+        Requires a recent step-up. Payload: principal_id, tenant_id, factor_id,
+        reason, actor, correlation_id.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+
+    MFAFactorReset:
+      name: identity.mfa_factor.reset
+      title: An administrator reset another principal's second factor
+      summary: |
+        Credential recovery (ZS-IAM-001 §3). Payload: principal_id (the
+        subject), tenant_id, reason_code, purpose, actor (the administrator),
+        correlation_id. Also streamed to SIEM at high severity.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+
+    StepUpSucceeded:
+      name: identity.step_up.succeeded
+      title: A session was stepped up with a second factor
+      summary: |
+        Written with the accepted code. Payload: principal_id, tenant_id,
+        factor_id, session_context_id, amr, correlation_id. Doc 05 §13.2 names
+        MFA/step-up events a required SIEM signal.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+
+    StepUpFailed:
+      name: identity.step_up.failed
+      title: A second-factor code was refused
+      summary: |
+        A wrong, replayed or locked code, on step-up or activation. Payload:
+        principal_id, tenant_id, credential_type, action, failure_reason,
+        correlation_id. The reason is here and in access_decision_log, never on
+        the wire.
       payload:
         allOf:
           - $ref: "#/components/schemas/Envelope"

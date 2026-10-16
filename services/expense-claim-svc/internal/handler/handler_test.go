@@ -143,7 +143,7 @@ type stubPolicy struct {
 	err    error
 }
 
-func (p *stubPolicy) EvaluateApprovalThreshold(context.Context, string, string, string, float64) (string, string, error) {
+func (p *stubPolicy) EvaluateApprovalThreshold(context.Context, policy.Caller, string, string, float64) (string, string, error) {
 	if p.err != nil {
 		return "", "", p.err
 	}

@@ -144,6 +144,10 @@ type Violation struct {
 	Field  string `json:"field"`
 	Header string `json:"header"`
 	Reason string `json:"reason"`
+	// RFC 9457 / API Standard §12 compliance: pointer is the JSON Pointer to
+	// the field in the request, code is the violation code.
+	Pointer string `json:"pointer"`
+	Code    string `json:"code"`
 }
 
 // ValidationError is the set of §4 obligations a request failed.
@@ -177,7 +181,13 @@ func (p Policy) Validate(e Envelope, r *http.Request) *ValidationError {
 
 	var vs []Violation
 	add := func(field, header, reason string) {
-		vs = append(vs, Violation{Field: field, Header: header, Reason: reason})
+		vs = append(vs, Violation{
+			Field:   field,
+			Header:  header,
+			Reason:  reason,
+			Pointer: "#/" + field,
+			Code:    "violation",
+		})
 	}
 
 	// --- §4 unconditionally Mandatory ---
