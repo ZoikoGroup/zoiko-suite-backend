@@ -3,6 +3,7 @@ package domain
 import (
 	"fmt"
 	"math"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -144,17 +145,20 @@ func PerformIntegrityValidation(req *ValidateMigrationRequest, jobID, tenantID s
 	var checks []IntegrityCheck
 	var auditEntries []AuditEntry
 	totalRecords := len(req.Records)
-	violatedRefs := make(map[string]bool)
+	// Violations are counted per RECORD (by position), never per distinct ref:
+	// several records sharing one ref are each a violation, so counting refs
+	// would overstate the valid count and the integrity score.
+	violated := make(map[int]bool)
 
 	// ── Check 1: Schema Validation (required fields) ──────────────────────────
 	schemaFailed := 0
-	for _, rec := range req.Records {
+	for i, rec := range req.Records {
 		hasMissing := false
 		for _, field := range req.RequiredFields {
 			val, exists := rec.Fields[field]
 			if !exists || strings.TrimSpace(val) == "" {
 				hasMissing = true
-				violatedRefs[rec.Ref] = true
+				violated[i] = true
 				auditEntries = append(auditEntries, AuditEntry{
 					TenantID:      tenantID,
 					JobID:         jobID,
@@ -189,11 +193,17 @@ func PerformIntegrityValidation(req *ValidateMigrationRequest, jobID, tenantID s
 	for _, rec := range req.Records {
 		seen[rec.Ref]++
 	}
+	// Every record of a duplicated ref fails: which copy is authoritative is
+	// unknowable here, so none is silently preferred (ZS-MIG-001 MIG-N05).
 	dupFailed := 0
+	for i, rec := range req.Records {
+		if seen[rec.Ref] > 1 {
+			dupFailed++
+			violated[i] = true
+		}
+	}
 	for ref, count := range seen {
 		if count > 1 {
-			dupFailed++
-			violatedRefs[ref] = true
 			auditEntries = append(auditEntries, AuditEntry{
 				TenantID:      tenantID,
 				JobID:         jobID,
@@ -221,26 +231,20 @@ func PerformIntegrityValidation(req *ValidateMigrationRequest, jobID, tenantID s
 	// ── Check 3: Numeric Format Check ─────────────────────────────────────────
 	numericFields := []string{"amount", "salary", "balance", "quantity"}
 	fmtFailed := 0
-	fmtFailedRecs := make(map[string]bool)
-	for _, rec := range req.Records {
+	fmtFailedRecs := make(map[int]bool)
+	for i, rec := range req.Records {
 		for _, field := range numericFields {
 			val, exists := rec.Fields[field]
-			if !exists {
+			// A blank value is a presence question, answered by the required-fields check.
+			if !exists || strings.TrimSpace(val) == "" {
 				continue
 			}
-			isNumeric := true
-			for _, ch := range strings.TrimSpace(val) {
-				if ch != '.' && ch != '-' && (ch < '0' || ch > '9') {
-					isNumeric = false
-					break
-				}
-			}
-			if !isNumeric {
-				if !fmtFailedRecs[rec.Ref] {
+			if !decimalRe.MatchString(strings.TrimSpace(val)) {
+				if !fmtFailedRecs[i] {
 					fmtFailed++
-					fmtFailedRecs[rec.Ref] = true
+					fmtFailedRecs[i] = true
 				}
-				violatedRefs[rec.Ref] = true
+				violated[i] = true
 				auditEntries = append(auditEntries, AuditEntry{
 					TenantID:      tenantID,
 					JobID:         jobID,
@@ -268,7 +272,7 @@ func PerformIntegrityValidation(req *ValidateMigrationRequest, jobID, tenantID s
 	})
 
 	// ── Compute final score ───────────────────────────────────────────────────
-	invalidCount := len(violatedRefs)
+	invalidCount := len(violated)
 	validCount := totalRecords - invalidCount
 	if validCount < 0 {
 		validCount = 0
@@ -281,6 +285,10 @@ func PerformIntegrityValidation(req *ValidateMigrationRequest, jobID, tenantID s
 
 	return checks, auditEntries, validCount, invalidCount, score
 }
+
+// decimalRe is a plain signed decimal: "5", "-5", "5.25", "5.", ".5". It refuses
+// "1.2.3", "-", ".", "1-2" and "--", which a per-character scan let through.
+var decimalRe = regexp.MustCompile(`^-?([0-9]+\.?[0-9]*|\.[0-9]+)$`)
 
 func sev(failCount int, whenFailed Severity) Severity {
 	if failCount > 0 {

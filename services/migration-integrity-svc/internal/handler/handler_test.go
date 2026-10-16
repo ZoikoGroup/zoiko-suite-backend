@@ -63,7 +63,7 @@ func TestValidateMigrationAndLifecycle(t *testing.T) {
 		TargetService:  "ledger-svc",
 		RequiredFields: []string{"employee_id", "amount", "cost_centre"},
 		Records: []domain.MigrationRecord{
-			// Valid record
+			// Duplicate ref (with the third record below — both copies are violations)
 			{Ref: "REC-001", Fields: map[string]string{"employee_id": "EMP-1", "amount": "5000.00", "cost_centre": "CC-100"}},
 			// Missing required field: cost_centre
 			{Ref: "REC-002", Fields: map[string]string{"employee_id": "EMP-2", "amount": "3000.00"}},
@@ -71,6 +71,8 @@ func TestValidateMigrationAndLifecycle(t *testing.T) {
 			{Ref: "REC-001", Fields: map[string]string{"employee_id": "EMP-3", "amount": "1500.00", "cost_centre": "CC-101"}},
 			// Bad numeric format
 			{Ref: "REC-003", Fields: map[string]string{"employee_id": "EMP-4", "amount": "N/A", "cost_centre": "CC-102"}},
+			// Valid record
+			{Ref: "REC-004", Fields: map[string]string{"employee_id": "EMP-5", "amount": "250.00", "cost_centre": "CC-103"}},
 		},
 	}
 
@@ -95,14 +97,15 @@ func TestValidateMigrationAndLifecycle(t *testing.T) {
 	if job.ID == "" {
 		t.Fatal("expected non-empty job ID")
 	}
-	if job.TotalRecordsCount != 4 {
-		t.Fatalf("expected 4 total records, got %d", job.TotalRecordsCount)
+	if job.TotalRecordsCount != 5 {
+		t.Fatalf("expected 5 total records, got %d", job.TotalRecordsCount)
 	}
-	if job.InvalidRecordsCount == 0 {
-		t.Fatal("expected some invalid records due to violations")
+	// Both REC-001 copies, REC-002 (missing field) and REC-003 (bad number) fail; only REC-004 is valid.
+	if job.InvalidRecordsCount != 4 || job.ValidRecordsCount != 1 {
+		t.Fatalf("expected 4 invalid / 1 valid records, got %d / %d", job.InvalidRecordsCount, job.ValidRecordsCount)
 	}
-	if job.IntegrityScore <= 0 || job.IntegrityScore > 100 {
-		t.Fatalf("expected integrity score in (0,100], got %f", job.IntegrityScore)
+	if job.IntegrityScore != 20 {
+		t.Fatalf("expected integrity score 20, got %f", job.IntegrityScore)
 	}
 	if len(job.IntegrityChecks) != 3 {
 		t.Fatalf("expected 3 integrity checks (schema, dup, format), got %d", len(job.IntegrityChecks))
