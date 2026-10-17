@@ -114,11 +114,20 @@ service. One scoring defect was fixed in this pass (B1).
   without a principal, 403 on denial, 503 when authorization-svc is
   unreachable. `MIGRATION_JOB_VIEW` is a new action name — until reader
   roles are granted it, reads fail closed with 403.
-- **A10. Source values are stored and echoed.** Audit entries keep the raw
-  offending `source_value` (e.g. a malformed salary). §25 prohibits PII or
-  sensitive values in migration logs ("errors use object IDs/reason codes,
-  not raw record dumps"); audit entries are evidence rather than logs, but
-  they are returned by the read API to anyone in the tenant (A9).
+- **A10. Source values are stored and echoed** (closed). The exposure half
+  of this was A9 — the read API echoed raw values to any principal in the
+  tenant — so what remains is an explicit decision, not a build. The value
+  is stored and echoed raw, deliberately: it is the single offending field
+  value, the evidence remediation acts on (A5, MIG-INV-12), not a record
+  dump; masking the one value a remediator must act on would leave them
+  with nothing, and no permission granularity finer than the per-entity
+  check exists here to hang a narrower read on. The boundary is therefore
+  the per-legal-entity read authorization: a caller authorized for the job
+  sees the evidence, everyone else gets 403, and the list read returns job
+  summaries carrying no audit entries at all. §25 governs migration logs;
+  this is an evidence row behind the same authorization as the job it
+  belongs to. If a whole record is ever captured, mask reads the way
+  treasury masks account numbers (`BANK_ACCOUNT_VIEW_MASKED`).
 - **A11. Integrity score is a ratio, not an acceptance result.** The 0–100
   score has no threshold, no PASS/FAIL, and no link to certification;
   "totals match" / "score is high" as an acceptance criterion is one of the

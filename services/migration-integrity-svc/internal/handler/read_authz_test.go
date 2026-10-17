@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 
@@ -183,4 +184,83 @@ func TestReads_RequirePrincipal(t *testing.T) {
 			t.Fatalf("expected 401 without a principal on %s, got %d", path, rec.Code)
 		}
 	}
+}
+
+// Raw source values are evidence, not exposure -- as long as where they can
+// be read is pinned. This test pins the boundary decided for SPEC_DEVIATIONS
+// A10: the value reaches only a principal authorized per legal entity for
+// the job (a denied read echoes nothing), and the list read never carries
+// audit entries at all.
+func TestReads_SourceValuesOnlyForAuthorizedReaders(t *testing.T) {
+	const rawSalary = "12,345.67" // fails the numeric format check; kept raw as evidence
+
+	// newJobWithRawValue creates one job whose single violation carries the
+	// raw offending value, through the real router.
+	newJobWithRawValue := func(t *testing.T, router http.Handler, principalID string) domain.MigrationJob {
+		t.Helper()
+		validateReq := domain.ValidateMigrationRequest{
+			LegalEntityID:  "LE-READ-VALUE",
+			MigrationName:  "raw source value fixture",
+			SourceSystem:   "LEGACY_ERP",
+			TargetService:  "payroll-svc",
+			RequiredFields: []string{"salary"},
+			Records: []domain.MigrationRecord{
+				{Ref: "REC-VALUE-1", Fields: map[string]string{"salary": rawSalary}},
+			},
+		}
+		body, _ := json.Marshal(validateReq)
+		req := httptest.NewRequest(http.MethodPost, "/v1/migrations/validate", bytes.NewBuffer(body))
+		withEnvelope(req)
+		req.Header.Set("X-Tenant-ID", "tenant-read-authz")
+		req.Header.Set("X-Principal-Id", principalID)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("fixture: expected 201, got %d: %s", rec.Code, rec.Body.String())
+		}
+		var job domain.MigrationJob
+		_ = json.Unmarshal(rec.Body.Bytes(), &job)
+		return job
+	}
+
+	t.Run("denied reader never sees the value", func(t *testing.T) {
+		router, _ := newRouterWithAuthz(t, func(body map[string]string) string {
+			if body["action_type"] == "MIGRATION_JOB_VIEW" {
+				return "DENIED"
+			}
+			return "GRANTED"
+		})
+		job := newJobWithRawValue(t, router, "reader-value-denied")
+		rec := issueRead(t, router, "/v1/migrations/"+job.ID, "tenant-read-authz", "reader-value-denied")
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("expected 403 for a denied reader, got %d", rec.Code)
+		}
+		if strings.Contains(rec.Body.String(), rawSalary) {
+			t.Fatal("a denied read must not echo the raw source value")
+		}
+	})
+
+	t.Run("authorized reader gets the evidence", func(t *testing.T) {
+		router, _ := newRouterWithAuthz(t, nil) // grants everything
+		job := newJobWithRawValue(t, router, "reader-value-allowed")
+		rec := issueRead(t, router, "/v1/migrations/"+job.ID, "tenant-read-authz", "reader-value-allowed")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 for an authorized reader, got %d: %s", rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), rawSalary) {
+			t.Fatal("an authorized read must return the raw source value: it is the evidence remediation acts on")
+		}
+	})
+
+	t.Run("list read carries no source values", func(t *testing.T) {
+		router, _ := newRouterWithAuthz(t, nil)
+		newJobWithRawValue(t, router, "reader-value-list")
+		rec := issueRead(t, router, "/v1/migrations?legal_entity_id=LE-READ-VALUE", "tenant-read-authz", "reader-value-list")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 for an authorized list read, got %d: %s", rec.Code, rec.Body.String())
+		}
+		if strings.Contains(rec.Body.String(), rawSalary) || strings.Contains(rec.Body.String(), "audit_entries") {
+			t.Fatal("the list read returns job summaries and must not carry audit entries / source values")
+		}
+	})
 }
