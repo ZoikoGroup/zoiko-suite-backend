@@ -88,6 +88,14 @@ type IntegrityCheck struct {
 	CreatedAt      time.Time `json:"created_at"`
 }
 
+// AuditEntry is one violation in a job's audit trail. SourceValue is the
+// single offending field value -- the evidence remediation acts on
+// (MIG-INV-12), never a record dump. It is kept raw rather than masked:
+// masking the one value a remediator must act on would leave the read API
+// empty-handed, with no narrower path to the evidence. The boundary that
+// keeps the raw value from being an exposure is the per-legal-entity read
+// authorization (SPEC_DEVIATIONS A9/A10); the list read carries no audit
+// entries at all.
 type AuditEntry struct {
 	ID            string        `json:"id,omitempty"`
 	TenantID      string        `json:"tenant_id"`

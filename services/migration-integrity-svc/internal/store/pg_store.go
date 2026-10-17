@@ -489,7 +489,13 @@ func (m *MemoryStore) ListJobs(ctx context.Context, tenantID, legalEntityID, sta
 		if status != "" && string(j.Status) != status {
 			continue
 		}
-		result = append(result, *j)
+		// The list is a job summary: no checks, no audit entries, no raw
+		// source values -- matching PgStore.ListJobs, which selects job
+		// columns only. The detail route carries them (SPEC_DEVIATIONS A10).
+		summary := *j
+		summary.IntegrityChecks = nil
+		summary.AuditEntries = nil
+		result = append(result, summary)
 	}
 	return result, nil
 }
