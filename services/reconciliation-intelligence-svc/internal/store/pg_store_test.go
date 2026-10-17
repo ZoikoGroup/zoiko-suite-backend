@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -42,6 +43,7 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	for _, migration := range []string{
 		"000001_initial_schema.up.sql",
 		"000002_add_eventing_outbox.up.sql",
+		"000003_bank_reconciliation_source.up.sql",
 	} {
 		sql, err := os.ReadFile(filepath.Join(base, "../../deployments/migrations", migration))
 		if err != nil {
@@ -55,29 +57,36 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
+const (
+	testRunID  = "6f1c2a8e-3b7d-4c55-9a10-2d4e8f7b9c01"
+	testLineID = "0b7e4c1a-9d2f-4e6b-8a3c-5f1d2e3c4b5a"
+)
+
+// newTestJob is a run-sourced job: one suggestion about one UNMATCHED
+// bank-reconciliation statement line. Match counters are nil — not measured
+// by this service.
 func newTestJob(legalEntityID string) (*domain.ReconciliationJob, []domain.UnmatchedItem) {
 	job := &domain.ReconciliationJob{
-		LegalEntityID:       legalEntityID,
-		JobName:             "test-job",
-		SourceSystemA:       domain.SourceGeneralLedger,
-		SourceSystemB:       domain.SourceBankStatement,
-		TotalProcessedCount: 2,
-		MatchedCount:        1,
-		UnmatchedCount:      1,
-		ReconciliationRate:  50.0,
-		Status:              "COMPLETED",
+		LegalEntityID:           legalEntityID,
+		JobName:                 "test-job",
+		BankReconciliationRunID: testRunID,
+		SourceSystemA:           domain.SourceBankStatement,
+		TotalProcessedCount:     1,
+		UnmatchedCount:          1,
+		Status:                  "COMPLETED",
 	}
 	items := []domain.UnmatchedItem{{
-		TransactionRefA:   "ref-a",
-		TransactionRefB:   "ref-b",
-		AmountA:           "100.25",
-		AmountB:           "132.5",
-		DiscrepancyAmount: "32.25",
-		DiscrepancyType:   domain.DiscrepancyAmountMismatch,
-		ConfidenceScore:   80,
-		Recommendation:    domain.RecommendationManualReview,
-		ResolutionStatus:  "RECOMMENDED",
-		ResolutionNotes:   "heuristic: above tolerance",
+		BankReconciliationRunID: testRunID,
+		StatementLineID:         testLineID,
+		TransactionRefA:         "REF-1",
+		AmountA:                 "100.25",
+		AmountB:                 "132.5",
+		DiscrepancyAmount:       "32.25",
+		DiscrepancyType:         domain.DiscrepancyMissingReference,
+		ConfidenceScore:         60,
+		Recommendation:          domain.RecommendationManualReview,
+		ResolutionStatus:        "RECOMMENDED",
+		ResolutionNotes:         "heuristic: above tolerance",
 	}}
 	return job, items
 }
@@ -211,5 +220,91 @@ func TestPgStore_AmountsRoundTripExactly(t *testing.T) {
 	}
 	if resolved.AmountA != "100.25" || resolved.AmountB != "132.5" || resolved.DiscrepancyAmount != "32.25" {
 		t.Fatalf("ApplyResolution amounts = %s / %s / %s, want 100.25 / 132.5 / 32.25", resolved.AmountA, resolved.AmountB, resolved.DiscrepancyAmount)
+	}
+}
+
+// TestPgStore_RunSourcedJob_TraceableAndUnmeasuredCountersStayNull proves
+// the A1 provenance survives storage — the run on the job, run and
+// statement line on each suggestion — and that a run-sourced job's match
+// counters are stored as NULL, not as a 0 / 0% nobody measured.
+func TestPgStore_RunSourcedJob_TraceableAndUnmeasuredCountersStayNull(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.NewPgStore(pool, store.WithEventRegion("test"))
+
+	tenantID := uuid.New().String()
+	ctx := context.Background()
+
+	job, items := newTestJob("le-us")
+	if err := s.CreateJob(ctx, tenantID, job, items, "actor-1", "corr-1"); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+
+	var matchedNull, rateNull, sourceBNull bool
+	if err := pool.QueryRow(ctx, `SELECT matched_count IS NULL, reconciliation_rate IS NULL, source_system_b IS NULL
+		FROM reconciliation_jobs WHERE id = $1`, job.ID).Scan(&matchedNull, &rateNull, &sourceBNull); err != nil {
+		t.Fatalf("raw select: %v", err)
+	}
+	if !matchedNull || !rateNull || !sourceBNull {
+		t.Fatalf("expected NULL matched_count/reconciliation_rate/source_system_b, got null=%v/%v/%v", matchedNull, rateNull, sourceBNull)
+	}
+
+	got, err := s.GetJobByID(ctx, tenantID, job.ID)
+	if err != nil {
+		t.Fatalf("GetJobByID: %v", err)
+	}
+	if got.BankReconciliationRunID != testRunID || got.MatchedCount != nil || got.ReconciliationRate != nil || got.SourceSystemB != "" {
+		t.Fatalf("job read back as run %q matched %v rate %v source_b %q", got.BankReconciliationRunID, got.MatchedCount, got.ReconciliationRate, got.SourceSystemB)
+	}
+	it := got.UnmatchedItems[0]
+	if it.BankReconciliationRunID != testRunID || it.StatementLineID != testLineID {
+		t.Fatalf("item read back as run %q line %q, want %q %q", it.BankReconciliationRunID, it.StatementLineID, testRunID, testLineID)
+	}
+
+	listed, err := s.ListJobs(ctx, tenantID, "le-us", "", "")
+	if err != nil || len(listed) != 1 || listed[0].BankReconciliationRunID != testRunID {
+		t.Fatalf("ListJobs: %v %+v", err, listed)
+	}
+
+	resolved, err := s.ApplyResolution(ctx, tenantID, job.ID, it.ID, domain.StatusApproved, "", job.LegalEntityID, "actor-2", "corr-2")
+	if err != nil {
+		t.Fatalf("ApplyResolution: %v", err)
+	}
+	if resolved.StatementLineID != testLineID {
+		t.Fatalf("ApplyResolution returned line %q", resolved.StatementLineID)
+	}
+	var eventData string
+	if err := pool.QueryRow(ctx, `SELECT convert_from(payload, 'UTF8') FROM eventing_outbox WHERE tenant_id = $1 AND event_type LIKE '%resolution-recommended'`, tenantID).Scan(&eventData); err != nil {
+		t.Fatalf("resolution event: %v", err)
+	}
+	if !strings.Contains(eventData, testLineID) || !strings.Contains(eventData, testRunID) {
+		t.Fatalf("resolution event does not name its statement line and run: %s", eventData)
+	}
+}
+
+// TestPgStore_LegacyJob_CountersPreserved proves jobs analyzed before
+// migration 000003 (caller-posted, two-sided) still read back with the
+// counters they were stored with and no source record.
+func TestPgStore_LegacyJob_CountersPreserved(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.NewPgStore(pool, store.WithEventRegion("test"))
+
+	tenantID := uuid.New().String()
+	ctx := context.Background()
+
+	matched, rate := 1, 50.0
+	job := &domain.ReconciliationJob{
+		LegalEntityID: "le-us", JobName: "legacy", SourceSystemA: domain.SourceGeneralLedger, SourceSystemB: domain.SourceBankStatement,
+		TotalProcessedCount: 2, MatchedCount: &matched, UnmatchedCount: 1, ReconciliationRate: &rate, Status: "COMPLETED",
+	}
+	if err := s.CreateJob(ctx, tenantID, job, nil, "actor-1", "corr-1"); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	got, err := s.GetJobByID(ctx, tenantID, job.ID)
+	if err != nil {
+		t.Fatalf("GetJobByID: %v", err)
+	}
+	if got.MatchedCount == nil || *got.MatchedCount != 1 || got.ReconciliationRate == nil || *got.ReconciliationRate != 50 ||
+		got.SourceSystemB != domain.SourceBankStatement || got.BankReconciliationRunID != "" {
+		t.Fatalf("legacy job read back as %+v", got)
 	}
 }

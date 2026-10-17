@@ -7,11 +7,6 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"go.uber.org/zap"
-	"zoiko.io/reconciliation-intelligence-svc/internal/authz"
-	"zoiko.io/reconciliation-intelligence-svc/internal/domain"
-	"zoiko.io/reconciliation-intelligence-svc/internal/financialcontrol"
-	"zoiko.io/reconciliation-intelligence-svc/internal/handler"
 	"zoiko.io/reconciliation-intelligence-svc/internal/store"
 )
 
@@ -22,10 +17,7 @@ import (
 // the whole request — never silently fall back to a guessed default,
 // and never create a job.
 func TestAnalyzeReconciliation_NoGovernedTolerance_RefusesRatherThanGuesses(t *testing.T) {
-	logger := zap.NewNop()
 	memStore := store.NewMemoryStore()
-	authzSrv := newGrantingAuthzServer(t)
-	authzClient := authz.NewClient(authzSrv.URL, logger)
 
 	// No TolerancePolicy configured for anyone — the real shape an
 	// operator hasn't gotten to yet.
@@ -34,17 +26,10 @@ func TestAnalyzeReconciliation_NoGovernedTolerance_RefusesRatherThanGuesses(t *t
 		_ = json.NewEncoder(w).Encode(map[string]any{"items": []map[string]any{}})
 	}))
 	t.Cleanup(emptyToleranceSrv.Close)
-	financialControlClient := financialcontrol.NewClient(emptyToleranceSrv.URL, logger)
 
-	h := handler.NewHandler(memStore, authzClient, financialControlClient, logger)
-	router := handler.NewRouter(h)
+	router := newTestRouter(t, deps{store: memStore, financialControlURL: emptyToleranceSrv.URL})
 
-	body, _ := json.Marshal(domain.AnalyzeReconciliationRequest{
-		LegalEntityID: "le-unconfigured", JobName: "job", SourceSystemA: domain.SourceGeneralLedger,
-		SourceSystemB: domain.SourceBankStatement,
-		TransactionsA: []domain.TransactionItem{{RefID: "r1", Amount: "100.00"}},
-		TransactionsB: []domain.TransactionItem{{RefID: "r1", Amount: "132.00"}},
-	})
+	body := analyzeBody("le-1", runSmall)
 	req := httptest.NewRequest(http.MethodPost, "/v1/reconciliations/analyze", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Tenant-ID", "tenant-no-policy")
@@ -57,7 +42,7 @@ func TestAnalyzeReconciliation_NoGovernedTolerance_RefusesRatherThanGuesses(t *t
 		t.Fatalf("expected 424 Failed Dependency when no tolerance policy is configured, got %d: %s", rec.Code, rec.Body.String())
 	}
 
-	jobs, err := memStore.ListJobs(req.Context(), "tenant-no-policy", "le-unconfigured", "", "")
+	jobs, err := memStore.ListJobs(req.Context(), "tenant-no-policy", "le-1", "", "")
 	if err != nil {
 		t.Fatalf("list jobs: %v", err)
 	}
@@ -70,20 +55,9 @@ func TestAnalyzeReconciliation_NoGovernedTolerance_RefusesRatherThanGuesses(t *t
 // covers the transport-failure case distinctly from "no policy yet" —
 // both must refuse, but for different reasons (503 vs 424).
 func TestAnalyzeReconciliation_FinancialControlUnreachable_FailsClosed(t *testing.T) {
-	logger := zap.NewNop()
-	memStore := store.NewMemoryStore()
-	authzSrv := newGrantingAuthzServer(t)
-	authzClient := authz.NewClient(authzSrv.URL, logger)
-	financialControlClient := financialcontrol.NewClient("http://127.0.0.1:1", logger) // nothing listens here
+	router := newTestRouter(t, deps{financialControlURL: "http://127.0.0.1:1"}) // nothing listens here
 
-	h := handler.NewHandler(memStore, authzClient, financialControlClient, logger)
-	router := handler.NewRouter(h)
-
-	body, _ := json.Marshal(domain.AnalyzeReconciliationRequest{
-		LegalEntityID: "le-1", JobName: "job", SourceSystemA: domain.SourceGeneralLedger,
-		SourceSystemB: domain.SourceBankStatement,
-		TransactionsA: []domain.TransactionItem{{RefID: "r1", Amount: "100.00"}},
-	})
+	body := analyzeBody("le-1", runSmall)
 	req := httptest.NewRequest(http.MethodPost, "/v1/reconciliations/analyze", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Tenant-ID", "tenant-1")

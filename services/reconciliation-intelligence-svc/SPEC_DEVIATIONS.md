@@ -20,30 +20,63 @@ service refuses to analyze without them.
 
 Overall: the advisory claim holds — the service writes only its own tables
 and never posts, waives or clears anything — and the tolerance gate is real.
-But it does not do what the data model and the ownership table say it is for:
-it does not consume bank-reconciliation and it never proposes a candidate
-match. Roughly 40% of what its own description implies is implemented. Two
-defects were fixed in this pass (B1, B2); a later pass closed A7 and the
-decimal half of A4.
+It now consumes bank-reconciliation (A1), but it still never proposes a
+candidate match (A2), which is the other half of what the data model and the
+ownership table say it is for. Two defects were fixed in this pass (B1, B2);
+a later pass closed A7 and the decimal half of A4; a third closed A1, A3 and
+A6.
 
 ## A. Not implemented / weaker than the spec
 
-- **A1. It does not consume bank-reconciliation.** Transactions are pushed in
-  the `POST /v1/reconciliations/analyze` body by the caller; nothing reads
-  bank-reconciliation-svc's runs or unmatched items. Suggestions are therefore
-  about whatever the caller sent, with no link to an authoritative
-  reconciliation run or record. Scope: read the unmatched items of a
-  bank-reconciliation run (or a financial-control-svc run) by id, and store
-  the source run id and record ids on each suggestion.
-- **A2. It never proposes a candidate match.** Matching is exact `ref_id`
-  equality; `RecommendationAutoMatch` and the discrepancy types `DATE_SKEW`
-  and `DUPLICATE_ENTRY` are declared and never produced. The one thing
-  ZS-CONTROL-001 §10 says AI assistance is for — proposing that two records
-  with *different* references are the same — is absent. Duplicate refs on
-  side B collapse silently in a map (last one wins).
-- **A3. One-directional.** Only side A is walked: a side-B item with no
-  side-A counterpart is never reported, and `total_processed_count` and the
-  reconciliation rate count side A only.
+- **A1. It does not consume bank-reconciliation** (closed). Transactions used
+  to be pushed in the `POST /v1/reconciliations/analyze` body by the caller,
+  so suggestions were about whatever the caller sent. The body is now
+  `{legal_entity_id, job_name, bank_reconciliation_run_id}` (unknown fields,
+  including the old `transactions_a`/`transactions_b`, are 400).
+  `internal/bankrec` reads the run (`GET /v1/reconciliation-runs/{id}`), then
+  its UNMATCHED lines (`GET /v1/statement-lines?bank_account_id=&
+  statement_date=&status=UNMATCHED`) — the same `(bank_account_id,
+  statement_date)` scope bank-reconciliation-svc's `FreezePopulation`
+  selects. `GET …/population` is not used: it returns the population's
+  header, not its lines. The job stores `bank_reconciliation_run_id`; every
+  suggestion stores `bank_reconciliation_run_id` and the real
+  `statement_line_id` (migration 000003), and the resolution event carries
+  both. The read fails closed: a run of another legal entity is 403, a
+  superseded run 409, and a line outside the run's scope, not UNMATCHED,
+  duplicated, or with an amount that cannot be held exactly is 502 — as is
+  bank-reconciliation-svc refusing the request (a 4xx is reported as this
+  request's defect, not an outage). Read-only by construction: the client
+  has no write method, and bank-reconciliation-svc's own propose/confirm/
+  reject-match flow remains the only way a match is established.
+  *Limits:* bank-reconciliation-svc's list route has no cursor and caps a
+  page at 1000, so a run with 1000+ UNMATCHED lines is refused (422) rather
+  than analyzed partially; lifting that needs a paged population route
+  there. Suggestions are about the run's *current* UNMATCHED lines, not the
+  frozen population snapshot, because no route exposes the snapshot's lines.
+  Pre-000003 jobs keep NULL in the new columns — there is no source record
+  to backfill.
+- **A2. It never proposes a candidate match.** There is no matching at all
+  now: since A1 the input is bank-reconciliation-svc's UNMATCHED lines, and
+  each one gets a review/write-off suggestion on its own.
+  `RecommendationAutoMatch` and the discrepancy types `DATE_SKEW` and
+  `DUPLICATE_ENTRY` are declared and never produced, and `AMOUNT_MISMATCH` /
+  `TIMING_ADJUSTMENT` are now produced only on pre-A1 jobs. The one thing
+  ZS-CONTROL-001 §10 says AI assistance is for — proposing that a line and a
+  ledger record with *different* references are the same — is absent; it
+  needs a counterpart source (general-ledger journals or banking-connector
+  canonical transactions) this service does not yet read.
+- **A3. One-directional** (closed — the framing no longer applies). Only side
+  A was walked: a side-B item with no side-A counterpart was never reported,
+  and `total_processed_count` and the rate counted side A only. Since A1 there
+  are no sides: bank-reconciliation-svc already ran the two-sided match, and
+  its UNMATCHED lines are one population. Every line is examined once and
+  yields exactly one suggestion, so nothing can be invisible, and
+  `total_processed_count` is the number of lines read. A run-sourced job's
+  `matched_count` and `reconciliation_rate` are NULL (omitted from JSON)
+  rather than a constant 0 / 0%: every line examined is unmatched by
+  definition, and match state is bank-reconciliation-svc's to report.
+  `source_system_a` is `BANK_STATEMENTS` and `source_system_b` is NULL.
+  Pre-A1 jobs keep the counters they were stored with.
 - **A4. Money has no currency** (the D06 decimal half is fixed). *Fixed:*
   amounts, discrepancies and tolerances were `float64`; they are now exact
   decimal strings compared as `big.Rat` (`internal/domain/decimal.go`, same
@@ -59,8 +92,8 @@ decimal half of A4.
   *Still open:* items carry no currency, so the governed tolerance (which
   has a currency in financial-control-svc) is compared with amounts of
   unknown currency, and the tolerance client ignores the policy's currency.
-  Belongs with A1, once bank-reconciliation data gives the amounts a
-  currency.
+  Since A1 the source line does have one (bank-reconciliation-svc's
+  `currency_code`); it is read but not yet stored or compared.
 - **A5. `WRITE_OFF` and `TIMING_ADJUSTMENT` are accounting actions, and
   `EXECUTED` has no reference.** The service recommends them, which is
   allowed (advisory), but marking a suggestion `EXECUTED` records no
@@ -69,10 +102,21 @@ decimal half of A4.
   domain's command, never free text. Scope: require an `authoritative_ref` on
   `EXECUTED`, or drop `EXECUTED` and let the owning domain's event close the
   suggestion.
-- **A6. Reads are not authorized.** `GET /v1/reconciliations` and `GET
-  /v1/reconciliations/{id}` check only the tenant (RLS); any principal of the
-  tenant can read every legal entity's jobs and items. Writes are authorized
-  per entity.
+- **A6. Reads are not authorized** (closed). `GET /v1/reconciliations` and
+  `GET /v1/reconciliations/{id}` checked only the tenant (RLS); any principal
+  of the tenant could read every legal entity's jobs and items. Both now
+  require `X-Principal-Id` (401) and a `RECONCILIATION_READ` grant from
+  authorization-svc on the legal entity (403 denied, 503 unreachable), the
+  same fail-closed check the writes use. `GET /{id}` checks the job's own
+  entity, after loading it, as the write routes do. The list now requires
+  `legal_entity_id` (400 without it): "every entity in the tenant" is not
+  something one decision can grant. Writes are unchanged — analyze checks
+  `RECONCILIATION_ANALYZE` on the request's entity and now also refuses a
+  run belonging to another entity. *Open, outside this service:* none of
+  this service's actions (`RECONCILIATION_READ`, `_ANALYZE`,
+  `_APPLY_RESOLUTION`, `_ARCHIVE`) is registered in access-control-svc's
+  permission taxonomy (migration 000008), which validates every bundle
+  write, so no permission bundle can grant them yet.
 - **A7. Silent in-memory fallback in production** (closed). If Postgres was
   unreachable or failed its ping at startup, `cmd/server/main.go` logged a
   warning and served from `MemoryStore`: jobs and decisions were lost on

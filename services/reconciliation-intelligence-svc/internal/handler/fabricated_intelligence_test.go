@@ -28,13 +28,8 @@ import (
 func TestApplyResolution_EmptyHumanNote_PreservesMachineRationale(t *testing.T) {
 	router := setupTestRouter(t)
 
-	analyzeBody, _ := json.Marshal(domain.AnalyzeReconciliationRequest{
-		LegalEntityID: "le-1", JobName: "job", SourceSystemA: domain.SourceGeneralLedger,
-		SourceSystemB: domain.SourceBankStatement,
-		TransactionsA: []domain.TransactionItem{{RefID: "r1", Amount: "100.00"}},
-		TransactionsB: []domain.TransactionItem{{RefID: "r1", Amount: "132.00"}}, // $32 discrepancy, below $50 tolerance
-	})
-	analyzeReq := httptest.NewRequest(http.MethodPost, "/v1/reconciliations/analyze", bytes.NewReader(analyzeBody))
+	// runSmall: one UNMATCHED 5.00 line, below the 10 tolerance.
+	analyzeReq := httptest.NewRequest(http.MethodPost, "/v1/reconciliations/analyze", bytes.NewReader(analyzeBody("le-1", runSmall)))
 	analyzeReq.Header.Set("Content-Type", "application/json")
 	analyzeReq.Header.Set("X-Tenant-ID", "tenant-rec-fab")
 	analyzeReq.Header.Set("X-Principal-Id", "principal-01")
@@ -93,12 +88,8 @@ func TestApplyResolution_EmptyHumanNote_PreservesMachineRationale(t *testing.T) 
 func TestApplyResolution_HumanNote_AppendedNotOverwritten(t *testing.T) {
 	router := setupTestRouter(t)
 
-	analyzeBody, _ := json.Marshal(domain.AnalyzeReconciliationRequest{
-		LegalEntityID: "le-1", JobName: "job", SourceSystemA: domain.SourceGeneralLedger,
-		SourceSystemB: domain.SourceBankStatement,
-		TransactionsA: []domain.TransactionItem{{RefID: "orphan", Amount: "5.00"}},
-	})
-	analyzeReq := httptest.NewRequest(http.MethodPost, "/v1/reconciliations/analyze", bytes.NewReader(analyzeBody))
+	// runSmall: one UNMATCHED 5.00 line, below the 10 tolerance.
+	analyzeReq := httptest.NewRequest(http.MethodPost, "/v1/reconciliations/analyze", bytes.NewReader(analyzeBody("le-1", runSmall)))
 	analyzeReq.Header.Set("Content-Type", "application/json")
 	analyzeReq.Header.Set("X-Tenant-ID", "tenant-rec-fab2")
 	analyzeReq.Header.Set("X-Principal-Id", "principal-01")

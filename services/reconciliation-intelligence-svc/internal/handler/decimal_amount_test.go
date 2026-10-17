@@ -1,37 +1,49 @@
 package handler_test
 
 import (
+	"encoding/json"
 	"net/http"
-	"net/http/httptest"
-	"strings"
 	"testing"
+
+	"zoiko.io/reconciliation-intelligence-svc/internal/domain"
+	"zoiko.io/reconciliation-intelligence-svc/internal/store"
 )
 
-// ZS-DATA-001 D06: amounts cross the API as exact decimal strings. A JSON
-// number would have to pass through float64 to be decoded, and a value with
-// more precision than the NUMERIC(18,4) column would be silently rounded by
-// Postgres — both are refused with 400 rather than accepted inexactly.
-func TestAnalyzeReconciliation_RejectsInexactAmounts(t *testing.T) {
-	router := setupTestRouter(t)
+const runExact = "44444444-4444-4444-8444-444444444444"
 
-	cases := map[string]string{
-		"json number":         `500.00`,
-		"five decimal places": `"500.00001"`,
+// ZS-DATA-001 D06: bank-reconciliation-svc sends amount as a bare JSON
+// number. It is decoded as its decimal text, never through float64 on this
+// side, so a 14-digit amount float64 cannot hold survives to the suggestion
+// exactly.
+func TestAnalyze_UpstreamAmountKeptExactly(t *testing.T) {
+	router := newTestRouter(t, deps{runs: map[string]fakeRun{
+		runExact: {LegalEntityID: "LE-1", Lines: [][2]string{{"sl-big", "90071992547409.93"}}},
+	}})
+
+	rec := postAnalyze(router, "LE-1", runExact)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
 	}
-	for name, amount := range cases {
-		body := `{"legal_entity_id":"LE-1","job_name":"j","source_system_a":"GENERAL_LEDGER","source_system_b":"BANK_STATEMENTS",` +
-			`"transactions_a":[{"ref_id":"TX-1","amount":` + amount + `,"date":"2026-07-01"}]}`
-		req := httptest.NewRequest(http.MethodPost, "/v1/reconciliations/analyze", strings.NewReader(body))
-		withEnvelope(req)
-		req.Header.Set("X-Tenant-ID", "tenant-dec")
-		req.Header.Set("X-Principal-Id", "principal-01")
-		req.Header.Set("Content-Type", "application/json")
-		rec := httptest.NewRecorder()
+	var job domain.ReconciliationJob
+	_ = json.Unmarshal(rec.Body.Bytes(), &job)
+	if got := job.UnmatchedItems[0].AmountA; got != "90071992547409.93" {
+		t.Fatalf("amount_a = %s, want 90071992547409.93", got)
+	}
+}
 
-		router.ServeHTTP(rec, req)
+// An upstream amount the NUMERIC(18,4) columns cannot hold exactly (here a
+// float artifact) is refused, not rounded, and nothing is stored.
+func TestAnalyze_UpstreamAmountInexact_RefusedNoJob(t *testing.T) {
+	memStore := store.NewMemoryStore()
+	router := newTestRouter(t, deps{store: memStore, runs: map[string]fakeRun{
+		runExact: {LegalEntityID: "LE-1", Lines: [][2]string{{"sl-x", "0.30000000000000004"}}},
+	}})
 
-		if rec.Code != http.StatusBadRequest {
-			t.Errorf("%s: expected 400, got %d: %s", name, rec.Code, rec.Body.String())
-		}
+	rec := postAnalyze(router, "LE-1", runExact)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("expected 502, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if jobs, _ := memStore.ListJobs(t.Context(), "tenant-test", "LE-1", "", ""); len(jobs) != 0 {
+		t.Fatalf("a refused analysis must not create a job, found %d", len(jobs))
 	}
 }

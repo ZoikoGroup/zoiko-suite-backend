@@ -22,9 +22,14 @@ type Config struct {
 	EventResidencyRegion string
 
 	// FinancialControlURL is financial-control-svc's base URL — the
-	// governed, versioned TolerancePolicy registry PerformIntelligentReconciliation
+	// governed, versioned TolerancePolicy registry AnalyzeUnmatchedStatementLines
 	// fetches its write-off tolerances from (ZS-SVC-Z-001 INV-09).
 	FinancialControlURL string
+
+	// BankReconciliationURL is bank-reconciliation-svc's base URL — the
+	// owner of the statement lines and runs this service analyzes. Read
+	// only: nothing here writes to it (see internal/bankrec).
+	BankReconciliationURL string
 
 	// AuthzMTLSEnabled/AuthzMTLSURL wire this service into the material-path
 	// mTLS pilot (see authorization-svc/internal/mtls's doc comment).
@@ -48,6 +53,7 @@ func Load() (*Config, error) {
 	authzURL := getEnv("AUTHZ_SERVICE_URL", "http://localhost:8089")
 	logLevel := getEnv("LOG_LEVEL", "info")
 	financialControlURL := getEnv("FINANCIAL_CONTROL_SERVICE_URL", "http://financial-control-svc:8171")
+	bankReconciliationURL := getEnv("BANK_RECONCILIATION_SERVICE_URL", "http://bank-reconciliation-svc:8102")
 
 	return &Config{
 		EventResidencyRegion: region,
@@ -58,6 +64,8 @@ func Load() (*Config, error) {
 		AuthzURL:             authzURL,
 		LogLevel:             logLevel,
 		FinancialControlURL:  financialControlURL,
+
+		BankReconciliationURL: bankReconciliationURL,
 
 		AuthzMTLSEnabled:         getEnv("AUTHZ_MTLS_ENABLED", "false") == "true",
 		AuthzMTLSURL:             getEnv("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),
