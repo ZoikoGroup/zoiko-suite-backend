@@ -40,7 +40,7 @@ func NewHandler(s store.Store, a *authz.Client, l *zap.Logger) *Handler {
 	return &Handler{store: s, authz: a, logger: l}
 }
 
-func NewRouter(h *Handler) http.Handler {
+func NewRouter(h *Handler, extra ...func(chi.Router)) http.Handler {
 	r := chi.NewRouter()
 
 	r.Use(middleware.RequestID)
@@ -64,6 +64,9 @@ func NewRouter(h *Handler) http.Handler {
 		r.Post("/runs/{runID}:replay", h.ReplayFromCheckpoint)
 		r.Get("/runs/{runID}/quarantine-items", h.ListQuarantineItems)
 		r.Get("/checkpoints/{sourceID}", h.GetCheckpoint)
+		for _, register := range extra {
+			register(r)
+		}
 	})
 
 	return r
