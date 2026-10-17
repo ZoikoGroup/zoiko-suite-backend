@@ -3,6 +3,7 @@ package domain
 import (
 	"fmt"
 	"math"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -17,6 +18,7 @@ type JobStatus string
 const (
 	CheckSchemaValidation   CheckType = "SCHEMA_VALIDATION"
 	CheckReferentialInteg   CheckType = "REFERENTIAL_INTEGRITY"
+	CheckSourceIdentity     CheckType = "SOURCE_IDENTITY"
 	CheckDuplicateDetection CheckType = "DUPLICATE_DETECTION"
 	CheckRangeCheck         CheckType = "RANGE_CHECK"
 	CheckFormatCheck        CheckType = "FORMAT_CHECK"
@@ -29,11 +31,12 @@ const (
 )
 
 const (
-	ViolationMissingRequired ViolationType = "MISSING_REQUIRED"
-	ViolationTypeMismatch    ViolationType = "TYPE_MISMATCH"
-	ViolationDuplicate       ViolationType = "DUPLICATE"
-	ViolationOutOfRange      ViolationType = "OUT_OF_RANGE"
-	ViolationOrphanedRef     ViolationType = "ORPHANED_REFERENCE"
+	ViolationMissingRequired       ViolationType = "MISSING_REQUIRED"
+	ViolationTypeMismatch          ViolationType = "TYPE_MISMATCH"
+	ViolationDuplicate             ViolationType = "DUPLICATE"
+	ViolationOutOfRange            ViolationType = "OUT_OF_RANGE"
+	ViolationOrphanedRef           ViolationType = "ORPHANED_REFERENCE"
+	ViolationMissingSourceIdentity ViolationType = "MISSING_SOURCE_IDENTITY"
 )
 
 const (
@@ -51,24 +54,29 @@ type MigrationRecord struct {
 	Fields map[string]string `json:"fields"`
 }
 
+// MigrationJob is one validation run. IntegrityScoreThreshold is the
+// acceptance bar the run was actually judged against (the config value at
+// validation time), stored per job so a PASS/FAIL decision remains
+// auditable after the configured default changes (SPEC_DEVIATIONS A11).
 type MigrationJob struct {
-	ID                  string           `json:"id"`
-	TenantID            string           `json:"tenant_id"`
-	LegalEntityID       string           `json:"legal_entity_id"`
-	MigrationName       string           `json:"migration_name"`
-	SourceSystem        string           `json:"source_system"`
-	TargetService       string           `json:"target_service"`
-	TotalRecordsCount   int              `json:"total_records_count"`
-	ValidRecordsCount   int              `json:"valid_records_count"`
-	InvalidRecordsCount int              `json:"invalid_records_count"`
-	IntegrityScore      float64          `json:"integrity_score"`
-	Status              JobStatus        `json:"status"`
-	IntegrityChecks     []IntegrityCheck `json:"integrity_checks,omitempty"`
-	AuditEntries        []AuditEntry     `json:"audit_entries,omitempty"`
-	StartedAt           *time.Time       `json:"started_at,omitempty"`
-	CompletedAt         *time.Time       `json:"completed_at,omitempty"`
-	CreatedAt           time.Time        `json:"created_at"`
-	UpdatedAt           time.Time        `json:"updated_at"`
+	ID                      string           `json:"id"`
+	TenantID                string           `json:"tenant_id"`
+	LegalEntityID           string           `json:"legal_entity_id"`
+	MigrationName           string           `json:"migration_name"`
+	SourceSystem            string           `json:"source_system"`
+	TargetService           string           `json:"target_service"`
+	TotalRecordsCount       int              `json:"total_records_count"`
+	ValidRecordsCount       int              `json:"valid_records_count"`
+	InvalidRecordsCount     int              `json:"invalid_records_count"`
+	IntegrityScore          float64          `json:"integrity_score"`
+	IntegrityScoreThreshold float64          `json:"integrity_score_threshold"`
+	Status                  JobStatus        `json:"status"`
+	IntegrityChecks         []IntegrityCheck `json:"integrity_checks,omitempty"`
+	AuditEntries            []AuditEntry     `json:"audit_entries,omitempty"`
+	StartedAt               *time.Time       `json:"started_at,omitempty"`
+	CompletedAt             *time.Time       `json:"completed_at,omitempty"`
+	CreatedAt               time.Time        `json:"created_at"`
+	UpdatedAt               time.Time        `json:"updated_at"`
 }
 
 type IntegrityCheck struct {
@@ -85,6 +93,14 @@ type IntegrityCheck struct {
 	CreatedAt      time.Time `json:"created_at"`
 }
 
+// AuditEntry is one violation in a job's audit trail. SourceValue is the
+// single offending field value -- the evidence remediation acts on
+// (MIG-INV-12), never a record dump. It is kept raw rather than masked:
+// masking the one value a remediator must act on would leave the read API
+// empty-handed, with no narrower path to the evidence. The boundary that
+// keeps the raw value from being an exposure is the per-legal-entity read
+// authorization (SPEC_DEVIATIONS A9/A10); the list read carries no audit
+// entries at all.
 type AuditEntry struct {
 	ID            string        `json:"id,omitempty"`
 	TenantID      string        `json:"tenant_id"`
@@ -95,7 +111,16 @@ type AuditEntry struct {
 	TargetValue   string        `json:"target_value,omitempty"`
 	ViolationType ViolationType `json:"violation_type"`
 	IsRemediated  bool          `json:"is_remediated"`
-	CreatedAt     time.Time     `json:"created_at"`
+
+	// Remediation evidence (ZS-MIG-001 MIG-INV-12: owner, reason code and
+	// disposition). Recorded on the first remediation only; a replayed
+	// remediate request returns the original decision unchanged.
+	RemediationReason      string     `json:"remediation_reason,omitempty"`
+	RemediationEvidenceRef string     `json:"remediation_evidence_ref,omitempty"`
+	RemediatedBy           string     `json:"remediated_by,omitempty"`
+	RemediatedAt           *time.Time `json:"remediated_at,omitempty"`
+
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // ─── Request DTOs ─────────────────────────────────────────────────────────────
@@ -109,8 +134,14 @@ type ValidateMigrationRequest struct {
 	Records        []MigrationRecord `json:"records"`
 }
 
+// RemediateRequest is the body of
+// POST /v1/migrations/{id}/audit/{entryId}/remediate. Remediation is an
+// evidenced decision, not a boolean flip: a reason and a reference to the
+// evidence supporting it are both required (MIG-INV-12, MIG-N27).
 type RemediateRequest struct {
-	Notes string `json:"notes"`
+	RemediationReason string `json:"remediation_reason"`
+
+	RemediationEvidenceRef string `json:"remediation_evidence_ref"`
 }
 
 // ─── Validation ───────────────────────────────────────────────────────────────
@@ -134,27 +165,43 @@ func (r *ValidateMigrationRequest) Validate() error {
 	return nil
 }
 
+// Validate enforces that a remediation carries its evidence: a reason
+// (the disposition) and a reference to what supports it. Both are required;
+// a blank or whitespace-only value is missing, not provided.
+func (r *RemediateRequest) Validate() error {
+	if strings.TrimSpace(r.RemediationReason) == "" {
+		return fmt.Errorf("remediation_reason is required")
+	}
+	if strings.TrimSpace(r.RemediationEvidenceRef) == "" {
+		return fmt.Errorf("remediation_evidence_ref is required")
+	}
+	return nil
+}
+
 // ─── Integrity Engine ─────────────────────────────────────────────────────────
 
-// PerformIntegrityValidation runs schema, duplicate, and format integrity checks
-// on the provided migration records. Returns checks, audit entries, valid count,
-// invalid count, and an integrity score (0–100%).
+// PerformIntegrityValidation runs schema, source identity, duplicate, and
+// format integrity checks on the provided migration records. Returns checks,
+// audit entries, valid count, invalid count, and an integrity score (0–100%).
 func PerformIntegrityValidation(req *ValidateMigrationRequest, jobID, tenantID string) ([]IntegrityCheck, []AuditEntry, int, int, float64) {
 	now := time.Now()
 	var checks []IntegrityCheck
 	var auditEntries []AuditEntry
 	totalRecords := len(req.Records)
-	violatedRefs := make(map[string]bool)
+	// Violations are counted per RECORD (by position), never per distinct ref:
+	// several records sharing one ref are each a violation, so counting refs
+	// would overstate the valid count and the integrity score.
+	violated := make(map[int]bool)
 
 	// ── Check 1: Schema Validation (required fields) ──────────────────────────
 	schemaFailed := 0
-	for _, rec := range req.Records {
+	for i, rec := range req.Records {
 		hasMissing := false
 		for _, field := range req.RequiredFields {
 			val, exists := rec.Fields[field]
 			if !exists || strings.TrimSpace(val) == "" {
 				hasMissing = true
-				violatedRefs[rec.Ref] = true
+				violated[i] = true
 				auditEntries = append(auditEntries, AuditEntry{
 					TenantID:      tenantID,
 					JobID:         jobID,
@@ -184,16 +231,72 @@ func PerformIntegrityValidation(req *ValidateMigrationRequest, jobID, tenantID s
 		CreatedAt:      now,
 	})
 
-	// ── Check 2: Duplicate Detection ──────────────────────────────────────────
+	// ── Check 2: Source Identity Presence ─────────────────────────────────────
+	// A blank ref is not just another value: the record has no source identity
+	// at all (MIG-INV-02 "every object preserves source identity"), which is a
+	// different defect from a duplicated one. Reported here, before duplicate
+	// detection, so several blank refs are each reported for what they are
+	// rather than only as "duplicates" of one another.
+	//
+	// refBlank is computed once: the identity check, the duplicate scan and
+	// its per-record count all need the same answer, and trimming each ref
+	// three times over would be pure repetition.
+	refBlank := make([]bool, totalRecords)
+	identityFailed := 0
+	for i, rec := range req.Records {
+		if strings.TrimSpace(rec.Ref) == "" {
+			refBlank[i] = true
+			identityFailed++
+			violated[i] = true
+			auditEntries = append(auditEntries, AuditEntry{
+				TenantID:      tenantID,
+				JobID:         jobID,
+				RecordRef:     rec.Ref,
+				ViolationType: ViolationMissingSourceIdentity,
+				IsRemediated:  false,
+				CreatedAt:     now,
+			})
+		}
+	}
+	checks = append(checks, IntegrityCheck{
+		TenantID:       tenantID,
+		JobID:          jobID,
+		CheckName:      "Source Identity Presence",
+		CheckType:      CheckSourceIdentity,
+		RecordsChecked: totalRecords,
+		RecordsPassed:  totalRecords - identityFailed,
+		RecordsFailed:  identityFailed,
+		Severity:       sev(identityFailed, SeverityCritical),
+		Detail:         fmt.Sprintf("Scanned %d records for a source reference", totalRecords),
+		CreatedAt:      now,
+	})
+
+	// ── Check 3: Duplicate Detection ──────────────────────────────────────────
+	// Blank refs are excluded (refBlank, computed once by the identity
+	// check above): they were already reported for what they are, and
+	// comparing empty strings would report a batch of unidentified records
+	// as duplicates of each other instead.
 	seen := make(map[string]int)
-	for _, rec := range req.Records {
+	for i, rec := range req.Records {
+		if refBlank[i] {
+			continue
+		}
 		seen[rec.Ref]++
 	}
+	// Every record of a duplicated ref fails: which copy is authoritative is
+	// unknowable here, so none is silently preferred (ZS-MIG-001 MIG-N05).
 	dupFailed := 0
+	for i, rec := range req.Records {
+		if refBlank[i] {
+			continue
+		}
+		if seen[rec.Ref] > 1 {
+			dupFailed++
+			violated[i] = true
+		}
+	}
 	for ref, count := range seen {
 		if count > 1 {
-			dupFailed++
-			violatedRefs[ref] = true
 			auditEntries = append(auditEntries, AuditEntry{
 				TenantID:      tenantID,
 				JobID:         jobID,
@@ -218,29 +321,23 @@ func PerformIntegrityValidation(req *ValidateMigrationRequest, jobID, tenantID s
 		CreatedAt:      now,
 	})
 
-	// ── Check 3: Numeric Format Check ─────────────────────────────────────────
+	// ── Check 4: Numeric Format Check ─────────────────────────────────────────
 	numericFields := []string{"amount", "salary", "balance", "quantity"}
 	fmtFailed := 0
-	fmtFailedRecs := make(map[string]bool)
-	for _, rec := range req.Records {
+	fmtFailedRecs := make(map[int]bool)
+	for i, rec := range req.Records {
 		for _, field := range numericFields {
 			val, exists := rec.Fields[field]
-			if !exists {
+			// A blank value is a presence question, answered by the required-fields check.
+			if !exists || strings.TrimSpace(val) == "" {
 				continue
 			}
-			isNumeric := true
-			for _, ch := range strings.TrimSpace(val) {
-				if ch != '.' && ch != '-' && (ch < '0' || ch > '9') {
-					isNumeric = false
-					break
-				}
-			}
-			if !isNumeric {
-				if !fmtFailedRecs[rec.Ref] {
+			if !decimalRe.MatchString(strings.TrimSpace(val)) {
+				if !fmtFailedRecs[i] {
 					fmtFailed++
-					fmtFailedRecs[rec.Ref] = true
+					fmtFailedRecs[i] = true
 				}
-				violatedRefs[rec.Ref] = true
+				violated[i] = true
 				auditEntries = append(auditEntries, AuditEntry{
 					TenantID:      tenantID,
 					JobID:         jobID,
@@ -268,7 +365,7 @@ func PerformIntegrityValidation(req *ValidateMigrationRequest, jobID, tenantID s
 	})
 
 	// ── Compute final score ───────────────────────────────────────────────────
-	invalidCount := len(violatedRefs)
+	invalidCount := len(violated)
 	validCount := totalRecords - invalidCount
 	if validCount < 0 {
 		validCount = 0
@@ -281,6 +378,25 @@ func PerformIntegrityValidation(req *ValidateMigrationRequest, jobID, tenantID s
 
 	return checks, auditEntries, validCount, invalidCount, score
 }
+
+// EvaluateJobStatus derives a job's acceptance result from its integrity
+// score and the acceptance bar the service applied: below the bar is FAILED,
+// at or above is COMPLETED. A run in which every record is invalid is FAILED
+// at any bar -- a migration with nothing intact is not an accepted migration,
+// whatever the configured threshold says (SPEC_DEVIATIONS A11).
+func EvaluateJobStatus(score float64, validCount, invalidCount int, threshold float64) JobStatus {
+	if validCount == 0 && invalidCount > 0 {
+		return JobStatusFailed
+	}
+	if score < threshold {
+		return JobStatusFailed
+	}
+	return JobStatusCompleted
+}
+
+// decimalRe is a plain signed decimal: "5", "-5", "5.25", "5.", ".5". It refuses
+// "1.2.3", "-", ".", "1-2" and "--", which a per-character scan let through.
+var decimalRe = regexp.MustCompile(`^-?([0-9]+\.?[0-9]*|\.[0-9]+)$`)
 
 func sev(failCount int, whenFailed Severity) Severity {
 	if failCount > 0 {

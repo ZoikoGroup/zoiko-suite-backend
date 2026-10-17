@@ -75,6 +75,7 @@ services:
       - ../services/currency-registry-svc/deployments/migrations:/migrations/currency-registry:ro
       - ../services/fiscal-calendar-svc/deployments/migrations:/migrations/fiscal-calendar:ro
       - ../services/accounting-period-svc/deployments/migrations:/migrations/accounting-period:ro
+      - ../services/financial-statements-svc/deployments/migrations:/migrations/financial-statements:ro
       - ../services/access-control-svc/deployments/migrations:/migrations/access-control:ro
       - ../services/decision-support-svc/deployments/migrations:/migrations/decision-support:ro
       - ../services/treasury-svc/deployments/migrations:/migrations/treasury:ro
@@ -2459,6 +2460,46 @@ services:
       start_period: 10s
     restart: on-failure
 
+  financial-statements-svc:
+    build:
+      # services/, so the build can reach ../eventing — see the Dockerfile.
+      context: ../services
+      dockerfile: financial-statements-svc/Dockerfile
+    container_name: financial-statements-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8175:8175"
+    environment:
+      PORT: "8175"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: financial_statements
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
+      DB_SSLMODE: disable
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.financial-statements.events"
+      EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      FINANCIAL_CLOSE_URL: "http://financial-close-svc:8104"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+      financial-close-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8175/readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
   # Access Control Service — 03-microservices.md §9.4. Owns role/permission-
   # bundle DEFINITIONS (the catalogue); previously unbuilt. Scope decision:
   # authorization-svc keeps owning live RBAC role/assignment data — this
@@ -2757,8 +2798,9 @@ services:
 
   financial-close-svc:
     build:
-      context: ../services/financial-close-svc
-      dockerfile: Dockerfile
+      # services/, so the build can reach ../eventing — see the Dockerfile.
+      context: ../services
+      dockerfile: financial-close-svc/Dockerfile
     container_name: financial-close-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -2782,6 +2824,11 @@ services:
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.close.events"
+      # Required, no default (ZS-EVENT-001 §4 residencyregion) — was missing
+      # entirely, so every outbox event this service tried to enqueue failed
+      # envelope validation with 'residency region "" must be a controlled
+      # lower-case code'. Found via VerifySnapshotIntegrity's manual test.
+      EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       LEDGER_SERVICE_URL: "http://general-ledger-svc:8098"
       AP_SERVICE_URL: "http://accounts-payable-svc:8099"
@@ -2966,8 +3013,9 @@ services:
 
   intercompany-accounting-svc:
     build:
-      context: ../services/intercompany-accounting-svc
-      dockerfile: Dockerfile
+      # services/, so the build can reach ../eventing — see the Dockerfile.
+      context: ../services
+      dockerfile: intercompany-accounting-svc/Dockerfile
     container_name: intercompany-accounting-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -2983,6 +3031,7 @@ services:
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.intercompany.events"
+      EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       LEDGER_SERVICE_URL: "http://general-ledger-svc:8098"
       TENANT_REGISTRY_URL: "http://tenant-entity-registry-svc:8081"

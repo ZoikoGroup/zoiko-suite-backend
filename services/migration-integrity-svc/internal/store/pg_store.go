@@ -26,7 +26,7 @@ type Store interface {
 	GetJobByID(ctx context.Context, tenantID, id string) (*domain.MigrationJob, error)
 	ListJobs(ctx context.Context, tenantID, legalEntityID, status string) ([]domain.MigrationJob, error)
 	ArchiveJob(ctx context.Context, tenantID, id, actorID, correlationID string) error
-	RemediateEntry(ctx context.Context, tenantID, jobID, entryID, notes, actorID, correlationID string) (*domain.AuditEntry, error)
+	RemediateEntry(ctx context.Context, tenantID, jobID, entryID, reason, evidenceRef, actorID, correlationID string) (*domain.AuditEntry, error)
 }
 
 // ─── PgStore ──────────────────────────────────────────────────────────────────
@@ -108,11 +108,11 @@ func (s *PgStore) CreateJob(ctx context.Context, tenantID string, job *domain.Mi
 		INSERT INTO migration_jobs
 		  (id, tenant_id, legal_entity_id, migration_name, source_system, target_service,
 		   total_records_count, valid_records_count, invalid_records_count, integrity_score,
-		   status, started_at, completed_at, created_at, updated_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+		   integrity_score_threshold, status, started_at, completed_at, created_at, updated_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
 		job.ID, tenantID, job.LegalEntityID, job.MigrationName, job.SourceSystem, job.TargetService,
 		job.TotalRecordsCount, job.ValidRecordsCount, job.InvalidRecordsCount, job.IntegrityScore,
-		string(job.Status), job.StartedAt, job.CompletedAt, job.CreatedAt, job.UpdatedAt,
+		job.IntegrityScoreThreshold, string(job.Status), job.StartedAt, job.CompletedAt, job.CreatedAt, job.UpdatedAt,
 	)
 	if err != nil {
 		return fmt.Errorf("insert migration_job: %w", err)
@@ -191,12 +191,12 @@ func (s *PgStore) GetJobByID(ctx context.Context, tenantID, id string) (*domain.
 	err = tx.QueryRow(ctx, `
 		SELECT id, tenant_id, legal_entity_id, migration_name, source_system, target_service,
 		       total_records_count, valid_records_count, invalid_records_count, integrity_score,
-		       status, started_at, completed_at, created_at, updated_at
+		       integrity_score_threshold, status, started_at, completed_at, created_at, updated_at
 		FROM migration_jobs
 		WHERE id = $1`, id).Scan(
 		&job.ID, &job.TenantID, &job.LegalEntityID, &job.MigrationName, &job.SourceSystem, &job.TargetService,
 		&job.TotalRecordsCount, &job.ValidRecordsCount, &job.InvalidRecordsCount, &job.IntegrityScore,
-		&job.Status, &startedAt, &completedAt, &job.CreatedAt, &job.UpdatedAt,
+		&job.IntegrityScoreThreshold, &job.Status, &startedAt, &completedAt, &job.CreatedAt, &job.UpdatedAt,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("migration job not found: %w", err)
@@ -218,14 +218,17 @@ func (s *PgStore) GetJobByID(ctx context.Context, tenantID, id string) (*domain.
 	}
 
 	arows, err := tx.Query(ctx, `
-		SELECT id, tenant_id, job_id, record_ref, field_name, source_value, target_value, violation_type, is_remediated, created_at
+		SELECT id, tenant_id, job_id, record_ref, field_name, source_value, target_value, violation_type, is_remediated, created_at,
+		       remediation_reason, remediation_evidence_ref, remediated_by, remediated_at
 		FROM migration_audit_entries WHERE job_id = $1 ORDER BY created_at ASC`, id)
 	if err == nil {
 		defer arows.Close()
 		for arows.Next() {
 			var e domain.AuditEntry
-			var fieldName, srcVal, tgtVal *string
-			if err := arows.Scan(&e.ID, &e.TenantID, &e.JobID, &e.RecordRef, &fieldName, &srcVal, &tgtVal, &e.ViolationType, &e.IsRemediated, &e.CreatedAt); err == nil {
+			var fieldName, srcVal, tgtVal, reasonVal, evidenceVal, remediatedBy *string
+			var remediatedAt *time.Time
+			if err := arows.Scan(&e.ID, &e.TenantID, &e.JobID, &e.RecordRef, &fieldName, &srcVal, &tgtVal, &e.ViolationType, &e.IsRemediated, &e.CreatedAt,
+				&reasonVal, &evidenceVal, &remediatedBy, &remediatedAt); err == nil {
 				if fieldName != nil {
 					e.FieldName = *fieldName
 				}
@@ -235,6 +238,16 @@ func (s *PgStore) GetJobByID(ctx context.Context, tenantID, id string) (*domain.
 				if tgtVal != nil {
 					e.TargetValue = *tgtVal
 				}
+				if reasonVal != nil {
+					e.RemediationReason = *reasonVal
+				}
+				if evidenceVal != nil {
+					e.RemediationEvidenceRef = *evidenceVal
+				}
+				if remediatedBy != nil {
+					e.RemediatedBy = *remediatedBy
+				}
+				e.RemediatedAt = remediatedAt
 				job.AuditEntries = append(job.AuditEntries, e)
 			}
 		}
@@ -258,7 +271,7 @@ func (s *PgStore) ListJobs(ctx context.Context, tenantID, legalEntityID, status 
 	query := `
 		SELECT id, tenant_id, legal_entity_id, migration_name, source_system, target_service,
 		       total_records_count, valid_records_count, invalid_records_count, integrity_score,
-		       status, started_at, completed_at, created_at, updated_at
+		       integrity_score_threshold, status, started_at, completed_at, created_at, updated_at
 		FROM migration_jobs
 		WHERE 1=1`
 	var args []interface{}
@@ -288,7 +301,7 @@ func (s *PgStore) ListJobs(ctx context.Context, tenantID, legalEntityID, status 
 		if err := rows.Scan(
 			&j.ID, &j.TenantID, &j.LegalEntityID, &j.MigrationName, &j.SourceSystem, &j.TargetService,
 			&j.TotalRecordsCount, &j.ValidRecordsCount, &j.InvalidRecordsCount, &j.IntegrityScore,
-			&j.Status, &startedAt, &completedAt, &j.CreatedAt, &j.UpdatedAt,
+			&j.IntegrityScoreThreshold, &j.Status, &startedAt, &completedAt, &j.CreatedAt, &j.UpdatedAt,
 		); err == nil {
 			j.StartedAt = startedAt
 			j.CompletedAt = completedAt
@@ -331,10 +344,13 @@ func (s *PgStore) ArchiveJob(ctx context.Context, tenantID, id, actorID, correla
 	return tx.Commit(ctx)
 }
 
-// RemediateEntry marks an audit entry remediated. Re-remediating an entry still
-// succeeds but emits nothing: a second audit_entry_remediated would be a false
-// evidence record. The event's aggregate is the entry, as the old subject_id was.
-func (s *PgStore) RemediateEntry(ctx context.Context, tenantID, jobID, entryID, notes, actorID, correlationID string) (*domain.AuditEntry, error) {
+// RemediateEntry marks an audit entry remediated, recording the remediation
+// evidence (reason, evidence reference, actor, time) with it. Re-remediating
+// an entry still succeeds but emits nothing and cannot rewrite the recorded
+// decision: the original evidence stands (a second audit_entry_remediated
+// would be a false evidence record, and a changed one would be worse). The
+// event's aggregate is the entry, as the old subject_id was.
+func (s *PgStore) RemediateEntry(ctx context.Context, tenantID, jobID, entryID, reason, evidenceRef, actorID, correlationID string) (*domain.AuditEntry, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -346,12 +362,17 @@ func (s *PgStore) RemediateEntry(ctx context.Context, tenantID, jobID, entryID, 
 	}
 
 	var e domain.AuditEntry
-	var fieldName, srcVal, tgtVal *string
+	var fieldName, srcVal, tgtVal, reasonVal, evidenceVal, remediatedBy *string
+	var remediatedAt *time.Time
 	var wasRemediated bool
 	var legalEntityID string
 	err = tx.QueryRow(ctx, `
 		UPDATE migration_audit_entries e
-		SET is_remediated = true
+		SET is_remediated = true,
+		    remediation_reason = COALESCE(e.remediation_reason, $4),
+		    remediation_evidence_ref = COALESCE(e.remediation_evidence_ref, $5),
+		    remediated_by = COALESCE(e.remediated_by, $6),
+		    remediated_at = COALESCE(e.remediated_at, $7)
 		FROM (
 			SELECT a.id, a.is_remediated, j.legal_entity_id
 			FROM migration_audit_entries a
@@ -361,9 +382,12 @@ func (s *PgStore) RemediateEntry(ctx context.Context, tenantID, jobID, entryID, 
 		) prev
 		WHERE e.id = prev.id
 		RETURNING e.id, e.tenant_id, e.job_id, e.record_ref, e.field_name, e.source_value, e.target_value,
-		          e.violation_type, e.is_remediated, e.created_at, prev.is_remediated, prev.legal_entity_id`,
-		entryID, jobID, tenantID).Scan(
+		          e.violation_type, e.is_remediated, e.created_at,
+		          e.remediation_reason, e.remediation_evidence_ref, e.remediated_by, e.remediated_at,
+		          prev.is_remediated, prev.legal_entity_id`,
+		entryID, jobID, tenantID, reason, evidenceRef, actorID, time.Now()).Scan(
 		&e.ID, &e.TenantID, &e.JobID, &e.RecordRef, &fieldName, &srcVal, &tgtVal, &e.ViolationType, &e.IsRemediated, &e.CreatedAt,
+		&reasonVal, &evidenceVal, &remediatedBy, &remediatedAt,
 		&wasRemediated, &legalEntityID,
 	)
 	if err != nil {
@@ -378,6 +402,16 @@ func (s *PgStore) RemediateEntry(ctx context.Context, tenantID, jobID, entryID, 
 	if tgtVal != nil {
 		e.TargetValue = *tgtVal
 	}
+	if reasonVal != nil {
+		e.RemediationReason = *reasonVal
+	}
+	if evidenceVal != nil {
+		e.RemediationEvidenceRef = *evidenceVal
+	}
+	if remediatedBy != nil {
+		e.RemediatedBy = *remediatedBy
+	}
+	e.RemediatedAt = remediatedAt
 
 	if !wasRemediated {
 		if err := s.enqueueMigrationEvent(ctx, tx, "audit-entry", "remediated", "migration.audit_entry_remediated", aggregateAuditEntry,
@@ -455,7 +489,13 @@ func (m *MemoryStore) ListJobs(ctx context.Context, tenantID, legalEntityID, sta
 		if status != "" && string(j.Status) != status {
 			continue
 		}
-		result = append(result, *j)
+		// The list is a job summary: no checks, no audit entries, no raw
+		// source values -- matching PgStore.ListJobs, which selects job
+		// columns only. The detail route carries them (SPEC_DEVIATIONS A10).
+		summary := *j
+		summary.IntegrityChecks = nil
+		summary.AuditEntries = nil
+		result = append(result, summary)
 	}
 	return result, nil
 }
@@ -472,7 +512,7 @@ func (m *MemoryStore) ArchiveJob(ctx context.Context, tenantID, id, _, _ string)
 	return nil
 }
 
-func (m *MemoryStore) RemediateEntry(ctx context.Context, tenantID, jobID, entryID, notes, _, _ string) (*domain.AuditEntry, error) {
+func (m *MemoryStore) RemediateEntry(ctx context.Context, tenantID, jobID, entryID, reason, evidenceRef, actorID, _ string) (*domain.AuditEntry, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	j, ok := m.jobs[jobID]
@@ -481,8 +521,18 @@ func (m *MemoryStore) RemediateEntry(ctx context.Context, tenantID, jobID, entry
 	}
 	for i := range j.AuditEntries {
 		if j.AuditEntries[i].ID == entryID {
-			j.AuditEntries[i].IsRemediated = true
-			return &j.AuditEntries[i], nil
+			e := &j.AuditEntries[i]
+			// First remediation only, same as PgStore's COALESCE: a replay
+			// returns the recorded decision and cannot rewrite it.
+			if !e.IsRemediated {
+				now := time.Now()
+				e.IsRemediated = true
+				e.RemediationReason = reason
+				e.RemediationEvidenceRef = evidenceRef
+				e.RemediatedBy = actorID
+				e.RemediatedAt = &now
+			}
+			return e, nil
 		}
 	}
 	return nil, fmt.Errorf("audit entry not found")

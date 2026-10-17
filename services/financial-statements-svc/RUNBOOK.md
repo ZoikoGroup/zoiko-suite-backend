@@ -1,0 +1,92 @@
+# Runbook — financial-statements-svc
+
+## What this service is
+
+REP-01 (Financial Statements, ZS-SVC-H-001 §4.1). Turns a CERTIFIED ACC-16
+Signed Financial Snapshot (financial-close-svc) into a Balance Sheet and
+Income Statement, through a Draft → Validated → InReview → Approved →
+Certified → Published lifecycle with segregation-of-duties enforcement.
+Port 8175, database `financial_statements`, topic
+`zoiko.financial-statements.events`.
+
+## Dependencies
+
+| Service | What for | Failure mode |
+|---|---|---|
+| Postgres | All state | Fails closed: `/readyz` fails, no writes possible. |
+| financial-close-svc | `GET /v1/financial-snapshots/{id}` — the only source of truth for a statement set | `CreateStatementSet` / `:refresh-draft` return 503 `DEPENDENCY_UNAVAILABLE` if unreachable; 422 `SOURCE_UNVERIFIED` if the snapshot isn't CERTIFIED. |
+| authorization-svc | Every command and read | Fails closed: 503 if unreachable, 403 if denied. |
+| Kafka | Event delivery | Never blocks a request — events wait in `eventing_outbox` until the relay can deliver them. |
+
+## Common operations
+
+**Check the outbox backlog**: `outbox_backlog_events{service="financial-statements-svc"}` and
+`outbox_oldest_backlog_age_seconds{service="financial-statements-svc"}` on `/metrics`. A growing
+age means the relay stopped or Kafka is unreachable — check `outboxWriter`
+connectivity, not the database.
+
+**A statement set is stuck in DRAFT with validation errors**: `GET /v1/statement-sets/{id}` shows
+`validation_errors`. The usual cause is the snapshot's accounts don't balance
+(Assets ≠ Liabilities + Equity) — this is a real data problem upstream, not a
+bug here; fix the source and `:refresh-draft` again.
+
+**A command returns 409 VERSION_CONFLICT**: someone else changed the set
+concurrently. Re-`GET` the set for its current version and retry with that
+version.
+
+**A command returns 403 SOD_DENIED**: the preparer (whoever last created or
+refreshed the set) tried to approve or certify their own work. This is
+correct behavior, not a bug — a different principal must perform that step.
+
+**Correcting a CERTIFIED or PUBLISHED set**: never edit it — call
+`POST /v1/statement-sets/{id}:supersede` with a new (also CERTIFIED)
+snapshot. The old set is marked SUPERSEDED and kept forever, unchanged; a new
+set starts its own DRAFT → ... → CERTIFIED cycle.
+
+**Fact reads fail with `column "source_accounts" does not exist`**: migration
+`000003_statement_fact_source_accounts` has not been applied to this
+database. The compose stack only runs migrations through Postgres's
+`docker-entrypoint-initdb.d` on a FRESH volume, so an existing volume must
+have it applied by hand (`psql -f deployments/migrations/000003_statement_fact_source_accounts.up.sql`).
+It is additive (one column, constant default) and safe to run on a live
+table.
+
+**Two sets show different line counts for the same snapshot**: check
+`mapping_version`. Sets created under `v1-fixed-category-map` report one
+line per account forever; sets under `v2-category-map-name-aggregation`
+merge same-named, same-category accounts. `GET /v1/statement-facts/{id}/explain`
+lists every account behind a line.
+
+**Disclosure reads/adds fail with `relation "statement_disclosures" does not exist`**:
+migration `000004_statement_disclosures` has not been applied to this
+database. Same cause as 000003 above: an existing volume must have it
+applied by hand (`psql -f deployments/migrations/000004_statement_disclosures.up.sql`),
+run as the same role that ran the earlier migrations so the app role's
+default privileges grant it DML on the new table. It is additive (one new
+table) and safe to run on a live database. Until it is applied, Approve and
+Certify also fail, because both check disclosure authorship.
+
+**`:add-disclosure` returns 409 INVALID_TRANSITION**: the set is not DRAFT.
+Notes can only be added in DRAFT; send an IN_REVIEW set back with
+`:request-changes`, or supersede a CERTIFIED/PUBLISHED one.
+
+**`:approve` / `:certify` returns 403 SOD_DENIED but the caller is not the
+preparer**: they added a disclosure to this set (SPEC_DEVIATIONS B9).
+`GET /v1/statement-sets/{id}/disclosures` shows each note's
+`added_by_principal_id`.
+
+## Known gaps (see SPEC_DEVIATIONS.md for the full list)
+
+- No Cash Flow Statement — only Balance Sheet and Income Statement.
+- A snapshot producer now exists: financial-close-svc's
+  `POST /v1/financial-snapshots/from-trial-balance` (commit 8083630e) compiles
+  general-ledger-svc's trial balance + chart of accounts into a Balance
+  Sheet-shaped `SnapshotContent` (one currency, no multi-book/consolidation
+  source, no REP-02…07 statement types). Snapshots from other sources still
+  must be hand-crafted against `internal/domain.SnapshotContent`'s schema.
+- Disclosures are freeform notes only, added in DRAFT: no check that a set
+  has the notes its framework/jurisdiction requires (SPEC_DEVIATIONS A11).
+- No real ACC-18 lineage graph walk. Comparatives are
+  two-period only, against an explicitly named CERTIFIED/PUBLISHED prior set
+  (`GetComparatives` 422 `SOURCE_UNVERIFIED` means the prior isn't certified;
+  `CONTEXT_INVALID` means entity/framework/currency/period don't line up).

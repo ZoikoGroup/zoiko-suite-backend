@@ -294,9 +294,16 @@ type TrialBalanceSnapshot struct {
 // TrialBalanceLine is one account's net balance (debit - credit) within a
 // TrialBalanceSnapshot, summed across every FINALIZED/REVERSED journal
 // line for that account at the snapshot's watermark.
+//
+// NetBalance is an exact decimal string, never float64 — ZS-DATA-001 D06,
+// the same rule SumLines's own doc comment explains for this package. The
+// underlying trial_balance_lines.net_balance column is NUMERIC(18,2); a
+// float64 field here would silently reintroduce the exactness this
+// snapshot otherwise guarantees, for every consumer that reads it back
+// (e.g. REP-01's ACC-16 ingestion), not just for GL's own code.
 type TrialBalanceLine struct {
-	AccountCode string  `json:"account_code"`
-	NetBalance  float64 `json:"net_balance"`
+	AccountCode string `json:"account_code"`
+	NetBalance  string `json:"net_balance"`
 }
 
 // AccountType is one of the five fundamental account classes.
@@ -513,6 +520,15 @@ type LedgerEntry struct {
 // never itself a source of truth. Grouped by entity/book/account/period
 // and a canonicalized dimensions key, matching the spec's "by entity,
 // book, account, dimension and period."
+//
+// DebitTotal/CreditTotal/NetBalance are exact decimal strings, never
+// float64 (ZS-DATA-001 D06: binary floating point is prohibited for
+// monetary values — the same rule SumLines's own doc comment already
+// explains for this package). The underlying ledger_balances columns are
+// NUMERIC; these fields used to lose that exactness the moment Go scanned
+// them into a float64, which also meant equality comparisons on NetBalance
+// anywhere downstream were comparing binary floats representing decimal
+// money, exactly the defect class SumLines exists to avoid.
 type LedgerBalance struct {
 	TenantID          string    `json:"tenant_id"`
 	LegalEntityID     string    `json:"legal_entity_id"`
@@ -520,9 +536,9 @@ type LedgerBalance struct {
 	AccountCode       string    `json:"account_code"`
 	FiscalPeriod      string    `json:"fiscal_period"`
 	DimensionsKey     string    `json:"dimensions_key,omitempty"`
-	DebitTotal        float64   `json:"debit_total"`
-	CreditTotal       float64   `json:"credit_total"`
-	NetBalance        float64   `json:"net_balance"`
+	DebitTotal        string    `json:"debit_total"`
+	CreditTotal       string    `json:"credit_total"`
+	NetBalance        string    `json:"net_balance"`
 	WatermarkEntrySeq int64     `json:"watermark_entry_seq"`
 	RebuiltAt         time.Time `json:"rebuilt_at"`
 }

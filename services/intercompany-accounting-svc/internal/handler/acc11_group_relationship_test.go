@@ -41,7 +41,7 @@ func (s *stubEntityRegistry) ListHierarchies(_ context.Context, _, legalEntityID
 	return s.hierarchies[legalEntityID], nil
 }
 
-func newRouterWithEntityRegistry(s *stubStoreReal, pub *stubPublisher, authz *stubAuthZ, leg *stubLedger, reg *stubEntityRegistry) chi.Router {
+func newRouterWithEntityRegistry(s *stubStoreReal, authz *stubAuthZ, leg *stubLedger, reg *stubEntityRegistry) chi.Router {
 	r := chi.NewRouter()
 	r.Use(func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -49,7 +49,7 @@ func newRouterWithEntityRegistry(s *stubStoreReal, pub *stubPublisher, authz *st
 			next.ServeHTTP(w, req)
 		})
 	})
-	h := handler.New(s, pub, authz, leg, zap.NewNop()).WithEntityRegistry(reg)
+	h := handler.New(s, authz, leg, zap.NewNop()).WithEntityRegistry(reg)
 	handler.RegisterRoutes(r, h)
 	return r
 }
@@ -66,7 +66,7 @@ func TestMatchEntry_GroupRelationshipLost_RecordsMismatchNotOutage(t *testing.T)
 		"entity-a": {{ParentLegalEntityID: "parent-x", ChildLegalEntityID: "entity-a", EffectiveFrom: time.Now().UTC().AddDate(-1, 0, 0)}},
 		"entity-b": {{ParentLegalEntityID: "parent-y", ChildLegalEntityID: "entity-b", EffectiveFrom: time.Now().UTC().AddDate(-1, 0, 0)}},
 	}}
-	r := newRouterWithEntityRegistry(s, &stubPublisher{}, &stubAuthZ{}, leg, reg)
+	r := newRouterWithEntityRegistry(s, &stubAuthZ{}, leg, reg)
 
 	resp := doReq(r, http.MethodPost, "/v1/intercompany/entries/e1/match", map[string]string{"target_journal_id": "journal-1"}, "user-1")
 	if resp.Code != http.StatusUnprocessableEntity {
@@ -92,7 +92,7 @@ func TestMatchEntry_GroupRelationshipIntact_MatchSucceeds(t *testing.T) {
 		"entity-a": {{ParentLegalEntityID: "parent-x", ChildLegalEntityID: "entity-a", EffectiveFrom: time.Now().UTC().AddDate(-1, 0, 0)}},
 		"entity-b": {{ParentLegalEntityID: "parent-x", ChildLegalEntityID: "entity-b", EffectiveFrom: time.Now().UTC().AddDate(-1, 0, 0)}},
 	}}
-	r := newRouterWithEntityRegistry(s, &stubPublisher{}, &stubAuthZ{}, leg, reg)
+	r := newRouterWithEntityRegistry(s, &stubAuthZ{}, leg, reg)
 
 	resp := doReq(r, http.MethodPost, "/v1/intercompany/entries/e1/match", map[string]string{"target_journal_id": "journal-1"}, "user-1")
 	if resp.Code != http.StatusOK {
@@ -112,7 +112,7 @@ func TestMatchEntry_NoEntityRegistryConfigured_CheckSkipped(t *testing.T) {
 	leg := &stubLedger{journal: validMatchedJournal(s.entries["e1"].Amount, "entity-b")}
 	// newRouter (not newRouterWithEntityRegistry) wires no entity registry
 	// at all — the check must be skipped, not fail closed.
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, leg)
+	r := newRouter(s, &stubAuthZ{}, leg)
 
 	resp := doReq(r, http.MethodPost, "/v1/intercompany/entries/e1/match", map[string]string{"target_journal_id": "journal-1"}, "user-1")
 	if resp.Code != http.StatusOK {
