@@ -213,3 +213,46 @@ func TestReverseConsolidationAdjustment_NoSnapshotYet_PlainReversalAllowed(t *te
 		t.Fatalf("expected 200 (no snapshot exists yet), got %d: %s", resp.Code, resp.Body.String())
 	}
 }
+
+// TestReverseConsolidationAdjustment_AfterSnapshot_InvalidSupersession_Refused
+// proves the supersession rule cannot be met by naming an adjustment that
+// replaces nothing: the adjustment itself, one for another group or period,
+// or one that was itself reversed.
+func TestReverseConsolidationAdjustment_AfterSnapshot_InvalidSupersession_Refused(t *testing.T) {
+	cases := []struct {
+		name  string
+		seed  func(s *stubStore)
+		named string
+	}{
+		{"itself", func(s *stubStore) {}, "adj-1"},
+		{"other period", func(s *stubStore) {
+			seedAdjustment(s, "adj-2", domain.AdjustmentStatusPendingApproval, "preparer-1").FiscalPeriod = "2026-08"
+		}, "adj-2"},
+		{"other group", func(s *stubStore) {
+			seedAdjustment(s, "adj-2", domain.AdjustmentStatusPendingApproval, "preparer-1").GroupLegalEntityID = "group-2"
+		}, "adj-2"},
+		{"reversed", func(s *stubStore) {
+			seedAdjustment(s, "adj-2", domain.AdjustmentStatusReversed, "preparer-1")
+		}, "adj-2"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newStubStore()
+			seedAdjustment(s, "adj-1", domain.AdjustmentStatusPosted, "preparer-1")
+			tc.seed(s)
+			s.hasSnapshot["group-1|2026-07"] = true
+			cl := &stubClients{}
+			r := newRouter(s, &stubAuthZ{}, cl)
+
+			resp := doReq(r, http.MethodPost, "/v1/consolidation/adjustments/adj-1/reverse", map[string]any{
+				"reason": "correcting an error", "superseded_by_adjustment_id": tc.named,
+			}, "reverser-1")
+			if resp.Code != http.StatusUnprocessableEntity {
+				t.Fatalf("expected 422, got %d: %s", resp.Code, resp.Body.String())
+			}
+			if s.adjustments["adj-1"].Status != domain.AdjustmentStatusPosted {
+				t.Fatalf("expected adj-1 to stay POSTED, got %q", s.adjustments["adj-1"].Status)
+			}
+		})
+	}
+}

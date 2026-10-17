@@ -178,5 +178,10 @@ var (
 	// be reversed by naming its replacement, never bare.
 	ErrReversalRequiresSupersession = errorString("a snapshot already exists for this group/period; reversal requires naming a superseding adjustment")
 
+	// ErrInvalidSupersession: the adjustment named as the replacement is
+	// this same adjustment, belongs to a different group or period, or has
+	// itself been reversed — so it replaces nothing.
+	ErrInvalidSupersession = errorString("superseded_by_adjustment_id must name a different, unreversed adjustment for the same group and fiscal period")
+
 	ErrReasonRequired = errorString("reason is required to reverse a consolidation adjustment")
 )
