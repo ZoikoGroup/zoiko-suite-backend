@@ -22,9 +22,12 @@ type Config struct {
 	// MTLSManagementServiceURL is where this service provisions its own
 	// client-side mTLS identity, used only when AuthzMTLSEnabled is true.
 	MTLSManagementServiceURL string
+
+	// Import configures INT-06 controlled import (off by default).
+	Import ImportConfig
 }
 
-func Load() *Config {
+func Load() (*Config, error) {
 	port := getEnv("PORT", "8145")
 	dbURL := getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/data_ingestion?sslmode=disable")
 	kafkaBrokers := getEnv("KAFKA_BROKERS", "localhost:9092")
@@ -35,7 +38,13 @@ func Load() *Config {
 	authzMTLSURL := getEnv("AUTHZ_MTLS_URL", "https://authorization-svc:8449")
 	mtlsManagementServiceURL := getEnv("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140")
 
+	imp, err := loadImport()
+	if err != nil {
+		return nil, err
+	}
+
 	return &Config{
+		Import:                   imp,
 		Port:                     port,
 		DatabaseURL:              dbURL,
 		KafkaBrokers:             kafkaBrokers,
@@ -45,7 +54,7 @@ func Load() *Config {
 		AuthzMTLSEnabled:         authzMTLSEnabled,
 		AuthzMTLSURL:             authzMTLSURL,
 		MTLSManagementServiceURL: mtlsManagementServiceURL,
-	}
+	}, nil
 }
 
 func getEnv(key, defaultVal string) string {
