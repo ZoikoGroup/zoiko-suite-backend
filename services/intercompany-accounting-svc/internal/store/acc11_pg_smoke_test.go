@@ -9,6 +9,7 @@ package store_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/google/uuid"
@@ -126,5 +127,54 @@ func TestPgStore_ACC11_InvalidMatchStatus_RejectedByCheckConstraint(t *testing.T
 	entry.MatchStatus = "NOT_A_REAL_STATUS"
 	if err := s.UpdateMatch(ctx, entry, "actor-1", "corr-2"); err == nil {
 		t.Fatal("expected the CHECK constraint to reject an unrecognized match_status value")
+	}
+}
+
+// TestPgStore_ACC11_UpdateMatchOnDisputedPair_Refused proves UpdateMatch's
+// status guard against the real database: a MatchIntercompany outcome that
+// arrives after the pair was disputed must not overwrite DISPUTED.
+func TestPgStore_ACC11_UpdateMatchOnDisputedPair_Refused(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool, store.WithEventRegion("test"))
+
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+
+	entry := newTestEntry(tenantID, uuid.New().String())
+	if _, err := s.CreateEntry(ctx, entry, "actor-1", "corr-1"); err != nil {
+		t.Fatalf("CreateEntry: %v", err)
+	}
+	reason := "amount_mismatch: test"
+	targetJ := uuid.New().String()
+	entry.TargetJournalID = &targetJ
+	entry.MatchStatus = domain.MatchStatusMismatch
+	entry.MismatchReason = &reason
+	if err := s.UpdateMatch(ctx, entry, "actor-1", "corr-2"); err != nil {
+		t.Fatalf("UpdateMatch to MISMATCH: %v", err)
+	}
+	if err := s.DisputeIntercompany(ctx, entry.IntercompanyEntryID, "disputer-1", "amount looks wrong"); err != nil {
+		t.Fatalf("DisputeIntercompany: %v", err)
+	}
+
+	// A stale match result computed from the earlier MISMATCH read.
+	entry.MatchStatus = domain.MatchStatusMatched
+	entry.MismatchReason = nil
+	err := s.UpdateMatch(ctx, entry, "actor-2", "corr-3")
+	if !errors.Is(err, domain.ErrInvalidPairTransition) {
+		t.Fatalf("expected ErrInvalidPairTransition, got %v", err)
+	}
+	got, err := s.GetEntry(ctx, entry.IntercompanyEntryID)
+	if err != nil {
+		t.Fatalf("GetEntry: %v", err)
+	}
+	if got.MatchStatus != domain.MatchStatusDisputed {
+		t.Fatalf("expected the pair to stay DISPUTED, got %q", got.MatchStatus)
+	}
+
+	// An id that does not exist is still reported as not found.
+	missing := *entry
+	missing.IntercompanyEntryID = uuid.New().String()
+	if err := s.UpdateMatch(ctx, &missing, "actor-2", "corr-4"); !errors.Is(err, domain.ErrEntryNotFound) {
+		t.Fatalf("expected ErrEntryNotFound for an unknown id, got %v", err)
 	}
 }
