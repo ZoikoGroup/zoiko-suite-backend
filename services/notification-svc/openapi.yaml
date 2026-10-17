@@ -3063,6 +3063,93 @@ paths:
       requestBody:
         required: false
         content: *id001
+  /v1/webhook-subscriptions:
+    post:
+      tags: [Outbound webhooks]
+      summary: Create an outbound webhook subscription (INT-04)
+      operationId: createWebhookSubscription
+      description: |
+        Starts in DRAFT. Nothing is sent to it until a different person approves exactly this
+        configuration. The destination must be https, publicly routable and in an allowed region;
+        allowed_fields may not name restricted data; signing_key_path is a reference into the
+        secret vault (the key itself never reaches this service). Requires WEBHOOK_SUBSCRIPTION_CREATE.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {type: object, required: [legal_entity_id, name, destination_url, event_types, signing_key_path, destination_region]}
+      responses:
+        "201": {description: Created (DRAFT)}
+        "400": {description: "INT-SCHEMA-004: invalid configuration"}
+        "403": {description: "INT-AUTH-003 or INT-REG-002: not authorized, or the destination or region is not allowed"}
+        "422": {description: "INT-SCOPE-013: an allowed field names restricted data"}
+    get:
+      tags: [Outbound webhooks]
+      summary: List subscriptions (WEBHOOK_SUBSCRIPTION_READ on X-Legal-Entity-Id)
+      operationId: listWebhookSubscriptions
+      responses:
+        "200": {description: Subscriptions}
+  /v1/webhook-subscriptions/{id}:
+    get:
+      tags: [Outbound webhooks]
+      summary: Get a subscription
+      operationId: getWebhookSubscription
+      responses:
+        "200": {description: The subscription}
+        "404": {description: Not found (also for another tenant's subscription)}
+    patch:
+      tags: [Outbound webhooks]
+      summary: Change a subscription
+      operationId: updateWebhookSubscription
+      description: |
+        Needs expected_version (body or X-Expected-Version). A change to the destination, events,
+        fields, API version or region withdraws any approval and returns the subscription to DRAFT;
+        a name or retry-budget change does not.
+      responses:
+        "200": {description: Updated}
+        "409": {description: "INT-IDEM-005: stale version; INT-SCOPE-013: revoked"}
+  /v1/webhook-subscriptions/{id}/submit:
+    post: {tags: [Outbound webhooks], summary: "Submit for approval (checks egress and the signing key reference)", operationId: submitWebhookSubscription, responses: {"200": {description: PENDING_APPROVAL}}}
+  /v1/webhook-subscriptions/{id}/approve:
+    post:
+      tags: [Outbound webhooks]
+      summary: Approve (maker-checker)
+      operationId: approveWebhookSubscription
+      description: The approver must not be the person who last changed the configuration. Egress, region and the signing key reference are checked again as the approver.
+      responses:
+        "200": {description: ACTIVE}
+        "403": {description: "INT-AUTH-003: self-approval or not authorized; INT-REG-002: destination not allowed"}
+        "422": {description: "INT-CRED-010: the signing key reference could not be confirmed"}
+  /v1/webhook-subscriptions/{id}/reject:
+    post: {tags: [Outbound webhooks], summary: Reject back to DRAFT (reason required), operationId: rejectWebhookSubscription, responses: {"200": {description: DRAFT}}}
+  /v1/webhook-subscriptions/{id}/rotate-signing-key:
+    post: {tags: [Outbound webhooks], summary: "Rotate the signing key reference (both keys sign during grace_period_seconds, at most 30 days)", operationId: rotateWebhookSigningKey, responses: {"200": {description: Rotated}}}
+  /v1/webhook-subscriptions/{id}/suspend:
+    post: {tags: [Outbound webhooks], summary: Suspend (reason required; deliveries stay queued), operationId: suspendWebhookSubscription, responses: {"200": {description: SUSPENDED}}}
+  /v1/webhook-subscriptions/{id}/resume:
+    post: {tags: [Outbound webhooks], summary: Resume a suspended or disabled subscription, operationId: resumeWebhookSubscription, responses: {"200": {description: ACTIVE}}}
+  /v1/webhook-subscriptions/{id}/revoke:
+    post: {tags: [Outbound webhooks], summary: Revoke for good (undelivered deliveries are dead-lettered), operationId: revokeWebhookSubscription, responses: {"200": {description: REVOKED}}}
+  /v1/webhook-subscriptions/{id}/log:
+    get: {tags: [Outbound webhooks], summary: The subscription's append-only log, operationId: webhookSubscriptionLog, responses: {"200": {description: Log entries}}}
+  /v1/webhook-subscriptions/{id}/deliveries:
+    get: {tags: [Outbound webhooks], summary: List deliveries, operationId: listWebhookDeliveries, responses: {"200": {description: Deliveries (payload hash only, never the body)}}}
+  /v1/webhook-subscriptions/{id}/health:
+    get: {tags: [Outbound webhooks], summary: Destination health (breaker, failures, queue depth), operationId: webhookDestinationHealth, responses: {"200": {description: Health}}}
+  /v1/webhook-dead-letters:
+    get: {tags: [Outbound webhooks], summary: List dead-lettered deliveries, operationId: listWebhookDeadLetters, responses: {"200": {description: Dead letters}}}
+  /v1/webhook-deliveries/{id}:
+    get: {tags: [Outbound webhooks], summary: "Delivery evidence: attempts with response code, response-body hash, signature metadata and destination host", operationId: getWebhookDeliveryEvidence, responses: {"200": {description: Evidence}}}
+  /v1/webhook-deliveries/{id}/replay:
+    post:
+      tags: [Outbound webhooks]
+      summary: Replay a dead-lettered delivery
+      operationId: replayWebhookDelivery
+      description: Keeps the delivery's identity and gives it a fresh retry budget. Needs approver_principal_id (a different person who is themselves entitled), approval_ref and reason.
+      responses:
+        "202": {description: Back on the queue}
+        "403": {description: "INT-AUTH-003: no valid approver"}
+        "409": {description: Not a dead letter, or the subscription is not active}
 components:
   parameters:
     TenantId:

@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"zoiko.io/connectivity-api-bridge-svc/internal/domain"
 )
 
@@ -88,8 +89,14 @@ func (c *Client) Verify(ctx context.Context, ref string, caller Caller) error {
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrUnavailable, err)
 	}
+	// The vault refuses a governed read without its canonical input contract (400
+	// envelope_incomplete): request id, source channel and purpose are mandatory. Found
+	// against the real vault; a stub does not enforce it.
 	req.Header.Set("X-Principal-Id", caller.PrincipalID)
 	req.Header.Set("X-Tenant-Id", caller.TenantID)
+	req.Header.Set("X-Request-Id", uuid.NewString())
+	req.Header.Set("X-Source-Channel", "system")
+	req.Header.Set("X-Purpose-Context", "connector-credential-verification")
 	if caller.CorrelationID != "" {
 		req.Header.Set("X-Correlation-Id", caller.CorrelationID)
 	}
