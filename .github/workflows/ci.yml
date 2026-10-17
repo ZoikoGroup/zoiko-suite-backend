@@ -81,6 +81,11 @@ jobs:
           # lifecycle, so its store tests need the database service below.
           - connectivity-api-bridge-svc
           - data-ingestion-svc
+          # INT-07 banking adapter: the live provider engine, and the callback receiver that owns finality.
+          - payment-initiation-adapter-svc
+          - payment-status-svc
+          # INT-08 tax authority adapter (live authority engine, callbacks, deadline-aware polling).
+          - tax-authority-interface-svc
           - schema-registry-svc
           - document-vault-svc
           - evidence-manifest-svc
@@ -182,7 +187,7 @@ jobs:
         run: go test -v -tags=integration -count=1 -timeout=600s ./cmd/server/
 
       - name: Integration test — store isolation/pipeline (PgStore → DB)
-        if: matrix.service == 'access-control-svc' || matrix.service == 'workflow-history-svc' || matrix.service == 'tenant-entity-registry-svc' || matrix.service == 'accounts-receivable-svc' || matrix.service == 'purchase-request-svc' || matrix.service == 'purchase-order-svc' || matrix.service == 'treasury-svc' || matrix.service == 'financial-close-svc' || matrix.service == 'bank-reconciliation-svc' || matrix.service == 'intercompany-accounting-svc' || matrix.service == 'consolidation-svc' || matrix.service == 'invoice-approval-svc' || matrix.service == 'employee-master-svc' || matrix.service == 'employment-contracts-svc' || matrix.service == 'payroll-run-svc' || matrix.service == 'compensation-svc' || matrix.service == 'benefits-svc' || matrix.service == 'payroll-tax-svc' || matrix.service == 'payroll-exceptions-svc' || matrix.service == 'leave-absence-svc' || matrix.service == 'org-structure-svc' || matrix.service == 'offboarding-severance-svc' || matrix.service == 'workforce-compliance-svc' || matrix.service == 'evidence-requirements-svc'
+        if: matrix.service == 'access-control-svc' || matrix.service == 'workflow-history-svc' || matrix.service == 'tenant-entity-registry-svc' || matrix.service == 'accounts-receivable-svc' || matrix.service == 'purchase-request-svc' || matrix.service == 'purchase-order-svc' || matrix.service == 'treasury-svc' || matrix.service == 'financial-close-svc' || matrix.service == 'bank-reconciliation-svc' || matrix.service == 'intercompany-accounting-svc' || matrix.service == 'consolidation-svc' || matrix.service == 'invoice-approval-svc' || matrix.service == 'employee-master-svc' || matrix.service == 'employment-contracts-svc' || matrix.service == 'payroll-run-svc' || matrix.service == 'compensation-svc' || matrix.service == 'benefits-svc' || matrix.service == 'payroll-tax-svc' || matrix.service == 'payroll-exceptions-svc' || matrix.service == 'leave-absence-svc' || matrix.service == 'org-structure-svc' || matrix.service == 'offboarding-severance-svc' || matrix.service == 'workforce-compliance-svc' || matrix.service == 'evidence-requirements-svc' || matrix.service == 'payment-initiation-adapter-svc' || matrix.service == 'payment-status-svc' || matrix.service == 'tax-authority-interface-svc'
         working-directory: services/${{ matrix.service }}
         env:
           TEST_DATABASE_URL: "postgres://postgres:secretpassword@localhost:5432/testdb?sslmode=disable"

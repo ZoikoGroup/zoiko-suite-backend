@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"encoding/json"
 	"errors"
 	"time"
 )
@@ -27,6 +28,13 @@ type TaxInterface struct {
 	Status        string    `json:"status"`
 	CreatedAt     time.Time `json:"created_at"`
 	UpdatedAt     time.Time `json:"updated_at"`
+
+	// Authority binding (INT-08). Empty ProviderKey keeps the legacy "record the intent" behaviour.
+	ProviderKey         string     `json:"provider_key,omitempty"`
+	ConnectorID         string     `json:"connector_id,omitempty"`
+	CertificateRef      string     `json:"certificate_ref,omitempty"`
+	CertificateNotAfter *time.Time `json:"certificate_not_after,omitempty"`
+	EscalateBeforeHours int        `json:"escalate_before_hours,omitempty"`
 }
 
 type TaxFilingSubmission struct {
@@ -46,6 +54,12 @@ type CreateInterfaceRequest struct {
 	Jurisdiction  string `json:"jurisdiction"`
 	AuthorityName string `json:"authority_name"`
 	Protocol      string `json:"protocol"`
+
+	ProviderKey         string     `json:"provider_key,omitempty"`
+	ConnectorID         string     `json:"connector_id,omitempty"`
+	CertificateRef      string     `json:"certificate_ref,omitempty"`
+	CertificateNotAfter *time.Time `json:"certificate_not_after,omitempty"`
+	EscalateBeforeHours int        `json:"escalate_before_hours,omitempty"`
 }
 
 type SubmitTaxFilingRequest struct {
@@ -54,4 +68,12 @@ type SubmitTaxFilingRequest struct {
 	FilingType  string  `json:"filing_type"`
 	TaxAmount   float64 `json:"tax_amount"`
 	Payload     string  `json:"payload"`
+
+	// Authority submission (INT-08). Document is the approved canonical filing; SubjectFingerprint is its canonical
+	// hash (adapter.CanonicalHash) as approved by the TAX domain; SubjectRef is the TAX submission subject.
+	SubjectRef         string          `json:"subject_ref,omitempty"`
+	SubjectFingerprint string          `json:"subject_fingerprint,omitempty"`
+	Document           json.RawMessage `json:"document,omitempty"`
+	Rail               string          `json:"rail,omitempty"`
+	DeadlineAt         *time.Time      `json:"deadline_at,omitempty"`
 }

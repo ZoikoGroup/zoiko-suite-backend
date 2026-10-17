@@ -52,6 +52,10 @@ type AttemptStatus string
 
 const (
 	StatusPrepared                 AttemptStatus = "PREPARED"
+	// StatusSubmitting is the durable "the request is leaving" state (INT-07): set by compare-and-set before the
+	// network call, so a crash mid-call leaves a trace. It is never terminal and is never resolved by an
+	// operator action; a stale one is swept to PENDING_UNKNOWN.
+	StatusSubmitting AttemptStatus = "SUBMITTING"
 	StatusSubmitted                AttemptStatus = "SUBMITTED"
 	StatusPendingUnknown           AttemptStatus = "PENDING_UNKNOWN"
 	StatusRejectedBeforeSubmission AttemptStatus = "REJECTED_BEFORE_SUBMISSION"
@@ -171,6 +175,12 @@ type PrepareAttemptRequest struct {
 	PaymentReference         string
 	PayerAccountVerified     bool
 	IdempotencyKey           string
+
+	// ProviderKey, Rail and ConnectorID bind the attempt to a certified provider profile, a rail (message
+	// version) and an approved connector (INT-05). An empty ProviderKey keeps the legacy stub path.
+	ProviderKey string
+	Rail        string
+	ConnectorID string
 }
 
 type ResolveAmbiguousRequest struct {

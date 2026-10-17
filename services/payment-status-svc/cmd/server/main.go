@@ -15,14 +15,16 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
+	"zoiko.io/eventing/kafkaout"
+	"zoiko.io/eventing/outbox"
+	"zoiko.io/eventing/signature"
 	"zoiko.io/payment-status-svc/internal/authz"
+	"zoiko.io/payment-status-svc/internal/callbacks"
 	"zoiko.io/payment-status-svc/internal/config"
 	"zoiko.io/payment-status-svc/internal/handler"
 	"zoiko.io/payment-status-svc/internal/health"
 	"zoiko.io/payment-status-svc/internal/middleware"
 	"zoiko.io/payment-status-svc/internal/store"
-	"zoiko.io/eventing/kafkaout"
-	"zoiko.io/eventing/outbox"
 )
 
 func main() {
@@ -95,6 +97,21 @@ func main() {
 	authzClient := authz.NewClient(cfg.AuthzServiceURL)
 
 	h := handler.New(pgStore, authzClient, cfg.WebhookSharedSecret, logger)
+
+	provCfg, err := callbacks.ParseConfig(cfg.ProviderCallbacksJSON)
+	if err != nil {
+		logger.Fatal("PROVIDER_CALLBACKS_JSON is invalid", zap.Error(err))
+	}
+	if len(provCfg) > 0 {
+		h = h.WithCallbacks(&callbacks.Processor{
+			Config:  provCfg,
+			Secrets: callbacks.NewVaultSecrets(cfg.VaultURL, cfg.VaultWorkloadID),
+			Store:   pgStore,
+			Guard:   signature.NewMemoryGuard(100_000, nil),
+			Log:     logger,
+		}, pgStore)
+		logger.Info("provider callbacks enabled", zap.Int("providers", len(provCfg)))
+	}
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)

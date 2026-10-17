@@ -15,6 +15,7 @@ import (
 	"zoiko.io/payment-initiation-adapter-svc/internal/domain"
 	svcmiddleware "zoiko.io/payment-initiation-adapter-svc/internal/middleware"
 	"zoiko.io/payment-initiation-adapter-svc/internal/provideradapter"
+	"zoiko.io/payment-initiation-adapter-svc/internal/providers"
 	"zoiko.io/payment-initiation-adapter-svc/internal/store"
 )
 
@@ -43,6 +44,8 @@ type Handler struct {
 	// payroll verifies AuthorizationSourcePayroll attempts (WFP-07). Nil means that source is not
 	// accepted: it is refused, never trusted.
 	payroll clients.PayrollClient
+	// engine drives live provider adapters (INT-07). Nil means every attempt uses the legacy stub.
+	engine *providers.Engine
 	log     *zap.Logger
 }
 
@@ -57,6 +60,7 @@ func New(st store.Store, az AuthzChecker, provider provideradapter.Client, treas
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
+	RegisterProviderRoutes(r, h)
 	r.Route("/bnk06/attempts", func(r chi.Router) {
 		r.Post("/", h.PrepareAttempt)
 		r.Get("/{attemptID}", h.GetPaymentAttempt)
@@ -229,6 +233,10 @@ func (h *Handler) PrepareAttempt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !h.checkProviderBinding(w, r, &req) {
+		return
+	}
+
 	correlationID := r.Header.Get("X-Correlation-ID")
 	created, err := h.store.PrepareAttempt(r.Context(), verifiedTenant, req, principalID, correlationID)
 	if err != nil {
@@ -331,6 +339,9 @@ func (h *Handler) SubmitAttempt(w http.ResponseWriter, r *http.Request) {
 	if !h.authorize(w, r, principalID, a.LegalEntityID, PaymentInitiate) {
 		return
 	}
+	if h.sendViaEngine(w, r, a, principalID) {
+		return
+	}
 
 	updated := h.submitToProvider(r.Context(), a, principalID)
 	writeJSON(w, http.StatusOK, updated)
@@ -388,6 +399,9 @@ func (h *Handler) RetrySameAttempt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !h.authorize(w, r, principalID, a.LegalEntityID, PaymentInitiate) {
+		return
+	}
+	if h.sendViaEngine(w, r, a, principalID) {
 		return
 	}
 

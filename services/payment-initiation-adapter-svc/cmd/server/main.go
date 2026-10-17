@@ -73,6 +73,21 @@ func main() {
 
 	h := handler.New(pgStore, authzClient, provider, treasuryClient, authorizationClient, logger).WithPayroll(clients.NewPayrollHTTPClient(cfg.PayrollRunServiceURL))
 
+	// Background work (the outbox relay, the in-flight sweeper) lives for the life of the process, not for
+	// the startup timeout above.
+	bg, stopBackground := context.WithCancel(context.Background())
+	defer stopBackground()
+
+	if cfg.Providers.Enabled {
+		engine, err := buildProviderEngine(cfg.Providers, pgStore)
+		if err != nil {
+			logger.Fatal("provider adapters misconfigured", zap.Error(err))
+		}
+		h = h.WithProviders(engine)
+		go runSweeper(bg, engine, cfg.Providers.SweepInterval, logger)
+		logger.Info("provider adapters enabled")
+	}
+
 	brokers := strings.Split(cfg.KafkaBrokers, ",")
 	writer, err := kafkaout.New(kafkaout.Config{Brokers: brokers, Topic: cfg.KafkaEventsTopic})
 	if err != nil {
@@ -82,7 +97,7 @@ func main() {
 	if err != nil {
 		logger.Fatal("failed to create outbox relay", zap.Error(err))
 	}
-	go relay.Run(ctx)
+	go relay.Run(bg)
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)
