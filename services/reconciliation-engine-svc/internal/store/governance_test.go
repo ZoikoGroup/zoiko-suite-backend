@@ -377,3 +377,34 @@ func containsStr(xs []string, want string) bool {
 	}
 	return false
 }
+
+// A9 / ZS-CONTROL-001 Invariant 12: a preparer cannot self-certify — not the
+// principal who started the run, matched in it or reperformed it, whichever of
+// them acted last. Someone who prepared none of it can.
+func TestGovernance_PreparerCannotCertify(t *testing.T) {
+	f := newFixture(t)
+	def := f.defineReconciliation(orgA, "maker-checker", 0)
+	run := f.startRun(orgA, def, cleanPops()) // started by test-operator
+	if _, err := f.s.Match(f.ctx, orgA, run.RunID, domain.MatchRequest{}, "matcher", f.claim("Match", run.RunID)); err != nil {
+		t.Fatalf("match: %v", err)
+	}
+	if _, err := f.s.Reperform(f.ctx, orgA, run.RunID, "reperformer", f.claim("Reperform", run.RunID)); err != nil {
+		t.Fatalf("reperform: %v", err)
+	}
+	for _, preparer := range []string{"test-operator", "matcher", "reperformer"} {
+		if _, err := f.s.Certify(f.ctx, orgA, run.RunID, preparer, f.claim("Certify", run.RunID)); !errors.Is(err, domain.ErrNotIndependentCertifier) {
+			t.Fatalf("%s certified a run they prepared: %v", preparer, err)
+		}
+	}
+	r, _ := f.s.GetRun(f.ctx, orgA, run.RunID)
+	if r.Status == domain.RunCertified {
+		t.Fatal("a refused certification changed the run")
+	}
+	cert, err := f.s.Certify(f.ctx, orgA, run.RunID, "certifier", f.claim("Certify", run.RunID))
+	if err != nil {
+		t.Fatalf("independent certifier: %v", err)
+	}
+	if cert.SealedBy != "certifier" {
+		t.Fatalf("sealed by %q", cert.SealedBy)
+	}
+}

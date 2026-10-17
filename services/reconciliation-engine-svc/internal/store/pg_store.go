@@ -1096,6 +1096,33 @@ func sideControlTotals(ctx context.Context, tx pgx.Tx, runID string) (map[string
 	return out, rows.Err()
 }
 
+// runPreparers is everyone who prepared the run: who started it, who matched
+// in it (auto or manual — matched_by is the principal who ran the command),
+// and who moved it out of Planned or into Reperformed. Raising an exception or
+// accepting a risk is a finding about the work, not preparing it, so those
+// actors are not preparers.
+func runPreparers(ctx context.Context, tx pgx.Tx, run *domain.ReconciliationRun) ([]string, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT started_by FROM reconciliation_runs WHERE run_id = $1
+		UNION SELECT matched_by FROM match_results WHERE run_id = $1
+		UNION SELECT actor FROM reconciliation_run_transitions
+			WHERE run_id = $1 AND dimension = 'LIFECYCLE' AND (from_state = $2 OR to_state = $3)`,
+		run.RunID, string(domain.RunPlanned), string(domain.RunReperformed))
+	if err != nil {
+		return nil, fmt.Errorf("load run preparers: %w", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
 // Certify seals an immutable Certification — only legal from Running or
 // Reperformed, and only once zero exceptions remain Open (the doc's
 // own "certified runs immutable" core control starts here; the
@@ -1132,6 +1159,15 @@ func (s *PgStore) Certify(ctx context.Context, tenantID, runID string, actor str
 		}
 		if !assessment.Certifiable || run.CertificationState != domain.CertEligible {
 			return fmt.Errorf("%w: %s", domain.ErrRunNotEligible, strings.Join(assessment.CertificationBlocks, "; "))
+		}
+		// Maker-checker, under the run's lock so no preparation can land between
+		// the check and the seal (the handler also requires RECONCILIATION_CERTIFY).
+		preparers, err := runPreparers(ctx, tx, run)
+		if err != nil {
+			return err
+		}
+		if err := domain.CheckCertifierIndependence(actor, preparers); err != nil {
+			return err
 		}
 		assessmentJSON, err := json.Marshal(assessment)
 		if err != nil {

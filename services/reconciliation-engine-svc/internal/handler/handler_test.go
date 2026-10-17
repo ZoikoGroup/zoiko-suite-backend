@@ -49,6 +49,12 @@ type fakeStore struct {
 	failures    []domain.RunFailure
 	transitions []domain.TransitionExceptionRequest
 	approvals   []string
+	certifiers  []string
+}
+
+func (s *fakeStore) Certify(_ context.Context, _, runID, actor string, _ domain.IdempotencyClaim) (*domain.Certification, error) {
+	s.certifiers = append(s.certifiers, actor)
+	return &domain.Certification{CertificationID: "rcf_1", RunID: runID}, nil
 }
 
 func (s *fakeStore) ApproveRuleVersion(_ context.Context, _, definitionID string, version int64, approver string,
@@ -261,6 +267,27 @@ func TestTransitionException_AcceptRiskNeedsItsOwnPermission(t *testing.T) {
 		`{"to_state":"INVESTIGATING","reason":"looking"}`)
 	if w.Code != http.StatusOK || az.actions[0] != ActionReconciliationManage {
 		t.Fatalf("investigate needs only MANAGE: %d %s, checks %v", w.Code, w.Body, az.actions)
+	}
+}
+
+// A9 / Invariant 12: certifying is its own permission, checked on the run's
+// entity; the permission that prepares a run is not enough to seal it.
+func TestCertify_NeedsCertifyPermission(t *testing.T) {
+	run := &domain.ReconciliationRun{RunID: "rcr_1", LegalEntityID: entityA}
+
+	az := &recordingAuthz{}
+	st := &fakeStore{run: run}
+	w := serve(NewHandler(st, az, failingFetcher{}, zap.NewNop()), http.MethodPost, "/v1/reconciliation/runs/rcr_1:certify", "")
+	if w.Code != http.StatusCreated || len(az.actions) != 1 || az.actions[0] != ActionReconciliationCertify || az.entities[0] != entityA ||
+		len(st.certifiers) != 1 {
+		t.Fatalf("certify: %d %s, checks %v on %v, certifiers %v", w.Code, w.Body, az.actions, az.entities, st.certifiers)
+	}
+
+	az = &recordingAuthz{deny: map[string]bool{ActionReconciliationCertify: true}}
+	st = &fakeStore{run: run}
+	w = serve(NewHandler(st, az, failingFetcher{}, zap.NewNop()), http.MethodPost, "/v1/reconciliation/runs/rcr_1:certify", "")
+	if w.Code != http.StatusForbidden || len(st.certifiers) != 0 {
+		t.Fatalf("certify with only MANAGE: %d %s, certifiers %v", w.Code, w.Body, st.certifiers)
 	}
 }
 

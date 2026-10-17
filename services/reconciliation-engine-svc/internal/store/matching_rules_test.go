@@ -225,7 +225,7 @@ func TestCertification_PerCurrencyTotalsOnly(t *testing.T) {
 		}
 	}
 	f.match(run.RunID)
-	cert, err := f.s.Certify(f.ctx, orgA, run.RunID, "test-operator", f.claim("Certify", run.RunID))
+	cert, err := f.s.Certify(f.ctx, orgA, run.RunID, "certifier", f.claim("Certify", run.RunID))
 	if err != nil {
 		t.Fatalf("certify: %v", err)
 	}

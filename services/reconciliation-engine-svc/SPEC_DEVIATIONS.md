@@ -79,16 +79,18 @@ and most of A4 (B21–B25); Stage 4 closed A11 (B26–B27).
   domain, a meaningful reperformance is a new run over new populations,
   linked to this one. Scope: define reperformance as "start a linked run and
   supersede on certification", or remove the command.
-- **A9. No maker-checker or separated permissions** (except accepting risk,
-  which has its own action and independence rule — B22 — and approving a rule
-  version, which has its own action and may not be done by the version's
-  author — B26). Every other command
-  uses one action, `RECONCILIATION_MANAGE`, so the same principal can define the
-  rules, start the run, manually match, and certify it (ZS-CONTROL-001
-  Invariant 12, §27; DATA-07 "configuration/rule publication separated from
-  evaluation/release approval"). Scope: separate actions (define, run, manual
-  match, certify) and refuse a certifier who started the run or made a manual
-  match in it, under the run's row lock.
+- **A9. Certification: Closed** — certifying is its own action and a
+  preparer cannot certify; see B28. Accepting risk (B22) and approving a rule
+  version (B26) were already separated. Define, StartRun, Match (including
+  manual matches) and Reperform still share `RECONCILIATION_MANAGE`, by
+  design: they are preparation steps, not a certifying authority, so no
+  independence requirement applies between them — one principal may define,
+  run and match. ZS-CONTROL-001 Invariant 12 is about the preparer certifying
+  their own work, which B28 refuses, and DATA-07's "rule publication
+  separated from … approval" is B26. RaiseException, assign and supersede
+  also stay on MANAGE. Not built: a policy switch for "where maker-checker
+  policy applies" — it applies to every certification here — and dynamic SoD
+  revalidated against authorization-svc beyond the action check.
 - **A10. Closed** — definitions and runs carry `legal_entity_id`; see B9.
 - **A11. Closed** — rule versions with independent approval and effective
   dating, and definition reads; see B26.
@@ -615,3 +617,28 @@ and most of A4 (B21–B25); Stage 4 closed A11 (B26–B27).
   redefinition test now asserts the refusal. Migration 000008 was applied over
   a 000007 database holding a definition with in-place rules (left untouched,
   given no version), round-tripped, and its down refusal exercised.
+- **B28. A preparer cannot certify (closes A9's certification part).**
+  ZS-CONTROL-001 Invariant 12 "A preparer cannot self-certify where
+  maker-checker policy applies". Certify needs the separate action
+  `RECONCILIATION_CERTIFY` (handler; `RECONCILIATION_MANAGE` is no longer
+  enough), checked on the run's entity. Under the run's row lock, after the
+  eligibility checks and before the idempotency claim, the store refuses
+  (`ErrNotIndependentCertifier`, 403) a certifier who is any of the run's
+  preparers: `started_by`, any `match_results.matched_by` (auto or manual —
+  it is the principal who ran Match), and the actor of the run's LIFECYCLE
+  transition out of Planned (the first Match) or into Reperformed. Every
+  preparer counts, not only whoever acted last, so a trivial final step by
+  someone else does not clear the original preparer. Raising an exception and
+  accepting risk are findings about the work, not preparing it, so those
+  actors may certify. No migration: every preparer was already recorded
+  (000001 `started_by`, `matched_by`; 000006 transition `actor`). If A8
+  replaces Reperform with a linked run, the preparer query must follow it.
+- **B29. Verification of B28.** A unit test in `internal/domain` that a
+  preparer — including an earlier one, not only the last — is refused and
+  another principal is not; a handler test that Certify is checked against
+  `RECONCILIATION_CERTIFY` on the run's entity and that a denial certifies
+  nothing. Integration test: on a run started by one principal, matched by
+  a second and reperformed by a third, each of the three is refused and the
+  run stays uncertified; a fourth principal certifies and is recorded as
+  `sealed_by`. Tests that certified as the run's own operator now certify as
+  a separate principal.

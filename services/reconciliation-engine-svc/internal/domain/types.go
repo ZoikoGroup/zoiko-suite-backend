@@ -492,4 +492,5 @@ var (
 	ErrExceptionNotFound            = errorString("reconciliation exception not found")
 	ErrNotExceptionOwner            = errorString("only the exception's assigned owner can work it; assign it first")
 	ErrNotIndependent               = errorString("risk must be accepted by someone other than the exception's owner and its raiser")
+	ErrNotIndependentCertifier      = errorString("a run must be certified by someone other than whoever started, matched or reperformed it")
 )

@@ -297,6 +297,19 @@ func CheckIndependence(to ExceptionStatus, actor string, owner *string, raisedBy
 	return nil
 }
 
+// CheckCertifierIndependence: a preparer cannot self-certify (ZS-CONTROL-001
+// Invariant 12). preparers is everyone who prepared the run — started it,
+// matched in it, or reperformed it — not only the last of them, so a trivial
+// final step by someone else does not clear the way for the original preparer.
+func CheckCertifierIndependence(actor string, preparers []string) error {
+	for _, p := range preparers {
+		if actor == p {
+			return ErrNotIndependentCertifier
+		}
+	}
+	return nil
+}
+
 type AssignExceptionRequest struct {
 	OwnerPrincipal string `json:"owner_principal_id"`
 	Reason         string `json:"reason"`
