@@ -2,7 +2,9 @@ package domain
 
 import "testing"
 
-func rec(ref string, fields map[string]string) MigrationRecord { return MigrationRecord{Ref: ref, Fields: fields} }
+func rec(ref string, fields map[string]string) MigrationRecord {
+	return MigrationRecord{Ref: ref, Fields: fields}
+}
 
 func validate(recs ...MigrationRecord) (valid, invalid int, score float64, checks []IntegrityCheck) {
 	req := &ValidateMigrationRequest{LegalEntityID: "le", MigrationName: "m", SourceSystem: "s", TargetService: "t",
@@ -114,5 +116,32 @@ func TestIntegrity_EmptyRefDoesNotPolluteDuplicateDetection(t *testing.T) {
 	}
 	if identity != 1 || dup != 1 {
 		t.Fatalf("expected 1 identity violation and 1 duplicate-ref entry, got identity=%d dup=%d", identity, dup)
+	}
+}
+
+// The score is a ratio; acceptance is the threshold rule (SPEC_DEVIATIONS
+// A11): below the bar is FAILED, at the bar passes, and a run with every
+// record invalid is FAILED at any bar.
+func TestEvaluateJobStatus(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		score          float64
+		valid, invalid int
+		threshold      float64
+		want           JobStatus
+	}{
+		{"clean run passes any bar", 100, 10, 0, 95, JobStatusCompleted},
+		{"just below the bar fails", 94.99, 19, 1, 95, JobStatusFailed},
+		{"at the bar passes", 95, 19, 1, 95, JobStatusCompleted},
+		{"one valid record in a thousand fails", 0.1, 1, 999, 95, JobStatusFailed},
+		{"below a lowered bar passes", 90, 9, 1, 80, JobStatusCompleted},
+		{"all records invalid fails even at a zero bar", 0, 0, 4, 0, JobStatusFailed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := EvaluateJobStatus(tc.score, tc.valid, tc.invalid, tc.threshold); got != tc.want {
+				t.Fatalf("score %.2f valid=%d invalid=%d threshold=%v: got %s, want %s",
+					tc.score, tc.valid, tc.invalid, tc.threshold, got, tc.want)
+			}
+		})
 	}
 }

@@ -3,6 +3,7 @@ package handler_test
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -27,11 +28,17 @@ func newMockAuthzServer(t *testing.T) *httptest.Server {
 }
 
 func newRouter(t *testing.T) http.Handler {
+	return newRouterWithThreshold(t, 95)
+}
+
+// newRouterWithThreshold wires the handler with an explicit acceptance
+// threshold (SPEC_DEVIATIONS A11).
+func newRouterWithThreshold(t *testing.T, threshold float64) http.Handler {
 	logger := zap.NewNop()
 	s := store.NewMemoryStore()
 	authzSrv := newMockAuthzServer(t)
 	a := authz.NewClient(authzSrv.URL, logger)
-	h := handler.NewHandler(s, a, logger)
+	h := handler.NewHandler(s, a, logger, threshold)
 	return handler.NewRouter(h)
 }
 
@@ -292,5 +299,55 @@ func TestValidationErrors(t *testing.T) {
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 Bad Request, got %d", rec.Code)
+	}
+}
+
+// A 90%-scoring job is FAILED at a 95 bar and COMPLETED at 80; whichever bar
+// was applied is exposed on the job record (SPEC_DEVIATIONS A11).
+func TestValidateMigration_ThresholdDecidesStatus(t *testing.T) {
+	records := make([]domain.MigrationRecord, 0, 10)
+	for i := 0; i < 9; i++ {
+		records = append(records, domain.MigrationRecord{
+			Ref:    fmt.Sprintf("REC-%02d", i),
+			Fields: map[string]string{"amount": "1.00"},
+		})
+	}
+	records = append(records, domain.MigrationRecord{Ref: "REC-BAD", Fields: map[string]string{"amount": "N/A"}})
+
+	for _, tc := range []struct {
+		threshold  float64
+		wantStatus domain.JobStatus
+	}{
+		{95, domain.JobStatusFailed},
+		{80, domain.JobStatusCompleted},
+	} {
+		router := newRouterWithThreshold(t, tc.threshold)
+		body, _ := json.Marshal(domain.ValidateMigrationRequest{
+			LegalEntityID:  "LE-THRESHOLD",
+			MigrationName:  "threshold acceptance fixture",
+			SourceSystem:   "LEGACY_ERP",
+			TargetService:  "general-ledger-svc",
+			RequiredFields: []string{"amount"},
+			Records:        records,
+		})
+		req := httptest.NewRequest(http.MethodPost, "/v1/migrations/validate", bytes.NewBuffer(body))
+		withEnvelope(req)
+		req.Header.Set("X-Tenant-ID", "tenant-mig-threshold")
+		req.Header.Set("X-Principal-Id", "user-1")
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+		}
+		var job domain.MigrationJob
+		if err := json.Unmarshal(rec.Body.Bytes(), &job); err != nil {
+			t.Fatalf("decode job: %v", err)
+		}
+		if job.IntegrityScoreThreshold != tc.threshold {
+			t.Fatalf("expected the applied threshold %v on the job record, got %v", tc.threshold, job.IntegrityScoreThreshold)
+		}
+		if job.Status != tc.wantStatus {
+			t.Fatalf("score %.2f at threshold %v: expected %s, got %s", job.IntegrityScore, tc.threshold, tc.wantStatus, job.Status)
+		}
 	}
 }

@@ -108,11 +108,11 @@ func (s *PgStore) CreateJob(ctx context.Context, tenantID string, job *domain.Mi
 		INSERT INTO migration_jobs
 		  (id, tenant_id, legal_entity_id, migration_name, source_system, target_service,
 		   total_records_count, valid_records_count, invalid_records_count, integrity_score,
-		   status, started_at, completed_at, created_at, updated_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+		   integrity_score_threshold, status, started_at, completed_at, created_at, updated_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
 		job.ID, tenantID, job.LegalEntityID, job.MigrationName, job.SourceSystem, job.TargetService,
 		job.TotalRecordsCount, job.ValidRecordsCount, job.InvalidRecordsCount, job.IntegrityScore,
-		string(job.Status), job.StartedAt, job.CompletedAt, job.CreatedAt, job.UpdatedAt,
+		job.IntegrityScoreThreshold, string(job.Status), job.StartedAt, job.CompletedAt, job.CreatedAt, job.UpdatedAt,
 	)
 	if err != nil {
 		return fmt.Errorf("insert migration_job: %w", err)
@@ -191,12 +191,12 @@ func (s *PgStore) GetJobByID(ctx context.Context, tenantID, id string) (*domain.
 	err = tx.QueryRow(ctx, `
 		SELECT id, tenant_id, legal_entity_id, migration_name, source_system, target_service,
 		       total_records_count, valid_records_count, invalid_records_count, integrity_score,
-		       status, started_at, completed_at, created_at, updated_at
+		       integrity_score_threshold, status, started_at, completed_at, created_at, updated_at
 		FROM migration_jobs
 		WHERE id = $1`, id).Scan(
 		&job.ID, &job.TenantID, &job.LegalEntityID, &job.MigrationName, &job.SourceSystem, &job.TargetService,
 		&job.TotalRecordsCount, &job.ValidRecordsCount, &job.InvalidRecordsCount, &job.IntegrityScore,
-		&job.Status, &startedAt, &completedAt, &job.CreatedAt, &job.UpdatedAt,
+		&job.IntegrityScoreThreshold, &job.Status, &startedAt, &completedAt, &job.CreatedAt, &job.UpdatedAt,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("migration job not found: %w", err)
@@ -271,7 +271,7 @@ func (s *PgStore) ListJobs(ctx context.Context, tenantID, legalEntityID, status 
 	query := `
 		SELECT id, tenant_id, legal_entity_id, migration_name, source_system, target_service,
 		       total_records_count, valid_records_count, invalid_records_count, integrity_score,
-		       status, started_at, completed_at, created_at, updated_at
+		       integrity_score_threshold, status, started_at, completed_at, created_at, updated_at
 		FROM migration_jobs
 		WHERE 1=1`
 	var args []interface{}
@@ -301,7 +301,7 @@ func (s *PgStore) ListJobs(ctx context.Context, tenantID, legalEntityID, status 
 		if err := rows.Scan(
 			&j.ID, &j.TenantID, &j.LegalEntityID, &j.MigrationName, &j.SourceSystem, &j.TargetService,
 			&j.TotalRecordsCount, &j.ValidRecordsCount, &j.InvalidRecordsCount, &j.IntegrityScore,
-			&j.Status, &startedAt, &completedAt, &j.CreatedAt, &j.UpdatedAt,
+			&j.IntegrityScoreThreshold, &j.Status, &startedAt, &completedAt, &j.CreatedAt, &j.UpdatedAt,
 		); err == nil {
 			j.StartedAt = startedAt
 			j.CompletedAt = completedAt

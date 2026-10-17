@@ -72,7 +72,8 @@ func createJob(t *testing.T, s *store.PgStore, tenantID string, invalidCount int
 		ID: uuid.NewString(), LegalEntityID: "le-uk-1", MigrationName: "fy26 ledger cutover",
 		SourceSystem: "LEGACY_ERP", TargetService: "general-ledger-svc",
 		TotalRecordsCount: 10, ValidRecordsCount: 10 - invalidCount, InvalidRecordsCount: invalidCount,
-		IntegrityScore: float64(10-invalidCount) * 10, Status: status, StartedAt: &now, CompletedAt: &now,
+		IntegrityScore: float64(10-invalidCount) * 10, IntegrityScoreThreshold: 95,
+		Status: status, StartedAt: &now, CompletedAt: &now,
 	}
 	var entries []domain.AuditEntry
 	for i := 0; i < invalidCount; i++ {

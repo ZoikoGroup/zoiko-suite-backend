@@ -128,11 +128,16 @@ service. One scoring defect was fixed in this pass (B1).
   this is an evidence row behind the same authorization as the job it
   belongs to. If a whole record is ever captured, mask reads the way
   treasury masks account numbers (`BANK_ACCOUNT_VIEW_MASKED`).
-- **A11. Integrity score is a ratio, not an acceptance result.** The 0–100
-  score has no threshold, no PASS/FAIL, and no link to certification;
-  "totals match" / "score is high" as an acceptance criterion is one of the
-  §33 anti-patterns. A job is `FAILED` only when every record is invalid;
-  with one valid record out of a thousand it is `COMPLETED`.
+- **A11. Integrity score is a ratio, not an acceptance result** (closed).
+  The score is now judged against an explicit, configurable acceptance bar
+  (`INTEGRITY_SCORE_THRESHOLD`, service default 95): a job scoring below it
+  is `FAILED`, not `COMPLETED` — including the one-valid-in-a-thousand case
+  that used to pass — and a run with every record invalid is `FAILED` at
+  any bar. The bar actually applied is stored on the job row
+  (`integrity_score_threshold`, migration `000004`) and returned by the
+  reads, so an acceptance decision stays auditable after the configured
+  default changes. "Score is high" as an acceptance criterion (§33
+  anti-pattern) is now an explicit, stored bar.
 
 ## B. Interpretations and additions (decisions a reviewer may want to reverse)
 
