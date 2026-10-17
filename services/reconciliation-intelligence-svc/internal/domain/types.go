@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -33,6 +34,10 @@ const (
 	RecommendationWriteOff         ResolutionRecommendation = "WRITE_OFF"
 	RecommendationTimingAdjustment ResolutionRecommendation = "TIMING_ADJUSTMENT"
 	RecommendationManualReview     ResolutionRecommendation = "MANUAL_REVIEW"
+	// RecommendationConfirmDuplicate asks a human to confirm that two
+	// statement lines are one bank entry counted twice. Removing the copy
+	// is done in bank-reconciliation-svc, by a human; never from here.
+	RecommendationConfirmDuplicate ResolutionRecommendation = "CONFIRM_DUPLICATE"
 )
 
 const (
@@ -93,14 +98,18 @@ type UnmatchedItem struct {
 	// BankReconciliationRunID and StatementLineID point at the authoritative
 	// record this suggestion is about in bank-reconciliation-svc. Empty only
 	// on items from jobs analyzed before migration 000003.
-	BankReconciliationRunID string          `json:"bank_reconciliation_run_id,omitempty"`
-	StatementLineID         string          `json:"statement_line_id,omitempty"`
-	TransactionRefA         string          `json:"transaction_ref_a"`
-	TransactionRefB         string          `json:"transaction_ref_b,omitempty"`
-	AmountA                 string          `json:"amount_a"`
-	AmountB                 string          `json:"amount_b"`
-	DiscrepancyAmount       string          `json:"discrepancy_amount"`
-	DiscrepancyType         DiscrepancyType `json:"discrepancy_type"`
+	BankReconciliationRunID string `json:"bank_reconciliation_run_id,omitempty"`
+	StatementLineID         string `json:"statement_line_id,omitempty"`
+	// CounterpartStatementLineID is the second record a two-record
+	// suggestion is about: on DUPLICATE_ENTRY, the line StatementLineID
+	// probably duplicates. Empty on single-line suggestions.
+	CounterpartStatementLineID string          `json:"counterpart_statement_line_id,omitempty"`
+	TransactionRefA            string          `json:"transaction_ref_a"`
+	TransactionRefB            string          `json:"transaction_ref_b,omitempty"`
+	AmountA                    string          `json:"amount_a"`
+	AmountB                    string          `json:"amount_b"`
+	DiscrepancyAmount          string          `json:"discrepancy_amount"`
+	DiscrepancyType            DiscrepancyType `json:"discrepancy_type"`
 	// ConfidenceScore is NOT statistically or ML-derived — it is one of two
 	// fixed values produced by AnalyzeUnmatchedStatementLines' hardcoded
 	// threshold rules (see the named heuristic constants below). ZS-SVC-Z-001
@@ -198,6 +207,11 @@ func (r *AnalyzeReconciliationRequest) Validate() error {
 const (
 	missingReferenceWriteOffConfidence     = 90.0
 	missingReferenceManualReviewConfidence = 60.0
+
+	// Duplicate-entry labels (duplicates.go): identical references are
+	// stronger evidence than a reference related by a sequence suffix.
+	duplicateExactReferenceConfidence    = 85.0
+	duplicateSuffixedReferenceConfidence = 70.0
 )
 
 // MetricMissingReferenceTolerance is the metric name under which the
@@ -208,7 +222,7 @@ const (
 // The amount-mismatch tolerance (RECONCILIATION_AMOUNT_MISMATCH_WRITEOFF)
 // is no longer fetched: an amount mismatch needs a counterpart record, and
 // bank-reconciliation-svc's UNMATCHED lines have none. Proposing a
-// counterpart is A2 in SPEC_DEVIATIONS.md.
+// counterpart is A2a in SPEC_DEVIATIONS.md.
 const MetricMissingReferenceTolerance = "RECONCILIATION_MISSING_REFERENCE_WRITEOFF"
 
 // AnalyzeUnmatchedStatementLines produces one advisory suggestion per
@@ -219,7 +233,13 @@ const MetricMissingReferenceTolerance = "RECONCILIATION_MISSING_REFERENCE_WRITEO
 // to walk, so every line is examined exactly once and every line yields a
 // suggestion — none is skipped and none is counted as matched here.
 //
-// "Intelligent" means one fixed threshold comparison against a governed,
+// Two rules, in order. First, lines that are probably the same bank entry
+// recorded twice are found (duplicates.go); each copy gets a
+// DUPLICATE_ENTRY suggestion naming the line it duplicates, and nothing
+// else. Then every other line — including the entry each copy duplicates —
+// gets the missing-reference suggestion below.
+//
+// "Intelligent" means fixed rules and one threshold comparison against a governed,
 // versioned tolerance the caller fetched from financial-control-svc
 // (internal/financialcontrol) — never a model. Every item carries
 // ResolutionStatus RECOMMENDED: domain.StatusApproved/Rejected/Executed are
@@ -239,12 +259,35 @@ func AnalyzeUnmatchedStatementLines(lines []BankStatementLine, runID, tenantID s
 	}
 	tol := CanonicalAmount(missingReferenceTolerance)
 
-	items := make([]UnmatchedItem, 0, len(lines))
-	for _, line := range lines {
+	amounts := make([]*big.Rat, len(lines))
+	for i, line := range lines {
 		amount, err := ParseStorableAmount(line.Amount)
 		if err != nil {
 			return nil, fmt.Errorf("statement line %s: %w", line.StatementLineID, err)
 		}
+		amounts[i] = amount
+	}
+
+	// Duplicate detection runs first and is exclusive for the duplicate: a
+	// line identified as a copy of another gets ONE suggestion,
+	// DUPLICATE_ENTRY, and not also a write-off or review recommendation.
+	// Writing off or investigating a copy is the wrong action, and two
+	// suggestions about the same line could contradict each other. The
+	// anchor — the entry that stays — still goes through the rules below:
+	// once the copy is removed it is one real entry that is still UNMATCHED.
+	// So every line is still the subject of exactly one suggestion.
+	dupOf, dupsOf := findDuplicates(lines, amounts)
+
+	items := make([]UnmatchedItem, 0, len(lines))
+	for i, line := range lines {
+		amount := amounts[i]
+		now := time.Now()
+
+		if d, isDup := dupOf[i]; isDup {
+			items = append(items, duplicateItem(line, lines[d.anchor], amount, amounts[d.anchor], d.exact, runID, tenantID, now))
+			continue
+		}
+
 		// The tolerance is a magnitude: a large credit (negative amount) is
 		// as material as a large debit and must never qualify as a "small
 		// amount" write-off.
@@ -263,8 +306,15 @@ func AnalyzeUnmatchedStatementLines(lines []BankStatementLine, runID, tenantID s
 				"heuristic rule: statement line %s is UNMATCHED in bank-reconciliation run %s; amount magnitude %s is below the %s governed small-amount write-off tolerance",
 				line.StatementLineID, runID, mag, tol)
 		}
+		if dups := dupsOf[i]; len(dups) > 0 {
+			ids := make([]string, len(dups))
+			for k, j := range dups {
+				ids[k] = lines[j].StatementLineID
+			}
+			rationale += fmt.Sprintf("; judged as one entry — %d probable duplicate(s) of it in this run (%s) carry DUPLICATE_ENTRY suggestions instead",
+				len(dups), strings.Join(ids, ", "))
+		}
 
-		now := time.Now()
 		items = append(items, UnmatchedItem{
 			TenantID:                tenantID,
 			BankReconciliationRunID: runID,
@@ -283,4 +333,38 @@ func AnalyzeUnmatchedStatementLines(lines []BankStatementLine, runID, tenantID s
 		})
 	}
 	return items, nil
+}
+
+// duplicateItem is the DUPLICATE_ENTRY suggestion that dup is probably the
+// same bank entry as anchor. It names both lines; the amounts are equal by
+// the detection rule, so the discrepancy is 0.
+func duplicateItem(dup, anchor BankStatementLine, dupAmount, anchorAmount *big.Rat, exact bool, runID, tenantID string, now time.Time) UnmatchedItem {
+	confScore := duplicateSuffixedReferenceConfidence
+	refRule := fmt.Sprintf("bank reference %q is %q plus a trailing sequence suffix", dup.BankReference, anchor.BankReference)
+	if exact {
+		confScore = duplicateExactReferenceConfidence
+		refRule = fmt.Sprintf("bank references %q and %q are identical ignoring case and whitespace", dup.BankReference, anchor.BankReference)
+	}
+	rationale := fmt.Sprintf(
+		"heuristic rule: statement line %s probably duplicates statement line %s in bank-reconciliation run %s — same bank account and statement date (the run's scope), same amount %s %s, and %s. If confirmed it is one bank entry counted twice: this line is not written off or reviewed on its own; line %s carries the suggestion for the entry itself",
+		dup.StatementLineID, anchor.StatementLineID, runID, CanonicalAmount(dupAmount), dup.CurrencyCode, refRule, anchor.StatementLineID)
+
+	return UnmatchedItem{
+		TenantID:                   tenantID,
+		BankReconciliationRunID:    runID,
+		StatementLineID:            dup.StatementLineID,
+		CounterpartStatementLineID: anchor.StatementLineID,
+		TransactionRefA:            dup.BankReference,
+		TransactionRefB:            anchor.BankReference,
+		AmountA:                    CanonicalAmount(dupAmount),
+		AmountB:                    CanonicalAmount(anchorAmount),
+		DiscrepancyAmount:          "0",
+		DiscrepancyType:            DiscrepancyDuplicateEntry,
+		ConfidenceScore:            confScore,
+		Recommendation:             RecommendationConfirmDuplicate,
+		ResolutionStatus:           StatusRecommended,
+		ResolutionNotes:            rationale,
+		CreatedAt:                  now,
+		UpdatedAt:                  now,
+	}
 }

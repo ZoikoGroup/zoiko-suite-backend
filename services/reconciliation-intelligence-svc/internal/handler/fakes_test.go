@@ -25,6 +25,8 @@ type fakeRun struct {
 	// Lines maps statement_line_id to the amount's raw JSON (a bare number,
 	// as bank-reconciliation-svc sends it, or a quoted string).
 	Lines [][2]string
+	// Refs overrides a line's bank_reference (default "REF-" + its id).
+	Refs map[string]string
 }
 
 // Standard fixtures. Each run's bank account is "ba-" + its id.
@@ -80,9 +82,13 @@ func newFakeBankRecServer(t *testing.T, runs map[string]fakeRun) *httptest.Serve
 			run := runs[id]
 			parts := make([]string, 0, len(run.Lines))
 			for _, l := range run.Lines {
+				ref, ok := run.Refs[l[0]]
+				if !ok {
+					ref = "REF-" + l[0]
+				}
 				parts = append(parts, fmt.Sprintf(
-					`{"statement_line_id":%q,"legal_entity_id":%q,"bank_account_id":%q,"statement_date":"2026-07-01T00:00:00Z","amount":%s,"currency_code":"USD","bank_reference":"REF-%s","status":"UNMATCHED"}`,
-					l[0], run.LegalEntityID, "ba-"+id, l[1], l[0]))
+					`{"statement_line_id":%q,"legal_entity_id":%q,"bank_account_id":%q,"statement_date":"2026-07-01T00:00:00Z","amount":%s,"currency_code":"USD","bank_reference":%q,"status":"UNMATCHED"}`,
+					l[0], run.LegalEntityID, "ba-"+id, l[1], ref))
 			}
 			_, _ = w.Write([]byte("[" + strings.Join(parts, ",") + "]"))
 			return

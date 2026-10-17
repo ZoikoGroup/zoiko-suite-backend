@@ -21,7 +21,8 @@ service refuses to analyze without them.
 Overall: the advisory claim holds — the service writes only its own tables
 and never posts, waives or clears anything — and the tolerance gate is real.
 It now consumes bank-reconciliation (A1), but it still never proposes a
-candidate match (A2), which is the other half of what the data model and the
+candidate match against a counterpart record (A2a; duplicate-entry detection
+within a run is done, A2), which is the other half of what the data model and the
 ownership table say it is for. Two defects were fixed in this pass (B1, B2);
 a later pass closed A7 and the decimal half of A4; a third closed A1, A3 and
 A6.
@@ -55,16 +56,61 @@ A6.
   frozen population snapshot, because no route exposes the snapshot's lines.
   Pre-000003 jobs keep NULL in the new columns — there is no source record
   to backfill.
-- **A2. It never proposes a candidate match.** There is no matching at all
-  now: since A1 the input is bank-reconciliation-svc's UNMATCHED lines, and
-  each one gets a review/write-off suggestion on its own.
-  `RecommendationAutoMatch` and the discrepancy types `DATE_SKEW` and
-  `DUPLICATE_ENTRY` are declared and never produced, and `AMOUNT_MISMATCH` /
-  `TIMING_ADJUSTMENT` are now produced only on pre-A1 jobs. The one thing
-  ZS-CONTROL-001 §10 says AI assistance is for — proposing that a line and a
-  ledger record with *different* references are the same — is absent; it
-  needs a counterpart source (general-ledger journals or banking-connector
-  canonical transactions) this service does not yet read.
+- **A2. It never proposes a candidate match** (narrowed — DUPLICATE_ENTRY
+  done; the rest is A2a). Of the three declared-but-never-produced types,
+  `DUPLICATE_ENTRY` is now produced: it needs only the UNMATCHED population
+  A1 already reads. Within one run, two lines are probable duplicates when
+  they have exactly the same amount (sign included, `big.Rat`), the same
+  `currency_code`, and bank references that are equal after upper-casing
+  and removing whitespace, or where one is the other plus one trailing
+  sequence suffix (`-1`, `_2`, `/3`, `.4`, `#5` or `(2)`; 1-2 digits). Two
+  *different* suffixes on one stem (`PAY-1` / `PAY-2`) are not a match:
+  that is how distinct recurring payments are numbered. An empty reference
+  never matches. Same bank account and statement date need no check — a
+  run is exactly one of each — so an entry duplicated across two statement
+  dates is in two runs and is not detected. In a group of duplicates one
+  line is the anchor (the unsuffixed original if there is one, else the
+  lowest `statement_line_id`); each other line gets one `DUPLICATE_ENTRY`
+  suggestion (`CONFIRM_DUPLICATE`, confidence label 85 for identical
+  references, 70 for suffix-related) naming both lines — the second in
+  `counterpart_statement_line_id` (migration 000004).
+  *Suppress, not coexist:* duplicate detection runs first, and a copy gets
+  *only* the `DUPLICATE_ENTRY` suggestion — no write-off or review of a copy,
+  which would be the wrong action and could contradict the duplicate
+  finding. The anchor still gets the normal missing-reference suggestion,
+  judged on its own amount and noting its copies: once the copy is removed
+  it is one real entry that is still unmatched. So every line remains the
+  subject of exactly one suggestion (A3's invariant holds).
+  Advisory only: removing a copy is done in bank-reconciliation-svc, by a
+  human. `AMOUNT_MISMATCH` / `TIMING_ADJUSTMENT` are produced only on pre-A1
+  jobs.
+- **A2a. No candidate match against a counterpart record: `AUTO_MATCH` and
+  `DATE_SKEW` are never produced.** Both mean proposing a counterpart for an
+  UNMATCHED statement line, and that counterpart is never another
+  bank-reconciliation-svc record. bank-reconciliation-svc's own match
+  verification (`MatchStatementLine` / `RunAutomaticMatching` →
+  `verifyJournalMatches` / `verifyCanonicalMatch`) accepts exactly two kinds:
+  (a) a general-ledger-svc journal that is FINALIZED, of the same legal
+  entity, and moves the line's `gl_cash_account_code` by the line's amount
+  in the right direction; or (b) a banking-connector-svc canonical
+  transaction that is NORMALIZED, of the same tenant and currency, and of
+  the same amount. This service reads neither. *Needed:* a read client to
+  general-ledger-svc and/or banking-connector-svc that can list candidates
+  scoped by the line's cash account (or bank account) and a date window
+  around the statement date. Neither offers such a route today:
+  general-ledger-svc's `GET /v1/journals` filters only by `legal_entity_id`,
+  `fiscal_period`, `status` and `limit` (no account, no date window), and
+  banking-connector-svc exposes canonical transactions only by id
+  (`GET /v1/banking/canonical-transactions/{id}`) — bank-reconciliation-svc
+  itself only ever verifies a caller-named candidate by id. So A2a needs a
+  candidate-search route in one of those services (or a bounded
+  per-fiscal-period read filtered here), plus `gl_cash_account_code`, which
+  bank-reconciliation-svc already returns on a statement line but
+  `internal/bankrec` does not yet decode. A candidate then becomes an
+  `AUTO_MATCH` suggestion (same amount, dated within a governed date
+  tolerance) or `DATE_SKEW` (same amount, dated beyond it), naming the journal or
+  transaction id — still advisory: the match is proposed and confirmed in
+  bank-reconciliation-svc's own maker-checker flow, by humans.
 - **A3. One-directional** (closed — the framing no longer applies). Only side
   A was walked: a side-B item with no side-A counterpart was never reported,
   and `total_processed_count` and the rate counted side A only. Since A1 there
