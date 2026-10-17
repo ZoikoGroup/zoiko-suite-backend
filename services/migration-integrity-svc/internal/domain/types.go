@@ -18,6 +18,7 @@ type JobStatus string
 const (
 	CheckSchemaValidation   CheckType = "SCHEMA_VALIDATION"
 	CheckReferentialInteg   CheckType = "REFERENTIAL_INTEGRITY"
+	CheckSourceIdentity     CheckType = "SOURCE_IDENTITY"
 	CheckDuplicateDetection CheckType = "DUPLICATE_DETECTION"
 	CheckRangeCheck         CheckType = "RANGE_CHECK"
 	CheckFormatCheck        CheckType = "FORMAT_CHECK"
@@ -30,11 +31,12 @@ const (
 )
 
 const (
-	ViolationMissingRequired ViolationType = "MISSING_REQUIRED"
-	ViolationTypeMismatch    ViolationType = "TYPE_MISMATCH"
-	ViolationDuplicate       ViolationType = "DUPLICATE"
-	ViolationOutOfRange      ViolationType = "OUT_OF_RANGE"
-	ViolationOrphanedRef     ViolationType = "ORPHANED_REFERENCE"
+	ViolationMissingRequired       ViolationType = "MISSING_REQUIRED"
+	ViolationTypeMismatch          ViolationType = "TYPE_MISMATCH"
+	ViolationDuplicate             ViolationType = "DUPLICATE"
+	ViolationOutOfRange            ViolationType = "OUT_OF_RANGE"
+	ViolationOrphanedRef           ViolationType = "ORPHANED_REFERENCE"
+	ViolationMissingSourceIdentity ViolationType = "MISSING_SOURCE_IDENTITY"
 )
 
 const (
@@ -165,9 +167,9 @@ func (r *RemediateRequest) Validate() error {
 
 // ─── Integrity Engine ─────────────────────────────────────────────────────────
 
-// PerformIntegrityValidation runs schema, duplicate, and format integrity checks
-// on the provided migration records. Returns checks, audit entries, valid count,
-// invalid count, and an integrity score (0–100%).
+// PerformIntegrityValidation runs schema, source identity, duplicate, and
+// format integrity checks on the provided migration records. Returns checks,
+// audit entries, valid count, invalid count, and an integrity score (0–100%).
 func PerformIntegrityValidation(req *ValidateMigrationRequest, jobID, tenantID string) ([]IntegrityCheck, []AuditEntry, int, int, float64) {
 	now := time.Now()
 	var checks []IntegrityCheck
@@ -216,15 +218,65 @@ func PerformIntegrityValidation(req *ValidateMigrationRequest, jobID, tenantID s
 		CreatedAt:      now,
 	})
 
-	// ── Check 2: Duplicate Detection ──────────────────────────────────────────
+	// ── Check 2: Source Identity Presence ─────────────────────────────────────
+	// A blank ref is not just another value: the record has no source identity
+	// at all (MIG-INV-02 "every object preserves source identity"), which is a
+	// different defect from a duplicated one. Reported here, before duplicate
+	// detection, so several blank refs are each reported for what they are
+	// rather than only as "duplicates" of one another.
+	//
+	// refBlank is computed once: the identity check, the duplicate scan and
+	// its per-record count all need the same answer, and trimming each ref
+	// three times over would be pure repetition.
+	refBlank := make([]bool, totalRecords)
+	identityFailed := 0
+	for i, rec := range req.Records {
+		if strings.TrimSpace(rec.Ref) == "" {
+			refBlank[i] = true
+			identityFailed++
+			violated[i] = true
+			auditEntries = append(auditEntries, AuditEntry{
+				TenantID:      tenantID,
+				JobID:         jobID,
+				RecordRef:     rec.Ref,
+				ViolationType: ViolationMissingSourceIdentity,
+				IsRemediated:  false,
+				CreatedAt:     now,
+			})
+		}
+	}
+	checks = append(checks, IntegrityCheck{
+		TenantID:       tenantID,
+		JobID:          jobID,
+		CheckName:      "Source Identity Presence",
+		CheckType:      CheckSourceIdentity,
+		RecordsChecked: totalRecords,
+		RecordsPassed:  totalRecords - identityFailed,
+		RecordsFailed:  identityFailed,
+		Severity:       sev(identityFailed, SeverityCritical),
+		Detail:         fmt.Sprintf("Scanned %d records for a source reference", totalRecords),
+		CreatedAt:      now,
+	})
+
+	// ── Check 3: Duplicate Detection ──────────────────────────────────────────
+	// Blank refs are excluded (refBlank, computed once by the identity
+	// check above): they were already reported for what they are, and
+	// comparing empty strings would report a batch of unidentified records
+	// as duplicates of each other instead.
 	seen := make(map[string]int)
-	for _, rec := range req.Records {
+	for i, rec := range req.Records {
+		if refBlank[i] {
+			continue
+		}
 		seen[rec.Ref]++
 	}
 	// Every record of a duplicated ref fails: which copy is authoritative is
 	// unknowable here, so none is silently preferred (ZS-MIG-001 MIG-N05).
 	dupFailed := 0
 	for i, rec := range req.Records {
+		if refBlank[i] {
+			continue
+		}
 		if seen[rec.Ref] > 1 {
 			dupFailed++
 			violated[i] = true
@@ -256,7 +308,7 @@ func PerformIntegrityValidation(req *ValidateMigrationRequest, jobID, tenantID s
 		CreatedAt:      now,
 	})
 
-	// ── Check 3: Numeric Format Check ─────────────────────────────────────────
+	// ── Check 4: Numeric Format Check ─────────────────────────────────────────
 	numericFields := []string{"amount", "salary", "balance", "quantity"}
 	fmtFailed := 0
 	fmtFailedRecs := make(map[int]bool)

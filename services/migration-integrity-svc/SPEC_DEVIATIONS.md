@@ -93,9 +93,15 @@ service. One scoring defect was fixed in this pass (B1).
   `ORPHANED_REFERENCE` / `OUT_OF_RANGE` violations are declared but never
   produced). Rules are not versioned, so a stored result cannot say which
   rule set produced it (MIG-INV-05).
-- **A8. Empty `ref` is accepted.** A record with no source identity is
-  checked like any other; several empty refs are reported only as
-  "duplicates" (MIG-INV-02 every object preserves source identity, MIG-INV-14).
+- **A8. Empty `ref` is accepted** (closed). A blank `ref` is now its own
+  violation, `MISSING_SOURCE_IDENTITY`, reported by a dedicated "Source
+  Identity Presence" check before duplicate detection runs (MIG-INV-02 every
+  object preserves source identity, MIG-INV-14). Blank refs are excluded from
+  duplicate detection, so several unidentified records are each reported for
+  what they are instead of as "duplicates" of one another; a blank ref also
+  no longer perturbs duplicate detection for the refs that do have an
+  identity. Each blank-ref record counts as invalid for the count and score,
+  like any other violation.
 - **A9. Reads are not authorized.** `GET /v1/migrations` and `GET
   /v1/migrations/{id}` check only the tenant (RLS); writes are authorized per
   legal entity.

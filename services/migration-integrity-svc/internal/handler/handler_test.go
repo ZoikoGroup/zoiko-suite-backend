@@ -107,8 +107,8 @@ func TestValidateMigrationAndLifecycle(t *testing.T) {
 	if job.IntegrityScore != 20 {
 		t.Fatalf("expected integrity score 20, got %f", job.IntegrityScore)
 	}
-	if len(job.IntegrityChecks) != 3 {
-		t.Fatalf("expected 3 integrity checks (schema, dup, format), got %d", len(job.IntegrityChecks))
+	if len(job.IntegrityChecks) != 4 {
+		t.Fatalf("expected 4 integrity checks (schema, identity, dup, format), got %d", len(job.IntegrityChecks))
 	}
 	if len(job.AuditEntries) == 0 {
 		t.Fatal("expected audit entries for violations")
@@ -226,6 +226,55 @@ func TestValidateMigrationCleanData(t *testing.T) {
 	}
 	if job.Status != domain.JobStatusCompleted {
 		t.Fatalf("expected status COMPLETED, got %s", job.Status)
+	}
+}
+
+func TestValidateMigrationEmptyRefReportedAsMissingIdentity(t *testing.T) {
+	router := newRouter(t)
+
+	validateReq := domain.ValidateMigrationRequest{
+		LegalEntityID:  "LE-5007",
+		MigrationName:  "Unidentified records",
+		SourceSystem:   "LEGACY_ERP",
+		TargetService:  "ledger-svc",
+		RequiredFields: []string{"amount"},
+		Records: []domain.MigrationRecord{
+			{Ref: "", Fields: map[string]string{"amount": "10.00"}},
+			{Ref: "  ", Fields: map[string]string{"amount": "20.00"}},
+			{Ref: "REC-900", Fields: map[string]string{"amount": "30.00"}},
+		},
+	}
+	body, _ := json.Marshal(validateReq)
+	req := httptest.NewRequest(http.MethodPost, "/v1/migrations/validate", bytes.NewBuffer(body))
+	withEnvelope(req)
+	req.Header.Set("X-Tenant-ID", "tenant-mig-55")
+	req.Header.Set("X-Principal-Id", "user-1")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var job domain.MigrationJob
+	_ = json.Unmarshal(rec.Body.Bytes(), &job)
+	if job.InvalidRecordsCount != 2 || job.ValidRecordsCount != 1 {
+		t.Fatalf("expected 2 invalid / 1 valid, got %d / %d", job.InvalidRecordsCount, job.ValidRecordsCount)
+	}
+
+	var identity, dup int
+	for _, e := range job.AuditEntries {
+		switch e.ViolationType {
+		case domain.ViolationMissingSourceIdentity:
+			identity++
+		case domain.ViolationDuplicate:
+			dup++
+		}
+	}
+	if identity != 2 {
+		t.Fatalf("expected 2 MISSING_SOURCE_IDENTITY audit entries, got %d (%+v)", identity, job.AuditEntries)
+	}
+	if dup != 0 {
+		t.Fatalf("blank refs must not be reported as duplicates, got %d DUPLICATE entries", dup)
 	}
 }
 
