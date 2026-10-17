@@ -177,6 +177,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Post("/v1/secret-policies/{secret_policy_id}/emergency-retrieval", h.EmergencyRetrieval)
 
 	r.Post("/v1/secrets/broker", h.Broker)
+	r.Post("/v1/secrets/sign", h.Sign)
 	r.Get("/v1/secrets/leases/{lease_id}", h.GetLease)
 	r.Post("/v1/secrets/leases/{lease_id}/verify", h.VerifyLease)
 	r.Get("/v1/secrets/leases", h.ListLeases)

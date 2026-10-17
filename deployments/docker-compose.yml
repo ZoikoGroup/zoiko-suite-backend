@@ -2069,8 +2069,8 @@ services:
 
   notification-svc:
     build:
-      context: ../services/notification-svc
-      dockerfile: Dockerfile
+      context: ../services
+      dockerfile: notification-svc/Dockerfile
     container_name: notification-svc
     mem_limit: 256m
     cpus: "0.5"

@@ -17,7 +17,6 @@ import (
 	"zoiko.io/connectivity-api-bridge-svc/internal/authz"
 	"zoiko.io/connectivity-api-bridge-svc/internal/config"
 	"zoiko.io/connectivity-api-bridge-svc/internal/connector"
-	"zoiko.io/connectivity-api-bridge-svc/internal/egress"
 	svcenvelope "zoiko.io/connectivity-api-bridge-svc/internal/envelope"
 	"zoiko.io/connectivity-api-bridge-svc/internal/handler"
 	"zoiko.io/connectivity-api-bridge-svc/internal/health"
@@ -26,6 +25,7 @@ import (
 	"zoiko.io/connectivity-api-bridge-svc/internal/store"
 	"zoiko.io/connectivity-api-bridge-svc/internal/telemetry"
 	"zoiko.io/connectivity-api-bridge-svc/internal/vault"
+	"zoiko.io/eventing/egress"
 	"zoiko.io/eventing/kafkaout"
 	"zoiko.io/eventing/outbox"
 )

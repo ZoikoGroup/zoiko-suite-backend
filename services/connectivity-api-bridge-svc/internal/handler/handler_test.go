@@ -18,10 +18,10 @@ import (
 	"zoiko.io/connectivity-api-bridge-svc/internal/authz"
 	"zoiko.io/connectivity-api-bridge-svc/internal/connector"
 	"zoiko.io/connectivity-api-bridge-svc/internal/domain"
-	"zoiko.io/connectivity-api-bridge-svc/internal/egress"
 	"zoiko.io/connectivity-api-bridge-svc/internal/middleware"
 	"zoiko.io/connectivity-api-bridge-svc/internal/store"
 	"zoiko.io/connectivity-api-bridge-svc/internal/vault"
+	"zoiko.io/eventing/egress"
 )
 
 const credOK = "0a000000-0000-4000-8000-000000000001"

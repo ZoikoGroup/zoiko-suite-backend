@@ -179,3 +179,42 @@ func TestHostMatchesSuffix(t *testing.T) {
 		t.Error("an empty allowlist matches nothing: fail closed")
 	}
 }
+
+func TestDialContextRefusesPrivateAndRebindingTargets(t *testing.T) {
+	p := Policy{Resolver: fakeResolver{
+		"rebind.example":  {"93.184.216.34", "10.0.0.5"}, // one private answer among public ones
+		"private.example": {"192.168.1.10"},
+		"meta.example":    {"169.254.169.254"},
+	}}
+	dial := p.DialContext(nil)
+	for _, addr := range []string{"rebind.example:443", "private.example:443", "meta.example:443", "127.0.0.1:443", "[::1]:443", "unknown.example:443"} {
+		if conn, err := dial(context.Background(), "tcp", addr); err == nil {
+			conn.Close()
+			t.Errorf("%s: connected", addr)
+		} else if !errors.Is(err, ErrDenied) {
+			t.Errorf("%s: %v, want ErrDenied", addr, err)
+		}
+	}
+	if _, err := dial(context.Background(), "tcp", "no-port"); !errors.Is(err, ErrDenied) {
+		t.Errorf("a malformed address: %v", err)
+	}
+}
+
+func TestHTTPClientDoesNotFollowRedirects(t *testing.T) {
+	c := (Policy{}).NewHTTPClient(0)
+	if c.CheckRedirect == nil || c.CheckRedirect(nil, nil) == nil {
+		t.Fatal("redirects must not be followed")
+	}
+	if c.Timeout <= 0 {
+		t.Fatal("a client without a timeout can wait forever")
+	}
+}
+
+func TestHostOfNeverReturnsPathOrQuery(t *testing.T) {
+	if got := HostOf("https://Hooks.Example.com:8443/a/b?token=1"); got != "Hooks.Example.com" {
+		t.Fatalf("%q", got)
+	}
+	if HostOf("::bad") != "" {
+		t.Fatal("a bad URL has no host")
+	}
+}

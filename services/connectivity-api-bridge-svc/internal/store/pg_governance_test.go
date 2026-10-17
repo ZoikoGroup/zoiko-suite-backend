@@ -19,10 +19,10 @@ import (
 
 	"zoiko.io/connectivity-api-bridge-svc/internal/connector"
 	"zoiko.io/connectivity-api-bridge-svc/internal/domain"
-	"zoiko.io/connectivity-api-bridge-svc/internal/egress"
 	"zoiko.io/connectivity-api-bridge-svc/internal/middleware"
 	"zoiko.io/connectivity-api-bridge-svc/internal/store"
 	"zoiko.io/connectivity-api-bridge-svc/internal/vault"
+	"zoiko.io/eventing/egress"
 )
 
 // These tests run the governed connector against REAL Postgres: the SQL, the

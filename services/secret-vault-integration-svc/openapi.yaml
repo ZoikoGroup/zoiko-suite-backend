@@ -612,6 +612,39 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
 
+  /v1/secrets/sign:
+    post:
+      tags: [Brokering]
+      summary: Sign a message with a WEBHOOK_SIGNING secret (the key never leaves the vault)
+      operationId: signWithSecret
+      description: |
+        Returns the HMAC-SHA256 of the supplied message under the key material at `secret_path`,
+        and nothing else. Same gates as brokering (gateway-verified identity equal to
+        `requested_by_principal_id`, an ACTIVE applicable policy version for the caller's tenant,
+        the caller in `allowed_workload_ids`) plus: the policy's secret class must be
+        `WEBHOOK_SIGNING`. Every use is audited (`SIGNED`, or `DENIED` with the reason); if the
+        audit entry cannot be written no signature is returned. Messages are limited to about
+        180 KiB. Used by notification-svc to sign outbound webhooks (ZS-SVC-M-001 INT-04).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [secret_path, requested_by_principal_id, request_id, message_base64]
+              properties:
+                secret_path: {type: string}
+                requested_by_principal_id: {type: string}
+                request_id: {type: string}
+                message_base64: {type: string}
+                algorithm: {type: string, enum: [HMAC-SHA256]}
+      responses:
+        "200": {description: "{secret_path, algorithm, signature_hex, secret_policy_version_id}"}
+        "400": {description: Invalid request, or the canonical input contract is incomplete}
+        "403": {description: Identity mismatch, not an allowed workload, or not a signing secret}
+        "404": {description: No applicable secret policy}
+        "503": {description: Vault backend or audit store unavailable (fails closed)}
+
   /v1/secrets/broker:
     post:
       tags: [Brokering]

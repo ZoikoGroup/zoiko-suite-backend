@@ -45,6 +45,18 @@ func TestVerifyAcceptsAnActiveVersion(t *testing.T) {
 		seen.Header.Get("X-Correlation-Id") != "corr-1" {
 		t.Fatalf("the vault must authorize the person doing the approving: %v", seen.Header)
 	}
+	// The real vault refuses a governed read without its canonical input contract
+	// (400 envelope_incomplete); a stub does not, which hid this in the live run.
+	for _, k := range []string{"X-Request-Id", "X-Source-Channel", "X-Purpose-Context"} {
+		if seen.Header.Get(k) == "" {
+			t.Errorf("%s is missing: the real vault answers 400 envelope_incomplete", k)
+		}
+	}
+	switch seen.Header.Get("X-Source-Channel") {
+	case "api", "import", "integration", "mobile", "scheduled_job", "system", "web":
+	default:
+		t.Errorf("X-Source-Channel %q is not one the contract accepts", seen.Header.Get("X-Source-Channel"))
+	}
 }
 
 func TestVerifyAcceptsAGlobalPolicy(t *testing.T) {

@@ -1,4 +1,5 @@
-// Package egress decides whether a connector's destination may be used at all
+// Package egress decides whether an outbound destination (a connector endpoint, a webhook
+// target) may be used at all
 // (ZS-SVC-M-001 §7, INT-CTRL-015, INT-NP-018): an approved connector must not
 // become arbitrary outbound network access.
 //
