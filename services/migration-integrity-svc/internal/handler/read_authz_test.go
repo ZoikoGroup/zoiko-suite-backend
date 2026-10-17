@@ -63,7 +63,7 @@ func newRouterWithAuthz(t *testing.T, decide func(body map[string]string) string
 	t.Cleanup(srv.Close)
 
 	logger := zap.NewNop()
-	h := handler.NewHandler(store.NewMemoryStore(), authz.NewClient(srv.URL, logger), logger)
+	h := handler.NewHandler(store.NewMemoryStore(), authz.NewClient(srv.URL, logger), logger, 95)
 	return handler.NewRouter(h), spy
 }
 

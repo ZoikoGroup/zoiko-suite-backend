@@ -54,24 +54,29 @@ type MigrationRecord struct {
 	Fields map[string]string `json:"fields"`
 }
 
+// MigrationJob is one validation run. IntegrityScoreThreshold is the
+// acceptance bar the run was actually judged against (the config value at
+// validation time), stored per job so a PASS/FAIL decision remains
+// auditable after the configured default changes (SPEC_DEVIATIONS A11).
 type MigrationJob struct {
-	ID                  string           `json:"id"`
-	TenantID            string           `json:"tenant_id"`
-	LegalEntityID       string           `json:"legal_entity_id"`
-	MigrationName       string           `json:"migration_name"`
-	SourceSystem        string           `json:"source_system"`
-	TargetService       string           `json:"target_service"`
-	TotalRecordsCount   int              `json:"total_records_count"`
-	ValidRecordsCount   int              `json:"valid_records_count"`
-	InvalidRecordsCount int              `json:"invalid_records_count"`
-	IntegrityScore      float64          `json:"integrity_score"`
-	Status              JobStatus        `json:"status"`
-	IntegrityChecks     []IntegrityCheck `json:"integrity_checks,omitempty"`
-	AuditEntries        []AuditEntry     `json:"audit_entries,omitempty"`
-	StartedAt           *time.Time       `json:"started_at,omitempty"`
-	CompletedAt         *time.Time       `json:"completed_at,omitempty"`
-	CreatedAt           time.Time        `json:"created_at"`
-	UpdatedAt           time.Time        `json:"updated_at"`
+	ID                      string           `json:"id"`
+	TenantID                string           `json:"tenant_id"`
+	LegalEntityID           string           `json:"legal_entity_id"`
+	MigrationName           string           `json:"migration_name"`
+	SourceSystem            string           `json:"source_system"`
+	TargetService           string           `json:"target_service"`
+	TotalRecordsCount       int              `json:"total_records_count"`
+	ValidRecordsCount       int              `json:"valid_records_count"`
+	InvalidRecordsCount     int              `json:"invalid_records_count"`
+	IntegrityScore          float64          `json:"integrity_score"`
+	IntegrityScoreThreshold float64          `json:"integrity_score_threshold"`
+	Status                  JobStatus        `json:"status"`
+	IntegrityChecks         []IntegrityCheck `json:"integrity_checks,omitempty"`
+	AuditEntries            []AuditEntry     `json:"audit_entries,omitempty"`
+	StartedAt               *time.Time       `json:"started_at,omitempty"`
+	CompletedAt             *time.Time       `json:"completed_at,omitempty"`
+	CreatedAt               time.Time        `json:"created_at"`
+	UpdatedAt               time.Time        `json:"updated_at"`
 }
 
 type IntegrityCheck struct {
@@ -372,6 +377,21 @@ func PerformIntegrityValidation(req *ValidateMigrationRequest, jobID, tenantID s
 	}
 
 	return checks, auditEntries, validCount, invalidCount, score
+}
+
+// EvaluateJobStatus derives a job's acceptance result from its integrity
+// score and the acceptance bar the service applied: below the bar is FAILED,
+// at or above is COMPLETED. A run in which every record is invalid is FAILED
+// at any bar -- a migration with nothing intact is not an accepted migration,
+// whatever the configured threshold says (SPEC_DEVIATIONS A11).
+func EvaluateJobStatus(score float64, validCount, invalidCount int, threshold float64) JobStatus {
+	if validCount == 0 && invalidCount > 0 {
+		return JobStatusFailed
+	}
+	if score < threshold {
+		return JobStatusFailed
+	}
+	return JobStatusCompleted
 }
 
 // decimalRe is a plain signed decimal: "5", "-5", "5.25", "5.", ".5". It refuses

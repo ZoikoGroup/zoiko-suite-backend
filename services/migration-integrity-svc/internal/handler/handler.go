@@ -29,13 +29,19 @@ const (
 )
 
 type Handler struct {
-	store  store.Store
-	authz  *authz.Client
-	logger *zap.Logger
+	store                   store.Store
+	authz                   *authz.Client
+	logger                  *zap.Logger
+	integrityScoreThreshold float64
 }
 
-func NewHandler(s store.Store, a *authz.Client, l *zap.Logger) *Handler {
-	return &Handler{store: s, authz: a, logger: l}
+// NewHandler wires the handler. integrityScoreThreshold is the service-level
+// acceptance bar for validation results (config.IntegrityScoreThreshold): a
+// job scoring below it is FAILED, and the bar is stored on every job it
+// decides so the acceptance stays auditable after the default changes
+// (SPEC_DEVIATIONS A11).
+func NewHandler(s store.Store, a *authz.Client, l *zap.Logger, integrityScoreThreshold float64) *Handler {
+	return &Handler{store: s, authz: a, logger: l, integrityScoreThreshold: integrityScoreThreshold}
 }
 
 func NewRouter(h *Handler) http.Handler {
@@ -103,24 +109,22 @@ func (h *Handler) ValidateMigration(w http.ResponseWriter, r *http.Request) {
 
 	checks, entries, validCount, invalidCount, score := domain.PerformIntegrityValidation(&req, jobID, tenantID)
 
-	status := domain.JobStatusCompleted
-	if invalidCount == len(req.Records) {
-		status = domain.JobStatusFailed
-	}
+	status := domain.EvaluateJobStatus(score, validCount, invalidCount, h.integrityScoreThreshold)
 
 	job := &domain.MigrationJob{
-		ID:                  jobID,
-		LegalEntityID:       req.LegalEntityID,
-		MigrationName:       req.MigrationName,
-		SourceSystem:        req.SourceSystem,
-		TargetService:       req.TargetService,
-		TotalRecordsCount:   len(req.Records),
-		ValidRecordsCount:   validCount,
-		InvalidRecordsCount: invalidCount,
-		IntegrityScore:      score,
-		Status:              status,
-		StartedAt:           &now,
-		CompletedAt:         &now,
+		ID:                      jobID,
+		LegalEntityID:           req.LegalEntityID,
+		MigrationName:           req.MigrationName,
+		SourceSystem:            req.SourceSystem,
+		TargetService:           req.TargetService,
+		TotalRecordsCount:       len(req.Records),
+		ValidRecordsCount:       validCount,
+		InvalidRecordsCount:     invalidCount,
+		IntegrityScore:          score,
+		IntegrityScoreThreshold: h.integrityScoreThreshold,
+		Status:                  status,
+		StartedAt:               &now,
+		CompletedAt:             &now,
 	}
 
 	if err := h.store.CreateJob(r.Context(), tenantID, job, checks, entries, principalID, r.Header.Get("X-Correlation-ID")); err != nil {
