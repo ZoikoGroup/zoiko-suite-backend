@@ -65,15 +65,20 @@ service. One scoring defect was fixed in this pass (B1).
   (MIG-N28) or relationships (MIG-N29), or ties open AR/AP to control accounts
   (MIG-C16/C17, MIG-N07). Records carry no amount field the service
   understands except as a numeric-format check.
-- **A5. Remediation has no evidence.** `RemediateEntry` accepts `notes` and
-  discards them: they are not stored and not in the
-  `migration.audit_entry_remediated` event. Remediation is a boolean flip by
-  anyone with `AUDIT_ENTRY_REMEDIATE`, with no reason, evidence reference,
-  re-validation or disposition (MIG-INV-12 "owner, reason code and
-  disposition"; MIG-N27 "quarantine item manually edited without evidence →
-  reject resolution"; §24 "immutable issue history"). Scope: a migration to
-  add `remediation_reason`, `remediation_evidence_ref`, `remediated_by`,
-  `remediated_at`; require reason and evidence; include them in the event.
+- **A5. Remediation has no evidence** (closed). `RemediateEntry` accepted
+  `notes` and discarded them: they were not stored and not in the
+  `migration.audit_entry_remediated` event. Remediation is now an evidenced
+  decision: `remediation_reason` and `remediation_evidence_ref` are both
+  required (400 when either is missing or blank) and are stored on the audit
+  entry together with `remediated_by` and `remediated_at` (migration
+  `000003_remediation_evidence`), and all four are included in the
+  `migration.audit_entry_remediated` event payload. The store records them on
+  the first remediation only: a replay still succeeds, emits nothing and
+  returns the recorded decision unchanged, so the evidence cannot be
+  rewritten after the fact. The discarded `notes` field was removed rather
+  than left as a field the API pretends to accept (MIG-INV-12 "owner, reason
+  code and disposition"; MIG-N27 "quarantine item manually edited without
+  evidence → reject resolution").
 - **A6. No quarantine severity or reason taxonomy.** §16 defines MQ0–MQ4
   severities with required dispositions and reason families (IDENTITY,
   REFERENCE, TEMPORAL, FINANCIAL, SUBLEDGER, TAX, DOCUMENT, SCHEMA, SECURITY,

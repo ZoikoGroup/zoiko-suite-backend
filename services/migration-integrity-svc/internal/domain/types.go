@@ -96,7 +96,16 @@ type AuditEntry struct {
 	TargetValue   string        `json:"target_value,omitempty"`
 	ViolationType ViolationType `json:"violation_type"`
 	IsRemediated  bool          `json:"is_remediated"`
-	CreatedAt     time.Time     `json:"created_at"`
+
+	// Remediation evidence (ZS-MIG-001 MIG-INV-12: owner, reason code and
+	// disposition). Recorded on the first remediation only; a replayed
+	// remediate request returns the original decision unchanged.
+	RemediationReason      string     `json:"remediation_reason,omitempty"`
+	RemediationEvidenceRef string     `json:"remediation_evidence_ref,omitempty"`
+	RemediatedBy           string     `json:"remediated_by,omitempty"`
+	RemediatedAt           *time.Time `json:"remediated_at,omitempty"`
+
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // ─── Request DTOs ─────────────────────────────────────────────────────────────
@@ -110,8 +119,14 @@ type ValidateMigrationRequest struct {
 	Records        []MigrationRecord `json:"records"`
 }
 
+// RemediateRequest is the body of
+// POST /v1/migrations/{id}/audit/{entryId}/remediate. Remediation is an
+// evidenced decision, not a boolean flip: a reason and a reference to the
+// evidence supporting it are both required (MIG-INV-12, MIG-N27).
 type RemediateRequest struct {
-	Notes string `json:"notes"`
+	RemediationReason string `json:"remediation_reason"`
+
+	RemediationEvidenceRef string `json:"remediation_evidence_ref"`
 }
 
 // ─── Validation ───────────────────────────────────────────────────────────────
@@ -131,6 +146,19 @@ func (r *ValidateMigrationRequest) Validate() error {
 	}
 	if len(r.Records) == 0 {
 		return fmt.Errorf("records cannot be empty")
+	}
+	return nil
+}
+
+// Validate enforces that a remediation carries its evidence: a reason
+// (the disposition) and a reference to what supports it. Both are required;
+// a blank or whitespace-only value is missing, not provided.
+func (r *RemediateRequest) Validate() error {
+	if strings.TrimSpace(r.RemediationReason) == "" {
+		return fmt.Errorf("remediation_reason is required")
+	}
+	if strings.TrimSpace(r.RemediationEvidenceRef) == "" {
+		return fmt.Errorf("remediation_evidence_ref is required")
 	}
 	return nil
 }
