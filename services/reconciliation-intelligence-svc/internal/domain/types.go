@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/big"
 	"time"
 )
 
@@ -40,11 +41,13 @@ const (
 	StatusExecuted    ResolutionStatus = "EXECUTED"
 )
 
+// Monetary fields are exact decimal strings (e.g. "1200.50"), never
+// float64 — ZS-DATA-001 D06. See decimal.go.
 type TransactionItem struct {
-	RefID     string  `json:"ref_id"`
-	Amount    float64 `json:"amount"`
-	Date      string  `json:"date"`
-	Narrative string  `json:"narrative,omitempty"`
+	RefID     string `json:"ref_id"`
+	Amount    string `json:"amount"`
+	Date      string `json:"date"`
+	Narrative string `json:"narrative,omitempty"`
 }
 
 type ReconciliationJob struct {
@@ -70,9 +73,9 @@ type UnmatchedItem struct {
 	JobID             string          `json:"job_id"`
 	TransactionRefA   string          `json:"transaction_ref_a"`
 	TransactionRefB   string          `json:"transaction_ref_b,omitempty"`
-	AmountA           float64         `json:"amount_a"`
-	AmountB           float64         `json:"amount_b"`
-	DiscrepancyAmount float64         `json:"discrepancy_amount"`
+	AmountA           string          `json:"amount_a"`
+	AmountB           string          `json:"amount_b"`
+	DiscrepancyAmount string          `json:"discrepancy_amount"`
 	DiscrepancyType   DiscrepancyType `json:"discrepancy_type"`
 	// ConfidenceScore is NOT statistically or ML-derived — it is one of three
 	// fixed values produced by PerformIntelligentReconciliation's hardcoded
@@ -154,6 +157,16 @@ func (r *AnalyzeReconciliationRequest) Validate() error {
 	if len(r.TransactionsA) == 0 && len(r.TransactionsB) == 0 {
 		return fmt.Errorf("transaction batches cannot be empty")
 	}
+	for i, tx := range r.TransactionsA {
+		if _, err := ParseStorableAmount(tx.Amount); err != nil {
+			return fmt.Errorf("transactions_a[%d].amount: %w", i, err)
+		}
+	}
+	for i, tx := range r.TransactionsB {
+		if _, err := ParseStorableAmount(tx.Amount); err != nil {
+			return fmt.Errorf("transactions_b[%d].amount: %w", i, err)
+		}
+	}
 	return nil
 }
 
@@ -204,7 +217,17 @@ const (
 // MetricMissingReferenceTolerance respectively, for this request's
 // legal entity — resolving "no policy configured" is the caller's job
 // (refuse, per ZS-SVC-Z-001 INV-09), not this function's.
-func PerformIntelligentReconciliation(req *AnalyzeReconciliationRequest, jobID, tenantID string, amountMismatchTolerance, missingReferenceTolerance float64) (int, int, float64, []UnmatchedItem) {
+//
+// All money is compared exactly as big.Rat (ZS-DATA-001 D06). A
+// discrepancy is |amount_a - amount_b| with no rounding: two amounts are
+// matched only when they are exactly equal.
+func PerformIntelligentReconciliation(req *AnalyzeReconciliationRequest, jobID, tenantID string, amountMismatchTolerance, missingReferenceTolerance *big.Rat) (int, int, float64, []UnmatchedItem, error) {
+	if amountMismatchTolerance == nil || missingReferenceTolerance == nil {
+		return 0, 0, 0, nil, fmt.Errorf("both governed tolerances are required")
+	}
+	amountMismatchTol := CanonicalAmount(amountMismatchTolerance)
+	missingReferenceTol := CanonicalAmount(missingReferenceTolerance)
+
 	mapB := make(map[string]TransactionItem)
 	for _, txB := range req.TransactionsB {
 		mapB[txB.RefID] = txB
@@ -215,11 +238,21 @@ func PerformIntelligentReconciliation(req *AnalyzeReconciliationRequest, jobID, 
 	totalProcessed := len(req.TransactionsA)
 
 	for _, txA := range req.TransactionsA {
+		amountA, err := ParseAmount(txA.Amount)
+		if err != nil {
+			return 0, 0, 0, nil, fmt.Errorf("transaction %q: %w", txA.RefID, err)
+		}
 		txB, exists := mapB[txA.RefID]
 		if exists {
 			// Reference matches! Check amounts and dates
-			discAmount := math.Round(math.Abs(txA.Amount-txB.Amount)*100) / 100
-			if discAmount == 0.0 {
+			amountB, err := ParseAmount(txB.Amount)
+			if err != nil {
+				return 0, 0, 0, nil, fmt.Errorf("transaction %q: %w", txB.RefID, err)
+			}
+			discAmount := new(big.Rat).Sub(amountA, amountB)
+			discAmount.Abs(discAmount)
+			disc := CanonicalAmount(discAmount)
+			if discAmount.Sign() == 0 {
 				// Exact Match
 				matchedCount++
 			} else {
@@ -227,16 +260,16 @@ func PerformIntelligentReconciliation(req *AnalyzeReconciliationRequest, jobID, 
 				confScore := amountMismatchConfidence
 				var rec ResolutionRecommendation
 				var rationale string
-				if discAmount < amountMismatchTolerance {
+				if discAmount.Cmp(amountMismatchTolerance) < 0 {
 					rec = RecommendationWriteOff
 					rationale = fmt.Sprintf(
-						"heuristic rule: discrepancy $%.2f is below the $%.2f governed write-off tolerance",
-						discAmount, amountMismatchTolerance)
+						"heuristic rule: discrepancy %s is below the %s governed write-off tolerance",
+						disc, amountMismatchTol)
 				} else {
 					rec = RecommendationTimingAdjustment
 					rationale = fmt.Sprintf(
-						"heuristic rule: discrepancy $%.2f is at or above the $%.2f governed write-off tolerance",
-						discAmount, amountMismatchTolerance)
+						"heuristic rule: discrepancy %s is at or above the %s governed write-off tolerance",
+						disc, amountMismatchTol)
 				}
 
 				unmatchedItems = append(unmatchedItems, UnmatchedItem{
@@ -244,9 +277,9 @@ func PerformIntelligentReconciliation(req *AnalyzeReconciliationRequest, jobID, 
 					JobID:             jobID,
 					TransactionRefA:   txA.RefID,
 					TransactionRefB:   txB.RefID,
-					AmountA:           txA.Amount,
-					AmountB:           txB.Amount,
-					DiscrepancyAmount: discAmount,
+					AmountA:           CanonicalAmount(amountA),
+					AmountB:           CanonicalAmount(amountB),
+					DiscrepancyAmount: disc,
 					DiscrepancyType:   DiscrepancyAmountMismatch,
 					ConfidenceScore:   confScore,
 					Recommendation:    rec,
@@ -260,29 +293,30 @@ func PerformIntelligentReconciliation(req *AnalyzeReconciliationRequest, jobID, 
 			// Missing Reference in System B. The tolerance is a magnitude: a
 			// large credit (negative amount) is as material as a large debit and
 			// must never qualify as a "small amount" write-off.
-			magnitude := math.Abs(txA.Amount)
+			magnitude := new(big.Rat).Abs(amountA)
+			mag := CanonicalAmount(magnitude)
 			confScore := missingReferenceManualReviewConfidence
 			rec := RecommendationManualReview
 			var rationale string
-			if magnitude < missingReferenceTolerance {
+			if magnitude.Cmp(missingReferenceTolerance) < 0 {
 				rec = RecommendationWriteOff
 				confScore = missingReferenceWriteOffConfidence
 				rationale = fmt.Sprintf(
-					"heuristic rule: amount magnitude $%.2f is below the $%.2f governed small-amount write-off tolerance",
-					magnitude, missingReferenceTolerance)
+					"heuristic rule: amount magnitude %s is below the %s governed small-amount write-off tolerance",
+					mag, missingReferenceTol)
 			} else {
 				rationale = fmt.Sprintf(
-					"heuristic rule: no matching reference in system B; amount magnitude $%.2f is at or above the $%.2f governed small-amount tolerance, so manual review is recommended rather than automatic write-off",
-					magnitude, missingReferenceTolerance)
+					"heuristic rule: no matching reference in system B; amount magnitude %s is at or above the %s governed small-amount tolerance, so manual review is recommended rather than automatic write-off",
+					mag, missingReferenceTol)
 			}
 
 			unmatchedItems = append(unmatchedItems, UnmatchedItem{
 				TenantID:          tenantID,
 				JobID:             jobID,
 				TransactionRefA:   txA.RefID,
-				AmountA:           txA.Amount,
-				AmountB:           0.0,
-				DiscrepancyAmount: magnitude,
+				AmountA:           CanonicalAmount(amountA),
+				AmountB:           "0",
+				DiscrepancyAmount: mag,
 				DiscrepancyType:   DiscrepancyMissingReference,
 				ConfidenceScore:   confScore,
 				Recommendation:    rec,
@@ -300,5 +334,5 @@ func PerformIntelligentReconciliation(req *AnalyzeReconciliationRequest, jobID, 
 		recRate = math.Round((float64(matchedCount)/float64(totalProcessed))*10000) / 100
 	}
 
-	return matchedCount, unmatchedCount, recRate, unmatchedItems
+	return matchedCount, unmatchedCount, recRate, unmatchedItems, nil
 }

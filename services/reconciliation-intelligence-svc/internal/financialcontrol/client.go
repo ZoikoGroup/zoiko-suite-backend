@@ -15,12 +15,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"net/http"
 	"net/url"
-	"strconv"
 	"time"
 
 	"go.uber.org/zap"
+	"zoiko.io/reconciliation-intelligence-svc/internal/domain"
 )
 
 // ErrServiceUnavailable is returned for any transport error, non-200
@@ -61,11 +62,17 @@ type listTolerancePoliciesResponse struct {
 // ErrServiceUnavailable; a reachable service with no policy configured
 // yet returns ErrToleranceNotConfigured. Neither case ever falls back
 // to a guessed default — see the package doc comment.
-func (c *Client) GetActiveAbsoluteTolerance(ctx context.Context, tenantID, principalID, legalEntityID, metric string) (float64, error) {
+//
+// financial-control-svc returns the tolerance as an exact decimal string;
+// it is parsed straight into a big.Rat, never float64 (ZS-DATA-001 D06),
+// so the governed limit a suggestion is compared against is the exact
+// value that was approved. A negative tolerance is malformed and also
+// fails closed.
+func (c *Client) GetActiveAbsoluteTolerance(ctx context.Context, tenantID, principalID, legalEntityID, metric string) (*big.Rat, error) {
 	q := url.Values{"legal_entity_id": {legalEntityID}, "metric": {metric}}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/controls/v1/tolerance-policies?"+q.Encode(), nil)
 	if err != nil {
-		return 0, ErrServiceUnavailable
+		return nil, ErrServiceUnavailable
 	}
 	req.Header.Set("X-Tenant-Id", tenantID)
 	req.Header.Set("X-Principal-Id", principalID)
@@ -75,28 +82,28 @@ func (c *Client) GetActiveAbsoluteTolerance(ctx context.Context, tenantID, princ
 		if c.logger != nil {
 			c.logger.Error("financial-control-svc unreachable — failing closed", zap.Error(err))
 		}
-		return 0, ErrServiceUnavailable
+		return nil, ErrServiceUnavailable
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return 0, ErrServiceUnavailable
+		return nil, ErrServiceUnavailable
 	}
 
 	var out listTolerancePoliciesResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return 0, ErrServiceUnavailable
+		return nil, ErrServiceUnavailable
 	}
 	if len(out.Items) == 0 {
-		return 0, ErrToleranceNotConfigured
+		return nil, ErrToleranceNotConfigured
 	}
 
 	// ListTolerancePolicies orders by (metric, tolerance_version)
 	// ascending, and CreateTolerancePolicy never edits a prior version
 	// in place — the last item is the current policy.
 	latest := out.Items[len(out.Items)-1]
-	tolerance, err := strconv.ParseFloat(latest.AbsoluteTolerance, 64)
-	if err != nil {
-		return 0, fmt.Errorf("%w: malformed absolute_tolerance %q", ErrServiceUnavailable, latest.AbsoluteTolerance)
+	tolerance, err := domain.ParseAmount(latest.AbsoluteTolerance)
+	if err != nil || tolerance.Sign() < 0 {
+		return nil, fmt.Errorf("%w: malformed absolute_tolerance %q", ErrServiceUnavailable, latest.AbsoluteTolerance)
 	}
 	return tolerance, nil
 }

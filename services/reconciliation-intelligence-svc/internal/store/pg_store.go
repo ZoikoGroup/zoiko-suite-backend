@@ -135,7 +135,7 @@ func (s *PgStore) CreateJob(ctx context.Context, tenantID string, job *domain.Re
 		INSERT INTO reconciliation_unmatched_items (
 			id, tenant_id, job_id, transaction_ref_a, transaction_ref_b, amount_a, amount_b,
 			discrepancy_amount, discrepancy_type, confidence_score, recommendation, resolution_status, resolution_notes, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`
+		) VALUES ($1, $2, $3, $4, $5, $6::numeric, $7::numeric, $8::numeric, $9, $10, $11, $12, $13, $14, $15)`
 
 	for i := range items {
 		item := &items[i]
@@ -226,6 +226,9 @@ func (s *PgStore) GetJobByID(ctx context.Context, tenantID, id string) (*domain.
 			_ = rows.Scan(&item.ID, &item.TenantID, &item.JobID, &item.TransactionRefA, &item.TransactionRefB,
 				&item.AmountA, &item.AmountB, &item.DiscrepancyAmount, &item.DiscrepancyType, &item.ConfidenceScore,
 				&item.Recommendation, &item.ResolutionStatus, &item.ResolutionNotes, &item.CreatedAt, &item.UpdatedAt)
+			if err := canonicalizeItemAmounts(&item); err != nil {
+				return nil, err
+			}
 			j.UnmatchedItems = append(j.UnmatchedItems, item)
 		}
 	}
@@ -310,6 +313,9 @@ func (s *PgStore) ApplyResolution(ctx context.Context, tenantID, jobID, itemID s
 	if err != nil {
 		return nil, fmt.Errorf("unmatched item not found: %w", err)
 	}
+	if err := canonicalizeItemAmounts(&item); err != nil {
+		return nil, err
+	}
 	if err := domain.ValidateResolutionTransition(item.ResolutionStatus, status); err != nil {
 		return nil, err
 	}
@@ -372,7 +378,23 @@ func (s *PgStore) ArchiveJob(ctx context.Context, tenantID, id string) error {
 	return tx.Commit(ctx)
 }
 
-// In-Memory Store for Testing & Fallback
+// canonicalizeItemAmounts rewrites the NUMERIC(18,4) text Postgres returns
+// ("32.0000") into the canonical decimal form the analyze response used
+// ("32"), so one amount reads the same however it is fetched.
+func canonicalizeItemAmounts(item *domain.UnmatchedItem) error {
+	for _, f := range []*string{&item.AmountA, &item.AmountB, &item.DiscrepancyAmount} {
+		r, err := domain.ParseAmount(*f)
+		if err != nil {
+			return fmt.Errorf("stored amount on item %s: %w", item.ID, err)
+		}
+		*f = domain.CanonicalAmount(r)
+	}
+	return nil
+}
+
+// MemoryStore is a test double for handler tests only. cmd/server never
+// serves from it: an unreachable database is a startup failure, not a
+// reason to hold human decisions in process memory.
 type MemoryStore struct {
 	mu   sync.RWMutex
 	jobs map[string]*domain.ReconciliationJob
@@ -384,10 +406,8 @@ func NewMemoryStore() *MemoryStore {
 	}
 }
 
-// CreateJob never emits an event: MemoryStore is the degraded fallback used
-// when Postgres itself is unreachable (see cmd/server/main.go), and it
-// already sacrifices durability for the job data — there is no outbox
-// without a real transaction to enqueue it in.
+// CreateJob never emits an event: MemoryStore is a test double with no
+// transaction to enqueue an outbox row into.
 func (m *MemoryStore) CreateJob(ctx context.Context, tenantID string, job *domain.ReconciliationJob, items []domain.UnmatchedItem, actorID, correlationID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

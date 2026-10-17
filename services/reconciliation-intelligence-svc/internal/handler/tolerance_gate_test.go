@@ -42,8 +42,8 @@ func TestAnalyzeReconciliation_NoGovernedTolerance_RefusesRatherThanGuesses(t *t
 	body, _ := json.Marshal(domain.AnalyzeReconciliationRequest{
 		LegalEntityID: "le-unconfigured", JobName: "job", SourceSystemA: domain.SourceGeneralLedger,
 		SourceSystemB: domain.SourceBankStatement,
-		TransactionsA: []domain.TransactionItem{{RefID: "r1", Amount: 100.00}},
-		TransactionsB: []domain.TransactionItem{{RefID: "r1", Amount: 132.00}},
+		TransactionsA: []domain.TransactionItem{{RefID: "r1", Amount: "100.00"}},
+		TransactionsB: []domain.TransactionItem{{RefID: "r1", Amount: "132.00"}},
 	})
 	req := httptest.NewRequest(http.MethodPost, "/v1/reconciliations/analyze", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
@@ -82,7 +82,7 @@ func TestAnalyzeReconciliation_FinancialControlUnreachable_FailsClosed(t *testin
 	body, _ := json.Marshal(domain.AnalyzeReconciliationRequest{
 		LegalEntityID: "le-1", JobName: "job", SourceSystemA: domain.SourceGeneralLedger,
 		SourceSystemB: domain.SourceBankStatement,
-		TransactionsA: []domain.TransactionItem{{RefID: "r1", Amount: 100.00}},
+		TransactionsA: []domain.TransactionItem{{RefID: "r1", Amount: "100.00"}},
 	})
 	req := httptest.NewRequest(http.MethodPost, "/v1/reconciliations/analyze", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")

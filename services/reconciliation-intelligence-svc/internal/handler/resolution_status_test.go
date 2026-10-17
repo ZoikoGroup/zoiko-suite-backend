@@ -18,7 +18,7 @@ func TestApplyResolution_EnforcesDecisionPath(t *testing.T) {
 	body, _ := json.Marshal(domain.AnalyzeReconciliationRequest{
 		LegalEntityID: "LE-1", JobName: "decisions", SourceSystemA: domain.SourceGeneralLedger,
 		SourceSystemB: domain.SourceBankStatement,
-		TransactionsA: []domain.TransactionItem{{RefID: "TX-1", Amount: 75}},
+		TransactionsA: []domain.TransactionItem{{RefID: "TX-1", Amount: "75"}},
 	})
 	req := httptest.NewRequest(http.MethodPost, "/v1/reconciliations/analyze", bytes.NewBuffer(body))
 	withEnvelope(req)

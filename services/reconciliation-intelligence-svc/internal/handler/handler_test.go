@@ -95,13 +95,13 @@ func TestAnalyzeAndLifecycleReconciliation(t *testing.T) {
 		SourceSystemA: domain.SourceGeneralLedger,
 		SourceSystemB: domain.SourceBankStatement,
 		TransactionsA: []domain.TransactionItem{
-			{RefID: "TX-101", Amount: 500.00, Date: "2026-07-01"},
-			{RefID: "TX-102", Amount: 1200.50, Date: "2026-07-02"}, // Mismatch
-			{RefID: "TX-103", Amount: 75.00, Date: "2026-07-03"},   // Missing in B
+			{RefID: "TX-101", Amount: "500.00", Date: "2026-07-01"},
+			{RefID: "TX-102", Amount: "1200.50", Date: "2026-07-02"}, // Mismatch
+			{RefID: "TX-103", Amount: "75.00", Date: "2026-07-03"},   // Missing in B
 		},
 		TransactionsB: []domain.TransactionItem{
-			{RefID: "TX-101", Amount: 500.00, Date: "2026-07-01"},
-			{RefID: "TX-102", Amount: 1220.50, Date: "2026-07-02"}, // Difference = 20.00
+			{RefID: "TX-101", Amount: "500.00", Date: "2026-07-01"},
+			{RefID: "TX-102", Amount: "1220.50", Date: "2026-07-02"}, // Difference = 20.00
 		},
 	}
 
