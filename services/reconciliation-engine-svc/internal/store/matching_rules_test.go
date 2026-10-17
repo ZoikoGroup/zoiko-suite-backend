@@ -92,12 +92,13 @@ func TestMatching_SubDimensionCannotHideInAggregate(t *testing.T) {
 	def := f.defineWith("dimensional", func(r *domain.DefineReconciliationRequest) {
 		r.BalanceDimensions = []string{"entity"}
 	})
-	run := f.startRun(orgA, def, []testPop{
+	pops := []testPop{
 		{Side: "Bank", SourceSystem: "BANK", Items: []domain.PopulationItemInput{
 			withDims(item("R1", 100), "entity", "E1"), withDims(item("R2", 100), "entity", "E2")}},
 		{Side: "Ledger", SourceSystem: "GL", Items: []domain.PopulationItemInput{
 			withDims(item("R1", 100), "entity", "E1"), withDims(item("R2", 100), "entity", "E1")}},
-	})
+	}
+	run := f.startRun(orgA, def, pops)
 	if got := f.match(run.RunID); got.Status != domain.RunExceptionsOpen {
 		t.Fatalf("status %s, want ExceptionsOpen", got.Status)
 	}
@@ -116,12 +117,136 @@ func TestMatching_SubDimensionCannotHideInAggregate(t *testing.T) {
 	if _, err := f.s.Certify(f.ctx, orgA, run.RunID, "test-operator", f.claim("Certify", run.RunID)); !errors.Is(err, domain.ErrOpenExceptionsRemain) {
 		t.Fatalf("certify with an unbalanced sub-dimension: %v", err)
 	}
-	// Re-running the matcher does not raise the same variance twice.
-	if _, err := f.s.Reperform(f.ctx, orgA, run.RunID, "test-operator", f.claim("Reperform", run.RunID)); err != nil {
+	// Reperforming re-reads both populations (A8): the re-read freezes a new
+	// generation beside the original, and re-running the matcher against it
+	// does not raise the same variance twice.
+	reperformed, err := f.s.Reperform(f.ctx, orgA, run.RunID, frozenAll(pops), "test-operator", f.claim("Reperform", run.RunID))
+	if err != nil {
 		t.Fatalf("reperform: %v", err)
+	}
+	if reperformed.Status != domain.RunReperformed {
+		t.Fatalf("status after reperform: %s, want Reperformed", reperformed.Status)
 	}
 	if n := len(f.exceptions(run.RunID)); n != 2 {
 		t.Fatalf("balance exceptions after reperform: %d, want 2", n)
+	}
+	snaps, err := f.s.GetPopulationSnapshots(f.ctx, orgA, run.RunID)
+	if err != nil || len(snaps) != 4 {
+		t.Fatalf("snapshots after reperform: %v / %d, want both sides in two generations", err, len(snaps))
+	}
+	for _, s := range snaps {
+		if s.Generation != 1 && s.Generation != 2 {
+			t.Fatalf("snapshot %s has generation %d, want 1 or 2", s.SnapshotID, s.Generation)
+		}
+	}
+	// The unchanged re-read is named as such — "read again, same content" is
+	// distinguishable from "not read again".
+	ts, err := f.s.GetTransitions(f.ctx, orgA, run.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var reason string
+	for _, tr := range ts {
+		if tr.Dimension == "LIFECYCLE" && tr.ToState == string(domain.RunReperformed) {
+			reason = tr.Reason
+		}
+	}
+	if !strings.Contains(reason, "generation 2") || !strings.Contains(reason, "populations unchanged from generation 1") {
+		t.Fatalf("reperformance transition reason %q does not record the re-read", reason)
+	}
+}
+
+// A8: reperforming re-reads the run's populations through the same path
+// StartRun uses — the owning domain's correction is picked up as a new frozen
+// generation, the original stays immutable beside it, the matcher re-tests the
+// correction, and what the re-read changed is recorded in the Reperformed
+// move's own reason.
+func TestReperform_RefetchesASourceChangeIntoANewGeneration(t *testing.T) {
+	f := newFixture(t)
+	def := f.defineReconciliation(orgA, "reperform-refetch", 0)
+	bank := testPop{Side: "Bank", SourceSystem: "BANK", Items: []domain.PopulationItemInput{item("R1", 100)}}
+	ledger := testPop{Side: "Ledger", SourceSystem: "GL", Items: []domain.PopulationItemInput{item("R1", 100)}}
+	run := f.startRun(orgA, def, []testPop{bank, ledger})
+	f.match(run.RunID)
+
+	before, err := f.s.GetPopulationSnapshots(f.ctx, orgA, run.RunID)
+	if err != nil || len(before) != 2 {
+		t.Fatalf("initial snapshots: %v / %d", err, len(before))
+	}
+	hashes, ids := map[string]string{}, map[string]string{}
+	for _, s := range before {
+		if s.Generation != 1 {
+			t.Fatalf("initial snapshot generation: %+v", s)
+		}
+		hashes[s.Side], ids[s.Side] = s.ContentHash, s.SnapshotID
+	}
+
+	// The owning domain has since corrected the ledger: the same reference is
+	// posted at 1.05, not 1.00. The bank population is untouched.
+	corrected := testPop{Side: "Ledger", SourceSystem: "GL", Items: []domain.PopulationItemInput{item("R1", 105)}}
+	got, err := f.s.Reperform(f.ctx, orgA, run.RunID, frozenAll([]testPop{bank, corrected}), "test-operator", f.claim("Reperform", run.RunID))
+	if err != nil {
+		t.Fatalf("reperform: %v", err)
+	}
+	if got.Status != domain.RunReperformed || got.ResultState != domain.ResultVariance {
+		t.Fatalf("after reperform: %s / %s, want Reperformed / VARIANCE", got.Status, got.ResultState)
+	}
+
+	// The correction is re-tested: the new generation's amount difference is
+	// an item exception, not a silent match.
+	var retested bool
+	for _, e := range f.exceptions(run.RunID) {
+		if e.Kind == domain.ExceptionKindItem && e.RefID == "R1" && rule(t, e).Rule == domain.RuleAmountTolerance {
+			retested = true
+		}
+	}
+	if !retested {
+		t.Fatalf("the corrected amount is not re-tested: %+v", f.exceptions(run.RunID))
+	}
+
+	// Both generations stand, immutable: the originals are byte-for-byte what
+	// they were, the untouched side's re-read hashes to the same content, and
+	// the corrected side's does not.
+	after, err := f.s.GetPopulationSnapshots(f.ctx, orgA, run.RunID)
+	if err != nil || len(after) != 4 {
+		t.Fatalf("snapshots after reperform: %v / %d, want two sides × two generations", err, len(after))
+	}
+	for _, s := range after {
+		switch s.Generation {
+		case 1:
+			if s.SnapshotID != ids[s.Side] || s.ContentHash != hashes[s.Side] {
+				t.Fatalf("generation 1 was rewritten: %+v", s)
+			}
+		case 2:
+			if s.Side == "Bank" && s.ContentHash != hashes["Bank"] {
+				t.Fatalf("unchanged side's re-read moved its hash: %+v", s)
+			}
+			if s.Side == "Ledger" && s.ContentHash == hashes["Ledger"] {
+				t.Fatalf("the corrected ledger froze the same hash: %+v", s)
+			}
+		default:
+			t.Fatalf("unexpected generation %d: %+v", s.Generation, s)
+		}
+	}
+
+	// What changed is durable, in the Reperformed move's own reason.
+	ts, err := f.s.GetTransitions(f.ctx, orgA, run.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var reason string
+	for _, tr := range ts {
+		if tr.Dimension == "LIFECYCLE" && tr.ToState == string(domain.RunReperformed) {
+			reason = tr.Reason
+		}
+	}
+	for _, want := range []string{"populations changed since generation 1", "Ledger content hash", "declared totals USD 1.00→1.05"} {
+		if !strings.Contains(reason, want) {
+			t.Fatalf("reperformance reason %q does not record %q", reason, want)
+		}
+	}
+	if strings.Contains(reason, "Bank content hash") {
+		t.Fatalf("reperformance reason %q reports the untouched side as changed", reason)
 	}
 }
 

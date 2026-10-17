@@ -117,6 +117,34 @@ func (s *PgStore) GetDefinition(ctx context.Context, tenantID, definitionID stri
 	return out, err
 }
 
+// loadRuleVersion reads one numbered version of a definition's rules — the
+// version a run pinned — with scanRuleVersion verifying it against the digest
+// sealed when it was created.
+func loadRuleVersion(ctx context.Context, tx pgx.Tx, tenantID, definitionID string, version int64) (*domain.RuleVersion, error) {
+	v, err := scanRuleVersion(tx.QueryRow(ctx, `SELECT `+ruleVersionColumns+` FROM reconciliation_rule_versions
+		WHERE tenant_id = $1 AND definition_id = $2 AND rule_version = $3`, tenantID, definitionID, version))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrRuleVersionNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return v, nil
+}
+
+// GetRuleVersion reads one rule version by its number, approved or draft. The
+// reperform command uses it to re-read a run's populations from the rules the
+// RUN pinned — never from the definition's current effective version.
+func (s *PgStore) GetRuleVersion(ctx context.Context, tenantID, definitionID string, version int64) (*domain.RuleVersion, error) {
+	var out *domain.RuleVersion
+	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
+		v, err := loadRuleVersion(ctx, tx, tenantID, definitionID, version)
+		out = v
+		return err
+	})
+	return out, err
+}
+
 func insertRuleVersion(ctx context.Context, tx pgx.Tx, tenantID, definitionID string, version int64, rules domain.RuleSet,
 	effectiveFrom, reason, actor string) (*domain.RuleVersion, error) {
 	digest, err := rules.Digest()

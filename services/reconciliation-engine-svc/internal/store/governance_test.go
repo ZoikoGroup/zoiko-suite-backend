@@ -388,7 +388,7 @@ func TestGovernance_PreparerCannotCertify(t *testing.T) {
 	if _, err := f.s.Match(f.ctx, orgA, run.RunID, domain.MatchRequest{}, "matcher", f.claim("Match", run.RunID)); err != nil {
 		t.Fatalf("match: %v", err)
 	}
-	if _, err := f.s.Reperform(f.ctx, orgA, run.RunID, "reperformer", f.claim("Reperform", run.RunID)); err != nil {
+	if _, err := f.s.Reperform(f.ctx, orgA, run.RunID, frozenAll(cleanPops()), "reperformer", f.claim("Reperform", run.RunID)); err != nil {
 		t.Fatalf("reperform: %v", err)
 	}
 	for _, preparer := range []string{"test-operator", "matcher", "reperformer"} {

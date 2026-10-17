@@ -29,16 +29,18 @@ a governed lifecycle; accepted risk is a separate, authorized path that keeps
 the result VARIANCE, and unresolved exposure is assessed in aggregate
 (B21–B24). Rules are immutable, digest-sealed rule versions, approved by
 someone other than their author and in effect from their effective date; a
-run pins the version in effect (B26). Still missing: rounding and
+run pins the version in effect (B26), and a reperformance re-reads the run's
+populations through the same contract, freezing the re-read as a new snapshot
+generation beside the immutable original (B30). Still missing: rounding and
 business-day tolerance and reconciling items (A5), maker-checker beyond
 accepting risk and approving rules (A9), recurrence and
-qualitative materiality (A4 remainder), a meaningful reperformance (A8),
+qualitative materiality (A4 remainder),
 certification evidence and revocation (A12, out of scope for this change),
 and two questions the specs leave open: how absolute and percentage
 tolerance combine (A15) and what defines a PARTIAL result (A16). Defects
 fixed: B1–B4; Stage 1 closed A1, A10, A13 and A14 (B7–B12); Stage 2
 closed A2 and A3 and most of A5 (B13–B17); Stage 3 closed A6 (B18–B20) and A7
-and most of A4 (B21–B25); Stage 4 closed A11 (B26–B27).
+and most of A4 (B21–B25); Stage 4 closed A11 (B26–B27); B30–B31 close A8.
 
 ## A. Not implemented / weaker than the spec
 
@@ -72,13 +74,10 @@ and most of A4 (B21–B25); Stage 4 closed A11 (B26–B27).
   ZS-SVC-Z-001's exception vocabulary, which this service follows, and needs
   a next-period run to carry into) and an escalation chain beyond the owner
   role (§21 "Owner / reviewer — authorized owner and escalation chain").
-- **A8. Reperform does nothing useful.** `Reperform` re-runs auto-matching on
-  items with neither a match nor an exception — after the first `Match` there
-  are none, so it only changes the status to `Reperformed`. Because
-  populations are frozen in the run and remediation happens in the owning
-  domain, a meaningful reperformance is a new run over new populations,
-  linked to this one. Scope: define reperformance as "start a linked run and
-  supersede on certification", or remove the command.
+- **A8. Closed** — `Reperform` re-reads the run's populations through the same
+  control-population path `StartRun` uses and re-tests the run against them,
+  freezing the re-read as a new snapshot generation beside the immutable
+  original; see B30–B31.
 - **A9. Certification: Closed** — certifying is its own action and a
   preparer cannot certify; see B28. Accepting risk (B22) and approving a rule
   version (B26) were already separated. Define, StartRun, Match (including
@@ -394,7 +393,8 @@ and most of A4 (B21–B25); Stage 4 closed A11 (B26–B27).
   (`ErrRunNotEvaluated`, 409) — before, `RaiseException` there tried
   Planned → ExceptionsOpen, which the trigger refused with a raw database error;
   and Reperform with exceptions still open stays Reperformed with a VARIANCE
-  (A8 is unchanged). Existing rows were backfilled from their status and open
+  (A8 was open at that point; a reperformance now re-reads the populations and
+  records what changed — B30). Existing rows were backfilled from their status and open
   exceptions, recorded as transitions by `migration:000006`; the migration
   refuses to run if a Failed run exists, because no code path could set
   Failed before it and any such row was written by hand.
@@ -631,8 +631,9 @@ and most of A4 (B21–B25); Stage 4 closed A11 (B26–B27).
   someone else does not clear the original preparer. Raising an exception and
   accepting risk are findings about the work, not preparing it, so those
   actors may certify. No migration: every preparer was already recorded
-  (000001 `started_by`, `matched_by`; 000006 transition `actor`). If A8
-  replaces Reperform with a linked run, the preparer query must follow it.
+  (000001 `started_by`, `matched_by`; 000006 transition `actor`). A8 did not
+  replace Reperform with a linked run, so the preparer set is unchanged by it;
+  were that ever done, the preparer query must follow it.
 - **B29. Verification of B28.** A unit test in `internal/domain` that a
   preparer — including an earlier one, not only the last — is refused and
   another principal is not; a handler test that Certify is checked against
@@ -642,3 +643,102 @@ and most of A4 (B21–B25); Stage 4 closed A11 (B26–B27).
   run stays uncertified; a fourth principal certifies and is recorded as
   `sealed_by`. Tests that certified as the run's own operator now certify as
   a separate principal.
+- **B30. Reperformance re-reads its populations (closes A8).** `Reperform` no
+  longer re-runs matching over items the first `Match` already consumed. It
+  re-reads BOTH of the run's populations through the same control-population
+  path `StartRun` uses — `source.BuildPopulations` over the registered source
+  systems, the run's own scope (`period_id`, entity, principal forwarded to the
+  source) and the spec params the definition named, whose canonical identity
+  (`BANK/bank-transactions`, `GL/account-postings?account_codes=1100`) is
+  recorded as the snapshot's `spec_ref` — and freezes what it pulled as the
+  run's next snapshot generation. Migration 000009 replaces
+  `UNIQUE (run_id, side)` with `UNIQUE (run_id, side, generation)`: an earlier
+  generation is immutable and stays beside the new one, so the history shows
+  both what the run was first tested against and what it was re-tested
+  against, and a re-read never edits a frozen population. Matching, the
+  population and per-dimension balance checks, the `RaiseException` item fetch,
+  manual matches and the certification's side control totals all read the
+  LATEST generation only (`generation = (SELECT MAX(generation) …)`), so a
+  reperformance cannot re-test old populations or add an old generation's
+  totals to the ones being certified. The re-read runs under the rules the RUN
+  pinned — `GetRuleVersion` at the run's `definition_version`, re-verified
+  against the run's `rules_sha256` — so a definition edited since the run
+  started cannot change what the run re-tests; the read and the persist are
+  StartRun's two-phase shape (detached read context under
+  `populationReadTimeout`, then the write under `persistTimeout`), and the run
+  moves to Reperformed. A material difference against the generation the
+  re-read supersedes — item content hash, declared row count or declared
+  totals — is recorded in the Reperformed transition's reason, append-only
+  history read at `GET /runs/{id}/transitions`, never silently absorbed:
+  `reperformed against generation 2 (populations changed since generation 1:
+  Ledger content hash f605c088→97f36497, declared row count 3→5, declared
+  totals USD 60.00→106.00): 6 exception(s) being worked, 0 accepted as risk`.
+  Unchanged content is named as such ("populations unchanged from generation
+  1"), so "read again, same content" stays distinguishable from "not read
+  again", and a moved watermark with unchanged content is mentioned on the
+  same principle. No new exception kind was introduced: under A7/B21 an
+  unclosable kind would block certification forever, and a re-read that found
+  a difference is not by itself a finding about the data — the note is
+  evidence, and the re-match's own ITEM and BALANCE exceptions are the
+  findings. Three consequences a reader may want to reverse:
+  (1) a re-read that cannot be proven complete and reproducible — unreachable,
+  unregistered, inconsistent with its declared totals, too large, unreadable —
+  freezes nothing and fails the command with StartRun's own classification
+  (502 `SOURCE_UNAVAILABLE`, 422 otherwise, with `failure_code` in the body),
+  leaving the run's state untouched and recording no attempt. Unlike StartRun
+  (B19) there is no Failed run: nothing about the data was obtained, and a
+  Failed run would be a durable claim about populations that were never read;
+  (2) exceptions raised for an earlier generation stay Open and keep blocking
+  certification — they close only through a manual match (B1/B21), and a
+  reperformance is not a correction — while the re-match raises the current
+  generation's own exceptions. A ref that now matches still leaves its earlier
+  exception Open; one that now differs raises a fresh exception beside it
+  (per-item uniqueness is `UNIQUE (item_id)`, so the new generation's item is
+  a new exception). After a re-read of a broken run the run is therefore still
+  uncertifiable until the earlier exceptions are matched or risk-accepted —
+  the deliberate answer to "certify over what?";
+  (3) the command is open only to Running and ExceptionsOpen: a Planned run has
+  not been evaluated, and a Reperformed one already has a current generation,
+  so re-reperforming after further remediation goes through `Match` first
+  (which is what raises the new evidence). A legacy run (no pinned tolerance or
+  digest, pre-000008) is refused rather than re-tested under rules it never
+  pinned.
+- **B31. Verification of B30.** Unit tests in `internal/store`
+  (`matching_rules_test.go`) — a reperformance of an open run reports
+  "populations unchanged from generation 1" and leaves it Reperformed with both
+  generations present; a population changed between StartRun and Reperform
+  freezes a second generation whose hash differs for the changed side and is
+  identical for the untouched one, raises the new generation's ITEM exception,
+  and the transition reason names the changed side only ("populations changed
+  since generation 1: Ledger content hash …"). Handler test: a re-read that
+  cannot be proven complete is refused 502/422 with `reperformCalls == 0`, so
+  nothing is frozen and nothing is recorded. Migration 000009 was round-tripped
+  on a database holding one generation per side (down drops the column and
+  restores `UNIQUE (run_id, side)`, both snapshots become generation 1
+  unchanged; up re-applies), and its refusal was exercised on a database
+  holding two generations of a side: down refuses with "cannot remove snapshot
+  generations while a run holds more than one generation of a side", leaving
+  the schema and both generations untouched. Live check (this change;
+  containers only — Postgres 16 in a container, the engine against it, a stub
+  population source implementing the control-population contract over a mutable
+  dataset, and a stub authorization service answering GRANTED): StartRun froze
+  Bank (4 items, USD 100.00) and Ledger (3 items, USD 60.00) as generation 1
+  and `:match` raised the Bank-only D ITEM exception and the USD balance
+  exception (ExceptionsOpen). The Ledger dataset was then mutated (C 30.00 →
+  31.00, D and E added, watermark gl-v1 → gl-v2) and `:reperform` returned
+  Reperformed with the reason quoted in B30;
+  `GET /runs/{id}/populations` showed four snapshots — Bank and Ledger,
+  generations 1 and 2 — the Bank hash identical across generations and the
+  Ledger hash changed; the re-match found A, B and D on generation 2 (D could
+  only match against the re-read) and raised ITEM exceptions for C (both sides,
+  the 1.00 difference) and E, while the earlier exceptions stayed Open, so
+  `:certify` was still refused (409, Open exceptions remain) and a second
+  `:reperform` was refused (409, not open). Every read the engine made used the
+  identical path and query — `…/account-postings?account_codes=1100&…&period_id=2026-08`,
+  the stub answering 400 for a read without `account_codes` — so the refetch
+  carried the same spec, not a lookalike. A source answering 503 and one whose
+  declared totals did not describe its records were both refused live (502
+  `SOURCE_UNAVAILABLE`, 422 `SOURCE_INCONSISTENT`) with the run's snapshots,
+  status and transition history unchanged, and after the source was restored
+  the same run reperformed and reported "populations unchanged from generation
+  1".

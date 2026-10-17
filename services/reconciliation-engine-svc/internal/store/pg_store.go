@@ -35,6 +35,7 @@ type Store interface {
 	ApproveRuleVersion(ctx context.Context, tenantID, definitionID string, version int64, approver string, claim domain.IdempotencyClaim) (*domain.RuleVersion, error)
 	ListRuleVersions(ctx context.Context, tenantID, definitionID string) ([]domain.RuleVersion, error)
 	GetDefinition(ctx context.Context, tenantID, definitionID string) (*domain.ReconciliationDefinition, error)
+	GetRuleVersion(ctx context.Context, tenantID, definitionID string, version int64) (*domain.RuleVersion, error)
 	CheckIdempotency(ctx context.Context, tenantID string, claim domain.IdempotencyClaim) error
 	StartRun(ctx context.Context, tenantID string, req domain.StartRunRequest, expectedDefinitionVersion int64,
 		pops []domain.FrozenPopulation, actor string, claim domain.IdempotencyClaim) (*domain.ReconciliationRun, error)
@@ -42,7 +43,7 @@ type Store interface {
 		failure domain.RunFailure, actor string, claim domain.IdempotencyClaim) (*domain.ReconciliationRun, error)
 	Match(ctx context.Context, tenantID, runID string, req domain.MatchRequest, actor string, claim domain.IdempotencyClaim) (*domain.ReconciliationRun, error)
 	RaiseException(ctx context.Context, tenantID, runID string, req domain.RaiseExceptionRequest, actor string, claim domain.IdempotencyClaim) (*domain.ReconciliationException, error)
-	Reperform(ctx context.Context, tenantID, runID string, actor string, claim domain.IdempotencyClaim) (*domain.ReconciliationRun, error)
+	Reperform(ctx context.Context, tenantID, runID string, pops []domain.FrozenPopulation, actor string, claim domain.IdempotencyClaim) (*domain.ReconciliationRun, error)
 	Certify(ctx context.Context, tenantID, runID string, actor string, claim domain.IdempotencyClaim) (*domain.Certification, error)
 	SupersedeRun(ctx context.Context, tenantID, runID string, req domain.SupersedeRunRequest, actor string, claim domain.IdempotencyClaim) (*domain.ReconciliationRun, error)
 
@@ -312,7 +313,7 @@ func (s *PgStore) StartRun(ctx context.Context, tenantID string, req domain.Star
 			return err
 		}
 		for _, pop := range pops {
-			if err := freezePopulation(ctx, tx, tenantID, created.run.RunID, created.def.AmountScale, pop); err != nil {
+			if err := freezePopulation(ctx, tx, tenantID, created.run.RunID, created.def.AmountScale, 1, pop); err != nil {
 				return err
 			}
 		}
@@ -551,12 +552,12 @@ func checkPopulationsMatchDefinition(def *domain.ReconciliationDefinition, pops 
 	return nil
 }
 
-// freezePopulation writes one side's snapshot and items. The snapshot's
-// control totals are computed here from the items themselves, with overflow
-// checks (A14): a total that does not fit an int64 refuses the run instead of
-// wrapping. The row count must equal the source's declared row count (the
-// table's CHECK enforces the same).
-func freezePopulation(ctx context.Context, tx pgx.Tx, tenantID, runID string, scale int, pop domain.FrozenPopulation) error {
+// freezePopulation writes one side's snapshot (one generation of it) and its
+// items. The snapshot's control totals are computed here from the items
+// themselves, with overflow checks (A14): a total that does not fit an int64
+// refuses the run instead of wrapping. The row count must equal the source's
+// declared row count (the table's CHECK enforces the same).
+func freezePopulation(ctx context.Context, tx pgx.Tx, tenantID, runID string, scale, generation int, pop domain.FrozenPopulation) error {
 	if strings.TrimSpace(pop.Watermark) == "" {
 		return fmt.Errorf("%w: population %q has no source watermark", domain.ErrInvalidArgument, pop.Side)
 	}
@@ -580,10 +581,10 @@ func freezePopulation(ctx context.Context, tx pgx.Tx, tenantID, runID string, sc
 
 	snapshotID := newID(domain.PrefixSnapshot)
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO population_snapshots (snapshot_id, tenant_id, run_id, side, source_system, spec_ref, source_watermark,
+		INSERT INTO population_snapshots (snapshot_id, tenant_id, run_id, side, generation, source_system, spec_ref, source_watermark,
 			item_count, amount_scale, control_totals, declared_row_count, declared_totals, content_hash)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
-		snapshotID, tenantID, runID, pop.Side, pop.SourceSystem, pop.SpecRef, pop.Watermark,
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+		snapshotID, tenantID, runID, pop.Side, generation, pop.SourceSystem, pop.SpecRef, pop.Watermark,
 		len(pop.Items), scale, controlJSON, pop.DeclaredRowCount, declaredJSON, domain.HashPopulation(pop.Items)); err != nil {
 		return fmt.Errorf("freeze population snapshot: %w", err)
 	}
@@ -643,10 +644,13 @@ func splitBySide(items []domain.MatchItem, sideA string) (a, b []domain.MatchIte
 }
 
 // runSides returns the run's two population sides, ordered by label. They
-// come from the frozen snapshots, not from the unprocessed items: an EMPTY
-// population is still a side (B2; ZS-SVC-Z-001 NP-27).
+// come from the frozen snapshots of the run's LATEST generation (A8: a
+// reperformance adds a generation; matching and totals are always about the
+// current one), not from the unprocessed items: an EMPTY population is still
+// a side (B2; ZS-SVC-Z-001 NP-27).
 func runSides(ctx context.Context, tx pgx.Tx, runID string) (string, string, error) {
-	rows, err := tx.Query(ctx, `SELECT side FROM population_snapshots WHERE run_id = $1 ORDER BY side`, runID)
+	rows, err := tx.Query(ctx, `SELECT side FROM population_snapshots WHERE run_id = $1
+		AND generation = (SELECT MAX(generation) FROM population_snapshots WHERE run_id = $1) ORDER BY side`, runID)
 	if err != nil {
 		return "", "", fmt.Errorf("load population sides: %w", err)
 	}
@@ -721,12 +725,14 @@ func insertBalanceException(ctx context.Context, tx pgx.Tx, tenantID string, run
 	return nil
 }
 
-// runAutoMatch pairs the run's still-unprocessed items (neither matched nor
-// excepted) on the run's pinned match key, under its pinned tolerance policy
+// runAutoMatch pairs the run's still-unprocessed items of its LATEST
+// generation (neither matched nor excepted; a reperformance supersedes the
+// earlier generation, whose matches and exceptions stand as history) on the
+// run's pinned match key, under its pinned tolerance policy
 // (domain.AutoMatch), then checks per-currency balance for the whole
 // population and every pinned balance dimension (domain.CheckBalances) over
-// ALL of the run's items. Matching by key — never by aggregate totals — is
-// what makes "equal totals with different composition still surface
+// the same generation's items. Matching by key — never by aggregate totals —
+// is what makes "equal totals with different composition still surface
 // exceptions" true; the balance check is what stops a balanced aggregate
 // hiding an unbalanced sub-dimension.
 func runAutoMatch(ctx context.Context, tx pgx.Tx, tenantID, actor string, run *domain.ReconciliationRun) error {
@@ -740,6 +746,7 @@ func runAutoMatch(ctx context.Context, tx pgx.Tx, tenantID, actor string, run *d
 	}
 	rows, err := tx.Query(ctx, matchItemSelect+`
 		WHERE ps.run_id = $1
+			AND ps.generation = (SELECT MAX(generation) FROM population_snapshots WHERE run_id = $1)
 			AND NOT EXISTS (SELECT 1 FROM match_results mr WHERE mr.item_a_id = pi.item_id OR mr.item_b_id = pi.item_id)
 			AND NOT EXISTS (SELECT 1 FROM reconciliation_exceptions re WHERE re.item_id = pi.item_id)`, run.RunID)
 	if err != nil {
@@ -765,7 +772,9 @@ func runAutoMatch(ctx context.Context, tx pgx.Tx, tenantID, actor string, run *d
 		}
 	}
 
-	rows, err = tx.Query(ctx, matchItemSelect+` WHERE ps.run_id = $1`, run.RunID)
+	rows, err = tx.Query(ctx, matchItemSelect+`
+		WHERE ps.run_id = $1
+			AND ps.generation = (SELECT MAX(generation) FROM population_snapshots WHERE run_id = $1)`, run.RunID)
 	if err != nil {
 		return fmt.Errorf("load run items: %w", err)
 	}
@@ -853,7 +862,9 @@ func (s *PgStore) Match(ctx context.Context, tenantID, runID string, req domain.
 func applyManualMatch(ctx context.Context, tx pgx.Tx, tenantID, runID, actor string, pol domain.TolerancePolicy, m domain.ManualMatchInput) error {
 	var pair [2]domain.MatchItem
 	for i, itemID := range []string{m.ItemAID, m.ItemBID} {
-		rows, err := tx.Query(ctx, matchItemSelect+` WHERE ps.run_id = $1 AND pi.item_id = $2`, runID, itemID)
+		rows, err := tx.Query(ctx, matchItemSelect+`
+			WHERE ps.run_id = $1 AND pi.item_id = $2
+				AND ps.generation = (SELECT MAX(generation) FROM population_snapshots WHERE run_id = $1)`, runID, itemID)
 		if err != nil {
 			return fmt.Errorf("check manual match item: %w", err)
 		}
@@ -912,7 +923,9 @@ func (s *PgStore) RaiseException(ctx context.Context, tenantID, runID string, re
 			return domain.ErrRunNotEvaluated
 		}
 
-		rows, err := tx.Query(ctx, matchItemSelect+` WHERE ps.run_id = $1 AND pi.item_id = $2`, runID, req.ItemID)
+		rows, err := tx.Query(ctx, matchItemSelect+`
+			WHERE ps.run_id = $1 AND pi.item_id = $2
+				AND ps.generation = (SELECT MAX(generation) FROM population_snapshots WHERE run_id = $1)`, runID, req.ItemID)
 		if err != nil {
 			return fmt.Errorf("load item for exception: %w", err)
 		}
@@ -985,14 +998,179 @@ func (s *PgStore) GetExceptions(ctx context.Context, tenantID, runID string) ([]
 
 // ── Reperform ────────────────────────────────────────────────────────────────
 
-// Reperform explicitly checkpoints a re-evaluation of an ExceptionsOpen
-// run — it re-runs the automatic pass over anything still unprocessed
-// (normally a no-op once every item has a match or an exception) and
-// moves the run to Reperformed, the doc's own distinct lifecycle stage
-// between ExceptionsOpen and Certified/Failed. Certify accepts a run
-// from either Running or Reperformed, but only once zero exceptions
-// remain Open.
-func (s *PgStore) Reperform(ctx context.Context, tenantID, runID string, actor string, claim domain.IdempotencyClaim) (*domain.ReconciliationRun, error) {
+// nextSnapshotGeneration is the generation a re-read freezes as: one past the
+// run's latest. StartRun writes generation 1.
+func nextSnapshotGeneration(ctx context.Context, tx pgx.Tx, runID string) (int, error) {
+	var next int
+	if err := tx.QueryRow(ctx, `SELECT COALESCE(MAX(generation), 0) + 1 FROM population_snapshots WHERE run_id = $1`,
+		runID).Scan(&next); err != nil {
+		return 0, fmt.Errorf("read next snapshot generation: %w", err)
+	}
+	return next, nil
+}
+
+// snapshotFacts is the material identity of one frozen side, as the re-read
+// note compares it across generations.
+type snapshotFacts struct {
+	watermark string
+	rows      int64
+	hash      string
+	totals    map[string]string
+}
+
+// reperformanceNote describes what the re-read frozen as generation changed
+// relative to the generation it supersedes. A change in the pulled content —
+// the hash of its items, the source's declared row count or declared totals —
+// is never silent (A8): the note is carried in the Reperformed move's reason,
+// append-only history exposed at GET /runs/{id}/transitions. Unchanged content
+// is named as such, so "read again, same content" is distinguishable from "not
+// read again"; a moved watermark with unchanged content is mentioned on the
+// same principle.
+func reperformanceNote(ctx context.Context, tx pgx.Tx, runID string, generation int) (string, error) {
+	if generation <= 1 {
+		return "", nil
+	}
+	rows, err := tx.Query(ctx, `SELECT side, generation, source_watermark, declared_row_count, content_hash, declared_totals
+		FROM population_snapshots WHERE run_id = $1 AND generation IN ($2, $3) ORDER BY side, generation`,
+		runID, generation-1, generation)
+	if err != nil {
+		return "", fmt.Errorf("load snapshot generations: %w", err)
+	}
+	defer rows.Close()
+	prev := map[string]snapshotFacts{}
+	cur := map[string]snapshotFacts{}
+	for rows.Next() {
+		var side string
+		var gen int
+		var watermark *string
+		var declaredRows *int64
+		var hash string
+		var totalsJSON []byte
+		if err := rows.Scan(&side, &gen, &watermark, &declaredRows, &hash, &totalsJSON); err != nil {
+			return "", err
+		}
+		f := snapshotFacts{hash: hash}
+		if watermark != nil {
+			f.watermark = *watermark
+		}
+		if declaredRows != nil {
+			f.rows = *declaredRows
+		}
+		if len(totalsJSON) > 0 {
+			if err := json.Unmarshal(totalsJSON, &f.totals); err != nil {
+				return "", fmt.Errorf("decode declared totals: %w", err)
+			}
+		}
+		if gen == generation {
+			cur[side] = f
+		} else {
+			prev[side] = f
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+
+	sides := make([]string, 0, len(cur))
+	for side := range cur {
+		sides = append(sides, side)
+	}
+	sort.Strings(sides)
+	var changed, moved []string
+	for _, side := range sides {
+		p, c := prev[side], cur[side]
+		var attrs []string
+		if p.hash != c.hash {
+			attrs = append(attrs, fmt.Sprintf("content hash %s→%s", shortHash(p.hash), shortHash(c.hash)))
+		}
+		if p.rows != c.rows {
+			attrs = append(attrs, fmt.Sprintf("declared row count %d→%d", p.rows, c.rows))
+		}
+		if !sameDeclaredTotals(p.totals, c.totals) {
+			attrs = append(attrs, "declared totals "+declaredTotalsDiff(p.totals, c.totals))
+		}
+		switch {
+		case len(attrs) > 0:
+			changed = append(changed, side+" "+strings.Join(attrs, ", "))
+		case p.watermark != c.watermark:
+			moved = append(moved, side)
+		}
+	}
+	unchanged := fmt.Sprintf("populations unchanged from generation %d", generation-1)
+	if len(changed) > 0 {
+		return fmt.Sprintf("populations changed since generation %d: %s", generation-1, strings.Join(changed, "; ")), nil
+	}
+	if len(moved) > 0 {
+		return fmt.Sprintf("%s; source watermarks moved for %s", unchanged, strings.Join(moved, ", ")), nil
+	}
+	return unchanged, nil
+}
+
+func shortHash(h string) string {
+	if len(h) <= 8 {
+		return h
+	}
+	return h[:8]
+}
+
+func sameDeclaredTotals(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for c, v := range a {
+		if b[c] != v {
+			return false
+		}
+	}
+	return true
+}
+
+// declaredTotalsDiff names each currency whose declared total changed, old
+// value before new ("USD 100.00→105.00"); an absent side prints as "none".
+func declaredTotalsDiff(a, b map[string]string) string {
+	ccys := map[string]bool{}
+	for c := range a {
+		ccys[c] = true
+	}
+	for c := range b {
+		ccys[c] = true
+	}
+	sorted := make([]string, 0, len(ccys))
+	for c := range ccys {
+		sorted = append(sorted, c)
+	}
+	sort.Strings(sorted)
+	var out []string
+	orNone := func(v string) string {
+		if v == "" {
+			return "none"
+		}
+		return v
+	}
+	for _, ccy := range sorted {
+		if a[ccy] != b[ccy] {
+			out = append(out, fmt.Sprintf("%s %s→%s", ccy, orNone(a[ccy]), orNone(b[ccy])))
+		}
+	}
+	return strings.Join(out, ", ")
+}
+
+// Reperform re-reads both of the run's populations and re-tests the run
+// against them (A8). The caller passes populations read through the same
+// control-population path StartRun uses (source.BuildPopulations); they are
+// verified against the rules the RUN pinned — never the definition's current
+// rule version, which may since have moved — and frozen as the run's next
+// snapshot generation, leaving every earlier generation immutable beside it.
+// The match pass then runs over the new generation (its matches and
+// exceptions are the run's current ones; earlier ones stand as history), and
+// the run moves to Reperformed, the doc's own distinct lifecycle stage
+// between ExceptionsOpen and Certified/Failed. Any material difference the
+// re-read found — item content hash, declared row count or declared totals
+// against the generation it supersedes — is recorded in the transition's
+// reason, never silently absorbed. Certify accepts a run from either Running
+// or Reperformed, but only once zero exceptions remain Open.
+func (s *PgStore) Reperform(ctx context.Context, tenantID, runID string, pops []domain.FrozenPopulation, actor string,
+	claim domain.IdempotencyClaim) (*domain.ReconciliationRun, error) {
 	var out *domain.ReconciliationRun
 	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
 		run, err := loadRunForUpdate(ctx, tx, tenantID, runID)
@@ -1002,9 +1180,38 @@ func (s *PgStore) Reperform(ctx context.Context, tenantID, runID string, actor s
 		if run.Status != domain.RunExceptionsOpen && run.Status != domain.RunRunning {
 			return domain.ErrRunNotOpen
 		}
+		if run.Tolerance == nil || run.RulesSHA256 == "" {
+			return domain.ErrLegacyRecord
+		}
 
 		claim.ResourceID = runID
 		if err := claimIdempotency(ctx, tx, claim); err != nil {
+			return err
+		}
+
+		version, err := loadRuleVersion(ctx, tx, tenantID, run.DefinitionID, run.DefinitionVersion)
+		if err != nil {
+			return err
+		}
+		if version.RulesSHA256 != run.RulesSHA256 {
+			return fmt.Errorf("run %s pinned rules digest %s but rule version %d of %s is sealed as %s",
+				runID, run.RulesSHA256, run.DefinitionVersion, run.DefinitionID, version.RulesSHA256)
+		}
+		if err := checkPopulationsMatchDefinition(&domain.ReconciliationDefinition{Populations: version.Rules.Populations}, pops); err != nil {
+			return err
+		}
+
+		generation, err := nextSnapshotGeneration(ctx, tx, runID)
+		if err != nil {
+			return err
+		}
+		for _, pop := range pops {
+			if err := freezePopulation(ctx, tx, tenantID, runID, version.Rules.AmountScale, generation, pop); err != nil {
+				return err
+			}
+		}
+		note, err := reperformanceNote(ctx, tx, runID, generation)
+		if err != nil {
 			return err
 		}
 
@@ -1012,7 +1219,8 @@ func (s *PgStore) Reperform(ctx context.Context, tenantID, runID string, actor s
 			return err
 		}
 
-		updated, err := settleResult(ctx, tx, tenantID, run, domain.RunReperformed, "reperformed", actor)
+		reason := fmt.Sprintf("reperformed against generation %d (%s)", generation, note)
+		updated, err := settleResult(ctx, tx, tenantID, run, domain.RunReperformed, reason, actor)
 		if err != nil {
 			return err
 		}
@@ -1067,10 +1275,13 @@ type certificationManifest struct {
 	SealedAt             time.Time                         `json:"sealed_at"`
 }
 
-// sideControlTotals returns each side's per-currency control totals. They are
-// never added together across sides or currencies (A2).
+// sideControlTotals returns each side's per-currency control totals, of the
+// run's latest snapshot generation (A8: an earlier generation is history and
+// must never be added to the totals being certified). They are never added
+// together across sides or currencies (A2).
 func sideControlTotals(ctx context.Context, tx pgx.Tx, runID string) (map[string][]domain.CurrencyTotal, error) {
-	rows, err := tx.Query(ctx, `SELECT side, control_totals FROM population_snapshots WHERE run_id = $1 ORDER BY side`, runID)
+	rows, err := tx.Query(ctx, `SELECT side, control_totals FROM population_snapshots WHERE run_id = $1
+		AND generation = (SELECT MAX(generation) FROM population_snapshots WHERE run_id = $1) ORDER BY side`, runID)
 	if err != nil {
 		return nil, fmt.Errorf("load control totals: %w", err)
 	}
@@ -1328,14 +1539,14 @@ func (s *PgStore) SupersedeRun(ctx context.Context, tenantID, runID string, req 
 
 // ── Read surfaces ────────────────────────────────────────────────────────────
 
-const snapshotColumns = `snapshot_id, tenant_id, run_id, side, source_system, spec_ref, source_watermark, item_count, amount_scale,
+const snapshotColumns = `snapshot_id, tenant_id, run_id, side, generation, source_system, spec_ref, source_watermark, item_count, amount_scale,
 	total_amount_minor_units, control_totals, declared_row_count, declared_totals, content_hash, created_at`
 
 func scanSnapshot(row pgx.Row) (*domain.PopulationSnapshot, error) {
 	var p domain.PopulationSnapshot
 	var specRef, watermark *string
 	var control, declared []byte
-	if err := row.Scan(&p.SnapshotID, &p.TenantID, &p.RunID, &p.Side, &p.SourceSystem, &specRef, &watermark, &p.ItemCount,
+	if err := row.Scan(&p.SnapshotID, &p.TenantID, &p.RunID, &p.Side, &p.Generation, &p.SourceSystem, &specRef, &watermark, &p.ItemCount,
 		&p.AmountScale, &p.TotalAmountMinorUnits, &control, &p.DeclaredRowCount, &declared, &p.ContentHash, &p.CreatedAt); err != nil {
 		return nil, err
 	}
@@ -1358,10 +1569,14 @@ func scanSnapshot(row pgx.Row) (*domain.PopulationSnapshot, error) {
 	return &p, nil
 }
 
+// GetPopulationSnapshots returns every frozen generation of both sides —
+// a reperformance freezes a new generation and the earlier ones stay (A8),
+// so the run's paper trail is the whole series — ordered by side and
+// generation.
 func (s *PgStore) GetPopulationSnapshots(ctx context.Context, tenantID, runID string) ([]domain.PopulationSnapshot, error) {
 	var out []domain.PopulationSnapshot
 	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
-		rows, err := tx.Query(ctx, `SELECT `+snapshotColumns+` FROM population_snapshots WHERE tenant_id = $1 AND run_id = $2 ORDER BY side`,
+		rows, err := tx.Query(ctx, `SELECT `+snapshotColumns+` FROM population_snapshots WHERE tenant_id = $1 AND run_id = $2 ORDER BY side, generation`,
 			tenantID, runID)
 		if err != nil {
 			return err

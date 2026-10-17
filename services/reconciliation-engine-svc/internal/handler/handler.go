@@ -469,14 +469,73 @@ func (h *Handler) RaiseException(w http.ResponseWriter, r *http.Request) {
 	h.respondJSON(w, http.StatusCreated, got)
 }
 
+// Reperform re-reads the run's two populations from their owning services —
+// the same control-population path StartRun uses — and re-tests the run
+// against them (A8): the re-read is frozen as the run's next snapshot
+// generation (the originals stay beside it, immutable), matched, and the run
+// moves to Reperformed, with any material source change recorded in the
+// transition's reason. A re-read that cannot be proven complete and
+// reproducible freezes nothing and fails the command with StartRun's own
+// classification (502 unreachable, 422 inconsistent); the run itself is left
+// exactly as it was.
 func (h *Handler) Reperform(w http.ResponseWriter, r *http.Request) {
 	tenantID, principalID, ok := h.authorizeRun(w, r, ActionReconciliationManage)
 	if !ok {
 		return
 	}
 	runID := chi.URLParam(r, "runID")
+	run, err := h.store.GetRun(r.Context(), tenantID, runID)
+	if err != nil {
+		h.respondFromError(w, err)
+		return
+	}
+	if run.Status != domain.RunExceptionsOpen && run.Status != domain.RunRunning {
+		h.respondFromError(w, domain.ErrRunNotOpen)
+		return
+	}
+	if run.Tolerance == nil || run.RulesSHA256 == "" {
+		h.respondFromError(w, domain.ErrLegacyRecord)
+		return
+	}
 	claim := h.idempotencyClaim(principalID, "Reperform", runID, "", r.Header.Get("Idempotency-Key"))
-	got, err := h.store.Reperform(r.Context(), tenantID, runID, principalID, claim)
+	if err := h.store.CheckIdempotency(r.Context(), tenantID, claim); err != nil {
+		h.respondFromError(w, err)
+		return
+	}
+	// The re-read runs under the rules the run pinned, never the definition's
+	// current version: a definition edited since the run started must not
+	// change what this run re-tests.
+	version, err := h.store.GetRuleVersion(r.Context(), tenantID, run.DefinitionID, run.DefinitionVersion)
+	if err != nil {
+		h.respondFromError(w, err)
+		return
+	}
+	def := domain.ReconciliationDefinition{DefinitionID: run.DefinitionID, LegalEntityID: run.LegalEntityID,
+		Populations: version.Rules.Populations, AmountScale: version.Rules.AmountScale}
+	req := domain.StartRunRequest{DefinitionID: run.DefinitionID, PeriodID: run.PeriodID, Scope: run.Scope}
+
+	readCtx, cancelRead := context.WithTimeout(context.WithoutCancel(r.Context()), populationReadTimeout)
+	defer cancelRead()
+	scope := source.Scope{TenantID: tenantID, PrincipalID: principalID, LegalEntityID: run.LegalEntityID,
+		PeriodID: run.PeriodID, CorrelationID: r.Header.Get("X-Correlation-ID")}
+	pops, err := source.BuildPopulations(readCtx, h.fetcher, def, req, scope)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), persistTimeout)
+	defer cancel()
+	var popErr *source.PopulationError
+	if errors.As(err, &popErr) {
+		h.logger.Warn("reperformance populations could not be proven complete", zap.Error(popErr))
+		code := http.StatusUnprocessableEntity
+		if popErr.Code() == domain.FailureSourceUnavailable {
+			code = http.StatusBadGateway
+		}
+		h.respondJSON(w, code, map[string]interface{}{"error": popErr.Error(), "failure_code": popErr.Code()})
+		return
+	}
+	if err != nil {
+		h.respondFromError(w, err)
+		return
+	}
+	got, err := h.store.Reperform(ctx, tenantID, runID, pops, principalID, claim)
 	if err != nil {
 		h.respondFromError(w, err)
 		return
