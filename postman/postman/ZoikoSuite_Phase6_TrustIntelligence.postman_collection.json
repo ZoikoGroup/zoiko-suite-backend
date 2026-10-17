@@ -15,6 +15,12 @@
 			"key": "tenantId",
 			"value": "tenant-default-001",
 			"type": "string"
+		},
+		{
+			"key": "bankReconciliationRunId",
+			"value": "",
+			"type": "string",
+			"description": "run_id of a bank-reconciliation-svc run; its UNMATCHED statement lines are analyzed"
 		}
 	],
 	"item": [
@@ -569,7 +575,7 @@
 						],
 						"body": {
 							"mode": "raw",
-							"raw": "{\n  \"legal_entity_id\": \"entity-uk-001\",\n  \"job_name\": \"Q3 Bank vs GL Reconciliation\",\n  \"source_system_a\": \"GENERAL_LEDGER\",\n  \"source_system_b\": \"BANK_STATEMENTS\",\n  \"transactions_a\": [\n    { \"ref_id\": \"TX-101\", \"amount\": \"500.00\", \"date\": \"2026-07-01\" },\n    { \"ref_id\": \"TX-102\", \"amount\": \"1200.50\", \"date\": \"2026-07-02\" },\n    { \"ref_id\": \"TX-103\", \"amount\": \"75.00\", \"date\": \"2026-07-03\" }\n  ],\n  \"transactions_b\": [\n    { \"ref_id\": \"TX-101\", \"amount\": \"500.00\", \"date\": \"2026-07-01\" },\n    { \"ref_id\": \"TX-102\", \"amount\": \"1220.50\", \"date\": \"2026-07-02\" }\n  ]\n}"
+							"raw": "{\n  \"legal_entity_id\": \"entity-uk-001\",\n  \"job_name\": \"Q3 bank reconciliation suggestions\",\n  \"bank_reconciliation_run_id\": \"{{bankReconciliationRunId}}\"\n}"
 						},
 						"url": {
 							"raw": "{{baseUrl}}:8137/v1/reconciliations/analyze",
