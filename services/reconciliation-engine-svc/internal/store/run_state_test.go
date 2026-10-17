@@ -58,7 +58,7 @@ func TestRunState_CleanRunToSupersession(t *testing.T) {
 	matched := f.match(run.RunID)
 	wantStates(t, matched, domain.RunRunning, domain.ResultMatch, domain.CertEligible)
 
-	if _, err := f.s.Certify(f.ctx, orgA, run.RunID, "test-operator", f.claim("Certify", run.RunID)); err != nil {
+	if _, err := f.s.Certify(f.ctx, orgA, run.RunID, "certifier", f.claim("Certify", run.RunID)); err != nil {
 		t.Fatalf("certify: %v", err)
 	}
 	certified, _ := f.s.GetRun(f.ctx, orgA, run.RunID)

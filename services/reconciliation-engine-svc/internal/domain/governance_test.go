@@ -137,6 +137,19 @@ func TestCheckIndependence(t *testing.T) {
 	}
 }
 
+func TestCheckCertifierIndependence(t *testing.T) {
+	preparers := []string{"alice", "bob"}
+	if err := CheckCertifierIndependence("alice", preparers); !errors.Is(err, ErrNotIndependentCertifier) {
+		t.Fatalf("preparer certifies own run: %v", err)
+	}
+	if err := CheckCertifierIndependence("bob", preparers); !errors.Is(err, ErrNotIndependentCertifier) {
+		t.Fatalf("an earlier preparer, not the last, certifies: %v", err)
+	}
+	if err := CheckCertifierIndependence("carol", preparers); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // Scenario 25: individually immaterial exceptions become material in aggregate.
 // A key-matched pair is counted once; a balance difference is not added on top
 // of the items it is made of.

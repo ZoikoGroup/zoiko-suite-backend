@@ -44,6 +44,9 @@ const (
 	// ActionReconciliationApproveRules approves a rule version — separate from
 	// publishing it (DATA-07 "rule publication separated from … approval").
 	ActionReconciliationApproveRules = "RECONCILIATION_APPROVE_RULES"
+	// ActionReconciliationCertify seals a run — separate from preparing it
+	// (ZS-CONTROL-001 Invariant 12: a preparer cannot self-certify).
+	ActionReconciliationCertify = "RECONCILIATION_CERTIFY"
 )
 
 // populationReadTimeout bounds reading both populations of a StartRun. The
@@ -482,7 +485,7 @@ func (h *Handler) Reperform(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) Certify(w http.ResponseWriter, r *http.Request) {
-	tenantID, principalID, ok := h.authorizeRun(w, r, ActionReconciliationManage)
+	tenantID, principalID, ok := h.authorizeRun(w, r, ActionReconciliationCertify)
 	if !ok {
 		return
 	}
@@ -761,7 +764,8 @@ func (h *Handler) respondFromError(w http.ResponseWriter, err error) {
 		return
 	}
 	switch {
-	case errors.Is(err, domain.ErrNotExceptionOwner), errors.Is(err, domain.ErrNotIndependent), errors.Is(err, domain.ErrSelfApproval):
+	case errors.Is(err, domain.ErrNotExceptionOwner), errors.Is(err, domain.ErrNotIndependent), errors.Is(err, domain.ErrSelfApproval),
+		errors.Is(err, domain.ErrNotIndependentCertifier):
 		h.respondError(w, http.StatusForbidden, err.Error())
 	case errors.Is(err, domain.ErrDefinitionNotFound), errors.Is(err, domain.ErrRunNotFound),
 		errors.Is(err, domain.ErrItemNotFound), errors.Is(err, domain.ErrExceptionNotFound), errors.Is(err, domain.ErrRuleVersionNotFound):

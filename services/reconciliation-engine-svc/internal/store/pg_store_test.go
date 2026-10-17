@@ -40,7 +40,7 @@ func TestReconciliation_HappyPath_MatchAndCertify(t *testing.T) {
 		t.Fatalf("match results: %+v", results)
 	}
 
-	cert, err := f.s.Certify(f.ctx, orgA, run.RunID, "test-operator", f.claim("Certify", run.RunID))
+	cert, err := f.s.Certify(f.ctx, orgA, run.RunID, "certifier", f.claim("Certify", run.RunID))
 	if err != nil {
 		t.Fatalf("certify: %v", err)
 	}
@@ -112,7 +112,7 @@ func TestReconciliation_ToleranceCannotBeWidenedOnCertifiedRun(t *testing.T) {
 	if _, err := f.s.Match(f.ctx, orgA, run.RunID, domain.MatchRequest{}, "test-operator", f.claim("Match", run.RunID)); err != nil {
 		t.Fatalf("match: %v", err)
 	}
-	if _, err := f.s.Certify(f.ctx, orgA, run.RunID, "test-operator", f.claim("Certify", run.RunID)); err != nil {
+	if _, err := f.s.Certify(f.ctx, orgA, run.RunID, "certifier", f.claim("Certify", run.RunID)); err != nil {
 		t.Fatalf("certify: %v", err)
 	}
 
@@ -235,7 +235,7 @@ func (f *fixture) matchAndCertify(runID string) {
 	if _, err := f.s.Match(f.ctx, orgA, runID, domain.MatchRequest{}, "test-operator", f.claim("Match", runID)); err != nil {
 		f.t.Fatalf("match %s: %v", runID, err)
 	}
-	if _, err := f.s.Certify(f.ctx, orgA, runID, "test-operator", f.claim("Certify", runID)); err != nil {
+	if _, err := f.s.Certify(f.ctx, orgA, runID, "certifier", f.claim("Certify", runID)); err != nil {
 		f.t.Fatalf("certify %s: %v", runID, err)
 	}
 }
