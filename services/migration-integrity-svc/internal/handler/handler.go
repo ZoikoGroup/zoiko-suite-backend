@@ -24,6 +24,7 @@ const (
 
 	ActionMigrationJobValidate = "MIGRATION_JOB_VALIDATE"
 	ActionMigrationJobArchive  = "MIGRATION_JOB_ARCHIVE"
+	ActionMigrationJobView     = "MIGRATION_JOB_VIEW"
 	ActionAuditEntryRemediate  = "AUDIT_ENTRY_REMEDIATE"
 )
 
@@ -135,18 +136,50 @@ func (h *Handler) GetJobByID(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetTenantID(r.Context())
 	id := chi.URLParam(r, "id")
 
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+
 	job, err := h.store.GetJobByID(r.Context(), tenantID, id)
 	if err != nil {
 		h.errJSON(w, http.StatusNotFound, "migration job not found")
 		return
 	}
+
+	// Reads are authorized per legal entity, like the writes: tenant scope
+	// (RLS) alone let any principal of the tenant read every entity's
+	// migration jobs. The job is fetched first because its own legal entity
+	// is what must be authorized — the caller names no entity on this route.
+	if !h.checkAllowed(w, r, principalID, job.LegalEntityID, ActionMigrationJobView) {
+		return
+	}
+
 	h.okJSON(w, http.StatusOK, job)
 }
 
+// ListJobs lists migration jobs for one legal entity, authorized at that
+// entity. The entity is REQUIRED: this is the read that used to hand any
+// principal of the tenant every entity's jobs, and a tenant-wide listing has
+// no legal entity to authorize against. A caller holding view rights for the
+// entity gets the list; a caller without gets a 403, not a silently filtered
+// subset (which would read as "there is nothing there").
 func (h *Handler) ListJobs(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetTenantID(r.Context())
 	legalEntityID := r.URL.Query().Get("legal_entity_id")
 	status := r.URL.Query().Get("status")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if legalEntityID == "" {
+		h.errJSON(w, http.StatusBadRequest, "legal_entity_id is required to list migration jobs (reads are authorized per legal entity)")
+		return
+	}
+	if !h.checkAllowed(w, r, principalID, legalEntityID, ActionMigrationJobView) {
+		return
+	}
 
 	jobs, err := h.store.ListJobs(r.Context(), tenantID, legalEntityID, status)
 	if err != nil {
@@ -252,9 +285,10 @@ func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (stri
 	return principalID, true
 }
 
-// checkAllowed enforces a fail-closed authorization check against
-// authorization-svc before any write mutation. It writes the appropriate
-// error response and returns false when the action must not proceed.
+// checkAllowed enforces a fail-closed per-legal-entity authorization check
+// against authorization-svc before a read or write proceeds. It writes the
+// appropriate error response and returns false when the action must not
+// proceed.
 func (h *Handler) checkAllowed(w http.ResponseWriter, r *http.Request, principalID, legalEntityID, actionType string) bool {
 	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionType); err != nil {
 		if errors.Is(err, authz.ErrAuthorizationDenied) {

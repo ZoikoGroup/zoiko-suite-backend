@@ -102,9 +102,18 @@ service. One scoring defect was fixed in this pass (B1).
   no longer perturbs duplicate detection for the refs that do have an
   identity. Each blank-ref record counts as invalid for the count and score,
   like any other violation.
-- **A9. Reads are not authorized.** `GET /v1/migrations` and `GET
-  /v1/migrations/{id}` check only the tenant (RLS); writes are authorized per
-  legal entity.
+- **A9. Reads are not authorized per legal entity** (closed). `GET
+  /v1/migrations` and `GET /v1/migrations/{id}` checked only the tenant
+  (RLS), so any principal in the tenant could read every legal entity's
+  migration jobs; writes were already authorized per legal entity. Both
+  reads now run the same per-entity check the writes do, against a new
+  `MIGRATION_JOB_VIEW` action: by id the job is fetched and authorized at its
+  own entity; the list is authorized at the requested entity and requires
+  `legal_entity_id` (400 without it, rather than a silently filtered list
+  that would read as "there is nothing there"). Reads fail closed: 401
+  without a principal, 403 on denial, 503 when authorization-svc is
+  unreachable. `MIGRATION_JOB_VIEW` is a new action name — until reader
+  roles are granted it, reads fail closed with 403.
 - **A10. Source values are stored and echoed.** Audit entries keep the raw
   offending `source_value` (e.g. a malformed salary). §25 prohibits PII or
   sensitive values in migration logs ("errors use object IDs/reason codes,
