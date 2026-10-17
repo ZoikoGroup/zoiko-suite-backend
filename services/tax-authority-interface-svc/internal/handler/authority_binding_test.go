@@ -79,3 +79,50 @@ func TestInterfaceAuthorityBindingIsPersistedAndValidated(t *testing.T) {
 		}
 	}
 }
+
+func TestInterfaceAdapterKind(t *testing.T) {
+	r, _ := setupTestRouter()
+	post := func(body map[string]any) *httptest.ResponseRecorder {
+		b, _ := json.Marshal(body)
+		req := httptest.NewRequest(http.MethodPost, "/v1/tax-authority/interfaces", bytes.NewReader(b))
+		req.Header.Set("X-Tenant-Id", "tenant-a")
+		req.Header.Set("X-Principal-Id", "maker")
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		return w
+	}
+	base := map[string]any{"legal_entity_id": "le-1", "jurisdiction": "DE", "authority_name": "Peppol AP", "protocol": "REST",
+		"provider_key": "einvnet", "connector_id": "7e57ab1e-0000-4000-8000-0000000000c3"}
+	with := func(kind any) map[string]any {
+		m := map[string]any{}
+		for k, v := range base {
+			m[k] = v
+		}
+		if kind != nil {
+			m["adapter_kind"] = kind
+		}
+		return m
+	}
+	w := post(with("EINVOICE"))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("%d %s", w.Code, w.Body.String())
+	}
+	var got domain.TaxInterface
+	_ = json.Unmarshal(w.Body.Bytes(), &got)
+	if got.AdapterKind != "EINVOICE" {
+		t.Fatalf("%+v", got)
+	}
+	if w := post(with("TAX")); w.Code != http.StatusCreated {
+		t.Fatalf("%d", w.Code)
+	}
+	if w := post(with(nil)); w.Code != http.StatusCreated {
+		t.Fatalf("the default kind is accepted: %d", w.Code)
+	}
+	if w := post(with("PAYROLL")); w.Code != http.StatusBadRequest {
+		t.Fatalf("an unknown kind is refused: %d", w.Code)
+	}
+	legacy := map[string]any{"legal_entity_id": "le-1", "jurisdiction": "DE", "authority_name": "x", "protocol": "REST", "adapter_kind": "EINVOICE"}
+	if w := post(legacy); w.Code != http.StatusBadRequest {
+		t.Fatalf("an e-invoice interface needs a provider: %d", w.Code)
+	}
+}

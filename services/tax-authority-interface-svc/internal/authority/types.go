@@ -39,6 +39,14 @@ const (
 	StatusAccepted       = "ACCEPTED"
 	StatusRejected       = "REJECTED"
 	StatusSuperseded     = "SUPERSEDED"
+	// StatusDelivered is an e-invoice network reporting the document reached its recipient (EINVOICE only).
+	StatusDelivered = "DELIVERED"
+)
+
+// Adapter kinds: what an interface carries.
+const (
+	KindTax      = "TAX"
+	KindEInvoice = "EINVOICE"
 )
 
 // Profile statuses.
@@ -70,6 +78,7 @@ type Filing struct {
 	LegalEntityID      string        `json:"legal_entity_id"`
 	Jurisdiction       string        `json:"jurisdiction"`
 	ProviderKey        string        `json:"provider_key"`
+	AdapterKind        string        `json:"adapter_kind"` // TAX or EINVOICE
 	ConnectorID        string        `json:"connector_id"`
 	CertificateRef     string        `json:"certificate_ref,omitempty"`
 	CertificateNotAt   *time.Time    `json:"certificate_not_after,omitempty"`
@@ -122,6 +131,7 @@ type OutcomeKind string
 const (
 	OutSubmitted OutcomeKind = "SUBMITTED"       // the authority holds the filing (received)
 	OutAccepted  OutcomeKind = "ACCEPTED"        // the authority accepted it
+	OutDelivered OutcomeKind = "DELIVERED"       // the network delivered it to its recipient (EINVOICE)
 	OutRejected  OutcomeKind = "REJECTED"        // the authority refused it
 	OutUnknown   OutcomeKind = "PENDING_UNKNOWN" // it may have reached the authority
 	OutRelease   OutcomeKind = "RELEASE"         // provably not processed: back to where it was
@@ -178,7 +188,9 @@ type Store interface {
 	// same subject_ref with a different fingerprint is ErrSubjectConflict.
 	CreateFiling(ctx context.Context, in CreateFiling) (f *Filing, created bool, err error)
 	LoadFiling(ctx context.Context, id string) (*Filing, error)
-	MarkValidated(ctx context.Context, id, actor string) (*Filing, error)
+	// MarkValidated records the validation AND pins the profile version it was validated under: a profile that
+	// changes after approval never silently re-transforms an approved document.
+	MarkValidated(ctx context.Context, id, actor string, profileVersion int) (*Filing, error)
 	Block(ctx context.Context, id, reason, actor, correlationID string) (*Filing, error)
 	BeginSend(ctx context.Context, id, from string, profileVersion int, sentPayloadHash, actor string) (*Filing, error)
 	Finish(ctx context.Context, id string, o Outcome, actor, correlationID string) (*Filing, error)

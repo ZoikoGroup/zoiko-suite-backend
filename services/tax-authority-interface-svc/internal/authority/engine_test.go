@@ -173,7 +173,7 @@ func (s *fakeStore) LoadFiling(_ context.Context, id string) (*authority.Filing,
 	c := *f
 	return &c, nil
 }
-func (s *fakeStore) MarkValidated(_ context.Context, id, _ string) (*authority.Filing, error) {
+func (s *fakeStore) MarkValidated(_ context.Context, id, _ string, ver int) (*authority.Filing, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	f := s.f[id]
@@ -182,6 +182,9 @@ func (s *fakeStore) MarkValidated(_ context.Context, id, _ string) (*authority.F
 	}
 	now := s.now()
 	f.Status, f.ValidatedAt = authority.StatusValidated, &now
+	if f.ProfileVersion == nil {
+		f.ProfileVersion = &ver
+	}
 	c := *f
 	return &c, nil
 }
@@ -225,7 +228,9 @@ func (s *fakeStore) Finish(_ context.Context, id string, o authority.Outcome, ac
 	case authority.OutSubmitted:
 		f.Status, f.AuthorityRef, f.AuthorityStatus, f.InFlightSince, f.NextPollAt = authority.StatusSubmitted, o.AuthorityRef, o.Authority, nil, o.NextPoll
 	case authority.OutAccepted:
-		f.Status, f.AuthorityRef, f.AuthorityStatus, f.InFlightSince, f.NextPollAt = authority.StatusAccepted, o.AuthorityRef, o.Authority, nil, nil
+		f.Status, f.AuthorityRef, f.AuthorityStatus, f.InFlightSince, f.NextPollAt = authority.StatusAccepted, o.AuthorityRef, o.Authority, nil, o.NextPoll
+	case authority.OutDelivered:
+		f.Status, f.AuthorityStatus, f.InFlightSince, f.NextPollAt = authority.StatusDelivered, o.Authority, nil, nil
 	case authority.OutRejected:
 		f.Status, f.AuthorityStatus, f.InFlightSince, f.LastFailure = authority.StatusRejected, o.Authority, nil, o.Reason
 	case authority.OutUnknown:
@@ -460,13 +465,13 @@ func TestUnsupportedSchemaVersionIsBlockedNotSent(t *testing.T) {
 	if s, _ := e.sim.hits(); s != 0 {
 		t.Fatal("nothing may be sent")
 	}
-	if err := e.eng.CheckBinding(context.Background(), "taxauth", "VAT-RETURN@9"); !errors.Is(err, authority.ErrBlocked) {
+	if err := e.eng.CheckBinding(context.Background(), "taxauth", "VAT-RETURN@9", "TAX"); !errors.Is(err, authority.ErrBlocked) {
 		t.Fatalf("%v", err)
 	}
-	if err := e.eng.CheckBinding(context.Background(), "taxauth", "VAT-RETURN@2"); err != nil {
+	if err := e.eng.CheckBinding(context.Background(), "taxauth", "VAT-RETURN@2", "TAX"); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.eng.CheckBinding(context.Background(), "nobody", "VAT-RETURN@2"); !errors.Is(err, authority.ErrProfileNotFound) {
+	if err := e.eng.CheckBinding(context.Background(), "nobody", "VAT-RETURN@2", "TAX"); !errors.Is(err, authority.ErrProfileNotFound) {
 		t.Fatalf("%v", err)
 	}
 }

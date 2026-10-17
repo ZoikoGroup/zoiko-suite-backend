@@ -137,7 +137,7 @@ func TestAuthority_BeginSendIsACompareAndSet(t *testing.T) {
 	f := newFixture(t)
 	tenant := uuid.NewString()
 	fl := f.filing(tenant, f.iface(tenant, nil))
-	_, err := f.st.MarkValidated(tc(tenant), fl.SubmissionID, "op")
+	_, err := f.st.MarkValidated(tc(tenant), fl.SubmissionID, "op", 1)
 	require.NoError(t, err)
 	var won, lost atomic.Int32
 	var wg sync.WaitGroup
@@ -173,7 +173,7 @@ func TestAuthority_FinishOutcomesAreAtomicWithEvidenceAndEvents(t *testing.T) {
 
 	// received → SUBMITTED; later ACCEPTED sets the acknowledgement reference the control population reads
 	a := f.filing(tenant, ifc)
-	_, _ = f.st.MarkValidated(ctx, a.SubmissionID, "op")
+	_, _ = f.st.MarkValidated(ctx, a.SubmissionID, "op", 1)
 	_, err := f.st.BeginSend(ctx, a.SubmissionID, authority.StatusValidated, 1, "h", "op")
 	require.NoError(t, err)
 	next := time.Now().Add(time.Minute)
@@ -202,7 +202,7 @@ func TestAuthority_FinishOutcomesAreAtomicWithEvidenceAndEvents(t *testing.T) {
 
 	// unknown → PENDING_UNKNOWN + event; release with a not-before
 	b := f.filing(tenant, ifc)
-	_, _ = f.st.MarkValidated(ctx, b.SubmissionID, "op")
+	_, _ = f.st.MarkValidated(ctx, b.SubmissionID, "op", 1)
 	_, _ = f.st.BeginSend(ctx, b.SubmissionID, authority.StatusValidated, 1, "h", "op")
 	_, err = f.st.Finish(ctx, b.SubmissionID, authority.Outcome{Kind: authority.OutUnknown, From: authority.StatusSubmitting, Failure: "no_answer_after_send", NextPoll: &next,
 		Transport: entry("SUBMIT", "UNKNOWN", "")}, "op", "c")
@@ -212,7 +212,7 @@ func TestAuthority_FinishOutcomesAreAtomicWithEvidenceAndEvents(t *testing.T) {
 	assert.Equal(t, 1, f.outbox(tenant, b.SubmissionID, "authority-attempt.unknown-outcome"))
 
 	c := f.filing(tenant, ifc)
-	_, _ = f.st.MarkValidated(ctx, c.SubmissionID, "op")
+	_, _ = f.st.MarkValidated(ctx, c.SubmissionID, "op", 1)
 	_, _ = f.st.BeginSend(ctx, c.SubmissionID, authority.StatusValidated, 1, "h", "op")
 	nb := time.Now().Add(time.Hour)
 	_, err = f.st.Finish(ctx, c.SubmissionID, authority.Outcome{Kind: authority.OutRelease, From: authority.StatusSubmitting, ReleaseTo: authority.StatusValidated, NotBefore: &nb,
@@ -223,7 +223,7 @@ func TestAuthority_FinishOutcomesAreAtomicWithEvidenceAndEvents(t *testing.T) {
 
 	// rejected is final
 	d := f.filing(tenant, ifc)
-	_, _ = f.st.MarkValidated(ctx, d.SubmissionID, "op")
+	_, _ = f.st.MarkValidated(ctx, d.SubmissionID, "op", 1)
 	_, _ = f.st.BeginSend(ctx, d.SubmissionID, authority.StatusValidated, 1, "h", "op")
 	r, err := f.st.Finish(ctx, d.SubmissionID, authority.Outcome{Kind: authority.OutRejected, From: authority.StatusSubmitting, Reason: "bad box 3",
 		Transport: entry("SUBMIT", "ANSWERED", "REJECTED")}, "op", "c")
@@ -268,7 +268,7 @@ func TestAuthority_TheDatabaseGuardsWhatWasApproved(t *testing.T) {
 	assert.Error(t, su(`UPDATE tax_filing_submissions SET status = 'SUBMITTING' WHERE submission_id = $1`, fl.SubmissionID), "SUBMITTING needs its start time")
 
 	// pinned once sent
-	_, _ = f.st.MarkValidated(ctx, fl.SubmissionID, "op")
+	_, _ = f.st.MarkValidated(ctx, fl.SubmissionID, "op", 1)
 	_, err := f.st.BeginSend(ctx, fl.SubmissionID, authority.StatusValidated, 1, "hash-A", "op")
 	require.NoError(t, err)
 	_, err = f.st.Finish(ctx, fl.SubmissionID, authority.Outcome{Kind: authority.OutUnknown, From: authority.StatusSubmitting, Transport: entry("SUBMIT", "UNKNOWN", "")}, "op", "c")
@@ -312,7 +312,7 @@ func TestAuthority_SweepAndPollDiscoveryAcrossTenantsUnderRLS(t *testing.T) {
 	b := f.filing(t2, f.iface(t2, nil))
 	fresh := f.filing(t1, f.iface(t1, nil))
 	for _, p := range []struct{ tenant, id string }{{t1, a.SubmissionID}, {t2, b.SubmissionID}, {t1, fresh.SubmissionID}} {
-		_, err := f.st.MarkValidated(tc(p.tenant), p.id, "op")
+		_, err := f.st.MarkValidated(tc(p.tenant), p.id, "op", 1)
 		require.NoError(t, err)
 		_, err = f.st.BeginSend(tc(p.tenant), p.id, authority.StatusValidated, 1, "h", "op")
 		require.NoError(t, err)
@@ -354,7 +354,7 @@ func TestAuthority_TenantsCannotSeeOrTouchEachOther(t *testing.T) {
 	f := newFixture(t)
 	owner, other := uuid.NewString(), uuid.NewString()
 	fl := f.filing(owner, f.iface(owner, nil))
-	_, _ = f.st.MarkValidated(tc(owner), fl.SubmissionID, "op")
+	_, _ = f.st.MarkValidated(tc(owner), fl.SubmissionID, "op", 1)
 	_, _ = f.st.BeginSend(tc(owner), fl.SubmissionID, authority.StatusValidated, 1, "h", "op")
 	_, _ = f.st.Finish(tc(owner), fl.SubmissionID, authority.Outcome{Kind: authority.OutSubmitted, From: authority.StatusSubmitting, AuthorityRef: "RC", Transport: entry("SUBMIT", "ANSWERED", "ACKNOWLEDGED")}, "op", "c")
 
@@ -449,7 +449,7 @@ func TestAuthority_EscalationIsRecordedOnceWithAnEvent(t *testing.T) {
 	assert.Equal(t, 1, f.outbox(tenant, fl.SubmissionID, "authority-attempt.deadline-at-risk"))
 	// a final filing is not escalated
 	acc := f.filing(tenant, f.iface(tenant, nil))
-	_, _ = f.st.MarkValidated(ctx, acc.SubmissionID, "op")
+	_, _ = f.st.MarkValidated(ctx, acc.SubmissionID, "op", 1)
 	_, _ = f.st.BeginSend(ctx, acc.SubmissionID, authority.StatusValidated, 1, "h", "op")
 	_, _ = f.st.Finish(ctx, acc.SubmissionID, authority.Outcome{Kind: authority.OutAccepted, From: authority.StatusSubmitting, AuthorityRef: "R", Transport: entry("SUBMIT", "ANSWERED", "ACCEPTED")}, "op", "c")
 	require.NoError(t, f.st.Escalate(ctx, acc.SubmissionID, "late", "op", "c"))

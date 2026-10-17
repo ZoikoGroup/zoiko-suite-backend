@@ -94,6 +94,7 @@ func (h *Handler) CreateInterface(w http.ResponseWriter, r *http.Request) {
 
 		// authority binding (INT-08); all empty keeps the legacy behaviour
 		ProviderKey:         req.ProviderKey,
+		AdapterKind:         req.AdapterKind,
 		ConnectorID:         req.ConnectorID,
 		CertificateRef:      req.CertificateRef,
 		CertificateNotAfter: req.CertificateNotAfter,

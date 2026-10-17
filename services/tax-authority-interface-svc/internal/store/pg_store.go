@@ -63,12 +63,12 @@ func (p *PgStore) CreateInterface(ctx context.Context, tf *domain.TaxInterface) 
 
 	query := `
 		INSERT INTO tax_interfaces (interface_id, tenant_id, legal_entity_id, jurisdiction, authority_name, protocol, status, created_at, updated_at,
-			provider_key, connector_id, certificate_ref, certificate_not_after, escalate_before_hours)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+			provider_key, connector_id, certificate_ref, certificate_not_after, escalate_before_hours, adapter_kind)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 	`
 	return p.withTenant(ctx, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, query, tf.InterfaceID, tf.TenantID, tf.LegalEntityID, tf.Jurisdiction, tf.AuthorityName, tf.Protocol, tf.Status, tf.CreatedAt, tf.UpdatedAt,
-			tf.ProviderKey, tf.ConnectorID, tf.CertificateRef, tf.CertificateNotAfter, escalateHours(tf.EscalateBeforeHours))
+			tf.ProviderKey, tf.ConnectorID, tf.CertificateRef, tf.CertificateNotAfter, escalateHours(tf.EscalateBeforeHours), adapterKind(tf.AdapterKind))
 		return err
 	})
 }
@@ -85,7 +85,7 @@ func (p *PgStore) CreateInterface(ctx context.Context, tf *domain.TaxInterface) 
 func (p *PgStore) GetInterfaceByID(ctx context.Context, id string) (*domain.TaxInterface, error) {
 	query := `
 		SELECT interface_id, tenant_id, legal_entity_id, jurisdiction, authority_name, protocol, status, created_at, updated_at,
-		       provider_key, connector_id, certificate_ref, certificate_not_after, escalate_before_hours
+		       provider_key, connector_id, certificate_ref, certificate_not_after, escalate_before_hours, adapter_kind
 		FROM tax_interfaces
 		WHERE interface_id = $1
 		  AND tenant_id = $2
@@ -94,7 +94,7 @@ func (p *PgStore) GetInterfaceByID(ctx context.Context, id string) (*domain.TaxI
 	err := p.withTenant(ctx, func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx, query, id, middleware.GetTenantID(ctx)).Scan(
 			&tf.InterfaceID, &tf.TenantID, &tf.LegalEntityID, &tf.Jurisdiction, &tf.AuthorityName, &tf.Protocol, &tf.Status, &tf.CreatedAt, &tf.UpdatedAt,
-			&tf.ProviderKey, &tf.ConnectorID, &tf.CertificateRef, &tf.CertificateNotAfter, &tf.EscalateBeforeHours)
+			&tf.ProviderKey, &tf.ConnectorID, &tf.CertificateRef, &tf.CertificateNotAfter, &tf.EscalateBeforeHours, &tf.AdapterKind)
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -116,7 +116,7 @@ func (p *PgStore) GetInterfaceByID(ctx context.Context, id string) (*domain.TaxI
 func (p *PgStore) ListInterfaces(ctx context.Context, legalEntityID string) ([]domain.TaxInterface, error) {
 	query := `
 		SELECT interface_id, tenant_id, legal_entity_id, jurisdiction, authority_name, protocol, status, created_at, updated_at,
-		       provider_key, connector_id, certificate_ref, certificate_not_after, escalate_before_hours
+		       provider_key, connector_id, certificate_ref, certificate_not_after, escalate_before_hours, adapter_kind
 		FROM tax_interfaces
 		WHERE tenant_id = $2
 		  AND ($1 = '' OR legal_entity_id = $1)
@@ -133,7 +133,7 @@ func (p *PgStore) ListInterfaces(ctx context.Context, legalEntityID string) ([]d
 		for rows.Next() {
 			var tf domain.TaxInterface
 			if err := rows.Scan(&tf.InterfaceID, &tf.TenantID, &tf.LegalEntityID, &tf.Jurisdiction, &tf.AuthorityName, &tf.Protocol, &tf.Status, &tf.CreatedAt, &tf.UpdatedAt,
-				&tf.ProviderKey, &tf.ConnectorID, &tf.CertificateRef, &tf.CertificateNotAfter, &tf.EscalateBeforeHours); err != nil {
+				&tf.ProviderKey, &tf.ConnectorID, &tf.CertificateRef, &tf.CertificateNotAfter, &tf.EscalateBeforeHours, &tf.AdapterKind); err != nil {
 				return err
 			}
 			res = append(res, tf)
@@ -238,4 +238,12 @@ func escalateHours(h int) int {
 		return 24
 	}
 	return h
+}
+
+// adapterKind defaults an interface to carrying tax filings.
+func adapterKind(k string) string {
+	if k == "" {
+		return "TAX"
+	}
+	return k
 }

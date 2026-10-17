@@ -164,3 +164,28 @@ func TestFilingMayCarryNoAmount(t *testing.T) {
 		t.Fatal("a negative amount is not a filing amount")
 	}
 }
+
+func TestCanonicalHashIsAPlainTextForm(t *testing.T) {
+	// sorted keys, compact, and written exactly as the text says: & < > are not escaped
+	plain := `{"a":[1,2.50,"x & <y>"],"b":{"c":true,"d":null}}`
+	want := HashBytes([]byte(plain))
+	for name, doc := range map[string]string{
+		"already canonical": plain,
+		"reordered":         `{"b":{"d":null,"c":true},"a":[1,2.50,"x & <y>"]}`,
+		"whitespace":        "{ \"b\" : {\"c\" : true,\n \"d\":null}, \"a\":[1, 2.50, \"x & <y>\"] }\n",
+		"escaped input":     `{"a":[1,2.50,"x \u0026 \u003cy\u003e"],"b":{"c":true,"d":null}}`,
+	} {
+		got, err := CanonicalHash([]byte(doc))
+		if err != nil || got != want {
+			t.Errorf("%s: %s %v", name, got, err)
+		}
+	}
+	if a, _ := CanonicalHash([]byte(`{"n":2.5}`)); a == func() string { h, _ := CanonicalHash([]byte(`{"n":2.50}`)); return h }() {
+		t.Error("numbers keep their exact spelling: 2.5 and 2.50 are different documents")
+	}
+	for _, bad := range []string{``, `nope`, `{"a":1} {"b":2}`} {
+		if _, err := CanonicalHash([]byte(bad)); err == nil {
+			t.Errorf("%q must be refused", bad)
+		}
+	}
+}

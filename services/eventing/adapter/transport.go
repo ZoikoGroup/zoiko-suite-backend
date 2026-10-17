@@ -40,6 +40,7 @@ type Class string
 const (
 	ClassAcknowledged Class = "ACKNOWLEDGED" // the provider took the request (NOT finality)
 	ClassPending      Class = "PENDING"      // the provider is still working
+	ClassDelivered    Class = "DELIVERED"    // EINVOICE only: the network delivered the document to its recipient
 	ClassAccepted     Class = "ACCEPTED"     // TAX/EINVOICE only: the authority or network accepted the document
 	ClassRejected     Class = "REJECTED"     // the provider refused it for a business reason
 	ClassRateLimited  Class = "RATE_LIMITED" // not processed; try later
@@ -291,6 +292,8 @@ func classify(res *Result, raw []byte, resp Response, notFound []int, success []
 			res.Reason = reasonFrom(raw, resp)
 		case StatusAccepted:
 			res.Class = ClassAccepted
+		case StatusDelivered:
+			res.Class = ClassDelivered
 		case StatusPending:
 			res.Class = ClassPending
 		}
