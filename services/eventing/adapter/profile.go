@@ -46,6 +46,11 @@ type Spec struct {
 	// validated against it BEFORE anything is sent. Required for TAX and EINVOICE profiles.
 	Schema        json.RawMessage `json:"schema,omitempty"`
 	SchemaVersion string          `json:"schema_version,omitempty"`
+
+	// Transform names the document transformer for an EINVOICE profile ("ubl-2.1"). The approved canonical
+	// invoice is rendered, then the rendered document's totals are checked against the canonical ones.
+	Transform string         `json:"transform,omitempty"`
+	EInvoice  *EInvoiceRules `json:"einvoice,omitempty"`
 }
 
 // Request describes the outbound call.
@@ -114,6 +119,8 @@ const (
 	// StatusAccepted is the authority accepting a filing (or a network clearing a document). It exists for TAX
 	// and EINVOICE profiles only: a bank acknowledgement is never finality, so a BANK profile cannot map to it.
 	StatusAccepted = "ACCEPTED"
+	// StatusDelivered is a network reporting the document reached its recipient (EINVOICE only).
+	StatusDelivered = "DELIVERED"
 )
 
 // Errors. Messages name the rule and never echo caller or provider content.
@@ -142,6 +149,9 @@ func (s Spec) Normalize() Spec {
 	}
 	if s.Submit.ContentType == "" {
 		s.Submit.ContentType = "application/json"
+		if s.Transform == TransformUBL {
+			s.Submit.ContentType = "application/xml"
+		}
 	}
 	if s.Submit.AmountFormat == "" {
 		s.Submit.AmountFormat = "decimal"
@@ -185,7 +195,20 @@ func (s Spec) Validate() error {
 			return bad("max_amount is not a plain decimal")
 		}
 	}
-	if err := validateRequest(s.Kind, s.Submit); err != nil {
+	if s.Transform != "" && (s.Kind != "EINVOICE" || s.Transform != TransformUBL) {
+		return bad("transform must be %q and only an EINVOICE profile may name it", TransformUBL)
+	}
+	if s.Kind == "EINVOICE" {
+		if err := s.EInvoice.validate(); err != nil {
+			return err
+		}
+	} else if s.EInvoice != nil {
+		return bad("einvoice rules belong to an EINVOICE profile")
+	}
+	if s.Transform == TransformUBL && s.Submit.ContentType != "application/xml" {
+		return bad("a ubl-2.1 profile sends application/xml")
+	}
+	if err := validateRequest(s.Kind, s.Transform, s.Submit); err != nil {
 		return err
 	}
 	if len(s.Schema) > 0 {
@@ -262,7 +285,7 @@ func validatePath(p string, allowVars bool) error {
 	return nil
 }
 
-func validateRequest(kind string, r Request) error {
+func validateRequest(kind, transform string, r Request) error {
 	bad := func(f string, a ...any) error { return fmt.Errorf("%w: %s", ErrSpecInvalid, fmt.Sprintf(f, a...)) }
 	if r.Method != "POST" && r.Method != "PUT" && r.Method != "PATCH" {
 		return bad("submit.method must be POST, PUT or PATCH")
@@ -277,6 +300,13 @@ func validateRequest(kind string, r Request) error {
 		// a document profile may carry no separately mapped amount
 	} else if !pathKeyRe.MatchString(r.AmountField) {
 		return bad("submit.amount_field is required: the amount in the built request is re-checked against the canonical amount")
+	}
+	if transform == TransformUBL {
+		// the transformer builds the whole body; there are no mapped fields to check
+		if len(r.Body) != 0 {
+			return bad("a ubl-2.1 profile builds the whole body; submit.body must be empty")
+		}
+		return nil
 	}
 	if len(r.Body) == 0 || len(r.Body) > 200 {
 		return bad("between 1 and 200 body fields are required")
@@ -340,7 +370,7 @@ func validateResponse(kind string, r Response, where string) error {
 		}
 	}
 	for _, v := range r.StatusMap {
-		if v != StatusAcknowledged && v != StatusRejected && v != StatusPending && !(v == StatusAccepted && kind != "BANK") {
+		if v != StatusAcknowledged && v != StatusRejected && v != StatusPending && !(v == StatusAccepted && kind != "BANK") && !(v == StatusDelivered && kind == "EINVOICE") {
 			return bad("a status maps to ACKNOWLEDGED, REJECTED or PENDING")
 		}
 	}
@@ -459,6 +489,9 @@ func (s Spec) BuildRequest(c Canonical) ([]byte, error) { return s.BuildRequestD
 // BuildRequestDoc is BuildRequest for a profile that embeds the approved document. The document is validated
 // against the authority schema first; a document that fails is never sent.
 func (s Spec) BuildRequestDoc(c Canonical, doc []byte) ([]byte, error) {
+	if s.Transform == TransformUBL {
+		return s.buildUBL(c, doc)
+	}
 	if err := s.CheckAgainstProfile(c); err != nil {
 		return nil, err
 	}
@@ -597,9 +630,48 @@ func (c Callback) Validate() error {
 		return bad("callback.status_map is required")
 	}
 	for _, v := range c.StatusMap {
-		if v != StatusAcknowledged && v != StatusRejected && v != StatusPending && v != "SETTLED" && v != StatusAccepted {
+		if v != StatusAcknowledged && v != StatusRejected && v != StatusPending && v != "SETTLED" && v != StatusAccepted && v != StatusDelivered {
 			return bad("a callback status maps to ACKNOWLEDGED, PENDING, REJECTED or SETTLED")
 		}
 	}
 	return nil
+}
+
+// buildUBL validates the approved canonical invoice against the network profile and renders it. Every refusal here
+// is explicit and happens before anything is sent: the wrong profile (unsupported rail), a malformed or
+// inconsistent invoice, an invalid recipient, a prohibited attachment, a schema failure, or transformed totals
+// that differ from the canonical ones.
+func (s Spec) buildUBL(c Canonical, doc []byte) ([]byte, error) {
+	if len(doc) == 0 {
+		return nil, ErrDocumentMissing
+	}
+	if err := s.CheckAgainstProfile(Canonical{"rail": c["rail"]}); err != nil {
+		return nil, err
+	}
+	if len(s.Schema) > 0 {
+		sch, err := CompileSchema(s.Schema)
+		if err != nil {
+			return nil, err
+		}
+		if err := sch.ValidateDocument(doc); err != nil {
+			return nil, err
+		}
+	}
+	inv, err := ParseInvoice(doc)
+	if err != nil {
+		return nil, err
+	}
+	if err := inv.CheckEconomics(); err != nil {
+		return nil, err
+	}
+	if err := s.CheckAgainstProfile(Canonical{"rail": c["rail"], "currency": inv.Currency, "amount": inv.Totals.Gross}); err != nil {
+		return nil, err
+	}
+	if err := inv.CheckRecipient(s.EInvoice); err != nil {
+		return nil, err
+	}
+	if err := inv.CheckAttachments(s.EInvoice); err != nil {
+		return nil, err
+	}
+	return RenderUBL(inv, s.EInvoice, c["reference"])
 }

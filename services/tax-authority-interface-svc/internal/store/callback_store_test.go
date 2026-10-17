@@ -24,7 +24,7 @@ func (f *fixture) sentFiling(tenant string, unknown bool) *authority.Filing {
 	f.t.Helper()
 	fl := f.filing(tenant, f.iface(tenant, nil))
 	ctx := tc(tenant)
-	_, err := f.st.MarkValidated(ctx, fl.SubmissionID, "op")
+	_, err := f.st.MarkValidated(ctx, fl.SubmissionID, "op", 1)
 	require.NoError(f.t, err)
 	_, err = f.st.BeginSend(ctx, fl.SubmissionID, authority.StatusValidated, 1, "h", "op")
 	require.NoError(f.t, err)

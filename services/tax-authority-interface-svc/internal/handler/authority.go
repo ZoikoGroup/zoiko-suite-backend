@@ -110,7 +110,7 @@ func (h *Handler) submitViaAuthority(w http.ResponseWriter, r *http.Request, ifa
 		writeError(w, http.StatusBadRequest, "tax_amount must be non-negative with at most four decimal places")
 		return true
 	}
-	if err := h.engine.CheckBinding(r.Context(), iface.ProviderKey, req.Rail); err != nil {
+	if err := h.engine.CheckBinding(r.Context(), iface.ProviderKey, req.Rail, kindOrTax(iface.AdapterKind)); err != nil {
 		switch {
 		case errors.Is(err, authority.ErrProfileNotFound):
 			writeError(w, http.StatusUnprocessableEntity, "no certified authority profile for this interface")
@@ -245,7 +245,8 @@ func (h *Handler) GetFilingReceipt(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"submission_id": f.SubmissionID, "status": f.Status, "authority_ref": f.AuthorityRef,
 		"authority_status": f.AuthorityStatus, "receipt_hash": f.ReceiptHash, "last_failure": f.LastFailure,
-		"accepted": f.Status == authority.StatusAccepted,
+		"accepted":  f.Status == authority.StatusAccepted || f.Status == authority.StatusDelivered,
+		"delivered": f.Status == authority.StatusDelivered, "adapter_kind": f.AdapterKind,
 	})
 }
 
@@ -397,8 +398,8 @@ func (h *Handler) PublishProfile(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnprocessableEntity, err.Error())
 		return
 	}
-	if spec.Kind != "TAX" {
-		writeError(w, http.StatusUnprocessableEntity, "this service publishes TAX profiles only")
+	if spec.Kind != "TAX" && spec.Kind != "EINVOICE" {
+		writeError(w, http.StatusUnprocessableEntity, "this service publishes TAX and EINVOICE profiles")
 		return
 	}
 	principalID := r.Header.Get(principalIDHeader)
@@ -515,7 +516,13 @@ var uuidRe = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[
 // validateAuthorityBinding checks the optional authority fields of an interface. A provider needs a connector;
 // a connector, certificate or escalation window without a provider is a mistake, not a setting.
 func validateAuthorityBinding(req domain.CreateInterfaceRequest) string {
+	if req.AdapterKind != "" && req.AdapterKind != "TAX" && req.AdapterKind != "EINVOICE" {
+		return "adapter_kind must be TAX or EINVOICE"
+	}
 	if req.ProviderKey == "" {
+		if req.AdapterKind == "EINVOICE" {
+			return "adapter_kind EINVOICE needs a provider_key"
+		}
 		if req.ConnectorID != "" || req.CertificateRef != "" || req.CertificateNotAfter != nil || req.EscalateBeforeHours != 0 {
 			return "connector_id, certificate and escalation settings need a provider_key"
 		}
@@ -531,4 +538,11 @@ func validateAuthorityBinding(req domain.CreateInterfaceRequest) string {
 		return "escalate_before_hours must be between 1 and 720"
 	}
 	return ""
+}
+
+func kindOrTax(k string) string {
+	if k == "" {
+		return authority.KindTax
+	}
+	return k
 }

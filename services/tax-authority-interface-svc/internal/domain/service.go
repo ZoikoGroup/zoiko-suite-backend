@@ -31,6 +31,7 @@ type TaxInterface struct {
 
 	// Authority binding (INT-08). Empty ProviderKey keeps the legacy "record the intent" behaviour.
 	ProviderKey         string     `json:"provider_key,omitempty"`
+	AdapterKind         string     `json:"adapter_kind,omitempty"` // TAX (default) or EINVOICE
 	ConnectorID         string     `json:"connector_id,omitempty"`
 	CertificateRef      string     `json:"certificate_ref,omitempty"`
 	CertificateNotAfter *time.Time `json:"certificate_not_after,omitempty"`
@@ -56,6 +57,7 @@ type CreateInterfaceRequest struct {
 	Protocol      string `json:"protocol"`
 
 	ProviderKey         string     `json:"provider_key,omitempty"`
+	AdapterKind         string     `json:"adapter_kind,omitempty"`
 	ConnectorID         string     `json:"connector_id,omitempty"`
 	CertificateRef      string     `json:"certificate_ref,omitempty"`
 	CertificateNotAfter *time.Time `json:"certificate_not_after,omitempty"`

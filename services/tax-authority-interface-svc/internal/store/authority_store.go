@@ -204,7 +204,7 @@ func (p *PgStore) ListProfiles(ctx context.Context, key string) ([]authority.Pro
 
 // ── filings ─────────────────────────────────────────────────────────────────
 
-const filingCols = `s.submission_id, s.tenant_id, s.interface_id, i.legal_entity_id, i.jurisdiction, i.provider_key, i.connector_id, i.certificate_ref,
+const filingCols = `s.submission_id, s.tenant_id, s.interface_id, i.legal_entity_id, i.jurisdiction, i.provider_key, i.adapter_kind, i.connector_id, i.certificate_ref,
 	i.certificate_not_after, i.escalate_before_hours, s.tax_period, s.filing_type, s.tax_amount::text, s.subject_ref, s.subject_fingerprint,
 	COALESCE(s.document::text, ''), s.payload_hash, s.rail, s.profile_version, s.sent_payload_hash, s.status, s.send_count, s.validated_at,
 	s.sent_at, s.in_flight_since, s.not_before, s.next_poll_at, s.deadline_at, s.authority_ref, s.authority_status, s.receipt_hash,
@@ -216,7 +216,7 @@ func scanFiling(r pgx.Row) (*authority.Filing, error) {
 	var f authority.Filing
 	var doc string
 	var hours int
-	if err := r.Scan(&f.SubmissionID, &f.TenantID, &f.InterfaceID, &f.LegalEntityID, &f.Jurisdiction, &f.ProviderKey, &f.ConnectorID, &f.CertificateRef,
+	if err := r.Scan(&f.SubmissionID, &f.TenantID, &f.InterfaceID, &f.LegalEntityID, &f.Jurisdiction, &f.ProviderKey, &f.AdapterKind, &f.ConnectorID, &f.CertificateRef,
 		&f.CertificateNotAt, &hours, &f.TaxPeriod, &f.FilingType, &f.AmountText, &f.SubjectRef, &f.SubjectFingerprint,
 		&doc, &f.PayloadHash, &f.Rail, &f.ProfileVersion, &f.SentPayloadHash, &f.Status, &f.SendCount, &f.ValidatedAt,
 		&f.SentAt, &f.InFlightSince, &f.NotBefore, &f.NextPollAt, &f.DeadlineAt, &f.AuthorityRef, &f.AuthorityStatus, &f.ReceiptHash,
@@ -282,7 +282,7 @@ func (p *PgStore) CreateFiling(ctx context.Context, in authority.CreateFiling) (
 		if f, err = p.loadIn(ctx, tx, id); err != nil {
 			return err
 		}
-		return p.enqueue(ctx, tx, "com.zoikosuite.tax.authority-attempt.prepared", id, tenant, f.LegalEntityID, in.Actor, in.CorrelationID,
+		return p.enqueue(ctx, tx, eventType(f, "prepared"), id, tenant, f.LegalEntityID, in.Actor, in.CorrelationID,
 			map[string]any{"submission_id": id, "interface_id": in.InterfaceID, "tax_period": in.TaxPeriod, "filing_type": in.FilingType,
 				"payload_hash": in.PayloadHash, "rail": in.Rail})
 	})
@@ -298,10 +298,11 @@ func (p *PgStore) CreateFiling(ctx context.Context, in authority.CreateFiling) (
 	return f, created, nil
 }
 
-func (p *PgStore) MarkValidated(ctx context.Context, id, actor string) (*authority.Filing, error) {
+func (p *PgStore) MarkValidated(ctx context.Context, id, actor string, profileVersion int) (*authority.Filing, error) {
 	var f *authority.Filing
 	err := p.withTenant(ctx, func(tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx, `UPDATE tax_filing_submissions SET status = 'VALIDATED', validated_at = now() WHERE submission_id = $1 AND status = 'PREPARED'`, id)
+		tag, err := tx.Exec(ctx, `UPDATE tax_filing_submissions SET status = 'VALIDATED', validated_at = now(), profile_version = COALESCE(profile_version, $2)
+			WHERE submission_id = $1 AND status = 'PREPARED'`, id, profileVersion)
 		if err != nil {
 			return err
 		}
@@ -333,7 +334,7 @@ func (p *PgStore) Block(ctx context.Context, id, reason, actor, corr string) (*a
 		if f, err = p.loadIn(ctx, tx, id); err != nil {
 			return err
 		}
-		return p.enqueue(ctx, tx, "com.zoikosuite.tax.authority-attempt.blocked", id, f.TenantID, f.LegalEntityID, actor, corr,
+		return p.enqueue(ctx, tx, eventType(f, "blocked"), id, f.TenantID, f.LegalEntityID, actor, corr,
 			map[string]any{"submission_id": id, "reason": reason})
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -409,12 +410,17 @@ func (p *PgStore) Finish(ctx context.Context, id string, o authority.Outcome, ac
 				WHERE submission_id = $1 AND status = $6`, id, o.AuthorityRef, o.Authority, o.ReceiptHash, o.NextPoll, o.From)
 		case authority.OutAccepted:
 			tag, err = tx.Exec(ctx, `UPDATE tax_filing_submissions SET status = 'ACCEPTED', authority_ref = CASE WHEN $2::text <> '' THEN $2::text ELSE authority_ref END,
-				authority_status = $3, receipt_hash = $4, in_flight_since = NULL, not_before = NULL, last_failure = '', next_poll_at = NULL, ack_reference = CASE WHEN $2::text <> '' THEN $2::text ELSE ack_reference END
-				WHERE submission_id = $1 AND status = $5`, id, o.AuthorityRef, o.Authority, o.ReceiptHash, o.From)
+				authority_status = $3, receipt_hash = $4, in_flight_since = NULL, not_before = NULL, last_failure = '', next_poll_at = $6, ack_reference = CASE WHEN $2::text <> '' THEN $2::text ELSE ack_reference END
+				WHERE submission_id = $1 AND status = $5`, id, o.AuthorityRef, o.Authority, o.ReceiptHash, o.From, o.NextPoll)
 		case authority.OutRejected:
 			tag, err = tx.Exec(ctx, `UPDATE tax_filing_submissions SET status = 'REJECTED', authority_ref = CASE WHEN $2::text <> '' THEN $2::text ELSE authority_ref END,
 				authority_status = $3, receipt_hash = $4, in_flight_since = NULL, not_before = NULL, last_failure = $5, next_poll_at = NULL
 				WHERE submission_id = $1 AND status = $6`, id, o.AuthorityRef, o.Authority, o.ReceiptHash, o.Reason, o.From)
+		case authority.OutDelivered:
+			tag, err = tx.Exec(ctx, `UPDATE tax_filing_submissions SET status = 'DELIVERED', authority_ref = CASE WHEN $2::text <> '' THEN $2::text ELSE authority_ref END,
+				authority_status = $3, receipt_hash = $4, in_flight_since = NULL, not_before = NULL, last_failure = '', next_poll_at = NULL,
+				ack_reference = CASE WHEN $2::text <> '' THEN $2::text ELSE ack_reference END
+				WHERE submission_id = $1 AND status = $5`, id, o.AuthorityRef, o.Authority, o.ReceiptHash, o.From)
 		case authority.OutUnknown:
 			tag, err = tx.Exec(ctx, `UPDATE tax_filing_submissions SET status = 'PENDING_UNKNOWN', in_flight_since = NULL, last_failure = $2, next_poll_at = $3
 				WHERE submission_id = $1 AND status = $4`, id, o.Failure, o.NextPoll, o.From)
@@ -441,15 +447,25 @@ func (p *PgStore) Finish(ctx context.Context, id string, o authority.Outcome, ac
 			return err
 		}
 		ev := func(kind string) error {
-			return p.enqueue(ctx, tx, "com.zoikosuite.tax.authority-attempt."+kind, id, f.TenantID, f.LegalEntityID, actor, corr,
+			return p.enqueue(ctx, tx, eventType(f, kind), id, f.TenantID, f.LegalEntityID, actor, corr,
 				map[string]any{"submission_id": id, "status": f.Status, "authority_ref": f.AuthorityRef, "authority_status": f.AuthorityStatus,
 					"tax_period": f.TaxPeriod, "filing_type": f.FilingType, "failure": o.Failure})
 		}
 		switch o.Kind {
 		case authority.OutSubmitted:
 			return ev("submitted")
-		case authority.OutAccepted, authority.OutRejected:
+		case authority.OutAccepted:
+			if f.AdapterKind == authority.KindEInvoice {
+				return ev("accepted")
+			}
 			return ev("response-received")
+		case authority.OutRejected:
+			if f.AdapterKind == authority.KindEInvoice {
+				return ev("rejected")
+			}
+			return ev("response-received")
+		case authority.OutDelivered:
+			return ev("delivered")
 		case authority.OutUnknown:
 			return ev("unknown-outcome")
 		}
@@ -476,7 +492,8 @@ func (p *PgStore) Finish(ctx context.Context, id string, o authority.Outcome, ac
 func (p *PgStore) Escalate(ctx context.Context, id, reason, actor, corr string) error {
 	err := p.withTenant(ctx, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, `UPDATE tax_filing_submissions SET escalated_at = now() WHERE submission_id = $1 AND escalated_at IS NULL
-			AND status IN ('VALIDATED', 'SUBMITTED', 'PENDING_UNKNOWN', 'PREPARED')`, id)
+			AND (status IN ('VALIDATED', 'SUBMITTED', 'PENDING_UNKNOWN', 'PREPARED')
+				OR (status = 'ACCEPTED' AND EXISTS (SELECT 1 FROM tax_interfaces i WHERE i.interface_id = tax_filing_submissions.interface_id AND i.adapter_kind = 'EINVOICE')))`, id)
 		if err != nil {
 			return err
 		}
@@ -487,7 +504,7 @@ func (p *PgStore) Escalate(ctx context.Context, id, reason, actor, corr string) 
 		if err != nil {
 			return err
 		}
-		return p.enqueue(ctx, tx, "com.zoikosuite.tax.authority-attempt.deadline-at-risk", id, f.TenantID, f.LegalEntityID, actor, corr,
+		return p.enqueue(ctx, tx, eventType(f, "deadline-at-risk"), id, f.TenantID, f.LegalEntityID, actor, corr,
 			map[string]any{"submission_id": id, "status": f.Status, "deadline_at": f.DeadlineAt, "reason": reason, "tax_period": f.TaxPeriod, "filing_type": f.FilingType})
 	})
 	if err != nil {
@@ -576,7 +593,7 @@ func (p *PgStore) workerScan(ctx context.Context, query string, args ...any) ([]
 
 func (p *PgStore) DuePolls(ctx context.Context, now time.Time, limit int) ([]authority.Due, error) {
 	due, err := p.workerScan(ctx, `SELECT submission_id, tenant_id FROM tax_filing_submissions
-		WHERE status IN ('SUBMITTED', 'PENDING_UNKNOWN') AND next_poll_at IS NOT NULL AND next_poll_at <= $1 ORDER BY next_poll_at LIMIT $2`, now, limit)
+		WHERE status IN ('SUBMITTED', 'PENDING_UNKNOWN', 'ACCEPTED') AND next_poll_at IS NOT NULL AND next_poll_at <= $1 ORDER BY next_poll_at LIMIT $2`, now, limit)
 	if err != nil {
 		return nil, unavailable(err)
 	}
@@ -606,7 +623,7 @@ func (p *PgStore) SweepStale(ctx context.Context, staleBefore time.Time, actor s
 			if err != nil {
 				return err
 			}
-			return p.enqueue(ctx, tx, "com.zoikosuite.tax.authority-attempt.unknown-outcome", d.SubmissionID, d.TenantID, f.LegalEntityID, actor, "",
+			return p.enqueue(ctx, tx, eventType(f, "unknown-outcome"), d.SubmissionID, d.TenantID, f.LegalEntityID, actor, "",
 				map[string]any{"submission_id": d.SubmissionID, "reason": "interrupted"})
 		})
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -617,4 +634,12 @@ func (p *PgStore) SweepStale(ctx context.Context, staleBefore time.Time, actor s
 		}
 	}
 	return n, nil
+}
+
+// eventType names an attempt event: a tax filing's events and an e-invoice's are different contracts.
+func eventType(f *authority.Filing, what string) string {
+	if f.AdapterKind == authority.KindEInvoice {
+		return "com.zoikosuite.einvoice.network-attempt." + what
+	}
+	return "com.zoikosuite.tax.authority-attempt." + what
 }

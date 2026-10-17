@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -20,8 +21,10 @@ func rank(s string) int {
 		return 0
 	case authority.StatusSubmitted:
 		return 1
-	case authority.StatusAccepted, authority.StatusRejected, authority.StatusSuperseded, authority.StatusBlocked:
+	case authority.StatusAccepted:
 		return 2
+	case authority.StatusDelivered, authority.StatusRejected, authority.StatusSuperseded, authority.StatusBlocked:
+		return 3
 	}
 	return 0
 }
@@ -108,6 +111,8 @@ func (p *PgStore) ApplyCallback(ctx context.Context, in authority.CallbackInput)
 		switch in.Mapped {
 		case "ACCEPTED":
 			to = authority.StatusAccepted
+		case "DELIVERED":
+			to = authority.StatusDelivered
 		case "REJECTED":
 			to = authority.StatusRejected
 		default: // PENDING, ACKNOWLEDGED: the authority has it
@@ -118,11 +123,13 @@ func (p *PgStore) ApplyCallback(ctx context.Context, in authority.CallbackInput)
 			return err
 		}
 		switch {
+		case to == authority.StatusDelivered && cur.AdapterKind != authority.KindEInvoice:
+			return receipt(authority.OutcomeStaleIgnored, "delivery is not a state of this filing", &id)
 		case cur.Status == to:
 			return receipt(authority.OutcomeStaleIgnored, "the filing is already in that state", &id)
-		case rank(cur.Status) >= 2:
+		case rank(cur.Status) >= 3 || (cur.Status == authority.StatusAccepted && cur.AdapterKind != authority.KindEInvoice):
 			return receipt(authority.OutcomeRegressionBlocked, "the filing is final; a callback cannot change it", &id)
-		case cur.Status != authority.StatusSubmitted && cur.Status != authority.StatusPendingUnknown:
+		case cur.Status != authority.StatusSubmitted && cur.Status != authority.StatusPendingUnknown && cur.Status != authority.StatusAccepted:
 			return receipt(authority.OutcomeStaleIgnored, "the filing was not sent, so the authority cannot be answering for it", &id)
 		case rank(to) < rank(cur.Status):
 			return receipt(authority.OutcomeStaleIgnored, "the callback reports an earlier stage than the filing has reached", &id)
@@ -131,7 +138,7 @@ func (p *PgStore) ApplyCallback(ctx context.Context, in authority.CallbackInput)
 			return err
 		}
 		var ack string
-		if to == authority.StatusAccepted {
+		if to == authority.StatusAccepted || to == authority.StatusDelivered {
 			ack = in.SubmissionRef
 		}
 		_, uerr := tx.Exec(ctx, `UPDATE tax_filing_submissions SET status = $2, authority_status = $3, in_flight_since = NULL, last_failure = '',
@@ -156,10 +163,15 @@ func (p *PgStore) ApplyCallback(ctx context.Context, in authority.CallbackInput)
 		}
 		res.Filing = upd
 		kind := "submitted"
-		if to != authority.StatusSubmitted {
+		switch {
+		case to == authority.StatusDelivered:
+			kind = "delivered"
+		case to != authority.StatusSubmitted && upd.AdapterKind == authority.KindEInvoice:
+			kind = strings.ToLower(to)
+		case to != authority.StatusSubmitted:
 			kind = "response-received"
 		}
-		if err := p.enqueue(ctx, tx, "com.zoikosuite.tax.authority-attempt."+kind, id, tenant, upd.LegalEntityID, "authority-callback", in.CorrelationID,
+		if err := p.enqueue(ctx, tx, eventType(upd, kind), id, tenant, upd.LegalEntityID, "authority-callback", in.CorrelationID,
 			map[string]any{"submission_id": id, "status": upd.Status, "authority_status": in.RawStatus, "via": in.Provider}); err != nil {
 			return err
 		}

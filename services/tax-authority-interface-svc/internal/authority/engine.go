@@ -91,10 +91,17 @@ func (e *Engine) profileFor(ctx context.Context, f *Filing) (*ProfileRecord, err
 	if p.Status == ProfileWithdrawn || (v == 0 && p.Status != ProfileCertified) {
 		return nil, ErrProfileNotFound
 	}
-	if p.Spec.Kind != "TAX" {
-		return nil, fmt.Errorf("%w: not a tax profile", ErrBlocked)
+	if p.Spec.Kind != kindOf(f) {
+		return nil, fmt.Errorf("%w: the profile is not a %s profile", ErrBlocked, kindOf(f))
 	}
 	return p, nil
+}
+
+func kindOf(f *Filing) string {
+	if f.AdapterKind == KindEInvoice {
+		return KindEInvoice
+	}
+	return KindTax
 }
 
 func canonicalOf(f *Filing) adapter.Canonical {
@@ -110,18 +117,27 @@ func canonicalOf(f *Filing) adapter.Canonical {
 
 // CheckBinding is the early refusal at filing time: does a certified profile of this authority carry this
 // schema version at all?
-func (e *Engine) CheckBinding(ctx context.Context, providerKey, rail string) error {
+func (e *Engine) CheckBinding(ctx context.Context, providerKey, rail, kind string) error {
 	p, err := e.Store.GetProfile(ctx, providerKey, 0)
 	if err != nil {
 		return err
 	}
-	if p.Status != ProfileCertified || p.Spec.Kind != "TAX" {
+	if p.Status != ProfileCertified || p.Spec.Kind != kind {
 		return ErrProfileNotFound
 	}
 	if err := p.Spec.Normalize().CheckAgainstProfile(adapter.Canonical{"rail": rail}); err != nil {
 		return fmt.Errorf("%w: %v", ErrBlocked, err)
 	}
 	return nil
+}
+
+// pollAfterAcceptance: a tax authority's acceptance is final, but an e-invoice network's clearance is followed by
+// delivery to the recipient, so an accepted e-invoice keeps being asked about until it is delivered.
+func (e *Engine) pollAfterAcceptance(f *Filing, cfg Config) *time.Time {
+	if f.AdapterKind != KindEInvoice {
+		return nil
+	}
+	return e.nextPoll(f, cfg)
 }
 
 func (e *Engine) atRisk(f *Filing) bool {
@@ -143,8 +159,12 @@ func (e *Engine) escalateIfAtRisk(ctx context.Context, f *Filing, why, actor, co
 		return
 	}
 	switch f.Status {
-	case StatusAccepted, StatusRejected, StatusBlocked, StatusSuperseded:
+	case StatusRejected, StatusBlocked, StatusSuperseded, StatusDelivered:
 		return
+	case StatusAccepted:
+		if f.AdapterKind != KindEInvoice {
+			return
+		}
 	}
 	_ = e.Store.Escalate(ctx, f.SubmissionID, why, actor, corr)
 }
@@ -182,7 +202,7 @@ func (e *Engine) Validate(ctx context.Context, id, actor, corr string) (*Result,
 		}
 		return nil, fmt.Errorf("%w: %v", ErrBlocked, err)
 	}
-	v, err := e.Store.MarkValidated(ctx, id, actor)
+	v, err := e.Store.MarkValidated(ctx, id, actor, prof.Version)
 	if err != nil {
 		return nil, err
 	}
@@ -242,7 +262,7 @@ func (e *Engine) Send(ctx context.Context, id, actor string, caller Caller) (*Re
 		return nil, ErrPayloadChanged
 	}
 	if from == StatusPrepared {
-		v, err := e.Store.MarkValidated(ctx, id, actor)
+		v, err := e.Store.MarkValidated(ctx, id, actor, prof.Version)
 		if err != nil {
 			return nil, err
 		}
@@ -338,8 +358,10 @@ func (e *Engine) reconcile(ctx context.Context, f *Filing, prof *ProfileRecord, 
 		return &Result{Filing: nf, Note: note}, true, nil
 	}
 	switch r.Class {
+	case adapter.ClassDelivered:
+		return settle(Outcome{Kind: OutDelivered, AuthorityRef: r.ProviderRef, Authority: r.ProviderStat, ReceiptHash: r.ResponseHash}, "delivered")
 	case adapter.ClassAccepted:
-		return settle(Outcome{Kind: OutAccepted, AuthorityRef: r.ProviderRef, Authority: r.ProviderStat, ReceiptHash: r.ResponseHash}, "accepted_at_authority")
+		return settle(Outcome{Kind: OutAccepted, AuthorityRef: r.ProviderRef, Authority: r.ProviderStat, ReceiptHash: r.ResponseHash, NextPoll: e.pollAfterAcceptance(f, cfg)}, "accepted_at_authority")
 	case adapter.ClassAcknowledged, adapter.ClassPending:
 		return settle(Outcome{Kind: OutSubmitted, AuthorityRef: r.ProviderRef, Authority: r.ProviderStat, ReceiptHash: r.ResponseHash, NextPoll: e.nextPoll(f, cfg)}, "found_at_authority")
 	case adapter.ClassRejected:
@@ -372,7 +394,8 @@ func (e *Engine) Poll(ctx context.Context, id, actor string, caller Caller) (*Re
 	if f.ProviderKey == "" {
 		return nil, ErrNotConfigured
 	}
-	if f.Status != StatusSubmitted && f.Status != StatusPendingUnknown {
+	pollable := f.Status == StatusSubmitted || f.Status == StatusPendingUnknown || (f.Status == StatusAccepted && f.AdapterKind == KindEInvoice)
+	if !pollable {
 		return nil, ErrInFlight
 	}
 	prof, err := e.profileFor(ctx, f)
@@ -412,11 +435,19 @@ func (e *Engine) Poll(ctx context.Context, id, actor string, caller Caller) (*Re
 	}
 	next := e.nextPoll(f, cfg)
 	switch r.Class {
+	case adapter.ClassDelivered:
+		return finish(Outcome{Kind: OutDelivered, AuthorityRef: r.ProviderRef, Authority: r.ProviderStat, ReceiptHash: r.ResponseHash}, "delivered")
 	case adapter.ClassAccepted:
-		return finish(Outcome{Kind: OutAccepted, AuthorityRef: r.ProviderRef, Authority: r.ProviderStat, ReceiptHash: r.ResponseHash}, "accepted_at_authority")
+		if f.Status == StatusAccepted {
+			return finish(Outcome{Kind: OutNone, Authority: r.ProviderStat, NextPoll: next}, "accepted_awaiting_delivery")
+		}
+		return finish(Outcome{Kind: OutAccepted, AuthorityRef: r.ProviderRef, Authority: r.ProviderStat, ReceiptHash: r.ResponseHash, NextPoll: e.pollAfterAcceptance(f, cfg)}, "accepted_at_authority")
 	case adapter.ClassRejected:
 		return finish(Outcome{Kind: OutRejected, AuthorityRef: r.ProviderRef, Authority: r.ProviderStat, ReceiptHash: r.ResponseHash, Reason: r.Reason}, "rejected_at_authority")
 	case adapter.ClassAcknowledged, adapter.ClassPending:
+		if f.Status == StatusAccepted {
+			return finish(Outcome{Kind: OutNone, Authority: r.ProviderStat, NextPoll: next}, "accepted_awaiting_delivery")
+		}
 		if f.Status == StatusPendingUnknown {
 			return finish(Outcome{Kind: OutSubmitted, AuthorityRef: r.ProviderRef, Authority: r.ProviderStat, ReceiptHash: r.ResponseHash, NextPoll: next}, "found_at_authority")
 		}
@@ -493,7 +524,9 @@ func (e *Engine) outcomeOf(r adapter.Result, from string, prof *ProfileRecord, o
 	case adapter.ClassAcknowledged, adapter.ClassPending:
 		o.Kind, o.NextPoll = OutSubmitted, e.nextPoll(f, cfg)
 	case adapter.ClassAccepted:
-		o.Kind = OutAccepted
+		o.Kind, o.NextPoll = OutAccepted, e.pollAfterAcceptance(f, cfg)
+	case adapter.ClassDelivered:
+		o.Kind = OutDelivered
 	case adapter.ClassRejected:
 		o.Kind, o.Reason = OutRejected, r.Reason
 	case adapter.ClassRateLimited:
@@ -529,6 +562,8 @@ func noteOf(o Outcome) string {
 		return "received_by_authority"
 	case OutAccepted:
 		return "accepted_by_authority"
+	case OutDelivered:
+		return "delivered"
 	case OutRejected:
 		return "rejected_by_authority"
 	case OutUnknown:
@@ -541,7 +576,9 @@ func noteOf(o Outcome) string {
 
 func isRefusal(err error) bool {
 	return errors.Is(err, adapter.ErrSchemaInvalid) || errors.Is(err, adapter.ErrRailUnsupported) ||
-		errors.Is(err, adapter.ErrCurrency) || errors.Is(err, adapter.ErrLimitExceeded) || errors.Is(err, adapter.ErrDocumentMissing)
+		errors.Is(err, adapter.ErrCurrency) || errors.Is(err, adapter.ErrLimitExceeded) || errors.Is(err, adapter.ErrDocumentMissing) ||
+		errors.Is(err, adapter.ErrInvoiceInvalid) || errors.Is(err, adapter.ErrRecipientInvalid) ||
+		errors.Is(err, adapter.ErrAttachmentProhibited) || errors.Is(err, adapter.ErrTotalMismatch)
 }
 
 func refusalName(err error) string {

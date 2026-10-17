@@ -213,9 +213,13 @@ func CanonicalHash(doc []byte) (string, error) {
 	if dec.More() {
 		return "", fmt.Errorf("document has trailing content")
 	}
-	b, err := json.Marshal(v)
-	if err != nil {
+	// sorted keys, no insignificant whitespace, and NO HTML escaping: the canonical form must not depend on a
+	// Go-specific habit of writing & < > as \u00XX, or an approver who hashes the plain text would never match
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
 		return "", err
 	}
-	return hashBytes(b), nil
+	return hashBytes(bytes.TrimRight(buf.Bytes(), "\n")), nil
 }
