@@ -39,6 +39,11 @@ type Policy struct {
 	AllowedPorts []int
 	// Resolver defaults to the system resolver.
 	Resolver Resolver
+	// PrivateNets are private ranges a deployment explicitly permits because a provider is reached over
+	// private connectivity (a dedicated link, a VPN, an on-premises gateway). It is an allowlist of exact
+	// ranges, never "all private": loopback, link-local (cloud metadata), unspecified and multicast
+	// addresses stay refused whatever is listed.
+	PrivateNets []*net.IPNet
 }
 
 // ambiguousIPForm matches hosts that some resolvers read as an IP address in a
@@ -82,7 +87,7 @@ func (p Policy) ValidateSyntax(raw string) (string, error) {
 		return "", fmt.Errorf("%w: destination has no host", ErrDenied)
 	}
 	if ip := net.ParseIP(host); ip != nil {
-		if !IsPublicIP(ip) {
+		if !p.Permitted(ip) {
 			return "", fmt.Errorf("%w: destination address is not publicly routable", ErrDenied)
 		}
 		return host, nil
@@ -152,7 +157,7 @@ func (p Policy) CheckDestination(ctx context.Context, raw string) (string, error
 		return "", fmt.Errorf("%w: destination host does not resolve", ErrDenied)
 	}
 	for _, a := range addrs {
-		if !IsPublicIP(a.IP) {
+		if !p.Permitted(a.IP) {
 			return "", fmt.Errorf("%w: destination host resolves to a non-public address", ErrDenied)
 		}
 	}
@@ -232,6 +237,48 @@ func HostMatchesSuffix(host string, suffixes []string) bool {
 			continue
 		}
 		if host == s || strings.HasSuffix(host, "."+s) {
+			return true
+		}
+	}
+	return false
+}
+
+// ParseCIDRs parses a list of CIDR strings for Policy.PrivateNets.
+func ParseCIDRs(list []string) ([]*net.IPNet, error) {
+	var out []*net.IPNet
+	for _, c := range list {
+		c = strings.TrimSpace(c)
+		if c == "" {
+			continue
+		}
+		_, n, err := net.ParseCIDR(c)
+		if err != nil {
+			return nil, fmt.Errorf("egress: bad CIDR %q", c)
+		}
+		out = append(out, n)
+	}
+	return out, nil
+}
+
+// Permitted reports whether the policy lets a connection go to ip: any publicly routable address, plus
+// addresses inside an explicitly listed private range. Loopback, link-local (which includes the cloud
+// metadata address), unspecified and multicast addresses are never permitted.
+func (p Policy) Permitted(ip net.IP) bool {
+	if IsPublicIP(ip) {
+		return true
+	}
+	if ip == nil {
+		return false
+	}
+	if v4 := ip.To4(); v4 != nil {
+		ip = v4
+	}
+	if ip.IsUnspecified() || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
+		ip.IsInterfaceLocalMulticast() || ip.IsMulticast() {
+		return false
+	}
+	for _, n := range p.PrivateNets {
+		if n.Contains(ip) {
 			return true
 		}
 	}

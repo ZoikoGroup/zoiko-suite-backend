@@ -44,7 +44,7 @@ func (p Policy) DialContext(d *net.Dialer) func(ctx context.Context, network, ad
 			}
 		}
 		for _, ip := range ips {
-			if !IsPublicIP(ip) {
+			if !p.Permitted(ip) {
 				return nil, fmt.Errorf("%w: destination resolves to a non-public address", ErrDenied)
 			}
 		}

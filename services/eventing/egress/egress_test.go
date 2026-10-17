@@ -218,3 +218,36 @@ func TestHostOfNeverReturnsPathOrQuery(t *testing.T) {
 		t.Fatal("a bad URL has no host")
 	}
 }
+
+func TestPrivateNetsAreAnExplicitAllowlist(t *testing.T) {
+	nets, err := ParseCIDRs([]string{"10.20.0.0/16", "127.0.0.0/8", "169.254.0.0/16", "0.0.0.0/0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := Policy{AllowHTTP: true, AllowedPorts: []int{80}, PrivateNets: nets}
+	for ip, want := range map[string]bool{
+		"10.20.1.1": true, "8.8.8.8": true,
+		"10.21.0.1": true, // inside the 0.0.0.0/0 entry, which is the operator's choice for private space
+		"127.0.0.1": false, "169.254.169.254": false, "0.0.0.0": false, "224.0.0.1": false, "::1": false,
+	} {
+		if got := p.Permitted(net.ParseIP(ip)); got != want {
+			t.Errorf("%s: got %v want %v", ip, got, want)
+		}
+	}
+	only, _ := ParseCIDRs([]string{"10.20.0.0/16"})
+	p = Policy{AllowHTTP: true, AllowedPorts: []int{80}, PrivateNets: only}
+	if _, err := p.ValidateSyntax("http://10.20.3.4/x"); err != nil {
+		t.Errorf("a listed private range: %v", err)
+	}
+	for _, bad := range []string{"http://10.21.3.4/x", "http://192.168.1.1/x", "http://127.0.0.1/x", "http://169.254.169.254/x"} {
+		if _, err := p.ValidateSyntax(bad); err == nil {
+			t.Errorf("%s must stay refused", bad)
+		}
+	}
+	if _, err := ParseCIDRs([]string{"nope"}); err == nil {
+		t.Error("a bad CIDR must be an error")
+	}
+	if (Policy{}).Permitted(net.ParseIP("10.20.3.4")) {
+		t.Error("with no PrivateNets nothing private is permitted")
+	}
+}

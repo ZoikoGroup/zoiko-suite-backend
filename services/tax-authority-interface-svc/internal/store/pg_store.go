@@ -14,7 +14,8 @@ import (
 )
 
 type PgStore struct {
-	pool *pgxpool.Pool
+	pool        *pgxpool.Pool
+	eventRegion string
 }
 
 func NewPgStore(pool *pgxpool.Pool) *PgStore {
@@ -61,11 +62,13 @@ func (p *PgStore) CreateInterface(ctx context.Context, tf *domain.TaxInterface) 
 	tf.TenantID = tenantID
 
 	query := `
-		INSERT INTO tax_interfaces (interface_id, tenant_id, legal_entity_id, jurisdiction, authority_name, protocol, status, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		INSERT INTO tax_interfaces (interface_id, tenant_id, legal_entity_id, jurisdiction, authority_name, protocol, status, created_at, updated_at,
+			provider_key, connector_id, certificate_ref, certificate_not_after, escalate_before_hours)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 	`
 	return p.withTenant(ctx, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, query, tf.InterfaceID, tf.TenantID, tf.LegalEntityID, tf.Jurisdiction, tf.AuthorityName, tf.Protocol, tf.Status, tf.CreatedAt, tf.UpdatedAt)
+		_, err := tx.Exec(ctx, query, tf.InterfaceID, tf.TenantID, tf.LegalEntityID, tf.Jurisdiction, tf.AuthorityName, tf.Protocol, tf.Status, tf.CreatedAt, tf.UpdatedAt,
+			tf.ProviderKey, tf.ConnectorID, tf.CertificateRef, tf.CertificateNotAfter, escalateHours(tf.EscalateBeforeHours))
 		return err
 	})
 }
@@ -81,7 +84,8 @@ func (p *PgStore) CreateInterface(ctx context.Context, tf *domain.TaxInterface) 
 // tenant's interface_id exists.
 func (p *PgStore) GetInterfaceByID(ctx context.Context, id string) (*domain.TaxInterface, error) {
 	query := `
-		SELECT interface_id, tenant_id, legal_entity_id, jurisdiction, authority_name, protocol, status, created_at, updated_at
+		SELECT interface_id, tenant_id, legal_entity_id, jurisdiction, authority_name, protocol, status, created_at, updated_at,
+		       provider_key, connector_id, certificate_ref, certificate_not_after, escalate_before_hours
 		FROM tax_interfaces
 		WHERE interface_id = $1
 		  AND tenant_id = $2
@@ -89,7 +93,8 @@ func (p *PgStore) GetInterfaceByID(ctx context.Context, id string) (*domain.TaxI
 	var tf domain.TaxInterface
 	err := p.withTenant(ctx, func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx, query, id, middleware.GetTenantID(ctx)).Scan(
-			&tf.InterfaceID, &tf.TenantID, &tf.LegalEntityID, &tf.Jurisdiction, &tf.AuthorityName, &tf.Protocol, &tf.Status, &tf.CreatedAt, &tf.UpdatedAt)
+			&tf.InterfaceID, &tf.TenantID, &tf.LegalEntityID, &tf.Jurisdiction, &tf.AuthorityName, &tf.Protocol, &tf.Status, &tf.CreatedAt, &tf.UpdatedAt,
+			&tf.ProviderKey, &tf.ConnectorID, &tf.CertificateRef, &tf.CertificateNotAfter, &tf.EscalateBeforeHours)
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -110,7 +115,8 @@ func (p *PgStore) GetInterfaceByID(ctx context.Context, id string) (*domain.TaxI
 // every tenant's tax-authority interfaces.
 func (p *PgStore) ListInterfaces(ctx context.Context, legalEntityID string) ([]domain.TaxInterface, error) {
 	query := `
-		SELECT interface_id, tenant_id, legal_entity_id, jurisdiction, authority_name, protocol, status, created_at, updated_at
+		SELECT interface_id, tenant_id, legal_entity_id, jurisdiction, authority_name, protocol, status, created_at, updated_at,
+		       provider_key, connector_id, certificate_ref, certificate_not_after, escalate_before_hours
 		FROM tax_interfaces
 		WHERE tenant_id = $2
 		  AND ($1 = '' OR legal_entity_id = $1)
@@ -126,7 +132,8 @@ func (p *PgStore) ListInterfaces(ctx context.Context, legalEntityID string) ([]d
 
 		for rows.Next() {
 			var tf domain.TaxInterface
-			if err := rows.Scan(&tf.InterfaceID, &tf.TenantID, &tf.LegalEntityID, &tf.Jurisdiction, &tf.AuthorityName, &tf.Protocol, &tf.Status, &tf.CreatedAt, &tf.UpdatedAt); err != nil {
+			if err := rows.Scan(&tf.InterfaceID, &tf.TenantID, &tf.LegalEntityID, &tf.Jurisdiction, &tf.AuthorityName, &tf.Protocol, &tf.Status, &tf.CreatedAt, &tf.UpdatedAt,
+				&tf.ProviderKey, &tf.ConnectorID, &tf.CertificateRef, &tf.CertificateNotAfter, &tf.EscalateBeforeHours); err != nil {
 				return err
 			}
 			res = append(res, tf)
@@ -223,4 +230,12 @@ func (p *PgStore) ListSubmissions(ctx context.Context, interfaceID string) ([]do
 		return nil, err
 	}
 	return res, nil
+}
+
+// escalateHours defaults the deadline-escalation window (hours before the filing deadline) when none is given.
+func escalateHours(h int) int {
+	if h <= 0 {
+		return 24
+	}
+	return h
 }
