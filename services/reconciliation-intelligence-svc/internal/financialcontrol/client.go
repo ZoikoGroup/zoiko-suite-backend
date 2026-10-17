@@ -20,8 +20,11 @@ import (
 	"net/url"
 	"time"
 
+	"github.com/go-chi/chi/v5/middleware"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 	"zoiko.io/reconciliation-intelligence-svc/internal/domain"
+	svcenvelope "zoiko.io/reconciliation-intelligence-svc/internal/envelope"
 )
 
 // ErrServiceUnavailable is returned for any transport error, non-200
@@ -74,8 +77,7 @@ func (c *Client) GetActiveAbsoluteTolerance(ctx context.Context, tenantID, princ
 	if err != nil {
 		return nil, ErrServiceUnavailable
 	}
-	req.Header.Set("X-Tenant-Id", tenantID)
-	req.Header.Set("X-Principal-Id", principalID)
+	setEnvelopeHeaders(ctx, req, tenantID, principalID, legalEntityID)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -106,4 +108,51 @@ func (c *Client) GetActiveAbsoluteTolerance(ctx context.Context, tenantID, princ
 		return nil, fmt.Errorf("%w: malformed absolute_tolerance %q", ErrServiceUnavailable, latest.AbsoluteTolerance)
 	}
 	return tolerance, nil
+}
+
+// setEnvelopeHeaders forwards the canonical service input envelope
+// (ZS-ARCH-SVC-001 §4). financial-control-svc requires tenant, actor,
+// request id, correlation id and source channel on every request, reads
+// included. Same pattern as internal/bankrec: the caller's values from the
+// envelope in context, an id minted only when none was supplied.
+func setEnvelopeHeaders(ctx context.Context, req *http.Request, tenantID, principalID, legalEntityID string) {
+	req.Header.Set(svcenvelope.HeaderTenantID, tenantID)
+	req.Header.Set(svcenvelope.HeaderActorSubjectID, principalID)
+	if legalEntityID != "" {
+		req.Header.Set(svcenvelope.HeaderLegalEntityID, legalEntityID)
+	}
+
+	requestID := middleware.GetReqID(ctx)
+	// Service-to-service. "system" is in the contract's accepted set; the
+	// caller's own channel replaces it when the envelope carries one.
+	sourceChannel := string(svcenvelope.ChannelSystem)
+	correlationID := ""
+	if env, ok := svcenvelope.FromContext(ctx); ok {
+		if env.RequestID != "" {
+			requestID = env.RequestID
+		}
+		if env.SourceChannel != "" {
+			sourceChannel = string(env.SourceChannel)
+		}
+		// An external channel (import, integration) obliges source_system;
+		// forwarding the channel without it would violate the contract.
+		if env.SourceSystem != "" {
+			req.Header.Set(svcenvelope.HeaderSourceSystem, env.SourceSystem)
+		}
+		if env.CorrelationID != "" {
+			correlationID = env.CorrelationID
+		}
+		if env.CausationID != "" {
+			req.Header.Set(svcenvelope.HeaderCausationID, env.CausationID)
+		}
+	}
+	if requestID == "" {
+		requestID = uuid.NewString()
+	}
+	if correlationID == "" {
+		correlationID = uuid.NewString()
+	}
+	req.Header.Set(svcenvelope.HeaderRequestID, requestID)
+	req.Header.Set(svcenvelope.HeaderCorrelationID, correlationID)
+	req.Header.Set(svcenvelope.HeaderSourceChannel, sourceChannel)
 }

@@ -9,7 +9,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-chi/chi/v5/middleware"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
+
+	svcenvelope "zoiko.io/reconciliation-intelligence-svc/internal/envelope"
 )
 
 // ErrAuthzServiceUnavailable is returned when authorization-svc cannot be
@@ -20,6 +24,12 @@ var ErrAuthzServiceUnavailable = errors.New("authorization-svc unavailable")
 // ErrAuthorizationDenied is returned when authorization-svc explicitly
 // denies the requested action.
 var ErrAuthorizationDenied = errors.New("authorization denied")
+
+// ErrTenantMissing is returned when no verified tenant was supplied. The
+// check is refused rather than made under a made-up tenant (b75655a2): a
+// decision evaluated against a tenant the caller was never verified to
+// belong to could be GRANTED.
+var ErrTenantMissing = errors.New("tenant is required for an authorization check")
 
 // decisionCacheTTL bounds how long a GRANTED/DENIED decision from
 // authorization-svc may be reused locally before it is asked again.
@@ -95,17 +105,23 @@ type authorizeResponse struct {
 }
 
 // CheckAllowed asks authorization-svc whether principalID may perform
-// actionType within legalEntityID. It fails closed: any transport error,
-// non-200 status, or undecodable body is treated as
+// actionType within legalEntityID, in tenantID. It fails closed: any
+// transport error, non-200 status, or undecodable body is treated as
 // ErrAuthzServiceUnavailable, never as an implicit grant.
-func (c *Client) CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error {
-	key := principalID + "|" + legalEntityID + "|" + actionType
+func (c *Client) CheckAllowed(ctx context.Context, tenantID, principalID, legalEntityID, actionType string) error {
+	if tenantID == "" {
+		return ErrTenantMissing
+	}
+	// The tenant is part of the key: the same principal, entity and action
+	// in two tenants are two different questions and must never share a
+	// cached decision.
+	key := tenantID + "|" + principalID + "|" + legalEntityID + "|" + actionType
 
 	if decision, hit := c.lookupCache(key); hit {
 		return decision
 	}
 
-	err := c.checkAllowedLive(ctx, principalID, legalEntityID, actionType)
+	err := c.checkAllowedLive(ctx, tenantID, principalID, legalEntityID, actionType)
 
 	// Cache the decision itself (GRANTED or DENIED), never an unavailable
 	// outcome — see the doc comment on decisionCacheTTL.
@@ -155,7 +171,7 @@ func (c *Client) storeCache(key string, decision error) {
 }
 
 // checkAllowedLive is the real, uncached call to authorization-svc.
-func (c *Client) checkAllowedLive(ctx context.Context, principalID, legalEntityID, actionType string) error {
+func (c *Client) checkAllowedLive(ctx context.Context, tenantID, principalID, legalEntityID, actionType string) error {
 	body, err := json.Marshal(authorizeRequest{
 		PrincipalID:   principalID,
 		LegalEntityID: legalEntityID,
@@ -170,6 +186,7 @@ func (c *Client) checkAllowedLive(ctx context.Context, principalID, legalEntityI
 		return ErrAuthzServiceUnavailable
 	}
 	req.Header.Set("Content-Type", "application/json")
+	setEnvelopeHeaders(ctx, req, tenantID, principalID, legalEntityID)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -192,4 +209,62 @@ func (c *Client) checkAllowedLive(ctx context.Context, principalID, legalEntityI
 		return ErrAuthorizationDenied
 	}
 	return nil
+}
+
+// setEnvelopeHeaders forwards the canonical service input envelope
+// (ZS-ARCH-SVC-001 §4) that authorization-svc validates: tenant, actor,
+// request id, correlation id and source channel are mandatory on every
+// request, and the legal entity names what the decision is about. Without
+// them each check was admitted only as a reported contract violation, and its
+// access_decision_log row could not be traced to the request that caused it.
+//
+// Same pattern as internal/bankrec (and financial-close-svc's
+// checkAllowedLive, 7abd0f8a / d6c2cc38): the values are the CALLER's, taken
+// from the envelope the middleware parsed into this request's context; an id
+// is minted only when neither the request-id middleware nor the envelope
+// supplied one.
+//
+// No Idempotency-Key: authorization-svc deliberately does not treat
+// /v1/authorize as a material write (its handler.MaterialWrite) — two
+// identical questions must produce two decision-log entries.
+func setEnvelopeHeaders(ctx context.Context, req *http.Request, tenantID, principalID, legalEntityID string) {
+	req.Header.Set(svcenvelope.HeaderTenantID, tenantID)
+	req.Header.Set(svcenvelope.HeaderActorSubjectID, principalID)
+	if legalEntityID != "" {
+		req.Header.Set(svcenvelope.HeaderLegalEntityID, legalEntityID)
+	}
+
+	requestID := middleware.GetReqID(ctx)
+	// Service-to-service. "system" is in the contract's accepted set; the
+	// caller's own channel replaces it when the envelope carries one.
+	sourceChannel := string(svcenvelope.ChannelSystem)
+	correlationID := ""
+	if env, ok := svcenvelope.FromContext(ctx); ok {
+		if env.RequestID != "" {
+			requestID = env.RequestID
+		}
+		if env.SourceChannel != "" {
+			sourceChannel = string(env.SourceChannel)
+		}
+		// An external channel (import, integration) obliges source_system;
+		// forwarding the channel without it would violate the contract.
+		if env.SourceSystem != "" {
+			req.Header.Set(svcenvelope.HeaderSourceSystem, env.SourceSystem)
+		}
+		if env.CorrelationID != "" {
+			correlationID = env.CorrelationID
+		}
+		if env.CausationID != "" {
+			req.Header.Set(svcenvelope.HeaderCausationID, env.CausationID)
+		}
+	}
+	if requestID == "" {
+		requestID = uuid.NewString()
+	}
+	if correlationID == "" {
+		correlationID = uuid.NewString()
+	}
+	req.Header.Set(svcenvelope.HeaderRequestID, requestID)
+	req.Header.Set(svcenvelope.HeaderCorrelationID, correlationID)
+	req.Header.Set(svcenvelope.HeaderSourceChannel, sourceChannel)
 }

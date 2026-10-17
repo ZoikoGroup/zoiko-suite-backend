@@ -10,6 +10,8 @@ import (
 	"testing"
 
 	"go.uber.org/zap"
+
+	svcenvelope "zoiko.io/reconciliation-intelligence-svc/internal/envelope"
 )
 
 func TestGetActiveAbsoluteTolerance_HappyPath_ReturnsLatestVersion(t *testing.T) {
@@ -73,6 +75,71 @@ func TestGetActiveAbsoluteTolerance_NegativeTolerance_FailsClosed(t *testing.T) 
 	_, err := c.GetActiveAbsoluteTolerance(context.Background(), "tenant-1", "principal-1", "le-1", "SOME_METRIC")
 	if !errors.Is(err, ErrServiceUnavailable) {
 		t.Fatalf("expected ErrServiceUnavailable on a negative tolerance, got %v", err)
+	}
+}
+
+// The canonical envelope is forwarded with the CALLER's values —
+// financial-control-svc requires request id, correlation id and source
+// channel on reads too. Same check as internal/bankrec's.
+func TestEnvelopeForwarded_CallerValues(t *testing.T) {
+	var got http.Header
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"items": []map[string]any{{"tolerance_version": 1, "absolute_tolerance": "10"}},
+		})
+	}))
+	defer srv.Close()
+
+	ctx := svcenvelope.WithEnvelope(context.Background(), svcenvelope.Envelope{
+		RequestID: "req-caller", CorrelationID: "corr-caller", CausationID: "cause-caller",
+		SourceChannel: svcenvelope.ChannelIntegration, SourceSystem: "erp-x",
+	})
+	c := NewClient(srv.URL, zap.NewNop())
+	if _, err := c.GetActiveAbsoluteTolerance(ctx, "tenant-1", "principal-1", "le-1", "SOME_METRIC"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := map[string]string{
+		"X-Tenant-Id":       "tenant-1",
+		"X-Principal-Id":    "principal-1",
+		"X-Legal-Entity-Id": "le-1",
+		"X-Request-Id":      "req-caller",
+		"X-Correlation-ID":  "corr-caller",
+		"X-Causation-Id":    "cause-caller",
+		"X-Source-Channel":  "integration",
+		"X-Source-System":   "erp-x",
+	}
+	for h, v := range want {
+		if got.Get(h) != v {
+			t.Errorf("%s = %q, want %q", h, got.Get(h), v)
+		}
+	}
+}
+
+// With no envelope in context, ids are minted and the channel is "system".
+func TestEnvelopeForwarded_MintsWhenAbsent(t *testing.T) {
+	var got http.Header
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"items": []map[string]any{{"tolerance_version": 1, "absolute_tolerance": "10"}},
+		})
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, zap.NewNop())
+	if _, err := c.GetActiveAbsoluteTolerance(context.Background(), "tenant-1", "principal-1", "le-1", "SOME_METRIC"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, h := range []string{"X-Tenant-Id", "X-Principal-Id", "X-Request-Id", "X-Correlation-ID"} {
+		if got.Get(h) == "" {
+			t.Errorf("%s not sent", h)
+		}
+	}
+	if got.Get("X-Source-Channel") != "system" {
+		t.Errorf("X-Source-Channel = %q, want system", got.Get("X-Source-Channel"))
 	}
 }
 
