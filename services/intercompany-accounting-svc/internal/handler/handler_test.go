@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"testing"
 	"time"
 
@@ -37,6 +39,9 @@ type stubStoreReal struct {
 	createdEvents []eventRecord
 	matchEvents   []eventRecord
 
+	// updateMatchErr, when set, is returned by UpdateMatch without writing.
+	updateMatchErr error
+
 	// control-population fake
 	cpPage  *domain.ControlPopulationPage
 	cpErr   error
@@ -65,7 +70,11 @@ func (s *stubStoreReal) GetEntry(_ context.Context, id string) (*domain.Intercom
 	if !ok {
 		return nil, domain.ErrEntryNotFound
 	}
-	return entry, nil
+	// A copy, like a real read: the handler mutates what it gets back
+	// before calling UpdateMatch, and that must not leak into the stored
+	// row or the status guard below would see the new status, not the old.
+	cp := *entry
+	return &cp, nil
 }
 
 func (s *stubStoreReal) ListEntries(_ context.Context, sourceEntityID, targetEntityID string) ([]domain.IntercompanyEntry, error) {
@@ -83,9 +92,15 @@ func (s *stubStoreReal) ListEntries(_ context.Context, sourceEntityID, targetEnt
 }
 
 func (s *stubStoreReal) UpdateMatch(_ context.Context, entry *domain.IntercompanyEntry, actorID, correlationID string) error {
+	if s.updateMatchErr != nil {
+		return s.updateMatchErr
+	}
 	existing, ok := s.entries[entry.IntercompanyEntryID]
 	if !ok {
 		return domain.ErrEntryNotFound
+	}
+	if !slices.Contains(domain.MatchableStatuses, existing.MatchStatus) {
+		return domain.ErrInvalidPairTransition
 	}
 	existing.TargetJournalID = entry.TargetJournalID
 	existing.MatchStatus = entry.MatchStatus
@@ -370,5 +385,74 @@ func TestMatchEntry_HappyPath(t *testing.T) {
 	}
 	if s.entries["entry-1"].MatchStatus != "MATCHED" {
 		t.Errorf("expected store match_status to be MATCHED, got %q", s.entries["entry-1"].MatchStatus)
+	}
+}
+
+// TestMatchEntry_MismatchNotRecorded_Is503 proves a MISMATCH outcome is only
+// reported once the store has recorded it. Before, every mismatch branch
+// discarded UpdateMatch's error and answered 422 MISMATCH regardless, so a
+// failed write left the pair UNMATCHED with no mismatch event while the
+// caller was told otherwise.
+func TestMatchEntry_MismatchNotRecorded_Is503(t *testing.T) {
+	s := newStubStoreReal()
+	s.entries["entry-1"] = &domain.IntercompanyEntry{
+		IntercompanyEntryID: "entry-1",
+		TenantID:            "tenant-abc",
+		SourceLegalEntityID: "le-us",
+		TargetLegalEntityID: "le-uk",
+		Amount:              5000.0,
+		MatchStatus:         domain.MatchStatusUnmatched,
+	}
+	s.updateMatchErr = errors.New("connection reset")
+	leg := &stubLedger{journal: &ledger.JournalDetail{
+		JournalID: "target-j-001", LegalEntityID: "le-uk", Status: "FINALIZED",
+		Lines: []ledger.JournalLine{{AccountCode: "1000", DebitAmount: 4000.0}}, // amount mismatch
+	}}
+	r := newRouter(s, &stubAuthZ{}, leg)
+	rr := doReq(r, http.MethodPost, "/v1/intercompany/entries/entry-1/match", map[string]any{
+		"target_journal_id": "target-j-001",
+	}, "principal-1")
+
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 got %d: %s", rr.Code, rr.Body.String())
+	}
+	if s.entries["entry-1"].MatchStatus != domain.MatchStatusUnmatched {
+		t.Errorf("expected the pair to stay UNMATCHED, got %q", s.entries["entry-1"].MatchStatus)
+	}
+}
+
+// TestMatchEntry_StatusMovedSinceRead_Is422 proves a pair that left the
+// matchable statuses between the handler's read and its write (e.g. disputed
+// by a concurrent request) is refused, not overwritten.
+func TestMatchEntry_StatusMovedSinceRead_Is422(t *testing.T) {
+	s := newStubStoreReal()
+	s.entries["entry-1"] = &domain.IntercompanyEntry{
+		IntercompanyEntryID: "entry-1",
+		TenantID:            "tenant-abc",
+		SourceLegalEntityID: "le-us",
+		TargetLegalEntityID: "le-uk",
+		Amount:              5000.0,
+		MatchStatus:         domain.MatchStatusMismatch,
+	}
+	s.updateMatchErr = domain.ErrInvalidPairTransition
+	leg := &stubLedger{journal: &ledger.JournalDetail{
+		JournalID: "target-j-001", LegalEntityID: "le-uk", Status: "FINALIZED",
+		Lines: []ledger.JournalLine{{AccountCode: "1000", DebitAmount: 5000.0}},
+	}}
+	r := newRouter(s, &stubAuthZ{}, leg)
+	rr := doReq(r, http.MethodPost, "/v1/intercompany/entries/entry-1/match", map[string]any{
+		"target_journal_id": "target-j-001",
+	}, "principal-1")
+
+	if rr.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 got %d: %s", rr.Code, rr.Body.String())
+	}
+	var body map[string]string
+	_ = json.NewDecoder(rr.Body).Decode(&body)
+	if body["error_code"] != "invalid_transition" {
+		t.Errorf("expected error_code invalid_transition, got %q", body["error_code"])
+	}
+	if len(s.matchEvents) != 0 {
+		t.Errorf("expected no match event, got %d", len(s.matchEvents))
 	}
 }

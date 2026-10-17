@@ -342,6 +342,11 @@ func (s *PgStore) ListEntries(ctx context.Context, sourceEntityID, targetEntityI
 // the target state the caller wants persisted (TargetJournalID, MatchStatus,
 // MismatchReason) — see handler.go's MatchEntry, which mutates its locally
 // fetched entry before calling this.
+//
+// Guarded on the CURRENT status being one of domain.MatchableStatuses, the
+// same compare-and-set the other lifecycle methods use: without it, a pair
+// disputed or matched by another request after the handler read it would be
+// silently overwritten. Returns domain.ErrInvalidPairTransition in that case.
 func (s *PgStore) UpdateMatch(ctx context.Context, entry *domain.IntercompanyEntry, actorID, correlationID string) error {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
@@ -353,13 +358,22 @@ func (s *PgStore) UpdateMatch(ctx context.Context, entry *domain.IntercompanyEnt
 		res, err := tx.Exec(ctx, `
 			UPDATE intercompany_entries
 			SET target_journal_id = $1, match_status = $2, mismatch_reason = $3, updated_at = $4
-			WHERE intercompany_entry_id = $5 AND tenant_id = $6
-		`, entry.TargetJournalID, entry.MatchStatus, entry.MismatchReason, now, entry.IntercompanyEntryID, tenantID)
+			WHERE intercompany_entry_id = $5 AND tenant_id = $6 AND match_status = ANY($7)
+		`, entry.TargetJournalID, entry.MatchStatus, entry.MismatchReason, now, entry.IntercompanyEntryID, tenantID, domain.MatchableStatuses)
 		if err != nil {
 			return err
 		}
 		if res.RowsAffected() == 0 {
-			return domain.ErrEntryNotFound
+			var exists bool
+			if err := tx.QueryRow(ctx, `
+				SELECT EXISTS (SELECT 1 FROM intercompany_entries WHERE intercompany_entry_id = $1 AND tenant_id = $2)
+			`, entry.IntercompanyEntryID, tenantID).Scan(&exists); err != nil {
+				return err
+			}
+			if !exists {
+				return domain.ErrEntryNotFound
+			}
+			return domain.ErrInvalidPairTransition
 		}
 		entry.TenantID = tenantID
 		entry.UpdatedAt = now

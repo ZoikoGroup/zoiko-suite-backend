@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"slices"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -277,15 +278,10 @@ func (h *Handler) MatchEntry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// MatchIntercompany is only meaningful from OPEN ("UNMATCHED") or
-	// AWAITING_COUNTERPARTY — a pair already MATCHED, under DISPUTE, or
-	// RESOLVED has left the part of the state model matching belongs to.
-	switch entry.MatchStatus {
-	case domain.MatchStatusUnmatched, domain.MatchStatusAwaitingCounterparty, domain.MatchStatusMismatch:
-		// MISMATCH is also re-matchable: a caller correcting a prior
-		// mismatch (e.g. supplying the right target_journal_id this time)
-		// re-runs MatchIntercompany rather than needing a separate command.
-	default:
+	// MatchIntercompany is only meaningful from the statuses in
+	// domain.MatchableStatuses. This early check gives a clean 422 without
+	// calling general-ledger-svc; the store re-checks it in the UPDATE.
+	if !slices.Contains(domain.MatchableStatuses, entry.MatchStatus) {
 		writeError(w, http.StatusUnprocessableEntity, "entry_already_matched", string(domain.ErrEntryAlreadyMatched))
 		return
 	}
@@ -306,15 +302,7 @@ func (h *Handler) MatchEntry(w http.ResponseWriter, r *http.Request) {
 		// caller almost certainly named the wrong journal_id, and retrying
 		// the identical request will fail identically.
 		reason := domain.ErrCounterpartyJournalMissing.Error()
-		entry.TargetJournalID = &req.TargetJournalID
-		entry.MatchStatus = domain.MatchStatusMismatch
-		entry.MismatchReason = &reason
-		_ = h.store.UpdateMatch(r.Context(), entry, principalID, correlationID)
-		writeJSON(w, http.StatusUnprocessableEntity, domain.MatchEntryResponse{
-			IntercompanyEntryID: id,
-			MatchStatus:         domain.MatchStatusMismatch,
-			MismatchReason:      &reason,
-		})
+		h.recordMismatch(w, r, entry, req.TargetJournalID, reason, principalID, correlationID)
 		return
 	}
 	if err != nil {
@@ -326,30 +314,14 @@ func (h *Handler) MatchEntry(w http.ResponseWriter, r *http.Request) {
 	// Validation 1: Target journal entity must match entry target legal entity
 	if journal.LegalEntityID != entry.TargetLegalEntityID {
 		reason := fmt.Sprintf("target_journal_entity_mismatch: journal entity %s != target entity %s", journal.LegalEntityID, entry.TargetLegalEntityID)
-		entry.TargetJournalID = &req.TargetJournalID
-		entry.MatchStatus = "MISMATCH"
-		entry.MismatchReason = &reason
-		_ = h.store.UpdateMatch(r.Context(), entry, principalID, correlationID)
-		writeJSON(w, http.StatusUnprocessableEntity, domain.MatchEntryResponse{
-			IntercompanyEntryID: id,
-			MatchStatus:         "MISMATCH",
-			MismatchReason:      &reason,
-		})
+		h.recordMismatch(w, r, entry, req.TargetJournalID, reason, principalID, correlationID)
 		return
 	}
 
 	// Validation 2: Journal status must be FINALIZED
 	if journal.Status != "FINALIZED" {
 		reason := fmt.Sprintf("target_journal_not_finalized: status is %s", journal.Status)
-		entry.TargetJournalID = &req.TargetJournalID
-		entry.MatchStatus = "MISMATCH"
-		entry.MismatchReason = &reason
-		_ = h.store.UpdateMatch(r.Context(), entry, principalID, correlationID)
-		writeJSON(w, http.StatusUnprocessableEntity, domain.MatchEntryResponse{
-			IntercompanyEntryID: id,
-			MatchStatus:         "MISMATCH",
-			MismatchReason:      &reason,
-		})
+		h.recordMismatch(w, r, entry, req.TargetJournalID, reason, principalID, correlationID)
 		return
 	}
 
@@ -366,15 +338,7 @@ func (h *Handler) MatchEntry(w http.ResponseWriter, r *http.Request) {
 
 	if math.Abs(journalAmount-entry.Amount) > 0.001 {
 		reason := fmt.Sprintf("amount_mismatch: intercompany amount %f != journal amount %f", entry.Amount, journalAmount)
-		entry.TargetJournalID = &req.TargetJournalID
-		entry.MatchStatus = "MISMATCH"
-		entry.MismatchReason = &reason
-		_ = h.store.UpdateMatch(r.Context(), entry, principalID, correlationID)
-		writeJSON(w, http.StatusUnprocessableEntity, domain.MatchEntryResponse{
-			IntercompanyEntryID: id,
-			MatchStatus:         "MISMATCH",
-			MismatchReason:      &reason,
-		})
+		h.recordMismatch(w, r, entry, req.TargetJournalID, reason, principalID, correlationID)
 		return
 	}
 
@@ -394,15 +358,7 @@ func (h *Handler) MatchEntry(w http.ResponseWriter, r *http.Request) {
 		}
 		if !entityregistry.SharesOpenGroupRelationship(sourceHierarchies, targetHierarchies, entry.SourceLegalEntityID, entry.TargetLegalEntityID, time.Now().UTC()) {
 			reason := domain.ErrGroupRelationshipLost.Error()
-			entry.TargetJournalID = &req.TargetJournalID
-			entry.MatchStatus = domain.MatchStatusMismatch
-			entry.MismatchReason = &reason
-			_ = h.store.UpdateMatch(r.Context(), entry, principalID, correlationID)
-			writeJSON(w, http.StatusUnprocessableEntity, domain.MatchEntryResponse{
-				IntercompanyEntryID: id,
-				MatchStatus:         domain.MatchStatusMismatch,
-				MismatchReason:      &reason,
-			})
+			h.recordMismatch(w, r, entry, req.TargetJournalID, reason, principalID, correlationID)
 			return
 		}
 	}
@@ -412,8 +368,7 @@ func (h *Handler) MatchEntry(w http.ResponseWriter, r *http.Request) {
 	entry.MatchStatus = "MATCHED"
 	entry.MismatchReason = nil
 	if err := h.store.UpdateMatch(r.Context(), entry, principalID, correlationID); err != nil {
-		h.log.Error("failed to update match status in store", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		h.writeUpdateMatchErr(w, err)
 		return
 	}
 
@@ -421,6 +376,37 @@ func (h *Handler) MatchEntry(w http.ResponseWriter, r *http.Request) {
 		IntercompanyEntryID: id,
 		MatchStatus:         "MATCHED",
 	})
+}
+
+// recordMismatch persists a MISMATCH outcome and reports it. The response
+// claims MISMATCH only once the store has recorded it (and its event): a
+// failed write is a 503 the caller can retry, and a pair whose status moved
+// on since it was read is a 422, never overwritten.
+func (h *Handler) recordMismatch(w http.ResponseWriter, r *http.Request, entry *domain.IntercompanyEntry, targetJournalID, reason, principalID, correlationID string) {
+	entry.TargetJournalID = &targetJournalID
+	entry.MatchStatus = domain.MatchStatusMismatch
+	entry.MismatchReason = &reason
+	if err := h.store.UpdateMatch(r.Context(), entry, principalID, correlationID); err != nil {
+		h.writeUpdateMatchErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusUnprocessableEntity, domain.MatchEntryResponse{
+		IntercompanyEntryID: entry.IntercompanyEntryID,
+		MatchStatus:         domain.MatchStatusMismatch,
+		MismatchReason:      &reason,
+	})
+}
+
+func (h *Handler) writeUpdateMatchErr(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, domain.ErrInvalidPairTransition):
+		writeError(w, http.StatusUnprocessableEntity, "invalid_transition", err.Error())
+	case errors.Is(err, domain.ErrEntryNotFound):
+		writeError(w, http.StatusNotFound, "entry_not_found", "")
+	default:
+		h.log.Error("failed to update match status in store", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+	}
 }
 
 // ── POST /v1/intercompany/entries/{id}/acknowledge ───────────────────────────────
