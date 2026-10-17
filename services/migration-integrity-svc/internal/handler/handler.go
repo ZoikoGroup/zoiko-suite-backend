@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -180,9 +181,18 @@ func (h *Handler) RemediateEntry(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req domain.RemediateRequest
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.errJSON(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if err := req.Validate(); err != nil {
+		h.errJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
-	entry, err := h.store.RemediateEntry(r.Context(), tenantID, jobID, entryID, req.Notes, principalID, r.Header.Get("X-Correlation-ID"))
+	entry, err := h.store.RemediateEntry(r.Context(), tenantID, jobID, entryID,
+		strings.TrimSpace(req.RemediationReason), strings.TrimSpace(req.RemediationEvidenceRef),
+		principalID, r.Header.Get("X-Correlation-ID"))
 	if err != nil {
 		h.errJSON(w, http.StatusNotFound, err.Error())
 		return

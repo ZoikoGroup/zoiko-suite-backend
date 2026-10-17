@@ -139,10 +139,13 @@ func TestValidateMigrationAndLifecycle(t *testing.T) {
 		t.Fatal("expected at least 1 job in list")
 	}
 
-	// 4. Remediate an Audit Entry
+	// 4. Remediate an Audit Entry — with the required evidence
 	if len(job.AuditEntries) > 0 {
 		entryID := job.AuditEntries[0].ID
-		remBody, _ := json.Marshal(domain.RemediateRequest{Notes: "Corrected in source system"})
+		remBody, _ := json.Marshal(domain.RemediateRequest{
+			RemediationReason:      "corrected in source system before reload",
+			RemediationEvidenceRef: "extract-run-2026-10-17/rec-002",
+		})
 		remReq := httptest.NewRequest(http.MethodPost, "/v1/migrations/"+job.ID+"/audit/"+entryID+"/remediate", bytes.NewBuffer(remBody))
 		withEnvelope(remReq)
 		remReq.Header.Set("X-Tenant-ID", "tenant-mig-55")
@@ -157,6 +160,18 @@ func TestValidateMigrationAndLifecycle(t *testing.T) {
 		_ = json.Unmarshal(remRec.Body.Bytes(), &remEntry)
 		if !remEntry.IsRemediated {
 			t.Fatal("expected is_remediated = true after remediation")
+		}
+		if remEntry.RemediationReason != "corrected in source system before reload" {
+			t.Fatalf("expected remediation_reason echoed, got %q", remEntry.RemediationReason)
+		}
+		if remEntry.RemediationEvidenceRef != "extract-run-2026-10-17/rec-002" {
+			t.Fatalf("expected remediation_evidence_ref echoed, got %q", remEntry.RemediationEvidenceRef)
+		}
+		if remEntry.RemediatedBy != "user-1" {
+			t.Fatalf("expected remediated_by = user-1, got %q", remEntry.RemediatedBy)
+		}
+		if remEntry.RemediatedAt == nil {
+			t.Fatal("expected remediated_at to be set")
 		}
 	}
 
