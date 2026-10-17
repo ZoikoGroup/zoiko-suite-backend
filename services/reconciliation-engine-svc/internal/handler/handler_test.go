@@ -43,13 +43,15 @@ func (a *recordingAuthz) CheckAllowed(_ context.Context, _, legalEntityID, actio
 // other call panics through the nil embedded interface.
 type fakeStore struct {
 	store.Store
-	def         *domain.ReconciliationDefinition
-	run         *domain.ReconciliationRun
-	startCalls  int
-	failures    []domain.RunFailure
-	transitions []domain.TransitionExceptionRequest
-	approvals   []string
-	certifiers  []string
+	def            *domain.ReconciliationDefinition
+	run            *domain.ReconciliationRun
+	version        *domain.RuleVersion
+	startCalls     int
+	reperformCalls int
+	failures       []domain.RunFailure
+	transitions    []domain.TransitionExceptionRequest
+	approvals      []string
+	certifiers     []string
 }
 
 func (s *fakeStore) Certify(_ context.Context, _, runID, actor string, _ domain.IdempotencyClaim) (*domain.Certification, error) {
@@ -102,6 +104,19 @@ func (s *fakeStore) RecordFailedRun(_ context.Context, _ string, _ domain.StartR
 	code := f.Code
 	return &domain.ReconciliationRun{RunID: "rcr_failed", LegalEntityID: s.def.LegalEntityID, Status: domain.RunFailed,
 		ResultState: domain.ResultIndeterminate, CertificationState: domain.CertUncertified, FailureCode: &code}, nil
+}
+
+func (s *fakeStore) GetRuleVersion(context.Context, string, string, int64) (*domain.RuleVersion, error) {
+	if s.version == nil {
+		return nil, domain.ErrRuleVersionNotFound
+	}
+	return s.version, nil
+}
+
+func (s *fakeStore) Reperform(_ context.Context, _, _ string, _ []domain.FrozenPopulation, _ string,
+	_ domain.IdempotencyClaim) (*domain.ReconciliationRun, error) {
+	s.reperformCalls++
+	return &domain.ReconciliationRun{RunID: "rcr_1"}, nil
 }
 
 type failingFetcher struct {
@@ -215,6 +230,31 @@ func TestStartRun_RequestErrorRecordsNothing(t *testing.T) {
 	w := serve(h, http.MethodPost, "/v1/reconciliation/runs", `{"definition_id":"rdf_1","period_id":"2026-09"}`)
 	if w.Code != http.StatusBadRequest || st.startCalls != 0 || len(st.failures) != 0 {
 		t.Fatalf("missing scope: %d %s, starts %d, failures %v", w.Code, w.Body, st.startCalls, st.failures)
+	}
+}
+
+// A8: Reperform re-reads the run's populations through the same path StartRun
+// uses. A re-read that cannot be proven complete and reproducible freezes
+// nothing and fails with StartRun's classification (502 unreachable, 422
+// inconsistent); the run itself is left exactly as it was — unlike StartRun,
+// there is no attempt-record to write, because the run already exists.
+func TestReperform_UnprovenSourceChangeIsRefused(t *testing.T) {
+	run := &domain.ReconciliationRun{RunID: "rcr_1", LegalEntityID: entityA, DefinitionID: "rdf_1", DefinitionVersion: 3,
+		Status: domain.RunExceptionsOpen, Tolerance: &domain.TolerancePolicy{}, RulesSHA256: strings.Repeat("a", 64)}
+	for name, tc := range map[string]struct {
+		err  error
+		code int
+	}{
+		"source down":      {source.ErrSourceUnavailable, http.StatusBadGateway},
+		"no declared tots": {source.ErrSourceInconsistent, http.StatusUnprocessableEntity},
+	} {
+		st := &fakeStore{run: run, version: &domain.RuleVersion{RuleVersion: 3,
+			Rules: domain.RuleSet{Populations: definition().Populations, AmountScale: 2}}}
+		h := NewHandler(st, &recordingAuthz{}, failingFetcher{err: tc.err}, zap.NewNop())
+		w := serve(h, http.MethodPost, "/v1/reconciliation/runs/rcr_1:reperform", "")
+		if w.Code != tc.code || st.reperformCalls != 0 || !strings.Contains(w.Body.String(), `"failure_code"`) {
+			t.Fatalf("%s: %d %s, store reperform calls %d", name, w.Code, w.Body, st.reperformCalls)
+		}
 	}
 }
 

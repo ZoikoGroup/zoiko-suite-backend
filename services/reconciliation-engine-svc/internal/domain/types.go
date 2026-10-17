@@ -206,16 +206,20 @@ type ReconciliationRun struct {
 
 // PopulationSnapshot is one frozen side of a run's comparison (e.g.
 // "Ledger" vs "Bank"), read from its owning service through the control
-// population contract. Immutable from the moment StartRun creates it. It pins
-// what ZS-CONTROL-001 names for a snapshot (side, source, query/spec,
-// watermark, row count, per-currency control totals, hash) plus the source's
-// own declared totals it was verified against. The optional fields are empty
-// only on snapshots frozen before migration 000004.
+// population contract. Immutable from the moment StartRun creates it (or a
+// reperformance freezes the next generation of it). It pins what
+// ZS-CONTROL-001 names for a snapshot (side, source, query/spec, watermark,
+// row count, per-currency control totals, hash) plus the source's own declared
+// totals it was verified against. Generation 1 is the run's initial freeze;
+// each reperformance adds the next generation and leaves the earlier ones
+// standing (A8). The optional fields are empty only on snapshots frozen before
+// migration 000004.
 type PopulationSnapshot struct {
 	SnapshotID      string `json:"snapshot_id"`
 	TenantID        string `json:"tenant_id"`
 	RunID           string `json:"run_id"`
 	Side            string `json:"side"`
+	Generation      int    `json:"generation"`
 	SourceSystem    string `json:"source_system"`
 	SpecRef         string `json:"spec_ref,omitempty"`
 	SourceWatermark string `json:"source_watermark,omitempty"`
