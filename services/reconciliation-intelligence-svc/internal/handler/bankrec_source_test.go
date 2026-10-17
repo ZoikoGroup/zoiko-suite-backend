@@ -150,3 +150,38 @@ func TestAnalyze_SourceFailures_RefusedNoJob(t *testing.T) {
 		})
 	}
 }
+
+// Two UNMATCHED lines that are one bank entry counted twice: the copy gets a
+// DUPLICATE_ENTRY suggestion naming both lines; the entry itself keeps its
+// own suggestion. Every line is still processed and suggested on once.
+func TestAnalyze_DuplicateEntry_EndToEnd(t *testing.T) {
+	const runDup = "99999999-0000-4000-8000-00000000d0d0"
+	const orig, copyLine = "0a000000-0000-4000-8000-000000000001", "0b000000-0000-4000-8000-000000000002"
+	router := newTestRouter(t, deps{runs: map[string]fakeRun{
+		runDup: {
+			LegalEntityID: "le-1",
+			Lines:         [][2]string{{copyLine, "120.00"}, {orig, "120"}},
+			Refs:          map[string]string{copyLine: "BACS 4471-1", orig: "BACS 4471"},
+		},
+	}})
+	rec := postAnalyze(router, "le-1", runDup)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var job domain.ReconciliationJob
+	_ = json.Unmarshal(rec.Body.Bytes(), &job)
+	if job.TotalProcessedCount != 2 || len(job.UnmatchedItems) != 2 {
+		t.Fatalf("expected 2 lines processed and 2 suggestions, got %d / %d", job.TotalProcessedCount, len(job.UnmatchedItems))
+	}
+	got := map[string]domain.UnmatchedItem{}
+	for _, it := range job.UnmatchedItems {
+		got[it.StatementLineID] = it
+	}
+	if d := got[copyLine]; d.DiscrepancyType != domain.DiscrepancyDuplicateEntry || d.CounterpartStatementLineID != orig ||
+		d.Recommendation != domain.RecommendationConfirmDuplicate {
+		t.Fatalf("copy: %s / %s / counterpart %q", d.DiscrepancyType, d.Recommendation, d.CounterpartStatementLineID)
+	}
+	if o := got[orig]; o.DiscrepancyType != domain.DiscrepancyMissingReference || o.Recommendation != domain.RecommendationManualReview {
+		t.Fatalf("original: %s / %s", o.DiscrepancyType, o.Recommendation)
+	}
+}

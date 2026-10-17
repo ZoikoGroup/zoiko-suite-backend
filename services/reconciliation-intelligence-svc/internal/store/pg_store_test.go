@@ -44,6 +44,7 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 		"000001_initial_schema.up.sql",
 		"000002_add_eventing_outbox.up.sql",
 		"000003_bank_reconciliation_source.up.sql",
+		"000004_suggestion_counterpart_line.up.sql",
 	} {
 		sql, err := os.ReadFile(filepath.Join(base, "../../deployments/migrations", migration))
 		if err != nil {
@@ -306,5 +307,70 @@ func TestPgStore_LegacyJob_CountersPreserved(t *testing.T) {
 	if got.MatchedCount == nil || *got.MatchedCount != 1 || got.ReconciliationRate == nil || *got.ReconciliationRate != 50 ||
 		got.SourceSystemB != domain.SourceBankStatement || got.BankReconciliationRunID != "" {
 		t.Fatalf("legacy job read back as %+v", got)
+	}
+}
+
+// TestPgStore_DuplicateEntry_CounterpartRoundTrips proves a two-record
+// suggestion keeps both statement lines through storage, through the
+// locked read in ApplyResolution, and onto the resolution event.
+func TestPgStore_DuplicateEntry_CounterpartRoundTrips(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.NewPgStore(pool, store.WithEventRegion("test"))
+
+	tenantID := uuid.New().String()
+	ctx := context.Background()
+	const counterpart = "1c2d3e4f-0000-4000-8000-00000000c0de"
+
+	job, items := newTestJob("le-us")
+	items[0].DiscrepancyType = domain.DiscrepancyDuplicateEntry
+	items[0].Recommendation = domain.RecommendationConfirmDuplicate
+	items[0].CounterpartStatementLineID = counterpart
+	single := items[0]
+	single.StatementLineID = counterpart
+	single.CounterpartStatementLineID = ""
+	single.DiscrepancyType = domain.DiscrepancyMissingReference
+	items = append(items, single)
+	if err := s.CreateJob(ctx, tenantID, job, items, "actor-1", "corr-1"); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+
+	var nullCount int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM reconciliation_unmatched_items
+		WHERE job_id = $1 AND counterpart_statement_line_id IS NULL`, job.ID).Scan(&nullCount); err != nil {
+		t.Fatalf("raw select: %v", err)
+	}
+	if nullCount != 1 {
+		t.Fatalf("the single-line suggestion should store NULL, got %d NULL rows", nullCount)
+	}
+
+	got, err := s.GetJobByID(ctx, tenantID, job.ID)
+	if err != nil {
+		t.Fatalf("GetJobByID: %v", err)
+	}
+	var dupID string
+	for _, it := range got.UnmatchedItems {
+		if it.StatementLineID == testLineID {
+			dupID = it.ID
+			if it.CounterpartStatementLineID != counterpart || it.Recommendation != domain.RecommendationConfirmDuplicate {
+				t.Fatalf("duplicate read back as counterpart %q / %s", it.CounterpartStatementLineID, it.Recommendation)
+			}
+		} else if it.CounterpartStatementLineID != "" {
+			t.Fatalf("single-line suggestion read back with counterpart %q", it.CounterpartStatementLineID)
+		}
+	}
+
+	resolved, err := s.ApplyResolution(ctx, tenantID, job.ID, dupID, domain.StatusApproved, "same BACS entry imported twice", job.LegalEntityID, "actor-2", "corr-2")
+	if err != nil {
+		t.Fatalf("ApplyResolution: %v", err)
+	}
+	if resolved.CounterpartStatementLineID != counterpart {
+		t.Fatalf("ApplyResolution returned counterpart %q", resolved.CounterpartStatementLineID)
+	}
+	var eventData string
+	if err := pool.QueryRow(ctx, `SELECT convert_from(payload, 'UTF8') FROM eventing_outbox WHERE tenant_id = $1 AND event_type LIKE '%resolution-recommended'`, tenantID).Scan(&eventData); err != nil {
+		t.Fatalf("resolution event: %v", err)
+	}
+	if !strings.Contains(eventData, counterpart) || !strings.Contains(eventData, testLineID) {
+		t.Fatalf("resolution event does not name both lines: %s", eventData)
 	}
 }

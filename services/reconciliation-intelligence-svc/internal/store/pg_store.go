@@ -138,9 +138,9 @@ func (s *PgStore) CreateJob(ctx context.Context, tenantID string, job *domain.Re
 		INSERT INTO reconciliation_unmatched_items (
 			id, tenant_id, job_id, transaction_ref_a, transaction_ref_b, amount_a, amount_b,
 			discrepancy_amount, discrepancy_type, confidence_score, recommendation, resolution_status, resolution_notes, created_at, updated_at,
-			bank_reconciliation_run_id, statement_line_id
+			bank_reconciliation_run_id, statement_line_id, counterpart_statement_line_id
 		) VALUES ($1, $2, $3, $4, $5, $6::numeric, $7::numeric, $8::numeric, $9, $10, $11, $12, $13, $14, $15,
-			NULLIF($16, '')::uuid, NULLIF($17, '')::uuid)`
+			NULLIF($16, '')::uuid, NULLIF($17, '')::uuid, NULLIF($18, '')::uuid)`
 
 	for i := range items {
 		item := &items[i]
@@ -154,7 +154,7 @@ func (s *PgStore) CreateJob(ctx context.Context, tenantID string, job *domain.Re
 			item.ID, tenantID, job.ID, item.TransactionRefA, item.TransactionRefB, item.AmountA, item.AmountB,
 			item.DiscrepancyAmount, string(item.DiscrepancyType), item.ConfidenceScore, string(item.Recommendation),
 			string(item.ResolutionStatus), item.ResolutionNotes, item.CreatedAt, item.UpdatedAt,
-			item.BankReconciliationRunID, item.StatementLineID,
+			item.BankReconciliationRunID, item.StatementLineID, item.CounterpartStatementLineID,
 		)
 		if err != nil {
 			return fmt.Errorf("insert reconciliation_unmatched_item failed: %w", err)
@@ -244,7 +244,8 @@ const jobColumns = `id, tenant_id, legal_entity_id, job_name, source_system_a, C
 const itemColumns = `id, tenant_id, job_id, transaction_ref_a, transaction_ref_b, amount_a, amount_b,
 	discrepancy_amount, discrepancy_type, confidence_score, recommendation, resolution_status,
 	COALESCE(resolution_notes, ''), created_at, updated_at,
-	COALESCE(bank_reconciliation_run_id::text, ''), COALESCE(statement_line_id::text, '')`
+	COALESCE(bank_reconciliation_run_id::text, ''), COALESCE(statement_line_id::text, ''),
+	COALESCE(counterpart_statement_line_id::text, '')`
 
 func scanJob(row pgx.Row, j *domain.ReconciliationJob) error {
 	return row.Scan(
@@ -259,7 +260,7 @@ func scanItem(row pgx.Row, item *domain.UnmatchedItem) error {
 		&item.ID, &item.TenantID, &item.JobID, &item.TransactionRefA, &item.TransactionRefB,
 		&item.AmountA, &item.AmountB, &item.DiscrepancyAmount, &item.DiscrepancyType, &item.ConfidenceScore,
 		&item.Recommendation, &item.ResolutionStatus, &item.ResolutionNotes, &item.CreatedAt, &item.UpdatedAt,
-		&item.BankReconciliationRunID, &item.StatementLineID,
+		&item.BankReconciliationRunID, &item.StatementLineID, &item.CounterpartStatementLineID,
 	); err != nil {
 		return err
 	}
@@ -364,10 +365,11 @@ func (s *PgStore) ApplyResolution(ctx context.Context, tenantID, jobID, itemID s
 			"job_id":  item.JobID,
 			// The authoritative record the decision is about; "" on items
 			// from jobs analyzed before migration 000003.
-			"bank_reconciliation_run_id": item.BankReconciliationRunID,
-			"statement_line_id":          item.StatementLineID,
-			"resolution_status":          string(item.ResolutionStatus),
-			"resolution_notes":           item.ResolutionNotes,
+			"bank_reconciliation_run_id":    item.BankReconciliationRunID,
+			"statement_line_id":             item.StatementLineID,
+			"counterpart_statement_line_id": item.CounterpartStatementLineID,
+			"resolution_status":             string(item.ResolutionStatus),
+			"resolution_notes":              item.ResolutionNotes,
 		}); err != nil {
 		return nil, err
 	}
