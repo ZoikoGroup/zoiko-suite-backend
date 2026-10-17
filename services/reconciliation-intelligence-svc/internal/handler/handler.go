@@ -117,7 +117,11 @@ func (h *Handler) AnalyzeReconciliation(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	matched, unmatched, rate, items := domain.PerformIntelligentReconciliation(&req, "", tenantID, amountMismatchTolerance, missingReferenceTolerance)
+	matched, unmatched, rate, items, err := domain.PerformIntelligentReconciliation(&req, "", tenantID, amountMismatchTolerance, missingReferenceTolerance)
+	if err != nil {
+		h.respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	job := &domain.ReconciliationJob{
 		LegalEntityID:       req.LegalEntityID,

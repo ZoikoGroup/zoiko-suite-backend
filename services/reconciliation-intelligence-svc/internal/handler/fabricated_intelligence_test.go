@@ -31,8 +31,8 @@ func TestApplyResolution_EmptyHumanNote_PreservesMachineRationale(t *testing.T) 
 	analyzeBody, _ := json.Marshal(domain.AnalyzeReconciliationRequest{
 		LegalEntityID: "le-1", JobName: "job", SourceSystemA: domain.SourceGeneralLedger,
 		SourceSystemB: domain.SourceBankStatement,
-		TransactionsA: []domain.TransactionItem{{RefID: "r1", Amount: 100.00}},
-		TransactionsB: []domain.TransactionItem{{RefID: "r1", Amount: 132.00}}, // $32 discrepancy, below $50 tolerance
+		TransactionsA: []domain.TransactionItem{{RefID: "r1", Amount: "100.00"}},
+		TransactionsB: []domain.TransactionItem{{RefID: "r1", Amount: "132.00"}}, // $32 discrepancy, below $50 tolerance
 	})
 	analyzeReq := httptest.NewRequest(http.MethodPost, "/v1/reconciliations/analyze", bytes.NewReader(analyzeBody))
 	analyzeReq.Header.Set("Content-Type", "application/json")
@@ -96,7 +96,7 @@ func TestApplyResolution_HumanNote_AppendedNotOverwritten(t *testing.T) {
 	analyzeBody, _ := json.Marshal(domain.AnalyzeReconciliationRequest{
 		LegalEntityID: "le-1", JobName: "job", SourceSystemA: domain.SourceGeneralLedger,
 		SourceSystemB: domain.SourceBankStatement,
-		TransactionsA: []domain.TransactionItem{{RefID: "orphan", Amount: 5.00}},
+		TransactionsA: []domain.TransactionItem{{RefID: "orphan", Amount: "5.00"}},
 	})
 	analyzeReq := httptest.NewRequest(http.MethodPost, "/v1/reconciliations/analyze", bytes.NewReader(analyzeBody))
 	analyzeReq.Header.Set("Content-Type", "application/json")

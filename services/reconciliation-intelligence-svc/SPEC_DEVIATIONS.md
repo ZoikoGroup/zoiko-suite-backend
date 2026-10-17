@@ -23,7 +23,8 @@ and never posts, waives or clears anything — and the tolerance gate is real.
 But it does not do what the data model and the ownership table say it is for:
 it does not consume bank-reconciliation and it never proposes a candidate
 match. Roughly 40% of what its own description implies is implemented. Two
-defects were fixed in this pass (B1, B2).
+defects were fixed in this pass (B1, B2); a later pass closed A7 and the
+decimal half of A4.
 
 ## A. Not implemented / weaker than the spec
 
@@ -43,11 +44,23 @@ defects were fixed in this pass (B1, B2).
 - **A3. One-directional.** Only side A is walked: a side-B item with no
   side-A counterpart is never reported, and `total_processed_count` and the
   reconciliation rate count side A only.
-- **A4. Money is `float64`.** Amounts, discrepancies and tolerances are binary
-  floating point (ZS-DATA-001 D06 prohibits this for monetary values), and
-  items carry no currency, so the governed tolerance (which has a currency in
-  financial-control-svc) is compared with amounts of unknown currency. The
-  tolerance client also ignores the policy's currency.
+- **A4. Money has no currency** (the D06 decimal half is fixed). *Fixed:*
+  amounts, discrepancies and tolerances were `float64`; they are now exact
+  decimal strings compared as `big.Rat` (`internal/domain/decimal.go`, same
+  convention as financial-statements-svc). The API takes and returns
+  amounts as strings — a JSON number is 400 — and an amount that would not
+  be stored exactly by the `NUMERIC(18,4)` columns (more than 4 decimal
+  places, or 15+ integer digits) is 400 rather than silently rounded by
+  Postgres. The tolerance client parses financial-control-svc's decimal
+  string straight to `big.Rat` (it used to go through `ParseFloat`) and
+  fails closed on a negative tolerance. A discrepancy is now exact
+  `|a − b|`; the old float path rounded it to 2 places, so a sub-cent
+  difference used to count as a match and now produces a suggestion.
+  *Still open:* items carry no currency, so the governed tolerance (which
+  has a currency in financial-control-svc) is compared with amounts of
+  unknown currency, and the tolerance client ignores the policy's currency.
+  Belongs with A1, once bank-reconciliation data gives the amounts a
+  currency.
 - **A5. `WRITE_OFF` and `TIMING_ADJUSTMENT` are accounting actions, and
   `EXECUTED` has no reference.** The service recommends them, which is
   allowed (advisory), but marking a suggestion `EXECUTED` records no
@@ -60,10 +73,14 @@ defects were fixed in this pass (B1, B2).
   /v1/reconciliations/{id}` check only the tenant (RLS); any principal of the
   tenant can read every legal entity's jobs and items. Writes are authorized
   per entity.
-- **A7. Silent in-memory fallback in production.** If Postgres is unreachable
-  or fails its ping at startup, `cmd/server/main.go` logs a warning and serves
-  from `MemoryStore`: jobs and decisions are lost on restart and no events are
-  emitted. A service that holds human decisions should fail to start instead.
+- **A7. Silent in-memory fallback in production** (closed). If Postgres was
+  unreachable or failed its ping at startup, `cmd/server/main.go` logged a
+  warning and served from `MemoryStore`: jobs and decisions were lost on
+  restart and no events were emitted. It now exits non-zero with
+  `db unreachable at startup` (or `failed to create db pool`), the same
+  posture as general-ledger-svc, financial-statements-svc and
+  bank-reconciliation-svc. `MemoryStore` remains only as a handler-test
+  double.
 - **A8. No model/score provenance.** The data model requires "model
   reference and score basis"; the score is one of three fixed numbers and the
   rule that fired is only in free-text notes. There is no rule/heuristic

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"math/big"
 	"net/http/httptest"
 	"testing"
 
@@ -31,8 +32,47 @@ func TestGetActiveAbsoluteTolerance_HappyPath_ReturnsLatestVersion(t *testing.T)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if tol != 75 {
+	if tol.Cmp(big.NewRat(75, 1)) != 0 {
 		t.Fatalf("expected the highest-version (current) policy's tolerance 75, got %v", tol)
+	}
+}
+
+// ZS-DATA-001 D06: the governed tolerance arrives as a decimal string and
+// must reach the comparison exactly — a float64 parse would turn this
+// 17-significant-digit value into a nearby binary approximation.
+func TestGetActiveAbsoluteTolerance_PreservesExactDecimal(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"items": []map[string]any{{"tolerance_version": 1, "absolute_tolerance": "12345678901234.567"}},
+		})
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, zap.NewNop())
+	tol, err := c.GetActiveAbsoluteTolerance(context.Background(), "tenant-1", "principal-1", "le-1", "SOME_METRIC")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want, _ := new(big.Rat).SetString("12345678901234.567")
+	if tol.Cmp(want) != 0 {
+		t.Fatalf("tolerance lost precision: got %s, want 12345678901234.567", tol.FloatString(6))
+	}
+}
+
+func TestGetActiveAbsoluteTolerance_NegativeTolerance_FailsClosed(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"items": []map[string]any{{"tolerance_version": 1, "absolute_tolerance": "-5"}},
+		})
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, zap.NewNop())
+	_, err := c.GetActiveAbsoluteTolerance(context.Background(), "tenant-1", "principal-1", "le-1", "SOME_METRIC")
+	if !errors.Is(err, ErrServiceUnavailable) {
+		t.Fatalf("expected ErrServiceUnavailable on a negative tolerance, got %v", err)
 	}
 }
 

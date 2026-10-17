@@ -70,9 +70,9 @@ func newTestJob(legalEntityID string) (*domain.ReconciliationJob, []domain.Unmat
 	items := []domain.UnmatchedItem{{
 		TransactionRefA:   "ref-a",
 		TransactionRefB:   "ref-b",
-		AmountA:           100,
-		AmountB:           132,
-		DiscrepancyAmount: 32,
+		AmountA:           "100.25",
+		AmountB:           "132.5",
+		DiscrepancyAmount: "32.25",
 		DiscrepancyType:   domain.DiscrepancyAmountMismatch,
 		ConfidenceScore:   80,
 		Recommendation:    domain.RecommendationManualReview,
@@ -166,5 +166,50 @@ func TestPgStore_ApplyResolution_EnqueuesResolutionEvent(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("expected exactly 1 resolution-recommended outbox event, got %d", count)
+	}
+}
+
+// TestPgStore_AmountsRoundTripExactly proves money survives NUMERIC(18,4)
+// storage exactly (ZS-DATA-001 D06) and reads back in the same canonical
+// form the analyze response used, not Postgres's padded "100.2500".
+func TestPgStore_AmountsRoundTripExactly(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.NewPgStore(pool, store.WithEventRegion("test"))
+
+	tenantID := uuid.New().String()
+	ctx := context.Background()
+
+	job, items := newTestJob("le-us")
+	if err := s.CreateJob(ctx, tenantID, job, items, "actor-1", "corr-1"); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	itemID := job.UnmatchedItems[0].ID
+
+	var rawA string
+	if err := pool.QueryRow(ctx, `SELECT amount_a::text FROM reconciliation_unmatched_items WHERE id = $1`, itemID).Scan(&rawA); err != nil {
+		t.Fatalf("raw select: %v", err)
+	}
+	if rawA != "100.2500" {
+		t.Fatalf("stored amount_a = %q, want 100.2500", rawA)
+	}
+
+	got, err := s.GetJobByID(ctx, tenantID, job.ID)
+	if err != nil {
+		t.Fatalf("GetJobByID: %v", err)
+	}
+	if len(got.UnmatchedItems) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(got.UnmatchedItems))
+	}
+	it := got.UnmatchedItems[0]
+	if it.AmountA != "100.25" || it.AmountB != "132.5" || it.DiscrepancyAmount != "32.25" {
+		t.Fatalf("GetJobByID amounts = %s / %s / %s, want 100.25 / 132.5 / 32.25", it.AmountA, it.AmountB, it.DiscrepancyAmount)
+	}
+
+	resolved, err := s.ApplyResolution(ctx, tenantID, job.ID, itemID, domain.StatusApproved, "", job.LegalEntityID, "actor-2", "corr-2")
+	if err != nil {
+		t.Fatalf("ApplyResolution: %v", err)
+	}
+	if resolved.AmountA != "100.25" || resolved.AmountB != "132.5" || resolved.DiscrepancyAmount != "32.25" {
+		t.Fatalf("ApplyResolution amounts = %s / %s / %s, want 100.25 / 132.5 / 32.25", resolved.AmountA, resolved.AmountB, resolved.DiscrepancyAmount)
 	}
 }
