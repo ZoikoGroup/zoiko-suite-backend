@@ -112,7 +112,7 @@ func (h *Handler) AnalyzeReconciliation(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, RECONCILIATION_ANALYZE); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), tenantID, principalID, req.LegalEntityID, RECONCILIATION_ANALYZE); err != nil {
 		h.writeAuthzErr(w, err)
 		return
 	}
@@ -200,7 +200,7 @@ func (h *Handler) ListJobs(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, RECONCILIATION_READ); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), tenantID, principalID, legalEntityID, RECONCILIATION_READ); err != nil {
 		h.writeAuthzErr(w, err)
 		return
 	}
@@ -239,7 +239,7 @@ func (h *Handler) GetJobByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.authz.CheckAllowed(r.Context(), principalID, job.LegalEntityID, RECONCILIATION_READ); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), tenantID, principalID, job.LegalEntityID, RECONCILIATION_READ); err != nil {
 		h.writeAuthzErr(w, err)
 		return
 	}
@@ -276,7 +276,7 @@ func (h *Handler) ApplyResolution(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), principalID, job.LegalEntityID, RECONCILIATION_APPLY_RESOLUTION); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), tenantID, principalID, job.LegalEntityID, RECONCILIATION_APPLY_RESOLUTION); err != nil {
 		h.writeAuthzErr(w, err)
 		return
 	}
@@ -309,7 +309,7 @@ func (h *Handler) ArchiveJob(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), principalID, job.LegalEntityID, RECONCILIATION_ARCHIVE); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), tenantID, principalID, job.LegalEntityID, RECONCILIATION_ARCHIVE); err != nil {
 		h.writeAuthzErr(w, err)
 		return
 	}
