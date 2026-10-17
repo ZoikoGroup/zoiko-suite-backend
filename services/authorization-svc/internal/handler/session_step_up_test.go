@@ -54,11 +54,11 @@ func TestSessionStepUp_RefusedWithoutARecentSecondFactor(t *testing.T) {
 		// person authenticated: only the basis can refuse this one.
 		"delegate service": {PrincipalID: scAdmin, Basis: idgate.BasisDelegate, Delegate: "access-control-svc",
 			MFAVerified: true, AuthTime: now.Add(-time.Minute)},
-		"password only":        {PrincipalID: scAdmin, Basis: idgate.BasisEnvelope, AuthTime: now.Add(-time.Minute)},
-		"stale step-up":        {PrincipalID: scAdmin, Basis: idgate.BasisEnvelope, MFAVerified: true, AuthTime: now.Add(-16 * time.Minute)},
-		"unknown auth time":    {PrincipalID: scAdmin, Basis: idgate.BasisEnvelope, MFAVerified: true},
-		"future auth time":     {PrincipalID: scAdmin, Basis: idgate.BasisEnvelope, MFAVerified: true, AuthTime: now.Add(10 * time.Minute)},
-		"someone else's":       {PrincipalID: scThird, Basis: idgate.BasisEnvelope, MFAVerified: true, AuthTime: now.Add(-time.Minute)},
+		"password only":     {PrincipalID: scAdmin, Basis: idgate.BasisEnvelope, AuthTime: now.Add(-time.Minute)},
+		"stale step-up":     {PrincipalID: scAdmin, Basis: idgate.BasisEnvelope, MFAVerified: true, AuthTime: now.Add(-16 * time.Minute)},
+		"unknown auth time": {PrincipalID: scAdmin, Basis: idgate.BasisEnvelope, MFAVerified: true},
+		"future auth time":  {PrincipalID: scAdmin, Basis: idgate.BasisEnvelope, MFAVerified: true, AuthTime: now.Add(10 * time.Minute)},
+		"someone else's":    {PrincipalID: scThird, Basis: idgate.BasisEnvelope, MFAVerified: true, AuthTime: now.Add(-time.Minute)},
 	}
 	bg := `{"principal_id":"` + scSubject + `","incident_id":"INC-1","reason":"r","requested_actions":["gateway.failover"]}`
 	for name, a := range cases {

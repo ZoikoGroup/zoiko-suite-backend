@@ -617,7 +617,7 @@ type CreateRoleAssignmentParams struct {
 	ApprovedBy        *string
 	ApprovalReference *string
 	ApprovalExpiresAt *time.Time
-	AssignedBy  string
+	AssignedBy        string
 }
 
 type CreateDelegatedAuthorityParams struct {
@@ -745,8 +745,8 @@ type RecordAccessDecisionParams struct {
 	OnBehalfOf       string
 	DelegationID     string
 	ExpiresAt        *time.Time
-	Basis         string
-	CorrelationID string
+	Basis            string
+	CorrelationID    string
 
 	// TenantID is the caller's verified tenant scope, empty when the caller
 	// supplied none. Stored as SQL NULL when empty: /v1/authorize is called

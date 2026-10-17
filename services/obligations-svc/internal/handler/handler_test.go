@@ -46,12 +46,12 @@ type stubStore struct {
 	// Idempotency key methods
 	idempotencyChecked bool
 	idempotencyResult  struct {
-		alreadyProcessed    bool
-		existingResourceID  string
+		alreadyProcessed     bool
+		existingResourceID   string
 		existingResourceType string
-		err                 error
+		err                  error
 	}
-	idempotencyStored bool
+	idempotencyStored   bool
 	idempotencyStoreErr error
 
 	// Chunk 10: applicability decisions.

@@ -16,8 +16,8 @@ import (
 
 	"zoiko.io/obligations-svc/internal/authz"
 	"zoiko.io/obligations-svc/internal/domain"
-	svcerrors "zoiko.io/obligations-svc/internal/errors"
 	"zoiko.io/obligations-svc/internal/envelope"
+	svcerrors "zoiko.io/obligations-svc/internal/errors"
 	"zoiko.io/obligations-svc/internal/jurisdiction"
 	"zoiko.io/obligations-svc/internal/middleware"
 	"zoiko.io/obligations-svc/internal/store"
@@ -368,7 +368,7 @@ func (h *Handler) CreateObligation(w http.ResponseWriter, r *http.Request) {
 		if alreadyProcessed && existingResourceType != "obligation" {
 			// Key used for different resource type
 			writeJSON(w, http.StatusConflict, map[string]string{
-				"error": "idempotency_key_conflict",
+				"error":  "idempotency_key_conflict",
 				"detail": "idempotency key already used for different resource type",
 			})
 			return
@@ -392,10 +392,10 @@ func (h *Handler) CreateObligation(w http.ResponseWriter, r *http.Request) {
 	// request schema. A mismatch indicates a confused or malicious caller.
 	if env.LegalEntityID != "" && env.LegalEntityID != req.LegalEntityID {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error":           "legal_entity_mismatch",
-			"detail":          "X-Legal-Entity-Id header must match body legal_entity_id",
-			"header_value":    env.LegalEntityID,
-			"body_value":      req.LegalEntityID,
+			"error":        "legal_entity_mismatch",
+			"detail":       "X-Legal-Entity-Id header must match body legal_entity_id",
+			"header_value": env.LegalEntityID,
+			"body_value":   req.LegalEntityID,
 		})
 		return
 	}
@@ -462,7 +462,7 @@ func (h *Handler) CreateObligation(w http.ResponseWriter, r *http.Request) {
 			})
 		case errors.Is(err, domain.ErrIdempotencyKeyConflict):
 			writeJSON(w, http.StatusConflict, map[string]string{
-				"error": "idempotency_key_conflict",
+				"error":  "idempotency_key_conflict",
 				"detail": "idempotency key already used with different request",
 			})
 		default:
@@ -692,7 +692,7 @@ func (h *Handler) UpdateObligationStatus(w http.ResponseWriter, r *http.Request)
 			expectedVersion = v
 		} else {
 			writeJSON(w, http.StatusBadRequest, map[string]string{
-				"error": "invalid_if_match",
+				"error":  "invalid_if_match",
 				"detail": "If-Match must be an integer version",
 			})
 			return
@@ -812,8 +812,8 @@ func (h *Handler) LinkWorkflow(w http.ResponseWriter, r *http.Request) {
 
 	if existing.WorkflowID != nil && *existing.WorkflowID != "" {
 		writeJSON(w, http.StatusConflict, map[string]string{
-			"error":        "workflow_already_linked",
-			"workflow_id":  *existing.WorkflowID,
+			"error":       "workflow_already_linked",
+			"workflow_id": *existing.WorkflowID,
 		})
 		return
 	}

@@ -894,8 +894,8 @@ func (h *Handler) HandleCanonicalDecision(w http.ResponseWriter, r *http.Request
 	}
 
 	resp := domain.CanonicalDecisionResponse{
-		Decision:         evalRes.Decision,
-		DecisionID:       decision.AccessDecisionID,
+		Decision:   evalRes.Decision,
+		DecisionID: decision.AccessDecisionID,
 		// The configuration watermark actually in force, recorded with the
 		// decision — not the constant this used to report for every decision.
 		PolicySetVersion: decision.PolicySetVersion,

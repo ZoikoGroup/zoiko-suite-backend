@@ -15,7 +15,7 @@ func TestSessionDuration_RefusesInsteadOfShortening(t *testing.T) {
 		want                         int
 		refused                      bool
 	}{
-		{0, 3600, 28800, 86400, 3600, false},     // default
+		{0, 3600, 28800, 86400, 3600, false},      // default
 		{28800, 3600, 28800, 86400, 28800, false}, // exactly the maximum
 		{28801, 3600, 28800, 86400, 0, true},      // one second over
 		{90000, 3600, 0, 86400, 0, true},          // no configured max: the ceiling still refuses

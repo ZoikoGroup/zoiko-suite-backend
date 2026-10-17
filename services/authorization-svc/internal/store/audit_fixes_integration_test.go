@@ -126,8 +126,26 @@ func TestFixesIT_RelayWritesABatchAtOnce(t *testing.T) {
 	if w.calls != 1 {
 		t.Errorf("WriteMessages called %d times for one batch, want 1", w.calls)
 	}
-	if n != 149 {
-		t.Errorf("published %d, want 149 (one failed)", n)
+	// The relay claims every pending row, not only this test's: the package
+	// suites run in parallel against one database, and another package's
+	// integration test can publish a row of its own into this batch. Count
+	// the events this test recorded, not the batch (which flaked as
+	// "published 150, want 149" whenever a foreign row slipped in).
+	ours := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		ours[id] = true
+	}
+	published := 0
+	for _, m := range w.sent {
+		if ours[string(m.Key)] {
+			published++
+		}
+	}
+	if n < 149 {
+		t.Errorf("relay reported %d published, want at least this test's 149", n)
+	}
+	if published != 149 {
+		t.Errorf("published %d of this test's 150 events, want 149 (one failed)", published)
 	}
 	if got := pendingFor(t, pool, ids[7]); len(got) != 1 {
 		t.Errorf("the failed row is not pending: %v", got)

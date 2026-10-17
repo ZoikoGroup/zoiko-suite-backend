@@ -54,10 +54,10 @@ func InitTracing(ctx context.Context, serviceName, otlpEndpoint string) (func(co
 }
 
 type Metrics struct {
-	HTTPRequestsTotal      *prometheus.CounterVec
-	HTTPRequestDuration    *prometheus.HistogramVec
-	ReadinessUp            prometheus.Gauge
-	EventPublishFailures   *prometheus.CounterVec
+	HTTPRequestsTotal    *prometheus.CounterVec
+	HTTPRequestDuration  *prometheus.HistogramVec
+	ReadinessUp          prometheus.Gauge
+	EventPublishFailures *prometheus.CounterVec
 }
 
 func NewMetrics(serviceName string) *Metrics {

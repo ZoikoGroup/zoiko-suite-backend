@@ -15,9 +15,9 @@ import (
 type State int
 
 const (
-	StateClosed State = iota // Normal operation, requests go through
-	StateOpen                // Circuit open, requests fail fast
-	StateHalfOpen            // Testing if service recovered
+	StateClosed   State = iota // Normal operation, requests go through
+	StateOpen                  // Circuit open, requests fail fast
+	StateHalfOpen              // Testing if service recovered
 )
 
 var (
@@ -45,13 +45,13 @@ func DefaultConfig() Config {
 
 // CircuitBreaker wraps a function with circuit breaker logic.
 type CircuitBreaker struct {
-	mu               sync.Mutex
-	state            State
-	failures         int
-	successes        int
-	lastFailureTime  time.Time
-	config           Config
-	name             string
+	mu              sync.Mutex
+	state           State
+	failures        int
+	successes       int
+	lastFailureTime time.Time
+	config          Config
+	name            string
 }
 
 // NewCircuitBreaker creates a new circuit breaker with the given name and config.

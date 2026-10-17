@@ -10,18 +10,18 @@
 package authz
 
 import (
-	"github.com/go-chi/chi/v5/middleware"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/go-chi/chi/v5/middleware"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
-	"strconv"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"

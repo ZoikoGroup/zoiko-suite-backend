@@ -111,7 +111,7 @@ func (s *PgStore) CheckIdempotencyKey(ctx context.Context, idempotencyKey, reque
 
 	// Verify the request hash matches to detect IDEMPOTENCY_MISMATCH (API standard L381).
 	if existingRequestHash != requestHash {
-		return false, "", "", domain.ErrIdempotencyMismatch
+		return false, "", "", domain.ErrIdempotencyKeyConflict
 	}
 
 	return true, existingResourceID, existingResourceType, nil

@@ -58,11 +58,11 @@ func (e *env) envelope(t *testing.T, mutate func(jwt.MapClaims), kid string) str
 	claims := jwt.MapClaims{
 		"iss": testIssuer, "aud": testAudience,
 		"iat": time.Now().Unix(), "exp": time.Now().Add(5 * time.Minute).Unix(),
-		"tenant_id": tenantA,
-		"principal": map[string]any{"principal_id": "P-ALICE", "tenant_id": tenantA},
+		"tenant_id":             tenantA,
+		"principal":             map[string]any{"principal_id": "P-ALICE", "tenant_id": tenantA},
 		"session_trust_posture": map[string]any{"mfa_verified": true, "session_context_id": "SC-1"},
-		"auth_time": time.Now().Add(-2 * time.Minute).Unix(),
-		"amr":       []string{"pwd", "otp"},
+		"auth_time":             time.Now().Add(-2 * time.Minute).Unix(),
+		"amr":                   []string{"pwd", "otp"},
 	}
 	if mutate != nil {
 		mutate(claims)

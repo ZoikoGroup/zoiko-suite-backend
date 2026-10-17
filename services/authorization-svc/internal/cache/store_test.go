@@ -794,8 +794,9 @@ func TestCache_RevokedDelegationIsNotServedFromCache(t *testing.T) {
 	}
 }
 
-
-func (c *countingStore) FindEntityStatus(_ context.Context, _, _ string) (string, error) { return "", nil }
+func (c *countingStore) FindEntityStatus(_ context.Context, _, _ string) (string, error) {
+	return "", nil
+}
 func (c *countingStore) FindPrincipalTenants(_ context.Context, _ string) ([]string, error) {
 	return nil, nil
 }

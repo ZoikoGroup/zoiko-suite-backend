@@ -37,18 +37,18 @@ import (
 	svcenvelope "zoiko.io/authorization-svc/internal/envelope"
 	"zoiko.io/authorization-svc/internal/events"
 	"zoiko.io/authorization-svc/internal/handler"
-	idgate "zoiko.io/authorization-svc/internal/identity"
 	"zoiko.io/authorization-svc/internal/health"
 	"zoiko.io/authorization-svc/internal/idempotency"
+	idgate "zoiko.io/authorization-svc/internal/identity"
 	"zoiko.io/authorization-svc/internal/jurisdiction"
+	"zoiko.io/authorization-svc/internal/mtls"
 	"zoiko.io/authorization-svc/internal/outbox"
 	"zoiko.io/authorization-svc/internal/registry"
-	"zoiko.io/authorization-svc/internal/mtls"
-	"zoiko.io/authorization-svc/internal/workload"
 	"zoiko.io/authorization-svc/internal/retention"
 	"zoiko.io/authorization-svc/internal/siem"
 	"zoiko.io/authorization-svc/internal/store"
 	"zoiko.io/authorization-svc/internal/telemetry"
+	"zoiko.io/authorization-svc/internal/workload"
 )
 
 // platformScopeID is the legal_entity_id presented when provisioning this

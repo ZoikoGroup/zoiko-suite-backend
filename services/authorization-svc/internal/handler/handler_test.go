@@ -255,7 +255,6 @@ type stubStore struct {
 	findWorkloadBindingErr   error
 	createdWorkloadBinding   *domain.WorkloadBinding
 	createWorkloadBindingErr error
-
 }
 
 func (s *stubStore) CreateRole(_ context.Context, _ domain.CreateRoleParams) (*domain.Role, bool, error) {
@@ -463,6 +462,7 @@ func (s *stubStore) FindEntityStatus(_ context.Context, _, _ string) (string, er
 func (s *stubStore) FindEntityTenant(_ context.Context, _ string) (string, error) {
 	return s.entityTenant, s.entityTenantErr
 }
+
 // FindPrincipalTenants answers principalTenants when the test set it. When it
 // did not, a principal the stub grants anything (RBAC or delegated) holds
 // authority in one tenant — the consistent world — so tests about other layers

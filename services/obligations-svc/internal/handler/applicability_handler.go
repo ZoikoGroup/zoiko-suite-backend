@@ -165,9 +165,9 @@ func (h *Handler) CreateApplicabilityDecision(w http.ResponseWriter, r *http.Req
 	env, _ := envelope.FromContext(r.Context())
 	if env.LegalEntityID != "" && env.LegalEntityID != parent.LegalEntityID {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error":           "legal_entity_mismatch",
-			"detail":          "X-Legal-Entity-Id header must match parent obligation's legal_entity_id",
-			"header_value":    env.LegalEntityID,
+			"error":            "legal_entity_mismatch",
+			"detail":           "X-Legal-Entity-Id header must match parent obligation's legal_entity_id",
+			"header_value":     env.LegalEntityID,
 			"obligation_value": parent.LegalEntityID,
 		})
 		return

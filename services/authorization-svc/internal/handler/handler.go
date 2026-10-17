@@ -393,7 +393,7 @@ func (h *Handler) requireTenant(w http.ResponseWriter, r *http.Request) (string,
 // Same defect as a malformed legal_entity_id and one layer deeper, which is
 // why it is easy to miss: tenant_id is UUID in every table that carries it,
 // and withRLS installs the raw value into app.tenant_id — where the POLICY
-// itself does `NULLIF(current_setting('app.tenant_id', true), '')::uuid`. So a
+// itself does `NULLIF(current_setting('app.tenant_id', true), ”)::uuid`. So a
 // malformed tenant does not fail in a query this service wrote; it fails
 // inside row security, on every table, as a driver error the store reports as
 // ErrStoreUnavailable and the handler answers 503 for.
@@ -3918,7 +3918,6 @@ func (h *Handler) CreateSupportSession(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
 		return
 	}
-
 
 	h.log.Info("support session created",
 		zap.String("session_id", ss.SessionID),
