@@ -52,13 +52,16 @@ reconciliation-engine-svc holds for DATA-07.
   and period filters plus cursor pagination; require either an entity filter
   or a group-scope authorization (a group-level action checked on the group
   entity); move consolidation-svc onto the scoped form in the same change.
-- **A3. `ExplainMismatch` is a free-text string.** `mismatch_reason` is a
-  formatted sentence (`amount_mismatch: intercompany amount … != journal amount
-  …`). There is no structured explanation (expected vs observed amount and
-  currency per side, which rule failed, the journal ids examined, the
-  tolerance applied), and the reason is overwritten on each match attempt, so
-  earlier attempts are lost. Scope: a `match_attempts` child table written in
-  the `UpdateMatch` transaction, served by `GET …/entries/{id}/explanation`.
+- **A3. `ExplainMismatch` is a free-text string. — Closed (B9).** Migration
+  000007 adds `intercompany_match_attempts`: one append-only, tenant-scoped
+  row per applied MatchIntercompany attempt, written in the `UpdateMatch`
+  transaction. Each row records the rule that failed, expected against
+  observed amount and currency per side, the journal ids examined, the
+  tolerance applied, the pair's period, who made the attempt and when.
+  `GET …/entries/{id}/explanation` serves the rows. `mismatch_reason` is
+  still returned, but it is now read from the latest attempt instead of
+  being overwritten on the pair, so earlier attempts are kept. The match
+  response also names `failed_rule`.
 - **A4. A pair carries one amount and one currency, and no period or
   dimensions. — Closed (B7).** Migration 000005 adds
   `counterparty_amount`/`counterparty_currency_code`, `fiscal_period` and
@@ -237,3 +240,47 @@ reconciliation-engine-svc holds for DATA-07.
     used to write whatever status it was handed, which would now have been
     a way to reach CLOSED without the close guard.
   - *No events* for close, dispute or resolve yet. That is A7, unchanged.
+- **B9. How match attempts are recorded (A3).**
+  - *What counts as an attempt.* Every MatchIntercompany call that reaches
+    an outcome and is applied, whether MATCHED or MISMATCH. These calls
+    record nothing: a call refused because the pair moved on since it was
+    read (422 `invalid_transition`), a call rejected before the ledger is
+    consulted (400/403/404), and a dependency outage (503). Recording a
+    refused attempt would make a stale result the "latest" and change the
+    `mismatch_reason` of a pair it never applied to.
+  - *Rules.* `COUNTERPARTY_JOURNAL_MISSING`, `TARGET_ENTITY_MISMATCH`,
+    `TARGET_JOURNAL_NOT_FINALIZED`, `CURRENCY_UNVERIFIABLE`,
+    `CURRENCY_MISMATCH`, `AMOUNT_MISMATCH`, `GROUP_RELATIONSHIP_LOST`
+    (CHECK-constrained), in the order the match applies them. The first
+    failing rule is the one recorded. The message keeps the sentence format
+    `mismatch_reason` always had.
+  - *Sides.* Each attempt stores the source and target side as journal id,
+    expected amount and currency, and observed amount, currency, legal
+    entity, status and fiscal period. The target's observed amount is the
+    journal total the match compared (A5's larger-of-debits-and-credits),
+    recorded even when an earlier rule failed. The source side's observed
+    columns are NULL until the source journal is verified (A6), and they
+    already exist for that change. Observed amounts are unconstrained
+    `NUMERIC`: they are general-ledger-svc's figures and must not be rounded
+    to fit the pair's NUMERIC(18,4). Expected amounts are the pair's own.
+  - *Integrity.* Append-only through the same `reject_immutable_row` trigger
+    as B8's transitions, FORCE RLS on tenant, and CHECKs that make a
+    MISMATCH carry a rule and message and a MATCHED attempt carry neither.
+  - *`mismatch_reason`.* Read from the latest attempt's message (NULL when
+    the latest attempt matched, or when there has been none). A DISPUTED,
+    RESOLVED or CLOSED pair keeps reporting the reason of the attempt that
+    put it there. The pair's own `mismatch_reason` column is no longer
+    written or read. It keeps its pre-000007 value only so a rollback has
+    something to return to: 000007's down migration writes each pair's
+    latest message back before dropping the attempts. The column can be
+    dropped once no deployed binary reads it.
+  - *Backfill.* A pair with a `mismatch_reason` gets one
+    `LEGACY_UNSTRUCTURED` attempt carrying that sentence, attributed to
+    `migration:000007` and timestamped at the migration. Only the last
+    attempt's text ever survived the overwrite, and when it was made is
+    unknown. Expected amounts come from the pair (after 000005), and the
+    tolerance is the 0.001 the old match applied. A pair that never
+    mismatched gets no attempt; none is invented.
+  - *Events.* The `mismatch-detected` event payload still carries
+    `mismatch_reason`. `failed_rule` is in the HTTP response and the
+    explanation, and is not yet added to the event (A7 owns the event set).

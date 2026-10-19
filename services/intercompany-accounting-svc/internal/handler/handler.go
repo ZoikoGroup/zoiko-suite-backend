@@ -29,9 +29,9 @@ type Store interface {
 	GetEntry(ctx context.Context, id string) (*domain.IntercompanyEntry, error)
 	ListEntries(ctx context.Context, sourceEntityID, targetEntityID string) ([]domain.IntercompanyEntry, error)
 	// UpdateMatch persists entry's target state and, in the same
-	// transaction, enqueues the "posted" or "mismatch.detected" event that
-	// state implies.
-	UpdateMatch(ctx context.Context, entry *domain.IntercompanyEntry, actorID, correlationID string) error
+	// transaction, the attempt that produced it and the "posted" or
+	// "mismatch.detected" event that state implies.
+	UpdateMatch(ctx context.Context, entry *domain.IntercompanyEntry, attempt *domain.MatchAttempt, actorID, correlationID string) error
 
 	// ACC-11 lifecycle — see migrations 000003 and 000006. Each records its
 	// state change in the pair's append-only transition history.
@@ -40,6 +40,9 @@ type Store interface {
 	ResolveMismatch(ctx context.Context, id, principalID, resolutionNote, outcome, correlationID string) error
 	ClosePair(ctx context.Context, id, principalID, reason, correlationID string) error
 	ListTransitions(ctx context.Context, id string) ([]domain.PairTransition, error)
+
+	// ListMatchAttempts is ExplainMismatch's evidence (migration 000007).
+	ListMatchAttempts(ctx context.Context, id string) ([]domain.MatchAttempt, error)
 
 	// Control-population read (docs/architecture/control-population-contract.md).
 	ControlPopulation(ctx context.Context, q domain.ControlPopulationQuery) (*domain.ControlPopulationPage, error)
@@ -118,6 +121,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{id}/resolve", h.ResolveMismatch)
 		r.Post("/{id}/close", h.ClosePair)
 		r.Get("/{id}/transitions", h.ListTransitions)
+		r.Get("/{id}/explanation", h.ExplainMismatch)
 	})
 }
 
@@ -373,6 +377,10 @@ func (h *Handler) MatchEntry(w http.ResponseWriter, r *http.Request) {
 
 	tenantID := svcmiddleware.TenantFromContext(r.Context())
 
+	// attempt is this call's evidence (ExplainMismatch): filled in as each
+	// check runs, and recorded with whichever outcome the match reaches.
+	attempt := newMatchAttempt(entry, req.TargetJournalID, principalID, correlationID)
+
 	// Fetch target journal detail from general-ledger-svc
 	journal, err := h.ledger.GetJournal(r.Context(), tenantID, req.TargetJournalID)
 	if errors.Is(err, domain.ErrEntryNotFound) {
@@ -382,7 +390,7 @@ func (h *Handler) MatchEntry(w http.ResponseWriter, r *http.Request) {
 		// caller almost certainly named the wrong journal_id, and retrying
 		// the identical request will fail identically.
 		reason := domain.ErrCounterpartyJournalMissing.Error()
-		h.recordMismatch(w, r, entry, req.TargetJournalID, reason, principalID, correlationID)
+		h.recordMismatch(w, r, entry, attempt, domain.MatchRuleCounterpartyJournalMissing, reason)
 		return
 	}
 	if err != nil {
@@ -391,40 +399,9 @@ func (h *Handler) MatchEntry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validation 1: Target journal entity must match entry target legal entity
-	if journal.LegalEntityID != entry.TargetLegalEntityID {
-		reason := fmt.Sprintf("target_journal_entity_mismatch: journal entity %s != target entity %s", journal.LegalEntityID, entry.TargetLegalEntityID)
-		h.recordMismatch(w, r, entry, req.TargetJournalID, reason, principalID, correlationID)
-		return
-	}
-
-	// Validation 2: Journal status must be FINALIZED
-	if journal.Status != "FINALIZED" {
-		reason := fmt.Sprintf("target_journal_not_finalized: status is %s", journal.Status)
-		h.recordMismatch(w, r, entry, req.TargetJournalID, reason, principalID, correlationID)
-		return
-	}
-
-	// Validation 3: the target journal must be in the currency the
-	// counterparty side is expected in. Checked before the amount: two
-	// amounts in different currencies are not comparable, so a currency
-	// difference is refused outright rather than the raw numbers being
-	// compared (a 5,000 GBP journal used to match a 5,000 USD pair).
-	if !domain.ValidCurrencyCode(journal.CurrencyCode) {
-		reason := fmt.Sprintf("currency_unverifiable: target journal currency is %q, expected %s", journal.CurrencyCode, entry.CounterpartyCurrencyCode)
-		h.recordMismatch(w, r, entry, req.TargetJournalID, reason, principalID, correlationID)
-		return
-	}
-	if journal.CurrencyCode != entry.CounterpartyCurrencyCode {
-		reason := fmt.Sprintf("currency_mismatch: expected counterparty currency %s != journal currency %s", entry.CounterpartyCurrencyCode, journal.CurrencyCode)
-		h.recordMismatch(w, r, entry, req.TargetJournalID, reason, principalID, correlationID)
-		return
-	}
-
-	// Validation 4: the target journal's amount must match the expected
-	// counterparty amount, compared exactly (big.Rat) within matchTolerance.
-	// The journal amount is still the larger of its total debits and total
-	// credits (SPEC_DEVIATIONS A5).
+	// The journal amount is the larger of its total debits and total
+	// credits (SPEC_DEVIATIONS A5), summed exactly. Read before any check so
+	// every attempt records what the journal held, whichever rule fails.
 	journalAmount, err := journalTotal(journal)
 	if err != nil {
 		h.log.Error("general-ledger-svc returned an unreadable journal amount", zap.Error(err))
@@ -437,10 +414,44 @@ func (h *Handler) MatchEntry(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
+	observeTargetJournal(&attempt.Target, journal, journalAmount)
+
+	// Validation 1: Target journal entity must match entry target legal entity
+	if journal.LegalEntityID != entry.TargetLegalEntityID {
+		reason := fmt.Sprintf("target_journal_entity_mismatch: journal entity %s != target entity %s", journal.LegalEntityID, entry.TargetLegalEntityID)
+		h.recordMismatch(w, r, entry, attempt, domain.MatchRuleTargetEntityMismatch, reason)
+		return
+	}
+
+	// Validation 2: Journal status must be FINALIZED
+	if journal.Status != "FINALIZED" {
+		reason := fmt.Sprintf("target_journal_not_finalized: status is %s", journal.Status)
+		h.recordMismatch(w, r, entry, attempt, domain.MatchRuleTargetJournalNotFinalized, reason)
+		return
+	}
+
+	// Validation 3: the target journal must be in the currency the
+	// counterparty side is expected in. Checked before the amount: two
+	// amounts in different currencies are not comparable, so a currency
+	// difference is refused outright rather than the raw numbers being
+	// compared (a 5,000 GBP journal used to match a 5,000 USD pair).
+	if !domain.ValidCurrencyCode(journal.CurrencyCode) {
+		reason := fmt.Sprintf("currency_unverifiable: target journal currency is %q, expected %s", journal.CurrencyCode, entry.CounterpartyCurrencyCode)
+		h.recordMismatch(w, r, entry, attempt, domain.MatchRuleCurrencyUnverifiable, reason)
+		return
+	}
+	if journal.CurrencyCode != entry.CounterpartyCurrencyCode {
+		reason := fmt.Sprintf("currency_mismatch: expected counterparty currency %s != journal currency %s", entry.CounterpartyCurrencyCode, journal.CurrencyCode)
+		h.recordMismatch(w, r, entry, attempt, domain.MatchRuleCurrencyMismatch, reason)
+		return
+	}
+
+	// Validation 4: the target journal's amount must match the expected
+	// counterparty amount, compared exactly (big.Rat) within matchTolerance.
 	if diff := new(big.Rat).Sub(journalAmount, expected); diff.Abs(diff).Cmp(matchTolerance) > 0 {
 		reason := fmt.Sprintf("amount_mismatch: expected counterparty amount %s %s != journal amount %s %s",
 			domain.CanonicalAmount(expected), entry.CounterpartyCurrencyCode, domain.CanonicalAmount(journalAmount), journal.CurrencyCode)
-		h.recordMismatch(w, r, entry, req.TargetJournalID, reason, principalID, correlationID)
+		h.recordMismatch(w, r, entry, attempt, domain.MatchRuleAmountMismatch, reason)
 		return
 	}
 
@@ -460,23 +471,23 @@ func (h *Handler) MatchEntry(w http.ResponseWriter, r *http.Request) {
 		}
 		if !entityregistry.SharesOpenGroupRelationship(sourceHierarchies, targetHierarchies, entry.SourceLegalEntityID, entry.TargetLegalEntityID, time.Now().UTC()) {
 			reason := domain.ErrGroupRelationshipLost.Error()
-			h.recordMismatch(w, r, entry, req.TargetJournalID, reason, principalID, correlationID)
+			h.recordMismatch(w, r, entry, attempt, domain.MatchRuleGroupRelationshipLost, reason)
 			return
 		}
 	}
 
 	// Match Successful
 	entry.TargetJournalID = &req.TargetJournalID
-	entry.MatchStatus = "MATCHED"
-	entry.MismatchReason = nil
-	if err := h.store.UpdateMatch(r.Context(), entry, principalID, correlationID); err != nil {
+	entry.MatchStatus = domain.MatchStatusMatched
+	attempt.Outcome = domain.MatchStatusMatched
+	if err := h.store.UpdateMatch(r.Context(), entry, attempt, principalID, correlationID); err != nil {
 		h.writeUpdateMatchErr(w, err)
 		return
 	}
 
 	writeJSON(w, http.StatusOK, domain.MatchEntryResponse{
 		IntercompanyEntryID: id,
-		MatchStatus:         "MATCHED",
+		MatchStatus:         domain.MatchStatusMatched,
 	})
 }
 
@@ -512,15 +523,51 @@ func journalTotal(j *ledger.JournalDetail) (*big.Rat, error) {
 	return totalDebit, nil
 }
 
-// recordMismatch persists a MISMATCH outcome and reports it. The response
-// claims MISMATCH only once the store has recorded it (and its event): a
-// failed write is a 503 the caller can retry, and a pair whose status moved
-// on since it was read is a 422, never overwritten.
-func (h *Handler) recordMismatch(w http.ResponseWriter, r *http.Request, entry *domain.IntercompanyEntry, targetJournalID, reason, principalID, correlationID string) {
-	entry.TargetJournalID = &targetJournalID
+// newMatchAttempt starts the evidence for one match attempt: what each side
+// of the pair expects, which journal is examined, and the tolerance. The
+// source side is expected but never examined (SPEC_DEVIATIONS A6).
+func newMatchAttempt(entry *domain.IntercompanyEntry, targetJournalID, principalID, correlationID string) *domain.MatchAttempt {
+	sourceJournalID := entry.SourceJournalID
+	return &domain.MatchAttempt{
+		IntercompanyEntryID: entry.IntercompanyEntryID,
+		Source: domain.MatchAttemptSide{
+			JournalID: &sourceJournalID, ExpectedAmount: entry.Amount, ExpectedCurrency: entry.CurrencyCode,
+		},
+		Target: domain.MatchAttemptSide{
+			JournalID: &targetJournalID, ExpectedAmount: entry.CounterpartyAmount, ExpectedCurrency: entry.CounterpartyCurrencyCode,
+		},
+		ExaminedJournalIDs: []string{targetJournalID},
+		Tolerance:          domain.Decimal(domain.CanonicalAmount(matchTolerance)),
+		AttemptedBy:        principalID,
+		CorrelationID:      &correlationID,
+	}
+}
+
+// observeTargetJournal records what general-ledger-svc reported for the
+// target journal, exactly as reported.
+func observeTargetJournal(side *domain.MatchAttemptSide, j *ledger.JournalDetail, total *big.Rat) {
+	amount := domain.Decimal(domain.CanonicalAmount(total))
+	currency, entity, status, period := j.CurrencyCode, j.LegalEntityID, j.Status, j.FiscalPeriod
+	side.ObservedAmount = &amount
+	side.ObservedCurrency = &currency
+	side.ObservedLegalEntityID = &entity
+	side.ObservedStatus = &status
+	side.ObservedFiscalPeriod = &period
+}
+
+// recordMismatch persists a MISMATCH outcome, with the rule that failed,
+// and reports it. The response claims MISMATCH only once the store has
+// recorded it (and its attempt and event): a failed write is a 503 the
+// caller can retry, and a pair whose status moved on since it was read is a
+// 422, never overwritten.
+func (h *Handler) recordMismatch(w http.ResponseWriter, r *http.Request, entry *domain.IntercompanyEntry, attempt *domain.MatchAttempt, rule, reason string) {
+	entry.TargetJournalID = attempt.Target.JournalID
 	entry.MatchStatus = domain.MatchStatusMismatch
 	entry.MismatchReason = &reason
-	if err := h.store.UpdateMatch(r.Context(), entry, principalID, correlationID); err != nil {
+	attempt.Outcome = domain.MatchStatusMismatch
+	attempt.FailedRule = &rule
+	attempt.Message = &reason
+	if err := h.store.UpdateMatch(r.Context(), entry, attempt, attempt.AttemptedBy, derefOr(attempt.CorrelationID)); err != nil {
 		h.writeUpdateMatchErr(w, err)
 		return
 	}
@@ -528,7 +575,15 @@ func (h *Handler) recordMismatch(w http.ResponseWriter, r *http.Request, entry *
 		IntercompanyEntryID: entry.IntercompanyEntryID,
 		MatchStatus:         domain.MatchStatusMismatch,
 		MismatchReason:      &reason,
+		FailedRule:          &rule,
 	})
+}
+
+func derefOr(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
 }
 
 func (h *Handler) writeUpdateMatchErr(w http.ResponseWriter, err error) {
@@ -750,6 +805,44 @@ func (h *Handler) ListTransitions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, transitions)
+}
+
+// ── GET /v1/intercompany/entries/{id}/explanation ─────────────────────────────────
+
+// ExplainMismatch returns the pair's current status and mismatch_reason
+// with every match attempt behind them, oldest first: expected against
+// observed amount and currency per side, the rule that failed, the journals
+// examined and the tolerance applied. Authorized like GetEntry.
+func (h *Handler) ExplainMismatch(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+
+	entry, ok := h.fetchEntry(w, r, id)
+	if !ok {
+		return
+	}
+
+	if err := h.authz.CheckAllowed(r.Context(), principalID, entry.SourceLegalEntityID, actionViewEntry); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	attempts, err := h.store.ListMatchAttempts(r.Context(), id)
+	if err != nil {
+		h.log.Error("failed to list intercompany match attempts", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, domain.MismatchExplanation{
+		IntercompanyEntryID: entry.IntercompanyEntryID,
+		MatchStatus:         entry.MatchStatus,
+		MismatchReason:      entry.MismatchReason,
+		Attempts:            attempts,
+	})
 }
 
 // fetchEntry reads a pair, answering 404 or 503 itself when it cannot.

@@ -14,12 +14,12 @@ import (
 // before this lifecycle existed — it IS the spec's "Open" state, just
 // under its pre-existing name.
 const (
-	MatchStatusUnmatched           = "UNMATCHED" // spec's "Open"
+	MatchStatusUnmatched            = "UNMATCHED" // spec's "Open"
 	MatchStatusAwaitingCounterparty = "AWAITING_COUNTERPARTY"
-	MatchStatusMatched             = "MATCHED"
-	MatchStatusMismatch            = "MISMATCH"
-	MatchStatusDisputed            = "DISPUTED"
-	MatchStatusResolved            = "RESOLVED"
+	MatchStatusMatched              = "MATCHED"
+	MatchStatusMismatch             = "MISMATCH"
+	MatchStatusDisputed             = "DISPUTED"
+	MatchStatusResolved             = "RESOLVED"
 
 	// MatchStatusClosed is the terminal state of a MATCHED pair, e.g. once
 	// its period has been consolidated. Nothing leaves it.
@@ -52,12 +52,12 @@ func ValidResolutionOutcome(o string) bool {
 var MatchableStatuses = []string{MatchStatusUnmatched, MatchStatusAwaitingCounterparty, MatchStatusMismatch}
 
 type IntercompanyEntry struct {
-	IntercompanyEntryID string    `json:"intercompany_entry_id"`
-	TenantID            string    `json:"tenant_id"`
-	SourceLegalEntityID string    `json:"source_legal_entity_id"`
-	TargetLegalEntityID string    `json:"target_legal_entity_id"`
-	SourceJournalID     string    `json:"source_journal_id"`
-	TargetJournalID     *string   `json:"target_journal_id,omitempty"`
+	IntercompanyEntryID string  `json:"intercompany_entry_id"`
+	TenantID            string  `json:"tenant_id"`
+	SourceLegalEntityID string  `json:"source_legal_entity_id"`
+	TargetLegalEntityID string  `json:"target_legal_entity_id"`
+	SourceJournalID     string  `json:"source_journal_id"`
+	TargetJournalID     *string `json:"target_journal_id,omitempty"`
 
 	// Amount/CurrencyCode are the originating (source) entity's side of the
 	// pair. CounterpartyAmount/CounterpartyCurrencyCode are what the
@@ -186,6 +186,8 @@ type MatchEntryResponse struct {
 	IntercompanyEntryID string  `json:"intercompany_entry_id"`
 	MatchStatus         string  `json:"match_status"`
 	MismatchReason      *string `json:"mismatch_reason,omitempty"`
+	// FailedRule is the MatchRule* code of a MISMATCH.
+	FailedRule *string `json:"failed_rule,omitempty"`
 }
 
 // AcknowledgeCounterpartyRequest is ACC-11's own AcknowledgeCounterparty
@@ -216,6 +218,74 @@ type ClosePairRequest struct {
 	Reason string `json:"reason"`
 }
 
+// Match rules: which check a MatchIntercompany attempt failed, in the order
+// the match applies them.
+const (
+	MatchRuleCounterpartyJournalMissing = "COUNTERPARTY_JOURNAL_MISSING"
+	MatchRuleTargetEntityMismatch       = "TARGET_ENTITY_MISMATCH"
+	MatchRuleTargetJournalNotFinalized  = "TARGET_JOURNAL_NOT_FINALIZED"
+	MatchRuleCurrencyUnverifiable       = "CURRENCY_UNVERIFIABLE"
+	MatchRuleCurrencyMismatch           = "CURRENCY_MISMATCH"
+	MatchRuleAmountMismatch             = "AMOUNT_MISMATCH"
+	MatchRuleGroupRelationshipLost      = "GROUP_RELATIONSHIP_LOST"
+
+	// MatchRuleLegacyUnstructured marks an attempt backfilled by migration
+	// 000007 from a pre-existing mismatch_reason sentence, which never said
+	// which rule failed.
+	MatchRuleLegacyUnstructured = "LEGACY_UNSTRUCTURED"
+)
+
+// MatchAttempt is one applied MatchIntercompany attempt, the structured
+// ExplainMismatch evidence (migration 000007). Append-only: a later attempt
+// never overwrites an earlier one.
+type MatchAttempt struct {
+	AttemptID           int64  `json:"attempt_id"`
+	IntercompanyEntryID string `json:"intercompany_entry_id"`
+
+	// Outcome is MatchStatusMatched or MatchStatusMismatch. FailedRule and
+	// Message are set exactly when it is a mismatch; Message is the sentence
+	// the pair's mismatch_reason reports.
+	Outcome    string  `json:"outcome"`
+	FailedRule *string `json:"failed_rule,omitempty"`
+	Message    *string `json:"message,omitempty"`
+
+	Source MatchAttemptSide `json:"source"`
+	Target MatchAttemptSide `json:"target"`
+
+	ExaminedJournalIDs []string `json:"examined_journal_ids"`
+	Tolerance          Decimal  `json:"tolerance"`
+
+	// FiscalPeriod is the pair's period at the time of the attempt.
+	FiscalPeriod  *string   `json:"fiscal_period,omitempty"`
+	AttemptedBy   string    `json:"attempted_by"`
+	CorrelationID *string   `json:"correlation_id,omitempty"`
+	AttemptedAt   time.Time `json:"attempted_at"`
+}
+
+// MatchAttemptSide is what one side of the pair expected and what
+// general-ledger-svc reported for the journal examined on that side. The
+// Observed fields are nil when the side was not examined (the source side
+// never is yet, SPEC_DEVIATIONS A6) or the journal was not found.
+type MatchAttemptSide struct {
+	JournalID             *string  `json:"journal_id,omitempty"`
+	ExpectedAmount        Decimal  `json:"expected_amount"`
+	ExpectedCurrency      string   `json:"expected_currency"`
+	ObservedAmount        *Decimal `json:"observed_amount,omitempty"`
+	ObservedCurrency      *string  `json:"observed_currency,omitempty"`
+	ObservedLegalEntityID *string  `json:"observed_legal_entity_id,omitempty"`
+	ObservedStatus        *string  `json:"observed_status,omitempty"`
+	ObservedFiscalPeriod  *string  `json:"observed_fiscal_period,omitempty"`
+}
+
+// MismatchExplanation is ExplainMismatch's answer: the pair's current
+// status and reason, and every match attempt, oldest first.
+type MismatchExplanation struct {
+	IntercompanyEntryID string         `json:"intercompany_entry_id"`
+	MatchStatus         string         `json:"match_status"`
+	MismatchReason      *string        `json:"mismatch_reason,omitempty"`
+	Attempts            []MatchAttempt `json:"attempts"`
+}
+
 // PairTransition is one row of a pair's append-only state history.
 // FromState is nil on the first row: the pair's creation, or (actor
 // "migration:000006") the state it was already in when history began.
@@ -237,12 +307,12 @@ type errorString string
 func (e errorString) Error() string { return string(e) }
 
 var (
-	ErrEntryNotFound           = errorString("intercompany entry not found")
-	ErrInvalidAmount           = errorString("intercompany entry amount must be greater than zero")
-	ErrAmountPrecision         = errorString("intercompany amounts must have at most 4 decimal places and 14 integer digits")
-	ErrInvalidCurrency         = errorString("currency codes must be three-letter ISO 4217 codes naming a real currency")
-	ErrInvalidFiscalPeriod     = errorString("fiscal_period must be 1-20 characters with no control characters")
-	ErrInvalidDimensions       = errorString("invalid dimensions")
+	ErrEntryNotFound       = errorString("intercompany entry not found")
+	ErrInvalidAmount       = errorString("intercompany entry amount must be greater than zero")
+	ErrAmountPrecision     = errorString("intercompany amounts must have at most 4 decimal places and 14 integer digits")
+	ErrInvalidCurrency     = errorString("currency codes must be three-letter ISO 4217 codes naming a real currency")
+	ErrInvalidFiscalPeriod = errorString("fiscal_period must be 1-20 characters with no control characters")
+	ErrInvalidDimensions   = errorString("invalid dimensions")
 
 	// ErrCounterpartyAmountRequired: a cross-currency pair must state the
 	// counterparty amount; this service has no FX rate to derive it from.
@@ -252,14 +322,14 @@ var (
 	// the same amount. Accepting a different expected counterparty amount
 	// would let a caller decide what the target journal has to match.
 	ErrCounterpartyAmountDiffers = errorString("counterparty_amount must equal amount when both sides are in the same currency")
-	ErrSameEntityForbidden     = errorString("source and target legal entities must be different")
-	ErrEntryAlreadyMatched     = errorString("intercompany entry is already matched")
-	ErrGLServiceUnavailable    = errorString("general-ledger-svc unavailable")
-	ErrAmountMismatch          = errorString("journal amount or entity discrepancy detected")
-	ErrAuthorizationDenied     = errorString("authorization denied for intercompany accounting action")
-	ErrAuthzServiceUnavailable = errorString("authorization-svc unavailable")
-	ErrIdentityMissing         = errorString("caller identity missing")
-	ErrStoreUnavailable        = errorString("intercompany store unavailable")
+	ErrSameEntityForbidden       = errorString("source and target legal entities must be different")
+	ErrEntryAlreadyMatched       = errorString("intercompany entry is already matched")
+	ErrGLServiceUnavailable      = errorString("general-ledger-svc unavailable")
+	ErrAmountMismatch            = errorString("journal amount or entity discrepancy detected")
+	ErrAuthorizationDenied       = errorString("authorization denied for intercompany accounting action")
+	ErrAuthzServiceUnavailable   = errorString("authorization-svc unavailable")
+	ErrIdentityMissing           = errorString("caller identity missing")
+	ErrStoreUnavailable          = errorString("intercompany store unavailable")
 
 	// ── ACC-11 lifecycle ─────────────────────────────────────────────────
 

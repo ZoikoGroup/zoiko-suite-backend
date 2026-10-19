@@ -149,13 +149,13 @@ func (s *PgStore) CreateEntry(ctx context.Context, entry *domain.IntercompanyEnt
 				intercompany_entry_id, tenant_id, source_legal_entity_id, target_legal_entity_id,
 				source_journal_id, target_journal_id, amount, currency_code,
 				counterparty_amount, counterparty_currency_code, fiscal_period, dimensions,
-				match_status, mismatch_reason, created_at, updated_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7::numeric, $8, $9::numeric, $10, $11, $12, $13, $14, $15, $16)
+				match_status, created_at, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7::numeric, $8, $9::numeric, $10, $11, $12, $13, $14, $15)
 			ON CONFLICT (tenant_id, source_journal_id) DO NOTHING
 		`, entry.IntercompanyEntryID, tenantID, entry.SourceLegalEntityID, entry.TargetLegalEntityID,
 			entry.SourceJournalID, entry.TargetJournalID, string(entry.Amount), entry.CurrencyCode,
 			string(entry.CounterpartyAmount), entry.CounterpartyCurrencyCode, entry.FiscalPeriod, entry.Dimensions,
-			entry.MatchStatus, entry.MismatchReason, entry.CreatedAt, entry.UpdatedAt)
+			entry.MatchStatus, entry.CreatedAt, entry.UpdatedAt)
 		if err != nil {
 			return err
 		}
@@ -186,11 +186,15 @@ func (s *PgStore) CreateEntry(ctx context.Context, entry *domain.IntercompanyEnt
 	return created, err
 }
 
-const intercompanyEntryColumns = `
+// intercompanyEntryColumns is the select list for a full pair, FROM
+// intercompany_entries. mismatch_reason comes from the latest match attempt
+// (match_attempts.go); the pair's own mismatch_reason column is no longer
+// written or read.
+var intercompanyEntryColumns = `
 	intercompany_entry_id, tenant_id, source_legal_entity_id, target_legal_entity_id,
 	source_journal_id, target_journal_id, amount::text, currency_code,
 	counterparty_amount::text, counterparty_currency_code, fiscal_period, dimensions,
-	match_status, mismatch_reason, acknowledged_at, acknowledged_by_principal_id,
+	match_status, ` + latestMismatchReason + ` AS mismatch_reason, acknowledged_at, acknowledged_by_principal_id,
 	disputed_at, disputed_by_principal_id, dispute_reason,
 	resolved_at, resolved_by_principal_id, resolution_note, resolution_outcome,
 	closed_at, closed_by_principal_id, close_reason,
@@ -279,11 +283,13 @@ func (s *PgStore) ListEntries(ctx context.Context, sourceEntityID, targetEntityI
 }
 
 // UpdateMatch records a MatchIntercompany outcome and, in the same
-// transaction, enqueues the lifecycle event that outcome implies: "posted"
-// for MATCHED, "mismatch.detected" for MISMATCH. entry must already carry
-// the target state the caller wants persisted (TargetJournalID, MatchStatus,
-// MismatchReason) — see handler.go's MatchEntry, which mutates its locally
-// fetched entry before calling this.
+// transaction, the attempt that produced it (intercompany_match_attempts)
+// and the lifecycle event that outcome implies: "posted" for MATCHED,
+// "mismatch.detected" for MISMATCH. entry must already carry the target
+// state (TargetJournalID, MatchStatus) and attempt the evidence for it —
+// see handler.go's MatchEntry. The pair's mismatch_reason is not stored on
+// the pair: it is the latest attempt's message, and entry.MismatchReason is
+// set from attempt on return.
 //
 // Guarded on the CURRENT status being one of domain.MatchableStatuses, read
 // under a row lock, the same guard the other lifecycle methods use: without
@@ -291,7 +297,7 @@ func (s *PgStore) ListEntries(ctx context.Context, sourceEntityID, targetEntityI
 // it would be silently overwritten. Returns domain.ErrInvalidPairTransition
 // in that case. A change of status is recorded in the pair's transition
 // history in the same transaction.
-func (s *PgStore) UpdateMatch(ctx context.Context, entry *domain.IntercompanyEntry, actorID, correlationID string) error {
+func (s *PgStore) UpdateMatch(ctx context.Context, entry *domain.IntercompanyEntry, attempt *domain.MatchAttempt, actorID, correlationID string) error {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
 		return domain.ErrIdentityMissing
@@ -301,6 +307,9 @@ func (s *PgStore) UpdateMatch(ctx context.Context, entry *domain.IntercompanyEnt
 	// belongs to a lifecycle command with its own guard (pair_lifecycle.go).
 	if entry.MatchStatus != domain.MatchStatusMatched && entry.MatchStatus != domain.MatchStatusMismatch {
 		return domain.ErrInvalidPairTransition
+	}
+	if attempt == nil || attempt.Outcome != entry.MatchStatus || attempt.IntercompanyEntryID != entry.IntercompanyEntryID {
+		return fmt.Errorf("match attempt does not describe this outcome")
 	}
 
 	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
@@ -314,16 +323,23 @@ func (s *PgStore) UpdateMatch(ctx context.Context, entry *domain.IntercompanyEnt
 		now := time.Now().UTC()
 		res, err := tx.Exec(ctx, `
 			UPDATE intercompany_entries
-			SET target_journal_id = $1, match_status = $2, mismatch_reason = $3, updated_at = $4
-			WHERE intercompany_entry_id = $5 AND tenant_id = $6 AND match_status = ANY($7)
-		`, entry.TargetJournalID, entry.MatchStatus, entry.MismatchReason, now, entry.IntercompanyEntryID, tenantID, domain.MatchableStatuses)
+			SET target_journal_id = $1, match_status = $2, updated_at = $3
+			WHERE intercompany_entry_id = $4 AND tenant_id = $5 AND match_status = ANY($6)
+		`, entry.TargetJournalID, entry.MatchStatus, now, entry.IntercompanyEntryID, tenantID, domain.MatchableStatuses)
 		if err != nil {
 			return err
 		}
 		if res.RowsAffected() == 0 {
 			return domain.ErrInvalidPairTransition
 		}
-		// A repeated MISMATCH is not a state change; only a change is history.
+		attempt.FiscalPeriod = period
+		if err := insertMatchAttempt(ctx, tx, tenantID, attempt); err != nil {
+			return err
+		}
+		entry.MismatchReason = attempt.Message
+
+		// A repeated MISMATCH is not a state change; only a change is history
+		// (the attempt itself is recorded above).
 		if current != entry.MatchStatus {
 			if err := recordTransition(ctx, tx, tenantID, entry.IntercompanyEntryID, transition{
 				from: &current, to: entry.MatchStatus, fiscalPeriod: period, reason: entry.MismatchReason,

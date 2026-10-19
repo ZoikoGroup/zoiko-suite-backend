@@ -65,12 +65,12 @@ func TestPgStore_A9_EveryStateChangeIsRecorded(t *testing.T) {
 		t.Fatalf("Acknowledge: %v", err)
 	}
 	mismatch(entry, "amount_mismatch: first")
-	if err := s.UpdateMatch(ctx, entry, "matcher", "corr-m1"); err != nil {
+	if err := s.UpdateMatch(ctx, entry, testAttempt(entry), "matcher", "corr-m1"); err != nil {
 		t.Fatalf("UpdateMatch 1: %v", err)
 	}
 	// A second mismatch is a new attempt, not a state change: no new row.
 	mismatch(entry, "amount_mismatch: second")
-	if err := s.UpdateMatch(ctx, entry, "matcher", "corr-m2"); err != nil {
+	if err := s.UpdateMatch(ctx, entry, testAttempt(entry), "matcher", "corr-m2"); err != nil {
 		t.Fatalf("UpdateMatch 2: %v", err)
 	}
 	if err := s.DisputeIntercompany(ctx, id, "disputer", "wrong rate", "corr-dispute"); err != nil {
@@ -133,7 +133,7 @@ func TestPgStore_A9_CloseOnlyFromMatched(t *testing.T) {
 
 	targetJ := uuid.New().String()
 	entry.TargetJournalID, entry.MatchStatus, entry.MismatchReason = &targetJ, domain.MatchStatusMatched, nil
-	if err := s.UpdateMatch(ctx, entry, "matcher", "c3"); err != nil {
+	if err := s.UpdateMatch(ctx, entry, testAttempt(entry), "matcher", "c3"); err != nil {
 		t.Fatalf("UpdateMatch: %v", err)
 	}
 	if err := s.ClosePair(ctx, id, "closer", "period 2026-09 consolidated", "c4"); err != nil {
@@ -154,7 +154,7 @@ func TestPgStore_A9_CloseOnlyFromMatched(t *testing.T) {
 		t.Fatalf("second close: expected ErrInvalidPairTransition, got %v", err)
 	}
 	entry.MatchStatus = domain.MatchStatusMatched
-	if err := s.UpdateMatch(ctx, entry, "matcher", "c6"); !errors.Is(err, domain.ErrInvalidPairTransition) {
+	if err := s.UpdateMatch(ctx, entry, testAttempt(entry), "matcher", "c6"); !errors.Is(err, domain.ErrInvalidPairTransition) {
 		t.Fatalf("match after close: expected ErrInvalidPairTransition, got %v", err)
 	}
 
@@ -180,7 +180,7 @@ func TestPgStore_A9_ResolveRequiresOutcome(t *testing.T) {
 		t.Fatal(err)
 	}
 	mismatch(entry, "x")
-	if err := s.UpdateMatch(ctx, entry, "a", "c"); err != nil {
+	if err := s.UpdateMatch(ctx, entry, testAttempt(entry), "a", "c"); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.DisputeIntercompany(ctx, entry.IntercompanyEntryID, "a", "r", "c"); err != nil {
@@ -216,9 +216,8 @@ func TestPgStore_A9_HistoryIsImmutable(t *testing.T) {
 	}
 }
 
-// The test connection is a superuser, which bypasses RLS entirely; this
-// probes the policy under an ordinary role, with no tenant predicate in the
-// query, so only the policy can be doing the filtering.
+// Probed under an ordinary role (rlsVisibleRows): the test connection is a
+// superuser and would bypass RLS.
 func TestPgStore_A9_HistoryIsTenantIsolatedByRLS(t *testing.T) {
 	pool := openTestPool(t)
 	s := store.New(pool, store.WithEventRegion("test"))
@@ -230,37 +229,10 @@ func TestPgStore_A9_HistoryIsTenantIsolatedByRLS(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := pool.Exec(ctx, `DO $$ BEGIN CREATE ROLE intercompany_rls_probe NOLOGIN;
-		EXCEPTION WHEN duplicate_object THEN NULL; END $$`); err != nil {
-		t.Fatalf("create role: %v", err)
-	}
-	if _, err := pool.Exec(ctx, `GRANT SELECT ON intercompany_pair_transitions TO intercompany_rls_probe`); err != nil {
-		t.Fatalf("grant: %v", err)
-	}
-
-	count := func(tenant string) int {
-		tx, err := pool.Begin(ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer func() { _ = tx.Rollback(ctx) }()
-		if _, err := tx.Exec(ctx, `SET LOCAL ROLE intercompany_rls_probe`); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := tx.Exec(ctx, `SELECT set_config('app.tenant_id', $1, true)`, tenant); err != nil {
-			t.Fatal(err)
-		}
-		var n int
-		if err := tx.QueryRow(ctx, `SELECT count(*) FROM intercompany_pair_transitions WHERE intercompany_entry_id = $1`,
-			entry.IntercompanyEntryID).Scan(&n); err != nil {
-			t.Fatal(err)
-		}
-		return n
-	}
-	if n := count(tenantA); n != 1 {
+	if n := rlsVisibleRows(t, pool, "intercompany_pair_transitions", tenantA, entry.IntercompanyEntryID); n != 1 {
 		t.Fatalf("tenant A should see its own history, saw %d rows", n)
 	}
-	if n := count(tenantB); n != 0 {
+	if n := rlsVisibleRows(t, pool, "intercompany_pair_transitions", tenantB, entry.IntercompanyEntryID); n != 0 {
 		t.Fatalf("RLS failure: tenant B saw %d of tenant A's transition rows", n)
 	}
 }

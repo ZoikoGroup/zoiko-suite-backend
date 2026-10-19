@@ -27,12 +27,14 @@ var migrations = []string{
 	"000004_add_eventing_outbox.up.sql",
 	"000005_pair_counterparty_period_dimensions.up.sql",
 	"000006_pair_closed_state_transitions.up.sql",
+	"000007_match_attempts.up.sql",
 }
 
 // resetTables is every table the migrations create, children first.
 // DROP ... CASCADE on a parent drops only the child's foreign key, not the
 // child table, so each is dropped by name.
 var resetTables = []string{
+	"intercompany_match_attempts",
 	"intercompany_pair_transitions",
 	"intercompany_entries",
 	"eventing_outbox",
@@ -176,4 +178,27 @@ func TestPgStore_RLS_TenantIsolation(t *testing.T) {
 	if err == nil {
 		t.Fatal("RLS failure: tenant B's session was able to read tenant A's intercompany entry")
 	}
+}
+
+// testAttempt is the minimal evidence UpdateMatch requires for the outcome
+// entry already carries, for tests whose subject is not the attempt itself.
+func testAttempt(entry *domain.IntercompanyEntry) *domain.MatchAttempt {
+	a := &domain.MatchAttempt{
+		IntercompanyEntryID: entry.IntercompanyEntryID,
+		Outcome:             entry.MatchStatus,
+		Source: domain.MatchAttemptSide{
+			JournalID: &entry.SourceJournalID, ExpectedAmount: entry.Amount, ExpectedCurrency: entry.CurrencyCode,
+		},
+		Target: domain.MatchAttemptSide{
+			JournalID: entry.TargetJournalID, ExpectedAmount: entry.CounterpartyAmount, ExpectedCurrency: entry.CounterpartyCurrencyCode,
+		},
+		ExaminedJournalIDs: []string{},
+		Tolerance:          "0.001",
+		AttemptedBy:        "test",
+	}
+	if entry.MatchStatus == domain.MatchStatusMismatch {
+		rule := domain.MatchRuleAmountMismatch
+		a.FailedRule, a.Message = &rule, entry.MismatchReason
+	}
+	return a
 }

@@ -40,6 +40,7 @@ type stubStoreReal struct {
 	matchEvents   []eventRecord
 
 	transitions map[string][]domain.PairTransition
+	attempts    map[string][]domain.MatchAttempt
 
 	// updateMatchErr, when set, is returned by UpdateMatch without writing.
 	updateMatchErr error
@@ -52,7 +53,8 @@ type stubStoreReal struct {
 }
 
 func newStubStoreReal() *stubStoreReal {
-	return &stubStoreReal{entries: make(map[string]*domain.IntercompanyEntry), bySourceJournal: make(map[string]string)}
+	return &stubStoreReal{entries: make(map[string]*domain.IntercompanyEntry), bySourceJournal: make(map[string]string),
+		attempts: make(map[string][]domain.MatchAttempt)}
 }
 
 func (s *stubStoreReal) CreateEntry(_ context.Context, entry *domain.IntercompanyEntry, actorID, correlationID string) (bool, error) {
@@ -93,7 +95,7 @@ func (s *stubStoreReal) ListEntries(_ context.Context, sourceEntityID, targetEnt
 	return out, nil
 }
 
-func (s *stubStoreReal) UpdateMatch(_ context.Context, entry *domain.IntercompanyEntry, actorID, correlationID string) error {
+func (s *stubStoreReal) UpdateMatch(_ context.Context, entry *domain.IntercompanyEntry, attempt *domain.MatchAttempt, actorID, correlationID string) error {
 	if s.updateMatchErr != nil {
 		return s.updateMatchErr
 	}
@@ -106,8 +108,9 @@ func (s *stubStoreReal) UpdateMatch(_ context.Context, entry *domain.Intercompan
 	}
 	existing.TargetJournalID = entry.TargetJournalID
 	existing.MatchStatus = entry.MatchStatus
-	existing.MismatchReason = entry.MismatchReason
+	existing.MismatchReason = attempt.Message
 	existing.UpdatedAt = time.Now().UTC()
+	s.attempts[entry.IntercompanyEntryID] = append(s.attempts[entry.IntercompanyEntryID], *attempt)
 	s.matchEvents = append(s.matchEvents, eventRecord{entry: *existing, actorID: actorID, correlationID: correlationID})
 	return nil
 }
@@ -154,6 +157,10 @@ func (s *stubStoreReal) ClosePair(_ context.Context, id, principalID, reason, _ 
 	now := time.Now().UTC()
 	entry.MatchStatus, entry.ClosedAt, entry.ClosedByPrincipalID, entry.CloseReason = domain.MatchStatusClosed, &now, &principalID, &reason
 	return nil
+}
+
+func (s *stubStoreReal) ListMatchAttempts(_ context.Context, id string) ([]domain.MatchAttempt, error) {
+	return s.attempts[id], nil
 }
 
 func (s *stubStoreReal) ListTransitions(_ context.Context, id string) ([]domain.PairTransition, error) {
