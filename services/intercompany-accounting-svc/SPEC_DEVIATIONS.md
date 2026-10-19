@@ -114,9 +114,9 @@ reconciliation-engine-svc holds for DATA-07.
   requires `outcome` (`ACCEPTED` / `CORRECTED` / `WRITTEN_OFF`) on
   ResolveMismatch and stores it as `resolution_outcome`. Every state change
   is now recorded in the append-only `intercompany_pair_transitions` table
-  (`GET …/entries/{id}/transitions`). consolidation-svc is not changed: it
-  still eliminates MATCHED only and does not read the outcome yet (see B8
-  before any pair is closed in production).
+  (`GET …/entries/{id}/transitions`). consolidation-svc now also eliminates
+  CLOSED pairs, not MATCHED only (see B8) — it still does not read
+  `resolution_outcome`.
 - **A10. No `Idempotency-Key` or `expected_version` on the lifecycle
   commands.** The wireframe requires both on every command. Create is
   idempotent by `(tenant_id, source_journal_id)`; acknowledge, match, dispute
@@ -208,14 +208,14 @@ reconciliation-engine-svc holds for DATA-07.
     each side's open set, so neither side alone may do it. The other
     commands check one entity (A8 is about who may certify both sides; that
     question is not settled here).
-  - ***Follow-up required before closing pairs in production:***
-    consolidation-svc's `FetchMatchedIntercompanyEntries` keeps
-    `match_status == "MATCHED"` only. Once a pair is CLOSED it drops out of
-    that list, so re-running consolidation for an already-consolidated
-    period would no longer eliminate it. consolidation-svc must treat CLOSED
-    as eliminable (it was matched; the history records MATCHED → CLOSED) in
-    the same change that wires up `resolution_outcome`. That change was
-    deliberately left out of scope here.
+  - ***Follow-up required before closing pairs in production: closed.***
+    consolidation-svc's `FetchMatchedIntercompanyEntries` (renamed
+    `FetchEliminableIntercompanyEntries`) kept `match_status == "MATCHED"`
+    only, so a CLOSED pair would have dropped out of elimination on any
+    re-run for an already-consolidated period. It now keeps MATCHED or
+    CLOSED (consolidation-svc's own B6), and its `Amount` field moved off
+    `float64` onto exact decimal text in the same change (ZS-DATA-001 D06).
+    `resolution_outcome` is still not read there — that remains open.
   - *Resolution outcome.* Required on every new resolution, by the handler
     (400 `invalid_outcome`), by the store, and by a CHECK constraint.
     `chk_resolved_has_outcome` is `NOT VALID`, so pairs resolved before
