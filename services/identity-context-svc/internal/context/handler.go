@@ -16,6 +16,7 @@ import (
 
 	"zoiko.io/identity-context-svc/internal/domain"
 	svcenvelope "zoiko.io/identity-context-svc/internal/envelope"
+	"zoiko.io/identity-context-svc/internal/lifecycle"
 	"zoiko.io/identity-context-svc/internal/ratelimit"
 	"zoiko.io/identity-context-svc/internal/session"
 	"zoiko.io/identity-context-svc/internal/store"
@@ -83,6 +84,29 @@ type Handler struct {
 	peerName     func(*http.Request) string
 	endLogin     func(ctx context.Context, tenantID, sid, reason, actor, correlationID string) error
 	dpop         *idenv.DPoPVerifier
+
+	// status backs PUT /v1/principals/{id}/status. Nil answers 501.
+	status StatusChanger
+}
+
+// StatusChanger changes a principal's status as one governed command: the
+// status row, its decision-log entry and its events in one transaction, then
+// every session the principal holds ended on a disable or suspension
+// (internal/lifecycle.Service.SetStatus).
+//
+// The route used to call PrincipalStore.UpdateStatus, which wrote the row and
+// a decision-log entry and nothing else: no event ever told another service,
+// so authorization-svc kept a disabled principal ACTIVE, and the principal's
+// live sessions ran to expiry (Group 1 re-audit F-3, 19 Oct 2026).
+type StatusChanger interface {
+	ChangeStatus(ctx context.Context, tenantID, actorID, principalID string,
+		status domain.PrincipalStatus, reason, correlationID string) error
+}
+
+// WithStatusChanger wires the principal-status command.
+func (h *Handler) WithStatusChanger(s StatusChanger) *Handler {
+	h.status = s
+	return h
 }
 
 // WithDPoP verifies DPoP proofs at resolve, so a DPoP-bound access token
@@ -722,6 +746,12 @@ func (h *Handler) UpdatePrincipalStatus(w http.ResponseWriter, r *http.Request) 
 	if !h.authorize(w, r, callerPrincipalID, tenantID, IdentityPrincipalStatus) {
 		return
 	}
+	if h.status == nil {
+		// An unconfigured privileged command is unavailable, not silently a
+		// row update that tells nobody (see StatusChanger).
+		writeError(w, http.StatusNotImplemented, "principal status changes are not configured")
+		return
+	}
 
 	var req domain.UpdateStatusRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -729,10 +759,18 @@ func (h *Handler) UpdatePrincipalStatus(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	if err := h.principals.UpdateStatus(
-		r.Context(), principalID, tenantID, req.Status, callerPrincipalID, correlationID,
+	if err := h.status.ChangeStatus(
+		r.Context(), tenantID, callerPrincipalID, principalID, req.Status, req.Reason, correlationID,
 	); err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to update status")
+		switch {
+		case errors.Is(err, lifecycle.ErrInvalid):
+			writeError(w, http.StatusBadRequest, err.Error())
+		case errors.Is(err, lifecycle.ErrForbidden):
+			writeCoded(w, http.StatusForbidden, "self_status_change", err.Error())
+		default:
+			h.log.Error("principal status change failed", zap.Error(err))
+			writeError(w, http.StatusInternalServerError, "failed to update status")
+		}
 		return
 	}
 

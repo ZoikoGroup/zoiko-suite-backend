@@ -91,13 +91,19 @@ type SessionContext struct {
 	AdaptiveRiskScore int    `json:"adaptive_risk_score"`
 	RiskSignalSource  string `json:"risk_signal_source"`
 	// EnvelopeJWTJTI is the JWT ID of the issued IdentityContextEnvelope.
-	EnvelopeJWTJTI string    `json:"envelope_jwt_jti"`
+	EnvelopeJWTJTI string `json:"envelope_jwt_jti"`
 	// AuthSessionID is the login session (OIDC sid) this session was
 	// resolved under; ending it ends this session (AU-01). Empty for a
 	// session resolved from a token minted before login sessions existed.
 	AuthSessionID string `json:"auth_session_id,omitempty"`
-	IssuedAt       time.Time `json:"issued_at"`
-	ExpiresAt      time.Time `json:"expires_at"`
+	// ConcurrencyExempt keeps the session-concurrency cap (ZS-IAM-001 §15,
+	// MAX_SESSIONS_PER_PRINCIPAL) off this session. Set by the resolver for
+	// service accounts and API clients: a workload may legitimately hold many
+	// concurrent sessions, and with session status now checked by relying
+	// parties a capped workload session would fail mid-flight. Not persisted.
+	ConcurrencyExempt bool      `json:"-"`
+	IssuedAt          time.Time `json:"issued_at"`
+	ExpiresAt         time.Time `json:"expires_at"`
 	// InvalidatedAt is append-only. This record is NEVER deleted.
 	InvalidatedAt      *time.Time          `json:"invalidated_at"`
 	InvalidationReason *InvalidationReason `json:"invalidation_reason"`

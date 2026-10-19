@@ -19,6 +19,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 	"github.com/riandyrn/otelchi"
@@ -35,9 +36,9 @@ import (
 	"zoiko.io/identity-context-svc/internal/events"
 	"zoiko.io/identity-context-svc/internal/health"
 	"zoiko.io/identity-context-svc/internal/idempotency"
-	"zoiko.io/identity-context-svc/internal/keys"
 	"zoiko.io/identity-context-svc/internal/mfa"
 	"zoiko.io/identity-context-svc/internal/mtlslistener"
+	"zoiko.io/identity-context-svc/internal/oidc"
 	"zoiko.io/identity-context-svc/internal/outbox"
 	"zoiko.io/identity-context-svc/internal/retention"
 	"zoiko.io/identity-context-svc/internal/session"
@@ -46,6 +47,7 @@ import (
 	"zoiko.io/identity-context-svc/internal/store"
 	"zoiko.io/identity-context-svc/internal/telemetry"
 	"zoiko.io/identity-context-svc/internal/upstream"
+	idenv "zoiko.io/identity-envelope"
 )
 
 // kafkaWriterAdapter bridges the relay's broker-agnostic MessageWriter to
@@ -250,6 +252,14 @@ func main() {
 	outboxStore := outbox.NewStore(pool, log)
 	publisher := events.NewPublisher(log, cfg.Kafka.Topic, outboxStore)
 
+	// A session the concurrency cap ends leaves the service as
+	// identity.session.revoked, like every other revocation.
+	sessionCache.WithRevocationHook(func(ctx context.Context, sessionContextID, principalID string, reason domain.InvalidationReason, correlationID string) {
+		if err := publisher.PublishSessionInvalidated(ctx, sessionContextID, principalID, reason, correlationID); err != nil {
+			log.Error("session revocation event not recorded", zap.String("session_context_id", sessionContextID), zap.Error(err))
+		}
+	})
+
 	relayCfg := outbox.DefaultRelayConfig()
 	relayCfg.BatchSize = cfg.OutboxRelayBatchSize
 	relayCfg.PollInterval = time.Duration(cfg.OutboxRelayPollMillis) * time.Millisecond
@@ -266,17 +276,20 @@ func main() {
 	go telemetry.SampleOutbox(relayCtx, relay, govMetrics, 30*time.Second, log)
 
 	// ── Signing keyring (AU-05) ──────────────────────────────────────────────
-	// Load the active signing key and any verify-only keys from config/env.
-	// The keyring is shared by JWTVerifier, JWTSigner, IdPTokenIssuer and JWKSHandler.
-	keyring, err := keys.Load(keys.Options{
-		Signing: []keys.Spec{
-			{Kid: cfg.JWTKeyID, Source: cfg.JWTSigningPrivateKeyPath},
-		},
-		ActiveKid: cfg.JWTKeyID,
-	})
+	// The keyring is shared by JWTVerifier, JWTSigner, IdPTokenIssuer, the
+	// OIDC provider and the JWKS handler.
+	//
+	// JWT_SIGNING_KEYS ("kid=source,kid=source", sources a PEM path or
+	// gcpkms://...) and JWT_VERIFY_ONLY_KEYS publish more than one key, which
+	// is what makes rotation possible without breaking live envelopes. Until
+	// 19 Oct they were loaded and read by nothing: the ring was always the one
+	// PEM file below (Group 1 re-audit F-5). That single key stays the
+	// fallback when JWT_SIGNING_KEYS is unset.
+	keyring, err := loadKeyring(cfg)
 	if err != nil {
 		log.Fatal("failed to load signing keyring", zap.Error(err))
 	}
+	log.Info("signing keyring loaded", zap.String("active_kid", keyring.ActiveKid()), zap.Strings("published_kids", keyring.Kids()))
 
 	verifier := auth.NewJWTVerifier(cfg, keyring)
 	signer := auth.NewJWTSigner(keyring)
@@ -423,6 +436,43 @@ func main() {
 			IssuerLabel:       cfg.MFAIssuerLabel,
 		})
 
+	// ── Auth plane: throttle, OIDC provider, subject lifecycle (F-5) ──────
+	//
+	// Built 14–15 Oct and constructed by nothing until 19 Oct: the provider's
+	// routes did not exist, /v1/authenticate was unthrottled and open, DPoP was
+	// never checked at resolve, and a principal disable told no one (F-3).
+	loginLimiter := newLoginLimiter(cfg, rdb, log)
+	oidcClients, err := oidc.LoadRegistry(cfg.AuthPlane.ClientsFile)
+	if err != nil {
+		log.Fatal("failed to load OIDC client registry", zap.Error(err))
+	}
+	mergeClientChannels(cfg, oidcClients)
+	// A nil *MFAService in the interface would be a non-nil SecondFactor, so
+	// the second factor is passed only when it can work.
+	var loginMFA oidc.SecondFactor
+	if mfaKeys != nil {
+		loginMFA = mfaService
+	}
+	provider, err := oidc.New(oidc.Options{
+		Cfg: cfg, Clients: oidcClients, Store: principalRepo, Pending: oidc.NewRedisPending(rdb), Ring: keyring,
+		AccessTokens: idpIssuer, AccessVerifier: verifier, Passwords: authenticator, MFA: loginMFA,
+		Sessions: resolver, Events: publisher, Limiter: loginLimiter, SIEM: siemClient, Log: log,
+		Metrics: oidc.NewMetrics(prometheus.DefaultRegisterer),
+	})
+	if err != nil {
+		log.Fatal("failed to build the OIDC provider", zap.Error(err))
+	}
+	log.Info("OIDC provider ready",
+		zap.String("issuer", cfg.AuthPlane.IssuerURL),
+		zap.Int("clients", oidcClients.Count()),
+		zap.String("authenticate_endpoint", cfg.AuthPlane.PasswordEndpoint))
+
+	lifecycleSvc, err := newLifecycle(cfg, principalRepo, hasher,
+		principalSessionEnder(principalRepo, provider, sessionCache), loginLimiter, log)
+	if err != nil {
+		log.Fatal("failed to build the subject lifecycle", zap.Error(err))
+	}
+
 	// ── HTTP router ───────────────────────────────────────────────────────
 	r := chi.NewRouter()
 
@@ -466,6 +516,9 @@ func main() {
 			return true
 		}
 	}
+	// The OAuth/OIDC protocol endpoints are called by browsers and OAuth
+	// clients speaking RFC 6749; they carry no §4 envelope by design.
+	envelopePolicy.Exempt = protocolExempt(envelopePolicy.ExemptPaths)
 	r.Use(svcenvelope.Middleware(envelopePolicy, svcenvelope.DefaultReporter()))
 
 	// Replay protection, AFTER the envelope contract.
@@ -478,7 +531,7 @@ func main() {
 	// §4 has always required Idempotency-Key on every COMMAND and the
 	// envelope has always enforced its presence. Nothing read it until now:
 	// replaying POST /v1/context/support minted a second break-glass grant.
-	r.Use(idempotency.Middleware(principalRepo, log))
+	r.Use(skipProtocolPaths(idempotency.Middleware(principalRepo, log)))
 
 	// Structured request logging
 	r.Use(func(next http.Handler) http.Handler {
@@ -579,8 +632,31 @@ func main() {
 		WithEnvironment(domain.Environment(cfg.Environment)).
 		WithSupport(supportService).
 		WithContextCache(cacheService).
-		WithMFA(mfaService)
+		WithMFA(mfaService).
+		WithLoginThrottle(loginLimiter, cfg.AuthPlane.TrustedProxyCIDRs).
+		WithAuthenticateEndpoint(cfg.AuthPlane.PasswordEndpoint, idenv.VerifiedPeerName).
+		WithLoginSessionEnder(func(ctx context.Context, tenantID, sid, reason, actor, correlationID string) error {
+			_, err := provider.EndLoginSession(ctx, tenantID, sid, reason, actor, correlationID)
+			return err
+		}).
+		WithDPoP(provider.DPoPVerifier()).
+		WithStatusChanger(statusChanger{svc: lifecycleSvc})
+	provider.RegisterRoutes(r)
 	identityctx.RegisterRoutes(r, h)
+
+	// Expired codes, revoked-jti rows and dead refresh families are only ever
+	// read to refuse them, so they are purged rather than kept.
+	go func() {
+		t := time.NewTicker(time.Hour)
+		defer t.Stop()
+		for range t.C {
+			if n, err := principalRepo.PurgeExpiredOAuth(context.Background(), time.Now().UTC().Add(-24*time.Hour)); err != nil {
+				log.Warn("OAuth purge failed", zap.Error(err))
+			} else if n > 0 {
+				log.Info("expired OAuth rows purged", zap.Int64("rows", n))
+			}
+		}
+	}()
 
 	// ── Retention / disposition sweep (GOV-09) ────────────────────────────
 	//

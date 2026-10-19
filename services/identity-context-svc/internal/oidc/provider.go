@@ -292,6 +292,20 @@ func (p *Provider) stream(ctx context.Context, tenantID, eventType string, sev s
 	}
 }
 
+// EndLoginSession ends a login session and everything resolved under it. It
+// is what a logout on /v1/context/session/{id}/invalidate and a principal
+// disable (internal/lifecycle) call, so a refresh token cannot mint a
+// replacement envelope after either.
+func (p *Provider) EndLoginSession(ctx context.Context, tenantID, sid, reason, actor, corr string) (int, error) {
+	return p.endLoginSession(ctx, tenantID, sid, reason, actor, corr)
+}
+
+// DPoPVerifier is the provider's DPoP verifier, whose replay cache is the
+// shared pending store. /v1/context/resolve uses the same one, so a proof
+// accepted at the token endpoint cannot be replayed at resolve on another
+// replica.
+func (p *Provider) DPoPVerifier() *idenv.DPoPVerifier { return p.dpop }
+
 // endLoginSession ends sid everywhere: the auth session row, its refresh
 // tokens, and every session context resolved under it (each then answers
 // inactive at every relying party's revocation check).

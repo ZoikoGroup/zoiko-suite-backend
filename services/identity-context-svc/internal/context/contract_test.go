@@ -135,6 +135,27 @@ func TestEveryContractPathIsServed(t *testing.T) {
 	mountedElsewhere := map[string]bool{
 		"GET /health":                true,
 		"GET /.well-known/jwks.json": true,
+		// The OIDC provider's routes (internal/oidc, mounted in cmd/server).
+		// internal/oidc's TestEveryProviderRouteIsPublished checks them against
+		// this same document in both directions.
+		"GET /.well-known/openid-configuration":       true,
+		"GET /.well-known/oauth-authorization-server": true,
+		"GET /oauth2/authorize":                       true,
+		"POST /oauth2/authorize":                      true,
+		"POST /oauth2/login":                          true,
+		"POST /oauth2/login/mfa":                      true,
+		"POST /oauth2/login/passkey/begin":            true,
+		"POST /oauth2/login/passkey/finish":           true,
+		"GET /oauth2/login/federate/{idpid}":          true,
+		"POST /oauth2/token":                          true,
+		"GET /oauth2/userinfo":                        true,
+		"POST /oauth2/userinfo":                       true,
+		"POST /oauth2/revoke":                         true,
+		"POST /oauth2/introspect":                     true,
+		"GET /oauth2/logout":                          true,
+		"POST /oauth2/logout":                         true,
+		"POST /v1/logout":                             true,
+		"POST /v1/context/session/introspect":         true,
 	}
 
 	var unserved []string

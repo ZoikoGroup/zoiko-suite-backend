@@ -68,9 +68,17 @@ channels:
         oneOf:
           - $ref: "#/components/messages/ContextResolved"
           - $ref: "#/components/messages/ResolutionFailed"
-          - $ref: "#/components/messages/SessionInvalidated"
+          - $ref: "#/components/messages/SessionRevoked"
           - $ref: "#/components/messages/RiskSignalUnavailable"
           - $ref: "#/components/messages/PrincipalStatusChanged"
+          - $ref: "#/components/messages/SubjectDisabled"
+          - $ref: "#/components/messages/SubjectEnabled"
+          - $ref: "#/components/messages/LoginSessionStarted"
+          - $ref: "#/components/messages/LoginSessionEnded"
+          - $ref: "#/components/messages/RefreshTokenReuseDetected"
+          - $ref: "#/components/messages/AuthorizationCodeReplayed"
+          - $ref: "#/components/messages/AuthenticationThrottled"
+          - $ref: "#/components/messages/TokenExchanged"
           - $ref: "#/components/messages/AuthenticationSucceeded"
           - $ref: "#/components/messages/AuthenticationFailed"
           - $ref: "#/components/messages/MFAFactorEnrolled"
@@ -121,6 +129,19 @@ channels:
 
 components:
   schemas:
+    PrincipalStatusPayload:
+      type: object
+      properties:
+        payload:
+          type: object
+          properties:
+            principal_id: { type: string }
+            tenant_id: { type: string }
+            new_status: { type: string, enum: [ACTIVE, SUSPENDED, DISABLED] }
+            actor: { type: string }
+            reason: { type: string }
+            correlation_id: { type: string }
+
     Envelope:
       type: object
       description: |
@@ -209,9 +230,12 @@ components:
                       - residency_denied
                       - trust_posture_blocked
 
-    SessionInvalidated:
-      name: session.invalidated
+    SessionRevoked:
+      name: identity.session.revoked
       title: One session was revoked
+      summary: |
+        ZS-IAM-001 §23's name. Emitted as `session.invalidated` until 16 Oct
+        2026; no service consumed the old name, so it was retired outright.
       payload:
         allOf:
           - $ref: "#/components/schemas/Envelope"
@@ -256,11 +280,97 @@ components:
 
     PrincipalStatusChanged:
       name: principal.status.changed
-      title: A principal was suspended or reactivated
+      title: A principal was enabled, suspended or disabled
+      summary: |
+        Written in the same transaction as the status change (PUT
+        /v1/principals/{id}/status), together with identity.subject.disabled
+        or identity.subject.enabled. authorization-svc's principal-status
+        projection and cache invalidator consume this name; ZS-IAM-001 names
+        the identity.subject.* pair, so both are emitted. Until 19 Oct 2026
+        the status route emitted neither (Group 1 re-audit F-3).
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - $ref: "#/components/schemas/PrincipalStatusPayload"
+
+    SubjectDisabled:
+      name: identity.subject.disabled
+      title: A principal was suspended or disabled (ZS-IAM-001 §23)
+      summary: Emitted with principal.status.changed; every session the principal held is then ended.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - $ref: "#/components/schemas/PrincipalStatusPayload"
+
+    SubjectEnabled:
+      name: identity.subject.enabled
+      title: A principal was (re)activated (ZS-IAM-001 §23)
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - $ref: "#/components/schemas/PrincipalStatusPayload"
+
+    LoginSessionStarted:
+      name: identity.login_session.started
+      title: A hosted login completed and a login session (sid) began
       payload:
         allOf:
           - $ref: "#/components/schemas/Envelope"
           - type: object
+            properties:
+              payload:
+                type: object
+                properties:
+                  sid: { type: string }
+                  principal_id: { type: string }
+                  tenant_id: { type: string }
+                  client_id: { type: string }
+                  amr: { type: array, items: { type: string } }
+                  assurance_level: { type: string }
+
+    LoginSessionEnded:
+      name: identity.login_session.ended
+      title: A login session ended (logout, refresh or code reuse, disable, admin revoke)
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+            properties:
+              payload:
+                type: object
+                properties:
+                  sid: { type: string }
+                  tenant_id: { type: string }
+                  reason: { type: string }
+                  session_contexts_ended: { type: integer }
+
+    RefreshTokenReuseDetected:
+      name: identity.refresh_token.reuse_detected
+      title: A rotated refresh token was presented again; its family was revoked and the login session ended
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+
+    AuthorizationCodeReplayed:
+      name: identity.authorization_code.replayed
+      title: An authorization code was redeemed twice; the login session it came from was ended
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+
+    AuthenticationThrottled:
+      name: identity.authentication.throttled
+      title: A hosted login was refused 429 by the source throttle (AU-04)
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+
+    TokenExchanged:
+      name: identity.token.exchanged
+      title: A workload exchanged an envelope for a narrower audience (RFC 8693)
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
 
     AuthenticationSucceeded:
       name: identity.authentication.succeeded

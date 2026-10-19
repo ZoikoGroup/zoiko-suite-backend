@@ -6,6 +6,8 @@ TEN=11111111-1111-1111-1111-111111111111
 PRIN=33333333-3333-3333-3333-333333333333
 ENT=22222222-2222-2222-2222-222222222222
 SUP=44444444-4444-4444-4444-444444444444
+# The break-glass approver: never the caller (PRIN) nor the grantee (SUP) — S1-1.
+APPR=55555555-5555-5555-5555-555555555555
 H=(-H "Content-Type: application/json" -H "X-Tenant-Id: $TEN" -H "X-Principal-Id: $PRIN" -H "X-Legal-Entity-Id: $ENT" -H "X-Source-Channel: api")
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); printf '  PASS  %s\n' "$1"; }
@@ -81,9 +83,11 @@ chk "RefreshTenantContextCache  POST /v1/context/cache/refresh" \
 chk "InvalidateTenantContext    POST /v1/context/tenant/invalidate" \
     "$(code -X POST $B/v1/context/tenant/invalidate "${H[@]}" -H 'X-Request-Id: au5' -H 'Idempotency-Key: au5' -H 'X-Correlation-ID: au5' -d '{"correlation_id":"au5","justification":"audit run: verifying the named command surface"}')" "200"
 SR=$(curl -s -m 25 -X POST $B/v1/context/support "${H[@]}" -H "X-Request-Id: au6" -H "Idempotency-Key: au6" -H "X-Correlation-ID: au6" \
-  -d "{\"tenant_id\":\"$TEN\",\"support_principal_id\":\"$SUP\",\"approver_principal_id\":\"$PRIN\",\"reason_code\":\"INCIDENT_RESPONSE\",\"justification\":\"audit run: exercising the privileged break-glass command\",\"ticket_ref\":\"AUDIT-X\",\"ttl_seconds\":300}")
+  -d "{\"tenant_id\":\"$TEN\",\"support_principal_id\":\"$SUP\",\"approver_principal_id\":\"$APPR\",\"reason_code\":\"INCIDENT_RESPONSE\",\"justification\":\"audit run: exercising the privileged break-glass command\",\"ticket_ref\":\"AUDIT-X\",\"ttl_seconds\":300}")
 SC=$(echo "$SR" | python -c "import sys,json;print(json.load(sys.stdin).get('support_context_id',''))" 2>/dev/null)
-if [ -n "$SC" ]; then ok "AttachSupportContext       POST /v1/context/support"; else bad "AttachSupportContext: $SR"; fi
+# Attach is a REQUEST since 8 Oct (S1-1): it answers 202 PENDING_APPROVAL and
+# grants nothing until the named approver approves it.
+if [ -n "$SC" ] && echo "$SR" | grep -q PENDING_APPROVAL; then ok "AttachSupportContext       POST /v1/context/support (pending approval)"; else bad "AttachSupportContext: $SR"; fi
 
 echo
 echo "-- 7. Negative-path acceptance (spec section 4) --------------------"
@@ -119,13 +123,29 @@ chk "NP2 unknown ingress cannot select a tenant" \
 chk "NP3 self-approved break-glass refused" \
     "$(code -X POST $B/v1/context/support "${H[@]}" -H 'X-Request-Id: np3' -H 'Idempotency-Key: np3' -H 'X-Correlation-ID: np3' -d "{\"tenant_id\":\"$TEN\",\"support_principal_id\":\"$PRIN\",\"approver_principal_id\":\"$PRIN\",\"reason_code\":\"INCIDENT_RESPONSE\",\"justification\":\"audit run: self-approval must be refused\",\"ticket_ref\":\"AUDIT-Y\",\"ttl_seconds\":300}")" "400"
 chk "NP3 excessive TTL refused" \
-    "$(code -X POST $B/v1/context/support "${H[@]}" -H 'X-Request-Id: np3b' -H 'Idempotency-Key: np3b' -H 'X-Correlation-ID: np3b' -d "{\"tenant_id\":\"$TEN\",\"support_principal_id\":\"$SUP\",\"approver_principal_id\":\"$PRIN\",\"reason_code\":\"INCIDENT_RESPONSE\",\"justification\":\"audit run: TTL beyond the ceiling must be refused\",\"ticket_ref\":\"AUDIT-Z\",\"ttl_seconds\":999999}")" "400"
+    "$(code -X POST $B/v1/context/support "${H[@]}" -H 'X-Request-Id: np3b' -H 'Idempotency-Key: np3b' -H 'X-Correlation-ID: np3b' -d "{\"tenant_id\":\"$TEN\",\"support_principal_id\":\"$SUP\",\"approver_principal_id\":\"$APPR\",\"reason_code\":\"INCIDENT_RESPONSE\",\"justification\":\"audit run: TTL beyond the ceiling must be refused\",\"ticket_ref\":\"AUDIT-Z\",\"ttl_seconds\":999999}")" "400"
 if [ -n "$SC" ]; then
   chk "NP4 revoke support context" "$(code -X DELETE $B/v1/context/support/$SC "${H[@]}" -H 'X-Request-Id: np4a' -H 'Idempotency-Key: np4a' -H 'X-Correlation-ID: np4a')" "204"
   chk "NP4 revoke is idempotent"   "$(code -X DELETE $B/v1/context/support/$SC "${H[@]}" -H 'X-Request-Id: np4b' -H 'Idempotency-Key: np4b' -H 'X-Correlation-ID: np4b')" "204"
 fi
-chk "envelope contract enforced (no headers)" \
-    "$(code -X POST $B/v1/context/resolve -H 'Content-Type: application/json' -d '{}')" "401"
+# Resolve is declassified from the envelope contract (it mints the envelope),
+# so a bare request is refused by the GOV-01 correlation guard: 400, not 401.
+chk "resolve with no correlation refused" \
+    "$(code -X POST $B/v1/context/resolve -H 'Content-Type: application/json' -d '{}')" "400"
+chk "resolve with no token refused" \
+    "$(code -X POST $B/v1/context/resolve -H 'Content-Type: application/json' -H 'X-Correlation-ID: np5' -d '{}')" "401"
+
+echo
+echo "-- 7b. Auth plane (OIDC provider, wired 19 Oct 2026) ---------------"
+chk "OIDC discovery" "$(code $B/.well-known/openid-configuration)" "200"
+DISC=$(curl -s -m 20 $B/.well-known/openid-configuration)
+if echo "$DISC" | grep -q '"code_challenge_methods_supported":\["S256"\]'; then ok "discovery advertises PKCE S256 only"; else bad "discovery PKCE"; fi
+chk "token endpoint refuses an unauthenticated client" \
+    "$(code -X POST $B/oauth2/token -H 'Content-Type: application/x-www-form-urlencoded' -d 'grant_type=authorization_code&code=x&code_verifier=x')" "401"
+chk "authorize refuses an unregistered client (no redirect)" \
+    "$(code "$B/oauth2/authorize?client_id=nobody&redirect_uri=https://evil.test/cb&response_type=code")" "400"
+chk "session status needs a token" \
+    "$(code -X POST $B/v1/context/session/introspect -H 'Content-Type: application/json' -d '{}')" "400"
 
 echo
 echo "-- 8. Telemetry ----------------------------------------------------"

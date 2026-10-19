@@ -581,11 +581,13 @@ func (r *Resolver) Resolve(ctx context.Context, req domain.ResolveRequest) (*Res
 		MFAVerified:      claims.MFADone,
 		// nil, not 0. No device fingerprint reaches this service, and 0 is the
 		// worst score rather than the absence of one — see DeviceTrustScore.
-		DeviceTrustScore:   nil,
-		AdaptiveRiskScore:  riskScore,
-		RiskSignalSource:   riskSource,
-		EnvelopeJWTJTI:     jti,
-		AuthSessionID:      claims.SID,
+		DeviceTrustScore:  nil,
+		AdaptiveRiskScore: riskScore,
+		RiskSignalSource:  riskSource,
+		EnvelopeJWTJTI:    jti,
+		AuthSessionID:     claims.SID,
+		// The concurrency cap is for people; a workload may hold many sessions.
+		ConcurrencyExempt:  principal.PrincipalType != domain.PrincipalTypeHuman,
 		IssuedAt:           now,
 		ExpiresAt:          exp,
 		InvalidatedAt:      nil,
