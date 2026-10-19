@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"zoiko.io/eventing/envelope"
+	"zoiko.io/eventing/repair"
 )
 
 // openPool gives each test its own schema holding a fresh eventing_outbox, so
@@ -27,7 +28,7 @@ func openPool(t *testing.T) *pgxpool.Pool {
 	if dsn == "" {
 		// Under CI a skip would report ok for a suite that never ran; every
 		// guarantee this package makes is only proven against real Postgres.
-		if os.Getenv("CI") != "" {
+		if os.Getenv("CI") != "" || os.Getenv("REQUIRE_DB_TESTS") != "" {
 			t.Fatal("TEST_DATABASE_URL must be set in CI")
 		}
 		t.Skip("TEST_DATABASE_URL not set")
@@ -58,8 +59,10 @@ func openPool(t *testing.T) *pgxpool.Pool {
 		t.Fatal(err)
 	}
 	t.Cleanup(pool.Close)
-	if _, err := pool.Exec(ctx, SchemaSQL); err != nil {
-		t.Fatalf("apply SchemaSQL: %v", err)
+	for _, ddl := range []string{SchemaSQL, HardeningSQL, repair.SchemaSQL} {
+		if _, err := pool.Exec(ctx, ddl); err != nil {
+			t.Fatalf("apply schema: %v", err)
+		}
 	}
 	return pool
 }
@@ -619,6 +622,12 @@ func TestRelay_CorruptStoredRowIsQuarantinedNotSent(t *testing.T) {
 	pool := openPool(t)
 	e := newEnvelope(t, "j-1")
 	enqueue(t, pool, e)
+	// Corruption has to come from outside the application path, so the
+	// immutability trigger (HardeningSQL) is switched off to simulate it.
+	if _, err := pool.Exec(context.Background(),
+		`ALTER TABLE eventing_outbox DISABLE TRIGGER eventing_outbox_content_immutable`); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := pool.Exec(context.Background(),
 		`UPDATE eventing_outbox SET payload = '\x5b315d' WHERE event_id = $1`, e.ID); err != nil { // "[1]"
 		t.Fatal(err)
@@ -651,11 +660,11 @@ func TestRequeue_ReturnsQuarantinedEventUnderItsOriginalID(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ok, err := r.Requeue(context.Background(), e.ID)
+	ok, err := r.Requeue(context.Background(), e.ID, testAuth)
 	if err != nil || !ok {
 		t.Fatalf("requeue: %v %v", ok, err)
 	}
-	if ok, _ := r.Requeue(context.Background(), e.ID); ok {
+	if ok, _ := r.Requeue(context.Background(), e.ID, testAuth); ok {
 		t.Fatal("requeue of a non-quarantined event must report false")
 	}
 	broken = false

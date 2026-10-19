@@ -18,6 +18,13 @@ EOSQL
 }
 
 create_db_and_migrate "zoiko_connectivity_api_bridge" "/migrations/connectivity-api-bridge/001_init.sql"
+# 001 alone leaves no row-level security (002) and none of the connector
+# governance schema or the transactional outbox (003); apply every migration the
+# service ships, in order.
+for f in /migrations/connectivity-api-bridge/002_add_rls.sql /migrations/connectivity-api-bridge/003_connector_management.sql; do
+  echo "Applying $f to zoiko_connectivity_api_bridge..."
+  psql -v ON_ERROR_STOP=1 --username "$PGUSER" --dbname zoiko_connectivity_api_bridge -f "$f"
+done
 create_db_and_migrate "zoiko_banking_connector" "/migrations/banking-connector/001_init.sql"
 create_db_and_migrate "zoiko_hris_connector" "/migrations/hris-connector/001_init.sql"
 create_db_and_migrate "zoiko_tax_authority_interface" "/migrations/tax-authority-interface/001_init.sql"

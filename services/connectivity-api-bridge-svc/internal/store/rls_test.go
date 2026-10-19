@@ -40,7 +40,7 @@ func openAdminPool(t *testing.T) *pgxpool.Pool {
 	}
 	t.Cleanup(pool.Close)
 
-	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS ingestion_logs, api_bridges CASCADE;`)
+	resetGovernanceObjects(ctx, pool)
 
 	// Every migration in filename order, never one hardcoded name — a
 	// suite that names migrations individually silently skips new ones,
@@ -125,7 +125,8 @@ func TestRLS_EnabledAndForced(t *testing.T) {
 	ctx := context.Background()
 	admin := openAdminPool(t)
 
-	for _, table := range []string{"api_bridges", "ingestion_logs"} {
+	for _, table := range []string{"api_bridges", "ingestion_logs", "connector_changes", "connector_approvals", "connector_health",
+		"connector_health_transitions", "sync_checkpoints", "checkpoint_reset_requests", "external_profiles", "eventing_outbox", "eventing_repair_log"} {
 		var enabled, forced bool
 		if err := admin.QueryRow(ctx,
 			`SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname = $1`, table,
@@ -133,10 +134,10 @@ func TestRLS_EnabledAndForced(t *testing.T) {
 			t.Fatalf("read pg_class for %s: %v", table, err)
 		}
 		if !enabled {
-			t.Errorf("%s: migration 002 must ENABLE row level security", table)
+			t.Errorf("%s: row level security must be ENABLED", table)
 		}
 		if !forced {
-			t.Errorf("%s: migration 002 must FORCE row level security", table)
+			t.Errorf("%s: row level security must be FORCED", table)
 		}
 	}
 }
@@ -155,6 +156,7 @@ func TestRLS_PgStore_TenantIsolation(t *testing.T) {
 	bridge := &domain.ApiBridge{
 		LegalEntityID: "le-a", BridgeName: "Test Bridge", Protocol: "REST",
 		EndpointURL: "https://erp.example.internal/api", AuthType: "OAUTH2", Status: "ACTIVE",
+		LegacyUnapproved: true, // a pre-governance row: the only way to hold ACTIVE without an approval
 	}
 	if err := s.CreateBridge(ctxA, bridge); err != nil {
 		t.Fatalf("create tenant A's bridge: %v", err)
@@ -207,8 +209,20 @@ func TestRLS_WithCheckRefusesForeignTenantWrite(t *testing.T) {
 	_, err = conn.Exec(ctx, `
 		INSERT INTO api_bridges
 			(bridge_id, tenant_id, legal_entity_id, bridge_name, protocol, endpoint_url, auth_type, status)
-		VALUES ('forged-1', 'tenant-a', 'le-a', 'Forged', 'REST', 'https://attacker.example/api', 'NONE', 'ACTIVE')`)
+		VALUES ('forged-1', 'tenant-a', 'le-a', 'Forged', 'REST', 'https://attacker.example/api', 'NONE', 'DRAFT')`)
 	if err == nil {
 		t.Fatal("WITH CHECK must refuse an insert attributed to another tenant")
 	}
+}
+
+// resetGovernanceObjects drops everything the migrations create, so the suite
+// can re-apply them from scratch against the same database. Order does not
+// matter: CASCADE removes the dependent foreign keys and triggers.
+func resetGovernanceObjects(ctx context.Context, pool *pgxpool.Pool) {
+	_, _ = pool.Exec(ctx, `
+		DROP TABLE IF EXISTS checkpoint_reset_requests, sync_checkpoints, connector_health_transitions, connector_health,
+			connector_approvals, connector_changes, external_profiles, eventing_outbox, eventing_repair_log,
+			ingestion_logs, api_bridges CASCADE;
+		DROP FUNCTION IF EXISTS connector_append_only(), sync_checkpoints_guard(), external_profiles_guard(),
+			eventing_outbox_payload_immutable(), eventing_repair_log_immutable() CASCADE;`)
 }

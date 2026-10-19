@@ -13,3 +13,13 @@
 # clear them.
 a1293aaceb57d44dd7a69bfd2134ac94bcd4d1f2:services/notification-svc/internal/handler/suppression_handler_test.go:generic-api-key:272
 a1293aaceb57d44dd7a69bfd2134ac94bcd4d1f2:services/notification-svc/scripts/README-live-check.md:generic-api-key:44
+
+# ZS-SVC-M-001 Waves 1-4 (PR feat/integration): deliberately fake secrets in
+# negative-path tests. Each proves a credential-shaped value is refused,
+# scrubbed or never echoed, so each has to contain one. All four are also marked
+# `// gitleaks:allow` on the line, which is what keeps them clean if the PR is
+# squash-merged; these fingerprints cover the commits already pushed.
+69c89a8ea0da7964337d541cf1d501ccb803dddb:services/connectivity-api-bridge-svc/internal/connector/service_test.go:stripe-access-token:218
+69c89a8ea0da7964337d541cf1d501ccb803dddb:services/connectivity-api-bridge-svc/internal/domain/lifecycle_test.go:stripe-access-token:140
+2fa30a2739ade5ee10d995d63ea196a803f7e077:services/gateway-auth-svc/internal/admin/admin_test.go:generic-api-key:15
+b4634f13b0fe152baeb1971abbf6c1c68a7c8852:services/eventing/integration/integration_test.go:private-key:455

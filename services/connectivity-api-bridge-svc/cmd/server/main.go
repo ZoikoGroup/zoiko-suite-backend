@@ -16,14 +16,18 @@ import (
 
 	"zoiko.io/connectivity-api-bridge-svc/internal/authz"
 	"zoiko.io/connectivity-api-bridge-svc/internal/config"
+	"zoiko.io/connectivity-api-bridge-svc/internal/connector"
+	"zoiko.io/connectivity-api-bridge-svc/internal/egress"
 	svcenvelope "zoiko.io/connectivity-api-bridge-svc/internal/envelope"
-	"zoiko.io/connectivity-api-bridge-svc/internal/events"
 	"zoiko.io/connectivity-api-bridge-svc/internal/handler"
 	"zoiko.io/connectivity-api-bridge-svc/internal/health"
 	"zoiko.io/connectivity-api-bridge-svc/internal/middleware"
 	"zoiko.io/connectivity-api-bridge-svc/internal/mtls"
 	"zoiko.io/connectivity-api-bridge-svc/internal/store"
 	"zoiko.io/connectivity-api-bridge-svc/internal/telemetry"
+	"zoiko.io/connectivity-api-bridge-svc/internal/vault"
+	"zoiko.io/eventing/kafkaout"
+	"zoiko.io/eventing/outbox"
 )
 
 func main() {
@@ -61,22 +65,64 @@ func main() {
 		logger.Info("connected to postgres database")
 	}
 
-	st := store.NewPgStore(dbpool)
+	// A service whose migration was never applied would start normally and fail
+	// on the first request that enqueues an event. Fail here, at deploy time.
+	if err := outbox.VerifySchema(ctx, dbpool); err != nil {
+		logger.Fatal("eventing outbox schema missing — apply migration 003_connector_management.sql", zap.Error(err))
+	}
 
+	st := store.NewPgStore(dbpool, store.WithEventRegion(cfg.EventResidencyRegion))
+
+	// Transactional outbox relay. Events are written in the same transaction as
+	// the state change they describe and delivered from here, so a crash or a
+	// broker outage between commit and publish can no longer lose one.
 	brokers := strings.Split(cfg.KafkaBrokers, ",")
-	publisher := events.NewKafkaPublisher(brokers, cfg.KafkaEventsTopic, logger)
+	writer, err := kafkaout.New(kafkaout.Config{Brokers: brokers, Topic: cfg.KafkaEventsTopic, AllowAutoTopicCreation: true})
+	if err != nil {
+		logger.Fatal("kafka writer", zap.Error(err))
+	}
+	defer func() { _ = writer.Close() }()
+	relay, err := outbox.NewRelay(dbpool, writer, outbox.DefaultConfig(), logger)
+	if err != nil {
+		logger.Fatal("outbox relay", zap.Error(err))
+	}
+	relay.SetRegion(cfg.EventResidencyRegion)
+	relayCtx, stopRelay := context.WithCancel(context.Background())
+	defer stopRelay()
+	go relay.Run(relayCtx)
+
 	var authzClient *authz.Client
-	if cfg.AuthzMTLSEnabled {
-		mtlsHTTPClient, err := mtls.NewClientHTTPClient(context.Background(), cfg.MTLSManagementServiceURL, "connectivity-api-bridge-svc", "00000000-0000-0000-0000-00000000f001")
+	var mtlsHTTPClient *http.Client
+	if cfg.AuthzMTLSEnabled || cfg.VaultMTLSEnabled {
+		mtlsHTTPClient, err = mtls.NewClientHTTPClient(context.Background(), cfg.MTLSManagementServiceURL, "connectivity-api-bridge-svc", store.PlatformScopeID)
 		if err != nil {
 			logger.Fatal("mtls: failed to provision client identity", zap.Error(err))
 		}
+	}
+	if cfg.AuthzMTLSEnabled {
 		authzClient = authz.NewClientWithHTTPClient(cfg.AuthzMTLSURL, mtlsHTTPClient)
 	} else {
 		authzClient = authz.NewClient(cfg.AuthzServiceURL)
 	}
 
-	h := handler.New(st, publisher, authzClient, logger)
+	vaultURL, vaultHTTP := cfg.VaultServiceURL, (*http.Client)(nil)
+	if cfg.VaultMTLSEnabled {
+		vaultURL, vaultHTTP = cfg.VaultMTLSURL, mtlsHTTPClient
+	}
+	vaultClient, err := vault.New(vaultURL, vaultHTTP)
+	if err != nil {
+		logger.Fatal("secret vault client", zap.Error(err))
+	}
+
+	if len(cfg.EgressAllowedRegions) == 0 {
+		logger.Warn("EGRESS_ALLOWED_REGIONS is empty: no connector can be submitted or approved until a region is allowed")
+	}
+	svc := &connector.Service{
+		Store: st, Vault: vaultClient,
+		Egress:               egress.Policy{AllowHTTP: cfg.EgressAllowInsecureHTTP, AllowedPorts: cfg.EgressAllowedPorts},
+		EgressAllowedRegions: cfg.EgressAllowedRegions,
+	}
+	h := handler.New(svc, st, authzClient, logger)
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)
