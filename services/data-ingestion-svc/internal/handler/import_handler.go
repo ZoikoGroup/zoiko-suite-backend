@@ -257,13 +257,18 @@ type batchDTO struct {
 	QuarantinedItems    int        `json:"quarantined_items"`
 	FailedItems         int        `json:"failed_items"`
 	SkippedItems        int        `json:"skipped_items"`
-	CreatedBy           string     `json:"created_by"`
-	CreatedAt           time.Time  `json:"created_at"`
-	UpdatedAt           time.Time  `json:"updated_at"`
+	// Outcome keeps delivery, validation, mapping, the owning domain and reconciliation apart; Overall is the pessimistic
+	// roll-up. A batch that was delivered but not reconciled is PENDING, never a success (INT-NP-048).
+	Outcome   integration.Outcome `json:"outcome"`
+	Overall   string              `json:"overall"`
+	CreatedBy string              `json:"created_by"`
+	CreatedAt time.Time           `json:"created_at"`
+	UpdatedAt time.Time           `json:"updated_at"`
 }
 
 func toBatchDTO(b *imports.Batch) batchDTO {
-	return batchDTO{
+	o := imports.OutcomeOf(b)
+	return batchDTO{Outcome: o, Overall: o.Overall(),
 		BatchID: b.BatchID, LegalEntityID: b.LegalEntityID, ProfileKey: b.ProfileKey, ProfileVersion: b.ProfileVersion, Material: b.Material,
 		SourceSystem: b.SourceSystem, FileName: b.FileName, DeclaredContentType: b.DeclaredContentType, DeclaredSHA256: b.DeclaredSHA256,
 		DeclaredRows: b.DeclaredRows, DeclaredControl: b.DeclaredControl, Status: string(b.Status), StatusReason: b.StatusReason, Version: b.Version,

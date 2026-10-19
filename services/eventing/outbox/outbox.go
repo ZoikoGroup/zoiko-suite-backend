@@ -807,28 +807,46 @@ func (r *Relay) SetGate(g Gate) { r.gate = g }
 type Thresholds struct {
 	MaxBacklog    int           // 0 = unchecked
 	MaxBacklogAge time.Duration // 0 = unchecked
+	// Owner is stamped on every alert; empty means DefaultAlertOwner.
+	Owner string
 }
 
 // Alert is a canonical integration event the service should emit.
 type Alert struct {
 	Event  string // ZS-SVC-M-001 §10 event name
 	Detail string
+	// Owner is the queue that owns what the alert is about, so it routes somewhere (INT-CTRL-034). Set from
+	// Thresholds.Owner, DefaultAlertOwner when that is empty.
+	Owner string
 }
+
+// DefaultAlertOwner owns an alert when the service names no one: quarantine and dead letters are never ownerless.
+const DefaultAlertOwner = "integration-operations"
 
 // Evaluate turns Stats into the §10 alerts: outbox_publish_delayed when the
 // backlog is too old or too large, outbox_quarantined whenever anything is
 // quarantined (quarantine always needs an owner).
 func Evaluate(s Stats, t Thresholds) []Alert {
+	out := evaluate(s, t)
+	owner := t.Owner
+	if owner == "" {
+		owner = DefaultAlertOwner
+	}
+	for i := range out {
+		out[i].Owner = owner
+	}
+	return out
+}
+
+func evaluate(s Stats, t Thresholds) []Alert {
 	var out []Alert
 	if t.MaxBacklogAge > 0 && s.OldestBacklogAge > t.MaxBacklogAge {
-		out = append(out, Alert{"outbox_publish_delayed",
-			fmt.Sprintf("oldest unpublished event is %s old", s.OldestBacklogAge.Round(time.Second))})
+		out = append(out, Alert{Event: "outbox_publish_delayed", Detail: fmt.Sprintf("oldest unpublished event is %s old", s.OldestBacklogAge.Round(time.Second))})
 	} else if t.MaxBacklog > 0 && s.Backlog > t.MaxBacklog {
-		out = append(out, Alert{"outbox_publish_delayed",
-			fmt.Sprintf("%d events are waiting to publish", s.Backlog)})
+		out = append(out, Alert{Event: "outbox_publish_delayed", Detail: fmt.Sprintf("%d events are waiting to publish", s.Backlog)})
 	}
 	if s.Quarantined > 0 {
-		out = append(out, Alert{"outbox_quarantined", fmt.Sprintf("%d events are quarantined", s.Quarantined)})
+		out = append(out, Alert{Event: "outbox_quarantined", Detail: fmt.Sprintf("%d events are quarantined", s.Quarantined)})
 	}
 	return out
 }

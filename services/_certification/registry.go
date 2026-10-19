@@ -17,6 +17,8 @@ var Prefixes = map[string]string{
 	"AC": "access-control-svc/internal",
 	"SR": "schema-registry-svc/internal",
 	"DV": "document-vault-svc/internal",
+	// CBC is connectivity-api-bridge-svc's command package, which sits beside internal/ rather than inside it.
+	"CBC": "connectivity-api-bridge-svc",
 }
 
 // Status of one ledger entry.
@@ -60,8 +62,9 @@ var Controls = []Entry{
 	{"INT-CTRL-005", "Event schema/producer authorization", Partial, []string{
 		"SR:handler/handler_test.go::TestRegisterVersion_BreakingChange_Returns409WithViolations",
 		"SR:handler/handler_test.go::TestRegisterVersion_AuthorizationDenied_Returns403",
-		"EV:outbox/controls_test.go::TestGateQuarantinesIncompatiblePayloadBeforePublish_INT_NP_006"},
-		"The publish-time schema gate is a tested library but is not installed in any service relay."},
+		"EV:outbox/controls_test.go::TestGateQuarantinesIncompatiblePayloadBeforePublish_INT_NP_006",
+		"CBC:cmd/server/schemagate_test.go::TestTheConnectivityRelayIsGatedByTheRegisteredContract"},
+		"The gate is installed in connectivity-api-bridge-svc's relay (SCHEMA_REGISTRY_URL). The other outbox producers (payment, tax, notification, data-ingestion, identity, access-control) have not adopted it yet."},
 	{"INT-CTRL-006", "Partition/order policy defined", Covered, []string{
 		"EV:envelope/envelope_test.go::TestPartitionKey_StablePerAggregateAndOpaque",
 		"EV:outbox/controls_test.go::TestVerifyPartitioning",
@@ -73,7 +76,8 @@ var Controls = []Entry{
 	{"INT-CTRL-008", "Consumer inbox/deduplication", Covered, []string{
 		"EV:inbox/inbox_test.go::TestProcessOnceThenDuplicate_INT_NP_007",
 		"EV:inbox/inbox_test.go::TestConcurrentDuplicatesProduceOneEffect",
-		"EV:inbox/inbox_test.go::TestConflictingRedeliveryRejected_INT_IDEM_005"}, ""},
+		"EV:inbox/inbox_test.go::TestConflictingRedeliveryRejected_INT_IDEM_005",
+		"EV:outbox/load_test.go::TestLoad_ConcurrentRedeliveryProducesOneEffectPerEvent"}, ""},
 	{"INT-CTRL-009", "Controlled event replay", Covered, []string{
 		"EV:outbox/controls_test.go::TestReplayNeedsApprovalAndBoundedBatch",
 		"EV:inbox/inbox_test.go::TestRequeueNeedsApprovalAndIsLogged",
@@ -179,20 +183,23 @@ var Controls = []Entry{
 		"NS:store/webhook_out_test.go::TestWebhook_CircuitBreakerAndAutoDisable",
 		"PI:providers/engine_test.go::TestSendingPausesWhenTheProviderIsFailing",
 		"GA:handler/admission_test.go::TestOverloadIsShedWithBackpressureNotQueued_INT_NP_044"}, ""},
-	{"INT-CTRL-034", "Quarantine/dead-letter ownership", Partial, []string{
-		"EV:inbox/inbox_test.go::TestRetryBudgetThenQuarantineThenHeld",
-		"EV:outbox/controls_test.go::TestEvaluateAlerts",
-		"DI:store/import_test.go::TestImport_PartialFailureIsExplicitAndNeverReconciled"},
-		"Import quarantine names an owner; inbox, outbox and webhook dead letters raise alerts but store no owner."},
+	{"INT-CTRL-034", "Quarantine/dead-letter ownership", Covered, []string{
+		"EV:inbox/inbox_test.go::TestQuarantineAlertsNameAnOwner",
+		"EV:outbox/controls_test.go::TestOutboxAlertsNameAnOwner",
+		"NS:whout/owner_test.go::TestADeadLetterNamesItsOwner",
+		"PS:store/callback_store_test.go::TestCallback_UncorrelatedIsQuarantinedForANamedOwnerOnce",
+		"TX:store/callback_store_test.go::TestCallback_UncorrelatedIsQuarantinedForANamedOwnerOnce",
+		"DI:store/import_test.go::TestImport_PartialFailureIsExplicitAndNeverReconciled"}, ""},
 	{"INT-CTRL-035", "Sensitive telemetry redaction", Covered, []string{
 		"EV:integration/integration_test.go::TestRedactNestedSecrets",
 		"EV:integration/integration_test.go::TestEvidenceJSONHasNoPayloadBody",
 		"EV:inbox/inbox_test.go::TestStoredErrorTextIsScrubbed_INT_NP_047"}, ""},
 	{"INT-CTRL-036", "Integration-to-domain reconciliation", Partial, []string{
 		"EV:integration/integration_test.go::TestOutcomeCannotHideReconciliationBreak_INT_NP_048",
+		"DI:imports/outcome_test.go::TestAnImportIsCertifiedOnlyWhenItReconciled",
 		"DI:store/import_test.go::TestImport_MaterialHappyPathToReconciled",
 		"PS:handler/handler_test.go::TestLinkStatementConfirmation_Conflict"},
-		"Import reconciliation is real; the generic Outcome model is used by no service, and there is no bank/tax/webhook reconciliation."},
+		"Imports reconcile and report through the shared Outcome model. Bank, tax and webhook flows have no population to reconcile inside INT; the bank statement confirmation lives in payment-status."},
 }
 
 // Scenarios are INT-NP-001..048.
@@ -200,10 +207,10 @@ var Scenarios = []Entry{
 	{"INT-NP-001", "Forged tenant header conflicts with authenticated tenant context", Covered, []string{
 		"GA:handler/admission_test.go::TestForgedTenantContextRefusedAsProblem_INT_NP_001",
 		"EV:integration/integration_test.go::TestForgedTenantHeaderRejected_INT_NP_001"}, ""},
-	{"INT-NP-002", "Valid gateway credential lacks downstream permission", Partial, []string{
+	{"INT-NP-002", "Valid gateway credential lacks downstream permission", Covered, []string{
+		"GA:handler/admission_test.go::TestGatewayAdmitsAndTheDomainRefusesWithBothDecisionsRetained_INT_NP_002",
 		"GA:handler/admission_test.go::TestValidCredentialIsAdmittedAndCounted_INT_NP_002",
-		"CB:handler/governance_test.go::TestEveryCommandChecksItsOwnAuthorizationAction"},
-		"Both halves are proven separately; no single test shows gateway-allow plus domain-deny with both decisions retained."},
+		"CB:handler/governance_test.go::TestEveryCommandChecksItsOwnAuthorizationAction"}, ""},
 	{"INT-NP-003", "Unsupported API version requested", Covered, []string{
 		"GA:handler/admission_test.go::TestUnsupportedAPIVersionRefusedWithoutFallback_INT_NP_003",
 		"GA:admission/admission_test.go::TestPolicyVersionHeaderNeverFallsBack"}, ""},
@@ -215,8 +222,9 @@ var Scenarios = []Entry{
 		"GA:handler/admission_test.go::TestConcurrentRequestsCannotBypassClientQuota_INT_NP_005"}, ""},
 	{"INT-NP-006", "Producer sends event with incompatible schema", Partial, []string{
 		"EV:outbox/controls_test.go::TestGateQuarantinesIncompatiblePayloadBeforePublish_INT_NP_006",
-		"EV:integration/gate_test.go::TestGateRejectsNonConformingNamingTheContract"},
-		"The library quarantines before publish; the gate is not installed in any service relay."},
+		"EV:integration/gate_test.go::TestGateRejectsNonConformingNamingTheContract",
+		"CBC:cmd/server/schemagate_test.go::TestTheConnectivityRelayIsGatedByTheRegisteredContract"},
+		"Quarantine-before-publish is proven at the service for connectivity only; other producers' relays are still ungated."},
 	{"INT-NP-007", "Same event delivered twice", Covered, []string{
 		"EV:inbox/inbox_test.go::TestProcessOnceThenDuplicate_INT_NP_007",
 		"EV:inbox/inbox_test.go::TestConcurrentDuplicatesProduceOneEffect"}, ""},
@@ -236,7 +244,9 @@ var Scenarios = []Entry{
 		""},
 	{"INT-NP-011", "Domain DB commits but broker is unavailable", Covered, []string{
 		"EV:outbox/outbox_test.go::TestRelay_BrokerOutageDoesNotSpendAttempts",
-		"EV:outbox/outbox_test.go::TestEnqueue_RolledBackTransactionLeavesNoEvent"}, ""},
+		"EV:outbox/outbox_test.go::TestEnqueue_RolledBackTransactionLeavesNoEvent",
+		"EV:outbox/load_test.go::TestLoad_BrokerOutageMidBacklogLosesNothingAndBlamesNoEvent",
+		"EV:outbox/load_test.go::TestLoad_ConcurrentRelaysDrainABacklogExactlyOnce"}, ""},
 	{"INT-NP-012", "Broker publish succeeds but relay crashes before marking published", Covered, []string{
 		"EV:outbox/outbox_test.go::TestRelay_ExpiredLeaseIsReclaimedWithOriginalDispatchTime",
 		"EV:outbox/outbox_test.go::TestRelay_RetryKeepsTheSameEventID",
@@ -343,16 +353,19 @@ var Scenarios = []Entry{
 		"IC:federation/oidc_test.go::TestVerifyRefusesForgeriesAndAlgorithmConfusion",
 		"IC:federation/login_test.go::TestEveryRefusalLooksTheSameToTheCaller"},
 		"OIDC fails closed on wrong issuer, audience and signature, and a SAML assertion is refused with no fallback. SAML federation itself was deferred by decision; a named owner must accept that or schedule it."},
-	{"INT-NP-043", "Provider callback cannot correlate to durable attempt", Partial, []string{
+	{"INT-NP-043", "Provider callback cannot correlate to durable attempt", Covered, []string{
 		"PS:store/callback_store_test.go::TestCallback_UnknownPaymentIsNotDecidedSoItCanApplyLater",
 		"PS:store/callback_store_test.go::TestCallback_AmbiguousReferenceChangesNothing",
-		"TX:store/callback_store_test.go::TestCallback_UnknownAmbiguousAndCrossTenant"},
-		"No state mutates and a receipt is kept, but no explicit quarantine record with an owner is raised."},
+		"TX:store/callback_store_test.go::TestCallback_UnknownAmbiguousAndCrossTenant",
+		"PS:store/callback_store_test.go::TestCallback_UncorrelatedIsQuarantinedForANamedOwnerOnce",
+		"TX:store/callback_store_test.go::TestCallback_UncorrelatedIsQuarantinedForANamedOwnerOnce"}, ""},
 	{"INT-NP-044", "Integration backlog is silently dropped during overload", Partial, []string{
 		"GA:handler/admission_test.go::TestOverloadIsShedWithBackpressureNotQueued_INT_NP_044",
 		"GA:admission/admission_test.go::TestGateConcurrentNeverExceedsCeiling",
-		"EV:outbox/outbox_test.go::TestRelay_BrokerOutageDoesNotSpendAttempts"},
-		"The gateway sheds with evidence in memory; its SIEM stream drops on saturation without a durable count."},
+		"EV:outbox/outbox_test.go::TestRelay_BrokerOutageDoesNotSpendAttempts",
+		"GA:siem/client_test.go::TestSaturationDropsAreExposedAsAMetric",
+		"EV:outbox/load_test.go::TestLoad_BrokerOutageMidBacklogLosesNothingAndBlamesNoEvent"},
+		"The outbox never drops (proven under load) and SIEM drops are now a metric. The gateway's shed decisions are held in an in-process ring and streamed to the SIEM, not stored durably by the gateway itself."},
 	{"INT-NP-045", "Replay/dead-letter is moved to non-compliant region", Partial, []string{
 		"EV:outbox/controls_test.go::TestRepairCannotCrossRegions_INT_NP_045",
 		"NS:store/webhook_out_test.go::TestWebhook_EgressIsReCheckedOnEverySend"},
@@ -366,9 +379,10 @@ var Scenarios = []Entry{
 		"PI:providers/engine_test.go::TestCredentialIsUsedForOneCallAndNeverLogged",
 		"TX:authority/engine_test.go::TestSchemaFailureBlocksAndNamesPathsNeverValues"},
 		"By design no raw provider response is stored anywhere: only request and response hashes. The specification's 'raw evidence stored separately with restricted access' is not implemented; a named owner must accept hash-only evidence or ask for a restricted store."},
-	{"INT-NP-048", "Integration reports success although downstream reconciliation differs", Partial, []string{
+	{"INT-NP-048", "Integration reports success although downstream reconciliation differs", Covered, []string{
+		"DI:imports/outcome_test.go::TestAnImportIsCertifiedOnlyWhenItReconciled",
 		"EV:integration/integration_test.go::TestOutcomeCannotHideReconciliationBreak_INT_NP_048",
 		"EV:integration/integration_test.go::TestOutcomePrecedence",
 		"DI:store/import_test.go::TestImport_PartialFailureIsExplicitAndNeverReconciled"},
-		"Proven in the library and for imports; no other service uses the Outcome model."},
+		""},
 }

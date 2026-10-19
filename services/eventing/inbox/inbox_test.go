@@ -723,3 +723,21 @@ func TestVerifySchema(t *testing.T) {
 		t.Fatal("missing table not reported")
 	}
 }
+
+// INT-CTRL-034: quarantine alerts always name an owner.
+func TestQuarantineAlertsNameAnOwner(t *testing.T) {
+	alerts := Evaluate(Stats{Quarantined: 2, Failed: 9}, Thresholds{MaxFailed: 1})
+	if len(alerts) != 2 {
+		t.Fatalf("%+v", alerts)
+	}
+	for _, a := range alerts {
+		if a.Owner != DefaultAlertOwner {
+			t.Errorf("%s has owner %q", a.Event, a.Owner)
+		}
+	}
+	for _, a := range Evaluate(Stats{Quarantined: 1}, Thresholds{Owner: "payments-ops"}) {
+		if a.Owner != "payments-ops" {
+			t.Errorf("a named owner is kept: %q", a.Owner)
+		}
+	}
+}

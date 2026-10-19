@@ -488,3 +488,47 @@ func TestQuotaIsPerHostNotPerConnection(t *testing.T) {
 	e.r.ServeHTTP(rec, other)
 	assert.Equal(t, http.StatusUnauthorized, rec.Code, "a different host has its own quota")
 }
+
+// INT-NP-002 end to end: the gateway admits a valid credential and forwards identity, the owning service refuses the
+// command, and the two decisions stay separately retained and joinable by request id. The gateway neither grants the
+// permission nor overrides the refusal.
+func TestGatewayAdmitsAndTheDomainRefusesWithBothDecisionsRetained_INT_NP_002(t *testing.T) {
+	e := newAdmEnv(t, handler.Admission{})
+
+	// the owning service: it trusts only the identity the gateway forwarded and decides permission itself
+	type domainDecision struct{ requestID, principal, outcome string }
+	var domainEvidence []domainDecision
+	domain := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		allowed := r.Header.Get("X-Principal-Id") == "principal-with-permission"
+		out := "DENIED"
+		if allowed {
+			out = "GRANTED"
+		}
+		domainEvidence = append(domainEvidence, domainDecision{r.Header.Get("X-Request-Id"), r.Header.Get("X-Principal-Id"), out})
+		if !allowed {
+			w.WriteHeader(http.StatusForbidden)
+		}
+	})
+
+	rec := e.verify(map[string]string{"Authorization": e.token(t, "tenant-abc"), "X-Forwarded-Uri": "/v1/payments", "X-Request-Id": "req-np002"})
+	require.Equal(t, http.StatusOK, rec.Code, "the gateway admits a valid credential")
+	assert.Empty(t, rec.Header().Get("X-Permissions"), "the gateway grants no domain permission")
+
+	// the proxy forwards what the gateway returned
+	fwd := httptest.NewRequest(http.MethodPost, "/v1/payments", nil)
+	for _, h := range []string{"X-Tenant-Id", "X-Principal-Id", "X-Legal-Entity-Id", "X-Correlation-Id", "X-Request-Id"} {
+		fwd.Header.Set(h, rec.Header().Get(h))
+	}
+	dr := httptest.NewRecorder()
+	domain.ServeHTTP(dr, fwd)
+	assert.Equal(t, http.StatusForbidden, dr.Code, "the owning service refuses; nothing upstream can turn that into success")
+
+	// both decisions exist, separately, and join on the request id
+	u, ok := e.h.Recorder().UsageOf("tenant-abc")
+	require.True(t, ok)
+	assert.Equal(t, uint64(1), u.Allowed, "the gateway's admission is retained")
+	require.Len(t, domainEvidence, 1)
+	assert.Equal(t, "DENIED", domainEvidence[0].outcome)
+	assert.Equal(t, "req-np002", domainEvidence[0].requestID, "the domain's decision carries the id the gateway echoed")
+	assert.Equal(t, rec.Header().Get("X-Request-Id"), domainEvidence[0].requestID)
+}

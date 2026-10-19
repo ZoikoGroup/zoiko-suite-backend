@@ -87,6 +87,14 @@ func main() {
 		logger.Fatal("outbox relay", zap.Error(err))
 	}
 	relay.SetRegion(cfg.EventResidencyRegion)
+	gate, err := schemaGate(cfg)
+	if err != nil {
+		logger.Fatal("schema gate", zap.Error(err))
+	}
+	if gate != nil {
+		relay.SetGate(gate)
+		logger.Info("producer schema gate enabled", zap.String("registry", cfg.SchemaRegistryURL), zap.Bool("allow_unregistered", cfg.SchemaGateAllowUnregistered))
+	}
 	relayCtx, stopRelay := context.WithCancel(context.Background())
 	defer stopRelay()
 	go relay.Run(relayCtx)

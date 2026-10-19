@@ -146,12 +146,20 @@ func ReplayEvent(s *Subscription, d *Delivery, operator, approver, correlation, 
 }
 
 func deliveryEvent(eventType string, tenantID, legalEntityID string, d *Delivery, attemptNo int, outcome AttemptOutcome, class, reason string) (events.Outbound, error) {
-	return events.Build(eventType, d.CorrelationID, tenantID, legalEntityID, "system:webhook-dispatcher", d.DeliveryID, map[string]any{
+	payload := map[string]any{
 		"delivery_id": d.DeliveryID, "subscription_id": d.SubscriptionID, "event_id": d.EventID,
 		"attempt": attemptNo, "outcome": string(outcome), "error_class": class, "reason": reason,
 		"payload_hash": d.BodyHash,
-	})
+	}
+	if eventType == EventDeadLettered {
+		// a dead letter is never ownerless: it names the queue that must decide it (INT-CTRL-034)
+		payload["owner"] = DeadLetterOwner
+	}
+	return events.Build(eventType, d.CorrelationID, tenantID, legalEntityID, "system:webhook-dispatcher", d.DeliveryID, payload)
 }
+
+// DeadLetterOwner is the queue that owns a dead-lettered webhook delivery. Replay needs an approver and a reason.
+const DeadLetterOwner = "integration-operations"
 
 // FailedEvent is webhook.delivery.failed (one failed attempt).
 func FailedEvent(tenantID, legalEntityID string, d *Delivery, attemptNo int, outcome AttemptOutcome, class string) (events.Outbound, error) {

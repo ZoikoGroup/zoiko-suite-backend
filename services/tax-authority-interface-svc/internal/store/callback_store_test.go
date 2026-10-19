@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"zoiko.io/tax-authority-interface-svc/internal/authority"
+	"zoiko.io/tax-authority-interface-svc/internal/store"
 )
 
 func cbIn(event, ref, raw, mapped string) authority.CallbackInput {
@@ -177,4 +178,33 @@ func TestCallback_UnknownAmbiguousAndCrossTenant(t *testing.T) {
 	assert.Error(t, err)
 	_, err = f.admin.Exec(context.Background(), `DELETE FROM tax_authority_callbacks WHERE receipt_id = $1`, id)
 	assert.Error(t, err)
+}
+
+// INT-NP-043 / INT-CTRL-034: an authority callback that cannot be correlated to a durable filing changes nothing, is
+// quarantined for a named owner, and raises one event so an alert can route to that owner; the authority's retries do not
+// re-raise it, and a callback that does correlate raises none.
+func TestCallback_UncorrelatedIsQuarantinedForANamedOwnerOnce(t *testing.T) {
+	f := newFixture(t)
+	tenant := uuid.NewString()
+	fl := f.sentFiling(tenant, false)
+	count := func() (n int, owner string) {
+		require.NoError(t, f.admin.QueryRow(context.Background(),
+			`SELECT count(*), COALESCE(max(convert_from(payload,'UTF8')::jsonb #>> '{data,owner}'), '') FROM eventing_outbox
+			 WHERE tenant_id = $1 AND event_type = 'com.zoikosuite.tax.authority-callback.quarantined'`, tenant).Scan(&n, &owner))
+		return
+	}
+	for i := 0; i < 3; i++ {
+		res, err := f.st.ApplyCallback(tc(tenant), cbIn("ORPHAN", "RC-nobody", "ACCEPTED", "ACCEPTED"))
+		require.NoError(t, err)
+		require.Equal(t, authority.OutcomeUnknownFiling, res.Outcome)
+	}
+	n, owner := count()
+	assert.Equal(t, 1, n, "one quarantine event however many times the authority retries")
+	assert.Equal(t, store.QuarantineOwner, owner)
+
+	res, err := f.st.ApplyCallback(tc(tenant), cbIn("OK-1", fl.AuthorityRef, "ACCEPTED", "ACCEPTED"))
+	require.NoError(t, err)
+	require.Equal(t, authority.OutcomeApplied, res.Outcome)
+	n, _ = count()
+	assert.Equal(t, 1, n, "a callback that correlates is not a quarantine")
 }

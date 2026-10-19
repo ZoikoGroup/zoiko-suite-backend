@@ -22,6 +22,10 @@ const (
 	OutcomeStaleIgnored      = "STALE_IGNORED"
 	OutcomeUnknownPayment    = "UNKNOWN_PAYMENT"
 	OutcomeAmbiguousPayment  = "AMBIGUOUS_PAYMENT"
+
+	// QuarantineOwner is the queue that owns a provider callback no durable payment could be found for (INT-CTRL-034). The
+	// quarantine event names it, so an alert routes somewhere instead of nowhere.
+	QuarantineOwner = "payment-operations"
 )
 
 // CallbackInput is one AUTHENTICATED provider callback (its signature has already been verified).
@@ -104,6 +108,15 @@ func (s *PgStore) ApplyProviderCallback(ctx context.Context, in CallbackInput) (
 			if err != nil {
 				return err
 			}
+			// an event that correlates to no durable payment is quarantined for a named owner, once per event
+			quarantined := outcome == OutcomeUnknownPayment || outcome == OutcomeAmbiguousPayment
+			var priorQuarantine int
+			if quarantined {
+				if err := tx.QueryRow(ctx, `SELECT count(*) FROM provider_callback_receipts WHERE tenant_id = $1 AND provider_key = $2 AND event_ref = $3
+					AND outcome IN ('UNKNOWN_PAYMENT', 'AMBIGUOUS_PAYMENT')`, tenant, in.Provider, in.EventRef).Scan(&priorQuarantine); err != nil {
+					return err
+				}
+			}
 			_, err = tx.Exec(ctx, `
 				INSERT INTO provider_callback_receipts (tenant_id, provider_key, event_ref, payment_ref, payment_id, legal_entity_id, scheme,
 					reported_status, mapped_status, event_time, body_hash, outcome, detail)
@@ -126,8 +139,15 @@ func (s *PgStore) ApplyProviderCallback(ctx context.Context, in CallbackInput) (
 			if err != nil {
 				return err
 			}
-			_, err = tx.Exec(ctx, "RELEASE SAVEPOINT receipt")
-			return err
+			if _, err = tx.Exec(ctx, "RELEASE SAVEPOINT receipt"); err != nil {
+				return err
+			}
+			if quarantined && priorQuarantine == 0 && res.Outcome == outcome {
+				return s.enqueueEvent(ctx, tx, "com.zoikosuite.banking.provider-callback.quarantined", "PROVIDER_CALLBACK_QUARANTINED", "provider-callback",
+					in.Provider+":"+in.EventRef, tenant, "", "provider-callback", in.CorrelationID,
+					map[string]any{"provider": in.Provider, "event_ref": in.EventRef, "outcome": outcome, "owner": QuarantineOwner, "body_hash": in.BodyHash})
+			}
+			return nil
 		}
 
 		// find the payment, by our id or by the provider's reference, in this tenant only

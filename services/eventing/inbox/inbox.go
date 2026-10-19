@@ -722,27 +722,45 @@ func (i *Inbox) Requeue(ctx context.Context, tenantID, eventID string, auth repa
 // Thresholds are the consumer-side alerting limits.
 type Thresholds struct {
 	MaxFailed int // 0 = unchecked
+	// Owner is stamped on every alert; empty means DefaultAlertOwner.
+	Owner string
 }
 
 // Alert is a canonical integration event the service should emit.
 type Alert struct {
 	Event  string // ZS-SVC-M-001 §10 event name
 	Detail string
+	// Owner is the queue that owns what the alert is about, so it routes somewhere (INT-CTRL-034). Set from
+	// Thresholds.Owner, DefaultAlertOwner when that is empty.
+	Owner string
 }
+
+// DefaultAlertOwner owns an alert when the service names no one: quarantine and dead letters are never ownerless.
+const DefaultAlertOwner = "integration-operations"
 
 // Evaluate turns Stats into the §10 alerts. inbox_processing_quarantined fires
 // whenever anything is quarantined (it always needs an owner); the per-delivery
 // inbox_duplicate_detected is raised by the consumer when Process reports
 // Duplicate.
 func Evaluate(s Stats, t Thresholds) []Alert {
+	out := evaluate(s, t)
+	owner := t.Owner
+	if owner == "" {
+		owner = DefaultAlertOwner
+	}
+	for i := range out {
+		out[i].Owner = owner
+	}
+	return out
+}
+
+func evaluate(s Stats, t Thresholds) []Alert {
 	var out []Alert
 	if s.Quarantined > 0 {
-		out = append(out, Alert{"inbox_processing_quarantined",
-			fmt.Sprintf("%d received events are quarantined", s.Quarantined)})
+		out = append(out, Alert{Event: "inbox_processing_quarantined", Detail: fmt.Sprintf("%d received events are quarantined", s.Quarantined)})
 	}
 	if t.MaxFailed > 0 && s.Failed > t.MaxFailed {
-		out = append(out, Alert{"inbox_processing_failing",
-			fmt.Sprintf("%d received events are failing and being retried", s.Failed)})
+		out = append(out, Alert{Event: "inbox_processing_failing", Detail: fmt.Sprintf("%d received events are failing and being retried", s.Failed)})
 	}
 	return out
 }
