@@ -4,12 +4,17 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path/filepath"
+	"runtime"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -53,33 +58,99 @@ func (e *okEmail) Deliver(_ context.Context, n domain.Notification) domain.Deliv
 	return domain.DeliveryOutcome{Delivered: true, ProviderName: "smtp", ProviderResponse: "ok; message-id=<" + n.NotificationID + ">"}
 }
 
-func ncdServer(t *testing.T) (http.Handler, *ncd.Service, string) {
+// handlerDB is this package's own database: TEST_DATABASE_URL's name plus
+// "_handler", created and migrated on first use.
+//
+// These tests used to read the store suite's schema in TEST_DATABASE_URL
+// itself and skip ("run the store suite first") when it was absent. go test
+// ./... runs internal/handler before internal/store, so on a fresh database —
+// CI's included — TestNCDHTTP_EndToEnd, …ProviderEventsNeedSignature and
+// …UnsubscribeHandlingCannotBeDisabled reported ok having run nothing (Group 1
+// re-audit, 19 Oct 2026). Sharing the store suite's database is not the fix
+// either: that suite drops and rebuilds the schema, which would race these
+// tests when packages run in parallel.
+var (
+	handlerDBOnce sync.Once
+	handlerDBURL  string
+	handlerDBErr  error
+)
+
+func handlerDB(t *testing.T) string {
+	t.Helper()
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("TEST_DATABASE_URL not set")
 	}
-	u, _ := url.Parse(dsn)
-	if !strings.Contains(u.Path, "test") {
-		t.Fatalf("refusing to run against %s", u.Path)
+	u, err := url.Parse(dsn)
+	if err != nil || !strings.Contains(u.Path, "test") {
+		t.Fatalf("refusing to run against %q: not a recognisably disposable database", dsn)
 	}
-	// The store suite's older tests recreate some tables after the NCD
-	// suite runs, which drops the app role's grants; restore them.
-	if admin, err := pgxpool.New(context.Background(), dsn); err == nil {
-		_, _ = admin.Exec(context.Background(), `GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO zoiko_ncd_app;
-			GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO zoiko_ncd_app`)
-		admin.Close()
+	handlerDBOnce.Do(func() {
+		ctx := context.Background()
+		name := strings.TrimPrefix(u.Path, "/") + "_handler"
+		admin, err := pgxpool.New(ctx, dsn)
+		if err != nil {
+			handlerDBErr = err
+			return
+		}
+		defer admin.Close()
+		var exists bool
+		if handlerDBErr = admin.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)`, name).Scan(&exists); handlerDBErr != nil {
+			return
+		}
+		if !exists {
+			if _, handlerDBErr = admin.Exec(ctx, `CREATE DATABASE "`+name+`"`); handlerDBErr != nil {
+				return
+			}
+		}
+		own := *u
+		own.Path = "/" + name
+		db, err := pgxpool.New(ctx, own.String())
+		if err != nil {
+			handlerDBErr = err
+			return
+		}
+		defer db.Close()
+		if _, handlerDBErr = db.Exec(ctx, `DROP SCHEMA public CASCADE; CREATE SCHEMA public;`); handlerDBErr != nil {
+			return
+		}
+		_, file, _, _ := runtime.Caller(0)
+		names, _ := filepath.Glob(filepath.Join(filepath.Dir(file), "../../deployments/migrations/*.up.sql"))
+		sort.Strings(names)
+		for _, n := range names {
+			raw, err := os.ReadFile(n)
+			if err != nil {
+				handlerDBErr = err
+				return
+			}
+			if _, err := db.Exec(ctx, string(bytes.TrimPrefix(raw, []byte("\xef\xbb\xbf")))); err != nil {
+				handlerDBErr = fmt.Errorf("%s: %w", filepath.Base(n), err)
+				return
+			}
+		}
+		if _, handlerDBErr = db.Exec(ctx, `DO $do$ BEGIN
+			IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'zoiko_ncd_app') THEN
+				CREATE ROLE zoiko_ncd_app LOGIN PASSWORD 'ncd' NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+			END IF;
+		END $do$;
+		GRANT USAGE ON SCHEMA public TO zoiko_ncd_app;
+		GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO zoiko_ncd_app;
+		GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO zoiko_ncd_app;`); handlerDBErr != nil {
+			return
+		}
+		own.User = url.UserPassword("zoiko_ncd_app", "ncd")
+		handlerDBURL = own.String()
+	})
+	if handlerDBErr != nil {
+		t.Fatalf("handler test database: %v", handlerDBErr)
 	}
-	u.User = url.UserPassword("zoiko_ncd_app", "ncd")
-	pool, err := pgxpool.New(context.Background(), u.String())
+	return handlerDBURL
+}
+
+func ncdServer(t *testing.T) (http.Handler, *ncd.Service, string) {
+	pool, err := pgxpool.New(context.Background(), handlerDB(t))
 	if err != nil {
 		t.Fatal(err)
-	}
-	if err := pool.Ping(context.Background()); err != nil {
-		t.Skipf("app role not provisioned (run the store suite first): %v", err)
-	}
-	var ok bool
-	if err := pool.QueryRow(context.Background(), `SELECT to_regclass('ncd_communications') IS NOT NULL`).Scan(&ok); err != nil || !ok {
-		t.Skip("NCD schema not present (run the store suite first)")
 	}
 	t.Cleanup(pool.Close)
 	pg := store.New(pool)
