@@ -94,6 +94,56 @@ func TestPgStore_AmendAccountVersion_AppendsVersionAndAdvancesHead(t *testing.T)
 	})
 }
 
+func TestPgStore_ActivateDeactivate_RoundTripsThroughVersionHistory(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+
+	acct := newTestAccount(tenantID, "1000", "Cash")
+	if err := s.CreateAccount(ctx, acct); err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+
+	deactivated, err := s.DeactivateAccount(ctx, tenantID, "1000", 1, time.Time{}, "cash desk closed", nil, "test-admin")
+	if err != nil {
+		t.Fatalf("DeactivateAccount: %v", err)
+	}
+	if deactivated.Status != "INACTIVE" || deactivated.Version != 2 {
+		t.Fatalf("expected INACTIVE at version 2, got %s at version %d", deactivated.Status, deactivated.Version)
+	}
+
+	reactivated, err := s.ActivateAccount(ctx, tenantID, "1000", 2, time.Time{}, "cash desk reopened", nil, "test-admin")
+	if err != nil {
+		t.Fatalf("ActivateAccount: %v", err)
+	}
+	if reactivated.Status != "ACTIVE" || reactivated.Version != 3 {
+		t.Fatalf("expected ACTIVE at version 3, got %s at version %d", reactivated.Status, reactivated.Version)
+	}
+
+	// Re-issuing the transition the account is already in is a no-op and must
+	// not write a fourth version.
+	idempotent, err := s.ActivateAccount(ctx, tenantID, "1000", 3, time.Time{}, "retry", nil, "test-admin")
+	if err != nil {
+		t.Fatalf("idempotent ActivateAccount: %v", err)
+	}
+	if idempotent.Version != 3 {
+		t.Fatalf("idempotent activation must not append a version, got version %d", idempotent.Version)
+	}
+
+	scoped(t, pool, tenantID, func(tx pgx.Tx) {
+		var count int
+		if err := tx.QueryRow(context.Background(),
+			`SELECT COUNT(*) FROM account_versions WHERE tenant_id = $1 AND account_id = $2`,
+			tenantID, acct.AccountID).Scan(&count); err != nil {
+			t.Fatalf("count account_versions: %v", err)
+		}
+		if count != 3 {
+			t.Fatalf("expected three version rows (created, deactivated, activated), got %d", count)
+		}
+	})
+}
+
 func TestPgStore_AmendAccountVersion_StaleExpectedVersionIsRefused(t *testing.T) {
 	pool := openTestPool(t)
 	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))

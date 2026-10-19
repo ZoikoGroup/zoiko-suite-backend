@@ -343,13 +343,49 @@ func (s *stubStore) ListAccounts(_ context.Context, tenantID string) ([]domain.A
 	return out, nil
 }
 
-func (s *stubStore) DeactivateAccount(_ context.Context, tenantID, accountCode string) error {
-	a, ok := s.accountsByCode[tenantID+"|"+accountCode]
+func (s *stubStore) ActivateAccount(_ context.Context, tenantID, accountCode string, expectedVersion int64, effectiveFrom time.Time, reason string, evidence []string, principalID string) (*domain.Account, error) {
+	return s.changeAccountStatus(tenantID, accountCode, "ACTIVE", "ACTIVATED", expectedVersion, effectiveFrom, reason, evidence, principalID)
+}
+
+func (s *stubStore) DeactivateAccount(_ context.Context, tenantID, accountCode string, expectedVersion int64, effectiveFrom time.Time, reason string, evidence []string, principalID string) (*domain.Account, error) {
+	return s.changeAccountStatus(tenantID, accountCode, "INACTIVE", "DEACTIVATED", expectedVersion, effectiveFrom, reason, evidence, principalID)
+}
+
+// changeAccountStatus mirrors the real store's transition invariants: idempotent
+// when already in the target status, version-guarded, and one appended version
+// per real transition.
+func (s *stubStore) changeAccountStatus(tenantID, accountCode, newStatus, changeKind string, expectedVersion int64, effectiveFrom time.Time, reason string, evidence []string, principalID string) (*domain.Account, error) {
+	key := tenantID + "|" + accountCode
+	a, ok := s.accountsByCode[key]
 	if !ok {
-		return domain.ErrAccountNotFound
+		return nil, domain.ErrAccountNotFound
 	}
-	a.Status = "INACTIVE"
-	return nil
+	if expectedVersion > 0 && a.Version != expectedVersion {
+		return nil, domain.ErrAccountVersionConflict
+	}
+	if a.Status == newStatus {
+		return a, nil
+	}
+	versions := s.accountVersions[key]
+	if len(versions) > 0 {
+		prev := versions[len(versions)-1]
+		if effectiveFrom.Before(prev.EffectiveFrom) {
+			return nil, domain.ErrAccountEffectiveDate
+		}
+		prev.EffectiveTo = &effectiveFrom
+	}
+	a.Status = newStatus
+	a.Version++
+	s.accountVersions[key] = append(versions, &domain.AccountVersion{
+		AccountVersionID: "v" + fmt.Sprint(a.Version) + "-" + key,
+		AccountID:        a.AccountID, TenantID: a.TenantID, AccountCode: a.AccountCode,
+		Version: a.Version, AccountName: a.AccountName, AccountType: a.AccountType,
+		ParentAccountID: a.ParentAccountID, IsControlAccount: a.IsControlAccount,
+		DirectPostingRestricted: a.DirectPostingRestricted, Status: a.Status,
+		EffectiveFrom: effectiveFrom, ChangeKind: changeKind, ChangeReason: reason,
+		EvidenceRefs: evidence, CreatedAt: time.Now().UTC(), CreatedByPrincipalID: principalID,
+	})
+	return a, nil
 }
 
 // SetAccountMapping mirrors the real store's own validation rule (the
@@ -1398,6 +1434,63 @@ func TestAmendAccountVersion_ExplicitNullParentClearsParent(t *testing.T) {
 	}
 	if updated.ParentAccountID != nil {
 		t.Fatalf("explicit null parent_account_id should clear the parent, got %v", *updated.ParentAccountID)
+	}
+}
+
+func TestActivateAccount_ReactivatesAndAppendsVersion(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1000-Cash", AccountName: "Cash", AccountType: domain.AccountTypeAsset})
+	doRequest(r, http.MethodPost, "/v1/chart-of-accounts/1000-Cash/deactivate", nil, "principal-1")
+
+	rec := doRequest(r, http.MethodPost, "/v1/chart-of-accounts/1000-Cash/activate", map[string]any{
+		"reason": "cash desk reopened",
+	}, "principal-1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var activated domain.Account
+	if err := json.Unmarshal(rec.Body.Bytes(), &activated); err != nil {
+		t.Fatalf("activated account is not valid JSON: %v", err)
+	}
+	if activated.Status != "ACTIVE" || activated.Version != 3 {
+		t.Fatalf("expected ACTIVE at version 3, got %s at version %d", activated.Status, activated.Version)
+	}
+
+	// A reactivated account must be postable again: the original Deactivate
+	// path blocked it, and an Activate that does not inverse that exactly is
+	// worse than no Activate at all.
+	rec = doRequest(r, http.MethodPost, "/v1/journals/", validCreateReq(), "principal-1")
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected posting to succeed after reactivation, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestActivateAccount_AlreadyActive_IsIdempotentNoNewVersion(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1000-Cash", AccountName: "Cash", AccountType: domain.AccountTypeAsset})
+
+	rec := doRequest(r, http.MethodPost, "/v1/chart-of-accounts/1000-Cash/activate", nil, "principal-1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if got := len(s.accountVersions["t1|1000-Cash"]); got != 1 {
+		t.Fatalf("activating an already-active account must not append a version, got %d", got)
+	}
+}
+
+func TestActivateAccount_ExpectedVersionConflict_Returns409(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1000-Cash", AccountName: "Cash", AccountType: domain.AccountTypeAsset})
+	doRequest(r, http.MethodPost, "/v1/chart-of-accounts/1000-Cash/deactivate", nil, "principal-1")
+
+	rec := doRequest(r, http.MethodPost, "/v1/chart-of-accounts/1000-Cash/activate", map[string]any{
+		"expected_version": 1,
+	}, "principal-1")
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 on stale expected_version, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
 

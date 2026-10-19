@@ -1472,19 +1472,86 @@ func (s *PgStore) ListAccountMappings(ctx context.Context, tenantID string) ([]d
 	return out, nil
 }
 
-func (s *PgStore) DeactivateAccount(ctx context.Context, tenantID, accountCode string) error {
+// changeAccountStatus is the shared implementation of ActivateAccount and
+// DeactivateAccount. Both are ordinary status transitions, so each appends a
+// new version and advances the head; re-issuing the transition an account is
+// already in is an idempotent no-op that writes no version, matching
+// DeactivateAccount's pre-versioning tolerance for being called twice.
+func (s *PgStore) changeAccountStatus(
+	ctx context.Context,
+	tenantID, accountCode, newStatus, changeKind string,
+	expectedVersion int64,
+	effectiveFrom time.Time,
+	reason string,
+	evidenceRefs []string,
+	principalID string,
+) (*domain.Account, error) {
+	var out *domain.Account
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		res, err := tx.Exec(ctx, `UPDATE chart_of_accounts SET status = 'INACTIVE' WHERE tenant_id = $1 AND account_code = $2`,
-			tenantID, accountCode)
+		cur, err := accountForUpdate(ctx, tx, tenantID, accountCode)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrAccountNotFound
+		}
 		if err != nil {
 			return mapPgError(err)
 		}
-		if res.RowsAffected() == 0 {
-			return domain.ErrAccountNotFound
+		if expectedVersion > 0 && cur.Version != expectedVersion {
+			return domain.ErrAccountVersionConflict
 		}
+		if cur.Status == newStatus {
+			out = cur
+			return nil
+		}
+
+		effective := effectiveFrom
+		if effective.IsZero() {
+			effective = time.Now().UTC()
+		}
+		currentEffectiveFrom, err := currentAccountVersionEffectiveFrom(ctx, tx, tenantID, cur.AccountID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			currentEffectiveFrom = cur.CreatedAt
+		} else if err != nil {
+			return mapPgError(err)
+		}
+		if effective.Before(currentEffectiveFrom) {
+			return domain.ErrAccountEffectiveDate
+		}
+
+		updated := *cur
+		updated.Status = newStatus
+		updated.Version = cur.Version + 1
+		if err := closeCurrentAccountVersion(ctx, tx, tenantID, cur.AccountID, effective); err != nil {
+			return err
+		}
+		if err := insertAccountVersion(ctx, tx, accountVersionFromAccount(
+			&updated, updated.Version, effective, changeKind, reason, principalID, evidenceRefs)); err != nil {
+			return err
+		}
+		tag, err := tx.Exec(ctx, `
+			UPDATE chart_of_accounts SET status = $1, version = $2
+			WHERE tenant_id = $3 AND account_code = $4 AND version = $5
+		`, updated.Status, updated.Version, tenantID, accountCode, cur.Version)
+		if err != nil {
+			return mapPgError(err)
+		}
+		if tag.RowsAffected() == 0 {
+			return domain.ErrAccountVersionConflict
+		}
+		out = &updated
 		return nil
 	})
-	return err
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (s *PgStore) ActivateAccount(ctx context.Context, tenantID, accountCode string, expectedVersion int64, effectiveFrom time.Time, reason string, evidenceRefs []string, principalID string) (*domain.Account, error) {
+	return s.changeAccountStatus(ctx, tenantID, accountCode, "ACTIVE", "ACTIVATED", expectedVersion, effectiveFrom, reason, evidenceRefs, principalID)
+}
+
+func (s *PgStore) DeactivateAccount(ctx context.Context, tenantID, accountCode string, expectedVersion int64, effectiveFrom time.Time, reason string, evidenceRefs []string, principalID string) (*domain.Account, error) {
+	return s.changeAccountStatus(ctx, tenantID, accountCode, "INACTIVE", "DEACTIVATED", expectedVersion, effectiveFrom, reason, evidenceRefs, principalID)
 }
 
 // ── ACC-04 (Posting Engine) ───────────────────────────────────────────────────

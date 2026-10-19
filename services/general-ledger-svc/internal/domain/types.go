@@ -412,6 +412,27 @@ type AmendAccountVersionRequest struct {
 	EvidenceRefs            []string       `json:"evidence_refs,omitempty"`
 }
 
+// ActivateAccountRequest and DeactivateAccountRequest are the optional request
+// bodies of the two status commands. Both fields beyond the path are optional:
+// the existing DeactivateAccount accepted no body at all, so requiring one now
+// would break every current caller. expected_version, when supplied, is a real
+// optimistic-concurrency check.
+type ActivateAccountRequest struct {
+	ExpectedVersion int64          `json:"expected_version,omitempty"`
+	EffectiveFrom   *EffectiveDate `json:"effective_from,omitempty"`
+	Reason          string         `json:"reason,omitempty"`
+	EvidenceRefs    []string       `json:"evidence_refs,omitempty"`
+}
+
+// DeactivateAccountRequest is the DeactivateAccount body — a separate named
+// type so the two commands' contracts can diverge later without an alias.
+type DeactivateAccountRequest struct {
+	ExpectedVersion int64          `json:"expected_version,omitempty"`
+	EffectiveFrom   *EffectiveDate `json:"effective_from,omitempty"`
+	Reason          string         `json:"reason,omitempty"`
+	EvidenceRefs    []string       `json:"evidence_refs,omitempty"`
+}
+
 // UnmarshalJSON records whether parent_account_id was present at all. A plain
 // *string cannot tell "clear the parent" from "leave the parent unchanged",
 // and silently treating one as the other would move an account in the chart
