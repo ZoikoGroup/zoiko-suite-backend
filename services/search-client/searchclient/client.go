@@ -38,7 +38,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"strings"
+	"net/http"
 
 	opensearch "github.com/opensearch-project/opensearch-go/v4"
 	"github.com/opensearch-project/opensearch-go/v4/opensearchapi"
@@ -166,17 +166,26 @@ func (c *client) EnsureIndex(ctx context.Context, index IndexName) error {
 	resp, err := c.os.Indices.Exists(ctx, opensearchapi.IndicesExistsReq{
 		Indices: []string{string(index)},
 	})
-	if err != nil {
-		if !strings.Contains(err.Error(), "404") {
-			return fmt.Errorf("searchclient: EnsureIndex exists check: %w", err)
-		}
-	} else {
-		if resp != nil && resp.Body != nil {
+
+	// Read the response before the error. opensearch-go returns a non-nil
+	// response together with an error for a 404, and the status is the only
+	// reliable signal: matching "404" in the error text would also treat a
+	// proxy's HTML error page or a timed-out URL as a missing index.
+	status := 0
+	if resp != nil {
+		status = resp.StatusCode
+		if resp.Body != nil {
 			_ = resp.Body.Close()
 		}
-		if resp != nil && resp.StatusCode == 200 {
-			return nil // already exists
-		}
+	}
+	if status == http.StatusOK {
+		return nil // already exists
+	}
+	if err != nil && status != http.StatusNotFound {
+		return fmt.Errorf("searchclient: EnsureIndex exists check: %w", err)
+	}
+	if status != http.StatusNotFound {
+		return fmt.Errorf("searchclient: EnsureIndex exists check: unexpected status %d", status)
 	}
 
 	// Create with basic mappings that enforce tenant_id and legal_entity_id

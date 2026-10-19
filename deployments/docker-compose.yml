@@ -1704,6 +1704,8 @@ services:
   # POST to /v1/search-sources, not a redeploy.
   search-indexer-svc:
     build:
+      # Root context is required: go.mod replaces zoiko.io/search-client with
+      # the sibling ../search-client module, so the build must see both.
       context: ..
       dockerfile: services/search-indexer-svc/Dockerfile
     container_name: search-indexer-svc
