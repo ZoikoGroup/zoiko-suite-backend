@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -118,6 +119,9 @@ func wireWebhookOut(ctx context.Context, cfg *config.Config, log *zap.Logger, po
 	in, err := inbox.New(inbox.PoolRunner{Pool: pool, TenantSetting: "app.tenant_id"}, whout.ConsumerName, inbox.DefaultConfig())
 	if err != nil {
 		log.Fatal("webhooks: inbox", zap.Error(err))
+	}
+	if len(wc.AllowedRegions) == 1 { // a single-region deployment pins its receipts; a multi-region one cannot name one
+		in.SetRegion(strings.ToLower(strings.TrimSpace(wc.AllowedRegions[0])))
 	}
 	consumer := whout.NewConsumer(log, pg, in)
 	go whout.SuperviseTopics(ctx, log, wc.SourceTopics, kafkaTopicLister(cfg.Kafka.Brokers),

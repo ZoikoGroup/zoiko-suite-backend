@@ -40,6 +40,7 @@ var (
 	ErrNotLive               = errors.New("the connector is not active")
 	ErrValidation            = errors.New("the request is not valid")
 	ErrNotPlatformScope      = errors.New("only the platform scope may do that")
+	ErrDeprecationWindow     = errors.New("the profile's deprecation window has not ended")
 )
 
 // Actor is who is acting.

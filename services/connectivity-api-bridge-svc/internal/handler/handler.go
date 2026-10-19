@@ -718,7 +718,10 @@ func (h *Handler) GetProfile(w http.ResponseWriter, r *http.Request) {
 }
 
 type statusRequest struct {
-	Status string `json:"status"`
+	Status    string     `json:"status"`
+	SunsetAt  *time.Time `json:"sunset_at,omitempty"`
+	Emergency bool       `json:"emergency,omitempty"`
+	Reason    string     `json:"reason,omitempty"`
 }
 
 func (h *Handler) SetProfileStatus(w http.ResponseWriter, r *http.Request) {
@@ -737,7 +740,8 @@ func (h *Handler) SetProfileStatus(w http.ResponseWriter, r *http.Request) {
 	if !h.authorize(w, r, principalID, store.PlatformScopeID, ActionProfilePublish) {
 		return
 	}
-	p, err := h.svc.SetProfileStatus(r.Context(), middleware.GetTenantID(r.Context()), h.actor(r), chi.URLParam(r, "key"), v, req.Status)
+	p, err := h.svc.ChangeProfileStatus(r.Context(), middleware.GetTenantID(r.Context()), h.actor(r), chi.URLParam(r, "key"), v,
+		connector.ProfileChange{Status: req.Status, SunsetAt: req.SunsetAt, Emergency: req.Emergency, Reason: req.Reason})
 	if err != nil {
 		writeProblem(w, r, err)
 		return

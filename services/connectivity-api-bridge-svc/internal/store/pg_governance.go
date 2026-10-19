@@ -409,15 +409,18 @@ func (p *PgStore) ListProfiles(ctx context.Context, key string) ([]domain.Profil
 	return out, err
 }
 
-func (p *PgStore) SetProfileStatus(ctx context.Context, key string, version int, status string, at time.Time, ev domain.OutboxEvent) (*domain.Profile, error) {
+func (p *PgStore) SetProfileStatus(ctx context.Context, key string, version int, status string, at time.Time, sunset *time.Time, ev domain.OutboxEvent) (*domain.Profile, error) {
 	var pr domain.Profile
 	err := p.withTenant(ctx, func(tx pgx.Tx) error {
 		err := scanProfile(tx.QueryRow(ctx, `
 			UPDATE external_profiles SET status = $3::text,
 				deprecated_at = CASE WHEN $3::text IN ('DEPRECATED', 'UNSUPPORTED') AND deprecated_at IS NULL THEN $4::timestamptz ELSE deprecated_at END,
-				sunset_at = CASE WHEN $3::text = 'UNSUPPORTED' AND sunset_at IS NULL THEN $4::timestamptz ELSE sunset_at END
+				sunset_at = CASE
+					WHEN $3::text = 'DEPRECATED' AND $5::timestamptz IS NOT NULL AND sunset_at IS NULL THEN $5::timestamptz
+					WHEN $3::text = 'UNSUPPORTED' AND sunset_at IS NULL THEN $4::timestamptz
+					ELSE sunset_at END
 			WHERE provider_key = $1 AND version = $2
-			RETURNING `+profileCols, key, version, status, at), &pr)
+			RETURNING `+profileCols, key, version, status, at, sunset), &pr)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.ErrProfileNotFound
 		}

@@ -42,6 +42,11 @@ import (
 // TableName is the one inbox table every consuming service creates.
 const TableName = "eventing_inbox"
 
+// RegionSQL adds the region column to an inbox created before it existed. It is additive and idempotent: append it
+// to the consumer's next migration. Receipts written before it have a NULL region, which a region-pinned inbox refuses
+// to repair (it cannot prove the event belongs here).
+const RegionSQL = `ALTER TABLE eventing_inbox ADD COLUMN IF NOT EXISTS region TEXT;`
+
 // SchemaSQL is copied verbatim into an adopting service's migration, together
 // with repair.SchemaSQL.
 const SchemaSQL = `
@@ -63,6 +68,8 @@ CREATE TABLE eventing_inbox (
     result_ref        TEXT,
     last_error_code   TEXT,
     last_error        TEXT,
+    -- the event's residency region, so a repair can be refused when it would move the event across regions (INT-NP-045)
+    region            TEXT,
 
     CONSTRAINT eventing_inbox_unique_delivery UNIQUE (consumer, tenant_id, event_id),
     CONSTRAINT eventing_inbox_state_valid CHECK (state IN
@@ -125,6 +132,8 @@ type Message struct {
 	AggregateID      string
 	AggregateVersion *int64
 	PayloadHash      string
+	// Region is the event's residency region from its envelope; empty for a legacy envelope that names none.
+	Region string
 }
 
 type wire struct {
@@ -134,6 +143,7 @@ type wire struct {
 	AggregateID      string          `json:"aggregateid"`
 	AggregateVersion *int64          `json:"aggregateversion"`
 	PayloadHash      string          `json:"payloadhash"`
+	Region           string          `json:"residencyregion"`
 	LegacyID         string          `json:"event_id"`
 	LegacyType       string          `json:"event_type"`
 	LegacyTenant     string          `json:"tenant_id"`
@@ -157,6 +167,7 @@ func Parse(raw []byte) (Message, error) {
 		AggregateID:      w.AggregateID,
 		AggregateVersion: w.AggregateVersion,
 		PayloadHash:      w.PayloadHash,
+		Region:           w.Region,
 	}
 	if m.PayloadHash == "" {
 		body := w.Data
@@ -290,7 +301,16 @@ type Inbox struct {
 	db       TxRunner
 	consumer string
 	cfg      Config
+	region   string
 }
+
+// ErrRegionMismatch means a repair would act on an event whose residency region is not this inbox's (or is unknown).
+var ErrRegionMismatch = errors.New("inbox: the event's residency region does not match this consumer's region")
+
+// SetRegion pins the inbox to a residency region. Requeue then refuses any receipt whose event region differs, or is
+// not recorded: a repair must not move an event out of, or into, a region it does not belong to (INT-REG-002, INT-NP-045).
+// Unset means no region check. Call before serving.
+func (i *Inbox) SetRegion(region string) { i.region = region }
 
 // New builds an Inbox for the named consumer (a stable name: renaming it
 // forgets every receipt).
@@ -411,11 +431,11 @@ func (i *Inbox) begin(ctx context.Context, tx pgx.Tx, msg Message) (beginResult,
 	tag, err := tx.Exec(ctx, `
 		INSERT INTO eventing_inbox
 		    (inbox_id, consumer, event_id, event_type, tenant_id, aggregate_id,
-		     aggregate_version, payload_hash, state, attempt_count)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'processing',1)
+		     aggregate_version, payload_hash, state, attempt_count, region)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'processing',1,$9)
 		ON CONFLICT (consumer, tenant_id, event_id) DO NOTHING`,
 		id, i.consumer, msg.EventID, msg.EventType, msg.TenantID,
-		nullable(msg.AggregateID), msg.AggregateVersion, msg.PayloadHash)
+		nullable(msg.AggregateID), msg.AggregateVersion, msg.PayloadHash, nullable(msg.Region))
 	if err != nil {
 		return beginResult{}, err
 	}
@@ -497,10 +517,10 @@ func (i *Inbox) recordFailure(ctx context.Context, msg Message, cause error) (st
 		return tx.QueryRow(ctx, `
 			INSERT INTO eventing_inbox
 			    (inbox_id, consumer, event_id, event_type, tenant_id, aggregate_id,
-			     aggregate_version, payload_hash, state, attempt_count, last_error_code, last_error)
+			     aggregate_version, payload_hash, state, attempt_count, last_error_code, last_error, region)
 			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,
 			        CASE WHEN $9::boolean OR 1 >= $10::int THEN 'quarantined' ELSE 'failed_retryable' END,
-			        1, $11, $12)
+			        1, $11, $12, $13)
 			ON CONFLICT (consumer, tenant_id, event_id) DO UPDATE
 			   SET attempt_count = eventing_inbox.attempt_count + 1,
 			       state = CASE WHEN $9::boolean OR eventing_inbox.attempt_count + 1 >= $10::int
@@ -509,7 +529,7 @@ func (i *Inbox) recordFailure(ctx context.Context, msg Message, cause error) (st
 			 WHERE eventing_inbox.state NOT IN ('completed', 'superseded')
 			RETURNING state, attempt_count`,
 			id, i.consumer, msg.EventID, msg.EventType, msg.TenantID, nullable(msg.AggregateID),
-			msg.AggregateVersion, msg.PayloadHash, permanent, i.cfg.MaxAttempts, code, safeError(cause),
+			msg.AggregateVersion, msg.PayloadHash, permanent, i.cfg.MaxAttempts, code, safeError(cause), nullable(msg.Region),
 		).Scan(&state, &attempt)
 	})
 	return state, attempt, err
@@ -664,13 +684,13 @@ func (i *Inbox) Quarantine(ctx context.Context, msg Message, code, reason string
 		_, err := tx.Exec(ctx, `
 			INSERT INTO eventing_inbox
 			    (inbox_id, consumer, event_id, event_type, tenant_id, aggregate_id,
-			     aggregate_version, payload_hash, state, attempt_count, last_error_code, last_error)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'quarantined',0,$9,$10)
+			     aggregate_version, payload_hash, state, attempt_count, last_error_code, last_error, region)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'quarantined',0,$9,$10,$11)
 			ON CONFLICT (consumer, tenant_id, event_id) DO UPDATE
 			   SET state = 'quarantined', last_error_code = $9, last_error = $10, updated_at = now()
 			 WHERE eventing_inbox.state NOT IN ('completed', 'superseded')`,
 			id, i.consumer, msg.EventID, msg.EventType, msg.TenantID, nullable(msg.AggregateID),
-			msg.AggregateVersion, msg.PayloadHash, code, safeReason(reason))
+			msg.AggregateVersion, msg.PayloadHash, code, safeReason(reason), nullable(msg.Region))
 		return err
 	})
 }
@@ -694,9 +714,10 @@ func (i *Inbox) Requeue(ctx context.Context, tenantID, eventID string, auth repa
 	}
 	return i.db.InTx(ctx, tenantID, func(tx pgx.Tx) error {
 		var state string
-		err := tx.QueryRow(ctx, `SELECT state FROM eventing_inbox
+		var region *string
+		err := tx.QueryRow(ctx, `SELECT state, region FROM eventing_inbox
 			WHERE consumer = $1 AND tenant_id = $2 AND event_id = $3 FOR UPDATE`,
-			i.consumer, tenantID, eventID).Scan(&state)
+			i.consumer, tenantID, eventID).Scan(&state, &region)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrNotFound
 		}
@@ -705,6 +726,9 @@ func (i *Inbox) Requeue(ctx context.Context, tenantID, eventID string, auth repa
 		}
 		if state != StateQuarantine && state != StateFailed {
 			return ErrNotRepairable
+		}
+		if i.region != "" && (region == nil || *region != i.region) {
+			return ErrRegionMismatch
 		}
 		if err := repair.Record(ctx, tx, repair.Entry{Kind: "inbox", Consumer: i.consumer,
 			TenantID: tenantID, EventID: eventID, Action: "requeue", PriorState: state, Auth: auth}); err != nil {
@@ -769,7 +793,7 @@ func evaluate(s Stats, t Thresholds) []Alert {
 var requiredColumns = []string{
 	"inbox_id", "consumer", "event_id", "event_type", "tenant_id", "aggregate_id",
 	"aggregate_version", "payload_hash", "state", "attempt_count", "duplicate_count",
-	"received_at", "updated_at", "completed_at", "result_ref", "last_error_code", "last_error",
+	"received_at", "updated_at", "completed_at", "result_ref", "last_error_code", "last_error", "region",
 }
 
 // VerifySchema fails if the inbox table or any column this package uses is
