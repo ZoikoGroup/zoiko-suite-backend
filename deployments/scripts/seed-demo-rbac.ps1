@@ -206,15 +206,16 @@ $BUNDLES = @(
     },
     @{
         # financial-control-svc (ZS-CONTROL-001). DEFINE / APPROVE_RULE / EXECUTE / CERTIFY /
-        # EXCEPTION_WAIVE / REPERFORM are deliberately separate actions: a real tenant should grant
-        # them through separate roles. The service itself also refuses a certifier who created or
-        # took part in a run, and a waiver from the exception's own owner, whatever is granted here.
+        # EXCEPTION_WAIVE / REPERFORM / REVOKE are deliberately separate actions: a real tenant
+        # should grant them through separate roles. The service itself also refuses a certifier
+        # who created or took part in a run, a waiver from the exception's own owner, and a
+        # revoker who certified the run being revoked, whatever is granted here.
         Code    = "FINCTRL_FULL"
         Service = "financial-control-svc"
         Actions = @("FINCTRL_DEFINE", "FINCTRL_APPROVE_RULE", "FINCTRL_POLICY_MANAGE", "FINCTRL_RUN_CREATE",
                     "FINCTRL_READ", "FINCTRL_EXECUTE", "FINCTRL_EXCEPTION_ASSIGN", "FINCTRL_CERTIFY",
                     "FINCTRL_EXCEPTION_RESOLVE", "FINCTRL_EXCEPTION_WAIVE", "FINCTRL_REPERFORM",
-                    "FINCTRL_EVIDENCE_EXPORT")
+                    "FINCTRL_EVIDENCE_EXPORT", "FINCTRL_REVOKE")
     },
     @{
         # The source services authorize the HUMAN caller of a control population (the control service
