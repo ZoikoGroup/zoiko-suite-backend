@@ -34,6 +34,10 @@ type memStore struct {
 	// orgs holds the ORG-02/ORG-03 state. Lazily built by memStore.org() so
 	// the existing newMemStore() stays as it was; see org_memstore_test.go.
 	orgs *orgState
+	// hierarchies and assignments are read by the by-id getters; nil until a
+	// test seeds them.
+	hierarchies map[string]*domain.EntityHierarchy
+	assignments map[string]*domain.EntityJurisdictionAssignment
 	// Minimal set — add more maps as tests require.
 }
 
@@ -239,6 +243,16 @@ func (m *memStore) ListJurisdictionAssignments(_ context.Context, _ string) ([]*
 }
 func (m *memStore) EndDateJurisdictionAssignment(_ context.Context, _ string, _ time.Time, _, _ string) error {
 	return nil
+}
+
+// GetHierarchyByID / GetJurisdictionAssignmentByID read the seeded maps only:
+// CreateHierarchy and CreateJurisdictionAssignment stay no-ops here, so a test
+// that needs a row to exist seeds it directly.
+func (m *memStore) GetHierarchyByID(_ context.Context, id string) (*domain.EntityHierarchy, error) {
+	return m.hierarchies[id], nil
+}
+func (m *memStore) GetJurisdictionAssignmentByID(_ context.Context, id string) (*domain.EntityJurisdictionAssignment, error) {
+	return m.assignments[id], nil
 }
 func (m *memStore) CreateResidencyPolicy(_ context.Context, p *domain.DataResidencyPolicy) error {
 	m.residencyPolicies[p.DataResidencyPolicyID] = p
@@ -657,13 +671,13 @@ func TestGetEntityStatus_Found(t *testing.T) {
 	svc, ms := baseSvc(t)
 
 	// Seed an entity in the store directly
-	ms.entities["ent-999"] = &domain.LegalEntity{
-		LegalEntityID: "ent-999",
+	ms.entities["e0000000-0000-4000-8000-000000000007"] = &domain.LegalEntity{
+		LegalEntityID: "e0000000-0000-4000-8000-000000000007",
 		TenantID:      "tenant-001",
 		EntityStatus:  domain.EntityStatusActive,
 	}
 
-	resp, err := svc.GetEntityStatus(context.Background(), "ent-999")
+	resp, err := svc.GetEntityStatus(context.Background(), "e0000000-0000-4000-8000-000000000007")
 	require.NoError(t, err)
 	assert.Equal(t, domain.EntityStatusActive, resp.EntityStatus)
 	assert.Equal(t, "tenant-001", resp.TenantID)
@@ -676,51 +690,51 @@ func TestGetEntityStatus_Found(t *testing.T) {
 func TestTransitionEntityStatus_ValidTransition(t *testing.T) {
 	svc, ms := baseSvc(t)
 
-	ms.entities["ent-001"] = &domain.LegalEntity{
-		LegalEntityID: "ent-001",
+	ms.entities["e0000000-0000-4000-8000-000000000001"] = &domain.LegalEntity{
+		LegalEntityID: "e0000000-0000-4000-8000-000000000001",
 		TenantID:      "tenant-001",
 		EntityStatus:  domain.EntityStatusActive,
 	}
 
-	err := svc.TransitionEntityStatus(tenantCtx("tenant-001"), "ent-001",
+	err := svc.TransitionEntityStatus(tenantCtx("tenant-001"), "e0000000-0000-4000-8000-000000000001",
 		domain.TransitionEntityStatusRequest{
 			NewStatus:     domain.EntityStatusDormant,
 			CorrelationID: "corr-007",
 		})
 	require.NoError(t, err)
-	assert.Equal(t, domain.EntityStatusDormant, ms.entities["ent-001"].EntityStatus)
+	assert.Equal(t, domain.EntityStatusDormant, ms.entities["e0000000-0000-4000-8000-000000000001"].EntityStatus)
 }
 
 func TestTransitionEntityStatus_Idempotent_SameStatus(t *testing.T) {
 	svc, ms := baseSvc(t)
 
-	ms.entities["ent-002"] = &domain.LegalEntity{
-		LegalEntityID: "ent-002",
+	ms.entities["e0000000-0000-4000-8000-000000000002"] = &domain.LegalEntity{
+		LegalEntityID: "e0000000-0000-4000-8000-000000000002",
 		TenantID:      "tenant-001",
 		EntityStatus:  domain.EntityStatusDormant,
 	}
 
 	// Applying the same status must be a no-op (idempotent)
-	err := svc.TransitionEntityStatus(tenantCtx("tenant-001"), "ent-002",
+	err := svc.TransitionEntityStatus(tenantCtx("tenant-001"), "e0000000-0000-4000-8000-000000000002",
 		domain.TransitionEntityStatusRequest{
 			NewStatus:     domain.EntityStatusDormant,
 			CorrelationID: "corr-008",
 		})
 	assert.NoError(t, err)
 	// Status unchanged
-	assert.Equal(t, domain.EntityStatusDormant, ms.entities["ent-002"].EntityStatus)
+	assert.Equal(t, domain.EntityStatusDormant, ms.entities["e0000000-0000-4000-8000-000000000002"].EntityStatus)
 }
 
 func TestTransitionEntityStatus_InvalidTransition_Rejected(t *testing.T) {
 	svc, ms := baseSvc(t)
 
-	ms.entities["ent-003"] = &domain.LegalEntity{
-		LegalEntityID: "ent-003",
+	ms.entities["e0000000-0000-4000-8000-000000000003"] = &domain.LegalEntity{
+		LegalEntityID: "e0000000-0000-4000-8000-000000000003",
 		TenantID:      "tenant-001",
 		EntityStatus:  domain.EntityStatusDissolved, // terminal state
 	}
 
-	err := svc.TransitionEntityStatus(tenantCtx("tenant-001"), "ent-003",
+	err := svc.TransitionEntityStatus(tenantCtx("tenant-001"), "e0000000-0000-4000-8000-000000000003",
 		domain.TransitionEntityStatusRequest{
 			NewStatus:     domain.EntityStatusActive,
 			CorrelationID: "corr-009",
@@ -735,8 +749,8 @@ func TestTransitionEntityStatus_InvalidTransition_Rejected(t *testing.T) {
 func TestCreateTaxIdentityBundle_Success(t *testing.T) {
 	svc, ms := baseSvc(t)
 
-	ms.entities["ent-100"] = &domain.LegalEntity{
-		LegalEntityID: "ent-100",
+	ms.entities["e0000000-0000-4000-8000-000000000005"] = &domain.LegalEntity{
+		LegalEntityID: "e0000000-0000-4000-8000-000000000005",
 		TenantID:      "tenant-001",
 		EntityStatus:  domain.EntityStatusActive,
 	}
@@ -747,10 +761,10 @@ func TestCreateTaxIdentityBundle_Success(t *testing.T) {
 		CorrelationID:  "corr-010",
 	}
 
-	bundle, err := svc.CreateTaxIdentityBundle(tenantCtx("tenant-001"), "ent-100", req)
+	bundle, err := svc.CreateTaxIdentityBundle(tenantCtx("tenant-001"), "e0000000-0000-4000-8000-000000000005", req)
 	require.NoError(t, err)
 	assert.NotEmpty(t, bundle.TaxIdentityBundleID)
-	assert.Equal(t, "ent-100", bundle.LegalEntityID)
+	assert.Equal(t, "e0000000-0000-4000-8000-000000000005", bundle.LegalEntityID)
 	assert.Equal(t, "JUR-US", bundle.JurisdictionID)
 	assert.Equal(t, domain.TaxIdentityBundlePending, bundle.Status)
 
@@ -764,8 +778,8 @@ func TestCreateTaxIdentityBundle_Success(t *testing.T) {
 func TestCreateTaxIdentityBundle_InvalidDataClassification_Fails(t *testing.T) {
 	svc, ms := baseSvc(t)
 
-	ms.entities["ent-100"] = &domain.LegalEntity{
-		LegalEntityID: "ent-100",
+	ms.entities["e0000000-0000-4000-8000-000000000005"] = &domain.LegalEntity{
+		LegalEntityID: "e0000000-0000-4000-8000-000000000005",
 		TenantID:      "tenant-001",
 		EntityStatus:  domain.EntityStatusActive,
 	}
@@ -777,7 +791,7 @@ func TestCreateTaxIdentityBundle_InvalidDataClassification_Fails(t *testing.T) {
 		DataClassification: "INVALID_CLASSIFICATION",
 	}
 
-	_, err := svc.CreateTaxIdentityBundle(tenantCtx("tenant-001"), "ent-100", req)
+	_, err := svc.CreateTaxIdentityBundle(tenantCtx("tenant-001"), "e0000000-0000-4000-8000-000000000005", req)
 	assert.ErrorIs(t, err, registry.ErrInvalidInput)
 }
 
@@ -787,7 +801,7 @@ func TestCreateTaxIdentityBundle_InvalidJurisdiction_FailsClosed(t *testing.T) {
 
 	// The bundle needs an operational entity; the jurisdiction check is
 	// what is under test.
-	seedEntityFor(ms, "ent-100", "tenant-001", "", "JUR-US")
+	seedEntityFor(ms, "e0000000-0000-4000-8000-000000000005", "tenant-001", "", "JUR-US")
 
 	req := domain.CreateTaxIdentityBundleRequest{
 		JurisdictionID: "JUR-INVALID",
@@ -795,7 +809,7 @@ func TestCreateTaxIdentityBundle_InvalidJurisdiction_FailsClosed(t *testing.T) {
 		CorrelationID:  "corr-011",
 	}
 
-	_, err := svc.CreateTaxIdentityBundle(tenantCtx("tenant-001"), "ent-100", req)
+	_, err := svc.CreateTaxIdentityBundle(tenantCtx("tenant-001"), "e0000000-0000-4000-8000-000000000005", req)
 	assert.ErrorIs(t, err, registry.ErrInvalidInput)
 }
 
@@ -805,7 +819,7 @@ func TestCreateTaxIdentityBundle_JurisdictionUnavailable_FailsClosed(t *testing.
 
 	// The bundle needs an operational entity; the jurisdiction check is
 	// what is under test.
-	seedEntityFor(ms, "ent-100", "tenant-001", "", "JUR-US")
+	seedEntityFor(ms, "e0000000-0000-4000-8000-000000000005", "tenant-001", "", "JUR-US")
 
 	req := domain.CreateTaxIdentityBundleRequest{
 		JurisdictionID: "JUR-US",
@@ -813,7 +827,7 @@ func TestCreateTaxIdentityBundle_JurisdictionUnavailable_FailsClosed(t *testing.
 		CorrelationID:  "corr-012",
 	}
 
-	_, err := svc.CreateTaxIdentityBundle(tenantCtx("tenant-001"), "ent-100", req)
+	_, err := svc.CreateTaxIdentityBundle(tenantCtx("tenant-001"), "e0000000-0000-4000-8000-000000000005", req)
 	assert.ErrorIs(t, err, registry.ErrServiceUnavailable)
 }
 
@@ -842,7 +856,7 @@ func seedEntity(ms *memStore, entityID string) {
 // middleware.Identity from the gateway-verified X-Principal-Id header.
 func TestUpdateEntity_WritesVerifiedActorPrincipalID(t *testing.T) {
 	svc, ms := baseSvc(t)
-	entityID := "ent-actor-test"
+	entityID := "e0000000-0000-4000-8000-00000000000a"
 	seedEntity(ms, entityID)
 
 	// trading_name, not legal_name: legal_name is under ORG-03 SoD and is
@@ -867,7 +881,7 @@ func TestUpdateEntity_WritesVerifiedActorPrincipalID(t *testing.T) {
 // principal, rather than attributed to whoever the token claimed to be.
 func TestUpdateEntity_IgnoresForgedJWT(t *testing.T) {
 	svc, ms := baseSvc(t)
-	entityID := "ent-forge-test"
+	entityID := "e0000000-0000-4000-8000-000000000010"
 	seedEntity(ms, entityID)
 
 	// The exact shape the old code trusted: unsigned, attacker-chosen subject.
@@ -912,11 +926,11 @@ func TestMutationsRequireVerifiedPrincipal(t *testing.T) {
 			return err
 		}},
 		{"UpdateEntity", func(s *registry.Service) error {
-			_, err := s.UpdateEntity(anon, "ent-001", domain.UpdateEntityRequest{})
+			_, err := s.UpdateEntity(anon, "e0000000-0000-4000-8000-000000000001", domain.UpdateEntityRequest{})
 			return err
 		}},
 		{"TransitionEntityStatus", func(s *registry.Service) error {
-			return s.TransitionEntityStatus(anon, "ent-001", domain.TransitionEntityStatusRequest{})
+			return s.TransitionEntityStatus(anon, "e0000000-0000-4000-8000-000000000001", domain.TransitionEntityStatusRequest{})
 		}},
 		{"CreateHierarchy", func(s *registry.Service) error {
 			_, err := s.CreateHierarchy(anon, domain.CreateHierarchyRequest{})
@@ -926,7 +940,7 @@ func TestMutationsRequireVerifiedPrincipal(t *testing.T) {
 			return s.EndDateHierarchy(anon, "h-001", time.Now(), "corr")
 		}},
 		{"AssignJurisdiction", func(s *registry.Service) error {
-			_, err := s.AssignJurisdiction(anon, "ent-001", domain.AssignJurisdictionRequest{})
+			_, err := s.AssignJurisdiction(anon, "e0000000-0000-4000-8000-000000000001", domain.AssignJurisdictionRequest{})
 			return err
 		}},
 		{"EndDateJurisdictionAssignment", func(s *registry.Service) error {
@@ -937,7 +951,7 @@ func TestMutationsRequireVerifiedPrincipal(t *testing.T) {
 			return err
 		}},
 		{"CreateTaxIdentityBundle", func(s *registry.Service) error {
-			_, err := s.CreateTaxIdentityBundle(anon, "ent-001", domain.CreateTaxIdentityBundleRequest{})
+			_, err := s.CreateTaxIdentityBundle(anon, "e0000000-0000-4000-8000-000000000001", domain.CreateTaxIdentityBundleRequest{})
 			return err
 		}},
 		{"TransitionTaxIdentityBundleStatus", func(s *registry.Service) error {
@@ -975,27 +989,28 @@ func (a *recordingAuthZ) Authorize(_ context.Context, principalID, scopeID, reso
 	return a.err
 }
 
-// TestAuthorizeReceivesVerifiedPrincipalAndEnvelopeEntity pins the two values
-// that decide who a mutation is evaluated for: the verified principal, and the
-// legal entity the envelope names. The tenant id must never travel in the
-// entity position — authorization-svc answers tenant_scope_mismatch for one,
-// which this client fails closed on as 503.
-func TestAuthorizeReceivesVerifiedPrincipalAndEnvelopeEntity(t *testing.T) {
+// TestAuthorizeReceivesVerifiedPrincipalAndTargetEntity pins the two values
+// that decide who an entity command is evaluated for: the verified principal,
+// and the legal entity the command ACTS ON. Neither the tenant id nor the
+// entity on the caller's envelope may travel in the entity position: the
+// tenant id is answered tenant_scope_mismatch (a 503 here), and the envelope
+// entity let a grant at one entity reach every other (F-2, 19 Oct 2026).
+func TestAuthorizeReceivesVerifiedPrincipalAndTargetEntity(t *testing.T) {
 	ms := newMemStore()
 	rec := &recordingAuthZ{}
 	svc := newSvc(t, ms, rec, acceptAllJurisd{})
 
-	entityID := "ent-scope-test"
+	entityID := "e0000000-0000-4000-8000-00000000001b"
 	seedEntity(ms, entityID)
 
-	ctx := domain.WithLegalEntity(domain.WithTenant(authCtx(), "ten-verified"), "le-envelope-7")
+	ctx := domain.WithLegalEntity(domain.WithTenant(authCtx(), "ten-verified"), "e0000000-0000-4000-8000-000000000021")
 	newName := "Updated"
 	_, err := svc.UpdateEntity(ctx, entityID, domain.UpdateEntityRequest{TradingName: &newName})
 	require.NoError(t, err)
 
 	require.Equal(t, 1, rec.calls)
 	assert.Equal(t, testPrincipal, rec.principalID, "decision subject must be the verified principal")
-	assert.Equal(t, "le-envelope-7", rec.scopeID, "decision scope must be the envelope's legal entity")
+	assert.Equal(t, entityID, rec.scopeID, "decision scope must be the entity being updated, not the envelope's")
 }
 
 // TestProvisionTenantUsesPlatformScope — tenant creation is the one mutation
@@ -1062,7 +1077,7 @@ func TestProvisionTenant_WithACallerTenant(t *testing.T) {
 func TestUpdateEntity_RefusesWhenNoVerifiedPrincipal(t *testing.T) {
 	svc, ms := baseSvc(t)
 
-	entityID := "ent-no-principal"
+	entityID := "e0000000-0000-4000-8000-000000000014"
 	seedEntity(ms, entityID)
 
 	newName := "Changed"

@@ -208,9 +208,9 @@ func TestLEI_ValidationAndStorage(t *testing.T) {
 
 func TestLEI_ChangingItIsAnIndependentlyApprovedIdentityChange(t *testing.T) {
 	svc, ms := baseSvc(t)
-	seedEntityFor(ms, "ent-lei", gapsTenant, "", "JUR-US")
+	seedEntityFor(ms, "e0000000-0000-4000-8000-000000000012", gapsTenant, "", "JUR-US")
 	lei, src, st := validLEI, "GLEIF", "ISSUED"
-	_, err := svc.AmendLegalProfile(tenantCtx(gapsTenant), "ent-lei", domain.AmendLegalProfileRequest{
+	_, err := svc.AmendLegalProfile(tenantCtx(gapsTenant), "e0000000-0000-4000-8000-000000000012", domain.AmendLegalProfileRequest{
 		LEI: &lei, LEISource: &src, LEIStatus: &st,
 	})
 	a := pendingOf(t, err)
@@ -221,7 +221,7 @@ func TestLEI_ChangingItIsAnIndependentlyApprovedIdentityChange(t *testing.T) {
 
 	// A later unrelated amendment carries the LEI forward.
 	trading := "Trading"
-	v3, err := svc.AmendLegalProfile(tenantCtx(gapsTenant), "ent-lei", domain.AmendLegalProfileRequest{TradingName: &trading})
+	v3, err := svc.AmendLegalProfile(tenantCtx(gapsTenant), "e0000000-0000-4000-8000-000000000012", domain.AmendLegalProfileRequest{TradingName: &trading})
 	require.NoError(t, err)
 	require.NotNil(t, v3.LEI)
 	assert.Equal(t, validLEI, *v3.LEI)
@@ -245,12 +245,12 @@ func draftEntity(t *testing.T, svc *registry.Service, code string) *domain.Legal
 
 func TestDraftEntity_CannotBeTransactedAgainstOrActivatedUnverified(t *testing.T) {
 	svc, ms := baseSvc(t)
-	seedEntityFor(ms, "ent-parent", gapsTenant, "", "JUR-US")
+	seedEntityFor(ms, "e0000000-0000-4000-8000-000000000017", gapsTenant, "", "JUR-US")
 	e := draftEntity(t, svc, "D1")
 	ctx := tenantCtx(gapsTenant)
 
 	_, err := svc.CreateHierarchy(ctx, domain.CreateHierarchyRequest{
-		TenantID: gapsTenant, ParentLegalEntityID: "ent-parent", ChildLegalEntityID: e.LegalEntityID,
+		TenantID: gapsTenant, ParentLegalEntityID: "e0000000-0000-4000-8000-000000000017", ChildLegalEntityID: e.LegalEntityID,
 		RelationshipType: "SUBSIDIARY_OF", EffectiveFrom: time.Now().UTC(),
 	})
 	require.ErrorIs(t, err, registry.ErrEntityNotOperational)
@@ -321,8 +321,8 @@ func TestVerification_RequiresEvidenceAndADraft(t *testing.T) {
 	err := svc.RequestEntityVerification(tenantCtx(gapsTenant), e.LegalEntityID, domain.RequestEntityVerificationRequest{})
 	require.ErrorIs(t, err, registry.ErrInvalidInput)
 
-	seedEntityFor(ms, "ent-active", gapsTenant, "", "JUR-US")
-	err = svc.RequestEntityVerification(tenantCtx(gapsTenant), "ent-active",
+	seedEntityFor(ms, "e0000000-0000-4000-8000-000000000009", gapsTenant, "", "JUR-US")
+	err = svc.RequestEntityVerification(tenantCtx(gapsTenant), "e0000000-0000-4000-8000-000000000009",
 		domain.RequestEntityVerificationRequest{VerificationEvidenceRef: "x"})
 	require.ErrorIs(t, err, registry.ErrInvalidTransition)
 }
@@ -344,65 +344,65 @@ func TestLegacyEntityCreateActive_OnlyWhenConfigured(t *testing.T) {
 
 func TestMerge_NonDestructiveAndIndependentlyApproved(t *testing.T) {
 	svc, ms := baseSvc(t)
-	seedEntityFor(ms, "ent-dup", gapsTenant, "RC-X1", "JUR-US")
-	seedEntityFor(ms, "ent-surv", gapsTenant, "RC-X2", "JUR-US")
+	seedEntityFor(ms, "e0000000-0000-4000-8000-00000000000f", gapsTenant, "RC-X1", "JUR-US")
+	seedEntityFor(ms, "e0000000-0000-4000-8000-00000000001d", gapsTenant, "RC-X2", "JUR-US")
 	ctx := tenantCtx(gapsTenant)
 
-	err := svc.MergeDuplicateCandidate(ctx, "ent-dup", domain.MergeDuplicateCandidateRequest{SurvivorLegalEntityID: "ent-dup", Reason: "r"})
+	err := svc.MergeDuplicateCandidate(ctx, "e0000000-0000-4000-8000-00000000000f", domain.MergeDuplicateCandidateRequest{SurvivorLegalEntityID: "e0000000-0000-4000-8000-00000000000f", Reason: "r"})
 	require.ErrorIs(t, err, registry.ErrInvalidInput, "no merging into itself")
 
-	err = svc.MergeDuplicateCandidate(ctx, "ent-dup", domain.MergeDuplicateCandidateRequest{
-		SurvivorLegalEntityID: "ent-surv", Reason: "same company, two registrations", EvidenceRef: "review-7",
+	err = svc.MergeDuplicateCandidate(ctx, "e0000000-0000-4000-8000-00000000000f", domain.MergeDuplicateCandidateRequest{
+		SurvivorLegalEntityID: "e0000000-0000-4000-8000-00000000001d", Reason: "same company, two registrations", EvidenceRef: "review-7",
 	})
 	a := pendingOf(t, err)
-	assert.Equal(t, domain.EntityStatusActive, ms.entities["ent-dup"].EntityStatus, "filed, not merged")
+	assert.Equal(t, domain.EntityStatusActive, ms.entities["e0000000-0000-4000-8000-00000000000f"].EntityStatus, "filed, not merged")
 
 	// "No self-approval of merge".
 	_, err = svc.ApproveRequest(ctx, a.ApprovalRequestID, domain.ApproveRequestBody{PayloadFingerprint: a.PayloadFingerprint})
 	require.ErrorIs(t, err, registry.ErrSelfApproval)
 
 	approveByID(t, svc, gapsTenant, a.ApprovalRequestID)
-	dup := ms.entities["ent-dup"]
+	dup := ms.entities["e0000000-0000-4000-8000-00000000000f"]
 	assert.Equal(t, domain.EntityStatusDormant, dup.EntityStatus)
 	require.NotNil(t, dup.MergedIntoLegalEntityID)
-	assert.Equal(t, "ent-surv", *dup.MergedIntoLegalEntityID)
-	_, stillThere := ms.entities["ent-dup"]
+	assert.Equal(t, "e0000000-0000-4000-8000-00000000001d", *dup.MergedIntoLegalEntityID)
+	_, stillThere := ms.entities["e0000000-0000-4000-8000-00000000000f"]
 	assert.True(t, stillThere, "nothing is deleted")
-	assert.Len(t, ms.org().profileVersions["ent-dup"], 1, "history untouched")
+	assert.Len(t, ms.org().profileVersions["e0000000-0000-4000-8000-00000000000f"], 1, "history untouched")
 
 	// A merged duplicate cannot be revived by the generic route, nor transacted against.
-	err = svc.TransitionEntityStatus(ctx, "ent-dup", domain.TransitionEntityStatusRequest{NewStatus: domain.EntityStatusActive})
+	err = svc.TransitionEntityStatus(ctx, "e0000000-0000-4000-8000-00000000000f", domain.TransitionEntityStatusRequest{NewStatus: domain.EntityStatusActive})
 	require.ErrorIs(t, err, registry.ErrInvalidTransition)
-	_, err = svc.AssignJurisdiction(ctx, "ent-dup", domain.AssignJurisdictionRequest{JurisdictionID: "JUR-US"})
+	_, err = svc.AssignJurisdiction(ctx, "e0000000-0000-4000-8000-00000000000f", domain.AssignJurisdictionRequest{JurisdictionID: "JUR-US"})
 	require.ErrorIs(t, err, registry.ErrEntityNotOperational)
 
 	// Lineage is readable from both sides.
-	recs, err := svc.ListEntityMergeRecords(ctx, "ent-surv")
+	recs, err := svc.ListEntityMergeRecords(ctx, "e0000000-0000-4000-8000-00000000001d")
 	require.NoError(t, err)
 	require.Len(t, recs, 1)
 	assert.Equal(t, testPrincipal, recs[0].MergedByPrincipalID)
 	assert.Equal(t, approverPrincipal, recs[0].MergeApprovedByPrincipalID)
 
 	// Unmerge: same governed path.
-	err = svc.UnmergeEntity(ctx, "ent-dup", domain.UnmergeEntityRequest{Reason: "not the same after all"})
+	err = svc.UnmergeEntity(ctx, "e0000000-0000-4000-8000-00000000000f", domain.UnmergeEntityRequest{Reason: "not the same after all"})
 	u := pendingOf(t, err)
 	_, err = svc.ApproveRequest(ctx, u.ApprovalRequestID, domain.ApproveRequestBody{PayloadFingerprint: u.PayloadFingerprint})
 	require.ErrorIs(t, err, registry.ErrSelfApproval)
 	approveByID(t, svc, gapsTenant, u.ApprovalRequestID)
-	assert.Equal(t, domain.EntityStatusActive, ms.entities["ent-dup"].EntityStatus)
-	assert.Nil(t, ms.entities["ent-dup"].MergedIntoLegalEntityID)
-	recs, _ = svc.ListEntityMergeRecords(ctx, "ent-dup")
+	assert.Equal(t, domain.EntityStatusActive, ms.entities["e0000000-0000-4000-8000-00000000000f"].EntityStatus)
+	assert.Nil(t, ms.entities["e0000000-0000-4000-8000-00000000000f"].MergedIntoLegalEntityID)
+	recs, _ = svc.ListEntityMergeRecords(ctx, "e0000000-0000-4000-8000-00000000000f")
 	require.Len(t, recs, 1, "the record is completed, not removed")
 	require.NotNil(t, recs[0].UnmergedAt)
 }
 
 func TestMerge_SurvivorMustBeActiveAndUnmerged(t *testing.T) {
 	svc, ms := baseSvc(t)
-	seedEntityFor(ms, "ent-a", gapsTenant, "", "JUR-US")
-	s := seedEntityFor(ms, "ent-b", gapsTenant, "", "JUR-US")
+	seedEntityFor(ms, "e0000000-0000-4000-8000-000000000008", gapsTenant, "", "JUR-US")
+	s := seedEntityFor(ms, "e0000000-0000-4000-8000-00000000000b", gapsTenant, "", "JUR-US")
 	s.EntityStatus = domain.EntityStatusDissolved
-	err := svc.MergeDuplicateCandidate(tenantCtx(gapsTenant), "ent-a",
-		domain.MergeDuplicateCandidateRequest{SurvivorLegalEntityID: "ent-b", Reason: "r"})
+	err := svc.MergeDuplicateCandidate(tenantCtx(gapsTenant), "e0000000-0000-4000-8000-000000000008",
+		domain.MergeDuplicateCandidateRequest{SurvivorLegalEntityID: "e0000000-0000-4000-8000-00000000000b", Reason: "r"})
 	require.ErrorIs(t, err, registry.ErrConflict)
 }
 
@@ -427,13 +427,13 @@ func TestIsolation_HostBindingIsAuthorizedInThePlatformScope(t *testing.T) {
 
 func TestSensitiveTaxBundle_NeedsPermissionAndPurpose(t *testing.T) {
 	svc, ms := baseSvc(t)
-	ms.bundles["b-r"] = &domain.TaxIdentityBundle{TaxIdentityBundleID: "b-r", TenantID: gapsTenant, LegalEntityID: "ent-t", DataClassification: "RESTRICTED"}
-	ms.bundles["b-i"] = &domain.TaxIdentityBundle{TaxIdentityBundleID: "b-i", TenantID: gapsTenant, LegalEntityID: "ent-t", DataClassification: "INTERNAL"}
+	ms.bundles["b-r"] = &domain.TaxIdentityBundle{TaxIdentityBundleID: "b-r", TenantID: gapsTenant, LegalEntityID: "e0000000-0000-4000-8000-00000000001e", DataClassification: "RESTRICTED"}
+	ms.bundles["b-i"] = &domain.TaxIdentityBundle{TaxIdentityBundleID: "b-i", TenantID: gapsTenant, LegalEntityID: "e0000000-0000-4000-8000-00000000001e", DataClassification: "INTERNAL"}
 
 	noPurpose := tenantCtx(gapsTenant)
 	_, err := svc.GetTaxIdentityBundle(noPurpose, "b-r")
 	require.ErrorIs(t, err, registry.ErrUnauthorized)
-	list, err := svc.ListTaxIdentityBundles(noPurpose, "ent-t")
+	list, err := svc.ListTaxIdentityBundles(noPurpose, "e0000000-0000-4000-8000-00000000001e")
 	require.NoError(t, err)
 	require.Len(t, list, 1, "the sensitive bundle is omitted, the ordinary one is not")
 	assert.Equal(t, "b-i", list[0].TaxIdentityBundleID)
@@ -442,7 +442,7 @@ func TestSensitiveTaxBundle_NeedsPermissionAndPurpose(t *testing.T) {
 	b, err := svc.GetTaxIdentityBundle(withPurpose, "b-r")
 	require.NoError(t, err)
 	assert.Equal(t, "b-r", b.TaxIdentityBundleID)
-	list, _ = svc.ListTaxIdentityBundles(withPurpose, "ent-t")
+	list, _ = svc.ListTaxIdentityBundles(withPurpose, "e0000000-0000-4000-8000-00000000001e")
 	assert.Len(t, list, 2)
 
 	// Purpose without the permission is not enough.

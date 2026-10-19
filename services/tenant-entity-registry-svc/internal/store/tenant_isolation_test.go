@@ -493,6 +493,46 @@ func TestPgStore_TenantIsolation_EndDateJurisdictionAssignment(t *testing.T) {
 	}
 }
 
+// GetHierarchyByID and GetJurisdictionAssignmentByID (F-2, 19 Oct 2026) are
+// read before an end-date so the command can be authorized at its entities.
+// Another tenant's id must read as absent; the caller's own must come back
+// whole, with the entity ids the authorization decision uses.
+func TestPgStore_TenantIsolation_GetHierarchyByID(t *testing.T) {
+	s := testStore
+	a := setupIsolationFixture(t, s, "ISO-A-GetHierarchy")
+	b := setupIsolationFixture(t, s, "ISO-B-GetHierarchy")
+
+	got, err := s.GetHierarchyByID(domain.WithTenant(context.Background(), b.tenantID), a.hierarchyID)
+	require.NoError(t, err)
+	assert.Nil(t, got, "ISOLATION FAILURE: GetHierarchyByID returned tenant A's hierarchy in tenant B's context")
+
+	own, err := s.GetHierarchyByID(domain.WithTenant(context.Background(), b.tenantID), b.hierarchyID)
+	require.NoError(t, err)
+	require.NotNil(t, own)
+	assert.Equal(t, b.hierarchyID, own.HierarchyID)
+	assert.NotEmpty(t, own.ChildLegalEntityID)
+	assert.NotEmpty(t, own.ParentLegalEntityID)
+
+	_, err = s.GetHierarchyByID(domain.WithTenant(context.Background(), b.tenantID), "not-a-uuid")
+	require.ErrorIs(t, err, registry.ErrInvalidInput)
+}
+
+func TestPgStore_TenantIsolation_GetJurisdictionAssignmentByID(t *testing.T) {
+	s := testStore
+	a := setupIsolationFixture(t, s, "ISO-A-GetAssignment")
+	b := setupIsolationFixture(t, s, "ISO-B-GetAssignment")
+
+	got, err := s.GetJurisdictionAssignmentByID(domain.WithTenant(context.Background(), b.tenantID), a.assignmentID)
+	require.NoError(t, err)
+	assert.Nil(t, got, "ISOLATION FAILURE: GetJurisdictionAssignmentByID returned tenant A's assignment in tenant B's context")
+
+	own, err := s.GetJurisdictionAssignmentByID(domain.WithTenant(context.Background(), b.tenantID), b.assignmentID)
+	require.NoError(t, err)
+	require.NotNil(t, own)
+	assert.Equal(t, b.assignmentID, own.AssignmentID)
+	assert.Equal(t, b.entityID, own.LegalEntityID)
+}
+
 func TestPgStore_TenantIsolation_GetResidencyPolicyByID(t *testing.T) {
 	s := testStore
 	ctx := context.Background()

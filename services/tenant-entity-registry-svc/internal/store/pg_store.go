@@ -864,6 +864,33 @@ func (s *PgStore) EndDateHierarchy(ctx context.Context, hierarchyID string, endD
 	})
 }
 
+// GetHierarchyByID returns one relationship, or (nil, nil) when it does not
+// exist in the caller's tenant.
+func (s *PgStore) GetHierarchyByID(ctx context.Context, hierarchyID string) (*domain.EntityHierarchy, error) {
+	s.log.Debug("store.GetHierarchyByID", zap.String("hierarchy_id", hierarchyID))
+	tid := domain.TenantFromContext(ctx)
+
+	var h domain.EntityHierarchy
+	err := s.withRLS(ctx, tid, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			SELECT hierarchy_id, tenant_id, parent_legal_entity_id, child_legal_entity_id,
+			       relationship_type, effective_from, effective_to, created_at, updated_at,
+			       created_by_principal_id, updated_by_principal_id, record_version
+			FROM entity_hierarchies WHERE hierarchy_id = $1 AND tenant_id = $2`,
+			hierarchyID, tid).Scan(
+			&h.HierarchyID, &h.TenantID, &h.ParentLegalEntityID, &h.ChildLegalEntityID,
+			&h.RelationshipType, &h.EffectiveFrom, &h.EffectiveTo, &h.CreatedAt, &h.UpdatedAt,
+			&h.CreatedByPrincipalID, &h.UpdatedByPrincipalID, &h.RecordVersion)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &h, nil
+}
+
 func (s *PgStore) ListHierarchiesByEntity(ctx context.Context, legalEntityID string) ([]*domain.EntityHierarchy, error) {
 	s.log.Debug("store.ListHierarchiesByEntity", zap.String("legal_entity_id", legalEntityID))
 	tid := domain.TenantFromContext(ctx)
@@ -964,6 +991,33 @@ func (s *PgStore) ListJurisdictionAssignments(ctx context.Context, legalEntityID
 		return rows.Err()
 	})
 	return results, err
+}
+
+// GetJurisdictionAssignmentByID returns one assignment, or (nil, nil) when it
+// does not exist in the caller's tenant.
+func (s *PgStore) GetJurisdictionAssignmentByID(ctx context.Context, assignmentID string) (*domain.EntityJurisdictionAssignment, error) {
+	s.log.Debug("store.GetJurisdictionAssignmentByID", zap.String("assignment_id", assignmentID))
+	tid := domain.TenantFromContext(ctx)
+
+	var a domain.EntityJurisdictionAssignment
+	err := s.withRLS(ctx, tid, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			SELECT assignment_id, tenant_id, legal_entity_id, jurisdiction_id, assignment_type,
+			       effective_from, effective_to, source_basis, created_at, updated_at,
+			       created_by_principal_id, updated_by_principal_id, record_version
+			FROM entity_jurisdiction_assignments WHERE assignment_id = $1 AND tenant_id = $2`,
+			assignmentID, tid).Scan(
+			&a.AssignmentID, &a.TenantID, &a.LegalEntityID, &a.JurisdictionID, &a.AssignmentType,
+			&a.EffectiveFrom, &a.EffectiveTo, &a.SourceBasis, &a.CreatedAt, &a.UpdatedAt,
+			&a.CreatedByPrincipalID, &a.UpdatedByPrincipalID, &a.RecordVersion)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &a, nil
 }
 
 // EndDateJurisdictionAssignment closes an assignment. As EndDateHierarchy,

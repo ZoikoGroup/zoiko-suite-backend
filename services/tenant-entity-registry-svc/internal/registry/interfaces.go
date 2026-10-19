@@ -69,12 +69,19 @@ type Store interface {
 	CreateHierarchy(ctx context.Context, h *domain.EntityHierarchy) error
 	EndDateHierarchy(ctx context.Context, hierarchyID string, endDate time.Time, actorID, correlationID string) error
 	ListHierarchiesByEntity(ctx context.Context, legalEntityID string) ([]*domain.EntityHierarchy, error)
+	// GetHierarchyByID returns one relationship, or (nil, nil) if absent. Read
+	// before an end-date so the command is authorized at the entities it
+	// changes.
+	GetHierarchyByID(ctx context.Context, hierarchyID string) (*domain.EntityHierarchy, error)
 
 	// ── EntityJurisdictionAssignment ────────────────────────────────────────
 
 	CreateJurisdictionAssignment(ctx context.Context, a *domain.EntityJurisdictionAssignment) error
 	ListJurisdictionAssignments(ctx context.Context, legalEntityID string) ([]*domain.EntityJurisdictionAssignment, error)
 	EndDateJurisdictionAssignment(ctx context.Context, assignmentID string, endDate time.Time, actorID, correlationID string) error
+	// GetJurisdictionAssignmentByID returns one assignment, or (nil, nil) if
+	// absent. Read before an end-date, as GetHierarchyByID.
+	GetJurisdictionAssignmentByID(ctx context.Context, assignmentID string) (*domain.EntityJurisdictionAssignment, error)
 
 	// ── DataResidencyPolicy ─────────────────────────────────────────────────
 

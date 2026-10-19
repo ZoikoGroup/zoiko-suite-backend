@@ -464,8 +464,16 @@ func (s *Service) CreateWorkspace(
 	ctx context.Context,
 	req domain.CreateWorkspaceRequest,
 ) (*domain.Workspace, error) {
-	if err := s.authorize(ctx, "workspace", "create"); err != nil {
-		return nil, err
+	// A workspace inside an entity is created at that entity; one with no
+	// entity is tenant-level.
+	var authzErr error
+	if strings.TrimSpace(req.LegalEntityID) != "" {
+		authzErr = s.authorizeEntity(ctx, req.LegalEntityID, "workspace", "create")
+	} else {
+		authzErr = s.authorize(ctx, "workspace", "create")
+	}
+	if authzErr != nil {
+		return nil, authzErr
 	}
 	// ORG §8 NP4: protected writes are refused while the tenant's lifecycle
 	// state forbids transacting. The tenant comes from the verified context,
@@ -533,7 +541,7 @@ func (s *Service) UpdateWorkspace(
 	workspaceID string,
 	req domain.UpdateWorkspaceRequest,
 ) (*domain.Workspace, error) {
-	if err := s.authorize(ctx, "workspace", "update"); err != nil {
+	if err := s.authorizeWorkspace(ctx, workspaceID, "update"); err != nil {
 		return nil, err
 	}
 	// ORG §8 NP4: protected writes are refused while the tenant's lifecycle
@@ -599,7 +607,7 @@ func (s *Service) TransitionWorkspaceStatus(
 	workspaceID string,
 	req domain.TransitionWorkspaceStatusRequest,
 ) error {
-	if err := s.authorize(ctx, "workspace", "status.transition"); err != nil {
+	if err := s.authorizeWorkspace(ctx, workspaceID, "status.transition"); err != nil {
 		return err
 	}
 	// ORG §8 NP4: protected writes are refused while the tenant's lifecycle
@@ -714,7 +722,7 @@ func (s *Service) UpdateEntity(
 	legalEntityID string,
 	req domain.UpdateEntityRequest,
 ) (*domain.LegalEntity, error) {
-	if err := s.authorize(ctx, "entity", "update"); err != nil {
+	if err := s.authorizeEntity(ctx, legalEntityID, "entity", "update"); err != nil {
 		return nil, err
 	}
 	// ORG §8 NP4: protected writes are refused while the tenant's lifecycle
@@ -784,7 +792,7 @@ func (s *Service) TransitionEntityStatus(
 	legalEntityID string,
 	req domain.TransitionEntityStatusRequest,
 ) error {
-	if err := s.authorize(ctx, "entity", "status.transition"); err != nil {
+	if err := s.authorizeEntity(ctx, legalEntityID, "entity", "status.transition"); err != nil {
 		return err
 	}
 	// ORG §8 NP4: protected writes are refused while the tenant's lifecycle
@@ -858,7 +866,8 @@ func (s *Service) CreateHierarchy(
 	ctx context.Context,
 	req domain.CreateHierarchyRequest,
 ) (*domain.EntityHierarchy, error) {
-	if err := s.authorize(ctx, "entity.hierarchy", "create"); err != nil {
+	// Both sides change: the parent gains a child, the child a parent.
+	if err := s.authorizeEntities(ctx, "entity.hierarchy", "create", req.ChildLegalEntityID, req.ParentLegalEntityID); err != nil {
 		return nil, err
 	}
 	// ORG §8 NP4: protected writes are refused while the tenant's lifecycle
@@ -905,7 +914,7 @@ func (s *Service) EndDateHierarchy(
 	endDate time.Time,
 	correlationID string,
 ) error {
-	if err := s.authorize(ctx, "entity.hierarchy", "end-date"); err != nil {
+	if err := s.authorizeHierarchy(ctx, hierarchyID, "end-date"); err != nil {
 		return err
 	}
 	// ORG §8 NP4: protected writes are refused while the tenant's lifecycle
@@ -943,7 +952,7 @@ func (s *Service) AssignJurisdiction(
 	legalEntityID string,
 	req domain.AssignJurisdictionRequest,
 ) (*domain.EntityJurisdictionAssignment, error) {
-	if err := s.authorize(ctx, "entity.jurisdiction", "assign"); err != nil {
+	if err := s.authorizeEntity(ctx, legalEntityID, "entity.jurisdiction", "assign"); err != nil {
 		return nil, err
 	}
 	// ORG §8 NP4: protected writes are refused while the tenant's lifecycle
@@ -999,7 +1008,7 @@ func (s *Service) EndDateJurisdictionAssignment(
 	endDate time.Time,
 	correlationID string,
 ) error {
-	if err := s.authorize(ctx, "entity.jurisdiction", "end-date"); err != nil {
+	if err := s.authorizeJurisdictionAssignment(ctx, assignmentID, "end-date"); err != nil {
 		return err
 	}
 	// ORG §8 NP4: protected writes are refused while the tenant's lifecycle
@@ -1156,7 +1165,7 @@ func (s *Service) CreateTaxIdentityBundle(
 	legalEntityID string,
 	req domain.CreateTaxIdentityBundleRequest,
 ) (*domain.TaxIdentityBundle, error) {
-	if err := s.authorize(ctx, "tax-identity-bundle", "create"); err != nil {
+	if err := s.authorizeEntity(ctx, legalEntityID, "tax-identity-bundle", "create"); err != nil {
 		return nil, err
 	}
 	// ORG §8 NP4: protected writes are refused while the tenant's lifecycle
@@ -1211,7 +1220,7 @@ func (s *Service) GetTaxIdentityBundle(ctx context.Context, bundleID string) (*d
 	}
 	// ORG-03 "sensitive identifier access scoped".
 	if sensitiveClassification(b.DataClassification) {
-		if err := s.authorizeSensitiveRead(ctx); err != nil {
+		if err := s.authorizeSensitiveRead(ctx, b.LegalEntityID); err != nil {
 			return nil, err
 		}
 	}
@@ -1233,7 +1242,7 @@ func (s *Service) ListTaxIdentityBundles(ctx context.Context, legalEntityID stri
 	for _, b := range all {
 		if sensitiveClassification(b.DataClassification) {
 			if permitted == nil {
-				ok := s.authorizeSensitiveRead(ctx) == nil
+				ok := s.authorizeSensitiveRead(ctx, legalEntityID) == nil
 				permitted = &ok
 			}
 			if !*permitted {
@@ -1251,7 +1260,7 @@ func (s *Service) TransitionTaxIdentityBundleStatus(
 	bundleID string,
 	req domain.TransitionTaxIdentityBundleStatusRequest,
 ) error {
-	if err := s.authorize(ctx, "tax-identity-bundle", "status.transition"); err != nil {
+	if err := s.authorizeBundle(ctx, bundleID, "tax-identity-bundle", "status.transition"); err != nil {
 		return err
 	}
 	// ORG §8 NP4: protected writes are refused while the tenant's lifecycle
@@ -1325,6 +1334,106 @@ func (s *Service) authorizeIn(ctx context.Context, scopeID, resource, action str
 		scopeID = s.platformScopeID
 	}
 	return s.authorizeAs(ctx, principalID, scopeID, resource, action)
+}
+
+// authorizeEntity evaluates a command against the legal entity it ACTS ON.
+//
+// authorize asks about the entity on the caller's envelope, which is right for
+// a tenant-level question and wrong for an entity command: with the envelope
+// naming E1, UpdateEntity(E2) was evaluated at E1, so a grant at any one
+// entity reached every entity in the tenant (Group 1 re-audit F-2, 19 Oct
+// 2026). authorization-svc answers a question about E2 from grants at E2 and
+// tenant-wide grants, which is what ORG §4's "validated tenant/entity scope"
+// asks for.
+//
+// A malformed id is refused as invalid input before authorization-svc is
+// asked. Asked first, its 400 would surface as this client's fail-closed 503.
+func (s *Service) authorizeEntity(ctx context.Context, legalEntityID, resource, action string) error {
+	if domain.PrincipalFromContext(ctx) == "" {
+		// authorize logs and refuses the unauthenticated case.
+		return s.authorize(ctx, resource, action)
+	}
+	id := strings.TrimSpace(legalEntityID)
+	if _, err := uuid.Parse(id); err != nil {
+		return fmt.Errorf("%w: legal entity id %q is not a UUID", ErrInvalidInput, legalEntityID)
+	}
+	return s.authorizeIn(ctx, id, resource, action)
+}
+
+// authorizeEntities is authorizeEntity over every entity a command changes
+// (both sides of a hierarchy, the duplicate and the survivor of a merge).
+func (s *Service) authorizeEntities(ctx context.Context, resource, action string, legalEntityIDs ...string) error {
+	for _, id := range legalEntityIDs {
+		if err := s.authorizeEntity(ctx, id, resource, action); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// The commands below are named by a record's id, not its entity's, so the
+// record is read first to find the entity it belongs to. A record that does not
+// exist is evaluated at the caller's scope, exactly as before, and the store
+// then answers not-found: an unauthorized caller learns nothing new about which
+// ids exist.
+
+func (s *Service) authorizeHierarchy(ctx context.Context, hierarchyID, action string) error {
+	h, err := s.store.GetHierarchyByID(ctx, hierarchyID)
+	if err != nil {
+		return fmt.Errorf("store.GetHierarchyByID: %w", err)
+	}
+	if h == nil {
+		return s.authorize(ctx, "entity.hierarchy", action)
+	}
+	return s.authorizeEntities(ctx, "entity.hierarchy", action, h.ChildLegalEntityID, h.ParentLegalEntityID)
+}
+
+func (s *Service) authorizeJurisdictionAssignment(ctx context.Context, assignmentID, action string) error {
+	a, err := s.store.GetJurisdictionAssignmentByID(ctx, assignmentID)
+	if err != nil {
+		return fmt.Errorf("store.GetJurisdictionAssignmentByID: %w", err)
+	}
+	if a == nil {
+		return s.authorize(ctx, "entity.jurisdiction", action)
+	}
+	return s.authorizeEntity(ctx, a.LegalEntityID, "entity.jurisdiction", action)
+}
+
+func (s *Service) authorizeBundle(ctx context.Context, bundleID, resource, action string) error {
+	b, err := s.store.GetTaxIdentityBundleByID(ctx, bundleID)
+	if err != nil {
+		return fmt.Errorf("store.GetTaxIdentityBundleByID: %w", err)
+	}
+	if b == nil {
+		return s.authorize(ctx, resource, action)
+	}
+	return s.authorizeEntity(ctx, b.LegalEntityID, resource, action)
+}
+
+// authorizeWorkspace checks a workspace command at the workspace's entity. A
+// workspace with no entity is tenant-level and stays at the caller's scope.
+func (s *Service) authorizeWorkspace(ctx context.Context, workspaceID, action string) error {
+	w, err := s.store.GetWorkspaceByID(ctx, workspaceID)
+	if err != nil {
+		return fmt.Errorf("store.GetWorkspaceByID: %w", err)
+	}
+	if w == nil || w.LegalEntityID == nil || strings.TrimSpace(*w.LegalEntityID) == "" {
+		return s.authorize(ctx, "workspace", action)
+	}
+	return s.authorizeEntity(ctx, *w.LegalEntityID, "workspace", action)
+}
+
+// authorizeConflict checks a registry-conflict command at the entity the
+// conflicting registry identity already belongs to.
+func (s *Service) authorizeConflict(ctx context.Context, conflictID, action string) error {
+	c, err := s.store.GetRegistryConflict(ctx, conflictID)
+	if err != nil {
+		return fmt.Errorf("store.GetRegistryConflict: %w", err)
+	}
+	if c == nil || strings.TrimSpace(c.ExistingLegalEntityID) == "" {
+		return s.authorize(ctx, "entity.registry-conflict", action)
+	}
+	return s.authorizeEntity(ctx, c.ExistingLegalEntityID, "entity.registry-conflict", action)
 }
 
 func (s *Service) authorizeAs(ctx context.Context, principalID, scopeID, resource, action string) error {
