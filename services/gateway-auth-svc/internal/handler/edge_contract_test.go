@@ -151,7 +151,7 @@ func canonicalSet(names []string) map[string]bool {
 
 func TestEdgeContract_ForwardAuthListsMatchVerify(t *testing.T) {
 	lists := map[string]map[string]bool{
-		"docker-compose.yml":    composeAuthResponseHeaders(t),
+		"docker-compose.yml":   composeAuthResponseHeaders(t),
 		"compiled-traefik.yml": compiledAuthResponseHeaders(t),
 	}
 	for file, listed := range lists {

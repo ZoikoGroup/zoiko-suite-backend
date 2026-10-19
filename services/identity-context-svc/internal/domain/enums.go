@@ -41,10 +41,10 @@ const (
 type InvalidationReason string
 
 const (
-	InvalidationReasonLogout            InvalidationReason = "LOGOUT"
-	InvalidationReasonAdminRevoke       InvalidationReason = "ADMIN_REVOKE"
-	InvalidationReasonRiskEscalation    InvalidationReason = "RISK_ESCALATION"
-	InvalidationReasonDelegationRevoked InvalidationReason = "DELEGATION_REVOKED"
+	InvalidationReasonLogout                InvalidationReason = "LOGOUT"
+	InvalidationReasonAdminRevoke           InvalidationReason = "ADMIN_REVOKE"
+	InvalidationReasonRiskEscalation        InvalidationReason = "RISK_ESCALATION"
+	InvalidationReasonDelegationRevoked     InvalidationReason = "DELEGATION_REVOKED"
 	InvalidationReasonSessionConcurrencyCap InvalidationReason = "SESSION_CONCURRENCY_CAP"
 )
 

@@ -680,7 +680,6 @@ func TestSessionContext_SchemaRefusesARecordedRejectedAssertion(t *testing.T) {
 	assert.Error(t, s.InsertSessionContext(ctx, unknown), "an undocumented basis must not reach the audit record")
 }
 
-
 // The review and its event commit together or not at all, and a repeat review
 // writes neither a second review nor a second event.
 func TestSupportContext_ReviewAndItsEventAreAtomicAndOnce(t *testing.T) {

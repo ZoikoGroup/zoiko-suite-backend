@@ -10,16 +10,16 @@ package envelope
 // request_id, correlation_id, source_channel) and idempotency_key on material
 // writes are enforced for every service and are not expressible here.
 func ServicePolicy() Policy {
-    return Policy{
-        ServiceName: "secret-vault-integration-svc",
+	return Policy{
+		ServiceName: "secret-vault-integration-svc",
 
-        // Â§4: mandatory for entity-specific records (INV-02).
-        LegalEntityID: NotRequired,
+		// Â§4: mandatory for entity-specific records (INV-02).
+		LegalEntityID: NotRequired,
 
-        // Â§4: required for governed sensitive access.
-        PurposeContext: RequiredOnWrite,
+		// Â§4: required for governed sensitive access.
+		PurposeContext: RequiredOnWrite,
 
-        // This service does not post to an accounting book.
-        BookID: NotRequired,
-    }
+		// This service does not post to an accounting book.
+		BookID: NotRequired,
+	}
 }

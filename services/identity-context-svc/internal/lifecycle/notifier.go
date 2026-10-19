@@ -14,8 +14,8 @@ import (
 
 // Notice is one credential link to deliver.
 type Notice struct {
-	TenantID      string
-	PrincipalID   string
+	TenantID    string
+	PrincipalID string
 	// Intent is the notification intent (activation or reset).
 	Intent        string
 	Link          string
@@ -99,8 +99,8 @@ func (n *NCDNotifier) Notify(ctx context.Context, nt Notice) error {
 	created, err := n.call(ctx, nt.TenantID, "/v1/communications", nt.SourceEventID+"-create", nt.CorrelationID, map[string]any{
 		"intent_id": nt.Intent, "legal_entity_id": n.LegalEntityID, "recipient_principal_id": nt.PrincipalID,
 		"recipient_tenant_id": nt.TenantID, "locale": "en",
-		"variables":            map[string]string{"link": nt.Link, "expires_at": exp.Format(time.RFC3339)},
-		"source_event_id":      nt.SourceEventID, "source_event_type": nt.Intent,
+		"variables":       map[string]string{"link": nt.Link, "expires_at": exp.Format(time.RFC3339)},
+		"source_event_id": nt.SourceEventID, "source_event_type": nt.Intent,
 		"privacy_permission":   map[string]string{"decision": "PERMIT"},
 		"marketing_permission": map[string]string{"decision": "DENY"},
 		"expires_at":           exp,

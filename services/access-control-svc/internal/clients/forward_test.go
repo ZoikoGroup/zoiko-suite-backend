@@ -28,7 +28,9 @@ func TestAuthzAdminClient_ForwardsTheCallersEnvelopeOnlyForThemselves(t *testing
 			return r
 		}())
 
-	scope := func(p string) Scope { return Scope{PrincipalID: p, TenantID: "t", LegalEntityID: "e", CorrelationID: "c"} }
+	scope := func(p string) Scope {
+		return Scope{PrincipalID: p, TenantID: "t", LegalEntityID: "e", CorrelationID: "c"}
+	}
 	if err := c.post(ctx, "/v1/admin/roles", []byte(`{}`), scope("P-ALICE")); err != nil {
 		t.Fatal(err)
 	}

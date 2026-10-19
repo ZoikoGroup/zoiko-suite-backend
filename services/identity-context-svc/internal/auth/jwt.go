@@ -53,10 +53,10 @@ type accessClaims struct {
 	// AuthTime is the OIDC auth_time: when the person authenticated.
 	AuthTime *jwt.NumericDate `json:"auth_time,omitempty"`
 	// AMR is the authentication methods (RFC 8176).
-	AMR            []string            `json:"amr,omitempty"`
-	SID            string              `json:"sid,omitempty"`
-	Scope          string              `json:"scope,omitempty"`
-	AssuranceLevel string              `json:"assurance_level,omitempty"`
+	AMR            []string             `json:"amr,omitempty"`
+	SID            string               `json:"sid,omitempty"`
+	Scope          string               `json:"scope,omitempty"`
+	AssuranceLevel string               `json:"assurance_level,omitempty"`
 	Cnf            *domain.Confirmation `json:"cnf,omitempty"`
 	jwt.RegisteredClaims
 }

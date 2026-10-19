@@ -132,17 +132,17 @@ type CredentialToken struct {
 // PasswordResetRequest is an administrator-initiated reset awaiting
 // independent approval.
 type PasswordResetRequest struct {
-	RequestID         string               `json:"request_id"`
-	TenantID          string               `json:"tenant_id"`
-	PrincipalID       string               `json:"principal_id"`
-	RequestedBy       string               `json:"requested_by"`
-	Reason            string               `json:"reason"`
-	ApprovalsRequired int                  `json:"approvals_required"`
-	Approvals         []ResetApproval      `json:"approvals"`
-	Status            string               `json:"status"`
-	CreatedAt         time.Time            `json:"created_at"`
-	DecidedAt         *time.Time           `json:"decided_at,omitempty"`
-	ExpiresAt         time.Time            `json:"expires_at"`
+	RequestID         string          `json:"request_id"`
+	TenantID          string          `json:"tenant_id"`
+	PrincipalID       string          `json:"principal_id"`
+	RequestedBy       string          `json:"requested_by"`
+	Reason            string          `json:"reason"`
+	ApprovalsRequired int             `json:"approvals_required"`
+	Approvals         []ResetApproval `json:"approvals"`
+	Status            string          `json:"status"`
+	CreatedAt         time.Time       `json:"created_at"`
+	DecidedAt         *time.Time      `json:"decided_at,omitempty"`
+	ExpiresAt         time.Time       `json:"expires_at"`
 }
 
 // ResetApproval is one approver's decision.

@@ -410,10 +410,10 @@ func Load() (*Config, error) {
 		MFARecentAuthSeconds:   envInt("MFA_RECENT_AUTH_SECONDS", 900),
 		MFATOTPSkewSteps:       envInt("MFA_TOTP_SKEW_STEPS", 1),
 		MFAIssuerLabel:         env("MFA_ISSUER_LABEL", "ZoikoSuite"),
-		AuthzServiceURL:      env("AUTHZ_SERVICE_URL", "http://authorization-svc"),
-		AuthzEnv:             env("AUTHZ_ENV", ""), // derived below; never defaulted here
-		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
-		SIEMServiceURL:       env("SIEM_SERVICE_URL", ""),
+		AuthzServiceURL:        env("AUTHZ_SERVICE_URL", "http://authorization-svc"),
+		AuthzEnv:               env("AUTHZ_ENV", ""), // derived below; never defaulted here
+		OTELExporterEndpoint:   env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
+		SIEMServiceURL:         env("SIEM_SERVICE_URL", ""),
 
 		Environment:              env("DEPLOY_ENVIRONMENT", "local"),
 		DeploymentRegion:         env("DEPLOYMENT_REGION", "local"),

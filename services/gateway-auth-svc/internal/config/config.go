@@ -109,23 +109,23 @@ func Load() (*Config, error) {
 	}
 
 	cfg := &Config{
-		Port:                    port,
-		JWKSURL:                 strEnv("IDENTITY_JWKS_URL", "http://identity-svc:8080/.well-known/jwks.json"),
-		JWKSCacheTTL:            time.Duration(ttlSeconds) * time.Second,
-		ExpectedIssuer:          strEnv("EXPECTED_ISSUER", "identity-context-svc"),
-		ExpectedAudience:        strEnv("EXPECTED_AUDIENCE", "zoiko-internal"),
-		CartaServiceURL:         strEnv("CARTA_SERVICE_URL", ""),
-		SIEMServiceURL:          strEnv("SIEM_SERVICE_URL", ""),
-		IdentityJWKSMTLSEnabled: strEnv("IDENTITY_JWKS_MTLS_ENABLED", "false") == "true",
-		IdentityJWKSMTLSURL:     strEnv("IDENTITY_JWKS_MTLS_URL", "https://identity-svc:8449/.well-known/jwks.json"),
+		Port:                      port,
+		JWKSURL:                   strEnv("IDENTITY_JWKS_URL", "http://identity-svc:8080/.well-known/jwks.json"),
+		JWKSCacheTTL:              time.Duration(ttlSeconds) * time.Second,
+		ExpectedIssuer:            strEnv("EXPECTED_ISSUER", "identity-context-svc"),
+		ExpectedAudience:          strEnv("EXPECTED_AUDIENCE", "zoiko-internal"),
+		CartaServiceURL:           strEnv("CARTA_SERVICE_URL", ""),
+		SIEMServiceURL:            strEnv("SIEM_SERVICE_URL", ""),
+		IdentityJWKSMTLSEnabled:   strEnv("IDENTITY_JWKS_MTLS_ENABLED", "false") == "true",
+		IdentityJWKSMTLSURL:       strEnv("IDENTITY_JWKS_MTLS_URL", "https://identity-svc:8449/.well-known/jwks.json"),
 		TenantRegistryMTLSEnabled: strEnv("TENANT_REGISTRY_MTLS_ENABLED", "false") == "true",
 		TenantRegistryMTLSURL:     strEnv("TENANT_REGISTRY_MTLS_URL", "https://tenant-entity-registry-svc:8449"),
 		MTLSManagementServiceURL:  strEnv("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
 		MTLSBootstrapTokenPath:    strEnv("MTLS_BOOTSTRAP_TOKEN_PATH", "/bootstrap/token"),
-		TenantRegistryURL:       strEnv("TENANT_REGISTRY_URL", ""),
-		OTELExporterEndpoint:    strEnv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
-		TenantContextTTL:        time.Duration(ctxTTL) * time.Second,
-		TenantContextStaleGrace: time.Duration(ctxGrace) * time.Second,
+		TenantRegistryURL:         strEnv("TENANT_REGISTRY_URL", ""),
+		OTELExporterEndpoint:      strEnv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
+		TenantContextTTL:          time.Duration(ctxTTL) * time.Second,
+		TenantContextStaleGrace:   time.Duration(ctxGrace) * time.Second,
 	}
 
 	// Enabling mTLS for a peer switches that peer's calls to its mTLS URL.

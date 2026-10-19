@@ -383,7 +383,9 @@ func TestGateRevokedAndUnavailable(t *testing.T) {
 		t.Fatalf("decisions = %v", obs.decisions)
 	}
 
-	down := StatusFunc(func(context.Context, string, *Claims) (SessionStatus, error) { return SessionStatus{}, errors.New("down") })
+	down := StatusFunc(func(context.Context, string, *Claims) (SessionStatus, error) {
+		return SessionStatus{}, errors.New("down")
+	})
 	g, _ = gateFor(t, ModeRequire, down)
 	req = httptest.NewRequest(http.MethodGet, "/v1/x", nil)
 	req.Header.Set("Authorization", "Bearer "+envelope(t, nil, nil))

@@ -545,7 +545,6 @@ func TestSupportJustificationIsTrimmedNotPadded(t *testing.T) {
 	require.Error(t, err)
 }
 
-
 // ── The review is evidenced (2026-09-28) ─────────────────────────────────────
 //
 // Attach and revoke always emitted events; the review — the step that closes

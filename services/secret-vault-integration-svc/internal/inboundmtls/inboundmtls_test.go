@@ -257,6 +257,7 @@ func TestIdentityCheck_CertButNoClaimRefusedWhenEnabled(t *testing.T) {
 		t.Fatalf("status = %d, want 401", w.Code)
 	}
 }
+
 // A certificate proving one header must not vouch for a different identity in
 // the other. The broker authorizes X-Principal-Id first, so checking only
 // X-Workload-Id let svc-a's own certificate lease svc-b's secrets.

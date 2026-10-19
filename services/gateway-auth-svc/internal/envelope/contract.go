@@ -10,19 +10,19 @@ package envelope
 // request_id, correlation_id, source_channel) and idempotency_key on material
 // writes are enforced for every service and are not expressible here.
 func ServicePolicy() Policy {
-    return Policy{
-        ServiceName: "gateway-auth-svc",
+	return Policy{
+		ServiceName: "gateway-auth-svc",
 
-        // Â§4: mandatory for entity-specific records (INV-02).
-        LegalEntityID: NotRequired,
+		// Â§4: mandatory for entity-specific records (INV-02).
+		LegalEntityID: NotRequired,
 
-        // Â§4: required for governed sensitive access.
-        PurposeContext: NotRequired,
+		// Â§4: required for governed sensitive access.
+		PurposeContext: NotRequired,
 
-        // This service does not post to an accounting book.
-        BookID: NotRequired,
-        // Endpoints that produce the envelope's mandatory fields rather than
-        // consume them, so requiring those fields as input would be circular.
-        // See EXEMPT_PATHS in rollout.ps1.
-        ExemptPaths: []string{"/verify"},    }
+		// This service does not post to an accounting book.
+		BookID: NotRequired,
+		// Endpoints that produce the envelope's mandatory fields rather than
+		// consume them, so requiring those fields as input would be circular.
+		// See EXEMPT_PATHS in rollout.ps1.
+		ExemptPaths: []string{"/verify"}}
 }

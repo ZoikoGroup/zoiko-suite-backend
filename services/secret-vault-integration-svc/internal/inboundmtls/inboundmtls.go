@@ -173,6 +173,7 @@ func identityMatches(claimed string, leaf *x509.Certificate) bool {
 	}
 	return false
 }
+
 // CertPolicy enforces Security Standard §9's "short-lived workload
 // certificates; identity bound to environment / region / audience" on the
 // presented client certificate:

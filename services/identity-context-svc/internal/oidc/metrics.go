@@ -50,11 +50,11 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 // NopMetrics are unregistered (tests).
 func NopMetrics() *Metrics { return newMetrics() }
 
-func (m *Metrics) Login(step, result string)     { m.logins.WithLabelValues(step, result).Inc() }
-func (m *Metrics) Throttled(reason string)       { m.throttled.WithLabelValues(reason).Inc() }
-func (m *Metrics) Issued(grant string)           { m.tokens.WithLabelValues(grant).Inc() }
-func (m *Metrics) RefreshReuse()                 { m.refreshReuse.Inc() }
-func (m *Metrics) CodeReplay()                   { m.codeReplay.Inc() }
-func (m *Metrics) ClientAuthFailure()            { m.clientAuthBad.Inc() }
-func (m *Metrics) LoginSessionEnded(r string)    { m.sessionsEnded.WithLabelValues(r).Inc() }
-func (m *Metrics) StatusCheck(result string)     { m.statusChecks.WithLabelValues(result).Inc() }
+func (m *Metrics) Login(step, result string)  { m.logins.WithLabelValues(step, result).Inc() }
+func (m *Metrics) Throttled(reason string)    { m.throttled.WithLabelValues(reason).Inc() }
+func (m *Metrics) Issued(grant string)        { m.tokens.WithLabelValues(grant).Inc() }
+func (m *Metrics) RefreshReuse()              { m.refreshReuse.Inc() }
+func (m *Metrics) CodeReplay()                { m.codeReplay.Inc() }
+func (m *Metrics) ClientAuthFailure()         { m.clientAuthBad.Inc() }
+func (m *Metrics) LoginSessionEnded(r string) { m.sessionsEnded.WithLabelValues(r).Inc() }
+func (m *Metrics) StatusCheck(result string)  { m.statusChecks.WithLabelValues(result).Inc() }

@@ -24,10 +24,10 @@ import (
 // below came to exist in the first place.
 
 const (
-	EventContextResolved   = "identity.context.resolved"
-	EventResolutionFailed  = "identity.context.resolution_failed"
-	EventSessionInvalidated = "session.invalidated"
-	EventPrincipalStatusChanged = "principal.status.changed"
+	EventContextResolved         = "identity.context.resolved"
+	EventResolutionFailed        = "identity.context.resolution_failed"
+	EventSessionInvalidated      = "session.invalidated"
+	EventPrincipalStatusChanged  = "principal.status.changed"
 	EventAuthenticationSucceeded = "identity.authentication.succeeded"
 	EventAuthenticationFailed    = "identity.authentication.failed"
 

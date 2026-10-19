@@ -52,18 +52,18 @@ type SessionEnder func(ctx context.Context, tenantID, principalID, reason, actor
 
 // Config is the lifecycle's policy.
 type Config struct {
-	InviteTTL         time.Duration
-	ResetTTL          time.Duration
-	PasswordHistory   int
-	ResetApprovals    int
-	PublicAppURL      string
-	ActivationPath    string
-	ResetPath         string
-	IntentActivation  string
-	IntentReset       string
-	ResetRequestTTL   time.Duration
-	StepUpMaxAge      time.Duration
-	ForgotPerIPPerHr  int
+	InviteTTL        time.Duration
+	ResetTTL         time.Duration
+	PasswordHistory  int
+	ResetApprovals   int
+	PublicAppURL     string
+	ActivationPath   string
+	ResetPath        string
+	IntentActivation string
+	IntentReset      string
+	ResetRequestTTL  time.Duration
+	StepUpMaxAge     time.Duration
+	ForgotPerIPPerHr int
 }
 
 // Service runs the lifecycle commands.

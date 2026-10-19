@@ -13,7 +13,9 @@ import (
 
 type fixedMFAStatus bool
 
-func (f fixedMFAStatus) HasActiveTOTP(context.Context, string, string) (bool, error) { return bool(f), nil }
+func (f fixedMFAStatus) HasActiveTOTP(context.Context, string, string) (bool, error) {
+	return bool(f), nil
+}
 
 // A verified client becomes the token's azp, and auth_time is the login.
 func TestAuthenticate_VerifiedClientAndAuthTimeReachTheToken(t *testing.T) {
