@@ -26,6 +26,16 @@ var migrations = []string{
 	"000003_add_acc11_lifecycle.up.sql",
 	"000004_add_eventing_outbox.up.sql",
 	"000005_pair_counterparty_period_dimensions.up.sql",
+	"000006_pair_closed_state_transitions.up.sql",
+}
+
+// resetTables is every table the migrations create, children first.
+// DROP ... CASCADE on a parent drops only the child's foreign key, not the
+// child table, so each is dropped by name.
+var resetTables = []string{
+	"intercompany_pair_transitions",
+	"intercompany_entries",
+	"eventing_outbox",
 }
 
 // openTestPool connects to a real Postgres and reapplies the migrations
@@ -54,8 +64,11 @@ func openEmptyPool(t *testing.T) *pgxpool.Pool {
 	}
 	t.Cleanup(pool.Close)
 
-	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS intercompany_entries CASCADE;`)
-	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS eventing_outbox CASCADE;`)
+	for _, table := range resetTables {
+		if _, err := pool.Exec(ctx, `DROP TABLE IF EXISTS `+table+` CASCADE`); err != nil {
+			t.Fatalf("drop %s: %v", table, err)
+		}
+	}
 	return pool
 }
 

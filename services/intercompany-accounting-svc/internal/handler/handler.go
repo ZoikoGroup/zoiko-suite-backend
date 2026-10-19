@@ -33,10 +33,13 @@ type Store interface {
 	// state implies.
 	UpdateMatch(ctx context.Context, entry *domain.IntercompanyEntry, actorID, correlationID string) error
 
-	// ACC-11 lifecycle — see migration 000003's doc comment.
-	AcknowledgeCounterparty(ctx context.Context, id, principalID string) error
-	DisputeIntercompany(ctx context.Context, id, principalID, reason string) error
-	ResolveMismatch(ctx context.Context, id, principalID, resolutionNote string) error
+	// ACC-11 lifecycle — see migrations 000003 and 000006. Each records its
+	// state change in the pair's append-only transition history.
+	AcknowledgeCounterparty(ctx context.Context, id, principalID, correlationID string) error
+	DisputeIntercompany(ctx context.Context, id, principalID, reason, correlationID string) error
+	ResolveMismatch(ctx context.Context, id, principalID, resolutionNote, outcome, correlationID string) error
+	ClosePair(ctx context.Context, id, principalID, reason, correlationID string) error
+	ListTransitions(ctx context.Context, id string) ([]domain.PairTransition, error)
 
 	// Control-population read (docs/architecture/control-population-contract.md).
 	ControlPopulation(ctx context.Context, q domain.ControlPopulationQuery) (*domain.ControlPopulationPage, error)
@@ -69,6 +72,10 @@ const (
 	actionAcknowledgeCounterparty = "INTERCOMPANY_ENTRY_ACKNOWLEDGE"
 	actionDisputeIntercompany     = "INTERCOMPANY_ENTRY_DISPUTE"
 	actionResolveMismatch         = "INTERCOMPANY_ENTRY_RESOLVE"
+
+	// actionClosePair is checked on BOTH entities: a terminal close takes
+	// the pair out of each side's open set, so neither side alone may do it.
+	actionClosePair = "INTERCOMPANY_ENTRY_CLOSE"
 )
 
 type Handler struct {
@@ -109,6 +116,8 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{id}/acknowledge", h.AcknowledgeCounterparty)
 		r.Post("/{id}/dispute", h.DisputeIntercompany)
 		r.Post("/{id}/resolve", h.ResolveMismatch)
+		r.Post("/{id}/close", h.ClosePair)
+		r.Get("/{id}/transitions", h.ListTransitions)
 	})
 }
 
@@ -563,13 +572,8 @@ func (h *Handler) AcknowledgeCounterparty(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if err := h.store.AcknowledgeCounterparty(r.Context(), id, principalID); err != nil {
-		if errors.Is(err, domain.ErrInvalidPairTransition) {
-			writeError(w, http.StatusUnprocessableEntity, "invalid_transition", err.Error())
-			return
-		}
-		h.log.Error("failed to acknowledge counterparty", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+	if err := h.store.AcknowledgeCounterparty(r.Context(), id, principalID, getCorrelationID(r)); err != nil {
+		h.writeTransitionErr(w, "failed to acknowledge counterparty", err)
 		return
 	}
 
@@ -614,13 +618,8 @@ func (h *Handler) DisputeIntercompany(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.store.DisputeIntercompany(r.Context(), id, principalID, req.Reason); err != nil {
-		if errors.Is(err, domain.ErrInvalidPairTransition) {
-			writeError(w, http.StatusUnprocessableEntity, "invalid_transition", err.Error())
-			return
-		}
-		h.log.Error("failed to dispute intercompany pair", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+	if err := h.store.DisputeIntercompany(r.Context(), id, principalID, req.Reason, getCorrelationID(r)); err != nil {
+		h.writeTransitionErr(w, "failed to dispute intercompany pair", err)
 		return
 	}
 
@@ -645,6 +644,10 @@ func (h *Handler) ResolveMismatch(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "missing_field", domain.ErrResolutionNoteRequired.Error())
 		return
 	}
+	if !domain.ValidResolutionOutcome(req.Outcome) {
+		writeError(w, http.StatusBadRequest, "invalid_outcome", domain.ErrResolutionOutcomeInvalid.Error())
+		return
+	}
 
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
@@ -667,17 +670,116 @@ func (h *Handler) ResolveMismatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.store.ResolveMismatch(r.Context(), id, principalID, req.ResolutionNote); err != nil {
-		if errors.Is(err, domain.ErrInvalidPairTransition) {
-			writeError(w, http.StatusUnprocessableEntity, "invalid_transition", err.Error())
-			return
-		}
-		h.log.Error("failed to resolve intercompany mismatch", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+	if err := h.store.ResolveMismatch(r.Context(), id, principalID, req.ResolutionNote, req.Outcome, getCorrelationID(r)); err != nil {
+		h.writeTransitionErr(w, "failed to resolve intercompany mismatch", err)
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]string{"match_status": domain.MatchStatusResolved})
+	writeJSON(w, http.StatusOK, map[string]string{"match_status": domain.MatchStatusResolved, "resolution_outcome": req.Outcome})
+}
+
+// ── POST /v1/intercompany/entries/{id}/close ──────────────────────────────────────
+
+// ClosePair moves a MATCHED pair to CLOSED, its terminal state (e.g. once
+// its period has been consolidated). Authorized on both entities: see
+// actionClosePair.
+func (h *Handler) ClosePair(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+
+	var req domain.ClosePairRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+		return
+	}
+	if req.Reason == "" {
+		writeError(w, http.StatusBadRequest, "missing_field", domain.ErrCloseReasonRequired.Error())
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+
+	entry, ok := h.fetchEntry(w, r, id)
+	if !ok {
+		return
+	}
+
+	for _, entityID := range []string{entry.SourceLegalEntityID, entry.TargetLegalEntityID} {
+		if err := h.authz.CheckAllowed(r.Context(), principalID, entityID, actionClosePair); err != nil {
+			h.writeAuthzErr(w, err)
+			return
+		}
+	}
+
+	if err := h.store.ClosePair(r.Context(), id, principalID, req.Reason, getCorrelationID(r)); err != nil {
+		h.writeTransitionErr(w, "failed to close intercompany pair", err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"match_status": domain.MatchStatusClosed})
+}
+
+// ── GET /v1/intercompany/entries/{id}/transitions ─────────────────────────────────
+
+// ListTransitions returns a pair's append-only state history, oldest first.
+// Authorized like GetEntry.
+func (h *Handler) ListTransitions(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+
+	entry, ok := h.fetchEntry(w, r, id)
+	if !ok {
+		return
+	}
+
+	if err := h.authz.CheckAllowed(r.Context(), principalID, entry.SourceLegalEntityID, actionViewEntry); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	transitions, err := h.store.ListTransitions(r.Context(), id)
+	if err != nil {
+		h.log.Error("failed to list intercompany pair transitions", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, transitions)
+}
+
+// fetchEntry reads a pair, answering 404 or 503 itself when it cannot.
+func (h *Handler) fetchEntry(w http.ResponseWriter, r *http.Request, id string) (*domain.IntercompanyEntry, bool) {
+	entry, err := h.store.GetEntry(r.Context(), id)
+	if errors.Is(err, domain.ErrEntryNotFound) {
+		writeError(w, http.StatusNotFound, "entry_not_found", "")
+		return nil, false
+	}
+	if err != nil {
+		h.log.Error("failed to fetch intercompany entry", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return nil, false
+	}
+	return entry, true
+}
+
+// writeTransitionErr maps a lifecycle store error: a pair not in the status
+// the command needs is 422, a pair that does not exist 404, anything else a
+// 503 the caller can retry.
+func (h *Handler) writeTransitionErr(w http.ResponseWriter, logMsg string, err error) {
+	switch {
+	case errors.Is(err, domain.ErrInvalidPairTransition):
+		writeError(w, http.StatusUnprocessableEntity, "invalid_transition", err.Error())
+	case errors.Is(err, domain.ErrEntryNotFound):
+		writeError(w, http.StatusNotFound, "entry_not_found", "")
+	default:
+		h.log.Error(logMsg, zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+	}
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────────

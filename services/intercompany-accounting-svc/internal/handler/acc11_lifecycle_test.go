@@ -107,7 +107,7 @@ func TestResolveMismatch_FromDisputed_MovesToResolved(t *testing.T) {
 	seedEntry(s, "e1", domain.MatchStatusDisputed)
 	r := newRouter(s, &stubAuthZ{}, &stubLedger{})
 
-	resp := doReq(r, http.MethodPost, "/v1/intercompany/entries/e1/resolve", map[string]string{"resolution_note": "FX rounding, accepted as-is"}, "user-1")
+	resp := doReq(r, http.MethodPost, "/v1/intercompany/entries/e1/resolve", map[string]string{"resolution_note": "FX rounding, accepted as-is", "outcome": domain.ResolutionAccepted}, "user-1")
 	if resp.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", resp.Code, resp.Body.String())
 	}
@@ -123,7 +123,7 @@ func TestResolveMismatch_FromMismatch_Refused(t *testing.T) {
 	seedEntry(s, "e1", domain.MatchStatusMismatch)
 	r := newRouter(s, &stubAuthZ{}, &stubLedger{})
 
-	resp := doReq(r, http.MethodPost, "/v1/intercompany/entries/e1/resolve", map[string]string{"resolution_note": "x"}, "user-1")
+	resp := doReq(r, http.MethodPost, "/v1/intercompany/entries/e1/resolve", map[string]string{"resolution_note": "x", "outcome": domain.ResolutionAccepted}, "user-1")
 	if resp.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("expected 422, got %d: %s", resp.Code, resp.Body.String())
 	}

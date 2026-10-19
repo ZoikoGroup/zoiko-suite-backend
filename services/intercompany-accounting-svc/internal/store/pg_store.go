@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -171,6 +172,11 @@ func (s *PgStore) CreateEntry(ctx context.Context, entry *domain.IntercompanyEnt
 			return nil
 		}
 		entry.TenantID = tenantID
+		if err := recordTransition(ctx, tx, tenantID, entry.IntercompanyEntryID, transition{
+			to: entry.MatchStatus, fiscalPeriod: entry.FiscalPeriod, actor: actorID, correlationID: correlationID,
+		}); err != nil {
+			return err
+		}
 		if err := s.enqueueEntryEvent(ctx, tx, "created", "intercompany.entry.created", actorID, correlationID, entry); err != nil {
 			return err
 		}
@@ -186,7 +192,8 @@ const intercompanyEntryColumns = `
 	counterparty_amount::text, counterparty_currency_code, fiscal_period, dimensions,
 	match_status, mismatch_reason, acknowledged_at, acknowledged_by_principal_id,
 	disputed_at, disputed_by_principal_id, dispute_reason,
-	resolved_at, resolved_by_principal_id, resolution_note,
+	resolved_at, resolved_by_principal_id, resolution_note, resolution_outcome,
+	closed_at, closed_by_principal_id, close_reason,
 	created_at, updated_at`
 
 func scanIntercompanyEntry(row pgx.Row, entry *domain.IntercompanyEntry) error {
@@ -196,7 +203,8 @@ func scanIntercompanyEntry(row pgx.Row, entry *domain.IntercompanyEntry) error {
 		&entry.CounterpartyAmount, &entry.CounterpartyCurrencyCode, &entry.FiscalPeriod, &entry.Dimensions,
 		&entry.MatchStatus, &entry.MismatchReason, &entry.AcknowledgedAt, &entry.AcknowledgedByPrincipalID,
 		&entry.DisputedAt, &entry.DisputedByPrincipalID, &entry.DisputeReason,
-		&entry.ResolvedAt, &entry.ResolvedByPrincipalID, &entry.ResolutionNote,
+		&entry.ResolvedAt, &entry.ResolvedByPrincipalID, &entry.ResolutionNote, &entry.ResolutionOutcome,
+		&entry.ClosedAt, &entry.ClosedByPrincipalID, &entry.CloseReason,
 		&entry.CreatedAt, &entry.UpdatedAt,
 	)
 }
@@ -222,84 +230,6 @@ func (s *PgStore) GetEntry(ctx context.Context, id string) (*domain.Intercompany
 		return nil, err
 	}
 	return &entry, nil
-}
-
-// AcknowledgeCounterparty is ACC-11's own AcknowledgeCounterparty command
-// — moves a pair from OPEN ("UNMATCHED") to AWAITING_COUNTERPARTY. Guarded
-// to only ever succeed from UNMATCHED, matching the spec's own state model
-// order.
-func (s *PgStore) AcknowledgeCounterparty(ctx context.Context, id, principalID string) error {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return domain.ErrIdentityMissing
-	}
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		now := time.Now().UTC()
-		res, err := tx.Exec(ctx, `
-			UPDATE intercompany_entries
-			SET match_status = $1, acknowledged_at = $2, acknowledged_by_principal_id = $3, updated_at = $2
-			WHERE intercompany_entry_id = $4 AND tenant_id = $5 AND match_status = $6
-		`, domain.MatchStatusAwaitingCounterparty, now, principalID, id, tenantID, domain.MatchStatusUnmatched)
-		if err != nil {
-			return err
-		}
-		if res.RowsAffected() == 0 {
-			return domain.ErrInvalidPairTransition
-		}
-		return nil
-	})
-}
-
-// DisputeIntercompany is ACC-11's own DisputeIntercompany command — moves
-// a pair from MISMATCH to DISPUTED. Only reachable from MISMATCH: there
-// is nothing to dispute about a pair that already matched or was never
-// even checked.
-func (s *PgStore) DisputeIntercompany(ctx context.Context, id, principalID, reason string) error {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return domain.ErrIdentityMissing
-	}
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		now := time.Now().UTC()
-		res, err := tx.Exec(ctx, `
-			UPDATE intercompany_entries
-			SET match_status = $1, disputed_at = $2, disputed_by_principal_id = $3, dispute_reason = $4, updated_at = $2
-			WHERE intercompany_entry_id = $5 AND tenant_id = $6 AND match_status = $7
-		`, domain.MatchStatusDisputed, now, principalID, reason, id, tenantID, domain.MatchStatusMismatch)
-		if err != nil {
-			return err
-		}
-		if res.RowsAffected() == 0 {
-			return domain.ErrInvalidPairTransition
-		}
-		return nil
-	})
-}
-
-// ResolveMismatch is ACC-11's own ResolveMismatch command — moves a pair
-// from DISPUTED to RESOLVED, the spec's own terminal outcome for a
-// disputed pair. Never re-runs matching itself: a resolution is a human
-// decision recorded as evidence, not an automatic recheck.
-func (s *PgStore) ResolveMismatch(ctx context.Context, id, principalID, resolutionNote string) error {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return domain.ErrIdentityMissing
-	}
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		now := time.Now().UTC()
-		res, err := tx.Exec(ctx, `
-			UPDATE intercompany_entries
-			SET match_status = $1, resolved_at = $2, resolved_by_principal_id = $3, resolution_note = $4, updated_at = $2
-			WHERE intercompany_entry_id = $5 AND tenant_id = $6 AND match_status = $7
-		`, domain.MatchStatusResolved, now, principalID, resolutionNote, id, tenantID, domain.MatchStatusDisputed)
-		if err != nil {
-			return err
-		}
-		if res.RowsAffected() == 0 {
-			return domain.ErrInvalidPairTransition
-		}
-		return nil
-	})
 }
 
 func (s *PgStore) ListEntries(ctx context.Context, sourceEntityID, targetEntityID string) ([]domain.IntercompanyEntry, error) {
@@ -355,17 +285,32 @@ func (s *PgStore) ListEntries(ctx context.Context, sourceEntityID, targetEntityI
 // MismatchReason) — see handler.go's MatchEntry, which mutates its locally
 // fetched entry before calling this.
 //
-// Guarded on the CURRENT status being one of domain.MatchableStatuses, the
-// same compare-and-set the other lifecycle methods use: without it, a pair
-// disputed or matched by another request after the handler read it would be
-// silently overwritten. Returns domain.ErrInvalidPairTransition in that case.
+// Guarded on the CURRENT status being one of domain.MatchableStatuses, read
+// under a row lock, the same guard the other lifecycle methods use: without
+// it, a pair disputed or matched by another request after the handler read
+// it would be silently overwritten. Returns domain.ErrInvalidPairTransition
+// in that case. A change of status is recorded in the pair's transition
+// history in the same transaction.
 func (s *PgStore) UpdateMatch(ctx context.Context, entry *domain.IntercompanyEntry, actorID, correlationID string) error {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
 		return domain.ErrIdentityMissing
 	}
 
+	// A match produces exactly these two outcomes; any other target status
+	// belongs to a lifecycle command with its own guard (pair_lifecycle.go).
+	if entry.MatchStatus != domain.MatchStatusMatched && entry.MatchStatus != domain.MatchStatusMismatch {
+		return domain.ErrInvalidPairTransition
+	}
+
 	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		current, period, err := lockPair(ctx, tx, tenantID, entry.IntercompanyEntryID)
+		if err != nil {
+			return err
+		}
+		if !slices.Contains(domain.MatchableStatuses, current) {
+			return domain.ErrInvalidPairTransition
+		}
 		now := time.Now().UTC()
 		res, err := tx.Exec(ctx, `
 			UPDATE intercompany_entries
@@ -376,16 +321,16 @@ func (s *PgStore) UpdateMatch(ctx context.Context, entry *domain.IntercompanyEnt
 			return err
 		}
 		if res.RowsAffected() == 0 {
-			var exists bool
-			if err := tx.QueryRow(ctx, `
-				SELECT EXISTS (SELECT 1 FROM intercompany_entries WHERE intercompany_entry_id = $1 AND tenant_id = $2)
-			`, entry.IntercompanyEntryID, tenantID).Scan(&exists); err != nil {
+			return domain.ErrInvalidPairTransition
+		}
+		// A repeated MISMATCH is not a state change; only a change is history.
+		if current != entry.MatchStatus {
+			if err := recordTransition(ctx, tx, tenantID, entry.IntercompanyEntryID, transition{
+				from: &current, to: entry.MatchStatus, fiscalPeriod: period, reason: entry.MismatchReason,
+				actor: actorID, correlationID: correlationID,
+			}); err != nil {
 				return err
 			}
-			if !exists {
-				return domain.ErrEntryNotFound
-			}
-			return domain.ErrInvalidPairTransition
 		}
 		entry.TenantID = tenantID
 		entry.UpdatedAt = now
@@ -396,9 +341,8 @@ func (s *PgStore) UpdateMatch(ctx context.Context, entry *domain.IntercompanyEnt
 		case domain.MatchStatusMismatch:
 			return s.enqueueEntryEvent(ctx, tx, "mismatch-detected", "intercompany.mismatch.detected", actorID, correlationID, entry)
 		default:
-			// AcknowledgeCounterparty/DisputeIntercompany/ResolveMismatch use
-			// their own dedicated store methods, not this one, and never
-			// published events before this migration either — unchanged.
+			// The other lifecycle commands use their own store methods
+			// (pair_lifecycle.go), not this one, and emit no events (A7).
 			return nil
 		}
 	})

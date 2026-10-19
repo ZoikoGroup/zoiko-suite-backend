@@ -39,6 +39,8 @@ type stubStoreReal struct {
 	createdEvents []eventRecord
 	matchEvents   []eventRecord
 
+	transitions map[string][]domain.PairTransition
+
 	// updateMatchErr, when set, is returned by UpdateMatch without writing.
 	updateMatchErr error
 
@@ -110,7 +112,7 @@ func (s *stubStoreReal) UpdateMatch(_ context.Context, entry *domain.Intercompan
 	return nil
 }
 
-func (s *stubStoreReal) AcknowledgeCounterparty(_ context.Context, id, principalID string) error {
+func (s *stubStoreReal) AcknowledgeCounterparty(_ context.Context, id, principalID, _ string) error {
 	entry, ok := s.entries[id]
 	if !ok || entry.MatchStatus != domain.MatchStatusUnmatched {
 		return domain.ErrInvalidPairTransition
@@ -120,7 +122,7 @@ func (s *stubStoreReal) AcknowledgeCounterparty(_ context.Context, id, principal
 	return nil
 }
 
-func (s *stubStoreReal) DisputeIntercompany(_ context.Context, id, principalID, reason string) error {
+func (s *stubStoreReal) DisputeIntercompany(_ context.Context, id, principalID, reason, _ string) error {
 	entry, ok := s.entries[id]
 	if !ok || entry.MatchStatus != domain.MatchStatusMismatch {
 		return domain.ErrInvalidPairTransition
@@ -130,14 +132,32 @@ func (s *stubStoreReal) DisputeIntercompany(_ context.Context, id, principalID, 
 	return nil
 }
 
-func (s *stubStoreReal) ResolveMismatch(_ context.Context, id, principalID, resolutionNote string) error {
+func (s *stubStoreReal) ResolveMismatch(_ context.Context, id, principalID, resolutionNote, outcome, _ string) error {
 	entry, ok := s.entries[id]
 	if !ok || entry.MatchStatus != domain.MatchStatusDisputed {
 		return domain.ErrInvalidPairTransition
 	}
 	now := time.Now().UTC()
 	entry.MatchStatus, entry.ResolvedAt, entry.ResolvedByPrincipalID, entry.ResolutionNote = domain.MatchStatusResolved, &now, &principalID, &resolutionNote
+	entry.ResolutionOutcome = &outcome
 	return nil
+}
+
+func (s *stubStoreReal) ClosePair(_ context.Context, id, principalID, reason, _ string) error {
+	entry, ok := s.entries[id]
+	if !ok {
+		return domain.ErrEntryNotFound
+	}
+	if entry.MatchStatus != domain.MatchStatusMatched {
+		return domain.ErrInvalidPairTransition
+	}
+	now := time.Now().UTC()
+	entry.MatchStatus, entry.ClosedAt, entry.ClosedByPrincipalID, entry.CloseReason = domain.MatchStatusClosed, &now, &principalID, &reason
+	return nil
+}
+
+func (s *stubStoreReal) ListTransitions(_ context.Context, id string) ([]domain.PairTransition, error) {
+	return s.transitions[id], nil
 }
 
 // Compile-time proof the stub still satisfies the contract the handler
@@ -165,7 +185,7 @@ func (l *stubLedger) GetJournal(_ context.Context, _, _ string) (*ledger.Journal
 
 // ── router factory ─────────────────────────────────────────────────────────────
 
-func newRouter(s *stubStoreReal, authz *stubAuthZ, leg *stubLedger) chi.Router {
+func newRouter(s *stubStoreReal, authz handler.AuthZClient, leg *stubLedger) chi.Router {
 	r := chi.NewRouter()
 	r.Use(func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {

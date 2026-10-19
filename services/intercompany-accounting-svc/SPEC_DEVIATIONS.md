@@ -105,12 +105,15 @@ reconciliation-engine-svc holds for DATA-07.
   Needs a decision on what "certify both sides" means here (resolver ≠
   disputer; or source and target each acknowledge; or a materiality threshold
   above which both are required) before it is built.
-- **A9. No `Closed` state, and `RESOLVED` records no outcome.** The state
-  model ends "Resolved/Closed"; only RESOLVED exists, reachable only from
-  DISPUTED. A MATCHED pair has no terminal close (e.g. after the period is
-  consolidated), and a resolution does not say whether the mismatch was
-  accepted, corrected, or written off, so consolidation cannot tell whether a
-  RESOLVED pair may be eliminated (it currently eliminates MATCHED only).
+- **A9. No `Closed` state, and `RESOLVED` records no outcome. — Closed
+  (B8).** Migration 000006 adds `CLOSED`, the terminal state of a MATCHED
+  pair (`POST …/entries/{id}/close`, with a required reason). It also
+  requires `outcome` (`ACCEPTED` / `CORRECTED` / `WRITTEN_OFF`) on
+  ResolveMismatch and stores it as `resolution_outcome`. Every state change
+  is now recorded in the append-only `intercompany_pair_transitions` table
+  (`GET …/entries/{id}/transitions`). consolidation-svc is not changed: it
+  still eliminates MATCHED only and does not read the outcome yet (see B8
+  before any pair is closed in production).
 - **A10. No `Idempotency-Key` or `expected_version` on the lifecycle
   commands.** The wireframe requires both on every command. Create is
   idempotent by `(tenant_id, source_journal_id)`; acknowledge, match, dispute
@@ -189,3 +192,48 @@ reconciliation-engine-svc holds for DATA-07.
     would break them. Quoted strings are accepted on input, so callers can
     move to strings before the output changes.
   - *Tolerance.* Still the fixed 0.001 (A5), now compared exactly.
+- **B8. CLOSED, resolution outcomes and the transition history (A9).**
+  - *Which states may close.* MATCHED only, as A9 scopes it. An open,
+    mismatched or disputed pair still has an unsettled difference, and
+    closing it would take that difference out of view (the invariant
+    "Unmatched intercompany balances remain visible"). RESOLVED is left as
+    it was: it is already terminal, and whether a resolved pair should also
+    close is a decision for the consolidation change below. CLOSED is
+    terminal, and nothing (match included) leaves it.
+  - *Who may close.* `INTERCOMPANY_ENTRY_CLOSE` is checked on **both** the
+    source and the target entity. A terminal close takes the pair out of
+    each side's open set, so neither side alone may do it. The other
+    commands check one entity (A8 is about who may certify both sides; that
+    question is not settled here).
+  - ***Follow-up required before closing pairs in production:***
+    consolidation-svc's `FetchMatchedIntercompanyEntries` keeps
+    `match_status == "MATCHED"` only. Once a pair is CLOSED it drops out of
+    that list, so re-running consolidation for an already-consolidated
+    period would no longer eliminate it. consolidation-svc must treat CLOSED
+    as eliminable (it was matched; the history records MATCHED → CLOSED) in
+    the same change that wires up `resolution_outcome`. That change was
+    deliberately left out of scope here.
+  - *Resolution outcome.* Required on every new resolution, by the handler
+    (400 `invalid_outcome`), by the store, and by a CHECK constraint.
+    `chk_resolved_has_outcome` is `NOT VALID`, so pairs resolved before
+    000006 keep a NULL outcome rather than an invented one. A consumer must
+    read NULL as "unknown", never as eliminable. The endpoint's input is
+    exact upper-case codes; lower-case is refused rather than normalised.
+  - *History.* `intercompany_pair_transitions` follows
+    reconciliation-engine-svc's `reconciliation_run_transitions`: identity
+    key, `from_state <> to_state`, ENABLE + FORCE RLS on tenant, and an
+    UPDATE/DELETE trigger (`reject_immutable_row`) that rejects any rewrite.
+    Each row carries the pair's `fiscal_period` at the time, the reason
+    (mismatch reason, dispute reason, resolution note or close reason), the
+    outcome on RESOLVED, the actor and the correlation id. Every lifecycle
+    write now locks the row (`SELECT … FOR UPDATE`), checks the current
+    status, updates it (keeping the WHERE-status guard as a second line of
+    defence) and inserts the transition in one transaction. A repeated
+    MISMATCH is not a state change and adds no row (each attempt is recorded
+    by A3's `match_attempts`). The backfill writes one row per existing
+    pair, for the state it is in, with actor `migration:000006`; earlier
+    transitions were never recorded and are not reconstructed.
+  - *UpdateMatch accepts only MATCHED or MISMATCH* as the target status. It
+    used to write whatever status it was handed, which would now have been
+    a way to reach CLOSED without the close guard.
+  - *No events* for close, dispute or resolve yet. That is A7, unchanged.

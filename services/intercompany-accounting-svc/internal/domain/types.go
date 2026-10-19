@@ -20,12 +20,33 @@ const (
 	MatchStatusMismatch            = "MISMATCH"
 	MatchStatusDisputed            = "DISPUTED"
 	MatchStatusResolved            = "RESOLVED"
+
+	// MatchStatusClosed is the terminal state of a MATCHED pair, e.g. once
+	// its period has been consolidated. Nothing leaves it.
+	MatchStatusClosed = "CLOSED"
 )
+
+// Resolution outcomes: what ResolveMismatch decided about a disputed pair.
+// A consumer deciding whether a RESOLVED pair may be eliminated reads this;
+// a NULL outcome (pairs resolved before migration 000006) means unknown.
+const (
+	// ResolutionAccepted: the difference was accepted as it stands.
+	ResolutionAccepted = "ACCEPTED"
+	// ResolutionCorrected: one side was corrected so the pair now agrees.
+	ResolutionCorrected = "CORRECTED"
+	// ResolutionWrittenOff: the difference was written off.
+	ResolutionWrittenOff = "WRITTEN_OFF"
+)
+
+// ValidResolutionOutcome reports whether o is one of the resolution outcomes.
+func ValidResolutionOutcome(o string) bool {
+	return o == ResolutionAccepted || o == ResolutionCorrected || o == ResolutionWrittenOff
+}
 
 // MatchableStatuses are the only statuses MatchIntercompany may move a pair
 // out of. MISMATCH is included so a caller can correct a prior mismatch by
-// re-running the match; MATCHED, DISPUTED and RESOLVED have left the part of
-// the state model matching belongs to. The store enforces this in the UPDATE
+// re-running the match; MATCHED, DISPUTED, RESOLVED and CLOSED have left the
+// part of the state model matching belongs to. The store enforces this in the UPDATE
 // itself, so a dispute that lands between the handler's read and its write
 // is never overwritten.
 var MatchableStatuses = []string{MatchStatusUnmatched, MatchStatusAwaitingCounterparty, MatchStatusMismatch}
@@ -79,6 +100,17 @@ type IntercompanyEntry struct {
 	ResolvedAt            *time.Time `json:"resolved_at,omitempty"`
 	ResolvedByPrincipalID *string    `json:"resolved_by_principal_id,omitempty"`
 	ResolutionNote        *string    `json:"resolution_note,omitempty"`
+
+	// ResolutionOutcome is ResolveMismatch's decision (ResolutionAccepted,
+	// ResolutionCorrected or ResolutionWrittenOff). Nil on a pair that is
+	// not RESOLVED, and on pairs resolved before it was recorded.
+	ResolutionOutcome *string `json:"resolution_outcome,omitempty"`
+
+	// ClosedAt/ClosedByPrincipalID/CloseReason record ClosePair, the
+	// terminal close of a MATCHED pair.
+	ClosedAt            *time.Time `json:"closed_at,omitempty"`
+	ClosedByPrincipalID *string    `json:"closed_by_principal_id,omitempty"`
+	CloseReason         *string    `json:"close_reason,omitempty"`
 
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
@@ -170,8 +202,34 @@ type DisputeIntercompanyRequest struct {
 }
 
 // ResolveMismatchRequest is ACC-11's own ResolveMismatch command input.
+// Outcome is required: a resolution that does not say whether the mismatch
+// was accepted, corrected or written off cannot tell consolidation whether
+// the pair may be eliminated.
 type ResolveMismatchRequest struct {
 	ResolutionNote string `json:"resolution_note"`
+	Outcome        string `json:"outcome"`
+}
+
+// ClosePairRequest is the input to ClosePair, the terminal close of a
+// MATCHED pair.
+type ClosePairRequest struct {
+	Reason string `json:"reason"`
+}
+
+// PairTransition is one row of a pair's append-only state history.
+// FromState is nil on the first row: the pair's creation, or (actor
+// "migration:000006") the state it was already in when history began.
+type PairTransition struct {
+	TransitionID        int64     `json:"transition_id"`
+	IntercompanyEntryID string    `json:"intercompany_entry_id"`
+	FromState           *string   `json:"from_state"`
+	ToState             string    `json:"to_state"`
+	FiscalPeriod        *string   `json:"fiscal_period,omitempty"`
+	Reason              *string   `json:"reason,omitempty"`
+	ResolutionOutcome   *string   `json:"resolution_outcome,omitempty"`
+	Actor               string    `json:"actor"`
+	CorrelationID       *string   `json:"correlation_id,omitempty"`
+	OccurredAt          time.Time `json:"occurred_at"`
 }
 
 type errorString string
@@ -216,6 +274,13 @@ var (
 	// ErrResolutionNoteRequired is ResolveMismatch's own guard — a
 	// resolution with no recorded rationale is not evidence of anything.
 	ErrResolutionNoteRequired = errorString("resolution_note is required to resolve a disputed intercompany pair")
+
+	// ErrResolutionOutcomeInvalid is ResolveMismatch's outcome guard.
+	ErrResolutionOutcomeInvalid = errorString("outcome is required to resolve a disputed intercompany pair: ACCEPTED, CORRECTED or WRITTEN_OFF")
+
+	// ErrCloseReasonRequired is ClosePair's guard: a terminal close with no
+	// recorded reason is not evidence of anything.
+	ErrCloseReasonRequired = errorString("reason is required to close an intercompany pair")
 
 	// ErrCounterpartyJournalMissing is the spec's own negative path "One
 	// side missing": MatchIntercompany named a target_journal_id that
