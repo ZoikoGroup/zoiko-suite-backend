@@ -21,6 +21,10 @@ services/*/secret_store.local
 # binaries left in a service's own root directory)
 services/*/server
 services/*/healthcheck
+# ...and their Windows names. Six of these (23–38 MB each) were committed on
+# 15 Oct 2026 and removed from the index on 19 Oct (Group 1 re-audit F-8):
+# a binary in the tree is one nobody can trace to a source revision.
+services/*/*.exe
 
 # same, for the Supabase bootstrap tool. `go build ./...` inside its directory
 # drops a ~13 MB binary named after the module, which is a build artifact and
