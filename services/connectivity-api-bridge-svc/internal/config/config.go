@@ -44,6 +44,10 @@ type Config struct {
 	// EgressAllowedPorts are the destination ports a connector may use. Empty
 	// means 443 only.
 	EgressAllowedPorts []int
+	// EgressPrivateCIDRs are private ranges a connector may point at because the provider is reached over
+	// private connectivity (a dedicated link, a VPN, an on-premises gateway). An allowlist of exact ranges:
+	// loopback, link-local (cloud metadata), unspecified and multicast stay refused whatever is listed.
+	EgressPrivateCIDRs []string
 }
 
 func Load() *Config {
@@ -67,6 +71,7 @@ func Load() *Config {
 		EgressAllowedRegions:    csv(os.Getenv("EGRESS_ALLOWED_REGIONS")),
 		EgressAllowInsecureHTTP: getEnv("EGRESS_ALLOW_INSECURE_HTTP", "false") == "true",
 		EgressAllowedPorts:      ints(os.Getenv("EGRESS_ALLOWED_PORTS")),
+		EgressPrivateCIDRs:      csv(os.Getenv("EGRESS_PRIVATE_CIDRS")),
 	}
 }
 

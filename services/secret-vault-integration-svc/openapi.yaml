@@ -645,6 +645,39 @@ paths:
         "404": {description: No applicable secret policy}
         "503": {description: Vault backend or audit store unavailable (fails closed)}
 
+  /v1/secrets/use:
+    post:
+      tags: [Brokering]
+      summary: Return a provider credential to an allow-listed workload for one call (documented exception)
+      operationId: useSecret
+      description: |
+        The one documented exception to "the vault never returns secret material" (ZS-SVC-M-001
+        INT-07/08/09). A bank or tax provider that accepts only a bearer token or API key needs that
+        value on the wire, and only the calling adapter can put it there. Narrow by design: only
+        secret classes `PROVIDER_CREDENTIAL` and `CALLBACK_SECRET` (any other class is refused), only a
+        workload named in the policy version's `allowed_workload_ids` whose gateway-verified identity
+        equals `requested_by_principal_id`, and only within the caller's own tenant. Every use is
+        audited (`USED`, or `DENIED` with the reason); if the audit entry cannot be written the credential
+        is withheld. The response is `Cache-Control: no-store`. The caller holds the value in memory
+        for the single call and never stores or logs it.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [secret_path, requested_by_principal_id, request_id]
+              properties:
+                secret_path: {type: string}
+                requested_by_principal_id: {type: string}
+                request_id: {type: string}
+      responses:
+        "200": {description: "{secret_path, secret_class, credential_base64, secret_policy_version_id}"}
+        "400": {description: Invalid request, or the canonical input contract is incomplete}
+        "403": {description: Identity mismatch, not an allowed workload, or a class that may not be used}
+        "404": {description: No applicable secret policy}
+        "503": {description: Vault backend or audit store unavailable (fails closed)}
+
   /v1/secrets/broker:
     post:
       tags: [Brokering]

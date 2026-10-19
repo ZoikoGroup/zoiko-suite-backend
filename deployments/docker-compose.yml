@@ -5088,8 +5088,8 @@ services:
   # fields once prepared.
   payment-initiation-adapter-svc:
     build:
-      context: ../services/payment-initiation-adapter-svc
-      dockerfile: Dockerfile
+      context: ../services
+      dockerfile: payment-initiation-adapter-svc/Dockerfile
     container_name: payment-initiation-adapter-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -5132,8 +5132,8 @@ services:
   # replaced before any real provider is ever connected.
   payment-status-svc:
     build:
-      context: ../services/payment-status-svc
-      dockerfile: Dockerfile
+      context: ../services
+      dockerfile: payment-status-svc/Dockerfile
     container_name: payment-status-svc
     mem_limit: 256m
     cpus: "0.5"

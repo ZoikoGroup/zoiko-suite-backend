@@ -25,7 +25,9 @@ const SigningSecretClass = "WEBHOOK_SIGNING"
 const maxSignedMessageBytes = 180 << 10
 
 type signRequest struct {
-	SecretPath             string  `json:"secret_path"`
+	SecretPath string `json:"secret_path,omitempty"`
+	// SecretPolicyID names the policy instead of its path (a connector stores the policy id as its credential reference).
+	SecretPolicyID         string  `json:"secret_policy_id,omitempty"`
 	TenantID               *string `json:"tenant_id,omitempty"`
 	LegalEntityID          *string `json:"legal_entity_id,omitempty"`
 	RequestedByPrincipalID string  `json:"requested_by_principal_id"`
@@ -43,7 +45,7 @@ type signResponse struct {
 
 func (r signRequest) missingField() string {
 	switch {
-	case r.SecretPath == "":
+	case r.SecretPath == "" && r.SecretPolicyID == "":
 		return "secret_path"
 	case r.RequestedByPrincipalID == "":
 		return "requested_by_principal_id"
@@ -124,6 +126,22 @@ func (h *Handler) Sign(w http.ResponseWriter, r *http.Request) {
 		h.metrics.BrokerDecision("sign_denied")
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "workload_identity_mismatch", "secret_path": req.SecretPath})
 		return
+	}
+
+	if req.SecretPath == "" {
+		pol, perr := h.store.FindSecretPolicyByID(r.Context(), req.SecretPolicyID)
+		if perr != nil {
+			if errors.Is(perr, domain.ErrSecretPolicyNotFound) || isInvalidID(perr) {
+				deny("", nil, "no secret policy with that id", req.RequestedByPrincipalID)
+				h.metrics.BrokerDecision("sign_no_policy")
+				writeJSON(w, http.StatusNotFound, map[string]string{"error": "no_applicable_secret_policy"})
+			} else {
+				h.log.Error("Sign: store unavailable resolving policy id", zap.String("correlation_id", correlationID), zap.Error(perr))
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			}
+			return
+		}
+		req.SecretPath = pol.SecretPath
 	}
 
 	applicable, err := h.store.FindApplicableVersionByPath(r.Context(), req.SecretPath, req.TenantID, req.LegalEntityID)
