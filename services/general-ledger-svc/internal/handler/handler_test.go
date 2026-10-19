@@ -17,8 +17,8 @@ import (
 	"zoiko.io/general-ledger-svc/internal/domain"
 	svcenvelope "zoiko.io/general-ledger-svc/internal/envelope"
 	"zoiko.io/general-ledger-svc/internal/handler"
-	"zoiko.io/general-ledger-svc/internal/store"
 	svcmiddleware "zoiko.io/general-ledger-svc/internal/middleware"
+	"zoiko.io/general-ledger-svc/internal/store"
 )
 
 // ── stubs ────────────────────────────────────────────────────────────────────
@@ -52,9 +52,11 @@ type stubStore struct {
 	// for, so a test can assert the handler passed the right scope down.
 	lastCompileLegalEntityID, lastCompileFiscalPeriod string
 
-	accounts         map[string]*domain.Account // by account_id
-	accountsByCode   map[string]*domain.Account // by "tenant|code"
+	accounts         map[string]*domain.Account          // by account_id
+	accountsByCode   map[string]*domain.Account          // by "tenant|code"
+	accountVersions  map[string][]*domain.AccountVersion // by "tenant|code"
 	createAccountErr error
+	amendAccountErr  error
 
 	currentMappings map[string]*domain.AccountMapping // by "tenant|mapping_key"
 	setMappingErr   error
@@ -85,6 +87,7 @@ func newStubStore() *stubStore {
 		trialBalances:     map[string]*domain.TrialBalanceSnapshot{},
 		accounts:          map[string]*domain.Account{},
 		accountsByCode:    map[string]*domain.Account{},
+		accountVersions:   map[string][]*domain.AccountVersion{},
 		currentMappings:   map[string]*domain.AccountMapping{},
 		postingExecutions: map[string]*domain.PostingExecution{},
 		bySourceEvent:     map[string]string{},
@@ -265,9 +268,61 @@ func (s *stubStore) CreateAccount(_ context.Context, a *domain.Account) error {
 	if _, exists := s.accountsByCode[key]; exists {
 		return domain.ErrAccountAlreadyExists
 	}
+	a.Version = 1
 	s.accounts[a.AccountID] = a
 	s.accountsByCode[key] = a
+	s.accountVersions[key] = []*domain.AccountVersion{{
+		AccountVersionID: "v1-" + key, AccountID: a.AccountID, TenantID: a.TenantID,
+		AccountCode: a.AccountCode, Version: 1, AccountName: a.AccountName,
+		AccountType: a.AccountType, ParentAccountID: a.ParentAccountID,
+		IsControlAccount: a.IsControlAccount, DirectPostingRestricted: a.DirectPostingRestricted,
+		Status: a.Status, EffectiveFrom: a.CreatedAt, ChangeKind: "CREATED",
+		CreatedAt: a.CreatedAt, CreatedByPrincipalID: a.CreatedByPrincipalID,
+	}}
 	return nil
+}
+
+// AmendAccountVersion mirrors the real store's core invariants: expected
+// version is enforced, a new version is appended, and the head row advances.
+func (s *stubStore) AmendAccountVersion(_ context.Context, tenantID, accountCode string, expectedVersion int64, effectiveFrom time.Time, a *domain.Account, reason string, evidence []string, principalID string) (*domain.Account, error) {
+	if s.amendAccountErr != nil {
+		return nil, s.amendAccountErr
+	}
+	key := tenantID + "|" + accountCode
+	cur, ok := s.accountsByCode[key]
+	if !ok {
+		return nil, domain.ErrAccountNotFound
+	}
+	if expectedVersion > 0 && cur.Version != expectedVersion {
+		return nil, domain.ErrAccountVersionConflict
+	}
+	versions := s.accountVersions[key]
+	if len(versions) > 0 {
+		prev := versions[len(versions)-1]
+		if effectiveFrom.Before(prev.EffectiveFrom) {
+			return nil, domain.ErrAccountEffectiveDate
+		}
+		prev.EffectiveTo = &effectiveFrom
+	}
+	updated := *cur
+	updated.AccountName = a.AccountName
+	updated.AccountType = a.AccountType
+	updated.ParentAccountID = a.ParentAccountID
+	updated.IsControlAccount = a.IsControlAccount
+	updated.DirectPostingRestricted = a.DirectPostingRestricted
+	updated.Status = a.Status
+	updated.Version = cur.Version + 1
+	*cur = updated
+	s.accountVersions[key] = append(versions, &domain.AccountVersion{
+		AccountVersionID: "v" + fmt.Sprint(updated.Version) + "-" + key,
+		AccountID:        updated.AccountID, TenantID: updated.TenantID, AccountCode: updated.AccountCode,
+		Version: updated.Version, AccountName: updated.AccountName, AccountType: updated.AccountType,
+		ParentAccountID: updated.ParentAccountID, IsControlAccount: updated.IsControlAccount,
+		DirectPostingRestricted: updated.DirectPostingRestricted, Status: updated.Status,
+		EffectiveFrom: effectiveFrom, ChangeKind: "AMENDED", ChangeReason: reason,
+		EvidenceRefs: evidence, CreatedAt: time.Now().UTC(), CreatedByPrincipalID: principalID,
+	})
+	return cur, nil
 }
 
 func (s *stubStore) GetAccountByCode(_ context.Context, tenantID, accountCode string) (*domain.Account, error) {
@@ -1258,6 +1313,91 @@ func TestCreateAccount_DuplicateCode_Returns409(t *testing.T) {
 	rec := doRequest(r, http.MethodPost, "/v1/chart-of-accounts/", req, "principal-1")
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("expected 409, got %d", rec.Code)
+	}
+}
+
+func TestAmendAccountVersion_UpdatesHeadAndAppendsVersion(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1000-Cash", AccountName: "Cash", AccountType: domain.AccountTypeAsset})
+
+	rec := doRequest(r, http.MethodPost, "/v1/chart-of-accounts/1000-Cash/amend", map[string]any{
+		"account_name": "Cash on hand",
+		"reason":       "renamed by finance",
+	}, "principal-1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var updated domain.Account
+	if err := json.Unmarshal(rec.Body.Bytes(), &updated); err != nil {
+		t.Fatalf("amended account is not valid JSON: %v", err)
+	}
+	if updated.AccountName != "Cash on hand" || updated.Version != 2 {
+		t.Fatalf("expected name %q at version 2, got %q at version %d",
+			"Cash on hand", updated.AccountName, updated.Version)
+	}
+
+	rec = doRequest(r, http.MethodGet, "/v1/chart-of-accounts/1000-Cash", nil, "principal-1")
+	var fetched domain.Account
+	if err := json.Unmarshal(rec.Body.Bytes(), &fetched); err != nil {
+		t.Fatalf("fetched account is not valid JSON: %v", err)
+	}
+	if fetched.Version != 2 || fetched.AccountName != "Cash on hand" {
+		t.Fatalf("GetAccount did not read the amended head: %+v", fetched)
+	}
+	if got := len(s.accountVersions["t1|1000-Cash"]); got != 2 {
+		t.Fatalf("expected two account versions after amendment, got %d", got)
+	}
+}
+
+func TestAmendAccountVersion_ExpectedVersionConflict_Returns409(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1000-Cash", AccountName: "Cash", AccountType: domain.AccountTypeAsset})
+
+	rec := doRequest(r, http.MethodPost, "/v1/chart-of-accounts/1000-Cash/amend", map[string]any{
+		"account_name":     "Stale rename",
+		"expected_version": 99,
+	}, "principal-1")
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 on stale expected_version, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if got := len(s.accountVersions["t1|1000-Cash"]); got != 1 {
+		t.Fatalf("a refused amendment must not append a version; got %d versions", got)
+	}
+}
+
+func TestAmendAccountVersion_UnknownAccount_Returns404(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	rec := doRequest(r, http.MethodPost, "/v1/chart-of-accounts/no-such/amend", map[string]any{
+		"account_name": "Nope",
+	}, "principal-1")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAmendAccountVersion_ExplicitNullParentClearsParent(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1000", AccountName: "Assets", AccountType: domain.AccountTypeAsset})
+	parent := s.accountsByCode["t1|1000"].AccountID
+	createAccount(t, r, domain.CreateAccountRequest{
+		AccountCode: "1010", AccountName: "Cash", AccountType: domain.AccountTypeAsset, ParentAccountID: &parent,
+	})
+
+	rec := doRequest(r, http.MethodPost, "/v1/chart-of-accounts/1010/amend", map[string]any{
+		"parent_account_id": nil,
+	}, "principal-1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var updated domain.Account
+	if err := json.Unmarshal(rec.Body.Bytes(), &updated); err != nil {
+		t.Fatalf("amended account is not valid JSON: %v", err)
+	}
+	if updated.ParentAccountID != nil {
+		t.Fatalf("explicit null parent_account_id should clear the parent, got %v", *updated.ParentAccountID)
 	}
 }
 

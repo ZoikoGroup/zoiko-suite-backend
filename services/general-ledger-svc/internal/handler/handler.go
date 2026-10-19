@@ -53,6 +53,7 @@ type Store interface {
 	GetAccountByCode(ctx context.Context, tenantID, accountCode string) (*domain.Account, error)
 	ListAccounts(ctx context.Context, tenantID string) ([]domain.Account, error)
 	DeactivateAccount(ctx context.Context, tenantID, accountCode string) error
+	AmendAccountVersion(ctx context.Context, tenantID, accountCode string, expectedVersion int64, effectiveFrom time.Time, a *domain.Account, reason string, evidenceRefs []string, principalID string) (*domain.Account, error)
 
 	// ACC-02 Account Mapping — see migration 000008's doc comment.
 	SetAccountMapping(ctx context.Context, m *domain.AccountMapping) error
@@ -135,6 +136,7 @@ const (
 	// it's co-deployed in this same process.
 	actionCreateAccount     = "COA_ACCOUNT_CREATE"
 	actionViewAccount       = "COA_ACCOUNT_VIEW"
+	actionAmendAccount      = "COA_ACCOUNT_AMEND"
 	actionDeactivateAccount = "COA_ACCOUNT_DEACTIVATE"
 	// actionOverridePostingRestriction gates the invariant #7 override —
 	// deliberately a distinct, more sensitive action than actionCreateJournal
@@ -290,6 +292,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/", h.CreateAccount)
 		r.Get("/", h.ListAccounts)
 		r.Get("/{account_code}", h.GetAccount)
+		r.Post("/{account_code}/amend", h.AmendAccountVersion)
 		r.Post("/{account_code}/deactivate", h.DeactivateAccount)
 	})
 	r.Route("/v1/account-mappings", func(r chi.Router) {
@@ -420,14 +423,14 @@ func (h *Handler) CreateJournal(w http.ResponseWriter, r *http.Request) {
 		SourceEventID:        req.SourceEventID,
 		GovernanceDecisionID: req.GovernanceDecisionID,
 
-		JournalType:              req.JournalType,
-		TransactionDate:          req.TransactionDate,
-		PostingDate:              req.PostingDate,
-		CurrencyCode:             req.CurrencyCode,
-		BookID:                   bookID,
-		ReportingBasis:           reportingBasis,
-		EvidenceRefs:             mergeEvidenceRefs(req.EvidenceRefs, env.EvidenceRefs),
-		SoftCloseOverrideReason:  &req.SoftCloseOverrideReason,
+		JournalType:             req.JournalType,
+		TransactionDate:         req.TransactionDate,
+		PostingDate:             req.PostingDate,
+		CurrencyCode:            req.CurrencyCode,
+		BookID:                  bookID,
+		ReportingBasis:          reportingBasis,
+		EvidenceRefs:            mergeEvidenceRefs(req.EvidenceRefs, env.EvidenceRefs),
+		SoftCloseOverrideReason: &req.SoftCloseOverrideReason,
 
 		// ACC-03: every ordinary journal a human creates starts as a
 		// proposal nobody has acted on yet — explicit here rather than
@@ -767,6 +770,103 @@ func (h *Handler) CreateAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, a)
+}
+
+// AmendAccountVersion appends a new version of an existing account. Omitted
+// fields keep their current values; an explicit null parent clears the parent.
+// The current chart row is advanced as a projection, but the prior version is
+// never overwritten — account_versions retains the full prior interval and
+// GetAccountAsOf reconstructs it.
+func (h *Handler) AmendAccountVersion(w http.ResponseWriter, r *http.Request) {
+	accountCode := chi.URLParam(r, "account_code")
+	var req domain.AmendAccountVersionRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, coaPlatformScopeID, actionAmendAccount); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	current, err := h.store.GetAccountByCode(r.Context(), tenantID, accountCode)
+	if errors.Is(err, domain.ErrAccountNotFound) {
+		writeError(w, http.StatusNotFound, "account_not_found", "")
+		return
+	}
+	if err != nil {
+		h.log.Error("AmendAccountVersion: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+
+	updated := *current
+	if req.AccountName != nil {
+		name := strings.TrimSpace(*req.AccountName)
+		if name == "" {
+			writeError(w, http.StatusBadRequest, "invalid_field", "account_name must not be empty")
+			return
+		}
+		updated.AccountName = name
+	}
+	if req.AccountType != nil {
+		if !domain.IsValidAccountType(*req.AccountType) {
+			writeError(w, http.StatusBadRequest, "invalid_field", domain.ErrInvalidAccountType.Error())
+			return
+		}
+		updated.AccountType = *req.AccountType
+	}
+	if req.ParentAccountIDSet {
+		updated.ParentAccountID = req.ParentAccountID
+	}
+	if req.IsControlAccount != nil {
+		updated.IsControlAccount = *req.IsControlAccount
+	}
+	if req.DirectPostingRestricted != nil {
+		updated.DirectPostingRestricted = *req.DirectPostingRestricted
+	}
+
+	effectiveFrom := time.Now().UTC()
+	if req.EffectiveFrom != nil {
+		effectiveFrom = req.EffectiveFrom.Time
+	}
+	result, err := h.store.AmendAccountVersion(r.Context(), tenantID, accountCode,
+		req.ExpectedVersion, effectiveFrom, &updated, req.Reason, req.EvidenceRefs, principalID)
+	if err != nil {
+		if h.writeAccountVersionErr(w, err) {
+			return
+		}
+		h.log.Error("AmendAccountVersion: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+// writeAccountVersionErr maps the shared versioned-account failures to stable
+// API errors. It returns true when the error was recognised.
+func (h *Handler) writeAccountVersionErr(w http.ResponseWriter, err error) bool {
+	switch {
+	case errors.Is(err, domain.ErrAccountNotFound):
+		writeError(w, http.StatusNotFound, "account_not_found", "")
+	case errors.Is(err, domain.ErrAccountVersionConflict):
+		writeError(w, http.StatusConflict, "account_version_conflict", err.Error())
+	case errors.Is(err, domain.ErrParentAccountNotFound):
+		writeError(w, http.StatusBadRequest, "parent_account_not_found", err.Error())
+	case errors.Is(err, domain.ErrAccountEffectiveDate):
+		writeError(w, http.StatusUnprocessableEntity, "effective_date_invalid", err.Error())
+	default:
+		return false
+	}
+	return true
 }
 
 func (h *Handler) GetAccount(w http.ResponseWriter, r *http.Request) {
@@ -1163,16 +1263,16 @@ func (h *Handler) ReverseJournal(w http.ResponseWriter, r *http.Request) {
 	// underlying document has not changed.
 
 	reversingHeader := &domain.JournalHeader{
-		JournalID:              uuid.NewString(),
-		TenantID:               header.TenantID,
-		LegalEntityID:          header.LegalEntityID,
-		FiscalPeriod:           header.FiscalPeriod,
-		Status:                 domain.JournalStatusFinalized,
-		ReversalOfJournalID:    &reversalID,
-		Description:            "Reversal of " + journalID + ": " + req.Reason,
-		CreatedByPrincipalID:   principalID,
-		PostedByPrincipalID:    &principalID,
-		CorrelationID:          req.CorrelationID,
+		JournalID:               uuid.NewString(),
+		TenantID:                header.TenantID,
+		LegalEntityID:           header.LegalEntityID,
+		FiscalPeriod:            header.FiscalPeriod,
+		Status:                  domain.JournalStatusFinalized,
+		ReversalOfJournalID:     &reversalID,
+		Description:             "Reversal of " + journalID + ": " + req.Reason,
+		CreatedByPrincipalID:    principalID,
+		PostedByPrincipalID:     &principalID,
+		CorrelationID:           req.CorrelationID,
 		SoftCloseOverrideReason: &req.SoftCloseOverrideReason,
 
 		JournalType:     domain.JournalTypeReversal,
@@ -2002,20 +2102,20 @@ func (h *Handler) PostAccountingEvent(w http.ResponseWriter, r *http.Request) {
 func eventJournal(tenantID, principalID string, req domain.PostAccountingEventRequest, resolvedLines []domain.CreateJournalLineInput) (*domain.JournalHeader, []domain.JournalLine) {
 	sourceEventID := req.SourceEventID
 	header := &domain.JournalHeader{
-		JournalID:                uuid.NewString(),
-		TenantID:                 tenantID,
-		LegalEntityID:            req.LegalEntityID,
-		FiscalPeriod:             req.FiscalPeriod,
-		Status:                   domain.JournalStatusPending,
-		Description:              req.Description,
-		CreatedByPrincipalID:     principalID,
-		CorrelationID:            req.CorrelationID,
-		SourceEventID:            &sourceEventID,
-		JournalType:              domain.JournalTypeStandard,
-		TransactionDate:          req.DocumentDate,
-		PostingDate:              req.PostingDate,
-		CurrencyCode:             req.TransactionCurrency,
-		SoftCloseOverrideReason:  &req.SoftCloseOverrideReason,
+		JournalID:               uuid.NewString(),
+		TenantID:                tenantID,
+		LegalEntityID:           req.LegalEntityID,
+		FiscalPeriod:            req.FiscalPeriod,
+		Status:                  domain.JournalStatusPending,
+		Description:             req.Description,
+		CreatedByPrincipalID:    principalID,
+		CorrelationID:           req.CorrelationID,
+		SourceEventID:           &sourceEventID,
+		JournalType:             domain.JournalTypeStandard,
+		TransactionDate:         req.DocumentDate,
+		PostingDate:             req.PostingDate,
+		CurrencyCode:            req.TransactionCurrency,
+		SoftCloseOverrideReason: &req.SoftCloseOverrideReason,
 		// System-originated: this bypasses ACC-03's human Draft/Submit/
 		// Approve workflow entirely (already gated by actionPostingExecute,
 		// which a deployment grants only to internal service identities —

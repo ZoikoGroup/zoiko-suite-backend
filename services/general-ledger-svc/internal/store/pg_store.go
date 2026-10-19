@@ -1090,7 +1090,7 @@ func (s *PgStore) GetTrialBalance(ctx context.Context, tenantID, snapshotID stri
 
 const accountColumns = `account_id, tenant_id, account_code, account_name, account_type,
 	parent_account_id, is_control_account, direct_posting_restricted, status,
-	created_at, created_by_principal_id`
+	created_at, created_by_principal_id, version`
 
 func scanAccount(row pgx.Row) (*domain.Account, error) {
 	var a domain.Account
@@ -1098,13 +1098,88 @@ func scanAccount(row pgx.Row) (*domain.Account, error) {
 	if err := row.Scan(
 		&a.AccountID, &a.TenantID, &a.AccountCode, &a.AccountName, &accountType,
 		&a.ParentAccountID, &a.IsControlAccount, &a.DirectPostingRestricted, &status,
-		&a.CreatedAt, &a.CreatedByPrincipalID,
+		&a.CreatedAt, &a.CreatedByPrincipalID, &a.Version,
 	); err != nil {
 		return nil, err
 	}
 	a.AccountType = domain.AccountType(accountType)
 	a.Status = status
 	return &a, nil
+}
+
+const accountVersionColumns = `account_version_id, tenant_id, account_id, account_code,
+	version, account_name, account_type, parent_account_id, is_control_account,
+	direct_posting_restricted, status, effective_from, effective_to, change_kind,
+	COALESCE(change_reason, ''), evidence_refs, created_at, created_by_principal_id`
+
+func scanAccountVersion(row pgx.Row) (*domain.AccountVersion, error) {
+	var v domain.AccountVersion
+	var accountType string
+	if err := row.Scan(
+		&v.AccountVersionID, &v.TenantID, &v.AccountID, &v.AccountCode,
+		&v.Version, &v.AccountName, &accountType, &v.ParentAccountID, &v.IsControlAccount,
+		&v.DirectPostingRestricted, &v.Status, &v.EffectiveFrom, &v.EffectiveTo, &v.ChangeKind,
+		&v.ChangeReason, &v.EvidenceRefs, &v.CreatedAt, &v.CreatedByPrincipalID,
+	); err != nil {
+		return nil, err
+	}
+	v.AccountType = domain.AccountType(accountType)
+	return &v, nil
+}
+
+// insertAccountVersion appends one immutable version row. Callers have already
+// closed the prior interval (see closeCurrentAccountVersion) in the same
+// transaction, so the partial unique index on the open version cannot race.
+func insertAccountVersion(ctx context.Context, tx pgx.Tx, v *domain.AccountVersion) error {
+	_, err := tx.Exec(ctx, `
+		INSERT INTO account_versions (
+			account_version_id, tenant_id, account_id, account_code, version,
+			account_name, account_type, parent_account_id, is_control_account,
+			direct_posting_restricted, status, effective_from, effective_to,
+			change_kind, change_reason, evidence_refs, created_at, created_by_principal_id
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+	`, v.AccountVersionID, v.TenantID, v.AccountID, v.AccountCode, v.Version,
+		v.AccountName, string(v.AccountType), v.ParentAccountID, v.IsControlAccount,
+		v.DirectPostingRestricted, v.Status, v.EffectiveFrom, v.EffectiveTo,
+		v.ChangeKind, nullableString(v.ChangeReason), v.EvidenceRefs, v.CreatedAt, v.CreatedByPrincipalID)
+	return mapPgError(err)
+}
+
+func closeCurrentAccountVersion(ctx context.Context, tx pgx.Tx, tenantID, accountID string, at time.Time) error {
+	_, err := tx.Exec(ctx, `
+		UPDATE account_versions SET effective_to = $1
+		WHERE tenant_id = $2 AND account_id = $3 AND effective_to IS NULL
+	`, at, tenantID, accountID)
+	return mapPgError(err)
+}
+
+func nullableString(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
+}
+
+func accountVersionFromAccount(a *domain.Account, version int64, effectiveFrom time.Time, changeKind, reason, principalID string, evidence []string) *domain.AccountVersion {
+	return &domain.AccountVersion{
+		AccountVersionID:        uuid.NewString(),
+		AccountID:               a.AccountID,
+		TenantID:                a.TenantID,
+		AccountCode:             a.AccountCode,
+		Version:                 version,
+		AccountName:             a.AccountName,
+		AccountType:             a.AccountType,
+		ParentAccountID:         a.ParentAccountID,
+		IsControlAccount:        a.IsControlAccount,
+		DirectPostingRestricted: a.DirectPostingRestricted,
+		Status:                  a.Status,
+		EffectiveFrom:           effectiveFrom,
+		ChangeKind:              changeKind,
+		ChangeReason:            reason,
+		EvidenceRefs:            evidence,
+		CreatedAt:               time.Now().UTC(),
+		CreatedByPrincipalID:    principalID,
+	}
 }
 
 func (s *PgStore) CreateAccount(ctx context.Context, a *domain.Account) error {
@@ -1127,16 +1202,21 @@ func (s *PgStore) CreateAccount(ctx context.Context, a *domain.Account) error {
 				return domain.ErrParentAccountNotFound
 			}
 		}
+		a.Version = 1
 		_, err := tx.Exec(ctx, `
 			INSERT INTO chart_of_accounts (
 				account_id, tenant_id, account_code, account_name, account_type,
 				parent_account_id, is_control_account, direct_posting_restricted, status,
-				created_at, created_by_principal_id
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+				created_at, created_by_principal_id, version
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 		`, a.AccountID, tenantID, a.AccountCode, a.AccountName, string(a.AccountType),
 			a.ParentAccountID, a.IsControlAccount, a.DirectPostingRestricted, a.Status,
-			a.CreatedAt, a.CreatedByPrincipalID)
-		return mapPgError(err)
+			a.CreatedAt, a.CreatedByPrincipalID, a.Version)
+		if err != nil {
+			return mapPgError(err)
+		}
+		return insertAccountVersion(ctx, tx, accountVersionFromAccount(
+			a, 1, a.CreatedAt, "CREATED", "initial version", a.CreatedByPrincipalID, nil))
 	})
 	if err != nil {
 		var pgErr *pgconn.PgError
@@ -1146,6 +1226,110 @@ func (s *PgStore) CreateAccount(ctx context.Context, a *domain.Account) error {
 		return err
 	}
 	return nil
+}
+
+// accountForUpdate loads the current head row under a row lock. Every
+// version-producing command takes this lock before reading the version it is
+// about to supersede, so two concurrent writers cannot both append from the
+// same expected version.
+func accountForUpdate(ctx context.Context, tx pgx.Tx, tenantID, accountCode string) (*domain.Account, error) {
+	row := tx.QueryRow(ctx, `SELECT `+accountColumns+` FROM chart_of_accounts
+		WHERE tenant_id = $1 AND account_code = $2 FOR UPDATE`, tenantID, accountCode)
+	return scanAccount(row)
+}
+
+func currentAccountVersionEffectiveFrom(ctx context.Context, tx pgx.Tx, tenantID, accountID string) (time.Time, error) {
+	var effectiveFrom time.Time
+	err := tx.QueryRow(ctx, `
+		SELECT effective_from FROM account_versions
+		WHERE tenant_id = $1 AND account_id = $2 AND effective_to IS NULL
+	`, tenantID, accountID).Scan(&effectiveFrom)
+	return effectiveFrom, err
+}
+
+// AmendAccountVersion appends a new immutable version and advances the head
+// row in the same transaction. The head row is a projection for existing
+// readers; history lives only in account_versions. expectedVersion, when
+// non-zero, is an optimistic-concurrency guard and is checked under the row
+// lock, not before it.
+func (s *PgStore) AmendAccountVersion(
+	ctx context.Context,
+	tenantID, accountCode string,
+	expectedVersion int64,
+	effectiveFrom time.Time,
+	a *domain.Account,
+	reason string,
+	evidenceRefs []string,
+	principalID string,
+) (*domain.Account, error) {
+	var out *domain.Account
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		cur, err := accountForUpdate(ctx, tx, tenantID, accountCode)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrAccountNotFound
+		}
+		if err != nil {
+			return mapPgError(err)
+		}
+		if expectedVersion > 0 && cur.Version != expectedVersion {
+			return domain.ErrAccountVersionConflict
+		}
+
+		effective := effectiveFrom
+		if effective.IsZero() {
+			effective = time.Now().UTC()
+		}
+		currentEffectiveFrom, err := currentAccountVersionEffectiveFrom(ctx, tx, tenantID, cur.AccountID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			// A pre-000016 row should have been backfilled; this fallback keeps
+			// the command usable even if a row was inserted outside the service.
+			currentEffectiveFrom = cur.CreatedAt
+		} else if err != nil {
+			return mapPgError(err)
+		}
+		if effective.Before(currentEffectiveFrom) {
+			return domain.ErrAccountEffectiveDate
+		}
+
+		updated := *cur
+		updated.AccountName = a.AccountName
+		updated.AccountType = a.AccountType
+		updated.ParentAccountID = a.ParentAccountID
+		updated.IsControlAccount = a.IsControlAccount
+		updated.DirectPostingRestricted = a.DirectPostingRestricted
+		updated.Status = a.Status
+		updated.Version = cur.Version + 1
+
+		if err := closeCurrentAccountVersion(ctx, tx, tenantID, cur.AccountID, effective); err != nil {
+			return err
+		}
+		if err := insertAccountVersion(ctx, tx, accountVersionFromAccount(
+			&updated, updated.Version, effective, "AMENDED", reason, principalID, evidenceRefs)); err != nil {
+			return err
+		}
+
+		tag, err := tx.Exec(ctx, `
+			UPDATE chart_of_accounts
+			SET account_name = $1, account_type = $2, parent_account_id = $3,
+			    is_control_account = $4, direct_posting_restricted = $5,
+			    status = $6, version = $7
+			WHERE tenant_id = $8 AND account_code = $9 AND version = $10
+		`, updated.AccountName, string(updated.AccountType), updated.ParentAccountID,
+			updated.IsControlAccount, updated.DirectPostingRestricted, updated.Status,
+			updated.Version, tenantID, accountCode, cur.Version)
+		if err != nil {
+			return mapPgError(err)
+		}
+		if tag.RowsAffected() == 0 {
+			return domain.ErrAccountVersionConflict
+		}
+		out = &updated
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (s *PgStore) GetAccountByCode(ctx context.Context, tenantID, accountCode string) (*domain.Account, error) {
