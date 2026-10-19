@@ -86,6 +86,9 @@ func main() {
 // configBody strips the leading provenance comment block (comment/blank lines)
 // so drift comparison ignores the always-changing timestamp/commit header.
 func configBody(s string) string {
+	// Git may check the artefact out with CRLF on Windows. Normalise before
+	// splitting so drift is a content difference, not a line-ending difference.
+	s = strings.ReplaceAll(s, "\r\n", "\n")
 	lines := strings.Split(s, "\n")
 	i := 0
 	for i < len(lines) {
