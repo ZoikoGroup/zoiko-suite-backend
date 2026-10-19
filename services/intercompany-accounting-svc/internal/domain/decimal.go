@@ -52,6 +52,21 @@ func CanonicalAmount(r *big.Rat) string {
 	return s
 }
 
+// ExactDecimal renders r as a Decimal without losing anything: a value
+// CanonicalAmount's 12-place rendering would round is refused instead of
+// returned as a different number. Every amount a NUMERIC(18,4) column can
+// hold, and any sum or difference of such amounts, renders exactly; the
+// guard exists so no reader can quietly introduce a rounding path on the way
+// out (SPEC_DEVIATIONS A1/B10).
+func ExactDecimal(r *big.Rat) (Decimal, error) {
+	d := Decimal(CanonicalAmount(r))
+	back, err := d.Rat()
+	if err != nil || back.Cmp(r) != 0 {
+		return "", fmt.Errorf("amount %s has no exact decimal rendering", r.RatString())
+	}
+	return d, nil
+}
+
 // jsonNumberRe is the JSON number grammar (RFC 8259 §6). big.Rat.SetString
 // also accepts fractions ("1/3"), which are not amounts; this rejects them.
 var jsonNumberRe = regexp.MustCompile(`^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?$`)

@@ -3,6 +3,7 @@ package domain_test
 import (
 	"encoding/json"
 	"errors"
+	"math/big"
 	"strings"
 	"testing"
 
@@ -82,6 +83,32 @@ func TestValidatePositiveAmount(t *testing.T) {
 	for d, want := range cases {
 		if _, err := domain.ValidatePositiveAmount(d); !errors.Is(err, want) {
 			t.Errorf("%q: got %v, want %v", d, err, want)
+		}
+	}
+}
+
+// ExactDecimal refuses anything CanonicalAmount's 12-place rendering would
+// round — a reader must not be able to introduce a silent rounding path —
+// while every amount NUMERIC(18,4) can hold, and any sum of such amounts,
+// renders exactly (SPEC_DEVIATIONS A1/B10).
+func TestExactDecimal(t *testing.T) {
+	ok := []string{"0.0001", "5000", "99999999999999.9999", "100000000000000", "-70.0002"}
+	for _, in := range ok {
+		r, err := domain.ParseAmount(in)
+		if err != nil {
+			t.Fatalf("%s: %v", in, err)
+		}
+		d, err := domain.ExactDecimal(r)
+		if err != nil || string(d) != in {
+			t.Errorf("%s: got %q, %v", in, d, err)
+		}
+	}
+	for name, r := range map[string]*big.Rat{
+		"thirteen decimal places": big.NewRat(1, 10000000000000),
+		"a rational":              big.NewRat(1, 3),
+	} {
+		if _, err := domain.ExactDecimal(r); err == nil {
+			t.Errorf("%s: expected a refusal, got an exact-looking decimal", name)
 		}
 	}
 }

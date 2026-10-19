@@ -31,14 +31,17 @@ reconciliation-engine-svc holds for DATA-07.
 
 ## A. Not implemented / weaker than the spec
 
-- **A1. `GetReciprocalBalances` is not implemented.** No endpoint aggregates
-  intercompany positions by entity pair (A owes B / B owes A, net, by currency,
-  by status). Consolidation therefore cannot ask "what is the matched reciprocal
-  balance between X and Y for this period", and has to fetch every entry and
-  add them up itself (see consolidation-svc A5). Scope: `GET
-  /v1/intercompany/reciprocal-balances?entity_a=&entity_b=&period=` returning
-  per-direction and net totals split by `match_status`, authorized on both
-  entities. This needs a period on the pair first (A4).
+- **A1. `GetReciprocalBalances` is not implemented. — Closed (B10).** `GET
+  /v1/intercompany/reciprocal-balances?entity_a=&entity_b=&period=` returns
+  the period's intercompany positions between the two entities, split by
+  `match_status`: each direction's totals by currency (A's source side
+  against B, and B's against A) and their net per currency, summed exactly
+  (`domain.SumAmounts`, `big.Rat`; migration 000005's `fiscal_period` is
+  required) and never combined across currencies. Authorized on **both**
+  entities; CLOSED is included — it was a real settled position (B10).
+  Consolidation's elimination bound (consolidation-svc A5) can now read this
+  instead of fetching every entry and adding them up itself; moving it onto
+  this endpoint is that service's change, not this one.
 - **A2. `ListUnmatchedIntercompany` does not exist as such; the list endpoint
   that stands in for it is unscoped.** `GET /v1/intercompany/entries` has no
   status filter, no period filter and no pagination. When neither
@@ -284,3 +287,43 @@ reconciliation-engine-svc holds for DATA-07.
   - *Events.* The `mismatch-detected` event payload still carries
     `mismatch_reason`. `failed_rule` is in the HTTP response and the
     explanation, and is not yet added to the event (A7 owns the event set).
+- **B10. How reciprocal balances are aggregated (A1).**
+  - *What is summed.* Each pair contributes its own (source) side,
+    `amount`/`currency_code`, grouped by `(source_legal_entity_id,
+    target_legal_entity_id, currency_code, match_status)` and summed in Go
+    with `domain.SumAmounts` (`big.Rat`), never in SQL and never through
+    float64. "Entity A to entity B" is the pairs whose source is entity_a
+    (the originating side); the other direction is the pairs sourced from
+    entity_b. Net is A's direction minus B's, per currency.
+  - *Currencies are never combined.* A USD total and a GBP total are
+    separate entries in every direction and in the net; a currency carried
+    by one direction only gets a signed net of its own, and a zero net is
+    stated rather than omitted. A cross-currency pair's counterparty side is
+    what the target is expected to book (B7), not a second amount in the
+    source side's currency: there is no FX rate source to translate it
+    with, so it is not folded into any total.
+  - *CLOSED counts.* It is the terminal state of a MATCHED pair — a real
+    settled position, the same reasoning that keeps it eliminable in
+    consolidation-svc (B8).
+  - *The period is required and exact.* Only pairs carrying the requested
+    `fiscal_period` are aggregated. A pair with a NULL period (pre-000005,
+    or a caller that sends none) belongs to no period: it is left out of
+    every period's answer rather than attributed to one, the same choice A4
+    made when it refused to invent a period.
+  - *Refused rather than rounded.* A total that `CanonicalAmount`'s
+    12-place rendering would round is refused by `ExactDecimal` instead of
+    returned, and an amount NUMERIC(18,4) would round cannot be stored in
+    the first place (`ValidatePositiveAmount`, B7) — so the answer is the
+    exact sum of the stored amounts or an error, never a different number. A
+    sum may exceed one column's NUMERIC(18,4) range (it is not being
+    stored); it is still returned in full.
+  - *Answer shape.* One entry per `match_status` present, in the spec's own
+    state-model order; an empty direction is `[]`, never null, and a pair
+    with no positions in the period is an empty `by_match_status`. A store
+    error is a 503, never an empty or partial answer.
+  - *Route and controls.* `GET /v1/intercompany/reciprocal-balances` (the
+    house REST form, B5). The spec's command table marks GetReciprocalBalances
+    a QUERY — "Scoped read; correlation + auth context" — so there is no
+    Idempotency-Key: the envelope's write rule (INV-08) does not apply to a
+    read. The read is checked with `INTERCOMPANY_ENTRY_VIEW` on both
+    entities, the same two-entity shape as `ClosePair` (B8).

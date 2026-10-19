@@ -28,6 +28,10 @@ type Store interface {
 	CreateEntry(ctx context.Context, entry *domain.IntercompanyEntry, actorID, correlationID string) (created bool, err error)
 	GetEntry(ctx context.Context, id string) (*domain.IntercompanyEntry, error)
 	ListEntries(ctx context.Context, sourceEntityID, targetEntityID string) ([]domain.IntercompanyEntry, error)
+	// ReciprocalBalances is GetReciprocalBalances' read (SPEC_DEVIATIONS A1):
+	// the period's exact per-currency totals between one pair of legal
+	// entities, grouped by direction, currency and match status.
+	ReciprocalBalances(ctx context.Context, entityA, entityB, period string) ([]domain.ReciprocalBalanceGroup, error)
 	// UpdateMatch persists entry's target state and, in the same
 	// transaction, the attempt that produced it and the "posted" or
 	// "mismatch.detected" event that state implies.
@@ -111,6 +115,7 @@ func (h *Handler) WithEntityRegistry(c EntityRegistryClient) *Handler {
 
 func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Get("/v1/control-populations/{population}", h.GetControlPopulation)
+	r.Get("/v1/intercompany/reciprocal-balances", h.GetReciprocalBalances)
 	r.Route("/v1/intercompany/entries", func(r chi.Router) {
 		r.Post("/", h.CreateEntry)
 		r.Get("/", h.ListEntries)
@@ -298,6 +303,63 @@ func (h *Handler) ListEntries(w http.ResponseWriter, r *http.Request) {
 		list = []domain.IntercompanyEntry{}
 	}
 	writeJSON(w, http.StatusOK, list)
+}
+
+// ── GET /v1/intercompany/reciprocal-balances ─────────────────────────────────────
+
+// GetReciprocalBalances is ACC-11's own GetReciprocalBalances query
+// (SPEC_DEVIATIONS A1). It answers with the period's intercompany positions
+// between two legal entities, split by match_status: each direction's totals
+// by currency and their net per currency, all exact decimals. CLOSED counts
+// — a closed pair was a real settled position, the same reasoning that keeps
+// it eliminable in consolidation-svc.
+//
+// Authorized on BOTH entities: a reciprocal balance is both sides' position,
+// so a principal entitled on one side only may not read the other's. Same
+// two-entity check as ClosePair.
+func (h *Handler) GetReciprocalBalances(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	entityA, entityB, period := q.Get("entity_a"), q.Get("entity_b"), q.Get("period")
+
+	if entityA == "" || entityB == "" || period == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "entity_a, entity_b and period are required")
+		return
+	}
+	if entityA == entityB {
+		writeError(w, http.StatusBadRequest, "same_entity_forbidden", string(domain.ErrSameEntityForbidden))
+		return
+	}
+	if !domain.ValidFiscalPeriod(period) {
+		writeError(w, http.StatusBadRequest, "invalid_fiscal_period", domain.ErrInvalidFiscalPeriod.Error())
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+
+	for _, entityID := range []string{entityA, entityB} {
+		if err := h.authz.CheckAllowed(r.Context(), principalID, entityID, actionViewEntry); err != nil {
+			h.writeAuthzErr(w, err)
+			return
+		}
+	}
+
+	groups, err := h.store.ReciprocalBalances(r.Context(), entityA, entityB, period)
+	if err != nil {
+		h.log.Error("failed to aggregate reciprocal balances", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	balances, err := domain.BuildReciprocalBalances(entityA, entityB, period, groups)
+	if err != nil {
+		h.log.Error("stored intercompany amount is unreadable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, balances)
 }
 
 // ── GET /v1/intercompany/entries/{id} ────────────────────────────────────────────
