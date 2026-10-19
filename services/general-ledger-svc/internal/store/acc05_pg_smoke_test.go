@@ -151,7 +151,7 @@ func TestPgStore_ACC05_RebuildDerivedBalanceProjection_RealDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("QueryAccountBalance: %v", err)
 	}
-	if bal.DebitTotal != 100 || bal.NetBalance != 100 {
+	if bal.DebitTotal != "100.00" || bal.NetBalance != "100.00" {
 		t.Fatalf("expected account 1000 debit 100 / net 100, got %+v", bal)
 	}
 
@@ -167,7 +167,7 @@ func TestPgStore_ACC05_RebuildDerivedBalanceProjection_RealDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("QueryAccountBalance after corruption: %v", err)
 	}
-	if bal.NetBalance != -1 {
+	if bal.NetBalance != "-1.00" {
 		t.Fatalf("expected corrupted value -1 to be visible before rebuild, got %v", bal.NetBalance)
 	}
 
@@ -182,7 +182,7 @@ func TestPgStore_ACC05_RebuildDerivedBalanceProjection_RealDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("QueryAccountBalance after rebuild: %v", err)
 	}
-	if bal.NetBalance != 100 {
+	if bal.NetBalance != "100.00" {
 		t.Fatalf("expected rebuild to restore net_balance 100 from entries, got %v", bal.NetBalance)
 	}
 }

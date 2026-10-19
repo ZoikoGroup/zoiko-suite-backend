@@ -15,12 +15,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"net/http"
 	"net/url"
-	"strconv"
 	"time"
 
+	"github.com/go-chi/chi/v5/middleware"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
+	"zoiko.io/reconciliation-intelligence-svc/internal/domain"
+	svcenvelope "zoiko.io/reconciliation-intelligence-svc/internal/envelope"
 )
 
 // ErrServiceUnavailable is returned for any transport error, non-200
@@ -61,42 +65,94 @@ type listTolerancePoliciesResponse struct {
 // ErrServiceUnavailable; a reachable service with no policy configured
 // yet returns ErrToleranceNotConfigured. Neither case ever falls back
 // to a guessed default — see the package doc comment.
-func (c *Client) GetActiveAbsoluteTolerance(ctx context.Context, tenantID, principalID, legalEntityID, metric string) (float64, error) {
+//
+// financial-control-svc returns the tolerance as an exact decimal string;
+// it is parsed straight into a big.Rat, never float64 (ZS-DATA-001 D06),
+// so the governed limit a suggestion is compared against is the exact
+// value that was approved. A negative tolerance is malformed and also
+// fails closed.
+func (c *Client) GetActiveAbsoluteTolerance(ctx context.Context, tenantID, principalID, legalEntityID, metric string) (*big.Rat, error) {
 	q := url.Values{"legal_entity_id": {legalEntityID}, "metric": {metric}}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/controls/v1/tolerance-policies?"+q.Encode(), nil)
 	if err != nil {
-		return 0, ErrServiceUnavailable
+		return nil, ErrServiceUnavailable
 	}
-	req.Header.Set("X-Tenant-Id", tenantID)
-	req.Header.Set("X-Principal-Id", principalID)
+	setEnvelopeHeaders(ctx, req, tenantID, principalID, legalEntityID)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		if c.logger != nil {
 			c.logger.Error("financial-control-svc unreachable — failing closed", zap.Error(err))
 		}
-		return 0, ErrServiceUnavailable
+		return nil, ErrServiceUnavailable
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return 0, ErrServiceUnavailable
+		return nil, ErrServiceUnavailable
 	}
 
 	var out listTolerancePoliciesResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return 0, ErrServiceUnavailable
+		return nil, ErrServiceUnavailable
 	}
 	if len(out.Items) == 0 {
-		return 0, ErrToleranceNotConfigured
+		return nil, ErrToleranceNotConfigured
 	}
 
 	// ListTolerancePolicies orders by (metric, tolerance_version)
 	// ascending, and CreateTolerancePolicy never edits a prior version
 	// in place — the last item is the current policy.
 	latest := out.Items[len(out.Items)-1]
-	tolerance, err := strconv.ParseFloat(latest.AbsoluteTolerance, 64)
-	if err != nil {
-		return 0, fmt.Errorf("%w: malformed absolute_tolerance %q", ErrServiceUnavailable, latest.AbsoluteTolerance)
+	tolerance, err := domain.ParseAmount(latest.AbsoluteTolerance)
+	if err != nil || tolerance.Sign() < 0 {
+		return nil, fmt.Errorf("%w: malformed absolute_tolerance %q", ErrServiceUnavailable, latest.AbsoluteTolerance)
 	}
 	return tolerance, nil
+}
+
+// setEnvelopeHeaders forwards the canonical service input envelope
+// (ZS-ARCH-SVC-001 §4). financial-control-svc requires tenant, actor,
+// request id, correlation id and source channel on every request, reads
+// included. Same pattern as internal/bankrec: the caller's values from the
+// envelope in context, an id minted only when none was supplied.
+func setEnvelopeHeaders(ctx context.Context, req *http.Request, tenantID, principalID, legalEntityID string) {
+	req.Header.Set(svcenvelope.HeaderTenantID, tenantID)
+	req.Header.Set(svcenvelope.HeaderActorSubjectID, principalID)
+	if legalEntityID != "" {
+		req.Header.Set(svcenvelope.HeaderLegalEntityID, legalEntityID)
+	}
+
+	requestID := middleware.GetReqID(ctx)
+	// Service-to-service. "system" is in the contract's accepted set; the
+	// caller's own channel replaces it when the envelope carries one.
+	sourceChannel := string(svcenvelope.ChannelSystem)
+	correlationID := ""
+	if env, ok := svcenvelope.FromContext(ctx); ok {
+		if env.RequestID != "" {
+			requestID = env.RequestID
+		}
+		if env.SourceChannel != "" {
+			sourceChannel = string(env.SourceChannel)
+		}
+		// An external channel (import, integration) obliges source_system;
+		// forwarding the channel without it would violate the contract.
+		if env.SourceSystem != "" {
+			req.Header.Set(svcenvelope.HeaderSourceSystem, env.SourceSystem)
+		}
+		if env.CorrelationID != "" {
+			correlationID = env.CorrelationID
+		}
+		if env.CausationID != "" {
+			req.Header.Set(svcenvelope.HeaderCausationID, env.CausationID)
+		}
+	}
+	if requestID == "" {
+		requestID = uuid.NewString()
+	}
+	if correlationID == "" {
+		correlationID = uuid.NewString()
+	}
+	req.Header.Set(svcenvelope.HeaderRequestID, requestID)
+	req.Header.Set(svcenvelope.HeaderCorrelationID, correlationID)
+	req.Header.Set(svcenvelope.HeaderSourceChannel, sourceChannel)
 }

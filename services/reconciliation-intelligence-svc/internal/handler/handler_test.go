@@ -7,62 +7,8 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"go.uber.org/zap"
-	"zoiko.io/reconciliation-intelligence-svc/internal/authz"
 	"zoiko.io/reconciliation-intelligence-svc/internal/domain"
-	"zoiko.io/reconciliation-intelligence-svc/internal/events"
-	"zoiko.io/reconciliation-intelligence-svc/internal/financialcontrol"
-	"zoiko.io/reconciliation-intelligence-svc/internal/handler"
-	"zoiko.io/reconciliation-intelligence-svc/internal/store"
 )
-
-// newGrantingAuthzServer stands in for authorization-svc in tests: it
-// always grants, matching the real service's contract of always returning
-// HTTP 200 with a decision in the body.
-func newGrantingAuthzServer(t *testing.T) *httptest.Server {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]string{"decision_outcome": "GRANTED"})
-	}))
-	t.Cleanup(srv.Close)
-	return srv
-}
-
-// newFixedToleranceServer stands in for financial-control-svc in tests:
-// it always answers with one TolerancePolicy whose absolute_tolerance
-// is "50" for MetricAmountMismatchWriteOffTolerance and "10" for
-// MetricMissingReferenceTolerance — the same values the heuristic used
-// to have hardcoded, so existing test expectations ($X above/below $50
-// or $10) continue to hold without each test needing its own fake
-// policy setup.
-func newFixedToleranceServer(t *testing.T) *httptest.Server {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		metric := r.URL.Query().Get("metric")
-		tolerance := "50"
-		if metric == domain.MetricMissingReferenceTolerance {
-			tolerance = "10"
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"items": []map[string]any{{"tolerance_version": 1, "absolute_tolerance": tolerance}},
-		})
-	}))
-	t.Cleanup(srv.Close)
-	return srv
-}
-
-func setupTestRouter(t *testing.T) http.Handler {
-	logger := zap.NewNop()
-	memStore := store.NewMemoryStore()
-	publisher := events.NewPublisher([]string{"localhost:9092"}, "zoiko.reconciliation-intelligence.events", logger)
-	authzSrv := newGrantingAuthzServer(t)
-	authzClient := authz.NewClient(authzSrv.URL, logger)
-	financialControlSrv := newFixedToleranceServer(t)
-	financialControlClient := financialcontrol.NewClient(financialControlSrv.URL, logger)
-	h := handler.NewHandler(memStore, publisher, authzClient, financialControlClient, logger)
-
-	return handler.NewRouter(h)
-}
 
 func TestHealthCheck(t *testing.T) {
 	router := setupTestRouter(t)
@@ -90,25 +36,8 @@ func TestHealthCheck(t *testing.T) {
 func TestAnalyzeAndLifecycleReconciliation(t *testing.T) {
 	router := setupTestRouter(t)
 
-	// 1. Analyze Reconciliation
-	analyzeReq := domain.AnalyzeReconciliationRequest{
-		LegalEntityID: "LE-3003",
-		JobName:       "Bank Reconciliation Match Q3",
-		SourceSystemA: domain.SourceGeneralLedger,
-		SourceSystemB: domain.SourceBankStatement,
-		TransactionsA: []domain.TransactionItem{
-			{RefID: "TX-101", Amount: 500.00, Date: "2026-07-01"},
-			{RefID: "TX-102", Amount: 1200.50, Date: "2026-07-02"}, // Mismatch
-			{RefID: "TX-103", Amount: 75.00, Date: "2026-07-03"},   // Missing in B
-		},
-		TransactionsB: []domain.TransactionItem{
-			{RefID: "TX-101", Amount: 500.00, Date: "2026-07-01"},
-			{RefID: "TX-102", Amount: 1220.50, Date: "2026-07-02"}, // Difference = 20.00
-		},
-	}
-
-	body, _ := json.Marshal(analyzeReq)
-	req := httptest.NewRequest(http.MethodPost, "/v1/reconciliations/analyze", bytes.NewBuffer(body))
+	// 1. Analyze the UNMATCHED lines of a bank-reconciliation run.
+	req := httptest.NewRequest(http.MethodPost, "/v1/reconciliations/analyze", bytes.NewBuffer(analyzeBody("LE-3003", runLE3003)))
 	withEnvelope(req)
 	req.Header.Set("X-Tenant-ID", "tenant-rec-88")
 	req.Header.Set("Content-Type", "application/json")
@@ -129,9 +58,16 @@ func TestAnalyzeAndLifecycleReconciliation(t *testing.T) {
 	if job.ID == "" {
 		t.Fatalf("expected non-empty job ID")
 	}
-
-	if job.MatchedCount != 1 || job.UnmatchedCount != 2 {
-		t.Fatalf("expected 1 matched and 2 unmatched, got %d matched and %d unmatched", job.MatchedCount, job.UnmatchedCount)
+	if job.BankReconciliationRunID != runLE3003 {
+		t.Fatalf("job not traceable to its run: bank_reconciliation_run_id = %q", job.BankReconciliationRunID)
+	}
+	if job.TotalProcessedCount != 2 || job.UnmatchedCount != 2 || len(job.UnmatchedItems) != 2 {
+		t.Fatalf("expected both UNMATCHED lines processed and suggested on, got processed %d, unmatched %d, items %d",
+			job.TotalProcessedCount, job.UnmatchedCount, len(job.UnmatchedItems))
+	}
+	if job.UnmatchedItems[0].StatementLineID != "sl-3003-a" || job.UnmatchedItems[1].StatementLineID != "sl-3003-b" {
+		t.Fatalf("suggestions not traceable to their statement lines: %q, %q",
+			job.UnmatchedItems[0].StatementLineID, job.UnmatchedItems[1].StatementLineID)
 	}
 
 	// 2. Get Job by ID
@@ -143,14 +79,14 @@ func TestAnalyzeAndLifecycleReconciliation(t *testing.T) {
 	router.ServeHTTP(getRec, getReq)
 
 	if getRec.Code != http.StatusOK {
-		t.Fatalf("expected status 200 OK, got %d", getRec.Code)
+		t.Fatalf("expected status 200 OK, got %d: %s", getRec.Code, getRec.Body.String())
 	}
 
 	// 3. Apply Resolution
 	itemId := job.UnmatchedItems[0].ID
 	applyBody, _ := json.Marshal(domain.ApplyResolutionRequest{
 		ResolutionStatus: domain.StatusApproved,
-		ResolutionNotes:  "Approved write-off of $20.00 timing difference",
+		ResolutionNotes:  "Reviewed; matched manually in bank reconciliation",
 	})
 
 	applyReq := httptest.NewRequest(http.MethodPost, "/v1/reconciliations/"+job.ID+"/resolutions/"+itemId+"/apply", bytes.NewBuffer(applyBody))
@@ -175,7 +111,7 @@ func TestAnalyzeAndLifecycleReconciliation(t *testing.T) {
 	router.ServeHTTP(listRec, listReq)
 
 	if listRec.Code != http.StatusOK {
-		t.Fatalf("expected status 200 OK, got %d", listRec.Code)
+		t.Fatalf("expected status 200 OK, got %d: %s", listRec.Code, listRec.Body.String())
 	}
 
 	// 5. Archive Job

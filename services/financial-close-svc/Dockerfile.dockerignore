@@ -1,0 +1,6 @@
+# Build context is services/ (see Dockerfile). Send only what the build reads.
+*
+!financial-close-svc
+!eventing
+financial-close-svc/deployments
+**/*_test.go

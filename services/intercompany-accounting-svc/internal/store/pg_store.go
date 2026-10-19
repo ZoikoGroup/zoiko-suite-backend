@@ -8,16 +8,89 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"zoiko.io/eventing/envelope"
+	"zoiko.io/eventing/outbox"
 	"zoiko.io/intercompany-accounting-svc/internal/domain"
 	svcmiddleware "zoiko.io/intercompany-accounting-svc/internal/middleware"
 )
 
 type PgStore struct {
 	pool *pgxpool.Pool
+
+	// eventRegion is the residencyregion stamped on every intercompany event.
+	// Empty means no region was configured, and every event-emitting write
+	// then fails (envelope.New refuses it) rather than emitting an event
+	// with a guessed region.
+	eventRegion string
 }
 
-func New(pool *pgxpool.Pool) *PgStore {
-	return &PgStore{pool: pool}
+// Option configures a PgStore.
+type Option func(*PgStore)
+
+// WithEventRegion sets the residency region carried by emitted events
+// (config EVENT_RESIDENCY_REGION).
+func WithEventRegion(region string) Option {
+	return func(s *PgStore) { s.eventRegion = region }
+}
+
+func New(pool *pgxpool.Pool, opts ...Option) *PgStore {
+	s := &PgStore{pool: pool}
+	for _, o := range opts {
+		o(s)
+	}
+	return s
+}
+
+// enqueueEntryEvent writes one intercompany-entry lifecycle event to the
+// transactional outbox inside tx, the transaction that made the change it
+// reports (ZS-EVENT-001 §6: state change and outbox record are one local
+// atomic transaction).
+//
+// legalEntityID is deliberately left empty: domain.IntercompanyEntry is
+// inherently two-entity (SourceLegalEntityID and TargetLegalEntityID), so it
+// has no single canonical legal_entity_id. Both remain explicit named
+// fields inside the payload instead.
+func (s *PgStore) enqueueEntryEvent(ctx context.Context, tx pgx.Tx, fact, legacyType, actorID, correlationID string, entry *domain.IntercompanyEntry) error {
+	data := map[string]any{
+		"intercompany_entry_id":  entry.IntercompanyEntryID,
+		"tenant_id":              entry.TenantID,
+		"source_legal_entity_id": entry.SourceLegalEntityID,
+		"target_legal_entity_id": entry.TargetLegalEntityID,
+		"source_journal_id":      entry.SourceJournalID,
+		"amount":                 entry.Amount,
+		"currency_code":          entry.CurrencyCode,
+		"match_status":           entry.MatchStatus,
+		"timestamp":              time.Now().UTC(),
+	}
+	if entry.TargetJournalID != nil {
+		data["target_journal_id"] = *entry.TargetJournalID
+	}
+	if entry.MismatchReason != nil {
+		data["mismatch_reason"] = *entry.MismatchReason
+	}
+	env, err := envelope.New(envelope.Spec{
+		Type:            "com.zoikosuite.accounting.intercompany-entry." + fact,
+		LegacyType:      legacyType,
+		Service:         "intercompany-accounting-svc",
+		SchemaVersion:   "1.0.0",
+		OccurredAt:      time.Now().UTC(),
+		TenantID:        entry.TenantID,
+		AggregateType:   "intercompany-entry",
+		AggregateID:     entry.IntercompanyEntryID,
+		CorrelationID:   correlationID,
+		ActorID:         actorID,
+		ResidencyRegion: s.eventRegion,
+		// Intercompany entries are financial records of a tenant's books.
+		Classification: envelope.Confidential,
+		Data:           data,
+	})
+	if err != nil {
+		return fmt.Errorf("build intercompany.%s event: %w", fact, err)
+	}
+	if err := outbox.Enqueue(ctx, tx, env); err != nil {
+		return fmt.Errorf("enqueue intercompany.%s event: %w", fact, err)
+	}
+	return nil
 }
 
 func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(tx pgx.Tx) error) error {
@@ -50,7 +123,7 @@ func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(tx pgx.T
 // unique index added in 000002 and resolves to the ORIGINAL entry —
 // mutating *entry in place to reflect it — rather than creating a
 // duplicate. Returns created=false when the row already existed.
-func (s *PgStore) CreateEntry(ctx context.Context, entry *domain.IntercompanyEntry) (created bool, err error) {
+func (s *PgStore) CreateEntry(ctx context.Context, entry *domain.IntercompanyEntry, actorID, correlationID string) (created bool, err error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
 		return false, domain.ErrIdentityMissing
@@ -82,8 +155,14 @@ func (s *PgStore) CreateEntry(ctx context.Context, entry *domain.IntercompanyEnt
 			); err != nil {
 				return err
 			}
+			// Replay of a prior request for the same source_journal_id —
+			// the original row's own creation already enqueued this event.
 			created = false
 			return nil
+		}
+		entry.TenantID = tenantID
+		if err := s.enqueueEntryEvent(ctx, tx, "created", "intercompany.entry.created", actorID, correlationID, entry); err != nil {
+			return err
 		}
 		created = true
 		return nil
@@ -257,7 +336,18 @@ func (s *PgStore) ListEntries(ctx context.Context, sourceEntityID, targetEntityI
 	return out, nil
 }
 
-func (s *PgStore) UpdateMatch(ctx context.Context, id, targetJournalID, matchStatus string, mismatchReason *string) error {
+// UpdateMatch records a MatchIntercompany outcome and, in the same
+// transaction, enqueues the lifecycle event that outcome implies: "posted"
+// for MATCHED, "mismatch.detected" for MISMATCH. entry must already carry
+// the target state the caller wants persisted (TargetJournalID, MatchStatus,
+// MismatchReason) — see handler.go's MatchEntry, which mutates its locally
+// fetched entry before calling this.
+//
+// Guarded on the CURRENT status being one of domain.MatchableStatuses, the
+// same compare-and-set the other lifecycle methods use: without it, a pair
+// disputed or matched by another request after the handler read it would be
+// silently overwritten. Returns domain.ErrInvalidPairTransition in that case.
+func (s *PgStore) UpdateMatch(ctx context.Context, entry *domain.IntercompanyEntry, actorID, correlationID string) error {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
 		return domain.ErrIdentityMissing
@@ -268,14 +358,36 @@ func (s *PgStore) UpdateMatch(ctx context.Context, id, targetJournalID, matchSta
 		res, err := tx.Exec(ctx, `
 			UPDATE intercompany_entries
 			SET target_journal_id = $1, match_status = $2, mismatch_reason = $3, updated_at = $4
-			WHERE intercompany_entry_id = $5 AND tenant_id = $6
-		`, targetJournalID, matchStatus, mismatchReason, now, id, tenantID)
+			WHERE intercompany_entry_id = $5 AND tenant_id = $6 AND match_status = ANY($7)
+		`, entry.TargetJournalID, entry.MatchStatus, entry.MismatchReason, now, entry.IntercompanyEntryID, tenantID, domain.MatchableStatuses)
 		if err != nil {
 			return err
 		}
 		if res.RowsAffected() == 0 {
-			return domain.ErrEntryNotFound
+			var exists bool
+			if err := tx.QueryRow(ctx, `
+				SELECT EXISTS (SELECT 1 FROM intercompany_entries WHERE intercompany_entry_id = $1 AND tenant_id = $2)
+			`, entry.IntercompanyEntryID, tenantID).Scan(&exists); err != nil {
+				return err
+			}
+			if !exists {
+				return domain.ErrEntryNotFound
+			}
+			return domain.ErrInvalidPairTransition
 		}
-		return nil
+		entry.TenantID = tenantID
+		entry.UpdatedAt = now
+
+		switch entry.MatchStatus {
+		case domain.MatchStatusMatched:
+			return s.enqueueEntryEvent(ctx, tx, "posted", "intercompany.entry.posted", actorID, correlationID, entry)
+		case domain.MatchStatusMismatch:
+			return s.enqueueEntryEvent(ctx, tx, "mismatch-detected", "intercompany.mismatch.detected", actorID, correlationID, entry)
+		default:
+			// AcknowledgeCounterparty/DisputeIntercompany/ResolveMismatch use
+			// their own dedicated store methods, not this one, and never
+			// published events before this migration either — unchanged.
+			return nil
+		}
 	})
 }

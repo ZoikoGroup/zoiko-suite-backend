@@ -17,6 +17,14 @@ const (
 	MatchStatusResolved            = "RESOLVED"
 )
 
+// MatchableStatuses are the only statuses MatchIntercompany may move a pair
+// out of. MISMATCH is included so a caller can correct a prior mismatch by
+// re-running the match; MATCHED, DISPUTED and RESOLVED have left the part of
+// the state model matching belongs to. The store enforces this in the UPDATE
+// itself, so a dispute that lands between the handler's read and its write
+// is never overwritten.
+var MatchableStatuses = []string{MatchStatusUnmatched, MatchStatusAwaitingCounterparty, MatchStatusMismatch}
+
 type IntercompanyEntry struct {
 	IntercompanyEntryID string    `json:"intercompany_entry_id"`
 	TenantID            string    `json:"tenant_id"`

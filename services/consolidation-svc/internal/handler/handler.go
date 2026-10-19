@@ -756,15 +756,26 @@ func (h *Handler) ReverseConsolidationAdjustment(w http.ResponseWriter, r *http.
 	}
 	// A named supersession must be a real adjustment — checked here so a
 	// bad id is a clean 400, not a foreign-key violation surfacing as a
-	// generic 500 from the store.
+	// generic 500 from the store. It must also actually replace this one:
+	// a different adjustment, for the same group and period, not itself
+	// reversed. Otherwise naming the adjustment itself, or any unrelated
+	// one, would satisfy the supersession rule above while replacing nothing.
 	if req.SupersededByAdjustmentID != nil && *req.SupersededByAdjustmentID != "" {
-		if _, err := h.store.GetAdjustment(r.Context(), *req.SupersededByAdjustmentID); err != nil {
+		successor, err := h.store.GetAdjustment(r.Context(), *req.SupersededByAdjustmentID)
+		if err != nil {
 			if errors.Is(err, domain.ErrAdjustmentNotFound) {
 				writeError(w, http.StatusBadRequest, "invalid_field", "superseded_by_adjustment_id does not name a real adjustment")
 				return
 			}
 			h.log.Error("failed to verify superseding adjustment", zap.Error(err))
 			writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+			return
+		}
+		if successor.ConsolidationAdjustmentID == a.ConsolidationAdjustmentID ||
+			successor.GroupLegalEntityID != a.GroupLegalEntityID ||
+			successor.FiscalPeriod != a.FiscalPeriod ||
+			successor.Status == domain.AdjustmentStatusReversed {
+			writeError(w, http.StatusUnprocessableEntity, "invalid_supersession", domain.ErrInvalidSupersession.Error())
 			return
 		}
 	}

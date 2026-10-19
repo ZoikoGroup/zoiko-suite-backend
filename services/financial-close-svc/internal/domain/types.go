@@ -408,6 +408,9 @@ const (
 const (
 	AccountTypeAsset     = "ASSET"
 	AccountTypeLiability = "LIABILITY"
+	AccountTypeEquity    = "EQUITY"
+	AccountTypeRevenue   = "REVENUE"
+	AccountTypeExpense   = "EXPENSE"
 )
 
 // FXRevaluationRun is ACC-10's own authority — "RevaluationRun, item
@@ -610,6 +613,29 @@ type FinancialSnapshot struct {
 	SupersededAt            *time.Time `json:"superseded_at,omitempty"`
 }
 
+// SnapshotIntegrityResult is VerifySnapshotIntegrity's response. A
+// mismatch is still a 200: the verification ran and this is its report.
+type SnapshotIntegrityResult struct {
+	Verified   bool      `json:"verified"`
+	SnapshotID string    `json:"snapshot_id"`
+	CheckedAt  time.Time `json:"checked_at"`
+}
+
+// SnapshotIntegrityFailure is what a failed VerifySnapshotIntegrity
+// records as ACC-16's SnapshotIntegrityFailed event. It intentionally has
+// no recomputed-signature field — see PgStore.RecordSnapshotIntegrityFailure.
+type SnapshotIntegrityFailure struct {
+	SnapshotID        string
+	LegalEntityID     string
+	Purpose           string
+	SnapshotStatus    string
+	StoredContentHash string
+	RecomputedHash    string
+	HashMatched       bool
+	SignatureMatched  bool
+	CheckedAt         time.Time
+}
+
 type CreateFinancialSnapshotRequest struct {
 	LegalEntityID           string `json:"legal_entity_id"`
 	Purpose                 string `json:"purpose"`
@@ -622,10 +648,49 @@ type CertifySnapshotRequest struct {
 	Reason string `json:"reason"`
 }
 
+// CreateFinancialSnapshotFromTrialBalanceRequest is the ACC-15->ACC-16 glue
+// command: instead of the caller assembling Content by hand, this service
+// compiles the trial balance itself (via general-ledger-svc) and maps each
+// account to its category using the chart of accounts, then creates the
+// Draft snapshot from that.
+type CreateFinancialSnapshotFromTrialBalanceRequest struct {
+	LegalEntityID string `json:"legal_entity_id"`
+	FiscalPeriod  string `json:"fiscal_period"`
+	Purpose       string `json:"purpose"`
+	Currency      string `json:"currency"`
+}
+
+// SnapshotContent and SnapshotContentAccount mirror financial-statements-svc's
+// schema for FinancialSnapshot.Content exactly (SnapshotContentAccount ==
+// financial-statements-svc's internal/domain.SnapshotContentAccount). Amounts
+// are decimal strings, never float64 (ZS-DATA-001 D06). Duplicated rather
+// than imported, matching this codebase's no-shared-domain-types-across-
+// services convention.
+type SnapshotContent struct {
+	Currency string                   `json:"currency"`
+	Accounts []SnapshotContentAccount `json:"accounts"`
+}
+
+type SnapshotContentAccount struct {
+	AccountCode string `json:"account_code"`
+	AccountName string `json:"account_name"`
+	Category    string `json:"category"`
+	Balance     string `json:"balance"`
+}
+
 var (
+	// ErrChartOfAccountsEntryMissing is returned when a trial-balance line's
+	// account_code has no matching entry in the chart of accounts — the
+	// snapshot cannot be built with an unclassified account, so this fails
+	// closed rather than guessing a category.
+	ErrChartOfAccountsEntryMissing = errorString("trial balance line references an account code not found in the chart of accounts")
 	ErrFinancialSnapshotNotFound = errorString("financial snapshot not found")
 	ErrInvalidSnapshotTransition = errorString("financial snapshot is not in a status that allows this action")
 	ErrSigningKeyUnavailable     = errorString("no valid signing key is available to seal this snapshot")
+	// ErrSnapshotNotSealed is returned by VerifySnapshotIntegrity for a
+	// snapshot that has no content hash / signature yet — there is nothing
+	// to verify against, so this is neither a pass nor a failure.
+	ErrSnapshotNotSealed = errorString("financial snapshot has not been sealed; there is no hash or signature to verify")
 	// ErrCertifyWithUnresolvedException is returned when CertifySnapshot
 	// is called on a snapshot whose has_unresolved_exceptions flag is
 	// still true — the spec's own negative path, "Certify snapshot with

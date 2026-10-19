@@ -38,11 +38,13 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	base := filepath.Dir(filename)
 
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS intercompany_entries CASCADE;`)
+	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS eventing_outbox CASCADE;`)
 
 	for _, migration := range []string{
 		"000001_initial_schema.up.sql",
 		"000002_add_idempotency_index.up.sql",
 		"000003_add_acc11_lifecycle.up.sql",
+		"000004_add_eventing_outbox.up.sql",
 	} {
 		sql, err := os.ReadFile(filepath.Join(base, "../../deployments/migrations", migration))
 		if err != nil {
@@ -84,14 +86,14 @@ func newTestEntry(tenantID, sourceJournalID string) *domain.IntercompanyEntry {
 // must resolve to the original entry, never a duplicate.
 func TestPgStore_CreateEntry_RetriedSourceJournalID_IsIdempotent(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("test"))
 
 	tenantID := uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
 	sourceJournalID := uuid.New().String()
 	entry1 := newTestEntry(tenantID, sourceJournalID)
-	created1, err := s.CreateEntry(ctx, entry1)
+	created1, err := s.CreateEntry(ctx, entry1, "actor-1", "corr-1")
 	if err != nil {
 		t.Fatalf("first CreateEntry failed: %v", err)
 	}
@@ -102,7 +104,7 @@ func TestPgStore_CreateEntry_RetriedSourceJournalID_IsIdempotent(t *testing.T) {
 	// Simulate a client retry: a fresh entry (new IntercompanyEntryID, as a
 	// real client would generate) but the SAME source_journal_id.
 	entry2 := newTestEntry(tenantID, sourceJournalID)
-	created2, err := s.CreateEntry(ctx, entry2)
+	created2, err := s.CreateEntry(ctx, entry2, "actor-1", "corr-2")
 	if err != nil {
 		t.Fatalf("retried CreateEntry failed: %v", err)
 	}
@@ -125,7 +127,7 @@ func TestPgStore_CreateEntry_RetriedSourceJournalID_IsIdempotent(t *testing.T) {
 
 func TestPgStore_RLS_TenantIsolation(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("test"))
 
 	tenantA := uuid.New().String()
 	tenantB := uuid.New().String()
@@ -133,7 +135,7 @@ func TestPgStore_RLS_TenantIsolation(t *testing.T) {
 	ctxB := svcmiddleware.WithTenant(context.Background(), tenantB)
 
 	entryA := newTestEntry(tenantA, uuid.New().String())
-	if _, err := s.CreateEntry(ctxA, entryA); err != nil {
+	if _, err := s.CreateEntry(ctxA, entryA, "actor-1", "corr-1"); err != nil {
 		t.Fatalf("CreateEntry (tenant A) failed: %v", err)
 	}
 

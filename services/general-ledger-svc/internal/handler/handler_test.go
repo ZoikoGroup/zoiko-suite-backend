@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -234,7 +235,7 @@ func (s *stubStore) CompileTrialBalance(_ context.Context, tenantID, legalEntity
 		}
 	}
 	for code, bal := range balances {
-		snap.Lines = append(snap.Lines, domain.TrialBalanceLine{AccountCode: code, NetBalance: bal})
+		snap.Lines = append(snap.Lines, domain.TrialBalanceLine{AccountCode: code, NetBalance: fmt.Sprintf("%.2f", bal)})
 	}
 	s.trialBalances[snap.TrialBalanceSnapshotID] = snap
 	return snap, nil
@@ -1169,11 +1170,11 @@ func TestCompileTrialBalance_OnlyFinalizedJournalsContribute(t *testing.T) {
 	if snap.LedgerWatermark != 1 {
 		t.Errorf("expected watermark reflecting exactly 1 included journal, got %d", snap.LedgerWatermark)
 	}
-	byAccount := map[string]float64{}
+	byAccount := map[string]string{}
 	for _, l := range snap.Lines {
 		byAccount[l.AccountCode] = l.NetBalance
 	}
-	if byAccount["1000"] != 100 || byAccount["4000"] != -100 {
+	if byAccount["1000"] != "100.00" || byAccount["4000"] != "-100.00" {
 		t.Errorf("expected only the FINALIZED journal's lines counted, got %+v", byAccount)
 	}
 }

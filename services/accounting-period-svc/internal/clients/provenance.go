@@ -10,6 +10,8 @@ import (
 	"net/url"
 	"time"
 
+	"github.com/google/uuid"
+
 	"zoiko.io/accounting-period-svc/internal/domain"
 	"zoiko.io/accounting-period-svc/internal/service"
 )
@@ -65,6 +67,19 @@ func (v *HTTPProvenance) Verify(ctx context.Context, r service.ProvenanceRequest
 	req.Header.Set("X-Tenant-Id", r.TenantID)
 	req.Header.Set("X-Workload-Id", workloadID)
 	req.Header.Set("Accept", "application/json")
+	// financial-close-svc's §4 envelope middleware treats actor_subject_id,
+	// request_id, correlation_id and source_channel as unconditionally
+	// mandatory, enforced on every request once ZS_ENVELOPE_ENFORCEMENT=strict
+	// (the default, write-strict, admits a GET missing them, so this call
+	// works today either way — but a future flip to strict must not silently
+	// start refusing the one real dependency REF-05 has). There is no human
+	// principal behind this call: it is machine-to-machine verification, not
+	// a user action, so it identifies itself as the calling workload rather
+	// than fabricating a human actor.
+	req.Header.Set("X-Principal-Id", workloadID)
+	req.Header.Set("X-Request-Id", uuid.NewString())
+	req.Header.Set("X-Correlation-ID", uuid.NewString())
+	req.Header.Set("X-Source-Channel", "system")
 
 	resp, err := v.Client.Do(req)
 	if err != nil {
