@@ -433,6 +433,75 @@ type DeactivateAccountRequest struct {
 	EvidenceRefs    []string       `json:"evidence_refs,omitempty"`
 }
 
+// ResolvePostingEligibilityRequest is ACC-01's read-side answer to "may this
+// account be posted to right now". AccountCode is optional when the route
+// already names the account. LegalEntityID is only used as the authorization
+// scope when the caller asks for the control-account override.
+type ResolvePostingEligibilityRequest struct {
+	AccountCode                       string `json:"account_code,omitempty"`
+	LegalEntityID                     string `json:"legal_entity_id,omitempty"`
+	OverrideControlAccountRestriction bool   `json:"override_control_account_restriction,omitempty"`
+}
+
+// PostingEligibility is the resolver's answer. It formalises the exact rules
+// PostAccountingEvent already enforces inline (see
+// handler.checkAccountRestrictions): an account the chart has never heard of
+// remains postable (the deliberate bootstrap gap), an INACTIVE account is not,
+// and a control account with direct_posting_restricted needs an explicit,
+// separately authorized override.
+type PostingEligibility struct {
+	AccountID               string `json:"account_id,omitempty"`
+	AccountCode             string `json:"account_code"`
+	Registered              bool   `json:"registered"`
+	Eligible                bool   `json:"eligible"`
+	Status                  string `json:"status,omitempty"`
+	Version                 int64  `json:"version,omitempty"`
+	IsControlAccount        bool   `json:"is_control_account"`
+	DirectPostingRestricted bool   `json:"direct_posting_restricted"`
+	RequiresOverride        bool   `json:"requires_override"`
+	OverrideApplied         bool   `json:"override_applied"`
+	Reason                  string `json:"reason,omitempty"`
+}
+
+// EvaluatePostingEligibility applies ACC-01's posting rules to an account. A
+// nil account is the unregistered case: the caller gets an explicit
+// registered=false answer rather than a 404, because ACC-04 must still be able
+// to accept the legacy codes nothing has registered.
+func EvaluatePostingEligibility(accountCode string, a *Account, override bool) PostingEligibility {
+	if a == nil {
+		return PostingEligibility{
+			AccountCode: accountCode,
+			Registered:  false,
+			Eligible:    true,
+			Status:      "UNREGISTERED",
+			Reason:      "account is not registered in the Chart of Accounts; legacy posting remains permitted",
+		}
+	}
+	result := PostingEligibility{
+		AccountID:               a.AccountID,
+		AccountCode:             a.AccountCode,
+		Registered:              true,
+		Status:                  a.Status,
+		Version:                 a.Version,
+		IsControlAccount:        a.IsControlAccount,
+		DirectPostingRestricted: a.DirectPostingRestricted,
+	}
+	if a.Status != "ACTIVE" {
+		result.Reason = ErrAccountInactive.Error()
+		return result
+	}
+	if a.IsControlAccount && a.DirectPostingRestricted {
+		result.RequiresOverride = true
+		if !override {
+			result.Reason = ErrControlAccountPostingRestricted.Error()
+			return result
+		}
+		result.OverrideApplied = true
+	}
+	result.Eligible = true
+	return result
+}
+
 // ReparentAccountRequest changes an account's parent in the chart hierarchy.
 // The parent field is required but may be null: an explicit null makes the
 // account a root, while omitting the field entirely is refused so an

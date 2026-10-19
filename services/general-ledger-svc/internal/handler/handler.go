@@ -296,7 +296,11 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Route("/v1/chart-of-accounts", func(r chi.Router) {
 		r.Post("/", h.CreateAccount)
 		r.Get("/", h.ListAccounts)
+		r.Get("/resolve-posting-eligibility", h.ResolvePostingEligibility)
+		r.Post("/resolve-posting-eligibility", h.ResolvePostingEligibility)
 		r.Get("/{account_code}", h.GetAccount)
+		r.Get("/{account_code}/posting-eligibility", h.ResolvePostingEligibility)
+		r.Post("/{account_code}/posting-eligibility", h.ResolvePostingEligibility)
 		r.Post("/{account_code}/amend", h.AmendAccountVersion)
 		r.Post("/{account_code}/activate", h.ActivateAccount)
 		r.Post("/{account_code}/deactivate", h.DeactivateAccount)
@@ -878,6 +882,84 @@ func (h *Handler) writeAccountVersionErr(w http.ResponseWriter, err error) bool 
 		return false
 	}
 	return true
+}
+
+// ResolvePostingEligibility is ACC-01's read contract used by the posting
+// engine before a journal line is accepted. It reproduces ACC-04's inline
+// rules exactly — unregistered codes stay postable, INACTIVE accounts do not,
+// control accounts with direct posting restricted need the same explicit,
+// separately authorized override — while answering with a stable shape a
+// caller can persist or explain rather than only a boolean.
+func (h *Handler) ResolvePostingEligibility(w http.ResponseWriter, r *http.Request) {
+	var req domain.ResolvePostingEligibilityRequest
+	if r.Method == http.MethodPost {
+		if !decodeOptionalJSON(w, r, &req) {
+			return
+		}
+	}
+
+	accountCode := chi.URLParam(r, "account_code")
+	if accountCode == "" {
+		accountCode = req.AccountCode
+	}
+	q := r.URL.Query()
+	if accountCode == "" {
+		accountCode = q.Get("account_code")
+	}
+	if accountCode == "" {
+		writeError(w, http.StatusBadRequest, "missing_field", "account_code is required")
+		return
+	}
+	if req.LegalEntityID == "" {
+		req.LegalEntityID = q.Get("legal_entity_id")
+	}
+	if !req.OverrideControlAccountRestriction {
+		if v := q.Get("override_control_account_restriction"); v != "" {
+			override, err := strconv.ParseBool(v)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, "invalid_field", "override_control_account_restriction must be true or false")
+				return
+			}
+			req.OverrideControlAccountRestriction = override
+		}
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, coaPlatformScopeID, actionViewAccount); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	acct, err := h.store.GetAccountByCode(r.Context(), tenantID, accountCode)
+	if errors.Is(err, domain.ErrAccountNotFound) {
+		writeJSON(w, http.StatusOK, domain.EvaluatePostingEligibility(accountCode, nil, false))
+		return
+	}
+	if err != nil {
+		h.log.Error("ResolvePostingEligibility: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+
+	eligibility := domain.EvaluatePostingEligibility(accountCode, acct, req.OverrideControlAccountRestriction)
+	if eligibility.RequiresOverride && req.OverrideControlAccountRestriction {
+		scope := req.LegalEntityID
+		if scope == "" {
+			scope = coaPlatformScopeID
+		}
+		if err := h.authz.CheckAllowed(r.Context(), principalID, scope, actionOverridePostingRestriction); err != nil {
+			h.writeAuthzErr(w, err)
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, eligibility)
 }
 
 // ReparentAccount changes an account's position in the chart hierarchy. The

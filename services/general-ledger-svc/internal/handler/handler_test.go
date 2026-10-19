@@ -709,9 +709,24 @@ func (p *stubPublisher) PublishJournalReversed(_ context.Context, _ domain.Journ
 
 type stubAuthZ struct {
 	err error
+
+	// denyAction narrows err to a single action code, so a test can prove a
+	// command needs its OWN grant rather than any authorization at all.
+	denyAction string
+	// actions records every action checked, in order.
+	actions []string
 }
 
-func (a *stubAuthZ) CheckAllowed(_ context.Context, _, _, _ string) error { return a.err }
+func (a *stubAuthZ) CheckAllowed(_ context.Context, _, _, action string) error {
+	a.actions = append(a.actions, action)
+	if a.denyAction != "" && action == a.denyAction {
+		return a.err
+	}
+	if a.denyAction != "" {
+		return nil
+	}
+	return a.err
+}
 
 type stubClose struct {
 	err error
@@ -1651,6 +1666,116 @@ func TestReparentAccount_MissingParentField_Returns400(t *testing.T) {
 	}, "principal-1")
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 when parent_account_id is absent, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestResolvePostingEligibility_UnregisteredAccount_StaysEligible(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	rec := doRequest(r, http.MethodGet, "/v1/chart-of-accounts/no-such/posting-eligibility", nil, "principal-1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var result domain.PostingEligibility
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatalf("eligibility is not valid JSON: %v", err)
+	}
+	if result.Registered || !result.Eligible || result.Status != "UNREGISTERED" {
+		t.Fatalf("unregistered codes must stay postable (the bootstrap gap), got %+v", result)
+	}
+}
+
+func TestResolvePostingEligibility_InactiveAccount_NotEligible(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1000", AccountName: "Cash", AccountType: domain.AccountTypeAsset})
+	doRequest(r, http.MethodPost, "/v1/chart-of-accounts/1000/deactivate", nil, "principal-1")
+
+	rec := doRequest(r, http.MethodGet, "/v1/chart-of-accounts/1000/posting-eligibility", nil, "principal-1")
+	var result domain.PostingEligibility
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatalf("eligibility is not valid JSON: %v", err)
+	}
+	if result.Eligible || !result.Registered || result.Status != "INACTIVE" {
+		t.Fatalf("inactive account must not be eligible, got %+v", result)
+	}
+}
+
+func TestResolvePostingEligibility_ControlRestricted_RequiresOverride(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	createAccount(t, r, domain.CreateAccountRequest{
+		AccountCode: "2100", AccountName: "AP Control", AccountType: domain.AccountTypeLiability,
+		IsControlAccount: true, DirectPostingRestricted: true,
+	})
+
+	rec := doRequest(r, http.MethodGet, "/v1/chart-of-accounts/2100/posting-eligibility", nil, "principal-1")
+	var result domain.PostingEligibility
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatalf("eligibility is not valid JSON: %v", err)
+	}
+	if result.Eligible || !result.RequiresOverride || result.OverrideApplied {
+		t.Fatalf("restricted control account must report override required, got %+v", result)
+	}
+}
+
+func TestResolvePostingEligibility_ControlRestricted_OverrideGranted(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	createAccount(t, r, domain.CreateAccountRequest{
+		AccountCode: "2100", AccountName: "AP Control", AccountType: domain.AccountTypeLiability,
+		IsControlAccount: true, DirectPostingRestricted: true,
+	})
+
+	rec := doRequest(r, http.MethodPost, "/v1/chart-of-accounts/2100/posting-eligibility", map[string]any{
+		"override_control_account_restriction": true,
+		"legal_entity_id":                      "e1",
+	}, "principal-1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var result domain.PostingEligibility
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatalf("eligibility is not valid JSON: %v", err)
+	}
+	if !result.Eligible || !result.RequiresOverride || !result.OverrideApplied {
+		t.Fatalf("authorized override should make the account eligible, got %+v", result)
+	}
+}
+
+func TestResolvePostingEligibility_OverrideDenied_Returns403(t *testing.T) {
+	s := newStubStore()
+	authz := &stubAuthZ{err: domain.ErrAuthorizationDenied, denyAction: "COA_CONTROL_ACCOUNT_POSTING_OVERRIDE"}
+	r := newRouter(s, &stubPublisher{}, authz)
+	createAccount(t, r, domain.CreateAccountRequest{
+		AccountCode: "2100", AccountName: "AP Control", AccountType: domain.AccountTypeLiability,
+		IsControlAccount: true, DirectPostingRestricted: true,
+	})
+
+	rec := doRequest(r, http.MethodGet,
+		"/v1/chart-of-accounts/2100/posting-eligibility?override_control_account_restriction=true&legal_entity_id=e1",
+		nil, "principal-1")
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 when only the override action is denied, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestResolvePostingEligibility_StaticRouteReadsAccountCodeFromBody(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1000", AccountName: "Cash", AccountType: domain.AccountTypeAsset})
+
+	rec := doRequest(r, http.MethodPost, "/v1/chart-of-accounts/resolve-posting-eligibility", map[string]any{
+		"account_code": "1000",
+	}, "principal-1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var result domain.PostingEligibility
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatalf("eligibility is not valid JSON: %v", err)
+	}
+	if !result.Registered || !result.Eligible || result.Version != 1 {
+		t.Fatalf("expected the registered account to be eligible at version 1, got %+v", result)
 	}
 }
 
