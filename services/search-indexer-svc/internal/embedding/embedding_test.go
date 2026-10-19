@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"zoiko.io/search-indexer-svc/internal/domain"
+	"zoiko.io/search-indexer-svc/internal/envelope"
 )
 
 func spec() domain.EmbeddingSpec {
@@ -104,4 +105,32 @@ func TestUnconfigured_RefusesEverything(t *testing.T) {
 	_, err := Unconfigured{}.Embed(context.Background(), spec(), []string{"x"})
 	assert.ErrorIs(t, err, ErrNoProvider)
 	assert.False(t, Unconfigured{}.Configured())
+}
+
+// The provider learns the text to embed and the trace ids, never who asked
+// (AB-001 §9.2; Group 1 re-audit F-6, 19 Oct 2026). Every identity header the
+// envelope carries is checked, so forwarding the whole envelope fails here.
+func TestHTTPProvider_SendsNoCallerIdentity(t *testing.T) {
+	var got http.Header
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+		_ = json.NewEncoder(w).Encode(echo(3)(embedRequest{Model: "m", ModelVersion: "2026-01", Input: []string{"x"}}))
+	}))
+	t.Cleanup(srv.Close)
+
+	ctx := envelope.WithEnvelope(context.Background(), envelope.Envelope{
+		TenantID: "tenant-A", ActorSubjectID: "alice@corp", LegalEntityID: "le-1", WorkloadID: "wl-1",
+		BookID: "book-1", RequestID: "req-1", CorrelationID: "corr-1", CausationID: "cause-1",
+		IdempotencyKey: "idem-1", SourceSystem: "console",
+	})
+	_, err := NewHTTPProvider(srv.URL, "tok", 0).Embed(ctx, spec(), []string{"disciplinary hearing"})
+	require.NoError(t, err)
+
+	assert.Equal(t, "req-1", got.Get(envelope.HeaderRequestID))
+	assert.Equal(t, "corr-1", got.Get(envelope.HeaderCorrelationID))
+	for _, h := range []string{envelope.HeaderTenantID, envelope.HeaderActorSubjectID, envelope.HeaderLegalEntityID,
+		envelope.HeaderWorkloadID, envelope.HeaderBookID, envelope.HeaderCausationID, envelope.HeaderIdempotencyKey,
+		envelope.HeaderSourceSystem} {
+		assert.Empty(t, got.Get(h), "%s must not reach the embedding provider", h)
+	}
 }

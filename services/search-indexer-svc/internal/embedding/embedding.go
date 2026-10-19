@@ -214,8 +214,20 @@ func (p *HTTPProvider) Embed(ctx context.Context, spec domain.EmbeddingSpec, inp
 	if p.token != "" {
 		req.Header.Set("Authorization", "Bearer "+p.token)
 	}
-	// Forward the caller's canonical envelope for downstream traceability
-	svcenvelope.ForwardTo(ctx, req)
+	// Trace headers only, and only when there is a request behind this call.
+	// NOT the caller's identity, and NOT svcenvelope.ForwardTo: the provider
+	// is a processor of text, not a party to the authorization decision, and
+	// handing it principal, tenant and entity ids alongside the query would
+	// tell it who searches for what (AB-001 §9.2). ForwardTo was put here on
+	// 15 Oct and reverted on 19 Oct (Group 1 re-audit F-6); a test pins it.
+	if env, ok := svcenvelope.FromContext(ctx); ok {
+		if env.RequestID != "" {
+			req.Header.Set(svcenvelope.HeaderRequestID, env.RequestID)
+		}
+		if env.CorrelationID != "" {
+			req.Header.Set(svcenvelope.HeaderCorrelationID, env.CorrelationID)
+		}
+	}
 
 	resp, err := p.http.Do(req)
 	if err != nil {
