@@ -520,8 +520,11 @@ services:
   # ── 1. identity-context-svc (Port: 8080) ─────────────────────────────────────
   identity-svc:
     build:
-      context: ../services/identity-context-svc
-      dockerfile: Dockerfile
+      # Root context is required: go.mod replaces zoiko.io/identity-envelope
+      # with the sibling ../identity-envelope module, so the build must see
+      # both (Group 1 re-audit F-4). Dockerfile.dockerignore keeps it small.
+      context: ..
+      dockerfile: services/identity-context-svc/Dockerfile
     container_name: identity-context-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -674,9 +677,26 @@ services:
       MFA_SECRET_KEY: "bG9jYWwtZGV2LW1mYS1rZXktMzItYnl0ZXMtbG9uZyE="
       MFA_SECRET_KEY_ID: "local-1"
       MFA_RECENT_AUTH_SECONDS: "900"
+      # ── OIDC provider and login throttling (wired 19 Oct 2026, F-5) ─────────
+      # The provider is mounted at /.well-known/openid-configuration and
+      # /oauth2/*. The local registry holds one public loopback client for
+      # trying the code flow by hand; the console is registered here when it
+      # moves from /v1/authenticate to /oauth2/authorize.
+      OIDC_ISSUER: "http://localhost:8080"
+      OIDC_CLIENTS_FILE: "/idp-clients/oidc-clients.json"
+      # The console still logs in through POST /v1/authenticate, so it stays
+      # open locally. The default is "internal" (mTLS platform tooling only),
+      # and config.Load refuses "open" in staging and production (IAM §18).
+      AUTHENTICATE_ENDPOINT: "open"
+      # Source-level login throttling (AU-04): per-IP attempt rate and failure
+      # budgets, per-tenant failure budget, in Redis.
+      AUTH_RATE_IP_PER_MINUTE: "30"
+      AUTH_FAIL_IP_LIMIT: "10"
+      AUTH_FAIL_TENANT_LIMIT: "100"
     volumes:
       - identity_jwt_keys:/keys:ro
       - ./identity/idp-clients.local.json:/idp-clients/clients.json:ro
+      - ./identity/oidc-clients.local.json:/idp-clients/oidc-clients.json:ro
       # Only this service's own bootstrap token (register M-01): the
       # sub-directory identity-context-svc/ of the keygen volume, so /bootstrap/token
       # here is a token mtls-management-svc binds to identity-context-svc alone.
