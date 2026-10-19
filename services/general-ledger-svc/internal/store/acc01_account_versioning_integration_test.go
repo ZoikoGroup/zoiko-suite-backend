@@ -53,7 +53,7 @@ func TestPgStore_AmendAccountVersion_AppendsVersionAndAdvancesHead(t *testing.T)
 	effective := time.Now().UTC().Add(time.Minute)
 	updates := *head
 	updates.AccountName = "Cash on hand"
-	amended, err := s.AmendAccountVersion(ctx, tenantID, "1000", 1, effective, &updates, "renamed by finance", nil, "test-admin")
+	amended, _, err := s.AmendAccountVersion(ctx, tenantID, "1000", "amend-initial", 1, effective, &updates, "renamed by finance", nil, "test-admin")
 	if err != nil {
 		t.Fatalf("AmendAccountVersion: %v", err)
 	}
@@ -192,7 +192,7 @@ func TestPgStore_ReparentAccount_GuardsHierarchyAndLeavesPostedFactsAlone(t *tes
 
 	entriesBefore := countLedgerEntriesForAccount(t, pool, tenantID, "1010")
 
-	moved, err := s.ReparentAccount(ctx, tenantID, "1010", &assets.AccountID, 1, time.Time{}, "moving cash under assets", nil, "test-admin")
+	moved, _, err := s.ReparentAccount(ctx, tenantID, "1010", "reparent-under-assets", &assets.AccountID, 1, time.Time{}, "moving cash under assets", nil, "test-admin")
 	if err != nil {
 		t.Fatalf("ReparentAccount: %v", err)
 	}
@@ -209,18 +209,18 @@ func TestPgStore_ReparentAccount_GuardsHierarchyAndLeavesPostedFactsAlone(t *tes
 	}
 
 	// A cycle must be refused: assets cannot become a child of its own child.
-	if _, err := s.ReparentAccount(ctx, tenantID, "1000", &cash.AccountID, 1, time.Time{}, "cycle attempt", nil, "test-admin"); !errors.Is(err, domain.ErrAccountHierarchyCycle) {
+	if _, _, err := s.ReparentAccount(ctx, tenantID, "1000", "reparent-cycle", &cash.AccountID, 1, time.Time{}, "cycle attempt", nil, "test-admin"); !errors.Is(err, domain.ErrAccountHierarchyCycle) {
 		t.Fatalf("expected ErrAccountHierarchyCycle, got %v", err)
 	}
 	// Self-parenting is the minimal cycle.
-	if _, err := s.ReparentAccount(ctx, tenantID, "1000", &assets.AccountID, 1, time.Time{}, "self-parent attempt", nil, "test-admin"); !errors.Is(err, domain.ErrAccountHierarchyCycle) {
+	if _, _, err := s.ReparentAccount(ctx, tenantID, "1000", "reparent-self", &assets.AccountID, 1, time.Time{}, "self-parent attempt", nil, "test-admin"); !errors.Is(err, domain.ErrAccountHierarchyCycle) {
 		t.Fatalf("expected ErrAccountHierarchyCycle for self-parenting, got %v", err)
 	}
 	// A hierarchy change backdated before today is refused outright, because
 	// this chart has no entity/book with which to ask a close service whether
 	// the target period is open.
 	backdated := time.Now().UTC().AddDate(0, 0, -1)
-	if _, err := s.ReparentAccount(ctx, tenantID, "1010", nil, 2, backdated, "backdated", nil, "test-admin"); !errors.Is(err, domain.ErrAccountHierarchyBackdated) {
+	if _, _, err := s.ReparentAccount(ctx, tenantID, "1010", "reparent-backdated", nil, 2, backdated, "backdated", nil, "test-admin"); !errors.Is(err, domain.ErrAccountHierarchyBackdated) {
 		t.Fatalf("expected ErrAccountHierarchyBackdated, got %v", err)
 	}
 	// The refused backdated command must leave the hierarchy exactly as it was.
@@ -268,7 +268,7 @@ func TestPgStore_AmendAccountVersion_StaleExpectedVersionIsRefused(t *testing.T)
 	updates := *head
 	updates.AccountName = "Cash on hand"
 
-	if _, err := s.AmendAccountVersion(ctx, tenantID, "1000", 99, time.Now().UTC(), &updates, "", nil, "test-admin"); !errors.Is(err, domain.ErrAccountVersionConflict) {
+	if _, _, err := s.AmendAccountVersion(ctx, tenantID, "1000", "amend-stale", 99, time.Now().UTC(), &updates, "", nil, "test-admin"); !errors.Is(err, domain.ErrAccountVersionConflict) {
 		t.Fatalf("expected ErrAccountVersionConflict, got %v", err)
 	}
 	head, _ = s.GetAccountByCode(ctx, tenantID, "1000")
@@ -293,7 +293,7 @@ func TestPgStore_GetAccountAsOf_ReconstructsVersionInForce(t *testing.T) {
 	amendAt := created.Add(24 * time.Hour)
 	updates := *acct
 	updates.AccountName = "Cash on hand"
-	if _, err := s.AmendAccountVersion(ctx, tenantID, "1000", 1, amendAt, &updates, "renamed by finance", nil, "test-admin"); err != nil {
+	if _, _, err := s.AmendAccountVersion(ctx, tenantID, "1000", "amend-as-of", 1, amendAt, &updates, "renamed by finance", nil, "test-admin"); err != nil {
 		t.Fatalf("AmendAccountVersion: %v", err)
 	}
 
@@ -336,4 +336,150 @@ func TestPgStore_GetAccountAsOf_ReconstructsVersionInForce(t *testing.T) {
 	if _, err := s.GetAccountAsOf(ctx, tenantID, "1000", created.Add(-time.Second)); !errors.Is(err, domain.ErrAccountNotFound) {
 		t.Fatalf("expected ErrAccountNotFound before the account existed, got %v", err)
 	}
+}
+
+// TestPgStore_AmendAccountVersion_IdempotencyKeyReplayDoesNotAppendVersion is
+// the A6 regression test at the store level: retrying the same Idempotency-Key
+// replays the recorded result and must not append a second version row. It
+// also pins the two halves of the reference shape — a key reused by another
+// command is a conflict, and a refused command never consumes its key.
+func TestPgStore_AmendAccountVersion_IdempotencyKeyReplayDoesNotAppendVersion(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+
+	acct := newTestAccount(tenantID, "1000", "Cash")
+	if err := s.CreateAccount(ctx, acct); err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	head, err := s.GetAccountByCode(ctx, tenantID, "1000")
+	if err != nil {
+		t.Fatalf("GetAccountByCode: %v", err)
+	}
+	updates := *head
+	updates.AccountName = "Cash on hand"
+
+	key := "amend-retry-" + uuid.NewString()
+	effective := time.Now().UTC().Add(time.Minute)
+	first, replay, err := s.AmendAccountVersion(ctx, tenantID, "1000", key, 1, effective, &updates, "renamed by finance", nil, "test-admin")
+	if err != nil {
+		t.Fatalf("AmendAccountVersion: %v", err)
+	}
+	if replay {
+		t.Fatal("the first call under a key must not report a replay")
+	}
+	if first.Version != 2 {
+		t.Fatalf("expected version 2 after the first amendment, got %d", first.Version)
+	}
+
+	// The retry carries the same key: it replays and appends nothing.
+	retried, replay, err := s.AmendAccountVersion(ctx, tenantID, "1000", key, 1, effective, &updates, "renamed by finance", nil, "test-admin")
+	if err != nil {
+		t.Fatalf("replayed AmendAccountVersion: %v", err)
+	}
+	if !replay {
+		t.Fatal("a retry under the same key must report a replay")
+	}
+	if retried.Version != 2 || retried.AccountName != "Cash on hand" {
+		t.Fatalf("replay must return the recorded result at version 2, got version %d named %q", retried.Version, retried.AccountName)
+	}
+
+	// The assertion reads account_versions directly: the retry must not have
+	// written a third row, and the key must be recorded exactly once.
+	scoped(t, pool, tenantID, func(tx pgx.Tx) {
+		var count int
+		if err := tx.QueryRow(context.Background(),
+			`SELECT COUNT(*) FROM account_versions WHERE tenant_id = $1 AND account_id = $2`,
+			tenantID, acct.AccountID).Scan(&count); err != nil {
+			t.Fatalf("count account_versions: %v", err)
+		}
+		if count != 2 {
+			t.Fatalf("a replayed key must not append a second version; got %d rows", count)
+		}
+		var claims int
+		if err := tx.QueryRow(context.Background(),
+			`SELECT COUNT(*) FROM command_idempotency WHERE tenant_id = $1 AND idempotency_key = $2`,
+			tenantID, key).Scan(&claims); err != nil {
+			t.Fatalf("count command_idempotency: %v", err)
+		}
+		if claims != 1 {
+			t.Fatalf("expected exactly one recorded key, got %d", claims)
+		}
+	})
+
+	// The same key on a different command is a conflict, not a second write.
+	if _, _, err := s.ReparentAccount(ctx, tenantID, "1000", key, nil, 0, time.Time{}, "other command", nil, "test-admin"); !errors.Is(err, domain.ErrIdempotencyKeyConflict) {
+		t.Fatalf("expected ErrIdempotencyKeyConflict when the key is reused for another command, got %v", err)
+	}
+
+	// A refused command never consumes its key: the stale expected_version is
+	// refused, and a corrected retry under the same key still runs.
+	staleKey := "amend-refused-" + uuid.NewString()
+	stale := *head
+	stale.AccountName = "never applied"
+	if _, _, err := s.AmendAccountVersion(ctx, tenantID, "1000", staleKey, 99, time.Now().UTC(), &stale, "", nil, "test-admin"); !errors.Is(err, domain.ErrAccountVersionConflict) {
+		t.Fatalf("expected ErrAccountVersionConflict, got %v", err)
+	}
+	corrected, replay, err := s.AmendAccountVersion(ctx, tenantID, "1000", staleKey, 2, time.Now().UTC().Add(2*time.Minute), &updates, "renamed after a refused attempt", nil, "test-admin")
+	if err != nil {
+		t.Fatalf("retry after a refused attempt: %v", err)
+	}
+	if replay {
+		t.Fatal("a refused command must not have consumed the key; the retry is a real execution")
+	}
+	if corrected.Version != 3 {
+		t.Fatalf("expected version 3 after the retry, got %d", corrected.Version)
+	}
+}
+
+func TestPgStore_ReparentAccount_IdempotencyKeyReplayDoesNotAppendVersion(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+
+	assets := newTestAccount(tenantID, "1000", "Assets")
+	cash := newTestAccount(tenantID, "1010", "Cash")
+	if err := s.CreateAccount(ctx, assets); err != nil {
+		t.Fatalf("CreateAccount assets: %v", err)
+	}
+	if err := s.CreateAccount(ctx, cash); err != nil {
+		t.Fatalf("CreateAccount cash: %v", err)
+	}
+
+	key := "reparent-retry-" + uuid.NewString()
+	first, replay, err := s.ReparentAccount(ctx, tenantID, "1010", key, &assets.AccountID, 1, time.Time{}, "moving cash under assets", nil, "test-admin")
+	if err != nil {
+		t.Fatalf("ReparentAccount: %v", err)
+	}
+	if replay {
+		t.Fatal("the first call under a key must not report a replay")
+	}
+	if first.Version != 2 || first.ParentAccountID == nil || *first.ParentAccountID != assets.AccountID {
+		t.Fatalf("expected cash under assets at version 2, got %+v", first)
+	}
+
+	retried, replay, err := s.ReparentAccount(ctx, tenantID, "1010", key, &assets.AccountID, 1, time.Time{}, "moving cash under assets", nil, "test-admin")
+	if err != nil {
+		t.Fatalf("replayed ReparentAccount: %v", err)
+	}
+	if !replay {
+		t.Fatal("a retry under the same key must report a replay")
+	}
+	if retried.Version != 2 {
+		t.Fatalf("replay must return the recorded result at version 2, got %d", retried.Version)
+	}
+
+	scoped(t, pool, tenantID, func(tx pgx.Tx) {
+		var count int
+		if err := tx.QueryRow(context.Background(),
+			`SELECT COUNT(*) FROM account_versions WHERE tenant_id = $1 AND account_id = $2`,
+			tenantID, cash.AccountID).Scan(&count); err != nil {
+			t.Fatalf("count account_versions: %v", err)
+		}
+		if count != 2 {
+			t.Fatalf("a replayed reparent must not append a second version; got %d rows", count)
+		}
+	})
 }

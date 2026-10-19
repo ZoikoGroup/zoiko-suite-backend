@@ -17,9 +17,9 @@ Overall: all nine named commands/queries now exist with real guards (cycles,
 optimistic version checks, append-only version history, half-open effective
 intervals) and tests. What is missing is structural: the account has no
 legal-entity/book dimension, no approval workflow or segregation of duties, no
-events, no idempotency keys, and reason/evidence are optional. Those are A1–A13,
-recorded rather than guessed. The deliberate design decisions a reviewer may
-want to reverse are B1–B10.
+events, idempotency keys only on the two replay-unsafe commands (B12), and
+reason/evidence are optional. Those are A1–A13, recorded rather than guessed.
+The deliberate design decisions a reviewer may want to reverse are B1–B12.
 
 ## A. Not implemented / weaker than the spec
 
@@ -70,13 +70,16 @@ want to reverse are B1–B10.
   event types (and their payload contracts) is a platform contract decision,
   not something to invent per command. Consumers that need to react to chart
   changes today must poll.
-- **A6. No `Idempotency-Key` handling on ACC-01 commands.** The wireframe
-  lists it as a mandatory control on all five commands. `CreateAccount`
-  relies on the unique account code (a retry answers 409, not a replay);
+- **A6. No `Idempotency-Key` handling on ACC-01 commands. — Closed for
+  `AmendAccountVersion` and `ReparentAccount` (B12); the other three commands
+  remain naturally idempotent as described here.** The wireframe lists it as a
+  mandatory control on all five commands. `CreateAccount` relies on the unique
+  account code (a retry answers 409, not a replay);
   `ActivateAccount`/`DeactivateAccount` retries are naturally idempotent by
   status; `AmendAccountVersion` and `ReparentAccount` retries with the key
-  omitted can append a second identical version. `expected_version` narrows
-  the window but is not an idempotency key. See also B4.
+  omitted can append a second identical version — the gap B12 closes.
+  `expected_version` narrows the window but is not an idempotency key. See also
+  B4.
 - **A7. The backdated-hierarchy guard is an approximation with no period
   linkage.** Negative path 3 requires blocking a hierarchy change backdated
   "across closed period". This service has no period or close client (accounts
@@ -225,3 +228,37 @@ want to reverse are B1–B10.
   `internal/handler/acc01_normal_balance_test.go`: the mapping for all five
   types, the field on Create/Get/List/as-of responses, and a request
   carrying `normal_balance` being unable to set it.
+- **B12. `AmendAccountVersion` and `ReparentAccount` require and honor an
+  `Idempotency-Key` (closes A6).** Migration
+  `000017_add_command_idempotency` adds `command_idempotency (tenant_id,
+  idempotency_key, command, account_code, created_at, PRIMARY KEY (tenant_id,
+  idempotency_key))`, RLS-scoped like the other tables and shaped after
+  financial-control-svc's table of the same name. The lookup-then-record order
+  is copied from that service's `BeginExecution`
+  (`internal/store/execution.go`): both store methods look the key up first
+  inside the write transaction; a key recorded for the same command and account
+  replays the account as it now stands with `Idempotent-Replay: true` and
+  writes no version; a key recorded for a different command or account fails
+  409 `idempotency_key_conflict`; otherwise the command executes and the key is
+  recorded only after the write has succeeded, in the same transaction, so a
+  refused command (stale `expected_version`, cycle, backdate) never consumes
+  its key. The handler reads the header, answers 400 `missing_idempotency_key`
+  when it is absent, and passes the key straight to the store — request,
+  validation and write path only, no response shape changed. A replay returns
+  the head as it stands now, not a snapshot of the first response: the same
+  semantics as the reference service's run replay, where a later command may
+  have advanced the record but the retry still never re-executes. Consequences
+  a reviewer should know: keys are tenant-scoped and never expire (the
+  reference table does not expire them either); `CreateAccount`,
+  `ActivateAccount` and `DeactivateAccount` do not participate because A6's
+  rationale still stands (unique code / status make them naturally idempotent);
+  the same key with a different payload for the same command and account
+  replays the original result rather than comparing bodies, as the reference
+  service does. Covered by `internal/handler/handler_test.go` (missing key 400
+  for both commands, replay at version 2 with `Idempotent-Replay: true` and no
+  second version, cross-command reuse 409) and by
+  `internal/store/acc01_account_versioning_integration_test.go` (amend and
+  reparent repeated under one key with `account_versions` and
+  `command_idempotency` row counts read directly, cross-command conflict, and a
+  stale-version refusal that does not consume the key so the corrected retry
+  runs).

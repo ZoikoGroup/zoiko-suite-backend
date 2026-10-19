@@ -53,10 +53,10 @@ type Store interface {
 	CreateAccount(ctx context.Context, a *domain.Account) error
 	GetAccountByCode(ctx context.Context, tenantID, accountCode string) (*domain.Account, error)
 	ListAccounts(ctx context.Context, tenantID string) ([]domain.Account, error)
-	AmendAccountVersion(ctx context.Context, tenantID, accountCode string, expectedVersion int64, effectiveFrom time.Time, a *domain.Account, reason string, evidenceRefs []string, principalID string) (*domain.Account, error)
+	AmendAccountVersion(ctx context.Context, tenantID, accountCode, idempotencyKey string, expectedVersion int64, effectiveFrom time.Time, a *domain.Account, reason string, evidenceRefs []string, principalID string) (*domain.Account, bool, error)
 	ActivateAccount(ctx context.Context, tenantID, accountCode string, expectedVersion int64, effectiveFrom time.Time, reason string, evidenceRefs []string, principalID string) (*domain.Account, error)
 	DeactivateAccount(ctx context.Context, tenantID, accountCode string, expectedVersion int64, effectiveFrom time.Time, reason string, evidenceRefs []string, principalID string) (*domain.Account, error)
-	ReparentAccount(ctx context.Context, tenantID, accountCode string, parentAccountID *string, expectedVersion int64, effectiveFrom time.Time, reason string, evidenceRefs []string, principalID string) (*domain.Account, error)
+	ReparentAccount(ctx context.Context, tenantID, accountCode, idempotencyKey string, parentAccountID *string, expectedVersion int64, effectiveFrom time.Time, reason string, evidenceRefs []string, principalID string) (*domain.Account, bool, error)
 	GetAccountAsOf(ctx context.Context, tenantID, accountCode string, asOf time.Time) (*domain.AccountVersion, error)
 
 	// ACC-02 Account Mapping — see migration 000008's doc comment.
@@ -800,6 +800,15 @@ func (h *Handler) AmendAccountVersion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Idempotency-Key is mandatory on this command (SPEC_DEVIATIONS A6/B12):
+	// it appends a version, and expected_version alone cannot stop a retry
+	// from appending a second one.
+	idempotencyKey := strings.TrimSpace(r.Header.Get(svcenvelope.HeaderIdempotencyKey))
+	if idempotencyKey == "" {
+		writeError(w, http.StatusBadRequest, "missing_idempotency_key", "Idempotency-Key header is required for account amendments")
+		return
+	}
+
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
@@ -854,7 +863,7 @@ func (h *Handler) AmendAccountVersion(w http.ResponseWriter, r *http.Request) {
 	if req.EffectiveFrom != nil {
 		effectiveFrom = req.EffectiveFrom.Time
 	}
-	result, err := h.store.AmendAccountVersion(r.Context(), tenantID, accountCode,
+	result, replay, err := h.store.AmendAccountVersion(r.Context(), tenantID, accountCode, idempotencyKey,
 		req.ExpectedVersion, effectiveFrom, &updated, req.Reason, req.EvidenceRefs, principalID)
 	if err != nil {
 		if h.writeAccountVersionErr(w, err) {
@@ -863,6 +872,11 @@ func (h *Handler) AmendAccountVersion(w http.ResponseWriter, r *http.Request) {
 		h.log.Error("AmendAccountVersion: store unavailable", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
 		return
+	}
+	if replay {
+		// A retried command returns the recorded result without executing
+		// again; the header says so explicitly.
+		w.Header().Set("Idempotent-Replay", "true")
 	}
 	writeJSON(w, http.StatusOK, result)
 }
@@ -875,6 +889,8 @@ func (h *Handler) writeAccountVersionErr(w http.ResponseWriter, err error) bool 
 		writeError(w, http.StatusNotFound, "account_not_found", "")
 	case errors.Is(err, domain.ErrAccountVersionConflict):
 		writeError(w, http.StatusConflict, "account_version_conflict", err.Error())
+	case errors.Is(err, domain.ErrIdempotencyKeyConflict):
+		writeError(w, http.StatusConflict, "idempotency_key_conflict", err.Error())
 	case errors.Is(err, domain.ErrParentAccountNotFound):
 		writeError(w, http.StatusBadRequest, "parent_account_not_found", err.Error())
 	case errors.Is(err, domain.ErrAccountEffectiveDate):
@@ -1046,6 +1062,16 @@ func (h *Handler) ReparentAccount(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
+
+	// Idempotency-Key is mandatory on this command (SPEC_DEVIATIONS A6/B12):
+	// it appends a version, and expected_version alone cannot stop a retry
+	// from appending a second one.
+	idempotencyKey := strings.TrimSpace(r.Header.Get(svcenvelope.HeaderIdempotencyKey))
+	if idempotencyKey == "" {
+		writeError(w, http.StatusBadRequest, "missing_idempotency_key", "Idempotency-Key header is required for a hierarchy change")
+		return
+	}
+
 	if !req.ParentAccountIDSet {
 		writeError(w, http.StatusBadRequest, "missing_field", "parent_account_id is required; send an explicit null to make the account a root")
 		return
@@ -1068,7 +1094,7 @@ func (h *Handler) ReparentAccount(w http.ResponseWriter, r *http.Request) {
 	if req.EffectiveFrom != nil {
 		effectiveFrom = req.EffectiveFrom.Time
 	}
-	updated, err := h.store.ReparentAccount(r.Context(), tenantID, accountCode,
+	updated, replay, err := h.store.ReparentAccount(r.Context(), tenantID, accountCode, idempotencyKey,
 		req.ParentAccountID, req.ExpectedVersion, effectiveFrom, req.Reason, req.EvidenceRefs, principalID)
 	if err != nil {
 		if h.writeAccountVersionErr(w, err) {
@@ -1077,6 +1103,11 @@ func (h *Handler) ReparentAccount(w http.ResponseWriter, r *http.Request) {
 		h.log.Error("ReparentAccount: store unavailable", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
 		return
+	}
+	if replay {
+		// A retried command returns the recorded result without executing
+		// again; the header says so explicitly.
+		w.Header().Set("Idempotent-Replay", "true")
 	}
 	writeJSON(w, http.StatusOK, updated)
 }

@@ -49,7 +49,7 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 		account_versions, account_mappings, chart_of_accounts,
 		posting_executions,
 		ledger_entries, ledger_balances,
-		outbox_events, eventing_outbox
+		outbox_events, eventing_outbox, command_idempotency
 		CASCADE;`)
 
 	// Every *.up.sql, sorted, rather than a list written out here.

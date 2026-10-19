@@ -58,6 +58,8 @@ type stubStore struct {
 	accountVersions  map[string][]*domain.AccountVersion // by "tenant|code"
 	createAccountErr error
 	amendAccountErr  error
+	// commandIdempotency mirrors command_idempotency rows, by "tenant|key".
+	commandIdempotency map[string]commandIdempotencyEntry
 
 	currentMappings map[string]*domain.AccountMapping // by "tenant|mapping_key"
 	setMappingErr   error
@@ -80,19 +82,34 @@ type stubStore struct {
 	markFailedErr     error
 }
 
+// commandIdempotencyEntry is one claimed Idempotency-Key: the command that
+// claimed it and the account it ran on, mirroring one command_idempotency row.
+type commandIdempotencyEntry struct {
+	command     string
+	accountCode string
+}
+
+// Command names recorded in the stub's idempotency map; same values the real
+// store writes to command_idempotency.command.
+const (
+	commandStubAmendAccount    = "AMEND_ACCOUNT_VERSION"
+	commandStubReparentAccount = "REPARENT_ACCOUNT"
+)
+
 func newStubStore() *stubStore {
 	return &stubStore{
-		journals:          map[string]*domain.JournalHeader{},
-		lines:             map[string][]domain.JournalLine{},
-		byCorrelation:     map[string]string{},
-		trialBalances:     map[string]*domain.TrialBalanceSnapshot{},
-		accounts:          map[string]*domain.Account{},
-		accountsByCode:    map[string]*domain.Account{},
-		accountVersions:   map[string][]*domain.AccountVersion{},
-		currentMappings:   map[string]*domain.AccountMapping{},
-		postingExecutions: map[string]*domain.PostingExecution{},
-		bySourceEvent:     map[string]string{},
-		claimedAt:         map[string]time.Time{},
+		journals:           map[string]*domain.JournalHeader{},
+		lines:              map[string][]domain.JournalLine{},
+		byCorrelation:      map[string]string{},
+		trialBalances:      map[string]*domain.TrialBalanceSnapshot{},
+		accounts:           map[string]*domain.Account{},
+		accountsByCode:     map[string]*domain.Account{},
+		accountVersions:    map[string][]*domain.AccountVersion{},
+		currentMappings:    map[string]*domain.AccountMapping{},
+		postingExecutions:  map[string]*domain.PostingExecution{},
+		bySourceEvent:      map[string]string{},
+		claimedAt:          map[string]time.Time{},
+		commandIdempotency: map[string]commandIdempotencyEntry{},
 	}
 }
 
@@ -283,25 +300,60 @@ func (s *stubStore) CreateAccount(_ context.Context, a *domain.Account) error {
 	return nil
 }
 
+// replayCommand mirrors the real store's command_idempotency lookup: a key
+// already claimed by the same command and account replays the account as it
+// now stands; a key claimed by a different command or account is the
+// idempotency conflict; an unclaimed key returns ok=false to execute.
+func (s *stubStore) replayCommand(tenantID, idempotencyKey, command, accountCode string) (bool, *domain.Account, bool, error) {
+	entry, claimed := s.commandIdempotency[tenantID+"|"+idempotencyKey]
+	if !claimed {
+		return false, nil, false, nil
+	}
+	if entry.command != command || entry.accountCode != accountCode {
+		return false, nil, false, fmt.Errorf("%w: key was claimed by %s on %s",
+			domain.ErrIdempotencyKeyConflict, entry.command, entry.accountCode)
+	}
+	a, ok := s.accountsByCode[tenantID+"|"+accountCode]
+	if !ok {
+		return false, nil, false, domain.ErrAccountNotFound
+	}
+	return true, a, true, nil
+}
+
+// claimCommand records a key once its command has succeeded, mirroring the
+// real store's insert after the write in the same transaction.
+func (s *stubStore) claimCommand(tenantID, idempotencyKey, command, accountCode string) {
+	s.commandIdempotency[tenantID+"|"+idempotencyKey] = commandIdempotencyEntry{
+		command: command, accountCode: accountCode,
+	}
+}
+
 // AmendAccountVersion mirrors the real store's core invariants: expected
 // version is enforced, a new version is appended, and the head row advances.
-func (s *stubStore) AmendAccountVersion(_ context.Context, tenantID, accountCode string, expectedVersion int64, effectiveFrom time.Time, a *domain.Account, reason string, evidence []string, principalID string) (*domain.Account, error) {
+// An Idempotency-Key already claimed by this command and account replays the
+// account instead of appending a second version.
+func (s *stubStore) AmendAccountVersion(_ context.Context, tenantID, accountCode, idempotencyKey string, expectedVersion int64, effectiveFrom time.Time, a *domain.Account, reason string, evidence []string, principalID string) (*domain.Account, bool, error) {
 	if s.amendAccountErr != nil {
-		return nil, s.amendAccountErr
+		return nil, false, s.amendAccountErr
+	}
+	if replay, acct, ok, err := s.replayCommand(tenantID, idempotencyKey, commandStubAmendAccount, accountCode); err != nil {
+		return nil, false, err
+	} else if ok {
+		return acct, replay, nil
 	}
 	key := tenantID + "|" + accountCode
 	cur, ok := s.accountsByCode[key]
 	if !ok {
-		return nil, domain.ErrAccountNotFound
+		return nil, false, domain.ErrAccountNotFound
 	}
 	if expectedVersion > 0 && cur.Version != expectedVersion {
-		return nil, domain.ErrAccountVersionConflict
+		return nil, false, domain.ErrAccountVersionConflict
 	}
 	versions := s.accountVersions[key]
 	if len(versions) > 0 {
 		prev := versions[len(versions)-1]
 		if effectiveFrom.Before(prev.EffectiveFrom) {
-			return nil, domain.ErrAccountEffectiveDate
+			return nil, false, domain.ErrAccountEffectiveDate
 		}
 		prev.EffectiveTo = &effectiveFrom
 	}
@@ -323,7 +375,8 @@ func (s *stubStore) AmendAccountVersion(_ context.Context, tenantID, accountCode
 		EffectiveFrom: effectiveFrom, ChangeKind: "AMENDED", ChangeReason: reason,
 		EvidenceRefs: evidence, CreatedAt: time.Now().UTC(), CreatedByPrincipalID: principalID,
 	})
-	return cur, nil
+	s.claimCommand(tenantID, idempotencyKey, commandStubAmendAccount, accountCode)
+	return cur, false, nil
 }
 
 func (s *stubStore) GetAccountByCode(_ context.Context, tenantID, accountCode string) (*domain.Account, error) {
@@ -367,28 +420,35 @@ func (s *stubStore) GetAccountAsOf(_ context.Context, tenantID, accountCode stri
 
 // ReparentAccount mirrors the real store's guards: cycles are refused by
 // walking the ancestors of the prospective parent, and a backdated effective
-// date is refused before any version is written.
-func (s *stubStore) ReparentAccount(_ context.Context, tenantID, accountCode string, parentAccountID *string, expectedVersion int64, effectiveFrom time.Time, reason string, evidence []string, principalID string) (*domain.Account, error) {
+// date is refused before any version is written. An Idempotency-Key already
+// claimed by this command and account replays the account instead of
+// appending a second version.
+func (s *stubStore) ReparentAccount(_ context.Context, tenantID, accountCode, idempotencyKey string, parentAccountID *string, expectedVersion int64, effectiveFrom time.Time, reason string, evidence []string, principalID string) (*domain.Account, bool, error) {
+	if replay, acct, ok, err := s.replayCommand(tenantID, idempotencyKey, commandStubReparentAccount, accountCode); err != nil {
+		return nil, false, err
+	} else if ok {
+		return acct, replay, nil
+	}
 	key := tenantID + "|" + accountCode
 	a, ok := s.accountsByCode[key]
 	if !ok {
-		return nil, domain.ErrAccountNotFound
+		return nil, false, domain.ErrAccountNotFound
 	}
 	if expectedVersion > 0 && a.Version != expectedVersion {
-		return nil, domain.ErrAccountVersionConflict
+		return nil, false, domain.ErrAccountVersionConflict
 	}
 	if parentAccountID != nil {
 		if *parentAccountID == a.AccountID {
-			return nil, domain.ErrAccountHierarchyCycle
+			return nil, false, domain.ErrAccountHierarchyCycle
 		}
 		ancestor, ok := s.accounts[*parentAccountID]
 		if !ok {
-			return nil, domain.ErrParentAccountNotFound
+			return nil, false, domain.ErrParentAccountNotFound
 		}
 		seen := map[string]bool{}
 		for ancestor != nil {
 			if ancestor.AccountID == a.AccountID {
-				return nil, domain.ErrAccountHierarchyCycle
+				return nil, false, domain.ErrAccountHierarchyCycle
 			}
 			if seen[ancestor.AccountID] {
 				break
@@ -403,20 +463,20 @@ func (s *stubStore) ReparentAccount(_ context.Context, tenantID, accountCode str
 	sameParent := (a.ParentAccountID == nil && parentAccountID == nil) ||
 		(a.ParentAccountID != nil && parentAccountID != nil && *a.ParentAccountID == *parentAccountID)
 	if sameParent {
-		return a, nil
+		return a, false, nil
 	}
 	effective := effectiveFrom
 	if effective.IsZero() {
 		effective = time.Now().UTC()
 	}
 	if effective.Before(time.Now().UTC().Truncate(24 * time.Hour)) {
-		return nil, domain.ErrAccountHierarchyBackdated
+		return nil, false, domain.ErrAccountHierarchyBackdated
 	}
 	versions := s.accountVersions[key]
 	if len(versions) > 0 {
 		prev := versions[len(versions)-1]
 		if effective.Before(prev.EffectiveFrom) {
-			return nil, domain.ErrAccountEffectiveDate
+			return nil, false, domain.ErrAccountEffectiveDate
 		}
 		prev.EffectiveTo = &effective
 	}
@@ -431,7 +491,8 @@ func (s *stubStore) ReparentAccount(_ context.Context, tenantID, accountCode str
 		EffectiveFrom: effective, ChangeKind: "REPARENTED", ChangeReason: reason,
 		EvidenceRefs: evidence, CreatedAt: time.Now().UTC(), CreatedByPrincipalID: principalID,
 	})
-	return a, nil
+	s.claimCommand(tenantID, idempotencyKey, commandStubReparentAccount, accountCode)
+	return a, false, nil
 }
 
 func (s *stubStore) ActivateAccount(_ context.Context, tenantID, accountCode string, expectedVersion int64, effectiveFrom time.Time, reason string, evidence []string, principalID string) (*domain.Account, error) {
@@ -805,6 +866,13 @@ func doRequestAs(r chi.Router, method, path string, body any, principalID, tenan
 // the body — book_id and evidence_refs.
 func doRequestWithHeaders(r chi.Router, method, path string, body any, principalID string, headers map[string]string) *httptest.ResponseRecorder {
 	return sendRequest(r, method, path, body, principalID, testTenantID, headers)
+}
+
+// doIdempotentRequest sends an AmendAccountVersion or ReparentAccount request
+// with the mandatory Idempotency-Key header those two commands require.
+func doIdempotentRequest(r chi.Router, method, path string, body any, principalID, idempotencyKey string) *httptest.ResponseRecorder {
+	return doRequestWithHeaders(r, method, path, body, principalID,
+		map[string]string{"Idempotency-Key": idempotencyKey})
 }
 
 func sendRequest(r chi.Router, method, path string, body any, principalID, tenantID string, headers map[string]string) *httptest.ResponseRecorder {
@@ -1463,10 +1531,10 @@ func TestAmendAccountVersion_UpdatesHeadAndAppendsVersion(t *testing.T) {
 	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
 	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1000-Cash", AccountName: "Cash", AccountType: domain.AccountTypeAsset})
 
-	rec := doRequest(r, http.MethodPost, "/v1/chart-of-accounts/1000-Cash/amend", map[string]any{
+	rec := doIdempotentRequest(r, http.MethodPost, "/v1/chart-of-accounts/1000-Cash/amend", map[string]any{
 		"account_name": "Cash on hand",
 		"reason":       "renamed by finance",
-	}, "principal-1")
+	}, "principal-1", "amend-1")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
@@ -1497,10 +1565,10 @@ func TestAmendAccountVersion_ExpectedVersionConflict_Returns409(t *testing.T) {
 	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
 	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1000-Cash", AccountName: "Cash", AccountType: domain.AccountTypeAsset})
 
-	rec := doRequest(r, http.MethodPost, "/v1/chart-of-accounts/1000-Cash/amend", map[string]any{
+	rec := doIdempotentRequest(r, http.MethodPost, "/v1/chart-of-accounts/1000-Cash/amend", map[string]any{
 		"account_name":     "Stale rename",
 		"expected_version": 99,
-	}, "principal-1")
+	}, "principal-1", "amend-stale")
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("expected 409 on stale expected_version, got %d: %s", rec.Code, rec.Body.String())
 	}
@@ -1511,9 +1579,9 @@ func TestAmendAccountVersion_ExpectedVersionConflict_Returns409(t *testing.T) {
 
 func TestAmendAccountVersion_UnknownAccount_Returns404(t *testing.T) {
 	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
-	rec := doRequest(r, http.MethodPost, "/v1/chart-of-accounts/no-such/amend", map[string]any{
+	rec := doIdempotentRequest(r, http.MethodPost, "/v1/chart-of-accounts/no-such/amend", map[string]any{
 		"account_name": "Nope",
-	}, "principal-1")
+	}, "principal-1", "amend-missing")
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("expected 404, got %d: %s", rec.Code, rec.Body.String())
 	}
@@ -1528,9 +1596,9 @@ func TestAmendAccountVersion_ExplicitNullParentClearsParent(t *testing.T) {
 		AccountCode: "1010", AccountName: "Cash", AccountType: domain.AccountTypeAsset, ParentAccountID: &parent,
 	})
 
-	rec := doRequest(r, http.MethodPost, "/v1/chart-of-accounts/1010/amend", map[string]any{
+	rec := doIdempotentRequest(r, http.MethodPost, "/v1/chart-of-accounts/1010/amend", map[string]any{
 		"parent_account_id": nil,
-	}, "principal-1")
+	}, "principal-1", "amend-clear-parent")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
@@ -1607,10 +1675,10 @@ func TestReparentAccount_MovesAccountAndAppendsVersion(t *testing.T) {
 	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1010", AccountName: "Cash", AccountType: domain.AccountTypeAsset})
 
 	assetsID := s.accountsByCode["t1|1000"].AccountID
-	rec := doRequest(r, http.MethodPost, "/v1/chart-of-accounts/1010/reparent", map[string]any{
+	rec := doIdempotentRequest(r, http.MethodPost, "/v1/chart-of-accounts/1010/reparent", map[string]any{
 		"parent_account_id": assetsID,
 		"reason":            "moving cash under assets",
-	}, "principal-1")
+	}, "principal-1", "reparent-move")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
@@ -1636,9 +1704,9 @@ func TestReparentAccount_CycleRefused_Returns422(t *testing.T) {
 	})
 
 	// Assets cannot become a child of its own child.
-	rec := doRequest(r, http.MethodPost, "/v1/chart-of-accounts/1000/reparent", map[string]any{
+	rec := doIdempotentRequest(r, http.MethodPost, "/v1/chart-of-accounts/1000/reparent", map[string]any{
 		"parent_account_id": s.accountsByCode["t1|1010"].AccountID,
-	}, "principal-1")
+	}, "principal-1", "reparent-cycle")
 	if rec.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("expected 422 for a hierarchy cycle, got %d: %s", rec.Code, rec.Body.String())
 	}
@@ -1652,9 +1720,9 @@ func TestReparentAccount_SelfParentRefused_Returns422(t *testing.T) {
 	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
 	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1000", AccountName: "Assets", AccountType: domain.AccountTypeAsset})
 
-	rec := doRequest(r, http.MethodPost, "/v1/chart-of-accounts/1000/reparent", map[string]any{
+	rec := doIdempotentRequest(r, http.MethodPost, "/v1/chart-of-accounts/1000/reparent", map[string]any{
 		"parent_account_id": s.accountsByCode["t1|1000"].AccountID,
-	}, "principal-1")
+	}, "principal-1", "reparent-self")
 	if rec.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("expected 422 for self-parenting, got %d: %s", rec.Code, rec.Body.String())
 	}
@@ -1666,10 +1734,10 @@ func TestReparentAccount_BackdatedEffectiveDate_Returns422(t *testing.T) {
 	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1000", AccountName: "Assets", AccountType: domain.AccountTypeAsset})
 	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1010", AccountName: "Cash", AccountType: domain.AccountTypeAsset})
 
-	rec := doRequest(r, http.MethodPost, "/v1/chart-of-accounts/1010/reparent", map[string]any{
+	rec := doIdempotentRequest(r, http.MethodPost, "/v1/chart-of-accounts/1010/reparent", map[string]any{
 		"parent_account_id": s.accountsByCode["t1|1000"].AccountID,
 		"effective_from":    "2020-01-01T00:00:00Z",
-	}, "principal-1")
+	}, "principal-1", "reparent-backdated")
 	if rec.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("expected 422 for a backdated hierarchy change, got %d: %s", rec.Code, rec.Body.String())
 	}
@@ -1683,11 +1751,131 @@ func TestReparentAccount_MissingParentField_Returns400(t *testing.T) {
 	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
 	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1010", AccountName: "Cash", AccountType: domain.AccountTypeAsset})
 
-	rec := doRequest(r, http.MethodPost, "/v1/chart-of-accounts/1010/reparent", map[string]any{
+	rec := doIdempotentRequest(r, http.MethodPost, "/v1/chart-of-accounts/1010/reparent", map[string]any{
 		"reason": "no parent named",
-	}, "principal-1")
+	}, "principal-1", "reparent-missing-parent")
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 when parent_account_id is absent, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// ── ACC-01 Idempotency-Key (SPEC_DEVIATIONS A6/B12) ──────────────────────────
+
+func TestAmendAccountVersion_MissingIdempotencyKey_Returns400(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1000", AccountName: "Cash", AccountType: domain.AccountTypeAsset})
+
+	rec := doRequest(r, http.MethodPost, "/v1/chart-of-accounts/1000/amend", map[string]any{
+		"account_name": "Cash on hand",
+	}, "principal-1")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 without an Idempotency-Key, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if got := len(s.accountVersions["t1|1000"]); got != 1 {
+		t.Fatalf("a request without a key must not amend the account; got %d versions", got)
+	}
+}
+
+func TestReparentAccount_MissingIdempotencyKey_Returns400(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1000", AccountName: "Assets", AccountType: domain.AccountTypeAsset})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1010", AccountName: "Cash", AccountType: domain.AccountTypeAsset})
+
+	rec := doRequest(r, http.MethodPost, "/v1/chart-of-accounts/1010/reparent", map[string]any{
+		"parent_account_id": s.accountsByCode["t1|1000"].AccountID,
+	}, "principal-1")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 without an Idempotency-Key, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if s.accountsByCode["t1|1010"].Version != 1 {
+		t.Fatal("a request without a key must not reparent the account")
+	}
+}
+
+// TestAmendAccountVersion_IdempotencyKeyReplayDoesNotAppendVersion is the A6
+// regression test: a retry with the same Idempotency-Key returns the recorded
+// result instead of appending a second identical version.
+func TestAmendAccountVersion_IdempotencyKeyReplayDoesNotAppendVersion(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1000", AccountName: "Cash", AccountType: domain.AccountTypeAsset})
+
+	body := map[string]any{"account_name": "Cash on hand", "reason": "renamed by finance"}
+	rec := doIdempotentRequest(r, http.MethodPost, "/v1/chart-of-accounts/1000/amend", body, "principal-1", "amend-retry-key")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("first amend: expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("Idempotent-Replay") != "" {
+		t.Fatalf("first call must not be a replay, got Idempotent-Replay: %s", rec.Header().Get("Idempotent-Replay"))
+	}
+
+	rec = doIdempotentRequest(r, http.MethodPost, "/v1/chart-of-accounts/1000/amend", body, "principal-1", "amend-retry-key")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("replayed amend: expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("Idempotent-Replay") != "true" {
+		t.Fatalf("a retried key must answer Idempotent-Replay: true, got %q", rec.Header().Get("Idempotent-Replay"))
+	}
+	var replayed domain.Account
+	if err := json.Unmarshal(rec.Body.Bytes(), &replayed); err != nil {
+		t.Fatalf("replayed account is not valid JSON: %v", err)
+	}
+	if replayed.Version != 2 || replayed.AccountName != "Cash on hand" {
+		t.Fatalf("expected the recorded result at version 2, got %q at version %d", replayed.AccountName, replayed.Version)
+	}
+	if got := len(s.accountVersions["t1|1000"]); got != 2 {
+		t.Fatalf("a replayed key must not append a second version; got %d versions", got)
+	}
+}
+
+func TestReparentAccount_IdempotencyKeyReplayDoesNotAppendVersion(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1000", AccountName: "Assets", AccountType: domain.AccountTypeAsset})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1010", AccountName: "Cash", AccountType: domain.AccountTypeAsset})
+
+	body := map[string]any{"parent_account_id": s.accountsByCode["t1|1000"].AccountID, "reason": "move"}
+	rec := doIdempotentRequest(r, http.MethodPost, "/v1/chart-of-accounts/1010/reparent", body, "principal-1", "reparent-retry-key")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("first reparent: expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	rec = doIdempotentRequest(r, http.MethodPost, "/v1/chart-of-accounts/1010/reparent", body, "principal-1", "reparent-retry-key")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("replayed reparent: expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("Idempotent-Replay") != "true" {
+		t.Fatalf("a retried key must answer Idempotent-Replay: true, got %q", rec.Header().Get("Idempotent-Replay"))
+	}
+	if got := len(s.accountVersions["t1|1010"]); got != 2 {
+		t.Fatalf("a replayed key must not append a second version; got %d versions", got)
+	}
+}
+
+func TestAmendAccountVersion_IdempotencyKeyReusedForOtherCommand_Returns409(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1000", AccountName: "Assets", AccountType: domain.AccountTypeAsset})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1010", AccountName: "Cash", AccountType: domain.AccountTypeAsset})
+
+	rec := doIdempotentRequest(r, http.MethodPost, "/v1/chart-of-accounts/1000/amend", map[string]any{
+		"account_name": "Assets (renamed)",
+	}, "principal-1", "one-key-one-command")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("amend: expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// The same key on a different command must conflict, not execute.
+	rec = doIdempotentRequest(r, http.MethodPost, "/v1/chart-of-accounts/1010/reparent", map[string]any{
+		"parent_account_id": s.accountsByCode["t1|1000"].AccountID,
+	}, "principal-1", "one-key-one-command")
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 when a key is reused for another command, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if s.accountsByCode["t1|1010"].Version != 1 {
+		t.Fatal("a conflicting key must not execute the other command")
 	}
 }
 
@@ -1808,10 +1996,10 @@ func TestGetAccountAsOf_ReturnsVersionInForceAtInstant(t *testing.T) {
 
 	created := s.accountVersions["t1|1000"][0].EffectiveFrom
 	amendAt := created.Add(time.Hour).Truncate(time.Second)
-	rec := doRequest(r, http.MethodPost, "/v1/chart-of-accounts/1000/amend", map[string]any{
+	rec := doIdempotentRequest(r, http.MethodPost, "/v1/chart-of-accounts/1000/amend", map[string]any{
 		"account_name":   "Cash on hand",
 		"effective_from": amendAt.Format(time.RFC3339),
-	}, "principal-1")
+	}, "principal-1", "amend-as-of")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("amend: expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}

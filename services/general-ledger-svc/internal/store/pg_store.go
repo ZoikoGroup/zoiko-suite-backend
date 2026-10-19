@@ -1247,23 +1247,116 @@ func currentAccountVersionEffectiveFrom(ctx context.Context, tx pgx.Tx, tenantID
 	return effectiveFrom, err
 }
 
+// ── ACC-01 command idempotency ───────────────────────────────────────────────
+//
+// AmendAccountVersion and ReparentAccount append a version row per call, so a
+// retried request could write a second identical version; expected_version
+// narrows that race but is not an idempotency key. command_idempotency
+// (migration 000017) records the key a successful command ran under,
+// following financial-control-svc's table and BeginExecution
+// lookup-then-record shape (internal/store/execution.go): look the key up
+// first — a matching command and account replays the account as it now stands;
+// the same key for a different command or account is a conflict — otherwise
+// run the command and record the key in the same transaction as the real
+// write. The key is recorded only after the write has succeeded, so a refused
+// command never consumes it.
+
+// Command names recorded in command_idempotency.command.
+const (
+	commandAmendAccount    = "AMEND_ACCOUNT_VERSION"
+	commandReparentAccount = "REPARENT_ACCOUNT"
+)
+
+// commandIdempotencyRecord is the identity a claimed key was recorded under.
+type commandIdempotencyRecord struct {
+	Command     string
+	AccountCode string
+}
+
+// lookupCommandIdempotency answers whether this key has already run, and
+// under which command and account. It does not claim anything; the claim is
+// the insert that happens after the write.
+func lookupCommandIdempotency(ctx context.Context, tx pgx.Tx, tenantID, idempotencyKey string) (commandIdempotencyRecord, bool, error) {
+	var rec commandIdempotencyRecord
+	err := tx.QueryRow(ctx, `
+		SELECT command, account_code FROM command_idempotency
+		WHERE tenant_id = $1 AND idempotency_key = $2
+	`, tenantID, idempotencyKey).Scan(&rec.Command, &rec.AccountCode)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return commandIdempotencyRecord{}, false, nil
+	}
+	if err != nil {
+		return commandIdempotencyRecord{}, false, mapPgError(err)
+	}
+	return rec, true, nil
+}
+
+// recordCommandIdempotency claims the key for a command that has just
+// succeeded, in the same transaction as the write it protects.
+func recordCommandIdempotency(ctx context.Context, tx pgx.Tx, tenantID, idempotencyKey, command, accountCode string) error {
+	_, err := tx.Exec(ctx, `
+		INSERT INTO command_idempotency (tenant_id, idempotency_key, command, account_code)
+		VALUES ($1, $2, $3, $4)
+	`, tenantID, idempotencyKey, command, accountCode)
+	return mapPgError(err)
+}
+
+// readAccountForReplay re-reads the account a recorded key belongs to, as the
+// account now stands — the same "the entity as it is now" replay
+// financial-control-svc returns for a run from BeginExecution.
+func readAccountForReplay(ctx context.Context, tx pgx.Tx, tenantID, accountCode string) (*domain.Account, error) {
+	a, err := scanAccount(tx.QueryRow(ctx, `
+		SELECT `+accountColumns+` FROM chart_of_accounts
+		WHERE tenant_id = $1 AND account_code = $2
+	`, tenantID, accountCode))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrAccountNotFound
+	}
+	return a, mapPgError(err)
+}
+
 // AmendAccountVersion appends a new immutable version and advances the head
 // row in the same transaction. The head row is a projection for existing
 // readers; history lives only in account_versions. expectedVersion, when
 // non-zero, is an optimistic-concurrency guard and is checked under the row
 // lock, not before it.
+//
+// idempotencyKey is the caller's Idempotency-Key. A key already recorded for
+// this command and account replays the account as it now stands and appends
+// nothing; a key recorded for a different command or account is a conflict;
+// an unrecorded key runs the amendment and is recorded in the same
+// transaction. The second return value is true when the call replayed.
 func (s *PgStore) AmendAccountVersion(
 	ctx context.Context,
-	tenantID, accountCode string,
+	tenantID, accountCode, idempotencyKey string,
 	expectedVersion int64,
 	effectiveFrom time.Time,
 	a *domain.Account,
 	reason string,
 	evidenceRefs []string,
 	principalID string,
-) (*domain.Account, error) {
+) (*domain.Account, bool, error) {
 	var out *domain.Account
+	replay := false
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		claimed, claimedOK, err := lookupCommandIdempotency(ctx, tx, tenantID, idempotencyKey)
+		if err != nil {
+			return err
+		}
+		if claimedOK {
+			if claimed.Command != commandAmendAccount || claimed.AccountCode != accountCode {
+				return fmt.Errorf("%w: key was claimed by %s on %s",
+					domain.ErrIdempotencyKeyConflict, claimed.Command, claimed.AccountCode)
+			}
+			replay = true
+			replayed, err := readAccountForReplay(ctx, tx, tenantID, accountCode)
+			if err != nil {
+				return err
+			}
+			out = replayed
+			return nil
+		}
+
 		cur, err := accountForUpdate(ctx, tx, tenantID, accountCode)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.ErrAccountNotFound
@@ -1323,13 +1416,16 @@ func (s *PgStore) AmendAccountVersion(
 		if tag.RowsAffected() == 0 {
 			return domain.ErrAccountVersionConflict
 		}
+		if err := recordCommandIdempotency(ctx, tx, tenantID, idempotencyKey, commandAmendAccount, accountCode); err != nil {
+			return err
+		}
 		out = &updated
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return out, nil
+	return out, replay, nil
 }
 
 // GetAccountAsOf reconstructs the account version in force at asOf. The
@@ -1593,18 +1689,43 @@ func (s *PgStore) ActivateAccount(ctx context.Context, tenantID, accountCode str
 //     hierarchy change across a closed period; this chart has no legal entity
 //     or book on which to ask a close service which periods are open, so the
 //     conservative interpretation is to refuse backdating outright.
+//
+// idempotencyKey is the caller's Idempotency-Key. A key already recorded for
+// this command and account replays the account as it now stands and appends
+// nothing; a key recorded for a different command or account is a conflict;
+// an unrecorded key runs the move and is recorded in the same transaction.
+// The second return value is true when the call replayed.
 func (s *PgStore) ReparentAccount(
 	ctx context.Context,
-	tenantID, accountCode string,
+	tenantID, accountCode, idempotencyKey string,
 	parentAccountID *string,
 	expectedVersion int64,
 	effectiveFrom time.Time,
 	reason string,
 	evidenceRefs []string,
 	principalID string,
-) (*domain.Account, error) {
+) (*domain.Account, bool, error) {
 	var out *domain.Account
+	replay := false
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		claimed, claimedOK, err := lookupCommandIdempotency(ctx, tx, tenantID, idempotencyKey)
+		if err != nil {
+			return err
+		}
+		if claimedOK {
+			if claimed.Command != commandReparentAccount || claimed.AccountCode != accountCode {
+				return fmt.Errorf("%w: key was claimed by %s on %s",
+					domain.ErrIdempotencyKeyConflict, claimed.Command, claimed.AccountCode)
+			}
+			replay = true
+			replayed, err := readAccountForReplay(ctx, tx, tenantID, accountCode)
+			if err != nil {
+				return err
+			}
+			out = replayed
+			return nil
+		}
+
 		cur, err := accountForUpdate(ctx, tx, tenantID, accountCode)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.ErrAccountNotFound
@@ -1695,13 +1816,16 @@ func (s *PgStore) ReparentAccount(
 		if tag.RowsAffected() == 0 {
 			return domain.ErrAccountVersionConflict
 		}
+		if err := recordCommandIdempotency(ctx, tx, tenantID, idempotencyKey, commandReparentAccount, accountCode); err != nil {
+			return err
+		}
 		out = &updated
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return out, nil
+	return out, replay, nil
 }
 
 func (s *PgStore) DeactivateAccount(ctx context.Context, tenantID, accountCode string, expectedVersion int64, effectiveFrom time.Time, reason string, evidenceRefs []string, principalID string) (*domain.Account, error) {
