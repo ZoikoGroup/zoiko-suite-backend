@@ -327,6 +327,52 @@ var validAccountTypes = map[AccountType]bool{
 
 func IsValidAccountType(t AccountType) bool { return validAccountTypes[t] }
 
+// Normal balance sides (ACC-01 "Required source inputs": normal_balance).
+const (
+	NormalBalanceDebit  = "DEBIT"
+	NormalBalanceCredit = "CREDIT"
+)
+
+// NormalBalance is the side on which an account of this type normally
+// carries its balance, by standard accounting convention: ASSET and EXPENSE
+// are debit-normal; LIABILITY, EQUITY and REVENUE are credit-normal.
+//
+// Derived from the type, never stored (SPEC_DEVIATIONS A2/B11): a separate
+// editable column could contradict the class. An unrecognised type returns
+// "", never a guess.
+func (t AccountType) NormalBalance() string {
+	switch t {
+	case AccountTypeAsset, AccountTypeExpense:
+		return NormalBalanceDebit
+	case AccountTypeLiability, AccountTypeEquity, AccountTypeRevenue:
+		return NormalBalanceCredit
+	default:
+		return ""
+	}
+}
+
+// MarshalJSON adds the read-only, derived normal_balance to every account
+// response (CreateAccount, GetAccount, ListAccounts, AmendAccountVersion,
+// Activate/Deactivate/ReparentAccount all return Account). It is computed
+// from AccountType on the way out, so it cannot disagree with it.
+func (a Account) MarshalJSON() ([]byte, error) {
+	type account Account // drops this method, so no recursion
+	return json.Marshal(struct {
+		account
+		NormalBalance string `json:"normal_balance,omitempty"`
+	}{account(a), a.AccountType.NormalBalance()})
+}
+
+// MarshalJSON adds normal_balance to an account version (GetAccountAsOf),
+// derived from the type in force in that version.
+func (v AccountVersion) MarshalJSON() ([]byte, error) {
+	type accountVersion AccountVersion
+	return json.Marshal(struct {
+		accountVersion
+		NormalBalance string `json:"normal_balance,omitempty"`
+	}{accountVersion(v), v.AccountType.NormalBalance()})
+}
+
 // Account is ACC-01's Chart of Accounts entry — the platform's first real
 // posting-account master (see migration 000007's doc comment). Kept as
 // its own authority, separate from JournalHeader/JournalLine, per the

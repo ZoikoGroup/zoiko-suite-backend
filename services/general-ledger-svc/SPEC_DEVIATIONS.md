@@ -36,13 +36,11 @@ want to reverse are B1–B10.
   addition here. Consequence: two entities in one tenant cannot hold different
   versions of the same account code, and `GetAccountAsOf` answers for the
   tenant, not a book.
-- **A2. `normal_balance` is not implemented.** §"Required source inputs" lists
-  it; the account type implies a normal balance, and for control account
-  classes the server is expected to resolve it. The model carries
-  account_class/type, control flag and posting restriction, but no normal
-  balance, and no consumer has needed one yet. If a reporting consumer needs it,
-  the right shape is a derived value from the class (not an
-  independently-editable column that can contradict the class).
+- **A2. `normal_balance` is not implemented. — Closed (B11).** Every
+  account response now carries a read-only `normal_balance`, derived from
+  `account_type` by `AccountType.NormalBalance()`: ASSET and EXPENSE are
+  `DEBIT`; LIABILITY, EQUITY and REVENUE are `CREDIT`. Nothing is stored.
+  There is no column and no migration, so it can never contradict the type.
 - **A3. No Draft → Approved state and no approver on the record.** The spec's
   state model is "Draft → Approved → Active → Inactive/Superseded", and
   "approver … retained with every material change". Accounts here are created
@@ -210,3 +208,20 @@ want to reverse are B1–B10.
   untouched, and `GetAccountAsOf` reconstructs v1 (closed at the amendment),
   v2 at the half-open boundary and 404 before creation. `go build ./...`,
   `go test ./...` and the integration suite are green.
+- **B11. `normal_balance` is derived on output, not stored (A2).** It is
+  computed in `MarshalJSON` on `domain.Account` and `domain.AccountVersion`,
+  the two shapes every account endpoint returns: CreateAccount, GetAccount,
+  ListAccounts, AmendAccountVersion, Activate/Deactivate/ReparentAccount
+  (Account) and GetAccountAsOf (AccountVersion, using the type in force in
+  that version). No handler builds the field itself, so a future account
+  endpoint gets it automatically, and no command's request, validation or
+  write path changed. A `normal_balance` sent in a request is ignored; it
+  is not an input. The spec says that for control account classes "the
+  server is expected to resolve" the normal balance. Type is the only input
+  today, and a control account takes its type's side. If a contra or
+  control class that reverses the side is ever modelled, the derivation
+  belongs in `NormalBalance()`, still not in a column. An unrecognised type
+  yields no `normal_balance` rather than a guessed one. Covered by
+  `internal/handler/acc01_normal_balance_test.go`: the mapping for all five
+  types, the field on Create/Get/List/as-of responses, and a request
+  carrying `normal_balance` being unable to set it.
