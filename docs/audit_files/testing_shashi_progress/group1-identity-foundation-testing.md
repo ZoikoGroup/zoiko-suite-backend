@@ -4,6 +4,19 @@
 
 **Last Updated:** 2026-10-16
 
+> **Correction, 19 Oct 2026.** The Group 1 re-audit of 19 Oct (see
+> `../Identity, Scope & Foundation-audit-2026-09-23.md`, "Group 1 re-audit, 19 October 2026" and
+> "Fixes, 19 October 2026") found that several statements below did not hold:
+> - identity-context-svc: "All in-repo code is complete — wiring done" was wrong. The OIDC provider,
+>   login throttling, DPoP, multi-key signing and the status lifecycle were compiled but never
+>   constructed in `cmd/server`, and the Docker image could not be built (F-4, F-5).
+> - "Event dual-emit retired" removed `principal.status.changed`, which authorization-svc still
+>   consumes; the status route emitted neither name (F-3).
+> - delegated-authority-svc: the 16 Oct idempotency change broke every create (F-1).
+> - tenant-entity-registry-svc: entity commands were authorized at the caller's entity (F-2).
+>
+> All of these are fixed and verified as of 19 Oct; the audit file has the evidence.
+
 ---
 
 # identity-context-svc (Port 8080) — Tier 0 Identity & Session Service

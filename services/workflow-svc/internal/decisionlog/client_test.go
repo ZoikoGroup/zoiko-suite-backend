@@ -14,26 +14,17 @@ import (
 
 // Matches the params sent by the client (fields have no JSON tags, so Go uses field names)
 type recordDecisionRequest struct {
-	TenantID                  string   `json:"TenantID"`
-	LegalEntityID             string   `json:"LegalEntityID"`
-	ActorPrincipalID          string   `json:"ActorPrincipalID"`
-	ActionType                string   `json:"ActionType"`
-	ResourceType              string   `json:"ResourceType"`
-	ResourceID                string   `json:"ResourceID"`
-	Outcome                   string   `json:"Outcome"`
-	Rationale                 *string  `json:"Rationale,omitempty"`
-	CorrelationID             string   `json:"CorrelationID"`
-	CausationID               *string  `json:"CausationID,omitempty"`
-	WorkflowType              string   `json:"WorkflowType"`
-	WorkflowDefinitionID      *string  `json:"WorkflowDefinitionID,omitempty"`
-	WorkflowDefinitionVersion *int     `json:"WorkflowDefinitionVersion,omitempty"`
-	EvidenceRefs              []string `json:"EvidenceRefs,omitempty"`
-	SubjectType               *string  `json:"SubjectType,omitempty"`
-	SubjectID                 *string  `json:"SubjectID,omitempty"`
-	SubjectVersion            *int     `json:"SubjectVersion,omitempty"`
-	SubjectFingerprint        *string  `json:"SubjectFingerprint,omitempty"`
+	DecisionID         string         `json:"decision_id"`
+	TenantID           string         `json:"tenant_id"`
+	LegalEntityID      string         `json:"legal_entity_id"`
+	ActionType         string         `json:"action_type"`
+	Outcome            string         `json:"outcome"`
+	RuleBasis          string         `json:"rule_basis"`
+	CorrelationID      string         `json:"correlation_id"`
+	WorkflowInstanceID *string        `json:"workflow_instance_id,omitempty"`
+	CausationID        *string        `json:"causation_id,omitempty"`
+	EvaluationContext  map[string]any `json:"evaluation_context,omitempty"`
 }
-
 type recordDecisionResponse struct {
 	DecisionID string `json:"decision_id"`
 }
@@ -51,8 +42,14 @@ func TestHTTPClient_RecordDecision_Success(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Errorf("decode failed: %v", err)
 		}
+		if req.DecisionID == "" {
+			t.Errorf("DecisionID must be generated")
+		}
 		if req.TenantID != "t-1" {
 			t.Errorf("TenantID = %q, want t-1", req.TenantID)
+		}
+		if req.RuleBasis == "" {
+			t.Errorf("RuleBasis must be set")
 		}
 		if req.ActionType != "WORKFLOW_APPROVED" {
 			t.Errorf("ActionType = %q, want WORKFLOW_APPROVED", req.ActionType)

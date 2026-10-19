@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -207,24 +208,29 @@ func (c *HTTPClient) CheckDelegation(ctx context.Context, delegatePrincipalID, a
 		}
 	}
 
+	// authorization-svc exposes delegation through the documented
+	// /v1/delegated-access/evaluate operation, not /v1/authorize/delegation.
+	// The old path did not exist, so every delegated approval failed closed
+	// with a 503 even when the delegation was valid.
 	body, err := json.Marshal(map[string]string{
-		"delegate_principal_id": delegatePrincipalID,
-		"approver_principal_id": approverPrincipalID,
-		"legal_entity_id":       legalEntityID,
-		"tenant_id":             tenantID,
-		"action_type":           "WORKFLOW_DELEGATE",
+		"principal_id":    delegatePrincipalID,
+		"legal_entity_id": legalEntityID,
+		"tenant_id":       tenantID,
+		"action_type":     "WORKFLOW_DELEGATE",
 	})
 	if err != nil {
 		return fmt.Errorf("marshal delegation check request: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/authorize/delegation", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/delegated-access/evaluate", bytes.NewReader(body))
 	if err != nil {
 		return domain.ErrAuthorizationServiceUnavailable
 	}
 	req.Header.Set("Content-Type", "application/json")
-
-	// Forward envelope headers for audit trail
+	req.Header.Set("X-Tenant-Id", tenantID)
+	req.Header.Set("X-Principal-Id", delegatePrincipalID)
+	req.Header.Set("X-Legal-Entity-Id", legalEntityID)
+	req.Header.Set("X-Purpose-Context", "workflow_delegation_evaluation")
 	if requestID := ctx.Value("request_id"); requestID != nil {
 		req.Header.Set("X-Request-Id", requestID.(string))
 	}
@@ -237,6 +243,10 @@ func (c *HTTPClient) CheckDelegation(ctx context.Context, delegatePrincipalID, a
 	if idempotencyKey := ctx.Value("idempotency_key"); idempotencyKey != nil {
 		req.Header.Set("Idempotency-Key", idempotencyKey.(string))
 	}
+
+	// Forward the caller's canonical envelope for audit traceability and to
+	// fill any header the handler did not put in the context.
+	svcenvelope.ForwardTo(ctx, req)
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -252,11 +262,17 @@ func (c *HTTPClient) CheckDelegation(ctx context.Context, delegatePrincipalID, a
 		return domain.ErrAuthorizationServiceUnavailable
 	}
 
-	var out authorizeResponse
+	var out struct {
+		HasDelegatedAccess bool   `json:"has_delegated_access"`
+		Basis              string `json:"basis"`
+	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return domain.ErrAuthorizationServiceUnavailable
 	}
-	if out.DecisionOutcome != "GRANTED" {
+	if !out.HasDelegatedAccess {
+		return domain.ErrAuthorizationDenied
+	}
+	if approverPrincipalID != "" && !strings.Contains(out.Basis, approverPrincipalID) {
 		return domain.ErrAuthorizationDenied
 	}
 	return nil

@@ -27,7 +27,7 @@ const (
 	testLegacyID    = "550e8400-e29b-41d4-a716-446655440004"
 )
 
-// ── stub store ────────────────────────────────────────────────────────────────
+// â”€â”€ stub store â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 type stubStore struct {
 	instance         *domain.WorkflowInstance
@@ -164,6 +164,18 @@ type stubStore struct {
 	getValidationResultErr  error
 	pendingSubmissions      []*domain.FormSubmission
 	listPendingErr          error
+
+	workflowDefinition      *domain.WorkflowDefinition
+	workflowDefinitions     []*domain.WorkflowDefinition
+	definitionErr           error
+	escalateToInstance      *domain.WorkflowInstance
+	escalateToTransitioned  bool
+	escalateToErr           error
+	requestChangesErr       error
+	pendingInstances        []*domain.WorkflowInstance
+	listPendingApprovalsErr error
+	approvalTransitions     []*domain.WorkflowTransition
+	approvalEvidenceErr     error
 }
 
 func (s *stubStore) CreateForm(_ context.Context, _ domain.CreateFormParams) (*domain.FormDefinition, bool, error) {
@@ -204,6 +216,39 @@ func (s *stubStore) GetValidationResult(_ context.Context, _, _ string) (*domain
 }
 func (s *stubStore) ListPendingSubmissions(_ context.Context, _, _ string, _, _ int) ([]*domain.FormSubmission, error) {
 	return s.pendingSubmissions, s.listPendingErr
+}
+func (s *stubStore) EscalateToWorkflow(_ context.Context, _ domain.EscalateToWorkflowParams) (*domain.WorkflowInstance, bool, error) {
+	return s.escalateToInstance, s.escalateToTransitioned, s.escalateToErr
+}
+func (s *stubStore) RequestChanges(_ context.Context, _, _, _ string, _ *string) error {
+	return s.requestChangesErr
+}
+func (s *stubStore) ListPendingApprovals(_ context.Context, _ string, _, _ int) ([]*domain.WorkflowInstance, error) {
+	return s.pendingInstances, s.listPendingApprovalsErr
+}
+func (s *stubStore) GetApprovalEvidence(_ context.Context, _ string) ([]*domain.WorkflowTransition, error) {
+	return s.approvalTransitions, s.approvalEvidenceErr
+}
+func (s *stubStore) CreateWorkflowDefinition(_ context.Context, _ domain.CreateWorkflowDefinitionParams) (*domain.WorkflowDefinition, error) {
+	return s.workflowDefinition, s.definitionErr
+}
+func (s *stubStore) GetWorkflowDefinition(_ context.Context, _ domain.GetWorkflowDefinitionParams) (*domain.WorkflowDefinition, error) {
+	return s.workflowDefinition, s.definitionErr
+}
+func (s *stubStore) ListWorkflowDefinitions(_ context.Context, _ domain.ListWorkflowDefinitionsParams) ([]*domain.WorkflowDefinition, error) {
+	return s.workflowDefinitions, s.definitionErr
+}
+func (s *stubStore) SupersedeWorkflowDefinition(_ context.Context, _, _ string) error {
+	return s.definitionErr
+}
+func (s *stubStore) ActivateWorkflowDefinition(_ context.Context, _ string) error {
+	return s.definitionErr
+}
+func (s *stubStore) SuspendWorkflowDefinition(_ context.Context, _ string) error {
+	return s.definitionErr
+}
+func (s *stubStore) RetireWorkflowDefinition(_ context.Context, _ string) error {
+	return s.definitionErr
 }
 
 func (s *stubStore) CreateWorkflow(_ context.Context, _ domain.CreateWorkflowParams) (*domain.WorkflowInstance, []*domain.WorkflowStage, bool, error) {
@@ -370,7 +415,7 @@ func (s *stubStore) GetAuditEngagementReportGates(_ context.Context, _, _ string
 	return s.reportSignOffsOK, s.reportNotesOK, s.reportGatesErr
 }
 
-// ── stub publisher ───────────────────────────────────────────────────────────
+// â”€â”€ stub publisher â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 type stubPublisher struct {
 	startedCalls     int
@@ -420,7 +465,7 @@ func (p *stubPublisher) PublishFormEvent(_ context.Context, eventType string, _ 
 	return nil
 }
 
-// ── stub authz client ────────────────────────────────────────────────────────
+// â”€â”€ stub authz client â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 // stubAuthz records the action_type and resource owner of every CheckAllowed
 // call, so a test can assert which permission a route actually asked for.
@@ -428,12 +473,19 @@ type stubAuthz struct {
 	err    error
 	asked  []string
 	owners []string
+	// entities records the legal_entity_id every check was asked at, so a
+	// test can pin platform-scope ops to the PLATFORM sentinel.
+	entities []string
 }
 
-func (a *stubAuthz) CheckApprovalAllowed(_ context.Context, _, _, _ string) error { return a.err }
-func (a *stubAuthz) CheckAllowed(_ context.Context, _, _, action, owner string) error {
+func (a *stubAuthz) CheckApprovalAllowed(_ context.Context, _, legalEntityID, _ string) error {
+	a.entities = append(a.entities, legalEntityID)
+	return a.err
+}
+func (a *stubAuthz) CheckAllowed(_ context.Context, _, legalEntityID, action, owner string) error {
 	a.asked = append(a.asked, action)
 	a.owners = append(a.owners, owner)
+	a.entities = append(a.entities, legalEntityID)
 	return a.err
 }
 func (a *stubAuthz) CheckDelegation(_ context.Context, _, _, _ string) error { return a.err }
@@ -463,14 +515,14 @@ func newTestRouterFull(s *stubStore, p *stubPublisher, a *stubAuthz) chi.Router 
 }
 
 // scoped adds a verified X-Tenant-Id (read into context by
-// svcmiddleware.TenantContext) — enough for read routes, which only
+// svcmiddleware.TenantContext) â€” enough for read routes, which only
 // require a tenant, not a principal.
 func scoped(req *http.Request) *http.Request {
 	req.Header.Set("X-Tenant-Id", "t-1")
 	return req
 }
 
-// scopedAs adds both a verified X-Tenant-Id and X-Principal-Id — for
+// scopedAs adds both a verified X-Tenant-Id and X-Principal-Id â€” for
 // mutation routes, which require both.
 func scopedAs(req *http.Request, principalID string) *http.Request {
 	req.Header.Set("X-Tenant-Id", "t-1")
@@ -482,7 +534,7 @@ func validCreateBody() string {
 	return `{"tenant_id":"t-1","legal_entity_id":"le-1","workflow_type":"PURCHASE_APPROVAL","initiated_by":"requester-1","stages":[{"approver_principal_id":"approver-1"},{"approver_principal_id":"approver-2"}]}`
 }
 
-// ── CreateWorkflow ───────────────────────────────────────────────────────────
+// â”€â”€ CreateWorkflow â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 func TestCreateWorkflow_Created(t *testing.T) {
 	store := &stubStore{
@@ -573,7 +625,7 @@ func TestCreateWorkflow_ForeignTenantBody_Refused(t *testing.T) {
 }
 
 // TestCreateWorkflow_InitiatorAsApprover_Rejected enforces Segregation of
-// Duties (docs/original_doc/zoiko_suite_doc1.txt §12.3) at creation time:
+// Duties (docs/original_doc/zoiko_suite_doc1.txt Â§12.3) at creation time:
 // a workflow's initiator may not be listed as an approver in any stage.
 func TestCreateWorkflow_InitiatorAsApprover_Rejected(t *testing.T) {
 	r := newTestRouter(&stubStore{})
@@ -588,7 +640,7 @@ func TestCreateWorkflow_InitiatorAsApprover_Rejected(t *testing.T) {
 	}
 }
 
-// ── SubmitAction ─────────────────────────────────────────────────────────────
+// â”€â”€ SubmitAction â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 func TestSubmitAction_Approved_PublishesGrantedOnly_WhenNotFinalStage(t *testing.T) {
 	store := &stubStore{
@@ -720,7 +772,7 @@ func TestSubmitAction_WrongApprover(t *testing.T) {
 }
 
 // TestSubmitAction_InitiatorSelfApproval_Forbidden enforces Segregation of
-// Duties (docs/original_doc/zoiko_suite_doc1.txt §12.3) as defense-in-depth
+// Duties (docs/original_doc/zoiko_suite_doc1.txt Â§12.3) as defense-in-depth
 // at decision time: even if the workflow's initiator was (hypothetically,
 // via a path that bypasses CreateWorkflow's validation) recorded as the
 // assigned approver for the current stage, they must still be rejected.
@@ -759,7 +811,7 @@ func TestSubmitAction_InvalidAction(t *testing.T) {
 }
 
 func TestSubmitAction_IllegalTransitionEdge_NegativeControl(t *testing.T) {
-	// Negative Control per ZS-STATE-001 §4 step 4 & §18 T-01:
+	// Negative Control per ZS-STATE-001 Â§4 step 4 & Â§18 T-01:
 	// Attempt an illegal transition edge: CANCELLED -> APPROVE (target APPROVED).
 	// Terminal state cannot be transitioned forward.
 	store := &stubStore{
@@ -801,7 +853,7 @@ func TestSubmitAction_IllegalTransitionEdge_NegativeControl(t *testing.T) {
 	}
 }
 
-// ── Escalate / Cancel ────────────────────────────────────────────────────────
+// â”€â”€ Escalate / Cancel â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 func TestEscalateWorkflow_InvalidTransition(t *testing.T) {
 	store := &stubStore{
@@ -852,7 +904,7 @@ func TestCancelWorkflow_Success(t *testing.T) {
 	}
 }
 
-// ── GetNextApprover ──────────────────────────────────────────────────────────
+// â”€â”€ GetNextApprover â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 func TestGetNextApprover_NotFound(t *testing.T) {
 	store := &stubStore{currentStageErr: domain.ErrWorkflowNotFound}
@@ -892,7 +944,7 @@ func TestGetNextApprover_NoTenantScope_Refused(t *testing.T) {
 	}
 }
 
-// ── GetWorkflow ──────────────────────────────────────────────────────────────
+// â”€â”€ GetWorkflow â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Had zero test coverage of any kind before this fix.
 
 func TestGetWorkflow_Found(t *testing.T) {
@@ -923,7 +975,7 @@ func TestGetWorkflow_NoTenantScope_Refused(t *testing.T) {
 	}
 }
 
-// ── Subject Binding Tests ───────────────────────────────────────────────────
+// â”€â”€ Subject Binding Tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 func validSubjectFingerprint() string {
 	b := svcenvelope.NewFingerprintBuilder()
@@ -1031,7 +1083,7 @@ func TestCreateWorkflow_MissingSubjectField_BadRequest(t *testing.T) {
 	}
 }
 
-// ── InvalidateWorkflow Tests ────────────────────────────────────────────────
+// â”€â”€ InvalidateWorkflow Tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 func TestInvalidateWorkflow_Pending_Success(t *testing.T) {
 	fp := validSubjectFingerprint()
@@ -1056,6 +1108,7 @@ func TestInvalidateWorkflow_Pending_Success(t *testing.T) {
 
 	body := `{"reason_code":"CONTROL_FAILURE","narrative":"material vendor bank account changed"}`
 	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/"+testWorkflowID+"/invalidate", bytes.NewBufferString(body)), "admin-1")
+	req.Header.Set("X-Expected-Version", "1")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -1085,6 +1138,7 @@ func TestInvalidateWorkflow_Approved_Success(t *testing.T) {
 
 	body := `{"reason_code":"CANCEL_CUSTOMER_REQUEST"}`
 	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/"+testApprovedID+"/invalidate", bytes.NewBufferString(body)), "admin-1")
+	req.Header.Set("X-Expected-Version", "1")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -1116,6 +1170,7 @@ func TestInvalidateWorkflow_IdempotentReplay_DoesNotRepublish(t *testing.T) {
 
 	body := `{"reason_code":"CONTROL_FAILURE"}`
 	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/"+testWorkflowID+"/invalidate", bytes.NewBufferString(body)), "admin-1")
+	req.Header.Set("X-Expected-Version", "1")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -1132,6 +1187,7 @@ func TestInvalidateWorkflow_InvalidReasonCode_BadRequest(t *testing.T) {
 
 	body := `{"reason_code":"NON_GOVERNED_CUSTOM_REASON"}`
 	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/"+testWorkflowID+"/invalidate", bytes.NewBufferString(body)), "admin-1")
+	req.Header.Set("X-Expected-Version", "1")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -1145,6 +1201,7 @@ func TestInvalidateWorkflow_MissingReasonCode_BadRequest(t *testing.T) {
 
 	body := `{"narrative":"missing reason code"}`
 	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/"+testWorkflowID+"/invalidate", bytes.NewBufferString(body)), "admin-1")
+	req.Header.Set("X-Expected-Version", "1")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -1162,6 +1219,7 @@ func TestInvalidateWorkflow_TerminalState_Conflict(t *testing.T) {
 
 	body := `{"reason_code":"CONTROL_FAILURE"}`
 	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/"+testWorkflowID+"/invalidate", bytes.NewBufferString(body)), "admin-1")
+	req.Header.Set("X-Expected-Version", "1")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -1181,11 +1239,12 @@ func TestInvalidateWorkflow_TerminalState_Conflict(t *testing.T) {
 	}
 }
 
-// ── VerifyRelease Tests ─────────────────────────────────────────────────────
+// â”€â”€ VerifyRelease Tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 func TestVerifyRelease_ApprovedMatching_CanRelease(t *testing.T) {
 	fp := validSubjectFingerprint()
 	store := &stubStore{
+		findInstance: &domain.WorkflowInstance{WorkflowInstanceID: testApprovedID, TenantID: "t-1", LegalEntityID: "le-1", WorkflowStatus: "APPROVED", InitiatedBy: "requester-1"},
 		verifyReleaseResult: &domain.ReleaseVerificationResult{
 			WorkflowInstanceID: testApprovedID,
 			CanRelease:         true,
@@ -1197,7 +1256,7 @@ func TestVerifyRelease_ApprovedMatching_CanRelease(t *testing.T) {
 	r := newTestRouter(store)
 
 	body := fmt.Sprintf(`{"current_subject_fingerprint":"%s","expected_subject_version":1}`, fp)
-	req := scoped(httptest.NewRequest(http.MethodPost, "/v1/workflows/"+testApprovedID+"/verify-release", bytes.NewBufferString(body)))
+	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/"+testApprovedID+"/verify-release", bytes.NewBufferString(body)), "approver-1")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -1214,6 +1273,7 @@ func TestVerifyRelease_ApprovedMatching_CanRelease(t *testing.T) {
 func TestVerifyRelease_FingerprintMismatch_Conflict(t *testing.T) {
 	reason := domain.ErrSubjectFingerprintMismatch.Error()
 	store := &stubStore{
+		findInstance: &domain.WorkflowInstance{WorkflowInstanceID: testApprovedID, TenantID: "t-1", LegalEntityID: "le-1", WorkflowStatus: "APPROVED", InitiatedBy: "requester-1"},
 		verifyReleaseResult: &domain.ReleaseVerificationResult{
 			WorkflowInstanceID: testApprovedID,
 			CanRelease:         false,
@@ -1227,7 +1287,7 @@ func TestVerifyRelease_FingerprintMismatch_Conflict(t *testing.T) {
 	// Caller presents modified fingerprint
 	liveFp := validSubjectFingerprint()
 	body := fmt.Sprintf(`{"current_subject_fingerprint":"%s"}`, liveFp)
-	req := scoped(httptest.NewRequest(http.MethodPost, "/v1/workflows/"+testApprovedID+"/verify-release", bytes.NewBufferString(body)))
+	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/"+testApprovedID+"/verify-release", bytes.NewBufferString(body)), "approver-1")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -1244,6 +1304,7 @@ func TestVerifyRelease_FingerprintMismatch_Conflict(t *testing.T) {
 func TestVerifyRelease_UnboundSubject_FailsSafely(t *testing.T) {
 	reason := domain.ErrWorkflowUnboundSubject.Error()
 	store := &stubStore{
+		findInstance: &domain.WorkflowInstance{WorkflowInstanceID: testLegacyID, TenantID: "t-1", LegalEntityID: "le-1", WorkflowStatus: "APPROVED", InitiatedBy: "requester-1"},
 		verifyReleaseResult: &domain.ReleaseVerificationResult{
 			WorkflowInstanceID: testLegacyID,
 			CanRelease:         false,
@@ -1255,7 +1316,7 @@ func TestVerifyRelease_UnboundSubject_FailsSafely(t *testing.T) {
 	r := newTestRouter(store)
 
 	body := fmt.Sprintf(`{"current_subject_fingerprint":"%s"}`, validSubjectFingerprint())
-	req := scoped(httptest.NewRequest(http.MethodPost, "/v1/workflows/"+testLegacyID+"/verify-release", bytes.NewBufferString(body)))
+	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/"+testLegacyID+"/verify-release", bytes.NewBufferString(body)), "approver-1")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -1270,10 +1331,12 @@ func TestVerifyRelease_UnboundSubject_FailsSafely(t *testing.T) {
 }
 
 func TestVerifyRelease_InvalidFingerprintFormat_BadRequest(t *testing.T) {
-	r := newTestRouter(&stubStore{})
+	r := newTestRouter(&stubStore{
+		findInstance: &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, TenantID: "t-1", LegalEntityID: "le-1", WorkflowStatus: "APPROVED", InitiatedBy: "requester-1"},
+	})
 
 	body := `{"current_subject_fingerprint":"bad-fingerprint"}`
-	req := scoped(httptest.NewRequest(http.MethodPost, "/v1/workflows/w-1/verify-release", bytes.NewBufferString(body)))
+	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/"+testWorkflowID+"/verify-release", bytes.NewBufferString(body)), "approver-1")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 

@@ -35,6 +35,7 @@ import (
 	"zoiko.io/workflow-svc/internal/documentvault"
 	svcenvelope "zoiko.io/workflow-svc/internal/envelope"
 	"zoiko.io/workflow-svc/internal/events"
+	"zoiko.io/workflow-svc/internal/evidence"
 	"zoiko.io/workflow-svc/internal/handler"
 	"zoiko.io/workflow-svc/internal/health"
 	svcmiddleware "zoiko.io/workflow-svc/internal/middleware"
@@ -142,6 +143,10 @@ func main() {
 
 	h := handler.New(pgStore, publisher, authzClient, documentVaultClient, log)
 	h = h.WithDecisionLogClient(decisionLogClient)
+	// AUD-07's contradiction check reads document-vault-svc's own AUD-06
+	// evidence state; without this wiring the check was skipped silently and
+	// a contradictory workpaper could be marked prepared.
+	h = h.WithEvidenceClient(evidence.NewHTTPClient(cfg.DocumentVaultServiceURL, log))
 	handler.RegisterRoutes(r, h)
 
 	// Outbox relay (ZS-STATE-001 Invariant I-13 / doc7 item 32):

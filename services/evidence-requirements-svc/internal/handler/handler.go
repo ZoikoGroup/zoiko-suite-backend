@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"reflect"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -28,8 +29,8 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/evidence-requirements-svc/internal/domain"
-	svcmiddleware "zoiko.io/evidence-requirements-svc/internal/middleware"
 	svcenvelope "zoiko.io/evidence-requirements-svc/internal/envelope"
+	svcmiddleware "zoiko.io/evidence-requirements-svc/internal/middleware"
 )
 
 // Store is the persistence contract the handler depends on.
@@ -212,18 +213,18 @@ func (h *Handler) Evaluate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	eval := &domain.EvidenceEvaluation{
-		EvaluationID:       uuid.NewString(),
-		TenantID:           tenantID,
-		LegalEntityID:      effectiveLegalEntityID,
-		DomainCode:         req.DomainCode,
-		ActionType:         req.ActionType,
-		Outcome:            outcome,
-		UnmetPayload:       unmetJSON,
+		EvaluationID:            uuid.NewString(),
+		TenantID:                tenantID,
+		LegalEntityID:           effectiveLegalEntityID,
+		DomainCode:              req.DomainCode,
+		ActionType:              req.ActionType,
+		Outcome:                 outcome,
+		UnmetPayload:            unmetJSON,
 		PresentArtifactsPayload: presentJSON,
 		EvaluatedForPrincipalID: principalID,
-		CorrelationID:      req.CorrelationID,
-		IdempotencyKey:     idempotencyKey,
-		RequirementIDs:     requirementIDs,
+		CorrelationID:           req.CorrelationID,
+		IdempotencyKey:          idempotencyKey,
+		RequirementIDs:          requirementIDs,
 	}
 
 	// Prepare outbox event for atomic write with evaluation (only for SATISFIED/MISSING)
@@ -234,12 +235,14 @@ func (h *Handler) Evaluate(w http.ResponseWriter, r *http.Request) {
 			eventType = "evidence.requirement.missing"
 		}
 		payload := map[string]any{
-			"evaluation_id":   eval.EvaluationID,
-			"tenant_id":       eval.TenantID,
-			"legal_entity_id": eval.LegalEntityID,
-			"domain_code":     eval.DomainCode,
-			"action_type":     eval.ActionType,
-			"outcome":         string(eval.Outcome),
+			"evaluation_id":              eval.EvaluationID,
+			"tenant_id":                  eval.TenantID,
+			"legal_entity_id":            eval.LegalEntityID,
+			"evaluated_for_principal_id": eval.EvaluatedForPrincipalID,
+			"correlation_id":             eval.CorrelationID,
+			"domain_code":                eval.DomainCode,
+			"action_type":                eval.ActionType,
+			"outcome":                    string(eval.Outcome),
 		}
 		if outcome == domain.OutcomeMissing {
 			payload["unmet"] = json.RawMessage(eval.UnmetPayload)
@@ -265,8 +268,21 @@ func (h *Handler) Evaluate(w http.ResponseWriter, r *http.Request) {
 		// No direct Kafka publish here anymore.
 	} else {
 		// Replay: return the ORIGINAL determination and do not republish.
-		// The stored unmet payload is authoritative — the catalog may have
+		// The stored unmet payload is authoritative �?" the catalog may have
 		// changed since, and the recorded decision must not be rewritten.
+		//
+		// A key replayed with a DIFFERENT request is not a retry: answering
+		// the original would report success for a determination that was
+		// never made (API standard: IDEMPOTENCY_MISMATCH).
+		if eval.DomainCode != req.DomainCode ||
+			eval.ActionType != req.ActionType ||
+			eval.LegalEntityID != effectiveLegalEntityID ||
+			eval.EvaluatedForPrincipalID != principalID ||
+			!jsonSemanticallyEqual(eval.PresentArtifactsPayload, presentJSON) {
+			writeError(w, http.StatusConflict, "idempotency_mismatch",
+				"Idempotency-Key was already used for a different evaluation request")
+			return
+		}
 		if err := json.Unmarshal(eval.UnmetPayload, &unmet); err != nil {
 			h.log.Warn("Evaluate: stored unmet payload unreadable on replay", zap.Error(err))
 			unmet = nil
@@ -598,6 +614,11 @@ func (h *Handler) CreateRequirement(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if req.LegalEntityID != nil && *req.LegalEntityID != "" && !isUUID(*req.LegalEntityID) {
+		writeError(w, http.StatusBadRequest, "invalid_field", "legal_entity_id must be a UUID")
+		return
+	}
+
 	// Get the Idempotency-Key from the envelope for replay protection
 	env, _ := svcenvelope.FromContext(r.Context())
 	idempotencyKey := env.IdempotencyKey
@@ -657,11 +678,32 @@ func (h *Handler) CreateRequirement(w http.ResponseWriter, r *http.Request) {
 		CorrelationID:         req.CorrelationID,
 		IdempotencyKey:        idempotencyKey,
 	}
+	requestedPayload := req.RequirementPayload
 	created, err := h.store.CreateRequirement(r.Context(), er)
 	if err != nil {
 		h.log.Error("CreateRequirement: store unavailable", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
 		return
+	}
+
+	if !created {
+		// Replay of the same key must describe the same requirement. The
+		// effective_from comparison only applies when the caller supplied
+		// one; an omitted value is server-assigned and legitimately differs
+		// between the original call and the retry.
+		effectiveFromMatches := req.EffectiveFrom == nil ||
+			er.EffectiveFrom.UTC().Truncate(time.Microsecond).Equal(effectiveFrom.UTC().Truncate(time.Microsecond))
+		if er.DomainCode != req.DomainCode ||
+			er.ActionType != req.ActionType ||
+			er.EvidenceType != req.EvidenceType ||
+			!optionalStringEqual(er.LegalEntityID, req.LegalEntityID) ||
+			er.CreatedByPrincipalID != principalID ||
+			!effectiveFromMatches ||
+			!jsonSemanticallyEqual(er.RequirementPayload, requestedPayload) {
+			writeError(w, http.StatusConflict, "idempotency_mismatch",
+				"Idempotency-Key was already used for a different requirement")
+			return
+		}
 	}
 
 	status := http.StatusOK
@@ -763,6 +805,33 @@ func (h *Handler) writeAuthzErr(w http.ResponseWriter, err error) {
 func isUUID(s string) bool {
 	_, err := uuid.Parse(s)
 	return err == nil
+}
+
+func optionalStringEqual(a, b *string) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
+}
+
+// jsonSemanticallyEqual compares two JSON values after decoding, so key
+// ordering and whitespace do not turn an honest retry into a mismatch. An
+// empty payload is normalised to {} because that is what the store persists.
+func jsonSemanticallyEqual(a, b []byte) bool {
+	if len(a) == 0 {
+		a = []byte(`{}`)
+	}
+	if len(b) == 0 {
+		b = []byte(`{}`)
+	}
+	var av, bv any
+	if err := json.Unmarshal(a, &av); err != nil {
+		return string(a) == string(b)
+	}
+	if err := json.Unmarshal(b, &bv); err != nil {
+		return string(a) == string(b)
+	}
+	return reflect.DeepEqual(av, bv)
 }
 
 // requireTenant reads the caller's verified tenant scope from context (set by

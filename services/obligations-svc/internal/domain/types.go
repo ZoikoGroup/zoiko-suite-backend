@@ -119,6 +119,9 @@ type CreateObligationParams struct {
 	SourceReference      string    `json:"source_reference"`
 	CreatedByPrincipalID string    `json:"created_by_principal_id"`
 	WorkflowID           *string   `json:"workflow_id,omitempty"`
+	// CorrelationID is the caller's trace id. The store uses it to write the
+	// obligation.created outbox record in the same transaction as the insert.
+	CorrelationID string `json:"-"`
 }
 
 // ListObligationsFilter holds optional filters for querying obligations.

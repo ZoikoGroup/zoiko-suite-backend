@@ -1,6 +1,6 @@
 # Group 1 — Identity, Scope & Foundation: documentation-compliance audit
 
-**Date:** 23 September 2026 (identity-context-svc re-audited 28 September 2026; tenant-entity-registry-svc re-audited live 29 September 2026; configuration-feature-flag-svc remediated 29 September 2026; secret-vault-integration-svc remediated 29 September 2026; gateway-auth-svc remediated and re-audited 29 September 2026; search-indexer-svc remediated, re-audited live and remediated again 30 September 2026; notification-svc remediated and verified live 30 September 2026, re-audited and six further defects fixed 5 October 2026, in-service gaps closed and full matrix scored 6 October 2026; delegated-authority-svc independently re-audited in two passes and seven defects fixed 6 October 2026; access-control-svc re-audited, two regressions and five gaps fixed 6 October 2026, and its unbuilt §5/§9/§24 scope built the same day; **all nine re-audited 7 October 2026, six findings, not yet fixed: see "Group 1 re-audit, 7 October 2026" at the end; every open gap, grouped by what it waits on, is in "07/10 re-audit gaps" after it**)
+**Date:** 23 September 2026 (identity-context-svc re-audited 28 September 2026; tenant-entity-registry-svc re-audited live 29 September 2026; configuration-feature-flag-svc remediated 29 September 2026; secret-vault-integration-svc remediated 29 September 2026; gateway-auth-svc remediated and re-audited 29 September 2026; search-indexer-svc remediated, re-audited live and remediated again 30 September 2026; notification-svc remediated and verified live 30 September 2026, re-audited and six further defects fixed 5 October 2026, in-service gaps closed and full matrix scored 6 October 2026; delegated-authority-svc independently re-audited in two passes and seven defects fixed 6 October 2026; access-control-svc re-audited, two regressions and five gaps fixed 6 October 2026, and its unbuilt §5/§9/§24 scope built the same day; all nine re-audited 7 October 2026, six findings, fixed 8 October: see "Group 1 re-audit, 7 October 2026"; every gap open then, grouped by what it waits on, is in "07/10 re-audit gaps" after it; **all nine re-audited again 19 October 2026: eight new findings (F-1 … F-8), none fixed yet, including a delegated-authority-svc create that fails on every call and an image identity-context-svc can no longer build: see "Group 1 re-audit, 19 October 2026" at the end**)
 **Scope:** all nine services of Group 1, audited one at a time.
 **Source of truth:** the original `.docx` specifications in `docs/architecture/`, **not** the
 per-service `openapi.yaml` / `asyncapi.yaml` artefacts. This is deliberate: auditing code
@@ -16,15 +16,15 @@ diff the two → report. Anything ambiguous in the documents is flagged **needs 
 
 | # | Service | Port | Spec audited against | Full match | Weighted |
 |---|---|---|---|---|---|
-| 1 | identity-context-svc | 8080 | GOV-01 §4 | **86%** on 7 Oct re-audit (95% on 28 Sep; was 73%) | **92%** (97% on 28 Sep; was 82%) |
-| 2 | tenant-entity-registry-svc | 8081 | ORG-02 + ORG-03 | **98%** (was 75%) | **99%** (was 80%) |
-| 3 | configuration-feature-flag-svc | 8086 | ZS-SVC-AA-001 (CFG-01…05) | **94%** on 7 Oct re-audit (96% on 29 Sep; was 12%) | **97%** (98% on 29 Sep; was 19%) |
-| 4 | secret-vault-integration-svc | 8087 | Security Standard §13, §9, §3.1 | **86%** (was 40%) | **93%** (was 52%) |
-| 5 | gateway-auth-svc | 8092 | Security §8 + GOV-01 ingress | **95%** (was 68%; 82% at re-audit) | **98%** (was 80%) |
-| 6 | search-indexer-svc | 8096 | ZS-SVC-AB-001 (ESR-01…05) | **96%** (was 86% recounted; published 90%) | **98%** (was 90%; published 93%) |
-| 7 | notification-svc | 8133 | ZS-SVC-Y-001 (NCD-01…05) | **92%** on 7 Oct re-audit, 34 of 37; 110-row matrix 85% (95% on 30 Sep; was 12%; 81% on 5 Oct re-audit of 43 rows, 95% after fixes; full spec matrix of 110 rows scored 6 Oct: **86%**) | **97%** (was 19%; 98% on 43 rows after fixes; 110-row matrix **92%**) |
-| 8 | delegated-authority-svc | 8136 | ORG-06 (delegation half) | **100%** (23 table rows; was 62% published, 48% recounted; 6 Oct re-audit found 83% in fact, 100% after fixes) | **100%** (was 69%; 57% recounted; 91% on 6 Oct re-audit before fixes) |
-| 9 | access-control-svc | 8137 | Authorization Standard §9 | **90%** (was 20% after the first 6 Oct pass; published 18% on 11; 10% recounted on its 10 rows) | **95%** (was 35%; 23% published; 20% recounted) |
+| 1 | identity-context-svc | 8080 | GOV-01 §4 | **93%** on 19 Oct re-audit, 41 of 44 (95% after the 8 Oct fixes; 86% on 7 Oct; 95% on 28 Sep; was 73%) | **95.5%** (96.6% on 8 Oct, published as 98%; 92% on 7 Oct; was 82%) |
+| 2 | tenant-entity-registry-svc | 8081 | ORG-02 + ORG-03 | **94%** on 19 Oct re-audit, 45 of 48 (98% on 29 Sep; was 75%) | **97%** (99% on 29 Sep; was 80%) |
+| 3 | configuration-feature-flag-svc | 8086 | ZS-SVC-AA-001 (CFG-01…05) | **96%**, unchanged on 19 Oct (94% on 7 Oct, 96% after the 8 Oct fixes; was 12%) | **98%** (97% on 7 Oct; was 19%) |
+| 4 | secret-vault-integration-svc | 8087 | Security Standard §13, §9, §3.1 | **86%**, unchanged on 19 Oct (was 40%) | **93%** (was 52%) |
+| 5 | gateway-auth-svc | 8092 | Security §8 + GOV-01 ingress | **100%** on 19 Oct: SEC-INV-05 closed 13 Oct (95% before; was 68%; 82% at re-audit) | **100%** (98% before; was 80%) |
+| 6 | search-indexer-svc | 8096 | ZS-SVC-AB-001 (ESR-01…05) | **96%**, unchanged on 19 Oct (was 86% recounted; published 90%) | **98%** (was 90%; published 93%) |
+| 7 | notification-svc | 8133 | ZS-SVC-Y-001 (NCD-01…05) | **95%**, 35 of 37, unchanged on 19 Oct (92% on 7 Oct, 95% after the 8 Oct fixes; was 12%); 110-row matrix 100 met, 7 partial, 3 not met after the 19 Oct Group A closure | **97%** (was 19%; 110-row matrix **94%**) |
+| 8 | delegated-authority-svc | 8136 | ORG-06 (delegation half) | **91%** on 19 Oct re-audit, 21 of 23: create fails on every call (100% on 6 Oct; was 62% published, 48% recounted; 6 Oct re-audit found 83% in fact, 100% after fixes) | **93.5%** (100% on 6 Oct; was 69%; 57% recounted) |
+| 9 | access-control-svc | 8137 | Authorization Standard §9 | **100%**, 10 of 10, unchanged on 19 Oct (since the 7 Oct fourth pass; 20% after the first 6 Oct pass; published 18% on 11; 10% recounted on its 10 rows) | **100%** (was 95%; 35%; 23% published; 20% recounted) |
 
 ---
 
@@ -2075,6 +2075,11 @@ attestation are now built (90%), and its one partial row waits on authorization-
 > **7 Oct re-audit:** the group total is now **283 of 303 (93.4%; 96.5% weighted)**. Services 1, 3 and
 > 7 each lost rows to self-asserted approvals or evidence gaps; the other six hold. See
 > "Group 1 re-audit, 7 October 2026" at the end of this document.
+>
+> **19 Oct re-audit:** after the 8 Oct fixes the total was 290 of 303 (95.7%; 97.9% weighted).
+> It is now **286 of 303 (94.4%; 96.9% weighted)**. Services 1, 2 and 8 lost rows to defects
+> introduced or exposed by the 14–16 Oct commits; service 5 gained its last row. See
+> "Group 1 re-audit, 19 October 2026" at the end of this document.
 
 ## The four findings that cross service boundaries
 
@@ -2261,7 +2266,7 @@ revoked role again.
 | ResolveTenantContext | QUERY: "read-only; scoped; **correlation required**" | `POST /v1/context/resolve` calls no correlation guard. Correlation is read from the body only; the handler copies channel, workload and causation from the envelope but not correlation (`internal/context/handler.go:296-300`) | ⚠️ (was ✅) | **Confirmed at the route.** No correlation → **200**, and the session is stored with `correlation_id = ""`. A correlation sent only as the `X-Correlation-ID` header → **200**, also stored as `""`. The `TenantContextResolutionFailed` events from that path carry the same empty value |
 | Correlation required (queries) | all three queries | enforced on 2 of 3 (GetEffectiveContext, ExplainContextResolution) | ⚠️ (was ✅) | The 28 Sep row read "both read queries"; ResolveTenantContext is the third |
 
-### R-7 · search-indexer-svc: the image can no longer be built (deployability, outside the scored rows)
+### R-7 · search-indexer-svc: the image can no longer be built (deployability, outside the scored rows; fixed 19 October 2026)
 
 The 5 Oct merge from main (`a2e27017`) replaced the two-stage `Dockerfile` with
 `COPY services/search-indexer-svc/server` and `…/healthcheck`. Neither file exists, and both are
@@ -2325,6 +2330,9 @@ the way the "Re-check" column says.
 
 Gap ids are `S<service>-<n>`, so S1 is identity-context-svc and S9 is access-control-svc.
 Where a gap came from the 7 Oct re-audit, its R-number is given too.
+
+> **19 Oct:** eight new group A gaps (S8-1, S2-1, S1-5 … S1-8, S6-3, S0-1), S1-C1 moved to
+> group B, and S5-B1 closed. See "Register changes, 19 October" at the end of this document.
 
 **Summary**
 
@@ -2471,8 +2479,9 @@ assignment failed to resolve; its openapi.yaml was not valid OpenAPI (duplicate 
 | 9 | access-control-svc | 9/10: 90% (95%) | **10/10: 100%** |
 | | **Group** | 283/303: 93.4% (96.5%) | **290/303: 95.7% (97.7%)** |
 
-Still open from the register's group A: S6-1/S6-2 (search-indexer Dockerfile and `EnsureIndex`), S7-2…S7-6
-(notification test/DLP items), S5-1 (GTRM on Windows) — none of them touch authorization.
+Closed on 19 October 2026: S6-1/S6-2 (search-indexer Dockerfile and `EnsureIndex`), S7-2…S7-6
+(notification test/DLP items) and S5-1 (GTRM on Windows). These were the last eight group A rows;
+group A now has no open gaps.
 
 # gateway-auth-svc cross-check and fixes, 13 October 2026
 
@@ -2598,3 +2607,298 @@ Everything is uncommitted.
 | MFA UI | Nothing in the console calls the MFA routes. | Frontend: enrolment QR, step-up prompt on `401 step_up_required`, admin reset page. |
 | Assurance | TOTP is not phishing-resistant. | Security approval of TOTP as the interim factor (ZS-IAM-001 §31 "session assurance taxonomy"); WebAuthn later. |
 | S5-B2, S4-B1, S3-D1, S5-D1–D3 | Unchanged from the 13 Oct table above. | As listed there. |
+
+# Group A closure, 19 October 2026: search, notification evidence and GTRM
+
+Closed the last eight service-local Group A rows. Group A now has no open gaps. Uncommitted.
+
+| ID | Service | Fix | Proof |
+|---|---|---|---|
+| S6-1 (R-7) | search-indexer-svc | Two-stage Dockerfile (Go 1.25 builder → distroless nonroot); it builds both binaries from source. The repo-root build context is required because `go.mod` replaces `zoiko.io/search-client` with the sibling module. | `docker build -f services/search-indexer-svc/Dockerfile .` completed; image `zoiko/search-indexer-svc:r7-test` exported. |
+| S6-2 | search-client | `EnsureIndex` reads `resp.StatusCode` (200 = exists, 404 = create, anything else = error) instead of matching `"404"` in error text. | `TestEnsureIndex_CreatesOnlyOnNotFound` (httptest, non-404 and 404 cases); `go test ./searchclient/...` passes. |
+| S7-2 (NP-34) | notification-svc | Provider callbacks may carry `attachment_hashes`; a non-nil manifest is compared exactly with the pinned render. Missing, extra or changed slots raise `ATTACHMENT_HASH_MISMATCH`, record `ATTACHMENT_MISMATCH`, and do not advance the attempt. Migration 000032 adds both values. | `TestNP34_ProviderAttachmentHashMismatchIsQuarantined`. Live operation still needs certified adapters to send the manifest. |
+| S7-3 (NP-57) | notification-svc | Added the NCD stranded-attempt test. | `TestNP57_StrandedSubmittingAttemptBecomesUnknown`: SUBMITTING → UNKNOWN, resolution deadline, one durable `PROVIDER_UNKNOWN` row. Setup disables the transition trigger because production forbids ACCEPTED→SUBMITTING. |
+| S7-4 (INV-29) | notification-svc | Added the read-only projection test. | `TestINV29_ProjectionRoleCannotMutateAuthoritativeState`: selects succeed and updates fail on communications, attempts and suppressions. |
+| S7-5 (TC-03) | notification-svc | Added fuzz coverage. | `FuzzRenderEscapesAndRefusesHeaderInjection`, `FuzzValidateVariablesTypes`. |
+| S7-6 (TC-18) | notification-svc | Added the sensitive-content exposure test. | `TestTC18_SensitiveValuesBlockedOnLowConfidentialitySurfaces`: S2/S3 in subject/body/link refused; S2 allowed only in-app; named sensitive terms refused. |
+| S5-1 | deployments/gtrm | `configBody` normalises CRLF before stripping provenance. | `TestConfigBodyIgnoresProvenanceAndLineEndings`; `go run . --check --map ../routing-map.yaml --regions ../regions.yaml --out ../compiled-traefik.yml` reports no drift on Windows. |
+
+**Scores.** notification-svc's matrix is now **100 / 110 met, 7 partial, 3 not met (94%
+weighted)**; all ten short rows depend on another component. The notification suite passes with
+`go test -p 1 ./...` against one test database. Run it serially: packages share `TEST_DATABASE_URL`,
+and parallel packages reset the schema under each other.
+
+---
+
+# Group 1 re-audit, 19 October 2026: all nine services
+
+**Why.** Eight commits touched Group 1 between 8 and 17 October, and none of them had been
+re-audited. Three say the group is finished:
+- `cbdb4aa1` (16 Oct): "resolve all code-fixable gaps across 9 services";
+- `d9a88c08` (15 Oct): "Group 1 complete";
+- the 16 Oct testing record, `testing_shashi_progress/group1-identity-foundation-testing.md`:
+  "All in-repo code is complete — builds, tests pass, wiring done".
+
+This pass checks those claims.
+
+**How.** Each service was re-read against the same `.docx` sections as before, with no credit
+taken from earlier passes:
+1. Every change since 7 October was listed and read.
+2. Every fix claimed in the 8, 13, 14 and 19 October sections above was re-checked in the
+   current code.
+3. The code was checked against the defect shapes this group keeps producing:
+   - approvals the requester asserts;
+   - state changes with no status guard;
+   - consumers that drop work on failure;
+   - controls that are built but never called (grep the callers, not the definitions);
+   - authorization asked about the wrong object.
+4. Every package was built, vetted and tested, store suites included.
+
+Every finding was reproduced before it was scored. Throwaway tests drove the service code or
+ran against Postgres, and were deleted afterwards. Mutants ran on a scratch copy, never the
+working tree. **Nothing was fixed in this pass.**
+
+**Test evidence.** HEAD `240f044a`, plus the uncommitted 19 Oct Group A changes.
+
+| Service | Build, vet | Passed | Failed | Skipped | Notes |
+|---|---|---|---|---|---|
+| identity-context-svc | clean | 564 | 0 | 0 | Store suite: 64 tests on Postgres |
+| tenant-entity-registry-svc | clean | 628 | 0 | 1 | The skip needs a running service (live OpenAPI check) |
+| configuration-feature-flag-svc | clean | 266 | 0 | 0 | |
+| secret-vault-integration-svc | clean | 187 | 0 | 1 | The skip is a POSIX file-mode test that Windows cannot enforce |
+| gateway-auth-svc | clean | 89 | 0 | 0 | |
+| search-indexer-svc | clean | 292 | 0 | 0 | Store suite on Postgres |
+| notification-svc | clean | 750 | 0 | 21 | 18 skips are rows of the legacy direct-send path's NP matrix marked NOT BUILT; the NCD plane covers them, and the open legacy path is register row S7-C3. 3 need the store schema first and pass when re-run after it (see "Also noted") |
+| delegated-authority-svc | clean | 89 | **20** | 0 | Every store test that creates a delegation fails (F-1) |
+| access-control-svc | clean | 176 | 0 | 0 | `-tags=integration`: 37 store tests on its own embedded Postgres |
+| search-client (shared) | clean | 42 | 0 | 0 | |
+
+- **Database:** a throwaway Postgres 16.15 on `:55432`, one database per service.
+- **Not run:** the live compose stack, `audit.sh`, Kafka, and Docker builds (Docker Desktop
+  was not running). The image-build finding (F-4) was reproduced by building in the
+  Dockerfile's own context, outside Docker.
+- **CI** (public Actions API):
+  - The last two runs on `shashi-changes` failed:
+    - `75ca7b90` (14 Oct): accounts-receivable-svc's integration step, and gitleaks;
+    - `02a125c9` (15 Oct): the workflow-svc and obligations-svc builds, and gitleaks.
+  - All nine Group 1 jobs passed on `02a125c9`.
+  - **No CI run exists for `d9a88c08`, `06a2599c`, `cbdb4aa1` or `240f044a`.** That is why F-1
+    was not caught: CI runs delegated-authority-svc's store suite against a database, and 20
+    of its tests fail.
+
+## Scores
+
+| # | Service | Before (last published) | **19 Oct** | What changed |
+|---|---|---|---|---|
+| 1 | identity-context-svc | 42/44: 95% (96.6% weighted; published as 98%) | **41/44: 93.2% (95.5%)** | NP4 ✅ → ⚠️ (F-3) |
+| 2 | tenant-entity-registry-svc | 47/48: 98% (99%) | **45/48: 93.8% (96.9%)** | Rows 22 and 34 ✅ → ⚠️ (F-2) |
+| 3 | configuration-feature-flag-svc | 47/49: 96% (98%) | **47/49: 96% (98%)** | No change. The 8 Oct fixes hold: C2/C3 self-approval refused, `approved_at` set by the server, only PROPOSED/VALIDATED decidable |
+| 4 | secret-vault-integration-svc | 18/21: 86% (93%) | **18/21: 86% (93%)** | No change. Only envelope forwarding to authorization-svc changed |
+| 5 | gateway-auth-svc | 21/22: 95% (98%) | **22/22: 100%** | SEC-INV-05 ⚠️ → ✅. The peer mTLS listeners closed it on 13 Oct (verified live that day) and compose still wires both; the score table was never updated |
+| 6 | search-indexer-svc | 47/49: 96% (98%) | **47/49: 96% (98%)** | No row change. The new defect F-6 sits in the two semantic rows, which are already ⚠️ |
+| 7 | notification-svc | 35/37: 95% (97%) | **35/37: 95% (97%)** | No change. The NP-11 controlled exception still resolves `exception_ref` against a recorded approval |
+| 8 | delegated-authority-svc | 23/23: 100% | **21/23: 91.3% (93.5%)** | DelegateAuthority ✅ → ❌; idempotency scope ✅ → ⚠️ (F-1) |
+| 9 | access-control-svc | 10/10: 100% | **10/10: 100%** | No change |
+| | **Group** | **290/303: 95.7%** (296.5 weighted, 97.9%) | **286/303: 94.4%** (293.5 weighted, 96.9%) | |
+
+The group's previous weighted figure was published as 97.7%. Recomputed from the per-service
+counts it was 97.9%. The difference is identity-context-svc: on 8 Oct its weighted figure was
+published as 98%, but its rows then (42 met, 1 partial, 1 missing) give 96.6%. Both columns
+above use recomputed figures.
+
+## Findings, ranked by risk
+
+### F-1 · delegated-authority-svc: no delegation can be created (availability / auth)
+
+| Item | Documented | Implemented | Status | Notes |
+|---|---|---|---|---|
+| DelegateAuthority | ORG-06 §4.6 named command | `POST /v1/delegations` → `CreateDelegation` (`internal/store/pg_store.go:136-146`) | ❌ (was ✅) | **Confirmed on Postgres 16.** `cbdb4aa1` (16 Oct) added `idempotency_key` to the INSERT's column list and its argument list (25 of each), but left the VALUES list at `$1 … $24`. Every insert fails with `INSERT has more target columns than expressions (SQLSTATE 42601)`, and every create answers `503 store_unavailable`. The service's own store suite shows it: 20 of 24 store tests fail. The authority, SoD and self-dealing refusals run before the insert, so refusals are still recorded. Proposals and capped grants are made through create, so they cannot be made either. Revoke, expiry, extend and resume of existing grants are untouched in code |
+| Idempotency scoped by principal + role + scope + validity | §4.6 | Migration 000012 adds `idempotency_key` to the unique key `(tenant, correlation, maker, action, entity, from, to)` | ⚠️ (was ✅) | **Code.** Adding a column to a unique key makes it looser, not tighter. The migration's stated problem (a fresh correlation_id with a repeated Idempotency-Key creating a second grant) is already handled by the HTTP replay store, `internal/idempotency`, mounted at `cmd/server/main.go:535`. What changes is the reverse case: the same correlation_id with a new key is no longer a replay. It becomes a second insert, which the overlap constraint refuses with 409 for an ACTIVE grant and accepts as a duplicate for a PROPOSED one. Rows written before 000012 hold NULL, which `idempotency_key = $8` never matches, so their replays fail as well |
+
+Only these two rows are re-scored. The Proposed-state, AuthorityLimit and DelegationActivated
+rows are not separately downgraded, but none of them can be exercised until create works.
+
+### F-2 · tenant-entity-registry-svc: entity commands are authorized at the caller's entity, not the target (auth)
+
+| Item | Documented | Implemented | Status | Notes |
+|---|---|---|---|---|
+| 22 · Protected changes need current version + validated scope | ORG §4: "validated tenant/entity scope" | `authorize()` sends `domain.LegalEntityFromContext(ctx)`, the entity named on the **caller's envelope** (`internal/registry/service.go:1306`) | ⚠️ (was ✅) | **Confirmed in a throwaway service test.** With the envelope naming E1, both `UpdateEntity(E2)` and `TransitionEntityStatus(E2)` asked authorization-svc about E1. A principal holding `entity.update` or `entity.status.transition` at any one entity can therefore update or deactivate every entity in the tenant; RLS still stops other tenants. Nothing compares the target with the envelope entity. Introduced by `cbdb4aa1`, which fixed a real defect: the tenant id had been sent in the entity slot, so every guarded command answered 503 once authorization-svc enforced entity scope. The fix chose the wrong entity. The target entity is the right scope; notification-svc already authorizes at the target's `legal_entity_id` |
+| 34 · Sensitive identifier access scoped | ORG-03 "sensitive identifier access scoped" | `authorizeSensitiveRead` uses the same caller-entity scope (`internal/registry/org_gaps_service.go:576`) | ⚠️ (was ✅) | **Code.** A grant at E1 plus any declared purpose reads E2's RESTRICTED tax identity bundle. The approval checks (`approval_service.go:276-286`) use the same scope, so a checker scoped to one entity can approve another entity's legal-name change |
+
+### F-3 · identity-context-svc: disabling a principal ends no session and tells no other service (auth)
+
+| Item | Documented | Implemented | Status | Notes |
+|---|---|---|---|---|
+| NP4 · cache invalidation removes stale privilege promptly | GOV-01 §4 NP4; the Auth-Service audit's AU-01 (revocation must not wait for expiry) | `PUT /v1/principals/{id}/status` (`internal/context/handler.go:710`) → `store.UpdateStatus` updates the row and writes a decision-log row. Nothing else | ⚠️ (was ✅) | **Code.** `PublishPrincipalStatusChanged` has **no caller**, and had none on 7 Oct either. No `EvictAllForPrincipal` runs on a status change. Resolve refuses a non-ACTIVE principal (`resolver.go:329`), so new sessions stop, but live envelopes run to expiry (≤ 300 s). The lasting effect is in authorization-svc. Its principal-status projection (`lifecycle_consumer.go:157`) and cache invalidator (`invalidator.go:49`) act on `principal.status.changed`, which nothing emits, so authorization-svc keeps treating a disabled principal as ACTIVE indefinitely. The 28 Sep audit scored NP4 on the session, tenant and event-driven paths and never looked at the status route |
+
+The 16 Oct change (`cbdb4aa1`) made this look solved. It "retired" `principal.status.changed`
+in favour of `identity.subject.disabled` / `.enabled`, with the comment "retired once all
+consumers subscribed to identity.subject.*". Both halves are wrong:
+- authorization-svc subscribes only to the legacy name, and its consumer tests are built on it;
+- the live path emits neither name. The only code that emits either is the unwired lifecycle
+  service (F-5).
+
+`asyncapi.yaml` is also out of step: it still documents `principal.status.changed` and
+`session.invalidated`, and does not list `identity.subject.*` or `identity.session.revoked`.
+
+### F-4 · identity-context-svc: the image cannot be built from a clean checkout (deployability, outside the scored rows)
+
+`02a125c9` (15 Oct) added `replace zoiko.io/identity-envelope => ../identity-envelope` to
+`go.mod`. The Dockerfile and compose (`context: ../services/identity-context-svc`) use the
+service folder as the build context, so `../identity-envelope` does not exist inside the build.
+
+**Reproduced** by building a clean `git archive` of the service on its own:
+`go build ./cmd/server/` fails with `replacement directory ../identity-envelope does not exist`.
+
+This is R-7 again, now on the Tier 0 service. search-indexer-svc's R-7 fix (a repo-root build
+context) is the pattern to copy. That fix is itself still uncommitted, so the committed branch
+cannot build either image.
+
+### F-5 · identity-context-svc: about 5,100 lines of the auth plane are compiled but never run (claims / auth, outside the GOV-01 rows)
+
+`02a125c9` added:
+- an OIDC provider (`internal/oidc`): discovery, authorize with code + PKCE, token, refresh
+  rotation, revoke, introspect, logout, passkey and federated login;
+- a subject lifecycle (`internal/lifecycle`): invite, activation, password change and reset,
+  breached-password check;
+- SCIM and federation stores;
+- a login rate limiter;
+- multi-key and KMS signing (`keys.Load` with `JWT_SIGNING_KEYS`);
+- DPoP verification at resolve.
+
+`cmd/server/main.go` constructs none of it:
+- `oidc.New` and `RegisterRoutes` are never called, so `/.well-known/openid-configuration` and
+  `/oauth2/*` do not exist.
+- Nothing imports `internal/lifecycle`.
+- `WithLoginThrottle`, `WithAuthenticateEndpoint`, `WithLoginSessionEnder` and `WithDPoP` are
+  never called.
+- The keyring is loaded from the single PEM path (`main.go:271-276`). `JWT_SIGNING_KEYS`,
+  `JWT_VERIFY_ONLY_KEYS` and every other `AuthPlane` setting are loaded and then read by
+  nothing that runs.
+- The SCIM and federation stores have no callers at all, so no SCIM or federation endpoint
+  exists even in the unwired code.
+- `internal/oidc` and `internal/lifecycle` have no test files.
+
+So the Auth-Service audit rows this code was written for are still open in the running service:
+AU-01 (revocation), AU-04 (throttling), AU-05 (rotation), AU-06 to AU-11 and AU-27.
+`openapi.yaml` correctly lists none of these routes, which is why the route-parity test passes.
+The testing record's "wiring done" is wrong.
+
+Not scored against GOV-01, which does not require this code. Closing it needs the wiring; the
+D-4 and D-7 decisions it rests on were taken on 14 Oct.
+
+### F-6 · search-indexer-svc: the embedding provider would learn who searched for what (privacy, latent)
+
+`02a125c9` replaced the embedding client's trace-only headers with `svcenvelope.ForwardTo`
+(`internal/embedding/embedding.go:218`). The comment it removed explained why only the request
+and correlation ids were sent: the provider processes text and is not a party to the decision,
+and AB-001 §9.2 treats query text as personal data.
+
+**Confirmed in a throwaway test.** With an envelope in context, the provider receives
+`X-Principal-Id`, `X-Tenant-Id` and `X-Legal-Entity-Id` alongside the query text.
+
+No provider is configured yet (OD-10), so nothing has leaked. But the two semantic rows cannot
+be closed with the code as it is.
+
+### F-7 · identity-context-svc: token-verifier refusals are no longer tested (test coverage)
+
+`02a125c9` deleted `internal/auth/jwt_test.go` and `idp_test.go`: 26 tests covering wrong
+audience, wrong issuer, expiry, a missing `exp`, the wrong algorithm, a missing `sub`, a
+missing `tenant_id`, the wrong key and a tampered token. It added 11, mostly for the keyring,
+rotation, the client registry and the rate limiter. The only refusals they cover are a token
+signed by a foreign key, an envelope presented as an access token, and the old HS256 token.
+
+**Two mutants survive the auth, context and server suites:**
+- removing the audience, issuer and expiry-required options from `VerifyBearer`;
+- removing its `sub` and `tenant_id` checks.
+
+The verifier is correct today. Nothing would notice if it stopped being.
+
+### F-8 · repository: six Windows binaries committed (provenance / hygiene)
+
+`02a125c9` committed `server.exe` (23–38 MB each, about 190 MB in total) for identity-context,
+tenant-entity-registry, configuration-feature-flag, secret-vault-integration, gateway-auth and
+search-indexer, and it is pushed. `.gitignore` covers `services/*/server` but not `.exe`.
+
+Nothing builds from them today. They are still binaries of unknown provenance in the tree, the
+risk R-7 was about. The gitleaks job failed on the same commit; reading its log needs
+repository admin.
+
+### Also noted (not scored)
+
+- **Session concurrency cap** (`cbdb4aa1`, migration 000015). It works as described. Revoking
+  the oldest session records the reason but emits no `identity.session.revoked` and no SIEM
+  event, and the default cap of 5 applies to service-account principals too.
+- **notification-svc: three handler tests skip silently** unless the store suite has already
+  built the schema in the same database, and `go test ./...` runs `internal/handler` first:
+  - `TestNCDHTTP_ProviderEventsNeedSignature`;
+  - `TestNCDHTTP_UnsubscribeHandlingCannotBeDisabled`;
+  - `TestSend_OverAQuotaIsRefusedWith429AndRetryAfter`.
+
+  Re-run after the store suite, all three pass. In CI, where packages run in parallel against
+  one database, they can skip without anyone noticing.
+- **gofmt.** 44 committed Go files are not gofmt-formatted: identity-context 17,
+  secret-vault-integration 10, gateway-auth 4, access-control 4, tenant-entity-registry 3,
+  search-indexer 2, notification 2, delegated-authority 2. This was counted from the committed
+  content, so Windows line endings do not inflate it. CI has no gofmt gate.
+- **DoD artefacts are stale.** identity-context-svc's `RELEASE_CERTIFICATE.md` and
+  `scripts/audit.sh` date from 18 Sep. The 16 Oct testing record says `audit.sh` has stale
+  expectations: its support call names the caller as the approver.
+- **S1-C1 (entitlement) is no longer blocked on a missing service.** commercial-account-svc
+  serves COM-03 (`GET /v1/commercial/entitlements/effective`), and identity-context-svc has a
+  matching client (8 Oct) that is used only when `COMMERCIAL_ACCOUNT_URL` is set. Compose does
+  not set it. The row stays ❌ until it is wired and verified, but it moves from register
+  group C to group B.
+- **The shared `zoiko.io/identity-envelope` module is used only by identity-context-svc.** The
+  other eight services still accept `X-Principal-Id` / `X-Tenant-Id` on a direct call
+  (register R-3, estate).
+- **S1-B2 is unchanged.** The `IDENTITY_*` actions are registered in access-control-svc's
+  registry (000020), but only the local seed script grants them.
+
+## Claims checked
+
+| Claim | Where | Holds? |
+|---|---|---|
+| "All in-repo code is complete — builds, tests pass, wiring done" | identity-context-svc testing record, 16 Oct | **No.** Build and tests pass (564/564, reproduced). The image does not build (F-4) and the auth-plane code is not wired (F-5) |
+| "resolve all code-fixable gaps across 9 services" | `cbdb4aa1` | **No.** It introduced F-1 and F-2, and its event retirement rests on a false premise (F-3) |
+| Legacy event names "retired once all consumers subscribed" | `cbdb4aa1`, `internal/events/publisher.go` | **No** (F-3) |
+| delegated-authority "Idempotency-Key header as part of dedup key" | `cbdb4aa1` | **No.** It broke create (F-1) |
+| identity-context 564/564; tenant-registry 628 pass, 1 skip; configuration 266 | testing record | **Yes**, reproduced exactly |
+| notification-svc "all 25 packages pass" | `d9a88c08` | **Yes.** Every test package passes (750 tests) |
+| "Group A now has no open gaps" | 19 Oct section above | **Yes in code** (the tests pass), but uncommitted. search-indexer-svc's image fix is not on the branch |
+
+## Register changes, 19 October
+
+**New gaps, all in group A (fixable now inside the service):**
+
+| Id | Service | Gap | Fix | Re-check |
+|---|---|---|---|---|
+| S8-1 (F-1) | delegated-authority-svc | Create fails on every call; 000012 loosened the replay key | Give the VALUES list 25 placeholders. Take `idempotency_key` back out of the unique key (a new migration), and leave key-based replay to the HTTP replay store | Store suite 24/24. Same correlation_id with a new key → replay, not 409. A fresh correlation_id with the same key → replay from the middleware |
+| S2-1 (F-2) | tenant-entity-registry-svc | Entity commands, sensitive reads and their approvals are authorized at the caller's envelope entity | Authorize at the target entity, read from the row before the check. Keep the platform scope for platform decisions | Grant at E1 only: update E2 → 403, update E1 → 200, sensitive read of E2 → 403 |
+| S1-5 (F-3) | identity-context-svc | A status change emits no event and ends no session | In the status transaction, enqueue `principal.status.changed` (what authorization-svc consumes) as well as `identity.subject.*`, and run `EvictAllForPrincipal` on DISABLED / SUSPENDED. Fix `asyncapi.yaml` | Disable → sessions ended, authorization-svc's projection reads DISABLED, a decision for the principal is denied |
+| S1-6 (F-4) | identity-context-svc | The image cannot be built | Build context `services/` (or the repo root) with both modules copied, as search-indexer-svc does | `docker build` from a clean checkout succeeds |
+| S1-7 (F-5) | identity-context-svc | The auth plane is compiled but not constructed | Build the OIDC provider, lifecycle service, login throttle, DPoP verifier and keyring from `cfg.AuthPlane` in `main.go`; add tests for `internal/oidc` and `internal/lifecycle`; then re-score AU-01 … AU-11 | Discovery answers 200; a code + PKCE login works end to end; a password spray gets 429 |
+| S6-3 (F-6) | search-indexer-svc | Caller identity reaches the embedding provider | Restore trace-only headers and pin them with a test | The provider sees no `X-Principal-Id` or `X-Tenant-Id` |
+| S1-8 (F-7) | identity-context-svc | Verifier refusals untested | Restore the negative tests | Both mutants killed |
+| S0-1 (F-8) | repository | Six binaries committed | Remove them and ignore `services/*/*.exe` | `git ls-files '*.exe'` lists nothing under Group 1 |
+
+**Closed since the 7 Oct register:**
+- S5-B1 / SEC-INV-05 (13 Oct): gateway-auth-svc row → ✅.
+- The eight remaining group A rows (19 Oct, uncommitted): tests pass in this run.
+- S1-B1 backend (14 Oct). The console part stays open, so the source-channel row stays ⚠️
+  until the console sends its client credentials and `IDP_CLIENT_AUTH` is `required`.
+
+**Moved:** S1-C1 from group C to group B (see "Also noted").
+
+## Where to start
+
+1. **F-1.** One placeholder restores delegated-authority-svc's create; then undo the
+   unique-key change.
+2. **F-3.** Emit the status event and end sessions on disable. This is the deprovisioning
+   control.
+3. **F-2.** Authorize entity commands at the target entity.
+4. **F-4.** Fix identity-context-svc's build context, and commit search-indexer-svc's fix.
+5. **Get CI running on the branch** before anything else is called complete. F-1 would have
+   failed it.
+6. **F-5.** Wire the auth plane or take it out. Until it runs, the AU rows stay open.
+7. F-6, F-7, F-8.

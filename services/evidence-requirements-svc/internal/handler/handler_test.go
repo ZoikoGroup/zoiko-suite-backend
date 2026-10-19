@@ -388,14 +388,16 @@ func TestEvaluate_DocumentServiceUnavailable_Returns503(t *testing.T) {
 // nothing further.
 func TestEvaluate_Replay_DoesNotRepublish(t *testing.T) {
 	original := &domain.EvidenceEvaluation{
-		EvaluationID:  "eval-original",
-		TenantID:      testTenant,
-		LegalEntityID: testEntity,
-		DomainCode:    "FINANCE",
-		ActionType:    "JOURNAL_POST",
-		Outcome:       domain.OutcomeMissing,
-		UnmetPayload:  json.RawMessage(`[{"evidence_requirement_id":"req-SIGNATURE","evidence_type":"SIGNATURE","reason":"stored reason"}]`),
-		CorrelationID: "corr-1",
+		EvaluationID:            "eval-original",
+		TenantID:                testTenant,
+		LegalEntityID:           testEntity,
+		DomainCode:              "FINANCE",
+		ActionType:              "JOURNAL_POST",
+		Outcome:                 domain.OutcomeMissing,
+		UnmetPayload:            json.RawMessage(`[{"evidence_requirement_id":"req-SIGNATURE","evidence_type":"SIGNATURE","reason":"stored reason"}]`),
+		PresentArtifactsPayload: json.RawMessage(`null`),
+		EvaluatedForPrincipalID: testPrincipal,
+		CorrelationID:           "corr-1",
 	}
 	st := &stubStore{
 		effective:   []domain.EvidenceRequirement{requirement("SIGNATURE", domain.RequirementSpec{})},
@@ -414,6 +416,29 @@ func TestEvaluate_Replay_DoesNotRepublish(t *testing.T) {
 	assert.Equal(t, "stored reason", got.Unmet[0].Reason,
 		"the recorded decision is authoritative on replay, not a fresh re-evaluation")
 	assert.Empty(t, pub.published, "a replay must not republish the event")
+}
+
+// Reusing an Idempotency-Key for a different determination is a conflict,
+// not a replay: answering the original would report a decision that was
+// never made for this action.
+func TestEvaluate_IdempotencyMismatch_Returns409(t *testing.T) {
+	original := &domain.EvidenceEvaluation{
+		EvaluationID:            "eval-original",
+		TenantID:                testTenant,
+		LegalEntityID:           testEntity,
+		DomainCode:              "FINANCE",
+		ActionType:              "PAYMENT_RELEASE",
+		Outcome:                 domain.OutcomeMissing,
+		UnmetPayload:            json.RawMessage(`[]`),
+		PresentArtifactsPayload: json.RawMessage(`null`),
+		EvaluatedForPrincipalID: testPrincipal,
+	}
+	st := &stubStore{evaluation: original, evalCreated: false}
+	h := newRouter(st, &stubPublisher{}, &stubAuthz{}, &stubDocs{})
+
+	rec := do(t, h, http.MethodPost, "/v1/evidence/evaluate", evaluateBody(), testTenant, testPrincipal)
+	assert.Equal(t, http.StatusConflict, rec.Code)
+	assert.Contains(t, rec.Body.String(), "idempotency_mismatch")
 }
 
 func TestEvaluate_MissingTenant_Returns400(t *testing.T) {
@@ -508,6 +533,7 @@ func TestCreateRequirement_Idempotent_ReplayReturns200(t *testing.T) {
 		DomainCode:            "FINANCE",
 		ActionType:            "JOURNAL_POST",
 		EvidenceType:          "SUPPORTING_DOCUMENT",
+		CreatedByPrincipalID:  testPrincipal,
 		CorrelationID:         "corr-create-1",
 	}
 	st := &stubStore{created: false, requirement: existing}
@@ -519,6 +545,25 @@ func TestCreateRequirement_Idempotent_ReplayReturns200(t *testing.T) {
 	var got domain.EvidenceRequirement
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
 	assert.Equal(t, "req-existing", got.EvidenceRequirementID)
+}
+
+// Same key, different catalog row: must conflict rather than answer 200
+// with a requirement the caller did not just describe.
+func TestCreateRequirement_IdempotencyMismatch_Returns409(t *testing.T) {
+	existing := &domain.EvidenceRequirement{
+		EvidenceRequirementID: "req-existing",
+		TenantID:              testTenant,
+		DomainCode:            "FINANCE",
+		ActionType:            "JOURNAL_POST",
+		EvidenceType:          "SIGNATURE",
+		CreatedByPrincipalID:  testPrincipal,
+	}
+	st := &stubStore{created: false, requirement: existing}
+	h := newRouter(st, &stubPublisher{}, &stubAuthz{}, &stubDocs{})
+
+	rec := do(t, h, http.MethodPost, "/v1/admin/evidence-requirements", createBody(), testTenant, testPrincipal)
+	assert.Equal(t, http.StatusConflict, rec.Code)
+	assert.Contains(t, rec.Body.String(), "idempotency_mismatch")
 }
 
 func TestCreateRequirement_MissingFields_Returns400(t *testing.T) {

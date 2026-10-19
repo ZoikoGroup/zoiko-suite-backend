@@ -1,8 +1,8 @@
 # Group 2 — Governance Platform: Testing Progress
 
-**Scope:** 7 services (jurisdiction-rules-svc, governance-decision-log-svc, policy-svc, authorization-svc, obligations-svc, workflow-svc, schema-registry-svc)
+**Scope:** 7 services (jurisdiction-rules-svc, governance-decision-log-svc, policy-svc, obligations-svc, authorization-svc, workflow-svc, evidence-requirements-svc) — plus `schema-registry-svc`, audited out of sequence as a supporting service
 
-**Last Updated:** 2026-10-17
+**Last Updated:** 2026-10-19
 
 ---
 
@@ -852,6 +852,512 @@ Key DB evidence: access_decision_log=250 rows; outbox_events unpublished=234 wit
 
 ---
 
+# workflow-svc (Port 8090) — Service 15 · Group 2 (6/7) — Tier 0 Workflow & Approvals Engine
+
+**Group:** 2 — Governance Platform
+**Status:** ✅ **ALL TESTS PASSING** (235 test funcs / 28 files · 0 fail · race clean · **35/35 live probes green** on real binaries; commit-blocking compile break resolved · missing `000008` migration recovered · 24-file gofmt drift fixed · **2 integration defects fixed** [platform-scope sentinel, request-changes evidence] · cross-tenant read leak closed · `supersede` implemented) · **ZS-QA-001 live audit: GREEN** (service 15 of 17; sixth of Group 2)
+**Last Verified:** 2026-10-19 — static checks, full suite vs real Postgres 16, race suite in Docker `golang:1.25`, and a full live E2E (real `workflow-svc` + real `authorization-svc` binaries; scratch DBs `workflow_live` / `authorization_live`; Kafka, governance-decision-log, document-vault and OTLP endpoints intentionally unreachable)
+
+---
+
+## 🔬 ZS-QA-001 Formal Verification (2026-10-19)
+
+**Live acceptance result:** ✅ **build/vet clean; suite green; race clean; 35/35 live probes green** (against the ZS-QA-001 standard and the canonical-envelope write-strict contract; closes the authorization-svc "Workflow & Approvals — next Group 2 service" dependency noted at service 14).
+
+At HEAD the service did not compile; after recovery it passed static checks, the real-DB suite, the race suite, and a 35-probe live E2E against a real authorization-svc (real RBAC grants, real decision log). Findings in this pass:
+
+| Finding | Root Cause | Fix / Status |
+|---------|-----------|--------------|
+| **A — commit-blocking compile break** | `internal/handler/handler.go` redeclaration (`err :=` where `err` already exists), a handler-order issue, and a `WorkflowStore` interface missing methods the handler calls (test stub had drifted too) | ✅ Fixed (`err =`, ordering, interface + `stubStore` completed); `go build ./...` clean |
+| **B — missing migration `000008_add_escalation_target`** | The escalation-target column is referenced by the store, but the migration files were absent from `deployments/migrations/` | ✅ Recovered `000008_add_escalation_target.up.sql` / `.down.sql`; store integration suite green against real Postgres |
+| **C — gofmt drift in 24 files** | Import-grouping / blank-line drift across `internal/**` | ✅ `gofmt -w` on all → 0 drift; formatting-only (`git diff -w`) |
+| **D — cross-tenant read leak** | `GetWorkflowDefinition` query lacked the tenant predicate — a caller scoped to tenant B could read tenant A's definition by id | ✅ Tenant predicate added; live probe: cross-tenant read → `404 workflow_definition_not_found` |
+| **E — definition lifecycle stubs (501)** | `supersede` unimplemented; `activate` / `suspend` / `retire` / `request-changes` / `pending` / `evidence` were 501 stubs | ✅ `SupersedeWorkflowDefinition` implemented (atomic tx: supersede old + activate replacement, same tenant+type); stubs wired to real store methods; all live-verified (`200 {"status":"superseded"/"activated"/"suspended"/"retired"}`) |
+| **F — platform-scope sentinel integration bug** | Definition operations authorized with an empty `legal_entity_id`; authorization-svc rejects an empty entity (400) so **every definition write failed closed as 503**. authorization-svc accepts the literal sentinel `"PLATFORM"` (resolved to `AUTHZ_PLATFORM_SCOPE_ENTITY_ID`), and a tenant-wide grant covers that platform entity | ✅ `platformScopeSentinel = "PLATFORM"` added in workflow-svc `authorizeLifecycle` (kept in lockstep with authorization-svc's constant); live: definition create → 201 with authz `PERMIT basis rbac:role=R_WORKFLOW_LIVE`; stranger → 403 `no_grant`; new test `TestLifecycleAuthz_DefinitionOpsAskPlatformScope` |
+| **G — request-changes: 404 for an existing workflow + audit trail lied** | Store's `RequestChanges` UPDATE matched only `REJECTED`/`ESCALATED`; a 0-row UPDATE was conflated with "not found" → 404 for a PENDING instance. Transition row hardcoded `from_state='REJECTED'` (wrong for ESCALATED) and `acted_by='system'` (ignored the calling principal — the evidence trail lost the requester's identity) | ✅ Rewritten: `SELECT … FOR UPDATE` first — absent → `ErrWorkflowNotFound` (404), ineligible status → `ErrInvalidTransition` (409); transition records the true from-state and the actual actor; correlation carried; tenant `set_config` for RLS parity. Live: PENDING → 409; REJECTED → reopen 200 with DB row `REJECTED→PENDING acted_by=wf-approver-live`; new test `TestPgStore_RequestChanges_ReopensRejectedAndAttributesActor` |
+| **H — envelope write-strict behavior (verified, not a defect)** | Non-GET requests require the full canonical envelope (`X-Tenant-Id`, `X-Principal-Id`, `X-Request-Id`, `X-Correlation-ID`, `X-Source-Channel`, `Idempotency-Key`, `X-Legal-Entity-Id`); reads warn-only | ✅ Observed fail-closed live: 401 `envelope_incomplete` (missing actor), 400 `canonical input contract violated: legal_entity_id` (missing entity) — the service refuses malformed writes, as designed (INV-02) |
+
+**Verification evidence:**
+
+- Static: `go build ./...` / `go vet ./...` clean; `gofmt` clean (byte-level) after finding C; `go mod verify` clean
+- Suite: all packages green against real Postgres 16 (`TEST_DATABASE_URL` on `workflow_test`; store suite ~64s; harness self-applies every `*.up.sql` in filename order). The `internal/domain` test binary intermittently trips the host Application Control policy — passes when compiled outside the build cache (`go test -c -o <temp>`); environmental, not code
+- Race suite (CI-equivalent, Docker `golang:1.25` on `gdl-race-net` with real Postgres): all packages ok, **0 data races**
+- New tests this pass: `TestLifecycleAuthz_DefinitionOpsAskPlatformScope` (handler), `TestPgStore_RequestChanges_ReopensRejectedAndAttributesActor` (store, real DB)
+- **Live E2E (real `workflow-svc` on :18098 + real `authorization-svc` on :18099; scratch DBs `workflow_live` / `authorization_live`; 2026-10-19):**
+
+```text
+H  healthz                                    -> 200 {"status":"ok"}
+C1 create wf (2 stages)                       -> 201 PENDING stage 1
+C2/C3 get wf / next-approver                  -> 200 / 200 (stage 1 -> wf-approver-live)
+C4 approve stage 1                            -> 200 PENDING stage 2
+C5 approve stage 2                            -> 200 APPROVED
+C6 duplicate approve (completed wf)           -> 409 invalid_transition (documented: workflow not PENDING)
+C7 evidence                                   -> 200 transition chain
+C8 create wf2 / stranger approve attempt      -> 201 / 403 authorization_denied (authz DENY no_grant)
+C9 cancel own                                 -> 200 CANCELLED
+C10 create wf3 / escalate                     -> 201 / 200 ESCALATED
+C11 request-changes on PENDING                -> 409 invalid_transition (was 404 pre-fix — finding G)
+C12 reject stage 1                            -> 200 REJECTED
+C13 request-changes (reopen)                  -> 200 {"status":"changes_requested"}
+C14 get reopened                              -> 200 PENDING stage 1
+C15 evidence-wf5                              -> 200; DB row REJECTED->PENDING acted_by=wf-approver-live, rationale kept
+C16 pending approvals                         -> 200 [wf5]
+C17 invalidate approved wf1                   -> 200 INVALIDATED (decisionlog unreachable -> still 200: best-effort, fail-soft)
+E1 missing principal                          -> 401 envelope_incomplete (X-Principal-Id mandatory)
+E2 missing tenant                             -> 401 missing_tenant_scope
+E3 cross-tenant read                          -> 404 workflow_not_found
+D1/D2 create definition v1/v2 (PLATFORM sentinel) -> 201 / 201  authz PERMIT basis rbac:role=R_WORKFLOW_LIVE
+D3/D4 get definition / list definitions       -> 200 / 200
+D5 supersede v1 -> v2                         -> 200 {"status":"superseded"}
+D6/D7/D8 activate / suspend / retire          -> 200 {"status":"activated"} / {"status":"suspended"} / {"status":"retired"}
+D9 cross-tenant definition read               -> 404 workflow_definition_not_found
+D10 stranger definition create                -> 403 authorization_denied (authz DENY no_grant)
+Authz decision log (cumulative across this pass's rig runs):
+  WORKFLOW_APPROVE GRANTED x31 / DENIED x2; WORKFLOW_DEFINE GRANTED x18 / DENIED x3;
+  WORKFLOW_ADMINISTER x3; WORKFLOW_CANCEL x2; WORKFLOW_ESCALATE x2; WORKFLOW_INVALIDATE x2
+Outbox (Kafka intentionally down): publishes fail + retry, rows stay pending, requests unaffected
+```
+
+---
+
+## ✅ Completed Fixes
+
+| Area | Issue | Resolution |
+|------|-------|------------|
+| **Compile break** | `err :=` redeclaration, handler ordering, incomplete `WorkflowStore` interface | Fixed; build/vet clean (finding A) |
+| **Missing migration** | `000008_add_escalation_target` absent | Recovered up/down (finding B) |
+| **gofmt drift** | 24 files | `gofmt -w`; 0 drift; formatting-only (finding C) |
+| **Cross-tenant leak** | `GetWorkflowDefinition` had no tenant predicate | Predicate added; live 404 cross-tenant (finding D) |
+| **Definition lifecycle** | `supersede` 501; activate/suspend/retire stubs | Implemented + wired; live-verified (finding E) |
+| **Platform authorization** | Empty `legal_entity_id` → authz 400 → all definition writes 503 | `"PLATFORM"` sentinel; live PERMIT/DENY proven (finding F) |
+| **request-changes** | 404 for existing PENDING wf; audit row said `system` / wrong from-state | Status-aware store rewrite; honest evidence; 409 for ineligible status (finding G) |
+
+---
+
+## ⚠️ Partial / Pending (Within This Repo)
+
+| Item | Status | Details |
+|------|--------|---------|
+| **No `openapi.yaml` / README** | ⚠️ | ~80 routes served; no machine-readable contract (QA-024 diff impossible) and no README; authorization-svc's `openapi.yaml` + route-parity test is the pattern to copy |
+| **`progress.md` stale** | ⚠️ | Claims ~6 routes; the service serves ~80; sections on authz/document-vault wiring are out of date |
+| **Evidence client never wired** | ⚠️ | `internal/evidence` client exists (AUD-06) but is not constructed in `cmd/server/main.go` |
+| **Decisionlog body lacks JSON tags** | ⚠️ | `internal/decisionlog` request struct has no JSON tags (D-01/R-5) — harmless only while the receiver is permissive; fix before real gdl-svc integration |
+| **Duplicate migration prefixes** | ⚠️ | Two `000010_*` and two `000012_*` files (filename ordering keeps it deterministic, but ambiguous for tooling) |
+| **RLS gap (6 tables)** | ⚠️ | `workflow_definitions`, `workflow_stages`, `workflow_transitions`, `workflow_stage_quorum_*` and `outbox_events` lack RLS (24/30 tables covered). Code-level tenant checks are the actual gate today; an RLS migration is the defense-in-depth follow-up |
+
+---
+
+## ❌ External Dependencies (Not In This Repo)
+
+| Dependency | Owner Repo | Config Field | Why Not Done Here | What's Wired |
+|------------|-----------|--------------|-------------------|--------------|
+| **Authorization** | `authorization-svc` (Group 2 ✅) | `AUTHORIZATION_SERVICE_URL` | — | **Live-verified against the real service** this pass (RBAC grants, decision log, platform sentinel, fail-closed 403/503) |
+| **Governance decision log** | `governance-decision-log-svc` (Group 2 ✅) | `GOVERNANCE_DECISION_LOG_SERVICE_URL` | Endpoint blackholed in the rig | Recording is **best-effort** by design (`Don't fail the request — decision log is best-effort for now`): live-proven — invalidate succeeded 200 while gdl was unreachable |
+| **Document vault** | `document-vault-svc` | `DOCUMENT_VAULT_SERVICE_URL` | Endpoint blackholed in the rig | Client wired in main; not exercised live this pass |
+| **Kafka / event backbone** | Platform infra | `KAFKA_BROKERS` | Infrastructure, not code | Transactional outbox + relay; **backlog behavior proven live** (Kafka down → publishes retry, rows stay pending, requests unaffected) |
+| **OTLP collector** | Platform infra | `OTEL_EXPORTER_OTLP_ENDPOINT` | Infrastructure | Traces exporter retries silently with endpoint down (observed) |
+
+---
+
+## 📋 Architecture Decisions Requiring Human Input
+
+| # | Decision | Impact |
+|---|----------|--------|
+| 1 | **RLS for the remaining 6 workflow tables** — add a migration or keep code-level tenant checks as the gate | Defense-in-depth vs migration risk |
+| 2 | **`openapi.yaml` for workflow-svc** — the authz pattern (spec + route-parity test) is now established; adopt here too | QA-024 contract diff |
+| 3 | **Decisionlog contract alignment** — JSON tags + canonical envelope before wiring the real gdl-svc | Cross-service evidence contract |
+| 4 | **Duplicate migration prefixes (000010/000012)** — rename policy needed estate-wide | Migration tooling determinism |
+
+---
+
+## 🔧 What Would Unblock Full Closure
+
+| Blocker | Action Required | By Whom |
+|---------|-----------------|---------|
+| Real governance-decision-log endpoint | Boot gdl-svc and run the recording path end-to-end (fix JSON tags first) | Group 2 follow-up |
+| Real document-vault endpoint | Exercise evidence-attachment paths against the real service | Group 3 |
+| Kafka brokers | Provision backbone; verify relay publishes + consumer flows | Platform infra |
+| Application Control (host) | Allowlist `%TEMP%\go-build*` test binaries or keep the relocated-binary workaround | Local env |
+
+---
+
+## 📊 Test Evidence
+
+```bash
+# Native (Windows host, Go 1.25) vs real Postgres 16:
+$ TEST_DATABASE_URL=... go test ./... -count=1
+ok  zoiko.io/workflow-svc/internal/{authz,config,decisionlog,documentvault,domain,envelope,events,evidence,handler,health,middleware,outbox,store,telemetry}
+# store suite ~64s (all migrations self-applied); handler ~1.6s
+# internal/domain: test binary trips host Application Control intermittently —
+# verified green via `go test -c -o <temp>` + execute (environmental)
+
+# CI-equivalent race verification (Docker: golang:1.25 + Postgres 16 on gdl-race-net):
+$ docker run --rm --network gdl-race-net -v <svc>:/src -w /src \
+  -e TEST_DATABASE_URL=... golang:1.25 sh -c "go test -race -count=1 ./..."
+# all packages ok, 0 data races
+```
+
+```text
+Live E2E (real workflow-svc :18098 + real authorization-svc :18099, scratch DBs, 2026-10-19):
+35/35 probes green — full transcript in the Formal Verification block above.
+Key evidence: definition create PROVEN with PLATFORM sentinel PERMIT; cross-tenant reads 404;
+stranger DENY no_grant; request-changes reopen row REJECTED->PENDING acted_by=wf-approver-live;
+decision-log counts above; outbox rows stay pending with Kafka down.
+```
+
+---
+
+## 📝 Notes for Next Auditor
+
+1. **In-repo fixes in this pass** — compile break, missing `000008` migration, 24-file gofmt drift, cross-tenant definition leak, `supersede` + wiring of definition stubs, platform-scope sentinel (finding F), `request-changes` status/evidence fix (finding G); suite green, race clean, 35/35 live probes
+2. **Service 15 of 17; Group 2 service 6/7** — `workflow-svc` on port 8090; next: `evidence-requirements-svc` (service 16, closes Group 2 7/7)
+3. **Envelope write-strict is expected** — every non-GET probe needs `X-Tenant-Id`, `X-Principal-Id`, `X-Correlation-ID`, `X-Request-Id`, `X-Source-Channel`, `Idempotency-Key`, `X-Legal-Entity-Id`; GETs only warn. A probe rig that omits them sees 401/400 — that is the service passing (fail-closed, INV-02), not a bug
+4. **PLATFORM sentinel must stay in lockstep** — workflow-svc sends the literal `"PLATFORM"` for definition ops; authorization-svc resolves it via `AUTHZ_PLATFORM_SCOPE_ENTITY_ID` and 400s `platform_scope_not_configured` if unset. Change one constant, change both
+5. **`request-changes` semantics** — eligible only from `REJECTED`/`ESCALATED` (resets to stage 1); any other status is 409, and the transition row records the true from-state + actor. (Pre-fix it 404'd and attributed the would-be transition to `system`)
+6. **`duplicate-approve` on a completed workflow is a 409 by contract** — the documented idempotent 200 applies while the instance is still PENDING; on a terminal instance the 409 (`workflow not PENDING`) is correct
+7. **Decisionlog is best-effort** — the request path does not fail when gdl is unreachable (live-proven); don't read a missing decision as a broken workflow
+8. **Live rig recipe** — authz :18099 (`AUTHZ_IDENTITY_ASSERTION=off`, `AUTHZ_EVALUATION_MTLS=permit`, `AUTHZ_CACHE_TTL_SECONDS=0`, `AUTHZ_PLATFORM_SCOPE_ENTITY_ID=fffffff1-0000-4000-8000-000000000001`) + workflow-svc :18098; gdl :59997 / document-vault :59998 / Kafka :59092 / OTLP :59996 all blackholed; grants seeded directly in `authorization_live` SQL (role `ccccccc1-0000-4000-8000-000000000015` R_WORKFLOW_LIVE, bundle `WF_LIVE`, tenant-wide assignments for requester/approver/approver2)
+9. **Authz config history is append-only** — re-seeding grants cannot `DELETE` from `authz_config_history` (trigger refuses, by design); re-insert the role with `version = MAX(version)+1` instead
+10. **Truncate between rig runs** — `workflow_live` accumulates definitions (version collisions on re-create) and instances; truncate the `workflow%` tables before re-running (cascades to stages/transitions/quorum/sign_offs)
+
+---
+
+# schema-registry-svc (Port 8093) — Supporting Service (out of sequence) — Tier 0 Event Schema Registry
+
+**Group:** — (supporting service; not one of the seven canonical Group 2 services)
+**Status:** ✅ **ALL TESTS PASSING** (80 test funcs / 7 files · 0 fail · race clean · **20/20 live probes green** on real binaries; `openapi.yaml` did not validate at all (409 `oneOf` ambiguity) → fixed + **route-parity/validation test added**; spec drift corrected [nested-compat claim, missing 401s/query params]; 1-file genuine gofmt drift fixed) · **ZS-QA-001 live audit: GREEN** (out-of-sequence supporting service; Group 2 closure is recorded at evidence-requirements-svc)
+**Last Verified:** 2026-10-19 — static checks, full suite vs real Postgres 16 (`schema_registry_test`), race suite in Docker `golang:1.25`, and a full live E2E (real `schema-registry-svc` + real `authorization-svc` binaries; scratch DBs `schema_registry_live` / `authorization_live`; all reads/writes exercised through the canonical envelope)
+
+---
+
+## 🔬 ZS-QA-001 Formal Verification (2026-10-19)
+
+**Live acceptance result:** ✅ **build/vet clean; suite green; race clean; 20/20 live probes green** (real RBAC grants in authorization-svc, real decision log, real Postgres). This verifies an out-of-sequence supporting service; canonical Group 2 closure (7/7) is recorded at `evidence-requirements-svc` (service 16).
+
+The service logic survived audit unchanged — no functional defects were found. The failures were in the machine-readable contract and its guardrails: `openapi.yaml` had never been validated (it does not load under a real OpenAPI implementation), described a compatibility checker that no longer existed, and omitted behavior the live probes exercised (401 on every read, `limit`/`offset`). Findings in this pass:
+
+| Finding | Root Cause | Fix / Status |
+|---------|-----------|--------------|
+| **A — `openapi.yaml` fails OpenAPI validation** | The 409 body is `oneOf [IncompatibleSchemaError, Error]`. `Error` is open (`additionalProperties` unset) and therefore *also* matches a body carrying `error` + `violations`; the `incompatible` example matches both members, so `kin-openapi` refuses the document (`input matches more than one oneOf schemas`). Any generator/validator would reject it | ✅ Dedicated **closed** `VersionRaceError` schema for the race case and `additionalProperties: false` on `IncompatibleSchemaError`, making the `oneOf` disjoint; document now loads and `Validate()`s. Caught by the new test in finding C |
+| **B — spec drift vs implementation** | (1) Document claimed compatibility is analysed "at the top level only … Nested object and array evolution is NOT analysed — a documented v1 limit"; `compat.Check` has recursed into nested objects and array item schemas for some time (6 nested/array tests prove it). (2) All four reads can answer 401 (live-proven) but no 401 was documented. (3) Both list endpoints accept `limit`/`offset` (default 100, max 500) and answer 400 on invalid paging — entirely undocumented. (4) POST 400 omitted missing canonical-envelope headers (live: `400 envelope_incomplete`). | ✅ Invariant text corrected to state recursive analysis; `401` added to every read; `Limit`/`Offset` parameters + `400 InvalidPaging` added to both lists; POST 400 description now names the envelope; version bumped `1.1.0` → `1.1.1` |
+| **C — no route-parity / spec-validation test** | `openapi.yaml` existed but nothing checked it against the router or a real parser — the drift in B (and the invalid document in A) went unnoticed | ✅ Added `internal/handler/openapi_test.go` (same pattern as authorization-svc / governance-decision-log-svc): loads + `Validate()`s the document with `kin-openapi` and `chi.Walk`s the router in both directions; health probes excluded (mounted by `cmd/server`); trailing slash normalized. **This test is what exposed finding A** |
+| **D — gofmt drift** | `gofmt -l` flagged 13 files; 12 were CRLF/LF artifacts with no content diff (`git diff --numstat` empty), one genuine import-grouping drift in `internal/authz/client.go` | ✅ `gofmt -w`; `gofmt -l .` empty; changed lines are formatting-only |
+| **E — live-audit confirmations (verified, not defects)** | — | ✅ Idempotent replay returns **201 with the original version** and inserts no second row (idempotency key scoped per `event_name`); breaking change → **409 with both violations**; explicit `NONE` records the exemption on the row (`compatibility_mode=NONE`) and skips the check; a denied principal → **403** (`SCHEMA_PUBLISH DENIED`); missing `Idempotency-Key` → **400 envelope_incomplete**; omitting `X-Legal-Entity-Id` falls back to `AUTHZ_PLATFORM_SCOPE_ID` and still authorizes → 201; reads without `X-Principal-Id` → **401**; **both** `GET /v1/schemas` and `GET /v1/schemas/` answer 200 (chi mounts both) |
+
+**Verification evidence:**
+
+- Static: `go mod verify` / `go build ./...` / `go vet ./...` clean; `gofmt -l .` empty after finding D
+- Suite: all packages green against real Postgres 16 (`TEST_DATABASE_URL` on `schema_registry_test`; harness self-applies all four `*.up.sql` in filename order; store suite ~3s). Without the DSN the store package skips cleanly by design (`newTestStore`)
+- Race suite (CI-equivalent, Docker `golang:1.25` on `gdl-race-net` with real Postgres): all packages ok, **0 data races**
+- New test this pass: `TestOpenAPI_MatchesTheRouter` (also validates the document and enforces route parity)
+- **Live E2E (real `schema-registry-svc` on :18101 + real `authorization-svc` on :18099; scratch DBs `schema_registry_live` / `authorization_live`; 2026-10-19):**
+
+```text
+healthz / readyz                                  -> 200 / 200
+GET /v1/schemas/ (reader)                         -> 200 []
+GET /v1/schemas  (no trailing slash)              -> 200 []   (both spellings served)
+GET /v1/schemas/ (no principal)                   -> 401 caller identity missing
+POST v1 demo.order.created                        -> 201 version 1 (registered_by sr-register-live)
+POST replay (same Idempotency-Key)                -> 201 version 1; DB still one row for v1
+POST v2 (+ optional currency)                     -> 201 version 2
+POST breaking (required tenant_id removed)        -> 409 incompatible: 2 violations
+POST breaking with compatibility_mode=NONE        -> 201 version 3, row records NONE
+POST denied (sr-reader-live)                      -> 403 not authorized to publish schemas
+POST missing Idempotency-Key                      -> 400 envelope_incomplete (idempotency_key)
+POST without X-Legal-Entity-Id (platform scope)   -> 201 demo.platform.event v1
+GET latest                                        -> 200 version 3
+GET version 1 / 999 / abc                         -> 200 / 404 / 400
+GET versions                                      -> 200 (v1,v2,v3)
+GET versions?limit=2&offset=2                     -> 200 (v3)
+GET versions?limit=0                              -> 400 limit must be 1..500
+Authz decision log: SCHEMA_PUBLISH GRANTED x6 / DENIED x1
+DB evidence: 4 rows (3 order.created + 1 platform.event), append-only,
+             per-version compatibility_mode + registered_by + idempotency_key
+```
+
+---
+
+## ✅ Completed Fixes
+
+| Area | Issue | Resolution |
+|------|-------|------------|
+| **Invalid OpenAPI document** | 409 `oneOf` ambiguous; `Validate()` failed | Closed `VersionRaceError` + closed `IncompatibleSchemaError`; document validates (finding A) |
+| **Spec drift** | Nested-compat claim false; missing 401s, `limit`/`offset`, paging 400, envelope 400 | Spec corrected + version bumped to 1.1.1 (finding B) |
+| **No contract guardrail** | Nothing loaded, validated, or route-diffed the spec | `openapi_test.go` added: validate + bidirectional route parity (finding C) |
+| **gofmt drift** | 1 genuine file, 12 CRLF artifacts | `gofmt -w`; 0 drift (finding D) |
+
+---
+
+## ⚠️ Partial / Pending (Within This Repo)
+
+| Item | Status | Details |
+|------|--------|---------|
+| **No README** | ⚠️ | `openapi.yaml` is now valid and self-describing, but there is no service README (run/env/migrations/ownership) |
+| **No OpenTelemetry/metrics wiring** | ⚠️ | `cmd/server/main.go` wires zap + chi only; peer services carry a `telemetry` package. Observability parity is a follow-up, not a functional gap |
+| **Replay status not documented** | ⚠️ | The spec documents 201 for a successful registration; a replay also answers 201 with the original version (verified live). Worth one sentence if clients treat 201 as "new row" |
+| **Reads are identity-only** | ⚠️ | Any verified principal may enumerate every contract; deliberate for platform-wide reference data, but there is no tenant scoping if schemas ever become tenant-confidential |
+
+---
+
+## ❌ External Dependencies (Not In This Repo)
+
+| Dependency | Owner Repo | Config Field | Why Not Done Here | What's Wired |
+|------------|-----------|--------------|-------------------|--------------|
+| **Authorization** | `authorization-svc` (Group 2 ✅) | `AUTHORIZATION_SERVICE_URL` | — | **Live-verified against the real service** this pass (`SCHEMA_PUBLISH` grant/deny, decision log, fail-closed) |
+| **Gateway identity** | `gateway-auth-svc` / Traefik (Group 1 ✅) | `X-Principal-Id` header | Assumed upstream | Service refuses requests without it (401); never parses tokens itself |
+| **Postgres 16** | Platform infra | `DB_*` | Provided locally | Live E2E + all suites vs real Postgres; append-only schema enforced by migration 000003 |
+
+---
+
+## 📋 Architecture Decisions Requiring Human Input
+
+| # | Decision | Impact |
+|---|----------|--------|
+| 1 | **README for schema-registry-svc** | Onboarding/runbook completeness |
+| 2 | **Observability parity** — add the shared telemetry package (traces/metrics) or record a deliberate exemption | Operational visibility |
+| 3 | **Tenant visibility of schemas** — keep platform-wide reads for every verified principal, or scope enumeration | Contract confidentiality vs registry-wide discovery |
+
+---
+
+## 🔧 What Would Unblock Full Closure
+
+| Blocker | Action Required | By Whom |
+|---------|-----------------|---------|
+| None blocking | — | — |
+| README | Document env vars, migrations, and the platform-scope setting | Service owner |
+| Telemetry | Adopt the shared observability package or record exemption | Platform infra |
+
+---
+
+## 📊 Test Evidence
+
+```bash
+# Native (Windows host, Go 1.25) vs real Postgres 16:
+$ TEST_DATABASE_URL=... go test ./... -count=1
+ok  zoiko.io/schema-registry-svc/internal/{authz,compat,handler,store}
+# store ~3s (4 migrations self-applied); handler includes the new OpenAPI test
+
+# CI-equivalent race verification (Docker: golang:1.25 + Postgres 16 on gdl-race-net):
+$ docker run --rm --network gdl-race-net -v <svc>:/src -w /src \
+  -e TEST_DATABASE_URL=... golang:1.25 sh -c "go test -race -count=1 ./..."
+# all packages ok, 0 data races
+```
+
+```text
+Live E2E (real schema-registry-svc :18101 + real authorization-svc :18099, scratch DBs, 2026-10-19):
+20/20 probes green — full transcript in the Formal Verification block above.
+Key evidence: idempotent replay single row; 409 compatibility violations; NONE exemption recorded;
+403 DENY (decision log x1); platform-scope fallback 201; reads 401 without identity.
+```
+
+---
+
+## 📝 Notes for Next Auditor
+
+1. **In-repo fixes in this pass** — `openapi.yaml` failed validation and had drifted (nested-compat, 401s, paging); route-parity/validation test added; 1 genuine gofmt file fixed. No functional service defect found; suite green, race clean, 20/20 live probes
+2. **Out-of-sequence supporting service** — `schema-registry-svc` on port 8093 is not one of the seven canonical Group 2 services; Group 2 (7/7) is closed by `evidence-requirements-svc` (service 16). Next numbered service: 17 (first of Group 3)
+3. **Live rig recipe** — authz :18099 + schema-registry :18101; DBs `authorization_live` / `schema_registry_live`; role `ddddddd1-0000-4000-8000-000000000016` `R_SCHEMA_REG_LIVE`, bundle `SR_LIVE` `["SCHEMA_PUBLISH"]`, tenant-wide assignment for `sr-register-live`; `sr-reader-live` deliberately unassigned (DENY probe). Script `%TEMP%\opencode\sr_live_rig.ps1`, seed `sr_live_seed.sql`
+4. **Platform scope must be aligned** — schema-registry sends `AUTHZ_PLATFORM_SCOPE_ID` (default `00000000-0000-0000-0000-00000000f001`) when `X-Legal-Entity-Id` is absent; authorization-svc resolves sentinel `"PLATFORM"` via its own `AUTHZ_PLATFORM_SCOPE_ENTITY_ID`. A tenant-wide (NULL-entity) grant covers any UUID, which is how the live rig succeeds; in deployment set both explicitly
+5. **Idempotency is per event** — `(event_name, Idempotency-Key)` identifies the original row; replay returns 201 + the original version and inserts nothing. Reusing a key across events is allowed
+6. **Compatibility recurses** — nested objects and array items are checked at every level (only `properties`/`required`); the spec now says so. `BACKWARD` and `NONE` only; unknown modes are 400, never defaulted
+7. **Append-only is enforced in the schema** — migration 000003's invariants plus the absence of update/delete paths; do not "fix" a bad schema by editing rows
+8. **Recreate the live DB between runs** — migrations are not idempotent; drop/recreate `schema_registry_live` and re-apply `*.up.sql`. Authz config history is append-only, so re-seed the role with `version = MAX(version)+1`
+9. **Test DB name guard** — the store harness refuses DB names not containing `test` (it drops `event_schemas`); use `schema_registry_test`
+10. **Header casing is harmless** — handlers read `X-Correlation-Id`; HTTP header lookup is case-insensitive, so the canonical `X-Correlation-ID` works (live-proven)
+
+---
+
+# evidence-requirements-svc (Port 8130) — Service 16 · Group 2 (7/7) — Tier 0 Evidence Requirements
+
+**Group:** 2 — Governance Platform
+**Status:** ✅ **ALL TESTS PASSING** (54 test funcs / 5 files · 0 fail · race clean · **42/42 live probes green** on real binaries; **8 defects fixed**: idempotent replays accepted different payloads · PBC authz scoped to tenant instead of request entity · scan-result unauthenticated · body/envelope entity confusion · malformed UUIDs answered 503 · outbox events never claimed/published · empty-key idempotency collisions · nanosecond-vs-microsecond replay false mismatch) · **ZS-QA-001 live audit: GREEN** (service 16 of 17; seventh and final of Group 2)
+**Last Verified:** 2026-10-19 — static checks, full suite vs real Postgres 16, integration-tagged store suite (29 cases), race suite in Docker `golang:1.25`, and a full live E2E (real `evidence-requirements-svc` + real `authorization-svc` binaries; scratch DBs `evidence_requirements_live` / `authorization_live`; document-vault, Kafka and OTLP endpoints intentionally unreachable)
+
+---
+
+## 🔬 ZS-QA-001 Formal Verification (2026-10-19)
+
+**Live acceptance result:** ✅ **build/vet/gofmt clean; suite green; race clean; 42/42 live probes green** (real RBAC grants in authorization-svc, real decision log, real Postgres, real outbox worker). This closes Group 2 at 7/7.
+
+The service is functionally complete, but several contract edges failed under retry and denial conditions. Eight defects were fixed (seven design gaps plus one precision bug the live run exposed), including audit items X4 (idempotency key ignored), X10 (bad UUID reported as outage) and #19 (a SATISFIED evaluation replayable for a different action). Findings in this pass:
+
+| Finding | Root Cause | Fix / Status |
+|---------|-----------|--------------|
+| **A — Idempotency-Key was accepted but never compared to the payload** (X4, #19) | Catalog create, evaluate, PBC create and PBC response submit all deduplicated on the key/correlation alone. A retry with a *different* body returned the original row with 200/201, so a SATISFIED result or a requirement could be replayed for a different request | ✅ Replay fingerprint checks: evaluate (domain, action, entity, evaluated-for, artifacts payload), requirement (domain, action, type, entity, creator, payload, caller-supplied `effective_from`), PBC create (title/description/assignee/due/entity/creator) and submit (request, principal, artifact). Mismatch → **409 `idempotency_mismatch`**. Live: all four mismatch probes 409; identical retries still 200 |
+| **B — PBC authorization used the wrong scope, and scan-result had no authorization** (#13 class) | `SubmitResponse` and `MarkSatisfied` authorized on `tenant_id` instead of the request's `legal_entity_id`; `RecordScanResult` accepted any authenticated caller (a stranger could mark malware `CLEAN`) | ✅ Both fetch the request first and authorize on its entity (`EVIDENCE_REQUEST_SUBMIT_RESPONSE` / `MANAGE`); scan requires `MANAGE` on the parent request's entity via new `GetResponseRequest` (interim until a dedicated scanner action exists). Live: entity-scoped submitter submit 201; reader/submitter scan 403; admin scan 200; entity-scoped evaluator mark-satisfied 200 |
+| **C — Body could override the envelope's legal entity** | PBC create filled an absent `X-Legal-Entity-Id` from the body and did not reject disagreement between the two, so the object could be written under one entity while authorization used another | ✅ Envelope is authoritative; disagreement → **400 `legal_entity_mismatch`** (same rule already applied by Evaluate). Live-proven |
+| **D — Malformed input answered as an outage** (X10) | Raw UUIDs reached Postgres; `22P02` mapped to 503 `store_unavailable`. `GET /v1/pbc/requests` without an entity filter bound `''` into `legal_entity_id::uuid`, so the *legitimate* unfiltered list was a 503 | ✅ `storeWrap` preserves domain sentinels and maps `22P02` → `ErrInvalidIdentifier` → **400 `invalid_identifier`**; handler pre-validates UUIDs; empty filter now means **all entities**. Live: malformed PBC id 400; unfiltered list 200 |
+| **E — Concurrent response retry was not serialized** | Submit read the request, then inserted with `ON CONFLICT` but no lock/re-select; a concurrent same-key retry could surface `pgx.ErrNoRows` or race the version | ✅ `SELECT … FOR UPDATE` on the parent request + `ON CONFLICT (tenant_id, correlation_id) DO NOTHING` + re-select; replay returns the original version, a different payload → 409. Live: 201 → 200 same `response_id`, version stays 1 |
+| **F — Outbox worker never claimed an event** | `claim_outbox_events()` returns 6 columns; the worker scanned `SELECT *` into 6 fields (10 actual columns) so **every claim scan failed** and no event was ever published. Payload access used unchecked type assertions (missing keys panicked the worker), and the evaluate payload omitted `evaluated_for_principal_id` / `correlation_id` | ✅ Claim now selects the six contract columns explicitly; `stringField` safe getter; Evaluate payload completed. Live: 2 events claimed, `publish_attempts=1`, `last_error` recorded (Kafka down), no panic, requests unaffected |
+| **G — Empty Idempotency-Key collided on the unique index** | Requirement/evaluation inserts used `''` when the key was absent; a second no-key write hit `(tenant_id, idempotency_key)` | ✅ Empty key falls back to the row's own UUID. Covered by suite |
+| **H — Date precision false mismatch (found in live run)** | PBC retries send the same JSON with a nanosecond `due_at`; Postgres stores microseconds, so full-precision comparison reported a mismatch for an identical request | ✅ Fingerprints compare at microsecond precision (same for caller-supplied `effective_from`); regression test `TestPgStore_CreateEvidenceRequest_ReplayToleratesDatePrecision` |
+| **I — Verified behavior, not defects** | — | ✅ Unknown key retry → 200 original; end-date replay → 422; document-vault down → **503 fail-closed, no evaluation row**; `NO_REQUIREMENTS_DEFINED` kept distinct; envelope write-strict (missing `Idempotency-Key` → 400 `envelope_incomplete`, missing tenant → 400 `missing_tenant`) |
+
+**Verification evidence:**
+
+- Static: `gofmt -l .` empty; `go mod verify` / `go build ./...` / `go vet ./...` clean
+- Suite: all packages green against real Postgres 16 (`TEST_DATABASE_URL` on `evidence_requirements_test`): events 1.0s, handler 0.7s, store 9.4s; 54 test funcs across 5 test files
+- Integration-tagged store suite: **29/29 PASS** (`TestPgStore_*` idempotency, tenant isolation, PBC replay conflict/date precision/empty-filter/versioning, RLS `set_config`)
+- Race suite (CI-equivalent, Docker `golang:1.25` on `gdl-race-net` with real Postgres): all packages ok, **0 data races**
+- **Live E2E (real `evidence-requirements-svc` on :18102 + real `authorization-svc` on :18099; scratch DBs `evidence_requirements_live` / `authorization_live`; 2026-10-19):**
+
+```text
+H  healthz / readyz                                  -> 200 / 200
+L1 list requirements (empty)                         -> 200 []
+L2 list without tenant                               -> 400 missing_tenant
+E1 evaluate before catalog seeded                    -> 200 NO_REQUIREMENTS_DEFINED
+R1 create SUPPORTING_DOCUMENT requirement            -> 201
+R2 replay same Idempotency-Key                       -> 200 same requirement id
+R3 same key, different payload                       -> 409 idempotency_mismatch
+R4 create as unassigned principal                    -> 403 authorization_denied
+R5 create APPROVAL_RECORD requirement                -> 201
+E2 evaluate (doc required, none present)             -> 200 MISSING (1 unmet)
+E3 evaluate with document-vault unreachable          -> 503 document_service_unavailable (no row written)
+R6 end-date document requirement                     -> 200 (effective_to set)
+R7 end-date replay                                   -> 422 already_retired
+E4 evaluate (approval present)                       -> 200 SATISFIED
+E5 replay same Idempotency-Key                       -> 200 same evaluation id
+E6 same key, different payload                       -> 409 idempotency_mismatch
+E7 get evaluation / malformed id                     -> 200 / 404
+L3 list requirements / as-of / get one               -> 200 / 200 / 200
+P1 create PBC request                                -> 201
+P2 replay same Idempotency-Key                       -> 200 same request_id (date-precision fix)
+P3 same key, different payload                       -> 409 idempotency_mismatch
+P4 body entity != envelope entity                    -> 400 legal_entity_mismatch
+P5 missing Idempotency-Key                           -> 400 envelope_incomplete
+P6 list open, no entity filter                       -> 200 (was 503 pre-fix)
+P7 list open, entity filter                          -> 200
+P8 list open, malformed entity                       -> 400 invalid_field
+P9 get request / malformed id                        -> 200 / 400 invalid_identifier
+S1 submit response (entity-scoped submitter)         -> 201 version 1, scan PENDING
+S2 replay same Idempotency-Key                       -> 200 same response_id, version 1
+S3 same key, different payload (admin)               -> 409 idempotency_mismatch
+S4 submit to malformed request id                    -> 400 invalid_identifier
+S5 scan result as reader / submitter                 -> 403 / 403 authorization_denied
+S6 scan result as admin                              -> 200 CLEAN
+S7 mark satisfied as entity-scoped evaluator         -> 200 (authz entity fix)
+S8 send as unassigned principal                      -> 403 authorization_denied
+S9 close request                                     -> 200 CLOSED
+Authz decision log: EVIDENCE_REQUEST_CREATE GRANTED x1 / DENIED x0 (rest cached);
+  EVIDENCE_REQUEST_MANAGE GRANTED x1 / DENIED x2; EVIDENCE_REQUEST_SUBMIT_RESPONSE GRANTED x2;
+  EVIDENCE_REQUEST_EVALUATE GRANTED x1; EVIDENCE_REQUIREMENT_CREATE GRANTED x1 / DENIED x1;
+  EVIDENCE_REQUIREMENT_RETIRE GRANTED x1. Entity-scoped roles prove entity authorization.
+DB: 2 requirements (document one retired=TRUE); evaluations MISSING=1, SATISFIED=1,
+  NO_REQUIREMENTS_DEFINED=1 (no row for the doc-vault 503); PBC 1 CLOSED, response v1 CLEAN;
+  outbox 2 events (missing, satisfied), publish_attempts=1 each, published=FALSE, error set.
+```
+
+---
+
+## ✅ Completed Fixes
+
+| Area | Issue | Resolution |
+|------|-------|------------|
+| **Idempotent replay** | Same key + different body accepted as success (X4, #19) | Payload fingerprints on evaluate/requirement/PBC create/PBC submit → 409 (finding A); µs precision (finding H) |
+| **PBC authorization** | Submit/mark-satisfied used tenant, scan had no gate | Authorize on request entity; scan requires `MANAGE`; live 403/200 proven (finding B) |
+| **Entity authority** | Body could override/contradict envelope entity | Envelope authoritative; mismatch → 400 (finding C) |
+| **Malformed UUIDs** | `22P02` → 503; unfiltered list → 503 | Domain mapping → 400; empty filter = all entities (finding D) |
+| **Response concurrency** | Retry not serialized | Parent `FOR UPDATE` + conflict re-select (finding E) |
+| **Outbox** | Claims always failed (`SELECT *` 10 cols vs 6); payload panics | Explicit columns, safe getter, complete payload (finding F) |
+| **Empty idempotency key** | `''` collided on unique index | Fallback to row UUID (finding G) |
+
+---
+
+## ⚠️ Partial / Pending (Within This Repo)
+
+| Item | Status | Details |
+|------|--------|---------|
+| **Evaluate has no authorization gate** (audit #13) | ⚠️ | Evaluate requires identity and now rejects body/envelope entity disagreement, but any verified principal may invoke it (live: unassigned reader got 200). Gating it needs a new action/bundle (e.g. `EVIDENCE_EVALUATION_CREATE`) agreed with authorization-svc and seeded for the three caller services; deliberately not invented in this pass. Documented decision below |
+| **No `openapi.yaml` / README** | ⚠️ | ~20 routes and the PBC surface have no machine-readable contract (QA-024 diff impossible) and no README; copy the authorization-svc/schema-registry pattern (spec + route-parity test) |
+| **`progress.md` stale** | ⚠️ | Still says "NOT STARTED"; every route, migration, test and live probe now contradicts it |
+| **Malformed reads are 404** | ⚠️ | `GET /v1/evidence/evaluations/not-a-uuid` answers 404 (read-as-absent) rather than 400; consistent with tenant-isolation behavior, but X10's "typo is not an outage" preference would say 400. Writes and PBC reads are already 400 |
+| **Scan action is interim** | ⚠️ | Scan-result is gated on `EVIDENCE_REQUEST_MANAGE` because no scanner identity/action exists in the contract yet; revisit when document-vault owns scan callbacks |
+
+---
+
+## ❌ External Dependencies (Not In This Repo)
+
+| Dependency | Owner Repo | Config Field | Why Not Done Here | What's Wired |
+|------------|-----------|--------------|-------------------|--------------|
+| **Authorization** | `authorization-svc` (Group 2 ✅) | `AUTHZ_SERVICE_URL` | — | **Live-verified against the real service** this pass (RBAC grant/deny, entity-scoped roles, decision log, fail-closed) |
+| **Document vault** | `document-vault-svc` | `DOCUMENT_VAULT_SERVICE_URL` | Endpoint blackholed in the rig | **Fail-closed proven live**: unreachable vault → 503 and no evaluation row for the asserted document |
+| **Kafka / event backbone** | Platform infra | `KAFKA_BROKERS` | Infrastructure, not code | Transactional outbox + relay; **live-proven**: 2 events claimed, publish attempted, attempts/error recorded, API unaffected |
+| **OTLP collector** | Platform infra | `OTEL_EXPORTER_OTLP_ENDPOINT` | Infrastructure | Trace exporter retries silently with endpoint down (observed, non-blocking) |
+| **Callers (GL post, close lock, board resolutions, corporate actions, etc.)** | Peer services | — | Cross-repo retrofit | Envelope cross-check means callers must send the full canonical envelope; the audit's X1/#17 caller gaps remain peer-service work |
+
+---
+
+## 📋 Architecture Decisions Requiring Human Input
+
+| # | Decision | Impact |
+|---|----------|--------|
+| 1 | **Evaluate authorization action** — add a dedicated action (e.g. `EVIDENCE_EVALUATION_CREATE`) or gate on an existing one? | Security gate vs caller breakage; needs authorization-svc catalog + grants for the three wired callers |
+| 2 | **`openapi.yaml` + route-parity test** | QA-024 contract diff and client generation |
+| 3 | **Scan-result ownership** — keep `MANAGE` as the interim gate or define a scanner principal/action | Least-privilege for malware status |
+| 4 | **Tier label** (§23 omits the service; §5.1 places it in Governance) | Determines whether it gates Tier 1 services |
+| 5 | **`NO_REQUIREMENTS_DEFINED` caller contract** — permit or block on an unseeded catalog | Documented in `context.md` §11.4; gate semantics for GL/close |
+
+---
+
+## 🔧 What Would Unblock Full Closure
+
+| Blocker | Action Required | By Whom |
+|---------|-----------------|---------|
+| Evaluate authorization | Agree/seed the action, then add the fail-closed authz call | Group 2 + authorization owner |
+| Real document-vault | Exercise SUPPORTING_DOCUMENT verification against the real service (status code 200 path) | Group 3 |
+| Kafka brokers | Verify real publish + consumer flow end-to-end (outbox retry already proven) | Platform infra |
+| Caller envelope retrofit | Send all canonical headers from GL/close/board/corporate callers (X1/#17) | Peer services |
+| Application Control (host) | Allowlist `%TEMP%\go-build*` test binaries or keep the relocated-binary workaround | Local env |
+
+---
+
+## 📊 Test Evidence
+
+```bash
+# Native (Windows host, Go 1.25) vs real Postgres 16:
+$ TEST_DATABASE_URL=... go test ./... -count=1
+ok  zoiko.io/evidence-requirements-svc/internal/events   1.035s
+ok  zoiko.io/evidence-requirements-svc/internal/handler  0.726s
+ok  zoiko.io/evidence-requirements-svc/internal/store    9.434s
+# 54 test funcs / 5 test files; gofmt clean; build/vet/mod verify clean
+
+# Integration-tagged store suite (host, real Postgres, embedded-PG harness):
+$ go test -tags=integration -c -o %TEMP%\er_store_integration.exe .\internal\store
+$ cd internal\store; %TEMP%\er_store_integration.exe -test.v -test.timeout=180s
+# 29/29 PASS
+
+# CI-equivalent race verification (Docker: golang:1.25 + Postgres 16 on gdl-race-net):
+$ docker run --rm --network gdl-race-net -v <svc>:/src -w /src \
+  -e TEST_DATABASE_URL=... golang:1.25 sh -c "go test -race ./... -count=1"
+# all packages ok, 0 data races
+```
+
+```text
+Live E2E (real evidence-requirements-svc :18102 + real authorization-svc :18099, scratch DBs, 2026-10-19):
+42/42 probes green — full transcript in the Formal Verification block above.
+Key evidence: all four idempotency-mismatch probes 409 and identical retries 200 with the same id;
+date-precision retry resolves to the original PBC row; entity-scoped submitter/evaluator succeed while
+reader/submitter scan attempts 403; malformed UUIDs 400; unfiltered PBC list 200; outbox claims two
+events and records publish errors with Kafka down; document-vault outage 503 with no evaluation row.
+```
+
+---
+
+## 📝 Notes for Next Auditor
+
+1. **In-repo fixes in this pass** — replay fingerprints (X4/#19), PBC authz scope + scan gate, entity authority, malformed-UUID 400 (X10), response-retry serialization, dead outbox claim/payload, empty-key collisions, µs date comparison. All live-verified; 42/42 probes
+2. **Service 16 of 17; Group 2 is now DONE (7/7)** — `evidence-requirements-svc` on port 8130; next: service 17 (first of Group 3)
+3. **Idempotency semantics are now strict** — the same key with a different payload is 409 `idempotency_mismatch`; identical retries return the original row (200 for replay, 201 for first write). Timestamps are compared at Postgres microsecond precision, so RFC3339Nano retries are not false mismatches
+4. **Entity scope is authoritative from the envelope** — body `legal_entity_id` may confirm it but not override it; disagreement is 400 `legal_entity_mismatch` on both Evaluate and PBC create
+5. **Scan-result is gated on `EVIDENCE_REQUEST_MANAGE` for now** — entity-scoped, fail-closed; replace when a scanner identity/action exists
+6. **Evaluate remains identity-only** — audit #13 is partially addressed (entity binding) but not authorization; see decision #1 before exposing it outside trusted callers
+7. **Outbox retries are real** — with Kafka down, `publish_attempts` increments and `last_error` is set; the API stays up. Don't mistake the pending rows for a new defect
+8. **Live rig recipe** — authz :18099 (`AUTHZ_IDENTITY_ASSERTION=off`, `AUTHZ_EVALUATION_MTLS=permit`, `AUTHZ_CACHE_TTL_SECONDS=0`, `AUTHZ_PLATFORM_SCOPE_ENTITY_ID=fffffff1-…-0001`) + evidence-requirements :18102; DBs `authorization_live` / `evidence_requirements_live`; roles `ddddddd1-…-0017/0018/0019` (admin tenant-wide; submitter `CREATE`+`SUBMIT_RESPONSE` entity-only; evaluator `MANAGE`+`EVALUATE` entity-only); scripts `er_live_seed.sql` / `er_live_rig.ps1`
+9. **Recreate the live DB between runs** — migrations are not idempotent (000008 is non-idempotent by design); drop/recreate `evidence_requirements_live` and re-apply `*.up.sql` in filename order. Authz history is append-only
+10. **Date precision matters** — Postgres `timestamptz` truncates to microseconds; any future replay comparison of caller-supplied timestamps must truncate both sides or it will reject identical retries (finding H)
+
+---
+
 | Service | Port | Group | Status | Tests |
 |---------|------|-------|--------|-------|
 | identity-context-svc | 8080 | 1 | ✅ Complete | 21/21 · 564 race · ZS-QA-001: 30 pass |
@@ -868,9 +1374,13 @@ Key DB evidence: access_decision_log=250 rows; outbox_events unpublished=234 wit
 | policy-svc | 8085 | 2 | ✅ Complete | 116 tests · 0 skip · race clean · live E2E green |
 | obligations-svc | 8088 | 2 | ✅ Complete | 58 tests · 0 skip · race clean · live E2E green (2 fixes: committed compile break + applicability 503) |
 | authorization-svc | 8089 | 2 | ✅ Complete | 749 tests · 1 by-design skip · race clean · live E2E 46/46 green (12 gofmt files fixed · openapi.yaml + parity test added · 1 flaky IT fixed) |
+| workflow-svc | 8090 | 2 | ✅ Complete | 235 test funcs · race clean · live E2E 35/35 green (2 integration fixes: platform-scope sentinel · request-changes evidence; compile break + missing 000008 migration + 24-file gofmt drift fixed) |
+| evidence-requirements-svc | 8130 | 2 | ✅ Complete | 54 test funcs / 5 files · 29 integration cases · race clean · live E2E 42/42 green (8 defects fixed: idempotency payload checks · PBC authz scope + scan gate · entity authority · malformed UUID 400 · response-retry race · outbox claim/payload · empty-key collisions · µs date precision) |
+| schema-registry-svc | 8093 | — (supporting) | ✅ Complete | 80 test funcs · 0 fail · race clean · live E2E 20/20 green (openapi.yaml fixed + validated + route-parity test added · spec drift corrected · 1-file gofmt) |
 
-**Completed:** 14/17 services (82.4%)
+**Completed:** 16/17 services (94.1%)
 **Group 1:** **DONE** (9/9)
-**Group 2:** **IN PROGRESS** (5/7 — jurisdiction-rules-svc, governance-decision-log-svc, policy-svc, obligations-svc, authorization-svc)
+**Group 2:** **DONE** (7/7 — jurisdiction-rules-svc, governance-decision-log-svc, policy-svc, obligations-svc, authorization-svc, workflow-svc, evidence-requirements-svc)
+**Out of sequence:** schema-registry-svc ✅ (supporting service; not part of the 17-service group sequence)
 
 ---

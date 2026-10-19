@@ -1493,6 +1493,8 @@ services:
       KAFKA_GROUP_ID: "workflow-svc"
       KAFKA_EVENTS_TOPIC: "zoiko.workflow.events"
       AUTHORIZATION_SERVICE_URL: "http://authorization-svc:8089"
+      DOCUMENT_VAULT_SERVICE_URL: "http://document-vault-svc:8094"
+      GOVERNANCE_DECISION_LOG_SERVICE_URL: "http://governance-decision-log-svc:8083"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
     depends_on:
       postgres:
@@ -1500,6 +1502,10 @@ services:
       kafka:
         condition: service_healthy
       authorization-svc:
+        condition: service_healthy
+      document-vault-svc:
+        condition: service_healthy
+      governance-decision-log-svc:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/healthcheck", "http://localhost:8090/healthz"]

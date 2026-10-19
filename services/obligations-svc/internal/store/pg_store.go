@@ -85,23 +85,66 @@ func (s *PgStore) withTenantTx(ctx context.Context, fn func(tx pgx.Tx, tenantID 
 	return nil
 }
 
+func (s *PgStore) withOutboxRelayTx(ctx context.Context, fn func(tx pgx.Tx) error) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.outbox_relay', 'true', true)"); err != nil {
+		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	if err := fn(tx); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// insertOutboxEventTx persists the same canonical envelope the Kafka
+// publisher emits, inside the caller's business transaction. This is the
+// D10 guarantee: the obligation mutation and its event commit together.
+func insertOutboxEventTx(ctx context.Context, tx pgx.Tx, tenantID, eventType, correlationID, legalEntityID, jurisdiction, actorID string, payload map[string]any) error {
+	env := map[string]any{
+		"event_id":        "evt-" + uuid.New().String(),
+		"event_type":      eventType,
+		"event_version":   "1.0",
+		"emitted_at":      time.Now().UTC().Format(time.RFC3339),
+		"schema_version":  "1.0",
+		"source_service":  "obligations-svc",
+		"tenant_id":       tenantID,
+		"legal_entity_id": legalEntityID,
+		"jurisdiction":    jurisdiction,
+		"actor_id":        actorID,
+		"correlation_id":  correlationID,
+		"payload":         payload,
+	}
+	raw, err := json.Marshal(env)
+	if err != nil {
+		return fmt.Errorf("event %q: marshal envelope: %w", eventType, err)
+	}
+	const query = `
+		INSERT INTO event_outbox (tenant_id, event_type, event_payload, correlation_id)
+		VALUES ($1, $2, $3, $4);`
+	if _, err := tx.Exec(ctx, query, tenantID, eventType, raw, correlationID); err != nil {
+		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return nil
+}
+
 // CheckIdempotencyKey checks if an idempotency key has been processed before.
 // Returns (alreadyProcessed bool, existingResourceID string, existingResourceType string, err error).
 // If alreadyProcessed is true, the caller can return the existing resource.
 // Verifies that the request hash matches to detect IDEMPOTENCY_MISMATCH.
 func (s *PgStore) CheckIdempotencyKey(ctx context.Context, idempotencyKey, requestHash string) (bool, string, string, error) {
-	tenantID, err := tenantOf(ctx)
-	if err != nil {
-		return false, "", "", err
-	}
-
 	const query = `
 		SELECT resource_id, resource_type, request_hash
 		FROM idempotency_keys
 		WHERE tenant_id = $1 AND idempotency_key = $2;`
 
 	var existingResourceID, existingResourceType, existingRequestHash string
-	err = s.pool.QueryRow(ctx, query, tenantID, idempotencyKey).Scan(&existingResourceID, &existingResourceType, &existingRequestHash)
+	err := s.withTenantTx(ctx, func(tx pgx.Tx, txTenantID string) error {
+		return tx.QueryRow(ctx, query, txTenantID, idempotencyKey).Scan(&existingResourceID, &existingResourceType, &existingRequestHash)
+	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return false, "", "", nil
@@ -119,21 +162,17 @@ func (s *PgStore) CheckIdempotencyKey(ctx context.Context, idempotencyKey, reque
 
 // StoreIdempotencyKey records an idempotency key with its associated resource.
 func (s *PgStore) StoreIdempotencyKey(ctx context.Context, idempotencyKey, requestHash, resourceID, resourceType string) error {
-	tenantID, err := tenantOf(ctx)
-	if err != nil {
-		return err
-	}
-
 	const query = `
 		INSERT INTO idempotency_keys (tenant_id, idempotency_key, request_hash, resource_id, resource_type)
 		VALUES ($1, $2, $3, $4, $5)
 		ON CONFLICT (tenant_id, idempotency_key) DO NOTHING;`
 
-	_, err = s.pool.Exec(ctx, query, tenantID, idempotencyKey, requestHash, resourceID, resourceType)
-	if err != nil {
-		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	return nil
+	return s.withTenantTx(ctx, func(tx pgx.Tx, tenantID string) error {
+		if _, err := tx.Exec(ctx, query, tenantID, idempotencyKey, requestHash, resourceID, resourceType); err != nil {
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+		return nil
+	})
 }
 
 // ComputeRequestHash computes a SHA256 hash of the request body for idempotency verification.
@@ -159,7 +198,7 @@ type Store interface {
 	// the obligation was already in the requested status).
 	// If expectedVersion > 0, the update will only succeed if the current
 	// version matches (optimistic locking via If-Match).
-	UpdateObligationStatus(ctx context.Context, obligationID, newStatus string, expectedVersion int) (*domain.Obligation, bool, error)
+	UpdateObligationStatus(ctx context.Context, obligationID, newStatus string, expectedVersion int, actorID, correlationID string) (*domain.Obligation, bool, error)
 
 	// UpdateObligationWorkflow links or unlinks an obligation to/from a workflow instance.
 	// Returns the updated obligation.
@@ -351,7 +390,19 @@ func (s *PgStore) CreateObligation(ctx context.Context, params domain.CreateObli
 		))
 		if scanErr == nil {
 			created = true
-			return nil
+			return insertOutboxEventTx(ctx, tx, tenantID, "obligation.created", params.CorrelationID,
+				o.LegalEntityID, o.JurisdictionID, o.CreatedByPrincipalID, map[string]any{
+					"obligation_id":           o.ObligationID,
+					"legal_entity_id":         o.LegalEntityID,
+					"jurisdiction_id":         o.JurisdictionID,
+					"obligation_code":         o.ObligationCode,
+					"obligation_type":         o.ObligationType,
+					"due_date":                o.DueDate,
+					"severity_level":          o.SeverityLevel,
+					"source_reference":        o.SourceReference,
+					"created_by_principal_id": o.CreatedByPrincipalID,
+					"created_at":              o.CreatedAt,
+				})
 		}
 		if !errors.Is(scanErr, pgx.ErrNoRows) {
 			if errors.Is(mapPgError(scanErr), domain.ErrInvalidIdentifier) {
@@ -502,7 +553,7 @@ var legalTransitions = map[string][]string{
 // policy-svc's ActivateVersion idempotency contract.
 // If expectedVersion > 0, the update will only succeed if the current
 // version matches (optimistic locking via If-Match).
-func (s *PgStore) UpdateObligationStatus(ctx context.Context, obligationID, newStatus string, expectedVersion int) (*domain.Obligation, bool, error) {
+func (s *PgStore) UpdateObligationStatus(ctx context.Context, obligationID, newStatus string, expectedVersion int, actorID, correlationID string) (*domain.Obligation, bool, error) {
 	var updated *domain.Obligation
 	transitioned := false
 
@@ -575,6 +626,33 @@ func (s *PgStore) UpdateObligationStatus(ctx context.Context, obligationID, newS
 			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 		}
 		transitioned = true
+		updatedEvent := map[string]any{
+			"obligation_id":     updated.ObligationID,
+			"obligation_status": updated.ObligationStatus,
+			"updated_at":        updated.UpdatedAt,
+		}
+		if err := insertOutboxEventTx(ctx, tx, tenantID, "obligation.updated", correlationID,
+			updated.LegalEntityID, updated.JurisdictionID, actorID, updatedEvent); err != nil {
+			return err
+		}
+		switch updated.ObligationStatus {
+		case "OVERDUE":
+			if err := insertOutboxEventTx(ctx, tx, tenantID, "obligation.overdue", correlationID,
+				updated.LegalEntityID, updated.JurisdictionID, actorID, map[string]any{
+					"obligation_id": updated.ObligationID,
+					"due_date":      updated.DueDate,
+				}); err != nil {
+				return err
+			}
+		case "CLOSED":
+			if err := insertOutboxEventTx(ctx, tx, tenantID, "obligation.closed", correlationID,
+				updated.LegalEntityID, updated.JurisdictionID, actorID, map[string]any{
+					"obligation_id": updated.ObligationID,
+					"closed_at":     updated.ClosedAt,
+				}); err != nil {
+				return err
+			}
+		}
 		return nil
 	})
 	if err != nil {
@@ -755,7 +833,7 @@ func (s *PgStore) ListFilingRequirements(ctx context.Context, obligationID strin
 // Returns the updated obligation and whether a transition occurred.
 // Uses expectedVersion=0 (no optimistic locking) as this is a system-driven transition.
 func (s *PgStore) TransitionOverdue(ctx context.Context, obligationID string) (*domain.Obligation, bool, error) {
-	return s.UpdateObligationStatus(ctx, obligationID, "OVERDUE", 0)
+	return s.UpdateObligationStatus(ctx, obligationID, "OVERDUE", 0, "system:obligations-svc", "overdue-sweep:"+obligationID)
 }
 
 // OutboxEvent represents an event in the transactional outbox.
@@ -773,50 +851,14 @@ type OutboxEvent struct {
 // AddEventToOutbox adds an event to the outbox within the current tenant transaction.
 // This should be called within the same transaction as the business data write.
 func (s *PgStore) AddEventToOutbox(ctx context.Context, eventType, correlationID, legalEntityID, jurisdiction, actorID, key string, payload map[string]any) error {
-	tenantID, err := tenantOf(ctx)
-	if err != nil {
-		return err
-	}
-
-	// Build the full event envelope
-	env := map[string]any{
-		"event_id":        "evt-" + uuid.New().String(),
-		"event_type":      eventType,
-		"event_version":   "1.0",
-		"emitted_at":      time.Now().UTC().Format(time.RFC3339),
-		"schema_version":  "1.0",
-		"source_service":  "obligations-svc",
-		"tenant_id":       tenantID,
-		"legal_entity_id": legalEntityID,
-		"jurisdiction":    jurisdiction,
-		"actor_id":        actorID,
-		"correlation_id":  correlationID,
-		"payload":         payload,
-	}
-
-	raw, err := json.Marshal(env)
-	if err != nil {
-		return fmt.Errorf("event %q: marshal envelope: %w", eventType, err)
-	}
-
-	const query = `
-		INSERT INTO event_outbox (tenant_id, event_type, event_payload, correlation_id)
-		VALUES ($1, $2, $3, $4);`
-
-	_, err = s.pool.Exec(ctx, query, tenantID, eventType, raw, correlationID)
-	if err != nil {
-		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	return nil
+	return s.withTenantTx(ctx, func(tx pgx.Tx, tenantID string) error {
+		return insertOutboxEventTx(ctx, tx, tenantID, eventType, correlationID,
+			legalEntityID, jurisdiction, actorID, payload)
+	})
 }
 
 // GetPendingOutboxEvents retrieves pending events from the outbox for publishing.
 func (s *PgStore) GetPendingOutboxEvents(ctx context.Context, limit int) ([]OutboxEvent, error) {
-	tenantID, err := tenantOf(ctx)
-	if err != nil {
-		return nil, err
-	}
-
 	if limit <= 0 {
 		limit = 100
 	}
@@ -828,21 +870,66 @@ func (s *PgStore) GetPendingOutboxEvents(ctx context.Context, limit int) ([]Outb
 		ORDER BY created_at ASC
 		LIMIT $2;`
 
-	rows, err := s.pool.Query(ctx, query, tenantID, limit)
+	var events []OutboxEvent
+	err := s.withTenantTx(ctx, func(tx pgx.Tx, tenantID string) error {
+		rows, qErr := tx.Query(ctx, query, tenantID, limit)
+		if qErr != nil {
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, qErr)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var e OutboxEvent
+			if scanErr := rows.Scan(&e.OutboxID, &e.TenantID, &e.EventType, &e.EventPayload, &e.CorrelationID, &e.Status, &e.Attempts, &e.CreatedAt); scanErr != nil {
+				return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, scanErr)
+			}
+			events = append(events, e)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return events, nil
+}
+
+// GetPendingOutboxEventsAllTenants is the relay's system read. It is
+// separate from the tenant-scoped method so a tenant-facing caller can
+// never accidentally receive another tenant's events.
+func (s *PgStore) GetPendingOutboxEventsAllTenants(ctx context.Context, limit int) ([]OutboxEvent, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.outbox_relay', 'true', true)"); err != nil {
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	const query = `
+		SELECT outbox_id, tenant_id, event_type, event_payload, correlation_id, status, attempts, created_at
+		FROM event_outbox
+		WHERE status = 'PENDING'
+		ORDER BY created_at ASC
+		LIMIT $1;`
+	rows, err := tx.Query(ctx, query, limit)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	defer rows.Close()
-
 	var events []OutboxEvent
 	for rows.Next() {
 		var e OutboxEvent
-		if err := rows.Scan(&e.OutboxID, &e.TenantID, &e.EventType, &e.EventPayload, &e.CorrelationID, &e.Status, &e.Attempts, &e.CreatedAt); err != nil {
-			return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		if scanErr := rows.Scan(&e.OutboxID, &e.TenantID, &e.EventType, &e.EventPayload, &e.CorrelationID, &e.Status, &e.Attempts, &e.CreatedAt); scanErr != nil {
+			return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, scanErr)
 		}
 		events = append(events, e)
 	}
-	return events, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return events, tx.Commit(ctx)
 }
 
 // MarkOutboxEventPublished marks an outbox event as successfully published.
@@ -851,12 +938,12 @@ func (s *PgStore) MarkOutboxEventPublished(ctx context.Context, outboxID string)
 		UPDATE event_outbox
 		SET status = 'PUBLISHED', published_at = NOW()
 		WHERE outbox_id = $1;`
-
-	_, err := s.pool.Exec(ctx, query, outboxID)
-	if err != nil {
-		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	return nil
+	return s.withOutboxRelayTx(ctx, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, query, outboxID); err != nil {
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+		return nil
+	})
 }
 
 // MarkOutboxEventFailed marks an outbox event as failed and increments attempts.
@@ -867,12 +954,12 @@ func (s *PgStore) MarkOutboxEventFailed(ctx context.Context, outboxID string, er
 		    attempts = attempts + 1,
 		    last_error = $2
 		WHERE outbox_id = $1;`
-
-	_, err := s.pool.Exec(ctx, query, outboxID, errMsg)
-	if err != nil {
-		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	return nil
+	return s.withOutboxRelayTx(ctx, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, query, outboxID, errMsg); err != nil {
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+		return nil
+	})
 }
 
 // FindOverdueObligations returns obligations that are OPEN or IN_PROGRESS

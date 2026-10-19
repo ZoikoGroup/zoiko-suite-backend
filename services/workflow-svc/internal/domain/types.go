@@ -169,7 +169,12 @@ type CreateWorkflowParams struct {
 	CorrelationID      string
 	IdempotencyKey     string
 	EscalationTarget   *string
-	Stages             []CreateWorkflowStageInput
+	// WorkflowDefinitionID/Version pin the instance to the definition that
+	// was in force when it started. Later definition changes must not
+	// retroactively alter an in-flight approval chain.
+	WorkflowDefinitionID      string
+	WorkflowDefinitionVersion int
+	Stages                    []CreateWorkflowStageInput
 }
 
 // SubmitActionParams holds input for approving or rejecting the current stage.
@@ -195,6 +200,10 @@ type InvalidateWorkflowParams struct {
 	EvidenceRefs       []string
 	CorrelationID      string
 	CausationID        *string
+	// ExpectedVersion is the caller's X-Expected-Version precondition. When
+	// present, the update fails with ErrConcurrencyConflict unless it matches
+	// the instance's current row_version.
+	ExpectedVersion *int
 }
 
 // EscalateToWorkflowParams holds input for escalating a workflow to a different target.

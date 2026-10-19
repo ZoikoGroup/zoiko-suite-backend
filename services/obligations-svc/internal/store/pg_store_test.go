@@ -235,7 +235,7 @@ func TestPgStore_UpdateObligationStatus_LegalTransitionsAndIdempotency(t *testin
 	}
 
 	// OPEN -> IN_PROGRESS: legal
-	updated, transitioned, err := s.UpdateObligationStatus(ctx, o.ObligationID, "IN_PROGRESS", 0)
+	updated, transitioned, err := s.UpdateObligationStatus(ctx, o.ObligationID, "IN_PROGRESS", 0, "actor-1", "corr-1")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -244,7 +244,7 @@ func TestPgStore_UpdateObligationStatus_LegalTransitionsAndIdempotency(t *testin
 	}
 
 	// IN_PROGRESS -> IN_PROGRESS: idempotent no-op
-	_, transitioned, err = s.UpdateObligationStatus(ctx, o.ObligationID, "IN_PROGRESS", 0)
+	_, transitioned, err = s.UpdateObligationStatus(ctx, o.ObligationID, "IN_PROGRESS", 0, "actor-1", "corr-1")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -253,7 +253,7 @@ func TestPgStore_UpdateObligationStatus_LegalTransitionsAndIdempotency(t *testin
 	}
 
 	// IN_PROGRESS -> CLOSED: legal, closed_at must be stamped
-	closed, transitioned, err := s.UpdateObligationStatus(ctx, o.ObligationID, "CLOSED", 0)
+	closed, transitioned, err := s.UpdateObligationStatus(ctx, o.ObligationID, "CLOSED", 0, "actor-1", "corr-1")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -265,7 +265,7 @@ func TestPgStore_UpdateObligationStatus_LegalTransitionsAndIdempotency(t *testin
 	}
 
 	// CLOSED -> anything: illegal, CLOSED is terminal
-	_, _, err = s.UpdateObligationStatus(ctx, o.ObligationID, "OPEN", 0)
+	_, _, err = s.UpdateObligationStatus(ctx, o.ObligationID, "OPEN", 0, "actor-1", "corr-1")
 	if !errors.Is(err, domain.ErrInvalidTransition) {
 		t.Fatalf("expected ErrInvalidTransition out of terminal CLOSED, got %v", err)
 	}
@@ -285,7 +285,7 @@ func TestPgStore_UpdateObligationStatus_IllegalSkipTransition(t *testing.T) {
 	}
 
 	// OPEN -> OVERDUE is legal (system-driven overdue sweep can skip IN_PROGRESS)
-	_, transitioned, err := s.UpdateObligationStatus(ctx, o.ObligationID, "OVERDUE", 0)
+	_, transitioned, err := s.UpdateObligationStatus(ctx, o.ObligationID, "OVERDUE", 0, "actor-1", "corr-1")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -294,7 +294,7 @@ func TestPgStore_UpdateObligationStatus_IllegalSkipTransition(t *testing.T) {
 	}
 
 	// OVERDUE -> IN_PROGRESS is illegal (only CLOSED is reachable from OVERDUE)
-	_, _, err = s.UpdateObligationStatus(ctx, o.ObligationID, "IN_PROGRESS", 0)
+	_, _, err = s.UpdateObligationStatus(ctx, o.ObligationID, "IN_PROGRESS", 0, "actor-1", "corr-1")
 	if !errors.Is(err, domain.ErrInvalidTransition) {
 		t.Fatalf("expected ErrInvalidTransition for OVERDUE -> IN_PROGRESS, got %v", err)
 	}

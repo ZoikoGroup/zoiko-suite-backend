@@ -14,12 +14,12 @@ import (
 
 // Worker polls the outbox table and publishes events to Kafka.
 type Worker struct {
-	pool        *pgxpool.Pool
-	kafkaWriter *kafka.Writer
-	log         *zap.Logger
+	pool         *pgxpool.Pool
+	kafkaWriter  *kafka.Writer
+	log          *zap.Logger
 	pollInterval time.Duration
-	batchSize   int
-	stopCh      chan struct{}
+	batchSize    int
+	stopCh       chan struct{}
 }
 
 // NewWorker creates a new outbox worker.
@@ -96,10 +96,10 @@ func (w *Worker) processBatch(ctx context.Context) {
 			EmittedAt:     row.CreatedAt,
 			SchemaVersion: "1.0",
 			SourceService: "evidence-requirements-svc",
-			TenantID:      payload["tenant_id"].(string),
-			LegalEntityID: payload["legal_entity_id"].(string),
-			ActorID:       payload["evaluated_for_principal_id"].(string),
-			CorrelationID: payload["correlation_id"].(string),
+			TenantID:      stringField(payload, "tenant_id"),
+			LegalEntityID: stringField(payload, "legal_entity_id"),
+			ActorID:       stringField(payload, "evaluated_for_principal_id"),
+			CorrelationID: stringField(payload, "correlation_id"),
 			Payload:       row.Payload,
 		}
 		envBytes, err := json.Marshal(env)
@@ -151,8 +151,23 @@ type outboxRow struct {
 	CreatedAt     time.Time
 }
 
+// stringField reads an optional envelope field without panicking. A payload
+// missing actor/correlation data must still be publishable (or explicitly
+// failed), not crash the whole service from a background goroutine.
+func stringField(m map[string]any, key string) string {
+	if v, ok := m[key].(string); ok {
+		return v
+	}
+	return ""
+}
+
 func (w *Worker) claimEvents(ctx context.Context) ([]outboxRow, error) {
-	rows, err := w.pool.Query(ctx, `SELECT * FROM claim_outbox_events($1)`, w.batchSize)
+	// Explicit columns: the function returns the whole outbox row (ten
+	// columns), while this scan only consumes six. SELECT * therefore made
+	// every claim fail with a field-count mismatch and no event was ever
+	// published.
+	rows, err := w.pool.Query(ctx, `SELECT outbox_id, aggregate_type, aggregate_id, event_type, payload, created_at
+		FROM claim_outbox_events($1)`, w.batchSize)
 	if err != nil {
 		return nil, err
 	}

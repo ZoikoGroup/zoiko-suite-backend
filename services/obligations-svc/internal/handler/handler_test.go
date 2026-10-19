@@ -92,7 +92,7 @@ func (s *stubStore) ListObligations(_ context.Context, _ domain.ListObligationsF
 	return s.list, s.listErr
 }
 
-func (s *stubStore) UpdateObligationStatus(_ context.Context, _, _ string, _ int) (*domain.Obligation, bool, error) {
+func (s *stubStore) UpdateObligationStatus(_ context.Context, _, _ string, _ int, _, _ string) (*domain.Obligation, bool, error) {
 	return s.updated, s.transitioned, s.updateErr
 }
 

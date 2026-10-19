@@ -1,5 +1,13 @@
 # Auth service — full documentation and behaviour audit (14 October 2026)
 
+> **Update, 19 Oct 2026.** The code written for AU-01, AU-04 to AU-11 and AU-27 landed on 15 Oct
+> but was not constructed in identity-context-svc's `cmd/server` until 19 Oct. It is wired and
+> verified live now: AU-04, AU-06 (identity side), AU-10 closed; AU-05 closed in code; AU-01 half
+> closed (sessions end and a session-status endpoint exists, but the gateway and
+> authorization-svc do not call it yet); AU-07, AU-08, AU-09 and AU-11 still open (storage only, no
+> endpoint). See `Identity, Scope & Foundation-audit-2026-09-23.md`, "Fixes, 19 October 2026".
+> The rows below are as found on 14 Oct.
+
 **Scope.** The auth service as one plane:
 - **identity-context-svc:** login, MFA, session envelope (GOV-01, Doc 03 §9.1);
 - **gateway-auth-svc:** edge authentication (INT-01, Doc 05 §10.1);

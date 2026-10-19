@@ -498,6 +498,92 @@ func TestPgStore_ConflictingResubmission_NotIdempotent(t *testing.T) {
 	}
 }
 
+func TestPgStore_RequestChanges_ReopensRejectedAndAttributesActor(t *testing.T) {
+	pool := getTestPool(t)
+	defer pool.Close()
+	setupTestDB(t, pool)
+
+	s := store.New(pool, zap.NewNop())
+	ctx := tenantCtx(testTenantID)
+
+	instance, _, _, err := s.CreateWorkflow(ctx, twoStageParams())
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	// A PENDING instance is not eligible for request-changes — that is a
+	// conflict (409), NOT a missing workflow (404).
+	err = s.RequestChanges(ctx, instance.WorkflowInstanceID, "requester-1", "too early", nil)
+	if !errors.Is(err, domain.ErrInvalidTransition) {
+		t.Fatalf("expected ErrInvalidTransition for PENDING workflow, got %v", err)
+	}
+
+	if _, _, _, err := s.SubmitAction(ctx, domain.SubmitActionParams{
+		WorkflowInstanceID: instance.WorkflowInstanceID, ActorPrincipalID: "approver-1", Action: "REJECT",
+	}); err != nil {
+		t.Fatalf("reject: %v", err)
+	}
+
+	rationale := "attach invoices"
+	if err := s.RequestChanges(ctx, instance.WorkflowInstanceID, "requester-1", rationale, nil); err != nil {
+		t.Fatalf("request changes: %v", err)
+	}
+
+	reopened, err := s.FindWorkflowByID(ctx, instance.WorkflowInstanceID)
+	if err != nil {
+		t.Fatalf("find after request-changes: %v", err)
+	}
+	if reopened.WorkflowStatus != "PENDING" || reopened.CurrentStage != 1 {
+		t.Fatalf("expected PENDING at stage 1 after request-changes, got status=%s stage=%d", reopened.WorkflowStatus, reopened.CurrentStage)
+	}
+
+	evidence, err := s.GetApprovalEvidence(ctx, instance.WorkflowInstanceID)
+	if err != nil {
+		t.Fatalf("get evidence: %v", err)
+	}
+	var reopen *domain.WorkflowTransition
+	for _, tr := range evidence {
+		if tr.FromState == "REJECTED" && tr.ToState == "PENDING" {
+			reopen = tr
+		}
+	}
+	if reopen == nil {
+		t.Fatal("expected a REJECTED -> PENDING transition row")
+	}
+	if reopen.ActedBy != "requester-1" {
+		t.Fatalf("expected transition acted_by=requester-1 (evidence must name the requester), got %q", reopen.ActedBy)
+	}
+
+	// ESCALATED is the other reopenable status — from_state must record it
+	// honestly rather than claiming REJECTED.
+	instance2, _, _, err := s.CreateWorkflow(ctx, twoStageParams())
+	if err != nil {
+		t.Fatalf("create 2: %v", err)
+	}
+	if _, _, err := s.EscalateWorkflow(ctx, instance2.WorkflowInstanceID, "admin-1"); err != nil {
+		t.Fatalf("escalate: %v", err)
+	}
+	if err := s.RequestChanges(ctx, instance2.WorkflowInstanceID, "requester-1", "come back", nil); err != nil {
+		t.Fatalf("request changes after escalate: %v", err)
+	}
+	evidence2, err := s.GetApprovalEvidence(ctx, instance2.WorkflowInstanceID)
+	if err != nil {
+		t.Fatalf("get evidence 2: %v", err)
+	}
+	var reopen2 *domain.WorkflowTransition
+	for _, tr := range evidence2 {
+		if tr.FromState == "ESCALATED" && tr.ToState == "PENDING" {
+			reopen2 = tr
+		}
+	}
+	if reopen2 == nil {
+		t.Fatal("expected an ESCALATED -> PENDING transition row")
+	}
+	if reopen2.ActedBy != "requester-1" {
+		t.Fatalf("expected transition acted_by=requester-1, got %q", reopen2.ActedBy)
+	}
+}
+
 func TestPgStore_EscalateAndCancel(t *testing.T) {
 	pool := getTestPool(t)
 	defer pool.Close()

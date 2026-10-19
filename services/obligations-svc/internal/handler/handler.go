@@ -29,7 +29,7 @@ type ObligationStore interface {
 	CreateObligation(ctx context.Context, params domain.CreateObligationParams) (*domain.Obligation, bool, error)
 	FindObligationByID(ctx context.Context, obligationID string) (*domain.Obligation, error)
 	ListObligations(ctx context.Context, filter domain.ListObligationsFilter) ([]*domain.Obligation, error)
-	UpdateObligationStatus(ctx context.Context, obligationID, newStatus string, expectedVersion int) (*domain.Obligation, bool, error)
+	UpdateObligationStatus(ctx context.Context, obligationID, newStatus string, expectedVersion int, actorID, correlationID string) (*domain.Obligation, bool, error)
 	UpdateObligationWorkflow(ctx context.Context, obligationID, workflowID string) (*domain.Obligation, error)
 	CreateFilingRequirement(ctx context.Context, params domain.CreateFilingRequirementParams) (*domain.FilingRequirement, error)
 	ListFilingRequirements(ctx context.Context, obligationID string) ([]*domain.FilingRequirement, error)
@@ -450,6 +450,7 @@ func (h *Handler) CreateObligation(w http.ResponseWriter, r *http.Request) {
 		SourceReference:      req.SourceReference,
 		CreatedByPrincipalID: principalID,
 		WorkflowID:           req.WorkflowID,
+		CorrelationID:        correlationID,
 	}
 
 	o, created, err := h.store.CreateObligation(r.Context(), params)
@@ -487,13 +488,8 @@ func (h *Handler) CreateObligation(w http.ResponseWriter, r *http.Request) {
 	status := http.StatusOK
 	if created {
 		status = http.StatusCreated
-		if pubErr := h.publisher.PublishObligationCreated(r.Context(), *o, correlationID); pubErr != nil {
-			h.log.Error("CreateObligation: failed to publish obligation.created",
-				zap.String("obligation_id", o.ObligationID),
-				zap.String("correlation_id", correlationID),
-				zap.Error(pubErr),
-			)
-		}
+		// obligation.created was written to event_outbox in the same
+		// transaction as the insert; the relay publishes it after commit.
 	}
 	h.log.Info("obligation created",
 		zap.String("obligation_id", o.ObligationID),
@@ -711,39 +707,16 @@ func (h *Handler) UpdateObligationStatus(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	updated, transitioned, err := h.store.UpdateObligationStatus(r.Context(), obligationID, req.ObligationStatus, expectedVersion)
+	updated, transitioned, err := h.store.UpdateObligationStatus(r.Context(), obligationID, req.ObligationStatus, expectedVersion, principalID, correlationID)
 	if err != nil {
 		h.writeStoreErr(w, "UpdateObligationStatus: store unavailable", err)
 		return
 	}
 
-	if transitioned {
-		if pubErr := h.publisher.PublishObligationUpdated(r.Context(), *updated, principalID, correlationID); pubErr != nil {
-			h.log.Error("UpdateObligationStatus: failed to publish obligation.updated",
-				zap.String("obligation_id", updated.ObligationID),
-				zap.String("correlation_id", correlationID),
-				zap.Error(pubErr),
-			)
-		}
-		switch updated.ObligationStatus {
-		case "OVERDUE":
-			if pubErr := h.publisher.PublishObligationOverdue(r.Context(), *updated, principalID, correlationID); pubErr != nil {
-				h.log.Error("UpdateObligationStatus: failed to publish obligation.overdue",
-					zap.String("obligation_id", updated.ObligationID),
-					zap.String("correlation_id", correlationID),
-					zap.Error(pubErr),
-				)
-			}
-		case "CLOSED":
-			if pubErr := h.publisher.PublishObligationClosed(r.Context(), *updated, principalID, correlationID); pubErr != nil {
-				h.log.Error("UpdateObligationStatus: failed to publish obligation.closed",
-					zap.String("obligation_id", updated.ObligationID),
-					zap.String("correlation_id", correlationID),
-					zap.Error(pubErr),
-				)
-			}
-		}
-	}
+	// obligation.updated (and overdue/closed when applicable) are written to
+	// event_outbox inside the same transaction as the status change.
+	// Publishing directly here would both duplicate those records and lose
+	// the event whenever Kafka was down after the commit.
 
 	h.log.Info("obligation status updated",
 		zap.String("obligation_id", obligationID),

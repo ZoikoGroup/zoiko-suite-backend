@@ -147,11 +147,14 @@ func TestHTTPClient_CheckDelegation_Granted(t *testing.T) {
 		if r.Method != http.MethodPost {
 			t.Errorf("expected POST, got %s", r.Method)
 		}
-		if r.URL.Path != "/v1/authorize/delegation" {
-			t.Errorf("expected /v1/authorize/delegation, got %s", r.URL.Path)
+		if r.URL.Path != "/v1/delegated-access/evaluate" {
+			t.Errorf("expected /v1/delegated-access/evaluate, got %s", r.URL.Path)
 		}
 		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(authorizeResponse{DecisionOutcome: "GRANTED"})
+		_ = json.NewEncoder(w).Encode(struct {
+			HasDelegatedAccess bool   `json:"has_delegated_access"`
+			Basis              string `json:"basis"`
+		}{HasDelegatedAccess: true, Basis: "delegated:from=approver-1"})
 	}))
 	defer server.Close()
 
@@ -168,7 +171,10 @@ func TestHTTPClient_CheckDelegation_Granted(t *testing.T) {
 func TestHTTPClient_CheckDelegation_Denied(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(authorizeResponse{DecisionOutcome: "DENIED"})
+		_ = json.NewEncoder(w).Encode(struct {
+			HasDelegatedAccess bool   `json:"has_delegated_access"`
+			Basis              string `json:"basis"`
+		}{HasDelegatedAccess: false})
 	}))
 	defer server.Close()
 

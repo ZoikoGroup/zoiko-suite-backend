@@ -2,7 +2,7 @@ openapi: "3.1.0"
 
 info:
   title: Schema Registry Service
-  version: "1.1.0"
+  version: "1.1.1"
   description: |
     Canonical registry of event payload contracts for ZoikoSuite.
 
@@ -19,8 +19,8 @@ info:
       409 and must re-read and resubmit, because its schema was checked against
       a version that is no longer latest.
     - Compatibility is evaluated against the current latest version only, and
-      at the top level only (`properties` and `required`). Nested object and
-      array evolution is NOT analysed — a documented v1 limit.
+      recursively: `properties` and `required` are compared at the top level
+      and inside every nested object property and array item schema.
     - Registration is governed: authorization-svc must grant SCHEMA_PUBLISH.
       An unreachable authorization service refuses the write (fail-closed); it
       is never treated as permission.
@@ -44,6 +44,9 @@ paths:
     get:
       tags: [Schemas]
       summary: List every event name with at least one registered version
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Offset"
       responses:
         "200":
           description: Event names. Empty array when nothing is registered — never null.
@@ -53,6 +56,10 @@ paths:
                 type: array
                 items: { type: string }
               example: ["entity.status.changed", "jurisdiction.rule.updated"]
+        "400":
+          $ref: "#/components/responses/InvalidPaging"
+        "401":
+          $ref: "#/components/responses/IdentityRequired"
         "503":
           $ref: "#/components/responses/StoreUnavailable"
 
@@ -62,6 +69,9 @@ paths:
     get:
       tags: [Schemas]
       summary: List every registered version of an event, oldest first
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Offset"
       responses:
         "200":
           description: All versions.
@@ -70,6 +80,10 @@ paths:
               schema:
                 type: array
                 items: { $ref: "#/components/schemas/EventSchema" }
+        "400":
+          $ref: "#/components/responses/InvalidPaging"
+        "401":
+          $ref: "#/components/responses/IdentityRequired"
         "404":
           $ref: "#/components/responses/NotFound"
         "503":
@@ -101,10 +115,11 @@ paths:
               schema: { $ref: "#/components/schemas/EventSchema" }
         "400":
           description: |
-            Malformed body, missing or non-JSON `json_schema`, or a
-            `compatibility_mode` this service cannot enforce. An unrecognised
-            mode is refused rather than defaulted to BACKWARD, so the registry
-            never records a discipline it is not applying.
+            A mandatory canonical envelope header is missing, the body is
+            malformed, `json_schema` is missing or not a JSON object, or a
+            `compatibility_mode` is declared that this service cannot enforce.
+            An unrecognised mode is refused rather than defaulted to BACKWARD,
+            so the registry never records a discipline it is not applying.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -125,7 +140,7 @@ paths:
               schema:
                 oneOf:
                   - $ref: "#/components/schemas/IncompatibleSchemaError"
-                  - $ref: "#/components/schemas/Error"
+                  - $ref: "#/components/schemas/VersionRaceError"
               examples:
                 incompatible:
                   summary: Breaks the current contract
@@ -157,6 +172,8 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/EventSchema" }
+        "401":
+          $ref: "#/components/responses/IdentityRequired"
         "404":
           $ref: "#/components/responses/NotFound"
         "503":
@@ -183,6 +200,8 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          $ref: "#/components/responses/IdentityRequired"
         "404":
           $ref: "#/components/responses/NotFound"
         "503":
@@ -225,8 +244,30 @@ components:
       required: true
       schema: { type: string }
       example: entity.status.changed
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: Maximum rows to return. Defaults to 100.
+      schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+    Offset:
+      name: offset
+      in: query
+      required: false
+      description: Rows to skip. Defaults to 0.
+      schema: { type: integer, minimum: 0, default: 0 }
 
   responses:
+    IdentityRequired:
+      description: No verified principal — the request did not carry gateway-resolved identity.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    InvalidPaging:
+      description: limit was not an integer in 1..500, or offset was not a non-negative integer.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
     NotFound:
       description: No such event or version.
       content:
@@ -310,6 +351,7 @@ components:
 
     IncompatibleSchemaError:
       type: object
+      additionalProperties: false
       required: [error, violations]
       properties:
         error: { type: string, example: "incompatible schema change" }
@@ -317,3 +359,10 @@ components:
           type: array
           description: One entry per breaking change, naming the field that broke.
           items: { type: string }
+
+    VersionRaceError:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error: { type: string, example: "a concurrent registration claimed this version — re-read the latest version and retry" }

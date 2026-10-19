@@ -22,17 +22,17 @@
 package authz
 
 import (
-	svcenvelope "zoiko.io/evidence-requirements-svc/internal/envelope"
-	"github.com/go-chi/chi/v5/middleware"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/go-chi/chi/v5/middleware"
 	"io"
 	"net/http"
 	"sync"
 	"time"
+	svcenvelope "zoiko.io/evidence-requirements-svc/internal/envelope"
 
 	"go.uber.org/zap"
 

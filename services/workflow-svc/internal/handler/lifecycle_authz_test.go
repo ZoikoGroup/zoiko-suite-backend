@@ -35,7 +35,11 @@ func lifecycleRequest(route, principal string) *http.Request {
 	} else {
 		body = bytes.NewBufferString("")
 	}
-	return scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/"+testWorkflowID+"/"+route, body), principal)
+	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/"+testWorkflowID+"/"+route, body), principal)
+	if route == "invalidate" {
+		req.Header.Set("X-Expected-Version", "1")
+	}
+	return req
 }
 
 func TestLifecycleAuthz_PermissionAskedFor(t *testing.T) {
@@ -192,5 +196,55 @@ func TestInvalidateWorkflow_NotFound_NoAuthzNoTransition(t *testing.T) {
 	}
 	if len(authz.asked) != 0 {
 		t.Errorf("expected no authorization call, got %v", authz.asked)
+	}
+}
+
+// A workflow definition belongs to no single legal entity, and
+// authorization-svc refuses an empty legal_entity_id with a 400 — a reply
+// this service can only read as the authorization plane being down. The
+// PLATFORM sentinel is what authorization-svc accepts for a platform-scope
+// act and resolves to its configured platform entity; sending "" made every
+// definition route fail closed with a 503 against a live authorization-svc.
+func TestLifecycleAuthz_DefinitionOpsAskPlatformScope(t *testing.T) {
+	store := &stubStore{
+		workflowDefinition: &domain.WorkflowDefinition{TenantID: "t-1", WorkflowType: "PURCHASE_APPROVAL", Version: 1},
+	}
+	authz := &stubAuthz{}
+	r := newTestRouterFull(store, &stubPublisher{}, authz)
+
+	body := `{"tenant_id":"t-1","workflow_type":"PURCHASE_APPROVAL","version":1,"stages_json":"W10="}`
+	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflow-definitions/", bytes.NewBufferString(body)), "creator-1")
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201 when authorization-svc grants, got %d: %s", w.Code, w.Body.String())
+	}
+	if len(authz.asked) != 1 || authz.asked[0] != "WORKFLOW_DEFINE" {
+		t.Fatalf("expected one check for WORKFLOW_DEFINE, got %v", authz.asked)
+	}
+	if len(authz.entities) != 1 || authz.entities[0] != "PLATFORM" {
+		t.Fatalf("expected the PLATFORM sentinel as legal_entity_id, got %v", authz.entities)
+	}
+
+	// Contrast: an instance-scoped op must still ask with the instance's
+	// own legal entity, not the sentinel.
+	instanceStore := &stubStore{
+		findInstance:       pendingInstance(),
+		cancelInstance:     &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, WorkflowStatus: "CANCELLED"},
+		cancelTransitioned: true,
+	}
+	instanceAuthz := &stubAuthz{}
+	instanceRouter := newTestRouterFull(instanceStore, &stubPublisher{}, instanceAuthz)
+
+	iw := httptest.NewRecorder()
+	instanceRouter.ServeHTTP(iw, lifecycleRequest("cancel", "requester-1"))
+
+	if iw.Code != http.StatusOK {
+		t.Fatalf("expected 200 for the instance-scoped cancel, got %d: %s", iw.Code, iw.Body.String())
+	}
+	if len(instanceAuthz.entities) != 1 || instanceAuthz.entities[0] != "le-1" {
+		t.Fatalf("expected the instance's legal entity le-1, got %v", instanceAuthz.entities)
 	}
 }
