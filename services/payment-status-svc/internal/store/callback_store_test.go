@@ -344,3 +344,52 @@ func TestCallback_TheStateGuardIsTheBackstop(t *testing.T) {
 	_, err := testPool.Exec(context.Background(), `UPDATE payment_execution_states SET status = 'PENDING' WHERE payment_id = $1`, p.PaymentID)
 	assert.Error(t, err)
 }
+
+// INT-NP-043 / INT-CTRL-034: a callback that cannot be correlated to a durable payment changes nothing, is quarantined
+// for a named owner, and raises one event so an alert can route to that owner. A provider's retries do not re-raise it.
+func TestCallback_UncorrelatedIsQuarantinedForANamedOwnerOnce(t *testing.T) {
+	st := app(t)
+	tenant := uuid.NewString()
+	ref := "PRV-" + uuid.NewString()
+	quarantineEvents := func() (n int, owner string) {
+		require.NoError(t, testPool.QueryRow(context.Background(),
+			`SELECT count(*), COALESCE(max(convert_from(payload,'UTF8')::jsonb #>> '{data,owner}'), '') FROM eventing_outbox
+			 WHERE tenant_id = $1 AND event_type = 'com.zoikosuite.banking.provider-callback.quarantined'`, tenant).Scan(&n, &owner))
+		return
+	}
+
+	res, err := st.ApplyProviderCallback(tctx(tenant), cb("simbank", "E-ORPHAN", ref, domain.StatusSettled, nil))
+	require.NoError(t, err)
+	require.Equal(t, store.OutcomeUnknownPayment, res.Outcome)
+	n, owner := quarantineEvents()
+	assert.Equal(t, 1, n)
+	assert.Equal(t, store.QuarantineOwner, owner)
+
+	// the provider retries the same orphan twice: still one quarantine event, receipts keep the evidence
+	for i := 0; i < 2; i++ {
+		_, err = st.ApplyProviderCallback(tctx(tenant), cb("simbank", "E-ORPHAN", ref, domain.StatusSettled, nil))
+		require.NoError(t, err)
+	}
+	n, _ = quarantineEvents()
+	assert.Equal(t, 1, n)
+	assert.Equal(t, 3, receiptCount(t, tenant, "simbank", "E-ORPHAN", store.OutcomeUnknownPayment))
+
+	// an ambiguous reference is quarantined the same way, and nothing moved
+	amb := "PRV-" + uuid.NewString()
+	a, b := newPayment(t, st, tenant, amb), newPayment(t, st, tenant, amb)
+	res, err = st.ApplyProviderCallback(tctx(tenant), cb("simbank", "E-AMB", amb, domain.StatusSettled, nil))
+	require.NoError(t, err)
+	require.Equal(t, store.OutcomeAmbiguousPayment, res.Outcome)
+	n, _ = quarantineEvents()
+	assert.Equal(t, 2, n)
+	assert.Equal(t, domain.StatusPrepared, status(t, st, tenant, a.PaymentID))
+	assert.Equal(t, domain.StatusPrepared, status(t, st, tenant, b.PaymentID))
+
+	// a callback that DOES correlate raises no quarantine
+	ok := "PRV-" + uuid.NewString()
+	newPayment(t, st, tenant, ok)
+	_, err = st.ApplyProviderCallback(tctx(tenant), cb("simbank", "E-OK", ok, domain.StatusAccepted, nil))
+	require.NoError(t, err)
+	n, _ = quarantineEvents()
+	assert.Equal(t, 2, n)
+}

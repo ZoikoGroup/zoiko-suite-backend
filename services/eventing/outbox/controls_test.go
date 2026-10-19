@@ -467,3 +467,21 @@ func TestWrongPartitionKeyIsQuarantinedAndTheProducerBlocked_INT_NP_009(t *testi
 		t.Fatal("the well-formed event still flows")
 	}
 }
+
+// INT-CTRL-034: quarantine and delay alerts always name an owner.
+func TestOutboxAlertsNameAnOwner(t *testing.T) {
+	alerts := Evaluate(Stats{Quarantined: 3, Backlog: 500}, Thresholds{MaxBacklog: 10})
+	if len(alerts) < 2 {
+		t.Fatalf("%+v", alerts)
+	}
+	for _, a := range alerts {
+		if a.Owner != DefaultAlertOwner {
+			t.Errorf("%s has owner %q", a.Event, a.Owner)
+		}
+	}
+	for _, a := range Evaluate(Stats{Quarantined: 1}, Thresholds{Owner: "ledger-ops"}) {
+		if a.Owner != "ledger-ops" {
+			t.Errorf("a named owner is kept: %q", a.Owner)
+		}
+	}
+}
