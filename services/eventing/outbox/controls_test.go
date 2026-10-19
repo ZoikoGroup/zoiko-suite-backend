@@ -427,3 +427,61 @@ func TestVerifyPartitioning(t *testing.T) {
 		t.Fatalf("window excluding the events must be clean: %v", v)
 	}
 }
+
+// INT-NP-009: a producer that invents its own partition key is blocked, not merely reported.
+func TestWrongPartitionKeyIsQuarantinedAndTheProducerBlocked_INT_NP_009(t *testing.T) {
+	pool := openPool(t)
+	ctx := context.Background()
+	w := &fakeWriter{}
+	r := newRelay(t, pool, w, fastConfig())
+	good := newEnvelope(t, "agg-1")
+	enqueue(t, pool, good)
+
+	if err := r.RequirePartitioning(ctx, time.Now().Add(-time.Hour)); err != nil {
+		t.Fatalf("envelope-derived keys must pass the startup gate: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO eventing_outbox (outbox_id, event_id, event_type, schema_version, tenant_id, region,
+		                             aggregate_id, aggregate_version, partition_key, payload, payload_hash)
+		SELECT gen_random_uuid(), 'rogue-1', event_type, schema_version, tenant_id, region,
+		       aggregate_id, aggregate_version, 'orders', payload, payload_hash
+		  FROM eventing_outbox WHERE aggregate_id = 'agg-1' LIMIT 1`); err != nil {
+		t.Fatal(err)
+	}
+	err := r.RequirePartitioning(ctx, time.Now().Add(-time.Hour))
+	if err == nil || !strings.Contains(err.Error(), "malformed-key") || !strings.Contains(err.Error(), "mixed-keys") {
+		t.Fatalf("the startup gate must name the violations: %v", err)
+	}
+
+	drainUntilIdle(t, r, 5)
+	got := readRow(t, pool, "rogue-1")
+	if got.state != StateQuarantined || got.code == nil || *got.code != CodePartitionKey {
+		t.Fatalf("the rogue event must be quarantined with %s, got %+v", CodePartitionKey, got)
+	}
+	for _, id := range w.ids() {
+		if id == "rogue-1" {
+			t.Fatal("an event with a wrong partition key reached the broker")
+		}
+	}
+	if readRow(t, pool, good.ID).state != StatePublished {
+		t.Fatal("the well-formed event still flows")
+	}
+}
+
+// INT-CTRL-034: quarantine and delay alerts always name an owner.
+func TestOutboxAlertsNameAnOwner(t *testing.T) {
+	alerts := Evaluate(Stats{Quarantined: 3, Backlog: 500}, Thresholds{MaxBacklog: 10})
+	if len(alerts) < 2 {
+		t.Fatalf("%+v", alerts)
+	}
+	for _, a := range alerts {
+		if a.Owner != DefaultAlertOwner {
+			t.Errorf("%s has owner %q", a.Event, a.Owner)
+		}
+	}
+	for _, a := range Evaluate(Stats{Quarantined: 1}, Thresholds{Owner: "ledger-ops"}) {
+		if a.Owner != "ledger-ops" {
+			t.Errorf("a named owner is kept: %q", a.Owner)
+		}
+	}
+}

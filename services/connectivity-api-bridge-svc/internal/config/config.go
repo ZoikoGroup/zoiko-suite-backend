@@ -44,6 +44,19 @@ type Config struct {
 	// EgressAllowedPorts are the destination ports a connector may use. Empty
 	// means 443 only.
 	EgressAllowedPorts []int
+	// EgressPrivateCIDRs are private ranges a connector may point at because the provider is reached over
+	// private connectivity (a dedicated link, a VPN, an on-premises gateway). An allowlist of exact ranges:
+	// loopback, link-local (cloud metadata), unspecified and multicast stay refused whatever is listed.
+	EgressPrivateCIDRs []string
+
+	// SchemaRegistryURL turns on the producer-side contract gate (INT-CTRL-005): an event whose data does not satisfy its
+	// registered contract is quarantined before any consumer sees it. Empty leaves the gate off.
+	SchemaRegistryURL string
+	// SchemaGatePrincipal is the workload identity the registry sees.
+	SchemaGatePrincipal string
+	// SchemaGateAllowUnregistered lets an event with no registered contract through. It exists to make a rollout
+	// possible, not as a destination: while true, a producer with no contract is ungoverned.
+	SchemaGateAllowUnregistered bool
 }
 
 func Load() *Config {
@@ -67,6 +80,11 @@ func Load() *Config {
 		EgressAllowedRegions:    csv(os.Getenv("EGRESS_ALLOWED_REGIONS")),
 		EgressAllowInsecureHTTP: getEnv("EGRESS_ALLOW_INSECURE_HTTP", "false") == "true",
 		EgressAllowedPorts:      ints(os.Getenv("EGRESS_ALLOWED_PORTS")),
+		EgressPrivateCIDRs:      csv(os.Getenv("EGRESS_PRIVATE_CIDRS")),
+
+		SchemaRegistryURL:           getEnv("SCHEMA_REGISTRY_URL", ""),
+		SchemaGatePrincipal:         getEnv("SCHEMA_GATE_PRINCIPAL", "connectivity-api-bridge-svc"),
+		SchemaGateAllowUnregistered: getEnv("SCHEMA_GATE_ALLOW_UNREGISTERED", "true") == "true",
 	}
 }
 

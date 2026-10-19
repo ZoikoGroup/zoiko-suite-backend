@@ -13,10 +13,10 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
-	"zoiko.io/payment-status-svc/internal/domain"
-	"zoiko.io/payment-status-svc/internal/middleware"
 	"zoiko.io/eventing/envelope"
 	"zoiko.io/eventing/outbox"
+	"zoiko.io/payment-status-svc/internal/domain"
+	"zoiko.io/payment-status-svc/internal/middleware"
 )
 
 func isInvalidUUID(err error) bool {

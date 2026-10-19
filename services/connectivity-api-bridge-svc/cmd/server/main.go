@@ -17,7 +17,6 @@ import (
 	"zoiko.io/connectivity-api-bridge-svc/internal/authz"
 	"zoiko.io/connectivity-api-bridge-svc/internal/config"
 	"zoiko.io/connectivity-api-bridge-svc/internal/connector"
-	"zoiko.io/connectivity-api-bridge-svc/internal/egress"
 	svcenvelope "zoiko.io/connectivity-api-bridge-svc/internal/envelope"
 	"zoiko.io/connectivity-api-bridge-svc/internal/handler"
 	"zoiko.io/connectivity-api-bridge-svc/internal/health"
@@ -26,6 +25,7 @@ import (
 	"zoiko.io/connectivity-api-bridge-svc/internal/store"
 	"zoiko.io/connectivity-api-bridge-svc/internal/telemetry"
 	"zoiko.io/connectivity-api-bridge-svc/internal/vault"
+	"zoiko.io/eventing/egress"
 	"zoiko.io/eventing/kafkaout"
 	"zoiko.io/eventing/outbox"
 )
@@ -87,6 +87,14 @@ func main() {
 		logger.Fatal("outbox relay", zap.Error(err))
 	}
 	relay.SetRegion(cfg.EventResidencyRegion)
+	gate, err := schemaGate(cfg)
+	if err != nil {
+		logger.Fatal("schema gate", zap.Error(err))
+	}
+	if gate != nil {
+		relay.SetGate(gate)
+		logger.Info("producer schema gate enabled", zap.String("registry", cfg.SchemaRegistryURL), zap.Bool("allow_unregistered", cfg.SchemaGateAllowUnregistered))
+	}
 	relayCtx, stopRelay := context.WithCancel(context.Background())
 	defer stopRelay()
 	go relay.Run(relayCtx)
@@ -119,7 +127,7 @@ func main() {
 	}
 	svc := &connector.Service{
 		Store: st, Vault: vaultClient,
-		Egress:               egress.Policy{AllowHTTP: cfg.EgressAllowInsecureHTTP, AllowedPorts: cfg.EgressAllowedPorts},
+		Egress:               egressPolicy(cfg, logger),
 		EgressAllowedRegions: cfg.EgressAllowedRegions,
 	}
 	h := handler.New(svc, st, authzClient, logger)
@@ -169,4 +177,14 @@ func main() {
 		logger.Error("server forced to shutdown", zap.Error(err))
 	}
 	logger.Info("connectivity-api-bridge-svc stopped cleanly")
+}
+
+// egressPolicy builds the connector egress rules. A malformed private range stops the service: an
+// allowlist that silently parses to nothing would hide a misconfiguration.
+func egressPolicy(cfg *config.Config, logger *zap.Logger) egress.Policy {
+	nets, err := egress.ParseCIDRs(cfg.EgressPrivateCIDRs)
+	if err != nil {
+		logger.Fatal("EGRESS_PRIVATE_CIDRS is invalid", zap.Error(err))
+	}
+	return egress.Policy{AllowHTTP: cfg.EgressAllowInsecureHTTP, AllowedPorts: cfg.EgressAllowedPorts, PrivateNets: nets}
 }

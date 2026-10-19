@@ -1,0 +1,120 @@
+{
+  "uid": "integration-int",
+  "title": "Integration, file exchange & connectivity (INT)",
+  "tags": ["integration", "int", "zs-svc-m-001"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "description": "ZS-SVC-M-001. The quiet integration failures: security events dropped before the SIEM, events stuck in an outbox, deliveries dead-lettered. Each panel reads a signal a service exports today; the matching alerts are in prometheus-rules.yml (group 'integration').",
+  "panels": [
+    {
+      "type": "row",
+      "title": "Nothing may be lost silently",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false
+    },
+    {
+      "type": "stat",
+      "title": "SIEM events dropped (24h)",
+      "description": "INT-NP-044. The gateway queue drops rather than blocks; every drop is audit evidence that never reached the SIEM. Should be zero.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 1 },
+      "targets": [
+        { "expr": "sum(increase(gateway_auth_siem_events_dropped_total[24h]))", "legendFormat": "dropped" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }]
+          }
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Identity outbox dead letters",
+      "description": "Federation provisioning and deprovisioning events that exhausted their attempts. Any non-zero value needs a person.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 1 },
+      "targets": [
+        { "expr": "sum(identity_context_outbox_dead_letter)", "legendFormat": "dead-lettered" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }]
+          }
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Webhook events dead-lettered (24h)",
+      "description": "INT-NP-045. Replays need an operator, a different approver and a reason, and stay inside the deployment's regions.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 1 },
+      "targets": [
+        { "expr": "sum(increase(notification_webhook_dlq_total[24h]))", "legendFormat": "dead-lettered" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{ "color": "green", "value": null }, { "color": "orange", "value": 1 }]
+          }
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Oldest undelivered notification event",
+      "description": "Committed but not published. Rises when the relay or the broker stops.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 1 },
+      "targets": [
+        { "expr": "max(notification_outbox_oldest_age_seconds)", "legendFormat": "age" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{ "color": "green", "value": null }, { "color": "orange", "value": 300 }, { "color": "red", "value": 900 }]
+          }
+        }
+      }
+    },
+    {
+      "type": "row",
+      "title": "Relays",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 6 },
+      "collapsed": false
+    },
+    {
+      "type": "timeseries",
+      "title": "Identity outbox: pending vs published",
+      "description": "Pending above zero with no publishing is a stopped relay, which is invisible from the request path.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 7 },
+      "targets": [
+        { "expr": "sum(identity_context_outbox_pending)", "legendFormat": "pending" },
+        { "expr": "sum(rate(identity_context_outbox_published_total[5m]))", "legendFormat": "published/s" },
+        { "expr": "sum(rate(identity_context_outbox_failed_total[5m]))", "legendFormat": "failed/s" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Notification outbox: pending and age",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 7 },
+      "targets": [
+        { "expr": "sum(notification_outbox_pending)", "legendFormat": "pending" },
+        { "expr": "max(notification_outbox_oldest_age_seconds)", "legendFormat": "oldest age (s)" }
+      ]
+    }
+  ]
+}

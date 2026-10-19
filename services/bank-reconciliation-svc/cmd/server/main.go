@@ -186,6 +186,7 @@ func main() {
 	if err != nil {
 		log.Fatal("evidence-conflict consumer: inbox", zap.Error(err))
 	}
+	conflictInbox.SetRegion(cfg.EventResidencyRegion)
 	conflictConsumer := events.NewConflictConsumer(log, pgStore, conflictInbox)
 	go conflictConsumer.Run(conflictConsumerCtx, conflictReader)
 

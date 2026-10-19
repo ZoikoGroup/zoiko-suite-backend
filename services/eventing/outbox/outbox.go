@@ -31,7 +31,9 @@ import (
 	"fmt"
 	"math"
 	"math/rand/v2"
+	"regexp"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -62,6 +64,9 @@ const (
 	CodeInvalidStored     = "INVALID_STORED_ENVELOPE"
 	CodeSchemaRejected    = "SCHEMA_REJECTED"
 	CodeGateUnavailable   = "GATE_UNAVAILABLE"
+	// CodePartitionKey: the row carries a partition key that is not the envelope's opaque hash. Publishing it would
+	// silently break per-aggregate ordering, so it is quarantined instead (INT-NP-009).
+	CodePartitionKey = "PARTITION_KEY_INVALID"
 )
 
 // EventIDHeader carries the event id as a Kafka header as well as in the body.
@@ -328,6 +333,10 @@ func (r *Relay) DrainOnce(ctx context.Context) (PassResult, error) {
 			// The row cannot be what Enqueue wrote. Retrying will not change
 			// it, and sending it would hand consumers a malformed event.
 			r.recordFailure(ctx, rec, true, CodeInvalidStored, err, &res)
+			continue
+		}
+		if !validPartitionKey(rec.partitionKey) {
+			r.recordFailure(ctx, rec, true, CodePartitionKey, errors.New("partition key is not the envelope's opaque hash"), &res)
 			continue
 		}
 		if r.gate != nil {
@@ -798,28 +807,46 @@ func (r *Relay) SetGate(g Gate) { r.gate = g }
 type Thresholds struct {
 	MaxBacklog    int           // 0 = unchecked
 	MaxBacklogAge time.Duration // 0 = unchecked
+	// Owner is stamped on every alert; empty means DefaultAlertOwner.
+	Owner string
 }
 
 // Alert is a canonical integration event the service should emit.
 type Alert struct {
 	Event  string // ZS-SVC-M-001 §10 event name
 	Detail string
+	// Owner is the queue that owns what the alert is about, so it routes somewhere (INT-CTRL-034). Set from
+	// Thresholds.Owner, DefaultAlertOwner when that is empty.
+	Owner string
 }
+
+// DefaultAlertOwner owns an alert when the service names no one: quarantine and dead letters are never ownerless.
+const DefaultAlertOwner = "integration-operations"
 
 // Evaluate turns Stats into the §10 alerts: outbox_publish_delayed when the
 // backlog is too old or too large, outbox_quarantined whenever anything is
 // quarantined (quarantine always needs an owner).
 func Evaluate(s Stats, t Thresholds) []Alert {
+	out := evaluate(s, t)
+	owner := t.Owner
+	if owner == "" {
+		owner = DefaultAlertOwner
+	}
+	for i := range out {
+		out[i].Owner = owner
+	}
+	return out
+}
+
+func evaluate(s Stats, t Thresholds) []Alert {
 	var out []Alert
 	if t.MaxBacklogAge > 0 && s.OldestBacklogAge > t.MaxBacklogAge {
-		out = append(out, Alert{"outbox_publish_delayed",
-			fmt.Sprintf("oldest unpublished event is %s old", s.OldestBacklogAge.Round(time.Second))})
+		out = append(out, Alert{Event: "outbox_publish_delayed", Detail: fmt.Sprintf("oldest unpublished event is %s old", s.OldestBacklogAge.Round(time.Second))})
 	} else if t.MaxBacklog > 0 && s.Backlog > t.MaxBacklog {
-		out = append(out, Alert{"outbox_publish_delayed",
-			fmt.Sprintf("%d events are waiting to publish", s.Backlog)})
+		out = append(out, Alert{Event: "outbox_publish_delayed", Detail: fmt.Sprintf("%d events are waiting to publish", s.Backlog)})
 	}
 	if s.Quarantined > 0 {
-		out = append(out, Alert{"outbox_quarantined", fmt.Sprintf("%d events are quarantined", s.Quarantined)})
+		out = append(out, Alert{Event: "outbox_quarantined", Detail: fmt.Sprintf("%d events are quarantined", s.Quarantined)})
 	}
 	return out
 }
@@ -916,4 +943,25 @@ func (r *Relay) VerifyPartitioning(ctx context.Context, since time.Time) ([]Part
 		return nil, fmt.Errorf("outbox: verify partitioning: %w", err)
 	}
 	return out, nil
+}
+
+var partitionKeyShape = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+func validPartitionKey(k string) bool { return partitionKeyShape.MatchString(k) }
+
+// RequirePartitioning is VerifyPartitioning as a gate: it returns an error naming every violation, for a producer to
+// run at startup or in CI so that a misconfigured producer cannot go live (INT-NP-009).
+func (r *Relay) RequirePartitioning(ctx context.Context, since time.Time) error {
+	v, err := r.VerifyPartitioning(ctx, since)
+	if err != nil {
+		return err
+	}
+	if len(v) == 0 {
+		return nil
+	}
+	parts := make([]string, 0, len(v))
+	for _, x := range v {
+		parts = append(parts, fmt.Sprintf("%s (tenant %s): %s", x.Kind, x.TenantID, x.Detail))
+	}
+	return fmt.Errorf("outbox: partition-key policy violated: %s", strings.Join(parts, "; "))
 }

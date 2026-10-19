@@ -108,6 +108,9 @@ type Config struct {
 	// WebhookDLQ configures the periodic background worker that reprocesses
 	// retryable webhook DLQ records.
 	WebhookDLQ WebhookDLQConfig
+
+	// WebhookOut configures INT-04 outbound webhooks (off by default).
+	WebhookOut WebhookOutConfig
 }
 
 type WebhookDLQConfig struct {
@@ -350,6 +353,12 @@ func Load() (*Config, error) {
 			BatchSize: envInt("NOTIFICATION_WEBHOOK_DLQ_BATCH_SIZE", 50),
 		},
 	}
+
+	webhookOut, woErr := loadWebhookOut(cfg.Env == "production")
+	if woErr != nil {
+		return nil, woErr
+	}
+	cfg.WebhookOut = webhookOut
 
 	// A malformed secret list is refused outright rather than ignored: ignoring it
 	// would close the webhook ingress (every callback refused) with nothing to say

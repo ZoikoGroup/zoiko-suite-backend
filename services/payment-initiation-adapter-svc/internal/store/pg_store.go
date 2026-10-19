@@ -191,7 +191,7 @@ func (s *PgStore) PrepareAttempt(ctx context.Context, tenantID string, req domai
 		if req.SourceReference != "" {
 			existing, err := scanAttempt(tx.QueryRow(ctx, `
 				SELECT `+attemptColumns+` FROM payment_initiation_attempts
-				WHERE source_reference = $1 AND status IN ('PREPARED', 'PENDING_UNKNOWN', 'SUBMITTED')
+				WHERE source_reference = $1 AND status IN ('PREPARED', 'SUBMITTING', 'PENDING_UNKNOWN', 'SUBMITTED')
 				LIMIT 1
 			`, req.SourceReference))
 			if err == nil {
@@ -216,6 +216,13 @@ func (s *PgStore) PrepareAttempt(ctx context.Context, tenantID string, req domai
 			return err
 		}
 		a = inserted
+		if req.ProviderKey != "" {
+			// bind the attempt to its provider, rail and connector in the same transaction as the row
+			if _, err := tx.Exec(ctx, `UPDATE payment_initiation_attempts SET provider_key = $2, rail = $3, connector_id = $4 WHERE attempt_id = $1`,
+				id, req.ProviderKey, req.Rail, req.ConnectorID); err != nil {
+				return err
+			}
+		}
 		if err := s.recordEvent(ctx, tx, a.TenantID, id, domain.EventInitiationPrepared, "", principalID); err != nil {
 			return err
 		}

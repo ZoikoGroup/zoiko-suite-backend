@@ -61,7 +61,8 @@ const (
 // the envelope middleware classifies its POST; deduplicating a query is
 // meaningless.
 var exemptPaths = map[string]bool{
-	"/v1/authenticate":    true,
+	"/v1/authenticate":           true,
+	"/v1/authenticate/federated": true,
 	"/v1/context/resolve": true,
 }
 

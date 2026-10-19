@@ -11,10 +11,10 @@ import (
 	"time"
 
 	"zoiko.io/connectivity-api-bridge-svc/internal/domain"
-	"zoiko.io/connectivity-api-bridge-svc/internal/egress"
 	"zoiko.io/connectivity-api-bridge-svc/internal/middleware"
 	"zoiko.io/connectivity-api-bridge-svc/internal/store"
 	"zoiko.io/connectivity-api-bridge-svc/internal/vault"
+	"zoiko.io/eventing/egress"
 )
 
 const (
@@ -809,7 +809,8 @@ func TestProfileWithdrawnDegradesAndRefuses_INT_NP_022(t *testing.T) {
 	if err != nil || !ps.UpgradeRequired || ps.Status != domain.ProfileDeprecated {
 		t.Fatalf("%v %+v", err, ps)
 	}
-	// unsupported: refused, no schema guessing
+	// unsupported: refused, no schema guessing (the window has run out)
+	*e.now = e.now.Add(DeprecationWindow + time.Hour)
 	if _, err := e.svc.SetProfileStatus(pctx, store.PlatformScopeID, admin, "bank-x", 2, domain.ProfileUnsupported); err != nil {
 		t.Fatal(err)
 	}
@@ -1119,5 +1120,55 @@ func TestLegacyConnectorKeepsWorkingUntilFirstProtectedChange(t *testing.T) {
 	}
 	if u.LegacyUnapproved || u.Live() {
 		t.Fatalf("its first protected change puts it through approval: %+v", u)
+	}
+}
+
+// Provider change management: a deprecation announces a sunset at least DeprecationWindow away, and a profile is not
+// withdrawn before it unless the withdrawal is declared an emergency with a reason.
+func TestDeprecationWindowIsEnforcedBeforeAProfileIsWithdrawn(t *testing.T) {
+	e := newEnv(t)
+	pctx := ctxOf(store.PlatformScopeID)
+	p := store.PlatformScopeID
+
+	// withdrawing a certified profile outright is refused
+	if _, err := e.svc.SetProfileStatus(pctx, p, admin, "bank-x", 2, domain.ProfileUnsupported); !errors.Is(err, ErrDeprecationWindow) {
+		t.Fatalf("a certified profile cannot be withdrawn without notice: %v", err)
+	}
+	// a window shorter than the minimum is refused
+	short := e.now.Add(DeprecationWindow - time.Hour)
+	if _, err := e.svc.ChangeProfileStatus(pctx, p, admin, "bank-x", 2, ProfileChange{Status: domain.ProfileDeprecated, SunsetAt: &short}); !errors.Is(err, ErrValidation) {
+		t.Fatalf("a short deprecation window: %v", err)
+	}
+	// deprecating with no date announces the minimum window
+	dep, err := e.svc.SetProfileStatus(pctx, p, admin, "bank-x", 2, domain.ProfileDeprecated)
+	if err != nil || dep.SunsetAt == nil || !dep.SunsetAt.Equal(e.now.Add(DeprecationWindow)) {
+		t.Fatalf("a deprecation records its sunset: %v %+v", err, dep)
+	}
+	// still inside the window: refused, and the profile is still only deprecated
+	*e.now = e.now.Add(DeprecationWindow - time.Hour)
+	if _, err := e.svc.SetProfileStatus(pctx, p, admin, "bank-x", 2, domain.ProfileUnsupported); !errors.Is(err, ErrDeprecationWindow) {
+		t.Fatalf("withdrawn inside its window: %v", err)
+	}
+	if got, _ := e.svc.Store.GetProfile(pctx, "bank-x", 2); got.Status != domain.ProfileDeprecated {
+		t.Fatalf("the refused withdrawal changed the profile: %s", got.Status)
+	}
+	// an emergency needs a reason, and then is allowed inside the window
+	if _, err := e.svc.ChangeProfileStatus(pctx, p, admin, "bank-x", 2, ProfileChange{Status: domain.ProfileUnsupported, Emergency: true}); !errors.Is(err, ErrValidation) {
+		t.Fatalf("an emergency without a reason: %v", err)
+	}
+	if got, err := e.svc.ChangeProfileStatus(pctx, p, admin, "bank-x", 2, ProfileChange{Status: domain.ProfileUnsupported, Emergency: true, Reason: "provider disclosed a signing-key leak"}); err != nil || got.Status != domain.ProfileUnsupported {
+		t.Fatalf("an emergency withdrawal: %v %+v", err, got)
+	}
+}
+
+func TestAWithdrawalAfterTheWindowIsAllowed(t *testing.T) {
+	e := newEnv(t)
+	pctx := ctxOf(store.PlatformScopeID)
+	if _, err := e.svc.SetProfileStatus(pctx, store.PlatformScopeID, admin, "bank-x", 2, domain.ProfileDeprecated); err != nil {
+		t.Fatal(err)
+	}
+	*e.now = e.now.Add(DeprecationWindow)
+	if got, err := e.svc.SetProfileStatus(pctx, store.PlatformScopeID, admin, "bank-x", 2, domain.ProfileUnsupported); err != nil || got.Status != domain.ProfileUnsupported {
+		t.Fatalf("at the sunset the profile may be withdrawn: %v %+v", err, got)
 	}
 }

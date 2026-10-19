@@ -723,3 +723,61 @@ func TestVerifySchema(t *testing.T) {
 		t.Fatal("missing table not reported")
 	}
 }
+
+// INT-CTRL-034: quarantine alerts always name an owner.
+func TestQuarantineAlertsNameAnOwner(t *testing.T) {
+	alerts := Evaluate(Stats{Quarantined: 2, Failed: 9}, Thresholds{MaxFailed: 1})
+	if len(alerts) != 2 {
+		t.Fatalf("%+v", alerts)
+	}
+	for _, a := range alerts {
+		if a.Owner != DefaultAlertOwner {
+			t.Errorf("%s has owner %q", a.Event, a.Owner)
+		}
+	}
+	for _, a := range Evaluate(Stats{Quarantined: 1}, Thresholds{Owner: "payments-ops"}) {
+		if a.Owner != "payments-ops" {
+			t.Errorf("a named owner is kept: %q", a.Owner)
+		}
+	}
+}
+
+// INT-NP-045: a repair must not move an event across regions. A region-pinned inbox requeues only receipts of its own
+// region, and refuses one it cannot place (no region recorded).
+func TestRequeueCannotCrossRegions_INT_NP_045(t *testing.T) {
+	h := newHarness(t)
+	in := h.inbox(t, 1)
+	in.SetRegion("uk")
+	ctx := context.Background()
+	fail := func(ctx context.Context, tx pgx.Tx, r Receipt) (string, error) { return "", errors.New("bad") }
+	regional := func(id, region string) Message { m := msg(id); m.Region = region; return m }
+
+	for _, m := range []Message{regional("uk-1", "uk"), regional("eu-1", "eu"), msg("legacy-1")} {
+		_, _ = in.Process(ctx, m, fail) // the handler's own error is the point: the receipt is quarantined
+	}
+	if err := in.Requeue(ctx, "tenant-a", "uk-1", validAuth); err != nil {
+		t.Fatalf("an event of this region is repairable: %v", err)
+	}
+	for _, id := range []string{"eu-1", "legacy-1"} {
+		if err := in.Requeue(ctx, "tenant-a", id, validAuth); !errors.Is(err, ErrRegionMismatch) {
+			t.Fatalf("%s: a repair across regions, or of an event with no recorded region, must be refused: %v", id, err)
+		}
+		if rec, _ := in.Get(ctx, "tenant-a", id); rec.State != StateQuarantine {
+			t.Fatalf("%s: a refused repair changes nothing: %s", id, rec.State)
+		}
+	}
+	var logged int
+	if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM eventing_repair_log WHERE event_id IN ('eu-1','legacy-1')`).Scan(&logged); err != nil || logged != 0 {
+		t.Fatalf("a refused repair leaves no repair record: %d %v", logged, err)
+	}
+	// an unpinned inbox keeps the old behaviour
+	free := h.inbox(t, 1)
+	if err := free.Requeue(ctx, "tenant-a", "eu-1", validAuth); err != nil {
+		t.Fatalf("no region pin, no region check: %v", err)
+	}
+	// the region travels from the envelope
+	m, err := Parse([]byte(`{"id":"e1","type":"com.zoikosuite.x.y.z","tenantid":"t","residencyregion":"uk","data":{"a":1}}`))
+	if err != nil || m.Region != "uk" {
+		t.Fatalf("%+v %v", m, err)
+	}
+}

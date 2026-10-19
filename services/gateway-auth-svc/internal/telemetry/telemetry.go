@@ -326,3 +326,17 @@ func newDiscardResponseWriter() *discardResponseWriter {
 func (d *discardResponseWriter) Header() http.Header         { return d.header }
 func (d *discardResponseWriter) Write(b []byte) (int, error) { return len(b), nil }
 func (d *discardResponseWriter) WriteHeader(int)             {}
+
+// RegisterSIEMDrops exposes the count of security events the SIEM queue discarded because it was full. The queue drops
+// rather than blocks (an unbounded one would turn a SIEM outage into this service's memory problem), so the loss is only
+// acceptable if it is measurable and alertable: gateway_auth_siem_events_dropped_total should stay at zero (INT-NP-044).
+// It returns the collector so a test can read it.
+func (m *Metrics) RegisterSIEMDrops(dropped func() uint64, serviceName string) prometheus.CounterFunc {
+	c := prometheus.NewCounterFunc(prometheus.CounterOpts{
+		Name:        "gateway_auth_siem_events_dropped_total",
+		Help:        "Security events discarded because the SIEM queue was full.",
+		ConstLabels: prometheus.Labels{"service": serviceName},
+	}, func() float64 { return float64(dropped()) })
+	prometheus.MustRegister(c)
+	return c
+}

@@ -21,9 +21,9 @@ import (
 	"time"
 
 	"zoiko.io/connectivity-api-bridge-svc/internal/domain"
-	"zoiko.io/connectivity-api-bridge-svc/internal/egress"
 	"zoiko.io/connectivity-api-bridge-svc/internal/store"
 	"zoiko.io/connectivity-api-bridge-svc/internal/vault"
+	"zoiko.io/eventing/egress"
 )
 
 // Errors the handler maps to stable INT-* problems.
@@ -40,6 +40,7 @@ var (
 	ErrNotLive               = errors.New("the connector is not active")
 	ErrValidation            = errors.New("the request is not valid")
 	ErrNotPlatformScope      = errors.New("only the platform scope may do that")
+	ErrDeprecationWindow     = errors.New("the profile's deprecation window has not ended")
 )
 
 // Actor is who is acting.
