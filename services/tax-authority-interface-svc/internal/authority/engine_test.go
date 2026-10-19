@@ -800,3 +800,35 @@ func TestCredentialIsReleasedPerCallAndNeverInEvidence(t *testing.T) {
 		t.Fatalf("the credential is in the evidence: %s", b)
 	}
 }
+
+// INT-CTRL-028: the adapter transports the approved return; it never computes, corrects or adds a tax figure.
+func TestTheAdapterSendsExactlyTheApprovedReturnAndComputesNothing(t *testing.T) {
+	e := newEnv(t, true)
+	// the filing's own AmountText says 777.77 and the document says 125.50: the adapter must not reconcile, round or
+	// replace either, it sends the document the tax domain approved
+	doc := `{"period":"2026-03","boxes":{"vat_due":125.50,"vat_reclaimed":3.10,"net_sales":99999.99}}`
+	id := e.filing(doc)
+	e.st.f[id].AmountText = "777.7700"
+	if _, err := e.send(id); err != nil {
+		t.Fatal(err)
+	}
+	var sent map[string]any
+	if err := json.Unmarshal([]byte(e.sim.bodies[0]), &sent); err != nil {
+		t.Fatal(err)
+	}
+	for k := range sent {
+		if k != "return" && k != "submission_ref" {
+			t.Fatalf("the adapter added a field of its own to the filing: %q", k)
+		}
+	}
+	var approved map[string]any
+	_ = json.Unmarshal([]byte(doc), &approved)
+	got, _ := json.Marshal(sent["return"])
+	want, _ := json.Marshal(approved)
+	if string(got) != string(want) {
+		t.Fatalf("the return was altered in transit:\n sent     %s\n approved %s", got, want)
+	}
+	if strings.Contains(e.sim.bodies[0], "777") {
+		t.Fatal("the filing's own amount text leaked into the submission")
+	}
+}
