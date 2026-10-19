@@ -52,6 +52,7 @@ type Store interface {
 
 	// Wave 5.
 	CertifyRun(ctx context.Context, tenantID, runID, actor, correlationID string, expectedVersion int, req domain.CertifyRequest) (*domain.ControlRun, error)
+	RevokeCertification(ctx context.Context, tenantID, runID, actor, correlationID, idempotencyKey string, expectedVersion int, req domain.RevokeCertificationRequest) (*domain.ControlRun, bool, error)
 	CloseGate(ctx context.Context, tenantID, legalEntityID, periodID string) (*domain.CloseGate, error)
 	ExceptionSummary(ctx context.Context, tenantID, legalEntityID, periodID string) (*domain.ExceptionSummary, error)
 
@@ -127,6 +128,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 			r.Get("/{run_id}/exceptions", h.ListExceptions)
 			r.Get("/{run_id}/evidence", h.GetEvidence)
 			r.Post("/{run_id}/certification", h.CertifyRun)
+			r.Post("/{run_id}/revoke-certification", h.RevokeCertification)
 			r.Post("/{run_id}/submit-for-certification", h.SubmitForCertification)
 			r.Get("/{run_id}/evidence-export", h.ExportRunEvidence)
 		})
@@ -518,7 +520,7 @@ func (h *Handler) writeErr(w http.ResponseWriter, op string, err error) {
 		writeError(w, http.StatusForbidden, "not_exception_owner", err.Error())
 	case errors.Is(err, domain.ErrNotIndependent):
 		writeError(w, http.StatusForbidden, "segregation_of_duties", err.Error())
-	case errors.Is(err, domain.ErrSegregation):
+	case errors.Is(err, domain.ErrSegregation), errors.Is(err, domain.ErrRevokerIsCertifier):
 		writeError(w, http.StatusForbidden, "segregation_of_duties", err.Error())
 	case errors.Is(err, domain.ErrSelfApproval):
 		writeError(w, http.StatusForbidden, "self_approval", err.Error())

@@ -31,6 +31,7 @@ type fakeStore struct {
 	w1        wave1State
 	w5        wave5State
 	w7        wave7State
+	rv        revokeState
 }
 
 func (f *fakeStore) CreateDefinition(_ context.Context, _, _, _ string, req domain.CreateControlDefinitionRequest) (*domain.ControlDefinition, error) {

@@ -18,44 +18,25 @@ policies a run pins.
 
 ## A. Not implemented / weaker than the spec
 
-- **A1. A certification cannot be revoked.** `CertRevoked` and the
-  `CERTIFIED → REVOKED` edge exist in `internal/domain/state.go`, but no command
-  reaches them. Today the only way out of CERTIFIED is a new run with
-  `prior_run_id` for the same entity and period, which supersedes it. That
-  covers "replace with a better result" but not "this result is wrong and
-  nothing replaces it yet".
-
-  *What the specification does say* (checked against the source text):
-  ZS-CONTROL-001 §7 names Revoked as a certification state (it is not a
-  lifecycle state); §27 "Reopen/supersede certified run — restricted command,
-  reason, evidence, prior certification retained"; §25 requires a reason for
-  reopen and idempotency, `If-Match` and re-authorization on material commands;
-  Invariant 2 "corrections create a new run, superseding certification or
-  documented reopen workflow"; scenario 12 "certified run later found erroneous
-  — original certification retained; controlled superseding/reopen workflow
-  required". ZS-SVC-Z-001 (the data-quality certification analogue) adds "new
-  material evidence may revoke certification prospectively; prior
-  certification history remains", runbook RB-05 "revoke affected certification
-  prospectively, preserve prior evidence, assess blast radius", NP-47
-  "certification revoked with no reason/evidence" must fail safe, and an event
-  carrying prior certification id, reason and effective time. Not relevant
-  here: scenario 11 ("certification authority revoked before sign-off") is the
-  *certifier's IAM authority* being withdrawn; `CertifyRun` already re-checks
-  authorization when it is called.
-
-  *Why it was not built* (2026-10-16): the specification does not say
-  (a) which **lifecycle** state a run takes when its certification is revoked
-  — §7 has no lifecycle Revoked, the only edge out of lifecycle CERTIFIED is
-  SUPERSEDED, and the `control_runs` CHECK forbids lifecycle CERTIFIED with any
-  other certification state, so a choice has to be made and the constraint
-  migrated; (b) what happens **downstream** (A11); (c) **who** may revoke —
-  "restricted command" names no role. Once those are decided, the command is
-  small: `POST /controls/v1/runs/{id}/revoke-certification` with mandatory
-  reason and evidence reference (NP-47), `If-Match`, `Idempotency-Key`, its own
-  action (not `FINCTRL_CERTIFY`), the original certification transition kept,
-  event `control.run.certification_revoked` (prior state, reason, effective
-  time), and a test that the close gate reports closed for that control
-  afterwards (the gate reads the latest run's states).
+- **A1. A certification cannot be revoked. — Closed (B6).**
+  `POST /controls/v1/runs/{run_id}/revoke-certification` moves a CERTIFIED
+  run's certification dimension CERTIFIED → REVOKED. The lifecycle stays
+  CERTIFIED and the result is untouched (§7: Revoked is a certification state,
+  not a lifecycle state). The original certification is retained (§27):
+  nothing in the run's history changes, and an append-only
+  `control_certification_revocations` row references the certification
+  transition it revokes. The request needs a mandatory reason and at least
+  one evidence reference (§25, NP-47), plus `If-Match` and `Idempotency-Key`.
+  It is authorized by its own action, `FINCTRL_REVOKE`, and the principal who
+  certified the run cannot revoke it. It emits
+  `control.run.certification_revoked` (prior state, prior certification,
+  reason, evidence, effective time). The close gate reports the control as
+  blocking with reason `CERTIFICATION_REVOKED`. The three questions this item
+  left open were settled as follows: (a) the lifecycle stays CERTIFIED
+  (migration 000006 relaxes the CHECK); (b) the downstream effect is
+  prospective only (RB-05; see A11); (c) who may revoke: holders of
+  `FINCTRL_REVOKE` other than the certifier. **Deployment prerequisite:**
+  see B6, `FINCTRL_REVOKE` must be registered in access-control-svc first.
 - **A2. No ControlCertification record (§6, Invariant 9).** Certifying changes
   the run's states and appends a transition row (actor, reason, time). Invariant
   9 requires the certified result to identify the certifier, *certification
@@ -123,22 +104,28 @@ policies a run pins.
 - **A10. 25 catalogue controls are blocked or partial.** See
   `financial-control-closure.md` §7 and `GET /controls/v1/catalogue/status`;
   not repeated here.
-- **A11. Downstream effect of a revoked (or superseded) certification is
-  unspecified.** A certification is consumed elsewhere: financial-close-svc's
-  readiness check calls `GET /controls/v1/close-gate` before a period is
-  closed, and reporting is released from that closed period (ZS-CONTROL-001
-  §22, Invariants 10 and 17). Neither ZS-CONTROL-001 nor ZS-SVC-Z-001 says
-  what happens when a certification that a period was **already** closed on is
-  revoked: whether the period must be reopened, whether released reports are
-  marked or withdrawn, or whether consumers are only notified. ZS-SVC-Z-001
-  RB-05 says only "assess blast radius", and its revocation is "prospective".
-  The close gate in this service would report the gate closed for future
-  readiness checks, but nothing tells financial-close-svc or reporting that a
-  past decision rested on a revoked certification. This needs an owner's
-  decision (Finance Controls / close governance) before A1 is built, and
-  probably a consumer of `control.run.certification_revoked` in
-  financial-close-svc. The same question applies today to a certified run that
-  is superseded by a failing one after its period closed.
+- **A11. Downstream effect of a revoked (or superseded) certification —
+  narrowed: the decision is made, consumers are not yet wired.**
+  ZS-SVC-Z-001 RB-05 answers the question this item asked: revocation is
+  **prospective**. Its downstream effect is flagging and notification from
+  the revocation onward. It does not reopen a period already closed on the
+  certification, and it does not withdraw reports already released from that
+  period. This service now does both of its parts (A1/B6): the close gate
+  reports the control as `BLOCKING` with reason `CERTIFICATION_REVOKED`, the
+  revocation time and its reason; and `control.run.certification_revoked`
+  is emitted with the prior certification, reason, evidence and effective
+  time. financial-close-svc already reads each gate item's `reason`, so a
+  readiness check made after a revocation sees it without any change there.
+  **Still open, and outside this service:** (1) nothing subscribes to
+  `control.run.certification_revoked`. financial-close-svc only asks the
+  gate when it closes a period, so a period closed *before* the revocation
+  is not flagged anywhere until someone queries the gate for it again;
+  (2) RB-05's "assess blast radius" has no query yet. Nothing lists the
+  closed periods, or released reports, whose close rested on a now-revoked
+  certification. Both are consumer-side work (financial-close-svc and
+  reporting). The same applies to a certified run superseded by a failing
+  one after its period closed: the gate reflects it, and
+  `control.run.superseded` is emitted, but nothing acts on it.
 
 ## B. Interpretations and additions (decisions a reviewer may want to reverse)
 
@@ -164,3 +151,51 @@ policies a run pins.
 - **B5. ZS-EVENT-001 CloudEvents naming is not used.** Events use the
   platform's shared envelope with ZS-EVENT attributes as extra fields; a
   platform-wide decision is needed (closure §5).
+- **B6. How certification revocation works (A1).**
+  - *State.* Only the certification dimension moves, CERTIFIED → REVOKED.
+    `domain.ValidateCertificationRevocation` admits it only on a lifecycle
+    CERTIFIED run, and REVOKED has no outgoing edge, so a second revocation
+    is refused (422). Migration 000006 replaces 000001's CHECK (lifecycle
+    CERTIFIED ⇒ certification CERTIFIED) with
+    `chk_certified_lifecycle_certification` (… IN CERTIFIED, REVOKED), and
+    adds `chk_revoked_follows_certification` (REVOKED only on lifecycle
+    CERTIFIED or SUPERSEDED). The down migration refuses while any revoked
+    run exists. A revoked run can still be superseded by a later run that
+    names it as `prior_run_id`. Its lifecycle then moves to SUPERSEDED and
+    its certification stays REVOKED, so the history reads "revoked, then
+    replaced".
+  - *Shape.* Mirrors `CertifyRun`: `h.caller`, mandatory `If-Match`
+    (`parseIfMatch`), `h.authorize` on the run's legal entity, and one
+    store transaction holding the `FOR UPDATE` lock. It also requires
+    `Idempotency-Key` and uses `command_idempotency` (command
+    `REVOKE_CERTIFICATION`) the way `BeginExecution` does. A retry gets its
+    original result (`Idempotent-Replay: true`) instead of a 422 on the
+    now-revoked run, the key is claimed only after every check passes, and
+    reusing a key for another run is a 409.
+  - *Retained, additive only.* The run's certification transition row, and
+    every other history row, is unchanged. The test compares their
+    `row_to_json` text before and after. The new CERTIFICATION
+    CERTIFIED → REVOKED transition records the revoker and reason. The new
+    `control_certification_revocations` row records
+    `certification_transition_id`, `certified_by`/`certified_at`, the reason,
+    `evidence_refs`, `revoked_by`/`revoked_at` and the correlation id. It is
+    one row per run (UNIQUE), immutable (`reject_control_mutation`), FORCE
+    RLS, and CHECKed for a non-blank reason, at least one evidence reference,
+    and `revoked_by <> certified_by`.
+  - *Who.* `FINCTRL_REVOKE` is a separate grant from `FINCTRL_CERTIFY`
+    (§27 "restricted command"). `domain.CheckRevokerIndependence` refuses
+    whoever moved the run to CERTIFIED (403 `segregation_of_duties`), on the
+    pattern of reconciliation-engine-svc's `CheckCertifierIndependence`. The
+    run's preparers are not barred: revoking is the fail-safe direction.
+  - ***Deployment prerequisite:*** access-control-svc validates every
+    permission bundle against its `permission_definitions` registry
+    (its migration 000008), and new actions are registered there by
+    migration. Until `FINCTRL_REVOKE` is added there (and to the
+    `FINCTRL_FULL` bundle in `deployments/scripts/seed-demo-rbac.ps1`), it
+    cannot be granted, so every revocation is denied (fail-closed). Both
+    files belong outside this service and were not changed here.
+  - *Gate.* `EvaluateGate` reports a lifecycle CERTIFIED + certification
+    REVOKED latest run as `BLOCKING` with reason `CERTIFICATION_REVOKED`.
+    Before this it would have fallen through to `LATEST_RUN_CERTIFIED_PASS`.
+    The item also carries `certification_revoked_at` and
+    `revocation_reason`, both additive JSON fields.
