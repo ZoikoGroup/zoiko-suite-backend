@@ -56,6 +56,7 @@ type Store interface {
 	AmendAccountVersion(ctx context.Context, tenantID, accountCode string, expectedVersion int64, effectiveFrom time.Time, a *domain.Account, reason string, evidenceRefs []string, principalID string) (*domain.Account, error)
 	ActivateAccount(ctx context.Context, tenantID, accountCode string, expectedVersion int64, effectiveFrom time.Time, reason string, evidenceRefs []string, principalID string) (*domain.Account, error)
 	DeactivateAccount(ctx context.Context, tenantID, accountCode string, expectedVersion int64, effectiveFrom time.Time, reason string, evidenceRefs []string, principalID string) (*domain.Account, error)
+	ReparentAccount(ctx context.Context, tenantID, accountCode string, parentAccountID *string, expectedVersion int64, effectiveFrom time.Time, reason string, evidenceRefs []string, principalID string) (*domain.Account, error)
 
 	// ACC-02 Account Mapping — see migration 000008's doc comment.
 	SetAccountMapping(ctx context.Context, m *domain.AccountMapping) error
@@ -141,6 +142,7 @@ const (
 	actionAmendAccount      = "COA_ACCOUNT_AMEND"
 	actionActivateAccount   = "COA_ACCOUNT_ACTIVATE"
 	actionDeactivateAccount = "COA_ACCOUNT_DEACTIVATE"
+	actionReparentAccount   = "COA_ACCOUNT_REPARENT"
 	// actionOverridePostingRestriction gates the invariant #7 override —
 	// deliberately a distinct, more sensitive action than actionCreateJournal
 	// itself, so it can be granted to a narrower group.
@@ -298,6 +300,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{account_code}/amend", h.AmendAccountVersion)
 		r.Post("/{account_code}/activate", h.ActivateAccount)
 		r.Post("/{account_code}/deactivate", h.DeactivateAccount)
+		r.Post("/{account_code}/reparent", h.ReparentAccount)
 	})
 	r.Route("/v1/account-mappings", func(r chi.Router) {
 		r.Post("/", h.SetAccountMapping)
@@ -867,10 +870,59 @@ func (h *Handler) writeAccountVersionErr(w http.ResponseWriter, err error) bool 
 		writeError(w, http.StatusBadRequest, "parent_account_not_found", err.Error())
 	case errors.Is(err, domain.ErrAccountEffectiveDate):
 		writeError(w, http.StatusUnprocessableEntity, "effective_date_invalid", err.Error())
+	case errors.Is(err, domain.ErrAccountHierarchyCycle):
+		writeError(w, http.StatusUnprocessableEntity, "hierarchy_cycle", err.Error())
+	case errors.Is(err, domain.ErrAccountHierarchyBackdated):
+		writeError(w, http.StatusUnprocessableEntity, "hierarchy_backdated", err.Error())
 	default:
 		return false
 	}
 	return true
+}
+
+// ReparentAccount changes an account's position in the chart hierarchy. The
+// store enforces the cycle guard and refuses a backdated effective date; the
+// handler's own guard is the structural one — a request that never names the
+// parent key at all is refused rather than treated as "make it a root".
+func (h *Handler) ReparentAccount(w http.ResponseWriter, r *http.Request) {
+	accountCode := chi.URLParam(r, "account_code")
+	var req domain.ReparentAccountRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if !req.ParentAccountIDSet {
+		writeError(w, http.StatusBadRequest, "missing_field", "parent_account_id is required; send an explicit null to make the account a root")
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, coaPlatformScopeID, actionReparentAccount); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	effectiveFrom := time.Now().UTC()
+	if req.EffectiveFrom != nil {
+		effectiveFrom = req.EffectiveFrom.Time
+	}
+	updated, err := h.store.ReparentAccount(r.Context(), tenantID, accountCode,
+		req.ParentAccountID, req.ExpectedVersion, effectiveFrom, req.Reason, req.EvidenceRefs, principalID)
+	if err != nil {
+		if h.writeAccountVersionErr(w, err) {
+			return
+		}
+		h.log.Error("ReparentAccount: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+	writeJSON(w, http.StatusOK, updated)
 }
 
 func (h *Handler) GetAccount(w http.ResponseWriter, r *http.Request) {

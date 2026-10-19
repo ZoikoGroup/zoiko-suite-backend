@@ -144,6 +144,116 @@ func TestPgStore_ActivateDeactivate_RoundTripsThroughVersionHistory(t *testing.T
 	})
 }
 
+func TestPgStore_ReparentAccount_GuardsHierarchyAndLeavesPostedFactsAlone(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+
+	assets := newTestAccount(tenantID, "1000", "Assets")
+	cash := newTestAccount(tenantID, "1010", "Cash")
+	if err := s.CreateAccount(ctx, assets); err != nil {
+		t.Fatalf("CreateAccount assets: %v", err)
+	}
+	if err := s.CreateAccount(ctx, cash); err != nil {
+		t.Fatalf("CreateAccount cash: %v", err)
+	}
+
+	// Post a real ledger fact on the account that is about to move subtree.
+	header := &domain.JournalHeader{
+		JournalType:          domain.JournalTypeStandard,
+		TransactionDate:      domain.NewDate(2026, 10, 1),
+		PostingDate:          domain.NewDate(2026, 10, 1),
+		CurrencyCode:         "GBP",
+		JournalID:            uuid.New().String(),
+		TenantID:             tenantID,
+		LegalEntityID:        uuid.New().String(),
+		FiscalPeriod:         "2026-10",
+		Status:               domain.JournalStatusPending,
+		Description:          "reparent fixture",
+		CreatedByPrincipalID: "test-admin",
+		CorrelationID:        "reparent-fixture",
+	}
+	lines := []domain.JournalLine{
+		{AccountCode: "1010", DebitAmount: 100},
+		{AccountCode: "4000", CreditAmount: 100},
+	}
+	if _, _, err := s.CreateJournal(ctx, header, lines); err != nil {
+		t.Fatalf("CreateJournal: %v", err)
+	}
+	if err := s.TransitionJournal(ctx, tenantID, header.JournalID,
+		domain.JournalStatusPending, domain.JournalStatusValidated, "test-admin"); err != nil {
+		t.Fatalf("TransitionJournal PENDING->VALIDATED: %v", err)
+	}
+	if err := s.TransitionJournal(ctx, tenantID, header.JournalID,
+		domain.JournalStatusValidated, domain.JournalStatusFinalized, "test-admin"); err != nil {
+		t.Fatalf("TransitionJournal VALIDATED->FINALIZED: %v", err)
+	}
+
+	entriesBefore := countLedgerEntriesForAccount(t, pool, tenantID, "1010")
+
+	moved, err := s.ReparentAccount(ctx, tenantID, "1010", &assets.AccountID, 1, time.Time{}, "moving cash under assets", nil, "test-admin")
+	if err != nil {
+		t.Fatalf("ReparentAccount: %v", err)
+	}
+	if moved.ParentAccountID == nil || *moved.ParentAccountID != assets.AccountID {
+		t.Fatalf("expected cash under assets, got parent %v", moved.ParentAccountID)
+	}
+	if moved.Version != 2 {
+		t.Fatalf("expected version 2 after reparent, got %d", moved.Version)
+	}
+
+	entriesAfter := countLedgerEntriesForAccount(t, pool, tenantID, "1010")
+	if entriesBefore == 0 || entriesAfter != entriesBefore {
+		t.Fatalf("reparent must not move or remove posted entries: before=%d after=%d", entriesBefore, entriesAfter)
+	}
+
+	// A cycle must be refused: assets cannot become a child of its own child.
+	if _, err := s.ReparentAccount(ctx, tenantID, "1000", &cash.AccountID, 1, time.Time{}, "cycle attempt", nil, "test-admin"); !errors.Is(err, domain.ErrAccountHierarchyCycle) {
+		t.Fatalf("expected ErrAccountHierarchyCycle, got %v", err)
+	}
+	// Self-parenting is the minimal cycle.
+	if _, err := s.ReparentAccount(ctx, tenantID, "1000", &assets.AccountID, 1, time.Time{}, "self-parent attempt", nil, "test-admin"); !errors.Is(err, domain.ErrAccountHierarchyCycle) {
+		t.Fatalf("expected ErrAccountHierarchyCycle for self-parenting, got %v", err)
+	}
+	// A hierarchy change backdated before today is refused outright, because
+	// this chart has no entity/book with which to ask a close service whether
+	// the target period is open.
+	backdated := time.Now().UTC().AddDate(0, 0, -1)
+	if _, err := s.ReparentAccount(ctx, tenantID, "1010", nil, 2, backdated, "backdated", nil, "test-admin"); !errors.Is(err, domain.ErrAccountHierarchyBackdated) {
+		t.Fatalf("expected ErrAccountHierarchyBackdated, got %v", err)
+	}
+	// The refused backdated command must leave the hierarchy exactly as it was.
+	stillUnderAssets, err := s.GetAccountByCode(ctx, tenantID, "1010")
+	if err != nil {
+		t.Fatalf("GetAccountByCode after refused backdate: %v", err)
+	}
+	if stillUnderAssets.ParentAccountID == nil || *stillUnderAssets.ParentAccountID != assets.AccountID {
+		t.Fatalf("refused backdated change moved the account anyway: %+v", stillUnderAssets)
+	}
+}
+
+func countLedgerEntriesForAccount(t *testing.T, pool interface {
+	Begin(context.Context) (pgx.Tx, error)
+}, tenantID, accountCode string) int {
+	t.Helper()
+	count := 0
+	tx, err := pool.Begin(context.Background())
+	if err != nil {
+		t.Fatalf("begin verification tx: %v", err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	if _, err := tx.Exec(context.Background(), "SELECT set_config('app.tenant_id', $1, true)", tenantID); err != nil {
+		t.Fatalf("install verification tenant scope: %v", err)
+	}
+	if err := tx.QueryRow(context.Background(),
+		`SELECT COUNT(*) FROM ledger_entries WHERE tenant_id = $1 AND account_code = $2`,
+		tenantID, accountCode).Scan(&count); err != nil {
+		t.Fatalf("count ledger_entries: %v", err)
+	}
+	return count
+}
+
 func TestPgStore_AmendAccountVersion_StaleExpectedVersionIsRefused(t *testing.T) {
 	pool := openTestPool(t)
 	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))

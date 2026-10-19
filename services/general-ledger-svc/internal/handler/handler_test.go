@@ -343,6 +343,75 @@ func (s *stubStore) ListAccounts(_ context.Context, tenantID string) ([]domain.A
 	return out, nil
 }
 
+// ReparentAccount mirrors the real store's guards: cycles are refused by
+// walking the ancestors of the prospective parent, and a backdated effective
+// date is refused before any version is written.
+func (s *stubStore) ReparentAccount(_ context.Context, tenantID, accountCode string, parentAccountID *string, expectedVersion int64, effectiveFrom time.Time, reason string, evidence []string, principalID string) (*domain.Account, error) {
+	key := tenantID + "|" + accountCode
+	a, ok := s.accountsByCode[key]
+	if !ok {
+		return nil, domain.ErrAccountNotFound
+	}
+	if expectedVersion > 0 && a.Version != expectedVersion {
+		return nil, domain.ErrAccountVersionConflict
+	}
+	if parentAccountID != nil {
+		if *parentAccountID == a.AccountID {
+			return nil, domain.ErrAccountHierarchyCycle
+		}
+		ancestor, ok := s.accounts[*parentAccountID]
+		if !ok {
+			return nil, domain.ErrParentAccountNotFound
+		}
+		seen := map[string]bool{}
+		for ancestor != nil {
+			if ancestor.AccountID == a.AccountID {
+				return nil, domain.ErrAccountHierarchyCycle
+			}
+			if seen[ancestor.AccountID] {
+				break
+			}
+			seen[ancestor.AccountID] = true
+			if ancestor.ParentAccountID == nil {
+				break
+			}
+			ancestor = s.accounts[*ancestor.ParentAccountID]
+		}
+	}
+	sameParent := (a.ParentAccountID == nil && parentAccountID == nil) ||
+		(a.ParentAccountID != nil && parentAccountID != nil && *a.ParentAccountID == *parentAccountID)
+	if sameParent {
+		return a, nil
+	}
+	effective := effectiveFrom
+	if effective.IsZero() {
+		effective = time.Now().UTC()
+	}
+	if effective.Before(time.Now().UTC().Truncate(24 * time.Hour)) {
+		return nil, domain.ErrAccountHierarchyBackdated
+	}
+	versions := s.accountVersions[key]
+	if len(versions) > 0 {
+		prev := versions[len(versions)-1]
+		if effective.Before(prev.EffectiveFrom) {
+			return nil, domain.ErrAccountEffectiveDate
+		}
+		prev.EffectiveTo = &effective
+	}
+	a.ParentAccountID = parentAccountID
+	a.Version++
+	s.accountVersions[key] = append(versions, &domain.AccountVersion{
+		AccountVersionID: "v" + fmt.Sprint(a.Version) + "-" + key,
+		AccountID:        a.AccountID, TenantID: a.TenantID, AccountCode: a.AccountCode,
+		Version: a.Version, AccountName: a.AccountName, AccountType: a.AccountType,
+		ParentAccountID: a.ParentAccountID, IsControlAccount: a.IsControlAccount,
+		DirectPostingRestricted: a.DirectPostingRestricted, Status: a.Status,
+		EffectiveFrom: effective, ChangeKind: "REPARENTED", ChangeReason: reason,
+		EvidenceRefs: evidence, CreatedAt: time.Now().UTC(), CreatedByPrincipalID: principalID,
+	})
+	return a, nil
+}
+
 func (s *stubStore) ActivateAccount(_ context.Context, tenantID, accountCode string, expectedVersion int64, effectiveFrom time.Time, reason string, evidence []string, principalID string) (*domain.Account, error) {
 	return s.changeAccountStatus(tenantID, accountCode, "ACTIVE", "ACTIVATED", expectedVersion, effectiveFrom, reason, evidence, principalID)
 }
@@ -1491,6 +1560,97 @@ func TestActivateAccount_ExpectedVersionConflict_Returns409(t *testing.T) {
 	}, "principal-1")
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("expected 409 on stale expected_version, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestReparentAccount_MovesAccountAndAppendsVersion(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1000", AccountName: "Assets", AccountType: domain.AccountTypeAsset})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1010", AccountName: "Cash", AccountType: domain.AccountTypeAsset})
+
+	assetsID := s.accountsByCode["t1|1000"].AccountID
+	rec := doRequest(r, http.MethodPost, "/v1/chart-of-accounts/1010/reparent", map[string]any{
+		"parent_account_id": assetsID,
+		"reason":            "moving cash under assets",
+	}, "principal-1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var moved domain.Account
+	if err := json.Unmarshal(rec.Body.Bytes(), &moved); err != nil {
+		t.Fatalf("reparented account is not valid JSON: %v", err)
+	}
+	if moved.ParentAccountID == nil || *moved.ParentAccountID != assetsID {
+		t.Fatalf("expected parent %s, got %v", assetsID, moved.ParentAccountID)
+	}
+	if moved.Version != 2 {
+		t.Fatalf("expected version 2 after reparent, got %d", moved.Version)
+	}
+}
+
+func TestReparentAccount_CycleRefused_Returns422(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1000", AccountName: "Assets", AccountType: domain.AccountTypeAsset})
+	assetsID := s.accountsByCode["t1|1000"].AccountID
+	createAccount(t, r, domain.CreateAccountRequest{
+		AccountCode: "1010", AccountName: "Cash", AccountType: domain.AccountTypeAsset, ParentAccountID: &assetsID,
+	})
+
+	// Assets cannot become a child of its own child.
+	rec := doRequest(r, http.MethodPost, "/v1/chart-of-accounts/1000/reparent", map[string]any{
+		"parent_account_id": s.accountsByCode["t1|1010"].AccountID,
+	}, "principal-1")
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 for a hierarchy cycle, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if s.accountsByCode["t1|1000"].Version != 1 {
+		t.Fatal("a refused cycle must not append a version")
+	}
+}
+
+func TestReparentAccount_SelfParentRefused_Returns422(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1000", AccountName: "Assets", AccountType: domain.AccountTypeAsset})
+
+	rec := doRequest(r, http.MethodPost, "/v1/chart-of-accounts/1000/reparent", map[string]any{
+		"parent_account_id": s.accountsByCode["t1|1000"].AccountID,
+	}, "principal-1")
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 for self-parenting, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestReparentAccount_BackdatedEffectiveDate_Returns422(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1000", AccountName: "Assets", AccountType: domain.AccountTypeAsset})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1010", AccountName: "Cash", AccountType: domain.AccountTypeAsset})
+
+	rec := doRequest(r, http.MethodPost, "/v1/chart-of-accounts/1010/reparent", map[string]any{
+		"parent_account_id": s.accountsByCode["t1|1000"].AccountID,
+		"effective_from":    "2020-01-01T00:00:00Z",
+	}, "principal-1")
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 for a backdated hierarchy change, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if s.accountsByCode["t1|1010"].Version != 1 {
+		t.Fatal("a refused backdated change must not append a version")
+	}
+}
+
+func TestReparentAccount_MissingParentField_Returns400(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1010", AccountName: "Cash", AccountType: domain.AccountTypeAsset})
+
+	rec := doRequest(r, http.MethodPost, "/v1/chart-of-accounts/1010/reparent", map[string]any{
+		"reason": "no parent named",
+	}, "principal-1")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 when parent_account_id is absent, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
 

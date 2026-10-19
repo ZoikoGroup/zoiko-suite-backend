@@ -1550,6 +1550,133 @@ func (s *PgStore) ActivateAccount(ctx context.Context, tenantID, accountCode str
 	return s.changeAccountStatus(ctx, tenantID, accountCode, "ACTIVE", "ACTIVATED", expectedVersion, effectiveFrom, reason, evidenceRefs, principalID)
 }
 
+// ReparentAccount moves an account under a different parent in the chart
+// hierarchy. It appends a version and advances the head; it never touches
+// journal lines, ledger entries or balances, because those are keyed by
+// account_code and the account keeps its code. A reader that summarises by
+// parent must use the version history to know which parent applied when.
+//
+// Three guards are enforced under the row lock:
+//   - expected_version, when supplied, must match the head;
+//   - the new parent must exist in this tenant's chart and must not be the
+//     account itself or one of its descendants (a cycle would make the
+//     hierarchy un-walkable);
+//   - the effective date cannot precede the currently effective version and
+//     cannot be before today's UTC date. The spec blocks backdating a
+//     hierarchy change across a closed period; this chart has no legal entity
+//     or book on which to ask a close service which periods are open, so the
+//     conservative interpretation is to refuse backdating outright.
+func (s *PgStore) ReparentAccount(
+	ctx context.Context,
+	tenantID, accountCode string,
+	parentAccountID *string,
+	expectedVersion int64,
+	effectiveFrom time.Time,
+	reason string,
+	evidenceRefs []string,
+	principalID string,
+) (*domain.Account, error) {
+	var out *domain.Account
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		cur, err := accountForUpdate(ctx, tx, tenantID, accountCode)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrAccountNotFound
+		}
+		if err != nil {
+			return mapPgError(err)
+		}
+		if expectedVersion > 0 && cur.Version != expectedVersion {
+			return domain.ErrAccountVersionConflict
+		}
+
+		if parentAccountID != nil {
+			if *parentAccountID == cur.AccountID {
+				return domain.ErrAccountHierarchyCycle
+			}
+			var parentExists bool
+			if err := tx.QueryRow(ctx, `
+				SELECT EXISTS(SELECT 1 FROM chart_of_accounts WHERE tenant_id = $1 AND account_id = $2)
+			`, tenantID, *parentAccountID).Scan(&parentExists); err != nil {
+				return mapPgError(err)
+			}
+			if !parentExists {
+				return domain.ErrParentAccountNotFound
+			}
+
+			var createsCycle bool
+			if err := tx.QueryRow(ctx, `
+				WITH RECURSIVE ancestors AS (
+					SELECT account_id, parent_account_id FROM chart_of_accounts
+					WHERE tenant_id = $1 AND account_id = $2
+					UNION ALL
+					SELECT c.account_id, c.parent_account_id
+					FROM chart_of_accounts c
+					JOIN ancestors a ON c.account_id = a.parent_account_id
+					WHERE c.tenant_id = $1
+				)
+				SELECT EXISTS(SELECT 1 FROM ancestors WHERE account_id = $3)
+			`, tenantID, *parentAccountID, cur.AccountID).Scan(&createsCycle); err != nil {
+				return mapPgError(err)
+			}
+			if createsCycle {
+				return domain.ErrAccountHierarchyCycle
+			}
+		}
+
+		sameParent := (cur.ParentAccountID == nil && parentAccountID == nil) ||
+			(cur.ParentAccountID != nil && parentAccountID != nil && *cur.ParentAccountID == *parentAccountID)
+		if sameParent {
+			out = cur
+			return nil
+		}
+
+		effective := effectiveFrom
+		if effective.IsZero() {
+			effective = time.Now().UTC()
+		}
+		todayUTC := time.Now().UTC().Truncate(24 * time.Hour)
+		if effective.Before(todayUTC) {
+			return domain.ErrAccountHierarchyBackdated
+		}
+		currentEffectiveFrom, err := currentAccountVersionEffectiveFrom(ctx, tx, tenantID, cur.AccountID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			currentEffectiveFrom = cur.CreatedAt
+		} else if err != nil {
+			return mapPgError(err)
+		}
+		if effective.Before(currentEffectiveFrom) {
+			return domain.ErrAccountEffectiveDate
+		}
+
+		updated := *cur
+		updated.ParentAccountID = parentAccountID
+		updated.Version = cur.Version + 1
+		if err := closeCurrentAccountVersion(ctx, tx, tenantID, cur.AccountID, effective); err != nil {
+			return err
+		}
+		if err := insertAccountVersion(ctx, tx, accountVersionFromAccount(
+			&updated, updated.Version, effective, "REPARENTED", reason, principalID, evidenceRefs)); err != nil {
+			return err
+		}
+		tag, err := tx.Exec(ctx, `
+			UPDATE chart_of_accounts SET parent_account_id = $1, version = $2
+			WHERE tenant_id = $3 AND account_code = $4 AND version = $5
+		`, updated.ParentAccountID, updated.Version, tenantID, accountCode, cur.Version)
+		if err != nil {
+			return mapPgError(err)
+		}
+		if tag.RowsAffected() == 0 {
+			return domain.ErrAccountVersionConflict
+		}
+		out = &updated
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (s *PgStore) DeactivateAccount(ctx context.Context, tenantID, accountCode string, expectedVersion int64, effectiveFrom time.Time, reason string, evidenceRefs []string, principalID string) (*domain.Account, error) {
 	return s.changeAccountStatus(ctx, tenantID, accountCode, "INACTIVE", "DEACTIVATED", expectedVersion, effectiveFrom, reason, evidenceRefs, principalID)
 }

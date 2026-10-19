@@ -433,6 +433,47 @@ type DeactivateAccountRequest struct {
 	EvidenceRefs    []string       `json:"evidence_refs,omitempty"`
 }
 
+// ReparentAccountRequest changes an account's parent in the chart hierarchy.
+// The parent field is required but may be null: an explicit null makes the
+// account a root, while omitting the field entirely is refused so an
+// accidental empty body cannot silently detach an account. The alias
+// new_parent_account_id is accepted for callers reading the command name
+// literally.
+type ReparentAccountRequest struct {
+	ExpectedVersion    int64          `json:"expected_version,omitempty"`
+	ParentAccountID    *string        `json:"parent_account_id"`
+	ParentAccountIDSet bool           `json:"-"`
+	EffectiveFrom      *EffectiveDate `json:"effective_from,omitempty"`
+	Reason             string         `json:"reason,omitempty"`
+	EvidenceRefs       []string       `json:"evidence_refs,omitempty"`
+}
+
+// UnmarshalJSON accepts both parent_account_id and new_parent_account_id and
+// records whether either key was present.
+func (r *ReparentAccountRequest) UnmarshalJSON(b []byte) error {
+	type plain ReparentAccountRequest
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return err
+	}
+	var p plain
+	if err := json.Unmarshal(b, &p); err != nil {
+		return err
+	}
+	*r = ReparentAccountRequest(p)
+	if v, ok := raw["new_parent_account_id"]; ok {
+		var parent *string
+		if err := json.Unmarshal(v, &parent); err != nil {
+			return err
+		}
+		r.ParentAccountID = parent
+		r.ParentAccountIDSet = true
+		return nil
+	}
+	_, r.ParentAccountIDSet = raw["parent_account_id"]
+	return nil
+}
+
 // UnmarshalJSON records whether parent_account_id was present at all. A plain
 // *string cannot tell "clear the parent" from "leave the parent unchanged",
 // and silently treating one as the other would move an account in the chart
