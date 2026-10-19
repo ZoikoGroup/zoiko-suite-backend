@@ -205,3 +205,52 @@ jobs:
 
           go test -v -tags=integration -count=1 -timeout=600s ./internal/store/
 
+
+  # ─── INT certification (ZS-SVC-M-001) ────────────────────────────────────────
+  # The ledger is checked against the tree on every change (a cited test that is renamed or deleted fails here), and
+  # intcert then executes every cited test and publishes the certificate. It reports only while items remain open
+  # (PARTIAL, or a deviation nobody accepted); remove --report-only once the ledger has nothing open.
+  int-certification:
+    name: "INT certification — ledger · cited tests · certificate"
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: secretpassword
+          POSTGRES_DB: testdb
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d testdb"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: services/_certification/go.mod
+          cache: false
+
+      - name: Ledger is well formed and every cited test exists
+        working-directory: services/_certification
+        run: go vet ./... && go test -count=1 ./...
+
+      - name: Run every cited test and write the certificate
+        working-directory: services/_certification
+        env:
+          TEST_DATABASE_URL: "postgres://postgres:secretpassword@localhost:5432/testdb?sslmode=disable"
+        run: go run ./cmd/intcert -services .. -out certificate.json --report-only
+
+      - name: Upload certificate
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: int-certificate
+          path: services/_certification/certificate.json
+          if-no-files-found: ignore

@@ -912,3 +912,56 @@ groups:
             Delivery facts are committed but not published, so consumers do not
             see them. Events are safe in event_outbox. Check the relay and the
             broker. RUNBOOK section 4.4.
+
+  - name: integration
+    # ZS-SVC-M-001 (INT). Every alert reads a signal a service exports today. The INT-NP scenarios these guard are the
+    # quiet ones: a dropped security event, a stalled relay, a dead-lettered delivery. None of them raises an error on
+    # the request path, so they are alerted from the plane's own counters and gauges. Services that do not yet export
+    # such a signal (connectivity, data-ingestion, payment-status, tax-authority) are tracked in the certification
+    # ledger rather than given an alert on a metric that does not exist.
+    rules:
+      - alert: GatewaySIEMEventsDropped
+        expr: increase(gateway_auth_siem_events_dropped_total{service="gateway-auth-svc"}[15m]) > 0
+        labels:
+          severity: page
+        annotations:
+          summary: "gateway-auth-svc: security events were discarded because the SIEM queue was full (INT-NP-044)"
+          description: >-
+            The queue drops rather than blocks, so a SIEM outage never becomes a memory problem, but each dropped event
+            is audit evidence that was never forwarded. The count should stay at zero. Check the SIEM endpoint and the
+            queue size.
+
+      - alert: IdentityOutboxDeadLetter
+        expr: identity_context_outbox_dead_letter{service="identity-context-svc"} > 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "identity-context-svc: federation or identity events exhausted their delivery attempts"
+          description: >-
+            Dead-lettered events stay in event_outbox with last_error set. Federation lifecycle events (provisioning,
+            deprovisioning) are among them, so a consumer may not know a principal was disabled. Repair them through the
+            audited repair path; do not edit the table.
+
+      - alert: IdentityOutboxStalled
+        expr: >-
+          identity_context_outbox_pending{service="identity-context-svc"} > 0
+          and increase(identity_context_outbox_published_total{service="identity-context-svc"}[10m]) == 0
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: "identity-context-svc: events are waiting and none has published for 10 minutes"
+          description: >-
+            A stopped relay is invisible from the request path. Deprovisioning is only as fast as the events that
+            carry it, so this delays revocation downstream. Check the relay and the broker.
+
+      - alert: WebhookDeadLetterGrowing
+        expr: increase(notification_webhook_dlq_total{service="notification-svc"}[30m]) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: "notification-svc: webhook events are being routed to the dead-letter queue (INT-NP-045)"
+          description: >-
+            Dead-lettered events are replayed only with an operator, a different approver, an approval reference and a
+            reason, and only into a region this deployment serves. Review them rather than letting them age.

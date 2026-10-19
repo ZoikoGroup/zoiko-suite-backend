@@ -551,7 +551,7 @@ func (m *MemoryStore) ListProfiles(ctx context.Context, key string) ([]domain.Pr
 
 var profileRank = map[string]int{domain.ProfileDraft: 0, domain.ProfileCertified: 1, domain.ProfileDeprecated: 2, domain.ProfileUnsupported: 3}
 
-func (m *MemoryStore) SetProfileStatus(ctx context.Context, key string, version int, status string, at time.Time, ev domain.OutboxEvent) (*domain.Profile, error) {
+func (m *MemoryStore) SetProfileStatus(ctx context.Context, key string, version int, status string, at time.Time, sunset *time.Time, ev domain.OutboxEvent) (*domain.Profile, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if middleware.GetTenantID(ctx) != PlatformScopeID {
@@ -575,6 +575,10 @@ func (m *MemoryStore) SetProfileStatus(ctx context.Context, key string, version 
 	if (status == domain.ProfileDeprecated || status == domain.ProfileUnsupported) && p.DeprecatedAt == nil {
 		t := at
 		p.DeprecatedAt = &t
+	}
+	if status == domain.ProfileDeprecated && sunset != nil && p.SunsetAt == nil {
+		t := *sunset
+		p.SunsetAt = &t
 	}
 	if status == domain.ProfileUnsupported && p.SunsetAt == nil {
 		t := at

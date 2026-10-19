@@ -27,16 +27,32 @@ func TestParse(t *testing.T) {
 	}
 }
 
-// A DEVIATION is not accepted by being written down: an owner has to sign it.
+// A DEVIATION is not accepted by being written down: an owner has to sign it. Withdrawing the signature reopens it.
 func TestADeviationIsOpenUntilAnOwnerAccepts(t *testing.T) {
-	var found bool
-	for _, e := range Open() {
-		if e.Status == Deviation {
-			found = true
+	isOpen := func(id string) bool {
+		for _, e := range Open() {
+			if e.ID == id {
+				return true
+			}
+		}
+		return false
+	}
+	for id := range Acceptances {
+		if isOpen(id) {
+			t.Fatalf("%s is accepted and must not be open", id)
+		}
+		saved := Acceptances[id]
+		delete(Acceptances, id)
+		reopened := isOpen(id)
+		Acceptances[id] = saved
+		if !reopened {
+			t.Fatalf("%s must reopen when its acceptance is withdrawn", id)
 		}
 	}
-	if !found && len(Acceptances) == 0 {
-		t.Fatal("a recorded deviation with no acceptance must remain open")
+	for _, e := range All() {
+		if _, ok := Acceptances[e.ID]; ok && e.Status != Deviation && e.Status != OutOfScope {
+			t.Fatalf("%s has an acceptance but is %s: only a deviation or out-of-scope entry takes one", e.ID, e.Status)
+		}
 	}
 }
 

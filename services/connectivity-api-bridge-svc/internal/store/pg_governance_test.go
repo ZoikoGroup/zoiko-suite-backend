@@ -539,7 +539,7 @@ func TestPg_ProfilesAreReadableByAllAndWritableOnlyByThePlatform(t *testing.T) {
 	if err := e.st.PublishProfile(tctx("tenant-a"), prof, domain.OutboxEvent{Type: "external-profile.published"}); !errors.Is(err, domain.ErrPlatformScopeRequired) {
 		t.Fatalf("a tenant wrote platform reference data (row-level security must refuse): %v", err)
 	}
-	if _, err := e.st.SetProfileStatus(tctx("tenant-a"), "bank-x", 2, domain.ProfileUnsupported, time.Now(), domain.OutboxEvent{Type: "external-profile.unsupported"}); !errors.Is(err, domain.ErrProfileNotFound) {
+	if _, err := e.st.SetProfileStatus(tctx("tenant-a"), "bank-x", 2, domain.ProfileUnsupported, time.Now(), nil, domain.OutboxEvent{Type: "external-profile.unsupported"}); !errors.Is(err, domain.ErrProfileNotFound) {
 		t.Fatalf("a tenant changed a platform profile's status: %v", err)
 	}
 	if p, _ := e.st.GetProfile(tctx("tenant-a"), "bank-x", 2); p.Status != domain.ProfileCertified {
@@ -745,5 +745,20 @@ func TestPg_OutboxSchemaVerifies(t *testing.T) {
 		if _, ok := env[k]; !ok {
 			t.Errorf("event envelope lacks %q", k)
 		}
+	}
+}
+
+// A deprecation's sunset date is the end of its window and survives in Postgres; withdrawing later does not move it.
+func TestPg_ADeprecationRecordsItsSunset(t *testing.T) {
+	e := newPgEnv(t)
+	at := time.Now().UTC().Truncate(time.Second)
+	sunset := at.Add(45 * 24 * time.Hour)
+	p, err := e.st.SetProfileStatus(tctx(store.PlatformScopeID), "bank-x", 2, domain.ProfileDeprecated, at, &sunset, domain.OutboxEvent{Type: "external-profile.deprecated"})
+	if err != nil || p.SunsetAt == nil || !p.SunsetAt.Equal(sunset) {
+		t.Fatalf("the sunset is stored: %v %+v", err, p)
+	}
+	p, err = e.st.SetProfileStatus(tctx(store.PlatformScopeID), "bank-x", 2, domain.ProfileUnsupported, at.Add(time.Hour), nil, domain.OutboxEvent{Type: "external-profile.unsupported"})
+	if err != nil || p.SunsetAt == nil || !p.SunsetAt.Equal(sunset) {
+		t.Fatalf("withdrawing keeps the announced sunset: %v %+v", err, p)
 	}
 }

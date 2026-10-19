@@ -53,8 +53,9 @@ type Store interface {
 	GetProfile(ctx context.Context, providerKey string, version int) (*domain.Profile, error)
 	ListProfiles(ctx context.Context, providerKey string) ([]domain.Profile, error)
 	// SetProfileStatus moves a profile forward (CERTIFIED, DEPRECATED,
-	// UNSUPPORTED). It never moves one back.
-	SetProfileStatus(ctx context.Context, providerKey string, version int, status string, at time.Time, ev domain.OutboxEvent) (*domain.Profile, error)
+	// UNSUPPORTED). It never moves one back. A DEPRECATED profile records sunset (when given) as the end of its
+	// deprecation window.
+	SetProfileStatus(ctx context.Context, providerKey string, version int, status string, at time.Time, sunset *time.Time, ev domain.OutboxEvent) (*domain.Profile, error)
 }
 
 // PlatformScopeID is the platform-scope tenant id the rest of the estate uses

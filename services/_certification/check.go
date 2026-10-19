@@ -46,8 +46,13 @@ func All() []Entry { return append(append([]Entry{}, Controls...), Scenarios...)
 // Acceptance records a named owner's sign-off of a DEVIATION. An entry with a deviation and no acceptance is open.
 type Acceptance struct{ By, On, Reference string }
 
-// Acceptances is empty until an owner signs; the ledger does not pretend otherwise.
-var Acceptances = map[string]Acceptance{}
+// Acceptances holds the decisions taken so far. They were taken by the product owner in the Wave 9c session; a formal
+// sign-off by the named control owner can replace By/Reference without changing the ledger's shape.
+var Acceptances = map[string]Acceptance{
+	"INT-NP-042":   {By: "yash@zoikogroup.com", On: "2026-10-19", Reference: "Wave 9c session decision: SAML federation deferred, OIDC only"},
+	"INT-NP-047":   {By: "yash@zoikogroup.com", On: "2026-10-19", Reference: "Wave 9c session decision: hash-only provider evidence"},
+	"INT-CTRL-026": {By: "yash@zoikogroup.com", On: "2026-10-19", Reference: "Wave 9c session decision: bank payment files out of scope, API only"},
+}
 
 // Problems checks the ledger against the source tree under servicesDir. It proves the ledger is well formed and that
 // every cited test exists; it does not run them (see Run).
@@ -88,7 +93,7 @@ func Problems(servicesDir string) []string {
 			if len(e.Evidence) == 0 {
 				add("%s is COVERED with no evidence", e.ID)
 			}
-		case Partial, Deviation:
+		case Partial, Deviation, OutOfScope:
 			if strings.TrimSpace(e.Note) == "" {
 				add("%s is %s with no note saying what is missing", e.ID, e.Status)
 			}
@@ -133,7 +138,7 @@ func Open() []Entry {
 		if e.Status == Partial {
 			out = append(out, e)
 		}
-		if e.Status == Deviation {
+		if e.Status == Deviation || e.Status == OutOfScope {
 			if _, ok := Acceptances[e.ID]; !ok {
 				out = append(out, e)
 			}

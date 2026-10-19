@@ -18,6 +18,7 @@ import (
 	"zoiko.io/eventing/adapter/ext"
 	"zoiko.io/eventing/egress"
 	"zoiko.io/eventing/kafkaout"
+	"zoiko.io/eventing/integration"
 	"zoiko.io/eventing/outbox"
 	"zoiko.io/eventing/signature"
 	"zoiko.io/tax-authority-interface-svc/internal/authority"
@@ -93,6 +94,14 @@ func main() {
 	relay, err := outbox.NewRelay(dbpool, writer, outbox.DefaultConfig(), logger)
 	if err != nil {
 		logger.Fatal("failed to create outbox relay", zap.Error(err))
+	}
+	// INT-CTRL-005 / INT-NP-006: with SCHEMA_REGISTRY_URL set, an event that breaks its registered contract is
+	// quarantined before publish, and a registry that cannot answer holds events instead of publishing them unchecked.
+	if gate, gerr := integration.GateFromEnv("tax-authority-interface-svc"); gerr != nil {
+		logger.Fatal("schema gate", zap.Error(gerr))
+	} else if gate != nil {
+		relay.SetGate(gate)
+		logger.Info("producer schema gate enabled")
 	}
 	go relay.Run(bg)
 

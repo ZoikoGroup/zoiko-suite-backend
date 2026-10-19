@@ -323,26 +323,75 @@ func lowerAll(in []string) []string {
 	return out
 }
 
-// SetProfileStatus certifies, deprecates or withdraws a profile version. It
-// only moves forward. Connectors pinned to it find out the next time they are
-// used or checked; none is moved silently (INT-CTRL-025).
+// DeprecationWindow is the least notice a deprecated profile gives its connectors before it may be withdrawn.
+const DeprecationWindow = 30 * 24 * time.Hour
+
+// ProfileChange is one provider-profile status change.
+type ProfileChange struct {
+	Status string
+	// SunsetAt ends a deprecation window. It is only meaningful when deprecating; left empty it is now plus
+	// DeprecationWindow, and it may not be earlier than that.
+	SunsetAt *time.Time
+	// Emergency withdraws a profile before its window has run out (a provider-side security problem, say). It needs a
+	// reason, and the reason travels with the event.
+	Emergency bool
+	Reason    string
+}
+
+// SetProfileStatus certifies, deprecates or withdraws a profile version with no options: see ChangeProfileStatus.
 func (s *Service) SetProfileStatus(ctx context.Context, tenant string, a Actor, key string, version int, status string) (*domain.Profile, error) {
+	return s.ChangeProfileStatus(ctx, tenant, a, key, version, ProfileChange{Status: status})
+}
+
+// ChangeProfileStatus certifies, deprecates or withdraws a profile version. It only moves forward. Connectors pinned
+// to it find out the next time they are used or checked; none is moved silently (INT-CTRL-025).
+//
+// Provider change is managed, not sprung: deprecating a profile announces a sunset at least DeprecationWindow away,
+// and a profile cannot be withdrawn until that date has passed unless the withdrawal is declared an emergency, with a
+// reason (INT-CTRL-025, provider change management).
+func (s *Service) ChangeProfileStatus(ctx context.Context, tenant string, a Actor, key string, version int, c ProfileChange) (*domain.Profile, error) {
 	if tenant != store.PlatformScopeID {
 		return nil, ErrNotPlatformScope
 	}
-	status = strings.ToUpper(strings.TrimSpace(status))
+	key = strings.ToLower(key)
+	status := strings.ToUpper(strings.TrimSpace(c.Status))
+	now := s.now()
+	data := map[string]any{"provider_key": key, "version": version, "status": status}
 	var typ string
+	var sunset *time.Time
 	switch status {
 	case domain.ProfileCertified:
 		typ = "external-profile.certified"
 	case domain.ProfileDeprecated:
 		typ = "external-profile.deprecated"
+		earliest := now.Add(DeprecationWindow)
+		at := earliest
+		if c.SunsetAt != nil {
+			at = c.SunsetAt.UTC()
+		}
+		if at.Before(earliest) {
+			return nil, fmt.Errorf("%w: a deprecation gives connectors at least %d days' notice", ErrValidation, int(DeprecationWindow.Hours()/24))
+		}
+		sunset = &at
+		data["sunset_at"] = at.Format(time.RFC3339)
 	case domain.ProfileUnsupported:
 		typ = "external-profile.unsupported"
+		p, err := s.Store.GetProfile(ctx, key, version)
+		if err != nil {
+			return nil, err
+		}
+		if c.Emergency {
+			if strings.TrimSpace(c.Reason) == "" {
+				return nil, fmt.Errorf("%w: an emergency withdrawal needs a reason", ErrValidation)
+			}
+			data["emergency"] = true
+			data["reason"] = strings.TrimSpace(c.Reason)
+		} else if p.Status != domain.ProfileDeprecated || p.SunsetAt == nil || now.Before(*p.SunsetAt) {
+			return nil, fmt.Errorf("%w: a profile is withdrawn only after it has been deprecated and its sunset date has passed", ErrDeprecationWindow)
+		}
 	default:
 		return nil, fmt.Errorf("%w: status must be CERTIFIED, DEPRECATED or UNSUPPORTED", ErrValidation)
 	}
-	return s.Store.SetProfileStatus(ctx, strings.ToLower(key), version, status, s.now(),
-		domain.OutboxEvent{Type: typ, ActorID: a.PrincipalID, CorrelationID: a.CorrelationID,
-			Data: map[string]any{"provider_key": strings.ToLower(key), "version": version, "status": status}})
+	return s.Store.SetProfileStatus(ctx, key, version, status, now, sunset,
+		domain.OutboxEvent{Type: typ, ActorID: a.PrincipalID, CorrelationID: a.CorrelationID, Data: data})
 }

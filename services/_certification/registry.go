@@ -28,6 +28,8 @@ const (
 	Partial = "PARTIAL"
 	// Deviation: the design deliberately differs from the specification text, recorded for a named owner to accept.
 	Deviation = "DEVIATION"
+	// OutOfScope: the specification names it but the product deliberately does not offer it; closed only by an acceptance.
+	OutOfScope = "OUT_OF_SCOPE"
 )
 
 // Entry is one control or scenario.
@@ -63,8 +65,9 @@ var Controls = []Entry{
 		"SR:handler/handler_test.go::TestRegisterVersion_BreakingChange_Returns409WithViolations",
 		"SR:handler/handler_test.go::TestRegisterVersion_AuthorizationDenied_Returns403",
 		"EV:outbox/controls_test.go::TestGateQuarantinesIncompatiblePayloadBeforePublish_INT_NP_006",
-		"CBC:cmd/server/schemagate_test.go::TestTheConnectivityRelayIsGatedByTheRegisteredContract"},
-		"The gate is installed in connectivity-api-bridge-svc's relay (SCHEMA_REGISTRY_URL). The other outbox producers (payment, tax, notification, data-ingestion, identity, access-control) have not adopted it yet."},
+		"CBC:cmd/server/schemagate_test.go::TestTheConnectivityRelayIsGatedByTheRegisteredContract",
+		"EV:integration/gateenv_test.go::TestGateFromEnv"},
+		"The gate is installed (SCHEMA_REGISTRY_URL, off by default) in the connectivity, payment-status, payment-initiation and tax-authority relays, all of which use the shared relay. Notification, data-ingestion, identity-context and access-control run their own outbox with no quarantine state; they must move onto the shared relay (a migration per service) before they can be gated without blocking or dropping events."},
 	{"INT-CTRL-006", "Partition/order policy defined", Covered, []string{
 		"EV:envelope/envelope_test.go::TestPartitionKey_StablePerAggregateAndOpaque",
 		"EV:outbox/controls_test.go::TestVerifyPartitioning",
@@ -147,12 +150,16 @@ var Controls = []Entry{
 	{"INT-CTRL-025", "Provider/profile version pinning", Covered, []string{
 		"PI:providers/engine_test.go::TestPayloadIsPinnedAcrossRetries",
 		"PI:store/dispatch_store_test.go::TestDispatch_PrepareBindsTheProviderAndTheExactAmount",
-		"TX:store/einvoice_store_test.go::TestEInvoice_ValidationPinsTheProfileVersion"}, ""},
-	{"INT-CTRL-026", "File manifest/hash/acknowledgement", Partial, []string{
+		"TX:store/einvoice_store_test.go::TestEInvoice_ValidationPinsTheProfileVersion",
+		"CB:connector/service_test.go::TestProfileWithdrawnDegradesAndRefuses_INT_NP_022",
+		"CB:connector/service_test.go::TestDeprecationWindowIsEnforcedBeforeAProfileIsWithdrawn",
+		"CB:connector/service_test.go::TestAWithdrawalAfterTheWindowIsAllowed",
+		"CB:store/pg_governance_test.go::TestPg_ADeprecationRecordsItsSunset"}, ""},
+	{"INT-CTRL-026", "File manifest/hash/acknowledgement", OutOfScope, []string{
 		"DI:store/import_test.go::TestImport_HashMismatchQuarantinesAtSeal",
 		"DI:store/import_test.go::TestImport_ChunkLevelIntegrity",
 		"DI:imports/profile_test.go::TestSpecHashesMoveWithTheirMeaning"},
-		"Inbound import manifests are proven. No outbound bank payment-file manifest or acknowledgement exists in the code."},
+		"Inbound import manifests are proven. Outbound bank payment-file exchange is out of scope: banks are reached through their APIs only, so there is no file manifest or acknowledgement to certify."},
 	{"INT-CTRL-027", "Bank adapter finality separation", Covered, []string{
 		"PI:providers/engine_test.go::TestAcknowledgedIsSubmittedNeverSettled",
 		"PS:store/callback_store_test.go::TestCallback_TheStateGuardIsTheBackstop",
@@ -223,8 +230,9 @@ var Scenarios = []Entry{
 	{"INT-NP-006", "Producer sends event with incompatible schema", Partial, []string{
 		"EV:outbox/controls_test.go::TestGateQuarantinesIncompatiblePayloadBeforePublish_INT_NP_006",
 		"EV:integration/gate_test.go::TestGateRejectsNonConformingNamingTheContract",
-		"CBC:cmd/server/schemagate_test.go::TestTheConnectivityRelayIsGatedByTheRegisteredContract"},
-		"Quarantine-before-publish is proven at the service for connectivity only; other producers' relays are still ungated."},
+		"CBC:cmd/server/schemagate_test.go::TestTheConnectivityRelayIsGatedByTheRegisteredContract",
+		"EV:integration/gateenv_test.go::TestGateFromEnv"},
+		"Quarantine-before-publish is proven at the service for connectivity and by the shared relay's own test for the other three shared-relay producers; the four producers with a local outbox (notification, data-ingestion, identity-context, access-control) are still ungated."},
 	{"INT-NP-007", "Same event delivered twice", Covered, []string{
 		"EV:inbox/inbox_test.go::TestProcessOnceThenDuplicate_INT_NP_007",
 		"EV:inbox/inbox_test.go::TestConcurrentDuplicatesProduceOneEffect"}, ""},
@@ -366,10 +374,12 @@ var Scenarios = []Entry{
 		"GA:siem/client_test.go::TestSaturationDropsAreExposedAsAMetric",
 		"EV:outbox/load_test.go::TestLoad_BrokerOutageMidBacklogLosesNothingAndBlamesNoEvent"},
 		"The outbox never drops (proven under load) and SIEM drops are now a metric. The gateway's shed decisions are held in an in-process ring and streamed to the SIEM, not stored durably by the gateway itself."},
-	{"INT-NP-045", "Replay/dead-letter is moved to non-compliant region", Partial, []string{
+	{"INT-NP-045", "Replay/dead-letter is moved to non-compliant region", Covered, []string{
 		"EV:outbox/controls_test.go::TestRepairCannotCrossRegions_INT_NP_045",
+		"EV:inbox/inbox_test.go::TestRequeueCannotCrossRegions_INT_NP_045",
+		"NS:whout/replay_region_test.go::TestReplayRefusesADestinationRegionThisDeploymentDoesNotServe_INT_NP_045",
 		"NS:store/webhook_out_test.go::TestWebhook_EgressIsReCheckedOnEverySend"},
-		"Outbox repair is region-gated; inbox requeue, webhook replay and import quarantine release are not."},
+		"Outbox repair, inbox requeue and webhook replay are region-gated. Import retry never leaves the deployment: items are redelivered only to the owning-domain targets configured for it."},
 	{"INT-NP-046", "Provider rate-limit response triggers unbounded retry storm", Covered, []string{
 		"NS:store/webhook_out_test.go::TestWebhook_RateLimitedHonoursRetryAfter",
 		"PI:providers/engine_test.go::TestProviderRateLimitIsNotProcessed",

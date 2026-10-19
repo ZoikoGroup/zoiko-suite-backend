@@ -399,6 +399,9 @@ func (s *Service) Replay(ctx context.Context, a Actor, deliveryID string, ap Rep
 	if sub.Status != StatusActive {
 		return nil, fmt.Errorf("%w: the subscription is not active", ErrInvalidState)
 	}
+	if !s.regionAllowed(sub.DestinationRegion) { // INT-NP-045: a replay cannot send data to a region this deployment does not serve
+		return nil, fmt.Errorf("%w: the destination region is not allowed in this deployment", ErrEgressDenied)
+	}
 	ev, err := ReplayEvent(sub, d, a.PrincipalID, ap.Approver, a.CorrelationID, ap.Reason)
 	if err != nil {
 		return nil, err

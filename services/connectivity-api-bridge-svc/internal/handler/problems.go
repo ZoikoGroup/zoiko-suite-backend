@@ -78,7 +78,7 @@ func classify(err error) outcome {
 		return outcome{http.StatusForbidden, integration.CodeScopeDenied, err.Error(), 0}
 
 	// lifecycle state
-	case errors.Is(err, connector.ErrNotLive), errors.Is(err, domain.ErrInvalidTransition),
+	case errors.Is(err, connector.ErrNotLive), errors.Is(err, domain.ErrInvalidTransition), errors.Is(err, connector.ErrDeprecationWindow),
 		errors.Is(err, domain.ErrConnectorTerminal), errors.Is(err, domain.ErrNotApproved):
 		return outcome{http.StatusConflict, integration.CodeScopeDenied, err.Error(), 0}
 
