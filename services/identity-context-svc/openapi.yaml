@@ -1258,6 +1258,345 @@ paths:
         "501":
           description: Support context is not configured in this deployment
 
+  # ── INT-10 identity federation ─────────────────────────────────────────────────
+
+  /v1/authenticate/federated:
+    post:
+      summary: Exchange a tenant identity provider's ID token for a bearer token
+      operationId: authenticateFederated
+      security: []
+      description: |
+        The federated twin of /v1/authenticate, with the same exemption from the canonical input contract and the
+        same uniform answers: a person who signs in through their tenant's IdP receives the SAME first-party bearer
+        token, so /v1/context/resolve and the envelope are unchanged.
+
+        The proof is a signature by the tenant's approved key set over claims naming the tenant's approved issuer and
+        this client, with a request-bound nonce (required unless the connection says otherwise). The person is found
+        by tenant + issuer + stable subject: **an email address is never an identity binding**, so an address shared
+        across issuers, or reassigned, cannot reach someone else's principal. A token is exchanged once.
+
+        Every refusal — unknown issuer, wrong audience, expired or forged token, replay, unlinked subject, suspended
+        link or principal — is the same 401. The reason is in the evidence (only for a token whose signature
+        verified), the event stream and the SIEM stream. An IdP outage with no usable cached keys is 503, never 401.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tenant_id, id_token]
+              properties:
+                tenant_id: { type: string }
+                id_token: { type: string }
+                nonce: { type: string }
+              additionalProperties: false
+      responses:
+        "200":
+          description: Verified — bearer token issued (never cacheable)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthenticateResponse"
+        "400":
+          description: tenant_id or id_token absent
+        "401":
+          description: Refused. Indistinguishable by design.
+        "503":
+          description: The attempt could not be decided (keys unavailable, store unavailable).
+
+  /v1/federation/connections:
+    post:
+      summary: ConfigureFederation — propose a connection, or a new version of one
+      operationId: configureFederation
+      description: |
+        Authorized as FEDERATION_CONFIGURE. The result always awaits an independent approver: a connection cannot
+        authenticate anyone on its author's word alone. The configuration names the issuer (https), the audience,
+        the JWKS location (checked against the egress policy: https, public addresses, no internal names), the
+        asymmetric algorithms accepted (RS*/PS*/ES*, never symmetric), the tenant's approved MFA amr/acr values,
+        the outage behaviour (FAIL_CLOSED, or CACHED_KEYS with a bounded grace) and whether just-in-time
+        provisioning is allowed. Naming `connection_id` proposes a new version; the approved one keeps serving.
+      responses:
+        "202": { description: Proposed; awaiting approval }
+        "400": { description: Invalid configuration }
+        "403": { description: Not authorized }
+        "409": { description: A version is already awaiting approval, or the connection is revoked }
+    get:
+      summary: List the tenant's federation connections
+      operationId: listFederationConnections
+      responses:
+        "200": { description: The connections }
+
+  /v1/federation/connections/{connectionId}:
+    get:
+      summary: GetFederationConfig — a connection with every version
+      operationId: getFederationConfig
+      responses:
+        "200": { description: The connection }
+        "404": { description: Not found in this tenant }
+
+  /v1/federation/connections/{connectionId}/versions/{version}/approve:
+    post:
+      summary: ApproveFederation
+      operationId: approveFederation
+      description: |
+        FEDERATION_APPROVE. The approver supplies the fingerprint they were shown; a different one is 409. The author
+        cannot approve their own version (403, and refused by the data as well). Only one live connection per issuer
+        per tenant. Approval supersedes the version it replaces.
+      responses:
+        "200": { description: Approved }
+        "403": { description: Self-approval, or not authorized }
+        "409": { description: Fingerprint mismatch, already decided, or issuer already trusted by another connection }
+
+  /v1/federation/connections/{connectionId}/versions/{version}/reject:
+    post:
+      summary: Reject a proposed version (a reason is required)
+      operationId: rejectFederationVersion
+      responses:
+        "200": { description: Rejected }
+
+  /v1/federation/connections/{connectionId}/rotate-metadata:
+    post:
+      summary: RotateMetadataOrCertificateRef — propose a new key location
+      operationId: rotateMetadataOrCertificateRef
+      description: Where signing keys come from is a trust decision, so a new location is a new version awaiting approval. Rotation of the keys at an unchanged location needs no approval; that is a refresh.
+      responses:
+        "202": { description: Proposed }
+        "400": { description: Unchanged or forbidden destination }
+
+  /v1/federation/connections/{connectionId}/keys/refresh:
+    post:
+      summary: Fetch the signing keys now from the approved location
+      operationId: refreshFederationKeys
+      responses:
+        "200": { description: Refreshed; key_count returned }
+        "503": { description: The identity provider's keys could not be obtained }
+
+  /v1/federation/connections/{connectionId}/suspend:
+    post:
+      summary: SuspendFederation (a reason is required)
+      operationId: suspendFederation
+      responses:
+        "200": { description: Suspended; new logins are refused }
+
+  /v1/federation/connections/{connectionId}/resume:
+    post:
+      summary: Return a suspended connection to service
+      operationId: resumeFederation
+      responses:
+        "200": { description: Resumed }
+        "409": { description: Not suspended }
+
+  /v1/federation/connections/{connectionId}/revoke:
+    post:
+      summary: Revoke a connection (final; a reason is required)
+      operationId: revokeFederation
+      responses:
+        "200": { description: Revoked }
+
+  /v1/federation/connections/{connectionId}/logins:
+    get:
+      summary: Evidence of recent federated logins whose signature verified
+      operationId: listFederationLogins
+      responses:
+        "200": { description: Newest first }
+
+  /v1/federation/links:
+    post:
+      summary: Link an external subject to an existing principal (administrator's decision)
+      operationId: linkExternalSubject
+      responses:
+        "201": { description: Linked }
+        "409": { description: The external subject or the principal is already linked }
+        "422": { description: Unknown principal, or one of another tenant }
+    get:
+      summary: List external-subject links
+      operationId: listExternalSubjectLinks
+      responses:
+        "200": { description: The links }
+
+  /v1/federation/links/{linkId}:
+    get:
+      summary: GetExternalSubjectLink
+      operationId: getExternalSubjectLink
+      responses:
+        "200": { description: The link }
+        "404": { description: Not found in this tenant }
+
+  /v1/federation/connections/{connectionId}/mapping:
+    post:
+      summary: ConfigureProvisioningMapping — propose how directory attributes map to baseline roles
+      operationId: configureProvisioningMapping
+      description: |
+        FEDERATION_PROVISIONING_MANAGE. An entry says: a person whose `groups`, `roles`, `department`, `title` or
+        `userType` holds a value is entitled to a role in a legal entity. Every role named is checked with
+        access-control-svc, which owns the risk taxonomy: only a **baseline** (all STANDARD-risk) role may be mapped.
+        A privileged role is 400; access control unreachable is 503, never "eligible". The proposal awaits an
+        independent approver and the roles are checked again at approval.
+      responses:
+        "202": { description: Proposed }
+        "400": { description: Invalid, or names a role that is not baseline }
+        "503": { description: Eligibility could not be established }
+    get:
+      summary: The mapping versions of a connection and the one in force
+      operationId: getProvisioningMapping
+      responses:
+        "200": { description: The mapping }
+
+  /v1/federation/connections/{connectionId}/mapping/versions/{version}/approve:
+    post:
+      summary: Approve a proposed mapping (by fingerprint; not by its author)
+      operationId: approveProvisioningMapping
+      responses:
+        "200": { description: Approved }
+        "400": { description: A role has stopped being baseline since the proposal }
+        "403": { description: Self-approval }
+        "409": { description: Fingerprint mismatch or already decided }
+
+  /v1/federation/connections/{connectionId}/mapping/versions/{version}/reject:
+    post:
+      summary: Reject a proposed mapping
+      operationId: rejectProvisioningMapping
+      responses:
+        "200": { description: Rejected }
+
+  /v1/federation/connections/{connectionId}/scim-token:
+    post:
+      summary: Issue the connection's SCIM bearer token
+      operationId: issueScimToken
+      description: The token is returned once and replaces any earlier one. Only its SHA-256 is stored; it is never logged or placed in an event.
+      responses:
+        "201": { description: Issued (never cacheable) }
+
+  /v1/federation/connections/{connectionId}/scim-token/revoke:
+    post:
+      summary: Revoke the connection's SCIM token
+      operationId: revokeScimToken
+      responses:
+        "200": { description: Number revoked }
+
+  /v1/federation/connections/{connectionId}/provisioning/status:
+    get:
+      summary: GetProvisioningStatus
+      operationId: getProvisioningStatus
+      responses:
+        "200": { description: Links, events, assignments, open exceptions, deprovision backlog }
+
+  /v1/federation/connections/{connectionId}/provisioning/events:
+    get:
+      summary: The provisioning event ledger
+      operationId: listProvisioningEvents
+      responses:
+        "200": { description: Newest first }
+
+  /v1/federation/connections/{connectionId}/provisioning/exceptions:
+    get:
+      summary: ListSyncExceptions — what provisioning could not settle by itself
+      operationId: listSyncExceptions
+      responses:
+        "200": { description: Quarantined identities and mappings, refused or unreachable assignments, late deprovisioning }
+
+  /v1/federation/connections/{connectionId}/provisioning/exceptions/{exceptionId}/resolve:
+    post:
+      summary: Close an exception with a note
+      operationId: resolveSyncException
+      responses:
+        "200": { description: Resolved }
+        "409": { description: Not open }
+
+  /v1/federation/connections/{connectionId}/provisioning/deprovision-latency:
+    get:
+      summary: GetDeprovisionLatency — how long deprovisioning took to take effect, against its objective
+      operationId: getDeprovisionLatency
+      responses:
+        "200": { description: Per person, plus completed, pending, escalated, median and maximum }
+
+  /v1/federation/connections/{connectionId}/provisioning/reconcile:
+    post:
+      summary: ReconcileDirectorySync — a directory snapshot as a safety net for deprovisioning never sent
+      operationId: reconcileDirectorySync
+      description: |
+        People the platform holds active that a COMPLETE snapshot omits are deprovisioned through the normal pipeline.
+        An empty snapshot, or one that would deprovision more than a quarter of the population (minimum ten), is
+        refused unless `allow_mass` is set. An incomplete snapshot only reports.
+      responses:
+        "200": { description: Report }
+        "400": { description: Empty or malformed snapshot }
+        "409": { description: Over the safety limit, or already run }
+
+  # SCIM 2.0. Served outside the platform envelope and replay middleware: a directory has no platform identity. The
+  # connection's bearer token, with the tenant and connection in the path, authenticates every request before anything
+  # is read or written; a caller without a valid token learns nothing and writes nothing.
+
+  /scim/v2/{tenantId}/{connectionId}/ServiceProviderConfig:
+    get:
+      summary: SCIM ServiceProviderConfig
+      operationId: scimServiceProviderConfig
+      security: []
+      responses:
+        "200": { description: Patch and filter supported; bulk, sort, change-password and etag are not }
+
+  /scim/v2/{tenantId}/{connectionId}/Users:
+    post:
+      summary: Provision a user
+      operationId: scimCreateUser
+      security: []
+      description: |
+        `externalId` (the directory's stable identifier) is required: it, not the userName or email, is the identity.
+        An email already held by a different principal quarantines the record (409 uniqueness) rather than merging
+        it. The directory's `groups`, `roles`, `department`, `title` and `userType` are matched against the approved
+        mapping and can obtain only the baseline roles it names; they can never name a role. A retry with the same
+        `X-Event-Id` (or Idempotency-Key) is answered from the ledger; without one, an identical request within five
+        minutes is absorbed. A user is not created inactive.
+      responses:
+        "201": { description: Created }
+        "200": { description: The user already existed, or a replay }
+        "400": { description: Invalid }
+        "401": { description: Bad token }
+        "403": { description: The connection is suspended }
+        "409": { description: Quarantined, or the event id was reused with a different request }
+    get:
+      summary: Look a user up by filter
+      operationId: scimListUsers
+      security: []
+      description: Only `userName eq "…"` and `externalId eq "…"` are understood; anything else is 400 invalidFilter. Without a filter the result is empty.
+      responses:
+        "200": { description: ListResponse }
+
+  /scim/v2/{tenantId}/{connectionId}/Users/{id}:
+    get:
+      summary: Read a user
+      operationId: scimGetUser
+      security: []
+      responses:
+        "200": { description: The user }
+        "404": { description: No such user }
+    put:
+      summary: Replace a user (externalId cannot change)
+      operationId: scimReplaceUser
+      security: []
+      responses:
+        "200": { description: Replaced }
+    patch:
+      summary: Patch a user (add/replace/remove on active, userName, displayName, emails, groups, roles, title, userType, department)
+      operationId: scimPatchUser
+      security: []
+      description: |
+        Applied to a copy, so a patch that fails changes nothing. `active:false` deprovisions: the principal is disabled
+        in the same transaction, live sessions are ended, and assignment revocation is queued and retried (revocations
+        never back off longer than a minute) until done. Past the mapping's deprovision SLO it is raised as an
+        incident. Re-enabling waits until an earlier deprovisioning has finished.
+      responses:
+        "200": { description: Patched }
+        "400": { description: Unsupported path or operation }
+        "409": { description: Concurrent change, or the earlier deprovisioning is still in progress }
+    delete:
+      summary: Deprovision a user (the principal is disabled; nothing is erased)
+      operationId: scimDeleteUser
+      security: []
+      responses:
+        "204": { description: Deprovisioned }
+        "404": { description: No such user }
+
   /health:
     get:
       summary: Health check

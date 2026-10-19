@@ -110,6 +110,7 @@ func NewGov(h *Handler, store GovStore, admin AssignmentAdmin) *Gov {
 
 func RegisterGovernanceRoutes(r chi.Router, g *Gov) {
 	r.Get("/v1/permission-definitions", g.ListPermissionDefinitions)
+	r.Get("/v1/iam/federation/role-eligibility", g.RoleEligibility)
 
 	r.Route("/v1/role-templates", func(r chi.Router) {
 		r.Get("/", g.ListTemplates)
@@ -237,6 +238,8 @@ func classify(err error) (int, string) {
 		status, code = http.StatusForbidden, "security_approval_required"
 	case errors.Is(err, domain.ErrAuthzApprovalPending):
 		status, code = http.StatusConflict, "authz_approval_pending"
+	case errors.Is(err, domain.ErrFederationPrivileged):
+		status, code = http.StatusConflict, "federation_privileged_refused"
 	case errors.Is(err, domain.ErrAssignmentPending):
 		status, code = http.StatusConflict, "assignment_pending"
 	case errors.Is(err, domain.ErrGroupNotFound), errors.Is(err, domain.ErrGroupAssignmentNotFound),
@@ -685,6 +688,10 @@ func (g *Gov) RequestAssignment(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if req.Origin != "" && req.Origin != domain.OriginFederation {
+		g.refuse(w, r, op, "", req.LegalEntityID, "", req.CorrelationID, http.StatusBadRequest, "invalid_origin", string(domain.ErrInvalidOrigin), req)
+		return
+	}
 	principalID, tenantID, ok := g.begin(w, r, op, req.LegalEntityID, req.CorrelationID, req)
 	if !ok {
 		return
@@ -713,7 +720,7 @@ func (g *Gov) RequestAssignment(w http.ResponseWriter, r *http.Request) {
 	}
 	a, created, err := g.submitAssignment(r.Context(), tenantID, principalID, role, assignmentSpec{
 		target: req.TargetPrincipalID, legalEntityID: req.LegalEntityID, justification: req.Justification,
-		correlationID: req.CorrelationID, from: req.EffectiveFrom, to: req.EffectiveTo,
+		correlationID: req.CorrelationID, from: req.EffectiveFrom, to: req.EffectiveTo, origin: req.Origin,
 	})
 	if err != nil {
 		fail(err)
@@ -736,6 +743,7 @@ func (g *Gov) RequestAssignment(w http.ResponseWriter, r *http.Request) {
 // one member's share of a group assignment's fan-out.
 type assignmentSpec struct {
 	target, legalEntityID, justification, correlationID string
+	origin                                              string
 	groupAssignmentID                                   string
 	from                                                time.Time
 	to                                                  *time.Time
@@ -771,6 +779,10 @@ func (g *Gov) submitAssignment(ctx context.Context, tenantID, principalID string
 		return nil, false, err
 	}
 	needsApproval, why := approvalPolicy(principalID, s.target, risk, drivers)
+	// a federation mapping obtains baseline access or nothing: it never opens an approval path
+	if s.origin == domain.OriginFederation && (needsApproval || risk != domain.RiskStandard) {
+		return nil, false, domain.ErrFederationPrivileged
+	}
 
 	now := time.Now().UTC()
 	effective := s.from.UTC()

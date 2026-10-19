@@ -331,3 +331,13 @@ func TestLiveClaimInsideTheLeaseIsStillInFlight(t *testing.T) {
 	assert.Contains(t, w.Body.String(), "IDEMPOTENCY_IN_FLIGHT")
 	assert.Zero(t, h.calls)
 }
+
+func TestFederatedLoginIsNeverRecordedForReplay(t *testing.T) {
+	// like the password login it mints a bearer credential; recording its response would put a working
+	// credential into a table with a retention period
+	for _, p := range []string{"/v1/authenticate", "/v1/authenticate/federated", "/v1/context/resolve"} {
+		if !exemptPaths[p] {
+			t.Errorf("%s must be exempt from replay recording", p)
+		}
+	}
+}
