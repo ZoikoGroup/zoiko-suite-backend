@@ -78,7 +78,7 @@ consolidation entries in a group entity's statutory ledger.
   and a check of every environment for journals with `source_event_id` equal
   to a `consolidation_adjustment_id` (the 2026-09 window above).
 - **A2. Elimination ignores the run's scope.** `StartRun` fetches every
-  MATCHED intercompany entry in the **tenant** (no filter by the run's child
+  eliminable (MATCHED or CLOSED, B6) intercompany entry in the **tenant** (no filter by the run's child
   entities, group or fiscal period) and, for each, subtracts every line of
   both the source and target journals from the group balances. Entries between
   entities outside this group, or from other periods, are subtracted from
@@ -109,7 +109,7 @@ consolidation entries in a group entity's statutory ledger.
   (`CONSOLIDATION_INPUT_UNCERTIFIED`), store snapshot id and hash per input.
 - **A5. The elimination-bound check on proposals is tenant-wide.**
   `CreateEliminationProposal` compares an ELIMINATION proposal against the sum
-  of **all** MATCHED intercompany amounts in the tenant, regardless of group,
+  of **all** eliminable (MATCHED or CLOSED, B6) intercompany amounts in the tenant, regardless of group,
   period or entity pair, and sums per-line the larger of debit/credit (so a
   balanced two-line 100 proposal counts as 200). The negative path
   "Elimination exceeds matched reciprocal balance" is therefore not
@@ -211,3 +211,37 @@ consolidation entries in a group entity's statutory ledger.
   ACC services.
 - **B5. Control population.** `GET /v1/control-populations/balance-contributions`
   serves financial-control-svc (not part of the named ACC-12/13 surface).
+- **B6. CLOSED intercompany pairs are eliminable, and their amounts are
+  exact decimals** (changed in this pass). This is the consolidation-side
+  blocker that intercompany-accounting-svc's A9 flagged in its own **B8**.
+  - *The coupling.* intercompany-accounting-svc added `CLOSED`, a terminal
+    state reachable only from `MATCHED`, for "the period this pair belongs to
+    has been consolidated". `FetchMatchedIntercompanyEntries` kept
+    `match_status == "MATCHED"` only, so a closed pair dropped out. A
+    re-run for an already-consolidated period (a restatement, an audit
+    adjustment) would then have treated the pair as never matched and left
+    it uneliminated, overstating group balances. The function is now
+    `FetchEliminableIntercompanyEntries` and keeps MATCHED **or** CLOSED.
+    UNMATCHED, AWAITING_COUNTERPARTY, MISMATCH, DISPUTED and RESOLVED are
+    still never eliminated. RESOLVED stays excluded until this service reads
+    intercompany-accounting-svc's `resolution_outcome`. Both callers
+    (`StartRun` elimination and the `CreateEliminationProposal` bound) use
+    the new set. `TestFetchEliminableIntercompanyEntries_MatchedAndClosedOnly`
+    covers it against an HTTP double with one pair in every status.
+  - *Decimal amounts.* `clients.IntercompanyEntry.Amount` was `float64`
+    (ZS-DATA-001 D06). It is now `domain.Decimal`: exact decimal text using
+    financial-statements-svc's `ParseAmount`/`SumAmounts`/`CanonicalAmount`
+    pattern (`internal/domain/decimal.go`), the same type
+    intercompany-accounting-svc uses. It decodes a JSON number as well as a
+    quoted string, because intercompany-accounting-svc still writes `amount`
+    as a JSON number literal of the exact digits. A plain `string` field
+    would refuse that. A malformed amount fails the fetch rather than
+    counting as zero. The matched-balance bound in `CreateEliminationProposal`
+    is summed as `big.Rat`. The proposal's own line amounts are still
+    `float64` in this service's domain; each is read as its shortest decimal
+    form before the exact comparison. A5's per-line semantics are unchanged.
+  - *Still float64, not part of this change:* general-ledger journal lines
+    and trial balances (`FetchTrialBalance`, `FetchJournalLines`), the
+    consolidated balances and snapshots built from them, and
+    `ConsolidationAdjustmentLine` amounts. Elimination itself never read
+    `IntercompanyEntry.Amount`; it reverses the journals' real posted lines.

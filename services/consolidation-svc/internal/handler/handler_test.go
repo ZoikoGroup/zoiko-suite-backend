@@ -206,7 +206,7 @@ type stubClients struct {
 
 	intercompanyEntries []clients.IntercompanyEntry
 	intercompanyErr     error
-	principalIDReceived string // captures what FetchMatchedIntercompanyEntries was called with
+	principalIDReceived string // captures what FetchEliminableIntercompanyEntries was called with
 
 	// journalLines maps journal_id -> its real posted lines, for the
 	// elimination path (FetchJournalLines). journalLinesErr, keyed the
@@ -232,7 +232,7 @@ func (c *stubClients) FetchTrialBalance(_ context.Context, _, legalEntityID, _ s
 	return map[string]float64{"1000-Cash": 10000.0}, nil
 }
 
-func (c *stubClients) FetchMatchedIntercompanyEntries(_ context.Context, _, principalID string) ([]clients.IntercompanyEntry, error) {
+func (c *stubClients) FetchEliminableIntercompanyEntries(_ context.Context, _, principalID string) ([]clients.IntercompanyEntry, error) {
 	c.principalIDReceived = principalID
 	if c.intercompanyErr != nil {
 		return nil, c.intercompanyErr
@@ -392,7 +392,7 @@ func TestStartRun_EliminatesMatchedIntercompanyEntry(t *testing.T) {
 				TargetLegalEntityID: "le-uk",
 				SourceJournalID:     "journal-us-1",
 				TargetJournalID:     &tgtJournal,
-				Amount:              500.0,
+				Amount:              "500",
 				MatchStatus:         "MATCHED",
 			},
 		},
@@ -458,7 +458,7 @@ func TestStartRun_EliminationFetchFailure_RecordsVisibleException(t *testing.T) 
 				IntercompanyEntryID: "ic-1",
 				SourceJournalID:     "journal-us-1",
 				TargetJournalID:     &tgtJournal,
-				Amount:              500.0,
+				Amount:              "500",
 				MatchStatus:         "MATCHED",
 			},
 		},

@@ -66,7 +66,7 @@ type ConsolidationRunResponse struct {
 // "Draft → PendingApproval → Approved → Posted → Reversed/Superseded."
 //
 // Distinct from the automatic elimination StartRun already performs
-// (handler.go's eliminateMatchedEntry): that path only ever adjusts the
+// (handler.go's eliminateIntercompanyEntry): that path only ever adjusts the
 // in-memory snapshot math for one run, is never itself an approved,
 // posted, reversible accounting fact, and posts nothing to any ledger.
 // A ConsolidationAdjustment is a governed, human-approved journal that

@@ -8,8 +8,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"net/http"
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -54,7 +57,7 @@ type AuthZClient interface {
 
 type DomainClients interface {
 	FetchTrialBalance(ctx context.Context, tenantID, legalEntityID, fiscalPeriod string) (map[string]float64, error)
-	FetchMatchedIntercompanyEntries(ctx context.Context, tenantID, principalID string) ([]clients.IntercompanyEntry, error)
+	FetchEliminableIntercompanyEntries(ctx context.Context, tenantID, principalID string) ([]clients.IntercompanyEntry, error)
 	FetchJournalLines(ctx context.Context, tenantID, journalID string) ([]clients.JournalLine, error)
 
 	// ACC-12's own real "ACC-04/05 consolidation book" dependency.
@@ -202,8 +205,9 @@ func (h *Handler) StartRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Step 2: Eliminate matched intercompany balances so a transaction
-	// between two group entities isn't double-counted in the group total.
+	// Step 2: Eliminate matched intercompany balances (MATCHED pairs, and
+	// CLOSED ones, which were matched first) so a transaction between two
+	// group entities isn't double-counted in the group total.
 	// Elimination reverses the REAL posted net contribution (debit-credit)
 	// of both legs' actual journal lines — never a guessed elimination
 	// account, since no intercompany-to-account mapping exists anywhere on
@@ -214,14 +218,14 @@ func (h *Handler) StartRun(w http.ResponseWriter, r *http.Request) {
 	// and then discarded the result entirely; see
 	// master-register-findings-2026-08-27.md §3.29).
 	var eliminationExceptions []string
-	matchedEntries, err := h.clients.FetchMatchedIntercompanyEntries(r.Context(), tenantID, principalID)
+	eliminableEntries, err := h.clients.FetchEliminableIntercompanyEntries(r.Context(), tenantID, principalID)
 	if err != nil {
 		h.log.Error("failed to fetch intercompany entries for elimination", zap.Error(err))
 		eliminationExceptions = append(eliminationExceptions, "intercompany entries unavailable: "+err.Error())
 	} else {
-		for _, entry := range matchedEntries {
-			if elimErr := h.eliminateMatchedEntry(r.Context(), tenantID, entry, consolidatedBalances); elimErr != nil {
-				h.log.Error("failed to eliminate matched intercompany entry",
+		for _, entry := range eliminableEntries {
+			if elimErr := h.eliminateIntercompanyEntry(r.Context(), tenantID, entry, consolidatedBalances); elimErr != nil {
+				h.log.Error("failed to eliminate intercompany entry",
 					zap.String("intercompany_entry_id", entry.IntercompanyEntryID), zap.Error(elimErr))
 				eliminationExceptions = append(eliminationExceptions,
 					fmt.Sprintf("intercompany entry %s: %s", entry.IntercompanyEntryID, elimErr.Error()))
@@ -284,11 +288,20 @@ func (h *Handler) StartRun(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// eliminateMatchedEntry subtracts entry's real, posted net contribution
+// floatAmount is the exact decimal a float64 line amount was most likely
+// sent as: its shortest round-tripping decimal form ("100.1", not
+// 100.099999999999994315658...).
+func floatAmount(f float64) *big.Rat {
+	r, _ := new(big.Rat).SetString(strconv.FormatFloat(f, 'f', -1, 64))
+	return r
+}
+
+// eliminateIntercompanyEntry subtracts an eliminable (MATCHED or CLOSED)
+// entry's real, posted net contribution
 // (debit - credit, both legs) from balances in place — the same sign
 // convention FetchTrialBalance itself uses when building consolidatedBalances,
 // so eliminating a leg here exactly reverses what it originally added.
-func (h *Handler) eliminateMatchedEntry(ctx context.Context, tenantID string, entry clients.IntercompanyEntry, balances map[string]float64) error {
+func (h *Handler) eliminateIntercompanyEntry(ctx context.Context, tenantID string, entry clients.IntercompanyEntry, balances map[string]float64) error {
 	sourceLines, err := h.clients.FetchJournalLines(ctx, tenantID, entry.SourceJournalID)
 	if err != nil {
 		return fmt.Errorf("source journal %s: %w", entry.SourceJournalID, err)
@@ -299,10 +312,11 @@ func (h *Handler) eliminateMatchedEntry(ctx context.Context, tenantID string, en
 
 	if entry.TargetJournalID == nil || *entry.TargetJournalID == "" {
 		// MatchEntry requires a target_journal_id to reach MATCHED status
-		// (see intercompany-accounting-svc's MatchEntryRequest) — a MATCHED
-		// entry with no target journal would itself be a defect in that
-		// service, not something to silently tolerate here.
-		return fmt.Errorf("matched entry has no target_journal_id")
+		// (see intercompany-accounting-svc's MatchEntryRequest), and CLOSED
+		// is reachable only from MATCHED — an eliminable entry with no
+		// target journal would itself be a defect in that service, not
+		// something to silently tolerate here.
+		return fmt.Errorf("%s entry has no target_journal_id", strings.ToLower(entry.MatchStatus))
 	}
 	targetLines, err := h.clients.FetchJournalLines(ctx, tenantID, *entry.TargetJournalID)
 	if err != nil {
@@ -507,25 +521,34 @@ func (h *Handler) CreateEliminationProposal(w http.ResponseWriter, r *http.Reque
 	// adjustment (e.g. a consolidation-only reclass) has no matched
 	// intercompany balance to be bounded by.
 	if req.AdjustmentType == domain.AdjustmentTypeElimination {
-		matched, err := h.clients.FetchMatchedIntercompanyEntries(r.Context(), tenantID, principalID)
+		eliminable, err := h.clients.FetchEliminableIntercompanyEntries(r.Context(), tenantID, principalID)
 		if err != nil {
-			h.log.Error("failed to fetch matched intercompany entries for elimination proposal", zap.Error(err))
+			h.log.Error("failed to fetch eliminable intercompany entries for elimination proposal", zap.Error(err))
 			writeError(w, http.StatusServiceUnavailable, "intercompany_unavailable", err.Error())
 			return
 		}
-		var matchedTotal float64
-		for _, e := range matched {
-			matchedTotal += e.Amount
+		// Summed exactly (ZS-DATA-001 D06). A malformed amount already
+		// failed the fetch above; this is defence in depth, and refuses
+		// rather than treating the entry as zero.
+		amounts := make([]string, 0, len(eliminable))
+		for _, e := range eliminable {
+			amounts = append(amounts, string(e.Amount))
 		}
-		var proposedTotal float64
+		matchedTotal, err := domain.SumAmounts(amounts)
+		if err != nil {
+			h.log.Error("intercompany-accounting-svc returned an unreadable amount", zap.Error(err))
+			writeError(w, http.StatusServiceUnavailable, "intercompany_unavailable", err.Error())
+			return
+		}
+		// Adjustment lines are still float64 in this service's own domain
+		// (outside this change); each is read as its shortest decimal form
+		// so the comparison itself is exact. Per-line larger-of semantics
+		// are unchanged (SPEC_DEVIATIONS A5).
+		proposedTotal := new(big.Rat)
 		for _, l := range req.Lines {
-			if l.DebitAmount > l.CreditAmount {
-				proposedTotal += l.DebitAmount
-			} else {
-				proposedTotal += l.CreditAmount
-			}
+			proposedTotal.Add(proposedTotal, floatAmount(max(l.DebitAmount, l.CreditAmount)))
 		}
-		if proposedTotal > matchedTotal {
+		if proposedTotal.Cmp(matchedTotal) > 0 {
 			writeError(w, http.StatusUnprocessableEntity, "elimination_exceeds_matched_balance", domain.ErrEliminationExceedsMatchedBalance.Error())
 			return
 		}

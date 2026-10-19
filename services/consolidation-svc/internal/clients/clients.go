@@ -142,18 +142,34 @@ func (c *Clients) FetchJournalLines(ctx context.Context, tenantID, journalID str
 	return out, nil
 }
 
+// IntercompanyEntry is the part of intercompany-accounting-svc's pair this
+// service reads. Amount is exact decimal text (ZS-DATA-001 D06), never
+// float64; see domain.Decimal for why it is not a plain string.
 type IntercompanyEntry struct {
-	IntercompanyEntryID string  `json:"intercompany_entry_id"`
-	SourceLegalEntityID string  `json:"source_legal_entity_id"`
-	TargetLegalEntityID string  `json:"target_legal_entity_id"`
-	SourceJournalID     string  `json:"source_journal_id"`
-	TargetJournalID     *string `json:"target_journal_id,omitempty"`
-	Amount              float64 `json:"amount"`
-	MatchStatus         string  `json:"match_status"`
+	IntercompanyEntryID string         `json:"intercompany_entry_id"`
+	SourceLegalEntityID string         `json:"source_legal_entity_id"`
+	TargetLegalEntityID string         `json:"target_legal_entity_id"`
+	SourceJournalID     string         `json:"source_journal_id"`
+	TargetJournalID     *string        `json:"target_journal_id,omitempty"`
+	Amount              domain.Decimal `json:"amount"`
+	MatchStatus         string         `json:"match_status"`
 }
 
-// FetchMatchedIntercompanyEntries returns every MATCHED intercompany entry
-// for tenantID. principalID is forwarded as X-Principal-Id — intercompany-
+// Intercompany pair statuses this service eliminates. CLOSED is
+// intercompany-accounting-svc's terminal state for a pair that was MATCHED
+// (its migration 000006, SPEC_DEVIATIONS A9/B8): reachable only from
+// MATCHED, so its reciprocal balance is as settled as a MATCHED one's.
+// Leaving it out would make a closed pair look never-matched, and a re-run
+// for its period would leave it uneliminated.
+const (
+	intercompanyStatusMatched = "MATCHED"
+	intercompanyStatusClosed  = "CLOSED"
+)
+
+// FetchEliminableIntercompanyEntries returns every intercompany entry for
+// tenantID whose reciprocal balance is eliminable: MATCHED, or CLOSED
+// (matched, then closed). Unmatched, mismatched, disputed and resolved
+// entries are never returned. principalID is forwarded as X-Principal-Id — intercompany-
 // accounting-svc's ListEntries requires a verified principal
 // (internal/handler/handler.go's requirePrincipal), which this call
 // previously never sent, so every prior invocation of this method failed
@@ -162,7 +178,7 @@ type IntercompanyEntry struct {
 // principal already authorized for CONSOLIDATION_RUN_INITIATE on the
 // calling request — reusing it here, rather than inventing a separate
 // system identity that doesn't exist anywhere on this platform.
-func (c *Clients) FetchMatchedIntercompanyEntries(ctx context.Context, tenantID, principalID string) ([]IntercompanyEntry, error) {
+func (c *Clients) FetchEliminableIntercompanyEntries(ctx context.Context, tenantID, principalID string) ([]IntercompanyEntry, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.intercompanyURL+"/v1/intercompany/entries", nil)
 	if err != nil {
 		return nil, err
@@ -186,13 +202,13 @@ func (c *Clients) FetchMatchedIntercompanyEntries(ctx context.Context, tenantID,
 		return nil, err
 	}
 
-	var matched []IntercompanyEntry
+	var eliminable []IntercompanyEntry
 	for _, entry := range list {
-		if entry.MatchStatus == "MATCHED" {
-			matched = append(matched, entry)
+		if entry.MatchStatus == intercompanyStatusMatched || entry.MatchStatus == intercompanyStatusClosed {
+			eliminable = append(eliminable, entry)
 		}
 	}
-	return matched, nil
+	return eliminable, nil
 }
 
 // postingEventLine mirrors general-ledger-svc's own
@@ -205,12 +221,12 @@ type postingEventLine struct {
 }
 
 type postAccountingEventRequest struct {
-	LegalEntityID string              `json:"legal_entity_id"`
-	FiscalPeriod  string              `json:"fiscal_period"`
-	Description   string              `json:"description"`
-	SourceEventID string              `json:"source_event_id"`
-	CorrelationID string              `json:"correlation_id"`
-	Lines         []postingEventLine  `json:"lines"`
+	LegalEntityID string             `json:"legal_entity_id"`
+	FiscalPeriod  string             `json:"fiscal_period"`
+	Description   string             `json:"description"`
+	SourceEventID string             `json:"source_event_id"`
+	CorrelationID string             `json:"correlation_id"`
+	Lines         []postingEventLine `json:"lines"`
 }
 
 type postingExecutionResponse struct {
