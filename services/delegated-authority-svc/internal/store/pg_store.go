@@ -139,8 +139,8 @@ func (s *PgStore) CreateDelegation(ctx context.Context, d *domain.DelegationGran
 				idempotency_key, created_at, updated_at, revoked_by_principal_id, revoked_at, expired_at,
 				authority_limit_cents, authority_limit_currency, authority_limit_quantity,
 				version, reason, approved_by_principal_id, approved_at, approval_method
-			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
-			ON CONFLICT (tenant_id, correlation_id, created_by_principal_id, action_type, legal_entity_id, effective_from, effective_to, idempotency_key) DO NOTHING
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
+			ON CONFLICT (tenant_id, correlation_id, created_by_principal_id, action_type, legal_entity_id, effective_from, effective_to) DO NOTHING
 		`, d.DelegationID, tenantID, d.LegalEntityID, d.DelegatorPrincipalID, d.DelegatePrincipalID,
 			d.ActionType, d.EffectiveFrom, d.EffectiveTo, string(d.Status), d.CreatedByPrincipalID, d.CorrelationID,
 			d.IdempotencyKey, d.CreatedAt, d.UpdatedAt, d.RevokedByPrincipalID, d.RevokedAt, d.ExpiredAt,
@@ -177,7 +177,13 @@ func (s *PgStore) CreateDelegation(ctx context.Context, d *domain.DelegationGran
 		// in the unique key, so a reused correlation_id naming another
 		// delegate (or delegator, or ceiling) used to come back as a 200
 		// "replay" of a delegation the caller never asked for.
-		row := tx.QueryRow(ctx, "SELECT "+delegationColumns+" FROM delegation_grants WHERE tenant_id = $1 AND correlation_id = $2 AND created_by_principal_id = $3 AND action_type = $4 AND legal_entity_id = $5 AND effective_from = $6 AND effective_to = $7 AND idempotency_key = $8", tenantID, d.CorrelationID, d.CreatedByPrincipalID, d.ActionType, d.LegalEntityID, d.EffectiveFrom, d.EffectiveTo, d.IdempotencyKey)
+		//
+		// The Idempotency-Key header is deliberately NOT part of this key
+		// (000013). A repeated key is already answered by the HTTP replay
+		// store before the handler runs; folding it in here only made a retry
+		// that carried a new key under the same correlation_id a second grant.
+		// idempotency_key records the first request's key, as evidence.
+		row := tx.QueryRow(ctx, "SELECT "+delegationColumns+" FROM delegation_grants WHERE tenant_id = $1 AND correlation_id = $2 AND created_by_principal_id = $3 AND action_type = $4 AND legal_entity_id = $5 AND effective_from = $6 AND effective_to = $7", tenantID, d.CorrelationID, d.CreatedByPrincipalID, d.ActionType, d.LegalEntityID, d.EffectiveFrom, d.EffectiveTo)
 		var existing domain.DelegationGrant
 		if err := scanDelegation(row, &existing); err != nil {
 			return err
@@ -660,7 +666,6 @@ func sameGrant(a, b *domain.DelegationGrant) bool {
 	eqI := func(x, y *int64) bool { return (x == nil && y == nil) || (x != nil && y != nil && *x == *y) }
 	eqS := func(x, y *string) bool { return (x == nil && y == nil) || (x != nil && y != nil && *x == *y) }
 	return a.DelegatorPrincipalID == b.DelegatorPrincipalID && a.DelegatePrincipalID == b.DelegatePrincipalID &&
-		a.IdempotencyKey == b.IdempotencyKey &&
 		eqI(a.AuthorityLimitCents, b.AuthorityLimitCents) && eqS(a.AuthorityLimitCurrency, b.AuthorityLimitCurrency) &&
 		eqI(a.AuthorityLimitQuantity, b.AuthorityLimitQuantity)
 }
