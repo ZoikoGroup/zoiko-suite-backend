@@ -534,6 +534,8 @@ func main() {
 		WithSupport(supportService).
 		WithContextCache(cacheService)
 	identityctx.RegisterRoutes(r, h)
+	rootHandler, stopFederation := mountFederation(r, config.LoadFederation(), config.LoadProvisioning(), cfg, principalRepo, idpIssuer, authzClient, siemClient, sessionEvictor{cache: sessionCache}, log)
+	defer stopFederation()
 
 	// ── Retention / disposition sweep (GOV-09) ────────────────────────────
 	//
@@ -556,7 +558,7 @@ func main() {
 	// ── Server ────────────────────────────────────────────────────────────
 	srv := &http.Server{
 		Addr:         fmt.Sprintf(":%d", cfg.Port),
-		Handler:      r,
+		Handler:      rootHandler,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 15 * time.Second,
 		IdleTimeout:  60 * time.Second,

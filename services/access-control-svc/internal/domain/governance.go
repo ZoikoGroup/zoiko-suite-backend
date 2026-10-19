@@ -145,6 +145,10 @@ type CreateAssignmentRequest struct {
 	EffectiveFrom     time.Time  `json:"effective_from,omitempty"`
 	EffectiveTo       *time.Time `json:"effective_to,omitempty"`
 	Justification     string     `json:"justification"`
+	// Origin names the automation that raised the request. FEDERATION (an identity-provider mapping, INT-10) is
+	// held to baseline access: a request that would be HIGH or CRITICAL risk, or need any approver, is refused
+	// outright. Empty is an ordinary governed request.
+	Origin            string     `json:"origin,omitempty"`
 	CorrelationID     string     `json:"correlation_id"`
 }
 
@@ -335,6 +339,12 @@ var (
 	ErrEscalationReviewerReq = errorString("the default reviewer is the subject of at least one assignment; supply escalation_reviewer_principal_id")
 	ErrAssignmentPending     = errorString("a request for this principal, role and entity is already awaiting approval")
 
+	// ErrFederationPrivileged: an identity-provider mapping (INT-10) may only ever obtain baseline access. Anything
+	// that would need an approver, however the request arrived, is refused here rather than queued, so a directory
+	// attribute can never open a path to privileged access.
+	ErrFederationPrivileged = errorString("a federation-origin assignment may only be granted for a baseline (STANDARD-risk) role; privileged access is requested through governance approval")
+	ErrInvalidOrigin        = errorString("origin must be empty or FEDERATION")
+
 	ErrGroupNotFound           = errorString("group not found")
 	ErrGroupCodeExists         = errorString("a group with that group_code already exists in this tenant")
 	ErrGroupRetired            = errorString("the group is retired")
@@ -475,4 +485,16 @@ type ReviewTrigger struct {
 	ReviewerPrincipalID string // empty: the configured default reviewer
 	Reason              string
 	CorrelationID       string // derived from the event id: a redelivery replays
+}
+
+// OriginFederation is the CreateAssignmentRequest origin of an identity-provider mapping.
+const OriginFederation = "FEDERATION"
+
+// FederationRoleEligibility answers whether a role may be the target of a federation mapping.
+type FederationRoleEligibility struct {
+	RoleDefinitionID string   `json:"role_definition_id"`
+	Eligible         bool     `json:"eligible"`
+	RiskTier         string   `json:"risk_tier"`
+	Reason           string   `json:"reason"`
+	Drivers          []string `json:"drivers,omitempty"`
 }

@@ -521,8 +521,8 @@ services:
   # ── 1. identity-context-svc (Port: 8080) ─────────────────────────────────────
   identity-svc:
     build:
-      context: ../services/identity-context-svc
-      dockerfile: Dockerfile
+      context: ../services
+      dockerfile: identity-context-svc/Dockerfile
     container_name: identity-context-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -658,6 +658,25 @@ services:
       MTLS_MANAGEMENT_SERVICE_URL: "http://mtls-management-svc:8140"
       MTLS_BOOTSTRAP_TOKEN_PATH: "/bootstrap/token"
       MTLS_ALLOWED_CLIENTS: "gateway-auth-svc,authorization-svc"
+
+      # ── INT-10 identity federation (OFF unless enabled) ───────────────────────
+      #
+      # A tenant's own identity provider can authenticate its people only on a platform whose operator
+      # has turned this on. The IdP's key location is a tenant-supplied destination, so it passes the same
+      # SSRF guard as every other (https, public addresses, pinned dial, no redirects); the *_ALLOW_HTTP and
+      # *_PRIVATE_CIDRS settings below exist for local development and private-link IdPs only.
+      FEDERATION_ENABLED: "${FEDERATION_ENABLED:-false}"
+      FEDERATION_EGRESS_ALLOW_HTTP: "${FEDERATION_EGRESS_ALLOW_HTTP:-false}"
+      FEDERATION_EGRESS_PRIVATE_CIDRS: "${FEDERATION_EGRESS_PRIVATE_CIDRS:-}"
+      FEDERATION_JWKS_REFRESH_SECONDS: "900"
+      FEDERATION_JWKS_MIN_REFRESH_SECONDS: "30"
+      # SCIM provisioning, role requests to access-control-svc, and the deprovisioning worker. Requires
+      # FEDERATION_ENABLED. IDENTITY_SERVICE_PRINCIPAL_ID needs ROLE_MANAGE on the entities its mappings name:
+      # an operator grant, never something federation gives itself.
+      FEDERATION_PROVISIONING_ENABLED: "${FEDERATION_PROVISIONING_ENABLED:-false}"
+      FEDERATION_WORKER_INTERVAL_SECONDS: "15"
+      FEDERATION_RETRY_BASE_SECONDS: "10"
+      FEDERATION_REVOKE_RETRY_MAX_SECONDS: "60"
     volumes:
       - identity_jwt_keys:/keys:ro
       # Only this service's own bootstrap token (register M-01): the
