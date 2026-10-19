@@ -52,15 +52,21 @@ func New(pool *pgxpool.Pool, opts ...Option) *PgStore {
 // fields inside the payload instead.
 func (s *PgStore) enqueueEntryEvent(ctx context.Context, tx pgx.Tx, fact, legacyType, actorID, correlationID string, entry *domain.IntercompanyEntry) error {
 	data := map[string]any{
-		"intercompany_entry_id":  entry.IntercompanyEntryID,
-		"tenant_id":              entry.TenantID,
-		"source_legal_entity_id": entry.SourceLegalEntityID,
-		"target_legal_entity_id": entry.TargetLegalEntityID,
-		"source_journal_id":      entry.SourceJournalID,
-		"amount":                 entry.Amount,
-		"currency_code":          entry.CurrencyCode,
-		"match_status":           entry.MatchStatus,
-		"timestamp":              time.Now().UTC(),
+		"intercompany_entry_id":      entry.IntercompanyEntryID,
+		"tenant_id":                  entry.TenantID,
+		"source_legal_entity_id":     entry.SourceLegalEntityID,
+		"target_legal_entity_id":     entry.TargetLegalEntityID,
+		"source_journal_id":          entry.SourceJournalID,
+		"amount":                     entry.Amount,
+		"currency_code":              entry.CurrencyCode,
+		"counterparty_amount":        entry.CounterpartyAmount,
+		"counterparty_currency_code": entry.CounterpartyCurrencyCode,
+		"dimensions":                 entry.Dimensions,
+		"match_status":               entry.MatchStatus,
+		"timestamp":                  time.Now().UTC(),
+	}
+	if entry.FiscalPeriod != nil {
+		data["fiscal_period"] = *entry.FiscalPeriod
 	}
 	if entry.TargetJournalID != nil {
 		data["target_journal_id"] = *entry.TargetJournalID
@@ -123,36 +129,40 @@ func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(tx pgx.T
 // unique index added in 000002 and resolves to the ORIGINAL entry —
 // mutating *entry in place to reflect it — rather than creating a
 // duplicate. Returns created=false when the row already existed.
+//
+// Amounts are bound as decimal text cast to NUMERIC; they never pass
+// through float64 on the way in or (amount::text) on the way out.
 func (s *PgStore) CreateEntry(ctx context.Context, entry *domain.IntercompanyEntry, actorID, correlationID string) (created bool, err error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
 		return false, domain.ErrIdentityMissing
 	}
 
+	if entry.Dimensions == nil {
+		entry.Dimensions = domain.Dimensions{}
+	}
+
 	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, `
 			INSERT INTO intercompany_entries (
 				intercompany_entry_id, tenant_id, source_legal_entity_id, target_legal_entity_id,
-				source_journal_id, target_journal_id, amount, currency_code, match_status,
-				mismatch_reason, created_at, updated_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+				source_journal_id, target_journal_id, amount, currency_code,
+				counterparty_amount, counterparty_currency_code, fiscal_period, dimensions,
+				match_status, mismatch_reason, created_at, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7::numeric, $8, $9::numeric, $10, $11, $12, $13, $14, $15, $16)
 			ON CONFLICT (tenant_id, source_journal_id) DO NOTHING
 		`, entry.IntercompanyEntryID, tenantID, entry.SourceLegalEntityID, entry.TargetLegalEntityID,
-			entry.SourceJournalID, entry.TargetJournalID, entry.Amount, entry.CurrencyCode,
+			entry.SourceJournalID, entry.TargetJournalID, string(entry.Amount), entry.CurrencyCode,
+			string(entry.CounterpartyAmount), entry.CounterpartyCurrencyCode, entry.FiscalPeriod, entry.Dimensions,
 			entry.MatchStatus, entry.MismatchReason, entry.CreatedAt, entry.UpdatedAt)
 		if err != nil {
 			return err
 		}
 		if tag.RowsAffected() == 0 {
-			row := tx.QueryRow(ctx, `
-				SELECT intercompany_entry_id, source_legal_entity_id, target_legal_entity_id, target_journal_id,
-				       amount, currency_code, match_status, mismatch_reason, created_at, updated_at
+			if err := scanIntercompanyEntry(tx.QueryRow(ctx, `
+				SELECT `+intercompanyEntryColumns+`
 				FROM intercompany_entries WHERE tenant_id = $1 AND source_journal_id = $2
-			`, tenantID, entry.SourceJournalID)
-			if err := row.Scan(
-				&entry.IntercompanyEntryID, &entry.SourceLegalEntityID, &entry.TargetLegalEntityID, &entry.TargetJournalID,
-				&entry.Amount, &entry.CurrencyCode, &entry.MatchStatus, &entry.MismatchReason, &entry.CreatedAt, &entry.UpdatedAt,
-			); err != nil {
+			`, tenantID, entry.SourceJournalID), entry); err != nil {
 				return err
 			}
 			// Replay of a prior request for the same source_journal_id —
@@ -172,8 +182,9 @@ func (s *PgStore) CreateEntry(ctx context.Context, entry *domain.IntercompanyEnt
 
 const intercompanyEntryColumns = `
 	intercompany_entry_id, tenant_id, source_legal_entity_id, target_legal_entity_id,
-	source_journal_id, target_journal_id, amount, currency_code, match_status,
-	mismatch_reason, acknowledged_at, acknowledged_by_principal_id,
+	source_journal_id, target_journal_id, amount::text, currency_code,
+	counterparty_amount::text, counterparty_currency_code, fiscal_period, dimensions,
+	match_status, mismatch_reason, acknowledged_at, acknowledged_by_principal_id,
 	disputed_at, disputed_by_principal_id, dispute_reason,
 	resolved_at, resolved_by_principal_id, resolution_note,
 	created_at, updated_at`
@@ -181,8 +192,9 @@ const intercompanyEntryColumns = `
 func scanIntercompanyEntry(row pgx.Row, entry *domain.IntercompanyEntry) error {
 	return row.Scan(
 		&entry.IntercompanyEntryID, &entry.TenantID, &entry.SourceLegalEntityID, &entry.TargetLegalEntityID,
-		&entry.SourceJournalID, &entry.TargetJournalID, &entry.Amount, &entry.CurrencyCode, &entry.MatchStatus,
-		&entry.MismatchReason, &entry.AcknowledgedAt, &entry.AcknowledgedByPrincipalID,
+		&entry.SourceJournalID, &entry.TargetJournalID, &entry.Amount, &entry.CurrencyCode,
+		&entry.CounterpartyAmount, &entry.CounterpartyCurrencyCode, &entry.FiscalPeriod, &entry.Dimensions,
+		&entry.MatchStatus, &entry.MismatchReason, &entry.AcknowledgedAt, &entry.AcknowledgedByPrincipalID,
 		&entry.DisputedAt, &entry.DisputedByPrincipalID, &entry.DisputeReason,
 		&entry.ResolvedAt, &entry.ResolvedByPrincipalID, &entry.ResolutionNote,
 		&entry.CreatedAt, &entry.UpdatedAt,

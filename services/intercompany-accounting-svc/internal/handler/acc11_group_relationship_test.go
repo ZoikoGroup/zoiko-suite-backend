@@ -17,13 +17,13 @@ import (
 )
 
 // validMatchedJournal builds a FINALIZED journal detail, in targetLegalEntityID,
-// whose lines net to amount — exactly what MatchEntry's own Validations 1-3
-// require to pass, so a test using it exercises only Validation 4 (group
-// relationship).
-func validMatchedJournal(amount float64, targetLegalEntityID string) *ledger.JournalDetail {
+// in the counterparty currency, whose lines net to the counterparty amount —
+// exactly what MatchEntry's own Validations 1-4 require to pass, so a test
+// using it exercises only Validation 5 (group relationship).
+func validMatchedJournal(entry *domain.IntercompanyEntry, targetLegalEntityID string) *ledger.JournalDetail {
 	return &ledger.JournalDetail{
-		JournalID: "journal-1", LegalEntityID: targetLegalEntityID, Status: "FINALIZED",
-		Lines: []ledger.JournalLine{{AccountCode: "1300-Intercompany", DebitAmount: amount}},
+		JournalID: "journal-1", LegalEntityID: targetLegalEntityID, Status: "FINALIZED", CurrencyCode: entry.CounterpartyCurrencyCode,
+		Lines: []ledger.JournalLine{{AccountCode: "1300-Intercompany", DebitAmount: entry.CounterpartyAmount}},
 	}
 }
 
@@ -60,7 +60,7 @@ func TestMatchEntry_GroupRelationshipLost_RecordsMismatchNotOutage(t *testing.T)
 	s.entries["e1"].SourceLegalEntityID = "entity-a"
 	s.entries["e1"].TargetLegalEntityID = "entity-b"
 
-	leg := &stubLedger{journal: validMatchedJournal(s.entries["e1"].Amount, "entity-b")}
+	leg := &stubLedger{journal: validMatchedJournal(s.entries["e1"], "entity-b")}
 	// entity-a and entity-b have no shared parent and no direct link.
 	reg := &stubEntityRegistry{hierarchies: map[string][]entityregistry.Hierarchy{
 		"entity-a": {{ParentLegalEntityID: "parent-x", ChildLegalEntityID: "entity-a", EffectiveFrom: time.Now().UTC().AddDate(-1, 0, 0)}},
@@ -86,7 +86,7 @@ func TestMatchEntry_GroupRelationshipIntact_MatchSucceeds(t *testing.T) {
 	s.entries["e1"].SourceLegalEntityID = "entity-a"
 	s.entries["e1"].TargetLegalEntityID = "entity-b"
 
-	leg := &stubLedger{journal: validMatchedJournal(s.entries["e1"].Amount, "entity-b")}
+	leg := &stubLedger{journal: validMatchedJournal(s.entries["e1"], "entity-b")}
 	// Both entities share the same open immediate parent.
 	reg := &stubEntityRegistry{hierarchies: map[string][]entityregistry.Hierarchy{
 		"entity-a": {{ParentLegalEntityID: "parent-x", ChildLegalEntityID: "entity-a", EffectiveFrom: time.Now().UTC().AddDate(-1, 0, 0)}},
@@ -109,7 +109,7 @@ func TestMatchEntry_NoEntityRegistryConfigured_CheckSkipped(t *testing.T) {
 	s.entries["e1"].SourceLegalEntityID = "entity-a"
 	s.entries["e1"].TargetLegalEntityID = "entity-b"
 
-	leg := &stubLedger{journal: validMatchedJournal(s.entries["e1"].Amount, "entity-b")}
+	leg := &stubLedger{journal: validMatchedJournal(s.entries["e1"], "entity-b")}
 	// newRouter (not newRouterWithEntityRegistry) wires no entity registry
 	// at all — the check must be skipped, not fail closed.
 	r := newRouter(s, &stubAuthZ{}, leg)

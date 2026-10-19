@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
+	"math/big"
 	"net/http"
 	"slices"
 	"time"
@@ -126,13 +126,14 @@ func (h *Handler) CreateEntry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Amount <= 0 {
-		writeError(w, http.StatusBadRequest, "invalid_amount", string(domain.ErrInvalidAmount))
+	if req.SourceLegalEntityID == req.TargetLegalEntityID {
+		writeError(w, http.StatusBadRequest, "same_entity_forbidden", string(domain.ErrSameEntityForbidden))
 		return
 	}
 
-	if req.SourceLegalEntityID == req.TargetLegalEntityID {
-		writeError(w, http.StatusBadRequest, "same_entity_forbidden", string(domain.ErrSameEntityForbidden))
+	pair, code, err := resolvePairSides(req)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, code, err.Error())
 		return
 	}
 
@@ -151,16 +152,20 @@ func (h *Handler) CreateEntry(w http.ResponseWriter, r *http.Request) {
 
 	now := time.Now().UTC()
 	entry := &domain.IntercompanyEntry{
-		IntercompanyEntryID: uuid.NewString(),
-		TenantID:            tenantID,
-		SourceLegalEntityID: req.SourceLegalEntityID,
-		TargetLegalEntityID: req.TargetLegalEntityID,
-		SourceJournalID:     req.SourceJournalID,
-		Amount:              req.Amount,
-		CurrencyCode:        req.CurrencyCode,
-		MatchStatus:         "UNMATCHED",
-		CreatedAt:           now,
-		UpdatedAt:           now,
+		IntercompanyEntryID:      uuid.NewString(),
+		TenantID:                 tenantID,
+		SourceLegalEntityID:      req.SourceLegalEntityID,
+		TargetLegalEntityID:      req.TargetLegalEntityID,
+		SourceJournalID:          req.SourceJournalID,
+		Amount:                   pair.amount,
+		CurrencyCode:             req.CurrencyCode,
+		CounterpartyAmount:       pair.counterpartyAmount,
+		CounterpartyCurrencyCode: pair.counterpartyCurrency,
+		FiscalPeriod:             pair.fiscalPeriod,
+		Dimensions:               pair.dimensions,
+		MatchStatus:              "UNMATCHED",
+		CreatedAt:                now,
+		UpdatedAt:                now,
 	}
 
 	created, err := h.store.CreateEntry(r.Context(), entry, principalID, correlationID)
@@ -178,6 +183,72 @@ func (h *Handler) CreateEntry(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusCreated, entry)
+}
+
+// pairSides is a validated CreateIntercompanyPair request's two sides,
+// period and dimensions, ready to store.
+type pairSides struct {
+	amount               domain.Decimal
+	counterpartyAmount   domain.Decimal
+	counterpartyCurrency string
+	fiscalPeriod         *string
+	dimensions           domain.Dimensions
+}
+
+// resolvePairSides validates both sides of a new pair and fills in the
+// counterparty defaults (see domain.CreateEntryRequest). It returns the
+// error code to answer 400 with when the request is refused.
+func resolvePairSides(req domain.CreateEntryRequest) (pairSides, string, error) {
+	var p pairSides
+	amount, err := domain.ValidatePositiveAmount(req.Amount)
+	if err != nil {
+		return p, "invalid_amount", err
+	}
+	if !domain.ValidCurrencyCode(req.CurrencyCode) {
+		return p, "invalid_currency", domain.ErrInvalidCurrency
+	}
+	p.amount = domain.Decimal(domain.CanonicalAmount(amount))
+
+	p.counterpartyCurrency = req.CounterpartyCurrencyCode
+	if p.counterpartyCurrency == "" {
+		p.counterpartyCurrency = req.CurrencyCode
+	}
+	if !domain.ValidCurrencyCode(p.counterpartyCurrency) {
+		return p, "invalid_currency", domain.ErrInvalidCurrency
+	}
+
+	switch {
+	case req.CounterpartyAmount == nil && p.counterpartyCurrency != req.CurrencyCode:
+		return p, "counterparty_amount_required", domain.ErrCounterpartyAmountRequired
+	case req.CounterpartyAmount == nil:
+		p.counterpartyAmount = p.amount
+	default:
+		cp, err := domain.ValidatePositiveAmount(*req.CounterpartyAmount)
+		if err != nil {
+			return p, "invalid_amount", err
+		}
+		if p.counterpartyCurrency == req.CurrencyCode && cp.Cmp(amount) != 0 {
+			return p, "counterparty_amount_differs", domain.ErrCounterpartyAmountDiffers
+		}
+		p.counterpartyAmount = domain.Decimal(domain.CanonicalAmount(cp))
+	}
+
+	if req.FiscalPeriod != "" {
+		if !domain.ValidFiscalPeriod(req.FiscalPeriod) {
+			return p, "invalid_fiscal_period", domain.ErrInvalidFiscalPeriod
+		}
+		fp := req.FiscalPeriod
+		p.fiscalPeriod = &fp
+	}
+
+	if err := req.Dimensions.Validate(); err != nil {
+		return p, "invalid_dimensions", err
+	}
+	p.dimensions = req.Dimensions
+	if p.dimensions == nil {
+		p.dimensions = domain.Dimensions{}
+	}
+	return p, "", nil
 }
 
 // ── GET /v1/intercompany/entries ─────────────────────────────────────────────────
@@ -325,24 +396,46 @@ func (h *Handler) MatchEntry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validation 3: Sum of line amounts in target journal must match intercompany entry amount
-	var totalDebit, totalCredit float64
-	for _, l := range journal.Lines {
-		totalDebit += l.DebitAmount
-		totalCredit += l.CreditAmount
+	// Validation 3: the target journal must be in the currency the
+	// counterparty side is expected in. Checked before the amount: two
+	// amounts in different currencies are not comparable, so a currency
+	// difference is refused outright rather than the raw numbers being
+	// compared (a 5,000 GBP journal used to match a 5,000 USD pair).
+	if !domain.ValidCurrencyCode(journal.CurrencyCode) {
+		reason := fmt.Sprintf("currency_unverifiable: target journal currency is %q, expected %s", journal.CurrencyCode, entry.CounterpartyCurrencyCode)
+		h.recordMismatch(w, r, entry, req.TargetJournalID, reason, principalID, correlationID)
+		return
 	}
-	journalAmount := totalDebit
-	if totalCredit > totalDebit {
-		journalAmount = totalCredit
-	}
-
-	if math.Abs(journalAmount-entry.Amount) > 0.001 {
-		reason := fmt.Sprintf("amount_mismatch: intercompany amount %f != journal amount %f", entry.Amount, journalAmount)
+	if journal.CurrencyCode != entry.CounterpartyCurrencyCode {
+		reason := fmt.Sprintf("currency_mismatch: expected counterparty currency %s != journal currency %s", entry.CounterpartyCurrencyCode, journal.CurrencyCode)
 		h.recordMismatch(w, r, entry, req.TargetJournalID, reason, principalID, correlationID)
 		return
 	}
 
-	// Validation 4: source and target legal entities must still share an
+	// Validation 4: the target journal's amount must match the expected
+	// counterparty amount, compared exactly (big.Rat) within matchTolerance.
+	// The journal amount is still the larger of its total debits and total
+	// credits (SPEC_DEVIATIONS A5).
+	journalAmount, err := journalTotal(journal)
+	if err != nil {
+		h.log.Error("general-ledger-svc returned an unreadable journal amount", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "gl_query_failed", err.Error())
+		return
+	}
+	expected, err := entry.CounterpartyAmount.Rat()
+	if err != nil {
+		h.log.Error("stored counterparty amount is unreadable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	if diff := new(big.Rat).Sub(journalAmount, expected); diff.Abs(diff).Cmp(matchTolerance) > 0 {
+		reason := fmt.Sprintf("amount_mismatch: expected counterparty amount %s %s != journal amount %s %s",
+			domain.CanonicalAmount(expected), entry.CounterpartyCurrencyCode, domain.CanonicalAmount(journalAmount), journal.CurrencyCode)
+		h.recordMismatch(w, r, entry, req.TargetJournalID, reason, principalID, correlationID)
+		return
+	}
+
+	// Validation 5: source and target legal entities must still share an
 	// open group relationship — the spec's own negative path, "Entity
 	// loses group relationship mid-period." Skipped (not enforced) when no
 	// entity-registry client is configured — see WithEntityRegistry's own
@@ -376,6 +469,38 @@ func (h *Handler) MatchEntry(w http.ResponseWriter, r *http.Request) {
 		IntercompanyEntryID: id,
 		MatchStatus:         "MATCHED",
 	})
+}
+
+// matchTolerance is the fixed tolerance a journal amount may differ from the
+// expected counterparty amount by (unchanged from the float-era 0.001; there
+// is no matching-policy version yet, SPEC_DEVIATIONS A5).
+var matchTolerance = big.NewRat(1, 1000)
+
+// journalTotal is the larger of the journal's total debits and total
+// credits, summed exactly. An absent line amount counts as zero, as it did
+// when lines were decoded into float64.
+func journalTotal(j *ledger.JournalDetail) (*big.Rat, error) {
+	var debits, credits []string
+	for _, l := range j.Lines {
+		if l.DebitAmount != "" {
+			debits = append(debits, string(l.DebitAmount))
+		}
+		if l.CreditAmount != "" {
+			credits = append(credits, string(l.CreditAmount))
+		}
+	}
+	totalDebit, err := domain.SumAmounts(debits)
+	if err != nil {
+		return nil, err
+	}
+	totalCredit, err := domain.SumAmounts(credits)
+	if err != nil {
+		return nil, err
+	}
+	if totalCredit.Cmp(totalDebit) > 0 {
+		return totalCredit, nil
+	}
+	return totalDebit, nil
 }
 
 // recordMismatch persists a MISMATCH outcome and reports it. The response

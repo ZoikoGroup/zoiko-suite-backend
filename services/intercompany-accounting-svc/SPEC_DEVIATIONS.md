@@ -60,16 +60,15 @@ reconciliation-engine-svc holds for DATA-07.
   earlier attempts are lost. Scope: a `match_attempts` child table written in
   the `UpdateMatch` transaction, served by `GET …/entries/{id}/explanation`.
 - **A4. A pair carries one amount and one currency, and no period or
-  dimensions.** §14 lists required inputs "currencies; reciprocal refs;
-  dimensions" and §24 "entity A/B refs, currencies, reciprocal IDs". The
-  entry stores a single `amount`/`currency_code`, and the match never checks
-  currency at all: `ledger.JournalDetail` carries no currency, so a 5,000 GBP
-  counterparty journal matches a 5,000 USD entry. Cross-currency pairs cannot
-  be represented. There is also no fiscal period on the pair, which A1 and
-  consolidation's period scoping (consolidation-svc A4) both need. Amounts are
-  `float64` in Go (the column is `NUMERIC(18,4)`). Scope: migration adding
-  counterparty amount/currency, fiscal period and dimensions; currency
-  compared at match time; decimal amounts.
+  dimensions. — Closed (B7).** Migration 000005 adds
+  `counterparty_amount`/`counterparty_currency_code`, `fiscal_period` and
+  `dimensions` to the pair. MatchIntercompany now compares the target journal
+  to the counterparty side, currency first: a currency difference is recorded
+  as a MISMATCH (`currency_mismatch`), and the amounts are never compared.
+  General-ledger-svc already returned the journal's `currency_code`; this
+  service never decoded it. Amounts are exact decimals end to end (`big.Rat`,
+  never `float64`). A1 and A5 stay open; the period and currency columns they
+  need are now there.
 - **A5. The match compares the whole target journal, not its intercompany
   line.** `MatchEntry` takes the larger of the journal's total debits and
   total credits and compares that to the entry amount. A journal that also
@@ -151,3 +150,42 @@ reconciliation-engine-svc holds for DATA-07.
   the other ACC services.
 - **B6. Control population.** `GET /v1/control-populations/{population}`
   serves financial-control-svc (not part of ACC-11's named surface).
+- **B7. How the pair's two sides, period and dimensions are modelled (A4).**
+  - *Which side is which.* `amount`/`currency_code` keep their meaning as the
+    originating (source) side. `counterparty_amount`/`counterparty_currency_code`
+    are what the target entity is expected to book.
+    `counterparty_currency_code` defaults to `currency_code`. In a
+    same-currency pair `counterparty_amount` defaults to `amount` and may not
+    differ from it, because otherwise a caller could choose what the target
+    journal has to match. A cross-currency pair must state
+    `counterparty_amount`. There is no FX rate source, so none is derived.
+  - *Backfill.* Existing pairs get counterparty = source. That is exactly
+    what the old match compared the target journal against, so their
+    behaviour does not change.
+  - *Period.* `fiscal_period` uses general-ledger-svc's own rule for a period
+    reference (1-20 characters, no control characters; no fiscal calendar
+    service exists to check it against). It is optional: treasury-svc's
+    BNK-09 pairing does not send one yet. It is NULL on every pre-000005 pair.
+    The true period is the source journal's, and inventing one from
+    `created_at` would misplace pairs at period boundaries. A1 must decide
+    how to report NULL-period pairs; it must not drop them silently.
+  - *Dimensions.* A flat string map like general-ledger-svc's line
+    dimensions, bounded to 32 entries (names 1-64 characters, values up to
+    256, no control characters), and stored as a JSONB object (CHECK).
+  - *Currency at match time.* A journal whose currency is not a real ISO
+    4217 code is recorded as a MISMATCH (`currency_unverifiable`) and never
+    matched. That covers general-ledger-svc's `XXX`, which it backfilled onto
+    journals that predate its currency column. New pairs must carry
+    three-letter uppercase codes. Existing rows are not re-validated.
+  - *Decimals and the wire format.* Amounts are `domain.Decimal`, exact
+    decimal text built on the `ParseAmount`/`SumAmounts`/`CanonicalAmount`
+    pattern from financial-statements-svc. They are bound as text cast to
+    NUMERIC and read back as `::text`. A value NUMERIC(18,4) would round
+    (more than 4 decimal places) or overflow (more than 14 integer digits) is
+    refused with a 400 instead of being stored as a different number. On the
+    wire `amount` and `counterparty_amount` stay **JSON numbers**, written
+    from the exact digits. consolidation-svc's `clients.IntercompanyEntry`
+    and treasury-svc's create request both use number types, so a string
+    would break them. Quoted strings are accepted on input, so callers can
+    move to strings before the output changes.
+  - *Tolerance.* Still the fixed 0.001 (A5), now compared exactly.

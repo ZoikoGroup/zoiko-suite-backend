@@ -13,7 +13,8 @@ func seedEntry(s *stubStoreReal, id, matchStatus string) *domain.IntercompanyEnt
 	entry := &domain.IntercompanyEntry{
 		IntercompanyEntryID: id, TenantID: "tenant-abc",
 		SourceLegalEntityID: "entity-a", TargetLegalEntityID: "entity-b",
-		SourceJournalID: "journal-1", Amount: 100, CurrencyCode: "GBP",
+		SourceJournalID: "journal-1", Amount: "100", CurrencyCode: "GBP",
+		CounterpartyAmount: "100", CounterpartyCurrencyCode: "GBP", Dimensions: domain.Dimensions{},
 		MatchStatus: matchStatus, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
 	}
 	s.entries[id] = entry

@@ -307,9 +307,10 @@ func TestMatchEntry_AlreadyMatched(t *testing.T) {
 		TenantID:            "tenant-abc",
 		SourceLegalEntityID: "le-us",
 		TargetLegalEntityID: "le-uk",
-		Amount:              5000.0,
-		MatchStatus:         "MATCHED",
-		TargetJournalID:     &targetJ,
+		Amount:              "5000",
+		CurrencyCode:        "USD", CounterpartyAmount: "5000", CounterpartyCurrencyCode: "USD",
+		MatchStatus:     "MATCHED",
+		TargetJournalID: &targetJ,
 	}
 	r := newRouter(s, &stubAuthZ{}, &stubLedger{})
 	rr := doReq(r, http.MethodPost, "/v1/intercompany/entries/entry-matched/match", map[string]any{
@@ -327,15 +328,16 @@ func TestMatchEntry_TargetEntityMismatch(t *testing.T) {
 		TenantID:            "tenant-abc",
 		SourceLegalEntityID: "le-us",
 		TargetLegalEntityID: "le-uk",
-		Amount:              5000.0,
-		MatchStatus:         "UNMATCHED",
+		Amount:              "5000",
+		CurrencyCode:        "USD", CounterpartyAmount: "5000", CounterpartyCurrencyCode: "USD",
+		MatchStatus: "UNMATCHED",
 	}
 	leg := &stubLedger{
 		journal: &ledger.JournalDetail{
 			JournalID:     "target-j-wrong-entity",
 			LegalEntityID: "le-de", // Doesn't match target le-uk
-			Status:        "FINALIZED",
-			Lines:         []ledger.JournalLine{{AccountCode: "1000", DebitAmount: 5000.0}},
+			Status:        "FINALIZED", CurrencyCode: "USD",
+			Lines: []ledger.JournalLine{{AccountCode: "1000", DebitAmount: "5000"}},
 		},
 	}
 	r := newRouter(s, &stubAuthZ{}, leg)
@@ -361,15 +363,16 @@ func TestMatchEntry_HappyPath(t *testing.T) {
 		TenantID:            "tenant-abc",
 		SourceLegalEntityID: "le-us",
 		TargetLegalEntityID: "le-uk",
-		Amount:              5000.0,
-		MatchStatus:         "UNMATCHED",
+		Amount:              "5000",
+		CurrencyCode:        "USD", CounterpartyAmount: "5000", CounterpartyCurrencyCode: "USD",
+		MatchStatus: "UNMATCHED",
 	}
 	leg := &stubLedger{
 		journal: &ledger.JournalDetail{
 			JournalID:     "target-j-001",
 			LegalEntityID: "le-uk",
-			Status:        "FINALIZED",
-			Lines:         []ledger.JournalLine{{AccountCode: "1000", DebitAmount: 5000.0}},
+			Status:        "FINALIZED", CurrencyCode: "USD",
+			Lines: []ledger.JournalLine{{AccountCode: "1000", DebitAmount: "5000"}},
 		},
 	}
 	r := newRouter(s, &stubAuthZ{}, leg)
@@ -400,13 +403,14 @@ func TestMatchEntry_MismatchNotRecorded_Is503(t *testing.T) {
 		TenantID:            "tenant-abc",
 		SourceLegalEntityID: "le-us",
 		TargetLegalEntityID: "le-uk",
-		Amount:              5000.0,
-		MatchStatus:         domain.MatchStatusUnmatched,
+		Amount:              "5000",
+		CurrencyCode:        "USD", CounterpartyAmount: "5000", CounterpartyCurrencyCode: "USD",
+		MatchStatus: domain.MatchStatusUnmatched,
 	}
 	s.updateMatchErr = errors.New("connection reset")
 	leg := &stubLedger{journal: &ledger.JournalDetail{
-		JournalID: "target-j-001", LegalEntityID: "le-uk", Status: "FINALIZED",
-		Lines: []ledger.JournalLine{{AccountCode: "1000", DebitAmount: 4000.0}}, // amount mismatch
+		JournalID: "target-j-001", LegalEntityID: "le-uk", Status: "FINALIZED", CurrencyCode: "USD",
+		Lines: []ledger.JournalLine{{AccountCode: "1000", DebitAmount: "4000"}}, // amount mismatch
 	}}
 	r := newRouter(s, &stubAuthZ{}, leg)
 	rr := doReq(r, http.MethodPost, "/v1/intercompany/entries/entry-1/match", map[string]any{
@@ -431,13 +435,14 @@ func TestMatchEntry_StatusMovedSinceRead_Is422(t *testing.T) {
 		TenantID:            "tenant-abc",
 		SourceLegalEntityID: "le-us",
 		TargetLegalEntityID: "le-uk",
-		Amount:              5000.0,
-		MatchStatus:         domain.MatchStatusMismatch,
+		Amount:              "5000",
+		CurrencyCode:        "USD", CounterpartyAmount: "5000", CounterpartyCurrencyCode: "USD",
+		MatchStatus: domain.MatchStatusMismatch,
 	}
 	s.updateMatchErr = domain.ErrInvalidPairTransition
 	leg := &stubLedger{journal: &ledger.JournalDetail{
-		JournalID: "target-j-001", LegalEntityID: "le-uk", Status: "FINALIZED",
-		Lines: []ledger.JournalLine{{AccountCode: "1000", DebitAmount: 5000.0}},
+		JournalID: "target-j-001", LegalEntityID: "le-uk", Status: "FINALIZED", CurrencyCode: "USD",
+		Lines: []ledger.JournalLine{{AccountCode: "1000", DebitAmount: "5000"}},
 	}}
 	r := newRouter(s, &stubAuthZ{}, leg)
 	rr := doReq(r, http.MethodPost, "/v1/intercompany/entries/entry-1/match", map[string]any{

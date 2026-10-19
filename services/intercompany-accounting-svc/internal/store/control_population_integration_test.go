@@ -91,8 +91,9 @@ func cpInsert(t *testing.T, p *pgxpool.Pool, e cpEntry) string {
 	}
 	_, err := p.Exec(context.Background(), `
 		INSERT INTO intercompany_entries (intercompany_entry_id, tenant_id, source_legal_entity_id, target_legal_entity_id,
-			source_journal_id, target_journal_id, amount, currency_code, match_status, created_at, updated_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7::numeric,$8,$9,$10::timestamptz,$10::timestamptz)`,
+			source_journal_id, target_journal_id, amount, currency_code, counterparty_amount, counterparty_currency_code,
+			match_status, created_at, updated_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7::numeric,$8,$7::numeric,$8,$9,$10::timestamptz,$10::timestamptz)`,
 		e.id, e.tenant, e.src, e.tgt, e.srcJournal, tj, e.amount, e.cur, e.status, e.createdAt)
 	if err != nil {
 		t.Fatalf("seed: %v", err)

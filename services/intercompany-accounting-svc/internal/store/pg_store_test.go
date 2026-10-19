@@ -17,10 +17,30 @@ import (
 	"zoiko.io/intercompany-accounting-svc/internal/store"
 )
 
+// migrations is every up migration, in order. openTestPool applies all of
+// them; a migration test applies a prefix, seeds rows the way the older
+// schema allowed, then applies the rest.
+var migrations = []string{
+	"000001_initial_schema.up.sql",
+	"000002_add_idempotency_index.up.sql",
+	"000003_add_acc11_lifecycle.up.sql",
+	"000004_add_eventing_outbox.up.sql",
+	"000005_pair_counterparty_period_dimensions.up.sql",
+}
+
 // openTestPool connects to a real Postgres and reapplies the migrations
 // from a clean slate. Skips (not fails) if TEST_DATABASE_URL isn't set —
 // same convention as every other service in this platform.
 func openTestPool(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+	pool := openEmptyPool(t)
+	applyMigrations(t, pool, migrations...)
+	return pool
+}
+
+// openEmptyPool connects and drops every table the migrations create, so
+// the caller decides how far to migrate.
+func openEmptyPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
@@ -34,18 +54,16 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	}
 	t.Cleanup(pool.Close)
 
-	_, filename, _, _ := runtime.Caller(0)
-	base := filepath.Dir(filename)
-
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS intercompany_entries CASCADE;`)
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS eventing_outbox CASCADE;`)
+	return pool
+}
 
-	for _, migration := range []string{
-		"000001_initial_schema.up.sql",
-		"000002_add_idempotency_index.up.sql",
-		"000003_add_acc11_lifecycle.up.sql",
-		"000004_add_eventing_outbox.up.sql",
-	} {
+func applyMigrations(t *testing.T, pool *pgxpool.Pool, names ...string) {
+	t.Helper()
+	_, filename, _, _ := runtime.Caller(0)
+	base := filepath.Dir(filename)
+	for _, migration := range names {
 		sql, err := os.ReadFile(filepath.Join(base, "../../deployments/migrations", migration))
 		if err != nil {
 			t.Fatalf("failed to read migration %s: %v", migration, err)
@@ -56,12 +74,10 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 		// rejects. Strip it here so this test exercises the same SQL psql
 		// would actually apply.
 		sql = bytes.TrimPrefix(sql, []byte("\xef\xbb\xbf"))
-		if _, err := pool.Exec(ctx, string(sql)); err != nil {
+		if _, err := pool.Exec(context.Background(), string(sql)); err != nil {
 			t.Fatalf("failed to apply migration %s: %v", migration, err)
 		}
 	}
-
-	return pool
 }
 
 func newTestEntry(tenantID, sourceJournalID string) *domain.IntercompanyEntry {
@@ -72,11 +88,12 @@ func newTestEntry(tenantID, sourceJournalID string) *domain.IntercompanyEntry {
 		SourceLegalEntityID: "le-us",
 		TargetLegalEntityID: "le-uk",
 		SourceJournalID:     sourceJournalID,
-		Amount:              5000,
-		CurrencyCode:        "USD",
-		MatchStatus:         "UNMATCHED",
-		CreatedAt:           now,
-		UpdatedAt:           now,
+		Amount:              "5000",
+		CounterpartyAmount:  "5000", CounterpartyCurrencyCode: "USD",
+		CurrencyCode: "USD",
+		MatchStatus:  "UNMATCHED",
+		CreatedAt:    now,
+		UpdatedAt:    now,
 	}
 }
 

@@ -1,6 +1,11 @@
 package domain
 
-import "time"
+import (
+	"fmt"
+	"time"
+	"unicode"
+	"unicode/utf8"
+)
 
 // Match/pair status values — ACC-11's own state model (verbatim from spec):
 // "Open → AwaitingCounterparty → Matched / Mismatched / Disputed →
@@ -32,10 +37,30 @@ type IntercompanyEntry struct {
 	TargetLegalEntityID string    `json:"target_legal_entity_id"`
 	SourceJournalID     string    `json:"source_journal_id"`
 	TargetJournalID     *string   `json:"target_journal_id,omitempty"`
-	Amount              float64   `json:"amount"`
-	CurrencyCode        string    `json:"currency_code"`
-	MatchStatus         string    `json:"match_status"`
-	MismatchReason      *string   `json:"mismatch_reason,omitempty"`
+
+	// Amount/CurrencyCode are the originating (source) entity's side of the
+	// pair. CounterpartyAmount/CounterpartyCurrencyCode are what the
+	// counterparty (target) entity is expected to book, and what
+	// MatchIntercompany compares the target journal against. They differ
+	// only for a cross-currency pair; for a same-currency pair they are
+	// equal (CreateIntercompanyPair refuses anything else).
+	Amount                   Decimal `json:"amount"`
+	CurrencyCode             string  `json:"currency_code"`
+	CounterpartyAmount       Decimal `json:"counterparty_amount"`
+	CounterpartyCurrencyCode string  `json:"counterparty_currency_code"`
+
+	// FiscalPeriod is the period the pair belongs to, in general-ledger-svc's
+	// own fiscal_period form (e.g. "2026-07"). Nil for pairs created before
+	// migration 000005, and for callers that do not send one yet.
+	FiscalPeriod *string `json:"fiscal_period,omitempty"`
+
+	// Dimensions are the pair's reporting dimensions (cost centre, project,
+	// ...), the same flat string map general-ledger-svc carries on journal
+	// lines. Never nil once read from the store.
+	Dimensions Dimensions `json:"dimensions"`
+
+	MatchStatus    string  `json:"match_status"`
+	MismatchReason *string `json:"mismatch_reason,omitempty"`
 
 	// AcknowledgedAt/AcknowledgedByPrincipalID record ACC-11's own
 	// "AwaitingCounterparty" milestone — the counterparty side confirming
@@ -63,8 +88,62 @@ type CreateEntryRequest struct {
 	SourceLegalEntityID string  `json:"source_legal_entity_id"`
 	TargetLegalEntityID string  `json:"target_legal_entity_id"`
 	SourceJournalID     string  `json:"source_journal_id"`
-	Amount              float64 `json:"amount"`
+	Amount              Decimal `json:"amount"`
 	CurrencyCode        string  `json:"currency_code"`
+
+	// CounterpartyCurrencyCode defaults to CurrencyCode. CounterpartyAmount
+	// defaults to Amount only when the two currencies are the same: a
+	// cross-currency pair must state the counterparty amount, because this
+	// service has no FX rate to derive it from and will not guess one.
+	CounterpartyAmount       *Decimal   `json:"counterparty_amount,omitempty"`
+	CounterpartyCurrencyCode string     `json:"counterparty_currency_code,omitempty"`
+	FiscalPeriod             string     `json:"fiscal_period,omitempty"`
+	Dimensions               Dimensions `json:"dimensions,omitempty"`
+}
+
+// Dimensions is a flat map of reporting dimension name to value.
+type Dimensions map[string]string
+
+const (
+	maxDimensions        = 32
+	maxDimensionKeyLen   = 64
+	maxDimensionValueLen = 256
+	maxFiscalPeriodLen   = 20
+)
+
+// Validate bounds the map so a pair cannot carry an unbounded blob.
+func (d Dimensions) Validate() error {
+	if len(d) > maxDimensions {
+		return fmt.Errorf("%w: at most %d dimensions", ErrInvalidDimensions, maxDimensions)
+	}
+	for k, v := range d {
+		if !printable(k, maxDimensionKeyLen) || k == "" {
+			return fmt.Errorf("%w: dimension name %q must be 1-%d printable characters", ErrInvalidDimensions, k, maxDimensionKeyLen)
+		}
+		if !printable(v, maxDimensionValueLen) {
+			return fmt.Errorf("%w: value of %q must be at most %d printable characters", ErrInvalidDimensions, k, maxDimensionValueLen)
+		}
+	}
+	return nil
+}
+
+// ValidFiscalPeriod applies general-ledger-svc's own rule for a
+// fiscal_period reference: 1-20 characters, no control characters. There is
+// no fiscal calendar service to check it against.
+func ValidFiscalPeriod(p string) bool {
+	return p != "" && printable(p, maxFiscalPeriodLen)
+}
+
+func printable(s string, maxLen int) bool {
+	if !utf8.ValidString(s) || utf8.RuneCountInString(s) > maxLen {
+		return false
+	}
+	for _, r := range s {
+		if unicode.IsControl(r) {
+			return false
+		}
+	}
+	return true
 }
 
 type MatchEntryRequest struct {
@@ -102,6 +181,19 @@ func (e errorString) Error() string { return string(e) }
 var (
 	ErrEntryNotFound           = errorString("intercompany entry not found")
 	ErrInvalidAmount           = errorString("intercompany entry amount must be greater than zero")
+	ErrAmountPrecision         = errorString("intercompany amounts must have at most 4 decimal places and 14 integer digits")
+	ErrInvalidCurrency         = errorString("currency codes must be three-letter ISO 4217 codes naming a real currency")
+	ErrInvalidFiscalPeriod     = errorString("fiscal_period must be 1-20 characters with no control characters")
+	ErrInvalidDimensions       = errorString("invalid dimensions")
+
+	// ErrCounterpartyAmountRequired: a cross-currency pair must state the
+	// counterparty amount; this service has no FX rate to derive it from.
+	ErrCounterpartyAmountRequired = errorString("counterparty_amount is required when counterparty_currency_code differs from currency_code")
+
+	// ErrCounterpartyAmountDiffers: in a same-currency pair both sides book
+	// the same amount. Accepting a different expected counterparty amount
+	// would let a caller decide what the target journal has to match.
+	ErrCounterpartyAmountDiffers = errorString("counterparty_amount must equal amount when both sides are in the same currency")
 	ErrSameEntityForbidden     = errorString("source and target legal entities must be different")
 	ErrEntryAlreadyMatched     = errorString("intercompany entry is already matched")
 	ErrGLServiceUnavailable    = errorString("general-ledger-svc unavailable")
