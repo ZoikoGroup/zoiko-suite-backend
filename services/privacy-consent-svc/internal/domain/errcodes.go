@@ -40,8 +40,4 @@ const (
 	// ErrCodeImportProvenanceRequired: an offline/imported consent (§11.1)
 	// was submitted without the provenance the spec requires.
 	ErrCodeImportProvenanceRequired = "IMPORT_PROVENANCE_REQUIRED"
-	// ErrCodeIdempotencyNotRecorded: the operation COMMITTED but its
-	// idempotency record could not be saved, so a replay of the same key
-	// would not be recognised. The response says so rather than hiding it.
-	ErrCodeIdempotencyNotRecorded = "IDEMPOTENCY_RECORD_NOT_SAVED"
 )

@@ -1,4 +1,19 @@
 // Package handler exposes privacy-transfer-svc's REST API — PRV-05.
+//
+// Every route — read or write — runs the same pre-flight, in this order:
+//
+//  1. X-Principal-Id          -> 401
+//  2. X-Tenant-Id             -> 401 (middleware.TenantContext)
+//  3. mutating only: X-Correlation-ID -> 400
+//  4. mutating only: Idempotency-Key  -> 400
+//  5. authorization-svc grant on the caller's verified tenant -> 403 / 503 (fail closed)
+//  6. mutating only: idempotent replay lookup (lookup failure -> 503, never "proceed")
+//  7. body validation -> 400
+//  8. resolve the resource (RLS-scoped) -> 404
+//
+// Authorization is decided on the caller's own verified tenant BEFORE any
+// resource lookup, so an unauthorized caller cannot use 404-vs-403 to probe
+// which ids exist, and a replayed key can never bypass authorization.
 package handler
 
 import (
@@ -18,7 +33,6 @@ import (
 
 	authzpkg "zoiko.io/privacy-transfer-svc/internal/authz"
 	"zoiko.io/privacy-transfer-svc/internal/domain"
-	"zoiko.io/privacy-transfer-svc/internal/events"
 	svcmiddleware "zoiko.io/privacy-transfer-svc/internal/middleware"
 	"zoiko.io/privacy-transfer-svc/internal/purposeregistry"
 	"zoiko.io/privacy-transfer-svc/internal/store"
@@ -31,60 +45,50 @@ const (
 	// PrivacyTransferDecisionEvaluate gates EvaluateTransfer — distinct from
 	// the three *_MANAGE/_RECORD actions above, which govern creating or
 	// amending the underlying relationship/mechanism/assessment records.
-	// Evaluating a transfer authorization is a separate capability: it reads
-	// those records and writes a durable, event-published decision, but
-	// does not by itself let the caller manage any of them.
 	PrivacyTransferDecisionEvaluate = "PRIVACY_TRANSFER_DECISION_EVALUATE"
 )
 
-// §19 Event Contracts owned by PRV-05. The service emits exactly these
-// three event types and no others — the previous non-spec names
-// ("privacy.processor_relationship.created", "privacy.transfer_decision.
-// evaluated") had no consumers anywhere in this repository (verified:
-// privacy-decision-svc integrates over HTTP, not Kafka) and were not in
-// the §19 catalogue, so they are superseded rather than emitted
-// alongside, which would publish undeclared events.
+// Read routes reuse the existing action of the resource they expose; the
+// specification names no read permission and none was invented:
+//
+//	relationships, subprocessors -> PRIVACY_TRANSFER_RELATIONSHIP_MANAGE
+//	transfer mechanisms          -> PRIVACY_TRANSFER_MECHANISM_MANAGE
+//	assessments                  -> PRIVACY_TRANSFER_ASSESSMENT_RECORD
+//	decisions, trigger evaluation-> PRIVACY_TRANSFER_DECISION_EVALUATE
+//
+// Whether dedicated read actions are wanted is a needs-clarification item.
+
+// §19 event types are defined in the store (they are enqueued there, inside
+// the transaction of the change they announce).
 const (
-	// EventTransferAuthorizationChanged — §19: "authorization, route/
-	// provider scope, state, conditions, expiry" → GTRM, XIC, data export
-	// services. Emitted by EvaluateTransfer.
-	EventTransferAuthorizationChanged = "privacy.transfer.authorization_changed"
-	// EventProcessorChanged — §19: "processor/subprocessor, activity scope,
-	// state, effective time" → XIC, procurement/vendor systems, domain
-	// owners. Emitted on relationship create, relationship status change
-	// and subprocessor attach.
-	EventProcessorChanged = "privacy.processor.changed"
-	// EventAssessmentExpiring — §19: "assessment, scope, expiry/review
-	// trigger" → WFC/privacy owner; never silently renew. Emitted when an
-	// assessment whose review/expiry trigger is declared is recorded;
-	// this service has no scheduler, so the event announces the trigger
-	// date for consumer-side expiry tracking.
-	EventAssessmentExpiring = "privacy.assessment.expiring"
+	EventTransferAuthorizationChanged = store.EventTransferAuthorizationChanged
+	EventProcessorChanged             = store.EventProcessorChanged
+	EventAssessmentExpiring           = store.EventAssessmentExpiring
 )
 
-const platformScopeID = "00000000-0000-0000-0000-00000000f001"
+const maxBodyBytes = 1 << 20
 
 type AuthzChecker interface {
 	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
 }
 
-// PurposeChecker is the real dependency on PRV-01 — see the domain
-// package's doc comment on why purpose_activity_refs are validated, not
-// trusted as opaque strings.
+// PurposeChecker is the real dependency on PRV-01. The caller's verified
+// principal is forwarded so PRV-01 can authenticate and authorize the read.
 type PurposeChecker interface {
-	ResolveActivity(ctx context.Context, tenantID, activityID string) (*purposeregistry.ActivityVersion, error)
+	ResolveActivity(ctx context.Context, tenantID, principalID, activityID string) (*purposeregistry.ActivityVersion, error)
 }
 
+// Handler holds no event publisher: events are enqueued by the store, inside
+// the transaction of the state change (internal/events outbox).
 type Handler struct {
 	store    store.Store
-	pub      events.Publisher
 	authz    AuthzChecker
 	purposes PurposeChecker
 	log      *zap.Logger
 }
 
-func New(st store.Store, pub events.Publisher, az AuthzChecker, purposes PurposeChecker, log *zap.Logger) *Handler {
-	return &Handler{store: st, pub: pub, authz: az, purposes: purposes, log: log}
+func New(st store.Store, az AuthzChecker, purposes PurposeChecker, log *zap.Logger) *Handler {
+	return &Handler{store: st, authz: az, purposes: purposes, log: log}
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
@@ -117,6 +121,8 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	mountRoutes("/v1/privacy")
 }
 
+// ── responses ────────────────────────────────────────────────────────────────
+
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -127,132 +133,24 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
 }
 
-func readBody(r *http.Request) ([]byte, error) {
-	if r.Body == nil {
-		return nil, nil
+func (h *Handler) storeError(w http.ResponseWriter, op string, err error) {
+	switch {
+	case errors.Is(err, domain.ErrRelationshipNotFound):
+		writeError(w, http.StatusNotFound, "processor relationship not found")
+	case errors.Is(err, domain.ErrMechanismNotFound):
+		writeError(w, http.StatusNotFound, "transfer mechanism not found")
+	case errors.Is(err, domain.ErrDecisionNotFound):
+		writeError(w, http.StatusNotFound, "transfer decision not found")
+	default:
+		h.log.Error(op+": store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store unavailable")
 	}
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		return nil, err
-	}
-	r.Body = io.NopCloser(bytes.NewReader(body))
-	return body, nil
 }
 
-func hashBody(b []byte) string {
-	sum := sha256.Sum256(b)
-	return hex.EncodeToString(sum[:])
-}
-
-func (h *Handler) checkIdempotency(w http.ResponseWriter, r *http.Request, tenantID, principalID string, body []byte) (*domain.IdempotencyRecord, bool, string, string) {
-	key := r.Header.Get("Idempotency-Key")
-	if key == "" {
-		key = r.Header.Get("X-Idempotency-Key")
-	}
-	if key == "" {
-		return nil, false, "", ""
-	}
-	reqHash := hashBody(body)
-	existing, err := h.store.GetIdempotency(r.Context(), tenantID, key)
-	if err != nil {
-		h.log.Warn("idempotency lookup error", zap.Error(err))
-		return nil, false, key, reqHash
-	}
-	if existing != nil {
-		if existing.RequestHash != reqHash {
-			writeError(w, http.StatusConflict, domain.ErrIdempotencyConflict.Error())
-			return existing, true, key, reqHash
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Idempotency-Replay", "true")
-		w.WriteHeader(existing.ResponseCode)
-		_, _ = w.Write(existing.ResponseBody)
-		return existing, true, key, reqHash
-	}
-	return nil, false, key, reqHash
-}
-
-func (h *Handler) writeJSONWithIdempotency(ctx context.Context, w http.ResponseWriter, tenantID, principalID, endpoint, key, reqHash string, status int, v interface{}) {
-	body, err := json.Marshal(v)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to marshal response")
-		return
-	}
-	if key != "" {
-		_ = h.store.SaveIdempotency(ctx, domain.IdempotencyRecord{
-			IdempotencyKey: key,
-			TenantID:       tenantID,
-			Endpoint:       endpoint,
-			RequestHash:    reqHash,
-			ResponseCode:   status,
-			ResponseBody:   body,
-		})
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_, _ = w.Write(body)
-}
-
-func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
-	principalID := r.Header.Get("X-Principal-Id")
-	if principalID == "" {
-		writeError(w, http.StatusUnauthorized, "X-Principal-Id header is required")
-		return "", false
-	}
-	return principalID, true
-}
-
-// requireCorrelationID enforces §18.1's "actor/service context … and
-// correlation ID" carrier on every mutating API. A missing or blank
-// correlation id is rejected before any side effect (idempotency
-// persistence, store mutation or event publication). The value is echoed
-// into events exactly as before.
-func (h *Handler) requireCorrelationID(w http.ResponseWriter, r *http.Request) (string, bool) {
-	correlationID := strings.TrimSpace(r.Header.Get("X-Correlation-ID"))
-	if correlationID == "" {
-		writeError(w, http.StatusBadRequest, "X-Correlation-ID header is required")
-		return "", false
-	}
-	return correlationID, true
-}
-
-// requireIdempotencyKey enforces §18.1's mandatory idempotency key on every
-// mutating API (the README documents "All mutating APIs enforce the
-// Idempotency-Key header"). Missing or blank keys are rejected before any
-// side effect. The existing replay/conflict semantics are unchanged — this
-// only makes a key that was previously optional mandatory.
-func (h *Handler) requireIdempotencyKey(w http.ResponseWriter, r *http.Request) (string, bool) {
-	key := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
-	if key == "" {
-		key = strings.TrimSpace(r.Header.Get("X-Idempotency-Key"))
-	}
-	if key == "" {
-		writeError(w, http.StatusBadRequest, "Idempotency-Key header is required")
-		return "", false
-	}
-	return key, true
-}
-
-// requireMutationPreconditions enforces the mandatory service-boundary
-// headers (§18.1) on the six mutating routes, after authentication and
-// authorization and before any idempotency lookup/persistence, database
-// mutation, business-state change or event publication.
-func (h *Handler) requireMutationPreconditions(w http.ResponseWriter, r *http.Request) bool {
-	if _, ok := h.requireCorrelationID(w, r); !ok {
-		return false
-	}
-	if _, ok := h.requireIdempotencyKey(w, r); !ok {
-		return false
-	}
-	return true
-}
+// ── pre-flight ───────────────────────────────────────────────────────────────
 
 func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID, tenantID, actionType string) bool {
-	scope := platformScopeID
-	if tenantID != "" {
-		scope = tenantID
-	}
-	if err := h.authz.CheckAllowed(r.Context(), principalID, scope, actionType); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), principalID, tenantID, actionType); err != nil {
 		if errors.Is(err, authzpkg.ErrAuthorizationDenied) {
 			writeError(w, http.StatusForbidden, "not authorized to perform this action")
 			return false
@@ -264,19 +162,173 @@ func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID,
 	return true
 }
 
+type callContext struct {
+	Principal   string
+	Tenant      string
+	Correlation string
+	IdemKey     string
+}
+
+func (cc *callContext) meta() store.Meta {
+	return store.Meta{PrincipalID: cc.Principal, CorrelationID: cc.Correlation}
+}
+
+// begin runs pre-flight steps 1-5. On false the response has been written.
+func (h *Handler) begin(w http.ResponseWriter, r *http.Request, actionType string, mutating bool) (*callContext, bool) {
+	principal := strings.TrimSpace(r.Header.Get("X-Principal-Id"))
+	if principal == "" {
+		writeError(w, http.StatusUnauthorized, "X-Principal-Id header is required")
+		return nil, false
+	}
+	tenant := strings.TrimSpace(svcmiddleware.TenantFromContext(r.Context()))
+	if tenant == "" {
+		writeError(w, http.StatusUnauthorized, "X-Tenant-Id header is required")
+		return nil, false
+	}
+	cc := &callContext{Principal: principal, Tenant: tenant}
+	if mutating {
+		cc.Correlation = strings.TrimSpace(r.Header.Get("X-Correlation-ID"))
+		if cc.Correlation == "" {
+			writeError(w, http.StatusBadRequest, "X-Correlation-ID header is required")
+			return nil, false
+		}
+		cc.IdemKey = idempotencyKey(r)
+		if cc.IdemKey == "" {
+			writeError(w, http.StatusBadRequest, "Idempotency-Key header is required")
+			return nil, false
+		}
+	}
+	if !h.authorize(w, r, principal, tenant, actionType) {
+		return nil, false
+	}
+	return cc, true
+}
+
+// idempotencyKey is the ONE place the key is read, so the mandatory check and
+// the replay/claim logic cannot disagree. X-Idempotency-Key is an alias.
+func idempotencyKey(r *http.Request) string {
+	key := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	if key == "" {
+		key = strings.TrimSpace(r.Header.Get("X-Idempotency-Key"))
+	}
+	return key
+}
+
+func readBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
+	if r.Body == nil {
+		return []byte{}, true
+	}
+	b, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "failed to read request body")
+		return nil, false
+	}
+	r.Body = io.NopCloser(bytes.NewReader(b))
+	return b, true
+}
+
+// ── idempotency (§18.1) ──────────────────────────────────────────────────────
+
+// requestHash binds a key to method + path + body; the /v1 alias prefix is
+// stripped so the same logical request through either mount hashes alike.
+func requestHash(r *http.Request, body []byte) string {
+	h := sha256.New()
+	h.Write([]byte(r.Method))
+	h.Write([]byte{0})
+	h.Write([]byte(strings.TrimPrefix(r.URL.Path, "/v1")))
+	h.Write([]byte{0})
+	h.Write(body)
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// replayOrContinue answers an already-seen key (after authentication and
+// authorization). A lookup failure refuses the request (503). handled=true
+// means a response was written.
+func (h *Handler) replayOrContinue(w http.ResponseWriter, r *http.Request, cc *callContext, hash string) bool {
+	existing, err := h.store.GetIdempotency(r.Context(), cc.Tenant, cc.Principal, cc.IdemKey)
+	if err != nil {
+		h.log.Error("idempotency lookup failed — refusing the request", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "idempotency store unavailable")
+		return true
+	}
+	if existing != nil {
+		writeReplay(w, existing, hash)
+		return true
+	}
+	return false
+}
+
+func writeReplay(w http.ResponseWriter, existing *domain.IdempotencyRecord, hash string) {
+	if existing.RequestHash != hash {
+		writeError(w, http.StatusConflict, domain.ErrIdempotencyConflict.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Idempotency-Replay", "true")
+	w.WriteHeader(existing.ResponseCode)
+	_, _ = w.Write(existing.ResponseBody)
+}
+
+// claim builds the atomic idempotency claim of one mutation.
+func (h *Handler) claim(cc *callContext, endpoint, hash string, status int, render func(result any) any) *store.Idem {
+	return &store.Idem{
+		Key: cc.IdemKey, PrincipalID: cc.Principal, Endpoint: endpoint, RequestHash: hash,
+		Render: func(result any) (int, []byte, error) {
+			b, err := json.Marshal(render(result))
+			return status, b, err
+		},
+	}
+}
+
+// respond writes the first-execution response, or the replay when a concurrent
+// request won the claim.
+func respond(w http.ResponseWriter, existing *domain.IdempotencyRecord, hash string, status int, v any) {
+	if existing != nil {
+		writeReplay(w, existing, hash)
+		return
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to marshal response")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, _ = w.Write(b)
+}
+
+func identity(res any) any { return res }
+
+// tenantMismatch refuses a body tenant_id that disagrees with the verified one.
+func tenantMismatch(w http.ResponseWriter, bodyTenant string, cc *callContext) bool {
+	if bodyTenant != "" && bodyTenant != cc.Tenant {
+		writeError(w, http.StatusForbidden, "tenant_id does not match the verified X-Tenant-Id")
+		return true
+	}
+	return false
+}
+
 // ── processor relationships ──────────────────────────────────────────────────
 
 // CreateRelationship handles POST /privacy/processor-relationships.
-// purpose_activity_refs, if supplied, are validated against a REAL call
-// to privacy-purpose-registry-svc — each must resolve to ACTIVE.
+// purpose_activity_refs, if supplied, are validated against a REAL call to
+// privacy-purpose-registry-svc — each must resolve to ACTIVE.
 func (h *Handler) CreateRelationship(w http.ResponseWriter, r *http.Request) {
-	bodyBytes, err := readBody(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "failed to read request body")
+	cc, ok := h.begin(w, r, PrivacyTransferRelationshipManage, true)
+	if !ok {
 		return
 	}
+	body, ok := readBody(w, r)
+	if !ok {
+		return
+	}
+	hash := requestHash(r, body)
+	if h.replayOrContinue(w, r, cc, hash) {
+		return
+	}
+
 	var req domain.CreateProcessorRelationshipRequest
-	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+	if err := json.Unmarshal(body, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
@@ -284,37 +336,12 @@ func (h *Handler) CreateRelationship(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "controller_ref, processor_ref and service are required")
 		return
 	}
-
-	verifiedTenant := svcmiddleware.TenantFromContext(r.Context())
-	if req.TenantID != "" && req.TenantID != verifiedTenant {
-		writeError(w, http.StatusForbidden, "tenant_id does not match the verified X-Tenant-Id")
-		return
-	}
-	tenantID := req.TenantID
-	if tenantID == "" {
-		tenantID = verifiedTenant
-	}
-
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-	if !h.authorize(w, r, principalID, tenantID, PrivacyTransferRelationshipManage) {
-		return
-	}
-
-	if !h.requireMutationPreconditions(w, r) {
-		return
-	}
-
-	// Check idempotency (§18.1)
-	_, handled, idemKey, reqHash := h.checkIdempotency(w, r, tenantID, principalID, bodyBytes)
-	if handled {
+	if tenantMismatch(w, req.TenantID, cc) {
 		return
 	}
 
 	for _, activityID := range req.PurposeActivityRefs {
-		activity, err := h.purposes.ResolveActivity(r.Context(), tenantID, activityID)
+		activity, err := h.purposes.ResolveActivity(r.Context(), cc.Tenant, cc.Principal, activityID)
 		if err != nil {
 			h.log.Error("CreateRelationship: purpose registry unavailable", zap.Error(err))
 			writeError(w, http.StatusServiceUnavailable, "purpose registry unavailable")
@@ -326,40 +353,33 @@ func (h *Handler) CreateRelationship(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	relationship, err := h.store.CreateRelationship(r.Context(), tenantID, req, principalID)
+	rel, existing, err := h.store.CreateRelationship(r.Context(), cc.Tenant, req, cc.meta(), h.claim(cc, "CreateRelationship", hash, http.StatusCreated, identity))
 	if err != nil {
-		h.log.Error("CreateRelationship: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+		h.storeError(w, "CreateRelationship", err)
 		return
 	}
-
-	_ = h.pub.Publish(r.Context(), events.PublishParams{
-		EventType: EventProcessorChanged, EntityID: relationship.RelationshipID, TenantID: tenantID,
-		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: relationship,
-	})
-	h.writeJSONWithIdempotency(r.Context(), w, tenantID, principalID, "CreateRelationship", idemKey, reqHash, http.StatusCreated, relationship)
+	respond(w, existing, hash, http.StatusCreated, rel)
 }
 
 func (h *Handler) GetRelationship(w http.ResponseWriter, r *http.Request) {
-	relationshipID := chi.URLParam(r, "relationshipID")
-	relationship, err := h.store.FindRelationship(r.Context(), relationshipID)
-	if err != nil {
-		if errors.Is(err, domain.ErrRelationshipNotFound) {
-			writeError(w, http.StatusNotFound, "processor relationship not found")
-			return
-		}
-		h.log.Error("GetRelationship: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+	if _, ok := h.begin(w, r, PrivacyTransferRelationshipManage, false); !ok {
 		return
 	}
-	writeJSON(w, http.StatusOK, relationship)
+	rel, err := h.store.FindRelationship(r.Context(), chi.URLParam(r, "relationshipID"))
+	if err != nil {
+		h.storeError(w, "GetRelationship", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, rel)
 }
 
 func (h *Handler) ListRelationships(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.begin(w, r, PrivacyTransferRelationshipManage, false); !ok {
+		return
+	}
 	relationships, err := h.store.ListRelationships(r.Context())
 	if err != nil {
-		h.log.Error("ListRelationships: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+		h.storeError(w, "ListRelationships", err)
 		return
 	}
 	if relationships == nil {
@@ -370,13 +390,21 @@ func (h *Handler) ListRelationships(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) UpdateRelationshipStatus(w http.ResponseWriter, r *http.Request) {
 	relationshipID := chi.URLParam(r, "relationshipID")
-	bodyBytes, err := readBody(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "failed to read request body")
+	cc, ok := h.begin(w, r, PrivacyTransferRelationshipManage, true)
+	if !ok {
 		return
 	}
+	body, ok := readBody(w, r)
+	if !ok {
+		return
+	}
+	hash := requestHash(r, body)
+	if h.replayOrContinue(w, r, cc, hash) {
+		return
+	}
+
 	var req domain.UpdateRelationshipStatusRequest
-	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+	if err := json.Unmarshal(body, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
@@ -385,68 +413,33 @@ func (h *Handler) UpdateRelationshipStatus(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-	existing, err := h.store.FindRelationship(r.Context(), relationshipID)
+	updated, existing, err := h.store.UpdateRelationshipStatus(r.Context(), relationshipID, req.Status, cc.meta(), h.claim(cc, "UpdateRelationshipStatus", hash, http.StatusOK, identity))
 	if err != nil {
-		if errors.Is(err, domain.ErrRelationshipNotFound) {
-			writeError(w, http.StatusNotFound, "processor relationship not found")
-			return
-		}
-		h.log.Error("UpdateRelationshipStatus: lookup failed", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+		h.storeError(w, "UpdateRelationshipStatus", err)
 		return
 	}
-	tenantID := ""
-	if existing.TenantID != nil {
-		tenantID = *existing.TenantID
-	}
-	if !h.authorize(w, r, principalID, tenantID, PrivacyTransferRelationshipManage) {
-		return
-	}
-
-	if !h.requireMutationPreconditions(w, r) {
-		return
-	}
-
-	// Check idempotency (§18.1)
-	_, handled, idemKey, reqHash := h.checkIdempotency(w, r, tenantID, principalID, bodyBytes)
-	if handled {
-		return
-	}
-
-	updated, err := h.store.UpdateRelationshipStatus(r.Context(), relationshipID, req.Status)
-	if err != nil {
-		if errors.Is(err, domain.ErrRelationshipNotFound) {
-			writeError(w, http.StatusNotFound, "processor relationship not found")
-			return
-		}
-		h.log.Error("UpdateRelationshipStatus: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
-		return
-	}
-	// §19 privacy.processor.changed — a status transition is a processor
-	// state change (state + effective time) consumers must see.
-	_ = h.pub.Publish(r.Context(), events.PublishParams{
-		EventType: EventProcessorChanged, EntityID: updated.RelationshipID, TenantID: tenantID,
-		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: updated,
-	})
-	h.writeJSONWithIdempotency(r.Context(), w, tenantID, principalID, "UpdateRelationshipStatus", idemKey, reqHash, http.StatusOK, updated)
+	respond(w, existing, hash, http.StatusOK, updated)
 }
 
 // ── subprocessors ────────────────────────────────────────────────────────────
 
 func (h *Handler) AttachSubprocessor(w http.ResponseWriter, r *http.Request) {
 	relationshipID := chi.URLParam(r, "relationshipID")
-	bodyBytes, err := readBody(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "failed to read request body")
+	cc, ok := h.begin(w, r, PrivacyTransferRelationshipManage, true)
+	if !ok {
 		return
 	}
+	body, ok := readBody(w, r)
+	if !ok {
+		return
+	}
+	hash := requestHash(r, body)
+	if h.replayOrContinue(w, r, cc, hash) {
+		return
+	}
+
 	var req domain.AttachSubprocessorRequest
-	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+	if err := json.Unmarshal(body, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
@@ -455,62 +448,21 @@ func (h *Handler) AttachSubprocessor(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-	existing, err := h.store.FindRelationship(r.Context(), relationshipID)
+	sp, existing, err := h.store.AttachSubprocessor(r.Context(), relationshipID, req, cc.meta(), h.claim(cc, "AttachSubprocessor", hash, http.StatusCreated, identity))
 	if err != nil {
-		if errors.Is(err, domain.ErrRelationshipNotFound) {
-			writeError(w, http.StatusNotFound, "processor relationship not found")
-			return
-		}
-		h.log.Error("AttachSubprocessor: lookup failed", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+		h.storeError(w, "AttachSubprocessor", err)
 		return
 	}
-	tenantID := ""
-	if existing.TenantID != nil {
-		tenantID = *existing.TenantID
-	}
-	if !h.authorize(w, r, principalID, tenantID, PrivacyTransferRelationshipManage) {
-		return
-	}
-
-	if !h.requireMutationPreconditions(w, r) {
-		return
-	}
-
-	// Check idempotency (§18.1)
-	_, handled, idemKey, reqHash := h.checkIdempotency(w, r, tenantID, principalID, bodyBytes)
-	if handled {
-		return
-	}
-
-	sp, err := h.store.AttachSubprocessor(r.Context(), relationshipID, req, principalID)
-	if err != nil {
-		if errors.Is(err, domain.ErrRelationshipNotFound) {
-			writeError(w, http.StatusNotFound, "processor relationship not found")
-			return
-		}
-		h.log.Error("AttachSubprocessor: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
-		return
-	}
-	// §19 privacy.processor.changed — "processor/subprocessor … state".
-	_ = h.pub.Publish(r.Context(), events.PublishParams{
-		EventType: EventProcessorChanged, EntityID: sp.SubprocessorID, TenantID: tenantID,
-		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: sp,
-	})
-	h.writeJSONWithIdempotency(r.Context(), w, tenantID, principalID, "AttachSubprocessor", idemKey, reqHash, http.StatusCreated, sp)
+	respond(w, existing, hash, http.StatusCreated, sp)
 }
 
 func (h *Handler) ListSubprocessors(w http.ResponseWriter, r *http.Request) {
-	relationshipID := chi.URLParam(r, "relationshipID")
-	subs, err := h.store.ListSubprocessors(r.Context(), relationshipID)
+	if _, ok := h.begin(w, r, PrivacyTransferRelationshipManage, false); !ok {
+		return
+	}
+	subs, err := h.store.ListSubprocessors(r.Context(), chi.URLParam(r, "relationshipID"))
 	if err != nil {
-		h.log.Error("ListSubprocessors: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+		h.storeError(w, "ListSubprocessors", err)
 		return
 	}
 	if subs == nil {
@@ -522,13 +474,21 @@ func (h *Handler) ListSubprocessors(w http.ResponseWriter, r *http.Request) {
 // ── transfer mechanisms ──────────────────────────────────────────────────────
 
 func (h *Handler) CreateMechanism(w http.ResponseWriter, r *http.Request) {
-	bodyBytes, err := readBody(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "failed to read request body")
+	cc, ok := h.begin(w, r, PrivacyTransferMechanismManage, true)
+	if !ok {
 		return
 	}
+	body, ok := readBody(w, r)
+	if !ok {
+		return
+	}
+	hash := requestHash(r, body)
+	if h.replayOrContinue(w, r, cc, hash) {
+		return
+	}
+
 	var req domain.CreateTransferMechanismRequest
-	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+	if err := json.Unmarshal(body, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
@@ -540,54 +500,25 @@ func (h *Handler) CreateMechanism(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "valid_until must not be before valid_from")
 		return
 	}
-
-	verifiedTenant := svcmiddleware.TenantFromContext(r.Context())
-	if req.TenantID != "" && req.TenantID != verifiedTenant {
-		writeError(w, http.StatusForbidden, "tenant_id does not match the verified X-Tenant-Id")
-		return
-	}
-	tenantID := req.TenantID
-	if tenantID == "" {
-		tenantID = verifiedTenant
-	}
-
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-	if !h.authorize(w, r, principalID, tenantID, PrivacyTransferMechanismManage) {
+	if tenantMismatch(w, req.TenantID, cc) {
 		return
 	}
 
-	if !h.requireMutationPreconditions(w, r) {
-		return
-	}
-
-	// Check idempotency (§18.1)
-	_, handled, idemKey, reqHash := h.checkIdempotency(w, r, tenantID, principalID, bodyBytes)
-	if handled {
-		return
-	}
-
-	mechanism, err := h.store.CreateMechanism(r.Context(), tenantID, req, principalID)
+	mechanism, existing, err := h.store.CreateMechanism(r.Context(), cc.Tenant, req, cc.meta(), h.claim(cc, "CreateMechanism", hash, http.StatusCreated, identity))
 	if err != nil {
-		h.log.Error("CreateMechanism: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+		h.storeError(w, "CreateMechanism", err)
 		return
 	}
-	h.writeJSONWithIdempotency(r.Context(), w, tenantID, principalID, "CreateMechanism", idemKey, reqHash, http.StatusCreated, mechanism)
+	respond(w, existing, hash, http.StatusCreated, mechanism)
 }
 
 func (h *Handler) GetMechanism(w http.ResponseWriter, r *http.Request) {
-	mechanismID := chi.URLParam(r, "mechanismID")
-	mechanism, err := h.store.FindMechanism(r.Context(), mechanismID)
+	if _, ok := h.begin(w, r, PrivacyTransferMechanismManage, false); !ok {
+		return
+	}
+	mechanism, err := h.store.FindMechanism(r.Context(), chi.URLParam(r, "mechanismID"))
 	if err != nil {
-		if errors.Is(err, domain.ErrMechanismNotFound) {
-			writeError(w, http.StatusNotFound, "transfer mechanism not found")
-			return
-		}
-		h.log.Error("GetMechanism: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+		h.storeError(w, "GetMechanism", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, mechanism)
@@ -596,13 +527,21 @@ func (h *Handler) GetMechanism(w http.ResponseWriter, r *http.Request) {
 // ── transfer assessments ─────────────────────────────────────────────────────
 
 func (h *Handler) RecordAssessment(w http.ResponseWriter, r *http.Request) {
-	bodyBytes, err := readBody(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "failed to read request body")
+	cc, ok := h.begin(w, r, PrivacyTransferAssessmentRecord, true)
+	if !ok {
 		return
 	}
+	body, ok := readBody(w, r)
+	if !ok {
+		return
+	}
+	hash := requestHash(r, body)
+	if h.replayOrContinue(w, r, cc, hash) {
+		return
+	}
+
 	var req domain.RecordTransferAssessmentRequest
-	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+	if err := json.Unmarshal(body, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
@@ -614,59 +553,24 @@ func (h *Handler) RecordAssessment(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "outcome must be APPROVE, REMEDIATE or REJECT")
 		return
 	}
-
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
+	// The relationship must exist in the caller's tenant (RLS-scoped lookup).
+	if _, err := h.store.FindRelationship(r.Context(), req.RelationshipID); err != nil {
+		h.storeError(w, "RecordAssessment", err)
 		return
 	}
-	relationship, err := h.store.FindRelationship(r.Context(), req.RelationshipID)
+
+	assessment, existing, err := h.store.RecordAssessment(r.Context(), cc.Tenant, req, cc.meta(), h.claim(cc, "RecordAssessment", hash, http.StatusCreated, identity))
 	if err != nil {
-		if errors.Is(err, domain.ErrRelationshipNotFound) {
-			writeError(w, http.StatusNotFound, "processor relationship not found")
-			return
-		}
-		h.log.Error("RecordAssessment: lookup failed", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+		h.storeError(w, "RecordAssessment", err)
 		return
 	}
-	tenantID := ""
-	if relationship.TenantID != nil {
-		tenantID = *relationship.TenantID
-	}
-	if !h.authorize(w, r, principalID, tenantID, PrivacyTransferAssessmentRecord) {
-		return
-	}
-
-	if !h.requireMutationPreconditions(w, r) {
-		return
-	}
-
-	// Check idempotency (§18.1)
-	_, handled, idemKey, reqHash := h.checkIdempotency(w, r, tenantID, principalID, bodyBytes)
-	if handled {
-		return
-	}
-
-	assessment, err := h.store.RecordAssessment(r.Context(), tenantID, req, principalID)
-	if err != nil {
-		h.log.Error("RecordAssessment: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
-		return
-	}
-	// §19 privacy.assessment.expiring — emitted when the recorded
-	// assessment declares its §17.1 expiry/review trigger, so WFC/the
-	// privacy owner can schedule reassessment and never silently renew.
-	// PRV-05 has no scheduler; the event carries the trigger date.
-	if assessment.ReviewTriggerAt != nil {
-		_ = h.pub.Publish(r.Context(), events.PublishParams{
-			EventType: EventAssessmentExpiring, EntityID: assessment.AssessmentID, TenantID: tenantID,
-			ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: assessment,
-		})
-	}
-	h.writeJSONWithIdempotency(r.Context(), w, tenantID, principalID, "RecordAssessment", idemKey, reqHash, http.StatusCreated, assessment)
+	respond(w, existing, hash, http.StatusCreated, assessment)
 }
 
 func (h *Handler) GetLatestAssessment(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.begin(w, r, PrivacyTransferAssessmentRecord, false); !ok {
+		return
+	}
 	relationshipID := r.URL.Query().Get("relationship_id")
 	if relationshipID == "" {
 		writeError(w, http.StatusBadRequest, "relationship_id query parameter is required")
@@ -674,8 +578,7 @@ func (h *Handler) GetLatestAssessment(w http.ResponseWriter, r *http.Request) {
 	}
 	assessment, err := h.store.FindLatestAssessment(r.Context(), relationshipID)
 	if err != nil {
-		h.log.Error("GetLatestAssessment: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+		h.storeError(w, "GetLatestAssessment", err)
 		return
 	}
 	if assessment == nil {
@@ -688,24 +591,24 @@ func (h *Handler) GetLatestAssessment(w http.ResponseWriter, r *http.Request) {
 // ── transfer decisions ───────────────────────────────────────────────────────
 
 // EvaluateTransfer handles POST /privacy/transfer-decisions — §16/§17's
-// runtime evaluation, scoped to what this version can determine from
-// real evidence. See the domain package's doc comment for exactly which
-// checks are implemented (relationship active, mechanism valid, and an
-// opt-in assessment check) and which (CONDITIONAL's machine-enforceable
-// constraints) are not.
+// runtime evaluation. The decision, its privacy.transfer.authorization_changed
+// event and the replay response are committed in one transaction.
 func (h *Handler) EvaluateTransfer(w http.ResponseWriter, r *http.Request) {
-	principalID, ok := h.requirePrincipal(w, r)
+	cc, ok := h.begin(w, r, PrivacyTransferDecisionEvaluate, true)
 	if !ok {
 		return
 	}
-
-	bodyBytes, err := readBody(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "failed to read request body")
+	body, ok := readBody(w, r)
+	if !ok {
 		return
 	}
+	hash := requestHash(r, body)
+	if h.replayOrContinue(w, r, cc, hash) {
+		return
+	}
+
 	var req domain.EvaluateTransferRequest
-	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+	if err := json.Unmarshal(body, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
@@ -713,35 +616,17 @@ func (h *Handler) EvaluateTransfer(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "relationship_id and transfer_mechanism_id are required")
 		return
 	}
-
-	verifiedTenant := svcmiddleware.TenantFromContext(r.Context())
-	if req.TenantID != "" && req.TenantID != verifiedTenant {
-		writeError(w, http.StatusForbidden, "tenant_id does not match the verified X-Tenant-Id")
+	if tenantMismatch(w, req.TenantID, cc) {
 		return
 	}
-	tenantID := req.TenantID
-	if tenantID == "" {
-		tenantID = verifiedTenant
-	}
-
-	if !h.authorize(w, r, principalID, tenantID, PrivacyTransferDecisionEvaluate) {
+	if req.ReassessmentTrigger != "" && !domain.ValidTrigger(req.ReassessmentTrigger) {
+		writeError(w, http.StatusBadRequest, domain.ErrInvalidTrigger.Error())
 		return
 	}
 
-	if !h.requireMutationPreconditions(w, r) {
-		return
-	}
-
-	// Check idempotency (§18.1)
-	_, handled, idemKey, reqHash := h.checkIdempotency(w, r, tenantID, principalID, bodyBytes)
-	if handled {
-		return
-	}
-
-	correlationID := r.Header.Get("X-Correlation-ID")
 	decision := &domain.TransferDecision{
 		RelationshipID: req.RelationshipID, TransferMechanismID: req.TransferMechanismID,
-		DestinationJurisdiction: req.DestinationJurisdiction, ActorPrincipalID: principalID, CorrelationID: correlationID,
+		DestinationJurisdiction: req.DestinationJurisdiction, ActorPrincipalID: cc.Principal, CorrelationID: cc.Correlation,
 		// §16.1 TransferContext — recorded verbatim as authorization
 		// evidence. Whitespace-only declarations normalise to "absent".
 		ExporterRole:         strings.TrimSpace(req.ExporterRole),
@@ -755,36 +640,23 @@ func (h *Handler) EvaluateTransfer(w http.ResponseWriter, r *http.Request) {
 	decision.Result = result
 	decision.ReasonCodes = reasonCodes
 
-	if err := h.store.RecordDecision(r.Context(), tenantID, decision); err != nil {
-		h.log.Error("EvaluateTransfer: failed to record decision", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+	render := func(res any) any { return res }
+	existing, err := h.store.RecordDecision(r.Context(), cc.Tenant, decision, cc.meta(), h.claim(cc, "EvaluateTransfer", hash, http.StatusOK, render))
+	if err != nil {
+		h.storeError(w, "EvaluateTransfer", err)
 		return
 	}
-	// §18 critical response field authorization_id must always be present
-	// on the wire regardless of which store assigned the decision id.
+	// §18 critical response field authorization_id is always present.
 	if decision.AuthorizationID == "" {
 		decision.AuthorizationID = decision.DecisionID
 	}
-
-	// §19 privacy.transfer.authorization_changed — "authorization, route/
-	// provider scope, state, conditions, expiry". Events communicate
-	// already-committed state (§19.1), so this is published only after the
-	// decision is durably recorded.
-	_ = h.pub.Publish(r.Context(), events.PublishParams{
-		EventType: EventTransferAuthorizationChanged, EntityID: decision.DecisionID, TenantID: tenantID,
-		ActorID: principalID, CorrelationID: correlationID, Payload: decision,
-	})
-	h.writeJSONWithIdempotency(r.Context(), w, tenantID, principalID, "EvaluateTransfer", idemKey, reqHash, http.StatusOK, decision)
+	respond(w, existing, hash, http.StatusOK, decision)
 }
 
-// evaluate is §17.2's fail-closed doctrine encoded literally: "If a
-// required DPIA/TIA, transfer mechanism... approval is missing, expired
-// or conflicted, PRV-05 returns BLOCKED or REVIEW_REQUIRED." Any
-// dependency being unreachable ALSO fails closed, as REVIEW_REQUIRED —
-// unlike PRV-03's INDETERMINATE-only posture, this service has a defined
-// "needs a human" outcome the spec itself names for exactly this
-// situation, so an unreachable dependency routes there rather than to a
-// separate ad hoc state.
+// evaluate is §17.2's fail-closed doctrine encoded literally: "If a required
+// DPIA/TIA, transfer mechanism... approval is missing, expired or conflicted,
+// PRV-05 returns BLOCKED or REVIEW_REQUIRED." Any dependency being
+// unreachable ALSO fails closed, as REVIEW_REQUIRED.
 func (h *Handler) evaluate(ctx context.Context, req *domain.EvaluateTransferRequest, decision *domain.TransferDecision) (domain.AuthorizationResult, []string) {
 	relationship, err := h.store.FindRelationship(ctx, req.RelationshipID)
 	if err != nil {
@@ -801,20 +673,9 @@ func (h *Handler) evaluate(ctx context.Context, req *domain.EvaluateTransferRequ
 		return domain.ResultBlocked, makeReasons(domain.ReasonInstructionMissing, "PROCESSOR_INSTRUCTION_MISSING")
 	}
 
-	// §17.2 — "If a required DPIA/TIA, transfer mechanism, controller
-	// instruction or subprocessor approval is missing, expired or
-	// conflicted, PRV-05 returns BLOCKED or REVIEW_REQUIRED."
-	//
-	// §16.1 models a subprocessor's "notification/approval model" as the
-	// control that records how that downstream processor is governed. An
-	// attached subprocessor with no approval model on file is therefore an
-	// unapproved subprocessor, and the transfer is blocked with the §32
-	// code PRV-018 rather than silently permitted. This is a relationship-
-	// level gate, grouped with the controller-instruction gate above; a
-	// relationship with no subprocessors has nothing to approve and skips
-	// it. (OD-10's processor/subprocessor approval *capability matrix* is
-	// still open, so the service takes the §33.1 safer explicit state —
-	// BLOCK — rather than inventing a local approval default.)
+	// §17.2 — a subprocessor with no approval model on file is an unapproved
+	// subprocessor: BLOCKED with PRV-018 (OD-10's capability matrix is still
+	// open, so the safer explicit state is used).
 	subprocessors, err := h.store.ListSubprocessors(ctx, req.RelationshipID)
 	if err != nil {
 		h.log.Error("evaluate: subprocessor lookup failed", zap.Error(err))
@@ -862,7 +723,7 @@ func (h *Handler) evaluate(ctx context.Context, req *domain.EvaluateTransferRequ
 			return domain.ResultReviewRequired, makeReasons(domain.ReasonAssessmentRemediate, "ASSESSMENT_REQUIRES_REMEDIATION")
 		}
 
-		// §17.1 Mandatory Reassessment Trigger 8: Expiry review date reached
+		// §17.1 trigger 8: expiry / review date reached.
 		if assessment.ExpiredAsOf(now) {
 			return domain.ResultReviewRequired, makeReasons(domain.ReasonAssessmentExpired, "ASSESSMENT_EXPIRED")
 		}
@@ -871,30 +732,25 @@ func (h *Handler) evaluate(ctx context.Context, req *domain.EvaluateTransferRequ
 				decision.ExpiresAt = assessment.ReviewTriggerAt
 			}
 		}
+	}
 
-		// §17.1 Mandatory Reassessment Trigger 4: Changed transfer mechanism since assessment
-		if mechanism.CreatedAt.After(assessment.CreatedAt) {
-			return domain.ResultReviewRequired, makeReasons("PRV-016: REASSESSMENT_TRIGGER_CHANGED_TRANSFER_MECHANISM", "CHANGED_TRANSFER_MECHANISM_OR_INSTRUCTION")
+	// §17.1 reassessment triggers — the same evaluation the trigger endpoint
+	// uses. Triggers established from stored evidence win over a declaration.
+	outcomes := computeTriggers(triggerInput{
+		Relationship: relationship, Mechanism: mechanism, Assessment: latestAssessment, Subprocessors: subprocessors,
+		Destination: req.DestinationJurisdiction, DataCats: req.DataCategories, SubjectCls: req.SubjectClasses,
+		Declared: "", Now: now,
+	})
+	for _, idx := range []int{3, 2, 5, 0} { // changed mechanism, new processor/jurisdiction, minors, sensitive category
+		if o := outcomes[idx]; o.Derived && o.Triggered {
+			return domain.ResultReviewRequired, makeReasons(o.ReasonCode, o.Trigger)
 		}
 	}
-
-	// §17.1 Mandatory Reassessment Trigger 3: New destination jurisdiction outside declared scope
-	if req.DestinationJurisdiction != "" && len(relationship.Jurisdictions) > 0 && !contains(relationship.Jurisdictions, req.DestinationJurisdiction) {
-		return domain.ResultReviewRequired, makeReasons("PRV-016: REASSESSMENT_TRIGGER_NEW_DESTINATION_JURISDICTION", "NEW_PROCESSOR_OR_DESTINATION_JURISDICTION")
-	}
-
-	// §17.1 Mandatory Reassessment Trigger 6: New minors context
-	if (contains(req.SubjectClasses, "MINORS") || contains(req.SubjectClasses, "CHILDREN")) && !contains(relationship.SubjectClasses, "MINORS") && !contains(relationship.SubjectClasses, "CHILDREN") {
-		return domain.ResultReviewRequired, makeReasons("PRV-016: REASSESSMENT_TRIGGER_NEW_MINORS_CONTEXT", "NEW_MINORS_CONTEXT")
-	}
-
-	// §17.1 Mandatory Reassessment Trigger 1/2/5/7: Explicit declared trigger
 	if req.ReassessmentTrigger != "" {
-		code := "PRV-016: REASSESSMENT_TRIGGER_" + req.ReassessmentTrigger
-		return domain.ResultReviewRequired, makeReasons(code, req.ReassessmentTrigger)
+		return domain.ResultReviewRequired, makeReasons("PRV-016: REASSESSMENT_TRIGGER_"+req.ReassessmentTrigger, req.ReassessmentTrigger)
 	}
 
-	// §16.1 & §18: Evaluate CONDITIONAL outcome vs AUTHORIZED
+	// §16.1 & §18: CONDITIONAL vs AUTHORIZED.
 	var conds []string
 	if latestAssessment != nil {
 		if latestAssessment.TechnicalMeasures != "" {
@@ -910,229 +766,119 @@ func (h *Handler) evaluate(ctx context.Context, req *domain.EvaluateTransferRequ
 	if req.EnforceConditions && mechanism.Conditions != "" {
 		conds = append(conds, mechanism.Conditions)
 	}
-
 	if len(conds) > 0 {
 		decision.Conditions = strings.Join(conds, "; ")
 		return domain.ResultConditional, []string{}
 	}
-
 	return domain.ResultAuthorized, []string{}
 }
 
 func (h *Handler) GetDecision(w http.ResponseWriter, r *http.Request) {
-	decisionID := chi.URLParam(r, "decisionID")
-	d, err := h.store.FindDecision(r.Context(), decisionID)
+	if _, ok := h.begin(w, r, PrivacyTransferDecisionEvaluate, false); !ok {
+		return
+	}
+	d, err := h.store.FindDecision(r.Context(), chi.URLParam(r, "decisionID"))
 	if err != nil {
-		if errors.Is(err, domain.ErrDecisionNotFound) {
-			writeError(w, http.StatusNotFound, "transfer decision not found")
-			return
-		}
-		h.log.Error("GetDecision: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+		h.storeError(w, "GetDecision", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, d)
 }
 
-// EvaluateTriggers evaluates all 8 mandatory reassessment triggers (§17.1) for a relationship.
+// EvaluateTriggers evaluates the eight mandatory reassessment triggers (§17.1)
+// for a relationship. It writes nothing; it is authenticated, tenant-scoped
+// and authorized like every other route, and a trigger the caller declares is
+// validated against the eight §17.1 names.
 func (h *Handler) EvaluateTriggers(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.begin(w, r, PrivacyTransferDecisionEvaluate, false); !ok {
+		return
+	}
 	var req domain.EvaluateTriggersRequest
 	if r.Method == http.MethodPost {
-		bodyBytes, err := readBody(r)
-		if err == nil && len(bodyBytes) > 0 {
-			_ = json.Unmarshal(bodyBytes, &req)
+		if body, ok := readBody(w, r); !ok {
+			return
+		} else if len(body) > 0 {
+			if err := json.Unmarshal(body, &req); err != nil {
+				writeError(w, http.StatusBadRequest, "invalid request body")
+				return
+			}
 		}
 	}
+	q := r.URL.Query()
 	if req.RelationshipID == "" {
-		req.RelationshipID = r.URL.Query().Get("relationship_id")
+		req.RelationshipID = q.Get("relationship_id")
 	}
 	if req.RelationshipID == "" {
 		writeError(w, http.StatusBadRequest, "relationship_id is required")
 		return
 	}
 	if req.TransferMechanismID == "" {
-		req.TransferMechanismID = r.URL.Query().Get("transfer_mechanism_id")
+		req.TransferMechanismID = q.Get("transfer_mechanism_id")
 	}
 	if req.DestinationJurisdiction == "" {
-		req.DestinationJurisdiction = r.URL.Query().Get("destination_jurisdiction")
+		req.DestinationJurisdiction = q.Get("destination_jurisdiction")
 	}
 	if req.DeclaredTrigger == "" {
-		req.DeclaredTrigger = r.URL.Query().Get("declared_trigger")
+		req.DeclaredTrigger = q.Get("declared_trigger")
+	}
+	if req.DeclaredTrigger != "" && !domain.ValidTrigger(req.DeclaredTrigger) {
+		writeError(w, http.StatusBadRequest, domain.ErrInvalidTrigger.Error())
+		return
 	}
 
 	relationship, err := h.store.FindRelationship(r.Context(), req.RelationshipID)
 	if err != nil {
-		if errors.Is(err, domain.ErrRelationshipNotFound) {
-			writeError(w, http.StatusNotFound, "processor relationship not found")
-			return
-		}
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+		h.storeError(w, "EvaluateTriggers", err)
 		return
 	}
-
-	assessment, _ := h.store.FindLatestAssessment(r.Context(), req.RelationshipID)
-
+	// Evidence lookups fail closed: an outage is an error, never "no trigger".
+	assessment, err := h.store.FindLatestAssessment(r.Context(), req.RelationshipID)
+	if err != nil {
+		h.storeError(w, "EvaluateTriggers", err)
+		return
+	}
+	subs, err := h.store.ListSubprocessors(r.Context(), req.RelationshipID)
+	if err != nil {
+		h.storeError(w, "EvaluateTriggers", err)
+		return
+	}
 	var mechanism *domain.TransferMechanism
 	if req.TransferMechanismID != "" {
-		mechanism, _ = h.store.FindMechanism(r.Context(), req.TransferMechanismID)
-	}
-
-	now := time.Now().UTC()
-	var evals []domain.TriggerEvaluation
-	var activeTriggers []string
-
-	// Trigger 1: New purpose or sensitive category
-	t1 := domain.TriggerEvaluation{
-		Trigger:     domain.TriggerNewPurposeOrSensitiveCategory,
-		Description: "New purpose, materially expanded purpose or new sensitive/special data category",
-		ReasonCode:  "PRV-016: REASSESSMENT_TRIGGER_NEW_PURPOSE_OR_SENSITIVE_CATEGORY",
-	}
-	for _, cat := range req.DataCategories {
-		if containsSensitive(cat) && !contains(relationship.DataCategories, cat) {
-			t1.Triggered = true
-			break
+		mechanism, err = h.store.FindMechanism(r.Context(), req.TransferMechanismID)
+		if err != nil && !errors.Is(err, domain.ErrMechanismNotFound) {
+			h.storeError(w, "EvaluateTriggers", err)
+			return
 		}
 	}
-	if req.DeclaredTrigger == domain.TriggerNewPurposeOrSensitiveCategory {
-		t1.Triggered = true
-	}
-	if t1.Triggered {
-		activeTriggers = append(activeTriggers, t1.Trigger)
-	}
-	evals = append(evals, t1)
 
-	// Trigger 2: New automated decisioning
-	t2 := domain.TriggerEvaluation{
-		Trigger:     domain.TriggerAutomatedDecisioning,
-		Description: "New automated decisioning/profiling or materially increased effect on individuals",
-		ReasonCode:  "PRV-016: REASSESSMENT_TRIGGER_AUTOMATED_DECISIONING",
-		Triggered:   req.DeclaredTrigger == domain.TriggerAutomatedDecisioning,
+	outcomes := computeTriggers(triggerInput{
+		Relationship: relationship, Mechanism: mechanism, Assessment: assessment, Subprocessors: subs,
+		Destination: req.DestinationJurisdiction, DataCats: req.DataCategories, SubjectCls: req.SubjectClasses,
+		Declared: req.DeclaredTrigger, Now: time.Now().UTC(),
+	})
+	evals := make([]domain.TriggerEvaluation, 0, len(outcomes))
+	active := []string{}
+	for _, o := range outcomes {
+		evals = append(evals, o.TriggerEvaluation)
+		if o.Triggered {
+			active = append(active, o.Trigger)
+		}
 	}
-	if t2.Triggered {
-		activeTriggers = append(activeTriggers, t2.Trigger)
-	}
-	evals = append(evals, t2)
-
-	// Trigger 3: New processor or destination jurisdiction
-	t3 := domain.TriggerEvaluation{
-		Trigger:     domain.TriggerNewProcessorOrJurisdiction,
-		Description: "New processor/subprocessor or destination jurisdiction/region",
-		ReasonCode:  "PRV-016: REASSESSMENT_TRIGGER_NEW_DESTINATION_JURISDICTION",
-	}
-	if req.DestinationJurisdiction != "" && len(relationship.Jurisdictions) > 0 && !contains(relationship.Jurisdictions, req.DestinationJurisdiction) {
-		t3.Triggered = true
-	}
-	if req.DeclaredTrigger == domain.TriggerNewProcessorOrJurisdiction {
-		t3.Triggered = true
-	}
-	if t3.Triggered {
-		activeTriggers = append(activeTriggers, t3.Trigger)
-	}
-	evals = append(evals, t3)
-
-	// Trigger 4: Changed transfer mechanism or instruction
-	t4 := domain.TriggerEvaluation{
-		Trigger:     domain.TriggerChangedTransferMechanism,
-		Description: "Changed transfer mechanism, legal validity, processing instruction or recipient category",
-		ReasonCode:  "PRV-016: REASSESSMENT_TRIGGER_CHANGED_TRANSFER_MECHANISM",
-	}
-	if mechanism != nil && assessment != nil && mechanism.CreatedAt.After(assessment.CreatedAt) {
-		t4.Triggered = true
-	}
-	if req.DeclaredTrigger == domain.TriggerChangedTransferMechanism {
-		t4.Triggered = true
-	}
-	if t4.Triggered {
-		activeTriggers = append(activeTriggers, t4.Trigger)
-	}
-	evals = append(evals, t4)
-
-	// Trigger 5: Material architecture change
-	t5 := domain.TriggerEvaluation{
-		Trigger:     domain.TriggerMaterialArchitectureChange,
-		Description: "Material architecture change affecting data access, observability, model training or re-identification risk",
-		ReasonCode:  "PRV-016: REASSESSMENT_TRIGGER_MATERIAL_ARCHITECTURE_CHANGE",
-		Triggered:   req.DeclaredTrigger == domain.TriggerMaterialArchitectureChange,
-	}
-	if t5.Triggered {
-		activeTriggers = append(activeTriggers, t5.Trigger)
-	}
-	evals = append(evals, t5)
-
-	// Trigger 6: New minors context
-	t6 := domain.TriggerEvaluation{
-		Trigger:     domain.TriggerNewMinorsContext,
-		Description: "New children/minors context or materially changed age-assurance model",
-		ReasonCode:  "PRV-016: REASSESSMENT_TRIGGER_NEW_MINORS_CONTEXT",
-	}
-	if (contains(req.SubjectClasses, "MINORS") || contains(req.SubjectClasses, "CHILDREN")) && !contains(relationship.SubjectClasses, "MINORS") && !contains(relationship.SubjectClasses, "CHILDREN") {
-		t6.Triggered = true
-	}
-	if req.DeclaredTrigger == domain.TriggerNewMinorsContext {
-		t6.Triggered = true
-	}
-	if t6.Triggered {
-		activeTriggers = append(activeTriggers, t6.Trigger)
-	}
-	evals = append(evals, t6)
-
-	// Trigger 7: Security or privacy incident
-	t7 := domain.TriggerEvaluation{
-		Trigger:     domain.TriggerSecurityPrivacyIncident,
-		Description: "Privacy/security incident revealing an unmodeled risk or control failure",
-		ReasonCode:  "PRV-016: REASSESSMENT_TRIGGER_SECURITY_PRIVACY_INCIDENT",
-		Triggered:   req.DeclaredTrigger == domain.TriggerSecurityPrivacyIncident,
-	}
-	if t7.Triggered {
-		activeTriggers = append(activeTriggers, t7.Trigger)
-	}
-	evals = append(evals, t7)
-
-	// Trigger 8: Expiry review date reached
-	t8 := domain.TriggerEvaluation{
-		Trigger:     domain.TriggerExpiryReviewDateReached,
-		Description: "Expiry/review date reached or PDC legal-rule package marks prior authorization stale",
-		ReasonCode:  "PRV-016: ASSESSMENT_EXPIRED",
-	}
-	if assessment != nil && assessment.ExpiredAsOf(now) {
-		t8.Triggered = true
-	}
-	if req.DeclaredTrigger == domain.TriggerExpiryReviewDateReached {
-		t8.Triggered = true
-	}
-	if t8.Triggered {
-		activeTriggers = append(activeTriggers, t8.Trigger)
-	}
-	evals = append(evals, t8)
-
-	resp := domain.EvaluateTriggersResponse{
+	writeJSON(w, http.StatusOK, domain.EvaluateTriggersResponse{
 		RelationshipID:     req.RelationshipID,
-		ReassessmentNeeded: len(activeTriggers) > 0,
-		ActiveTriggers:     activeTriggers,
+		ReassessmentNeeded: len(active) > 0,
+		ActiveTriggers:     active,
 		TriggerEvaluations: evals,
-	}
-	writeJSON(w, http.StatusOK, resp)
+	})
 }
 
 func contains(list []string, item string) bool {
 	for _, s := range list {
-		if strings.EqualFold(s, item) {
+		if strings.EqualFold(strings.TrimSpace(s), strings.TrimSpace(item)) {
 			return true
 		}
 	}
 	return false
-}
-
-func containsSensitive(cat string) bool {
-	upper := strings.ToUpper(cat)
-	return strings.Contains(upper, "HEALTH") ||
-		strings.Contains(upper, "BIOMETRIC") ||
-		strings.Contains(upper, "GENETIC") ||
-		strings.Contains(upper, "SPECIAL") ||
-		strings.Contains(upper, "CRIMINAL") ||
-		strings.Contains(upper, "SEXUAL") ||
-		strings.Contains(upper, "RELIGIOUS") ||
-		strings.Contains(upper, "POLITICAL")
 }
 
 func makeReasons(code, symbol string) []string {

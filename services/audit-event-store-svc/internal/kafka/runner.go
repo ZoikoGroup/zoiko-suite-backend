@@ -15,7 +15,12 @@
 //     ON CONFLICT DO NOTHING still functions correctly.
 //
 //   - Error handling:
-//       • Validation errors (Handler returns nil)  → commit & continue.
+//       • Malformed events (Handler returns an error wrapping
+//         consumer.ErrMalformedEvent) → NOT retried (the message can never
+//         become valid); published to "<topic>.dlq" with the reason in
+//         X-DLQ-Reason, and only then committed. If that publish fails the
+//         offset is left uncommitted so a restart retries. They are never
+//         silently dropped.
 //       • Store errors (Handler returns non-nil)   → retried a bounded
 //         number of times against the SAME message; if every retry still
 //         fails, the message is published to "<topic>.dlq" and only then
@@ -38,6 +43,7 @@ package kafka
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -59,12 +65,41 @@ const dlqRetryAttempts = 3
 
 // Runner manages the lifecycle of one kafka.Reader goroutine for one topic.
 type Runner struct {
-	reader    *kafka.Reader
-	dlqWriter *kafka.Writer
-	handler   *consumer.Consumer
+	reader    messageReader
+	dlqWriter messageWriter
+	handler   messageHandler
 	topic     string
 	log       *zap.Logger
 	metrics   *telemetry.Metrics
+
+	// retryBackoff is the base delay between handler retries (attempt N waits
+	// N x retryBackoff). Zero means the production default of 200 ms.
+	retryBackoff time.Duration
+}
+
+// messageReader, messageWriter and messageHandler are the slices of
+// *kafka.Reader, *kafka.Writer and *consumer.Consumer the loop uses, narrowed to
+// interfaces so the retry/DLQ/offset behaviour can be tested without a broker.
+type messageReader interface {
+	FetchMessage(ctx context.Context) (kafka.Message, error)
+	CommitMessages(ctx context.Context, msgs ...kafka.Message) error
+	Close() error
+}
+
+type messageWriter interface {
+	WriteMessages(ctx context.Context, msgs ...kafka.Message) error
+	Close() error
+}
+
+type messageHandler interface {
+	Handle(ctx context.Context, eventID string, raw []byte) error
+}
+
+func (r *Runner) backoff() time.Duration {
+	if r.retryBackoff > 0 {
+		return r.retryBackoff
+	}
+	return 200 * time.Millisecond
 }
 
 // NewRunner constructs a Runner for a single topic. metrics records one
@@ -145,8 +180,10 @@ func (r *Runner) Run(ctx context.Context) {
 
 		spanCtx, span := telemetry.StartConsumeSpan(ctx, r.topic, eventID)
 		err = r.handler.Handle(spanCtx, eventID, msg.Value)
-		for attempt := 1; err != nil && attempt < dlqRetryAttempts; attempt++ {
-			time.Sleep(time.Duration(attempt) * 200 * time.Millisecond)
+		// A malformed message is a permanent condition: skip the retries.
+		isMalformed := errors.Is(err, consumer.ErrMalformedEvent)
+		for attempt := 1; err != nil && !isMalformed && attempt < dlqRetryAttempts; attempt++ {
+			time.Sleep(time.Duration(attempt) * r.backoff())
 			err = r.handler.Handle(spanCtx, eventID, msg.Value)
 		}
 		if err != nil {
@@ -163,7 +200,11 @@ func (r *Runner) Run(ctx context.Context) {
 			// it uncommitted is NOT safe here (a later message's commit
 			// would silently drop it anyway).
 			if dlqErr := r.publishToDLQ(ctx, msg, err); dlqErr != nil {
-				r.metrics.MessagesConsumedTotal.WithLabelValues(r.topic, "store_error").Inc()
+				outcome := "store_error"
+				if isMalformed {
+					outcome = "malformed_dlq_failed"
+				}
+				r.metrics.MessagesConsumedTotal.WithLabelValues(r.topic, outcome).Inc()
 				r.log.Error("handler failed and DLQ publish also failed — not committing offset, a restart will retry",
 					zap.String("event_id", eventID),
 					zap.Int64("offset", msg.Offset),
@@ -172,8 +213,12 @@ func (r *Runner) Run(ctx context.Context) {
 				)
 				continue
 			}
-			r.metrics.MessagesConsumedTotal.WithLabelValues(r.topic, "dead_lettered").Inc()
-			r.log.Error("handler failed after retries — dead-lettered and committing to unblock the partition",
+			if isMalformed {
+				r.metrics.MessagesConsumedTotal.WithLabelValues(r.topic, "malformed_dead_lettered").Inc()
+			} else {
+				r.metrics.MessagesConsumedTotal.WithLabelValues(r.topic, "dead_lettered").Inc()
+			}
+			r.log.Error("message dead-lettered and committing to unblock the partition",
 				zap.String("event_id", eventID),
 				zap.Int64("offset", msg.Offset),
 				zap.Error(err),
@@ -182,7 +227,8 @@ func (r *Runner) Run(ctx context.Context) {
 			r.metrics.MessagesConsumedTotal.WithLabelValues(r.topic, "ok").Inc()
 		}
 
-		// Commit after successful handling (or validated-rejection).
+		// Commit after successful handling, or after the message has been
+		// dead-lettered (malformed or retry-exhausted).
 		// CommitMessages is a synchronous, exactly-once commit for the
 		// consumer group.
 		if err := r.reader.CommitMessages(ctx, msg); err != nil {

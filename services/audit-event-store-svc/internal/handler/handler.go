@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/url"
 	"strconv"
 	"time"
 
@@ -65,17 +66,24 @@ func New(s Store, az AuthzChecker, log *zap.Logger) *Handler {
 	return &Handler{store: s, authz: az, log: log}
 }
 
-// requirePrincipal reads the caller's identity from the already-validated
-// envelope (X-Principal-Id, checked for presence by svcenvelope.Middleware
-// upstream) and refuses the request if it is absent.
+// requirePrincipal establishes the caller's principal from X-Principal-Id and
+// refuses the request (401) if it is absent.
+//
+// Only the principal identity counts. envelope.Actor() would also return the
+// workload id (X-Workload-Id) when no principal is present, which is right for
+// service-to-service plumbing elsewhere in the platform but is NOT what this
+// service's contract says: every route requires X-Principal-Id, and an
+// authorization grant is checked for that principal. A request carrying only a
+// workload id therefore gets 401 here instead of being authorized as if the
+// workload id were a principal.
+//
+// The envelope's parsed actor_subject_id is the same X-Principal-Id header
+// (svcenvelope.Middleware in the real server); the direct header read covers the
+// unit tests, which mount a bare router with no envelope middleware.
 func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
 	e, _ := envelope.FromContext(r.Context())
-	principalID := e.Actor()
+	principalID := e.ActorSubjectID
 	if principalID == "" {
-		// Mirrors listEvents' own tenantID fallback: envelope context first
-		// (set by svcenvelope.Middleware in the real server), direct header
-		// read otherwise (unit tests mount a bare router with no envelope
-		// middleware, same as every existing test in this package).
 		principalID = r.Header.Get(envelope.HeaderActorSubjectID)
 	}
 	if principalID == "" {
@@ -83,6 +91,31 @@ func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (stri
 		return "", false
 	}
 	return principalID, true
+}
+
+// requireTenant resolves the caller's tenant from the already-validated
+// envelope (X-Tenant-Id, set by gateway-auth-svc from the signed identity
+// envelope) and refuses the request when it is absent.
+//
+// Tenant scope is mandatory on every route — the audit doc's §2 "Segregation
+// of Duties & Auth" states "X-Tenant-Id mandatory on all queries (401 if
+// missing)". A missing tenant is an authentication failure, not a validation
+// error (INV-01: "Every authenticated operation resolves exactly one tenant
+// context before data access"), so this is 401 — matching the canonical
+// envelope's own StatusFor — not the 400 this service previously returned.
+// The tenant is taken only from server-established sources (envelope, then the
+// header); a caller-supplied query parameter is not treated as tenant authority.
+func (h *Handler) requireTenant(w http.ResponseWriter, r *http.Request) (string, bool) {
+	e, _ := envelope.FromContext(r.Context())
+	tenantID := e.TenantID
+	if tenantID == "" {
+		tenantID = r.Header.Get(envelope.HeaderTenantID)
+	}
+	if tenantID == "" {
+		writeError(w, http.StatusUnauthorized, "tenant_required", "X-Tenant-Id header is required")
+		return "", false
+	}
+	return tenantID, true
 }
 
 // authorize checks principalID against authorization-svc for actionType,
@@ -124,64 +157,15 @@ func (h *Handler) listEvents(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
-	e, _ := envelope.FromContext(ctx)
-
-	tenantID := e.TenantID
-	if tenantID == "" {
-		tenantID = r.Header.Get("X-Tenant-Id")
-	}
-	if tenantID == "" {
-		tenantID = r.URL.Query().Get("tenant_id")
-	}
-	if tenantID == "" {
-		writeError(w, http.StatusBadRequest, "tenant_required", "X-Tenant-Id header is required")
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
 		return
 	}
 
-	q := r.URL.Query()
-	params := domain.QueryEventsParams{
-		TenantID:      tenantID,
-		LegalEntityID: q.Get("entity"),
-		PrincipalID:   q.Get("actor"),
-		EventType:     q.Get("action"),
-		CorrelationID: q.Get("workflow"),
-		Limit:         50,
-		Offset:        0,
-	}
-
-	if params.LegalEntityID == "" {
-		params.LegalEntityID = q.Get("legal_entity_id")
-	}
-	if params.PrincipalID == "" {
-		params.PrincipalID = q.Get("principal_id")
-	}
-	if params.EventType == "" {
-		params.EventType = q.Get("event_type")
-	}
-	if params.CorrelationID == "" {
-		params.CorrelationID = q.Get("correlation_id")
-	}
-
-	if limitStr := q.Get("limit"); limitStr != "" {
-		if l, err := strconv.Atoi(limitStr); err == nil && l > 0 {
-			params.Limit = l
-		}
-	}
-	if offsetStr := q.Get("offset"); offsetStr != "" {
-		if o, err := strconv.Atoi(offsetStr); err == nil && o >= 0 {
-			params.Offset = o
-		}
-	}
-
-	if fromStr := q.Get("from"); fromStr != "" {
-		if t, err := time.Parse(time.RFC3339, fromStr); err == nil {
-			params.FromTime = &t
-		}
-	}
-	if toStr := q.Get("to"); toStr != "" {
-		if t, err := time.Parse(time.RFC3339, toStr); err == nil {
-			params.ToTime = &t
-		}
+	params, perr := buildQueryParams(tenantID, r.URL.Query())
+	if perr != nil {
+		writeError(w, http.StatusBadRequest, perr.code, perr.message)
+		return
 	}
 
 	result, err := h.store.QueryEvents(ctx, params)
@@ -192,6 +176,79 @@ func (h *Handler) listEvents(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, result)
+}
+
+// queryParamError is a malformed GET /v1/events query parameter. It is reported
+// as 400 — a malformed filter is never silently dropped, because that would
+// answer a narrower question with a broader (unfiltered) result.
+type queryParamError struct {
+	code    string
+	message string
+}
+
+// maxQueryLimit is the page-size ceiling (enforced again in the store). A limit
+// above it is clamped, not rejected; the documented maximum page is 200 events.
+const maxQueryLimit = 200
+
+// buildQueryParams parses and validates the GET /v1/events query string.
+// Accepted: actor|principal_id, entity|legal_entity_id, action|event_type,
+// workflow|correlation_id, from, to (RFC 3339), limit (integer >= 1), offset
+// (integer >= 0). An empty value is the same as an absent one.
+func buildQueryParams(tenantID string, q url.Values) (domain.QueryEventsParams, *queryParamError) {
+	params := domain.QueryEventsParams{
+		TenantID:      tenantID,
+		LegalEntityID: firstNonEmpty(q.Get("entity"), q.Get("legal_entity_id")),
+		PrincipalID:   firstNonEmpty(q.Get("actor"), q.Get("principal_id")),
+		EventType:     firstNonEmpty(q.Get("action"), q.Get("event_type")),
+		CorrelationID: firstNonEmpty(q.Get("workflow"), q.Get("correlation_id")),
+		Limit:         50,
+		Offset:        0,
+	}
+
+	if raw := q.Get("limit"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 {
+			return params, &queryParamError{"invalid_limit", "limit must be an integer >= 1"}
+		}
+		if n > maxQueryLimit {
+			n = maxQueryLimit
+		}
+		params.Limit = n
+	}
+	if raw := q.Get("offset"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 0 {
+			return params, &queryParamError{"invalid_offset", "offset must be an integer >= 0"}
+		}
+		params.Offset = n
+	}
+	if raw := q.Get("from"); raw != "" {
+		ts, err := time.Parse(time.RFC3339, raw)
+		if err != nil {
+			return params, &queryParamError{"invalid_from", "from must be an RFC 3339 timestamp, e.g. 2026-01-02T15:04:05Z"}
+		}
+		params.FromTime = &ts
+	}
+	if raw := q.Get("to"); raw != "" {
+		ts, err := time.Parse(time.RFC3339, raw)
+		if err != nil {
+			return params, &queryParamError{"invalid_to", "to must be an RFC 3339 timestamp, e.g. 2026-01-02T15:04:05Z"}
+		}
+		params.ToTime = &ts
+	}
+	if params.FromTime != nil && params.ToTime != nil && params.FromTime.After(*params.ToTime) {
+		return params, &queryParamError{"invalid_range", "from must not be after to"}
+	}
+	return params, nil
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 type verifyChainResponse struct {
@@ -207,6 +264,9 @@ func (h *Handler) verifyEventsChain(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !h.authorize(w, r, principalID, AuditEventRead) {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
 		return
 	}
 
@@ -237,6 +297,10 @@ func (h *Handler) createArchive(w http.ResponseWriter, r *http.Request) {
 	if !h.authorize(w, r, principalID, AuditArchiveManage) {
 		return
 	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
 
 	var req createArchiveRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -246,6 +310,7 @@ func (h *Handler) createArchive(w http.ResponseWriter, r *http.Request) {
 	a, err := h.store.CreateArchive(r.Context(), domain.CreateArchiveParams{
 		FromSequence:         req.FromSequence,
 		ToSequence:           req.ToSequence,
+		TenantID:             tenantID,
 		CreatedByPrincipalID: principalID,
 	})
 	if err != nil {
@@ -263,8 +328,12 @@ func (h *Handler) getArchive(w http.ResponseWriter, r *http.Request) {
 	if !h.authorize(w, r, principalID, AuditArchiveManage) {
 		return
 	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
 
-	a, err := h.store.GetArchive(r.Context(), chi.URLParam(r, "id"))
+	a, err := h.store.GetArchive(r.Context(), chi.URLParam(r, "id"), tenantID)
 	if err != nil {
 		writeStoreError(w, err)
 		return
@@ -280,9 +349,14 @@ func (h *Handler) verifyArchive(w http.ResponseWriter, r *http.Request) {
 	if !h.authorize(w, r, principalID, AuditArchiveManage) {
 		return
 	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
 
 	v, err := h.store.VerifyArchive(r.Context(), domain.VerifyArchiveParams{
 		ArchiveID:             chi.URLParam(r, "id"),
+		TenantID:              tenantID,
 		VerifiedByPrincipalID: principalID,
 	})
 	if err != nil {
@@ -300,8 +374,12 @@ func (h *Handler) listVerifications(w http.ResponseWriter, r *http.Request) {
 	if !h.authorize(w, r, principalID, AuditArchiveManage) {
 		return
 	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
 
-	list, err := h.store.ListVerifications(r.Context(), chi.URLParam(r, "id"))
+	list, err := h.store.ListVerifications(r.Context(), chi.URLParam(r, "id"), tenantID)
 	if err != nil {
 		writeStoreError(w, err)
 		return
@@ -311,6 +389,10 @@ func (h *Handler) listVerifications(w http.ResponseWriter, r *http.Request) {
 
 func writeStoreError(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, domain.ErrTenantRequired):
+		// INV-01: missing tenant context is an authentication failure (401),
+		// consistent with requireTenant.
+		writeError(w, http.StatusUnauthorized, "tenant_required", err.Error())
 	case errors.Is(err, domain.ErrArchiveNotFound):
 		writeError(w, http.StatusNotFound, "archive_not_found", err.Error())
 	case errors.Is(err, domain.ErrInvalidRange):

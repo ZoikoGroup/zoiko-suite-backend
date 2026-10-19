@@ -75,7 +75,13 @@ type Store interface {
 	ActivateActivity(ctx context.Context, activityID, versionID, principalID, correlationID string) (*domain.ProcessingActivityVersion, error)
 
 	GetIdempotency(ctx context.Context, tenantID, principalID, key string) (*domain.IdempotencyRecord, error)
-	SaveIdempotency(ctx context.Context, record domain.IdempotencyRecord) error
+	// RunIdempotent claims the idempotency key, runs fn and stores the
+	// replayable response in ONE transaction: every store call fn makes joins
+	// that transaction (see withTenant), so the change, its audit row, its
+	// outbox event and the idempotency record commit together or not at all,
+	// and concurrent identical requests execute exactly once. When the key
+	// was already claimed it runs nothing and returns the stored record.
+	RunIdempotent(ctx context.Context, claim domain.IdempotencyRecord, fn func(ctx context.Context) (status int, payload any, err error)) (existing *domain.IdempotencyRecord, status int, payload any, err error)
 }
 
 type PgStore struct {
@@ -98,7 +104,15 @@ func NewPgStore(pool *pgxpool.Pool, log *zap.Logger) *PgStore {
 // The write policies of migration 000006 require a matching tenant OR the
 // platform capability, so a request with no tenant context can write
 // nothing, and a platform context can write no tenant's row.
+// ambientTxKey carries the transaction opened by RunIdempotent so the store
+// calls made inside it join it instead of opening their own. The RLS session
+// variables are identical (same request context), so they are already set.
+type ambientTxKey struct{}
+
 func (s *PgStore) withTenant(ctx context.Context, fn func(pgx.Tx) error) error {
+	if tx, ok := ctx.Value(ambientTxKey{}).(pgx.Tx); ok {
+		return fn(tx) // commit/rollback belongs to RunIdempotent
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -679,6 +693,48 @@ func (s *PgStore) FindActivityVersion(ctx context.Context, activityID, versionID
 	return version, nil
 }
 
+// statusAt is the version's status at the requested instants, so a version
+// that is SUSPENDED today is not reported as suspended for an instant before the
+// suspension (or after a resume). Suspend and resume are recorded as SUSPEND /
+// RESUME rows in the append-only activity_lifecycle_audit; the service stamps
+// recorded_at itself, so it is both the valid-time and the knowledge-time of
+// the change and a suspension counts only when recorded_at <= as_of AND
+// recorded_at <= known_as_of. Intervals are half-open: a version is SUSPENDED
+// from its suspend instant up to (excluding) its resume instant.
+//
+//   - Both instants at or after the database clock ("what is true now"): the
+//     stored status, so current reads are unchanged.
+//   - Otherwise the last SUSPEND/RESUME at or before both instants decides;
+//     with none, the version was ACTIVE then (it governs only inside
+//     [effective_from, effective_to)).
+//   - A SUSPENDED version with no lifecycle row at all (suspended before the
+//     audit table existed) cannot be time-sliced and stays SUSPENDED.
+func (s *PgStore) statusAt(ctx context.Context, tx pgx.Tx, v *domain.ProcessingActivityVersion, asOf, knownAsOf time.Time) (domain.ActivityVersionStatus, error) {
+	var status string
+	err := tx.QueryRow(ctx, `
+		SELECT CASE
+		  WHEN $2 >= NOW() AND $3 >= NOW() AND $4 <> 'RETIRED' THEN $4
+		  ELSE COALESCE(
+		    (SELECT CASE action WHEN 'SUSPEND' THEN 'SUSPENDED' ELSE 'ACTIVE' END
+		       FROM activity_lifecycle_audit
+		      WHERE activity_version_id = $1
+		        AND action IN ('SUSPEND', 'RESUME')
+		        AND recorded_at <= $2 AND recorded_at <= $3
+		      ORDER BY recorded_at DESC
+		      LIMIT 1),
+		    CASE WHEN $4 = 'SUSPENDED'
+		          AND NOT EXISTS (SELECT 1 FROM activity_lifecycle_audit
+		                           WHERE activity_version_id = $1 AND action IN ('SUSPEND', 'RESUME'))
+		         THEN 'SUSPENDED' ELSE 'ACTIVE' END)
+		END`,
+		v.ActivityVersionID, asOf, knownAsOf, string(v.VersionStatus),
+	).Scan(&status)
+	if err != nil {
+		return "", err
+	}
+	return domain.ActivityVersionStatus(status), nil
+}
+
 func (s *PgStore) ResolveActivityAsOf(ctx context.Context, activityID string, asOf, knownAsOf time.Time) (*domain.ProcessingActivityVersion, error) {
 	var version *domain.ProcessingActivityVersion
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
@@ -696,6 +752,10 @@ func (s *PgStore) ResolveActivityAsOf(ctx context.Context, activityID string, as
 			LIMIT 1`,
 			activityID, asOf, knownAsOf,
 		))
+		if err != nil {
+			return err
+		}
+		version.VersionStatus, err = s.statusAt(ctx, tx, version, asOf, knownAsOf)
 		return err
 	})
 	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
@@ -1193,21 +1253,67 @@ func (s *PgStore) GetIdempotency(ctx context.Context, tenantID, principalID, key
 	return &rec, nil
 }
 
-func (s *PgStore) SaveIdempotency(ctx context.Context, record domain.IdempotencyRecord) error {
+var errReplay = errors.New("idempotent replay")
+
+func (s *PgStore) RunIdempotent(ctx context.Context, claim domain.IdempotencyRecord, fn func(ctx context.Context) (int, any, error)) (*domain.IdempotencyRecord, int, any, error) {
+	var existing *domain.IdempotencyRecord
+	var status int
+	var payload any
+	var opErr error
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `
+		tag, err := tx.Exec(ctx, `
 			INSERT INTO purpose_registry_idempotency_keys
 				(idempotency_key, tenant_id, principal_id, operation, request_hash, response_status, response_body, created_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+			VALUES ($1, $2, $3, $4, $5, 0, 'null'::jsonb, NOW())
 			ON CONFLICT (COALESCE(tenant_id, '00000000-0000-0000-0000-000000000000'::uuid), principal_id, idempotency_key)
 			DO NOTHING`,
-			record.IdempotencyKey, record.TenantID, record.PrincipalID, record.Operation, record.RequestHash, record.ResponseStatus, record.ResponseBody,
-		)
-		return err
+			claim.IdempotencyKey, claim.TenantID, claim.PrincipalID, claim.Operation, claim.RequestHash)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			var rec domain.IdempotencyRecord
+			var tID *string
+			if err := tx.QueryRow(ctx, `
+				SELECT idempotency_key, tenant_id, principal_id, operation, request_hash, response_status, response_body, created_at
+				FROM purpose_registry_idempotency_keys
+				WHERE COALESCE(tenant_id, '00000000-0000-0000-0000-000000000000'::uuid) = COALESCE($1::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
+				  AND principal_id = $2 AND idempotency_key = $3`,
+				claim.TenantID, claim.PrincipalID, claim.IdempotencyKey,
+			).Scan(&rec.IdempotencyKey, &tID, &rec.PrincipalID, &rec.Operation, &rec.RequestHash, &rec.ResponseStatus, &rec.ResponseBody, &rec.CreatedAt); err != nil {
+				return err
+			}
+			existing = &rec
+			return errReplay
+		}
+		st, v, err := fn(context.WithValue(ctx, ambientTxKey{}, tx))
+		if err != nil {
+			opErr = err
+			return err // roll back the claim and every change made by fn
+		}
+		body, err := json.Marshal(v)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE purpose_registry_idempotency_keys SET response_status = $1, response_body = $2
+			WHERE COALESCE(tenant_id, '00000000-0000-0000-0000-000000000000'::uuid) = COALESCE($3::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
+			  AND principal_id = $4 AND idempotency_key = $5`,
+			st, body, claim.TenantID, claim.PrincipalID, claim.IdempotencyKey); err != nil {
+			return err
+		}
+		status, payload = st, v
+		return nil
 	})
-	if err != nil {
-		s.log.Error("pg SaveIdempotency failed", zap.Error(err))
-		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	switch {
+	case errors.Is(err, errReplay):
+		return existing, 0, nil, nil
+	case err == nil:
+		return nil, status, payload, nil
+	case opErr != nil:
+		return nil, 0, nil, opErr // a domain error the handler maps (404/409/…)
+	default:
+		s.log.Error("pg RunIdempotent failed", zap.Error(err))
+		return nil, 0, nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
-	return nil
 }

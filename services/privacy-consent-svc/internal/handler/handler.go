@@ -1,4 +1,21 @@
 // Package handler exposes privacy-consent-svc's REST API — PRV-02.
+//
+// Every mutating route runs the same pre-flight, in this order:
+//
+//  1. X-Principal-Id          -> 401 AUTHENTICATION_FAILED
+//  2. X-Tenant-Id             -> 401 TENANT_SCOPE_REQUIRED
+//  3. X-Correlation-ID        -> 400 CORRELATION_ID_REQUIRED
+//  4. authorization-svc grant on the caller's verified tenant -> 403 / 503 (fail closed)
+//  5. Idempotency-Key         -> 400 IDEMPOTENCY_KEY_REQUIRED, then the replay lookup
+//     (a lookup failure refuses the request, 503)
+//  6. body parsing and validation -> 400 / 422
+//  7. resolve the resource -> 404
+//
+// Body validation therefore never precedes authentication or authorization,
+// and authorization precedes every lookup, so an unauthorized caller cannot
+// probe which ids exist and a replayed key can never bypass authorization.
+// Reads run principal -> tenant -> authorization -> parameter validation ->
+// lookup.
 package handler
 
 import (
@@ -34,48 +51,37 @@ const (
 	// to invalidate ANY subject's grant on the platform's own initiative.
 	PrivacyConsentInvalidate = "PRIVACY_CONSENT_INVALIDATE"
 	PrivacyPreferenceSet     = "PRIVACY_PREFERENCE_SET"
-	// PrivacyNoticePresentationRecord gates recordPresentationInternal —
-	// distinct from the four PrivacyNotice* lifecycle actions above, which
-	// govern the notice's own draft/approve/publish/withdraw state.
-	// Recording a presentation receipt is a separate capability: it is
-	// evidence that a notice version was actually shown to a subject, not
-	// a change to the notice itself.
+	// PrivacyNoticePresentationRecord gates recording a presentation receipt:
+	// evidence that a notice version was shown to a subject, not a change to
+	// the notice itself.
 	PrivacyNoticePresentationRecord = "PRIVACY_NOTICE_PRESENTATION_RECORD"
 
 	// PrivacyConsentRead/PrivacyPreferenceRead gate the two reads that
-	// answer "what did this subject assert". They used to require no
-	// principal and no authorization at all — any caller who could reach
-	// the service (the port is published directly in local compose) and
-	// set an arbitrary X-Tenant-Id header could read any tenant's subject
-	// consent/preference state. GetNotice stays ungated: a published
-	// notice is, by its own documented purpose, content meant to be shown
-	// to the subject before any session exists — but it is still tenant-
-	// scoped, see requireTenant on GetNotice.
+	// answer "what did this subject assert". GetNotice stays ungated: a
+	// published notice is, by its own documented purpose, content meant to
+	// be shown to the subject before any session exists — but it is still
+	// tenant-scoped.
 	PrivacyConsentRead    = "PRIVACY_CONSENT_READ"
 	PrivacyPreferenceRead = "PRIVACY_PREFERENCE_READ"
 )
 
 const platformScopeID = "00000000-0000-0000-0000-00000000f001"
 
+const maxBodyBytes = 1 << 20
+
 type AuthzChecker interface {
 	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
 }
 
-// PurposeChecker is the real cross-service dependency on PRV-01 — see
-// internal/purposeregistry's package doc comment for why this can't be a
-// trusted opaque string.
+// PurposeChecker is the real cross-service dependency on PRV-01. The caller's
+// verified principal is forwarded so PRV-01 can authenticate and authorize
+// the read (the grant itself is provisioned in authorization-svc).
 type PurposeChecker interface {
-	IsPublished(ctx context.Context, tenantID, purposeID string) (bool, error)
+	IsPublished(ctx context.Context, tenantID, principalID, purposeID string) (bool, error)
 }
 
-// Handler no longer holds an events.Publisher. Every event this service
-// produces (privacy.notice.published, privacy.consent.changed) is now
-// enqueued by the STORE, inside the same transaction as the evidence row
-// it reports (internal/outbox) — see RecordConsent/WithdrawConsent/
-// InvalidateConsent/publishNoticeVersionInternal's own comments for why
-// the old post-commit, fire-and-forget publish call here was the gap:
-// a crash or a broker outage between "the write committed" and "Kafka got
-// it" lost the event with no trace and no retry.
+// Handler holds no event publisher: every event is enqueued by the STORE,
+// inside the same transaction as the evidence row it reports (internal/outbox).
 type Handler struct {
 	store    store.Store
 	authz    AuthzChecker
@@ -121,7 +127,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	})
 }
 
-// ── helpers ──────────────────────────────────────────────────────────────────
+// ── responses ────────────────────────────────────────────────────────────────
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
@@ -129,17 +135,13 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-// errorResponse carries the stable §32-style ErrorCode on every refusal —
-// previously every error from this service was an untyped
-// {"error": "..."} string, so a caller could only branch on prose.
+// errorResponse carries the stable §32-style ErrorCode on every refusal.
 type errorResponse struct {
 	Error     string `json:"error"`
 	ErrorCode string `json:"error_code,omitempty"`
 }
 
-// writeError is kept for call sites that have not been given a specific
-// code yet; it falls back to the status-derived default. New code should
-// prefer writeCoded.
+// writeError falls back to the status-derived default code.
 func writeError(w http.ResponseWriter, status int, msg string) {
 	writeCoded(w, status, codeForStatus(status), msg)
 }
@@ -148,8 +150,7 @@ func writeCoded(w http.ResponseWriter, status int, code, msg string) {
 	writeJSON(w, status, errorResponse{Error: msg, ErrorCode: code})
 }
 
-// codeForStatus is the fallback when no more specific code applies — still
-// typed and stable, just coarser than a dedicated code.
+// codeForStatus is the fallback when no more specific code applies.
 func codeForStatus(status int) string {
 	switch status {
 	case http.StatusNotFound:
@@ -171,91 +172,10 @@ func codeForStatus(status int) string {
 	}
 }
 
-func hashBody(b []byte) string {
-	sum := sha256.Sum256(b)
-	return hex.EncodeToString(sum[:])
-}
-
-// checkIdempotency enforces §18.1: "All mutating APIs require ... an
-// idempotency key." A missing header used to be treated as "proceed
-// without replay protection"; it is now a 400, the same posture
-// privacy-purpose-registry-svc and tenant-entity-registry-svc already
-// take. Every existing call site already does `if handled { return }`
-// immediately after calling this, so the mandatory check needed no change
-// to any of them beyond this function.
-func (h *Handler) checkIdempotency(w http.ResponseWriter, r *http.Request, tenantID, principalID string, body []byte) (*domain.IdempotencyRecord, bool, string, string) {
-	key := r.Header.Get("Idempotency-Key")
-	if key == "" {
-		writeCoded(w, http.StatusBadRequest, domain.ErrCodeIdempotencyRequired, domain.ErrIdempotencyKeyRequired.Error())
-		return nil, true, "", ""
-	}
-	reqHash := hashBody(body)
-	existing, err := h.store.GetIdempotency(r.Context(), tenantID, key)
-	if err != nil {
-		// Fail CLOSED. Carrying on without the lookup would execute a request
-		// that may be a replay with no replay protection at all — exactly what
-		// the mandatory key exists to prevent.
-		h.log.Error("idempotency lookup failed — refusing the request", zap.Error(err))
-		writeCoded(w, http.StatusServiceUnavailable, domain.ErrCodeStoreUnavailable, "idempotency store unavailable")
-		return nil, true, key, reqHash
-	}
-	if existing != nil {
-		if existing.RequestHash != reqHash {
-			writeCoded(w, http.StatusConflict, domain.ErrCodeIdempotencyMismatch, domain.ErrIdempotencyConflict.Error())
-			return existing, true, key, reqHash
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Idempotency-Replay", "true")
-		w.WriteHeader(existing.ResponseCode)
-		_, _ = w.Write(existing.ResponseBody)
-		return existing, true, key, reqHash
-	}
-	return nil, false, key, reqHash
-}
-
-func (h *Handler) writeJSONWithIdempotency(ctx context.Context, w http.ResponseWriter, tenantID, principalID, endpoint, key, reqHash string, status int, v interface{}) {
-	body, err := json.Marshal(v)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to marshal response")
-		return
-	}
-	if key != "" {
-		if err := h.store.SaveIdempotency(ctx, domain.IdempotencyRecord{
-			Key:          key,
-			TenantID:     tenantID,
-			Endpoint:     endpoint,
-			RequestHash:  reqHash,
-			ResponseCode: status,
-			ResponseBody: body,
-			CreatedAt:    time.Now().UTC(),
-		}); err != nil {
-			// The operation has ALREADY COMMITTED. Reporting success would
-			// leave a client that retries after a network error unprotected;
-			// hiding it would be worse. So the failure is surfaced, with the
-			// committed result attached so the caller can recover without
-			// repeating the operation.
-			h.log.Error("idempotency record not saved after commit", zap.String("endpoint", endpoint), zap.Error(err))
-			writeJSON(w, http.StatusInternalServerError, struct {
-				Error     string          `json:"error"`
-				ErrorCode string          `json:"error_code"`
-				Committed bool            `json:"committed"`
-				Result    json.RawMessage `json:"result"`
-			}{
-				Error:     "the operation was committed but its idempotency record could not be saved; a retry with the same Idempotency-Key will not be recognised as a replay",
-				ErrorCode: domain.ErrCodeIdempotencyNotRecorded,
-				Committed: true,
-				Result:    body,
-			})
-			return
-		}
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_, _ = w.Write(body)
-}
+// ── pre-flight ───────────────────────────────────────────────────────────────
 
 func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
-	principalID := r.Header.Get("X-Principal-Id")
+	principalID := strings.TrimSpace(r.Header.Get("X-Principal-Id"))
 	if principalID == "" {
 		writeCoded(w, http.StatusUnauthorized, domain.ErrCodeAuthenticationFailed, domain.ErrIdentityMissing.Error())
 		return "", false
@@ -263,18 +183,11 @@ func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (stri
 	return principalID, true
 }
 
-// requireTenant returns the caller's verified tenant, or refuses. §18.1
-// requires tenant scope to be server-validated on every mutating API; it
-// used to be read and, if absent, simply treated as "platform scope" —
-// which meant a caller who sent no X-Tenant-Id at all could create a
-// platform-wide notice, record a platform-wide consent, or set a
-// platform-wide preference with nothing to stop them. A genuinely
-// platform-wide record (Notice.TenantID nil, "Zoiko as independent
-// controller") is still representable — see the sentinel constant below —
-// but it must now be asked for explicitly via X-Tenant-Id, never produced
-// by omission.
+// requireTenant returns the caller's verified tenant, or refuses. A request
+// with no X-Tenant-Id is never treated as platform scope; the platform plane
+// must be asked for explicitly with the sentinel id.
 func (h *Handler) requireTenant(w http.ResponseWriter, r *http.Request) (string, bool) {
-	tenantID := svcmiddleware.TenantFromContext(r.Context())
+	tenantID := strings.TrimSpace(svcmiddleware.TenantFromContext(r.Context()))
 	if tenantID == "" {
 		writeCoded(w, http.StatusUnauthorized, domain.ErrCodeTenantScopeRequired, domain.ErrTenantScopeRequired.Error())
 		return "", false
@@ -282,11 +195,6 @@ func (h *Handler) requireTenant(w http.ResponseWriter, r *http.Request) (string,
 	return tenantID, true
 }
 
-// requireCorrelationID enforces §18.1's "correlation ID" requirement on
-// mutating APIs. It used to be read opportunistically (used if present,
-// silently absent otherwise), which left every write's downstream event
-// untraceable to the request that caused it whenever a caller omitted the
-// header.
 func (h *Handler) requireCorrelationID(w http.ResponseWriter, r *http.Request) (string, bool) {
 	id := strings.TrimSpace(r.Header.Get("X-Correlation-ID"))
 	if id == "" {
@@ -313,6 +221,129 @@ func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID,
 	return true
 }
 
+// callContext is the verified identity of one request plus its idempotency
+// claim (mutating routes).
+type callContext struct {
+	Principal   string
+	Tenant      string
+	Correlation string
+	Key         string
+	Hash        string
+	Body        []byte
+}
+
+func requestHash(r *http.Request, body []byte) string {
+	h := sha256.New()
+	h.Write([]byte(r.Method))
+	h.Write([]byte{0})
+	h.Write([]byte(r.URL.Path))
+	h.Write([]byte{0})
+	h.Write(body)
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// begin runs pre-flight steps 1-5 for a mutating route and reads (but does not
+// parse) the body. handled=false/ok=false means a response was written —
+// including the replay of an already-seen key.
+func (h *Handler) begin(w http.ResponseWriter, r *http.Request, actionType string) (*callContext, bool) {
+	principal, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return nil, false
+	}
+	tenant, ok := h.requireTenant(w, r)
+	if !ok {
+		return nil, false
+	}
+	corr, ok := h.requireCorrelationID(w, r)
+	if !ok {
+		return nil, false
+	}
+	if !h.authorize(w, r, principal, tenant, actionType) {
+		return nil, false
+	}
+
+	key := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	if key == "" {
+		writeCoded(w, http.StatusBadRequest, domain.ErrCodeIdempotencyRequired, domain.ErrIdempotencyKeyRequired.Error())
+		return nil, false
+	}
+	var body []byte
+	if r.Body != nil {
+		b, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "failed to read request body")
+			return nil, false
+		}
+		body = b
+	}
+	cc := &callContext{Principal: principal, Tenant: tenant, Correlation: corr, Key: key, Hash: requestHash(r, body), Body: body}
+
+	// Replay lookup. Fail CLOSED: carrying on without it would execute a
+	// request that may be a replay.
+	existing, err := h.store.GetIdempotency(r.Context(), tenant, principal, key)
+	if err != nil {
+		h.log.Error("idempotency lookup failed — refusing the request", zap.Error(err))
+		writeCoded(w, http.StatusServiceUnavailable, domain.ErrCodeStoreUnavailable, "idempotency store unavailable")
+		return nil, false
+	}
+	if existing != nil {
+		writeReplay(w, existing, cc.Hash)
+		return nil, false
+	}
+	return cc, true
+}
+
+// writeReplay returns the stored original response, or 409 when the key was
+// used with a different request.
+func writeReplay(w http.ResponseWriter, existing *domain.IdempotencyRecord, hash string) {
+	if existing.RequestHash != hash {
+		writeCoded(w, http.StatusConflict, domain.ErrCodeIdempotencyMismatch, domain.ErrIdempotencyConflict.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Idempotency-Replay", "true")
+	w.WriteHeader(existing.ResponseCode)
+	_, _ = w.Write(existing.ResponseBody)
+}
+
+// execute runs op and the idempotency claim in ONE transaction: the claim, the
+// evidence row(s), the outbox event and the stored replay response all commit
+// or none does. Concurrent identical requests execute exactly once. When the
+// key was claimed meanwhile, the stored record is returned instead.
+func (h *Handler) execute(r *http.Request, cc *callContext, endpoint string, status int, op func(ctx context.Context) (any, error)) (payload any, existing *domain.IdempotencyRecord, err error) {
+	claim := domain.IdempotencyRecord{
+		Key: cc.Key, TenantID: cc.Tenant, PrincipalID: cc.Principal, Endpoint: endpoint, RequestHash: cc.Hash,
+	}
+	existing, _, payload, err = h.store.RunIdempotent(r.Context(), claim, func(ctx context.Context) (int, any, error) {
+		v, e := op(ctx)
+		return status, v, e
+	})
+	return payload, existing, err
+}
+
+// finish writes the first-execution response, or the replay when a concurrent
+// request won the claim.
+func (h *Handler) finish(w http.ResponseWriter, cc *callContext, existing *domain.IdempotencyRecord, status int, payload any) {
+	if existing != nil {
+		writeReplay(w, existing, cc.Hash)
+		return
+	}
+	b, err := json.Marshal(payload)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to marshal response")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, _ = w.Write(b)
+}
+
+// storeFailure maps an unexpected store error to 503.
+func (h *Handler) storeFailure(w http.ResponseWriter, op string, err error) {
+	h.log.Error(op+": store unavailable", zap.Error(err))
+	writeError(w, http.StatusServiceUnavailable, "store unavailable")
+}
+
 func parseAsOf(r *http.Request) time.Time {
 	raw := r.URL.Query().Get("as_of")
 	if raw == "" {
@@ -334,24 +365,30 @@ func (h *Handler) resolveLatestNoticeVersion(w http.ResponseWriter, r *http.Requ
 			writeError(w, http.StatusNotFound, "notice not found")
 			return nil, false
 		}
-		h.log.Error("resolveLatestNoticeVersion: lookup failed", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+		h.storeFailure(w, "resolveLatestNoticeVersion", err)
 		return nil, false
 	}
 	return latest, true
 }
 
+// scopeMismatch refuses a body tenant_id that disagrees with the verified one.
+func scopeMismatch(w http.ResponseWriter, bodyTenant, verified string) bool {
+	if bodyTenant != "" && bodyTenant != verified {
+		writeCoded(w, http.StatusForbidden, domain.ErrCodeTenantScopeMismatch, domain.ErrTenantScopeMismatch.Error())
+		return true
+	}
+	return false
+}
+
 // ── notices ──────────────────────────────────────────────────────────────────
 
 func (h *Handler) CreateNotice(w http.ResponseWriter, r *http.Request) {
-	bodyBytes, err := io.ReadAll(r.Body)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "failed to read request body")
+	cc, ok := h.begin(w, r, PrivacyNoticeCreate)
+	if !ok {
 		return
 	}
-
 	var req domain.CreateNoticeRequest
-	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+	if err := json.Unmarshal(cc.Body, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
@@ -359,52 +396,29 @@ func (h *Handler) CreateNotice(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "locale, audience and content_hash are required")
 		return
 	}
-
-	verifiedTenant, ok := h.requireTenant(w, r)
-	if !ok {
-		return
-	}
-	if req.TenantID != "" && req.TenantID != verifiedTenant {
-		writeCoded(w, http.StatusForbidden, domain.ErrCodeTenantScopeMismatch, domain.ErrTenantScopeMismatch.Error())
-		return
-	}
-	tenantID := verifiedTenant
-
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-	if !h.authorize(w, r, principalID, tenantID, PrivacyNoticeCreate) {
-		return
-	}
-	if _, ok := h.requireCorrelationID(w, r); !ok {
+	if scopeMismatch(w, req.TenantID, cc.Tenant) {
 		return
 	}
 
-	_, handled, idemKey, reqHash := h.checkIdempotency(w, r, tenantID, principalID, bodyBytes)
-	if handled {
-		return
-	}
-
-	_, version, err := h.store.CreateNotice(r.Context(), tenantID, req, principalID)
+	payload, existing, err := h.execute(r, cc, "CreateNotice", http.StatusCreated, func(ctx context.Context) (any, error) {
+		_, version, err := h.store.CreateNotice(ctx, cc.Tenant, req, cc.Principal)
+		return version, err
+	})
 	if err != nil {
-		h.log.Error("CreateNotice: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+		h.storeFailure(w, "CreateNotice", err)
 		return
 	}
-	h.writeJSONWithIdempotency(r.Context(), w, tenantID, principalID, "CreateNotice", idemKey, reqHash, http.StatusCreated, version)
+	h.finish(w, cc, existing, http.StatusCreated, payload)
 }
 
 func (h *Handler) CreateNoticeVersion(w http.ResponseWriter, r *http.Request) {
 	noticeID := chi.URLParam(r, "noticeID")
-	bodyBytes, err := io.ReadAll(r.Body)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "failed to read request body")
+	cc, ok := h.begin(w, r, PrivacyNoticeCreate)
+	if !ok {
 		return
 	}
-
 	var req domain.CreateNoticeVersionRequest
-	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+	if err := json.Unmarshal(cc.Body, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
@@ -413,74 +427,36 @@ func (h *Handler) CreateNoticeVersion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-	verifiedTenant, ok := h.requireTenant(w, r)
-	if !ok {
-		return
-	}
-	if !h.authorize(w, r, principalID, verifiedTenant, PrivacyNoticeCreate) {
-		return
-	}
-	if _, ok := h.requireCorrelationID(w, r); !ok {
-		return
-	}
-
-	_, handled, idemKey, reqHash := h.checkIdempotency(w, r, verifiedTenant, principalID, bodyBytes)
-	if handled {
-		return
-	}
-
-	version, err := h.store.CreateNoticeVersion(r.Context(), noticeID, req, principalID)
+	payload, existing, err := h.execute(r, cc, "CreateNoticeVersion", http.StatusCreated, func(ctx context.Context) (any, error) {
+		return h.store.CreateNoticeVersion(ctx, noticeID, req, cc.Principal)
+	})
 	if err != nil {
 		if errors.Is(err, domain.ErrNoticeVersionNotFound) {
 			writeError(w, http.StatusNotFound, "parent notice version not found")
 			return
 		}
-		h.log.Error("CreateNoticeVersion: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+		h.storeFailure(w, "CreateNoticeVersion", err)
 		return
 	}
-	h.writeJSONWithIdempotency(r.Context(), w, verifiedTenant, principalID, "CreateNoticeVersion", idemKey, reqHash, http.StatusCreated, version)
+	h.finish(w, cc, existing, http.StatusCreated, payload)
 }
 
 func (h *Handler) ApproveNoticeVersion(w http.ResponseWriter, r *http.Request) {
-	noticeID := chi.URLParam(r, "noticeID")
-	versionID := chi.URLParam(r, "versionID")
-	h.approveNoticeVersionInternal(w, r, noticeID, versionID)
+	h.approveNoticeVersionInternal(w, r, chi.URLParam(r, "noticeID"), chi.URLParam(r, "versionID"))
 }
 
 func (h *Handler) ApproveLatestNotice(w http.ResponseWriter, r *http.Request) {
-	// versionID "" = "the latest": resolved inside, only AFTER authentication
-	// and authorization, so an unauthorized caller learns nothing about whether
+	// versionID "" = "the latest": resolved only AFTER authentication and
+	// authorization, so an unauthorized caller learns nothing about whether
 	// the notice exists.
 	h.approveNoticeVersionInternal(w, r, chi.URLParam(r, "noticeID"), "")
 }
 
 func (h *Handler) approveNoticeVersionInternal(w http.ResponseWriter, r *http.Request, noticeID, versionID string) {
-	principalID, ok := h.requirePrincipal(w, r)
+	cc, ok := h.begin(w, r, PrivacyNoticeApprove)
 	if !ok {
 		return
 	}
-	verifiedTenant, ok := h.requireTenant(w, r)
-	if !ok {
-		return
-	}
-	if _, ok := h.requireCorrelationID(w, r); !ok {
-		return
-	}
-	if !h.authorize(w, r, principalID, verifiedTenant, PrivacyNoticeApprove) {
-		return
-	}
-
-	bodyBytes, _ := io.ReadAll(r.Body)
-	_, handled, idemKey, reqHash := h.checkIdempotency(w, r, verifiedTenant, principalID, bodyBytes)
-	if handled {
-		return
-	}
-
 	if versionID == "" {
 		latest, ok := h.resolveLatestNoticeVersion(w, r, noticeID)
 		if !ok {
@@ -494,34 +470,31 @@ func (h *Handler) approveNoticeVersionInternal(w http.ResponseWriter, r *http.Re
 			writeError(w, http.StatusNotFound, "notice version not found")
 			return
 		}
-		h.log.Error("ApproveNoticeVersion: lookup failed", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+		h.storeFailure(w, "ApproveNoticeVersion", err)
 		return
 	}
-
-	// Segregation of Duties (§18): Maker cannot self-approve own notice version
-	if existing.CreatedByPrincipalID == principalID {
+	// Segregation of Duties (§18): the maker cannot approve their own version.
+	if existing.CreatedByPrincipalID == cc.Principal {
 		writeCoded(w, http.StatusForbidden, domain.ErrCodeSoDDenied, "maker cannot approve own notice version (Segregation of Duties)")
 		return
 	}
 
-	version, err := h.store.ApproveNoticeVersion(r.Context(), noticeID, versionID, principalID)
+	payload, replay, err := h.execute(r, cc, "ApproveNoticeVersion", http.StatusOK, func(ctx context.Context) (any, error) {
+		return h.store.ApproveNoticeVersion(ctx, noticeID, versionID, cc.Principal)
+	})
 	if err != nil {
 		if errors.Is(err, domain.ErrInvalidNoticeTransition) {
 			writeError(w, http.StatusConflict, "version is not in the required DRAFT state")
 			return
 		}
-		h.log.Error("ApproveNoticeVersion: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+		h.storeFailure(w, "ApproveNoticeVersion", err)
 		return
 	}
-	h.writeJSONWithIdempotency(r.Context(), w, verifiedTenant, principalID, "ApproveNoticeVersion", idemKey, reqHash, http.StatusOK, version)
+	h.finish(w, cc, replay, http.StatusOK, payload)
 }
 
 func (h *Handler) PublishNoticeVersion(w http.ResponseWriter, r *http.Request) {
-	noticeID := chi.URLParam(r, "noticeID")
-	versionID := chi.URLParam(r, "versionID")
-	h.publishNoticeVersionInternal(w, r, noticeID, versionID)
+	h.publishNoticeVersionInternal(w, r, chi.URLParam(r, "noticeID"), chi.URLParam(r, "versionID"))
 }
 
 func (h *Handler) PublishLatestNotice(w http.ResponseWriter, r *http.Request) {
@@ -529,28 +502,10 @@ func (h *Handler) PublishLatestNotice(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) publishNoticeVersionInternal(w http.ResponseWriter, r *http.Request, noticeID, versionID string) {
-	principalID, ok := h.requirePrincipal(w, r)
+	cc, ok := h.begin(w, r, PrivacyNoticePublish)
 	if !ok {
 		return
 	}
-	verifiedTenant, ok := h.requireTenant(w, r)
-	if !ok {
-		return
-	}
-	correlationID, ok := h.requireCorrelationID(w, r)
-	if !ok {
-		return
-	}
-	if !h.authorize(w, r, principalID, verifiedTenant, PrivacyNoticePublish) {
-		return
-	}
-
-	bodyBytes, _ := io.ReadAll(r.Body)
-	_, handled, idemKey, reqHash := h.checkIdempotency(w, r, verifiedTenant, principalID, bodyBytes)
-	if handled {
-		return
-	}
-
 	if versionID == "" {
 		latest, ok := h.resolveLatestNoticeVersion(w, r, noticeID)
 		if !ok {
@@ -564,43 +519,38 @@ func (h *Handler) publishNoticeVersionInternal(w http.ResponseWriter, r *http.Re
 			writeError(w, http.StatusNotFound, "notice version not found")
 			return
 		}
-		h.log.Error("PublishNoticeVersion: lookup failed", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+		h.storeFailure(w, "PublishNoticeVersion", err)
 		return
 	}
-
-	// Segregation of Duties (§18): Maker cannot publish own notice version
-	if existing.CreatedByPrincipalID == principalID {
+	// Segregation of Duties (§18): the maker cannot publish their own version,
+	// and the approver cannot also publish it.
+	if existing.CreatedByPrincipalID == cc.Principal {
 		writeCoded(w, http.StatusForbidden, domain.ErrCodeSoDDenied, "maker cannot publish own notice version (Segregation of Duties)")
 		return
 	}
-	// Checker role separation: Approver cannot also publish
-	if existing.ApprovedByPrincipalID != nil && *existing.ApprovedByPrincipalID == principalID {
+	if existing.ApprovedByPrincipalID != nil && *existing.ApprovedByPrincipalID == cc.Principal {
 		writeCoded(w, http.StatusForbidden, domain.ErrCodeSoDDenied, "approver cannot also publish notice version (Segregation of Duties)")
 		return
 	}
 
-	// version_status/publisher evidence AND the privacy.notice.published
-	// event are written together, inside the store's own transaction — see
-	// PgStore.PublishNoticeVersion's doc comment.
-	version, err := h.store.PublishNoticeVersion(r.Context(), noticeID, versionID, principalID, correlationID)
+	// Publisher evidence AND the privacy.notice.published event are written
+	// together with the idempotency claim — one transaction.
+	payload, replay, err := h.execute(r, cc, "PublishNoticeVersion", http.StatusOK, func(ctx context.Context) (any, error) {
+		return h.store.PublishNoticeVersion(ctx, noticeID, versionID, cc.Principal, cc.Correlation)
+	})
 	if err != nil {
 		if errors.Is(err, domain.ErrInvalidNoticeTransition) {
 			writeError(w, http.StatusConflict, "version is not in the required APPROVED state")
 			return
 		}
-		h.log.Error("PublishNoticeVersion: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+		h.storeFailure(w, "PublishNoticeVersion", err)
 		return
 	}
-
-	h.writeJSONWithIdempotency(r.Context(), w, verifiedTenant, principalID, "PublishNoticeVersion", idemKey, reqHash, http.StatusOK, version)
+	h.finish(w, cc, replay, http.StatusOK, payload)
 }
 
 func (h *Handler) WithdrawNoticeVersion(w http.ResponseWriter, r *http.Request) {
-	noticeID := chi.URLParam(r, "noticeID")
-	versionID := chi.URLParam(r, "versionID")
-	h.withdrawNoticeVersionInternal(w, r, noticeID, versionID)
+	h.withdrawNoticeVersionInternal(w, r, chi.URLParam(r, "noticeID"), chi.URLParam(r, "versionID"))
 }
 
 func (h *Handler) WithdrawLatestNotice(w http.ResponseWriter, r *http.Request) {
@@ -608,27 +558,10 @@ func (h *Handler) WithdrawLatestNotice(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) withdrawNoticeVersionInternal(w http.ResponseWriter, r *http.Request, noticeID, versionID string) {
-	principalID, ok := h.requirePrincipal(w, r)
+	cc, ok := h.begin(w, r, PrivacyNoticeWithdraw)
 	if !ok {
 		return
 	}
-	verifiedTenant, ok := h.requireTenant(w, r)
-	if !ok {
-		return
-	}
-	if _, ok := h.requireCorrelationID(w, r); !ok {
-		return
-	}
-	if !h.authorize(w, r, principalID, verifiedTenant, PrivacyNoticeWithdraw) {
-		return
-	}
-
-	bodyBytes, _ := io.ReadAll(r.Body)
-	_, handled, idemKey, reqHash := h.checkIdempotency(w, r, verifiedTenant, principalID, bodyBytes)
-	if handled {
-		return
-	}
-
 	if versionID == "" {
 		latest, ok := h.resolveLatestNoticeVersion(w, r, noticeID)
 		if !ok {
@@ -636,93 +569,63 @@ func (h *Handler) withdrawNoticeVersionInternal(w http.ResponseWriter, r *http.R
 		}
 		versionID = latest.NoticeVersionID
 	}
-	version, err := h.store.WithdrawNoticeVersion(r.Context(), noticeID, versionID)
+	payload, replay, err := h.execute(r, cc, "WithdrawNoticeVersion", http.StatusOK, func(ctx context.Context) (any, error) {
+		return h.store.WithdrawNoticeVersion(ctx, noticeID, versionID)
+	})
 	if err != nil {
 		if errors.Is(err, domain.ErrInvalidNoticeTransition) {
 			writeError(w, http.StatusConflict, "version is not in the required PUBLISHED state")
 			return
 		}
-		h.log.Error("WithdrawNoticeVersion: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+		h.storeFailure(w, "WithdrawNoticeVersion", err)
 		return
 	}
-	h.writeJSONWithIdempotency(r.Context(), w, verifiedTenant, principalID, "WithdrawNoticeVersion", idemKey, reqHash, http.StatusOK, version)
+	h.finish(w, cc, replay, http.StatusOK, payload)
 }
 
 // GetNotice stays reachable without a principal: a published notice is, by
-// its own documented purpose, content meant to be shown to a subject
-// before any session exists (ORG-style "notice precedes consent" ordering,
-// §11 Figure 5: NOTICE PUBLISHED -> PRESENTED comes before any consent
-// decision). It is still tenant-scoped — requireTenant — so a notice id
-// cannot be read across tenants by a caller who sends no, or a guessed,
-// X-Tenant-Id.
+// its own documented purpose, content meant to be shown to a subject before
+// any session exists (§11 Figure 5). It is still tenant-scoped.
 func (h *Handler) GetNotice(w http.ResponseWriter, r *http.Request) {
 	if _, ok := h.requireTenant(w, r); !ok {
 		return
 	}
-	noticeID := chi.URLParam(r, "noticeID")
-	version, err := h.store.ResolveNoticeAsOf(r.Context(), noticeID, parseAsOf(r))
+	version, err := h.store.ResolveNoticeAsOf(r.Context(), chi.URLParam(r, "noticeID"), parseAsOf(r))
 	if err != nil {
 		if errors.Is(err, domain.ErrNoticeNotFound) {
 			writeError(w, http.StatusNotFound, "notice not found")
 			return
 		}
-		h.log.Error("GetNotice: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+		h.storeFailure(w, "GetNotice", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, version)
 }
 
 func (h *Handler) RecordPresentation(w http.ResponseWriter, r *http.Request) {
-	noticeID := chi.URLParam(r, "noticeID")
-	versionID := chi.URLParam(r, "versionID")
-	h.recordPresentationInternal(w, r, noticeID, versionID)
+	h.recordPresentationInternal(w, r, chi.URLParam(r, "noticeID"), chi.URLParam(r, "versionID"))
 }
 
 func (h *Handler) RecordPresentationLatest(w http.ResponseWriter, r *http.Request) {
 	// The canonical route binds to the notice's PUBLISHED version, not its
-	// latest-created one (often a DRAFT successor — which a presentation
-	// receipt may no longer bind to). "" tells recordPresentationInternal to
-	// resolve it AFTER authentication and authorization, so an anonymous
-	// caller cannot probe notice ids through the resolution's error.
+	// latest-created one (often a DRAFT successor). "" tells
+	// recordPresentationInternal to resolve it AFTER authentication and
+	// authorization.
 	h.recordPresentationInternal(w, r, chi.URLParam(r, "noticeID"), "")
 }
 
 func (h *Handler) recordPresentationInternal(w http.ResponseWriter, r *http.Request, noticeID, versionID string) {
-	bodyBytes, err := io.ReadAll(r.Body)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "failed to read request body")
+	cc, ok := h.begin(w, r, PrivacyNoticePresentationRecord)
+	if !ok {
 		return
 	}
-
 	var req domain.RecordPresentationRequest
-	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+	if err := json.Unmarshal(cc.Body, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 	if req.SubjectRef == "" || req.Channel == "" {
 		writeError(w, http.StatusBadRequest, "subject_ref and channel are required")
-		return
-	}
-
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-	verifiedTenant, ok := h.requireTenant(w, r)
-	if !ok {
-		return
-	}
-	if !h.authorize(w, r, principalID, verifiedTenant, PrivacyNoticePresentationRecord) {
-		return
-	}
-	if _, ok := h.requireCorrelationID(w, r); !ok {
-		return
-	}
-
-	_, handled, idemKey, reqHash := h.checkIdempotency(w, r, verifiedTenant, principalID, bodyBytes)
-	if handled {
 		return
 	}
 
@@ -733,41 +636,39 @@ func (h *Handler) recordPresentationInternal(w http.ResponseWriter, r *http.Requ
 				writeCoded(w, http.StatusUnprocessableEntity, domain.ErrCodeNoticeVersionInvalid, domain.ErrNoticeVersionInvalid.Error())
 				return
 			}
-			h.log.Error("RecordPresentation: published-version lookup failed", zap.Error(err))
-			writeError(w, http.StatusServiceUnavailable, "store unavailable")
+			h.storeFailure(w, "RecordPresentation", err)
 			return
 		}
 		versionID = published.NoticeVersionID
 	}
 
-	receipt, err := h.store.RecordPresentation(r.Context(), verifiedTenant, noticeID, versionID, req)
+	payload, replay, err := h.execute(r, cc, "RecordPresentation", http.StatusCreated, func(ctx context.Context) (any, error) {
+		return h.store.RecordPresentation(ctx, cc.Tenant, noticeID, versionID, req)
+	})
 	if err != nil {
 		if errors.Is(err, domain.ErrNoticeVersionInvalid) {
 			writeCoded(w, http.StatusUnprocessableEntity, domain.ErrCodeNoticeVersionInvalid, domain.ErrNoticeVersionInvalid.Error())
 			return
 		}
-		h.log.Error("RecordPresentation: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+		h.storeFailure(w, "RecordPresentation", err)
 		return
 	}
-	h.writeJSONWithIdempotency(r.Context(), w, verifiedTenant, principalID, "RecordPresentation", idemKey, reqHash, http.StatusCreated, receipt)
+	h.finish(w, cc, replay, http.StatusCreated, payload)
 }
 
 // ── consent ──────────────────────────────────────────────────────────────────
 
 // RecordConsent handles POST /privacy/consents. purpose_id is validated
 // against a REAL call to privacy-purpose-registry-svc. Supports proxy
-// verification (§11.1), affirmative-action evidence (§10.1), and
-// replay deduplication (§28, PRV-N04).
+// verification (§11.1), affirmative-action evidence (§10.1), offline-import
+// provenance and replay deduplication (§28, PRV-N04).
 func (h *Handler) RecordConsent(w http.ResponseWriter, r *http.Request) {
-	bodyBytes, err := io.ReadAll(r.Body)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "failed to read request body")
+	cc, ok := h.begin(w, r, PrivacyConsentRecord)
+	if !ok {
 		return
 	}
-
 	var req domain.RecordConsentRequest
-	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+	if err := json.Unmarshal(cc.Body, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
@@ -788,12 +689,10 @@ func (h *Handler) RecordConsent(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Offline / imported consent (§11.1): "require source, capture method,
-	// original evidence reference and migration provenance; never fabricate
-	// current-platform consent timestamps." All four map to this service's
-	// import_* fields, and imported_at is the consent's own original time — it
-	// is what stops a migrated grant being stamped with today's date. Online
-	// consent is unaffected.
+	// Offline / imported consent (§11.1): source, capture method, original
+	// evidence reference and migration provenance are all required, and
+	// imported_at is the consent's own original time (never a fabricated
+	// current one). Online consent is unaffected.
 	if req.IsOfflineImport {
 		var missing []string
 		if strings.TrimSpace(req.ImportSource) == "" {
@@ -819,35 +718,11 @@ func (h *Handler) RecordConsent(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-
-	verifiedTenant, ok := h.requireTenant(w, r)
-	if !ok {
-		return
-	}
-	if req.TenantID != "" && req.TenantID != verifiedTenant {
-		writeCoded(w, http.StatusForbidden, domain.ErrCodeTenantScopeMismatch, domain.ErrTenantScopeMismatch.Error())
-		return
-	}
-	tenantID := verifiedTenant
-
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-	if !h.authorize(w, r, principalID, tenantID, PrivacyConsentRecord) {
-		return
-	}
-	correlationID, ok := h.requireCorrelationID(w, r)
-	if !ok {
+	if scopeMismatch(w, req.TenantID, cc.Tenant) {
 		return
 	}
 
-	_, handled, idemKey, reqHash := h.checkIdempotency(w, r, tenantID, principalID, bodyBytes)
-	if handled {
-		return
-	}
-
-	published, err := h.purposes.IsPublished(r.Context(), tenantID, req.PurposeID)
+	published, err := h.purposes.IsPublished(r.Context(), cc.Tenant, cc.Principal, req.PurposeID)
 	if err != nil {
 		h.log.Error("RecordConsent: purpose registry unavailable", zap.Error(err))
 		writeCoded(w, http.StatusServiceUnavailable, domain.ErrCodeUpstreamUnavailable, "purpose registry unavailable")
@@ -863,36 +738,54 @@ func (h *Handler) RecordConsent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The ConsentReceipt (and its ConsentRequest evidence, when supplied) are
-	// written, and the privacy.consent.changed event enqueued, in one
-	// transaction — see PgStore.RecordConsent's own doc comment.
-	receipt, err := h.store.RecordConsent(r.Context(), tenantID, req, principalID, correlationID)
+	// The ConsentReceipt (and its ConsentRequest evidence), the
+	// privacy.consent.changed event and the idempotency claim are one
+	// transaction.
+	payload, existing, err := h.execute(r, cc, "RecordConsent", http.StatusCreated, func(ctx context.Context) (any, error) {
+		return h.store.RecordConsent(ctx, cc.Tenant, req, cc.Principal, cc.Correlation)
+	})
 	if err != nil {
 		if errors.Is(err, domain.ErrNoticeVersionInvalid) {
 			writeCoded(w, http.StatusUnprocessableEntity, domain.ErrCodeNoticeVersionInvalid, domain.ErrNoticeVersionInvalid.Error())
 			return
 		}
-		h.log.Error("RecordConsent: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+		h.storeFailure(w, "RecordConsent", err)
 		return
 	}
+	h.finish(w, cc, existing, http.StatusCreated, payload)
+}
 
-	h.writeJSONWithIdempotency(r.Context(), w, tenantID, principalID, "RecordConsent", idemKey, reqHash, http.StatusCreated, receipt)
+// ownedReceipt resolves a consent receipt for withdraw/invalidate AFTER
+// authorization. A receipt the caller's tenant does not own answers 404, never
+// 403 — a distinct forbidden would confirm the id exists.
+func (h *Handler) ownedReceipt(w http.ResponseWriter, r *http.Request, op, receiptID, tenant string) bool {
+	existing, err := h.store.FindConsentReceipt(r.Context(), receiptID)
+	if err != nil {
+		if errors.Is(err, domain.ErrConsentReceiptNotFound) {
+			writeError(w, http.StatusNotFound, "consent receipt not found")
+			return false
+		}
+		h.storeFailure(w, op, err)
+		return false
+	}
+	if existing.TenantID == nil || *existing.TenantID != tenant {
+		writeError(w, http.StatusNotFound, "consent receipt not found")
+		return false
+	}
+	return true
 }
 
 // WithdrawConsent handles POST /privacy/consents/{consentReceiptID}/withdraw.
 // PRV-I10: never deletes the original receipt. PRV-I11: affects future
-// resolution only. PRV-N05: replayed withdrawal returns original withdrawal.
+// resolution only. PRV-N05: a replayed withdrawal returns the original.
 func (h *Handler) WithdrawConsent(w http.ResponseWriter, r *http.Request) {
 	receiptID := chi.URLParam(r, "consentReceiptID")
-	bodyBytes, err := io.ReadAll(r.Body)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "failed to read request body")
+	cc, ok := h.begin(w, r, PrivacyConsentWithdraw)
+	if !ok {
 		return
 	}
-
 	var req domain.WithdrawConsentRequest
-	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+	if err := json.Unmarshal(cc.Body, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
@@ -900,58 +793,13 @@ func (h *Handler) WithdrawConsent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "channel is required")
 		return
 	}
-
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-	verifiedTenant, ok := h.requireTenant(w, r)
-	if !ok {
-		return
-	}
-	correlationID, ok := h.requireCorrelationID(w, r)
-	if !ok {
+	if !h.ownedReceipt(w, r, "WithdrawConsent", receiptID, cc.Tenant) {
 		return
 	}
 
-	// Authorization is decided on the caller's own verified tenant BEFORE the
-	// receipt is looked up, so a caller who is not authorized cannot use the
-	// 404/200 difference to probe receipt ids.
-	tenantID := verifiedTenant
-	if !h.authorize(w, r, principalID, tenantID, PrivacyConsentWithdraw) {
-		return
-	}
-
-	existing, err := h.store.FindConsentReceipt(r.Context(), receiptID)
-	if err != nil {
-		if errors.Is(err, domain.ErrConsentReceiptNotFound) {
-			writeError(w, http.StatusNotFound, "consent receipt not found")
-			return
-		}
-		h.log.Error("WithdrawConsent: lookup failed", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
-		return
-	}
-	// A receipt the caller's tenant does not own answers 404, never 403 — a
-	// distinct forbidden would confirm the id exists, and a receipt id is
-	// exactly what an attacker would be probing for. Row-level security
-	// (strict since migration 000006) already stops FindConsentReceipt from
-	// returning another tenant's row; a row with NO tenant is likewise treated
-	// as not found rather than as some shared scope. This is the belt to that
-	// braces.
-	if existing.TenantID == nil || *existing.TenantID != verifiedTenant {
-		writeError(w, http.StatusNotFound, "consent receipt not found")
-		return
-	}
-
-	_, handled, idemKey, reqHash := h.checkIdempotency(w, r, tenantID, principalID, bodyBytes)
-	if handled {
-		return
-	}
-
-	// The WithdrawalReceipt and the privacy.consent.changed event are
-	// written together — see PgStore.WithdrawConsent's own doc comment.
-	withdrawal, err := h.store.WithdrawConsent(r.Context(), receiptID, req.Channel, principalID, correlationID)
+	payload, existing, err := h.execute(r, cc, "WithdrawConsent", http.StatusOK, func(ctx context.Context) (any, error) {
+		return h.store.WithdrawConsent(ctx, receiptID, req.Channel, cc.Principal, cc.Correlation)
+	})
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrConsentReceiptNotFound):
@@ -959,28 +807,23 @@ func (h *Handler) WithdrawConsent(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, domain.ErrAlreadyWithdrawn):
 			writeCoded(w, http.StatusConflict, domain.ErrCodeAlreadyWithdrawn, "consent receipt is already withdrawn")
 		default:
-			h.log.Error("WithdrawConsent: store unavailable", zap.Error(err))
-			writeError(w, http.StatusServiceUnavailable, "store unavailable")
+			h.storeFailure(w, "WithdrawConsent", err)
 		}
 		return
 	}
-
-	h.writeJSONWithIdempotency(r.Context(), w, tenantID, principalID, "WithdrawConsent", idemKey, reqHash, http.StatusOK, withdrawal)
+	h.finish(w, cc, existing, http.StatusOK, payload)
 }
 
 // InvalidateConsent handles POST /privacy/consents/{consentReceiptID}/invalidate
-// — the platform-initiated counterpart to WithdrawConsent. See
-// domain.ConsentInvalidation's own doc comment for why the two are
-// recorded as distinct facts.
+// — the platform-initiated counterpart to WithdrawConsent.
 func (h *Handler) InvalidateConsent(w http.ResponseWriter, r *http.Request) {
 	receiptID := chi.URLParam(r, "consentReceiptID")
-	bodyBytes, err := io.ReadAll(r.Body)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "failed to read request body")
+	cc, ok := h.begin(w, r, PrivacyConsentInvalidate)
+	if !ok {
 		return
 	}
 	var req domain.InvalidateConsentRequest
-	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+	if err := json.Unmarshal(cc.Body, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
@@ -992,95 +835,57 @@ func (h *Handler) InvalidateConsent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "channel is required")
 		return
 	}
-
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-	verifiedTenant, ok := h.requireTenant(w, r)
-	if !ok {
-		return
-	}
-	correlationID, ok := h.requireCorrelationID(w, r)
-	if !ok {
+	if !h.ownedReceipt(w, r, "InvalidateConsent", receiptID, cc.Tenant) {
 		return
 	}
 
-	// Authorize on the caller's own verified tenant first, then look up — see
-	// WithdrawConsent for why both the order and the strict ownership check.
-	tenantID := verifiedTenant
-	if !h.authorize(w, r, principalID, tenantID, PrivacyConsentInvalidate) {
-		return
-	}
-
-	existing, err := h.store.FindConsentReceipt(r.Context(), receiptID)
+	payload, existing, err := h.execute(r, cc, "InvalidateConsent", http.StatusOK, func(ctx context.Context) (any, error) {
+		return h.store.InvalidateConsent(ctx, receiptID, req.Reason, req.Channel, cc.Principal, cc.Correlation)
+	})
 	if err != nil {
 		if errors.Is(err, domain.ErrConsentReceiptNotFound) {
 			writeError(w, http.StatusNotFound, "consent receipt not found")
 			return
 		}
-		h.log.Error("InvalidateConsent: lookup failed", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+		h.storeFailure(w, "InvalidateConsent", err)
 		return
 	}
-	if existing.TenantID == nil || *existing.TenantID != verifiedTenant {
-		writeError(w, http.StatusNotFound, "consent receipt not found")
-		return
-	}
-
-	_, handled, idemKey, reqHash := h.checkIdempotency(w, r, tenantID, principalID, bodyBytes)
-	if handled {
-		return
-	}
-
-	inv, err := h.store.InvalidateConsent(r.Context(), receiptID, req.Reason, req.Channel, principalID, correlationID)
-	if err != nil {
-		switch {
-		case errors.Is(err, domain.ErrConsentReceiptNotFound):
-			writeError(w, http.StatusNotFound, "consent receipt not found")
-		default:
-			h.log.Error("InvalidateConsent: store unavailable", zap.Error(err))
-			writeError(w, http.StatusServiceUnavailable, "store unavailable")
-		}
-		return
-	}
-
-	h.writeJSONWithIdempotency(r.Context(), w, tenantID, principalID, "InvalidateConsent", idemKey, reqHash, http.StatusOK, inv)
+	h.finish(w, cc, existing, http.StatusOK, payload)
 }
 
-// GetConsentStatus answers "what did this subject assert about this
-// purpose" — the single most sensitive read this service exposes. It used
-// to require no principal, no authorization and no verified tenant at
-// all: the service's compose definition publishes its port directly, so
-// any caller who could reach it, and who set an arbitrary X-Tenant-Id
-// header, could read any tenant's subject consent state. It is now gated
-// exactly like a mutating route: a verified principal, a verified tenant
-// (which is what scopes the underlying RLS-protected query), and an
-// explicit grant.
+// beginRead runs principal -> tenant -> authorization for a read route.
+func (h *Handler) beginRead(w http.ResponseWriter, r *http.Request, actionType string) (principal, tenant string, ok bool) {
+	principal, ok = h.requirePrincipal(w, r)
+	if !ok {
+		return "", "", false
+	}
+	tenant, ok = h.requireTenant(w, r)
+	if !ok {
+		return "", "", false
+	}
+	if !h.authorize(w, r, principal, tenant, actionType) {
+		return "", "", false
+	}
+	return principal, tenant, true
+}
+
+// GetConsentStatus answers "what did this subject assert about this purpose"
+// — the single most sensitive read this service exposes: principal, verified
+// tenant and an explicit grant, all decided before the parameters are even
+// validated.
 func (h *Handler) GetConsentStatus(w http.ResponseWriter, r *http.Request) {
+	if _, _, ok := h.beginRead(w, r, PrivacyConsentRead); !ok {
+		return
+	}
 	subjectRef := r.URL.Query().Get("subject_ref")
 	purposeID := r.URL.Query().Get("purpose_id")
 	if subjectRef == "" || purposeID == "" {
 		writeError(w, http.StatusBadRequest, "subject_ref and purpose_id query parameters are required")
 		return
 	}
-
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-	tenantID, ok := h.requireTenant(w, r)
-	if !ok {
-		return
-	}
-	if !h.authorize(w, r, principalID, tenantID, PrivacyConsentRead) {
-		return
-	}
-
 	resolution, err := h.store.ResolveConsentStatus(r.Context(), subjectRef, purposeID)
 	if err != nil {
-		h.log.Error("GetConsentStatus: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+		h.storeFailure(w, "GetConsentStatus", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, resolution)
@@ -1089,14 +894,12 @@ func (h *Handler) GetConsentStatus(w http.ResponseWriter, r *http.Request) {
 // ── preferences ──────────────────────────────────────────────────────────────
 
 func (h *Handler) SetPreference(w http.ResponseWriter, r *http.Request) {
-	bodyBytes, err := io.ReadAll(r.Body)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "failed to read request body")
+	cc, ok := h.begin(w, r, PrivacyPreferenceSet)
+	if !ok {
 		return
 	}
-
 	var req domain.SetPreferenceRequest
-	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+	if err := json.Unmarshal(cc.Body, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
@@ -1108,69 +911,38 @@ func (h *Handler) SetPreference(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "value must be one of ENABLED, DISABLED, UNSET, NOT_APPLICABLE")
 		return
 	}
-
-	verifiedTenant, ok := h.requireTenant(w, r)
-	if !ok {
+	if req.EffectiveAt != nil && req.EffectiveAt.IsZero() {
+		writeError(w, http.StatusBadRequest, "effective_at must be a valid RFC 3339 instant")
 		return
 	}
-	if req.TenantID != "" && req.TenantID != verifiedTenant {
-		writeCoded(w, http.StatusForbidden, domain.ErrCodeTenantScopeMismatch, domain.ErrTenantScopeMismatch.Error())
-		return
-	}
-	tenantID := verifiedTenant
-
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-	if !h.authorize(w, r, principalID, tenantID, PrivacyPreferenceSet) {
-		return
-	}
-	if _, ok := h.requireCorrelationID(w, r); !ok {
+	if scopeMismatch(w, req.TenantID, cc.Tenant) {
 		return
 	}
 
-	_, handled, idemKey, reqHash := h.checkIdempotency(w, r, tenantID, principalID, bodyBytes)
-	if handled {
-		return
-	}
-
-	p, err := h.store.SetPreference(r.Context(), tenantID, req)
+	payload, existing, err := h.execute(r, cc, "SetPreference", http.StatusCreated, func(ctx context.Context) (any, error) {
+		return h.store.SetPreference(ctx, cc.Tenant, req)
+	})
 	if err != nil {
-		h.log.Error("SetPreference: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+		h.storeFailure(w, "SetPreference", err)
 		return
 	}
-	h.writeJSONWithIdempotency(r.Context(), w, tenantID, principalID, "SetPreference", idemKey, reqHash, http.StatusCreated, p)
+	h.finish(w, cc, existing, http.StatusCreated, payload)
 }
 
-// GetPreference is gated the same way GetConsentStatus now is — see that
-// handler's own doc comment for why an unauthenticated, tenant-unscoped
-// read of per-subject preference state was the gap.
+// GetPreference is gated exactly like GetConsentStatus.
 func (h *Handler) GetPreference(w http.ResponseWriter, r *http.Request) {
+	if _, _, ok := h.beginRead(w, r, PrivacyPreferenceRead); !ok {
+		return
+	}
 	subjectRef := r.URL.Query().Get("subject_ref")
 	channelOrPurpose := r.URL.Query().Get("channel_or_purpose")
 	if subjectRef == "" || channelOrPurpose == "" {
 		writeError(w, http.StatusBadRequest, "subject_ref and channel_or_purpose query parameters are required")
 		return
 	}
-
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-	tenantID, ok := h.requireTenant(w, r)
-	if !ok {
-		return
-	}
-	if !h.authorize(w, r, principalID, tenantID, PrivacyPreferenceRead) {
-		return
-	}
-
 	p, err := h.store.ResolvePreference(r.Context(), subjectRef, channelOrPurpose)
 	if err != nil {
-		h.log.Error("GetPreference: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+		h.storeFailure(w, "GetPreference", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, p)

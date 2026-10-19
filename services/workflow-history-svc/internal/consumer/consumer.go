@@ -14,10 +14,23 @@
 //     workflow.escalated, workflow.completed) the payload does not carry
 //     tenant_id or legal_entity_id (verified from workflow-svc/internal/events/
 //     publisher.go). The consumer inherits these from the workflow.started row
-//     already stored for the same workflow_instance_id via a single DB lookup.
-//     If no started row exists yet (out-of-order delivery), the event is rejected
-//     with a store error (not committed), so the broker re-delivers after
-//     restart. This is the correct fail-closed posture for evidence integrity.
+//     already stored for the same workflow_instance_id via a single DB lookup
+//     (store.GetTenantContext), which considers workflow.started rows only. If
+//     no started row exists yet (out-of-order delivery), or the started rows for
+//     that instance id disagree on tenant or legal entity
+//     (store.ErrAmbiguousTenantContext), Handle returns a non-nil error and
+//     stores nothing. This is the correct fail-closed posture for evidence
+//     integrity.
+//
+//     What happens to that error is the Kafka runner's job (internal/kafka/
+//     runner.go), not the consumer's: the runner calls Handle up to three times
+//     in total for the same message (200ms then 400ms between attempts — an
+//     out-of-order transition usually resolves in this window because it is
+//     produced to the same partition as its started event). If all attempts
+//     fail, the message is published unchanged to "<topic>.dlq" with
+//     X-DLQ-* headers and the offset is then COMMITTED, so one unresolvable
+//     message cannot block the partition. Only if the DLQ publish itself fails
+//     is the offset left uncommitted, so a restart retries the message.
 package consumer
 
 import (
@@ -108,8 +121,10 @@ func New(appendStore store.AppendStore, readStore store.ReadStore, log *zap.Logg
 //   - Duplicate event_ids (same eventID delivered twice) are handled atomically
 //     by the store layer (INSERT … ON CONFLICT DO NOTHING).
 //   - For non-started events, if no workflow.started row exists yet for the
-//     workflow_instance_id (out-of-order delivery), a non-nil error is returned
-//     so the caller does NOT commit the offset — the broker re-delivers.
+//     workflow_instance_id (out-of-order delivery), or the started rows are
+//     ambiguous, a non-nil error is returned and nothing is stored. The caller
+//     (the Kafka runner) retries, then dead-letters and commits — see the package
+//     doc comment.
 //
 // eventID is the globally unique event identifier supplied by the message broker.
 // In the Kafka integration it comes from the X-Event-ID header; if absent, the
@@ -227,8 +242,10 @@ func (c *Consumer) handleWorkflowStarted(ctx context.Context, eventID string, en
 //
 // These event types carry only workflow_instance_id in their payload;
 // tenant_id and legal_entity_id are inherited from the workflow.started row.
-// If no started row exists yet (out-of-order delivery), a non-nil error is
-// returned so the broker re-delivers after restart.
+// If no started row exists yet (out-of-order delivery), or the started rows for
+// the instance disagree on tenant/entity, a non-nil error is returned and
+// nothing is stored; the runner then retries and, if still failing,
+// dead-letters the message (see the package doc comment).
 func (c *Consumer) handleWorkflowTransition(ctx context.Context, eventID string, env envelope) error {
 	var p workflowInstancePayload
 	if err := json.Unmarshal(env.Payload, &p); err != nil {
@@ -257,8 +274,7 @@ func (c *Consumer) handleWorkflowTransition(ctx context.Context, eventID string,
 	}
 	if !found {
 		// Out-of-order delivery or the started event was not yet persisted.
-		// Return a non-nil error so the runner does NOT commit the offset —
-		// the broker will re-deliver after restart.
+		// Return a non-nil error; the runner retries and then dead-letters.
 		return fmt.Errorf("handleWorkflowTransition: no tenant context found for workflow_instance_id %q"+
 			" (workflow.started event not yet persisted — will retry)",
 			p.WorkflowInstanceID)

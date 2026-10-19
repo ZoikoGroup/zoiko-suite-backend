@@ -2,8 +2,10 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -18,6 +20,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/document-vault-svc/internal/authz"
+	"zoiko.io/document-vault-svc/internal/contenttype"
 	"zoiko.io/document-vault-svc/internal/domain"
 	svcmiddleware "zoiko.io/document-vault-svc/internal/middleware"
 	"zoiko.io/document-vault-svc/internal/residency"
@@ -36,6 +39,9 @@ type Store interface {
 	LinkDocument(ctx context.Context, p domain.LinkDocumentParams) (*domain.DocumentLink, error)
 	ListDocumentLinks(ctx context.Context, documentID string) ([]domain.DocumentLink, error)
 	ClassifyRecord(ctx context.Context, p domain.ClassifyRecordParams) (*domain.RecordClassification, error)
+	// BulkClassifyRecords classifies every listed document in ONE transaction
+	// (all or nothing); a failure returns a *domain.BulkClassifyError.
+	BulkClassifyRecords(ctx context.Context, ps []domain.ClassifyRecordParams) ([]*domain.RecordClassification, error)
 	FindClassificationByID(ctx context.Context, classificationID string) (*domain.RecordClassification, error)
 	ConfirmClassification(ctx context.Context, p domain.ConfirmClassificationParams) (*domain.RecordClassification, error)
 	GetClassification(ctx context.Context, documentID string) (*domain.RecordClassification, error)
@@ -52,6 +58,13 @@ type Store interface {
 	RecordAccess(ctx context.Context, log *domain.DocumentAccessLog) error
 	ListAccessLog(ctx context.Context, documentID string, limit, offset int) ([]domain.DocumentAccessLog, error)
 	RecordQuarantinedVersionUpload(ctx context.Context, documentID, attemptedByPrincipalID, reason, correlationID string) error
+
+	// Idempotent commands (ZS-SVC-S-001 §9.1): the Idempotency-Key claim is
+	// committed in the same transaction as the document/version. A non-nil
+	// record means the key was already used and nothing was created.
+	GetIdempotency(ctx context.Context, principalID, key string) (*domain.IdempotencyRecord, error)
+	CreateDocumentIdempotent(ctx context.Context, claim domain.IdempotencyClaim, doc *domain.Document, firstVersion *domain.DocumentVersion, correlationID string) (*domain.IdempotencyRecord, error)
+	AddVersionIdempotent(ctx context.Context, claim domain.IdempotencyClaim, documentID string, v *domain.DocumentVersion, correlationID string) (*domain.Document, *domain.IdempotencyRecord, error)
 }
 
 type Handler struct {
@@ -123,8 +136,12 @@ func (h *Handler) CreateDocument(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	raw, ok := readBody(w, r)
+	if !ok {
+		return
+	}
 	var req domain.CreateDocumentRequest
-	if !decodeJSON(w, r, &req) {
+	if !decodeBytes(w, raw, &req) {
 		return
 	}
 
@@ -140,6 +157,19 @@ func (h *Handler) CreateDocument(w http.ResponseWriter, r *http.Request) {
 	}
 	req.TenantID = tenantID
 
+	// legal_entity_id is the authorization scope, so it is the one field that
+	// must be read before authorizing. Every other validation waits until the
+	// caller is known to be allowed to create here: an unauthorized caller gets
+	// 403 whatever else is wrong with the body, and learns nothing about what
+	// the service considers a valid document.
+	if req.LegalEntityID == "" {
+		writeError(w, http.StatusBadRequest, "missing_field", "legal_entity_id")
+		return
+	}
+	if !h.authorize(w, r, actor, req.LegalEntityID, authz.ActionDocumentCreate) {
+		return
+	}
+
 	if missing := requiredFieldMissing(req); missing != "" {
 		writeError(w, http.StatusBadRequest, "missing_field", missing)
 		return
@@ -148,7 +178,12 @@ func (h *Handler) CreateDocument(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_classification", string(req.Classification))
 		return
 	}
-	if !h.authorize(w, r, actor, req.LegalEntityID, authz.ActionDocumentCreate) {
+
+	// Idempotent replay (ZS-SVC-S-001 §9.1, DRC-I30). Runs after
+	// authorization, so a replay is never a way around it, and before any bytes
+	// are decoded, scanned or stored.
+	idem, handled := h.beginIdempotent(w, r, actor, "CreateDocument", raw)
+	if handled {
 		return
 	}
 
@@ -162,12 +197,22 @@ func (h *Handler) CreateDocument(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// DRC-I19: the declared MIME type is checked against the bytes, and the
+	// malware scanner is given the type that was DETECTED, not the caller's
+	// header.
+	detected, err := contenttype.Validate(req.ContentType, content)
+	if err != nil {
+		h.writeContentTypeError(w, err)
+		return
+	}
+
 	// Malware/type scan gate (BIZ-01's own "Malware/type/hash failure
 	// quarantines upload" failure semantics) — before anything is
 	// persisted. No document exists yet at this point, so a quarantine
 	// here is reject-only: there is no aggregate to tie a recorded event
-	// to (see internal/scan's own package doc on the current NoOpScanner).
-	if result, err := h.scanner.Scan(r.Context(), content, req.ContentType); err != nil {
+	// to. An unconfigured scanner is an error here, never a clean result
+	// (see internal/scan's package doc: it fails closed).
+	if result, err := h.scanner.Scan(r.Context(), content, detected); err != nil {
 		h.log.Error("CreateDocument: scan unavailable — failing closed", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "scan_unavailable", "")
 		return
@@ -201,19 +246,11 @@ func (h *Handler) CreateDocument(w http.ResponseWriter, r *http.Request) {
 		CreatedByPrincipalID: actor,
 	}
 
-	// storage_key is decided before the row exists, using a random
-	// placeholder tied to the document only after creation would be circular
-	// — so we generate the document ID client-side isn't an option (Postgres
-	// assigns it). Instead: write bytes to storage AFTER the document row
-	// exists, keyed by document_id+version, inside the same logical request
-	// (not the same DB transaction — storage and Postgres are different
-	// systems, so this is a two-phase write: DB row first with a temporary
-	// key reservation would be needlessly complex for v1; instead we insert
-	// metadata with the storage key already computed from a fresh UUID we
-	// mint here, then write the blob under that key. If the process crashes
-	// between the two, the row would reference a missing blob — an accepted
-	// v1 gap, not swept under the rug: see docs/gtrm-style "known limitations"
-	// pattern used elsewhere in this repo).
+	// The blob is written before the metadata row (storage and Postgres are
+	// different systems, so the two cannot share a transaction). On a normal
+	// database failure the blob is deleted again below. A PROCESS CRASH between
+	// the two writes leaves an orphaned blob that nothing references — a known
+	// v1 limitation, recorded in the audit file, not claimed as solved.
 	tempKey := newStorageKey()
 	checksum, err := h.storage.Put(r.Context(), tempKey, content)
 	if err != nil {
@@ -230,14 +267,24 @@ func (h *Handler) CreateDocument(w http.ResponseWriter, r *http.Request) {
 		CreatedByPrincipalID: actor,
 	}
 
-	if err := h.store.CreateDocument(r.Context(), doc, firstVersion, r.Header.Get("X-Correlation-ID")); err != nil {
+	corr := r.Header.Get("X-Correlation-ID")
+	var existing *domain.IdempotencyRecord
+	if idem != nil {
+		existing, err = h.store.CreateDocumentIdempotent(r.Context(), *idem, doc, firstVersion, corr)
+	} else {
+		err = h.store.CreateDocument(r.Context(), doc, firstVersion, corr)
+	}
+	if err != nil {
 		h.log.Error("CreateDocument: store unavailable", zap.Error(err))
-		if delErr := h.storage.Delete(r.Context(), tempKey); delErr != nil {
-			h.log.Error("CreateDocument: failed to cleanup storage blob after store error", zap.String("storage_key", tempKey), zap.Error(delErr))
-		} else {
-			h.log.Info("CreateDocument: cleaned up orphaned storage blob after store error", zap.String("storage_key", tempKey))
-		}
+		h.cleanupBlob("CreateDocument", tempKey)
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+	if existing != nil {
+		// A concurrent request with the same key committed first: this one's
+		// blob is an orphan, and the caller gets the original outcome.
+		h.cleanupBlob("CreateDocument", tempKey)
+		h.writeReplay(w, existing, idem.RequestHash)
 		return
 	}
 
@@ -267,7 +314,10 @@ func (h *Handler) GetDocument(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.recordAccess(r, actor, documentID, nil, domain.AccessMetadata)
+	// Metadata reads keep best-effort access logging (the failure is logged
+	// loudly inside recordAccess). The documented guarantee — "every download is
+	// logged" — is enforced on the content route below, which fails closed.
+	_ = h.recordAccess(r, actor, documentID, nil, domain.AccessMetadata)
 	writeJSON(w, http.StatusOK, doc)
 }
 
@@ -473,6 +523,11 @@ func (h *Handler) VerifyDigest(w http.ResponseWriter, r *http.Request) {
 		h.log.Error("VerifyDigest: INTEGRITY FAILURE", zap.String("document_id", documentID), zap.Int("version", version))
 		result.Verified = false
 		writeJSON(w, http.StatusOK, result)
+		return
+	}
+	if errors.Is(err, storage.ErrObjectNotFound) {
+		h.log.Error("VerifyDigest: OBJECT MISSING", zap.String("document_id", documentID), zap.Int("version", version))
+		writeError(w, http.StatusServiceUnavailable, "object_missing", "DRC-019: OBJECT_MISSING: the stored object for this version is unavailable")
 		return
 	}
 	if err != nil {
@@ -826,11 +881,11 @@ func (h *Handler) SupersedeClassification(w http.ResponseWriter, r *http.Request
 
 // ── POST /v1/documents/bulk-classify ─────────────────────────────────────────
 
-// maxBulkClassifyDocuments bounds a single BulkClassify call — each
-// listed document is its own sequential authorization round-trip and its
-// own database transaction, so an unbounded list turns one HTTP request
-// into an unbounded amount of work. Matches maxPageLimit's existing cap
-// on this service's other unbounded-list surface.
+// maxBulkClassifyDocuments bounds a single BulkClassify call — each listed
+// document is its own authorization round-trip and the whole batch is one
+// database transaction, so an unbounded list turns one HTTP request into an
+// unbounded amount of work. Matches maxPageLimit's existing cap on this
+// service's other unbounded-list surface.
 const maxBulkClassifyDocuments = maxPageLimit
 
 type bulkClassifyRequest struct {
@@ -845,17 +900,32 @@ type bulkClassifyRequest struct {
 type bulkClassifyResult struct {
 	DocumentID     string                       `json:"document_id"`
 	Classification *domain.RecordClassification `json:"classification,omitempty"`
-	Error          string                       `json:"error,omitempty"`
 }
 
-// BulkClassify applies ClassifyRecord independently to each listed
-// document — BIZ-02's own BulkClassify command. Each document gets its
-// own authorization decision and its own transaction (via the existing
-// FindDocumentByID + ClassifyRecord path); one document's failure —
-// not found, already confirmed, denied — never blocks the others in the
-// same call. The response is always 200 with a per-document result
-// list, never a single pass/fail for the whole batch, so a caller must
-// inspect each entry rather than infer success from the status code.
+// bulkClassifyFailure is the body of a refused or rolled-back batch. Nothing
+// was applied: FailedDocumentID names the document that stopped the batch.
+type bulkClassifyFailure struct {
+	Error            string `json:"error"`
+	Detail           string `json:"detail,omitempty"`
+	FailedDocumentID string `json:"failed_document_id,omitempty"`
+	RolledBack       bool   `json:"rolled_back"`
+}
+
+// BulkClassify proposes a classification for each listed document — BIZ-02's
+// BulkClassify command — ATOMICALLY: every proposal commits together or none
+// does.
+//
+// Every listed document is looked up and authorized (CLASSIFY_RECORD on its own
+// legal entity) BEFORE anything is written, so a missing document or a denied
+// caller stops the whole batch with nothing applied. The writes then run in one
+// database transaction (store.BulkClassifyRecords) together with their
+// classification.proposed outbox events, so a rule failure part-way through
+// (for example a document that already has a confirmed classification) rolls
+// every earlier proposal and event back.
+//
+// 200 with a result per document on success. On failure the status follows the
+// failing condition (404, 403, 409, 400, 503) and the body names the failing
+// document; no partial result exists in either case.
 func (h *Handler) BulkClassify(w http.ResponseWriter, r *http.Request) {
 	if _, ok := h.requireTenant(w, r); !ok {
 		return
@@ -882,42 +952,64 @@ func (h *Handler) BulkClassify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	results := make([]bulkClassifyResult, 0, len(req.DocumentIDs))
+	corr := r.Header.Get("X-Correlation-ID")
+	params := make([]domain.ClassifyRecordParams, 0, len(req.DocumentIDs))
 	for _, documentID := range req.DocumentIDs {
-		results = append(results, h.classifyOneForBulk(r, actor, documentID, req))
+		doc, err := h.store.FindDocumentByID(r.Context(), documentID)
+		if err != nil {
+			h.writeBulkFailure(w, documentID, h.classificationErrorCode(err))
+			return
+		}
+		if err := h.authz.CheckAllowed(r.Context(), actor, doc.LegalEntityID, authz.ActionClassifyRecord); err != nil {
+			h.writeBulkFailure(w, documentID, h.authzErrorCode(err))
+			return
+		}
+		params = append(params, domain.ClassifyRecordParams{
+			DocumentID: documentID, ClassificationValue: req.ClassificationValue, Source: req.Source,
+			Confidence: req.Confidence, RuleModelVersion: req.RuleModelVersion, SourceEvidence: req.SourceEvidence,
+			ProposedByPrincipalID: actor, CorrelationID: corr,
+		})
+	}
+
+	classifications, err := h.store.BulkClassifyRecords(r.Context(), params)
+	if err != nil {
+		failedID := ""
+		var be *domain.BulkClassifyError
+		if errors.As(err, &be) {
+			failedID = be.DocumentID
+			err = be.Err
+		}
+		h.writeBulkFailure(w, failedID, h.classificationErrorCode(err))
+		return
+	}
+
+	results := make([]bulkClassifyResult, 0, len(classifications))
+	for i, c := range classifications {
+		results = append(results, bulkClassifyResult{DocumentID: req.DocumentIDs[i], Classification: c})
 	}
 	writeJSON(w, http.StatusOK, results)
 }
 
-// classifyOneForBulk runs ClassifyRecord for one document within a
-// BulkClassify call. It deliberately never writes to the response
-// itself — h.authorize can't be reused here, because it writes the
-// denial straight to the (shared, single) ResponseWriter, which is only
-// correct for a handler with one outcome. Each document's outcome is
-// captured as data instead, and only the final aggregate response is
-// written once, after every document has been attempted.
-func (h *Handler) classifyOneForBulk(r *http.Request, actor, documentID string, req bulkClassifyRequest) bulkClassifyResult {
-	doc, err := h.store.FindDocumentByID(r.Context(), documentID)
-	if err != nil {
-		return bulkClassifyResult{DocumentID: documentID, Error: h.classificationErrorCode(err)}
+// writeBulkFailure answers a refused or rolled-back batch. The status follows
+// the failing condition; the body always says nothing was applied.
+func (h *Handler) writeBulkFailure(w http.ResponseWriter, documentID, code string) {
+	status := http.StatusServiceUnavailable
+	switch code {
+	case "document_not_found":
+		status = http.StatusNotFound
+	case "forbidden":
+		status = http.StatusForbidden
+	case "invalid_source", "confidence_required", "confidence_not_allowed":
+		status = http.StatusBadRequest
+	case "not_candidate":
+		status = http.StatusConflict
 	}
-	if err := h.authz.CheckAllowed(r.Context(), actor, doc.LegalEntityID, authz.ActionClassifyRecord); err != nil {
-		return bulkClassifyResult{DocumentID: documentID, Error: h.authzErrorCode(err)}
-	}
-	classification, err := h.store.ClassifyRecord(r.Context(), domain.ClassifyRecordParams{
-		DocumentID: documentID, ClassificationValue: req.ClassificationValue, Source: req.Source,
-		Confidence: req.Confidence, RuleModelVersion: req.RuleModelVersion, SourceEvidence: req.SourceEvidence,
-		ProposedByPrincipalID: actor, CorrelationID: r.Header.Get("X-Correlation-ID"),
-	})
-	if err != nil {
-		return bulkClassifyResult{DocumentID: documentID, Error: h.classificationErrorCode(err)}
-	}
-	return bulkClassifyResult{DocumentID: documentID, Classification: classification}
+	writeJSON(w, status, bulkClassifyFailure{Error: code, FailedDocumentID: documentID, RolledBack: true})
 }
 
 // classificationErrorCode maps a classification store error to the same
-// short code handleStoreError would write for it, for the per-document
-// results BulkClassify returns instead of a single HTTP status.
+// short code handleStoreError would write for it, so BulkClassify's failure
+// body carries the same vocabulary as the single-document routes.
 func (h *Handler) classificationErrorCode(err error) string {
 	switch {
 	case errors.Is(err, domain.ErrDocumentNotFound):
@@ -937,7 +1029,8 @@ func (h *Handler) classificationErrorCode(err error) string {
 }
 
 // authzErrorCode mirrors h.authorize's own decision mapping without
-// writing to the response — see classifyOneForBulk's own comment on why.
+// writing to the response, so BulkClassify can turn a denial into its failure
+// body.
 func (h *Handler) authzErrorCode(err error) string {
 	if errors.Is(err, domain.ErrAuthorizationDenied) {
 		return "forbidden"
@@ -1178,7 +1271,13 @@ func (h *Handler) GetContent(w http.ResponseWriter, r *http.Request) {
 	content, err := h.storage.Get(r.Context(), v.StorageKey, v.ChecksumSHA256)
 	if errors.Is(err, storage.ErrIntegrityFailure) {
 		h.log.Error("GetContent: INTEGRITY FAILURE", zap.String("document_id", documentID), zap.Int("version", version))
-		writeError(w, http.StatusConflict, "integrity_check_failed", domain.ErrChecksumMismatch.Error())
+		writeError(w, http.StatusConflict, "integrity_check_failed", "DRC-011: FIXITY_MISMATCH: "+domain.ErrChecksumMismatch.Error())
+		return
+	}
+	if errors.Is(err, storage.ErrObjectNotFound) {
+		h.log.Error("GetContent: OBJECT MISSING — metadata exists but the stored object does not",
+			zap.String("document_id", documentID), zap.Int("version", version))
+		writeError(w, http.StatusServiceUnavailable, "object_missing", "DRC-019: OBJECT_MISSING: the stored object for this version is unavailable")
 		return
 	}
 	if err != nil {
@@ -1187,9 +1286,26 @@ func (h *Handler) GetContent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.recordAccess(r, actor, documentID, &v.DocumentVersionID, domain.AccessDownload)
+	// Fail closed: the immutable access record is written BEFORE any byte is
+	// served, and a failed write means nothing is served. A download with no
+	// record of who took it is exactly what the access log exists to prevent.
+	// (Authorization, tenant scoping and the integrity/object checks above are
+	// unchanged and run first.) The status follows the service's store-failure
+	// convention (503 store_unavailable).
+	if err := h.recordAccess(r, actor, documentID, &v.DocumentVersionID, domain.AccessDownload); err != nil {
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable",
+			"the download could not be recorded in the access log, so no content was served")
+		return
+	}
 
+	// Download controls (ZS-SVC-S-001 §10.1): served as an attachment, never
+	// sniffed into an executable type, never cached by a shared proxy or the
+	// browser. The filename is the document id and version — a title can carry
+	// party or matter names (§10.1 "metadata minimization").
 	w.Header().Set("Content-Type", v.ContentType)
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s-v%d"`, documentID, v.Version))
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Checksum-SHA256", v.ChecksumSHA256)
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(content)
@@ -1219,8 +1335,17 @@ func (h *Handler) AddVersion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	raw, ok := readBody(w, r)
+	if !ok {
+		return
+	}
 	var req domain.CreateDocumentVersionRequest
-	if !decodeJSON(w, r, &req) {
+	if !decodeBytes(w, raw, &req) {
+		return
+	}
+
+	idem, handled := h.beginIdempotent(w, r, actor, "AddVersion", raw)
+	if handled {
 		return
 	}
 
@@ -1234,11 +1359,19 @@ func (h *Handler) AddVersion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// DRC-I19: declared MIME checked against the bytes; the scanner gets the
+	// detected type.
+	detected, err := contenttype.Validate(req.ContentType, content)
+	if err != nil {
+		h.writeContentTypeError(w, err)
+		return
+	}
+
 	// Malware/type scan gate — same as CreateDocument's, but this time
 	// the document already exists, so a quarantine is recorded as a real
 	// event (document.version_upload_quarantined) rather than only
 	// rejected. Still nothing is persisted to storage or document_versions.
-	if result, err := h.scanner.Scan(r.Context(), content, req.ContentType); err != nil {
+	if result, err := h.scanner.Scan(r.Context(), content, detected); err != nil {
 		h.log.Error("AddVersion: scan unavailable — failing closed", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "scan_unavailable", "")
 		return
@@ -1267,14 +1400,24 @@ func (h *Handler) AddVersion(w http.ResponseWriter, r *http.Request) {
 		CreatedByPrincipalID: actor,
 	}
 
-	doc, err := h.store.AddVersion(r.Context(), documentID, v, r.Header.Get("X-Correlation-ID"))
+	corr := r.Header.Get("X-Correlation-ID")
+	var (
+		doc      *domain.Document
+		replayed *domain.IdempotencyRecord
+	)
+	if idem != nil {
+		doc, replayed, err = h.store.AddVersionIdempotent(r.Context(), *idem, documentID, v, corr)
+	} else {
+		doc, err = h.store.AddVersion(r.Context(), documentID, v, corr)
+	}
 	if err != nil {
-		if delErr := h.storage.Delete(r.Context(), tempKey); delErr != nil {
-			h.log.Error("AddVersion: failed to cleanup storage blob after store error", zap.String("storage_key", tempKey), zap.Error(delErr))
-		} else {
-			h.log.Info("AddVersion: cleaned up orphaned storage blob after store error", zap.String("storage_key", tempKey))
-		}
+		h.cleanupBlob("AddVersion", tempKey)
 		h.handleStoreError(w, err)
+		return
+	}
+	if replayed != nil {
+		h.cleanupBlob("AddVersion", tempKey)
+		h.writeReplay(w, replayed, idem.RequestHash)
 		return
 	}
 
@@ -1355,7 +1498,7 @@ func (h *Handler) ListAccessLog(w http.ResponseWriter, r *http.Request) {
 // X-Actor-Principal-ID and fell back to the literal "unknown" — so the
 // append-only record of who read a RESTRICTED document could be attributed to
 // anyone, or to nobody.
-func (h *Handler) recordAccess(r *http.Request, actor, documentID string, versionID *string, accessType domain.AccessType) {
+func (h *Handler) recordAccess(r *http.Request, actor, documentID string, versionID *string, accessType domain.AccessType) error {
 	corrID := r.Header.Get("X-Correlation-ID")
 	var corrPtr *string
 	if corrID != "" {
@@ -1369,11 +1512,14 @@ func (h *Handler) recordAccess(r *http.Request, actor, documentID string, versio
 		CorrelationID:         corrPtr,
 	}
 	if err := h.store.RecordAccess(r.Context(), entry); err != nil {
-		// Access logging must never silently vanish — log loudly even though
-		// we don't fail the read itself (the read already succeeded by the
-		// time logging runs).
+		// Access logging must never silently vanish. Callers decide what a
+		// failed write means: a DOWNLOAD must not be served without its access
+		// record (GetContent fails closed on this error); a metadata read keeps
+		// the earlier best-effort behavior.
 		h.log.Error("FAILED TO RECORD ACCESS LOG ENTRY", zap.String("document_id", documentID), zap.Error(err))
+		return err
 	}
+	return nil
 }
 
 func (h *Handler) handleStoreError(w http.ResponseWriter, err error) {
@@ -1400,6 +1546,9 @@ func (h *Handler) handleStoreError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusConflict, "not_archivable", err.Error())
 	case errors.Is(err, domain.ErrDispositionAlreadyRequested):
 		writeError(w, http.StatusConflict, "disposition_already_requested", err.Error())
+	case errors.Is(err, domain.ErrRecordUnderLegalHold):
+		// DRC-008 LEGAL_HOLD_BLOCK: blocked, with the hold reference; nothing mutated.
+		writeError(w, http.StatusConflict, "legal_hold_block", "DRC-008: LEGAL_HOLD_BLOCK: "+err.Error())
 	case errors.Is(err, domain.ErrDuplicateLink):
 		writeError(w, http.StatusConflict, "duplicate_link", err.Error())
 	case errors.Is(err, domain.ErrClassificationNotFound):
@@ -1513,6 +1662,91 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 		return false
 	}
 	return true
+}
+
+// readBody reads a request body under the size cap. The commands that accept
+// document bytes need the raw bytes as well as the decoded struct: the request
+// hash that binds an Idempotency-Key to its request is taken over them.
+func readBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
+	b, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+		return nil, false
+	}
+	return b, true
+}
+
+// decodeBytes is decodeJSON for an already-read body: no unknown fields, no
+// trailing garbage.
+func decodeBytes(w http.ResponseWriter, raw []byte, dst any) bool {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+		return false
+	}
+	return true
+}
+
+// beginIdempotent applies Idempotency-Key semantics for one command. With no
+// header it returns (nil, false) and the command runs un-keyed (the canonical
+// envelope middleware is what makes the header mandatory on writes). With a
+// header it looks the key up FIRST: a stored outcome for the same request is
+// replayed (handled == true), the same key for a different request is 409, a
+// lookup failure fails closed (503). Otherwise it returns the claim the command
+// must commit together with its own change.
+func (h *Handler) beginIdempotent(w http.ResponseWriter, r *http.Request, actor, operation string, rawBody []byte) (*domain.IdempotencyClaim, bool) {
+	key := r.Header.Get("Idempotency-Key")
+	if key == "" {
+		return nil, false
+	}
+	sum := sha256.Sum256(append([]byte(r.Method+"\n"+r.URL.Path+"\n"), rawBody...))
+	claim := &domain.IdempotencyClaim{
+		PrincipalID: actor, Key: key, Operation: operation, RequestHash: hex.EncodeToString(sum[:]),
+	}
+	rec, err := h.store.GetIdempotency(r.Context(), actor, key)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return nil, true
+	}
+	if rec != nil {
+		h.writeReplay(w, rec, claim.RequestHash)
+		return nil, true
+	}
+	return claim, false
+}
+
+// writeReplay answers with the stored outcome of an earlier identical command,
+// or 409 when the key belongs to a different request.
+func (h *Handler) writeReplay(w http.ResponseWriter, rec *domain.IdempotencyRecord, requestHash string) {
+	if rec.RequestHash != requestHash {
+		writeError(w, http.StatusConflict, "idempotency_mismatch", domain.ErrIdempotencyMismatch.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Idempotency-Replay", "true")
+	w.WriteHeader(rec.ResponseStatus)
+	_, _ = w.Write(rec.ResponseBody)
+}
+
+// cleanupBlob removes a blob whose metadata row was not committed.
+func (h *Handler) cleanupBlob(op, storageKey string) {
+	if err := h.storage.Delete(context.Background(), storageKey); err != nil {
+		h.log.Error(op+": failed to cleanup storage blob after store error", zap.String("storage_key", storageKey), zap.Error(err))
+		return
+	}
+	h.log.Info(op+": cleaned up orphaned storage blob after store error", zap.String("storage_key", storageKey))
+}
+
+// writeContentTypeError renders a failed content-type validation. A declared
+// type that is not a media type at all is a plain 400; a type that contradicts
+// the bytes is DRC-002 UPLOAD_VALIDATION_FAILED.
+func (h *Handler) writeContentTypeError(w http.ResponseWriter, err error) {
+	if errors.Is(err, contenttype.ErrInvalidDeclared) {
+		writeError(w, http.StatusBadRequest, "invalid_content_type", err.Error())
+		return
+	}
+	writeError(w, http.StatusUnprocessableEntity, "DRC-002", "UPLOAD_VALIDATION_FAILED: "+err.Error())
 }
 
 // decodeJSONOptional is decodeJSON for a command whose body is entirely

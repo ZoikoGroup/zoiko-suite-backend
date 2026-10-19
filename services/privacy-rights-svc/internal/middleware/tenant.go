@@ -40,7 +40,7 @@ func TenantContext() func(http.Handler) http.Handler {
 			if tenantID == "" {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusUnauthorized)
-				_ = json.NewEncoder(w).Encode(map[string]string{"error": "X-Tenant-Id header is required"})
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "X-Tenant-Id header is required", "error_code": "TENANT_SCOPE_REQUIRED"})
 				return
 			}
 			next.ServeHTTP(w, r.WithContext(WithTenant(r.Context(), tenantID)))

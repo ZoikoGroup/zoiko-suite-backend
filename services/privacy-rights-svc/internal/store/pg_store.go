@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -24,21 +25,49 @@ func isInvalidUUID(err error) bool {
 	return errors.As(err, &pgErr) && pgErr.Code == "22P02"
 }
 
-// Store is the interface the handler depends on.
+// Idem is the idempotency claim of one mutation (§18.1). The claim, the
+// business change, the outbox event and the stored replay response are written
+// in ONE transaction, so either all of them exist or none does: a retry after
+// any failure re-executes cleanly, and concurrent identical requests execute
+// exactly once.
+type Idem struct {
+	Key         string
+	PrincipalID string
+	Endpoint    string
+	RequestHash string
+	// Render builds the HTTP status and body to replay from the operation's
+	// result (the typed value the operation returned).
+	Render func(result any) (status int, body []byte, err error)
+}
+
+// Store is the interface the handler depends on. Every mutating method takes
+// the idempotency claim and returns the already-stored record instead of
+// executing when the key was claimed before.
 type Store interface {
-	CreateRequest(ctx context.Context, tenantID string, req domain.CreateRightsRequestRequest, principalID string) (*domain.RightsRequest, error)
+	CreateRequest(ctx context.Context, tenantID string, req domain.CreateRightsRequestRequest, principalID string, idem *Idem) (*domain.RightsRequest, *domain.IdempotencyRecord, error)
 	FindRequest(ctx context.Context, requestID string) (*domain.RightsRequest, error)
 	ListRequestsBySubject(ctx context.Context, subjectRef string) ([]domain.RightsRequest, error)
 
-	RecordIdentityVerification(ctx context.Context, requestID string, req domain.RecordIdentityVerificationRequest, principalID string) (*domain.IdentityVerificationEvent, *domain.RightsRequest, error)
-	AttachDiscoveryManifest(ctx context.Context, requestID string, req domain.AttachDiscoveryManifestRequest, principalID string) (*domain.DiscoveryManifest, *domain.RightsRequest, error)
+	RecordIdentityVerification(ctx context.Context, requestID string, req domain.RecordIdentityVerificationRequest, principalID string, idem *Idem) (*IdentityResult, *domain.IdempotencyRecord, error)
+	AttachDiscoveryManifest(ctx context.Context, requestID string, req domain.AttachDiscoveryManifestRequest, principalID string, idem *Idem) (*ManifestResult, *domain.IdempotencyRecord, error)
 	ListDiscoveryManifests(ctx context.Context, requestID string) ([]domain.DiscoveryManifest, error)
-	CloseRequest(ctx context.Context, requestID string, req domain.CloseRequestRequest, principalID string) (*domain.RightsRequest, error)
-	AttachWFCProcessRef(ctx context.Context, requestID, wfcProcessRef string) (*domain.RightsRequest, error)
+	CloseRequest(ctx context.Context, requestID string, req domain.CloseRequestRequest, principalID string, idem *Idem) (*domain.RightsRequest, *domain.IdempotencyRecord, error)
+	AttachWFCProcessRef(ctx context.Context, requestID, wfcProcessRef string, idem *Idem) (*domain.RightsRequest, *domain.IdempotencyRecord, error)
 
-	// Idempotency (§18.1)
-	GetIdempotency(ctx context.Context, tenantID, key string) (*domain.IdempotencyRecord, error)
-	SaveIdempotency(ctx context.Context, rec domain.IdempotencyRecord) error
+	// GetIdempotency looks up a stored response by (tenant, principal, key).
+	GetIdempotency(ctx context.Context, tenantID, principalID, key string) (*domain.IdempotencyRecord, error)
+}
+
+// IdentityResult / ManifestResult are the typed results of the two evidence
+// mutations (the evidence row plus the updated case).
+type IdentityResult struct {
+	Event   *domain.IdentityVerificationEvent
+	Request *domain.RightsRequest
+}
+
+type ManifestResult struct {
+	Manifest *domain.DiscoveryManifest
+	Request  *domain.RightsRequest
 }
 
 type PgStore struct {
@@ -50,20 +79,96 @@ func NewPgStore(pool *pgxpool.Pool, log *zap.Logger) *PgStore {
 	return &PgStore{pool: pool, log: log}
 }
 
+// withTenant runs fn in a transaction scoped by the verified tenant carried in
+// ctx (transaction-local app.tenant_id). A missing tenant is refused outright
+// rather than degrading to an empty scope.
 func (s *PgStore) withTenant(ctx context.Context, fn func(pgx.Tx) error) error {
+	tenant := strings.TrimSpace(middleware.TenantFromContext(ctx))
+	if tenant == "" {
+		return errors.New("verified tenant is required for store operations")
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", middleware.TenantFromContext(ctx)); err != nil {
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenant); err != nil {
 		return fmt.Errorf("set_config app.tenant_id: %w", err)
 	}
 	if err := fn(tx); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+var errReplay = errors.New("idempotent replay")
+
+func isDomainError(err error) bool {
+	for _, e := range []error{domain.ErrRequestNotFound, domain.ErrRequestAlreadyClosed, domain.ErrIdentityNotVerified, domain.ErrNoDiscoveryManifest} {
+		if errors.Is(err, e) {
+			return true
+		}
+	}
+	return false
+}
+
+// mutate runs fn atomically with the idempotency claim (when idem != nil).
+// On a prior claim it executes nothing and returns the stored record.
+func (s *PgStore) mutate(ctx context.Context, op string, idem *Idem, fn func(tx pgx.Tx) (any, error)) (any, *domain.IdempotencyRecord, error) {
+	tenant := strings.TrimSpace(middleware.TenantFromContext(ctx))
+	var result any
+	var existing *domain.IdempotencyRecord
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		if idem != nil {
+			tag, err := tx.Exec(ctx, `
+				INSERT INTO rights_idempotency_keys
+					(idempotency_key, tenant_id, principal_id, endpoint, request_hash, response_code, response_body, created_at)
+				VALUES ($1, $2, $3, $4, $5, 0, ''::bytea, NOW())
+				ON CONFLICT (tenant_id, principal_id, idempotency_key) DO NOTHING`,
+				idem.Key, tenant, idem.PrincipalID, idem.Endpoint, idem.RequestHash)
+			if err != nil {
+				return err
+			}
+			if tag.RowsAffected() == 0 {
+				rec, err := getIdempotencyTx(ctx, tx, tenant, idem.PrincipalID, idem.Key)
+				if err != nil {
+					return err
+				}
+				existing = rec
+				return errReplay
+			}
+		}
+		r, err := fn(tx)
+		if err != nil {
+			return err
+		}
+		result = r
+		if idem != nil {
+			code, body, err := idem.Render(r)
+			if err != nil {
+				return err
+			}
+			if _, err := tx.Exec(ctx, `
+				UPDATE rights_idempotency_keys SET response_code = $1, response_body = $2
+				WHERE tenant_id = $3 AND principal_id = $4 AND idempotency_key = $5`,
+				code, body, tenant, idem.PrincipalID, idem.Key); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	switch {
+	case errors.Is(err, errReplay):
+		return nil, existing, nil
+	case err == nil:
+		return result, nil, nil
+	case isDomainError(err):
+		return nil, nil, err
+	default:
+		s.log.Error("pg "+op+" failed", zap.Error(err))
+		return nil, nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
 }
 
 func strPtrOrNil(s string) *string {
@@ -94,25 +199,41 @@ func scanRequest(row pgx.Row) (*domain.RightsRequest, error) {
 	return r, nil
 }
 
-func (s *PgStore) CreateRequest(ctx context.Context, tenantID string, req domain.CreateRightsRequestRequest, principalID string) (*domain.RightsRequest, error) {
+// lockOpenRequest locks the case row and refuses a missing or CLOSED case, so
+// the closed-case check and the write happen under the same lock.
+func lockOpenRequest(ctx context.Context, tx pgx.Tx, requestID string) (tenantID *string, err error) {
+	var status string
+	if err := tx.QueryRow(ctx, `SELECT tenant_id, status FROM rights_requests WHERE request_id = $1 FOR UPDATE`, requestID).Scan(&tenantID, &status); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
+			return nil, domain.ErrRequestNotFound
+		}
+		return nil, err
+	}
+	if status == string(domain.StatusClosed) {
+		return nil, domain.ErrRequestAlreadyClosed
+	}
+	return tenantID, nil
+}
+
+func (s *PgStore) CreateRequest(ctx context.Context, tenantID string, req domain.CreateRightsRequestRequest, principalID string, idem *Idem) (*domain.RightsRequest, *domain.IdempotencyRecord, error) {
 	id := uuid.New().String()
-	var request *domain.RightsRequest
-	err := s.withTenant(ctx, func(tx pgx.Tx) error {
-		var err error
-		request, err = scanRequest(tx.QueryRow(ctx, `
+	res, existing, err := s.mutate(ctx, "CreateRequest", idem, func(tx pgx.Tx) (any, error) {
+		request, err := scanRequest(tx.QueryRow(ctx, `
 			INSERT INTO rights_requests (`+requestColumns+`)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, 'RECEIVED', false, NULL, NULL, 0, NULL, NOW(), $8, NULL)
 			RETURNING `+requestColumns,
 			id, strPtrOrNil(tenantID), req.SubjectRef, req.RightFamily, strPtrOrNil(req.Jurisdiction),
 			strPtrOrNil(req.RequesterRef), strPtrOrNil(req.SubmittedVia), principalID,
 		))
-		return err
+		if err != nil {
+			return nil, err
+		}
+		return request, nil
 	})
-	if err != nil {
-		s.log.Error("pg CreateRequest failed", zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	if err != nil || existing != nil {
+		return nil, existing, err
 	}
-	return request, nil
+	return res.(*domain.RightsRequest), nil, nil
 }
 
 func (s *PgStore) FindRequest(ctx context.Context, requestID string) (*domain.RightsRequest, error) {
@@ -156,32 +277,27 @@ func (s *PgStore) ListRequestsBySubject(ctx context.Context, subjectRef string) 
 	return out, nil
 }
 
-func (s *PgStore) RecordIdentityVerification(ctx context.Context, requestID string, req domain.RecordIdentityVerificationRequest, principalID string) (*domain.IdentityVerificationEvent, *domain.RightsRequest, error) {
+func (s *PgStore) RecordIdentityVerification(ctx context.Context, requestID string, req domain.RecordIdentityVerificationRequest, principalID string, idem *Idem) (*IdentityResult, *domain.IdempotencyRecord, error) {
 	id := uuid.New().String()
-	var event domain.IdentityVerificationEvent
-	var request *domain.RightsRequest
-	err := s.withTenant(ctx, func(tx pgx.Tx) error {
-		var tenantID *string
-		if err := tx.QueryRow(ctx, `SELECT tenant_id FROM rights_requests WHERE request_id = $1`, requestID).Scan(&tenantID); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
-				return domain.ErrRequestNotFound
-			}
-			return err
+	res, existing, err := s.mutate(ctx, "RecordIdentityVerification", idem, func(tx pgx.Tx) (any, error) {
+		tenantID, err := lockOpenRequest(ctx, tx, requestID)
+		if err != nil {
+			return nil, err
 		}
-
+		var event domain.IdentityVerificationEvent
 		if err := tx.QueryRow(ctx, `
 			INSERT INTO identity_verification_events (event_id, tenant_id, request_id, verified, method, note, verified_by_principal_id)
 			VALUES ($1, $2, $3, $4, $5, $6, $7)
 			RETURNING event_id, tenant_id, request_id, verified, method, note, verified_by_principal_id, created_at`,
-			id, tenantID, requestID, req.Verified, req.Method, strPtrOrNilForNote(req.Note), principalID,
+			id, tenantID, requestID, req.Verified, req.Method, strPtrOrNil(req.Note), principalID,
 		).Scan(&event.EventID, &event.TenantID, &event.RequestID, &event.Verified, &event.Method, &nullString{&event.Note}, &event.VerifiedByPrincipalID, &event.CreatedAt); err != nil {
-			return err
+			return nil, err
 		}
 
 		// Only a VERIFIED=true event advances status — a failed attempt is
 		// recorded as evidence but must never silently advance the case.
+		var request *domain.RightsRequest
 		if req.Verified {
-			var err error
 			request, err = scanRequest(tx.QueryRow(ctx, `
 				UPDATE rights_requests SET identity_verified = true,
 					status = CASE WHEN status = 'RECEIVED' THEN 'IDENTITY_VERIFIED' ELSE status END
@@ -189,35 +305,28 @@ func (s *PgStore) RecordIdentityVerification(ctx context.Context, requestID stri
 				RETURNING `+requestColumns,
 				requestID,
 			))
-			return err
+		} else {
+			request, err = scanRequest(tx.QueryRow(ctx, `SELECT `+requestColumns+` FROM rights_requests WHERE request_id = $1`, requestID))
 		}
-		var err error
-		request, err = scanRequest(tx.QueryRow(ctx, `SELECT `+requestColumns+` FROM rights_requests WHERE request_id = $1`, requestID))
-		return err
+		if err != nil {
+			return nil, err
+		}
+		return &IdentityResult{Event: &event, Request: request}, nil
 	})
-	if errors.Is(err, domain.ErrRequestNotFound) {
-		return nil, nil, domain.ErrRequestNotFound
+	if err != nil || existing != nil {
+		return nil, existing, err
 	}
-	if err != nil {
-		s.log.Error("pg RecordIdentityVerification failed", zap.Error(err))
-		return nil, nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	return &event, request, nil
+	return res.(*IdentityResult), nil, nil
 }
 
-func (s *PgStore) AttachDiscoveryManifest(ctx context.Context, requestID string, req domain.AttachDiscoveryManifestRequest, principalID string) (*domain.DiscoveryManifest, *domain.RightsRequest, error) {
+func (s *PgStore) AttachDiscoveryManifest(ctx context.Context, requestID string, req domain.AttachDiscoveryManifestRequest, principalID string, idem *Idem) (*ManifestResult, *domain.IdempotencyRecord, error) {
 	id := uuid.New().String()
-	var manifest domain.DiscoveryManifest
-	var request *domain.RightsRequest
-	err := s.withTenant(ctx, func(tx pgx.Tx) error {
-		var tenantID *string
-		if err := tx.QueryRow(ctx, `SELECT tenant_id FROM rights_requests WHERE request_id = $1`, requestID).Scan(&tenantID); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
-				return domain.ErrRequestNotFound
-			}
-			return err
+	res, existing, err := s.mutate(ctx, "AttachDiscoveryManifest", idem, func(tx pgx.Tx) (any, error) {
+		tenantID, err := lockOpenRequest(ctx, tx, requestID)
+		if err != nil {
+			return nil, err
 		}
-
+		var manifest domain.DiscoveryManifest
 		if err := tx.QueryRow(ctx, `
 			INSERT INTO discovery_manifests (manifest_id, tenant_id, request_id, domain, content_hash, candidate_count, evidence_ref, submitted_by_principal_id)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
@@ -225,27 +334,24 @@ func (s *PgStore) AttachDiscoveryManifest(ctx context.Context, requestID string,
 			id, tenantID, requestID, req.Domain, req.ContentHash, req.CandidateCount, strPtrOrNil(req.EvidenceRef), principalID,
 		).Scan(&manifest.ManifestID, &manifest.TenantID, &manifest.RequestID, &manifest.Domain, &manifest.ContentHash,
 			&manifest.CandidateCount, &nullString{&manifest.EvidenceRef}, &manifest.SubmittedByPrincipalID, &manifest.CreatedAt); err != nil {
-			return err
+			return nil, err
 		}
-
-		var err error
-		request, err = scanRequest(tx.QueryRow(ctx, `
+		request, err := scanRequest(tx.QueryRow(ctx, `
 			UPDATE rights_requests SET
 				status = CASE WHEN status = 'IDENTITY_VERIFIED' THEN 'IN_DISCOVERY' ELSE status END
 			WHERE request_id = $1
 			RETURNING `+requestColumns,
 			requestID,
 		))
-		return err
+		if err != nil {
+			return nil, err
+		}
+		return &ManifestResult{Manifest: &manifest, Request: request}, nil
 	})
-	if errors.Is(err, domain.ErrRequestNotFound) {
-		return nil, nil, domain.ErrRequestNotFound
+	if err != nil || existing != nil {
+		return nil, existing, err
 	}
-	if err != nil {
-		s.log.Error("pg AttachDiscoveryManifest failed", zap.Error(err))
-		return nil, nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	return &manifest, request, nil
+	return res.(*ManifestResult), nil, nil
 }
 
 func (s *PgStore) ListDiscoveryManifests(ctx context.Context, requestID string) ([]domain.DiscoveryManifest, error) {
@@ -275,96 +381,91 @@ func (s *PgStore) ListDiscoveryManifests(ctx context.Context, requestID string) 
 	return out, nil
 }
 
-// CloseRequest enforces §15.2's DISCLOSURE GATE at the store layer, not
-// just the handler: FULFILLED requires identity_verified=true AND at
-// least one discovery manifest — checked atomically inside the same
-// transaction that performs the close, so a race between two callers
-// cannot slip a FULFILLED closure past the gate.
+// CloseRequest enforces what this service can verify of §15.2's DISCLOSURE
+// GATE at the store layer, atomically with the close: FULFILLED requires that
+// a VERIFIED identity-assurance event actually exists for the case (not merely
+// that the denormalised flag is set) AND at least one discovery manifest.
+// Applicable-right determination, scope review, exemptions, third-party
+// protection, redaction and approved response assembly are WFC/reviewer-owned
+// (§14.1) and are not verifiable here — see the README.
 // I21: response package versioning — increments on every FULFILLED closure.
-func (s *PgStore) CloseRequest(ctx context.Context, requestID string, req domain.CloseRequestRequest, principalID string) (*domain.RightsRequest, error) {
-	var request *domain.RightsRequest
-	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+func (s *PgStore) CloseRequest(ctx context.Context, requestID string, req domain.CloseRequestRequest, principalID string, idem *Idem) (*domain.RightsRequest, *domain.IdempotencyRecord, error) {
+	res, existing, err := s.mutate(ctx, "CloseRequest", idem, func(tx pgx.Tx) (any, error) {
 		var status string
 		var identityVerified bool
 		var currentVersion int
-		if err := tx.QueryRow(ctx, `SELECT status, identity_verified, response_package_version FROM rights_requests WHERE request_id = $1`, requestID).Scan(&status, &identityVerified, &currentVersion); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT status, identity_verified, response_package_version FROM rights_requests WHERE request_id = $1 FOR UPDATE`, requestID).
+			Scan(&status, &identityVerified, &currentVersion); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
-				return domain.ErrRequestNotFound
+				return nil, domain.ErrRequestNotFound
 			}
-			return err
+			return nil, err
 		}
 		if status == string(domain.StatusClosed) {
-			return domain.ErrRequestAlreadyClosed
+			return nil, domain.ErrRequestAlreadyClosed
 		}
 
 		if req.Outcome == domain.OutcomeFulfilled {
-			if !identityVerified {
-				return domain.ErrIdentityNotVerified
+			var verifiedEvents int
+			if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM identity_verification_events WHERE request_id = $1 AND verified = true`, requestID).Scan(&verifiedEvents); err != nil {
+				return nil, err
+			}
+			if !identityVerified || verifiedEvents == 0 {
+				return nil, domain.ErrIdentityNotVerified
 			}
 			var manifestCount int
 			if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM discovery_manifests WHERE request_id = $1`, requestID).Scan(&manifestCount); err != nil {
-				return err
+				return nil, err
 			}
 			if manifestCount == 0 {
-				return domain.ErrNoDiscoveryManifest
+				return nil, domain.ErrNoDiscoveryManifest
 			}
 		}
 
-		var err error
 		nextVersion := currentVersion
 		if req.Outcome == domain.OutcomeFulfilled {
 			nextVersion = currentVersion + 1
 		}
-		request, err = scanRequest(tx.QueryRow(ctx, `
+		request, err := scanRequest(tx.QueryRow(ctx, `
 			UPDATE rights_requests SET
 				status = 'CLOSED', outcome = $2, response_evidence_hash = $3, response_package_version = $4, closed_at = NOW()
 			WHERE request_id = $1
 			RETURNING `+requestColumns,
 			requestID, req.Outcome, strPtrOrNil(req.ResponseEvidenceHash), nextVersion,
 		))
-		return err
+		if err != nil {
+			return nil, err
+		}
+		return request, nil
 	})
-	switch {
-	case errors.Is(err, domain.ErrRequestNotFound), errors.Is(err, domain.ErrRequestAlreadyClosed),
-		errors.Is(err, domain.ErrIdentityNotVerified), errors.Is(err, domain.ErrNoDiscoveryManifest):
-		return nil, err
-	case err != nil:
-		s.log.Error("pg CloseRequest failed", zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	if err != nil || existing != nil {
+		return nil, existing, err
 	}
-	return request, nil
+	return res.(*domain.RightsRequest), nil, nil
 }
 
-func (s *PgStore) AttachWFCProcessRef(ctx context.Context, requestID, wfcProcessRef string) (*domain.RightsRequest, error) {
-	var request *domain.RightsRequest
-	err := s.withTenant(ctx, func(tx pgx.Tx) error {
-		var err error
-		request, err = scanRequest(tx.QueryRow(ctx, `
+func (s *PgStore) AttachWFCProcessRef(ctx context.Context, requestID, wfcProcessRef string, idem *Idem) (*domain.RightsRequest, *domain.IdempotencyRecord, error) {
+	res, existing, err := s.mutate(ctx, "AttachWFCProcessRef", idem, func(tx pgx.Tx) (any, error) {
+		if _, err := lockOpenRequest(ctx, tx, requestID); err != nil {
+			return nil, err
+		}
+		return scanRequest(tx.QueryRow(ctx, `
 			UPDATE rights_requests SET wfc_process_ref = $2 WHERE request_id = $1
 			RETURNING `+requestColumns,
 			requestID, wfcProcessRef,
 		))
-		return err
 	})
-	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
-		return nil, domain.ErrRequestNotFound
+	if err != nil || existing != nil {
+		return nil, existing, err
 	}
-	if err != nil {
-		s.log.Error("pg AttachWFCProcessRef failed", zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	return request, nil
+	return res.(*domain.RightsRequest), nil, nil
 }
 
 // nullString bridges a nullable TEXT column onto a plain (non-pointer)
-// string field on a domain struct — several fields here (Note,
-// EvidenceRef, Jurisdiction, RequesterRef, SubmittedVia) are documented
-// as always-present-but-possibly-empty strings on the wire, not
-// omitempty pointers, so the scan target must bridge NULL -> "" rather
-// than fail outright. A gap in this coverage (scanRequest originally
-// scanned Jurisdiction/RequesterRef/SubmittedVia directly into *string)
-// was caught by live-stack testing, not the unit suite, whose stub store
-// has no real SQL NULL to expose the mismatch.
+// string field on a domain struct: several fields here (Note, EvidenceRef,
+// Jurisdiction, RequesterRef, SubmittedVia) are documented as
+// always-present-but-possibly-empty strings on the wire, so the scan target
+// must bridge NULL -> "" rather than fail outright.
 type nullString struct{ dest *string }
 
 func (n *nullString) Scan(src interface{}) error {
@@ -377,21 +478,28 @@ func (n *nullString) Scan(src interface{}) error {
 	return nil
 }
 
-func strPtrOrNilForNote(s string) *string {
-	return strPtrOrNil(s)
-}
-
 // ── Idempotency (§18.1) ──────────────────────────────────────────────────────
 
-func (s *PgStore) GetIdempotency(ctx context.Context, tenantID, key string) (*domain.IdempotencyRecord, error) {
+func getIdempotencyTx(ctx context.Context, tx pgx.Tx, tenantID, principalID, key string) (*domain.IdempotencyRecord, error) {
 	var rec domain.IdempotencyRecord
+	err := tx.QueryRow(ctx, `
+		SELECT idempotency_key, tenant_id, principal_id, endpoint, request_hash, response_code, response_body, created_at
+		FROM rights_idempotency_keys
+		WHERE tenant_id = $1 AND principal_id = $2 AND idempotency_key = $3`,
+		tenantID, principalID, key,
+	).Scan(&rec.Key, &rec.TenantID, &rec.PrincipalID, &rec.Endpoint, &rec.RequestHash, &rec.ResponseCode, &rec.ResponseBody, &rec.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &rec, nil
+}
+
+func (s *PgStore) GetIdempotency(ctx context.Context, tenantID, principalID, key string) (*domain.IdempotencyRecord, error) {
+	var rec *domain.IdempotencyRecord
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
-		return tx.QueryRow(ctx, `
-			SELECT idempotency_key, tenant_id, endpoint, request_hash, response_code, response_body, created_at
-			FROM rights_idempotency_keys
-			WHERE idempotency_key = $1`,
-			key,
-		).Scan(&rec.Key, &rec.TenantID, &rec.Endpoint, &rec.RequestHash, &rec.ResponseCode, &rec.ResponseBody, &rec.CreatedAt)
+		r, err := getIdempotencyTx(ctx, tx, tenantID, principalID, key)
+		rec = r
+		return err
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
@@ -400,22 +508,5 @@ func (s *PgStore) GetIdempotency(ctx context.Context, tenantID, key string) (*do
 		s.log.Error("pg GetIdempotency failed", zap.Error(err))
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
-	return &rec, nil
-}
-
-func (s *PgStore) SaveIdempotency(ctx context.Context, rec domain.IdempotencyRecord) error {
-	err := s.withTenant(ctx, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `
-			INSERT INTO rights_idempotency_keys (idempotency_key, tenant_id, endpoint, request_hash, response_code, response_body, created_at)
-			VALUES ($1, $2, $3, $4, $5, $6, NOW())
-			ON CONFLICT (tenant_id, idempotency_key) DO NOTHING`,
-			rec.Key, rec.TenantID, rec.Endpoint, rec.RequestHash, rec.ResponseCode, rec.ResponseBody,
-		)
-		return err
-	})
-	if err != nil {
-		s.log.Error("pg SaveIdempotency failed", zap.Error(err))
-		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	return nil
+	return rec, nil
 }

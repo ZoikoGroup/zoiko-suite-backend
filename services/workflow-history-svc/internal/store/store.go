@@ -16,6 +16,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -24,6 +25,18 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 )
+
+// EventTypeWorkflowStarted is the one event type that carries tenant_id and
+// legal_entity_id, and therefore the only authoritative source of that context
+// for the rest of an instance's events.
+const EventTypeWorkflowStarted = "workflow.started"
+
+// ErrAmbiguousTenantContext is returned by GetTenantContext when the
+// workflow.started rows recorded for one workflow_instance_id disagree about
+// tenant or legal entity. The schema keys rows on event_id only, so it does not
+// prevent two tenants from emitting the same instance id; the service refuses
+// to guess which one a later event belongs to.
+var ErrAmbiguousTenantContext = errors.New("workflow.started rows for this workflow_instance_id disagree on tenant or legal entity")
 
 // WorkflowHistoryEvent is the normalised representation stored in the
 // workflow_history_events table. Fields map 1-to-1 to the schema columns
@@ -89,11 +102,13 @@ type ReadStore interface {
 	// recorded_at ASC. All filter fields are required.
 	ListByFilter(ctx context.Context, f QueryFilter) ([]WorkflowHistoryEvent, error)
 
-	// GetTenantContext retrieves the tenant_id and legal_entity_id recorded
-	// in the earliest event for the given workflow instance. This is used by
-	// the consumer to inherit governance context for non-started events that
-	// do not carry tenant/entity IDs in their payload.
-	// Returns a zero-value TenantContext and false if no rows exist yet.
+	// GetTenantContext retrieves the tenant_id and legal_entity_id recorded on
+	// the workflow.started row(s) for the given workflow instance. Only
+	// workflow.started rows are consulted — never a transition row, whatever
+	// its age. This is used by the consumer to inherit governance context for
+	// non-started events that do not carry tenant/entity IDs in their payload.
+	// Returns a zero-value TenantContext and false if no workflow.started row
+	// exists yet, and ErrAmbiguousTenantContext if the started rows disagree.
 	GetTenantContext(ctx context.Context, workflowInstanceID string) (TenantContext, bool, error)
 }
 
@@ -239,9 +254,16 @@ ORDER BY recorded_at ASC`
 	return events, nil
 }
 
-// GetTenantContext retrieves the tenant_id and legal_entity_id from the earliest
-// stored event for the given workflow instance. Returns (zero, false, nil) if no
-// row exists yet.
+// GetTenantContext retrieves the tenant_id and legal_entity_id from the
+// workflow.started row for the given workflow instance — the contract's
+// authoritative source — and from nothing else. Returns (zero, false, nil) if
+// no workflow.started row exists yet, and ErrAmbiguousTenantContext if started
+// rows for the same instance id carry different tenant or legal entity values.
+//
+// The lookup necessarily runs without a tenant (the tenant is the value being
+// looked up), so it sets the internal app.bypass_rls flag for this one
+// read-only transaction. It is called only by the Kafka consumer and never
+// from an HTTP-reachable path.
 func (s *PgStore) GetTenantContext(ctx context.Context, workflowInstanceID string) (TenantContext, bool, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -255,25 +277,39 @@ func (s *PgStore) GetTenantContext(ctx context.Context, workflowInstanceID strin
 		return TenantContext{}, false, fmt.Errorf("set bypass_rls context: %w", err)
 	}
 
+	// LIMIT 2 is enough to tell "one context" from "conflicting contexts".
 	const q = `
-SELECT tenant_id, legal_entity_id
+SELECT DISTINCT tenant_id, legal_entity_id
 FROM workflow_history_events
-WHERE workflow_instance_id = $1
-ORDER BY recorded_at ASC
-LIMIT 1`
+WHERE workflow_instance_id = $1 AND event_type = $2
+LIMIT 2`
 
-	var tc TenantContext
-	err = tx.QueryRow(ctx, q, workflowInstanceID).Scan(&tc.TenantID, &tc.LegalEntityID)
+	rows, err := tx.Query(ctx, q, workflowInstanceID, EventTypeWorkflowStarted)
 	if err != nil {
-		if err == pgx.ErrNoRows {
-			return TenantContext{}, false, nil
-		}
 		return TenantContext{}, false, fmt.Errorf("get tenant context for instance %q: %w", workflowInstanceID, err)
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return TenantContext{}, false, fmt.Errorf("commit transaction: %w", err)
+	var found []TenantContext
+	for rows.Next() {
+		var tc TenantContext
+		if err := rows.Scan(&tc.TenantID, &tc.LegalEntityID); err != nil {
+			rows.Close()
+			return TenantContext{}, false, fmt.Errorf("scan tenant context for instance %q: %w", workflowInstanceID, err)
+		}
+		found = append(found, tc)
 	}
-	return tc, true, nil
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return TenantContext{}, false, fmt.Errorf("get tenant context for instance %q: %w", workflowInstanceID, err)
+	}
+
+	switch len(found) {
+	case 0:
+		return TenantContext{}, false, nil
+	case 1:
+		return found[0], true, nil
+	default:
+		return TenantContext{}, false, fmt.Errorf("instance %q: %w", workflowInstanceID, ErrAmbiguousTenantContext)
+	}
 }
 
 func scanRows(rows pgx.Rows) ([]WorkflowHistoryEvent, error) {
@@ -366,16 +402,35 @@ func (f *FakeStore) ListByFilter(_ context.Context, filter QueryFilter) ([]Workf
 	return out, nil
 }
 
-// GetTenantContext returns the tenant context from the first event for the instance.
+// GetTenantContext mirrors PgStore: only workflow.started rows count, and
+// conflicting started rows are ErrAmbiguousTenantContext.
 func (f *FakeStore) GetTenantContext(_ context.Context, workflowInstanceID string) (TenantContext, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	var found []TenantContext
 	for _, e := range f.events {
-		if e.WorkflowInstanceID == workflowInstanceID {
-			return TenantContext{TenantID: e.TenantID, LegalEntityID: e.LegalEntityID}, true, nil
+		if e.WorkflowInstanceID != workflowInstanceID || e.EventType != EventTypeWorkflowStarted {
+			continue
+		}
+		tc := TenantContext{TenantID: e.TenantID, LegalEntityID: e.LegalEntityID}
+		dup := false
+		for _, x := range found {
+			if x == tc {
+				dup = true
+			}
+		}
+		if !dup {
+			found = append(found, tc)
 		}
 	}
-	return TenantContext{}, false, nil
+	switch len(found) {
+	case 0:
+		return TenantContext{}, false, nil
+	case 1:
+		return found[0], true, nil
+	default:
+		return TenantContext{}, false, fmt.Errorf("instance %q: %w", workflowInstanceID, ErrAmbiguousTenantContext)
+	}
 }
 
 // Count returns the total number of stored events (test helper).

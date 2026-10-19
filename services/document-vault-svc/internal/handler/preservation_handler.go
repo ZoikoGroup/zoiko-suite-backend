@@ -90,15 +90,15 @@ func (h *preservationHandler) CreateRendition(w http.ResponseWriter, r *http.Req
 	if _, ok := h.requireTenant(w, r); !ok {
 		return
 	}
+	if !h.authorize(w, r, principalID, "", actionRenditionManage) {
+		return
+	}
 	var req createRenditionRequest
 	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if req.SourceDocumentVersionID == "" {
 		writeError(w, http.StatusBadRequest, "missing_field", "source_document_version_id")
-		return
-	}
-	if !h.authorize(w, r, principalID, "", actionRenditionManage) {
 		return
 	}
 	rd, err := h.store.CreateRendition(r.Context(), domain.CreateRenditionParams{
@@ -148,15 +148,15 @@ func (h *preservationHandler) CreateFixityManifestForVersion(w http.ResponseWrit
 	if _, ok := h.requireTenant(w, r); !ok {
 		return
 	}
+	if !h.authorize(w, r, principalID, "", actionFixityManage) {
+		return
+	}
 	var req createFixityManifestRequest
 	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if req.DocumentVersionID == "" {
 		writeError(w, http.StatusBadRequest, "missing_field", "document_version_id")
-		return
-	}
-	if !h.authorize(w, r, principalID, "", actionFixityManage) {
 		return
 	}
 	m, err := h.store.CreateFixityManifestForVersion(r.Context(), req.DocumentVersionID, req.SourceHash, principalID)
@@ -218,11 +218,11 @@ func (h *preservationHandler) RecordVerification(w http.ResponseWriter, r *http.
 	if _, ok := h.requireTenant(w, r); !ok {
 		return
 	}
-	var req recordVerificationRequest
-	if !decodeJSON(w, r, &req) {
+	if !h.authorize(w, r, principalID, "", actionFixityManage) {
 		return
 	}
-	if !h.authorize(w, r, principalID, "", actionFixityManage) {
+	var req recordVerificationRequest
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	m, err := h.store.RecordVerification(r.Context(), domain.RecordVerificationParams{
@@ -248,11 +248,11 @@ func (h *preservationHandler) StartRepair(w http.ResponseWriter, r *http.Request
 	if _, ok := h.requireTenant(w, r); !ok {
 		return
 	}
-	var req startRepairRequest
-	if !decodeJSON(w, r, &req) {
+	if !h.authorize(w, r, principalID, "", actionFixityManage) {
 		return
 	}
-	if !h.authorize(w, r, principalID, "", actionFixityManage) {
+	var req startRepairRequest
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	m, err := h.store.StartRepair(r.Context(), domain.StartRepairParams{
@@ -283,15 +283,15 @@ func (h *preservationHandler) CreateRedactionProfile(w http.ResponseWriter, r *h
 	if _, ok := h.requireTenant(w, r); !ok {
 		return
 	}
+	if !h.authorize(w, r, principalID, "", actionRedactionManage) {
+		return
+	}
 	var req createRedactionProfileRequest
 	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if req.RenditionID == "" {
 		writeError(w, http.StatusBadRequest, "missing_field", "rendition_id")
-		return
-	}
-	if !h.authorize(w, r, principalID, "", actionRedactionManage) {
 		return
 	}
 	rp, err := h.store.CreateRedactionProfile(r.Context(), domain.CreateRedactionProfileParams{
@@ -346,11 +346,11 @@ func (h *preservationHandler) CreateExportPackage(w http.ResponseWriter, r *http
 	if _, ok := h.requireTenant(w, r); !ok {
 		return
 	}
-	var req createExportPackageRequest
-	if !decodeJSON(w, r, &req) {
+	if !h.authorize(w, r, principalID, "", actionExportManage) {
 		return
 	}
-	if !h.authorize(w, r, principalID, "", actionExportManage) {
+	var req createExportPackageRequest
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	items := make([]domain.ExportPackageItemInput, 0, len(req.Items))

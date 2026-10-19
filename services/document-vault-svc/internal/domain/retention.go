@@ -146,13 +146,15 @@ type BindRetentionRuleParams struct {
 }
 
 type RecordTriggerEventParams struct {
-	RetentionStateID string
-	TriggerDate      time.Time
+	RetentionStateID       string
+	TriggerDate            time.Time
+	TriggeredByPrincipalID string
 }
 
 type EvaluateDueParams struct {
-	RetentionStateID string
-	AsOf             time.Time
+	RetentionStateID       string
+	AsOf                   time.Time
+	EvaluatedByPrincipalID string
 }
 
 type FlagForReviewParams struct {

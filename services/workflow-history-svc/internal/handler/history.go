@@ -208,17 +208,22 @@ func (h *Handler) GetInstanceHistory(w http.ResponseWriter, r *http.Request) {
 
 // GetCrossWorkflowHistory handles GET /v1/workflows/history.
 //
-// Query parameters (all required):
-//   - tenant_id:       tenant scope for the query
-//   - legal_entity_id: legal entity scope for the query
-//   - from:            start of the time window (RFC3339)
-//   - to:              end of the time window (RFC3339)
+// Query parameters:
+//   - legal_entity_id: required; the legal entity scope for the query, and the
+//     scope authorization-svc is asked about
+//   - from:            required; start of the time window (RFC3339, inclusive)
+//   - to:              required; end of the time window (RFC3339, inclusive);
+//     must be after from
+//   - tenant_id:       optional; the tenant is the verified X-Tenant-Id header.
+//     If supplied it must equal the header, otherwise 403
 //
-// Returns all workflow history events for the given tenant and entity within
-// the specified time window, ordered by recorded_at ASC.
+// Returns all workflow history events for the verified tenant and the given
+// entity within the time window, ordered by recorded_at ASC. 401 if X-Tenant-Id
+// or X-Principal-Id is missing, 400 for a missing or invalid parameter, 403 if
+// authorization is denied, 503 if authorization-svc is unavailable.
 //
-// v1 Known Gap: evidence-manifest-svc is not wired to this endpoint.
-// See package doc for details.
+// evidence-manifest-svc's aggregator calls this endpoint for its workflow-history
+// time-window source (see package doc).
 func (h *Handler) GetCrossWorkflowHistory(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	legalEntityID := q.Get("legal_entity_id")

@@ -78,8 +78,12 @@ func main() {
 		log.Info("configuring ClamAV malware scanner", zap.String("clamav_url", cfg.ClamAVURL))
 		scanner = scan.NewClamAVScanner(cfg.ClamAVURL, 5*time.Second)
 	} else {
-		log.Info("no ClamAV URL configured — using NoOpScanner")
-		scanner = scan.NoOpScanner{}
+		// Fail closed. An absent scanner is NOT a clean verdict: every upload and
+		// every new version will be refused with 503 scan_unavailable until
+		// CLAMAV_URL is set. Everything that does not accept new bytes (reads,
+		// records, retention, holds, preservation) keeps working.
+		log.Error("no ClamAV URL configured (CLAMAV_URL) — document and version uploads will be REFUSED (fail-closed) until a malware scanner is configured")
+		scanner = scan.UnconfiguredScanner{}
 	}
 	h := handler.New(pgStore, storageBackend, residencyValidator, authzClient, scanner, log)
 	healthH := health.New(pool)

@@ -65,7 +65,8 @@ func (h *recordsHandler) DeclareRecord(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if _, ok := h.requireTenant(w, r); !ok {
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
 		return
 	}
 	var req declareRecordRequest
@@ -76,6 +77,27 @@ func (h *recordsHandler) DeclareRecord(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "missing_field", "document_id")
 		return
 	}
+
+	// The grant that matters is the one on the entity that OWNS the document.
+	// It used to be the caller's own legal_entity_id whenever one was supplied,
+	// so a principal with the declare grant on entity A could declare a record
+	// over entity B's document by naming A. The owning entity is resolved from
+	// the document (inherently before authorization — the scope lives on the
+	// resource) and is the only scope checked.
+	doc, err := h.Handler.store.FindDocumentByID(r.Context(), req.DocumentID)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	if !h.authorize(w, r, principalID, doc.LegalEntityID, actionRecordDeclare) {
+		return
+	}
+	if req.LegalEntityID != "" && req.LegalEntityID != doc.LegalEntityID {
+		writeError(w, http.StatusBadRequest, "legal_entity_mismatch",
+			"legal_entity_id does not match the legal entity that owns the document")
+		return
+	}
+
 	if req.DocumentVersionID == "" {
 		writeError(w, http.StatusBadRequest, "missing_field", "document_version_id")
 		return
@@ -89,21 +111,19 @@ func (h *recordsHandler) DeclareRecord(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resolvedLegalEntityID, err := h.resolveDocumentLegalEntity(r.Context(), req.DocumentID)
-	if err != nil {
-		h.handleStoreError(w, err)
-		return
-	}
-	legalEntityID := req.LegalEntityID
-	if legalEntityID == "" {
-		legalEntityID = resolvedLegalEntityID
-	}
-	if !h.authorize(w, r, principalID, legalEntityID, actionRecordDeclare) {
-		return
+	// §4.2 "Residency": the document's storage region must be allowed for the
+	// tenant at declaration time (the same registry check upload performs).
+	// Fail closed on a mismatch or an unreachable registry. Whether the record
+	// CLASS further restricts regions is not defined by the specification.
+	if doc.ResidencyRegionCode != nil && *doc.ResidencyRegionCode != "" {
+		if err := h.Handler.residency.CheckRegion(r.Context(), tenantID, *doc.ResidencyRegionCode); err != nil {
+			h.handleResidencyError(w, err)
+			return
+		}
 	}
 
 	rec, _, err := h.store.DeclareRecordV2(r.Context(), domain.DeclareRecordV2Params{
-		DocumentID: req.DocumentID, DocumentVersionID: req.DocumentVersionID, LegalEntityID: legalEntityID,
+		DocumentID: req.DocumentID, DocumentVersionID: req.DocumentVersionID, LegalEntityID: doc.LegalEntityID,
 		RecordClass: req.RecordClass, JurisdictionScope: req.JurisdictionScope, BusinessContext: req.BusinessContext,
 		RetentionScheduleRef: req.RetentionScheduleRef, DeclaredByPrincipalID: principalID,
 		DeclarationReason: req.DeclarationReason, CorrelationID: req.CorrelationID,
@@ -113,18 +133,6 @@ func (h *recordsHandler) DeclareRecord(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, rec)
-}
-
-// resolveDocumentLegalEntity resolves a document's legal_entity_id,
-// used only as a fallback authorization scope when the caller doesn't
-// supply one explicitly — mirrors how DeclareRecord (the existing
-// Document-flag command) resolves the owning document first.
-func (h *recordsHandler) resolveDocumentLegalEntity(ctx context.Context, documentID string) (string, error) {
-	doc, err := h.Handler.store.FindDocumentByID(ctx, documentID)
-	if err != nil {
-		return "", err
-	}
-	return doc.LegalEntityID, nil
 }
 
 func (h *recordsHandler) GetRecord(w http.ResponseWriter, r *http.Request) {

@@ -97,11 +97,11 @@ func (h *retentionHandler) CreateRetentionRuleVersion(w http.ResponseWriter, r *
 	if _, ok := h.requireTenant(w, r); !ok {
 		return
 	}
-	var req createRetentionRuleRequest
-	if !decodeJSON(w, r, &req) {
+	if !h.authorize(w, r, principalID, "", actionRetentionRuleManage) {
 		return
 	}
-	if !h.authorize(w, r, principalID, "", actionRetentionRuleManage) {
+	var req createRetentionRuleRequest
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	rr, err := h.store.CreateRetentionRuleVersion(r.Context(), domain.CreateRetentionRuleVersionParams{
@@ -194,6 +194,9 @@ func (h *retentionHandler) BindRetentionRule(w http.ResponseWriter, r *http.Requ
 	if _, ok := h.requireTenant(w, r); !ok {
 		return
 	}
+	if !h.authorize(w, r, principalID, "", actionRetentionStateManage) {
+		return
+	}
 	var req bindRetentionRuleRequest
 	if !decodeJSON(w, r, &req) {
 		return
@@ -204,9 +207,6 @@ func (h *retentionHandler) BindRetentionRule(w http.ResponseWriter, r *http.Requ
 	}
 	if req.RetentionRuleVersionID == "" {
 		writeError(w, http.StatusBadRequest, "missing_field", "retention_rule_version_id")
-		return
-	}
-	if !h.authorize(w, r, principalID, "", actionRetentionStateManage) {
 		return
 	}
 	st, err := h.store.BindRetentionRule(r.Context(), domain.BindRetentionRuleParams{
@@ -270,6 +270,9 @@ func (h *retentionHandler) RecordTriggerEvent(w http.ResponseWriter, r *http.Req
 	if _, ok := h.requireTenant(w, r); !ok {
 		return
 	}
+	if !h.authorize(w, r, principalID, "", actionRetentionStateManage) {
+		return
+	}
 	var req recordTriggerEventRequest
 	if !decodeJSON(w, r, &req) {
 		return
@@ -278,11 +281,9 @@ func (h *retentionHandler) RecordTriggerEvent(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusBadRequest, "missing_field", "trigger_date")
 		return
 	}
-	if !h.authorize(w, r, principalID, "", actionRetentionStateManage) {
-		return
-	}
 	st, err := h.store.RecordTriggerEvent(r.Context(), domain.RecordTriggerEventParams{
 		RetentionStateID: chi.URLParam(r, "retention_state_id"), TriggerDate: req.TriggerDate,
+		TriggeredByPrincipalID: principalID,
 	})
 	if err != nil {
 		h.handleRetentionStoreError(w, err)
@@ -303,6 +304,9 @@ func (h *retentionHandler) EvaluateDue(w http.ResponseWriter, r *http.Request) {
 	if _, ok := h.requireTenant(w, r); !ok {
 		return
 	}
+	if !h.authorize(w, r, principalID, "", actionRetentionStateManage) {
+		return
+	}
 	var req evaluateDueRequest
 	if !decodeJSON(w, r, &req) {
 		return
@@ -311,11 +315,9 @@ func (h *retentionHandler) EvaluateDue(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "missing_field", "as_of")
 		return
 	}
-	if !h.authorize(w, r, principalID, "", actionRetentionStateManage) {
-		return
-	}
 	st, err := h.store.EvaluateDue(r.Context(), domain.EvaluateDueParams{
 		RetentionStateID: chi.URLParam(r, "retention_state_id"), AsOf: req.AsOf,
+		EvaluatedByPrincipalID: principalID,
 	})
 	if err != nil {
 		h.handleRetentionStoreError(w, err)
@@ -336,11 +338,11 @@ func (h *retentionHandler) FlagForReview(w http.ResponseWriter, r *http.Request)
 	if _, ok := h.requireTenant(w, r); !ok {
 		return
 	}
-	var req flagForReviewRequest
-	if !decodeJSON(w, r, &req) {
+	if !h.authorize(w, r, principalID, "", actionRetentionStateManage) {
 		return
 	}
-	if !h.authorize(w, r, principalID, "", actionRetentionStateManage) {
+	var req flagForReviewRequest
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	st, err := h.store.FlagForReview(r.Context(), domain.FlagForReviewParams{
@@ -393,6 +395,9 @@ func (h *retentionHandler) CreateLegalHold(w http.ResponseWriter, r *http.Reques
 	if _, ok := h.requireTenant(w, r); !ok {
 		return
 	}
+	if !h.authorize(w, r, principalID, "", actionLegalHoldManage) {
+		return
+	}
 	var req createLegalHoldRequest
 	if !decodeJSON(w, r, &req) {
 		return
@@ -403,9 +408,6 @@ func (h *retentionHandler) CreateLegalHold(w http.ResponseWriter, r *http.Reques
 	}
 	if req.HoldReasonCode == "" {
 		writeError(w, http.StatusBadRequest, "missing_field", "hold_reason_code")
-		return
-	}
-	if !h.authorize(w, r, principalID, "", actionLegalHoldManage) {
 		return
 	}
 	hold, err := h.store.CreateLegalHold(r.Context(), domain.CreateLegalHoldParams{
@@ -471,15 +473,15 @@ func (h *retentionHandler) AddLegalHoldTarget(w http.ResponseWriter, r *http.Req
 	if _, ok := h.requireTenant(w, r); !ok {
 		return
 	}
+	if !h.authorize(w, r, principalID, "", actionLegalHoldManage) {
+		return
+	}
 	var req addLegalHoldTargetRequest
 	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if req.RecordID == "" {
 		writeError(w, http.StatusBadRequest, "missing_field", "record_id")
-		return
-	}
-	if !h.authorize(w, r, principalID, "", actionLegalHoldManage) {
 		return
 	}
 	target, err := h.store.AddLegalHoldTarget(r.Context(), domain.AddLegalHoldTargetParams{
@@ -534,6 +536,9 @@ func (h *retentionHandler) ReleaseLegalHold(w http.ResponseWriter, r *http.Reque
 	if _, ok := h.requireTenant(w, r); !ok {
 		return
 	}
+	if !h.authorize(w, r, principalID, "", actionLegalHoldManage) {
+		return
+	}
 	var req releaseLegalHoldRequest
 	if !decodeJSON(w, r, &req) {
 		return
@@ -548,9 +553,6 @@ func (h *retentionHandler) ReleaseLegalHold(w http.ResponseWriter, r *http.Reque
 	}
 	if principalID == req.ReleaseApprovedByPrincipalID {
 		writeError(w, http.StatusForbidden, "self_release_forbidden", domain.ErrLegalHoldSelfRelease.Error())
-		return
-	}
-	if !h.authorize(w, r, principalID, "", actionLegalHoldManage) {
 		return
 	}
 	if !h.authorize(w, r, req.ReleaseApprovedByPrincipalID, "", actionLegalHoldManage) {

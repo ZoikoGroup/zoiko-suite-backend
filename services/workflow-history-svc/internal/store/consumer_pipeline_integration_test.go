@@ -326,4 +326,99 @@ func TestConsumerPipelineIntegration(t *testing.T) {
 			assert.Equal(t, "e-all", e.LegalEntityID)
 		}
 	})
+
+	// ── Tenant-context inheritance (workflow.started is the only source) ─────
+	// Every assertion below reads the PERSISTED row with a raw query, not the
+	// value the consumer returned, so it proves what was actually written.
+	persisted := func(t *testing.T, eventID string) (tenant, entity string, ok bool) {
+		t.Helper()
+		err := pool.QueryRow(ctx, `SELECT tenant_id, legal_entity_id FROM workflow_history_events WHERE event_id=$1`, eventID).Scan(&tenant, &entity)
+		if err != nil {
+			return "", "", false
+		}
+		return tenant, entity, true
+	}
+	seedRaw := func(t *testing.T, eventID, instance, eventType, tenant, entity string, at time.Time) {
+		t.Helper()
+		_, err := pool.Exec(ctx, `INSERT INTO workflow_history_events (event_id, workflow_instance_id, event_type, correlation_id, tenant_id, legal_entity_id, payload, recorded_at)
+			VALUES ($1,$2,$3,'corr',$4,$5,'{}',$6)`, eventID, instance, eventType, tenant, entity, at)
+		require.NoError(t, err)
+	}
+	granted := func(t *testing.T, instance string) []byte {
+		return buildMessage(t, "approval.granted", "corr-tc", map[string]any{
+			"workflow_instance_id": instance, "stage_order": 1, "approver_principal_id": "u-x",
+		})
+	}
+	started := func(t *testing.T, instance, tenant, entity string) []byte {
+		return buildMessage(t, "workflow.started", "corr-tc", map[string]any{
+			"workflow_instance_id": instance, "tenant_id": tenant, "legal_entity_id": entity,
+		})
+	}
+
+	t.Run("tenant context: persisted tenant/entity come from the started row", func(t *testing.T) {
+		require.NoError(t, c.Handle(ctx, "tc1-start", started(t, "wf-tc1", "t-tc1", "e-tc1")))
+		require.NoError(t, c.Handle(ctx, "tc1-g1", granted(t, "wf-tc1")))
+		require.NoError(t, c.Handle(ctx, "tc1-g2", granted(t, "wf-tc1")))
+		for _, id := range []string{"tc1-start", "tc1-g1", "tc1-g2"} {
+			tenant, entity, ok := persisted(t, id)
+			require.True(t, ok, id)
+			assert.Equal(t, "t-tc1", tenant, id)
+			assert.Equal(t, "e-tc1", entity, id)
+		}
+	})
+
+	t.Run("tenant context: an earlier non-start row is never used as the source", func(t *testing.T) {
+		// A rogue non-start row, older than the started row, for the same instance.
+		seedRaw(t, "tc2-rogue", "wf-tc2", "approval.granted", "t-rogue", "e-rogue", time.Now().Add(-time.Hour))
+		require.NoError(t, c.Handle(ctx, "tc2-start", started(t, "wf-tc2", "t-real", "e-real")))
+		require.NoError(t, c.Handle(ctx, "tc2-next", granted(t, "wf-tc2")))
+
+		tenant, entity, ok := persisted(t, "tc2-next")
+		require.True(t, ok)
+		assert.Equal(t, "t-real", tenant, "inherited from the workflow.started row, not the earliest row")
+		assert.Equal(t, "e-real", entity)
+	})
+
+	t.Run("tenant context: no started row, only non-start rows -> fail closed, nothing stored", func(t *testing.T) {
+		seedRaw(t, "tc3-rogue", "wf-tc3", "workflow.completed", "t-rogue", "e-rogue", time.Now().Add(-time.Hour))
+		err := c.Handle(ctx, "tc3-next", granted(t, "wf-tc3"))
+		require.Error(t, err)
+		_, _, ok := persisted(t, "tc3-next")
+		assert.False(t, ok, "the refused event must not be persisted")
+	})
+
+	t.Run("tenant context: same instance id under two tenants is ambiguous, nothing inherited", func(t *testing.T) {
+		// The schema keys on event_id only, so this state is representable.
+		require.NoError(t, c.Handle(ctx, "tc4-start-a", started(t, "wf-tc4", "t-tc4-a", "e-tc4-a")))
+		require.NoError(t, c.Handle(ctx, "tc4-start-b", started(t, "wf-tc4", "t-tc4-b", "e-tc4-b")))
+
+		err := c.Handle(ctx, "tc4-next", granted(t, "wf-tc4"))
+		require.ErrorIs(t, err, store.ErrAmbiguousTenantContext)
+		_, _, ok := persisted(t, "tc4-next")
+		assert.False(t, ok, "must not be filed under either tenant")
+
+		// And each tenant still sees only its own started row.
+		a, err := pgStore.ListByInstance(ctx, "t-tc4-a", "wf-tc4")
+		require.NoError(t, err)
+		require.Len(t, a, 1)
+		assert.Equal(t, "e-tc4-a", a[0].LegalEntityID)
+	})
+
+	t.Run("tenant context: duplicate started rows with the same context are not ambiguous", func(t *testing.T) {
+		require.NoError(t, c.Handle(ctx, "tc5-start-1", started(t, "wf-tc5", "t-tc5", "e-tc5")))
+		require.NoError(t, c.Handle(ctx, "tc5-start-2", started(t, "wf-tc5", "t-tc5", "e-tc5")))
+		require.NoError(t, c.Handle(ctx, "tc5-next", granted(t, "wf-tc5")))
+		tenant, entity, ok := persisted(t, "tc5-next")
+		require.True(t, ok)
+		assert.Equal(t, "t-tc5", tenant)
+		assert.Equal(t, "e-tc5", entity)
+	})
+
+	t.Run("tenant context: no cross-tenant inheritance for an unrelated instance", func(t *testing.T) {
+		require.NoError(t, c.Handle(ctx, "tc6-start", started(t, "wf-tc6-a", "t-tc6", "e-tc6")))
+		err := c.Handle(ctx, "tc6-next", granted(t, "wf-tc6-other"))
+		require.Error(t, err, "another instance's started row must not be borrowed")
+		_, _, ok := persisted(t, "tc6-next")
+		assert.False(t, ok)
+	})
 }

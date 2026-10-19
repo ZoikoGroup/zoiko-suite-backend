@@ -82,59 +82,41 @@ func (s *stubStore) tenantOf(ctx context.Context, manifestID string) (*domain.Ev
 	return m, true
 }
 
-func (s *stubStore) CreateManifest(ctx context.Context, m *domain.EvidenceManifest) error {
+// CompleteManifest mirrors PgStore's all-or-nothing contract: on error nothing
+// is stored; on success the manifest, its records and one outbox event exist.
+func (s *stubStore) CompleteManifest(ctx context.Context, m *domain.EvidenceManifest, records []domain.ManifestRecord, correlationID string) (*domain.EvidenceManifest, error) {
 	if s.createErr != nil {
-		return s.createErr
+		return nil, s.createErr
 	}
 	m.ManifestID = "manifest-1"
-	m.Status = domain.StatusPending
-	// Attribution comes from the verified context, as in PgStore — never
-	// from the request body, which is what made the tenant caller-declared.
+	m.Status = domain.StatusGenerated
 	m.TenantID = svcmiddleware.TenantFromContext(ctx)
 	s.manifests[m.ManifestID] = m
-	return nil
-}
-
-func (s *stubStore) AddRecord(ctx context.Context, r *domain.ManifestRecord) error {
-	// Mirrors the RLS WITH CHECK on manifest_records: a record cannot be
-	// appended to a manifest the caller cannot see.
-	if _, ok := s.tenantOf(ctx, r.ManifestID); !ok {
-		return domain.ErrManifestNotFound
+	for i := range records {
+		r := records[i]
+		r.ManifestID = m.ManifestID
+		r.ManifestRecordID = "record-" + r.SourceRecordID
+		s.records[m.ManifestID] = append(s.records[m.ManifestID], r)
 	}
-	r.ManifestRecordID = "record-" + r.SourceRecordID
-	s.records[r.ManifestID] = append(s.records[r.ManifestID], *r)
-	return nil
-}
-
-func (s *stubStore) FinalizeGenerated(ctx context.Context, manifestID, checksum string, correlationID ...string) (*domain.EvidenceManifest, error) {
-	m, ok := s.tenantOf(ctx, manifestID)
-	if !ok {
-		return nil, domain.ErrManifestNotFound
-	}
-	m.Status = domain.StatusGenerated
+	checksum := domain.ManifestChecksum(s.records[m.ManifestID])
 	m.ChecksumSHA256 = &checksum
-	corrID := ""
-	if len(correlationID) > 0 {
-		corrID = correlationID[0]
-	}
 	s.outboxEvents = append(s.outboxEvents, outbox.Event{
 		AggregateType: "MANIFEST",
-		AggregateID:   manifestID,
+		AggregateID:   m.ManifestID,
 		EventType:     "evidence.manifest.generated",
 		TenantID:      m.TenantID,
 		LegalEntityID: m.LegalEntityID,
-		CorrelationID: corrID,
+		CorrelationID: correlationID,
 	})
 	return m, nil
 }
 
-func (s *stubStore) FinalizeFailed(ctx context.Context, manifestID, reason string) (*domain.EvidenceManifest, error) {
-	m, ok := s.tenantOf(ctx, manifestID)
-	if !ok {
-		return nil, domain.ErrManifestNotFound
-	}
+func (s *stubStore) RecordFailedManifest(ctx context.Context, m *domain.EvidenceManifest, reason string) (*domain.EvidenceManifest, error) {
+	m.ManifestID = "manifest-1"
 	m.Status = domain.StatusFailed
+	m.TenantID = svcmiddleware.TenantFromContext(ctx)
 	m.FailureReason = &reason
+	s.manifests[m.ManifestID] = m
 	return m, nil
 }
 

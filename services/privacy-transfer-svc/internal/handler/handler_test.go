@@ -46,8 +46,6 @@ func (p *stubPublisher) published(eventType string) bool {
 	return false
 }
 
-var _ events.Publisher = (*stubPublisher)(nil)
-
 // ── stub authz ───────────────────────────────────────────────────────────────
 
 type stubAuthz struct{ deny bool }
@@ -70,7 +68,7 @@ func newStubPurposeRegistry() *stubPurposeRegistry {
 	return &stubPurposeRegistry{activities: map[string]*purposeregistry.ActivityVersion{}}
 }
 
-func (p *stubPurposeRegistry) ResolveActivity(_ context.Context, _, activityID string) (*purposeregistry.ActivityVersion, error) {
+func (p *stubPurposeRegistry) ResolveActivity(_ context.Context, _, _, activityID string) (*purposeregistry.ActivityVersion, error) {
 	if p.err != nil {
 		return nil, p.err
 	}
@@ -81,9 +79,12 @@ func (p *stubPurposeRegistry) ResolveActivity(_ context.Context, _, activityID s
 
 const testTenant = "tenant-transfer-1"
 
-func newTestRouter(st *stubStore, pub *stubPublisher, az *stubAuthz, purposes *stubPurposeRegistry) chi.Router {
+func tctx() context.Context { return middleware.WithTenant(context.Background(), testTenant) }
+
+func newTestRouter(st *stubStore, pub *stubPublisher, az handler.AuthzChecker, purposes *stubPurposeRegistry) chi.Router {
 	logger := zap.NewNop()
-	h := handler.New(st, pub, az, purposes, logger)
+	st.pub = pub // the store "enqueues" events; the stub records the committed ones here
+	h := handler.New(st, az, purposes, logger)
 	r := chi.NewRouter()
 	r.Use(middleware.TenantContext())
 	handler.RegisterRoutes(r, h)
@@ -188,7 +189,7 @@ func TestUpdateRelationshipStatus_ToInactive(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
-	updated, _ := st.FindRelationship(context.Background(), rel.RelationshipID)
+	updated, _ := st.FindRelationship(tctx(), rel.RelationshipID)
 	if updated.Status != domain.RelationshipInactive {
 		t.Fatalf("expected INACTIVE, got %s", updated.Status)
 	}
