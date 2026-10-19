@@ -1332,6 +1332,33 @@ func (s *PgStore) AmendAccountVersion(
 	return out, nil
 }
 
+// GetAccountAsOf reconstructs the account version in force at asOf. The
+// interval is half-open [effective_from, effective_to): the version that
+// started exactly at asOf is the one that applies, and the one whose
+// effective_to equals asOf has already been superseded.
+func (s *PgStore) GetAccountAsOf(ctx context.Context, tenantID, accountCode string, asOf time.Time) (*domain.AccountVersion, error) {
+	var version *domain.AccountVersion
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		row := tx.QueryRow(ctx, `SELECT `+accountVersionColumns+`
+			FROM account_versions
+			WHERE tenant_id = $1 AND account_code = $2
+			  AND effective_from <= $3
+			  AND (effective_to IS NULL OR effective_to > $3)
+			ORDER BY effective_from DESC, version DESC
+			LIMIT 1`, tenantID, accountCode, asOf)
+		var err error
+		version, err = scanAccountVersion(row)
+		return mapPgError(err)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrAccountNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return version, nil
+}
+
 func (s *PgStore) GetAccountByCode(ctx context.Context, tenantID, accountCode string) (*domain.Account, error) {
 	var a *domain.Account
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {

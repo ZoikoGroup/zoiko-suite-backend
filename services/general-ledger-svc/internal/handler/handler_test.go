@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 	"time"
 
@@ -341,6 +342,27 @@ func (s *stubStore) ListAccounts(_ context.Context, tenantID string) ([]domain.A
 		}
 	}
 	return out, nil
+}
+
+// GetAccountAsOf mirrors the real store's half-open interval lookup
+// [effective_from, effective_to) over the stub's own version history.
+func (s *stubStore) GetAccountAsOf(_ context.Context, tenantID, accountCode string, asOf time.Time) (*domain.AccountVersion, error) {
+	var found *domain.AccountVersion
+	for _, v := range s.accountVersions[tenantID+"|"+accountCode] {
+		if v.EffectiveFrom.After(asOf) {
+			continue
+		}
+		if v.EffectiveTo != nil && !asOf.Before(*v.EffectiveTo) {
+			continue
+		}
+		if found == nil || v.Version > found.Version {
+			found = v
+		}
+	}
+	if found == nil {
+		return nil, domain.ErrAccountNotFound
+	}
+	return found, nil
 }
 
 // ReparentAccount mirrors the real store's guards: cycles are refused by
@@ -1776,6 +1798,100 @@ func TestResolvePostingEligibility_StaticRouteReadsAccountCodeFromBody(t *testin
 	}
 	if !result.Registered || !result.Eligible || result.Version != 1 {
 		t.Fatalf("expected the registered account to be eligible at version 1, got %+v", result)
+	}
+}
+
+func TestGetAccountAsOf_ReturnsVersionInForceAtInstant(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1000", AccountName: "Cash", AccountType: domain.AccountTypeAsset})
+
+	created := s.accountVersions["t1|1000"][0].EffectiveFrom
+	amendAt := created.Add(time.Hour).Truncate(time.Second)
+	rec := doRequest(r, http.MethodPost, "/v1/chart-of-accounts/1000/amend", map[string]any{
+		"account_name":   "Cash on hand",
+		"effective_from": amendAt.Format(time.RFC3339),
+	}, "principal-1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("amend: expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Between creation and the amendment, version 1 was in force — with its
+	// interval closed exactly at the amendment.
+	rec = doRequest(r, http.MethodGet,
+		"/v1/chart-of-accounts/1000/as-of?as_of="+url.QueryEscape(created.Add(30*time.Minute).Format(time.RFC3339)),
+		nil, "principal-1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var v1 domain.AccountVersion
+	if err := json.Unmarshal(rec.Body.Bytes(), &v1); err != nil {
+		t.Fatalf("as-of result is not valid JSON: %v", err)
+	}
+	if v1.Version != 1 || v1.AccountName != "Cash" {
+		t.Fatalf("expected version 1 named %q, got version %d named %q", "Cash", v1.Version, v1.AccountName)
+	}
+	if v1.EffectiveTo == nil || !v1.EffectiveTo.Equal(amendAt) {
+		t.Fatalf("version 1 interval must close at the amendment, got %v", v1.EffectiveTo)
+	}
+
+	// At the amendment instant the interval is half-open, so version 2 applies.
+	rec = doRequest(r, http.MethodGet,
+		"/v1/chart-of-accounts/1000/as-of?as_of="+url.QueryEscape(amendAt.Format(time.RFC3339)),
+		nil, "principal-1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var v2 domain.AccountVersion
+	if err := json.Unmarshal(rec.Body.Bytes(), &v2); err != nil {
+		t.Fatalf("as-of result is not valid JSON: %v", err)
+	}
+	if v2.Version != 2 || v2.AccountName != "Cash on hand" || v2.EffectiveTo != nil {
+		t.Fatalf("expected the open version 2 named %q at the amendment instant, got %+v", "Cash on hand", v2)
+	}
+}
+
+func TestGetAccountAsOf_MissingAsOf_Returns400(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	rec := doRequest(r, http.MethodGet, "/v1/chart-of-accounts/1000/as-of", nil, "principal-1")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 when as_of is absent, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestGetAccountAsOf_BeforeAccountExisted_Returns404(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1000", AccountName: "Cash", AccountType: domain.AccountTypeAsset})
+
+	created := s.accountVersions["t1|1000"][0].EffectiveFrom
+	before := created.Add(-time.Hour).Format(time.RFC3339)
+	rec := doRequest(r, http.MethodGet,
+		"/v1/chart-of-accounts/1000/as-of?as_of="+url.QueryEscape(before), nil, "principal-1")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 before the account's first version, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestGetAccountAsOf_StaticRouteReadsAccountCodeFromBody(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1000", AccountName: "Cash", AccountType: domain.AccountTypeAsset})
+
+	created := s.accountVersions["t1|1000"][0].EffectiveFrom
+	rec := doRequest(r, http.MethodPost, "/v1/chart-of-accounts/as-of", map[string]any{
+		"account_code": "1000",
+		"as_of":        created.Add(time.Second).Format(time.RFC3339),
+	}, "principal-1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var result domain.AccountVersion
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatalf("as-of result is not valid JSON: %v", err)
+	}
+	if result.Version != 1 || result.AccountName != "Cash" {
+		t.Fatalf("expected the creation version, got %+v", result)
 	}
 }
 

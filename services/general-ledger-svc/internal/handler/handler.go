@@ -57,6 +57,7 @@ type Store interface {
 	ActivateAccount(ctx context.Context, tenantID, accountCode string, expectedVersion int64, effectiveFrom time.Time, reason string, evidenceRefs []string, principalID string) (*domain.Account, error)
 	DeactivateAccount(ctx context.Context, tenantID, accountCode string, expectedVersion int64, effectiveFrom time.Time, reason string, evidenceRefs []string, principalID string) (*domain.Account, error)
 	ReparentAccount(ctx context.Context, tenantID, accountCode string, parentAccountID *string, expectedVersion int64, effectiveFrom time.Time, reason string, evidenceRefs []string, principalID string) (*domain.Account, error)
+	GetAccountAsOf(ctx context.Context, tenantID, accountCode string, asOf time.Time) (*domain.AccountVersion, error)
 
 	// ACC-02 Account Mapping — see migration 000008's doc comment.
 	SetAccountMapping(ctx context.Context, m *domain.AccountMapping) error
@@ -298,7 +299,11 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/", h.ListAccounts)
 		r.Get("/resolve-posting-eligibility", h.ResolvePostingEligibility)
 		r.Post("/resolve-posting-eligibility", h.ResolvePostingEligibility)
+		r.Get("/as-of", h.GetAccountAsOf)
+		r.Post("/as-of", h.GetAccountAsOf)
 		r.Get("/{account_code}", h.GetAccount)
+		r.Get("/{account_code}/as-of", h.GetAccountAsOf)
+		r.Post("/{account_code}/as-of", h.GetAccountAsOf)
 		r.Get("/{account_code}/posting-eligibility", h.ResolvePostingEligibility)
 		r.Post("/{account_code}/posting-eligibility", h.ResolvePostingEligibility)
 		r.Post("/{account_code}/amend", h.AmendAccountVersion)
@@ -960,6 +965,75 @@ func (h *Handler) ResolvePostingEligibility(w http.ResponseWriter, r *http.Reque
 		}
 	}
 	writeJSON(w, http.StatusOK, eligibility)
+}
+
+// GetAccountAsOf answers the point-in-time read over AmendAccountVersion's
+// history: which version of this account was in force at as_of. The natural
+// callers are audit/reporting reconstructions and any consumer that must
+// explain what the posting engine could have seen on an earlier date.
+func (h *Handler) GetAccountAsOf(w http.ResponseWriter, r *http.Request) {
+	var req domain.GetAccountAsOfRequest
+	if r.Method == http.MethodPost {
+		if !decodeOptionalJSON(w, r, &req) {
+			return
+		}
+	}
+	q := r.URL.Query()
+	accountCode := chi.URLParam(r, "account_code")
+	if accountCode == "" {
+		accountCode = req.AccountCode
+	}
+	if accountCode == "" {
+		accountCode = q.Get("account_code")
+	}
+	if accountCode == "" {
+		writeError(w, http.StatusBadRequest, "missing_field", "account_code is required")
+		return
+	}
+
+	asOf := req.AsOf
+	if asOf == nil {
+		for _, key := range []string{"as_of", "at", "effective_at"} {
+			if raw := q.Get(key); raw != "" {
+				var parsed domain.EffectiveDate
+				if err := json.Unmarshal([]byte(strconv.Quote(raw)), &parsed); err != nil {
+					writeError(w, http.StatusBadRequest, "invalid_field", domain.ErrAccountEffectiveDateRequired.Error())
+					return
+				}
+				asOf = &parsed
+				break
+			}
+		}
+	}
+	if asOf == nil {
+		writeError(w, http.StatusBadRequest, "missing_field", domain.ErrAccountEffectiveDateRequired.Error())
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, coaPlatformScopeID, actionViewAccount); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	version, err := h.store.GetAccountAsOf(r.Context(), tenantID, accountCode, asOf.Time)
+	if errors.Is(err, domain.ErrAccountNotFound) {
+		writeError(w, http.StatusNotFound, "account_not_found", "")
+		return
+	}
+	if err != nil {
+		h.log.Error("GetAccountAsOf: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+	writeJSON(w, http.StatusOK, version)
 }
 
 // ReparentAccount changes an account's position in the chart hierarchy. The

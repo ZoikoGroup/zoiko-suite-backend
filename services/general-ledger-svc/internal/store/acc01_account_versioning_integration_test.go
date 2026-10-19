@@ -276,3 +276,64 @@ func TestPgStore_AmendAccountVersion_StaleExpectedVersionIsRefused(t *testing.T)
 		t.Fatalf("refused amendment must leave the head untouched, got %+v", head)
 	}
 }
+
+func TestPgStore_GetAccountAsOf_ReconstructsVersionInForce(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+
+	created := time.Date(2026, 9, 1, 9, 0, 0, 0, time.UTC)
+	acct := newTestAccount(tenantID, "1000", "Cash")
+	acct.CreatedAt = created
+	if err := s.CreateAccount(ctx, acct); err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+
+	amendAt := created.Add(24 * time.Hour)
+	updates := *acct
+	updates.AccountName = "Cash on hand"
+	if _, err := s.AmendAccountVersion(ctx, tenantID, "1000", 1, amendAt, &updates, "renamed by finance", nil, "test-admin"); err != nil {
+		t.Fatalf("AmendAccountVersion: %v", err)
+	}
+
+	// Inside the first interval: version 1, whose interval was closed exactly
+	// at the amendment instant.
+	v1, err := s.GetAccountAsOf(ctx, tenantID, "1000", created.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("GetAccountAsOf (v1): %v", err)
+	}
+	if v1.Version != 1 || v1.AccountName != "Cash" {
+		t.Fatalf("expected version 1 named %q, got version %d named %q", "Cash", v1.Version, v1.AccountName)
+	}
+	if v1.EffectiveTo == nil || !v1.EffectiveTo.Equal(amendAt) {
+		t.Fatalf("version 1 interval must close at the amendment, got %v", v1.EffectiveTo)
+	}
+
+	// The interval is half-open [effective_from, effective_to): the version
+	// that starts exactly at the instant is the one in force.
+	v2, err := s.GetAccountAsOf(ctx, tenantID, "1000", amendAt)
+	if err != nil {
+		t.Fatalf("GetAccountAsOf at amendment instant: %v", err)
+	}
+	if v2.Version != 2 || v2.AccountName != "Cash on hand" {
+		t.Fatalf("expected version 2 at the amendment instant, got version %d named %q", v2.Version, v2.AccountName)
+	}
+	if v2.EffectiveTo != nil {
+		t.Fatalf("the current version's interval must stay open, got %v", v2.EffectiveTo)
+	}
+
+	// And it remains in force afterwards.
+	v2Later, err := s.GetAccountAsOf(ctx, tenantID, "1000", amendAt.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("GetAccountAsOf after amendment: %v", err)
+	}
+	if v2Later.Version != 2 {
+		t.Fatalf("expected version 2 to remain in force, got %d", v2Later.Version)
+	}
+
+	// Before the account's first version, nothing was in force.
+	if _, err := s.GetAccountAsOf(ctx, tenantID, "1000", created.Add(-time.Second)); !errors.Is(err, domain.ErrAccountNotFound) {
+		t.Fatalf("expected ErrAccountNotFound before the account existed, got %v", err)
+	}
+}

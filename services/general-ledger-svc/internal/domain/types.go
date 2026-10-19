@@ -502,6 +502,15 @@ func EvaluatePostingEligibility(accountCode string, a *Account, override bool) P
 	return result
 }
 
+// GetAccountAsOfRequest is the point-in-time read over the version history.
+// AsOf is required; a request without one is refused rather than defaulted to
+// "now", because a historical read with an accidental current-time default
+// returns a plausible wrong answer.
+type GetAccountAsOfRequest struct {
+	AccountCode string         `json:"account_code,omitempty"`
+	AsOf        *EffectiveDate `json:"as_of,omitempty"`
+}
+
 // ReparentAccountRequest changes an account's parent in the chart hierarchy.
 // The parent field is required but may be null: an explicit null makes the
 // account a root, while omitting the field entirely is refused so an
