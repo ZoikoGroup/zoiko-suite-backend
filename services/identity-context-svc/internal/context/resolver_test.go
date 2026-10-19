@@ -647,3 +647,13 @@ func TestInvalidateSession_NoOp_WhenSessionNotFound(t *testing.T) {
 	require.NoError(t, err) // must not error on missing session
 	assert.Empty(t, f.sessions.invalidated)
 }
+
+// INT-NP-042: SAML federation is deferred by decision. An assertion must fail closed: refused as unsupported, no
+// session minted, and no fallback to trusting it, to OIDC, or to the password path.
+func TestResolve_SAMLAssertionFailsClosedWithNoFallback(t *testing.T) {
+	f := defaultFixture()
+	req := domain.ResolveRequest{SAMLAssertion: "PHNhbWw+Zm9yZ2VkPC9zYW1sPg==", LegalEntityID: "eid", CorrelationID: "cid"}
+	_, err := f.build().Resolve(context.Background(), req)
+	require.ErrorIs(t, err, identityctx.ErrSAMLUnsupported)
+	assert.Empty(t, f.sessions.storedCtx, "a refused assertion must not leave a session behind")
+}

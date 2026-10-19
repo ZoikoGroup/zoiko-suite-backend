@@ -31,7 +31,9 @@ import (
 	"fmt"
 	"math"
 	"math/rand/v2"
+	"regexp"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -62,6 +64,9 @@ const (
 	CodeInvalidStored     = "INVALID_STORED_ENVELOPE"
 	CodeSchemaRejected    = "SCHEMA_REJECTED"
 	CodeGateUnavailable   = "GATE_UNAVAILABLE"
+	// CodePartitionKey: the row carries a partition key that is not the envelope's opaque hash. Publishing it would
+	// silently break per-aggregate ordering, so it is quarantined instead (INT-NP-009).
+	CodePartitionKey = "PARTITION_KEY_INVALID"
 )
 
 // EventIDHeader carries the event id as a Kafka header as well as in the body.
@@ -328,6 +333,10 @@ func (r *Relay) DrainOnce(ctx context.Context) (PassResult, error) {
 			// The row cannot be what Enqueue wrote. Retrying will not change
 			// it, and sending it would hand consumers a malformed event.
 			r.recordFailure(ctx, rec, true, CodeInvalidStored, err, &res)
+			continue
+		}
+		if !validPartitionKey(rec.partitionKey) {
+			r.recordFailure(ctx, rec, true, CodePartitionKey, errors.New("partition key is not the envelope's opaque hash"), &res)
 			continue
 		}
 		if r.gate != nil {
@@ -916,4 +925,25 @@ func (r *Relay) VerifyPartitioning(ctx context.Context, since time.Time) ([]Part
 		return nil, fmt.Errorf("outbox: verify partitioning: %w", err)
 	}
 	return out, nil
+}
+
+var partitionKeyShape = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+func validPartitionKey(k string) bool { return partitionKeyShape.MatchString(k) }
+
+// RequirePartitioning is VerifyPartitioning as a gate: it returns an error naming every violation, for a producer to
+// run at startup or in CI so that a misconfigured producer cannot go live (INT-NP-009).
+func (r *Relay) RequirePartitioning(ctx context.Context, since time.Time) error {
+	v, err := r.VerifyPartitioning(ctx, since)
+	if err != nil {
+		return err
+	}
+	if len(v) == 0 {
+		return nil
+	}
+	parts := make([]string, 0, len(v))
+	for _, x := range v {
+		parts = append(parts, fmt.Sprintf("%s (tenant %s): %s", x.Kind, x.TenantID, x.Detail))
+	}
+	return fmt.Errorf("outbox: partition-key policy violated: %s", strings.Join(parts, "; "))
 }
