@@ -138,10 +138,105 @@ func TestEvaluateJobStatus(t *testing.T) {
 		{"all records invalid fails even at a zero bar", 0, 0, 4, 0, JobStatusFailed},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := EvaluateJobStatus(tc.score, tc.valid, tc.invalid, tc.threshold); got != tc.want {
+			if got := EvaluateJobStatus(tc.score, tc.valid, tc.invalid, 0, tc.threshold); got != tc.want {
 				t.Fatalf("score %.2f valid=%d invalid=%d threshold=%v: got %s, want %s",
 					tc.score, tc.valid, tc.invalid, tc.threshold, got, tc.want)
 			}
 		})
+	}
+}
+
+// Every entry is classified where it is raised (§16) and owned by the
+// request's exception owner (MIG-INV-12). Violation type and reason family
+// are separate dimensions; this pins the classification each check applies.
+func TestIntegrity_EntriesCarrySeverityFamilyAndOwner(t *testing.T) {
+	req := &ValidateMigrationRequest{LegalEntityID: "le", MigrationName: "m", SourceSystem: "s", TargetService: "t",
+		ExceptionOwnerID: " owner-7 ", RequiredFields: []string{"cost_centre"}, Records: []MigrationRecord{
+			rec("", map[string]string{"cost_centre": "CC"}),                   // no identity
+			rec("D", map[string]string{"cost_centre": "CC"}),                  // duplicate
+			rec("D", map[string]string{"cost_centre": "CC"}),                  // duplicate
+			rec("M", map[string]string{}),                                     // missing required
+			rec("T", map[string]string{"cost_centre": "CC", "amount": "N/A"}), // bad amount
+		}}
+	checks, entries, _, _, _ := PerformIntegrityValidation(req, "job", "tenant")
+
+	want := map[ViolationType]struct {
+		sev Severity
+		fam ReasonFamily
+	}{
+		ViolationMissingSourceIdentity: {SeverityMQ0, ReasonIdentity},
+		ViolationDuplicate:             {SeverityMQ1, ReasonIdentity},
+		ViolationTypeMismatch:          {SeverityMQ1, ReasonSchema},
+		ViolationMissingRequired:       {SeverityMQ2, ReasonSchema},
+	}
+	seen := map[ViolationType]bool{}
+	for _, e := range entries {
+		w, ok := want[e.ViolationType]
+		if !ok {
+			t.Fatalf("unexpected violation %s", e.ViolationType)
+		}
+		seen[e.ViolationType] = true
+		if e.Severity != w.sev || e.ReasonFamily != w.fam {
+			t.Fatalf("%s: got %s/%s, want %s/%s", e.ViolationType, e.Severity, e.ReasonFamily, w.sev, w.fam)
+		}
+		if e.OwnerID != "owner-7" {
+			t.Fatalf("%s: owner %q, want the trimmed exception owner", e.ViolationType, e.OwnerID)
+		}
+	}
+	if len(seen) != len(want) {
+		t.Fatalf("expected every classified violation type to be produced, saw %v", seen)
+	}
+	if n := CountBlockers(entries); n != 1 {
+		t.Fatalf("expected 1 MQ0 blocker, got %d", n)
+	}
+	for _, c := range checks {
+		if c.RecordsFailed == 0 {
+			t.Fatalf("fixture should fail every check, %s passed", c.CheckName)
+		}
+	}
+}
+
+// A check that finds nothing is MQ4 (informational), whatever class its
+// failures would carry.
+func TestIntegrity_CleanChecksAreInformational(t *testing.T) {
+	_, _, _, checks := validate(rec("A", map[string]string{"amount": "1"}))
+	for _, c := range checks {
+		if c.Severity != SeverityMQ4 {
+			t.Fatalf("%s passed but has severity %s", c.CheckName, c.Severity)
+		}
+	}
+}
+
+// An MQ0 stops the run: the job is FAILED at any score and any bar, a
+// perfect score included (SPEC_DEVIATIONS A6).
+func TestEvaluateJobStatus_BlockerFailsAtAnyScore(t *testing.T) {
+	if got := EvaluateJobStatus(100, 10, 0, 1, 0); got != JobStatusFailed {
+		t.Fatalf("a blocker at score 100 / bar 0 must fail, got %s", got)
+	}
+	if got := EvaluateJobStatus(99, 99, 1, 1, 95); got != JobStatusFailed {
+		t.Fatalf("a blocker above the bar must fail, got %s", got)
+	}
+	if got := EvaluateJobStatus(99, 99, 1, 0, 95); got != JobStatusCompleted {
+		t.Fatalf("the same run without a blocker passes, got %s", got)
+	}
+}
+
+func TestSeverity_OnlyMQ0Blocks(t *testing.T) {
+	for _, s := range []Severity{SeverityMQ0, SeverityMQ1, SeverityMQ2, SeverityMQ3, SeverityMQ4} {
+		if s.Blocks() != (s == SeverityMQ0) {
+			t.Fatalf("%s.Blocks() = %v", s, s.Blocks())
+		}
+	}
+}
+
+func TestValidateRequest_ExceptionOwnerRequired(t *testing.T) {
+	r := ValidateMigrationRequest{LegalEntityID: "le", MigrationName: "m", SourceSystem: "s", TargetService: "t",
+		Records: []MigrationRecord{rec("A", nil)}, ExceptionOwnerID: "  "}
+	if err := r.Validate(); err == nil || err.Error() != "exception_owner_id is required" {
+		t.Fatalf("blank owner must be refused, got %v", err)
+	}
+	r.ExceptionOwnerID = "owner-1"
+	if err := r.Validate(); err != nil {
+		t.Fatalf("named owner must be accepted, got %v", err)
 	}
 }

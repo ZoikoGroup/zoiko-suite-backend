@@ -79,12 +79,47 @@ service. One scoring defect was fixed in this pass (B1).
   than left as a field the API pretends to accept (MIG-INV-12 "owner, reason
   code and disposition"; MIG-N27 "quarantine item manually edited without
   evidence → reject resolution").
-- **A6. No quarantine severity or reason taxonomy.** §16 defines MQ0–MQ4
-  severities with required dispositions and reason families (IDENTITY,
-  REFERENCE, TEMPORAL, FINANCIAL, SUBLEDGER, TAX, DOCUMENT, SCHEMA, SECURITY,
-  SOURCE). The service has INFO/WARNING/CRITICAL per check and five violation
-  types. There is no owner on an audit entry and no blocking semantics (an MQ0
-  must stop the batch; nothing here stops anything).
+- **A6. No quarantine severity or reason taxonomy** (closed; classification
+  choices in B3). §16's MQ0–MQ4 replace INFO/WARNING/CRITICAL outright (no
+  reader outside this service consumed the old values). Each audit entry now
+  stores its own `severity`, a §16 `reason_family` and an `owner_id`;
+  checks carry the MQ class of the violations they raise, or MQ4 when they
+  find nothing. Reason family is stored beside `violation_type`, not derived
+  from it: today each check happens to raise one family, but the family
+  depends on the field (a type mismatch on a date would be TEMPORAL, on a
+  currency REFERENCE), so it is assigned where the violation is raised. The
+  validate request requires `exception_owner_id` (400 without it), and that
+  owner is stamped on every entry (MIG-INV-12, MIG-C37). Dispositions as
+  built: **MQ0** fails the job at any score and any bar, by extending the
+  A11 acceptance rule rather than adding a separate block; the job stores
+  `blocker_count`, which is also in the `integrity_validated` event; and only
+  the entry's named owner may remediate it (403 for anyone else, even with
+  `AUDIT_ENTRY_REMEDIATE`). **MQ2** is left to the acceptance threshold,
+  which is the spec's "may proceed only if acceptance criteria permit".
+  **MQ1/MQ3/MQ4** are labelled and owned, nothing more. Migration
+  `000005_quarantine_taxonomy` backfills existing rows exactly from the
+  check/violation type that produced them, enforces the vocabulary with
+  CHECK constraints and reverses cleanly; it is tested at schema version 4
+  with legacy rows, then up, down and up again.
+  **Not built, deliberately:**
+  (1) *"Stop affected batch/cutover"* beyond this service. Batches and
+  cutover live in financial-close-svc (A1) and nothing there consumes this
+  service's results, so a FAILED job with `blocker_count > 0` is as far as
+  "stop" reaches; no cross-service halt was invented.
+  (2) *MQ1 "formally approved, time-limited migration exception"* needs an
+  exception object and a certificate for it to gate (A1–A3, MIG-N34);
+  neither exists, so an unresolved MQ1 blocks nothing.
+  (3) *Remediation does not re-accept a job.* Resolving every MQ0 records
+  the decision but leaves the job FAILED: acceptance needs a fresh
+  validation of corrected data, not a note overriding a failed check.
+  (4) *Legacy rows.* Entries recorded before 000005 have no owner (none was
+  ever captured, and inventing one would fabricate accountability), so their
+  MQ0s fall back to the action check alone. Stored job statuses were not
+  recomputed: a job accepted before this change keeps COMPLETED, with its
+  `blocker_count` beside it.
+  (5) *No materiality figure.* MQ1 versus MQ2 cannot be judged against an
+  approved materiality amount (the service understands no amounts, A4/A7);
+  B3 states the rule used instead.
 - **A7. Fixed, unversioned checks.** Required fields come from each request;
   the numeric fields are hard-coded (`amount`, `salary`, `balance`,
   `quantity`); there is no schema-version check (MIG-C03, MIG-N03), currency
@@ -159,3 +194,17 @@ service. One scoring defect was fixed in this pass (B1).
   separators, `+`, and exponents are still refused, as before. A blank value
   is still not a format violation — presence is the required-fields check's
   job.
+- **B3. Quarantine classification rule** (A6). Fixed per check, because
+  without amounts or a materiality figure the service cannot classify per
+  record: missing source identity → MQ0 / IDENTITY (a record with no
+  identity cannot be counted in "loaded + quarantined + excluded = source
+  population", so it threatens financial completeness); duplicate ref → MQ1
+  / IDENTITY (collision, possible duplicate economic effect, MIG-N05/N09/N10);
+  unparseable `amount`/`salary`/`balance`/`quantity` → MQ1 / SCHEMA (a
+  financial value that cannot load, of unmeasurable size, is not presumed
+  immaterial); missing caller-declared required field → MQ2 / SCHEMA (field
+  of unknown meaning; the threshold decides). Nothing produces MQ3, and MQ4
+  marks a clean check. Two consequences a reviewer may want to reverse: a
+  single blank `ref` now fails a run that would otherwise pass, and the
+  owner-only rule for MQ0 means a delegate cannot resolve one on the
+  owner's behalf.

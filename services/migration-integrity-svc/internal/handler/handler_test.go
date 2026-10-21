@@ -64,11 +64,12 @@ func TestValidateMigrationAndLifecycle(t *testing.T) {
 
 	// 1. Validate a mixed dataset — some valid, some violating
 	validateReq := domain.ValidateMigrationRequest{
-		LegalEntityID:  "LE-5005",
-		MigrationName:  "Legacy ERP to Ledger Service Migration",
-		SourceSystem:   "LEGACY_ERP",
-		TargetService:  "ledger-svc",
-		RequiredFields: []string{"employee_id", "amount", "cost_centre"},
+		LegalEntityID:    "LE-5005",
+		MigrationName:    "Legacy ERP to Ledger Service Migration",
+		SourceSystem:     "LEGACY_ERP",
+		TargetService:    "ledger-svc",
+		ExceptionOwnerID: "owner-1",
+		RequiredFields:   []string{"employee_id", "amount", "cost_centre"},
 		Records: []domain.MigrationRecord{
 			// Duplicate ref (with the third record below — both copies are violations)
 			{Ref: "REC-001", Fields: map[string]string{"employee_id": "EMP-1", "amount": "5000.00", "cost_centre": "CC-100"}},
@@ -198,11 +199,12 @@ func TestValidateMigrationCleanData(t *testing.T) {
 	router := newRouter(t)
 
 	cleanReq := domain.ValidateMigrationRequest{
-		LegalEntityID:  "LE-5006",
-		MigrationName:  "Payroll Clean Migration",
-		SourceSystem:   "EXTERNAL_PAYROLL",
-		TargetService:  "payroll-svc",
-		RequiredFields: []string{"employee_id", "salary"},
+		LegalEntityID:    "LE-5006",
+		MigrationName:    "Payroll Clean Migration",
+		SourceSystem:     "EXTERNAL_PAYROLL",
+		TargetService:    "payroll-svc",
+		ExceptionOwnerID: "owner-1",
+		RequiredFields:   []string{"employee_id", "salary"},
 		Records: []domain.MigrationRecord{
 			{Ref: "PAY-001", Fields: map[string]string{"employee_id": "E-1", "salary": "50000.00"}},
 			{Ref: "PAY-002", Fields: map[string]string{"employee_id": "E-2", "salary": "62000.00"}},
@@ -240,11 +242,12 @@ func TestValidateMigrationEmptyRefReportedAsMissingIdentity(t *testing.T) {
 	router := newRouter(t)
 
 	validateReq := domain.ValidateMigrationRequest{
-		LegalEntityID:  "LE-5007",
-		MigrationName:  "Unidentified records",
-		SourceSystem:   "LEGACY_ERP",
-		TargetService:  "ledger-svc",
-		RequiredFields: []string{"amount"},
+		LegalEntityID:    "LE-5007",
+		MigrationName:    "Unidentified records",
+		SourceSystem:     "LEGACY_ERP",
+		TargetService:    "ledger-svc",
+		ExceptionOwnerID: "owner-1",
+		RequiredFields:   []string{"amount"},
 		Records: []domain.MigrationRecord{
 			{Ref: "", Fields: map[string]string{"amount": "10.00"}},
 			{Ref: "  ", Fields: map[string]string{"amount": "20.00"}},
@@ -323,12 +326,13 @@ func TestValidateMigration_ThresholdDecidesStatus(t *testing.T) {
 	} {
 		router := newRouterWithThreshold(t, tc.threshold)
 		body, _ := json.Marshal(domain.ValidateMigrationRequest{
-			LegalEntityID:  "LE-THRESHOLD",
-			MigrationName:  "threshold acceptance fixture",
-			SourceSystem:   "LEGACY_ERP",
-			TargetService:  "general-ledger-svc",
-			RequiredFields: []string{"amount"},
-			Records:        records,
+			LegalEntityID:    "LE-THRESHOLD",
+			MigrationName:    "threshold acceptance fixture",
+			SourceSystem:     "LEGACY_ERP",
+			TargetService:    "general-ledger-svc",
+			ExceptionOwnerID: "owner-1",
+			RequiredFields:   []string{"amount"},
+			Records:          records,
 		})
 		req := httptest.NewRequest(http.MethodPost, "/v1/migrations/validate", bytes.NewBuffer(body))
 		withEnvelope(req)
