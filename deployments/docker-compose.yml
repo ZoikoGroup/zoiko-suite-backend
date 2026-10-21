@@ -890,8 +890,10 @@ services:
   # ── 3. jurisdiction-rules-svc (Port: 8082) ──────────────────────────────────
   jurisdiction-svc:
     build:
-      context: ../services/jurisdiction-rules-svc
-      dockerfile: Dockerfile
+      # Root context: go.mod replaces zoiko.io/identity-envelope with the
+      # sibling module, so the build must see both (see the Dockerfile).
+      context: ..
+      dockerfile: services/jurisdiction-rules-svc/Dockerfile
     container_name: jurisdiction-rules-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -917,6 +919,22 @@ services:
       # platform-scope entity. Role assignments granting JURISDICTION_* /
       # JURISDICTION_RULE_* actions must use this same id.
       AUTHZ_PLATFORM_SCOPE_ID: "00000000-0000-0000-0000-00000000f001"
+      # Rule activation confirms its X-Approval-Reference with workflow-svc
+      # (an APPROVED workflow bound to the rule, decided by someone other than
+      # its author; J-02).
+      WORKFLOW_SERVICE_URL: "http://workflow-svc:8090"
+      # Identity gate (J-01): a presented signed envelope is verified and its
+      # session checked. warn: the tax and payroll services that read rule packs
+      # (out of this domain) do not forward the envelope yet. The code default
+      # outside local is require.
+      IDENTITY_VERIFY: "${JURISDICTION_IDENTITY_VERIFY:-warn}"
+      IDENTITY_JWKS_URL: "http://identity-context-svc:8080/.well-known/jwks.json"
+      IDENTITY_INTROSPECT_URL: "http://identity-context-svc:8080/v1/context/session/introspect"
+      IDENTITY_ISSUER: "identity-context-svc"
+      # ZS-JUR rule resolver on (decision J-07, 21 Oct 2026): governed actions'
+      # rule basis is recorded as rule_decision_evidence. Locally it serves every
+      # RELEASED pack; production and staging must name RESOLVER_RING / _REGION.
+      RESOLVER_ENABLED: "${RESOLVER_ENABLED:-true}"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_GROUP_ID: "jurisdiction-rules-svc"
       KAFKA_EVENTS_TOPIC: "zoiko.jurisdiction.events"

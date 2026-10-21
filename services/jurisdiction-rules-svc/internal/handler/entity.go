@@ -9,6 +9,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
+	"zoiko.io/jurisdiction-rules-svc/internal/approval"
 	"zoiko.io/jurisdiction-rules-svc/internal/domain"
 )
 
@@ -73,4 +74,12 @@ func (h *Handler) GetEntityJurisdictions(w http.ResponseWriter, r *http.Request)
 		"effective_at":    at,
 		"jurisdictions":   rows,
 	})
+}
+
+// WithApprovalVerifier makes rule activation confirm its X-Approval-Reference
+// with workflow-svc (Governance audit J-02). Without it the reference is
+// recorded and not checked, which main.go allows only in local/dev.
+func (h *Handler) WithApprovalVerifier(v approval.Verifier) *Handler {
+	h.approvals = v
+	return h
 }

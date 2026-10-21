@@ -15,6 +15,7 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
+	"zoiko.io/jurisdiction-rules-svc/internal/approval"
 	"zoiko.io/jurisdiction-rules-svc/internal/authz"
 	"zoiko.io/jurisdiction-rules-svc/internal/domain"
 	svcenvelope "zoiko.io/jurisdiction-rules-svc/internal/envelope"
@@ -96,6 +97,10 @@ type Handler struct {
 
 	// entities is the optional entity-jurisdiction applicability projection (see WithEntityApplicability).
 	entities EntityApplicabilityReader
+
+	// approvals confirms the X-Approval-Reference an activation cites (see
+	// WithApprovalVerifier, J-02). Nil only in local/dev.
+	approvals approval.Verifier
 }
 
 // New constructs a Handler.
@@ -234,6 +239,9 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Post("/v1/admin/jurisdictions/{jurisdiction_id}/rules", h.CreateRule)
 	r.Post("/v1/admin/rules/{jurisdiction_rule_id}/transition", h.TransitionRuleStatus)
 	r.Post("/v1/admin/rules/{jurisdiction_rule_id}/drift", h.RecordDrift)
+
+	// Doc 03 §8.2 validate-action (J-06): authorized as JURISDICTION_RULE_VALIDATE.
+	r.Post(ValidateActionPath, h.ValidateAction)
 
 	// ZS-JUR-001 registries: mounted only when WithRegistry was called.
 	// Entity applicability: mounted only when WithEntityApplicability was called.
@@ -976,6 +984,29 @@ func (h *Handler) TransitionRuleStatus(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "missing_approval_reference",
 				"transition to ACTIVE requires X-Approval-Reference header with approval evidence")
 			return
+		}
+		// J-02: the reference was recorded and never checked, so any string
+		// passed. It must now be an APPROVED workflow-svc approval of this rule,
+		// decided by someone other than its author; workflow-svc unreachable
+		// fails closed.
+		if h.approvals != nil {
+			current, err := h.store.FindRuleByID(r.Context(), ruleID)
+			if err != nil {
+				h.writeStoreError(w, err, correlationID)
+				return
+			}
+			if current.RuleStatus != "ACTIVE" {
+				if err := h.approvals.Verify(r.Context(), approvalRef, ruleID, current.CreatedByPrincipalID); err != nil {
+					if errors.Is(err, approval.ErrNotValid) {
+						writeError(w, http.StatusForbidden, "approval_not_valid", err.Error())
+						return
+					}
+					h.log.Error("TransitionRuleStatus: workflow-svc unavailable — failing closed",
+						zap.String("jurisdiction_rule_id", ruleID), zap.String("correlation_id", correlationID), zap.Error(err))
+					writeError(w, http.StatusServiceUnavailable, "approval_service_unavailable", "the approval could not be confirmed")
+					return
+				}
+			}
 		}
 	}
 

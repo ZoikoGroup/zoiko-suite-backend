@@ -332,7 +332,8 @@ spec:
     - protocol: TCP
       port: 8082
   egress:
-  # Allow egress to Postgres in zoiko-infra
+  # Allow egress to Postgres and Kafka in zoiko-infra (the outbox relay and the
+  # entity consumer; Kafka was not allowed at all).
   - to:
     - namespaceSelector:
         matchLabels:
@@ -340,6 +341,35 @@ spec:
     ports:
     - protocol: TCP
       port: 5432
+    - protocol: TCP
+      port: 9092
+  # authorization-svc (every admin mutation) and workflow-svc (activation
+  # approvals, J-02) in this namespace.
+  - to:
+    - podSelector:
+        matchLabels:
+          app: authorization-svc
+    ports:
+    - protocol: TCP
+      port: 8089
+  - to:
+    - podSelector:
+        matchLabels:
+          app: workflow-svc
+    ports:
+    - protocol: TCP
+      port: 8090
+  # identity-svc serves the gate's JWKS and session status.
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: zoiko-identity
+      podSelector:
+        matchLabels:
+          app: identity-svc
+    ports:
+    - protocol: TCP
+      port: 8080
   # Allow CoreDNS access
   - to:
     - namespaceSelector: {}
