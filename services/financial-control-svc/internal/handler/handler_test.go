@@ -32,6 +32,11 @@ type fakeStore struct {
 	w5        wave5State
 	w7        wave7State
 	rv        revokeState
+
+	// idemKey is the Idempotency-Key the last replayable command received;
+	// idemReplay makes the fake report that command as a replay.
+	idemKey    string
+	idemReplay bool
 }
 
 func (f *fakeStore) CreateDefinition(_ context.Context, _, _, _ string, req domain.CreateControlDefinitionRequest) (*domain.ControlDefinition, error) {

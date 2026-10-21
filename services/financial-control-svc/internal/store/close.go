@@ -27,13 +27,19 @@ import (
 // migration 000007) in the same transaction: authority is the certifier's live
 // authorization-svc decision and is required — a certification whose authority
 // cannot be identified is refused, not recorded without it.
-func (s *PgStore) CertifyRun(ctx context.Context, tenantID, runID, actor, correlationID string, expectedVersion int,
-	req domain.CertifyRequest, authority *domain.AuthoritySnapshot) (*domain.ControlRun, error) {
+//
+// Idempotent on (tenant, Idempotency-Key) through command_idempotency, like
+// BeginExecution: a repeat of the key for the same decision on the same run returns
+// replay=true and the run as it now stands — a client retrying a CERTIFY whose
+// response was lost gets its result, not a 412/409 on the moved-on run. The key used
+// for another run or the other decision is a conflict.
+func (s *PgStore) CertifyRun(ctx context.Context, tenantID, runID, actor, correlationID, idempotencyKey string, expectedVersion int,
+	req domain.CertifyRequest, authority *domain.AuthoritySnapshot) (*domain.ControlRun, bool, error) {
 	if req.Decision == domain.DecisionCertify && (authority == nil || authority.AccessDecisionID == "" || authority.PrincipalID != actor) {
-		return nil, fmt.Errorf("%w: a certification must carry the certifier's own authorization decision", domain.ErrAuthorizationServiceUnavailable)
+		return nil, false, fmt.Errorf("%w: a certification must carry the certifier's own authorization decision", domain.ErrAuthorizationServiceUnavailable)
 	}
 	var out *domain.ControlRun
-	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+	apply := func(tx pgx.Tx) error {
 		var cur domain.ControlRun
 		if err := scanRun(tx.QueryRow(ctx, `SELECT `+runColumns+` FROM control_runs
 			WHERE tenant_id = $1 AND run_id = $2 FOR UPDATE`, tenantID, runID), &cur); err != nil {
@@ -94,11 +100,27 @@ func (s *PgStore) CertifyRun(ctx context.Context, tenantID, runID, actor, correl
 			return err
 		}
 		return recordCertification(ctx, tx, tenantID, *out, actor, correlationID, req.Reason, *authority)
+	}
+	replay := false
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		k := commandKey{key: idempotencyKey, command: certifyCommand(req.Decision), runID: runID}
+		cur, err := lockRun(ctx, tx, tenantID, runID)
+		if err != nil {
+			return err
+		}
+		if replay, err = lookupCommandKey(ctx, tx, tenantID, k); err != nil || replay {
+			out = cur
+			return err
+		}
+		if err := apply(tx); err != nil {
+			return err
+		}
+		return recordCommandKey(ctx, tx, tenantID, k)
 	})
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return out, nil
+	return out, replay, nil
 }
 
 // recordCertification writes the ControlCertification of run, which advanceTx has just

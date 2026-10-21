@@ -5,6 +5,7 @@ package store_test
 // SPEC_DEVIATIONS A2/B7: the ControlCertification record (Invariant 9).
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -33,7 +34,7 @@ func TestCertification_RecordedWithEveryInvariant9Field(t *testing.T) {
 	_, final := w.run("FIN-CTRL-020", fiscal)
 	auth := testAuthority("checker", w.tenant)
 	auth.LegalEntityID = w.entity
-	out, err := testStore.CertifyRun(ctx, w.tenant, final.RunID, "checker", "corr-cert", final.Version,
+	out, err := certifyRun(ctx, w.tenant, final.RunID, "checker", "corr-cert", final.Version,
 		domain.CertifyRequest{Decision: "CERTIFY", Reason: "reviewed"}, auth)
 	require.NoError(t, err)
 
@@ -92,14 +93,14 @@ func TestCertification_RejectRecordsNothingAndAuthorityIsRequired(t *testing.T) 
 		"no access decision id": {PrincipalID: "checker", DecisionOutcome: "GRANTED"},
 		"someone else's":        testAuthority("other", w.tenant),
 	} {
-		_, err := testStore.CertifyRun(ctx, w.tenant, final.RunID, "checker", "c", final.Version, domain.CertifyRequest{Decision: "CERTIFY"}, a)
+		_, err := certifyRun(ctx, w.tenant, final.RunID, "checker", "c", final.Version, domain.CertifyRequest{Decision: "CERTIFY"}, a)
 		require.ErrorIs(t, err, domain.ErrAuthorizationServiceUnavailable, name)
 	}
 	got, err := testStore.GetRun(ctx, w.tenant, final.RunID)
 	require.NoError(t, err)
 	assert.Equal(t, domain.LifecycleReadyToCertify, got.LifecycleState, "a refused certification changes nothing")
 
-	_, err = testStore.CertifyRun(ctx, w.tenant, final.RunID, "checker", "c", final.Version,
+	_, err = certifyRun(ctx, w.tenant, final.RunID, "checker", "c", final.Version,
 		domain.CertifyRequest{Decision: "REJECT", Reason: "evidence incomplete"}, nil)
 	require.NoError(t, err)
 	_, err = testStore.GetCertification(ctx, w.tenant, final.RunID)
@@ -133,7 +134,7 @@ func TestCertification_RecordsAcceptedExceptionsAndAssessedExposure(t *testing.T
 	require.Equal(t, domain.LifecycleReadyToCertify, ready.LifecycleState)
 	require.Equal(t, domain.ResultPassWithApprovedEx, ready.ResultState)
 
-	_, err = testStore.CertifyRun(ctx, w.tenant, run.RunID, "checker", "c", ready.Version,
+	_, err = certifyRun(ctx, w.tenant, run.RunID, "checker", "c", ready.Version,
 		domain.CertifyRequest{Decision: "CERTIFY"}, testAuthority("checker", w.tenant))
 	require.NoError(t, err)
 
@@ -170,4 +171,24 @@ func waiveAll(t *testing.T, w *wave2, runID string, list []domain.ControlExcepti
 			AuthorityRef: "waiver:memo-7"})
 		require.NoError(t, err)
 	}
+}
+
+// certifyRun, submitForCertification and resolveException call the store's
+// idempotent commands with a fresh Idempotency-Key each time, for tests whose
+// subject is not idempotency (see idempotency_integration_test.go for that).
+func certifyRun(c context.Context, tenantID, runID, actor, correlationID string, expectedVersion int,
+	req domain.CertifyRequest, authority *domain.AuthoritySnapshot) (*domain.ControlRun, error) {
+	out, _, err := testStore.CertifyRun(c, tenantID, runID, actor, correlationID, "k-"+uuid.NewString(), expectedVersion, req, authority)
+	return out, err
+}
+
+func submitForCertification(c context.Context, tenantID, runID, actor, correlationID string, expectedVersion int, reason string) (*domain.ControlRun, error) {
+	out, _, err := testStore.SubmitForCertification(c, tenantID, runID, actor, correlationID, "k-"+uuid.NewString(), expectedVersion, reason)
+	return out, err
+}
+
+func resolveException(c context.Context, tenantID, exceptionID, actor, correlationID string, expectedVersion int,
+	req domain.ResolveExceptionRequest) (*domain.ControlException, error) {
+	out, _, err := testStore.ResolveException(c, tenantID, exceptionID, actor, correlationID, "k-"+uuid.NewString(), expectedVersion, req)
+	return out, err
 }

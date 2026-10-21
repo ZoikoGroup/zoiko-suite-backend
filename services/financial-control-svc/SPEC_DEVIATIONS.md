@@ -46,13 +46,16 @@ policies a run pins.
   and the certification transition it records. `GET …/evidence` and the
   evidence export serve the record as a `certification` field, read directly
   from the table instead of being inferred from the transition history.
-- **A3. Certification has no idempotency key.** §25: idempotency is mandatory
-  for run creation, execution, reperformance and certification. Create and
-  execute require `Idempotency-Key` (`command_idempotency` table); `POST
-  …/certification`, `POST …/submit-for-certification` and exception
-  transitions (including REPERFORMED) rely on `If-Match` only. A client that
-  retries a successful CERTIFY after a lost response gets 412 instead of the
-  original result. Scope: reuse `command_idempotency` for those commands.
+- **A3. Certification has no idempotency key. — Closed (B8).** `POST
+  …/certification`, `POST …/submit-for-certification` and `POST
+  /controls/v1/exceptions/{id}/transition` (every target state, including
+  REPERFORMED) now require `Idempotency-Key` (400 `missing_idempotency_key`),
+  in addition to `If-Match`. Each claims the key in `command_idempotency`
+  exactly as `BeginExecution` does. A repeat of the key for the same command
+  on the same target returns the original result (`Idempotent-Replay: true`,
+  the target as it now stands) instead of a 409/412. The same key used for
+  another target or decision is a 409. Migration 000008 adds the
+  `exception_id` an exception transition needs, and widens `command`.
 - **A4. Tolerance and materiality approval is self-declared.**
   `CreateTolerancePolicy` / `CreateMaterialityPolicy` take `approved_by` as a
   free-text body field; the only check is `approved_by != caller`. No second
@@ -243,3 +246,42 @@ policies a run pins.
     none) inside the bundle's manifest digest. `run_transitions` stays in
     the export as history, but is no longer the only place a certification
     can be seen.
+- **B8. Idempotency of certification, resubmission and exception
+  transitions (A3).**
+  - *One mechanism.* The same `command_idempotency` table and rule as
+    `BeginExecution` (and `RevokeCertification`, B6, which is unchanged): the
+    key is looked up first, the command runs, and the key is claimed in the
+    same transaction only once the command has succeeded, so a refused
+    command (segregation, a stale version, an invalid transition) never
+    consumes it. The three commands share `internal/store/idempotency.go`
+    (`lookupCommandKey`/`recordCommandKey`). `BeginExecution` and
+    `RevokeCertification` keep their own inline copies, which apply the same
+    rule.
+  - *What a key is bound to.* The run, and for an exception transition the
+    exception too: migration 000008 adds `command_idempotency.exception_id`.
+    Without it, one key retried against two exceptions of the same run would
+    read as a replay of the first. The command name records what was decided
+    (`CERTIFY` or `REJECT`, `SUBMIT_FOR_CERTIFICATION`,
+    `EXCEPTION:<to_state>`), so a key cannot replay a different decision on
+    the same target; that 409s instead. `command` is widened to
+    VARCHAR(64) for `EXCEPTION:CARRIED_FORWARD_UNDER_AUTHORITY`. A key from
+    another command (e.g. the run's `EXECUTE` key) is a 409.
+  - *Replay.* Like `BeginExecution`, a replay returns the target as it now
+    stands, not a stored copy of the original response. It is checked
+    before the `If-Match` version, because the retry carries the version the
+    client saw before its first attempt. The response carries
+    `Idempotent-Replay: true` and the current ETag.
+  - *Concurrency.* Unlike `BeginExecution`, these commands take the
+    target's row lock **before** looking the key up. Two concurrent first
+    attempts with one key are therefore serialised: one applies and the
+    other replays it, rather than the second failing on the version
+    (covered by a concurrent integration test).
+  - *Order of checks in the handler.* Idempotency-Key, then If-Match (428),
+    then the body, then authorization, matching `ExecuteRun` and
+    `RevokeCertification`. Authorization is re-evaluated on a replay too
+    (§25: on every material command). No caller outside this service uses
+    these three endpoints, so making the header mandatory breaks no client
+    in the repository.
+  - *Rollback.* 000008's down migration deletes the claims the old schema
+    cannot hold (exception transitions, commands longer than 32 characters).
+    They are retry protection, not records.

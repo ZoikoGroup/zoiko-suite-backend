@@ -51,16 +51,16 @@ type Store interface {
 	GetLatestEvidence(ctx context.Context, tenantID, runID string) (*domain.EvidencePackage, error)
 
 	// Wave 5.
-	CertifyRun(ctx context.Context, tenantID, runID, actor, correlationID string, expectedVersion int, req domain.CertifyRequest, authority *domain.AuthoritySnapshot) (*domain.ControlRun, error)
+	CertifyRun(ctx context.Context, tenantID, runID, actor, correlationID, idempotencyKey string, expectedVersion int, req domain.CertifyRequest, authority *domain.AuthoritySnapshot) (*domain.ControlRun, bool, error)
 	GetCertification(ctx context.Context, tenantID, runID string) (*domain.ControlCertification, error)
 	RevokeCertification(ctx context.Context, tenantID, runID, actor, correlationID, idempotencyKey string, expectedVersion int, req domain.RevokeCertificationRequest) (*domain.ControlRun, bool, error)
 	CloseGate(ctx context.Context, tenantID, legalEntityID, periodID string) (*domain.CloseGate, error)
 	ExceptionSummary(ctx context.Context, tenantID, legalEntityID, periodID string) (*domain.ExceptionSummary, error)
 
 	// Wave 7.
-	ResolveException(ctx context.Context, tenantID, exceptionID, actor, correlationID string, expectedVersion int, req domain.ResolveExceptionRequest) (*domain.ControlException, error)
+	ResolveException(ctx context.Context, tenantID, exceptionID, actor, correlationID, idempotencyKey string, expectedVersion int, req domain.ResolveExceptionRequest) (*domain.ControlException, bool, error)
 	ListExceptionTransitions(ctx context.Context, tenantID, exceptionID string) ([]domain.ExceptionTransition, error)
-	SubmitForCertification(ctx context.Context, tenantID, runID, actor, correlationID string, expectedVersion int, reason string) (*domain.ControlRun, error)
+	SubmitForCertification(ctx context.Context, tenantID, runID, actor, correlationID, idempotencyKey string, expectedVersion int, reason string) (*domain.ControlRun, bool, error)
 
 	// Wave 7/8.
 	Monitoring(ctx context.Context, tenantID, legalEntityID, periodID string, now time.Time) (*domain.MonitoringSnapshot, error)
@@ -514,6 +514,33 @@ func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principal, e
 		writeError(w, http.StatusServiceUnavailable, "authorization_unavailable", "")
 	}
 	return false
+}
+
+// requireIdempotencyKey reads the mandatory Idempotency-Key of a command that
+// ZS-CONTROL-001 makes idempotent ("Mandatory for run creation, execution,
+// reperformance and certification commands"), answering 400 itself when it is
+// missing or too long for command_idempotency.
+func requireIdempotencyKey(w http.ResponseWriter, r *http.Request, what string) (string, bool) {
+	key := r.Header.Get("Idempotency-Key")
+	if key == "" {
+		writeError(w, http.StatusBadRequest, "missing_idempotency_key", "Idempotency-Key header is required to "+what)
+		return "", false
+	}
+	if len(key) > 255 {
+		writeError(w, http.StatusBadRequest, "invalid_idempotency_key", "Idempotency-Key must be at most 255 characters")
+		return "", false
+	}
+	return key, true
+}
+
+// writeCommandResult answers a replayable command: the target as it now stands,
+// its ETag, and Idempotent-Replay: true when this was a repeat of a completed key.
+func writeCommandResult(w http.ResponseWriter, version int, replay bool, v any) {
+	if replay {
+		w.Header().Set("Idempotent-Replay", "true")
+	}
+	setETag(w, version)
+	writeJSON(w, http.StatusOK, v)
 }
 
 // authorizeWithAuthority is authorize for a command that must record the authority it

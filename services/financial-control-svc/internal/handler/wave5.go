@@ -22,13 +22,19 @@ var uuidRe = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[
 
 // CertifyRun — POST /controls/v1/runs/{run_id}/certification (§26).
 // Body {"decision":"CERTIFY"|"REJECT","reason":"..."}; If-Match with the run's ETag
-// is mandatory so a decision is always taken on the state the certifier saw.
+// is mandatory so a decision is always taken on the state the certifier saw, and so
+// is Idempotency-Key: a retry of a decision whose response was lost returns that
+// decision's result (Idempotent-Replay: true), not a 409 on the run that moved on.
 // Authority is checked against the run's own legal entity, live (never from the
 // decision cache), and that decision is recorded as the certification's authority
 // snapshot (Invariant 9). The store refuses a certifier who created or took part in
 // the run (maker-checker).
 func (h *Handler) CertifyRun(w http.ResponseWriter, r *http.Request) {
 	tenantID, principal, ok := h.caller(w, r)
+	if !ok {
+		return
+	}
+	key, ok := requireIdempotencyKey(w, r, "certify a run")
 	if !ok {
 		return
 	}
@@ -58,13 +64,12 @@ func (h *Handler) CertifyRun(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	out, err := h.store.CertifyRun(r.Context(), tenantID, runID, principal, corrID(r), expected, req, authority)
+	out, replay, err := h.store.CertifyRun(r.Context(), tenantID, runID, principal, corrID(r), key, expected, req, authority)
 	if err != nil {
 		h.writeErr(w, "certify run", err)
 		return
 	}
-	setETag(w, out.Version)
-	writeJSON(w, http.StatusOK, out)
+	writeCommandResult(w, out.Version, replay, out)
 }
 
 // RevokeCertification — POST /controls/v1/runs/{run_id}/revoke-certification

@@ -120,12 +120,12 @@ func TestWave5_Certify_MakerCannotCertifyCheckerCan(t *testing.T) {
 	run, final := w.run("FIN-CTRL-020", fiscal) // created and executed by "prep"
 	require.Equal(t, domain.LifecycleReadyToCertify, final.LifecycleState)
 
-	_, err := testStore.CertifyRun(ctx, w.tenant, run.RunID, "prep", "c", final.Version, domain.CertifyRequest{Decision: "CERTIFY"}, testAuthority("prep", w.tenant))
+	_, err := certifyRun(ctx, w.tenant, run.RunID, "prep", "c", final.Version, domain.CertifyRequest{Decision: "CERTIFY"}, testAuthority("prep", w.tenant))
 	require.ErrorIs(t, err, domain.ErrSegregation, "the creator/executor cannot certify")
-	_, err = testStore.CertifyRun(ctx, w.tenant, run.RunID, "checker", "c", final.Version+5, domain.CertifyRequest{Decision: "CERTIFY"}, testAuthority("checker", w.tenant))
+	_, err = certifyRun(ctx, w.tenant, run.RunID, "checker", "c", final.Version+5, domain.CertifyRequest{Decision: "CERTIFY"}, testAuthority("checker", w.tenant))
 	require.ErrorIs(t, err, domain.ErrConflict, "a stale ETag is refused")
 
-	out, err := testStore.CertifyRun(ctx, w.tenant, run.RunID, "checker", "c", final.Version, domain.CertifyRequest{Decision: "CERTIFY", Reason: "reviewed"}, testAuthority("checker", w.tenant))
+	out, err := certifyRun(ctx, w.tenant, run.RunID, "checker", "c", final.Version, domain.CertifyRequest{Decision: "CERTIFY", Reason: "reviewed"}, testAuthority("checker", w.tenant))
 	require.NoError(t, err)
 	assert.Equal(t, domain.LifecycleCertified, out.LifecycleState)
 	assert.Equal(t, domain.CertCertified, out.CertificationState)
@@ -141,7 +141,7 @@ func TestWave5_Certify_MakerCannotCertifyCheckerCan(t *testing.T) {
 	require.NotEmpty(t, cert)
 	assert.Equal(t, "PENDING>CERTIFIED@checker", cert[len(cert)-1], "the decision is attributed to the certifier")
 
-	_, err = testStore.CertifyRun(ctx, w.tenant, run.RunID, "other", "c", store.SkipVersionCheck, domain.CertifyRequest{Decision: "CERTIFY"}, testAuthority("other", w.tenant))
+	_, err = certifyRun(ctx, w.tenant, run.RunID, "other", "c", store.SkipVersionCheck, domain.CertifyRequest{Decision: "CERTIFY"}, testAuthority("other", w.tenant))
 	require.ErrorIs(t, err, domain.ErrInvalidTransition, "a certified run is final")
 }
 
@@ -149,7 +149,7 @@ func TestWave5_Certify_RejectReturnsRunToExceptionReview(t *testing.T) {
 	w := newWave5(t)
 	w.src.set(catalogue.SysGL, "journal-balances", "wm", journalBal("j1", "5", "5"))
 	run, final := w.run("FIN-CTRL-020", fiscal)
-	out, err := testStore.CertifyRun(ctx, w.tenant, run.RunID, "checker", "c", final.Version, domain.CertifyRequest{Decision: "REJECT", Reason: "evidence incomplete"}, testAuthority("checker", w.tenant))
+	out, err := certifyRun(ctx, w.tenant, run.RunID, "checker", "c", final.Version, domain.CertifyRequest{Decision: "REJECT", Reason: "evidence incomplete"}, testAuthority("checker", w.tenant))
 	require.NoError(t, err)
 	assert.Equal(t, domain.LifecycleExceptionReview, out.LifecycleState)
 	assert.Equal(t, domain.CertRejected, out.CertificationState)
@@ -160,7 +160,7 @@ func TestWave5_Certify_FailedRunCannotBeCertified(t *testing.T) {
 	w.src.set(catalogue.SysGL, "journal-balances", "wm", journalBal("j1", "5", "4"))
 	run, final := w.run("FIN-CTRL-020", fiscal)
 	require.Equal(t, domain.ResultFail, final.ResultState)
-	_, err := testStore.CertifyRun(ctx, w.tenant, run.RunID, "checker", "c", store.SkipVersionCheck, domain.CertifyRequest{Decision: "CERTIFY"}, testAuthority("checker", w.tenant))
+	_, err := certifyRun(ctx, w.tenant, run.RunID, "checker", "c", store.SkipVersionCheck, domain.CertifyRequest{Decision: "CERTIFY"}, testAuthority("checker", w.tenant))
 	require.ErrorIs(t, err, domain.ErrInvalidTransition)
 }
 
@@ -191,7 +191,7 @@ func TestWave5_CloseGate_OpensOnlyWhenEveryMandatoryControlIsCertified(t *testin
 		g, err = testStore.CloseGate(ctx, w.tenant, w.entity, "2026-09")
 		require.NoError(t, err)
 		assert.False(t, g.Open, "not open until the last control is certified (%s just executed)", code)
-		_, err = testStore.CertifyRun(ctx, w.tenant, final.RunID, "checker", "c", final.Version, domain.CertifyRequest{Decision: "CERTIFY"}, testAuthority("checker", w.tenant))
+		_, err = certifyRun(ctx, w.tenant, final.RunID, "checker", "c", final.Version, domain.CertifyRequest{Decision: "CERTIFY"}, testAuthority("checker", w.tenant))
 		require.NoError(t, err, code)
 	}
 	g, err = testStore.CloseGate(ctx, w.tenant, w.entity, "2026-09")

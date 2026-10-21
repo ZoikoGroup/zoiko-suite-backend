@@ -20,16 +20,17 @@ type wave5State struct {
 	summary    *domain.ExceptionSummary
 }
 
-func (f *fakeStore) CertifyRun(_ context.Context, _, _, _, _ string, expected int, req domain.CertifyRequest, auth *domain.AuthoritySnapshot) (*domain.ControlRun, error) {
+func (f *fakeStore) CertifyRun(_ context.Context, _, _, _, _, key string, expected int, req domain.CertifyRequest, auth *domain.AuthoritySnapshot) (*domain.ControlRun, bool, error) {
 	f.calls = append(f.calls, "CertifyRun")
 	f.w5.certExpect, f.w5.certReq, f.w5.certAuth = expected, req, auth
+	f.idemKey = key
 	if f.w5.certErr != nil {
-		return nil, f.w5.certErr
+		return nil, false, f.w5.certErr
 	}
 	c := *f.run
 	c.Version++
 	c.LifecycleState, c.CertificationState = domain.LifecycleCertified, domain.CertCertified
-	return &c, nil
+	return &c, f.idemReplay, nil
 }
 func (f *fakeStore) GetCertification(context.Context, string, string) (*domain.ControlCertification, error) {
 	if f.w5.cert == nil {
@@ -51,8 +52,8 @@ const entityUUID = "22222222-2222-2222-2222-222222222222"
 func TestCertify_RequiresIfMatchAndValidDecision(t *testing.T) {
 	s := &fakeStore{run: sampleRun()}
 	h := newServer(s, &fakeAuthz{})
-	assert.Equal(t, 428, do(h, "POST", "/controls/v1/runs/r1/certification", `{"decision":"CERTIFY"}`, auth).Code)
-	hdr := with(map[string]string{"If-Match": `"3"`})
+	assert.Equal(t, 428, do(h, "POST", "/controls/v1/runs/r1/certification", `{"decision":"CERTIFY"}`, with(map[string]string{"Idempotency-Key": "k-1"})).Code)
+	hdr := with(map[string]string{"Idempotency-Key": "k-1", "If-Match": `"3"`})
 	assert.Equal(t, 400, do(h, "POST", "/controls/v1/runs/r1/certification", `{"decision":"MAYBE"}`, hdr).Code)
 	assert.Equal(t, 400, do(h, "POST", "/controls/v1/runs/r1/certification", `{"decision":"REJECT"}`, hdr).Code, "a rejection needs a reason")
 	assert.NotContains(t, s.calls, "CertifyRun")
@@ -61,7 +62,7 @@ func TestCertify_RequiresIfMatchAndValidDecision(t *testing.T) {
 func TestCertify_AuthorizedAgainstTheRunsEntityWithCertifyAction(t *testing.T) {
 	s := &fakeStore{run: sampleRun()}
 	a := &fakeAuthz{}
-	rr := do(newServer(s, a), "POST", "/controls/v1/runs/r1/certification", `{"decision":"CERTIFY"}`, with(map[string]string{"If-Match": `"3"`}))
+	rr := do(newServer(s, a), "POST", "/controls/v1/runs/r1/certification", `{"decision":"CERTIFY"}`, with(map[string]string{"Idempotency-Key": "k-1", "If-Match": `"3"`}))
 	require.Equal(t, 200, rr.Code, rr.Body.String())
 	assert.Equal(t, []string{"FINCTRL_CERTIFY"}, a.actions)
 	assert.Equal(t, []string{"e1"}, a.entity)
@@ -72,7 +73,7 @@ func TestCertify_AuthorizedAgainstTheRunsEntityWithCertifyAction(t *testing.T) {
 func TestCertify_DeniedNeverReachesTheStore(t *testing.T) {
 	s := &fakeStore{run: sampleRun()}
 	rr := do(newServer(s, &fakeAuthz{err: domain.ErrAuthorizationDenied}), "POST", "/controls/v1/runs/r1/certification",
-		`{"decision":"CERTIFY"}`, with(map[string]string{"If-Match": `"3"`}))
+		`{"decision":"CERTIFY"}`, with(map[string]string{"Idempotency-Key": "k-1", "If-Match": `"3"`}))
 	assert.Equal(t, 403, rr.Code)
 	assert.NotContains(t, s.calls, "CertifyRun")
 }
@@ -83,7 +84,7 @@ func TestCertify_SegregationConflictAndTransitionMapping(t *testing.T) {
 		code int
 	}{{domain.ErrSegregation, 403}, {domain.ErrConflict, 409}, {domain.ErrInvalidTransition, 422}} {
 		s := &fakeStore{run: sampleRun(), w5: wave5State{certErr: c.err}}
-		rr := do(newServer(s, &fakeAuthz{}), "POST", "/controls/v1/runs/r1/certification", `{"decision":"CERTIFY"}`, with(map[string]string{"If-Match": `"3"`}))
+		rr := do(newServer(s, &fakeAuthz{}), "POST", "/controls/v1/runs/r1/certification", `{"decision":"CERTIFY"}`, with(map[string]string{"Idempotency-Key": "k-1", "If-Match": `"3"`}))
 		assert.Equal(t, c.code, rr.Code, c.err.Error())
 	}
 }
