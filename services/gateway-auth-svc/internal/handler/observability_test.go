@@ -353,7 +353,7 @@ func TestVerify_CartaAllowIsStillCounted(t *testing.T) {
 
 // TestVerify_CartaStepUpMFA_Returns403AndCounted proves STEP_UP_MFA is
 // blocked and still counted in the metrics.
-func TestVerify_CartaStepUpMFA_Returns403AndCounted(t *testing.T) {
+func TestVerify_CartaStepUpMFA_Returns401AndCounted(t *testing.T) {
 	h, key, _ := newTestEnvWithCartaDecision(t, "STEP_UP_MFA")
 	m := &recordingMetrics{}
 	h.UseMetrics(m)
@@ -363,7 +363,7 @@ func TestVerify_CartaStepUpMFA_Returns403AndCounted(t *testing.T) {
 	rec := httptest.NewRecorder()
 	h.Verify(rec, req)
 
-	assert.Equal(t, http.StatusForbidden, rec.Code, "STEP_UP_MFA now blocks")
+	assert.Equal(t, http.StatusUnauthorized, rec.Code, "STEP_UP_MFA asks for a step-up")
 	_, _, _, decisions := m.snapshot()
 	require.Len(t, decisions, 1)
 	assert.Equal(t, "STEP_UP_MFA", decisions[0])
@@ -383,14 +383,18 @@ func TestOutcomeConstantsMatchTelemetry(t *testing.T) {
 	h.UseMetrics(m)
 
 	known := map[string]bool{
-		telemetry.OutcomeAllowed:                 true,
-		telemetry.OutcomeNoToken:                 true,
-		telemetry.OutcomeInvalidToken:            true,
-		telemetry.OutcomeIncompleteClaims:        true,
-		telemetry.OutcomeTenantHostnameMismatch:  true,
-		telemetry.OutcomeCartaBlocked:            true,
-		telemetry.OutcomeTenantContextDenied:     true,
-		telemetry.OutcomeTenantContextUnresolved: true,
+		telemetry.OutcomeAllowed:                  true,
+		telemetry.OutcomeNoToken:                  true,
+		telemetry.OutcomeInvalidToken:             true,
+		telemetry.OutcomeIncompleteClaims:         true,
+		telemetry.OutcomeTenantHostnameMismatch:   true,
+		telemetry.OutcomeCartaBlocked:             true,
+		telemetry.OutcomeTenantContextDenied:      true,
+		telemetry.OutcomeTenantContextUnresolved:  true,
+		telemetry.OutcomeSessionRevoked:           true,
+		telemetry.OutcomeSessionStatusUnavailable: true,
+		telemetry.OutcomeStepUpRequired:           true,
+		telemetry.OutcomeCartaUnavailable:         true,
 	}
 
 	// Drive several paths, then assert every label the handler produced is one

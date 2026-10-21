@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+	idenv "zoiko.io/identity-envelope"
 
 	"zoiko.io/gateway-auth-svc/internal/carta"
 	"zoiko.io/gateway-auth-svc/internal/config"
@@ -116,6 +117,24 @@ func main() {
 	}
 
 	h := handler.New(cfg, jwksClient, cartaClient, siemClient, tenantResolver, log).UseMetrics(metrics)
+	// AU-01: a verified envelope's session is checked at identity-context-svc
+	// (live answers reused for the revocation TTL), so a logout stops passing
+	// the edge at once instead of when the envelope expires.
+	if cfg.IdentityRevocation == "on" {
+		fail := idenv.FailClosed
+		if cfg.RevocationFail == "open" {
+			fail = idenv.FailOpen
+		}
+		h.UseRevocation(idenv.NewRevocation(idenv.RevocationOptions{
+			Source:    idenv.NewIntrospector(cfg.IdentityIntrospectURL, jwksHTTPClient),
+			ActiveTTL: cfg.RevocationTTL,
+			Fail:      fail,
+		}))
+		log.Info("identity session revocation check on", zap.String("introspect_url", cfg.IdentityIntrospectURL),
+			zap.Duration("ttl", cfg.RevocationTTL), zap.String("fail", string(fail)))
+	} else {
+		log.Warn("IDENTITY_REVOCATION=off — a revoked session keeps passing the edge until its envelope expires (ENV=local only)")
+	}
 	r := router.New(h, jwksClient, metrics)
 
 	srv := &http.Server{

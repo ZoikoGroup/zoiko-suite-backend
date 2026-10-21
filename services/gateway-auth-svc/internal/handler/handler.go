@@ -12,6 +12,7 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 	"go.uber.org/zap"
+	idenv "zoiko.io/identity-envelope"
 
 	"zoiko.io/gateway-auth-svc/internal/carta"
 	"zoiko.io/gateway-auth-svc/internal/config"
@@ -30,6 +31,10 @@ type Handler struct {
 
 	// metrics is never nil — New installs nopMetrics.
 	metrics DomainMetrics
+
+	// revocation checks each verified envelope's session at
+	// identity-context-svc (AU-01). Nil skips the check (ENV=local only).
+	revocation *idenv.Revocation
 }
 
 // DomainMetrics records the outcomes this service's HTTP metrics cannot
@@ -100,6 +105,14 @@ func (h *Handler) UseMetrics(m DomainMetrics) *Handler {
 	return h
 }
 
+// UseRevocation makes /verify refuse an envelope whose session has ended. A
+// logout used to leave the envelope passing the edge until it expired (Auth
+// audit AU-01: revocation "must not wait for cache/token expiry").
+func (h *Handler) UseRevocation(r *idenv.Revocation) *Handler {
+	h.revocation = r
+	return h
+}
+
 // envelopeClaims mirrors only the fields this gateway needs to propagate
 // downstream. The full IdentityContextEnvelope shape is owned by
 // identity-context-svc — this service reads a signed token, it never mints
@@ -126,7 +139,8 @@ type envelopeClaims struct {
 	// session was issued with. A pointer so an envelope without the claim
 	// asserts nothing, rather than "single factor".
 	SessionTrustPosture struct {
-		MFAVerified *bool `json:"mfa_verified"`
+		MFAVerified      *bool  `json:"mfa_verified"`
+		SessionContextID string `json:"session_context_id"`
 	} `json:"session_trust_posture"`
 
 	// AuthTime is when the person last authenticated (OIDC auth_time, Unix
@@ -134,6 +148,9 @@ type envelopeClaims struct {
 	// when the envelope was minted and moves on every re-resolve. Zero when the
 	// envelope predates the claim, in which case no age is asserted.
 	AuthTime int64 `json:"auth_time"`
+
+	// SID is the login session the envelope descends from (OIDC sid).
+	SID string `json:"sid"`
 
 	jwt.RegisteredClaims
 }
@@ -222,6 +239,13 @@ func (h *Handler) Verify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// AU-01: the envelope verified, but its session may have ended since it
+	// was minted. Asked of identity-context-svc (cached for the revocation
+	// TTL), before anything is forwarded.
+	if !h.sessionLive(ctx, w, rawToken, claims) {
+		return
+	}
+
 	// Token/hostname tenant mismatch defense — GTRM decision doc §6.2/§11
 	// (acceptance test O), which explicitly assigns this check to the
 	// application layer, not the router: "the app must reject a session
@@ -280,6 +304,17 @@ func (h *Handler) Verify(w http.ResponseWriter, r *http.Request) {
 		"MEDIUM",
 	)
 
+	// AU-23 (decision 21 Oct 2026): carta-svc configured but silent fails
+	// closed on a material write and open on a read. It used to fail open for
+	// everything, so an outage of the risk engine removed the control.
+	if assessment == nil && h.carta.Enabled() && materialWrite(originalMethod(r)) {
+		h.metrics.VerifyDecision(outcomeCartaUnavailable)
+		w.Header().Set(denialReasonHeader, outcomeCartaUnavailable)
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("continuous risk assessment unavailable"))
+		return
+	}
+
 	if assessment != nil {
 		// Counted before the branch, so ALLOW and STEP_UP_MFA are visible too.
 		h.metrics.CartaDecision(string(assessment.Decision))
@@ -305,6 +340,13 @@ func (h *Handler) Verify(w http.ResponseWriter, r *http.Request) {
 		// value carta-svc adds later, or an empty one from a reply that
 		// parsed but carried no decision — and CARTA having answered is not
 		// the unreachable case that Evaluate deliberately fails open on.
+		// STEP_UP_MFA: a TOTP step-up now exists (identity-context-svc), so the
+		// answer is 401 step_up_required, which the console turns into a
+		// step-up and a retry, not a hard 403 (AU-23).
+		if assessment.Decision == carta.DecisionStepUpMFA {
+			h.denyStepUp(w)
+			return
+		}
 		h.metrics.VerifyDecision(outcomeCartaBlocked)
 		h.denyCarta(w, "access denied by continuous risk assessment", string(assessment.Decision))
 		return
@@ -545,14 +587,18 @@ func bearerToken(header string) (string, bool) {
 // depend on internal/telemetry — see DomainMetrics. The audit script compares
 // the two lists so they cannot drift apart unnoticed.
 const (
-	outcomeAllowed                 = "allowed"
-	outcomeNoToken                 = "no_token"
-	outcomeInvalidToken            = "invalid_token"
-	outcomeIncompleteClaims        = "incomplete_claims"
-	outcomeTenantHostnameMismatch  = "tenant_hostname_mismatch"
-	outcomeCartaBlocked            = "carta_blocked"
-	outcomeTenantContextDenied     = "tenant_context_denied"
-	outcomeTenantContextUnresolved = "tenant_context_unresolved"
+	outcomeAllowed                  = "allowed"
+	outcomeNoToken                  = "no_token"
+	outcomeInvalidToken             = "invalid_token"
+	outcomeIncompleteClaims         = "incomplete_claims"
+	outcomeTenantHostnameMismatch   = "tenant_hostname_mismatch"
+	outcomeCartaBlocked             = "carta_blocked"
+	outcomeTenantContextDenied      = "tenant_context_denied"
+	outcomeTenantContextUnresolved  = "tenant_context_unresolved"
+	outcomeSessionRevoked           = "session_revoked"
+	outcomeSessionStatusUnavailable = "session_status_unavailable"
+	outcomeStepUpRequired           = "step_up_required"
+	outcomeCartaUnavailable         = "carta_unavailable"
 )
 
 // denialReasonHeader names why a request was refused, on every refusal.
@@ -583,6 +629,45 @@ func (h *Handler) denyCarta(w http.ResponseWriter, msg, decision string) {
 	w.Header().Set(denialReasonHeader, outcomeCartaBlocked)
 	w.WriteHeader(http.StatusForbidden)
 	_, _ = w.Write([]byte(msg))
+}
+
+// denyStepUp answers 401 with the RFC 9470 step-up challenge: the caller
+// authenticates again with a second factor and retries.
+func (h *Handler) denyStepUp(w http.ResponseWriter) {
+	h.metrics.VerifyDecision(outcomeStepUpRequired)
+	w.Header().Set("X-Carta-Decision", string(carta.DecisionStepUpMFA))
+	w.Header().Set(denialReasonHeader, outcomeStepUpRequired)
+	w.Header().Set("WWW-Authenticate", `Bearer error="insufficient_user_authentication", error_description="step-up authentication required"`)
+	w.WriteHeader(http.StatusUnauthorized)
+	_, _ = w.Write([]byte("step_up_required"))
+}
+
+// sessionLive runs the AU-01 revocation check and writes the refusal: 401
+// session_revoked for an ended session, 503 when identity-context-svc cannot
+// answer and the check fails closed.
+func (h *Handler) sessionLive(ctx context.Context, w http.ResponseWriter, token string, claims *envelopeClaims) bool {
+	if h.revocation == nil {
+		return true
+	}
+	c := &idenv.Claims{TenantID: claims.TenantID, SID: claims.SID}
+	c.Principal.PrincipalID = claims.Principal.PrincipalID
+	c.SessionTrustPosture.SessionContextID = claims.SessionTrustPosture.SessionContextID
+	err := h.revocation.Check(ctx, token, c)
+	switch {
+	case err == nil:
+		return true
+	case errors.Is(err, idenv.ErrRevoked):
+		h.log.Info("gateway refused a revoked session", zap.String("principal_id", claims.Principal.PrincipalID),
+			zap.String("session_context_id", c.SessionContextID()), zap.Error(err))
+		h.deny(w, "session revoked", outcomeSessionRevoked)
+	default:
+		h.log.Error("identity session status unavailable — failing closed", zap.Error(err))
+		h.metrics.VerifyDecision(outcomeSessionStatusUnavailable)
+		w.Header().Set(denialReasonHeader, outcomeSessionStatusUnavailable)
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("session status unavailable"))
+	}
+	return false
 }
 
 // denyMismatch refuses with 403 because the token's tenant is not the tenant

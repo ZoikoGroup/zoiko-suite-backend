@@ -33,6 +33,16 @@ type Config struct {
 	ExpectedIssuer   string
 	ExpectedAudience string
 
+	// AU-01 revocation: each verified envelope's session is checked at
+	// identity-context-svc's introspection endpoint. IdentityRevocation "off"
+	// is refused unless ENV=local; RevocationTTL caps how long a live answer is
+	// reused (≤ 60 s, the revocation SLO); RevocationFail is "closed" (503 when
+	// the status is unknown) or "open".
+	IdentityRevocation    string
+	IdentityIntrospectURL string
+	RevocationTTL         time.Duration
+	RevocationFail        string
+
 	// CartaServiceURL is carta-svc — continuous session-risk scoring
 	// (Doc 05 §3.11/§5.4's "authentication is not a one-time event").
 	// Empty disables the call: risk scoring degrades to "not evaluated",
@@ -114,6 +124,9 @@ func Load() (*Config, error) {
 		JWKSCacheTTL:              time.Duration(ttlSeconds) * time.Second,
 		ExpectedIssuer:            strEnv("EXPECTED_ISSUER", "identity-context-svc"),
 		ExpectedAudience:          strEnv("EXPECTED_AUDIENCE", "zoiko-internal"),
+		IdentityRevocation:        strings.ToLower(strEnv("IDENTITY_REVOCATION", "on")),
+		IdentityIntrospectURL:     strEnv("IDENTITY_INTROSPECT_URL", "http://identity-svc:8080/v1/context/session/introspect"),
+		RevocationFail:            strings.ToLower(strEnv("IDENTITY_REVOCATION_FAIL", "closed")),
 		CartaServiceURL:           strEnv("CARTA_SERVICE_URL", ""),
 		SIEMServiceURL:            strEnv("SIEM_SERVICE_URL", ""),
 		IdentityJWKSMTLSEnabled:   strEnv("IDENTITY_JWKS_MTLS_ENABLED", "false") == "true",
@@ -126,6 +139,27 @@ func Load() (*Config, error) {
 		OTELExporterEndpoint:      strEnv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 		TenantContextTTL:          time.Duration(ctxTTL) * time.Second,
 		TenantContextStaleGrace:   time.Duration(ctxGrace) * time.Second,
+	}
+
+	revTTL, err := intEnv("IDENTITY_REVOCATION_TTL_SECONDS", 5)
+	if err != nil {
+		return nil, err
+	}
+	if revTTL < 1 || revTTL > 60 {
+		return nil, fmt.Errorf("IDENTITY_REVOCATION_TTL_SECONDS must be 1-60 (the revocation SLO), got %d", revTTL)
+	}
+	cfg.RevocationTTL = time.Duration(revTTL) * time.Second
+	switch cfg.IdentityRevocation {
+	case "on":
+	case "off":
+		if env := strings.ToLower(strEnv("ENV", "local")); env != "local" {
+			return nil, fmt.Errorf("IDENTITY_REVOCATION=off is refused outside ENV=local: a logged-out session would keep passing the edge until its envelope expired (AU-01)")
+		}
+	default:
+		return nil, fmt.Errorf("IDENTITY_REVOCATION must be on or off, got %q", cfg.IdentityRevocation)
+	}
+	if cfg.RevocationFail != "closed" && cfg.RevocationFail != "open" {
+		return nil, fmt.Errorf("IDENTITY_REVOCATION_FAIL must be closed or open, got %q", cfg.RevocationFail)
 	}
 
 	// Enabling mTLS for a peer switches that peer's calls to its mTLS URL.

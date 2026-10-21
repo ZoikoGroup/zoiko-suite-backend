@@ -108,6 +108,11 @@ func New(baseURL string, log *zap.Logger) *Client {
 // closed on its own. Losing the risk-scoring signal degrades this request to
 // "scored the way every request was scored before this feature existed,"
 // not to an unauthenticated pass-through.
+// Enabled reports whether carta-svc is configured. A configured client that
+// returns no assessment was unreachable or answered nonsense; the caller fails
+// closed on writes (decision 21 Oct 2026).
+func (c *Client) Enabled() bool { return c != nil && c.baseURL != "" }
+
 func (c *Client) Evaluate(ctx context.Context, principalID, tenantID, legalEntityID, ipAddress, actionRequested, resourceSensitivity string) *Assessment {
 	if c == nil || c.baseURL == "" {
 		return nil

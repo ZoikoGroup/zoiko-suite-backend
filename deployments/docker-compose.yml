@@ -732,8 +732,10 @@ services:
   # wired into a route.
   gateway-auth-svc:
     build:
-      context: ../services/gateway-auth-svc
-      dockerfile: Dockerfile
+      # Root context: go.mod replaces zoiko.io/identity-envelope with the
+      # sibling module, so the build must see both (see the Dockerfile).
+      context: ..
+      dockerfile: services/gateway-auth-svc/Dockerfile
     container_name: gateway-auth-svc
     mem_limit: 256m
     cpus: "0.5"
