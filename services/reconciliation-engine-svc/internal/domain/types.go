@@ -295,6 +295,8 @@ type MatchResult struct {
 	Reason        string    `json:"reason,omitempty"`
 	MatchedBy     string    `json:"matched_by"`
 	MatchedAt     time.Time `json:"matched_at"`
+	// Evidence is set on manual matches made from migration 000010 on.
+	Evidence *ManualMatchEvidence `json:"evidence,omitempty"`
 }
 
 type ManualMatchInput struct {
@@ -446,11 +448,19 @@ type Certification struct {
 	// ResultState and Assessment are set on certifications sealed from
 	// migration 000007 on: a certification over accepted risk says so — the
 	// result stays VARIANCE and every accepted exception is listed.
-	ResultState    *ResultState   `json:"result_state,omitempty"`
-	Assessment     *RunAssessment `json:"assessment,omitempty"`
-	ManifestSHA256 string         `json:"manifest_sha256"`
-	SealedAt       time.Time      `json:"sealed_at"`
-	SealedBy       string         `json:"sealed_by"`
+	ResultState *ResultState   `json:"result_state,omitempty"`
+	Assessment  *RunAssessment `json:"assessment,omitempty"`
+	// Authority, Populations and ManualMatches are set on certifications
+	// sealed from migration 000010 on (A12): the certifier's live
+	// authorization decision, the content hash of every side of the
+	// generation certified, and every manual match with its reason and
+	// evidence. All three are in the manifest hash.
+	Authority      *AuthoritySnapshot     `json:"authority_snapshot,omitempty"`
+	Populations    []CertifiedPopulation  `json:"populations,omitempty"`
+	ManualMatches  []CertifiedManualMatch `json:"manual_matches,omitempty"`
+	ManifestSHA256 string                 `json:"manifest_sha256"`
+	SealedAt       time.Time              `json:"sealed_at"`
+	SealedBy       string                 `json:"sealed_by"`
 }
 
 type SupersedeRunRequest struct {
@@ -497,4 +507,8 @@ var (
 	ErrNotExceptionOwner            = errorString("only the exception's assigned owner can work it; assign it first")
 	ErrNotIndependent               = errorString("risk must be accepted by someone other than the exception's owner and its raiser")
 	ErrNotIndependentCertifier      = errorString("a run must be certified by someone other than whoever started, matched or reperformed it")
+	// ErrAuthorityUntraceable: a certification must record the certifier's own
+	// traceable authorization decision (A12); without one it is refused, not
+	// recorded without it. Answered 503, as authorization-svc being unavailable.
+	ErrAuthorityUntraceable = errorString("the certifier's authorization decision cannot be traced; certification refused")
 )

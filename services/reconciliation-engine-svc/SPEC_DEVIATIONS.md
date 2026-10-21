@@ -35,12 +35,13 @@ generation beside the immutable original (B30). Still missing: rounding and
 business-day tolerance and reconciling items (A5), maker-checker beyond
 accepting risk and approving rules (A9), recurrence and
 qualitative materiality (A4 remainder),
-certification evidence and revocation (A12, out of scope for this change),
+certification revocation (A12; the manifest part is closed by B32),
 and two questions the specs leave open: how absolute and percentage
 tolerance combine (A15) and what defines a PARTIAL result (A16). Defects
 fixed: B1–B4; Stage 1 closed A1, A10, A13 and A14 (B7–B12); Stage 2
 closed A2 and A3 and most of A5 (B13–B17); Stage 3 closed A6 (B18–B20) and A7
-and most of A4 (B21–B25); Stage 4 closed A11 (B26–B27); B30–B31 close A8.
+and most of A4 (B21–B25); Stage 4 closed A11 (B26–B27); B30–B31 close A8;
+B32–B33 close A12's manifest part.
 
 ## A. Not implemented / weaker than the spec
 
@@ -93,13 +94,40 @@ and most of A4 (B21–B25); Stage 4 closed A11 (B26–B27); B30–B31 close A8.
 - **A10. Closed** — definitions and runs carry `legal_entity_id`; see B9.
 - **A11. Closed** — rule versions with independent approval and effective
   dating, and definition reads; see B26.
-- **A12. Certification is thin.** The sealed manifest records counts, the
-  pinned tolerance/materiality, the definition (rule) version and its rules
-  digest (B26), and (since B22) the result and the assessment with every
-  accepted risk — not the
-  population hashes, the manual matches with their reasons, or the certifier's
-  authority (ZS-SVC-Z-001 INV-21, DQC-05 "certification binds exact
-  evidence"; ZS-CONTROL-001 Invariant 9). No revocation.
+- **A12. Certification is thin. — Manifest: Closed (B32). Revocation:
+  still open.** (ZS-SVC-Z-001 INV-21, DQC-05 "certification binds exact
+  evidence"; ZS-CONTROL-001 Invariant 9.) The sealed manifest already recorded
+  counts, the pinned tolerance and materiality, the rule version and its
+  digest (B26), and the result and the assessment with every accepted risk
+  (B22). Migration 000010 adds three things. Each is stored on the
+  `certifications` row and inside the manifest hash, and is served by `GET
+  …/runs/{id}/certification` and the `CONTROL.Certified` event:
+  1. *Populations.* The content hash of every side of the generation that
+     was certified. That is the run's latest generation (A8), named by
+     snapshot id, with the spec, watermark, item count and declared totals
+     it was frozen against.
+  2. *Manual matches.* Every manual match of the run, with its reason, who
+     made it, and the exceptions it resolved. Each also carries the
+     structured evidence recorded when the match was made: both frozen items,
+     their generation, and the comparison under the pinned tolerance.
+  3. *Authority.* The certifier's authority: authorization-svc's own
+     decision (`access_decision_id`, `decision_basis`, `policy_set_version`),
+     asked live for this certification. A grant with no traceable decision
+     fails closed (503), and nothing is certified.
+
+  **Still open, and a separate task: no revocation.** This service has no
+  REVOKED certification state and no revocation command; B18 left REVOKED
+  out. A certified result can be superseded by a later run (B10), but it
+  cannot be withdrawn. Porting financial-control-svc's revocation (its
+  A1/B6) is its own change, built on this record.
+
+  **Not built:**
+  1. No backfill. A certification sealed, or a manual match made, before
+     000010 carries none of this, and none is reconstructed.
+  2. The manifest is still stored only as its SHA-256. The fields it covers
+     are stored beside it, but nothing re-derives the hash to verify it.
+  3. The certification is not signed. DQC-05 says "signed/immutable"; it is
+     immutable (`reject_immutable_row`), not signed.
 - **A13. Closed** — supersession is constrained and records its actor; see B10.
 - **A14. Closed** — population totals are overflow-checked; see B11.
 - **A15. How an absolute and a percentage tolerance combine is unspecified.**
@@ -742,3 +770,113 @@ and most of A4 (B21–B25); Stage 4 closed A11 (B26–B27); B30–B31 close A8.
   status and transition history unchanged, and after the source was restored
   the same run reperformed and reported "populations unchanged from generation
   1".
+- **B32. What a certification binds (closes A12's manifest part).** The
+  shape mirrors financial-control-svc's ControlCertification (its A2/B7),
+  applied to this service's existing `certifications` record instead of a
+  new table. Migration 000010 adds `authority_snapshot`, `populations` and
+  `manual_matches` to `certifications`, and `evidence` to `match_results`.
+  Both tables are already immutable (`reject_immutable_row`), so each column
+  is written once, on insert. The new CHECKs are `NOT VALID`, so rows from
+  before 000010 stay as they are, and every new row must satisfy them.
+  - *Authority.* `authz.Client.Decide` calls authorization-svc's
+    `/v1/authorize` live and returns its recorded decision:
+    `access_decision_id` (the key of its append-only AccessDecisionLog),
+    `decision`, `decision_basis`, `policy_set_version` and `reason_codes`.
+    The client records the principal, entity, action and the time the
+    answer arrived.
+    - `Certify` now authorizes `RECONCILIATION_CERTIFY` on the run's entity
+      through `Decide` rather than `CheckAllowed`, and hands the snapshot to
+      the store.
+    - A GRANTED answer with no `access_decision_id` cannot be traced, so it
+      is refused as unavailable (503).
+    - The store also refuses (`ErrAuthorityUntraceable`, 503) a snapshot
+      that is missing, untraceable, not GRANTED or another principal's. It
+      checks this before taking the run's lock or the idempotency key.
+    - The table CHECK requires `access_decision_id`, `decision_outcome =
+      GRANTED`, and `principal_id = sealed_by`.
+
+    Every other command still uses `CheckAllowed`; only certification
+    records its authority.
+  - *A defect fixed on the way.* The authz client posted to
+    `/v1/authorization/check`, a route authorization-svc does not register.
+    Every check got a 404, which the client turned into a denial. That is
+    the defect already fixed in data-quality-svc, data-lineage-svc,
+    global-search-svc and semantic-model-svc. `CheckAllowed` and `Decide`
+    now share one `/v1/authorize` call. A transport, status or decoding
+    failure is now `ErrAuthorizationUnavailable` (503) instead of a 403
+    denial. The client still caches nothing.
+  - *Populations.* Every side of the run's latest snapshot generation: the
+    generation whose control totals the certification already used, and the
+    one matching ran against (A8). Each side is recorded by `snapshot_id`,
+    `generation` and `content_hash`, with `source_system`, `spec_ref`,
+    `source_watermark`, `item_count`, `declared_row_count` and
+    `declared_totals`. Earlier generations are history, not what was
+    certified, so they are not listed. A run with no frozen population
+    cannot be certified.
+  - *Manual matches: what was already recorded, and what was missing.* A
+    manual match was already its own immutable `match_results` row:
+    `manual = true`, the reason (required by a CHECK), `matched_by` and
+    `matched_at`. Its exceptions name it in `resolved_by_match_id`, and B1
+    already refused a pairing outside the pinned tolerance. So nothing was
+    lost or overwritten, and the reason is prose by design: it is the
+    operator's justification. intercompany-accounting-svc's A3 had a
+    different problem: a machine-determined outcome kept only as an
+    overwritten sentence. What was missing here was §10's "evidence" beside
+    the reason: what the pairing was checked against.
+  - *Manual matches: the evidence column.* `match_results.evidence` is now
+    written in the transaction that applies the match, never reconstructed
+    later (`domain.NewManualMatchEvidence`, required on manual rows by a
+    CHECK). It holds:
+    - both frozen items (id, side, source record, key, amount, currency,
+      date) and their snapshot generation;
+    - `key_overridden`;
+    - the currency, the difference against the allowed amount, and the day
+      difference against the allowed days when the policy has a date
+      tolerance;
+    - the pinned tolerance policy itself.
+
+    The figures are computed exactly as `Compare` computes them, including
+    the percentage base side. The certification lists every manual match of
+    the run, of any generation, because an earlier generation's match closed
+    exceptions the assessment counts. Each is listed with its reason,
+    matcher, time, evidence (null for a pre-000010 match) and the exceptions
+    it resolved. A run with none records an empty list.
+  - *Manifest.* `certificationManifest` gains `populations`,
+    `manual_matches`, `certifier` and `authority_snapshot`, so
+    `manifest_sha256` now covers them. The `CONTROL.Certified` event payload
+    is the certification row, so it carries all three.
+  - *Rollback.* 000010's down refuses while any certification records an
+    authority or any manual match records evidence. Dropping either would
+    leave a manifest hash covering fields that no longer exist. Otherwise it
+    drops the constraints and columns. This is the same posture as
+    000007's and 000009's downs.
+- **B33. Verification of B32.**
+  - *Unit tests.*
+    - `internal/domain`: the evidence builder's figures, including the
+      percentage of the base side, the day difference and no date figures
+      without a date tolerance; and `Traceable`.
+    - `internal/authz`: both calls reach `/v1/authorize`; `Decide` returns
+      the recorded decision and asks again each time; a denial, a grant with
+      no access decision, a 503 and an unreachable server all fail closed.
+    - `internal/handler`: Certify hands the store the certifier's own
+      decision for `RECONCILIATION_CERTIFY` on the run's entity, and an
+      untraceable grant answers 503 and certifies nothing.
+  - *Integration tests* (`internal/store/certification_evidence_test.go`):
+    - A manual match of two differently keyed items, 1003 against 1000 under
+      a 5-unit tolerance, records its evidence (difference 3, allowed 5, key
+      overridden, generation 1) on `GET …/matches`.
+    - The certification lists both generation-1 snapshots by id and hash,
+      the manual match with its reason, matcher, evidence and both resolved
+      exceptions, and the certifier's decision. `GetCertification` reads the
+      same back.
+    - A direct insert whose authority lacks its decision id, or names
+      another principal, breaks `certifications_evidence_check`.
+    - After a reperformance, the certified hashes are generation 2's and
+      differ from generation 1's.
+    - A missing, untraceable, denied or other principal's authority is
+      refused, and the run stays uncertified.
+    - 000010's down round-trips on an empty database and refuses once a
+      manual match has recorded evidence, leaving it intact.
+  - *Existing tests* now pass the certifier's grant to `Certify`.
+  - *Suite.* The full suite ran against a fresh, disposable Postgres 16
+    container and passed.

@@ -159,6 +159,15 @@ func (f *fixture) claim(op, resource string) domain.IdempotencyClaim {
 	}
 }
 
+// grant is the traceable authorization-svc decision a certifier brings to
+// Certify (A12): what the handler's live Decide returns on GRANTED.
+func grant(principal string) *domain.AuthoritySnapshot {
+	return &domain.AuthoritySnapshot{Source: "authorization-svc", PrincipalID: principal, LegalEntityID: entityA,
+		ActionType: "RECONCILIATION_CERTIFY", AccessDecisionID: "adl-" + principal, DecisionOutcome: "GRANTED",
+		Decision: "ALLOW", DecisionBasis: "rbac:role=recon-certifier", PolicySetVersion: "psv-1",
+		DecidedAt: time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)}
+}
+
 const (
 	entityA = "aaaaaaaa-0000-0000-0000-00000000000a"
 	entityB = "bbbbbbbb-0000-0000-0000-00000000000b"

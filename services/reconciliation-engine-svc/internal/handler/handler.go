@@ -64,6 +64,9 @@ const persistTimeout = 30 * time.Second
 // Authorizer is the authorization-svc check this handler needs.
 type Authorizer interface {
 	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
+	// Decide is CheckAllowed returning the decision authorization-svc recorded,
+	// for the one command that must record its authority: Certify (A12).
+	Decide(ctx context.Context, principalID, legalEntityID, actionType string) (*domain.AuthoritySnapshot, error)
 }
 
 type Handler struct {
@@ -543,14 +546,34 @@ func (h *Handler) Reperform(w http.ResponseWriter, r *http.Request) {
 	h.respondJSON(w, http.StatusOK, got)
 }
 
+// Certify authorizes through Decide rather than CheckAllowed: the
+// certification records the certifier's authority (A12, ZS-CONTROL-001
+// Invariant 9), so it must be authorization-svc's own decision for this
+// principal, action and entity, asked for this request. A grant that cannot be
+// traced is refused (503) and nothing is certified.
 func (h *Handler) Certify(w http.ResponseWriter, r *http.Request) {
-	tenantID, principalID, ok := h.authorizeRun(w, r, ActionReconciliationCertify)
+	tenantID := customMiddleware.GetTenantID(r.Context())
+	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
 	}
 	runID := chi.URLParam(r, "runID")
+	run, err := h.store.GetRun(r.Context(), tenantID, runID)
+	if err != nil {
+		h.respondFromError(w, err)
+		return
+	}
+	if run.LegalEntityID == "" {
+		h.respondFromError(w, domain.ErrLegacyRecord)
+		return
+	}
+	authority, err := h.authz.Decide(r.Context(), principalID, run.LegalEntityID, ActionReconciliationCertify)
+	if err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
 	claim := h.idempotencyClaim(principalID, "Certify", runID, "", r.Header.Get("Idempotency-Key"))
-	got, err := h.store.Certify(r.Context(), tenantID, runID, principalID, claim)
+	got, err := h.store.Certify(r.Context(), tenantID, runID, principalID, authority, claim)
 	if err != nil {
 		h.respondFromError(w, err)
 		return
@@ -826,6 +849,8 @@ func (h *Handler) respondFromError(w http.ResponseWriter, err error) {
 	case errors.Is(err, domain.ErrNotExceptionOwner), errors.Is(err, domain.ErrNotIndependent), errors.Is(err, domain.ErrSelfApproval),
 		errors.Is(err, domain.ErrNotIndependentCertifier):
 		h.respondError(w, http.StatusForbidden, err.Error())
+	case errors.Is(err, domain.ErrAuthorityUntraceable):
+		h.respondError(w, http.StatusServiceUnavailable, err.Error())
 	case errors.Is(err, domain.ErrDefinitionNotFound), errors.Is(err, domain.ErrRunNotFound),
 		errors.Is(err, domain.ErrItemNotFound), errors.Is(err, domain.ErrExceptionNotFound), errors.Is(err, domain.ErrRuleVersionNotFound):
 		h.respondError(w, http.StatusNotFound, err.Error())

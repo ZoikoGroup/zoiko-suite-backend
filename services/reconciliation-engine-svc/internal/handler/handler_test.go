@@ -23,11 +23,24 @@ const (
 )
 
 // recordingAuthz grants everything (except the actions in deny) and records
-// the entity and action of each check.
+// the entity and action of each check. Decide answers with a traceable
+// decision, unless untraceable is set.
 type recordingAuthz struct {
-	entities []string
-	actions  []string
-	deny     map[string]bool
+	entities    []string
+	actions     []string
+	deny        map[string]bool
+	untraceable bool
+}
+
+func (a *recordingAuthz) Decide(ctx context.Context, principalID, legalEntityID, action string) (*domain.AuthoritySnapshot, error) {
+	if err := a.CheckAllowed(ctx, principalID, legalEntityID, action); err != nil {
+		return nil, err
+	}
+	if a.untraceable {
+		return nil, authz.ErrAuthorizationUnavailable
+	}
+	return &domain.AuthoritySnapshot{Source: "authorization-svc", PrincipalID: principalID, LegalEntityID: legalEntityID,
+		ActionType: action, AccessDecisionID: "adl_1", DecisionOutcome: "GRANTED", DecisionBasis: "rbac:role=controller"}, nil
 }
 
 func (a *recordingAuthz) CheckAllowed(_ context.Context, _, legalEntityID, action string) error {
@@ -52,11 +65,14 @@ type fakeStore struct {
 	transitions    []domain.TransitionExceptionRequest
 	approvals      []string
 	certifiers     []string
+	authorities    []*domain.AuthoritySnapshot
 }
 
-func (s *fakeStore) Certify(_ context.Context, _, runID, actor string, _ domain.IdempotencyClaim) (*domain.Certification, error) {
+func (s *fakeStore) Certify(_ context.Context, _, runID, actor string, authority *domain.AuthoritySnapshot,
+	_ domain.IdempotencyClaim) (*domain.Certification, error) {
 	s.certifiers = append(s.certifiers, actor)
-	return &domain.Certification{CertificationID: "rcf_1", RunID: runID}, nil
+	s.authorities = append(s.authorities, authority)
+	return &domain.Certification{CertificationID: "rcf_1", RunID: runID, Authority: authority}, nil
 }
 
 func (s *fakeStore) ApproveRuleVersion(_ context.Context, _, definitionID string, version int64, approver string,
@@ -328,6 +344,30 @@ func TestCertify_NeedsCertifyPermission(t *testing.T) {
 	w = serve(NewHandler(st, az, failingFetcher{}, zap.NewNop()), http.MethodPost, "/v1/reconciliation/runs/rcr_1:certify", "")
 	if w.Code != http.StatusForbidden || len(st.certifiers) != 0 {
 		t.Fatalf("certify with only MANAGE: %d %s, certifiers %v", w.Code, w.Body, st.certifiers)
+	}
+}
+
+// A12: the certification is handed the certifier's own live decision, for
+// this action on the run's entity; a grant that cannot be traced certifies
+// nothing.
+func TestCertify_RecordsTheCertifiersDecision(t *testing.T) {
+	run := &domain.ReconciliationRun{RunID: "rcr_1", LegalEntityID: entityA}
+
+	st := &fakeStore{run: run}
+	w := serve(NewHandler(st, &recordingAuthz{}, failingFetcher{}, zap.NewNop()), http.MethodPost, "/v1/reconciliation/runs/rcr_1:certify", "")
+	if w.Code != http.StatusCreated || len(st.authorities) != 1 {
+		t.Fatalf("certify: %d %s, authorities %v", w.Code, w.Body, st.authorities)
+	}
+	a := st.authorities[0]
+	if a.AccessDecisionID != "adl_1" || a.PrincipalID != "alice" || a.LegalEntityID != entityA || a.ActionType != ActionReconciliationCertify {
+		t.Fatalf("authority handed to the store: %+v", a)
+	}
+
+	st = &fakeStore{run: run}
+	w = serve(NewHandler(st, &recordingAuthz{untraceable: true}, failingFetcher{}, zap.NewNop()), http.MethodPost,
+		"/v1/reconciliation/runs/rcr_1:certify", "")
+	if w.Code != http.StatusServiceUnavailable || len(st.certifiers) != 0 {
+		t.Fatalf("untraceable grant: %d %s, certifiers %v", w.Code, w.Body, st.certifiers)
 	}
 }
 
