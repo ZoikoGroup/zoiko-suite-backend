@@ -16,6 +16,7 @@ type fakeStore struct {
 	marked    []string
 	forgotten []string
 	markErr   error
+	tenants   []string
 }
 
 func (f *fakeStore) RecordConsumedEvent(_ context.Context, id, _, _ string) (bool, error) {
@@ -33,6 +34,8 @@ func (f *fakeStore) ForgetConsumedEvent(_ context.Context, id string) error {
 	f.forgotten = append(f.forgotten, id)
 	return nil
 }
+func (f *fakeStore) ListTenantsWithPending(context.Context) ([]string, error) { return f.tenants, nil }
+
 func (f *fakeStore) MarkApproverRecheck(_ context.Context, tenant, principal string) (int, error) {
 	if f.markErr != nil {
 		return 0, f.markErr
@@ -105,5 +108,23 @@ func TestApply_FailureReleasesTheClaim(t *testing.T) {
 	st.markErr = nil
 	if err := consumer.Apply(context.Background(), st, m, zap.NewNop()); err != nil || len(st.marked) != 1 {
 		t.Fatalf("redelivery not applied: err=%v marked=%v", err, st.marked)
+	}
+}
+
+// A global (tenantless) policy change re-checks every tenant with a pending
+// approval; it used to be skipped. A tenantless event naming a principal is
+// still skipped: there is no tenant to look the principal up in.
+func TestApply_GlobalPolicyChangeRechecksEveryTenant(t *testing.T) {
+	st := &fakeStore{tenants: []string{"t-1", "t-2"}}
+	if err := consumer.Apply(context.Background(), st, msg(t, "e-g", "policy.version.activated", "", nil), zap.NewNop()); err != nil {
+		t.Fatal(err)
+	}
+	if len(st.marked) != 2 || st.marked[0] != "t-1/" || st.marked[1] != "t-2/" {
+		t.Fatalf("marked %v, want both tenants", st.marked)
+	}
+	st = &fakeStore{tenants: []string{"t-1"}}
+	_ = consumer.Apply(context.Background(), st, msg(t, "e-d", "authorization.denied", "", map[string]any{"principal_id": "a"}), zap.NewNop())
+	if len(st.marked) != 0 {
+		t.Fatalf("a tenantless principal event flagged %v", st.marked)
 	}
 }

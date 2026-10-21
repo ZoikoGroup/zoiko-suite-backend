@@ -177,3 +177,34 @@ func (s *PgStore) ForgetConsumedEvent(ctx context.Context, eventID string) error
 	}
 	return nil
 }
+
+// ListTenantsWithPending names every tenant with a PENDING instance, read
+// across tenants under the same SELECT-only app.timer_sweep policy the timer
+// pass uses. A platform-wide event (a global policy change) re-checks each.
+func (s *PgStore) ListTenantsWithPending(ctx context.Context) ([]string, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.timer_sweep', 'true', true)"); err != nil {
+		return nil, fmt.Errorf("%w: set_config app.timer_sweep: %v", domain.ErrStoreUnavailable, err)
+	}
+	rows, err := tx.Query(ctx, `SELECT DISTINCT tenant_id::text FROM workflow_instances WHERE workflow_status = 'PENDING' ORDER BY 1`)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var t string
+		if err := rows.Scan(&t); err != nil {
+			return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+		out = append(out, t)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return out, tx.Commit(ctx)
+}

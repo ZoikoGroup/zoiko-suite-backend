@@ -7,6 +7,7 @@ package handler_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -222,5 +223,124 @@ func TestErrors_AreProblemJSONWithLegacyCode(t *testing.T) {
 	_ = json.Unmarshal(w.Body.Bytes(), &body)
 	if body["error"] != "authorization_denied" || body["status"] != float64(403) || body["error_class"] != "AUTHORIZATION_DENIED" {
 		t.Fatalf("body = %v", body)
+	}
+}
+
+type stubRegistry struct{ err error }
+
+func (s stubRegistry) CheckEntity(context.Context, string, string) error { return s.err }
+
+func routerWithRegistry(s *stubStore, a *stubAuthz, reg stubRegistry) chi.Router {
+	r := chi.NewRouter()
+	r.Use(svcmiddleware.TenantContext())
+	handler.RegisterRoutes(r, handler.New(s, &stubPublisher{}, a, &stubDocuments{}, zap.NewNop()).WithRegistryChecker(reg))
+	return r
+}
+
+// Row 6 / 53: the legal entity must exist in the caller's tenant; a registry
+// that cannot answer fails closed.
+func TestCreate_RegistryDecidesTheEntity(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		want int
+	}{{nil, http.StatusCreated}, {domain.ErrLegalEntityNotFound, http.StatusNotFound}, {domain.ErrRegistryUnavailable, http.StatusServiceUnavailable}} {
+		s := &stubStore{instance: readInstance()}
+		w := post(routerWithRegistry(s, &stubAuthz{}, stubRegistry{err: tc.err}), "/v1/workflows", "requester-1", validCreateBody(), nil)
+		if w.Code != tc.want {
+			t.Fatalf("registry %v: expected %d, got %d: %s", tc.err, tc.want, w.Code, w.Body.String())
+		}
+	}
+}
+
+// Row 13: a workflow started from a definition follows the definition's
+// route, deadline, expiry and escalation target (it used to validate the
+// definition and then ignore its stages).
+func TestCreate_DefinitionSuppliesTheRoute(t *testing.T) {
+	expiry, target := 48, "head-of-finance"
+	def := &domain.WorkflowDefinition{WorkflowDefinitionID: "33333333-3333-4333-8333-333333333333", WorkflowType: "PURCHASE_APPROVAL",
+		Version: 2, IsActive: true, ExpiryHours: &expiry, EscalationTarget: &target,
+		StagesJSON: []byte(`[{"order":1,"stage_type":"SINGLE","approver_principal_id":"approver-1","due_at_hours":24},{"order":2,"stage_type":"ROLE","approver_role":"FINANCE_CONTROLLER"}]`)}
+	s := &stubStore{instance: readInstance(), workflowDefinition: def}
+	a := &stubAuthz{}
+	body := `{"tenant_id":"` + testTenant + `","legal_entity_id":"` + testEntity + `","workflow_type":"PURCHASE_APPROVAL","workflow_definition_id":"` + def.WorkflowDefinitionID + `"}`
+	w := post(newTestRouterFull(s, &stubPublisher{}, a), "/v1/workflows", "requester-1", body, nil)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+	p := s.createdParams
+	if len(p.Stages) != 2 || p.Stages[0].ApproverPrincipalID != "approver-1" || p.Stages[0].DueAtHours != 24 ||
+		p.Stages[1].StageType != domain.StageTypeRole || p.Stages[1].ApproverRole != "FINANCE_CONTROLLER" {
+		t.Fatalf("stages = %+v, want the definition's route", p.Stages)
+	}
+	if p.WorkflowDefinitionVersion != 2 || p.EscalationTarget == nil || *p.EscalationTarget != target || p.DueAt == nil {
+		t.Fatalf("pinning: version %d target %v due %v", p.WorkflowDefinitionVersion, p.EscalationTarget, p.DueAt)
+	}
+	// Only the named approver is checked at create; a ROLE stage names no one.
+	if len(a.entities) != 1 {
+		t.Fatalf("approver checks = %d, want 1", len(a.entities))
+	}
+}
+
+// A ROLE stage is decided by a role holder, as such ("role"), and the
+// stage's role travels to authorization-svc as an attribute.
+func TestDecision_RoleStageHolderDecides(t *testing.T) {
+	role := "FINANCE_CONTROLLER"
+	s := &stubStore{findInstance: readInstance(),
+		currentStage:   &domain.WorkflowStage{StageOrder: 2, StageType: domain.StageTypeRole, ApproverRole: &role},
+		submitInstance: readInstance(), submitStage: &domain.WorkflowStage{StageOrder: 2}, submitTransitioned: true}
+	w := post(newTestRouter(s), "/v1/workflows/"+testWorkflowID+"/actions", "controller-7", `{"action":"APPROVE"}`, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if s.submitParams.ActingAs != "role" || s.submitParams.Authority.AccessDecisionID != "ad-1" {
+		t.Fatalf("submit = %+v, want acting as role with the access decision", s.submitParams)
+	}
+	var resp map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["decision_id"] == nil || resp["decision_id"] == "" {
+		t.Fatalf("no decision_id in %v", resp)
+	}
+}
+
+// The escalation target of an ESCALATED instance decides as such; the
+// delegation check is not asked.
+func TestDecision_EscalationTargetDecides(t *testing.T) {
+	inst := readInstance()
+	inst.WorkflowStatus = domain.WorkflowStatusEscalated
+	target := "head-of-finance"
+	inst.EscalationTarget = &target
+	s := &stubStore{findInstance: inst, currentStage: &domain.WorkflowStage{StageOrder: 1, ApproverPrincipalID: "approver-1"},
+		submitInstance: inst, submitStage: &domain.WorkflowStage{StageOrder: 1}, submitTransitioned: true}
+	w := post(newTestRouter(s), "/v1/workflows/"+testWorkflowID+"/actions", target, `{"action":"REJECT","rationale":"no budget"}`, nil)
+	if w.Code != http.StatusOK || s.submitParams.ActingAs != "escalation" || s.submitParams.AssignedApproverID != "" {
+		t.Fatalf("code %d submit %+v", w.Code, s.submitParams)
+	}
+}
+
+// A delegate of the stage's approver decides with the delegation recorded.
+func TestDecision_DelegateRecordsTheDelegation(t *testing.T) {
+	s := &stubStore{findInstance: readInstance(), currentStage: &domain.WorkflowStage{StageOrder: 1, ApproverPrincipalID: "approver-1"},
+		submitInstance: readInstance(), submitStage: &domain.WorkflowStage{StageOrder: 1}, submitTransitioned: true}
+	w := post(newTestRouter(s), "/v1/workflows/"+testWorkflowID+"/actions", "cover-1", `{"action":"APPROVE"}`, nil)
+	if w.Code != http.StatusOK || s.submitParams.AssignedApproverID != "approver-1" || s.submitParams.Authority.DelegationID != "del-1" {
+		t.Fatalf("code %d submit %+v", w.Code, s.submitParams)
+	}
+}
+
+// Commands carry the Idempotency-Key and a request hash to the store; the
+// same body hashes the same, a different body differently.
+func TestDecision_IdempotencyKeyAndHashReachTheStore(t *testing.T) {
+	hashOf := func(body string) domain.CommandMeta {
+		s := &stubStore{findInstance: readInstance(), currentStage: &domain.WorkflowStage{StageOrder: 1, ApproverPrincipalID: "approver-1"},
+			submitInstance: readInstance(), submitStage: &domain.WorkflowStage{StageOrder: 1}}
+		post(newTestRouter(s), "/v1/workflows/"+testWorkflowID+"/actions", "approver-1", body, map[string]string{"Idempotency-Key": "k-1"})
+		return s.submitParams.Meta
+	}
+	a, b, c := hashOf(`{"action":"APPROVE"}`), hashOf(`{"action":"APPROVE"}`), hashOf(`{"action":"REJECT","rationale":"x"}`)
+	if a.IdempotencyKey != "k-1" || a.RequestHash == "" || a.RequestHash != b.RequestHash || a.RequestHash == c.RequestHash {
+		t.Fatalf("meta a=%+v b=%+v c=%+v", a, b, c)
+	}
+	if a.DecisionID == "" || a.DecisionID == b.DecisionID {
+		t.Fatal("each command needs its own ledger decision id")
 	}
 }

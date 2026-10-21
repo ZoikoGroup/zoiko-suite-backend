@@ -29,6 +29,9 @@ type Store interface {
 	RecordConsumedEvent(ctx context.Context, eventID, eventType, tenantID string) (bool, error)
 	ForgetConsumedEvent(ctx context.Context, eventID string) error
 	MarkApproverRecheck(ctx context.Context, tenantID, principalID string) (int, error)
+	// ListTenantsWithPending names every tenant with a PENDING instance, for an
+	// event that applies platform-wide (a global policy change).
+	ListTenantsWithPending(ctx context.Context) ([]string, error)
 }
 
 // Default topics, with the producers' wire names.
@@ -89,7 +92,12 @@ func Apply(ctx context.Context, st Store, value []byte, log *zap.Logger) error {
 	if !ok {
 		return nil
 	}
-	if e.TenantID == "" {
+	// A tenantless event is a platform-wide change: a global policy applies to
+	// every tenant, so every tenant with a pending approval is re-checked. It
+	// used to be skipped, and a global policy change re-checked nobody. Other
+	// tenantless events name a principal without a tenant to look it up in.
+	global := e.TenantID == ""
+	if global && (len(affected) != 1 || affected[0] != "") {
 		log.Warn("workflow consumer: skipping a tenantless event", zap.String("event_id", e.EventID), zap.String("event_type", e.EventType))
 		return nil
 	}
@@ -100,17 +108,29 @@ func Apply(ctx context.Context, st Store, value []byte, log *zap.Logger) error {
 	if !first {
 		return nil
 	}
-	flagged := 0
-	for _, principal := range affected {
-		n, err := st.MarkApproverRecheck(ctx, e.TenantID, principal)
-		if err != nil {
+	tenants := []string{e.TenantID}
+	if global {
+		if tenants, err = st.ListTenantsWithPending(ctx); err != nil {
 			if ferr := st.ForgetConsumedEvent(ctx, e.EventID); ferr != nil {
 				log.Error("workflow consumer: releasing a failed claim failed — the event will not be re-applied",
 					zap.String("event_id", e.EventID), zap.Error(ferr))
 			}
 			return err
 		}
-		flagged += n
+	}
+	flagged := 0
+	for _, tenant := range tenants {
+		for _, principal := range affected {
+			n, err := st.MarkApproverRecheck(ctx, tenant, principal)
+			if err != nil {
+				if ferr := st.ForgetConsumedEvent(ctx, e.EventID); ferr != nil {
+					log.Error("workflow consumer: releasing a failed claim failed — the event will not be re-applied",
+						zap.String("event_id", e.EventID), zap.Error(ferr))
+				}
+				return err
+			}
+			flagged += n
+		}
 	}
 	if flagged > 0 {
 		log.Info("workflow consumer: pending approvals flagged for re-check",

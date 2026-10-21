@@ -297,3 +297,23 @@ func TestPgStore_RLS_RecheckListsOnlyQuorumApproversStillToVote(t *testing.T) {
 		t.Fatalf("approvers still to vote = %+v, want voter-2 and voter-3", approvers)
 	}
 }
+
+func TestPgStore_RLS_ListTenantsWithPendingCrossesTenants(t *testing.T) {
+	admin := getTestPool(t)
+	defer admin.Close()
+	setupTestDB(t, admin)
+	s := store.New(appRolePool(t, admin), zap.NewNop())
+
+	const otherTenant = "00000000-0000-0000-0000-000000000002"
+	for _, tenant := range []string{testTenantID, otherTenant} {
+		p := twoStageParams()
+		p.TenantID = tenant
+		if _, _, _, err := s.CreateWorkflow(tenantCtx(tenant), p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tenants, err := s.ListTenantsWithPending(context.Background())
+	if err != nil || len(tenants) != 2 {
+		t.Fatalf("tenants = %v, %v", tenants, err)
+	}
+}

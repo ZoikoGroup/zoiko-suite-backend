@@ -30,6 +30,10 @@ const (
 // ── stub store ────────────────────────────────────────────────────────────────
 
 type stubStore struct {
+	// createdParams / submitParams record what the handler passed the store.
+	createdParams domain.CreateWorkflowParams
+	submitParams  domain.SubmitActionParams
+
 	instance         *domain.WorkflowInstance
 	stages           []*domain.WorkflowStage
 	createErr        error
@@ -251,7 +255,8 @@ func (s *stubStore) RetireWorkflowDefinition(_ context.Context, _ string) error 
 	return s.definitionErr
 }
 
-func (s *stubStore) CreateWorkflow(_ context.Context, _ domain.CreateWorkflowParams) (*domain.WorkflowInstance, []*domain.WorkflowStage, bool, error) {
+func (s *stubStore) CreateWorkflow(_ context.Context, p domain.CreateWorkflowParams) (*domain.WorkflowInstance, []*domain.WorkflowStage, bool, error) {
+	s.createdParams = p
 	created := s.createCreated
 	if !s.createCreatedSet {
 		created = true // default: existing tests expect the "newly created" (201) path
@@ -270,7 +275,8 @@ func (s *stubStore) FindCurrentStage(_ context.Context, _ string) (*domain.Workf
 func (s *stubStore) IsCurrentStageApprover(_ context.Context, _, _ string) (bool, error) {
 	return s.currentStageApprover, s.currentStageApproverErr
 }
-func (s *stubStore) SubmitAction(_ context.Context, _ domain.SubmitActionParams) (*domain.WorkflowInstance, *domain.WorkflowStage, bool, error) {
+func (s *stubStore) SubmitAction(_ context.Context, p domain.SubmitActionParams) (*domain.WorkflowInstance, *domain.WorkflowStage, bool, error) {
+	s.submitParams = p
 	return s.submitInstance, s.submitStage, s.submitTransitioned, s.submitErr
 }
 func (s *stubStore) SubmitQuorumVote(_ context.Context, _ domain.SubmitQuorumVoteParams) (*domain.WorkflowInstance, *domain.WorkflowStage, bool, error) {
