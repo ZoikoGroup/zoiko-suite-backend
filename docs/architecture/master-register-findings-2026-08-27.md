@@ -89,6 +89,28 @@ Full attribute-condition ABAC beyond this one own-object case remains out of sco
 
 **Decision (2026-08-28): keep the current 503 behavior.** Switching to a recorded DENIED would be a real behavior change for every caller of `/v1/authorize` — a lookup failure would start looking identical to "you lack permission" rather than "we couldn't check," in every one of the roughly 86 services calling this endpoint. Not undertaken.
 
+### 2.8 Six services' authz clients call a route `authorization-svc` has never registered — 6 services still broken, found 2026-10-21
+
+`authorization-svc` registers exactly one evaluation route: `POST /v1/authorize` (`internal/handler/handler.go:272`, `AuthorizePath` at `envelope_policy.go:12`). A copy-pasted authz-client implementation instead posts to `POST /v1/authorization/check`, a path the router never mounts. Every call 404s, and the client's fail-closed handling turns that 404 into an ordinary denial — so the bug is invisible in normal operation: a gated action is simply always refused, which looks identical to "you lack the grant." It only becomes visible against a real `authorization-svc`, and none of the affected services have a client test that makes a real HTTP call (only store tests, or a stubbed authz client), so it was never caught.
+
+**Fixed, confirmed by a real HTTP client test in each:** `data-lineage-svc`, `data-quality-svc`, `global-search-svc`, `semantic-model-svc` (all in `6ea8fcaa`), and `reconciliation-engine-svc` (`f3736a5d`, found and fixed incidentally while closing a SPEC_DEVIATIONS gap in that service — its own `internal/authz/client_test.go` now covers it).
+
+**Still broken, confirmed 2026-10-21, not fixed (outside the checking session's domain):**
+
+| Service | Location | Test coverage that would have caught it |
+|---|---|---|
+| `analytical-data-platform-svc` | `internal/authz/client.go:46` | None — only `pg_store_test.go`/`rls_test.go` |
+| `assistant-rag-svc` | `internal/authz/client.go:46` | None — only `pg_store_test.go`/`rls_test.go` |
+| `classification-svc` | `internal/authz/client.go:46` | None — only `pg_store_test.go`/`rls_test.go` |
+| `data-ingestion-svc` | `internal/authz/client.go:46` | None — only `pg_store_test.go`/`rls_test.go` |
+| `document-extraction-svc` | `internal/authz/client.go:46` | None — only `pg_store_test.go`/`rls_test.go` |
+
+All five date from the same original commit (`76031b12`) and are wired in each service's `main.go`; every gated action behind `CheckAllowed` in each of these five services is refused (403) in any environment with a real `authorization-svc`.
+
+**A related, distinct defect in `workflow-svc`:** its delegation check (`internal/authz/client.go:221`) posts `POST /v1/authorize/delegation`, which is also never registered — but unlike the five above, this almost certainly isn't a typo of `/v1/authorize`. `authorization-svc` separately registers `POST /v1/delegated-access/evaluate` (`DelegatedAccessEvaluatePath`, `internal/handler/handler.go:294`, implemented at `validation.go:490`), which is the likely intended target — confirmed as a real, mounted route, not a guess. `CheckDelegation` fails closed the same way, so a designated delegate can never approve on the assigned approver's behalf (`handler.go:749`). Only `handler_test.go:423` stubs `CheckDelegation`; no client test exists. workflow-svc's owner should confirm `/v1/delegated-access/evaluate` is the right replacement before changing it — the request/response shape may differ from a simple path swap.
+
+Not fixed by this entry — all six services are outside the Accounting Kernel/Controls/Treasury/Commercial-Plane domain (Satyaprakash) that found this; routing to each service's actual owner is a tracker/triage action, not a code change made here.
+
 ---
 
 ## 3. New obligations with zero tracker presence — entirely new priority tiers, not gap-fills
