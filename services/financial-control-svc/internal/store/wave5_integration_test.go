@@ -28,7 +28,8 @@ func newWave5(t *testing.T) *wave2 {
 	for _, p := range []string{"journal-balances", "control-account-postings", "unposted-events", "manual-journals", "event-journal-breaks"} {
 		w.src.noPeriod[catalogue.SysGL+"/"+p] = true
 	}
-	w.exec = engine.New(testStore, source.NewHTTPFetcher(map[string]string{catalogue.SysGL: s.URL}, nil), zap.NewNop()).
+	w.fetch = source.NewHTTPFetcher(map[string]string{catalogue.SysGL: s.URL}, nil)
+	w.exec = engine.New(testStore, w.fetch, zap.NewNop()).
 		WithClock(func() time.Time { return wave2Now })
 	defs, err := catalogue.Wave5("2026-01-01")
 	require.NoError(t, err)

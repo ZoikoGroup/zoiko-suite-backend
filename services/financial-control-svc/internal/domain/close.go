@@ -111,11 +111,23 @@ type CloseGateItem struct {
 	// that the certification is withdrawn from that instant.
 	CertificationRevokedAt string `json:"certification_revoked_at,omitempty"`
 	RevocationReason       string `json:"revocation_reason,omitempty"`
+
+	// Set when the latest run is certified and an unresolved late-data
+	// exception says its source changed since (Invariant 14). The
+	// certification itself is untouched; the gate reads the exception.
+	LateDataExceptionID string `json:"late_data_exception_id,omitempty"`
+	LateDataDetectedAt  string `json:"late_data_detected_at,omitempty"`
 }
 
 // GateReasonCertificationRevoked: the latest run was certified, and that
 // certification has since been revoked.
 const GateReasonCertificationRevoked = "CERTIFICATION_REVOKED"
+
+// GateReasonLateDataAfterCertification: the latest run is certified, but its
+// source has changed since and the late-data exception that records it is
+// unresolved. A new run naming it as prior, or resolving the exception under
+// authority (waiver, carry-forward, closure), clears it.
+const GateReasonLateDataAfterCertification = "LATE_DATA_AFTER_CERTIFICATION"
 
 // CloseGate is the entity-level decision (FIN-CTRL-041). Open means every
 // mandatory control's LATEST run for the period is CERTIFIED. It is fail-closed:
@@ -144,6 +156,10 @@ func EvaluateGate(entityID, periodID string, controls []GateInput) CloseGate {
 			it.Status, it.Reason = GateBlocking, GateReasonCertificationRevoked
 			it.RunID, it.Lifecycle, it.Result, it.Certificatio = c.RunID, c.Lifecycle, c.Result, c.Certification
 			it.CertificationRevokedAt, it.RevocationReason = c.RevokedAt, c.RevocationReason
+		case c.Lifecycle == string(LifecycleCertified) && c.Certification == string(CertCertified) && c.LateDataExceptionID != "":
+			it.Status, it.Reason = GateBlocking, GateReasonLateDataAfterCertification
+			it.RunID, it.Lifecycle, it.Result, it.Certificatio = c.RunID, c.Lifecycle, c.Result, c.Certification
+			it.LateDataExceptionID, it.LateDataDetectedAt = c.LateDataExceptionID, c.LateDataDetectedAt
 		case c.Lifecycle == string(LifecycleCertified) && c.Certification == string(CertCertified):
 			it.Status = GatePassed
 			it.RunID, it.Lifecycle, it.Result, it.Certificatio = c.RunID, c.Lifecycle, c.Result, c.Certification
@@ -168,6 +184,9 @@ type GateInput struct {
 	// RevokedAt (RFC 3339) and RevocationReason are set when the latest run's
 	// certification was revoked.
 	RevokedAt, RevocationReason string
+	// LateDataExceptionID and LateDataDetectedAt (RFC 3339) are set when the
+	// latest run has an unresolved late-data exception.
+	LateDataExceptionID, LateDataDetectedAt string
 }
 
 // ExposureRow is the unresolved exception exposure of one currency and severity.

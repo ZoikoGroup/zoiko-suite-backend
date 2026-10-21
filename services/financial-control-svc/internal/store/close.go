@@ -396,7 +396,9 @@ func (s *PgStore) RevokeCertification(ctx context.Context, tenantID, runID, acto
 
 // CloseGate returns each mandatory (close_gating) control with its latest run for
 // the entity and period. Only the latest run counts: an earlier certified run does
-// not survive a later run that failed or is still open.
+// not survive a later run that failed or is still open. A certified latest run with
+// an unresolved late-data exception (Invariant 14; opened by the late-data sweep)
+// is reported with it, and EvaluateGate decides it blocks.
 func (s *PgStore) CloseGate(ctx context.Context, tenantID, legalEntityID, periodID string) (*domain.CloseGate, error) {
 	var in []domain.GateInput
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
@@ -404,7 +406,8 @@ func (s *PgStore) CloseGate(ctx context.Context, tenantID, legalEntityID, period
 			SELECT d.control_code, d.name, COALESCE(r.run_id::text,''), COALESCE(r.lifecycle_state,''),
 			       COALESCE(r.result_state,''), COALESCE(r.certification_state,''),
 			       COALESCE(to_char(v.revoked_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),''),
-			       COALESCE(v.reason,'')
+			       COALESCE(v.reason,''), COALESCE(ld.exception_id::text,''),
+			       COALESCE(to_char(ld.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),'')
 			FROM control_definitions d
 			LEFT JOIN LATERAL (
 				SELECT run_id, lifecycle_state, result_state, certification_state FROM control_runs
@@ -412,6 +415,12 @@ func (s *PgStore) CloseGate(ctx context.Context, tenantID, legalEntityID, period
 				  AND legal_entity_id = $2 AND period_id = $3
 				ORDER BY created_at DESC, run_id DESC LIMIT 1) r ON true
 			LEFT JOIN control_certification_revocations v ON v.tenant_id = d.tenant_id AND v.run_id = r.run_id
+			LEFT JOIN LATERAL (
+				SELECT exception_id, created_at FROM control_exceptions
+				WHERE tenant_id = d.tenant_id AND run_id = r.run_id
+				  AND category = 'LATE_DATA' AND reason_code = 'LATE_DATA_AFTER_CERTIFICATION'
+				  AND state NOT IN ('CLOSED','WAIVED_UNDER_AUTHORITY','CARRIED_FORWARD_UNDER_AUTHORITY')
+				ORDER BY created_at, exception_id LIMIT 1) ld ON true
 			WHERE d.tenant_id = $1 AND d.close_gating
 			ORDER BY d.control_code`, tenantID, legalEntityID, periodID)
 		if err != nil {
@@ -421,7 +430,7 @@ func (s *PgStore) CloseGate(ctx context.Context, tenantID, legalEntityID, period
 		for rows.Next() {
 			var g domain.GateInput
 			if err := rows.Scan(&g.ControlCode, &g.ControlName, &g.RunID, &g.Lifecycle, &g.Result, &g.Certification,
-				&g.RevokedAt, &g.RevocationReason); err != nil {
+				&g.RevokedAt, &g.RevocationReason, &g.LateDataExceptionID, &g.LateDataDetectedAt); err != nil {
 				return err
 			}
 			in = append(in, g)

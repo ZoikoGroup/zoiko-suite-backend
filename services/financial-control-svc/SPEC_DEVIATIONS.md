@@ -84,17 +84,44 @@ policies a run pins.
   new run with `prior_run_id` (documented in `financial-control-wave7.md`).
   Whether a run-level reperform is still needed is a design decision; if not,
   the two unused states should be removed or documented as reserved.
-- **A7. Late data after freeze/certification is not detected (Invariant 14,
-  scenarios 05 and 21).** A frozen population is immutable and later source
-  data is picked up by a new run — but nothing notices that a source's
-  watermark has moved after a run was CERTIFIED, so a certified population can
-  go stale silently. `LATE_DATA` exists only as a category an `EXCEPTION_SCAN`
-  rule may emit. The §7 attention signals derived today are CONTROL_FAILED,
-  CONTROL_STALE (run never started), RESULT_INDETERMINATE, OVERDUE, SLA_BREACH
-  and MATERIAL; `DATA_LATE` and `RECURRENT` are not derived. Scope: a sweeper
-  that re-reads the watermark (page 1, `limit=1`) for the latest certified run
-  of each control/entity/period, and on change opens a `LATE_DATA` exception
-  or attention signal and, per policy, reports the close gate closed.
+- **A7. Late data after certification is not detected (Invariant 14,
+  scenarios 05 and 21). — Closed (B9).** A late-data sweep now runs on the
+  service's housekeeping schedule. For the latest CERTIFIED run of each
+  control, entity and period, it re-reads each side's source watermark (page
+  1, `limit=1`, through the same `source` client request execution builds
+  populations with) and compares it with the watermark the run froze. When
+  it has moved, it opens one `LATE_DATA` exception on that run, with reason
+  `LATE_DATA_AFTER_CERTIFICATION`, through the same insert, transition and
+  `control.exception.opened` event execution uses. The close gate then
+  reports the control as `BLOCKING` with that reason, at the same decision
+  point (`EvaluateGate`) as every other reason. It stays blocked until the
+  exception is resolved under authority or a new run supersedes the
+  certified one. Nothing is mutated: the run row, its history, its frozen
+  population, its evidence and its `control_certifications` row are never
+  written. The integration test compares their `row_to_json` before and
+  after.
+  **Not built:**
+  1. There is no configurable per-control or per-population late-data
+     policy (§9 "Late-data rule"). Every moved watermark on a latest
+     certified run blocks the gate until it is resolved.
+  2. Late data on a run that has frozen its population but is not yet
+     certified (READY_TO_CERTIFY, EXCEPTION_REVIEW) is not detected, so a
+     certifier can still certify a population the source has already moved
+     past.
+  3. Detection runs at the sweep's cadence (every 10 minutes, each run at
+     most every 30), not on a source event, so a gate read in between does
+     not see it yet.
+  4. A source the sweep cannot read is recorded as `UNVERIFIED` in
+     `control_watermark_checks` and logged. It does not affect the gate, and
+     no endpoint exposes it.
+  5. The `DATA_LATE` and `RECURRENT` attention signals are still not derived.
+     The exception was chosen as the shape (B9), and `GET
+     …/monitoring/metrics`' late-data count already includes these
+     exceptions.
+  6. As in A11, nothing subscribes to the event, so a period closed before
+     the late data arrived is not flagged anywhere.
+  7. Scenario 21's consolidation population belongs to consolidation-svc.
+     This covers this service's populations only.
 - **A8. No cross-currency matching (§10, ZS-SVC-Z-001 INV-10).** Records in
   different currencies on one reference raise `CURRENCY_MISMATCH`; nothing
   normalizes through an approved FX basis. Blocked on an FX-rate read capability
@@ -285,3 +312,78 @@ policies a run pins.
   - *Rollback.* 000008's down migration deletes the claims the old schema
     cannot hold (exception transitions, commands longer than 32 characters).
     They are retry protection, not records.
+
+- **B9. How late data after certification is detected (A7).**
+  - *Trigger.* The service already had an in-process scheduler. `cmd/server`
+    runs the housekeeping `Sweep` (run expiry, SLA breaches) on a 10-minute
+    ticker under the relay context, and the late-data sweep is a second loop
+    of the same shape: `engine.LateDataSweeper.Sweep(ctx, 100)` every 10
+    minutes, re-checking a run at most every 30 minutes, least recently
+    checked first. It is not computed lazily on close-gate reads, for three
+    reasons:
+    1. The gate would then make one or two source calls per mandatory
+       control on every read, and a source outage would make the gate's
+       answer depend on that source.
+    2. A GET would have to write the exception.
+    3. Invariant 14 wants the exception to exist when the late data is
+       there, not only once someone asks the gate. Monitoring and exception
+       queues see it too.
+
+    It is a separate loop rather than another step in `Sweep` so that a slow
+    source (each read is bounded at 10 seconds) cannot delay run expiry or
+    SLA events. `Sweep` lives in `store`, which has no source client.
+  - *Shape.* An exception, not an attention signal. `LATE_DATA` is already a
+    `control_exceptions` category, the one `EXCEPTION_SCAN` rules emit. The
+    exception lifecycle already carries owner, due date, authority, evidence
+    and root cause, which is how a late-data finding gets resolved, and
+    monitoring already counts the category. Attention signals are derived
+    from stored fields on read, which a watermark re-check cannot be.
+    `domain.LateDataException` builds it with:
+    - severity HIGH, owner = the definition's owner role, due date from the
+      HIGH SLA;
+    - side = the side that moved, `record_ids` = the stale frozen
+      `population_id`;
+    - exposure 0 in `XXX` (there is no amount yet);
+    - detail naming both watermarks.
+
+    Its reason `LATE_DATA_AFTER_CERTIFICATION` is reserved (`validateScan`
+    refuses it), so the gate cannot confuse it with a `LATE_DATA` finding the
+    certifier already saw.
+  - *Population read.* `source.HTTPFetcher.Watermark` calls the same `page`
+    request `Fetch` loops over, now taking its limit, with `limit=1` and no
+    cursor. The spec is resolved as `Execute` resolves it (definition spec,
+    bound to the run's scope) and must give the frozen snapshot's `spec_ref`,
+    or the check is `UNVERIFIED`. As at execution, the source authorizes the
+    human caller (control-population-contract.md): the read forwards the
+    principal who executed the run, the actor of its PREPARING transition.
+    If that principal has since lost the source's read action, the source
+    refuses and the check is `UNVERIFIED`. *A reviewer may prefer a service
+    principal here; the contract has none today.*
+  - *Recording.* `PgStore.RecordWatermarkCheck` runs in one transaction
+    under the run's `FOR UPDATE` lock, so replicas sweeping at once open the
+    exception once (covered by a concurrent test). It first re-checks that
+    the run is still CERTIFIED/CERTIFIED and still the latest run of its
+    control, entity and period. It opens an exception only when no
+    unresolved late-data exception exists for that side and the observed
+    watermark is not the one the last such exception was opened for. Once
+    that one is resolved, the same watermark is not reported again, but a
+    further move is. Migration 000009's `control_watermark_checks` (one
+    mutable row per run and side, FORCE RLS) holds the last check (CURRENT,
+    MOVED, or UNVERIFIED with its error) and that reported watermark. It is
+    the sweep's state, not a record: the exception, its transition and its
+    event are the record.
+  - *Gate.* `PgStore.CloseGate` reads the latest run's oldest unresolved
+    `LATE_DATA_AFTER_CERTIFICATION` exception into `GateInput`. When the
+    run is CERTIFIED/CERTIFIED, `EvaluateGate` reports `BLOCKING` with that
+    reason, plus `late_data_exception_id` and `late_data_detected_at`. A
+    revoked certification still reports `CERTIFICATION_REVOKED`. Two things
+    clear it:
+    - resolving the exception (closure, waiver or carry-forward under
+      authority, through the existing transition endpoint);
+    - a new run, which becomes the latest. Naming the certified run as
+      prior supersedes it, as before.
+  - *Rollback.* 000009's down migration refuses while any check records a
+    late-data exception it opened. That reported watermark is what stops a
+    resolved one being reported again after a re-apply. Otherwise it drops
+    the table. The same `DO $$ … RAISE EXCEPTION` guard as 000006/000007,
+    with a table check so it can be re-run.
