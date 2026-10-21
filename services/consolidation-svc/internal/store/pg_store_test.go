@@ -42,7 +42,7 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	base := filepath.Dir(filename)
 
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS
-		eventing_outbox, consolidation_adjustment_transitions, consolidation_adjustments, balance_contributions, balance_snapshots, consolidation_runs
+		eventing_outbox, consolidation_eliminations, consolidation_adjustment_transitions, consolidation_adjustments, balance_contributions, balance_snapshots, consolidation_runs
 		CASCADE;`)
 
 	for _, migration := range []string{
@@ -52,6 +52,7 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 		"000004_add_eventing_outbox.up.sql",
 		"000005_eventing_outbox_relay_policy.up.sql",
 		"000006_add_consolidation_adjustment_transitions.up.sql",
+		"000007_add_consolidation_eliminations.up.sql",
 	} {
 		sql, err := os.ReadFile(filepath.Join(base, "../../deployments/migrations", migration))
 		if err != nil {

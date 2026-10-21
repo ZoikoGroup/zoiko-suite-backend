@@ -47,8 +47,8 @@ const (
 // balance it was checked against.
 //
 // Eliminable is the rule's current answer for the pair, not a replay of a
-// past run's arithmetic: this service does not yet persist per-run
-// elimination rows (that is A2's remaining work). The reciprocal balance is
+// past run: what a run actually eliminated is answered from its own rows
+// (RunEliminationExplanation, given consolidation_run_id). The reciprocal balance is
 // returned whole so the caller can see both directions and every currency,
 // rather than a single number that would hide how it was reached.
 type EliminationExplanation struct {

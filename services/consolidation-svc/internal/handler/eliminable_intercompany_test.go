@@ -21,18 +21,20 @@ func TestStartRun_EliminatesClosedIntercompanyEntry(t *testing.T) {
 		},
 		intercompanyEntries: []clients.IntercompanyEntry{{
 			IntercompanyEntryID: "ic-1", SourceLegalEntityID: "le-us", TargetLegalEntityID: "le-uk",
-			SourceJournalID: "journal-us-1", TargetJournalID: &tgtJournal, Amount: "500", MatchStatus: "CLOSED",
+			SourceJournalID: "journal-us-1", TargetJournalID: &tgtJournal, Amount: "500", CounterpartyAmount: "500",
+			FiscalPeriod: strPtr("2024-Q1"), MatchStatus: "CLOSED",
 		}},
-		journalLines: map[string][]clients.JournalLine{
-			"journal-us-1": {{AccountCode: "1500-IC-Receivable", DebitAmount: 500.0}},
-			"journal-uk-1": {{AccountCode: "2500-IC-Payable", CreditAmount: 500.0}},
+		journals: map[string]*domain.PostedJournal{
+			"journal-us-1": finalized("journal-us-1", "le-us", "2024-Q1", domain.PostedLine{AccountCode: "1500-IC-Receivable", DebitAmount: 500.0}),
+			"journal-uk-1": finalized("journal-uk-1", "le-uk", "2024-Q1", domain.PostedLine{AccountCode: "2500-IC-Payable", CreditAmount: 500.0}),
 		},
 	}
 	rr := doReq(newRouter(s, &stubAuthZ{}, cl), http.MethodPost, "/v1/consolidation/runs/", map[string]any{
-		"group_legal_entity_id":  "le-group",
-		"child_legal_entity_ids": []string{"le-us", "le-uk"},
-		"fiscal_period":          "2024-Q1",
-		"target_currency":        "USD",
+		"group_legal_entity_id":      "le-group",
+		"child_legal_entity_ids":     []string{"le-us", "le-uk"},
+		"fiscal_period":              "2024-Q1",
+		"target_currency":            "USD",
+		"intercompany_account_codes": []string{"1500-IC-Receivable", "2500-IC-Payable"},
 	}, "principal-1")
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("expected 201 got %d: %s", rr.Code, rr.Body.String())

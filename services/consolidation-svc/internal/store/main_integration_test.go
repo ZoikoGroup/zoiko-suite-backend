@@ -97,7 +97,7 @@ func resetAndMigrate(dsn string) error {
 	}
 
 	if _, err := pool.Exec(ctx, `DROP TABLE IF EXISTS
-		eventing_outbox, consolidation_adjustment_transitions, consolidation_adjustments, balance_contributions, balance_snapshots, consolidation_runs
+		eventing_outbox, consolidation_eliminations, consolidation_adjustment_transitions, consolidation_adjustments, balance_contributions, balance_snapshots, consolidation_runs
 		CASCADE;`); err != nil {
 		return fmt.Errorf("reset schema: %w", err)
 	}

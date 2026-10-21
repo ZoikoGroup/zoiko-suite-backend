@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -35,6 +34,10 @@ type Store interface {
 	ListSnapshotsByRun(ctx context.Context, runID string) ([]domain.BalanceSnapshot, error)
 	CreateBalanceContributions(ctx context.Context, contributions []domain.BalanceContribution) error
 	ListContributionsByRun(ctx context.Context, runID string) ([]domain.BalanceContribution, error)
+	// CreateEliminations records a run's per-pair eliminations, all or none
+	// (migration 000007, SPEC_DEVIATIONS B9).
+	CreateEliminations(ctx context.Context, rows []domain.Elimination) error
+	ListEliminationsByRun(ctx context.Context, runID string) ([]domain.Elimination, error)
 
 	// BalanceContributionsPopulation serves the control-population contract (balance-contributions).
 	BalanceContributionsPopulation(ctx context.Context, q domain.BalanceContributionsQuery) (*domain.ControlPopulationPage, error)
@@ -60,7 +63,7 @@ type DomainClients interface {
 	FetchTrialBalance(ctx context.Context, tenantID, legalEntityID, fiscalPeriod string) (map[string]float64, error)
 	FetchEliminableIntercompanyEntries(ctx context.Context, tenantID, principalID string) ([]clients.IntercompanyEntry, error)
 	FetchReciprocalBalances(ctx context.Context, tenantID, principalID, entityA, entityB, fiscalPeriod string) (*domain.ReciprocalBalances, error)
-	FetchJournalLines(ctx context.Context, tenantID, journalID string) ([]clients.JournalLine, error)
+	FetchJournal(ctx context.Context, tenantID, journalID string) (*domain.PostedJournal, error)
 
 	// ACC-12's own real "ACC-04/05 consolidation book" dependency.
 	PostConsolidationAdjustmentJournal(ctx context.Context, tenantID, principalID, legalEntityID, fiscalPeriod, description, sourceEventID, correlationID string, lines []clients.JournalLine) (journalID string, err error)
@@ -108,6 +111,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/{id}", h.GetRun)
 		r.Get("/{id}/snapshots", h.ListSnapshots)
 		r.Get("/{id}/contributions", h.ListContributions)
+		r.Get("/{id}/eliminations", h.ListRunEliminations)
 	})
 	r.Route("/v1/control-populations", func(r chi.Router) {
 		r.Get("/{population}", h.GetControlPopulation)
@@ -137,6 +141,11 @@ func (h *Handler) StartRun(w http.ResponseWriter, r *http.Request) {
 
 	if req.GroupLegalEntityID == "" || len(req.ChildLegalEntityIDs) == 0 || req.FiscalPeriod == "" || req.TargetCurrency == "" {
 		writeError(w, http.StatusBadRequest, "missing_fields", "group_legal_entity_id, child_legal_entity_ids, fiscal_period, target_currency are required")
+		return
+	}
+	accountCodes, err := domain.NormalizeAccountCodes(req.IntercompanyAccountCodes)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_intercompany_account_codes", err.Error())
 		return
 	}
 
@@ -213,41 +222,53 @@ func (h *Handler) StartRun(w http.ResponseWriter, r *http.Request) {
 
 	// Step 2: Eliminate matched intercompany balances (MATCHED pairs, and
 	// CLOSED ones, which were matched first) so a transaction between two
-	// group entities isn't double-counted in the group total.
-	// Elimination reverses the REAL posted net contribution (debit-credit)
-	// of both legs' actual journal lines — never a guessed elimination
-	// account, since no intercompany-to-account mapping exists anywhere on
-	// this platform (IntercompanyEntry itself carries no account_code).
-	// A leg that can't be fetched is a real, visible exception on the run
-	// — never a silent warning a caller of this API would never see (this
-	// replaces a prior version of this step that fetched matched entries
-	// and then discarded the result entirely; see
-	// master-register-findings-2026-08-27.md §3.29).
-	var eliminationExceptions []string
+	// group entities isn't double-counted in the group total (A2/B9).
+	// Only pairs in the run's scope are considered: both entities among
+	// the run's children and the pair in the run's period. Of each such
+	// pair, only the lines on the declared intercompany accounts are
+	// subtracted, and only from legs whose lines the run actually summed.
+	// A pair is eliminated whole or not at all, and every in-scope pair is
+	// recorded as its own elimination row, ELIMINATED or BLOCKED. A BLOCKED
+	// pair is a visible exception on the run.
+	//
+	// The population itself must be readable: a run that cannot list the
+	// pairs cannot know what it failed to eliminate, so it fails rather
+	// than completing with no elimination at all.
 	eliminableEntries, err := h.clients.FetchEliminableIntercompanyEntries(r.Context(), tenantID, principalID)
 	if err != nil {
 		h.log.Error("failed to fetch intercompany entries for elimination", zap.Error(err))
-		eliminationExceptions = append(eliminationExceptions, "intercompany entries unavailable: "+err.Error())
-	} else {
-		for _, entry := range eliminableEntries {
-			if elimErr := h.eliminateIntercompanyEntry(r.Context(), tenantID, entry, consolidatedBalances); elimErr != nil {
-				h.log.Error("failed to eliminate intercompany entry",
-					zap.String("intercompany_entry_id", entry.IntercompanyEntryID), zap.Error(elimErr))
-				eliminationExceptions = append(eliminationExceptions,
-					fmt.Sprintf("intercompany entry %s: %s", entry.IntercompanyEntryID, elimErr.Error()))
-			}
+		_ = h.store.CompleteRun(r.Context(), runID, "FAILED", 1, time.Now().UTC(), principalID, correlationID, 0, nil)
+		writeError(w, http.StatusServiceUnavailable, "intercompany_unavailable", "failed to read the intercompany pairs to eliminate: "+err.Error())
+		return
+	}
+	eliminations := h.eliminateInScope(r.Context(), tenantID, run, req.ChildLegalEntityIDs, accountCodes, eliminableEntries, consolidatedBalances, now)
+	var eliminationExceptions []string
+	for _, e := range eliminations {
+		if e.Outcome == domain.EliminationOutcomeBlocked {
+			h.log.Warn("intercompany pair not eliminated",
+				zap.String("intercompany_entry_id", e.IntercompanyEntryID), zap.String("reason", *e.BlockedReason))
+			eliminationExceptions = append(eliminationExceptions,
+				fmt.Sprintf("intercompany entry %s: %s", e.IntercompanyEntryID, *e.BlockedReason))
 		}
+	}
+	if err := h.store.CreateEliminations(r.Context(), eliminations); err != nil {
+		// The elimination record is the run's evidence of what it
+		// subtracted; balances without it would be unexplainable.
+		h.log.Error("failed to record eliminations", zap.Error(err))
+		_ = h.store.CompleteRun(r.Context(), runID, "FAILED", 1, time.Now().UTC(), principalID, correlationID, 0, nil)
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "failed to record eliminations: "+err.Error())
+		return
 	}
 
 	// Step 3: Produce signed BalanceSnapshots
-	accountCodes := make([]string, 0, len(consolidatedBalances))
+	balanceAccounts := make([]string, 0, len(consolidatedBalances))
 	for code := range consolidatedBalances {
-		accountCodes = append(accountCodes, code)
+		balanceAccounts = append(balanceAccounts, code)
 	}
-	sort.Strings(accountCodes)
+	sort.Strings(balanceAccounts)
 
-	snapshots := make([]domain.BalanceSnapshot, 0, len(accountCodes))
-	for _, code := range accountCodes {
+	snapshots := make([]domain.BalanceSnapshot, 0, len(balanceAccounts))
+	for _, code := range balanceAccounts {
 		bal := consolidatedBalances[code]
 
 		// Cryptographic HMAC-SHA256 signature per snapshot
@@ -291,6 +312,7 @@ func (h *Handler) StartRun(w http.ResponseWriter, r *http.Request) {
 		ExceptionCount:     exceptionCount,
 		StartedAt:          now,
 		Snapshots:          snapshots,
+		Eliminations:       eliminations,
 	})
 }
 
@@ -302,36 +324,103 @@ func floatAmount(f float64) *big.Rat {
 	return r
 }
 
-// eliminateIntercompanyEntry subtracts an eliminable (MATCHED or CLOSED)
-// entry's real, posted net contribution
-// (debit - credit, both legs) from balances in place — the same sign
-// convention FetchTrialBalance itself uses when building consolidatedBalances,
-// so eliminating a leg here exactly reverses what it originally added.
-func (h *Handler) eliminateIntercompanyEntry(ctx context.Context, tenantID string, entry clients.IntercompanyEntry, balances map[string]float64) error {
-	sourceLines, err := h.clients.FetchJournalLines(ctx, tenantID, entry.SourceJournalID)
-	if err != nil {
-		return fmt.Errorf("source journal %s: %w", entry.SourceJournalID, err)
-	}
-	for _, l := range sourceLines {
-		balances[l.AccountCode] -= l.DebitAmount - l.CreditAmount
+// eliminateInScope scopes the eliminable (MATCHED or CLOSED) pairs to the
+// run, decides each in-scope pair's elimination (domain.PlanElimination),
+// subtracts the eliminated lines' net (debit - credit, the sign
+// FetchTrialBalance added them with) from balances in place, and returns one
+// elimination row per in-scope pair. A pair outside the run's entities or
+// period is neither eliminated nor recorded. A pair is decided completely
+// before any of its lines touch balances, so a leg that cannot be read
+// leaves the whole pair uneliminated (BLOCKED), never half eliminated.
+func (h *Handler) eliminateInScope(ctx context.Context, tenantID string, run *domain.ConsolidationRun, children, accountCodes []string,
+	entries []clients.IntercompanyEntry, balances map[string]float64, now time.Time) []domain.Elimination {
+	entities := make(map[string]bool, len(children))
+	for _, c := range children {
+		entities[c] = true
 	}
 
-	if entry.TargetJournalID == nil || *entry.TargetJournalID == "" {
-		// MatchEntry requires a target_journal_id to reach MATCHED status
-		// (see intercompany-accounting-svc's MatchEntryRequest), and CLOSED
-		// is reachable only from MATCHED — an eliminable entry with no
-		// target journal would itself be a defect in that service, not
-		// something to silently tolerate here.
-		return fmt.Errorf("%s entry has no target_journal_id", strings.ToLower(entry.MatchStatus))
+	journals := map[string]*domain.PostedJournal{}
+	fetch := func(journalID string) (*domain.PostedJournal, error) {
+		if j, ok := journals[journalID]; ok {
+			return j, nil
+		}
+		j, err := h.clients.FetchJournal(ctx, tenantID, journalID)
+		if err != nil {
+			return nil, err
+		}
+		journals[journalID] = j
+		return j, nil
 	}
-	targetLines, err := h.clients.FetchJournalLines(ctx, tenantID, *entry.TargetJournalID)
-	if err != nil {
-		return fmt.Errorf("target journal %s: %w", *entry.TargetJournalID, err)
+
+	out := []domain.Elimination{}
+	for _, entry := range entries {
+		basis := domain.PeriodBasisPair
+		var blocked string
+		switch domain.ScopePair(entry, entities, run.FiscalPeriod) {
+		case domain.PairOutOfScope:
+			continue
+		case domain.PairNeedsSourcePeriod:
+			src, err := fetch(entry.SourceJournalID)
+			if err != nil {
+				basis = domain.PeriodBasisUndetermined
+				blocked = fmt.Sprintf("the pair records no fiscal_period and its source journal %s could not be read to find it: %v", entry.SourceJournalID, err)
+				break
+			}
+			if src.FiscalPeriod != run.FiscalPeriod {
+				continue
+			}
+			basis = domain.PeriodBasisSourceJournal
+		}
+
+		var lines []domain.EliminatedLine
+		if blocked == "" {
+			var source, target *domain.PostedJournal
+			var err error
+			if source, err = fetch(entry.SourceJournalID); err != nil {
+				blocked = fmt.Sprintf("source journal %s could not be read: %v", entry.SourceJournalID, err)
+			} else if entry.TargetJournalID != nil && *entry.TargetJournalID != "" {
+				if target, err = fetch(*entry.TargetJournalID); err != nil {
+					blocked = fmt.Sprintf("target journal %s could not be read: %v", *entry.TargetJournalID, err)
+				}
+			}
+			if blocked == "" {
+				lines, blocked = domain.PlanElimination(entry, source, target, accountCodes, run.FiscalPeriod)
+			}
+		}
+
+		e := domain.Elimination{
+			EliminationID:            uuid.NewString(),
+			TenantID:                 tenantID,
+			ConsolidationRunID:       run.ConsolidationRunID,
+			IntercompanyEntryID:      entry.IntercompanyEntryID,
+			SourceLegalEntityID:      entry.SourceLegalEntityID,
+			TargetLegalEntityID:      entry.TargetLegalEntityID,
+			FiscalPeriod:             run.FiscalPeriod,
+			PeriodBasis:              basis,
+			MatchStatus:              entry.MatchStatus,
+			SourceJournalID:          entry.SourceJournalID,
+			TargetJournalID:          entry.TargetJournalID,
+			Amount:                   entry.Amount,
+			CurrencyCode:             entry.CurrencyCode,
+			CounterpartyAmount:       entry.CounterpartyAmount,
+			CounterpartyCurrencyCode: entry.CounterpartyCurrencyCode,
+			IntercompanyAccountCodes: accountCodes,
+			Lines:                    []domain.EliminatedLine{},
+			CreatedAt:                now,
+		}
+		if blocked != "" {
+			e.Outcome = domain.EliminationOutcomeBlocked
+			e.BlockedReason = &blocked
+		} else {
+			e.Outcome = domain.EliminationOutcomeEliminated
+			e.Lines = lines
+			for _, l := range lines {
+				balances[l.AccountCode] -= l.Net()
+			}
+		}
+		out = append(out, e)
 	}
-	for _, l := range targetLines {
-		balances[l.AccountCode] -= l.DebitAmount - l.CreditAmount
-	}
-	return nil
+	return out
 }
 
 // ── GET /v1/consolidation/runs ────────────────────────────────────────────────────
@@ -899,6 +988,11 @@ func (h *Handler) ExplainElimination(w http.ResponseWriter, r *http.Request) {
 	entityB := q.Get("entity_b")
 	fiscalPeriod := q.Get("fiscal_period")
 
+	if runID := q.Get("consolidation_run_id"); runID != "" {
+		h.explainRunElimination(w, r, runID, groupLegalEntityID, entityA, entityB, fiscalPeriod)
+		return
+	}
+
 	if groupLegalEntityID == "" || entityA == "" || entityB == "" || fiscalPeriod == "" {
 		writeError(w, http.StatusBadRequest, "missing_fields",
 			"group_legal_entity_id, entity_a, entity_b and fiscal_period are required")
@@ -935,6 +1029,76 @@ func (h *Handler) ExplainElimination(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusOK,
 		domain.BuildEliminationExplanation(groupLegalEntityID, entityA, entityB, fiscalPeriod, balances))
+}
+
+// explainRunElimination answers ExplainElimination for one run from the
+// elimination rows that run recorded (B9), not from the pair's current
+// reciprocal balance. The run fixes the group and the period; when the
+// caller also names them they must be the run's.
+func (h *Handler) explainRunElimination(w http.ResponseWriter, r *http.Request, runID, groupLegalEntityID, entityA, entityB, fiscalPeriod string) {
+	if entityA == "" || entityB == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "entity_a and entity_b are required")
+		return
+	}
+	if entityA == entityB {
+		writeError(w, http.StatusBadRequest, "same_entity_forbidden",
+			"entity_a and entity_b must be different legal entities")
+		return
+	}
+	run, rows, ok := h.runEliminations(w, r, runID)
+	if !ok {
+		return
+	}
+	if (groupLegalEntityID != "" && groupLegalEntityID != run.GroupLegalEntityID) ||
+		(fiscalPeriod != "" && fiscalPeriod != run.FiscalPeriod) {
+		writeError(w, http.StatusBadRequest, "run_scope_mismatch",
+			"group_legal_entity_id and fiscal_period, when given, must be the run's")
+		return
+	}
+	writeJSON(w, http.StatusOK, domain.BuildRunEliminationExplanation(run, entityA, entityB, rows))
+}
+
+// ── GET /v1/consolidation/runs/{id}/eliminations ─────────────────────────────────
+
+// ListRunEliminations is ListEliminations for one run: every elimination row
+// the run recorded, ELIMINATED and BLOCKED.
+func (h *Handler) ListRunEliminations(w http.ResponseWriter, r *http.Request) {
+	if _, rows, ok := h.runEliminations(w, r, chi.URLParam(r, "id")); ok {
+		writeJSON(w, http.StatusOK, rows)
+	}
+}
+
+// runEliminations loads a run, authorizes CONSOLIDATION_RUN_VIEW on its
+// group, and reads its elimination rows.
+func (h *Handler) runEliminations(w http.ResponseWriter, r *http.Request, runID string) (*domain.ConsolidationRun, []domain.Elimination, bool) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return nil, nil, false
+	}
+	run, err := h.store.GetRun(r.Context(), runID)
+	if errors.Is(err, domain.ErrRunNotFound) {
+		writeError(w, http.StatusNotFound, "run_not_found", "")
+		return nil, nil, false
+	}
+	if err != nil {
+		h.log.Error("failed to fetch consolidation run", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return nil, nil, false
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, run.GroupLegalEntityID, actionRunView); err != nil {
+		h.writeAuthzErr(w, err)
+		return nil, nil, false
+	}
+	rows, err := h.store.ListEliminationsByRun(r.Context(), run.ConsolidationRunID)
+	if err != nil {
+		h.log.Error("failed to list eliminations", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return nil, nil, false
+	}
+	if rows == nil {
+		rows = []domain.Elimination{}
+	}
+	return run, rows, true
 }
 
 func getCorrelationID(r *http.Request) string {

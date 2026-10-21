@@ -25,6 +25,8 @@ type stubStore struct {
 	snapshots     map[string][]domain.BalanceSnapshot
 	contributions map[string][]domain.BalanceContribution
 	contribErr    error
+	eliminations  map[string][]domain.Elimination
+	elimErr       error
 
 	adjustments map[string]*domain.ConsolidationAdjustment
 	histories   map[string]*domain.AdjustmentHistory
@@ -45,6 +47,7 @@ func newStubStore() *stubStore {
 		runs:          make(map[string]*domain.ConsolidationRun),
 		snapshots:     make(map[string][]domain.BalanceSnapshot),
 		contributions: make(map[string][]domain.BalanceContribution),
+		eliminations:  make(map[string][]domain.Elimination),
 		adjustments:   make(map[string]*domain.ConsolidationAdjustment),
 		histories:     make(map[string]*domain.AdjustmentHistory),
 		groupHasRun:   make(map[string]bool),
@@ -126,6 +129,20 @@ func (s *stubStore) ListContributionsByRun(_ context.Context, runID string) ([]d
 		return []domain.BalanceContribution{}, nil
 	}
 	return c, nil
+}
+
+func (s *stubStore) CreateEliminations(_ context.Context, rows []domain.Elimination) error {
+	if s.elimErr != nil {
+		return s.elimErr
+	}
+	for _, e := range rows {
+		s.eliminations[e.ConsolidationRunID] = append(s.eliminations[e.ConsolidationRunID], e)
+	}
+	return nil
+}
+
+func (s *stubStore) ListEliminationsByRun(_ context.Context, runID string) ([]domain.Elimination, error) {
+	return s.eliminations[runID], nil
 }
 
 func (s *stubStore) GroupEntityHasRun(_ context.Context, groupLegalEntityID string) (bool, error) {
@@ -224,11 +241,12 @@ type stubClients struct {
 	reciprocalEntityB  string
 	reciprocalPeriod   string
 
-	// journalLines maps journal_id -> its real posted lines, for the
-	// elimination path (FetchJournalLines). journalLinesErr, keyed the
-	// same way, lets a test simulate one specific journal's lookup failing.
-	journalLines    map[string][]clients.JournalLine
-	journalLinesErr map[string]error
+	// journals maps journal_id -> the journal general-ledger-svc serves,
+	// for the elimination path (FetchJournal). journalErr, keyed the same
+	// way, lets a test simulate one specific journal's lookup failing.
+	journals     map[string]*domain.PostedJournal
+	journalErr   map[string]error
+	journalReads []string
 
 	postJournalID           string
 	postErr                 error
@@ -265,12 +283,23 @@ func (c *stubClients) FetchReciprocalBalances(_ context.Context, _, principalID,
 	return c.reciprocalBalances, nil
 }
 
-func (c *stubClients) FetchJournalLines(_ context.Context, _, journalID string) ([]clients.JournalLine, error) {
-	if err, ok := c.journalLinesErr[journalID]; ok {
+func (c *stubClients) FetchJournal(_ context.Context, _, journalID string) (*domain.PostedJournal, error) {
+	c.journalReads = append(c.journalReads, journalID)
+	if err, ok := c.journalErr[journalID]; ok {
 		return nil, err
 	}
-	return c.journalLines[journalID], nil
+	if j, ok := c.journals[journalID]; ok {
+		return j, nil
+	}
+	return nil, domain.ErrGLServiceUnavailable
 }
+
+// finalized is a FINALIZED journal of entity in period with lines.
+func finalized(id, entity, period string, lines ...domain.PostedLine) *domain.PostedJournal {
+	return &domain.PostedJournal{JournalID: id, LegalEntityID: entity, FiscalPeriod: period, Status: "FINALIZED", Lines: lines}
+}
+
+func strPtr(s string) *string { return &s }
 
 func (c *stubClients) PostConsolidationAdjustmentJournal(_ context.Context, _, _, legalEntityID, _, _, _, _ string, _ []clients.JournalLine) (string, error) {
 	c.lastPostedLegalEntityID = legalEntityID
@@ -418,20 +447,23 @@ func TestStartRun_EliminatesMatchedIntercompanyEntry(t *testing.T) {
 				SourceJournalID:     "journal-us-1",
 				TargetJournalID:     &tgtJournal,
 				Amount:              "500",
+				CounterpartyAmount:  "500",
+				FiscalPeriod:        strPtr("2024-Q1"),
 				MatchStatus:         "MATCHED",
 			},
 		},
-		journalLines: map[string][]clients.JournalLine{
-			"journal-us-1": {{AccountCode: "1500-IC-Receivable", DebitAmount: 500.0, CreditAmount: 0}},
-			"journal-uk-1": {{AccountCode: "2500-IC-Payable", DebitAmount: 0, CreditAmount: 500.0}},
+		journals: map[string]*domain.PostedJournal{
+			"journal-us-1": finalized("journal-us-1", "le-us", "2024-Q1", domain.PostedLine{LineNumber: 1, AccountCode: "1500-IC-Receivable", DebitAmount: 500.0}),
+			"journal-uk-1": finalized("journal-uk-1", "le-uk", "2024-Q1", domain.PostedLine{LineNumber: 1, AccountCode: "2500-IC-Payable", CreditAmount: 500.0}),
 		},
 	}
 	r := newRouter(s, &stubAuthZ{}, cl)
 	rr := doReq(r, http.MethodPost, "/v1/consolidation/runs/", map[string]any{
-		"group_legal_entity_id":  "le-group",
-		"child_legal_entity_ids": []string{"le-us", "le-uk"},
-		"fiscal_period":          "2024-Q1",
-		"target_currency":        "USD",
+		"group_legal_entity_id":      "le-group",
+		"child_legal_entity_ids":     []string{"le-us", "le-uk"},
+		"fiscal_period":              "2024-Q1",
+		"target_currency":            "USD",
+		"intercompany_account_codes": []string{"1500-IC-Receivable", "2500-IC-Payable"},
 	}, "principal-1")
 
 	if rr.Code != http.StatusCreated {
@@ -467,36 +499,44 @@ func TestStartRun_EliminatesMatchedIntercompanyEntry(t *testing.T) {
 }
 
 // TestStartRun_EliminationFetchFailure_RecordsVisibleException proves a
-// failed elimination leg surfaces as a real, visible exception on the run
-// — never a silent warning, and never a run that reports 0 exceptions
-// while quietly having skipped elimination.
+// leg that cannot be read leaves the whole pair uneliminated: the pair is a
+// BLOCKED elimination row and a visible exception on the run, and the
+// readable leg is not subtracted on its own (no half-eliminated pair).
 func TestStartRun_EliminationFetchFailure_RecordsVisibleException(t *testing.T) {
 	s := newStubStore()
 	tgtJournal := "journal-uk-1"
 	cl := &stubClients{
 		glBalances: map[string]map[string]float64{
-			"le-us": {"1000-Cash": 5000.0},
-			"le-uk": {"1000-Cash": 3000.0},
+			"le-us": {"1000-Cash": 5000.0, "1500-IC-Receivable": 500.0},
+			"le-uk": {"1000-Cash": 3000.0, "2500-IC-Payable": -500.0},
 		},
 		intercompanyEntries: []clients.IntercompanyEntry{
 			{
 				IntercompanyEntryID: "ic-1",
+				SourceLegalEntityID: "le-us",
+				TargetLegalEntityID: "le-uk",
 				SourceJournalID:     "journal-us-1",
 				TargetJournalID:     &tgtJournal,
 				Amount:              "500",
+				CounterpartyAmount:  "500",
+				FiscalPeriod:        strPtr("2024-Q1"),
 				MatchStatus:         "MATCHED",
 			},
 		},
-		journalLinesErr: map[string]error{
-			"journal-us-1": domain.ErrGLServiceUnavailable,
+		journals: map[string]*domain.PostedJournal{
+			"journal-us-1": finalized("journal-us-1", "le-us", "2024-Q1", domain.PostedLine{LineNumber: 1, AccountCode: "1500-IC-Receivable", DebitAmount: 500.0}),
+		},
+		journalErr: map[string]error{
+			"journal-uk-1": domain.ErrGLServiceUnavailable,
 		},
 	}
 	r := newRouter(s, &stubAuthZ{}, cl)
 	rr := doReq(r, http.MethodPost, "/v1/consolidation/runs/", map[string]any{
-		"group_legal_entity_id":  "le-group",
-		"child_legal_entity_ids": []string{"le-us", "le-uk"},
-		"fiscal_period":          "2024-Q1",
-		"target_currency":        "USD",
+		"group_legal_entity_id":      "le-group",
+		"child_legal_entity_ids":     []string{"le-us", "le-uk"},
+		"fiscal_period":              "2024-Q1",
+		"target_currency":            "USD",
+		"intercompany_account_codes": []string{"1500-IC-Receivable", "2500-IC-Payable"},
 	}, "principal-1")
 
 	if rr.Code != http.StatusCreated {
@@ -512,6 +552,15 @@ func TestStartRun_EliminationFetchFailure_RecordsVisibleException(t *testing.T) 
 	// exception.detected enqueue: TestPgStore_CompleteRun_WithExceptions_EnqueuesExceptionDetectedEvent.
 	if len(s.completedExceptions) != 1 {
 		t.Errorf("expected the 1 elimination exception handed to CompleteRun, got %v", s.completedExceptions)
+	}
+	for _, snap := range resp.Snapshots {
+		if snap.AccountCode == "1500-IC-Receivable" && snap.ConsolidatedBalance != 500 {
+			t.Errorf("the readable source leg was eliminated on its own: receivable = %v", snap.ConsolidatedBalance)
+		}
+	}
+	rows := s.eliminations[resp.ConsolidationRunID]
+	if len(rows) != 1 || rows[0].Outcome != domain.EliminationOutcomeBlocked || rows[0].BlockedReason == nil || len(rows[0].Lines) != 0 {
+		t.Fatalf("expected one BLOCKED elimination row with no lines, got %+v", rows)
 	}
 }
 

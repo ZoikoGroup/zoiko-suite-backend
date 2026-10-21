@@ -21,8 +21,8 @@ only the first four. All seven are surveyed here.
 Overall: the ACC-12 adjustment lifecycle is largely built (create → approve →
 post → reverse, with maker-checker, a status guard on every transition, and
 reversal through ACC-04). ACC-13 is one synchronous call that sums live GL
-journals per account, subtracts matched intercompany journals and writes
-signed snapshots; none of the run's governance (input lock, translation,
+journals per account, subtracts the intercompany lines of in-scope matched
+pairs (A2/B9) and writes signed snapshots; none of the run's governance (input lock, translation,
 ownership, review, certification, supersession) exists. Most importantly, the
 adjustment posting path writes into the group entity's own ledger book (A1).
 Roughly 55% of ACC-12 and 20% of ACC-13; about 35% overall.
@@ -77,19 +77,27 @@ consolidation entries in a group entity's statutory ledger.
   can never target a book that is an entity's statutory book (§27 test 23),
   and a check of every environment for journals with `source_event_id` equal
   to a `consolidation_adjustment_id` (the 2026-09 window above).
-- **A2. Elimination ignores the run's scope.** `StartRun` fetches every
-  eliminable (MATCHED or CLOSED, B6) intercompany entry in the **tenant** (no filter by the run's child
-  entities, group or fiscal period) and, for each, subtracts every line of
-  both the source and target journals from the group balances. Entries between
-  entities outside this group, or from other periods, are subtracted from
-  balances they never contributed to. Subtracting whole journals also removes
-  any non-intercompany lines those journals carry. An entry whose journals
-  cannot be fetched becomes a run exception, but the run still completes
-  with a partially eliminated balance. Scope: filter to pairs whose both
-  entities are in the run and whose period is the run's period (needs a
-  period on the pair — intercompany-accounting-svc A4), eliminate the
-  intercompany lines only, and record each elimination as an elimination row
-  linked to the pair (so ExplainElimination is answerable).
+- **A2. Elimination ignores the run's scope. — Closed (B9).** `StartRun`
+  used to fetch every eliminable (MATCHED or CLOSED, B6) intercompany entry
+  in the **tenant** and subtract every line of both journals from the group
+  balances, whatever the entities or period. It also recorded nothing per
+  pair. It now does three things:
+  1. *Scope.* It eliminates only pairs whose two entities are both among the
+     run's children and whose period is the run's.
+  2. *Lines.* Of each such pair, it subtracts only the lines on the
+     intercompany accounts the run declares.
+  3. *Record.* It records every in-scope pair as its own
+     `consolidation_eliminations` row, ELIMINATED or BLOCKED and linked to
+     the pair. ExplainElimination answers from these rows when given
+     `consolidation_run_id`.
+
+  A pair is now eliminated whole or not at all; before, a source leg could be
+  subtracted when its target leg could not be read. A run that cannot read
+  the pairs at all now fails instead of completing uneliminated (B9).
+  Unchanged and still open elsewhere:
+  - the float64 group balances (B6);
+  - certification refusing a run with BLOCKED pairs (A6);
+  - A5's tenant-wide proposal bound.
 - **A3. No currency translation (`TranslateEntities`, `ExplainTranslation`).**
   Child balances are summed in whatever currency each journal was posted in,
   and the result is labelled with the request's `target_currency`. A group
@@ -163,9 +171,12 @@ consolidation entries in a group entity's statutory ledger.
   every currency, exact decimals. Both are QUERY reads: scoped read plus
   correlation/auth context, no Idempotency-Key. `ListEliminations` is still
   approximated by `GET /v1/consolidation/adjustments` (all types, no type
-  filter), and per-run `eliminations` rows are still A2's work; B8 records
-  both, and that ExplainElimination answers the rule from the pair's current
-  reciprocal balance rather than replaying a past run.
+  filter); B8 records
+  that. Per-run elimination rows now exist (A2/B9): given
+  `consolidation_run_id`, ExplainElimination answers from what that run
+  recorded, and `GET /v1/consolidation/runs/{id}/eliminations` lists them.
+  Without a run id it still answers the rule from the pair's current
+  reciprocal balance.
 - **A11. `GetGroupBalance` and `DrillEntityContribution` are partial.**
   Group balances are readable per run (`/runs/{id}/snapshots`), not by group
   and period ("the certified balance for group G, period P"). Contributions
@@ -253,8 +264,9 @@ consolidation entries in a group entity's statutory ledger.
   - *Still float64, not part of this change:* general-ledger journal lines
     and trial balances (`FetchTrialBalance`, `FetchJournalLines`), the
     consolidated balances and snapshots built from them, and
-    `ConsolidationAdjustmentLine` amounts. Elimination itself never read
-    `IntercompanyEntry.Amount`; it reverses the journals' real posted lines.
+    `ConsolidationAdjustmentLine` amounts. Elimination reverses the
+    journals' real posted lines; since B9 it also checks them exactly
+    against the pair's decimal `amount`/`counterparty_amount`.
 - **B7. Adjustment event shape (A9).** Each lifecycle command emits one event
   in the transaction that already made the change:
   `com.zoikosuite.accounting.consolidation-adjustment.created|approved|posted|reversed`,
@@ -288,15 +300,154 @@ consolidation entries in a group entity's statutory ledger.
     (B6); the answer names the rule and the statuses that matched, and returns
     the reciprocal balance — each direction's totals by currency, never
     combined — as the amount the decision was checked against. It is a
-    current-state explanation. The service still does not persist one
-    elimination row per automatic run elimination: StartRun adjusts the
-    in-memory snapshot and records only arithmetic, which is A2's remaining
-    work (explicitly out of this change). A historical "what did run R
-    eliminate" answer therefore awaits those rows; this query does not pretend
-    to replay them. `ListEliminations` likewise remains approximated by
+    current-state explanation. (Superseded for the run question by B9: with
+    `consolidation_run_id` the query answers from that run's recorded
+    elimination rows.) `ListEliminations` likewise remains approximated by
     `GET /v1/consolidation/adjustments` (all types, no type filter).
   - *Both are reads.* No Idempotency-Key and no state change; each is a scoped
     read authorized on the group entity (`CONSOLIDATION_ADJUSTMENT_VIEW` for
     history, `CONSOLIDATION_RUN_VIEW` for the elimination explanation). The
     explanation call forwards the caller's principal to
     intercompany-accounting-svc, whose endpoint authorizes both entities.
+- **B9. How a run scopes, identifies and records eliminations (A2).**
+  - *Which pairs.* The scope set is the run's `child_legal_entity_ids`, the
+    entities whose trial balances the run summed. The group entity is in
+    scope only when it is also a child: a pair touching an entity whose
+    balances were never added has nothing to eliminate from. The run row
+    stores neither the children nor the declared accounts, and no lookup
+    was added: `StartRun` has both from its own request. The declared
+    accounts are recorded on every elimination row. A pair is in the run's
+    period when:
+    - its `fiscal_period` (intercompany-accounting-svc 000005, A4 closed)
+      equals the run's; or
+    - for a pair created before 000005, with no period, its source journal's
+      `fiscal_period` equals the run's. 000005 names the source journal's
+      period as the pair's true period. The row records `period_basis =
+      SOURCE_JOURNAL`.
+
+    If a pair has no period and its source journal cannot be read, it is
+    BLOCKED with `period_basis = UNDETERMINED`, the conservative choice.
+    Out-of-scope pairs are neither eliminated nor recorded, and their
+    journals are not read.
+  - *Which lines: the precedent followed.* No line-level intercompany marker
+    exists on the platform:
+    - general-ledger-svc lines carry account, amounts, tax and free-form
+      dimensions, and nothing marks a line as intercompany or names a
+      counterparty (financial-control-svc's FIN-CTRL-043 records the same
+      fact);
+    - intercompany-accounting-svc identifies no lines: it checks a pair's
+      amount against the whole journal's total.
+
+    The platform's precedent for "which ledger lines are intercompany" is
+    financial-control-svc's FIN-CTRL-014/015. They read the lines on
+    declared accounts (`ic_receivable_accounts`, `ic_payable_accounts`), the
+    spec's server-resolved "intercompany accounts" / "elimination mapping",
+    which has no platform source yet. StartRun follows that precedent with
+    one list, `intercompany_account_codes`: receivable, payable and any
+    intercompany revenue or expense accounts. A line of a pair's journal on
+    one of these accounts is the pair's own, and every other line stays in
+    the group balance.
+
+    The list is optional on the API, so no existing caller breaks. Without
+    it nothing is guessed: every in-scope pair is BLOCKED and the run shows
+    it as an exception. An empty entry is a 400.
+  - *Per-leg checks before anything is subtracted* (`domain.PlanElimination`).
+    Each leg must pass all of these:
+    - it is a journal of the pair's entity for that side;
+    - it is FINALIZED, because `FetchTrialBalance` sums only FINALIZED
+      journals, so a reversed leg was never added;
+    - it is in the run's period. A leg booked in another period (a cutoff
+      difference) is not in this run's balances, so subtracting it would
+      eliminate what was never added;
+    - it has at least one line on a declared account;
+    - those lines total (the larger of debits and credits, exact) the
+      pair's amount for that side, the source `amount` or the target
+      `counterparty_amount`. The tolerance is intercompany-accounting-svc's
+      match tolerance, 0.001.
+
+    Any failure, or a leg that cannot be read, BLOCKs the whole pair with a
+    reason, and no line of it is subtracted.
+  - *The record.* Migration 000007 adds `consolidation_eliminations`. It has
+    one row per (run, pair), written in one transaction for the run, and is
+    append-only (trigger) with RLS forced. Each row holds:
+    - the pair's entities, journals, amounts and currencies, match status
+      and period basis;
+    - the declared accounts;
+    - the outcome, and for ELIMINATED, every line subtracted: side, journal,
+      line number, account, debit and credit as the exact decimal of the
+      served float.
+
+    CHECKs tie the outcome to its shape:
+    - ELIMINATED rows have lines, no reason, a determined period and a
+      target journal;
+    - BLOCKED rows have a reason and no lines.
+
+    The down migration refuses while any row exists. The rows are returned
+    on the StartRun response, listed by `GET
+    /v1/consolidation/runs/{id}/eliminations`, and read by
+    `ExplainElimination?consolidation_run_id=…&entity_a=…&entity_b=…`. The
+    run fixes the group and period; if the caller also names them they must
+    be the run's (400 `run_scope_mismatch`). Both reads authorize
+    `CONSOLIDATION_RUN_VIEW` on the run's group.
+  - *Decision: what still completes a run, and what fails it.* An unreadable
+    pair population (the intercompany list call failing) now **fails** the
+    run, with 503 `intercompany_unavailable`, a FAILED run and no snapshots.
+    Before, the run completed with one exception and no elimination at all,
+    and with scoping that is an unknown, not a partial, result. A failure to
+    write the elimination rows also fails the run, as for contributions. A
+    single in-scope pair that cannot be eliminated **does not** fail the
+    run:
+    - it is BLOCKED, nothing of it is subtracted, and it is an exception on
+      the run (and on the `exception-detected` event);
+    - the run's balances are therefore fully eliminated for every pair not
+      blocked, and every blocked pair is named with its reason.
+
+    Spec §16 puts the stop at certification: "unresolved elimination
+    blockers … block certification" and "Elimination run incomplete but
+    certification attempted". So the BLOCKED rows are the input A6's
+    CertifyConsolidation must refuse on. Until A6 exists, a COMPLETED run
+    with exceptions is not certified anything.
+  - *Not changed.*
+    - The group balances map and snapshots are still float64. This is
+      tracked by B6 ("Still float64") and deliberately not touched here; the
+      eliminated amounts are recorded as exact decimals.
+    - UNMATCHED, MISMATCH, DISPUTED and RESOLVED pairs in scope are still
+      not recorded (B6 rule).
+    - A5's proposal bound still uses the tenant-wide fetch.
+    - There is still no input lock (A4), so a leg's journal is read live,
+      as the trial balance is.
+- **B10. Verification of B9.**
+  - *Unit tests.*
+    - `internal/domain`: `ScopePair` (in, other period, either entity
+      outside, no or empty period); `PlanElimination` eliminates only
+      declared-account lines, checks the target against the counterparty
+      amount, and blocks on each rule (no accounts, no target journal, not
+      FINALIZED, other period, other entity, no intercompany line, total
+      disagreeing, no counterparty amount); `NormalizeAccountCodes`.
+    - `internal/handler`:
+      - a five-pair fixture eliminates only the in-period pair between
+        children and the pre-000005 pair whose source journal is in the
+        period, leaving a third-party sale on the same journal in the
+        balance;
+      - out-of-scope pairs' journals are never read;
+      - an unreadable target leg leaves the readable source leg
+        unsubtracted, as one BLOCKED row;
+      - an unreadable pair list or a failed row write fails the run;
+      - no declared accounts blocks every in-scope pair;
+      - an empty account code is 400;
+      - ExplainElimination with a run id answers from the rows (and never
+        calls GetReciprocalBalances), with 400, 404 and 403 paths; the
+        per-run list endpoint returns the rows.
+    - `internal/clients`: `FetchJournal` reads the header and lines over
+      HTTP; the pair's period and counterparty fields decode.
+  - *Integration tests* (`internal/store/eliminations_test.go`, app role so
+    RLS applies):
+    - rows round-trip exactly, are invisible to another tenant, and are all
+      or none per run;
+    - every outcome CHECK and the match-status CHECK refuse bad rows;
+    - UPDATE and DELETE are refused;
+    - 000007's down round-trips on an empty table and refuses once a row
+      exists.
+  - *Suite.* The full suite (`go test -tags=integration ./...`) ran against
+    a fresh, disposable Postgres 16 container and passed, with no test
+    skipped.

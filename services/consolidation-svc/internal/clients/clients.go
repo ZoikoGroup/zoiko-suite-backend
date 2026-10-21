@@ -116,44 +116,47 @@ func (c *Clients) getJournalLines(ctx context.Context, tenantID, journalID strin
 	return detail.Lines, nil
 }
 
-// JournalLine is the exported shape of one posted journal line — used by
-// the elimination path (see FetchJournalLines) as well as internally by
-// FetchTrialBalance's own glJournalLine.
+// JournalLine is the line shape a consolidation adjustment posts to
+// general-ledger-svc (PostConsolidationAdjustmentJournal).
 type JournalLine struct {
 	AccountCode  string  `json:"account_code"`
 	DebitAmount  float64 `json:"debit_amount"`
 	CreditAmount float64 `json:"credit_amount"`
 }
 
-// FetchJournalLines returns the real posted lines of one journal from
-// general-ledger-svc — the authoritative source ACC-12 elimination must
-// read from, rather than any invented per-service mapping of intercompany
-// amounts to elimination accounts (no such mapping exists anywhere on this
-// platform; IntercompanyEntry itself carries no account_code).
-func (c *Clients) FetchJournalLines(ctx context.Context, tenantID, journalID string) ([]JournalLine, error) {
-	lines, err := c.getJournalLines(ctx, tenantID, journalID)
+// FetchJournal returns one journal from general-ledger-svc, header and
+// posted lines — the authoritative source ACC-12 elimination reads. The
+// header is what lets a run check that a leg is a FINALIZED journal of its
+// own entity in the run's period, i.e. one whose lines FetchTrialBalance
+// summed (SPEC_DEVIATIONS A2/B9).
+func (c *Clients) FetchJournal(ctx context.Context, tenantID, journalID string) (*domain.PostedJournal, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s/v1/journals/%s", c.ledgerURL, url.PathEscape(journalID)), nil)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]JournalLine, 0, len(lines))
-	for _, l := range lines {
-		out = append(out, JournalLine{AccountCode: l.AccountCode, DebitAmount: l.DebitAmount, CreditAmount: l.CreditAmount})
+	req.Header.Set("X-Tenant-Id", tenantID)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, domain.ErrGLServiceUnavailable
 	}
-	return out, nil
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("%w: general-ledger-svc returned status %d for journal %s", domain.ErrGLServiceUnavailable, resp.StatusCode, journalID)
+	}
+
+	var j domain.PostedJournal
+	if err := json.NewDecoder(resp.Body).Decode(&j); err != nil {
+		return nil, err
+	}
+	return &j, nil
 }
 
 // IntercompanyEntry is the part of intercompany-accounting-svc's pair this
-// service reads. Amount is exact decimal text (ZS-DATA-001 D06), never
-// float64; see domain.Decimal for why it is not a plain string.
-type IntercompanyEntry struct {
-	IntercompanyEntryID string         `json:"intercompany_entry_id"`
-	SourceLegalEntityID string         `json:"source_legal_entity_id"`
-	TargetLegalEntityID string         `json:"target_legal_entity_id"`
-	SourceJournalID     string         `json:"source_journal_id"`
-	TargetJournalID     *string        `json:"target_journal_id,omitempty"`
-	Amount              domain.Decimal `json:"amount"`
-	MatchStatus         string         `json:"match_status"`
-}
+// service reads (domain.IntercompanyPair). Amounts are exact decimal text
+// (ZS-DATA-001 D06), never float64; see domain.Decimal for why they are not
+// plain strings.
+type IntercompanyEntry = domain.IntercompanyPair
 
 // Intercompany pair statuses this service eliminates. CLOSED is
 // intercompany-accounting-svc's terminal state for a pair that was MATCHED

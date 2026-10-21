@@ -47,6 +47,15 @@ type StartConsolidationRequest struct {
 	ChildLegalEntityIDs []string `json:"child_legal_entity_ids"`
 	FiscalPeriod        string   `json:"fiscal_period"`
 	TargetCurrency      string   `json:"target_currency"`
+
+	// IntercompanyAccountCodes are the accounts on which this group books
+	// intercompany balances and activity: the lines of a pair's journals on
+	// these accounts are its intercompany lines, and only those are
+	// eliminated (SPEC_DEVIATIONS B9). The spec's "elimination mapping" has
+	// no platform source yet, so it is declared per run, as
+	// financial-control-svc's FIN-CTRL-014/015 declare ic_receivable_accounts
+	// and ic_payable_accounts.
+	IntercompanyAccountCodes []string `json:"intercompany_account_codes,omitempty"`
 }
 
 type ConsolidationRunResponse struct {
@@ -57,6 +66,7 @@ type ConsolidationRunResponse struct {
 	ExceptionCount     int               `json:"exception_count"`
 	StartedAt          time.Time         `json:"started_at"`
 	Snapshots          []BalanceSnapshot `json:"snapshots,omitempty"`
+	Eliminations       []Elimination     `json:"eliminations,omitempty"`
 }
 
 // ConsolidationAdjustment is ACC-12's own authority — "owns Consolidation
@@ -66,8 +76,8 @@ type ConsolidationRunResponse struct {
 // "Draft → PendingApproval → Approved → Posted → Reversed/Superseded."
 //
 // Distinct from the automatic elimination StartRun already performs
-// (handler.go's eliminateIntercompanyEntry): that path only ever adjusts the
-// in-memory snapshot math for one run, is never itself an approved,
+// (handler.go's eliminateInScope): that path adjusts the snapshot math for
+// one run and records what it did (consolidation_eliminations), is never itself an approved,
 // posted, reversible accounting fact, and posts nothing to any ledger.
 // A ConsolidationAdjustment is a governed, human-approved journal that
 // actually posts to general-ledger-svc under the group entity — see
