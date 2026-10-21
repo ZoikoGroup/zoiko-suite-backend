@@ -66,14 +66,32 @@ func TestTemplatesSeedTheArchetypes(t *testing.T) {
 	list, err := s.ListTemplates(ctx)
 	require.NoError(t, err)
 	archetypes := 0
+	byCode := map[string][]string{}
 	for _, tpl := range list {
+		byCode[tpl.TemplateCode] = tpl.LatestActions
 		if tpl.IsArchetype {
 			archetypes++
-			require.Equal(t, 1, tpl.LatestVersion)
+			// 000021 published version 2 of the read-only archetype (the
+			// governance-platform reads); every other archetype is at 1.
+			want := 1
+			if tpl.TemplateCode == "VIEWER_AUDITOR_READ_ONLY" {
+				want = 2
+			}
+			require.Equal(t, want, tpl.LatestVersion, tpl.TemplateCode)
 			require.NotEmpty(t, tpl.LatestActions)
 		}
 	}
 	require.Equal(t, 21, archetypes)
+	// Governance holds H-1 / H-2 and identity hold S1-B2 (000021): the
+	// actions those services check are carried by a template.
+	require.Contains(t, byCode["WORKFLOW_APPROVER"], "WORKFLOW_APPROVE")
+	require.Contains(t, byCode["WORKFLOW_REQUESTER"], "WORKFLOW_CANCEL")
+	require.Contains(t, byCode["WORKFLOW_ADMINISTRATOR"], "WORKFLOW_ADMINISTER")
+	require.Contains(t, byCode["IDENTITY_ADMINISTRATOR"], "IDENTITY_PRINCIPAL_STATUS_SET")
+	require.Contains(t, byCode["VIEWER_AUDITOR_READ_ONLY"], "WORKFLOW_READ")
+	// Maker-checker on support contexts: the operator attaches, a different
+	// role approves.
+	require.NotContains(t, byCode["IDENTITY_SUPPORT_OPERATOR"], "IDENTITY_SUPPORT_CONTEXT_APPROVE")
 	v, err := s.GetTemplateVersion(ctx, "TREASURY_RELEASER", 0)
 	require.NoError(t, err)
 	require.Equal(t, []string{"payment.read", "payment.release"}, v.PermittedActions)
