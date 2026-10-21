@@ -424,6 +424,17 @@ spec:
     ports:
     - protocol: TCP
       port: 8083
+  # Cross-domain identity verification (JWKS).
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: zoiko-identity
+      podSelector:
+        matchLabels:
+          app: identity-svc
+    ports:
+    - protocol: TCP
+      port: 8080
   # Allow CoreDNS access
   - to:
     - namespaceSelector: {}
@@ -503,6 +514,17 @@ spec:
       port: 5432
     - protocol: TCP
       port: 9092
+  # Cross-domain identity verification (JWKS) for AUTHZ_IDENTITY_ASSERTION.
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: zoiko-identity
+      podSelector:
+        matchLabels:
+          app: identity-svc
+    ports:
+    - protocol: TCP
+      port: 8080
   # Allow CoreDNS access
   - to:
     - namespaceSelector: {}
@@ -549,6 +571,47 @@ spec:
     ports:
     - protocol: TCP
       port: 8089
+  # Cross-domain facts workflow-svc calls synchronously: tenant-svc confirms
+  # the legal entity; identity-svc serves the gate's JWKS/session introspection.
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: zoiko-identity
+      podSelector:
+        matchLabels:
+          app: tenant-svc
+    ports:
+    - protocol: TCP
+      port: 8081
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: zoiko-identity
+      podSelector:
+        matchLabels:
+          app: identity-svc
+    ports:
+    - protocol: TCP
+      port: 8080
+  # Governance ledger records are delivered by the decision_log outbox relay.
+  - to:
+    - podSelector:
+        matchLabels:
+          app: governance-svc
+    ports:
+    - protocol: TCP
+      port: 8083
+  # Evidence checks (AUD-07) and the approval evidence package.
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: zoiko-evidence
+      podSelector:
+        matchLabels:
+          app: document-vault-svc
+    ports:
+    - protocol: TCP
+      port: 8094
   # Allow CoreDNS access
   - to:
     - namespaceSelector: {}
@@ -675,6 +738,36 @@ spec:
     ports:
     - protocol: TCP
       port: 8082
+  # Every mutation is authorized by authorization-svc (same namespace).
+  - to:
+    - podSelector:
+        matchLabels:
+          app: authorization-svc
+    ports:
+    - protocol: TCP
+      port: 8089
+  # Cross-domain: the legal entity must exist in tenant-svc, and the identity
+  # gate verifies envelopes against identity-svc's JWKS/introspection.
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: zoiko-identity
+      podSelector:
+        matchLabels:
+          app: tenant-svc
+    ports:
+    - protocol: TCP
+      port: 8081
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: zoiko-identity
+      podSelector:
+        matchLabels:
+          app: identity-svc
+    ports:
+    - protocol: TCP
+      port: 8080
   # Allow CoreDNS access
   - to:
     - namespaceSelector: {}
@@ -762,6 +855,84 @@ spec:
     - protocol: TCP
       port: 8089
   # Allow CoreDNS access
+  - to:
+    - namespaceSelector: {}
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+---
+# evidence-requirements-svc (zoiko-governance). Without this policy the
+# namespace default-deny leaves the pod unable to reach Postgres, Kafka,
+# authorization-svc, tenant-svc or document-vault-svc at all.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: evidence-requirements-svc-policy
+  namespace: zoiko-governance
+spec:
+  podSelector:
+    matchLabels:
+      app: evidence-requirements-svc
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector: {}
+    ports:
+    - protocol: TCP
+      port: 8130
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: zoiko-infra
+    ports:
+    - protocol: TCP
+      port: 5432
+    - protocol: TCP
+      port: 9092
+  - to:
+    - podSelector:
+        matchLabels:
+          app: authorization-svc
+    ports:
+    - protocol: TCP
+      port: 8089
+  # Cross-domain: legal-entity validation and identity verification.
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: zoiko-identity
+      podSelector:
+        matchLabels:
+          app: tenant-svc
+    ports:
+    - protocol: TCP
+      port: 8081
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: zoiko-identity
+      podSelector:
+        matchLabels:
+          app: identity-svc
+    ports:
+    - protocol: TCP
+      port: 8080
+  # Supporting-document verification.
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: zoiko-evidence
+      podSelector:
+        matchLabels:
+          app: document-vault-svc
+    ports:
+    - protocol: TCP
+      port: 8094
   - to:
     - namespaceSelector: {}
     ports:
