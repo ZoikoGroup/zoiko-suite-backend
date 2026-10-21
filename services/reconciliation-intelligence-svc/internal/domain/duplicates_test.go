@@ -47,6 +47,9 @@ func TestDuplicates_ExactReference(t *testing.T) {
 	if dup.ConfidenceScore != duplicateExactReferenceConfidence || dup.ResolutionStatus != StatusRecommended {
 		t.Fatalf("copy: confidence %.1f status %s", dup.ConfidenceScore, dup.ResolutionStatus)
 	}
+	if dup.HeuristicRule != HeuristicDuplicateExact || dup.ToleranceVersion != 7 {
+		t.Fatalf("copy: rule %q version %d, want %q / 7", dup.HeuristicRule, dup.ToleranceVersion, HeuristicDuplicateExact)
+	}
 	for _, want := range []string{"heuristic rule", "sl-2 probably duplicates statement line sl-1", "identical ignoring case and whitespace"} {
 		if !strings.Contains(dup.ResolutionNotes, want) {
 			t.Fatalf("copy rationale missing %q: %q", want, dup.ResolutionNotes)
@@ -82,6 +85,9 @@ func TestDuplicates_SuffixedReference_AnchorIsTheOriginal(t *testing.T) {
 		}
 		if it.ConfidenceScore != duplicateSuffixedReferenceConfidence || !strings.Contains(it.ResolutionNotes, "plus a trailing sequence suffix") {
 			t.Fatalf("%s: confidence %.1f, rationale %q", id, it.ConfidenceScore, it.ResolutionNotes)
+		}
+		if it.HeuristicRule != HeuristicDuplicateSuffixed {
+			t.Fatalf("%s: rule %q, want %q", id, it.HeuristicRule, HeuristicDuplicateSuffixed)
 		}
 	}
 	if by["sl-9"].DiscrepancyType != DiscrepancyMissingReference || !strings.Contains(by["sl-9"].ResolutionNotes, "(sl-1, sl-2)") {

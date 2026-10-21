@@ -47,6 +47,28 @@ const (
 	StatusExecuted    ResolutionStatus = "EXECUTED"
 )
 
+// HeuristicRule names the fixed rule that produced a suggestion. It is the
+// machine-readable "score basis" the data model requires: a reviewer can
+// select and group by the rule that fired without parsing ResolutionNotes,
+// and a value here is a named constant, not free text.
+type HeuristicRule string
+
+const (
+	HeuristicMissingReferenceWriteOff     HeuristicRule = "MISSING_REFERENCE_WRITE_OFF"
+	HeuristicMissingReferenceManualReview HeuristicRule = "MISSING_REFERENCE_MANUAL_REVIEW"
+	HeuristicDuplicateExact               HeuristicRule = "DUPLICATE_EXACT"
+	HeuristicDuplicateSuffixed            HeuristicRule = "DUPLICATE_SUFFIXED"
+)
+
+// GovernedTolerance is the financial-control-svc TolerancePolicy used for an
+// analysis: the exact amount approved and the version it was approved under.
+// Every suggestion records the version, so its score basis points at one
+// retrievable policy rather than "whatever was current at the time".
+type GovernedTolerance struct {
+	Amount  *big.Rat
+	Version int
+}
+
 // BankStatementLine is one UNMATCHED statement line as read from
 // bank-reconciliation-svc, the authoritative owner of statement lines and
 // their match state. This service never posts a line: it is fetched by run
@@ -110,16 +132,20 @@ type UnmatchedItem struct {
 	AmountB                    string          `json:"amount_b"`
 	DiscrepancyAmount          string          `json:"discrepancy_amount"`
 	DiscrepancyType            DiscrepancyType `json:"discrepancy_type"`
-	// ConfidenceScore is NOT statistically or ML-derived — it is one of two
-	// fixed values produced by AnalyzeUnmatchedStatementLines' hardcoded
-	// threshold rules (see the named heuristic constants below). ZS-SVC-Z-001
-	// (Data Quality/Reconciliation/Lineage/Control Totals) requires tolerance
-	// be "explicit and versioned" (its own INV-09); this remains an
-	// unversioned Go-code heuristic, not that. Kept as a documented,
-	// human-reviewed starting point — ResolutionNotes below carries the
-	// actual rule that fired, so a reviewer sees the reasoning rather than
-	// trusting this number as if it were a real confidence estimate.
-	ConfidenceScore  float64                  `json:"confidence_score"`
+	// ConfidenceScore is NOT statistically or ML-derived — it is a fixed
+	// label produced by AnalyzeUnmatchedStatementLines' hardcoded threshold
+	// rules. HeuristicRule names the exact rule that fired, so the score has
+	// a machine-readable basis instead of being an unexplained number.
+	ConfidenceScore float64 `json:"confidence_score"`
+	// HeuristicRule is the named rule that produced this suggestion. Empty
+	// only on rows written before migration 000005.
+	HeuristicRule HeuristicRule `json:"heuristic_rule,omitempty"`
+	// ToleranceVersion is the version of the governed missing-reference
+	// tolerance policy in force for the analysis. Duplicate detection does
+	// not compare amounts against the tolerance, but the version still
+	// identifies the policy under which the analysis ran. Zero only on rows
+	// written before migration 000005.
+	ToleranceVersion int                      `json:"tolerance_version,omitempty"`
 	Recommendation   ResolutionRecommendation `json:"recommendation"`
 	ResolutionStatus ResolutionStatus         `json:"resolution_status"`
 	ResolutionNotes  string                   `json:"resolution_notes,omitempty"`
@@ -196,9 +222,10 @@ func (r *AnalyzeReconciliationRequest) Validate() error {
 }
 
 // Confidence-score labels for the recommendations AnalyzeUnmatchedStatementLines
-// produces. These are NOT a governed policy and carry no monetary
-// meaning — they are fixed descriptive labels telling a human reviewer which
-// fixed heuristic rule fired (see ConfidenceScore's own field comment). The
+// produces, paired one-for-one with the HeuristicRule constants. These are NOT
+// a governed policy and carry no monetary meaning — they are fixed descriptive
+// labels telling a human reviewer which fixed heuristic rule fired (see
+// ConfidenceScore's own field comment). The
 // monetary tolerance the heuristic compares against is not hardcoded: it is
 // fetched from financial-control-svc's governed, versioned TolerancePolicy
 // registry (ZS-SVC-Z-001 INV-09 — tolerance must be "explicit and
@@ -250,14 +277,17 @@ const MetricMissingReferenceTolerance = "RECONCILIATION_MISSING_REFERENCE_WRITEO
 // cannot certify, waive, post or clear). A real match is still established
 // through bank-reconciliation-svc's own propose/confirm flow, by a human.
 //
-// missingReferenceTolerance is the current MetricMissingReferenceTolerance
-// for the run's legal entity. All money is compared exactly as big.Rat
-// (ZS-DATA-001 D06).
-func AnalyzeUnmatchedStatementLines(lines []BankStatementLine, runID, tenantID string, missingReferenceTolerance *big.Rat) ([]UnmatchedItem, error) {
-	if missingReferenceTolerance == nil {
+// missingReferenceTolerance is the current MetricMissingReferenceTolerance for
+// the run's legal entity, including the version that was actually used. All
+// money is compared exactly as big.Rat (ZS-DATA-001 D06).
+func AnalyzeUnmatchedStatementLines(lines []BankStatementLine, runID, tenantID string, missingReferenceTolerance *GovernedTolerance) ([]UnmatchedItem, error) {
+	if missingReferenceTolerance == nil || missingReferenceTolerance.Amount == nil {
 		return nil, fmt.Errorf("the governed missing-reference tolerance is required")
 	}
-	tol := CanonicalAmount(missingReferenceTolerance)
+	if missingReferenceTolerance.Version <= 0 {
+		return nil, fmt.Errorf("the governed missing-reference tolerance version is required")
+	}
+	tol := CanonicalAmount(missingReferenceTolerance.Amount)
 
 	amounts := make([]*big.Rat, len(lines))
 	for i, line := range lines {
@@ -284,7 +314,7 @@ func AnalyzeUnmatchedStatementLines(lines []BankStatementLine, runID, tenantID s
 		now := time.Now()
 
 		if d, isDup := dupOf[i]; isDup {
-			items = append(items, duplicateItem(line, lines[d.anchor], amount, amounts[d.anchor], d.exact, runID, tenantID, now))
+			items = append(items, duplicateItem(line, lines[d.anchor], amount, amounts[d.anchor], d.exact, runID, tenantID, missingReferenceTolerance.Version, now))
 			continue
 		}
 
@@ -295,13 +325,15 @@ func AnalyzeUnmatchedStatementLines(lines []BankStatementLine, runID, tenantID s
 		mag := CanonicalAmount(magnitude)
 
 		confScore := missingReferenceManualReviewConfidence
+		rule := HeuristicMissingReferenceManualReview
 		rec := RecommendationManualReview
 		rationale := fmt.Sprintf(
 			"heuristic rule: statement line %s is UNMATCHED in bank-reconciliation run %s; amount magnitude %s is at or above the %s governed small-amount tolerance, so manual review is recommended rather than write-off",
 			line.StatementLineID, runID, mag, tol)
-		if magnitude.Cmp(missingReferenceTolerance) < 0 {
+		if magnitude.Cmp(missingReferenceTolerance.Amount) < 0 {
 			rec = RecommendationWriteOff
 			confScore = missingReferenceWriteOffConfidence
+			rule = HeuristicMissingReferenceWriteOff
 			rationale = fmt.Sprintf(
 				"heuristic rule: statement line %s is UNMATCHED in bank-reconciliation run %s; amount magnitude %s is below the %s governed small-amount write-off tolerance",
 				line.StatementLineID, runID, mag, tol)
@@ -325,6 +357,8 @@ func AnalyzeUnmatchedStatementLines(lines []BankStatementLine, runID, tenantID s
 			DiscrepancyAmount:       mag,
 			DiscrepancyType:         DiscrepancyMissingReference,
 			ConfidenceScore:         confScore,
+			HeuristicRule:           rule,
+			ToleranceVersion:        missingReferenceTolerance.Version,
 			Recommendation:          rec,
 			ResolutionStatus:        StatusRecommended,
 			ResolutionNotes:         rationale,
@@ -338,11 +372,13 @@ func AnalyzeUnmatchedStatementLines(lines []BankStatementLine, runID, tenantID s
 // duplicateItem is the DUPLICATE_ENTRY suggestion that dup is probably the
 // same bank entry as anchor. It names both lines; the amounts are equal by
 // the detection rule, so the discrepancy is 0.
-func duplicateItem(dup, anchor BankStatementLine, dupAmount, anchorAmount *big.Rat, exact bool, runID, tenantID string, now time.Time) UnmatchedItem {
+func duplicateItem(dup, anchor BankStatementLine, dupAmount, anchorAmount *big.Rat, exact bool, runID, tenantID string, toleranceVersion int, now time.Time) UnmatchedItem {
 	confScore := duplicateSuffixedReferenceConfidence
+	rule := HeuristicDuplicateSuffixed
 	refRule := fmt.Sprintf("bank reference %q is %q plus a trailing sequence suffix", dup.BankReference, anchor.BankReference)
 	if exact {
 		confScore = duplicateExactReferenceConfidence
+		rule = HeuristicDuplicateExact
 		refRule = fmt.Sprintf("bank references %q and %q are identical ignoring case and whitespace", dup.BankReference, anchor.BankReference)
 	}
 	rationale := fmt.Sprintf(
@@ -361,6 +397,8 @@ func duplicateItem(dup, anchor BankStatementLine, dupAmount, anchorAmount *big.R
 		DiscrepancyAmount:          "0",
 		DiscrepancyType:            DiscrepancyDuplicateEntry,
 		ConfidenceScore:            confScore,
+		HeuristicRule:              rule,
+		ToleranceVersion:           toleranceVersion,
 		Recommendation:             RecommendationConfirmDuplicate,
 		ResolutionStatus:           StatusRecommended,
 		ResolutionNotes:            rationale,

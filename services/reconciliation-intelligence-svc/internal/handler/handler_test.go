@@ -128,6 +128,45 @@ func TestAnalyzeAndLifecycleReconciliation(t *testing.T) {
 	}
 }
 
+// A8: every suggestion in the analyze response names the rule that fired and
+// the exact tolerance-policy version used, so the confidence number has a
+// machine-readable basis.
+func TestAnalyze_ResponseCarriesScoreProvenance(t *testing.T) {
+	router := setupTestRouter(t)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/reconciliations/analyze", bytes.NewBuffer(analyzeBody("LE-3003", runLE3003)))
+	withEnvelope(req)
+	req.Header.Set("X-Tenant-ID", "tenant-rec-a8")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Principal-Id", "principal-01")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var body struct {
+		UnmatchedItems []map[string]any `json:"unmatched_items"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(body.UnmatchedItems) != 2 {
+		t.Fatalf("expected 2 suggestions, got %d", len(body.UnmatchedItems))
+	}
+	// runLE3003 has a 75.00 line (at/above the 10 tolerance) and a 5.00
+	// line (below it); the fake policy registry answers version 1.
+	wantRules := []string{"MISSING_REFERENCE_MANUAL_REVIEW", "MISSING_REFERENCE_WRITE_OFF"}
+	for i, item := range body.UnmatchedItems {
+		if item["heuristic_rule"] != wantRules[i] {
+			t.Errorf("item %d heuristic_rule = %v, want %s", i, item["heuristic_rule"], wantRules[i])
+		}
+		if item["tolerance_version"] != float64(1) {
+			t.Errorf("item %d tolerance_version = %v, want 1", i, item["tolerance_version"])
+		}
+	}
+}
+
 func TestValidationErrors(t *testing.T) {
 	router := setupTestRouter(t)
 

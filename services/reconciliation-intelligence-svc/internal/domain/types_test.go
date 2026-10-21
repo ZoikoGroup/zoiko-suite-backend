@@ -17,8 +17,9 @@ import (
 // The tolerance is passed explicitly here, mirroring what a real caller
 // fetches from financial-control-svc's governed TolerancePolicy registry
 // (internal/financialcontrol) — it is not a package constant (ZS-SVC-Z-001
-// INV-09).
-var testMissingReferenceTolerance = big.NewRat(10, 1)
+// INV-09). Version 7 stands in for the policy version that must be recorded
+// on every suggestion (A8).
+var testMissingReferenceTolerance = &GovernedTolerance{Amount: big.NewRat(10, 1), Version: 7}
 
 const testRunID = "6f1c2a8e-3b7d-4c55-9a10-2d4e8f7b9c01"
 
@@ -109,6 +110,22 @@ func TestAnalyze_EveryLineYieldsOneTraceableSuggestion(t *testing.T) {
 	}
 }
 
+// A8: the score's basis is a named rule and a specific tolerance-policy
+// version, not an unexplained number plus prose.
+func TestAnalyze_RecordsScoreProvenance(t *testing.T) {
+	writeOff := analyze(t, line("write-off", "5.00"))[0]
+	if writeOff.HeuristicRule != HeuristicMissingReferenceWriteOff || writeOff.ToleranceVersion != 7 {
+		t.Fatalf("write-off provenance = %q / %d, want %q / 7",
+			writeOff.HeuristicRule, writeOff.ToleranceVersion, HeuristicMissingReferenceWriteOff)
+	}
+
+	review := analyze(t, line("review", "50.00"))[0]
+	if review.HeuristicRule != HeuristicMissingReferenceManualReview || review.ToleranceVersion != 7 {
+		t.Fatalf("manual-review provenance = %q / %d, want %q / 7",
+			review.HeuristicRule, review.ToleranceVersion, HeuristicMissingReferenceManualReview)
+	}
+}
+
 func TestAnalyze_EmptyPopulation_NoSuggestions(t *testing.T) {
 	if items := analyze(t); len(items) != 0 {
 		t.Fatalf("expected no suggestions for no lines, got %d", len(items))
@@ -135,6 +152,12 @@ func TestAnalyze_UnstorableAmountRefused(t *testing.T) {
 func TestAnalyze_NilToleranceRefused(t *testing.T) {
 	if _, err := AnalyzeUnmatchedStatementLines([]BankStatementLine{line("x", "1")}, testRunID, "t", nil); err == nil {
 		t.Fatal("expected an error for a missing governed tolerance")
+	}
+	// A value with no policy version is not provenance: refuse it rather
+	// than store an item whose score basis cannot name the policy used.
+	if _, err := AnalyzeUnmatchedStatementLines([]BankStatementLine{line("x", "1")}, testRunID, "t",
+		&GovernedTolerance{Amount: big.NewRat(10, 1)}); err == nil {
+		t.Fatal("expected an error for a governed tolerance with no version")
 	}
 }
 

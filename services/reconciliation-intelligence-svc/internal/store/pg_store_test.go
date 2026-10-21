@@ -45,6 +45,7 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 		"000002_add_eventing_outbox.up.sql",
 		"000003_bank_reconciliation_source.up.sql",
 		"000004_suggestion_counterpart_line.up.sql",
+		"000005_suggestion_score_provenance.up.sql",
 	} {
 		sql, err := os.ReadFile(filepath.Join(base, "../../deployments/migrations", migration))
 		if err != nil {
@@ -85,6 +86,8 @@ func newTestJob(legalEntityID string) (*domain.ReconciliationJob, []domain.Unmat
 		DiscrepancyAmount:       "32.25",
 		DiscrepancyType:         domain.DiscrepancyMissingReference,
 		ConfidenceScore:         60,
+		HeuristicRule:           domain.HeuristicMissingReferenceManualReview,
+		ToleranceVersion:        3,
 		Recommendation:          domain.RecommendationManualReview,
 		ResolutionStatus:        "RECOMMENDED",
 		ResolutionNotes:         "heuristic: above tolerance",
@@ -221,6 +224,43 @@ func TestPgStore_AmountsRoundTripExactly(t *testing.T) {
 	}
 	if resolved.AmountA != "100.25" || resolved.AmountB != "132.5" || resolved.DiscrepancyAmount != "32.25" {
 		t.Fatalf("ApplyResolution amounts = %s / %s / %s, want 100.25 / 132.5 / 32.25", resolved.AmountA, resolved.AmountB, resolved.DiscrepancyAmount)
+	}
+}
+
+// TestPgStore_ScoreProvenanceRoundTrips proves A8's two provenance fields
+// survive storage and read-back: the named rule that fired and the exact
+// tolerance-policy version the suggestion was evaluated against.
+func TestPgStore_ScoreProvenanceRoundTrips(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.NewPgStore(pool, store.WithEventRegion("test"))
+
+	tenantID := uuid.New().String()
+	ctx := context.Background()
+
+	job, items := newTestJob("le-us")
+	if err := s.CreateJob(ctx, tenantID, job, items, "actor-1", "corr-1"); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+
+	var rule string
+	var version int
+	if err := pool.QueryRow(ctx, `SELECT heuristic_rule, tolerance_version
+		FROM reconciliation_unmatched_items WHERE job_id = $1`, job.ID).Scan(&rule, &version); err != nil {
+		t.Fatalf("raw select: %v", err)
+	}
+	if rule != string(domain.HeuristicMissingReferenceManualReview) || version != 3 {
+		t.Fatalf("stored provenance = %q / %d, want %q / 3",
+			rule, version, domain.HeuristicMissingReferenceManualReview)
+	}
+
+	got, err := s.GetJobByID(ctx, tenantID, job.ID)
+	if err != nil {
+		t.Fatalf("GetJobByID: %v", err)
+	}
+	it := got.UnmatchedItems[0]
+	if it.HeuristicRule != domain.HeuristicMissingReferenceManualReview || it.ToleranceVersion != 3 {
+		t.Fatalf("read-back provenance = %q / %d, want %q / 3",
+			it.HeuristicRule, it.ToleranceVersion, domain.HeuristicMissingReferenceManualReview)
 	}
 }
 

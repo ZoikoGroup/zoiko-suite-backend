@@ -137,10 +137,11 @@ func (s *PgStore) CreateJob(ctx context.Context, tenantID string, job *domain.Re
 	queryItem := `
 		INSERT INTO reconciliation_unmatched_items (
 			id, tenant_id, job_id, transaction_ref_a, transaction_ref_b, amount_a, amount_b,
-			discrepancy_amount, discrepancy_type, confidence_score, recommendation, resolution_status, resolution_notes, created_at, updated_at,
+			discrepancy_amount, discrepancy_type, confidence_score, heuristic_rule, tolerance_version,
+			recommendation, resolution_status, resolution_notes, created_at, updated_at,
 			bank_reconciliation_run_id, statement_line_id, counterpart_statement_line_id
-		) VALUES ($1, $2, $3, $4, $5, $6::numeric, $7::numeric, $8::numeric, $9, $10, $11, $12, $13, $14, $15,
-			NULLIF($16, '')::uuid, NULLIF($17, '')::uuid, NULLIF($18, '')::uuid)`
+		) VALUES ($1, $2, $3, $4, $5, $6::numeric, $7::numeric, $8::numeric, $9, $10, $11, $12, $13, $14, $15, $16, $17,
+			NULLIF($18, '')::uuid, NULLIF($19, '')::uuid, NULLIF($20, '')::uuid)`
 
 	for i := range items {
 		item := &items[i]
@@ -152,7 +153,8 @@ func (s *PgStore) CreateJob(ctx context.Context, tenantID string, job *domain.Re
 
 		_, err := tx.Exec(ctx, queryItem,
 			item.ID, tenantID, job.ID, item.TransactionRefA, item.TransactionRefB, item.AmountA, item.AmountB,
-			item.DiscrepancyAmount, string(item.DiscrepancyType), item.ConfidenceScore, string(item.Recommendation),
+			item.DiscrepancyAmount, string(item.DiscrepancyType), item.ConfidenceScore,
+			nullableHeuristicRule(item.HeuristicRule), nullableToleranceVersion(item.ToleranceVersion), string(item.Recommendation),
 			string(item.ResolutionStatus), item.ResolutionNotes, item.CreatedAt, item.UpdatedAt,
 			item.BankReconciliationRunID, item.StatementLineID, item.CounterpartStatementLineID,
 		)
@@ -242,7 +244,8 @@ const jobColumns = `id, tenant_id, legal_entity_id, job_name, source_system_a, C
 	COALESCE(bank_reconciliation_run_id::text, '')`
 
 const itemColumns = `id, tenant_id, job_id, transaction_ref_a, transaction_ref_b, amount_a, amount_b,
-	discrepancy_amount, discrepancy_type, confidence_score, recommendation, resolution_status,
+	discrepancy_amount, discrepancy_type, confidence_score, COALESCE(heuristic_rule, ''),
+	COALESCE(tolerance_version, 0), recommendation, resolution_status,
 	COALESCE(resolution_notes, ''), created_at, updated_at,
 	COALESCE(bank_reconciliation_run_id::text, ''), COALESCE(statement_line_id::text, ''),
 	COALESCE(counterpart_statement_line_id::text, '')`
@@ -259,6 +262,7 @@ func scanItem(row pgx.Row, item *domain.UnmatchedItem) error {
 	if err := row.Scan(
 		&item.ID, &item.TenantID, &item.JobID, &item.TransactionRefA, &item.TransactionRefB,
 		&item.AmountA, &item.AmountB, &item.DiscrepancyAmount, &item.DiscrepancyType, &item.ConfidenceScore,
+		&item.HeuristicRule, &item.ToleranceVersion,
 		&item.Recommendation, &item.ResolutionStatus, &item.ResolutionNotes, &item.CreatedAt, &item.UpdatedAt,
 		&item.BankReconciliationRunID, &item.StatementLineID, &item.CounterpartStatementLineID,
 	); err != nil {
@@ -400,6 +404,26 @@ func (s *PgStore) ArchiveJob(ctx context.Context, tenantID, id string) error {
 	}
 
 	return tx.Commit(ctx)
+}
+
+// nullableHeuristicRule stores an unset rule as NULL. That is only possible
+// for rows written before migration 000005 or for an item a test constructs
+// by hand; a produced suggestion always names its rule. NULL keeps "not
+// recorded" distinct from an empty rule name.
+func nullableHeuristicRule(rule domain.HeuristicRule) any {
+	if rule == "" {
+		return nil
+	}
+	return string(rule)
+}
+
+// nullableToleranceVersion stores an unset version as NULL for the same
+// reason: 0 is not a policy version that was ever approved.
+func nullableToleranceVersion(version int) any {
+	if version == 0 {
+		return nil
+	}
+	return version
 }
 
 // canonicalizeItemAmounts rewrites the NUMERIC(18,4) text Postgres returns
