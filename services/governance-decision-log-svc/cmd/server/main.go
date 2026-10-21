@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -110,25 +111,41 @@ func main() {
 	}
 	log.Info("db pool connected")
 
-	// ── 4b. Kafka producer & outbox worker ──────────────────────────────────────
-	kafkaWriter := &kafka.Writer{
-		Addr:         kafka.TCP(cfg.Kafka.Brokers...),
-		Topic:        cfg.Kafka.Topic,
-		Balancer:     &kafka.LeastBytes{},
-		BatchSize:    100,
-		BatchTimeout: 10 * time.Millisecond,
-		RequiredAcks: kafka.RequireAll,
-		Async:        false,
-	}
-	defer func() {
-		if err := kafkaWriter.Close(); err != nil {
-			log.Error("kafka writer close failed", zap.Error(err))
+	// ── 4b. Kafka producer & outbox relay ───────────────────────────────────────
+	// This service is the governance evidence ledger (Tier 0). A deployment
+	// with no broker would accept decisions whose events never leave the
+	// outbox, so that is refused outside local development (GCP §1: evidence
+	// is not an afterthought). Locally, KAFKA_BROKERS= runs without a relay and
+	// events wait in the outbox until one runs.
+	if len(cfg.Kafka.Brokers) == 0 {
+		if strings.EqualFold(cfg.Env, "production") || strings.EqualFold(cfg.Env, "staging") {
+			log.Fatal("KAFKA_BROKERS is empty: refusing to start the governance ledger without an event backbone",
+				zap.String("env", cfg.Env))
 		}
-	}()
+		log.Warn("KAFKA_BROKERS is empty: outbox relay disabled; events accumulate in the outbox")
+	} else {
+		kafkaWriter := &kafka.Writer{
+			Addr:         kafka.TCP(cfg.Kafka.Brokers...),
+			Topic:        cfg.Kafka.Topic,
+			Balancer:     &kafka.Hash{},
+			BatchTimeout: 10 * time.Millisecond,
+			RequiredAcks: kafka.RequireAll,
+			// Without this, a broker that has not yet had the topic created
+			// answers every publish with Unknown Topic Or Partition and the
+			// relay retries forever. Same setting as the other services.
+			AllowAutoTopicCreation: true,
+		}
+		defer func() {
+			if err := kafkaWriter.Close(); err != nil {
+				log.Error("kafka writer close failed", zap.Error(err))
+			}
+		}()
 
-	outboxWorker := outbox.NewWorker(pool, kafkaWriter, cfg.Kafka.Topic, log)
-	outboxWorker.Start(context.Background())
-	defer outboxWorker.Stop()
+		outboxWorker := outbox.NewWorker(pool, kafkaWriter, log,
+			outbox.WithObserver(metrics), outbox.WithRetention(cfg.OutboxRetention))
+		outboxWorker.Start(context.Background())
+		defer outboxWorker.Stop()
+	}
 
 	// ── 5. Store ──────────────────────────────────────────────────────────────
 	pgStore := store.New(pool, log)
@@ -167,10 +184,16 @@ func main() {
 	// handler so no request reaches business logic without a resolved tenant,
 	// actor, correlation and — on material writes — an idempotency key.
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
+	// Refusals rendered as RFC 9457 problem+json, like every other error here.
+	r.Use(handler.ProblemEnvelopeRefusals)
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
 	policyClient := policyclient.NewHTTPClient(cfg.PolicyServiceURL)
 	h := handler.New(pgStore, authzClient, policyClient, cfg.AuthZPlatformScopeID, log)
+	if strings.EqualFold(cfg.ReadAuthzMode, "warn") {
+		log.Warn("DECISION_LOG_READ_AUTHZ=warn: unauthorized reads are logged and served, not refused")
+		h.WarnOnlyReadAuthz()
+	}
 	handler.RegisterRoutes(r, h)
 
 	// ── 7. Health probes + metrics ────────────────────────────────────────────

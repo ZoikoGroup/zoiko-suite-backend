@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"sort"
 	"testing"
 	"time"
 
@@ -23,6 +25,7 @@ import (
 var (
 	testPool  *pgxpool.Pool
 	testStore *store.PgStore
+	testDSN   string
 )
 
 // TestMain provisions a real, throwaway embedded Postgres instance and
@@ -31,28 +34,33 @@ var (
 // exercised by internal/handler/handler_test.go, which cannot prove a
 // database-level trigger actually fires.
 func TestMain(m *testing.M) {
-	dbPort := uint32(15901 + uint32(os.Getpid()%499))
-	pg := embeddedpostgres.NewDatabase(
-		embeddedpostgres.DefaultConfig().
-			RuntimePath(os.TempDir() + "/payment-pg-" + fmt.Sprint(os.Getpid())).
-			Version(embeddedpostgres.V16).
-			Port(dbPort).
-			Database("payment_adapter_test").
-			Username("postgres").
-			Password("postgres"),
-	)
-	if err := pg.Start(); err != nil {
-		fmt.Printf("failed to start embedded postgres: %v\n", err)
-		os.Exit(1)
-	}
-
-	dsn := fmt.Sprintf("host=localhost port=%d dbname=payment_adapter_test user=postgres password=postgres sslmode=disable", dbPort)
 	ctx := context.Background()
+	stop := func() {}
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		dbPort := uint32(15901 + uint32(os.Getpid()%499))
+		pg := embeddedpostgres.NewDatabase(
+			embeddedpostgres.DefaultConfig().
+				RuntimePath(os.TempDir() + "/payment-pg-" + fmt.Sprint(os.Getpid())).
+				Version(embeddedpostgres.V16).
+				Port(dbPort).
+				Database("payment_adapter_test").
+				Username("postgres").
+				Password("postgres"),
+		)
+		if err := pg.Start(); err != nil {
+			fmt.Printf("failed to start embedded postgres: %v\n", err)
+			os.Exit(1)
+		}
+		stop = func() { _ = pg.Stop() }
+		dsn = fmt.Sprintf("host=localhost port=%d dbname=payment_adapter_test user=postgres password=postgres sslmode=disable", dbPort)
+	}
+	testDSN = dsn
 	var err error
 	testPool, err = pgxpool.New(ctx, dsn)
 	if err != nil {
 		fmt.Printf("failed to connect: %v\n", err)
-		_ = pg.Stop()
+		stop()
 		os.Exit(1)
 	}
 	for i := 0; i < 75; i++ {
@@ -64,28 +72,39 @@ func TestMain(m *testing.M) {
 	if err != nil {
 		fmt.Printf("postgres did not become ready: %v\n", err)
 		testPool.Close()
-		_ = pg.Stop()
+		stop()
 		os.Exit(1)
 	}
+	if os.Getenv("TEST_DATABASE_URL") != "" {
+		// a shared server: start from an empty schema so the migrations are exercised from nothing
+		if _, err := testPool.Exec(ctx, "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"); err != nil {
+			fmt.Printf("reset schema: %v\n", err)
+			os.Exit(1)
+		}
+	}
 
-	for _, migration := range []string{
-		"000001_initial_schema.up.sql",
-		"000002_immutability.up.sql",
-		"000003_add_rls.up.sql",
-		"000004_add_authorization_verification.up.sql",
-		"000005_add_eventing_outbox.up.sql",
-	} {
-		sql, err := os.ReadFile("../../deployments/migrations/" + migration)
+	// Every migration in filename order, never a hardcoded list: a list that must be remembered to be
+	// updated silently skips new migrations.
+	migrations, err := filepath.Glob("../../deployments/migrations/*.up.sql")
+	if err != nil || len(migrations) == 0 {
+		fmt.Printf("no migrations found: %v\n", err)
+		testPool.Close()
+		stop()
+		os.Exit(1)
+	}
+	sort.Strings(migrations)
+	for _, migration := range migrations {
+		sql, err := os.ReadFile(migration)
 		if err != nil {
 			fmt.Printf("read migration %s: %v\n", migration, err)
 			testPool.Close()
-			_ = pg.Stop()
+			stop()
 			os.Exit(1)
 		}
 		if _, err := testPool.Exec(ctx, string(sql)); err != nil {
-			fmt.Printf("apply migration %s: %v\n", migration, err)
+			fmt.Printf("apply migration %s: %v\n", filepath.Base(migration), err)
 			testPool.Close()
-			_ = pg.Stop()
+			stop()
 			os.Exit(1)
 		}
 	}
@@ -94,7 +113,7 @@ func TestMain(m *testing.M) {
 
 	code := m.Run()
 	testPool.Close()
-	_ = pg.Stop()
+	stop()
 	os.Exit(code)
 }
 

@@ -11,7 +11,15 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"zoiko.io/privacy-consent-svc/internal/middleware"
 )
+
+// platformScopeID mirrors handler.platformScopeID / authorization-svc's
+// platform entity UUID. Duplicated here (not imported from package handler,
+// which imports this package) rather than factored into a third package,
+// since it is one literal shared by exactly two files.
+const platformScopeID = "00000000-0000-0000-0000-00000000f001"
 
 var ErrAuthzServiceUnavailable = errors.New("authorization-svc unavailable")
 var ErrAuthorizationDenied = errors.New("authorization denied")
@@ -40,6 +48,18 @@ func NewClient(baseURL string) *Client {
 	}
 }
 
+// CheckAllowed asks authorization-svc whether principalID may perform
+// actionType within legalEntityID's scope. tenantID is read from the
+// caller's verified request context (see checkAllowedLive) — it is a
+// SEPARATE dimension from legalEntityID/scope, not derived from it. A
+// platform-wide action (legalEntityID == platformScopeID, or empty) still
+// happens inside the caller's own real tenant; the call previously
+// substituted a single hard-coded tenant UUID for every platform-scope
+// check across every tenant on the platform, which meant authorization-svc
+// evaluated the grant against roles assigned under that one fake tenant
+// rather than the caller's own — scoped correctly for a tenant-scoped
+// action, silently wrong for a platform-scoped one from any tenant other
+// than the hard-coded one.
 func (c *Client) CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error {
 	key := principalID + "|" + legalEntityID + "|" + actionType
 
@@ -102,9 +122,17 @@ func (c *Client) checkAllowedLive(ctx context.Context, principalID, legalEntityI
 	req.Header.Set("X-Principal-Id", principalID)
 	req.Header.Set("X-Legal-Entity-Id", legalEntityID)
 
-	tenantID := legalEntityID
-	if tenantID == "" || tenantID == "00000000-0000-0000-0000-00000000f001" {
-		tenantID = "11111111-1111-1111-1111-111111111111"
+	// X-Tenant-Id is the caller's own VERIFIED tenant, read from context —
+	// never derived from legalEntityID/scope. A platform-scope check
+	// (legalEntityID == platformScopeID, or empty) still happens inside the
+	// caller's real tenant; only when no tenant is known at all (a true
+	// bootstrap call, e.g. before any tenant context exists) does this fall
+	// back to the platform scope itself, which is a real, resolvable id —
+	// never the unrelated hard-coded tenant this used to send for every
+	// platform-scope check regardless of which tenant the caller belonged to.
+	tenantID := middleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		tenantID = platformScopeID
 	}
 	req.Header.Set("X-Tenant-Id", tenantID)
 	req.Header.Set("X-Request-Id", uuid.New().String())

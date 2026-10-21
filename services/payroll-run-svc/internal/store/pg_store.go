@@ -135,7 +135,7 @@ func (s *PgStore) CreatePayrollRun(ctx context.Context, r *domain.PayrollRun) (c
 			return nil
 		}
 		created = true
-		return nil
+		return enqueueRunEvent(ctx, tx, tenantID, r.RunID)
 	})
 	return created, err
 }
@@ -285,7 +285,7 @@ func (s *PgStore) SaveCalculatedResults(ctx context.Context, runID string, total
 					reimbursements, advance_deduction, loan_deduction
 				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
 					$16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29,
-					$30, $31, $32, $33, $34, $35, $36)
+					$30, $31, $32, $33, $34, $35)
 			`, slip.SlipID, tenantID, runID, slip.EmployeeID, slip.EmployeeNumber,
 				slip.EmployeeName, slip.GrossPay, slip.TaxWithheld, slip.BenefitsDeductions,
 				slip.NetPay, slip.Currency, slip.EffectiveDate, slip.TaxableAmount,
@@ -310,6 +310,9 @@ func (s *PgStore) SaveCalculatedResults(ctx context.Context, runID string, total
 					item.CalculationValue, item.Amount, item.Sequence, item.CreatedAt); err != nil {
 					return err
 				}
+			}
+			if err := insertTaxLinesTx(ctx, tx, tenantID, slip); err != nil {
+				return err
 			}
 		}
 
@@ -343,7 +346,10 @@ func (s *PgStore) SaveCalculatedResults(ctx context.Context, runID string, total
 			    updated_at = $6
 			WHERE run_id = $7 AND tenant_id = $8
 		`, totalGross, totalNet, totalTax, totalDeductions, len(slips), time.Now().UTC(), runID, tenantID)
-		return err
+		if err != nil {
+			return err
+		}
+		return enqueueRunEvent(ctx, tx, tenantID, runID)
 	})
 }
 
@@ -428,6 +434,9 @@ func (s *PgStore) GetPaySlipsByRun(ctx context.Context, runID string) ([]domain.
 
 		for i := range out {
 			out[i].Items = bySlip[out[i].SlipID]
+		}
+		if err := attachTaxLinesTx(ctx, tx, tenantID, runID, out); err != nil {
+			return err
 		}
 		return nil
 	})
@@ -526,6 +535,9 @@ func (s *PgStore) FinalizePayrollRun(ctx context.Context, runID string, governan
 			    snapshot_hash = $4
 			WHERE run_id = $5 AND tenant_id = $6
 		`, now, now, governanceDecisionID, snapshotHash, runID, tenantID)
-		return err
+		if err != nil {
+			return err
+		}
+		return enqueueRunEvent(ctx, tx, tenantID, runID)
 	})
 }

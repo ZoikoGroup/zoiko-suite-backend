@@ -9,6 +9,7 @@ package domain
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"strings"
 	"time"
 )
@@ -449,16 +450,33 @@ type PrivilegedSession struct {
 	CreatedAt        time.Time  `json:"created_at"`
 	RevokedAt        *time.Time `json:"revoked_at,omitempty"`
 	RevokedBy        *string    `json:"revoked_by,omitempty"`
+	// 000030: §13 request fields, approval and post-session review.
+	RequestedBy       *string    `json:"requested_by,omitempty"`
+	ResourceScope     *string    `json:"resource_scope,omitempty"`
+	TargetEnvironment *string    `json:"target_environment,omitempty"`
+	HighImpact        bool       `json:"high_impact"`
+	ApprovedBy        *string    `json:"approved_by,omitempty"`
+	ApprovedAt        *time.Time `json:"approved_at,omitempty"`
+	ReviewStatus      string     `json:"review_status"`
+	ReviewedBy        *string    `json:"reviewed_by,omitempty"`
+	ReviewedAt        *time.Time `json:"reviewed_at,omitempty"`
+	ReviewNotes       *string    `json:"review_notes,omitempty"`
 }
 
 // CreatePrivilegedSessionParams holds the parameters to issue a new JIT privileged session.
 type CreatePrivilegedSessionParams struct {
-	TenantID         string
-	PrincipalID      string
-	RequestedActions []string
-	TicketRef        string
-	Reason           string
-	DurationSeconds  int
+	TenantID          string
+	PrincipalID       string
+	RequestedActions  []string
+	TicketRef         string
+	Reason            string
+	DurationSeconds   int
+	RequestedBy       string
+	ResourceScope     string
+	TargetEnvironment string
+	// HighImpact sessions start PENDING_APPROVAL and grant nothing until an
+	// independent approver approves (§13).
+	HighImpact bool
 }
 
 // BreakGlassSessionStatus represents the lifecycle state of an emergency break-glass session (ZS-IAM-001 §14 & §21).
@@ -482,6 +500,12 @@ type BreakGlassSession struct {
 	CreatedAt        time.Time  `json:"created_at"`
 	RevokedAt        *time.Time `json:"revoked_at,omitempty"`
 	RevokedBy        *string    `json:"revoked_by,omitempty"`
+	// 000030: requester and the mandatory post-event review (§14).
+	RequestedBy  *string    `json:"requested_by,omitempty"`
+	ReviewStatus string     `json:"review_status"`
+	ReviewedBy   *string    `json:"reviewed_by,omitempty"`
+	ReviewedAt   *time.Time `json:"reviewed_at,omitempty"`
+	ReviewNotes  *string    `json:"review_notes,omitempty"`
 }
 
 type CreateBreakGlassSessionParams struct {
@@ -491,6 +515,7 @@ type CreateBreakGlassSessionParams struct {
 	Reason           string
 	RequestedActions []string
 	DurationSeconds  int
+	RequestedBy      string
 }
 
 // SupportSessionStatus represents the lifecycle state of a tenant support session (ZS-IAM-001 §15 & §21).
@@ -517,6 +542,7 @@ type SupportSession struct {
 	CreatedAt             time.Time  `json:"created_at"`
 	RevokedAt             *time.Time `json:"revoked_at,omitempty"`
 	RevokedBy             *string    `json:"revoked_by,omitempty"`
+	RequestedBy           *string    `json:"requested_by,omitempty"`
 }
 
 type CreateSupportSessionParams struct {
@@ -529,6 +555,7 @@ type CreateSupportSessionParams struct {
 	AllowedActions        []string
 	DurationSeconds       int
 	TenantConsentObtained bool
+	RequestedBy           string
 }
 
 // ── params ───────────────────────────────────────────────────────────────────
@@ -979,8 +1006,6 @@ var ErrJurisdictionServiceUnavailable = errorString("jurisdiction-rules-svc unav
 var ErrAuthorityLimitNotFound = errorString("authority limit not found")
 var ErrAuthorityLimitTargetRequired = errorString("authority limit requires at least one of principal_id or role_id")
 var ErrWorkloadBindingNotFound = errorString("workload binding not found")
-var ErrAccessReviewNotFound = errorString("access review not found")
-var ErrAccessReviewAlreadyCompleted = errorString("access review is already completed")
 
 // AuthorityLimit defines the foundational approval and signing limit for a principal
 // or role within an optional legal entity, book, or org-unit scope (ZS-IAM-001 §12, §21, §22).
@@ -1038,10 +1063,30 @@ const (
 // EnvironmentContext captures contextual environment attributes including authentication age,
 // assurance level, operational risk, and audience (ZS-IAM-001 §8.1, §16).
 type EnvironmentContext struct {
-	AuthnAgeSeconds int    `json:"authn_age_seconds,omitempty"`
-	Assurance       string `json:"assurance,omitempty"`
-	Risk            string `json:"risk,omitempty"`
-	Audience        string `json:"audience,omitempty"`
+	AuthnAgeSeconds int `json:"authn_age_seconds,omitempty"`
+	// AuthnAgeKnown says whether the caller stated an authentication age at
+	// all. AuthnAgeSeconds 0 with AuthnAgeKnown false is "not said", which a
+	// step-up action treats as not recent (Governance audit N-07) — it used to
+	// read as a login zero seconds old.
+	AuthnAgeKnown bool   `json:"-"`
+	Assurance     string `json:"assurance,omitempty"`
+	Risk          string `json:"risk,omitempty"`
+	Audience      string `json:"audience,omitempty"`
+}
+
+// UnmarshalJSON records whether authn_age_seconds was present.
+func (e *EnvironmentContext) UnmarshalJSON(b []byte) error {
+	type plain EnvironmentContext
+	var p plain
+	if err := json.Unmarshal(b, &p); err != nil {
+		return err
+	}
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal(b, &keys); err == nil {
+		_, p.AuthnAgeKnown = keys["authn_age_seconds"]
+	}
+	*e = EnvironmentContext(p)
+	return nil
 }
 
 // StepUpRequirement details the required assurance and authentication freshness needed
@@ -1070,6 +1115,10 @@ type CanonicalDecisionRequest struct {
 	DelegationID        *string            `json:"delegation_id,omitempty"`
 	CorrelationID       string             `json:"correlation_id,omitempty"`
 	InitiatingSubjectID string             `json:"initiating_subject_id,omitempty"`
+	// The emergency and support session layers, as on /v1/authorize. The
+	// canonical API accepted only a JIT session_id (Governance audit N-16).
+	BreakGlassSessionID string `json:"break_glass_session_id,omitempty"`
+	SupportSessionID    string `json:"support_session_id,omitempty"`
 }
 
 // CanonicalDecisionResponse matches ZS-IAM-001 §8.2 for POST /internal/authorization/decisions.
@@ -1124,51 +1173,6 @@ type CapabilitiesResponse struct {
 	Permissions   []string        `json:"permissions"`
 	Modules       []string        `json:"modules"`
 	Features      map[string]bool `json:"features"`
-}
-
-// Phase 5: Access Reviews & Continuous Governance (ZS-IAM-001 §21, §24)
-const (
-	ReviewTypePeriodic       = "PERIODIC"
-	ReviewTypeEventTriggered = "EVENT_TRIGGERED"
-	ReviewTypePrivileged     = "PRIVILEGED"
-
-	ReviewStatusOpen      = "OPEN"
-	ReviewStatusCompleted = "COMPLETED"
-	ReviewStatusEscalated = "ESCALATED"
-	ReviewStatusExpired   = "EXPIRED"
-
-	ReviewDecisionKeep     = "KEEP"
-	ReviewDecisionRevoke   = "REVOKE"
-	ReviewDecisionModify   = "MODIFY"
-	ReviewDecisionEscalate = "ESCALATE"
-)
-
-// AccessReview matches ZS-IAM-001 §21, §22, §24 access_reviews table and API.
-type AccessReview struct {
-	ReviewID            string     `json:"review_id"`
-	TenantID            string     `json:"tenant_id"`
-	CampaignID          string     `json:"campaign_id"`
-	CampaignName        string     `json:"campaign_name"`
-	ReviewerPrincipalID string     `json:"reviewer_principal_id"`
-	TargetPrincipalID   string     `json:"target_principal_id"`
-	RoleID              string     `json:"role_id"`
-	LegalEntityID       string     `json:"legal_entity_id"`
-	BookID              *string    `json:"book_id,omitempty"`
-	OrgUnitID           *string    `json:"org_unit_id,omitempty"`
-	ReviewType          string     `json:"review_type"`
-	Status              string     `json:"status"`
-	Decision            *string    `json:"decision,omitempty"`
-	DecisionReason      *string    `json:"decision_reason,omitempty"`
-	DecidedAt           *time.Time `json:"decided_at,omitempty"`
-	DecidedBy           *string    `json:"decided_by,omitempty"`
-	DueAt               time.Time  `json:"due_at"`
-	CreatedAt           time.Time  `json:"created_at"`
-}
-
-// AccessReviewDecideRequest matches POST /v1/iam/access-reviews/{id}:decide body.
-type AccessReviewDecideRequest struct {
-	Decision string `json:"decision"`
-	Reason   string `json:"reason"`
 }
 
 // WorkloadBinding matches ZS-IAM-001 §16 workload_bindings table.

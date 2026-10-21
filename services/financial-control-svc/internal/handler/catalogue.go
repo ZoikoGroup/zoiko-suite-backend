@@ -47,8 +47,10 @@ func (h *Handler) SeedCatalogue(w http.ResponseWriter, r *http.Request) {
 		defs, err = catalogue.Wave5(req.EffectiveFrom)
 	case 6:
 		defs, err = catalogue.Wave6(req.EffectiveFrom)
+	case 7:
+		defs, err = catalogue.Wave7(req.EffectiveFrom)
 	default:
-		writeError(w, http.StatusBadRequest, "invalid_request", "wave must be 2, 3, 4, 5 or 6 in this build")
+		writeError(w, http.StatusBadRequest, "invalid_request", "wave must be 2, 3, 4, 5, 6 or 7 in this build")
 		return
 	}
 	if err != nil {

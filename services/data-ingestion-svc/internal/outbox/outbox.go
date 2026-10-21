@@ -14,7 +14,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 	"go.uber.org/zap"
 )
 
@@ -85,8 +84,7 @@ type Relay struct {
 
 // PgxPool is the subset of *pgxpool.Pool the relay needs.
 type PgxPool interface {
-	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
-	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	Begin(ctx context.Context) (pgx.Tx, error)
 }
 
 func NewRelay(pool PgxPool, publisher Publisher, interval time.Duration, batchSize int, log *zap.Logger) *Relay {
@@ -114,13 +112,34 @@ func (r *Relay) Start(ctx context.Context) {
 	}
 }
 
+// RunOnce makes one pass over the unpublished events. Start calls it on every tick; it is exported so
+// an operator or a test can drive a single pass.
+func (r *Relay) RunOnce(ctx context.Context) { r.relayOnce(ctx) }
+
+// relayOnce works inside one transaction that names itself as the relay (app.outbox_relay), the way the
+// other services' relays do, because outbox_events is row-level secured by tenant and an unscoped read
+// by an unprivileged role sees nothing. The flag admits the relay to read unpublished rows and mark them,
+// and nothing else. FOR UPDATE SKIP LOCKED lets several replicas share the work without publishing a row
+// twice at the same moment; a row published and not yet marked when a replica dies is published again,
+// which is the at-least-once the event consumers' inbox deduplicates.
 func (r *Relay) relayOnce(ctx context.Context) {
-	rows, err := r.pool.Query(ctx, `
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		r.log.Error("outbox relay: begin failed", zap.Error(err))
+		return
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // a no-op after commit
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.outbox_relay', 'true', true)"); err != nil {
+		r.log.Error("outbox relay: cannot name the relay", zap.Error(err))
+		return
+	}
+	rows, err := tx.Query(ctx, `
 		SELECT outbox_event_id, event_type, aggregate_id, tenant_id, payload, publish_attempts
 		FROM outbox_events
 		WHERE published_at IS NULL
 		ORDER BY created_at ASC
 		LIMIT $1
+		FOR UPDATE SKIP LOCKED
 	`, r.batchSize)
 	if err != nil {
 		r.log.Error("outbox relay: poll failed", zap.Error(err))
@@ -149,22 +168,25 @@ func (r *Relay) relayOnce(ctx context.Context) {
 		_ = json.Unmarshal(e.Payload, &payload)
 
 		if pubErr := r.publisher.PublishForOutbox(ctx, e.EventType, e.AggregateID, tenantID, payload); pubErr != nil {
-			r.markFailed(ctx, e.OutboxEventID, pubErr)
+			r.markFailed(ctx, tx, e.OutboxEventID, pubErr)
 			continue
 		}
-		r.markPublished(ctx, e.OutboxEventID)
+		r.markPublished(ctx, tx, e.OutboxEventID)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		r.log.Error("outbox relay: commit failed (published rows will be published again)", zap.Error(err))
 	}
 }
 
-func (r *Relay) markPublished(ctx context.Context, outboxEventID string) {
-	_, err := r.pool.Exec(ctx, `UPDATE outbox_events SET published_at = NOW() WHERE outbox_event_id = $1`, outboxEventID)
+func (r *Relay) markPublished(ctx context.Context, tx pgx.Tx, outboxEventID string) {
+	_, err := tx.Exec(ctx, `UPDATE outbox_events SET published_at = NOW() WHERE outbox_event_id = $1`, outboxEventID)
 	if err != nil {
 		r.log.Error("outbox relay: failed to mark published", zap.String("outbox_event_id", outboxEventID), zap.Error(err))
 	}
 }
 
-func (r *Relay) markFailed(ctx context.Context, outboxEventID string, publishErr error) {
-	_, err := r.pool.Exec(ctx, `
+func (r *Relay) markFailed(ctx context.Context, tx pgx.Tx, outboxEventID string, publishErr error) {
+	_, err := tx.Exec(ctx, `
 		UPDATE outbox_events SET publish_attempts = publish_attempts + 1, last_error = $2
 		WHERE outbox_event_id = $1
 	`, outboxEventID, publishErr.Error())

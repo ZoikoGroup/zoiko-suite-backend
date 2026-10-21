@@ -5,8 +5,8 @@
 #
 #   map_version:      47
 #   compiler_version: 0.1.0
-#   commit:           unknown
-#   generated_at:     2026-09-29T09:32:58Z
+#   commit:           f0b8f380
+#   generated_at:     2026-10-13T05:42:32Z
 # ─────────────────────────────────────────────────────────────────────────────
 http:
     routers:
@@ -79,6 +79,14 @@ http:
                     - X-Tenant-Context-Stale
                     - X-Workload-Id
                     - X-Support-Context-Id
+                    - X-Source-Channel
+                    - X-Source-Channel-Basis
+                    - X-Assurance-Level
+                    - X-Authn-Age-Seconds
+                    - X-Audience
+                    - X-Token-Audience
+                    - X-Initiating-Subject-Id
+                    - X-On-Behalf-Of
         gtrm-ctx-acme:
             headers:
                 customRequestHeaders:
@@ -106,7 +114,14 @@ http:
         gtrm-edge-strip:
             headers:
                 customRequestHeaders:
+                    X-Assurance-Level: ""
+                    X-Audience: ""
+                    X-Authn-Age-Seconds: ""
+                    X-Initiating-Subject-Id: ""
+                    X-On-Behalf-Of: ""
+                    X-Source-Channel-Basis: ""
                     X-Support-Context-Id: ""
+                    X-Token-Audience: ""
                     X-Workload-Id: ""
                     X-Zoiko-GTRM-Map-Version: ""
                     X-Zoiko-GTRM-State: ""

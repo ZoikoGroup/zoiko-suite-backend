@@ -75,12 +75,33 @@ var untrustedInboundHeaders = []string{
 	"X-Workload-Id",
 	"X-Support-Context-Id",
 
+	// Assurance- and subject-class headers authorization-svc reads (13 Oct
+	// 2026). A client wrote them straight through the edge: a forged
+	// X-Authn-Age-Seconds passed step-up, a forged audience passed the workload
+	// audience check, a forged on-behalf-of named the initiating subject.
+	// gateway-auth-svc sets X-Assurance-Level and X-Source-Channel-Basis from
+	// the signed envelope; the rest have no verified source yet, so they are
+	// only ever stripped.
+	"X-Assurance-Level",
+	"X-Authn-Age-Seconds",
+	"X-Audience",
+	"X-Token-Audience",
+	"X-Initiating-Subject-Id",
+	"X-On-Behalf-Of",
+	"X-Source-Channel-Basis",
+
 	// NOT stripped, deliberately: X-Purpose-Context, X-Approval-Reference,
 	// X-Evidence-Refs, X-Causation-Id, X-Workflow-Instance-Id, X-Book-Id,
-	// X-Source-Channel, X-Expected-Version. The §4 envelope contract makes these
-	// caller-written assertions that the owning service validates. Stripping
-	// them failed every service that requires purpose or book with 400
+	// X-Expected-Version. The §4 envelope contract makes these caller-written
+	// assertions that the owning service validates. Stripping them failed
+	// every service that requires purpose or book with 400
 	// envelope_incomplete, and silently disabled optimistic concurrency.
+	//
+	// X-Source-Channel is not stripped HERE either: ForwardAuth must still see
+	// the caller's value, which gateway-auth-svc passes on (labelled
+	// "asserted") only when the signed envelope names no channel. It is in
+	// gatewayAuthResponseHeaders, so whatever reaches the backend is the
+	// gateway's answer (S1-B1).
 }
 
 // gatewayAuthResponseHeaders is the ForwardAuth authResponseHeaders list.
@@ -101,6 +122,14 @@ var gatewayAuthResponseHeaders = []string{
 	"X-Tenant-Context-Stale",
 	"X-Workload-Id",
 	"X-Support-Context-Id",
+	"X-Source-Channel",
+	"X-Source-Channel-Basis",
+	"X-Assurance-Level",
+	"X-Authn-Age-Seconds",
+	"X-Audience",
+	"X-Token-Audience",
+	"X-Initiating-Subject-Id",
+	"X-On-Behalf-Of",
 }
 
 const (

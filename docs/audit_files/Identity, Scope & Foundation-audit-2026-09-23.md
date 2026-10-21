@@ -2473,3 +2473,42 @@ assignment failed to resolve; its openapi.yaml was not valid OpenAPI (duplicate 
 
 Still open from the register's group A: S6-1/S6-2 (search-indexer Dockerfile and `EnsureIndex`), S7-2…S7-6
 (notification test/DLP items), S5-1 (GTRM on Windows) — none of them touch authorization.
+
+# gateway-auth-svc cross-check and fixes, 13 October 2026
+
+A fresh cross-check of gateway-auth-svc against its open register rows, plus what
+authorization-svc's register (A-01, A-03) and its 13 Oct step-up fix need from the edge.
+Uncommitted.
+
+**Verification:**
+- **Unit:** unit suites of gateway-auth-svc, the GTRM compiler, identity-context-svc and
+  tenant-entity-registry-svc.
+- **Mutation check:** the edge-contract test catches a header dropped from compose.
+- **Live, compose (target services and their dependencies only):** gateway
+  `scripts/audit.sh` **57 / 57**, plus a separate probe of the new headers and the mTLS
+  listeners.
+
+## Fixed
+
+| ID | Gap | Fix | Proof |
+|---|---|---|---|
+| G-1 / S1-B1 | The edge passed the client's `X-Source-Channel` through, although identity-context-svc puts a verified channel on the envelope. | The gateway reads `source_channel` from the signed envelope and stamps it (`X-Source-Channel-Basis: verified`). With no claim, the caller's value is passed on, labelled `asserted`. `X-Source-Channel` is now in `authResponseHeaders`, but not edge-stripped, so `/verify` still sees the caller's value. | unit; live (human login → `asserted`, see R-1) |
+| G-2 (new) | **Through the edge, a client could write the assurance and subject headers authorization-svc trusts.** `X-Authn-Age-Seconds: 1` passed the step-up added on 13 Oct; `X-Audience` passed the workload audience check; `X-On-Behalf-Of` / `X-Initiating-Subject-Id` named the initiating subject; `X-Assurance-Level` was free text. | All of them are now stripped at the edge (GTRM `gtrm-edge-strip`) and by ForwardAuth (compose and GTRM `authResponseHeaders`). `X-Assurance-Level` is set from `session_trust_posture.mfa_verified` (`MFA` / `SINGLE_FACTOR`). `X-Authn-Age-Seconds` is never set: the envelope `iat` is when the envelope was minted, not when the user logged in. | unit; GTRM compiler tests; live (forged values replaced or dropped) |
+| G-3 (new) | The verified support context on the envelope never reached backends: the edge only stripped the header. | `X-Support-Context-Id` is set from the envelope claim; a client copy is still stripped. | unit |
+| S5-B1 / SEC-INV-05 | Peers had no mTLS listener, so the gateway's mTLS client stayed off. | New `internal/mtlslistener` (the same file in both peers): a `:8449` mTLS listener on the same router. Its certificate comes from mtls-management-svc through the bootstrap path, provisioned in the background with retry (so mtls-management-svc being down never stops the plaintext listener) and renewed at 2/3 of its life. `MTLS_ALLOWED_CLIENTS` allow-lists callers, and `X-Workload-Id` is set to the verified CN. Compose turns on both listeners and the gateway's `IDENTITY_JWKS_MTLS_ENABLED` / `TENANT_REGISTRY_MTLS_ENABLED`. The gateway's JWKS URL is now `identity-context-svc:8449` (the DNS name on the certificate; `identity-svc` fails hostname verification). | unit (retry, allow-list 403, rogue CA refused); live: both listeners serving, gateway readyz green over mTLS, a no-certificate call refused at the handshake, `/verify` 200 |
+
+`openapi.yaml` documents the four new response headers (validated with `openapi_spec_validator`).
+
+## Not fixable in gateway-auth-svc (what each one needs)
+
+| ID | Issue | Needs |
+|---|---|---|
+| R-1 (S1-B1 remainder) | A **human** login never gets a verified channel. `/v1/authenticate` issues IdP tokens with no `azp`, so identity-context-svc's `IDP_CLIENT_CHANNELS` mapping has nothing to match. Service accounts and API clients get a server-derived channel; humans stay `asserted`. | identity-context-svc: an authenticated client at login (an OIDC client or external IdP that sets `azp`), then `IDP_CLIENT_CHANNELS="<console-client>=web,…"`. |
+| R-2 (A-03 remainder) | The gateway can state assurance but not **how recently** the user authenticated: there is no `auth_time` claim, and `mfa_verified` is always false (no second factor exists). authorization-svc's step-up therefore stays at `AUTHZ_STEP_UP_UNKNOWN_AGE=permit` in compose. | identity-context-svc: an `auth_time` claim carried from the login, then the gateway forwards `X-Authn-Age-Seconds` and compose switches to `step_up`. An MFA factor for `MFA`. |
+| R-3 (A-01) | Backends still trust `X-Principal-Id` / `X-Tenant-Id`. The edge makes those authoritative for traffic through Traefik, but a call that reaches a service directly (console server calls, S5-B2) is not covered. The signed envelope already travels in `Authorization` to every backend. | Each consuming service (first authorization-svc) verifies the bearer against identity-context-svc's JWKS instead of trusting the headers. Service-to-service admin calls (e.g. access-control-svc → authorization-svc) must forward the user's bearer first. Cross-service change with a rollout mode. |
+| S5-B2 | Console → service calls bypass ForwardAuth. | Frontend: route through the edge, or R-3. |
+| S4-B1 | A client certificate for the edge → service hop. | Traefik `serversTransport` certificates from mtls-management-svc (infrastructure); gateway-auth-svc is not in the data path. |
+| S3-D1 | Should `X-Commercial-Plan` / `X-Org-Unit-Id` be edge-set or caller assertions? | Spec decision; then the edge sets them from COM. |
+| S5-D1–D3 | WAF/DDoS/rate limits; CARTA fail-open; real client IP behind the GCP LB. | Platform / security decisions. |
+| M-01 (via mtls-management-svc) | Any bootstrap-token holder can mint a certificate for any CN, which weakens the `MTLS_ALLOWED_CLIENTS` allow-lists. | mtls-management-svc: per-service enrolment. |
+

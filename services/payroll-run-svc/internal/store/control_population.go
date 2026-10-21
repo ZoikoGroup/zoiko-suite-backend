@@ -127,7 +127,10 @@ func (s *PgStore) ControlPopulation(ctx context.Context, q domain.ControlPopulat
 	case domain.PopulationPayrollRuns:
 		scope, digest = payrollRunsScope, payrollRunsDigest
 	default:
-		return nil, errors.New("unsupported control population")
+		var ok bool
+		if scope, digest, ok = wfpScope(q.Population); !ok {
+			return nil, errors.New("unsupported control population")
+		}
 	}
 
 	page := &domain.ControlPopulationPage{
@@ -171,10 +174,13 @@ func (s *PgStore) ControlPopulation(ctx context.Context, q domain.ControlPopulat
 		}
 		pageArgs := append(append([]any{}, args...), after, q.Limit+1)
 
-		if q.Population == domain.PopulationPaySlips {
+		switch q.Population {
+		case domain.PopulationPaySlips:
 			return scanPaySlips(ctx, tx, scope, pageArgs, page)
+		case domain.PopulationPayrollRuns:
+			return scanPayrollRuns(ctx, tx, scope, pageArgs, page)
 		}
-		return scanPayrollRuns(ctx, tx, scope, pageArgs, page)
+		return scanWFPPopulation(ctx, tx, scope, pageArgs, page)
 	})
 	if err != nil {
 		return nil, err

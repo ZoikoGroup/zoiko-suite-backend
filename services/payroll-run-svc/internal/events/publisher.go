@@ -58,78 +58,19 @@ func NewPublisher(log *zap.Logger, topic string, producer MessageWriter) *Publis
 // requirePrincipal() — domain.PayrollRun has no InitiatedBy/CalculatedBy/
 // etc. field of its own, so this is the only real source for it.
 func (p *Publisher) PublishRunInitiated(ctx context.Context, correlationID, actorID string, r domain.PayrollRun) {
-	p.emit(ctx, "payroll.run.initiated", correlationID, actorID, r.RunID, r.TenantID, r.LegalEntityID, map[string]any{
-		"run_id":                    r.RunID,
-		"tenant_id":                 r.TenantID,
-		"legal_entity_id":           r.LegalEntityID,
-		"run_number":                r.RunNumber,
-		"pay_period_start":          r.PayPeriodStart,
-		"pay_period_end":            r.PayPeriodEnd,
-		"pay_date":                  r.PayDate,
-		"is_shadow_run":             r.IsShadowRun,
-		"status":                    r.Status,
-		"initiated_at":              r.CreatedAt,
-		"total_employer_contributions": r.TotalEmployerContributions,
-		"total_employee_contributions": r.TotalEmployeeContributions,
-		"batch_id":                  r.BatchID,
-	})
+	p.emit(ctx, RunInitiated, correlationID, actorID, r.RunID, r.TenantID, r.LegalEntityID, runPayload(RunInitiated, r, ""))
 }
 
 func (p *Publisher) PublishRunCalculated(ctx context.Context, correlationID, actorID string, r domain.PayrollRun) {
-	p.emit(ctx, "payroll.run.calculated", correlationID, actorID, r.RunID, r.TenantID, r.LegalEntityID, map[string]any{
-		"run_id":                      r.RunID,
-		"tenant_id":                   r.TenantID,
-		"legal_entity_id":             r.LegalEntityID,
-		"run_number":                  r.RunNumber,
-		"total_gross_pay":             r.TotalGrossPay,
-		"total_net_pay":               r.TotalNetPay,
-		"total_tax_deductions":        r.TotalTaxDeductions,
-		"total_employer_contributions": r.TotalEmployerContributions,
-		"total_employee_contributions": r.TotalEmployeeContributions,
-		"total_tds":                   r.TotalTDS,
-		"total_pf":                    r.TotalPF,
-		"total_esi":                   r.TotalESI,
-		"total_pt":                    r.TotalPT,
-		"employee_count":              r.EmployeeCount,
-		"is_shadow_run":               r.IsShadowRun,
-		"calculated_at":               r.UpdatedAt,
-	})
+	p.emit(ctx, RunCalculated, correlationID, actorID, r.RunID, r.TenantID, r.LegalEntityID, runPayload(RunCalculated, r, ""))
 }
 
 func (p *Publisher) PublishRunCompleted(ctx context.Context, correlationID, actorID string, r domain.PayrollRun) {
-	p.emit(ctx, "payroll.run.completed", correlationID, actorID, r.RunID, r.TenantID, r.LegalEntityID, map[string]any{
-		"run_id":                      r.RunID,
-		"tenant_id":                   r.TenantID,
-		"legal_entity_id":             r.LegalEntityID,
-		"run_number":                  r.RunNumber,
-		"total_gross_pay":             r.TotalGrossPay,
-		"total_net_pay":               r.TotalNetPay,
-		"total_tax_deductions":        r.TotalTaxDeductions,
-		"total_employer_contributions": r.TotalEmployerContributions,
-		"total_employee_contributions": r.TotalEmployeeContributions,
-		"total_tds":                   r.TotalTDS,
-		"total_pf":                    r.TotalPF,
-		"total_esi":                   r.TotalESI,
-		"total_pt":                    r.TotalPT,
-		"employee_count":              r.EmployeeCount,
-		"is_shadow_run":               r.IsShadowRun,
-		"finalized_at":                r.FinalizedAt,
-		"governance_decision_id":      r.GovernanceDecisionID,
-		"snapshot_hash":               r.SnapshotHash,
-		"approved_by":                 r.ApprovedBy,
-		"approved_at":                 r.ApprovedAt,
-	})
+	p.emit(ctx, RunCompleted, correlationID, actorID, r.RunID, r.TenantID, r.LegalEntityID, runPayload(RunCompleted, r, ""))
 }
 
 func (p *Publisher) PublishRunBlocked(ctx context.Context, correlationID, actorID string, r domain.PayrollRun, reason string) {
-	p.emit(ctx, "payroll.run.blocked", correlationID, actorID, r.RunID, r.TenantID, r.LegalEntityID, map[string]any{
-		"run_id":          r.RunID,
-		"tenant_id":       r.TenantID,
-		"legal_entity_id": r.LegalEntityID,
-		"run_number":      r.RunNumber,
-		"block_reason":    reason,
-		"blocked_at":      time.Now().UTC(),
-	})
+	p.emit(ctx, RunBlocked, correlationID, actorID, r.RunID, r.TenantID, r.LegalEntityID, runPayload(RunBlocked, r, reason))
 }
 
 func (p *Publisher) emit(ctx context.Context, eventType, correlationID, actorID, key, tenantID, legalEntityID string, payload map[string]any) {

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"sync"
 	"time"
@@ -17,6 +18,10 @@ import (
 var (
 	ErrAuthzServiceUnavailable = errors.New("authorization-svc unavailable")
 	ErrAuthorizationDenied     = errors.New("authorization denied")
+	// ErrAuthorizationRejected: authorization-svc refused to evaluate the
+	// question as asked (400) — a malformed legal_entity_id, say. Not an
+	// outage, and not cached: nothing was decided.
+	ErrAuthorizationRejected = errors.New("authorization request rejected")
 )
 
 // decisionCacheTTL bounds how long a GRANTED/DENIED decision from
@@ -37,6 +42,10 @@ var (
 // transient outage into a standing permit-or-deny for every subsequent
 // caller on this instance, which defeats fail-closed.
 const decisionCacheTTL = 5 * time.Second
+
+// errRefusedUncached marks a denial that must not be cached (see the 403 case
+// in checkAllowedLive).
+var errRefusedUncached = errors.New("refused before evaluation")
 
 type cachedDecision struct {
 	deniedErr error
@@ -72,11 +81,19 @@ func NewClientWithHTTPClient(baseURL string, httpClient *http.Client) *Client {
 	}
 }
 
-// Authorize is a legacy no-op stub retained for backward compatibility.
-// It is not used by any handler; CheckAllowed enforces the real fail-closed
-// authorization contract and should be used for all write actions.
+// CheckAllowed asks authorization-svc whether principalID may perform
+// actionType within legalEntityID, failing closed: nil only on GRANTED.
 func (c *Client) CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error {
-	key := principalID + "|" + legalEntityID + "|" + actionType
+	// The tenant is part of the question authorization-svc answers (it
+	// refuses an entity outside the forwarded tenant), so it is part of the
+	// key. It was not: a GRANTED for tenant A was replayed, for up to the TTL,
+	// to the same principal/entity/action asked under tenant B — found live
+	// on 13 Oct 2026, where a wrong-tenant listing answered 200.
+	tenantID := ""
+	if env, ok := svcenvelope.FromContext(ctx); ok {
+		tenantID = env.TenantID
+	}
+	key := tenantID + "|" + principalID + "|" + legalEntityID + "|" + actionType
 
 	if decision, hit := c.lookupCache(key); hit {
 		return decision
@@ -84,7 +101,7 @@ func (c *Client) CheckAllowed(ctx context.Context, principalID, legalEntityID, a
 
 	err := c.checkAllowedLive(ctx, principalID, legalEntityID, actionType)
 
-	if err == nil || errors.Is(err, ErrAuthorizationDenied) {
+	if err == nil || (errors.Is(err, ErrAuthorizationDenied) && !errors.Is(err, errRefusedUncached)) {
 		c.storeCache(key, err)
 	}
 
@@ -187,7 +204,22 @@ func (c *Client) checkAllowedLive(ctx context.Context, principalID, legalEntityI
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
+	switch resp.StatusCode {
+	case http.StatusOK:
+	case http.StatusForbidden:
+		// authorization-svc refuses some questions before evaluating them —
+		// tenant_scope_mismatch (the entity is another tenant's),
+		// tenant_required, a principal it has suspended at the gate. Those
+		// are denials. They used to be reported as 503 "authorization service
+		// unavailable", so a wrong-tenant request looked like an outage.
+		// Not cached: the refusal is about this request's scope, and a later
+		// projection or registry answer can change it.
+		return fmt.Errorf("%w: %w", ErrAuthorizationDenied, errRefusedUncached)
+	case http.StatusBadRequest:
+		return ErrAuthorizationRejected
+	default:
+		// 401 (this service's workload identity refused), 5xx and anything
+		// else: no decision was made. Fail closed.
 		return ErrAuthzServiceUnavailable
 	}
 

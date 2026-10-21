@@ -12,6 +12,7 @@ package outbox
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -57,8 +58,16 @@ func (r *Relay) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if _, err := r.RelayOnce(ctx); err != nil && ctx.Err() == nil {
-				r.log.Error("outbox relay pass failed", zap.Error(err))
+			// A full batch means more are waiting: drain without waiting a
+			// tick, so a backlog clears at Kafka speed, not batchSize/second.
+			for {
+				n, err := r.RelayOnce(ctx)
+				if err != nil && ctx.Err() == nil {
+					r.log.Error("outbox relay pass failed", zap.Error(err))
+				}
+				if err != nil || n < r.batchSize || ctx.Err() != nil {
+					break
+				}
 			}
 		}
 	}
@@ -79,6 +88,16 @@ type pending struct {
 }
 
 // RelayOnce publishes one batch and reports how many rows it published.
+//
+// ONE WriteMessages call per batch (Governance audit N-04, 13 Oct 2026). It
+// used to write row by row, and kafka-go flushes an incomplete batch only
+// after Writer.BatchTimeout (1s by default), so every row cost a second: the
+// relay drained about one event per second while every authorization decision
+// added one, and the IAM, session and SoD events the 000026/000029/000030
+// triggers write queued behind them — a revocation reached downstream services
+// as late as the backlog was long, while this transaction held the claimed
+// rows' locks. A partial failure comes back as kafka.WriteErrors, one entry
+// per message, so only the rows that failed stay pending.
 func (r *Relay) RelayOnce(ctx context.Context) (int, error) {
 	tx, err := r.db.Begin(ctx)
 	if err != nil {
@@ -103,29 +122,66 @@ func (r *Relay) RelayOnce(ctx context.Context) (int, error) {
 	if err := rows.Err(); err != nil {
 		return 0, err
 	}
+	if len(batch) == 0 {
+		return 0, nil
+	}
 
-	published := 0
-	for _, p := range batch {
-		if werr := r.writer.WriteMessages(ctx, kafka.Message{Key: []byte(p.key), Value: p.value}); werr != nil {
-			r.log.Error("outbox relay: publish failed — row stays pending",
-				zap.String("outbox_event_id", p.id),
-				zap.String("event_type", p.eventType),
-				zap.Int("attempts", p.attempts+1),
-				zap.Error(werr))
-			if _, err := tx.Exec(ctx,
-				`UPDATE outbox_events SET publish_attempts = publish_attempts + 1, last_error = $2 WHERE outbox_event_id = $1`,
-				p.id, werr.Error()); err != nil {
-				return published, err
+	msgs := make([]kafka.Message, len(batch))
+	for i, p := range batch {
+		msgs[i] = kafka.Message{Key: []byte(p.key), Value: p.value}
+	}
+	failed := make([]error, len(batch))
+	wholeBatch := false
+	if werr := r.writer.WriteMessages(ctx, msgs...); werr != nil {
+		var perMessage kafka.WriteErrors
+		if errors.As(werr, &perMessage) && len(perMessage) == len(batch) {
+			copy(failed, perMessage)
+		} else {
+			wholeBatch = true
+			for i := range failed {
+				failed[i] = werr
 			}
+			// One line for the batch, not one per row: during a broker outage
+			// the per-row lines were thousands a minute.
+			r.log.Error("outbox relay: publish failed for the whole batch — rows stay pending",
+				zap.Int("rows", len(batch)), zap.Int("oldest_attempts", batch[0].attempts+1), zap.Error(werr))
+		}
+	}
+
+	var publishedIDs, failedIDs []string
+	lastErr := ""
+	for i, p := range batch {
+		if failed[i] == nil {
+			publishedIDs = append(publishedIDs, p.id)
 			continue
 		}
-		if _, err := tx.Exec(ctx, `UPDATE outbox_events SET published_at = NOW() WHERE outbox_event_id = $1`, p.id); err != nil {
-			return published, err
+		failedIDs = append(failedIDs, p.id)
+		lastErr = failed[i].Error()
+		if wholeBatch {
+			continue
 		}
-		published++
+		r.log.Error("outbox relay: publish failed — row stays pending",
+			zap.String("outbox_event_id", p.id),
+			zap.String("event_type", p.eventType),
+			zap.Int("attempts", p.attempts+1),
+			zap.Error(failed[i]))
+	}
+	if len(publishedIDs) > 0 {
+		if _, err := tx.Exec(ctx,
+			`UPDATE outbox_events SET published_at = NOW() WHERE outbox_event_id = ANY($1::uuid[])`,
+			publishedIDs); err != nil {
+			return 0, err
+		}
+	}
+	if len(failedIDs) > 0 {
+		if _, err := tx.Exec(ctx,
+			`UPDATE outbox_events SET publish_attempts = publish_attempts + 1, last_error = $2 WHERE outbox_event_id = ANY($1::uuid[])`,
+			failedIDs, lastErr); err != nil {
+			return 0, err
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return 0, err
 	}
-	return published, nil
+	return len(publishedIDs), nil
 }

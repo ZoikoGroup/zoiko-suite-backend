@@ -1,0 +1,369 @@
+openapi: 3.0.3
+info:
+  title: Governance Decision Log Service
+  version: 1.1.0
+  description: |
+    The append-only ledger of governance decisions (Doc 03 §8.7). Every
+    decision is tenant-owned, immutable once written, and queryable by actor,
+    entity, action, rule basis and time range.
+
+    **Envelope.** Every request carries the canonical service input envelope
+    (ZS-ARCH-SVC-001 v2.0 §4). Writes (POST) are refused with 400
+    `envelope_incomplete` unless all of these are present: `X-Tenant-Id`,
+    `X-Principal-Id` (or `X-Workload-Id`), `X-Request-Id`, `X-Correlation-ID`,
+    `X-Source-Channel`, `Idempotency-Key`, `X-Legal-Entity-Id`,
+    `X-Purpose-Context` (plus `X-Source-System` when the channel is `import` or
+    `integration`). Every error, envelope refusals included, is RFC 9457
+    `application/problem+json` with a GCP §16-style class in `type`
+    (`ENVELOPE_INCOMPLETE` / `UNAUTHORIZED` for a refusal, which also keeps the
+    platform's `error`, `service` and `violations` members).
+
+    **Authorization.** Writes need `GOVERNANCE_DECISION_RECORD` on the
+    decision's legal entity; replays need `GOVERNANCE_DECISION_REPLAY` on the
+    decision's legal entity; reads need `GOVERNANCE_DECISION_READ` on the
+    legal entity the data belongs to (the decision's, or the `entity` filter),
+    or on the platform scope, which is the tenant-wide reader and the only
+    scope for an unfiltered list. An unknown `decision_id` answers 404 only to
+    a tenant-wide reader and 403 to anyone else. All fail closed (403 on deny,
+    503 when authorization-svc is unreachable). A deployment may run reads in the
+    `DECISION_LOG_READ_AUTHZ=warn` migration mode, which logs rather than
+    refuses an unauthorized read.
+
+    **Events.** A newly recorded decision publishes
+    `governance.decision.recorded`, and a new replay manifest publishes
+    `governance.decision.replayed`, each through a transactional outbox keyed
+    by `decision_id`. Both envelopes carry the request's jurisdiction context.
+servers:
+  - url: http://governance-decision-log-svc:8083
+tags:
+  - name: decisions
+  - name: replay
+paths:
+  /v1/decisions:
+    post:
+      tags: [decisions]
+      operationId: recordDecision
+      summary: Record a governance decision
+      description: |
+        Idempotent two ways. The same `Idempotency-Key` with the same request
+        replays the stored decision (200); with a different request it is 409
+        `IDEMPOTENCY_MISMATCH`. "Request" is the body together with the
+        principal, correlation id, jurisdiction context and legal entity, so
+        the same body from another principal or under another jurisdiction is
+        a different request. Every field is checked against its stored width
+        and answered 400 `Value Too Long` rather than reaching the database. A `decision_id` this tenant already recorded
+        answers 200 with the stored row when the content matches and 409
+        `DECISION_ID_CONFLICT` when it does not. `actor_id` is always the
+        authenticated `X-Principal-Id`; a body value is ignored.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateDecisionRequest'
+      responses:
+        '201':
+          description: Recorded for the first time.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GovernanceDecision'
+        '200':
+          description: Replay of a decision already recorded; the body is the stored row.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GovernanceDecision'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+    get:
+      tags: [decisions]
+      operationId: listDecisions
+      summary: Query decisions (newest first)
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - {name: actor, in: query, schema: {type: string}, description: actor_id}
+        - {name: entity, in: query, schema: {type: string}, description: legal_entity_id}
+        - {name: action, in: query, schema: {type: string}, description: action_type}
+        - {name: rule_basis, in: query, schema: {type: string}}
+        - {name: from, in: query, schema: {type: string, format: date-time}, description: 'decided_at lower bound (inclusive)'}
+        - {name: to, in: query, schema: {type: string, format: date-time}, description: 'decided_at upper bound (inclusive)'}
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, default: 50}, description: Values above 200 are capped to 200.}
+        - {name: offset, in: query, schema: {type: integer, minimum: 0, default: 0}}
+      responses:
+        '200':
+          description: Matching decisions (possibly empty).
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/GovernanceDecision'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /v1/decisions/{decision_id}:
+    get:
+      tags: [decisions]
+      operationId: getDecision
+      summary: Read one decision
+      description: Another tenant's decision is indistinguishable from a missing one (404).
+      parameters:
+        - $ref: '#/components/parameters/DecisionId'
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+      responses:
+        '200':
+          description: The decision.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GovernanceDecision'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /v1/decisions/{decision_id}/replay:
+    post:
+      tags: [replay]
+      operationId: replayDecision
+      summary: Re-evaluate a decision against the exact policy version it used
+      description: |
+        GCP §2 invariant #11 (reproducibility). Records a permanent replay
+        manifest stating whether the outcome reproduced. Idempotent on
+        `Idempotency-Key`: a retry returns the first manifest (200) without
+        re-evaluating. Only `action_type=APPROVAL_THRESHOLD` has replay logic
+        (501 otherwise).
+      parameters:
+        - $ref: '#/components/parameters/DecisionId'
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                correlation_id: {type: string}
+      responses:
+        '201':
+          description: Replay performed and manifest recorded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReplayManifest'
+        '200':
+          description: Retry of a replay already recorded under this key.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReplayManifest'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '501':
+          description: Replay not implemented for this decision's action_type.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /v1/decisions/{decision_id}/replay-manifests:
+    get:
+      tags: [replay]
+      operationId: listReplayManifests
+      summary: Replay history of one decision (newest first)
+      parameters:
+        - $ref: '#/components/parameters/DecisionId'
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+      responses:
+        '200':
+          description: Manifests (possibly empty), scoped to the caller's tenant.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ReplayManifest'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+components:
+  parameters:
+    TenantId:
+      name: X-Tenant-Id
+      in: header
+      required: true
+      schema: {type: string}
+    PrincipalId:
+      name: X-Principal-Id
+      in: header
+      required: true
+      schema: {type: string}
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: {type: string, maxLength: 256}
+    CorrelationId:
+      name: X-Correlation-ID
+      in: header
+      required: false
+      description: When the body also carries correlation_id the two must match (400 CORRELATION_MISMATCH).
+      schema: {type: string}
+    DecisionId:
+      name: decision_id
+      in: path
+      required: true
+      schema: {type: string, maxLength: 64}
+  schemas:
+    CreateDecisionRequest:
+      type: object
+      required: [decision_id, action_type, outcome, rule_basis]
+      properties:
+        decision_id: {type: string, maxLength: 64, description: Caller-supplied; unique within the tenant.}
+        tenant_id: {type: string, description: Optional; must equal X-Tenant-Id (403 otherwise).}
+        legal_entity_id: {type: string, maxLength: 64, description: 'A UUID, or the PLATFORM sentinel. Defaults to X-Legal-Entity-Id; when both are sent they must match (400 LEGAL_ENTITY_MISMATCH).'}
+        action_type: {type: string, maxLength: 128}
+        outcome: {type: string, maxLength: 32, description: 'Data-driven vocabulary, e.g. GRANTED, DENIED, ESCALATED.'}
+        rule_basis: {type: string, maxLength: 256}
+        jurisdiction_context: {type: string, description: 'Defaults to X-Jurisdiction-Context; when both are sent they must match (400 JURISDICTION_MISMATCH).'}
+        policy_version_id: {type: string, description: 'Derived from a "code:<uuid>" rule_basis when omitted.'}
+        action_subject_type: {type: string}
+        action_subject_id: {type: string}
+        evaluation_context: {type: object, additionalProperties: true}
+        correlation_id: {type: string, description: Defaults to X-Correlation-ID.}
+        workflow_instance_id: {type: string}
+        causation_id: {type: string}
+        decided_at:
+          type: string
+          format: date-time
+          description: Defaults to receipt time. At most 5 minutes ahead of the server clock and not before 2020-01-01.
+    GovernanceDecision:
+      type: object
+      required: [decision_id, tenant_id, legal_entity_id, actor_id, action_type, outcome, rule_basis, correlation_id, decided_at, recorded_at]
+      properties:
+        decision_id: {type: string}
+        tenant_id: {type: string}
+        legal_entity_id: {type: string}
+        actor_id: {type: string, description: The authenticated principal that recorded the decision.}
+        action_type: {type: string}
+        outcome: {type: string}
+        rule_basis: {type: string}
+        jurisdiction_context: {type: string, description: 'Defaults to X-Jurisdiction-Context; when both are sent they must match (400 JURISDICTION_MISMATCH).'}
+        policy_version_id: {type: string}
+        evaluation_context: {type: object, additionalProperties: true}
+        correlation_id: {type: string}
+        workflow_instance_id: {type: string}
+        causation_id: {type: string}
+        action_subject_type: {type: string}
+        action_subject_id: {type: string}
+        decided_at: {type: string, format: date-time, description: When the decision was made upstream (caller's claim).}
+        recorded_at: {type: string, format: date-time, description: When this service stored it (server-assigned).}
+    ReplayManifest:
+      type: object
+      required: [replay_manifest_id, decision_id, policy_version_id, replayed_outcome, original_outcome, outcomes_match, replayed_at, replayed_by_principal_id, tenant_id]
+      properties:
+        replay_manifest_id: {type: string, format: uuid}
+        decision_id: {type: string}
+        policy_version_id: {type: string}
+        replayed_outcome: {type: string}
+        original_outcome: {type: string}
+        outcomes_match: {type: boolean}
+        replay_notes: {type: string}
+        replayed_at: {type: string, format: date-time}
+        replayed_by_principal_id: {type: string, description: The authenticated caller who ran the replay.}
+        tenant_id: {type: string}
+    Problem:
+      type: object
+      required: [title, status]
+      properties:
+        type: {type: string, description: 'Stable error class, e.g. IDEMPOTENCY_MISMATCH, AUTHORIZATION_DENIED.'}
+        title: {type: string}
+        status: {type: integer}
+        detail: {type: string}
+        instance: {type: string}
+        error: {type: string, description: 'Envelope refusals only: envelope_incomplete.'}
+        service: {type: string, description: 'Envelope refusals only.'}
+        violations: {type: array, items: {type: object}, description: 'Envelope refusals only: one entry per missing or invalid envelope field.'}
+  responses:
+    BadRequest:
+      description: Invalid input, or (on writes) an incomplete envelope.
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    Unauthorized:
+      description: Missing X-Principal-Id or X-Tenant-Id.
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    Forbidden:
+      description: Tenant scope mismatch or AUTHORIZATION_DENIED.
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    NotFound:
+      description: No such decision in the caller's tenant, or its policy version is gone.
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    Conflict:
+      description: IDEMPOTENCY_MISMATCH or DECISION_ID_CONFLICT.
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    PayloadTooLarge:
+      description: Body over 256 KiB.
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    Unavailable:
+      description: Store, authorization-svc or policy-svc unavailable.
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}

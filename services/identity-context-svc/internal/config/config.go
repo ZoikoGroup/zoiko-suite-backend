@@ -14,6 +14,16 @@ import (
 type Config struct {
 	Port int
 
+	// MTLS* enable the mutual-TLS listener gateway-auth-svc's mTLS client
+	// calls (SEC-INV-05; Group 1 register S5-B1). Off unless MTLS_ENABLED.
+	MTLSEnabled            bool
+	MTLSPort               int
+	MTLSManagementURL      string
+	MTLSBootstrapTokenPath string
+	// MTLSAllowedClients lists the client certificate CNs admitted on the
+	// mTLS listener; empty admits any certificate the platform CA issued.
+	MTLSAllowedClients []string
+
 	// JWT envelope signing (Q2 — signed short-lived JWT)
 	// Production: RS256 via KMS-backed keypair through Secret Vault Integration Service.
 	JWTSigningPrivateKeyPath string
@@ -460,6 +470,19 @@ func Load() (*Config, error) {
 
 	if len(cfg.Kafka.ConsumeTopics) == 0 {
 		cfg.Kafka.ConsumeTopics = append([]string(nil), DefaultConsumeTopics...)
+	}
+
+	cfg.MTLSEnabled = envBool("MTLS_ENABLED", false)
+	cfg.MTLSPort = envInt("MTLS_PORT", 8449)
+	cfg.MTLSManagementURL = env("MTLS_MANAGEMENT_SERVICE_URL", "")
+	cfg.MTLSBootstrapTokenPath = env("MTLS_BOOTSTRAP_TOKEN_PATH", "")
+	for _, s := range strings.Split(env("MTLS_ALLOWED_CLIENTS", ""), ",") {
+		if s = strings.TrimSpace(s); s != "" {
+			cfg.MTLSAllowedClients = append(cfg.MTLSAllowedClients, s)
+		}
+	}
+	if cfg.MTLSEnabled && cfg.MTLSManagementURL == "" {
+		return nil, fmt.Errorf("MTLS_ENABLED=true needs MTLS_MANAGEMENT_SERVICE_URL: the listener's certificate comes from mtls-management-svc")
 	}
 
 	return cfg, nil

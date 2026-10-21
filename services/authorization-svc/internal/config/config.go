@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -42,6 +43,15 @@ type Config struct {
 	// fail, since this service has no principal at startup) — MTLSEnabled
 	// should not be turned on without this also being set.
 	MTLSBootstrapTokenPath string
+	// MTLSRevocationCheck is "require" (default) or "off": whether the mTLS
+	// listener refuses client certificates on mtls-management-svc's CRL, and
+	// refuses every client certificate while it holds no current CRL
+	// (register M-03). "off" is accepted only with ENV=local.
+	MTLSRevocationCheck string
+	// MTLSCRLURL is where the CRL is fetched (default: the management
+	// service's /v1/mtls/crl); MTLSCRLRefreshSeconds how often.
+	MTLSCRLURL            string
+	MTLSCRLRefreshSeconds int
 
 	// SIEMServiceURL is siem-integration-svc. Empty disables streaming —
 	// see internal/siem's doc comment.
@@ -93,6 +103,12 @@ type Config struct {
 	RetentionSweepInterval        time.Duration
 	PartitionMonthsAhead          int
 
+	// OutboxRetention / IdempotencyRetention: how long the retention sweep
+	// keeps a published outbox row and an Idempotency-Key record (000031,
+	// Governance audit N-14). 0 keeps them forever, the old behaviour.
+	OutboxRetention      time.Duration
+	IdempotencyRetention time.Duration
+
 	// EnforceTenantOnAuthorize controls whether /v1/authorize requires a tenant
 	// scope (via X-Tenant-Id header or tenant_id in body). When false (default),
 	// tenantless requests are allowed but logged with a warning — they are
@@ -102,14 +118,99 @@ type Config struct {
 	// set to true.
 	EnforceTenantOnAuthorize bool
 
+	// EntityRegistryURL is tenant-entity-registry-svc. /v1/authorize asks it
+	// whether an entity the projection has not heard of is in the claimed
+	// tenant (or, with no claim, in one the principal holds authority in), so
+	// no evaluation is scoped by an unverified tenant or run across tenants.
+	// Empty disables the check and keeps the projection-only behaviour.
+	EntityRegistryURL string
+
 	// CommandContractEnforce refuses a privileged or destructive admin
 	// command without purpose / reason_code, and a delegation without an end
 	// date (Governance Control Plane §16; ZS-IAM-001 §11). False is the
 	// migration state: such commands are admitted, marked
 	// X-Command-Contract: violated and logged, and an open-ended delegation
-	// is bounded to the default term. Set AUTHZ_COMMAND_CONTRACT=enforce once
-	// the console and access-control-svc send the fields.
+	// is bounded to the default term. Enforce is the default since 12 Oct
+	// 2026, when the console and access-control-svc both send the fields;
+	// AUTHZ_COMMAND_CONTRACT=warn is the explicit, logged way back.
 	CommandContractEnforce bool
+
+	// EvaluationMTLS is "require" or "permit" (internal/workload.Mode): whether
+	// an evaluation call (/v1/authorize, /internal/*, the SoD / entity-scope /
+	// delegated-access evaluators) must arrive with a verified client
+	// certificate. Defaults to require everywhere except ENV=local, so a
+	// deployment has to opt OUT of the check rather than into it
+	// (Governance audit register A-02). AUTHZ_EVALUATION_MTLS overrides.
+	EvaluationMTLS string
+
+	// PEPAllowList names the services (client certificate CN, which
+	// mtls-management-svc sets to service_name) allowed to call the
+	// evaluation endpoints. Required in require mode; in permit mode an empty
+	// list admits any certificate the platform CA issued.
+	PEPAllowList []string
+
+	// StepUp* are the server's step-up policy (Governance audit N-07; see
+	// handler.StepUpPolicy). StepUpActions adds exact action names to the
+	// built-in "reopen" set; StepUpMaxAuthnAgeSeconds is the oldest
+	// authentication a step-up action accepts; StepUpUnknownAge is "step_up"
+	// (default: an unstated age is not recent) or "permit" (the old reading,
+	// for a deployment whose PEPs cannot forward an age yet — register A-03).
+	StepUpActions            []string
+	StepUpMaxAuthnAgeSeconds int
+	StepUpUnknownAge         string
+
+	// ReplicaID names this replica's cache-invalidation consumer group. Set it
+	// to something stable across restarts; empty falls back to the hostname.
+	ReplicaID string
+}
+
+// Validate refuses a configuration under which no PEP could ever be admitted,
+// or any certificate the CA issued would be. Neither is visible from outside,
+// so both stop startup instead.
+func (c *Config) Validate() error {
+	switch c.StepUpUnknownAge {
+	case "", "step_up", "permit": // "" is Load's default, step_up
+	default:
+		return fmt.Errorf("AUTHZ_STEP_UP_UNKNOWN_AGE must be \"step_up\" or \"permit\", got %q", c.StepUpUnknownAge)
+	}
+	// Outside a local stack the tenant of an entity the projection has not
+	// heard of must be checked with the registry (Governance audit N-12):
+	// without AUTHZ_ENTITY_REGISTRY_URL a claimed tenant is taken on trust for
+	// those entities and the 12 Oct cross-tenant fix silently stops applying.
+	if c.Env != "" && !strings.EqualFold(c.Env, "local") && strings.TrimSpace(c.EntityRegistryURL) == "" {
+		return fmt.Errorf("AUTHZ_ENTITY_REGISTRY_URL is required outside ENV=local: without it the tenant of an unprojected entity is not verified")
+	}
+	switch c.MTLSRevocationCheck {
+	case "", "require": // "" is Load's default, require
+	case "off":
+		if c.MTLSEnabled && !strings.EqualFold(c.Env, "local") {
+			return fmt.Errorf("MTLS_REVOCATION_CHECK=off is only allowed with ENV=local: a revoked client certificate would be admitted until it expires")
+		}
+	default:
+		return fmt.Errorf("MTLS_REVOCATION_CHECK must be \"require\" or \"off\", got %q", c.MTLSRevocationCheck)
+	}
+	switch c.EvaluationMTLS {
+	case "permit":
+		return nil
+	case "require":
+	default:
+		return fmt.Errorf("AUTHZ_EVALUATION_MTLS must be \"require\" or \"permit\", got %q", c.EvaluationMTLS)
+	}
+	if !c.MTLSEnabled {
+		return fmt.Errorf("AUTHZ_EVALUATION_MTLS=require needs MTLS_ENABLED=true: no listener could carry a client certificate")
+	}
+	if len(c.PEPAllowList) == 0 {
+		return fmt.Errorf("AUTHZ_EVALUATION_MTLS=require needs AUTHZ_PEP_ALLOWLIST: without it any certificate the platform CA issued is admitted")
+	}
+	return nil
+}
+
+// defaultEvaluationMTLS is require outside a local stack.
+func defaultEvaluationMTLS(envName string) string {
+	if strings.EqualFold(envName, "local") {
+		return "permit"
+	}
+	return "require"
 }
 
 type DBConfig struct {
@@ -258,8 +359,9 @@ type KafkaConfig struct {
 
 // Load reads configuration from environment variables.
 func Load() (*Config, error) {
+	envName := env("ENV", "local")
 	return &Config{
-		Env: env("ENV", "local"),
+		Env: envName,
 		// 8089: 8080-8088 are already taken by every other Phase 1 service
 		// built so far — see services/README.md.
 		Port: envInt("PORT", 8089),
@@ -315,6 +417,9 @@ func Load() (*Config, error) {
 		MTLSPort:                 envInt("MTLS_PORT", 8449),
 		MTLSManagementServiceURL: env("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
 		MTLSBootstrapTokenPath:   env("MTLS_BOOTSTRAP_TOKEN_PATH", ""),
+		MTLSRevocationCheck:      strings.ToLower(env("MTLS_REVOCATION_CHECK", "require")),
+		MTLSCRLURL:               env("MTLS_CRL_URL", strings.TrimRight(env("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"), "/")+"/v1/mtls/crl"),
+		MTLSCRLRefreshSeconds:    envInt("MTLS_CRL_REFRESH_SECONDS", 30),
 		SIEMServiceURL:           env("SIEM_SERVICE_URL", ""),
 		PlatformScopeEntityID:    env("AUTHZ_PLATFORM_SCOPE_ENTITY_ID", ""),
 
@@ -340,6 +445,11 @@ func Load() (*Config, error) {
 		// consecutive months before any decision lands in the default partition.
 		PartitionMonthsAhead: envInt("AUTHZ_PARTITION_MONTHS_AHEAD", 3),
 
+		// Seven days each: a published event is in Kafka, and an admin
+		// command retried a week later is a new command.
+		OutboxRetention:      time.Duration(envInt("AUTHZ_OUTBOX_RETENTION_HOURS", 168)) * time.Hour,
+		IdempotencyRetention: time.Duration(envInt("AUTHZ_IDEMPOTENCY_RETENTION_HOURS", 168)) * time.Hour,
+
 		// EnforceTenantOnAuthorize controls whether /v1/authorize requires a tenant
 		// scope (via X-Tenant-Id header or tenant_id in body). When false (default),
 		// tenantless requests are allowed but logged with a warning — they are
@@ -348,7 +458,14 @@ func Load() (*Config, error) {
 		// do not yet forward X-Tenant-Id; once they are all migrated, this should be
 		// set to true.
 		EnforceTenantOnAuthorize: envBool("AUTHZ_ENFORCE_TENANT_ON_AUTHORIZE", false),
-		CommandContractEnforce:   strings.EqualFold(env("AUTHZ_COMMAND_CONTRACT", "warn"), "enforce"),
+		CommandContractEnforce:   !strings.EqualFold(env("AUTHZ_COMMAND_CONTRACT", "enforce"), "warn"),
+		EntityRegistryURL:        env("AUTHZ_ENTITY_REGISTRY_URL", ""),
+		EvaluationMTLS:           strings.ToLower(env("AUTHZ_EVALUATION_MTLS", defaultEvaluationMTLS(envName))),
+		PEPAllowList:             splitTopics(env("AUTHZ_PEP_ALLOWLIST", "")),
+		StepUpActions:            splitTopics(env("AUTHZ_STEP_UP_ACTIONS", "")),
+		StepUpMaxAuthnAgeSeconds: envInt("AUTHZ_STEP_UP_MAX_AUTHN_AGE_SECONDS", 300),
+		StepUpUnknownAge:         strings.ToLower(env("AUTHZ_STEP_UP_UNKNOWN_AGE", "step_up")),
+		ReplicaID:                strings.TrimSpace(env("AUTHZ_REPLICA_ID", "")),
 	}, nil
 }
 

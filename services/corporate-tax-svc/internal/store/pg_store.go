@@ -61,9 +61,6 @@ func (s *PgStore) Create(ctx context.Context, r *domain.TaxReturn) error {
 	if r.Status == "" {
 		r.Status = domain.StatusDraft
 	}
-	if r.Currency == "" {
-		r.Currency = "USD"
-	}
 	r.Compute()
 
 	_, err = tx.Exec(ctx, `
@@ -108,7 +105,7 @@ func (s *PgStore) GetByID(ctx context.Context, id string) (*domain.TaxReturn, er
 		       balance_due, currency, status, submitted_at, submitted_by,
 		       assessed_tax_amount, assessment_reference, notes,
 		       effective_from, effective_to, created_by, created_at, updated_at
-		FROM corporate_tax_returns WHERE return_id = $1`, id,
+		FROM corporate_tax_returns WHERE return_id = $1 AND tenant_id = $2`, id, middleware.GetTenantID(ctx),
 	).Scan(
 		&r.ReturnID, &r.TenantID, &r.LegalEntityID, &r.JurisdictionID, &r.TaxRegistrationNumber,
 		&r.FiscalYear, &r.AccountingPeriodStart, &r.AccountingPeriodEnd,
@@ -148,12 +145,13 @@ func (s *PgStore) List(ctx context.Context, legalEntityID, jurisdictionID, statu
 		       assessed_tax_amount, assessment_reference, notes,
 		       effective_from, effective_to, created_by, created_at, updated_at
 		FROM corporate_tax_returns
-		WHERE ($1 = '' OR legal_entity_id = $1)
+		WHERE tenant_id = $5
+		  AND ($1 = '' OR legal_entity_id = $1)
 		  AND ($2 = '' OR jurisdiction_id = $2)
 		  AND ($3 = '' OR status = $3)
 		  AND ($4 = 0  OR fiscal_year = $4)
 		ORDER BY fiscal_year DESC, created_at DESC`,
-		legalEntityID, jurisdictionID, status, fiscalYear,
+		legalEntityID, jurisdictionID, status, fiscalYear, middleware.GetTenantID(ctx),
 	)
 	if err != nil {
 		return nil, err
@@ -199,10 +197,10 @@ func (s *PgStore) Update(ctx context.Context, r *domain.TaxReturn) error {
 		SET gross_revenue=$1, allowable_deductions=$2, taxable_income=$3, tax_rate_percent=$4,
 		    gross_tax_liability=$5, tax_credits=$6, net_tax_payable=$7, tax_already_paid=$8,
 		    balance_due=$9, notes=$10, effective_to=$11, updated_at=$12
-		WHERE return_id=$13`,
+		WHERE return_id=$13 AND tenant_id=$14`,
 		r.GrossRevenue, r.AllowableDeductions, r.TaxableIncome, r.TaxRatePercent,
 		r.GrossTaxLiability, r.TaxCredits, r.NetTaxPayable, r.TaxAlreadyPaid,
-		r.BalanceDue, r.Notes, r.EffectiveTo, r.UpdatedAt, r.ReturnID,
+		r.BalanceDue, r.Notes, r.EffectiveTo, r.UpdatedAt, r.ReturnID, middleware.GetTenantID(ctx),
 	)
 	if err != nil {
 		return fmt.Errorf("update corporate tax return: %w", err)
@@ -210,15 +208,10 @@ func (s *PgStore) Update(ctx context.Context, r *domain.TaxReturn) error {
 	return tx.Commit(ctx)
 }
 
+// Submit moves DRAFT -> SUBMITTED inside a single transaction with a
+// FOR UPDATE row lock, eliminating the TOCTOU race the previous
+// two-transaction design allowed.
 func (s *PgStore) Submit(ctx context.Context, id, submittedBy string) (*domain.TaxReturn, error) {
-	r, err := s.GetByID(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	if r.Status == domain.StatusSubmitted || r.Status == domain.StatusAssessed || r.Status == domain.StatusSettled {
-		return nil, domain.ErrAlreadySubmitted
-	}
-
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -226,6 +219,39 @@ func (s *PgStore) Submit(ctx context.Context, id, submittedBy string) (*domain.T
 	defer func() { _ = tx.Rollback(ctx) }()
 	if err := s.setRLS(ctx, tx); err != nil {
 		return nil, err
+	}
+
+	var r domain.TaxReturn
+	var status string
+	err = tx.QueryRow(ctx, `
+		SELECT return_id, tenant_id, legal_entity_id, jurisdiction_id, tax_registration_number,
+		       fiscal_year, accounting_period_start, accounting_period_end,
+		       gross_revenue, allowable_deductions, taxable_income, tax_rate_percent,
+		       gross_tax_liability, tax_credits, net_tax_payable, tax_already_paid,
+		       balance_due, currency, status, submitted_at, submitted_by,
+		       assessed_tax_amount, assessment_reference, notes,
+		       effective_from, effective_to, created_by, created_at, updated_at
+		FROM corporate_tax_returns WHERE return_id = $1 AND tenant_id = $2 FOR UPDATE`,
+		id, middleware.GetTenantID(ctx),
+	).Scan(
+		&r.ReturnID, &r.TenantID, &r.LegalEntityID, &r.JurisdictionID, &r.TaxRegistrationNumber,
+		&r.FiscalYear, &r.AccountingPeriodStart, &r.AccountingPeriodEnd,
+		&r.GrossRevenue, &r.AllowableDeductions, &r.TaxableIncome, &r.TaxRatePercent,
+		&r.GrossTaxLiability, &r.TaxCredits, &r.NetTaxPayable, &r.TaxAlreadyPaid,
+		&r.BalanceDue, &r.Currency, &status, &r.SubmittedAt, &r.SubmittedBy,
+		&r.AssessedTaxAmount, &r.AssessmentReference, &r.Notes,
+		&r.EffectiveFrom, &r.EffectiveTo, &r.CreatedBy, &r.CreatedAt, &r.UpdatedAt,
+	)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, domain.ErrTaxReturnNotFound
+		}
+		return nil, err
+	}
+	r.Status = domain.FilingStatus(status)
+
+	if r.Status == domain.StatusSubmitted || r.Status == domain.StatusAssessed || r.Status == domain.StatusSettled {
+		return nil, domain.ErrAlreadySubmitted
 	}
 
 	now := time.Now().UTC()
@@ -237,8 +263,8 @@ func (s *PgStore) Submit(ctx context.Context, id, submittedBy string) (*domain.T
 	_, err = tx.Exec(ctx, `
 		UPDATE corporate_tax_returns
 		SET status=$1, submitted_at=$2, submitted_by=$3, updated_at=$4
-		WHERE return_id=$5`,
-		string(r.Status), r.SubmittedAt, r.SubmittedBy, r.UpdatedAt, id,
+		WHERE return_id=$5 AND tenant_id=$6`,
+		string(r.Status), r.SubmittedAt, r.SubmittedBy, r.UpdatedAt, id, middleware.GetTenantID(ctx),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("submit corporate tax return: %w", err)
@@ -246,15 +272,13 @@ func (s *PgStore) Submit(ctx context.Context, id, submittedBy string) (*domain.T
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
-	return r, nil
+	return &r, nil
 }
 
+// Assess records a tax authority assessment inside a single transaction
+// with a FOR UPDATE row lock, eliminating the TOCTOU race and adding the
+// explicit tenant_id predicate.
 func (s *PgStore) Assess(ctx context.Context, id string, req *domain.AssessTaxReturnRequest) (*domain.TaxReturn, error) {
-	r, err := s.GetByID(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -263,6 +287,35 @@ func (s *PgStore) Assess(ctx context.Context, id string, req *domain.AssessTaxRe
 	if err := s.setRLS(ctx, tx); err != nil {
 		return nil, err
 	}
+
+	var r domain.TaxReturn
+	var status string
+	err = tx.QueryRow(ctx, `
+		SELECT return_id, tenant_id, legal_entity_id, jurisdiction_id, tax_registration_number,
+		       fiscal_year, accounting_period_start, accounting_period_end,
+		       gross_revenue, allowable_deductions, taxable_income, tax_rate_percent,
+		       gross_tax_liability, tax_credits, net_tax_payable, tax_already_paid,
+		       balance_due, currency, status, submitted_at, submitted_by,
+		       assessed_tax_amount, assessment_reference, notes,
+		       effective_from, effective_to, created_by, created_at, updated_at
+		FROM corporate_tax_returns WHERE return_id = $1 AND tenant_id = $2 FOR UPDATE`,
+		id, middleware.GetTenantID(ctx),
+	).Scan(
+		&r.ReturnID, &r.TenantID, &r.LegalEntityID, &r.JurisdictionID, &r.TaxRegistrationNumber,
+		&r.FiscalYear, &r.AccountingPeriodStart, &r.AccountingPeriodEnd,
+		&r.GrossRevenue, &r.AllowableDeductions, &r.TaxableIncome, &r.TaxRatePercent,
+		&r.GrossTaxLiability, &r.TaxCredits, &r.NetTaxPayable, &r.TaxAlreadyPaid,
+		&r.BalanceDue, &r.Currency, &status, &r.SubmittedAt, &r.SubmittedBy,
+		&r.AssessedTaxAmount, &r.AssessmentReference, &r.Notes,
+		&r.EffectiveFrom, &r.EffectiveTo, &r.CreatedBy, &r.CreatedAt, &r.UpdatedAt,
+	)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, domain.ErrTaxReturnNotFound
+		}
+		return nil, err
+	}
+	r.Status = domain.FilingStatus(status)
 
 	now := time.Now().UTC()
 	r.Status = domain.StatusAssessed
@@ -276,8 +329,8 @@ func (s *PgStore) Assess(ctx context.Context, id string, req *domain.AssessTaxRe
 	_, err = tx.Exec(ctx, `
 		UPDATE corporate_tax_returns
 		SET status=$1, assessed_tax_amount=$2, assessment_reference=$3, notes=$4, updated_at=$5
-		WHERE return_id=$6`,
-		string(r.Status), r.AssessedTaxAmount, r.AssessmentReference, r.Notes, r.UpdatedAt, id,
+		WHERE return_id=$6 AND tenant_id=$7`,
+		string(r.Status), r.AssessedTaxAmount, r.AssessmentReference, r.Notes, r.UpdatedAt, id, middleware.GetTenantID(ctx),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("assess corporate tax return: %w", err)
@@ -285,5 +338,5 @@ func (s *PgStore) Assess(ctx context.Context, id string, req *domain.AssessTaxRe
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
-	return r, nil
+	return &r, nil
 }

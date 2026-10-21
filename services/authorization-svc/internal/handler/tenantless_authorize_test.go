@@ -58,10 +58,24 @@ func TestTenantlessAuthorize_PlatformScopeStillAnswered(t *testing.T) {
 	}
 }
 
-// Default (non-enforcing) behaviour is unchanged: tenantless is admitted.
+// Default (non-enforcing) behaviour is unchanged for a principal that holds
+// authority somewhere: tenantless is admitted.
 func TestTenantlessAuthorize_DefaultStillAdmits(t *testing.T) {
-	s := &stubStore{rbacActions: []string{"GOVERNANCE_DECISION_RECORD"}}
+	s := &stubStore{rbacActions: []string{"GOVERNANCE_DECISION_RECORD"}, principalTenants: []string{"11111111-1111-4111-8111-111111111111"}}
 	if w := tenantlessAuthorize(newTestRouter(s), "22222222-2222-4222-8222-222222222222"); w.Code != http.StatusOK {
 		t.Fatalf("default mode: want 200, got %d", w.Code)
+	}
+}
+
+// Governance audit C-01: a principal that holds nothing in any tenant is
+// refused, not evaluated tenantless into a decision row no tenant can read.
+func TestTenantlessAuthorize_PrincipalWithNoTenantIsRefused(t *testing.T) {
+	s := &stubStore{}
+	w := tenantlessAuthorize(newTestRouter(s), "22222222-2222-4222-8222-222222222222")
+	if w.Code != http.StatusForbidden || !bytes.Contains(w.Body.Bytes(), []byte("tenant_required")) {
+		t.Fatalf("want 403 tenant_required, got %d: %s", w.Code, w.Body.String())
+	}
+	if s.recordedParams.ActionType != "" {
+		t.Error("a tenantless decision was recorded")
 	}
 }

@@ -1,0 +1,6 @@
+# Build context is services/ (see Dockerfile). Send only what the build reads.
+*
+!connectivity-api-bridge-svc
+!eventing
+connectivity-api-bridge-svc/deployments
+**/*_test.go

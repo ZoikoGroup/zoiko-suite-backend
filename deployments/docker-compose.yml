@@ -298,15 +298,21 @@ services:
         chmod 644 /keys/envelope_signing_key.pem
     restart: "no"
 
-  # ── One-shot: generate the shared mTLS self-provisioning bootstrap token ──
+  # ── One-shot: generate the per-service mTLS self-provisioning tokens ──────
   # mtls-management-svc requires a verified principal + authorize() decision
   # for every certificate request EXCEPT this one bootstrap path: a service
   # requesting its own first certificate has no principal or session yet to
   # present (the standard PKI bootstrap problem — see
-  # docs/architecture/master-register-findings-2026-08-27.md §3.28). This
-  # generates one random token into a shared volume, exactly like
-  # identity-svc-keygen above; never used in staging/production, where a
-  # real value is injected via the secrets manager.
+  # docs/architecture/master-register-findings-2026-08-27.md §3.28).
+  #
+  # ONE TOKEN PER SERVICE (Governance register M-01, 13 Oct 2026). There used
+  # to be a single shared token, and any holder could mint a certificate for
+  # any service name — including a registered PEP's. Each service now gets
+  # <service_name>/token; it mounts only that sub-directory (volume subpath),
+  # and mtls-management-svc issues a token's certificate only for the service
+  # it is named after. To add a consumer: add its service_name below and
+  # mount `subpath: <service_name>` at /bootstrap. Never used in
+  # staging/production, where the secrets manager injects each token.
   mtls-bootstrap-keygen:
     image: alpine:3.19
     container_name: mtls-bootstrap-keygen
@@ -318,13 +324,17 @@ services:
     command:
       - |
         set -e
-        if [ ! -f /bootstrap/token ]; then
-          head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > /bootstrap/token
-          echo "Generated throwaway dev mTLS bootstrap token"
-        else
-          echo "Dev mTLS bootstrap token already present, skipping"
-        fi
-        chmod 644 /bootstrap/token
+        for svc in identity-context-svc gateway-auth-svc tenant-entity-registry-svc authorization-svc ai-governance-svc; do
+          mkdir -p "/bootstrap/$$svc"
+          if [ ! -f "/bootstrap/$$svc/token" ]; then
+            head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "/bootstrap/$$svc/token"
+            echo "Generated dev mTLS bootstrap token for $$svc"
+          fi
+          chmod 644 "/bootstrap/$$svc/token"
+        done
+        # The pre-M-01 shared token, if this volume still has one: nothing
+        # accepts it any more, so it must not linger as if it did.
+        rm -f /bootstrap/token
     restart: "no"
 
   # ── Docker socket proxy ──────────────────────────────────────────────────────
@@ -511,8 +521,8 @@ services:
   # ── 1. identity-context-svc (Port: 8080) ─────────────────────────────────────
   identity-svc:
     build:
-      context: ../services/identity-context-svc
-      dockerfile: Dockerfile
+      context: ../services
+      dockerfile: identity-context-svc/Dockerfile
     container_name: identity-context-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -637,10 +647,51 @@ services:
       OUTBOX_RELAY_BATCH_SIZE: "100"
       OUTBOX_RELAY_POLL_MILLIS: "1000"
       OUTBOX_RETENTION_DAYS: "7"
+      # Mutual-TLS listener on :8449 for gateway-auth-svc (SEC-INV-05, S5-B1).
+      # Same router as :8080; the certificate comes from mtls-management-svc
+      # through the bootstrap path and is renewed at two thirds of its life.
+      # Provisioning retries in the background: mtls-management-svc being down
+      # never stops the plaintext listener. Only the listed client CNs are
+      # admitted, and X-Workload-Id is set to the verified one.
+      MTLS_ENABLED: "true"
+      MTLS_PORT: "8449"
+      MTLS_MANAGEMENT_SERVICE_URL: "http://mtls-management-svc:8140"
+      MTLS_BOOTSTRAP_TOKEN_PATH: "/bootstrap/token"
+      MTLS_ALLOWED_CLIENTS: "gateway-auth-svc,authorization-svc"
+
+      # ── INT-10 identity federation (OFF unless enabled) ───────────────────────
+      #
+      # A tenant's own identity provider can authenticate its people only on a platform whose operator
+      # has turned this on. The IdP's key location is a tenant-supplied destination, so it passes the same
+      # SSRF guard as every other (https, public addresses, pinned dial, no redirects); the *_ALLOW_HTTP and
+      # *_PRIVATE_CIDRS settings below exist for local development and private-link IdPs only.
+      FEDERATION_ENABLED: "${FEDERATION_ENABLED:-false}"
+      FEDERATION_EGRESS_ALLOW_HTTP: "${FEDERATION_EGRESS_ALLOW_HTTP:-false}"
+      FEDERATION_EGRESS_PRIVATE_CIDRS: "${FEDERATION_EGRESS_PRIVATE_CIDRS:-}"
+      FEDERATION_JWKS_REFRESH_SECONDS: "900"
+      FEDERATION_JWKS_MIN_REFRESH_SECONDS: "30"
+      # SCIM provisioning, role requests to access-control-svc, and the deprovisioning worker. Requires
+      # FEDERATION_ENABLED. IDENTITY_SERVICE_PRINCIPAL_ID needs ROLE_MANAGE on the entities its mappings name:
+      # an operator grant, never something federation gives itself.
+      FEDERATION_PROVISIONING_ENABLED: "${FEDERATION_PROVISIONING_ENABLED:-false}"
+      FEDERATION_WORKER_INTERVAL_SECONDS: "15"
+      FEDERATION_RETRY_BASE_SECONDS: "10"
+      FEDERATION_REVOKE_RETRY_MAX_SECONDS: "60"
     volumes:
       - identity_jwt_keys:/keys:ro
+      # Only this service's own bootstrap token (register M-01): the
+      # sub-directory identity-context-svc/ of the keygen volume, so /bootstrap/token
+      # here is a token mtls-management-svc binds to identity-context-svc alone.
+      - type: volume
+        source: mtls_bootstrap_token
+        target: /bootstrap
+        read_only: true
+        volume:
+          subpath: identity-context-svc
     depends_on:
       identity-svc-keygen:
+        condition: service_completed_successfully
+      mtls-bootstrap-keygen:
         condition: service_completed_successfully
       postgres:
         condition: service_healthy
@@ -702,27 +753,37 @@ services:
       # unreachable. Writes are never served from a stale context.
       TENANT_CONTEXT_STALE_GRACE_SECONDS: "120"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
-      # SEC-INV-05 mTLS to identity-svc (JWKS) and tenant-svc. The gateway's
-      # client side is ready: set either *_ENABLED to "true" and that peer is
-      # called at its https:// *_MTLS_URL with a 1-day certificate from
-      # mtls-management-svc, renewed at half-life. It stays off because
-      # NEITHER PEER HAS AN mTLS LISTENER YET: enabling it now fails every
-      # JWKS fetch or registry read, which refuses every request in the
-      # estate. Turn each on only after its peer serves :8449 with
-      # RequireAndVerifyClientCert (the pattern is authorization-svc's
-      # internal/mtls).
-      IDENTITY_JWKS_MTLS_ENABLED: "false"
-      IDENTITY_JWKS_MTLS_URL: "https://identity-svc:8449/.well-known/jwks.json"
-      TENANT_REGISTRY_MTLS_ENABLED: "false"
+      # SEC-INV-05 mTLS to identity-context-svc (JWKS) and the tenant registry:
+      # each peer is called at its https:// *_MTLS_URL with a 1-day
+      # certificate from mtls-management-svc, renewed at half-life. Both peers
+      # serve :8449 with RequireAndVerifyClientCert since 13 Oct
+      # (internal/mtlslistener). The host names are the container names,
+      # which are the DNS names on the peers' certificates — "identity-svc"
+      # (the compose key) would fail hostname verification. The gateway
+      # provisions its client identity at boot and refuses to start without
+      # it, hence the dependency on mtls-management-svc below.
+      IDENTITY_JWKS_MTLS_ENABLED: "true"
+      IDENTITY_JWKS_MTLS_URL: "https://identity-context-svc:8449/.well-known/jwks.json"
+      TENANT_REGISTRY_MTLS_ENABLED: "true"
       TENANT_REGISTRY_MTLS_URL: "https://tenant-entity-registry-svc:8449"
       MTLS_MANAGEMENT_SERVICE_URL: "http://mtls-management-svc:8140"
       MTLS_BOOTSTRAP_TOKEN_PATH: "/bootstrap/token"
     volumes:
-      - mtls_bootstrap_token:/bootstrap:ro
+      # Only this service's own bootstrap token (register M-01): the
+      # sub-directory gateway-auth-svc/ of the keygen volume, so /bootstrap/token
+      # here is a token mtls-management-svc binds to gateway-auth-svc alone.
+      - type: volume
+        source: mtls_bootstrap_token
+        target: /bootstrap
+        read_only: true
+        volume:
+          subpath: gateway-auth-svc
     depends_on:
       identity-svc:
         condition: service_healthy
       tenant-svc:
+        condition: service_healthy
+      mtls-management-svc:
         condition: service_healthy
     healthcheck:
       # readyz, not healthz. Liveness here answers 200 whenever the process is
@@ -770,7 +831,30 @@ services:
       # granting TENANT_PROVISION must target this same ID.
       AUTHZ_PLATFORM_SCOPE_ID: "00000000-0000-0000-0000-00000000f001"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
+      # Mutual-TLS listener on :8449 for gateway-auth-svc (SEC-INV-05, S5-B1).
+      # Same router as :8081; the certificate comes from mtls-management-svc
+      # through the bootstrap path and is renewed at two thirds of its life.
+      # Provisioning retries in the background: mtls-management-svc being down
+      # never stops the plaintext listener. Only the listed client CNs are
+      # admitted, and X-Workload-Id is set to the verified one.
+      MTLS_ENABLED: "true"
+      MTLS_PORT: "8449"
+      MTLS_MANAGEMENT_SERVICE_URL: "http://mtls-management-svc:8140"
+      MTLS_BOOTSTRAP_TOKEN_PATH: "/bootstrap/token"
+      MTLS_ALLOWED_CLIENTS: "gateway-auth-svc,authorization-svc"
+    volumes:
+      # Only this service's own bootstrap token (register M-01): the
+      # sub-directory tenant-entity-registry-svc/ of the keygen volume, so /bootstrap/token
+      # here is a token mtls-management-svc binds to tenant-entity-registry-svc alone.
+      - type: volume
+        source: mtls_bootstrap_token
+        target: /bootstrap
+        read_only: true
+        volume:
+          subpath: tenant-entity-registry-svc
     depends_on:
+      mtls-bootstrap-keygen:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       kafka:
@@ -863,11 +947,14 @@ services:
       # provenance class S ("client may request context but cannot override
       # result"). A header the gateway sets and this list omits is dropped
       # silently, so any addition in handler.Verify belongs here too.
-      # X-Workload-Id and X-Support-Context-Id are listed but never set by the
-      # gateway: listing them is how they are stripped, since no client can
-      # assert a workload identity or a support session. Must match
-      # gatewayAuthResponseHeaders in gtrm/compiler/emit.go.
-      - "traefik.http.middlewares.gateway-auth.forwardauth.authResponseHeaders=X-Principal-Id,X-Tenant-Id,X-Legal-Entity-Id,X-Correlation-Id,X-Jurisdiction-Context,X-Timezone,X-Residency-Policy-Id,X-Tenant-Context-Stale,X-Workload-Id,X-Support-Context-Id"
+      # X-Workload-Id, X-Authn-Age-Seconds, X-Audience, X-Token-Audience,
+      # X-Initiating-Subject-Id and X-On-Behalf-Of are listed but never set by
+      # the gateway: listing them is how they are stripped, since no client can
+      # assert a workload identity, a login age, a token audience or an
+      # initiating subject. X-Support-Context-Id, X-Assurance-Level and
+      # X-Source-Channel(-Basis) are set from the signed envelope (13 Oct, S1-B1).
+      # Must match gatewayAuthResponseHeaders in gtrm/compiler/emit.go.
+      - "traefik.http.middlewares.gateway-auth.forwardauth.authResponseHeaders=X-Principal-Id,X-Tenant-Id,X-Legal-Entity-Id,X-Correlation-Id,X-Jurisdiction-Context,X-Timezone,X-Residency-Policy-Id,X-Tenant-Context-Stale,X-Workload-Id,X-Support-Context-Id,X-Source-Channel,X-Source-Channel-Basis,X-Assurance-Level,X-Authn-Age-Seconds,X-Audience,X-Token-Audience,X-Initiating-Subject-Id,X-On-Behalf-Of"
       - "traefik.http.routers.jurisdiction.middlewares=gateway-auth,jurisdiction-strip"
 
   # ── 4. governance-decision-log-svc (Port: 8083) ──────────────────────────────
@@ -899,6 +986,11 @@ services:
       # policy version a past decision used (doc7 backlog item 34) — never
       # for authorization.
       POLICY_SERVICE_URL: "http://policy-svc:8085"
+      # Reads are authorized on GOVERNANCE_DECISION_READ. warn logs a refusal
+      # instead of making it, because contract-lifecycle-svc (contract
+      # activation) and decision-support-svc still read with no X-Principal-Id.
+      # Set to enforce (the code default) once both forward the caller.
+      DECISION_LOG_READ_AUTHZ: "warn"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_GROUP_ID: "governance-decision-log-svc"
       KAFKA_EVENTS_TOPIC: "zoiko.governance.events"
@@ -1155,8 +1247,11 @@ services:
     mem_limit: 256m
     cpus: "0.5"
     ports:
-      - "8089:8089"
-      - "8449:8449" # mTLS pilot listener — see MTLS_ENABLED below
+      # Loopback only: the plaintext port trusts X-Principal-Id / X-Tenant-Id
+      # as sent (audit register A-01), so it must not answer the LAN.
+      # Containers still reach it as authorization-svc:8089.
+      - "127.0.0.1:8089:8089"
+      - "8449:8449" # mTLS listener — see MTLS_ENABLED below
     environment:
       PORT: "8089"
       DB_HOST: postgres
@@ -1246,9 +1341,15 @@ services:
       # purpose / reason_code on privileged and destructive commands, a finite
       # end date on a delegation. "warn" admits a command without them, marks
       # it X-Command-Contract: violated and bounds an open delegation to 90
-      # days; "enforce" refuses. Stays warn until the console and
-      # access-control-svc send the fields.
-      AUTHZ_COMMAND_CONTRACT: "warn"
+      # days; "enforce" refuses. Enforced since 12 Oct 2026: access-control-svc
+      # sends reason_code on every command, and the admin console asks for a
+      # reason, one sentence and (delegations) an end date before it calls.
+      AUTHZ_COMMAND_CONTRACT: "enforce"
+      # Tenant of an entity /v1/authorize has no projection for (created before
+      # entity.created was consumed): checked with the registry, never taken
+      # on the caller's word or evaluated across tenants. No depends_on on
+      # purpose — the registry being down refuses only those entities (503).
+      AUTHZ_ENTITY_REGISTRY_URL: "http://tenant-entity-registry-svc:8081"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
       # siem-integration-svc lives in docker-compose.phase6.yml — reachable
       # only when that file is up alongside this one. Streaming degrades to
@@ -1264,8 +1365,31 @@ services:
       MTLS_PORT: "8449"
       MTLS_MANAGEMENT_SERVICE_URL: "http://mtls-management-svc:8140"
       MTLS_BOOTSTRAP_TOKEN_PATH: "/bootstrap/token"
+      # Evaluation routes (/v1/authorize, /internal/*, the SoD / entity-scope /
+      # delegated-access evaluators) are gated by client certificate — see
+      # internal/workload. "permit" is the local default: callers not yet on
+      # mTLS keep the plaintext port, and a caller that DOES present a cert is
+      # still checked against AUTHZ_PEP_ALLOWLIST when one is set. Outside
+      # ENV=local the default is "require", which also needs the allow-list.
+      AUTHZ_EVALUATION_MTLS: "permit"
+      AUTHZ_PEP_ALLOWLIST: ""
+      # Step-up on reopen-class actions (Governance audit N-07). The code
+      # default "step_up" treats a decision request with no stated
+      # authentication age as NOT recent. No PEP forwards X-Authn-Age-Seconds
+      # yet (gateway-auth-svc asserts no age, register A-03), so "step_up"
+      # would answer STEP_UP to financial-close-svc's PERIOD_REOPEN_APPROVE.
+      # "permit" keeps the old reading here until PEPs forward the age.
+      AUTHZ_STEP_UP_UNKNOWN_AGE: "permit"
     volumes:
-      - mtls_bootstrap_token:/bootstrap:ro
+      # Only this service's own bootstrap token (register M-01): the
+      # sub-directory authorization-svc/ of the keygen volume, so /bootstrap/token
+      # here is a token mtls-management-svc binds to authorization-svc alone.
+      - type: volume
+        source: mtls_bootstrap_token
+        target: /bootstrap
+        read_only: true
+        volume:
+          subpath: authorization-svc
     depends_on:
       postgres:
         condition: service_healthy
@@ -1965,8 +2089,8 @@ services:
 
   notification-svc:
     build:
-      context: ../services/notification-svc
-      dockerfile: Dockerfile
+      context: ../services
+      dockerfile: notification-svc/Dockerfile
     container_name: notification-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -2513,15 +2637,21 @@ services:
       PORT: "8140"
       CA_DATA_DIR: "/data/ca"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      # Authorization decisions over mTLS, presenting a client certificate
+      # this service issues itself (it is the CA, so it needs no bootstrap
+      # token). authorization-svc's evaluation gate requires a verified
+      # workload certificate outside ENV=local; AUTHZ_SERVICE_URL is the
+      # plaintext fallback used only when this is unset.
+      AUTHZ_MTLS_URL: "https://authorization-svc:8449"
       # Enables the self-provisioning bootstrap path on ProvisionCert — see
-      # master-register-findings-2026-08-27.md §3.28. Empty/unset leaves
-      # that path disabled, requiring every caller to present a real
-      # principal (which mtls-bootstrap-keygen's own consumers cannot, at
-      # their own startup — this is what makes the pilot actually usable).
-      MTLS_BOOTSTRAP_TOKEN_PATH: "/bootstrap/token"
+      # master-register-findings-2026-08-27.md §3.28. One sub-directory per
+      # service, each holding that service's own token (register M-01); the
+      # old shared MTLS_BOOTSTRAP_TOKEN_PATH is refused at startup.
+      MTLS_BOOTSTRAP_TOKENS_DIR: "/bootstrap-tokens"
     volumes:
+      # Also holds revocations.json — the CRL's ledger lives with the CA key.
       - mtls_ca_data:/data/ca
-      - mtls_bootstrap_token:/bootstrap:ro
+      - mtls_bootstrap_token:/bootstrap-tokens:ro
     depends_on:
       mtls-bootstrap-keygen:
         condition: service_completed_successfully
@@ -4115,7 +4245,15 @@ services:
       MTLS_MANAGEMENT_SERVICE_URL: "http://mtls-management-svc:8140"
       MTLS_BOOTSTRAP_TOKEN_PATH: "/bootstrap/token"
     volumes:
-      - mtls_bootstrap_token:/bootstrap:ro
+      # Only this service's own bootstrap token (register M-01): the
+      # sub-directory ai-governance-svc/ of the keygen volume, so /bootstrap/token
+      # here is a token mtls-management-svc binds to ai-governance-svc alone.
+      - type: volume
+        source: mtls_bootstrap_token
+        target: /bootstrap
+        read_only: true
+        volume:
+          subpath: ai-governance-svc
     depends_on:
       postgres:
         condition: service_healthy
@@ -5018,8 +5156,8 @@ services:
   # fields once prepared.
   payment-initiation-adapter-svc:
     build:
-      context: ../services/payment-initiation-adapter-svc
-      dockerfile: Dockerfile
+      context: ../services
+      dockerfile: payment-initiation-adapter-svc/Dockerfile
     container_name: payment-initiation-adapter-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -5062,8 +5200,8 @@ services:
   # replaced before any real provider is ever connected.
   payment-status-svc:
     build:
-      context: ../services/payment-status-svc
-      dockerfile: Dockerfile
+      context: ../services
+      dockerfile: payment-status-svc/Dockerfile
     container_name: payment-status-svc
     mem_limit: 256m
     cpus: "0.5"

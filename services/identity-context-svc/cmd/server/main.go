@@ -35,6 +35,7 @@ import (
 	"zoiko.io/identity-context-svc/internal/events"
 	"zoiko.io/identity-context-svc/internal/health"
 	"zoiko.io/identity-context-svc/internal/idempotency"
+	"zoiko.io/identity-context-svc/internal/mtlslistener"
 	"zoiko.io/identity-context-svc/internal/outbox"
 	"zoiko.io/identity-context-svc/internal/retention"
 	"zoiko.io/identity-context-svc/internal/session"
@@ -533,6 +534,8 @@ func main() {
 		WithSupport(supportService).
 		WithContextCache(cacheService)
 	identityctx.RegisterRoutes(r, h)
+	rootHandler, stopFederation := mountFederation(r, config.LoadFederation(), config.LoadProvisioning(), cfg, principalRepo, idpIssuer, authzClient, siemClient, sessionEvictor{cache: sessionCache}, log)
+	defer stopFederation()
 
 	// ── Retention / disposition sweep (GOV-09) ────────────────────────────
 	//
@@ -555,7 +558,7 @@ func main() {
 	// ── Server ────────────────────────────────────────────────────────────
 	srv := &http.Server{
 		Addr:         fmt.Sprintf(":%d", cfg.Port),
-		Handler:      r,
+		Handler:      rootHandler,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 15 * time.Second,
 		IdleTimeout:  60 * time.Second,
@@ -575,6 +578,22 @@ func main() {
 		}
 	}()
 
+	// Mutual-TLS listener for gateway-auth-svc and other platform callers
+	// (SEC-INV-05, S5-B1). Same router; provisioned in the background, so an
+	// unavailable mtls-management-svc never stops the plaintext listener.
+	mtlsCtx, stopMTLS := context.WithCancel(context.Background())
+	defer stopMTLS()
+	var mtlsListener *mtlslistener.Listener
+	if cfg.MTLSEnabled {
+		mtlsListener = mtlslistener.Start(mtlsCtx, mtlslistener.Options{
+			ServiceName:        "identity-context-svc",
+			Port:               cfg.MTLSPort,
+			ManagementURL:      cfg.MTLSManagementURL,
+			BootstrapTokenPath: cfg.MTLSBootstrapTokenPath,
+			AllowedClients:     cfg.MTLSAllowedClients,
+		}, r, log)
+	}
+
 	<-quit
 	log.Info("shutdown signal received — draining connections")
 
@@ -582,6 +601,12 @@ func main() {
 	defer shutdownCancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Error("graceful shutdown failed", zap.Error(err))
+	}
+	if mtlsListener != nil {
+		stopMTLS()
+		if err := mtlsListener.Shutdown(shutdownCtx); err != nil {
+			log.Error("mtls listener shutdown failed", zap.Error(err))
+		}
 	}
 	log.Info("stopping event consumer")
 	stopConsumer()

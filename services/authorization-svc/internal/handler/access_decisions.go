@@ -234,14 +234,11 @@ func redactDecision(d *domain.AccessDecisionLog) {
 }
 
 // holdsPermission reports whether principalID holds action in the tenant
-// scope, without recording a decision — it gates what a read may show, it
-// authorizes no material act.
+// scope, without writing a refusal — the caller decides what a "no" means
+// (a narrower read, a 404). Status-checked and recorded like every other
+// check (checkPermission).
 func (h *Handler) holdsPermission(r *http.Request, principalID, tenantID, action string) (bool, error) {
-	actions, _, err := h.store.FindGrantedActions(r.Context(), principalID, tenantID, tenantID)
-	if err != nil {
-		return false, err
-	}
-	return contains(actions, action), nil
+	return h.checkPermission(r, principalID, tenantID, tenantID, action)
 }
 
 // parseTimeParam reads an optional RFC3339 timestamp, writing a 400 and

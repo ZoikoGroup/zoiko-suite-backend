@@ -8,9 +8,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"go.uber.org/zap"
 
 	"zoiko.io/gateway-auth-svc/internal/siem"
+	"zoiko.io/gateway-auth-svc/internal/telemetry"
 )
 
 const testTenant = "00000000-0000-0000-0000-0000000000a1"
@@ -211,6 +213,28 @@ func TestStream_DropsRatherThanBlocksWhenSaturated(t *testing.T) {
 		t.Fatal("no drops recorded after saturating the queue — a full queue must drop loudly, not grow")
 	}
 
+	close(release)
+	c.Close()
+}
+
+// INT-NP-044: the drop is not only counted in memory; it is a metric an alert can fire on.
+func TestSaturationDropsAreExposedAsAMetric(t *testing.T) {
+	release := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { <-release }))
+	defer upstream.Close()
+	c := siem.New(upstream.URL, "gateway-auth-svc", zap.NewNop())
+
+	m := telemetry.NewMetrics("gateway-auth-svc-droptest")
+	counter := m.RegisterSIEMDrops(c.Dropped, "gateway-auth-svc-droptest")
+	if got := testutil.ToFloat64(counter); got != 0 {
+		t.Fatalf("a healthy queue has dropped nothing: %v", got)
+	}
+	for i := 0; i < 5000; i++ {
+		c.Stream(context.Background(), testTenant, "tenant_context.denied", siem.SeverityHigh, "denied")
+	}
+	if got := testutil.ToFloat64(counter); got == 0 || uint64(got) != c.Dropped() {
+		t.Fatalf("the metric (%v) must equal the drops (%d), and be non-zero after saturation", got, c.Dropped())
+	}
 	close(release)
 	c.Close()
 }

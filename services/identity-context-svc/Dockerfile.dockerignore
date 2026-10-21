@@ -1,0 +1,8 @@
+# Build context is services/ (see Dockerfile). Send only what the build reads.
+*
+!identity-context-svc
+!eventing
+identity-context-svc/deployments
+**/*_test.go
+**/testdata
+**/.git

@@ -759,10 +759,17 @@ func (s *PgStore) SetRuleProvenance(ctx context.Context, p domain.SetRuleProvena
 		}
 	}
 
+	// rule_version follows the chain the provenance declares (1, or the
+	// superseded version + 1), as on the create path.
 	if _, err := tx.Exec(ctx, `UPDATE jurisdiction_rules SET regime_id=$2, interpretation_id=$3, supersedes_rule_id=$4,
-			precedence=$5, published_on=$6::date, updated_at=NOW(), updated_by_principal_id=$7
+			precedence=$5, published_on=$6::date, updated_at=NOW(), updated_by_principal_id=$7,
+			rule_version = COALESCE((SELECT GREATEST(p.rule_version, 1) + 1 FROM jurisdiction_rules p
+			                         WHERE p.jurisdiction_rule_id = $4), 1)
 		WHERE jurisdiction_rule_id::text=$1`,
 		p.JurisdictionRuleID, p.RegimeID, p.InterpretationID, p.SupersedesRuleID, p.Precedence, p.PublishedOn, p.ActorID); err != nil {
+		if isUniqueViolation(err, "uq_jurisdiction_rules_single_successor") {
+			return nil, domain.ErrSupersedesTaken
+		}
 		return nil, s.registryFail("SetRuleProvenance update", err, nil)
 	}
 	if _, err := tx.Exec(ctx, `DELETE FROM rule_sources WHERE jurisdiction_rule_id::text=$1`, p.JurisdictionRuleID); err != nil {

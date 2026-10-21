@@ -22,6 +22,7 @@ import (
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 
+	"zoiko.io/employee-master-svc/internal/clients"
 	"zoiko.io/employee-master-svc/internal/config"
 	"zoiko.io/employee-master-svc/internal/domain"
 	svcenvelope "zoiko.io/employee-master-svc/internal/envelope"
@@ -30,6 +31,7 @@ import (
 	"zoiko.io/employee-master-svc/internal/health"
 	svcmiddleware "zoiko.io/employee-master-svc/internal/middleware"
 	"zoiko.io/employee-master-svc/internal/mtls"
+	"zoiko.io/employee-master-svc/internal/outbox"
 	"zoiko.io/employee-master-svc/internal/store"
 	"zoiko.io/employee-master-svc/internal/telemetry"
 )
@@ -339,6 +341,21 @@ func main() {
 	h := handler.New(pgStore, publisher, authzClient, log)
 	handler.RegisterRoutes(r, h)
 
+	// ZS-SVC-L-001 WFP-01: worker financial profile interface.
+	wfpHTTP := &http.Client{Timeout: 5 * time.Second}
+	handler.RegisterWFPRoutes(r, handler.NewWFP(pgStore, authzClient,
+		clients.NewSourceTrust(cfg.PayrollRunServiceURL, wfpHTTP),
+		clients.NewJurisdictions(cfg.JurisdictionRulesURL, wfpHTTP), log))
+
+	// WFP-01 events are written to wfp_outbox in the transaction that changes
+	// state and delivered here, so a broker outage delays them and never loses them.
+	relayCtx, stopRelay := context.WithCancel(context.Background())
+	relayDone := make(chan struct{})
+	go func() {
+		defer close(relayDone)
+		outbox.NewRelay(pgStore, kafkaWriter, log).Run(relayCtx)
+	}()
+
 	// ── 6. Health probes + metrics ────────────────────────────────────────────
 	healthH := health.New(pool, log)
 	r.Get("/healthz", healthH.Liveness)
@@ -376,6 +393,12 @@ func main() {
 	defer shutdownCancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Error("graceful shutdown failed", zap.Error(err))
+	}
+	stopRelay()
+	select {
+	case <-relayDone:
+	case <-time.After(10 * time.Second):
+		log.Warn("outbox relay did not stop within 10s; undelivered events remain queued and will drain at next start")
 	}
 	log.Info("server stopped")
 }

@@ -12,6 +12,7 @@ import (
 	"go.uber.org/zap"
 
 	authzpkg "zoiko.io/payment-status-svc/internal/authz"
+	"zoiko.io/payment-status-svc/internal/callbacks"
 	"zoiko.io/payment-status-svc/internal/domain"
 	svcmiddleware "zoiko.io/payment-status-svc/internal/middleware"
 	"zoiko.io/payment-status-svc/internal/store"
@@ -40,6 +41,9 @@ type Handler struct {
 	authz         AuthzChecker
 	webhookSecret []byte
 	log           *zap.Logger
+	// callbacks and receipts serve the profile-driven provider callback endpoint (INT-07); nil means it is off.
+	callbacks *callbacks.Processor
+	receipts  store.CallbackStore
 }
 
 func New(st store.Store, az AuthzChecker, webhookSecret string, log *zap.Logger) *Handler {
@@ -69,6 +73,11 @@ func RegisterRoutes(r chi.Router, h *Handler, tenantMiddleware func(http.Handler
 		})
 	})
 	r.Post("/bnk07/webhooks/provider-callback", h.ProcessProviderCallback)
+	r.Post("/bnk07/webhooks/provider-callback/{provider}/{tenantID}", h.ProviderCallback)
+	r.Group(func(r chi.Router) {
+		r.Use(tenantMiddleware)
+		r.Get("/bnk07/callback-receipts", h.ListCallbackReceipts)
+	})
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {

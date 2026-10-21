@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"errors"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -91,6 +92,62 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
+// appRolePool returns a pool connected as a NOSUPERUSER NOBYPASSRLS role, the
+// shape of the service's real runtime role. Call it after openTestPool, which
+// has just recreated the tables the grants below cover.
+//
+// TEST_DATABASE_URL is the `postgres` superuser in CI, and a superuser bypasses
+// row-level security unconditionally, FORCE included: an isolation assertion
+// made over openTestPool's connection fails there although the policy is
+// correct, and would pass there even if the policy were missing.
+func appRolePool(t *testing.T, admin *pgxpool.Pool) *pgxpool.Pool {
+	t.Helper()
+	ctx := context.Background()
+
+	const appRole = "gdl_app_test"
+	const appPassword = "gdl_app_test_pw"
+
+	if _, err := admin.Exec(ctx, `DO $do$ BEGIN
+		IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '`+appRole+`') THEN
+			CREATE ROLE `+appRole+` LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+		END IF;
+	END $do$;`); err != nil {
+		t.Fatalf("create role %s: %v", appRole, err)
+	}
+	for _, stmt := range []string{
+		`ALTER ROLE ` + appRole + ` WITH LOGIN PASSWORD '` + appPassword + `' NOSUPERUSER NOBYPASSRLS`,
+		`GRANT USAGE ON SCHEMA public TO ` + appRole,
+		`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO ` + appRole,
+		`GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO ` + appRole,
+	} {
+		if _, err := admin.Exec(ctx, stmt); err != nil {
+			t.Fatalf("grant to %s (%s): %v", appRole, stmt, err)
+		}
+	}
+
+	u, err := url.Parse(os.Getenv("TEST_DATABASE_URL"))
+	if err != nil {
+		t.Fatalf("parse TEST_DATABASE_URL: %v", err)
+	}
+	u.User = url.UserPassword(appRole, appPassword)
+	pool, err := pgxpool.New(ctx, u.String())
+	if err != nil {
+		t.Fatalf("connect as %s: %v", appRole, err)
+	}
+	t.Cleanup(pool.Close)
+
+	var isSuper, bypassRLS bool
+	if err := pool.QueryRow(ctx,
+		`SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user`,
+	).Scan(&isSuper, &bypassRLS); err != nil {
+		t.Fatalf("verify %s privileges: %v", appRole, err)
+	}
+	if isSuper || bypassRLS {
+		t.Fatalf("%s must be NOSUPERUSER and NOBYPASSRLS, got rolsuper=%v rolbypassrls=%v", appRole, isSuper, bypassRLS)
+	}
+	return pool
+}
+
 // scoped runs a verification query with app.tenant_id installed, exactly as the
 // store installs it for every statement it makes.
 //
@@ -141,7 +198,7 @@ func TestPgStore_Insert_Integration(t *testing.T) {
 	s := store.New(pool, zap.NewNop())
 
 	d := sampleDecision("dec-int-001")
-	created, err := s.Insert(ctx, d)
+	created, err := insertDecision(ctx, s, d)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -167,7 +224,7 @@ func TestPgStore_FindByID_ScopedToTenant(t *testing.T) {
 	s := store.New(pool, zap.NewNop())
 
 	d := sampleDecision("dec-cross-tenant")
-	if _, err := s.Insert(ctx, d); err != nil {
+	if _, err := insertDecision(ctx, s, d); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -187,7 +244,7 @@ func TestPgStore_Insert_IdempotentOnDuplicateDecisionID(t *testing.T) {
 
 	d := sampleDecision("dec-int-dup")
 
-	created1, err := s.Insert(ctx, d)
+	created1, err := insertDecision(ctx, s, d)
 	if err != nil {
 		t.Fatalf("unexpected error on first insert: %v", err)
 	}
@@ -199,7 +256,7 @@ func TestPgStore_Insert_IdempotentOnDuplicateDecisionID(t *testing.T) {
 	// must be a silent no-op, not an overwrite (append-only evidence rule).
 	dup := d
 	dup.Outcome = "GRANTED"
-	created2, err := s.Insert(ctx, dup)
+	created2, err := insertDecision(ctx, s, dup)
 	if err != nil {
 		t.Fatalf("unexpected error on duplicate insert: %v", err)
 	}
@@ -256,7 +313,7 @@ func TestPgStore_ErrorsWrapErrStoreUnavailable(t *testing.T) {
 		t.Fatalf("failed to drop table for test setup: %v", err)
 	}
 
-	if _, err := s.Insert(ctx, sampleDecision("dec-unavailable")); !errors.Is(err, domain.ErrStoreUnavailable) {
+	if _, err := insertDecision(ctx, s, sampleDecision("dec-unavailable")); !errors.Is(err, domain.ErrStoreUnavailable) {
 		t.Errorf("Insert: expected error to wrap ErrStoreUnavailable, got %v", err)
 	}
 	if _, err := s.FindByID(ctx, "tenant-1", "dec-unavailable"); !errors.Is(err, domain.ErrStoreUnavailable) {
@@ -292,7 +349,7 @@ func seedListFixtures(t *testing.T, ctx context.Context, s *store.PgStore) {
 		},
 	}
 	for _, d := range fixtures {
-		if _, err := s.Insert(ctx, d); err != nil {
+		if _, err := insertDecision(ctx, s, d); err != nil {
 			t.Fatalf("failed to seed fixture %q: %v", d.DecisionID, err)
 		}
 	}

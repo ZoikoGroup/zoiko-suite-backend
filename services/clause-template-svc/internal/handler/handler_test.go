@@ -436,3 +436,44 @@ func TestCreateTemplate(t *testing.T) {
 		t.Errorf("expected DRAFT, got %s", resp.Status)
 	}
 }
+
+func TestClauseTemplate_ReadEndpoints_RequirePrincipal(t *testing.T) {
+	store := newStubStore()
+	store.clauses["cls-001"] = &domain.Clause{
+		ClauseID: "cls-001", TenantID: "tenant-test-01", LegalEntityID: "le-001",
+		Title: "Confidentiality", Category: "CONFIDENTIALITY", Body: "...", Status: domain.StatusDraft,
+	}
+	store.templates["tmpl-001"] = &domain.ContractTemplate{
+		TemplateID: "tmpl-001", TenantID: "tenant-test-01", LegalEntityID: "le-001",
+		Title: "NDA", ContractType: "NDA", Status: domain.StatusDraft,
+	}
+	store.deviations["dev-001"] = &domain.DeviationRule{
+		DeviationID: "dev-001", TenantID: "tenant-test-01", LegalEntityID: "le-001",
+		Status: domain.DeviationStatusProposed, ProposedBy: "user-test-01",
+	}
+
+	h := New(store, &stubPublisher{}, &stubAuthz{}, zap.NewNop())
+	router := newChiRouter(h)
+
+	endpoints := []string{
+		"/v1/clauses",
+		"/v1/clauses/cls-001",
+		"/v1/clauses/cls-001/versions",
+		"/v1/templates",
+		"/v1/templates/tmpl-001",
+		"/v1/deviation-rules",
+		"/v1/deviation-rules/dev-001",
+	}
+
+	for _, ep := range endpoints {
+		req := httptest.NewRequest(http.MethodGet, ep, nil)
+		req.Header.Set("X-Tenant-Id", "tenant-test-01")
+		// No X-Principal-Id
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusUnauthorized {
+			t.Errorf("GET %s without X-Principal-Id: expected 401, got %d", ep, w.Code)
+		}
+	}
+}
+

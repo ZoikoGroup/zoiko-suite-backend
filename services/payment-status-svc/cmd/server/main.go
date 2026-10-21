@@ -15,14 +15,17 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
+	"zoiko.io/eventing/kafkaout"
+	"zoiko.io/eventing/integration"
+	"zoiko.io/eventing/outbox"
+	"zoiko.io/eventing/signature"
 	"zoiko.io/payment-status-svc/internal/authz"
+	"zoiko.io/payment-status-svc/internal/callbacks"
 	"zoiko.io/payment-status-svc/internal/config"
 	"zoiko.io/payment-status-svc/internal/handler"
 	"zoiko.io/payment-status-svc/internal/health"
 	"zoiko.io/payment-status-svc/internal/middleware"
 	"zoiko.io/payment-status-svc/internal/store"
-	"zoiko.io/eventing/kafkaout"
-	"zoiko.io/eventing/outbox"
 )
 
 func main() {
@@ -84,6 +87,14 @@ func main() {
 	if err != nil {
 		logger.Fatal("outbox relay", zap.Error(err))
 	}
+	// INT-CTRL-005 / INT-NP-006: with SCHEMA_REGISTRY_URL set, an event that breaks its registered contract is
+	// quarantined before publish, and a registry that cannot answer holds events instead of publishing them unchecked.
+	if gate, gerr := integration.GateFromEnv("payment-status-svc"); gerr != nil {
+		logger.Fatal("schema gate", zap.Error(gerr))
+	} else if gate != nil {
+		relay.SetGate(gate)
+		logger.Info("producer schema gate enabled")
+	}
 	relayCtx, cancelRelay := context.WithCancel(context.Background())
 	defer cancelRelay()
 	relayDone := make(chan struct{}, 1)
@@ -95,6 +106,21 @@ func main() {
 	authzClient := authz.NewClient(cfg.AuthzServiceURL)
 
 	h := handler.New(pgStore, authzClient, cfg.WebhookSharedSecret, logger)
+
+	provCfg, err := callbacks.ParseConfig(cfg.ProviderCallbacksJSON)
+	if err != nil {
+		logger.Fatal("PROVIDER_CALLBACKS_JSON is invalid", zap.Error(err))
+	}
+	if len(provCfg) > 0 {
+		h = h.WithCallbacks(&callbacks.Processor{
+			Config:  provCfg,
+			Secrets: callbacks.NewVaultSecrets(cfg.VaultURL, cfg.VaultWorkloadID),
+			Store:   pgStore,
+			Guard:   signature.NewMemoryGuard(100_000, nil),
+			Log:     logger,
+		}, pgStore)
+		logger.Info("provider callbacks enabled", zap.Int("providers", len(provCfg)))
+	}
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)

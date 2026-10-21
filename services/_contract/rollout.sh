@@ -98,7 +98,8 @@ bank-reconciliation-svc reconciliation-intelligence-svc"
 # authenticator itself while its JWT verification never runs.
 #
 # identity-context-svc:/v1/authenticate is the same circularity one step
-# earlier. It is where a human exchanges a password for the bearer token that
+# earlier. It is where a human exchanges a password (or, at /v1/authenticate/federated, a tenant IdP's
+# signed ID token) for the bearer token that
 # /v1/context/resolve turns into a signed envelope, so it necessarily runs
 # before any identity exists to put in the headers the contract demands. Left
 # unexempted, the endpoint that produces every identity on the platform refuses
@@ -109,7 +110,7 @@ bank-reconciliation-svc reconciliation-intelligence-svc"
 # and actor honestly.
 #
 # Format: "<svc>:<path>[,<path>...]" — one entry per service.
-EXEMPT_PATHS="gateway-auth-svc:/verify identity-context-svc:/v1/authenticate"
+EXEMPT_PATHS="gateway-auth-svc:/verify identity-context-svc:/v1/authenticate,/v1/authenticate/federated"
 
 # Services whose POST routes resolve or evaluate but change nothing (a body-
 # carrying read). They still get the full envelope; only the idempotency_key

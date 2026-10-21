@@ -23,12 +23,13 @@ type EvaluateTransferRequest struct {
 }
 
 type TransferDecision struct {
-	DecisionID              string   `json:"decision_id"`
-	Result                  string   `json:"result"` // AUTHORIZED, CONDITIONAL, BLOCKED, REVIEW_REQUIRED
-	ReasonCodes             []string `json:"reason_codes"`
-	TransferMechanismID     string   `json:"transfer_mechanism_id"`
-	RelationshipID          string   `json:"relationship_id"`
-	DestinationJurisdiction string   `json:"destination_jurisdiction,omitempty"`
+	DecisionID              string     `json:"decision_id"`
+	Result                  string     `json:"result"` // AUTHORIZED, CONDITIONAL, BLOCKED, REVIEW_REQUIRED
+	ReasonCodes             []string   `json:"reason_codes"`
+	TransferMechanismID     string     `json:"transfer_mechanism_id"`
+	RelationshipID          string     `json:"relationship_id"`
+	DestinationJurisdiction string     `json:"destination_jurisdiction,omitempty"`
+	ExpiresAt               *time.Time `json:"expires_at,omitempty"`
 }
 
 type Client struct {

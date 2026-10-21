@@ -171,6 +171,8 @@ func NewMetrics(serviceName string) *Metrics {
 		OutcomeAllowed, OutcomeNoToken, OutcomeInvalidToken, OutcomeIncompleteClaims,
 		OutcomeTenantHostnameMismatch, OutcomeCartaBlocked,
 		OutcomeTenantContextDenied, OutcomeTenantContextUnresolved,
+		OutcomeRateLimited, OutcomeOverloaded, OutcomeRequestTooLarge, OutcomeRequestEncodingRefused,
+		OutcomeMalformedRequest, OutcomeVersionUnsupported,
 	} {
 		m.VerifyDecisionsTotal.WithLabelValues(outcome)
 	}
@@ -214,6 +216,21 @@ const (
 	// OutcomeTenantContextUnresolved — the registry could not be reached, so no
 	// decision exists. Fail-closed, and an outage rather than a refusal.
 	OutcomeTenantContextUnresolved = "tenant_context_unresolved"
+	// OutcomeRateLimited — a client or tenant quota was exhausted (INT-RATE-007).
+	OutcomeRateLimited = "rate_limited"
+	// OutcomeOverloaded — the gateway shed the request above its concurrency
+	// ceiling (INT-BP-016). Distinct from a refusal: nothing about the caller
+	// was judged.
+	OutcomeOverloaded = "overloaded"
+	// OutcomeRequestTooLarge — a declared body length above the admission cap.
+	OutcomeRequestTooLarge = "request_too_large"
+	// OutcomeRequestEncodingRefused — a compressed request body that is not
+	// accepted (decompression-bomb protection).
+	OutcomeRequestEncodingRefused = "request_encoding_refused"
+	// OutcomeMalformedRequest — an unreadable length or request URI.
+	OutcomeMalformedRequest = "malformed_request"
+	// OutcomeVersionUnsupported — an API version that is not routed (INT-VERS-012).
+	OutcomeVersionUnsupported = "version_unsupported"
 )
 
 // ── handler.DomainMetrics implementation ─────────────────────────────────────
@@ -309,3 +326,17 @@ func newDiscardResponseWriter() *discardResponseWriter {
 func (d *discardResponseWriter) Header() http.Header         { return d.header }
 func (d *discardResponseWriter) Write(b []byte) (int, error) { return len(b), nil }
 func (d *discardResponseWriter) WriteHeader(int)             {}
+
+// RegisterSIEMDrops exposes the count of security events the SIEM queue discarded because it was full. The queue drops
+// rather than blocks (an unbounded one would turn a SIEM outage into this service's memory problem), so the loss is only
+// acceptable if it is measurable and alertable: gateway_auth_siem_events_dropped_total should stay at zero (INT-NP-044).
+// It returns the collector so a test can read it.
+func (m *Metrics) RegisterSIEMDrops(dropped func() uint64, serviceName string) prometheus.CounterFunc {
+	c := prometheus.NewCounterFunc(prometheus.CounterOpts{
+		Name:        "gateway_auth_siem_events_dropped_total",
+		Help:        "Security events discarded because the SIEM queue was full.",
+		ConstLabels: prometheus.Labels{"service": serviceName},
+	}, func() float64 { return float64(dropped()) })
+	prometheus.MustRegister(c)
+	return c
+}

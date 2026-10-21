@@ -4,6 +4,7 @@ package store_test
 
 import (
 	"context"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -37,8 +38,10 @@ func appPool(t *testing.T, super *pgxpool.Pool) *pgxpool.Pool {
 		GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO cons_app;`)
 	require.NoError(t, err)
 	dsn := os.Getenv("TEST_DATABASE_URL")
-	require.Contains(t, dsn, "postgres:postgres@")
-	pool, err := pgxpool.New(ctx, strings.Replace(dsn, "postgres:postgres@", "cons_app:cons_app@", 1))
+	u, err := url.Parse(dsn)
+	require.NoError(t, err)
+	u.User = url.UserPassword("cons_app", "cons_app")
+	pool, err := pgxpool.New(ctx, u.String())
 	require.NoError(t, err)
 	t.Cleanup(pool.Close)
 	return pool

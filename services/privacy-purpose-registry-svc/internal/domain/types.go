@@ -38,6 +38,7 @@
 package domain
 
 import (
+	"strings"
 	"time"
 )
 
@@ -70,16 +71,27 @@ type Purpose struct {
 // Amending a published purpose means creating a new version via
 // SupersedesVersionID, never editing this row.
 type PurposeVersion struct {
-	PurposeVersionID     string               `json:"purpose_version_id"`
-	PurposeID            string               `json:"purpose_id"`
-	Statement            string               `json:"statement"`
-	CompatibilityClass   string               `json:"compatibility_class"` // data only, e.g. PRIMARY, SECONDARY_COMPATIBLE
-	LawfulBasisRefs      []string             `json:"lawful_basis_refs"`
-	VersionStatus        PurposeVersionStatus `json:"version_status"`
-	EffectiveFrom        time.Time            `json:"effective_from"`
-	SupersedesVersionID  *string              `json:"supersedes_version_id,omitempty"`
-	CreatedAt            time.Time            `json:"created_at"`
-	CreatedByPrincipalID string               `json:"created_by_principal_id"`
+	PurposeVersionID   string   `json:"purpose_version_id"`
+	PurposeID          string   `json:"purpose_id"`
+	TenantID           *string  `json:"tenant_id,omitempty"`
+	Statement          string   `json:"statement"`
+	CompatibilityClass string   `json:"compatibility_class"` // data only, e.g. PRIMARY, SECONDARY_COMPATIBLE
+	LawfulBasisRefs    []string `json:"lawful_basis_refs"`
+	// NecessityRationale is §7's PurposeVersion "necessity evidence" and §8.2
+	// gate 3's "necessity/minimization rationale". SpecialConditionRefs are
+	// §8.2 gate 4's "special-category/other condition references". Both are
+	// content: immutable once PUBLISHED (migration 000002's trigger), and both
+	// are enforced at activity validation, not at purpose creation, the same
+	// way lawful_basis_refs always has been.
+	NecessityRationale     string               `json:"necessity_rationale,omitempty"`
+	SpecialConditionRefs   []string             `json:"special_condition_refs"`
+	VersionStatus          PurposeVersionStatus `json:"version_status"`
+	EffectiveFrom          time.Time            `json:"effective_from"`
+	SupersedesVersionID    *string              `json:"supersedes_version_id,omitempty"`
+	PublishedByPrincipalID *string              `json:"published_by_principal_id,omitempty"`
+	PublishedAt            *time.Time           `json:"published_at,omitempty"`
+	CreatedAt              time.Time            `json:"created_at"`
+	CreatedByPrincipalID   string               `json:"created_by_principal_id"`
 }
 
 // ── Processing Activity ──────────────────────────────────────────────────────
@@ -196,27 +208,96 @@ func (s DPIATIAStatus) Valid() bool {
 // themselves set) may change after that point. Amending content means
 // creating a new version.
 type ProcessingActivityVersion struct {
-	ActivityVersionID       string                  `json:"activity_version_id"`
-	ActivityID              string                  `json:"activity_id"`
-	PrivacyRole             PrivacyRole             `json:"privacy_role"`
-	Owner                   string                  `json:"owner"`
-	PurposeIDs              []string                `json:"purpose_ids"`
-	SubjectClasses          []string                `json:"subject_classes"`
-	DataCategories          []string                `json:"data_categories"`
-	Sources                 []string                `json:"sources"`
-	Recipients              []string                `json:"recipients"`
-	Jurisdictions           []string                `json:"jurisdictions"`
-	RetentionRuleRefs       []string                `json:"retention_rule_refs"`
-	TransferRefs            []string                `json:"transfer_refs"`
+	ActivityVersionID string      `json:"activity_version_id"`
+	ActivityID        string      `json:"activity_id"`
+	TenantID          *string     `json:"tenant_id,omitempty"`
+	PrivacyRole       PrivacyRole `json:"privacy_role"`
+	Owner             string      `json:"owner"`         // accountable BUSINESS owner (§8.2 gate 1)
+	PrivacyOwner      string      `json:"privacy_owner"` // accountable PRIVACY owner (§8.2 gate 1)
+	PurposeIDs        []string    `json:"purpose_ids"`
+	SubjectClasses    []string    `json:"subject_classes"`
+	DataCategories    []string    `json:"data_categories"`
+	Sources           []string    `json:"sources"`
+	Recipients        []string    `json:"recipients"`
+	Jurisdictions     []string    `json:"jurisdictions"`
+	RetentionRuleRefs []string    `json:"retention_rule_refs"`
+	TransferRefs      []string    `json:"transfer_refs"`
+	// ProcessorRefs is the service-defined representation of §8.2 gate 6's
+	// "processor dependencies": references to PRV-05 ProcessorRelationships
+	// that carry the documented processing instruction. §7's field list does
+	// not name this field — see README "Spec gaps carried as clarifications".
+	ProcessorRefs           []string                `json:"processor_refs"`
 	NoticeConsentDependency NoticeConsentDependency `json:"notice_consent_dependency,omitempty"`
 	DPIATIAStatus           DPIATIAStatus           `json:"dpia_tia_status,omitempty"`
 	VersionStatus           ActivityVersionStatus   `json:"version_status"`
 	ValidationFindings      []ValidationFinding     `json:"validation_findings,omitempty"`
 	RejectionReason         *string                 `json:"rejection_reason,omitempty"`
-	EffectiveFrom           *time.Time              `json:"effective_from,omitempty"`
-	SupersedesVersionID     *string                 `json:"supersedes_version_id,omitempty"`
-	CreatedAt               time.Time               `json:"created_at"`
-	CreatedByPrincipalID    string                  `json:"created_by_principal_id"`
+	// EffectiveFrom/EffectiveTo bound the VALID-time window (§20.3 "when a
+	// privacy fact/rule became effective"). EffectiveFrom is the server's
+	// activation instant; EffectiveTo is set when the version stops being the
+	// governing one (retired, or superseded by a later activation). The
+	// KNOWLEDGE-time half ("when ZoikoSuite learned/approved it") is
+	// ApprovedAt — see ResolveActivityAsOf.
+	EffectiveFrom          *time.Time `json:"effective_from,omitempty"`
+	EffectiveTo            *time.Time `json:"effective_to,omitempty"`
+	SupersedesVersionID    *string    `json:"supersedes_version_id,omitempty"`
+	ApprovedByPrincipalID  *string    `json:"approved_by_principal_id,omitempty"`
+	ApprovedAt             *time.Time `json:"approved_at,omitempty"`
+	RejectedByPrincipalID  *string    `json:"rejected_by_principal_id,omitempty"`
+	RejectedAt             *time.Time `json:"rejected_at,omitempty"`
+	ActivatedByPrincipalID *string    `json:"activated_by_principal_id,omitempty"`
+	ActivatedAt            *time.Time `json:"activated_at,omitempty"`
+	CreatedAt              time.Time  `json:"created_at"`
+	CreatedByPrincipalID   string     `json:"created_by_principal_id"`
+}
+
+// ── Recognized Jurisdictions & Data Categories Registry (§8.1) ───────────────
+
+// IsValidJurisdiction reports whether j is a registered jurisdiction: an ISO
+// 3166-1 alpha-2 country code or one of the recognised regimes (EU, EEA,
+// GLOBAL) — see jurisdictions.go. Anything else (free text, malformed codes,
+// or two letters that are not an assigned country) is rejected (§8.1). The
+// comparison is case-insensitive; stored values are canonicalised by
+// NormalizeCode.
+func IsValidJurisdiction(j string) bool {
+	j = NormalizeCode(j)
+	if j == "" {
+		return false
+	}
+	return isoAlpha2[j] || regimeJurisdictions[j]
+}
+
+var RecognizedDataCategories = map[string]bool{
+	// Standard personal data categories
+	"CONTACT_INFO": true, "IDENTIFIERS": true, "FINANCIAL": true,
+	"TRANSACTIONAL": true, "EMPLOYMENT": true, "BEHAVIORAL": true,
+	"TECHNICAL": true, "LOCATION": true, "COMMUNICATIONS": true,
+	"USER_CONTENT": true, "ACCOUNT_CREDENTIALS": true,
+
+	// Registered sensitive / special categories (§8.1, GDPR Art. 9, CPRA, HIPAA)
+	"SPECIAL_CATEGORY": true, "HEALTH": true, "BIOMETRIC": true,
+	"GENETIC": true, "RACIAL_ETHNIC": true, "POLITICAL_OPINIONS": true,
+	"RELIGIOUS_PHILOSOPHICAL": true, "TRADE_UNION": true,
+	"SEX_LIFE_ORIENTATION": true, "CRIMINAL_CONVICTIONS": true,
+	"CHILD_DATA": true, "HIGH_RISK": true, "VULNERABLE_SUBJECTS": true,
+}
+
+// IsValidDataCategory checks whether a category is registered in the taxonomy.
+// Arbitrary free-text values are blocked when registry validation is required (§8.1).
+func IsValidDataCategory(cat string) bool {
+	cat = strings.TrimSpace(strings.ToUpper(cat))
+	return RecognizedDataCategories[cat]
+}
+
+func IsSensitiveCategory(cat string) bool {
+	cat = strings.TrimSpace(strings.ToUpper(cat))
+	switch cat {
+	case "SPECIAL_CATEGORY", "HEALTH", "BIOMETRIC", "GENETIC", "RACIAL_ETHNIC",
+		"POLITICAL_OPINIONS", "RELIGIOUS_PHILOSOPHICAL", "TRADE_UNION",
+		"SEX_LIFE_ORIENTATION", "CRIMINAL_CONVICTIONS", "CHILD_DATA", "HIGH_RISK", "VULNERABLE_SUBJECTS":
+		return true
+	}
+	return false
 }
 
 // ValidationFinding is one structural problem Validate found — never a
@@ -242,25 +323,30 @@ type IdempotencyRecord struct {
 // ── Request DTOs ─────────────────────────────────────────────────────────────
 
 type CreatePurposeRequest struct {
-	TenantID           string     `json:"tenant_id,omitempty"`
-	Statement          string     `json:"statement"`
-	CompatibilityClass string     `json:"compatibility_class"`
-	LawfulBasisRefs    []string   `json:"lawful_basis_refs"`
-	EffectiveFrom      *time.Time `json:"effective_from,omitempty"`
+	TenantID             string     `json:"tenant_id,omitempty"`
+	Statement            string     `json:"statement"`
+	CompatibilityClass   string     `json:"compatibility_class"`
+	LawfulBasisRefs      []string   `json:"lawful_basis_refs"`
+	NecessityRationale   string     `json:"necessity_rationale,omitempty"`
+	SpecialConditionRefs []string   `json:"special_condition_refs"`
+	EffectiveFrom        *time.Time `json:"effective_from,omitempty"`
 }
 
 type CreatePurposeVersionRequest struct {
-	ParentVersionID    string     `json:"parent_version_id"`
-	Statement          string     `json:"statement"`
-	CompatibilityClass string     `json:"compatibility_class"`
-	LawfulBasisRefs    []string   `json:"lawful_basis_refs"`
-	EffectiveFrom      *time.Time `json:"effective_from,omitempty"`
+	ParentVersionID      string     `json:"parent_version_id"`
+	Statement            string     `json:"statement"`
+	CompatibilityClass   string     `json:"compatibility_class"`
+	LawfulBasisRefs      []string   `json:"lawful_basis_refs"`
+	NecessityRationale   string     `json:"necessity_rationale,omitempty"`
+	SpecialConditionRefs []string   `json:"special_condition_refs"`
+	EffectiveFrom        *time.Time `json:"effective_from,omitempty"`
 }
 
 type CreateActivityRequest struct {
 	TenantID                string   `json:"tenant_id,omitempty"`
 	PrivacyRole             string   `json:"privacy_role"`
 	Owner                   string   `json:"owner"`
+	PrivacyOwner            string   `json:"privacy_owner"`
 	PurposeIDs              []string `json:"purpose_ids"`
 	SubjectClasses          []string `json:"subject_classes"`
 	DataCategories          []string `json:"data_categories"`
@@ -269,6 +355,7 @@ type CreateActivityRequest struct {
 	Jurisdictions           []string `json:"jurisdictions"`
 	RetentionRuleRefs       []string `json:"retention_rule_refs"`
 	TransferRefs            []string `json:"transfer_refs"`
+	ProcessorRefs           []string `json:"processor_refs"`
 	NoticeConsentDependency string   `json:"notice_consent_dependency,omitempty"`
 	DPIATIAStatus           string   `json:"dpia_tia_status,omitempty"`
 }
@@ -277,6 +364,7 @@ type CreateActivityVersionRequest struct {
 	ParentVersionID         string   `json:"parent_version_id"`
 	PrivacyRole             string   `json:"privacy_role"`
 	Owner                   string   `json:"owner"`
+	PrivacyOwner            string   `json:"privacy_owner"`
 	PurposeIDs              []string `json:"purpose_ids"`
 	SubjectClasses          []string `json:"subject_classes"`
 	DataCategories          []string `json:"data_categories"`
@@ -285,6 +373,7 @@ type CreateActivityVersionRequest struct {
 	Jurisdictions           []string `json:"jurisdictions"`
 	RetentionRuleRefs       []string `json:"retention_rule_refs"`
 	TransferRefs            []string `json:"transfer_refs"`
+	ProcessorRefs           []string `json:"processor_refs"`
 	NoticeConsentDependency string   `json:"notice_consent_dependency,omitempty"`
 	DPIATIAStatus           string   `json:"dpia_tia_status,omitempty"`
 }
@@ -311,6 +400,27 @@ var (
 	ErrActivityVersionNotFound = errorString("processing activity version not found")
 	ErrInvalidTransition       = errorString("invalid activity version status transition")
 	ErrStoreUnavailable        = errorString("privacy-purpose-registry store unavailable")
-	ErrSelfApprovalForbidden  = errorString("maker-checker segregation of duties violation: creator cannot approve or publish own object")
+	ErrSelfApprovalForbidden   = errorString("maker-checker segregation of duties violation: creator cannot approve or publish own object")
 	ErrIdempotencyKeyReused    = errorString("idempotency key reused with different request payload")
+	ErrEffectiveTimeInvalid    = errorString("effective_from must be omitted or equal to the server activation time (no backdating, no future-dating)")
 )
+
+// ActivityEventPayload is the payload of every privacy.processing_activity.*
+// event (§19: "tenant, activity/version, effective time, purpose/role scope,
+// policy refs"). It embeds the full version — so existing consumers reading
+// the version fields keep working — and adds the fields §19 names that the
+// version row does not carry on its own.
+type ActivityEventPayload struct {
+	ProcessingActivityVersion
+	// PreviousStatus is the status the version left; empty for the first
+	// state a version is announced in.
+	PreviousStatus ActivityVersionStatus `json:"previous_status,omitempty"`
+	// PolicyRefs is the governed policy surface the version operates under:
+	// the lawful-basis and special-condition references of its linked
+	// published purposes, plus its own retention, transfer and processor
+	// references. Never nil, so consumers can range over it unconditionally.
+	PolicyRefs []string `json:"policy_refs"`
+	// SupersededByVersionID is set on the retired event emitted for a version
+	// that stopped governing because a later version was activated.
+	SupersededByVersionID *string `json:"superseded_by_version_id,omitempty"`
+}

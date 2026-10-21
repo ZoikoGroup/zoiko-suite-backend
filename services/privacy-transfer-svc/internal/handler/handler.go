@@ -37,6 +37,31 @@ const (
 	PrivacyTransferDecisionEvaluate = "PRIVACY_TRANSFER_DECISION_EVALUATE"
 )
 
+// §19 Event Contracts owned by PRV-05. The service emits exactly these
+// three event types and no others — the previous non-spec names
+// ("privacy.processor_relationship.created", "privacy.transfer_decision.
+// evaluated") had no consumers anywhere in this repository (verified:
+// privacy-decision-svc integrates over HTTP, not Kafka) and were not in
+// the §19 catalogue, so they are superseded rather than emitted
+// alongside, which would publish undeclared events.
+const (
+	// EventTransferAuthorizationChanged — §19: "authorization, route/
+	// provider scope, state, conditions, expiry" → GTRM, XIC, data export
+	// services. Emitted by EvaluateTransfer.
+	EventTransferAuthorizationChanged = "privacy.transfer.authorization_changed"
+	// EventProcessorChanged — §19: "processor/subprocessor, activity scope,
+	// state, effective time" → XIC, procurement/vendor systems, domain
+	// owners. Emitted on relationship create, relationship status change
+	// and subprocessor attach.
+	EventProcessorChanged = "privacy.processor.changed"
+	// EventAssessmentExpiring — §19: "assessment, scope, expiry/review
+	// trigger" → WFC/privacy owner; never silently renew. Emitted when an
+	// assessment whose review/expiry trigger is declared is recorded;
+	// this service has no scheduler, so the event announces the trigger
+	// date for consumer-side expiry tracking.
+	EventAssessmentExpiring = "privacy.assessment.expiring"
+)
+
 const platformScopeID = "00000000-0000-0000-0000-00000000f001"
 
 type AuthzChecker interface {
@@ -177,6 +202,51 @@ func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (stri
 	return principalID, true
 }
 
+// requireCorrelationID enforces §18.1's "actor/service context … and
+// correlation ID" carrier on every mutating API. A missing or blank
+// correlation id is rejected before any side effect (idempotency
+// persistence, store mutation or event publication). The value is echoed
+// into events exactly as before.
+func (h *Handler) requireCorrelationID(w http.ResponseWriter, r *http.Request) (string, bool) {
+	correlationID := strings.TrimSpace(r.Header.Get("X-Correlation-ID"))
+	if correlationID == "" {
+		writeError(w, http.StatusBadRequest, "X-Correlation-ID header is required")
+		return "", false
+	}
+	return correlationID, true
+}
+
+// requireIdempotencyKey enforces §18.1's mandatory idempotency key on every
+// mutating API (the README documents "All mutating APIs enforce the
+// Idempotency-Key header"). Missing or blank keys are rejected before any
+// side effect. The existing replay/conflict semantics are unchanged — this
+// only makes a key that was previously optional mandatory.
+func (h *Handler) requireIdempotencyKey(w http.ResponseWriter, r *http.Request) (string, bool) {
+	key := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	if key == "" {
+		key = strings.TrimSpace(r.Header.Get("X-Idempotency-Key"))
+	}
+	if key == "" {
+		writeError(w, http.StatusBadRequest, "Idempotency-Key header is required")
+		return "", false
+	}
+	return key, true
+}
+
+// requireMutationPreconditions enforces the mandatory service-boundary
+// headers (§18.1) on the six mutating routes, after authentication and
+// authorization and before any idempotency lookup/persistence, database
+// mutation, business-state change or event publication.
+func (h *Handler) requireMutationPreconditions(w http.ResponseWriter, r *http.Request) bool {
+	if _, ok := h.requireCorrelationID(w, r); !ok {
+		return false
+	}
+	if _, ok := h.requireIdempotencyKey(w, r); !ok {
+		return false
+	}
+	return true
+}
+
 func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID, tenantID, actionType string) bool {
 	scope := platformScopeID
 	if tenantID != "" {
@@ -233,6 +303,10 @@ func (h *Handler) CreateRelationship(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !h.requireMutationPreconditions(w, r) {
+		return
+	}
+
 	// Check idempotency (§18.1)
 	_, handled, idemKey, reqHash := h.checkIdempotency(w, r, tenantID, principalID, bodyBytes)
 	if handled {
@@ -260,7 +334,7 @@ func (h *Handler) CreateRelationship(w http.ResponseWriter, r *http.Request) {
 	}
 
 	_ = h.pub.Publish(r.Context(), events.PublishParams{
-		EventType: "privacy.processor_relationship.created", EntityID: relationship.RelationshipID, TenantID: tenantID,
+		EventType: EventProcessorChanged, EntityID: relationship.RelationshipID, TenantID: tenantID,
 		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: relationship,
 	})
 	h.writeJSONWithIdempotency(r.Context(), w, tenantID, principalID, "CreateRelationship", idemKey, reqHash, http.StatusCreated, relationship)
@@ -333,6 +407,10 @@ func (h *Handler) UpdateRelationshipStatus(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	if !h.requireMutationPreconditions(w, r) {
+		return
+	}
+
 	// Check idempotency (§18.1)
 	_, handled, idemKey, reqHash := h.checkIdempotency(w, r, tenantID, principalID, bodyBytes)
 	if handled {
@@ -349,6 +427,12 @@ func (h *Handler) UpdateRelationshipStatus(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusServiceUnavailable, "store unavailable")
 		return
 	}
+	// §19 privacy.processor.changed — a status transition is a processor
+	// state change (state + effective time) consumers must see.
+	_ = h.pub.Publish(r.Context(), events.PublishParams{
+		EventType: EventProcessorChanged, EntityID: updated.RelationshipID, TenantID: tenantID,
+		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: updated,
+	})
 	h.writeJSONWithIdempotency(r.Context(), w, tenantID, principalID, "UpdateRelationshipStatus", idemKey, reqHash, http.StatusOK, updated)
 }
 
@@ -393,6 +477,10 @@ func (h *Handler) AttachSubprocessor(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !h.requireMutationPreconditions(w, r) {
+		return
+	}
+
 	// Check idempotency (§18.1)
 	_, handled, idemKey, reqHash := h.checkIdempotency(w, r, tenantID, principalID, bodyBytes)
 	if handled {
@@ -409,6 +497,11 @@ func (h *Handler) AttachSubprocessor(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "store unavailable")
 		return
 	}
+	// §19 privacy.processor.changed — "processor/subprocessor … state".
+	_ = h.pub.Publish(r.Context(), events.PublishParams{
+		EventType: EventProcessorChanged, EntityID: sp.SubprocessorID, TenantID: tenantID,
+		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: sp,
+	})
 	h.writeJSONWithIdempotency(r.Context(), w, tenantID, principalID, "AttachSubprocessor", idemKey, reqHash, http.StatusCreated, sp)
 }
 
@@ -463,6 +556,10 @@ func (h *Handler) CreateMechanism(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !h.authorize(w, r, principalID, tenantID, PrivacyTransferMechanismManage) {
+		return
+	}
+
+	if !h.requireMutationPreconditions(w, r) {
 		return
 	}
 
@@ -540,6 +637,10 @@ func (h *Handler) RecordAssessment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !h.requireMutationPreconditions(w, r) {
+		return
+	}
+
 	// Check idempotency (§18.1)
 	_, handled, idemKey, reqHash := h.checkIdempotency(w, r, tenantID, principalID, bodyBytes)
 	if handled {
@@ -551,6 +652,16 @@ func (h *Handler) RecordAssessment(w http.ResponseWriter, r *http.Request) {
 		h.log.Error("RecordAssessment: store unavailable", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store unavailable")
 		return
+	}
+	// §19 privacy.assessment.expiring — emitted when the recorded
+	// assessment declares its §17.1 expiry/review trigger, so WFC/the
+	// privacy owner can schedule reassessment and never silently renew.
+	// PRV-05 has no scheduler; the event carries the trigger date.
+	if assessment.ReviewTriggerAt != nil {
+		_ = h.pub.Publish(r.Context(), events.PublishParams{
+			EventType: EventAssessmentExpiring, EntityID: assessment.AssessmentID, TenantID: tenantID,
+			ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: assessment,
+		})
 	}
 	h.writeJSONWithIdempotency(r.Context(), w, tenantID, principalID, "RecordAssessment", idemKey, reqHash, http.StatusCreated, assessment)
 }
@@ -617,6 +728,10 @@ func (h *Handler) EvaluateTransfer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !h.requireMutationPreconditions(w, r) {
+		return
+	}
+
 	// Check idempotency (§18.1)
 	_, handled, idemKey, reqHash := h.checkIdempotency(w, r, tenantID, principalID, bodyBytes)
 	if handled {
@@ -627,6 +742,13 @@ func (h *Handler) EvaluateTransfer(w http.ResponseWriter, r *http.Request) {
 	decision := &domain.TransferDecision{
 		RelationshipID: req.RelationshipID, TransferMechanismID: req.TransferMechanismID,
 		DestinationJurisdiction: req.DestinationJurisdiction, ActorPrincipalID: principalID, CorrelationID: correlationID,
+		// §16.1 TransferContext — recorded verbatim as authorization
+		// evidence. Whitespace-only declarations normalise to "absent".
+		ExporterRole:         strings.TrimSpace(req.ExporterRole),
+		ImporterRole:         strings.TrimSpace(req.ImporterRole),
+		OriginJurisdiction:   strings.TrimSpace(req.OriginJurisdiction),
+		RouteProvider:        strings.TrimSpace(req.RouteProvider),
+		FrequencyVolumeClass: strings.TrimSpace(req.FrequencyVolumeClass),
 	}
 
 	result, reasonCodes := h.evaluate(r.Context(), &req, decision)
@@ -638,9 +760,18 @@ func (h *Handler) EvaluateTransfer(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "store unavailable")
 		return
 	}
+	// §18 critical response field authorization_id must always be present
+	// on the wire regardless of which store assigned the decision id.
+	if decision.AuthorizationID == "" {
+		decision.AuthorizationID = decision.DecisionID
+	}
 
+	// §19 privacy.transfer.authorization_changed — "authorization, route/
+	// provider scope, state, conditions, expiry". Events communicate
+	// already-committed state (§19.1), so this is published only after the
+	// decision is durably recorded.
 	_ = h.pub.Publish(r.Context(), events.PublishParams{
-		EventType: "privacy.transfer_decision.evaluated", EntityID: decision.DecisionID, TenantID: tenantID,
+		EventType: EventTransferAuthorizationChanged, EntityID: decision.DecisionID, TenantID: tenantID,
 		ActorID: principalID, CorrelationID: correlationID, Payload: decision,
 	})
 	h.writeJSONWithIdempotency(r.Context(), w, tenantID, principalID, "EvaluateTransfer", idemKey, reqHash, http.StatusOK, decision)
@@ -665,6 +796,34 @@ func (h *Handler) evaluate(ctx context.Context, req *domain.EvaluateTransferRequ
 	}
 	if relationship.Status != domain.RelationshipActive {
 		return domain.ResultBlocked, makeReasons(domain.ReasonRelationshipNotActive, "PROCESSOR_RELATIONSHIP_NOT_ACTIVE")
+	}
+	if strings.TrimSpace(relationship.ProcessingInstructions) == "" {
+		return domain.ResultBlocked, makeReasons(domain.ReasonInstructionMissing, "PROCESSOR_INSTRUCTION_MISSING")
+	}
+
+	// §17.2 — "If a required DPIA/TIA, transfer mechanism, controller
+	// instruction or subprocessor approval is missing, expired or
+	// conflicted, PRV-05 returns BLOCKED or REVIEW_REQUIRED."
+	//
+	// §16.1 models a subprocessor's "notification/approval model" as the
+	// control that records how that downstream processor is governed. An
+	// attached subprocessor with no approval model on file is therefore an
+	// unapproved subprocessor, and the transfer is blocked with the §32
+	// code PRV-018 rather than silently permitted. This is a relationship-
+	// level gate, grouped with the controller-instruction gate above; a
+	// relationship with no subprocessors has nothing to approve and skips
+	// it. (OD-10's processor/subprocessor approval *capability matrix* is
+	// still open, so the service takes the §33.1 safer explicit state —
+	// BLOCK — rather than inventing a local approval default.)
+	subprocessors, err := h.store.ListSubprocessors(ctx, req.RelationshipID)
+	if err != nil {
+		h.log.Error("evaluate: subprocessor lookup failed", zap.Error(err))
+		return domain.ResultReviewRequired, makeReasons(domain.ReasonDependencyUnavailable, "DEPENDENCY_UNAVAILABLE")
+	}
+	for _, sp := range subprocessors {
+		if strings.TrimSpace(sp.NotificationApprovalModel) == "" {
+			return domain.ResultBlocked, makeReasons(domain.ReasonSubprocessorNotApproved, "SUBPROCESSOR_NOT_APPROVED")
+		}
 	}
 
 	mechanism, err := h.store.FindMechanism(ctx, req.TransferMechanismID)

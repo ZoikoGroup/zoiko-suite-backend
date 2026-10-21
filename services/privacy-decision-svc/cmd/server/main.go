@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
@@ -17,7 +16,6 @@ import (
 
 	"zoiko.io/privacy-decision-svc/internal/config"
 	"zoiko.io/privacy-decision-svc/internal/consentregistry"
-	"zoiko.io/privacy-decision-svc/internal/events"
 	"zoiko.io/privacy-decision-svc/internal/handler"
 	"zoiko.io/privacy-decision-svc/internal/health"
 	"zoiko.io/privacy-decision-svc/internal/middleware"
@@ -54,20 +52,20 @@ func main() {
 	poolCfg.HealthCheckPeriod = 1 * time.Minute
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
-		logger.Warn("unable to connect to database on startup", zap.Error(err))
-	} else {
-		logger.Info("connected to postgres database")
+		logger.Fatal("failed to initialize db pool", zap.Error(err))
 	}
+	if err := pool.Ping(ctx); err != nil {
+		logger.Fatal("failed to connect to postgres database on startup", zap.Error(err))
+	}
+	logger.Info("connected to postgres database and ping succeeded")
 
 	pgStore := store.NewPgStore(pool, logger)
-	brokers := strings.Split(cfg.KafkaBrokers, ",")
-	publisher := events.NewKafkaPublisher(brokers, cfg.KafkaEventsTopic, logger)
 	purposeClient := purposeregistry.NewClient(cfg.PurposeRegistryURL)
 	consentClient := consentregistry.NewClient(cfg.ConsentRegistryURL)
 	holdClient := retentionregistry.NewClient(cfg.RetentionRegistryURL)
 	transferClient := transferregistry.NewClient(cfg.TransferServiceURL)
 
-	h := handler.New(pgStore, publisher, purposeClient, consentClient, holdClient, transferClient, logger)
+	h := handler.New(pgStore, purposeClient, consentClient, holdClient, transferClient, logger)
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)
