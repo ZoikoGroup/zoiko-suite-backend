@@ -100,7 +100,17 @@ func (w *Worker) processBatch(ctx context.Context) {
 			LegalEntityID: stringField(payload, "legal_entity_id"),
 			ActorID:       stringField(payload, "evaluated_for_principal_id"),
 			CorrelationID: stringField(payload, "correlation_id"),
-			Payload:       row.Payload,
+
+			CausationID:         stringField(payload, "causation_id"),
+			JurisdictionContext: stringField(payload, "jurisdiction_context"),
+			AggregateType:       row.AggregateType,
+			AggregateID:         row.AggregateID,
+			Payload:             row.Payload,
+		}
+		if ids, ok := payload["requirement_ids"]; ok {
+			if refs, err := json.Marshal(map[string]any{"requirement_ids": ids}); err == nil {
+				env.GoverningRefs = refs
+			}
 		}
 		envBytes, err := json.Marshal(env)
 		if err != nil {
@@ -112,8 +122,9 @@ func (w *Worker) processBatch(ctx context.Context) {
 		}
 
 		// Publish to Kafka
+		// Partition key hash(tenant, aggregate) (Event Catalogue §5.3).
 		msg := kafka.Message{
-			Key:   []byte(row.AggregateID),
+			Key:   []byte(env.TenantID + "/" + row.AggregateID),
 			Value: envBytes,
 		}
 		if err := w.kafkaWriter.WriteMessages(ctx, msg); err != nil {
@@ -196,15 +207,23 @@ func (w *Worker) markFailed(ctx context.Context, ids []string, errMsg string) er
 
 // EventEnvelope is the domain event envelope (copied from events/publisher.go)
 type EventEnvelope struct {
-	EventID       string          `json:"event_id"`
-	EventType     string          `json:"event_type"`
-	EventVersion  string          `json:"event_version"`
-	EmittedAt     time.Time       `json:"emitted_at"`
-	SchemaVersion string          `json:"schema_version"`
-	SourceService string          `json:"source_service"`
-	TenantID      string          `json:"tenant_id,omitempty"`
-	LegalEntityID string          `json:"legal_entity_id,omitempty"`
-	ActorID       string          `json:"actor_id,omitempty"`
-	CorrelationID string          `json:"correlation_id"`
-	Payload       json.RawMessage `json:"payload"`
+	EventID       string    `json:"event_id"`
+	EventType     string    `json:"event_type"`
+	EventVersion  string    `json:"event_version"`
+	EmittedAt     time.Time `json:"emitted_at"`
+	SchemaVersion string    `json:"schema_version"`
+	SourceService string    `json:"source_service"`
+	TenantID      string    `json:"tenant_id,omitempty"`
+	LegalEntityID string    `json:"legal_entity_id,omitempty"`
+	ActorID       string    `json:"actor_id,omitempty"`
+	CorrelationID string    `json:"correlation_id"`
+	// GCP §16 / Doc 03 §19 event minimum: what caused this, under which
+	// jurisdiction, and the governing references (the requirement set the
+	// determination was tested against).
+	CausationID         string          `json:"causation_id,omitempty"`
+	JurisdictionContext string          `json:"jurisdiction_context,omitempty"`
+	AggregateType       string          `json:"aggregate_type,omitempty"`
+	AggregateID         string          `json:"aggregate_id,omitempty"`
+	GoverningRefs       json.RawMessage `json:"governing_refs,omitempty"`
+	Payload             json.RawMessage `json:"payload"`
 }

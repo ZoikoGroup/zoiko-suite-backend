@@ -441,10 +441,10 @@ func TestEvaluate_IdempotencyMismatch_Returns409(t *testing.T) {
 	assert.Contains(t, rec.Body.String(), "idempotency_mismatch")
 }
 
-func TestEvaluate_MissingTenant_Returns400(t *testing.T) {
+func TestEvaluate_MissingTenant_Returns401(t *testing.T) {
 	h := newRouter(&stubStore{}, &stubPublisher{}, &stubAuthz{}, &stubDocs{})
 	rec := do(t, h, http.MethodPost, "/v1/evidence/evaluate", evaluateBody(), "", testPrincipal)
-	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Equal(t, http.StatusUnauthorized, rec.Code, "the same fault answered 400 here and 401 at the envelope")
 	assert.Contains(t, rec.Body.String(), "missing_tenant",
 		"absent tenant scope must be rejected, never defaulted to a placeholder tenant")
 }
@@ -642,7 +642,7 @@ func TestEndDate_CallsAuthorization(t *testing.T) {
 func TestListRequirements_NoTenantScope_Refused(t *testing.T) {
 	h := newRouter(&stubStore{}, &stubPublisher{}, &stubAuthz{}, &stubDocs{})
 	rec := do(t, h, http.MethodGet, "/v1/evidence-requirements", nil, "", testPrincipal)
-	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
 }
 
 func TestListRequirements_NoQueryParam_UsesVerifiedScope(t *testing.T) {

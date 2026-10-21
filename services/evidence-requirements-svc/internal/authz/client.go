@@ -35,6 +35,7 @@ import (
 	svcenvelope "zoiko.io/evidence-requirements-svc/internal/envelope"
 
 	"go.uber.org/zap"
+	idenv "zoiko.io/identity-envelope"
 
 	"zoiko.io/evidence-requirements-svc/internal/domain"
 )
@@ -121,7 +122,14 @@ type authorizeResponse struct {
 }
 
 func (c *HTTPClient) CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error {
-	key := principalID + "|" + legalEntityID + "|" + actionType
+	// The tenant is part of the decision: the same principal and entity
+	// scope in another tenant (PLATFORM above all) is a different question,
+	// and a cached GRANTED must not answer it.
+	tenantID := ""
+	if env, ok := svcenvelope.FromContext(ctx); ok {
+		tenantID = env.TenantID
+	}
+	key := tenantID + "|" + principalID + "|" + legalEntityID + "|" + actionType
 
 	if decision, hit := c.lookupCache(key); hit {
 		return decision
@@ -229,8 +237,11 @@ func (c *HTTPClient) checkAllowedLive(ctx context.Context, principalID, legalEnt
 	// several actions, and each is its own decision to record.
 	req.Header.Set("Idempotency-Key", authzRequestID+":"+actionType)
 
-	// Forward the caller's canonical envelope for downstream traceability
+	// Forward the caller's canonical envelope for downstream traceability,
+	// and the verified identity envelope so the decision is attributed to the
+	// person (X-82i) and authorization-svc sees the authentication age.
 	svcenvelope.ForwardTo(ctx, req)
+	idenv.Forward(ctx, req)
 
 	resp, err := c.http.Do(req)
 	if err != nil {

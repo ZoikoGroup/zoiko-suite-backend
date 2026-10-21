@@ -272,4 +272,9 @@ var (
 	ErrDocumentNotFound           = errorString("referenced document not found")
 	ErrDocumentMismatch           = errorString("referenced document belongs to a different tenant or legal entity")
 	ErrDocumentServiceUnavailable = errorString("document-vault-svc unavailable")
+
+	// The legal entity is not held by tenant-entity-registry-svc in the
+	// caller's tenant, or the registry could not answer (fail-closed).
+	ErrLegalEntityNotFound = errorString("legal entity does not exist in this tenant")
+	ErrRegistryUnavailable = errorString("tenant-entity-registry-svc unavailable")
 )

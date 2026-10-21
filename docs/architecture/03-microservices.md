@@ -784,6 +784,8 @@ Errors carry the GCP §16 stable class in `code`. A conflict between two equally
 
 - evidence.requirement.satisfied
 
+*Physical surface (21 Oct 2026): `services/evidence-requirements-svc/openapi.yaml` — `POST /v1/evidence/evaluate` (outcomes SATISFIED / MISSING / NO_REQUIREMENTS_DEFINED; the last is never reported as satisfied and the caller decides), the requirement catalogue under `/v1/evidence-requirements` and `/v1/admin/evidence-requirements`, and the provided-by-client workflow under `/v1/pbc`.*
+
 **Critical Constraint**
  No finalization path may skip required evidence states.
 

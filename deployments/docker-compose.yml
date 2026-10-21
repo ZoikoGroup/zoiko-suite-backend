@@ -2728,13 +2728,16 @@ services:
   # `jurisdiction-svc` (the service key) was required.
   evidence-requirements-svc:
     build:
-      context: ../services/evidence-requirements-svc
-      dockerfile: Dockerfile
+      # Root context: go.mod replaces zoiko.io/identity-envelope with the
+      # sibling module, so the build must see both.
+      context: ..
+      dockerfile: services/evidence-requirements-svc/Dockerfile
     container_name: evidence-requirements-svc
     mem_limit: 256m
     cpus: "0.5"
     ports:
-      - "8130:8130"
+      # Loopback only while the identity gate runs in warn mode.
+      - "127.0.0.1:8130:8130"
     environment:
       PORT: "8130"
       DB_HOST: postgres
@@ -2747,6 +2750,19 @@ services:
       KAFKA_EVENTS_TOPIC: "zoiko.evidence-requirements.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       DOCUMENT_VAULT_SERVICE_URL: "http://document-vault-svc:8094"
+      # The legal entity of every evaluation and requirement is confirmed here.
+      TENANT_REGISTRY_URL: "http://tenant-entity-registry-svc:8081"
+      # Evaluate is gated on EVIDENCE_EVALUATE (decided 21 Oct 2026). warn on the
+      # local stack until the callers outside the governance domains
+      # (board-resolutions, corporate-actions, filing-preparation) have their
+      # principals granted; the code default is enforce. Reads enforce.
+      EVIDENCE_EVALUATE_AUTHZ: "${EVIDENCE_EVALUATE_AUTHZ:-warn}"
+      EVIDENCE_READ_AUTHZ: "${EVIDENCE_READ_AUTHZ:-enforce}"
+      # Identity gate (X5 / X-R3); see obligations-svc for the semantics.
+      IDENTITY_VERIFY: "${EVIDENCE_IDENTITY_VERIFY:-warn}"
+      IDENTITY_JWKS_URL: "http://identity-context-svc:8080/.well-known/jwks.json"
+      IDENTITY_INTROSPECT_URL: "http://identity-context-svc:8080/v1/context/session/introspect"
+      IDENTITY_ISSUER: "identity-context-svc"
     depends_on:
       postgres:
         condition: service_healthy
@@ -2755,6 +2771,8 @@ services:
       authorization-svc:
         condition: service_healthy
       document-vault-svc:
+        condition: service_healthy
+      tenant-svc:
         condition: service_healthy
     healthcheck:
       # readyz, not healthz: liveness answers 200 whenever the process is up, so a
