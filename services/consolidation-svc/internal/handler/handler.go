@@ -43,12 +43,12 @@ type Store interface {
 	// 000003's doc comment.
 	GroupEntityHasRun(ctx context.Context, groupLegalEntityID string) (bool, error)
 	HasSnapshotForPeriod(ctx context.Context, groupLegalEntityID, fiscalPeriod string) (bool, error)
-	CreateAdjustment(ctx context.Context, a *domain.ConsolidationAdjustment) error
+	CreateAdjustment(ctx context.Context, a *domain.ConsolidationAdjustment, correlationID string) error
 	GetAdjustment(ctx context.Context, id string) (*domain.ConsolidationAdjustment, error)
 	ListAdjustments(ctx context.Context, groupLegalEntityID, fiscalPeriod string) ([]domain.ConsolidationAdjustment, error)
-	ApproveAdjustment(ctx context.Context, id, principalID string) error
-	MarkAdjustmentPosted(ctx context.Context, id, principalID, journalID string) error
-	ReverseAdjustment(ctx context.Context, id, principalID, reason string, supersededBy *string) error
+	ApproveAdjustment(ctx context.Context, id, principalID, correlationID string) error
+	MarkAdjustmentPosted(ctx context.Context, id, principalID, journalID, correlationID string) error
+	ReverseAdjustment(ctx context.Context, id, principalID, reason string, supersededBy *string, correlationID string) error
 }
 
 type AuthZClient interface {
@@ -570,7 +570,7 @@ func (h *Handler) CreateEliminationProposal(w http.ResponseWriter, r *http.Reque
 		CreatedAt:            now,
 		CreatedByPrincipalID: principalID,
 	}
-	if err := h.store.CreateAdjustment(r.Context(), adjustment); err != nil {
+	if err := h.store.CreateAdjustment(r.Context(), adjustment, getCorrelationID(r)); err != nil {
 		h.log.Error("failed to create consolidation adjustment", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
@@ -665,7 +665,7 @@ func (h *Handler) ApproveConsolidationAdjustment(w http.ResponseWriter, r *http.
 		return
 	}
 
-	if err := h.store.ApproveAdjustment(r.Context(), id, principalID); err != nil {
+	if err := h.store.ApproveAdjustment(r.Context(), id, principalID, getCorrelationID(r)); err != nil {
 		if errors.Is(err, domain.ErrInvalidAdjustmentTransition) {
 			writeError(w, http.StatusUnprocessableEntity, "invalid_transition", err.Error())
 			return
@@ -720,7 +720,7 @@ func (h *Handler) PostConsolidationAdjustment(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	if err := h.store.MarkAdjustmentPosted(r.Context(), id, principalID, journalID); err != nil {
+	if err := h.store.MarkAdjustmentPosted(r.Context(), id, principalID, journalID, correlationID); err != nil {
 		h.log.Error("consolidation adjustment journal posted but the adjustment could not be marked POSTED",
 			zap.String("consolidation_adjustment_id", id), zap.String("journal_id", journalID), zap.Error(err))
 		writeError(w, http.StatusInternalServerError, "adjustment_not_recorded",
@@ -817,7 +817,7 @@ func (h *Handler) ReverseConsolidationAdjustment(w http.ResponseWriter, r *http.
 		}
 	}
 
-	if err := h.store.ReverseAdjustment(r.Context(), id, principalID, req.Reason, req.SupersededByAdjustmentID); err != nil {
+	if err := h.store.ReverseAdjustment(r.Context(), id, principalID, req.Reason, req.SupersededByAdjustmentID, getCorrelationID(r)); err != nil {
 		if errors.Is(err, domain.ErrInvalidAdjustmentTransition) {
 			writeError(w, http.StatusUnprocessableEntity, "invalid_transition", err.Error())
 			return

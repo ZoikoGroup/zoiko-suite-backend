@@ -125,7 +125,7 @@ func TestPgStore_ACC12_FullLifecycle_ApprovePostReverse_RealDB(t *testing.T) {
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
 	adj := newTestAdjustment(tenantID, "group-1", "preparer-1")
-	if err := s.CreateAdjustment(ctx, adj); err != nil {
+	if err := s.CreateAdjustment(ctx, adj, "corr-1"); err != nil {
 		t.Fatalf("CreateAdjustment: %v", err)
 	}
 
@@ -137,11 +137,11 @@ func TestPgStore_ACC12_FullLifecycle_ApprovePostReverse_RealDB(t *testing.T) {
 		t.Fatalf("expected lines round-tripped through JSONB, got %+v", got.Lines)
 	}
 
-	if err := s.ApproveAdjustment(ctx, adj.ConsolidationAdjustmentID, "approver-1"); err != nil {
+	if err := s.ApproveAdjustment(ctx, adj.ConsolidationAdjustmentID, "approver-1", "corr-1"); err != nil {
 		t.Fatalf("ApproveAdjustment: %v", err)
 	}
 	journalID := uuid.New().String()
-	if err := s.MarkAdjustmentPosted(ctx, adj.ConsolidationAdjustmentID, "poster-1", journalID); err != nil {
+	if err := s.MarkAdjustmentPosted(ctx, adj.ConsolidationAdjustmentID, "poster-1", journalID, "corr-1"); err != nil {
 		t.Fatalf("MarkAdjustmentPosted: %v", err)
 	}
 	got, err = s.GetAdjustment(ctx, adj.ConsolidationAdjustmentID)
@@ -156,11 +156,11 @@ func TestPgStore_ACC12_FullLifecycle_ApprovePostReverse_RealDB(t *testing.T) {
 	// a real row — the same "no phantom supersession" guarantee that FK
 	// gives for free.
 	replacement := newTestAdjustment(tenantID, "group-1", "preparer-1")
-	if err := s.CreateAdjustment(ctx, replacement); err != nil {
+	if err := s.CreateAdjustment(ctx, replacement, "corr-1"); err != nil {
 		t.Fatalf("CreateAdjustment (replacement): %v", err)
 	}
 
-	if err := s.ReverseAdjustment(ctx, adj.ConsolidationAdjustmentID, "reverser-1", "correction", &replacement.ConsolidationAdjustmentID); err != nil {
+	if err := s.ReverseAdjustment(ctx, adj.ConsolidationAdjustmentID, "reverser-1", "correction", &replacement.ConsolidationAdjustmentID, "corr-1"); err != nil {
 		t.Fatalf("ReverseAdjustment: %v", err)
 	}
 	got, err = s.GetAdjustment(ctx, adj.ConsolidationAdjustmentID)
@@ -182,15 +182,15 @@ func TestPgStore_ACC12_ApproveFromWrongStatus_Refused(t *testing.T) {
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
 	adj := newTestAdjustment(tenantID, "group-1", "preparer-1")
-	if err := s.CreateAdjustment(ctx, adj); err != nil {
+	if err := s.CreateAdjustment(ctx, adj, "corr-1"); err != nil {
 		t.Fatalf("CreateAdjustment: %v", err)
 	}
-	if err := s.ApproveAdjustment(ctx, adj.ConsolidationAdjustmentID, "approver-1"); err != nil {
+	if err := s.ApproveAdjustment(ctx, adj.ConsolidationAdjustmentID, "approver-1", "corr-1"); err != nil {
 		t.Fatalf("first ApproveAdjustment: %v", err)
 	}
 	// A second approval attempt must fail — the adjustment is now APPROVED,
 	// not PENDING_APPROVAL.
-	if err := s.ApproveAdjustment(ctx, adj.ConsolidationAdjustmentID, "approver-2"); err == nil {
+	if err := s.ApproveAdjustment(ctx, adj.ConsolidationAdjustmentID, "approver-2", "corr-1"); err == nil {
 		t.Fatal("expected a second ApproveAdjustment to be refused")
 	}
 }
@@ -206,7 +206,7 @@ func TestPgStore_ACC12_InvalidAdjustmentType_RejectedByCheckConstraint(t *testin
 
 	adj := newTestAdjustment(tenantID, "group-1", "preparer-1")
 	adj.AdjustmentType = "NOT_A_REAL_TYPE"
-	if err := s.CreateAdjustment(ctx, adj); err == nil {
+	if err := s.CreateAdjustment(ctx, adj, "corr-1"); err == nil {
 		t.Fatal("expected the CHECK constraint to reject an unrecognized adjustment_type value")
 	}
 }

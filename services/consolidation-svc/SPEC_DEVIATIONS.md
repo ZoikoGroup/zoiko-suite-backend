@@ -142,11 +142,13 @@ consolidation entries in a group entity's statutory ledger.
   indirectly, if it reached the GL (A1) and the group entity happens to be one
   of the children. Once A1 is decided, a run must apply POSTED, unreversed
   adjustments for its group/period explicitly and record which ones.
-- **A9. ACC-12 emits no events.** ConsolidationAdjustmentCreated, Approved,
-  Posted and Reversed are all missing; the adjustment store methods do not
-  enqueue to the outbox. Downstream consumers (ACC-15/16/18, reporting) cannot
-  see adjustments. Scope: enqueue in the existing guarded transactions, as
-  the run events already do.
+- **A9. ACC-12's adjustment events are emitted. — Closed (B7).**
+  ConsolidationAdjustmentCreated, ConsolidationAdjustmentApproved,
+  ConsolidationAdjustmentPosted and ConsolidationAdjustmentReversed are
+  enqueued to the transactional outbox in the transaction that makes the
+  adjustment state change, with the adjustment itself as the aggregate and
+  the exact spec name preserved as the legacy `event_type`. Downstream
+  consumers (ACC-15/16/18, reporting) can now see adjustments.
 - **A10. `ExplainElimination` and `GetAdjustmentHistory` are not
   implemented.** History is only the latest set of approve/post/reverse
   columns on the adjustment row; there is no transition log. There is no
@@ -245,3 +247,16 @@ consolidation entries in a group entity's statutory ledger.
     consolidated balances and snapshots built from them, and
     `ConsolidationAdjustmentLine` amounts. Elimination itself never read
     `IntercompanyEntry.Amount`; it reverses the journals' real posted lines.
+- **B7. Adjustment event shape (A9).** Each lifecycle command emits one event
+  in the transaction that already made the change:
+  `com.zoikosuite.accounting.consolidation-adjustment.created|approved|posted|reversed`,
+  with `ConsolidationAdjustmentCreated|Approved|Posted|Reversed` as the
+  legacy `event_type` (the spec's "Events produced" names, verbatim). The
+  aggregate is the adjustment itself (`subject =
+  urn:zoikosuite:consolidation-adjustment:<id>`) and `legalentityid` is the
+  group legal entity, mirroring the run events' envelope shape. The payload
+  carries the adjustment id, tenant, group, period, status, the real
+  transition timestamp and actor; Posted adds the consolidation-book journal
+  id, and Reversed adds the reason and any superseding adjustment id. A
+  rejected transition (wrong status, unknown id) never reaches the event:
+  the outbox cannot report a change the transaction rolled back.

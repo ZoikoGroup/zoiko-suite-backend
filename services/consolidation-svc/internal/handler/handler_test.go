@@ -134,7 +134,7 @@ func (s *stubStore) HasSnapshotForPeriod(_ context.Context, groupLegalEntityID, 
 	return s.hasSnapshot[groupLegalEntityID+"|"+fiscalPeriod], nil
 }
 
-func (s *stubStore) CreateAdjustment(_ context.Context, a *domain.ConsolidationAdjustment) error {
+func (s *stubStore) CreateAdjustment(_ context.Context, a *domain.ConsolidationAdjustment, _ string) error {
 	s.adjustments[a.ConsolidationAdjustmentID] = a
 	return nil
 }
@@ -161,7 +161,7 @@ func (s *stubStore) ListAdjustments(_ context.Context, groupLegalEntityID, fisca
 	return out, nil
 }
 
-func (s *stubStore) ApproveAdjustment(_ context.Context, id, principalID string) error {
+func (s *stubStore) ApproveAdjustment(_ context.Context, id, principalID, _ string) error {
 	a, ok := s.adjustments[id]
 	if !ok || a.Status != domain.AdjustmentStatusPendingApproval {
 		return domain.ErrInvalidAdjustmentTransition
@@ -171,7 +171,7 @@ func (s *stubStore) ApproveAdjustment(_ context.Context, id, principalID string)
 	return nil
 }
 
-func (s *stubStore) MarkAdjustmentPosted(_ context.Context, id, principalID, journalID string) error {
+func (s *stubStore) MarkAdjustmentPosted(_ context.Context, id, principalID, journalID, _ string) error {
 	a, ok := s.adjustments[id]
 	if !ok || a.Status != domain.AdjustmentStatusApproved {
 		return domain.ErrInvalidAdjustmentTransition
@@ -181,7 +181,7 @@ func (s *stubStore) MarkAdjustmentPosted(_ context.Context, id, principalID, jou
 	return nil
 }
 
-func (s *stubStore) ReverseAdjustment(_ context.Context, id, principalID, reason string, supersededBy *string) error {
+func (s *stubStore) ReverseAdjustment(_ context.Context, id, principalID, reason string, supersededBy *string, _ string) error {
 	a, ok := s.adjustments[id]
 	if !ok || a.Status != domain.AdjustmentStatusPosted {
 		return domain.ErrInvalidAdjustmentTransition

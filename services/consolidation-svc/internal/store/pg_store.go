@@ -71,6 +71,39 @@ func (s *PgStore) enqueueRunEvent(ctx context.Context, tx pgx.Tx, fact, legacyTy
 	return nil
 }
 
+// enqueueAdjustmentEvent writes one ACC-12 consolidation-adjustment
+// lifecycle event to the transactional outbox inside tx, the transaction
+// that made the change it reports. fact is kebab-case (envelope.New rejects
+// underscores); legacyType is the exact pre-standard event name existing
+// consumers filter on (ConsolidationAdjustmentCreated and the like). The
+// aggregate is always the adjustment itself — never the run or the
+// consolidation-book journal it may reference.
+func (s *PgStore) enqueueAdjustmentEvent(ctx context.Context, tx pgx.Tx, fact, legacyType, tenantID, groupLegalEntityID, adjustmentID, actorID, correlationID string, data map[string]any) error {
+	env, err := envelope.New(envelope.Spec{
+		Type:            "com.zoikosuite.accounting.consolidation-adjustment." + fact,
+		LegacyType:      legacyType,
+		Service:         "consolidation-svc",
+		SchemaVersion:   "1.0.0",
+		OccurredAt:      time.Now().UTC(),
+		TenantID:        tenantID,
+		LegalEntityID:   groupLegalEntityID,
+		AggregateType:   "consolidation-adjustment",
+		AggregateID:     adjustmentID,
+		CorrelationID:   correlationID,
+		ActorID:         actorID,
+		ResidencyRegion: s.eventRegion,
+		Classification:  envelope.Confidential,
+		Data:            data,
+	})
+	if err != nil {
+		return fmt.Errorf("build consolidation-adjustment.%s event: %w", fact, err)
+	}
+	if err := outbox.Enqueue(ctx, tx, env); err != nil {
+		return fmt.Errorf("enqueue consolidation-adjustment.%s event: %w", fact, err)
+	}
+	return nil
+}
+
 func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(tx pgx.Tx) error) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -448,8 +481,9 @@ func (s *PgStore) HasSnapshotForPeriod(ctx context.Context, groupLegalEntityID, 
 
 // CreateAdjustment inserts a new ConsolidationAdjustment. Callers land it
 // directly in PENDING_APPROVAL — see migration 000003's doc comment on why
-// no DRAFT resting state is reachable via this v1's API.
-func (s *PgStore) CreateAdjustment(ctx context.Context, a *domain.ConsolidationAdjustment) error {
+// no DRAFT resting state is reachable via this v1's API. Consolidation-
+// AdjustmentCreated is enqueued in the same transaction as the insert.
+func (s *PgStore) CreateAdjustment(ctx context.Context, a *domain.ConsolidationAdjustment, correlationID string) error {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
 		return domain.ErrIdentityMissing
@@ -468,7 +502,21 @@ func (s *PgStore) CreateAdjustment(ctx context.Context, a *domain.ConsolidationA
 		`, a.ConsolidationAdjustmentID, tenantID, a.GroupLegalEntityID, a.FiscalPeriod,
 			a.AdjustmentType, a.Description, a.Status, linesJSON,
 			a.CreatedAt, a.CreatedByPrincipalID)
-		return err
+		if err != nil {
+			return err
+		}
+		return s.enqueueAdjustmentEvent(ctx, tx, "created", "ConsolidationAdjustmentCreated",
+			tenantID, a.GroupLegalEntityID, a.ConsolidationAdjustmentID,
+			a.CreatedByPrincipalID, correlationID, map[string]any{
+				"consolidation_adjustment_id": a.ConsolidationAdjustmentID,
+				"tenant_id":                   tenantID,
+				"group_legal_entity_id":       a.GroupLegalEntityID,
+				"fiscal_period":               a.FiscalPeriod,
+				"adjustment_type":             a.AdjustmentType,
+				"status":                      a.Status,
+				"created_at":                  a.CreatedAt,
+				"created_by_principal_id":     a.CreatedByPrincipalID,
+			})
 	})
 }
 
@@ -537,72 +585,111 @@ func (s *PgStore) ListAdjustments(ctx context.Context, groupLegalEntityID, fisca
 // own "Top-side journal self-approved" negative path) is the handler's
 // job, since it needs to compare against the CALLER's principal, which
 // this store method deliberately doesn't decide.
-func (s *PgStore) ApproveAdjustment(ctx context.Context, id, principalID string) error {
+func (s *PgStore) ApproveAdjustment(ctx context.Context, id, principalID, correlationID string) error {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
 		return domain.ErrIdentityMissing
 	}
 	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		now := time.Now().UTC()
-		res, err := tx.Exec(ctx, `
+		var groupLegalEntityID, fiscalPeriod string
+		err := tx.QueryRow(ctx, `
 			UPDATE consolidation_adjustments
 			SET status = $1, approved_at = $2, approved_by_principal_id = $3
 			WHERE consolidation_adjustment_id = $4 AND tenant_id = $5 AND status = $6
-		`, domain.AdjustmentStatusApproved, now, principalID, id, tenantID, domain.AdjustmentStatusPendingApproval)
+			RETURNING group_legal_entity_id, fiscal_period
+		`, domain.AdjustmentStatusApproved, now, principalID, id, tenantID, domain.AdjustmentStatusPendingApproval).
+			Scan(&groupLegalEntityID, &fiscalPeriod)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrInvalidAdjustmentTransition
+		}
 		if err != nil {
 			return err
 		}
-		if res.RowsAffected() == 0 {
-			return domain.ErrInvalidAdjustmentTransition
-		}
-		return nil
+		return s.enqueueAdjustmentEvent(ctx, tx, "approved", "ConsolidationAdjustmentApproved",
+			tenantID, groupLegalEntityID, id, principalID, correlationID, map[string]any{
+				"consolidation_adjustment_id": id,
+				"tenant_id":                   tenantID,
+				"group_legal_entity_id":       groupLegalEntityID,
+				"fiscal_period":               fiscalPeriod,
+				"status":                      domain.AdjustmentStatusApproved,
+				"approved_at":                 now,
+				"approved_by_principal_id":    principalID,
+			})
 	})
 }
 
 // MarkAdjustmentPosted moves APPROVED -> POSTED, recording the real
 // consolidation-book journal general-ledger-svc actually created.
-func (s *PgStore) MarkAdjustmentPosted(ctx context.Context, id, principalID, journalID string) error {
+func (s *PgStore) MarkAdjustmentPosted(ctx context.Context, id, principalID, journalID, correlationID string) error {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
 		return domain.ErrIdentityMissing
 	}
 	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		now := time.Now().UTC()
-		res, err := tx.Exec(ctx, `
+		var groupLegalEntityID, fiscalPeriod string
+		err := tx.QueryRow(ctx, `
 			UPDATE consolidation_adjustments
 			SET status = $1, posted_at = $2, posted_by_principal_id = $3, consolidation_book_journal_id = $4
 			WHERE consolidation_adjustment_id = $5 AND tenant_id = $6 AND status = $7
-		`, domain.AdjustmentStatusPosted, now, principalID, journalID, id, tenantID, domain.AdjustmentStatusApproved)
+			RETURNING group_legal_entity_id, fiscal_period
+		`, domain.AdjustmentStatusPosted, now, principalID, journalID, id, tenantID, domain.AdjustmentStatusApproved).
+			Scan(&groupLegalEntityID, &fiscalPeriod)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrInvalidAdjustmentTransition
+		}
 		if err != nil {
 			return err
 		}
-		if res.RowsAffected() == 0 {
-			return domain.ErrInvalidAdjustmentTransition
-		}
-		return nil
+		return s.enqueueAdjustmentEvent(ctx, tx, "posted", "ConsolidationAdjustmentPosted",
+			tenantID, groupLegalEntityID, id, principalID, correlationID, map[string]any{
+				"consolidation_adjustment_id":   id,
+				"tenant_id":                     tenantID,
+				"group_legal_entity_id":         groupLegalEntityID,
+				"fiscal_period":                 fiscalPeriod,
+				"status":                        domain.AdjustmentStatusPosted,
+				"posted_at":                     now,
+				"posted_by_principal_id":        principalID,
+				"consolidation_book_journal_id": journalID,
+			})
 	})
 }
 
 // ReverseAdjustment moves POSTED -> REVERSED, optionally recording the
 // replacement adjustment that supersedes it.
-func (s *PgStore) ReverseAdjustment(ctx context.Context, id, principalID, reason string, supersededBy *string) error {
+func (s *PgStore) ReverseAdjustment(ctx context.Context, id, principalID, reason string, supersededBy *string, correlationID string) error {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
 		return domain.ErrIdentityMissing
 	}
 	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		now := time.Now().UTC()
-		res, err := tx.Exec(ctx, `
+		var groupLegalEntityID, fiscalPeriod string
+		err := tx.QueryRow(ctx, `
 			UPDATE consolidation_adjustments
 			SET status = $1, reversed_at = $2, reversed_by_principal_id = $3, reversal_reason = $4, superseded_by_adjustment_id = $5
 			WHERE consolidation_adjustment_id = $6 AND tenant_id = $7 AND status = $8
-		`, domain.AdjustmentStatusReversed, now, principalID, reason, supersededBy, id, tenantID, domain.AdjustmentStatusPosted)
+			RETURNING group_legal_entity_id, fiscal_period
+		`, domain.AdjustmentStatusReversed, now, principalID, reason, supersededBy, id, tenantID, domain.AdjustmentStatusPosted).
+			Scan(&groupLegalEntityID, &fiscalPeriod)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrInvalidAdjustmentTransition
+		}
 		if err != nil {
 			return err
 		}
-		if res.RowsAffected() == 0 {
-			return domain.ErrInvalidAdjustmentTransition
-		}
-		return nil
+		return s.enqueueAdjustmentEvent(ctx, tx, "reversed", "ConsolidationAdjustmentReversed",
+			tenantID, groupLegalEntityID, id, principalID, correlationID, map[string]any{
+				"consolidation_adjustment_id": id,
+				"tenant_id":                   tenantID,
+				"group_legal_entity_id":       groupLegalEntityID,
+				"fiscal_period":               fiscalPeriod,
+				"status":                      domain.AdjustmentStatusReversed,
+				"reversed_at":                 now,
+				"reversed_by_principal_id":    principalID,
+				"reversal_reason":             reason,
+				"superseded_by_adjustment_id": supersededBy,
+			})
 	})
 }
