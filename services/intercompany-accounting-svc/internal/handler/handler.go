@@ -33,8 +33,8 @@ type Store interface {
 	// entities, grouped by direction, currency and match status.
 	ReciprocalBalances(ctx context.Context, entityA, entityB, period string) ([]domain.ReciprocalBalanceGroup, error)
 	// UpdateMatch persists entry's target state and, in the same
-	// transaction, the attempt that produced it and the "posted" or
-	// "mismatch.detected" event that state implies.
+	// transaction, the attempt that produced it and the "matched" (legacy
+	// "posted") or "mismatch-detected" event that state implies.
 	UpdateMatch(ctx context.Context, entry *domain.IntercompanyEntry, attempt *domain.MatchAttempt, actorID, correlationID string) error
 
 	// ACC-11 lifecycle — see migrations 000003 and 000006. Each records its

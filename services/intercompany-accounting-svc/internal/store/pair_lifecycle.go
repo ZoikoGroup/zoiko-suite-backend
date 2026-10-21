@@ -43,6 +43,15 @@ type transition struct {
 	correlationID string
 }
 
+// lifecycleEvent names the outbox event a lifecycle command emits in the same
+// transaction as its state change. nil means the command emits none (A7/B11:
+// acknowledge has no event named in the governing spec, and close is outside
+// A7's scope).
+type lifecycleEvent struct {
+	fact       string
+	legacyType string
+}
+
 func recordTransition(ctx context.Context, tx pgx.Tx, tenantID, id string, t transition) error {
 	var correlationID *string
 	if t.correlationID != "" {
@@ -61,8 +70,9 @@ func recordTransition(ctx context.Context, tx pgx.Tx, tenantID, id string, t tra
 // moveLifecycle moves a pair from one of allowedFrom to t.to: it locks the
 // row, refuses any other current status with ErrInvalidPairTransition,
 // applies set (an UPDATE that must also carry the status guard, as defence
-// in depth), and records the transition, all in one transaction.
-func (s *PgStore) moveLifecycle(ctx context.Context, id string, allowedFrom []string, t transition,
+// in depth), records the transition, and — when event is non-nil — enqueues
+// the event that state change implies, all in one transaction.
+func (s *PgStore) moveLifecycle(ctx context.Context, id string, allowedFrom []string, t transition, event *lifecycleEvent,
 	set func(tx pgx.Tx, tenantID string, now time.Time) (int64, error)) error {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
@@ -84,17 +94,32 @@ func (s *PgStore) moveLifecycle(ctx context.Context, id string, allowedFrom []st
 			return domain.ErrInvalidPairTransition
 		}
 		t.from, t.fiscalPeriod = &current, period
-		return recordTransition(ctx, tx, tenantID, id, t)
+		if err := recordTransition(ctx, tx, tenantID, id, t); err != nil {
+			return err
+		}
+		if event == nil {
+			return nil
+		}
+		// The event carries the row as this transaction committed it (it is
+		// read after the guarded UPDATE, under the same row lock), not the
+		// stale copy the handler read before the lock.
+		entry, err := loadEntry(ctx, tx, tenantID, id)
+		if err != nil {
+			return err
+		}
+		return s.enqueueEntryEvent(ctx, tx, event.fact, event.legacyType, t.actor, t.correlationID, entry)
 	})
 }
 
 // AcknowledgeCounterparty is ACC-11's own AcknowledgeCounterparty command
 // — moves a pair from OPEN ("UNMATCHED") to AWAITING_COUNTERPARTY. Guarded
 // to only ever succeed from UNMATCHED, matching the spec's own state model
-// order.
+// order. It emits no event: the governing spec's ACC-11 "Events produced"
+// row names only PairCreated, Matched, MismatchDetected and DisputeResolved,
+// and §23 repeats Matched/MismatchDetected (A7/B11).
 func (s *PgStore) AcknowledgeCounterparty(ctx context.Context, id, principalID, correlationID string) error {
 	return s.moveLifecycle(ctx, id, []string{domain.MatchStatusUnmatched},
-		transition{to: domain.MatchStatusAwaitingCounterparty, actor: principalID, correlationID: correlationID},
+		transition{to: domain.MatchStatusAwaitingCounterparty, actor: principalID, correlationID: correlationID}, nil,
 		func(tx pgx.Tx, tenantID string, now time.Time) (int64, error) {
 			res, err := tx.Exec(ctx, `
 				UPDATE intercompany_entries
@@ -108,10 +133,12 @@ func (s *PgStore) AcknowledgeCounterparty(ctx context.Context, id, principalID, 
 // DisputeIntercompany is ACC-11's own DisputeIntercompany command — moves
 // a pair from MISMATCH to DISPUTED. Only reachable from MISMATCH: there
 // is nothing to dispute about a pair that already matched or was never
-// even checked.
+// even checked. Its event carries the dispute reason, so a consumer can act
+// on the fact without reading the pair back (A7/B11).
 func (s *PgStore) DisputeIntercompany(ctx context.Context, id, principalID, reason, correlationID string) error {
 	return s.moveLifecycle(ctx, id, []string{domain.MatchStatusMismatch},
 		transition{to: domain.MatchStatusDisputed, reason: &reason, actor: principalID, correlationID: correlationID},
+		&lifecycleEvent{fact: "dispute-raised", legacyType: "intercompany.entry.dispute-raised"},
 		func(tx pgx.Tx, tenantID string, now time.Time) (int64, error) {
 			res, err := tx.Exec(ctx, `
 				UPDATE intercompany_entries
@@ -126,13 +153,15 @@ func (s *PgStore) DisputeIntercompany(ctx context.Context, id, principalID, reas
 // from DISPUTED to RESOLVED, recording the outcome (accepted, corrected or
 // written off) alongside the note. Never re-runs matching itself: a
 // resolution is a human decision recorded as evidence, not an automatic
-// recheck.
+// recheck. Its event carries the resolution note and outcome, so a consumer
+// reacting to a resolution knows what was decided (A7/B11).
 func (s *PgStore) ResolveMismatch(ctx context.Context, id, principalID, resolutionNote, outcome, correlationID string) error {
 	if !domain.ValidResolutionOutcome(outcome) {
 		return domain.ErrResolutionOutcomeInvalid
 	}
 	return s.moveLifecycle(ctx, id, []string{domain.MatchStatusDisputed},
 		transition{to: domain.MatchStatusResolved, reason: &resolutionNote, outcome: &outcome, actor: principalID, correlationID: correlationID},
+		&lifecycleEvent{fact: "dispute-resolved", legacyType: "intercompany.entry.dispute-resolved"},
 		func(tx pgx.Tx, tenantID string, now time.Time) (int64, error) {
 			res, err := tx.Exec(ctx, `
 				UPDATE intercompany_entries
@@ -148,10 +177,11 @@ func (s *PgStore) ResolveMismatch(ctx context.Context, id, principalID, resoluti
 // its period has been consolidated). Only MATCHED may close: a pair still
 // open, mismatched or disputed has an unsettled difference, and closing it
 // would take that difference out of view ("Unmatched intercompany balances
-// remain visible and are not silently eliminated").
+// remain visible and are not silently eliminated"). It emits no event: A7
+// names no close event, and B11 does not invent one.
 func (s *PgStore) ClosePair(ctx context.Context, id, principalID, reason, correlationID string) error {
 	return s.moveLifecycle(ctx, id, []string{domain.MatchStatusMatched},
-		transition{to: domain.MatchStatusClosed, reason: &reason, actor: principalID, correlationID: correlationID},
+		transition{to: domain.MatchStatusClosed, reason: &reason, actor: principalID, correlationID: correlationID}, nil,
 		func(tx pgx.Tx, tenantID string, now time.Time) (int64, error) {
 			res, err := tx.Exec(ctx, `
 				UPDATE intercompany_entries

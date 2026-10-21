@@ -75,6 +75,15 @@ func (s *PgStore) enqueueEntryEvent(ctx context.Context, tx pgx.Tx, fact, legacy
 	if entry.MismatchReason != nil {
 		data["mismatch_reason"] = *entry.MismatchReason
 	}
+	if entry.DisputeReason != nil {
+		data["dispute_reason"] = *entry.DisputeReason
+	}
+	if entry.ResolutionNote != nil {
+		data["resolution_note"] = *entry.ResolutionNote
+	}
+	if entry.ResolutionOutcome != nil {
+		data["resolution_outcome"] = *entry.ResolutionOutcome
+	}
 	env, err := envelope.New(envelope.Spec{
 		Type:            "com.zoikosuite.accounting.intercompany-entry." + fact,
 		LegacyType:      legacyType,
@@ -213,6 +222,25 @@ func scanIntercompanyEntry(row pgx.Row, entry *domain.IntercompanyEntry) error {
 	)
 }
 
+// loadEntry reads one pair through intercompanyEntryColumns inside tx, for a
+// caller that already holds an RLS-scoped transaction. The lifecycle commands
+// use it after their guarded UPDATE, so the event they enqueue describes the
+// state they just committed rather than the row as read before the lock.
+func loadEntry(ctx context.Context, tx pgx.Tx, tenantID, id string) (*domain.IntercompanyEntry, error) {
+	var entry domain.IntercompanyEntry
+	if err := scanIntercompanyEntry(tx.QueryRow(ctx, `
+		SELECT `+intercompanyEntryColumns+`
+		FROM intercompany_entries
+		WHERE intercompany_entry_id = $1 AND tenant_id = $2
+	`, id, tenantID), &entry); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, domain.ErrEntryNotFound
+		}
+		return nil, err
+	}
+	return &entry, nil
+}
+
 func (s *PgStore) GetEntry(ctx context.Context, id string) (*domain.IntercompanyEntry, error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
@@ -284,9 +312,10 @@ func (s *PgStore) ListEntries(ctx context.Context, sourceEntityID, targetEntityI
 
 // UpdateMatch records a MatchIntercompany outcome and, in the same
 // transaction, the attempt that produced it (intercompany_match_attempts)
-// and the lifecycle event that outcome implies: "posted" for MATCHED,
-// "mismatch.detected" for MISMATCH. entry must already carry the target
-// state (TargetJournalID, MatchStatus) and attempt the evidence for it —
+// and the lifecycle event that outcome implies: "matched" for MATCHED (with
+// the pre-standard "posted" name kept as its legacy event_type for one
+// release), "mismatch-detected" for MISMATCH. entry must already carry the
+// target state (TargetJournalID, MatchStatus) and attempt the evidence for it —
 // see handler.go's MatchEntry. The pair's mismatch_reason is not stored on
 // the pair: it is the latest attempt's message, and entry.MismatchReason is
 // set from attempt on return.
@@ -353,12 +382,15 @@ func (s *PgStore) UpdateMatch(ctx context.Context, entry *domain.IntercompanyEnt
 
 		switch entry.MatchStatus {
 		case domain.MatchStatusMatched:
-			return s.enqueueEntryEvent(ctx, tx, "posted", "intercompany.entry.posted", actorID, correlationID, entry)
+			// "matched" is the event's real name; "posted" is kept only as
+			// its legacy event_type for one release so a consumer still
+			// filtering on the old name keeps working (SPEC_DEVIATIONS B11).
+			return s.enqueueEntryEvent(ctx, tx, "matched", "intercompany.entry.posted", actorID, correlationID, entry)
 		case domain.MatchStatusMismatch:
 			return s.enqueueEntryEvent(ctx, tx, "mismatch-detected", "intercompany.mismatch.detected", actorID, correlationID, entry)
 		default:
 			// The other lifecycle commands use their own store methods
-			// (pair_lifecycle.go), not this one, and emit no events (A7).
+			// (pair_lifecycle.go), not this one.
 			return nil
 		}
 	})

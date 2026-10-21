@@ -411,7 +411,7 @@ func TestMatchEntry_HappyPath(t *testing.T) {
 		t.Fatalf("expected 200 got %d: %s", rr.Code, rr.Body.String())
 	}
 	if len(s.matchEvents) != 1 || s.matchEvents[0].entry.MatchStatus != "MATCHED" {
-		t.Errorf("expected 1 posted event got %d", len(s.matchEvents))
+		t.Errorf("expected 1 matched event got %d", len(s.matchEvents))
 	}
 	if s.entries["entry-1"].MatchStatus != "MATCHED" {
 		t.Errorf("expected store match_status to be MATCHED, got %q", s.entries["entry-1"].MatchStatus)

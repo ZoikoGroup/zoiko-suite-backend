@@ -91,17 +91,21 @@ reconciliation-engine-svc holds for DATA-07.
   missing" is therefore enforced for the counterparty only. Scope: the same
   four checks `MatchEntry` runs on the target, run on the source at create
   time (reject, or create directly in MISMATCH with a reason).
-- **A7. Events: two of the four named events are missing, and one has a
-  misleading name.** Emitted: `intercompany-entry.created`
+- **A7. Events: two of the four named events were missing, and one had a
+  misleading name. — Closed (B11).** Emitted: `intercompany-entry.created`
   (IntercompanyPairCreated), `intercompany-entry.mismatch-detected`
-  (IntercompanyMismatchDetected) and `intercompany-entry.posted` for a
-  successful match. IntercompanyMatched is published under the name
-  **`posted`**, which suggests a ledger posting this service never makes.
-  `IntercompanyDisputeResolved` is not emitted at all, and acknowledge and
-  dispute emit nothing either, so a consumer (ACC-12/13, close) cannot react
-  to a resolution. Scope: enqueue `matched` (keeping `posted` as the legacy
-  type for one release), `dispute-raised` and `dispute-resolved` inside the
-  existing guarded transactions.
+  (IntercompanyMismatchDetected), `intercompany-entry.matched`
+  (IntercompanyMatched) and `intercompany-entry.dispute-resolved`
+  (IntercompanyDisputeResolved), plus `intercompany-entry.dispute-raised`
+  for the MISMATCH → DISPUTED transition. A successful match no longer
+  publishes under `posted`: the envelope's canonical `type` is `matched`,
+  and the pre-standard `event_type` remains `intercompany.entry.posted` as
+  the legacy name for one release. Acknowledge emits no event: the
+  governing spec's ACC-11 "Events produced" row names only PairCreated,
+  Matched, MismatchDetected and DisputeResolved (and §23 repeats
+  Matched/MismatchDetected), so no acknowledgement event is invented. All
+  three new events are enqueued in the same guarded transaction as the
+  state change; a failed enqueue rolls the change back.
 - **A8. No segregation of duties on resolution.** §14: "One entity cannot
   certify both sides of material mismatch without compensating control."
   Dispute and resolve use different actions, but both are authorized on the
@@ -242,7 +246,9 @@ reconciliation-engine-svc holds for DATA-07.
   - *UpdateMatch accepts only MATCHED or MISMATCH* as the target status. It
     used to write whatever status it was handed, which would now have been
     a way to reach CLOSED without the close guard.
-  - *No events* for close, dispute or resolve yet. That is A7, unchanged.
+  - *No event for close.* Dispute and resolve now emit `dispute-raised` and
+    `dispute-resolved` (B11); close remains outside the spec's named event
+    set.
 - **B9. How match attempts are recorded (A3).**
   - *What counts as an attempt.* Every MatchIntercompany call that reaches
     an outcome and is applied, whether MATCHED or MISMATCH. These calls
@@ -286,7 +292,8 @@ reconciliation-engine-svc holds for DATA-07.
     mismatched gets no attempt; none is invented.
   - *Events.* The `mismatch-detected` event payload still carries
     `mismatch_reason`. `failed_rule` is in the HTTP response and the
-    explanation, and is not yet added to the event (A7 owns the event set).
+    explanation, and is not yet added to the event; A7/B11 did not change
+    the mismatch event's payload.
 - **B10. How reciprocal balances are aggregated (A1).**
   - *What is summed.* Each pair contributes its own (source) side,
     `amount`/`currency_code`, grouped by `(source_legal_entity_id,
@@ -327,3 +334,36 @@ reconciliation-engine-svc holds for DATA-07.
     Idempotency-Key: the envelope's write rule (INV-08) does not apply to a
     read. The read is checked with `INTERCOMPANY_ENTRY_VIEW` on both
     entities, the same two-entity shape as `ClosePair` (B8).
+- **B11. How A7's event set is emitted (A7).**
+  - *Matched, not posted.* `UpdateMatch` now enqueues the canonical
+    `com.zoikosuite.accounting.intercompany-entry.matched` with
+    `LegacyType: intercompany.entry.posted`. While legacy fields are on, the
+    envelope still carries the old `event_type`
+    (`intercompany.entry.posted`), so a consumer filtering on the old name
+    sees the same name; the canonical `type` is the corrected one. This is
+    one event, not two: a second copy under the old canonical name would
+    duplicate a fact. No in-repo consumer filtered on either name —
+    consolidation-svc reads intercompany entries over HTTP, not this topic —
+    and the legacy name is kept for one release regardless.
+  - *Dispute and resolution.* `DisputeIntercompany` (MISMATCH → DISPUTED)
+    enqueues `...dispute-raised`; `ResolveMismatch` (DISPUTED → RESOLVED)
+    enqueues `...dispute-resolved`. Their legacy `event_type` values are
+    `intercompany.entry.dispute-raised` and
+    `intercompany.entry.dispute-resolved`. The payload carries the pair's
+    state as committed, plus `dispute_reason` on a dispute and
+    `resolution_note` and `resolution_outcome` on a resolution.
+    `resolution_outcome` is the same ACCEPTED / CORRECTED / WRITTEN_OFF
+    value stored by A9, so a consumer can act on the decision rather than
+    merely on the fact that a resolution happened.
+  - *No acknowledgement or close event.* `AcknowledgeCounterparty` and
+    `ClosePair` emit none. The governing spec's ACC-11 "Events produced" row
+    names IntercompanyPairCreated, IntercompanyMatched,
+    IntercompanyMismatchDetected and IntercompanyDisputeResolved only; §23
+    repeats Matched and MismatchDetected. Adding an acknowledgement fact
+    would be inventing an event the spec does not name. Close is outside
+    A7's scope and remains without one.
+  - *Transaction.* The lifecycle helper loads the pair after its guarded
+    UPDATE, under the same row lock and RLS-scoped transaction, and calls the
+    same `enqueueEntryEvent` helper every other event in this service uses.
+    If building or enqueuing the envelope fails, the transaction rolls back,
+    so a committed state change and its event cannot diverge.
