@@ -28,6 +28,7 @@ var migrations = []string{
 	"000005_pair_counterparty_period_dimensions.up.sql",
 	"000006_pair_closed_state_transitions.up.sql",
 	"000007_match_attempts.up.sql",
+	"000008_source_journal_checks.up.sql",
 }
 
 // resetTables is every table the migrations create, children first.

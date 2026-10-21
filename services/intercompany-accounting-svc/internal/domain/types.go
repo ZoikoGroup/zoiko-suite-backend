@@ -229,6 +229,16 @@ const (
 	MatchRuleAmountMismatch             = "AMOUNT_MISMATCH"
 	MatchRuleGroupRelationshipLost      = "GROUP_RELATIONSHIP_LOST"
 
+	// Source-side rules: the same four checks MatchIntercompany runs on the
+	// target, run on the source journal when the pair is created
+	// (SPEC_DEVIATIONS A6). A pair whose source journal fails one of them is
+	// created directly in MISMATCH, and the attempt says which rule failed.
+	MatchRuleSourceJournalMissing       = "SOURCE_JOURNAL_MISSING"
+	MatchRuleSourceEntityMismatch       = "SOURCE_ENTITY_MISMATCH"
+	MatchRuleSourceJournalNotFinalized  = "SOURCE_JOURNAL_NOT_FINALIZED"
+	MatchRuleSourceCurrencyUnverifiable = "SOURCE_CURRENCY_UNVERIFIABLE"
+	MatchRuleSourceCurrencyMismatch     = "SOURCE_CURRENCY_MISMATCH"
+
 	// MatchRuleLegacyUnstructured marks an attempt backfilled by migration
 	// 000007 from a pre-existing mismatch_reason sentence, which never said
 	// which rule failed.
@@ -264,8 +274,10 @@ type MatchAttempt struct {
 
 // MatchAttemptSide is what one side of the pair expected and what
 // general-ledger-svc reported for the journal examined on that side. The
-// Observed fields are nil when the side was not examined (the source side
-// never is yet, SPEC_DEVIATIONS A6) or the journal was not found.
+// Observed fields are nil when the side was not examined. A match attempt
+// examines the target only; the source side is examined when the pair is
+// created (SPEC_DEVIATIONS A6), and that create-time attempt is the one that
+// carries its observed fields.
 type MatchAttemptSide struct {
 	JournalID             *string  `json:"journal_id,omitempty"`
 	ExpectedAmount        Decimal  `json:"expected_amount"`
@@ -358,6 +370,12 @@ var (
 	// not a 503 — a missing counterparty journal is a real accounting
 	// fact worth recording, not a transient outage.
 	ErrCounterpartyJournalMissing = errorString("counterparty journal does not exist in general-ledger-svc")
+
+	// ErrSourceJournalMissing is the same negative path on the source side
+	// (SPEC_DEVIATIONS A6): CreateIntercompanyPair named a source_journal_id
+	// general-ledger-svc has no record of. The pair is created in MISMATCH
+	// rather than refused, for the same reason as the counterparty case.
+	ErrSourceJournalMissing = errorString("source journal does not exist in general-ledger-svc")
 
 	// ErrEntityRegistryUnavailable is returned when tenant-entity-registry-svc
 	// cannot be reached to check group relationship state.

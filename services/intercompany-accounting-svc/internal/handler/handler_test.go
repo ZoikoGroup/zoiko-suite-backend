@@ -57,16 +57,34 @@ func newStubStoreReal() *stubStoreReal {
 		attempts: make(map[string][]domain.MatchAttempt)}
 }
 
-func (s *stubStoreReal) CreateEntry(_ context.Context, entry *domain.IntercompanyEntry, actorID, correlationID string) (bool, error) {
+func (s *stubStoreReal) CreateEntry(ctx context.Context, entry *domain.IntercompanyEntry, actorID, correlationID string) (bool, error) {
+	return s.CreateEntryWithAttempt(ctx, entry, nil, actorID, correlationID)
+}
+
+func (s *stubStoreReal) CreateEntryWithAttempt(_ context.Context, entry *domain.IntercompanyEntry, attempt *domain.MatchAttempt, actorID, correlationID string) (bool, error) {
 	key := entry.TenantID + "|" + entry.SourceJournalID
 	if existingID, ok := s.bySourceJournal[key]; ok {
 		*entry = *s.entries[existingID]
 		return false, nil
 	}
+	if attempt != nil {
+		entry.MismatchReason = attempt.Message
+		s.attempts[entry.IntercompanyEntryID] = append(s.attempts[entry.IntercompanyEntryID], *attempt)
+	}
 	s.bySourceJournal[key] = entry.IntercompanyEntryID
 	s.entries[entry.IntercompanyEntryID] = entry
 	s.createdEvents = append(s.createdEvents, eventRecord{entry: *entry, actorID: actorID, correlationID: correlationID})
 	return true, nil
+}
+
+func (s *stubStoreReal) GetEntryBySourceJournal(_ context.Context, sourceJournalID string) (*domain.IntercompanyEntry, error) {
+	for _, entry := range s.entries {
+		if entry.SourceJournalID == sourceJournalID {
+			cp := *entry
+			return &cp, nil
+		}
+	}
+	return nil, domain.ErrEntryNotFound
 }
 
 func (s *stubStoreReal) GetEntry(_ context.Context, id string) (*domain.IntercompanyEntry, error) {
@@ -190,6 +208,17 @@ func (l *stubLedger) GetJournal(_ context.Context, _, _ string) (*ledger.Journal
 	return l.journal, nil
 }
 
+// ledgerWithSourceJournal is a general-ledger-svc stub answering with a
+// journal that passes CreateIntercompanyPair's four source checks
+// (SPEC_DEVIATIONS A6): it exists, belongs to entity, is FINALIZED and is in
+// currency.
+func ledgerWithSourceJournal(entity, currency string) *stubLedger {
+	return &stubLedger{journal: &ledger.JournalDetail{
+		JournalID: "source-journal", LegalEntityID: entity, Status: "FINALIZED", CurrencyCode: currency,
+		Lines: []ledger.JournalLine{{AccountCode: "1300", DebitAmount: "5000"}},
+	}}
+}
+
 // ── router factory ─────────────────────────────────────────────────────────────
 
 func newRouter(s *stubStoreReal, authz handler.AuthZClient, leg *stubLedger) chi.Router {
@@ -266,7 +295,7 @@ func TestCreateEntry_NegativeAmount(t *testing.T) {
 
 func TestCreateEntry_HappyPath(t *testing.T) {
 	s := newStubStoreReal()
-	r := newRouter(s, &stubAuthZ{}, &stubLedger{})
+	r := newRouter(s, &stubAuthZ{}, ledgerWithSourceJournal("le-us", "USD"))
 	rr := doReq(r, http.MethodPost, "/v1/intercompany/entries/", map[string]any{
 		"source_legal_entity_id": "le-us",
 		"target_legal_entity_id": "le-uk",
@@ -291,7 +320,7 @@ func TestCreateEntry_HappyPath(t *testing.T) {
 
 func TestCreateEntry_RetriedSourceJournalID_ReturnsOriginalNotDuplicate(t *testing.T) {
 	s := newStubStoreReal()
-	r := newRouter(s, &stubAuthZ{}, &stubLedger{})
+	r := newRouter(s, &stubAuthZ{}, ledgerWithSourceJournal("le-us", "USD"))
 	body := map[string]any{
 		"source_legal_entity_id": "le-us",
 		"target_legal_entity_id": "le-uk",

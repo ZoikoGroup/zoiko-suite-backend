@@ -29,7 +29,7 @@ func createBody(overrides map[string]any) map[string]any {
 
 func TestCreateEntry_SameCurrency_CounterpartyDefaultsToSourceSide(t *testing.T) {
 	s := newStubStoreReal()
-	rr := doReq(newRouter(s, &stubAuthZ{}, &stubLedger{}), http.MethodPost, "/v1/intercompany/entries/",
+	rr := doReq(newRouter(s, &stubAuthZ{}, ledgerWithSourceJournal("le-us", "USD")), http.MethodPost, "/v1/intercompany/entries/",
 		createBody(map[string]any{"fiscal_period": "2026-09", "dimensions": map[string]string{"cost_centre": "CC-1"}}), "p-1")
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("expected 201, got %d: %s", rr.Code, rr.Body.String())
@@ -46,7 +46,7 @@ func TestCreateEntry_SameCurrency_CounterpartyDefaultsToSourceSide(t *testing.T)
 
 func TestCreateEntry_CrossCurrency(t *testing.T) {
 	s := newStubStoreReal()
-	r := newRouter(s, &stubAuthZ{}, &stubLedger{})
+	r := newRouter(s, &stubAuthZ{}, ledgerWithSourceJournal("le-us", "USD"))
 
 	// No counterparty amount: there is no FX rate to derive one from.
 	rr := doReq(r, http.MethodPost, "/v1/intercompany/entries/",

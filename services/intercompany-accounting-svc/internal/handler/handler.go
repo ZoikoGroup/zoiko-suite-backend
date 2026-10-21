@@ -21,11 +21,18 @@ import (
 )
 
 type Store interface {
-	// CreateEntry enqueues the "created" lifecycle event in the same
-	// transaction as the insert (services/eventing outbox) — see
-	// internal/store's doc comment on why this replaced a post-commit
-	// publish from this handler.
-	CreateEntry(ctx context.Context, entry *domain.IntercompanyEntry, actorID, correlationID string) (created bool, err error)
+	// CreateEntryWithAttempt inserts a new pair and, in the same
+	// transaction, the create-time source-verification attempt when the
+	// pair is created directly in MISMATCH (SPEC_DEVIATIONS A6), its
+	// creation transition and the "created" lifecycle event. attempt is nil
+	// for a pair created UNMATCHED. A MISMATCH pair without an attempt is
+	// refused: the reason would have no evidence.
+	CreateEntryWithAttempt(ctx context.Context, entry *domain.IntercompanyEntry, attempt *domain.MatchAttempt, actorID, correlationID string) (created bool, err error)
+	// GetEntryBySourceJournal resolves the idempotent-create key before the
+	// source journal is verified, so a retried create returns the original
+	// pair without re-querying general-ledger-svc or adding a second
+	// attempt.
+	GetEntryBySourceJournal(ctx context.Context, sourceJournalID string) (*domain.IntercompanyEntry, error)
 	GetEntry(ctx context.Context, id string) (*domain.IntercompanyEntry, error)
 	ListEntries(ctx context.Context, sourceEntityID, targetEntityID string) ([]domain.IntercompanyEntry, error)
 	// ReciprocalBalances is GetReciprocalBalances' read (SPEC_DEVIATIONS A1):
@@ -168,6 +175,22 @@ func (h *Handler) CreateEntry(w http.ResponseWriter, r *http.Request) {
 	tenantID := svcmiddleware.TenantFromContext(r.Context())
 	correlationID := getCorrelationID(r)
 
+	// Idempotent replay, resolved before general-ledger-svc is consulted: a
+	// retried POST for a source_journal_id that already has a pair returns
+	// that pair unchanged. Verifying first would let a transient GL outage
+	// turn a successful create's retry into a 503, and could record a second
+	// attempt against a pair that was already created.
+	existing, err := h.store.GetEntryBySourceJournal(r.Context(), req.SourceJournalID)
+	if err == nil {
+		writeJSON(w, http.StatusOK, existing)
+		return
+	}
+	if !errors.Is(err, domain.ErrEntryNotFound) {
+		h.log.Error("failed to resolve existing intercompany entry", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
 	now := time.Now().UTC()
 	entry := &domain.IntercompanyEntry{
 		IntercompanyEntryID:      uuid.NewString(),
@@ -181,26 +204,93 @@ func (h *Handler) CreateEntry(w http.ResponseWriter, r *http.Request) {
 		CounterpartyCurrencyCode: pair.counterpartyCurrency,
 		FiscalPeriod:             pair.fiscalPeriod,
 		Dimensions:               pair.dimensions,
-		MatchStatus:              "UNMATCHED",
+		MatchStatus:              domain.MatchStatusUnmatched,
 		CreatedAt:                now,
 		UpdatedAt:                now,
 	}
 
-	created, err := h.store.CreateEntry(r.Context(), entry, principalID, correlationID)
+	// ACC-11 A6: the source journal gets the same four checks MatchEntry
+	// runs on the target, at create time. A journal that fails one is a real
+	// accounting fact: the pair is created in MISMATCH with an attempt
+	// naming the rule, not refused with a 400 the caller cannot fix by
+	// retrying the same request.
+	attempt, err := h.verifySourceJournal(r.Context(), tenantID, entry, principalID, correlationID)
+	if err != nil {
+		h.log.Error("failed to verify source journal with GL", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "gl_query_failed", err.Error())
+		return
+	}
+
+	created, err := h.store.CreateEntryWithAttempt(r.Context(), entry, attempt, principalID, correlationID)
 	if err != nil {
 		h.log.Error("failed to create intercompany entry", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
 	if !created {
-		// Replay of a prior request for the same source_journal_id — return
-		// the original entry; the original request's CreateEntry already
-		// enqueued the created event.
+		// A concurrent request created the same source_journal_id between
+		// the replay lookup above and this insert. CreateEntryWithAttempt
+		// has replaced entry with the original row and recorded no attempt
+		// for this request; the original request already enqueued its
+		// events.
 		writeJSON(w, http.StatusOK, entry)
 		return
 	}
 
 	writeJSON(w, http.StatusCreated, entry)
+}
+
+// verifySourceJournal runs MatchEntry's target-side checks on the source
+// journal at create time (SPEC_DEVIATIONS A6): it exists, its legal entity is
+// the pair's source entity, it is FINALIZED, and its currency is both valid
+// and the currency the source side is denominated in. It reuses
+// checkJournal/GetJournal, so there is one journal-verification path, not a
+// second one.
+//
+// A failure sets entry to MISMATCH and returns the attempt that records it.
+// A nil attempt with a nil error means the journal passed and the pair stays
+// UNMATCHED. An error is a dependency failure (general-ledger-svc or an
+// unreadable journal amount): the caller answers 503 and creates nothing.
+func (h *Handler) verifySourceJournal(ctx context.Context, tenantID string, entry *domain.IntercompanyEntry, principalID, correlationID string) (*domain.MatchAttempt, error) {
+	journal, failure, err := h.checkJournal(ctx, tenantID, entry.SourceJournalID, sourceJournalCheck(entry))
+	if err != nil {
+		return nil, err
+	}
+	if failure == nil {
+		return nil, nil
+	}
+
+	sourceJournalID := entry.SourceJournalID
+	attempt := &domain.MatchAttempt{
+		IntercompanyEntryID: entry.IntercompanyEntryID,
+		Outcome:             domain.MatchStatusMismatch,
+		FailedRule:          &failure.rule,
+		Message:             &failure.message,
+		Source: domain.MatchAttemptSide{
+			JournalID: &sourceJournalID, ExpectedAmount: entry.Amount, ExpectedCurrency: entry.CurrencyCode,
+		},
+		// The target journal has not been named yet; its expected side is
+		// still recorded, as every attempt records both sides' expectations.
+		Target: domain.MatchAttemptSide{
+			ExpectedAmount: entry.CounterpartyAmount, ExpectedCurrency: entry.CounterpartyCurrencyCode,
+		},
+		ExaminedJournalIDs: []string{entry.SourceJournalID},
+		Tolerance:          toleranceDecimal(),
+		FiscalPeriod:       entry.FiscalPeriod,
+		AttemptedBy:        principalID,
+		CorrelationID:      &correlationID,
+	}
+	if journal != nil {
+		total, err := journalTotal(journal)
+		if err != nil {
+			return nil, fmt.Errorf("read source journal amount: %w", err)
+		}
+		observeJournal(&attempt.Source, journal, total)
+	}
+
+	entry.MatchStatus = domain.MatchStatusMismatch
+	entry.MismatchReason = &failure.message
+	return attempt, nil
 }
 
 // pairSides is a validated CreateIntercompanyPair request's two sides,
@@ -443,27 +533,31 @@ func (h *Handler) MatchEntry(w http.ResponseWriter, r *http.Request) {
 	// check runs, and recorded with whichever outcome the match reaches.
 	attempt := newMatchAttempt(entry, req.TargetJournalID, principalID, correlationID)
 
-	// Fetch target journal detail from general-ledger-svc
-	journal, err := h.ledger.GetJournal(r.Context(), tenantID, req.TargetJournalID)
-	if errors.Is(err, domain.ErrEntryNotFound) {
-		// ACC-11's own negative path, "One side missing": the named
-		// counterparty journal does not exist at all. A real accounting
-		// fact worth recording as MISMATCH, not a transient 503 — the
-		// caller almost certainly named the wrong journal_id, and retrying
-		// the identical request will fail identically.
-		reason := domain.ErrCounterpartyJournalMissing.Error()
-		h.recordMismatch(w, r, entry, attempt, domain.MatchRuleCounterpartyJournalMissing, reason)
-		return
-	}
+	// Fetch the target journal and run the four checks every pairing side
+	// gets: it exists, its legal entity is the expected one, it is FINALIZED,
+	// and its currency is valid and the expected one. The amount check below
+	// is target-specific; a create-time source check stops at these four
+	// (SPEC_DEVIATIONS A6).
+	journal, failure, err := h.checkJournal(r.Context(), tenantID, req.TargetJournalID, targetJournalCheck(entry))
 	if err != nil {
 		h.log.Error("failed to query target journal from GL", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "gl_query_failed", err.Error())
 		return
 	}
+	if journal == nil {
+		// ACC-11's own negative path, "One side missing": the named
+		// counterparty journal does not exist at all. A real accounting
+		// fact worth recording as MISMATCH, not a transient 503 — the
+		// caller almost certainly named the wrong journal_id, and retrying
+		// the identical request will fail identically.
+		h.recordMismatch(w, r, entry, attempt, failure.rule, failure.message)
+		return
+	}
 
 	// The journal amount is the larger of its total debits and total
-	// credits (SPEC_DEVIATIONS A5), summed exactly. Read before any check so
-	// every attempt records what the journal held, whichever rule fails.
+	// credits (SPEC_DEVIATIONS A5), summed exactly. Read before the checks'
+	// outcome is recorded so every attempt records what the journal held,
+	// whichever rule fails.
 	journalAmount, err := journalTotal(journal)
 	if err != nil {
 		h.log.Error("general-ledger-svc returned an unreadable journal amount", zap.Error(err))
@@ -476,40 +570,15 @@ func (h *Handler) MatchEntry(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
-	observeTargetJournal(&attempt.Target, journal, journalAmount)
+	observeJournal(&attempt.Target, journal, journalAmount)
 
-	// Validation 1: Target journal entity must match entry target legal entity
-	if journal.LegalEntityID != entry.TargetLegalEntityID {
-		reason := fmt.Sprintf("target_journal_entity_mismatch: journal entity %s != target entity %s", journal.LegalEntityID, entry.TargetLegalEntityID)
-		h.recordMismatch(w, r, entry, attempt, domain.MatchRuleTargetEntityMismatch, reason)
+	if failure != nil {
+		h.recordMismatch(w, r, entry, attempt, failure.rule, failure.message)
 		return
 	}
 
-	// Validation 2: Journal status must be FINALIZED
-	if journal.Status != "FINALIZED" {
-		reason := fmt.Sprintf("target_journal_not_finalized: status is %s", journal.Status)
-		h.recordMismatch(w, r, entry, attempt, domain.MatchRuleTargetJournalNotFinalized, reason)
-		return
-	}
-
-	// Validation 3: the target journal must be in the currency the
-	// counterparty side is expected in. Checked before the amount: two
-	// amounts in different currencies are not comparable, so a currency
-	// difference is refused outright rather than the raw numbers being
-	// compared (a 5,000 GBP journal used to match a 5,000 USD pair).
-	if !domain.ValidCurrencyCode(journal.CurrencyCode) {
-		reason := fmt.Sprintf("currency_unverifiable: target journal currency is %q, expected %s", journal.CurrencyCode, entry.CounterpartyCurrencyCode)
-		h.recordMismatch(w, r, entry, attempt, domain.MatchRuleCurrencyUnverifiable, reason)
-		return
-	}
-	if journal.CurrencyCode != entry.CounterpartyCurrencyCode {
-		reason := fmt.Sprintf("currency_mismatch: expected counterparty currency %s != journal currency %s", entry.CounterpartyCurrencyCode, journal.CurrencyCode)
-		h.recordMismatch(w, r, entry, attempt, domain.MatchRuleCurrencyMismatch, reason)
-		return
-	}
-
-	// Validation 4: the target journal's amount must match the expected
-	// counterparty amount, compared exactly (big.Rat) within matchTolerance.
+	// The target journal's amount must match the expected counterparty
+	// amount, compared exactly (big.Rat) within matchTolerance.
 	if diff := new(big.Rat).Sub(journalAmount, expected); diff.Abs(diff).Cmp(matchTolerance) > 0 {
 		reason := fmt.Sprintf("amount_mismatch: expected counterparty amount %s %s != journal amount %s %s",
 			domain.CanonicalAmount(expected), entry.CounterpartyCurrencyCode, domain.CanonicalAmount(journalAmount), journal.CurrencyCode)
@@ -558,6 +627,110 @@ func (h *Handler) MatchEntry(w http.ResponseWriter, r *http.Request) {
 // is no matching-policy version yet, SPEC_DEVIATIONS A5).
 var matchTolerance = big.NewRat(1, 1000)
 
+func toleranceDecimal() domain.Decimal {
+	return domain.Decimal(domain.CanonicalAmount(matchTolerance))
+}
+
+// journalCheck describes the four checks one side of a pair gets from
+// general-ledger-svc and the rule names a failure records. The checks and
+// their order are the same on both sides; only the rules and the sentences
+// differ, so there is one verification path (SPEC_DEVIATIONS A6).
+type journalCheck struct {
+	side                  string // "source" or "target"
+	expectedEntityID      string
+	expectedCurrency      string
+	expectedCurrencyLabel string // "source" or "counterparty" in a currency_mismatch sentence
+	missingRule           string
+	missingMessage        string
+	entityRule            string
+	notFinalizedRule      string
+	unverifiableRule      string
+	currencyMismatchRule  string
+}
+
+func sourceJournalCheck(entry *domain.IntercompanyEntry) journalCheck {
+	return journalCheck{
+		side:                  "source",
+		expectedEntityID:      entry.SourceLegalEntityID,
+		expectedCurrency:      entry.CurrencyCode,
+		expectedCurrencyLabel: "source",
+		missingRule:           domain.MatchRuleSourceJournalMissing,
+		missingMessage:        domain.ErrSourceJournalMissing.Error(),
+		entityRule:            domain.MatchRuleSourceEntityMismatch,
+		notFinalizedRule:      domain.MatchRuleSourceJournalNotFinalized,
+		unverifiableRule:      domain.MatchRuleSourceCurrencyUnverifiable,
+		currencyMismatchRule:  domain.MatchRuleSourceCurrencyMismatch,
+	}
+}
+
+func targetJournalCheck(entry *domain.IntercompanyEntry) journalCheck {
+	return journalCheck{
+		side:                  "target",
+		expectedEntityID:      entry.TargetLegalEntityID,
+		expectedCurrency:      entry.CounterpartyCurrencyCode,
+		expectedCurrencyLabel: "counterparty",
+		missingRule:           domain.MatchRuleCounterpartyJournalMissing,
+		missingMessage:        domain.ErrCounterpartyJournalMissing.Error(),
+		entityRule:            domain.MatchRuleTargetEntityMismatch,
+		notFinalizedRule:      domain.MatchRuleTargetJournalNotFinalized,
+		unverifiableRule:      domain.MatchRuleCurrencyUnverifiable,
+		currencyMismatchRule:  domain.MatchRuleCurrencyMismatch,
+	}
+}
+
+// journalFailure is a real accounting fact about a journal: which rule it
+// failed and the sentence that explains it.
+type journalFailure struct {
+	rule    string
+	message string
+}
+
+// checkJournal fetches journalID with the same general-ledger-svc call
+// MatchEntry has always used and applies the four checks common to both
+// sides of a pair, in this order: exists, belongs to expectedEntityID, is
+// FINALIZED, and carries a valid ISO 4217 currency equal to expectedCurrency.
+// Currency is checked before any amount comparison, so two amounts in
+// different currencies are never compared as if comparable.
+//
+// A missing journal returns a nil detail and a failure; any other failure
+// returns the detail as fetched, so the caller can still record what was
+// observed. Only a general-ledger-svc error returns err.
+func (h *Handler) checkJournal(ctx context.Context, tenantID, journalID string, c journalCheck) (*ledger.JournalDetail, *journalFailure, error) {
+	journal, err := h.ledger.GetJournal(ctx, tenantID, journalID)
+	if errors.Is(err, domain.ErrEntryNotFound) {
+		return nil, &journalFailure{rule: c.missingRule, message: c.missingMessage}, nil
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if journal.LegalEntityID != c.expectedEntityID {
+		return journal, &journalFailure{
+			rule:    c.entityRule,
+			message: fmt.Sprintf("%s_journal_entity_mismatch: journal entity %s != %s entity %s", c.side, journal.LegalEntityID, c.side, c.expectedEntityID),
+		}, nil
+	}
+	if journal.Status != "FINALIZED" {
+		return journal, &journalFailure{
+			rule:    c.notFinalizedRule,
+			message: fmt.Sprintf("%s_journal_not_finalized: status is %s", c.side, journal.Status),
+		}, nil
+	}
+	if !domain.ValidCurrencyCode(journal.CurrencyCode) {
+		return journal, &journalFailure{
+			rule:    c.unverifiableRule,
+			message: fmt.Sprintf("currency_unverifiable: %s journal currency is %q, expected %s", c.side, journal.CurrencyCode, c.expectedCurrency),
+		}, nil
+	}
+	if journal.CurrencyCode != c.expectedCurrency {
+		return journal, &journalFailure{
+			rule:    c.currencyMismatchRule,
+			message: fmt.Sprintf("currency_mismatch: expected %s currency %s != journal currency %s", c.expectedCurrencyLabel, c.expectedCurrency, journal.CurrencyCode),
+		}, nil
+	}
+	return journal, nil, nil
+}
+
 // journalTotal is the larger of the journal's total debits and total
 // credits, summed exactly. An absent line amount counts as zero, as it did
 // when lines were decoded into float64.
@@ -587,7 +760,9 @@ func journalTotal(j *ledger.JournalDetail) (*big.Rat, error) {
 
 // newMatchAttempt starts the evidence for one match attempt: what each side
 // of the pair expects, which journal is examined, and the tolerance. The
-// source side is expected but never examined (SPEC_DEVIATIONS A6).
+// source side is expected but not re-examined at match time: it was verified
+// when the pair was created (SPEC_DEVIATIONS A6), and that create-time
+// attempt carries its observed fields.
 func newMatchAttempt(entry *domain.IntercompanyEntry, targetJournalID, principalID, correlationID string) *domain.MatchAttempt {
 	sourceJournalID := entry.SourceJournalID
 	return &domain.MatchAttempt{
@@ -599,15 +774,15 @@ func newMatchAttempt(entry *domain.IntercompanyEntry, targetJournalID, principal
 			JournalID: &targetJournalID, ExpectedAmount: entry.CounterpartyAmount, ExpectedCurrency: entry.CounterpartyCurrencyCode,
 		},
 		ExaminedJournalIDs: []string{targetJournalID},
-		Tolerance:          domain.Decimal(domain.CanonicalAmount(matchTolerance)),
+		Tolerance:          toleranceDecimal(),
 		AttemptedBy:        principalID,
 		CorrelationID:      &correlationID,
 	}
 }
 
-// observeTargetJournal records what general-ledger-svc reported for the
-// target journal, exactly as reported.
-func observeTargetJournal(side *domain.MatchAttemptSide, j *ledger.JournalDetail, total *big.Rat) {
+// observeJournal records what general-ledger-svc reported for a journal,
+// exactly as reported.
+func observeJournal(side *domain.MatchAttemptSide, j *ledger.JournalDetail, total *big.Rat) {
 	amount := domain.Decimal(domain.CanonicalAmount(total))
 	currency, entity, status, period := j.CurrencyCode, j.LegalEntityID, j.Status, j.FiscalPeriod
 	side.ObservedAmount = &amount

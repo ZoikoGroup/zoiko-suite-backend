@@ -84,13 +84,26 @@ reconciliation-engine-svc holds for DATA-07.
   and no matching-policy or tolerance version (fixed `0.001`). Needs an
   intercompany account designation from the chart of accounts (ACC-01/02);
   until then this is a known approximation.
-- **A6. The source side is never verified.** `CreateIntercompanyPair` accepts
-  any `source_journal_id` without asking general-ledger-svc whether it exists,
-  is FINALIZED, belongs to `source_legal_entity_id`, or matches the amount.
-  Only the target side is checked, at match time. The negative path "One side
-  missing" is therefore enforced for the counterparty only. Scope: the same
-  four checks `MatchEntry` runs on the target, run on the source at create
-  time (reject, or create directly in MISMATCH with a reason).
+- **A6. The source side was never verified. — Closed (B12).**
+  `CreateIntercompanyPair` now fetches the named source journal from
+  general-ledger-svc with the same `GetJournal` call `MatchEntry` uses and
+  runs the same four checks on it that `MatchEntry` runs on the target: the
+  journal exists, its legal entity is the pair's `source_legal_entity_id`,
+  its status is `FINALIZED`, and its currency is a valid ISO 4217 code equal
+  to the pair's `currency_code`. A journal that fails one is a real
+  accounting fact, so the pair is created directly in MISMATCH, in the same
+  transaction as its `intercompany_match_attempts` row (A3), recording
+  `SOURCE_JOURNAL_MISSING`, `SOURCE_ENTITY_MISMATCH`,
+  `SOURCE_JOURNAL_NOT_FINALIZED`, `SOURCE_CURRENCY_UNVERIFIABLE` or
+  `SOURCE_CURRENCY_MISMATCH`; migration 000008 widens the rule CHECK for
+  them. The answer is 201 with the pair (MISMATCH plus `mismatch_reason`),
+  not a 400/422/503 that would make the caller retry an identically wrong
+  request. A general-ledger-svc outage is still a 503 and creates nothing.
+  The source amount is not compared at create: A6's scope is the four checks
+  `MatchEntry` runs before its amount check, and amount verification is A5's,
+  where the journal-total approximation lives. A replay for the same
+  `source_journal_id` returns the original pair before the ledger is
+  consulted, so it neither re-verifies nor adds an attempt.
 - **A7. Events: two of the four named events were missing, and one had a
   misleading name. — Closed (B11).** Emitted: `intercompany-entry.created`
   (IntercompanyPairCreated), `intercompany-entry.mismatch-detected`
@@ -367,3 +380,52 @@ reconciliation-engine-svc holds for DATA-07.
     same `enqueueEntryEvent` helper every other event in this service uses.
     If building or enqueuing the envelope fails, the transaction rolls back,
     so a committed state change and its event cannot diverge.
+- **B12. How the source journal is verified at create (A6).**
+  - *One verification path.* `CreateEntry` and `MatchEntry` both call
+    `checkJournal`, which makes the same `ledger.Client.GetJournal` request
+    and applies the checks in the same order: exists → entity → FINALIZED →
+    currency. Currency has two refusals, `…_CURRENCY_UNVERIFIABLE` for a
+    code that is not a real ISO 4217 currency (`XXX`, general-ledger-svc's
+    value for journals predating its currency column) and
+    `…_CURRENCY_MISMATCH` for a different valid one; both precede any amount
+    comparison, which is why a 5,000 GBP source journal cannot back a 5,000
+    USD pair.
+  - *Side-specific rules.* The target's existing rule names are unchanged.
+    The source gets its own five so an explanation cannot mistake which side
+    failed; the target's `COUNTERPARTY_JOURNAL_MISSING` wording is not
+    reused for the source.
+  - *Created in MISMATCH, 201.* The create command succeeds in the sense
+    that the pair exists; its state says the source journal did not verify.
+    The caller is not asked to retry. The create-time attempt records the
+    source journal's observed amount, currency, entity, status and period
+    (when the journal was fetched) and both sides' expectations; the target
+    journal id is NULL until a match names it. It is append-only like every
+    other attempt.
+  - *Still 503 for an outage.* A failed general-ledger-svc call, or an
+    unreadable journal amount, creates nothing and answers 503
+    `gl_query_failed`: unlike a wrong journal, a retry can succeed.
+  - *No amount check.* A6's scope is the four checks `MatchEntry` runs
+    before its amount check, not amount equality. The pair's `amount` is the
+    source side the caller states. A5 already records that the match compares
+    a journal total, not its intercompany line, so comparing the source
+    journal's total here would reject journals A5 knows are approximated.
+    Source amount verification belongs with A5.
+  - *Events.* The create transaction enqueues `…created` and, because the
+    pair is MISMATCH from birth, `…mismatch-detected`; both carry
+    `match_status` MISMATCH and the reason. Both roll back with the pair.
+  - *Replay.* `GetEntryBySourceJournal` resolves `(tenant_id,
+    source_journal_id)` before `GetJournal`, so a retried POST gets 200 and
+    the original pair even during a ledger outage, and
+    `CreateEntryWithAttempt` writes no attempt when its insert conflicts. A
+    concurrent create between the lookup and the insert is the same: the
+    loser returns the original row.
+  - *Source is checked once, at create.* `MatchIntercompany` still verifies
+    the target only. A source journal edited after the pair was created is
+    not re-checked by a match; that is outside A6. Match attempts therefore
+    still leave the source's observed columns NULL, and the create-time
+    attempt is the one carrying them.
+  - *Schema.* Migration 000008 widens
+    `intercompany_match_attempts_failed_rule_check`. Its down migration
+    restores 000007's list as `NOT VALID`: source-rule rows are immutable
+    and must survive a rollback, and a pre-A6 binary only writes rules the
+    old list allows. Re-applying 000008 validates them again.

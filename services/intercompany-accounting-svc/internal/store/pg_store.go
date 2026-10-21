@@ -132,17 +132,42 @@ func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(tx pgx.T
 	return nil
 }
 
-// CreateEntry inserts an intercompany entry in UNMATCHED status.
+// CreateEntry inserts an UNMATCHED intercompany entry. It is the
+// pre-A6-friendly form of CreateEntryWithAttempt with no create-time
+// verification attempt; production create calls go through
+// CreateEntryWithAttempt.
+func (s *PgStore) CreateEntry(ctx context.Context, entry *domain.IntercompanyEntry, actorID, correlationID string) (created bool, err error) {
+	return s.createEntry(ctx, entry, nil, actorID, correlationID)
+}
+
+// CreateEntryWithAttempt inserts an intercompany entry and, in the same
+// transaction, the create-time source-verification attempt that put it in
+// MISMATCH (SPEC_DEVIATIONS A6), its creation transition and its "created"
+// lifecycle event. attempt is nil when the source journal passed and the pair
+// is UNMATCHED. A MISMATCH pair without an attempt is refused: the reason
+// would have no evidence.
 //
-// Idempotent on (tenant_id, source_journal_id): a retried call (e.g. a
-// client timeout on a POST that actually succeeded server-side) hits the
-// unique index added in 000002 and resolves to the ORIGINAL entry —
-// mutating *entry in place to reflect it — rather than creating a
-// duplicate. Returns created=false when the row already existed.
+// Idempotent on (tenant_id, source_journal_id), exactly like CreateEntry. On
+// a replay the ORIGINAL row is loaded into *entry and created=false; no
+// attempt is written for the replay, and no second event is enqueued.
 //
 // Amounts are bound as decimal text cast to NUMERIC; they never pass
 // through float64 on the way in or (amount::text) on the way out.
-func (s *PgStore) CreateEntry(ctx context.Context, entry *domain.IntercompanyEntry, actorID, correlationID string) (created bool, err error) {
+func (s *PgStore) CreateEntryWithAttempt(ctx context.Context, entry *domain.IntercompanyEntry, attempt *domain.MatchAttempt, actorID, correlationID string) (created bool, err error) {
+	switch {
+	case entry.MatchStatus == domain.MatchStatusMismatch && attempt == nil:
+		return false, fmt.Errorf("create MISMATCH entry %s: a match attempt is required", entry.IntercompanyEntryID)
+	case attempt != nil && entry.MatchStatus != domain.MatchStatusMismatch:
+		return false, fmt.Errorf("create entry %s: an attempt is only valid for MISMATCH, got %s", entry.IntercompanyEntryID, entry.MatchStatus)
+	case attempt != nil && attempt.Outcome != domain.MatchStatusMismatch:
+		return false, fmt.Errorf("create entry %s: attempt outcome must be MISMATCH, got %s", entry.IntercompanyEntryID, attempt.Outcome)
+	case attempt != nil && attempt.IntercompanyEntryID != entry.IntercompanyEntryID:
+		return false, fmt.Errorf("create entry %s: attempt describes %s", entry.IntercompanyEntryID, attempt.IntercompanyEntryID)
+	}
+	return s.createEntry(ctx, entry, attempt, actorID, correlationID)
+}
+
+func (s *PgStore) createEntry(ctx context.Context, entry *domain.IntercompanyEntry, attempt *domain.MatchAttempt, actorID, correlationID string) (created bool, err error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
 		return false, domain.ErrIdentityMissing
@@ -150,6 +175,11 @@ func (s *PgStore) CreateEntry(ctx context.Context, entry *domain.IntercompanyEnt
 
 	if entry.Dimensions == nil {
 		entry.Dimensions = domain.Dimensions{}
+	}
+	if attempt != nil {
+		// The pair reports the attempt's sentence, and the event and
+		// transition below describe the row as committed.
+		entry.MismatchReason = attempt.Message
 	}
 
 	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
@@ -176,18 +206,33 @@ func (s *PgStore) CreateEntry(ctx context.Context, entry *domain.IntercompanyEnt
 				return err
 			}
 			// Replay of a prior request for the same source_journal_id —
-			// the original row's own creation already enqueued this event.
+			// the original row's own creation already recorded its attempt
+			// and enqueued its events.
 			created = false
 			return nil
 		}
 		entry.TenantID = tenantID
+		if attempt != nil {
+			attempt.FiscalPeriod = entry.FiscalPeriod
+			if err := insertMatchAttempt(ctx, tx, tenantID, attempt); err != nil {
+				return err
+			}
+		}
 		if err := recordTransition(ctx, tx, tenantID, entry.IntercompanyEntryID, transition{
-			to: entry.MatchStatus, fiscalPeriod: entry.FiscalPeriod, actor: actorID, correlationID: correlationID,
+			to: entry.MatchStatus, fiscalPeriod: entry.FiscalPeriod, reason: entry.MismatchReason,
+			actor: actorID, correlationID: correlationID,
 		}); err != nil {
 			return err
 		}
 		if err := s.enqueueEntryEvent(ctx, tx, "created", "intercompany.entry.created", actorID, correlationID, entry); err != nil {
 			return err
+		}
+		if attempt != nil {
+			// A pair created already MISMATCH is both a created and a
+			// detected-mismatch fact, and A7's event set has a name for each.
+			if err := s.enqueueEntryEvent(ctx, tx, "mismatch-detected", "intercompany.mismatch.detected", actorID, correlationID, entry); err != nil {
+				return err
+			}
 		}
 		created = true
 		return nil
@@ -254,6 +299,33 @@ func (s *PgStore) GetEntry(ctx context.Context, id string) (*domain.Intercompany
 			FROM intercompany_entries
 			WHERE intercompany_entry_id = $1 AND tenant_id = $2
 		`, id, tenantID), &entry)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrEntryNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &entry, nil
+}
+
+// GetEntryBySourceJournal resolves the create idempotency key without
+// consulting general-ledger-svc, so a retried create returns the original
+// pair even when the ledger is unavailable and never records a second
+// create-time attempt (SPEC_DEVIATIONS A6).
+func (s *PgStore) GetEntryBySourceJournal(ctx context.Context, sourceJournalID string) (*domain.IntercompanyEntry, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+
+	var entry domain.IntercompanyEntry
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		return scanIntercompanyEntry(tx.QueryRow(ctx, `
+			SELECT `+intercompanyEntryColumns+`
+			FROM intercompany_entries
+			WHERE tenant_id = $1 AND source_journal_id = $2
+		`, tenantID, sourceJournalID), &entry)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, domain.ErrEntryNotFound
