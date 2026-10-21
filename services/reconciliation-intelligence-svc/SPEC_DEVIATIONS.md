@@ -25,7 +25,7 @@ candidate match against a counterpart record (A2a; duplicate-entry detection
 within a run is done, A2), which is the other half of what the data model and the
 ownership table say it is for. Two defects were fixed in this pass (B1, B2);
 a later pass closed A7 and the decimal half of A4; a third closed A1, A3 and
-A6.
+A6; the latest closes A8 and A9.
 
 ## A. Not implemented / weaker than the spec
 
@@ -187,10 +187,26 @@ A6.
   identify the exact append-only policy row. Duplicate suggestions record the
   same version even though their rule does not compare amounts against the
   tolerance (B4).
-- **A9. Field names differ from the data model.** `UnmatchedItem` /
-  `resolution_status` / `transaction_ref_a|b` rather than
-  `ReconciliationSuggestion` / `suggestion_status` / `source_record_a|b`; no
-  `legal_entity_id` on the item row (it is on the job).
+- **A9. Field names differ from the data model.** — Closed (B5). The
+  canonical Data Model / ERD Pack (`docs/architecture/04-data-model.md` §16,
+  the document that calls itself "the canonical truth model") names the
+  entity `ReconciliationSuggestion` with `reconciliation_suggestion_id`,
+  `legal_entity_id`, `source_record_a`, `source_record_b`,
+  `confidence_score`, `suggestion_status` and `generated_at`. The Go type is
+  now `ReconciliationSuggestion`; `transaction_ref_a|b` are
+  `source_record_a|b`, `resolution_status` is `suggestion_status`, and
+  `legal_entity_id` is on the suggestion row — migration 000006 adds it,
+  backfills it from the job, and makes it NOT NULL. The Data/AI spec's
+  DATA-07 "Reconciliation Engine" section names different entities
+  altogether (`ReconciliationDefinition`, `ReconciliationRun`,
+  `PopulationSnapshot`, `MatchResult`, `ReconciliationException`,
+  `Certification`) and does not name `ReconciliationSuggestion`; the
+  canonical data model is therefore the source used here. For one release
+  the item JSON still emits the old keys and the apply route still accepts
+  `resolution_status`, both derived from the canonical fields (B5).
+  `resolution_notes` and the `unmatched_items` collection key keep their
+  names: A9 did not name them, and the collection key is the existing wire
+  shape.
 
 ## B. Interpretations and additions (decisions a reviewer may want to reverse)
 
@@ -221,3 +237,16 @@ A6.
   compare amounts against the tolerance: the version identifies the policy in
   force for the analysis they belong to. A job with no suggestions records no
   version, which is honest — it produced no intelligence artifact.
+- **B5. A9's rename is dual-named on the wire for one release.** The
+  canonical response emits `suggestion_status`, `source_record_a|b` and
+  `legal_entity_id`, and also emits `resolution_status` and
+  `transaction_ref_a|b`, derived from the same fields so they cannot
+  disagree. `POST …/apply` accepts either status key; sending both with
+  different values is 400. The internal "resolution" names A9 did not cover
+  (`ApplyResolution`, `resolution_notes`, the
+  `reconciliation.resolution_recommended` event and its legacy
+  `resolution_status` payload key) are unchanged; the event payload now also
+  carries `suggestion_status`. Remove the aliases after one release. The only
+  in-repo consumer of the old names is the Postman collection, whose apply
+  request still sends `resolution_status`, so it exercises the alias rather
+  than a hard break.

@@ -85,7 +85,7 @@ func TestAnalyzeAndLifecycleReconciliation(t *testing.T) {
 	// 3. Apply Resolution
 	itemId := job.UnmatchedItems[0].ID
 	applyBody, _ := json.Marshal(domain.ApplyResolutionRequest{
-		ResolutionStatus: domain.StatusApproved,
+		SuggestionStatus: domain.StatusApproved,
 		ResolutionNotes:  "Reviewed; matched manually in bank reconciliation",
 	})
 

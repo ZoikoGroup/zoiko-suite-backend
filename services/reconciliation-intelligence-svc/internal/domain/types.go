@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
@@ -13,7 +14,7 @@ import (
 type SourceSystem string
 type DiscrepancyType string
 type ResolutionRecommendation string
-type ResolutionStatus string
+type SuggestionStatus string
 
 const (
 	SourceGeneralLedger  SourceSystem = "GENERAL_LEDGER"
@@ -41,10 +42,10 @@ const (
 )
 
 const (
-	StatusRecommended ResolutionStatus = "RECOMMENDED"
-	StatusApproved    ResolutionStatus = "APPROVED"
-	StatusRejected    ResolutionStatus = "REJECTED"
-	StatusExecuted    ResolutionStatus = "EXECUTED"
+	StatusRecommended SuggestionStatus = "RECOMMENDED"
+	StatusApproved    SuggestionStatus = "APPROVED"
+	StatusRejected    SuggestionStatus = "REJECTED"
+	StatusExecuted    SuggestionStatus = "EXECUTED"
 )
 
 // HeuristicRule names the fixed rule that produced a suggestion. It is the
@@ -96,27 +97,38 @@ type BankStatementLine struct {
 // state is bank-reconciliation-svc's to report, so the honest values here
 // are "not measured", not 0 and 0%.
 type ReconciliationJob struct {
-	ID                      string          `json:"id"`
-	TenantID                string          `json:"tenant_id"`
-	LegalEntityID           string          `json:"legal_entity_id"`
-	JobName                 string          `json:"job_name"`
-	BankReconciliationRunID string          `json:"bank_reconciliation_run_id,omitempty"`
-	SourceSystemA           SourceSystem    `json:"source_system_a"`
-	SourceSystemB           SourceSystem    `json:"source_system_b,omitempty"`
-	TotalProcessedCount     int             `json:"total_processed_count"`
-	MatchedCount            *int            `json:"matched_count,omitempty"`
-	UnmatchedCount          int             `json:"unmatched_count"`
-	ReconciliationRate      *float64        `json:"reconciliation_rate,omitempty"` // 0.00 to 100.00%; legacy jobs only
-	Status                  string          `json:"status"`                        // COMPLETED, ARCHIVED
-	AnalyzedAt              time.Time       `json:"analyzed_at"`
-	CreatedAt               time.Time       `json:"created_at"`
-	UnmatchedItems          []UnmatchedItem `json:"unmatched_items,omitempty"`
+	ID                      string                     `json:"id"`
+	TenantID                string                     `json:"tenant_id"`
+	LegalEntityID           string                     `json:"legal_entity_id"`
+	JobName                 string                     `json:"job_name"`
+	BankReconciliationRunID string                     `json:"bank_reconciliation_run_id,omitempty"`
+	SourceSystemA           SourceSystem               `json:"source_system_a"`
+	SourceSystemB           SourceSystem               `json:"source_system_b,omitempty"`
+	TotalProcessedCount     int                        `json:"total_processed_count"`
+	MatchedCount            *int                       `json:"matched_count,omitempty"`
+	UnmatchedCount          int                        `json:"unmatched_count"`
+	ReconciliationRate      *float64                   `json:"reconciliation_rate,omitempty"` // 0.00 to 100.00%; legacy jobs only
+	Status                  string                     `json:"status"`                        // COMPLETED, ARCHIVED
+	AnalyzedAt              time.Time                  `json:"analyzed_at"`
+	CreatedAt               time.Time                  `json:"created_at"`
+	UnmatchedItems          []ReconciliationSuggestion `json:"unmatched_items,omitempty"`
 }
 
-type UnmatchedItem struct {
-	ID       string `json:"id,omitempty"`
-	TenantID string `json:"tenant_id"`
-	JobID    string `json:"job_id"`
+// ReconciliationSuggestion is one advisory suggestion about an UNMATCHED
+// bank-reconciliation statement line. The name and fields follow the
+// canonical data model's ReconciliationSuggestion entity (04-data-model.md
+// §16): reconciliation_suggestion_id is ID, source_record_a/b are the bank
+// references, suggestion_status is the human decision state, and
+// legal_entity_id is on the suggestion itself, not only on its job.
+//
+// For one release the JSON also carries the pre-rename names
+// transaction_ref_a/b and resolution_status (see MarshalJSON). Callers can
+// migrate without a hard break.
+type ReconciliationSuggestion struct {
+	ID            string `json:"id,omitempty"`
+	TenantID      string `json:"tenant_id"`
+	LegalEntityID string `json:"legal_entity_id"`
+	JobID         string `json:"job_id"`
 	// BankReconciliationRunID and StatementLineID point at the authoritative
 	// record this suggestion is about in bank-reconciliation-svc. Empty only
 	// on items from jobs analyzed before migration 000003.
@@ -126,8 +138,8 @@ type UnmatchedItem struct {
 	// suggestion is about: on DUPLICATE_ENTRY, the line StatementLineID
 	// probably duplicates. Empty on single-line suggestions.
 	CounterpartStatementLineID string          `json:"counterpart_statement_line_id,omitempty"`
-	TransactionRefA            string          `json:"transaction_ref_a"`
-	TransactionRefB            string          `json:"transaction_ref_b,omitempty"`
+	SourceRecordA              string          `json:"source_record_a"`
+	SourceRecordB              string          `json:"source_record_b,omitempty"`
 	AmountA                    string          `json:"amount_a"`
 	AmountB                    string          `json:"amount_b"`
 	DiscrepancyAmount          string          `json:"discrepancy_amount"`
@@ -147,10 +159,30 @@ type UnmatchedItem struct {
 	// written before migration 000005.
 	ToleranceVersion int                      `json:"tolerance_version,omitempty"`
 	Recommendation   ResolutionRecommendation `json:"recommendation"`
-	ResolutionStatus ResolutionStatus         `json:"resolution_status"`
+	SuggestionStatus SuggestionStatus         `json:"suggestion_status"`
 	ResolutionNotes  string                   `json:"resolution_notes,omitempty"`
 	CreatedAt        time.Time                `json:"created_at"`
 	UpdatedAt        time.Time                `json:"updated_at"`
+}
+
+// MarshalJSON emits the canonical field names and, for one release, the
+// pre-rename aliases. A consumer still reading resolution_status or
+// transaction_ref_a/b keeps working; new consumers read suggestion_status
+// and source_record_a/b. The aliases are derived from the same fields, so
+// they cannot disagree. Remove them after one release (A9/B5).
+func (s ReconciliationSuggestion) MarshalJSON() ([]byte, error) {
+	type alias ReconciliationSuggestion
+	return json.Marshal(struct {
+		alias
+		LegacyTransactionRefA  string           `json:"transaction_ref_a"`
+		LegacyTransactionRefB  string           `json:"transaction_ref_b,omitempty"`
+		LegacyResolutionStatus SuggestionStatus `json:"resolution_status"`
+	}{
+		alias:                  alias(s),
+		LegacyTransactionRefA:  s.SourceRecordA,
+		LegacyTransactionRefB:  s.SourceRecordB,
+		LegacyResolutionStatus: s.SuggestionStatus,
+	})
 }
 
 // AnalyzeReconciliationRequest names the bank-reconciliation run whose
@@ -163,35 +195,58 @@ type AnalyzeReconciliationRequest struct {
 }
 
 type ApplyResolutionRequest struct {
-	ResolutionStatus ResolutionStatus `json:"resolution_status"` // APPROVED, REJECTED, EXECUTED
+	SuggestionStatus SuggestionStatus `json:"suggestion_status"` // APPROVED, REJECTED, EXECUTED
 	ResolutionNotes  string           `json:"resolution_notes"`
 }
 
+// UnmarshalJSON accepts the canonical suggestion_status and, for one release,
+// the pre-rename resolution_status. A caller sending both names with
+// different values is refused rather than having one silently chosen.
+func (r *ApplyResolutionRequest) UnmarshalJSON(data []byte) error {
+	var wire struct {
+		SuggestionStatus SuggestionStatus `json:"suggestion_status"`
+		ResolutionStatus SuggestionStatus `json:"resolution_status"`
+		ResolutionNotes  string           `json:"resolution_notes"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	if wire.SuggestionStatus != "" && wire.ResolutionStatus != "" && wire.SuggestionStatus != wire.ResolutionStatus {
+		return fmt.Errorf("suggestion_status and legacy resolution_status disagree")
+	}
+	r.SuggestionStatus = wire.SuggestionStatus
+	if r.SuggestionStatus == "" {
+		r.SuggestionStatus = wire.ResolutionStatus
+	}
+	r.ResolutionNotes = wire.ResolutionNotes
+	return nil
+}
+
 var (
-	ErrInvalidResolutionStatus = errors.New("resolution_status must be APPROVED, REJECTED or EXECUTED")
-	ErrResolutionTransition    = errors.New("resolution status transition not allowed")
+	ErrInvalidSuggestionStatus = errors.New("suggestion_status must be APPROVED, REJECTED or EXECUTED")
+	ErrResolutionTransition    = errors.New("suggestion status transition not allowed")
 )
 
 // resolutionEdges is the human decision path over a recommendation. A decision
 // is never silently overwritten: REJECTED and EXECUTED are final, and EXECUTED
 // (the owning domain acted on the recommendation) is reachable only from an
 // explicit APPROVED, never straight from the machine's RECOMMENDED.
-var resolutionEdges = map[ResolutionStatus][]ResolutionStatus{
+var resolutionEdges = map[SuggestionStatus][]SuggestionStatus{
 	StatusRecommended: {StatusApproved, StatusRejected},
 	StatusApproved:    {StatusExecuted},
 }
 
 // ValidateResolutionTarget rejects a requested status a caller may not set.
-func ValidateResolutionTarget(to ResolutionStatus) error {
+func ValidateResolutionTarget(to SuggestionStatus) error {
 	switch to {
 	case StatusApproved, StatusRejected, StatusExecuted:
 		return nil
 	}
-	return fmt.Errorf("%w: got %q", ErrInvalidResolutionStatus, to)
+	return fmt.Errorf("%w: got %q", ErrInvalidSuggestionStatus, to)
 }
 
 // ValidateResolutionTransition checks a decision against the item's current status.
-func ValidateResolutionTransition(from, to ResolutionStatus) error {
+func ValidateResolutionTransition(from, to SuggestionStatus) error {
 	if err := ValidateResolutionTarget(to); err != nil {
 		return err
 	}
@@ -269,7 +324,7 @@ const MetricMissingReferenceTolerance = "RECONCILIATION_MISSING_REFERENCE_WRITEO
 // "Intelligent" means fixed rules and one threshold comparison against a governed,
 // versioned tolerance the caller fetched from financial-control-svc
 // (internal/financialcontrol) — never a model. Every item carries
-// ResolutionStatus RECOMMENDED: domain.StatusApproved/Rejected/Executed are
+// SuggestionStatus RECOMMENDED: domain.StatusApproved/Rejected/Executed are
 // only reached through Handler.ApplyResolution, by an authenticated
 // principal holding RECONCILIATION_APPLY_RESOLUTION. Nothing here writes
 // anything off or matches anything, in this service or in
@@ -280,7 +335,7 @@ const MetricMissingReferenceTolerance = "RECONCILIATION_MISSING_REFERENCE_WRITEO
 // missingReferenceTolerance is the current MetricMissingReferenceTolerance for
 // the run's legal entity, including the version that was actually used. All
 // money is compared exactly as big.Rat (ZS-DATA-001 D06).
-func AnalyzeUnmatchedStatementLines(lines []BankStatementLine, runID, tenantID string, missingReferenceTolerance *GovernedTolerance) ([]UnmatchedItem, error) {
+func AnalyzeUnmatchedStatementLines(lines []BankStatementLine, runID, tenantID string, missingReferenceTolerance *GovernedTolerance) ([]ReconciliationSuggestion, error) {
 	if missingReferenceTolerance == nil || missingReferenceTolerance.Amount == nil {
 		return nil, fmt.Errorf("the governed missing-reference tolerance is required")
 	}
@@ -308,7 +363,7 @@ func AnalyzeUnmatchedStatementLines(lines []BankStatementLine, runID, tenantID s
 	// So every line is still the subject of exactly one suggestion.
 	dupOf, dupsOf := findDuplicates(lines, amounts)
 
-	items := make([]UnmatchedItem, 0, len(lines))
+	items := make([]ReconciliationSuggestion, 0, len(lines))
 	for i, line := range lines {
 		amount := amounts[i]
 		now := time.Now()
@@ -347,11 +402,12 @@ func AnalyzeUnmatchedStatementLines(lines []BankStatementLine, runID, tenantID s
 				len(dups), strings.Join(ids, ", "))
 		}
 
-		items = append(items, UnmatchedItem{
+		items = append(items, ReconciliationSuggestion{
 			TenantID:                tenantID,
+			LegalEntityID:           line.LegalEntityID,
 			BankReconciliationRunID: runID,
 			StatementLineID:         line.StatementLineID,
-			TransactionRefA:         line.BankReference,
+			SourceRecordA:           line.BankReference,
 			AmountA:                 CanonicalAmount(amount),
 			AmountB:                 "0",
 			DiscrepancyAmount:       mag,
@@ -360,7 +416,7 @@ func AnalyzeUnmatchedStatementLines(lines []BankStatementLine, runID, tenantID s
 			HeuristicRule:           rule,
 			ToleranceVersion:        missingReferenceTolerance.Version,
 			Recommendation:          rec,
-			ResolutionStatus:        StatusRecommended,
+			SuggestionStatus:        StatusRecommended,
 			ResolutionNotes:         rationale,
 			CreatedAt:               now,
 			UpdatedAt:               now,
@@ -372,7 +428,7 @@ func AnalyzeUnmatchedStatementLines(lines []BankStatementLine, runID, tenantID s
 // duplicateItem is the DUPLICATE_ENTRY suggestion that dup is probably the
 // same bank entry as anchor. It names both lines; the amounts are equal by
 // the detection rule, so the discrepancy is 0.
-func duplicateItem(dup, anchor BankStatementLine, dupAmount, anchorAmount *big.Rat, exact bool, runID, tenantID string, toleranceVersion int, now time.Time) UnmatchedItem {
+func duplicateItem(dup, anchor BankStatementLine, dupAmount, anchorAmount *big.Rat, exact bool, runID, tenantID string, toleranceVersion int, now time.Time) ReconciliationSuggestion {
 	confScore := duplicateSuffixedReferenceConfidence
 	rule := HeuristicDuplicateSuffixed
 	refRule := fmt.Sprintf("bank reference %q is %q plus a trailing sequence suffix", dup.BankReference, anchor.BankReference)
@@ -385,13 +441,14 @@ func duplicateItem(dup, anchor BankStatementLine, dupAmount, anchorAmount *big.R
 		"heuristic rule: statement line %s probably duplicates statement line %s in bank-reconciliation run %s — same bank account and statement date (the run's scope), same amount %s %s, and %s. If confirmed it is one bank entry counted twice: this line is not written off or reviewed on its own; line %s carries the suggestion for the entry itself",
 		dup.StatementLineID, anchor.StatementLineID, runID, CanonicalAmount(dupAmount), dup.CurrencyCode, refRule, anchor.StatementLineID)
 
-	return UnmatchedItem{
+	return ReconciliationSuggestion{
 		TenantID:                   tenantID,
+		LegalEntityID:              dup.LegalEntityID,
 		BankReconciliationRunID:    runID,
 		StatementLineID:            dup.StatementLineID,
 		CounterpartStatementLineID: anchor.StatementLineID,
-		TransactionRefA:            dup.BankReference,
-		TransactionRefB:            anchor.BankReference,
+		SourceRecordA:              dup.BankReference,
+		SourceRecordB:              anchor.BankReference,
 		AmountA:                    CanonicalAmount(dupAmount),
 		AmountB:                    CanonicalAmount(anchorAmount),
 		DiscrepancyAmount:          "0",
@@ -400,7 +457,7 @@ func duplicateItem(dup, anchor BankStatementLine, dupAmount, anchorAmount *big.R
 		HeuristicRule:              rule,
 		ToleranceVersion:           toleranceVersion,
 		Recommendation:             RecommendationConfirmDuplicate,
-		ResolutionStatus:           StatusRecommended,
+		SuggestionStatus:           StatusRecommended,
 		ResolutionNotes:            rationale,
 		CreatedAt:                  now,
 		UpdatedAt:                  now,
