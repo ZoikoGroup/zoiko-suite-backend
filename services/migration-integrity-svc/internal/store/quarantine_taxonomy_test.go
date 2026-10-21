@@ -227,4 +227,21 @@ func TestMigration000005_BackfillsLegacyRowsAndReverses(t *testing.T) {
 	// And up again: the migration is re-runnable after a rollback.
 	exec(up5)
 	assert.Equal(t, "MQ0", checkSev()["SOURCE_IDENTITY"])
+
+	// Once an entry names an owner, the down refuses: the owner cannot be
+	// reconstructed after the column is dropped. Nothing is dropped or
+	// relabelled.
+	_, err = pool.Exec(ctx, `INSERT INTO migration_audit_entries
+		(tenant_id, job_id, record_ref, violation_type, severity, reason_family, owner_id)
+		VALUES ('t', $1, '', 'MISSING_SOURCE_IDENTITY', 'MQ0', 'IDENTITY', 'owner-1')`, jobID)
+	require.NoError(t, err)
+	b, err := os.ReadFile(strings.Replace(up5, ".up.sql", ".down.sql", 1))
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, string(b))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "audit entries with a named owner exist")
+	assert.Equal(t, "MQ0", checkSev()["SOURCE_IDENTITY"], "a refused rollback must leave the taxonomy in place")
+	var owner string
+	require.NoError(t, pool.QueryRow(ctx, `SELECT owner_id FROM migration_audit_entries WHERE owner_id IS NOT NULL`).Scan(&owner))
+	assert.Equal(t, "owner-1", owner)
 }
