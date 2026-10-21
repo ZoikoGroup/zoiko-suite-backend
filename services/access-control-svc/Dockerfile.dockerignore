@@ -1,0 +1,13 @@
+# Used by BuildKit for builds with -f services/access-control-svc/Dockerfile.
+# The context is the repository root (see the Dockerfile), so everything is
+# excluded except the modules the image is built from.
+*
+!services/access-control-svc/
+!services/identity-envelope/
+
+# Not needed inside the image.
+services/access-control-svc/.gotmp/
+services/access-control-svc/**/*.exe
+services/access-control-svc/**/*_test.go
+services/access-control-svc/deployments/
+services/identity-envelope/**/*_test.go

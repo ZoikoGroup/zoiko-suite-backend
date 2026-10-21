@@ -1,0 +1,13 @@
+# Used by BuildKit for builds with -f services/notification-svc/Dockerfile.
+# The context is the repository root (see the Dockerfile), so everything is
+# excluded except the modules the image is built from.
+*
+!services/notification-svc/
+!services/identity-envelope/
+
+# Not needed inside the image.
+services/notification-svc/.gotmp/
+services/notification-svc/**/*.exe
+services/notification-svc/**/*_test.go
+services/notification-svc/deployments/
+services/identity-envelope/**/*_test.go

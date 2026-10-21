@@ -1,10 +1,12 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
@@ -12,6 +14,7 @@ import (
 	"zoiko.io/corporate-tax-svc/internal/authz"
 	"zoiko.io/corporate-tax-svc/internal/domain"
 	"zoiko.io/corporate-tax-svc/internal/events"
+	"zoiko.io/corporate-tax-svc/internal/evidencereq"
 	"zoiko.io/corporate-tax-svc/internal/middleware"
 	"zoiko.io/corporate-tax-svc/internal/store"
 )
@@ -29,11 +32,53 @@ type Handler struct {
 	store     store.Store
 	publisher events.Publisher
 	authz     *authz.Client
+	evidence  EvidenceChecker
 	logger    *zap.Logger
+}
+
+// EvidenceChecker is the evidence-requirements contract the handler depends
+// on. A nil checker leaves the gate unwired (tests); production always wires
+// it in main.
+type EvidenceChecker interface {
+	EvaluateSufficient(ctx context.Context, tenantID, legalEntityID, domainCode, actionType, correlationID, principalID string, evidenceRefs []string) error
 }
 
 func New(st store.Store, pub events.Publisher, az *authz.Client, logger *zap.Logger) *Handler {
 	return &Handler{store: st, publisher: pub, authz: az, logger: logger}
+}
+
+// WithEvidenceGate wires the evidence-requirements gate into return submission.
+func (h *Handler) WithEvidenceGate(c EvidenceChecker) *Handler {
+	h.evidence = c
+	return h
+}
+
+func (h *Handler) checkEvidence(w http.ResponseWriter, r *http.Request, tenantID, legalEntityID, principalID string) bool {
+	if h.evidence == nil {
+		return true
+	}
+	err := h.evidence.EvaluateSufficient(r.Context(), tenantID, legalEntityID,
+		"TAX", ActionTaxReturnSubmit, r.Header.Get("X-Correlation-ID"), principalID, evidenceRefsFromHeader(r.Header.Get("X-Evidence-Refs")))
+	switch {
+	case err == nil:
+		return true
+	case errors.Is(err, evidencereq.ErrEvidenceMissing):
+		writeError(w, http.StatusUnprocessableEntity, "required evidence is missing")
+	default:
+		h.logger.Error("evidence gate unavailable — failing closed", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "evidence service unavailable")
+	}
+	return false
+}
+
+func evidenceRefsFromHeader(raw string) []string {
+	var refs []string
+	for _, ref := range strings.Split(raw, ",") {
+		if ref = strings.TrimSpace(ref); ref != "" {
+			refs = append(refs, ref)
+		}
+	}
+	return refs
 }
 
 // RegisterRoutes mounts all corporate-tax endpoints under a chi Router.
@@ -232,6 +277,9 @@ func (h *Handler) Submit(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !h.checkAuthorized(w, r, principalID, existing.LegalEntityID, ActionTaxReturnSubmit) {
+		return
+	}
+	if !h.checkEvidence(w, r, tenantID, existing.LegalEntityID, principalID) {
 		return
 	}
 

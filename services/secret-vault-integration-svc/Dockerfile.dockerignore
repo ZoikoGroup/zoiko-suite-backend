@@ -1,0 +1,13 @@
+# Used by BuildKit for builds with -f services/secret-vault-integration-svc/Dockerfile.
+# The context is the repository root (see the Dockerfile), so everything is
+# excluded except the modules the image is built from.
+*
+!services/secret-vault-integration-svc/
+!services/identity-envelope/
+
+# Not needed inside the image.
+services/secret-vault-integration-svc/.gotmp/
+services/secret-vault-integration-svc/**/*.exe
+services/secret-vault-integration-svc/**/*_test.go
+services/secret-vault-integration-svc/deployments/
+services/identity-envelope/**/*_test.go

@@ -33,6 +33,7 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+	idenv "zoiko.io/identity-envelope"
 
 	"zoiko.io/notification-svc/internal/domain"
 	svcenvelope "zoiko.io/notification-svc/internal/envelope"
@@ -99,6 +100,9 @@ func (c *Client) ResolveEmail(ctx context.Context, tenantID, callerPrincipalID, 
 	}
 
 	svcenvelope.ForwardTo(ctx, req)
+	// The verified identity envelope too, so the next hop can check who
+	// is asking instead of trusting X-Principal-Id (X-R3).
+	idenv.Forward(ctx, req)
 
 	resp, err := c.client.Do(req)
 	if err != nil {

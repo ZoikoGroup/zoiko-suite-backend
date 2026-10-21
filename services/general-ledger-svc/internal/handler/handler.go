@@ -20,6 +20,7 @@ import (
 	"zoiko.io/general-ledger-svc/internal/close"
 	"zoiko.io/general-ledger-svc/internal/domain"
 	svcenvelope "zoiko.io/general-ledger-svc/internal/envelope"
+	"zoiko.io/general-ledger-svc/internal/evidencereq"
 	svcmiddleware "zoiko.io/general-ledger-svc/internal/middleware"
 )
 
@@ -111,6 +112,13 @@ type Publisher interface {
 // AuthZClient is the authorization contract the handler depends on.
 type AuthZClient interface {
 	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
+}
+
+// EvidenceChecker is the evidence-requirements contract the handler depends
+// on. A nil checker leaves the gate unwired (tests); production always wires
+// it in main.
+type EvidenceChecker interface {
+	EvaluateSufficient(ctx context.Context, tenantID, legalEntityID, domainCode, actionType, correlationID, principalID string, evidenceRefs []string) error
 }
 
 // Action types checked against authorization-svc. A single, platform-wide
@@ -210,6 +218,7 @@ type Handler struct {
 	publisher   Publisher
 	authz       AuthZClient
 	closeClient close.Client
+	evidence    EvidenceChecker
 	log         *zap.Logger
 
 	// clock supplies the reversal posting date. Injectable because a test that
@@ -227,6 +236,34 @@ func New(store Store, publisher Publisher, authz AuthZClient, closeClient close.
 func (h *Handler) WithClock(clock func() time.Time) *Handler {
 	h.clock = clock
 	return h
+}
+
+// WithEvidenceGate wires the evidence-requirements gate into finalization
+// paths. Without it the gate is not consulted.
+func (h *Handler) WithEvidenceGate(c EvidenceChecker) *Handler {
+	h.evidence = c
+	return h
+}
+
+// checkEvidence refuses a finalization when required evidence is missing or
+// the evidence service cannot answer. A nil checker means this deployment has
+// not wired the gate (tests); production wires it in main.
+func (h *Handler) checkEvidence(w http.ResponseWriter, r *http.Request, tenantID, legalEntityID, principalID string, evidenceRefs []string) bool {
+	if h.evidence == nil {
+		return true
+	}
+	err := h.evidence.EvaluateSufficient(r.Context(), tenantID, legalEntityID,
+		"FINANCE", "JOURNAL_POST", r.Header.Get("X-Correlation-ID"), principalID, evidenceRefs)
+	switch {
+	case err == nil:
+		return true
+	case errors.Is(err, evidencereq.ErrEvidenceMissing):
+		writeError(w, http.StatusUnprocessableEntity, "evidence_missing", "required evidence is missing")
+	default:
+		h.log.Error("evidence gate unavailable — failing closed", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "evidence_service_unavailable", "")
+	}
+	return false
 }
 
 func (h *Handler) now() time.Time {
@@ -420,14 +457,14 @@ func (h *Handler) CreateJournal(w http.ResponseWriter, r *http.Request) {
 		SourceEventID:        req.SourceEventID,
 		GovernanceDecisionID: req.GovernanceDecisionID,
 
-		JournalType:              req.JournalType,
-		TransactionDate:          req.TransactionDate,
-		PostingDate:              req.PostingDate,
-		CurrencyCode:             req.CurrencyCode,
-		BookID:                   bookID,
-		ReportingBasis:           reportingBasis,
-		EvidenceRefs:             mergeEvidenceRefs(req.EvidenceRefs, env.EvidenceRefs),
-		SoftCloseOverrideReason:  &req.SoftCloseOverrideReason,
+		JournalType:             req.JournalType,
+		TransactionDate:         req.TransactionDate,
+		PostingDate:             req.PostingDate,
+		CurrencyCode:            req.CurrencyCode,
+		BookID:                  bookID,
+		ReportingBasis:          reportingBasis,
+		EvidenceRefs:            mergeEvidenceRefs(req.EvidenceRefs, env.EvidenceRefs),
+		SoftCloseOverrideReason: &req.SoftCloseOverrideReason,
 
 		// ACC-03: every ordinary journal a human creates starts as a
 		// proposal nobody has acted on yet — explicit here rather than
@@ -1048,6 +1085,9 @@ func (h *Handler) PostJournal(w http.ResponseWriter, r *http.Request) {
 		h.writeAuthzErr(w, err)
 		return
 	}
+	if !h.checkEvidence(w, r, header.TenantID, header.LegalEntityID, principalID, header.EvidenceRefs) {
+		return
+	}
 
 	// Soft-close override: if the journal was created with a soft-close override
 	// reason, allow it through SOFT_CLOSE without requiring a new override at post time.
@@ -1163,16 +1203,16 @@ func (h *Handler) ReverseJournal(w http.ResponseWriter, r *http.Request) {
 	// underlying document has not changed.
 
 	reversingHeader := &domain.JournalHeader{
-		JournalID:              uuid.NewString(),
-		TenantID:               header.TenantID,
-		LegalEntityID:          header.LegalEntityID,
-		FiscalPeriod:           header.FiscalPeriod,
-		Status:                 domain.JournalStatusFinalized,
-		ReversalOfJournalID:    &reversalID,
-		Description:            "Reversal of " + journalID + ": " + req.Reason,
-		CreatedByPrincipalID:   principalID,
-		PostedByPrincipalID:    &principalID,
-		CorrelationID:          req.CorrelationID,
+		JournalID:               uuid.NewString(),
+		TenantID:                header.TenantID,
+		LegalEntityID:           header.LegalEntityID,
+		FiscalPeriod:            header.FiscalPeriod,
+		Status:                  domain.JournalStatusFinalized,
+		ReversalOfJournalID:     &reversalID,
+		Description:             "Reversal of " + journalID + ": " + req.Reason,
+		CreatedByPrincipalID:    principalID,
+		PostedByPrincipalID:     &principalID,
+		CorrelationID:           req.CorrelationID,
 		SoftCloseOverrideReason: &req.SoftCloseOverrideReason,
 
 		JournalType:     domain.JournalTypeReversal,
@@ -2002,20 +2042,20 @@ func (h *Handler) PostAccountingEvent(w http.ResponseWriter, r *http.Request) {
 func eventJournal(tenantID, principalID string, req domain.PostAccountingEventRequest, resolvedLines []domain.CreateJournalLineInput) (*domain.JournalHeader, []domain.JournalLine) {
 	sourceEventID := req.SourceEventID
 	header := &domain.JournalHeader{
-		JournalID:                uuid.NewString(),
-		TenantID:                 tenantID,
-		LegalEntityID:            req.LegalEntityID,
-		FiscalPeriod:             req.FiscalPeriod,
-		Status:                   domain.JournalStatusPending,
-		Description:              req.Description,
-		CreatedByPrincipalID:     principalID,
-		CorrelationID:            req.CorrelationID,
-		SourceEventID:            &sourceEventID,
-		JournalType:              domain.JournalTypeStandard,
-		TransactionDate:          req.DocumentDate,
-		PostingDate:              req.PostingDate,
-		CurrencyCode:             req.TransactionCurrency,
-		SoftCloseOverrideReason:  &req.SoftCloseOverrideReason,
+		JournalID:               uuid.NewString(),
+		TenantID:                tenantID,
+		LegalEntityID:           req.LegalEntityID,
+		FiscalPeriod:            req.FiscalPeriod,
+		Status:                  domain.JournalStatusPending,
+		Description:             req.Description,
+		CreatedByPrincipalID:    principalID,
+		CorrelationID:           req.CorrelationID,
+		SourceEventID:           &sourceEventID,
+		JournalType:             domain.JournalTypeStandard,
+		TransactionDate:         req.DocumentDate,
+		PostingDate:             req.PostingDate,
+		CurrencyCode:            req.TransactionCurrency,
+		SoftCloseOverrideReason: &req.SoftCloseOverrideReason,
 		// System-originated: this bypasses ACC-03's human Draft/Submit/
 		// Approve workflow entirely (already gated by actionPostingExecute,
 		// which a deployment grants only to internal service identities —

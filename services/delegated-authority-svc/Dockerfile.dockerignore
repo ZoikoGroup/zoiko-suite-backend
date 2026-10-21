@@ -1,0 +1,13 @@
+# Used by BuildKit for builds with -f services/delegated-authority-svc/Dockerfile.
+# The context is the repository root (see the Dockerfile), so everything is
+# excluded except the modules the image is built from.
+*
+!services/delegated-authority-svc/
+!services/identity-envelope/
+
+# Not needed inside the image.
+services/delegated-authority-svc/.gotmp/
+services/delegated-authority-svc/**/*.exe
+services/delegated-authority-svc/**/*_test.go
+services/delegated-authority-svc/deployments/
+services/identity-envelope/**/*_test.go

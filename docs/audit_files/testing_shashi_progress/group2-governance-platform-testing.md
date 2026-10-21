@@ -2,7 +2,7 @@
 
 **Scope:** 7 services (jurisdiction-rules-svc, governance-decision-log-svc, policy-svc, obligations-svc, authorization-svc, workflow-svc, evidence-requirements-svc) — plus `schema-registry-svc`, audited out of sequence as a supporting service
 
-**Last Updated:** 2026-10-19
+**Last Updated:** 2026-10-21
 
 ---
 
@@ -505,8 +505,8 @@ DB: evidence delivered=t attempts=1 · transitions fully attributed · 8 outbox 
 # obligations-svc (Port 8088) — Service 13 · Group 2 (4/7) — Tier 0 Obligation Register
 
 **Group:** 2 — Governance Platform
-**Status:** ✅ **ALL TESTS PASSING** (58 tests · 0 skip · 0 fail · race clean · **2 defects found & fixed**: a committed compile break + an applicability write-path outage) · **ZS-QA-001 live audit: GREEN** (service 13 of 17; fourth of Group 2)
-**Last Verified:** 2026-10-17 — static checks, unit + store suite vs real Postgres 16, race suite in Docker, and a full live round trip (real binary + real `jurisdiction-rules-svc` binary, scratch DB `obligations_live`)
+**Status:** ✅ **ALL TESTS PASSING** (58 tests + outbox package · 0 skip · 0 fail · race clean · **2 defects found & fixed**: a committed compile break + an applicability write-path outage · **outbox relay wired 19 Oct**) · **ZS-QA-001 live audit: GREEN** (service 13 of 17; fourth of Group 2)
+**Last Verified:** 2026-10-19 — outbox relay fix (build/vet/gofmt clean, handler/events/outbox/store suites green); 2026-10-17 — static checks, unit + store suite vs real Postgres 16, race suite in Docker, and a full live round trip (real binary + real `jurisdiction-rules-svc` binary, scratch DB `obligations_live`)
 
 ---
 
@@ -521,19 +521,19 @@ Findings in this pass:
 | **A — HEAD did not compile (committed)** | `internal/store/pg_store.go:114` referenced `domain.ErrIdempotencyMismatch`, which is never defined in this module. The *usage* was introduced by commit `02a125c9` (2026-10-15, "Testing fixes for 16 services … build fixes") without the definition; working tree clean → HEAD does not build and CI (matrix includes obligations-svc) turned **red for this service since that commit** | ✅ Fixed: return the defined `domain.ErrIdempotencyKeyConflict` ("idempotency key already used with a different request"); `DomainErrorCodeMap` already maps its message → **409 `IDEMPOTENCY_KEY_CONFLICT`**, no handler change needed. **Proven live** (same key, different body → 409) |
 | **B — every applicability-decision write returned 503** | Migration `000006` added NOT NULL `tenant_id` + FORCE RLS to `applicability_decisions`; the INSERT omitted `tenant_id` → SQLSTATE 23502 on every POST → `store_unavailable`. `List`/`FindCurrent` also ran outside a tenant transaction (non-owner role → silent empty results) | ✅ Fixed: `tenant_id` added to the INSERT and all three methods wrapped in `withTenantTx` (+ `tenant_id` predicate), mirroring the filing-requirement pattern in the same package. **Proven live** (201 create / 200 list / `NOT_APPLICABLE` current / 401 no principal / scoped `[]`; DB row carries tenant_id) |
 | **C — genuine gofmt drift in 9 files** | `internal/{authz/client.go, circuitbreaker/circuitbreaker.go, envelope/contract.go, envelope/reason.go, errors/errors.go, handler/applicability_handler.go, handler/handler.go, handler/handler_test.go, telemetry/telemetry.go}` (import-grouping etc.). Caution: a naive `gofmt` comparison flags ~31 files — that is a PowerShell console-encoding artifact (em-dashes mangled by `Out-String`), not drift | ✅ `gofmt -w` on all 9 → **0 genuine drift** (byte-level verification, CRLF-tolerant method); `git diff -w` shows only import-group moves |
-| **D — transactional outbox skeleton unwired** | `event_outbox` table (migration `000010`) + store methods `AddEventToOutbox` / `GetPendingOutboxEvents` / `MarkOutboxEvent{Published,Failed}` exist with **no callers and no relay worker** (dead code). Handlers publish directly, fire-and-forget; a publish failure is **logged only** (live with unreachable broker: errors logged, request still 2xx). Live DB audit: `event_outbox=0` after created/updated/overdue events | ⚠️ Open — wire the in-tx write path + relay loop, or delete the dead code (decision #1) |
+| **D — transactional outbox skeleton unwired** | `event_outbox` table (migration `000010`) + store methods `AddEventToOutbox` / `GetPendingOutboxEvents` / `MarkOutboxEvent{Published,Failed}` existed with **no callers and no relay worker** (dead code). Handlers published directly, fire-and-forget; a publish failure was **logged only** (live with unreachable broker: errors logged, request still 2xx). Live DB audit: `event_outbox=0` after created/updated/overdue events | ✅ **Fixed 19 Oct:** `internal/outbox` worker (500 ms poll, batches of 100, per-row published/failed marking, `obligation_id` key); create/status/link-unlink/overdue all write the outbox row in the tenant transaction; scheduler no longer publishes directly. Covered by `internal/outbox` tests, `TestPublishEnvelope_PreservesStoredBytesAndKey` and `TestPgStore_EventsCommitWithTheMutation`; broker E2E still outstanding |
 | **E — minor API-surface drift** | (1) No `Location` header on 201 creates (audit Section A row confirmed live); (2) unknown JSON field → `400 INVALID_JSON` (`json: unknown field "foo"`) instead of the defined `UNKNOWN_FIELD` code; (3) duplicate filing-requirement POST replays with **201** (same id) rather than 200 (create path replays 200) | ⚠️ Open — cosmetic/estate-wide; align or document |
 | **F — `progress.md` stale** | Still claims "No built-in scheduler … out of scope" (scheduler exists at `main.go:144` and was live-proven) and "No Authorization Service wiring" (wired + live-proven). Governance audit row 33 stands | ⚠️ Open — refresh `progress.md` |
 | **G — no contract artifacts** | No `openapi.yaml`, no Postman collection (audit row 34); gateway route in `all-services.yml` is a prefix strip (`PathPrefix /obligations-svc`) → no per-route parity diff possible | ⚠️ Open — add spec for QA-024 |
 
-**Governance audit §4/7 gaps closed in code and proven live:** object-level read authz (`ActionObligationRead` on get/list — gap #5); applicability reads require a principal (401 — top gap #1); legal-entity **header↔body reconciliation** (400 `legal_entity_mismatch` — gap #2 partially: registry check still absent); **overdue computed in-process** by the 1-minute scheduler (gap #7, proven after a live tick); **real idempotency** (gap #8: same key+body → 200 same id / same key+different body → 409); workflow mapping (migration `000007` + link/unlink routes live); optimistic locking (migration `000008` + `If-Match` live 412/200); filing dedup (migration `000005`, duplicate POST → same id); outbound authz carries the caller's full canonical envelope + `ForwardTo` (X6 closed). Still open from the audit's Section B (WFC-05 deadline clocks / supersession / escalation) — deliberately out of v1 scope.
+**Governance audit §4/7 gaps closed in code and proven live:** object-level read authz (`ActionObligationRead` on get/list — gap #5); applicability reads require a principal (401 — top gap #1); legal-entity **header↔body reconciliation** (400 `legal_entity_mismatch` — gap #2 partially: registry check still absent); **overdue computed in-process** by the 1-minute scheduler (gap #7, proven after a live tick); **real idempotency** (gap #8: same key+body → 200 same id / same key+different body → 409); workflow mapping (migration `000007` + link/unlink routes live); optimistic locking (migration `000008` + `If-Match` live 412/200); filing dedup (migration `000005`, duplicate POST → same id); outbound authz carries the caller's full canonical envelope + `ForwardTo` (X6 closed); **transactional outbox + relay** (finding D, 19 Oct: in-tx writes for create/status/link-unlink/overdue, background worker, scheduler deduped). Still open from the audit's Section B (WFC-05 deadline clocks / supersession / escalation) — deliberately out of v1 scope.
 
 **Verification evidence:**
 
 - Static: `go mod verify` clean; `go build ./...` / `go vet ./...` clean **after finding-A fix**; `gofmt` clean (byte-level, line-ending independent)
-- Suite: **58 pass / 0 skip / 0 fail** (`go test ./...` with `TEST_DATABASE_URL` → real Postgres 16, scratch DB `obligations_test`); test-bearing packages: `authz`, `events`, `handler`, `store` (store harness self-applies **all** migrations filename-sorted, then drops what it created; no embedded-PG harness, no tag-gated suites — unlike jurisdiction-rules-svc)
+- Suite: **58 pass / 0 skip / 0 fail** (`go test ./...` with `TEST_DATABASE_URL` → real Postgres 16, scratch DB `obligations_test`); test-bearing packages: `authz`, `events`, `handler`, `store` (store harness self-applies **all** migrations filename-sorted, then drops what it created; no embedded-PG harness, no tag-gated suites — unlike jurisdiction-rules-svc). 19 Oct: `outbox` package added, all suites green
 - Race suite (CI-equivalent, Docker `golang:1.26` + real Postgres 16 on `gdl-race-net`): all packages ok, **0 data races** (re-run clean after the finding-B fix)
-- Wiring: envelope middleware (write-strict default; `ServicePolicy` `LegalEntityID: RequiredOnWrite`) → tenant context middleware → per-action authz (fail-closed; client refuses placeholder URL outside `ENV=local`; full envelope + `ForwardTo`) → store (`withTenantTx` + RLS, `app.tenant_id` per tx) → direct Kafka publisher → overdue scheduler (1-min ticker, per-tenant contexts, `system` actor); 12 business routes (`handler.go:232-239` + `applicability_handler.go:42-44`) + `/healthz` `/readyz` `/metrics`
+- Wiring: envelope middleware (write-strict default; `ServicePolicy` `LegalEntityID: RequiredOnWrite`) → tenant context middleware → per-action authz (fail-closed; client refuses placeholder URL outside `ENV=local`; full envelope + `ForwardTo`) → store (`withTenantTx` + RLS, `app.tenant_id` per tx) → `event_outbox` rows in the same transaction → relay worker (500 ms poll, batch 100) → overdue scheduler (1-min ticker, per-tenant contexts, `system` actor); 12 business routes (`handler.go:232-239` + `applicability_handler.go:42-44`) + `/healthz` `/readyz` `/metrics`
 - **Live E2E (real obligations-svc binary + real jurisdiction-rules-svc binary on :8082 with `juris_live`, scratch DB `obligations_live` with all 10 migrations, authz stub returning `GRANTED`, unreachable Kafka, 2026-10-17):**
 
 ```text
@@ -593,7 +593,7 @@ DB audit: 3 obligations exact states · idempotency_keys=3 · event_outbox=0 (fi
 
 | Item | Status | Details |
 |------|--------|---------|
-| **Outbox skeleton unwired** | ⚠️ Finding D | `event_outbox` + 4 store methods are dead code; direct publish is fire-and-forget (broker-down = event lost, logged only). Decide: wire (in-tx + relay) or delete |
+| **Outbox relay** | ✅ Resolved 19 Oct | `internal/outbox` worker started from `main.go`; create/status/link-unlink/overdue write `event_outbox` in the tenant transaction; scheduler publishes only through the store. Broker E2E remains an infra dependency |
 | **Location header absent** | ⚠️ Finding E | Audit Section A row confirmed live; estate-wide pattern |
 | **`UNKNOWN_FIELD` code unused** | ⚠️ Finding E | Unknown JSON fields surface as `invalid_json` with Go's decoder message |
 | **Filing replay returns 201** | ⚠️ Finding E | Idempotent (same `filing_requirement_id`) but 201 vs 200 inconsistency with the obligation create path |
@@ -612,7 +612,7 @@ These are **separate services/repos** owned by other teams. This service is wire
 | **Jurisdiction Rules** | `jurisdiction-rules-svc` (Group 2, service 10 ✅) | `JURISDICTION_RULES_URL` | Separate service, already verified | Synchronous fail-closed validation on create; **verified live against the real binary** (A8/A9: unknown + inactive → 404) |
 | **Authorization Service** | `authorization-svc` (Group 2, next service) | `AUTHZ_SERVICE_URL` | Next in Group 2, not yet verified | `authz.NewClient` per-action, fail-closed outside `ENV=local`; live runs against a local responder stub (`decision_outcome: GRANTED`) |
 | **Workflow & Approvals** | `workflow-svc` (Group 2, later) | — | Later Group 2 service | `workflow_id` mapping persists links/unlinks today (data-level, live) |
-| **Kafka/Event Backbone** | Platform infra | `KAFKA_BROKERS`, topic `zoiko.obligations.events` | Infrastructure, not code | Direct publisher wired (not the outbox table — finding D) |
+| **Kafka/Event Backbone** | Platform infra | `KAFKA_BROKERS`, topic `zoiko.obligations.events` | Infrastructure, not code | Transactional outbox + relay wired (finding D resolved 19 Oct); broker E2E outstanding |
 
 ---
 
@@ -620,7 +620,7 @@ These are **separate services/repos** owned by other teams. This service is wire
 
 | # | Decision | Impact |
 |---|----------|--------|
-| 1 | **Outbox: wire or delete** — `event_outbox` + store methods are dead code; current publish path loses events when Kafka is down | Durability guarantee for `zoiko.obligations.events` |
+| 1 | ~~**Outbox: wire or delete**~~ — **decided: wire** (19 Oct). In-tx writes + relay worker landed; no further decision needed | Durability guarantee for `zoiko.obligations.events` (broker E2E pending infra) |
 | 2 | **OpenAPI spec artifact** — add `openapi.yaml` (+ Postman) for ~12 routes | QA-024 contract diff becomes possible |
 | 3 | **API-standard alignment** — `Location` on 201 + use defined `UNKNOWN_FIELD` code | Estate-wide drift; align with sibling services |
 | 4 | **WFC-05 ownership** — is obligations-svc the deadline-clock owner? Section B deliberately unbuilt | Scope for v2 |
@@ -1382,5 +1382,13 @@ events and records publish errors with Kafka down; document-vault outage 503 wit
 **Group 1:** **DONE** (9/9)
 **Group 2:** **DONE** (7/7 — jurisdiction-rules-svc, governance-decision-log-svc, policy-svc, obligations-svc, authorization-svc, workflow-svc, evidence-requirements-svc)
 **Out of sequence:** schema-registry-svc ✅ (supporting service; not part of the 17-service group sequence)
+
+> **21 October update (workflow completion pass, uncommitted):** the pass described in the
+> Governance audit now passes its **full workflow suite: 257 pass / 0 skip / 0 fail** against
+> real PostgreSQL 16 (`workflow_test`, all migrations including 000020). The whole estate was
+> re-run on the same host: **3,827 pass / 31 skip / 0 fail across all 17 services** (Domain 1:
+> 2,314 pass / 2 skip; Domain 2 + schema: 1,513 pass / 29 skip; the 29 authorization skips are
+> AUTHZ_IT_DSN-only IT cases). Docker image builds, compose/live E2E and CI remain unrun, so
+> the 19 October live-probe counts are still the last live evidence.
 
 ---

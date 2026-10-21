@@ -2706,6 +2706,11 @@ counts it was 97.9%. The difference is identity-context-svc: on 8 Oct its weight
 published as 98%, but its rows then (42 met, 1 partial, 1 missing) give 96.6%. Both columns
 above use recomputed figures.
 
+**Fixes landed the same day, and were verified.** Eight findings (F-1 … F-8) were fixed and
+re-tested on 19 October; the group returns to **291/303 = 96.0% full, 97.9% weighted**
+(identity 42/44, tenant 47/48, delegated-authority 23/23). See *Fixes, 19 October 2026
+(verified)* at the end of this file for the commit map, test evidence and register changes.
+
 ## Findings, ranked by risk
 
 ### F-1 · delegated-authority-svc: no delegation can be created (availability / auth)
@@ -2902,3 +2907,119 @@ repository admin.
    failed it.
 6. **F-5.** Wire the auth plane or take it out. Until it runs, the AU rows stay open.
 7. F-6, F-7, F-8.
+
+## Fixes, 19 October 2026 (verified)
+
+Every finding in this re-audit was fixed and re-verified the same day. Evidence was taken
+against HEAD `d7eaef57` on `shashi-changes`; the fixes are commits `7ef15e3a` through
+`768bee68`. Nothing was accepted on the commit message: each fix was read in the code and
+exercised by the suite (and, for F-4, by a real image build).
+
+**Verification environment.** Go 1.26.7 on Windows; Postgres 16.15 on `:55432`, one database
+per service; Docker Desktop running for the F-4 build. Not re-run in this pass: the live
+compose stack, `audit.sh` live probes, Kafka, and mutation testing.
+
+### Findings closed
+
+| Finding | Fix (commit) | Evidence | Status |
+|---|---|---|---|
+| F-1 · delegated-authority create fails | `7ef15e3a` gives the INSERT 25 placeholders; migration `000013` takes `idempotency_key` back out of the replay unique key and defaults it to `''` | Store suite green (24/24 store tests); 109 tests pass across the service. Create, revoke, expiry, extend and resume all exercise | ✅ Closed |
+| F-2 · entity commands authorized at the caller's entity | `63264481` adds `authorizeEntity` / `authorizeEntities`; update, status transition, sensitive reads and their approvals now authorize at the entity acted on | `service.go:725,795`, `org_gaps_service.go:498,581`; 633 tests pass (1 skip needs a live service) | ✅ Closed |
+| F-3 · disabling a principal ends no session and tells no service | `b492053e`: `PUT /v1/principals/{id}/status` routes through `lifecycle.SetStatus`, which writes `principal.status.changed` **and** `identity.subject.enabled/disabled` to the outbox in the status transaction, then evicts every session on a non-ACTIVE status | `internal/lifecycle/service.go:489-527`; `cmd/server/main.go:470,643`; `TestSetStatus_DisableEmitsBothNamesAndEndsSessions` and four siblings | ✅ Closed |
+| F-4 · identity image cannot be built from a clean checkout | `8c3be624` builds from the repo-root context with both modules copied (search-indexer's R-7 pattern); `05cc1196` did the same for search-indexer | `docker build -f services/identity-context-svc/Dockerfile -t zoiko/identity-context-svc:f4-verify .` from the repo root: **succeeded** | ✅ Closed |
+| F-5 · about 5,100 lines of auth plane never run | `b492053e`: `oidc.New` + `Provider.RegisterRoutes`, login throttle, DPoP verifier, multi-key keyring and the lifecycle service are constructed in `main.go`; SCIM/federation remain deliberately unregistered | `cmd/server/main.go:456-471,636-645`; `internal/lifecycle` now has 5 test functions; discovery and `/oauth2/*` are mounted | ✅ Closed (AU rows become exercisable; not separately re-scored here) |
+| F-6 · caller identity reaches the embedding provider | `4c75516f` restores trace-only headers and adds a test pinning them | Embedding tests assert no `X-Principal-Id` / `X-Tenant-Id` / `X-Legal-Entity-Id`; 292 tests pass | ✅ Closed |
+| F-7 · token-verifier refusals untested | `e4052e4a` restores `internal/auth/verifier_refusals_test.go`; the suite grows from 564 to 615 tests | Audience, issuer, expiry, missing `exp`/`sub`/`tenant_id`, wrong algorithm, wrong key and tampered-token cases all present and passing | ✅ Closed |
+| F-8 · six Windows binaries committed | `c59c1dc0` removes them; `.gitignore` covers `services/*/*.exe` | `git ls-files` lists no Group 1 `.exe` | ✅ Closed |
+
+**Also closed in this pass:** `768bee68` gofmt across the committed Group 1 files (45 files);
+`da399ffd` adds the three notification NCD handler tests that previously skipped when the
+store schema was absent; `612a5b31` refuses attachment-hash mismatch; `2494a7e6` makes the
+gtrm `--check` stop reporting false drift. The three notification tests now pass inside
+`go test ./...` rather than only after the store package ran.
+
+### Test evidence
+
+| Service | Build, vet | Passed | Failed | Skipped | Notes |
+|---|---|---|---|---|---|
+| identity-context-svc | clean | 615 | 0 | 0 | Includes the restored verifier refusals and lifecycle status tests |
+| tenant-entity-registry-svc | clean | 633 | 0 | 1 | Skip needs a running service (live OpenAPI check) |
+| configuration-feature-flag-svc | clean | 266 | 0 | 0 | |
+| secret-vault-integration-svc | clean | 187 | 0 | 1 | Skip is the POSIX file-mode test Windows cannot enforce |
+| gateway-auth-svc | clean | 89 | 0 | 0 | |
+| search-indexer-svc | clean | 292 | 0 | 0 | Store suite on Postgres |
+| notification-svc | clean | 750 | 0 | 21 | The three former schema-order skips now pass in-suite; the 18 legacy NP-matrix skips remain (register S7-C3) |
+| delegated-authority-svc | clean | 109 | 0 | 0 | 20 previously failing store tests now pass |
+| access-control-svc | clean | 176 | 0 | 0 | `-tags=integration`: 37 store tests on its embedded Postgres |
+| search-client (shared) | clean | 42 | 0 | 0 | |
+
+The Group 1 image build from a clean checkout also succeeded (F-4). CI on the branch was not
+re-run in this pass; that remains the outstanding gate.
+
+### Scores after the fixes
+
+| # | Service | 19 Oct re-audit | **After fixes** | What changed |
+|---|---|---|---|---|
+| 1 | identity-context-svc | 41/44: 93.2% (95.5%) | **42/44: 95.5% (96.6%)** | NP4 ⚠️ → ✅ (F-3) |
+| 2 | tenant-entity-registry-svc | 45/48: 93.8% (96.9%) | **47/48: 97.9% (99.0%)** | Rows 22 and 34 ⚠️ → ✅ (F-2) |
+| 3 | configuration-feature-flag-svc | 47/49: 96% (98%) | **47/49: 96% (98%)** | No change |
+| 4 | secret-vault-integration-svc | 18/21: 86% (93%) | **18/21: 86% (93%)** | No change |
+| 5 | gateway-auth-svc | 22/22: 100% | **22/22: 100%** | No change |
+| 6 | search-indexer-svc | 47/49: 96% (98%) | **47/49: 96% (98%)** | F-6 fixed; both affected rows also carry F-4/R-7 history, so the semantic rows stay ⚠️ |
+| 7 | notification-svc | 35/37: 95% (97%) | **35/37: 95% (97%)** | No change |
+| 8 | delegated-authority-svc | 21/23: 91.3% (93.5%) | **23/23: 100%** | DelegateAuthority ❌ → ✅; idempotency scope ⚠️ → ✅ (F-1, 000013) |
+| 9 | access-control-svc | 10/10: 100% | **10/10: 100%** | No change |
+| | **Group** | 286/303: 94.4% (96.9%) | **291/303: 96.0%** (296.5 weighted, **97.9%**) | |
+
+### Register changes
+
+Closed: **S8-1** (F-1), **S2-1** (F-2), **S1-5** (F-3), **S1-6** (F-4), **S1-7** (F-5),
+**S6-3** (F-6), **S1-8** (F-7), **S0-1** (F-8). The rows closed earlier on 19 Oct (Group A)
+remain closed. **S1-C1** stays open (commercial-account-svc is wired only when
+`COMMERCIAL_ACCOUNT_URL` is set), and **S1-B1**'s console half stays open.
+
+### Residual notes
+
+- CI has not run on `d7eaef57`; the last green Group 1 jobs were on `02a125c9`. F-1 would have
+  caught a future placeholder drift, so a CI run is still the release gate.
+- Group 2 and other groups still track binaries (`evidence-requirements-svc/handler.test.exe`,
+  `governance-decision-log-svc/server.exe`, `privacy-rights-svc/{healthcheck,server}.exe`,
+  `tools/schemacheck/schemacheck.exe`); the F-8 fix was scoped to Group 1.
+- F-5 makes the AU-01 … AU-11 routes real, but those rows belong to the Auth-Service audit and
+  were not re-scored here.
+- No live compose acceptance run was repeated after these fixes. Everything above is code,
+  unit/integration-suite and image-build evidence.
+
+## Cross-domain completion pass affecting Group 1, 21 October 2026 (uncommitted)
+
+Group 2's workflow-svc completion pass changes how two Group 1 services are reached. No
+Group 1 score changes; this note records the new call paths and the deployment fixes they
+required.
+
+- **tenant-entity-registry-svc** is now called synchronously by workflow-svc
+  (`GET /v1/entities/{id}/status`) before a workflow instance is created, and by
+  obligations-svc and evidence-requirements-svc on their write paths. The read uses the
+  caller tenant and no additional authorization action; the response fields were checked
+  against the client struct. Compose uses the `tenant-entity-registry-svc` container name;
+  K8s uses `tenant-svc.zoiko-identity.svc.cluster.local:8081`.
+- **identity-context-svc** serves the `identity-envelope` gate now mounted by workflow-svc.
+  A presented signed envelope is verified against JWKS, its session is introspected, and
+  its claims override `X-Principal-Id` / `X-Tenant-Id` before the workflow envelope parser
+  and tenant middleware read them. This also makes `idenv.Forward` meaningful for outbound
+  authorization, tenant-registry and ledger calls. Compose sets `IDENTITY_VERIFY=warn`
+  while the console does not forward the envelope on every workflow call; K8s points at
+  `identity-svc.zoiko-identity.svc.cluster.local:8080`.
+- **K8s deployment gaps corrected.** The workflow, obligations and evidence-requirements
+  manifests were missing in-cluster DNS for `tenant-svc`/`identity-svc`; obligations and
+  evidence also lacked the identity URLs, and evidence-requirements-svc had no
+  NetworkPolicy at all under a namespace default-deny (so it could not reach Postgres or
+  Kafka). The policies now allow the cross-namespace G1 calls and workflow's ledger/
+  document-vault egress. policy-svc and authorization-svc likewise now name the in-cluster
+  identity-svc JWKS URL instead of the compose-only short name, with matching egress rules.
+  Modified YAML parses; the manifests were not applied to a live cluster in this pass.
+- **Verified on this tree.** Main code is unchanged, but every Group 1 suite was rerun after
+  the wiring changes against real PostgreSQL 16: **2,314 pass / 2 skip / 0 fail** across the
+  nine services (identity 515, tenant-registry 269, configuration 175, secret-vault 154,
+  gateway-auth 64, search-indexer 258, notification 634, delegated-authority 109,
+  access-control 136). Docker Desktop is not installed, so image builds and compose/live
+  acceptance remain unrun; CI remains the release gate.

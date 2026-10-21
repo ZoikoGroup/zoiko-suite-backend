@@ -700,6 +700,17 @@ spec:
     ports:
     - protocol: TCP
       port: 5432
+  # identity-svc serves the identity gate's JWKS and session status.
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: zoiko-identity
+      podSelector:
+        matchLabels:
+          app: identity-svc
+    ports:
+    - protocol: TCP
+      port: 8080
   # Allow CoreDNS access
   - to:
     - namespaceSelector: {}
@@ -738,6 +749,17 @@ spec:
     ports:
     - protocol: TCP
       port: 5432
+  # identity-svc serves the identity gate's JWKS and session status.
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: zoiko-identity
+      podSelector:
+        matchLabels:
+          app: identity-svc
+    ports:
+    - protocol: TCP
+      port: 8080
   # Allow CoreDNS access
   - to:
     - namespaceSelector: {}

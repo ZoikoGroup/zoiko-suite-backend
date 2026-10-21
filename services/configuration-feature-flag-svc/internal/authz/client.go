@@ -25,6 +25,7 @@ import (
 
 	"github.com/go-chi/chi/v5/middleware"
 	"go.uber.org/zap"
+	idenv "zoiko.io/identity-envelope"
 
 	svcenvelope "zoiko.io/configuration-feature-flag-svc/internal/envelope"
 )
@@ -235,6 +236,9 @@ func (c *HTTPClient) checkAllowedLive(ctx context.Context, principalID, legalEnt
 
 	// Forward the caller's canonical envelope for downstream traceability
 	svcenvelope.ForwardTo(ctx, req)
+	// The verified identity envelope too, so the next hop can check who
+	// is asking instead of trusting X-Principal-Id (X-R3).
+	idenv.Forward(ctx, req)
 
 	resp, err := c.http.Do(req)
 	if err != nil {
