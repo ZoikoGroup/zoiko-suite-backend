@@ -16,6 +16,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	identityctx "zoiko.io/identity-context-svc/internal/context"
+	"zoiko.io/identity-context-svc/internal/federation"
 )
 
 // DoD gate 1: "Machine contract published and compatibility certified."
@@ -65,6 +66,10 @@ func routerPaths(t *testing.T) map[string]bool {
 
 	r := chi.NewRouter()
 	identityctx.RegisterRoutes(r, h)
+	// INT-10: the federation and SCIM routes are part of the same published contract.
+	fh := federation.NewHandler(nil, nil, nil, nil).WithProvisioning(&federation.Provisioning{})
+	fh.Register(r)
+	fh.RegisterSCIM(r)
 
 	out := map[string]bool{}
 	err := chi.Walk(r, func(method, route string, _ http.Handler, _ ...func(http.Handler) http.Handler) error {

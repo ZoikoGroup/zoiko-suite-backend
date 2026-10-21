@@ -157,7 +157,7 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 		Currency:              req.Currency,
 		Notes:                 req.Notes,
 		EffectiveFrom:         req.EffectiveFrom,
-		CreatedBy:             req.CreatedBy,
+		CreatedBy:             principalID, // always the authenticated caller, never the body value
 	}
 
 	if err := h.store.Create(r.Context(), ret); err != nil {
@@ -175,6 +175,11 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) GetByID(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	// Read routes require a principal: an unauthenticated caller must not
+	// retrieve corporate tax records (previously unguarded).
+	if _, ok := principalIDOrUnauthorized(w, r); !ok {
+		return
+	}
 	ret, err := h.store.GetByID(r.Context(), id)
 	if err != nil {
 		if errors.Is(err, domain.ErrTaxReturnNotFound) {
@@ -188,6 +193,10 @@ func (h *Handler) GetByID(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
+	// Read routes require a principal — previously unguarded.
+	if _, ok := principalIDOrUnauthorized(w, r); !ok {
+		return
+	}
 	legalEntityID := r.URL.Query().Get("legal_entity_id")
 	jurisdictionID := r.URL.Query().Get("jurisdiction_id")
 	status := r.URL.Query().Get("status")
@@ -223,6 +232,11 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "failed to fetch corporate tax return")
+		return
+	}
+
+	if existing.Status != domain.StatusDraft {
+		writeError(w, http.StatusConflict, "only DRAFT tax returns can be updated")
 		return
 	}
 

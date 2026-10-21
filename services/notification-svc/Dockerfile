@@ -1,3 +1,10 @@
+# BUILD CONTEXT IS services/, NOT THIS DIRECTORY:
+#   docker build -f notification-svc/Dockerfile services/
+# go.mod replaces zoiko.io/eventing with ../eventing (the shared event envelope,
+# transactional outbox, inbox and signature framework), and Docker can only COPY from
+# inside the build context. Dockerfile.dockerignore next to this file trims the context
+# to the two directories the build reads.
+
 # ─── Stage 1: builder ─────────────────────────────────────────────────────────
 # BUILT FROM THE REPOSITORY ROOT:
 #
@@ -16,6 +23,7 @@ WORKDIR /src/services/notification-svc
 
 COPY services/notification-svc/go.mod services/notification-svc/go.sum ./
 COPY services/identity-envelope/ /src/services/identity-envelope/
+COPY services/eventing/ /src/services/eventing/
 RUN go mod download
 
 COPY services/notification-svc/ ./

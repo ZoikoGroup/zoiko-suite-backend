@@ -87,6 +87,14 @@ func (h *Handler) CreateCounterparty(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// Attribution is pinned to the authenticated caller. created_by used to be
+	// stored verbatim from the request body — inconsistent with the
+	// requireSelfAttribution pattern established in board-resolutions-svc and
+	// the SoD fix applied to corporate-actions-svc.
+	if req.CreatedBy != "" && req.CreatedBy != principalID {
+		writeError(w, http.StatusBadRequest, "created_by must match the authenticated principal (X-Principal-Id)")
+		return
+	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionCounterpartyCreate); err != nil {
 		h.writeAuthzErr(w, err)
 		return
@@ -105,7 +113,7 @@ func (h *Handler) CreateCounterparty(w http.ResponseWriter, r *http.Request) {
 		Phone:              req.Phone,
 		Address:            req.Address,
 		EffectiveFrom:      req.EffectiveFrom,
-		CreatedBy:          req.CreatedBy,
+		CreatedBy:          principalID, // always the authenticated caller, never the body value
 	}
 
 	if err := h.store.CreateCounterparty(r.Context(), c); err != nil {
@@ -124,6 +132,10 @@ func (h *Handler) CreateCounterparty(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) GetCounterparty(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	// Read routes require a principal — previously unguarded.
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
 	c, err := h.store.GetCounterparty(r.Context(), id)
 	if err != nil {
 		if errors.Is(err, domain.ErrCounterpartyNotFound) {
@@ -137,6 +149,10 @@ func (h *Handler) GetCounterparty(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListCounterparties(w http.ResponseWriter, r *http.Request) {
+	// Read routes require a principal — previously unguarded.
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
 	legalEntityID := r.URL.Query().Get("legal_entity_id")
 	counterpartyType := r.URL.Query().Get("counterparty_type")
 	status := r.URL.Query().Get("status")

@@ -76,7 +76,7 @@ func publishedNames(t *testing.T) map[string]bool {
 // point is to fail when somebody adds a publisher method and forgets the
 // contract — and a reflective list would grow silently along with the code.
 func producedEventTypes() []string {
-	return []string{
+	return append([]string{
 		events.EventContextResolved,
 		events.EventResolutionFailed,
 		events.EventSessionRevoked,
@@ -107,7 +107,7 @@ func producedEventTypes() []string {
 		events.EventSupportContextReviewed,
 		events.EventDispositionExecuted,
 		events.EventDispositionBlocked,
-	}
+	}, events.FederationEventTypes()...)
 }
 
 func TestEveryProducedEventIsPublishedInTheContract(t *testing.T) {

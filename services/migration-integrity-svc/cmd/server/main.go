@@ -114,7 +114,7 @@ func main() {
 	} else {
 		authzClient = authz.NewClient(cfg.AuthzURL, logger)
 	}
-	h := handler.NewHandler(dataStore, authzClient, logger)
+	h := handler.NewHandler(dataStore, authzClient, logger, cfg.IntegrityScoreThreshold)
 
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())

@@ -5,12 +5,12 @@ import "time"
 type PayrollRunStatus string
 
 const (
-	PayrollRunStatusInitiated   PayrollRunStatus = "INITIATED"
-	PayrollRunStatusCalculated  PayrollRunStatus = "CALCULATED"
-	PayrollRunStatusBlocked     PayrollRunStatus = "BLOCKED"
-	PayrollRunStatusCompleted   PayrollRunStatus = "COMPLETED"
-	PayrollRunStatusReversed    PayrollRunStatus = "REVERSED"
-	PayrollRunStatusOnHold      PayrollRunStatus = "ON_HOLD"
+	PayrollRunStatusInitiated  PayrollRunStatus = "INITIATED"
+	PayrollRunStatusCalculated PayrollRunStatus = "CALCULATED"
+	PayrollRunStatusBlocked    PayrollRunStatus = "BLOCKED"
+	PayrollRunStatusCompleted  PayrollRunStatus = "COMPLETED"
+	PayrollRunStatusReversed   PayrollRunStatus = "REVERSED"
+	PayrollRunStatusOnHold     PayrollRunStatus = "ON_HOLD"
 )
 
 type PayrollRun struct {
@@ -37,15 +37,15 @@ type PayrollRun struct {
 	SnapshotHash         *string `json:"snapshot_hash,omitempty"`
 
 	// Monolith-aligned fields
-	TotalEmployerContributions *float64 `json:"total_employer_contributions,omitempty"`
-	TotalEmployeeContributions *float64 `json:"total_employee_contributions,omitempty"`
-	TotalTDS                   *float64 `json:"total_tds,omitempty"`
-	TotalPF                    *float64 `json:"total_pf,omitempty"`
-	TotalESI                   *float64 `json:"total_esi,omitempty"`
-	TotalPT                    *float64 `json:"total_pt,omitempty"`
-	BatchID                    *string  `json:"batch_id,omitempty"`
-	ProcessedBy                *string  `json:"processed_by,omitempty"`
-	ApprovedBy                 *string  `json:"approved_by,omitempty"`
+	TotalEmployerContributions *float64   `json:"total_employer_contributions,omitempty"`
+	TotalEmployeeContributions *float64   `json:"total_employee_contributions,omitempty"`
+	TotalTDS                   *float64   `json:"total_tds,omitempty"`
+	TotalPF                    *float64   `json:"total_pf,omitempty"`
+	TotalESI                   *float64   `json:"total_esi,omitempty"`
+	TotalPT                    *float64   `json:"total_pt,omitempty"`
+	BatchID                    *string    `json:"batch_id,omitempty"`
+	ProcessedBy                *string    `json:"processed_by,omitempty"`
+	ApprovedBy                 *string    `json:"approved_by,omitempty"`
 	ApprovedAt                 *time.Time `json:"approved_at,omitempty"`
 }
 
@@ -69,29 +69,33 @@ type PaySlip struct {
 
 	Items []PaySlipItem `json:"items,omitempty"`
 
+	// TaxLines is the tax engine's own breakdown when the tax came from payroll-tax-svc; empty when the
+	// legacy placeholder rate produced it.
+	TaxLines []PaySlipTaxLine `json:"tax_lines,omitempty"`
+
 	CreatedAt time.Time `json:"created_at"`
 
 	// Monolith-aligned fields
-	BasicSalary       *float64 `json:"basic_salary,omitempty"`
-	HRA               *float64 `json:"hra,omitempty"`
-	SpecialAllowance  *float64 `json:"special_allowance,omitempty"`
-	Conveyance        *float64 `json:"conveyance,omitempty"`
-	MedicalAllowance  *float64 `json:"medical_allowance,omitempty"`
-	LTA               *float64 `json:"lta,omitempty"`
-	PFEmployee        *float64 `json:"pf_employee,omitempty"`
-	PFEmployer        *float64 `json:"pf_employer,omitempty"`
-	ESIEmployee       *float64 `json:"esi_employee,omitempty"`
-	ESIEmployer       *float64 `json:"esi_employer,omitempty"`
-	PT                *float64 `json:"pt,omitempty"`
-	TDS               *float64 `json:"tds,omitempty"`
-	OtherDeductions   *float64 `json:"other_deductions,omitempty"`
-	Arrears           *float64 `json:"arrears,omitempty"`
-	Bonus             *float64 `json:"bonus,omitempty"`
-	OvertimePay       *float64 `json:"overtime_pay,omitempty"`
-	LeaveEncashment   *float64 `json:"leave_encashment,omitempty"`
-	Reimbursements    *float64 `json:"reimbursements,omitempty"`
-	AdvanceDeduction  *float64 `json:"advance_deduction,omitempty"`
-	LoanDeduction     *float64 `json:"loan_deduction,omitempty"`
+	BasicSalary      *float64 `json:"basic_salary,omitempty"`
+	HRA              *float64 `json:"hra,omitempty"`
+	SpecialAllowance *float64 `json:"special_allowance,omitempty"`
+	Conveyance       *float64 `json:"conveyance,omitempty"`
+	MedicalAllowance *float64 `json:"medical_allowance,omitempty"`
+	LTA              *float64 `json:"lta,omitempty"`
+	PFEmployee       *float64 `json:"pf_employee,omitempty"`
+	PFEmployer       *float64 `json:"pf_employer,omitempty"`
+	ESIEmployee      *float64 `json:"esi_employee,omitempty"`
+	ESIEmployer      *float64 `json:"esi_employer,omitempty"`
+	PT               *float64 `json:"pt,omitempty"`
+	TDS              *float64 `json:"tds,omitempty"`
+	OtherDeductions  *float64 `json:"other_deductions,omitempty"`
+	Arrears          *float64 `json:"arrears,omitempty"`
+	Bonus            *float64 `json:"bonus,omitempty"`
+	OvertimePay      *float64 `json:"overtime_pay,omitempty"`
+	LeaveEncashment  *float64 `json:"leave_encashment,omitempty"`
+	Reimbursements   *float64 `json:"reimbursements,omitempty"`
+	AdvanceDeduction *float64 `json:"advance_deduction,omitempty"`
+	LoanDeduction    *float64 `json:"loan_deduction,omitempty"`
 }
 
 type PaySlipItem struct {
@@ -147,6 +151,8 @@ type ShadowInputItem struct {
 
 type CalculateRunRequest struct {
 	ShadowBaselineItems []ShadowInputItem `json:"shadow_baseline_items,omitempty"`
+	// InputBatchID, when set, names the FROZEN WFP input batch the calculation takes its inputs from (WFP-CTRL-006).
+	InputBatchID *string `json:"input_batch_id,omitempty"`
 }
 
 type FinalizeRunRequest struct {
@@ -168,6 +174,6 @@ var (
 	ErrIdentityMissing         = errorString("caller identity missing")
 	ErrStoreUnavailable        = errorString("payroll store unavailable")
 
-	ErrContractLookupFailed    = errorString("failed to verify an active salary contract for one or more employees")
+	ErrContractLookupFailed     = errorString("failed to verify an active salary contract for one or more employees")
 	ErrCompensationLookupFailed = errorString("failed to resolve compensation breakdown: compensation-svc unavailable")
 )

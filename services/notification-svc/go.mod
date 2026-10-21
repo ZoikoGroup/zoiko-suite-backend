@@ -17,6 +17,7 @@ require (
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp v1.44.0
 	go.opentelemetry.io/otel/sdk v1.44.0
 	go.uber.org/zap v1.28.0
+	zoiko.io/eventing v0.0.0-00010101000000-000000000000
 )
 
 require (
@@ -59,3 +60,4 @@ require (
 )
 
 replace zoiko.io/identity-envelope => ../identity-envelope
+replace zoiko.io/eventing => ../eventing

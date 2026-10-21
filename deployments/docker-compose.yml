@@ -75,6 +75,7 @@ services:
       - ../services/currency-registry-svc/deployments/migrations:/migrations/currency-registry:ro
       - ../services/fiscal-calendar-svc/deployments/migrations:/migrations/fiscal-calendar:ro
       - ../services/accounting-period-svc/deployments/migrations:/migrations/accounting-period:ro
+      - ../services/financial-statements-svc/deployments/migrations:/migrations/financial-statements:ro
       - ../services/access-control-svc/deployments/migrations:/migrations/access-control:ro
       - ../services/decision-support-svc/deployments/migrations:/migrations/decision-support:ro
       - ../services/treasury-svc/deployments/migrations:/migrations/treasury:ro
@@ -693,6 +694,25 @@ services:
       AUTH_RATE_IP_PER_MINUTE: "30"
       AUTH_FAIL_IP_LIMIT: "10"
       AUTH_FAIL_TENANT_LIMIT: "100"
+
+      # ── INT-10 identity federation (OFF unless enabled) ───────────────────────
+      #
+      # A tenant's own identity provider can authenticate its people only on a platform whose operator
+      # has turned this on. The IdP's key location is a tenant-supplied destination, so it passes the same
+      # SSRF guard as every other (https, public addresses, pinned dial, no redirects); the *_ALLOW_HTTP and
+      # *_PRIVATE_CIDRS settings below exist for local development and private-link IdPs only.
+      FEDERATION_ENABLED: "${FEDERATION_ENABLED:-false}"
+      FEDERATION_EGRESS_ALLOW_HTTP: "${FEDERATION_EGRESS_ALLOW_HTTP:-false}"
+      FEDERATION_EGRESS_PRIVATE_CIDRS: "${FEDERATION_EGRESS_PRIVATE_CIDRS:-}"
+      FEDERATION_JWKS_REFRESH_SECONDS: "900"
+      FEDERATION_JWKS_MIN_REFRESH_SECONDS: "30"
+      # SCIM provisioning, role requests to access-control-svc, and the deprovisioning worker. Requires
+      # FEDERATION_ENABLED. IDENTITY_SERVICE_PRINCIPAL_ID needs ROLE_MANAGE on the entities its mappings name:
+      # an operator grant, never something federation gives itself.
+      FEDERATION_PROVISIONING_ENABLED: "${FEDERATION_PROVISIONING_ENABLED:-false}"
+      FEDERATION_WORKER_INTERVAL_SECONDS: "15"
+      FEDERATION_RETRY_BASE_SECONDS: "10"
+      FEDERATION_REVOKE_RETRY_MAX_SECONDS: "60"
     volumes:
       - identity_jwt_keys:/keys:ro
       - ./identity/idp-clients.local.json:/idp-clients/clients.json:ro
@@ -2700,6 +2720,46 @@ services:
       start_period: 10s
     restart: on-failure
 
+  financial-statements-svc:
+    build:
+      # services/, so the build can reach ../eventing — see the Dockerfile.
+      context: ../services
+      dockerfile: financial-statements-svc/Dockerfile
+    container_name: financial-statements-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8175:8175"
+    environment:
+      PORT: "8175"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: financial_statements
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
+      DB_SSLMODE: disable
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.financial-statements.events"
+      EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      FINANCIAL_CLOSE_URL: "http://financial-close-svc:8104"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+      financial-close-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8175/readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
   # Access Control Service — 03-microservices.md §9.4. Owns role/permission-
   # bundle DEFINITIONS (the catalogue); previously unbuilt. Scope decision:
   # authorization-svc keeps owning live RBAC role/assignment data — this
@@ -3025,8 +3085,9 @@ services:
 
   financial-close-svc:
     build:
-      context: ../services/financial-close-svc
-      dockerfile: Dockerfile
+      # services/, so the build can reach ../eventing — see the Dockerfile.
+      context: ../services
+      dockerfile: financial-close-svc/Dockerfile
     container_name: financial-close-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -3050,6 +3111,11 @@ services:
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.close.events"
+      # Required, no default (ZS-EVENT-001 §4 residencyregion) — was missing
+      # entirely, so every outbox event this service tried to enqueue failed
+      # envelope validation with 'residency region "" must be a controlled
+      # lower-case code'. Found via VerifySnapshotIntegrity's manual test.
+      EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       LEDGER_SERVICE_URL: "http://general-ledger-svc:8098"
       AP_SERVICE_URL: "http://accounts-payable-svc:8099"
@@ -3235,8 +3301,9 @@ services:
 
   intercompany-accounting-svc:
     build:
-      context: ../services/intercompany-accounting-svc
-      dockerfile: Dockerfile
+      # services/, so the build can reach ../eventing — see the Dockerfile.
+      context: ../services
+      dockerfile: intercompany-accounting-svc/Dockerfile
     container_name: intercompany-accounting-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -3252,6 +3319,7 @@ services:
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.intercompany.events"
+      EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       LEDGER_SERVICE_URL: "http://general-ledger-svc:8098"
       TENANT_REGISTRY_URL: "http://tenant-entity-registry-svc:8081"
@@ -5363,8 +5431,8 @@ services:
   # fields once prepared.
   payment-initiation-adapter-svc:
     build:
-      context: ../services/payment-initiation-adapter-svc
-      dockerfile: Dockerfile
+      context: ../services
+      dockerfile: payment-initiation-adapter-svc/Dockerfile
     container_name: payment-initiation-adapter-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -5407,8 +5475,8 @@ services:
   # replaced before any real provider is ever connected.
   payment-status-svc:
     build:
-      context: ../services/payment-status-svc
-      dockerfile: Dockerfile
+      context: ../services
+      dockerfile: payment-status-svc/Dockerfile
     container_name: payment-status-svc
     mem_limit: 256m
     cpus: "0.5"

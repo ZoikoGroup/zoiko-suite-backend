@@ -10,6 +10,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
@@ -142,6 +143,49 @@ func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (stri
 	return principalID, true
 }
 
+// requireCorrelationID enforces §18.1's "actor/service context … and
+// correlation ID" carrier on every mutating API. A missing or blank
+// correlation id is rejected before any side effect (idempotency
+// persistence, store mutation or event publication). The value is echoed
+// into events exactly as before.
+func (h *Handler) requireCorrelationID(w http.ResponseWriter, r *http.Request) (string, bool) {
+	correlationID := strings.TrimSpace(r.Header.Get("X-Correlation-ID"))
+	if correlationID == "" {
+		writeError(w, http.StatusBadRequest, "X-Correlation-ID header is required")
+		return "", false
+	}
+	return correlationID, true
+}
+
+// requireIdempotencyKey enforces §18.1's mandatory idempotency key on every
+// mutating API. Missing or blank keys are rejected before any side effect;
+// the existing replay/conflict semantics are unchanged — this only makes a
+// key that was previously optional mandatory.
+func (h *Handler) requireIdempotencyKey(w http.ResponseWriter, r *http.Request) (string, bool) {
+	key := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	if key == "" {
+		key = strings.TrimSpace(r.Header.Get("X-Idempotency-Key"))
+	}
+	if key == "" {
+		writeError(w, http.StatusBadRequest, "Idempotency-Key header is required")
+		return "", false
+	}
+	return key, true
+}
+
+// requireMutationPreconditions enforces the mandatory service-boundary
+// headers (§18.1) on the mutating routes, after authentication and before
+// any idempotency lookup/persistence, store mutation or event publication.
+func (h *Handler) requireMutationPreconditions(w http.ResponseWriter, r *http.Request) bool {
+	if _, ok := h.requireCorrelationID(w, r); !ok {
+		return false
+	}
+	if _, ok := h.requireIdempotencyKey(w, r); !ok {
+		return false
+	}
+	return true
+}
+
 func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID, tenantID, actionType string) bool {
 	scope := platformScopeID
 	if tenantID != "" {
@@ -168,6 +212,9 @@ func (h *Handler) CreateRequest(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if !h.requireMutationPreconditions(w, r) {
+		return
+	}
 
 	bodyBytes, err := readBodyBytes(r)
 	if err != nil {
@@ -177,23 +224,9 @@ func (h *Handler) CreateRequest(w http.ResponseWriter, r *http.Request) {
 
 	verifiedTenant := svcmiddleware.TenantFromContext(r.Context())
 
-	// Check idempotency (§18.1)
-	_, handled, idemKey, reqHash := h.checkIdempotency(w, r, verifiedTenant, principalID, bodyBytes)
-	if handled {
-		return
-	}
-
 	var req domain.CreateRightsRequestRequest
 	if err := json.Unmarshal(bodyBytes, &req); err != nil {
-		writeError(w, http.StatusBadRequest, domain.PRV005PolicyUnavailable)
-		return
-	}
-	if req.SubjectRef == "" {
-		writeError(w, http.StatusBadRequest, domain.PRV005PolicyUnavailable)
-		return
-	}
-	if !req.RightFamily.Valid() {
-		writeError(w, http.StatusBadRequest, domain.PRV005PolicyUnavailable)
+		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
@@ -210,6 +243,22 @@ func (h *Handler) CreateRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// §18.1 idempotency is evaluated only AFTER authorization so a replayed
+	// key can never bypass the authorization decision.
+	_, handled, idemKey, reqHash := h.checkIdempotency(w, r, tenantID, principalID, bodyBytes)
+	if handled {
+		return
+	}
+
+	if req.SubjectRef == "" {
+		writeError(w, http.StatusBadRequest, "subject_ref is required")
+		return
+	}
+	if !req.RightFamily.Valid() {
+		writeError(w, http.StatusBadRequest, "right_family is not a recognized right family")
+		return
+	}
+
 	request, err := h.store.CreateRequest(r.Context(), tenantID, req, principalID)
 	if err != nil {
 		h.log.Error("CreateRequest: store unavailable", zap.Error(err))
@@ -217,12 +266,7 @@ func (h *Handler) CreateRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.pub.Publish(r.Context(), events.PublishParams{
-		EventType: "privacy.rights_request.received", EntityID: request.RequestID, TenantID: tenantID,
-		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: request,
-	})
-
-	h.writeJSONWithIdempotency(r.Context(), w, tenantID, principalID, "CreateRequest", idemKey, reqHash, http.StatusCreated, request)
+	h.writeJSONWithIdempotency(r.Context(), w, tenantID, principalID, "CreateRequest", idemKey, reqHash, http.StatusCreated, request.WithCanonicalResponseFields())
 }
 
 func (h *Handler) GetRequest(w http.ResponseWriter, r *http.Request) {
@@ -237,7 +281,7 @@ func (h *Handler) GetRequest(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "store unavailable")
 		return
 	}
-	writeJSON(w, http.StatusOK, request)
+	writeJSON(w, http.StatusOK, request.WithCanonicalResponseFields())
 }
 
 func (h *Handler) ListRequestsBySubject(w http.ResponseWriter, r *http.Request) {
@@ -255,6 +299,9 @@ func (h *Handler) ListRequestsBySubject(w http.ResponseWriter, r *http.Request) 
 	if requests == nil {
 		requests = []domain.RightsRequest{}
 	}
+	for i := range requests {
+		requests[i] = *requests[i].WithCanonicalResponseFields()
+	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"data": requests, "count": len(requests)})
 }
 
@@ -270,6 +317,9 @@ func (h *Handler) RecordIdentityVerification(w http.ResponseWriter, r *http.Requ
 	if !ok {
 		return
 	}
+	if !h.requireMutationPreconditions(w, r) {
+		return
+	}
 
 	bodyBytes, err := readBodyBytes(r)
 	if err != nil {
@@ -277,11 +327,10 @@ func (h *Handler) RecordIdentityVerification(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// Check idempotency (§18.1)
 	existing, err := h.store.FindRequest(r.Context(), requestID)
 	if err != nil {
 		if errors.Is(err, domain.ErrRequestNotFound) {
-			writeError(w, http.StatusNotFound, domain.PRV001PurposeNotRegistered)
+			writeError(w, http.StatusNotFound, domain.ErrRequestNotFound.Error())
 			return
 		}
 		h.log.Error("RecordIdentityVerification: lookup failed", zap.Error(err))
@@ -300,7 +349,7 @@ func (h *Handler) RecordIdentityVerification(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// Check idempotency (§18.1)
+	// §18.1 idempotency is evaluated only AFTER authorization.
 	_, handled, idemKey, reqHash := h.checkIdempotency(w, r, tenantID, principalID, bodyBytes)
 	if handled {
 		return
@@ -308,18 +357,18 @@ func (h *Handler) RecordIdentityVerification(w http.ResponseWriter, r *http.Requ
 
 	var req domain.RecordIdentityVerificationRequest
 	if err := json.Unmarshal(bodyBytes, &req); err != nil {
-		writeError(w, http.StatusBadRequest, domain.PRV005PolicyUnavailable)
+		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 	if req.Method == "" {
-		writeError(w, http.StatusBadRequest, domain.PRV005PolicyUnavailable)
+		writeError(w, http.StatusBadRequest, "method is required")
 		return
 	}
 
 	event, request, err := h.store.RecordIdentityVerification(r.Context(), requestID, req, principalID)
 	if err != nil {
 		if errors.Is(err, domain.ErrRequestNotFound) {
-			writeError(w, http.StatusNotFound, domain.PRV001PurposeNotRegistered)
+			writeError(w, http.StatusNotFound, domain.ErrRequestNotFound.Error())
 			return
 		}
 		h.log.Error("RecordIdentityVerification: store unavailable", zap.Error(err))
@@ -327,7 +376,7 @@ func (h *Handler) RecordIdentityVerification(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	h.writeJSONWithIdempotency(r.Context(), w, tenantID, principalID, "RecordIdentityVerification", idemKey, reqHash, http.StatusCreated, map[string]interface{}{"event": event, "request": request})
+	h.writeJSONWithIdempotency(r.Context(), w, tenantID, principalID, "RecordIdentityVerification", idemKey, reqHash, http.StatusCreated, map[string]interface{}{"event": event, "request": request.WithCanonicalResponseFields()})
 }
 
 // AttachDiscoveryManifest handles
@@ -340,6 +389,9 @@ func (h *Handler) AttachDiscoveryManifest(w http.ResponseWriter, r *http.Request
 	if !ok {
 		return
 	}
+	if !h.requireMutationPreconditions(w, r) {
+		return
+	}
 
 	bodyBytes, err := readBodyBytes(r)
 	if err != nil {
@@ -350,7 +402,7 @@ func (h *Handler) AttachDiscoveryManifest(w http.ResponseWriter, r *http.Request
 	existing, err := h.store.FindRequest(r.Context(), requestID)
 	if err != nil {
 		if errors.Is(err, domain.ErrRequestNotFound) {
-			writeError(w, http.StatusNotFound, domain.PRV001PurposeNotRegistered)
+			writeError(w, http.StatusNotFound, domain.ErrRequestNotFound.Error())
 			return
 		}
 		h.log.Error("AttachDiscoveryManifest: lookup failed", zap.Error(err))
@@ -369,7 +421,7 @@ func (h *Handler) AttachDiscoveryManifest(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Check idempotency (§18.1)
+	// §18.1 idempotency is evaluated only AFTER authorization.
 	_, handled, idemKey, reqHash := h.checkIdempotency(w, r, tenantID, principalID, bodyBytes)
 	if handled {
 		return
@@ -377,18 +429,18 @@ func (h *Handler) AttachDiscoveryManifest(w http.ResponseWriter, r *http.Request
 
 	var req domain.AttachDiscoveryManifestRequest
 	if err := json.Unmarshal(bodyBytes, &req); err != nil {
-		writeError(w, http.StatusBadRequest, domain.PRV005PolicyUnavailable)
+		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 	if req.Domain == "" || req.ContentHash == "" {
-		writeError(w, http.StatusBadRequest, domain.PRV005PolicyUnavailable)
+		writeError(w, http.StatusBadRequest, "domain and content_hash are required")
 		return
 	}
 
 	manifest, request, err := h.store.AttachDiscoveryManifest(r.Context(), requestID, req, principalID)
 	if err != nil {
 		if errors.Is(err, domain.ErrRequestNotFound) {
-			writeError(w, http.StatusNotFound, domain.PRV001PurposeNotRegistered)
+			writeError(w, http.StatusNotFound, domain.ErrRequestNotFound.Error())
 			return
 		}
 		h.log.Error("AttachDiscoveryManifest: store unavailable", zap.Error(err))
@@ -396,7 +448,7 @@ func (h *Handler) AttachDiscoveryManifest(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	h.writeJSONWithIdempotency(r.Context(), w, tenantID, principalID, "AttachDiscoveryManifest", idemKey, reqHash, http.StatusCreated, map[string]interface{}{"manifest": manifest, "request": request})
+	h.writeJSONWithIdempotency(r.Context(), w, tenantID, principalID, "AttachDiscoveryManifest", idemKey, reqHash, http.StatusCreated, map[string]interface{}{"manifest": manifest.WithCanonicalResponseFields(), "request": request.WithCanonicalResponseFields()})
 }
 
 func (h *Handler) ListDiscoveryManifests(w http.ResponseWriter, r *http.Request) {
@@ -409,6 +461,9 @@ func (h *Handler) ListDiscoveryManifests(w http.ResponseWriter, r *http.Request)
 	}
 	if manifests == nil {
 		manifests = []domain.DiscoveryManifest{}
+	}
+	for i := range manifests {
+		manifests[i] = *manifests[i].WithCanonicalResponseFields()
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"data": manifests, "count": len(manifests)})
 }
@@ -424,6 +479,9 @@ func (h *Handler) AttachWFCProcessRef(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if !h.requireMutationPreconditions(w, r) {
+		return
+	}
 
 	bodyBytes, err := readBodyBytes(r)
 	if err != nil {
@@ -434,7 +492,7 @@ func (h *Handler) AttachWFCProcessRef(w http.ResponseWriter, r *http.Request) {
 	existing, err := h.store.FindRequest(r.Context(), requestID)
 	if err != nil {
 		if errors.Is(err, domain.ErrRequestNotFound) {
-			writeError(w, http.StatusNotFound, domain.PRV001PurposeNotRegistered)
+			writeError(w, http.StatusNotFound, domain.ErrRequestNotFound.Error())
 			return
 		}
 		h.log.Error("AttachWFCProcessRef: lookup failed", zap.Error(err))
@@ -453,7 +511,7 @@ func (h *Handler) AttachWFCProcessRef(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check idempotency (§18.1)
+	// §18.1 idempotency is evaluated only AFTER authorization.
 	_, handled, idemKey, reqHash := h.checkIdempotency(w, r, tenantID, principalID, bodyBytes)
 	if handled {
 		return
@@ -461,18 +519,18 @@ func (h *Handler) AttachWFCProcessRef(w http.ResponseWriter, r *http.Request) {
 
 	var req domain.AttachWFCProcessRefRequest
 	if err := json.Unmarshal(bodyBytes, &req); err != nil {
-		writeError(w, http.StatusBadRequest, domain.PRV005PolicyUnavailable)
+		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 	if req.WFCProcessRef == "" {
-		writeError(w, http.StatusBadRequest, domain.PRV005PolicyUnavailable)
+		writeError(w, http.StatusBadRequest, "wfc_process_ref is required")
 		return
 	}
 
 	request, err := h.store.AttachWFCProcessRef(r.Context(), requestID, req.WFCProcessRef)
 	if err != nil {
 		if errors.Is(err, domain.ErrRequestNotFound) {
-			writeError(w, http.StatusNotFound, domain.PRV001PurposeNotRegistered)
+			writeError(w, http.StatusNotFound, domain.ErrRequestNotFound.Error())
 			return
 		}
 		h.log.Error("AttachWFCProcessRef: store unavailable", zap.Error(err))
@@ -480,7 +538,7 @@ func (h *Handler) AttachWFCProcessRef(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.writeJSONWithIdempotency(r.Context(), w, tenantID, principalID, "AttachWFCProcessRef", idemKey, reqHash, http.StatusOK, request)
+	h.writeJSONWithIdempotency(r.Context(), w, tenantID, principalID, "AttachWFCProcessRef", idemKey, reqHash, http.StatusOK, request.WithCanonicalResponseFields())
 }
 
 // CloseRequest handles POST /privacy/rights-requests/{requestID}/close —
@@ -494,6 +552,9 @@ func (h *Handler) CloseRequest(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if !h.requireMutationPreconditions(w, r) {
+		return
+	}
 
 	bodyBytes, err := readBodyBytes(r)
 	if err != nil {
@@ -504,7 +565,7 @@ func (h *Handler) CloseRequest(w http.ResponseWriter, r *http.Request) {
 	existing, err := h.store.FindRequest(r.Context(), requestID)
 	if err != nil {
 		if errors.Is(err, domain.ErrRequestNotFound) {
-			writeError(w, http.StatusNotFound, domain.PRV001PurposeNotRegistered)
+			writeError(w, http.StatusNotFound, domain.ErrRequestNotFound.Error())
 			return
 		}
 		h.log.Error("CloseRequest: lookup failed", zap.Error(err))
@@ -519,7 +580,7 @@ func (h *Handler) CloseRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check idempotency (§18.1)
+	// §18.1 idempotency is evaluated only AFTER authorization.
 	_, handled, idemKey, reqHash := h.checkIdempotency(w, r, tenantID, principalID, bodyBytes)
 	if handled {
 		return
@@ -527,11 +588,11 @@ func (h *Handler) CloseRequest(w http.ResponseWriter, r *http.Request) {
 
 	var req domain.CloseRequestRequest
 	if err := json.Unmarshal(bodyBytes, &req); err != nil {
-		writeError(w, http.StatusBadRequest, domain.PRV005PolicyUnavailable)
+		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 	if !req.Outcome.Valid() {
-		writeError(w, http.StatusBadRequest, domain.PRV005PolicyUnavailable)
+		writeError(w, http.StatusBadRequest, "outcome must be one of FULFILLED, REJECTED, WITHDRAWN")
 		return
 	}
 
@@ -539,7 +600,7 @@ func (h *Handler) CloseRequest(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrRequestNotFound):
-			writeError(w, http.StatusNotFound, domain.PRV001PurposeNotRegistered)
+			writeError(w, http.StatusNotFound, domain.ErrRequestNotFound.Error())
 		case errors.Is(err, domain.ErrRequestAlreadyClosed):
 			writeError(w, http.StatusConflict, domain.PRV020ImmutableEvidenceConflict)
 		case errors.Is(err, domain.ErrIdentityNotVerified):
@@ -553,9 +614,5 @@ func (h *Handler) CloseRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.pub.Publish(r.Context(), events.PublishParams{
-		EventType: "privacy.rights_request.closed", EntityID: request.RequestID, TenantID: tenantID,
-		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: request,
-	})
-	h.writeJSONWithIdempotency(r.Context(), w, tenantID, principalID, "CloseRequest", idemKey, reqHash, http.StatusOK, request)
+	h.writeJSONWithIdempotency(r.Context(), w, tenantID, principalID, "CloseRequest", idemKey, reqHash, http.StatusOK, request.WithCanonicalResponseFields())
 }

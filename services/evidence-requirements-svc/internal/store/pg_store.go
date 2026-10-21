@@ -127,7 +127,7 @@ func (s *PgStore) CreateRequirement(ctx context.Context, r *domain.EvidenceRequi
 		payload = json.RawMessage(`{}`)
 	}
 
-	// An absent key means "not an idempotent write", not "share the empty
+// An absent key means "not an idempotent write", not "share the empty
 	// key with every other absent-key row". The latter made a second insert
 	// in the same tenant collide with the first at the DB level.
 	idempotencyKey := r.IdempotencyKey
@@ -356,7 +356,7 @@ func (s *PgStore) RecordEvaluation(ctx context.Context, e *domain.EvidenceEvalua
 		reqIDs = []string{}
 	}
 
-	// As with requirements, an absent key is not a shared empty key; the
+// As with requirements, an absent key is not a shared empty key; the
 	// evaluation's own uuid keeps independent determinations insertable.
 	idempotencyKey := e.IdempotencyKey
 	if idempotencyKey == "" {

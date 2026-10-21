@@ -18,6 +18,7 @@ import (
 	"zoiko.io/payroll-run-svc/internal/employee"
 	"zoiko.io/payroll-run-svc/internal/handler"
 	"zoiko.io/payroll-run-svc/internal/middleware"
+	"zoiko.io/payroll-run-svc/internal/store"
 )
 
 // ── stubs ─────────────────────────────────────────────────────────────────────
@@ -28,11 +29,20 @@ type stubStore struct {
 	slips       map[string][]domain.PaySlip
 	shadowComps map[string][]domain.ShadowComparison
 
+	// pub records the run events the handler asked the store to write in-transaction.
+	pub *stubPublisher
+
 	// control-population stub state (see control_population_test.go)
 	cpPage  *domain.ControlPopulationPage
 	cpErr   error
 	cpCalls int
 	cpLast  domain.ControlPopulationQuery
+
+	// frozen input batch stub state (see calculate_batch_test.go)
+	batches    map[string]*domain.InputBatch
+	batchLines map[string][]domain.InputLine
+	consumeErr error
+	consumed   []string
 }
 
 func newStubStore() *stubStore {
@@ -44,7 +54,7 @@ func newStubStore() *stubStore {
 	}
 }
 
-func (s *stubStore) CreatePayrollRun(_ context.Context, r *domain.PayrollRun) (bool, error) {
+func (s *stubStore) CreatePayrollRun(ctx context.Context, r *domain.PayrollRun) (bool, error) {
 	if r.CorrelationID != "" {
 		if existingID, ok := s.runsByCorr[r.CorrelationID]; ok {
 			*r = *s.runs[existingID]
@@ -55,6 +65,7 @@ func (s *stubStore) CreatePayrollRun(_ context.Context, r *domain.PayrollRun) (b
 	if r.CorrelationID != "" {
 		s.runsByCorr[r.CorrelationID] = r.RunID
 	}
+	s.emit(ctx, *r)
 	return true, nil
 }
 
@@ -83,7 +94,7 @@ func (s *stubStore) ListPayrollRuns(_ context.Context, legalEntityID, status str
 	return out, nil
 }
 
-func (s *stubStore) SaveCalculatedResults(_ context.Context, runID string, totalGross, totalNet, totalTax, totalDeductions float64, slips []domain.PaySlip, shadowComps []domain.ShadowComparison) error {
+func (s *stubStore) SaveCalculatedResults(ctx context.Context, runID string, totalGross, totalNet, totalTax, totalDeductions float64, slips []domain.PaySlip, shadowComps []domain.ShadowComparison) error {
 	r, ok := s.runs[runID]
 	if !ok {
 		return domain.ErrPayrollRunNotFound
@@ -102,6 +113,7 @@ func (s *stubStore) SaveCalculatedResults(_ context.Context, runID string, total
 
 	s.slips[runID] = slips
 	s.shadowComps[runID] = shadowComps
+	s.emit(ctx, *r)
 	return nil
 }
 
@@ -113,7 +125,7 @@ func (s *stubStore) GetShadowComparisonsByRun(_ context.Context, runID string) (
 	return s.shadowComps[runID], nil
 }
 
-func (s *stubStore) FinalizePayrollRun(_ context.Context, runID string, governanceDecisionID *string) error {
+func (s *stubStore) FinalizePayrollRun(ctx context.Context, runID string, governanceDecisionID *string) error {
 	r, ok := s.runs[runID]
 	if !ok {
 		return domain.ErrPayrollRunNotFound
@@ -132,6 +144,7 @@ func (s *stubStore) FinalizePayrollRun(_ context.Context, runID string, governan
 	r.GovernanceDecisionID = governanceDecisionID
 	hash := "stub-snapshot-hash"
 	r.SnapshotHash = &hash
+	s.emit(ctx, *r)
 	return nil
 }
 
@@ -139,17 +152,35 @@ type stubPublisher struct {
 	initiated, calculated, completed, blocked int
 }
 
-func (p *stubPublisher) PublishRunInitiated(_ context.Context, _, _ string, _ domain.PayrollRun) {
-	p.initiated++
+// record counts a run lifecycle event by type.
+func (p *stubPublisher) record(eventType string) {
+	switch eventType {
+	case domain.EventRunInitiated:
+		p.initiated++
+	case domain.EventRunCalculated:
+		p.calculated++
+	case domain.EventRunCompleted:
+		p.completed++
+	case domain.EventRunBlocked:
+		p.blocked++
+	}
 }
-func (p *stubPublisher) PublishRunCalculated(_ context.Context, _, _ string, _ domain.PayrollRun) {
-	p.calculated++
+
+// emit runs the event builder the handler attached to ctx, exactly as the real
+// store does inside its transaction.
+func (s *stubStore) emit(ctx context.Context, run domain.PayrollRun) {
+	if fn := store.RunEventFromContext(ctx); fn != nil && s.pub != nil {
+		if ev, err := fn(run); err == nil {
+			s.pub.record(ev.EventType)
+		}
+	}
 }
-func (p *stubPublisher) PublishRunCompleted(_ context.Context, _, _ string, _ domain.PayrollRun) {
-	p.completed++
-}
-func (p *stubPublisher) PublishRunBlocked(_ context.Context, _, _ string, _ domain.PayrollRun, _ string) {
-	p.blocked++
+
+func (s *stubStore) EnqueueRunEvent(ctx context.Context, run domain.PayrollRun, fn store.RunEventFunc) error {
+	if ev, err := fn(run); err == nil && s.pub != nil {
+		s.pub.record(ev.EventType)
+	}
+	return nil
 }
 
 type stubAuthZ struct{ err error }
@@ -196,7 +227,8 @@ func newRouterWithComp(s *stubStore, pub *stubPublisher, authz *stubAuthZ, empC 
 			next.ServeHTTP(w, req)
 		})
 	})
-	h := handler.New(s, pub, authz, empC, ctrC, compC, testTaxRate, zap.NewNop())
+	s.pub = pub
+	h := handler.New(s, authz, empC, ctrC, compC, testTaxRate, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
 }

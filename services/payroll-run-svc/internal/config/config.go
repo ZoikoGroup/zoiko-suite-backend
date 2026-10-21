@@ -17,6 +17,41 @@ type Config struct {
 	EmployeeMasterURL      string
 	EmploymentContractsURL string
 	CompensationURL        string
+	// BenefitsURL is benefits-svc, read by WFP-03 payroll input batches.
+	BenefitsURL string
+
+	// LedgerServiceURL is general-ledger-svc, the ONLY way payroll reaches the ledger.
+	// GLPostingPrincipalID is the service identity the dispatcher posts as; it must
+	// hold GL_POSTING_EXECUTE and GL_POSTING_REVERSE. AccountingBook is the single
+	// default book (carried, not sent: the ledger has no book field yet).
+	LedgerServiceURL string
+
+	// CounterpartyURL validates WFP-06 liability authorities; PaymentStatusURL is the Banking
+	// evidence for a settlement. Both fail closed.
+	CounterpartyURL  string
+	PaymentStatusURL string
+
+	// WFP-07 payment instruction dependencies (all fail closed).
+	PayeeBankingURL      string
+	TreasuryURL          string
+	PolicyURL            string
+	PaymentAdapterURL    string
+	HighValueSignatures  int
+	GLPostingPrincipalID string
+	AccountingBook       string
+	PostingIntervalSecs  int
+	// PayrollTaxURL, PayrollTaxMode and PayrollTaxEngineCertified: in "engine" mode (the default) a calculation takes
+	// each employee's tax from payroll-tax-svc and fails closed; "placeholder" keeps the legacy rate. Certified is the
+	// operator's declaration about that engine and only removes the TAX_ENGINE_UNCERTIFIED label.
+	PayrollTaxURL             string
+	PayrollTaxMode            string
+	PayrollTaxEngineCertified bool
+	// RetentionRegistryURL is the read-only source of legal holds and retention policy for the disposition guard.
+	RetentionRegistryURL string
+	// BankingRefreshIntervalSecs and LiabilityDueSweepIntervalSecs drive the two background loops; 0 disables a loop.
+	BankingRefreshIntervalSecs    int
+	BankingRefreshPrincipalID     string
+	LiabilityDueSweepIntervalSecs int
 
 	// DefaultTaxRate is applied to a payslip's taxable amount when no
 	// jurisdiction rule is available. A placeholder until payroll-tax-svc
@@ -141,11 +176,30 @@ func Load() (*Config, error) {
 			GroupID: env("KAFKA_GROUP_ID", "payroll-run-svc"),
 			Topic:   env("KAFKA_EVENTS_TOPIC", "zoiko.payroll.events"),
 		},
-		EmployeeMasterURL:      env("EMPLOYEE_MASTER_URL", "http://employee-master-svc:8108"),
-		EmploymentContractsURL: env("EMPLOYMENT_CONTRACTS_URL", "http://employment-contracts-svc:8109"),
-		CompensationURL:        env("COMPENSATION_URL", "http://compensation-svc:8111"),
-		DefaultTaxRate:         envFloat("PAYROLL_DEFAULT_TAX_RATE", 0.20),
-		AuthZServiceURL:        env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
+		EmployeeMasterURL:             env("EMPLOYEE_MASTER_URL", "http://employee-master-svc:8108"),
+		EmploymentContractsURL:        env("EMPLOYMENT_CONTRACTS_URL", "http://employment-contracts-svc:8109"),
+		CompensationURL:               env("COMPENSATION_URL", "http://compensation-svc:8111"),
+		BenefitsURL:                   env("BENEFITS_URL", "http://benefits-svc:8112"),
+		LedgerServiceURL:              env("LEDGER_SERVICE_URL", "http://general-ledger-svc:8098"),
+		CounterpartyURL:               env("COUNTERPARTY_URL", "http://counterparty-management-svc:8124"),
+		PaymentStatusURL:              env("PAYMENT_STATUS_URL", "http://payment-status-svc:8163"),
+		PayeeBankingURL:               env("PAYEE_BANKING_URL", "http://payee-banking-identity-svc:8166"),
+		TreasuryURL:                   env("TREASURY_URL", "http://treasury-svc:8103"),
+		PolicyURL:                     env("POLICY_URL", "http://policy-svc:8085"),
+		PayrollTaxURL:                 env("PAYROLL_TAX_URL", "http://payroll-tax-svc:8113"),
+		PayrollTaxMode:                env("PAYROLL_TAX_MODE", "engine"),
+		PayrollTaxEngineCertified:     env("PAYROLL_TAX_ENGINE_CERTIFIED", "false") == "true",
+		RetentionRegistryURL:          env("RETENTION_REGISTRY_URL", "http://retention-registry-svc:8148"),
+		PaymentAdapterURL:             env("PAYMENT_INITIATION_ADAPTER_URL", "http://payment-initiation-adapter-svc:8162"),
+		HighValueSignatures:           envInt("PAYROLL_PAYMENT_HIGH_VALUE_SIGNATURES", 2),
+		GLPostingPrincipalID:          env("GL_POSTING_PRINCIPAL_ID", "payroll-run-svc"),
+		AccountingBook:                env("PAYROLL_ACCOUNTING_BOOK", "PRIMARY"),
+		PostingIntervalSecs:           envInt("PAYROLL_POSTING_INTERVAL_SECONDS", 5),
+		BankingRefreshIntervalSecs:    envInt("BANKING_REFRESH_INTERVAL_SECONDS", 30),
+		BankingRefreshPrincipalID:     env("BANKING_REFRESH_PRINCIPAL_ID", "payroll-run-svc"),
+		LiabilityDueSweepIntervalSecs: envInt("LIABILITY_DUE_SWEEP_INTERVAL_SECONDS", 3600),
+		DefaultTaxRate:                envFloat("PAYROLL_DEFAULT_TAX_RATE", 0.20),
+		AuthZServiceURL:               env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
 
 		AuthzMTLSEnabled:         env("AUTHZ_MTLS_ENABLED", "false") == "true",
 		AuthzMTLSURL:             env("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),

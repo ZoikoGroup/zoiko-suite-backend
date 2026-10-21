@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"net/http"
 	"os"
 	"os/signal"
@@ -16,20 +17,21 @@ import (
 	"github.com/exaring/otelpgx"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/riandyrn/otelchi"
-	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 
+	"zoiko.io/eventing/kafkaout"
+	"zoiko.io/eventing/outbox"
 	"zoiko.io/intercompany-accounting-svc/internal/config"
 	"zoiko.io/intercompany-accounting-svc/internal/domain"
+	"zoiko.io/intercompany-accounting-svc/internal/entityregistry"
 	svcenvelope "zoiko.io/intercompany-accounting-svc/internal/envelope"
-	"zoiko.io/intercompany-accounting-svc/internal/events"
 	"zoiko.io/intercompany-accounting-svc/internal/handler"
 	"zoiko.io/intercompany-accounting-svc/internal/health"
-	"zoiko.io/intercompany-accounting-svc/internal/entityregistry"
 	"zoiko.io/intercompany-accounting-svc/internal/ledger"
 	svcmiddleware "zoiko.io/intercompany-accounting-svc/internal/middleware"
 	"zoiko.io/intercompany-accounting-svc/internal/mtls"
@@ -244,24 +246,45 @@ func main() {
 	}
 	log.Info("db pool connected")
 
-	// ── 4. Store, Kafka producer, clients ─────────────────────────────────────
-	pgStore := store.New(pool)
-
-	// AllowAutoTopicCreation is required even though the broker itself has
-	// auto.create.topics.enable=true: segmentio/kafka-go's Writer defaults
-	// this to false and never asks the broker to auto-create in its
-	// metadata request, so every write to a not-yet-existing topic fails
-	// with "Unknown Topic Or Partition" regardless of the broker-side
-	// setting.
-	kafkaWriter := &kafka.Writer{
-		Addr:                   kafka.TCP(cfg.Kafka.Brokers...),
-		Topic:                  cfg.Kafka.Topic,
-		Balancer:               &kafka.LeastBytes{},
-		AllowAutoTopicCreation: true,
+	// The eventing outbox table must exist before the first write tries to
+	// enqueue into it; fail here, at deploy time, not on a request.
+	if err := outbox.VerifySchema(pingCtx, pool); err != nil {
+		log.Fatal("eventing outbox schema missing", zap.Error(err))
 	}
-	defer func() { _ = kafkaWriter.Close() }()
 
-	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
+	// ── 4. Store, clients ──────────────────────────────────────────────────────
+	pgStore := store.New(pool, store.WithEventRegion(cfg.EventResidencyRegion))
+
+	// ── 4b. Transactional outbox relay (ZS-EVENT-001 §6) ─────────────────────
+	// Entry lifecycle events are written to eventing_outbox in the same
+	// transaction as the entry change; this relay delivers them. kafkaout
+	// requires broker acknowledgement (RequireAll) — a fire-and-forget
+	// writer here would turn a "published" event into one no broker stored,
+	// the exact loss the outbox exists to prevent. This service had no
+	// transactional outbox at all before this migration: events published
+	// straight from the HTTP handler, after the state change had already
+	// committed.
+	outboxWriter, err := kafkaout.New(kafkaout.Config{
+		Brokers:                cfg.Kafka.Brokers,
+		Topic:                  cfg.Kafka.Topic,
+		AllowAutoTopicCreation: cfg.Env == "local",
+	})
+	if err != nil {
+		log.Fatal("outbox kafka writer", zap.Error(err))
+	}
+	defer func() { _ = outboxWriter.Close() }()
+	relay, err := outbox.NewRelay(pool, outboxWriter, outbox.DefaultConfig(), log)
+	if err != nil {
+		log.Fatal("outbox relay", zap.Error(err))
+	}
+	relayCtx, cancelRelay := context.WithCancel(context.Background())
+	defer cancelRelay()
+	relayDone := make(chan struct{}, 1)
+	go func() {
+		relay.Run(relayCtx)
+		relayDone <- struct{}{}
+	}()
+	registerOutboxMetrics(relay, log)
 
 	var httpClientForAuthz *http.Client
 	if cfg.AuthzMTLSEnabled {
@@ -300,7 +323,7 @@ func main() {
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
-	h := handler.New(pgStore, publisher, authzClient, ledgerClient, log).WithEntityRegistry(entityRegistryClient)
+	h := handler.New(pgStore, authzClient, ledgerClient, log).WithEntityRegistry(entityRegistryClient)
 	handler.RegisterRoutes(r, h)
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────
@@ -341,6 +364,15 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Error("graceful shutdown failed", zap.Error(err))
 	}
+	// Stop the relay after the server: requests finishing during Shutdown
+	// may still commit events. Anything not delivered stays in the outbox
+	// for the next process — stopping loses nothing.
+	cancelRelay()
+	select {
+	case <-relayDone:
+	case <-shutdownCtx.Done():
+		log.Warn("outbox relay did not stop before the shutdown deadline")
+	}
 	log.Info("server stopped")
 }
 
@@ -352,4 +384,35 @@ func correlationIDMiddleware(next http.Handler) http.Handler {
 		w.Header().Set("X-Correlation-ID", r.Header.Get("X-Correlation-ID"))
 		next.ServeHTTP(w, r)
 	})
+}
+
+// registerOutboxMetrics exposes the outbox backlog signals ZS-EVENT-001 §6.1
+// calls first-class. Alert on outbox_oldest_backlog_age_seconds that only
+// grows (relay stopped or broker gone while the service otherwise looks
+// healthy) and on any quarantined event (needs an owner's decision).
+func registerOutboxMetrics(relay *outbox.Relay, log *zap.Logger) {
+	read := func(pick func(outbox.Stats) float64) func() float64 {
+		return func() float64 {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			st, err := relay.ReadStats(ctx)
+			if err != nil {
+				log.Warn("outbox stats unavailable", zap.Error(err))
+				return math.NaN()
+			}
+			return pick(st)
+		}
+	}
+	labels := prometheus.Labels{"service": "intercompany-accounting-svc"}
+	prometheus.MustRegister(
+		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Name: "outbox_backlog_events", Help: "Events committed but not yet published.", ConstLabels: labels,
+		}, read(func(s outbox.Stats) float64 { return float64(s.Backlog) })),
+		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Name: "outbox_quarantined_events", Help: "Events quarantined after exhausting retries or a permanent broker rejection.", ConstLabels: labels,
+		}, read(func(s outbox.Stats) float64 { return float64(s.Quarantined) })),
+		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Name: "outbox_oldest_backlog_age_seconds", Help: "Age of the oldest undelivered event.", ConstLabels: labels,
+		}, read(func(s outbox.Stats) float64 { return s.OldestBacklogAge.Seconds() })),
+	)
 }

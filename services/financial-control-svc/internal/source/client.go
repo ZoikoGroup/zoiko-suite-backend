@@ -7,7 +7,7 @@
 //	200 { "records": [ {record_id, reference, amount, currency, date, attributes} ],
 //	      "next_cursor": "",            // empty on the last page
 //	      "watermark": "...",           // commit sequence / dataset version; REQUIRED
-//	      "declared_totals": { "row_count": n, "totals": {"USD": "123.45"} } }  // optional
+//	      "declared_totals": { "row_count": n, "totals": {"USD": "123.45"} } }  // REQUIRED, same on every page
 //
 // The builder fails CLOSED. A population that cannot be proven complete and
 // reproducible is never returned — the caller records the run as Indeterminate
@@ -202,8 +202,16 @@ func (f *HTTPFetcher) Fetch(ctx context.Context, spec Spec, scope Scope) (*Fetch
 		if len(all) > maxRecords {
 			return nil, ErrPopulationTooLarge
 		}
-		if resp.DeclaredTotals != nil {
+		// declared_totals describe the WHOLE population, so they are required on every
+		// page and cannot differ between pages; without them a short or altered
+		// transfer could not be told apart from the complete one (FIN-CTRL-033).
+		if resp.DeclaredTotals == nil {
+			return nil, fmt.Errorf("%w: %s returned no declared_totals", ErrSourceInconsistent, spec.Ref())
+		}
+		if page == 0 {
 			declared = resp.DeclaredTotals
+		} else if !sameDeclared(declared, resp.DeclaredTotals) {
+			return nil, fmt.Errorf("%w: %s declared_totals changed mid-extraction", ErrSourceInconsistent, spec.Ref())
 		}
 		if resp.NextCursor == "" {
 			break
@@ -214,12 +222,25 @@ func (f *HTTPFetcher) Fetch(ctx context.Context, spec Spec, scope Scope) (*Fetch
 		cursor = resp.NextCursor
 	}
 
-	if declared != nil {
-		if err := verifyDeclared(spec, all, declared); err != nil {
-			return nil, err
-		}
+	if err := verifyDeclared(spec, all, declared); err != nil {
+		return nil, err
 	}
 	return &Fetched{Records: all, Watermark: watermark}, nil
+}
+
+// sameDeclared compares two pages' declared totals by row count and exact
+// per-currency value (so "6" and "6.00" agree).
+func sameDeclared(a, b *declaredTotals) bool {
+	if a.RowCount != b.RowCount || len(a.Totals) != len(b.Totals) {
+		return false
+	}
+	for c, v := range a.Totals {
+		w, ok := b.Totals[c]
+		if !ok || !sameDecimal(v, w) {
+			return false
+		}
+	}
+	return true
 }
 
 // verifyDeclared checks the source's own control totals against what was

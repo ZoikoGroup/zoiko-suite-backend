@@ -1,0 +1,7 @@
+# Build context is services/ (see Dockerfile). Send only what the build reads.
+*
+!payment-status-svc
+!eventing
+payment-status-svc/deployments
+**/*_test.go
+**/.git

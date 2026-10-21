@@ -43,10 +43,33 @@ func scanConflict(row interface{ Scan(...any) error }, c *domain.EvidenceConflic
 // existing conflict with created=false. This is the safe path for replayed
 // payment-status events.
 func (s *PgStore) RaiseEvidenceConflict(ctx context.Context, tenantID string, req domain.RaiseEvidenceConflictRequest) (*domain.EvidenceConflict, bool, error) {
+	var conflict *domain.EvidenceConflict
+	var created bool
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		var err error
+		conflict, created, err = s.RaiseEvidenceConflictInTx(ctx, tx, tenantID, req)
+		return err
+	})
+	if err != nil {
+		return nil, false, mapPgError(err)
+	}
+	return conflict, created, nil
+}
+
+// InTx runs fn in a transaction scoped to tenantID. It makes PgStore a
+// zoiko.io/eventing/inbox TxRunner, so a consumer can apply its effect and
+// record its inbox receipt in one transaction.
+func (s *PgStore) InTx(ctx context.Context, tenantID string, fn func(pgx.Tx) error) error {
+	return s.withRLS(ctx, tenantID, fn)
+}
+
+// RaiseEvidenceConflictInTx is RaiseEvidenceConflict inside the caller's
+// transaction, with the same idempotency per open (statement line, payment).
+func (s *PgStore) RaiseEvidenceConflictInTx(ctx context.Context, tx pgx.Tx, tenantID string, req domain.RaiseEvidenceConflictRequest) (*domain.EvidenceConflict, bool, error) {
 	var conflict domain.EvidenceConflict
 	var created bool
 
-	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+	err := func(tx pgx.Tx) error {
 		// Idempotent check: existing open conflict?
 		existRow := tx.QueryRow(ctx, `
 			SELECT `+conflictSelectColumns+`
@@ -94,9 +117,9 @@ func (s *PgStore) RaiseEvidenceConflict(ctx context.Context, tenantID string, re
 				"provider_confirmed_status": conflict.ProviderConfirmedStatus,
 				"conflict_type":             conflict.ConflictType,
 			})
-	})
+	}(tx)
 	if err != nil {
-		return nil, false, mapPgError(err)
+		return nil, false, err
 	}
 	return &conflict, created, nil
 }

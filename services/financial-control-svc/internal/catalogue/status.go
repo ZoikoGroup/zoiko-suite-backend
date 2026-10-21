@@ -42,12 +42,8 @@ func Status() []ControlStatus {
 		impl("FIN-CTRL-003", "Bank statement to cash GL", 2, "banking-connector-svc runs in the phase-7 compose stack"),
 		blk("FIN-CTRL-004", "Payment provider settlement", 2,
 			"no provider settlement population: payment-status-svc carries no amount/currency, and bank settlement evidence is not linked to payment instructions"),
-		blk("FIN-CTRL-005", "Payroll run to GL", 3,
-			"payroll-run-svc has no path that posts payroll to the GL (no source_event_id convention, no expense/liability account mapping)",
-			"employer taxes and contributions are not modelled in payroll-run-svc"),
-		blk("FIN-CTRL-006", "Payroll net-pay to payment", 3,
-			"no payroll-to-payment path: payment-proposal-svc payable_source is limited to AP_INVOICE and EXPENSE_CLAIM",
-			"no key linking a pay slip to a payment instruction"),
+		part("FIN-CTRL-005", "Payroll run to GL", 3, "seed wave 7. Ties each ACCEPTED payroll result's gross to the gross expense of its POSTED payroll journal (one record per result, exact); an accepted result with no posted journal surfaces as missing. Gross and net only: per-line, liability and per-worker comparison is the WFP reconciliation run inside payroll-run-svc, and a Zoiko result is flagged EMPLOYER_LIABILITIES_NOT_COMPUTED so employer cost is absent from both sides"),
+		part("FIN-CTRL-006", "Payroll net-pay to payment", 3, "seed wave 7. Ties each ACCEPTED payroll result's net pay to the sum of its live net-pay payment instructions (cancelled, superseded and returned ones do not count); it proves payment is instructed, not that Banking settled it: settlement, returns and unknown outcomes are observed and reconciled inside payroll-run-svc"),
 		blk("FIN-CTRL-007", "Tax ledger to GL", 3,
 			"no tax ledger exists (TAX-07) and no tax service posts to the GL"),
 		blk("FIN-CTRL-008", "Tax return to tax ledger", 3,
@@ -129,6 +125,7 @@ func Status() []ControlStatus {
 		impl("PAY-CTRL-001", "Payroll gross-to-net integrity (per pay slip)", 3, "extension implementing §15 Gross-to-net; does not replace FIN-CTRL-005"),
 		impl("PAY-CTRL-002", "Payroll run net total to pay slips", 3, "extension implementing §15 run-control-total tie-out; does not replace FIN-CTRL-005"),
 		impl("PAY-CTRL-003", "Payroll run gross total to pay slips", 3, "extension implementing §15 run-control-total tie-out; does not replace FIN-CTRL-005"),
+		impl("PAY-CTRL-004", "Payroll result net pay to posted net-pay payable", 3, "seed wave 7: accepted result net pay to the net-pay payable of its POSTED payroll journal"),
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Code < out[j].Code })
 	return out

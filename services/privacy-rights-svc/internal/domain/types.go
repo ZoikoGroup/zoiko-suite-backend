@@ -117,6 +117,16 @@ func (o Outcome) Valid() bool {
 	return false
 }
 
+// RightsClassification is the §18 create-response view of a request's
+// right/jurisdiction classification — the canonical API table lists
+// "classification" as a critical create-response field (the §14.1
+// pipeline's "CLASSIFY RIGHT/JURISDICTION" step). It is derived from
+// RightFamily and Jurisdiction and is not separately persisted.
+type RightsClassification struct {
+	RightFamily  RightFamily `json:"right_family"`
+	Jurisdiction string      `json:"jurisdiction,omitempty"`
+}
+
 // RightsRequest is the case record — PRV-04's own privacy-meaning state,
 // not a workflow/task list.
 type RightsRequest struct {
@@ -138,6 +148,31 @@ type RightsRequest struct {
 	CreatedAt            time.Time  `json:"created_at"`
 	CreatedByPrincipalID string     `json:"created_by_principal_id"`
 	ClosedAt             *time.Time `json:"closed_at,omitempty"`
+	// Classification and IdentityState are the §18 canonical response
+	// fields. They are derived from the stored record at response time
+	// (see WithCanonicalResponseFields) and are never persisted.
+	Classification *RightsClassification `json:"classification,omitempty"`
+	IdentityState  string                `json:"identity_state,omitempty"`
+}
+
+// WithCanonicalResponseFields attaches the §18 canonical response fields
+// (classification, identity_state) that are derived from the stored record
+// rather than persisted themselves. identity_state is always recomputed
+// from identity_verified so it stays correct as the case advances. It
+// returns the same receiver for convenient inline use.
+func (r *RightsRequest) WithCanonicalResponseFields() *RightsRequest {
+	if r == nil {
+		return r
+	}
+	if r.Classification == nil {
+		r.Classification = &RightsClassification{RightFamily: r.RightFamily, Jurisdiction: r.Jurisdiction}
+	}
+	if r.IdentityVerified {
+		r.IdentityState = "VERIFIED"
+	} else {
+		r.IdentityState = "UNVERIFIED"
+	}
+	return r
 }
 
 // IdentityVerificationEvent is append-only evidence of one verification
@@ -170,6 +205,23 @@ type DiscoveryManifest struct {
 	EvidenceRef            string    `json:"evidence_ref,omitempty"`
 	SubmittedByPrincipalID string    `json:"submitted_by_principal_id"`
 	CreatedAt              time.Time `json:"created_at"`
+	// Hash is the §18 canonical response field for the manifest's content
+	// hash (the canonical API table names it "hash"). It is derived from
+	// ContentHash at response time and is never persisted.
+	Hash string `json:"hash,omitempty"`
+}
+
+// WithCanonicalResponseFields attaches the §18 canonical "hash" response
+// field, derived from the stored ContentHash. It is safe to call more than
+// once and returns the same receiver for convenient inline use.
+func (m *DiscoveryManifest) WithCanonicalResponseFields() *DiscoveryManifest {
+	if m == nil {
+		return m
+	}
+	if m.Hash == "" {
+		m.Hash = m.ContentHash
+	}
+	return m
 }
 
 // ── Request DTOs ─────────────────────────────────────────────────────────────

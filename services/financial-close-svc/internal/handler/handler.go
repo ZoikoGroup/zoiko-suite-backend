@@ -18,6 +18,7 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
+	"zoiko.io/financial-close-svc/internal/clients"
 	"zoiko.io/financial-close-svc/internal/domain"
 	"zoiko.io/financial-close-svc/internal/evidencereq"
 	svcmiddleware "zoiko.io/financial-close-svc/internal/middleware"
@@ -131,6 +132,9 @@ type Store interface {
 	CertifyFinancialSnapshot(ctx context.Context, snapshotID, principalID, reason string, at time.Time) error
 	SupersedeFinancialSnapshot(ctx context.Context, snapshotID, fromStatus, newSnapshotID string, at time.Time) error
 	ListSnapshotSupersession(ctx context.Context, legalEntityID, purpose string) ([]domain.FinancialSnapshot, error)
+	// RecordSnapshotIntegrityFailure enqueues SnapshotIntegrityFailed to the
+	// outbox; it never changes the snapshot row itself.
+	RecordSnapshotIntegrityFailure(ctx context.Context, f *domain.SnapshotIntegrityFailure, correlationID, actorID string) error
 
 	// ACC-18 (Source-to-Report Traceability) — see domain.LineageEdge's
 	// doc comment for the authority boundary these implement.
@@ -163,6 +167,8 @@ type EvidenceChecker interface {
 type Clients interface {
 	GetUnpostedJournalsCount(ctx context.Context, tenantID, legalEntityID, fiscalPeriod string) (int, error)
 	CompileTrialBalance(ctx context.Context, tenantID, legalEntityID, fiscalPeriod, principalID string) (map[string]float64, error)
+	CompileTrialBalanceDecimal(ctx context.Context, tenantID, legalEntityID, fiscalPeriod, principalID string) (*clients.TrialBalanceForSnapshot, error)
+	ListChartOfAccounts(ctx context.Context, tenantID, principalID string) ([]clients.ChartOfAccountsEntry, error)
 	// The AP/AR counts take the period bounds: an unsettled invoice only blocks
 	// the period it belongs to. Without them a single outstanding invoice
 	// anywhere blocked every period forever.
@@ -319,6 +325,7 @@ const (
 	actionSnapshotCertify   = "SNAPSHOT_CERTIFY"
 	actionSnapshotSupersede = "SNAPSHOT_SUPERSEDE"
 	actionSnapshotView      = "SNAPSHOT_VIEW"
+	actionSnapshotVerify    = "SNAPSHOT_VERIFY"
 
 	// ACC-18 (Source-to-Report Traceability) actions. Rebuilding the
 	// projection is a heavier operation than reading it, so it gets its
@@ -532,8 +539,13 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	})
 	r.Route("/v1/financial-snapshots", func(r chi.Router) {
 		r.Post("/", h.CreateFinancialSnapshot)
+		r.Post("/from-trial-balance", h.CreateFinancialSnapshotFromTrialBalance)
 		r.Get("/supersession", h.ListSnapshotSupersession)
 		r.Get("/{id}", h.GetFinancialSnapshotHandler)
+		// The spec lists VerifySnapshotIntegrity as "GET/POST"; it is a
+		// read either way, so both verbs reach the same handler.
+		r.Get("/{id}/verify", h.VerifySnapshotIntegrity)
+		r.Post("/{id}/verify", h.VerifySnapshotIntegrity)
 		r.Post("/{id}/seal", h.SealSnapshot)
 		r.Post("/{id}/certify", h.CertifySnapshot)
 		r.Post("/{id}/supersede", h.SupersedeSnapshot)
@@ -3906,6 +3918,104 @@ func (h *Handler) CreateFinancialSnapshot(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusCreated, snap)
 }
 
+// CreateFinancialSnapshotFromTrialBalance is the ACC-15->ACC-16 glue command:
+// it compiles the trial balance (ACC-15, via general-ledger-svc) and maps
+// every line to its chart-of-accounts category itself, instead of requiring
+// the caller to assemble the snapshot Content by hand. Fails closed if any
+// trial-balance line's account code is missing from the chart of accounts —
+// an unclassified balance must not silently end up in a signed snapshot.
+func (h *Handler) CreateFinancialSnapshotFromTrialBalance(w http.ResponseWriter, r *http.Request) {
+	var req domain.CreateFinancialSnapshotFromTrialBalanceRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.LegalEntityID == "" || req.FiscalPeriod == "" || req.Purpose == "" || req.Currency == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "legal_entity_id, fiscal_period, purpose and currency are required")
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionSnapshotCreate); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	tb, err := h.clients.CompileTrialBalanceDecimal(r.Context(), tenantID, req.LegalEntityID, req.FiscalPeriod, principalID)
+	if err != nil {
+		h.log.Error("CreateFinancialSnapshotFromTrialBalance: failed to compile trial balance", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "dependency_unavailable", err.Error())
+		return
+	}
+	accounts, err := h.clients.ListChartOfAccounts(r.Context(), tenantID, principalID)
+	if err != nil {
+		h.log.Error("CreateFinancialSnapshotFromTrialBalance: failed to list chart of accounts", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "dependency_unavailable", err.Error())
+		return
+	}
+	byCode := make(map[string]clients.ChartOfAccountsEntry, len(accounts))
+	for _, a := range accounts {
+		byCode[a.AccountCode] = a
+	}
+
+	// Sorted for a deterministic Content byte sequence — the snapshot's hash
+	// and signature are computed over this exact JSON, so unstable map
+	// iteration order here would make SealSnapshot non-reproducible.
+	codes := make([]string, 0, len(tb.Lines))
+	for code := range tb.Lines {
+		codes = append(codes, code)
+	}
+	sort.Strings(codes)
+
+	content := domain.SnapshotContent{Currency: req.Currency}
+	for _, code := range codes {
+		acc, ok := byCode[code]
+		if !ok {
+			writeError(w, http.StatusUnprocessableEntity, "chart_of_accounts_entry_missing",
+				fmt.Sprintf("account %s appears in the trial balance but has no chart-of-accounts entry", code))
+			return
+		}
+		content.Accounts = append(content.Accounts, domain.SnapshotContentAccount{
+			AccountCode: code,
+			AccountName: acc.AccountName,
+			Category:    acc.AccountType,
+			Balance:     tb.Lines[code],
+		})
+	}
+
+	contentBytes, err := json.Marshal(content)
+	if err != nil {
+		h.log.Error("CreateFinancialSnapshotFromTrialBalance: failed to marshal content", zap.Error(err))
+		writeError(w, http.StatusInternalServerError, "internal_error", "failed to build snapshot content")
+		return
+	}
+
+	snap := &domain.FinancialSnapshot{
+		SnapshotID:    uuid.NewString(),
+		TenantID:      tenantID,
+		LegalEntityID: req.LegalEntityID,
+		Purpose:       req.Purpose,
+		Content:       string(contentBytes),
+		SourceReferences: fmt.Sprintf("trial_balance_snapshot_id=%s;ledger_watermark=%d",
+			tb.TrialBalanceSnapshotID, tb.LedgerWatermark),
+		Status:               domain.SnapshotStatusDraft,
+		CreatedAt:            time.Now().UTC(),
+		CreatedByPrincipalID: principalID,
+	}
+	if err := h.store.CreateFinancialSnapshot(r.Context(), snap); err != nil {
+		h.log.Error("failed to create financial snapshot", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, snap)
+}
+
 // SealSnapshot computes the content hash and HMAC signature over the
 // snapshot's own already-fixed Content + SourceReferences and freezes it
 // — the spec's own negative path, "signing key invalid/revoked," is
@@ -4079,6 +4189,88 @@ func (h *Handler) GetFinancialSnapshotHandler(w http.ResponseWriter, r *http.Req
 		return
 	}
 	writeJSON(w, http.StatusOK, snap)
+}
+
+// VerifySnapshotIntegrity recomputes a sealed snapshot's content hash and
+// HMAC signature exactly as SealSnapshot produced them and compares both
+// against what is stored. Spec: "Hash/signature mismatch fails
+// verification." A mismatch is reported as verified=false (200 — the
+// check ran) AND recorded as a SnapshotIntegrityFailed outbox event, so
+// the security signal does not depend on log retention or on the caller
+// checking again. If that event cannot be recorded the request fails with
+// 503 rather than returning a report whose signal was lost.
+func (h *Handler) VerifySnapshotIntegrity(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	snap, err := h.store.GetFinancialSnapshot(r.Context(), id)
+	if err != nil {
+		h.writeSnapshotErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, snap.LegalEntityID, actionSnapshotVerify); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	if snap.ContentHash == nil || snap.Signature == nil {
+		writeError(w, http.StatusUnprocessableEntity, "snapshot_not_sealed", string(domain.ErrSnapshotNotSealed))
+		return
+	}
+	// Without the real key every signature would "mismatch" — refuse
+	// rather than raise a false integrity failure.
+	if len(h.signingKey) == 0 {
+		writeError(w, http.StatusServiceUnavailable, "signing_key_unavailable", "no signing key is available to verify this snapshot")
+		return
+	}
+
+	manifest := snap.Purpose + "|" + snap.Content + "|" + snap.SourceReferences
+	hashBytes := sha256.Sum256([]byte(manifest))
+	recomputedHash := hex.EncodeToString(hashBytes[:])
+	recomputedSignature := h.signEvidence(hashBytes[:])
+
+	hashMatched := hmac.Equal([]byte(recomputedHash), []byte(*snap.ContentHash))
+	signatureMatched := hmac.Equal([]byte(recomputedSignature), []byte(*snap.Signature))
+	result := domain.SnapshotIntegrityResult{
+		Verified:   hashMatched && signatureMatched,
+		SnapshotID: snap.SnapshotID,
+		CheckedAt:  time.Now().UTC(),
+	}
+	if result.Verified {
+		writeJSON(w, http.StatusOK, result)
+		return
+	}
+
+	h.log.Error("financial snapshot integrity verification FAILED",
+		zap.String("snapshot_id", snap.SnapshotID), zap.String("legal_entity_id", snap.LegalEntityID),
+		zap.String("status", snap.Status), zap.Bool("hash_matched", hashMatched),
+		zap.Bool("signature_matched", signatureMatched), zap.String("principal_id", principalID))
+
+	correlationID := r.Header.Get("X-Correlation-ID")
+	if correlationID == "" {
+		correlationID = uuid.NewString()
+	}
+	if err := h.store.RecordSnapshotIntegrityFailure(r.Context(), &domain.SnapshotIntegrityFailure{
+		SnapshotID:        snap.SnapshotID,
+		LegalEntityID:     snap.LegalEntityID,
+		Purpose:           snap.Purpose,
+		SnapshotStatus:    snap.Status,
+		StoredContentHash: *snap.ContentHash,
+		RecomputedHash:    recomputedHash,
+		HashMatched:       hashMatched,
+		SignatureMatched:  signatureMatched,
+		CheckedAt:         result.CheckedAt,
+	}, correlationID, principalID); err != nil {
+		h.log.Error("snapshot integrity failure could not be recorded", zap.String("snapshot_id", snap.SnapshotID), zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "integrity_failure_not_recorded",
+			"snapshot integrity verification FAILED, but the failure event could not be recorded; retry")
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
 }
 
 func (h *Handler) ListSnapshotSupersession(w http.ResponseWriter, r *http.Request) {

@@ -57,22 +57,6 @@ components:
         password:
           type: string
           format: password
-        client_id:
-          type: string
-          description: |
-            The confidential OAuth client the person signs in through (the
-            console's server tier). When it proves `client_secret`, the token
-            carries it as a VERIFIED `azp`, which IDP_CLIENT_CHANNELS maps to a
-            verified source channel. Optional unless IDP_CLIENT_AUTH=required.
-            A presented client that fails is refused (401 `invalid_client`),
-            never downgraded to "no client".
-          example: zoiko-console
-        client_secret:
-          type: string
-          format: password
-          description: The client's secret. Never sent from a browser.
-        correlation_id:
-          type: string
       additionalProperties: false
 
     AuthenticateResponse:
@@ -104,127 +88,10 @@ components:
         mfa_required:
           type: boolean
           description: |
-            Always false: login is password-baseline (ZS-IAM-001 §3, "where
-            permitted by tenant policy"). A second factor is demanded at
-            POST /v1/authenticate/step-up, before a privileged session.
-        mfa_enrolled:
-          type: boolean
-          description: |
-            The principal holds an ACTIVE TOTP factor, so the client can offer
-            step-up rather than enrolment.
-        auth_time:
-          type: integer
-          format: int64
-          description: |
-            When this authentication happened (Unix seconds). Carried on the
-            token and then the envelope as `auth_time`; unlike the envelope's
-            `iat` it does not move on re-resolve.
-        amr:
-          type: array
-          items:
-            type: string
-          description: |
-            Authentication methods (RFC 8176): `["pwd"]` after a password,
-            `["pwd","otp"]` after a TOTP step-up.
-
-    StepUpRequest:
-      type: object
-      required: [code]
-      properties:
-        code:
-          type: string
-          description: The current 6-digit code from the enrolled authenticator.
-          example: "123456"
-        correlation_id:
-          type: string
-
-    TOTPEnrollment:
-      type: object
-      description: Returned once. The secret is never readable again.
-      properties:
-        factor_id:
-          type: string
-        secret:
-          type: string
-          description: Unpadded base32 shared secret (160 bits).
-        otpauth_uri:
-          type: string
-          description: Key Uri Format for an authenticator app's QR code.
-        algorithm:
-          type: string
-          enum: [SHA1]
-        digits:
-          type: integer
-          example: 6
-        period:
-          type: integer
-          example: 30
-        status:
-          type: string
-          enum: [PENDING]
-
-    MFAFactor:
-      type: object
-      description: A factor without any secret material.
-      properties:
-        factor_id:
-          type: string
-        principal_id:
-          type: string
-        type:
-          type: string
-          enum: [TOTP]
-        status:
-          type: string
-          enum: [PENDING, ACTIVE, RETIRED]
-        created_at:
-          type: string
-          format: date-time
-        activated_at:
-          type: string
-          format: date-time
-        last_used_at:
-          type: string
-          format: date-time
-        retired_reason:
-          type: string
-        failed_attempts:
-          type: integer
-        locked_until:
-          type: string
-          format: date-time
-
-    ActivateTOTPRequest:
-      type: object
-      required: [factor_id, code]
-      properties:
-        factor_id:
-          type: string
-        code:
-          type: string
-        correlation_id:
-          type: string
-
-    RevokeTOTPRequest:
-      type: object
-      required: [factor_id]
-      properties:
-        factor_id:
-          type: string
-        reason_code:
-          type: string
-        correlation_id:
-          type: string
-
-    ResetMFARequest:
-      type: object
-      required: [reason_code]
-      properties:
-        reason_code:
-          type: string
-          example: LOST_DEVICE
-        purpose:
-          type: string
+            Whether a second factor is needed before trust posture can reach
+            MFA_VERIFIED. Always false today — no step-up factor is implemented
+            in the estate, so there is nothing a client could do in response to
+            true.
 
     JWKSResponse:
       type: object
@@ -711,9 +578,6 @@ paths:
           description: |
             Invalid credentials. Covers unknown principal, absent credential,
             locked account and password mismatch — indistinguishable by design.
-            A presented client that does not authenticate is a separate 401
-            with `error_code: invalid_client`; it is checked before the account
-            is touched, so it costs the account no lockout attempt.
           content:
             application/json:
               schema:
@@ -735,10 +599,10 @@ paths:
       operationId: getJWKS
       security: []
       description: |
-        Every published signing key (RS256 or ES256): the active key and any
-        key still verifying live tokens during a rotation (JWT_SIGNING_KEYS,
-        JWT_VERIFY_ONLY_KEYS). Relying parties verify identity envelopes,
-        access tokens and ID tokens against this set; verifiers hold no secret.
+        The RSA public key downstream services use to verify the
+        IdentityContextEnvelope. Envelopes are signed RS256 so verifiers hold no
+        secret; the bearer token from /v1/authenticate is separately HS256 and
+        is not verifiable with this key.
       responses:
         "200":
           description: JSON Web Key Set
@@ -911,18 +775,9 @@ paths:
       summary: Transition principal status
       operationId: updatePrincipalStatus
       description: |
-        Status transitions only (ACTIVE, SUSPENDED, DISABLED).
+        Status transitions only (ACTIVE → SUSPENDED → DISABLED). 
         No soft-delete per doctrine (data-model §2.11).
         Idempotent — re-applying same status is a no-op.
-
-        One governed command: the status row, its decision-log entry and the
-        events `principal.status.changed` and `identity.subject.disabled` /
-        `identity.subject.enabled` are written in one transaction, and a
-        disable or suspension then ends every session the principal holds
-        (login sessions, their refresh tokens and resolved session contexts).
-        The actor is the verified caller (X-Principal-Id); every change needs
-        IDENTITY_PRINCIPAL_STATUS, including on yourself, and nobody may
-        disable or suspend their own account.
       parameters:
         - name: principalId
           in: path
@@ -930,6 +785,11 @@ paths:
           schema:
             type: string
         - name: X-Correlation-ID
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: X-Actor-Principal-ID
           in: header
           required: true
           schema:
@@ -942,17 +802,7 @@ paths:
               $ref: "#/components/schemas/UpdatePrincipalStatusRequest"
       responses:
         "204":
-          description: Status updated (or already in that status)
-        "400":
-          description: Malformed body, or a status other than ACTIVE, SUSPENDED or DISABLED
-        "403":
-          description: |
-            The caller lacks IDENTITY_PRINCIPAL_STATUS, or (`self_status_change`)
-            tried to disable or suspend their own account.
-        "501":
-          description: The status command is not configured in this deployment
-        "503":
-          description: authorization-svc is unreachable
+          description: Status updated
 
   # -- GOV-01 contract operations ---------------------------------------------
   #
@@ -1408,446 +1258,344 @@ paths:
         "501":
           description: Support context is not configured in this deployment
 
-  /v1/authenticate/step-up:
-    post:
-      summary: Step up the current session with a TOTP code
-      operationId: stepUp
-      description: |
-        ZS-IAM-001 §3: "Step-up creates a new assurance assertion with bounded
-        age." The caller's session envelope (Authorization) and a code from its
-        ACTIVE factor return a NEW login token with `mfa_done`, `auth_time` =
-        now and `amr` `["pwd","otp"]`. Exchange it at /v1/context/resolve for an
-        envelope with `mfa_verified: true`, which authorization-svc requires
-        before issuing or approving a JIT or break-glass session.
+  # ── INT-10 identity federation ─────────────────────────────────────────────────
 
-        The caller is identified by the envelope, verified with this service's
-        key and checked against its live session record; X-Principal-Id and
-        X-Tenant-Id, when sent, must name the same principal and tenant (403
-        `identity_mismatch`). The session's verified client (azp) is carried
-        over. A code is accepted once (its time step is recorded), and the
-        factor locks after MFA_MAX_FAILED_ATTEMPTS wrong codes. The response is
-        never stored for idempotent replay: it is a credential.
-      parameters:
-        - name: X-Correlation-ID
-          in: header
-          schema:
-            type: string
+  /v1/authenticate/federated:
+    post:
+      summary: Exchange a tenant identity provider's ID token for a bearer token
+      operationId: authenticateFederated
+      security: []
+      description: |
+        The federated twin of /v1/authenticate, with the same exemption from the canonical input contract and the
+        same uniform answers: a person who signs in through their tenant's IdP receives the SAME first-party bearer
+        token, so /v1/context/resolve and the envelope are unchanged.
+
+        The proof is a signature by the tenant's approved key set over claims naming the tenant's approved issuer and
+        this client, with a request-bound nonce (required unless the connection says otherwise). The person is found
+        by tenant + issuer + stable subject: **an email address is never an identity binding**, so an address shared
+        across issuers, or reassigned, cannot reach someone else's principal. A token is exchanged once.
+
+        Every refusal — unknown issuer, wrong audience, expired or forged token, replay, unlinked subject, suspended
+        link or principal — is the same 401. The reason is in the evidence (only for a token whose signature
+        verified), the event stream and the SIEM stream. An IdP outage with no usable cached keys is 503, never 401.
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/StepUpRequest"
+              type: object
+              required: [tenant_id, id_token]
+              properties:
+                tenant_id: { type: string }
+                id_token: { type: string }
+                nonce: { type: string }
+              additionalProperties: false
       responses:
         "200":
-          description: Stepped up — a new login token
+          description: Verified — bearer token issued (never cacheable)
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/AuthenticateResponse"
         "400":
-          description: The code is not 6 digits
+          description: tenant_id or id_token absent
         "401":
-          description: |
-            `session_invalid` (bearer missing, forged, expired, or its session
-            invalidated, or the principal no longer active) or `invalid_code`
-            (wrong, replayed, or the factor is locked — one answer for all three).
-        "403":
-          description: "`identity_mismatch`: a header names someone other than the session"
-        "409":
-          description: "`mfa_not_enrolled`: no ACTIVE factor"
+          description: Refused. Indistinguishable by design.
         "503":
-          description: "`mfa_unavailable` (no MFA_SECRET_KEY) or the store is unreachable"
+          description: The attempt could not be decided (keys unavailable, store unavailable).
 
-  /v1/mfa/totp/enroll:
+  /v1/federation/connections:
     post:
-      summary: Start a TOTP enrolment
-      operationId: enrollTOTP
+      summary: ConfigureFederation — propose a connection, or a new version of one
+      operationId: configureFederation
       description: |
-        Creates a PENDING factor and returns its secret and otpauth:// URI
-        exactly once (no-store; never recorded for idempotent replay). A first
-        factor needs a login no older than MFA_RECENT_AUTH_SECONDS (401
-        `reauthentication_required`). Replacing an ACTIVE factor needs a recent
-        step-up with it (403 `step_up_required`), so a stolen password alone
-        cannot swap someone's second factor. The secret is AES-256-GCM
-        encrypted at rest, bound to its row.
+        Authorized as FEDERATION_CONFIGURE. The result always awaits an independent approver: a connection cannot
+        authenticate anyone on its author's word alone. The configuration names the issuer (https), the audience,
+        the JWKS location (checked against the egress policy: https, public addresses, no internal names), the
+        asymmetric algorithms accepted (RS*/PS*/ES*, never symmetric), the tenant's approved MFA amr/acr values,
+        the outage behaviour (FAIL_CLOSED, or CACHED_KEYS with a bounded grace) and whether just-in-time
+        provisioning is allowed. Naming `connection_id` proposes a new version; the approved one keeps serving.
       responses:
-        "201":
-          description: Enrolment started
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/TOTPEnrollment"
-        "401":
-          description: "`session_invalid` or `reauthentication_required`"
-        "403":
-          description: "`step_up_required` or `identity_mismatch`"
-        "503":
-          description: "`mfa_unavailable`"
+        "202": { description: Proposed; awaiting approval }
+        "400": { description: Invalid configuration }
+        "403": { description: Not authorized }
+        "409": { description: A version is already awaiting approval, or the connection is revoked }
+    get:
+      summary: List the tenant's federation connections
+      operationId: listFederationConnections
+      responses:
+        "200": { description: The connections }
 
-  /v1/mfa/totp/activate:
+  /v1/federation/connections/{connectionId}:
+    get:
+      summary: GetFederationConfig — a connection with every version
+      operationId: getFederationConfig
+      responses:
+        "200": { description: The connection }
+        "404": { description: Not found in this tenant }
+
+  /v1/federation/connections/{connectionId}/versions/{version}/approve:
     post:
-      summary: Prove a pending factor and make it active
-      operationId: activateTOTP
+      summary: ApproveFederation
+      operationId: approveFederation
       description: |
-        A code from the PENDING factor makes it ACTIVE and retires any previous
-        factor in the same transaction. Activation does not raise the current
-        session's assurance; step up for that.
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/ActivateTOTPRequest"
+        FEDERATION_APPROVE. The approver supplies the fingerprint they were shown; a different one is 409. The author
+        cannot approve their own version (403, and refused by the data as well). Only one live connection per issuer
+        per tenant. Approval supersedes the version it replaces.
       responses:
-        "200":
-          description: Factor active
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/MFAFactor"
-        "400":
-          description: factor_id missing or the code is not 6 digits
-        "401":
-          description: "`session_invalid` or `invalid_code`"
-        "404":
-          description: "`factor_not_found`: no PENDING factor with that id for this principal"
-        "503":
-          description: "`mfa_unavailable`"
+        "200": { description: Approved }
+        "403": { description: Self-approval, or not authorized }
+        "409": { description: Fingerprint mismatch, already decided, or issuer already trusted by another connection }
 
-  /v1/mfa/totp/revoke:
+  /v1/federation/connections/{connectionId}/versions/{version}/reject:
     post:
-      summary: Revoke one of the caller's own factors
-      operationId: revokeTOTP
+      summary: Reject a proposed version (a reason is required)
+      operationId: rejectFederationVersion
+      responses:
+        "200": { description: Rejected }
+
+  /v1/federation/connections/{connectionId}/rotate-metadata:
+    post:
+      summary: RotateMetadataOrCertificateRef — propose a new key location
+      operationId: rotateMetadataOrCertificateRef
+      description: Where signing keys come from is a trust decision, so a new location is a new version awaiting approval. Rotation of the keys at an unchanged location needs no approval; that is a refresh.
+      responses:
+        "202": { description: Proposed }
+        "400": { description: Unchanged or forbidden destination }
+
+  /v1/federation/connections/{connectionId}/keys/refresh:
+    post:
+      summary: Fetch the signing keys now from the approved location
+      operationId: refreshFederationKeys
+      responses:
+        "200": { description: Refreshed; key_count returned }
+        "503": { description: The identity provider's keys could not be obtained }
+
+  /v1/federation/connections/{connectionId}/suspend:
+    post:
+      summary: SuspendFederation (a reason is required)
+      operationId: suspendFederation
+      responses:
+        "200": { description: Suspended; new logins are refused }
+
+  /v1/federation/connections/{connectionId}/resume:
+    post:
+      summary: Return a suspended connection to service
+      operationId: resumeFederation
+      responses:
+        "200": { description: Resumed }
+        "409": { description: Not suspended }
+
+  /v1/federation/connections/{connectionId}/revoke:
+    post:
+      summary: Revoke a connection (final; a reason is required)
+      operationId: revokeFederation
+      responses:
+        "200": { description: Revoked }
+
+  /v1/federation/connections/{connectionId}/logins:
+    get:
+      summary: Evidence of recent federated logins whose signature verified
+      operationId: listFederationLogins
+      responses:
+        "200": { description: Newest first }
+
+  /v1/federation/links:
+    post:
+      summary: Link an external subject to an existing principal (administrator's decision)
+      operationId: linkExternalSubject
+      responses:
+        "201": { description: Linked }
+        "409": { description: The external subject or the principal is already linked }
+        "422": { description: Unknown principal, or one of another tenant }
+    get:
+      summary: List external-subject links
+      operationId: listExternalSubjectLinks
+      responses:
+        "200": { description: The links }
+
+  /v1/federation/links/{linkId}:
+    get:
+      summary: GetExternalSubjectLink
+      operationId: getExternalSubjectLink
+      responses:
+        "200": { description: The link }
+        "404": { description: Not found in this tenant }
+
+  /v1/federation/connections/{connectionId}/mapping:
+    post:
+      summary: ConfigureProvisioningMapping — propose how directory attributes map to baseline roles
+      operationId: configureProvisioningMapping
       description: |
-        Needs a recent step-up (403 `step_up_required`): removing the factor
-        that guards privileged sessions is itself sensitive. A person who has
-        lost their device asks an administrator for a reset instead.
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/RevokeTOTPRequest"
+        FEDERATION_PROVISIONING_MANAGE. An entry says: a person whose `groups`, `roles`, `department`, `title` or
+        `userType` holds a value is entitled to a role in a legal entity. Every role named is checked with
+        access-control-svc, which owns the risk taxonomy: only a **baseline** (all STANDARD-risk) role may be mapped.
+        A privileged role is 400; access control unreachable is 503, never "eligible". The proposal awaits an
+        independent approver and the roles are checked again at approval.
       responses:
-        "200":
-          description: Retired
-        "401":
-          description: "`session_invalid`"
-        "403":
-          description: "`step_up_required` or `identity_mismatch`"
-        "404":
-          description: "`factor_not_found`"
-
-  /v1/mfa/factors:
+        "202": { description: Proposed }
+        "400": { description: Invalid, or names a role that is not baseline }
+        "503": { description: Eligibility could not be established }
     get:
-      summary: List the caller's own factors
-      operationId: listMFAFactors
+      summary: The mapping versions of a connection and the one in force
+      operationId: getProvisioningMapping
       responses:
-        "200":
-          description: Factors, without secrets
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  factors:
-                    type: array
-                    items:
-                      $ref: "#/components/schemas/MFAFactor"
-                  count:
-                    type: integer
-        "401":
-          description: "`session_invalid`"
+        "200": { description: The mapping }
 
-  /v1/principals/{principalId}/mfa/reset:
+  /v1/federation/connections/{connectionId}/mapping/versions/{version}/approve:
     post:
-      summary: Reset another principal's second factor (administrator)
-      operationId: resetPrincipalMFA
+      summary: Approve a proposed mapping (by fingerprint; not by its author)
+      operationId: approveProvisioningMapping
+      responses:
+        "200": { description: Approved }
+        "400": { description: A role has stopped being baseline since the proposal }
+        "403": { description: Self-approval }
+        "409": { description: Fingerprint mismatch or already decided }
+
+  /v1/federation/connections/{connectionId}/mapping/versions/{version}/reject:
+    post:
+      summary: Reject a proposed mapping
+      operationId: rejectProvisioningMapping
+      responses:
+        "200": { description: Rejected }
+
+  /v1/federation/connections/{connectionId}/scim-token:
+    post:
+      summary: Issue the connection's SCIM bearer token
+      operationId: issueScimToken
+      description: The token is returned once and replaces any earlier one. Only its SHA-256 is stored; it is never logged or placed in an event.
+      responses:
+        "201": { description: Issued (never cacheable) }
+
+  /v1/federation/connections/{connectionId}/scim-token/revoke:
+    post:
+      summary: Revoke the connection's SCIM token
+      operationId: revokeScimToken
+      responses:
+        "200": { description: Number revoked }
+
+  /v1/federation/connections/{connectionId}/provisioning/status:
+    get:
+      summary: GetProvisioningStatus
+      operationId: getProvisioningStatus
+      responses:
+        "200": { description: Links, events, assignments, open exceptions, deprovision backlog }
+
+  /v1/federation/connections/{connectionId}/provisioning/events:
+    get:
+      summary: The provisioning event ledger
+      operationId: listProvisioningEvents
+      responses:
+        "200": { description: Newest first }
+
+  /v1/federation/connections/{connectionId}/provisioning/exceptions:
+    get:
+      summary: ListSyncExceptions — what provisioning could not settle by itself
+      operationId: listSyncExceptions
+      responses:
+        "200": { description: Quarantined identities and mappings, refused or unreachable assignments, late deprovisioning }
+
+  /v1/federation/connections/{connectionId}/provisioning/exceptions/{exceptionId}/resolve:
+    post:
+      summary: Close an exception with a note
+      operationId: resolveSyncException
+      responses:
+        "200": { description: Resolved }
+        "409": { description: Not open }
+
+  /v1/federation/connections/{connectionId}/provisioning/deprovision-latency:
+    get:
+      summary: GetDeprovisionLatency — how long deprovisioning took to take effect, against its objective
+      operationId: getDeprovisionLatency
+      responses:
+        "200": { description: Per person, plus completed, pending, escalated, median and maximum }
+
+  /v1/federation/connections/{connectionId}/provisioning/reconcile:
+    post:
+      summary: ReconcileDirectorySync — a directory snapshot as a safety net for deprovisioning never sent
+      operationId: reconcileDirectorySync
       description: |
-        Credential recovery for a lost device, "separately controlled"
-        (ZS-IAM-001 §3). The administrator is identified by their own session
-        envelope, must hold `IDENTITY_MFA_RESET` in authorization-svc, must have
-        stepped up within MFA_RECENT_AUTH_SECONDS, and cannot reset themselves.
-        Every ACTIVE and PENDING factor of the subject is retired;
-        `identity.mfa_factor.reset` is written with the change and streamed to
-        SIEM at high severity.
-      parameters:
-        - name: principalId
-          in: path
-          required: true
-          schema:
-            type: string
-        - name: Idempotency-Key
-          in: header
-          required: true
-          schema:
-            type: string
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/ResetMFARequest"
+        People the platform holds active that a COMPLETE snapshot omits are deprovisioned through the normal pipeline.
+        An empty snapshot, or one that would deprovision more than a quarter of the population (minimum ten), is
+        refused unless `allow_mass` is set. An incomplete snapshot only reports.
       responses:
-        "200":
-          description: Factors retired
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  principal_id:
-                    type: string
-                  factors_retired:
-                    type: integer
-        "400":
-          description: reason_code missing
-        "401":
-          description: "`session_invalid`"
-        "403":
-          description: |
-            `self_reset_refused`, `step_up_required`, `identity_mismatch`, or
-            the administrator lacks IDENTITY_MFA_RESET.
-        "404":
-          description: No such principal in the tenant
-        "503":
-          description: authorization-svc or the store is unreachable
+        "200": { description: Report }
+        "400": { description: Empty or malformed snapshot }
+        "409": { description: Over the safety limit, or already run }
 
-  # -- OpenID Connect provider (internal/oidc; AU-01, AU-04, AU-06, AU-10, AU-12, AU-27) --
-  #
-  # Mounted outside the §4 envelope and the idempotency replay store: these
-  # endpoints speak RFC 6749 to browsers and OAuth clients, and their replay
-  # protection is the protocol's own (single-use codes, rotating refresh
-  # tokens, DPoP jti). Clients are registered in OIDC_CLIENTS_FILE.
+  # SCIM 2.0. Served outside the platform envelope and replay middleware: a directory has no platform identity. The
+  # connection's bearer token, with the tenant and connection in the path, authenticates every request before anything
+  # is read or written; a caller without a valid token learns nothing and writes nothing.
 
-  /.well-known/openid-configuration:
+  /scim/v2/{tenantId}/{connectionId}/ServiceProviderConfig:
     get:
-      summary: OpenID Provider metadata
-      operationId: getOpenIDConfiguration
+      summary: SCIM ServiceProviderConfig
+      operationId: scimServiceProviderConfig
       security: []
       responses:
-        "200":
-          description: OIDC Discovery 1.0 metadata (issuer, endpoints, PKCE S256, DPoP algorithms)
+        "200": { description: Patch and filter supported; bulk, sort, change-password and etag are not }
 
-  /.well-known/oauth-authorization-server:
-    get:
-      summary: OAuth 2.0 authorization server metadata (RFC 8414)
-      operationId: getAuthorizationServerMetadata
-      security: []
-      responses:
-        "200":
-          description: Same document as /.well-known/openid-configuration
-
-  /oauth2/authorize:
-    get:
-      summary: Authorization endpoint (code flow with PKCE S256)
-      operationId: authorize
-      security: []
-      description: |
-        Authorization code flow only, PKCE S256 required for every client, exact
-        redirect-URI match. An unknown client or unregistered redirect URI is
-        answered here, never redirected. Renders the hosted login page, or
-        redirects with a code when a live single-sign-on session exists.
-      responses:
-        "200":
-          description: Hosted login page
-        "302":
-          description: Redirect to the client with `code`, `state` and `iss`, or with an OAuth error
-        "400":
-          description: Unknown client or unregistered redirect URI
+  /scim/v2/{tenantId}/{connectionId}/Users:
     post:
-      summary: Authorization endpoint (form post)
-      operationId: authorizePost
-      security: []
-      responses:
-        "200":
-          description: Hosted login page
-        "302":
-          description: Redirect to the client
-        "400":
-          description: Unknown client or unregistered redirect URI
-
-  /oauth2/login:
-    post:
-      summary: Hosted login, password step
-      operationId: loginPassword
-      security: []
-      description: Form post from the hosted login page, CSRF-bound to the pending authorization. Throttled per source IP and tenant (AU-04).
-      responses:
-        "200":
-          description: Login page again (error, or the second-factor step)
-        "302":
-          description: Login complete; redirect to the client with a code
-        "403":
-          description: The form's CSRF token did not verify
-        "429":
-          description: Too many attempts (Retry-After)
-
-  /oauth2/login/mfa:
-    post:
-      summary: Hosted login, TOTP second factor
-      operationId: loginTOTP
-      security: []
-      responses:
-        "200":
-          description: Login page again with an error
-        "302":
-          description: Login complete; redirect to the client with a code
-        "401":
-          description: Too many incorrect codes, or the account can no longer sign in
-        "429":
-          description: Too many attempts (Retry-After)
-
-  /oauth2/login/passkey/begin:
-    post:
-      summary: Hosted login, passkey challenge
-      operationId: loginPasskeyBegin
-      security: []
-      description: No WebAuthn backend is built yet, so this answers 400 `passkey_not_available`.
-      responses:
-        "400":
-          description: passkey_not_available
-
-  /oauth2/login/passkey/finish:
-    post:
-      summary: Hosted login, passkey assertion
-      operationId: loginPasskeyFinish
-      security: []
-      description: No WebAuthn backend is built yet, so this answers 400 `passkey_not_available`.
-      responses:
-        "400":
-          description: passkey_not_available
-
-  /oauth2/login/federate/{idpId}:
-    get:
-      summary: Hosted login, enterprise IdP hand-off
-      operationId: loginFederate
-      security: []
-      description: No federation backend is built yet, so this answers 404.
-      parameters:
-        - name: idpId
-          in: path
-          required: true
-          schema:
-            type: string
-      responses:
-        "404":
-          description: Enterprise sign-in is not configured
-
-  /oauth2/token:
-    post:
-      summary: Token endpoint
-      operationId: token
+      summary: Provision a user
+      operationId: scimCreateUser
       security: []
       description: |
-        Grants: authorization_code (with code_verifier), refresh_token (rotated
-        on every use; a reused token revokes its family and ends the login
-        session), client_credentials (workload clients only) and RFC 8693
-        token exchange (workload clients only). DPoP-bound when the client
-        sends a proof or is registered dpop_bound.
+        `externalId` (the directory's stable identifier) is required: it, not the userName or email, is the identity.
+        An email already held by a different principal quarantines the record (409 uniqueness) rather than merging
+        it. The directory's `groups`, `roles`, `department`, `title` and `userType` are matched against the approved
+        mapping and can obtain only the baseline roles it names; they can never name a role. A retry with the same
+        `X-Event-Id` (or Idempotency-Key) is answered from the ledger; without one, an identical request within five
+        minutes is absorbed. A user is not created inactive.
       responses:
-        "200":
-          description: Tokens (access_token, token_type, expires_in, refresh_token, id_token)
-        "400":
-          description: OAuth error (invalid_request, invalid_grant, unsupported_grant_type, invalid_dpop_proof, …)
-        "401":
-          description: invalid_client
-        "429":
-          description: slow_down (Retry-After)
-
-  /oauth2/userinfo:
+        "201": { description: Created }
+        "200": { description: The user already existed, or a replay }
+        "400": { description: Invalid }
+        "401": { description: Bad token }
+        "403": { description: The connection is suspended }
+        "409": { description: Quarantined, or the event id was reused with a different request }
     get:
-      summary: UserInfo endpoint
-      operationId: userInfo
-      responses:
-        "200":
-          description: sub and tenant_id, plus email / name by scope
-        "401":
-          description: Invalid, revoked or session-ended access token
-    post:
-      summary: UserInfo endpoint (POST)
-      operationId: userInfoPost
-      responses:
-        "200":
-          description: sub and tenant_id, plus email / name by scope
-        "401":
-          description: Invalid, revoked or session-ended access token
-
-  /oauth2/revoke:
-    post:
-      summary: Token revocation (RFC 7009)
-      operationId: revokeToken
+      summary: Look a user up by filter
+      operationId: scimListUsers
       security: []
+      description: Only `userName eq "…"` and `externalId eq "…"` are understood; anything else is 400 invalidFilter. Without a filter the result is empty.
       responses:
-        "200":
-          description: Revoked, or the token was unknown (RFC 7009 §2.2)
-        "401":
-          description: invalid_client
+        "200": { description: ListResponse }
 
-  /oauth2/introspect:
-    post:
-      summary: Token introspection (RFC 7662)
-      operationId: introspectToken
-      security: []
-      description: Confidential and workload clients only. Answers for access tokens and identity envelopes.
-      responses:
-        "200":
-          description: "{active: true, …} or {active: false}"
-        "400":
-          description: unauthorized_client (public clients may not introspect)
-        "401":
-          description: invalid_client
-
-  /oauth2/logout:
+  /scim/v2/{tenantId}/{connectionId}/Users/{id}:
     get:
-      summary: RP-initiated logout
-      operationId: logout
+      summary: Read a user
+      operationId: scimGetUser
       security: []
       responses:
-        "200":
-          description: Signed out
-        "302":
-          description: Redirect to a registered post_logout_redirect_uri
-    post:
-      summary: RP-initiated logout (POST)
-      operationId: logoutPost
+        "200": { description: The user }
+        "404": { description: No such user }
+    put:
+      summary: Replace a user (externalId cannot change)
+      operationId: scimReplaceUser
       security: []
       responses:
-        "200":
-          description: Signed out
-        "302":
-          description: Redirect to a registered post_logout_redirect_uri
-
-  /v1/logout:
-    post:
-      summary: End the caller's own session (server tier)
-      operationId: apiLogout
-      description: The envelope in Authorization names the session; its login session ends with it, so a refresh token cannot mint a replacement.
-      responses:
-        "204":
-          description: Logged out
-        "401":
-          description: identity_assertion_required / identity_assertion_invalid
-        "503":
-          description: logout_unavailable
-
-  /v1/context/session/introspect:
-    post:
-      summary: Session status for relying parties (AU-01)
-      operationId: sessionStatus
+        "200": { description: Replaced }
+    patch:
+      summary: Patch a user (add/replace/remove on active, userName, displayName, emails, groups, roles, title, userType, department)
+      operationId: scimPatchUser
       security: []
       description: |
-        POST {"token": "<envelope>"}. Answers whether the envelope's session is
-        still live: its session context exists and is not invalidated or
-        expired, its login session has not ended, and its principal is ACTIVE.
+        Applied to a copy, so a patch that fails changes nothing. `active:false` deprovisions: the principal is disabled
+        in the same transaction, live sessions are ended, and assignment revocation is queued and retried (revocations
+        never back off longer than a minute) until done. Past the mapping's deprovision SLO it is raised as an
+        incident. Re-enabling waits until an earlier deprovisioning has finished.
       responses:
-        "200":
-          description: "{active, reason, session_context_id, sid, invalidated_at}"
-        "400":
-          description: token is required
-        "503":
-          description: session_status_unavailable
+        "200": { description: Patched }
+        "400": { description: Unsupported path or operation }
+        "409": { description: Concurrent change, or the earlier deprovisioning is still in progress }
+    delete:
+      summary: Deprovision a user (the principal is disabled; nothing is erased)
+      operationId: scimDeleteUser
+      security: []
+      responses:
+        "204": { description: Deprovisioned }
+        "404": { description: No such user }
 
   /health:
     get:

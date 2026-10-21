@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
 	svcenvelope "zoiko.io/financial-close-svc/internal/envelope"
 
 	"go.uber.org/zap"
@@ -433,9 +435,17 @@ type tbCompileRequest struct {
 	FiscalPeriod  string `json:"fiscal_period"`
 }
 
+// NetBalance is a decimal string on the wire (general-ledger-svc fixed a
+// ZS-DATA-001 D06 violation: NUMERIC(18,2) was previously round-tripped
+// through a Go float64). Parsed to float64 immediately below, at the one
+// place this service's existing map[string]float64 contract meets GL's
+// wire format, rather than threading a wire-format change through every
+// caller of CompileTrialBalance — those callers have their own float64
+// domain types (e.g. domain.AllocationRun.SourceAmount) that are a
+// separate, pre-existing D06 gap, out of scope here.
 type tbLine struct {
-	AccountCode string  `json:"account_code"`
-	NetBalance  float64 `json:"net_balance"`
+	AccountCode string `json:"account_code"`
+	NetBalance  string `json:"net_balance"`
 }
 
 type tbSnapshot struct {
@@ -457,6 +467,60 @@ type tbSnapshot struct {
 // close-svc" system identity anywhere on this platform to invent — the
 // principal already driving this close is the real caller.
 func (c *Clients) CompileTrialBalance(ctx context.Context, tenantID, legalEntityID, fiscalPeriod, principalID string) (map[string]float64, error) {
+	snap, err := c.compileTrialBalance(ctx, tenantID, legalEntityID, fiscalPeriod, principalID)
+	if err != nil {
+		return nil, err
+	}
+	balances := make(map[string]float64, len(snap.Lines))
+	for _, l := range snap.Lines {
+		bal, err := strconv.ParseFloat(l.NetBalance, 64)
+		if err != nil {
+			return nil, fmt.Errorf("account %s: net_balance %q is not a decimal number: %w", l.AccountCode, l.NetBalance, err)
+		}
+		balances[l.AccountCode] = bal
+	}
+	return balances, nil
+}
+
+// TrialBalanceForSnapshot is CompileTrialBalanceDecimal's result: the exact
+// decimal lines, never converted through float64, plus the two identifiers
+// ACC-16 records as evidence of what a snapshot was built from.
+type TrialBalanceForSnapshot struct {
+	TrialBalanceSnapshotID string
+	LedgerWatermark        int64
+	// Lines maps account_code -> net_balance as an exact decimal string
+	// (ZS-DATA-001 D06).
+	Lines map[string]string
+}
+
+// CompileTrialBalanceDecimal is CompileTrialBalance's sibling for callers
+// that need the exact decimal balances, not a float64 approximation --
+// REP-01's ACC-16 snapshot-from-trial-balance command (see
+// CreateFinancialSnapshotFromTrialBalance) is the one caller today. Kept as
+// a separate method rather than changing CompileTrialBalance's own return
+// type, so the three existing float64 callers (subledger control matching,
+// allocation runs) are untouched.
+func (c *Clients) CompileTrialBalanceDecimal(ctx context.Context, tenantID, legalEntityID, fiscalPeriod, principalID string) (*TrialBalanceForSnapshot, error) {
+	snap, err := c.compileTrialBalance(ctx, tenantID, legalEntityID, fiscalPeriod, principalID)
+	if err != nil {
+		return nil, err
+	}
+	lines := make(map[string]string, len(snap.Lines))
+	for _, l := range snap.Lines {
+		lines[l.AccountCode] = l.NetBalance
+	}
+	return &TrialBalanceForSnapshot{
+		TrialBalanceSnapshotID: snap.TrialBalanceSnapshotID,
+		LedgerWatermark:        snap.LedgerWatermark,
+		Lines:                  lines,
+	}, nil
+}
+
+// compileTrialBalance is the shared HTTP call both public methods above
+// wrap: ask general-ledger-svc's ACC-15 endpoint to compile the period and
+// decode its answer, without picking a representation for the balances —
+// that choice belongs to the caller-facing method, not here.
+func (c *Clients) compileTrialBalance(ctx context.Context, tenantID, legalEntityID, fiscalPeriod, principalID string) (*tbSnapshot, error) {
 	body, err := json.Marshal(tbCompileRequest{LegalEntityID: legalEntityID, FiscalPeriod: fiscalPeriod})
 	if err != nil {
 		return nil, err
@@ -468,6 +532,45 @@ func (c *Clients) CompileTrialBalance(ctx context.Context, tenantID, legalEntity
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Tenant-Id", tenantID)
 	req.Header.Set("X-Principal-Id", principalID)
+	req.Header.Set("X-Legal-Entity-Id", legalEntityID)
+
+	// Forward canonical envelope headers so general-ledger-svc's envelope
+	// middleware (write-strict mode) accepts this write request. Mirrors
+	// the pattern in checkAllowedLive.
+	ledgerRequestID := middleware.GetReqID(ctx)
+	ledgerSourceChannel := "system"
+	ledgerCorrelationID := ""
+	if env, ok := svcenvelope.FromContext(ctx); ok {
+		if env.TenantID != "" {
+			req.Header.Set("X-Tenant-Id", env.TenantID)
+		}
+		if env.RequestID != "" {
+			ledgerRequestID = env.RequestID
+		}
+		if env.SourceChannel != "" {
+			ledgerSourceChannel = string(env.SourceChannel)
+		}
+		if env.CorrelationID != "" {
+			ledgerCorrelationID = env.CorrelationID
+		}
+		if env.CausationID != "" {
+			req.Header.Set("X-Causation-Id", env.CausationID)
+		}
+	}
+	// If no request ID from middleware or envelope, generate one for traceability.
+	if ledgerRequestID == "" {
+		ledgerRequestID = uuid.NewString()
+	}
+	req.Header.Set("X-Request-Id", ledgerRequestID)
+	req.Header.Set("X-Source-Channel", ledgerSourceChannel)
+	// If no correlation ID from envelope, generate one for end-to-end traceability.
+	if ledgerCorrelationID == "" {
+		ledgerCorrelationID = uuid.NewString()
+	}
+	req.Header.Set("X-Correlation-ID", ledgerCorrelationID)
+
+	// Idempotency key for general-ledger-svc's material write endpoint.
+	req.Header.Set("Idempotency-Key", ledgerRequestID+":compile-trial-balance:"+fiscalPeriod)
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -486,12 +589,7 @@ func (c *Clients) CompileTrialBalance(ctx context.Context, tenantID, legalEntity
 	if err := json.NewDecoder(resp.Body).Decode(&snap); err != nil {
 		return nil, err
 	}
-
-	balances := make(map[string]float64, len(snap.Lines))
-	for _, l := range snap.Lines {
-		balances[l.AccountCode] = l.NetBalance
-	}
-	return balances, nil
+	return &snap, nil
 }
 
 // glAccountMapping mirrors general-ledger-svc's ACC-02
@@ -736,6 +834,51 @@ func (c *Clients) GetAccountStatus(ctx context.Context, tenantID, principalID, a
 		return "", err
 	}
 	return a.Status, nil
+}
+
+// ChartOfAccountsEntry mirrors general-ledger-svc's ACC-01 domain.Account
+// wire shape — only the fields a caller needs to classify a trial-balance
+// line onto a statement.
+type ChartOfAccountsEntry struct {
+	AccountCode string `json:"account_code"`
+	AccountName string `json:"account_name"`
+	// AccountType is one of ASSET/LIABILITY/EQUITY/REVENUE/EXPENSE -- the
+	// same five-value vocabulary general-ledger-svc's chart of accounts and
+	// financial-statements-svc's SnapshotContent both use; this client does
+	// not translate between two different category vocabularies because
+	// there is only ever the one.
+	AccountType string `json:"account_type"`
+}
+
+// ListChartOfAccounts reads the WHOLE chart in one call — ACC-16's own
+// snapshot-from-trial-balance command needs every account's category to
+// classify a trial balance's lines, and the chart is tenant-wide reference
+// data (not entity- or period-scoped), so one list serves every entity and
+// period a tenant ever compiles.
+func (c *Clients) ListChartOfAccounts(ctx context.Context, tenantID, principalID string) ([]ChartOfAccountsEntry, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.ledgerURL+"/v1/chart-of-accounts", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("X-Tenant-Id", tenantID)
+	req.Header.Set("X-Principal-Id", principalID)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		c.log.Error("failed to list chart of accounts via general-ledger-svc", zap.Error(err))
+		return nil, domain.ErrGLServiceUnavailable
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		c.log.Error("general-ledger-svc refused to list the chart of accounts", zap.Int("status", resp.StatusCode))
+		return nil, domain.ErrGLServiceUnavailable
+	}
+	var accounts []ChartOfAccountsEntry
+	if err := json.NewDecoder(resp.Body).Decode(&accounts); err != nil {
+		return nil, err
+	}
+	return accounts, nil
 }
 
 // PostAllocationJournal posts ONE balanced journal crediting the

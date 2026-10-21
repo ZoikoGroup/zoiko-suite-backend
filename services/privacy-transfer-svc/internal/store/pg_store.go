@@ -404,12 +404,15 @@ func (s *PgStore) RecordDecision(ctx context.Context, tenantID string, d *domain
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx, `
 			INSERT INTO transfer_decisions (decision_id, tenant_id, relationship_id, transfer_mechanism_id, destination_jurisdiction,
-				assessment_id, result, reason_codes, actor_principal_id, correlation_id, conditions, expires_at, decided_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW())
+				assessment_id, result, reason_codes, actor_principal_id, correlation_id, conditions, expires_at,
+				exporter_role, importer_role, origin_jurisdiction, route_provider, frequency_volume_class, decided_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, NOW())
 			RETURNING decided_at`,
 			d.DecisionID, strPtrOrNil(tenantID), d.RelationshipID, d.TransferMechanismID, strPtrOrNil(d.DestinationJurisdiction),
 			d.AssessmentID, d.Result, reasonRaw, d.ActorPrincipalID, strPtrOrNil(d.CorrelationID),
 			strPtrOrNil(d.Conditions), d.ExpiresAt,
+			strPtrOrNil(d.ExporterRole), strPtrOrNil(d.ImporterRole), strPtrOrNil(d.OriginJurisdiction),
+			strPtrOrNil(d.RouteProvider), strPtrOrNil(d.FrequencyVolumeClass),
 		).Scan(&d.DecidedAt)
 	})
 	if err != nil {
@@ -427,10 +430,13 @@ func (s *PgStore) FindDecision(ctx context.Context, decisionID string) (*domain.
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx, `
 			SELECT decision_id, tenant_id, relationship_id, transfer_mechanism_id, destination_jurisdiction, assessment_id,
-				result, reason_codes, actor_principal_id, correlation_id, conditions, expires_at, decided_at
+				result, reason_codes, actor_principal_id, correlation_id, conditions, expires_at,
+				exporter_role, importer_role, origin_jurisdiction, route_provider, frequency_volume_class, decided_at
 			FROM transfer_decisions WHERE decision_id = $1`, decisionID,
 		).Scan(&d.DecisionID, &d.TenantID, &d.RelationshipID, &d.TransferMechanismID, &destJurisdiction, &d.AssessmentID,
-			&d.Result, &reasonRaw, &d.ActorPrincipalID, &correlationID, &conditions, &d.ExpiresAt, &d.DecidedAt)
+			&d.Result, &reasonRaw, &d.ActorPrincipalID, &correlationID, &conditions, &d.ExpiresAt,
+			&nullString{&d.ExporterRole}, &nullString{&d.ImporterRole}, &nullString{&d.OriginJurisdiction},
+			&nullString{&d.RouteProvider}, &nullString{&d.FrequencyVolumeClass}, &d.DecidedAt)
 	})
 	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		return nil, domain.ErrDecisionNotFound

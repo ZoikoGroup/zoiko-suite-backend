@@ -566,6 +566,9 @@ func main() {
 	relay := outbox.NewRelay(pgStore, publisher, domainMetrics, log)
 	go relay.Run(workerCtx)
 
+	// INT-04 outbound webhooks: API, fan-out consumer and dispatcher (off unless enabled).
+	wireWebhookOut(workerCtx, cfg, log, pool, pgStore, authzClient, r)
+
 	// ── 6a''. NCD delivery worker ─────────────────────────────────────────────
 	// Moves delivery jobs, reconciles stranded and UNKNOWN attempts, runs the
 	// regulated-notice clocks and evaluates reputation. Dispatch kicks it, so

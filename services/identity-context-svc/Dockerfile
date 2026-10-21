@@ -1,3 +1,8 @@
+# BUILD CONTEXT IS services/, NOT THIS DIRECTORY:
+#   docker build -f identity-context-svc/Dockerfile services/
+# go.mod replaces zoiko.io/eventing with ../eventing (the shared egress guard INT-10 fetches tenant IdP keys
+# through), and Docker can only COPY from inside the build context. Dockerfile.dockerignore next to this
+# file trims the context to the two directories the build reads.
 # ─── Stage 1: builder ─────────────────────────────────────────────────────────
 # BUILT FROM THE REPOSITORY ROOT:
 #
@@ -24,6 +29,7 @@ WORKDIR /src/services/identity-context-svc
 # if go.mod / go.sum are unchanged the module download layer is reused.
 COPY services/identity-context-svc/go.mod services/identity-context-svc/go.sum ./
 COPY services/identity-envelope/ /src/services/identity-envelope/
+COPY services/eventing/ /src/services/eventing/
 RUN go mod download
 
 # Copy the rest of the source.

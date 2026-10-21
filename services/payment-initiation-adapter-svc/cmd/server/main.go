@@ -16,6 +16,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/eventing/kafkaout"
+	"zoiko.io/eventing/integration"
 	"zoiko.io/eventing/outbox"
 	"zoiko.io/payment-initiation-adapter-svc/internal/authz"
 	"zoiko.io/payment-initiation-adapter-svc/internal/clients"
@@ -71,7 +72,22 @@ func main() {
 	treasuryClient := clients.NewTreasuryHTTPClient(cfg.TreasuryServiceURL)
 	authorizationClient := clients.NewAuthorizationHTTPClient(cfg.AuthorizationServiceURL)
 
-	h := handler.New(pgStore, authzClient, provider, treasuryClient, authorizationClient, logger)
+	h := handler.New(pgStore, authzClient, provider, treasuryClient, authorizationClient, logger).WithPayroll(clients.NewPayrollHTTPClient(cfg.PayrollRunServiceURL))
+
+	// Background work (the outbox relay, the in-flight sweeper) lives for the life of the process, not for
+	// the startup timeout above.
+	bg, stopBackground := context.WithCancel(context.Background())
+	defer stopBackground()
+
+	if cfg.Providers.Enabled {
+		engine, err := buildProviderEngine(cfg.Providers, pgStore)
+		if err != nil {
+			logger.Fatal("provider adapters misconfigured", zap.Error(err))
+		}
+		h = h.WithProviders(engine)
+		go runSweeper(bg, engine, cfg.Providers.SweepInterval, logger)
+		logger.Info("provider adapters enabled")
+	}
 
 	brokers := strings.Split(cfg.KafkaBrokers, ",")
 	writer, err := kafkaout.New(kafkaout.Config{Brokers: brokers, Topic: cfg.KafkaEventsTopic})
@@ -82,7 +98,15 @@ func main() {
 	if err != nil {
 		logger.Fatal("failed to create outbox relay", zap.Error(err))
 	}
-	go relay.Run(ctx)
+	// INT-CTRL-005 / INT-NP-006: with SCHEMA_REGISTRY_URL set, an event that breaks its registered contract is
+	// quarantined before publish, and a registry that cannot answer holds events instead of publishing them unchecked.
+	if gate, gerr := integration.GateFromEnv("payment-initiation-adapter-svc"); gerr != nil {
+		logger.Fatal("schema gate", zap.Error(gerr))
+	} else if gate != nil {
+		relay.SetGate(gate)
+		logger.Info("producer schema gate enabled")
+	}
+	go relay.Run(bg)
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)

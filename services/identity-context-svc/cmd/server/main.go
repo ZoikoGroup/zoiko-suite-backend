@@ -643,6 +643,8 @@ func main() {
 		WithStatusChanger(statusChanger{svc: lifecycleSvc})
 	provider.RegisterRoutes(r)
 	identityctx.RegisterRoutes(r, h)
+	rootHandler, stopFederation := mountFederation(r, config.LoadFederation(), config.LoadProvisioning(), cfg, principalRepo, idpIssuer, authzClient, siemClient, sessionEvictor{cache: sessionCache}, log)
+	defer stopFederation()
 
 	// Expired codes, revoked-jti rows and dead refresh families are only ever
 	// read to refuse them, so they are purged rather than kept.
@@ -679,7 +681,7 @@ func main() {
 	// ── Server ────────────────────────────────────────────────────────────
 	srv := &http.Server{
 		Addr:         fmt.Sprintf(":%d", cfg.Port),
-		Handler:      r,
+		Handler:      rootHandler,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 15 * time.Second,
 		IdleTimeout:  60 * time.Second,

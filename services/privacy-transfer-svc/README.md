@@ -17,10 +17,13 @@
 4. **Transfer Impact Assessments (§16.1, §17):** Records append-only TIA/DPIA evaluation evidence with reviewer identity, residual risk, review triggers (`review_trigger_at`), and structured assessment measures (`government_access_risk`, `technical_measures`, `organizational_measures`).
 5. **Runtime Transfer Evaluation (§16.1, §17.2):** Evaluates proposed personal data transfers, enforcing fail-closed doctrine:
    - Processor relationship must exist and be `ACTIVE` (`PRV-015: PROCESSOR_RELATIONSHIP_NOT_ACTIVE` if inactive).
+   - The controller's processing instructions must be present (`PRV-017: PROCESSOR_INSTRUCTION_MISSING` if absent).
+   - Every attached subprocessor must carry a §16.1 notification/approval model (`PRV-018: SUBPROCESSOR_NOT_APPROVED` otherwise — an unapproved downstream subprocessor blocks the transfer).
    - Governed mechanism must exist and be valid as of execution time (`PRV-015: TRANSFER_MECHANISM_INVALID_OR_EXPIRED` if expired).
    - If assessment is required, the latest assessment on file must be approved and not expired (`PRV-015: ASSESSMENT_REJECTED`, `PRV-016: ASSESSMENT_REQUIRED_NOT_FOUND`, `PRV-016: ASSESSMENT_EXPIRED`).
    - Any dependency lookup failure fails closed to `REVIEW_REQUIRED` (`PRV-019: PRIVACY_CONTEXT_INDETERMINATE`).
-6. **Integration with PRV-03:** Serves as the authoritative transfer control plane queried by `privacy-decision-svc` during step 4 of runtime data operation evaluation.
+6. **Transfer Context (§16.1):** The transfer evaluation records the caller-declared `exporter_role`, `importer_role`, `origin_jurisdiction`, `destination_jurisdiction`, `route_provider` and `frequency_volume_class` as part of the append-only authorization evidence. These are **data only** — the spec names no taxonomy for them, so they are recorded verbatim and are optional on the wire (making them mandatory would break the existing workbench client). `data_categories`, `subject_classes` and the relationship's `purpose_activity_refs` complete §16.1's TransferContext field list.
+7. **Integration with PRV-03:** Serves as the authoritative transfer control plane queried by `privacy-decision-svc` during step 4 of runtime data operation evaluation.
 
 ---
 
@@ -73,6 +76,37 @@ All mutating APIs enforce the `Idempotency-Key` header:
 - Retried execution with the same key and identical payload replays the cached response with `Idempotency-Replay: true`.
 - Retried execution with the same key but conflicting payload returns HTTP 409 Conflict with `PRV-020: IMMUTABLE_EVIDENCE_CONFLICT`.
 
+### 4. §18.1 Concurrency (version/etag) — architecture clarification
+
+§18.1 states that "conditional updates use version/etag to prevent lost updates to draft/admin state." PRV-05 has no draft/admin lifecycle analogous to PRV-01's processing-activity `DRAFT`/`APPROVED` workflow: relationships, subprocessors, mechanisms, assessments and decisions are append-only evidence enforced at the PostgreSQL level (immutability triggers above), so an `UPDATE`/`DELETE` can never overwrite a prior record. The only mutable field anywhere in the service is a relationship's two-value `status` enum (`ACTIVE`/`INACTIVE`), whose transitions are idempotent set-operations rather than read-modify-write deltas. No lost-update-able draft/admin state exists here, and requiring `If-Match` on the status route would break the existing workbench client (which sends no validator). This is therefore recorded as an **architecture clarification**, not implemented as an invented concurrency mechanism.
+
+---
+
+## Event Contracts (§19)
+
+PRV-05 emits exactly the three §19 events it owns, and no others:
+
+| Event | §19 minimum payload | Emitted when | §19 required consumers |
+|---|---|---|---|
+| `privacy.processor.changed` | processor/subprocessor, activity scope, state, effective time | relationship created, relationship status changed, subprocessor attached | XIC, procurement/vendor systems, domain owners |
+| `privacy.transfer.authorization_changed` | authorization, route/provider scope, state, conditions, expiry | a transfer decision is evaluated (published only after the decision is durably recorded) | GTRM, XIC, data export services |
+| `privacy.assessment.expiring` | assessment, scope, expiry/review trigger | an assessment is recorded **with** a `review_trigger_at` (§17.1's expiry/review trigger). PRV-05 has no scheduler, so the event announces the trigger date for consumer-side expiry tracking | WFC/privacy owner; never silently renew |
+
+Per §19.1, events communicate already-committed state. The service previously emitted two non-spec names (`privacy.processor_relationship.created`, `privacy.transfer_decision.evaluated`); both had no consumers anywhere in this repository — the sole downstream, `privacy-decision-svc`, integrates over HTTP rather than Kafka — and were not in the §19 catalogue, so they are superseded rather than emitted alongside undeclared events.
+
+### Mandatory request headers (§18.1)
+
+Every request is tenant-scoped by the verified `X-Tenant-Id` header — a missing, empty or whitespace-only value is refused with `401` before any business logic (a request is never defaulted to the platform tenant). Every mutating route additionally requires:
+
+| Header | Missing / blank | Purpose |
+|---|---|---|
+| `X-Tenant-Id` | `401 Unauthorized` | Tenant-scope carrier, enforced for all routes except `/healthz` and `/readyz`. |
+| `X-Principal-Id` | `401 Unauthorized` | Verified actor; also forwarded to `authorization-svc`. |
+| `X-Correlation-ID` | `400 Bad Request` | §18.1 correlation ID; echoed into emitted events. |
+| `Idempotency-Key` (or `X-Idempotency-Key`) | `400 Bad Request` | §18.1 idempotency key (see §18.1 Idempotency Key Handling above). |
+
+These checks run after authentication and authorization, and before any idempotency lookup, database mutation, state change or event publication.
+
 ---
 
 ## API Surface
@@ -91,17 +125,19 @@ Both canonical `/privacy/...` and versioned `/v1/privacy/...` routes are mounted
 | `GET` | `/privacy/transfer-mechanisms/{id}` | Get transfer mechanism by ID | Tenant verified |
 | `POST` | `/privacy/transfer-assessments` | Record TIA/DPIA assessment review | `PRIVACY_TRANSFER_ASSESSMENT_RECORD` |
 | `GET` | `/privacy/transfer-assessments?relationship_id=...` | Get latest assessment for relationship | Tenant verified |
-| `POST` | `/privacy/transfer-decisions` | Evaluate cross-border transfer authorization | Tenant verified (`X-Principal-Id`) |
+| `POST` | `/privacy/transfer-assessments/evaluate-triggers` | Evaluate all 8 mandatory §17.1 reassessment triggers | Tenant verified |
+| `GET` | `/privacy/transfer-assessments/triggers?relationship_id=...` | Same §17.1 trigger evaluation, via GET | Tenant verified |
+| `POST` | `/privacy/transfer-decisions` | Evaluate cross-border transfer authorization | `PRIVACY_TRANSFER_DECISION_EVALUATE` |
 | `GET` | `/privacy/transfer-decisions/{id}` | Lookup transfer decision by ID | Tenant verified |
 
 ---
 
 ## §32 Stable Error & Reason Code Contract
 
-- `PRV-015: TRANSFER_NOT_AUTHORIZED` — Transfer blocked due to inactive relationship, expired mechanism, or rejected assessment.
+- `PRV-015: TRANSFER_NOT_AUTHORIZED` — Transfer blocked due to inactive relationship, expired/absent mechanism, or rejected assessment. The service emits the stable §32 code carrying the specific symbol as the conventional `code: SYMBOL` pair (e.g. `PRV-015: PROCESSOR_RELATIONSHIP_NOT_ACTIVE`, `PRV-015: TRANSFER_MECHANISM_NOT_FOUND`, `PRV-015: TRANSFER_MECHANISM_INVALID_OR_EXPIRED`, `PRV-015: ASSESSMENT_REJECTED`), so a consumer matching the `PRV-015` prefix remains correct.
 - `PRV-016: ASSESSMENT_REQUIRED` — Assessment missing, expired, or requires remediation.
 - `PRV-017: PROCESSOR_INSTRUCTION_MISSING` — Processing instructions missing on relationship.
-- `PRV-018: SUBPROCESSOR_NOT_APPROVED` — Subprocessor unauthorized or unapproved.
+- `PRV-018: SUBPROCESSOR_NOT_APPROVED` — An attached subprocessor carries no §16.1 notification/approval model on file (unapproved downstream subprocessor).
 - `PRV-019: PRIVACY_CONTEXT_INDETERMINATE` — Upstream service or store dependency unavailable.
 - `PRV-020: IMMUTABLE_EVIDENCE_CONFLICT` — Idempotency key replayed with mismatched payload.
 

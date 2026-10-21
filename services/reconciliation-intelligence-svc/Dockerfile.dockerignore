@@ -1,0 +1,6 @@
+# Build context is services/ (see Dockerfile). Send only what the build reads.
+*
+!reconciliation-intelligence-svc
+!eventing
+reconciliation-intelligence-svc/deployments
+**/*_test.go

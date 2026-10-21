@@ -4,10 +4,13 @@
 *
 !services/notification-svc/
 !services/identity-envelope/
+!services/eventing/
 
 # Not needed inside the image.
 services/notification-svc/.gotmp/
 services/notification-svc/**/*.exe
 services/notification-svc/**/*_test.go
 services/notification-svc/deployments/
+services/notification-svc/scripts/
 services/identity-envelope/**/*_test.go
+services/eventing/**/*_test.go

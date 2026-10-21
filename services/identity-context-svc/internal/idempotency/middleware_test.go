@@ -371,3 +371,14 @@ func TestEmptyBodyStillCompletes(t *testing.T) {
 	assert.Equal(t, http.StatusNoContent, w.Code)
 	assert.Equal(t, "true", w.Header().Get(headerReplayed))
 }
+
+// Federated login, like the password login, mints a bearer credential;
+// recording its response would put a working credential into a table with a
+// retention period.
+func TestFederatedLoginIsNeverRecordedForReplay(t *testing.T) {
+	for _, p := range []string{"/v1/authenticate", "/v1/authenticate/federated", "/v1/context/resolve"} {
+		if !exemptPaths[p] {
+			t.Errorf("%s must be exempt from replay recording", p)
+		}
+	}
+}

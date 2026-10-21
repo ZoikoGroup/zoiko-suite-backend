@@ -3,6 +3,7 @@ package handler_test
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -27,11 +28,17 @@ func newMockAuthzServer(t *testing.T) *httptest.Server {
 }
 
 func newRouter(t *testing.T) http.Handler {
+	return newRouterWithThreshold(t, 95)
+}
+
+// newRouterWithThreshold wires the handler with an explicit acceptance
+// threshold (SPEC_DEVIATIONS A11).
+func newRouterWithThreshold(t *testing.T, threshold float64) http.Handler {
 	logger := zap.NewNop()
 	s := store.NewMemoryStore()
 	authzSrv := newMockAuthzServer(t)
 	a := authz.NewClient(authzSrv.URL, logger)
-	h := handler.NewHandler(s, a, logger)
+	h := handler.NewHandler(s, a, logger, threshold)
 	return handler.NewRouter(h)
 }
 
@@ -63,7 +70,7 @@ func TestValidateMigrationAndLifecycle(t *testing.T) {
 		TargetService:  "ledger-svc",
 		RequiredFields: []string{"employee_id", "amount", "cost_centre"},
 		Records: []domain.MigrationRecord{
-			// Valid record
+			// Duplicate ref (with the third record below — both copies are violations)
 			{Ref: "REC-001", Fields: map[string]string{"employee_id": "EMP-1", "amount": "5000.00", "cost_centre": "CC-100"}},
 			// Missing required field: cost_centre
 			{Ref: "REC-002", Fields: map[string]string{"employee_id": "EMP-2", "amount": "3000.00"}},
@@ -71,6 +78,8 @@ func TestValidateMigrationAndLifecycle(t *testing.T) {
 			{Ref: "REC-001", Fields: map[string]string{"employee_id": "EMP-3", "amount": "1500.00", "cost_centre": "CC-101"}},
 			// Bad numeric format
 			{Ref: "REC-003", Fields: map[string]string{"employee_id": "EMP-4", "amount": "N/A", "cost_centre": "CC-102"}},
+			// Valid record
+			{Ref: "REC-004", Fields: map[string]string{"employee_id": "EMP-5", "amount": "250.00", "cost_centre": "CC-103"}},
 		},
 	}
 
@@ -95,17 +104,18 @@ func TestValidateMigrationAndLifecycle(t *testing.T) {
 	if job.ID == "" {
 		t.Fatal("expected non-empty job ID")
 	}
-	if job.TotalRecordsCount != 4 {
-		t.Fatalf("expected 4 total records, got %d", job.TotalRecordsCount)
+	if job.TotalRecordsCount != 5 {
+		t.Fatalf("expected 5 total records, got %d", job.TotalRecordsCount)
 	}
-	if job.InvalidRecordsCount == 0 {
-		t.Fatal("expected some invalid records due to violations")
+	// Both REC-001 copies, REC-002 (missing field) and REC-003 (bad number) fail; only REC-004 is valid.
+	if job.InvalidRecordsCount != 4 || job.ValidRecordsCount != 1 {
+		t.Fatalf("expected 4 invalid / 1 valid records, got %d / %d", job.InvalidRecordsCount, job.ValidRecordsCount)
 	}
-	if job.IntegrityScore <= 0 || job.IntegrityScore > 100 {
-		t.Fatalf("expected integrity score in (0,100], got %f", job.IntegrityScore)
+	if job.IntegrityScore != 20 {
+		t.Fatalf("expected integrity score 20, got %f", job.IntegrityScore)
 	}
-	if len(job.IntegrityChecks) != 3 {
-		t.Fatalf("expected 3 integrity checks (schema, dup, format), got %d", len(job.IntegrityChecks))
+	if len(job.IntegrityChecks) != 4 {
+		t.Fatalf("expected 4 integrity checks (schema, identity, dup, format), got %d", len(job.IntegrityChecks))
 	}
 	if len(job.AuditEntries) == 0 {
 		t.Fatal("expected audit entries for violations")
@@ -136,10 +146,13 @@ func TestValidateMigrationAndLifecycle(t *testing.T) {
 		t.Fatal("expected at least 1 job in list")
 	}
 
-	// 4. Remediate an Audit Entry
+	// 4. Remediate an Audit Entry — with the required evidence
 	if len(job.AuditEntries) > 0 {
 		entryID := job.AuditEntries[0].ID
-		remBody, _ := json.Marshal(domain.RemediateRequest{Notes: "Corrected in source system"})
+		remBody, _ := json.Marshal(domain.RemediateRequest{
+			RemediationReason:      "corrected in source system before reload",
+			RemediationEvidenceRef: "extract-run-2026-10-17/rec-002",
+		})
 		remReq := httptest.NewRequest(http.MethodPost, "/v1/migrations/"+job.ID+"/audit/"+entryID+"/remediate", bytes.NewBuffer(remBody))
 		withEnvelope(remReq)
 		remReq.Header.Set("X-Tenant-ID", "tenant-mig-55")
@@ -154,6 +167,18 @@ func TestValidateMigrationAndLifecycle(t *testing.T) {
 		_ = json.Unmarshal(remRec.Body.Bytes(), &remEntry)
 		if !remEntry.IsRemediated {
 			t.Fatal("expected is_remediated = true after remediation")
+		}
+		if remEntry.RemediationReason != "corrected in source system before reload" {
+			t.Fatalf("expected remediation_reason echoed, got %q", remEntry.RemediationReason)
+		}
+		if remEntry.RemediationEvidenceRef != "extract-run-2026-10-17/rec-002" {
+			t.Fatalf("expected remediation_evidence_ref echoed, got %q", remEntry.RemediationEvidenceRef)
+		}
+		if remEntry.RemediatedBy != "user-1" {
+			t.Fatalf("expected remediated_by = user-1, got %q", remEntry.RemediatedBy)
+		}
+		if remEntry.RemediatedAt == nil {
+			t.Fatal("expected remediated_at to be set")
 		}
 	}
 
@@ -211,6 +236,55 @@ func TestValidateMigrationCleanData(t *testing.T) {
 	}
 }
 
+func TestValidateMigrationEmptyRefReportedAsMissingIdentity(t *testing.T) {
+	router := newRouter(t)
+
+	validateReq := domain.ValidateMigrationRequest{
+		LegalEntityID:  "LE-5007",
+		MigrationName:  "Unidentified records",
+		SourceSystem:   "LEGACY_ERP",
+		TargetService:  "ledger-svc",
+		RequiredFields: []string{"amount"},
+		Records: []domain.MigrationRecord{
+			{Ref: "", Fields: map[string]string{"amount": "10.00"}},
+			{Ref: "  ", Fields: map[string]string{"amount": "20.00"}},
+			{Ref: "REC-900", Fields: map[string]string{"amount": "30.00"}},
+		},
+	}
+	body, _ := json.Marshal(validateReq)
+	req := httptest.NewRequest(http.MethodPost, "/v1/migrations/validate", bytes.NewBuffer(body))
+	withEnvelope(req)
+	req.Header.Set("X-Tenant-ID", "tenant-mig-55")
+	req.Header.Set("X-Principal-Id", "user-1")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var job domain.MigrationJob
+	_ = json.Unmarshal(rec.Body.Bytes(), &job)
+	if job.InvalidRecordsCount != 2 || job.ValidRecordsCount != 1 {
+		t.Fatalf("expected 2 invalid / 1 valid, got %d / %d", job.InvalidRecordsCount, job.ValidRecordsCount)
+	}
+
+	var identity, dup int
+	for _, e := range job.AuditEntries {
+		switch e.ViolationType {
+		case domain.ViolationMissingSourceIdentity:
+			identity++
+		case domain.ViolationDuplicate:
+			dup++
+		}
+	}
+	if identity != 2 {
+		t.Fatalf("expected 2 MISSING_SOURCE_IDENTITY audit entries, got %d (%+v)", identity, job.AuditEntries)
+	}
+	if dup != 0 {
+		t.Fatalf("blank refs must not be reported as duplicates, got %d DUPLICATE entries", dup)
+	}
+}
+
 func TestValidationErrors(t *testing.T) {
 	router := newRouter(t)
 
@@ -225,5 +299,55 @@ func TestValidationErrors(t *testing.T) {
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 Bad Request, got %d", rec.Code)
+	}
+}
+
+// A 90%-scoring job is FAILED at a 95 bar and COMPLETED at 80; whichever bar
+// was applied is exposed on the job record (SPEC_DEVIATIONS A11).
+func TestValidateMigration_ThresholdDecidesStatus(t *testing.T) {
+	records := make([]domain.MigrationRecord, 0, 10)
+	for i := 0; i < 9; i++ {
+		records = append(records, domain.MigrationRecord{
+			Ref:    fmt.Sprintf("REC-%02d", i),
+			Fields: map[string]string{"amount": "1.00"},
+		})
+	}
+	records = append(records, domain.MigrationRecord{Ref: "REC-BAD", Fields: map[string]string{"amount": "N/A"}})
+
+	for _, tc := range []struct {
+		threshold  float64
+		wantStatus domain.JobStatus
+	}{
+		{95, domain.JobStatusFailed},
+		{80, domain.JobStatusCompleted},
+	} {
+		router := newRouterWithThreshold(t, tc.threshold)
+		body, _ := json.Marshal(domain.ValidateMigrationRequest{
+			LegalEntityID:  "LE-THRESHOLD",
+			MigrationName:  "threshold acceptance fixture",
+			SourceSystem:   "LEGACY_ERP",
+			TargetService:  "general-ledger-svc",
+			RequiredFields: []string{"amount"},
+			Records:        records,
+		})
+		req := httptest.NewRequest(http.MethodPost, "/v1/migrations/validate", bytes.NewBuffer(body))
+		withEnvelope(req)
+		req.Header.Set("X-Tenant-ID", "tenant-mig-threshold")
+		req.Header.Set("X-Principal-Id", "user-1")
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+		}
+		var job domain.MigrationJob
+		if err := json.Unmarshal(rec.Body.Bytes(), &job); err != nil {
+			t.Fatalf("decode job: %v", err)
+		}
+		if job.IntegrityScoreThreshold != tc.threshold {
+			t.Fatalf("expected the applied threshold %v on the job record, got %v", tc.threshold, job.IntegrityScoreThreshold)
+		}
+		if job.Status != tc.wantStatus {
+			t.Fatalf("score %.2f at threshold %v: expected %s, got %s", job.IntegrityScore, tc.threshold, tc.wantStatus, job.Status)
+		}
 	}
 }

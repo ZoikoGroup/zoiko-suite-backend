@@ -109,6 +109,34 @@ func TestLegacyTables_RLSIsolatesTenantsAsTheAppRole(t *testing.T) {
 	// Counters are written only when quotas are on, so count through a quota-enabled store.
 	must(t, send(store.New(app).WithQuota(quota.Limits{RecipientPerHour: 100}), tenantA, "corr-rls-quota-"+uuid.NewString(), "usr-quota", "T0"))
 
+	// INT-04 outbound webhooks and the shared consumer inbox (migration 000032), seeded as
+	// the app role under tenant A, which also exercises each policy's WITH CHECK.
+	subID, deliveryID := uuid.NewString(), uuid.NewString()
+	asTenant(t, app, tenantA, func(tx pgx.Tx) error {
+		for _, s := range []struct {
+			q    string
+			args []any
+		}{
+			{`INSERT INTO webhook_subscriptions (subscription_id, tenant_id, legal_entity_id, name, destination_url, event_types,
+				signing_key_path, destination_region, config_fingerprint, created_by, last_changed_by)
+				VALUES ($1, $2, 'le-1', 'rls', 'https://example.com/h', '{a.b}', 'kv/rls', 'uk', repeat('a', 64), 'maker', 'maker')`, []any{subID, tenantA}},
+			{`INSERT INTO webhook_subscription_log (tenant_id, subscription_id, kind, actor, version) VALUES ($1, $2, 'CREATED', 'maker', 1)`, []any{tenantA, subID}},
+			{`INSERT INTO webhook_deliveries (delivery_id, tenant_id, subscription_id, event_id, event_type, event_occurred_at, body, body_hash, scope_fingerprint)
+				VALUES ($1, $2, $3, 'e', 'a.b', now(), '{}', repeat('b', 64), 'x')`, []any{deliveryID, tenantA, subID}},
+			{`INSERT INTO webhook_delivery_attempts (tenant_id, delivery_id, subscription_id, attempt_no, payload_hash)
+				VALUES ($1, $2, $3, 1, repeat('b', 64))`, []any{tenantA, deliveryID, subID}},
+			{`INSERT INTO eventing_inbox (inbox_id, consumer, event_id, event_type, tenant_id, payload_hash)
+				VALUES ($1, 'rls', 'e', 'a.b', $2, 'h')`, []any{uuid.NewString(), tenantA}},
+			{`INSERT INTO eventing_repair_log (repair_id, target_kind, tenant_id, event_id, action, operator, approver, approval_ref, reason, prior_state)
+				VALUES ($1, 'inbox', $2, 'e', 'requeue', 'op', 'ap', 'ref', 'r', 'quarantined')`, []any{uuid.NewString(), tenantA}},
+		} {
+			if _, err := tx.Exec(ctx, s.q, s.args...); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+
 	// ── Every legacy tenant table, from the catalog ──────────────────────────
 	tables := legacyTenantTables(t, admin)
 	if len(tables) < 13 {

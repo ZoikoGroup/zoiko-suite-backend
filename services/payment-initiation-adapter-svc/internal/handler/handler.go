@@ -15,6 +15,7 @@ import (
 	"zoiko.io/payment-initiation-adapter-svc/internal/domain"
 	svcmiddleware "zoiko.io/payment-initiation-adapter-svc/internal/middleware"
 	"zoiko.io/payment-initiation-adapter-svc/internal/provideradapter"
+	"zoiko.io/payment-initiation-adapter-svc/internal/providers"
 	"zoiko.io/payment-initiation-adapter-svc/internal/store"
 )
 
@@ -40,7 +41,18 @@ type Handler struct {
 	provider      provideradapter.Client
 	treasury      clients.TreasuryClient
 	authorization clients.AuthorizationClient
-	log           *zap.Logger
+	// payroll verifies AuthorizationSourcePayroll attempts (WFP-07). Nil means that source is not
+	// accepted: it is refused, never trusted.
+	payroll clients.PayrollClient
+	// engine drives live provider adapters (INT-07). Nil means every attempt uses the legacy stub.
+	engine *providers.Engine
+	log     *zap.Logger
+}
+
+// WithPayroll enables the PAYROLL_RUN_SVC authorization source.
+func (h *Handler) WithPayroll(p clients.PayrollClient) *Handler {
+	h.payroll = p
+	return h
 }
 
 func New(st store.Store, az AuthzChecker, provider provideradapter.Client, treasury clients.TreasuryClient, authorization clients.AuthorizationClient, log *zap.Logger) *Handler {
@@ -48,6 +60,7 @@ func New(st store.Store, az AuthzChecker, provider provideradapter.Client, treas
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
+	RegisterProviderRoutes(r, h)
 	r.Route("/bnk06/attempts", func(r chi.Router) {
 		r.Post("/", h.PrepareAttempt)
 		r.Get("/{attemptID}", h.GetPaymentAttempt)
@@ -179,6 +192,24 @@ func (h *Handler) PrepareAttempt(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusServiceUnavailable, "treasury service unavailable")
 			return
 		}
+	case domain.AuthorizationSourcePayroll:
+		if h.payroll == nil {
+			writeError(w, http.StatusBadRequest, domain.ErrUnrecognizedAuthorizationSource.Error())
+			return
+		}
+		if req.AuthorizationFingerprint == "" || req.AuthorizationID == "" {
+			writeError(w, http.StatusBadRequest, domain.ErrAuthorizationFingerprintRequired.Error())
+			return
+		}
+		if err := h.payroll.VerifyInstructionFingerprint(r.Context(), verifiedTenant, req.AuthorizationID, req.AuthorizationFingerprint); err != nil {
+			if errors.Is(err, domain.ErrPayrollFingerprintMismatch) {
+				writeError(w, http.StatusUnprocessableEntity, domain.ErrPayrollFingerprintMismatch.Error())
+				return
+			}
+			h.log.Error("PrepareAttempt: payroll-run-svc instruction fingerprint verification failed — failing closed", zap.Error(err))
+			writeError(w, http.StatusServiceUnavailable, "payroll service unavailable")
+			return
+		}
 	case "":
 		// Exempted — no currently-integrated caller sends empty.
 	default:
@@ -199,6 +230,10 @@ func (h *Handler) PrepareAttempt(w http.ResponseWriter, r *http.Request) {
 		}
 		h.log.Error("PrepareAttempt: treasury-svc payer account verification failed — failing closed", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "treasury service unavailable")
+		return
+	}
+
+	if !h.checkProviderBinding(w, r, &req) {
 		return
 	}
 
@@ -304,6 +339,9 @@ func (h *Handler) SubmitAttempt(w http.ResponseWriter, r *http.Request) {
 	if !h.authorize(w, r, principalID, a.LegalEntityID, PaymentInitiate) {
 		return
 	}
+	if h.sendViaEngine(w, r, a, principalID) {
+		return
+	}
 
 	updated := h.submitToProvider(r.Context(), a, principalID)
 	writeJSON(w, http.StatusOK, updated)
@@ -361,6 +399,9 @@ func (h *Handler) RetrySameAttempt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !h.authorize(w, r, principalID, a.LegalEntityID, PaymentInitiate) {
+		return
+	}
+	if h.sendViaEngine(w, r, a, principalID) {
 		return
 	}
 

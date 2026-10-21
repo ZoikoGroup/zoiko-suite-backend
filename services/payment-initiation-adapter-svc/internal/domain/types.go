@@ -52,6 +52,10 @@ type AttemptStatus string
 
 const (
 	StatusPrepared                 AttemptStatus = "PREPARED"
+	// StatusSubmitting is the durable "the request is leaving" state (INT-07): set by compare-and-set before the
+	// network call, so a crash mid-call leaves a trace. It is never terminal and is never resolved by an
+	// operator action; a stale one is swept to PENDING_UNKNOWN.
+	StatusSubmitting AttemptStatus = "SUBMITTING"
 	StatusSubmitted                AttemptStatus = "SUBMITTED"
 	StatusPendingUnknown           AttemptStatus = "PENDING_UNKNOWN"
 	StatusRejectedBeforeSubmission AttemptStatus = "REJECTED_BEFORE_SUBMISSION"
@@ -83,6 +87,10 @@ const (
 const (
 	AuthorizationSourcePaymentAuthorization = "PAYMENT_AUTHORIZATION_SVC"
 	AuthorizationSourceTreasury             = "TREASURY_SVC"
+	// AuthorizationSourcePayroll is WFP-07: an approved payroll payment instruction in
+	// payroll-run-svc. PrepareAttempt re-fetches the instruction's approved fingerprint from
+	// payroll-run-svc and refuses a mismatch, the same live-refetch idiom as the other two.
+	AuthorizationSourcePayroll = "PAYROLL_RUN_SVC"
 )
 
 func CanSubmit(s AttemptStatus) bool                 { return s == StatusPrepared }
@@ -104,15 +112,15 @@ type PaymentInitiationAttempt struct {
 	// PrepareAttempt can independently re-fetch and compare it rather than
 	// trusting it as given — see AuthorizationSourcePaymentAuthorization's
 	// own doc comment.
-	AuthorizationID   string
-	AuthorizationSource string
-	PayerAccountRef          string
-	PayeeRef                 string
-	Amount                   float64
-	Currency                 string
-	ExecutionDate            time.Time
-	PaymentReference         string
-	PayerAccountVerified     bool
+	AuthorizationID      string
+	AuthorizationSource  string
+	PayerAccountRef      string
+	PayeeRef             string
+	Amount               float64
+	Currency             string
+	ExecutionDate        time.Time
+	PaymentReference     string
+	PayerAccountVerified bool
 
 	IdempotencyKey string
 
@@ -167,6 +175,12 @@ type PrepareAttemptRequest struct {
 	PaymentReference         string
 	PayerAccountVerified     bool
 	IdempotencyKey           string
+
+	// ProviderKey, Rail and ConnectorID bind the attempt to a certified provider profile, a rail (message
+	// version) and an approved connector (INT-05). An empty ProviderKey keeps the legacy stub path.
+	ProviderKey string
+	Rail        string
+	ConnectorID string
 }
 
 type ResolveAmbiguousRequest struct {
@@ -185,10 +199,10 @@ type sentinel string
 func (s sentinel) Error() string { return string(s) }
 
 const (
-	ErrAttemptNotFound            = sentinel("payment initiation attempt not found")
-	ErrInvalidTransition          = sentinel("invalid payment initiation attempt state transition")
-	ErrIdempotencyKeyRequired     = sentinel("idempotency_key is required")
-	ErrDuplicateIdempotencyKey    = sentinel("an attempt already exists for this idempotency key")
+	ErrAttemptNotFound         = sentinel("payment initiation attempt not found")
+	ErrInvalidTransition       = sentinel("invalid payment initiation attempt state transition")
+	ErrIdempotencyKeyRequired  = sentinel("idempotency_key is required")
+	ErrDuplicateIdempotencyKey = sentinel("an attempt already exists for this idempotency key")
 	// ErrUnresolvedAttemptExists is Invariant #16: a source_reference with
 	// an attempt in PREPARED/PENDING_UNKNOWN/SUBMITTED must not get a
 	// second one — the existing one has to resolve (get rejected or get
@@ -213,14 +227,17 @@ const (
 	// 11a's real fingerprint verification outcomes for an
 	// AuthorizationSourcePaymentAuthorization attempt — see
 	// clients/authorization.go.
-	ErrAuthorizationFingerprintRequired  = sentinel("authorization_fingerprint and authorization_id are required for this authorization_source")
-	ErrAuthorizationFingerprintMismatch  = sentinel("authorization_fingerprint does not match the live authorization record")
-	ErrAuthorizationServiceUnavailable   = sentinel("payment-authorization-svc unavailable")
+	ErrAuthorizationFingerprintRequired = sentinel("authorization_fingerprint and authorization_id are required for this authorization_source")
+	ErrAuthorizationFingerprintMismatch = sentinel("authorization_fingerprint does not match the live authorization record")
+	ErrAuthorizationServiceUnavailable  = sentinel("payment-authorization-svc unavailable")
 
 	// ErrTreasuryFingerprintMismatch/Unavailable are Wave 11b's fingerprint
 	// verification outcomes for an AuthorizationSourceTreasury attempt —
 	// see clients/treasury.go's VerifyTransferFingerprint.
 	ErrTreasuryFingerprintMismatch = sentinel("authorization_fingerprint does not match the live treasury transfer record")
+
+	// ErrPayrollFingerprintMismatch: the WFP-07 instruction is not APPROVED or its approved fingerprint differs.
+	ErrPayrollFingerprintMismatch = sentinel("authorization_fingerprint does not match the live approved payroll payment instruction")
 
 	// ErrUnrecognizedAuthorizationSource (Wave 11b): a non-empty
 	// authorization_source outside AuthorizationSourcePaymentAuthorization/

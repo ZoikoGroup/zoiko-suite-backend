@@ -38,7 +38,7 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	_, filename, _, _ := runtime.Caller(0)
 	base := filepath.Dir(filename)
 
-	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS leave_requests, leave_balances, leave_types, holidays CASCADE;`)
+	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS leave_requests, leave_balances, leave_types, holidays, wfp_time_leave_lines, wfp_time_leave_batches, wfp_outbox CASCADE;`)
 
 	// EVERY *.up.sql, BY GLOB, NOT A HARDCODED LIST. This named 000001 and 000002
 	// and the service has three: 000003_leave_policy_and_holidays was never

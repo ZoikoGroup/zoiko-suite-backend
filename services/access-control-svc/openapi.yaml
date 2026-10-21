@@ -1461,6 +1461,35 @@ paths:
         '503': { $ref: '#/components/responses/ProvisioningUnavailable' }
 
 
+  /v1/iam/federation/role-eligibility:
+    get:
+      tags: [governance]
+      summary: Whether a role may be the target of an identity-provider mapping (INT-10)
+      description: |
+        Identity federation maps directory attributes to roles, and must never be a way to privileged access. This
+        service owns the risk taxonomy, so it answers: a role is **eligible** only if it is ACTIVE and every action in
+        it is STANDARD risk. An action the taxonomy does not know counts as HIGH, so an unclassified role is not
+        eligible either. A taxonomy outage is 503, never "eligible".
+
+        The same rule is enforced where it matters: `POST /v1/iam/access-assignments/` with `origin: FEDERATION`
+        refuses (409 `federation_privileged_refused`) any request that would be HIGH or CRITICAL risk, or would need an
+        approver (including a self-request), and does not queue it for approval.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/WorkloadId'
+        - { name: role_definition_id, in: query, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: The answer.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FederationRoleEligibility' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '503': { $ref: '#/components/responses/ProvisioningUnavailable' }
+
   /healthz:
     get:
       tags: [operations]
@@ -1863,6 +1892,13 @@ components:
           format: date-time
           description: 'Optional end date (§9 "effective dates"). Must be after effective_from and in the future (400 invalid_effective_to).'
         justification: { type: string }
+        origin:
+          type: string
+          enum: [FEDERATION]
+          description: |
+            Names the automation that raised the request. FEDERATION (an identity-provider mapping, INT-10) is held to
+            baseline access: a request that would be HIGH or CRITICAL risk, or need any approver, is refused outright
+            with 409 `federation_privileged_refused` and nothing is queued. Omitted is an ordinary governed request.
         correlation_id: { type: string }
 
     AssignmentDecisionRequest:
@@ -2059,6 +2095,16 @@ components:
         effective_to: { type: string, format: date-time }
         justification: { type: string }
         correlation_id: { type: string }
+
+    FederationRoleEligibility:
+      type: object
+      required: [role_definition_id, eligible, risk_tier, reason]
+      properties:
+        role_definition_id: { type: string }
+        eligible: { type: boolean }
+        risk_tier: { type: string, description: 'The highest tier among the role''s actions; empty when the role is not active.' }
+        reason: { type: string }
+        drivers: { type: array, items: { type: string }, description: The actions that set a tier above STANDARD. }
 
     SubjectLink:
       type: object

@@ -45,6 +45,7 @@ import (
 	"zoiko.io/bank-reconciliation-svc/internal/mtls"
 	"zoiko.io/bank-reconciliation-svc/internal/store"
 	"zoiko.io/bank-reconciliation-svc/internal/telemetry"
+	"zoiko.io/eventing/inbox"
 	"zoiko.io/eventing/kafkaout"
 	"zoiko.io/eventing/outbox"
 )
@@ -125,6 +126,9 @@ func main() {
 	if err := outbox.VerifySchema(pingCtx, pool); err != nil {
 		log.Fatal("eventing outbox schema missing", zap.Error(err))
 	}
+	if err := inbox.VerifySchema(pingCtx, pool); err != nil {
+		log.Fatal("eventing inbox schema missing", zap.Error(err))
+	}
 
 	// ── 4. Store, outbox relay, jurisdiction validator ───────────────────────
 	pgStore := store.New(pool, log, store.WithEventRegion(cfg.EventResidencyRegion))
@@ -178,7 +182,12 @@ func main() {
 			log.Debug("evidence-conflict consumer kafka reader: " + fmt.Sprintf(msg, args...))
 		}),
 	})
-	conflictConsumer := events.NewConflictConsumer(log, pgStore)
+	conflictInbox, err := inbox.New(pgStore, events.ConsumerName, inbox.DefaultConfig())
+	if err != nil {
+		log.Fatal("evidence-conflict consumer: inbox", zap.Error(err))
+	}
+	conflictInbox.SetRegion(cfg.EventResidencyRegion)
+	conflictConsumer := events.NewConflictConsumer(log, pgStore, conflictInbox)
 	go conflictConsumer.Run(conflictConsumerCtx, conflictReader)
 
 	var authzClient *authz.HTTPClient

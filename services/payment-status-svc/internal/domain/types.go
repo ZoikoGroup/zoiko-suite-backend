@@ -163,7 +163,7 @@ type LinkStatementRequest struct {
 
 	// BNK-05 correlation fields — carried through to the conflict event so
 	// bank-reconciliation-svc can correlate without fuzzy matching.
-	StatementLineID   string `json:"statement_line_id,omitempty"`    // bank-reconciliation-svc statement_line_id
+	StatementLineID   string `json:"statement_line_id,omitempty"`   // bank-reconciliation-svc statement_line_id
 	ProviderRequestID string `json:"provider_request_id,omitempty"` // BNK-06 provider_request_id
 	BankRecStatus     string `json:"bank_rec_status,omitempty"`     // bank-rec status at time of link
 }

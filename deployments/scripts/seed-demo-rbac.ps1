@@ -1455,6 +1455,120 @@ foreach ($principal in @($PRINCIPAL_ID, $APPROVER_ID)) {
     }
 }
 
+# -- REP-01 financial-statements-svc maker-checker roles --------------------------
+#
+# Actions (copied from the Action* constants in
+# services/financial-statements-svc/internal/service/service.go -- re-grep
+# them before editing): FINANCIAL_STATEMENT_SET_CREATE, _VIEW, _REFRESH,
+# _VALIDATE, _REVIEW, _APPROVE, _CERTIFY, _PUBLISH.
+#
+# _REVIEW covers both SubmitForReview (maker side) and RequestChanges
+# (checker side) -- one action, like accounting-period-svc's
+# PERIOD_STATE_COMMAND above, because the service's own in-code Preparer()
+# check is the real control, not an RBAC split. The genuine SoD boundary the
+# service enforces is "the preparer may not also Approve or Certify their own
+# work" (ZS-SVC-H-001 4.1) -- that is a per-row identity comparison against
+# whoever created or last refreshed the set, never just "does this principal
+# hold the APPROVE/CERTIFY grant". The two roles below exist so a demo run
+# has two DISTINCT principals to prove that with, same purpose as REF05's
+# maker/checker pair.
+$REF01_ROLES = @(
+    @{
+        RoleId     = "88888888-8888-8888-8888-888888888883"
+        Code       = "REF01_STATEMENT_MAKER"
+        Name       = "REP-01 Statement Maker"
+        Principal  = $PRINCIPAL_ID
+        BundleCode = "REF01_MAKER"
+        Actions    = @(
+            "FINANCIAL_STATEMENT_SET_CREATE", "FINANCIAL_STATEMENT_SET_VIEW",
+            "FINANCIAL_STATEMENT_SET_REFRESH", "FINANCIAL_STATEMENT_SET_VALIDATE",
+            "FINANCIAL_STATEMENT_SET_REVIEW"
+        )
+    },
+    @{
+        RoleId     = "88888888-8888-8888-8888-888888888884"
+        Code       = "REF01_STATEMENT_CHECKER"
+        Name       = "REP-01 Statement Checker"
+        Principal  = $APPROVER_ID
+        BundleCode = "REF01_CHECKER"
+        Actions    = @(
+            "FINANCIAL_STATEMENT_SET_VIEW", "FINANCIAL_STATEMENT_SET_REVIEW",
+            "FINANCIAL_STATEMENT_SET_APPROVE", "FINANCIAL_STATEMENT_SET_CERTIFY",
+            "FINANCIAL_STATEMENT_SET_PUBLISH"
+        )
+    }
+)
+# Not RBAC-exclusive pairs (both are checked below only to confirm the two
+# demo principals are genuinely distinct grants, not to assert the platform
+# would refuse one principal holding both -- it would not; the service's own
+# Preparer() check is what actually refuses that, and is NOT exercised by
+# this seed script).
+$REF01_SOD_PAIRS = @(
+    @("FINANCIAL_STATEMENT_SET_CREATE", "FINANCIAL_STATEMENT_SET_APPROVE"),
+    @("FINANCIAL_STATEMENT_SET_CREATE", "FINANCIAL_STATEMENT_SET_CERTIFY")
+)
+
+foreach ($r in $REF01_ROLES) {
+    $roleMissing = @()
+    foreach ($action in $r.Actions) {
+        foreach ($scope in @($LEGAL_ENTITY, $PLATFORM_SCOPE)) {
+            $probe = Invoke-Authz -Path "/v1/authorize" -Body @{
+                principal_id = $r.Principal; legal_entity_id = $scope; action_type = $action
+            }
+            if ($probe.body.decision_outcome -ne "GRANTED") { $roleMissing += "$action@$scope" }
+        }
+    }
+    if ($roleMissing.Count -eq 0) {
+        Write-Host "$($r.Code): already granted to $($r.Principal)" -ForegroundColor Green
+        continue
+    }
+    Write-Host "$($r.Code): $($roleMissing.Count) grants missing" -ForegroundColor Yellow
+    Write-Host "role $($r.Code)" -NoNewline
+    try {
+        $role = Invoke-Authz -Path "/v1/admin/roles" -Body @{
+            role_id                 = $r.RoleId
+            tenant_id               = $TENANT_ID
+            role_code               = $r.Code
+            role_name               = $r.Name
+            role_scope_type         = "LEGAL_ENTITY"
+            created_by_principal_id = $PRINCIPAL_ID
+        }
+        Write-Host "  -> $($role.status)"
+    } catch {
+        Write-Host "  -> already exists, or could not be created; continuing to the bundle" -ForegroundColor DarkGray
+    }
+    $bundle = Invoke-Authz -Path "/v1/admin/roles/$($r.RoleId)/permission-bundles" -Body @{
+        bundle_code       = $r.BundleCode
+        permitted_actions = $r.Actions
+    }
+    Write-Host "bundle $($r.BundleCode)  -> $($bundle.status) [$($bundle.body.permitted_actions -join ', ')]"
+    Add-Ref05Assignment -PrincipalId $r.Principal -RoleId $r.RoleId -Scope $LEGAL_ENTITY -Label "legal entity"
+    Add-Ref05Assignment -PrincipalId $r.Principal -RoleId $r.RoleId -Scope $PLATFORM_SCOPE -Label "platform scope"
+}
+
+Write-Host "Verifying REP-01 maker-checker roles:" -ForegroundColor Cyan
+foreach ($r in $REF01_ROLES) {
+    foreach ($action in $r.Actions) {
+        foreach ($scope in @($LEGAL_ENTITY, $PLATFORM_SCOPE)) {
+            $probe = Invoke-Authz -Path "/v1/authorize" -Body @{
+                principal_id = $r.Principal; legal_entity_id = $scope; action_type = $action
+            }
+            if ($probe.body.decision_outcome -ne "GRANTED") { $failed += "$action ($($r.Code) on $scope)" }
+        }
+    }
+}
+foreach ($pair in $REF01_SOD_PAIRS) {
+    $makerHas = (Invoke-Authz -Path "/v1/authorize" -Body @{
+        principal_id = $PRINCIPAL_ID; legal_entity_id = $LEGAL_ENTITY; action_type = $pair[1]
+    }).body.decision_outcome -eq "GRANTED"
+    if ($makerHas) {
+        $failed += "$PRINCIPAL_ID (the REP-01 maker) unexpectedly holds the checker-only action $($pair[1])"
+        Write-Host "     maker unexpectedly holds $($pair[1])" -ForegroundColor Red
+    } else {
+        Write-Host ("     maker/checker split holds for {0}" -f $pair[1]) -ForegroundColor Green
+    }
+}
+
 if ($failed.Count -gt 0) {
     throw "Seed completed but these are still not GRANTED: $($failed -join ', '). The console's writes will be refused."
 }

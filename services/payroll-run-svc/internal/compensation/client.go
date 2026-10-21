@@ -147,3 +147,42 @@ func (c *Client) getStructureBreakdown(ctx context.Context, tenantID, principalI
 	}
 	return &b, nil
 }
+
+// Bonus is one bonus grant as compensation-svc reports it.
+type Bonus struct {
+	GrantID    string  `json:"grant_id"`
+	EmployeeID string  `json:"employee_id"`
+	BonusType  string  `json:"bonus_type"`
+	Amount     float64 `json:"amount"`
+	Currency   string  `json:"currency"`
+	GrantDate  string  `json:"grant_date"`
+	Status     string  `json:"status"`
+	ApprovedBy *string `json:"approved_by,omitempty"`
+}
+
+// ListApprovedBonuses returns the employee's APPROVED bonus grants. Any failure,
+// including an unreachable service, is an error: a payroll input population is
+// never built on a guess that an employee has no bonuses.
+func (c *Client) ListApprovedBonuses(ctx context.Context, tenantID, principalID, employeeID string) ([]Bonus, error) {
+	url := fmt.Sprintf("%s/v1/compensation/bonuses?employee_id=%s&status=APPROVED", c.baseURL, employeeID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("X-Tenant-Id", tenantID)
+	req.Header.Set("X-Principal-Id", principalID)
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("call compensation-svc: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("compensation-svc returned status %d for bonuses", resp.StatusCode)
+	}
+	var list []Bonus
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		return nil, fmt.Errorf("decode bonuses response: %w", err)
+	}
+	return list, nil
+}

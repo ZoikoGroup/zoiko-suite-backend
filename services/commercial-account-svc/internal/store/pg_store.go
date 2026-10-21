@@ -44,6 +44,7 @@ import (
 
 	"zoiko.io/commercial-account-svc/internal/domain"
 	svcmiddleware "zoiko.io/commercial-account-svc/internal/middleware"
+	"zoiko.io/commercial-account-svc/internal/outbox"
 )
 
 // isLiveSubscriptionConflict reports that the account already holds a live
@@ -208,7 +209,14 @@ func (s *PgStore) CreateCommercialAccount(ctx context.Context, a *domain.Commerc
 			a.ContactEmail, a.ContractReference, a.ProcessorCustomerRef, string(a.Status),
 			a.CreatedAt, now, a.CreatedByPrincipalID,
 		)
-		return err
+		if err != nil {
+			return err
+		}
+		tenantID := a.OrganizationID
+		return outbox.Insert(ctx, tx, outbox.Event{
+			AggregateType: "commercial_account", AggregateID: a.CommercialAccountID,
+			EventType: "commercial_account.created", Payload: a, TenantID: &tenantID,
+		})
 	})
 	if err != nil {
 		if isUniqueViolation(err) {
@@ -295,7 +303,14 @@ func (s *PgStore) CreateMembership(ctx context.Context, m *domain.Membership) er
 		`, m.MembershipID, m.PrincipalID, m.OrganizationID, m.WorkspaceID, m.LegalEntityID,
 			string(m.Status), m.EffectiveFrom, m.EffectiveTo, m.CreatedAt, m.CreatedByPrincipalID,
 		)
-		return err
+		if err != nil {
+			return err
+		}
+		tenantID := m.OrganizationID
+		return outbox.Insert(ctx, tx, outbox.Event{
+			AggregateType: "membership", AggregateID: m.MembershipID,
+			EventType: "membership.created", Payload: m, TenantID: &tenantID,
+		})
 	})
 	if err != nil {
 		return fmt.Errorf("insert membership: %w", err)
@@ -392,7 +407,14 @@ func (s *PgStore) DeactivateMembership(ctx context.Context, membershipID, organi
 			return err
 		}
 		affected = tag.RowsAffected()
-		return nil
+		if affected == 0 {
+			return nil
+		}
+		tenantID := organizationID
+		return outbox.Insert(ctx, tx, outbox.Event{
+			AggregateType: "membership", AggregateID: membershipID,
+			EventType: "membership.deactivated", Payload: map[string]string{"membership_id": membershipID}, TenantID: &tenantID,
+		})
 	})
 	if err != nil {
 		return fmt.Errorf("deactivate membership: %w", err)
