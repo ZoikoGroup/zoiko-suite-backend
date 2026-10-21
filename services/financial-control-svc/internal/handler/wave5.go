@@ -23,8 +23,10 @@ var uuidRe = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[
 // CertifyRun — POST /controls/v1/runs/{run_id}/certification (§26).
 // Body {"decision":"CERTIFY"|"REJECT","reason":"..."}; If-Match with the run's ETag
 // is mandatory so a decision is always taken on the state the certifier saw.
-// Authority is checked against the run's own legal entity, and the store refuses a
-// certifier who created or took part in the run (maker-checker).
+// Authority is checked against the run's own legal entity, live (never from the
+// decision cache), and that decision is recorded as the certification's authority
+// snapshot (Invariant 9). The store refuses a certifier who created or took part in
+// the run (maker-checker).
 func (h *Handler) CertifyRun(w http.ResponseWriter, r *http.Request) {
 	tenantID, principal, ok := h.caller(w, r)
 	if !ok {
@@ -52,10 +54,11 @@ func (h *Handler) CertifyRun(w http.ResponseWriter, r *http.Request) {
 		h.writeErr(w, "certify run", err)
 		return
 	}
-	if !h.authorize(w, r, principal, run.LegalEntityID, ActionCertify) {
+	authority, ok := h.authorizeWithAuthority(w, r, principal, run.LegalEntityID, ActionCertify)
+	if !ok {
 		return
 	}
-	out, err := h.store.CertifyRun(r.Context(), tenantID, runID, principal, corrID(r), expected, req)
+	out, err := h.store.CertifyRun(r.Context(), tenantID, runID, principal, corrID(r), expected, req, authority)
 	if err != nil {
 		h.writeErr(w, "certify run", err)
 		return

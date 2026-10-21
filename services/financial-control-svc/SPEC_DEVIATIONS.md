@@ -37,17 +37,15 @@ policies a run pins.
   prospective only (RB-05; see A11); (c) who may revoke: holders of
   `FINCTRL_REVOKE` other than the certifier. **Deployment prerequisite:**
   see B6, `FINCTRL_REVOKE` must be registered in access-control-svc first.
-- **A2. No ControlCertification record (§6, Invariant 9).** Certifying changes
-  the run's states and appends a transition row (actor, reason, time). Invariant
-  9 requires the certified result to identify the certifier, *certification
-  authority*, time, run version, *unresolved exceptions* and *impact
-  assessment*. Not stored: which grant/role authorized the certifier at that
-  moment (authority snapshot), the list of waived/carried-forward exceptions
-  accepted by this certification, assessed exposure, and a link to an evidence
-  package sealed for this certification (the package is sealed at execution).
-  The evidence export reconstructs part of this from history. Scope: an
-  append-only `control_certifications` table written in the certify
-  transaction, included in `GET …/evidence` and the export.
+- **A2. No ControlCertification record (§6, Invariant 9). — Closed (B7).**
+  Every CERTIFY decision now writes one append-only `control_certifications`
+  row (migration 000007) inside `CertifyRun`'s own transaction, under the
+  run's row lock. It holds §6's canonical fields: `run_id`, certifier,
+  authority snapshot, result, unresolved exceptions, assessed exposure,
+  timestamp and evidence package. It also holds Invariant 9's run version
+  and the certification transition it records. `GET …/evidence` and the
+  evidence export serve the record as a `certification` field, read directly
+  from the table instead of being inferred from the transition history.
 - **A3. Certification has no idempotency key.** §25: idempotency is mandatory
   for run creation, execution, reperformance and certification. Create and
   execute require `Idempotency-Key` (`command_idempotency` table); `POST
@@ -199,3 +197,49 @@ policies a run pins.
     Before this it would have fallen through to `LATEST_RUN_CERTIFIED_PASS`.
     The item also carries `certification_revoked_at` and
     `revocation_reason`, both additive JSON fields.
+- **B7. The ControlCertification record (A2).**
+  - *Authority snapshot.* authorization-svc's `/v1/authorize` already
+    returns `access_decision_id` (the key of its append-only
+    AccessDecisionLog, which holds the matched grants), `decision_basis`
+    (e.g. `rbac:role=…`), `decision`, `policy_set_version` and
+    `reason_codes`; this service used to keep only the outcome. A new
+    `authz.Client.Decide` returns them, and `CertifyRun` now authorizes
+    through it (`authorizeWithAuthority`). `Decide` always asks live,
+    bypassing the 5-second decision cache, so the recorded authority is the
+    decision taken for this certification and never one reused from
+    another request. A GRANTED answer with no `access_decision_id` cannot be
+    traced and is refused as `authorization_unavailable` (503). The store
+    also refuses a CERTIFY whose snapshot is missing, untraceable, or for
+    another principal, and a CHECK requires `access_decision_id` and
+    `decision_outcome = GRANTED`. The snapshot is stored as authorization-svc
+    gave it, plus the principal, entity, action and the time it was
+    received. Every other command still uses the cached `CheckAllowed`;
+    only certification records its authority.
+  - *Unresolved exceptions.* Every exception of the run not CLOSED at
+    certification: in practice the WAIVED_UNDER_AUTHORITY and
+    CARRIED_FORWARD_UNDER_AUTHORITY ones a PASS_WITH_APPROVED_EXCEPTIONS
+    result accepts. Each is recorded with state, category, reason code,
+    severity, exact exposure and currency, plus the `authority_ref` and
+    `carry_to_period` of the exception transition that put it there.
+  - *Assessed exposure.* `domain.AssessExposure`, which is the existing
+    `Summarise` (exact `big.Rat` totals per currency and severity) applied
+    to those exceptions, against the materiality policy the **run pinned
+    at creation**, not the entity's current one. A run that pinned none
+    gets totals with `aggregate_material: null` (not assessable). No FX is
+    applied; other currencies are listed as unassessed.
+  - *Evidence package.* A reference to the package sealed at execution
+    (the latest, if reperformed), by `evidence_package_id` (foreign key) and
+    `evidence_digest`. No new package is sealed for the certification. A
+    run with no sealed package cannot be certified (422).
+  - *Scope.* Only CERTIFY writes a record; a REJECT is a transition, not a
+    certification. One row per run (UNIQUE), immutable
+    (`reject_control_mutation`), FORCE RLS. `certification_transition_id`
+    is the same CERTIFICATION → CERTIFIED row a revocation (B6) references.
+    No backfill: runs certified before 000007 had no authority recorded,
+    none is invented, and their `certification` is absent or null. The
+    `control.run.certified` event payload is unchanged.
+  - *Reads.* `GET …/evidence` adds `certification` to the package fields
+    (omitted when there is none). The export adds `certification` (null when
+    none) inside the bundle's manifest digest. `run_transitions` stays in
+    the export as history, but is no longer the only place a certification
+    can be seen.

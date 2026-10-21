@@ -14,13 +14,15 @@ type wave5State struct {
 	certErr    error
 	certExpect int
 	certReq    domain.CertifyRequest
+	certAuth   *domain.AuthoritySnapshot
+	cert       *domain.ControlCertification
 	gate       *domain.CloseGate
 	summary    *domain.ExceptionSummary
 }
 
-func (f *fakeStore) CertifyRun(_ context.Context, _, _, _, _ string, expected int, req domain.CertifyRequest) (*domain.ControlRun, error) {
+func (f *fakeStore) CertifyRun(_ context.Context, _, _, _, _ string, expected int, req domain.CertifyRequest, auth *domain.AuthoritySnapshot) (*domain.ControlRun, error) {
 	f.calls = append(f.calls, "CertifyRun")
-	f.w5.certExpect, f.w5.certReq = expected, req
+	f.w5.certExpect, f.w5.certReq, f.w5.certAuth = expected, req, auth
 	if f.w5.certErr != nil {
 		return nil, f.w5.certErr
 	}
@@ -28,6 +30,12 @@ func (f *fakeStore) CertifyRun(_ context.Context, _, _, _, _ string, expected in
 	c.Version++
 	c.LifecycleState, c.CertificationState = domain.LifecycleCertified, domain.CertCertified
 	return &c, nil
+}
+func (f *fakeStore) GetCertification(context.Context, string, string) (*domain.ControlCertification, error) {
+	if f.w5.cert == nil {
+		return nil, domain.ErrNotFound
+	}
+	return f.w5.cert, nil
 }
 func (f *fakeStore) CloseGate(context.Context, string, string, string) (*domain.CloseGate, error) {
 	f.calls = append(f.calls, "CloseGate")

@@ -90,7 +90,7 @@ func TestWave8_Monitoring_ComputesTheSectionTwentyEightSignals(t *testing.T) {
 	require.Len(t, exc, 2)
 	w.src.set(catalogue.SysGL, "journal-balances", "wm", journalBal("j1", "5", "5"))
 	_, final := w.run("FIN-CTRL-020", fiscal)
-	_, err = testStore.CertifyRun(ctx, w.tenant, final.RunID, "checker", "c", final.Version, domain.CertifyRequest{Decision: "CERTIFY"})
+	_, err = testStore.CertifyRun(ctx, w.tenant, final.RunID, "checker", "c", final.Version, domain.CertifyRequest{Decision: "CERTIFY"}, testAuthority("checker", w.tenant))
 	require.NoError(t, err)
 
 	m, err := testStore.Monitoring(ctx, w.tenant, w.entity, "2026-09", time.Now().UTC())

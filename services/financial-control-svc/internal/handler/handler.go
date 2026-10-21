@@ -51,7 +51,8 @@ type Store interface {
 	GetLatestEvidence(ctx context.Context, tenantID, runID string) (*domain.EvidencePackage, error)
 
 	// Wave 5.
-	CertifyRun(ctx context.Context, tenantID, runID, actor, correlationID string, expectedVersion int, req domain.CertifyRequest) (*domain.ControlRun, error)
+	CertifyRun(ctx context.Context, tenantID, runID, actor, correlationID string, expectedVersion int, req domain.CertifyRequest, authority *domain.AuthoritySnapshot) (*domain.ControlRun, error)
+	GetCertification(ctx context.Context, tenantID, runID string) (*domain.ControlCertification, error)
 	RevokeCertification(ctx context.Context, tenantID, runID, actor, correlationID, idempotencyKey string, expectedVersion int, req domain.RevokeCertificationRequest) (*domain.ControlRun, bool, error)
 	CloseGate(ctx context.Context, tenantID, legalEntityID, periodID string) (*domain.CloseGate, error)
 	ExceptionSummary(ctx context.Context, tenantID, legalEntityID, periodID string) (*domain.ExceptionSummary, error)
@@ -73,6 +74,9 @@ type Executor interface {
 // AuthZClient is the authorization contract (fail-closed).
 type AuthZClient interface {
 	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
+	// Decide is the live, uncached check whose decision is recorded as the
+	// certification authority (Invariant 9); see internal/authz.
+	Decide(ctx context.Context, principalID, legalEntityID, actionType string) (*domain.AuthoritySnapshot, error)
 }
 
 // Action types checked against authorization-svc.
@@ -510,6 +514,22 @@ func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principal, e
 		writeError(w, http.StatusServiceUnavailable, "authorization_unavailable", "")
 	}
 	return false
+}
+
+// authorizeWithAuthority is authorize for a command that must record the authority it
+// acted under: it asks authorization-svc live and returns the decision.
+func (h *Handler) authorizeWithAuthority(w http.ResponseWriter, r *http.Request, principal, entity, action string) (*domain.AuthoritySnapshot, bool) {
+	a, err := h.authz.Decide(r.Context(), principal, entity, action)
+	switch {
+	case err == nil:
+		return a, true
+	case errors.Is(err, domain.ErrAuthorizationDenied):
+		writeError(w, http.StatusForbidden, "forbidden", err.Error())
+	default:
+		h.log.Error("authorization unavailable — failing closed", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "authorization_unavailable", "")
+	}
+	return nil, false
 }
 
 func (h *Handler) writeErr(w http.ResponseWriter, op string, err error) {

@@ -2,8 +2,10 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 
 	"time"
 
@@ -20,7 +22,16 @@ import (
 // creator, nor anyone who appears on the run's transition history (the person who
 // executed it, assigned an exception on it, and so on). A single actor can therefore
 // never both produce and certify a result.
-func (s *PgStore) CertifyRun(ctx context.Context, tenantID, runID, actor, correlationID string, expectedVersion int, req domain.CertifyRequest) (*domain.ControlRun, error) {
+//
+// A CERTIFY decision also writes the run's ControlCertification (Invariant 9,
+// migration 000007) in the same transaction: authority is the certifier's live
+// authorization-svc decision and is required — a certification whose authority
+// cannot be identified is refused, not recorded without it.
+func (s *PgStore) CertifyRun(ctx context.Context, tenantID, runID, actor, correlationID string, expectedVersion int,
+	req domain.CertifyRequest, authority *domain.AuthoritySnapshot) (*domain.ControlRun, error) {
+	if req.Decision == domain.DecisionCertify && (authority == nil || authority.AccessDecisionID == "" || authority.PrincipalID != actor) {
+		return nil, fmt.Errorf("%w: a certification must carry the certifier's own authorization decision", domain.ErrAuthorizationServiceUnavailable)
+	}
 	var out *domain.ControlRun
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		var cur domain.ControlRun
@@ -79,12 +90,147 @@ func (s *PgStore) CertifyRun(ctx context.Context, tenantID, runID, actor, correl
 		p.ToCert = &cert
 		var err error
 		out, err = advanceTx(ctx, tx, tenantID, runID, p)
-		return err
+		if err != nil || req.Decision != domain.DecisionCertify {
+			return err
+		}
+		return recordCertification(ctx, tx, tenantID, *out, actor, correlationID, req.Reason, *authority)
 	})
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
+}
+
+// recordCertification writes the ControlCertification of run, which advanceTx has just
+// moved to CERTIFIED inside tx, so it is committed or rolled back with the certification
+// itself.
+func recordCertification(ctx context.Context, tx pgx.Tx, tenantID string, run domain.ControlRun,
+	certifier, correlationID, reason string, authority domain.AuthoritySnapshot) error {
+	// Evidence package: the one sealed at execution (the latest, if reperformed).
+	var packageID, digest string
+	if err := tx.QueryRow(ctx, `SELECT package_id::text, digest FROM evidence_packages
+		WHERE tenant_id = $1 AND run_id = $2 ORDER BY sealed_at DESC, package_id DESC LIMIT 1`, tenantID, run.RunID).
+		Scan(&packageID, &digest); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("%w: the run has no sealed evidence package to certify", domain.ErrInvalidTransition)
+		}
+		return err
+	}
+
+	var transitionID int64
+	if err := tx.QueryRow(ctx, `SELECT transition_id FROM control_run_transitions
+		WHERE tenant_id = $1 AND run_id = $2 AND dimension = 'CERTIFICATION' AND to_state = 'CERTIFIED'
+		ORDER BY transition_id DESC LIMIT 1`, tenantID, run.RunID).Scan(&transitionID); err != nil {
+		return fmt.Errorf("read certification transition: %w", err)
+	}
+
+	// Unresolved exceptions: everything not CLOSED, with the authority and target
+	// period of the transition that last moved it (the waiver or carry-forward).
+	rows, err := tx.Query(ctx, `
+		SELECT e.exception_id::text, e.state, e.category, e.reason_code, e.severity, e.exposure::text, e.currency::text,
+		       COALESCE(t.authority_ref, ''), COALESCE(t.carry_to_period, '')
+		FROM control_exceptions e
+		LEFT JOIN LATERAL (
+			SELECT authority_ref, carry_to_period FROM exception_transitions
+			WHERE tenant_id = e.tenant_id AND exception_id = e.exception_id
+			ORDER BY transition_id DESC LIMIT 1) t ON true
+		WHERE e.tenant_id = $1 AND e.run_id = $2 AND e.state <> 'CLOSED'
+		ORDER BY e.exception_id`, tenantID, run.RunID)
+	if err != nil {
+		return err
+	}
+	unresolved := []domain.CertifiedException{}
+	for rows.Next() {
+		var e domain.CertifiedException
+		if err := rows.Scan(&e.ExceptionID, &e.State, &e.Category, &e.ReasonCode, &e.Severity, &e.Exposure, &e.Currency,
+			&e.AuthorityRef, &e.CarryToPeriod); err != nil {
+			rows.Close()
+			return err
+		}
+		x, ok := new(big.Rat).SetString(e.Exposure)
+		if !ok {
+			rows.Close()
+			return fmt.Errorf("exposure %q is not a decimal", e.Exposure)
+		}
+		e.Exposure = domain.CanonicalAmount(x)
+		unresolved = append(unresolved, e)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	// Impact assessment against the materiality policy the run pinned at creation.
+	var mat *domain.MaterialityView2
+	if run.MaterialityID != nil {
+		var m domain.MaterialityView2
+		if err := tx.QueryRow(ctx, `SELECT materiality_id::text, aggregate_threshold::text, currency::text
+			FROM materiality_policies WHERE tenant_id = $1 AND materiality_id = $2`, tenantID, *run.MaterialityID).
+			Scan(&m.MaterialityID, &m.AggregateThreshold, &m.Currency); err != nil {
+			return fmt.Errorf("read pinned materiality policy: %w", err)
+		}
+		mat = &m
+	}
+	exposure, err := domain.AssessExposure(run.LegalEntityID, run.PeriodID, unresolved, mat)
+	if err != nil {
+		return err
+	}
+
+	authJSON, err := json.Marshal(authority)
+	if err != nil {
+		return err
+	}
+	unresolvedJSON, err := json.Marshal(unresolved)
+	if err != nil {
+		return err
+	}
+	exposureJSON, err := json.Marshal(exposure)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `INSERT INTO control_certifications
+		(tenant_id, run_id, run_version, certification_transition_id, certifier, authority_snapshot, result,
+		 unresolved_exceptions, assessed_exposure, evidence_package_id, evidence_digest, reason, correlation_id)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+		tenantID, run.RunID, run.Version, transitionID, certifier, authJSON, string(run.ResultState),
+		unresolvedJSON, exposureJSON, packageID, digest, reason, correlationID)
+	if err != nil {
+		return fmt.Errorf("record certification: %w", err)
+	}
+	return nil
+}
+
+// GetCertification returns the run's ControlCertification, or ErrNotFound when the
+// run was never certified (or was certified before migration 000007 recorded them).
+func (s *PgStore) GetCertification(ctx context.Context, tenantID, runID string) (*domain.ControlCertification, error) {
+	var c domain.ControlCertification
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		var authJSON, unresolvedJSON, exposureJSON []byte
+		var result string
+		if err := tx.QueryRow(ctx, `SELECT certification_id::text, run_id::text, run_version, certification_transition_id,
+				certifier, authority_snapshot, result, unresolved_exceptions, assessed_exposure, certified_at,
+				evidence_package_id::text, evidence_digest, reason
+			FROM control_certifications WHERE tenant_id = $1 AND run_id = $2`, tenantID, runID).
+			Scan(&c.CertificationID, &c.RunID, &c.RunVersion, &c.CertificationTransitionID, &c.Certifier, &authJSON,
+				&result, &unresolvedJSON, &exposureJSON, &c.CertifiedAt, &c.EvidencePackageID, &c.EvidenceDigest, &c.Reason); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return domain.ErrNotFound
+			}
+			return err
+		}
+		c.Result = domain.ResultState(result)
+		if err := json.Unmarshal(authJSON, &c.Authority); err != nil {
+			return err
+		}
+		if err := json.Unmarshal(unresolvedJSON, &c.UnresolvedExceptions); err != nil {
+			return err
+		}
+		return json.Unmarshal(exposureJSON, &c.AssessedExposure)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &c, nil
 }
 
 // revokeCommand is the command_idempotency name of RevokeCertification.

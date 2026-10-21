@@ -95,7 +95,7 @@ func TestWave7_ExceptionLifecycle_MakerCheckerAndRollup(t *testing.T) {
 
 	// Certification follows: rejection returns the run, resubmission brings it back, and the
 	// same certifier may then decide, but the operator who produced the result never can.
-	rej, err := testStore.CertifyRun(ctx, w.tenant, run.RunID, "checker", "c", cur.Version, domain.CertifyRequest{Decision: "REJECT", Reason: "attach the waiver memo"})
+	rej, err := testStore.CertifyRun(ctx, w.tenant, run.RunID, "checker", "c", cur.Version, domain.CertifyRequest{Decision: "REJECT", Reason: "attach the waiver memo"}, testAuthority("checker", w.tenant))
 	require.NoError(t, err)
 	assert.Equal(t, domain.LifecycleExceptionReview, rej.LifecycleState)
 	assert.Equal(t, domain.CertRejected, rej.CertificationState)
@@ -107,9 +107,9 @@ func TestWave7_ExceptionLifecycle_MakerCheckerAndRollup(t *testing.T) {
 	assert.Equal(t, domain.LifecycleReadyToCertify, sub.LifecycleState)
 	assert.Equal(t, domain.CertPending, sub.CertificationState)
 
-	_, err = testStore.CertifyRun(ctx, w.tenant, run.RunID, "prep", "c", sub.Version, domain.CertifyRequest{Decision: "CERTIFY"})
+	_, err = testStore.CertifyRun(ctx, w.tenant, run.RunID, "prep", "c", sub.Version, domain.CertifyRequest{Decision: "CERTIFY"}, testAuthority("prep", w.tenant))
 	require.ErrorIs(t, err, domain.ErrSegregation)
-	done, err := testStore.CertifyRun(ctx, w.tenant, run.RunID, "checker", "c", sub.Version, domain.CertifyRequest{Decision: "CERTIFY"})
+	done, err := testStore.CertifyRun(ctx, w.tenant, run.RunID, "checker", "c", sub.Version, domain.CertifyRequest{Decision: "CERTIFY"}, testAuthority("checker", w.tenant))
 	require.NoError(t, err, "the certifier who rejected may certify the corrected run")
 	assert.Equal(t, domain.LifecycleCertified, done.LifecycleState)
 	assert.Equal(t, domain.ResultPassWithApprovedEx, done.ResultState)
@@ -155,7 +155,7 @@ func TestWave7_RerunSupersedesTheCertifiedRunAndOnlyThat(t *testing.T) {
 	w := newWave5(t)
 	w.src.set(catalogue.SysGL, "journal-balances", "wm", journalBal("j1", "5", "5"))
 	first, final := w.run("FIN-CTRL-020", fiscal)
-	done, err := testStore.CertifyRun(ctx, w.tenant, first.RunID, "checker", "c", final.Version, domain.CertifyRequest{Decision: "CERTIFY"})
+	done, err := testStore.CertifyRun(ctx, w.tenant, first.RunID, "checker", "c", final.Version, domain.CertifyRequest{Decision: "CERTIFY"}, testAuthority("checker", w.tenant))
 	require.NoError(t, err)
 	require.Equal(t, domain.LifecycleCertified, done.LifecycleState)
 

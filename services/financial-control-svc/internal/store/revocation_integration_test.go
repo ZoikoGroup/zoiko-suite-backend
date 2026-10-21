@@ -29,8 +29,7 @@ func certifiedRun(t *testing.T, w *wave2) *domain.ControlRun {
 	w.src.set(catalogue.SysGL, "journal-balances", "wm", journalBal("j1", "5", "5"))
 	_, final := w.run("FIN-CTRL-020", fiscal)
 	require.Equal(t, domain.LifecycleReadyToCertify, final.LifecycleState)
-	out, err := testStore.CertifyRun(ctx, w.tenant, final.RunID, "checker", "c", final.Version,
-		domain.CertifyRequest{Decision: "CERTIFY", Reason: "reviewed"})
+	out, err := testStore.CertifyRun(ctx, w.tenant, final.RunID, "checker", "c", final.Version, domain.CertifyRequest{Decision: "CERTIFY", Reason: "reviewed"}, testAuthority("checker", w.tenant))
 	require.NoError(t, err)
 	require.Equal(t, domain.CertCertified, out.CertificationState)
 	return out
@@ -196,7 +195,7 @@ func TestRevocation_CloseGateReflectsIt(t *testing.T) {
 	var certified020 *domain.ControlRun
 	for _, code := range []string{"FIN-CTRL-020", "FIN-CTRL-021", "FIN-CTRL-023"} {
 		_, final := w.run(code, fiscal)
-		out, err := testStore.CertifyRun(ctx, w.tenant, final.RunID, "checker", "c", final.Version, domain.CertifyRequest{Decision: "CERTIFY"})
+		out, err := testStore.CertifyRun(ctx, w.tenant, final.RunID, "checker", "c", final.Version, domain.CertifyRequest{Decision: "CERTIFY"}, testAuthority("checker", w.tenant))
 		require.NoError(t, err, code)
 		if code == "FIN-CTRL-020" {
 			certified020 = out
