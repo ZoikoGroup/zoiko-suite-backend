@@ -15,37 +15,53 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
+	idenv "zoiko.io/identity-envelope"
 	"zoiko.io/workflow-svc/internal/domain"
 	svcenvelope "zoiko.io/workflow-svc/internal/envelope"
 	svcmiddleware "zoiko.io/workflow-svc/internal/middleware"
 )
 
+// ApprovalAction is the action every approval decision is authorized under.
+// One action, with the workflow type and the stage's approver role passed as
+// attributes (Governance audit H-2, decision 21 Oct 2026): a rule pack that
+// wants per-type approval authority writes an ABAC rule on the attribute
+// instead of the platform minting one action code per workflow type.
+const ApprovalAction = "WORKFLOW_APPROVE"
+
+// Attribute names sent with an approval authorization.
+const (
+	AttrWorkflowType = "workflow_type"
+	AttrApproverRole = "approver_role"
+	AttrStageOrder   = "stage_order"
+)
+
 // Client is the narrow interface the handler depends on.
 type Client interface {
-	// CheckApprovalAllowed returns nil if principalID is authorized to
-	// approve within legalEntityID. Returns domain.ErrAuthorizationDenied
-	// if authorization-svc says DENIED, or
-	// domain.ErrAuthorizationServiceUnavailable if it cannot be reached —
-	// callers must fail-closed on the latter, same as every other
-	// synchronous cross-service call in this platform.
-	// resourceOwnerPrincipalID is the principal who owns the resource (e.g.
-	// workflow initiator) for own-object SoD checks in authorization-svc.
-	CheckApprovalAllowed(ctx context.Context, principalID, legalEntityID, resourceOwnerPrincipalID string) error
+	// CheckApprovalAllowed asks whether principalID may decide an approval
+	// in legalEntityID. resourceOwnerPrincipalID is the initiator, for
+	// authorization-svc's own-object SoD check; attrs carries the workflow
+	// type and approver role. On GRANTED it returns the authority snapshot
+	// the decision is recorded under. domain.ErrAuthorizationDenied on any
+	// other outcome; domain.ErrAuthorizationServiceUnavailable when
+	// authorization-svc cannot answer — callers fail closed on both.
+	CheckApprovalAllowed(ctx context.Context, principalID, legalEntityID, resourceOwnerPrincipalID string, attrs map[string]string) (domain.ActionAuthority, error)
 	// CheckAllowed is used by typed workflow-domain modules for actions other
 	// than generic stage approval. It deliberately still delegates the decision
 	// to authorization-svc; a workflow module must not self-authorize.
 	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType, resourceOwnerPrincipalID string) error
-	// CheckDelegation returns nil if delegatePrincipalID is authorized to act
-	// as a delegate for approverPrincipalID within legalEntityID. This enables
-	// approval delegation where a designated delegate can approve on behalf of
-	// the assigned approver.
-	CheckDelegation(ctx context.Context, delegatePrincipalID, approverPrincipalID, legalEntityID string) error
+	// CheckAllowedWithAuthority is CheckAllowed for lifecycle commands: it
+	// returns the same authority snapshot an approval records, so cancel /
+	// escalate / invalidate ledger records carry the access decision too.
+	CheckAllowedWithAuthority(ctx context.Context, principalID, legalEntityID, actionType, resourceOwnerPrincipalID string) (domain.ActionAuthority, error)
+	// CheckDelegation asks whether delegatePrincipalID holds WORKFLOW_APPROVE
+	// by a live delegation FROM approverPrincipalID — the approver the stage
+	// names, not any delegator. Returns the delegation id on success.
+	CheckDelegation(ctx context.Context, delegatePrincipalID, approverPrincipalID, legalEntityID string) (domain.ActionAuthority, error)
 }
 
 // HTTPClient implements Client against a real authorization-svc instance.
@@ -68,70 +84,75 @@ func NewHTTPClient(baseURL string, log *zap.Logger) *HTTPClient {
 }
 
 type authorizeRequest struct {
-	PrincipalID              string `json:"principal_id"`
-	LegalEntityID            string `json:"legal_entity_id"`
-	ActionType               string `json:"action_type"`
-	TenantID                 string `json:"tenant_id,omitempty"`
-	ResourceOwnerPrincipalID string `json:"resource_owner_principal_id,omitempty"`
+	PrincipalID              string            `json:"principal_id"`
+	LegalEntityID            string            `json:"legal_entity_id"`
+	ActionType               string            `json:"action_type"`
+	TenantID                 string            `json:"tenant_id,omitempty"`
+	ResourceOwnerPrincipalID string            `json:"resource_owner_principal_id,omitempty"`
+	Attributes               map[string]string `json:"attributes,omitempty"`
 }
 
 type authorizeResponse struct {
-	DecisionOutcome string `json:"decision_outcome"`
+	DecisionOutcome  string `json:"decision_outcome"`
+	AccessDecisionID string `json:"access_decision_id"`
+	DecisionBasis    string `json:"decision_basis"`
 }
 
-// approvalActionType is the action_type checked against authorization-svc
-// for every approval submission. A single, platform-wide action type is
-// intentional for v1 — nothing in the docs specifies per-workflow-type
-// action codes.
-const approvalActionType = "WORKFLOW_APPROVE"
-
-func (c *HTTPClient) CheckApprovalAllowed(ctx context.Context, principalID, legalEntityID, resourceOwnerPrincipalID string) error {
-	return c.checkAllowed(ctx, principalID, legalEntityID, approvalActionType, resourceOwnerPrincipalID)
+func (c *HTTPClient) CheckApprovalAllowed(ctx context.Context, principalID, legalEntityID, resourceOwnerPrincipalID string, attrs map[string]string) (domain.ActionAuthority, error) {
+	out, err := c.authorize(ctx, authorizeRequest{
+		PrincipalID: principalID, LegalEntityID: legalEntityID, ActionType: ApprovalAction,
+		ResourceOwnerPrincipalID: resourceOwnerPrincipalID, Attributes: attrs,
+	})
+	if err != nil {
+		return domain.ActionAuthority{}, err
+	}
+	return domain.ActionAuthority{AccessDecisionID: out.AccessDecisionID, Basis: out.DecisionBasis}, nil
 }
 
 func (c *HTTPClient) CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType, resourceOwnerPrincipalID string) error {
-	return c.checkAllowed(ctx, principalID, legalEntityID, actionType, resourceOwnerPrincipalID)
+	_, err := c.CheckAllowedWithAuthority(ctx, principalID, legalEntityID, actionType, resourceOwnerPrincipalID)
+	return err
 }
 
-func (c *HTTPClient) checkAllowed(ctx context.Context, principalID, legalEntityID, actionType string, resourceOwnerPrincipalID string) error {
-	// Extract tenant_id from context (set by TenantContext middleware)
-	tenantID := ""
-	if v := ctx.Value("tenant_id"); v != nil {
-		if s, ok := v.(string); ok {
-			tenantID = s
-		}
-	}
-
-	body, err := json.Marshal(authorizeRequest{
-		PrincipalID:              principalID,
-		LegalEntityID:            legalEntityID,
-		ActionType:               actionType,
-		TenantID:                 tenantID,
+func (c *HTTPClient) CheckAllowedWithAuthority(ctx context.Context, principalID, legalEntityID, actionType, resourceOwnerPrincipalID string) (domain.ActionAuthority, error) {
+	out, err := c.authorize(ctx, authorizeRequest{
+		PrincipalID: principalID, LegalEntityID: legalEntityID, ActionType: actionType,
 		ResourceOwnerPrincipalID: resourceOwnerPrincipalID,
 	})
 	if err != nil {
-		return fmt.Errorf("marshal authorize request: %w", err)
+		return domain.ActionAuthority{}, err
 	}
+	return domain.ActionAuthority{AccessDecisionID: out.AccessDecisionID, Basis: out.DecisionBasis}, nil
+}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/authorize", bytes.NewReader(body))
-	if err != nil {
-		return domain.ErrAuthorizationServiceUnavailable
+// tenantOf is the verified tenant of the request. It used to be read from
+// ctx.Value("tenant_id"), a key nothing ever set, so the body's tenant_id was
+// always empty and authorization-svc evaluated outside any tenant.
+func tenantOf(ctx context.Context) string {
+	if env, ok := svcenvelope.FromContext(ctx); ok && env.TenantID != "" {
+		return env.TenantID
 	}
+	return svcmiddleware.TenantFromContext(ctx)
+}
+
+// stamp sets the headers every authorization-svc call carries: the verified
+// identity forwarded (envelope, principal, tenant), and the trace.
+func stamp(ctx context.Context, req *http.Request, principalID, legalEntityID, tenantID string) {
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Principal-Id", principalID)
+	idenv.Forward(ctx, req)
+	if req.Header.Get("X-Principal-Id") == "" {
+		req.Header.Set("X-Principal-Id", principalID)
+	}
+	if tenantID != "" {
+		req.Header.Set("X-Tenant-Id", tenantID)
+	}
 	req.Header.Set("X-Legal-Entity-Id", legalEntityID)
 
-	authzRequestID := ""
-	authzSourceChannel := "web"
+	requestID, channel := "", "web"
 	if env, ok := svcenvelope.FromContext(ctx); ok {
-		if env.TenantID != "" {
-			req.Header.Set("X-Tenant-Id", env.TenantID)
-		}
-		if env.RequestID != "" {
-			authzRequestID = env.RequestID
-		}
+		requestID = env.RequestID
 		if env.SourceChannel != "" {
-			authzSourceChannel = string(env.SourceChannel)
+			channel = string(env.SourceChannel)
 		}
 		if env.CorrelationID != "" {
 			req.Header.Set("X-Correlation-ID", env.CorrelationID)
@@ -139,42 +160,34 @@ func (c *HTTPClient) checkAllowed(ctx context.Context, principalID, legalEntityI
 		if env.CausationID != "" {
 			req.Header.Set("X-Causation-Id", env.CausationID)
 		}
-		if env.IdempotencyKey != "" {
-			req.Header.Set("Idempotency-Key", env.IdempotencyKey)
-		}
 	}
-	if req.Header.Get("X-Tenant-Id") == "" {
-		if tid := svcmiddleware.TenantFromContext(ctx); tid != "" {
-			req.Header.Set("X-Tenant-Id", tid)
-		}
+	if requestID == "" {
+		requestID = uuid.New().String()
 	}
-	if authzRequestID == "" {
-		authzRequestID = uuid.New().String()
-	}
-	req.Header.Set("X-Request-Id", authzRequestID)
-	req.Header.Set("X-Source-Channel", authzSourceChannel)
-	if req.Header.Get("Idempotency-Key") == "" {
-		req.Header.Set("Idempotency-Key", "authz-"+authzRequestID)
-	}
+	req.Header.Set("X-Request-Id", requestID)
+	req.Header.Set("X-Source-Channel", channel)
+	// An authorization question is not the caller's command: its own
+	// Idempotency-Key would make authorization-svc replay the first answer
+	// for a different action or principal under the same key.
+	req.Header.Set("Idempotency-Key", "authz-"+uuid.New().String())
+}
 
-	// Forward envelope headers for audit trail
-	if requestID := ctx.Value("request_id"); requestID != nil {
-		req.Header.Set("X-Request-Id", requestID.(string))
+func (c *HTTPClient) authorize(ctx context.Context, in authorizeRequest) (authorizeResponse, error) {
+	in.TenantID = tenantOf(ctx)
+	body, err := json.Marshal(in)
+	if err != nil {
+		return authorizeResponse{}, fmt.Errorf("marshal authorize request: %w", err)
 	}
-	if correlationID := ctx.Value("correlation_id"); correlationID != nil {
-		req.Header.Set("X-Correlation-ID", correlationID.(string))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/authorize", bytes.NewReader(body))
+	if err != nil {
+		return authorizeResponse{}, domain.ErrAuthorizationServiceUnavailable
 	}
-	if sourceChannel := ctx.Value("source_channel"); sourceChannel != nil {
-		req.Header.Set("X-Source-Channel", sourceChannel.(string))
-	}
-	if idempotencyKey := ctx.Value("idempotency_key"); idempotencyKey != nil {
-		req.Header.Set("Idempotency-Key", idempotencyKey.(string))
-	}
+	stamp(ctx, req, in.PrincipalID, in.LegalEntityID, in.TenantID)
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		c.log.Error("authorization-svc unreachable — failing closed", zap.String("principal_id", principalID), zap.Error(err))
-		return domain.ErrAuthorizationServiceUnavailable
+		c.log.Error("authorization-svc unreachable — failing closed", zap.String("principal_id", in.PrincipalID), zap.Error(err))
+		return authorizeResponse{}, domain.ErrAuthorizationServiceUnavailable
 	}
 	defer resp.Body.Close()
 
@@ -182,76 +195,52 @@ func (c *HTTPClient) checkAllowed(ctx context.Context, principalID, legalEntityI
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 		c.log.Error("unexpected response from authorization-svc — failing closed",
 			zap.Int("status", resp.StatusCode), zap.ByteString("body", respBody))
-		return domain.ErrAuthorizationServiceUnavailable
+		return authorizeResponse{}, domain.ErrAuthorizationServiceUnavailable
 	}
 
 	var out authorizeResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return domain.ErrAuthorizationServiceUnavailable
+		return authorizeResponse{}, domain.ErrAuthorizationServiceUnavailable
 	}
 	if out.DecisionOutcome != "GRANTED" {
-		return domain.ErrAuthorizationDenied
+		return out, domain.ErrAuthorizationDenied
 	}
-	return nil
+	return out, nil
 }
 
-// CheckDelegation returns nil if delegatePrincipalID is authorized to act
-// as a delegate for approverPrincipalID within legalEntityID. This enables
-// approval delegation where a designated delegate can approve on behalf of
-// the assigned approver.
-func (c *HTTPClient) CheckDelegation(ctx context.Context, delegatePrincipalID, approverPrincipalID, legalEntityID string) error {
-	// Extract tenant_id from context (set by TenantContext middleware)
-	tenantID := ""
-	if v := ctx.Value("tenant_id"); v != nil {
-		if s, ok := v.(string); ok {
-			tenantID = s
-		}
+// CheckDelegation asks authorization-svc's delegated-access evaluation the
+// delegator-specific question. Before 21 Oct 2026 it asked for
+// WORKFLOW_DELEGATE (an action no delegation confers) and then matched the
+// approver as a substring of a basis that names only the FIRST delegator, so
+// a delegate covering for two approvers was refused for the second, and an
+// approver id that was a prefix of another's matched it.
+func (c *HTTPClient) CheckDelegation(ctx context.Context, delegatePrincipalID, approverPrincipalID, legalEntityID string) (domain.ActionAuthority, error) {
+	if approverPrincipalID == "" {
+		return domain.ActionAuthority{}, domain.ErrAuthorizationDenied
 	}
-
-	// authorization-svc exposes delegation through the documented
-	// /v1/delegated-access/evaluate operation, not /v1/authorize/delegation.
-	// The old path did not exist, so every delegated approval failed closed
-	// with a 503 even when the delegation was valid.
+	tenantID := tenantOf(ctx)
 	body, err := json.Marshal(map[string]string{
-		"principal_id":    delegatePrincipalID,
-		"legal_entity_id": legalEntityID,
-		"tenant_id":       tenantID,
-		"action_type":     "WORKFLOW_DELEGATE",
+		"principal_id":           delegatePrincipalID,
+		"legal_entity_id":        legalEntityID,
+		"tenant_id":              tenantID,
+		"action_type":            ApprovalAction,
+		"delegator_principal_id": approverPrincipalID,
 	})
 	if err != nil {
-		return fmt.Errorf("marshal delegation check request: %w", err)
+		return domain.ActionAuthority{}, fmt.Errorf("marshal delegation check request: %w", err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/delegated-access/evaluate", bytes.NewReader(body))
 	if err != nil {
-		return domain.ErrAuthorizationServiceUnavailable
+		return domain.ActionAuthority{}, domain.ErrAuthorizationServiceUnavailable
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Tenant-Id", tenantID)
-	req.Header.Set("X-Principal-Id", delegatePrincipalID)
-	req.Header.Set("X-Legal-Entity-Id", legalEntityID)
+	stamp(ctx, req, delegatePrincipalID, legalEntityID, tenantID)
 	req.Header.Set("X-Purpose-Context", "workflow_delegation_evaluation")
-	if requestID := ctx.Value("request_id"); requestID != nil {
-		req.Header.Set("X-Request-Id", requestID.(string))
-	}
-	if correlationID := ctx.Value("correlation_id"); correlationID != nil {
-		req.Header.Set("X-Correlation-ID", correlationID.(string))
-	}
-	if sourceChannel := ctx.Value("source_channel"); sourceChannel != nil {
-		req.Header.Set("X-Source-Channel", sourceChannel.(string))
-	}
-	if idempotencyKey := ctx.Value("idempotency_key"); idempotencyKey != nil {
-		req.Header.Set("Idempotency-Key", idempotencyKey.(string))
-	}
-
-	// Forward the caller's canonical envelope for audit traceability and to
-	// fill any header the handler did not put in the context.
-	svcenvelope.ForwardTo(ctx, req)
 
 	resp, err := c.http.Do(req)
 	if err != nil {
 		c.log.Error("authorization-svc unreachable for delegation check — failing closed", zap.String("delegate_principal_id", delegatePrincipalID), zap.Error(err))
-		return domain.ErrAuthorizationServiceUnavailable
+		return domain.ActionAuthority{}, domain.ErrAuthorizationServiceUnavailable
 	}
 	defer resp.Body.Close()
 
@@ -259,21 +248,22 @@ func (c *HTTPClient) CheckDelegation(ctx context.Context, delegatePrincipalID, a
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 		c.log.Error("unexpected response from authorization-svc for delegation check — failing closed",
 			zap.Int("status", resp.StatusCode), zap.ByteString("body", respBody))
-		return domain.ErrAuthorizationServiceUnavailable
+		return domain.ActionAuthority{}, domain.ErrAuthorizationServiceUnavailable
 	}
 
 	var out struct {
 		HasDelegatedAccess bool   `json:"has_delegated_access"`
 		Basis              string `json:"basis"`
+		DelegationID       string `json:"delegation_id"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return domain.ErrAuthorizationServiceUnavailable
+		return domain.ActionAuthority{}, domain.ErrAuthorizationServiceUnavailable
 	}
-	if !out.HasDelegatedAccess {
-		return domain.ErrAuthorizationDenied
+	// An authorization-svc that predates the delegator-specific question
+	// ignores delegator_principal_id and answers for any delegator; without a
+	// delegation id there is no proof the answer is about this approver.
+	if !out.HasDelegatedAccess || out.DelegationID == "" || out.Basis != "delegated:from="+approverPrincipalID {
+		return domain.ActionAuthority{}, domain.ErrAuthorizationDenied
 	}
-	if approverPrincipalID != "" && !strings.Contains(out.Basis, approverPrincipalID) {
-		return domain.ErrAuthorizationDenied
-	}
-	return nil
+	return domain.ActionAuthority{Basis: out.Basis, DelegationID: out.DelegationID}, nil
 }

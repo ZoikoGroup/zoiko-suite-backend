@@ -698,6 +698,14 @@ Errors carry the GCP §16 stable class in `code`. A conflict between two equally
 
 - workflow.completed
 
+- workflow.expired *(added 21 Oct 2026: an open instance passed its deadline)*
+
+- workflow.reopened *(added 21 Oct 2026: changes requested; a new review cycle starts)*
+
+- workflow.approval.invalidated *(the bound subject changed after approval, ZS-STATE-001 §6.1)*
+
+*A cancellation stays workflow.completed with status CANCELLED (decision C3, 21 Oct 2026).*
+
 **Consumed Events**
 
 - authorization.denied
@@ -705,6 +713,8 @@ Errors carry the GCP §16 stable class in `code`. A conflict between two equally
 - policy.updated
 
 - authority.delegated
+
+*Behaviour (21 Oct 2026): each flags the PENDING instances whose current approver it concerns (all of the tenant's for a policy change, also policy.version.activated / suspended and authority.revoked / expired / suspended); a timer pass re-authorizes their approvers and escalates an instance whose approver may no longer approve. Physical surface: `services/workflow-svc/openapi.yaml`.*
 
 **Evidence Obligations**
 

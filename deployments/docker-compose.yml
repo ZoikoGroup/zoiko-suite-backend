@@ -1494,8 +1494,10 @@ services:
   # ── 11. workflow-svc (Port: 8090) ───────────────────────────────────────────
   workflow-svc:
     build:
-      context: ../services/workflow-svc
-      dockerfile: Dockerfile
+      # Root context: go.mod replaces zoiko.io/identity-envelope with the
+      # sibling module, so the build must see both (see the Dockerfile).
+      context: ..
+      dockerfile: services/workflow-svc/Dockerfile
     container_name: workflow-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -1515,6 +1517,28 @@ services:
       AUTHORIZATION_SERVICE_URL: "http://authorization-svc:8089"
       DOCUMENT_VAULT_SERVICE_URL: "http://document-vault-svc:8094"
       GOVERNANCE_DECISION_LOG_SERVICE_URL: "http://governance-decision-log-svc:8083"
+      # The writer to the governance ledger (workflow decision evidence): a
+      # service principal holding GOVERNANCE_DECISION_RECORD and nothing else
+      # (GOVERNANCE_LEDGER_WRITER in deployments/supabase/seed-rbac.sql).
+      # Without the grant every decision still commits, and its ledger record
+      # waits durably in the outbox.
+      WORKFLOW_LEDGER_PRINCIPAL_ID: "${WORKFLOW_LEDGER_PRINCIPAL_ID:-svc-workflow}"
+      # Reads need WORKFLOW_READ unless the caller is a participant (the
+      # WORKFLOW_APPROVER / WORKFLOW_ADMINISTRATOR templates, access-control 000021).
+      WORKFLOW_READ_AUTHZ: "${WORKFLOW_READ_AUTHZ:-enforce}"
+      # Approver re-check on authority changes (policy, delegation, denials).
+      KAFKA_CONSUMER_GROUP_ID: "workflow-svc-recheck"
+      # CreateWorkflow validates the legal entity against the registry
+      # (cross-domain fact) rather than trusting a caller-supplied UUID.
+      TENANT_ENTITY_REGISTRY_SERVICE_URL: "http://tenant-entity-registry-svc:8081"
+      # Identity gate (X5 / X-R3): verify a presented signed envelope against
+      # identity-context-svc and derive the trusted principal/tenant from it.
+      # Warn locally while the console does not forward the envelope on every
+      # workflow call; require in production.
+      IDENTITY_VERIFY: "${WORKFLOW_IDENTITY_VERIFY:-warn}"
+      IDENTITY_JWKS_URL: "http://identity-context-svc:8080/.well-known/jwks.json"
+      IDENTITY_INTROSPECT_URL: "http://identity-context-svc:8080/v1/context/session/introspect"
+      IDENTITY_ISSUER: "identity-context-svc"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
     depends_on:
       postgres:
@@ -1524,6 +1548,8 @@ services:
       authorization-svc:
         condition: service_healthy
       document-vault-svc:
+        condition: service_healthy
+      tenant-svc:
         condition: service_healthy
       # The compose service key is governance-svc (container
       # governance-decision-log-svc); naming the container here made every

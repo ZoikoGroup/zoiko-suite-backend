@@ -139,11 +139,12 @@ func TestPgStore_AuditEngagement_PinsEvidenceAndIsIdempotent(t *testing.T) {
 	}
 }
 
-// TestPgStore_CreateWorkflow_RetriedCorrelationID_IsIdempotent proves the
-// exact scenario a network-timeout-triggered client retry produces: it must
-// resolve to the original instance and stages, never create a duplicate
-// workflow with its own duplicate stage chain (migration 000003).
-func TestPgStore_CreateWorkflow_RetriedCorrelationID_IsIdempotent(t *testing.T) {
+// TestPgStore_CreateWorkflow_IdempotencyKeyOwnsReplay proves the post-000020
+// contract: a retried Idempotency-Key resolves to the original instance and
+// stages, a different body under the same key is a mismatch, and
+// correlation_id alone is only a trace (a second workflow in the same
+// business flow must not be swallowed).
+func TestPgStore_CreateWorkflow_IdempotencyKeyOwnsReplay(t *testing.T) {
 	pool := getTestPool(t)
 	defer pool.Close()
 	setupTestDB(t, pool)
@@ -152,7 +153,8 @@ func TestPgStore_CreateWorkflow_RetriedCorrelationID_IsIdempotent(t *testing.T) 
 	ctx := tenantCtx(testTenantID)
 
 	params := twoStageParams()
-	params.CorrelationID = "corr-retry-1"
+	params.CorrelationID = "corr-shared-1"
+	params.IdempotencyKey = "idem-create-1"
 
 	instance1, stages1, created1, err := s.CreateWorkflow(ctx, params)
 	if err != nil {
@@ -176,13 +178,38 @@ func TestPgStore_CreateWorkflow_RetriedCorrelationID_IsIdempotent(t *testing.T) 
 		t.Fatalf("expected the same %d stages back, got %d", len(stages1), len(stages2))
 	}
 
+	mismatch := params
+	mismatch.WorkflowType = "EXPENSE_APPROVAL"
+	if _, _, _, err := s.CreateWorkflow(ctx, mismatch); !errors.Is(err, domain.ErrIdempotencyMismatch) {
+		t.Fatalf("expected ErrIdempotencyMismatch for same key with a different body, got %v", err)
+	}
+
 	var count int
 	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM workflow_instances WHERE tenant_id = $1 AND correlation_id = $2`,
 		params.TenantID, params.CorrelationID).Scan(&count); err != nil {
 		t.Fatalf("count query: %v", err)
 	}
 	if count != 1 {
-		t.Fatalf("DUPLICATE WORKFLOW: expected exactly 1 workflow_instances row for this correlation_id, got %d", count)
+		t.Fatalf("expected exactly 1 workflow_instances row for this idempotency key, got %d", count)
+	}
+
+	// Correlation is the business-flow trace, not the idempotency key: a
+	// second, deliberately new workflow in the same flow must be created.
+	other := twoStageParams()
+	other.CorrelationID = params.CorrelationID
+	instance3, _, created3, err := s.CreateWorkflow(ctx, other)
+	if err != nil {
+		t.Fatalf("second workflow in same correlation flow: %v", err)
+	}
+	if !created3 || instance3.WorkflowInstanceID == instance1.WorkflowInstanceID {
+		t.Fatalf("correlation_id alone must not replay the first workflow")
+	}
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM workflow_instances WHERE tenant_id = $1 AND correlation_id = $2`,
+		params.TenantID, params.CorrelationID).Scan(&count); err != nil {
+		t.Fatalf("count query after second workflow: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("expected 2 workflow_instances rows for this correlation_id, got %d", count)
 	}
 }
 

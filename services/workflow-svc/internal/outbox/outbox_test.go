@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -168,6 +169,7 @@ func (m *mockRows) Scan(dest ...any) error {
 	*(dest[8].(*[]byte)) = row.headersJSON
 	*(dest[9].(*json.RawMessage)) = json.RawMessage(row.payloadJSON)
 	*(dest[10].(*int)) = row.attempts
+	*(dest[11].(*time.Time)) = time.Now()
 	return nil
 }
 
@@ -201,18 +203,15 @@ type mockPublisher struct {
 	failErr   error
 }
 
-func (p *mockPublisher) PublishOutbox(ctx context.Context, outboxEventID, eventType, correlationID, tenantID, legalEntityID, actorID string, payload []byte) error {
+func record(e outbox.StoredEvent) recordedPublish {
+	return recordedPublish{outboxEventID: e.OutboxEventID, eventType: e.EventType, correlationID: e.Correlation(),
+		tenantID: e.TenantID, legalEntityID: e.LegalEntityID, actorID: e.Actor(), payload: e.Payload}
+}
+
+func (p *mockPublisher) Deliver(ctx context.Context, e outbox.StoredEvent) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.publishes = append(p.publishes, recordedPublish{
-		outboxEventID: outboxEventID,
-		eventType:     eventType,
-		correlationID: correlationID,
-		tenantID:      tenantID,
-		legalEntityID: legalEntityID,
-		actorID:       actorID,
-		payload:       payload,
-	})
+	p.publishes = append(p.publishes, record(e))
 	return p.failErr
 }
 
@@ -293,7 +292,7 @@ func TestRelay_SuccessfulPublish_MarksPublished(t *testing.T) {
 	pub := &mockPublisher{}
 
 	logger := zap.NewNop()
-	relay := outbox.NewRelay(pool, pub, 100*time.Millisecond, 50, logger)
+	relay := outbox.NewRelay(pool, pub, outbox.DestinationKafka, 100*time.Millisecond, 50, logger)
 
 	relay.RelayOnce(context.Background())
 
@@ -353,7 +352,7 @@ func TestRelay_FailedPublish_IncrementsAttemptsAndRecordsLastError(t *testing.T)
 	pub := &mockPublisher{failErr: errors.New("kafka connection refused")}
 
 	logger := zap.NewNop()
-	relay := outbox.NewRelay(pool, pub, 100*time.Millisecond, 50, logger)
+	relay := outbox.NewRelay(pool, pub, outbox.DestinationKafka, 100*time.Millisecond, 50, logger)
 
 	relay.RelayOnce(context.Background())
 
@@ -363,7 +362,7 @@ func TestRelay_FailedPublish_IncrementsAttemptsAndRecordsLastError(t *testing.T)
 
 	var foundFailureUpdate bool
 	for _, sql := range tx.execCalls {
-		if containsStr(sql, "publish_attempts = publish_attempts + 1") {
+		if containsStr(sql, "publish_attempts + 1") {
 			foundFailureUpdate = true
 		}
 	}
@@ -396,7 +395,7 @@ func TestRelay_StableEventIDAcrossRetries(t *testing.T) {
 	pool := &mockPool{tx: tx}
 	pub := &mockPublisher{}
 
-	relay := outbox.NewRelay(pool, pub, 100*time.Millisecond, 50, zap.NewNop())
+	relay := outbox.NewRelay(pool, pub, outbox.DestinationKafka, 100*time.Millisecond, 50, zap.NewNop())
 	relay.RelayOnce(context.Background())
 
 	if len(pub.publishes) != 1 {
@@ -412,7 +411,7 @@ func TestRelay_UsesForUpdateSkipLocked(t *testing.T) {
 	pool := &mockPool{tx: tx}
 	pub := &mockPublisher{}
 
-	relay := outbox.NewRelay(pool, pub, 100*time.Millisecond, 50, zap.NewNop())
+	relay := outbox.NewRelay(pool, pub, outbox.DestinationKafka, 100*time.Millisecond, 50, zap.NewNop())
 	relay.RelayOnce(context.Background())
 
 	if len(tx.queryCalls) != 1 {
@@ -451,7 +450,7 @@ func TestRelay_CrashBeforeCommit_RollsBack(t *testing.T) {
 	pool := &mockPool{tx: tx}
 	pub := &mockPublisher{}
 
-	relay := outbox.NewRelay(pool, pub, 100*time.Millisecond, 50, zap.NewNop())
+	relay := outbox.NewRelay(pool, pub, outbox.DestinationKafka, 100*time.Millisecond, 50, zap.NewNop())
 	relay.RelayOnce(context.Background())
 
 	// Kafka publish occurred
@@ -469,7 +468,7 @@ func TestRelay_StartAndCancel(t *testing.T) {
 	pool := &mockPool{tx: tx}
 	pub := &mockPublisher{}
 
-	relay := outbox.NewRelay(pool, pub, 10*time.Millisecond, 50, zap.NewNop())
+	relay := outbox.NewRelay(pool, pub, outbox.DestinationKafka, 10*time.Millisecond, 50, zap.NewNop())
 	ctx, cancel := context.WithCancel(context.Background())
 
 	done := make(chan struct{})
@@ -508,19 +507,11 @@ type mockConditionalPublisher struct {
 	failIDs   map[string]error
 }
 
-func (m *mockConditionalPublisher) PublishOutbox(ctx context.Context, outboxEventID, eventType, correlationID, tenantID, legalEntityID, actorID string, payload []byte) error {
+func (m *mockConditionalPublisher) Deliver(ctx context.Context, e outbox.StoredEvent) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.publishes = append(m.publishes, recordedPublish{
-		outboxEventID: outboxEventID,
-		eventType:     eventType,
-		correlationID: correlationID,
-		tenantID:      tenantID,
-		legalEntityID: legalEntityID,
-		actorID:       actorID,
-		payload:       payload,
-	})
-	if err, ok := m.failIDs[outboxEventID]; ok {
+	m.publishes = append(m.publishes, record(e))
+	if err, ok := m.failIDs[e.OutboxEventID]; ok {
 		return err
 	}
 	return nil
@@ -554,7 +545,7 @@ func TestRelay_MaxAttemptsCeiling_QueryFilterAndDeadLetterLogging(t *testing.T) 
 	pool := &mockPool{tx: tx}
 	pub := &mockPublisher{failErr: errors.New("kafka permanent failure")}
 
-	relay := outbox.NewRelay(pool, pub, 100*time.Millisecond, 10, zap.NewNop())
+	relay := outbox.NewRelay(pool, pub, outbox.DestinationKafka, 100*time.Millisecond, 10, zap.NewNop())
 	relay.RelayOnce(context.Background())
 
 	// 1. Assert polling query filtered by publish_attempts < $2
@@ -572,7 +563,7 @@ func TestRelay_MaxAttemptsCeiling_QueryFilterAndDeadLetterLogging(t *testing.T) 
 	// 2. Assert update incremented attempt to 10
 	var foundErrorUpdate bool
 	for _, call := range tx.execCalls {
-		if strings.Contains(call, "publish_attempts = publish_attempts + 1") {
+		if strings.Contains(call, "publish_attempts + 1") {
 			foundErrorUpdate = true
 			break
 		}
@@ -631,7 +622,7 @@ func TestRelay_DeadLetter_DoesNotBlockSubsequentEvents(t *testing.T) {
 		},
 	}
 
-	relay := outbox.NewRelay(pool, pub, 100*time.Millisecond, 10, zap.NewNop())
+	relay := outbox.NewRelay(pool, pub, outbox.DestinationKafka, 100*time.Millisecond, 10, zap.NewNop())
 	relay.RelayOnce(context.Background())
 
 	// Healthy event must be published
@@ -650,7 +641,7 @@ func TestRelay_DeadLetter_DoesNotBlockSubsequentEvents(t *testing.T) {
 	for _, call := range tx.execCalls {
 		if strings.Contains(call, "published_at = NOW()") {
 			publishedCount++
-		} else if strings.Contains(call, "publish_attempts = publish_attempts + 1") {
+		} else if strings.Contains(call, "publish_attempts + 1") {
 			errorCount++
 		}
 	}
@@ -659,5 +650,65 @@ func TestRelay_DeadLetter_DoesNotBlockSubsequentEvents(t *testing.T) {
 	}
 	if publishedCount != 1 {
 		t.Fatalf("expected 1 published update for healthy event, got %d", publishedCount)
+	}
+}
+
+// A refusal no retry can fix (the ledger already holds a different record
+// under this decision id) parks the event at once: attempts are raised to the
+// ceiling instead of retrying for ~16 hours.
+func TestRelay_PermanentRefusalParksAtOnce(t *testing.T) {
+	aID, cID := "a-1", "corr-1"
+	rows := &mockRows{rows: []mockEventRow{{
+		id: uuid.NewString(), aggType: "workflow_instance", aggID: "w-1", eventType: "governance.decision.record",
+		tenantID: "t-1", entityID: "e-1", actorID: &aID, corrID: &cID, payloadJSON: []byte(`{}`), attempts: 0,
+	}}}
+	tx := &mockTx{queryRows: rows}
+	pub := &mockPublisher{failErr: fmt.Errorf("%w: 409", outbox.ErrPermanent)}
+
+	outbox.NewRelay(&mockPool{tx: tx}, pub, outbox.DestinationDecisionLog, time.Second, 10, zap.NewNop()).RelayOnce(context.Background())
+
+	for i, call := range tx.execCalls {
+		if strings.Contains(call, "publish_attempts + 1") {
+			if got := tx.execArgs[i][2]; got != outbox.MaxPublishAttempts {
+				t.Fatalf("attempts floor = %v, want %d (parked)", got, outbox.MaxPublishAttempts)
+			}
+			return
+		}
+	}
+	t.Fatal("no failure update recorded")
+}
+
+// A transient failure keeps retrying: the floor is just the next attempt.
+func TestRelay_TransientFailureDoesNotPark(t *testing.T) {
+	aID, cID := "a-1", "corr-1"
+	rows := &mockRows{rows: []mockEventRow{{
+		id: uuid.NewString(), aggType: "workflow_instance", aggID: "w-1", eventType: "workflow.created",
+		tenantID: "t-1", entityID: "e-1", actorID: &aID, corrID: &cID, payloadJSON: []byte(`{}`), attempts: 3,
+	}}}
+	tx := &mockTx{queryRows: rows}
+	pub := &mockPublisher{failErr: errors.New("broker down")}
+
+	outbox.NewRelay(&mockPool{tx: tx}, pub, outbox.DestinationKafka, time.Second, 10, zap.NewNop()).RelayOnce(context.Background())
+
+	for i, call := range tx.execCalls {
+		if strings.Contains(call, "publish_attempts + 1") {
+			if got := tx.execArgs[i][2]; got != 4 {
+				t.Fatalf("attempts floor = %v, want 4", got)
+			}
+			return
+		}
+	}
+	t.Fatal("no failure update recorded")
+}
+
+// Each relay claims only its own destination's rows.
+func TestRelay_PollsOnlyItsDestination(t *testing.T) {
+	tx := &mockTx{queryRows: &mockRows{}}
+	outbox.NewRelay(&mockPool{tx: tx}, &mockPublisher{}, outbox.DestinationDecisionLog, time.Second, 10, zap.NewNop()).RelayOnce(context.Background())
+	if len(tx.queryArgs) != 1 || tx.queryArgs[0][2] != outbox.DestinationDecisionLog {
+		t.Fatalf("query args = %v, want destination decision_log as $3", tx.queryArgs)
+	}
+	if !strings.Contains(tx.queryCalls[0], "destination = $3") || !strings.Contains(tx.queryCalls[0], "next_attempt_at <= NOW()") {
+		t.Fatalf("poll does not filter by destination and due time:\n%s", tx.queryCalls[0])
 	}
 }

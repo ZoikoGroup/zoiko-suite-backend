@@ -2,6 +2,8 @@ package handler
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,15 +14,18 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
+	idenv "zoiko.io/identity-envelope"
 
 	"zoiko.io/workflow-svc/internal/authz"
-	"zoiko.io/workflow-svc/internal/decisionlog"
 	"zoiko.io/workflow-svc/internal/documentvault"
 	"zoiko.io/workflow-svc/internal/domain"
 	svcenvelope "zoiko.io/workflow-svc/internal/envelope"
 	"zoiko.io/workflow-svc/internal/evidence"
 	svcmiddleware "zoiko.io/workflow-svc/internal/middleware"
+	"zoiko.io/workflow-svc/internal/registry"
+	"zoiko.io/workflow-svc/internal/store"
 )
 
 // WorkflowStore is the narrow interface the handler depends on.
@@ -32,12 +37,13 @@ type WorkflowStore interface {
 	IsCurrentStageApprover(ctx context.Context, workflowInstanceID, principalID string) (bool, error)
 	SubmitAction(ctx context.Context, params domain.SubmitActionParams) (*domain.WorkflowInstance, *domain.WorkflowStage, bool, error)
 	SubmitQuorumVote(ctx context.Context, params domain.SubmitQuorumVoteParams) (*domain.WorkflowInstance, *domain.WorkflowStage, bool, error)
-	EscalateWorkflow(ctx context.Context, workflowInstanceID, actorPrincipalID string) (*domain.WorkflowInstance, bool, error)
-	CancelWorkflow(ctx context.Context, workflowInstanceID, actorPrincipalID string) (*domain.WorkflowInstance, bool, error)
+	EscalateWorkflow(ctx context.Context, workflowInstanceID, actorPrincipalID string, cmd ...domain.LifecycleCommand) (*domain.WorkflowInstance, bool, error)
+	CancelWorkflow(ctx context.Context, workflowInstanceID, actorPrincipalID string, cmd ...domain.LifecycleCommand) (*domain.WorkflowInstance, bool, error)
+	ExpireWorkflow(ctx context.Context, workflowInstanceID string, cmd ...domain.LifecycleCommand) (*domain.WorkflowInstance, bool, error)
 	InvalidateWorkflow(ctx context.Context, params domain.InvalidateWorkflowParams) (*domain.WorkflowInstance, bool, error)
 	VerifyRelease(ctx context.Context, params domain.VerifyReleaseParams) (*domain.ReleaseVerificationResult, error)
 	EscalateToWorkflow(ctx context.Context, params domain.EscalateToWorkflowParams) (*domain.WorkflowInstance, bool, error)
-	RequestChanges(ctx context.Context, workflowInstanceID, actorPrincipalID, rationale string, causationID *string) error
+	RequestChanges(ctx context.Context, workflowInstanceID, actorPrincipalID, rationale string, causationID *string, cmd ...domain.LifecycleCommand) error
 	ListPendingApprovals(ctx context.Context, tenantID string, limit, offset int) ([]*domain.WorkflowInstance, error)
 	GetApprovalEvidence(ctx context.Context, workflowInstanceID string) ([]*domain.WorkflowTransition, error)
 
@@ -155,24 +161,28 @@ type EvidenceClient interface {
 	GetContradictionFlag(ctx context.Context, tenantID, evidenceID, actorID, correlationID string) (bool, error)
 }
 
-// DecisionLogClient writes governance decisions to the decision-log-svc.
-// Optional: a nil client means decisions are not recorded in the governance ledger.
-type DecisionLogClient interface {
-	RecordDecision(ctx context.Context, params decisionlog.RecordDecisionParams) (decisionID string, err error)
-}
-
 type Handler struct {
-	store       WorkflowStore
-	publisher   EventPublisher
-	authz       authz.Client
-	documents   DocumentVaultClient
-	evidence    EvidenceClient
-	decisionLog DecisionLogClient
-	log         *zap.Logger
+	store     WorkflowStore
+	publisher EventPublisher
+	authz     authz.Client
+	documents DocumentVaultClient
+	evidence  EvidenceClient
+	registry  registry.Checker
+	readAuthz string
+	log       *zap.Logger
 }
 
 func New(store WorkflowStore, publisher EventPublisher, authzClient authz.Client, documents documentvault.Client, log *zap.Logger) *Handler {
-	return &Handler{store: store, publisher: publisher, authz: authzClient, documents: documents, log: log}
+	return &Handler{store: store, publisher: publisher, authz: authzClient, documents: documents,
+		registry: registry.Noop{}, log: log}
+}
+
+// WithRegistryChecker attaches the legal-entity check against
+// tenant-entity-registry-svc. Without it the handler admits any entity in the
+// caller's tenant (Noop), which is only acceptable in local/dev.
+func (h *Handler) WithRegistryChecker(checker registry.Checker) *Handler {
+	h.registry = checker
+	return h
 }
 
 // WithEvidenceClient attaches the optional AUD-06 evidence client — an
@@ -181,12 +191,6 @@ func New(store WorkflowStore, publisher EventPublisher, authzClient authz.Client
 // required parameter list stays unchanged.
 func (h *Handler) WithEvidenceClient(client evidence.Client) *Handler {
 	h.evidence = client
-	return h
-}
-
-// WithDecisionLogClient attaches the optional governance decision log client.
-func (h *Handler) WithDecisionLogClient(client decisionlog.Client) *Handler {
-	h.decisionLog = client
 	return h
 }
 
@@ -200,6 +204,9 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Post("/v1/workflows/{workflow_instance_id}/actions", h.SubmitAction)
 	r.Post("/v1/workflows/{workflow_instance_id}/quorum-votes", h.SubmitQuorumVote)
 	r.Post("/v1/workflows/{workflow_instance_id}/escalate", h.EscalateWorkflow)
+	// escalate-to had a handler and no route: escalating to a named owner
+	// was unreachable (Governance audit row 28).
+	r.Post("/v1/workflows/{workflow_instance_id}/escalate-to", h.EscalateToWorkflow)
 	r.Post("/v1/workflows/{workflow_instance_id}/cancel", h.CancelWorkflow)
 	r.Post("/v1/workflows/{workflow_instance_id}/invalidate", h.InvalidateWorkflow)
 	r.Post("/v1/workflows/{workflow_instance_id}/verify-release", h.VerifyRelease)
@@ -317,6 +324,15 @@ func (h *Handler) requireTenant(w http.ResponseWriter, r *http.Request) (string,
 		})
 		return "", false
 	}
+	// A non-UUID tenant used to reach the ::uuid cast and come back as a 503
+	// store outage (row 54); it is the caller's error.
+	if !isValidUUID(strings.ToLower(tenantID)) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error":   "invalid_tenant",
+			"message": "X-Tenant-Id must be a UUID",
+		})
+		return "", false
+	}
 	return tenantID, true
 }
 
@@ -339,6 +355,55 @@ func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (stri
 		return "", false
 	}
 	return principalID, true
+}
+
+// servicePrincipalPrefixes mark the platform's service and system principals
+// (svc-policy, svc-workflow, system:workflow-svc).
+var servicePrincipalPrefixes = []string{"svc-", "system:"}
+
+// refuseNonHumanApprover writes 403 approver_not_human and returns true when
+// the caller is a service account or workload rather than a person (R-INV-08,
+// decision Q-5, 21 Oct 2026). A verified envelope says so in
+// principal.principal_type; the platform's service principals are also known
+// by their prefix, which covers a caller whose envelope was not verified. A
+// workload calling over mTLS (basis mtls_peer) may still carry a decision for
+// the person it authenticated: the principal it names is checked, not the
+// workload.
+func (h *Handler) refuseNonHumanApprover(w http.ResponseWriter, r *http.Request, principalID string) bool {
+	reason := ""
+	if id, ok := idenv.FromContext(r.Context()); ok && id.Claims != nil {
+		if pt := strings.TrimSpace(id.Claims.Principal.PrincipalType); pt != "" && !strings.EqualFold(pt, "HUMAN") {
+			reason = "principal_type " + pt
+		}
+	}
+	for _, p := range servicePrincipalPrefixes {
+		if strings.HasPrefix(strings.ToLower(principalID), p) {
+			reason = "service principal"
+		}
+	}
+	if reason == "" {
+		return false
+	}
+	writeJSON(w, http.StatusForbidden, map[string]string{
+		"error":   "approver_not_human",
+		"message": domain.ErrApproverNotHuman.Error() + " (" + reason + ")",
+	})
+	return true
+}
+
+// refuseRejectWithoutRationale writes 400 rationale_required and returns true
+// for a REJECT with no rationale: a rejection is the decision an initiator and
+// an auditor most need the reason for (row 38).
+func refuseRejectWithoutRationale(w http.ResponseWriter, action string, rationale *string) bool {
+	if action != "REJECT" || strings.TrimSpace(derefString(rationale)) != "" {
+		return false
+	}
+	writeJSON(w, http.StatusBadRequest, map[string]string{
+		"error":   "rationale_required",
+		"field":   "rationale",
+		"message": domain.ErrRationaleRequired.Error(),
+	})
+	return true
 }
 
 // refuseForeignTenant reports whether claimed names a tenant other than
@@ -364,6 +429,42 @@ func (h *Handler) requireCorrelationID(w http.ResponseWriter, r *http.Request) (
 		return "", false
 	}
 	return correlationID, true
+}
+
+// commandMeta builds the lineage a state-changing command records with its
+// transition. The ledger decision id is allocated here, before the store
+// transaction, so the transition, its outbox events and the ledger record all
+// carry the same id. bodyParts is the command's canonical body: an
+// Idempotency-Key replayed with different bodyParts is
+// ErrIdempotencyMismatch, while a retry of the same command replays.
+func commandMeta(r *http.Request, correlationID string, bodyParts ...string) domain.CommandMeta {
+	meta := domain.CommandMeta{
+		IdempotencyKey: strings.TrimSpace(r.Header.Get("Idempotency-Key")),
+		CorrelationID:  correlationID,
+		DecisionID:     uuid.NewString(),
+		Jurisdiction:   strings.TrimSpace(r.Header.Get("X-Jurisdiction-Context")),
+	}
+	if meta.IdempotencyKey != "" {
+		sum := sha256.Sum256([]byte(strings.Join(bodyParts, "\x00")))
+		meta.RequestHash = hex.EncodeToString(sum[:])
+	}
+	return meta
+}
+
+// decisionIDFor returns the ledger decision id only when this call committed a
+// new transition; an idempotent no-op has no new evidence to point at.
+func decisionIDFor(meta domain.CommandMeta, transitioned bool) string {
+	if !transitioned {
+		return ""
+	}
+	return meta.DecisionID
+}
+
+func derefString(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return *p
 }
 
 func correlationIDMiddleware(next http.Handler) http.Handler {
@@ -407,6 +508,10 @@ func (req createWorkflowRequest) missingField() string {
 type workflowResponse struct {
 	*domain.WorkflowInstance
 	Stages []*domain.WorkflowStage `json:"stages"`
+	// DecisionID is the governance-ledger record written with a decision
+	// (row 39: evidence_id returned). It is empty on an idempotent replay that
+	// made no new transition.
+	DecisionID string `json:"decision_id,omitempty"`
 }
 
 // CreateWorkflow handles POST /v1/workflows.
@@ -437,10 +542,86 @@ func (h *Handler) CreateWorkflow(w http.ResponseWriter, r *http.Request) {
 	if h.refuseForeignTenant(w, req.TenantID, tenantScope) {
 		return
 	}
+	// The envelope's X-Legal-Entity-Id and the body name the same entity; the
+	// body's is what is authorized and stored, so they may not disagree
+	// (row 53). A non-UUID entity used to reach the cast as a 503 (row 54).
+	if !isValidUUID(strings.ToLower(req.LegalEntityID)) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_uuid", "field": "legal_entity_id"})
+		return
+	}
+	if hdr := strings.TrimSpace(r.Header.Get("X-Legal-Entity-Id")); hdr != "" && !strings.EqualFold(hdr, req.LegalEntityID) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error":   "legal_entity_mismatch",
+			"message": "body legal_entity_id does not match the X-Legal-Entity-Id header",
+		})
+		return
+	}
+
+	// Resolve the pinned definition first: when the caller names one without
+	// spelling out stages, the instance follows that definition's route
+	// (including ROLE stages and deadlines). Doing this before validation
+	// means definition-supplied stages get the same checks as caller-supplied
+	// ones.
+	var instanceDueAt *time.Time
+	if req.WorkflowDefinitionID != "" {
+		if !isValidUUID(req.WorkflowDefinitionID) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_uuid", "field": "workflow_definition_id"})
+			return
+		}
+		defID := req.WorkflowDefinitionID
+		def, defErr := h.store.GetWorkflowDefinition(r.Context(), domain.GetWorkflowDefinitionParams{
+			TenantID:             req.TenantID,
+			WorkflowDefinitionID: &defID,
+		})
+		if defErr != nil {
+			if errors.Is(defErr, domain.ErrWorkflowNotFound) {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "workflow_definition_not_found"})
+				return
+			}
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			return
+		}
+		if def.WorkflowType != req.WorkflowType {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error":   "workflow_definition_type_mismatch",
+				"message": "workflow_definition_id does not match workflow_type",
+			})
+			return
+		}
+		if !def.IsActive {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "workflow_definition_not_active"})
+			return
+		}
+		if req.WorkflowDefinitionVersion != 0 && req.WorkflowDefinitionVersion != def.Version {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "workflow_definition_version_mismatch"})
+			return
+		}
+		// Always pin the resolved version, even when the caller omitted it.
+		req.WorkflowDefinitionVersion = def.Version
+
+		if len(req.Stages) == 0 {
+			defStages, stageErr := store.DefinitionStages(def)
+			if stageErr != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{
+					"error": "invalid_definition_stages", "message": stageErr.Error(),
+				})
+				return
+			}
+			req.Stages = defStages
+		}
+		if req.EscalationTarget == nil {
+			req.EscalationTarget = def.EscalationTarget
+		}
+		if def.ExpiryHours != nil && *def.ExpiryHours > 0 {
+			t := time.Now().UTC().Add(time.Duration(*def.ExpiryHours) * time.Hour)
+			instanceDueAt = &t
+		}
+	}
 	if len(req.Stages) == 0 {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "no_stages"})
 		return
 	}
+
 	// Each stage is SINGLE (default, one named approver) or QUORUM (an
 	// eligible pool with an N-of-M threshold — ZS-SVC-R-001 §5.1).
 	// Segregation of Duties (docs/original_doc/zoiko_suite_doc1.txt §12.3):
@@ -483,19 +664,53 @@ func (h *Handler) CreateWorkflow(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 			}
+		case domain.StageTypeRole:
+			if strings.TrimSpace(st.ApproverRole) == "" {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "stages[].approver_role"})
+				return
+			}
+			// A ROLE stage names a role, not a principal: naming both would
+			// leave it ambiguous who the stage is for.
+			if st.ApproverPrincipalID != "" || len(st.QuorumApprovers) > 0 {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "role_stage_takes_no_approver", "field": fmt.Sprintf("stages[%d]", i)})
+				return
+			}
 		default:
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_stage_type", "field": fmt.Sprintf("stages[%d].stage_type", i)})
 			return
 		}
 	}
 
+	// The legal entity is tenant-entity-registry-svc's fact, not one this
+	// service may assume from a UUID the caller supplied.
+	if h.registry != nil {
+		if err := h.registry.CheckEntity(r.Context(), req.TenantID, req.LegalEntityID); err != nil {
+			switch {
+			case errors.Is(err, domain.ErrLegalEntityNotFound):
+				writeJSON(w, http.StatusNotFound, map[string]string{"error": "legal_entity_not_found"})
+			default:
+				h.log.Error("CreateWorkflow: tenant-entity-registry-svc unavailable — failing closed",
+					zap.String("correlation_id", correlationID), zap.Error(err))
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "registry_unavailable"})
+			}
+			return
+		}
+	}
+
 	// Validate each named approver is authorized to approve for this legal
 	// entity: the one approver of a SINGLE stage, every member of a QUORUM
-	// pool. Defense in depth; full server-resolved routing (WFC-01) requires a
-	// separate rule engine service per R-001.
+	// pool. A ROLE stage names no principal, so there is no one to check
+	// until decision time. Defense in depth; full server-resolved routing
+	// (WFC-01) requires a separate rule engine service per R-001.
 	for _, st := range req.Stages {
 		for _, approver := range stageApprovers(st) {
-			if err := h.authz.CheckApprovalAllowed(r.Context(), approver, req.LegalEntityID, principalID); err != nil {
+			attrs := map[string]string{
+				authz.AttrWorkflowType: req.WorkflowType,
+			}
+			if st.ApproverRole != "" {
+				attrs[authz.AttrApproverRole] = st.ApproverRole
+			}
+			if _, err := h.authz.CheckApprovalAllowed(r.Context(), approver, req.LegalEntityID, principalID, attrs); err != nil {
 				switch {
 				case errors.Is(err, domain.ErrAuthorizationDenied):
 					writeJSON(w, http.StatusForbidden, map[string]string{
@@ -573,43 +788,6 @@ func (h *Handler) CreateWorkflow(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	if req.WorkflowDefinitionID != "" {
-		if !isValidUUID(req.WorkflowDefinitionID) {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_uuid", "field": "workflow_definition_id"})
-			return
-		}
-		defID := req.WorkflowDefinitionID
-		def, defErr := h.store.GetWorkflowDefinition(r.Context(), domain.GetWorkflowDefinitionParams{
-			TenantID:             req.TenantID,
-			WorkflowDefinitionID: &defID,
-		})
-		if defErr != nil {
-			if errors.Is(defErr, domain.ErrWorkflowNotFound) {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "workflow_definition_not_found"})
-				return
-			}
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
-			return
-		}
-		if def.WorkflowType != req.WorkflowType {
-			writeJSON(w, http.StatusBadRequest, map[string]string{
-				"error":   "workflow_definition_type_mismatch",
-				"message": "workflow_definition_id does not match workflow_type",
-			})
-			return
-		}
-		if !def.IsActive {
-			writeJSON(w, http.StatusConflict, map[string]string{"error": "workflow_definition_not_active"})
-			return
-		}
-		if req.WorkflowDefinitionVersion != 0 && req.WorkflowDefinitionVersion != def.Version {
-			writeJSON(w, http.StatusConflict, map[string]string{"error": "workflow_definition_version_mismatch"})
-			return
-		}
-		// Always pin the resolved version, even when the caller omitted it.
-		req.WorkflowDefinitionVersion = def.Version
-	}
-
 	instance, stages, created, err := h.store.CreateWorkflow(r.Context(), domain.CreateWorkflowParams{
 		// initiated_by is always the verified caller, never the request
 		// body �?" see requirePrincipal's doc comment.
@@ -621,6 +799,7 @@ func (h *Handler) CreateWorkflow(w http.ResponseWriter, r *http.Request) {
 		EscalationTarget:          req.EscalationTarget,
 		WorkflowDefinitionID:      req.WorkflowDefinitionID,
 		WorkflowDefinitionVersion: req.WorkflowDefinitionVersion,
+		DueAt:                     instanceDueAt,
 	})
 	if err != nil {
 		if errors.Is(err, domain.ErrNoStages) {
@@ -669,6 +848,10 @@ func (h *Handler) GetWorkflow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
 	if _, ok := h.requireTenant(w, r); !ok {
 		return
 	}
@@ -676,6 +859,9 @@ func (h *Handler) GetWorkflow(w http.ResponseWriter, r *http.Request) {
 	instance, err := h.store.FindWorkflowByID(r.Context(), workflowInstanceID)
 	if err != nil {
 		writeStoreErr(w, h.log, err, correlationID, "GetWorkflow")
+		return
+	}
+	if !h.authorizeRead(w, r, instance, principalID, correlationID, "GetWorkflow") {
 		return
 	}
 	stages, err := h.store.FindStagesByWorkflowID(r.Context(), workflowInstanceID)
@@ -701,7 +887,20 @@ func (h *Handler) GetNextApprover(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
 	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+
+	instance, err := h.store.FindWorkflowByID(r.Context(), workflowInstanceID)
+	if err != nil {
+		writeStoreErr(w, h.log, err, correlationID, "GetNextApprover")
+		return
+	}
+	if !h.authorizeRead(w, r, instance, principalID, correlationID, "GetNextApprover") {
 		return
 	}
 
@@ -779,6 +978,9 @@ func (h *Handler) SubmitAction(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_field", "field": "action", "message": "must be APPROVE or REJECT"})
 		return
 	}
+	if refuseRejectWithoutRationale(w, req.Action, req.Rationale) || h.refuseNonHumanApprover(w, r, principalID) {
+		return
+	}
 
 	instanceForAuthzCheck, err := h.store.FindWorkflowByID(r.Context(), workflowInstanceID)
 	if err != nil {
@@ -794,18 +996,6 @@ func (h *Handler) SubmitAction(w http.ResponseWriter, r *http.Request) {
 	// existed, or via any path that bypasses it.
 	if principalID == instanceForAuthzCheck.InitiatedBy {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "self_approval_not_allowed", "message": domain.ErrSelfApprovalNotAllowed.Error()})
-		return
-	}
-
-	if err := h.authz.CheckApprovalAllowed(r.Context(), principalID, instanceForAuthzCheck.LegalEntityID, instanceForAuthzCheck.InitiatedBy); err != nil {
-		switch {
-		case errors.Is(err, domain.ErrAuthorizationDenied):
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": "authorization_denied"})
-		default:
-			h.log.Error("SubmitAction: authorization-svc unavailable — failing closed",
-				zap.String("correlation_id", correlationID), zap.Error(err))
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "authorization_service_unavailable"})
-		}
 		return
 	}
 
@@ -830,17 +1020,45 @@ func (h *Handler) SubmitAction(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Resolve the current stage to get the assigned approver for delegation support.
+	// Resolve the current stage: it names the approver (or the role) the
+	// authorization question is about.
 	currentStage, err := h.store.FindCurrentStage(r.Context(), workflowInstanceID)
 	if err != nil {
 		writeStoreErr(w, h.log, err, correlationID, "SubmitAction")
 		return
 	}
 
-	assignedApproverID := ""
-	if currentStage.ApproverPrincipalID != principalID {
+	attrs := map[string]string{
+		authz.AttrWorkflowType: instanceForAuthzCheck.WorkflowType,
+		authz.AttrStageOrder:   strconv.Itoa(currentStage.StageOrder),
+	}
+	if currentStage.ApproverRole != nil && *currentStage.ApproverRole != "" {
+		attrs[authz.AttrApproverRole] = *currentStage.ApproverRole
+	}
+	authority, err := h.authz.CheckApprovalAllowed(r.Context(), principalID, instanceForAuthzCheck.LegalEntityID, instanceForAuthzCheck.InitiatedBy, attrs)
+	if err != nil {
+		switch {
+		case errors.Is(err, domain.ErrAuthorizationDenied):
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "authorization_denied"})
+		default:
+			h.log.Error("SubmitAction: authorization-svc unavailable — failing closed",
+				zap.String("correlation_id", correlationID), zap.Error(err))
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "authorization_service_unavailable"})
+		}
+		return
+	}
+
+	actingAs, assignedApproverID := "", ""
+	switch {
+	case instanceForAuthzCheck.WorkflowStatus == domain.WorkflowStatusEscalated &&
+		instanceForAuthzCheck.EscalationTarget != nil && *instanceForAuthzCheck.EscalationTarget == principalID:
+		actingAs = "escalation"
+	case currentStage.StageType == domain.StageTypeRole:
+		actingAs = "role"
+	case currentStage.ApproverPrincipalID != "" && currentStage.ApproverPrincipalID != principalID:
 		// Caller is not the assigned approver — check if they're a delegate.
-		if err := h.authz.CheckDelegation(r.Context(), principalID, currentStage.ApproverPrincipalID, instanceForAuthzCheck.LegalEntityID); err != nil {
+		delegated, err := h.authz.CheckDelegation(r.Context(), principalID, currentStage.ApproverPrincipalID, instanceForAuthzCheck.LegalEntityID)
+		if err != nil {
 			switch {
 			case errors.Is(err, domain.ErrAuthorizationDenied):
 				writeJSON(w, http.StatusForbidden, map[string]string{"error": "wrong_approver"})
@@ -853,11 +1071,17 @@ func (h *Handler) SubmitAction(w http.ResponseWriter, r *http.Request) {
 		}
 		// Delegate authorized: use the assigned approver's ID for stage lookup.
 		assignedApproverID = currentStage.ApproverPrincipalID
+		authority.DelegationID = delegated.DelegationID
+		if authority.Basis == "" {
+			authority.Basis = delegated.Basis
+		}
 	}
 
+	meta := commandMeta(r, correlationID, req.Action, derefString(req.Rationale), derefString(req.CausationID), workflowInstanceID)
 	instance, stage, transitioned, err := h.store.SubmitAction(r.Context(), domain.SubmitActionParams{
 		WorkflowInstanceID: workflowInstanceID, ActorPrincipalID: principalID, AssignedApproverID: assignedApproverID,
 		Action: req.Action, Rationale: req.Rationale, CausationID: req.CausationID,
+		ActingAs: actingAs, Authority: authority, Meta: meta,
 	})
 	if err != nil {
 		switch {
@@ -879,71 +1103,6 @@ func (h *Handler) SubmitAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if transitioned {
-		// Event publication (approval.granted/rejected, workflow.completed) is handled
-		// by the transactional outbox (outbox_events), written atomically in SubmitAction's DB transaction.
-
-		// Record governance decision per GOV §1 "No evidence afterthought"
-		if h.decisionLog != nil {
-			actionType := "WORKFLOW_" + req.Action
-			outcome := req.Action
-			if instance.WorkflowStatus == "APPROVED" {
-				actionType = "WORKFLOW_APPROVED"
-				outcome = "APPROVED"
-			} else if instance.WorkflowStatus == "REJECTED" {
-				actionType = "WORKFLOW_REJECTED"
-				outcome = "REJECTED"
-			}
-			// Populate evidence refs from the stage's rationale and transition metadata
-			evidenceRefs := []string{}
-			if stage.Rationale != nil && *stage.Rationale != "" {
-				evidenceRefs = append(evidenceRefs, "stage_rationale:"+*stage.Rationale)
-			}
-			if req.Rationale != nil && *req.Rationale != "" {
-				evidenceRefs = append(evidenceRefs, "action_rationale:"+*req.Rationale)
-			}
-			if req.CausationID != nil && *req.CausationID != "" {
-				evidenceRefs = append(evidenceRefs, "causation_id:"+*req.CausationID)
-			}
-			decisionID, dlErr := h.decisionLog.RecordDecision(r.Context(), decisionlog.RecordDecisionParams{
-				TenantID:         instance.TenantID,
-				LegalEntityID:    instance.LegalEntityID,
-				ActorPrincipalID: principalID,
-				ActionType:       actionType,
-				ResourceType:     "workflow_instance",
-				ResourceID:       instance.WorkflowInstanceID,
-				Outcome:          outcome,
-				Rationale:        req.Rationale,
-				CorrelationID:    correlationID,
-				CausationID:      req.CausationID,
-				WorkflowType:     instance.WorkflowType,
-				WorkflowDefinitionID: func() *string {
-					if instance.WorkflowDefinitionID != "" {
-						return &instance.WorkflowDefinitionID
-					}
-					return nil
-				}(),
-				WorkflowDefinitionVersion: func() *int {
-					if instance.WorkflowDefinitionVersion > 0 {
-						return &instance.WorkflowDefinitionVersion
-					}
-					return nil
-				}(),
-				EvidenceRefs:       evidenceRefs,
-				SubjectType:        instance.SubjectType,
-				SubjectID:          instance.SubjectID,
-				SubjectVersion:     instance.SubjectVersion,
-				SubjectFingerprint: instance.SubjectFingerprint,
-			})
-			if dlErr != nil {
-				h.log.Error("SubmitAction: failed to record governance decision", zap.String("correlation_id", correlationID), zap.Error(dlErr))
-				// Don't fail the request — decision log is best-effort for now
-			} else {
-				h.log.Info("governance decision recorded", zap.String("decision_id", decisionID), zap.String("workflow_instance_id", workflowInstanceID))
-			}
-		}
-	}
-
 	h.log.Info("workflow action submitted",
 		zap.String("workflow_instance_id", workflowInstanceID),
 		zap.String("action", req.Action),
@@ -951,7 +1110,7 @@ func (h *Handler) SubmitAction(w http.ResponseWriter, r *http.Request) {
 		zap.String("workflow_status", instance.WorkflowStatus),
 		zap.String("correlation_id", correlationID),
 	)
-	writeJSON(w, http.StatusOK, workflowResponse{WorkflowInstance: instance, Stages: []*domain.WorkflowStage{stage}})
+	writeJSON(w, http.StatusOK, workflowResponse{WorkflowInstance: instance, Stages: []*domain.WorkflowStage{stage}, DecisionID: decisionIDFor(meta, transitioned)})
 }
 
 // ── POST /v1/workflows/{id}/quorum-votes ─────────────────────────────────────
@@ -964,6 +1123,12 @@ func (h *Handler) SubmitAction(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) SubmitQuorumVote(w http.ResponseWriter, r *http.Request) {
 	workflowInstanceID := chi.URLParam(r, "workflow_instance_id")
 	correlationID := r.Header.Get("X-Correlation-ID")
+
+	// The one action route that never checked its path id (row 54).
+	if !isValidUUID(workflowInstanceID) {
+		writeError(w, http.StatusBadRequest, "invalid_uuid", "workflow_instance_id must be a valid UUID", correlationID, nil)
+		return
+	}
 
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
@@ -982,6 +1147,9 @@ func (h *Handler) SubmitQuorumVote(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_field", "field": "action", "message": "must be APPROVE or REJECT"})
 		return
 	}
+	if refuseRejectWithoutRationale(w, req.Action, req.Rationale) || h.refuseNonHumanApprover(w, r, principalID) {
+		return
+	}
 
 	instanceForAuthzCheck, err := h.store.FindWorkflowByID(r.Context(), workflowInstanceID)
 	if err != nil {
@@ -998,7 +1166,17 @@ func (h *Handler) SubmitQuorumVote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.authz.CheckApprovalAllowed(r.Context(), principalID, instanceForAuthzCheck.LegalEntityID, instanceForAuthzCheck.InitiatedBy); err != nil {
+	currentStage, err := h.store.FindCurrentStage(r.Context(), workflowInstanceID)
+	if err != nil {
+		writeStoreErr(w, h.log, err, correlationID, "SubmitQuorumVote")
+		return
+	}
+	authority, err := h.authz.CheckApprovalAllowed(r.Context(), principalID, instanceForAuthzCheck.LegalEntityID, instanceForAuthzCheck.InitiatedBy,
+		map[string]string{
+			authz.AttrWorkflowType: instanceForAuthzCheck.WorkflowType,
+			authz.AttrStageOrder:   strconv.Itoa(currentStage.StageOrder),
+		})
+	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrAuthorizationDenied):
 			writeJSON(w, http.StatusForbidden, map[string]string{"error": "authorization_denied"})
@@ -1010,9 +1188,10 @@ func (h *Handler) SubmitQuorumVote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	meta := commandMeta(r, correlationID, req.Action, derefString(req.Rationale), derefString(req.CausationID), workflowInstanceID)
 	instance, stage, transitioned, err := h.store.SubmitQuorumVote(r.Context(), domain.SubmitQuorumVoteParams{
 		WorkflowInstanceID: workflowInstanceID, ActorPrincipalID: principalID, Action: req.Action,
-		Rationale: req.Rationale, CausationID: req.CausationID,
+		Rationale: req.Rationale, CausationID: req.CausationID, Authority: authority, Meta: meta,
 	})
 	if err != nil {
 		switch {
@@ -1036,51 +1215,6 @@ func (h *Handler) SubmitQuorumVote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Every accepted quorum vote is a governance decision in its own right,
-	// not only the vote that crosses the threshold. Record each one with the
-	// voter as actor so the decision log reconstructs who approved what.
-	if h.decisionLog != nil {
-		var evidenceRefs []string
-		if req.Rationale != nil && *req.Rationale != "" {
-			evidenceRefs = append(evidenceRefs, "quorum_vote_rationale:"+*req.Rationale)
-		}
-		decisionID, dlErr := h.decisionLog.RecordDecision(r.Context(), decisionlog.RecordDecisionParams{
-			TenantID:         instance.TenantID,
-			LegalEntityID:    instance.LegalEntityID,
-			ActorPrincipalID: principalID,
-			ActionType:       "WORKFLOW_QUORUM_VOTE",
-			ResourceType:     "workflow_instance",
-			ResourceID:       instance.WorkflowInstanceID,
-			Outcome:          req.Action,
-			Rationale:        req.Rationale,
-			CorrelationID:    correlationID,
-			CausationID:      req.CausationID,
-			WorkflowType:     instance.WorkflowType,
-			WorkflowDefinitionID: func() *string {
-				if instance.WorkflowDefinitionID != "" {
-					return &instance.WorkflowDefinitionID
-				}
-				return nil
-			}(),
-			WorkflowDefinitionVersion: func() *int {
-				if instance.WorkflowDefinitionVersion > 0 {
-					return &instance.WorkflowDefinitionVersion
-				}
-				return nil
-			}(),
-			EvidenceRefs:       evidenceRefs,
-			SubjectType:        instance.SubjectType,
-			SubjectID:          instance.SubjectID,
-			SubjectVersion:     instance.SubjectVersion,
-			SubjectFingerprint: instance.SubjectFingerprint,
-		})
-		if dlErr != nil {
-			h.log.Error("SubmitQuorumVote: failed to record governance decision", zap.String("correlation_id", correlationID), zap.Error(dlErr))
-		} else {
-			h.log.Info("governance decision recorded", zap.String("decision_id", decisionID), zap.String("workflow_instance_id", workflowInstanceID))
-		}
-	}
-
 	h.log.Info("workflow quorum vote submitted",
 		zap.String("workflow_instance_id", workflowInstanceID),
 		zap.String("action", req.Action),
@@ -1088,7 +1222,7 @@ func (h *Handler) SubmitQuorumVote(w http.ResponseWriter, r *http.Request) {
 		zap.String("workflow_status", instance.WorkflowStatus),
 		zap.String("correlation_id", correlationID),
 	)
-	writeJSON(w, http.StatusOK, workflowResponse{WorkflowInstance: instance, Stages: []*domain.WorkflowStage{stage}})
+	writeJSON(w, http.StatusOK, workflowResponse{WorkflowInstance: instance, Stages: []*domain.WorkflowStage{stage}, DecisionID: decisionIDFor(meta, transitioned)})
 }
 
 // ── Lifecycle authorization (cancel / escalate / invalidate) ─────────────────
@@ -1103,7 +1237,6 @@ const (
 	actionWorkflowInvalidate = "WORKFLOW_INVALIDATE"
 	actionWorkflowAdminister = "WORKFLOW_ADMINISTER"
 	actionWorkflowDefine     = "WORKFLOW_DEFINE"
-	actionWorkflowExpire     = "WORKFLOW_EXPIRE"
 	actionWorkflowEscalateTo = "WORKFLOW_ESCALATE_TO"
 )
 
@@ -1117,12 +1250,83 @@ const (
 // Must stay in lockstep with authorization-svc's handler.PlatformScopeSentinel.
 const platformScopeSentinel = "PLATFORM"
 
+// actionWorkflowRead gates every read of an instance, its evidence and the
+// definitions. Reads were tenant-scoped only: anyone holding a tenant header
+// could read the tenant's whole approval history (GCP §2 invariant #3, "read
+// strongly scoped").
+const actionWorkflowRead = "WORKFLOW_READ"
+
+// Read authorization modes (WORKFLOW_READ_AUTHZ).
+const (
+	ReadAuthzEnforce = "enforce"
+	ReadAuthzWarn    = "warn"
+	ReadAuthzOff     = "off"
+)
+
+// WithReadAuthz sets the read-authorization mode: enforce (default), warn
+// (log a refusal and serve the read — for a rollout while role templates are
+// granted) or off.
+func (h *Handler) WithReadAuthz(mode string) *Handler {
+	h.readAuthz = strings.ToLower(strings.TrimSpace(mode))
+	return h
+}
+
+// authorizeRead decides a read. instance nil means a tenant-wide read (the
+// pending list, definitions), authorized at the platform scope. A participant
+// — the initiator or an approver of the current stage — reads its own
+// instance without the grant; anyone else needs WORKFLOW_READ on the
+// instance's legal entity. Writes the 403/503 and returns false when the
+// caller must stop.
+func (h *Handler) authorizeRead(w http.ResponseWriter, r *http.Request, instance *domain.WorkflowInstance, principalID, correlationID, op string) bool {
+	if h.readAuthz == ReadAuthzOff {
+		return true
+	}
+	entity, owner := platformScopeSentinel, principalID
+	if instance != nil {
+		if principalID == instance.InitiatedBy {
+			return true
+		}
+		onStage, err := h.store.IsCurrentStageApprover(r.Context(), instance.WorkflowInstanceID, principalID)
+		if err == nil && onStage {
+			return true
+		}
+		entity, owner = instance.LegalEntityID, instance.InitiatedBy
+	}
+	err := h.authz.CheckAllowed(r.Context(), principalID, entity, actionWorkflowRead, owner)
+	if err == nil {
+		return true
+	}
+	if h.readAuthz == ReadAuthzWarn {
+		h.log.Warn(op+": read not authorized — served because WORKFLOW_READ_AUTHZ=warn",
+			zap.String("principal_id", principalID), zap.String("correlation_id", correlationID), zap.Error(err))
+		return true
+	}
+	if errors.Is(err, domain.ErrAuthorizationDenied) {
+		writeError(w, http.StatusForbidden, "authorization_denied", "principal is not authorized to read this workflow", correlationID,
+			map[string]any{"action_type": actionWorkflowRead})
+		return false
+	}
+	h.log.Error(op+": authorization-svc unavailable — failing closed", zap.String("correlation_id", correlationID), zap.Error(err))
+	writeError(w, http.StatusServiceUnavailable, "authorization_service_unavailable", "authorization service unavailable", correlationID,
+		map[string]any{"retryable": true})
+	return false
+}
+
 // authorizeLifecycle asks authorization-svc whether principalID may perform
 // action on instance, failing closed. The initiator goes along as the resource
 // owner, so an own-object rule declared for the action still applies. Writes
 // the 403 / 503 itself and returns false when the caller must stop.
 // For workflow definition operations (instance == nil), uses platform scope.
 func (h *Handler) authorizeLifecycle(w http.ResponseWriter, r *http.Request, instance *domain.WorkflowInstance, principalID, action, correlationID, op string) bool {
+	_, ok := h.authorizeLifecycleCommand(w, r, instance, principalID, action, correlationID, op)
+	return ok
+}
+
+// authorizeLifecycleCommand is authorizeLifecycle for commands that are
+// written as lifecycle transitions: it returns the authorization-svc decision
+// so the ledger record and outbox event carry the access_decision_id and
+// basis, the same lineage approval decisions already record.
+func (h *Handler) authorizeLifecycleCommand(w http.ResponseWriter, r *http.Request, instance *domain.WorkflowInstance, principalID, action, correlationID, op string) (domain.ActionAuthority, bool) {
 	var legalEntityID string
 	if instance != nil {
 		legalEntityID = instance.LegalEntityID
@@ -1136,22 +1340,22 @@ func (h *Handler) authorizeLifecycle(w http.ResponseWriter, r *http.Request, ins
 	} else {
 		initiatedBy = principalID
 	}
-	err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, action, initiatedBy)
+	authority, err := h.authz.CheckAllowedWithAuthority(r.Context(), principalID, legalEntityID, action, initiatedBy)
 	if err == nil {
-		return true
+		return authority, true
 	}
 	if errors.Is(err, domain.ErrAuthorizationDenied) {
 		writeError(w, http.StatusForbidden, "authorization_denied", "principal is not authorized for "+action+" on this workflow", correlationID, map[string]any{
 			"action_type": action,
 		})
-		return false
+		return domain.ActionAuthority{}, false
 	}
 	h.log.Error(op+": authorization-svc unavailable — failing closed",
 		zap.String("correlation_id", correlationID), zap.String("action_type", action), zap.Error(err))
 	writeError(w, http.StatusServiceUnavailable, "authorization_service_unavailable", "authorization service unavailable", correlationID, map[string]any{
 		"retryable": true,
 	})
-	return false
+	return domain.ActionAuthority{}, false
 }
 
 // ── POST /v1/workflows/{id}/escalate ─────────────────────────────────────────
@@ -1197,58 +1401,16 @@ func (h *Handler) EscalateWorkflow(w http.ResponseWriter, r *http.Request) {
 			action = actionWorkflowEscalate
 		}
 	}
-	if !h.authorizeLifecycle(w, r, instanceForAuthzCheck, principalID, action, correlationID, "EscalateWorkflow") {
+	authority, ok := h.authorizeLifecycleCommand(w, r, instanceForAuthzCheck, principalID, action, correlationID, "EscalateWorkflow")
+	if !ok {
 		return
 	}
 
-	instance, transitioned, err := h.store.EscalateWorkflow(r.Context(), workflowInstanceID, principalID)
+	instance, _, err := h.store.EscalateWorkflow(r.Context(), workflowInstanceID, principalID,
+		domain.LifecycleCommand{Authority: authority, Meta: commandMeta(r, correlationID, "ESCALATE", workflowInstanceID)})
 	if err != nil {
 		writeStoreErr(w, h.log, err, correlationID, "EscalateWorkflow")
 		return
-	}
-	if transitioned {
-		// Event publication is handled by the transactional outbox (outbox_events),
-		// written atomically in EscalateWorkflow's DB transaction.
-
-		// Record governance decision per GOV §1 "No evidence afterthought"
-		if h.decisionLog != nil {
-			evidenceRefs := []string{"escalation_reason:stage_timeout_or_manual"}
-			decisionID, dlErr := h.decisionLog.RecordDecision(r.Context(), decisionlog.RecordDecisionParams{
-				TenantID:         instance.TenantID,
-				LegalEntityID:    instance.LegalEntityID,
-				ActorPrincipalID: principalID,
-				ActionType:       "WORKFLOW_ESCALATED",
-				ResourceType:     "workflow_instance",
-				ResourceID:       instance.WorkflowInstanceID,
-				Outcome:          "ESCALATED",
-				Rationale:        nil,
-				CorrelationID:    correlationID,
-				CausationID:      nil,
-				WorkflowType:     instance.WorkflowType,
-				WorkflowDefinitionID: func() *string {
-					if instance.WorkflowDefinitionID != "" {
-						return &instance.WorkflowDefinitionID
-					}
-					return nil
-				}(),
-				WorkflowDefinitionVersion: func() *int {
-					if instance.WorkflowDefinitionVersion > 0 {
-						return &instance.WorkflowDefinitionVersion
-					}
-					return nil
-				}(),
-				EvidenceRefs:       evidenceRefs,
-				SubjectType:        instance.SubjectType,
-				SubjectID:          instance.SubjectID,
-				SubjectVersion:     instance.SubjectVersion,
-				SubjectFingerprint: instance.SubjectFingerprint,
-			})
-			if dlErr != nil {
-				h.log.Error("EscalateWorkflow: failed to record governance decision", zap.String("correlation_id", correlationID), zap.Error(dlErr))
-			} else {
-				h.log.Info("governance decision recorded", zap.String("decision_id", decisionID), zap.String("workflow_instance_id", workflowInstanceID))
-			}
-		}
 	}
 	writeJSON(w, http.StatusOK, instance)
 }
@@ -1287,58 +1449,16 @@ func (h *Handler) CancelWorkflow(w http.ResponseWriter, r *http.Request) {
 	if principalID == instanceForAuthzCheck.InitiatedBy {
 		action = actionWorkflowCancel
 	}
-	if !h.authorizeLifecycle(w, r, instanceForAuthzCheck, principalID, action, correlationID, "CancelWorkflow") {
+	authority, ok := h.authorizeLifecycleCommand(w, r, instanceForAuthzCheck, principalID, action, correlationID, "CancelWorkflow")
+	if !ok {
 		return
 	}
 
-	instance, transitioned, err := h.store.CancelWorkflow(r.Context(), workflowInstanceID, principalID)
+	instance, _, err := h.store.CancelWorkflow(r.Context(), workflowInstanceID, principalID,
+		domain.LifecycleCommand{Authority: authority, Meta: commandMeta(r, correlationID, "CANCEL", workflowInstanceID)})
 	if err != nil {
 		writeStoreErr(w, h.log, err, correlationID, "CancelWorkflow")
 		return
-	}
-	if transitioned {
-		// Event publication is handled by the transactional outbox (outbox_events),
-		// written atomically in CancelWorkflow's DB transaction.
-
-		// Record governance decision per GOV §1 "No evidence afterthought"
-		if h.decisionLog != nil {
-			evidenceRefs := []string{"cancellation_reason:manual_or_policy"}
-			decisionID, dlErr := h.decisionLog.RecordDecision(r.Context(), decisionlog.RecordDecisionParams{
-				TenantID:         instance.TenantID,
-				LegalEntityID:    instance.LegalEntityID,
-				ActorPrincipalID: principalID,
-				ActionType:       "WORKFLOW_CANCELLED",
-				ResourceType:     "workflow_instance",
-				ResourceID:       instance.WorkflowInstanceID,
-				Outcome:          "CANCELLED",
-				Rationale:        nil,
-				CorrelationID:    correlationID,
-				CausationID:      nil,
-				WorkflowType:     instance.WorkflowType,
-				WorkflowDefinitionID: func() *string {
-					if instance.WorkflowDefinitionID != "" {
-						return &instance.WorkflowDefinitionID
-					}
-					return nil
-				}(),
-				WorkflowDefinitionVersion: func() *int {
-					if instance.WorkflowDefinitionVersion > 0 {
-						return &instance.WorkflowDefinitionVersion
-					}
-					return nil
-				}(),
-				EvidenceRefs:       evidenceRefs,
-				SubjectType:        instance.SubjectType,
-				SubjectID:          instance.SubjectID,
-				SubjectVersion:     instance.SubjectVersion,
-				SubjectFingerprint: instance.SubjectFingerprint,
-			})
-			if dlErr != nil {
-				h.log.Error("CancelWorkflow: failed to record governance decision", zap.String("correlation_id", correlationID), zap.Error(dlErr))
-			} else {
-				h.log.Info("governance decision recorded", zap.String("decision_id", decisionID), zap.String("workflow_instance_id", workflowInstanceID))
-			}
-		}
 	}
 	writeJSON(w, http.StatusOK, instance)
 }
@@ -1458,11 +1578,19 @@ func (h *Handler) InvalidateWorkflow(w http.ResponseWriter, r *http.Request) {
 	// Invalidation is a system transition: the service that owns the bound
 	// business object calls it when that object changes. It has no participant
 	// rule, only its own permission.
-	if !h.authorizeLifecycle(w, r, existing, principalID, actionWorkflowInvalidate, correlationID, "InvalidateWorkflow") {
+	authority, ok := h.authorizeLifecycleCommand(w, r, existing, principalID, actionWorkflowInvalidate, correlationID, "InvalidateWorkflow")
+	if !ok {
 		return
 	}
 
-	// Verify transition edge exists in pinned state-machine definition (ZS-STATE-001 §4 step 4)
+	// Verify transition edge exists in pinned state-machine definition (ZS-STATE-001 §4 step 4).
+	// An already-INVALIDATED workflow skips it: INVALIDATED -> INVALIDATED is
+	// no edge, so a plain retry answered 409 and never reached the store's
+	// idempotent no-op (N-1).
+	if existing.WorkflowStatus == domain.WorkflowStatusInvalidated {
+		writeJSON(w, http.StatusOK, existing)
+		return
+	}
 	if edgeErr := svcenvelope.ValidateTransitionEdge("workflow_instance", existing.WorkflowStatus, "INVALIDATED"); edgeErr != nil {
 		var illegalErr *svcenvelope.IllegalEdgeError
 		if errors.As(edgeErr, &illegalErr) {
@@ -1489,6 +1617,9 @@ func (h *Handler) InvalidateWorkflow(w http.ResponseWriter, r *http.Request) {
 		CorrelationID:      correlationID,
 		CausationID:        req.CausationID,
 		ExpectedVersion:    &cmd.ExpectedObjectVersion,
+		Authority:          authority,
+		Meta: commandMeta(r, correlationID, canonicalReason, derefString(req.Narrative),
+			derefString(req.CausationID), strings.Join(req.EvidenceRefs, ","), workflowInstanceID),
 	})
 	if err != nil {
 		switch {
@@ -1525,43 +1656,6 @@ func (h *Handler) InvalidateWorkflow(w http.ResponseWriter, r *http.Request) {
 		)
 
 		// Record governance decision per GOV §1 "No evidence afterthought"
-		if h.decisionLog != nil {
-			decisionID, dlErr := h.decisionLog.RecordDecision(r.Context(), decisionlog.RecordDecisionParams{
-				TenantID:         instance.TenantID,
-				LegalEntityID:    instance.LegalEntityID,
-				ActorPrincipalID: principalID,
-				ActionType:       "WORKFLOW_INVALIDATED",
-				ResourceType:     "workflow_instance",
-				ResourceID:       instance.WorkflowInstanceID,
-				Outcome:          "INVALIDATED",
-				Rationale:        req.Narrative,
-				CorrelationID:    correlationID,
-				CausationID:      req.CausationID,
-				WorkflowType:     instance.WorkflowType,
-				WorkflowDefinitionID: func() *string {
-					if instance.WorkflowDefinitionID != "" {
-						return &instance.WorkflowDefinitionID
-					}
-					return nil
-				}(),
-				WorkflowDefinitionVersion: func() *int {
-					if instance.WorkflowDefinitionVersion > 0 {
-						return &instance.WorkflowDefinitionVersion
-					}
-					return nil
-				}(),
-				EvidenceRefs:       req.EvidenceRefs,
-				SubjectType:        instance.SubjectType,
-				SubjectID:          instance.SubjectID,
-				SubjectVersion:     instance.SubjectVersion,
-				SubjectFingerprint: instance.SubjectFingerprint,
-			})
-			if dlErr != nil {
-				h.log.Error("InvalidateWorkflow: failed to record governance decision", zap.String("correlation_id", correlationID), zap.Error(dlErr))
-			} else {
-				h.log.Info("governance decision recorded", zap.String("decision_id", decisionID), zap.String("workflow_instance_id", workflowInstanceID))
-			}
-		}
 	}
 	writeJSON(w, http.StatusOK, instance)
 }
@@ -1611,7 +1705,8 @@ func (h *Handler) VerifyRelease(w http.ResponseWriter, r *http.Request) {
 		writeStoreErr(w, h.log, err, correlationID, "VerifyRelease")
 		return
 	}
-	if err := h.authz.CheckApprovalAllowed(r.Context(), principalID, instanceForAuthz.LegalEntityID, instanceForAuthz.InitiatedBy); err != nil {
+	if _, err := h.authz.CheckApprovalAllowed(r.Context(), principalID, instanceForAuthz.LegalEntityID, instanceForAuthz.InitiatedBy,
+		map[string]string{authz.AttrWorkflowType: instanceForAuthz.WorkflowType}); err != nil {
 		switch {
 		case errors.Is(err, domain.ErrAuthorizationDenied):
 			writeJSON(w, http.StatusForbidden, map[string]string{"error": "authorization_denied"})
@@ -1740,11 +1835,15 @@ func (h *Handler) CreateWorkflowDefinition(w http.ResponseWriter, r *http.Reques
 
 // ListWorkflowDefinitions handles GET /v1/workflow-definitions.
 func (h *Handler) ListWorkflowDefinitions(w http.ResponseWriter, r *http.Request) {
-	if _, ok := h.requirePrincipal(w, r); !ok {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
 		return
 	}
 	tenantScope, ok := h.requireTenant(w, r)
 	if !ok {
+		return
+	}
+	if !h.authorizeRead(w, r, nil, principalID, r.Header.Get("X-Correlation-ID"), "ListWorkflowDefinitions") {
 		return
 	}
 
@@ -1768,11 +1867,15 @@ func (h *Handler) ListWorkflowDefinitions(w http.ResponseWriter, r *http.Request
 
 // GetWorkflowDefinition handles GET /v1/workflow-definitions/{workflow_definition_id}.
 func (h *Handler) GetWorkflowDefinition(w http.ResponseWriter, r *http.Request) {
-	if _, ok := h.requirePrincipal(w, r); !ok {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
 		return
 	}
 	tenantScope, ok := h.requireTenant(w, r)
 	if !ok {
+		return
+	}
+	if !h.authorizeRead(w, r, nil, principalID, r.Header.Get("X-Correlation-ID"), "GetWorkflowDefinition") {
 		return
 	}
 
@@ -2007,65 +2110,25 @@ func (h *Handler) EscalateToWorkflow(w http.ResponseWriter, r *http.Request) {
 	}
 
 	action := actionWorkflowEscalateTo
-	if !h.authorizeLifecycle(w, r, instanceForAuthzCheck, principalID, action, correlationID, "EscalateToWorkflow") {
+	authority, ok := h.authorizeLifecycleCommand(w, r, instanceForAuthzCheck, principalID, action, correlationID, "EscalateToWorkflow")
+	if !ok {
 		return
 	}
 
-	instance, transitioned, err := h.store.EscalateToWorkflow(r.Context(), domain.EscalateToWorkflowParams{
+	instance, _, err := h.store.EscalateToWorkflow(r.Context(), domain.EscalateToWorkflowParams{
 		WorkflowInstanceID: workflowInstanceID,
 		ActorPrincipalID:   principalID,
 		EscalationTarget:   req.EscalationTarget,
 		ReasonCode:         req.ReasonCode,
 		Narrative:          req.Narrative,
 		CorrelationID:      correlationID,
+		Authority:          authority,
+		Meta: commandMeta(r, correlationID, req.EscalationTarget, req.ReasonCode,
+			derefString(req.Narrative), workflowInstanceID),
 	})
 	if err != nil {
 		writeStoreErr(w, h.log, err, correlationID, "EscalateToWorkflow")
 		return
-	}
-
-	if transitioned {
-		if h.decisionLog != nil {
-			evidenceRefs := []string{"escalation_reason:" + req.ReasonCode}
-			if req.Narrative != nil {
-				evidenceRefs = append(evidenceRefs, "narrative:"+*req.Narrative)
-			}
-			decisionID, dlErr := h.decisionLog.RecordDecision(r.Context(), decisionlog.RecordDecisionParams{
-				TenantID:         instance.TenantID,
-				LegalEntityID:    instance.LegalEntityID,
-				ActorPrincipalID: principalID,
-				ActionType:       "WORKFLOW_ESCALATED_TO",
-				ResourceType:     "workflow_instance",
-				ResourceID:       instance.WorkflowInstanceID,
-				Outcome:          "ESCALATED",
-				Rationale:        req.Narrative,
-				CorrelationID:    correlationID,
-				CausationID:      nil,
-				WorkflowType:     instance.WorkflowType,
-				WorkflowDefinitionID: func() *string {
-					if instance.WorkflowDefinitionID != "" {
-						return &instance.WorkflowDefinitionID
-					}
-					return nil
-				}(),
-				WorkflowDefinitionVersion: func() *int {
-					if instance.WorkflowDefinitionVersion > 0 {
-						return &instance.WorkflowDefinitionVersion
-					}
-					return nil
-				}(),
-				EvidenceRefs:       evidenceRefs,
-				SubjectType:        instance.SubjectType,
-				SubjectID:          instance.SubjectID,
-				SubjectVersion:     instance.SubjectVersion,
-				SubjectFingerprint: instance.SubjectFingerprint,
-			})
-			if dlErr != nil {
-				h.log.Error("EscalateToWorkflow: failed to record governance decision", zap.String("correlation_id", correlationID), zap.Error(dlErr))
-			} else {
-				h.log.Info("governance decision recorded", zap.String("decision_id", decisionID), zap.String("workflow_instance_id", workflowInstanceID))
-			}
-		}
 	}
 
 	h.log.Info("workflow escalated to target",
@@ -2079,7 +2142,8 @@ func (h *Handler) EscalateToWorkflow(w http.ResponseWriter, r *http.Request) {
 
 // ListPendingApprovals handles GET /v1/workflows/pending.
 func (h *Handler) ListPendingApprovals(w http.ResponseWriter, r *http.Request) {
-	if _, ok := h.requirePrincipal(w, r); !ok {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
 		return
 	}
 	tenantScope, ok := h.requireTenant(w, r)
@@ -2088,6 +2152,9 @@ func (h *Handler) ListPendingApprovals(w http.ResponseWriter, r *http.Request) {
 	}
 
 	correlationID := r.Header.Get("X-Correlation-ID")
+	if !h.authorizeRead(w, r, nil, principalID, correlationID, "ListPendingApprovals") {
+		return
+	}
 
 	instances, err := h.store.ListPendingApprovals(r.Context(), tenantScope, getIntQuery(r, "limit", 50), getIntQuery(r, "offset", 0))
 	if err != nil {
@@ -2102,7 +2169,8 @@ func (h *Handler) ListPendingApprovals(w http.ResponseWriter, r *http.Request) {
 
 // GetApprovalEvidence handles GET /v1/workflows/{workflow_instance_id}/evidence.
 func (h *Handler) GetApprovalEvidence(w http.ResponseWriter, r *http.Request) {
-	if _, ok := h.requirePrincipal(w, r); !ok {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
 		return
 	}
 	tenantScope, ok := h.requireTenant(w, r)
@@ -2125,6 +2193,9 @@ func (h *Handler) GetApprovalEvidence(w http.ResponseWriter, r *http.Request) {
 	}
 	if instance.TenantID != tenantScope {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "workflow_not_found"})
+		return
+	}
+	if !h.authorizeRead(w, r, instance, principalID, correlationID, "GetApprovalEvidence") {
 		return
 	}
 
@@ -2168,7 +2239,8 @@ func (h *Handler) RequestChanges(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !h.authorizeLifecycle(w, r, instance, principalID, actionWorkflowAdminister, correlationID, "RequestChanges") {
+	authority, ok := h.authorizeLifecycleCommand(w, r, instance, principalID, actionWorkflowAdminister, correlationID, "RequestChanges")
+	if !ok {
 		return
 	}
 
@@ -2186,7 +2258,8 @@ func (h *Handler) RequestChanges(w http.ResponseWriter, r *http.Request) {
 		rationale = *req.Rationale
 	}
 
-	if err := h.store.RequestChanges(r.Context(), workflowInstanceID, principalID, rationale, req.CausationID); err != nil {
+	if err := h.store.RequestChanges(r.Context(), workflowInstanceID, principalID, rationale, req.CausationID,
+		domain.LifecycleCommand{Authority: authority, Meta: commandMeta(r, correlationID, "REQUEST_CHANGES", rationale, workflowInstanceID)}); err != nil {
 		writeStoreErr(w, h.log, err, correlationID, "RequestChanges")
 		return
 	}
@@ -2267,6 +2340,22 @@ func writeStoreErr(w http.ResponseWriter, log *zap.Logger, err error, correlatio
 		writeError(w, http.StatusConflict, "idempotency_mismatch", "same idempotency key used with different request body", correlationID, nil)
 	case errors.Is(err, domain.ErrWrongApprover):
 		writeError(w, http.StatusForbidden, "wrong_approver", "actor is not the approver for the current stage", correlationID, nil)
+	case errors.Is(err, domain.ErrNoCurrentStage):
+		writeError(w, http.StatusNotFound, "no_current_stage", "workflow has no stage awaiting a decision", correlationID, nil)
+	case errors.Is(err, domain.ErrNotEscalationOwner):
+		writeError(w, http.StatusForbidden, "not_escalation_owner", "only the escalation target may decide this stage", correlationID, nil)
+	case errors.Is(err, domain.ErrAlreadyDecided):
+		writeError(w, http.StatusConflict, "already_decided", "principal already decided another stage of this workflow", correlationID, nil)
+	case errors.Is(err, domain.ErrSelfApprovalNotAllowed):
+		writeError(w, http.StatusForbidden, "self_approval_not_allowed", "principal may not decide their own submission", correlationID, nil)
+	case errors.Is(err, domain.ErrNotQuorumStage):
+		writeError(w, http.StatusConflict, "not_quorum_stage", "the current stage is not a QUORUM stage", correlationID, nil)
+	case errors.Is(err, domain.ErrNotEligibleQuorumApprover):
+		writeError(w, http.StatusForbidden, "not_eligible_quorum_approver", "actor is not eligible to vote on this stage", correlationID, nil)
+	case errors.Is(err, domain.ErrLegalEntityNotFound):
+		writeError(w, http.StatusNotFound, "legal_entity_not_found", "legal entity not found in the caller's tenant", correlationID, nil)
+	case errors.Is(err, domain.ErrRegistryUnavailable):
+		writeError(w, http.StatusServiceUnavailable, "registry_unavailable", "tenant-entity-registry-svc unavailable", correlationID, map[string]any{"retryable": true})
 	default:
 		log.Error(op+": store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "workflow store temporarily unavailable", correlationID, map[string]any{
@@ -2275,7 +2364,14 @@ func writeStoreErr(w http.ResponseWriter, log *zap.Logger, err error, correlatio
 	}
 }
 
+// writeJSON serialises v. An error body ({"error": code, ...}) is rendered as
+// RFC 9457 application/problem+json with the §16 error_class; the legacy
+// members stay, so callers that read "error" are unaffected (Governance audit
+// X9, workflow row 55).
 func writeJSON(w http.ResponseWriter, status int, v any) {
+	if idenv.WriteLegacyError(w, nil, status, v) {
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(v); err != nil {

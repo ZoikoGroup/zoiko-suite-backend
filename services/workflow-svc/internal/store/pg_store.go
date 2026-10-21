@@ -9,9 +9,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
@@ -40,8 +42,9 @@ type Store interface {
 	// current QUORUM stage. Same return-shape contract as SubmitAction.
 	SubmitQuorumVote(ctx context.Context, params domain.SubmitQuorumVoteParams) (*domain.WorkflowInstance, *domain.WorkflowStage, bool, error)
 
-	EscalateWorkflow(ctx context.Context, workflowInstanceID, actorPrincipalID string) (*domain.WorkflowInstance, bool, error)
-	CancelWorkflow(ctx context.Context, workflowInstanceID, actorPrincipalID string) (*domain.WorkflowInstance, bool, error)
+	EscalateWorkflow(ctx context.Context, workflowInstanceID, actorPrincipalID string, cmd ...domain.LifecycleCommand) (*domain.WorkflowInstance, bool, error)
+	CancelWorkflow(ctx context.Context, workflowInstanceID, actorPrincipalID string, cmd ...domain.LifecycleCommand) (*domain.WorkflowInstance, bool, error)
+	ExpireWorkflow(ctx context.Context, workflowInstanceID string, cmd ...domain.LifecycleCommand) (*domain.WorkflowInstance, bool, error)
 	InvalidateWorkflow(ctx context.Context, params domain.InvalidateWorkflowParams) (*domain.WorkflowInstance, bool, error)
 	VerifyRelease(ctx context.Context, params domain.VerifyReleaseParams) (*domain.ReleaseVerificationResult, error)
 
@@ -62,7 +65,7 @@ type Store interface {
 	// Additional workflow instance methods
 	ListPendingApprovals(ctx context.Context, tenantID string, limit, offset int) ([]*domain.WorkflowInstance, error)
 	GetApprovalEvidence(ctx context.Context, workflowInstanceID string) ([]*domain.WorkflowTransition, error)
-	RequestChanges(ctx context.Context, workflowInstanceID, actorPrincipalID, rationale string, causationID *string) error
+	RequestChanges(ctx context.Context, workflowInstanceID, actorPrincipalID, rationale string, causationID *string, cmd ...domain.LifecycleCommand) error
 }
 
 // PgStore implements Store against a PostgreSQL cluster via pgxpool.
@@ -99,7 +102,7 @@ func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(pgx.Tx) 
 
 // ── workflow_instances ───────────────────────────────────────────────────────
 
-const instanceColumns = `workflow_instance_id, tenant_id, legal_entity_id, workflow_type, workflow_status, current_stage, initiated_by, correlation_id, started_at, completed_at, subject_type, subject_id, subject_version, subject_fingerprint, invalidated_at, invalidation_reason_code, invalidation_narrative, invalidation_evidence_refs, row_version, updated_at, created_by, plane, data_class, residency_region, idempotency_key, due_at, next_action_at, escalation_target, workflow_definition_id, workflow_definition_version`
+const instanceColumns = `workflow_instance_id, tenant_id, legal_entity_id, workflow_type, workflow_status, current_stage, initiated_by, correlation_id, started_at, completed_at, subject_type, subject_id, subject_version, subject_fingerprint, invalidated_at, invalidation_reason_code, invalidation_narrative, invalidation_evidence_refs, row_version, updated_at, created_by, plane, data_class, residency_region, idempotency_key, due_at, next_action_at, escalation_target, workflow_definition_id, workflow_definition_version, review_cycle, escalated_at`
 
 func scanInstance(row pgx.Row) (*domain.WorkflowInstance, error) {
 	w := &domain.WorkflowInstance{}
@@ -113,7 +116,7 @@ func scanInstance(row pgx.Row) (*domain.WorkflowInstance, error) {
 		&w.SubjectType, &w.SubjectID, &w.SubjectVersion, &w.SubjectFingerprint,
 		&w.InvalidatedAt, &w.InvalidationReasonCode, &w.InvalidationNarrative, &w.InvalidationEvidenceRefs,
 		&w.RowVersion, &w.UpdatedAt, &w.CreatedBy, &w.Plane, &w.DataClass, &w.ResidencyRegion, &idempotencyKey,
-		&w.DueAt, &w.NextActionAt, &escalationTarget, &definitionID, &definitionVersion)
+		&w.DueAt, &w.NextActionAt, &escalationTarget, &definitionID, &definitionVersion, &w.ReviewCycle, &w.EscalatedAt)
 	if idempotencyKey != nil {
 		w.IdempotencyKey = *idempotencyKey
 	}
@@ -162,41 +165,52 @@ func (s *PgStore) FindWorkflowByID(ctx context.Context, workflowInstanceID strin
 	return w, nil
 }
 
-const stageColumns = `workflow_stage_id, workflow_instance_id, stage_order, stage_type, approver_principal_id, required_approvals, stage_status, acted_at, rationale, row_version, updated_at, created_by, plane, data_class, residency_region`
+const stageColumns = `workflow_stage_id, workflow_instance_id, stage_order, stage_type, approver_principal_id, required_approvals, stage_status, acted_at, rationale, row_version, updated_at, created_by, plane, data_class, residency_region, approver_role, due_at, acted_by`
 
 func scanStage(row pgx.Row) (*domain.WorkflowStage, error) {
 	st := &domain.WorkflowStage{}
 	var approverPrincipalID *string
 	err := row.Scan(&st.WorkflowStageID, &st.WorkflowInstanceID, &st.StageOrder, &st.StageType, &approverPrincipalID,
 		&st.RequiredApprovals, &st.StageStatus, &st.ActedAt, &st.Rationale,
-		&st.RowVersion, &st.UpdatedAt, &st.CreatedBy, &st.Plane, &st.DataClass, &st.ResidencyRegion)
+		&st.RowVersion, &st.UpdatedAt, &st.CreatedBy, &st.Plane, &st.DataClass, &st.ResidencyRegion,
+		&st.ApproverRole, &st.DueAt, &st.ActedBy)
 	if approverPrincipalID != nil {
 		st.ApproverPrincipalID = *approverPrincipalID
 	}
 	return st, err
 }
 
+// Every read of workflow_stages, its quorum tables and workflow_transitions
+// runs inside withRLS with the caller's tenant. 000017 put FORCE RLS on those
+// tables, and the runtime role (zoiko_app) does not bypass it: reads made on
+// the bare pool saw no rows at all, so under the real role a workflow had no
+// stages, its approver could not approve ("not the approver for the current
+// stage") and every retry was an idempotency mismatch. The suite proves this
+// as a NOBYPASSRLS role (TestPgStore_RuntimeRole_*).
+
 func (s *PgStore) FindStagesByWorkflowID(ctx context.Context, workflowInstanceID string) ([]*domain.WorkflowStage, error) {
 	if _, err := s.FindWorkflowByID(ctx, workflowInstanceID); err != nil {
 		return nil, err
 	}
 	const query = `SELECT ` + stageColumns + ` FROM workflow_stages WHERE workflow_instance_id = $1 ORDER BY stage_order;`
-	rows, err := s.pool.Query(ctx, query, workflowInstanceID)
+	var stages []*domain.WorkflowStage
+	err := s.withRLS(ctx, svcmiddleware.TenantFromContext(ctx), func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, query, workflowInstanceID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			st, scanErr := scanStage(rows)
+			if scanErr != nil {
+				return scanErr
+			}
+			stages = append(stages, st)
+		}
+		return rows.Err()
+	})
 	if err != nil {
 		s.log.Error("pg FindStagesByWorkflowID failed", zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	defer rows.Close()
-
-	var stages []*domain.WorkflowStage
-	for rows.Next() {
-		st, scanErr := scanStage(rows)
-		if scanErr != nil {
-			return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, scanErr)
-		}
-		stages = append(stages, st)
-	}
-	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	return stages, nil
@@ -209,8 +223,12 @@ func (s *PgStore) FindStagesByWorkflowID(ctx context.Context, workflowInstanceID
 // Uses ORDER BY stage_order to return the earliest matching stage.
 func (s *PgStore) findStageByApprover(ctx context.Context, workflowInstanceID, approverPrincipalID string) (*domain.WorkflowStage, error) {
 	const query = `SELECT ` + stageColumns + ` FROM workflow_stages WHERE workflow_instance_id = $1 AND approver_principal_id = $2 ORDER BY stage_order LIMIT 1;`
-	row := s.pool.QueryRow(ctx, query, workflowInstanceID, approverPrincipalID)
-	st, err := scanStage(row)
+	var st *domain.WorkflowStage
+	err := s.withRLS(ctx, svcmiddleware.TenantFromContext(ctx), func(tx pgx.Tx) error {
+		var scanErr error
+		st, scanErr = scanStage(tx.QueryRow(ctx, query, workflowInstanceID, approverPrincipalID))
+		return scanErr
+	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, domain.ErrWrongApprover
@@ -221,22 +239,37 @@ func (s *PgStore) findStageByApprover(ctx context.Context, workflowInstanceID, a
 	return st, nil
 }
 
+// findStageByOrder reads one stage of an instance under the caller's tenant.
+func (s *PgStore) findStageByOrder(ctx context.Context, workflowInstanceID string, order int) (*domain.WorkflowStage, error) {
+	const query = `SELECT ` + stageColumns + ` FROM workflow_stages WHERE workflow_instance_id = $1 AND stage_order = $2;`
+	var st *domain.WorkflowStage
+	err := s.withRLS(ctx, svcmiddleware.TenantFromContext(ctx), func(tx pgx.Tx) error {
+		var scanErr error
+		st, scanErr = scanStage(tx.QueryRow(ctx, query, workflowInstanceID, order))
+		return scanErr
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, domain.ErrWorkflowNotFound
+		}
+		s.log.Error("pg findStageByOrder failed", zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return st, nil
+}
+
+// FindCurrentStage returns the stage awaiting a decision. An ESCALATED
+// instance keeps its current stage (it is still decidable); a terminal one
+// has none.
 func (s *PgStore) FindCurrentStage(ctx context.Context, workflowInstanceID string) (*domain.WorkflowStage, error) {
 	instance, err := s.FindWorkflowByID(ctx, workflowInstanceID)
 	if err != nil {
 		return nil, err
 	}
 	if instance.CurrentStage == 0 {
-		return nil, domain.ErrWorkflowNotFound // terminal — no current stage
+		return nil, domain.ErrNoCurrentStage
 	}
-	const query = `SELECT ` + stageColumns + ` FROM workflow_stages WHERE workflow_instance_id = $1 AND stage_order = $2;`
-	row := s.pool.QueryRow(ctx, query, workflowInstanceID, instance.CurrentStage)
-	st, err := scanStage(row)
-	if err != nil {
-		s.log.Error("pg FindCurrentStage failed", zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	return st, nil
+	return s.findStageByOrder(ctx, workflowInstanceID, instance.CurrentStage)
 }
 
 // IsCurrentStageApprover reports whether principalID is an approver on the
@@ -297,10 +330,20 @@ func (s *PgStore) CreateWorkflow(ctx context.Context, params domain.CreateWorkfl
 		return nil, nil, false, fmt.Errorf("set_config app.tenant_id: %w", err)
 	}
 
-	// Determine which idempotency key to use
+	// Idempotency is the Idempotency-Key alone. It used to fall back to the
+	// correlation id, which is the business-flow trace: a second, different
+	// workflow started in the same flow was then answered with the first
+	// one (or, with 000003's unique index, a 503). 000020 drops that index.
 	idemKey := params.IdempotencyKey
-	if idemKey == "" {
-		idemKey = params.CorrelationID // fallback for backward compatibility
+
+	// Stage 1 is current from the start, so its deadline starts now; the
+	// instance's next_action_at is that deadline (the timer sweep escalates
+	// past it). due_at is the expiry of the whole approval.
+	now := time.Now().UTC()
+	var firstStageDue *time.Time
+	if len(params.Stages) > 0 && params.Stages[0].DueAtHours > 0 {
+		t := now.Add(time.Duration(params.Stages[0].DueAtHours) * time.Hour)
+		firstStageDue = &t
 	}
 
 	var instance *domain.WorkflowInstance
@@ -316,11 +359,11 @@ func (s *PgStore) CreateWorkflow(ctx context.Context, params domain.CreateWorkfl
 	if idemKey != "" {
 		// Try to insert with idempotency key
 		const insertInstance = `
-			INSERT INTO workflow_instances (workflow_instance_id, tenant_id, legal_entity_id, workflow_type, initiated_by, correlation_id, subject_type, subject_id, subject_version, subject_fingerprint, idempotency_key, escalation_target, workflow_definition_id, workflow_definition_version)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+			INSERT INTO workflow_instances (workflow_instance_id, tenant_id, legal_entity_id, workflow_type, initiated_by, correlation_id, subject_type, subject_id, subject_version, subject_fingerprint, idempotency_key, escalation_target, workflow_definition_id, workflow_definition_version, created_by, due_at, next_action_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $5, $15, $16)
 			ON CONFLICT (tenant_id, idempotency_key) WHERE idempotency_key IS NOT NULL AND idempotency_key != '' DO NOTHING
 			RETURNING ` + instanceColumns + `;`
-		row := tx.QueryRow(ctx, insertInstance, params.WorkflowInstanceID, params.TenantID, params.LegalEntityID, params.WorkflowType, params.InitiatedBy, params.CorrelationID, params.SubjectType, params.SubjectID, params.SubjectVersion, params.SubjectFingerprint, idemKey, params.EscalationTarget, definitionID, definitionVersion)
+		row := tx.QueryRow(ctx, insertInstance, params.WorkflowInstanceID, params.TenantID, params.LegalEntityID, params.WorkflowType, params.InitiatedBy, params.CorrelationID, params.SubjectType, params.SubjectID, params.SubjectVersion, params.SubjectFingerprint, idemKey, params.EscalationTarget, definitionID, definitionVersion, params.DueAt, firstStageDue)
 		instance, err = scanInstance(row)
 		if err != nil {
 			if !errors.Is(err, pgx.ErrNoRows) {
@@ -334,7 +377,7 @@ func (s *PgStore) CreateWorkflow(ctx context.Context, params domain.CreateWorkfl
 				s.log.Error("pg CreateWorkflow: lookup by idempotency_key failed", zap.Error(fetchErr))
 				return nil, nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, fetchErr)
 			}
-			if existing != nil && s.workflowBodyDiffers(existing, params) {
+			if existing != nil && s.workflowBodyDiffers(ctx, existing, params) {
 				return nil, nil, false, domain.ErrIdempotencyMismatch
 			}
 			// Same body — return existing (idempotent replay)
@@ -347,10 +390,10 @@ func (s *PgStore) CreateWorkflow(ctx context.Context, params domain.CreateWorkfl
 	} else {
 		// No idempotency key provided — insert without idempotency check
 		const insertInstance = `
-			INSERT INTO workflow_instances (workflow_instance_id, tenant_id, legal_entity_id, workflow_type, initiated_by, correlation_id, subject_type, subject_id, subject_version, subject_fingerprint, escalation_target, workflow_definition_id, workflow_definition_version)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+			INSERT INTO workflow_instances (workflow_instance_id, tenant_id, legal_entity_id, workflow_type, initiated_by, correlation_id, subject_type, subject_id, subject_version, subject_fingerprint, escalation_target, workflow_definition_id, workflow_definition_version, created_by, due_at, next_action_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $5, $14, $15)
 			RETURNING ` + instanceColumns + `;`
-		row := tx.QueryRow(ctx, insertInstance, params.WorkflowInstanceID, params.TenantID, params.LegalEntityID, params.WorkflowType, params.InitiatedBy, params.CorrelationID, params.SubjectType, params.SubjectID, params.SubjectVersion, params.SubjectFingerprint, params.EscalationTarget, definitionID, definitionVersion)
+		row := tx.QueryRow(ctx, insertInstance, params.WorkflowInstanceID, params.TenantID, params.LegalEntityID, params.WorkflowType, params.InitiatedBy, params.CorrelationID, params.SubjectType, params.SubjectID, params.SubjectVersion, params.SubjectFingerprint, params.EscalationTarget, definitionID, definitionVersion, params.DueAt, firstStageDue)
 		instance, err = scanInstance(row)
 		if err != nil {
 			s.log.Error("pg CreateWorkflow: insert instance failed", zap.Error(err))
@@ -359,13 +402,20 @@ func (s *PgStore) CreateWorkflow(ctx context.Context, params domain.CreateWorkfl
 	}
 
 	stages := make([]*domain.WorkflowStage, 0, len(params.Stages))
+	// created_by is the initiator (it was never written, so every row read
+	// ''). Only stage 1 gets a due_at now; later stages get theirs when they
+	// become current.
 	const insertSingleStage = `
-		INSERT INTO workflow_stages (workflow_instance_id, stage_order, stage_type, approver_principal_id)
-		VALUES ($1, $2, 'SINGLE', $3)
+		INSERT INTO workflow_stages (workflow_instance_id, stage_order, stage_type, approver_principal_id, created_by, due_at, due_hours)
+		VALUES ($1, $2, 'SINGLE', $3, $4, $5, $6)
 		RETURNING ` + stageColumns + `;`
 	const insertQuorumStage = `
-		INSERT INTO workflow_stages (workflow_instance_id, stage_order, stage_type, required_approvals)
-		VALUES ($1, $2, 'QUORUM', $3)
+		INSERT INTO workflow_stages (workflow_instance_id, stage_order, stage_type, required_approvals, created_by, due_at, due_hours)
+		VALUES ($1, $2, 'QUORUM', $3, $4, $5, $6)
+		RETURNING ` + stageColumns + `;`
+	const insertRoleStage = `
+		INSERT INTO workflow_stages (workflow_instance_id, stage_order, stage_type, approver_role, created_by, due_at, due_hours)
+		VALUES ($1, $2, 'ROLE', $3, $4, $5, $6)
 		RETURNING ` + stageColumns + `;`
 	const insertQuorumApprover = `
 		INSERT INTO workflow_stage_quorum_approvers (workflow_stage_id, approver_principal_id) VALUES ($1, $2);`
@@ -374,11 +424,23 @@ func (s *PgStore) CreateWorkflow(ctx context.Context, params domain.CreateWorkfl
 		if stageType == "" {
 			stageType = domain.StageTypeSingle
 		}
+		var due *time.Time
+		if i == 0 {
+			due = firstStageDue
+		}
+		var dueHours *int
+		if stageInput.DueAtHours > 0 {
+			h := stageInput.DueAtHours
+			dueHours = &h
+		}
 		var row pgx.Row
-		if stageType == domain.StageTypeQuorum {
-			row = tx.QueryRow(ctx, insertQuorumStage, params.WorkflowInstanceID, i+1, stageInput.RequiredApprovals)
-		} else {
-			row = tx.QueryRow(ctx, insertSingleStage, params.WorkflowInstanceID, i+1, stageInput.ApproverPrincipalID)
+		switch stageType {
+		case domain.StageTypeQuorum:
+			row = tx.QueryRow(ctx, insertQuorumStage, params.WorkflowInstanceID, i+1, stageInput.RequiredApprovals, params.InitiatedBy, due, dueHours)
+		case domain.StageTypeRole:
+			row = tx.QueryRow(ctx, insertRoleStage, params.WorkflowInstanceID, i+1, stageInput.ApproverRole, params.InitiatedBy, due, dueHours)
+		default:
+			row = tx.QueryRow(ctx, insertSingleStage, params.WorkflowInstanceID, i+1, stageInput.ApproverPrincipalID, params.InitiatedBy, due, dueHours)
 		}
 		st, err := scanStage(row)
 		if err != nil {
@@ -466,8 +528,12 @@ func (s *PgStore) findByIdempotencyKey(ctx context.Context, tenantID, idempotenc
 	return instance, nil
 }
 
-// workflowBodyDiffers compares the existing workflow with new params to detect IDEMPOTENCY_MISMATCH
-func (s *PgStore) workflowBodyDiffers(existing *domain.WorkflowInstance, params domain.CreateWorkflowParams) bool {
+// workflowBodyDiffers compares the existing workflow with new params to detect
+// IDEMPOTENCY_MISMATCH. It reads the stored stages with the caller's context:
+// it used context.Background(), which carries no tenant, so under the runtime
+// role RLS hid the stages, "cannot read" counted as "differs", and every
+// honest same-key retry was refused 409.
+func (s *PgStore) workflowBodyDiffers(ctx context.Context, existing *domain.WorkflowInstance, params domain.CreateWorkflowParams) bool {
 	// Compare the fields that define the workflow body
 	if existing.WorkflowType != params.WorkflowType {
 		return true
@@ -505,7 +571,7 @@ func (s *PgStore) workflowBodyDiffers(existing *domain.WorkflowInstance, params 
 	}
 
 	// Compare stages: stage order, type, approver, required approvals, quorum pool
-	existingStages, err := s.FindStagesByWorkflowID(context.Background(), existing.WorkflowInstanceID)
+	existingStages, err := s.FindStagesByWorkflowID(ctx, existing.WorkflowInstanceID)
 	if err != nil {
 		// If we can't fetch stages, assume they differ to be safe
 		return true
@@ -544,11 +610,15 @@ func (s *PgStore) workflowBodyDiffers(existing *domain.WorkflowInstance, params 
 				return true
 			}
 			// Fetch quorum approvers from DB for comparison
-			existingApprovers, err := s.fetchQuorumApprovers(context.Background(), existingStage.WorkflowStageID)
+			existingApprovers, err := s.fetchQuorumApprovers(ctx, existingStage.WorkflowStageID)
 			if err != nil {
 				return true
 			}
-			if !slicesEqual(existingApprovers, newStage.QuorumApprovers) {
+			if !sameSet(existingApprovers, newStage.QuorumApprovers) {
+				return true
+			}
+		case domain.StageTypeRole:
+			if existingStage.ApproverRole == nil || *existingStage.ApproverRole != newStage.ApproverRole {
 				return true
 			}
 		}
@@ -556,34 +626,44 @@ func (s *PgStore) workflowBodyDiffers(existing *domain.WorkflowInstance, params 
 	return false
 }
 
-func slicesEqual(a, b []string) bool {
+// sameSet compares two approver pools as sets: the store returns a pool
+// sorted, the caller sends it in any order, and order means nothing.
+func sameSet(a, b []string) bool {
 	if len(a) != len(b) {
 		return false
 	}
-	for i := range a {
-		if a[i] != b[i] {
+	seen := make(map[string]int, len(a))
+	for _, x := range a {
+		seen[x]++
+	}
+	for _, x := range b {
+		if seen[x] == 0 {
 			return false
 		}
+		seen[x]--
 	}
 	return true
 }
 
 func (s *PgStore) fetchQuorumApprovers(ctx context.Context, workflowStageID string) ([]string, error) {
 	const query = `SELECT approver_principal_id FROM workflow_stage_quorum_approvers WHERE workflow_stage_id = $1 ORDER BY approver_principal_id;`
-	rows, err := s.pool.Query(ctx, query, workflowStageID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
 	var approvers []string
-	for rows.Next() {
-		var a string
-		if err := rows.Scan(&a); err != nil {
-			return nil, err
+	err := s.withRLS(ctx, svcmiddleware.TenantFromContext(ctx), func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, query, workflowStageID)
+		if err != nil {
+			return err
 		}
-		approvers = append(approvers, a)
-	}
-	return approvers, rows.Err()
+		defer rows.Close()
+		for rows.Next() {
+			var a string
+			if err := rows.Scan(&a); err != nil {
+				return err
+			}
+			approvers = append(approvers, a)
+		}
+		return rows.Err()
+	})
+	return approvers, err
 }
 
 // findExistingByCorrelation resolves the instance+stages an idempotent
@@ -609,190 +689,75 @@ func (s *PgStore) findExistingByCorrelation(ctx context.Context, tenantID, corre
 }
 
 func insertTransition(ctx context.Context, tx pgx.Tx, workflowInstanceID, fromState, toState, actedBy string, rationale, correlationID, causationID *string) error {
+	return insertTransitionRecord(ctx, tx, transitionRecord{InstanceID: workflowInstanceID, From: fromState, To: toState,
+		ActedBy: actedBy, Rationale: rationale, CorrelationID: correlationID, CausationID: causationID})
+}
+
+// transitionRecord is one row of the append-only transition log with its
+// lineage: the stage and review cycle, the authority snapshot, the route
+// version, the command's Idempotency-Key and request hash, and the
+// governance-ledger decision id.
+type transitionRecord struct {
+	InstanceID, From, To, ActedBy string
+	Rationale, CorrelationID      *string
+	CausationID                   *string
+	StageOrder, ReviewCycle       *int
+	DefinitionVersion             *int
+	IdempotencyKey, RequestHash   string
+	Authority                     domain.ActionAuthority
+	DecisionID                    string
+}
+
+func insertTransitionRecord(ctx context.Context, tx pgx.Tx, r transitionRecord) error {
 	const query = `
-		INSERT INTO workflow_transitions (workflow_instance_id, from_state, to_state, acted_by, rationale, correlation_id, causation_id)
-		VALUES ($1, $2, $3, $4, $5, $6, $7);`
-	if _, err := tx.Exec(ctx, query, workflowInstanceID, fromState, toState, actedBy, rationale, correlationID, causationID); err != nil {
+		INSERT INTO workflow_transitions (workflow_instance_id, from_state, to_state, acted_by, rationale, correlation_id, causation_id,
+			stage_order, review_cycle, workflow_definition_version, idempotency_key, request_hash,
+			access_decision_id, authority_basis, delegation_id, decision_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16);`
+	var decisionID *string
+	if r.DecisionID != "" {
+		decisionID = &r.DecisionID
+	}
+	if _, err := tx.Exec(ctx, query, r.InstanceID, r.From, r.To, r.ActedBy, r.Rationale, r.CorrelationID, r.CausationID,
+		r.StageOrder, r.ReviewCycle, r.DefinitionVersion, nullIfEmpty(r.IdempotencyKey), nullIfEmpty(r.RequestHash),
+		nullIfEmpty(r.Authority.AccessDecisionID), nullIfEmpty(r.Authority.Basis), nullIfEmpty(r.Authority.DelegationID), decisionID); err != nil {
+		if isUniqueViolation(err, "uq_workflow_transitions_idempotency") {
+			return errIdempotentRetry
+		}
 		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	return nil
 }
 
-// SubmitAction applies an APPROVE/REJECT action to the current stage.
-//
-// Idempotency (doctrine requirement): if the stage is already in the exact
-// outcome this action would produce, this is a no-op — transitioned=false,
-// no new transition row, no re-publish. If the stage is in a *different*
-// terminal outcome (e.g. already REJECTED but caller submits APPROVE), that
-// is a real conflict, not idempotency — domain.ErrInvalidTransition.
-func (s *PgStore) SubmitAction(ctx context.Context, params domain.SubmitActionParams) (instance *domain.WorkflowInstance, stage *domain.WorkflowStage, transitioned bool, err error) {
-	current, err := s.FindWorkflowByID(ctx, params.WorkflowInstanceID)
+// errIdempotentRetry: a transition with this command's Idempotency-Key was
+// committed concurrently; the caller answers as a replay.
+var errIdempotentRetry = errors.New("idempotent retry")
+
+func isUniqueViolation(err error, constraint string) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505" && (constraint == "" || pgErr.ConstraintName == constraint)
+}
+
+// replayedCommand looks for a transition already recorded under this
+// command's Idempotency-Key. found=false when there is none; a stored request
+// hash that differs is domain.ErrIdempotencyMismatch.
+func replayedCommand(ctx context.Context, tx pgx.Tx, instanceID string, meta domain.CommandMeta) (bool, error) {
+	if meta.IdempotencyKey == "" {
+		return false, nil
+	}
+	var hash *string
+	err := tx.QueryRow(ctx, `SELECT request_hash FROM workflow_transitions WHERE workflow_instance_id = $1 AND idempotency_key = $2`,
+		instanceID, meta.IdempotencyKey).Scan(&hash)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
 	if err != nil {
-		return nil, nil, false, err
+		return false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
-	// Allow actions on PENDING or ESCALATED workflows.
-	// ESCALATED is not a terminal state — it can be resolved to APPROVED/REJECTED.
-	if current.WorkflowStatus != "PENDING" && current.WorkflowStatus != "ESCALATED" {
-		// Workflow already reached a terminal state (APPROVED, REJECTED, CANCELLED, INVALIDATED)
-		// — no action can be submitted against it.
-		return nil, nil, false, domain.ErrInvalidTransition
+	if hash != nil && meta.RequestHash != "" && *hash != meta.RequestHash {
+		return true, domain.ErrIdempotencyMismatch
 	}
-
-	// Determine which approver's stage to look up.
-	// If AssignedApproverID is provided (delegation), use that.
-	// Otherwise, use ActorPrincipalID (direct approval).
-	approverID := params.ActorPrincipalID
-	if params.AssignedApproverID != "" {
-		approverID = params.AssignedApproverID
-	}
-
-	// Look up the approver's stage (not just "the current stage") —
-	// a duplicate/retried submission must be recognized as idempotent even
-	// after the workflow has already advanced past that stage (e.g. a
-	// slow network retry of stage 1's approval arriving after stage 2 has
-	// already become current). Assumes at most one stage per approver per
-	// workflow — a documented v1 simplification.
-	actorStage, err := s.findStageByApprover(ctx, params.WorkflowInstanceID, approverID)
-	if err != nil {
-		return nil, nil, false, err
-	}
-
-	wantStatus := "APPROVED"
-	if params.Action == "REJECT" {
-		wantStatus = "REJECTED"
-	}
-	if actorStage.StageStatus == wantStatus {
-		// Idempotent replay of the identical action, even if the workflow
-		// has since moved on — doctrine requirement.
-		return current, actorStage, false, nil
-	}
-	if actorStage.StageStatus != "PENDING" {
-		// Actor's stage already resolved to the OTHER outcome — a real conflict.
-		return nil, nil, false, domain.ErrInvalidTransition
-	}
-	if actorStage.StageOrder != current.CurrentStage {
-		// Actor's stage is still PENDING but it is not yet their turn.
-		return nil, nil, false, domain.ErrWrongApprover
-	}
-	st := actorStage
-
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		s.log.Error("pg SubmitAction: begin tx failed", zap.Error(err))
-		return nil, nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-
-	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", svcmiddleware.TenantFromContext(ctx)); err != nil {
-		return nil, nil, false, fmt.Errorf("set_config app.tenant_id: %w", err)
-	}
-
-	// Optimistic concurrency: update stage with row_version check.
-	// This prevents lost updates from concurrent approvals on the same stage.
-	const updateStage = `
-		UPDATE workflow_stages
-		SET stage_status = $1, acted_at = NOW(), rationale = $2,
-		    row_version = row_version + 1, updated_at = NOW()
-		WHERE workflow_stage_id = $3 AND row_version = $4
-		RETURNING ` + stageColumns + `;`
-	row := tx.QueryRow(ctx, updateStage, wantStatus, params.Rationale, st.WorkflowStageID, st.RowVersion)
-	updatedStage, err := scanStage(row)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, nil, false, domain.ErrConcurrencyConflict
-		}
-		s.log.Error("pg SubmitAction: update stage failed", zap.Error(err))
-		return nil, nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-
-	isLastStage, err := isFinalStage(ctx, tx, params.WorkflowInstanceID, st.StageOrder)
-	if err != nil {
-		return nil, nil, false, err
-	}
-
-	newInstanceStatus := "PENDING"
-	newCurrentStage := st.StageOrder + 1
-	switch {
-	case params.Action == "REJECT":
-		newInstanceStatus = "REJECTED"
-		newCurrentStage = 0
-	case params.Action == "APPROVE" && isLastStage:
-		newInstanceStatus = "APPROVED"
-		newCurrentStage = 0
-	}
-
-	// Optimistic concurrency: update instance with row_version check.
-	const updateInstance = `
-		UPDATE workflow_instances
-		SET workflow_status = $1, current_stage = $2,
-		    completed_at = CASE WHEN $1::VARCHAR != 'PENDING' THEN NOW() ELSE completed_at END,
-		    row_version = row_version + 1, updated_at = NOW()
-		WHERE workflow_instance_id = $3 AND row_version = $4
-		RETURNING ` + instanceColumns + `;`
-	row = tx.QueryRow(ctx, updateInstance, newInstanceStatus, newCurrentStage, params.WorkflowInstanceID, current.RowVersion)
-	updatedInstance, err := scanInstance(row)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, nil, false, domain.ErrConcurrencyConflict
-		}
-		s.log.Error("pg SubmitAction: update instance failed", zap.Error(err))
-		return nil, nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-
-	rationale := fmt.Sprintf("stage %d %s by %s", st.StageOrder, wantStatus, params.ActorPrincipalID)
-	var instanceCorrelationID *string
-	if current.CorrelationID != "" {
-		instanceCorrelationID = &current.CorrelationID
-	}
-	if err := insertTransition(ctx, tx, params.WorkflowInstanceID, "PENDING", newInstanceStatus, params.ActorPrincipalID, &rationale, instanceCorrelationID, params.CausationID); err != nil {
-		return nil, nil, false, err
-	}
-
-	stageEventType := "approval.granted"
-	if updatedStage.StageStatus == "REJECTED" {
-		stageEventType = "approval.rejected"
-	}
-	if err := outbox.Insert(ctx, tx, outbox.Event{
-		AggregateType: "workflow_instance",
-		AggregateID:   params.WorkflowInstanceID,
-		EventType:     stageEventType,
-		TenantID:      updatedInstance.TenantID,
-		LegalEntityID: updatedInstance.LegalEntityID,
-		ActorID:       &params.ActorPrincipalID,
-		CorrelationID: instanceCorrelationID,
-		Payload: map[string]any{
-			"workflow_instance_id":  updatedInstance.WorkflowInstanceID,
-			"stage_order":           updatedStage.StageOrder,
-			"approver_principal_id": updatedStage.ApproverPrincipalID,
-		},
-	}); err != nil {
-		return nil, nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-
-	if updatedInstance.WorkflowStatus == "APPROVED" || updatedInstance.WorkflowStatus == "REJECTED" {
-		if err := outbox.Insert(ctx, tx, outbox.Event{
-			AggregateType: "workflow_instance",
-			AggregateID:   params.WorkflowInstanceID,
-			EventType:     "workflow.completed",
-			TenantID:      updatedInstance.TenantID,
-			LegalEntityID: updatedInstance.LegalEntityID,
-			ActorID:       &params.ActorPrincipalID,
-			CorrelationID: instanceCorrelationID,
-			Payload: map[string]any{
-				"workflow_instance_id": updatedInstance.WorkflowInstanceID,
-				"workflow_status":      updatedInstance.WorkflowStatus,
-				"completed_at":         updatedInstance.CompletedAt,
-			},
-		}); err != nil {
-			return nil, nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-		}
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		s.log.Error("pg SubmitAction: commit failed", zap.Error(err))
-		return nil, nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	return updatedInstance, updatedStage, true, nil
+	return true, nil
 }
 
 func isFinalStage(ctx context.Context, tx pgx.Tx, workflowInstanceID string, stageOrder int) (bool, error) {
@@ -802,221 +767,6 @@ func isFinalStage(ctx context.Context, tx pgx.Tx, workflowInstanceID string, sta
 		return false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	return stageOrder == maxOrder, nil
-}
-
-// SubmitQuorumVote casts one eligible approver's vote against the
-// workflow's current QUORUM stage (ZS-SVC-R-001 §5.1/§8.3). This is a
-// self-contained path, deliberately not sharing SubmitAction's
-// internals — SubmitAction's single-approver lookup
-// (findStageByApprover) assumes at most one stage per approver per
-// workflow, which does not hold for a quorum pool, and duplicating
-// the small "stage resolved -> advance instance" tail here keeps
-// SubmitAction (and its existing test coverage) completely
-// unmodified rather than risking a regression in a core, heavily
-// exercised function for a feature it doesn't need to know about.
-//
-// Idempotency mirrors SubmitAction: a replay of the identical vote is
-// a no-op (transitioned=false); a vote that conflicts with the
-// approver's own prior vote is domain.ErrInvalidTransition. A new
-// vote that does not yet resolve the stage (quorum neither reached
-// nor mathematically failed) still returns transitioned=true — the
-// vote was recorded — with the stage/instance left PENDING.
-func (s *PgStore) SubmitQuorumVote(ctx context.Context, params domain.SubmitQuorumVoteParams) (instance *domain.WorkflowInstance, stage *domain.WorkflowStage, transitioned bool, err error) {
-	current, err := s.FindWorkflowByID(ctx, params.WorkflowInstanceID)
-	if err != nil {
-		return nil, nil, false, err
-	}
-	if current.WorkflowStatus != "PENDING" {
-		return nil, nil, false, domain.ErrInvalidTransition
-	}
-
-	const stageQuery = `SELECT ` + stageColumns + ` FROM workflow_stages WHERE workflow_instance_id = $1 AND stage_order = $2;`
-	st, err := scanStage(s.pool.QueryRow(ctx, stageQuery, params.WorkflowInstanceID, current.CurrentStage))
-	if err != nil {
-		s.log.Error("pg SubmitQuorumVote: load current stage failed", zap.Error(err))
-		return nil, nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	if st.StageType != domain.StageTypeQuorum {
-		return nil, nil, false, domain.ErrNotQuorumStage
-	}
-	if st.StageStatus != "PENDING" {
-		return nil, nil, false, domain.ErrInvalidTransition
-	}
-
-	var eligible bool
-	const eligibleQuery = `SELECT EXISTS(SELECT 1 FROM workflow_stage_quorum_approvers WHERE workflow_stage_id = $1 AND approver_principal_id = $2);`
-	if err := s.pool.QueryRow(ctx, eligibleQuery, st.WorkflowStageID, params.ActorPrincipalID).Scan(&eligible); err != nil {
-		s.log.Error("pg SubmitQuorumVote: eligibility check failed", zap.Error(err))
-		return nil, nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	if !eligible {
-		return nil, nil, false, domain.ErrNotEligibleQuorumApprover
-	}
-
-	wantDecision := domain.QuorumDecisionApprove
-	if params.Action == "REJECT" {
-		wantDecision = domain.QuorumDecisionReject
-	}
-
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		s.log.Error("pg SubmitQuorumVote: begin tx failed", zap.Error(err))
-		return nil, nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-
-	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", svcmiddleware.TenantFromContext(ctx)); err != nil {
-		return nil, nil, false, fmt.Errorf("set_config app.tenant_id: %w", err)
-	}
-
-	const insertDecision = `
-		INSERT INTO workflow_stage_quorum_decisions (workflow_stage_id, approver_principal_id, decision, rationale)
-		VALUES ($1, $2, $3, $4)
-		ON CONFLICT (workflow_stage_id, approver_principal_id) DO NOTHING
-		RETURNING decision;`
-	var insertedDecision string
-	insertErr := tx.QueryRow(ctx, insertDecision, st.WorkflowStageID, params.ActorPrincipalID, wantDecision, params.Rationale).Scan(&insertedDecision)
-	if insertErr != nil {
-		if !errors.Is(insertErr, pgx.ErrNoRows) {
-			s.log.Error("pg SubmitQuorumVote: insert decision failed", zap.Error(insertErr))
-			return nil, nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, insertErr)
-		}
-		// Conflict: this approver already voted. Idempotent replay of the
-		// identical vote is a no-op; a different vote is a real conflict.
-		const existingQuery = `SELECT decision FROM workflow_stage_quorum_decisions WHERE workflow_stage_id = $1 AND approver_principal_id = $2;`
-		var existing string
-		if err := tx.QueryRow(ctx, existingQuery, st.WorkflowStageID, params.ActorPrincipalID).Scan(&existing); err != nil {
-			return nil, nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-		}
-		if existing != wantDecision {
-			return nil, nil, false, domain.ErrInvalidTransition
-		}
-		return current, st, false, nil
-	}
-
-	tally, err := quorumTally(ctx, tx, st.WorkflowStageID)
-	if err != nil {
-		return nil, nil, false, err
-	}
-	requiredApprovals := 0
-	if st.RequiredApprovals != nil {
-		requiredApprovals = *st.RequiredApprovals
-	}
-	qs := domain.QuorumStageStatus{
-		PoolSize: tally.poolSize, RequiredApprovals: requiredApprovals,
-		ApprovalCount: tally.approvals, RejectionCount: tally.rejections, VotesCast: tally.votesCast,
-	}
-	outcome, resolved := qs.Resolved()
-	if !resolved {
-		// Vote recorded; stage still awaiting more votes. Nothing else to
-		// update — commit just the decision row.
-		if err := tx.Commit(ctx); err != nil {
-			return nil, nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-		}
-		return current, st, true, nil
-	}
-
-	const updateStage = `
-		UPDATE workflow_stages
-		SET stage_status = $1, acted_at = NOW(), rationale = $2,
-		    row_version = row_version + 1, updated_at = NOW()
-		WHERE workflow_stage_id = $3 AND row_version = $4
-		RETURNING ` + stageColumns + `;`
-	rationale := fmt.Sprintf("quorum %s: %d/%d approvals (%d of %d eligible voted)", outcome, tally.approvals, requiredApprovals, tally.votesCast, tally.poolSize)
-	updatedStage, err := scanStage(tx.QueryRow(ctx, updateStage, outcome, rationale, st.WorkflowStageID, st.RowVersion))
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, nil, false, domain.ErrConcurrencyConflict
-		}
-		s.log.Error("pg SubmitQuorumVote: update stage failed", zap.Error(err))
-		return nil, nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-
-	isLastStage, err := isFinalStage(ctx, tx, params.WorkflowInstanceID, st.StageOrder)
-	if err != nil {
-		return nil, nil, false, err
-	}
-	newInstanceStatus := "PENDING"
-	newCurrentStage := st.StageOrder + 1
-	switch {
-	case outcome == "REJECTED":
-		newInstanceStatus = "REJECTED"
-		newCurrentStage = 0
-	case outcome == "APPROVED" && isLastStage:
-		newInstanceStatus = "APPROVED"
-		newCurrentStage = 0
-	}
-
-	const updateInstance = `
-		UPDATE workflow_instances
-		SET workflow_status = $1, current_stage = $2,
-		    completed_at = CASE WHEN $1::VARCHAR != 'PENDING' THEN NOW() ELSE completed_at END,
-		    row_version = row_version + 1, updated_at = NOW()
-		WHERE workflow_instance_id = $3 AND row_version = $4
-		RETURNING ` + instanceColumns + `;`
-	updatedInstance, err := scanInstance(tx.QueryRow(ctx, updateInstance, newInstanceStatus, newCurrentStage, params.WorkflowInstanceID, current.RowVersion))
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, nil, false, domain.ErrConcurrencyConflict
-		}
-		s.log.Error("pg SubmitQuorumVote: update instance failed", zap.Error(err))
-		return nil, nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-
-	var instanceCorrelationID *string
-	if current.CorrelationID != "" {
-		instanceCorrelationID = &current.CorrelationID
-	}
-	if err := insertTransition(ctx, tx, params.WorkflowInstanceID, "PENDING", newInstanceStatus, params.ActorPrincipalID, &rationale, instanceCorrelationID, params.CausationID); err != nil {
-		return nil, nil, false, err
-	}
-
-	stageEventType := "approval.granted"
-	if updatedStage.StageStatus == "REJECTED" {
-		stageEventType = "approval.rejected"
-	}
-	if err := outbox.Insert(ctx, tx, outbox.Event{
-		AggregateType: "workflow_instance",
-		AggregateID:   params.WorkflowInstanceID,
-		EventType:     stageEventType,
-		TenantID:      updatedInstance.TenantID,
-		LegalEntityID: updatedInstance.LegalEntityID,
-		ActorID:       &params.ActorPrincipalID,
-		CorrelationID: instanceCorrelationID,
-		Payload: map[string]any{
-			"workflow_instance_id": updatedInstance.WorkflowInstanceID,
-			"stage_order":          updatedStage.StageOrder,
-			"quorum_approvals":     tally.approvals,
-			"quorum_required":      requiredApprovals,
-		},
-	}); err != nil {
-		return nil, nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-
-	if updatedInstance.WorkflowStatus == "APPROVED" || updatedInstance.WorkflowStatus == "REJECTED" {
-		if err := outbox.Insert(ctx, tx, outbox.Event{
-			AggregateType: "workflow_instance",
-			AggregateID:   params.WorkflowInstanceID,
-			EventType:     "workflow.completed",
-			TenantID:      updatedInstance.TenantID,
-			LegalEntityID: updatedInstance.LegalEntityID,
-			ActorID:       &params.ActorPrincipalID,
-			CorrelationID: instanceCorrelationID,
-			Payload: map[string]any{
-				"workflow_instance_id": updatedInstance.WorkflowInstanceID,
-				"workflow_status":      updatedInstance.WorkflowStatus,
-				"completed_at":         updatedInstance.CompletedAt,
-			},
-		}); err != nil {
-			return nil, nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-		}
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		s.log.Error("pg SubmitQuorumVote: commit failed", zap.Error(err))
-		return nil, nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	return updatedInstance, updatedStage, true, nil
 }
 
 type quorumTallyResult struct {
@@ -1052,119 +802,6 @@ func quorumTally(ctx context.Context, tx pgx.Tx, workflowStageID string) (quorum
 		return tr, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	return tr, nil
-}
-
-// EscalateWorkflow transitions PENDING -> ESCALATED. Idempotent if already ESCALATED.
-func (s *PgStore) EscalateWorkflow(ctx context.Context, workflowInstanceID, actorPrincipalID string) (*domain.WorkflowInstance, bool, error) {
-	current, err := s.FindWorkflowByID(ctx, workflowInstanceID)
-	if err != nil {
-		return nil, false, err
-	}
-	if current.WorkflowStatus == "ESCALATED" {
-		return current, false, nil
-	}
-	if current.WorkflowStatus != "PENDING" {
-		return nil, false, domain.ErrInvalidTransition
-	}
-	// Keep the current stage. Escalation adds an escalation target; it does
-	// not reset the approval chain to stage 0 (which made the next approver
-	// lookup impossible and left the instance unable to resume).
-	return s.transitionInstanceStatus(ctx, workflowInstanceID, "PENDING", "ESCALATED", actorPrincipalID, current.CurrentStage, current.RowVersion)
-}
-
-// CancelWorkflow transitions PENDING or ESCALATED -> CANCELLED. Idempotent if
-// already CANCELLED. Illegal from APPROVED/REJECTED (terminal).
-func (s *PgStore) CancelWorkflow(ctx context.Context, workflowInstanceID, actorPrincipalID string) (*domain.WorkflowInstance, bool, error) {
-	current, err := s.FindWorkflowByID(ctx, workflowInstanceID)
-	if err != nil {
-		return nil, false, err
-	}
-	if current.WorkflowStatus == "CANCELLED" {
-		return current, false, nil
-	}
-	if current.WorkflowStatus != "PENDING" && current.WorkflowStatus != "ESCALATED" {
-		return nil, false, domain.ErrInvalidTransition
-	}
-	return s.transitionInstanceStatus(ctx, workflowInstanceID, current.WorkflowStatus, "CANCELLED", actorPrincipalID, 0, current.RowVersion)
-}
-
-func (s *PgStore) transitionInstanceStatus(ctx context.Context, workflowInstanceID, fromState, toState, actorPrincipalID string, newCurrentStage int, expectedRowVersion int) (*domain.WorkflowInstance, bool, error) {
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		s.log.Error("pg transitionInstanceStatus: begin tx failed", zap.Error(err))
-		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-
-	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", svcmiddleware.TenantFromContext(ctx)); err != nil {
-		return nil, false, fmt.Errorf("set_config app.tenant_id: %w", err)
-	}
-
-	const query = `
-		UPDATE workflow_instances
-		SET workflow_status = $1, current_stage = $2,
-		    completed_at = CASE WHEN $1::VARCHAR IN ('APPROVED','REJECTED','CANCELLED','INVALIDATED') THEN NOW() ELSE completed_at END,
-		    row_version = row_version + 1, updated_at = NOW()
-		WHERE workflow_instance_id = $3 AND row_version = $4
-		RETURNING ` + instanceColumns + `;`
-	row := tx.QueryRow(ctx, query, toState, newCurrentStage, workflowInstanceID, expectedRowVersion)
-	updated, err := scanInstance(row)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, false, domain.ErrConcurrencyConflict
-		}
-		s.log.Error("pg transitionInstanceStatus: update failed", zap.Error(err))
-		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-
-	var instanceCorrelationID *string
-	if updated.CorrelationID != "" {
-		instanceCorrelationID = &updated.CorrelationID
-	}
-	if err := insertTransition(ctx, tx, workflowInstanceID, fromState, toState, actorPrincipalID, nil, instanceCorrelationID, nil); err != nil {
-		return nil, false, err
-	}
-
-	if toState == "ESCALATED" {
-		if err := outbox.Insert(ctx, tx, outbox.Event{
-			AggregateType: "workflow_instance",
-			AggregateID:   workflowInstanceID,
-			EventType:     "workflow.escalated",
-			TenantID:      updated.TenantID,
-			LegalEntityID: updated.LegalEntityID,
-			ActorID:       &actorPrincipalID,
-			CorrelationID: instanceCorrelationID,
-			Payload: map[string]any{
-				"workflow_instance_id": updated.WorkflowInstanceID,
-				"current_stage":        updated.CurrentStage,
-			},
-		}); err != nil {
-			return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-		}
-	} else if toState == "CANCELLED" {
-		if err := outbox.Insert(ctx, tx, outbox.Event{
-			AggregateType: "workflow_instance",
-			AggregateID:   workflowInstanceID,
-			EventType:     "workflow.completed",
-			TenantID:      updated.TenantID,
-			LegalEntityID: updated.LegalEntityID,
-			ActorID:       &actorPrincipalID,
-			CorrelationID: instanceCorrelationID,
-			Payload: map[string]any{
-				"workflow_instance_id": updated.WorkflowInstanceID,
-				"workflow_status":      updated.WorkflowStatus,
-				"completed_at":         updated.CompletedAt,
-			},
-		}); err != nil {
-			return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-		}
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		s.log.Error("pg transitionInstanceStatus: commit failed", zap.Error(err))
-		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	return updated, true, nil
 }
 
 // InvalidateWorkflow transitions PENDING or APPROVED -> INVALIDATED per ZS-STATE-001 §6.1 / §7.
@@ -1241,7 +878,24 @@ func (s *PgStore) InvalidateWorkflow(ctx context.Context, params domain.Invalida
 		rationale += " narrative=" + *params.Narrative
 	}
 
-	if err := insertTransition(ctx, tx, params.WorkflowInstanceID, current.WorkflowStatus, domain.WorkflowStatusInvalidated, params.ActorPrincipalID, &rationale, instanceCorrelationID, params.CausationID); err != nil {
+	cycle := current.ReviewCycle
+	if err := insertTransitionRecord(ctx, tx, transitionRecord{
+		InstanceID: params.WorkflowInstanceID, From: current.WorkflowStatus, To: domain.WorkflowStatusInvalidated,
+		ActedBy: params.ActorPrincipalID, Rationale: &rationale, CorrelationID: instanceCorrelationID, CausationID: params.CausationID,
+		ReviewCycle: &cycle, IdempotencyKey: params.Meta.IdempotencyKey, RequestHash: params.Meta.RequestHash,
+		Authority: params.Authority, DecisionID: params.Meta.DecisionID,
+	}); err != nil {
+		if errors.Is(err, errIdempotentRetry) {
+			return current, false, nil
+		}
+		return nil, false, err
+	}
+	if err := writeLedgerTx(ctx, tx, updated, params.ActorPrincipalID, "WORKFLOW_INVALIDATE", domain.WorkflowStatusInvalidated,
+		params.CausationID, params.Authority, params.Meta, map[string]any{"from_status": current.WorkflowStatus,
+			"reason_code": params.ReasonCode, "rationale": rationale, "evidence_refs": params.EvidenceRefs}); err != nil {
+		if errors.Is(err, errIdempotentRetry) {
+			return current, false, nil
+		}
 		return nil, false, err
 	}
 
@@ -1359,13 +1013,13 @@ func (s *PgStore) VerifyRelease(ctx context.Context, params domain.VerifyRelease
 }
 
 // Workflow Definition columns and scanning
-const definitionColumns = `workflow_definition_id, tenant_id, workflow_type, version, stages_json, name, description, created_by, created_at, superseded_by, is_active, row_version, updated_at, plane, data_class, residency_region`
+const definitionColumns = `workflow_definition_id, tenant_id, workflow_type, version, stages_json, name, description, created_by, created_at, superseded_by, is_active, row_version, updated_at, plane, data_class, residency_region, expiry_hours, escalation_target`
 
 func scanDefinition(row pgx.Row) (*domain.WorkflowDefinition, error) {
 	d := &domain.WorkflowDefinition{}
 	err := row.Scan(&d.WorkflowDefinitionID, &d.TenantID, &d.WorkflowType, &d.Version, &d.StagesJSON,
 		&d.Name, &d.Description, &d.CreatedBy, &d.CreatedAt, &d.SupersededBy, &d.IsActive,
-		&d.RowVersion, &d.UpdatedAt, &d.Plane, &d.DataClass, &d.ResidencyRegion)
+		&d.RowVersion, &d.UpdatedAt, &d.Plane, &d.DataClass, &d.ResidencyRegion, &d.ExpiryHours, &d.EscalationTarget)
 	return d, err
 }
 
@@ -1383,11 +1037,11 @@ func (s *PgStore) CreateWorkflowDefinition(ctx context.Context, params domain.Cr
 	}
 
 	const query = `
-		INSERT INTO workflow_definitions (workflow_definition_id, tenant_id, workflow_type, version, stages_json, name, description, created_by, created_at, is_active)
-		VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, NOW(), true)
+		INSERT INTO workflow_definitions (workflow_definition_id, tenant_id, workflow_type, version, stages_json, name, description, created_by, created_at, is_active, expiry_hours, escalation_target)
+		VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, NOW(), true, $8, $9)
 		RETURNING ` + definitionColumns + `;`
 
-	row := tx.QueryRow(ctx, query, params.TenantID, params.WorkflowType, params.Version, params.StagesJSON, params.Name, params.Description, params.CreatedBy)
+	row := tx.QueryRow(ctx, query, params.TenantID, params.WorkflowType, params.Version, params.StagesJSON, params.Name, params.Description, params.CreatedBy, params.ExpiryHours, params.EscalationTarget)
 	definition, err := scanDefinition(row)
 	if err != nil {
 		s.log.Error("pg CreateWorkflowDefinition: insert failed", zap.Error(err))
@@ -1434,184 +1088,9 @@ func (s *PgStore) GetWorkflowDefinition(ctx context.Context, params domain.GetWo
 	return definition, nil
 }
 
-// ListWorkflowDefinitions lists workflow definitions with optional filters.
-func (s *PgStore) ListWorkflowDefinitions(ctx context.Context, params domain.ListWorkflowDefinitionsParams) ([]*domain.WorkflowDefinition, error) {
-	query := `SELECT ` + definitionColumns + ` FROM workflow_definitions WHERE tenant_id = $1`
-	args := []any{params.TenantID}
-	argIdx := 2
-
-	if params.WorkflowType != nil {
-		query += fmt.Sprintf(" AND workflow_type = $%d", argIdx)
-		args = append(args, *params.WorkflowType)
-		argIdx++
-	}
-	if params.IsActive != nil {
-		query += fmt.Sprintf(" AND is_active = $%d", argIdx)
-		args = append(args, *params.IsActive)
-		argIdx++
-	}
-	query += ` ORDER BY workflow_type, version DESC`
-
-	if params.Limit > 0 {
-		query += fmt.Sprintf(" LIMIT $%d", argIdx)
-		args = append(args, params.Limit)
-		argIdx++
-	}
-	if params.Offset > 0 {
-		query += fmt.Sprintf(" OFFSET $%d", argIdx)
-		args = append(args, params.Offset)
-	}
-
-	rows, err := s.pool.Query(ctx, query, args...)
-	if err != nil {
-		s.log.Error("pg ListWorkflowDefinitions failed", zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	defer rows.Close()
-
-	var definitions []*domain.WorkflowDefinition
-	for rows.Next() {
-		def, scanErr := scanDefinition(rows)
-		if scanErr != nil {
-			return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, scanErr)
-		}
-		definitions = append(definitions, def)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	return definitions, nil
-}
-
-// SupersedeWorkflowDefinition marks oldDefID as superseded by newDefID and
-// activates the new definition. Both must exist and belong to the same
-// tenant and workflow type; oldDefID must currently be active. The pair
-// update runs in one transaction so a definition can never be left
-// deactivated without its replacement.
-func (s *PgStore) SupersedeWorkflowDefinition(ctx context.Context, oldDefID, newDefID string) error {
-	if oldDefID == newDefID {
-		return domain.ErrInvalidTransition
-	}
-
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-
-	// The replacement must exist under the same tenant and workflow type.
-	var replacementActive bool
-	err = tx.QueryRow(ctx, `
-		SELECT n.is_active
-		FROM workflow_definitions n
-		JOIN workflow_definitions o ON o.workflow_definition_id = $1
-		WHERE n.workflow_definition_id = $2
-		  AND n.tenant_id = o.tenant_id
-		  AND n.workflow_type = o.workflow_type;`, oldDefID, newDefID).Scan(&replacementActive)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return domain.ErrWorkflowNotFound
-		}
-		s.log.Error("pg SupersedeWorkflowDefinition: lookup failed", zap.Error(err))
-		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-
-	const markSuperseded = `
-		UPDATE workflow_definitions
-		SET is_active = false, superseded_by = $2, updated_at = NOW(), row_version = row_version + 1
-		WHERE workflow_definition_id = $1 AND is_active = true;`
-	tag, err := tx.Exec(ctx, markSuperseded, oldDefID, newDefID)
-	if err != nil {
-		s.log.Error("pg SupersedeWorkflowDefinition: mark superseded failed", zap.Error(err))
-		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	if tag.RowsAffected() == 0 {
-		return domain.ErrInvalidTransition
-	}
-
-	if !replacementActive {
-		const activateReplacement = `
-			UPDATE workflow_definitions
-			SET is_active = true, updated_at = NOW(), row_version = row_version + 1
-			WHERE workflow_definition_id = $1 AND is_active = false;`
-		if _, err := tx.Exec(ctx, activateReplacement, newDefID); err != nil {
-			s.log.Error("pg SupersedeWorkflowDefinition: activate replacement failed", zap.Error(err))
-			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-		}
-	}
-
-	return tx.Commit(ctx)
-}
-
-// ActivateWorkflowDefinition activates a workflow definition.
-func (s *PgStore) ActivateWorkflowDefinition(ctx context.Context, workflowDefinitionID string) error {
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-
-	const query = `
-		UPDATE workflow_definitions
-		SET is_active = true, updated_at = NOW(), row_version = row_version + 1
-		WHERE workflow_definition_id = $1 AND is_active = false;`
-
-	_, err = tx.Exec(ctx, query, workflowDefinitionID)
-	if err != nil {
-		s.log.Error("pg ActivateWorkflowDefinition failed", zap.Error(err))
-		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-
-	return tx.Commit(ctx)
-}
-
-// SuspendWorkflowDefinition suspends a workflow definition.
-func (s *PgStore) SuspendWorkflowDefinition(ctx context.Context, workflowDefinitionID string) error {
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-
-	const query = `
-		UPDATE workflow_definitions
-		SET is_active = false, updated_at = NOW(), row_version = row_version + 1
-		WHERE workflow_definition_id = $1 AND is_active = true;`
-
-	_, err = tx.Exec(ctx, query, workflowDefinitionID)
-	if err != nil {
-		s.log.Error("pg SuspendWorkflowDefinition failed", zap.Error(err))
-		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-
-	return tx.Commit(ctx)
-}
-
-// RetireWorkflowDefinition retires a workflow definition.
-func (s *PgStore) RetireWorkflowDefinition(ctx context.Context, workflowDefinitionID string) error {
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-
-	const query = `
-		UPDATE workflow_definitions
-		SET is_active = false, updated_at = NOW(), row_version = row_version + 1
-		WHERE workflow_definition_id = $1 AND is_active = true;`
-
-	_, err = tx.Exec(ctx, query, workflowDefinitionID)
-	if err != nil {
-		s.log.Error("pg RetireWorkflowDefinition failed", zap.Error(err))
-		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-
-	return tx.Commit(ctx)
-}
-
 // ListPendingApprovals lists workflows pending approval for a tenant.
 func (s *PgStore) ListPendingApprovals(ctx context.Context, tenantID string, limit, offset int) ([]*domain.WorkflowInstance, error) {
-	const query = `SELECT ` + instanceColumns + ` FROM workflow_instances WHERE tenant_id = $1 AND workflow_status = 'PENDING' ORDER BY started_at DESC LIMIT $2 OFFSET $3;`
+	const query = `SELECT ` + instanceColumns + ` FROM workflow_instances WHERE tenant_id = $1 AND workflow_status IN ('PENDING','ESCALATED') ORDER BY started_at DESC, workflow_instance_id DESC LIMIT $2 OFFSET $3;`
 
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -1645,171 +1124,4 @@ func (s *PgStore) ListPendingApprovals(ctx context.Context, tenantID string, lim
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	return instances, nil
-}
-
-// GetApprovalEvidence returns the transition history for a workflow instance.
-func (s *PgStore) GetApprovalEvidence(ctx context.Context, workflowInstanceID string) ([]*domain.WorkflowTransition, error) {
-	const query = `SELECT workflow_transition_id, workflow_instance_id, from_state, to_state, acted_by, rationale, correlation_id, causation_id, acted_at FROM workflow_transitions WHERE workflow_instance_id = $1 ORDER BY acted_at;`
-
-	rows, err := s.pool.Query(ctx, query, workflowInstanceID)
-	if err != nil {
-		s.log.Error("pg GetApprovalEvidence failed", zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	defer rows.Close()
-
-	var transitions []*domain.WorkflowTransition
-	for rows.Next() {
-		t := &domain.WorkflowTransition{}
-		if err := rows.Scan(&t.WorkflowTransitionID, &t.WorkflowInstanceID, &t.FromState, &t.ToState, &t.ActedBy, &t.Rationale, &t.CorrelationID, &t.CausationID, &t.ActedAt); err != nil {
-			return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-		}
-		transitions = append(transitions, t)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	return transitions, nil
-}
-
-// RequestChanges reopens a REJECTED or ESCALATED workflow instance at stage 1
-// (workflow_status back to PENDING) and appends the corresponding transition.
-// The originating status is recorded verbatim as the transition's from_state,
-// and acted_by is the requesting principal — both are governance evidence and
-// must reflect reality, not a hardcoded placeholder. Any other current status
-// is an invalid transition (409 at the HTTP layer); only a genuinely absent
-// instance yields ErrWorkflowNotFound.
-func (s *PgStore) RequestChanges(ctx context.Context, workflowInstanceID, actorPrincipalID, rationale string, causationID *string) error {
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-
-	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", svcmiddleware.TenantFromContext(ctx)); err != nil {
-		return fmt.Errorf("%w: set_config app.tenant_id: %v", domain.ErrStoreUnavailable, err)
-	}
-
-	const selectQuery = `
-		SELECT workflow_status, COALESCE(correlation_id, '')
-		FROM workflow_instances
-		WHERE workflow_instance_id = $1
-		FOR UPDATE;`
-
-	var fromStatus, instanceCorrelationID string
-	if err := tx.QueryRow(ctx, selectQuery, workflowInstanceID).Scan(&fromStatus, &instanceCorrelationID); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return domain.ErrWorkflowNotFound
-		}
-		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	if fromStatus != "REJECTED" && fromStatus != "ESCALATED" {
-		return domain.ErrInvalidTransition
-	}
-
-	const query = `
-		UPDATE workflow_instances
-		SET workflow_status = 'PENDING', current_stage = 1, updated_at = NOW(), row_version = row_version + 1
-		WHERE workflow_instance_id = $1
-		RETURNING workflow_instance_id;`
-
-	var wfID string
-	if err := tx.QueryRow(ctx, query, workflowInstanceID).Scan(&wfID); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return domain.ErrWorkflowNotFound
-		}
-		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-
-	var correlationID *string
-	if instanceCorrelationID != "" {
-		correlationID = &instanceCorrelationID
-	}
-
-	if err := insertTransition(ctx, tx, workflowInstanceID, fromStatus, "PENDING", actorPrincipalID, &rationale, correlationID, causationID); err != nil {
-		return err
-	}
-
-	return tx.Commit(ctx)
-}
-
-// EscalateToWorkflow escalates a workflow to a different target per R-001 §4.2.
-func (s *PgStore) EscalateToWorkflow(ctx context.Context, params domain.EscalateToWorkflowParams) (*domain.WorkflowInstance, bool, error) {
-	current, err := s.FindWorkflowByID(ctx, params.WorkflowInstanceID)
-	if err != nil {
-		return nil, false, err
-	}
-	if current.WorkflowStatus == "ESCALATED" && current.EscalationTarget != nil && *current.EscalationTarget == params.EscalationTarget {
-		return current, false, nil
-	}
-	if current.WorkflowStatus != "PENDING" && current.WorkflowStatus != "ESCALATED" {
-		return nil, false, domain.ErrInvalidTransition
-	}
-
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		s.log.Error("pg EscalateToWorkflow: begin tx failed", zap.Error(err))
-		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-
-	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", svcmiddleware.TenantFromContext(ctx)); err != nil {
-		return nil, false, fmt.Errorf("set_config app.tenant_id: %w", err)
-	}
-
-	const query = `
-		UPDATE workflow_instances
-		SET workflow_status = 'ESCALATED',
-		    current_stage = 0,
-		    completed_at = NOW(),
-		    escalation_target = $1,
-		    row_version = row_version + 1, updated_at = NOW()
-		WHERE workflow_instance_id = $2 AND row_version = $3
-		RETURNING ` + instanceColumns + `;`
-
-	row := tx.QueryRow(ctx, query, params.EscalationTarget, params.WorkflowInstanceID, current.RowVersion)
-	updated, err := scanInstance(row)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, false, domain.ErrConcurrencyConflict
-		}
-		s.log.Error("pg EscalateToWorkflow: update failed", zap.Error(err))
-		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-
-	var instanceCorrelationID *string
-	if updated.CorrelationID != "" {
-		instanceCorrelationID = &updated.CorrelationID
-	}
-	if params.CorrelationID != "" {
-		instanceCorrelationID = &params.CorrelationID
-	}
-
-	rationale := fmt.Sprintf("escalated to %s by %s: code=%s", params.EscalationTarget, params.ActorPrincipalID, "MANUAL_ESCALATION")
-	if err := insertTransition(ctx, tx, params.WorkflowInstanceID, current.WorkflowStatus, "ESCALATED", params.ActorPrincipalID, &rationale, instanceCorrelationID, nil); err != nil {
-		return nil, false, err
-	}
-
-	if err := outbox.Insert(ctx, tx, outbox.Event{
-		AggregateType: "workflow_instance",
-		AggregateID:   params.WorkflowInstanceID,
-		EventType:     "workflow.escalated",
-		TenantID:      updated.TenantID,
-		LegalEntityID: updated.LegalEntityID,
-		ActorID:       &params.ActorPrincipalID,
-		CorrelationID: instanceCorrelationID,
-		Payload: map[string]any{
-			"workflow_instance_id": updated.WorkflowInstanceID,
-			"escalation_target":    params.EscalationTarget,
-			"current_stage":        updated.CurrentStage,
-		},
-	}); err != nil {
-		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		s.log.Error("pg EscalateToWorkflow: commit failed", zap.Error(err))
-		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	return updated, true, nil
 }

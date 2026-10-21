@@ -20,8 +20,8 @@ import (
 func pendingInstance() *domain.WorkflowInstance {
 	return &domain.WorkflowInstance{
 		WorkflowInstanceID: testWorkflowID,
-		TenantID:           "t-1",
-		LegalEntityID:      "le-1",
+		TenantID:           "11111111-1111-4111-8111-111111111111",
+		LegalEntityID:      "22222222-2222-4222-8222-222222222222",
 		WorkflowStatus:     "PENDING",
 		CurrentStage:       1,
 		InitiatedBy:        "requester-1",
@@ -207,12 +207,12 @@ func TestInvalidateWorkflow_NotFound_NoAuthzNoTransition(t *testing.T) {
 // definition route fail closed with a 503 against a live authorization-svc.
 func TestLifecycleAuthz_DefinitionOpsAskPlatformScope(t *testing.T) {
 	store := &stubStore{
-		workflowDefinition: &domain.WorkflowDefinition{TenantID: "t-1", WorkflowType: "PURCHASE_APPROVAL", Version: 1},
+		workflowDefinition: &domain.WorkflowDefinition{TenantID: "11111111-1111-4111-8111-111111111111", WorkflowType: "PURCHASE_APPROVAL", Version: 1},
 	}
 	authz := &stubAuthz{}
 	r := newTestRouterFull(store, &stubPublisher{}, authz)
 
-	body := `{"tenant_id":"t-1","workflow_type":"PURCHASE_APPROVAL","version":1,"stages_json":"W10="}`
+	body := `{"tenant_id":"11111111-1111-4111-8111-111111111111","workflow_type":"PURCHASE_APPROVAL","version":1,"stages_json":"W10="}`
 	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflow-definitions/", bytes.NewBufferString(body)), "creator-1")
 
 	w := httptest.NewRecorder()
@@ -244,7 +244,7 @@ func TestLifecycleAuthz_DefinitionOpsAskPlatformScope(t *testing.T) {
 	if iw.Code != http.StatusOK {
 		t.Fatalf("expected 200 for the instance-scoped cancel, got %d: %s", iw.Code, iw.Body.String())
 	}
-	if len(instanceAuthz.entities) != 1 || instanceAuthz.entities[0] != "le-1" {
+	if len(instanceAuthz.entities) != 1 || instanceAuthz.entities[0] != "22222222-2222-4222-8222-222222222222" {
 		t.Fatalf("expected the instance's legal entity le-1, got %v", instanceAuthz.entities)
 	}
 }

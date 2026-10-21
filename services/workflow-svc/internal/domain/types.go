@@ -78,6 +78,11 @@ type WorkflowInstance struct {
 	// Versioned workflow definition reference per R-001 WFC-02
 	WorkflowDefinitionID      string `json:"workflow_definition_id,omitempty"`
 	WorkflowDefinitionVersion int    `json:"workflow_definition_version,omitempty"`
+
+	// ReviewCycle increments when changes are requested and the chain is
+	// decided again (000020); EscalatedAt is when it was last escalated.
+	ReviewCycle int        `json:"review_cycle"`
+	EscalatedAt *time.Time `json:"escalated_at,omitempty"`
 }
 
 // WorkflowStage is one approval gate in a workflow's ordered chain,
@@ -120,6 +125,13 @@ type WorkflowStage struct {
 	Plane           string    `json:"plane"`
 	DataClass       string    `json:"data_class"`
 	ResidencyRegion string    `json:"residency_region"`
+
+	// ApproverRole is set only for a ROLE stage (routed by a definition);
+	// DueAt is the stage deadline; ActedBy is who decided it (a delegate or
+	// an escalation target acts for the stage, and the record says so).
+	ApproverRole *string    `json:"approver_role,omitempty"`
+	DueAt        *time.Time `json:"due_at,omitempty"`
+	ActedBy      *string    `json:"acted_by,omitempty"`
 }
 
 // WorkflowTransition is the append-only audit trail — one row per state
@@ -141,6 +153,17 @@ type WorkflowTransition struct {
 	CausationID   *string `json:"causation_id,omitempty"`
 
 	ActedAt time.Time `json:"acted_at"`
+
+	// Lineage (000020): the stage and review cycle decided, the authority
+	// snapshot (access decision, basis, delegation), the route version, and
+	// the governance-ledger decision id.
+	StageOrder                *int    `json:"stage_order,omitempty"`
+	ReviewCycle               *int    `json:"review_cycle,omitempty"`
+	AccessDecisionID          *string `json:"access_decision_id,omitempty"`
+	AuthorityBasis            *string `json:"authority_basis,omitempty"`
+	DelegationID              *string `json:"delegation_id,omitempty"`
+	WorkflowDefinitionVersion *int    `json:"workflow_definition_version,omitempty"`
+	DecisionID                *string `json:"decision_id,omitempty"`
 }
 
 // ── params ───────────────────────────────────────────────────────────────────
@@ -154,6 +177,11 @@ type CreateWorkflowStageInput struct {
 	ApproverPrincipalID string   `json:"approver_principal_id,omitempty"`
 	RequiredApprovals   int      `json:"required_approvals,omitempty"`
 	QuorumApprovers     []string `json:"quorum_approvers,omitempty"`
+	// ApproverRole routes a ROLE stage (definition-driven).
+	ApproverRole string `json:"approver_role,omitempty"`
+	// DueAtHours is the stage deadline, counted from when the stage becomes
+	// current; when it passes the instance is escalated.
+	DueAtHours int `json:"due_at_hours,omitempty"`
 }
 
 type CreateWorkflowParams struct {
@@ -175,6 +203,9 @@ type CreateWorkflowParams struct {
 	WorkflowDefinitionID      string
 	WorkflowDefinitionVersion int
 	Stages                    []CreateWorkflowStageInput
+	// DueAt is when the whole approval expires (R-001 Expire): past it, a
+	// PENDING or ESCALATED instance becomes EXPIRED. nil = no expiry.
+	DueAt *time.Time
 }
 
 // SubmitActionParams holds input for approving or rejecting the current stage.
@@ -188,6 +219,14 @@ type SubmitActionParams struct {
 	// CausationID is optional: the event/decision that caused this specific
 	// action, when the caller knows it.
 	CausationID *string
+
+	// ActingAs is the stage the actor decides when they are not its named
+	// approver: "escalation" (the instance's escalation target on an
+	// ESCALATED stage) or "role" (a ROLE stage). Empty for a named approver
+	// or a delegate (AssignedApproverID).
+	ActingAs  string
+	Authority ActionAuthority
+	Meta      CommandMeta
 }
 
 // InvalidateWorkflowParams holds input for invalidating a workflow on material change.
@@ -204,6 +243,9 @@ type InvalidateWorkflowParams struct {
 	// present, the update fails with ErrConcurrencyConflict unless it matches
 	// the instance's current row_version.
 	ExpectedVersion *int
+
+	Authority ActionAuthority
+	Meta      CommandMeta
 }
 
 // EscalateToWorkflowParams holds input for escalating a workflow to a different target.
@@ -214,6 +256,9 @@ type EscalateToWorkflowParams struct {
 	ReasonCode         string
 	Narrative          *string
 	CorrelationID      string
+
+	Authority ActionAuthority
+	Meta      CommandMeta
 }
 
 // VerifyReleaseParams holds input for verifying an approval before release.
@@ -255,17 +300,25 @@ type WorkflowDefinition struct {
 	Plane           string    `json:"plane"`
 	DataClass       string    `json:"data_class"`
 	ResidencyRegion string    `json:"residency_region"`
+
+	// ExpiryHours: an instance started from this definition expires this
+	// long after it starts (000020). EscalationTarget: who an instance is
+	// escalated to when a stage deadline passes.
+	ExpiryHours      *int    `json:"expiry_hours,omitempty"`
+	EscalationTarget *string `json:"escalation_target,omitempty"`
 }
 
 // CreateWorkflowDefinitionParams holds input for creating a workflow definition.
 type CreateWorkflowDefinitionParams struct {
-	TenantID     string
-	WorkflowType string
-	Version      int
-	StagesJSON   []byte
-	Name         *string
-	Description  *string
-	CreatedBy    string
+	TenantID         string
+	WorkflowType     string
+	Version          int
+	StagesJSON       []byte
+	Name             *string
+	Description      *string
+	CreatedBy        string
+	ExpiryHours      *int
+	EscalationTarget *string
 }
 
 // GetWorkflowDefinitionParams holds input for retrieving a workflow definition.
