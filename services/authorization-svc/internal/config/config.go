@@ -175,6 +175,16 @@ type Config struct {
 	// IdentityIssuer / IdentityAudience are the envelope's iss and aud.
 	IdentityIssuer   string
 	IdentityAudience string
+	// IdentityRevocation is "on" (default) or "off": whether a verified
+	// envelope's session is checked at identity-context-svc (AU-01). off is
+	// only allowed with ENV=local. IdentityIntrospectURL is the session status
+	// endpoint; IdentityRevocationTTL caps how long a live answer is reused
+	// (the revocation lag at this relying party); IdentityRevocationFail is
+	// "closed" (default: 503 when the status is unknown) or "open".
+	IdentityRevocation     string
+	IdentityIntrospectURL  string
+	IdentityRevocationTTL  time.Duration
+	IdentityRevocationFail string
 	// AdminDelegates are services (client certificate CNs) that may act on
 	// the admin routes for a principal they forward, without that principal's
 	// envelope: access-control-svc provisioning an approved grant.
@@ -228,6 +238,23 @@ func (c *Config) Validate() error {
 	// them, so the checks apply to every real configuration.
 	if c.IdentityAssertion != "" && c.IdentityAssertion != "off" && strings.TrimSpace(c.IdentityJWKSURL) == "" {
 		return fmt.Errorf("AUTHZ_IDENTITY_JWKS_URL is required unless AUTHZ_IDENTITY_ASSERTION=off: no envelope could be verified")
+	}
+	switch c.IdentityRevocation {
+	case "", "on":
+	case "off":
+		if !local {
+			return fmt.Errorf("AUTHZ_IDENTITY_REVOCATION=off is only allowed with ENV=local: a logged-out session would keep opening the admin routes until its envelope expired (AU-01)")
+		}
+	default:
+		return fmt.Errorf("AUTHZ_IDENTITY_REVOCATION must be \"on\" or \"off\", got %q", c.IdentityRevocation)
+	}
+	if c.IdentityRevocationTTL > time.Minute {
+		return fmt.Errorf("AUTHZ_IDENTITY_REVOCATION_TTL_SECONDS above 60 exceeds the revocation SLO")
+	}
+	switch c.IdentityRevocationFail {
+	case "", "closed", "open":
+	default:
+		return fmt.Errorf("AUTHZ_IDENTITY_REVOCATION_FAIL must be \"closed\" or \"open\", got %q", c.IdentityRevocationFail)
 	}
 	switch c.SessionStepUp {
 	case "", "enforce":
@@ -542,6 +569,11 @@ func Load() (*Config, error) {
 		IdentityIssuer:    env("AUTHZ_IDENTITY_ISSUER", "identity-context-svc"),
 		IdentityAudience:  env("AUTHZ_IDENTITY_AUDIENCE", "zoiko-internal"),
 		AdminDelegates:    splitTopics(env("AUTHZ_ADMIN_DELEGATES", "")),
+
+		IdentityRevocation:     strings.ToLower(env("AUTHZ_IDENTITY_REVOCATION", "on")),
+		IdentityIntrospectURL:  env("AUTHZ_IDENTITY_INTROSPECT_URL", "http://identity-context-svc:8080/v1/context/session/introspect"),
+		IdentityRevocationTTL:  time.Duration(envInt("AUTHZ_IDENTITY_REVOCATION_TTL_SECONDS", 5)) * time.Second,
+		IdentityRevocationFail: strings.ToLower(env("AUTHZ_IDENTITY_REVOCATION_FAIL", "closed")),
 
 		SessionStepUp:              strings.ToLower(env("AUTHZ_SESSION_STEP_UP", "enforce")),
 		SessionStepUpMaxAgeSeconds: envInt("AUTHZ_SESSION_STEP_UP_MAX_AGE_SECONDS", 900),

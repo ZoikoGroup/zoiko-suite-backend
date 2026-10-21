@@ -1337,8 +1337,10 @@ services:
   # ── 10. authorization-svc (Port: 8089) ──────────────────────────────────────
   authorization-svc:
     build:
-      context: ../services/authorization-svc
-      dockerfile: Dockerfile
+      # Root context: go.mod replaces zoiko.io/identity-envelope with the
+      # sibling module, so the build must see both (see the Dockerfile).
+      context: ..
+      dockerfile: services/authorization-svc/Dockerfile
     container_name: authorization-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -1489,6 +1491,11 @@ services:
       # allow-lists authorization-svc and is fetched with its own certificate.
       AUTHZ_IDENTITY_ASSERTION: "warn"
       AUTHZ_IDENTITY_JWKS_URL: "http://identity-svc:8080/.well-known/jwks.json"
+      # AU-01: every verified envelope's session is checked here (live answers
+      # reused for 5 s), so a logout stops the admin routes at once instead of
+      # when the envelope expires. Fails closed when identity-context cannot
+      # answer.
+      AUTHZ_IDENTITY_INTROSPECT_URL: "http://identity-svc:8080/v1/context/session/introspect"
       AUTHZ_ADMIN_DELEGATES: "access-control-svc"
       # Issuing or approving a JIT or break-glass session needs a TOTP step-up
       # no older than this (register A-03, ZS-IAM-001 §13/§14). Enforced here

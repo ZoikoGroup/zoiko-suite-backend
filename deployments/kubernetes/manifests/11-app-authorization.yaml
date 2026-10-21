@@ -79,6 +79,9 @@ spec:
           value: "warn"
         - name: AUTHZ_IDENTITY_JWKS_URL
           value: "http://identity-svc.zoiko-identity.svc.cluster.local:8080/.well-known/jwks.json"
+        # AU-01: each verified envelope's session is checked at identity-svc.
+        - name: AUTHZ_IDENTITY_INTROSPECT_URL
+          value: "http://identity-svc.zoiko-identity.svc.cluster.local:8080/v1/context/session/introspect"
         - name: AUTHZ_IDENTITY_ISSUER
           value: "identity-context-svc"
         - name: AUTHZ_IDENTITY_AUDIENCE

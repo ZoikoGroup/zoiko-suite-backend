@@ -43,6 +43,7 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 	"go.uber.org/zap"
+	idenv "zoiko.io/identity-envelope"
 
 	"zoiko.io/authorization-svc/internal/workload"
 )
@@ -71,7 +72,10 @@ type Assertion struct {
 	PrincipalID      string
 	TenantID         string
 	SessionContextID string
-	MFAVerified      bool
+	// SID is the login session the envelope descends from (OIDC sid);
+	// ending it ends every envelope minted under it.
+	SID         string
+	MFAVerified bool
 	// AuthTime is when the person last authenticated; zero when unknown.
 	AuthTime time.Time
 	AMR      []string
@@ -122,6 +126,19 @@ type Gate struct {
 	delegates map[string]bool
 	log       *zap.Logger
 	now       func() time.Time
+
+	// revocation checks each verified envelope's session at
+	// identity-context-svc (AU-01). Nil skips the check (ENV=local only).
+	revocation *idenv.Revocation
+}
+
+// WithRevocation makes the gate refuse an envelope whose session has ended:
+// a logout, an invalidation, a suspended principal or an ended login session.
+// Before it, a revoked envelope kept opening the admin routes until it expired
+// (Auth audit AU-01: "revocation must not wait for token expiry").
+func (g *Gate) WithRevocation(r *idenv.Revocation) *Gate {
+	g.revocation = r
+	return g
 }
 
 // NewGate builds the gate. delegates are service names (client certificate
@@ -176,6 +193,7 @@ type envelopeClaims struct {
 	} `json:"session_trust_posture"`
 	AuthTime int64    `json:"auth_time"`
 	AMR      []string `json:"amr"`
+	SID      string   `json:"sid"`
 	jwt.RegisteredClaims
 }
 
@@ -213,6 +231,7 @@ func (g *Gate) Verify(ctx context.Context, token string) (*Assertion, error) {
 		PrincipalID:      claims.Principal.PrincipalID,
 		TenantID:         claims.TenantID,
 		SessionContextID: claims.SessionTrustPosture.SessionContextID,
+		SID:              claims.SID,
 		MFAVerified:      claims.SessionTrustPosture.MFAVerified,
 		AMR:              claims.AMR,
 		Basis:            BasisEnvelope,
@@ -256,6 +275,9 @@ func (g *Gate) Middleware(next http.Handler) http.Handler {
 					"X-Tenant-Id does not name the tenant the identity envelope was issued for")
 				return
 			}
+			if !g.sessionLive(w, r, token, a) {
+				return
+			}
 			// The verified values become the headers every handler already
 			// reads, so no handler can see anything else.
 			r.Header.Set("X-Principal-Id", a.PrincipalID)
@@ -288,6 +310,33 @@ func (g *Gate) Middleware(next http.Handler) http.Handler {
 		w.Header().Set("X-Identity-Assertion", "missing")
 		next.ServeHTTP(w, r)
 	})
+}
+
+// sessionLive runs the revocation check (AU-01) and writes the refusal when
+// the session has ended (401 session_revoked) or its status is unknown and
+// the check fails closed (503).
+func (g *Gate) sessionLive(w http.ResponseWriter, r *http.Request, token string, a *Assertion) bool {
+	if g.revocation == nil {
+		return true
+	}
+	c := &idenv.Claims{TenantID: a.TenantID, SID: a.SID}
+	c.Principal.PrincipalID = a.PrincipalID
+	c.SessionTrustPosture.SessionContextID = a.SessionContextID
+	err := g.revocation.Check(r.Context(), token, c)
+	switch {
+	case err == nil:
+		return true
+	case errors.Is(err, idenv.ErrRevoked):
+		g.log.Warn("identity session revoked — refused", zap.String("path", r.URL.Path),
+			zap.String("principal_id", a.PrincipalID), zap.String("session_context_id", a.SessionContextID), zap.Error(err))
+		refuse(w, http.StatusUnauthorized, "session_revoked", "AUTHENTICATION_FAILED",
+			"the identity envelope's session has ended; sign in again")
+	default:
+		g.log.Error("identity session status unavailable — failing closed", zap.String("path", r.URL.Path), zap.Error(err))
+		refuse(w, http.StatusServiceUnavailable, "session_status_unavailable", "DEPENDENCY_UNAVAILABLE",
+			"the identity session could not be confirmed")
+	}
+	return false
 }
 
 func bearer(header string) (string, bool) {

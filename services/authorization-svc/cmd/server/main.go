@@ -31,6 +31,7 @@ import (
 	"github.com/riandyrn/otelchi"
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
+	idenv "zoiko.io/identity-envelope"
 
 	"zoiko.io/authorization-svc/internal/cache"
 	"zoiko.io/authorization-svc/internal/config"
@@ -216,6 +217,24 @@ func main() {
 		keys := idgate.NewJWKS(cfg.IdentityJWKSURL, 5*time.Minute, jwksHTTP)
 		identityGate := idgate.NewGate(idgate.Mode(cfg.IdentityAssertion), keys,
 			cfg.IdentityIssuer, cfg.IdentityAudience, cfg.AdminDelegates, log)
+		// AU-01: a verified envelope's session is checked at identity-context-svc
+		// (cached for the revocation TTL), so a logout or suspension stops the
+		// admin routes now, not when the envelope expires.
+		if cfg.IdentityRevocation != "off" {
+			fail := idenv.FailClosed
+			if cfg.IdentityRevocationFail == "open" {
+				fail = idenv.FailOpen
+			}
+			identityGate.WithRevocation(idenv.NewRevocation(idenv.RevocationOptions{
+				Source:    idenv.NewIntrospector(cfg.IdentityIntrospectURL, jwksHTTP),
+				ActiveTTL: cfg.IdentityRevocationTTL,
+				Fail:      fail,
+			}))
+			log.Info("identity session revocation check on", zap.String("introspect_url", cfg.IdentityIntrospectURL),
+				zap.Duration("ttl", cfg.IdentityRevocationTTL), zap.String("fail", string(fail)))
+		} else {
+			log.Warn("AUTHZ_IDENTITY_REVOCATION=off — a revoked session keeps working until its envelope expires (ENV=local only)")
+		}
 		r.Use(identityGate.Middleware)
 		log.Info("identity assertion gate configured",
 			zap.String("mode", cfg.IdentityAssertion), zap.String("jwks_url", cfg.IdentityJWKSURL),
