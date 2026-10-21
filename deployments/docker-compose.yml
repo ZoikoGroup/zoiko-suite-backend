@@ -1083,8 +1083,10 @@ services:
   # ── 6. policy-svc (Port: 8085) ────────────────────────────────────────────────
   policy-svc:
     build:
-      context: ../services/policy-svc
-      dockerfile: Dockerfile
+      # Root context: go.mod replaces zoiko.io/identity-envelope with the
+      # sibling module, so the build must see both (see the Dockerfile).
+      context: ..
+      dockerfile: services/policy-svc/Dockerfile
     container_name: policy-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -1118,14 +1120,17 @@ services:
       # replay through its envelope).
       POLICY_EVALUATE_AUTHZ: "${POLICY_EVALUATE_AUTHZ:-enforce}"
       POLICY_READ_AUTHZ: "${POLICY_READ_AUTHZ:-enforce}"
-      # Identity headers (X5): enforce needs identity-context-svc's signed
-      # envelope (Authorization, verified against its JWKS) agreeing with
-      # X-Tenant-Id / X-Principal-Id, or a peer certificate on the :8449 mTLS
-      # listener. warn until governance-decision-log-svc's replay forwards the
-      # envelope (its generated ForwardTo carries no Authorization) and the
-      # peers call over mTLS; the code default is enforce.
+      # Identity headers (X5), through the shared identity-envelope gate:
+      # identity-context-svc's signed envelope (verified against its JWKS, its
+      # session checked at introspection, AU-01) replaces X-Tenant-Id /
+      # X-Principal-Id, or a peer certificate on the :8449 mTLS listener vouches
+      # for them. governance-decision-log-svc's replay forwards the envelope
+      # since 21 Oct; warn remains for the out-of-domain evaluate callers
+      # (expense-claim-svc, payment-authorization-svc), which forward the
+      # principal but not the envelope. The code default is enforce.
       POLICY_IDENTITY_VERIFY: "${POLICY_IDENTITY_VERIFY:-warn}"
       IDENTITY_JWKS_URL: "http://identity-svc:8080/.well-known/jwks.json"
+      IDENTITY_INTROSPECT_URL: "http://identity-svc:8080/v1/context/session/introspect"
       EXPECTED_ISSUER: "identity-context-svc"
       EXPECTED_AUDIENCE: "zoiko-internal"
       EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"

@@ -79,6 +79,9 @@ spec:
           value: "warn"
         - name: IDENTITY_JWKS_URL
           value: "http://identity-svc.zoiko-identity.svc.cluster.local:8080/.well-known/jwks.json"
+        # The shared gate checks each envelope's session (AU-01).
+        - name: IDENTITY_INTROSPECT_URL
+          value: "http://identity-svc.zoiko-identity.svc.cluster.local:8080/v1/context/session/introspect"
         - name: EXPECTED_ISSUER
           value: "identity-context-svc"
         livenessProbe:

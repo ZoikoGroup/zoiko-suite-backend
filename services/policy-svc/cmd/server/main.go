@@ -28,6 +28,7 @@ import (
 	"github.com/riandyrn/otelchi"
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
+	idenv "zoiko.io/identity-envelope"
 
 	"zoiko.io/policy-svc/internal/authz"
 	"zoiko.io/policy-svc/internal/cache"
@@ -38,7 +39,6 @@ import (
 	"zoiko.io/policy-svc/internal/evidence"
 	"zoiko.io/policy-svc/internal/handler"
 	"zoiko.io/policy-svc/internal/health"
-	"zoiko.io/policy-svc/internal/identity"
 	svcmiddleware "zoiko.io/policy-svc/internal/middleware"
 	"zoiko.io/policy-svc/internal/mtlslistener"
 	"zoiko.io/policy-svc/internal/outbox"
@@ -179,16 +179,18 @@ func main() {
 	r.Use(correlationIDMiddleware)
 	r.Use(middleware.Logger)
 
-	// Identity before anything reads X-Tenant-Id / X-Principal-Id (X5): a
-	// signed envelope that agrees with them, or an mTLS peer.
-	identityMode := identity.ParseMode(cfg.IdentityVerify)
-	verifier := identity.NewVerifier(identityMode, identity.NewKeySet(cfg.JWKSURL, cfg.JWKSCacheTTL),
-		cfg.ExpectedIssuer, cfg.ExpectedAudience, log)
-	if identityMode != identity.Enforce {
-		log.Warn("identity verification is not enforced: identity headers may be asserted by any caller",
-			zap.String("mode", string(identityMode)))
+	// Identity before anything reads X-Tenant-Id / X-Principal-Id (X5), through
+	// the platform's shared gate (decision 21 Oct 2026). policy-svc's own
+	// verifier checked the envelope's signature and nothing else, so a session
+	// ended at identity-context-svc (logout, suspension) kept working here until
+	// the envelope expired (AU-01). The gate also checks the session status, and
+	// makes the verified claims the only source of the identity headers.
+	gate, gateSettings, err := idenv.NewGateFromEnv("policy-svc", log, gateOptions(cfg))
+	if err != nil {
+		log.Fatal("identity gate configuration refused", zap.Error(err))
 	}
-	r.Use(verifier.Middleware)
+	log.Info("identity gate", gateSettings.Fields()...)
+	r.Use(gate.Middleware)
 	r.Use(svcmiddleware.TenantContext())
 
 	// Canonical Service Input Contract (ZS-ARCH-SVC-001 v2.0 §4). Runs after
