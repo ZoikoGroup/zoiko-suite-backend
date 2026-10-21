@@ -47,6 +47,10 @@ const (
 	// ActionReconciliationCertify seals a run — separate from preparing it
 	// (ZS-CONTROL-001 Invariant 12: a preparer cannot self-certify).
 	ActionReconciliationCertify = "RECONCILIATION_CERTIFY"
+	// ActionReconciliationRevoke withdraws a certification — separate from
+	// certifying (ZS-CONTROL-001 §27 "restricted command"): the power to seal
+	// a run does not carry the power to withdraw a seal.
+	ActionReconciliationRevoke = "RECONCILIATION_REVOKE"
 )
 
 // populationReadTimeout bounds reading both populations of a StartRun. The
@@ -65,7 +69,8 @@ const persistTimeout = 30 * time.Second
 type Authorizer interface {
 	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
 	// Decide is CheckAllowed returning the decision authorization-svc recorded,
-	// for the one command that must record its authority: Certify (A12).
+	// for the commands that must record their authority: Certify (A12) and
+	// RevokeCertification (B34).
 	Decide(ctx context.Context, principalID, legalEntityID, actionType string) (*domain.AuthoritySnapshot, error)
 }
 
@@ -111,6 +116,7 @@ func (h *Handler) routes(r chi.Router) {
 	r.Post("/runs/{runID}:raise-exception", h.RaiseException)
 	r.Post("/runs/{runID}:reperform", h.Reperform)
 	r.Post("/runs/{runID}:certify", h.Certify)
+	r.Post("/runs/{runID}:revoke-certification", h.RevokeCertification)
 	r.Post("/runs/{runID}:supersede", h.SupersedeRun)
 	r.Get("/runs/{runID}/populations", h.GetPopulationSnapshots)
 	r.Get("/runs/{runID}/matches", h.GetMatchResults)
@@ -581,6 +587,56 @@ func (h *Handler) Certify(w http.ResponseWriter, r *http.Request) {
 	h.respondJSON(w, http.StatusCreated, got)
 }
 
+// RevokeCertification withdraws a Certified run's certification (A12/B34;
+// ZS-SVC-Z-001 DQC-05, RB-05; ZS-CONTROL-001 §27). Body {"reason": "...",
+// "evidence_refs": ["..."]}, both mandatory (NP-47); unknown fields are
+// refused. Authority is RECONCILIATION_REVOKE on the run's entity, through
+// Decide as Certify's is, because the revocation records the revoker's
+// decision; the store refuses any principal who certified the run.
+//
+// Prospective: the run's certification is REVOKED from now on, its status
+// stays Certified, and its sealed certification is served unchanged with the
+// revocation beside it. Nothing already decided on the certification is undone.
+func (h *Handler) RevokeCertification(w http.ResponseWriter, r *http.Request) {
+	tenantID := customMiddleware.GetTenantID(r.Context())
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	runID := chi.URLParam(r, "runID")
+	var req domain.RevokeCertificationRequest
+	reqHash, err := h.readStrict(r, &req)
+	if err != nil {
+		h.respondError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	if err := req.Validate(); err != nil {
+		h.respondFromError(w, err)
+		return
+	}
+	run, err := h.store.GetRun(r.Context(), tenantID, runID)
+	if err != nil {
+		h.respondFromError(w, err)
+		return
+	}
+	if run.LegalEntityID == "" {
+		h.respondFromError(w, domain.ErrLegacyRecord)
+		return
+	}
+	authority, err := h.authz.Decide(r.Context(), principalID, run.LegalEntityID, ActionReconciliationRevoke)
+	if err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	claim := h.idempotencyClaim(principalID, "RevokeCertification", runID, reqHash, r.Header.Get("Idempotency-Key"))
+	got, err := h.store.RevokeCertification(r.Context(), tenantID, runID, req, principalID, authority, claim)
+	if err != nil {
+		h.respondFromError(w, err)
+		return
+	}
+	h.respondJSON(w, http.StatusCreated, got)
+}
+
 func (h *Handler) SupersedeRun(w http.ResponseWriter, r *http.Request) {
 	tenantID, principalID, ok := h.authorizeRun(w, r, ActionReconciliationManage)
 	if !ok {
@@ -847,9 +903,9 @@ func (h *Handler) respondFromError(w http.ResponseWriter, err error) {
 	}
 	switch {
 	case errors.Is(err, domain.ErrNotExceptionOwner), errors.Is(err, domain.ErrNotIndependent), errors.Is(err, domain.ErrSelfApproval),
-		errors.Is(err, domain.ErrNotIndependentCertifier):
+		errors.Is(err, domain.ErrNotIndependentCertifier), errors.Is(err, domain.ErrRevokerIsCertifier):
 		h.respondError(w, http.StatusForbidden, err.Error())
-	case errors.Is(err, domain.ErrAuthorityUntraceable):
+	case errors.Is(err, domain.ErrAuthorityUntraceable), errors.Is(err, domain.ErrRevokerAuthorityUntraceable):
 		h.respondError(w, http.StatusServiceUnavailable, err.Error())
 	case errors.Is(err, domain.ErrDefinitionNotFound), errors.Is(err, domain.ErrRunNotFound),
 		errors.Is(err, domain.ErrItemNotFound), errors.Is(err, domain.ErrExceptionNotFound), errors.Is(err, domain.ErrRuleVersionNotFound):

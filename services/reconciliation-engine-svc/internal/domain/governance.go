@@ -297,6 +297,21 @@ func CheckIndependence(to ExceptionStatus, actor string, owner *string, raisedBy
 	return nil
 }
 
+// CheckRevokerIndependence: the principal who certified a run cannot revoke
+// that certification, the same independence a certifier has from the run's
+// preparers (CheckCertifierIndependence; financial-control-svc's
+// CheckRevokerIndependence). certifiers is everyone recorded as certifying the
+// run — every actor of its CERTIFICATION -> CERTIFIED transitions, and the
+// certification's sealer — not only the last of them.
+func CheckRevokerIndependence(actor string, certifiers []string) error {
+	for _, c := range certifiers {
+		if actor == c {
+			return ErrRevokerIsCertifier
+		}
+	}
+	return nil
+}
+
 // CheckCertifierIndependence: a preparer cannot self-certify (ZS-CONTROL-001
 // Invariant 12). preparers is everyone who prepared the run — started it,
 // matched in it, or reperformed it — not only the last of them, so a trivial

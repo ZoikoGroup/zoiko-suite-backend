@@ -45,6 +45,8 @@ type Store interface {
 	RaiseException(ctx context.Context, tenantID, runID string, req domain.RaiseExceptionRequest, actor string, claim domain.IdempotencyClaim) (*domain.ReconciliationException, error)
 	Reperform(ctx context.Context, tenantID, runID string, pops []domain.FrozenPopulation, actor string, claim domain.IdempotencyClaim) (*domain.ReconciliationRun, error)
 	Certify(ctx context.Context, tenantID, runID string, actor string, authority *domain.AuthoritySnapshot, claim domain.IdempotencyClaim) (*domain.Certification, error)
+	RevokeCertification(ctx context.Context, tenantID, runID string, req domain.RevokeCertificationRequest, actor string,
+		authority *domain.AuthoritySnapshot, claim domain.IdempotencyClaim) (*domain.CertificationRevocation, error)
 	SupersedeRun(ctx context.Context, tenantID, runID string, req domain.SupersedeRunRequest, actor string, claim domain.IdempotencyClaim) (*domain.ReconciliationRun, error)
 
 	GetRun(ctx context.Context, tenantID, runID string) (*domain.ReconciliationRun, error)
@@ -275,22 +277,29 @@ func (s *PgStore) GetRun(ctx context.Context, tenantID, runID string) (*domain.R
 // instead of re-reading populations that may since have moved.
 func (s *PgStore) CheckIdempotency(ctx context.Context, tenantID string, c domain.IdempotencyClaim) error {
 	return s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
-		var reqHash, resourceID string
-		err := tx.QueryRow(ctx, `
-			SELECT request_sha256, resource_id FROM idempotency_keys
-			WHERE tenant_id = $1 AND owner_scope = $2 AND principal_id = $3 AND idempotency_key = $4`,
-			tenantID, c.OwnerScope, c.PrincipalID, c.Key).Scan(&reqHash, &resourceID)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil
-		}
-		if err != nil {
-			return fmt.Errorf("read idempotency claim: %w", err)
-		}
-		if reqHash != c.RequestSHA256 {
-			return domain.ErrIdempotencyKeyReused
-		}
-		return &domain.IdempotentReplayError{ResourceID: resourceID}
+		return peekIdempotency(ctx, tx, tenantID, c)
 	})
+}
+
+// peekIdempotency is CheckIdempotency inside a caller's transaction: a command
+// that must refuse a state it already produced (RevokeCertification) asks it
+// under the row lock, so a retry of a completed command replays instead.
+func peekIdempotency(ctx context.Context, tx pgx.Tx, tenantID string, c domain.IdempotencyClaim) error {
+	var reqHash, resourceID string
+	err := tx.QueryRow(ctx, `
+		SELECT request_sha256, resource_id FROM idempotency_keys
+		WHERE tenant_id = $1 AND owner_scope = $2 AND principal_id = $3 AND idempotency_key = $4`,
+		tenantID, c.OwnerScope, c.PrincipalID, c.Key).Scan(&reqHash, &resourceID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read idempotency claim: %w", err)
+	}
+	if reqHash != c.RequestSHA256 {
+		return domain.ErrIdempotencyKeyReused
+	}
+	return &domain.IdempotentReplayError{ResourceID: resourceID}
 }
 
 // StartRun freezes the two populations the caller read from their sources —
@@ -1590,8 +1599,16 @@ func (s *PgStore) GetCertification(ctx context.Context, tenantID, runID string) 
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.ErrRunNotFound
 		}
+		if err != nil {
+			return err
+		}
+		// A revoked certification is still served whole, with its revocation
+		// beside it, so a reader never mistakes it for one still in force.
+		if c.Revocation, err = runRevocation(ctx, tx, tenantID, runID); err != nil {
+			return err
+		}
 		out = c
-		return err
+		return nil
 	})
 	return out, err
 }

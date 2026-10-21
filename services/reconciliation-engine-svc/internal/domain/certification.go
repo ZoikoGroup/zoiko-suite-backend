@@ -1,6 +1,10 @@
 package domain
 
-import "time"
+import (
+	"fmt"
+	"strings"
+	"time"
+)
 
 // What a certification binds (SPEC_DEVIATIONS A12; ZS-SVC-Z-001 INV-21
 // "Certification binds exact observation/reconciliation/lineage evidence",
@@ -125,4 +129,65 @@ type CertifiedManualMatch struct {
 	MatchedAt            time.Time            `json:"matched_at"`
 	Evidence             *ManualMatchEvidence `json:"evidence"`
 	ResolvedExceptionIDs []string             `json:"resolved_exception_ids"`
+}
+
+// RevokeCertificationRequest withdraws a run's certification (A12/B34;
+// ZS-SVC-Z-001 DQC-05 "new material evidence may revoke certification
+// prospectively", RB-05; ZS-CONTROL-001 §27 "restricted command, reason,
+// evidence, prior certification retained"). Both fields are mandatory: NP-47
+// says a revocation with no reason or evidence must fail safe. EvidenceRefs
+// name the new material evidence the revocation rests on, as evidence_ref
+// names the correction on an exception's REMEDIATED transition.
+type RevokeCertificationRequest struct {
+	Reason       string   `json:"reason"`
+	EvidenceRefs []string `json:"evidence_refs"`
+}
+
+const (
+	maxRevocationReasonLen      = 2000
+	maxRevocationEvidenceRefs   = 20
+	maxRevocationEvidenceRefLen = 500
+)
+
+func (r RevokeCertificationRequest) Validate() error {
+	if strings.TrimSpace(r.Reason) == "" {
+		return fmt.Errorf("%w: a revocation needs a reason", ErrInvalidArgument)
+	}
+	if len(r.Reason) > maxRevocationReasonLen {
+		return fmt.Errorf("%w: reason is too long", ErrInvalidArgument)
+	}
+	if len(r.EvidenceRefs) == 0 {
+		return fmt.Errorf("%w: a revocation needs at least one evidence reference", ErrInvalidArgument)
+	}
+	if len(r.EvidenceRefs) > maxRevocationEvidenceRefs {
+		return fmt.Errorf("%w: at most %d evidence references", ErrInvalidArgument, maxRevocationEvidenceRefs)
+	}
+	for _, e := range r.EvidenceRefs {
+		if strings.TrimSpace(e) == "" || len(e) > maxRevocationEvidenceRefLen {
+			return fmt.Errorf("%w: each evidence reference must be 1-%d characters", ErrInvalidArgument, maxRevocationEvidenceRefLen)
+		}
+	}
+	return nil
+}
+
+// CertificationRevocation is the append-only record of one revocation
+// (migration 000011). It names exactly what it revokes — the sealed
+// certification, the manifest hash it was sealed under, and the run's
+// CERTIFICATION -> CERTIFIED transition — none of which it changes, and
+// records who revoked it, why, on what evidence and by what authority.
+// RevokedAt is the effective time: the revocation is prospective (RB-05).
+type CertificationRevocation struct {
+	RevocationID              string            `json:"revocation_id"`
+	TenantID                  string            `json:"tenant_id"`
+	RunID                     string            `json:"run_id"`
+	CertificationID           string            `json:"certification_id"`
+	RevokedManifestSHA256     string            `json:"revoked_manifest_sha256"`
+	CertificationTransitionID int64             `json:"certification_transition_id"`
+	CertifiedBy               string            `json:"certified_by"`
+	CertifiedAt               time.Time         `json:"certified_at"`
+	Reason                    string            `json:"reason"`
+	EvidenceRefs              []string          `json:"evidence_refs"`
+	Authority                 AuthoritySnapshot `json:"authority_snapshot"`
+	RevokedBy                 string            `json:"revoked_by"`
+	RevokedAt                 time.Time         `json:"revoked_at"`
 }

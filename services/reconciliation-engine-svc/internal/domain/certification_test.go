@@ -1,6 +1,8 @@
 package domain
 
 import (
+	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -46,6 +48,30 @@ func TestAuthoritySnapshot_Traceable(t *testing.T) {
 	for _, a := range []*AuthoritySnapshot{none, &noID, &denied} {
 		if a.Traceable("carol") {
 			t.Fatalf("traceable: %+v", a)
+		}
+	}
+}
+
+// B34 / NP-47: a revocation without a reason or evidence fails safe.
+func TestRevokeCertificationRequest_Validate(t *testing.T) {
+	ok := RevokeCertificationRequest{Reason: "source restated after certification", EvidenceRefs: []string{"bank-restatement-2026-10"}}
+	if err := ok.Validate(); err != nil {
+		t.Fatalf("valid request: %v", err)
+	}
+	many := make([]string, 21)
+	for i := range many {
+		many[i] = "ref"
+	}
+	for name, r := range map[string]RevokeCertificationRequest{
+		"no reason":         {Reason: "  ", EvidenceRefs: []string{"x"}},
+		"reason too long":   {Reason: strings.Repeat("r", 2001), EvidenceRefs: []string{"x"}},
+		"no evidence":       {Reason: "why"},
+		"blank evidence":    {Reason: "why", EvidenceRefs: []string{"x", " "}},
+		"evidence too long": {Reason: "why", EvidenceRefs: []string{strings.Repeat("e", 501)}},
+		"too much evidence": {Reason: "why", EvidenceRefs: many},
+	} {
+		if err := r.Validate(); !errors.Is(err, ErrInvalidArgument) {
+			t.Errorf("%s: %v, want ErrInvalidArgument", name, err)
 		}
 	}
 }

@@ -66,6 +66,19 @@ type fakeStore struct {
 	approvals      []string
 	certifiers     []string
 	authorities    []*domain.AuthoritySnapshot
+	revocations    []domain.RevokeCertificationRequest
+	revokeErr      error
+}
+
+func (s *fakeStore) RevokeCertification(_ context.Context, _, runID string, req domain.RevokeCertificationRequest, actor string,
+	authority *domain.AuthoritySnapshot, _ domain.IdempotencyClaim) (*domain.CertificationRevocation, error) {
+	if s.revokeErr != nil {
+		return nil, s.revokeErr
+	}
+	s.revocations = append(s.revocations, req)
+	s.authorities = append(s.authorities, authority)
+	return &domain.CertificationRevocation{RevocationID: "rcv_1", RunID: runID, Reason: req.Reason, EvidenceRefs: req.EvidenceRefs,
+		Authority: *authority, RevokedBy: actor}, nil
 }
 
 func (s *fakeStore) Certify(_ context.Context, _, runID, actor string, authority *domain.AuthoritySnapshot,
@@ -368,6 +381,69 @@ func TestCertify_RecordsTheCertifiersDecision(t *testing.T) {
 		"/v1/reconciliation/runs/rcr_1:certify", "")
 	if w.Code != http.StatusServiceUnavailable || len(st.certifiers) != 0 {
 		t.Fatalf("untraceable grant: %d %s, certifiers %v", w.Code, w.Body, st.certifiers)
+	}
+}
+
+const revokeBody = `{"reason":"bank statement restated after certification","evidence_refs":["bank-restatement-2026-10"]}`
+
+// B34: revoking is its own permission, checked on the run's entity through
+// Decide, and the store is handed the revoker's own decision for it; the
+// permission to certify is not enough.
+func TestRevokeCertification_NeedsRevokePermissionAndRecordsTheDecision(t *testing.T) {
+	run := &domain.ReconciliationRun{RunID: "rcr_1", LegalEntityID: entityA, Status: domain.RunCertified,
+		CertificationState: domain.CertCertified}
+	const path = "/v1/reconciliation/runs/rcr_1:revoke-certification"
+
+	az := &recordingAuthz{}
+	st := &fakeStore{run: run}
+	w := serve(NewHandler(st, az, failingFetcher{}, zap.NewNop()), http.MethodPost, path, revokeBody)
+	if w.Code != http.StatusCreated || len(az.actions) != 1 || az.actions[0] != ActionReconciliationRevoke || az.entities[0] != entityA ||
+		len(st.revocations) != 1 || st.revocations[0].EvidenceRefs[0] != "bank-restatement-2026-10" {
+		t.Fatalf("revoke: %d %s, checks %v on %v, revocations %v", w.Code, w.Body, az.actions, az.entities, st.revocations)
+	}
+	if a := st.authorities[0]; a.AccessDecisionID != "adl_1" || a.PrincipalID != "alice" || a.ActionType != ActionReconciliationRevoke {
+		t.Fatalf("authority handed to the store: %+v", a)
+	}
+
+	az = &recordingAuthz{deny: map[string]bool{ActionReconciliationRevoke: true}}
+	st = &fakeStore{run: run}
+	w = serve(NewHandler(st, az, failingFetcher{}, zap.NewNop()), http.MethodPost, path, revokeBody)
+	if w.Code != http.StatusForbidden || len(st.revocations) != 0 {
+		t.Fatalf("revoke with only CERTIFY: %d %s, revocations %v", w.Code, w.Body, st.revocations)
+	}
+
+	st = &fakeStore{run: run}
+	w = serve(NewHandler(st, &recordingAuthz{untraceable: true}, failingFetcher{}, zap.NewNop()), http.MethodPost, path, revokeBody)
+	if w.Code != http.StatusServiceUnavailable || len(st.revocations) != 0 {
+		t.Fatalf("untraceable grant: %d %s, revocations %v", w.Code, w.Body, st.revocations)
+	}
+
+	// The store's independence refusal is a 403.
+	st = &fakeStore{run: run, revokeErr: domain.ErrRevokerIsCertifier}
+	w = serve(NewHandler(st, &recordingAuthz{}, failingFetcher{}, zap.NewNop()), http.MethodPost, path, revokeBody)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("certifier revokes: %d %s", w.Code, w.Body)
+	}
+}
+
+// NP-47: a revocation with no reason or evidence is refused before anything
+// is authorized or written, and so is an unknown field.
+func TestRevokeCertification_RequiresReasonAndEvidence(t *testing.T) {
+	run := &domain.ReconciliationRun{RunID: "rcr_1", LegalEntityID: entityA}
+	for name, body := range map[string]string{
+		"empty body":    ``,
+		"no reason":     `{"evidence_refs":["x"]}`,
+		"no evidence":   `{"reason":"restated"}`,
+		"blank ref":     `{"reason":"restated","evidence_refs":[" "]}`,
+		"unknown field": `{"reason":"restated","evidence_ref":"x"}`,
+	} {
+		az := &recordingAuthz{}
+		st := &fakeStore{run: run}
+		w := serve(NewHandler(st, az, failingFetcher{}, zap.NewNop()), http.MethodPost,
+			"/v1/reconciliation/runs/rcr_1:revoke-certification", body)
+		if w.Code != http.StatusBadRequest || len(az.actions) != 0 || len(st.revocations) != 0 {
+			t.Errorf("%s: %d %s, checks %v, revocations %v", name, w.Code, w.Body, az.actions, st.revocations)
+		}
 	}
 }
 

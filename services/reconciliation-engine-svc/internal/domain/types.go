@@ -23,6 +23,7 @@ const (
 	PrefixMatchResult   = "rmr_"
 	PrefixException     = "rex_"
 	PrefixCertification = "rct_"
+	PrefixRevocation    = "rcv_"
 )
 
 type errorString string
@@ -455,12 +456,16 @@ type Certification struct {
 	// authorization decision, the content hash of every side of the
 	// generation certified, and every manual match with its reason and
 	// evidence. All three are in the manifest hash.
-	Authority      *AuthoritySnapshot     `json:"authority_snapshot,omitempty"`
-	Populations    []CertifiedPopulation  `json:"populations,omitempty"`
-	ManualMatches  []CertifiedManualMatch `json:"manual_matches,omitempty"`
-	ManifestSHA256 string                 `json:"manifest_sha256"`
-	SealedAt       time.Time              `json:"sealed_at"`
-	SealedBy       string                 `json:"sealed_by"`
+	Authority     *AuthoritySnapshot     `json:"authority_snapshot,omitempty"`
+	Populations   []CertifiedPopulation  `json:"populations,omitempty"`
+	ManualMatches []CertifiedManualMatch `json:"manual_matches,omitempty"`
+	// Revocation is set on read once the certification has been revoked
+	// (B34). It is a separate record: the sealed certification above, and its
+	// manifest hash, are never changed by a revocation.
+	Revocation     *CertificationRevocation `json:"revocation,omitempty"`
+	ManifestSHA256 string                   `json:"manifest_sha256"`
+	SealedAt       time.Time                `json:"sealed_at"`
+	SealedBy       string                   `json:"sealed_by"`
 }
 
 type SupersedeRunRequest struct {
@@ -511,4 +516,11 @@ var (
 	// traceable authorization decision (A12); without one it is refused, not
 	// recorded without it. Answered 503, as authorization-svc being unavailable.
 	ErrAuthorityUntraceable = errorString("the certifier's authorization decision cannot be traced; certification refused")
+	// ErrRevokerIsCertifier: a certification is revoked by someone other than
+	// whoever certified the run (B34).
+	ErrRevokerIsCertifier = errorString("a certification cannot be revoked by the principal who certified it")
+	// ErrRevokerAuthorityUntraceable: a revocation records the revoker's own
+	// traceable authorization decision, as a certification records its
+	// certifier's; without one it is refused (503) and nothing is revoked.
+	ErrRevokerAuthorityUntraceable = errorString("the revoker's authorization decision cannot be traced; revocation refused")
 )

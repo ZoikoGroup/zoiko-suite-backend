@@ -35,13 +35,12 @@ generation beside the immutable original (B30). Still missing: rounding and
 business-day tolerance and reconciling items (A5), maker-checker beyond
 accepting risk and approving rules (A9), recurrence and
 qualitative materiality (A4 remainder),
-certification revocation (A12; the manifest part is closed by B32),
 and two questions the specs leave open: how absolute and percentage
 tolerance combine (A15) and what defines a PARTIAL result (A16). Defects
 fixed: B1–B4; Stage 1 closed A1, A10, A13 and A14 (B7–B12); Stage 2
 closed A2 and A3 and most of A5 (B13–B17); Stage 3 closed A6 (B18–B20) and A7
 and most of A4 (B21–B25); Stage 4 closed A11 (B26–B27); B30–B31 close A8;
-B32–B33 close A12's manifest part.
+B32–B33 close A12's manifest part and B34–B35 its revocation part.
 
 ## A. Not implemented / weaker than the spec
 
@@ -94,8 +93,8 @@ B32–B33 close A12's manifest part.
 - **A10. Closed** — definitions and runs carry `legal_entity_id`; see B9.
 - **A11. Closed** — rule versions with independent approval and effective
   dating, and definition reads; see B26.
-- **A12. Certification is thin. — Manifest: Closed (B32). Revocation:
-  still open.** (ZS-SVC-Z-001 INV-21, DQC-05 "certification binds exact
+- **A12. Certification is thin. — Closed: manifest (B32), revocation
+  (B34).** (ZS-SVC-Z-001 INV-21, DQC-05 "certification binds exact
   evidence"; ZS-CONTROL-001 Invariant 9.) The sealed manifest already recorded
   counts, the pinned tolerance and materiality, the rule version and its
   digest (B26), and the result and the assessment with every accepted risk
@@ -115,11 +114,21 @@ B32–B33 close A12's manifest part.
      asked live for this certification. A grant with no traceable decision
      fails closed (503), and nothing is certified.
 
-  **Still open, and a separate task: no revocation.** This service has no
-  REVOKED certification state and no revocation command; B18 left REVOKED
-  out. A certified result can be superseded by a later run (B10), but it
-  cannot be withdrawn. Porting financial-control-svc's revocation (its
-  A1/B6) is its own change, built on this record.
+  **Revocation (B34).** `POST …/runs/{id}:revoke-certification` moves a
+  Certified run's certification CERTIFIED → REVOKED. The status stays
+  Certified and the result is untouched. The request needs a reason and at
+  least one evidence reference (NP-47), and its own action,
+  `RECONCILIATION_REVOKE`. No principal recorded as certifying the run may
+  revoke it. The sealed certification is retained untouched, with its
+  manifest hash and everything 1–3 above bound into it. An append-only
+  `reconciliation_certification_revocations` row names the certification
+  and hash it revokes, and records the revoker's own authorization decision.
+  `GET …/certification` serves the certification with its revocation beside
+  it. This is financial-control-svc's revocation (its A1/B6), ported.
+  ***Deployment prerequisite, outside this service:***
+  `RECONCILIATION_REVOKE` is not registered in access-control-svc, so it
+  cannot be granted yet (B34). Neither are `RECONCILIATION_CERTIFY`,
+  `RECONCILIATION_ACCEPT_RISK` or `RECONCILIATION_APPROVE_RULES`.
 
   **Not built:**
   1. No backfill. A certification sealed, or a manual match made, before
@@ -396,8 +405,9 @@ B32–B33 close A12's manifest part.
   §7's longer list, because DATA-07 is this service's contract; *result* is
   DQC-03's `NOT_RUN / MATCH / VARIANCE / INDETERMINATE / PARTIAL /
   SUPERSEDED`; *certification* is ZS-SVC-Z-001's `UNCERTIFIED / ELIGIBLE /
-  CERTIFIED / SUPERSEDED` (REVOKED is left out: revocation is A12, out of
-  scope, and adding a state nothing can reach would only pretend). Rules
+  CERTIFIED / SUPERSEDED` (REVOKED was left out here: revocation was A12,
+  out of scope, and adding a state nothing can reach would only pretend;
+  B34 adds it with the command that reaches it). Rules
   (`internal/domain/state.go`, enforced again by migration 000006's CHECK and
   lifecycle trigger): a run is created Planned / NOT_RUN / UNCERTIFIED; no
   result before matching; an open run's result is MATCH with no open
@@ -880,3 +890,192 @@ B32–B33 close A12's manifest part.
   - *Existing tests* now pass the certifier's grant to `Certify`.
   - *Suite.* The full suite ran against a fresh, disposable Postgres 16
     container and passed.
+- **B34. How a certification is revoked (closes A12's revocation part).**
+  The shape is financial-control-svc's (c4ca5347, its A1/B6, and the
+  rollback guard of 9bec6e69), applied to this service's state model and
+  A12 record.
+  - *State.* `CertRevoked` joins the certification dimension, with the edge
+    CERTIFIED → {REVOKED, SUPERSEDED}. REVOKED has no outgoing edge, so a
+    second revocation is refused.
+    - `domain.ValidateCertificationRevocation` admits a revocation only on a
+      Certified run whose certification is CERTIFIED. A superseded run's
+      certification (SUPERSEDED) cannot be revoked.
+    - `ValidateLifecycleTransition` lets a Certified run's certification be
+      REVOKED without a status move. A run never *enters* Certified as
+      REVOKED, and REVOKED needs status Certified or Superseded.
+    - A revoked run can still be superseded (`SupersedeRun` is unchanged).
+      It keeps REVOKED, because only CERTIFIED becomes SUPERSEDED.
+    - The status (lifecycle) does not move, as in financial-control-svc's
+      orthogonal model: the run was certified, and that history does not
+      change.
+  - *Command.* `POST /v1/reconciliation/runs/{runID}:revoke-certification`,
+    with body `{"reason": …, "evidence_refs": […]}`. This service's
+    `{runID}:verb` form is used, as for `:certify` and `:supersede`.
+    - Both fields are mandatory (NP-47; §27 "reason, evidence"). The reason
+      is 1–2000 characters. There are 1–20 evidence references of 1–500
+      characters each, the same bound as an exception's `evidence_ref`.
+      Unknown fields are refused, so a caller who sends the singular
+      `evidence_ref` gets a 400 rather than a revocation without evidence.
+    - Authority is the new action `RECONCILIATION_REVOKE` on the run's
+      entity. It is distinct from `RECONCILIATION_CERTIFY`: the power to
+      seal a run is not the power to withdraw a seal. The handler asks
+      authorization-svc through `Decide`, as `Certify` does (B32), so the
+      decision is recorded. An untraceable grant is refused with 503
+      (`ErrRevokerAuthorityUntraceable`) and nothing is revoked.
+    - The answer is 201 with the revocation record.
+  - *Store* (`store.RevokeCertification`, one transaction, under the run's
+    `FOR UPDATE` lock):
+    1. Peek at the idempotency key. A retry of a completed revocation
+       replays (200, `Idempotent-Replayed`) instead of being refused as
+       already REVOKED. The same key with another body is 409.
+    2. Validate the revocation.
+    3. Load the sealed certification, and every CERTIFICATION → CERTIFIED
+       transition of the run.
+    4. Check independence (`domain.CheckRevokerIndependence`, the same
+       shape as `CheckCertifierIndependence`). The revoker must not be any
+       recorded certifier: the certification's `sealed_by`, the run's
+       `certified_by`, and every actor of those transitions, not only the
+       last.
+    5. Claim the key. A refused revocation never consumes it.
+    6. Insert the revocation row.
+    7. Move the run through `advanceRun`, the one mechanism every state
+       change uses. It validates the dimensions and appends one
+       `CERTIFICATION: CERTIFIED → REVOKED` row to
+       `reconciliation_run_transitions`, exactly as Certify's and
+       Reperform's moves are recorded.
+    8. Emit `CONTROL.CertificationRevoked`, whose payload is the revocation
+       record: the prior certification id, the reason, the evidence and the
+       effective time (`revoked_at`). These are DQC-05's
+       `dqc.certification.revoked` fields.
+
+    Prospective (RB-05): nothing already decided on the certification is
+    undone.
+  - *What a revocation's evidence is.* A12 made "evidence" in this service
+    mean what a certification binds: populations, manual matches and
+    authority. A revocation therefore records three things:
+    - the caller's `evidence_refs`: the new material evidence (DQC-05);
+    - exactly what it revokes: `certification_id`, the certification's
+      `manifest_sha256` as `revoked_manifest_sha256`, and the CERTIFIED
+      transition, with `certified_by` and `certified_at`;
+    - the revoker's authority: authorization-svc's decision, as the
+      certification records its certifier's.
+
+    This last item is the one addition to financial-control-svc's shape,
+    whose revocation does not record an authority decision.
+  - *Prior certification retained* (§27, DQC-05). The `certifications` row
+    is never written: it is immutable by trigger, and the store only reads
+    it. The test compares the stored row before and after, byte for byte.
+    Its populations, manual matches, authority and manifest hash survive the
+    revocation, and so does the CERTIFIED transition. `GET
+    …/runs/{id}/certification` serves the certification unchanged, with
+    `revocation` beside it, so a reader cannot mistake it for one still in
+    force. The run's own `certified_by` and `certified_at` are unchanged.
+  - *Database* (migration 000011):
+    - The `certification_state` vocabulary gains REVOKED.
+    - 000007's `state_dimensions_check` splits "Certified ⇔ CERTIFIED" in
+      three: Certified ⇒ CERTIFIED or REVOKED; CERTIFIED ⇒ Certified;
+      REVOKED ⇒ Certified or Superseded.
+    - The lifecycle trigger admits CERTIFIED → REVOKED. A Certified run
+      may then change its certification state only, CERTIFIED → REVOKED,
+      and nothing else (the row is compared whole), and only once its
+      revocation record exists in the transaction.
+    - A deferred constraint trigger refuses, at commit, a revocation record
+      whose run is not REVOKED. So the record and the state exist only
+      together.
+    - `reconciliation_certification_revocations` has one row per run and
+      per certification. It is append-only (`reject_immutable_row`), with
+      RLS forced. Its named CHECKs mirror financial-control-svc's:
+      - `independence_check`: `revoked_by <> certified_by`;
+      - `reason_check`: a non-blank reason;
+      - `evidence_refs_check`: at least one evidence reference, none NULL
+        or blank;
+      - `authority_check`: a GRANTED decision with an access decision id,
+        of `revoked_by`;
+      - `prospective_check`: `revoked_at >= certified_at`.
+  - *Rollback.* 000011's down follows 9bec6e69's pattern. It refuses while
+    any revocation is recorded, or any run is REVOKED. Otherwise it restores
+    the 000006/000007 definitions exactly. Dropping the table would lose who
+    revoked what, why and by what authority, with no way to reconstruct
+    it. Rolling the CHECK back would require re-certifying a revoked run,
+    which undoes the revocation.
+  - ***Deployment prerequisite, outside this service.*** access-control-svc
+    validates every grantable action against its `permission_definitions`
+    registry (its 000008), and new actions are registered there by
+    migration. financial-control-svc's `FINCTRL_REVOKE` needed exactly that
+    (access-control-svc 000017). The same applies here, and more widely:
+    - the registry holds `RECONCILIATION_MANAGE` and `RECONCILIATION_READ`
+      only;
+    - it does not hold `RECONCILIATION_REVOKE`, nor this service's existing
+      `RECONCILIATION_CERTIFY`, `RECONCILIATION_ACCEPT_RISK` or
+      `RECONCILIATION_APPROVE_RULES`;
+    - `deployments/scripts/seed-demo-rbac.ps1` grants no `RECONCILIATION_*`
+      action.
+
+    Until they are registered and granted, revocation, certification, risk
+    acceptance and rule approval are all denied (403, fail-closed). Both
+    files are outside this service and were not changed here.
+  - *Not changed.* Nothing in this service consumes certification state
+    downstream, so there is no gate to update (financial-control-svc's
+    close gate has no counterpart here). A REVOKED run that is still
+    Certified remains a terminal run for `SupersedeRun`'s replacement check.
+- **B35. Verification of B34.**
+  - *Unit tests.*
+    - `internal/domain`:
+      - the new edges (CERTIFIED → REVOKED; nothing out of REVOKED;
+        ELIGIBLE and SUPERSEDED cannot become REVOKED);
+      - the lifecycle rules (Certified stays Certified when revoked; a
+        revoked run supersedes; REVOKED cannot be entered from Reperformed
+        or held by an open run);
+      - `ValidateCertificationRevocation`;
+      - `CheckRevokerIndependence` refuses an earlier certifier, not only
+        the last;
+      - the request's reason and evidence bounds.
+    - `internal/handler`:
+      - the revoke route authorizes `RECONCILIATION_REVOKE` on the run's
+        entity and hands the store that decision;
+      - only CERTIFY is 403; an untraceable grant is 503; the store's
+        independence refusal is 403;
+      - an empty body, missing reason, missing or blank evidence, or an
+        unknown field is 400 before anything is authorized.
+  - *Integration tests* (`internal/store/revocation_test.go`, app role, so
+    RLS applies):
+    - A revocation records the certification id and manifest hash it
+      revokes, the certifier, the reason, the evidence and the revoker's
+      decision. The run is Certified / MATCH / REVOKED, with the same
+      certifier and certification time.
+    - The history is unchanged, plus one appended CERTIFICATION move.
+    - The certifications row is byte-identical, and the served
+      certification is identical apart from its new `revocation`.
+    - The event carries the prior certification, reason, evidence and
+      effective time.
+    - A retry replays; the same key with another request is refused; a
+      second revocation is refused; another tenant sees neither the run nor
+      the record.
+    - The sealer and an earlier recorded certifier are both refused, and
+      neither refusal consumes its key.
+    - An open run, an untraceable, denied or other principal's authority,
+      or a missing reason or evidence is refused, and the run stays
+      CERTIFIED.
+    - A revoked run supersedes and stays REVOKED, still served with its
+      revocation.
+    - The database refuses each of these: REVOKED with no record; a record
+      with no revocation (at commit); a revocation that also changes
+      `certified_by`; each named CHECK; UPDATE and DELETE of a record;
+      re-certifying a revoked run.
+    - 000011's down round-trips with a certified, unrevoked run, and
+      refuses once a revocation exists, leaving it intact.
+  - *Rollback guard, verified by hand.* On a fresh, disposable Postgres 16
+    container, every up file was applied with `psql --single-transaction -v
+    ON_ERROR_STOP=1 -f`, the semantics a migration runner uses.
+    - With no revocation, the down applied the same way exited 0. It
+      dropped the table and restored the four-state CHECK, and the up
+      re-applied cleanly.
+    - With a run that was revoked and then superseded, the down exited 3:
+      "cannot roll back 000011: recorded certification revocations exist",
+      raised at line 18.
+    - After that refusal, the revocation row, the REVOKED run, the
+      five-state CHECK, the trigger's revocation branch and both new
+      functions were all still present. Nothing was partially applied.
+  - *Suite.* The full suite (`go test -count=1 -p 1 ./...`, with
+    `TEST_DATABASE_URL` set) ran against a fresh, disposable Postgres 16
+    container. All 131 tests passed, and none was skipped.

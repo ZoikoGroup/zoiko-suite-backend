@@ -45,6 +45,7 @@ func openAdminPool(t *testing.T) *pgxpool.Pool {
 	t.Cleanup(pool.Close)
 
 	_, _ = pool.Exec(ctx, `
+		DROP TABLE IF EXISTS reconciliation_certification_revocations CASCADE;
 		DROP TABLE IF EXISTS reconciliation_rule_versions CASCADE;
 		DROP TABLE IF EXISTS reconciliation_exception_transitions CASCADE;
 		DROP TABLE IF EXISTS reconciliation_run_transitions CASCADE;
@@ -63,7 +64,9 @@ func openAdminPool(t *testing.T) *pgxpool.Pool {
 		DROP FUNCTION IF EXISTS enforce_run_creation() CASCADE;
 		DROP FUNCTION IF EXISTS enforce_run_governance_pinned() CASCADE;
 		DROP FUNCTION IF EXISTS guard_rule_version() CASCADE;
-		DROP FUNCTION IF EXISTS enforce_definition_versioning() CASCADE;`)
+		DROP FUNCTION IF EXISTS enforce_definition_versioning() CASCADE;
+		DROP FUNCTION IF EXISTS enforce_revocation_revokes() CASCADE;
+		DROP FUNCTION IF EXISTS reconciliation_refs_nonblank(TEXT[]) CASCADE;`)
 
 	_, thisFile, _, _ := runtime.Caller(0)
 	migDir := filepath.Join(filepath.Dir(thisFile), "../../deployments/migrations")
