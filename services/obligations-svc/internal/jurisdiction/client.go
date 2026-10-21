@@ -18,12 +18,15 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"time"
 
 	"go.uber.org/zap"
+	idenv "zoiko.io/identity-envelope"
 
 	"zoiko.io/obligations-svc/internal/circuitbreaker"
 	"zoiko.io/obligations-svc/internal/domain"
+	svcenvelope "zoiko.io/obligations-svc/internal/envelope"
 )
 
 // Validator validates that a jurisdiction_id exists before it is persisted
@@ -70,11 +73,15 @@ func NewHTTPValidator(baseURL string, log *zap.Logger) *HTTPValidator {
 // ValidateExists calls GET {baseURL}/v1/jurisdictions/{jurisdictionID}.
 func (v *HTTPValidator) ValidateExists(ctx context.Context, jurisdictionID string) error {
 	err := v.breaker.Execute(ctx, func() error {
-		url := fmt.Sprintf("%s/v1/jurisdictions/%s", v.baseURL, jurisdictionID)
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		// The id comes from the request body; escape it so it can only ever
+		// name one path segment.
+		target := fmt.Sprintf("%s/v1/jurisdictions/%s", v.baseURL, url.PathEscape(jurisdictionID))
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 		if err != nil {
 			return domain.ErrJurisdictionServiceUnavailable
 		}
+		svcenvelope.ForwardTo(ctx, req)
+		idenv.Forward(ctx, req)
 
 		resp, err := v.client.Do(req)
 		if err != nil {

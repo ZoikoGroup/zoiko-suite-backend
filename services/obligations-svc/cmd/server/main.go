@@ -28,6 +28,7 @@ import (
 	"github.com/riandyrn/otelchi"
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
+	idenv "zoiko.io/identity-envelope"
 
 	"zoiko.io/obligations-svc/internal/authz"
 	"zoiko.io/obligations-svc/internal/config"
@@ -37,6 +38,8 @@ import (
 	"zoiko.io/obligations-svc/internal/health"
 	"zoiko.io/obligations-svc/internal/jurisdiction"
 	svcmiddleware "zoiko.io/obligations-svc/internal/middleware"
+	"zoiko.io/obligations-svc/internal/outbox"
+	"zoiko.io/obligations-svc/internal/registry"
 	"zoiko.io/obligations-svc/internal/store"
 	"zoiko.io/obligations-svc/internal/telemetry"
 )
@@ -135,21 +138,56 @@ func main() {
 	jurisdictionValidator := jurisdiction.NewHTTPValidator(cfg.JurisdictionRulesURL, log)
 	authzClient := authz.NewHTTPClient(cfg.AuthZServiceURL, log)
 
+	// ── 4a. Outbox relay ──────────────────────────────────────────────────────
+	// Every obligation event is written to event_outbox in the same
+	// transaction as the mutation; the relay delivers it to Kafka and retries
+	// until the broker accepts it. A broker outage delays events, never loses
+	// them.
+	outboxWorker := outbox.NewWorker(pgStore, publisher, log).WithGauges(metrics)
+	outboxWorker.Start(context.Background())
+	defer outboxWorker.Stop()
+
 	// ── 4b. Overdue scheduler ─────────────────────────────────────────────────
 	// Runs every minute to find obligations past their due_date and transition
 	// them to OVERDUE. This addresses the audit gap where overdue was never
-	// computed automatically.
+	// computed automatically. The transition writes its events to the outbox;
+	// the relay publishes them.
 	overdueCtx, overdueCancel := context.WithCancel(context.Background())
 	defer overdueCancel()
-	go runOverdueScheduler(overdueCtx, pgStore, publisher, log)
+	go runOverdueScheduler(overdueCtx, pgStore, log)
+
+	// ── 4c. Identity gate and legal-entity registry ──────────────────────────
+	// X-Principal-Id / X-Tenant-Id were read exactly as sent, and host port
+	// 8088 is published, so anyone who could reach the port could act as any
+	// principal in any tenant (Governance audit X5). The gate verifies
+	// identity-context-svc's signed envelope (JWKS) and that its session is
+	// still live (AU-01), then makes the verified claims the only source of
+	// those headers. IDENTITY_VERIFY: require (default outside local) | warn.
+	gate, gateSettings, err := idenv.NewGateFromEnv("obligations-svc", log, idenv.EnvOptions{})
+	if err != nil {
+		log.Fatal("identity gate configuration refused", zap.Error(err))
+	}
+	log.Info("identity gate", gateSettings.Fields()...)
+
+	var entityChecker registry.Checker = registry.Noop{}
+	switch {
+	case cfg.TenantRegistryURL != "":
+		entityChecker = registry.New(cfg.TenantRegistryURL, log)
+	case !cfg.LocalEnv():
+		log.Fatal("TENANT_REGISTRY_URL is required outside local/dev: every obligation must name a legal entity that exists in its tenant")
+	default:
+		log.Warn("TENANT_REGISTRY_URL unset — legal entities are not confirmed against the registry (local/dev only)")
+	}
 
 	// ── 5. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()
+	r.Use(idenv.RequestID)
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
 	r.Use(middleware.Recoverer)
 	r.Use(otelchi.Middleware("obligations-svc", otelchi.WithChiRoutes(r)))
 	r.Use(metrics.HTTPMiddleware)
+	r.Use(gate.Middleware)
 	r.Use(correlationIDMiddleware)
 	r.Use(svcmiddleware.TenantContext())
 	r.Use(middleware.Logger)
@@ -161,7 +199,7 @@ func main() {
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
-	h := handler.New(pgStore, publisher, jurisdictionValidator, authzClient, log)
+	h := handler.New(pgStore, jurisdictionValidator, authzClient, log).WithRegistry(entityChecker)
 	handler.RegisterRoutes(r, h)
 	handler.RegisterApplicabilityRoutes(r, h)
 
@@ -225,8 +263,10 @@ func correlationIDMiddleware(next http.Handler) http.Handler {
 }
 
 // runOverdueScheduler periodically checks for obligations past their due_date
-// and transitions them to OVERDUE status across all tenants.
-func runOverdueScheduler(ctx context.Context, pgStore *store.PgStore, publisher *events.Publisher, log *zap.Logger) {
+// and transitions them to OVERDUE status across all tenants. TransitionOverdue
+// writes obligation.updated and obligation.overdue to the outbox; the relay
+// publishes them, so the sweep itself does not touch Kafka.
+func runOverdueScheduler(ctx context.Context, pgStore *store.PgStore, log *zap.Logger) {
 	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
 
@@ -266,13 +306,6 @@ func runOverdueScheduler(ctx context.Context, pgStore *store.PgStore, publisher 
 						continue
 					}
 					if transitioned {
-						// Publish the overdue event with tenant context
-						if pubErr := publisher.PublishObligationOverdue(tenantCtx, *updated, "system", ""); pubErr != nil {
-							log.Error("overdue scheduler: failed to publish obligation.overdue",
-								zap.String("tenant_id", tenantID),
-								zap.String("obligation_id", updated.ObligationID),
-								zap.Error(pubErr))
-						}
 						log.Info("overdue scheduler: transitioned obligation to OVERDUE",
 							zap.String("tenant_id", tenantID),
 							zap.String("obligation_id", updated.ObligationID),

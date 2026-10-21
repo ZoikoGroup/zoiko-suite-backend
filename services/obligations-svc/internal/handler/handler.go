@@ -3,6 +3,7 @@ package handler
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
+	idenv "zoiko.io/identity-envelope"
 
 	"zoiko.io/obligations-svc/internal/authz"
 	"zoiko.io/obligations-svc/internal/domain"
@@ -20,6 +22,7 @@ import (
 	svcerrors "zoiko.io/obligations-svc/internal/errors"
 	"zoiko.io/obligations-svc/internal/jurisdiction"
 	"zoiko.io/obligations-svc/internal/middleware"
+	"zoiko.io/obligations-svc/internal/registry"
 	"zoiko.io/obligations-svc/internal/store"
 )
 
@@ -30,48 +33,81 @@ type ObligationStore interface {
 	FindObligationByID(ctx context.Context, obligationID string) (*domain.Obligation, error)
 	ListObligations(ctx context.Context, filter domain.ListObligationsFilter) ([]*domain.Obligation, error)
 	UpdateObligationStatus(ctx context.Context, obligationID, newStatus string, expectedVersion int, actorID, correlationID string) (*domain.Obligation, bool, error)
-	UpdateObligationWorkflow(ctx context.Context, obligationID, workflowID string) (*domain.Obligation, error)
+	UpdateObligationWorkflow(ctx context.Context, obligationID, workflowID, actorID, correlationID string) (*domain.Obligation, error)
+	UpdateObligation(ctx context.Context, params domain.UpdateObligationParams) (*domain.Obligation, bool, error)
 	CreateFilingRequirement(ctx context.Context, params domain.CreateFilingRequirementParams) (*domain.FilingRequirement, error)
-	ListFilingRequirements(ctx context.Context, obligationID string) ([]*domain.FilingRequirement, error)
+	ListFilingRequirements(ctx context.Context, obligationID string, limit int) ([]*domain.FilingRequirement, error)
+	FindFilingRequirement(ctx context.Context, obligationID, filingRequirementID string) (*domain.FilingRequirement, error)
+	UpdateFilingStatus(ctx context.Context, params domain.UpdateFilingStatusParams) (*domain.FilingRequirement, bool, error)
+	ListFilingTransitions(ctx context.Context, obligationID, filingRequirementID string) ([]*domain.FilingTransition, error)
 
 	// Idempotency key methods
 	CheckIdempotencyKey(ctx context.Context, idempotencyKey, requestHash string) (bool, string, string, error)
 	StoreIdempotencyKey(ctx context.Context, idempotencyKey, requestHash, resourceID, resourceType string) error
 
 	// ── Chunk 10: applicability decisions ────────────────────────────────────
-	CreateApplicabilityDecision(ctx context.Context, params domain.CreateApplicabilityDecisionParams) (*domain.ApplicabilityDecision, error)
-	ListApplicabilityDecisions(ctx context.Context, obligationID, jurisdictionCode, entityRef string) ([]*domain.ApplicabilityDecision, error)
+	CreateApplicabilityDecision(ctx context.Context, params domain.CreateApplicabilityDecisionParams) (*domain.ApplicabilityDecision, bool, error)
+	ListApplicabilityDecisions(ctx context.Context, obligationID, jurisdictionCode, entityRef string, limit int) ([]*domain.ApplicabilityDecision, error)
 	FindCurrentApplicability(ctx context.Context, obligationID, jurisdictionCode, entityRef string) (*domain.CurrentApplicability, error)
-}
 
-// EventPublisher is the narrow interface the handler depends on for
-// publishing domain events. Allows the handler to be tested without a real
-// event backbone. Mirrors policy-svc's pattern.
-type EventPublisher interface {
-	PublishObligationCreated(ctx context.Context, o domain.Obligation, correlationID string) error
-	PublishObligationUpdated(ctx context.Context, o domain.Obligation, actorID, correlationID string) error
-	PublishObligationOverdue(ctx context.Context, o domain.Obligation, actorID, correlationID string) error
-	PublishObligationClosed(ctx context.Context, o domain.Obligation, actorID, correlationID string) error
+	// ── definitions and entity mappings (Doc 03 §8.5 "Owns") ─────────────────
+	CreateDefinition(ctx context.Context, params domain.CreateDefinitionParams) (*domain.ObligationDefinition, bool, error)
+	GetDefinition(ctx context.Context, id string) (*domain.ObligationDefinition, error)
+	ListDefinitions(ctx context.Context, status string, limit int, afterCode string) ([]*domain.ObligationDefinition, error)
+	ListDefinitionVersions(ctx context.Context, id string) ([]*domain.ObligationDefinitionVersion, error)
+	NewDefinitionVersion(ctx context.Context, params domain.NewDefinitionVersionParams) (*domain.ObligationDefinition, error)
+	RetireDefinition(ctx context.Context, id string, expectedVersion int, actor, correlationID string) (*domain.ObligationDefinition, error)
+	CreateMapping(ctx context.Context, params domain.CreateMappingParams) (*domain.ObligationEntityMapping, error)
+	ListMappings(ctx context.Context, definitionID string) ([]*domain.ObligationEntityMapping, error)
+	FindMapping(ctx context.Context, definitionID, mappingID string) (*domain.ObligationEntityMapping, error)
+	EndMapping(ctx context.Context, definitionID, mappingID string, effectiveTo time.Time, actor, correlationID string) (*domain.ObligationEntityMapping, error)
 }
 
 // Handler holds all HTTP handler methods.
 type Handler struct {
 	store                 ObligationStore
-	publisher             EventPublisher
 	jurisdictionValidator jurisdiction.Validator
 	authz                 authz.Client
+	registry              registry.Checker
 	log                   *zap.Logger
 }
 
-// New constructs a Handler.
-func New(store ObligationStore, publisher EventPublisher, jurisdictionValidator jurisdiction.Validator, authzClient authz.Client, log *zap.Logger) *Handler {
+// New constructs a Handler. The legal-entity registry check is off until
+// WithRegistry is called; main.go always calls it outside local/dev.
+func New(store ObligationStore, jurisdictionValidator jurisdiction.Validator, authzClient authz.Client, log *zap.Logger) *Handler {
 	return &Handler{
 		store:                 store,
-		publisher:             publisher,
 		jurisdictionValidator: jurisdictionValidator,
 		authz:                 authzClient,
+		registry:              registry.Noop{},
 		log:                   log,
 	}
+}
+
+// WithRegistry confirms every legal entity a write names against
+// tenant-entity-registry-svc (exists, and in the caller's tenant).
+func (h *Handler) WithRegistry(c registry.Checker) *Handler {
+	h.registry = c
+	return h
+}
+
+// checkEntity refuses a legal entity the registry does not hold in the
+// caller's tenant (422), and fails closed when the registry cannot answer.
+func (h *Handler) checkEntity(w http.ResponseWriter, r *http.Request, legalEntityID string) bool {
+	tenantID := middleware.TenantFromContext(r.Context())
+	err := h.registry.CheckEntity(r.Context(), tenantID, legalEntityID)
+	switch {
+	case err == nil:
+		return true
+	case errors.Is(err, domain.ErrLegalEntityNotFound):
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{
+			"error": "legal_entity_not_found", "legal_entity_id": legalEntityID,
+			"detail": "the legal entity does not exist in this tenant (tenant-entity-registry-svc)"})
+	default:
+		h.log.Error("legal entity check failed — failing closed", zap.String("legal_entity_id", legalEntityID), zap.Error(err))
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "registry_unavailable"})
+	}
+	return false
 }
 
 // ── request preconditions ────────────────────────────────────────────────────
@@ -139,14 +175,16 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 	return true
 }
 
+// API standard L556-570: default page 50, maximum 200, cursor continuation.
 const (
-	defaultLimit = 100
-	maxLimit     = 500
+	defaultLimit = 50
+	maxLimit     = 200
 )
 
 // parsePaging bounds a register read. A discarded strconv error is the
 // platform's recurring shape: limit=abc silently defaulted, and offset=-1
-// reached Postgres and answered 503.
+// reached Postgres and answered 503. offset is still accepted for callers
+// written before the cursor; new callers follow next_cursor.
 func parsePaging(w http.ResponseWriter, r *http.Request) (limit, offset int, ok bool) {
 	limit, offset = defaultLimit, 0
 	if raw := r.URL.Query().Get("limit"); raw != "" {
@@ -182,12 +220,36 @@ func (h *Handler) writeStoreErr(w http.ResponseWriter, what string, err error) {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": string(svcerrors.ErrCodeTenantMissing)})
 	case errors.Is(err, domain.ErrObligationNotFound):
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": string(svcerrors.ErrCodeObligationNotFound)})
+	case errors.Is(err, domain.ErrFilingRequirementNotFound):
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "filing_requirement_not_found"})
+	case errors.Is(err, domain.ErrDefinitionNotFound):
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "obligation_definition_not_found"})
+	case errors.Is(err, domain.ErrMappingNotFound):
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "entity_mapping_not_found"})
 	case errors.Is(err, domain.ErrInvalidIdentifier):
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": string(svcerrors.ErrCodeInvalidIdentifier)})
+	case errors.Is(err, domain.ErrInvalidField):
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": string(svcerrors.ErrCodeInvalidField), "detail": err.Error()})
 	case errors.Is(err, domain.ErrInvalidTransition):
 		writeJSON(w, http.StatusConflict, map[string]string{"error": string(svcerrors.ErrCodeInvalidTransition)})
 	case errors.Is(err, domain.ErrVersionMismatch):
 		writeJSON(w, http.StatusPreconditionFailed, map[string]string{"error": string(svcerrors.ErrCodeVersionMismatch), "detail": err.Error()})
+	case errors.Is(err, domain.ErrObligationIDConflict):
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "obligation_id_conflict", "detail": err.Error()})
+	case errors.Is(err, domain.ErrIdempotencyKeyConflict):
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "idempotency_key_conflict", "detail": "idempotency key already used with a different request"})
+	case errors.Is(err, domain.ErrConflict):
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "conflict", "detail": err.Error()})
+	case errors.Is(err, domain.ErrObligationClosed):
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "already_closed", "detail": err.Error()})
+	case errors.Is(err, domain.ErrDefinitionRetired):
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "obligation_definition_retired"})
+	case errors.Is(err, domain.ErrDefinitionCodeConflict):
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "definition_code_conflict", "detail": err.Error()})
+	case errors.Is(err, domain.ErrMappingExists):
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "entity_mapping_exists", "detail": err.Error()})
+	case errors.Is(err, domain.ErrEntityNotMapped):
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "entity_not_mapped", "detail": err.Error()})
 	default:
 		h.log.Error(what, zap.Error(err))
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": string(svcerrors.ErrCodeStoreUnavailable)})
@@ -237,6 +299,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Delete("/v1/obligations/{obligation_id}/workflow", h.UnlinkWorkflow)
 	r.Post("/v1/obligations/{obligation_id}/filing-requirements", h.CreateFilingRequirement)
 	r.Get("/v1/obligations/{obligation_id}/filing-requirements", h.ListFilingRequirements)
+	registerCompletionRoutes(r, h)
 }
 
 func correlationIDMiddleware(next http.Handler) http.Handler {
@@ -266,6 +329,44 @@ type createObligationRequest struct {
 	SourceReference      string    `json:"source_reference"`
 	CreatedByPrincipalID string    `json:"created_by_principal_id"`
 	WorkflowID           *string   `json:"workflow_id,omitempty"`
+
+	// ObligationDefinitionID raises the obligation from a catalogue
+	// definition. Fields the definition holds may then be omitted (they are
+	// taken from its current version) or must equal it.
+	ObligationDefinitionID string `json:"obligation_definition_id,omitempty"`
+	DefinitionVersion      int    `json:"definition_version,omitempty"`
+}
+
+// applyDefinition fills the definition-held fields from version v, and names
+// the first field the request sets to something else.
+func (req *createObligationRequest) applyDefinition(v *domain.ObligationDefinitionVersion) string {
+	fill := func(dst *string, src, name string) string {
+		if *dst == "" {
+			*dst = src
+			return ""
+		}
+		if *dst != src {
+			return name
+		}
+		return ""
+	}
+	for _, f := range []struct {
+		dst       *string
+		src, name string
+	}{
+		{&req.JurisdictionID, v.JurisdictionID, "jurisdiction_id"},
+		{&req.ObligationType, v.ObligationType, "obligation_type"},
+		{&req.ObligationSourceType, v.ObligationSourceType, "obligation_source_type"},
+		{&req.ObligationSourceID, v.ObligationSourceID, "obligation_source_id"},
+		{&req.SourceReference, v.SourceReference, "source_reference"},
+		{&req.SeverityLevel, v.SeverityLevel, "severity_level"},
+		{&req.ResponsibleFunction, v.ResponsibleFunction, "responsible_function"},
+	} {
+		if bad := fill(f.dst, f.src, f.name); bad != "" {
+			return bad
+		}
+	}
+	return ""
 }
 
 func (req createObligationRequest) missingField() string {
@@ -379,6 +480,28 @@ func (h *Handler) CreateObligation(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
+	if req.ObligationDefinitionID != "" {
+		def, err := h.store.GetDefinition(r.Context(), req.ObligationDefinitionID)
+		if err != nil {
+			h.writeStoreErr(w, "CreateObligation: definition lookup failed", err)
+			return
+		}
+		if def.DefinitionStatus != "ACTIVE" {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "obligation_definition_retired"})
+			return
+		}
+		if req.DefinitionVersion != 0 && req.DefinitionVersion != def.CurrentVersion {
+			writeJSON(w, http.StatusConflict, map[string]any{"error": "version_mismatch",
+				"detail": "definition_version is not the definition's current version", "current_version": def.CurrentVersion})
+			return
+		}
+		if bad := req.applyDefinition(def.Current); bad != "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "definition_mismatch", "field": bad,
+				"detail": "the field differs from the definition's current version; omit it or send the definition's value"})
+			return
+		}
+		req.DefinitionVersion = def.CurrentVersion
+	}
 	if missing := req.missingField(); missing != "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"error": "missing_field",
@@ -417,6 +540,10 @@ func (h *Handler) CreateObligation(w http.ResponseWriter, r *http.Request) {
 	if !h.authorize(w, r, principalID, req.LegalEntityID, authz.ActionObligationCreate) {
 		return
 	}
+	// Entity-bound (Doc 03 §8.5): the entity must exist in this tenant.
+	if !h.checkEntity(w, r, req.LegalEntityID) {
+		return
+	}
 
 	if err := h.jurisdictionValidator.ValidateExists(r.Context(), req.JurisdictionID); err != nil {
 		switch {
@@ -451,6 +578,9 @@ func (h *Handler) CreateObligation(w http.ResponseWriter, r *http.Request) {
 		CreatedByPrincipalID: principalID,
 		WorkflowID:           req.WorkflowID,
 		CorrelationID:        correlationID,
+
+		ObligationDefinitionID: req.ObligationDefinitionID,
+		DefinitionVersion:      req.DefinitionVersion,
 	}
 
 	o, created, err := h.store.CreateObligation(r.Context(), params)
@@ -466,6 +596,10 @@ func (h *Handler) CreateObligation(w http.ResponseWriter, r *http.Request) {
 				"error":  "idempotency_key_conflict",
 				"detail": "idempotency key already used with different request",
 			})
+		case errors.Is(err, domain.ErrVersionMismatch):
+			// The definition was superseded between the read and the pin.
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "version_mismatch",
+				"detail": "the definition changed while the obligation was being raised; retry"})
 		default:
 			h.writeStoreErr(w, "CreateObligation: store unavailable", err)
 		}
@@ -490,7 +624,9 @@ func (h *Handler) CreateObligation(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusCreated
 		// obligation.created was written to event_outbox in the same
 		// transaction as the insert; the relay publishes it after commit.
+		w.Header().Set("Location", "/v1/obligations/"+o.ObligationID)
 	}
+	w.Header().Set("ETag", strconv.Quote(strconv.Itoa(o.Version)))
 	h.log.Info("obligation created",
 		zap.String("obligation_id", o.ObligationID),
 		zap.String("obligation_code", o.ObligationCode),
@@ -531,6 +667,7 @@ func (h *Handler) GetObligation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	w.Header().Set("ETag", strconv.Quote(strconv.Itoa(o.Version)))
 	writeJSON(w, http.StatusOK, o)
 }
 
@@ -606,6 +743,19 @@ func (h *Handler) ListObligations(w http.ResponseWriter, r *http.Request) {
 		}
 		filter.DueAfter = &t
 	}
+	if filter.Status != "" && !domain.ObligationStatuses[filter.Status] {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_field", "field": "status"})
+		return
+	}
+	if c := q.Get("cursor"); c != "" {
+		at, id, ok := decodeCursor(c)
+		if !ok || offset != 0 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_field", "field": "cursor",
+				"detail": "cursor must be a next_cursor this endpoint returned, and cannot be combined with offset"})
+			return
+		}
+		filter.AfterCreatedAt, filter.AfterID = &at, id
+	}
 
 	results, err := h.store.ListObligations(r.Context(), filter)
 	if err != nil {
@@ -613,11 +763,43 @@ func (h *Handler) ListObligations(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Always return an array — never null.
+	// Always return an array — never null. A full page carries the cursor
+	// for the next one (headers, so the body stays the array callers read).
 	if results == nil {
 		results = []*domain.Obligation{}
 	}
+	if len(results) == limit {
+		last := results[len(results)-1]
+		next := encodeCursor(last.CreatedAt, last.ObligationID)
+		nq := r.URL.Query()
+		nq.Set("cursor", next)
+		nq.Del("offset")
+		w.Header().Set("X-Next-Cursor", next)
+		w.Header().Set("Link", "<"+r.URL.Path+"?"+nq.Encode()+`>; rel="next"`)
+	}
 	writeJSON(w, http.StatusOK, results)
+}
+
+// encodeCursor / decodeCursor carry the keyset position of a list page:
+// (created_at, id) of its last row, opaque to the caller.
+func encodeCursor(at time.Time, id string) string {
+	return base64.RawURLEncoding.EncodeToString([]byte(at.UTC().Format(time.RFC3339Nano) + "|" + id))
+}
+
+func decodeCursor(c string) (time.Time, string, bool) {
+	raw, err := base64.RawURLEncoding.DecodeString(c)
+	if err != nil {
+		return time.Time{}, "", false
+	}
+	ts, id, ok := strings.Cut(string(raw), "|")
+	if !ok || id == "" {
+		return time.Time{}, "", false
+	}
+	at, err := time.Parse(time.RFC3339Nano, ts)
+	if err != nil {
+		return time.Time{}, "", false
+	}
+	return at, id, true
 }
 
 // ── POST /v1/obligations/{obligation_id}/status ─────────────────────────────
@@ -676,6 +858,16 @@ func (h *Handler) UpdateObligationStatus(w http.ResponseWriter, r *http.Request)
 		})
 		return
 	}
+	// An unknown status is a malformed request (400), not an illegal
+	// transition between real states (409) — "FOO" used to answer 409.
+	if !domain.ObligationStatuses[req.ObligationStatus] {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error":  "invalid_field",
+			"field":  "obligation_status",
+			"detail": "obligation_status must be one of OPEN, IN_PROGRESS, OVERDUE, CLOSED",
+		})
+		return
+	}
 
 	// Parse If-Match header for optimistic locking (expected_version).
 	// If-Match: "123" or If-Match: W/"123" (weak etag not supported, treat as strong).
@@ -724,6 +916,7 @@ func (h *Handler) UpdateObligationStatus(w http.ResponseWriter, r *http.Request)
 		zap.Bool("transitioned", transitioned),
 		zap.String("correlation_id", correlationID),
 	)
+	w.Header().Set("ETag", strconv.Quote(strconv.Itoa(updated.Version)))
 	writeJSON(w, http.StatusOK, updated)
 }
 
@@ -791,18 +984,10 @@ func (h *Handler) LinkWorkflow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	updated, err := h.store.UpdateObligationWorkflow(r.Context(), obligationID, req.WorkflowID)
+	updated, err := h.store.UpdateObligationWorkflow(r.Context(), obligationID, req.WorkflowID, principalID, correlationID)
 	if err != nil {
 		h.writeStoreErr(w, "LinkWorkflow: store unavailable", err)
 		return
-	}
-
-	if pubErr := h.publisher.PublishObligationUpdated(r.Context(), *updated, principalID, correlationID); pubErr != nil {
-		h.log.Error("LinkWorkflow: failed to publish obligation.updated",
-			zap.String("obligation_id", updated.ObligationID),
-			zap.String("correlation_id", correlationID),
-			zap.Error(pubErr),
-		)
 	}
 
 	h.log.Info("obligation linked to workflow",
@@ -852,18 +1037,10 @@ func (h *Handler) UnlinkWorkflow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	updated, err := h.store.UpdateObligationWorkflow(r.Context(), obligationID, "")
+	updated, err := h.store.UpdateObligationWorkflow(r.Context(), obligationID, "", principalID, correlationID)
 	if err != nil {
 		h.writeStoreErr(w, "UnlinkWorkflow: store unavailable", err)
 		return
-	}
-
-	if pubErr := h.publisher.PublishObligationUpdated(r.Context(), *updated, principalID, correlationID); pubErr != nil {
-		h.log.Error("UnlinkWorkflow: failed to publish obligation.updated",
-			zap.String("obligation_id", updated.ObligationID),
-			zap.String("correlation_id", correlationID),
-			zap.Error(pubErr),
-		)
 	}
 
 	h.log.Info("obligation unlinked from workflow",
@@ -956,6 +1133,7 @@ func (h *Handler) CreateFilingRequirement(w http.ResponseWriter, r *http.Request
 		zap.String("filing_requirement_id", f.FilingRequirementID),
 		zap.String("correlation_id", correlationID),
 	)
+	w.Header().Set("Location", "/v1/obligations/"+obligationID+"/filing-requirements/"+f.FilingRequirementID)
 	writeJSON(w, http.StatusCreated, f)
 }
 
@@ -990,8 +1168,12 @@ func (h *Handler) ListFilingRequirements(w http.ResponseWriter, r *http.Request)
 	if !h.authorize(w, r, principalID, parent.LegalEntityID, authz.ActionFilingRequirementRead) {
 		return
 	}
+	limit, _, ok := parsePaging(w, r)
+	if !ok {
+		return
+	}
 
-	results, err := h.store.ListFilingRequirements(r.Context(), obligationID)
+	results, err := h.store.ListFilingRequirements(r.Context(), obligationID, limit)
 	if err != nil {
 		h.writeStoreErr(w, "ListFilingRequirements: store unavailable", err)
 		return
@@ -1004,7 +1186,13 @@ func (h *Handler) ListFilingRequirements(w http.ResponseWriter, r *http.Request)
 }
 
 // writeJSON serialises v as JSON and writes it to w with the given status code.
+// An error body ({"error": code, ...}) is rendered as RFC 9457
+// application/problem+json with the §16 error_class; the legacy members stay,
+// so callers that read "error" are unaffected (Governance audit X9).
 func writeJSON(w http.ResponseWriter, status int, v any) {
+	if idenv.WriteLegacyError(w, nil, status, v) {
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(v); err != nil {

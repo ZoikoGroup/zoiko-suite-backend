@@ -22,8 +22,10 @@
 package handler
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"time"
 
@@ -33,6 +35,7 @@ import (
 	"zoiko.io/obligations-svc/internal/authz"
 	"zoiko.io/obligations-svc/internal/domain"
 	"zoiko.io/obligations-svc/internal/envelope"
+	"zoiko.io/obligations-svc/internal/store"
 )
 
 // RegisterApplicabilityRoutes mounts applicability-decision routes on the
@@ -119,12 +122,33 @@ func (h *Handler) CreateApplicabilityDecision(w http.ResponseWriter, r *http.Req
 	// uncapped body is a memory-exhaustion route into a service that is
 	// otherwise careful, and silently discarding a misspelled field is how a
 	// caller comes to believe it sent a value it did not.
+	// The raw body is kept (under the same size cap) so a retried request can
+	// be recognised by its Idempotency-Key and the hash of what it asked for.
+	bodyBytes, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBytes))
+	if err != nil {
+		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "request_too_large"})
+		return
+	}
+	r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 	var req createApplicabilityDecisionRequest
 	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if missing := req.missingField(); missing != "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": missing})
+		return
+	}
+	// The database refuses both of these (000006 CHECKs); refusing them here
+	// answers 400 instead of the 503 a constraint violation used to become.
+	// UNASSESSED is the absence of a decision and is never stored.
+	if !domain.ApplicabilityDecisionValues[req.Decision] {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_field", "field": "decision",
+			"detail": "decision must be APPLICABLE, NOT_APPLICABLE or UNCERTAIN"})
+		return
+	}
+	if req.EffectiveTo != nil && !req.EffectiveTo.After(req.EffectiveFrom) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_field", "field": "effective_to",
+			"detail": "effective_to must be after effective_from"})
 		return
 	}
 
@@ -146,6 +170,12 @@ func (h *Handler) CreateApplicabilityDecision(w http.ResponseWriter, r *http.Req
 			"error":  "decided_by_mismatch",
 			"detail": "decided_by_principal_id must be the authenticated principal — a decision cannot be attributed to another principal by the request body; use decided_by_system for an automated decision",
 		})
+		return
+	}
+	// doc7 §E2 "exactly one" of a human or a system (000006 CHECK).
+	if req.DecidedByPrincipalID != "" && req.DecidedBySystem != "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_field", "field": "decided_by_principal_id",
+			"detail": "a decision is attributed to exactly one of decided_by_principal_id or decided_by_system"})
 		return
 	}
 
@@ -179,7 +209,9 @@ func (h *Handler) CreateApplicabilityDecision(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	d, err := h.store.CreateApplicabilityDecision(r.Context(), domain.CreateApplicabilityDecisionParams{
+	d, replayed, err := h.store.CreateApplicabilityDecision(r.Context(), domain.CreateApplicabilityDecisionParams{
+		IdempotencyKey:          env.IdempotencyKey,
+		RequestHash:             store.ComputeRequestHash(bodyBytes),
 		ApplicabilityDecisionID: req.ApplicabilityDecisionID,
 		ObligationID:            obligationID,
 		JurisdictionCode:        req.JurisdictionCode,
@@ -203,6 +235,9 @@ func (h *Handler) CreateApplicabilityDecision(w http.ResponseWriter, r *http.Req
 		switch {
 		case errors.Is(err, domain.ErrObligationNotFound):
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "obligation_not_found", "obligation_id": obligationID})
+		case errors.Is(err, domain.ErrIdempotencyKeyConflict), errors.Is(err, domain.ErrConflict),
+			errors.Is(err, domain.ErrInvalidField), errors.Is(err, domain.ErrInvalidIdentifier):
+			h.writeStoreErr(w, "CreateApplicabilityDecision", err)
 		default:
 			h.log.Error("CreateApplicabilityDecision: store unavailable",
 				zap.String("obligation_id", obligationID),
@@ -213,6 +248,12 @@ func (h *Handler) CreateApplicabilityDecision(w http.ResponseWriter, r *http.Req
 		}
 		return
 	}
+	if replayed {
+		// Same Idempotency-Key, same body: the decision already recorded.
+		writeJSON(w, http.StatusOK, d)
+		return
+	}
+	w.Header().Set("Location", "/v1/obligations/"+obligationID+"/applicability-decisions/"+d.ApplicabilityDecisionID)
 	writeJSON(w, http.StatusCreated, d)
 }
 
@@ -247,8 +288,12 @@ func (h *Handler) ListApplicabilityDecisions(w http.ResponseWriter, r *http.Requ
 	if !h.authorize(w, r, principalID, parent.LegalEntityID, authz.ActionApplicabilityRead) {
 		return
 	}
+	limit, _, ok := parsePaging(w, r)
+	if !ok {
+		return
+	}
 
-	results, err := h.store.ListApplicabilityDecisions(r.Context(), obligationID, jurisdictionCode, entityRef)
+	results, err := h.store.ListApplicabilityDecisions(r.Context(), obligationID, jurisdictionCode, entityRef, limit)
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrObligationNotFound):

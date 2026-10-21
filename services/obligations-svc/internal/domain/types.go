@@ -87,6 +87,11 @@ type Obligation struct {
 	// Version is the optimistic locking version. Incremented on every
 	// successful update. Used with If-Match header for concurrency control.
 	Version int `json:"version"`
+
+	// ObligationDefinitionID and DefinitionVersion pin the definition version
+	// the obligation was raised from; both nil for a free-standing obligation.
+	ObligationDefinitionID *string `json:"obligation_definition_id,omitempty"`
+	DefinitionVersion      *int    `json:"definition_version,omitempty"`
 }
 
 // FilingRequirement is a filing obligation scoped under a parent Obligation.
@@ -98,10 +103,13 @@ type FilingRequirement struct {
 	FilingAuthority   string `json:"filing_authority"`
 	SubmissionChannel string `json:"submission_channel"`
 
-	// FilingStatus is data only (e.g. "PENDING", "SUBMITTED", "ACCEPTED", "REJECTED").
+	// FilingStatus follows FilingStatuses: PENDING → IN_PREPARATION →
+	// SUBMITTED → ACCEPTED | REJECTED, with WITHDRAWN as an exit.
 	FilingStatus string `json:"filing_status"`
 
-	CreatedAt time.Time `json:"created_at"`
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
+	RowVersion int       `json:"row_version"`
 }
 
 // CreateObligationParams holds input parameters for creating an obligation.
@@ -122,6 +130,12 @@ type CreateObligationParams struct {
 	// CorrelationID is the caller's trace id. The store uses it to write the
 	// obligation.created outbox record in the same transaction as the insert.
 	CorrelationID string `json:"-"`
+
+	// ObligationDefinitionID raises the obligation from a definition; the
+	// store pins the definition's current version and refuses an entity the
+	// definition is not mapped to.
+	ObligationDefinitionID string `json:"-"`
+	DefinitionVersion      int    `json:"-"`
 }
 
 // ListObligationsFilter holds optional filters for querying obligations.
@@ -142,6 +156,11 @@ type ListObligationsFilter struct {
 	// obligation a tenant had ever recorded, in one response, forever.
 	Limit  int
 	Offset int
+
+	// AfterCreatedAt / AfterID continue a keyset (cursor) read after the last
+	// row of the previous page, in the list's created_at DESC, id DESC order.
+	AfterCreatedAt *time.Time
+	AfterID        string
 }
 
 // CreateFilingRequirementParams holds input parameters for creating a

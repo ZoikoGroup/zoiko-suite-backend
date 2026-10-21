@@ -749,6 +749,12 @@ Errors carry the GCP §16 stable class in `code`. A conflict between two equally
 
 - obligation.closed
 
+- obligation.definition.changed *(added 21 Oct 2026: definition created, versioned or retired)*
+
+- obligation.entity_mapping.changed *(added 21 Oct 2026: a definition bound to, or released from, a legal entity)*
+
+*Physical surface (21 Oct 2026): `services/obligations-svc/openapi.yaml`. obligation.updated also covers attribute edits, workflow link changes and filing-status changes, naming them in `changed_fields`.*
+
 **Critical Enhancement**
  Supports **Atomic Linking** — every obligation must be able to point to the originating source, including specific contract clause, filing rule, policy mandate, or jurisdictional rule reference.
 

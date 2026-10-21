@@ -1238,13 +1238,18 @@ services:
   # same pre-existing gap as the two services above.
   obligations-svc:
     build:
-      context: ../services/obligations-svc
-      dockerfile: Dockerfile
+      # Root context: go.mod replaces zoiko.io/identity-envelope with the
+      # sibling module, and the image is built from source (it used to copy
+      # prebuilt binaries that a clean checkout does not have).
+      context: ..
+      dockerfile: services/obligations-svc/Dockerfile
     container_name: obligations-svc
     mem_limit: 256m
     cpus: "0.5"
     ports:
-      - "8088:8088"
+      # Loopback only: in warn mode a request without an identity envelope is
+      # still admitted on its headers, so the port must not answer the LAN.
+      - "127.0.0.1:8088:8088"
     environment:
       PORT: "8088"
       DB_HOST: postgres
@@ -1262,12 +1267,27 @@ services:
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_GROUP_ID: "obligations-svc"
       KAFKA_EVENTS_TOPIC: "zoiko.obligations.events"
+      # Every legal entity a write names must exist in the caller's tenant.
+      TENANT_REGISTRY_URL: "http://tenant-entity-registry-svc:8081"
+      # Identity gate (X5 / X-R3): the signed envelope is verified when sent
+      # and a refused envelope is 401 in every mode; warn admits a request
+      # that carries none until every caller forwards it. Code default
+      # outside local: require.
+      IDENTITY_VERIFY: "${OBLIGATIONS_IDENTITY_VERIFY:-warn}"
+      IDENTITY_JWKS_URL: "http://identity-context-svc:8080/.well-known/jwks.json"
+      IDENTITY_INTROSPECT_URL: "http://identity-context-svc:8080/v1/context/session/introspect"
+      IDENTITY_ISSUER: "identity-context-svc"
     depends_on:
       postgres:
         condition: service_healthy
       kafka:
         condition: service_healthy
       authorization-svc:
+        condition: service_healthy
+      # Creates fail closed (503) until both answer.
+      jurisdiction-svc:
+        condition: service_healthy
+      tenant-svc:
         condition: service_healthy
     healthcheck:
       # readyz, not healthz: liveness answers 200 whenever the process is up, so a
@@ -1505,7 +1525,10 @@ services:
         condition: service_healthy
       document-vault-svc:
         condition: service_healthy
-      governance-decision-log-svc:
+      # The compose service key is governance-svc (container
+      # governance-decision-log-svc); naming the container here made every
+      # docker compose command fail with "undefined service".
+      governance-svc:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/healthcheck", "http://localhost:8090/healthz"]

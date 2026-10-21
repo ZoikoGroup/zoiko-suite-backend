@@ -31,6 +31,7 @@ import (
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
+	idenv "zoiko.io/identity-envelope"
 
 	"zoiko.io/obligations-svc/internal/circuitbreaker"
 	"zoiko.io/obligations-svc/internal/domain"
@@ -64,6 +65,18 @@ const (
 	ActionObligationRead         = "OBLIGATION_READ"
 	ActionFilingRequirementRead  = "FILING_REQUIREMENT_READ"
 	ActionApplicabilityRead      = "APPLICABILITY_DECISION_READ"
+
+	// 21 Oct 2026 completion pass (registered in access-control-svc 000021).
+	ActionObligationUpdate           = "OBLIGATION_UPDATE"
+	ActionFilingStatusUpdate         = "FILING_REQUIREMENT_STATUS_UPDATE"
+	ActionObligationDefinitionManage = "OBLIGATION_DEFINITION_MANAGE"
+	ActionObligationDefinitionRead   = "OBLIGATION_DEFINITION_READ"
+	ActionObligationMappingManage    = "OBLIGATION_ENTITY_MAPPING_MANAGE"
+
+	// PlatformScope is the legal-entity scope for tenant-wide actions (the
+	// definition catalogue has no entity); authorization-svc resolves it to
+	// the configured platform entity, within the caller's tenant.
+	PlatformScope = "PLATFORM"
 )
 
 type HTTPClient struct {
@@ -185,8 +198,11 @@ func (c *HTTPClient) CheckAllowed(ctx context.Context, principalID, legalEntityI
 	req.Header.Set("X-Source-Channel", authzSourceChannel)
 	req.Header.Set("Idempotency-Key", authzRequestID+":"+actionType)
 
-	// Forward the caller's canonical envelope for downstream traceability
+	// Forward the caller's canonical envelope for downstream traceability,
+	// and the verified identity envelope so authorization-svc attributes the
+	// decision to the person (X-82i) and sees the authentication age.
 	svcenvelope.ForwardTo(ctx, req)
+	idenv.Forward(ctx, req)
 
 	// Execute with circuit breaker
 	err = c.breaker.Execute(ctx, func() error {
