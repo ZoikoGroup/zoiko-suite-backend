@@ -110,11 +110,11 @@ func New(store Store, authz AuthZClient, ledger LedgerClient, log *zap.Logger) *
 }
 
 // WithEntityRegistry sets the client MatchIntercompany uses to check ACC-11's
-// own "Entity loses group relationship mid-period" negative path. Left nil,
-// the check is skipped entirely (a deliberate, deployable-without-it
-// posture — see MatchEntry's own comment) rather than New's signature
-// growing a required parameter every existing caller and test would have
-// to update.
+// own "Entity loses group relationship mid-period" negative path. It is not a
+// New parameter because handler tests exercise the other match rules without
+// an entity registry; cmd/server, the only production entrypoint, always
+// calls it. Left nil the check is skipped and logged — see MatchEntry's own
+// comment and SPEC_DEVIATIONS B13.
 func (h *Handler) WithEntityRegistry(c EntityRegistryClient) *Handler {
 	h.entityRegistry = c
 	return h
@@ -588,11 +588,20 @@ func (h *Handler) MatchEntry(w http.ResponseWriter, r *http.Request) {
 
 	// Validation 5: source and target legal entities must still share an
 	// open group relationship — the spec's own negative path, "Entity
-	// loses group relationship mid-period." Skipped (not enforced) when no
-	// entity-registry client is configured — see WithEntityRegistry's own
-	// comment — rather than this handler failing closed against a
-	// dependency a deployment hasn't wired up.
-	if h.entityRegistry != nil {
+	// loses group relationship mid-period." The relationship is evaluated
+	// as of the end of the pair's fiscal_period, not at the moment of the
+	// match call (SPEC_DEVIATIONS A11): a relationship that held through
+	// the period still passes even if it has ended since, and one that only
+	// started after the period fails even if it is open today.
+	//
+	// An unconfigured client skips the check. That branch is unreachable
+	// from cmd/server, which always wires the client (TENANT_REGISTRY_URL
+	// has a non-empty default); it exists for tests, and it is logged so a
+	// future entrypoint that forgets the client is not silent.
+	if h.entityRegistry == nil {
+		h.log.Warn("entity-registry client not configured; skipping group relationship check",
+			zap.String("intercompany_entry_id", entry.IntercompanyEntryID))
+	} else {
 		sourceHierarchies, srcErr := h.entityRegistry.ListHierarchies(r.Context(), tenantID, entry.SourceLegalEntityID)
 		targetHierarchies, tgtErr := h.entityRegistry.ListHierarchies(r.Context(), tenantID, entry.TargetLegalEntityID)
 		if srcErr != nil || tgtErr != nil {
@@ -600,7 +609,7 @@ func (h *Handler) MatchEntry(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusServiceUnavailable, "entity_registry_unavailable", domain.ErrEntityRegistryUnavailable.Error())
 			return
 		}
-		if !entityregistry.SharesOpenGroupRelationship(sourceHierarchies, targetHierarchies, entry.SourceLegalEntityID, entry.TargetLegalEntityID, time.Now().UTC()) {
+		if !entityregistry.SharesOpenGroupRelationship(sourceHierarchies, targetHierarchies, entry.SourceLegalEntityID, entry.TargetLegalEntityID, groupRelationshipAsOf(entry)) {
 			reason := domain.ErrGroupRelationshipLost.Error()
 			h.recordMismatch(w, r, entry, attempt, domain.MatchRuleGroupRelationshipLost, reason)
 			return
@@ -620,6 +629,28 @@ func (h *Handler) MatchEntry(w http.ResponseWriter, r *http.Request) {
 		IntercompanyEntryID: id,
 		MatchStatus:         domain.MatchStatusMatched,
 	})
+}
+
+// groupRelationshipAsOf is the instant Validation 5 evaluates the
+// source/target relationship at (SPEC_DEVIATIONS A11): the end of the pair's
+// fiscal_period when it names a calendar month, so the check answers "did the
+// relationship hold through the period this pair belongs to".
+//
+// A pair with no period, or with a period that is not YYYY-MM, is checked as
+// of now. fiscal_period is a free 1-20 character reference (A4/B7) and
+// general-ledger-svc stores it verbatim, so anything else has no calendar end
+// to evaluate at; "now" is the only instant left, and it is the pre-A11
+// behaviour.
+func groupRelationshipAsOf(entry *domain.IntercompanyEntry) time.Time {
+	now := time.Now().UTC()
+	if entry.FiscalPeriod == nil {
+		return now
+	}
+	end, ok := domain.FiscalPeriodEnd(*entry.FiscalPeriod)
+	if !ok {
+		return now
+	}
+	return end
 }
 
 // matchTolerance is the fixed tolerance a journal amount may differ from the

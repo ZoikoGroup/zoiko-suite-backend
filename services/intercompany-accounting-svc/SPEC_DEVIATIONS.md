@@ -144,10 +144,21 @@ reconciliation-engine-svc holds for DATA-07.
   after a lost response gets 422 instead of its original result, and there is
   no version a client can send to say "only if nothing changed since I read
   it". There is no version column.
-- **A11. Group relationship check is optional and as-of now.** The "entity
-  loses group relationship mid-period" check runs only when an entity-registry
-  client is configured (it is in `cmd/server`), and it checks the relationship
-  at the time of the match call, not over the pair's period. Belongs with A4.
+- **A11. Group relationship check is optional and as-of now. — Closed (B13).**
+  `MatchIntercompany` now evaluates the relationship at the end of the pair's
+  `fiscal_period` when it is a `YYYY-MM` period — the same "as of the end of
+  that month" cut-off the control-population contract gives `period_id` — not
+  at the time of the match call. A relationship that held through the period
+  and has ended since still matches; one that began after the period, or was
+  lost inside it, is a MISMATCH regardless of today's hierarchy.
+  `domain.FiscalPeriodEnd` computes the instant. A pair with no period, or a
+  period that is not `YYYY-MM` (A4/B7 allow a free reference and
+  general-ledger-svc stores it verbatim), is still checked as of now, because
+  there is no calendar end to invent. The client is wired by `cmd/server` in
+  every deployment (the URL has a non-empty default, and a registry that
+  cannot be reached is a 503, never a skip); the nil-client branch is
+  reachable only from tests and now logs a warning rather than passing
+  silently. B13 has the reasoning and tests.
 
 ## B. Interpretations and additions (decisions a reviewer may want to reverse)
 
@@ -429,3 +440,44 @@ reconciliation-engine-svc holds for DATA-07.
     restores 000007's list as `NOT VALID`: source-rule rows are immutable
     and must survive a rollback, and a pre-A6 binary only writes rules the
     old list allows. Re-applying 000008 validates them again.
+- **B13. How the group-relationship check is anchored to the pair's period (A11).**
+  - *As-of instant.* `groupRelationshipAsOf` evaluates the check at the last
+    nanosecond of the pair's `fiscal_period` month, in UTC
+    (`domain.FiscalPeriodEnd`). That is `control-population-contract.md`'s
+    `period_id` rule — "as of the end of that month", all records dated
+    on/before the last day — applied to a timestamp rather than a date: the
+    last instant is inclusive of anything dated on the month's last day, and a
+    relationship end-dated anywhere inside the month (including midnight on
+    the last day) is closed by then and fails. Both hierarchy lists are still
+    fetched unfiltered (open and closed alike), and
+    `entityregistry.SharesOpenGroupRelationship` already applies
+    `effective_from`/`effective_to` against the supplied instant, so there is
+    no second date algorithm here.
+  - *Nil or non-calendar period.* A4/B7 made `fiscal_period` optional and a
+    free 1-20 character reference; general-ledger-svc stores it verbatim
+    (`TestWave4_FiscalPeriodIsNotAssumedToBeYYYYMM` there). Only exact
+    `YYYY-MM` has a month end. A pair with no period, or with one such as
+    `FY26-P09`, is checked as of now: the pre-A11 behaviour, kept because
+    there is no defensible period instant to substitute and refusing the match
+    would reject a period this service already accepted. That is the only case
+    in which the call time is used.
+  - *Optional client.* `cmd/server` is the only production entrypoint and
+    always calls `WithEntityRegistry`; `TENANT_REGISTRY_URL` has a non-empty
+    default and config's `env` treats empty as unset, so no deployment can
+    omit the client. A configured client that cannot be reached fails the
+    match with 503 `entity_registry_unavailable`; it never passes. The nil
+    branch is reachable only by handler tests that exercise other rules
+    without a registry; it now logs a warning instead of skipping silently.
+    It was not turned into a fail-closed 503 because it cannot occur in a
+    deployment and doing so would only change the test harness; the existing
+    `NoEntityRegistryConfigured` test pins that test-only skip.
+  - *Evidence.* The match attempt still records the pair's `fiscal_period`
+    (A3), so the instant the relationship was evaluated at can be
+    reconstructed from the explanation.
+  - *Tests.* `domain.FiscalPeriodEnd` covers normal month ends, a leap
+    February and non-calendar periods. Handler tests cover a relationship
+    that ended after the pair's period and still matches (it failed under the
+    old call-time check), one that began after the period and is MISMATCH
+    although open today (it passed under the old check), and one that ended
+    inside the period and is MISMATCH. The existing intact/lost tests seed no
+    period, so they continue to cover the as-of-now fallback.

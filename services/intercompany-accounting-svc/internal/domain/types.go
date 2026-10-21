@@ -166,6 +166,28 @@ func ValidFiscalPeriod(p string) bool {
 	return p != "" && printable(p, maxFiscalPeriodLen)
 }
 
+// FiscalPeriodEnd returns the last instant of a YYYY-MM period, in UTC: the
+// "as of the end of that month" cut-off the control-population contract
+// gives period_id (all records dated on/before the last day of the month).
+// It exists so a check about a pair's period can be evaluated at that
+// period, not at the moment the pair happens to be read (SPEC_DEVIATIONS
+// A11).
+//
+// ok is false when p is not exactly YYYY-MM. fiscal_period is deliberately a
+// free 1-20 character reference (ValidFiscalPeriod) and general-ledger-svc
+// stores it verbatim, so a period such as "FY26-P09" has no calendar end this
+// service may invent.
+func FiscalPeriodEnd(p string) (time.Time, bool) {
+	if len(p) != 7 {
+		return time.Time{}, false
+	}
+	first, err := time.Parse("2006-01", p)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return first.AddDate(0, 1, 0).Add(-time.Nanosecond), true
+}
+
 func printable(s string, maxLen int) bool {
 	if !utf8.ValidString(s) || utf8.RuneCountInString(s) > maxLen {
 		return false
