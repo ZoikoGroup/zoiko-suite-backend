@@ -638,7 +638,6 @@ const (
 // status, body and headers — so this reaches the caller and is what lets a
 // console tell the gateway's own refusals apart from the backend's.
 const denialReasonHeader = "X-Auth-Denial-Reason"
-<<<<<<< HEAD
 
 // deny refuses with 401 and names the reason.
 func (h *Handler) deny(w http.ResponseWriter, msg, outcome string) {
@@ -726,5 +725,3 @@ func setAuthnAge(w http.ResponseWriter, authTime int64, now time.Time) {
 	}
 	w.Header().Set("X-Authn-Age-Seconds", strconv.FormatInt(age, 10))
 }
-=======
->>>>>>> aafcc88f688c7c98914e029c24c1c27314888254

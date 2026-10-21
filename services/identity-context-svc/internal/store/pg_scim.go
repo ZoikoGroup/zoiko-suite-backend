@@ -269,7 +269,7 @@ func (s *PgStore) GroupsOfPrincipal(ctx context.Context, tenantID, principalID s
 const mappingCols = `mapping_id, tenant_id, group_id, role_id, COALESCE(legal_entity_id,''), status, version, reason,
 	proposed_by, proposed_at, COALESCE(decided_by,''), decided_at`
 
-func scanMapping(row pgx.Row) (*domain.GroupRoleMapping, error) {
+func scanGroupRoleMapping(row pgx.Row) (*domain.GroupRoleMapping, error) {
 	var m domain.GroupRoleMapping
 	err := row.Scan(&m.MappingID, &m.TenantID, &m.GroupID, &m.RoleID, &m.LegalEntityID, &m.Status, &m.Version, &m.Reason,
 		&m.ProposedBy, &m.ProposedAt, &m.DecidedBy, &m.DecidedAt)
@@ -313,7 +313,7 @@ func (s *PgStore) DecideMapping(ctx context.Context, tenantID, mappingID, from, 
 			return fmt.Errorf("unsupported mapping transition to %s", to)
 		}
 		var err error
-		out, err = scanMapping(tx.QueryRow(ctx, q, mappingID, tenantID, from, to, actor))
+		out, err = scanGroupRoleMapping(tx.QueryRow(ctx, q, mappingID, tenantID, from, to, actor))
 		if err != nil || out == nil {
 			return err
 		}
@@ -331,7 +331,7 @@ func (s *PgStore) GetMapping(ctx context.Context, tenantID, mappingID string) (*
 	var out *domain.GroupRoleMapping
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		var err error
-		out, err = scanMapping(tx.QueryRow(ctx, `SELECT `+mappingCols+` FROM group_role_mappings WHERE mapping_id = $1 AND tenant_id = $2`,
+		out, err = scanGroupRoleMapping(tx.QueryRow(ctx, `SELECT `+mappingCols+` FROM group_role_mappings WHERE mapping_id = $1 AND tenant_id = $2`,
 			mappingID, tenantID))
 		return err
 	})
@@ -359,7 +359,7 @@ func (s *PgStore) ListMappings(ctx context.Context, tenantID, groupID, status st
 		}
 		defer rows.Close()
 		for rows.Next() {
-			m, err := scanMapping(rows)
+			m, err := scanGroupRoleMapping(rows)
 			if err != nil {
 				return err
 			}
