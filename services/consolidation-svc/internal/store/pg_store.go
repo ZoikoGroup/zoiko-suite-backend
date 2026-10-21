@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
@@ -100,6 +101,28 @@ func (s *PgStore) enqueueAdjustmentEvent(ctx context.Context, tx pgx.Tx, fact, l
 	}
 	if err := outbox.Enqueue(ctx, tx, env); err != nil {
 		return fmt.Errorf("enqueue consolidation-adjustment.%s event: %w", fact, err)
+	}
+	return nil
+}
+
+// appendAdjustmentTransition writes one row of the append-only lifecycle log
+// inside the same transaction as the status change it records. fromStatus is
+// nil for the creation step; details carries step-specific evidence. The
+// table is insert-and-read only: nothing in this store updates or deletes it.
+func (s *PgStore) appendAdjustmentTransition(ctx context.Context, tx pgx.Tx, tenantID, adjustmentID string, fromStatus *string, toStatus, actorID, correlationID string, occurredAt time.Time, reason *string, details map[string]any) error {
+	detailsJSON, err := json.Marshal(details)
+	if err != nil {
+		return fmt.Errorf("marshal adjustment transition details: %w", err)
+	}
+	_, err = tx.Exec(ctx, `
+		INSERT INTO consolidation_adjustment_transitions (
+			transition_id, tenant_id, consolidation_adjustment_id, from_status, to_status,
+			actor_principal_id, occurred_at, correlation_id, reason, details
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+	`, uuid.NewString(), tenantID, adjustmentID, fromStatus, toStatus,
+		actorID, occurredAt, correlationID, reason, detailsJSON)
+	if err != nil {
+		return fmt.Errorf("record adjustment transition to %s: %w", toStatus, err)
 	}
 	return nil
 }
@@ -505,6 +528,11 @@ func (s *PgStore) CreateAdjustment(ctx context.Context, a *domain.ConsolidationA
 		if err != nil {
 			return err
 		}
+		if err := s.appendAdjustmentTransition(ctx, tx, tenantID, a.ConsolidationAdjustmentID,
+			nil, a.Status, a.CreatedByPrincipalID, correlationID, a.CreatedAt, nil,
+			map[string]any{"adjustment_type": a.AdjustmentType}); err != nil {
+			return err
+		}
 		return s.enqueueAdjustmentEvent(ctx, tx, "created", "ConsolidationAdjustmentCreated",
 			tenantID, a.GroupLegalEntityID, a.ConsolidationAdjustmentID,
 			a.CreatedByPrincipalID, correlationID, map[string]any{
@@ -606,6 +634,11 @@ func (s *PgStore) ApproveAdjustment(ctx context.Context, id, principalID, correl
 		if err != nil {
 			return err
 		}
+		from := domain.AdjustmentStatusPendingApproval
+		if err := s.appendAdjustmentTransition(ctx, tx, tenantID, id, &from,
+			domain.AdjustmentStatusApproved, principalID, correlationID, now, nil, nil); err != nil {
+			return err
+		}
 		return s.enqueueAdjustmentEvent(ctx, tx, "approved", "ConsolidationAdjustmentApproved",
 			tenantID, groupLegalEntityID, id, principalID, correlationID, map[string]any{
 				"consolidation_adjustment_id": id,
@@ -640,6 +673,12 @@ func (s *PgStore) MarkAdjustmentPosted(ctx context.Context, id, principalID, jou
 			return domain.ErrInvalidAdjustmentTransition
 		}
 		if err != nil {
+			return err
+		}
+		from := domain.AdjustmentStatusApproved
+		if err := s.appendAdjustmentTransition(ctx, tx, tenantID, id, &from,
+			domain.AdjustmentStatusPosted, principalID, correlationID, now, nil,
+			map[string]any{"consolidation_book_journal_id": journalID}); err != nil {
 			return err
 		}
 		return s.enqueueAdjustmentEvent(ctx, tx, "posted", "ConsolidationAdjustmentPosted",
@@ -679,6 +718,12 @@ func (s *PgStore) ReverseAdjustment(ctx context.Context, id, principalID, reason
 		if err != nil {
 			return err
 		}
+		from := domain.AdjustmentStatusPosted
+		if err := s.appendAdjustmentTransition(ctx, tx, tenantID, id, &from,
+			domain.AdjustmentStatusReversed, principalID, correlationID, now, &reason,
+			map[string]any{"superseded_by_adjustment_id": supersededBy}); err != nil {
+			return err
+		}
 		return s.enqueueAdjustmentEvent(ctx, tx, "reversed", "ConsolidationAdjustmentReversed",
 			tenantID, groupLegalEntityID, id, principalID, correlationID, map[string]any{
 				"consolidation_adjustment_id": id,
@@ -692,4 +737,137 @@ func (s *PgStore) ReverseAdjustment(ctx context.Context, id, principalID, reason
 				"superseded_by_adjustment_id": supersededBy,
 			})
 	})
+}
+
+// GetAdjustmentHistory returns the adjustment's append-only lifecycle. The
+// transition table is the record; rows that predate migration 000006 (or were
+// written by an old instance during a rolling deploy after the backfill) are
+// synthesized from the lifecycle columns on the adjustment itself, so the
+// answer is always the full chain rather than an empty one.
+func (s *PgStore) GetAdjustmentHistory(ctx context.Context, id string) (*domain.AdjustmentHistory, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+
+	var a domain.ConsolidationAdjustment
+	out := &domain.AdjustmentHistory{Transitions: []domain.AdjustmentTransition{}}
+
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		if err := scanConsolidationAdjustment(tx.QueryRow(ctx, `
+			SELECT `+consolidationAdjustmentColumns+`
+			FROM consolidation_adjustments
+			WHERE consolidation_adjustment_id = $1 AND tenant_id = $2
+		`, id, tenantID), &a); err != nil {
+			return err
+		}
+
+		out.ConsolidationAdjustmentID = a.ConsolidationAdjustmentID
+		out.GroupLegalEntityID = a.GroupLegalEntityID
+		out.FiscalPeriod = a.FiscalPeriod
+		out.AdjustmentType = a.AdjustmentType
+		out.Status = a.Status
+
+		rows, err := tx.Query(ctx, `
+			SELECT transition_id, consolidation_adjustment_id, sequence, from_status, to_status,
+			       actor_principal_id, occurred_at, COALESCE(correlation_id, ''), reason, details
+			FROM consolidation_adjustment_transitions
+			WHERE consolidation_adjustment_id = $1 AND tenant_id = $2
+			ORDER BY sequence ASC
+		`, id, tenantID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var t domain.AdjustmentTransition
+			var details []byte
+			if err := rows.Scan(&t.TransitionID, &t.ConsolidationAdjustmentID, &t.Sequence,
+				&t.FromStatus, &t.ToStatus, &t.ActorPrincipalID, &t.OccurredAt,
+				&t.CorrelationID, &t.Reason, &details); err != nil {
+				return err
+			}
+			if len(details) > 0 {
+				if err := json.Unmarshal(details, &t.Details); err != nil {
+					return fmt.Errorf("read adjustment transition %s details: %w", t.TransitionID, err)
+				}
+			}
+			out.Transitions = append(out.Transitions, t)
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		if len(out.Transitions) == 0 {
+			out.Transitions = synthesizeAdjustmentTransitions(&a)
+		}
+		return nil
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrAdjustmentNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// synthesizeAdjustmentTransitions rebuilds the lifecycle chain from the
+// adjustment row for an adjustment whose transitions were never written
+// (created before migration 000006). It mirrors exactly what the commands
+// would have recorded, from the same columns.
+func synthesizeAdjustmentTransitions(a *domain.ConsolidationAdjustment) []domain.AdjustmentTransition {
+	out := make([]domain.AdjustmentTransition, 0, 4)
+	var seq int64
+	add := func(from *string, to, actor string, at time.Time, reason *string, details map[string]any) {
+		seq++
+		out = append(out, domain.AdjustmentTransition{
+			TransitionID:              uuid.NewString(),
+			ConsolidationAdjustmentID: a.ConsolidationAdjustmentID,
+			Sequence:                  seq,
+			FromStatus:                from,
+			ToStatus:                  to,
+			ActorPrincipalID:          actor,
+			OccurredAt:                at,
+			Reason:                    reason,
+			Details:                   details,
+		})
+	}
+
+	add(nil, domain.AdjustmentStatusPendingApproval, a.CreatedByPrincipalID, a.CreatedAt, nil,
+		map[string]any{"adjustment_type": a.AdjustmentType})
+
+	if a.ApprovedAt != nil {
+		from := domain.AdjustmentStatusPendingApproval
+		actor := ""
+		if a.ApprovedByPrincipalID != nil {
+			actor = *a.ApprovedByPrincipalID
+		}
+		add(&from, domain.AdjustmentStatusApproved, actor, *a.ApprovedAt, nil, nil)
+	}
+	if a.PostedAt != nil {
+		from := domain.AdjustmentStatusApproved
+		actor := ""
+		if a.PostedByPrincipalID != nil {
+			actor = *a.PostedByPrincipalID
+		}
+		details := map[string]any{}
+		if a.ConsolidationBookJournalID != nil {
+			details["consolidation_book_journal_id"] = *a.ConsolidationBookJournalID
+		}
+		add(&from, domain.AdjustmentStatusPosted, actor, *a.PostedAt, nil, details)
+	}
+	if a.ReversedAt != nil {
+		from := domain.AdjustmentStatusPosted
+		actor := ""
+		if a.ReversedByPrincipalID != nil {
+			actor = *a.ReversedByPrincipalID
+		}
+		details := map[string]any{}
+		if a.SupersededByAdjustmentID != nil {
+			details["superseded_by_adjustment_id"] = *a.SupersededByAdjustmentID
+		}
+		add(&from, domain.AdjustmentStatusReversed, actor, *a.ReversedAt, a.ReversalReason, details)
+	}
+	return out
 }

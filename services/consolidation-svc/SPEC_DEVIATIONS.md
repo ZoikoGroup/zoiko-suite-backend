@@ -149,15 +149,23 @@ consolidation entries in a group entity's statutory ledger.
   adjustment state change, with the adjustment itself as the aggregate and
   the exact spec name preserved as the legacy `event_type`. Downstream
   consumers (ACC-15/16/18, reporting) can now see adjustments.
-- **A10. `ExplainElimination` and `GetAdjustmentHistory` are not
-  implemented.** History is only the latest set of approve/post/reverse
-  columns on the adjustment row; there is no transition log. There is no
-  elimination record at all for the automatic eliminations a run performs
-  (they exist only as arithmetic on the snapshot), so "why was this amount
-  eliminated" has no answer. `ListEliminations` is approximated by
-  `GET /v1/consolidation/adjustments` (all types, no type filter). Scope:
-  `consolidation_adjustment_transitions` table; per-run `eliminations` rows
-  from A2.
+- **A10. `ExplainElimination` and `GetAdjustmentHistory` are implemented as
+  read-only queries. — Closed (B8).** `GET
+  /v1/consolidation/adjustments/{id}/history` returns the adjustment's
+  append-only lifecycle log (`consolidation_adjustment_transitions`: from/to
+  status, actor, occurrence time, correlation id, reason and step details,
+  with rows that predate migration 000006 backfilled from the lifecycle
+  columns). `GET
+  /v1/consolidation/eliminations/explanation?group_legal_entity_id=&entity_a=&entity_b=&fiscal_period=`
+  returns the MATCHED-or-CLOSED rule's decision for the pair, the statuses
+  that matched, and the reciprocal balance it was checked against from
+  intercompany-accounting-svc's `GetReciprocalBalances` — both directions,
+  every currency, exact decimals. Both are QUERY reads: scoped read plus
+  correlation/auth context, no Idempotency-Key. `ListEliminations` is still
+  approximated by `GET /v1/consolidation/adjustments` (all types, no type
+  filter), and per-run `eliminations` rows are still A2's work; B8 records
+  both, and that ExplainElimination answers the rule from the pair's current
+  reciprocal balance rather than replaying a past run.
 - **A11. `GetGroupBalance` and `DrillEntityContribution` are partial.**
   Group balances are readable per run (`/runs/{id}/snapshots`), not by group
   and period ("the certified balance for group G, period P"). Contributions
@@ -260,3 +268,35 @@ consolidation entries in a group entity's statutory ledger.
   id, and Reversed adds the reason and any superseding adjustment id. A
   rejected transition (wrong status, unknown id) never reaches the event:
   the outbox cannot report a change the transaction rolled back.
+- **B8. What ExplainElimination and GetAdjustmentHistory answer (A10).**
+  - *History is a real append-only log.* Migration 000006 adds
+    `consolidation_adjustment_transitions`. Each lifecycle command writes its
+    transition in the same transaction as the status change: created
+    (from NULL to PENDING_APPROVAL), approved, posted (with the
+    consolidation-book journal id in `details`) and reversed (with the reason
+    and any superseding adjustment id). The row carries the actor, the real
+    occurrence time, the correlation id and step details. The migration
+    backfills one chain per existing adjustment from its lifecycle columns, so
+    the answer is complete for rows created before the table; the read also
+    synthesizes the chain for a row with no transition rows at all (an
+    adjustment written by an old instance during a rolling deploy after the
+    backfill). A rejected transition writes neither a transition nor an event.
+  - *ExplainElimination answers the rule, not a run replay.* The query takes
+    the group, the entity pair and the period and reads
+    intercompany-accounting-svc's `GetReciprocalBalances` for exactly that
+    pair/period. The rule is ACC-12's existing MATCHED-or-CLOSED predicate
+    (B6); the answer names the rule and the statuses that matched, and returns
+    the reciprocal balance — each direction's totals by currency, never
+    combined — as the amount the decision was checked against. It is a
+    current-state explanation. The service still does not persist one
+    elimination row per automatic run elimination: StartRun adjusts the
+    in-memory snapshot and records only arithmetic, which is A2's remaining
+    work (explicitly out of this change). A historical "what did run R
+    eliminate" answer therefore awaits those rows; this query does not pretend
+    to replay them. `ListEliminations` likewise remains approximated by
+    `GET /v1/consolidation/adjustments` (all types, no type filter).
+  - *Both are reads.* No Idempotency-Key and no state change; each is a scoped
+    read authorized on the group entity (`CONSOLIDATION_ADJUSTMENT_VIEW` for
+    history, `CONSOLIDATION_RUN_VIEW` for the elimination explanation). The
+    explanation call forwards the caller's principal to
+    intercompany-accounting-svc, whose endpoint authorizes both entities.

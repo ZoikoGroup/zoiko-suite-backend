@@ -211,6 +211,54 @@ func (c *Clients) FetchEliminableIntercompanyEntries(ctx context.Context, tenant
 	return eliminable, nil
 }
 
+// FetchReciprocalBalances reads intercompany-accounting-svc's
+// GetReciprocalBalances for one entity pair and period. ACC-12's
+// ExplainElimination returns this as the balance its MATCHED-or-CLOSED rule
+// was checked against, rather than re-deriving the pair's positions from the
+// entry list here (the aggregation is exact there: big.Rat sums, per-currency
+// separation, never float64). principalID is forwarded as X-Principal-Id;
+// that endpoint authorizes both entities.
+func (c *Clients) FetchReciprocalBalances(ctx context.Context, tenantID, principalID, entityA, entityB, fiscalPeriod string) (*domain.ReciprocalBalances, error) {
+	u, err := url.Parse(c.intercompanyURL + "/v1/intercompany/reciprocal-balances")
+	if err != nil {
+		return nil, err
+	}
+	q := u.Query()
+	q.Set("entity_a", entityA)
+	q.Set("entity_b", entityB)
+	q.Set("period", fiscalPeriod)
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("X-Tenant-Id", tenantID)
+	req.Header.Set("X-Principal-Id", principalID)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		c.log.Error("failed to query intercompany-accounting-svc reciprocal balances", zap.Error(err))
+		return nil, domain.ErrIntercompanyUnavailable
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusUnauthorized {
+		// The reciprocal-balances endpoint authorizes BOTH entities. A
+		// denial is the caller's, not an outage: surface it as such.
+		return nil, domain.ErrAuthorizationDenied
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, domain.ErrIntercompanyUnavailable
+	}
+
+	var balances domain.ReciprocalBalances
+	if err := json.NewDecoder(resp.Body).Decode(&balances); err != nil {
+		return nil, err
+	}
+	return &balances, nil
+}
+
 // postingEventLine mirrors general-ledger-svc's own
 // domain.PostingEventLineInput — account_code only, never a mapping_key:
 // a consolidation adjustment names its own accounts explicitly.

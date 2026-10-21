@@ -73,26 +73,26 @@ type ConsolidationRunResponse struct {
 // actually posts to general-ledger-svc under the group entity — see
 // migration 000003's doc comment.
 type ConsolidationAdjustment struct {
-	ConsolidationAdjustmentID string  `json:"consolidation_adjustment_id"`
-	TenantID                  string  `json:"tenant_id"`
-	GroupLegalEntityID        string  `json:"group_legal_entity_id"`
-	FiscalPeriod              string  `json:"fiscal_period"`
-	AdjustmentType            string  `json:"adjustment_type"` // ELIMINATION | MANUAL
-	Description               string  `json:"description"`
-	Status                    string  `json:"status"`
+	ConsolidationAdjustmentID string                        `json:"consolidation_adjustment_id"`
+	TenantID                  string                        `json:"tenant_id"`
+	GroupLegalEntityID        string                        `json:"group_legal_entity_id"`
+	FiscalPeriod              string                        `json:"fiscal_period"`
+	AdjustmentType            string                        `json:"adjustment_type"` // ELIMINATION | MANUAL
+	Description               string                        `json:"description"`
+	Status                    string                        `json:"status"`
 	Lines                     []ConsolidationAdjustmentLine `json:"lines"`
 
 	ConsolidationBookJournalID *string `json:"consolidation_book_journal_id,omitempty"`
 
-	CreatedAt            time.Time  `json:"created_at"`
-	CreatedByPrincipalID string     `json:"created_by_principal_id"`
-	ApprovedAt           *time.Time `json:"approved_at,omitempty"`
-	ApprovedByPrincipalID *string   `json:"approved_by_principal_id,omitempty"`
-	PostedAt             *time.Time `json:"posted_at,omitempty"`
-	PostedByPrincipalID  *string    `json:"posted_by_principal_id,omitempty"`
-	ReversedAt           *time.Time `json:"reversed_at,omitempty"`
-	ReversedByPrincipalID *string   `json:"reversed_by_principal_id,omitempty"`
-	ReversalReason       *string    `json:"reversal_reason,omitempty"`
+	CreatedAt             time.Time  `json:"created_at"`
+	CreatedByPrincipalID  string     `json:"created_by_principal_id"`
+	ApprovedAt            *time.Time `json:"approved_at,omitempty"`
+	ApprovedByPrincipalID *string    `json:"approved_by_principal_id,omitempty"`
+	PostedAt              *time.Time `json:"posted_at,omitempty"`
+	PostedByPrincipalID   *string    `json:"posted_by_principal_id,omitempty"`
+	ReversedAt            *time.Time `json:"reversed_at,omitempty"`
+	ReversedByPrincipalID *string    `json:"reversed_by_principal_id,omitempty"`
+	ReversalReason        *string    `json:"reversal_reason,omitempty"`
 
 	// SupersededByAdjustmentID is set only when Reverse was called WITH a
 	// replacement adjustment named — the spec's own "Reversed/Superseded"
@@ -129,6 +129,36 @@ type CreateEliminationProposalRequest struct {
 type ReverseConsolidationAdjustmentRequest struct {
 	Reason                   string  `json:"reason"`
 	SupersededByAdjustmentID *string `json:"superseded_by_adjustment_id,omitempty"`
+}
+
+// AdjustmentTransition is one row of the append-only lifecycle log
+// (consolidation_adjustment_transitions, migration 000006). FromStatus is
+// nil for the creation step; Reason is set on a reversal; Details carries
+// step-specific evidence (the consolidation-book journal id on POSTED, the
+// superseding adjustment id on REVERSED).
+type AdjustmentTransition struct {
+	TransitionID              string         `json:"transition_id"`
+	ConsolidationAdjustmentID string         `json:"consolidation_adjustment_id"`
+	Sequence                  int64          `json:"sequence"`
+	FromStatus                *string        `json:"from_status"`
+	ToStatus                  string         `json:"to_status"`
+	ActorPrincipalID          string         `json:"actor_principal_id"`
+	OccurredAt                time.Time      `json:"occurred_at"`
+	CorrelationID             string         `json:"correlation_id,omitempty"`
+	Reason                    *string        `json:"reason,omitempty"`
+	Details                   map[string]any `json:"details,omitempty"`
+}
+
+// AdjustmentHistory is GetAdjustmentHistory's answer: the adjustment's
+// current identity and status plus every transition in the order it
+// happened. Transitions is never null.
+type AdjustmentHistory struct {
+	ConsolidationAdjustmentID string                 `json:"consolidation_adjustment_id"`
+	GroupLegalEntityID        string                 `json:"group_legal_entity_id"`
+	FiscalPeriod              string                 `json:"fiscal_period"`
+	AdjustmentType            string                 `json:"adjustment_type"`
+	Status                    string                 `json:"status"`
+	Transitions               []AdjustmentTransition `json:"transitions"`
 }
 
 type errorString string

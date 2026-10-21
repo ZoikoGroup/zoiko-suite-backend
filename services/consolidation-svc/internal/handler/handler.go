@@ -45,6 +45,7 @@ type Store interface {
 	HasSnapshotForPeriod(ctx context.Context, groupLegalEntityID, fiscalPeriod string) (bool, error)
 	CreateAdjustment(ctx context.Context, a *domain.ConsolidationAdjustment, correlationID string) error
 	GetAdjustment(ctx context.Context, id string) (*domain.ConsolidationAdjustment, error)
+	GetAdjustmentHistory(ctx context.Context, id string) (*domain.AdjustmentHistory, error)
 	ListAdjustments(ctx context.Context, groupLegalEntityID, fiscalPeriod string) ([]domain.ConsolidationAdjustment, error)
 	ApproveAdjustment(ctx context.Context, id, principalID, correlationID string) error
 	MarkAdjustmentPosted(ctx context.Context, id, principalID, journalID, correlationID string) error
@@ -58,6 +59,7 @@ type AuthZClient interface {
 type DomainClients interface {
 	FetchTrialBalance(ctx context.Context, tenantID, legalEntityID, fiscalPeriod string) (map[string]float64, error)
 	FetchEliminableIntercompanyEntries(ctx context.Context, tenantID, principalID string) ([]clients.IntercompanyEntry, error)
+	FetchReciprocalBalances(ctx context.Context, tenantID, principalID, entityA, entityB, fiscalPeriod string) (*domain.ReciprocalBalances, error)
 	FetchJournalLines(ctx context.Context, tenantID, journalID string) ([]clients.JournalLine, error)
 
 	// ACC-12's own real "ACC-04/05 consolidation book" dependency.
@@ -114,9 +116,13 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/", h.CreateEliminationProposal)
 		r.Get("/", h.ListAdjustments)
 		r.Get("/{id}", h.GetAdjustment)
+		r.Get("/{id}/history", h.GetAdjustmentHistory)
 		r.Post("/{id}/approve", h.ApproveConsolidationAdjustment)
 		r.Post("/{id}/post", h.PostConsolidationAdjustment)
 		r.Post("/{id}/reverse", h.ReverseConsolidationAdjustment)
+	})
+	r.Route("/v1/consolidation/eliminations", func(r chi.Router) {
+		r.Get("/explanation", h.ExplainElimination)
 	})
 }
 
@@ -846,6 +852,89 @@ func (h *Handler) writeAuthzErr(w http.ResponseWriter, err error) {
 	} else {
 		writeError(w, http.StatusServiceUnavailable, "authz_unavailable", err.Error())
 	}
+}
+
+// ── GET /v1/consolidation/adjustments/{id}/history ────────────────────────────────
+
+// GetAdjustmentHistory is ACC-12's GetAdjustmentHistory query: a read-only
+// lifecycle log, not a command. No Idempotency-Key is read. Authorization is
+// on the adjustment's own group entity, the same view action GetAdjustment
+// uses.
+func (h *Handler) GetAdjustmentHistory(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+
+	history, err := h.store.GetAdjustmentHistory(r.Context(), id)
+	if errors.Is(err, domain.ErrAdjustmentNotFound) {
+		writeError(w, http.StatusNotFound, "adjustment_not_found", "")
+		return
+	}
+	if err != nil {
+		h.log.Error("failed to fetch consolidation adjustment history", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, history.GroupLegalEntityID, actionAdjustmentView); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, history)
+}
+
+// ── GET /v1/consolidation/eliminations/explanation ────────────────────────────────
+
+// ExplainElimination is ACC-12's ExplainElimination query: why a pair is or
+// is not eliminable, the rule that decided it, and the reciprocal balance it
+// was checked against. The balance comes from intercompany-accounting-svc's
+// GetReciprocalBalances (ACC-11 A1) rather than being re-derived from the
+// entry list here. Read-only: scoped read plus auth context, no
+// Idempotency-Key.
+func (h *Handler) ExplainElimination(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	groupLegalEntityID := q.Get("group_legal_entity_id")
+	entityA := q.Get("entity_a")
+	entityB := q.Get("entity_b")
+	fiscalPeriod := q.Get("fiscal_period")
+
+	if groupLegalEntityID == "" || entityA == "" || entityB == "" || fiscalPeriod == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields",
+			"group_legal_entity_id, entity_a, entity_b and fiscal_period are required")
+		return
+	}
+	if entityA == entityB {
+		writeError(w, http.StatusBadRequest, "same_entity_forbidden",
+			"entity_a and entity_b must be different legal entities")
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, groupLegalEntityID, actionRunView); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	tenantID := svcmiddleware.TenantFromContext(r.Context())
+	balances, err := h.clients.FetchReciprocalBalances(r.Context(), tenantID, principalID, entityA, entityB, fiscalPeriod)
+	if err != nil {
+		if errors.Is(err, domain.ErrAuthorizationDenied) {
+			h.writeAuthzErr(w, err)
+			return
+		}
+		h.log.Error("failed to fetch reciprocal balances for elimination explanation",
+			zap.String("entity_a", entityA), zap.String("entity_b", entityB),
+			zap.String("fiscal_period", fiscalPeriod), zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "intercompany_unavailable", err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK,
+		domain.BuildEliminationExplanation(groupLegalEntityID, entityA, entityB, fiscalPeriod, balances))
 }
 
 func getCorrelationID(r *http.Request) string {

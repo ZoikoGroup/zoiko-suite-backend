@@ -27,6 +27,7 @@ type stubStore struct {
 	contribErr    error
 
 	adjustments map[string]*domain.ConsolidationAdjustment
+	histories   map[string]*domain.AdjustmentHistory
 	groupHasRun map[string]bool
 	hasSnapshot map[string]bool
 
@@ -45,6 +46,7 @@ func newStubStore() *stubStore {
 		snapshots:     make(map[string][]domain.BalanceSnapshot),
 		contributions: make(map[string][]domain.BalanceContribution),
 		adjustments:   make(map[string]*domain.ConsolidationAdjustment),
+		histories:     make(map[string]*domain.AdjustmentHistory),
 		groupHasRun:   make(map[string]bool),
 		hasSnapshot:   make(map[string]bool),
 	}
@@ -147,6 +149,14 @@ func (s *stubStore) GetAdjustment(_ context.Context, id string) (*domain.Consoli
 	return a, nil
 }
 
+func (s *stubStore) GetAdjustmentHistory(_ context.Context, id string) (*domain.AdjustmentHistory, error) {
+	h, ok := s.histories[id]
+	if !ok {
+		return nil, domain.ErrAdjustmentNotFound
+	}
+	return h, nil
+}
+
 func (s *stubStore) ListAdjustments(_ context.Context, groupLegalEntityID, fiscalPeriod string) ([]domain.ConsolidationAdjustment, error) {
 	var out []domain.ConsolidationAdjustment
 	for _, a := range s.adjustments {
@@ -208,6 +218,12 @@ type stubClients struct {
 	intercompanyErr     error
 	principalIDReceived string // captures what FetchEliminableIntercompanyEntries was called with
 
+	reciprocalBalances *domain.ReciprocalBalances
+	reciprocalErr      error
+	reciprocalEntityA  string
+	reciprocalEntityB  string
+	reciprocalPeriod   string
+
 	// journalLines maps journal_id -> its real posted lines, for the
 	// elimination path (FetchJournalLines). journalLinesErr, keyed the
 	// same way, lets a test simulate one specific journal's lookup failing.
@@ -238,6 +254,15 @@ func (c *stubClients) FetchEliminableIntercompanyEntries(_ context.Context, _, p
 		return nil, c.intercompanyErr
 	}
 	return c.intercompanyEntries, nil
+}
+
+func (c *stubClients) FetchReciprocalBalances(_ context.Context, _, principalID, entityA, entityB, fiscalPeriod string) (*domain.ReciprocalBalances, error) {
+	c.principalIDReceived = principalID
+	c.reciprocalEntityA, c.reciprocalEntityB, c.reciprocalPeriod = entityA, entityB, fiscalPeriod
+	if c.reciprocalErr != nil {
+		return nil, c.reciprocalErr
+	}
+	return c.reciprocalBalances, nil
 }
 
 func (c *stubClients) FetchJournalLines(_ context.Context, _, journalID string) ([]clients.JournalLine, error) {
