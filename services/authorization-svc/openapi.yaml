@@ -290,7 +290,14 @@ paths:
     post:
       tags: [Evaluation]
       summary: Evaluate delegated access for a principal and action
-      description: ZS-IAM-001 §8.3. Gated by client certificate.
+      description: |
+        ZS-IAM-001 §8.3. Gated by client certificate.
+
+        With `delegator_principal_id` (and `action_type`, then required) the
+        question narrows to one delegator: does the principal hold the action
+        by a live delegation FROM that principal. The answer then carries
+        `delegation_id`. Workflow approval uses this for a delegate acting on a
+        stage that names its approver.
       security: []
       requestBody:
         required: true
@@ -298,6 +305,12 @@ paths:
           application/json:
             schema:
               type: object
+              properties:
+                principal_id: { type: string }
+                legal_entity_id: { type: string }
+                action_type: { type: string }
+                delegator_principal_id: { type: string }
+              required: [principal_id, legal_entity_id]
               additionalProperties: true
       responses:
         '200':
@@ -2916,6 +2929,10 @@ components:
       type: object
       properties:
         has_delegated_access: { type: boolean }
+        basis: { type: string, description: "delegated:from=<delegator> or no_delegated_grant" }
+        delegated_actions: { type: array, items: { type: string } }
+        held_directly: { type: boolean }
+        delegation_id: { type: string, description: "Set when delegator_principal_id was asked about and access is held." }
       additionalProperties: true
 
     AvailableActions:

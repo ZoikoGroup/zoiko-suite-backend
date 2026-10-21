@@ -2059,6 +2059,66 @@ func (s *PgStore) FindDelegationSource(ctx context.Context, delegatePrincipalID,
 	return delegator, delegationID, nil
 }
 
+// FindDelegationFrom names the ACTIVE delegation from delegatorPrincipalID to
+// delegatePrincipalID that confers actionType in this scope, with the same
+// predicates as FindDelegationSource (the delegator must still hold the
+// action and still stand). "" when there is none.
+//
+// The caller asks a narrower question than "does the delegate hold this by
+// delegation": whether it holds it from THIS delegator — the assigned
+// approver a workflow stage names. FindDelegatedActions' basis names only the
+// first delegator, so a delegate holding delegations from two approvers was
+// refused for the second (Governance audit, workflow row 23, 21 Oct 2026).
+func (s *PgStore) FindDelegationFrom(ctx context.Context, delegatePrincipalID, delegatorPrincipalID, legalEntityID, tenantID, actionType string) (string, error) {
+	const query = `
+		SELECT da.delegated_authority_id::text
+		  FROM delegated_authorities da
+		  JOIN principal_role_assignments pra ON pra.principal_id = da.delegator_principal_id
+		  JOIN roles r ON r.role_id = pra.role_id AND r.active_flag
+		  JOIN permission_bundles pb ON pb.role_id = r.role_id AND pb.active_flag
+		 WHERE da.delegate_principal_id = $1
+		   AND da.delegator_principal_id = $5
+		   AND (da.legal_entity_id = $2 OR (da.legal_entity_id IS NULL AND $3 != ''))
+		   AND ($3 = '' OR da.tenant_id::text = $3)
+		   AND da.revocation_status = 'ACTIVE'
+		   AND da.effective_from <= NOW()
+		   AND (da.effective_to IS NULL OR da.effective_to > NOW())
+		   AND r.tenant_id = da.tenant_id
+		   AND pra.approval_status = 'APPROVED'
+		   AND (pra.legal_entity_id = $2 OR (pra.legal_entity_id IS NULL AND $3 != ''))
+		   AND pra.effective_from <= NOW()
+		   AND (pra.effective_to IS NULL OR pra.effective_to > NOW())
+		   AND pb.permitted_actions @> jsonb_build_array($4::text)
+		   AND (da.delegated_actions IS NULL OR da.delegated_actions @> jsonb_build_array($4::text))
+		   AND NOT EXISTS (SELECT 1 FROM principal_status_projection psp
+		                    WHERE psp.principal_id = da.delegator_principal_id
+		                      AND psp.tenant_id = da.tenant_id
+		                      AND psp.status <> 'ACTIVE')
+		 ORDER BY da.created_at, da.delegated_authority_id
+		 LIMIT 1;`
+	if domain.IsPrivilegedAction(actionType) {
+		return "", nil // privileged actions are never delegable
+	}
+	var delegationID string
+	run := func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, query, delegatePrincipalID, legalEntityID, tenantID, actionType, delegatorPrincipalID).Scan(&delegationID)
+	}
+	var err error
+	if tenantID != "" {
+		err = s.withRLS(ctx, tenantID, run)
+	} else {
+		err = s.withPlatformScope(ctx, run)
+	}
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		s.log.Error("pg FindDelegationFrom failed", zap.Error(err))
+		return "", fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return delegationID, nil
+}
+
 // FindDelegatedActionsScoped resolves delegations taking into account book_id and org_unit_id hierarchical dimensions.
 func (s *PgStore) FindDelegatedActionsScoped(ctx context.Context, principalID, legalEntityID, tenantID, bookID, orgUnitID string) ([]string, string, error) {
 	const query = `

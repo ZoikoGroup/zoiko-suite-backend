@@ -830,6 +830,18 @@ func (s *Store) FindDelegationSource(ctx context.Context, delegatePrincipalID, l
 	return f.FindDelegationSource(ctx, delegatePrincipalID, legalEntityID, tenantID, bookID, orgUnitID, actionType)
 }
 
+// FindDelegationFrom passes through uncached: a delegation question names
+// one delegator and must see a revocation at once.
+func (s *Store) FindDelegationFrom(ctx context.Context, delegatePrincipalID, delegatorPrincipalID, legalEntityID, tenantID, actionType string) (string, error) {
+	f, ok := s.inner.(interface {
+		FindDelegationFrom(ctx context.Context, delegatePrincipalID, delegatorPrincipalID, legalEntityID, tenantID, actionType string) (string, error)
+	})
+	if !ok {
+		return "", domain.ErrStoreUnavailable
+	}
+	return f.FindDelegationFrom(ctx, delegatePrincipalID, delegatorPrincipalID, legalEntityID, tenantID, actionType)
+}
+
 // DecideRoleAssignment approves or rejects a pending privileged assignment.
 // An approval starts granting, so cached grant sources are dropped.
 func (s *Store) DecideRoleAssignment(ctx context.Context, assignmentID, tenantID, decision, deciderPrincipalID string) (*domain.PrincipalRoleAssignment, error) {

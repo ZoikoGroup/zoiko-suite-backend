@@ -498,6 +498,12 @@ type delegatedAccessRequest struct {
 	ActionType string `json:"action_type,omitempty"`
 
 	TenantID string `json:"tenant_id,omitempty"`
+
+	// DelegatorPrincipalID narrows the question to one delegator: does the
+	// principal hold ActionType by a live delegation FROM this principal (the
+	// approver a workflow stage names)? Requires ActionType. The answer then
+	// carries the delegation id for the decision's lineage.
+	DelegatorPrincipalID string `json:"delegator_principal_id,omitempty"`
 }
 
 type delegatedAccessResponse struct {
@@ -524,6 +530,16 @@ type delegatedAccessResponse struct {
 	// the delegator's own authority while the workflow believed a delegate had
 	// acted. Only meaningful when ActionType was given.
 	HeldDirectly bool `json:"held_directly,omitempty"`
+
+	// DelegationID names the delegation that answered a delegator-specific
+	// question (DelegatorPrincipalID was given and access is held).
+	DelegationID string `json:"delegation_id,omitempty"`
+}
+
+// delegationFromFinder is the store capability behind a delegator-specific
+// question. Optional; a store without it answers 503 rather than guess.
+type delegationFromFinder interface {
+	FindDelegationFrom(ctx context.Context, delegatePrincipalID, delegatorPrincipalID, legalEntityID, tenantID, actionType string) (string, error)
 }
 
 // EvaluateDelegatedAccess handles POST /v1/delegated-access/evaluate — §8.3's
@@ -567,6 +583,37 @@ func (h *Handler) EvaluateDelegatedAccess(w http.ResponseWriter, r *http.Request
 
 	evaluationEntityID, ok := h.resolvePlatformScope(w, strings.TrimSpace(req.LegalEntityID), correlationID)
 	if !ok {
+		return
+	}
+
+	if delegator := strings.TrimSpace(req.DelegatorPrincipalID); delegator != "" {
+		if strings.TrimSpace(req.ActionType) == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "action_type",
+				"message": "a delegator-specific question needs the action it is about"})
+			return
+		}
+		finder, ok := h.store.(delegationFromFinder)
+		if !ok {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			return
+		}
+		delegationID, err := finder.FindDelegationFrom(r.Context(), req.PrincipalID, delegator, evaluationEntityID, tenantScope, req.ActionType)
+		if err != nil {
+			h.log.Error("EvaluateDelegatedAccess: store unavailable (delegation-from lookup)",
+				zap.String("correlation_id", correlationID), zap.Error(err))
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			return
+		}
+		resp := delegatedAccessResponse{PrincipalID: req.PrincipalID, LegalEntityID: req.LegalEntityID,
+			HasDelegatedAccess: delegationID != "", Basis: "no_delegated_grant", DelegationID: delegationID}
+		if delegationID != "" {
+			resp.Basis = "delegated:from=" + delegator
+		}
+		h.log.Info("delegated access evaluated (delegator-specific)",
+			zap.String("caller_principal_id", callerPrincipal), zap.String("subject_principal_id", req.PrincipalID),
+			zap.String("delegator_principal_id", delegator), zap.String("action_type", req.ActionType),
+			zap.Bool("has_delegated_access", resp.HasDelegatedAccess), zap.String("correlation_id", correlationID))
+		writeJSON(w, http.StatusOK, resp)
 		return
 	}
 
