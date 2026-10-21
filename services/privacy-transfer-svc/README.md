@@ -60,7 +60,7 @@ Enforced at the PostgreSQL level via trigger functions:
 - `transfer_decisions_append_only`: Prevents `UPDATE` or `DELETE` on transfer decision records.
 
 ### 2. Row-Level Security (RLS) & Multi-Tenancy
-`FORCE ROW LEVEL SECURITY` is applied to `processor_relationships`, `subprocessors`, `transfer_mechanisms`, `transfer_assessments`, `transfer_decisions`, `transfer_idempotency_keys` and `event_outbox`. Since migration `000005` **no policy has a `tenant_id IS NULL` exception**: a row is visible and writable only when its `tenant_id` equals the transaction-local `app.tenant_id`, so a row with no tenant is visible to nobody (it used to be visible to, and writable by, every tenant).
+`FORCE ROW LEVEL SECURITY` is applied to `processor_relationships`, `subprocessors`, `transfer_mechanisms`, `transfer_assessments`, `transfer_decisions`, `transfer_idempotency_keys` and `event_outbox`. Since migration `000005_strict_tenant_isolation` **no policy has a `tenant_id IS NULL` exception**: a row is visible and writable only when its `tenant_id` equals the transaction-local `app.tenant_id`, so a row with no tenant is visible to nobody (it used to be visible to, and writable by, every tenant).
 
 - The verified `X-Tenant-Id` is required on every request (`internal/middleware`, 401), and the store refuses to open a transaction without one.
 - A body `tenant_id` that differs from the verified header is `403`; records are always stamped with the verified tenant.
@@ -71,7 +71,7 @@ Enforced at the PostgreSQL level via trigger functions:
 All mutating APIs require `Idempotency-Key` (`X-Idempotency-Key` is an alias honoured everywhere, including the replay lookup):
 - **Scope:** (tenant, principal, key) — a key never replays another principal's response.
 - **Binding:** the stored hash covers method + path (the `/v1` prefix is normalised) + body; the same key on a different operation or payload is `409` `PRV-020: IMMUTABLE_EVIDENCE_CONFLICT`.
-- **Order:** authentication → tenant → correlation / key presence → authorization → replay lookup → validation → execution, so a revoked grant cannot replay a cached success.
+- **Order:** tenant (applied by the `TenantContext` middleware, which wraps every API route and so runs before the handler) → principal → correlation / key presence → authorization → replay lookup → validation → execution, so a revoked grant cannot replay a cached success. See "Mandatory request headers" for the exact order of the first two.
 - **Atomic:** the key claim, the business change, the outbox event and the stored replay response are one transaction. If any step fails nothing persists and a retry re-executes cleanly; concurrent identical requests execute exactly once.
 - **Fail closed:** an idempotency lookup failure refuses the request (`503`) — it never proceeds without the lookup — and a failed save fails the whole operation.
 - Replay returns the original body with `Idempotency-Replay: true`; refused attempts are not stored.
@@ -104,6 +104,8 @@ Every request is tenant-scoped by the verified `X-Tenant-Id` header — a missin
 | `X-Principal-Id` | `401 Unauthorized` | Verified actor; also forwarded to `authorization-svc`. |
 | `X-Correlation-ID` | `400 Bad Request` | §18.1 correlation ID; echoed into emitted events. |
 | `Idempotency-Key` (or `X-Idempotency-Key`) | `400 Bad Request` | §18.1 idempotency key (see §18.1 Idempotency Key Handling above). |
+
+**Order of the checks.** The tenant check is made by the `TenantContext` middleware, before the handler runs; the handler then checks the principal, then (mutating routes) the correlation id and the idempotency key, then the `authorization-svc` grant. A request with neither the tenant nor the principal is therefore refused for the **tenant** (`401`, "X-Tenant-Id header is required"); with a tenant but no principal, for the principal (`401`, "X-Principal-Id header is required"). ZS-SVC-W-001 §18.1 requires both headers but prescribes no order between them; this is the order the service applies. Both refusals are `401`, and nothing is read, written or authorized before both headers are present.
 
 Authentication, the §18.1 headers and the `authorization-svc` grant (on the caller's verified tenant) are decided **before** any lookup, so 404-vs-403 cannot be used to probe ids, and before any idempotency lookup, database mutation or event; body validation follows.
 
@@ -138,13 +140,30 @@ The specification names **no read permission**, and none was invented: each read
 
 ## §17.1 Reassessment triggers
 
-`EvaluateTransfer` and the trigger endpoint share one evaluation, so they cannot disagree. Triggers established from stored evidence: **1** a sensitive category (exact membership in the sensitive taxonomy, a local copy of the registry's — drift is a clarification item) the relationship was not registered for; **3** a destination outside the relationship's jurisdictions, or a **subprocessor attached after the latest assessment**; **4** a mechanism recorded after the assessment; **6** a minors subject class the relationship does not cover; **8** the assessment's review date has passed. Triggers **2** (new automated decisioning), **5** (material architecture change) and **7** (security/privacy incident) concern facts that originate in other systems and are recorded nowhere in this service, so they can only be **caller-declared** — a CROSS-SERVICE / EXTERNAL DEPENDENCY, not something this service can derive. A declared trigger must be one of the eight §17.1 names (anything else is `400`, never echoed into a reason code). Evidence lookups fail closed (an outage is a `503`, never "no trigger").
+`EvaluateTransfer` and the trigger endpoint use one evaluation (`computeTriggers`) **and the same stored evidence**: both read the relationship's latest assessment and its subprocessors whether or not `assessment_required` is set, so for the same inputs they report the same triggers (a derived trigger makes `EvaluateTransfer` return `REVIEW_REQUIRED` with that trigger's reason code, including trigger 8, `ASSESSMENT_EXPIRED`). `assessment_required` controls only the assessment **gate** — a missing assessment, a `REJECT` or `REMEDIATE` outcome, and an expired review date are enforced only when it is true — and whether the assessment's measures, `assessment_id` and review date enter the decision. Triggers established from stored evidence: **1** a sensitive category (exact membership in the sensitive taxonomy, a local copy of the registry's — drift is a clarification item) the relationship was not registered for; **3** a destination outside the relationship's jurisdictions, or a **subprocessor attached after the latest assessment**; **4** a mechanism recorded after the assessment; **6** a minors subject class the relationship does not cover; **8** the assessment's review date has passed. Triggers **2** (new automated decisioning), **5** (material architecture change) and **7** (security/privacy incident) concern facts that originate in other systems and are recorded nowhere in this service, so they can only be **caller-declared** — a CROSS-SERVICE / EXTERNAL DEPENDENCY, not something this service can derive. A declared trigger must be one of the eight §17.1 names (anything else is `400`, never echoed into a reason code). Evidence lookups fail closed (an outage is a `503`, never "no trigger").
 
 ---
 
 ## Registry integration (external dependency)
 
 `CreateRelationship` validates `purpose_activity_refs` against `privacy-purpose-registry-svc`. The caller's verified `X-Principal-Id` and `X-Tenant-Id` are forwarded; PRV-01 additionally requires a read grant for that principal in `authorization-svc`. Provisioning that grant is outside this service (**BLOCKED — EXTERNAL DEPENDENCY** for end-to-end verification; the client's behaviour is covered by unit tests against a stub registry only).
+
+---
+
+## Migrations
+
+`deployments/migrations` holds eight `*.up.sql` files. They are applied **in filename order** — the platform loader (`deployments/migrate.py`) sorts the file names and records each applied migration by its **full file name**, and the test harness sorts the same way — so the order is:
+
+1. `000001_initial_schema`
+2. `000002_immutability` — append-only and content-immutability triggers
+3. `000003_add_rls`
+4. `000004_idempotency_and_measures` — `transfer_idempotency_keys` and the assessment measures
+5. `000005_decision_conditions_and_expiry` — `conditions`, `expires_at` on decisions
+6. `000005_strict_tenant_isolation` — strict RLS, FORCE RLS, `tenant_id IS NOT NULL` checks (the "migration 000005" the sections above refer to)
+7. `000006_idempotency_principal_and_outbox` — principal in the idempotency key, `event_outbox`
+8. `000006_transfer_context` — the §16.1 transfer-context columns
+
+Two numeric prefixes are therefore shared (`000005` and `000006`, two files each). That is deliberate history, not a defect: the loader does not key on the number, the pairs touch different objects and apply correctly in name order, and renaming an already-applied file would make the loader treat it as new. New migrations should take the next unused number (`000007`).
 
 ---
 
@@ -160,7 +179,7 @@ $env:TEST_DATABASE_URL="postgres://postgres:pgsuper@localhost:55432/postgres?ssl
 $env:REQUIRE_DB_TESTS="1"
 go test -count=1 -v ./...
 ```
-Latest run: **with** the database 55 top-level tests pass, 0 skipped; **without** it 47 pass and 8 are skipped (the store tests) — a run without a database proves nothing about RLS, atomicity, the outbox or the migrations. Not performed: Docker rebuild, live compose stack, live `authorization-svc` / purpose registry, frontend.
+Latest run: **with** the database 62 top-level tests pass, 0 skipped (handler 54, store 8); **without** it 53 pass and 9 are skipped (8 store tests + 1 handler test that needs a real database) — a run without a database proves nothing about RLS, atomicity, the outbox or the migrations. Not performed: Docker rebuild, live compose stack, live `authorization-svc` / purpose registry, frontend.
 
 ---
 

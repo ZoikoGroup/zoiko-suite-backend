@@ -110,26 +110,44 @@ const documentColumns = `
 	residency_region_code, current_version, status, created_by_principal_id, created_at, updated_at,
 	declared_version, declared_at, declared_by_principal_id, superseded_by_document_id,
 	archived_at, archived_by_principal_id, archive_reason,
-	disposition_requested_at, disposition_requested_by_principal_id, disposition_reason
+	disposition_requested_at, disposition_requested_by_principal_id, disposition_reason,
+	row_version
 `
 
 func scanDocument(row pgx.Row, d *domain.Document) error {
+	if err := scanDocumentRow(row, d); err != nil {
+		return err
+	}
+	d.DocumentState = domain.DocumentStateFor(d.Status)
+	return nil
+}
+
+func scanDocumentRow(row pgx.Row, d *domain.Document) error {
 	return row.Scan(&d.DocumentID, &d.TenantID, &d.LegalEntityID, &d.Title, &d.Classification,
 		&d.RetentionPolicy, &d.ResidencyRegionCode, &d.CurrentVersion, &d.Status,
 		&d.CreatedByPrincipalID, &d.CreatedAt, &d.UpdatedAt,
 		&d.DeclaredVersion, &d.DeclaredAt, &d.DeclaredByPrincipalID, &d.SupersededByDocumentID,
 		&d.ArchivedAt, &d.ArchivedByPrincipalID, &d.ArchiveReason,
-		&d.DispositionRequestedAt, &d.DispositionRequestedByPrincipalID, &d.DispositionReason)
+		&d.DispositionRequestedAt, &d.DispositionRequestedByPrincipalID, &d.DispositionReason,
+		&d.RowVersion)
 }
 
 const versionColumns = `
 	document_version_id, document_id, version, checksum_sha256, storage_key, size_bytes,
-	content_type, created_by_principal_id, created_at
+	content_type, created_by_principal_id, created_at, detected_content_type
 `
 
 func scanVersion(row pgx.Row, v *domain.DocumentVersion) error {
-	return row.Scan(&v.DocumentVersionID, &v.DocumentID, &v.Version, &v.ChecksumSHA256, &v.StorageKey,
-		&v.SizeBytes, &v.ContentType, &v.CreatedByPrincipalID, &v.CreatedAt)
+	var detected *string
+	if err := row.Scan(&v.DocumentVersionID, &v.DocumentID, &v.Version, &v.ChecksumSHA256, &v.StorageKey,
+		&v.SizeBytes, &v.ContentType, &v.CreatedByPrincipalID, &v.CreatedAt, &detected); err != nil {
+		return err
+	}
+	v.DetectedContentType = ""
+	if detected != nil {
+		v.DetectedContentType = *detected
+	}
+	return nil
 }
 
 // CreateDocument inserts the document row and its first version in one
@@ -168,27 +186,14 @@ func (s *PgStore) createDocumentTx(ctx context.Context, tx pgx.Tx, tenantID stri
 	firstVersion.Version = 1
 	err = tx.QueryRow(ctx, `
 		INSERT INTO document_versions (document_id, version, checksum_sha256, storage_key, size_bytes,
-			content_type, created_by_principal_id)
-		VALUES ($1, 1, $2, $3, $4, $5, $6)
+			content_type, created_by_principal_id, detected_content_type)
+		VALUES ($1, 1, $2, $3, $4, $5, $6, $7)
 		RETURNING document_version_id, created_at
 	`, firstVersion.DocumentID, firstVersion.ChecksumSHA256, firstVersion.StorageKey, firstVersion.SizeBytes,
-		firstVersion.ContentType, firstVersion.CreatedByPrincipalID,
+		firstVersion.ContentType, firstVersion.CreatedByPrincipalID, nullableString(firstVersion.DetectedContentType),
 	).Scan(&firstVersion.DocumentVersionID, &firstVersion.CreatedAt)
 	if err != nil {
 		return fmt.Errorf("document store unavailable: %w", mapPgError(err))
-	}
-
-	if err := s.insertDocumentOutboxEvent(ctx, tx, "document.uploaded", doc.DocumentID, tenantID,
-		doc.LegalEntityID, doc.CreatedByPrincipalID, correlationID, map[string]any{
-			"document_id":     doc.DocumentID,
-			"tenant_id":       tenantID,
-			"legal_entity_id": doc.LegalEntityID,
-			"title":           doc.Title,
-			"classification":  string(doc.Classification),
-			"version":         firstVersion.Version,
-			"checksum_sha256": firstVersion.ChecksumSHA256,
-		}); err != nil {
-		return err
 	}
 
 	// BIZ-02: the uploader's classification choice is seeded as the
@@ -206,6 +211,26 @@ func (s *PgStore) createDocumentTx(ctx context.Context, tx pgx.Tx, tenantID stri
 	`, doc.DocumentID, tenantID, doc.LegalEntityID, string(doc.Classification), doc.CreatedByPrincipalID, nullableString(correlationID),
 	).Scan(&classificationID); err != nil {
 		return fmt.Errorf("document store unavailable: %w", err)
+	}
+	// §9.3: creating a document with its first version is two canonical events.
+	// document_created carries the classification_id of the candidate classification
+	// seeded above; document_version_committed carries the committed version and its
+	// hash and region. Both are written in this transaction, so neither exists
+	// unless the document and version do.
+	if err := s.insertDocumentOutboxEvent(ctx, tx, evtDocumentCreated, doc.DocumentID, tenantID,
+		doc.LegalEntityID, doc.CreatedByPrincipalID, correlationID, map[string]any{
+			"document_id":       doc.DocumentID,
+			"tenant_id":         tenantID,
+			"classification_id": classificationID,
+			"legal_entity_id":   doc.LegalEntityID,
+			"title":             doc.Title,
+			"classification":    string(doc.Classification),
+		}); err != nil {
+		return err
+	}
+	if err := s.insertDocumentOutboxEvent(ctx, tx, evtDocumentVersionCommitted, doc.DocumentID, tenantID,
+		doc.LegalEntityID, doc.CreatedByPrincipalID, correlationID, versionCommittedPayload(doc.DocumentID, tenantID, doc.LegalEntityID, firstVersion, doc.ResidencyRegionCode)); err != nil {
+		return err
 	}
 	return s.insertDocumentOutboxEvent(ctx, tx, "classification.proposed", doc.DocumentID, tenantID,
 		doc.LegalEntityID, doc.CreatedByPrincipalID, correlationID, map[string]any{
@@ -284,10 +309,11 @@ func (s *PgStore) addVersionTx(ctx context.Context, tx pgx.Tx, tenantID, documen
 	v.Version = nextVersion
 	err = tx.QueryRow(ctx, `
 		INSERT INTO document_versions (document_id, version, checksum_sha256, storage_key, size_bytes,
-			content_type, created_by_principal_id)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
+			content_type, created_by_principal_id, detected_content_type)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		RETURNING document_version_id, created_at
 	`, documentID, nextVersion, v.ChecksumSHA256, v.StorageKey, v.SizeBytes, v.ContentType, v.CreatedByPrincipalID,
+		nullableString(v.DetectedContentType),
 	).Scan(&v.DocumentVersionID, &v.CreatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("document store unavailable: %w", mapPgError(err))
@@ -304,14 +330,9 @@ func (s *PgStore) addVersionTx(ctx context.Context, tx pgx.Tx, tenantID, documen
 		return nil, fmt.Errorf("document store unavailable: %w", err)
 	}
 
-	if err := s.insertDocumentOutboxEvent(ctx, tx, "document.version_created", documentID, tenantID,
-		out.LegalEntityID, v.CreatedByPrincipalID, correlationID, map[string]any{
-			"document_id":     documentID,
-			"tenant_id":       tenantID,
-			"legal_entity_id": out.LegalEntityID,
-			"version":         v.Version,
-			"checksum_sha256": v.ChecksumSHA256,
-		}); err != nil {
+	if err := s.insertDocumentOutboxEvent(ctx, tx, evtDocumentVersionCommitted, documentID, tenantID,
+		out.LegalEntityID, v.CreatedByPrincipalID, correlationID,
+		versionCommittedPayload(documentID, tenantID, out.LegalEntityID, v, out.ResidencyRegionCode)); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -1021,4 +1042,29 @@ func ensureDocument(ctx context.Context, tx pgx.Tx, documentID, tenantID string)
 		return domain.ErrDocumentNotFound
 	}
 	return nil
+}
+
+// Canonical document events (ZS-SVC-S-001 §9.3), written to the outbox in the same
+// transaction as the change they announce.
+const (
+	evtDocumentCreated          = "document_created"
+	evtDocumentVersionCommitted = "document_version_committed"
+	evtRecordSuperseded         = "record_superseded"
+)
+
+// versionCommittedPayload is §9.3's document_version_committed:
+// version_id, document_id, content_hash, region. region is null when the document
+// has no residency region. The remaining keys are context this service has always
+// carried on its version event.
+func versionCommittedPayload(documentID, tenantID, legalEntityID string, v *domain.DocumentVersion, region *string) map[string]any {
+	return map[string]any{
+		"version_id":      v.DocumentVersionID,
+		"document_id":     documentID,
+		"content_hash":    v.ChecksumSHA256,
+		"region":          region,
+		"tenant_id":       tenantID,
+		"legal_entity_id": legalEntityID,
+		"version":         v.Version,
+		"checksum_sha256": v.ChecksumSHA256,
+	}
 }

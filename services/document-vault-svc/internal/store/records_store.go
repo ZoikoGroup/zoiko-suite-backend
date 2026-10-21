@@ -242,6 +242,19 @@ func (s *PgStore) CreateRecordRelationship(ctx context.Context, p domain.CreateR
 			}
 			return fmt.Errorf("document store unavailable: %w", mapPgError(err))
 		}
+		// §9.3: a SUPERSEDES relationship is the canonical record_superseded event
+		// (new_record_id, prior_record_id, relation_type). The other relationship
+		// types (§4.5) have no §9.3 event and keep record.relationship_created.
+		if p.RelationshipType == string(domain.RelationshipSupersedes) {
+			return s.insertRecordOutboxEvent(ctx, tx, evtRecordSuperseded, p.SourceRecordID, tenantID, sourceLegalEntityID,
+				p.CreatedByPrincipalID, "", map[string]any{
+					"new_record_id":   p.SourceRecordID,
+					"prior_record_id": p.TargetRecordID,
+					"relation_type":   p.RelationshipType,
+					"relationship_id": out.RelationshipID,
+					"tenant_id":       tenantID,
+				})
+		}
 		return s.insertRecordOutboxEvent(ctx, tx, "record.relationship_created", p.SourceRecordID, tenantID, sourceLegalEntityID,
 			p.CreatedByPrincipalID, "", map[string]any{
 				"relationship_id":   out.RelationshipID,

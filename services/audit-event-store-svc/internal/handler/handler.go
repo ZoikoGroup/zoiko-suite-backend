@@ -4,11 +4,14 @@ package handler
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -289,6 +292,23 @@ type createArchiveRequest struct {
 	ToSequence   int64 `json:"to_sequence"`
 }
 
+// archiveEndpoint is the idempotency scope's endpoint component.
+const archiveEndpoint = "POST /v1/archives"
+
+// maxIdempotencyKeyLen mirrors idempotency_keys.idempotency_key VARCHAR(255).
+// A longer key is a 400, not a database error.
+const maxIdempotencyKeyLen = 255
+
+// archiveFingerprint identifies a request for idempotency: the acting principal
+// and the archive range. With the principal folded in, a second principal
+// presenting the first one's key and body is a DIFFERENT request
+// (ErrIdempotencyMismatch), never a replay of someone else's response. The NUL
+// separators keep the fields distinct.
+func archiveFingerprint(principalID string, req createArchiveRequest) string {
+	sum := sha256.Sum256([]byte(principalID + "\x00" + strconv.FormatInt(req.FromSequence, 10) + "\x00" + strconv.FormatInt(req.ToSequence, 10)))
+	return hex.EncodeToString(sum[:])
+}
+
 func (h *Handler) createArchive(w http.ResponseWriter, r *http.Request) {
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
@@ -307,15 +327,33 @@ func (h *Handler) createArchive(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_body", err.Error())
 		return
 	}
+	// Idempotency (migration 000007). Reached only AFTER the principal is
+	// established, authorization has passed and the tenant is resolved, so a
+	// replay can never be answered to a caller who would be refused the
+	// original request. The key is scoped to the tenant by the store.
+	var idem *domain.Idempotency
+	if key := strings.TrimSpace(r.Header.Get(envelope.HeaderIdempotencyKey)); key != "" {
+		if len(key) > maxIdempotencyKeyLen {
+			writeError(w, http.StatusBadRequest, "invalid_idempotency_key",
+				"Idempotency-Key must be at most "+strconv.Itoa(maxIdempotencyKeyLen)+" characters")
+			return
+		}
+		idem = &domain.Idempotency{Key: key, Endpoint: archiveEndpoint, Fingerprint: archiveFingerprint(principalID, req)}
+	}
+
 	a, err := h.store.CreateArchive(r.Context(), domain.CreateArchiveParams{
 		FromSequence:         req.FromSequence,
 		ToSequence:           req.ToSequence,
 		TenantID:             tenantID,
 		CreatedByPrincipalID: principalID,
+		Idem:                 idem,
 	})
 	if err != nil {
 		writeStoreError(w, err)
 		return
+	}
+	if idem != nil && idem.Replayed {
+		w.Header().Set("X-Idempotent-Replay", "true")
 	}
 	writeJSON(w, http.StatusCreated, a)
 }
@@ -401,6 +439,8 @@ func writeStoreError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusBadRequest, "empty_range", err.Error())
 	case errors.Is(err, domain.ErrChainBroken):
 		writeError(w, http.StatusConflict, "chain_broken", err.Error())
+	case errors.Is(err, domain.ErrIdempotencyMismatch):
+		writeError(w, http.StatusConflict, "idempotency_mismatch", err.Error())
 	default:
 		writeError(w, http.StatusInternalServerError, "internal_error", "an unexpected error occurred")
 	}

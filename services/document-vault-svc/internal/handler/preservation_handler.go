@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 
@@ -58,6 +59,8 @@ func RegisterPreservationRoutes(r chi.Router, h *Handler, store PreservationStor
 		r.Post("/", ph.CreateRedactionProfile)
 		r.Get("/{redaction_id}", ph.GetRedactionProfile)
 	})
+	// ZS-SVC-S-001 §9.2: POST /v1/exports (recipient_scope and purpose required).
+	r.Post("/v1/exports", ph.CreateExport)
 	r.Route("/v1/export-packages", func(r chi.Router) {
 		r.Post("/", ph.CreateExportPackage)
 		r.Get("/{package_id}", ph.GetExportPackage)
@@ -335,10 +338,31 @@ type createExportPackageItemRequest struct {
 }
 
 type createExportPackageRequest struct {
-	Items []createExportPackageItemRequest `json:"items"`
+	RecipientScope string                           `json:"recipient_scope,omitempty"`
+	Purpose        string                           `json:"purpose,omitempty"`
+	Items          []createExportPackageItemRequest `json:"items"`
 }
 
+// maxExportLabelLen mirrors export_packages.recipient_scope / purpose VARCHAR(255).
+const maxExportLabelLen = 255
+
+// CreateExportPackage is the original route; recipient_scope and purpose are
+// optional on it.
 func (h *preservationHandler) CreateExportPackage(w http.ResponseWriter, r *http.Request) {
+	h.createExport(w, r, false)
+}
+
+// CreateExport is ZS-SVC-S-001 §9.2's POST /v1/exports: "Build controlled export
+// package. Recipient/purpose + exact scope + redaction policy." It is the same
+// builder, grant, transaction and event as CreateExportPackage; the difference is
+// that recipient_scope and purpose are REQUIRED. Scope is exact (items name
+// version or rendition ids, never "latest") and the redaction policy is each
+// item's redaction_id, as before.
+func (h *preservationHandler) CreateExport(w http.ResponseWriter, r *http.Request) {
+	h.createExport(w, r, true)
+}
+
+func (h *preservationHandler) createExport(w http.ResponseWriter, r *http.Request, recipientRequired bool) {
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
@@ -353,6 +377,20 @@ func (h *preservationHandler) CreateExportPackage(w http.ResponseWriter, r *http
 	if !decodeJSON(w, r, &req) {
 		return
 	}
+	if recipientRequired {
+		if strings.TrimSpace(req.RecipientScope) == "" {
+			writeError(w, http.StatusBadRequest, "missing_field", "recipient_scope")
+			return
+		}
+		if strings.TrimSpace(req.Purpose) == "" {
+			writeError(w, http.StatusBadRequest, "missing_field", "purpose")
+			return
+		}
+	}
+	if len(req.RecipientScope) > maxExportLabelLen || len(req.Purpose) > maxExportLabelLen {
+		writeError(w, http.StatusBadRequest, "invalid_request", "recipient_scope and purpose must be at most 255 characters")
+		return
+	}
 	items := make([]domain.ExportPackageItemInput, 0, len(req.Items))
 	for _, it := range req.Items {
 		items = append(items, domain.ExportPackageItemInput{
@@ -360,7 +398,7 @@ func (h *preservationHandler) CreateExportPackage(w http.ResponseWriter, r *http
 		})
 	}
 	pkg, err := h.store.CreateExportPackage(r.Context(), domain.CreateExportPackageParams{
-		RequestedByPrincipalID: principalID, Items: items,
+		RequestedByPrincipalID: principalID, RecipientScope: strings.TrimSpace(req.RecipientScope), Purpose: strings.TrimSpace(req.Purpose), Items: items,
 	})
 	if err != nil {
 		h.handlePreservationStoreError(w, err)

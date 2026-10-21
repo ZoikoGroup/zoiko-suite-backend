@@ -420,10 +420,21 @@ func (s *PgStore) GetRedactionProfile(ctx context.Context, redactionID string) (
 
 // ── Export Packages ──────────────────────────────────────────────────────────
 
-const exportPackageColumns = `package_id, tenant_id, requested_by_principal_id, package_hash, created_at`
+const exportPackageColumns = `package_id, tenant_id, requested_by_principal_id, package_hash, created_at, recipient_scope, purpose`
 
 func scanExportPackage(row pgx.Row, p *domain.ExportPackage) error {
-	return row.Scan(&p.PackageID, &p.TenantID, &p.RequestedByPrincipalID, &p.PackageHash, &p.CreatedAt)
+	var recipient, purpose *string
+	if err := row.Scan(&p.PackageID, &p.TenantID, &p.RequestedByPrincipalID, &p.PackageHash, &p.CreatedAt, &recipient, &purpose); err != nil {
+		return err
+	}
+	p.RecipientScope, p.Purpose = "", ""
+	if recipient != nil {
+		p.RecipientScope = *recipient
+	}
+	if purpose != nil {
+		p.Purpose = *purpose
+	}
+	return nil
 }
 
 const exportPackageItemColumns = `
@@ -544,10 +555,10 @@ func (s *PgStore) CreateExportPackage(ctx context.Context, p domain.CreateExport
 		packageHash := hex.EncodeToString(sum[:])
 
 		row := tx.QueryRow(ctx, `
-			INSERT INTO export_packages (tenant_id, requested_by_principal_id, package_hash)
-			VALUES ($1, $2, $3)
+			INSERT INTO export_packages (tenant_id, requested_by_principal_id, package_hash, recipient_scope, purpose)
+			VALUES ($1, $2, $3, $4, $5)
 			RETURNING `+exportPackageColumns,
-			tenantID, p.RequestedByPrincipalID, packageHash,
+			tenantID, p.RequestedByPrincipalID, packageHash, nullableString(p.RecipientScope), nullableString(p.Purpose),
 		)
 		if err := scanExportPackage(row, &out); err != nil {
 			return fmt.Errorf("document store unavailable: %w", mapPgError(err))
@@ -571,14 +582,21 @@ func (s *PgStore) CreateExportPackage(ctx context.Context, p domain.CreateExport
 
 		out.PackageHash = packageHash
 		out.Items = items
-		// recipient_scope is not modelled (an export carries no recipient or
-		// purpose today), so it is not invented.
+		// recipient_scope is the §9.3 export_package_created anchor; it (and the
+		// purpose, §6.5) is present when the caller supplied it.
+		payload := map[string]any{
+			"package_id":   out.PackageID,
+			"item_count":   len(items),
+			"package_hash": packageHash,
+		}
+		if p.RecipientScope != "" {
+			payload["recipient_scope"] = p.RecipientScope
+		}
+		if p.Purpose != "" {
+			payload["purpose"] = p.Purpose
+		}
 		return enqueueDRCEvent(ctx, tx, "EXPORT_PACKAGE", out.PackageID, evtExportPackageCreated, tenantID, "",
-			p.RequestedByPrincipalID, "", map[string]any{
-				"package_id":   out.PackageID,
-				"item_count":   len(items),
-				"package_hash": packageHash,
-			})
+			p.RequestedByPrincipalID, "", payload)
 	})
 	if err != nil {
 		return nil, err

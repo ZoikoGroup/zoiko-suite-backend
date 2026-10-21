@@ -414,6 +414,69 @@ func (s *PgStore) ListManifests(ctx context.Context, legalEntityID string, limit
 	return out, nil
 }
 
+// ListManifestLegalEntities returns the distinct legal entities that have a
+// manifest in the caller's tenant. The list route authorizes each one, so a
+// caller who names no legal entity is still only shown what they may read.
+func (s *PgStore) ListManifestLegalEntities(ctx context.Context) ([]string, error) {
+	var out []string
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `SELECT DISTINCT legal_entity_id::text FROM evidence_manifests WHERE tenant_id::text = $1 ORDER BY 1`,
+			svcmiddleware.TenantFromContext(ctx))
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var e string
+			if err := rows.Scan(&e); err != nil {
+				return err
+			}
+			out = append(out, e)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, fmt.Errorf("evidence manifest store unavailable: %w", err)
+	}
+	return out, nil
+}
+
+// ListManifestsForEntities is ListManifests restricted to a set of legal
+// entities, applied before pagination so a page is never short because rows
+// the caller may not read were dropped afterwards.
+func (s *PgStore) ListManifestsForEntities(ctx context.Context, legalEntityIDs []string, limit, offset int) ([]domain.EvidenceManifest, error) {
+	out := []domain.EvidenceManifest{}
+	if len(legalEntityIDs) == 0 {
+		return out, nil
+	}
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT manifest_id, tenant_id, legal_entity_id, scenario_type, requested_by, status,
+				checksum_sha256, failure_reason, requested_at, generated_at
+			FROM evidence_manifests
+			WHERE tenant_id::text = $1 AND legal_entity_id::text = ANY($2)
+			ORDER BY requested_at DESC LIMIT $3 OFFSET $4`,
+			svcmiddleware.TenantFromContext(ctx), legalEntityIDs, limit, offset)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var m domain.EvidenceManifest
+			if err := rows.Scan(&m.ManifestID, &m.TenantID, &m.LegalEntityID, &m.ScenarioType, &m.RequestedBy, &m.Status,
+				&m.ChecksumSHA256, &m.FailureReason, &m.RequestedAt, &m.GeneratedAt); err != nil {
+				return err
+			}
+			out = append(out, m)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, fmt.Errorf("evidence manifest store unavailable: %w", err)
+	}
+	return out, nil
+}
+
 // ListRecords reads a manifest's records, scoped to the caller's tenant.
 //
 // This was the worst of the unscoped reads: manifest_records has no

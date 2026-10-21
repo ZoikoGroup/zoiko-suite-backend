@@ -162,9 +162,14 @@ func codeForStatus(status int) string {
 	case http.StatusForbidden:
 		return domain.ErrCodeAuthorizationDenied
 	case http.StatusConflict:
-		return domain.ErrCodeIdempotencyMismatch
-	case http.StatusUnprocessableEntity:
+		// The only 409 that reaches this fallback is a refused lifecycle
+		// transition. An idempotency-key mismatch is always written with its
+		// own explicit code (writeReplay) and is never derived from the status.
 		return domain.ErrCodeInvalidTransition
+	case http.StatusUnprocessableEntity:
+		// Every 422 this service returns (PRV-001, PRV-008) is written with its
+		// own §32 code; this fallback is only a safety net for a bare 422.
+		return domain.ErrCodeValidationFailed
 	case http.StatusServiceUnavailable:
 		return domain.ErrCodeStoreUnavailable
 	default:
@@ -484,7 +489,7 @@ func (h *Handler) approveNoticeVersionInternal(w http.ResponseWriter, r *http.Re
 	})
 	if err != nil {
 		if errors.Is(err, domain.ErrInvalidNoticeTransition) {
-			writeError(w, http.StatusConflict, "version is not in the required DRAFT state")
+			writeCoded(w, http.StatusConflict, domain.ErrCodeInvalidTransition, "version is not in the required DRAFT state")
 			return
 		}
 		h.storeFailure(w, "ApproveNoticeVersion", err)
@@ -540,7 +545,7 @@ func (h *Handler) publishNoticeVersionInternal(w http.ResponseWriter, r *http.Re
 	})
 	if err != nil {
 		if errors.Is(err, domain.ErrInvalidNoticeTransition) {
-			writeError(w, http.StatusConflict, "version is not in the required APPROVED state")
+			writeCoded(w, http.StatusConflict, domain.ErrCodeInvalidTransition, "version is not in the required APPROVED state")
 			return
 		}
 		h.storeFailure(w, "PublishNoticeVersion", err)
@@ -574,7 +579,7 @@ func (h *Handler) withdrawNoticeVersionInternal(w http.ResponseWriter, r *http.R
 	})
 	if err != nil {
 		if errors.Is(err, domain.ErrInvalidNoticeTransition) {
-			writeError(w, http.StatusConflict, "version is not in the required PUBLISHED state")
+			writeCoded(w, http.StatusConflict, domain.ErrCodeInvalidTransition, "version is not in the required PUBLISHED state")
 			return
 		}
 		h.storeFailure(w, "WithdrawNoticeVersion", err)

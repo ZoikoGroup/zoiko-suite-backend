@@ -28,6 +28,8 @@ const (
 	evtLegalHoldActivated        = "legal_hold_activated"
 	evtLegalHoldTargetAdded      = "legal_hold_target_added"
 	evtLegalHoldReleased         = "legal_hold_released"
+	evtLegalHoldPartialApplied   = "legal_hold_partial_application"
+	evtRetentionConflict         = "retention_conflict_detected"
 	evtRenditionCreated          = "rendition_created"
 	evtIntegrityCheckFailed      = "integrity_check_failed"
 	evtExportPackageCreated      = "export_package_created"

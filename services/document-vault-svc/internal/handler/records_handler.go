@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"errors"
+	"strings"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
@@ -33,10 +34,15 @@ func RegisterRecordsRoutes(r chi.Router, h *Handler, recordsStore RecordsStore) 
 	r.Route("/v1/records", func(r chi.Router) {
 		r.Post("/", rh.DeclareRecord)
 		r.Get("/{record_id}", rh.GetRecord)
+		// ZS-SVC-S-001 §9.2: POST /v1/records/{id}:supersede.
+		r.Post("/{record_id}:supersede", rh.SupersedeRecord)
 		r.Get("/by-version/{document_version_id}", rh.GetRecordByDocumentVersion)
 		r.Post("/{record_id}/relationships", rh.CreateRecordRelationship)
 		r.Get("/{record_id}/relationships", rh.ListRecordRelationships)
 	})
+	// ZS-SVC-S-001 §9.2: POST /v1/records:declare — the same handler as POST
+	// /v1/records, so there is one declaration path.
+	r.Post("/v1/records:declare", rh.DeclareRecord)
 }
 
 type recordsHandler struct {
@@ -103,11 +109,23 @@ func (h *recordsHandler) DeclareRecord(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.RecordClass == "" {
-		writeError(w, http.StatusBadRequest, "missing_field", "record_class")
+		writeError(w, http.StatusBadRequest, "missing_field", "DRC-005: RECORD_DECLARATION_INCOMPLETE: record_class")
 		return
 	}
 	if req.JurisdictionScope == "" {
-		writeError(w, http.StatusBadRequest, "missing_field", "jurisdiction_scope")
+		writeError(w, http.StatusBadRequest, "missing_field", "DRC-005: RECORD_DECLARATION_INCOMPLETE: jurisdiction_scope")
+		return
+	}
+
+	// §4.2 "Business context: domain object, record purpose and declared record
+	// class are complete" -> Block; §4.3 makes declaration_reason a mandatory
+	// field. DRC-005 RECORD_DECLARATION_INCOMPLETE.
+	if strings.TrimSpace(req.BusinessContext) == "" {
+		writeError(w, http.StatusBadRequest, "missing_field", "DRC-005: RECORD_DECLARATION_INCOMPLETE: business_context")
+		return
+	}
+	if strings.TrimSpace(req.DeclarationReason) == "" {
+		writeError(w, http.StatusBadRequest, "missing_field", "DRC-005: RECORD_DECLARATION_INCOMPLETE: declaration_reason")
 		return
 	}
 

@@ -34,6 +34,10 @@ func requireTestDB(t *testing.T) *pgxpool.Pool {
 
 	// Fresh schema per test run.
 	_, err = pool.Exec(context.Background(), `
+		DROP TABLE IF EXISTS legal_hold_resolutions;
+		DROP FUNCTION IF EXISTS reject_legal_hold_resolution_mutation() CASCADE;
+		DROP TABLE IF EXISTS upload_reservations;
+		DROP FUNCTION IF EXISTS reject_upload_reservation_mutation() CASCADE;
 		DROP TABLE IF EXISTS document_idempotency_keys;
 		DROP TABLE IF EXISTS export_package_items;
 		DROP TABLE IF EXISTS export_packages;
@@ -846,8 +850,8 @@ func TestPgStore_AddVersion_UnknownDocument_ReturnsNotFound(t *testing.T) {
 }
 
 // TestPgStore_CreateDocument_InsertsOutboxEventAtomically is the real
-// proof of Wave 1 (BIZ-01 events): CreateDocument must leave a
-// document.uploaded row in outbox_events, written in the SAME transaction
+// proof of Wave 1 (BIZ-01 events): CreateDocument must leave its §9.3
+// document_created / document_version_committed rows in outbox_events, written in the SAME transaction
 // as the document/version insert — see internal/outbox's own package doc.
 func TestPgStore_CreateDocument_InsertsOutboxEventAtomically(t *testing.T) {
 	pool := requireTestDB(t)
@@ -863,16 +867,25 @@ func TestPgStore_CreateDocument_InsertsOutboxEventAtomically(t *testing.T) {
 		ContentType: "text/plain", CreatedByPrincipalID: "principal-1"}
 	require.NoError(t, s.CreateDocument(tenantCtx(), doc, v, "corr-outbox-1"))
 
-	var eventType, aggregateID, correlationID string
-	var publishedAt *string
-	err := pool.QueryRow(context.Background(),
-		`SELECT event_type, aggregate_id, correlation_id, published_at::text FROM outbox_events WHERE aggregate_id = $1`,
-		doc.DocumentID).Scan(&eventType, &aggregateID, &correlationID, &publishedAt)
-	require.NoError(t, err, "expected exactly one outbox_events row for this document")
-	require.Equal(t, "document.uploaded", eventType)
-	require.Equal(t, doc.DocumentID, aggregateID)
-	require.Equal(t, "corr-outbox-1", correlationID)
-	require.Nil(t, publishedAt, "a freshly-inserted event must be unpublished until the relay picks it up")
+	rows, err := pool.Query(context.Background(),
+		`SELECT event_type, aggregate_id, correlation_id, published_at::text FROM outbox_events WHERE aggregate_id = $1 ORDER BY event_type`,
+		doc.DocumentID)
+	require.NoError(t, err)
+	defer rows.Close()
+	var types []string
+	for rows.Next() {
+		var eventType, aggregateID, correlationID string
+		var publishedAt *string
+		require.NoError(t, rows.Scan(&eventType, &aggregateID, &correlationID, &publishedAt))
+		types = append(types, eventType)
+		require.Equal(t, doc.DocumentID, aggregateID)
+		require.Equal(t, "corr-outbox-1", correlationID)
+		require.Nil(t, publishedAt, "a freshly-inserted event must be unpublished until the relay picks it up")
+	}
+	require.NoError(t, rows.Err())
+	// ZS-SVC-S-001 §9.3: document_created and document_version_committed replace
+	// the old document.uploaded; the BIZ-02 classification proposal is unchanged.
+	require.ElementsMatch(t, []string{"classification.proposed", "document_created", "document_version_committed"}, types)
 }
 
 // TestPgStore_AddVersion_InsertsOutboxEventAtomically mirrors the create
@@ -898,10 +911,10 @@ func TestPgStore_AddVersion_InsertsOutboxEventAtomically(t *testing.T) {
 
 	var count int
 	err = pool.QueryRow(context.Background(),
-		`SELECT COUNT(*) FROM outbox_events WHERE aggregate_id = $1 AND event_type = 'document.version_created'`,
+		`SELECT COUNT(*) FROM outbox_events WHERE aggregate_id = $1 AND event_type = 'document_version_committed'`,
 		doc.DocumentID).Scan(&count)
 	require.NoError(t, err)
-	require.Equal(t, 1, count, "expected exactly one document.version_created event")
+	require.Equal(t, 2, count, "document_version_committed once for version 1 and once for version 2")
 }
 
 func TestPgStore_RecordAccess_IsAppendOnly(t *testing.T) {

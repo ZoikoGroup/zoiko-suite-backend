@@ -1,0 +1,10 @@
+DROP TRIGGER IF EXISTS trg_reject_legal_hold_resolution_mutation ON legal_hold_resolutions;
+DROP FUNCTION IF EXISTS reject_legal_hold_resolution_mutation();
+DROP TABLE IF EXISTS legal_hold_resolutions;
+DROP TRIGGER IF EXISTS trg_reject_upload_reservation_mutation ON upload_reservations;
+DROP FUNCTION IF EXISTS reject_upload_reservation_mutation();
+DROP TABLE IF EXISTS upload_reservations;
+ALTER TABLE record_retention_states DROP COLUMN IF EXISTS disposition_approval_ref;
+ALTER TABLE export_packages DROP COLUMN IF EXISTS purpose;
+ALTER TABLE export_packages DROP COLUMN IF EXISTS recipient_scope;
+ALTER TABLE document_versions DROP COLUMN IF EXISTS detected_content_type;

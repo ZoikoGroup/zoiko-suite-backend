@@ -68,6 +68,7 @@ func (p *KafkaPublisher) PublishCommentAdded(ctx context.Context, correlationID,
 	p.emit(ctx, "comment.added", correlationID, actorID, tenantID, legalEntityID, c.CommentID, map[string]any{
 		"comment_id": c.CommentID, "thread_id": t.ThreadID,
 		"linked_object_type": t.LinkedObjectType, "linked_object_id": t.LinkedObjectID,
+		"classification": t.Classification,
 	})
 }
 

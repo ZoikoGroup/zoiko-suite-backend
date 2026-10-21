@@ -132,6 +132,8 @@ func main() {
 	handler.RegisterRoutes(r, h)
 	handler.RegisterEvidenceRoutes(r, h, pgStore)
 	handler.RegisterRecordsRoutes(r, h, pgStore)
+	handler.RegisterVersionRoutes(r, h, pgStore)
+	handler.RegisterUploadReservationRoutes(r, h, pgStore)
 	handler.RegisterRetentionRoutes(r, h, pgStore)
 	handler.RegisterPreservationRoutes(r, h, pgStore)
 

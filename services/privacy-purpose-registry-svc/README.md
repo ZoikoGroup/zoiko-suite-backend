@@ -60,7 +60,7 @@ The `authorization-svc` client caches GRANTED/DENIED decisions for up to **5 sec
 | Path | Method | Action | Description |
 |---|---|---|---|
 | `/privacy/purposes` | `POST` | `PRIVACY_PURPOSE_CREATE` | Create purpose and initial draft version |
-| `/privacy/purposes` | `GET` | `PRIVACY_PURPOSE_READ` | List currently `PUBLISHED` purposes |
+| `/privacy/purposes` | `GET` | `PRIVACY_PURPOSE_READ` | List the currently published purposes: one row per purpose, the published version **in force now** (the version `GET /privacy/purposes/{id}` resolves with no parameters). Superseded versions, published versions whose `effective_from` is still in the future, and drafts are not listed. |
 | `/privacy/purposes/{id}?as_of=&known_as_of=` | `GET` | `PRIVACY_PURPOSE_READ` | Resolve the published version in force |
 | `/privacy/purposes/{id}/versions` | `POST` | `PRIVACY_PURPOSE_CREATE` | Create successor draft from a parent version |
 | `/privacy/purposes/{id}/versions/{vid}/publish` | `POST` | `PRIVACY_PURPOSE_PUBLISH` | Publish (maker-checker, immutable) |
@@ -90,7 +90,7 @@ The canonical (no version segment) forms act on the latest version, resolved onl
 |---|---|---|---|
 | `/privacy/ropa?role=&jurisdiction=` | `GET` | `PRIVACY_ROPA_READ` | `ACTIVE` versions in force, filtered by role (`CONTROLLER`/`PROCESSOR`/`JOINT_CONTROLLER`) and jurisdiction |
 
-`/healthz` and `/readyz` are unauthenticated.
+`/healthz` and `/readyz` are unauthenticated. `/healthz` answers `200 {"status":"ok"}`; `/readyz` answers `200 {"status":"ready"}`, or `503` with the standard error envelope (`STORE_UNAVAILABLE`) when the database pool is missing or does not answer.
 
 The three `*_READ` action names are this service's: §8.1 limits callers to privacy admins, approved domain owners, the change pipeline and compliance services but names no permission.
 
@@ -160,7 +160,7 @@ Every lifecycle change also writes an append-only row to `activity_lifecycle_aud
 
 ## Error contract (§32)
 
-Every error is `{"error": "...", "error_code": "..."}`; an activation refusal adds `findings`. §32 codes keep their §32 meaning: `PRV-001` (unknown/unpublished purpose), `PRV-002` (no governing activity version), `PRV-020` (re-publishing an immutable published purpose), plus the finding codes above. The remaining codes are local because §32 names none for them: `AUTHENTICATION_FAILED`, `AUTHORIZATION_DENIED`, `AUTHORIZATION_SERVICE_UNAVAILABLE`, `TENANT_SCOPE_REQUIRED`, `TENANT_SCOPE_MISMATCH`, `PLATFORM_SCOPE_REQUIRED`, `IDEMPOTENCY_KEY_REQUIRED`, `IDEMPOTENCY_MISMATCH`, `CORRELATION_ID_REQUIRED`, `INVALID_TRANSITION`, `SOD_DENIED`, `INVALID_AS_OF`, `EFFECTIVE_TIME_INVALID`, `VALIDATION_FAILED`, `NOT_FOUND`, `STORE_UNAVAILABLE`, `INTERNAL_ERROR`.
+Every error is `{"error": "...", "error_code": "..."}`; an activation refusal adds `findings`. §32 codes keep their §32 meaning: `PRV-001` (unknown/unpublished purpose), `PRV-002` (no governing activity version), `PRV-020` (re-publishing an immutable published purpose), plus the finding codes above. The remaining codes are local because §32 names none for them: `AUTHENTICATION_FAILED`, `AUTHORIZATION_DENIED`, `AUTHORIZATION_SERVICE_UNAVAILABLE`, `TENANT_SCOPE_REQUIRED`, `TENANT_SCOPE_MISMATCH`, `PLATFORM_SCOPE_REQUIRED`, `IDEMPOTENCY_KEY_REQUIRED`, `IDEMPOTENCY_MISMATCH`, `CORRELATION_ID_REQUIRED`, `INVALID_TRANSITION`, `SOD_DENIED`, `INVALID_AS_OF`, `EFFECTIVE_TIME_INVALID`, `VALIDATION_FAILED`, `NOT_FOUND`, `METHOD_NOT_ALLOWED`, `STORE_UNAVAILABLE`, `INTERNAL_ERROR`. **Transport-level errors use the same envelope.** An unknown route is `404 NOT_FOUND`, a known path with an unsupported method is `405 METHOD_NOT_ALLOWED` (with an `Allow` header), a panic recovered in a handler is `500 INTERNAL_ERROR` (the panic value and stack go to the log, never to the caller), and a failed `/readyz` is `503 STORE_UNAVAILABLE`. The one boundary: a malformed request that Go's `net/http` server rejects before routing (invalid request line, over-large headers) gets `net/http`'s own plain-text response; that layer is not service code.
 
 ---
 
@@ -191,13 +191,13 @@ curl http://localhost:8151/healthz
 curl http://localhost:8151/readyz
 ```
 
-Latest run (database reachable): **80 top-level tests pass, none skipped** (domain 4, handler 50, store 26). If the database is unreachable the integration tests skip (a run without one proves nothing about RLS, the outbox, atomic idempotency or the migrations). If `TEST_DATABASE_URL` is unset the integration tests fall back to `postgres://postgres:pgsuper@localhost:55432/postgres`. The server aborts on startup if the database is unreachable.
+Latest run (database reachable): **95 top-level tests pass, none skipped** (domain 4, handler 62, store 29). If the database is unreachable the integration tests skip (a run without one proves nothing about RLS, the outbox, atomic idempotency or the migrations). If `TEST_DATABASE_URL` is unset the integration tests fall back to `postgres://postgres:pgsuper@localhost:55432/postgres`. The server aborts on startup if the database is unreachable.
 
 ---
 
 ## Dependency-blocked items
 
-- **`privacy-consent-svc`, `privacy-decision-svc`, `privacy-transfer-svc`** call `GET /privacy/purposes/{id}` and `GET /privacy/processing-activities/{id}`. Their clients now forward the caller's verified `X-Principal-Id` and `X-Tenant-Id`; the calls still return `401`/`403` until that principal holds `PRIVACY_PURPOSE_READ` / `PRIVACY_ACTIVITY_READ` in `authorization-svc`, and a service-to-service identity for callers without an end-user principal is not defined by the architecture. Neither is provisioned here; end-to-end behaviour was not verified against live services.
+- **`privacy-consent-svc`, `privacy-decision-svc`, `privacy-transfer-svc`** call `GET /privacy/purposes/{id}` and `GET /privacy/processing-activities/{id}`. Their clients forward the calling request's `X-Tenant-Id` and, when it has one, its `X-Principal-Id` (a call with no principal is refused `401` here); the calls still return `401`/`403` until that principal holds `PRIVACY_PURPOSE_READ` / `PRIVACY_ACTIVITY_READ` in `authorization-svc`, and a service-to-service identity for callers without an end-user principal is not defined by the architecture. Neither is provisioned here; end-to-end behaviour was not verified against live services.
 - **`authorization-svc`** must provision `PRIVACY_PURPOSE_READ`, `PRIVACY_ACTIVITY_READ`, `PRIVACY_ROPA_READ` and the platform-scope grant for platform-plane principals; until then reads fail closed with `403`. Platform-scope authorization against the live service was not verified.
 - **Frontend** must send the new content fields (`privacy_owner`, `necessity_rationale`, `special_condition_refs`, `processor_refs`), may select the platform scope, and must stop sending a free `effective_from` on activation.
 - **WFC (§2.1/§9.1)** owns workflow timers, approval orchestration and escalation; none is integrated.

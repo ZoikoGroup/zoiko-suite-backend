@@ -133,14 +133,8 @@ func (p Projection) document() map[string]any {
 // verification in §8.2 depends on, since it proves invisibility by searching
 // for the thing it just removed.
 func (c *client) IndexProjection(ctx context.Context, physicalIndex string, p Projection) error {
-	if p.DocID == "" {
-		return errors.New("searchclient: IndexProjection: DocID must not be empty")
-	}
-	if p.TenantID == "" {
-		return ErrTenantIDRequired
-	}
-	if p.SourceType == "" || p.SourceID == "" {
-		return errors.New("searchclient: IndexProjection: SourceType and SourceID must not be empty")
+	if err := p.validate("IndexProjection"); err != nil {
+		return err
 	}
 
 	body, err := json.Marshal(p.document())
@@ -183,11 +177,8 @@ var ErrProjectionExists = errors.New("searchclient: projection already exists")
 // one. Without it, a backfill that read the ledger a moment before a live
 // update would write the older state over the newer.
 func (c *client) CreateProjection(ctx context.Context, physicalIndex string, p Projection) error {
-	if p.DocID == "" {
-		return errors.New("searchclient: CreateProjection: DocID must not be empty")
-	}
-	if p.TenantID == "" {
-		return ErrTenantIDRequired
+	if err := p.validate("CreateProjection"); err != nil {
+		return err
 	}
 	body, err := json.Marshal(p.document())
 	if err != nil {

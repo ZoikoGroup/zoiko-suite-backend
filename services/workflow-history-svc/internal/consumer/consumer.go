@@ -5,11 +5,14 @@
 //
 //   - Evidence services are read-only consumers of every other domain's events.
 //     They NEVER mutate the source truth of any other service.
+//
 //   - Every consumer handler is idempotent: the store layer guarantees that
 //     two deliveries of the same event_id produce exactly one stored row.
+//
 //   - Malformed events (missing required fields) are rejected and logged.
 //     They are NOT stored partially and they do NOT crash the consumer loop.
 //     Failure mode: fail-safe / degrade per event, not per consumer.
+//
 //   - For non-started events (approval.granted, approval.rejected,
 //     workflow.escalated, workflow.completed) the payload does not carry
 //     tenant_id or legal_entity_id (verified from workflow-svc/internal/events/
@@ -36,6 +39,7 @@ package consumer
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"go.uber.org/zap"
@@ -47,13 +51,26 @@ import (
 // (see workflow-svc/internal/events/publisher.go).
 // Every event arriving on the Kafka topic is expected to conform to this shape.
 type envelope struct {
-	EventType     string          `json:"event_type"`
-	EmittedAt     string          `json:"emitted_at"` // RFC3339 string from producer
-	SchemaVersion string          `json:"schema_version"`
-	SourceService string          `json:"source_service"`
-	CorrelationID string          `json:"correlation_id"`
-	Payload       json.RawMessage `json:"payload"`
+	EventType     string `json:"event_type"`
+	EmittedAt     string `json:"emitted_at"` // RFC3339 string from producer
+	SchemaVersion string `json:"schema_version"`
+	SourceService string `json:"source_service"`
+	CorrelationID string `json:"correlation_id"`
+	// TenantID is the envelope-level tenant (Doc 03 §19: every published event
+	// carries a tenant ID; workflow-svc's publisher sets it, `omitempty`, on every
+	// workflow event). When present it is checked against the tenant this service
+	// would store the event under — see ErrEnvelopeTenantMismatch.
+	TenantID string          `json:"tenant_id"`
+	Payload  json.RawMessage `json:"payload"`
 }
+
+// ErrEnvelopeTenantMismatch is returned when an event's envelope tenant_id
+// disagrees with the tenant context the consumer would store it under (the
+// payload tenant for workflow.started, the tenant inherited from the stored
+// workflow.started row for every other event). Nothing is stored. The runner
+// treats it like any other Handle error: bounded retries, then the message is
+// dead-lettered unchanged — that dead-letter record is the quarantine.
+var ErrEnvelopeTenantMismatch = errors.New("envelope tenant_id does not match the workflow's tenant context")
 
 // workflowStartedPayload is the payload for the workflow.started event.
 // This is the ONLY workflow event type that carries tenant_id and legal_entity_id.
@@ -214,6 +231,16 @@ func (c *Consumer) handleWorkflowStarted(ctx context.Context, eventID string, en
 		return nil
 	}
 
+	// The envelope tenant, when present, must agree with the payload tenant the
+	// row is stored under.
+	if env.TenantID != "" && env.TenantID != p.TenantID {
+		c.log.Error("rejected: workflow.started envelope tenant_id differs from payload tenant_id",
+			zap.String("event_id", eventID),
+			zap.String("workflow_instance_id", p.WorkflowInstanceID),
+		)
+		return fmt.Errorf("handleWorkflowStarted: event %q instance %q: %w", eventID, p.WorkflowInstanceID, ErrEnvelopeTenantMismatch)
+	}
+
 	evt := store.WorkflowHistoryEvent{
 		EventID:            eventID,
 		WorkflowInstanceID: p.WorkflowInstanceID,
@@ -278,6 +305,22 @@ func (c *Consumer) handleWorkflowTransition(ctx context.Context, eventID string,
 		return fmt.Errorf("handleWorkflowTransition: no tenant context found for workflow_instance_id %q"+
 			" (workflow.started event not yet persisted — will retry)",
 			p.WorkflowInstanceID)
+	}
+
+	// Envelope tenant integrity. A non-started event carries no tenant in its
+	// payload, so it is filed under the tenant of its instance's started row. If
+	// the producer also stamped a tenant on the envelope it must be that same
+	// tenant; a different one means this event is either misrouted or naming
+	// another tenant's instance id, and it is refused, not filed. An envelope
+	// with no tenant cannot be checked and is accepted as before (workflow-svc
+	// marks the field omitempty rather than fabricating a default).
+	if env.TenantID != "" && env.TenantID != tc.TenantID {
+		c.log.Error("rejected: envelope tenant_id does not match the workflow's tenant context",
+			zap.String("event_id", eventID),
+			zap.String("event_type", env.EventType),
+			zap.String("workflow_instance_id", p.WorkflowInstanceID),
+		)
+		return fmt.Errorf("handleWorkflowTransition: event %q instance %q: %w", eventID, p.WorkflowInstanceID, ErrEnvelopeTenantMismatch)
 	}
 
 	evt := store.WorkflowHistoryEvent{

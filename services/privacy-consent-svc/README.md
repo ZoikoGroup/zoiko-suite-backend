@@ -118,11 +118,13 @@ a platform-wide write.
 `Idempotency-Key` and `X-Correlation-ID` are mandatory on every mutating
 route (400 if missing), backed by `consent_idempotency_keys` (RLS-protected).
 
+Authentication, tenant, correlation and the `authorization-svc` grant (steps 1–4 of [Request ordering](#request-ordering)) all run **before** the replay lookup, so a replay can never bypass them.
+
 - **Scope:** (tenant, principal, key) — a key never replays another principal's response.
 - **Binding:** the stored hash covers method + path + body. The same key on a different operation or payload is `409 IDEMPOTENCY_MISMATCH`.
 - **Atomic:** the key claim, the evidence row(s), the `privacy.consent.changed` / `privacy.notice.published` outbox event and the stored replay response are written in **one transaction** (`store.RunIdempotent`; every store call made by the operation joins it). If any step fails — including saving the idempotency record — **nothing persists**, so a retry re-executes cleanly. Concurrent identical requests execute exactly once; the others replay the winner's response.
 - **Fail closed:** a lookup failure → `503 STORE_UNAVAILABLE` and the request is **not executed**.
-- A refused operation (404, 409, 422 …) stores nothing and does not consume the key.
+- A refused or failed operation (404, 409, 422, a store error, a failed commit) stores nothing — not the evidence, not the event, not the key — so the same key can simply be retried and re-executes. Only a successful commit makes a key replayable.
 - A replay returns the original response with `Idempotency-Replay: true`. (The former `500 IDEMPOTENCY_RECORD_NOT_SAVED` / `committed: true` outcome no longer exists: there is no longer a window in which the operation has committed but its record has not.)
 
 ## Preference effective time
@@ -192,24 +194,25 @@ are never touched.
 - `NoticeVersion.published_by_principal_id` / `published_at` record who
   actually published a version — distinct from maker and checker.
 
-## Idempotency & correlation (§18.1)
+## Error contract
 
-`Idempotency-Key` and `X-Correlation-ID` are mandatory on every mutating
-route (400 if missing), backed by `consent_idempotency_keys`
-(RLS-protected). A replay with the same key and body returns the original
-response with `Idempotency-Replay: true`; a different body under the same key
-returns `409 IDEMPOTENCY_MISMATCH`.
+Every error a handler writes is `{"error": "...", "error_code": "..."}`.
 
-It fails safe:
+| Status | `error_code` | Meaning |
+|---|---|---|
+| 400 | `CORRELATION_ID_REQUIRED`, `IDEMPOTENCY_KEY_REQUIRED`, `VALIDATION_FAILED`, `IMPORT_PROVENANCE_REQUIRED` | missing header / invalid body or parameter / incomplete offline-import provenance |
+| 401 | `AUTHENTICATION_FAILED`, `TENANT_SCOPE_REQUIRED` | no principal / no tenant |
+| 403 | `AUTHORIZATION_DENIED`, `SOD_DENIED`, `TENANT_SCOPE_MISMATCH` | no grant / maker-checker violation / body tenant differs from the verified one |
+| 404 | `NOT_FOUND` | unknown (or foreign-tenant) resource |
+| 409 | `INVALID_TRANSITION` | a refused **notice lifecycle transition**: approve needs `DRAFT`, publish needs `APPROVED`, withdraw needs `PUBLISHED` |
+| 409 | `IDEMPOTENCY_MISMATCH` | the `Idempotency-Key` was already used with a different method, path or body |
+| 422 | `PRV-001`, `PRV-008` | purpose not registered/published; notice version not a currently PUBLISHED one (§32) |
+| 503 | `STORE_UNAVAILABLE`, `AUTHORIZATION_SERVICE_UNAVAILABLE`, `UPSTREAM_UNAVAILABLE` | store, authorization-svc or purpose registry unavailable (fail closed) |
+| 500 | `INTERNAL_ERROR` | response could not be serialised |
 
-- **Lookup failure** → `503 STORE_UNAVAILABLE`, and the request is **not
-  executed**. It no longer proceeds without replay protection.
-- **Save failure after the operation committed** → `500
-  IDEMPOTENCY_RECORD_NOT_SAVED` with `committed: true` and the committed
-  `result`. It is no longer ignored. A retry with the same key will **not** be
-  recognised as a replay; consent and withdrawal/invalidation are naturally
-  idempotent (PRV-N04/N05), other creates are not — see
-  [Remaining limitations](#remaining-limitations).
+The two `409`s share a status and are told apart **only** by `error_code`: a lifecycle refusal is never reported as an idempotency conflict, and an idempotency conflict is never derived from the status (it is written with its own code). `ALREADY_WITHDRAWN` and `ALREADY_INVALIDATED` are defined but not produced: a repeated withdrawal or invalidation returns the original record (PRV-N05).
+
+**Not in this envelope** — framework-level responses outside the handlers: the router's plain-text `404`/`405` for an unknown route or method, the empty `500` of the panic recoverer, the `/readyz` `503` body, and requests that Go's `net/http` rejects before routing.
 
 ## Events & delivery
 
@@ -317,6 +320,7 @@ These are **not** implemented by this service, and none is claimed as working.
   `consent_request`.
 - Receipts and legacy rows written before migration `000006` / the `v2`
   digest are described above; they are not migrated.
+- **At most one `PUBLISHED` version per notice is not enforced — NEEDS CLARIFICATION / DESIGN DECISION.** Publishing supersedes the currently `PUBLISHED` version and then publishes the target, with no lock and no unique index. ZS-SVC-W-001 does not state this invariant (§10.1 asks for an effective window and supersession chain; §6 only that a receipt bind an exact published version), so none was added. Investigated on 2026-10-21 against real PostgreSQL: two concurrent publishes of two `APPROVED` versions of one notice ended with two `PUBLISHED` versions in 24 of 25 rounds. Effects today: `GET /privacy/notices/{id}` and the canonical presentation route pick the `PUBLISHED` version with the latest `effective_from`; receipts still bind an exact `PUBLISHED` version.
 - `GetNotice` treats an unparseable `as_of` as "now" (the registry rejects it
   with `400`); the consent documentation does not specify which is wanted —
   needs clarification.
@@ -336,8 +340,8 @@ go vet ./...
 go build ./...
 ```
 
-With the database: **141 top-level tests pass, none skipped** (+ subtests; domain 7, handler 88, outbox 10, purposeregistry 3, store 33 — counted across all packages).
-**Without** `TEST_DATABASE_URL`: 103 pass and **38 skip** — the row-level
+With the database: **147 top-level tests pass, none skipped** (+ subtests; domain 7, handler 94, outbox 10, purposeregistry 3, store 33 — counted across all packages).
+**Without** `TEST_DATABASE_URL`: 109 pass and **38 skip** — the row-level
 security, outbox, notice-binding and store-level evidence tests are among the
 skipped, so a run without the database does **not** prove tenant isolation.
 

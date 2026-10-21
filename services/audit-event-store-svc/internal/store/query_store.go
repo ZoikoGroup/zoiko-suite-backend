@@ -441,6 +441,18 @@ func (f *FakeStore) CreateArchive(_ context.Context, p domain.CreateArchiveParam
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	var idemKey string
+	if p.Idem != nil {
+		idemKey = p.TenantID + "\x00" + p.Idem.Endpoint + "\x00" + p.Idem.Key
+		if prior, ok := f.idem[idemKey]; ok {
+			if prior.fingerprint != p.Idem.Fingerprint {
+				return nil, domain.ErrIdempotencyMismatch
+			}
+			p.Idem.Replayed = true
+			replay := prior.archive
+			return &replay, nil
+		}
+	}
 	a := domain.Archive{
 		ArchiveID:            fmt.Sprintf("arch-%d", len(f.archives)+1),
 		TenantID:             p.TenantID,
@@ -450,6 +462,9 @@ func (f *FakeStore) CreateArchive(_ context.Context, p domain.CreateArchiveParam
 		CreatedByPrincipalID: p.CreatedByPrincipalID,
 	}
 	f.archives[a.ArchiveID] = a
+	if p.Idem != nil {
+		f.idem[idemKey] = fakeIdem{fingerprint: p.Idem.Fingerprint, archive: a}
+	}
 	return &a, nil
 }
 

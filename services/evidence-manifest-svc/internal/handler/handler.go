@@ -7,8 +7,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"time"
@@ -31,6 +31,11 @@ type Store interface {
 	RecordFailedManifest(ctx context.Context, m *domain.EvidenceManifest, reason string) (*domain.EvidenceManifest, error)
 	FindManifestByID(ctx context.Context, manifestID string) (*domain.EvidenceManifest, error)
 	ListManifests(ctx context.Context, legalEntityID string, limit, offset int) ([]domain.EvidenceManifest, error)
+	// ListManifestLegalEntities / ListManifestsForEntities back the list route
+	// when the caller names no legal entity: each entity is authorized on its
+	// own and only the readable ones are listed.
+	ListManifestLegalEntities(ctx context.Context) ([]string, error)
+	ListManifestsForEntities(ctx context.Context, legalEntityIDs []string, limit, offset int) ([]domain.EvidenceManifest, error)
 	ListRecords(ctx context.Context, manifestID string) ([]domain.ManifestRecord, error)
 
 	// AUD-03 Audit Population — see internal/store/population_store.go's
@@ -382,15 +387,46 @@ func (h *Handler) collectRecords(ctx context.Context, req domain.GenerateManifes
 // ── GET /v1/evidence-manifests ───────────────────────────────────────────────
 
 // ListManifests returns the manifests for the caller's tenant, ordered newest first.
-// If legal_entity_id is provided, checks authorization against that legal entity.
+//
+// EVIDENCE_MANIFEST_READ is granted per legal entity, so every path authorizes:
+//   - legal_entity_id given: that entity is authorized, then listed.
+//   - legal_entity_id omitted: each distinct legal entity that has a manifest is
+//     authorized on its own and only the readable ones are listed. If manifests
+//     exist but none is readable the answer is 403, as it is for a single
+//     manifest; an authorization-svc failure on any entity fails the whole
+//     request closed (503). A tenant with no manifests discloses nothing and has
+//     no entity to authorize against, so it returns an empty list.
 func (h *Handler) ListManifests(w http.ResponseWriter, r *http.Request) {
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
 	}
 	legalEntityID := r.URL.Query().Get("legal_entity_id")
+	var readable []string
 	if legalEntityID != "" {
 		if !h.authorize(w, r, principalID, legalEntityID, EvidenceManifestRead) {
+			return
+		}
+	} else {
+		entities, err := h.store.ListManifestLegalEntities(r.Context())
+		if err != nil {
+			h.handleStoreError(w, err)
+			return
+		}
+		for _, e := range entities {
+			err := h.authz.CheckAllowed(r.Context(), principalID, e, EvidenceManifestRead)
+			switch {
+			case err == nil:
+				readable = append(readable, e)
+			case errors.Is(err, authzpkg.ErrAuthorizationDenied):
+			default:
+				h.log.Error("authorization check failed", zap.Error(err))
+				writeError(w, http.StatusServiceUnavailable, "authorization_unavailable", "")
+				return
+			}
+		}
+		if len(entities) > 0 && len(readable) == 0 {
+			writeError(w, http.StatusForbidden, "not_authorized", "")
 			return
 		}
 	}
@@ -414,7 +450,13 @@ func (h *Handler) ListManifests(w http.ResponseWriter, r *http.Request) {
 		offset = v
 	}
 
-	manifests, err := h.store.ListManifests(r.Context(), legalEntityID, limit, offset)
+	var manifests []domain.EvidenceManifest
+	var err error
+	if legalEntityID != "" {
+		manifests, err = h.store.ListManifests(r.Context(), legalEntityID, limit, offset)
+	} else {
+		manifests, err = h.store.ListManifestsForEntities(r.Context(), readable, limit, offset)
+	}
 	if err != nil {
 		h.handleStoreError(w, err)
 		return
@@ -598,52 +640,13 @@ func (h *Handler) DownloadManifestZip(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The archive is assembled completely, and every write is checked, BEFORE
+	// any response header is sent: a packaging failure is an error response,
+	// never a 200 carrying a truncated archive.
 	buf := new(bytes.Buffer)
-	zw := zip.NewWriter(buf)
-
-	// 1. manifest.json
-	manifestJSON, err := json.MarshalIndent(m, "", "  ")
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "packaging_failed", err.Error())
-		return
-	}
-	mw, err := zw.Create("manifest.json")
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "packaging_failed", err.Error())
-		return
-	}
-	if _, err := mw.Write(manifestJSON); err != nil {
-		writeError(w, http.StatusInternalServerError, "packaging_failed", err.Error())
-		return
-	}
-
-	// 2. checksum.sha256
-	storedChecksum := ""
-	if m.ChecksumSHA256 != nil {
-		storedChecksum = *m.ChecksumSHA256
-	}
-	cw, err := zw.Create("checksum.sha256")
-	if err == nil {
-		_, _ = cw.Write([]byte(storedChecksum + "\n"))
-	}
-
-	// 3. records index and snapshots
-	recordsJSON, err := json.MarshalIndent(records, "", "  ")
-	if err == nil {
-		if rw, err := zw.Create("records/records.json"); err == nil {
-			_, _ = rw.Write(recordsJSON)
-		}
-	}
-
-	for i, rec := range records {
-		entryName := fmt.Sprintf("records/%03d_%s_%s.json", i+1, rec.SourceType, rec.SourceRecordID)
-		if sw, err := zw.Create(entryName); err == nil {
-			_, _ = sw.Write(rec.RecordSnapshot)
-		}
-	}
-
-	if err := zw.Close(); err != nil {
-		writeError(w, http.StatusInternalServerError, "packaging_failed", err.Error())
+	if err := writeManifestZip(buf, m, records); err != nil {
+		h.log.Error("DownloadManifestZip: packaging failed", zap.String("manifest_id", manifestID), zap.Error(err))
+		writeError(w, http.StatusInternalServerError, "packaging_failed", "")
 		return
 	}
 
@@ -652,6 +655,57 @@ func (h *Handler) DownloadManifestZip(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Length", strconv.Itoa(buf.Len()))
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(buf.Bytes())
+}
+
+// writeManifestZip writes the manifest package — manifest.json, checksum.sha256,
+// records/records.json and one entry per record snapshot — to out, and returns
+// the first error from ANY create, write or close. Nothing is ignored.
+func writeManifestZip(out io.Writer, m *domain.EvidenceManifest, records []domain.ManifestRecord) error {
+	zw := zip.NewWriter(out)
+	add := func(name string, content []byte) error {
+		fw, err := zw.Create(name)
+		if err != nil {
+			return fmt.Errorf("create %s: %w", name, err)
+		}
+		if _, err := fw.Write(content); err != nil {
+			return fmt.Errorf("write %s: %w", name, err)
+		}
+		return nil
+	}
+
+	manifestJSON, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode manifest.json: %w", err)
+	}
+	if err := add("manifest.json", manifestJSON); err != nil {
+		return err
+	}
+
+	storedChecksum := ""
+	if m.ChecksumSHA256 != nil {
+		storedChecksum = *m.ChecksumSHA256
+	}
+	if err := add("checksum.sha256", []byte(storedChecksum+"\n")); err != nil {
+		return err
+	}
+
+	recordsJSON, err := json.MarshalIndent(records, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode records.json: %w", err)
+	}
+	if err := add("records/records.json", recordsJSON); err != nil {
+		return err
+	}
+	for i, rec := range records {
+		name := fmt.Sprintf("records/%03d_%s_%s.json", i+1, rec.SourceType, rec.SourceRecordID)
+		if err := add(name, rec.RecordSnapshot); err != nil {
+			return err
+		}
+	}
+	if err := zw.Close(); err != nil {
+		return fmt.Errorf("close archive: %w", err)
+	}
+	return nil
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────

@@ -61,6 +61,22 @@ type CreateArchiveParams struct {
 	FromSequence, ToSequence int64
 	TenantID                 string
 	CreatedByPrincipalID     string
+	// Idem, when non-nil, makes the call idempotent (migration 000007). It is
+	// nil when the request carried no Idempotency-Key.
+	Idem *Idempotency
+}
+
+// Idempotency carries POST /v1/archives' Idempotency-Key into the store. The
+// store claims it in the same transaction as the archive row, so a retry —
+// sequential or concurrent — receives the original archive instead of
+// creating a second permanent record. Fingerprint binds the acting principal
+// and the request, so a key reused for a different request, or by a different
+// principal, is ErrIdempotencyMismatch. Replayed is set by the store.
+type Idempotency struct {
+	Key         string
+	Endpoint    string
+	Fingerprint string
+	Replayed    bool
 }
 
 type VerifyArchiveParams struct {
@@ -73,8 +89,12 @@ type VerifyArchiveParams struct {
 
 var (
 	ErrArchiveNotFound = errors.New("archive not found")
-	ErrInvalidRange    = errors.New("to_sequence must be greater than or equal to from_sequence")
-	ErrEmptyRange      = errors.New("no events exist in the requested sequence range")
+
+	// ErrIdempotencyMismatch — the Idempotency-Key was already used for a
+	// different request (or by a different principal).
+	ErrIdempotencyMismatch = errors.New("this Idempotency-Key was already used for a different request")
+	ErrInvalidRange        = errors.New("to_sequence must be greater than or equal to from_sequence")
+	ErrEmptyRange          = errors.New("no events exist in the requested sequence range")
 
 	// ErrTenantRequired means an archive operation was reached without a
 	// resolved tenant context. Archive records are tenant-owned and

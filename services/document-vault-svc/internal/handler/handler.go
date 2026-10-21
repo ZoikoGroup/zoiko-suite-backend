@@ -151,8 +151,15 @@ func (h *Handler) CreateDocument(w http.ResponseWriter, r *http.Request) {
 	// filing into another tenant should be told it cannot, not quietly have the
 	// document land somewhere else.
 	if req.TenantID != "" && req.TenantID != tenantID {
+		// §11.1 DRC-004 TENANT_SCOPE_MISMATCH: reject, with security telemetry.
+		// §11.1 defines the code and the behaviour, not a telemetry schema, so the
+		// existing structured log carries it; the response keeps the service's
+		// {error, detail} body with the code named in detail.
+		h.log.Warn("security: DRC-004 TENANT_SCOPE_MISMATCH: body tenant_id differs from the authenticated tenant",
+			zap.String("code", "DRC-004"), zap.String("authenticated_tenant_id", tenantID),
+			zap.String("body_tenant_id", req.TenantID), zap.String("principal_id", actor))
 		writeError(w, http.StatusBadRequest, "tenant_mismatch",
-			"tenant_id in the body does not match the request's tenant")
+			"DRC-004: TENANT_SCOPE_MISMATCH: tenant_id in the body does not match the request's tenant")
 		return
 	}
 	req.TenantID = tenantID
@@ -218,7 +225,7 @@ func (h *Handler) CreateDocument(w http.ResponseWriter, r *http.Request) {
 		return
 	} else if !result.Clean {
 		h.log.Warn("CreateDocument: upload quarantined", zap.String("reason", result.Reason))
-		writeError(w, http.StatusUnprocessableEntity, "upload_quarantined", result.Reason)
+		writeError(w, http.StatusUnprocessableEntity, "upload_quarantined", "DRC-003: MALWARE_QUARANTINED: "+result.Reason)
 		return
 	}
 
@@ -264,6 +271,7 @@ func (h *Handler) CreateDocument(w http.ResponseWriter, r *http.Request) {
 		StorageKey:           tempKey,
 		SizeBytes:            int64(len(content)),
 		ContentType:          req.ContentType,
+		DetectedContentType:  detected,
 		CreatedByPrincipalID: actor,
 	}
 
@@ -318,7 +326,51 @@ func (h *Handler) GetDocument(w http.ResponseWriter, r *http.Request) {
 	// loudly inside recordAccess). The documented guarantee — "every download is
 	// logged" — is enforced on the content route below, which fails closed.
 	_ = h.recordAccess(r, actor, documentID, nil, domain.AccessMetadata)
-	writeJSON(w, http.StatusOK, doc)
+	view, err := h.buildDocumentView(r.Context(), doc)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, view)
+}
+
+// documentView is the document plus the two §3.2 reference fields that are
+// derived from data this service already owns.
+type documentView struct {
+	*domain.Document
+	// CurrentVersionID is §3.2 current_version_id: the id of the version whose
+	// number is the document's current_version. It is read from the version
+	// relationship on every request, so it cannot go stale.
+	CurrentVersionID string `json:"current_version_id,omitempty"`
+	// ClassificationID is §3.2 classification_id, "Reference to approved
+	// information classification": the id of the document's current CONFIRMED
+	// classification. A document whose current classification is still a
+	// CANDIDATE has no approved classification yet, so the field is left out
+	// rather than pointing at an unapproved one.
+	ClassificationID string `json:"classification_id,omitempty"`
+}
+
+func (h *Handler) buildDocumentView(ctx context.Context, doc *domain.Document) (*documentView, error) {
+	v := &documentView{Document: doc}
+	ver, err := h.store.FindVersion(ctx, doc.DocumentID, doc.CurrentVersion)
+	switch {
+	case err == nil:
+		v.CurrentVersionID = ver.DocumentVersionID
+	case errors.Is(err, domain.ErrDocumentVersionNotFound):
+	default:
+		return nil, err
+	}
+	cls, err := h.store.GetClassification(ctx, doc.DocumentID)
+	switch {
+	case err == nil:
+		if cls.Status == domain.ClassificationStatusConfirmed {
+			v.ClassificationID = cls.ClassificationID
+		}
+	case errors.Is(err, domain.ErrClassificationNotFound), errors.Is(err, domain.ErrDocumentNotFound):
+	default:
+		return nil, err
+	}
+	return v, nil
 }
 
 // ── POST /v1/documents/{documentID}/declare-record ──────────────────────────
@@ -1380,7 +1432,7 @@ func (h *Handler) AddVersion(w http.ResponseWriter, r *http.Request) {
 		if err := h.store.RecordQuarantinedVersionUpload(r.Context(), documentID, actor, result.Reason, r.Header.Get("X-Correlation-ID")); err != nil {
 			h.log.Error("AddVersion: failed to record quarantine event", zap.Error(err))
 		}
-		writeError(w, http.StatusUnprocessableEntity, "upload_quarantined", result.Reason)
+		writeError(w, http.StatusUnprocessableEntity, "upload_quarantined", "DRC-003: MALWARE_QUARANTINED: "+result.Reason)
 		return
 	}
 
@@ -1397,6 +1449,7 @@ func (h *Handler) AddVersion(w http.ResponseWriter, r *http.Request) {
 		StorageKey:           tempKey,
 		SizeBytes:            int64(len(content)),
 		ContentType:          req.ContentType,
+		DetectedContentType:  detected,
 		CreatedByPrincipalID: actor,
 	}
 

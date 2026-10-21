@@ -185,11 +185,19 @@ func (s *stubStore) ResolvePurposeAsOf(ctx context.Context, purposeID string, as
 	return best, nil
 }
 
+// ListPurposes mirrors PgStore.ListPurposes: one row per visible purpose — the
+// published version in force now (ResolvePurposeAsOf at the current instant).
 func (s *stubStore) ListPurposes(ctx context.Context) ([]domain.PurposeVersion, error) {
 	var out []domain.PurposeVersion
+	now := time.Now().UTC()
+	seen := map[string]bool{}
 	for _, v := range s.purposeVersions {
-		if v.VersionStatus == domain.PurposeStatusPublished && visible(ctx, v.TenantID) {
-			out = append(out, *v)
+		if seen[v.PurposeID] || v.VersionStatus != domain.PurposeStatusPublished || !visible(ctx, v.TenantID) {
+			continue
+		}
+		seen[v.PurposeID] = true
+		if cur, err := s.ResolvePurposeAsOf(ctx, v.PurposeID, now, now); err == nil {
+			out = append(out, *cur)
 		}
 	}
 	return out, nil

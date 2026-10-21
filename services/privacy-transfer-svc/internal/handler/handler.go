@@ -2,8 +2,9 @@
 //
 // Every route — read or write — runs the same pre-flight, in this order:
 //
-//  1. X-Principal-Id          -> 401
-//  2. X-Tenant-Id             -> 401 (middleware.TenantContext)
+//  1. X-Tenant-Id             -> 401 (middleware.TenantContext, which wraps the
+//     group and therefore runs before the handler)
+//  2. X-Principal-Id          -> 401
 //  3. mutating only: X-Correlation-ID -> 400
 //  4. mutating only: Idempotency-Key  -> 400
 //  5. authorization-svc grant on the caller's verified tenant -> 403 / 503 (fail closed)
@@ -703,13 +704,23 @@ func (h *Handler) evaluate(ctx context.Context, req *domain.EvaluateTransferRequ
 		decision.ExpiresAt = mechanism.ValidUntil
 	}
 
+	// The latest assessment is trigger EVIDENCE (§17.1 triggers 3, 4 and 8 are
+	// measured against it) and is therefore read whether or not the caller
+	// declared an assessment required — otherwise this evaluation and the
+	// trigger endpoint would answer differently for the same stored evidence.
+	// assessment_required only controls whether the assessment GATE below
+	// (missing / rejected / remediate / expired) is enforced and whether the
+	// assessment's measures and review date enter the decision. A lookup failure
+	// fails closed either way.
+	triggerAssessment, err := h.store.FindLatestAssessment(ctx, req.RelationshipID)
+	if err != nil {
+		h.log.Error("evaluate: assessment lookup failed", zap.Error(err))
+		return domain.ResultReviewRequired, makeReasons(domain.ReasonDependencyUnavailable, "DEPENDENCY_UNAVAILABLE")
+	}
+
 	var latestAssessment *domain.TransferAssessment
 	if req.AssessmentRequired {
-		assessment, err := h.store.FindLatestAssessment(ctx, req.RelationshipID)
-		if err != nil {
-			h.log.Error("evaluate: assessment lookup failed", zap.Error(err))
-			return domain.ResultReviewRequired, makeReasons(domain.ReasonDependencyUnavailable, "DEPENDENCY_UNAVAILABLE")
-		}
+		assessment := triggerAssessment
 		if assessment == nil {
 			return domain.ResultReviewRequired, makeReasons(domain.ReasonAssessmentMissing, "ASSESSMENT_REQUIRED_NOT_FOUND")
 		}
@@ -737,11 +748,14 @@ func (h *Handler) evaluate(ctx context.Context, req *domain.EvaluateTransferRequ
 	// §17.1 reassessment triggers — the same evaluation the trigger endpoint
 	// uses. Triggers established from stored evidence win over a declaration.
 	outcomes := computeTriggers(triggerInput{
-		Relationship: relationship, Mechanism: mechanism, Assessment: latestAssessment, Subprocessors: subprocessors,
+		Relationship: relationship, Mechanism: mechanism, Assessment: triggerAssessment, Subprocessors: subprocessors,
 		Destination: req.DestinationJurisdiction, DataCats: req.DataCategories, SubjectCls: req.SubjectClasses,
 		Declared: "", Now: now,
 	})
-	for _, idx := range []int{3, 2, 5, 0} { // changed mechanism, new processor/jurisdiction, minors, sensitive category
+	// changed mechanism (4), new processor/jurisdiction (3), minors (6), sensitive
+	// category (1), expiry/review date reached (8). With assessment_required the
+	// expiry already returned above, so trigger 8 only decides here when it was not.
+	for _, idx := range []int{3, 2, 5, 0, 7} {
 		if o := outcomes[idx]; o.Derived && o.Triggered {
 			return domain.ResultReviewRequired, makeReasons(o.ReasonCode, o.Trigger)
 		}

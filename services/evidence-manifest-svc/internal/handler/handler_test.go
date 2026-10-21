@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"testing"
 	"time"
 
@@ -136,6 +137,42 @@ func (s *stubStore) ListManifests(ctx context.Context, legalEntityID string, lim
 			if legalEntityID == "" || m.LegalEntityID == legalEntityID {
 				out = append(out, *m)
 			}
+		}
+	}
+	if offset >= len(out) {
+		return []domain.EvidenceManifest{}, nil
+	}
+	end := offset + limit
+	if end > len(out) {
+		end = len(out)
+	}
+	return out[offset:end], nil
+}
+
+func (s *stubStore) ListManifestLegalEntities(ctx context.Context) ([]string, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	seen := map[string]bool{}
+	var out []string
+	for _, m := range s.manifests {
+		if m.TenantID == tenantID && !seen[m.LegalEntityID] {
+			seen[m.LegalEntityID] = true
+			out = append(out, m.LegalEntityID)
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+func (s *stubStore) ListManifestsForEntities(ctx context.Context, legalEntityIDs []string, limit, offset int) ([]domain.EvidenceManifest, error) {
+	allowed := map[string]bool{}
+	for _, e := range legalEntityIDs {
+		allowed[e] = true
+	}
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	var out []domain.EvidenceManifest
+	for _, m := range s.manifests {
+		if m.TenantID == tenantID && allowed[m.LegalEntityID] {
+			out = append(out, *m)
 		}
 	}
 	if offset >= len(out) {
@@ -883,4 +920,3 @@ func TestApproveSampleDesign_SelfApproval_Forbidden403(t *testing.T) {
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &errResp))
 	assert.Equal(t, "self_approval_forbidden", errResp["error"])
 }
-

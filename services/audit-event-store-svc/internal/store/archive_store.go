@@ -145,6 +145,21 @@ func (s *PgStore) CreateArchive(ctx context.Context, p domain.CreateArchiveParam
 			return err
 		}
 
+		// Idempotency (migration 000007). Claimed before the chain is read, in
+		// this same transaction: a replay returns the original archive, a
+		// concurrent duplicate waits for the first to commit, and any failure
+		// below rolls the claim back with everything else.
+		if p.Idem != nil {
+			replayed, err := claimIdempotency(ctx, tx, p.TenantID, p.Idem)
+			if err != nil {
+				return err
+			}
+			if replayed != nil {
+				archive = replayed
+				return nil
+			}
+		}
+
 		rows, err := readChainRange(ctx, tx, p.FromSequence, p.ToSequence)
 		if err != nil {
 			return err
@@ -173,6 +188,11 @@ func (s *PgStore) CreateArchive(ctx context.Context, p domain.CreateArchiveParam
 		if err := row.Scan(&a.ArchiveID, &a.TenantID, &a.FromSequence, &a.ToSequence, &a.EventCount, &a.ArchiveDigest,
 			&a.FirstEventHash, &a.LastEventHash, &a.CreatedByPrincipalID, &a.CreatedAt); err != nil {
 			return fmt.Errorf("insert archive: %w", err)
+		}
+		if p.Idem != nil {
+			if err := recordIdempotency(ctx, tx, p.TenantID, p.Idem, a); err != nil {
+				return err
+			}
 		}
 		archive = a
 		return nil

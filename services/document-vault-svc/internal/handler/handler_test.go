@@ -1676,6 +1676,12 @@ func TestGetAsOfClassification_ReturnsWhatGovernedAtThatTime(t *testing.T) {
 	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/documents", bytes.NewReader(createBody(t, "CONFIDENTIAL", "content"))))
 	original := confirmFirstClassification(t, r, s)
 	beforeReclassify := time.Now().UTC()
+	// The reclassification below is stamped with time.Now() by the stub. On a
+	// coarse clock (Windows resolution is ~15ms) that stamp can equal
+	// beforeReclassify, so the as-of query would count it as already governing and
+	// this test failed about 1 run in 30. Waiting past one clock tick makes the
+	// ordering strict without changing what is asserted.
+	time.Sleep(30 * time.Millisecond)
 
 	reclassifyReq := httptest.NewRequest(http.MethodPost, "/v1/documents/doc-1/reclassify", bytes.NewReader(classifyBody(t, "RESTRICTED", "HUMAN", nil)))
 	reclassifyRec := httptest.NewRecorder()

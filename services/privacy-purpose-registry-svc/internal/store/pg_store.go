@@ -416,6 +416,13 @@ func (s *PgStore) ResolvePurposeAsOf(ctx context.Context, purposeID string, asOf
 	return version, nil
 }
 
+// ListPurposes returns the CURRENTLY PUBLISHED purposes: for each visible
+// purpose, the one published version in force right now — the same version
+// ResolvePurposeAsOf(now, now) returns (published, effective_from reached,
+// published_at reached; latest effective_from wins, insertion order breaks
+// ties). A superseded published version, a published version dated in the
+// future and an unpublished draft are not returned, and no purpose appears
+// twice. Visibility follows RLS: the caller's tenant rows plus platform rows.
 func (s *PgStore) ListPurposes(ctx context.Context) ([]domain.PurposeVersion, error) {
 	var out []domain.PurposeVersion
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
@@ -423,7 +430,14 @@ func (s *PgStore) ListPurposes(ctx context.Context) ([]domain.PurposeVersion, er
 			SELECT `+purposeVersionColumnsJoined+`
 			FROM purpose_versions pv
 			JOIN purposes p ON p.purpose_id = pv.purpose_id
-			WHERE pv.version_status = 'PUBLISHED'
+			WHERE pv.purpose_version_id IN (
+				SELECT DISTINCT ON (c.purpose_id) c.purpose_version_id
+				FROM purpose_versions c
+				WHERE c.version_status = 'PUBLISHED'
+				  AND c.effective_from <= NOW()
+				  AND COALESCE(c.published_at, c.effective_from) <= NOW()
+				ORDER BY c.purpose_id, c.effective_from DESC, c.sequence_no DESC
+			)
 			ORDER BY pv.created_at DESC`)
 		if err != nil {
 			return err

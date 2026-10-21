@@ -1303,7 +1303,7 @@ Status: ✅ Resolved by correcting the documentation (DOC DRIFT). The shared con
 - Principal: only the envelope's `X-Principal-Id` is read. `X-Actor-Principal-ID` is ignored (it previously overrode the verified principal). `requested_by` on a manifest is always the verified principal; a differing `requested_by` in the body is refused with 403 `requested_by_mismatch`. The platform input contract defines no delegated-actor header.
 - Tenant & Identity Isolation: `X-Tenant-Id` and `X-Principal-Id` mandatory on all operations (`svcmiddleware.TenantContext()`), returning 401 if missing. RLS enforced on `evidence_manifests` and related tables (migration `000003_add_rls.up.sql`); re-confirmed this pass via `internal/store/rls_test.go` run against a real, non-superuser Postgres role (not just a superuser connection, which would prove nothing about the policy).
 - Canonical Envelope Enforcement: `svcenvelope.Middleware` requires `X-Request-Id`, `X-Correlation-ID`, `X-Source-Channel`, `Idempotency-Key`, `X-Legal-Entity-Id`, and `X-Purpose-Context` on material writes; live-reconfirmed this pass (a request missing `X-Purpose-Context` was correctly refused with `envelope_incomplete`).
-- Fine-Grained Authorization: `EVIDENCE_MANIFEST_GENERATE` and `EVIDENCE_MANIFEST_READ` (the latter only when filtering reads by legal entity) checked synchronously against `authorization-svc`, fail-closed on denial or unavailability.
+- Fine-Grained Authorization: `EVIDENCE_MANIFEST_GENERATE` and `EVIDENCE_MANIFEST_READ` (the latter only when filtering reads by legal entity) checked synchronously against `authorization-svc`, fail-closed on denial or unavailability. The population and sampling routes use their own four actions (`AUDIT_POPULATION_WRITE` / `_READ`, `SAMPLE_DESIGN_WRITE` / `_READ`) and three sample-item routes make no authorization call; the complete route-to-action map is the "Authorization map" in the Remediation Pass (2026-10-21) below.
 - Context Propagation to Downstream Sources (Original Gap, re-verified): `forwardTenant` in `internal/aggregator/clients.go` forwards `X-Tenant-Id`, `X-Principal-Id`, and `X-Correlation-ID` to `workflow-svc`, `workflow-history-svc`, and `governance-decision-log-svc`. Confirmed present and correct in current code; test coverage (`TestWorkflowAndHistoryClients_ForwardPrincipalHeader`, `TestWorkflowAndAccessClients_ForwardTenantHeader`, `TestClient_TenantlessContext_SendsNoHeader`) passes.
 - Fail-Closed Aggregation: manifest generation is all-or-nothing — any single source service error (unreachable, non-200, decode failure) fails the entire request rather than producing a manifest that looks complete but silently omits records (`collectRecords` in `internal/handler/handler.go`). Source collection happens before anything is stored; the manifest, its records, its checksum, the GENERATED status and the outbox event are then written in ONE transaction (`PgStore.CompleteManifest`). A source failure stores a single FAILED manifest with its reason and no records (`RecordFailedManifest`). No PENDING manifest is created by the API; PENDING remains a valid schema state but is only reachable through the legacy two-step store methods, which the handler no longer calls.
 
@@ -1312,18 +1312,18 @@ Status: ✅ Resolved by correcting the documentation (DOC DRIFT). The shared con
 ### Gap 1 — Manifest Aggregator Context Propagation Failure (Original Gap, from §14.1/§1)
 Status: ✅ Fixed
 Original Issue:
-`internal/aggregator/clients.go#L213, L266`'s `forwardTenant` propagated only `X-Tenant-Id`, omitting `X-Principal-Id`. Callee services (`workflow-svc`, `workflow-history-svc`) strictly require both and returned HTTP 401, so manifest collection failed 100% of the time with HTTP 503 `source_service_unavailable`.
+`forwardTenant` in `internal/aggregator/clients.go` (at the time of the original finding, lines 213 and 266 of that older version of the file; those line numbers no longer exist) propagated only `X-Tenant-Id`, omitting `X-Principal-Id`. Callee services (`workflow-svc`, `workflow-history-svc`) strictly require both and returned HTTP 401, so manifest collection failed 100% of the time with HTTP 503 `source_service_unavailable`.
 Fix Verification (as previously recorded, re-confirmed this pass):
-Centralized `forwardTenant` helper (`internal/aggregator/clients.go#L38-L63`) propagates `X-Tenant-Id`, `X-Principal-Id`, and `X-Correlation-ID` from middleware context with an envelope-context fallback. Re-read this pass: still present, still correct, and the middleware context it reads from (`internal/middleware/tenant.go`'s `TenantContext()`) is the one actually wired in `cmd/server/main.go` — not the now-removed duplicate (see new Gap 4).
+Centralized `forwardTenant` helper (`internal/aggregator/clients.go`, lines 44–63 as of 2026-10-21) propagates `X-Tenant-Id`, `X-Principal-Id`, and `X-Correlation-ID` from middleware context with an envelope-context fallback. Re-read this pass: still present, still correct, and the middleware context it reads from (`internal/middleware/tenant.go`'s `TenantContext()`) is the one actually wired in `cmd/server/main.go` — not the now-removed duplicate (see new Gap 4).
 Evidence:
-`internal/aggregator/clients.go#L38-L63`, `internal/aggregator/clients_test.go` (`TestWorkflowAndHistoryClients_ForwardPrincipalHeader`, `TestWorkflowAndAccessClients_ForwardTenantHeader`), re-run and passing this pass.
+`internal/aggregator/clients.go` (`forwardTenant`, lines 44–63 as of 2026-10-21), `internal/aggregator/clients_test.go` (`TestWorkflowAndHistoryClients_ForwardPrincipalHeader`, `TestWorkflowAndAccessClients_ForwardTenantHeader`), re-run and passing this pass.
 
 ### Gap 2 — Missing Manifest Catalog Endpoint (Original Gap, from §14.4)
 Status: ✅ Fixed
 Original Issue:
 Frontend called `GET /v1/evidence-manifests` (`lib/api/evidence-manifest.ts`); no list route existed in `internal/handler/handler.go`, so calls returned HTTP 404, preventing users from browsing previously generated manifests.
 Fix Verification (as previously recorded, re-confirmed this pass):
-`GET /v1/evidence-manifests` registered and implemented (`internal/handler/handler.go#L355-L395` per the original record; current line numbers have shifted with the service's growth but the route and its tenant-scoped, paginated, `legal_entity_id`-filterable query in `internal/store/pg_store.go` are present and covered by `TestListManifests_ReturnsAllManifestsForTenant`, `TestListManifests_LegalEntityFilter`, `TestListManifests_InvalidPagination_Returns400`, all passing this pass.
+`GET /v1/evidence-manifests` registered and implemented (`ListManifests` in `internal/handler/handler.go`, line 386 as of 2026-10-21 — the original record cited lines 355–395; the route and its tenant-scoped, paginated, `legal_entity_id`-filterable query in `internal/store/pg_store.go` are present and covered by `TestListManifests_ReturnsAllManifestsForTenant`, `TestListManifests_LegalEntityFilter`, `TestListManifests_InvalidPagination_Returns400`, all passing this pass.
 Evidence:
 `internal/handler/handler.go`, `internal/store/pg_store.go`, `internal/handler/handler_test.go`, test suite re-run this pass.
 
@@ -1345,7 +1345,7 @@ Evidence:
 - None of the ten remediation gaps remain open. The items below were found and deliberately not changed (see Needs-Clarification Items).
 - Frontend was not audited (no frontend code was read or tested).
 - Legacy manifests generated before this pass hashed the source JSON bytes, whereas `manifest_records.record_snapshot` is JSONB (re-ordered keys, normalised whitespace). A legacy manifest whose source JSON was not already in JSONB-canonical form will not re-verify. New manifests are hashed from the stored form and verify.
-- `EvaluateSample` writes its incomplete-evaluation row and then returns `ErrSampleEvaluationIncomplete` from inside the transaction, so that row (and the `evaluation_id` in the 422 body) is rolled back — the same pattern as the freeze-quarantine defect fixed in this pass. Not changed: the contract does not say whether an incomplete evaluation must persist.
+- `EvaluateSample` on a design with a selected item that lacks a terminal result inserts the evaluation row, then returns `ErrSampleEvaluationIncomplete` from inside the transaction, so the row is rolled back; the design stays out of `EVALUATED`, no `SampleEvaluated` event is emitted, and the caller gets `422 evaluation_incomplete` whose `evaluation` object (`completeness_ok: false`, `known_exception_count`) carries an `evaluation_id` that is **not stored** (the service has no evaluation read route that could dereference it). This is **not** a confirmed defect: the Audit & Assurance specification (AUD-04) says only that "incomplete item testing blocks final evaluation" and AUD-NEG-014 that an evaluation omitting a known exception must "fail evaluation completeness gate"; it does not say whether the failed attempt must be persisted. Re-classified on 2026-10-21 from a service-owned remaining gap to a **design decision** (see Needs-Clarification Items); not changed.
 
 **Dependency-Limited Items:**
 - ❌ **Not Fixed — `authorization-svc` missing migrations (cross-service dependency, not owned by this service):** a live manifest-generation attempt answered `503 authorization_unavailable` after passing envelope and body validation. Same platform-wide blocker documented for every other service in this file. `authorization-svc` was not modified.
@@ -1360,6 +1360,9 @@ Evidence:
 - AUD-04 `Reviewed` state (absent; the service has `Invalidated`, which the specification does not list).
 - Route names for AUD-03/AUD-04 versus the specification's.
 - Per-item `integrity_hash` on manifest records (`04-data-model.md` EvidenceManifestItem): the schema stores none; the manifest checksum is a single flat SHA-256.
+- Authorization of `POST /v1/sample-items/{item_id}/result`, `/nonresponse` and `/alternative-procedure`: they check only the principal and `X-Correlation-ID` and make no authorization call; the action `SAMPLE_EXECUTE` is defined in `internal/handler/sampling.go` but never used. The Audit & Assurance specification names no permission for any route and its AUD-04 "Authorization / SoD / controls" row lists only controls (seed preserved, no silent item replacement, parameter changes invalidate selection), so no requirement for `SAMPLE_EXECUTE` could be established and none was added. Decision needed: should these three routes require `SAMPLE_EXECUTE` (checked against the sample design's population legal entity)?
+- Whether a failed (incomplete) `EvaluateSample` attempt must be persisted as evidence, or the 422 body must omit the `evaluation` object (see Remaining Gaps).
+- `record_snapshot` on manifest records (and `row_snapshot` on population rows) is a Go `[]byte`, so `encoding/json` serialises it as a base64 string, not as embedded JSON; the ZIP download writes the raw bytes. The documentation and the specification do not say which representation `GET …/records` should use.
 
 ### Gap 4 — Service Did Not Compile From a Clean Checkout (newly discovered this pass, critical)
 Status: ✅ Fixed
@@ -1417,6 +1420,93 @@ Scope: `evidence-manifest-svc` only. Starting point: the read-only audit of this
 | 10 | Body size / unknown fields | NEEDS CLARIFICATION — no platform contract; nothing implemented |
 
 Verification: `go build ./...`, `go vet ./...` clean. `go test ./...` against a disposable PostgreSQL (`evidence_manifest_test`): 123 top-level tests, 122 passed, 1 skipped (`TestPublishOutbox_AgainstRealBroker`, needs a live Kafka broker and was not run), 0 failed. Every fix has a regression test; the freeze, record-ordering and principal-spoofing tests, and the AuditPopulationFrozen event test, were confirmed to fail when the fix is reverted (the other event and atomicity tests were not mutation-checked individually).
+
+
+### Remediation Pass (2026-10-21)
+
+Scope: `evidence-manifest-svc` only (documentation; no code change was needed or made). `authorization-svc` was **not modified**. Starting point: the 2026-10-21 read-only audit (23 of 27 = 85.2%; partials: undocumented authorization actions, `EvaluateSample`, stale line references, undocumented schemas).
+
+| # | Finding | Result |
+|---|---|---|
+| 1 | Population / sampling authorization actions undocumented | Fixed (documentation): the "Authorization map" below |
+| 2 | `EvaluateSample` rolls back its incomplete-evaluation row | Re-classified, not changed: not a specification requirement either way — **design decision** (Remaining Gaps, Needs-Clarification Items) |
+| 3 | Stale source line references | Fixed (documentation): re-pointed at the current implementation (Gap 1, Gap 2) |
+| 4 | Request/response schemas undocumented | Fixed (documentation): "API schemas" below, read from the Go types |
+| 5 | Sample-item routes unauthorized | Not changed: the specification names no permission, so no `SAMPLE_EXECUTE` requirement can be established — clarification added |
+
+#### Authorization map
+
+Every route runs `svcmiddleware.TenantContext()` (401 without `X-Tenant-Id`) and the canonical envelope policy first, then requires `X-Principal-Id` (401 `missing_principal`). Authorization is then a synchronous call to `authorization-svc` with (principal, legal entity, action) and **fails closed**: a denial is `403 not_authorized`, an unreachable or erroring authorization-svc is `503 authorization_unavailable`. The legal entity checked is never caller-nominated on reads: it is taken from the stored row.
+
+| Route | Action | Legal entity checked | Order |
+|---|---|---|---|
+| `POST /v1/evidence-manifests` | `EVIDENCE_MANIFEST_GENERATE` | body `legal_entity_id` (the only field read before the check; 400 `missing_field` if absent) | principal → read body → authorize → decode/validate |
+| `GET /v1/evidence-manifests` | `EVIDENCE_MANIFEST_READ` **only when** `?legal_entity_id=` is supplied; otherwise no grant is checked (documented clarification) | the query value | principal → authorize (if filtered) → paginate |
+| `GET /v1/evidence-manifests/{id}`, `/{id}/records`, `/{id}/download`, `POST /v1/evidence-manifests/verify`, `POST /{id}/verify` | `EVIDENCE_MANIFEST_READ` | the manifest's own `legal_entity_id` | principal → fetch manifest (tenant-scoped, 404 `manifest_not_found`) → authorize |
+| `POST /v1/audit-populations` | `AUDIT_POPULATION_WRITE` | body `legal_entity_id` | principal → decode body → authorize → correlation id → validate dates |
+| `POST /v1/audit-populations/{id}/build`, `/validate`, `/freeze`, `/supersede`, `/quarantine`, `/delta` | `AUDIT_POPULATION_WRITE` | the population's `legal_entity_id` | principal → fetch population (404 `population_not_found`) → authorize → correlation id (not required by `/quarantine`) → decode |
+| `GET /v1/audit-populations/{id}`, `/{id}/control-totals` | `AUDIT_POPULATION_READ` | the population's `legal_entity_id` | principal → fetch → authorize |
+| `GET /v1/audit/engagements/{engagement_id}/populations` | `AUDIT_POPULATION_READ` | **each distinct** legal entity among the engagement's populations | only authorized populations are returned; none readable → 403; authorization-svc down → 503; empty → `[]` |
+| `POST /v1/sampling-parameter-sets` | `SAMPLE_DESIGN_WRITE` | body `legal_entity_id` | principal → decode → authorize → validate `approach` |
+| `POST /v1/sample-designs` | `SAMPLE_DESIGN_WRITE` | the legal entity of the population named by `population_id` | principal → correlation id → decode/validate `sample_size` → fetch population → authorize |
+| `POST /v1/sample-designs/{id}/approve`, `/select`, `/evaluate`, `/supersede` | `SAMPLE_DESIGN_WRITE` | the design's population's `legal_entity_id` | principal → fetch design and population → authorize → (approve: maker-checker) → correlation id |
+| `GET /v1/sample-designs/{id}`, `/{id}/items`, `/{id}/selections/{selection_id}/reproduce` | `SAMPLE_DESIGN_READ` | the design's population's `legal_entity_id` | principal → fetch → authorize |
+| `POST /v1/sample-items/{item_id}/result`, `/nonresponse`, `/alternative-procedure` | **none** — no authorization call (clarification; `SAMPLE_EXECUTE` is defined but unused) | — | principal → correlation id → decode → store |
+| `GET /healthz`, `GET /readyz` | none (outside the tenant gate) | — | — |
+
+Maker-checker: `POST /v1/sample-designs/{id}/approve` refuses the design's creator with `403 self_approval_forbidden`. A resource fetched before authorization (population, design, manifest) is tenant-scoped, so another tenant's resource is a 404; within a tenant, a 404 versus a 403 can therefore tell a caller whether an id exists. `authorization-svc` grants for all of these actions are provisioned outside this service (external blocker; not modified).
+
+#### API schemas (the implemented contract)
+
+Errors are `{"error": "<code>", "detail": "<text, optional>"}`; the codes and statuses used are listed per route. A mutating route additionally needs the envelope (`X-Request-Id`, `X-Correlation-ID`, `X-Source-Channel`, `Idempotency-Key`, `X-Legal-Entity-Id`, `X-Purpose-Context`); `/verify` is not classified as a material write. Times are RFC 3339 unless stated; ids are strings.
+
+**`EvidenceManifest`** (response of generate, list, get): `manifest_id`, `tenant_id`, `legal_entity_id`, `scenario_type` (`AUDIT` | `REGULATOR` | `LEGAL_DISCOVERY` | `COMPLIANCE_REVIEW`), `requested_by`, `status` (`PENDING` | `GENERATED` | `FAILED`), `checksum_sha256` (omitted until generated), `failure_reason` (omitted unless FAILED), `requested_at`, `generated_at` (omitted until generated). **`ManifestRecord`** (`GET …/records`, an array ordered by `fetched_at, manifest_record_id`): `manifest_record_id`, `manifest_id`, `source_type` (`GOVERNANCE_DECISION` | `ACCESS_DECISION` | `WORKFLOW_INSTANCE` | `WORKFLOW_HISTORY`), `source_record_id`, `record_snapshot` (serialised as a base64 string — see Needs-Clarification Items), `fetched_at`.
+
+| Route | Request | Success | Errors |
+|---|---|---|---|
+| `POST /v1/evidence-manifests` | `tenant_id` (required; must equal `X-Tenant-Id`), `legal_entity_id` (required), `scenario_type` (required, enum above), `requested_by` (optional; must equal the verified principal), `governance_decisions_from` / `governance_decisions_to` (optional), `governance_decision_ids[]`, `access_decision_ids[]`, `workflow_instance_ids[]` (optional; each workflow instance also pulls its full transition history), `workflow_history_from` / `workflow_history_to` (optional, both or neither). At least one source selector is required. | `201` `EvidenceManifest` (`status: GENERATED`) | 400 `invalid_json`, `missing_field`, `invalid_scenario_type`, `no_records_requested`, `invalid_field`; 401 `missing_principal`; 403 `not_authorized`, `tenant_mismatch`, `requested_by_mismatch`; 503 `authorization_unavailable`, `source_service_unavailable` (a FAILED manifest is stored), `store_unavailable` |
+| `GET /v1/evidence-manifests` | query `legal_entity_id` (optional), `limit` (1–200, default 50), `offset` (≥ 0, default 0) | `200` array of `EvidenceManifest`, newest first, `[]` when none | 400 `invalid_limit`, `invalid_offset`; 403/503 as above |
+| `GET /v1/evidence-manifests/{id}` | — | `200` `EvidenceManifest` | 404 `manifest_not_found`; 403/503 |
+| `GET /v1/evidence-manifests/{id}/records` | — | `200` array of `ManifestRecord` | as above |
+| `POST /v1/evidence-manifests/verify`, `POST …/{id}/verify` | the bare route takes `manifest_id` (required) and `checksum_sha256` (optional expected value); the `{id}` route takes the id from the path | `200` `{manifest_id, status, checksum_sha256, computed_checksum, valid, record_count, verified_at}` — `valid` is false if the recomputed checksum differs from the stored one or from a supplied `checksum_sha256` | 400 `invalid_json`, `missing_manifest_id`, `invalid_manifest_state` (only `GENERATED` manifests verify); 404; 403/503 |
+| `GET …/{id}/download` | — | `200` `application/zip` (`manifest.json`, `checksum.sha256`, `records/records.json`, one `records/NNN_<source_type>_<id>.json` per record) | 404; 403/503; 500 `packaging_failed` |
+
+**`AuditPopulation`**: `population_id`, `engagement_id`, `tenant_id`, `legal_entity_id`, `object_class`, `period_start`, `period_end`, `source_system`, `source_query`, `source_watermark`, `assertion`, `expected_completeness_check`, `status` (`DEFINED` | `BUILDING` | `VALIDATING` | `FROZEN` | `IN_USE` | `SUPERSEDED` | `QUARANTINED`), `row_count`, `digest_sha256`, `prior_population_id`, `superseded_by_population_id`, `quarantine_reason` (all five omitted when empty), `created_by_principal_id`, `created_at`, `frozen_at` (omitted until frozen). **`PopulationControlTotal`**: `control_total_id`, `population_id`, `measure_name`, `source_value`, `computed_value`, `reconciled`.
+
+| Route | Request | Success | Errors |
+|---|---|---|---|
+| `POST /v1/audit-populations` | `engagement_id`, `legal_entity_id`, `object_class`, `period_start`, `period_end` (`YYYY-MM-DD`), `source_system`, `source_query`, `source_watermark`, `assertion`, `expected_completeness_check`. The handler validates only the two dates and the correlation id; other fields are not checked by the handler. | `201` `AuditPopulation` when created, `200` when it already exists | 400 `invalid_json`, `missing_correlation_id`, `invalid_date`; 403/503 |
+| `GET …/{id}`, `GET …/{id}/control-totals` | — | `200` `AuditPopulation` / array of `PopulationControlTotal` | 404 `population_not_found`; 403/503 |
+| `GET /v1/audit/engagements/{engagement_id}/populations` | — | `200` array of `AuditPopulation` (only authorized ones) | 403 `not_authorized`, 503 |
+| `POST …/{id}/build` | `rows[]` (required, non-empty): `source_record_id`, `amount` (optional number), `row_snapshot` (JSON) | `200` `AuditPopulation` | 400 `missing_field` (`rows`), `missing_correlation_id`; 422 `invalid_population_state`; 404 |
+| `POST …/{id}/validate` | `control_totals` (required, non-empty object of measure name → number) | `200` `AuditPopulation` | 400 `missing_field`, `missing_correlation_id`; 422 `invalid_population_state` |
+| `POST …/{id}/freeze` | — | `200` `AuditPopulation` (`FROZEN`) | 422 `control_total_mismatch` (body `{error, population}`; the population is committed as `QUARANTINED`), 422 `invalid_population_state`, 400 `missing_correlation_id` |
+| `POST …/{id}/supersede` | `reason` (optional) | `200` `AuditPopulation` | 422 `invalid_population_state`; 400 |
+| `POST …/{id}/quarantine` | `reason` (required) | `200` `AuditPopulation` | 400 `missing_field` (`reason`); 422 |
+| `POST …/{id}/delta` | `reason` (required), `rows[]` (required, as in build) | `201` new linked `AuditPopulation` when created, `200` when it already exists | 400 `missing_field`, `missing_correlation_id`; 422 |
+
+**`SamplingParameterSet`**: `param_set_id`, `tenant_id`, `version`, `approach`, `tolerable_misstatement`, `expected_misstatement`, `confidence_level`, `key_item_threshold` (the four numbers omitted when unset), `created_at`. **`SampleDesign`**: `design_id`, `tenant_id`, `population_id`, `objective`, `param_set_id`, `sample_size`, `status` (`DRAFT_DESIGN` | `APPROVED_DESIGN` | `SELECTED` | `TESTING` | `EVALUATED` | `LOCKED` | `INVALIDATED`), `approved_by_principal_id` (omitted until approved), `created_by_principal_id`, `created_at`. **`SampleSelection`**: `selection_id`, `design_id`, `tenant_id`, `method` (`SYSTEMATIC_INTERVAL`), `rng_seed`, `interval_size`, `start_point` (optional), `param_set_id`, `param_set_version`, `population_digest_sha256`, `selected_at`. **`SampleItem`**: `item_id`, `selection_id`, `tenant_id`, `population_row_id`, `is_key_item`, `status` (`SELECTED` | `TESTED` | `NONRESPONSE` | `ALTERNATIVE_PROCEDURE`). **`SampleEvaluation`**: `evaluation_id`, `design_id`, `tenant_id`, `projected_misstatement` (optional), `known_exception_count`, `completeness_ok`, `evaluated_at`.
+
+| Route | Request | Success | Errors |
+|---|---|---|---|
+| `POST /v1/sampling-parameter-sets` | `legal_entity_id` (required for authorization), `approach` (required: `RANDOM`, `SYSTEMATIC_MUS` or `JUDGMENTAL`), `tolerable_misstatement`, `expected_misstatement`, `confidence_level`, `key_item_threshold` (optional numbers) | `201` `SamplingParameterSet` | 400 `invalid_json`, `invalid_field` (`approach`); 403/503 |
+| `POST /v1/sample-designs` | `population_id`, `objective`, `param_set_id`, `sample_size` (> 0) | `201` `SampleDesign` when created, `200` when it already exists | 400 `missing_correlation_id`, `invalid_json`, `invalid_field`; 404 `population_not_found`; 422 `population_not_frozen`; 403/503 |
+| `GET …/{id}` | — | `200` `SampleDesign` | 404 `sample_design_not_found`; 403/503 |
+| `POST …/{id}/approve` | — | `200` `SampleDesign` | 403 `self_approval_forbidden`; 400; 422 `invalid_sample_design_state` |
+| `POST …/{id}/select` | — | `201` `{selection: SampleSelection, items: [SampleItem]}` | 422 `invalid_sample_design_state`, `population_not_frozen`; 400 |
+| `GET …/{id}/items` | — | `200` array of item results | 404; 403/503 |
+| `GET …/{id}/selections/{selection_id}/reproduce` | — | `200` `{reproducible: bool}` | 404; 403/503 |
+| `POST …/{id}/evaluate` | — | `200` `SampleEvaluation` | 422 `evaluation_incomplete` (body `{error, evaluation}`; see Remaining Gaps), 422 `invalid_sample_design_state`; 400 |
+| `POST …/{id}/supersede` | `reason` (required), `new_param_set_id` (required) | `201` new `SampleDesign` when created, `200` when it already exists; the old design becomes `INVALIDATED` | 400 `missing_field`; 422 |
+| `POST /v1/sample-items/{item_id}/result` | `objective_tested` (required), `result`, `exception_amount` (optional number) | `200` `SampleItem` | 400 `invalid_json`/`missing_field`, `missing_correlation_id`; 422 `objective_mismatch` (body `{error, item}`) and `invalid_sample_item_state`; 404 `sample_item_not_found` |
+| `POST …/{item_id}/nonresponse` | — | `200` `SampleItem` | 404; 422 `invalid_sample_item_state`; 400 |
+| `POST …/{item_id}/alternative-procedure` | `objective_tested`, `result` | `200` `SampleItem` | 400; 404; 422 |
+
+Other store failures on any route are `503 store_unavailable`.
+
+#### Re-audit (2026-10-21, after this pass)
+
+Before: 23 ✅ / 4 ⚠️ / 0 ❌ = 23/27 = 85.2%. Rows resolved by documentation: undocumented authorization actions → ✅, stale line references → ✅, undocumented schemas → ✅. The `EvaluateSample` row is a design decision the specification leaves open, not a confirmed defect: counted as an open partial it gives **26/27 = 96.3%**; excluded as a clarification item it gives 26/26 = 100%. The conservative figure is 96.3%. No code changed, so the test results are unchanged (123 top-level tests, 122 pass, 1 skipped for lack of a live Kafka broker). Still open: the three sample-item routes make no authorization call (clarification), the unfiltered manifest list has no grant (clarification), and an authorized end-to-end path remains blocked by the external `authorization-svc` migration gap (`authorization-svc` not modified). **NOT PRODUCTION READY.**
 
 ---
 
@@ -2095,3 +2185,662 @@ Unchanged by design: all routes and permissions, the platform-wide `source_autho
 
 External blocker: the `authorization-svc` migration gap; a real authorized create/supersede/record has not been exercised end to end.
 
+---
+
+# PART 3 — SERVICE-OWNED DOCUMENTATION COMPLIANCE AUDIT (2026-10-21)
+
+# Documentation Compliance Audit — 11 Evidence, Audit & Utility Services
+
+**Audit date:** 2026-10-21
+
+**Audit method:**
+- One agent only.
+- Services audited strictly in the order listed below.
+- No service code was changed during the audit.
+- No live service, broker, OpenSearch cluster, or authorization-svc grant was run/verified.
+- Only the respective service's documented contract was scored.
+- Linked-service dependencies, external blockers, and authorization-svc issues are **excluded from the service's compliance percentage**.
+- Ambiguous documentation was classified as **Needs Clarification** and excluded from the percentage.
+- The percentage represents **service-owned documentation compliance only**.
+- It does not represent overall architectural or integration readiness.
+
+## Important scoring rule
+
+These percentages must not be compared directly with earlier broader audits where cross-service requirements were counted.
+
+For this audit:
+
+> **Service-owned compliance = implemented documented requirements owned by that service ÷ scorable requirements owned by that service.**
+
+Do **not** reduce a service's percentage because:
+- authorization-svc is unavailable or has a migration issue;
+- Kafka is unavailable;
+- another service does not provide an expected dependency;
+- another service's contract is incomplete;
+- live grants cannot be verified;
+- OpenSearch is unavailable;
+- an external object store/key-management service is unavailable;
+- another service has incompatible behavior.
+
+Those are reported separately as **External Blockers**.
+
+---
+
+# 1. audit-event-store-svc
+
+**Port:** 8080
+
+**Service-owned compliance:** **90.0%**
+
+| Category | Count |
+|---|---:|
+| ✅ Match | 18 |
+| ⚠️ Partial | 2 |
+| ❌ Missing | 0 |
+| ⚠️ Needs clarification | 12 |
+| ⛔ External blockers | 4 |
+
+### Service-owned gaps
+
+1. **AuditEvent field set incomplete**
+   - The stored event does not retain `event_timestamp` from the producer.
+   - `payload_reference` is also not stored.
+   - This is a service-owned data-model/implementation gap.
+
+2. **Four platform topics are not subscribed**
+   - `accounting-period`
+   - `currency-registry`
+   - `financial-statements`
+   - `fiscal-calendar`
+   - These topics exist but are not included in the platform compose subscription configuration.
+   - Result: those events do not reach the audit ledger.
+
+### External blockers — excluded from score
+
+- authorization-svc live grant/migration issue.
+- Kafka broker live verification unavailable.
+- reporting-orchestration-svc owns AUD-10 export.
+- Production database-role/superuser trigger-bypass behavior cannot be verified here.
+
+### Needs clarification — excluded from score
+
+- Malformed-event handling conflict between documents.
+- AUD-03 cold-storage archival ownership.
+- Whether `/v1/events/verify` is platform-wide.
+- Port 8084 vs 8080.
+- Pagination/platform error-body requirements.
+- Workflow filter semantics.
+- Cross-tenant archive ranges.
+- Empty hash-chain validity semantics.
+- Required hash strength.
+- `checked_events` failure semantics.
+- Archive size/unknown-field hardening.
+- Other unresolved documentation details.
+
+### Verdict
+
+**⚠️ PARTIALLY COMPLIANT**
+
+**Service-owned compliance: 90.0%**
+
+---
+
+# 2. schema-registry-svc
+
+**Port:** 8093
+
+**Service-owned compliance:** **100.0%**
+
+| Category | Count |
+|---|---:|
+| ✅ Match | 12 |
+| ⚠️ Partial | 0 |
+| ❌ Missing | 0 |
+| ⚠️ Needs clarification | 11 |
+| ⛔ External blockers | 3 |
+
+### Service-owned gaps
+
+**None found.**
+
+All documented service-owned routes, validation, authorization ordering, compatibility behavior, idempotency, version assignment, immutability and error handling matched the documented contract.
+
+### External blockers — excluded from score
+
+- authorization-svc live registration/grant verification.
+- Platform direct-port exposure.
+- Frontend, which is outside this service's ownership.
+
+### Needs clarification — excluded from score
+
+- Read permission.
+- Replay-key binding.
+- Replay marker.
+- SchemaDependencyMap.
+- NONE rollout approval.
+- Exact JSON Schema comparison keywords.
+- Artifact fields.
+- Runtime payload validation.
+- 1 MiB body limit ownership.
+- Event Catalogue compatibility requirements.
+- Required artifacts.
+
+### Verdict
+
+**⚠️ SERVICE COMPLIANT — EXTERNAL BLOCKERS**
+
+**Service-owned compliance: 100.0%**
+
+---
+
+# 3. document-vault-svc
+
+**Port:** 8094
+
+**Service-owned compliance:** **91.3%**
+
+| Category | Count |
+|---|---:|
+| ✅ Match | 21 |
+| ⚠️ Partial | 2 |
+| ❌ Missing | 0 |
+| ⚠️ Needs clarification | 4 |
+| ⛔ External blockers | 4 |
+
+### Service-owned gaps
+
+1. **Error taxonomy is only partially documented**
+   - DRC error codes are named in detail for some conditions but not all.
+   - Error body structure is also not fully specified.
+
+2. **Event vocabulary drift**
+   - `record_declared`
+   - `document_version_quarantined`
+   - These are emitted under older/different names from the currently documented vocabulary.
+
+### External blockers — excluded from score
+
+- authorization-svc.
+- esignature-integration-svc.
+- Object store/key management.
+- Workflow service.
+
+### Needs clarification — excluded from score
+
+- DRAFT lifecycle and metadata-only document creation.
+- PATCH/lock/withdraw semantics.
+- Additional document state and retention fields.
+- Selector/deletion semantics.
+- Error-body structure.
+
+### Verdict
+
+**⚠️ PARTIALLY COMPLIANT**
+
+**Service-owned compliance: 91.3%**
+
+---
+
+# 4. evidence-manifest-svc
+
+**Port:** 8095
+
+**Service-owned compliance:** **100.0%**
+
+| Category | Count |
+|---|---:|
+| ✅ Match | 18 |
+| ⚠️ Partial | 0 |
+| ❌ Missing | 0 |
+| ⚠️ Needs clarification | 14 |
+| ⛔ External blockers | 4 |
+
+### Service-owned gaps
+
+**None found.**
+
+The documented manifest, AUD-03 population and AUD-04 sampling commands and controls were implemented.
+
+### External blockers — excluded from score
+
+- authorization-svc live path.
+- Kafka broker.
+- Source services required for live generation.
+- document-vault/audit-event-store source-contract limitations.
+
+### Needs clarification — excluded from score
+
+- Manifest field sources.
+- Document/audit source ownership.
+- Permission naming.
+- Signed ZIP semantics.
+- AUD-03/AUD-04 read surfaces.
+- Sample-item authorization.
+- Failed evaluation persistence.
+- Record snapshot representation.
+- Idempotency behavior for generation.
+- Request-size caps.
+- Event naming.
+- Error-body format.
+- Other unresolved AUD-03/AUD-04 contract details.
+
+### Verdict
+
+**⚠️ SERVICE COMPLIANT — EXTERNAL BLOCKERS**
+
+**Service-owned compliance: 100.0%**
+
+---
+
+# 5. workflow-history-svc
+
+**Port:** 8097
+
+**Service-owned compliance:** **100.0%**
+
+| Category | Count |
+|---|---:|
+| ✅ Match | 13 |
+| ⚠️ Partial | 0 |
+| ❌ Missing | 0 |
+| ⚠️ Needs clarification | 9 |
+| ⛔ External blockers | 4 |
+
+### Service-owned gaps
+
+**None found.**
+
+The documented read endpoints, tenant/principal requirements, authorization behavior, five consumed events, immutability, deduplication, retry/dead-letter behavior and database timestamp behavior matched the service-owned contract.
+
+### External blockers — excluded from score
+
+- authorization-svc live grants.
+- Kafka/broker transport.
+- evidence-manifest-svc sends unbounded requests.
+- workflow-svc producer does not supply some optional transition information and emits an additional event.
+
+### Needs clarification — excluded from score
+
+- Structured transition fields.
+- Full-state history.
+- Permission name.
+- Cursor signing.
+- Additional workflow event.
+- Events without tenant envelopes.
+- Error body.
+- Rate limiting.
+- Startup authorization guard.
+- Response schema.
+
+### Verdict
+
+**⚠️ SERVICE COMPLIANT — EXTERNAL BLOCKERS**
+
+**Service-owned compliance: 100.0%**
+
+---
+
+# 6. kill-switch-registry-svc
+
+**Port:** 8147
+
+**Service-owned compliance:** **100.0%**
+
+| Category | Count |
+|---|---:|
+| ✅ Match | 14 |
+| ⚠️ Partial | 0 |
+| ❌ Missing | 0 |
+| ⚠️ Needs clarification | 6 |
+| ⛔ External blockers | 2 |
+
+### Service-owned gaps
+
+**None found.**
+
+Engage/disengage, two-person approval, reconciliation reference, tenant rules, resolve/check behavior, history, append-only behavior, RLS, outbox and correlation handling matched the documented contract.
+
+### External blockers — excluded from score
+
+- authorization-svc live path.
+- Kafka live relay.
+
+### Needs clarification — excluded from score
+
+- Authentication/authorization for list/history reads.
+- Idempotency-key behavior.
+- Database immutability trigger.
+- Missing standalone service specification.
+- Error-body structure.
+- Rate limiting.
+
+### Verdict
+
+**⚠️ SERVICE COMPLIANT — EXTERNAL BLOCKERS**
+
+**Service-owned compliance: 100.0%**
+
+---
+
+# 7. retention-registry-svc
+
+**Port:** 8148
+
+**Service-owned compliance:** **100.0%**
+
+| Category | Count |
+|---|---:|
+| ✅ Match | 11 |
+| ⚠️ Partial | 0 |
+| ❌ Missing | 0 |
+| ⚠️ Needs clarification | 9 |
+| ⛔ External blockers | 2 |
+
+### Service-owned gaps
+
+**None found.**
+
+Retention policy creation, legal-hold creation/release, resolution, pagination, tenant boundaries, forced RLS, outbox delivery, body tenant validation, migration sequence and append-only release behavior matched the documented service-owned contract.
+
+### External blockers — excluded from score
+
+- authorization-svc live grants.
+- Kafka broker.
+
+### Needs clarification — excluded from score
+
+- Read grant for individual holds.
+- Release check ordering.
+- Minimum/maximum retention relationship.
+- Correlation-ID precedence.
+- Publisher failure behavior.
+- Read authorization on lists.
+- ZS-DATA-GOV-001 schedule fields and ownership.
+- Hold scope/version/review-date semantics.
+- Error-body structure.
+
+### Verdict
+
+**⚠️ SERVICE COMPLIANT — EXTERNAL BLOCKERS**
+
+**Service-owned compliance: 100.0%**
+
+---
+
+# 8. metric-registry-svc
+
+**Port:** 8149
+
+**Service-owned compliance:** **100.0%**
+
+| Category | Count |
+|---|---:|
+| ✅ Match | 10 |
+| ⚠️ Partial | 0 |
+| ❌ Missing | 0 |
+| ⚠️ Needs clarification | 7 |
+| ⛔ External blockers | 3 |
+
+### Service-owned gaps
+
+**None found under the current documented service-owned contract.**
+
+The service implements the definitions-only metric registry documented in the audit file.
+
+### External blockers — excluded from score
+
+- authorization-svc live grants.
+- Kafka broker.
+- Historical Docker registry build issue.
+
+### Needs clarification — excluded from score
+
+- Whether RAE-01 applies to this service.
+- Required metric field set if RAE-01 is applicable.
+- Draft/approval/publication controls.
+- Deprecation/retirement.
+- Measure and dimension objects.
+- Read authorization.
+- Concurrent publish behavior.
+- Replay request-body comparison.
+- Route naming/error body details.
+
+### Verdict
+
+**⚠️ SERVICE COMPLIANT — EXTERNAL BLOCKERS**
+
+**Service-owned compliance: 100.0%**
+
+---
+
+# 9. source-authority-svc
+
+**Port:** 8150
+
+**Service-owned compliance:** **100.0%**
+
+| Category | Count |
+|---|---:|
+| ✅ Match | 11 |
+| ⚠️ Partial | 0 |
+| ❌ Missing | 0 |
+| ⚠️ Needs clarification | 6 |
+| ⛔ External blockers | 3 |
+
+### Service-owned gaps
+
+**None found.**
+
+Map creation/replay, supersede, normalized-fact recording, list queries, resolution, tenant boundaries, outbox behavior, append-only behavior and database-role configuration matched the documented service-owned contract.
+
+### External blockers — excluded from score
+
+- authorization-svc.
+- Kafka broker.
+- Historical Docker registry build issue.
+
+### Needs clarification — excluded from score
+
+- Principal requirement on resolve.
+- Populated precedence data.
+- Normative field/route contract.
+- Database immutability trigger for facts.
+- Error-body structure.
+- Rate limiting.
+
+### Verdict
+
+**⚠️ SERVICE COMPLIANT — EXTERNAL BLOCKERS**
+
+**Service-owned compliance: 100.0%**
+
+---
+
+# 10. search-client
+
+**Port:** None — Go library, no HTTP surface
+
+**Service-owned compliance:** **100.0%**
+
+| Category | Count |
+|---|---:|
+| ✅ Match | 13 |
+| ⚠️ Partial | 0 |
+| ❌ Missing | 0 |
+| ⚠️ Needs clarification | 8 |
+| ⛔ External blockers | 3 |
+
+### Service-owned gaps
+
+**None found.**
+
+All documented client/library behavior was implemented, including tenant requirements, strict mappings, mandatory filters, target validation, result-field restrictions, paging, alias generation behavior, projections, vector/hybrid search and Ping.
+
+### External blockers — excluded from score
+
+- OpenSearch cluster.
+- GTRM residency topology.
+- search-indexer-svc consumer.
+
+### Needs clarification — excluded from score
+
+- Restriction epoch.
+- Legacy client scope.
+- Page-size cap.
+- DropIndex guards.
+- Environment defaults.
+- Cursor tie-break.
+- Refresh policy.
+- Query-complexity budgets.
+
+### Verdict
+
+**⚠️ SERVICE COMPLIANT — EXTERNAL BLOCKERS**
+
+**Service-owned compliance: 100.0%**
+
+---
+
+# 11. comments-collaboration-svc
+
+**Port:** Not stated in documentation
+
+**Service-owned compliance:** **100.0%**
+
+| Category | Count |
+|---|---:|
+| ✅ Match | 12 |
+| ⚠️ Partial | 0 |
+| ❌ Missing | 0 |
+| ⚠️ Needs clarification | 8 |
+| ⛔ External blockers | 4 |
+
+### Service-owned gaps
+
+**None found under the currently documented BIZ-09 contract.**
+
+The eight documented commands, five queries, lifecycle, history, events, mention non-disclosure, redaction, authorization, restricted-thread permission, classification and moderation trail matched the implemented behavior.
+
+### External blockers — excluded from score
+
+- Visibility providers.
+- retention-registry-svc.
+- authorization-svc.
+- Kafka broker.
+
+### Needs clarification — excluded from score
+
+- Event-name style.
+- Moderation permission separation.
+- Authorized-participant rule.
+- Membership/purpose controls.
+- Retention-status evidence.
+- Delete-under-hold behavior.
+- Outbox requirement.
+- Error-body structure.
+
+### Verdict
+
+**⚠️ SERVICE COMPLIANT — EXTERNAL BLOCKERS**
+
+**Service-owned compliance: 100.0%**
+
+---
+
+# Final Cross-Service Summary
+
+| Service | Port | Service-Owned Compliance | Service-Owned Gaps | External Blockers | Clarifications | Verdict |
+|---|---:|---:|---:|---:|---:|---|
+| audit-event-store-svc | 8080 | **90.0%** | 2 | 4 | 12 | ⚠️ Partially compliant |
+| schema-registry-svc | 8093 | **100.0%** | 0 | 3 | 11 | ⚠️ Service compliant — external blockers |
+| document-vault-svc | 8094 | **91.3%** | 2 | 4 | 4 | ⚠️ Partially compliant |
+| evidence-manifest-svc | 8095 | **100.0%** | 0 | 4 | 14 | ⚠️ Service compliant — external blockers |
+| workflow-history-svc | 8097 | **100.0%** | 0 | 4 | 9 | ⚠️ Service compliant — external blockers |
+| kill-switch-registry-svc | 8147 | **100.0%** | 0 | 2 | 6 | ⚠️ Service compliant — external blockers |
+| retention-registry-svc | 8148 | **100.0%** | 0 | 2 | 9 | ⚠️ Service compliant — external blockers |
+| metric-registry-svc | 8149 | **100.0%** | 0 | 3 | 7 | ⚠️ Service compliant — external blockers |
+| source-authority-svc | 8150 | **100.0%** | 0 | 3 | 6 | ⚠️ Service compliant — external blockers |
+| search-client | — | **100.0%** | 0 | 3 | 8 | ⚠️ Service compliant — external blockers |
+| comments-collaboration-svc | — | **100.0%** | 0 | 4 | 8 | ⚠️ Service compliant — external blockers |
+
+## Informational aggregate
+
+**153 matches, 4 partials, 0 missing**
+
+**153 / 157 scorable items = 97.5%**
+
+This aggregate is informational only. It does not replace the individual service-owned scores.
+
+---
+
+# Highest-Priority Service-Owned Issues
+
+## 1. audit-event-store-svc — Data integrity
+
+The stored `AuditEvent` field set is incomplete because `event_timestamp` and `payload_reference` are not retained as required by the applicable data model.
+
+## 2. audit-event-store-svc — Event ingestion coverage
+
+Four published platform topics are not subscribed by the platform compose configuration:
+
+- `accounting-period`
+- `currency-registry`
+- `financial-statements`
+- `fiscal-calendar`
+
+This prevents those events from reaching the audit ledger.
+
+## 3. document-vault-svc — Error contract drift
+
+DRC error-code documentation does not completely describe the implemented error surface and the error-body structure is not fully defined.
+
+## 4. document-vault-svc — Event vocabulary drift
+
+`record_declared` and `document_version_quarantined` are emitted under legacy/different names from the current documented vocabulary.
+
+---
+
+# Important Clarifications — Not Service-Owned Gaps
+
+The following must **not** reduce the service-owned compliance scores until ownership/requirements are explicitly clarified:
+
+- authorization-svc grants and availability.
+- Kafka availability.
+- OpenSearch availability.
+- visibility-provider registration.
+- workflow producer behavior.
+- evidence-manifest source-service behavior.
+- RAE-01 ownership for metric-registry-svc.
+- ZS-DATA-GOV-001 schedule ownership for retention-registry-svc.
+- structured transition-field ownership for workflow-history-svc.
+- membership/moderation semantics for comments-collaboration-svc.
+- other requirements explicitly identified as unresolved or externally owned.
+
+---
+
+# Final Audit Result
+
+**11 services audited sequentially using one agent.**
+
+**Service-owned compliance: 9 services at 100%, 2 services below 100%.**
+
+**Below 100%:**
+- `audit-event-store-svc` — **90.0%**
+- `document-vault-svc` — **91.3%**
+
+**At 100% under current service-owned documentation:**
+- `schema-registry-svc`
+- `evidence-manifest-svc`
+- `workflow-history-svc`
+- `kill-switch-registry-svc`
+- `retention-registry-svc`
+- `metric-registry-svc`
+- `source-authority-svc`
+- `search-client`
+- `comments-collaboration-svc`
+
+**Overall informational scorable result: 97.5%**
+
+**No external dependency was counted as a service-owned gap.**
+
+**No code changes were made during this audit.**

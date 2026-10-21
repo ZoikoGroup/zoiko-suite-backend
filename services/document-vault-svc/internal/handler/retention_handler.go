@@ -42,11 +42,19 @@ type RetentionStore interface {
 	ActivateLegalHold(ctx context.Context, p domain.ActivateLegalHoldParams) (*domain.LegalHold, error)
 	AddLegalHoldTarget(ctx context.Context, p domain.AddLegalHoldTargetParams) (*domain.LegalHoldTarget, error)
 	ReleaseLegalHold(ctx context.Context, p domain.ReleaseLegalHoldParams) (*domain.LegalHold, error)
+	RecordLegalEntities(ctx context.Context, recordIDs []string) (map[string]string, error)
+	EvaluateRetentionAt(ctx context.Context, p domain.EvaluateRetentionParams) ([]domain.RetentionEvaluation, error)
+	CreateDispositionCandidate(ctx context.Context, p domain.CreateDispositionCandidateParams) (*domain.RecordRetentionState, error)
+	ResolveLegalHoldTargets(ctx context.Context, p domain.ResolveLegalHoldTargetsParams) (*domain.HoldResolution, error)
 	ListLegalHoldTargets(ctx context.Context, holdID string) ([]domain.LegalHoldTarget, error)
 }
 
 func RegisterRetentionRoutes(r chi.Router, h *Handler, retentionStore RetentionStore) {
 	rh := &retentionHandler{Handler: h, store: retentionStore}
+	// ZS-SVC-S-001 §9.2 routes; see drc_routes.go.
+	r.Post("/v1/retention:evaluate", rh.EvaluateRetention)
+	r.Post("/v1/dispositions", rh.CreateDisposition)
+	r.Post("/v1/dispositions/{disposition_id}:approve", rh.ApproveDisposition)
 	r.Route("/v1/retention-rules", func(r chi.Router) {
 		r.Post("/", rh.CreateRetentionRuleVersion)
 		r.Get("/{retention_rule_version_id}", rh.GetRetentionRuleVersion)
@@ -69,6 +77,11 @@ func RegisterRetentionRoutes(r chi.Router, h *Handler, retentionStore RetentionS
 		r.Post("/{hold_id}/targets", rh.AddLegalHoldTarget)
 		r.Get("/{hold_id}/targets", rh.ListLegalHoldTargets)
 		r.Post("/{hold_id}/release", rh.ReleaseLegalHold)
+		// ZS-SVC-S-001 §9.2: POST /v1/legal-holds/{id}:release — the same handler,
+		// two-person rule and transaction as /release.
+		r.Post("/{hold_id}:release", rh.ReleaseLegalHold)
+		// §9.2: POST /v1/legal-holds/{id}:resolve-targets (explicit-object scope).
+		r.Post("/{hold_id}:resolve-targets", rh.ResolveLegalHoldTargets)
 	})
 }
 
@@ -87,6 +100,9 @@ type createRetentionRuleRequest struct {
 	TriggerType          string `json:"trigger_type"`
 	DurationDays         int    `json:"duration_days"`
 	DispositionAction    string `json:"disposition_action"`
+	// EffectiveFrom/EffectiveTo are §5.2 effective_from/effective_to (RFC 3339).
+	EffectiveFrom *time.Time `json:"effective_from"`
+	EffectiveTo   *time.Time `json:"effective_to"`
 }
 
 func (h *retentionHandler) CreateRetentionRuleVersion(w http.ResponseWriter, r *http.Request) {
@@ -108,6 +124,7 @@ func (h *retentionHandler) CreateRetentionRuleVersion(w http.ResponseWriter, r *
 		RecordClass: req.RecordClass, JurisdictionSelector: req.JurisdictionSelector, LegalBasisRef: req.LegalBasisRef,
 		PurposeRef: req.PurposeRef, TriggerType: req.TriggerType, DurationDays: req.DurationDays,
 		DispositionAction: req.DispositionAction, CreatedByPrincipalID: principalID,
+		EffectiveFrom: req.EffectiveFrom, EffectiveTo: req.EffectiveTo,
 	})
 	if err != nil {
 		h.handleRetentionStoreError(w, err)
@@ -576,7 +593,7 @@ func (h *retentionHandler) handleRetentionStoreError(w http.ResponseWriter, err 
 		writeError(w, http.StatusNotFound, "not_found", err.Error())
 	case errors.Is(err, domain.ErrInvalidRecordClass), errors.Is(err, domain.ErrJurisdictionScopeRequired),
 		errors.Is(err, domain.ErrInvalidTriggerType), errors.Is(err, domain.ErrInvalidDispositionAction),
-		errors.Is(err, domain.ErrNoRecordIDsForHold):
+		errors.Is(err, domain.ErrNoRecordIDsForHold), errors.Is(err, domain.ErrNoRecordIDsToResolve):
 		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
 	case errors.Is(err, domain.ErrLegalHoldSelfRelease):
 		writeError(w, http.StatusForbidden, "self_release_forbidden", err.Error())
@@ -587,7 +604,7 @@ func (h *retentionHandler) handleRetentionStoreError(w http.ResponseWriter, err 
 		errors.Is(err, domain.ErrRetentionStateNotDue), errors.Is(err, domain.ErrRetentionStateNotReviewRequired),
 		errors.Is(err, domain.ErrNotYetDue), errors.Is(err, domain.ErrRecordUnderLegalHold),
 		errors.Is(err, domain.ErrLegalHoldNotDraft), errors.Is(err, domain.ErrLegalHoldNotActive),
-		errors.Is(err, domain.ErrLegalHoldTargetExists):
+		errors.Is(err, domain.ErrLegalHoldTargetExists), errors.Is(err, domain.ErrLegalHoldReleased):
 		writeError(w, http.StatusConflict, "conflict", err.Error())
 	default:
 		h.handleStoreError(w, err)

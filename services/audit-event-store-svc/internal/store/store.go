@@ -319,6 +319,14 @@ type FakeStore struct {
 	// reachable by the tenant that created it.
 	archives      map[string]domain.Archive
 	verifications map[string][]domain.ArchiveVerification
+	// idem mirrors migration 000007: (tenant, endpoint, key) -> fingerprint and
+	// the archive first created under it.
+	idem map[string]fakeIdem
+}
+
+type fakeIdem struct {
+	fingerprint string
+	archive     domain.Archive
 }
 
 // NewFakeStore returns an initialised FakeStore.
@@ -327,6 +335,7 @@ func NewFakeStore() *FakeStore {
 		events:        make(map[string]AuditEvent),
 		archives:      make(map[string]domain.Archive),
 		verifications: make(map[string][]domain.ArchiveVerification),
+		idem:          make(map[string]fakeIdem),
 	}
 }
 
