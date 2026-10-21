@@ -61,10 +61,10 @@ func TestPgStore_AdjustmentLifecycle_EnqueuesFourEvents(t *testing.T) {
 	adj := newTestAdjustment(tenantID, "group-le-1", "preparer-1")
 
 	journalID := uuid.NewString()
-	require.NoError(t, s.CreateAdjustment(ctx, adj, "corr-create"))
-	require.NoError(t, s.ApproveAdjustment(ctx, adj.ConsolidationAdjustmentID, "approver-1", "corr-approve"))
-	require.NoError(t, s.MarkAdjustmentPosted(ctx, adj.ConsolidationAdjustmentID, "poster-1", journalID, "corr-post"))
-	require.NoError(t, s.ReverseAdjustment(ctx, adj.ConsolidationAdjustmentID, "reverser-1", "correction", nil, "corr-reverse"))
+	require.NoError(t, createAdjustment(s, ctx, adj, "corr-create"))
+	require.NoError(t, approveAdjustment(s, ctx, adj.ConsolidationAdjustmentID, "approver-1", "corr-approve"))
+	require.NoError(t, postAdjustment(s, ctx, adj.ConsolidationAdjustmentID, "poster-1", journalID, "corr-post"))
+	require.NoError(t, reverseAdjustment(s, ctx, adj.ConsolidationAdjustmentID, "reverser-1", "correction", nil, "corr-reverse"))
 
 	rows := outboxRowsFor(t, pool, tenantID, adj.ConsolidationAdjustmentID)
 	require.Len(t, rows, 4, "one event per lifecycle command, all keyed on the adjustment's own id")
@@ -112,15 +112,15 @@ func TestPgStore_AdjustmentTransitionFromWrongStatus_EnqueuesNothing(t *testing.
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 	adj := newTestAdjustment(tenantID, "group-le-1", "preparer-1")
 
-	require.NoError(t, s.CreateAdjustment(ctx, adj, "corr-create"))
-	require.NoError(t, s.ApproveAdjustment(ctx, adj.ConsolidationAdjustmentID, "approver-1", "corr-approve"))
+	require.NoError(t, createAdjustment(s, ctx, adj, "corr-create"))
+	require.NoError(t, approveAdjustment(s, ctx, adj.ConsolidationAdjustmentID, "approver-1", "corr-approve"))
 
 	before := outboxRowsFor(t, pool, tenantID, adj.ConsolidationAdjustmentID)
 	require.Len(t, before, 2)
 
 	// A second approval cannot move APPROVED -> APPROVED; the guarded UPDATE
 	// affects no row, so no third event may be left behind.
-	require.Error(t, s.ApproveAdjustment(ctx, adj.ConsolidationAdjustmentID, "approver-2", "corr-again"))
+	require.Error(t, approveAdjustment(s, ctx, adj.ConsolidationAdjustmentID, "approver-2", "corr-again"))
 
 	after := outboxRowsFor(t, pool, tenantID, adj.ConsolidationAdjustmentID)
 	require.Len(t, after, 2)
@@ -134,8 +134,8 @@ func TestPgStore_CreateAdjustment_InsertFailure_EnqueuesNothing(t *testing.T) {
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 	adj := newTestAdjustment(tenantID, "group-le-1", "preparer-1")
 
-	require.NoError(t, s.CreateAdjustment(ctx, adj, "corr-create"))
-	require.Error(t, s.CreateAdjustment(ctx, adj, "corr-duplicate"), "same primary key must fail")
+	require.NoError(t, createAdjustment(s, ctx, adj, "corr-create"))
+	require.Error(t, createAdjustment(s, ctx, adj, "corr-duplicate"), "same primary key must fail")
 
 	rows := outboxRowsFor(t, pool, tenantID, adj.ConsolidationAdjustmentID)
 	require.Len(t, rows, 1, "a failed CreateAdjustment must not leave a second created event behind")

@@ -57,7 +57,7 @@ func TestPgStore_Eliminations_RoundTrip_RealDB(t *testing.T) {
 	tenantID := uuid.NewString()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 	run := newTestRun(tenantID, "le-group")
-	require.NoError(t, s.CreateRun(ctx, run, "principal-1", "corr-1"))
+	require.NoError(t, createRun(s, ctx, run, "principal-1", "corr-1"))
 
 	rows := eliminationRows(tenantID, run.ConsolidationRunID)
 	require.NoError(t, s.CreateEliminations(ctx, rows))
@@ -91,7 +91,7 @@ func TestPgStore_Eliminations_AllOrNone_RealDB(t *testing.T) {
 	tenantID := uuid.NewString()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 	run := newTestRun(tenantID, "le-group")
-	require.NoError(t, s.CreateRun(ctx, run, "principal-1", "corr-1"))
+	require.NoError(t, createRun(s, ctx, run, "principal-1", "corr-1"))
 
 	rows := eliminationRows(tenantID, run.ConsolidationRunID)
 	rows[1].IntercompanyEntryID = rows[0].IntercompanyEntryID
@@ -109,7 +109,7 @@ func TestPgStore_Eliminations_ConstraintsAndAppendOnly_RealDB(t *testing.T) {
 	tenantID := uuid.NewString()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 	run := newTestRun(tenantID, "le-group")
-	require.NoError(t, s.CreateRun(ctx, run, "principal-1", "corr-1"))
+	require.NoError(t, createRun(s, ctx, run, "principal-1", "corr-1"))
 
 	for name, mutate := range map[string]func(e *domain.Elimination){
 		"eliminated with no line":  func(e *domain.Elimination) { e.Lines = nil },
@@ -167,7 +167,7 @@ func TestMigration000007_Down_RealDB(t *testing.T) {
 	tenantID := uuid.NewString()
 	tctx := svcmiddleware.WithTenant(ctx, tenantID)
 	run := newTestRun(tenantID, "le-group")
-	require.NoError(t, s.CreateRun(tctx, run, "principal-1", "corr-1"))
+	require.NoError(t, createRun(s, tctx, run, "principal-1", "corr-1"))
 	require.NoError(t, s.CreateEliminations(tctx, eliminationRows(tenantID, run.ConsolidationRunID)))
 
 	_, err = pool.Exec(ctx, read("000007_add_consolidation_eliminations.down.sql"))

@@ -69,6 +69,17 @@ type ConsolidationRunResponse struct {
 	Eliminations       []Elimination     `json:"eliminations,omitempty"`
 }
 
+// RunNotCompletedResponse is what StartRun answers when its final CompleteRun
+// write failed. The run exists — it was created RUNNING before any of the work
+// — so the response names the run and the state the store actually holds,
+// rather than a 201 COMPLETED for a status that was never persisted (A14).
+type RunNotCompletedResponse struct {
+	ErrorCode          string `json:"error_code"`
+	ErrorMessage       string `json:"error_message"`
+	ConsolidationRunID string `json:"consolidation_run_id"`
+	Status             string `json:"status"`
+}
+
 // ConsolidationAdjustment is ACC-12's own authority — "owns Consolidation
 // adjustment lifecycle. Must never own: Entity statutory ledgers." Fuller
 // ownership: "ConsolidationAdjustment, elimination rule version, approval
@@ -119,6 +130,18 @@ type ConsolidationAdjustmentLine struct {
 const (
 	AdjustmentTypeElimination = "ELIMINATION"
 	AdjustmentTypeManual      = "MANUAL"
+)
+
+// Command names recorded in command_idempotency.command (migration 000008).
+// Each names what was decided, not just which endpoint was called, so one key
+// cannot replay a different command on the same target. They are domain
+// constants because both the HTTP handler and the store need the exact text.
+const (
+	CommandStartRun          = "START_RUN"
+	CommandCreateAdjustment  = "CREATE_ADJUSTMENT"
+	CommandApproveAdjustment = "APPROVE_ADJUSTMENT"
+	CommandPostAdjustment    = "POST_ADJUSTMENT"
+	CommandReverseAdjustment = "REVERSE_ADJUSTMENT"
 )
 
 const (
@@ -224,4 +247,16 @@ var (
 	ErrInvalidSupersession = errorString("superseded_by_adjustment_id must name a different, unreversed adjustment for the same group and fiscal period")
 
 	ErrReasonRequired = errorString("reason is required to reverse a consolidation adjustment")
+
+	// ── Command idempotency (migration 000008) ──────────────────────────
+
+	// ErrIdempotencyKeyRequired: every mutating command in this service
+	// creates a run or moves an adjustment, so the caller must supply the
+	// Idempotency-Key that lets a retry be recognised as one.
+	ErrIdempotencyKeyRequired = errorString("an Idempotency-Key is required for this command")
+
+	// ErrIdempotencyKeyConflict: the key was already used for a different
+	// command or a different resource. Replaying it would return another
+	// command's result, so it is refused rather than guessed at.
+	ErrIdempotencyKeyConflict = errorString("idempotency key already used for a different command or resource")
 )

@@ -24,7 +24,11 @@ import (
 )
 
 type Store interface {
-	CreateRun(ctx context.Context, run *domain.ConsolidationRun, actorID, correlationID string) error
+	// CreateRun claims the Idempotency-Key and creates the run in one
+	// transaction (migration 000008). A repeat for the same request returns
+	// the run as it now stands with replay=true; the same key for a different
+	// command or request is domain.ErrIdempotencyKeyConflict.
+	CreateRun(ctx context.Context, run *domain.ConsolidationRun, idempotencyKey, actorID, correlationID string) (*domain.ConsolidationRun, bool, error)
 	GetRun(ctx context.Context, id string) (*domain.ConsolidationRun, error)
 	ListRuns(ctx context.Context, groupLegalEntityID string) ([]domain.ConsolidationRun, error)
 	// CompleteRun enqueues the run's completion events (only for status
@@ -43,16 +47,23 @@ type Store interface {
 	BalanceContributionsPopulation(ctx context.Context, q domain.BalanceContributionsQuery) (*domain.ControlPopulationPage, error)
 
 	// ACC-12 Elimination & Consolidation Adjustments — see migration
-	// 000003's doc comment.
+	// 000003's doc comment. Every mutating command claims its
+	// Idempotency-Key in the transaction that makes the change (migration
+	// 000008); a repeat for the same command and adjustment returns the
+	// adjustment as it now stands with replay=true.
 	GroupEntityHasRun(ctx context.Context, groupLegalEntityID string) (bool, error)
 	HasSnapshotForPeriod(ctx context.Context, groupLegalEntityID, fiscalPeriod string) (bool, error)
-	CreateAdjustment(ctx context.Context, a *domain.ConsolidationAdjustment, correlationID string) error
+	CreateAdjustment(ctx context.Context, a *domain.ConsolidationAdjustment, idempotencyKey, correlationID string) (*domain.ConsolidationAdjustment, bool, error)
 	GetAdjustment(ctx context.Context, id string) (*domain.ConsolidationAdjustment, error)
 	GetAdjustmentHistory(ctx context.Context, id string) (*domain.AdjustmentHistory, error)
 	ListAdjustments(ctx context.Context, groupLegalEntityID, fiscalPeriod string) ([]domain.ConsolidationAdjustment, error)
-	ApproveAdjustment(ctx context.Context, id, principalID, correlationID string) error
-	MarkAdjustmentPosted(ctx context.Context, id, principalID, journalID, correlationID string) error
-	ReverseAdjustment(ctx context.Context, id, principalID, reason string, supersededBy *string, correlationID string) error
+	ApproveAdjustment(ctx context.Context, id, principalID, idempotencyKey, correlationID string) (*domain.ConsolidationAdjustment, bool, error)
+	MarkAdjustmentPosted(ctx context.Context, id, principalID, journalID, idempotencyKey, correlationID string) (*domain.ConsolidationAdjustment, bool, error)
+	ReverseAdjustment(ctx context.Context, id, principalID, reason string, supersededBy *string, idempotencyKey, correlationID string) (*domain.ConsolidationAdjustment, bool, error)
+	// ReplayedAdjustmentCommand is the pre-flight replay check before an
+	// external ledger call and before a status guard the original command
+	// has already moved past.
+	ReplayedAdjustmentCommand(ctx context.Context, id, command, idempotencyKey string) (bool, error)
 }
 
 type AuthZClient interface {
@@ -153,6 +164,11 @@ func (h *Handler) StartRun(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	idempotencyKey := r.Header.Get("Idempotency-Key")
+	if idempotencyKey == "" {
+		writeError(w, http.StatusBadRequest, "missing_idempotency_key", domain.ErrIdempotencyKeyRequired.Error())
+		return
+	}
 
 	if err := h.authz.CheckAllowed(r.Context(), principalID, req.GroupLegalEntityID, actionRunInitiate); err != nil {
 		h.writeAuthzErr(w, err)
@@ -176,9 +192,22 @@ func (h *Handler) StartRun(w http.ResponseWriter, r *http.Request) {
 		StartedAt:          now,
 	}
 
-	if err := h.store.CreateRun(r.Context(), run, principalID, correlationID); err != nil {
+	// The key is claimed here, in the transaction that creates the run and
+	// before any of the run's work: a retried POST must never create a second
+	// run, whether the first attempt is still running, failed halfway, or
+	// completed. A replay answers with the run as the store now holds it.
+	persisted, replay, err := h.store.CreateRun(r.Context(), run, idempotencyKey, principalID, correlationID)
+	if err != nil {
+		if errors.Is(err, domain.ErrIdempotencyKeyConflict) {
+			writeError(w, http.StatusConflict, "idempotency_key_conflict", err.Error())
+			return
+		}
 		h.log.Error("failed to create consolidation run", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	if replay {
+		h.writeRunReplay(w, r, persisted)
 		return
 	}
 
@@ -301,7 +330,23 @@ func (h *Handler) StartRun(w http.ResponseWriter, r *http.Request) {
 	completedAt := time.Now().UTC()
 	exceptionCount := len(eliminationExceptions)
 	if err := h.store.CompleteRun(r.Context(), runID, "COMPLETED", exceptionCount, completedAt, principalID, correlationID, len(snapshots), eliminationExceptions); err != nil {
-		h.log.Error("failed to mark consolidation run completed", zap.Error(err))
+		// The run row was created RUNNING, and this write is the only thing
+		// that could have moved it. Answering 201 COMPLETED here would report
+		// a state the store never persisted (A14): report the run's actual
+		// state instead, with the id needed to look it up.
+		h.log.Error("failed to mark consolidation run completed",
+			zap.String("consolidation_run_id", runID), zap.Error(err))
+		persistedStatus := "RUNNING"
+		if persistedRun, getErr := h.store.GetRun(r.Context(), runID); getErr == nil && persistedRun != nil {
+			persistedStatus = persistedRun.Status
+		}
+		writeJSON(w, http.StatusServiceUnavailable, domain.RunNotCompletedResponse{
+			ErrorCode:          "run_not_completed",
+			ErrorMessage:       "the run was not marked COMPLETED: " + err.Error(),
+			ConsolidationRunID: runID,
+			Status:             persistedStatus,
+		})
+		return
 	}
 
 	writeJSON(w, http.StatusCreated, domain.ConsolidationRunResponse{
@@ -311,6 +356,36 @@ func (h *Handler) StartRun(w http.ResponseWriter, r *http.Request) {
 		Status:             "COMPLETED",
 		ExceptionCount:     exceptionCount,
 		StartedAt:          now,
+		Snapshots:          snapshots,
+		Eliminations:       eliminations,
+	})
+}
+
+// writeRunReplay answers a repeated StartRun from what the store holds for the
+// run its Idempotency-Key already created: the run's current status plus the
+// snapshots and eliminations recorded so far. It creates nothing and runs none
+// of the A2 elimination work again.
+func (h *Handler) writeRunReplay(w http.ResponseWriter, r *http.Request, run *domain.ConsolidationRun) {
+	snapshots, err := h.store.ListSnapshotsByRun(r.Context(), run.ConsolidationRunID)
+	if err != nil {
+		h.log.Error("failed to read a replayed run's snapshots", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	eliminations, err := h.store.ListEliminationsByRun(r.Context(), run.ConsolidationRunID)
+	if err != nil {
+		h.log.Error("failed to read a replayed run's eliminations", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	w.Header().Set("Idempotent-Replay", "true")
+	writeJSON(w, http.StatusOK, domain.ConsolidationRunResponse{
+		ConsolidationRunID: run.ConsolidationRunID,
+		GroupLegalEntityID: run.GroupLegalEntityID,
+		FiscalPeriod:       run.FiscalPeriod,
+		Status:             run.Status,
+		ExceptionCount:     run.ExceptionCount,
+		StartedAt:          run.StartedAt,
 		Snapshots:          snapshots,
 		Eliminations:       eliminations,
 	})
@@ -587,6 +662,11 @@ func (h *Handler) CreateEliminationProposal(w http.ResponseWriter, r *http.Reque
 	if !ok {
 		return
 	}
+	idempotencyKey := r.Header.Get("Idempotency-Key")
+	if idempotencyKey == "" {
+		writeError(w, http.StatusBadRequest, "missing_idempotency_key", domain.ErrIdempotencyKeyRequired.Error())
+		return
+	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, req.GroupLegalEntityID, actionAdjustmentCreate); err != nil {
 		h.writeAuthzErr(w, err)
 		return
@@ -665,13 +745,22 @@ func (h *Handler) CreateEliminationProposal(w http.ResponseWriter, r *http.Reque
 		CreatedAt:            now,
 		CreatedByPrincipalID: principalID,
 	}
-	if err := h.store.CreateAdjustment(r.Context(), adjustment, getCorrelationID(r)); err != nil {
+	persisted, replay, err := h.store.CreateAdjustment(r.Context(), adjustment, idempotencyKey, getCorrelationID(r))
+	if err != nil {
+		if errors.Is(err, domain.ErrIdempotencyKeyConflict) {
+			writeError(w, http.StatusConflict, "idempotency_key_conflict", err.Error())
+			return
+		}
 		h.log.Error("failed to create consolidation adjustment", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
-
-	writeJSON(w, http.StatusCreated, adjustment)
+	if replay {
+		w.Header().Set("Idempotent-Replay", "true")
+		writeJSON(w, http.StatusOK, persisted)
+		return
+	}
+	writeJSON(w, http.StatusCreated, persisted)
 }
 
 // ── GET /v1/consolidation/adjustments ─────────────────────────────────────────────
@@ -737,6 +826,11 @@ func (h *Handler) ApproveConsolidationAdjustment(w http.ResponseWriter, r *http.
 	if !ok {
 		return
 	}
+	idempotencyKey := r.Header.Get("Idempotency-Key")
+	if idempotencyKey == "" {
+		writeError(w, http.StatusBadRequest, "missing_idempotency_key", domain.ErrIdempotencyKeyRequired.Error())
+		return
+	}
 	a, err := h.store.GetAdjustment(r.Context(), id)
 	if errors.Is(err, domain.ErrAdjustmentNotFound) {
 		writeError(w, http.StatusNotFound, "adjustment_not_found", "")
@@ -760,16 +854,28 @@ func (h *Handler) ApproveConsolidationAdjustment(w http.ResponseWriter, r *http.
 		return
 	}
 
-	if err := h.store.ApproveAdjustment(r.Context(), id, principalID, getCorrelationID(r)); err != nil {
+	persisted, replay, err := h.store.ApproveAdjustment(r.Context(), id, principalID, idempotencyKey, getCorrelationID(r))
+	if err != nil {
+		if errors.Is(err, domain.ErrIdempotencyKeyConflict) {
+			writeError(w, http.StatusConflict, "idempotency_key_conflict", err.Error())
+			return
+		}
 		if errors.Is(err, domain.ErrInvalidAdjustmentTransition) {
 			writeError(w, http.StatusUnprocessableEntity, "invalid_transition", err.Error())
+			return
+		}
+		if errors.Is(err, domain.ErrAdjustmentNotFound) {
+			writeError(w, http.StatusNotFound, "adjustment_not_found", "")
 			return
 		}
 		h.log.Error("failed to approve consolidation adjustment", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": domain.AdjustmentStatusApproved})
+	if replay {
+		w.Header().Set("Idempotent-Replay", "true")
+	}
+	writeJSON(w, http.StatusOK, adjustmentCommandResponse(persisted))
 }
 
 // ── POST /v1/consolidation/adjustments/{id}/post ──────────────────────────────────
@@ -779,6 +885,11 @@ func (h *Handler) PostConsolidationAdjustment(w http.ResponseWriter, r *http.Req
 	correlationID := getCorrelationID(r)
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
+		return
+	}
+	idempotencyKey := r.Header.Get("Idempotency-Key")
+	if idempotencyKey == "" {
+		writeError(w, http.StatusBadRequest, "missing_idempotency_key", domain.ErrIdempotencyKeyRequired.Error())
 		return
 	}
 	a, err := h.store.GetAdjustment(r.Context(), id)
@@ -791,6 +902,26 @@ func (h *Handler) PostConsolidationAdjustment(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
+
+	// A retry of a POST that already succeeded must answer with its result,
+	// not fall into the APPROVED-only guard below or post the journal again.
+	// Checked before the guard and before the ledger call.
+	replay, err := h.store.ReplayedAdjustmentCommand(r.Context(), id, domain.CommandPostAdjustment, idempotencyKey)
+	if err != nil {
+		if errors.Is(err, domain.ErrIdempotencyKeyConflict) {
+			writeError(w, http.StatusConflict, "idempotency_key_conflict", err.Error())
+			return
+		}
+		h.log.Error("failed to check the post command's idempotency key", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	if replay {
+		w.Header().Set("Idempotent-Replay", "true")
+		writeJSON(w, http.StatusOK, adjustmentCommandResponse(a))
+		return
+	}
+
 	if a.Status != domain.AdjustmentStatusApproved {
 		writeError(w, http.StatusUnprocessableEntity, "invalid_transition", domain.ErrInvalidAdjustmentTransition.Error())
 		return
@@ -815,14 +946,22 @@ func (h *Handler) PostConsolidationAdjustment(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	if err := h.store.MarkAdjustmentPosted(r.Context(), id, principalID, journalID, correlationID); err != nil {
+	persisted, replay, err := h.store.MarkAdjustmentPosted(r.Context(), id, principalID, journalID, idempotencyKey, correlationID)
+	if err != nil {
+		if errors.Is(err, domain.ErrIdempotencyKeyConflict) {
+			writeError(w, http.StatusConflict, "idempotency_key_conflict", err.Error())
+			return
+		}
 		h.log.Error("consolidation adjustment journal posted but the adjustment could not be marked POSTED",
 			zap.String("consolidation_adjustment_id", id), zap.String("journal_id", journalID), zap.Error(err))
 		writeError(w, http.StatusInternalServerError, "adjustment_not_recorded",
 			"the journal IS posted ("+journalID+"), but the adjustment could not be marked POSTED.")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": domain.AdjustmentStatusPosted, "consolidation_book_journal_id": journalID})
+	if replay {
+		w.Header().Set("Idempotent-Replay", "true")
+	}
+	writeJSON(w, http.StatusOK, adjustmentCommandResponse(persisted))
 }
 
 // ── POST /v1/consolidation/adjustments/{id}/reverse ───────────────────────────────
@@ -843,6 +982,11 @@ func (h *Handler) ReverseConsolidationAdjustment(w http.ResponseWriter, r *http.
 	if !ok {
 		return
 	}
+	idempotencyKey := r.Header.Get("Idempotency-Key")
+	if idempotencyKey == "" {
+		writeError(w, http.StatusBadRequest, "missing_idempotency_key", domain.ErrIdempotencyKeyRequired.Error())
+		return
+	}
 	a, err := h.store.GetAdjustment(r.Context(), id)
 	if errors.Is(err, domain.ErrAdjustmentNotFound) {
 		writeError(w, http.StatusNotFound, "adjustment_not_found", "")
@@ -853,6 +997,27 @@ func (h *Handler) ReverseConsolidationAdjustment(w http.ResponseWriter, r *http.
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
+
+	// A retry of a reversal that already succeeded must answer with its
+	// result, not fail the POSTED-only guard or the supersession checks (the
+	// named replacement may itself have been reversed since) and, above all,
+	// must not call general-ledger-svc's reversal endpoint a second time.
+	replay, err := h.store.ReplayedAdjustmentCommand(r.Context(), id, domain.CommandReverseAdjustment, idempotencyKey)
+	if err != nil {
+		if errors.Is(err, domain.ErrIdempotencyKeyConflict) {
+			writeError(w, http.StatusConflict, "idempotency_key_conflict", err.Error())
+			return
+		}
+		h.log.Error("failed to check the reverse command's idempotency key", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	if replay {
+		w.Header().Set("Idempotent-Replay", "true")
+		writeJSON(w, http.StatusOK, adjustmentCommandResponse(a))
+		return
+	}
+
 	if a.Status != domain.AdjustmentStatusPosted {
 		writeError(w, http.StatusUnprocessableEntity, "invalid_transition", domain.ErrInvalidAdjustmentTransition.Error())
 		return
@@ -912,7 +1077,12 @@ func (h *Handler) ReverseConsolidationAdjustment(w http.ResponseWriter, r *http.
 		}
 	}
 
-	if err := h.store.ReverseAdjustment(r.Context(), id, principalID, req.Reason, req.SupersededByAdjustmentID, getCorrelationID(r)); err != nil {
+	persisted, replay, err := h.store.ReverseAdjustment(r.Context(), id, principalID, req.Reason, req.SupersededByAdjustmentID, idempotencyKey, getCorrelationID(r))
+	if err != nil {
+		if errors.Is(err, domain.ErrIdempotencyKeyConflict) {
+			writeError(w, http.StatusConflict, "idempotency_key_conflict", err.Error())
+			return
+		}
 		if errors.Is(err, domain.ErrInvalidAdjustmentTransition) {
 			writeError(w, http.StatusUnprocessableEntity, "invalid_transition", err.Error())
 			return
@@ -921,10 +1091,26 @@ func (h *Handler) ReverseConsolidationAdjustment(w http.ResponseWriter, r *http.
 		writeError(w, http.StatusInternalServerError, "adjustment_not_recorded", err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": domain.AdjustmentStatusReversed})
+	if replay {
+		w.Header().Set("Idempotent-Replay", "true")
+	}
+	writeJSON(w, http.StatusOK, adjustmentCommandResponse(persisted))
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────────
+
+// adjustmentCommandResponse is the answer to a successful or replayed
+// approve/post/reverse: the adjustment's status as the store now holds it, plus
+// the consolidation-book journal id when one is recorded. A replay therefore
+// reports where the adjustment actually stands, which may be a later state than
+// the command originally produced.
+func adjustmentCommandResponse(a *domain.ConsolidationAdjustment) map[string]string {
+	out := map[string]string{"status": a.Status}
+	if a.ConsolidationBookJournalID != nil {
+		out["consolidation_book_journal_id"] = *a.ConsolidationBookJournalID
+	}
+	return out
+}
 
 func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
 	principalID := r.Header.Get("X-Principal-Id")

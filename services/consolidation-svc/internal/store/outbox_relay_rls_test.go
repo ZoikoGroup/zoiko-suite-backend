@@ -67,7 +67,7 @@ func TestRelay_DeliversUnderAppRole(t *testing.T) {
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 	run := newTestRun(tenantID, "group-le-1")
 	run.Status = "RUNNING"
-	require.NoError(t, s.CreateRun(ctx, run, "principal-1", "corr-1"))
+	require.NoError(t, createRun(s, ctx, run, "principal-1", "corr-1"))
 
 	w := &capturingWriter{}
 	relay, err := outbox.NewRelay(app, w, outbox.DefaultConfig(), zap.NewNop())
@@ -97,7 +97,7 @@ func TestOutboxRLS_TenantCannotSeeAnotherTenantsEvents(t *testing.T) {
 	s := store.New(app, zap.NewNop(), store.WithEventRegion("uk"))
 	tenantID := uuid.NewString()
 	run := newTestRun(tenantID, "group-le-1")
-	require.NoError(t, s.CreateRun(svcmiddleware.WithTenant(context.Background(), tenantID), run, "principal-1", "corr-1"))
+	require.NoError(t, createRun(s, svcmiddleware.WithTenant(context.Background(), tenantID), run, "principal-1", "corr-1"))
 
 	ctx := context.Background()
 	tx, err := app.Begin(ctx)

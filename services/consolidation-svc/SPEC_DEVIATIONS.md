@@ -195,12 +195,22 @@ consolidation entries in a group entity's statutory ledger.
   `X-Principal-Id`. No other service calls these endpoints (checked across
   the repository), so requiring the filter is safe, but it is an API contract
   change and is left for an explicit decision.
-- **A14. No `Idempotency-Key`/`expected_version`, and `StartRun` is not
-  idempotent.** A retried `POST /v1/consolidation/runs` creates a second run.
-  Adjustment commands rely on status guards only (same as
-  intercompany-accounting-svc A10). If the final `CompleteRun` write fails,
-  the handler logs it and still answers 201 COMPLETED while the row stays
-  RUNNING.
+- **A14. No `Idempotency-Key`/`expected_version`, and `StartRun` was not
+  idempotent. — Closed for `Idempotency-Key` (B11).** Every mutating command
+  now requires an `Idempotency-Key` and records it in `command_idempotency`
+  (migration 000008) in the same transaction as the write it protects — the
+  platform rule financial-control-svc's `BeginExecution` follows. That covers
+  `StartRun` and the four adjustment commands (create, approve, post, reverse).
+  A retry under the same key replays the original run or adjustment as it now
+  stands (200, `Idempotent-Replay: true`) and never creates a second run or
+  posts/reverses a journal twice; the same key for another command or resource
+  is 409 `idempotency_key_conflict`. `StartRun` claims the key before any GL or
+  elimination work, so a retry of a run that failed halfway returns the
+  RUNNING/FAILED run rather than a duplicate. A failed final `CompleteRun` now
+  answers 503 `run_not_completed` with the run's persisted status (`RUNNING`
+  unless something else moved it), never 201 COMPLETED. `expected_version` is
+  still not implemented; B11 records why the status guards plus keys make it
+  unnecessary for these commands.
 - **A15. No `Draft` adjustment state.** `CreateEliminationProposal` lands
   directly in PENDING_APPROVAL (documented in migration 000003; no Submit
   command is named). `Superseded` is represented as REVERSED with
@@ -451,3 +461,61 @@ consolidation entries in a group entity's statutory ledger.
   - *Suite.* The full suite (`go test -tags=integration ./...`) ran against
     a fresh, disposable Postgres 16 container and passed, with no test
     skipped.
+- **B11. Command idempotency (A14) follows financial-control-svc's
+  `command_idempotency`, and `expected_version` is deliberately not added.**
+  - *The claim.* Migration 000008 adds `command_idempotency`: primary key
+    `(tenant_id, idempotency_key)`, `command`, exactly one of
+    `consolidation_run_id` / `consolidation_adjustment_id` (CHECK
+    `num_nonnulls(...) = 1`), both real foreign keys, and forced RLS by
+    `app.tenant_id`. A claim is written in the same transaction as the command
+    it protects, so a refused command consumes nothing and a committed one
+    always leaves its claim. The commands are `START_RUN`,
+    `CREATE_ADJUSTMENT`, `APPROVE_ADJUSTMENT`, `POST_ADJUSTMENT` and
+    `REVERSE_ADJUSTMENT`. The down migration refuses while any claim exists:
+    dropping the table would forget that a key already created a run or moved
+    an adjustment, so a retry after a rollback would duplicate it.
+  - *Replay rule.* Same key + same command + same target replays. Because the
+    run and adjustment ids are server-generated, the target is recognised by
+    the request the caller repeats: group, period and (for a run) target
+    currency. A replay answers 200 with `Idempotent-Replay: true` and the
+    resource as it now stands — a later status is reported, not necessarily
+    the one the original response carried. The same key for another command or
+    target is 409. Two concurrent first attempts with one key are serialised
+    by the claim's primary key: the loser retries once and replays the winner.
+  - *StartRun.* The key is claimed in the transaction that creates the run,
+    before the trial balances, contributions, eliminations or snapshots. A
+    retry therefore returns the run the first attempt left — COMPLETED if it
+    finished, RUNNING/FAILED if it did not — and never starts the work again.
+    A failed final `CompleteRun` answers 503 `run_not_completed`, carrying the
+    run id and the status the store actually holds (read back, `RUNNING` if
+    that read also fails), rather than a 201 for a state never persisted.
+  - *Adjustments.* Approve claims in the same transaction as its guarded
+    UPDATE. Post and reverse make a pre-flight `ReplayedAdjustmentCommand`
+    check before the status guard and before the external ledger call. That
+    matters for general-ledger-svc's reversal endpoint, which has no
+    source-event key of its own. The authoritative claim is still recorded by
+    `MarkAdjustmentPosted`/`ReverseAdjustment` in the transaction that moves
+    the adjustment.
+    - *Residual window.* If the store transaction that records the claim fails
+      after general-ledger-svc has already posted or reversed, the key is
+      unclaimed and a retry repeats that call. Posting is idempotent on the
+      adjustment id; reversal is not, so that window remains a
+      manual-reconciliation case — the 500 says the journal was already
+      posted/reversed, and the client should not blindly retry it.
+  - *`expected_version`.* Not added. Each of these five commands moves one
+    resource through a one-way guarded transition, and a repeated key already
+    returns the result instead of applying the command again. A version
+    precondition would add a second way to refuse a request that the status
+    guard (422) and the key (409) already distinguish, and no spec text here
+    requires one.
+  - *Tests.* Handler: a retried `StartRun` under one key creates one run and
+    re-reads no trial balances; a failed `CompleteRun` is 503 with the row's
+    RUNNING status; every mutating command is 400 without a key; the four
+    adjustment replays return the original resource and do not call the ledger
+    again; a key moved between commands is 409. Store (real Postgres, app role
+    for RLS): replay and conflict for runs and for each adjustment command,
+    one claim per successful command, a refused command leaves its key unused,
+    keys are per tenant and invisible across tenants, and 000008's down
+    refuses while a claim exists.
+  - *Suite.* `go test -tags=integration -count=1 -timeout=400s ./...` ran
+    against a fresh, disposable `postgres:16-alpine` container and passed.

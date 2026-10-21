@@ -21,16 +21,16 @@ func TestPgStore_GetAdjustmentHistory_FullLifecycle(t *testing.T) {
 	adj := newTestAdjustment(tenantID, "group-1", "preparer-1")
 	journalID := uuid.NewString()
 
-	if err := s.CreateAdjustment(ctx, adj, "corr-create"); err != nil {
+	if err := createAdjustment(s, ctx, adj, "corr-create"); err != nil {
 		t.Fatalf("CreateAdjustment: %v", err)
 	}
-	if err := s.ApproveAdjustment(ctx, adj.ConsolidationAdjustmentID, "approver-1", "corr-approve"); err != nil {
+	if err := approveAdjustment(s, ctx, adj.ConsolidationAdjustmentID, "approver-1", "corr-approve"); err != nil {
 		t.Fatalf("ApproveAdjustment: %v", err)
 	}
-	if err := s.MarkAdjustmentPosted(ctx, adj.ConsolidationAdjustmentID, "poster-1", journalID, "corr-post"); err != nil {
+	if err := postAdjustment(s, ctx, adj.ConsolidationAdjustmentID, "poster-1", journalID, "corr-post"); err != nil {
 		t.Fatalf("MarkAdjustmentPosted: %v", err)
 	}
-	if err := s.ReverseAdjustment(ctx, adj.ConsolidationAdjustmentID, "reverser-1", "correction", nil, "corr-reverse"); err != nil {
+	if err := reverseAdjustment(s, ctx, adj.ConsolidationAdjustmentID, "reverser-1", "correction", nil, "corr-reverse"); err != nil {
 		t.Fatalf("ReverseAdjustment: %v", err)
 	}
 
@@ -97,13 +97,13 @@ func TestPgStore_GetAdjustmentHistory_RejectedTransitionWritesNoTransition(t *te
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 	adj := newTestAdjustment(tenantID, "group-1", "preparer-1")
 
-	if err := s.CreateAdjustment(ctx, adj, "corr-create"); err != nil {
+	if err := createAdjustment(s, ctx, adj, "corr-create"); err != nil {
 		t.Fatalf("CreateAdjustment: %v", err)
 	}
-	if err := s.ApproveAdjustment(ctx, adj.ConsolidationAdjustmentID, "approver-1", "corr-approve"); err != nil {
+	if err := approveAdjustment(s, ctx, adj.ConsolidationAdjustmentID, "approver-1", "corr-approve"); err != nil {
 		t.Fatalf("ApproveAdjustment: %v", err)
 	}
-	if err := s.ApproveAdjustment(ctx, adj.ConsolidationAdjustmentID, "approver-2", "corr-again"); !errors.Is(err, domain.ErrInvalidAdjustmentTransition) {
+	if err := approveAdjustment(s, ctx, adj.ConsolidationAdjustmentID, "approver-2", "corr-again"); !errors.Is(err, domain.ErrInvalidAdjustmentTransition) {
 		t.Fatalf("second approve: expected ErrInvalidAdjustmentTransition, got %v", err)
 	}
 
@@ -137,7 +137,7 @@ func TestPgStore_GetAdjustmentHistory_TenantIsolation(t *testing.T) {
 	ctxB := svcmiddleware.WithTenant(context.Background(), tenantB)
 	adj := newTestAdjustment(tenantA, "group-1", "preparer-1")
 
-	if err := s.CreateAdjustment(ctxA, adj, "corr-create"); err != nil {
+	if err := createAdjustment(s, ctxA, adj, "corr-create"); err != nil {
 		t.Fatalf("CreateAdjustment: %v", err)
 	}
 	if _, err := s.GetAdjustmentHistory(ctxB, adj.ConsolidationAdjustmentID); !errors.Is(err, domain.ErrAdjustmentNotFound) {
@@ -157,13 +157,13 @@ func TestPgStore_GetAdjustmentHistory_SynthesizesLegacyChain(t *testing.T) {
 	adj := newTestAdjustment(tenantID, "group-1", "preparer-1")
 	journalID := uuid.NewString()
 
-	if err := s.CreateAdjustment(ctx, adj, "corr-create"); err != nil {
+	if err := createAdjustment(s, ctx, adj, "corr-create"); err != nil {
 		t.Fatalf("CreateAdjustment: %v", err)
 	}
-	if err := s.ApproveAdjustment(ctx, adj.ConsolidationAdjustmentID, "approver-1", "corr-approve"); err != nil {
+	if err := approveAdjustment(s, ctx, adj.ConsolidationAdjustmentID, "approver-1", "corr-approve"); err != nil {
 		t.Fatalf("ApproveAdjustment: %v", err)
 	}
-	if err := s.MarkAdjustmentPosted(ctx, adj.ConsolidationAdjustmentID, "poster-1", journalID, "corr-post"); err != nil {
+	if err := postAdjustment(s, ctx, adj.ConsolidationAdjustmentID, "poster-1", journalID, "corr-post"); err != nil {
 		t.Fatalf("MarkAdjustmentPosted: %v", err)
 	}
 
@@ -211,7 +211,7 @@ func TestPgStore_GetAdjustmentHistory_BackfilledNullCorrelationReads(t *testing.
 	tenantID := uuid.NewString()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 	adj := newTestAdjustment(tenantID, "group-1", "preparer-1")
-	if err := s.CreateAdjustment(ctx, adj, "corr-create"); err != nil {
+	if err := createAdjustment(s, ctx, adj, "corr-create"); err != nil {
 		t.Fatalf("CreateAdjustment: %v", err)
 	}
 

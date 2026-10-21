@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 
 	"zoiko.io/consolidation-svc/internal/clients"
@@ -33,6 +34,15 @@ type stubStore struct {
 	groupHasRun map[string]bool
 	hasSnapshot map[string]bool
 
+	// commandKeys mirrors command_idempotency by Idempotency-Key, so the
+	// handler's replay path is exercised against the same rule the store
+	// applies: same command and target replays, anything else conflicts.
+	commandKeys map[string]stubCommandKey
+
+	// completeErr makes CompleteRun fail, for the A14 test that the response
+	// reports the run's persisted state instead of 201 COMPLETED.
+	completeErr error
+
 	// What the handler handed the store for the run's events; the enqueue
 	// itself happens inside PgStore and is proven in outbox_events_test.go.
 	createRunActor      string
@@ -40,6 +50,13 @@ type stubStore struct {
 	completedActor      string
 	completedSnapshots  int
 	completedExceptions []string
+}
+
+// stubCommandKey is one command_idempotency row.
+type stubCommandKey struct {
+	command      string
+	runID        string
+	adjustmentID string
 }
 
 func newStubStore() *stubStore {
@@ -52,13 +69,37 @@ func newStubStore() *stubStore {
 		histories:     make(map[string]*domain.AdjustmentHistory),
 		groupHasRun:   make(map[string]bool),
 		hasSnapshot:   make(map[string]bool),
+		commandKeys:   make(map[string]stubCommandKey),
 	}
 }
 
-func (s *stubStore) CreateRun(_ context.Context, run *domain.ConsolidationRun, actorID, _ string) error {
+func (s *stubStore) recordCommandKey(key, command, runID, adjustmentID string) {
+	s.commandKeys[key] = stubCommandKey{command: command, runID: runID, adjustmentID: adjustmentID}
+}
+
+func (s *stubStore) CreateRun(_ context.Context, run *domain.ConsolidationRun, idempotencyKey, actorID, _ string) (*domain.ConsolidationRun, bool, error) {
+	if idempotencyKey == "" {
+		return nil, false, domain.ErrIdempotencyKeyRequired
+	}
+	if rec, ok := s.commandKeys[idempotencyKey]; ok {
+		if rec.command != domain.CommandStartRun || rec.runID == "" {
+			return nil, false, domain.ErrIdempotencyKeyConflict
+		}
+		existing, ok := s.runs[rec.runID]
+		if !ok {
+			return nil, false, domain.ErrRunNotFound
+		}
+		if existing.GroupLegalEntityID != run.GroupLegalEntityID ||
+			existing.FiscalPeriod != run.FiscalPeriod ||
+			existing.TargetCurrency != run.TargetCurrency {
+			return nil, false, domain.ErrIdempotencyKeyConflict
+		}
+		return existing, true, nil
+	}
 	s.runs[run.ConsolidationRunID] = run
 	s.createRunActor = actorID
-	return nil
+	s.recordCommandKey(idempotencyKey, domain.CommandStartRun, run.ConsolidationRunID, "")
+	return run, false, nil
 }
 
 func (s *stubStore) GetRun(_ context.Context, id string) (*domain.ConsolidationRun, error) {
@@ -81,6 +122,9 @@ func (s *stubStore) ListRuns(_ context.Context, groupLegalEntityID string) ([]do
 }
 
 func (s *stubStore) CompleteRun(_ context.Context, id, status string, exceptionCount int, completedAt time.Time, actorID, _ string, snapshotCount int, exceptions []string) error {
+	if s.completeErr != nil {
+		return s.completeErr
+	}
 	run, ok := s.runs[id]
 	if !ok {
 		return domain.ErrRunNotFound
@@ -153,9 +197,28 @@ func (s *stubStore) HasSnapshotForPeriod(_ context.Context, groupLegalEntityID, 
 	return s.hasSnapshot[groupLegalEntityID+"|"+fiscalPeriod], nil
 }
 
-func (s *stubStore) CreateAdjustment(_ context.Context, a *domain.ConsolidationAdjustment, _ string) error {
+func (s *stubStore) CreateAdjustment(_ context.Context, a *domain.ConsolidationAdjustment, idempotencyKey, _ string) (*domain.ConsolidationAdjustment, bool, error) {
+	if idempotencyKey == "" {
+		return nil, false, domain.ErrIdempotencyKeyRequired
+	}
+	if rec, ok := s.commandKeys[idempotencyKey]; ok {
+		if rec.command != domain.CommandCreateAdjustment || rec.adjustmentID == "" {
+			return nil, false, domain.ErrIdempotencyKeyConflict
+		}
+		existing, ok := s.adjustments[rec.adjustmentID]
+		if !ok {
+			return nil, false, domain.ErrAdjustmentNotFound
+		}
+		if existing.GroupLegalEntityID != a.GroupLegalEntityID ||
+			existing.FiscalPeriod != a.FiscalPeriod ||
+			existing.AdjustmentType != a.AdjustmentType {
+			return nil, false, domain.ErrIdempotencyKeyConflict
+		}
+		return existing, true, nil
+	}
 	s.adjustments[a.ConsolidationAdjustmentID] = a
-	return nil
+	s.recordCommandKey(idempotencyKey, domain.CommandCreateAdjustment, "", a.ConsolidationAdjustmentID)
+	return a, false, nil
 }
 
 func (s *stubStore) GetAdjustment(_ context.Context, id string) (*domain.ConsolidationAdjustment, error) {
@@ -188,35 +251,88 @@ func (s *stubStore) ListAdjustments(_ context.Context, groupLegalEntityID, fisca
 	return out, nil
 }
 
-func (s *stubStore) ApproveAdjustment(_ context.Context, id, principalID, _ string) error {
+func (s *stubStore) ApproveAdjustment(_ context.Context, id, principalID, idempotencyKey, _ string) (*domain.ConsolidationAdjustment, bool, error) {
+	if idempotencyKey == "" {
+		return nil, false, domain.ErrIdempotencyKeyRequired
+	}
 	a, ok := s.adjustments[id]
-	if !ok || a.Status != domain.AdjustmentStatusPendingApproval {
-		return domain.ErrInvalidAdjustmentTransition
+	if !ok {
+		return nil, false, domain.ErrAdjustmentNotFound
+	}
+	if rec, ok := s.commandKeys[idempotencyKey]; ok {
+		if rec.command != domain.CommandApproveAdjustment || rec.adjustmentID != id {
+			return nil, false, domain.ErrIdempotencyKeyConflict
+		}
+		return a, true, nil
+	}
+	if a.Status != domain.AdjustmentStatusPendingApproval {
+		return nil, false, domain.ErrInvalidAdjustmentTransition
 	}
 	now := time.Now().UTC()
 	a.Status, a.ApprovedAt, a.ApprovedByPrincipalID = domain.AdjustmentStatusApproved, &now, &principalID
-	return nil
+	s.recordCommandKey(idempotencyKey, domain.CommandApproveAdjustment, "", id)
+	return a, false, nil
 }
 
-func (s *stubStore) MarkAdjustmentPosted(_ context.Context, id, principalID, journalID, _ string) error {
+func (s *stubStore) MarkAdjustmentPosted(_ context.Context, id, principalID, journalID, idempotencyKey, _ string) (*domain.ConsolidationAdjustment, bool, error) {
+	if idempotencyKey == "" {
+		return nil, false, domain.ErrIdempotencyKeyRequired
+	}
 	a, ok := s.adjustments[id]
-	if !ok || a.Status != domain.AdjustmentStatusApproved {
-		return domain.ErrInvalidAdjustmentTransition
+	if !ok {
+		return nil, false, domain.ErrAdjustmentNotFound
+	}
+	if rec, ok := s.commandKeys[idempotencyKey]; ok {
+		if rec.command != domain.CommandPostAdjustment || rec.adjustmentID != id {
+			return nil, false, domain.ErrIdempotencyKeyConflict
+		}
+		return a, true, nil
+	}
+	if a.Status != domain.AdjustmentStatusApproved {
+		return nil, false, domain.ErrInvalidAdjustmentTransition
 	}
 	now := time.Now().UTC()
 	a.Status, a.PostedAt, a.PostedByPrincipalID, a.ConsolidationBookJournalID = domain.AdjustmentStatusPosted, &now, &principalID, &journalID
-	return nil
+	s.recordCommandKey(idempotencyKey, domain.CommandPostAdjustment, "", id)
+	return a, false, nil
 }
 
-func (s *stubStore) ReverseAdjustment(_ context.Context, id, principalID, reason string, supersededBy *string, _ string) error {
+func (s *stubStore) ReverseAdjustment(_ context.Context, id, principalID, reason string, supersededBy *string, idempotencyKey, _ string) (*domain.ConsolidationAdjustment, bool, error) {
+	if idempotencyKey == "" {
+		return nil, false, domain.ErrIdempotencyKeyRequired
+	}
 	a, ok := s.adjustments[id]
-	if !ok || a.Status != domain.AdjustmentStatusPosted {
-		return domain.ErrInvalidAdjustmentTransition
+	if !ok {
+		return nil, false, domain.ErrAdjustmentNotFound
+	}
+	if rec, ok := s.commandKeys[idempotencyKey]; ok {
+		if rec.command != domain.CommandReverseAdjustment || rec.adjustmentID != id {
+			return nil, false, domain.ErrIdempotencyKeyConflict
+		}
+		return a, true, nil
+	}
+	if a.Status != domain.AdjustmentStatusPosted {
+		return nil, false, domain.ErrInvalidAdjustmentTransition
 	}
 	now := time.Now().UTC()
 	a.Status, a.ReversedAt, a.ReversedByPrincipalID, a.ReversalReason, a.SupersededByAdjustmentID =
 		domain.AdjustmentStatusReversed, &now, &principalID, &reason, supersededBy
-	return nil
+	s.recordCommandKey(idempotencyKey, domain.CommandReverseAdjustment, "", id)
+	return a, false, nil
+}
+
+func (s *stubStore) ReplayedAdjustmentCommand(_ context.Context, id, command, idempotencyKey string) (bool, error) {
+	if idempotencyKey == "" {
+		return false, domain.ErrIdempotencyKeyRequired
+	}
+	rec, ok := s.commandKeys[idempotencyKey]
+	if !ok {
+		return false, nil
+	}
+	if rec.command != command || rec.adjustmentID != id {
+		return false, domain.ErrIdempotencyKeyConflict
+	}
+	return true, nil
 }
 
 // Compile-time proof the stub still satisfies the contract the handler
@@ -230,6 +346,10 @@ func (a *stubAuthZ) CheckAllowed(_ context.Context, _, _, _ string) error { retu
 type stubClients struct {
 	glBalances map[string]map[string]float64
 	glErr      error
+
+	// trialBalanceReads counts FetchTrialBalance calls, so an A14 replay can
+	// prove it did not run the run's GL work a second time.
+	trialBalanceReads int
 
 	intercompanyEntries []clients.IntercompanyEntry
 	intercompanyErr     error
@@ -250,11 +370,14 @@ type stubClients struct {
 
 	postJournalID           string
 	postErr                 error
+	postCalls               int
 	reverseErr              error
+	reverseCalls            int
 	lastPostedLegalEntityID string
 }
 
 func (c *stubClients) FetchTrialBalance(_ context.Context, _, legalEntityID, _ string) (map[string]float64, error) {
+	c.trialBalanceReads++
 	if c.glErr != nil {
 		return nil, c.glErr
 	}
@@ -302,6 +425,7 @@ func finalized(id, entity, period string, lines ...domain.PostedLine) *domain.Po
 func strPtr(s string) *string { return &s }
 
 func (c *stubClients) PostConsolidationAdjustmentJournal(_ context.Context, _, _, legalEntityID, _, _, _, _ string, _ []clients.JournalLine) (string, error) {
+	c.postCalls++
 	c.lastPostedLegalEntityID = legalEntityID
 	if c.postErr != nil {
 		return "", c.postErr
@@ -313,6 +437,7 @@ func (c *stubClients) PostConsolidationAdjustmentJournal(_ context.Context, _, _
 }
 
 func (c *stubClients) ReverseConsolidationAdjustmentJournal(_ context.Context, _, _, _, _ string) error {
+	c.reverseCalls++
 	return c.reverseErr
 }
 
@@ -331,13 +456,23 @@ func newRouter(s *stubStore, authz *stubAuthZ, cl *stubClients) chi.Router {
 	return r
 }
 
+// doReq sends a command with a fresh Idempotency-Key: every mutating route in
+// this service requires one. Tests that need to retry under the same key use
+// doReqWithKey; the missing-key path uses doReqWithKey with "".
 func doReq(r chi.Router, method, path string, body any, principalID string) *httptest.ResponseRecorder {
+	return doReqWithKey(r, method, path, body, principalID, uuid.NewString())
+}
+
+func doReqWithKey(r chi.Router, method, path string, body any, principalID, idempotencyKey string) *httptest.ResponseRecorder {
 	var buf bytes.Buffer
 	if body != nil {
 		_ = json.NewEncoder(&buf).Encode(body)
 	}
 	req := httptest.NewRequest(method, path, &buf)
 	req.Header.Set("Content-Type", "application/json")
+	if idempotencyKey != "" {
+		req.Header.Set("Idempotency-Key", idempotencyKey)
+	}
 	if principalID != "" {
 		req.Header.Set("X-Principal-Id", principalID)
 	}
