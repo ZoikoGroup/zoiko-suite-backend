@@ -820,14 +820,25 @@ services:
   # ── 2. tenant-entity-registry-svc (Port: 8081) ────────────────────────────────
   tenant-svc:
     build:
-      context: ../services/tenant-entity-registry-svc
-      dockerfile: Dockerfile
+      # Root context: go.mod replaces zoiko.io/identity-envelope with the
+      # sibling module, so the build must see both (see the Dockerfile).
+      context: ..
+      dockerfile: services/tenant-entity-registry-svc/Dockerfile
     container_name: tenant-entity-registry-svc
     mem_limit: 256m
     cpus: "0.5"
     ports:
       - "8081:8081"
     environment:
+      # Identity gate (X-R3): a presented signed envelope is verified and its
+      # session checked; its claims replace X-Principal-Id / X-Tenant-Id.
+      # warn here: the services outside Groups 1-2 that read entities forward
+      # the principal but not the envelope. The gateway's tenant-context calls
+      # come over mTLS as a peer. The code default outside local is require.
+      IDENTITY_VERIFY: "${TENANT_REGISTRY_IDENTITY_VERIFY:-warn}"
+      IDENTITY_JWKS_URL: "http://identity-context-svc:8080/.well-known/jwks.json"
+      IDENTITY_INTROSPECT_URL: "http://identity-context-svc:8080/v1/context/session/introspect"
+      IDENTITY_ISSUER: "identity-context-svc"
       PORT: "8081"
       DB_HOST: postgres
       DB_PORT: "5432"

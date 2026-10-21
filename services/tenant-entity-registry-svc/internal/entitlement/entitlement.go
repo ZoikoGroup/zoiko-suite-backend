@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+	idenv "zoiko.io/identity-envelope"
 
 	svcenvelope "zoiko.io/tenant-entity-registry-svc/internal/envelope"
 )
@@ -60,6 +61,9 @@ func (c *HTTPChecker) CheckProvisioning(ctx context.Context, subscriptionID, pri
 	req.Header.Set("X-Source-Channel", "system")
 	// Forward the caller's canonical envelope for §4 contract propagation
 	svcenvelope.ForwardTo(ctx, req)
+	// The verified identity envelope too, so the next hop can check who
+	// is asking instead of trusting X-Principal-Id (X-R3).
+	idenv.Forward(ctx, req)
 
 	resp, err := c.client.Do(req)
 	if err != nil {
