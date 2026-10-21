@@ -230,6 +230,20 @@ $BUNDLES = @(
                     "PAYEE_BANKING_CONTROL_POPULATION_READ", "TAX_AUTHORITY_CONTROL_POPULATION_READ")
     },
     @{
+        # reconciliation-engine-svc (DATA-07, ZS-SVC-Z-001 DQC-03). DEFINE/RUN/MATCH stay under
+        # MANAGE as preparation steps; CERTIFY, ACCEPT_RISK, APPROVE_RULES and REVOKE are
+        # deliberately separate actions, the same posture as FINCTRL_FULL above — a real tenant
+        # should grant them through separate roles. The service itself also refuses a certifier
+        # who prepared the run, a revoker who certified it, and a self-accepted risk, whatever is
+        # granted here. None of these five actions had a permission_definitions row before
+        # migration 000008 (MANAGE/READ) and 000018 (the other four) — without that row no role
+        # can hold the action at all.
+        Code    = "RECONCILIATION_FULL"
+        Service = "reconciliation-engine-svc"
+        Actions = @("RECONCILIATION_MANAGE", "RECONCILIATION_READ", "RECONCILIATION_CERTIFY",
+                    "RECONCILIATION_ACCEPT_RISK", "RECONCILIATION_APPROVE_RULES", "RECONCILIATION_REVOKE")
+    },
+    @{
         # spend-controls-svc separates setting a limit from spending against it,
         # and checks VIEW on its two read routes as well -- the reads are
         # authorized unconditionally, so without VIEW the console's registers
