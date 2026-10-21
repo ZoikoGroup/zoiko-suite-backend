@@ -48,6 +48,10 @@ $ENTITY_SCOPED = @(
 # §4 requires purpose_context "for governed sensitive access", and §15 (INV-15)
 # forbids emitting that content into telemetry -- capturing WHY it was accessed is
 # what makes the access reviewable afterwards.
+# Sensitive services whose purpose of access is a read concern only: appends to
+# them are evidence, not access (decision D-06, 21 Oct 2026).
+$PURPOSE_ON_READ = @("governance-decision-log-svc")
+
 $SENSITIVE = @(
     "document-vault-svc", "comments-collaboration-svc", "employee-master-svc", "compensation-svc", "benefits-svc",
     "payroll-run-svc", "payroll-tax-svc", "payroll-exceptions-svc", "offboarding-severance-svc",
@@ -147,6 +151,8 @@ foreach ($svc in $targets) {
 
     $purpose = "NotRequired"
     if (In-List $svc $SENSITIVE) { $purpose = "RequiredOnWrite" }
+    # The ledger demands purpose on reads, not on evidence appends (D-06).
+    if (In-List $svc $PURPOSE_ON_READ) { $purpose = "RequiredOnRead" }
 
     $exempt_literal = Get-ExemptLiteral $svc
     $exempt_block = ""

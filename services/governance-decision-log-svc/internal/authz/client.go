@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+	idenv "zoiko.io/identity-envelope"
 
 	svcenvelope "zoiko.io/governance-decision-log-svc/internal/envelope"
 )
@@ -240,6 +241,9 @@ func (c *HTTPClient) checkAllowedLive(ctx context.Context, principalID, legalEnt
 	// unavailable" -- failing closed on every authorized write while
 	// authorization-svc was healthy and answering correctly.
 	svcenvelope.ForwardTo(ctx, req)
+	// And the verified identity envelope, for authorization-svc's identity
+	// assertion check (AUTHZ_IDENTITY_ASSERTION).
+	idenv.Forward(ctx, req)
 
 	resp, err := c.http.Do(req)
 	if err != nil {

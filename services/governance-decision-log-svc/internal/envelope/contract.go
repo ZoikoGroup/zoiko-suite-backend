@@ -4,7 +4,7 @@
 
 package envelope
 
-// ServicePolicy is this service's Â§4 conditional-field policy.
+// ServicePolicy is this service's §4 conditional-field policy.
 //
 // The unconditionally mandatory fields (tenant_id, actor_subject_id,
 // request_id, correlation_id, source_channel) and idempotency_key on material
@@ -13,11 +13,12 @@ func ServicePolicy() Policy {
 	return Policy{
 		ServiceName: "governance-decision-log-svc",
 
-		// Â§4: mandatory for entity-specific records (INV-02).
+		// §4: mandatory for entity-specific records (INV-02).
 		LegalEntityID: RequiredOnWrite,
 
-		// Â§4: required for governed sensitive access.
-		PurposeContext: RequiredOnWrite,
+		// §4: required for governed sensitive access — on reads. An evidence
+		// append is not access, so it carries no purpose (decision D-06).
+		PurposeContext: RequiredOnRead,
 
 		// This service does not post to an accounting book.
 		BookID: NotRequired,

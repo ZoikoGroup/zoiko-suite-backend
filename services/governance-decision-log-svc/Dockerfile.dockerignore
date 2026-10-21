@@ -1,0 +1,13 @@
+# Used by BuildKit for builds with -f services/governance-decision-log-svc/Dockerfile.
+# The context is the repository root (see the Dockerfile), so everything is
+# excluded except the modules the image is built from.
+*
+!services/governance-decision-log-svc/
+!services/identity-envelope/
+
+# Not needed inside the image.
+services/governance-decision-log-svc/.gotmp/
+services/governance-decision-log-svc/**/*.exe
+services/governance-decision-log-svc/**/*_test.go
+services/governance-decision-log-svc/deployments/
+services/identity-envelope/**/*_test.go

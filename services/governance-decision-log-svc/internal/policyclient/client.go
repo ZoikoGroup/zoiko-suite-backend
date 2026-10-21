@@ -15,6 +15,8 @@ import (
 	"strings"
 	"time"
 
+	idenv "zoiko.io/identity-envelope"
+
 	svcenvelope "zoiko.io/governance-decision-log-svc/internal/envelope"
 )
 
@@ -71,6 +73,10 @@ func (c *HTTPClient) GetPolicyVersion(ctx context.Context, tenantID, policyVersi
 	// asked for the replay is who policy-svc sees). The tenant is then pinned to
 	// the decision's own, whatever the envelope says.
 	svcenvelope.ForwardTo(ctx, req)
+	// The verified identity envelope too (P-12): policy-svc verifies the signed
+	// envelope, and a replay carrying only the asserted headers kept
+	// policy-svc's identity gate at warn for every caller.
+	idenv.Forward(ctx, req)
 	req.Header.Set("X-Tenant-Id", tenantID)
 	resp, err := c.http.Do(req)
 	if err != nil {

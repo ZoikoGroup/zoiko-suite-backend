@@ -978,8 +978,10 @@ services:
   # ── 4. governance-decision-log-svc (Port: 8083) ──────────────────────────────
   governance-svc:
     build:
-      context: ../services/governance-decision-log-svc
-      dockerfile: Dockerfile
+      # Root context: go.mod replaces zoiko.io/identity-envelope with the
+      # sibling module, so the build must see both (see the Dockerfile).
+      context: ..
+      dockerfile: services/governance-decision-log-svc/Dockerfile
     container_name: governance-decision-log-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -1009,6 +1011,16 @@ services:
       # activation) and decision-support-svc still read with no X-Principal-Id.
       # Set to enforce (the code default) once both forward the caller.
       DECISION_LOG_READ_AUTHZ: "warn"
+      # Identity gate (A1 / D-05): a presented signed envelope is verified and
+      # its session checked; its claims replace X-Principal-Id / X-Tenant-Id.
+      # warn here because the out-of-domain readers above, and every ledger
+      # writer's async relay (no person behind it; a peer over mTLS in
+      # production), present no envelope yet. The code default outside local is
+      # require.
+      IDENTITY_VERIFY: "${DECISION_LOG_IDENTITY_VERIFY:-warn}"
+      IDENTITY_JWKS_URL: "http://identity-context-svc:8080/.well-known/jwks.json"
+      IDENTITY_INTROSPECT_URL: "http://identity-context-svc:8080/v1/context/session/introspect"
+      IDENTITY_ISSUER: "identity-context-svc"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_GROUP_ID: "governance-decision-log-svc"
       KAFKA_EVENTS_TOPIC: "zoiko.governance.events"
