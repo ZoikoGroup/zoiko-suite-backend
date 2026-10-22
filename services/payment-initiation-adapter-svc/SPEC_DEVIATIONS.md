@@ -40,6 +40,8 @@ sweeps a stale in-flight attempt to `PENDING_UNKNOWN`, reconciles a
 evidence. With the engine disabled — the default — every attempt uses the
 legacy path described in A3.
 
+A later pass closed A6.
+
 ## A. Not implemented / weaker than the spec
 
 - **A1. `ListPaymentAttempts` is not implemented.** The §7 query line names
@@ -150,17 +152,32 @@ legacy path described in A3.
   decision (and, for a manual finality assertion, the BNK-07 exceptional
   workflow).
 - **A6. Money is `float64` in the API and the legacy path can persist a
-  rounded amount.** `PrepareAttemptRequest.Amount` and
-  `PaymentInitiationAttempt.Amount` are `float64`; the column is
-  `NUMERIC(18,2)` with `CHECK (amount > 0)`. The provider-bound path calls
-  `exactAmount` and refuses more than two decimal places, but the legacy path
-  only checks `Amount > 0`, so an amount such as `10.005` is sent to the
-  adapter as a float and stored as `10.01` — the stored amount and the sent
-  amount differ. That is a change to the payment subject (invariant 13) and
-  a C0 money-precision defect. *Not fixed here:* the correct fix is a decimal
-  type across the request/response/domain boundary (the pattern
-  consolidation-svc and intercompany-accounting-svc use), which is an API
-  change, not a local validation tweak.
+  rounded amount.** — Closed (B11). `PrepareAttemptRequest.Amount` and
+  `PaymentInitiationAttempt.Amount` were `float64`; the column is
+  `NUMERIC(18,2)` with `CHECK (amount > 0)`. The provider-bound path called
+  `exactAmount`, which checked the float's printed form for more than two
+  decimal places after the JSON number had already been decoded into a
+  float. The legacy path only checked `Amount > 0`, so `10.005` was sent to
+  the adapter as a float and stored as `10.01`: the stored amount and the
+  sent amount differed. That is a change to the payment subject (invariant
+  13) and a C0 money-precision defect (ZS-DATA-001 D06). Both fields are now
+  `domain.Decimal`, decimal text backed by `big.Rat`, the pattern
+  intercompany-accounting-svc uses. It is read from a JSON number or a
+  quoted string and is never held in a float. `PrepareAttempt` refuses with
+  400, on both paths, an amount that is not positive, has more than two
+  decimal places or more than 16 integer digits, and the store refuses the
+  same before the insert. A valid amount is then held in the column's own
+  form (`10.50`). The row is written from that text and read back as
+  `amount::text`; the provider check, the legacy adapter's `SubmitRequest`
+  and the engine's pinned payload hash all use the same digits.
+  `exactAmount` is removed. On the wire `Amount` is still a JSON number, so
+  no caller needed changing. payment-run-svc, payroll-run-svc, treasury-svc
+  and accounts-receivable-svc all send a `float64`, and a test sends that
+  exact shape and checks it is stored and sent unchanged.
+  *Still open:* those callers still hold the amount as a `float64` before
+  they send it, so a value they have already rounded arrives rounded. This
+  service now refuses what it cannot hold, but cannot recover digits a
+  caller lost.
 - **A7. A replay re-runs all external verification before returning the
   original attempt.** `PrepareAttempt` performs the authorization
   fingerprint check, the treasury payer-account lookup and the provider
@@ -303,3 +320,29 @@ legacy path described in A3.
   (store), legacy outcome events with correlation (store). The pre-existing
   immutability, CAS, terminal-state, retry-identity, timeout-to-
   `PENDING_UNKNOWN` and suspended-account tests still pass.
+- **B11. A6's amount is a JSON number on the wire, and exactness is
+  enforced at the boundary, not trusted.**
+  1. *Wire shape.* `Decimal` writes a bare JSON number of exactly its
+     digits, as `float64` did, and accepts a number or a quoted string.
+     Moving responses to a string would break any caller that decodes
+     `Amount` into a number. Accepting a string lets callers move to the
+     string form D06 prefers without a coordinated release.
+  2. *Refuse, never round.* An amount the `NUMERIC(18,2)` column would round
+     (`10.005`, `0.001`) or overflow (`10000000000000000`) is refused, never
+     rounded to fit. Rounding would change the authorized amount, which
+     invariant 13 forbids. The same check runs in the handler (400) and at
+     the top of `PgStore.PrepareAttempt`, so no in-process caller can reach
+     the column with an amount it would round.
+  3. *One text for every consumer.* After validation the amount is held as
+     `ColumnText` (`r.FloatString(2)`). That is exactly what `amount::text`
+     returns, so `CheckBinding` at prepare time, the stored row,
+     `LoadDispatch`'s `AmountText` (the engine's canonical and payload hash)
+     and the legacy adapter's `SubmitRequest.Amount` agree digit for digit.
+  4. *Verification.* `go test -tags=integration -count=1 -p 1 ./...` ran
+     against a fresh `postgres:16-alpine` container through
+     `TEST_DATABASE_URL`: 73 passed, 0 failed, 0 skipped. New coverage:
+     decoding and encoding `Decimal` (domain); a caller's `float64` body
+     stored and sent unchanged and read back as a `float64`, and refused
+     amounts storing nothing (handler); `9999999999999999.99`, which has no
+     `float64`, round-tripping through the column, the read and the
+     prepared event, and the store's own refusal (store).

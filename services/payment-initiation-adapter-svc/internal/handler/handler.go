@@ -133,10 +133,21 @@ func (h *Handler) PrepareAttempt(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if req.LegalEntityID == "" || req.PayerAccountRef == "" || req.PayeeRef == "" || req.Amount <= 0 || req.Currency == "" {
+	if req.LegalEntityID == "" || req.PayerAccountRef == "" || req.PayeeRef == "" || req.Amount == "" || req.Currency == "" {
 		writeError(w, http.StatusBadRequest, "legal_entity_id, payer_account_ref, payee_ref, positive amount and currency are required")
 		return
 	}
+	// A6: the amount is decoded as decimal text, never a float, so an amount
+	// the column would round (10.005) is refused here instead of being stored
+	// and sent as a different number. From here on it is held in the column's
+	// own form, so the provider check, the row and the pinned payload all
+	// read the same digits.
+	amount, err := domain.ValidatePositiveAmount(req.Amount)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	req.Amount = domain.Decimal(domain.ColumnText(amount))
 	if req.IdempotencyKey == "" {
 		writeError(w, http.StatusBadRequest, domain.ErrIdempotencyKeyRequired.Error())
 		return
@@ -377,7 +388,7 @@ func (h *Handler) SubmitAttempt(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) submitToProvider(ctx context.Context, a *domain.PaymentInitiationAttempt, principalID, correlationID string) *domain.PaymentInitiationAttempt {
 	result, err := h.provider.Submit(ctx, provideradapter.SubmitRequest{
 		IdempotencyKey: a.IdempotencyKey, PayerAccountRef: a.PayerAccountRef, PayeeRef: a.PayeeRef,
-		Amount: a.Amount, Currency: a.Currency, PaymentReference: a.PaymentReference,
+		Amount: string(a.Amount), Currency: a.Currency, PaymentReference: a.PaymentReference,
 	})
 	if err != nil {
 		h.log.Warn("provider adapter unreachable — treating as PENDING_UNKNOWN, never Rejected", zap.Error(err))

@@ -117,7 +117,7 @@ type PaymentInitiationAttempt struct {
 	AuthorizationSource  string
 	PayerAccountRef      string
 	PayeeRef             string
-	Amount               float64
+	Amount               Decimal
 	Currency             string
 	ExecutionDate        time.Time
 	PaymentReference     string
@@ -170,7 +170,7 @@ type PrepareAttemptRequest struct {
 	AuthorizationSource      string
 	PayerAccountRef          string
 	PayeeRef                 string
-	Amount                   float64
+	Amount                   Decimal
 	Currency                 string
 	ExecutionDate            time.Time
 	PaymentReference         string
@@ -223,6 +223,11 @@ const (
 	ErrInvalidResolution          = sentinel("resolved_status must be SUBMITTED or REJECTED_BEFORE_SUBMISSION")
 	ErrProviderAdapterUnavailable = sentinel("provider adapter unavailable")
 	ErrStoreUnavailable           = sentinel("store unavailable")
+
+	// ErrInvalidAmount/ErrAmountPrecision: Amount is not a positive decimal,
+	// or the NUMERIC(18,2) column cannot hold it exactly — see decimal.go.
+	ErrInvalidAmount   = sentinel("amount must be a positive decimal number")
+	ErrAmountPrecision = sentinel("amount must have at most two decimal places and at most 16 integer digits")
 
 	// ErrAuthorizationFingerprintRequired/Mismatch/Unavailable are Wave
 	// 11a's real fingerprint verification outcomes for an

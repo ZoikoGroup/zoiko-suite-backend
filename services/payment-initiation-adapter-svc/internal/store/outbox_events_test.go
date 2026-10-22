@@ -50,7 +50,7 @@ func TestPgStore_PrepareAttempt_EnqueuesPreparedEvent(t *testing.T) {
 
 	attempt, err := testStore.PrepareAttempt(ctx, tenantID, domain.PrepareAttemptRequest{
 		LegalEntityID: legalEntityID, PayerAccountRef: "acct-src", PayeeRef: "acct-dst",
-		Amount: 100.00, Currency: "USD", ExecutionDate: time.Now().Add(24 * time.Hour),
+		Amount: "100.00", Currency: "USD", ExecutionDate: time.Now().Add(24 * time.Hour),
 		PayerAccountVerified: true, IdempotencyKey: "corr-outbox-1",
 	}, "maker-1", "corr-outbox-1")
 	require.NoError(t, err)
@@ -73,7 +73,7 @@ func TestPgStore_PrepareAttempt_IdempotentReplay_NoReEnqueue(t *testing.T) {
 	first, err := testStore.PrepareAttempt(ctx, tenantID, domain.PrepareAttemptRequest{
 		LegalEntityID: legalEntityID, SourceReference: sourceRef,
 		PayerAccountRef: "acct-src", PayeeRef: "acct-dst",
-		Amount: 75.00, Currency: "USD", ExecutionDate: time.Now().Add(24 * time.Hour),
+		Amount: "75.00", Currency: "USD", ExecutionDate: time.Now().Add(24 * time.Hour),
 		PayerAccountVerified: true, IdempotencyKey: "corr-replay-1",
 	}, "maker-1", "corr-replay-1")
 	require.NoError(t, err)
@@ -87,7 +87,7 @@ func TestPgStore_PrepareAttempt_IdempotentReplay_NoReEnqueue(t *testing.T) {
 	second, err := testStore.PrepareAttempt(ctx, tenantID, domain.PrepareAttemptRequest{
 		LegalEntityID: legalEntityID, SourceReference: sourceRef,
 		PayerAccountRef: "acct-src", PayeeRef: "acct-dst",
-		Amount: 75.00, Currency: "USD", ExecutionDate: time.Now().Add(24 * time.Hour),
+		Amount: "75.00", Currency: "USD", ExecutionDate: time.Now().Add(24 * time.Hour),
 		PayerAccountVerified: true, IdempotencyKey: "corr-replay-2",
 	}, "maker-1", "corr-replay-2")
 	require.ErrorIs(t, err, domain.ErrUnresolvedAttemptExists)
@@ -110,7 +110,7 @@ func TestPgStore_LegacyStub_OutcomeEventsWithCorrelation(t *testing.T) {
 	prepare := func(key string) *domain.PaymentInitiationAttempt {
 		a, err := testStore.PrepareAttempt(ctx, tenantID, domain.PrepareAttemptRequest{
 			LegalEntityID: uuid.New().String(), PayerAccountRef: "acct-src", PayeeRef: "acct-dst",
-			Amount: 15.00, Currency: "USD", ExecutionDate: time.Now().Add(24 * time.Hour),
+			Amount: "15.00", Currency: "USD", ExecutionDate: time.Now().Add(24 * time.Hour),
 			PayerAccountVerified: true, IdempotencyKey: key,
 		}, "maker-1", "corr-"+key)
 		require.NoError(t, err)

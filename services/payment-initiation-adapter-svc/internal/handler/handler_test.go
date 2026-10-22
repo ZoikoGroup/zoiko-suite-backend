@@ -118,7 +118,7 @@ func doRequest(r http.Handler, method, path string, body interface{}, tenantID s
 func newPrepareReq(idempotencyKey, paymentRef string) domain.PrepareAttemptRequest {
 	return domain.PrepareAttemptRequest{
 		LegalEntityID: testLegalEntity, SourceReference: "run-instruction-1", AuthorizationFingerprint: "fp-abc",
-		PayerAccountRef: "payer-acct-1", PayeeRef: "payee-1", Amount: 500, Currency: "USD",
+		PayerAccountRef: "payer-acct-1", PayeeRef: "payee-1", Amount: "500", Currency: "USD",
 		ExecutionDate: time.Now().UTC().Add(24 * time.Hour), PaymentReference: paymentRef,
 		PayerAccountVerified: true, IdempotencyKey: idempotencyKey,
 	}
