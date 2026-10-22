@@ -110,14 +110,14 @@ func TestMain(m *testing.M) {
 	}
 
 	_, _ = testPool.Exec(ctx, `
-		DROP TABLE IF EXISTS reconciliation_evidence_conflicts CASCADE;
-		DROP TABLE IF EXISTS reconciliation_population_lines CASCADE;
-		DROP TABLE IF EXISTS reconciliation_populations CASCADE;
-		DROP TABLE IF EXISTS reconciliation_policies CASCADE;
-		DROP TABLE IF EXISTS reconciliation_runs CASCADE;
-		DROP TABLE IF EXISTS reconciliation_certificates CASCADE;
-		DROP TABLE IF EXISTS statement_lines CASCADE;
-	`)
+			DROP TABLE IF EXISTS reconciliation_evidence_conflicts CASCADE;
+			DROP TABLE IF EXISTS reconciliation_population_lines CASCADE;
+			DROP TABLE IF EXISTS reconciliation_populations CASCADE;
+			DROP TABLE IF EXISTS reconciliation_policies CASCADE;
+			DROP TABLE IF EXISTS reconciliation_runs CASCADE;
+			DROP TABLE IF EXISTS reconciliation_certificates CASCADE;
+			DROP TABLE IF EXISTS statement_lines CASCADE;
+		`)
 
 	// EVERY *.up.sql, BY GLOB, NOT A NAMED LIST.
 	//
