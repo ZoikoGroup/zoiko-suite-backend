@@ -44,7 +44,7 @@ type stubPurposeRegistry struct {
 	err       error
 }
 
-func (p *stubPurposeRegistry) IsPublished(_ context.Context, _, purposeID string) (bool, error) {
+func (p *stubPurposeRegistry) IsPublished(_ context.Context, _, _, purposeID string) (bool, error) {
 	if p.err != nil {
 		return false, p.err
 	}

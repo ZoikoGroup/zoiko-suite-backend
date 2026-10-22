@@ -38,6 +38,7 @@ func requireTestDB(t *testing.T) *pgxpool.Pool {
 		DROP TABLE IF EXISTS population_control_totals;
 		DROP TABLE IF EXISTS audit_populations;
 		DROP TABLE IF EXISTS manifest_records;
+		DROP TABLE IF EXISTS outbox_events;
 		DROP TABLE IF EXISTS evidence_manifests;
 	`)
 	require.NoError(t, err)

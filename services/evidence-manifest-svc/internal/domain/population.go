@@ -113,7 +113,10 @@ type BuildPopulationRow struct {
 
 type BuildPopulationParams struct {
 	PopulationID, TenantID, CorrelationID string
-	Rows                                  []BuildPopulationRow
+	// ActorPrincipalID is the verified principal; it is recorded on the
+	// AuditPopulationBuilt event.
+	ActorPrincipalID string
+	Rows             []BuildPopulationRow
 }
 
 type ValidatePopulationParams struct {
@@ -127,10 +130,16 @@ type ValidatePopulationParams struct {
 
 type FreezePopulationParams struct {
 	PopulationID, TenantID, CorrelationID string
+	// ActorPrincipalID is the verified principal; it is recorded on the
+	// AuditPopulationFrozen / PopulationValidationFailed events.
+	ActorPrincipalID string
 }
 
 type SupersedePopulationParams struct {
 	PopulationID, TenantID, Reason, CorrelationID string
+	// ActorPrincipalID is the verified principal; it is recorded on the
+	// PopulationSuperseded event.
+	ActorPrincipalID string
 }
 
 type QuarantinePopulationParams struct {

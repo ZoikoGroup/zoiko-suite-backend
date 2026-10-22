@@ -313,7 +313,13 @@ type PreferenceAssertion struct {
 	ChannelOrPurpose      string          `json:"channel_or_purpose"`
 	Value                 PreferenceValue `json:"value"`
 	Source                string          `json:"source"`
-	CreatedAt             time.Time       `json:"created_at"`
+	// EffectiveAt is §10.1's "effective time": the instant from which this
+	// assertion governs. It is separate from CreatedAt (when the service
+	// recorded it), so a preference captured later can state when it took
+	// effect. Defaults to the recording instant; rows written before
+	// migration 000008 carry no stored value and read as CreatedAt.
+	EffectiveAt time.Time `json:"effective_at"`
+	CreatedAt   time.Time `json:"created_at"`
 }
 
 // ── Request DTOs ─────────────────────────────────────────────────────────────
@@ -387,6 +393,9 @@ type SetPreferenceRequest struct {
 	ChannelOrPurpose string `json:"channel_or_purpose"`
 	Value            string `json:"value"`
 	Source           string `json:"source"`
+	// EffectiveAt (§10.1 "effective time"), optional RFC 3339 instant, stored
+	// in UTC at microsecond precision. Omitted = the recording instant.
+	EffectiveAt *time.Time `json:"effective_at,omitempty"`
 }
 
 // ── Idempotency (§18.1) ──────────────────────────────────────────────────────
@@ -394,6 +403,7 @@ type SetPreferenceRequest struct {
 type IdempotencyRecord struct {
 	Key          string
 	TenantID     string
+	PrincipalID  string
 	Endpoint     string
 	RequestHash  string
 	ResponseCode int

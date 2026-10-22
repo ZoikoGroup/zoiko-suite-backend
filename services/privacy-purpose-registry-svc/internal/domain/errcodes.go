@@ -19,6 +19,7 @@ const (
 
 	// Local extensions — not in §32.
 	ErrCodeNotFound             = "NOT_FOUND"
+	ErrCodeMethodNotAllowed     = "METHOD_NOT_ALLOWED" // router-level 405: the path exists, the method does not
 	ErrCodeValidationFailed     = "VALIDATION_FAILED"
 	ErrCodeAuthenticationFailed = "AUTHENTICATION_FAILED"
 	ErrCodeAuthorizationDenied  = "AUTHORIZATION_DENIED"

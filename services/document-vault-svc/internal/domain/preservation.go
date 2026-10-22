@@ -166,12 +166,17 @@ type CreateRedactionProfileParams struct {
 // left the vault in one export (DRC-I27). PackageHash is computed by
 // the store from the ordered item hashes — never caller-supplied.
 type ExportPackage struct {
-	PackageID              string              `json:"package_id"`
-	TenantID               string              `json:"tenant_id"`
-	RequestedByPrincipalID string              `json:"requested_by_principal_id"`
-	PackageHash            string              `json:"package_hash"`
-	CreatedAt              time.Time           `json:"created_at"`
-	Items                  []ExportPackageItem `json:"items,omitempty"`
+	PackageID              string    `json:"package_id"`
+	TenantID               string    `json:"tenant_id"`
+	RequestedByPrincipalID string    `json:"requested_by_principal_id"`
+	PackageHash            string    `json:"package_hash"`
+	CreatedAt              time.Time `json:"created_at"`
+	// RecipientScope and Purpose are supplied by POST /v1/exports (§9.2) and
+	// optionally by the older /v1/export-packages route; empty for packages made
+	// before migration 000015 without them.
+	RecipientScope string              `json:"recipient_scope,omitempty"`
+	Purpose        string              `json:"purpose,omitempty"`
+	Items          []ExportPackageItem `json:"items,omitempty"`
 }
 
 type ExportItemType string
@@ -213,6 +218,8 @@ type ExportPackageItemInput struct {
 
 type CreateExportPackageParams struct {
 	RequestedByPrincipalID string
+	RecipientScope         string
+	Purpose                string
 	Items                  []ExportPackageItemInput
 }
 

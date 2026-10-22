@@ -206,6 +206,19 @@ const (
 	TriggerExpiryReviewDateReached       = "EXPIRY_OR_REVIEW_DATE_REACHED"
 )
 
+// ValidTrigger reports whether v is one of the eight §17.1 mandatory
+// reassessment triggers. A caller-declared trigger outside this set is
+// refused rather than echoed into a reason code.
+func ValidTrigger(v string) bool {
+	switch v {
+	case TriggerNewPurposeOrSensitiveCategory, TriggerAutomatedDecisioning, TriggerNewProcessorOrJurisdiction,
+		TriggerChangedTransferMechanism, TriggerMaterialArchitectureChange, TriggerNewMinorsContext,
+		TriggerSecurityPrivacyIncident, TriggerExpiryReviewDateReached:
+		return true
+	}
+	return false
+}
+
 // TransferContext — §16.1's own required field list for the context of a
 // proposed transfer: "exporter/importer roles, origin/destination
 // jurisdictions, data categories, subject classes, purpose, route/provider,
@@ -358,6 +371,7 @@ type EvaluateTriggersResponse struct {
 type IdempotencyRecord struct {
 	IdempotencyKey string    `json:"idempotency_key"`
 	TenantID       string    `json:"tenant_id"`
+	PrincipalID    string    `json:"principal_id"`
 	Endpoint       string    `json:"endpoint"`
 	RequestHash    string    `json:"request_hash"`
 	ResponseCode   int       `json:"response_code"`
@@ -377,5 +391,6 @@ var (
 	ErrDecisionNotFound     = errorString("PRV-015: transfer decision not found")
 	ErrPurposeNotActive     = errorString("PRV-002: referenced processing activity is not active")
 	ErrStoreUnavailable     = errorString("PRV-019: privacy-transfer store unavailable")
+	ErrInvalidTrigger       = errorString("reassessment_trigger / declared_trigger must be one of the eight §17.1 triggers")
 	ErrIdempotencyConflict  = errorString("PRV-020: IMMUTABLE_EVIDENCE_CONFLICT: idempotency key replayed with conflicting payload")
 )

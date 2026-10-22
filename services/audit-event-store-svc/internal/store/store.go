@@ -23,6 +23,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
+
+	"zoiko.io/audit-event-store-svc/internal/domain"
 )
 
 // AuditEvent is the normalised representation stored in the audit_events table.
@@ -68,10 +70,27 @@ type AuditEvent struct {
 	PreviousEventHash string
 }
 
-// hashPayload returns the hex-encoded SHA-256 digest of raw. This is what
-// makes a stored row's payload independently re-verifiable: recomputing
-// this hash from the stored payload and comparing it to the stored
-// payload_hash detects any post-insert tampering with the payload column.
+// PayloadHashSchemeJSONBTextV1 is the payload_hash_scheme written for every row
+// stored since migration 000006: payload_hash = lower-hex SHA-256 of the row's
+// payload::text, i.e. of the canonical JSONB text the database itself holds.
+// Because the database can re-derive that text from the stored column, the
+// hash can be recomputed at verification time and a modified payload is
+// detected. Rows written earlier carry a NULL scheme (hash over the
+// producer's raw bytes, which the JSONB column no longer holds) and can only
+// have their sequence and link verified.
+const PayloadHashSchemeJSONBTextV1 = "sha256-jsonb-text-v1"
+
+// hashPayloadText returns the hex-encoded SHA-256 digest of s (the canonical
+// JSONB text of a payload). It matches encode(sha256(convert_to(payload::text,
+// 'UTF8')), 'hex') computed inside PostgreSQL.
+func hashPayloadText(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:])
+}
+
+// hashPayload returns the hex-encoded SHA-256 digest of raw. It is the
+// in-memory FakeStore's stand-in for the database's canonical-text hash; the
+// real store never uses it (see Store: the hash is taken over payload::text).
 func hashPayload(raw json.RawMessage) string {
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:])
@@ -144,7 +163,7 @@ var auditChainLockKey = func() int64 {
 // lock is released automatically on commit or rollback, including if the
 // INSERT is a no-op due to ON CONFLICT DO NOTHING.
 func (s *PgStore) Store(ctx context.Context, e *AuditEvent) error {
-	payloadHash := hashPayload(e.Payload)
+	var payloadHash string
 
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", auditChainLockKey); err != nil {
@@ -171,6 +190,16 @@ func (s *PgStore) Store(ctx context.Context, e *AuditEvent) error {
 		if _, err := tx.Exec(ctx, "SELECT set_config('app.platform_scope', 'true', true)"); err != nil {
 			return fmt.Errorf("set platform scope: %w", err)
 		}
+
+		// The payload hash is taken over the canonical JSONB text the database
+		// will actually store (payload::text), not over the producer's raw
+		// bytes: JSONB does not preserve those, so a hash over them could never
+		// be recomputed from the stored column. See migration 000006.
+		var canonical string
+		if err := tx.QueryRow(ctx, "SELECT $1::jsonb::text", []byte(e.Payload)).Scan(&canonical); err != nil {
+			return fmt.Errorf("canonicalise payload: %w", err)
+		}
+		payloadHash = hashPayloadText(canonical)
 
 		// Both the previous hash AND the next sequence_number are computed
 		// here, explicitly, under the advisory lock — deliberately NOT via a
@@ -200,9 +229,10 @@ func (s *PgStore) Store(ctx context.Context, e *AuditEvent) error {
 INSERT INTO audit_events
     (event_id, event_type, tenant_id, legal_entity_id, principal_id,
      source_service, schema_version, payload,
-     correlation_id, causation_id, sequence_number, payload_hash, previous_event_hash)
+     correlation_id, causation_id, sequence_number, payload_hash, previous_event_hash,
+     payload_hash_scheme)
 VALUES
-    ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+    ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 ON CONFLICT (event_id) DO NOTHING
 RETURNING sequence_number`
 
@@ -220,6 +250,7 @@ RETURNING sequence_number`
 			nextSeq,
 			payloadHash,
 			prevHash,
+			PayloadHashSchemeJSONBTextV1,
 		)
 
 		var seq int64
@@ -281,11 +312,31 @@ type FakeStore struct {
 	order    []string // event_id in insertion order, for chain-tip lookup
 	nextSeq  int64
 	lastHash string // payload_hash of the current chain tip; "" if empty
+
+	// Archive state — tenant-scoped, mirroring the RLS policy added by
+	// migration 000005 so handler/unit tests exercise the same isolation
+	// contract as PgStore: an archive (and its verification history) is only
+	// reachable by the tenant that created it.
+	archives      map[string]domain.Archive
+	verifications map[string][]domain.ArchiveVerification
+	// idem mirrors migration 000007: (tenant, endpoint, key) -> fingerprint and
+	// the archive first created under it.
+	idem map[string]fakeIdem
+}
+
+type fakeIdem struct {
+	fingerprint string
+	archive     domain.Archive
 }
 
 // NewFakeStore returns an initialised FakeStore.
 func NewFakeStore() *FakeStore {
-	return &FakeStore{events: make(map[string]AuditEvent)}
+	return &FakeStore{
+		events:        make(map[string]AuditEvent),
+		archives:      make(map[string]domain.Archive),
+		verifications: make(map[string][]domain.ArchiveVerification),
+		idem:          make(map[string]fakeIdem),
+	}
 }
 
 // Store inserts e into the in-memory map and extends the fake chain.
@@ -337,6 +388,51 @@ func (f *FakeStore) ChainInOrder() []AuditEvent {
 		out = append(out, f.events[id])
 	}
 	return out
+}
+
+// ─── test-only tampering helpers (simulate a privileged rewrite) ───────────
+
+// TamperPayloadForTest replaces a stored payload without touching its hash.
+func (f *FakeStore) TamperPayloadForTest(eventID string, payload json.RawMessage) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if e, ok := f.events[eventID]; ok {
+		e.Payload = payload
+		f.events[eventID] = e
+	}
+}
+
+// TamperHashForTest overwrites a stored payload_hash.
+func (f *FakeStore) TamperHashForTest(eventID, hash string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if e, ok := f.events[eventID]; ok {
+		e.PayloadHash = hash
+		f.events[eventID] = e
+	}
+}
+
+// TamperPreviousHashForTest overwrites a stored previous_event_hash.
+func (f *FakeStore) TamperPreviousHashForTest(eventID, hash string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if e, ok := f.events[eventID]; ok {
+		e.PreviousEventHash = hash
+		f.events[eventID] = e
+	}
+}
+
+// DeleteForTest removes a stored event, leaving a gap in the sequence.
+func (f *FakeStore) DeleteForTest(eventID string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.events, eventID)
+	for i, id := range f.order {
+		if id == eventID {
+			f.order = append(f.order[:i], f.order[i+1:]...)
+			break
+		}
+	}
 }
 
 // ─── compile-time interface check ──────────────────────────────────────────

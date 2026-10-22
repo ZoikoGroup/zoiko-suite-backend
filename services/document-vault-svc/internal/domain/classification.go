@@ -196,3 +196,17 @@ func CanConfirmClassification(c *RecordClassification) bool {
 func CanReclassify(c *RecordClassification) bool {
 	return c.Status == ClassificationStatusConfirmed || c.Status == ClassificationStatusRestricted
 }
+
+// BulkClassifyError is returned by BulkClassifyRecords when the batch was
+// rolled back. DocumentID names the document whose classification failed and
+// Err is the underlying domain error (so errors.Is still matches it).
+type BulkClassifyError struct {
+	DocumentID string
+	Err        error
+}
+
+func (e *BulkClassifyError) Error() string {
+	return "bulk classify: document " + e.DocumentID + ": " + e.Err.Error()
+}
+
+func (e *BulkClassifyError) Unwrap() error { return e.Err }

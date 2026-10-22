@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -39,13 +40,19 @@ func NewClient(baseURL string) *Client {
 // tenantID is forwarded via X-Tenant-Id — PRV-01's own RLS scopes this
 // read by tenant, same convention as every other cross-service client in
 // this domain (see retentionregistry-style clients elsewhere).
-func (c *Client) IsPublished(ctx context.Context, tenantID, purposeID string) (bool, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/privacy/purposes/"+purposeID, nil)
+func (c *Client) IsPublished(ctx context.Context, tenantID, principalID, purposeID string) (bool, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/privacy/purposes/"+url.PathEscape(purposeID), nil)
 	if err != nil {
 		return false, err
 	}
 	if tenantID != "" {
 		req.Header.Set("X-Tenant-Id", tenantID)
+	}
+	// PRV-01 requires an authenticated principal with a read grant on every
+	// route; the caller's verified principal is forwarded. (Provisioning the
+	// grant is authorization-svc's / the operator's job, not this service's.)
+	if principalID != "" {
+		req.Header.Set("X-Principal-Id", principalID)
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
