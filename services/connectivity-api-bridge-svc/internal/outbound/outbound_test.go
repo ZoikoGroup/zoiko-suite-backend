@@ -967,11 +967,15 @@ func TestEveryEventTypeIsProducedByARealFlow(t *testing.T) {
 	cfg := outbound.DefaultConfig()
 	cfg.MaxUnknownAge = time.Hour
 	e.svc.Cfg = cfg
-	c := e.setup(variant{callback: true})
+	c := e.setup(variant{callback: true, claims: true})
 	// reserved, submitted, pending
 	a := e.reserve(c, "PAY-1")
 	e.prov.set(answer(202, `{"payment_id":"P-9"}`))
 	_, _ = e.svc.Submit(ctxFor(tenantA), domain, a.AttemptID, nil)
+	// callbacks on the pending attempt: a claim about another tenant, an applied callback and its duplicate
+	e.callback(cb{conn: c, body: `{"event_id":"c1","payment_id":"P-9","status":"SETTLED","client_ref":"PAY-1","tenant":"tenant-b"}`})
+	e.callback(cb{conn: c, body: cbBody("c2", "P-9", "SETTLED", "PAY-1")})
+	e.callback(cb{conn: c, body: cbBody("c2", "P-9", "SETTLED", "PAY-1")})
 	// unknown, resolved, escalated
 	b := e.reserve(c, "PAY-2")
 	e.prov.set(failWith(timeoutErr{}))
@@ -990,6 +994,8 @@ func TestEveryEventTypeIsProducedByARealFlow(t *testing.T) {
 	e.prov.set(func(call) (int, string, error) { return 302, "", nil })
 	_, _ = e.svc.Submit(ctxFor(tenantA), domain, f.AttemptID, nil)
 
+	// callbacks: a claim about another tenant, an impossible transition, an applied callback, a duplicate, a late contradiction
+	e.callback(cb{conn: c, body: cbBody("c3", "P-0", "SETTLED", "PAY-4")}) // PAY-4 failed on a refused redirect
 	types := e.repo.Types()
 	for _, want := range outbound.EventTypes {
 		if want == "integration.security.outbound-region-blocked" {

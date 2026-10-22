@@ -358,6 +358,9 @@ func TestBind_MTLSCarriesTheCertificateExpiry(t *testing.T) {
 			if in.Content.Profiles[i].Name == "hmac-in" {
 				in.Content.Profiles[i].Spec = json.RawMessage(`{"mechanism":"MTLS","subject_binding":"CONNECTION","credential_class":"CALLBACK_SECRET"}`)
 			}
+			if in.Content.Profiles[i].Name == "cb" { // the callback follows the credential profile it names
+				in.Content.Profiles[i].Spec = json.RawMessage(`{"mechanism":"MTLS","replay_window_seconds":300,"dedupe_key_source":"body:/event_id","schema":"payment-cb@1","tenant_binding":"CONNECTION","transitions":{"PENDING":["SETTLED"]},"auth_profile":"hmac-in","reference_pointer":"/payment_id","status_pointer":"/status"}`)
+			}
 		}
 	})
 	c := authorizing(e, v, tenantA, "acc")

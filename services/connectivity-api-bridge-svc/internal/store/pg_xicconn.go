@@ -603,3 +603,27 @@ func (r *XICConnRepo) RecordSignal(ctx context.Context, tenant string, ev xiccon
 		return r.enqueue(ctx, tx, tenant, ev)
 	})
 }
+
+// LiveRefs returns the live (active or degraded) connections across tenants, for the workers that poll providers.
+func (r *XICConnRepo) LiveRefs(ctx context.Context, limit int) ([]xicconn.DueRef, error) {
+	if limit < 1 || limit > 10000 {
+		limit = 1000
+	}
+	var out []xicconn.DueRef
+	err := r.withWorker(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `SELECT tenant_id, connection_id::text FROM xic_connections WHERE status IN ('ACTIVE', 'DEGRADED') ORDER BY 1, 2 LIMIT $1`, limit)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var d xicconn.DueRef
+			if err := rows.Scan(&d.TenantID, &d.ConnectionID); err != nil {
+				return err
+			}
+			out = append(out, d)
+		}
+		return rows.Err()
+	})
+	return out, err
+}

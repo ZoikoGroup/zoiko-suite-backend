@@ -29,9 +29,10 @@ import (
 )
 
 const (
-	hRefAPI  = "0a000000-0000-4000-8000-0000000000c1"
-	hAPIKey  = "handler-provider-api-key"
-	hPayload = `{"amount":"10.00","currency":"GBP"}`
+	hRefAPI   = "0a000000-0000-4000-8000-0000000000c1"
+	hAPIKey   = "handler-provider-api-key"
+	hPayload  = `{"amount":"10.00","currency":"GBP"}`
+	hCBSecret = "handler-callback-secret"
 )
 
 type hSecrets struct{}
@@ -39,6 +40,9 @@ type hSecrets struct{}
 func (hSecrets) Secret(_ context.Context, _ string, ref string) ([]byte, error) {
 	if strings.EqualFold(ref, hRefAPI) {
 		return []byte(hAPIKey), nil
+	}
+	if strings.EqualFold(ref, hRefHMAC) {
+		return []byte(hCBSecret), nil
 	}
 	return nil, outbound.ErrBlocked
 }
@@ -119,7 +123,11 @@ type obHarness struct {
 	conn xicconn.Connection
 }
 
-func newObHarness(t *testing.T) *obHarness {
+func newObHarness(t *testing.T) *obHarness { return newObHarnessWith(t, false) }
+
+// newObHarnessWith builds the outbound harness; with callback, payment-submit keeps its callback profile (a 2xx is then
+// PENDING until the provider reports back).
+func newObHarnessWith(t *testing.T, callback bool) *obHarness {
 	t.Helper()
 	ch := newConnHarness(t)
 	in := registrytest.Input("1.1.0")
@@ -129,8 +137,11 @@ func newObHarness(t *testing.T) *obHarness {
 		o := &in.Content.Operations[i]
 		switch o.ID {
 		case "payment-submit":
-			o.AuthProfile, o.CallbackProfile, o.DataClasses, o.ResubmitAfterUnknown = "api-out", "", []string{"FINANCIAL"}, false
-			o.UnknownResolution = registry.UnknownResolution{StatusQueryOperation: "payment-status"}
+			o.AuthProfile, o.DataClasses, o.ResubmitAfterUnknown = "api-out", []string{"FINANCIAL"}, false
+			if !callback {
+				o.CallbackProfile = ""
+			}
+			o.UnknownResolution = registry.UnknownResolution{StatusQueryOperation: "payment-status", ViaCallback: callback}
 		case "payment-status":
 			o.AuthProfile = "api-out"
 		}

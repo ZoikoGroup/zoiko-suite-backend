@@ -28,9 +28,10 @@ import (
 // row-level security, the outbox, body retention and concurrency.
 
 const (
-	obRefKey = "0a000000-0000-4000-8000-0000000000d1"
-	obKey    = "pg-provider-api-key"
-	obPay    = `{"amount":"10.00","currency":"GBP"}`
+	obRefKey   = "0a000000-0000-4000-8000-0000000000d1"
+	obKey      = "pg-provider-api-key"
+	obPay      = `{"amount":"10.00","currency":"GBP"}`
+	pgCBSecret = "pg-callback-secret"
 )
 
 type obSecrets struct{ down atomic.Bool }
@@ -41,6 +42,9 @@ func (s *obSecrets) Secret(_ context.Context, _ string, ref string) ([]byte, err
 	}
 	if strings.EqualFold(ref, obRefKey) {
 		return []byte(obKey), nil
+	}
+	if strings.EqualFold(ref, cRefHMAC) {
+		return []byte(pgCBSecret), nil
 	}
 	return nil, outbound.ErrBlocked
 }
@@ -123,6 +127,12 @@ func newObEnv(t *testing.T) *obEnv {
 
 // contract publishes the reference contract with outbound calls carried by an API key.
 func (o *obEnv) contract(t *testing.T, resubmit bool) *registry.ContractVersion {
+	return o.contractWith(t, resubmit, false)
+}
+
+// contractWith publishes the reference contract with outbound calls carried by an API key; with callback, payment-submit
+// keeps its callback profile (authenticated by the hmac-in credential).
+func (o *obEnv) contractWith(t *testing.T, resubmit, callback bool) *registry.ContractVersion {
 	t.Helper()
 	return o.published(t, "bank-x", "1.0.0", func(in *registry.VersionInput) {
 		in.Content.Profiles = append(in.Content.Profiles, registry.Profile{Kind: registry.ProfileAuth, Name: "api-out",
@@ -131,8 +141,11 @@ func (o *obEnv) contract(t *testing.T, resubmit bool) *registry.ContractVersion 
 			op := &in.Content.Operations[i]
 			switch op.ID {
 			case "payment-submit":
-				op.AuthProfile, op.CallbackProfile, op.DataClasses, op.ResubmitAfterUnknown = "api-out", "", []string{"FINANCIAL"}, resubmit
-				op.UnknownResolution = registry.UnknownResolution{StatusQueryOperation: "payment-status"}
+				op.AuthProfile, op.DataClasses, op.ResubmitAfterUnknown = "api-out", []string{"FINANCIAL"}, resubmit
+				if !callback {
+					op.CallbackProfile = ""
+				}
+				op.UnknownResolution = registry.UnknownResolution{StatusQueryOperation: "payment-status", ViaCallback: callback}
 			case "payment-status":
 				op.AuthProfile = "api-out"
 			}
@@ -274,7 +287,7 @@ func TestOutboundPG_ReserveSubmitSettleAndDropBody(t *testing.T) {
 			t.Errorf("%d %s events", n, want)
 		}
 	}
-	if n := o.countAs(cTenantA, `SELECT count(*) FROM eventing_outbox WHERE event_type LIKE '%outbound%' AND (payload::text LIKE '%'||$1||'%' OR payload::text LIKE '%10.00%')`, obKey); n != 0 {
+	if n := o.countAs(cTenantA, `SELECT count(*) FROM eventing_outbox WHERE event_type LIKE '%outbound%' AND (convert_from(payload, 'UTF8') LIKE '%'||$1||'%' OR convert_from(payload, 'UTF8') LIKE '%10.00%')`, obKey); n != 0 {
 		t.Fatalf("%d outbound events leak a secret or a value", n)
 	}
 	if n := o.countAs(cTenantA, `SELECT count(*) FROM xic_outbound_events WHERE detail::text LIKE '%'||$1||'%' OR detail::text LIKE '%10.00%'`, obKey); n != 0 {

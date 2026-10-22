@@ -139,7 +139,12 @@ func (p *provider) RoundTrip(r *http.Request) (*http.Response, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &http.Response{StatusCode: status, Status: strconv.Itoa(status), Header: http.Header{"Content-Type": {"application/json"}},
+	hdr := http.Header{"Content-Type": {"application/json"}}
+	if strings.HasPrefix(body, "->") { // a redirect: the body names the Location
+		hdr.Set("Location", strings.TrimPrefix(body, "->"))
+		body = ""
+	}
+	return &http.Response{StatusCode: status, Status: strconv.Itoa(status), Header: hdr,
 		Body: io.NopCloser(bytes.NewReader([]byte(body))), Request: r}, nil
 }
 
@@ -187,6 +192,8 @@ type variant struct {
 	personal      bool // the payload class forbids storing the request body
 	hmacOut       bool // the outbound auth profile is HMAC signing instead of an API key
 	noStatusQuery bool
+	claims        bool   // the callback profile names tenant and account claim pointers
+	redirects     string // the endpoint profile's redirect mode (default NONE)
 }
 
 type env struct {
@@ -208,7 +215,7 @@ type env struct {
 func newEnv(t *testing.T) *env {
 	t.Helper()
 	e := &env{t: t, contracts: registry.NewMemRepo(), conns: xicconn.NewMemRepo(), repo: outbound.NewMemRepo(), prov: &provider{},
-		dns: &fakeDNS{m: map[string]string{"api.bank-x.com": "93.184.216.34"}}, now: registrytest.T0.Add(72 * time.Hour)}
+		dns: &fakeDNS{m: map[string]string{"api.bank-x.com": "93.184.216.34", "files.bank-x.com": "93.184.216.35", "rebind.bank-x.com": "10.0.0.9"}}, now: registrytest.T0.Add(72 * time.Hour)}
 	clock := func() time.Time { e.mu.Lock(); defer e.mu.Unlock(); return e.now }
 	pol := egress.Policy{Resolver: e.dns}
 	e.regSvc = &registry.Service{Repo: e.contracts, Clock: func() time.Time { return registrytest.T0 }}
@@ -259,6 +266,25 @@ func (e *env) publish(v variant, mutate func(*registry.VersionInput)) *registry.
 			}
 		case "payment-status":
 			o.AuthProfile = "api-out"
+		}
+	}
+	if v.redirects != "" {
+		for i := range in.Content.Profiles {
+			if in.Content.Profiles[i].Name == "bank-api" {
+				spec := `{"schemes":["https"],"hosts":["api.bank-x.com"],"ports":[443],"regions":["uk"],"redirects":"` + v.redirects + `"`
+				if v.redirects == "APPROVED_HOSTS" {
+					spec += `,"approved_redirect_hosts":["files.bank-x.com","rebind.bank-x.com"]`
+				}
+				in.Content.Profiles[i].Spec = json.RawMessage(spec + "}")
+			}
+		}
+	}
+	if v.claims {
+		for i := range in.Content.Profiles {
+			if in.Content.Profiles[i].Name == "cb" {
+				in.Content.Profiles[i].Spec = json.RawMessage(strings.Replace(string(in.Content.Profiles[i].Spec), `"auth_profile":"hmac-in"`,
+					`"auth_profile":"hmac-in","tenant_pointer":"/tenant","account_pointer":"/account"`, 1))
+			}
 		}
 	}
 	if mutate != nil {
@@ -315,7 +341,7 @@ func (e *env) activeConn(tenant string, v *registry.ContractVersion, account, ou
 	exp := e.at().Add(60 * 24 * time.Hour)
 	for _, b := range []xicconn.BindInput{
 		{AuthProfile: "api-out", CredentialRef: outRef, ConsentActor: "x", ExpiresAt: &exp},
-		{AuthProfile: "hmac-in", CredentialRef: uniqueRef(tenant+account, "h"), ConsentActor: "x"},
+		{AuthProfile: "hmac-in", CredentialRef: e.hmacRef(tenant, account), ConsentActor: "x"},
 	} {
 		if cur, err = e.connSvc.Bind(ctx, creator, c.ConnectionID, cur.Version, b); err != nil {
 			e.t.Fatal(err)
@@ -383,3 +409,14 @@ var _ = errors.New
 
 func newHMAC(secret string) hash.Hash { return hmac.New(sha256.New, []byte(secret)) }
 func hexOf(b []byte) string           { return hex.EncodeToString(b) }
+
+const cbSecret = "callback-hmac-secret-material"
+
+// hmacRef is the vault reference of a connection's callback credential; its material is registered for the test.
+func (e *env) hmacRef(tenant, account string) string {
+	ref := uniqueRef(tenant+account, "h")
+	e.secrets.mu.Lock()
+	e.secrets.m[strings.ToLower(ref)] = cbSecret
+	e.secrets.mu.Unlock()
+	return ref
+}

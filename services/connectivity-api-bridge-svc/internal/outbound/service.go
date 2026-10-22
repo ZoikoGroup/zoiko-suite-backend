@@ -19,6 +19,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -55,13 +56,20 @@ type Config struct {
 	ResolveBackoffMax time.Duration
 	MaxUnknownAge     time.Duration // OD-13: an attempt open this long is escalated once
 	MaxResponseBytes  int64
+
+	// Provider callbacks.
+	CallbackMaxBodyBytes   int64 // the read cap before any parsing
+	CallbackConnRatePerMin int   // callbacks per connection per minute (0 = unlimited)
+	CallbackIPRatePerMin   int   // callbacks per source address per minute (0 = unlimited)
+	CallbackInvalidPerMin  int   // unauthenticated-callback evidence rows kept per connection per minute
 }
 
 // DefaultConfig returns safe defaults.
 func DefaultConfig() Config {
 	return Config{BodyRetention: 7 * 24 * time.Hour, BodyMaxBytes: 256 << 10, BodyDenyClasses: []string{"PERSONAL", "RESTRICTED"},
 		RequestTimeout: 20 * time.Second, SubmitLease: 2 * time.Minute, ResolveBackoff: 30 * time.Second, ResolveBackoffMax: 15 * time.Minute,
-		MaxUnknownAge: 24 * time.Hour, MaxResponseBytes: 64 << 10}
+		MaxUnknownAge: 24 * time.Hour, MaxResponseBytes: 64 << 10,
+		CallbackMaxBodyBytes: 1 << 20, CallbackConnRatePerMin: 600, CallbackIPRatePerMin: 1200, CallbackInvalidPerMin: 30}
 }
 
 // Service is the outbound engine.
@@ -79,6 +87,11 @@ type Service struct {
 	Check func(ctx context.Context, url string) (string, error)
 	// Observe receives a short reason for every refusal and outcome, for metrics. It must not block.
 	Observe func(kind, reason string)
+	// EdgeSecret is shared with the TLS edge that attests client-certificate fingerprints (MTLS callbacks only).
+	EdgeSecret []byte
+
+	limMu sync.Mutex
+	lim   *limiter
 }
 
 func (s *Service) now() time.Time {
@@ -92,7 +105,11 @@ func (s *Service) cfg() Config {
 	if s.Cfg.RequestTimeout == 0 {
 		return DefaultConfig()
 	}
-	return s.Cfg
+	c := s.Cfg
+	if c.CallbackMaxBodyBytes == 0 {
+		c.CallbackMaxBodyBytes = DefaultConfig().CallbackMaxBodyBytes
+	}
+	return c
 }
 
 func (s *Service) observe(kind, reason string) {
@@ -293,6 +310,8 @@ type prepared struct {
 	op     registry.Operation
 	auth   registry.AuthInfo
 	url    string
+	host   string
+	ep     registry.EndpointInfo
 	secret []byte
 	media  string
 }
@@ -348,7 +367,7 @@ func (s *Service) prepare(ctx context.Context, a *Attempt, operationID string, q
 			ActorID: "system:xic-outbound", CorrelationID: a.CorrelationID, Data: map[string]any{"tenant_id": a.TenantID, "attempt_id": a.AttemptID, "reason_code": "XIC-009"}})
 		return nil, ErrBlocked
 	}
-	p := &prepared{d: d, v: v, op: op, auth: auth, url: u, media: "application/json"}
+	p := &prepared{d: d, v: v, op: op, auth: auth, url: u, host: d.Host, ep: ep, media: "application/json"}
 	if op.RequestSchema != "" {
 		if sch := v.SchemaByRef(op.RequestSchema); sch != nil && sch.MediaType != "" {
 			p.media = sch.MediaType
@@ -416,6 +435,8 @@ type response struct {
 	body   []byte
 	err    error
 	sent   bool
+	// redirectBlocked: a redirect of this call was refused by the endpoint profile or egress policy
+	redirectBlocked bool
 }
 
 func (s *Service) call(ctx context.Context, p *prepared, a *Attempt, method string, body []byte) response {
@@ -438,8 +459,14 @@ func (s *Service) call(ctx context.Context, p *prepared, a *Attempt, method stri
 		req.Header.Set(p.op.ProviderIdempotency.Header, providerKey(a))
 	}
 	p.authorize(req, body, s.now())
-	resp, err := s.client().Do(req)
+	blocked := false
+	resp, err := s.clientFor(p, method, func() { blocked = true }).Do(req)
 	if err != nil {
+		if blocked {
+			_ = s.Repo.RecordSignal(ctx, a.TenantID, OutEvent{Type: "integration.security.outbound-redirect-refused", AggregateType: "outbound-attempt", AggregateID: a.AttemptID,
+				ActorID: "system:xic-outbound", CorrelationID: a.CorrelationID, Data: map[string]any{"tenant_id": a.TenantID, "attempt_id": a.AttemptID, "reason_code": "XIC-009"}})
+			return response{err: err, sent: true, redirectBlocked: true}
+		}
 		return response{err: err, sent: !notSent(err)}
 	}
 	defer resp.Body.Close()
@@ -528,7 +555,8 @@ func (s *Service) Submit(ctx context.Context, actor Actor, id string, supplied [
 		lease := now.Add(s.cfg().SubmitLease)
 		tx.A.State, tx.A.SubmitCount, tx.A.LastSubmitAt, tx.A.NextResolutionAt = StateSubmitting, tx.A.SubmitCount+1, &now, &lease
 		tx.Event = &Event{Kind: "SUBMIT_STARTED", From: st, To: StateSubmitting, Actor: actor.PrincipalID, At: now,
-			Detail: mustJSON(map[string]any{"submit_count": tx.A.SubmitCount, "resubmission": st != StateReserved})}
+			Detail: mustJSON(map[string]any{"submit_count": tx.A.SubmitCount, "resubmission": st != StateReserved,
+				"destination_hash": hashBytes([]byte(p.host + "|" + p.ep.Name))[:16]})}
 		tx.Out = append(tx.Out, OutEvent{Type: "integration.outbound.submitted", AggregateType: "outbound-attempt", AggregateID: tx.A.AttemptID, ActorID: actor.PrincipalID,
 			CorrelationID: tx.A.CorrelationID, Data: map[string]any{"attempt_id": tx.A.AttemptID, "connection_id": tx.A.ConnectionID, "operation_id": tx.A.OperationID,
 				"tenant_id": tx.A.TenantID, "provider_idempotency_ref_hash": tx.A.ProviderIdemRefHash, "submit_count": tx.A.SubmitCount}})
@@ -705,20 +733,25 @@ func (s *Service) toUnknown(ctx context.Context, a *Attempt, reason string, stat
 	return out, err
 }
 
+// markPending moves an open attempt to PENDING inside tx. It is the one definition of that transition, used by the
+// submit path, the status query and the callback path alike.
+func (s *Service) markPending(tx *Tx, from string, status int, ref string, hasQuery bool, now time.Time, actor, kind string) {
+	tx.A.State, tx.A.AmbiguityReason, tx.A.ProviderStatus = StatePending, "", status
+	if ref != "" && tx.A.ProviderReference == "" {
+		tx.A.ProviderReference = ref
+	}
+	tx.A.NextResolutionAt = s.nextResolution(tx.A, hasQuery, now)
+	tx.Event = &Event{Kind: kind, From: from, To: StatePending, Actor: actor, At: now, Detail: mustJSON(map[string]any{"provider_status": status})}
+	tx.Out = append(tx.Out, OutEvent{Type: "integration.outbound.pending", AggregateType: "outbound-attempt", AggregateID: tx.A.AttemptID, ActorID: actor,
+		CorrelationID: tx.A.CorrelationID, Data: map[string]any{"attempt_id": tx.A.AttemptID, "tenant_id": tx.A.TenantID, "connection_id": tx.A.ConnectionID, "provider_reference": tx.A.ProviderReference}})
+}
+
 func (s *Service) toPending(ctx context.Context, a *Attempt, status int, ref string, hasQuery bool, now time.Time) (*Attempt, error) {
 	out, err := s.mutate(ctx, a.AttemptID, func(tx *Tx) error {
 		if tx.A.State != StateSubmitting && tx.A.State != StateUnknown && tx.A.State != StatePending {
 			return errNoChange
 		}
-		from := tx.A.State
-		tx.A.State, tx.A.AmbiguityReason, tx.A.ProviderStatus = StatePending, "", status
-		if ref != "" && tx.A.ProviderReference == "" {
-			tx.A.ProviderReference = ref
-		}
-		tx.A.NextResolutionAt = s.nextResolution(tx.A, hasQuery, now)
-		tx.Event = &Event{Kind: "PENDING", From: from, To: StatePending, Actor: "system:xic-outbound", At: now, Detail: mustJSON(map[string]any{"provider_status": status})}
-		tx.Out = append(tx.Out, OutEvent{Type: "integration.outbound.pending", AggregateType: "outbound-attempt", AggregateID: tx.A.AttemptID, ActorID: "system:xic-outbound",
-			CorrelationID: tx.A.CorrelationID, Data: map[string]any{"attempt_id": tx.A.AttemptID, "tenant_id": tx.A.TenantID, "connection_id": tx.A.ConnectionID, "provider_reference": tx.A.ProviderReference}})
+		s.markPending(tx, tx.A.State, status, ref, hasQuery, now, "system:xic-outbound", "PENDING")
 		return nil
 	})
 	if err == nil {
@@ -727,25 +760,31 @@ func (s *Service) toPending(ctx context.Context, a *Attempt, status int, ref str
 	return out, err
 }
 
-// toFinal records SETTLED or FAILED with how it was reached. The stored body is dropped: it is no longer needed.
+// markFinal records SETTLED or FAILED inside tx with how it was reached. The stored body is dropped: it is no
+// longer needed.
+func (s *Service) markFinal(tx *Tx, state, method, reason string, status int, ref, resolvedBy, evidence string, now time.Time) {
+	from := tx.A.State
+	tx.A.State, tx.A.AmbiguityReason, tx.A.ProviderStatus = state, reason, status
+	if ref != "" && tx.A.ProviderReference == "" {
+		tx.A.ProviderReference = ref
+	}
+	tx.A.ResolutionMethod, tx.A.ResolvedBy, tx.A.EvidenceRef = method, resolvedBy, evidence
+	tx.A.FinalOutcomeRef = mustJSON(map[string]any{"transport_state": state, "provider_status": status, "provider_reference": tx.A.ProviderReference, "reason": reason, "method": method})
+	tx.A.NextResolutionAt, tx.A.Body, tx.A.BodyRetained = nil, nil, false
+	tx.Event = &Event{Kind: "RESOLVED", From: from, To: state, Actor: dflt(resolvedBy, "system:xic-outbound"), At: now,
+		Detail: mustJSON(map[string]any{"method": method, "provider_status": status, "reason": reason})}
+	tx.Out = append(tx.Out, OutEvent{Type: "integration.outbound.resolved", AggregateType: "outbound-attempt", AggregateID: tx.A.AttemptID, ActorID: dflt(resolvedBy, "system:xic-outbound"),
+		CorrelationID: tx.A.CorrelationID, Data: map[string]any{"attempt_id": tx.A.AttemptID, "tenant_id": tx.A.TenantID, "connection_id": tx.A.ConnectionID,
+			"final_transport_state": state, "resolution_method": method, "provider_reference": tx.A.ProviderReference, "reason_code": reason}})
+}
+
+// toFinal records SETTLED or FAILED with how it was reached.
 func (s *Service) toFinal(ctx context.Context, a *Attempt, state, method, reason string, status int, ref, resolvedBy, evidence string, now time.Time) (*Attempt, error) {
 	out, err := s.mutate(ctx, a.AttemptID, func(tx *Tx) error {
 		if !tx.A.Open() || tx.A.State == StateReserved {
 			return errNoChange
 		}
-		from := tx.A.State
-		tx.A.State, tx.A.AmbiguityReason, tx.A.ProviderStatus = state, reason, status
-		if ref != "" && tx.A.ProviderReference == "" {
-			tx.A.ProviderReference = ref
-		}
-		tx.A.ResolutionMethod, tx.A.ResolvedBy, tx.A.EvidenceRef = method, resolvedBy, evidence
-		tx.A.FinalOutcomeRef = mustJSON(map[string]any{"transport_state": state, "provider_status": status, "provider_reference": tx.A.ProviderReference, "reason": reason, "method": method})
-		tx.A.NextResolutionAt, tx.A.Body, tx.A.BodyRetained = nil, nil, false
-		tx.Event = &Event{Kind: "RESOLVED", From: from, To: state, Actor: dflt(resolvedBy, "system:xic-outbound"), At: now,
-			Detail: mustJSON(map[string]any{"method": method, "provider_status": status, "reason": reason})}
-		tx.Out = append(tx.Out, OutEvent{Type: "integration.outbound.resolved", AggregateType: "outbound-attempt", AggregateID: tx.A.AttemptID, ActorID: dflt(resolvedBy, "system:xic-outbound"),
-			CorrelationID: tx.A.CorrelationID, Data: map[string]any{"attempt_id": tx.A.AttemptID, "tenant_id": tx.A.TenantID, "connection_id": tx.A.ConnectionID,
-				"final_transport_state": state, "resolution_method": method, "provider_reference": tx.A.ProviderReference, "reason_code": reason}})
+		s.markFinal(tx, state, method, reason, status, ref, resolvedBy, evidence, now)
 		return nil
 	})
 	if err == nil {
@@ -774,4 +813,76 @@ func (s *Service) Cancel(ctx context.Context, actor Actor, id, reason string) (*
 			CorrelationID: tx.A.CorrelationID, Data: map[string]any{"attempt_id": tx.A.AttemptID, "tenant_id": tx.A.TenantID, "connection_id": tx.A.ConnectionID}})
 		return nil
 	})
+}
+
+// ── redirects (§9.4, §15.1) ─────────────────────────────────────────────────
+
+const maxRedirectHops = 3
+
+var errRedirectBlocked = errors.New("redirect blocked by the endpoint profile or egress policy")
+
+// stripCredentials removes everything that authenticates the request. It runs whenever a redirect changes the host:
+// a credential belongs to the host it was approved for and is never forwarded to another one.
+func (p *prepared) stripCredentials(h http.Header) {
+	h.Del("Authorization")
+	switch p.auth.Mechanism {
+	case "API_KEY_HEADER":
+		h.Del(p.auth.APIKeyHeader)
+	case "HMAC":
+		h.Del(p.auth.SignatureHeader)
+		h.Del(p.auth.TimestampHeader)
+	}
+}
+
+// clientFor returns the HTTP client for one call. A redirect is followed only for a read (a status query), only when
+// the endpoint profile allows it (SAME_HOST, or APPROVED_HOSTS), for at most a few hops, and only after the next
+// hop passes the same egress checks as the first (scheme, port, DNS, address ranges). The credential is stripped when
+// the host changes. A submission is never redirected: replaying a POST at another address is an unknown outcome, and a
+// 3xx to it is reported as FAILED/REDIRECT_REFUSED by the caller.
+func (s *Service) clientFor(p *prepared, method string, onBlocked func()) *http.Client {
+	c := s.client()
+	if p == nil || method != http.MethodGet || (p.ep.Redirects != "SAME_HOST" && p.ep.Redirects != "APPROVED_HOSTS") {
+		return c
+	}
+	block := func() error {
+		onBlocked()
+		return errRedirectBlocked
+	}
+	c.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) > maxRedirectHops {
+			return block()
+		}
+		u := req.URL
+		if u.Scheme != "https" || u.User != nil || u.Host == "" {
+			return block()
+		}
+		host := strings.ToLower(u.Hostname())
+		same := strings.EqualFold(host, p.host)
+		if !same && (p.ep.Redirects == "SAME_HOST" || !containsFold(p.ep.ApprovedRedirectHosts, host)) {
+			return block()
+		}
+		if port := u.Port(); port != "" && port != "443" {
+			n, err := strconv.Atoi(port)
+			if err != nil || !containsInt(p.ep.Ports, n) {
+				return block()
+			}
+		}
+		if _, err := s.checkDest(req.Context(), u.String()); err != nil {
+			return block()
+		}
+		if !same {
+			p.stripCredentials(req.Header)
+		}
+		return nil
+	}
+	return c
+}
+
+func containsInt(list []int, n int) bool {
+	for _, v := range list {
+		if v == n {
+			return true
+		}
+	}
+	return false
 }

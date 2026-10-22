@@ -160,6 +160,11 @@ type Tx struct {
 	A     *Attempt
 	Event *Event
 	Out   []OutEvent
+	// Receipt, when set, is written in the same transaction (a callback applied to the attempt).
+	Receipt *Receipt
+	// NoUpdate leaves the attempt row untouched: evidence and events are still written. A final attempt is never
+	// updated, so a late callback about it is recorded without touching it.
+	NoUpdate bool
 }
 
 // Repo is the persistence boundary of XIC-04.
@@ -179,6 +184,16 @@ type Repo interface {
 	PurgeBodies(ctx context.Context, now time.Time, limit int) (int, error)
 	// RecordSignal writes a security-signal event in its own transaction.
 	RecordSignal(ctx context.Context, tenant string, ev OutEvent) error
+
+	// Callback receipts (§9.3). InsertReceipt writes a receipt that does not change an attempt; one that claims a
+	// dedupe key already held returns the holder with ErrDuplicate and writes nothing.
+	InsertReceipt(ctx context.Context, r *Receipt, out []OutEvent) (existing *Receipt, err error)
+	GetReceipt(ctx context.Context, id string) (*Receipt, error)
+	GetReceiptByDedupe(ctx context.Context, tenant, key string) (*Receipt, error)
+	ListReceipts(ctx context.Context, f ReceiptFilter) ([]Receipt, error)
+	// FindAttempt correlates a callback with its ORIGINAL attempt: by the provider's reference, else by the domain
+	// request reference the callback echoes.
+	FindAttempt(ctx context.Context, connectionID, operationID, reference, clientRef string) (*Attempt, error)
 }
 
 // ErrDuplicate is returned by Reserve when the logical operation already has an attempt.
@@ -198,7 +213,8 @@ var EventTypes = []string{
 	"integration.outbound.reserved", "integration.outbound.submitted", "integration.outbound.pending", "integration.outbound.unknown",
 	"integration.outbound.resolved", "integration.outbound.cancelled", "integration.outbound.blocked",
 	"integration.outbound.unknown-escalated",
-	"integration.security.outbound-egress-blocked", "integration.security.outbound-region-blocked", "integration.security.outbound-redirect-refused",
+	"integration.callback.applied", "integration.callback.duplicate", "integration.callback.invalid", "integration.callback.inconsistent",
+	"integration.security.outbound-egress-blocked", "integration.security.outbound-region-blocked", "integration.security.outbound-redirect-refused", "integration.security.callback-claim-mismatch",
 }
 
 func tenantFromCtx(ctx context.Context) string { return middleware.GetTenantID(ctx) }

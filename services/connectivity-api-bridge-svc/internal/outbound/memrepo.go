@@ -14,18 +14,19 @@ import (
 // operation rule, the version bump, the state graph, the resubmission rule and the submit counter, and it records the
 // outbox events it is given. The Postgres tests prove the database holds the rules itself.
 type MemRepo struct {
-	mu      sync.Mutex
-	at      map[string]*Attempt
-	events  map[string][]Event
-	Out     []OutEvent
-	Signals []OutEvent
+	mu       sync.Mutex
+	at       map[string]*Attempt
+	events   map[string][]Event
+	receipts map[string]*Receipt
+	Out      []OutEvent
+	Signals  []OutEvent
 	// FailNext makes the next Reserve fail, to test storage outages.
 	FailNext bool
 }
 
 // NewMemRepo returns an empty MemRepo.
 func NewMemRepo() *MemRepo {
-	return &MemRepo{at: map[string]*Attempt{}, events: map[string][]Event{}}
+	return &MemRepo{at: map[string]*Attempt{}, events: map[string][]Event{}, receipts: map[string]*Receipt{}}
 }
 
 func cloneAttempt(a *Attempt) *Attempt {
@@ -136,6 +137,22 @@ func (m *MemRepo) Mutate(ctx context.Context, id string, fn func(tx *Tx) error) 
 	if err := fn(tx); err != nil {
 		return nil, err
 	}
+	if tx.Receipt != nil {
+		if holder := m.heldKey(tx.Receipt); holder != nil {
+			return nil, ErrDuplicate
+		}
+	}
+	if tx.NoUpdate {
+		if tx.Event != nil {
+			m.events[id] = append(m.events[id], *tx.Event)
+		}
+		if tx.Receipt != nil {
+			r := *tx.Receipt
+			m.receipts[r.ReceiptID] = &r
+		}
+		m.Out = append(m.Out, tx.Out...)
+		return cloneAttempt(cur), nil
+	}
 	if w.State != cur.State {
 		okMove := false
 		for _, to := range legal[cur.State] {
@@ -179,6 +196,10 @@ func (m *MemRepo) Mutate(ctx context.Context, id string, fn func(tx *Tx) error) 
 	m.at[id] = w
 	if tx.Event != nil {
 		m.events[id] = append(m.events[id], *tx.Event)
+	}
+	if tx.Receipt != nil {
+		r := *tx.Receipt
+		m.receipts[r.ReceiptID] = &r
 	}
 	m.Out = append(m.Out, tx.Out...)
 	return cloneAttempt(w), nil
@@ -247,3 +268,114 @@ func (m *MemRepo) Types() []string {
 
 var _ Repo = (*MemRepo)(nil)
 var _ = errors.New
+
+// heldKey returns the receipt that already holds r's dedupe key in the same tenant, if any.
+func (m *MemRepo) heldKey(r *Receipt) *Receipt {
+	if r.DedupeKey == "" {
+		return nil
+	}
+	for _, x := range m.receipts {
+		if x.TenantID == r.TenantID && x.DedupeKey == r.DedupeKey {
+			return x
+		}
+	}
+	return nil
+}
+
+// InsertReceipt implements Repo.
+func (m *MemRepo) InsertReceipt(ctx context.Context, r *Receipt, out []OutEvent) (*Receipt, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.FailNext {
+		m.FailNext = false
+		return nil, context.DeadlineExceeded
+	}
+	if r.TenantID != middleware.GetTenantID(ctx) {
+		return nil, ErrReceiptNotFound
+	}
+	if h := m.heldKey(r); h != nil {
+		c := *h
+		return &c, ErrDuplicate
+	}
+	c := *r
+	m.receipts[r.ReceiptID] = &c
+	m.Out = append(m.Out, out...)
+	return nil, nil
+}
+
+// GetReceipt implements Repo.
+func (m *MemRepo) GetReceipt(ctx context.Context, id string) (*Receipt, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.receipts[id]
+	if !ok || r.TenantID != middleware.GetTenantID(ctx) {
+		return nil, ErrReceiptNotFound
+	}
+	c := *r
+	return &c, nil
+}
+
+// GetReceiptByDedupe implements Repo.
+func (m *MemRepo) GetReceiptByDedupe(ctx context.Context, tenant, key string) (*Receipt, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, r := range m.receipts {
+		if r.TenantID == tenant && r.DedupeKey == key && key != "" {
+			c := *r
+			return &c, nil
+		}
+	}
+	return nil, ErrReceiptNotFound
+}
+
+// ListReceipts implements Repo.
+func (m *MemRepo) ListReceipts(ctx context.Context, f ReceiptFilter) ([]Receipt, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := []Receipt{}
+	for _, r := range m.receipts {
+		if r.TenantID != middleware.GetTenantID(ctx) {
+			continue
+		}
+		if (f.State != "" && r.State != f.State) || (f.ConnectionID != "" && r.ConnectionID != f.ConnectionID) ||
+			(f.AttemptID != "" && r.AttemptID != f.AttemptID) || (f.NeedsReconciliation && !r.NeedsReconciliation) {
+			continue
+		}
+		out = append(out, *r)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].ReceivedAt.Equal(out[j].ReceivedAt) {
+			return out[i].ReceivedAt.After(out[j].ReceivedAt)
+		}
+		return out[i].ReceiptID < out[j].ReceiptID
+	})
+	if f.Limit > 0 && len(out) > f.Limit {
+		out = out[:f.Limit]
+	}
+	return out, nil
+}
+
+// FindAttempt implements Repo.
+func (m *MemRepo) FindAttempt(ctx context.Context, connectionID, operationID, reference, clientRef string) (*Attempt, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var byRef, byClient *Attempt
+	for _, a := range m.at {
+		if a.TenantID != middleware.GetTenantID(ctx) || a.ConnectionID != connectionID || a.OperationID != operationID {
+			continue
+		}
+		if reference != "" && a.ProviderReference == reference {
+			byRef = a
+		}
+		if clientRef != "" && a.DomainRequestRef == clientRef {
+			byClient = a
+		}
+	}
+	switch {
+	case byRef != nil:
+		return cloneAttempt(byRef), nil
+	case byClient != nil:
+		return cloneAttempt(byClient), nil
+	}
+	return nil, ErrNotFound
+}

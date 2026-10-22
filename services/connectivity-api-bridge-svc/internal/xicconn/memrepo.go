@@ -284,3 +284,16 @@ func (m *MemRepo) Types() []string {
 }
 
 var _ Repo = (*MemRepo)(nil)
+
+// LiveRefs returns the live connections across tenants.
+func (m *MemRepo) LiveRefs(_ context.Context, limit int) ([]DueRef, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []DueRef
+	for _, c := range m.conns {
+		if c.Live() && (limit < 1 || len(out) < limit) {
+			out = append(out, DueRef{TenantID: c.TenantID, ConnectionID: c.ConnectionID})
+		}
+	}
+	return out, nil
+}

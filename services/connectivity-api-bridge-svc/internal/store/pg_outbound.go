@@ -35,7 +35,7 @@ func outboundErr(err error) error {
 	msg := err.Error()
 	switch pgCode(err) {
 	case "23505":
-		if strings.Contains(msg, "xic_oa_logical") {
+		if strings.Contains(msg, "xic_oa_logical") || strings.Contains(msg, "xic_cr_dedupe") {
 			return outbound.ErrDuplicate
 		}
 	case "23000", "23514":
@@ -247,7 +247,9 @@ func (r *OutboundRepo) Mutate(ctx context.Context, id string, fn func(tx *outbou
 			fin = []byte(w.FinalOutcomeRef)
 		}
 		dropBody := len(cur.Body) > 0 && len(w.Body) == 0
-		if _, err := pg.Exec(ctx, `UPDATE xic_outbound_attempts SET state=$2, ambiguity_reason=$3, provider_reference=$4, provider_status=$5, submit_count=$6,
+		if tx.NoUpdate {
+			// the attempt is left exactly as it is (a final attempt cannot be updated at all); evidence is still written
+		} else if _, err := pg.Exec(ctx, `UPDATE xic_outbound_attempts SET state=$2, ambiguity_reason=$3, provider_reference=$4, provider_status=$5, submit_count=$6,
 			last_submit_at=$7, resolve_count=$8, next_resolution_at=$9, escalated_at=$10, resolution_method=$11, resolved_by=$12, evidence_ref=$13, final_outcome=$14,
 			body = CASE WHEN $15 THEN NULL ELSE body END, version=version+1, updated_at=now()
 			WHERE attempt_id=$1::uuid`, id, w.State, w.AmbiguityReason, w.ProviderReference, w.ProviderStatus, w.SubmitCount, w.LastSubmitAt, w.ResolveCount,
@@ -256,6 +258,11 @@ func (r *OutboundRepo) Mutate(ctx context.Context, id string, fn func(tx *outbou
 		}
 		if tx.Event != nil {
 			if err := insertOutboundEvent(ctx, pg, id, cur.TenantID, *tx.Event); err != nil {
+				return err
+			}
+		}
+		if tx.Receipt != nil {
+			if err := insertReceipt(ctx, pg, tx.Receipt); err != nil {
 				return err
 			}
 		}

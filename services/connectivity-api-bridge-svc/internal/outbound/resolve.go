@@ -138,6 +138,8 @@ func (s *Service) applyStatus(ctx context.Context, a *Attempt, p *prepared, r re
 	if r.err != nil || r.status < 200 || r.status >= 300 {
 		reason := ReasonUnclassified
 		switch {
+		case r.redirectBlocked:
+			reason = ReasonRedirectRefused
 		case r.err != nil:
 			reason = ReasonConnectionLost
 		case r.status == http.StatusNotFound:
