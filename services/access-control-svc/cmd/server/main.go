@@ -24,6 +24,7 @@ import (
 	"github.com/riandyrn/otelchi"
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
+	idenv "zoiko.io/identity-envelope"
 
 	"zoiko.io/access-control-svc/internal/clients"
 	"zoiko.io/access-control-svc/internal/config"
@@ -353,7 +354,11 @@ func main() {
 		authzBaseURL = cfg.AuthzMTLSURL
 	}
 	authzClient := &httpAuthzClient{baseURL: authzBaseURL, client: httpClientForAuthz, log: log, cache: make(map[string]cachedDecision)}
-	authzAdminClient := clients.NewAuthzAdminClient(cfg.AuthZServiceURL)
+	// Over the same client and URL as the decision calls: with mTLS on, the
+	// admin calls used to go out plaintext to AUTHZ_SERVICE_URL, so
+	// authorization-svc could never see this service's certificate and admit it
+	// as a registered delegate (its register A-01).
+	authzAdminClient := clients.NewAuthzAdminClientWithHTTP(authzBaseURL, httpClientForAuthz)
 	sodClient := clients.NewSoDClient(authzBaseURL)
 	// The protected-action catalogue is this service's own table, not a call:
 	// the route the old client called (GET /v1/protected-permissions) exists
@@ -362,15 +367,31 @@ func main() {
 	permissionTaxonomy := store.NewPermissionCatalogue(pgStore)
 
 	// ── 5. Router + handler ───────────────────────────────────────────────────
+	// Identity gate (X5 / X-R3, decision 21 Oct 2026): identity-context-svc's
+	// signed envelope is verified (JWKS) with its session status (AU-01), and
+	// its claims become the only source of X-Principal-Id / X-Tenant-Id; a peer
+	// over verified mTLS may vouch for them instead. Until now this service took
+	// those headers as sent. IDENTITY_VERIFY: require (default outside local) | warn.
+	gate, gateSettings, err := idenv.NewGateFromEnv("access-control-svc", log, idenv.EnvOptions{DefaultPeers: nil})
+	if err != nil {
+		log.Fatal("identity gate configuration refused", zap.Error(err))
+	}
+	log.Info("identity gate", gateSettings.Fields()...)
+
 	r := chi.NewRouter()
+	r.Use(idenv.RequestID)
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
 	r.Use(middleware.Recoverer)
 	r.Use(otelchi.Middleware("access-control-svc", otelchi.WithChiRoutes(r)))
 	r.Use(metrics.HTTPMiddleware)
 	r.Use(correlationIDMiddleware)
+	r.Use(gate.Middleware)
 	r.Use(svcmiddleware.TenantContext())
 	r.Use(middleware.Logger)
+	// Records the caller's identity envelope so the authorization-svc admin
+	// client can forward it (authorization-svc register A-01; clients/forward.go).
+	r.Use(clients.ForwardBearer)
 
 	// Canonical Service Input Contract (ZS-ARCH-SVC-001 v2.0 §4). Runs after
 	// Recoverer and telemetry so a refusal is still traced, and ahead of every
@@ -529,10 +550,11 @@ func authzReachable(baseURL string) func(context.Context) error {
 
 func correlationIDMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("X-Correlation-ID") == "" {
-			r.Header.Set("X-Correlation-ID", middleware.GetReqID(r.Context()))
+		// Echoed, never invented: a correlation id made up here, before the
+		// input contract can refuse a request without one, traces nothing.
+		if id := r.Header.Get("X-Correlation-ID"); id != "" {
+			w.Header().Set("X-Correlation-ID", id)
 		}
-		w.Header().Set("X-Correlation-ID", r.Header.Get("X-Correlation-ID"))
 		next.ServeHTTP(w, r)
 	})
 }

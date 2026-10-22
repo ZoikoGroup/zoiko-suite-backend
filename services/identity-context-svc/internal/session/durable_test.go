@@ -247,7 +247,7 @@ type fixture struct {
 func newFixture() *fixture {
 	hot := newFakeHot()
 	store := newFakeStore()
-	return &fixture{hot: hot, store: store, dc: session.NewDurableCache(hot, store, zap.NewNop())}
+	return &fixture{hot: hot, store: store, dc: session.NewDurableCache(hot, store, zap.NewNop(), 0)}
 }
 
 func (f *fixture) seed(id, tenantID, principalID string) domain.SessionContext {

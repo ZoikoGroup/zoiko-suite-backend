@@ -145,6 +145,8 @@ paths:
               $ref: "#/components/headers/AssuranceLevel"
             X-Support-Context-Id:
               $ref: "#/components/headers/SupportContextId"
+            X-Authn-Age-Seconds:
+              $ref: "#/components/headers/AuthnAgeSeconds"
         "401":
           description: |
             The caller could not be verified. One of `no_token`,
@@ -371,10 +373,19 @@ components:
     AssuranceLevel:
       description: |
         Authentication assurance of the session, from the envelope's
-        `session_trust_posture.mfa_verified`. Absent when the envelope states
-        none. No login age is ever asserted: the envelope carries no
-        `auth_time`, so `X-Authn-Age-Seconds` is stripped at the edge.
+        `session_trust_posture.mfa_verified` (true only after a TOTP step-up
+        at identity-context-svc). Absent when the envelope states none.
       schema: { type: string, enum: [MFA, SINGLE_FACTOR] }
+    AuthnAgeSeconds:
+      description: |
+        Seconds since the person last authenticated: the envelope's
+        `auth_time` (the password login, or a later TOTP step-up). Never
+        derived from `iat`, which is when the envelope was minted and moves on
+        every re-resolve. Absent when the envelope carries no `auth_time`, or
+        one more than a minute in the future; a backend reads absent as
+        unknown, which authorization-svc's step-up treats as not recent. A
+        client copy is always stripped at the edge.
+      schema: { type: integer, minimum: 0 }
     SupportContextId:
       description: |
         The support elevation identity-context-svc verified when it issued the

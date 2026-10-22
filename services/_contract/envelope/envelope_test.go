@@ -358,3 +358,22 @@ func hasField(err *ValidationError, field string) bool {
 	}
 	return false
 }
+
+// RequiredOnRead (decision D-06): purpose of access is demanded on reads and
+// not on writes — governance-decision-log-svc's evidence appends carry no
+// purpose, its reads of governed decisions must.
+func TestPurposeRequiredOnReadOnly(t *testing.T) {
+	p := Policy{ServiceName: "test", PurposeContext: RequiredOnRead}
+
+	read := fullEnvelope(http.MethodGet, "/v1/decisions")
+	read.Header.Del(HeaderPurposeContext)
+	if err := p.Validate(Parse(read), read); err == nil {
+		t.Fatal("a read without purpose was admitted")
+	}
+
+	write := fullEnvelope(http.MethodPost, "/v1/decisions")
+	write.Header.Del(HeaderPurposeContext)
+	if err := p.Validate(Parse(write), write); err != nil {
+		t.Fatalf("a write was refused for missing purpose: %+v", err.Violations)
+	}
+}

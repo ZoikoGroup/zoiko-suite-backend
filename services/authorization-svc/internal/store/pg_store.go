@@ -2059,6 +2059,66 @@ func (s *PgStore) FindDelegationSource(ctx context.Context, delegatePrincipalID,
 	return delegator, delegationID, nil
 }
 
+// FindDelegationFrom names the ACTIVE delegation from delegatorPrincipalID to
+// delegatePrincipalID that confers actionType in this scope, with the same
+// predicates as FindDelegationSource (the delegator must still hold the
+// action and still stand). "" when there is none.
+//
+// The caller asks a narrower question than "does the delegate hold this by
+// delegation": whether it holds it from THIS delegator — the assigned
+// approver a workflow stage names. FindDelegatedActions' basis names only the
+// first delegator, so a delegate holding delegations from two approvers was
+// refused for the second (Governance audit, workflow row 23, 21 Oct 2026).
+func (s *PgStore) FindDelegationFrom(ctx context.Context, delegatePrincipalID, delegatorPrincipalID, legalEntityID, tenantID, actionType string) (string, error) {
+	const query = `
+		SELECT da.delegated_authority_id::text
+		  FROM delegated_authorities da
+		  JOIN principal_role_assignments pra ON pra.principal_id = da.delegator_principal_id
+		  JOIN roles r ON r.role_id = pra.role_id AND r.active_flag
+		  JOIN permission_bundles pb ON pb.role_id = r.role_id AND pb.active_flag
+		 WHERE da.delegate_principal_id = $1
+		   AND da.delegator_principal_id = $5
+		   AND (da.legal_entity_id = $2 OR (da.legal_entity_id IS NULL AND $3 != ''))
+		   AND ($3 = '' OR da.tenant_id::text = $3)
+		   AND da.revocation_status = 'ACTIVE'
+		   AND da.effective_from <= NOW()
+		   AND (da.effective_to IS NULL OR da.effective_to > NOW())
+		   AND r.tenant_id = da.tenant_id
+		   AND pra.approval_status = 'APPROVED'
+		   AND (pra.legal_entity_id = $2 OR (pra.legal_entity_id IS NULL AND $3 != ''))
+		   AND pra.effective_from <= NOW()
+		   AND (pra.effective_to IS NULL OR pra.effective_to > NOW())
+		   AND pb.permitted_actions @> jsonb_build_array($4::text)
+		   AND (da.delegated_actions IS NULL OR da.delegated_actions @> jsonb_build_array($4::text))
+		   AND NOT EXISTS (SELECT 1 FROM principal_status_projection psp
+		                    WHERE psp.principal_id = da.delegator_principal_id
+		                      AND psp.tenant_id = da.tenant_id
+		                      AND psp.status <> 'ACTIVE')
+		 ORDER BY da.created_at, da.delegated_authority_id
+		 LIMIT 1;`
+	if domain.IsPrivilegedAction(actionType) {
+		return "", nil // privileged actions are never delegable
+	}
+	var delegationID string
+	run := func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, query, delegatePrincipalID, legalEntityID, tenantID, actionType, delegatorPrincipalID).Scan(&delegationID)
+	}
+	var err error
+	if tenantID != "" {
+		err = s.withRLS(ctx, tenantID, run)
+	} else {
+		err = s.withPlatformScope(ctx, run)
+	}
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		s.log.Error("pg FindDelegationFrom failed", zap.Error(err))
+		return "", fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return delegationID, nil
+}
+
 // FindDelegatedActionsScoped resolves delegations taking into account book_id and org_unit_id hierarchical dimensions.
 func (s *PgStore) FindDelegatedActionsScoped(ctx context.Context, principalID, legalEntityID, tenantID, bookID, orgUnitID string) ([]string, string, error) {
 	const query = `
@@ -2945,11 +3005,14 @@ func isUndefinedTable(err error) bool {
 // ── Privileged Access Management (ZS-IAM-001 §13 & §21) ─────────────────────
 
 const privilegedSessionColumns = `session_id, tenant_id, principal_id, requested_actions, ticket_ref, reason, status, duration_seconds, expires_at, created_at, revoked_at, revoked_by,
-	requested_by, resource_scope, target_environment, high_impact, approved_by, approved_at, review_status, reviewed_by, reviewed_at, review_notes`
+	requested_by, resource_scope, target_environment, high_impact, approved_by, approved_at, review_status, reviewed_by, reviewed_at, review_notes,
+	requester_assurance, requester_authn_at, requester_identity_session, approver_assurance, approver_authn_at, approver_identity_session`
 
 func scanPrivilegedSession(row pgx.Row) (*domain.PrivilegedSession, error) {
 	var ps domain.PrivilegedSession
 	var tenantUUID, sessionUUID uuid.UUID
+	var reqAssurance, reqSession, apprAssurance, apprSession *string
+	var reqAuthnAt, apprAuthnAt *time.Time
 	err := row.Scan(
 		&sessionUUID,
 		&tenantUUID,
@@ -2973,10 +3036,14 @@ func scanPrivilegedSession(row pgx.Row) (*domain.PrivilegedSession, error) {
 		&ps.ReviewedBy,
 		&ps.ReviewedAt,
 		&ps.ReviewNotes,
+		&reqAssurance, &reqAuthnAt, &reqSession,
+		&apprAssurance, &apprAuthnAt, &apprSession,
 	)
 	if err != nil {
 		return nil, err
 	}
+	ps.RequesterStepUp = stepUpEvidence(reqAssurance, reqAuthnAt, reqSession)
+	ps.ApproverStepUp = stepUpEvidence(apprAssurance, apprAuthnAt, apprSession)
 	ps.SessionID = sessionUUID.String()
 	ps.TenantID = tenantUUID.String()
 	return &ps, nil
@@ -2990,11 +3057,9 @@ func (s *PgStore) CreatePrivilegedSession(ctx context.Context, params domain.Cre
 		return nil, domain.ErrPrivilegedSessionIncomplete
 	}
 
-	durationSec := params.DurationSeconds
-	if durationSec <= 0 {
-		durationSec = 3600 // default 1 hour
-	} else if durationSec > 86400 {
-		durationSec = 86400 // max 24 hours
+	durationSec, err := sessionDuration(params.DurationSeconds, 3600, params.MaxDurationSeconds, 86400)
+	if err != nil {
+		return nil, err
 	}
 
 	expiresAt := time.Now().UTC().Add(time.Duration(durationSec) * time.Second)
@@ -3014,17 +3079,21 @@ func (s *PgStore) CreatePrivilegedSession(ctx context.Context, params domain.Cre
 	const query = `
 		INSERT INTO privileged_sessions (
 			tenant_id, principal_id, requested_actions, ticket_ref, reason, status, duration_seconds, expires_at,
-			requested_by, resource_scope, target_environment, high_impact
+			requested_by, resource_scope, target_environment, high_impact,
+			requester_assurance, requester_authn_at, requester_identity_session
 		) VALUES (
-			$1::uuid, $2, $3, $4, $5, $6, $7, $8, NULLIF($9, ''), NULLIF($10, ''), NULLIF($11, ''), $12
+			$1::uuid, $2, $3, $4, $5, $6, $7, $8, NULLIF($9, ''), NULLIF($10, ''), NULLIF($11, ''), $12,
+			$13, $14, $15
 		) RETURNING ` + privilegedSessionColumns + `;`
 
+	assurance, authnAt, idSession := stepUpColumns(params.StepUp)
 	var ps *domain.PrivilegedSession
-	err := s.withRLS(ctx, params.TenantID, func(tx pgx.Tx) error {
+	err = s.withRLS(ctx, params.TenantID, func(tx pgx.Tx) error {
 		var scanErr error
 		ps, scanErr = scanPrivilegedSession(tx.QueryRow(ctx, query,
 			params.TenantID, params.PrincipalID, actions, params.TicketRef, params.Reason, status, durationSec, expiresAt,
 			params.RequestedBy, params.ResourceScope, params.TargetEnvironment, params.HighImpact,
+			assurance, authnAt, idSession,
 		))
 		return scanErr
 	})
@@ -3169,7 +3238,7 @@ func (s *PgStore) RevokePrivilegedSession(ctx context.Context, sessionID, tenant
 // a PENDING_APPROVAL JIT session. The approver's independence is the
 // handler's check and a CHECK in 000030. ErrSessionNotPending when the
 // session is not pending or its approval window has passed.
-func (s *PgStore) DecidePrivilegedSession(ctx context.Context, sessionID, tenantID, approver string, approve bool) (*domain.PrivilegedSession, error) {
+func (s *PgStore) DecidePrivilegedSession(ctx context.Context, sessionID, tenantID, approver string, approve bool, stepUp *domain.StepUpEvidence) (*domain.PrivilegedSession, error) {
 	if tenantID == "" {
 		return nil, domain.ErrTenantScopeRequired
 	}
@@ -3178,7 +3247,10 @@ func (s *PgStore) DecidePrivilegedSession(ctx context.Context, sessionID, tenant
 		   SET status      = CASE WHEN $4 THEN 'ACTIVE' ELSE 'REJECTED' END,
 		       approved_by = $3,
 		       approved_at = NOW(),
-		       expires_at  = CASE WHEN $4 THEN NOW() + make_interval(secs => duration_seconds) ELSE expires_at END
+		       expires_at  = CASE WHEN $4 THEN NOW() + make_interval(secs => duration_seconds) ELSE expires_at END,
+		       approver_assurance        = $6,
+		       approver_authn_at         = $7,
+		       approver_identity_session = $8
 		 WHERE session_id = $1::uuid AND tenant_id = $2::uuid
 		   AND status = 'PENDING_APPROVAL'
 		   AND created_at > NOW() - make_interval(secs => $5)
@@ -3186,8 +3258,9 @@ func (s *PgStore) DecidePrivilegedSession(ctx context.Context, sessionID, tenant
 	var ps *domain.PrivilegedSession
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		var scanErr error
+		assurance, authnAt, idSession := stepUpColumns(stepUp)
 		ps, scanErr = scanPrivilegedSession(tx.QueryRow(ctx, query, sessionID, tenantID, approver, approve,
-			domain.PrivilegedSessionApprovalWindow.Seconds()))
+			domain.PrivilegedSessionApprovalWindow.Seconds(), assurance, authnAt, idSession))
 		return scanErr
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -3235,11 +3308,13 @@ func (s *PgStore) ReviewSession(ctx context.Context, kind, sessionID, tenantID, 
 
 // ── Break-Glass Emergency Sessions (ZS-IAM-001 §14 & §21) ───────────────────
 
-const breakGlassSessionColumns = "session_id, tenant_id, principal_id, incident_id, reason, requested_actions, status, duration_seconds, expires_at, created_at, revoked_at, revoked_by, requested_by, review_status, reviewed_by, reviewed_at, review_notes"
+const breakGlassSessionColumns = "session_id, tenant_id, principal_id, incident_id, reason, requested_actions, status, duration_seconds, expires_at, created_at, revoked_at, revoked_by, requested_by, review_status, reviewed_by, reviewed_at, review_notes, requester_assurance, requester_authn_at, requester_identity_session"
 
 func scanBreakGlassSession(row pgx.Row) (*domain.BreakGlassSession, error) {
 	var bg domain.BreakGlassSession
 	var tenantUUID, sessionUUID uuid.UUID
+	var reqAssurance, reqSession *string
+	var reqAuthnAt *time.Time
 	err := row.Scan(
 		&sessionUUID,
 		&tenantUUID,
@@ -3258,10 +3333,12 @@ func scanBreakGlassSession(row pgx.Row) (*domain.BreakGlassSession, error) {
 		&bg.ReviewedBy,
 		&bg.ReviewedAt,
 		&bg.ReviewNotes,
+		&reqAssurance, &reqAuthnAt, &reqSession,
 	)
 	if err != nil {
 		return nil, err
 	}
+	bg.RequesterStepUp = stepUpEvidence(reqAssurance, reqAuthnAt, reqSession)
 	bg.SessionID = sessionUUID.String()
 	bg.TenantID = tenantUUID.String()
 	return &bg, nil
@@ -3279,11 +3356,9 @@ func (s *PgStore) CreateBreakGlassSession(ctx context.Context, params domain.Cre
 		return nil, domain.ErrBreakGlassIncidentRequired
 	}
 
-	durationSec := params.DurationSeconds
-	if durationSec <= 0 {
-		durationSec = 1800 // default 30 mins
-	} else if durationSec > 7200 {
-		durationSec = 7200 // max 2 hours for break glass
+	durationSec, err := sessionDuration(params.DurationSeconds, 1800, params.MaxDurationSeconds, 7200)
+	if err != nil {
+		return nil, err
 	}
 
 	expiresAt := time.Now().UTC().Add(time.Duration(durationSec) * time.Second)
@@ -3295,16 +3370,19 @@ func (s *PgStore) CreateBreakGlassSession(ctx context.Context, params domain.Cre
 
 	const query = `
 		INSERT INTO break_glass_sessions (
-			tenant_id, principal_id, incident_id, reason, requested_actions, status, duration_seconds, expires_at, requested_by
+			tenant_id, principal_id, incident_id, reason, requested_actions, status, duration_seconds, expires_at, requested_by,
+			requester_assurance, requester_authn_at, requester_identity_session
 		) VALUES (
-			$1::uuid, $2, $3, $4, $5, 'ACTIVE', $6, $7, NULLIF($8, '')
+			$1::uuid, $2, $3, $4, $5, 'ACTIVE', $6, $7, NULLIF($8, ''), $9, $10, $11
 		) RETURNING ` + breakGlassSessionColumns + `;`
 
+	assurance, authnAt, idSession := stepUpColumns(params.StepUp)
 	var bg *domain.BreakGlassSession
-	err := s.withRLS(ctx, params.TenantID, func(tx pgx.Tx) error {
+	err = s.withRLS(ctx, params.TenantID, func(tx pgx.Tx) error {
 		var scanErr error
 		bg, scanErr = scanBreakGlassSession(tx.QueryRow(ctx, query,
 			params.TenantID, params.PrincipalID, params.IncidentID, params.Reason, actions, durationSec, expiresAt, params.RequestedBy,
+			assurance, authnAt, idSession,
 		))
 		return scanErr
 	})
@@ -3486,11 +3564,9 @@ func (s *PgStore) CreateSupportSession(ctx context.Context, params domain.Create
 		return nil, domain.ErrSupportSessionIncomplete
 	}
 
-	durationSec := params.DurationSeconds
-	if durationSec <= 0 {
-		durationSec = 3600 // default 1 hour
-	} else if durationSec > 86400 {
-		durationSec = 86400 // max 24 hours
+	durationSec, err := sessionDuration(params.DurationSeconds, 3600, params.MaxDurationSeconds, 86400)
+	if err != nil {
+		return nil, err
 	}
 
 	expiresAt := time.Now().UTC().Add(time.Duration(durationSec) * time.Second)
@@ -3509,7 +3585,7 @@ func (s *PgStore) CreateSupportSession(ctx context.Context, params domain.Create
 		) RETURNING ` + supportSessionColumns + `;`
 
 	var ss *domain.SupportSession
-	err := s.withRLS(ctx, params.TenantID, func(tx pgx.Tx) error {
+	err = s.withRLS(ctx, params.TenantID, func(tx pgx.Tx) error {
 		var scanErr error
 		ss, scanErr = scanSupportSession(tx.QueryRow(ctx, query,
 			params.TenantID, params.SupportOperatorID, params.TicketRef, params.Purpose,
@@ -3826,4 +3902,54 @@ func (s *PgStore) CreateWorkloadBinding(ctx context.Context, wb domain.WorkloadB
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	return &wb, nil
+}
+
+// sessionDuration resolves a requested session length: requested when
+// positive, else def; refused with ErrSessionDurationExceeded above max (or
+// above ceiling when no max is configured). It never shortens a request
+// (Governance audit register B-01): a person asking for more than the maximum
+// and silently receiving less believes they hold access they do not. A
+// default above a configured maximum is capped to it, since no one asked for
+// that length.
+func sessionDuration(requested, def, max, ceiling int) (int, error) {
+	if max <= 0 {
+		max = ceiling
+	}
+	if requested <= 0 {
+		if def > max {
+			return max, nil
+		}
+		return def, nil
+	}
+	if requested > max {
+		return 0, fmt.Errorf("%w: %d seconds requested, maximum %d", domain.ErrSessionDurationExceeded, requested, max)
+	}
+	return requested, nil
+}
+
+// stepUpColumns flattens step-up evidence into its three nullable columns.
+func stepUpColumns(e *domain.StepUpEvidence) (assurance *string, authnAt *time.Time, session *string) {
+	if e == nil || e.Assurance == "" || e.AuthnAt.IsZero() {
+		return nil, nil, nil
+	}
+	a, t := e.Assurance, e.AuthnAt.UTC()
+	assurance, authnAt = &a, &t
+	if e.SessionContextID != "" {
+		sid := e.SessionContextID
+		session = &sid
+	}
+	return assurance, authnAt, session
+}
+
+// stepUpEvidence rebuilds step-up evidence from its columns; nil when none was
+// recorded (a row from before 000033).
+func stepUpEvidence(assurance *string, authnAt *time.Time, session *string) *domain.StepUpEvidence {
+	if assurance == nil || authnAt == nil {
+		return nil
+	}
+	e := &domain.StepUpEvidence{Assurance: *assurance, AuthnAt: authnAt.UTC()}
+	if session != nil {
+		e.SessionContextID = *session
+	}
+	return e
 }

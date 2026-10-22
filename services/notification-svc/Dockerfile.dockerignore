@@ -1,8 +1,16 @@
-# Build context is services/ (see Dockerfile). Send only what the build reads.
+# Used by BuildKit for builds with -f services/notification-svc/Dockerfile.
+# The context is the repository root (see the Dockerfile), so everything is
+# excluded except the modules the image is built from.
 *
-!notification-svc
-!eventing
-notification-svc/deployments
-notification-svc/scripts
-**/*_test.go
-**/.git
+!services/notification-svc/
+!services/identity-envelope/
+!services/eventing/
+
+# Not needed inside the image.
+services/notification-svc/.gotmp/
+services/notification-svc/**/*.exe
+services/notification-svc/**/*_test.go
+services/notification-svc/deployments/
+services/notification-svc/scripts/
+services/identity-envelope/**/*_test.go
+services/eventing/**/*_test.go

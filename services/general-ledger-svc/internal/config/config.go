@@ -46,6 +46,10 @@ type Config struct {
 	// CloseServiceURL is the base URL of financial-close-svc.
 	CloseServiceURL string
 
+	// EvidenceRequirementsURL is the base URL of evidence-requirements-svc.
+	// Posting is a finalization path and must not skip required evidence.
+	EvidenceRequirementsURL string
+
 	// OTELExporterEndpoint is where internal/telemetry sends OTLP/HTTP
 	// traces (03-microservices.md §3.8's Observability Baseline).
 	OTELExporterEndpoint string
@@ -129,6 +133,7 @@ func Load() (*Config, error) {
 		AuthzMTLSURL:             env("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),
 		MTLSManagementServiceURL: env("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
 		CloseServiceURL:          env("CLOSE_SERVICE_URL", "http://financial-close-svc:8104"),
+		EvidenceRequirementsURL:  env("EVIDENCE_REQUIREMENTS_URL", "http://evidence-requirements-svc:8130"),
 		OTELExporterEndpoint:     env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 		PeriodGateMode:           mode,
 		AccountingPeriodURL:      env("ACCOUNTING_PERIOD_URL", "http://accounting-period-svc:8174"),

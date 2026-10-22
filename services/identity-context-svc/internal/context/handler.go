@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"strings"
 
@@ -15,15 +16,20 @@ import (
 
 	"zoiko.io/identity-context-svc/internal/domain"
 	svcenvelope "zoiko.io/identity-context-svc/internal/envelope"
+	"zoiko.io/identity-context-svc/internal/lifecycle"
+	"zoiko.io/identity-context-svc/internal/ratelimit"
 	"zoiko.io/identity-context-svc/internal/session"
 	"zoiko.io/identity-context-svc/internal/store"
+	idenv "zoiko.io/identity-envelope"
 )
 
 // Action constants passed to authorization-svc as action_type.
 //
-// Scoped at the tenant: domain.Principal and domain.SessionContext carry
-// TenantID and no legal entity, so there is no finer scope to pass. Naming
-// the real one is better than inventing a legal entity that does not exist.
+// Every authorize call carries the caller's verified tenant AND the legal
+// entity the verified envelope names. authorization-svc resolves an entity's
+// owning tenant from the entity registry and refuses a question whose entity
+// and tenant disagree (tenant_scope_mismatch), so the entity position must
+// hold the real legal entity — never the tenant id standing in for it.
 const (
 	IdentitySessionRead       = "IDENTITY_SESSION_READ"
 	IdentitySessionInvalidate = "IDENTITY_SESSION_INVALIDATE"
@@ -33,10 +39,15 @@ const (
 
 // AuthzChecker is the authorization-svc contract this handler depends on.
 type AuthzChecker interface {
-	// tenantID is the caller's gateway-verified tenant scope, forwarded to
-	// authorization-svc as X-Tenant-Id. Without it /v1/authorize answers 400
-	// envelope_incomplete and this client fails closed, so every guarded route
-	// below reports an outage instead of a decision.
+	// legalEntityID is the legal entity from the caller's verified envelope
+	// (X-Legal-Entity-Id). It must be a legal entity, NOT the tenant: the
+	// authorization service resolves the entity's owning tenant from the
+	// registry and answers 403 tenant_scope_mismatch when the value is a
+	// tenant id. tenantID is the caller's gateway-verified tenant scope,
+	// forwarded to authorization-svc as X-Tenant-Id. Without the tenant
+	// /v1/authorize answers 400 envelope_incomplete and this client fails
+	// closed, so every guarded route below reports an outage instead of a
+	// decision.
 	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType, tenantID string) error
 }
 
@@ -62,6 +73,91 @@ type Handler struct {
 
 	// cache backs RefreshTenantContextCache and InvalidateTenantContext.
 	cache *ContextCacheService
+
+	// mfa backs the second-factor routes. Nil answers 501, like support.
+	mfa *MFAService
+
+	// ── Auth plane closure (AU-04, AU-06, AU-01) ─────────────────────────────
+	limiter      *ratelimit.Limiter
+	trusted      []*net.IPNet
+	authEndpoint string
+	peerName     func(*http.Request) string
+	endLogin     func(ctx context.Context, tenantID, sid, reason, actor, correlationID string) error
+	dpop         *idenv.DPoPVerifier
+
+	// status backs PUT /v1/principals/{id}/status. Nil answers 501.
+	status StatusChanger
+}
+
+// StatusChanger changes a principal's status as one governed command: the
+// status row, its decision-log entry and its events in one transaction, then
+// every session the principal holds ended on a disable or suspension
+// (internal/lifecycle.Service.SetStatus).
+//
+// The route used to call PrincipalStore.UpdateStatus, which wrote the row and
+// a decision-log entry and nothing else: no event ever told another service,
+// so authorization-svc kept a disabled principal ACTIVE, and the principal's
+// live sessions ran to expiry (Group 1 re-audit F-3, 19 Oct 2026).
+type StatusChanger interface {
+	ChangeStatus(ctx context.Context, tenantID, actorID, principalID string,
+		status domain.PrincipalStatus, reason, correlationID string) error
+}
+
+// WithStatusChanger wires the principal-status command.
+func (h *Handler) WithStatusChanger(s StatusChanger) *Handler {
+	h.status = s
+	return h
+}
+
+// WithDPoP verifies DPoP proofs at resolve, so a DPoP-bound access token
+// resolves only for the holder of its key (AU-27).
+func (h *Handler) WithDPoP(d *idenv.DPoPVerifier) *Handler {
+	h.dpop = d
+	return h
+}
+
+// WithLoginThrottle installs source-level throttling on the credential
+// routes (AU-04). trusted are the proxies whose X-Forwarded-For is believed.
+func (h *Handler) WithLoginThrottle(l *ratelimit.Limiter, trusted []*net.IPNet) *Handler {
+	h.limiter, h.trusted = l, trusted
+	return h
+}
+
+// WithAuthenticateEndpoint sets the /v1/authenticate mode: "internal" (mTLS
+// peers only), "open" (local), "disabled" (AU-06; IAM §18 prohibits the
+// password grant for clients — they use the authorization code flow).
+func (h *Handler) WithAuthenticateEndpoint(mode string, peerName func(*http.Request) string) *Handler {
+	h.authEndpoint, h.peerName = mode, peerName
+	return h
+}
+
+// WithLoginSessionEnder lets a LOGOUT invalidation end the login session
+// too, so a refresh token cannot mint a replacement envelope (AU-01).
+func (h *Handler) WithLoginSessionEnder(f func(ctx context.Context, tenantID, sid, reason, actor, correlationID string) error) *Handler {
+	h.endLogin = f
+	return h
+}
+
+// throttle applies the source limits; false means a 429 was written.
+func (h *Handler) throttle(w http.ResponseWriter, r *http.Request, endpoint, tenantID string) (string, bool) {
+	ip := ratelimit.ClientIP(r, h.trusted)
+	if h.limiter == nil {
+		return ip, true
+	}
+	if d := h.limiter.Attempt(r.Context(), endpoint, ip, tenantID); !d.Allowed {
+		h.log.Warn("credential endpoint throttled", zap.String("endpoint", endpoint), zap.String("reason", d.Reason),
+			zap.String("client_ip_hash", ratelimit.HashIP(ip)))
+		w.Header().Set("Retry-After", d.RetryAfterSeconds())
+		writeCoded(w, http.StatusTooManyRequests, "too_many_attempts", "too many attempts; retry later")
+		return ip, false
+	}
+	return ip, true
+}
+
+// WithMFA wires the TOTP second factor and step-up routes.
+func (h *Handler) WithMFA(m *MFAService) *Handler {
+	h.mfa = m
+	return h
 }
 
 func NewHandler(
@@ -213,9 +309,20 @@ func (h *Handler) authorizeUnlessSelf(w http.ResponseWriter, r *http.Request, ca
 }
 
 // authorize asks authorization-svc whether this principal may perform
-// action within tenantID, and fails CLOSED.
+// action within tenantID at the legal entity the verified envelope carries,
+// and fails CLOSED.
+//
+// The legal entity is load-bearing, not decoration. authorization-svc
+// resolves which tenant owns the entity, and refuses a question whose entity
+// and tenant disagree. This call passed the TENANT id in the entity position
+// (a merge artifact carried over from a 3-argument client whose slot meant
+// "scope"), so every guarded command answered 503 Service Unavailable once
+// the authorization service began enforcing entity scope: it replied 403
+// tenant_scope_mismatch and this client failed closed. The grant seeded for
+// the old convention (an assignment keyed at legal_entity_id = tenant id)
+// could never be reached; grants are matched at the real entity.
 func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID, tenantID, action string) bool {
-	if err := h.authz.CheckAllowed(r.Context(), principalID, tenantID, action, tenantID); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityOf(r), action, tenantID); err != nil {
 		if errors.Is(err, domain.ErrAuthorizationDenied) {
 			writeError(w, http.StatusForbidden, "not authorized to perform this action")
 			return false
@@ -227,11 +334,32 @@ func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID,
 	return true
 }
 
+// legalEntityOf returns the legal entity the request is acting within, from
+// the envelope middleware's parsed envelope when present (the production
+// path) and from the raw header otherwise (handler unit tests drive handlers
+// without the middleware mounted).
+func legalEntityOf(r *http.Request) string {
+	if e, ok := svcenvelope.FromContext(r.Context()); ok {
+		return e.LegalEntityID
+	}
+	return strings.TrimSpace(r.Header.Get(svcenvelope.HeaderLegalEntityID))
+}
+
 // RegisterRoutes mounts all endpoints under a chi Router.
 // All routes are under /v1/ per URI versioning strategy.
 func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Route("/v1", func(r chi.Router) {
 		r.Post("/authenticate", h.Authenticate)
+
+		// ── Second factor (TOTP) and step-up ─────────────────────────────────
+		// Each identifies its caller by the session envelope in Authorization,
+		// never by X-Principal-Id. See handler_mfa.go.
+		r.Post("/authenticate/step-up", h.StepUp)
+		r.Post("/mfa/totp/enroll", h.EnrollTOTP)
+		r.Post("/mfa/totp/activate", h.ActivateTOTP)
+		r.Post("/mfa/totp/revoke", h.RevokeTOTP)
+		r.Get("/mfa/factors", h.ListMFAFactors)
+		r.Post("/principals/{principalID}/mfa/reset", h.ResetPrincipalMFA)
 
 		// ── GOV-01 queries ───────────────────────────────────────────────────
 		// ResolveTenantContext
@@ -299,6 +427,15 @@ func (h *Handler) ResolveContext(w http.ResponseWriter, r *http.Request) {
 		req.SourceChannel = string(env.SourceChannel)
 		req.WorkloadID = env.WorkloadID
 		req.CausationID = env.CausationID
+	}
+	if proof := r.Header.Get(idenv.HeaderDPoP); proof != "" && h.dpop != nil {
+		pf, err := h.dpop.Verify(proof, idenv.RequestMethod(r), idenv.RequestHTU(r), req.BearerToken)
+		if err != nil {
+			w.Header().Set("WWW-Authenticate", `DPoP error="invalid_dpop_proof"`)
+			writeCoded(w, http.StatusUnauthorized, "invalid_dpop_proof", err.Error())
+			return
+		}
+		req.DPoPJKT = pf.JKT
 	}
 
 	// ResolveTenantContext is a GOV-01 query: "correlation required" (S1-3 /
@@ -497,6 +634,14 @@ func (h *Handler) InvalidateSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to invalidate session")
 		return
 	}
+	// A logout ends the login session the envelope came from, so a refresh
+	// token cannot mint a replacement (AU-01). An administrative revoke of one
+	// session leaves the person's other sessions alone.
+	if req.Reason == domain.InvalidationReasonLogout && sc.AuthSessionID != "" && h.endLogin != nil {
+		if err := h.endLogin(r.Context(), tenantID, sc.AuthSessionID, domain.SessionEndLogout, callerPrincipalID, correlationID); err != nil {
+			h.log.Error("login session not ended with its session", zap.Error(err))
+		}
+	}
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -601,6 +746,12 @@ func (h *Handler) UpdatePrincipalStatus(w http.ResponseWriter, r *http.Request) 
 	if !h.authorize(w, r, callerPrincipalID, tenantID, IdentityPrincipalStatus) {
 		return
 	}
+	if h.status == nil {
+		// An unconfigured privileged command is unavailable, not silently a
+		// row update that tells nobody (see StatusChanger).
+		writeError(w, http.StatusNotImplemented, "principal status changes are not configured")
+		return
+	}
 
 	var req domain.UpdateStatusRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -608,10 +759,18 @@ func (h *Handler) UpdatePrincipalStatus(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	if err := h.principals.UpdateStatus(
-		r.Context(), principalID, tenantID, req.Status, callerPrincipalID, correlationID,
+	if err := h.status.ChangeStatus(
+		r.Context(), tenantID, callerPrincipalID, principalID, req.Status, req.Reason, correlationID,
 	); err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to update status")
+		switch {
+		case errors.Is(err, lifecycle.ErrInvalid):
+			writeError(w, http.StatusBadRequest, err.Error())
+		case errors.Is(err, lifecycle.ErrForbidden):
+			writeCoded(w, http.StatusForbidden, "self_status_change", err.Error())
+		default:
+			h.log.Error("principal status change failed", zap.Error(err))
+			writeError(w, http.StatusInternalServerError, "failed to update status")
+		}
 		return
 	}
 
@@ -641,12 +800,39 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 }
 
 func writeError(w http.ResponseWriter, status int, msg string) {
-	writeJSON(w, status, errorResponse{Error: msg})
+	writeCoded(w, status, "", msg)
 }
 
 // writeCoded is writeError with one of the spec's stable error classes.
+//
+// The body is an RFC 9457 problem document (ZS-API-001 §12, AU-24): type,
+// title, status, detail and the lower_snake_case code clients branch on.
+// error and error_code keep their old meaning (the message, and the spec's
+// upper-case class) until every consumer reads code.
 func writeCoded(w http.ResponseWriter, status int, code, msg string) {
-	writeJSON(w, status, errorResponse{Error: msg, ErrorCode: code})
+	slug := strings.ToLower(code)
+	if slug == "" {
+		slug = strings.ToLower(strings.ReplaceAll(http.StatusText(status), " ", "_"))
+	}
+	body := map[string]any{
+		"type":      "https://api.zoikosuite.com/problems/" + strings.ReplaceAll(slug, "_", "-"),
+		"title":     http.StatusText(status),
+		"status":    status,
+		"detail":    msg,
+		"code":      slug,
+		"retryable": status == http.StatusServiceUnavailable || status == http.StatusTooManyRequests,
+		"error":     msg,
+	}
+	if code != "" {
+		body["error_code"] = code
+	}
+	if rid := w.Header().Get("Zoiko-Request-Id"); rid != "" {
+		body["request_id"] = rid
+		body["instance"] = "urn:zoikosuite:problem:" + rid
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(body)
 }
 
 // Ensure the interfaces defined in interfaces.go are satisfied at compile time.
@@ -680,6 +866,20 @@ var _ RiskSignalCache = (*session.RiskSignalCache)(nil)
 // Response: 200 with a bearer token / 400 missing field / 401 invalid
 // credentials / 503 unavailable.
 func (h *Handler) Authenticate(w http.ResponseWriter, r *http.Request) {
+	switch h.authEndpoint {
+	case "disabled":
+		writeCoded(w, http.StatusNotFound, "endpoint_disabled",
+			"password login is disabled; use the OAuth authorization code flow at /oauth2/authorize")
+		return
+	case "internal":
+		// IAM §18 prohibits the resource-owner password grant for clients.
+		// This route stays for platform tooling over mTLS only (AU-06).
+		if h.peerName == nil || h.peerName(r) == "" {
+			writeCoded(w, http.StatusForbidden, "password_grant_prohibited",
+				"clients sign in with the OAuth authorization code flow (/oauth2/authorize); this route is for mTLS platform tooling")
+			return
+		}
+	}
 	var req domain.AuthenticateRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
@@ -688,12 +888,24 @@ func (h *Handler) Authenticate(w http.ResponseWriter, r *http.Request) {
 	if req.CorrelationID == "" {
 		req.CorrelationID = r.Header.Get("X-Correlation-ID")
 	}
+	ip, ok := h.throttle(w, r, "authenticate", req.TenantID)
+	if !ok {
+		return
+	}
 
 	resp, err := h.auth.Authenticate(r.Context(), req)
+	if err != nil && h.limiter != nil && (errors.Is(err, ErrInvalidCredentials) || errors.Is(err, ErrInvalidClient)) {
+		h.limiter.Failure(r.Context(), ip, req.TenantID)
+	}
 	if err != nil {
 		switch {
 		case errors.Is(err, ErrRequestInvalid):
 			writeError(w, http.StatusBadRequest, err.Error())
+		case errors.Is(err, ErrInvalidClient):
+			// The OAuth client did not authenticate (R-1). Distinct from a wrong
+			// password: it says nothing about the account, and was decided
+			// before the account was touched.
+			writeCoded(w, http.StatusUnauthorized, "invalid_client", "invalid client credentials")
 		case errors.Is(err, ErrInvalidCredentials):
 			// One message for every rejection reason. See ErrInvalidCredentials
 			// — the reason is in access_decision_log and the event stream, not

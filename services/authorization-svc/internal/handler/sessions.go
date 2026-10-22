@@ -47,6 +47,10 @@ type sessionRequest struct {
 // checkSessionRequest applies the request-time controls. It writes the
 // refusal and returns false.
 func (h *Handler) checkSessionRequest(w http.ResponseWriter, r *http.Request, req sessionRequest) bool {
+	// B-01: longer than the maximum is refused, never shortened.
+	if h.refuseOverLongSession(w, req.kind, req.duration) {
+		return false
+	}
 	for _, a := range req.actions {
 		if domain.IsWildcardAction(a) {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_field", "field": "requested_actions",
@@ -144,7 +148,16 @@ func (h *Handler) decidePrivilegedSession(w http.ResponseWriter, r *http.Request
 			"message": "a JIT session is approved by someone other than its subject and its requester"})
 		return
 	}
-	decided, err := h.store.DecidePrivilegedSession(r.Context(), sessionID, tenantScope, approver, approve)
+	// §13: approving a JIT session is itself a privileged act and needs the
+	// approver's own recent step-up (A-03). A rejection grants nothing and
+	// needs none.
+	var stepUp *domain.StepUpEvidence
+	if approve {
+		if stepUp, ok = h.requireSessionStepUp(w, r, approver, tenantScope, "approve_jit"); !ok {
+			return
+		}
+	}
+	decided, err := h.store.DecidePrivilegedSession(r.Context(), sessionID, tenantScope, approver, approve, stepUp)
 	switch {
 	case errors.Is(err, domain.ErrSessionNotPending):
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "approval_not_pending",

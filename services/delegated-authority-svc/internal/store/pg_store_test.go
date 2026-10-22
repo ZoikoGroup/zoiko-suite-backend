@@ -291,6 +291,16 @@ func TestCreateDelegationIsIdempotentOnCorrelationID(t *testing.T) {
 	require.Equal(t, d.DelegationID, replay.DelegationID)
 	require.Equal(t, principalSelf, replay.DelegatorPrincipalID)
 
+	// A retry that carries a NEW Idempotency-Key under the same correlation_id
+	// is still the same grant (F-1, 19 Oct): the key is not part of the replay
+	// key, and the stored row keeps the first request's key.
+	retry := grant("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbc", "corr-a2", testEntityA, principalSelf, principalOther, from, to)
+	retry.IdempotencyKey = "key-second"
+	created, err = s.CreateDelegation(ctx, retry)
+	require.NoError(t, err)
+	require.False(t, created, "a new Idempotency-Key does not turn a retry into a second grant")
+	require.Equal(t, d.DelegationID, retry.DelegationID)
+
 	events := outboxEvents(t, pool, testTenantA, d.DelegationID)
 	require.Equal(t, []string{"authority.delegated"}, events,
 		"an idempotent retry must not emit a second authority.delegated")

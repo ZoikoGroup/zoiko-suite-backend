@@ -91,9 +91,19 @@ type SessionContext struct {
 	AdaptiveRiskScore int    `json:"adaptive_risk_score"`
 	RiskSignalSource  string `json:"risk_signal_source"`
 	// EnvelopeJWTJTI is the JWT ID of the issued IdentityContextEnvelope.
-	EnvelopeJWTJTI string    `json:"envelope_jwt_jti"`
-	IssuedAt       time.Time `json:"issued_at"`
-	ExpiresAt      time.Time `json:"expires_at"`
+	EnvelopeJWTJTI string `json:"envelope_jwt_jti"`
+	// AuthSessionID is the login session (OIDC sid) this session was
+	// resolved under; ending it ends this session (AU-01). Empty for a
+	// session resolved from a token minted before login sessions existed.
+	AuthSessionID string `json:"auth_session_id,omitempty"`
+	// ConcurrencyExempt keeps the session-concurrency cap (ZS-IAM-001 §15,
+	// MAX_SESSIONS_PER_PRINCIPAL) off this session. Set by the resolver for
+	// service accounts and API clients: a workload may legitimately hold many
+	// concurrent sessions, and with session status now checked by relying
+	// parties a capped workload session would fail mid-flight. Not persisted.
+	ConcurrencyExempt bool      `json:"-"`
+	IssuedAt          time.Time `json:"issued_at"`
+	ExpiresAt         time.Time `json:"expires_at"`
 	// InvalidatedAt is append-only. This record is NEVER deleted.
 	InvalidatedAt      *time.Time          `json:"invalidated_at"`
 	InvalidationReason *InvalidationReason `json:"invalidation_reason"`
@@ -267,6 +277,36 @@ type IdentityContextEnvelope struct {
 	// header. Empty when only an assertion was available.
 	SourceChannel string `json:"source_channel,omitempty"`
 
+	// AuthTime is when the person last authenticated (OIDC auth_time, Unix
+	// seconds): the password login, or a later TOTP step-up. NOT iat, which is
+	// when this envelope was minted and moves on every resolve.
+	// authorization-svc's session step-up and gateway-auth-svc's
+	// X-Authn-Age-Seconds both read it (ZS-IAM-001 §3 "Reauthentication age",
+	// §13 step-up).
+	AuthTime int64 `json:"auth_time,omitempty"`
+
+	// AMR is the authentication methods behind AuthTime (RFC 8176): ["pwd"]
+	// after a password, ["pwd","otp"] after a TOTP step-up. MFAVerified on the
+	// trust posture is the same fact as a boolean.
+	AMR []string `json:"amr,omitempty"`
+
+	// AuthorizedParty is the verified OAuth client the person signed in through
+	// (OIDC azp). Carried so a step-up re-issue keeps the verified channel.
+	AuthorizedParty string `json:"azp,omitempty"`
+
+	// SID is the login session this envelope descends from (OIDC sid). A
+	// relying party's revocation check (POST /v1/context/session/introspect)
+	// answers inactive once it ends (AU-01).
+	SID string `json:"sid,omitempty"`
+
+	// Cnf binds the envelope to a DPoP key or a client certificate (RFC 7800 /
+	// 9449 / 8705, AU-27). A relying party refuses it without the proof.
+	Cnf *Confirmation `json:"cnf,omitempty"`
+
+	// Act names the workload that exchanged this envelope for a narrower
+	// audience on the person's behalf (RFC 8693, AU-12).
+	Act *Actor `json:"act,omitempty"`
+
 	// Propagation
 	CorrelationID string `json:"correlation_id"`
 	SchemaVersion string `json:"schema_version"`
@@ -303,7 +343,29 @@ type SessionTrustClaims struct {
 	MFAVerified       bool         `json:"mfa_verified"`
 	AdaptiveRiskScore int          `json:"adaptive_risk_score"`
 	SessionContextID  string       `json:"session_context_id"`
+	// AssuranceLevel is the session's authentication assurance (IAM §31
+	// taxonomy): SINGLE_FACTOR, MFA, or PHISHING_RESISTANT after a WebAuthn
+	// factor (AU-11).
+	AssuranceLevel string `json:"assurance_level,omitempty"`
 }
+
+// Confirmation is the RFC 7800 cnf claim.
+type Confirmation struct {
+	JKT     string `json:"jkt,omitempty"`
+	X5TS256 string `json:"x5t#S256,omitempty"`
+}
+
+// Actor is the RFC 8693 act claim.
+type Actor struct {
+	Subject string `json:"sub"`
+}
+
+// Assurance levels (IAM §3 / §31 session assurance taxonomy).
+const (
+	AssuranceSingleFactor      = "SINGLE_FACTOR"
+	AssuranceMFA               = "MFA"
+	AssurancePhishingResistant = "PHISHING_RESISTANT"
+)
 
 // ---------------------------------------------------------------------------
 // Wire types (request/response)
@@ -361,6 +423,10 @@ type ResolveRequest struct {
 	// Empty for ordinary user traffic.
 	WorkloadID string `json:"-"`
 
+	// DPoPJKT is the thumbprint of a DPoP proof the handler verified on this
+	// request (RFC 9449); a DPoP-bound access token resolves only with it.
+	DPoPJKT string `json:"-"`
+
 	// CausationID names the event or command that caused this one. Distinct
 	// from CorrelationID: correlation groups a story, causation is the edge
 	// between two steps of it.
@@ -403,6 +469,15 @@ type AuthenticateRequest struct {
 	Email         string `json:"email"`
 	Password      string `json:"password"`
 	CorrelationID string `json:"correlation_id"`
+
+	// ClientID and ClientSecret authenticate the OAuth client the person is
+	// signing in through (the console's server tier), so the token can carry a
+	// VERIFIED azp and the session a verified source channel (Group 1 register
+	// R-1). Optional unless IDP_CLIENT_AUTH=required. A client_id that is
+	// presented must verify: a wrong secret is refused, never downgraded to
+	// "no client".
+	ClientID     string `json:"client_id,omitempty"`
+	ClientSecret string `json:"client_secret,omitempty"`
 }
 
 // AuthenticateResponse carries the IdP-shaped bearer token that
@@ -426,11 +501,117 @@ type AuthenticateResponse struct {
 	// authorization-svc, not this service, decides whether a posture is
 	// sufficient for an action.
 	//
-	// FALSE for every principal today, and that is accurate rather than
-	// permissive: no step-up factor is implemented anywhere in the estate, so
-	// there is nothing a client could do in response to true. It becomes a real
-	// per-principal answer when a factor lands.
+	// Still FALSE: login itself is password-baseline (ZS-IAM-001 §3, "where
+	// permitted by tenant policy"). The second factor is demanded where the
+	// standard demands it, before a privileged session: POST
+	// /v1/authenticate/step-up, which authorization-svc's session routes
+	// require.
 	MFARequired bool `json:"mfa_required"`
+
+	// MFAEnrolled reports that the principal holds an ACTIVE TOTP factor, so a
+	// client can offer step-up rather than enrolment.
+	MFAEnrolled bool `json:"mfa_enrolled"`
+
+	// AuthTime is when this authentication happened (Unix seconds). It travels
+	// on the token, then on the envelope, as auth_time.
+	AuthTime int64 `json:"auth_time"`
+
+	// AMR lists the authentication methods behind the token (RFC 8176).
+	AMR []string `json:"amr"`
+}
+
+// TokenGrant is everything a minted IdP token asserts. A struct rather than a
+// growing parameter list so a new claim cannot be dropped by a caller that
+// passes positional values.
+type TokenGrant struct {
+	Subject  string
+	TenantID string
+	// MFADone is true only after a second factor was verified (step-up).
+	MFADone bool
+	// AuthTime is when this authentication happened. Zero means now.
+	AuthTime time.Time
+	// AMR is the methods behind it (RFC 8176).
+	AMR []string
+	// ClientID is the VERIFIED OAuth client (azp). Empty when none
+	// authenticated.
+	ClientID string
+	// SID is the login session (auth_sessions) the token belongs to.
+	SID string
+	// CnfJKT binds the token to a DPoP key; "" for a bearer token.
+	CnfJKT string
+	// Scope is the granted OAuth scope (space-separated).
+	Scope string
+	// AssuranceLevel is SINGLE_FACTOR, MFA or PHISHING_RESISTANT.
+	AssuranceLevel string
+}
+
+// StepUpRequest is POST /v1/authenticate/step-up: the current session's
+// envelope travels in Authorization, the one-time code in the body.
+type StepUpRequest struct {
+	Code          string `json:"code"`
+	CorrelationID string `json:"correlation_id"`
+}
+
+// TOTPEnrollment is returned exactly once, by POST /v1/mfa/totp/enroll. The
+// secret is never readable again: it is stored encrypted and decrypted only to
+// compute a code.
+type TOTPEnrollment struct {
+	FactorID   string `json:"factor_id"`
+	Secret     string `json:"secret"`
+	OTPAuthURI string `json:"otpauth_uri"`
+	Algorithm  string `json:"algorithm"`
+	Digits     int    `json:"digits"`
+	Period     int    `json:"period"`
+	Status     string `json:"status"`
+}
+
+// MFAFactor is a factor as listed to its owner or an administrator. It never
+// carries secret material, encrypted or otherwise.
+type MFAFactor struct {
+	FactorID       string     `json:"factor_id"`
+	PrincipalID    string     `json:"principal_id"`
+	Type           string     `json:"type"`
+	Status         string     `json:"status"`
+	CreatedAt      time.Time  `json:"created_at"`
+	ActivatedAt    *time.Time `json:"activated_at,omitempty"`
+	LastUsedAt     *time.Time `json:"last_used_at,omitempty"`
+	RetiredReason  *string    `json:"retired_reason,omitempty"`
+	FailedAttempts int        `json:"failed_attempts"`
+	LockedUntil    *time.Time `json:"locked_until,omitempty"`
+}
+
+// ErrTOTPReplayed is a code whose time step was already accepted for the
+// factor (or the factor changed state under the request). It is refused like a
+// wrong code: a replayed code is exactly what an observer of the real one
+// would send.
+var ErrTOTPReplayed = errors.New("totp code already used")
+
+// TOTPAcceptance records a verified code: the step it matched, and whether it
+// activates a PENDING factor (enrolment) rather than authenticating with an
+// ACTIVE one (step-up).
+type TOTPAcceptance struct {
+	FactorID      string
+	PrincipalID   string
+	TenantID      string
+	Step          int64
+	Activate      bool
+	Action        string
+	CorrelationID string
+}
+
+// TOTPFactorSecret is a TOTP factor as the store hands it to the MFA service:
+// the secret still encrypted. No JSON tags, so it cannot be serialised by
+// accident.
+type TOTPFactorSecret struct {
+	FactorID       string
+	PrincipalID    string
+	TenantID       string
+	Status         string
+	Ciphertext     string
+	KeyID          string
+	LastUsedStep   *int64
+	FailedAttempts int
+	LockedUntil    *time.Time
 }
 
 // PrincipalCredential is the stored password material for one principal.
@@ -456,8 +637,44 @@ const (
 	CredentialStatusRetired = "RETIRED"
 )
 
-// CredentialTypePassword is the only factor issued today.
-const CredentialTypePassword = "PASSWORD"
+// Credential types. A TOTP factor is another principal_credentials row, as
+// 000004 anticipated, holding an encrypted secret instead of a digest.
+const (
+	CredentialTypePassword = "PASSWORD"
+	CredentialTypeTOTP     = "TOTP"
+)
+
+// CredentialStatusPending is a TOTP factor generated but not yet proven: it
+// grants nothing until a code from it verifies.
+const CredentialStatusPending = "PENDING"
+
+// Authentication method references (RFC 8176), carried as amr.
+const (
+	AMRPassword = "pwd"
+	AMROTP      = "otp"
+	// AMRHardwareKey is a WebAuthn/passkey assertion (RFC 8176 "hwk").
+	AMRHardwareKey = "hwk"
+	// AMRFederated is a login delegated to an enterprise IdP (OIDC or SAML).
+	AMRFederated = "fed"
+	// AMRMFA marks that more than one factor was used (RFC 8176 "mfa").
+	AMRMFA = "mfa"
+)
+
+// AssuranceFor derives the assurance level from authentication methods.
+func AssuranceFor(amr []string) string {
+	has := map[string]bool{}
+	for _, m := range amr {
+		has[m] = true
+	}
+	switch {
+	case has[AMRHardwareKey]:
+		return AssurancePhishingResistant
+	case has[AMROTP] || has[AMRMFA]:
+		return AssuranceMFA
+	default:
+		return AssuranceSingleFactor
+	}
+}
 
 // ErrPrincipalNotFound is returned when a principal does not exist in the caller's tenant scope.
 var ErrPrincipalNotFound = errors.New("principal not found")
@@ -496,10 +713,28 @@ type VerifiedClaims struct {
 	Subject  string
 	TenantID string
 	MFADone  bool
+	// AuthTime is when the person authenticated: the token's auth_time, or
+	// its iat for a token minted before auth_time existed.
+	AuthTime time.Time
+	// AMR is the token's authentication methods (RFC 8176).
+	AMR []string
 	// ClientID is the IdP token's azp: the OAuth client the person signed in
 	// through (the web console, the mobile app). Verified with the token, so
 	// the channel derived from it is a fact, not an assertion.
 	ClientID string
+	// SID is the login session the token belongs to (OIDC sid). Ending it
+	// (logout, refresh-token reuse, deprovisioning) ends every envelope
+	// resolved from it.
+	SID string
+	// CnfJKT is the DPoP key the token is bound to (RFC 9449 §6), "" for a
+	// bearer token. The envelope resolved from it carries the same binding.
+	CnfJKT string
+	// AssuranceLevel is SINGLE_FACTOR, MFA or PHISHING_RESISTANT.
+	AssuranceLevel string
+	JTI            string
+	ExpiresAt      time.Time
+	// Scope is the OAuth scope the token was granted.
+	Scope string
 }
 
 // ErrAuthorizationDenied is returned when the caller is not authorized for the requested action.

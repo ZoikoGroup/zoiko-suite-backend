@@ -645,3 +645,71 @@ func TestEvaluateDelegatedAccess_RequiresPrincipalAndTenant(t *testing.T) {
 		t.Errorf("no tenant: expected 401, got %d", w.Code)
 	}
 }
+
+// Governance workflow row 23: a delegate acting on a stage that names one
+// approver must hold the authority FROM that approver. The undirected answer
+// names only the first delegator found, so a delegate covering for two people
+// read as "not delegated by the second". The delegator-specific question
+// answers for the named principal and returns the delegation id.
+func TestEvaluateDelegatedAccess_DelegatorSpecificAnswersForTheNamedDelegator(t *testing.T) {
+	store := &stubStore{
+		// The undirected lookup would report p-first.
+		delegatedActions: []string{"WORKFLOW_APPROVE"},
+		delegatedBasis:   "delegated:from=p-first",
+		delegationsFrom: map[string]string{
+			"p-1/p-second/WORKFLOW_APPROVE": "d-second",
+		},
+	}
+	r := newTestRouter(store)
+
+	w := postJSON(t, r, handler.DelegatedAccessEvaluatePath,
+		`{"principal_id":"p-1","legal_entity_id":"11111111-1111-4111-8111-aaaaaaaaaaa1","action_type":"WORKFLOW_APPROVE","delegator_principal_id":"p-second"}`, adminHeaders())
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		HasDelegatedAccess bool   `json:"has_delegated_access"`
+		Basis              string `json:"basis"`
+		DelegationID       string `json:"delegation_id"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if !resp.HasDelegatedAccess || resp.Basis != "delegated:from=p-second" || resp.DelegationID != "d-second" {
+		t.Fatalf("got %+v, want delegated from p-second with id d-second", resp)
+	}
+	if store.lastFromEntity != "11111111-1111-4111-8111-aaaaaaaaaaa1" {
+		t.Errorf("entity asked = %q", store.lastFromEntity)
+	}
+}
+
+func TestEvaluateDelegatedAccess_DelegatorSpecificRefusesAnotherDelegator(t *testing.T) {
+	store := &stubStore{
+		delegatedActions: []string{"WORKFLOW_APPROVE"},
+		delegatedBasis:   "delegated:from=p-first",
+		delegationsFrom:  map[string]string{"p-1/p-first/WORKFLOW_APPROVE": "d-first"},
+	}
+	r := newTestRouter(store)
+
+	w := postJSON(t, r, handler.DelegatedAccessEvaluatePath,
+		`{"principal_id":"p-1","legal_entity_id":"11111111-1111-4111-8111-aaaaaaaaaaa1","action_type":"WORKFLOW_APPROVE","delegator_principal_id":"p-other"}`, adminHeaders())
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		HasDelegatedAccess bool   `json:"has_delegated_access"`
+		Basis              string `json:"basis"`
+		DelegationID       string `json:"delegation_id"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp.HasDelegatedAccess || resp.DelegationID != "" || resp.Basis != "no_delegated_grant" {
+		t.Fatalf("got %+v — a delegation from p-first must not answer for p-other", resp)
+	}
+}
+
+func TestEvaluateDelegatedAccess_DelegatorSpecificNeedsAnAction(t *testing.T) {
+	r := newTestRouter(&stubStore{})
+	w := postJSON(t, r, handler.DelegatedAccessEvaluatePath,
+		`{"principal_id":"p-1","legal_entity_id":"11111111-1111-4111-8111-aaaaaaaaaaa1","delegator_principal_id":"p-second"}`, adminHeaders())
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+}

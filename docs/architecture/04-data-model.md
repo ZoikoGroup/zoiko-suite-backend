@@ -873,6 +873,13 @@ This is the runtime rules foundation of ZoikoSuite.
 
 - activated_at
 
+*Physical names (recorded 14 Oct 2026; policy-svc column and wire names):*
+Policy `policy_domain` → `policy_type`; a NULL `tenant_id` is a platform-wide family ·
+PolicyVersion `policy_payload` → `rule_payload` (with a server-derived `artifact_digest`) ·
+`activation_status` → `version_status`, whose values are the GOV-05 state model
+(DRAFT, REVIEW, APPROVED, SCHEDULED, ACTIVE, SUSPENDED, SUPERSEDED, RETIRED) ·
+`activated_by` → `activated_by_principal_id` · `version_number` is sequential per policy and owning tenant.
+
 ### **Jurisdiction**
 
 - jurisdiction_id

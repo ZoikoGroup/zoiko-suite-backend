@@ -20,6 +20,11 @@ const (
 	// RequiredOnWrite means Mandatory only for material state changes, which is
 	// how §4 qualifies idempotency_key ("Mandatory for material state changes").
 	RequiredOnWrite
+	// RequiredOnRead means Mandatory only on reads. Purpose of access is about
+	// reading governed content (§4 "governed sensitive access"), not about
+	// appending to it: governance-decision-log-svc requires X-Purpose-Context on
+	// reads and not on evidence appends (decision D-06, 21 Oct 2026).
+	RequiredOnRead
 )
 
 // Policy declares which conditional §4 fields a given service actually needs.
@@ -263,6 +268,8 @@ func required(req Requirement, isWrite bool) bool {
 		return true
 	case RequiredOnWrite:
 		return isWrite
+	case RequiredOnRead:
+		return !isWrite
 	default:
 		return false
 	}

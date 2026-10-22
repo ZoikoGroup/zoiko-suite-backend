@@ -21,6 +21,7 @@ import (
 	"zoiko.io/general-ledger-svc/internal/close"
 	"zoiko.io/general-ledger-svc/internal/domain"
 	svcenvelope "zoiko.io/general-ledger-svc/internal/envelope"
+	"zoiko.io/general-ledger-svc/internal/evidencereq"
 	svcmiddleware "zoiko.io/general-ledger-svc/internal/middleware"
 )
 
@@ -116,6 +117,13 @@ type Publisher interface {
 // AuthZClient is the authorization contract the handler depends on.
 type AuthZClient interface {
 	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
+}
+
+// EvidenceChecker is the evidence-requirements contract the handler depends
+// on. A nil checker leaves the gate unwired (tests); production always wires
+// it in main.
+type EvidenceChecker interface {
+	EvaluateSufficient(ctx context.Context, tenantID, legalEntityID, domainCode, actionType, correlationID, principalID string, evidenceRefs []string) error
 }
 
 // Action types checked against authorization-svc. A single, platform-wide
@@ -218,6 +226,7 @@ type Handler struct {
 	publisher   Publisher
 	authz       AuthZClient
 	closeClient close.Client
+	evidence    EvidenceChecker
 	log         *zap.Logger
 
 	// clock supplies the reversal posting date. Injectable because a test that
@@ -235,6 +244,34 @@ func New(store Store, publisher Publisher, authz AuthZClient, closeClient close.
 func (h *Handler) WithClock(clock func() time.Time) *Handler {
 	h.clock = clock
 	return h
+}
+
+// WithEvidenceGate wires the evidence-requirements gate into finalization
+// paths. Without it the gate is not consulted.
+func (h *Handler) WithEvidenceGate(c EvidenceChecker) *Handler {
+	h.evidence = c
+	return h
+}
+
+// checkEvidence refuses a finalization when required evidence is missing or
+// the evidence service cannot answer. A nil checker means this deployment has
+// not wired the gate (tests); production wires it in main.
+func (h *Handler) checkEvidence(w http.ResponseWriter, r *http.Request, tenantID, legalEntityID, principalID string, evidenceRefs []string) bool {
+	if h.evidence == nil {
+		return true
+	}
+	err := h.evidence.EvaluateSufficient(r.Context(), tenantID, legalEntityID,
+		"FINANCE", "JOURNAL_POST", r.Header.Get("X-Correlation-ID"), principalID, evidenceRefs)
+	switch {
+	case err == nil:
+		return true
+	case errors.Is(err, evidencereq.ErrEvidenceMissing):
+		writeError(w, http.StatusUnprocessableEntity, "evidence_missing", "required evidence is missing")
+	default:
+		h.log.Error("evidence gate unavailable — failing closed", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "evidence_service_unavailable", "")
+	}
+	return false
 }
 
 func (h *Handler) now() time.Time {
@@ -1414,6 +1451,9 @@ func (h *Handler) PostJournal(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, header.LegalEntityID, actionPostJournal); err != nil {
 		h.writeAuthzErr(w, err)
+		return
+	}
+	if !h.checkEvidence(w, r, header.TenantID, header.LegalEntityID, principalID, header.EvidenceRefs) {
 		return
 	}
 

@@ -39,7 +39,7 @@ func TestWrites_AreAuthorized(t *testing.T) {
 				filingReq:         &domain.FilingRequirement{FilingRequirementID: "f-1"},
 			}
 			az := &stubAuthz{err: domain.ErrAuthorizationDenied}
-			r := newTestRouterAuthz(store, &stubPublisher{}, &stubValidator{}, az)
+			r := newTestRouterAuthz(store, &stubValidator{}, az)
 
 			w := httptest.NewRecorder()
 			r.ServeHTTP(w, withIdentity(httptest.NewRequest(tc.method, tc.path, bytes.NewBufferString(tc.body))))
@@ -58,7 +58,7 @@ func TestWrites_AreAuthorized(t *testing.T) {
 func TestWrites_AuthorizationUnavailable_FailsClosed(t *testing.T) {
 	store := &stubStore{obligation: &domain.Obligation{ObligationID: "o-1"}, obligationCreated: true}
 	az := &stubAuthz{err: domain.ErrAuthorizationUnavailable}
-	r := newTestRouterAuthz(store, &stubPublisher{}, &stubValidator{}, az)
+	r := newTestRouterAuthz(store, &stubValidator{}, az)
 
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, withIdentity(httptest.NewRequest(http.MethodPost, "/v1/obligations",

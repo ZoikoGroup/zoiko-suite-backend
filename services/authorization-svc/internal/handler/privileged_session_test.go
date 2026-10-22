@@ -40,6 +40,7 @@ func TestPrivilegedSession_Create_Success(t *testing.T) {
 	req.Header.Set("X-Tenant-Id", testPAMTenantID)
 	req.Header.Set("X-Principal-Id", testPAMCaller)
 	req.Header.Set("X-Correlation-ID", "corr-pam-1")
+	req = withStepUp(req, testPAMCaller)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 

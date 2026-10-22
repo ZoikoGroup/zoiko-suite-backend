@@ -34,7 +34,7 @@ func declare(t *testing.T, s *store.PgStore, key, valueType, safety string, scop
 	}
 	if _, err := s.PublishDefinition(ctx, domain.PublishDefinitionParams{
 		DefinitionID: def.DefinitionID, Lifecycle: domain.LifecyclePublished, ActorPrincipalID: "admin-1",
-		ApprovalReference: "CAB-2026-001",
+		ApprovalReference: "CAB-2026-001", CallerTenantID: testCallerTenant,
 	}); err != nil {
 		t.Fatalf("publish %s: %v", key, err)
 	}

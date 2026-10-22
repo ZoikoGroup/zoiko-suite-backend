@@ -64,6 +64,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	svcenvelope "zoiko.io/identity-context-svc/internal/envelope"
+
 	"go.uber.org/zap"
 )
 
@@ -239,6 +241,9 @@ func (c *Client) activeExporters(ctx context.Context, tenantID string) ([]export
 	}
 	req.Header.Set("X-Tenant-ID", tenantID)
 
+	// Forward the canonical envelope for downstream traceability
+	svcenvelope.ForwardTo(ctx, req)
+
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, err
@@ -280,6 +285,9 @@ func (c *Client) streamTo(ctx context.Context, tenantID, exporterID, eventType s
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Tenant-ID", tenantID)
+
+	// Forward the canonical envelope for downstream traceability
+	svcenvelope.ForwardTo(ctx, req)
 
 	resp, err := c.http.Do(req)
 	if err != nil {

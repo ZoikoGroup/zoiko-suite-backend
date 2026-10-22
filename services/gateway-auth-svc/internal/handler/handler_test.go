@@ -261,7 +261,10 @@ func TestVerify_CartaAllow_Returns200(t *testing.T) {
 // Previously it was allowed through because there was no step-up challenge
 // flow downstream, but letting it pass silently defeats the risk engine's
 // intent — a request that needs step-up must not proceed as if it were ALLOW.
-func TestVerify_CartaStepUpMFA_Returns403(t *testing.T) {
+// AU-23 (decision 21 Oct 2026): STEP_UP_MFA is a 401 step_up_required with
+// the RFC 9470 challenge, which the console answers with a TOTP step-up and a
+// retry. It used to be a hard 403, when no step-up existed in the estate.
+func TestVerify_CartaStepUpMFA_Returns401StepUpRequired(t *testing.T) {
 	h, key, _ := newTestEnvWithCartaDecision(t, "STEP_UP_MFA")
 	tok := mintEnvelope(t, key, testKid, validClaims())
 
@@ -271,8 +274,12 @@ func TestVerify_CartaStepUpMFA_Returns403(t *testing.T) {
 
 	h.Verify(rec, req)
 
-	assert.Equal(t, http.StatusForbidden, rec.Code)
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
 	assert.Equal(t, "STEP_UP_MFA", rec.Header().Get("X-Carta-Decision"))
+	assert.Equal(t, "step_up_required", rec.Header().Get("X-Auth-Denial-Reason"))
+	assert.Contains(t, rec.Header().Get("WWW-Authenticate"), "insufficient_user_authentication")
+	assert.Equal(t, "application/problem+json", rec.Header().Get("Content-Type"))
+	assert.NotEmpty(t, rec.Header().Get("X-Gateway-Decision-Id"))
 }
 
 // TestVerify_CartaIsolate_Returns403 and TestVerify_CartaDeny_Returns403
@@ -306,6 +313,10 @@ func TestVerify_CartaDeny_Returns403(t *testing.T) {
 
 	assert.Equal(t, http.StatusForbidden, rec.Code)
 	assert.Equal(t, "DENY", rec.Header().Get("X-Carta-Decision"))
+	// INT-01: a CARTA block is a refusal like any other — RFC 9457 and recorded.
+	assert.Equal(t, "application/problem+json", rec.Header().Get("Content-Type"))
+	assert.Equal(t, "carta_blocked", rec.Header().Get("X-Auth-Denial-Reason"))
+	assert.NotEmpty(t, rec.Header().Get("X-Gateway-Decision-Id"))
 }
 
 // A decision the gateway does not recognise must block, not pass. The block

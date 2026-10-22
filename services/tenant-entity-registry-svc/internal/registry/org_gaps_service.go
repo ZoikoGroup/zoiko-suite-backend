@@ -289,7 +289,7 @@ func entityStatusEvent(e *domain.LegalEntity, actor, correlationID string, from,
 
 // RequestEntityVerification files VerifyLegalEntity for independent approval.
 func (s *Service) RequestEntityVerification(ctx context.Context, legalEntityID string, req domain.RequestEntityVerificationRequest) error {
-	if err := s.authorize(ctx, "entity", "verify"); err != nil {
+	if err := s.authorizeEntity(ctx, legalEntityID, "entity", "verify"); err != nil {
 		return err
 	}
 	if strings.TrimSpace(req.VerificationEvidenceRef) == "" {
@@ -363,7 +363,7 @@ func (s *Service) approveEntityVerification(ctx context.Context, a *domain.Appro
 // ActivateLegalEntity is VERIFIED → ACTIVE. Verification was the independent
 // gate; activation itself needs only the permission.
 func (s *Service) ActivateLegalEntity(ctx context.Context, legalEntityID string, req domain.ActivateLegalEntityRequest) (*domain.LegalEntity, error) {
-	if err := s.authorize(ctx, "entity", "activate"); err != nil {
+	if err := s.authorizeEntity(ctx, legalEntityID, "entity", "activate"); err != nil {
 		return nil, err
 	}
 	e, err := s.GetEntity(ctx, legalEntityID)
@@ -400,7 +400,9 @@ func (s *Service) ActivateLegalEntity(ctx context.Context, legalEntityID string,
 // independent approval. Nothing is deleted or re-pointed when it lands: the
 // duplicate becomes DORMANT with merged_into lineage.
 func (s *Service) MergeDuplicateCandidate(ctx context.Context, duplicateID string, req domain.MergeDuplicateCandidateRequest) error {
-	if err := s.authorize(ctx, "entity", "merge"); err != nil {
+	// A merge changes both records: the duplicate goes DORMANT, the survivor
+	// takes its lineage.
+	if err := s.authorizeEntities(ctx, "entity", "merge", duplicateID, req.SurvivorLegalEntityID); err != nil {
 		return err
 	}
 	if strings.TrimSpace(req.Reason) == "" {
@@ -493,7 +495,7 @@ func (s *Service) approveMerge(ctx context.Context, a *domain.ApprovalRequest, d
 
 // UnmergeEntity files the reversal of a merge for independent approval.
 func (s *Service) UnmergeEntity(ctx context.Context, duplicateID string, req domain.UnmergeEntityRequest) error {
-	if err := s.authorize(ctx, "entity", "unmerge"); err != nil {
+	if err := s.authorizeEntity(ctx, duplicateID, "entity", "unmerge"); err != nil {
 		return err
 	}
 	if strings.TrimSpace(req.Reason) == "" {
@@ -572,8 +574,11 @@ func sensitiveClassification(c string) bool {
 // a declared purpose. Both, because the permission says who MAY read and the
 // purpose records why they DID — the second is what makes the access
 // reviewable afterwards.
-func (s *Service) authorizeSensitiveRead(ctx context.Context) error {
-	if err := s.authorize(ctx, "entity.sensitive-identifier", "read"); err != nil {
+//
+// The permission is checked at the entity the bundle belongs to, not the
+// caller's envelope entity (F-2, 19 Oct 2026).
+func (s *Service) authorizeSensitiveRead(ctx context.Context, legalEntityID string) error {
+	if err := s.authorizeEntity(ctx, legalEntityID, "entity.sensitive-identifier", "read"); err != nil {
 		return err
 	}
 	env, ok := envelope.FromContext(ctx)

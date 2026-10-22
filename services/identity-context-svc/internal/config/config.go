@@ -2,6 +2,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"os"
@@ -29,7 +30,9 @@ type Config struct {
 	JWTSigningPrivateKeyPath string
 	JWTKeyID                 string
 
-	// TODO: replace JWTSigningSecret with KMS key reference before Phase 1 production cutover.
+	// JWTSigningSecret is DEPRECATED and ignored: the access token is signed
+	// by the keyring like every other token (AU-05). Still read so a
+	// deployment that sets it gets a warning rather than a silent no-op.
 	JWTSigningSecret      string
 	JWTIssuer             string
 	JWTAudienceInternal   string
@@ -75,6 +78,39 @@ type Config struct {
 	// IDPClientChannels maps a verified IdP client id (azp) to its §4 source
 	// channel: IDP_CLIENT_CHANNELS="zoiko-console=web,zoiko-mobile=mobile".
 	IDPClientChannels map[string]string
+
+	// IDPClientSecretsFile is a JSON object mapping each confidential login
+	// client to the SHA-256 of its secret: {"zoiko-console":"sha256:<hex>"}.
+	// /v1/authenticate stamps azp only for a client that proves its secret
+	// (Group 1 register R-1). Empty registers no clients.
+	IDPClientSecretsFile string
+	// IDPClientAuth is "optional" (default: a login without a client still
+	// succeeds, with an asserted channel) or "required" (it is refused).
+	IDPClientAuth string
+
+	// ── TOTP second factor (migration 000012) ────────────────────────────────
+
+	// MFASecretKeys is the keyring TOTP secrets are encrypted under at rest,
+	// by key id; MFASecretKeyID is the current one. From MFA_SECRET_KEY
+	// (base64, 32 bytes), MFA_SECRET_KEY_ID (default "k1") and, during a
+	// rotation, MFA_SECRET_PREVIOUS_KEYS="<id>:<base64>;<id>:<base64>". Empty
+	// disables the MFA routes (503); required in staging and production.
+	MFASecretKeys  map[string][]byte
+	MFASecretKeyID string
+	// MFAMaxFailedAttempts / MFALockDurationSeconds: a factor's own lockout.
+	MFAMaxFailedAttempts   int
+	MFALockDurationSeconds int
+	// MFARecentAuthSeconds is how recent an authentication must be to enrol a
+	// first factor, or (as an MFA authentication) to replace or revoke one.
+	MFARecentAuthSeconds int
+	// MFATOTPSkewSteps is the RFC 6238 drift allowance either side (0-2).
+	MFATOTPSkewSteps int
+	// MFAIssuerLabel is the issuer an authenticator app shows.
+	MFAIssuerLabel string
+
+	// AuthPlane is the 15 Oct 2026 auth closure's settings (keys, OIDC,
+	// throttling, lifecycle, federation, WebAuthn). See config_authplane.go.
+	AuthPlane AuthPlaneConfig
 
 	// Authorization Service URL for admin mutation authorization checks.
 	// Must be set in production/staging; a placeholder is allowed only in local development.
@@ -134,6 +170,12 @@ type Config struct {
 	// as "never due" — the safe default, because a misconfigured period should
 	// keep evidence too long rather than delete it early.
 	SessionEvidenceRetentionDays int
+
+	// MaxSessionsPerPrincipal caps how many live sessions one principal may
+	// hold at once (ZS-IAM-001 §15 session-concurrency control). Zero means
+	// uncapped. When a new session would exceed it, the principal's oldest
+	// live session is invalidated first.
+	MaxSessionsPerPrincipal int
 
 	// RetentionSweepIntervalMinutes is how often the disposition sweep runs.
 	RetentionSweepIntervalMinutes int
@@ -359,10 +401,19 @@ func Load() (*Config, error) {
 		CommercialAccountURL: env("COMMERCIAL_ACCOUNT_URL", ""),
 		ServicePrincipalID:   env("IDENTITY_SERVICE_PRINCIPAL_ID", "svc-identity-context"),
 		IDPClientChannels:    envPairs("IDP_CLIENT_CHANNELS"),
-		AuthzServiceURL:      env("AUTHZ_SERVICE_URL", "http://authorization-svc"),
-		AuthzEnv:             env("AUTHZ_ENV", ""), // derived below; never defaulted here
-		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
-		SIEMServiceURL:       env("SIEM_SERVICE_URL", ""),
+		IDPClientSecretsFile: env("IDP_CLIENT_SECRETS_FILE", ""),
+		IDPClientAuth:        strings.ToLower(env("IDP_CLIENT_AUTH", "optional")),
+
+		MFASecretKeyID:         env("MFA_SECRET_KEY_ID", "k1"),
+		MFAMaxFailedAttempts:   envInt("MFA_MAX_FAILED_ATTEMPTS", 5),
+		MFALockDurationSeconds: envInt("MFA_LOCK_DURATION_SECONDS", 900),
+		MFARecentAuthSeconds:   envInt("MFA_RECENT_AUTH_SECONDS", 900),
+		MFATOTPSkewSteps:       envInt("MFA_TOTP_SKEW_STEPS", 1),
+		MFAIssuerLabel:         env("MFA_ISSUER_LABEL", "ZoikoSuite"),
+		AuthzServiceURL:        env("AUTHZ_SERVICE_URL", "http://authorization-svc"),
+		AuthzEnv:               env("AUTHZ_ENV", ""), // derived below; never defaulted here
+		OTELExporterEndpoint:   env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
+		SIEMServiceURL:         env("SIEM_SERVICE_URL", ""),
 
 		Environment:              env("DEPLOY_ENVIRONMENT", "local"),
 		DeploymentRegion:         env("DEPLOYMENT_REGION", "local"),
@@ -374,20 +425,13 @@ func Load() (*Config, error) {
 		SupportContextDefaultTTLSeconds: envInt("SUPPORT_CONTEXT_DEFAULT_TTL_SECONDS", 60*60),
 
 		SessionEvidenceRetentionDays:  envInt("SESSION_EVIDENCE_RETENTION_DAYS", 0),
+		MaxSessionsPerPrincipal:       envInt("MAX_SESSIONS_PER_PRINCIPAL", 5),
 		RetentionSweepIntervalMinutes: envInt("RETENTION_SWEEP_INTERVAL_MINUTES", 360),
 		OutboxRetentionDays:           envInt("OUTBOX_RETENTION_DAYS", 7),
 		OutboxRelayBatchSize:          envInt("OUTBOX_RELAY_BATCH_SIZE", 100),
 		OutboxRelayPollMillis:         envInt("OUTBOX_RELAY_POLL_MILLIS", 1000),
 		SupportReviewIntervalMinutes:  envInt("SUPPORT_REVIEW_INTERVAL_MINUTES", 60),
 		IngressBindingTTLSeconds:      envInt("INGRESS_BINDING_TTL_SECONDS", 24*60*60),
-	}
-
-	// JWT_SIGNING_SECRET is mandatory and must be at least 32 bytes for HS256.
-	if cfg.JWTSigningSecret == "" {
-		return nil, errors.New("JWT_SIGNING_SECRET is required")
-	}
-	if len(cfg.JWTSigningSecret) < 32 {
-		return nil, errors.New("JWT_SIGNING_SECRET must be at least 32 bytes")
 	}
 
 	// Lockout must actually bound guessing. A zero or negative threshold would
@@ -472,6 +516,50 @@ func Load() (*Config, error) {
 		cfg.Kafka.ConsumeTopics = append([]string(nil), DefaultConsumeTopics...)
 	}
 
+	// ── Login clients and the second factor ──────────────────────────────────
+	switch cfg.IDPClientAuth {
+	case "optional", "required":
+	default:
+		return nil, fmt.Errorf("IDP_CLIENT_AUTH %q is invalid: expected optional or required", cfg.IDPClientAuth)
+	}
+	if cfg.IDPClientAuth == "required" && cfg.IDPClientSecretsFile == "" {
+		return nil, errors.New("IDP_CLIENT_AUTH=required needs IDP_CLIENT_SECRETS_FILE: no client could ever log in")
+	}
+
+	keys, err := mfaKeyring(env("MFA_SECRET_KEY", ""), cfg.MFASecretKeyID, env("MFA_SECRET_PREVIOUS_KEYS", ""))
+	if err != nil {
+		return nil, err
+	}
+	cfg.MFASecretKeys = keys
+	if len(keys) == 0 && (cfg.Environment == "production" || cfg.Environment == "staging") {
+		// Without the key no factor can be enrolled or used, so no envelope can
+		// ever carry mfa_verified, and authorization-svc refuses every JIT and
+		// break-glass session (ZS-IAM-001 §13/§14). Refused at boot rather than
+		// discovered during an incident.
+		return nil, fmt.Errorf("MFA_SECRET_KEY is required in %s: without it no second factor exists and no privileged session can be issued", cfg.Environment)
+	}
+	if cfg.Environment == "production" || cfg.Environment == "staging" {
+		for id, k := range keys {
+			if string(k) == localMFAKey {
+				return nil, fmt.Errorf("MFA key %q is the local key published in deployments/docker-compose.yml: %s needs its own from the secret store", id, cfg.Environment)
+			}
+		}
+	}
+	if cfg.MFAMaxFailedAttempts < 1 {
+		return nil, errors.New("MFA_MAX_FAILED_ATTEMPTS must be at least 1")
+	}
+	if cfg.MFALockDurationSeconds < 1 {
+		return nil, errors.New("MFA_LOCK_DURATION_SECONDS must be at least 1")
+	}
+	if cfg.MFARecentAuthSeconds < 60 {
+		return nil, errors.New("MFA_RECENT_AUTH_SECONDS must be at least 60")
+	}
+	if cfg.MFATOTPSkewSteps < 0 || cfg.MFATOTPSkewSteps > 2 {
+		// RFC 6238 §5.2 recommends at most one step; two is the most any
+		// deployment should need, and more widens the replay and guessing window.
+		return nil, errors.New("MFA_TOTP_SKEW_STEPS must be between 0 and 2")
+	}
+
 	cfg.MTLSEnabled = envBool("MTLS_ENABLED", false)
 	cfg.MTLSPort = envInt("MTLS_PORT", 8449)
 	cfg.MTLSManagementURL = env("MTLS_MANAGEMENT_SERVICE_URL", "")
@@ -485,6 +573,9 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("MTLS_ENABLED=true needs MTLS_MANAGEMENT_SERVICE_URL: the listener's certificate comes from mtls-management-svc")
 	}
 
+	if err := loadAuthPlane(cfg); err != nil {
+		return nil, err
+	}
 	return cfg, nil
 }
 
@@ -543,7 +634,58 @@ func envBool(key string, def bool) bool {
 	return b
 }
 
+// localMFAKey is the key deployments/docker-compose.yml publishes for local
+// stacks (MFA_SECRET_KEY is its base64). It is in git, so it protects nothing:
+// staging and production refuse it anywhere in the keyring.
+const localMFAKey = "local-dev-mfa-key-32-bytes-long!"
+
 // envPairs parses "a=b,c=d" into a map; blanks and malformed pairs are skipped.
+// mfaKeyring decodes the TOTP secret keyring. current is MFA_SECRET_KEY under
+// currentID; previous is "<id>:<base64>;<id>:<base64>", kept for decryption
+// during a rotation. Every key must decode to exactly 32 bytes. An empty
+// current key with no previous keys yields an empty ring (MFA disabled); a
+// previous key without a current one is refused, because nothing could be
+// enrolled.
+func mfaKeyring(current, currentID, previous string) (map[string][]byte, error) {
+	keys := map[string][]byte{}
+	decode := func(id, b64 string) error {
+		raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(b64))
+		if err != nil {
+			return fmt.Errorf("MFA key %q is not valid base64: %w", id, err)
+		}
+		if len(raw) != 32 {
+			return fmt.Errorf("MFA key %q decodes to %d bytes, want 32 (AES-256)", id, len(raw))
+		}
+		keys[id] = raw
+		return nil
+	}
+	for _, part := range strings.Split(previous, ";") {
+		if strings.TrimSpace(part) == "" {
+			continue
+		}
+		id, b64, ok := strings.Cut(part, ":")
+		if !ok || strings.TrimSpace(id) == "" {
+			return nil, errors.New(`MFA_SECRET_PREVIOUS_KEYS must be "<id>:<base64>;<id>:<base64>"`)
+		}
+		if err := decode(strings.TrimSpace(id), b64); err != nil {
+			return nil, err
+		}
+	}
+	if strings.TrimSpace(current) == "" {
+		if len(keys) > 0 {
+			return nil, errors.New("MFA_SECRET_PREVIOUS_KEYS is set but MFA_SECRET_KEY is not: new factors could not be enrolled")
+		}
+		return nil, nil
+	}
+	if strings.TrimSpace(currentID) == "" {
+		return nil, errors.New("MFA_SECRET_KEY_ID must not be empty")
+	}
+	if err := decode(currentID, current); err != nil {
+		return nil, err
+	}
+	return keys, nil
+}
+
 func envPairs(key string) map[string]string {
 	out := map[string]string{}
 	for _, part := range strings.Split(os.Getenv(key), ",") {

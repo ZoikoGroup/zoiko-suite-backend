@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
@@ -12,6 +13,7 @@ import (
 	authzpkg "zoiko.io/vat-gst-svc/internal/authz"
 	"zoiko.io/vat-gst-svc/internal/domain"
 	"zoiko.io/vat-gst-svc/internal/events"
+	"zoiko.io/vat-gst-svc/internal/evidencereq"
 	"zoiko.io/vat-gst-svc/internal/middleware"
 	"zoiko.io/vat-gst-svc/internal/store"
 )
@@ -31,15 +33,57 @@ type AuthzChecker interface {
 	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
 }
 
+// EvidenceChecker is the evidence-requirements contract the handler depends
+// on. A nil checker leaves the gate unwired (tests); production always wires
+// it in main.
+type EvidenceChecker interface {
+	EvaluateSufficient(ctx context.Context, tenantID, legalEntityID, domainCode, actionType, correlationID, principalID string, evidenceRefs []string) error
+}
+
 type Handler struct {
 	store     store.Store
 	publisher events.Publisher
 	authz     AuthzChecker
+	evidence  EvidenceChecker
 	logger    *zap.Logger
 }
 
 func New(st store.Store, pub events.Publisher, az AuthzChecker, logger *zap.Logger) *Handler {
 	return &Handler{store: st, publisher: pub, authz: az, logger: logger}
+}
+
+// WithEvidenceGate wires the evidence-requirements gate into return filing.
+func (h *Handler) WithEvidenceGate(c EvidenceChecker) *Handler {
+	h.evidence = c
+	return h
+}
+
+func (h *Handler) checkEvidence(w http.ResponseWriter, r *http.Request, tenantID, legalEntityID, principalID string) bool {
+	if h.evidence == nil {
+		return true
+	}
+	err := h.evidence.EvaluateSufficient(r.Context(), tenantID, legalEntityID,
+		"TAX", VATReturnFile, r.Header.Get("X-Correlation-ID"), principalID, evidenceRefsFromHeader(r.Header.Get("X-Evidence-Refs")))
+	switch {
+	case err == nil:
+		return true
+	case errors.Is(err, evidencereq.ErrEvidenceMissing):
+		writeError(w, http.StatusUnprocessableEntity, "required evidence is missing")
+	default:
+		h.logger.Error("evidence gate unavailable — failing closed", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "evidence service unavailable")
+	}
+	return false
+}
+
+func evidenceRefsFromHeader(raw string) []string {
+	var refs []string
+	for _, ref := range strings.Split(raw, ",") {
+		if ref = strings.TrimSpace(ref); ref != "" {
+			refs = append(refs, ref)
+		}
+	}
+	return refs
 }
 
 // authorize extracts the calling principal from X-Principal-Id and checks
@@ -227,6 +271,9 @@ func (h *Handler) FileVATReturn(w http.ResponseWriter, r *http.Request) {
 
 	principalID, ok := h.authorize(w, r, existing.LegalEntityID, VATReturnFile)
 	if !ok {
+		return
+	}
+	if !h.checkEvidence(w, r, tenantID, existing.LegalEntityID, principalID) {
 		return
 	}
 

@@ -11,15 +11,15 @@
 package authz
 
 import (
-	svcenvelope "zoiko.io/schema-registry-svc/internal/envelope"
-	"github.com/go-chi/chi/v5/middleware"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/go-chi/chi/v5/middleware"
 	"io"
 	"net/http"
 	"time"
+	svcenvelope "zoiko.io/schema-registry-svc/internal/envelope"
 
 	"go.uber.org/zap"
 

@@ -184,14 +184,19 @@ Mirrors `jurisdiction-rules-svc`'s proven split: public read paths plus a
 separate `/v1/admin/...` namespace for catalog mutation
 (`internal/handler/handler.go:112-121`).
 
+The contract is `openapi.yaml` (21 Oct 2026; kin-openapi valid, route parity
+tested). Every route sits behind the identity-envelope gate; errors are RFC
+9457 problem documents with the §16 `error_class`.
+
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `POST` | `/v1/evidence/evaluate` | **The point of the service.** Sufficiency determination for one pending action. Publishes `evidence.requirement.satisfied` or `evidence.requirement.missing`. Idempotent on `(tenant_id, correlation_id)`. See §5. |
-| `GET` | `/v1/evidence-requirements` | List effective requirements. Filters: `tenant_id` (required), `domain_code`, `action_type`, `as_of` (defaults to now). |
-| `GET` | `/v1/evidence-requirements/{evidence_requirement_id}` | Get one. |
-| `GET` | `/v1/evidence/evaluations/{evaluation_id}` | Retrieve a past determination as evidence. |
-| `POST` | `/v1/admin/evidence-requirements` | Create a requirement. Authz-gated (`EVIDENCE_REQUIREMENT_CREATE`). Idempotent. |
-| `POST` | `/v1/admin/evidence-requirements/{id}/end-date` | Retire by setting `effective_to`. Authz-gated (`EVIDENCE_REQUIREMENT_RETIRE`). Never a DELETE. |
+| `POST` | `/v1/evidence/evaluate` | **The point of the service.** Sufficiency determination for one pending action. Authorized on `EVIDENCE_EVALUATE` at the legal entity, which must exist in the caller's tenant. Publishes `evidence.requirement.satisfied` or `evidence.requirement.missing` through the outbox. Idempotent on `Idempotency-Key` (a changed body is 409). See §5. |
+| `GET` | `/v1/evidence-requirements` | List the caller's tenant catalogue. The scope is the verified tenant (`?tenant_id` may only repeat it); filters `legal_entity_id`, `domain_code`, `action_type`, `as_of` (`now`, or RFC 3339; omitted = full history). `EVIDENCE_REQUIREMENT_READ`. |
+| `GET` | `/v1/evidence-requirements/{evidence_requirement_id}` | Get one. `EVIDENCE_REQUIREMENT_READ` at its entity (PLATFORM if tenant-wide). |
+| `GET` | `/v1/evidence/evaluations/{evaluation_id}` | Retrieve a past determination as evidence. `EVIDENCE_EVALUATION_READ` at its entity. |
+| `POST` | `/v1/admin/evidence-requirements` | Create a requirement. `EVIDENCE_REQUIREMENT_CREATE` at its entity, or PLATFORM for a tenant-wide one. `requirement_payload` must match `{minimum_count, artifact_subtype, description}`. Idempotent on `Idempotency-Key`. |
+| `POST` | `/v1/admin/evidence-requirements/{id}/end-date` | Retire by setting `effective_to` (after `effective_from`, not retroactive). `EVIDENCE_REQUIREMENT_RETIRE`. Never a DELETE. |
+| `…` | `/v1/pbc/requests…`, `/v1/pbc/responses…` | Provided-by-client evidence requests (see `openapi.yaml`). |
 | `GET` | `/healthz` | Liveness. |
 | `GET` | `/readyz` | Readiness (DB connectivity). |
 
@@ -345,13 +350,16 @@ failures. And the `set_config` form from §2.1(1), not `SET LOCAL`.
 
 ## 7. Idempotency
 
-- **Catalog create:** `INSERT ... ON CONFLICT (tenant_id, correlation_id)
-  DO NOTHING`, then re-select — `201` first time, `200` with an identical
-  body on replay.
-- **Evaluate:** same pattern on `evidence_evaluations`. A replayed
-  evaluation returns the original determination and **does not republish**
-  its Kafka event. `purchase-order-svc` proved this behaviour against a
-  real Kafka consume rather than a mock counter; do the same here.
+- **Catalog create:** keyed on `Idempotency-Key` (000006), not on
+  `correlation_id` — `201` first time, `200` with an identical body on
+  replay, `409 idempotency_mismatch` when the key is reused for a different
+  requirement. (Keying on `correlation_id` silently dropped a second,
+  different requirement created in the same business flow.)
+- **Evaluate:** keyed on `Idempotency-Key` (000005). A replay returns the
+  original determination and **does not republish**; a key reused for a
+  different action, entity or artifact set is `409`. (Keyed on
+  `correlation_id`, a SATISFIED result could be replayed for a different
+  action.) Events go through the transactional outbox (000008).
 - **End-date:** atomic CAS, `WHERE effective_to IS NULL`. Second call →
   `422`, never a double-apply. `invoice-approval-svc`'s non-atomic
   read-then-write is the anti-pattern to avoid.
@@ -377,6 +385,15 @@ the store/authz/Kafka corrections from `purchase-order-svc` per §2.1.
 ---
 
 ## 9. Why now: the constraint is currently unenforced
+
+> **State on 21 Oct 2026 (supersedes the table below).** Three services call
+> the gate: board-resolutions-svc (pass), corporate-actions-svc (execute) and
+> filing-preparation-svc (validate). general-ledger-svc, financial-close-svc,
+> vat-gst-svc and corporate-tax-svc still have no gate, and the three callers
+> still send an incomplete envelope and two treat any outcome other than
+> MISSING as a pass. All seven are outside the Identity and Governance
+> domains and are tracked in the Governance audit as caller-side gaps; this
+> service's side of the contract is complete.
 
 §8.6 says *"No finalization path may skip required evidence states."*
 Every finalization path built to date skips them, because there is nothing
@@ -487,7 +504,11 @@ criteria in `06-blueprint.md`"* — so the label determines whether this
 service gates others. Either the §23 list is incomplete or the omission is
 intentional. **Needs a human answer.** Nothing in the code depends on it.
 
-### 11.4 Is the retrofit advisory or blocking on day one? — STILL OPEN, blocks §9.1
+### 11.4 Is the retrofit advisory or blocking on day one? — DECIDED 21 Oct 2026
+
+**Decided:** `NO_REQUIREMENTS_DEFINED` stays a distinct outcome and the
+calling service decides what its action does with it. This service never
+reports it as SATISFIED. The original discussion follows.
 §8.6's constraint is absolute: no finalization path may skip required
 evidence. Taken literally, `NO_REQUIREMENTS_DEFINED` on an empty catalog
 should still permit the action, or every journal post on the platform

@@ -198,7 +198,7 @@ func (c *countingStore) ListPrivilegedSessions(_ context.Context, _, _ string, _
 func (c *countingStore) RevokePrivilegedSession(_ context.Context, _, _, _ string) (*domain.PrivilegedSession, error) {
 	return nil, nil
 }
-func (c *countingStore) DecidePrivilegedSession(_ context.Context, _, _, _ string, _ bool) (*domain.PrivilegedSession, error) {
+func (c *countingStore) DecidePrivilegedSession(_ context.Context, _, _, _ string, _ bool, _ *domain.StepUpEvidence) (*domain.PrivilegedSession, error) {
 	return nil, nil
 }
 func (c *countingStore) ReviewSession(_ context.Context, _, _, _, _, _, _ string) error { return nil }
@@ -794,8 +794,9 @@ func TestCache_RevokedDelegationIsNotServedFromCache(t *testing.T) {
 	}
 }
 
-
-func (c *countingStore) FindEntityStatus(_ context.Context, _, _ string) (string, error) { return "", nil }
+func (c *countingStore) FindEntityStatus(_ context.Context, _, _ string) (string, error) {
+	return "", nil
+}
 func (c *countingStore) FindPrincipalTenants(_ context.Context, _ string) ([]string, error) {
 	return nil, nil
 }

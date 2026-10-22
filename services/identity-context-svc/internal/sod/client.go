@@ -36,6 +36,8 @@ import (
 	"strings"
 	"time"
 
+	svcenvelope "zoiko.io/identity-context-svc/internal/envelope"
+
 	"go.uber.org/zap"
 )
 
@@ -148,6 +150,9 @@ func (c *HTTPClient) CheckConflict(ctx context.Context, req Request) (*Decision,
 	}
 	httpReq.Header.Set("X-Request-Id", requestID)
 	httpReq.Header.Set("X-Correlation-ID", requestID)
+
+	// Forward the canonical envelope for downstream traceability
+	svcenvelope.ForwardTo(ctx, httpReq)
 
 	resp, err := c.http.Do(httpReq)
 	if err != nil {

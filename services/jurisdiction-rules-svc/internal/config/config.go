@@ -21,6 +21,10 @@ type Config struct {
 	// No service self-authorizes (doctrine).
 	AuthZServiceURL string
 
+	// WorkflowServiceURL is workflow-svc, which confirms the approval a rule
+	// activation cites (J-02). Required outside local/dev.
+	WorkflowServiceURL string
+
 	// AuthZAllowStub opts in to the permit-all StubAuthZClient. Honoured only
 	// with ENV=local; any other ENV refuses to start with it set.
 	AuthZAllowStub bool
@@ -144,6 +148,7 @@ func Load() (*Config, error) {
 			EntityTopic: env("KAFKA_ENTITY_TOPIC", "zoiko.entity.events"),
 		},
 		AuthZServiceURL:      env("AUTHZ_SERVICE_URL", "http://authorization-svc"),
+		WorkflowServiceURL:   env("WORKFLOW_SERVICE_URL", ""),
 		AuthZPlatformScopeID: env("AUTHZ_PLATFORM_SCOPE_ID", ""),
 		AuthZAllowStub:       env("AUTHZ_ALLOW_STUB", "false") == "true",
 		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),

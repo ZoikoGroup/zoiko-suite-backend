@@ -20,6 +20,7 @@ import (
 
 	"zoiko.io/financial-close-svc/internal/clients"
 	"zoiko.io/financial-close-svc/internal/domain"
+	"zoiko.io/financial-close-svc/internal/evidencereq"
 	svcmiddleware "zoiko.io/financial-close-svc/internal/middleware"
 )
 
@@ -154,6 +155,13 @@ type Store interface {
 
 type AuthZClient interface {
 	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
+}
+
+// EvidenceChecker is the evidence-requirements contract the handler depends
+// on. A nil checker leaves the gate unwired (tests); production always wires
+// it in main.
+type EvidenceChecker interface {
+	EvaluateSufficient(ctx context.Context, tenantID, legalEntityID, domainCode, actionType, correlationID, principalID string, evidenceRefs []string) error
 }
 
 type Clients interface {
@@ -334,9 +342,10 @@ const (
 )
 
 type Handler struct {
-	store   Store
-	authz   AuthZClient
-	clients Clients
+	store    Store
+	authz    AuthZClient
+	clients  Clients
+	evidence EvidenceChecker
 	// signingKey is the HMAC secret for close evidence. See signEvidence.
 	signingKey []byte
 	log        *zap.Logger
@@ -354,7 +363,6 @@ type Handler struct {
 	// bankReconCutoffDays — see config.BankReconCutoffDays. Zero means the
 	// statement must be dated on the period's last day itself.
 	bankReconCutoffDays int
-
 
 	// REF-05 cutover phase 1 (see period_mirror.go). All nil/empty by default,
 	// which means: no mirroring, and the workflow-ref endpoint refuses everyone.
@@ -400,6 +408,44 @@ func New(store Store, authz AuthZClient, clients Clients, signingKey []byte, log
 		log:                 log,
 		bankReconCutoffDays: defaultBankReconCutoffDays,
 	}
+}
+
+// WithEvidenceGate wires the evidence-requirements gate into period close.
+// Without it the gate is not consulted.
+func (h *Handler) WithEvidenceGate(c EvidenceChecker) *Handler {
+	h.evidence = c
+	return h
+}
+
+// checkEvidence refuses a close when required evidence is missing or the
+// evidence service cannot answer.
+func (h *Handler) checkEvidence(w http.ResponseWriter, r *http.Request, tenantID, legalEntityID, principalID, actionType string) bool {
+	if h.evidence == nil {
+		return true
+	}
+	refs := evidenceRefsFromHeader(r.Header.Get("X-Evidence-Refs"))
+	err := h.evidence.EvaluateSufficient(r.Context(), tenantID, legalEntityID,
+		"FINANCE", actionType, r.Header.Get("X-Correlation-ID"), principalID, refs)
+	switch {
+	case err == nil:
+		return true
+	case errors.Is(err, evidencereq.ErrEvidenceMissing):
+		writeError(w, http.StatusUnprocessableEntity, "evidence_missing", "required evidence is missing")
+	default:
+		h.log.Error("evidence gate unavailable — failing closed", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "evidence_service_unavailable", "")
+	}
+	return false
+}
+
+func evidenceRefsFromHeader(raw string) []string {
+	var refs []string
+	for _, ref := range strings.Split(raw, ",") {
+		if ref = strings.TrimSpace(ref); ref != "" {
+			refs = append(refs, ref)
+		}
+	}
+	return refs
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
@@ -924,6 +970,7 @@ func (h *Handler) closeWithEvidence(w http.ResponseWriter, r *http.Request, mode
 	if correlationID == "" {
 		correlationID = uuid.NewString()
 	}
+	r.Header.Set("X-Correlation-ID", correlationID)
 
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
@@ -943,6 +990,14 @@ func (h *Handler) closeWithEvidence(w http.ResponseWriter, r *http.Request, mode
 
 	if err := h.authz.CheckAllowed(r.Context(), principalID, fp.LegalEntityID, actionCloseApprove); err != nil {
 		h.writeAuthzErr(w, err)
+		return
+	}
+
+	evidenceAction := "PERIOD_LOCK"
+	if mode.reperform {
+		evidenceAction = "PERIOD_RECLOSE"
+	}
+	if !h.checkEvidence(w, r, tenantID, fp.LegalEntityID, principalID, evidenceAction) {
 		return
 	}
 

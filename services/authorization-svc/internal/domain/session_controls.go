@@ -49,7 +49,22 @@ const PrivilegedSessionApprovalWindow = 24 * time.Hour
 var (
 	ErrSessionNotPending       = errorString("the session is not awaiting approval")
 	ErrSessionReviewNotPending = errorString("the session has no pending review")
+	// ErrSessionDurationExceeded: a request longer than the configured
+	// maximum (register B-01). Refused, never shortened: a person asking for
+	// 24 hours and silently receiving 8 believes they hold access they do not.
+	ErrSessionDurationExceeded = errorString("the requested duration exceeds the session maximum")
 )
+
+// StepUpEvidence is the authentication a person proved at the moment they
+// issued or approved a privileged or break-glass session (ZS-IAM-001 §13
+// "step-up authenticated", §14 "high-assurance step-up"; register A-03): the
+// assurance level, when they authenticated, and the identity-context session
+// it came from. Stored on the session row so the review can see it.
+type StepUpEvidence struct {
+	Assurance        string    `json:"assurance"`
+	AuthnAt          time.Time `json:"authn_at"`
+	SessionContextID string    `json:"session_context_id,omitempty"`
+}
 
 func actionTokens(action string) []string {
 	return strings.FieldsFunc(strings.ToUpper(strings.TrimSpace(action)), func(r rune) bool {

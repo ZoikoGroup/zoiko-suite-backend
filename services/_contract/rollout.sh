@@ -71,6 +71,11 @@ treasury-svc corporate-tax-svc vat-gst-svc withholding-tax-svc tax-determination
 tax-authority-interface-svc evidence-manifest-svc governance-decision-log-svc \
 audit-event-store-svc hris-connector-svc search-indexer-svc"
 
+# Sensitive services whose purpose of access is a read concern only: appends to
+# them are evidence, not access (governance-decision-log-svc, decision D-06,
+# 21 Oct 2026).
+PURPOSE_ON_READ="governance-decision-log-svc"
+
 # Services that post to, or report from, an accounting book (INV-03).
 #
 # Their generated policy sets BookID to NotRequired with a pointer to the gap,
@@ -173,6 +178,8 @@ for svc in "${targets[@]}"; do
 
 	purpose="NotRequired"
 	in_list "$svc" "$SENSITIVE" && purpose="RequiredOnWrite"
+	# The ledger demands purpose on reads, not on evidence appends (D-06).
+	in_list "$svc" "$PURPOSE_ON_READ" && purpose="RequiredOnRead"
 
 	exempt_block=""
 	if exempt_literal="$(exempt_for "$svc")"; then

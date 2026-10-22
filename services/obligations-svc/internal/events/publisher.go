@@ -128,6 +128,25 @@ func (p *Publisher) PublishObligationClosed(ctx context.Context, o domain.Obliga
 	})
 }
 
+// PublishEnvelope writes an envelope that was already built and stored by the
+// transactional outbox. The bytes are not re-serialised, so the event_id and
+// emitted_at recorded with the business transaction are the ones delivered.
+func (p *Publisher) PublishEnvelope(ctx context.Context, key string, envelope []byte) error {
+	msg := kafka.Message{Key: []byte(key), Value: envelope}
+	if err := p.producer.WriteMessages(ctx, msg); err != nil {
+		if p.metrics != nil {
+			p.metrics.EventPublishFailures.WithLabelValues("outbox").Inc()
+		}
+		return fmt.Errorf("outbox publish: kafka write: %w", err)
+	}
+
+	p.log.Info("event published",
+		zap.String("topic", p.topic),
+		zap.String("key", key),
+	)
+	return nil
+}
+
 // emit serialises the payload into the canonical envelope and writes it to
 // the Kafka topic set on the Writer (main.go) — not set here, since kafka-go
 // rejects a Message that also specifies Topic when the Writer already has one.

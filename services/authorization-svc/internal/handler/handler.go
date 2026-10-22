@@ -126,7 +126,7 @@ type AuthorizationStore interface {
 	RevokePrivilegedSession(ctx context.Context, sessionID, tenantID, revokedBy string) (*domain.PrivilegedSession, error)
 	// DecidePrivilegedSession approves or rejects a PENDING_APPROVAL JIT
 	// session; ReviewSession records the post-session review (000030).
-	DecidePrivilegedSession(ctx context.Context, sessionID, tenantID, approver string, approve bool) (*domain.PrivilegedSession, error)
+	DecidePrivilegedSession(ctx context.Context, sessionID, tenantID, approver string, approve bool, stepUp *domain.StepUpEvidence) (*domain.PrivilegedSession, error)
 	ReviewSession(ctx context.Context, kind, sessionID, tenantID, reviewer, outcome, notes string) error
 
 	// Break-Glass Emergency Sessions (ZS-IAM-001 §14 & §21).
@@ -198,6 +198,14 @@ type Handler struct {
 	// projection has not heard of. Nil keeps the projection as the only
 	// source — see SetEntityRegistry.
 	entityRegistry registry.Client
+
+	// sessionStepUp is the A-03 gate on issuing and approving JIT and
+	// break-glass sessions. Its zero value ENFORCES (see SessionStepUpPolicy),
+	// so a handler built without SetSessionStepUp fails closed.
+	sessionStepUp SessionStepUpPolicy
+	// sessionLimits are the B-01 session maximums; zero fields fall back to
+	// the store's built-in ceilings. See SetSessionLimits.
+	sessionLimits SessionLimits
 }
 
 // SetEntityRegistry lets resolveTenantScope check, with
@@ -385,7 +393,7 @@ func (h *Handler) requireTenant(w http.ResponseWriter, r *http.Request) (string,
 // Same defect as a malformed legal_entity_id and one layer deeper, which is
 // why it is easy to miss: tenant_id is UUID in every table that carries it,
 // and withRLS installs the raw value into app.tenant_id — where the POLICY
-// itself does `NULLIF(current_setting('app.tenant_id', true), '')::uuid`. So a
+// itself does `NULLIF(current_setting('app.tenant_id', true), ”)::uuid`. So a
 // malformed tenant does not fail in a query this service wrote; it fails
 // inside row security, on every table, as a driver error the store reports as
 // ErrStoreUnavailable and the handler answers 503 for.
@@ -3468,19 +3476,30 @@ func (h *Handler) CreatePrivilegedSession(w http.ResponseWriter, r *http.Request
 			highImpact = true
 		}
 	}
+	// §13 step-up before session issue (register A-03).
+	stepUp, ok := h.requireSessionStepUp(w, r, callerPrincipalID, tenantScope, "issue_jit")
+	if !ok {
+		return
+	}
 
 	ps, err := h.store.CreatePrivilegedSession(r.Context(), domain.CreatePrivilegedSessionParams{
-		TenantID:          tenantScope,
-		PrincipalID:       targetPrincipal,
-		RequestedActions:  req.RequestedActions,
-		TicketRef:         req.TicketRef,
-		Reason:            req.Reason,
-		DurationSeconds:   req.DurationSeconds,
-		RequestedBy:       callerPrincipalID,
-		ResourceScope:     req.ResourceScope,
-		TargetEnvironment: req.TargetEnvironment,
-		HighImpact:        highImpact,
+		TenantID:           tenantScope,
+		PrincipalID:        targetPrincipal,
+		RequestedActions:   req.RequestedActions,
+		TicketRef:          req.TicketRef,
+		Reason:             req.Reason,
+		DurationSeconds:    req.DurationSeconds,
+		RequestedBy:        callerPrincipalID,
+		ResourceScope:      req.ResourceScope,
+		TargetEnvironment:  req.TargetEnvironment,
+		HighImpact:         highImpact,
+		MaxDurationSeconds: h.sessionLimits.JIT,
+		StepUp:             stepUp,
 	})
+	if errors.Is(err, domain.ErrSessionDurationExceeded) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "duration_exceeds_maximum", "message": err.Error()})
+		return
+	}
 	if err != nil {
 		h.log.Error("CreatePrivilegedSession: store failed", zap.String("correlation_id", correlationID), zap.Error(err))
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
@@ -3634,19 +3653,32 @@ func (h *Handler) CreateBreakGlassSession(w http.ResponseWriter, r *http.Request
 
 	if !h.checkSessionRequest(w, r, sessionRequest{
 		kind: "break_glass", subject: targetPrincipal, tenant: tenantScope, actions: req.RequestedActions,
+		duration: req.DurationSeconds,
 	}) {
+		return
+	}
+	// §14: "High-assurance step-up; compromised/unverified session cannot
+	// break glass" (register A-03).
+	stepUp, ok := h.requireSessionStepUp(w, r, callerPrincipalID, tenantScope, "issue_break_glass")
+	if !ok {
 		return
 	}
 
 	bg, err := h.store.CreateBreakGlassSession(r.Context(), domain.CreateBreakGlassSessionParams{
-		TenantID:         tenantScope,
-		PrincipalID:      targetPrincipal,
-		IncidentID:       req.IncidentID,
-		Reason:           req.Reason,
-		RequestedActions: req.RequestedActions,
-		DurationSeconds:  req.DurationSeconds,
-		RequestedBy:      callerPrincipalID,
+		TenantID:           tenantScope,
+		PrincipalID:        targetPrincipal,
+		IncidentID:         req.IncidentID,
+		Reason:             req.Reason,
+		RequestedActions:   req.RequestedActions,
+		DurationSeconds:    req.DurationSeconds,
+		RequestedBy:        callerPrincipalID,
+		MaxDurationSeconds: h.sessionLimits.BreakGlass,
+		StepUp:             stepUp,
 	})
+	if errors.Is(err, domain.ErrSessionDurationExceeded) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "duration_exceeds_maximum", "message": err.Error()})
+		return
+	}
 	if err != nil {
 		if errors.Is(err, domain.ErrBreakGlassIncidentRequired) {
 			writeJSON(w, http.StatusBadRequest, map[string]string{
@@ -3859,7 +3891,8 @@ func (h *Handler) CreateSupportSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	consent := *req.TenantConsentObtained
-	if !h.checkSessionRequest(w, r, sessionRequest{kind: "support", subject: targetOperator, tenant: tenantScope, actions: req.AllowedActions}) {
+	if !h.checkSessionRequest(w, r, sessionRequest{kind: "support", subject: targetOperator, tenant: tenantScope, actions: req.AllowedActions,
+		duration: req.DurationSeconds}) {
 		return
 	}
 
@@ -3874,13 +3907,17 @@ func (h *Handler) CreateSupportSession(w http.ResponseWriter, r *http.Request) {
 		DurationSeconds:       req.DurationSeconds,
 		TenantConsentObtained: consent,
 		RequestedBy:           callerPrincipalID,
+		MaxDurationSeconds:    h.sessionLimits.Support,
 	})
+	if errors.Is(err, domain.ErrSessionDurationExceeded) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "duration_exceeds_maximum", "message": err.Error()})
+		return
+	}
 	if err != nil {
 		h.log.Error("CreateSupportSession: store failed", zap.String("correlation_id", correlationID), zap.Error(err))
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
 		return
 	}
-
 
 	h.log.Info("support session created",
 		zap.String("session_id", ss.SessionID),

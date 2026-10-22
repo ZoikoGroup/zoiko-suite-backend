@@ -37,6 +37,12 @@ type Config struct {
 	// gated through it, fail-closed.
 	AuthZServiceURL string
 
+	// TenantRegistryURL is tenant-entity-registry-svc's base URL. Every legal
+	// entity a write names is confirmed there (exists, and in the caller's
+	// tenant), fail-closed. Empty disables the check, which only ENV
+	// local/dev/test allows.
+	TenantRegistryURL string
+
 	// OTELExporterEndpoint is where internal/telemetry sends OTLP/HTTP
 	// traces (03-microservices.md §3.8's Observability Baseline).
 	OTELExporterEndpoint string
@@ -93,8 +99,19 @@ func Load() (*Config, error) {
 		},
 		JurisdictionRulesURL: env("JURISDICTION_RULES_URL", "http://jurisdiction-rules-svc:8082"),
 		AuthZServiceURL:      env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
+		TenantRegistryURL:    os.Getenv("TENANT_REGISTRY_URL"),
 		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 	}, nil
+}
+
+// LocalEnv reports whether Env names a developer tier, where a dependency
+// may be left unconfigured.
+func (c *Config) LocalEnv() bool {
+	switch strings.ToLower(c.Env) {
+	case "local", "dev", "development", "test":
+		return true
+	}
+	return false
 }
 
 func env(key, def string) string {

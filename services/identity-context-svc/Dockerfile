@@ -4,27 +4,36 @@
 # through), and Docker can only COPY from inside the build context. Dockerfile.dockerignore next to this
 # file trims the context to the two directories the build reads.
 # ─── Stage 1: builder ─────────────────────────────────────────────────────────
-# Use the exact Go toolchain version from go.mod (go 1.22).
-# The builder image produces a statically-linked binary so it runs on distroless.
+# BUILT FROM THE REPOSITORY ROOT:
+#
+#   docker build -f services/identity-context-svc/Dockerfile .
+#
+# go.mod replaces zoiko.io/identity-envelope with the sibling module
+# ../identity-envelope, so the build must see both. With the service folder as
+# the context (as before 19 Oct 2026) that path does not exist and the build
+# fails "replacement directory ../identity-envelope does not exist" (Group 1
+# re-audit F-4). Dockerfile.dockerignore keeps the root context to the two
+# modules this image is built from.
+#
+# The builder produces a statically-linked binary so it runs on distroless.
 FROM golang:1.25-alpine AS builder
 
 # Install git for modules that fetch via VCS (e.g. some indirect deps).
 # ca-certificates is needed for HTTPS module downloads.
 RUN apk add --no-cache git ca-certificates
 
-# The service sits at /build/identity-context-svc so the go.mod replace directive's ../eventing
-# resolves to /build/eventing.
-WORKDIR /build/identity-context-svc
+# The same relative layout as the repository, so the replace path resolves.
+WORKDIR /src/services/identity-context-svc
 
 # Copy dependency manifests first to leverage Docker layer caching:
 # if go.mod / go.sum are unchanged the module download layer is reused.
-# The replaced module must be present before go mod download can resolve it.
-COPY eventing/ /build/eventing/
-COPY identity-context-svc/go.mod identity-context-svc/go.sum ./
+COPY services/identity-context-svc/go.mod services/identity-context-svc/go.sum ./
+COPY services/identity-envelope/ /src/services/identity-envelope/
+COPY services/eventing/ /src/services/eventing/
 RUN go mod download
 
 # Copy the rest of the source.
-COPY identity-context-svc/ ./
+COPY services/identity-context-svc/ ./
 
 # Build a statically-linked binary.
 # CGO_ENABLED=0     — pure Go; no libc dependency, runs on distroless/static.

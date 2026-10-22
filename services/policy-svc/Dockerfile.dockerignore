@@ -1,0 +1,13 @@
+# Used by BuildKit for builds with -f services/policy-svc/Dockerfile.
+# The context is the repository root (see the Dockerfile), so everything is
+# excluded except the modules the image is built from.
+*
+!services/policy-svc/
+!services/identity-envelope/
+
+# Not needed inside the image.
+services/policy-svc/.gotmp/
+services/policy-svc/**/*.exe
+services/policy-svc/**/*_test.go
+services/policy-svc/deployments/
+services/identity-envelope/**/*_test.go

@@ -521,8 +521,11 @@ services:
   # ── 1. identity-context-svc (Port: 8080) ─────────────────────────────────────
   identity-svc:
     build:
-      context: ../services
-      dockerfile: identity-context-svc/Dockerfile
+      # Root context is required: go.mod replaces zoiko.io/identity-envelope
+      # with the sibling ../identity-envelope module, so the build must see
+      # both (Group 1 re-audit F-4). Dockerfile.dockerignore keeps it small.
+      context: ..
+      dockerfile: services/identity-context-svc/Dockerfile
     container_name: identity-context-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -658,6 +661,39 @@ services:
       MTLS_MANAGEMENT_SERVICE_URL: "http://mtls-management-svc:8140"
       MTLS_BOOTSTRAP_TOKEN_PATH: "/bootstrap/token"
       MTLS_ALLOWED_CLIENTS: "gateway-auth-svc,authorization-svc"
+      # ── Auth plane closure (14 Oct 2026) ───────────────────────────────────
+      # Login clients (Group 1 register R-1). The console's SERVER tier logs
+      # in as client "zoiko-console" with its secret (local value:
+      # local-dev-console-client-secret; the file holds only its SHA-256), so
+      # the token carries a verified azp and a human session gets a VERIFIED
+      # source channel. "optional" until the console sends the client; then
+      # "required".
+      IDP_CLIENT_SECRETS_FILE: "/idp-clients/clients.json"
+      IDP_CLIENT_CHANNELS: "zoiko-console=web"
+      IDP_CLIENT_AUTH: "optional"
+      # The TOTP second factor (migration 000012): secrets are AES-256-GCM
+      # encrypted under this key. LOCAL VALUE ONLY — staging and production
+      # refuse to start without their own (from the secret store), and a
+      # factor enrolled under one key cannot be used under another.
+      MFA_SECRET_KEY: "bG9jYWwtZGV2LW1mYS1rZXktMzItYnl0ZXMtbG9uZyE=" # gitleaks:allow -- local-only key; identity-context-svc refuses it in staging/production
+      MFA_SECRET_KEY_ID: "local-1"
+      MFA_RECENT_AUTH_SECONDS: "900"
+      # ── OIDC provider and login throttling (wired 19 Oct 2026, F-5) ─────────
+      # The provider is mounted at /.well-known/openid-configuration and
+      # /oauth2/*. The local registry holds one public loopback client for
+      # trying the code flow by hand; the console is registered here when it
+      # moves from /v1/authenticate to /oauth2/authorize.
+      OIDC_ISSUER: "http://localhost:8080"
+      OIDC_CLIENTS_FILE: "/idp-clients/oidc-clients.json"
+      # The console still logs in through POST /v1/authenticate, so it stays
+      # open locally. The default is "internal" (mTLS platform tooling only),
+      # and config.Load refuses "open" in staging and production (IAM §18).
+      AUTHENTICATE_ENDPOINT: "open"
+      # Source-level login throttling (AU-04): per-IP attempt rate and failure
+      # budgets, per-tenant failure budget, in Redis.
+      AUTH_RATE_IP_PER_MINUTE: "30"
+      AUTH_FAIL_IP_LIMIT: "10"
+      AUTH_FAIL_TENANT_LIMIT: "100"
 
       # ── INT-10 identity federation (OFF unless enabled) ───────────────────────
       #
@@ -679,6 +715,8 @@ services:
       FEDERATION_REVOKE_RETRY_MAX_SECONDS: "60"
     volumes:
       - identity_jwt_keys:/keys:ro
+      - ./identity/idp-clients.local.json:/idp-clients/clients.json:ro
+      - ./identity/oidc-clients.local.json:/idp-clients/oidc-clients.json:ro
       # Only this service's own bootstrap token (register M-01): the
       # sub-directory identity-context-svc/ of the keygen volume, so /bootstrap/token
       # here is a token mtls-management-svc binds to identity-context-svc alone.
@@ -714,8 +752,10 @@ services:
   # wired into a route.
   gateway-auth-svc:
     build:
-      context: ../services/gateway-auth-svc
-      dockerfile: Dockerfile
+      # Root context: go.mod replaces zoiko.io/identity-envelope with the
+      # sibling module, so the build must see both (see the Dockerfile).
+      context: ..
+      dockerfile: services/gateway-auth-svc/Dockerfile
     container_name: gateway-auth-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -800,14 +840,25 @@ services:
   # ── 2. tenant-entity-registry-svc (Port: 8081) ────────────────────────────────
   tenant-svc:
     build:
-      context: ../services/tenant-entity-registry-svc
-      dockerfile: Dockerfile
+      # Root context: go.mod replaces zoiko.io/identity-envelope with the
+      # sibling module, so the build must see both (see the Dockerfile).
+      context: ..
+      dockerfile: services/tenant-entity-registry-svc/Dockerfile
     container_name: tenant-entity-registry-svc
     mem_limit: 256m
     cpus: "0.5"
     ports:
       - "8081:8081"
     environment:
+      # Identity gate (X-R3): a presented signed envelope is verified and its
+      # session checked; its claims replace X-Principal-Id / X-Tenant-Id.
+      # warn here: the services outside Groups 1-2 that read entities forward
+      # the principal but not the envelope. The gateway's tenant-context calls
+      # come over mTLS as a peer. The code default outside local is require.
+      IDENTITY_VERIFY: "${TENANT_REGISTRY_IDENTITY_VERIFY:-warn}"
+      IDENTITY_JWKS_URL: "http://identity-context-svc:8080/.well-known/jwks.json"
+      IDENTITY_INTROSPECT_URL: "http://identity-context-svc:8080/v1/context/session/introspect"
+      IDENTITY_ISSUER: "identity-context-svc"
       PORT: "8081"
       DB_HOST: postgres
       DB_PORT: "5432"
@@ -872,8 +923,10 @@ services:
   # ── 3. jurisdiction-rules-svc (Port: 8082) ──────────────────────────────────
   jurisdiction-svc:
     build:
-      context: ../services/jurisdiction-rules-svc
-      dockerfile: Dockerfile
+      # Root context: go.mod replaces zoiko.io/identity-envelope with the
+      # sibling module, so the build must see both (see the Dockerfile).
+      context: ..
+      dockerfile: services/jurisdiction-rules-svc/Dockerfile
     container_name: jurisdiction-rules-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -899,6 +952,22 @@ services:
       # platform-scope entity. Role assignments granting JURISDICTION_* /
       # JURISDICTION_RULE_* actions must use this same id.
       AUTHZ_PLATFORM_SCOPE_ID: "00000000-0000-0000-0000-00000000f001"
+      # Rule activation confirms its X-Approval-Reference with workflow-svc
+      # (an APPROVED workflow bound to the rule, decided by someone other than
+      # its author; J-02).
+      WORKFLOW_SERVICE_URL: "http://workflow-svc:8090"
+      # Identity gate (J-01): a presented signed envelope is verified and its
+      # session checked. warn: the tax and payroll services that read rule packs
+      # (out of this domain) do not forward the envelope yet. The code default
+      # outside local is require.
+      IDENTITY_VERIFY: "${JURISDICTION_IDENTITY_VERIFY:-warn}"
+      IDENTITY_JWKS_URL: "http://identity-context-svc:8080/.well-known/jwks.json"
+      IDENTITY_INTROSPECT_URL: "http://identity-context-svc:8080/v1/context/session/introspect"
+      IDENTITY_ISSUER: "identity-context-svc"
+      # ZS-JUR rule resolver on (decision J-07, 21 Oct 2026): governed actions'
+      # rule basis is recorded as rule_decision_evidence. Locally it serves every
+      # RELEASED pack; production and staging must name RESOLVER_RING / _REGION.
+      RESOLVER_ENABLED: "${RESOLVER_ENABLED:-true}"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_GROUP_ID: "jurisdiction-rules-svc"
       KAFKA_EVENTS_TOPIC: "zoiko.jurisdiction.events"
@@ -960,8 +1029,10 @@ services:
   # ── 4. governance-decision-log-svc (Port: 8083) ──────────────────────────────
   governance-svc:
     build:
-      context: ../services/governance-decision-log-svc
-      dockerfile: Dockerfile
+      # Root context: go.mod replaces zoiko.io/identity-envelope with the
+      # sibling module, so the build must see both (see the Dockerfile).
+      context: ..
+      dockerfile: services/governance-decision-log-svc/Dockerfile
     container_name: governance-decision-log-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -991,6 +1062,16 @@ services:
       # activation) and decision-support-svc still read with no X-Principal-Id.
       # Set to enforce (the code default) once both forward the caller.
       DECISION_LOG_READ_AUTHZ: "warn"
+      # Identity gate (A1 / D-05): a presented signed envelope is verified and
+      # its session checked; its claims replace X-Principal-Id / X-Tenant-Id.
+      # warn here because the out-of-domain readers above, and every ledger
+      # writer's async relay (no person behind it; a peer over mTLS in
+      # production), present no envelope yet. The code default outside local is
+      # require.
+      IDENTITY_VERIFY: "${DECISION_LOG_IDENTITY_VERIFY:-warn}"
+      IDENTITY_JWKS_URL: "http://identity-context-svc:8080/.well-known/jwks.json"
+      IDENTITY_INTROSPECT_URL: "http://identity-context-svc:8080/v1/context/session/introspect"
+      IDENTITY_ISSUER: "identity-context-svc"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_GROUP_ID: "governance-decision-log-svc"
       KAFKA_EVENTS_TOPIC: "zoiko.governance.events"
@@ -1053,8 +1134,10 @@ services:
   # ── 6. policy-svc (Port: 8085) ────────────────────────────────────────────────
   policy-svc:
     build:
-      context: ../services/policy-svc
-      dockerfile: Dockerfile
+      # Root context: go.mod replaces zoiko.io/identity-envelope with the
+      # sibling module, so the build must see both (see the Dockerfile).
+      context: ..
+      dockerfile: services/policy-svc/Dockerfile
     container_name: policy-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -1069,6 +1152,11 @@ services:
       DB_PASSWORD: "${DB_PASSWORD:-postgres}"
       DB_SSLMODE: disable
       GOVERNANCE_DECISION_LOG_SERVICE_URL: "http://governance-svc:8083"
+      # The principal policy-svc writes evaluation evidence to the governance
+      # ledger as (decision D-02). It needs GOVERNANCE_DECISION_RECORD; until
+      # it has it, evaluations still succeed and their evidence waits, durable,
+      # in policy_evidence_outbox.
+      POLICY_LEDGER_PRINCIPAL_ID: "${POLICY_LEDGER_PRINCIPAL_ID:-svc-policy}"
       # Authorization gate. policy-svc had none: anyone able to reach the
       # port could define a policy, publish a version and activate it.
       # Role assignments granting POLICY_CREATE / POLICY_VERSION_CREATE /
@@ -1076,6 +1164,27 @@ services:
       # legal_entity_id for policies that are not entity-scoped.
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       AUTHZ_PLATFORM_SCOPE_ID: "00000000-0000-0000-0000-00000000f001"
+      # POLICY_EVALUATE and POLICY_READ gates. Enforced: access-control-svc
+      # registers both actions (its 000019), seed-demo-rbac.ps1 grants them,
+      # and every caller forwards X-Principal-Id (expense-claim-svc and
+      # payment-authorization-svc since 14 Oct; governance-decision-log-svc's
+      # replay through its envelope).
+      POLICY_EVALUATE_AUTHZ: "${POLICY_EVALUATE_AUTHZ:-enforce}"
+      POLICY_READ_AUTHZ: "${POLICY_READ_AUTHZ:-enforce}"
+      # Identity headers (X5), through the shared identity-envelope gate:
+      # identity-context-svc's signed envelope (verified against its JWKS, its
+      # session checked at introspection, AU-01) replaces X-Tenant-Id /
+      # X-Principal-Id, or a peer certificate on the :8449 mTLS listener vouches
+      # for them. governance-decision-log-svc's replay forwards the envelope
+      # since 21 Oct; warn remains for the out-of-domain evaluate callers
+      # (expense-claim-svc, payment-authorization-svc), which forward the
+      # principal but not the envelope. The code default is enforce.
+      POLICY_IDENTITY_VERIFY: "${POLICY_IDENTITY_VERIFY:-warn}"
+      IDENTITY_JWKS_URL: "http://identity-svc:8080/.well-known/jwks.json"
+      IDENTITY_INTROSPECT_URL: "http://identity-svc:8080/v1/context/session/introspect"
+      EXPECTED_ISSUER: "identity-context-svc"
+      EXPECTED_AUDIENCE: "zoiko-internal"
+      EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_GROUP_ID: "policy-svc"
@@ -1101,14 +1210,23 @@ services:
   # docs/architecture/observability-baseline-plan.md).
   configuration-feature-flag-svc:
     build:
-      context: ../services/configuration-feature-flag-svc
-      dockerfile: Dockerfile
+      # Root context: go.mod replaces zoiko.io/identity-envelope with the
+      # sibling module, so the build must see both (see the Dockerfile).
+      context: ..
+      dockerfile: services/configuration-feature-flag-svc/Dockerfile
     container_name: configuration-feature-flag-svc
     mem_limit: 256m
     cpus: "0.5"
     ports:
       - "8086:8086"
     environment:
+      # Identity gate (X-R3): a presented signed envelope is verified and its
+      # session checked; its claims replace X-Principal-Id / X-Tenant-Id.
+      # warn here: callers outside Groups 1-2 read flags without the envelope. The code default outside local is require.
+      IDENTITY_VERIFY: "${CONFIG_IDENTITY_VERIFY:-warn}"
+      IDENTITY_JWKS_URL: "http://identity-context-svc:8080/.well-known/jwks.json"
+      IDENTITY_INTROSPECT_URL: "http://identity-context-svc:8080/v1/context/session/introspect"
+      IDENTITY_ISSUER: "identity-context-svc"
       PORT: "8086"
       DB_HOST: postgres
       DB_PORT: "5432"
@@ -1150,14 +1268,23 @@ services:
   # identity-svc's envelope signing key — never used in staging/production.
   secret-vault-integration-svc:
     build:
-      context: ../services/secret-vault-integration-svc
-      dockerfile: Dockerfile
+      # Root context: go.mod replaces zoiko.io/identity-envelope with the
+      # sibling module, so the build must see both (see the Dockerfile).
+      context: ..
+      dockerfile: services/secret-vault-integration-svc/Dockerfile
     container_name: secret-vault-integration-svc
     mem_limit: 256m
     cpus: "0.5"
     ports:
       - "8087:8087"
     environment:
+      # Identity gate (X-R3): a presented signed envelope is verified and its
+      # session checked; its claims replace X-Principal-Id / X-Tenant-Id.
+      # warn here: service callers present client certificates (peers), the console no envelope yet. The code default outside local is require.
+      IDENTITY_VERIFY: "${SECRET_VAULT_IDENTITY_VERIFY:-warn}"
+      IDENTITY_JWKS_URL: "http://identity-context-svc:8080/.well-known/jwks.json"
+      IDENTITY_INTROSPECT_URL: "http://identity-context-svc:8080/v1/context/session/introspect"
+      IDENTITY_ISSUER: "identity-context-svc"
       PORT: "8087"
       DB_HOST: postgres
       DB_PORT: "5432"
@@ -1197,13 +1324,18 @@ services:
   # same pre-existing gap as the two services above.
   obligations-svc:
     build:
-      context: ../services/obligations-svc
-      dockerfile: Dockerfile
+      # Root context: go.mod replaces zoiko.io/identity-envelope with the
+      # sibling module, and the image is built from source (it used to copy
+      # prebuilt binaries that a clean checkout does not have).
+      context: ..
+      dockerfile: services/obligations-svc/Dockerfile
     container_name: obligations-svc
     mem_limit: 256m
     cpus: "0.5"
     ports:
-      - "8088:8088"
+      # Loopback only: in warn mode a request without an identity envelope is
+      # still admitted on its headers, so the port must not answer the LAN.
+      - "127.0.0.1:8088:8088"
     environment:
       PORT: "8088"
       DB_HOST: postgres
@@ -1221,12 +1353,27 @@ services:
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_GROUP_ID: "obligations-svc"
       KAFKA_EVENTS_TOPIC: "zoiko.obligations.events"
+      # Every legal entity a write names must exist in the caller's tenant.
+      TENANT_REGISTRY_URL: "http://tenant-entity-registry-svc:8081"
+      # Identity gate (X5 / X-R3): the signed envelope is verified when sent
+      # and a refused envelope is 401 in every mode; warn admits a request
+      # that carries none until every caller forwards it. Code default
+      # outside local: require.
+      IDENTITY_VERIFY: "${OBLIGATIONS_IDENTITY_VERIFY:-warn}"
+      IDENTITY_JWKS_URL: "http://identity-context-svc:8080/.well-known/jwks.json"
+      IDENTITY_INTROSPECT_URL: "http://identity-context-svc:8080/v1/context/session/introspect"
+      IDENTITY_ISSUER: "identity-context-svc"
     depends_on:
       postgres:
         condition: service_healthy
       kafka:
         condition: service_healthy
       authorization-svc:
+        condition: service_healthy
+      # Creates fail closed (503) until both answer.
+      jurisdiction-svc:
+        condition: service_healthy
+      tenant-svc:
         condition: service_healthy
     healthcheck:
       # readyz, not healthz: liveness answers 200 whenever the process is up, so a
@@ -1241,8 +1388,10 @@ services:
   # ── 10. authorization-svc (Port: 8089) ──────────────────────────────────────
   authorization-svc:
     build:
-      context: ../services/authorization-svc
-      dockerfile: Dockerfile
+      # Root context: go.mod replaces zoiko.io/identity-envelope with the
+      # sibling module, so the build must see both (see the Dockerfile).
+      context: ..
+      dockerfile: services/authorization-svc/Dockerfile
     container_name: authorization-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -1380,6 +1529,34 @@ services:
       # would answer STEP_UP to financial-close-svc's PERIOD_REOPEN_APPROVE.
       # "permit" keeps the old reading here until PEPs forward the age.
       AUTHZ_STEP_UP_UNKNOWN_AGE: "permit"
+      # Who is calling the admin, session and console routes (register A-01):
+      # the identity envelope in Authorization, verified against
+      # identity-context-svc's JWKS, or a registered delegate's client
+      # certificate. "warn" locally (admitted on X-Principal-Id, logged and
+      # marked X-Identity-Assertion: missing) so a console that does not yet
+      # forward the envelope keeps working; outside ENV=local the default is
+      # "require". A PRESENTED envelope that fails is refused in every mode.
+      # Plaintext JWKS here because docker-compose.override.yml turns this
+      # service's mTLS off; production points at
+      # https://identity-context-svc:8449/.well-known/jwks.json, which
+      # allow-lists authorization-svc and is fetched with its own certificate.
+      AUTHZ_IDENTITY_ASSERTION: "warn"
+      AUTHZ_IDENTITY_JWKS_URL: "http://identity-svc:8080/.well-known/jwks.json"
+      # AU-01: every verified envelope's session is checked here (live answers
+      # reused for 5 s), so a logout stops the admin routes at once instead of
+      # when the envelope expires. Fails closed when identity-context cannot
+      # answer.
+      AUTHZ_IDENTITY_INTROSPECT_URL: "http://identity-svc:8080/v1/context/session/introspect"
+      AUTHZ_ADMIN_DELEGATES: "access-control-svc"
+      # Issuing or approving a JIT or break-glass session needs a TOTP step-up
+      # no older than this (register A-03, ZS-IAM-001 §13/§14). Enforced here
+      # too: there is deliberately no local opt-out in this file.
+      AUTHZ_SESSION_STEP_UP_MAX_AGE_SECONDS: "900"
+      # Session maximums (register B-01), refused rather than shortened.
+      # Chosen 14 Oct 2026; "numeric limits require Security approval".
+      AUTHZ_MAX_JIT_SECONDS: "28800"
+      AUTHZ_MAX_BREAK_GLASS_SECONDS: "7200"
+      AUTHZ_MAX_SUPPORT_SECONDS: "14400"
     volumes:
       # Only this service's own bootstrap token (register M-01): the
       # sub-directory authorization-svc/ of the keygen volume, so /bootstrap/token
@@ -1410,8 +1587,10 @@ services:
   # ── 11. workflow-svc (Port: 8090) ───────────────────────────────────────────
   workflow-svc:
     build:
-      context: ../services/workflow-svc
-      dockerfile: Dockerfile
+      # Root context: go.mod replaces zoiko.io/identity-envelope with the
+      # sibling module, so the build must see both (see the Dockerfile).
+      context: ..
+      dockerfile: services/workflow-svc/Dockerfile
     container_name: workflow-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -1429,6 +1608,30 @@ services:
       KAFKA_GROUP_ID: "workflow-svc"
       KAFKA_EVENTS_TOPIC: "zoiko.workflow.events"
       AUTHORIZATION_SERVICE_URL: "http://authorization-svc:8089"
+      DOCUMENT_VAULT_SERVICE_URL: "http://document-vault-svc:8094"
+      GOVERNANCE_DECISION_LOG_SERVICE_URL: "http://governance-decision-log-svc:8083"
+      # The writer to the governance ledger (workflow decision evidence): a
+      # service principal holding GOVERNANCE_DECISION_RECORD and nothing else
+      # (GOVERNANCE_LEDGER_WRITER in deployments/supabase/seed-rbac.sql).
+      # Without the grant every decision still commits, and its ledger record
+      # waits durably in the outbox.
+      WORKFLOW_LEDGER_PRINCIPAL_ID: "${WORKFLOW_LEDGER_PRINCIPAL_ID:-svc-workflow}"
+      # Reads need WORKFLOW_READ unless the caller is a participant (the
+      # WORKFLOW_APPROVER / WORKFLOW_ADMINISTRATOR templates, access-control 000021).
+      WORKFLOW_READ_AUTHZ: "${WORKFLOW_READ_AUTHZ:-enforce}"
+      # Approver re-check on authority changes (policy, delegation, denials).
+      KAFKA_CONSUMER_GROUP_ID: "workflow-svc-recheck"
+      # CreateWorkflow validates the legal entity against the registry
+      # (cross-domain fact) rather than trusting a caller-supplied UUID.
+      TENANT_ENTITY_REGISTRY_SERVICE_URL: "http://tenant-entity-registry-svc:8081"
+      # Identity gate (X5 / X-R3): verify a presented signed envelope against
+      # identity-context-svc and derive the trusted principal/tenant from it.
+      # Warn locally while the console does not forward the envelope on every
+      # workflow call; require in production.
+      IDENTITY_VERIFY: "${WORKFLOW_IDENTITY_VERIFY:-warn}"
+      IDENTITY_JWKS_URL: "http://identity-context-svc:8080/.well-known/jwks.json"
+      IDENTITY_INTROSPECT_URL: "http://identity-context-svc:8080/v1/context/session/introspect"
+      IDENTITY_ISSUER: "identity-context-svc"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
     depends_on:
       postgres:
@@ -1436,6 +1639,15 @@ services:
       kafka:
         condition: service_healthy
       authorization-svc:
+        condition: service_healthy
+      document-vault-svc:
+        condition: service_healthy
+      tenant-svc:
+        condition: service_healthy
+      # The compose service key is governance-svc (container
+      # governance-decision-log-svc); naming the container here made every
+      # docker compose command fail with "undefined service".
+      governance-svc:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/healthcheck", "http://localhost:8090/healthz"]
@@ -1550,8 +1762,6 @@ services:
         condition: service_healthy
       authorization-svc:
         condition: service_healthy
-      kafka:
-        condition: service_healthy
       document-vault-storage-init:
         condition: service_completed_successfully
     healthcheck:
@@ -1642,6 +1852,8 @@ services:
   # POST to /v1/search-sources, not a redeploy.
   search-indexer-svc:
     build:
+      # Root context is required: go.mod replaces zoiko.io/search-client with
+      # the sibling ../search-client module, so the build must see both.
       context: ..
       dockerfile: services/search-indexer-svc/Dockerfile
     container_name: search-indexer-svc
@@ -1651,6 +1863,14 @@ services:
       - "8096:8096"
     environment:
       ENV: "local"
+      # Identity gate (X-R3): a presented signed envelope is verified and its
+      # session checked; its claims replace X-Principal-Id / X-Tenant-Id.
+      # warn here: the console's search calls do not forward the envelope yet.
+      # The code default outside local is require.
+      IDENTITY_VERIFY: "${SEARCH_INDEXER_IDENTITY_VERIFY:-warn}"
+      IDENTITY_JWKS_URL: "http://identity-context-svc:8080/.well-known/jwks.json"
+      IDENTITY_INTROSPECT_URL: "http://identity-context-svc:8080/v1/context/session/introspect"
+      IDENTITY_ISSUER: "identity-context-svc"
       PORT: "8096"
       DB_HOST: "postgres"
       DB_PORT: "5432"
@@ -1792,12 +2012,15 @@ services:
       # Required, no default (ZS-EVENT-001 §4 residencyregion).
       EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      EVIDENCE_REQUIREMENTS_URL: "http://evidence-requirements-svc:8130"
     depends_on:
       postgres:
         condition: service_healthy
       kafka:
         condition: service_healthy
       authorization-svc:
+        condition: service_healthy
+      evidence-requirements-svc:
         condition: service_healthy
     healthcheck:
       # readyz, not healthz: liveness answers 200 whenever the process is up, so a
@@ -2091,14 +2314,23 @@ services:
 
   notification-svc:
     build:
-      context: ../services
-      dockerfile: notification-svc/Dockerfile
+      # Root context: go.mod replaces zoiko.io/identity-envelope with the
+      # sibling module, so the build must see both (see the Dockerfile).
+      context: ..
+      dockerfile: services/notification-svc/Dockerfile
     container_name: notification-svc
     mem_limit: 256m
     cpus: "0.5"
     ports:
       - "8133:8133"
     environment:
+      # Identity gate (X-R3): a presented signed envelope is verified and its
+      # session checked; its claims replace X-Principal-Id / X-Tenant-Id.
+      # warn here: domain services outside Groups 1-2 send without the envelope. The code default outside local is require.
+      IDENTITY_VERIFY: "${NOTIFICATION_IDENTITY_VERIFY:-warn}"
+      IDENTITY_JWKS_URL: "http://identity-context-svc:8080/.well-known/jwks.json"
+      IDENTITY_INTROSPECT_URL: "http://identity-context-svc:8080/v1/context/session/introspect"
+      IDENTITY_ISSUER: "identity-context-svc"
       PORT: "8133"
       DB_HOST: postgres
       DB_PORT: "5432"
@@ -2322,14 +2554,23 @@ services:
   # delegated, at creation time.
   delegated-authority-svc:
     build:
-      context: ../services/delegated-authority-svc
-      dockerfile: Dockerfile
+      # Root context: go.mod replaces zoiko.io/identity-envelope with the
+      # sibling module, so the build must see both (see the Dockerfile).
+      context: ..
+      dockerfile: services/delegated-authority-svc/Dockerfile
     container_name: delegated-authority-svc
     mem_limit: 256m
     cpus: "0.5"
     ports:
       - "8136:8136"
     environment:
+      # Identity gate (X-R3): a presented signed envelope is verified and its
+      # session checked; its claims replace X-Principal-Id / X-Tenant-Id.
+      # warn here: the console does not forward the envelope on every call yet. The code default outside local is require.
+      IDENTITY_VERIFY: "${DELEGATED_AUTHORITY_IDENTITY_VERIFY:-warn}"
+      IDENTITY_JWKS_URL: "http://identity-context-svc:8080/.well-known/jwks.json"
+      IDENTITY_INTROSPECT_URL: "http://identity-context-svc:8080/v1/context/session/introspect"
+      IDENTITY_ISSUER: "identity-context-svc"
       PORT: "8136"
       DB_HOST: postgres
       DB_PORT: "5432"
@@ -2530,14 +2771,23 @@ services:
   # internal/domain/types.go for the full rationale.
   access-control-svc:
     build:
-      context: ../services/access-control-svc
-      dockerfile: Dockerfile
+      # Root context: go.mod replaces zoiko.io/identity-envelope with the
+      # sibling module, so the build must see both (see the Dockerfile).
+      context: ..
+      dockerfile: services/access-control-svc/Dockerfile
     container_name: access-control-svc
     mem_limit: 256m
     cpus: "0.5"
     ports:
       - "8137:8137"
     environment:
+      # Identity gate (X-R3): a presented signed envelope is verified and its
+      # session checked; its claims replace X-Principal-Id / X-Tenant-Id.
+      # warn here: HR and other out-of-domain event sources call without the envelope. The code default outside local is require.
+      IDENTITY_VERIFY: "${ACCESS_CONTROL_IDENTITY_VERIFY:-warn}"
+      IDENTITY_JWKS_URL: "http://identity-context-svc:8080/.well-known/jwks.json"
+      IDENTITY_INTROSPECT_URL: "http://identity-context-svc:8080/v1/context/session/introspect"
+      IDENTITY_ISSUER: "identity-context-svc"
       PORT: "8137"
       DB_HOST: postgres
       DB_PORT: "5432"
@@ -2675,13 +2925,16 @@ services:
   # `jurisdiction-svc` (the service key) was required.
   evidence-requirements-svc:
     build:
-      context: ../services/evidence-requirements-svc
-      dockerfile: Dockerfile
+      # Root context: go.mod replaces zoiko.io/identity-envelope with the
+      # sibling module, so the build must see both.
+      context: ..
+      dockerfile: services/evidence-requirements-svc/Dockerfile
     container_name: evidence-requirements-svc
     mem_limit: 256m
     cpus: "0.5"
     ports:
-      - "8130:8130"
+      # Loopback only while the identity gate runs in warn mode.
+      - "127.0.0.1:8130:8130"
     environment:
       PORT: "8130"
       DB_HOST: postgres
@@ -2694,6 +2947,19 @@ services:
       KAFKA_EVENTS_TOPIC: "zoiko.evidence-requirements.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       DOCUMENT_VAULT_SERVICE_URL: "http://document-vault-svc:8094"
+      # The legal entity of every evaluation and requirement is confirmed here.
+      TENANT_REGISTRY_URL: "http://tenant-entity-registry-svc:8081"
+      # Evaluate is gated on EVIDENCE_EVALUATE (decided 21 Oct 2026). warn on the
+      # local stack until the callers outside the governance domains
+      # (board-resolutions, corporate-actions, filing-preparation) have their
+      # principals granted; the code default is enforce. Reads enforce.
+      EVIDENCE_EVALUATE_AUTHZ: "${EVIDENCE_EVALUATE_AUTHZ:-warn}"
+      EVIDENCE_READ_AUTHZ: "${EVIDENCE_READ_AUTHZ:-enforce}"
+      # Identity gate (X5 / X-R3); see obligations-svc for the semantics.
+      IDENTITY_VERIFY: "${EVIDENCE_IDENTITY_VERIFY:-warn}"
+      IDENTITY_JWKS_URL: "http://identity-context-svc:8080/.well-known/jwks.json"
+      IDENTITY_INTROSPECT_URL: "http://identity-context-svc:8080/v1/context/session/introspect"
+      IDENTITY_ISSUER: "identity-context-svc"
     depends_on:
       postgres:
         condition: service_healthy
@@ -2702,6 +2968,8 @@ services:
       authorization-svc:
         condition: service_healthy
       document-vault-svc:
+        condition: service_healthy
+      tenant-svc:
         condition: service_healthy
     healthcheck:
       # readyz, not healthz: liveness answers 200 whenever the process is up, so a
@@ -2860,6 +3128,7 @@ services:
       # upload with "failed to record close evidence in vault", which reads as
       # the vault being broken rather than as never having been contacted.
       VAULT_SERVICE_URL: "http://document-vault-svc:8094"
+      EVIDENCE_REQUIREMENTS_URL: "http://evidence-requirements-svc:8130"
       # ACC-06's third subledger source (ASSETS), added to satisfy the
       # AST/INV/PRJ domain spec's own §9 "Assets → GL" reconciliation
       # assertion — no new reconciliation engine, just a new caller onto
@@ -4066,12 +4335,15 @@ services:
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       TAX_RULES_SERVICE_URL: "http://tax-rules-svc:8125"
       JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8082"
+      EVIDENCE_REQUIREMENTS_URL: "http://evidence-requirements-svc:8130"
     depends_on:
       postgres:
         condition: service_healthy
       kafka:
         condition: service_healthy
       authorization-svc:
+        condition: service_healthy
+      evidence-requirements-svc:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/app/healthcheck"]
@@ -4099,12 +4371,15 @@ services:
       TAX_RULES_SERVICE_URL: "http://tax-rules-svc:8125"
       JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8082"
       GENERAL_LEDGER_URL: "http://general-ledger-svc:8091"
+      EVIDENCE_REQUIREMENTS_URL: "http://evidence-requirements-svc:8130"
     depends_on:
       postgres:
         condition: service_healthy
       kafka:
         condition: service_healthy
       authorization-svc:
+        condition: service_healthy
+      evidence-requirements-svc:
         condition: service_healthy
       tax-rules-svc:
         condition: service_healthy

@@ -127,12 +127,12 @@ func (s *PgStore) CreateRequirement(ctx context.Context, r *domain.EvidenceRequi
 		payload = json.RawMessage(`{}`)
 	}
 
-	if r.IdempotencyKey == "" {
-		if r.CorrelationID != "" {
-			r.IdempotencyKey = r.CorrelationID
-		} else {
-			r.IdempotencyKey = r.EvidenceRequirementID
-		}
+	// An absent key means "not an idempotent write", not "share the empty
+	// key with every other absent-key row". The latter made a second insert
+	// in the same tenant collide with the first at the DB level.
+	idempotencyKey := r.IdempotencyKey
+	if idempotencyKey == "" {
+		idempotencyKey = r.EvidenceRequirementID
 	}
 
 	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
@@ -146,7 +146,7 @@ func (s *PgStore) CreateRequirement(ctx context.Context, r *domain.EvidenceRequi
 			ON CONFLICT (tenant_id, idempotency_key) DO NOTHING
 		`, r.EvidenceRequirementID, r.TenantID, r.LegalEntityID, r.DomainCode, r.ActionType,
 			r.EvidenceType, []byte(payload), r.EffectiveFrom,
-			now, r.CreatedByPrincipalID, r.CorrelationID, r.IdempotencyKey)
+			now, r.CreatedByPrincipalID, r.CorrelationID, idempotencyKey)
 		if err != nil {
 			return err
 		}
@@ -164,7 +164,7 @@ func (s *PgStore) CreateRequirement(ctx context.Context, r *domain.EvidenceRequi
 		existing, err := scanRequirement(tx.QueryRow(ctx,
 			`SELECT `+requirementColumns+`
 			 FROM evidence_requirements WHERE tenant_id = $1 AND idempotency_key = $2`,
-			r.TenantID, r.IdempotencyKey))
+			r.TenantID, idempotencyKey))
 		if err != nil {
 			return err
 		}
@@ -356,12 +356,11 @@ func (s *PgStore) RecordEvaluation(ctx context.Context, e *domain.EvidenceEvalua
 		reqIDs = []string{}
 	}
 
-	if e.IdempotencyKey == "" {
-		if e.CorrelationID != "" {
-			e.IdempotencyKey = e.CorrelationID
-		} else {
-			e.IdempotencyKey = e.EvaluationID
-		}
+	// As with requirements, an absent key is not a shared empty key; the
+	// evaluation's own uuid keeps independent determinations insertable.
+	idempotencyKey := e.IdempotencyKey
+	if idempotencyKey == "" {
+		idempotencyKey = e.EvaluationID
 	}
 
 	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
@@ -375,7 +374,7 @@ func (s *PgStore) RecordEvaluation(ctx context.Context, e *domain.EvidenceEvalua
 			ON CONFLICT (tenant_id, idempotency_key) DO NOTHING
 		`, e.EvaluationID, e.TenantID, e.LegalEntityID, e.DomainCode, e.ActionType,
 			string(e.Outcome), []byte(e.UnmetPayload), []byte(e.PresentArtifactsPayload),
-			now, e.EvaluatedForPrincipalID, e.CorrelationID, e.IdempotencyKey, reqIDs)
+			now, e.EvaluatedForPrincipalID, e.CorrelationID, idempotencyKey, reqIDs)
 		if err != nil {
 			return err
 		}
@@ -397,7 +396,7 @@ func (s *PgStore) RecordEvaluation(ctx context.Context, e *domain.EvidenceEvalua
 		existing, err := scanEvaluation(tx.QueryRow(ctx,
 			`SELECT `+evaluationColumns+`
 			 FROM evidence_evaluations WHERE tenant_id = $1 AND idempotency_key = $2`,
-			e.TenantID, e.IdempotencyKey))
+			e.TenantID, idempotencyKey))
 		if err != nil {
 			return err
 		}

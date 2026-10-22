@@ -12,6 +12,8 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	svcenvelope "zoiko.io/gateway-auth-svc/internal/envelope"
 )
 
 type key struct {
@@ -49,6 +51,11 @@ func NewClient(url string, ttl time.Duration) *Client {
 // NewClientWithHTTPClient constructs a Client with a custom *http.Client
 // (e.g. one provisioned for mTLS). The caller owns the client's lifetime.
 func NewClientWithHTTPClient(url string, ttl time.Duration, httpClient *http.Client) *Client {
+	if httpClient == nil {
+		// A nil client panics on the first fetch; that was every /verify on a
+		// deployment without JWKS mTLS until 14 Oct 2026.
+		httpClient = &http.Client{Timeout: 5 * time.Second}
+	}
 	return &Client{
 		url:        url,
 		ttl:        ttl,
@@ -121,6 +128,9 @@ func (c *Client) refresh(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// Forward the caller's canonical envelope for downstream traceability
+	svcenvelope.ForwardTo(ctx, req)
+
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("fetch jwks: %w", err)

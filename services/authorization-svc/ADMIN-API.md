@@ -6,9 +6,18 @@ until 7 Oct 2026 existed only in code. For the evaluation endpoints see
 
 ## Conventions (all routes)
 
-- **Identity.** `X-Principal-Id` and `X-Tenant-Id` are required and verified
-  (the gateway sets them). A missing one is `401`; a malformed tenant is `400`.
-  No route takes the caller or tenant from the body or query string.
+- **Identity (register A-01, 14 Oct 2026).** Every route here (all but the evaluation
+  routes and the probes) identifies the caller by the identity envelope identity-context-svc
+  minted, sent as `Authorization: Bearer <envelope>` and verified against its JWKS (RS256,
+  issuer, audience, expiry). Principal and tenant come from the envelope; an
+  `X-Principal-Id` / `X-Tenant-Id` that names anyone else is `403 identity_mismatch` /
+  `403 tenant_scope_mismatch`. A presented envelope that does not verify is
+  `401 identity_assertion_invalid` in every mode. With none, a registered delegate service
+  (`AUTHZ_ADMIN_DELEGATES`, its mTLS certificate CN — never a header) may act for the
+  principal it forwards; otherwise `AUTHZ_IDENTITY_ASSERTION=require` (the default outside
+  ENV=local) answers `401 identity_assertion_required`, and `warn` admits the request marked
+  `X-Identity-Assertion: missing`. No route takes the caller or tenant from the body or query
+  string. A malformed tenant is `400`.
 - **Permission.** Each admin route requires the named Authorization Standard
   (ZS-IAM-001 Appendix A) permission, held at tenant scope unless the row says
   *platform*. Missing it is `403 authorization_denied`, and the check is itself
@@ -115,14 +124,29 @@ ACTIVE and unexpired, and only the actions it names — no wildcard is accepted 
 
 | Route | Permission | Rules |
 |---|---|---|
-| `POST …/privileged-sessions` | `iam.pam.manage` | Body: `principal_id` (default the caller), `requested_actions`, `ticket_ref`, `reason`, `duration_seconds`, `resource_scope`, `target_environment` — all mandatory (§13). The subject must hold `iam.pam.eligible`. Any high-impact action (`iam.*`, protected platform, payment / posting / filing) → `202` `PENDING_APPROVAL`, granting nothing; otherwise `201` ACTIVE. Max 24 h. |
-| `POST …/privileged-sessions/{id}/approve` · `/reject` | `iam.pam.approve` | **R**. Never the subject or the requester (`403 checker_not_independent`; also a DB CHECK). The clock starts at approval. Pending requests expire after 24 h. |
+| `POST …/privileged-sessions` | `iam.pam.manage` | Body: `principal_id` (default the caller), `requested_actions`, `ticket_ref`, `reason`, `duration_seconds`, `resource_scope`, `target_environment` — all mandatory (§13). The subject must hold `iam.pam.eligible`. Any high-impact action (`iam.*`, protected platform, payment / posting / filing) → `202` `PENDING_APPROVAL`, granting nothing; otherwise `201` ACTIVE. **Step-up** (see below). Max `AUTHZ_MAX_JIT_SECONDS` (8 h); longer is `400 duration_exceeds_maximum`. |
+| `POST …/privileged-sessions/{id}/approve` · `/reject` | `iam.pam.approve` | **R**. Never the subject or the requester (`403 checker_not_independent`; also a DB CHECK). Approval needs the approver's own **step-up**; rejection does not. The clock starts at approval. Pending requests expire after 24 h. |
 | `POST …/privileged-sessions/{id}/revoke` | `iam.pam.manage` | **R**. |
-| `POST …/break-glass-sessions` | `iam.break_glass.manage` | `incident_id` (A16), `reason`, `requested_actions`. The subject must hold `iam.break_glass.eligible`. No payment / posting / filing power (§14 "separately constrained"). CRITICAL SIEM alert on issue. Max 2 h. |
+| `POST …/break-glass-sessions` | `iam.break_glass.manage` | `incident_id` (A16), `reason`, `requested_actions`. The subject must hold `iam.break_glass.eligible`. No payment / posting / filing power (§14 "separately constrained"). CRITICAL SIEM alert on issue. **Step-up**. Max `AUTHZ_MAX_BREAK_GLASS_SECONDS` (2 h); longer is `400`. |
 | `POST …/break-glass-sessions/{id}/revoke` | `iam.break_glass.manage` | **R**. |
-| `POST /v1/support/sessions` | `iam.support.manage` | `ticket_ref`, `purpose`, and `tenant_consent_obtained` stated explicitly (400 if omitted). Read-only by default: grants read verbs only (`…READ/VIEW/LIST/GET/SEARCH/QUERY/LOOKUP/INSPECT/DISCOVER`). A writable session also grants only the writes named in `allowed_actions`. No consent → nothing granted. Bulk export off unless `allow_bulk_export`. Max 24 h. |
+| `POST /v1/support/sessions` | `iam.support.manage` | `ticket_ref`, `purpose`, and `tenant_consent_obtained` stated explicitly (400 if omitted). Read-only by default: grants read verbs only (`…READ/VIEW/LIST/GET/SEARCH/QUERY/LOOKUP/INSPECT/DISCOVER`). A writable session also grants only the writes named in `allowed_actions`. No consent → nothing granted. Bulk export off unless `allow_bulk_export`. Max `AUTHZ_MAX_SUPPORT_SECONDS` (4 h); longer is `400`. |
 | `POST /v1/support/sessions/{id}/revoke` | `iam.support.manage` | **R**. |
 | `POST …/privileged-sessions/{id}/review` · `…/break-glass-sessions/{id}/review` | `iam.session.review` | `{"outcome": "ATTESTED" \| "FLAGGED", "notes"}`; FLAGGED needs notes and raises a CRITICAL SIEM alert. Reviewer is never the subject or the requester. A review is opened when a high-impact JIT session or any break-glass session ends (revoked or expired). |
+
+**Step-up (register A-03, ZS-IAM-001 §3/§13/§14).** Issuing a JIT session, approving one,
+and issuing a break-glass session need the caller's verified envelope to carry
+`session_trust_posture.mfa_verified=true` with an `auth_time` no older than
+`AUTHZ_SESSION_STEP_UP_MAX_AGE_SECONDS` (900). Otherwise `401 step_up_required` with
+`reason` (`no_verified_identity`, `delegated_caller`, `single_factor`, `step_up_stale`,
+`authn_time_unknown`, `authn_time_in_future`, `assertion_principal_mismatch`),
+`required_assurance: "MFA"`, `max_authn_age_seconds`, and
+`WWW-Authenticate: Bearer error="insufficient_user_authentication"`. The remedy is
+identity-context-svc `POST /v1/authenticate/step-up` (a TOTP code), then
+`/v1/context/resolve`, then retry with the new envelope. Every check is recorded as
+`iam.session.step_up.<issue_jit|approve_jit|issue_break_glass>`. What was proven is stored on
+the session (000033) and returned as `requester_step_up` / `approver_step_up`
+(`assurance`, `authn_at`, `session_context_id`). `AUTHZ_SESSION_STEP_UP=off` exists for
+ENV=local only.
 
 Events (outbox, 000030): `security.privileged_session.started` / `.ended`,
 `security.break_glass.started` / `.ended`, `support.session.started` / `.ended`; a revoke's
@@ -243,3 +267,19 @@ to the list.
   its lifetime; new handshakes use the new certificate.
 - **Replica id (N-15).** `AUTHZ_REPLICA_ID` names this replica's cache-invalidation consumer
   group; it defaults to the hostname.
+
+## Changes of 14 Oct 2026 (auth plane closure: A-01, A-03, B-01)
+
+- **The caller is the identity envelope (A-01).** See *Identity* under Conventions.
+  `internal/identity` (gate + JWKS client); config `AUTHZ_IDENTITY_ASSERTION`,
+  `AUTHZ_IDENTITY_JWKS_URL` (required unless `off`), `AUTHZ_IDENTITY_ISSUER`,
+  `AUTHZ_IDENTITY_AUDIENCE`, `AUTHZ_ADMIN_DELEGATES`. An https JWKS URL is fetched with this
+  service's own mTLS certificate (identity-context-svc's :8449 listener allow-lists it).
+  Unknown-kid refetches are rate-limited to one per 10 s.
+- **Step-up before privileged sessions (A-03).** See *Step-up* under Sessions. Migration
+  **000033** (evidence columns, paired by CHECK; down refuses while evidence exists).
+- **Session maximums (B-01).** Configurable, refused rather than shortened: JIT 8 h,
+  break-glass 2 h, support 4 h (chosen 14 Oct 2026; Security sign-off pending). The store
+  refuses too, so a caller that skips the handler cannot be clamped.
+- **access-control-svc** forwards the person's envelope when its call acts in that person's
+  name, and calls over mTLS (when enabled) so it can be admitted as a delegate otherwise.

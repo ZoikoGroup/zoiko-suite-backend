@@ -5,7 +5,38 @@
     "description": "evidence-requirements-svc (8130) plus the authorization-svc (8089) grants needed to exercise it end-to-end.\n\nSpec: docs/architecture/03-microservices.md §8.6 — \"Determines what supporting evidence must exist before an action may be completed.\" Critical constraint: \"No finalization path may skip required evidence states.\"\n\nRun folders in order: 00 (one-time authz setup), then 01, 02, 03.\n\nStart the stack with:\n  docker compose -f deployments/docker-compose.yml up -d postgres kafka authorization-svc document-vault-svc evidence-requirements-svc\n\nNotes:\n- Folder 02's 'NO_REQUIREMENTS_DEFINED' case deliberately uses an action_type nothing is configured for, so it does not depend on folder ordering.\n- Folder 02's SUPPORTING_DOCUMENT case uses a document_id that does not exist in document-vault-svc. It is expected to come back MISSING — that proves asserted artifacts are actually verified rather than trusted, and is not a setup error.\n- Correlation IDs are generated per run with {{$guid}} and captured where a replay needs the same value, so the collection is re-runnable without a database reset.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
+  "auth": {
+    "type": "bearer",
+    "bearer": [{"key": "token", "value": "{{identityEnvelope}}", "type": "string"}]
+  },
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "// 21 Oct 2026: every request needs the canonical envelope (write-strict refused these POSTs with",
+          "// 400 envelope_incomplete) and, outside warn mode, identity-context-svc's envelope as the bearer.",
+          "const v = (k) => pm.variables.get(k);",
+          "if (!pm.request.headers.has('X-Tenant-Id')) { pm.request.headers.upsert({key: 'X-Tenant-Id', value: v('tenantId')}); }",
+          "if (!pm.request.headers.has('X-Principal-Id')) { pm.request.headers.upsert({key: 'X-Principal-Id', value: v('principalId')}); }",
+          "pm.request.headers.upsert({key: 'X-Request-Id', value: 'req_' + Date.now() + Math.floor(Math.random()*1e6)});",
+          "pm.request.headers.upsert({key: 'X-Source-Channel', value: 'api'});",
+          "if (!pm.request.headers.has('X-Correlation-ID')) { pm.request.headers.upsert({key: 'X-Correlation-ID', value: pm.variables.replaceIn('{{$guid}}')}); }",
+          "if (pm.request.method !== 'GET') {",
+          "  // Replays are keyed on Idempotency-Key (not correlation_id): a request that repeats an earlier",
+          "  // correlation_id is that request's retry, so it re-sends the same key.",
+          "  let key = '';",
+          "  try { const b = JSON.parse(pm.variables.replaceIn(pm.request.body.raw || '{}')); if (b.correlation_id) { key = 'idem-' + b.correlation_id; } } catch (e) {}",
+          "  if (!pm.request.headers.has('Idempotency-Key')) { pm.request.headers.upsert({key: 'Idempotency-Key', value: key || pm.variables.replaceIn('{{$guid}}')}); }",
+          "  if (!pm.request.headers.has('X-Legal-Entity-Id')) { pm.request.headers.upsert({key: 'X-Legal-Entity-Id', value: v('entityId')}); }",
+          "}"
+        ]
+      }
+    }
+  ],
   "variable": [
+    { "key": "identityEnvelope", "type": "string", "value": "" },
     { "key": "baseUrl", "type": "string", "value": "http://localhost" },
     { "key": "tenantId", "type": "string", "value": "aa5c2c9f-1201-43f4-a8fe-41d5684954e8" },
     { "key": "entityId", "type": "string", "value": "b660fffe-1729-4d42-8ddd-f19db1619225" },

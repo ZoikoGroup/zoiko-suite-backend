@@ -63,3 +63,49 @@ func TestAppRole_GovernedLifecycleWritesTenantScopedValues(t *testing.T) {
 		t.Fatalf("tenant emergency value must be reverted: %+v", v)
 	}
 }
+
+// Publishing runs under the definition_admin escape, but the
+// config.version.published row it enqueues is owned by the CALLER's tenant —
+// the same rule every request-path event follows: the outbox policy admits a
+// request-path row only for the session tenant or a named background escape,
+// and definition_admin is neither. The enqueue used to name nobody, so the
+// real role's INSERT was refused (42501) and — sharing the publish's
+// transaction — failed the whole publish with a 503. SUPERUSER test
+// connections cannot see this class of defect at all: RLS is off for them,
+// which is why this runs as the real role.
+func TestAppRole_PublishDefinitionOwnsTheOutboxRow(t *testing.T) {
+	ctx := context.Background()
+	admin := openTestPool(t)
+	s := store.New(appRolePool(t, admin), zap.NewNop())
+
+	def, err := s.CreateDefinition(ctx, domain.CreateDefinitionParams{
+		Key: "payroll.publish_probe", Owner: "platform", ValueType: "INTEGER",
+		SafetyClass: "S1", AllowedScopes: []string{"ENVIRONMENT", "TENANT"},
+		FallbackPolicy: "SAFE_DEFAULT", Sensitivity: "INTERNAL",
+		ActorPrincipalID: "admin-1",
+	})
+	if err != nil {
+		t.Fatalf("declare as app role: %v", err)
+	}
+	v, err := s.PublishDefinition(ctx, domain.PublishDefinitionParams{
+		DefinitionID: def.DefinitionID, Lifecycle: domain.LifecyclePublished,
+		ActorPrincipalID: "admin-1", CallerTenantID: testCallerTenant,
+	})
+	if err != nil {
+		t.Fatalf("publish as app role: %v", err)
+	}
+	if v == nil || v.Version != 1 {
+		t.Fatalf("publish must return the first version, got %+v", v)
+	}
+	// The admin pool sees every RLS-tenanted row, so this asserts the row's
+	// OWNER, not merely that some row exists.
+	var owner, eventType string
+	if err := admin.QueryRow(ctx, `
+		SELECT tenant_id, event_type FROM event_outbox
+		WHERE aggregate_key = $1`, v.VersionID).Scan(&owner, &eventType); err != nil {
+		t.Fatalf("the publish must enqueue its event: %v", err)
+	}
+	if owner != testCallerTenant || eventType != "config.version.published" {
+		t.Fatalf("outbox row must be owned by the caller: got tenant=%q type=%q", owner, eventType)
+	}
+}

@@ -29,6 +29,7 @@ import (
 
 	"github.com/go-chi/chi/v5/middleware"
 	"go.uber.org/zap"
+	idenv "zoiko.io/identity-envelope"
 
 	svcenvelope "zoiko.io/jurisdiction-rules-svc/internal/envelope"
 )
@@ -318,6 +319,12 @@ func (c *HTTPAuthZClient) authorizeLive(ctx context.Context, principalID, scopeI
 	// One decision per (request, action): an inbound request may authorize
 	// several actions, and each is its own decision to record.
 	req.Header.Set("Idempotency-Key", authzRequestID+":"+actionType)
+
+	// Forward the caller's canonical envelope for downstream traceability
+	svcenvelope.ForwardTo(ctx, req)
+	// And the verified identity envelope, for authorization-svc's identity
+	// assertion check (AUTHZ_IDENTITY_ASSERTION).
+	idenv.Forward(ctx, req)
 
 	resp, err := c.client.Do(req)
 	if err != nil {

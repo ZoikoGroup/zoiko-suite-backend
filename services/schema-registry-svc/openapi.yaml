@@ -193,7 +193,7 @@ paths:
               schema:
                 oneOf:
                   - $ref: "#/components/schemas/IncompatibleSchemaError"
-                  - $ref: "#/components/schemas/Error"
+                  - $ref: "#/components/schemas/VersionRaceError"
               examples:
                 incompatible:
                   summary: Breaks the current contract
@@ -446,6 +446,7 @@ components:
 
     IncompatibleSchemaError:
       type: object
+      additionalProperties: false
       required: [error, violations]
       properties:
         error: { type: string, example: "incompatible schema change" }
@@ -455,6 +456,13 @@ components:
             One entry per breaking change, naming the field that broke, in a
             stable sorted order (the same two schemas always yield the same list).
           items: { type: string }
+
+    VersionRaceError:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error: { type: string, example: "a concurrent registration claimed this version — re-read the latest version and retry" }
 
     EnvelopeError:
       type: object

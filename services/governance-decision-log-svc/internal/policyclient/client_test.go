@@ -6,6 +6,8 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	idenv "zoiko.io/identity-envelope"
+
 	svcenvelope "zoiko.io/governance-decision-log-svc/internal/envelope"
 	"zoiko.io/governance-decision-log-svc/internal/policyclient"
 )
@@ -39,5 +41,25 @@ func TestGetPolicyVersion_ForwardsTheEnvelopeAndPinsTheTenant(t *testing.T) {
 		if got.Get(header) != want {
 			t.Errorf("%s = %q, want %q", header, got.Get(header), want)
 		}
+	}
+}
+
+// P-12: the replay's lookup carries the verified identity envelope, so
+// policy-svc's identity gate can verify who asked instead of trusting the
+// asserted X-Principal-Id.
+func TestGetPolicyVersion_ForwardsTheVerifiedEnvelope(t *testing.T) {
+	var got http.Header
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+		_, _ = w.Write([]byte(`{"policy_version_id":"pv-1","rule_payload":{}}`))
+	}))
+	defer srv.Close()
+
+	ctx := idenv.WithIdentity(context.Background(), &idenv.Identity{Basis: idenv.BasisEnvelope, PrincipalID: "auditor-1", TenantID: "t-1", Token: "signed.envelope.jwt"})
+	if _, err := policyclient.NewHTTPClient(srv.URL).GetPolicyVersion(ctx, "t-1", "pv-1"); err != nil {
+		t.Fatal(err)
+	}
+	if got.Get("Authorization") != "Bearer signed.envelope.jwt" {
+		t.Fatalf("Authorization = %q, want the caller's envelope", got.Get("Authorization"))
 	}
 }

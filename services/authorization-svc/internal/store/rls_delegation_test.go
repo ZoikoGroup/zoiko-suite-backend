@@ -522,3 +522,61 @@ func TestPgStore_ProjectDelegation_VersionGuardAndCeiling(t *testing.T) {
 		t.Fatalf("a stale replayed suspension ended a resumed delegation: %v", actions)
 	}
 }
+
+// FindDelegationFrom answers "does the delegate hold this action FROM this
+// delegator", under the ordinary role, and returns that delegation's id. Two
+// delegators cover one assistant: each question answers for its own
+// delegator only, and a revoked delegation stops answering at once.
+func TestPgStore_RLS_FindDelegationFrom_AnswersForTheNamedDelegator(t *testing.T) {
+	admin := getTestPool(t)
+	defer admin.Close()
+	setupTestDB(t, admin)
+
+	adminStore := store.New(admin, zap.NewNop())
+	ctx := context.Background()
+
+	const tenantID = "00000000-0000-0000-0000-0000000000a1"
+	legalEntityID := "00000000-0000-0000-0000-0000000000e1"
+
+	setupRoleWithGrant(t, adminStore, tenantID, "boss-1", legalEntityID, "FINANCE_APPROVER", []string{"PAYMENT_APPROVE"})
+	setupRoleWithGrant(t, adminStore, tenantID, "boss-2", legalEntityID, "FINANCE_APPROVER_2", []string{"PAYMENT_APPROVE"})
+	var ids []string
+	for _, delegator := range []string{"boss-1", "boss-2"} {
+		d, err := adminStore.CreateDelegatedAuthority(ctx, domain.CreateDelegatedAuthorityParams{
+			TenantID:             tenantID,
+			DelegatorPrincipalID: delegator, DelegatePrincipalID: "assistant-1", ScopeType: "FULL",
+			LegalEntityID: &legalEntityID, EffectiveFrom: time.Now().Add(-time.Hour),
+		})
+		if err != nil {
+			t.Fatalf("create delegation from %s: %v", delegator, err)
+		}
+		ids = append(ids, d.DelegatedAuthorityID)
+	}
+
+	rlsPool := getRLSPool(t, admin)
+	defer rlsPool.Close()
+	rlsStore := store.New(rlsPool, zap.NewNop())
+
+	for i, delegator := range []string{"boss-1", "boss-2"} {
+		got, err := rlsStore.FindDelegationFrom(ctx, "assistant-1", delegator, legalEntityID, tenantID, "PAYMENT_APPROVE")
+		if err != nil {
+			t.Fatalf("%s: %v", delegator, err)
+		}
+		if got != ids[i] {
+			t.Errorf("delegation from %s = %q, want %q", delegator, got, ids[i])
+		}
+	}
+	if got, _ := rlsStore.FindDelegationFrom(ctx, "assistant-1", "boss-3", legalEntityID, tenantID, "PAYMENT_APPROVE"); got != "" {
+		t.Errorf("a delegator who delegated nothing answered %q", got)
+	}
+	if got, _ := rlsStore.FindDelegationFrom(ctx, "assistant-1", "boss-1", legalEntityID, "00000000-0000-0000-0000-0000000000b2", "PAYMENT_APPROVE"); got != "" {
+		t.Errorf("another tenant's question answered %q", got)
+	}
+
+	if _, err := adminStore.RevokeDelegatedAuthority(ctx, ids[1], tenantID); err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+	if got, _ := rlsStore.FindDelegationFrom(ctx, "assistant-1", "boss-2", legalEntityID, tenantID, "PAYMENT_APPROVE"); got != "" {
+		t.Errorf("a revoked delegation still answered %q", got)
+	}
+}

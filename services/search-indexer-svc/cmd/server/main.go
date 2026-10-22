@@ -54,6 +54,7 @@ import (
 	"github.com/riandyrn/otelchi"
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
+	idenv "zoiko.io/identity-envelope"
 
 	"zoiko.io/search-client/searchclient"
 	"zoiko.io/search-indexer-svc/internal/authz"
@@ -307,13 +308,26 @@ func run(log *zap.Logger) error {
 		MaxResultWindow:  cfg.MaxResultWindow,
 	})
 
+	// Identity gate (X5 / X-R3, decision 21 Oct 2026): identity-context-svc's
+	// signed envelope is verified (JWKS) with its session status (AU-01), and
+	// its claims become the only source of X-Principal-Id / X-Tenant-Id; a peer
+	// over verified mTLS may vouch for them instead. Until now this service took
+	// those headers as sent. IDENTITY_VERIFY: require (default outside local) | warn.
+	gate, gateSettings, err := idenv.NewGateFromEnv("search-indexer-svc", log, idenv.EnvOptions{DefaultPeers: nil})
+	if err != nil {
+		log.Fatal("identity gate configuration refused", zap.Error(err))
+	}
+	log.Info("identity gate", gateSettings.Fields()...)
+
 	r := chi.NewRouter()
+	r.Use(idenv.RequestID)
 	r.Use(chimiddleware.RequestID)
 	r.Use(chimiddleware.RealIP)
 	r.Use(chimiddleware.Recoverer)
 	r.Use(otelchi.Middleware(serviceName, otelchi.WithChiRoutes(r)))
 	r.Use(metrics.HTTPMiddleware)
 	r.Use(correlationID)
+	r.Use(gate.Middleware)
 
 	// Probes and metrics are mounted BEFORE the envelope middleware. A
 	// liveness probe cannot carry a tenant or an actor, and gating it on the
@@ -421,12 +435,11 @@ func checkAliasDrift(ctx context.Context, st store.Store, engine searchclient.En
 // correlationID ensures every request carries one and echoes it back.
 func correlationID(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		id := r.Header.Get("X-Correlation-ID")
-		if id == "" {
-			id = chimiddleware.GetReqID(r.Context())
-			r.Header.Set("X-Correlation-ID", id)
+		// Echoed, never invented: a correlation id made up here, before the
+		// input contract can refuse a request without one, traces nothing.
+		if id := r.Header.Get("X-Correlation-ID"); id != "" {
+			w.Header().Set("X-Correlation-ID", id)
 		}
-		w.Header().Set("X-Correlation-ID", id)
 		next.ServeHTTP(w, r)
 	})
 }

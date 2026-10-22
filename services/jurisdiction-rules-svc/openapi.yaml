@@ -2420,14 +2420,18 @@ components:
       properties:
         action_type:
           type: string
-          description: The action being validated, e.g., "tax.calculate", "payroll.run".
+          pattern: '^[^.]+\.[^.].*$'
+          description: |
+            The rule the action rests on, as `<rule_domain>.<rule_code>`, matched
+            exactly (decision 21 Oct 2026), e.g. `TAX.STD`. Authorized as
+            JURISDICTION_RULE_VALIDATE.
         jurisdiction_id:
           type: string
           format: uuid
           description: The jurisdiction context for the action.
         entity_type:
           type: string
-          description: The entity type the action applies to, e.g., "COMPANY", "EMPLOYEE".
+          description: The entity type the action applies to, e.g., "COMPANY", "EMPLOYEE". Echoed for the caller's record; rules carry no entity-type applicability.
         effective_at:
           type: [string, "null"]
           format: date-time
@@ -2450,6 +2454,12 @@ components:
           type: array
           items: { type: string, format: uuid }
           description: The jurisdiction chain the pack was assembled from.
+        pack_digest:
+          type: string
+          description: Pins the rule basis (the resolved pack); record it with the action.
+        action_type: { type: string }
+        entity_type: { type: string }
+        effective_at: { type: string, format: date-time }
 
     ValidateActionConflictResponse:
       type: object
@@ -2470,6 +2480,9 @@ components:
           type: array
           items: { type: string }
           description: Present when detail=insufficient. List of (rule_domain, rule_code) pairs with no rule.
+        pack_digest: { type: string }
+        action_type: { type: string }
+        entity_type: { type: string }
 
     EventEnvelope:
       type: object

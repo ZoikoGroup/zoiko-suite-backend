@@ -24,12 +24,22 @@ import (
 // below came to exist in the first place.
 
 const (
-	EventContextResolved   = "identity.context.resolved"
-	EventResolutionFailed  = "identity.context.resolution_failed"
-	EventSessionInvalidated = "session.invalidated"
-	EventPrincipalStatusChanged = "principal.status.changed"
+	EventContextResolved         = "identity.context.resolved"
+	EventResolutionFailed        = "identity.context.resolution_failed"
+	EventSessionInvalidated      = "session.invalidated"
+	EventPrincipalStatusChanged  = "principal.status.changed"
 	EventAuthenticationSucceeded = "identity.authentication.succeeded"
 	EventAuthenticationFailed    = "identity.authentication.failed"
+
+	// The TOTP second factor (migration 000012). Enrolment, revocation and
+	// reset commit through the outbox with the row change; a step-up success
+	// commits with the accepted code. Doc 05 §13.2 names "MFA/step-up events"
+	// a required SIEM signal, so failures are also streamed.
+	EventMFAFactorEnrolled = "identity.mfa_factor.enrolled"
+	EventMFAFactorRevoked  = "identity.mfa_factor.revoked"
+	EventMFAFactorReset    = "identity.mfa_factor.reset"
+	EventStepUpSucceeded   = "identity.step_up.succeeded"
+	EventStepUpFailed      = "identity.step_up.failed"
 
 	// EventRiskSignalUnavailable replaces the "session.risk.changed" this
 	// service used to publish when its risk cache missed.
@@ -81,6 +91,39 @@ const (
 	// contract names DispositionFailed; a legal hold is not a failure, so this
 	// is a distinct name rather than a misuse of that one.
 	EventDispositionBlocked = "identity.retention.disposition_blocked"
+
+	// ── ZS-IAM-001 §23 canonical names (AU-25) ───────────────────────────────
+	//
+	// §23 names identity.session.revoked / identity.subject.*, while this
+	// service has published session.invalidated / principal.status.changed
+	// since before the standard, and authorization-svc and the gateway
+	// consume those. Both are now emitted: the legacy name for existing
+	// consumers, the canonical one for every new consumer. The legacy names
+	// retire when the consumer register shows no subscriber.
+	EventSessionRevoked    = "identity.session.revoked"
+	EventSubjectCreated    = "identity.subject.created"
+	EventSubjectDisabled   = "identity.subject.disabled"
+	EventSubjectEnabled    = "identity.subject.enabled"
+	EventSCIMSyncCompleted = "identity.scim_sync.completed"
+
+	// ── Auth plane closure (15 Oct 2026) ─────────────────────────────────────
+	EventLoginSessionStarted   = "identity.login_session.started"
+	EventLoginSessionEnded     = "identity.login_session.ended"
+	EventRefreshReuseDetected  = "identity.refresh_token.reuse_detected"
+	EventAuthCodeReplayed      = "identity.authorization_code.replayed"
+	EventLoginThrottled        = "identity.authentication.throttled"
+	EventPasswordChanged       = "identity.password.changed"
+	EventPasswordResetRequest  = "identity.password_reset.requested"
+	EventPasswordResetDecided  = "identity.password_reset.decided"
+	EventSubjectInvited        = "identity.subject.invited"
+	EventIdPRegistered         = "identity.idp.registered"
+	EventIdPStatusChanged      = "identity.idp.status_changed"
+	EventFederatedLogin        = "identity.federation.login"
+	EventGroupMappingProposed  = "identity.group_role_mapping.proposed"
+	EventGroupMappingDecided   = "identity.group_role_mapping.decided"
+	EventGroupMembershipChange = "identity.group.membership_changed"
+	EventSCIMConnectionCreated = "identity.scim_connection.created"
+	EventTokenExchanged        = "identity.token.exchanged"
 )
 
 // SourceServiceName is stamped on every envelope this service emits, and is
@@ -220,12 +263,21 @@ func (p *Publisher) PublishSessionInvalidated(
 	reason domain.InvalidationReason,
 	correlationID string,
 ) error {
-	return p.emit(ctx, EventSessionInvalidated, "", "", principalID, correlationID, sessionContextID, map[string]any{
+	payload := map[string]any{
 		"session_context_id":  sessionContextID,
 		"principal_id":        principalID,
 		"invalidation_reason": reason,
 		"correlation_id":      correlationID,
-	})
+	}
+	// ZS-IAM-001 §23 canonical name. The legacy session.invalidated name
+	// retired once all consumers subscribed to identity.session.revoked.
+	return p.emit(ctx, EventSessionRevoked, "", "", principalID, correlationID, sessionContextID, payload)
+}
+
+// Emit renders and enqueues any event (the auth-plane services use it for
+// events that have no dedicated method).
+func (p *Publisher) Emit(ctx context.Context, eventType, tenantID, actorID, correlationID, key string, payload map[string]any) error {
+	return p.emit(ctx, eventType, tenantID, "", actorID, correlationID, key, payload)
 }
 
 // PublishRiskSignalUnavailable raises the alarm that the risk cache had no
@@ -250,13 +302,22 @@ func (p *Publisher) PublishPrincipalStatusChanged(
 	newStatus domain.PrincipalStatus,
 	actorID, correlationID string,
 ) error {
-	return p.emit(ctx, EventPrincipalStatusChanged, tenantID, "", actorID, correlationID, principalID, map[string]any{
+	payload := map[string]any{
 		"principal_id":   principalID,
 		"tenant_id":      tenantID,
 		"new_status":     string(newStatus),
 		"actor":          actorID,
 		"correlation_id": correlationID,
-	})
+	}
+	// ZS-IAM-001 canonical names. The legacy principal.status.changed name
+	// retired once all consumers subscribed to identity.subject.*.
+	switch newStatus {
+	case domain.PrincipalStatusDisabled, domain.PrincipalStatusSuspended:
+		return p.emit(ctx, EventSubjectDisabled, tenantID, "", actorID, correlationID, principalID, payload)
+	case domain.PrincipalStatusActive:
+		return p.emit(ctx, EventSubjectEnabled, tenantID, "", actorID, correlationID, principalID, payload)
+	}
+	return nil
 }
 
 // PublishAuthenticationSucceeded records that a human proved possession of a
@@ -296,6 +357,23 @@ func (p *Publisher) PublishAuthenticationFailed(
 		"principal_id":    principalID,
 		"tenant_id":       tenantID,
 		"credential_type": "PASSWORD",
+		"failure_reason":  reason,
+		"correlation_id":  correlationID,
+	})
+}
+
+// PublishStepUpFailed records a refused second-factor attempt (a wrong,
+// replayed or locked code). reason is the internal basis, as for
+// PublishAuthenticationFailed: on the event, never on the wire.
+func (p *Publisher) PublishStepUpFailed(
+	ctx context.Context,
+	principalID, tenantID, correlationID, action, reason string,
+) error {
+	return p.emit(ctx, EventStepUpFailed, tenantID, "", principalID, correlationID, principalID, map[string]any{
+		"principal_id":    principalID,
+		"tenant_id":       tenantID,
+		"credential_type": "TOTP",
+		"action":          action,
 		"failure_reason":  reason,
 		"correlation_id":  correlationID,
 	})

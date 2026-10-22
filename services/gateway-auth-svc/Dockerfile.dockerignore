@@ -1,0 +1,13 @@
+# Used by BuildKit for builds with -f services/gateway-auth-svc/Dockerfile.
+# The context is the repository root (see the Dockerfile), so everything is
+# excluded except the modules the image is built from.
+*
+!services/gateway-auth-svc/
+!services/identity-envelope/
+
+# Not needed inside the image.
+services/gateway-auth-svc/.gotmp/
+services/gateway-auth-svc/**/*.exe
+services/gateway-auth-svc/**/*_test.go
+services/gateway-auth-svc/deployments/
+services/identity-envelope/**/*_test.go

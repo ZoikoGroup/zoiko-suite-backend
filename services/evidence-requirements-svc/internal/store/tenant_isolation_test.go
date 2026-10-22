@@ -398,7 +398,7 @@ func TestPgStore_EffectiveRequirements_ExcludesRetired(t *testing.T) {
 }
 
 // Idempotency is enforced by the database, not by convention.
-func TestPgStore_CreateRequirement_IdempotentOnCorrelationID(t *testing.T) {
+func TestPgStore_CreateRequirement_IsIdempotentByKey(t *testing.T) {
 	ctx := context.Background()
 	tenantID := uuid.New().String()
 	entityID := uuid.New().String()
@@ -416,6 +416,7 @@ func TestPgStore_CreateRequirement_IdempotentOnCorrelationID(t *testing.T) {
 			EffectiveFrom:         time.Now().UTC(),
 			CreatedByPrincipalID:  "admin",
 			CorrelationID:         "corr-idem-1",
+			IdempotencyKey:        "idem-req-replay",
 		}
 	}
 
@@ -425,7 +426,7 @@ func TestPgStore_CreateRequirement_IdempotentOnCorrelationID(t *testing.T) {
 	require.True(t, created)
 
 	// Replay with a DIFFERENT generated primary key but the same
-	// correlation_id: must return the original row, not mint a second.
+	// idempotency key: must return the original row, not mint a second.
 	second := mk()
 	created, err = testStore.CreateRequirement(tctx, second)
 	require.NoError(t, err)
@@ -473,7 +474,7 @@ func TestPgStore_TenantIsolation_GetEvaluation(t *testing.T) {
 
 // A replayed evaluation must return the ORIGINAL determination — the handler
 // relies on created=false to decide not to republish its Kafka event.
-func TestPgStore_RecordEvaluation_IdempotentOnCorrelationID(t *testing.T) {
+func TestPgStore_RecordEvaluation_IsIdempotentByKey(t *testing.T) {
 	ctx := context.Background()
 	tenantID := uuid.New().String()
 	entityID := uuid.New().String()
@@ -491,6 +492,7 @@ func TestPgStore_RecordEvaluation_IdempotentOnCorrelationID(t *testing.T) {
 			PresentArtifactsPayload: json.RawMessage(`[]`),
 			EvaluatedForPrincipalID: "admin",
 			CorrelationID:           "corr-eval-idem",
+			IdempotencyKey:          "idem-eval-replay",
 		}
 	}
 
