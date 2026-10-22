@@ -33,6 +33,8 @@ type ReconciliationRun struct {
 	PolicyVersion          *int                    `json:"policy_version,omitempty"`
 	MaxUnmatchedCount      int                     `json:"max_unmatched_count"`
 	MaxUnmatchedPct        float64                 `json:"max_unmatched_pct"`
+	MaxUnresolvedAmount    float64                 `json:"max_unresolved_amount"`
+	PolicyCurrency         string                  `json:"policy_currency,omitempty"`
 	PopulationID           *string                 `json:"population_id,omitempty"`
 	PopulationVersion      int                     `json:"population_version"`
 	CertifiedByPrincipalID *string                 `json:"certified_by_principal_id,omitempty"`
@@ -172,6 +174,21 @@ type RunAutomaticMatchingResponse struct {
 	Results      []AutoMatchResult `json:"results"`
 }
 
+// CheckCertifierIndependence applies the run-level segregation-of-duties rule:
+// a certifier must be independent of everyone who prepared the run — started
+// it, froze its population, proposed or performed a match in it, or
+// reperformed it. preparers is the complete set, not only the last actor, so a
+// trivial final step by someone else does not clear the way for the original
+// preparer. Mirrors reconciliation-engine-svc's CheckCertifierIndependence.
+func CheckCertifierIndependence(actor string, preparers []string) error {
+	for _, p := range preparers {
+		if p != "" && actor == p {
+			return ErrRunSelfCertificationForbidden
+		}
+	}
+	return nil
+}
+
 // Sentinel errors for the run model.
 var (
 	ErrRunNotFound                 = errorString("reconciliation run not found")
@@ -186,17 +203,23 @@ var (
 	ErrPopulationNotFound          = errorString("population snapshot not found")
 	ErrMaterialResidualBlocked     = errorString("material unmatched residual exceeds policy threshold")
 	// ErrRunSelfCertificationForbidden is the run-level SoD rule: a
-	// principal who matched (or confirmed) any MATCHED line in the
-	// frozen population cannot also certify the run — mirrors the
-	// line-level ConfirmMatch self-confirmation block, applied at the
-	// run/certification level.
-	ErrRunSelfCertificationForbidden = errorString("the certifying principal matched at least one line in this population and cannot also certify the run")
+	// principal who prepared the run — created it, froze its population,
+	// proposed or performed a match in it, or reperformed it — cannot also
+	// certify it. Mirrors the line-level ConfirmMatch self-confirmation
+	// block, applied at the run/certification level.
+	ErrRunSelfCertificationForbidden = errorString("the certifying principal prepared this reconciliation and cannot also certify it")
+
+	// ErrUnresolvedExposureUnassessable means the run has unresolved lines in
+	// a currency other than the one its pinned policy is denominated in.
+	// Without an FX basis the service cannot say whether the exposure is
+	// within tolerance, so it refuses to certify rather than assume it is.
+	ErrUnresolvedExposureUnassessable = errorString("unresolved items include a currency the run's pinned policy does not cover")
 
 	// ErrPeriodLocked/ErrCloseServiceUnavailable back CertifyRun's Wave 13
 	// closed-period check (internal/close's client) — certification must
 	// fail closed on either: a CLOSED/LOCKED period, or an unreachable/
 	// ambiguous financial-close-svc response.
-	ErrPeriodLocked          = errorString("the accounting period for this run's statement date is closed or locked")
+	ErrPeriodLocked            = errorString("the accounting period for this run's statement date is closed or locked")
 	ErrCloseServiceUnavailable = errorString("financial-close-svc unavailable")
 )
 

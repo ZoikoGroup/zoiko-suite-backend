@@ -1227,6 +1227,35 @@ func TestBindPolicy_Success_Returns200(t *testing.T) {
 	}
 }
 
+// Freezing a population decides what will be certified, and binding a policy
+// pins the thresholds it will be certified against. Both are run commands and
+// must be authorized as such; they previously accepted any principal.
+func TestFreezePopulation_AuthorizationDenied_Returns403(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{err: domain.ErrAuthorizationDenied}, &stubLedger{})
+	rec := doRequest(r, http.MethodPost, "/v1/reconciliation-runs/run-1/freeze", nil, "principal-1")
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 when BANKREC_RUN is denied, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestBindPolicy_AuthorizationDenied_Returns403(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{err: domain.ErrAuthorizationDenied}, &stubLedger{})
+	rec := doRequest(r, http.MethodPost, "/v1/reconciliation-runs/run-1/bind-policy", map[string]string{"policy_id": "pol-1"}, "principal-1")
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 when BANKREC_RUN is denied, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestCertifyRun_UnresolvedExposureUnassessable_Returns422(t *testing.T) {
+	s := newStubStore()
+	s.certifyRunErr = domain.ErrUnresolvedExposureUnassessable
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubLedger{})
+	rec := doRequest(r, http.MethodPost, "/v1/reconciliation-runs/run-1/certify", nil, "principal-1")
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 when unresolved exposure is in an unassessable currency, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
 // ── BNK-05 backlog: reconciliation policies ─────────────────────────────────
 
 func TestCreatePolicy_MissingFields_Returns400(t *testing.T) {
