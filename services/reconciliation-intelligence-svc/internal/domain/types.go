@@ -161,8 +161,12 @@ type ReconciliationSuggestion struct {
 	Recommendation   ResolutionRecommendation `json:"recommendation"`
 	SuggestionStatus SuggestionStatus         `json:"suggestion_status"`
 	ResolutionNotes  string                   `json:"resolution_notes,omitempty"`
-	CreatedAt        time.Time                `json:"created_at"`
-	UpdatedAt        time.Time                `json:"updated_at"`
+	// AuthoritativeRef is the owning domain's record that carried out an
+	// EXECUTED suggestion (A5). Set only on EXECUTED, and always on an
+	// EXECUTED WRITE_OFF or TIMING_ADJUSTMENT executed after migration 000007.
+	AuthoritativeRef *AuthoritativeRef `json:"authoritative_ref,omitempty"`
+	CreatedAt        time.Time         `json:"created_at"`
+	UpdatedAt        time.Time         `json:"updated_at"`
 }
 
 // MarshalJSON emits the canonical field names and, for one release, the
@@ -197,6 +201,9 @@ type AnalyzeReconciliationRequest struct {
 type ApplyResolutionRequest struct {
 	SuggestionStatus SuggestionStatus `json:"suggestion_status"` // APPROVED, REJECTED, EXECUTED
 	ResolutionNotes  string           `json:"resolution_notes"`
+	// AuthoritativeRef accompanies EXECUTED only; see ValidateExecutionRef
+	// for when it is required.
+	AuthoritativeRef *AuthoritativeRef `json:"authoritative_ref,omitempty"`
 }
 
 // UnmarshalJSON accepts the canonical suggestion_status and, for one release,
@@ -204,9 +211,10 @@ type ApplyResolutionRequest struct {
 // different values is refused rather than having one silently chosen.
 func (r *ApplyResolutionRequest) UnmarshalJSON(data []byte) error {
 	var wire struct {
-		SuggestionStatus SuggestionStatus `json:"suggestion_status"`
-		ResolutionStatus SuggestionStatus `json:"resolution_status"`
-		ResolutionNotes  string           `json:"resolution_notes"`
+		SuggestionStatus SuggestionStatus  `json:"suggestion_status"`
+		ResolutionStatus SuggestionStatus  `json:"resolution_status"`
+		ResolutionNotes  string            `json:"resolution_notes"`
+		AuthoritativeRef *AuthoritativeRef `json:"authoritative_ref"`
 	}
 	if err := json.Unmarshal(data, &wire); err != nil {
 		return err
@@ -219,6 +227,7 @@ func (r *ApplyResolutionRequest) UnmarshalJSON(data []byte) error {
 		r.SuggestionStatus = wire.ResolutionStatus
 	}
 	r.ResolutionNotes = wire.ResolutionNotes
+	r.AuthoritativeRef = wire.AuthoritativeRef
 	return nil
 }
 

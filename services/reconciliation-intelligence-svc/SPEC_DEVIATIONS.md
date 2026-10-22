@@ -25,7 +25,7 @@ candidate match against a counterpart record (A2a; duplicate-entry detection
 within a run is done, A2), which is the other half of what the data model and the
 ownership table say it is for. Two defects were fixed in this pass (B1, B2);
 a later pass closed A7 and the decimal half of A4; a third closed A1, A3 and
-A6; the latest closes A8 and A9.
+A6; a fourth closed A8 and A9; the latest closes A5.
 
 ## A. Not implemented / weaker than the spec
 
@@ -141,13 +141,28 @@ A6; the latest closes A8 and A9.
   Since A1 the source line does have one (bank-reconciliation-svc's
   `currency_code`); it is read but not yet stored or compared.
 - **A5. `WRITE_OFF` and `TIMING_ADJUSTMENT` are accounting actions, and
-  `EXECUTED` has no reference.** The service recommends them, which is
-  allowed (advisory), but marking a suggestion `EXECUTED` records no
-  reference to the authoritative command that did it (journal id, adjustment
-  id). ZS-CONTROL-001 §21/§24 require remediation to reference the owning
-  domain's command, never free text. Scope: require an `authoritative_ref` on
-  `EXECUTED`, or drop `EXECUTED` and let the owning domain's event close the
-  suggestion.
+  `EXECUTED` has no reference.** — Closed (B6). The service recommends them,
+  which is allowed (advisory), but marking a suggestion `EXECUTED` recorded no
+  reference to the authoritative command that did it, only free text in
+  `resolution_notes`. ZS-CONTROL-001 requires the RemediationAction to carry
+  an "authoritative command reference", and its evidence standard says
+  "Journal/reversal/adjustment/credit/debit note IDs; control does not embed
+  authoritative correction as free text". `POST …/apply` now takes a
+  structured `authoritative_ref`, `{"kind":"GL_JOURNAL","journal_id":"<uuid>"}`:
+  the general-ledger-svc journal that posted the correction. Marking a
+  `WRITE_OFF` or `TIMING_ADJUSTMENT` `EXECUTED` without one is 400, and the
+  suggestion stays `APPROVED`. A note is not accepted in its place. A
+  reference that is malformed, or sent with any decision other than
+  `EXECUTED`, is also 400. Migration 000007 stores it in two columns, and the
+  database refuses an `EXECUTED` accounting action without one. The reference
+  is returned on the suggestion and carried on the
+  `reconciliation.resolution_recommended` event. `EXECUTED` is kept: the
+  doc's other option, dropping it and letting the owning domain's event close
+  the suggestion, is a larger change than this gap needs.
+  *Still open:* the reference is caller-asserted. Its shape is checked, but
+  general-ledger-svc is not asked whether the journal exists, is posted, or
+  belongs to the suggestion's entity (B6). Suggestions `EXECUTED` before
+  000007 carry no reference, and none is reconstructed.
 - **A6. Reads are not authorized** (closed). `GET /v1/reconciliations` and
   `GET /v1/reconciliations/{id}` checked only the tenant (RLS); any principal
   of the tenant could read every legal entity's jobs and items. Both now
@@ -250,3 +265,46 @@ A6; the latest closes A8 and A9.
   in-repo consumer of the old names is the Postman collection, whose apply
   request still sends `resolution_status`, so it exercises the alias rather
   than a hard break.
+- **B6. A5's reference is a ledger journal id, asserted by the caller, and
+  required only for accounting actions.**
+  1. *One shape, `journal_id`.* Both `WRITE_OFF` and `TIMING_ADJUSTMENT` of a
+     bank reconciling item are postings to the entity's own books.
+     general-ledger-svc is the only service that posts them, and it returns
+     the same identifier for every journal it posts: the UUID `journal_id`.
+     That covers its ADJUSTMENT, ACCRUAL, REVERSAL and STANDARD journals, so
+     a reversal is a journal id as well. Nothing that owns a bank line issues
+     an `adjustment_id`. bank-reconciliation-svc has no write-off or
+     adjustment command. consolidation-svc's `adjustment_id` is for
+     consolidation-only adjustments, which never touch an entity's books, and
+     accounts-receivable-svc's is for receivables. The reference still
+     carries `kind` (only `GL_JOURNAL` today), so another owning domain's
+     command can be added without changing what is stored.
+  2. *Which recommendations need one.* `WRITE_OFF` and `TIMING_ADJUSTMENT`
+     must have one. `MANUAL_REVIEW` may have one, because a review can end in
+     a journal or in nothing to post. `CONFIRM_DUPLICATE` and `AUTO_MATCH`
+     refuse one, because they are carried out in bank-reconciliation-svc, not
+     the ledger. bank-reconciliation-svc has no command that removes a
+     duplicate line, so those two still reach `EXECUTED` with no reference;
+     there is nothing yet for them to name.
+  3. *Asserted, not verified.* Nothing else in the apply request is checked
+     against another service: the status is checked against the allowed
+     decisions, and the note is free text. The only outside call is the
+     authorization check. The reference follows the same rule. It must be
+     whole, of a known kind, and a UUID, which is canonicalized. Whether it
+     is required depends on the suggestion's recommendation, which the store
+     reads from the row it already locks. So a decision adds no query and no
+     outside call, on a path every decision takes. Verifying it would need a
+     call to general-ledger-svc for each `EXECUTED` decision, made
+     before the row is locked. That call would return the journal's status
+     and legal entity.
+  4. *Database.* Two CHECKs in migration 000007 enforce this:
+     - `reconciliation_suggestion_authoritative_ref_check`: a reference is
+       whole or absent, is `GL_JOURNAL`, is recorded only on `EXECUTED`, and
+       only on `WRITE_OFF`, `TIMING_ADJUSTMENT` or `MANUAL_REVIEW`.
+     - `reconciliation_suggestion_accounting_execution_check`: an `EXECUTED`
+       `WRITE_OFF` or `TIMING_ADJUSTMENT` has a reference. It is `NOT VALID`,
+       so rows `EXECUTED` before 000007 stay as they are, and every new write
+       is held to it.
+
+     The down migration refuses, with "cannot roll back 000007: recorded
+     authoritative references exist", while any reference is recorded.

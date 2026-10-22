@@ -265,6 +265,10 @@ func (h *Handler) ApplyResolution(w http.ResponseWriter, r *http.Request) {
 		h.respondError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if err := domain.ValidateAuthoritativeRef(req.SuggestionStatus, req.AuthoritativeRef); err != nil {
+		h.respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	job, err := h.store.GetJobByID(r.Context(), tenantID, jobID)
 	if err != nil {
@@ -282,9 +286,15 @@ func (h *Handler) ApplyResolution(w http.ResponseWriter, r *http.Request) {
 	}
 
 	item, err := h.store.ApplyResolution(r.Context(), tenantID, jobID, itemID, req.SuggestionStatus, req.ResolutionNotes,
-		job.LegalEntityID, principalID, r.Header.Get("X-Correlation-ID"))
+		req.AuthoritativeRef, job.LegalEntityID, principalID, r.Header.Get("X-Correlation-ID"))
 	if errors.Is(err, domain.ErrResolutionTransition) {
 		h.respondError(w, http.StatusConflict, err.Error())
+		return
+	}
+	// Whether a reference is required depends on the suggestion's
+	// recommendation, which the store reads with the row it locks.
+	if errors.Is(err, domain.ErrAuthoritativeRefRequired) || errors.Is(err, domain.ErrInvalidAuthoritativeRef) {
+		h.respondError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if err != nil {
