@@ -1,11 +1,13 @@
 package handler
 
 import (
+	"context"
 	"crypto/subtle"
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"time"
@@ -654,15 +656,12 @@ func (h *Handler) SignCSR(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if !h.authorize(w, r, principalID, tenantID, MtlsCertProvision) {
-		return
-	}
 
 	var req struct {
-		CSR            string `json:"csr"`
-		RotationDays   int    `json:"rotation_days"`
-		ServiceName    string `json:"service_name"`
-		LegalEntityID  string `json:"legal_entity_id"`
+		CSR           string `json:"csr"`
+		RotationDays  int    `json:"rotation_days"`
+		ServiceName   string `json:"service_name"`
+		LegalEntityID string `json:"legal_entity_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.errJSON(w, 400, "invalid body")
@@ -674,6 +673,14 @@ func (h *Handler) SignCSR(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.ServiceName == "" {
 		h.errJSON(w, 400, "service_name is required")
+		return
+	}
+	if req.LegalEntityID == "" {
+		h.errJSON(w, 400, "legal_entity_id is required")
+		return
+	}
+	// Same decision as ProvisionCert: at the legal entity the certificate is for.
+	if !h.authorize(w, r, principalID, req.LegalEntityID, MtlsCertProvision) {
 		return
 	}
 	if req.RotationDays <= 0 {
@@ -775,14 +782,8 @@ func (h *Handler) SignCSR(w http.ResponseWriter, r *http.Request) {
 
 	// Return only the certificate (no private key)
 	h.okJSON(w, 201, domain.ProvisionCertResult{
-		Certificate:   domain.MtlsCertificate{ // Certificate only, no private key
-			CertificatePEM: string(issued.CertificatePEM),
-			SerialNumber:   issued.SerialNumber,
-			Fingerprint:    issued.Fingerprint,
-			NotBefore:      issued.NotBefore,
-			NotAfter:       issued.NotAfter,
-			CACertPEM:      string(h.ca.CertificatePEM()),
-		},
+		Certificate: *cert,
+		CACertPEM:   string(h.ca.CertificatePEM()),
 	})
 }
 

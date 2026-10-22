@@ -295,14 +295,14 @@ func (c *CA) SignCSR(csr *x509.CertificateRequest, validFor time.Duration) (*Iss
 	notAfter := now.Add(validFor)
 
 	template := &x509.Certificate{
-		SerialNumber: serial,
-		Subject:      csr.Subject,
-		DNSNames:     csr.DNSNames,
-		URIs:         csr.URIs,
-		NotBefore:    notBefore,
-		NotAfter:     notAfter,
-		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		SerialNumber:          serial,
+		Subject:               csr.Subject,
+		DNSNames:              csr.DNSNames,
+		URIs:                  csr.URIs,
+		NotBefore:             notBefore,
+		NotAfter:              notAfter,
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
 		BasicConstraintsValid: true,
 	}
 
