@@ -1785,12 +1785,14 @@ services:
   # error fails manifest generation entirely, never a silent partial manifest.
   # UPDATE: every requested WorkflowInstanceID now also pulls that instance's
   # real transition history from workflow-history-svc — closing the gap
-  # workflow-history-svc's own package doc named directly ("evidence-
+  # workflow-history-svc's earlier package doc named directly ("evidence-
   # manifest-svc currently... is NOT wired to this... endpoint"). Not a new
   # opt-in field: an instance's history is intrinsically part of its
-  # evidence. The cross-workflow query endpoint remains unwired — a
-  # separate, broader discovery surface this service has no request shape
-  # for yet.
+  # evidence. The cross-workflow query endpoint (GET /v1/workflows/history) is
+  # also wired: a request may supply workflow_history_from and
+  # workflow_history_to, and the aggregator then pulls every transition for
+  # the request's legal entity in that window
+  # (WorkflowHistoryClient.ListByEntityAndDateRange).
   evidence-manifest-svc:
     build:
       context: ../services/evidence-manifest-svc

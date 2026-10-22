@@ -56,27 +56,34 @@ func (s *PgStore) setRLS(ctx context.Context, tx pgx.Tx) error {
 }
 
 const threadColumns = `thread_id, tenant_id, legal_entity_id, linked_object_type, linked_object_id,
-	restricted, status, created_by, created_at, resolved_by, resolved_at, resolution_note`
+	restricted, status, created_by, created_at, resolved_by, resolved_at, resolution_note, classification`
 
 func scanThread(row pgx.Row) (*domain.CommentThread, error) {
 	t := &domain.CommentThread{}
+	var classification *string
 	err := row.Scan(&t.ThreadID, &t.TenantID, &t.LegalEntityID, &t.LinkedObjectType, &t.LinkedObjectID,
-		&t.Restricted, &t.Status, &t.CreatedBy, &t.CreatedAt, &t.ResolvedBy, &t.ResolvedAt, &t.ResolutionNote)
+		&t.Restricted, &t.Status, &t.CreatedBy, &t.CreatedAt, &t.ResolvedBy, &t.ResolvedAt, &t.ResolutionNote, &classification)
+	if classification != nil {
+		t.Classification = *classification
+	}
 	return t, err
 }
 
 const commentColumns = `comment_id, thread_id, tenant_id, parent_comment_id, current_version_id, status,
 	created_by, created_at, updated_at, moderated_at, moderated_by_principal_id, moderation_reason,
-	deleted_at, deleted_by_principal_id, deletion_reason`
+	deleted_at, deleted_by_principal_id, deletion_reason, classification`
 
 func scanComment(row pgx.Row) (*domain.Comment, error) {
 	c := &domain.Comment{}
-	var parentCommentID *string
+	var parentCommentID, classification *string
 	err := row.Scan(&c.CommentID, &c.ThreadID, &c.TenantID, &parentCommentID, &c.CurrentVersionID, &c.Status,
 		&c.CreatedBy, &c.CreatedAt, &c.UpdatedAt, &c.ModeratedAt, &c.ModeratedByPrincipalID, &c.ModerationReason,
-		&c.DeletedAt, &c.DeletedByPrincipalID, &c.DeletionReason)
+		&c.DeletedAt, &c.DeletedByPrincipalID, &c.DeletionReason, &classification)
 	if err != nil {
 		return nil, err
+	}
+	if classification != nil {
+		c.Classification = *classification
 	}
 	if parentCommentID != nil {
 		c.ParentCommentID = *parentCommentID
@@ -100,6 +107,9 @@ func (s *PgStore) AddComment(ctx context.Context, p domain.AddCommentParams) (*d
 	if p.Body == "" {
 		return nil, nil, domain.ErrEmptyBody
 	}
+	if p.Classification != "" && !domain.ValidClassification(p.Classification) {
+		return nil, nil, domain.ErrClassificationInvalid
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, nil, fmt.Errorf("begin tx: %w", err)
@@ -107,6 +117,11 @@ func (s *PgStore) AddComment(ctx context.Context, p domain.AddCommentParams) (*d
 	defer func() { _ = tx.Rollback(ctx) }()
 	if err := s.setRLS(ctx, tx); err != nil {
 		return nil, nil, err
+	}
+	if replay, err := idemClaim[addCommentResult](ctx, tx, p.TenantID, p.Idem); err != nil {
+		return nil, nil, err
+	} else if replay != nil {
+		return replay.Comment, replay.Thread, nil
 	}
 
 	thread, err := scanThread(tx.QueryRow(ctx, `
@@ -121,12 +136,25 @@ func (s *PgStore) AddComment(ctx context.Context, p domain.AddCommentParams) (*d
 		return nil, nil, err
 	}
 
+	if threadExists && thread.Restricted != p.Restricted {
+		return nil, nil, domain.ErrThreadRestrictionMismatch
+	}
+	// Classification (BIZ-09 required input, inherited lineage): a new thread
+	// must carry one; a comment on an existing thread inherits the thread's and
+	// may only restate it.
+	if threadExists && p.Classification != "" && p.Classification != thread.Classification {
+		return nil, nil, domain.ErrClassificationMismatch
+	}
+	if !threadExists && p.Classification == "" {
+		return nil, nil, domain.ErrClassificationRequired
+	}
+
 	if !threadExists {
 		threadID := "thread-" + uuid.New().String()
 		thread, err = scanThread(tx.QueryRow(ctx, `
-			INSERT INTO comment_threads (thread_id, tenant_id, legal_entity_id, linked_object_type, linked_object_id, restricted, created_by)
-			VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING `+threadColumns,
-			threadID, p.TenantID, p.LegalEntityID, p.LinkedObjectType, p.LinkedObjectID, p.Restricted, p.CreatedByPrincipalID))
+			INSERT INTO comment_threads (thread_id, tenant_id, legal_entity_id, linked_object_type, linked_object_id, restricted, created_by, classification)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING `+threadColumns,
+			threadID, p.TenantID, p.LegalEntityID, p.LinkedObjectType, p.LinkedObjectID, p.Restricted, p.CreatedByPrincipalID, p.Classification))
 		if err != nil {
 			return nil, nil, fmt.Errorf("insert comment_thread: %w", err)
 		}
@@ -161,14 +189,20 @@ func (s *PgStore) AddComment(ctx context.Context, p domain.AddCommentParams) (*d
 	if p.ParentCommentID != "" {
 		parentCommentID = p.ParentCommentID
 	}
+	// The comment inherits its thread's classification and keeps it as its own
+	// lineage snapshot. NULL (not recorded) for threads that predate it.
+	var inheritedClassification any
+	if thread.Classification != "" {
+		inheritedClassification = thread.Classification
+	}
 	// The comment row is inserted BEFORE its first version — comment_versions
 	// has an FK back to comments, so the comment must exist first.
 	// current_version_id is backfilled immediately after, in the same
 	// transaction, so no caller ever observes it unset.
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO comments (comment_id, thread_id, tenant_id, parent_comment_id, created_by)
-		VALUES ($1,$2,$3,$4,$5)
-	`, commentID, thread.ThreadID, p.TenantID, parentCommentID, p.CreatedByPrincipalID); err != nil {
+		INSERT INTO comments (comment_id, thread_id, tenant_id, parent_comment_id, created_by, classification)
+		VALUES ($1,$2,$3,$4,$5,$6)
+	`, commentID, thread.ThreadID, p.TenantID, parentCommentID, p.CreatedByPrincipalID, inheritedClassification); err != nil {
 		return nil, nil, fmt.Errorf("insert comment: %w", err)
 	}
 
@@ -187,6 +221,9 @@ func (s *PgStore) AddComment(ctx context.Context, p domain.AddCommentParams) (*d
 	}
 	comment.CurrentBody = p.Body
 
+	if err := idemRecord(ctx, tx, p.TenantID, p.Idem, addCommentResult{Comment: comment, Thread: thread}); err != nil {
+		return nil, nil, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, nil, err
 	}
@@ -207,6 +244,11 @@ func (s *PgStore) EditComment(ctx context.Context, p domain.EditCommentParams) (
 	defer func() { _ = tx.Rollback(ctx) }()
 	if err := s.setRLS(ctx, tx); err != nil {
 		return nil, err
+	}
+	if replay, err := idemClaim[domain.Comment](ctx, tx, p.TenantID, p.Idem); err != nil {
+		return nil, err
+	} else if replay != nil {
+		return replay, nil
 	}
 	current, err := scanComment(tx.QueryRow(ctx, `SELECT `+commentColumns+` FROM comments WHERE comment_id=$1 AND tenant_id=$2 FOR UPDATE`, p.CommentID, p.TenantID))
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -239,6 +281,9 @@ func (s *PgStore) EditComment(ctx context.Context, p domain.EditCommentParams) (
 		return nil, err
 	}
 	comment.CurrentBody = p.Body
+	if err := idemRecord(ctx, tx, p.TenantID, p.Idem, comment); err != nil {
+		return nil, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
@@ -304,7 +349,7 @@ func (s *PgStore) ListComments(ctx context.Context, tenantID, threadID string) (
 	rows, err := tx.Query(ctx, `
 		SELECT c.comment_id, c.thread_id, c.tenant_id, c.parent_comment_id, c.current_version_id, c.status,
 			c.created_by, c.created_at, c.updated_at, c.moderated_at, c.moderated_by_principal_id, c.moderation_reason,
-			c.deleted_at, c.deleted_by_principal_id, c.deletion_reason, v.body
+			c.deleted_at, c.deleted_by_principal_id, c.deletion_reason, c.classification, v.body
 		FROM comments c
 		JOIN comment_versions v ON v.version_id = c.current_version_id AND v.tenant_id = c.tenant_id
 		WHERE c.tenant_id=$1 AND c.thread_id=$2
@@ -317,11 +362,14 @@ func (s *PgStore) ListComments(ctx context.Context, tenantID, threadID string) (
 	var out []domain.Comment
 	for rows.Next() {
 		c := domain.Comment{}
-		var parentCommentID *string
+		var parentCommentID, classification *string
 		if err := rows.Scan(&c.CommentID, &c.ThreadID, &c.TenantID, &parentCommentID, &c.CurrentVersionID, &c.Status,
 			&c.CreatedBy, &c.CreatedAt, &c.UpdatedAt, &c.ModeratedAt, &c.ModeratedByPrincipalID, &c.ModerationReason,
-			&c.DeletedAt, &c.DeletedByPrincipalID, &c.DeletionReason, &c.CurrentBody); err != nil {
+			&c.DeletedAt, &c.DeletedByPrincipalID, &c.DeletionReason, &classification, &c.CurrentBody); err != nil {
 			return nil, err
+		}
+		if classification != nil {
+			c.Classification = *classification
 		}
 		if parentCommentID != nil {
 			c.ParentCommentID = *parentCommentID
@@ -374,6 +422,11 @@ func (s *PgStore) DeleteComment(ctx context.Context, p domain.DeleteCommentParam
 	if err := s.setRLS(ctx, tx); err != nil {
 		return nil, err
 	}
+	if replay, err := idemClaim[domain.Comment](ctx, tx, p.TenantID, p.Idem); err != nil {
+		return nil, err
+	} else if replay != nil {
+		return replay, nil
+	}
 	current, err := scanComment(tx.QueryRow(ctx, `SELECT `+commentColumns+` FROM comments WHERE comment_id=$1 AND tenant_id=$2 FOR UPDATE`, p.CommentID, p.TenantID))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, domain.ErrCommentNotFound
@@ -389,6 +442,9 @@ func (s *PgStore) DeleteComment(ctx context.Context, p domain.DeleteCommentParam
 		WHERE comment_id=$1 AND tenant_id=$2 RETURNING `+commentColumns,
 		p.CommentID, p.TenantID, p.ActorPrincipalID, p.Reason))
 	if err != nil {
+		return nil, err
+	}
+	if err := idemRecord(ctx, tx, p.TenantID, p.Idem, comment); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -409,6 +465,11 @@ func (s *PgStore) Mention(ctx context.Context, p domain.MentionParams) (*domain.
 	if err := s.setRLS(ctx, tx); err != nil {
 		return nil, err
 	}
+	if replay, err := idemClaim[domain.Mention](ctx, tx, p.TenantID, p.Idem); err != nil {
+		return nil, err
+	} else if replay != nil {
+		return replay, nil
+	}
 	var exists int
 	if err := tx.QueryRow(ctx, `SELECT count(*) FROM comments WHERE comment_id=$1 AND tenant_id=$2`, p.CommentID, p.TenantID).Scan(&exists); err != nil {
 		return nil, err
@@ -425,6 +486,9 @@ func (s *PgStore) Mention(ctx context.Context, p domain.MentionParams) (*domain.
 		Scan(&m.MentionID, &m.CommentID, &m.TenantID, &m.MentionedPrincipalID, &m.VisibilityGranted, &m.CreatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("insert mention: %w", err)
+	}
+	if err := idemRecord(ctx, tx, p.TenantID, p.Idem, m); err != nil {
+		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
@@ -446,6 +510,11 @@ func (s *PgStore) React(ctx context.Context, p domain.ReactParams) (bool, error)
 	if err := s.setRLS(ctx, tx); err != nil {
 		return false, err
 	}
+	if replay, err := idemClaim[reactResult](ctx, tx, p.TenantID, p.Idem); err != nil {
+		return false, err
+	} else if replay != nil {
+		return replay.Added, nil
+	}
 	var exists int
 	if err := tx.QueryRow(ctx, `SELECT count(*) FROM comments WHERE comment_id=$1 AND tenant_id=$2`, p.CommentID, p.TenantID).Scan(&exists); err != nil {
 		return false, err
@@ -465,6 +534,9 @@ func (s *PgStore) React(ctx context.Context, p domain.ReactParams) (bool, error)
 			return false, fmt.Errorf("insert reaction: %w", err)
 		}
 		added = true
+	}
+	if err := idemRecord(ctx, tx, p.TenantID, p.Idem, reactResult{Added: added}); err != nil {
+		return false, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return false, err
@@ -486,6 +558,11 @@ func (s *PgStore) Moderate(ctx context.Context, p domain.ModerateParams) (*domai
 	defer func() { _ = tx.Rollback(ctx) }()
 	if err := s.setRLS(ctx, tx); err != nil {
 		return nil, err
+	}
+	if replay, err := idemClaim[domain.Comment](ctx, tx, p.TenantID, p.Idem); err != nil {
+		return nil, err
+	} else if replay != nil {
+		return replay, nil
 	}
 	current, err := scanComment(tx.QueryRow(ctx, `SELECT `+commentColumns+` FROM comments WHERE comment_id=$1 AND tenant_id=$2 FOR UPDATE`, p.CommentID, p.TenantID))
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -510,6 +587,9 @@ func (s *PgStore) Moderate(ctx context.Context, p domain.ModerateParams) (*domai
 	`, "modtrail-"+uuid.New().String(), p.CommentID, p.TenantID, p.ModeratorPrincipalID, p.Action, p.Reason); err != nil {
 		return nil, fmt.Errorf("insert moderation_trail: %w", err)
 	}
+	if err := idemRecord(ctx, tx, p.TenantID, p.Idem, comment); err != nil {
+		return nil, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
@@ -527,6 +607,11 @@ func (s *PgStore) ResolveThread(ctx context.Context, p domain.ResolveThreadParam
 	if err := s.setRLS(ctx, tx); err != nil {
 		return nil, err
 	}
+	if replay, err := idemClaim[domain.CommentThread](ctx, tx, p.TenantID, p.Idem); err != nil {
+		return nil, err
+	} else if replay != nil {
+		return replay, nil
+	}
 	current, err := scanThread(tx.QueryRow(ctx, `SELECT `+threadColumns+` FROM comment_threads WHERE thread_id=$1 AND tenant_id=$2 FOR UPDATE`, p.ThreadID, p.TenantID))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, domain.ErrThreadNotFound
@@ -542,6 +627,9 @@ func (s *PgStore) ResolveThread(ctx context.Context, p domain.ResolveThreadParam
 		WHERE thread_id=$1 AND tenant_id=$2 RETURNING `+threadColumns,
 		p.ThreadID, p.TenantID, p.ActorPrincipalID, p.ResolutionNote))
 	if err != nil {
+		return nil, err
+	}
+	if err := idemRecord(ctx, tx, p.TenantID, p.Idem, thread); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -561,6 +649,11 @@ func (s *PgStore) AttachReference(ctx context.Context, p domain.AttachReferenceP
 	defer func() { _ = tx.Rollback(ctx) }()
 	if err := s.setRLS(ctx, tx); err != nil {
 		return nil, err
+	}
+	if replay, err := idemClaim[domain.CommentAttachment](ctx, tx, p.TenantID, p.Idem); err != nil {
+		return nil, err
+	} else if replay != nil {
+		return replay, nil
 	}
 	current, err := scanComment(tx.QueryRow(ctx, `SELECT `+commentColumns+` FROM comments WHERE comment_id=$1 AND tenant_id=$2 FOR UPDATE`, p.CommentID, p.TenantID))
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -585,6 +678,9 @@ func (s *PgStore) AttachReference(ctx context.Context, p domain.AttachReferenceP
 		Scan(&a.AttachmentID, &a.CommentID, &a.TenantID, &a.LinkedObjectType, &a.LinkedObjectID, &a.AttachedByPrincipalID, &a.AttachedAt)
 	if err != nil {
 		return nil, fmt.Errorf("insert comment_attachment: %w", err)
+	}
+	if err := idemRecord(ctx, tx, p.TenantID, p.Idem, a); err != nil {
+		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err

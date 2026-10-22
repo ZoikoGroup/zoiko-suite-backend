@@ -17,19 +17,20 @@ import (
 )
 
 // requireTestDB connects to a real Postgres named by TEST_DATABASE_URL and
-// replays every migration from a clean slate — same gating/discovery
+// replays every migration from a clean slate â€” same gating/discovery
 // pattern used by every other service in this platform.
 func requireTestDB(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
-		t.Skip("TEST_DATABASE_URL not set — skipping real-Postgres integration test")
+		t.Skip("TEST_DATABASE_URL not set â€” skipping real-Postgres integration test")
 	}
 	pool, err := pgxpool.New(context.Background(), dsn)
 	require.NoError(t, err)
 	t.Cleanup(pool.Close)
 
 	_, err = pool.Exec(context.Background(), `
+		DROP TABLE IF EXISTS idempotency_keys;
 		DROP TABLE IF EXISTS moderation_trail;
 		DROP TABLE IF EXISTS comment_attachments;
 		DROP TABLE IF EXISTS reactions;
@@ -55,7 +56,7 @@ func requireTestDB(t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
-// ctx carries tenant "default" — middleware.TenantFromContext resolves an
+// ctx carries tenant "default" â€” middleware.TenantFromContext resolves an
 // unset context to "", so every test explicitly scopes to a real tenant.
 func ctx() context.Context {
 	return svcmiddleware.WithTenant(context.Background(), "default")
@@ -65,7 +66,7 @@ func TestPgStore_AddComment_CreatesThreadAndFirstComment(t *testing.T) {
 	pool := requireTestDB(t)
 	s := store.NewPgStore(pool)
 
-	comment, thread, err := s.AddComment(ctx(), domain.AddCommentParams{
+	comment, thread, err := s.AddComment(ctx(), domain.AddCommentParams{Classification: "INTERNAL",
 		TenantID: "default", LegalEntityID: "le-1",
 		LinkedObjectType: "DOCUMENT", LinkedObjectID: "doc-1",
 		Body: "Why does clause 4.2 say Net-60?", CreatedByPrincipalID: "reviewer-1",
@@ -84,13 +85,13 @@ func TestPgStore_AddComment_SecondCommentSameObjectReusesThread(t *testing.T) {
 	pool := requireTestDB(t)
 	s := store.NewPgStore(pool)
 
-	_, thread1, err := s.AddComment(ctx(), domain.AddCommentParams{
+	_, thread1, err := s.AddComment(ctx(), domain.AddCommentParams{Classification: "INTERNAL",
 		TenantID: "default", LegalEntityID: "le-1", LinkedObjectType: "DOCUMENT", LinkedObjectID: "doc-2",
 		Body: "first", CreatedByPrincipalID: "reviewer-1",
 	})
 	require.NoError(t, err)
 
-	_, thread2, err := s.AddComment(ctx(), domain.AddCommentParams{
+	_, thread2, err := s.AddComment(ctx(), domain.AddCommentParams{Classification: "INTERNAL",
 		TenantID: "default", LegalEntityID: "le-1", LinkedObjectType: "DOCUMENT", LinkedObjectID: "doc-2",
 		Body: "second", CreatedByPrincipalID: "reviewer-2",
 	})
@@ -106,21 +107,21 @@ func TestPgStore_AddComment_ReplyMustBelongToSameThread(t *testing.T) {
 	pool := requireTestDB(t)
 	s := store.NewPgStore(pool)
 
-	parent, _, err := s.AddComment(ctx(), domain.AddCommentParams{
+	parent, _, err := s.AddComment(ctx(), domain.AddCommentParams{Classification: "INTERNAL",
 		TenantID: "default", LegalEntityID: "le-1", LinkedObjectType: "DOCUMENT", LinkedObjectID: "doc-3",
 		Body: "parent", CreatedByPrincipalID: "reviewer-1",
 	})
 	require.NoError(t, err)
 
-	other, _, err := s.AddComment(ctx(), domain.AddCommentParams{
+	other, _, err := s.AddComment(ctx(), domain.AddCommentParams{Classification: "INTERNAL",
 		TenantID: "default", LegalEntityID: "le-1", LinkedObjectType: "DOCUMENT", LinkedObjectID: "doc-4",
 		Body: "unrelated", CreatedByPrincipalID: "reviewer-1",
 	})
 	require.NoError(t, err)
 
-	// A reply nesting under a comment in an unrelated thread is refused —
+	// A reply nesting under a comment in an unrelated thread is refused â€”
 	// the negative control against replies silently crossing discussions.
-	_, _, err = s.AddComment(ctx(), domain.AddCommentParams{
+	_, _, err = s.AddComment(ctx(), domain.AddCommentParams{Classification: "INTERNAL",
 		TenantID: "default", LegalEntityID: "le-1", LinkedObjectType: "DOCUMENT", LinkedObjectID: "doc-4",
 		ParentCommentID: parent.CommentID, Body: "cross-thread reply", CreatedByPrincipalID: "reviewer-2",
 	})
@@ -132,7 +133,7 @@ func TestPgStore_AddComment_ReopensResolvedThread(t *testing.T) {
 	pool := requireTestDB(t)
 	s := store.NewPgStore(pool)
 
-	_, thread, err := s.AddComment(ctx(), domain.AddCommentParams{
+	_, thread, err := s.AddComment(ctx(), domain.AddCommentParams{Classification: "INTERNAL",
 		TenantID: "default", LegalEntityID: "le-1", LinkedObjectType: "TASK", LinkedObjectID: "task-1",
 		Body: "first", CreatedByPrincipalID: "reviewer-1",
 	})
@@ -152,7 +153,7 @@ func TestPgStore_AddComment_ReopensResolvedThread(t *testing.T) {
 	require.Equal(t, int64(1), tag.RowsAffected())
 	conn.Release()
 
-	_, reopened, err := s.AddComment(ctx(), domain.AddCommentParams{
+	_, reopened, err := s.AddComment(ctx(), domain.AddCommentParams{Classification: "INTERNAL",
 		TenantID: "default", LegalEntityID: "le-1", LinkedObjectType: "TASK", LinkedObjectID: "task-1",
 		Body: "new activity", CreatedByPrincipalID: "reviewer-2",
 	})
@@ -164,7 +165,7 @@ func TestPgStore_AddComment_ReopensResolvedThread(t *testing.T) {
 func TestPgStore_AddComment_EmptyBody_Rejected(t *testing.T) {
 	pool := requireTestDB(t)
 	s := store.NewPgStore(pool)
-	_, _, err := s.AddComment(ctx(), domain.AddCommentParams{
+	_, _, err := s.AddComment(ctx(), domain.AddCommentParams{Classification: "INTERNAL",
 		TenantID: "default", LegalEntityID: "le-1", LinkedObjectType: "DOCUMENT", LinkedObjectID: "doc-5",
 		Body: "", CreatedByPrincipalID: "reviewer-1",
 	})
@@ -175,7 +176,7 @@ func TestPgStore_EditComment_CreatesNewVersionPreservesHistory(t *testing.T) {
 	pool := requireTestDB(t)
 	s := store.NewPgStore(pool)
 
-	comment, _, err := s.AddComment(ctx(), domain.AddCommentParams{
+	comment, _, err := s.AddComment(ctx(), domain.AddCommentParams{Classification: "INTERNAL",
 		TenantID: "default", LegalEntityID: "le-1", LinkedObjectType: "DOCUMENT", LinkedObjectID: "doc-6",
 		Body: "Net-60 seems wrong", CreatedByPrincipalID: "reviewer-1",
 	})
@@ -203,14 +204,14 @@ func TestPgStore_EditComment_UnknownComment_ReturnsNotFound(t *testing.T) {
 }
 
 // TestPgStore_CommentVersions_AreAppendOnly is the negative control on
-// migration 000001's trigger — a raw UPDATE or DELETE against
+// migration 000001's trigger â€” a raw UPDATE or DELETE against
 // comment_versions is refused outright, proving "original history
 // preserved" is real, not just documented intent.
 func TestPgStore_CommentVersions_AreAppendOnly(t *testing.T) {
 	pool := requireTestDB(t)
 	s := store.NewPgStore(pool)
 
-	comment, _, err := s.AddComment(ctx(), domain.AddCommentParams{
+	comment, _, err := s.AddComment(ctx(), domain.AddCommentParams{Classification: "INTERNAL",
 		TenantID: "default", LegalEntityID: "le-1", LinkedObjectType: "DOCUMENT", LinkedObjectID: "doc-7",
 		Body: "original", CreatedByPrincipalID: "reviewer-1",
 	})
@@ -238,12 +239,12 @@ func TestPgStore_ListComments_OrdersByCreatedAt(t *testing.T) {
 	pool := requireTestDB(t)
 	s := store.NewPgStore(pool)
 
-	_, thread, err := s.AddComment(ctx(), domain.AddCommentParams{
+	_, thread, err := s.AddComment(ctx(), domain.AddCommentParams{Classification: "INTERNAL",
 		TenantID: "default", LegalEntityID: "le-1", LinkedObjectType: "DOCUMENT", LinkedObjectID: "doc-8",
 		Body: "first", CreatedByPrincipalID: "reviewer-1",
 	})
 	require.NoError(t, err)
-	_, _, err = s.AddComment(ctx(), domain.AddCommentParams{
+	_, _, err = s.AddComment(ctx(), domain.AddCommentParams{Classification: "INTERNAL",
 		TenantID: "default", LegalEntityID: "le-1", LinkedObjectType: "DOCUMENT", LinkedObjectID: "doc-8",
 		Body: "second", CreatedByPrincipalID: "reviewer-2",
 	})
@@ -267,7 +268,7 @@ func TestPgStore_DeleteComment_ThenRejectsDoubleDelete(t *testing.T) {
 	pool := requireTestDB(t)
 	s := store.NewPgStore(pool)
 
-	comment, _, err := s.AddComment(ctx(), domain.AddCommentParams{
+	comment, _, err := s.AddComment(ctx(), domain.AddCommentParams{Classification: "INTERNAL",
 		TenantID: "default", LegalEntityID: "le-1", LinkedObjectType: "DOCUMENT", LinkedObjectID: "doc-9",
 		Body: "spam", CreatedByPrincipalID: "reviewer-1",
 	})
@@ -286,7 +287,7 @@ func TestPgStore_Mention_ThenGetMentions(t *testing.T) {
 	pool := requireTestDB(t)
 	s := store.NewPgStore(pool)
 
-	comment, _, err := s.AddComment(ctx(), domain.AddCommentParams{
+	comment, _, err := s.AddComment(ctx(), domain.AddCommentParams{Classification: "INTERNAL",
 		TenantID: "default", LegalEntityID: "le-1", LinkedObjectType: "DOCUMENT", LinkedObjectID: "doc-10",
 		Body: "hello", CreatedByPrincipalID: "reviewer-1",
 	})
@@ -308,7 +309,7 @@ func TestPgStore_Mentions_AreAppendOnly(t *testing.T) {
 	pool := requireTestDB(t)
 	s := store.NewPgStore(pool)
 
-	comment, _, err := s.AddComment(ctx(), domain.AddCommentParams{
+	comment, _, err := s.AddComment(ctx(), domain.AddCommentParams{Classification: "INTERNAL",
 		TenantID: "default", LegalEntityID: "le-1", LinkedObjectType: "DOCUMENT", LinkedObjectID: "doc-11",
 		Body: "hello", CreatedByPrincipalID: "reviewer-1",
 	})
@@ -330,7 +331,7 @@ func TestPgStore_React_TogglesOnAndOff(t *testing.T) {
 	pool := requireTestDB(t)
 	s := store.NewPgStore(pool)
 
-	comment, _, err := s.AddComment(ctx(), domain.AddCommentParams{
+	comment, _, err := s.AddComment(ctx(), domain.AddCommentParams{Classification: "INTERNAL",
 		TenantID: "default", LegalEntityID: "le-1", LinkedObjectType: "DOCUMENT", LinkedObjectID: "doc-12",
 		Body: "hello", CreatedByPrincipalID: "reviewer-1",
 	})
@@ -349,7 +350,7 @@ func TestPgStore_Moderate_RequiresReasonAndRecordsTrail(t *testing.T) {
 	pool := requireTestDB(t)
 	s := store.NewPgStore(pool)
 
-	comment, _, err := s.AddComment(ctx(), domain.AddCommentParams{
+	comment, _, err := s.AddComment(ctx(), domain.AddCommentParams{Classification: "INTERNAL",
 		TenantID: "default", LegalEntityID: "le-1", LinkedObjectType: "DOCUMENT", LinkedObjectID: "doc-13",
 		Body: "inappropriate", CreatedByPrincipalID: "reviewer-1",
 	})
@@ -375,7 +376,7 @@ func TestPgStore_ModerationTrail_AreAppendOnly(t *testing.T) {
 	pool := requireTestDB(t)
 	s := store.NewPgStore(pool)
 
-	comment, _, err := s.AddComment(ctx(), domain.AddCommentParams{
+	comment, _, err := s.AddComment(ctx(), domain.AddCommentParams{Classification: "INTERNAL",
 		TenantID: "default", LegalEntityID: "le-1", LinkedObjectType: "DOCUMENT", LinkedObjectID: "doc-14",
 		Body: "inappropriate", CreatedByPrincipalID: "reviewer-1",
 	})
@@ -401,7 +402,7 @@ func TestPgStore_ResolveThread_ThenRejectsDoubleResolve(t *testing.T) {
 	pool := requireTestDB(t)
 	s := store.NewPgStore(pool)
 
-	_, thread, err := s.AddComment(ctx(), domain.AddCommentParams{
+	_, thread, err := s.AddComment(ctx(), domain.AddCommentParams{Classification: "INTERNAL",
 		TenantID: "default", LegalEntityID: "le-1", LinkedObjectType: "DOCUMENT", LinkedObjectID: "doc-15",
 		Body: "hello", CreatedByPrincipalID: "reviewer-1",
 	})
@@ -419,7 +420,7 @@ func TestPgStore_AttachReference_ThenRejectsOnDeletedComment(t *testing.T) {
 	pool := requireTestDB(t)
 	s := store.NewPgStore(pool)
 
-	comment, _, err := s.AddComment(ctx(), domain.AddCommentParams{
+	comment, _, err := s.AddComment(ctx(), domain.AddCommentParams{Classification: "INTERNAL",
 		TenantID: "default", LegalEntityID: "le-1", LinkedObjectType: "DOCUMENT", LinkedObjectID: "doc-16",
 		Body: "see attached quote", CreatedByPrincipalID: "reviewer-1",
 	})
@@ -442,7 +443,7 @@ func TestPgStore_CommentAttachments_AreAppendOnly(t *testing.T) {
 	pool := requireTestDB(t)
 	s := store.NewPgStore(pool)
 
-	comment, _, err := s.AddComment(ctx(), domain.AddCommentParams{
+	comment, _, err := s.AddComment(ctx(), domain.AddCommentParams{Classification: "INTERNAL",
 		TenantID: "default", LegalEntityID: "le-1", LinkedObjectType: "DOCUMENT", LinkedObjectID: "doc-17",
 		Body: "see attached quote", CreatedByPrincipalID: "reviewer-1",
 	})
