@@ -267,7 +267,7 @@ func (h *Handler) Verify(w http.ResponseWriter, r *http.Request) {
 	// AU-01: the envelope verified, but its session may have ended since it
 	// was minted. Asked of identity-context-svc (cached for the revocation
 	// TTL), before anything is forwarded.
-	if !h.sessionLive(ctx, w, rawToken, claims) {
+	if !h.sessionLive(ctx, w, r, rc, rawToken, claims) {
 		return
 	}
 
@@ -336,10 +336,10 @@ func (h *Handler) Verify(w http.ResponseWriter, r *http.Request) {
 	// closed on a material write and open on a read. It used to fail open for
 	// everything, so an outage of the risk engine removed the control.
 	if assessment == nil && h.carta.Enabled() && materialWrite(originalMethod(r)) {
-		h.metrics.VerifyDecision(outcomeCartaUnavailable)
-		w.Header().Set(denialReasonHeader, outcomeCartaUnavailable)
-		w.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = w.Write([]byte("continuous risk assessment unavailable"))
+		h.refuse(w, r, rc, refusal{
+			outcome: outcomeCartaUnavailable, code: problem.CodeAuthDenied, status: http.StatusServiceUnavailable,
+			detail: "continuous risk assessment unavailable", retryable: true,
+		})
 		return
 	}
 
@@ -371,12 +371,25 @@ func (h *Handler) Verify(w http.ResponseWriter, r *http.Request) {
 		// STEP_UP_MFA: a TOTP step-up now exists (identity-context-svc), so the
 		// answer is 401 step_up_required, which the console turns into a
 		// step-up and a retry, not a hard 403 (AU-23).
+		// X-Carta-Decision is set on these two refusals and nowhere else, so it
+		// is never attributed to a refusal the risk engine did not make.
 		if assessment.Decision == carta.DecisionStepUpMFA {
-			h.denyStepUp(w)
+			h.refuse(w, r, rc, refusal{
+				outcome: outcomeStepUpRequired, code: problem.CodeAuthDenied, status: http.StatusUnauthorized,
+				detail: "step-up authentication required", severity: severityFor(assessment.Decision), dedicated: true,
+				headers: [][2]string{
+					{"X-Carta-Decision", string(carta.DecisionStepUpMFA)},
+					// RFC 9470: authenticate again with a second factor and retry.
+					{"WWW-Authenticate", `Bearer error="insufficient_user_authentication", error_description="step-up authentication required"`},
+				},
+			})
 			return
 		}
-		h.metrics.VerifyDecision(outcomeCartaBlocked)
-		h.denyCarta(w, "access denied by continuous risk assessment", string(assessment.Decision))
+		h.refuse(w, r, rc, refusal{
+			outcome: outcomeCartaBlocked, code: problem.CodeAuthDenied, status: http.StatusForbidden,
+			detail: "access denied by continuous risk assessment", severity: severityFor(assessment.Decision), dedicated: true,
+			headers: [][2]string{{"X-Carta-Decision", string(assessment.Decision)}},
+		})
 		return
 	}
 
@@ -639,44 +652,10 @@ const (
 // console tell the gateway's own refusals apart from the backend's.
 const denialReasonHeader = "X-Auth-Denial-Reason"
 
-// deny refuses with 401 and names the reason.
-func (h *Handler) deny(w http.ResponseWriter, msg, outcome string) {
-	h.metrics.VerifyDecision(outcome)
-	w.Header().Set(denialReasonHeader, outcome)
-	w.WriteHeader(http.StatusUnauthorized)
-	_, _ = w.Write([]byte(msg))
-}
-
-// denyCarta refuses with 403 because continuous risk assessment said so.
-//
-// X-Carta-Decision is set here and ONLY here. It used to be set by a shared
-// helper that the tenant/hostname mismatch also called, so a token-spoofing
-// rejection was reported to the caller as a decision the risk engine had made
-// — attributing a refusal to a component that had not been consulted, and
-// sending anyone reading the header to carta-svc's logs to look for a decision
-// that was never there.
-func (h *Handler) denyCarta(w http.ResponseWriter, msg, decision string) {
-	w.Header().Set("X-Carta-Decision", decision)
-	w.Header().Set(denialReasonHeader, outcomeCartaBlocked)
-	w.WriteHeader(http.StatusForbidden)
-	_, _ = w.Write([]byte(msg))
-}
-
-// denyStepUp answers 401 with the RFC 9470 step-up challenge: the caller
-// authenticates again with a second factor and retries.
-func (h *Handler) denyStepUp(w http.ResponseWriter) {
-	h.metrics.VerifyDecision(outcomeStepUpRequired)
-	w.Header().Set("X-Carta-Decision", string(carta.DecisionStepUpMFA))
-	w.Header().Set(denialReasonHeader, outcomeStepUpRequired)
-	w.Header().Set("WWW-Authenticate", `Bearer error="insufficient_user_authentication", error_description="step-up authentication required"`)
-	w.WriteHeader(http.StatusUnauthorized)
-	_, _ = w.Write([]byte("step_up_required"))
-}
-
 // sessionLive runs the AU-01 revocation check and writes the refusal: 401
 // session_revoked for an ended session, 503 when identity-context-svc cannot
 // answer and the check fails closed.
-func (h *Handler) sessionLive(ctx context.Context, w http.ResponseWriter, token string, claims *envelopeClaims) bool {
+func (h *Handler) sessionLive(ctx context.Context, w http.ResponseWriter, r *http.Request, rc *reqCtx, token string, claims *envelopeClaims) bool {
 	if h.revocation == nil {
 		return true
 	}
@@ -690,24 +669,15 @@ func (h *Handler) sessionLive(ctx context.Context, w http.ResponseWriter, token 
 	case errors.Is(err, idenv.ErrRevoked):
 		h.log.Info("gateway refused a revoked session", zap.String("principal_id", claims.Principal.PrincipalID),
 			zap.String("session_context_id", c.SessionContextID()), zap.Error(err))
-		h.deny(w, "session revoked", outcomeSessionRevoked)
+		h.refuseAuth(w, r, rc, outcomeSessionRevoked, "session revoked")
 	default:
 		h.log.Error("identity session status unavailable — failing closed", zap.Error(err))
-		h.metrics.VerifyDecision(outcomeSessionStatusUnavailable)
-		w.Header().Set(denialReasonHeader, outcomeSessionStatusUnavailable)
-		w.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = w.Write([]byte("session status unavailable"))
+		h.refuse(w, r, rc, refusal{
+			outcome: outcomeSessionStatusUnavailable, code: problem.CodeAuthDenied, status: http.StatusServiceUnavailable,
+			detail: "session status unavailable", retryable: true,
+		})
 	}
 	return false
-}
-
-// denyMismatch refuses with 403 because the token's tenant is not the tenant
-// the caller's hostname resolved to.
-func (h *Handler) denyMismatch(w http.ResponseWriter, msg string) {
-	h.metrics.VerifyDecision(outcomeTenantHostnameMismatch)
-	w.Header().Set(denialReasonHeader, outcomeTenantHostnameMismatch)
-	w.WriteHeader(http.StatusForbidden)
-	_, _ = w.Write([]byte(msg))
 }
 
 // setAuthnAge stamps X-Authn-Age-Seconds from authTime (Unix seconds), or

@@ -58,6 +58,8 @@ func TestVerify_RevokedSessionIsRefused(t *testing.T) {
 	assert.Equal(t, http.StatusUnauthorized, rec.Code)
 	assert.Equal(t, "session_revoked", rec.Header().Get("X-Auth-Denial-Reason"))
 	assert.Empty(t, rec.Header().Get("X-Principal-Id"), "a refused request must forward no identity")
+	assert.Equal(t, "application/problem+json", rec.Header().Get("Content-Type"))
+	assert.NotEmpty(t, rec.Header().Get("X-Gateway-Decision-Id"), "recorded like every other refusal")
 }
 
 func TestVerify_SessionStatusUnknownFailsClosed(t *testing.T) {
@@ -66,6 +68,8 @@ func TestVerify_SessionStatusUnknownFailsClosed(t *testing.T) {
 	rec := verify(h, mintEnvelope(t, key, testKid, withSession("SC-1")), http.MethodGet)
 	assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
 	assert.Equal(t, "session_status_unavailable", rec.Header().Get("X-Auth-Denial-Reason"))
+	assert.Equal(t, "application/problem+json", rec.Header().Get("Content-Type"))
+	assert.NotEmpty(t, rec.Header().Get("X-Gateway-Decision-Id"))
 }
 
 // AU-23 (decision 21 Oct 2026): carta-svc configured but unreachable fails
@@ -80,6 +84,7 @@ func TestVerify_CartaUnreachable_ClosedOnWritesOpenOnReads(t *testing.T) {
 	write := verify(dead, tok, http.MethodPost)
 	assert.Equal(t, http.StatusServiceUnavailable, write.Code)
 	assert.Equal(t, "carta_unavailable", write.Header().Get("X-Auth-Denial-Reason"))
+	assert.Equal(t, "application/problem+json", write.Header().Get("Content-Type"))
 
 	read := verify(dead, tok, http.MethodGet)
 	assert.Equal(t, http.StatusOK, read.Code, "a read proceeds unscored when carta-svc is down")
