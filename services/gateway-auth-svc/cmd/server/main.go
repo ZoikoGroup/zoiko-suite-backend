@@ -119,7 +119,7 @@ func main() {
 			"resolution; tenant operability and cross-tenant entity ownership are not checked at the gateway")
 	}
 
-h := handler.New(cfg, jwksClient, cartaClient, siemClient, tenantResolver, log).UseMetrics(metrics)
+	h := handler.New(cfg, jwksClient, cartaClient, siemClient, tenantResolver, log).UseMetrics(metrics)
 
 	// AU-01: a verified envelope's session is checked at identity-context-svc
 	// (live answers reused for the revocation TTL), so a logout stops passing

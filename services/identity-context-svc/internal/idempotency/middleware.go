@@ -63,7 +63,7 @@ const (
 var exemptPaths = map[string]bool{
 	"/v1/authenticate":           true,
 	"/v1/authenticate/federated": true,
-	"/v1/context/resolve": true,
+	"/v1/context/resolve":        true,
 	// Step-up mints a login token; enrolment returns a TOTP shared secret. A
 	// recorded response would store either one in Postgres in the clear and
 	// replay it to whoever repeats the key.

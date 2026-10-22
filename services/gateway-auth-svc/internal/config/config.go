@@ -163,7 +163,7 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 
-cfg := &Config{
+	cfg := &Config{
 		Port:                      port,
 		JWKSURL:                   strEnv("IDENTITY_JWKS_URL", "http://identity-svc:8080/.well-known/jwks.json"),
 		JWKSCacheTTL:              time.Duration(ttlSeconds) * time.Second,
