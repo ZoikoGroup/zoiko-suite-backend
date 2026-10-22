@@ -1,0 +1,1 @@
+DROP INDEX IF EXISTS uq_payment_initiation_attempts_unresolved_source_reference;

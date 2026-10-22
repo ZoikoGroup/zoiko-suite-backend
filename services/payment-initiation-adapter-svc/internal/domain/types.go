@@ -38,12 +38,13 @@
 //     payer/payee references, authorization fingerprint) are immutable —
 //     enforced by a database trigger — the direct fix for "payment amount
 //     changed after authorization."
-//   - "Payment sent from suspended/unverified account" has no real
-//     account-status source to check against (AP-09/AP-10 already treat
-//     bank account references as opaque — see their own package docs), so
-//     this service requires the caller to explicitly assert
-//     PayerAccountVerified=true at PrepareAttempt time — a real,
-//     caller-attested gate, not a fabricated automatic check.
+//   - "Payment sent from suspended/unverified account" is checked against
+//     treasury-svc's BNK-01 record: PrepareAttempt requires the caller to
+//     assert PayerAccountVerified=true AND re-fetches the account, refusing
+//     it unless it is ACTIVE with ownership verified in the caller's tenant.
+//     The caller-attested flag alone is only a cheap early rejection; the
+//     treasury-svc lookup is the gate. A treasury-svc failure is a 503, never
+//     an assumed-good account.
 package domain
 
 import "time"

@@ -243,6 +243,15 @@ func (h *Handler) PrepareAttempt(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, domain.ErrDuplicateIdempotencyKey) {
 			existing, findErr := h.store.FindByIdempotencyKey(r.Context(), req.IdempotencyKey)
 			if findErr != nil {
+				if errors.Is(findErr, domain.ErrAttemptNotFound) {
+					// The idempotency_key unique index is platform-wide, but
+					// the lookup above is tenant-scoped by row-level security.
+					// A duplicate the caller's own tenant cannot see is another
+					// tenant's attempt: refuse rather than leak it or return a
+					// misleading 503.
+					writeError(w, http.StatusConflict, "idempotency_key is already in use in another tenant")
+					return
+				}
 				h.log.Error("PrepareAttempt: failed to fetch existing attempt for duplicate key", zap.Error(findErr))
 				writeError(w, http.StatusServiceUnavailable, "store unavailable")
 				return
@@ -267,9 +276,27 @@ func (h *Handler) PrepareAttempt(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, created)
 }
 
+// fetchReadableAttempt requires an authenticated principal and authorizes
+// PAYMENT_ATTEMPT_READ against the attempt's own legal entity before any
+// attempt data (including its existence) is returned.
+func (h *Handler) fetchReadableAttempt(w http.ResponseWriter, r *http.Request, attemptID string) (*domain.PaymentInitiationAttempt, bool) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return nil, false
+	}
+	a, ok := h.fetchAttemptForAuth(w, r, attemptID)
+	if !ok {
+		return nil, false
+	}
+	if !h.authorize(w, r, principalID, a.LegalEntityID, PaymentAttemptRead) {
+		return nil, false
+	}
+	return a, true
+}
+
 func (h *Handler) GetPaymentAttempt(w http.ResponseWriter, r *http.Request) {
 	attemptID := chi.URLParam(r, "attemptID")
-	a, ok := h.fetchAttemptForAuth(w, r, attemptID)
+	a, ok := h.fetchReadableAttempt(w, r, attemptID)
 	if !ok {
 		return
 	}
@@ -278,7 +305,7 @@ func (h *Handler) GetPaymentAttempt(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) GetProviderReceipt(w http.ResponseWriter, r *http.Request) {
 	attemptID := chi.URLParam(r, "attemptID")
-	a, ok := h.fetchAttemptForAuth(w, r, attemptID)
+	a, ok := h.fetchReadableAttempt(w, r, attemptID)
 	if !ok {
 		return
 	}
@@ -289,7 +316,7 @@ func (h *Handler) GetProviderReceipt(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) GetSubmissionState(w http.ResponseWriter, r *http.Request) {
 	attemptID := chi.URLParam(r, "attemptID")
-	a, ok := h.fetchAttemptForAuth(w, r, attemptID)
+	a, ok := h.fetchReadableAttempt(w, r, attemptID)
 	if !ok {
 		return
 	}
@@ -298,7 +325,7 @@ func (h *Handler) GetSubmissionState(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) GetAttemptEvidence(w http.ResponseWriter, r *http.Request) {
 	attemptID := chi.URLParam(r, "attemptID")
-	a, ok := h.fetchAttemptForAuth(w, r, attemptID)
+	a, ok := h.fetchReadableAttempt(w, r, attemptID)
 	if !ok {
 		return
 	}
@@ -343,18 +370,18 @@ func (h *Handler) SubmitAttempt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	updated := h.submitToProvider(r.Context(), a, principalID)
+	updated := h.submitToProvider(r.Context(), a, principalID, r.Header.Get("X-Correlation-ID"))
 	writeJSON(w, http.StatusOK, updated)
 }
 
-func (h *Handler) submitToProvider(ctx context.Context, a *domain.PaymentInitiationAttempt, principalID string) *domain.PaymentInitiationAttempt {
+func (h *Handler) submitToProvider(ctx context.Context, a *domain.PaymentInitiationAttempt, principalID, correlationID string) *domain.PaymentInitiationAttempt {
 	result, err := h.provider.Submit(ctx, provideradapter.SubmitRequest{
 		IdempotencyKey: a.IdempotencyKey, PayerAccountRef: a.PayerAccountRef, PayeeRef: a.PayeeRef,
 		Amount: a.Amount, Currency: a.Currency, PaymentReference: a.PaymentReference,
 	})
 	if err != nil {
 		h.log.Warn("provider adapter unreachable — treating as PENDING_UNKNOWN, never Rejected", zap.Error(err))
-		updated, err := h.store.MarkPendingUnknown(ctx, a.AttemptID, principalID)
+		updated, err := h.store.MarkPendingUnknown(ctx, a.AttemptID, principalID, correlationID)
 		if err != nil {
 			h.log.Error("failed to record PENDING_UNKNOWN", zap.Error(err))
 			return a
@@ -365,13 +392,13 @@ func (h *Handler) submitToProvider(ctx context.Context, a *domain.PaymentInitiat
 	var updated *domain.PaymentInitiationAttempt
 	switch result.Outcome {
 	case provideradapter.OutcomeSubmitted:
-		updated, err = h.store.MarkSubmitted(ctx, a.AttemptID, result.ProviderRequestID, result.ResponseRef, principalID)
+		updated, err = h.store.MarkSubmitted(ctx, a.AttemptID, result.ProviderRequestID, result.ResponseRef, principalID, correlationID)
 	case provideradapter.OutcomeTimeout:
-		updated, err = h.store.MarkPendingUnknown(ctx, a.AttemptID, principalID)
+		updated, err = h.store.MarkPendingUnknown(ctx, a.AttemptID, principalID, correlationID)
 	case provideradapter.OutcomeRejected:
-		updated, err = h.store.MarkRejected(ctx, a.AttemptID, result.RejectionReason, principalID)
+		updated, err = h.store.MarkRejected(ctx, a.AttemptID, result.RejectionReason, principalID, correlationID)
 	default:
-		updated, err = h.store.MarkPendingUnknown(ctx, a.AttemptID, principalID)
+		updated, err = h.store.MarkPendingUnknown(ctx, a.AttemptID, principalID, correlationID)
 	}
 	if err != nil {
 		h.log.Error("failed to record submission outcome", zap.Error(err))
@@ -405,7 +432,7 @@ func (h *Handler) RetrySameAttempt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	updated := h.submitToProvider(r.Context(), a, principalID)
+	updated := h.submitToProvider(r.Context(), a, principalID, r.Header.Get("X-Correlation-ID"))
 	writeJSON(w, http.StatusOK, updated)
 }
 
@@ -509,7 +536,7 @@ func (h *Handler) QuarantineAttempt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	updated, err := h.store.QuarantineAttempt(r.Context(), attemptID, req, principalID)
+	updated, err := h.store.QuarantineAttempt(r.Context(), attemptID, req, principalID, r.Header.Get("X-Correlation-ID"))
 	if err != nil {
 		if errors.Is(err, domain.ErrInvalidTransition) {
 			writeError(w, http.StatusConflict, "attempt is not in a quarantinable state")

@@ -508,6 +508,53 @@ func TestGetPaymentAttempt_NotFound(t *testing.T) {
 	}
 }
 
+// TestReadEndpoints_RequirePrincipalAndReadPermission proves every
+// attempt-reading endpoint is closed to anonymous callers and to principals
+// without PAYMENT_ATTEMPT_READ, not only the write commands.
+func TestReadEndpoints_RequirePrincipalAndReadPermission(t *testing.T) {
+	az := &stubAuthz{}
+	r := newTestRouter(newStubStore(), az, provideradapter.NewStubProviderAdapter())
+	a := prepareAttempt(t, r, newPrepareReq("idem-read-authz", "invoice-payment"))
+	paths := []string{
+		"/bnk06/attempts/" + a.AttemptID,
+		"/bnk06/attempts/" + a.AttemptID + "/receipt",
+		"/bnk06/attempts/" + a.AttemptID + "/state",
+		"/bnk06/attempts/" + a.AttemptID + "/evidence",
+	}
+
+	for _, path := range paths {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("X-Tenant-Id", testTenant)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("%s without X-Principal-Id: expected 401, got %d: %s", path, w.Code, w.Body.String())
+		}
+	}
+
+	az.deny = true
+	for _, path := range paths {
+		w := doRequest(r, http.MethodGet, path, nil, testTenant)
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("%s without PAYMENT_ATTEMPT_READ: expected 403, got %d: %s", path, w.Code, w.Body.String())
+		}
+	}
+}
+
+// TestPrepareAttempt_CrossTenantIdempotencyKey_ReturnsConflict proves a
+// platform-wide idempotency-key collision the caller's tenant cannot see is
+// refused as a conflict instead of being reported as an unavailable store.
+func TestPrepareAttempt_CrossTenantIdempotencyKey_ReturnsConflict(t *testing.T) {
+	r := newTestRouter(newStubStore(), &stubAuthz{}, provideradapter.NewStubProviderAdapter())
+	prepareAttempt(t, r, newPrepareReq("idem-cross-tenant", "invoice-payment"))
+
+	w := doRequestAs(r, http.MethodPost, "/bnk06/attempts/", newPrepareReq("idem-cross-tenant", "invoice-payment"),
+		"tenant-bnk06-other", "principal-other")
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409 for an idempotency_key owned by another tenant, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
 func TestPrepareAttempt_AuthorizationDenied(t *testing.T) {
 	r := newTestRouter(newStubStore(), &stubAuthz{deny: true}, provideradapter.NewStubProviderAdapter())
 	w := doRequest(r, http.MethodPost, "/bnk06/attempts/", newPrepareReq("idem-12", "invoice-payment"), testTenant)

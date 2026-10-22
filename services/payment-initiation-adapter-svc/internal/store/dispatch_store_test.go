@@ -256,7 +256,7 @@ func TestDispatch_TriggersPinTheContextAndGuardInFlight(t *testing.T) {
 	assert.Error(t, su(`UPDATE payment_initiation_attempts SET status = 'QUARANTINED', in_flight_since = NULL WHERE attempt_id = $1`, b.AttemptID))
 	_, err = st.CancelAttempt(ctx, b.AttemptID, "op")
 	assert.ErrorIs(t, err, domain.ErrInvalidTransition, "cancel through the store is also refused while in flight")
-	_, err = st.QuarantineAttempt(ctx, b.AttemptID, domain.QuarantineRequest{Reason: "x"}, "op")
+	_, err = st.QuarantineAttempt(ctx, b.AttemptID, domain.QuarantineRequest{Reason: "x"}, "op", "corr-q")
 	assert.ErrorIs(t, err, domain.ErrInvalidTransition)
 
 	// SUBMITTING and its timestamp are one fact
