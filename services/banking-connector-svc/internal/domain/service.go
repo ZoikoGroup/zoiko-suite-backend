@@ -220,6 +220,19 @@ type BankStatement struct {
 	ClosingBalance   float64   `json:"closing_balance"`
 	TransactionCount int       `json:"transaction_count"`
 	IngestedAt       time.Time `json:"ingested_at"`
+
+	// BNK-03 ingestion evidence. These are part of the statement's
+	// authoritative record, not handler-local bookkeeping: a caller that
+	// cannot see the status, raw-source hash, source/batch ids and
+	// quarantine reason cannot prove which import it is looking at or
+	// whether the evidence was accepted. The raw payload itself is still
+	// not stored (see SPEC_DEVIATIONS.md A10).
+	ContentHash          string `json:"content_hash,omitempty"`
+	SourceID             string `json:"source_id,omitempty"`
+	ImportBatchID        string `json:"import_batch_id,omitempty"`
+	Status               string `json:"status,omitempty"`
+	QuarantineReason     string `json:"quarantine_reason,omitempty"`
+	CreatedByPrincipalID string `json:"created_by_principal_id,omitempty"`
 }
 
 type CreateConnectionRequest struct {

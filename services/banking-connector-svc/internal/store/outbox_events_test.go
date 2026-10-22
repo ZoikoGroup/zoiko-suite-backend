@@ -248,8 +248,7 @@ func TestPgStore_Outbox_NormalizeTransaction_EnqueuesNormalizedOrException(t *te
 		t.Fatalf("ingest mapped: %v", err)
 	}
 	normResult, err := s.NormalizeTransaction(ctx, domain.NormalizeTransactionParams{
-		TenantID: "tenant-outbox-bnk04", StatementLineID: mapped.Lines[0].LineID, TransactionDate: time.Now(),
-		Amount: 250, Currency: "USD", Counterparty: "Acme", ActorPrincipalID: "ops-1", CorrelationID: "corr-norm-1",
+		TenantID: "tenant-outbox-bnk04", StatementLineID: mapped.Lines[0].LineID, Counterparty: "Acme", ActorPrincipalID: "ops-1", CorrelationID: "corr-norm-1",
 	})
 	if err != nil || normResult.Transaction == nil {
 		t.Fatalf("normalize mapped line: %+v err=%v", normResult, err)
@@ -267,8 +266,7 @@ func TestPgStore_Outbox_NormalizeTransaction_EnqueuesNormalizedOrException(t *te
 		t.Fatalf("ingest unmapped: %v", err)
 	}
 	excResult, err := s.NormalizeTransaction(ctx, domain.NormalizeTransactionParams{
-		TenantID: "tenant-outbox-bnk04", StatementLineID: unmapped.Lines[0].LineID, TransactionDate: time.Now(),
-		Amount: 50, Currency: "USD", ActorPrincipalID: "ops-1", CorrelationID: "corr-norm-2",
+		TenantID: "tenant-outbox-bnk04", StatementLineID: unmapped.Lines[0].LineID, ActorPrincipalID: "ops-1", CorrelationID: "corr-norm-2",
 	})
 	if err != nil || excResult.QuarantinedException == nil {
 		t.Fatalf("normalize unmapped line: %+v err=%v", excResult, err)
@@ -279,8 +277,7 @@ func TestPgStore_Outbox_NormalizeTransaction_EnqueuesNormalizedOrException(t *te
 	}
 
 	if _, err := s.NormalizeTransaction(ctx, domain.NormalizeTransactionParams{
-		TenantID: "tenant-outbox-bnk04", StatementLineID: unmapped.Lines[0].LineID, TransactionDate: time.Now(),
-		Amount: 50, Currency: "USD", ActorPrincipalID: "ops-1", CorrelationID: "corr-norm-3",
+		TenantID: "tenant-outbox-bnk04", StatementLineID: unmapped.Lines[0].LineID, ActorPrincipalID: "ops-1", CorrelationID: "corr-norm-3",
 	}); err != nil {
 		t.Fatalf("second normalize of unmapped line: %v", err)
 	}
@@ -310,16 +307,14 @@ func TestPgStore_Outbox_ReNormalizeTransaction_EnqueuesRenormalizedEvent(t *test
 		t.Fatalf("ingest: %v", err)
 	}
 	normResult, err := s.NormalizeTransaction(ctx, domain.NormalizeTransactionParams{
-		TenantID: "tenant-outbox-renorm", StatementLineID: result.Lines[0].LineID, TransactionDate: time.Now(),
-		Amount: 75, Currency: "USD", ActorPrincipalID: "ops-1",
+		TenantID: "tenant-outbox-renorm", StatementLineID: result.Lines[0].LineID, ActorPrincipalID: "ops-1",
 	})
 	if err != nil || normResult.Transaction == nil {
 		t.Fatalf("normalize: %+v err=%v", normResult, err)
 	}
 
 	corrected, err := s.ReNormalizeTransaction(ctx, domain.ReNormalizeTransactionParams{
-		TenantID: "tenant-outbox-renorm", PriorTransactionID: normResult.Transaction.TransactionID, TransactionDate: time.Now(),
-		Amount: 75, Currency: "USD", Category: "MISC_CORRECTED", ActorPrincipalID: "ops-2", CorrelationID: "corr-renorm-1",
+		TenantID: "tenant-outbox-renorm", PriorTransactionID: normResult.Transaction.TransactionID, Category: "MISC_CORRECTED", ActorPrincipalID: "ops-2", CorrelationID: "corr-renorm-1",
 	})
 	if err != nil {
 		t.Fatalf("re-normalize: %v", err)
@@ -364,8 +359,7 @@ func TestPgStore_Outbox_QuarantineAndApproveMappingException_EnqueueBothEvents(t
 	}
 
 	if _, err := s.ApproveMappingException(ctx, domain.ApproveMappingExceptionParams{
-		TenantID: "tenant-outbox-mapex", ExceptionID: exc.ExceptionID, TransactionDate: time.Now(),
-		Amount: 42, Currency: "USD", Category: "MISC", ApproverPrincipalID: "ops-2", CorrelationID: "corr-approve-1",
+		TenantID: "tenant-outbox-mapex", ExceptionID: exc.ExceptionID, Category: "MISC", ApproverPrincipalID: "ops-2", CorrelationID: "corr-approve-1",
 	}); err != nil {
 		t.Fatalf("approve: %v", err)
 	}

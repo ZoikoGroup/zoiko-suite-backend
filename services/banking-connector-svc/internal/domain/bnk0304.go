@@ -7,8 +7,10 @@ import (
 
 // BNK-03 Statement Ingestion lifecycle. RECEIVED is the initial state for
 // an ingested statement before its lines are validated; VALIDATING is
-// in-progress; ACCEPTED/QUARANTINED/REJECTED are all terminal — see
-// migration 004's own reject_terminal_statement_mutation trigger.
+// in-progress; ACCEPTED and REJECTED are terminal. QUARANTINED is terminal
+// for ordinary writes but may be reset to RECEIVED by the explicit
+// ReprocessQuarantinedStatement path — see migration 008's narrow exception
+// to migration 004's reject_terminal_statement_mutation trigger.
 const (
 	StatementReceived   = "RECEIVED"
 	StatementValidating = "VALIDATING"
@@ -91,31 +93,37 @@ var (
 )
 
 type CanonicalTransaction struct {
-	TransactionID         string     `json:"transaction_id"`
-	TenantID              string     `json:"tenant_id"`
-	StatementLineID       string     `json:"statement_line_id"`
-	MappingVersion        int        `json:"mapping_version"`
-	TransactionDate       time.Time  `json:"transaction_date"`
-	Amount                float64    `json:"amount"`
-	Currency              string     `json:"currency"`
-	Category              string     `json:"category"`
-	Counterparty          string     `json:"counterparty"`
-	Status                string     `json:"status"`
-	SupersededBy          string     `json:"superseded_by,omitempty"`
-	CreatedByPrincipalID  string     `json:"-"`
-	CreatedAt             time.Time  `json:"created_at"`
+	TransactionID        string    `json:"transaction_id"`
+	TenantID             string    `json:"tenant_id"`
+	StatementLineID      string    `json:"statement_line_id"`
+	MappingVersion       int       `json:"mapping_version"`
+	TransactionDate      time.Time `json:"transaction_date"`
+	Amount               float64   `json:"amount"`
+	Currency             string    `json:"currency"`
+	Category             string    `json:"category"`
+	Counterparty         string    `json:"counterparty"`
+	Status               string    `json:"status"`
+	SupersededBy         string    `json:"superseded_by,omitempty"`
+	CreatedByPrincipalID string    `json:"-"`
+	CreatedAt            time.Time `json:"created_at"`
 }
 
-// NormalizeTransactionParams no longer carries a caller-supplied Category
-// — see NormalizeTransactionResult. The category is resolved exclusively
-// from bank_transaction_mappings, keyed by the statement line's own
-// bank_code (real evidence captured at ingest), never accepted as a
+// NormalizeTransactionParams no longer carries a required caller-supplied
+// Category — see NormalizeTransactionResult. The category is resolved
+// exclusively from bank_transaction_mappings, keyed by the statement line's
+// own bank_code (real evidence captured at ingest), never accepted as a
 // caller-supplied guess. Counterparty remains passthrough descriptive
 // evidence; there is no counterparty dictionary to check it against.
+//
+// TransactionDate, Amount and Currency are optional assertions: when the
+// caller supplies one it must exactly match the immutable statement line,
+// and a mismatch is rejected with ErrTransactionEvidenceMismatch. The
+// canonical row is always built from the statement line's raw values, never
+// from the request. Omitting them is the normal path.
 type NormalizeTransactionParams struct {
 	TenantID, StatementLineID, Counterparty string
-	TransactionDate                         time.Time
-	Amount                                  float64
+	TransactionDate                         *time.Time
+	Amount                                  *float64
 	Currency                                string
 	ActorPrincipalID                        string
 	CorrelationID                           string
@@ -130,17 +138,24 @@ type NormalizeTransactionResult struct {
 	QuarantinedException *MappingException     `json:"quarantined_exception,omitempty"`
 }
 
-var ErrStatementLineNotFound = errors.New("statement line not found")
+var (
+	ErrStatementLineNotFound = errors.New("statement line not found")
+	// ErrTransactionEvidenceMismatch is returned when a caller asserts a
+	// booking date, amount or currency that contradicts the immutable raw
+	// statement line. The raw line always wins; a mismatch is refused so a
+	// client cannot believe it wrote a fact the service did not store.
+	ErrTransactionEvidenceMismatch = errors.New("caller-supplied transaction evidence does not match the statement line")
+)
 
 // TransactionMapping is one tenant-scoped bank_code -> category dictionary
 // entry (migration 005).
 type TransactionMapping struct {
 	MappingID            string    `json:"mapping_id"`
-	TenantID              string    `json:"tenant_id"`
-	BankCode               string    `json:"bank_code"`
-	Category               string    `json:"category"`
-	CreatedByPrincipalID   string    `json:"-"`
-	CreatedAt              time.Time `json:"created_at"`
+	TenantID             string    `json:"tenant_id"`
+	BankCode             string    `json:"bank_code"`
+	Category             string    `json:"category"`
+	CreatedByPrincipalID string    `json:"-"`
+	CreatedAt            time.Time `json:"created_at"`
 }
 
 type CreateTransactionMappingParams struct {
@@ -151,14 +166,17 @@ var ErrMappingAlreadyExists = errors.New("a mapping for this bank_code already e
 
 // ReNormalizeTransactionParams supersedes an existing NORMALIZED canonical
 // row with a corrected one, preserving the prior version rather than
-// editing it in place.
+// editing it in place. Category is the deliberate correction; date, amount
+// and currency remain raw statement-line evidence and cannot be changed by
+// a re-normalization. TransactionDate/Amount/Currency are optional
+// assertions, checked exactly like NormalizeTransactionParams.
 type ReNormalizeTransactionParams struct {
 	TenantID, PriorTransactionID, Category, Counterparty string
-	TransactionDate                                       time.Time
-	Amount                                                 float64
-	Currency                                               string
-	ActorPrincipalID                                       string
-	CorrelationID                                          string
+	TransactionDate                                      *time.Time
+	Amount                                               *float64
+	Currency                                             string
+	ActorPrincipalID                                     string
+	CorrelationID                                        string
 }
 
 type QuarantineTransactionParams struct {
@@ -169,14 +187,17 @@ type QuarantineTransactionParams struct {
 // ApproveMappingExceptionParams is BNK-04's maker-checker resolution: the
 // principal approving must differ from the one who raised the exception
 // (see the app-layer self-approval check in the handler, mirroring every
-// other maker-checker flow in this codebase).
+// other maker-checker flow in this codebase). Category and Counterparty are
+// the approver's decision; date, amount and currency come from the raw
+// statement line. The date/amount/currency fields are optional assertions,
+// checked exactly like NormalizeTransactionParams.
 type ApproveMappingExceptionParams struct {
 	TenantID, ExceptionID, Category, Counterparty string
-	TransactionDate                                time.Time
-	Amount                                          float64
-	Currency                                        string
-	ApproverPrincipalID                             string
-	CorrelationID                                   string
+	TransactionDate                               *time.Time
+	Amount                                        *float64
+	Currency                                      string
+	ApproverPrincipalID                           string
+	CorrelationID                                 string
 }
 
 var (
@@ -186,14 +207,14 @@ var (
 )
 
 type MappingException struct {
-	ExceptionID            string     `json:"exception_id"`
-	TenantID               string     `json:"tenant_id"`
-	StatementLineID        string     `json:"statement_line_id"`
-	Reason                 string     `json:"reason"`
-	Status                 string     `json:"status"`
-	RaisedByPrincipalID    string     `json:"raised_by_principal_id"`
-	ResolvedTransactionID  string     `json:"resolved_transaction_id,omitempty"`
-	ResolvedByPrincipalID  string     `json:"resolved_by_principal_id,omitempty"`
-	ResolvedAt             *time.Time `json:"resolved_at,omitempty"`
-	CreatedAt              time.Time  `json:"created_at"`
+	ExceptionID           string     `json:"exception_id"`
+	TenantID              string     `json:"tenant_id"`
+	StatementLineID       string     `json:"statement_line_id"`
+	Reason                string     `json:"reason"`
+	Status                string     `json:"status"`
+	RaisedByPrincipalID   string     `json:"raised_by_principal_id"`
+	ResolvedTransactionID string     `json:"resolved_transaction_id,omitempty"`
+	ResolvedByPrincipalID string     `json:"resolved_by_principal_id,omitempty"`
+	ResolvedAt            *time.Time `json:"resolved_at,omitempty"`
+	CreatedAt             time.Time  `json:"created_at"`
 }

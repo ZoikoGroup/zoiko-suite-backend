@@ -210,6 +210,10 @@ func (p *PgStore) RecordStatement(ctx context.Context, stmt *domain.BankStatemen
 	}
 	stmt.IngestedAt = time.Now().UTC()
 	stmt.TenantID = tenantID
+	// The legacy header-only path inserts straight into the terminal
+	// ACCEPTED state (migration 004's backward-compatible default). Reflect
+	// that in the returned/event payload instead of leaving an empty status.
+	stmt.Status = domain.StatementAccepted
 
 	query := `
 		INSERT INTO bank_statements (statement_id, connection_id, tenant_id, statement_format, statement_date, opening_balance, closing_balance, transaction_count, ingested_at)
@@ -234,8 +238,12 @@ func (p *PgStore) RecordStatement(ctx context.Context, stmt *domain.BankStatemen
 // alone, so any caller holding another tenant's connection_id could read
 // its statements — opening/closing balances and transaction counts.
 func (p *PgStore) ListStatements(ctx context.Context, connectionID string) ([]domain.BankStatement, error) {
+	// Return the full ingestion record, including status, raw-source hash,
+	// source/import-batch ids and quarantine reason. The earlier nine-column
+	// projection hid whether a statement was accepted, quarantined or
+	// rejected, and which source evidence it represented.
 	query := `
-		SELECT statement_id, connection_id, tenant_id, statement_format, statement_date, opening_balance, closing_balance, transaction_count, ingested_at
+		SELECT ` + statementColumns + `
 		FROM bank_statements
 		WHERE connection_id = $1
 		  AND tenant_id = $2
@@ -251,7 +259,7 @@ func (p *PgStore) ListStatements(ctx context.Context, connectionID string) ([]do
 
 		for rows.Next() {
 			var s domain.BankStatement
-			if err := rows.Scan(&s.StatementID, &s.ConnectionID, &s.TenantID, &s.StatementFormat, &s.StatementDate, &s.OpeningBalance, &s.ClosingBalance, &s.TransactionCount, &s.IngestedAt); err != nil {
+			if err := scanStatement(rows, &s); err != nil {
 				return err
 			}
 			res = append(res, s)
