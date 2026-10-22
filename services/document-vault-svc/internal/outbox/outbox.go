@@ -125,9 +125,15 @@ func Insert(ctx context.Context, tx pgx.Tx, e Event) error {
 			tenant_id, legal_entity_id, actor_id, correlation_id, headers, payload
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 	`
+	// A tenant-level aggregate (a legal hold, an export package) has no legal
+	// entity: store NULL rather than an empty string the uuid column rejects.
+	var legalEntity any
+	if e.LegalEntityID != "" {
+		legalEntity = e.LegalEntityID
+	}
 	_, err = tx.Exec(ctx, sql,
 		e.OutboxEventID, e.AggregateType, e.AggregateID, e.EventType,
-		e.TenantID, e.LegalEntityID, e.ActorID, e.CorrelationID, headersJSON, payloadJSON,
+		e.TenantID, legalEntity, e.ActorID, e.CorrelationID, headersJSON, payloadJSON,
 	)
 	if err != nil {
 		return fmt.Errorf("insert outbox event: %w", err)

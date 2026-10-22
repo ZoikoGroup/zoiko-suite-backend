@@ -52,6 +52,9 @@ func (l RuleLogic) validateScan() error {
 	if !scanReasonRe.MatchString(l.FindingReason) {
 		return fmt.Errorf("EXCEPTION_SCAN needs finding_reason in UPPER_SNAKE_CASE")
 	}
+	if l.FindingReason == ReasonLateDataAfterCertification {
+		return fmt.Errorf("finding_reason %s is reserved for the late-data sweep", ReasonLateDataAfterCertification)
+	}
 	if strings.TrimSpace(l.FindingAssertion) == "" {
 		return fmt.Errorf("EXCEPTION_SCAN needs finding_assertion")
 	}

@@ -48,6 +48,16 @@ func (s *stubStore) AppendEvent(_ context.Context, e *domain.KillSwitchEvent, ou
 	return nil
 }
 
+// DisengageIfEngaged mirrors the real store's contract: refuse unless the
+// exact scope's latest event is ENGAGE, otherwise append.
+func (s *stubStore) DisengageIfEngaged(ctx context.Context, e *domain.KillSwitchEvent, outboxEvents ...outbox.Event) error {
+	cur, _ := s.LatestEventForScope(ctx, e.Plane, e.Domain, e.ProviderCode, e.TenantID)
+	if cur == nil || cur.Action != domain.KillSwitchActionEngage {
+		return domain.ErrNotCurrentlyEngaged
+	}
+	return s.AppendEvent(ctx, e, outboxEvents...)
+}
+
 func (s *stubStore) LatestEventForScope(_ context.Context, plane, domainName, providerCode, tenantID *string) (*domain.KillSwitchEvent, error) {
 	key := scopeKey(plane, domainName, providerCode, tenantID)
 	var latest *domain.KillSwitchEvent
@@ -254,13 +264,17 @@ func TestResolve_MostSpecificEngagedSwitchWins(t *testing.T) {
 		ApprovedByPrincipalID:      "sre-lead-approver-2",
 	}))
 	// ...then disengage it for one specific tenant only (more specific).
-	r.ServeHTTP(httptest.NewRecorder(), buildRequest(http.MethodPost, "/v1/kill-switches/engage", domain.EngageKillSwitchRequest{
+	tenantEngage := buildRequest(http.MethodPost, "/v1/kill-switches/engage", domain.EngageKillSwitchRequest{
 		Domain:                     "AUTOMATION_ACTION",
 		TenantID:                   testTenantID2,
 		Reason:                     "tenant-safe cleared for automation resumption",
 		ReconciliationProcedureRef: "runbook:tenant-safe",
 		ApprovedByPrincipalID:      "sre-lead-approver-2",
-	}))
+	})
+	// A tenant-scoped engage is made under that tenant's verified identity; a
+	// body tenant_id with no X-Tenant-Id is refused (see tenant_write_test.go).
+	tenantEngage.Header.Set("X-Tenant-Id", testTenantID2)
+	r.ServeHTTP(httptest.NewRecorder(), tenantEngage)
 
 	if len(st.events) != 2 {
 		t.Fatalf("expected 2 stored events, got %d", len(st.events))

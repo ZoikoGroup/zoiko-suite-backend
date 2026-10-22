@@ -361,6 +361,44 @@ func TestIdempotency_StoreFailure_FailsClosed(t *testing.T) {
 	}
 }
 
+// The idempotency record is committed in the SAME transaction as the change: a
+// failed save fails the whole operation (nothing persists) instead of being
+// logged and ignored, and the retry executes cleanly.
+func TestIdempotency_SaveFailure_FailsTheWholeOperation_RetryCreatesOne(t *testing.T) {
+	st := newStubStore()
+	r := newRouter(st, &stubAuthz{})
+	req := domain.CreatePurposeRequest{Statement: "atomic", CompatibilityClass: "PRIMARY"}
+	hdr := map[string]string{"Idempotency-Key": "key-atomic-1"}
+
+	st.idempotencySaveErr = domain.ErrStoreUnavailable
+	wantErr(t, call(r, http.MethodPost, purposesPath, req, tenantA, maker, hdr), http.StatusServiceUnavailable, domain.ErrCodeStoreUnavailable)
+	if len(st.purposes) != 0 || len(st.idempotency) != 0 {
+		t.Fatalf("a failed idempotency save must persist neither the purpose nor the key (%d purposes, %d keys)", len(st.purposes), len(st.idempotency))
+	}
+
+	st.idempotencySaveErr = nil
+	first := call(r, http.MethodPost, purposesPath, req, tenantA, maker, hdr)
+	wantOK(t, first, http.StatusCreated)
+	if first.Header().Get("Idempotency-Replay") == "true" {
+		t.Fatal("the retry after a failed commit must be a fresh execution")
+	}
+	second := call(r, http.MethodPost, purposesPath, req, tenantA, maker, hdr)
+	if second.Header().Get("Idempotency-Replay") != "true" || len(st.purposes) != 1 {
+		t.Fatalf("replay=%q purposes=%d", second.Header().Get("Idempotency-Replay"), len(st.purposes))
+	}
+}
+
+// A refused operation consumes no idempotency key.
+func TestIdempotency_RefusedOperationDoesNotConsumeTheKey(t *testing.T) {
+	st := newStubStore()
+	r := newRouter(st, &stubAuthz{})
+	hdr := map[string]string{"Idempotency-Key": "key-refused-1"}
+	wantErr(t, call(r, http.MethodPost, activitiesPath+"/"+uuid.NewString()+"/validate", nil, tenantA, maker, hdr), http.StatusNotFound, domain.ErrCodeNotFound)
+	if len(st.idempotency) != 0 {
+		t.Fatal("a 404 must not store an idempotency record")
+	}
+}
+
 // ── item 11: stable §32 error contract ───────────────────────────────────────
 
 func TestErrorContract_EveryRefusalCarriesAStableCode(t *testing.T) {

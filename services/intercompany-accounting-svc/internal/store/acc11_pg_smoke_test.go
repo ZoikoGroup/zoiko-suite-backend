@@ -31,7 +31,7 @@ func TestPgStore_ACC11_FullLifecycle_AcknowledgeDisputeResolve_RealDB(t *testing
 		t.Fatalf("CreateEntry: %v", err)
 	}
 
-	if err := s.AcknowledgeCounterparty(ctx, entry.IntercompanyEntryID, "counterparty-user"); err != nil {
+	if err := s.AcknowledgeCounterparty(ctx, entry.IntercompanyEntryID, "counterparty-user", "corr-ack"); err != nil {
 		t.Fatalf("AcknowledgeCounterparty: %v", err)
 	}
 	got, err := s.GetEntry(ctx, entry.IntercompanyEntryID)
@@ -53,11 +53,11 @@ func TestPgStore_ACC11_FullLifecycle_AcknowledgeDisputeResolve_RealDB(t *testing
 	entry.TargetJournalID = &targetJ
 	entry.MatchStatus = domain.MatchStatusMismatch
 	entry.MismatchReason = &reason
-	if err := s.UpdateMatch(ctx, entry, "actor-1", "corr-2"); err != nil {
+	if err := s.UpdateMatch(ctx, entry, testAttempt(entry), "actor-1", "corr-2"); err != nil {
 		t.Fatalf("UpdateMatch: %v", err)
 	}
 
-	if err := s.DisputeIntercompany(ctx, entry.IntercompanyEntryID, "disputer-1", "the counterparty amount looks wrong"); err != nil {
+	if err := s.DisputeIntercompany(ctx, entry.IntercompanyEntryID, "disputer-1", "the counterparty amount looks wrong", "corr-dispute"); err != nil {
 		t.Fatalf("DisputeIntercompany: %v", err)
 	}
 	got, err = s.GetEntry(ctx, entry.IntercompanyEntryID)
@@ -71,7 +71,7 @@ func TestPgStore_ACC11_FullLifecycle_AcknowledgeDisputeResolve_RealDB(t *testing
 		t.Fatalf("expected dispute reason recorded, got %+v", got.DisputeReason)
 	}
 
-	if err := s.ResolveMismatch(ctx, entry.IntercompanyEntryID, "resolver-1", "confirmed FX rounding, accepted"); err != nil {
+	if err := s.ResolveMismatch(ctx, entry.IntercompanyEntryID, "resolver-1", "confirmed FX rounding, accepted", domain.ResolutionAccepted, "corr-resolve"); err != nil {
 		t.Fatalf("ResolveMismatch: %v", err)
 	}
 	got, err = s.GetEntry(ctx, entry.IntercompanyEntryID)
@@ -101,7 +101,7 @@ func TestPgStore_ACC11_DisputeFromWrongStatus_Refused(t *testing.T) {
 		t.Fatalf("CreateEntry: %v", err)
 	}
 
-	err := s.DisputeIntercompany(ctx, entry.IntercompanyEntryID, "disputer-1", "premature dispute")
+	err := s.DisputeIntercompany(ctx, entry.IntercompanyEntryID, "disputer-1", "premature dispute", "corr-2")
 	if err == nil {
 		t.Fatal("expected DisputeIntercompany to refuse a pair that is still UNMATCHED")
 	}
@@ -122,11 +122,17 @@ func TestPgStore_ACC11_InvalidMatchStatus_RejectedByCheckConstraint(t *testing.T
 		t.Fatalf("CreateEntry: %v", err)
 	}
 
-	targetJ := uuid.New().String()
-	entry.TargetJournalID = &targetJ
-	entry.MatchStatus = "NOT_A_REAL_STATUS"
-	if err := s.UpdateMatch(ctx, entry, "actor-1", "corr-2"); err == nil {
+	// Written directly: UpdateMatch refuses any target status other than
+	// MATCHED/MISMATCH before reaching the database, and this test is about
+	// the constraint itself.
+	if _, err := pool.Exec(ctx, `UPDATE intercompany_entries SET match_status = 'NOT_A_REAL_STATUS' WHERE intercompany_entry_id = $1`,
+		entry.IntercompanyEntryID); err == nil {
 		t.Fatal("expected the CHECK constraint to reject an unrecognized match_status value")
+	}
+
+	entry.MatchStatus = "NOT_A_REAL_STATUS"
+	if err := s.UpdateMatch(ctx, entry, testAttempt(entry), "actor-1", "corr-2"); !errors.Is(err, domain.ErrInvalidPairTransition) {
+		t.Fatalf("expected UpdateMatch to refuse a non-match outcome, got %v", err)
 	}
 }
 
@@ -149,17 +155,17 @@ func TestPgStore_ACC11_UpdateMatchOnDisputedPair_Refused(t *testing.T) {
 	entry.TargetJournalID = &targetJ
 	entry.MatchStatus = domain.MatchStatusMismatch
 	entry.MismatchReason = &reason
-	if err := s.UpdateMatch(ctx, entry, "actor-1", "corr-2"); err != nil {
+	if err := s.UpdateMatch(ctx, entry, testAttempt(entry), "actor-1", "corr-2"); err != nil {
 		t.Fatalf("UpdateMatch to MISMATCH: %v", err)
 	}
-	if err := s.DisputeIntercompany(ctx, entry.IntercompanyEntryID, "disputer-1", "amount looks wrong"); err != nil {
+	if err := s.DisputeIntercompany(ctx, entry.IntercompanyEntryID, "disputer-1", "amount looks wrong", "corr-dispute"); err != nil {
 		t.Fatalf("DisputeIntercompany: %v", err)
 	}
 
 	// A stale match result computed from the earlier MISMATCH read.
 	entry.MatchStatus = domain.MatchStatusMatched
 	entry.MismatchReason = nil
-	err := s.UpdateMatch(ctx, entry, "actor-2", "corr-3")
+	err := s.UpdateMatch(ctx, entry, testAttempt(entry), "actor-2", "corr-3")
 	if !errors.Is(err, domain.ErrInvalidPairTransition) {
 		t.Fatalf("expected ErrInvalidPairTransition, got %v", err)
 	}
@@ -174,7 +180,7 @@ func TestPgStore_ACC11_UpdateMatchOnDisputedPair_Refused(t *testing.T) {
 	// An id that does not exist is still reported as not found.
 	missing := *entry
 	missing.IntercompanyEntryID = uuid.New().String()
-	if err := s.UpdateMatch(ctx, &missing, "actor-2", "corr-4"); !errors.Is(err, domain.ErrEntryNotFound) {
+	if err := s.UpdateMatch(ctx, &missing, testAttempt(&missing), "actor-2", "corr-4"); !errors.Is(err, domain.ErrEntryNotFound) {
 		t.Fatalf("expected ErrEntryNotFound for an unknown id, got %v", err)
 	}
 }

@@ -116,44 +116,63 @@ func (c *Clients) getJournalLines(ctx context.Context, tenantID, journalID strin
 	return detail.Lines, nil
 }
 
-// JournalLine is the exported shape of one posted journal line — used by
-// the elimination path (see FetchJournalLines) as well as internally by
-// FetchTrialBalance's own glJournalLine.
+// JournalLine is the line shape a consolidation adjustment posts to
+// general-ledger-svc (PostConsolidationAdjustmentJournal).
 type JournalLine struct {
 	AccountCode  string  `json:"account_code"`
 	DebitAmount  float64 `json:"debit_amount"`
 	CreditAmount float64 `json:"credit_amount"`
 }
 
-// FetchJournalLines returns the real posted lines of one journal from
-// general-ledger-svc — the authoritative source ACC-12 elimination must
-// read from, rather than any invented per-service mapping of intercompany
-// amounts to elimination accounts (no such mapping exists anywhere on this
-// platform; IntercompanyEntry itself carries no account_code).
-func (c *Clients) FetchJournalLines(ctx context.Context, tenantID, journalID string) ([]JournalLine, error) {
-	lines, err := c.getJournalLines(ctx, tenantID, journalID)
+// FetchJournal returns one journal from general-ledger-svc, header and
+// posted lines — the authoritative source ACC-12 elimination reads. The
+// header is what lets a run check that a leg is a FINALIZED journal of its
+// own entity in the run's period, i.e. one whose lines FetchTrialBalance
+// summed (SPEC_DEVIATIONS A2/B9).
+func (c *Clients) FetchJournal(ctx context.Context, tenantID, journalID string) (*domain.PostedJournal, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s/v1/journals/%s", c.ledgerURL, url.PathEscape(journalID)), nil)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]JournalLine, 0, len(lines))
-	for _, l := range lines {
-		out = append(out, JournalLine{AccountCode: l.AccountCode, DebitAmount: l.DebitAmount, CreditAmount: l.CreditAmount})
+	req.Header.Set("X-Tenant-Id", tenantID)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, domain.ErrGLServiceUnavailable
 	}
-	return out, nil
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("%w: general-ledger-svc returned status %d for journal %s", domain.ErrGLServiceUnavailable, resp.StatusCode, journalID)
+	}
+
+	var j domain.PostedJournal
+	if err := json.NewDecoder(resp.Body).Decode(&j); err != nil {
+		return nil, err
+	}
+	return &j, nil
 }
 
-type IntercompanyEntry struct {
-	IntercompanyEntryID string  `json:"intercompany_entry_id"`
-	SourceLegalEntityID string  `json:"source_legal_entity_id"`
-	TargetLegalEntityID string  `json:"target_legal_entity_id"`
-	SourceJournalID     string  `json:"source_journal_id"`
-	TargetJournalID     *string `json:"target_journal_id,omitempty"`
-	Amount              float64 `json:"amount"`
-	MatchStatus         string  `json:"match_status"`
-}
+// IntercompanyEntry is the part of intercompany-accounting-svc's pair this
+// service reads (domain.IntercompanyPair). Amounts are exact decimal text
+// (ZS-DATA-001 D06), never float64; see domain.Decimal for why they are not
+// plain strings.
+type IntercompanyEntry = domain.IntercompanyPair
 
-// FetchMatchedIntercompanyEntries returns every MATCHED intercompany entry
-// for tenantID. principalID is forwarded as X-Principal-Id — intercompany-
+// Intercompany pair statuses this service eliminates. CLOSED is
+// intercompany-accounting-svc's terminal state for a pair that was MATCHED
+// (its migration 000006, SPEC_DEVIATIONS A9/B8): reachable only from
+// MATCHED, so its reciprocal balance is as settled as a MATCHED one's.
+// Leaving it out would make a closed pair look never-matched, and a re-run
+// for its period would leave it uneliminated.
+const (
+	intercompanyStatusMatched = "MATCHED"
+	intercompanyStatusClosed  = "CLOSED"
+)
+
+// FetchEliminableIntercompanyEntries returns every intercompany entry for
+// tenantID whose reciprocal balance is eliminable: MATCHED, or CLOSED
+// (matched, then closed). Unmatched, mismatched, disputed and resolved
+// entries are never returned. principalID is forwarded as X-Principal-Id — intercompany-
 // accounting-svc's ListEntries requires a verified principal
 // (internal/handler/handler.go's requirePrincipal), which this call
 // previously never sent, so every prior invocation of this method failed
@@ -162,7 +181,7 @@ type IntercompanyEntry struct {
 // principal already authorized for CONSOLIDATION_RUN_INITIATE on the
 // calling request — reusing it here, rather than inventing a separate
 // system identity that doesn't exist anywhere on this platform.
-func (c *Clients) FetchMatchedIntercompanyEntries(ctx context.Context, tenantID, principalID string) ([]IntercompanyEntry, error) {
+func (c *Clients) FetchEliminableIntercompanyEntries(ctx context.Context, tenantID, principalID string) ([]IntercompanyEntry, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.intercompanyURL+"/v1/intercompany/entries", nil)
 	if err != nil {
 		return nil, err
@@ -186,13 +205,61 @@ func (c *Clients) FetchMatchedIntercompanyEntries(ctx context.Context, tenantID,
 		return nil, err
 	}
 
-	var matched []IntercompanyEntry
+	var eliminable []IntercompanyEntry
 	for _, entry := range list {
-		if entry.MatchStatus == "MATCHED" {
-			matched = append(matched, entry)
+		if entry.MatchStatus == intercompanyStatusMatched || entry.MatchStatus == intercompanyStatusClosed {
+			eliminable = append(eliminable, entry)
 		}
 	}
-	return matched, nil
+	return eliminable, nil
+}
+
+// FetchReciprocalBalances reads intercompany-accounting-svc's
+// GetReciprocalBalances for one entity pair and period. ACC-12's
+// ExplainElimination returns this as the balance its MATCHED-or-CLOSED rule
+// was checked against, rather than re-deriving the pair's positions from the
+// entry list here (the aggregation is exact there: big.Rat sums, per-currency
+// separation, never float64). principalID is forwarded as X-Principal-Id;
+// that endpoint authorizes both entities.
+func (c *Clients) FetchReciprocalBalances(ctx context.Context, tenantID, principalID, entityA, entityB, fiscalPeriod string) (*domain.ReciprocalBalances, error) {
+	u, err := url.Parse(c.intercompanyURL + "/v1/intercompany/reciprocal-balances")
+	if err != nil {
+		return nil, err
+	}
+	q := u.Query()
+	q.Set("entity_a", entityA)
+	q.Set("entity_b", entityB)
+	q.Set("period", fiscalPeriod)
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("X-Tenant-Id", tenantID)
+	req.Header.Set("X-Principal-Id", principalID)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		c.log.Error("failed to query intercompany-accounting-svc reciprocal balances", zap.Error(err))
+		return nil, domain.ErrIntercompanyUnavailable
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusUnauthorized {
+		// The reciprocal-balances endpoint authorizes BOTH entities. A
+		// denial is the caller's, not an outage: surface it as such.
+		return nil, domain.ErrAuthorizationDenied
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, domain.ErrIntercompanyUnavailable
+	}
+
+	var balances domain.ReciprocalBalances
+	if err := json.NewDecoder(resp.Body).Decode(&balances); err != nil {
+		return nil, err
+	}
+	return &balances, nil
 }
 
 // postingEventLine mirrors general-ledger-svc's own
@@ -205,12 +272,12 @@ type postingEventLine struct {
 }
 
 type postAccountingEventRequest struct {
-	LegalEntityID string              `json:"legal_entity_id"`
-	FiscalPeriod  string              `json:"fiscal_period"`
-	Description   string              `json:"description"`
-	SourceEventID string              `json:"source_event_id"`
-	CorrelationID string              `json:"correlation_id"`
-	Lines         []postingEventLine  `json:"lines"`
+	LegalEntityID string             `json:"legal_entity_id"`
+	FiscalPeriod  string             `json:"fiscal_period"`
+	Description   string             `json:"description"`
+	SourceEventID string             `json:"source_event_id"`
+	CorrelationID string             `json:"correlation_id"`
+	Lines         []postingEventLine `json:"lines"`
 }
 
 type postingExecutionResponse struct {

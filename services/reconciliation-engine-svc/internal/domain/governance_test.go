@@ -150,6 +150,21 @@ func TestCheckCertifierIndependence(t *testing.T) {
 	}
 }
 
+// B34: every principal recorded as certifying the run is barred from revoking
+// it, not only the last.
+func TestCheckRevokerIndependence(t *testing.T) {
+	certifiers := []string{"carol", "dave"}
+	if err := CheckRevokerIndependence("carol", certifiers); !errors.Is(err, ErrRevokerIsCertifier) {
+		t.Fatalf("certifier revokes own certification: %v", err)
+	}
+	if err := CheckRevokerIndependence("dave", certifiers); !errors.Is(err, ErrRevokerIsCertifier) {
+		t.Fatalf("an earlier certifier, not the last, revokes: %v", err)
+	}
+	if err := CheckRevokerIndependence("erin", certifiers); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // Scenario 25: individually immaterial exceptions become material in aggregate.
 // A key-matched pair is counted once; a balance difference is not added on top
 // of the items it is made of.

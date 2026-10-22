@@ -124,6 +124,13 @@ func main() {
 	defer stopRelay()
 	go outbox.NewRelay(pool, publisher, 0, 0, log).Start(relayCtx)
 
+	endpoints, err := source.ParseEndpoints(cfg.SourceEndpoints)
+	if err != nil {
+		log.Fatal("invalid SOURCE_ENDPOINTS", zap.Error(err))
+	}
+	log.Info("control source systems registered", zap.Int("count", len(endpoints)))
+	fetcher := source.NewHTTPFetcher(endpoints, nil)
+
 	// Housekeeping: expire runs nobody executed and announce SLA breaches, once each.
 	go func() {
 		t := time.NewTicker(10 * time.Minute)
@@ -139,6 +146,30 @@ func main() {
 				} else if res.ExpiredRuns+res.SLABreaches+res.Errors > 0 {
 					log.Info("housekeeping sweep", zap.Int("expired_runs", res.ExpiredRuns),
 						zap.Int("sla_breaches", res.SLABreaches), zap.Int("errors", res.Errors))
+				}
+			}
+		}
+	}()
+
+	// Late data after certification (Invariant 14, SPEC_DEVIATIONS A7): re-read the
+	// source watermark of each latest certified run, at most every 30 minutes, and
+	// open a LATE_DATA exception where it has moved. A loop of its own, like the
+	// housekeeping one above, so slow sources cannot delay run expiry or SLA events.
+	lateData := engine.NewLateDataSweeper(pgStore, fetcher, log, 30*time.Minute)
+	go func() {
+		t := time.NewTicker(10 * time.Minute)
+		defer t.Stop()
+		for {
+			select {
+			case <-relayCtx.Done():
+				return
+			case <-t.C:
+				res, err := lateData.Sweep(relayCtx, 100)
+				if err != nil {
+					log.Warn("late-data sweep failed", zap.Error(err))
+				} else if res.Moved+res.Unverified+res.Errors > 0 {
+					log.Info("late-data sweep", zap.Int("runs", res.Runs), zap.Int("moved", res.Moved),
+						zap.Int("opened", res.Opened), zap.Int("unverified", res.Unverified), zap.Int("errors", res.Errors))
 				}
 			}
 		}
@@ -166,12 +197,7 @@ func main() {
 	r.Use(middleware.Logger)
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
-	endpoints, err := source.ParseEndpoints(cfg.SourceEndpoints)
-	if err != nil {
-		log.Fatal("invalid SOURCE_ENDPOINTS", zap.Error(err))
-	}
-	log.Info("control source systems registered", zap.Int("count", len(endpoints)))
-	executor := engine.New(pgStore, source.NewHTTPFetcher(endpoints, nil), log)
+	executor := engine.New(pgStore, fetcher, log)
 
 	handler.RegisterRoutes(r, handler.New(pgStore, authzClient, executor, log))
 

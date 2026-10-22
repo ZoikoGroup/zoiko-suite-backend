@@ -229,8 +229,9 @@ func (h *Handler) RegisterVersion(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusConflict, domain.ErrVersionRaced.Error())
 			return
 		}
-		h.log.Error("insert schema version failed", zap.Error(err), zap.String("event_name", eventName))
-		writeError(w, http.StatusServiceUnavailable, domain.ErrStoreUnavailable.Error())
+		// ErrFieldTooLong (Postgres 22001 — e.g. an Idempotency-Key wider than
+		// its column) is a caller mistake, so 400; anything else is an outage.
+		h.writeStoreErr(w, "insert schema version failed", err)
 		return
 	}
 

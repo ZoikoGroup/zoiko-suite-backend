@@ -38,7 +38,7 @@ Authentication and authorization strictly precede any idempotent replay.
 | 4 | mutating: `X-Correlation-ID` (echoed in the response) | `400 CORRELATION_ID_REQUIRED` |
 | 5 | mutating: `Idempotency-Key`, then replay lookup | `400 IDEMPOTENCY_KEY_REQUIRED`; same key with a different method/path/body `409 IDEMPOTENCY_MISMATCH`; lookup failure `503` |
 
-An idempotent replay returns the original response with `Idempotency-Replay: true`. Records are scoped to (tenant or platform plane, principal, key). Replay bodies are read from a `JSONB` column, so they are JSON-equivalent to the original, not byte-identical.
+An idempotent replay returns the original response with `Idempotency-Replay: true`. Records are scoped to (tenant or platform plane, principal, key). **The claim, the change, its audit row, its outbox event and the stored replay response are committed in one transaction** (`store.RunIdempotent`; every store call the operation makes joins it): if any step — including saving the idempotency record — fails, nothing persists, so a retry re-executes cleanly, and concurrent identical requests execute exactly once. A refused operation (404/409/422 …) stores nothing and does not consume the key. Replay bodies are read from a `JSONB` column, so they are JSON-equivalent to the original, not byte-identical.
 
 The `authorization-svc` client caches GRANTED/DENIED decisions for up to **5 seconds**, so a revocation is honoured within that window.
 
@@ -60,7 +60,7 @@ The `authorization-svc` client caches GRANTED/DENIED decisions for up to **5 sec
 | Path | Method | Action | Description |
 |---|---|---|---|
 | `/privacy/purposes` | `POST` | `PRIVACY_PURPOSE_CREATE` | Create purpose and initial draft version |
-| `/privacy/purposes` | `GET` | `PRIVACY_PURPOSE_READ` | List currently `PUBLISHED` purposes |
+| `/privacy/purposes` | `GET` | `PRIVACY_PURPOSE_READ` | List the currently published purposes: one row per purpose, the published version **in force now** (the version `GET /privacy/purposes/{id}` resolves with no parameters). Superseded versions, published versions whose `effective_from` is still in the future, and drafts are not listed. |
 | `/privacy/purposes/{id}?as_of=&known_as_of=` | `GET` | `PRIVACY_PURPOSE_READ` | Resolve the published version in force |
 | `/privacy/purposes/{id}/versions` | `POST` | `PRIVACY_PURPOSE_CREATE` | Create successor draft from a parent version |
 | `/privacy/purposes/{id}/versions/{vid}/publish` | `POST` | `PRIVACY_PURPOSE_PUBLISH` | Publish (maker-checker, immutable) |
@@ -90,7 +90,7 @@ The canonical (no version segment) forms act on the latest version, resolved onl
 |---|---|---|---|
 | `/privacy/ropa?role=&jurisdiction=` | `GET` | `PRIVACY_ROPA_READ` | `ACTIVE` versions in force, filtered by role (`CONTROLLER`/`PROCESSOR`/`JOINT_CONTROLLER`) and jurisdiction |
 
-`/healthz` and `/readyz` are unauthenticated.
+`/healthz` and `/readyz` are unauthenticated. `/healthz` answers `200 {"status":"ok"}`; `/readyz` answers `200 {"status":"ready"}`, or `503` with the standard error envelope (`STORE_UNAVAILABLE`) when the database pool is missing or does not answer.
 
 The three `*_READ` action names are this service's: §8.1 limits callers to privacy admins, approved domain owners, the change pipeline and compliance services but names no permission.
 
@@ -138,7 +138,7 @@ DRAFT --validate(8 gates)--> VALIDATED --submit--> SUBMITTED --approve--> APPROV
 
 ## Bitemporality (§9.1, §20.3)
 
-`GET …/{id}?as_of=T&known_as_of=K` returns the version that governed at `T` (`effective_from ≤ T < effective_to`) **and** that the platform had approved by `K`. Omit both for "what governs now". No governing version: `404 PRV-002` (purposes: `404 PRV-001`). A present-but-malformed `as_of`/`known_as_of` is `400 INVALID_AS_OF` (RFC 3339 required) — never silently replaced by "now". A retired version stops governing at `effective_to`; suspended intervals are not time-sliced (see limitations).
+`GET …/{id}?as_of=T&known_as_of=K` returns the version that governed at `T` (`effective_from ≤ T < effective_to`) **and** that the platform had approved by `K`. Omit both for "what governs now". No governing version: `404 PRV-002` (purposes: `404 PRV-001`). A present-but-malformed `as_of`/`known_as_of` is `400 INVALID_AS_OF` (RFC 3339 required) — never silently replaced by "now". A retired version stops governing at `effective_to`. **Suspension is time-sliced.** The `version_status` of the version a read returns is its status **at the requested instants**, not today's: a version SUSPENDED now is reported ACTIVE for an `as_of` before the suspension (or after a resume) and SUSPENDED for an `as_of` inside it. Suspend/resume are the `SUSPEND`/`RESUME` rows of the append-only `activity_lifecycle_audit`; the service stamps `recorded_at` itself, so it is both the valid-time and the knowledge-time of the change. The last such row with `recorded_at ≤ as_of` **and** `≤ known_as_of` decides (intervals are half-open: `[suspend, resume)`); with none the version was ACTIVE. A suspension recorded after `known_as_of` is therefore not yet known. A read with both instants at/after the database clock (no `as_of`) returns the stored status unchanged. A SUSPENDED version with no lifecycle row at all (suspended before the audit table existed) cannot be sliced and stays SUSPENDED. A RETIRED version reports the status it had inside its window (ACTIVE/SUSPENDED), since it governed then. A suspended instant still resolves the version (`200`, `version_status: SUSPENDED`), exactly as a current read of a suspended activity does; callers (decision, transfer) refuse anything that is not ACTIVE. The specification (§9.1, §20.3, PRV-002) names no suspended-at-`as_of` status code, so the existing 200-with-status contract was kept rather than inventing a new one. No schema change was needed.
 
 ## Events — transactional outbox only
 
@@ -160,7 +160,7 @@ Every lifecycle change also writes an append-only row to `activity_lifecycle_aud
 
 ## Error contract (§32)
 
-Every error is `{"error": "...", "error_code": "..."}`; an activation refusal adds `findings`. §32 codes keep their §32 meaning: `PRV-001` (unknown/unpublished purpose), `PRV-002` (no governing activity version), `PRV-020` (re-publishing an immutable published purpose), plus the finding codes above. The remaining codes are local because §32 names none for them: `AUTHENTICATION_FAILED`, `AUTHORIZATION_DENIED`, `AUTHORIZATION_SERVICE_UNAVAILABLE`, `TENANT_SCOPE_REQUIRED`, `TENANT_SCOPE_MISMATCH`, `PLATFORM_SCOPE_REQUIRED`, `IDEMPOTENCY_KEY_REQUIRED`, `IDEMPOTENCY_MISMATCH`, `CORRELATION_ID_REQUIRED`, `INVALID_TRANSITION`, `SOD_DENIED`, `INVALID_AS_OF`, `EFFECTIVE_TIME_INVALID`, `VALIDATION_FAILED`, `NOT_FOUND`, `STORE_UNAVAILABLE`, `INTERNAL_ERROR`.
+Every error is `{"error": "...", "error_code": "..."}`; an activation refusal adds `findings`. §32 codes keep their §32 meaning: `PRV-001` (unknown/unpublished purpose), `PRV-002` (no governing activity version), `PRV-020` (re-publishing an immutable published purpose), plus the finding codes above. The remaining codes are local because §32 names none for them: `AUTHENTICATION_FAILED`, `AUTHORIZATION_DENIED`, `AUTHORIZATION_SERVICE_UNAVAILABLE`, `TENANT_SCOPE_REQUIRED`, `TENANT_SCOPE_MISMATCH`, `PLATFORM_SCOPE_REQUIRED`, `IDEMPOTENCY_KEY_REQUIRED`, `IDEMPOTENCY_MISMATCH`, `CORRELATION_ID_REQUIRED`, `INVALID_TRANSITION`, `SOD_DENIED`, `INVALID_AS_OF`, `EFFECTIVE_TIME_INVALID`, `VALIDATION_FAILED`, `NOT_FOUND`, `METHOD_NOT_ALLOWED`, `STORE_UNAVAILABLE`, `INTERNAL_ERROR`. **Transport-level errors use the same envelope.** An unknown route is `404 NOT_FOUND`, a known path with an unsupported method is `405 METHOD_NOT_ALLOWED` (with an `Allow` header), a panic recovered in a handler is `500 INTERNAL_ERROR` (the panic value and stack go to the log, never to the caller), and a failed `/readyz` is `503 STORE_UNAVAILABLE`. The one boundary: a malformed request that Go's `net/http` server rejects before routing (invalid request line, over-large headers) gets `net/http`'s own plain-text response; that layer is not service code.
 
 ---
 
@@ -191,13 +191,13 @@ curl http://localhost:8151/healthz
 curl http://localhost:8151/readyz
 ```
 
-If `TEST_DATABASE_URL` is unset the integration tests fall back to `postgres://postgres:pgsuper@localhost:55432/postgres`. The server aborts on startup if the database is unreachable.
+Latest run (database reachable): **95 top-level tests pass, none skipped** (domain 4, handler 62, store 29). If the database is unreachable the integration tests skip (a run without one proves nothing about RLS, the outbox, atomic idempotency or the migrations). If `TEST_DATABASE_URL` is unset the integration tests fall back to `postgres://postgres:pgsuper@localhost:55432/postgres`. The server aborts on startup if the database is unreachable.
 
 ---
 
 ## Dependency-blocked items
 
-- **`privacy-consent-svc`, `privacy-decision-svc`, `privacy-transfer-svc`** call `GET /privacy/purposes/{id}` and `GET /privacy/processing-activities/{id}` with `X-Tenant-Id` only. These routes now require `X-Principal-Id` and a grant, so those calls return `401` until the clients send a service principal granted `PRIVACY_PURPOSE_READ` / `PRIVACY_ACTIVITY_READ`.
+- **`privacy-consent-svc`, `privacy-decision-svc`, `privacy-transfer-svc`** call `GET /privacy/purposes/{id}` and `GET /privacy/processing-activities/{id}`. Their clients forward the calling request's `X-Tenant-Id` and, when it has one, its `X-Principal-Id` (a call with no principal is refused `401` here); the calls still return `401`/`403` until that principal holds `PRIVACY_PURPOSE_READ` / `PRIVACY_ACTIVITY_READ` in `authorization-svc`, and a service-to-service identity for callers without an end-user principal is not defined by the architecture. Neither is provisioned here; end-to-end behaviour was not verified against live services.
 - **`authorization-svc`** must provision `PRIVACY_PURPOSE_READ`, `PRIVACY_ACTIVITY_READ`, `PRIVACY_ROPA_READ` and the platform-scope grant for platform-plane principals; until then reads fail closed with `403`. Platform-scope authorization against the live service was not verified.
 - **Frontend** must send the new content fields (`privacy_owner`, `necessity_rationale`, `special_condition_refs`, `processor_refs`), may select the platform scope, and must stop sending a free `effective_from` on activation.
 - **WFC (§2.1/§9.1)** owns workflow timers, approval orchestration and escalation; none is integrated.
@@ -205,9 +205,9 @@ If `TEST_DATABASE_URL` is unset the integration tests fall back to `postgres://p
 
 ## Remaining limitations
 
-- Suspended intervals are not time-sliced in `as_of` resolution (the audit table records suspend/resume instants).
-- Reference *existence* is not verified, only presence.
-- The idempotency record is saved after the transaction commits; a crash between the two lets a retry re-execute, and concurrent first requests with one key are not serialised.
+- *(fixed)* Suspension is now correctly time-sliced for `as_of` historical resolution (see Bitemporality).
+- Reference *existence* is not verified, only presence (`CROSS-SERVICE / EXTERNAL DEPENDENCY`). §8.2 gate 4 asks for lawful-basis / special-condition references "from PDC" and gate 6 for retention/DRC references and transfer/processor dependencies to be *identified*; the catalogues that could confirm that a reference is approved, active or even exists (PDC, DRC/retention-registry, PRV-05) are not callable contracts this service may depend on, and duplicating their logic here would invent rules. Presence, non-blank entries and the gate-triggering conditions are enforced.
+- `owner` (the accountable business owner) is required when a draft is **created** (`400 VALIDATION_FAILED`), so the gate-1 `owner` finding cannot occur for a version created through the API; `privacy_owner` is checked at validate and again at activate.
 - Versions activated before migration 000006 have no `privacy_owner`.
 
 ## Spec points carried as clarifications

@@ -4,8 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"net/http"
 	"math/big"
+	"net/http"
 	"net/http/httptest"
 	"testing"
 
@@ -34,8 +34,13 @@ func TestGetActiveAbsoluteTolerance_HappyPath_ReturnsLatestVersion(t *testing.T)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if tol.Cmp(big.NewRat(75, 1)) != 0 {
-		t.Fatalf("expected the highest-version (current) policy's tolerance 75, got %v", tol)
+	if tol.Amount.Cmp(big.NewRat(75, 1)) != 0 {
+		t.Fatalf("expected the highest-version (current) policy's tolerance 75, got %v", tol.Amount)
+	}
+	// A8: the version is no longer discarded — it is the policy version the
+	// suggestion must record.
+	if tol.Version != 2 {
+		t.Fatalf("expected tolerance_version 2, got %d", tol.Version)
 	}
 }
 
@@ -57,8 +62,8 @@ func TestGetActiveAbsoluteTolerance_PreservesExactDecimal(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	want, _ := new(big.Rat).SetString("12345678901234.567")
-	if tol.Cmp(want) != 0 {
-		t.Fatalf("tolerance lost precision: got %s, want 12345678901234.567", tol.FloatString(6))
+	if tol.Amount.Cmp(want) != 0 {
+		t.Fatalf("tolerance lost precision: got %s, want 12345678901234.567", tol.Amount.FloatString(6))
 	}
 }
 
@@ -140,6 +145,23 @@ func TestEnvelopeForwarded_MintsWhenAbsent(t *testing.T) {
 	}
 	if got.Get("X-Source-Channel") != "system" {
 		t.Errorf("X-Source-Channel = %q, want system", got.Get("X-Source-Channel"))
+	}
+}
+
+// A policy row with no positive version cannot be cited as score basis.
+func TestGetActiveAbsoluteTolerance_MissingVersion_FailsClosed(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"items": []map[string]any{{"absolute_tolerance": "10"}},
+		})
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, zap.NewNop())
+	_, err := c.GetActiveAbsoluteTolerance(context.Background(), "tenant-1", "principal-1", "le-1", "SOME_METRIC")
+	if !errors.Is(err, ErrServiceUnavailable) {
+		t.Fatalf("expected ErrServiceUnavailable on a missing tolerance_version, got %v", err)
 	}
 }
 

@@ -236,12 +236,13 @@ func (s *PgStore) CreateLegalHold(ctx context.Context, h *domain.LegalHold, outb
 // A hold belonging to another tenant answers ErrLegalHoldNotFound rather than a
 // forbidden, so a probe cannot confirm that an id exists.
 //
-// TWO GATES, AND NEITHER IS REDUNDANT. The predicate is in the SQL *and* the
-// read runs inside withTenant so migration 000002's policy applies too. The
-// policy binds app_retention_registry on Supabase and binds nothing at all on
-// the compose estate, where services connect as the Postgres superuser and a
-// superuser bypasses row security unconditionally. A predicate-only fix leaves
-// the policy unexercised; a policy-only fix leaves compose wide open.
+// TWO GATES, AND NEITHER IS REDUNDANT. The tenant predicate is in the SQL and
+// the read runs inside withTenant, so migration 000002's row-level-security
+// policy applies too. The service connects as the least-privilege zoiko_app role
+// (NOSUPERUSER, NOBYPASSRLS — see deployments/docker-compose.yml), so the policy
+// is genuinely in force; the explicit predicate keeps the query correct on its
+// own if RLS is ever bypassed (a different role, a pooler change). Either gate
+// alone would leave the other as a single point of failure.
 func (s *PgStore) FindLegalHoldByID(ctx context.Context, id, callerTenantID string) (*domain.LegalHold, error) {
 	if callerTenantID == "" {
 		return nil, domain.ErrTenantMissing

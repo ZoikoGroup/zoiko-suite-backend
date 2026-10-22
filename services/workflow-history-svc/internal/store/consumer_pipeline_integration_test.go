@@ -31,6 +31,7 @@ package store_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -325,5 +326,258 @@ func TestConsumerPipelineIntegration(t *testing.T) {
 			assert.Equal(t, "t-all", e.TenantID)
 			assert.Equal(t, "e-all", e.LegalEntityID)
 		}
+	})
+
+	// ── Tenant-context inheritance (workflow.started is the only source) ─────
+	// Every assertion below reads the PERSISTED row with a raw query, not the
+	// value the consumer returned, so it proves what was actually written.
+	persisted := func(t *testing.T, eventID string) (tenant, entity string, ok bool) {
+		t.Helper()
+		err := pool.QueryRow(ctx, `SELECT tenant_id, legal_entity_id FROM workflow_history_events WHERE event_id=$1`, eventID).Scan(&tenant, &entity)
+		if err != nil {
+			return "", "", false
+		}
+		return tenant, entity, true
+	}
+	seedRaw := func(t *testing.T, eventID, instance, eventType, tenant, entity string, at time.Time) {
+		t.Helper()
+		_, err := pool.Exec(ctx, `INSERT INTO workflow_history_events (event_id, workflow_instance_id, event_type, correlation_id, tenant_id, legal_entity_id, payload, recorded_at)
+			VALUES ($1,$2,$3,'corr',$4,$5,'{}',$6)`, eventID, instance, eventType, tenant, entity, at)
+		require.NoError(t, err)
+	}
+	granted := func(t *testing.T, instance string) []byte {
+		return buildMessage(t, "approval.granted", "corr-tc", map[string]any{
+			"workflow_instance_id": instance, "stage_order": 1, "approver_principal_id": "u-x",
+		})
+	}
+	started := func(t *testing.T, instance, tenant, entity string) []byte {
+		return buildMessage(t, "workflow.started", "corr-tc", map[string]any{
+			"workflow_instance_id": instance, "tenant_id": tenant, "legal_entity_id": entity,
+		})
+	}
+
+	t.Run("tenant context: persisted tenant/entity come from the started row", func(t *testing.T) {
+		require.NoError(t, c.Handle(ctx, "tc1-start", started(t, "wf-tc1", "t-tc1", "e-tc1")))
+		require.NoError(t, c.Handle(ctx, "tc1-g1", granted(t, "wf-tc1")))
+		require.NoError(t, c.Handle(ctx, "tc1-g2", granted(t, "wf-tc1")))
+		for _, id := range []string{"tc1-start", "tc1-g1", "tc1-g2"} {
+			tenant, entity, ok := persisted(t, id)
+			require.True(t, ok, id)
+			assert.Equal(t, "t-tc1", tenant, id)
+			assert.Equal(t, "e-tc1", entity, id)
+		}
+	})
+
+	t.Run("tenant context: an earlier non-start row is never used as the source", func(t *testing.T) {
+		// A rogue non-start row, older than the started row, for the same instance.
+		seedRaw(t, "tc2-rogue", "wf-tc2", "approval.granted", "t-rogue", "e-rogue", time.Now().Add(-time.Hour))
+		require.NoError(t, c.Handle(ctx, "tc2-start", started(t, "wf-tc2", "t-real", "e-real")))
+		require.NoError(t, c.Handle(ctx, "tc2-next", granted(t, "wf-tc2")))
+
+		tenant, entity, ok := persisted(t, "tc2-next")
+		require.True(t, ok)
+		assert.Equal(t, "t-real", tenant, "inherited from the workflow.started row, not the earliest row")
+		assert.Equal(t, "e-real", entity)
+	})
+
+	t.Run("tenant context: no started row, only non-start rows -> fail closed, nothing stored", func(t *testing.T) {
+		seedRaw(t, "tc3-rogue", "wf-tc3", "workflow.completed", "t-rogue", "e-rogue", time.Now().Add(-time.Hour))
+		err := c.Handle(ctx, "tc3-next", granted(t, "wf-tc3"))
+		require.Error(t, err)
+		_, _, ok := persisted(t, "tc3-next")
+		assert.False(t, ok, "the refused event must not be persisted")
+	})
+
+	t.Run("tenant context: same instance id under two tenants is ambiguous, nothing inherited", func(t *testing.T) {
+		// The schema keys on event_id only, so this state is representable.
+		require.NoError(t, c.Handle(ctx, "tc4-start-a", started(t, "wf-tc4", "t-tc4-a", "e-tc4-a")))
+		require.NoError(t, c.Handle(ctx, "tc4-start-b", started(t, "wf-tc4", "t-tc4-b", "e-tc4-b")))
+
+		err := c.Handle(ctx, "tc4-next", granted(t, "wf-tc4"))
+		require.ErrorIs(t, err, store.ErrAmbiguousTenantContext)
+		_, _, ok := persisted(t, "tc4-next")
+		assert.False(t, ok, "must not be filed under either tenant")
+
+		// And each tenant still sees only its own started row.
+		a, err := pgStore.ListByInstance(ctx, "t-tc4-a", "wf-tc4")
+		require.NoError(t, err)
+		require.Len(t, a, 1)
+		assert.Equal(t, "e-tc4-a", a[0].LegalEntityID)
+	})
+
+	t.Run("tenant context: duplicate started rows with the same context are not ambiguous", func(t *testing.T) {
+		require.NoError(t, c.Handle(ctx, "tc5-start-1", started(t, "wf-tc5", "t-tc5", "e-tc5")))
+		require.NoError(t, c.Handle(ctx, "tc5-start-2", started(t, "wf-tc5", "t-tc5", "e-tc5")))
+		require.NoError(t, c.Handle(ctx, "tc5-next", granted(t, "wf-tc5")))
+		tenant, entity, ok := persisted(t, "tc5-next")
+		require.True(t, ok)
+		assert.Equal(t, "t-tc5", tenant)
+		assert.Equal(t, "e-tc5", entity)
+	})
+
+	t.Run("tenant context: no cross-tenant inheritance for an unrelated instance", func(t *testing.T) {
+		require.NoError(t, c.Handle(ctx, "tc6-start", started(t, "wf-tc6-a", "t-tc6", "e-tc6")))
+		err := c.Handle(ctx, "tc6-next", granted(t, "wf-tc6-other"))
+		require.Error(t, err, "another instance's started row must not be borrowed")
+		_, _, ok := persisted(t, "tc6-next")
+		assert.False(t, ok)
+	})
+
+	// ── deterministic ordering and keyset pagination (ZS-API-001 §15) ────────
+
+	// insertTied writes rows that ALL share one recorded_at, in descending
+	// event_id order, so neither insertion order nor the timestamp can produce the
+	// expected order — only the event_id tie-breaker can.
+	insertTied := func(t *testing.T, tenant, entity, instance string, n int, at time.Time) {
+		t.Helper()
+		tx, err := pool.Begin(ctx)
+		require.NoError(t, err)
+		defer func() { _ = tx.Rollback(ctx) }()
+		_, err = tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenant)
+		require.NoError(t, err)
+		for i := n - 1; i >= 0; i-- {
+			_, err = tx.Exec(ctx, `INSERT INTO workflow_history_events
+				(event_id, workflow_instance_id, event_type, correlation_id, tenant_id, legal_entity_id, payload, recorded_at)
+				VALUES ($1, $2, 'approval.granted', 'corr', $3, $4, '{}'::jsonb, $5)`,
+				fmt.Sprintf("%s-e%02d", instance, i), instance, tenant, entity, at)
+			require.NoError(t, err)
+		}
+		require.NoError(t, tx.Commit(ctx))
+	}
+	ids := func(evs []store.WorkflowHistoryEvent) []string {
+		out := make([]string, 0, len(evs))
+		for _, e := range evs {
+			out = append(out, e.EventID)
+		}
+		return out
+	}
+
+	t.Run("ordering: rows sharing recorded_at come back in event_id order on both queries", func(t *testing.T) {
+		at := time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)
+		insertTied(t, "t-ord", "e-ord", "wf-ord", 5, at)
+		want := []string{"wf-ord-e00", "wf-ord-e01", "wf-ord-e02", "wf-ord-e03", "wf-ord-e04"}
+
+		byInstance, err := pgStore.ListByInstance(ctx, "t-ord", "wf-ord")
+		require.NoError(t, err)
+		assert.Equal(t, want, ids(byInstance))
+
+		byFilter, err := pgStore.ListByFilter(ctx, store.QueryFilter{TenantID: "t-ord", LegalEntityID: "e-ord",
+			From: at.Add(-time.Hour), To: at.Add(time.Hour)})
+		require.NoError(t, err)
+		assert.Equal(t, want, ids(byFilter))
+	})
+
+	t.Run("pagination: keyset pages over tied timestamps lose and repeat nothing", func(t *testing.T) {
+		at := time.Date(2026, 7, 2, 12, 0, 0, 0, time.UTC)
+		insertTied(t, "t-pg", "e-pg", "wf-pg", 7, at)
+
+		walk := func(next func(after *store.PageCursor) ([]store.WorkflowHistoryEvent, error)) []string {
+			var seen []string
+			var after *store.PageCursor
+			for i := 0; i < 10; i++ {
+				page, err := next(after)
+				require.NoError(t, err)
+				if len(page) == 0 {
+					break
+				}
+				require.LessOrEqual(t, len(page), 3)
+				seen = append(seen, ids(page)...)
+				last := page[len(page)-1]
+				after = &store.PageCursor{RecordedAt: last.RecordedAt, EventID: last.EventID}
+			}
+			return seen
+		}
+		want := []string{"wf-pg-e00", "wf-pg-e01", "wf-pg-e02", "wf-pg-e03", "wf-pg-e04", "wf-pg-e05", "wf-pg-e06"}
+
+		assert.Equal(t, want, walk(func(after *store.PageCursor) ([]store.WorkflowHistoryEvent, error) {
+			return pgStore.ListByInstancePage(ctx, "t-pg", "wf-pg", after, 3)
+		}))
+		assert.Equal(t, want, walk(func(after *store.PageCursor) ([]store.WorkflowHistoryEvent, error) {
+			return pgStore.ListByFilterPage(ctx, store.QueryFilter{TenantID: "t-pg", LegalEntityID: "e-pg",
+				From: at.Add(-time.Hour), To: at.Add(time.Hour)}, after, 3)
+		}))
+
+		// Tenant scoping holds on every page: another tenant sees nothing, even with
+		// the right instance id and a cursor.
+		other, err := pgStore.ListByInstancePage(ctx, "t-other", "wf-pg", nil, 3)
+		require.NoError(t, err)
+		assert.Empty(t, other)
+		otherF, err := pgStore.ListByFilterPage(ctx, store.QueryFilter{TenantID: "t-other", LegalEntityID: "e-pg",
+			From: at.Add(-time.Hour), To: at.Add(time.Hour)}, nil, 3)
+		require.NoError(t, err)
+		assert.Empty(t, otherF)
+	})
+
+	// ── envelope tenant integrity ────────────────────────────────────────────
+
+	withEnvelopeTenant := func(t *testing.T, raw []byte, tenant string) []byte {
+		t.Helper()
+		var env map[string]any
+		require.NoError(t, json.Unmarshal(raw, &env))
+		env["tenant_id"] = tenant
+		out, err := json.Marshal(env)
+		require.NoError(t, err)
+		return out
+	}
+
+	t.Run("envelope tenant: a mismatching tenant is refused against a real database, a matching one is stored", func(t *testing.T) {
+		require.NoError(t, c.Handle(ctx, "et-start", started(t, "wf-et", "t-et", "e-et")))
+
+		err := c.Handle(ctx, "et-bad", withEnvelopeTenant(t, granted(t, "wf-et"), "t-someone-else"))
+		require.Error(t, err)
+		assert.True(t, errors.Is(err, consumer.ErrEnvelopeTenantMismatch), "got %v", err)
+		_, _, ok := persisted(t, "et-bad")
+		assert.False(t, ok, "a mismatched event is not stored")
+		other, err := pgStore.ListByInstance(ctx, "t-someone-else", "wf-et")
+		require.NoError(t, err)
+		assert.Empty(t, other)
+
+		require.NoError(t, c.Handle(ctx, "et-good", withEnvelopeTenant(t, granted(t, "wf-et"), "t-et")))
+		tenant, _, ok := persisted(t, "et-good")
+		require.True(t, ok)
+		assert.Equal(t, "t-et", tenant)
+
+		require.NoError(t, c.Handle(ctx, "et-none", granted(t, "wf-et")), "no envelope tenant: accepted as before")
+		_, _, ok = persisted(t, "et-none")
+		assert.True(t, ok)
+	})
+
+	// ── database-level guarantees ────────────────────────────────────────────
+	// These pin what the migrations promise and nothing else in this suite
+	// exercised: append-only rows, forced RLS, and a database-owned recorded_at.
+
+	t.Run("storage guarantees: UPDATE and DELETE are rejected, RLS is forced, recorded_at is database-generated", func(t *testing.T) {
+		before := time.Now().UTC().Add(-2 * time.Second)
+		require.NoError(t, pgStore.Append(ctx, store.WorkflowHistoryEvent{
+			EventID: "sg-1", WorkflowInstanceID: "wf-sg", EventType: "workflow.started", CorrelationID: "c",
+			TenantID: "t-sg", LegalEntityID: "e-sg", Payload: json.RawMessage(`{}`),
+			RecordedAt: time.Date(2001, 1, 1, 0, 0, 0, 0, time.UTC), // a producer-supplied time must be ignored
+		}))
+		evs, err := pgStore.ListByInstance(ctx, "t-sg", "wf-sg")
+		require.NoError(t, err)
+		require.Len(t, evs, 1)
+		assert.True(t, evs[0].RecordedAt.After(before), "recorded_at is the database clock, not the caller's value: %s", evs[0].RecordedAt)
+
+		_, err = pool.Exec(ctx, `UPDATE workflow_history_events SET event_type = 'x' WHERE event_id = 'sg-1'`)
+		require.Error(t, err, "UPDATE must be rejected")
+		assert.Contains(t, err.Error(), "append-only")
+		_, err = pool.Exec(ctx, `DELETE FROM workflow_history_events WHERE event_id = 'sg-1'`)
+		require.Error(t, err, "DELETE must be rejected")
+		assert.Contains(t, err.Error(), "append-only")
+
+		// A duplicate event_id is absorbed, not stored twice.
+		require.NoError(t, pgStore.Append(ctx, store.WorkflowHistoryEvent{
+			EventID: "sg-1", WorkflowInstanceID: "wf-sg", EventType: "workflow.started", CorrelationID: "c2",
+			TenantID: "t-sg", LegalEntityID: "e-sg", Payload: json.RawMessage(`{"again":true}`)}))
+		evs, err = pgStore.ListByInstance(ctx, "t-sg", "wf-sg")
+		require.NoError(t, err)
+		assert.Len(t, evs, 1)
+		assert.Equal(t, "c", evs[0].CorrelationID, "the first write wins")
+
+		var rls, forced bool
+		require.NoError(t, pool.QueryRow(ctx,
+			`SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname = 'workflow_history_events'`).Scan(&rls, &forced))
+		assert.True(t, rls, "row-level security is enabled")
+		assert.True(t, forced, "and forced")
 	})
 }

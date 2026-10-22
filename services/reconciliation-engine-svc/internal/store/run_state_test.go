@@ -58,7 +58,7 @@ func TestRunState_CleanRunToSupersession(t *testing.T) {
 	matched := f.match(run.RunID)
 	wantStates(t, matched, domain.RunRunning, domain.ResultMatch, domain.CertEligible)
 
-	if _, err := f.s.Certify(f.ctx, orgA, run.RunID, "certifier", f.claim("Certify", run.RunID)); err != nil {
+	if _, err := f.s.Certify(f.ctx, orgA, run.RunID, "certifier", grant("certifier"), f.claim("Certify", run.RunID)); err != nil {
 		t.Fatalf("certify: %v", err)
 	}
 	certified, _ := f.s.GetRun(f.ctx, orgA, run.RunID)
@@ -90,7 +90,7 @@ func TestRunState_VarianceThenResolved(t *testing.T) {
 	})
 	matched := f.match(run.RunID)
 	wantStates(t, matched, domain.RunExceptionsOpen, domain.ResultVariance, domain.CertUncertified)
-	if _, err := f.s.Certify(f.ctx, orgA, run.RunID, "test-operator", f.claim("Certify", run.RunID)); !errors.Is(err, domain.ErrOpenExceptionsRemain) {
+	if _, err := f.s.Certify(f.ctx, orgA, run.RunID, "test-operator", grant("test-operator"), f.claim("Certify", run.RunID)); !errors.Is(err, domain.ErrOpenExceptionsRemain) {
 		t.Fatalf("certify a VARIANCE: %v", err)
 	}
 
@@ -144,7 +144,7 @@ func TestRunState_FailedRunIsIndeterminateAndTerminal(t *testing.T) {
 	if _, err := f.s.Match(f.ctx, orgA, run.RunID, domain.MatchRequest{}, "test-operator", f.claim("Match", run.RunID)); !errors.Is(err, domain.ErrRunNotOpen) {
 		t.Fatalf("match a failed run: %v", err)
 	}
-	if _, err := f.s.Certify(f.ctx, orgA, run.RunID, "test-operator", f.claim("Certify", run.RunID)); !errors.Is(err, domain.ErrRunNotOpen) {
+	if _, err := f.s.Certify(f.ctx, orgA, run.RunID, "test-operator", grant("test-operator"), f.claim("Certify", run.RunID)); !errors.Is(err, domain.ErrRunNotOpen) {
 		t.Fatalf("certify a failed run: %v", err)
 	}
 
@@ -188,7 +188,7 @@ func TestRunState_RaiseExceptionBeforeMatchIsRefused(t *testing.T) {
 	if !errors.Is(err, domain.ErrRunNotEvaluated) {
 		t.Fatalf("raise exception on a Planned run: %v, want ErrRunNotEvaluated", err)
 	}
-	if _, err := f.s.Certify(f.ctx, orgA, run.RunID, "test-operator", f.claim("Certify", run.RunID)); !errors.Is(err, domain.ErrRunNotEvaluated) {
+	if _, err := f.s.Certify(f.ctx, orgA, run.RunID, "test-operator", grant("test-operator"), f.claim("Certify", run.RunID)); !errors.Is(err, domain.ErrRunNotEvaluated) {
 		t.Fatalf("certify a Planned run: %v, want ErrRunNotEvaluated", err)
 	}
 	got, _ := f.s.GetRun(f.ctx, orgA, run.RunID)

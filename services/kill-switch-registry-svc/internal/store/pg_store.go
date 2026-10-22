@@ -20,6 +20,12 @@ type Store interface {
 	// Never an UPDATE — the append-only doctrine is enforced here, not just documented.
 	AppendEvent(ctx context.Context, e *domain.KillSwitchEvent, outboxEvents ...outbox.Event) error
 
+	// DisengageIfEngaged appends a DISENGAGE event (and its outbox events) only
+	// if the EXACT scope tuple's latest event is currently ENGAGE, deciding and
+	// inserting in one serialized transaction. Returns domain.ErrNotCurrentlyEngaged
+	// otherwise — including for the loser of two concurrent disengages.
+	DisengageIfEngaged(ctx context.Context, e *domain.KillSwitchEvent, outboxEvents ...outbox.Event) error
+
 	// LatestEventForScope returns the most recent event for the EXACT
 	// scope tuple given (nil means that dimension is nil in the row too —
 	// no fallback matching). Returns nil, nil if no event exists yet for
@@ -116,28 +122,85 @@ func scanEvent(row pgx.Row) (*domain.KillSwitchEvent, error) {
 // 000002's header, which says so at length rather than leaving it implied.
 func (s *PgStore) AppendEvent(ctx context.Context, e *domain.KillSwitchEvent, outboxEvents ...outbox.Event) error {
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `
-			INSERT INTO kill_switch_events (
-				kill_switch_event_id, plane, domain, provider_code, tenant_id,
-				action, reason, reconciliation_procedure_ref,
-				approved_by_principal_id, created_at, created_by_principal_id
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-		`, e.KillSwitchEventID, e.Plane, e.Domain, e.ProviderCode, e.TenantID,
-			string(e.Action), e.Reason, e.ReconciliationProcedureRef,
-			e.ApprovedByPrincipalID, e.CreatedAt, e.CreatedByPrincipalID,
-		)
-		if err != nil {
-			return err
-		}
-		for _, oEvt := range outboxEvents {
-			if err := outbox.Insert(ctx, tx, oEvt); err != nil {
-				return fmt.Errorf("insert outbox event: %w", err)
-			}
-		}
-		return nil
+		return insertEventTx(ctx, tx, e, outboxEvents)
 	})
 	if err != nil {
 		return fmt.Errorf("insert kill switch event: %w", err)
+	}
+	return nil
+}
+
+func insertEventTx(ctx context.Context, tx pgx.Tx, e *domain.KillSwitchEvent, outboxEvents []outbox.Event) error {
+	_, err := tx.Exec(ctx, `
+		INSERT INTO kill_switch_events (
+			kill_switch_event_id, plane, domain, provider_code, tenant_id,
+			action, reason, reconciliation_procedure_ref,
+			approved_by_principal_id, created_at, created_by_principal_id
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+	`, e.KillSwitchEventID, e.Plane, e.Domain, e.ProviderCode, e.TenantID,
+		string(e.Action), e.Reason, e.ReconciliationProcedureRef,
+		e.ApprovedByPrincipalID, e.CreatedAt, e.CreatedByPrincipalID,
+	)
+	if err != nil {
+		return err
+	}
+	for _, oEvt := range outboxEvents {
+		if err := outbox.Insert(ctx, tx, oEvt); err != nil {
+			return fmt.Errorf("insert outbox event: %w", err)
+		}
+	}
+	return nil
+}
+
+// scopeLockKey identifies one exact scope tuple (nil is distinct from any
+// value, and values are quoted so no delimiter can blur two tuples together).
+func scopeLockKey(plane, domainName, providerCode, tenantID *string) string {
+	f := func(s *string) string {
+		if s == nil {
+			return "<nil>"
+		}
+		return fmt.Sprintf("%q", *s)
+	}
+	return "kill_switch_scope:" + f(plane) + "|" + f(domainName) + "|" + f(providerCode) + "|" + f(tenantID)
+}
+
+// DisengageIfEngaged makes "the scope is currently ENGAGED" and "append the
+// DISENGAGE" one atomic step.
+//
+// The history is an append-only event log with no current-state row to lock,
+// so serialization is a transaction-scoped advisory lock keyed on the exact
+// scope tuple: concurrent disengages of one scope queue on it, and the second
+// one — whose first statement after acquiring the lock takes a fresh READ
+// COMMITTED snapshot — sees the first one's DISENGAGE and is refused. Disengages
+// of different scopes do not contend. The lock is released at commit/rollback;
+// nothing persists, no state model is added, and RLS applies unchanged (the
+// latest-event read below runs under the same app.tenant_id).
+//
+// The scope tuple includes the tenant, so a caller cannot make one tenant's
+// disengage wait on another tenant's scope except by naming the same tuple.
+func (s *PgStore) DisengageIfEngaged(ctx context.Context, e *domain.KillSwitchEvent, outboxEvents ...outbox.Event) error {
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
+			scopeLockKey(e.Plane, e.Domain, e.ProviderCode, e.TenantID)); err != nil {
+			return err
+		}
+		current, err := scanEvent(tx.QueryRow(ctx, latestForScopeQuery, e.Plane, e.Domain, e.ProviderCode, e.TenantID))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrNotCurrentlyEngaged
+		}
+		if err != nil {
+			return err
+		}
+		if current.Action != domain.KillSwitchActionEngage {
+			return domain.ErrNotCurrentlyEngaged
+		}
+		return insertEventTx(ctx, tx, e, outboxEvents)
+	})
+	if errors.Is(err, domain.ErrNotCurrentlyEngaged) {
+		return domain.ErrNotCurrentlyEngaged
+	}
+	if err != nil {
+		return fmt.Errorf("disengage kill switch: %w", err)
 	}
 	return nil
 }
@@ -147,8 +210,8 @@ func (s *PgStore) AppendEvent(ctx context.Context, e *domain.KillSwitchEvent, ou
 // equals the request's value for that dimension. When the request's own
 // value for a dimension is nil, only rows with that dimension also nil can
 // match (handled by passing the nil-safe equality directly).
-func (s *PgStore) LatestEventForScope(ctx context.Context, plane, domainName, providerCode, tenantID *string) (*domain.KillSwitchEvent, error) {
-	const query = `
+// latestForScopeQuery reads the latest event for an EXACT scope tuple.
+const latestForScopeQuery = `
 		SELECT ` + eventColumns + `
 		FROM kill_switch_events
 		WHERE plane IS NOT DISTINCT FROM $1
@@ -158,10 +221,11 @@ func (s *PgStore) LatestEventForScope(ctx context.Context, plane, domainName, pr
 		ORDER BY event_seq DESC
 		LIMIT 1;`
 
+func (s *PgStore) LatestEventForScope(ctx context.Context, plane, domainName, providerCode, tenantID *string) (*domain.KillSwitchEvent, error) {
 	var e *domain.KillSwitchEvent
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
 		var scanErr error
-		e, scanErr = scanEvent(tx.QueryRow(ctx, query, plane, domainName, providerCode, tenantID))
+		e, scanErr = scanEvent(tx.QueryRow(ctx, latestForScopeQuery, plane, domainName, providerCode, tenantID))
 		return scanErr
 	})
 	if errors.Is(err, pgx.ErrNoRows) {

@@ -141,7 +141,10 @@ func (s *PgStore) BuildPopulation(ctx context.Context, p domain.BuildPopulationP
 			return err
 		}
 		changed = true
-		return nil
+		return emitEvent(ctx, tx, EventAuditPopulationBuilt, aggregatePopulation, out.PopulationID, out.LegalEntityID,
+			p.ActorPrincipalID, p.CorrelationID, map[string]any{
+				"population_id": out.PopulationID, "engagement_id": out.EngagementID, "row_count": len(p.Rows),
+			})
 	})
 	if errors.Is(err, domain.ErrPopulationNotFound) || errors.Is(err, domain.ErrPopulationInvalidState) {
 		return nil, false, err
@@ -224,12 +227,19 @@ func (s *PgStore) ValidatePopulation(ctx context.Context, p domain.ValidatePopul
 // control total reconciles. On failure it QUARANTINES the population
 // instead of leaving it stuck — a real row recording exactly which
 // measure failed (AUD-NEG-008's own fail-closed path), not a silent 500.
+//
+// The quarantine must be COMMITTED. withTenant commits only when its callback
+// returns nil, so returning ErrPopulationControlTotalMismatch from inside the
+// callback rolled the UPDATE back: the API reported QUARANTINED while the row
+// stayed VALIDATING. The callback therefore returns nil after quarantining,
+// and the mismatch error is returned only once the transaction has committed.
 func (s *PgStore) FreezePopulation(ctx context.Context, p domain.FreezePopulationParams) (*domain.AuditPopulation, bool, error) {
 	if p.CorrelationID == "" {
 		return nil, false, fmt.Errorf("%w: correlation id is required", domain.ErrStoreUnavailable)
 	}
 	var out *domain.AuditPopulation
 	changed := false
+	quarantined := false
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
 		current, err := scanPopulation(tx.QueryRow(ctx, `SELECT `+populationColumns+` FROM audit_populations WHERE population_id=$1 FOR UPDATE`, p.PopulationID))
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -265,7 +275,12 @@ func (s *PgStore) FreezePopulation(ctx context.Context, p domain.FreezePopulatio
 				return err
 			}
 			changed = true
-			return domain.ErrPopulationControlTotalMismatch
+			quarantined = true
+			// Commit the quarantine; the mismatch is reported below.
+			return emitEvent(ctx, tx, EventPopulationValidationFail, aggregatePopulation, out.PopulationID, out.LegalEntityID,
+				p.ActorPrincipalID, p.CorrelationID, map[string]any{
+					"population_id": out.PopulationID, "reason": reason,
+				})
 		}
 
 		var rowCount int64
@@ -297,16 +312,19 @@ func (s *PgStore) FreezePopulation(ctx context.Context, p domain.FreezePopulatio
 			return err
 		}
 		changed = true
-		return nil
+		return emitEvent(ctx, tx, EventAuditPopulationFrozen, aggregatePopulation, out.PopulationID, out.LegalEntityID,
+			p.ActorPrincipalID, p.CorrelationID, map[string]any{
+				"population_id": out.PopulationID, "row_count": rowCount, "digest_sha256": digest,
+			})
 	})
-	if errors.Is(err, domain.ErrPopulationControlTotalMismatch) {
-		return out, changed, err
-	}
 	if errors.Is(err, domain.ErrPopulationNotFound) || errors.Is(err, domain.ErrPopulationInvalidState) {
 		return nil, false, err
 	}
 	if err != nil {
 		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	if quarantined {
+		return out, changed, domain.ErrPopulationControlTotalMismatch
 	}
 	return out, changed, nil
 }
@@ -338,7 +356,10 @@ func (s *PgStore) SupersedePopulation(ctx context.Context, p domain.SupersedePop
 			return err
 		}
 		changed = true
-		return nil
+		return emitEvent(ctx, tx, EventPopulationSuperseded, aggregatePopulation, out.PopulationID, out.LegalEntityID,
+			p.ActorPrincipalID, p.CorrelationID, map[string]any{
+				"population_id": out.PopulationID, "reason": p.Reason,
+			})
 	})
 	if errors.Is(err, domain.ErrPopulationNotFound) || errors.Is(err, domain.ErrPopulationInvalidState) {
 		return nil, false, err
@@ -456,6 +477,19 @@ func (s *PgStore) AddControlledDelta(ctx context.Context, p domain.AddControlled
 		}
 		if _, err := tx.Exec(ctx, `UPDATE audit_populations SET status=$1, superseded_by_population_id=$2 WHERE population_id=$3`,
 			domain.PopulationSuperseded, newPop.PopulationID, old.PopulationID); err != nil {
+			return err
+		}
+		if err := emitEvent(ctx, tx, EventPopulationDeltaAdded, aggregatePopulation, old.PopulationID, old.LegalEntityID,
+			p.CreatedByPrincipalID, p.CorrelationID, map[string]any{
+				"population_id": old.PopulationID, "new_population_id": newPop.PopulationID,
+				"reason": p.Reason, "delta_row_count": len(p.Rows),
+			}); err != nil {
+			return err
+		}
+		if err := emitEvent(ctx, tx, EventPopulationSuperseded, aggregatePopulation, old.PopulationID, old.LegalEntityID,
+			p.CreatedByPrincipalID, p.CorrelationID, map[string]any{
+				"population_id": old.PopulationID, "superseded_by_population_id": newPop.PopulationID, "reason": p.Reason,
+			}); err != nil {
 			return err
 		}
 

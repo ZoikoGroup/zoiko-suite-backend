@@ -19,8 +19,10 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -108,26 +110,44 @@ const documentColumns = `
 	residency_region_code, current_version, status, created_by_principal_id, created_at, updated_at,
 	declared_version, declared_at, declared_by_principal_id, superseded_by_document_id,
 	archived_at, archived_by_principal_id, archive_reason,
-	disposition_requested_at, disposition_requested_by_principal_id, disposition_reason
+	disposition_requested_at, disposition_requested_by_principal_id, disposition_reason,
+	row_version
 `
 
 func scanDocument(row pgx.Row, d *domain.Document) error {
+	if err := scanDocumentRow(row, d); err != nil {
+		return err
+	}
+	d.DocumentState = domain.DocumentStateFor(d.Status)
+	return nil
+}
+
+func scanDocumentRow(row pgx.Row, d *domain.Document) error {
 	return row.Scan(&d.DocumentID, &d.TenantID, &d.LegalEntityID, &d.Title, &d.Classification,
 		&d.RetentionPolicy, &d.ResidencyRegionCode, &d.CurrentVersion, &d.Status,
 		&d.CreatedByPrincipalID, &d.CreatedAt, &d.UpdatedAt,
 		&d.DeclaredVersion, &d.DeclaredAt, &d.DeclaredByPrincipalID, &d.SupersededByDocumentID,
 		&d.ArchivedAt, &d.ArchivedByPrincipalID, &d.ArchiveReason,
-		&d.DispositionRequestedAt, &d.DispositionRequestedByPrincipalID, &d.DispositionReason)
+		&d.DispositionRequestedAt, &d.DispositionRequestedByPrincipalID, &d.DispositionReason,
+		&d.RowVersion)
 }
 
 const versionColumns = `
 	document_version_id, document_id, version, checksum_sha256, storage_key, size_bytes,
-	content_type, created_by_principal_id, created_at
+	content_type, created_by_principal_id, created_at, detected_content_type
 `
 
 func scanVersion(row pgx.Row, v *domain.DocumentVersion) error {
-	return row.Scan(&v.DocumentVersionID, &v.DocumentID, &v.Version, &v.ChecksumSHA256, &v.StorageKey,
-		&v.SizeBytes, &v.ContentType, &v.CreatedByPrincipalID, &v.CreatedAt)
+	var detected *string
+	if err := row.Scan(&v.DocumentVersionID, &v.DocumentID, &v.Version, &v.ChecksumSHA256, &v.StorageKey,
+		&v.SizeBytes, &v.ContentType, &v.CreatedByPrincipalID, &v.CreatedAt, &detected); err != nil {
+		return err
+	}
+	v.DetectedContentType = ""
+	if detected != nil {
+		v.DetectedContentType = *detected
+	}
+	return nil
 }
 
 // CreateDocument inserts the document row and its first version in one
@@ -139,74 +159,88 @@ func scanVersion(row pgx.Row, v *domain.DocumentVersion) error {
 // the WITH CHECK half of the policy enforces the same thing at the database.
 func (s *PgStore) CreateDocument(ctx context.Context, doc *domain.Document, firstVersion *domain.DocumentVersion, correlationID string) error {
 	return s.withTenant(ctx, func(tx pgx.Tx, tenantID string) error {
-		doc.TenantID = tenantID
-		err := tx.QueryRow(ctx, `
-			INSERT INTO documents (tenant_id, legal_entity_id, title, classification, retention_policy,
-				residency_region_code, current_version, status, created_by_principal_id)
-			VALUES ($1, $2, $3, $4, $5, $6, 1, 'ACTIVE', $7)
-			RETURNING document_id, created_at, updated_at
-		`, tenantID, doc.LegalEntityID, doc.Title, string(doc.Classification), doc.RetentionPolicy,
-			doc.ResidencyRegionCode, doc.CreatedByPrincipalID,
-		).Scan(&doc.DocumentID, &doc.CreatedAt, &doc.UpdatedAt)
-		if err != nil {
-			return fmt.Errorf("document store unavailable: %w", mapPgError(err))
-		}
-		doc.CurrentVersion = 1
-		doc.Status = domain.StatusActive
-
-		firstVersion.DocumentID = doc.DocumentID
-		firstVersion.Version = 1
-		err = tx.QueryRow(ctx, `
-			INSERT INTO document_versions (document_id, version, checksum_sha256, storage_key, size_bytes,
-				content_type, created_by_principal_id)
-			VALUES ($1, 1, $2, $3, $4, $5, $6)
-			RETURNING document_version_id, created_at
-		`, firstVersion.DocumentID, firstVersion.ChecksumSHA256, firstVersion.StorageKey, firstVersion.SizeBytes,
-			firstVersion.ContentType, firstVersion.CreatedByPrincipalID,
-		).Scan(&firstVersion.DocumentVersionID, &firstVersion.CreatedAt)
-		if err != nil {
-			return fmt.Errorf("document store unavailable: %w", mapPgError(err))
-		}
-
-		if err := s.insertDocumentOutboxEvent(ctx, tx, "document.uploaded", doc.DocumentID, tenantID,
-			doc.LegalEntityID, doc.CreatedByPrincipalID, correlationID, map[string]any{
-				"document_id":     doc.DocumentID,
-				"tenant_id":       tenantID,
-				"legal_entity_id": doc.LegalEntityID,
-				"title":           doc.Title,
-				"classification":  string(doc.Classification),
-				"version":         firstVersion.Version,
-				"checksum_sha256": firstVersion.ChecksumSHA256,
-			}); err != nil {
-			return err
-		}
-
-		// BIZ-02: the uploader's classification choice is seeded as the
-		// document's first CANDIDATE proposal, not trusted as final —
-		// see internal/domain/classification.go's own doc comment. It
-		// still requires ConfirmClassification (by a DIFFERENT
-		// principal) before it's a governed fact; documents.classification
-		// above is populated immediately for backward-compatible reads,
-		// but record_classifications is the real source of truth.
-		var classificationID string
-		if err := tx.QueryRow(ctx, `
-			INSERT INTO record_classifications (document_id, tenant_id, legal_entity_id, classification_value, source, proposed_by_principal_id, correlation_id)
-			VALUES ($1, $2, $3, $4, 'HUMAN', $5, $6)
-			RETURNING classification_id
-		`, doc.DocumentID, tenantID, doc.LegalEntityID, string(doc.Classification), doc.CreatedByPrincipalID, nullableString(correlationID),
-		).Scan(&classificationID); err != nil {
-			return fmt.Errorf("document store unavailable: %w", err)
-		}
-		return s.insertDocumentOutboxEvent(ctx, tx, "classification.proposed", doc.DocumentID, tenantID,
-			doc.LegalEntityID, doc.CreatedByPrincipalID, correlationID, map[string]any{
-				"classification_id":    classificationID,
-				"document_id":          doc.DocumentID,
-				"tenant_id":            tenantID,
-				"legal_entity_id":      doc.LegalEntityID,
-				"classification_value": string(doc.Classification),
-				"source":               "HUMAN",
-			})
+		return s.createDocumentTx(ctx, tx, tenantID, doc, firstVersion, correlationID)
 	})
+}
+
+// createDocumentTx is CreateDocument's work, inside a caller-supplied
+// transaction, so CreateDocumentIdempotent can commit the idempotency claim
+// with it.
+func (s *PgStore) createDocumentTx(ctx context.Context, tx pgx.Tx, tenantID string, doc *domain.Document, firstVersion *domain.DocumentVersion, correlationID string) error {
+	doc.TenantID = tenantID
+	err := tx.QueryRow(ctx, `
+		INSERT INTO documents (tenant_id, legal_entity_id, title, classification, retention_policy,
+			residency_region_code, current_version, status, created_by_principal_id)
+		VALUES ($1, $2, $3, $4, $5, $6, 1, 'ACTIVE', $7)
+		RETURNING document_id, created_at, updated_at
+	`, tenantID, doc.LegalEntityID, doc.Title, string(doc.Classification), doc.RetentionPolicy,
+		doc.ResidencyRegionCode, doc.CreatedByPrincipalID,
+	).Scan(&doc.DocumentID, &doc.CreatedAt, &doc.UpdatedAt)
+	if err != nil {
+		return fmt.Errorf("document store unavailable: %w", mapPgError(err))
+	}
+	doc.CurrentVersion = 1
+	doc.Status = domain.StatusActive
+
+	firstVersion.DocumentID = doc.DocumentID
+	firstVersion.Version = 1
+	err = tx.QueryRow(ctx, `
+		INSERT INTO document_versions (document_id, version, checksum_sha256, storage_key, size_bytes,
+			content_type, created_by_principal_id, detected_content_type)
+		VALUES ($1, 1, $2, $3, $4, $5, $6, $7)
+		RETURNING document_version_id, created_at
+	`, firstVersion.DocumentID, firstVersion.ChecksumSHA256, firstVersion.StorageKey, firstVersion.SizeBytes,
+		firstVersion.ContentType, firstVersion.CreatedByPrincipalID, nullableString(firstVersion.DetectedContentType),
+	).Scan(&firstVersion.DocumentVersionID, &firstVersion.CreatedAt)
+	if err != nil {
+		return fmt.Errorf("document store unavailable: %w", mapPgError(err))
+	}
+
+	// BIZ-02: the uploader's classification choice is seeded as the
+	// document's first CANDIDATE proposal, not trusted as final —
+	// see internal/domain/classification.go's own doc comment. It
+	// still requires ConfirmClassification (by a DIFFERENT
+	// principal) before it's a governed fact; documents.classification
+	// above is populated immediately for backward-compatible reads,
+	// but record_classifications is the real source of truth.
+	var classificationID string
+	if err := tx.QueryRow(ctx, `
+		INSERT INTO record_classifications (document_id, tenant_id, legal_entity_id, classification_value, source, proposed_by_principal_id, correlation_id)
+		VALUES ($1, $2, $3, $4, 'HUMAN', $5, $6)
+		RETURNING classification_id
+	`, doc.DocumentID, tenantID, doc.LegalEntityID, string(doc.Classification), doc.CreatedByPrincipalID, nullableString(correlationID),
+	).Scan(&classificationID); err != nil {
+		return fmt.Errorf("document store unavailable: %w", err)
+	}
+	// §9.3: creating a document with its first version is two canonical events.
+	// document_created carries the classification_id of the candidate classification
+	// seeded above; document_version_committed carries the committed version and its
+	// hash and region. Both are written in this transaction, so neither exists
+	// unless the document and version do.
+	if err := s.insertDocumentOutboxEvent(ctx, tx, evtDocumentCreated, doc.DocumentID, tenantID,
+		doc.LegalEntityID, doc.CreatedByPrincipalID, correlationID, map[string]any{
+			"document_id":       doc.DocumentID,
+			"tenant_id":         tenantID,
+			"classification_id": classificationID,
+			"legal_entity_id":   doc.LegalEntityID,
+			"title":             doc.Title,
+			"classification":    string(doc.Classification),
+		}); err != nil {
+		return err
+	}
+	if err := s.insertDocumentOutboxEvent(ctx, tx, evtDocumentVersionCommitted, doc.DocumentID, tenantID,
+		doc.LegalEntityID, doc.CreatedByPrincipalID, correlationID, versionCommittedPayload(doc.DocumentID, tenantID, doc.LegalEntityID, firstVersion, doc.ResidencyRegionCode)); err != nil {
+		return err
+	}
+	return s.insertDocumentOutboxEvent(ctx, tx, "classification.proposed", doc.DocumentID, tenantID,
+		doc.LegalEntityID, doc.CreatedByPrincipalID, correlationID, map[string]any{
+			"classification_id":    classificationID,
+			"document_id":          doc.DocumentID,
+			"tenant_id":            tenantID,
+			"legal_entity_id":      doc.LegalEntityID,
+			"classification_value": string(doc.Classification),
+			"source":               "HUMAN",
+		})
 }
 
 // insertDocumentOutboxEvent is the shared outbox-insert call site for
@@ -241,64 +275,194 @@ func (s *PgStore) insertDocumentOutboxEvent(ctx context.Context, tx pgx.Tx, even
 // documents.current_version — the ONLY mutation ever applied to the documents
 // row post-creation.
 func (s *PgStore) AddVersion(ctx context.Context, documentID string, v *domain.DocumentVersion, correlationID string) (*domain.Document, error) {
-	var out domain.Document
+	var out *domain.Document
 	err := s.withTenant(ctx, func(tx pgx.Tx, tenantID string) error {
-		var nextVersion int
-		err := tx.QueryRow(ctx, `
-			UPDATE documents SET current_version = current_version + 1, updated_at = now()
-			WHERE document_id = $1 AND tenant_id = $2::uuid
-			RETURNING current_version
-		`, documentID, tenantID).Scan(&nextVersion)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return domain.ErrDocumentNotFound
-		}
-		if err != nil {
-			if mapped := mapPgError(err); errors.Is(mapped, domain.ErrDocumentNotFound) {
-				return mapped
-			}
-			return fmt.Errorf("document store unavailable: %w", err)
-		}
-
-		v.DocumentID = documentID
-		v.Version = nextVersion
-		err = tx.QueryRow(ctx, `
-			INSERT INTO document_versions (document_id, version, checksum_sha256, storage_key, size_bytes,
-				content_type, created_by_principal_id)
-			VALUES ($1, $2, $3, $4, $5, $6, $7)
-			RETURNING document_version_id, created_at
-		`, documentID, nextVersion, v.ChecksumSHA256, v.StorageKey, v.SizeBytes, v.ContentType, v.CreatedByPrincipalID,
-		).Scan(&v.DocumentVersionID, &v.CreatedAt)
-		if err != nil {
-			return fmt.Errorf("document store unavailable: %w", mapPgError(err))
-		}
-
-		// Read the document back inside the SAME transaction. Doing it after
-		// the commit — as this used to — reads through a second connection
-		// that has not installed app.tenant_id, so under FORCE row-level
-		// security it would find nothing and report a document that had just
-		// been written successfully as missing.
-		row := tx.QueryRow(ctx, `SELECT `+documentColumns+`
-			FROM documents WHERE document_id = $1 AND tenant_id = $2::uuid`, documentID, tenantID)
-		if err := scanDocument(row, &out); err != nil {
-			return fmt.Errorf("document store unavailable: %w", err)
-		}
-
-		if err := s.insertDocumentOutboxEvent(ctx, tx, "document.version_created", documentID, tenantID,
-			out.LegalEntityID, v.CreatedByPrincipalID, correlationID, map[string]any{
-				"document_id":     documentID,
-				"tenant_id":       tenantID,
-				"legal_entity_id": out.LegalEntityID,
-				"version":         v.Version,
-				"checksum_sha256": v.ChecksumSHA256,
-			}); err != nil {
-			return err
-		}
-		return nil
+		var err error
+		out, err = s.addVersionTx(ctx, tx, tenantID, documentID, v, correlationID)
+		return err
 	})
 	if err != nil {
 		return nil, err
 	}
+	return out, nil
+}
+
+// addVersionTx is AddVersion's work, inside a caller-supplied transaction.
+func (s *PgStore) addVersionTx(ctx context.Context, tx pgx.Tx, tenantID, documentID string, v *domain.DocumentVersion, correlationID string) (*domain.Document, error) {
+	var nextVersion int
+	err := tx.QueryRow(ctx, `
+		UPDATE documents SET current_version = current_version + 1, updated_at = now()
+		WHERE document_id = $1 AND tenant_id = $2::uuid
+		RETURNING current_version
+	`, documentID, tenantID).Scan(&nextVersion)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrDocumentNotFound
+	}
+	if err != nil {
+		if mapped := mapPgError(err); errors.Is(mapped, domain.ErrDocumentNotFound) {
+			return nil, mapped
+		}
+		return nil, fmt.Errorf("document store unavailable: %w", err)
+	}
+
+	v.DocumentID = documentID
+	v.Version = nextVersion
+	err = tx.QueryRow(ctx, `
+		INSERT INTO document_versions (document_id, version, checksum_sha256, storage_key, size_bytes,
+			content_type, created_by_principal_id, detected_content_type)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		RETURNING document_version_id, created_at
+	`, documentID, nextVersion, v.ChecksumSHA256, v.StorageKey, v.SizeBytes, v.ContentType, v.CreatedByPrincipalID,
+		nullableString(v.DetectedContentType),
+	).Scan(&v.DocumentVersionID, &v.CreatedAt)
+	if err != nil {
+		return nil, fmt.Errorf("document store unavailable: %w", mapPgError(err))
+	}
+
+	// Read the document back inside the SAME transaction. Doing it after
+	// the commit reads through a second connection that has not installed
+	// app.tenant_id, so under FORCE row-level security it would find nothing
+	// and report a document that had just been written as missing.
+	var out domain.Document
+	row := tx.QueryRow(ctx, `SELECT `+documentColumns+`
+		FROM documents WHERE document_id = $1 AND tenant_id = $2::uuid`, documentID, tenantID)
+	if err := scanDocument(row, &out); err != nil {
+		return nil, fmt.Errorf("document store unavailable: %w", err)
+	}
+
+	if err := s.insertDocumentOutboxEvent(ctx, tx, evtDocumentVersionCommitted, documentID, tenantID,
+		out.LegalEntityID, v.CreatedByPrincipalID, correlationID,
+		versionCommittedPayload(documentID, tenantID, out.LegalEntityID, v, out.ResidencyRegionCode)); err != nil {
+		return nil, err
+	}
 	return &out, nil
+}
+
+// ── idempotent commands ──────────────────────────────────────────────────────
+
+// errIdempotentLost aborts (rolls back) a transaction whose operation lost the
+// race to claim its Idempotency-Key to a concurrent identical request.
+var errIdempotentLost = errors.New("idempotency key claimed concurrently")
+
+func loadIdempotency(ctx context.Context, tx pgx.Tx, tenantID, principalID, key string) (*domain.IdempotencyRecord, error) {
+	var rec domain.IdempotencyRecord
+	err := tx.QueryRow(ctx, `
+		SELECT principal_id, idempotency_key, operation, request_hash, response_status, response_body, created_at
+		FROM document_idempotency_keys
+		WHERE tenant_id = $1::uuid AND principal_id = $2 AND idempotency_key = $3`,
+		tenantID, principalID, key,
+	).Scan(&rec.PrincipalID, &rec.Key, &rec.Operation, &rec.RequestHash, &rec.ResponseStatus, &rec.ResponseBody, &rec.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("document store unavailable: %w", err)
+	}
+	return &rec, nil
+}
+
+// claimIdempotency records the outcome under the key. It reports false when the
+// key already exists (a concurrent request committed first).
+func claimIdempotency(ctx context.Context, tx pgx.Tx, tenantID string, c domain.IdempotencyClaim, status int, body []byte) (bool, error) {
+	tag, err := tx.Exec(ctx, `
+		INSERT INTO document_idempotency_keys
+			(tenant_id, principal_id, idempotency_key, operation, request_hash, response_status, response_body)
+		VALUES ($1::uuid, $2, $3, $4, $5, $6, $7)
+		ON CONFLICT (tenant_id, principal_id, idempotency_key) DO NOTHING`,
+		tenantID, c.PrincipalID, c.Key, c.Operation, c.RequestHash, status, body)
+	if err != nil {
+		return false, fmt.Errorf("document store unavailable: %w", err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// GetIdempotency returns the stored outcome for (tenant, principal, key), or
+// nil when the key has not been used.
+func (s *PgStore) GetIdempotency(ctx context.Context, principalID, key string) (*domain.IdempotencyRecord, error) {
+	var rec *domain.IdempotencyRecord
+	err := s.withTenant(ctx, func(tx pgx.Tx, tenantID string) error {
+		var err error
+		rec, err = loadIdempotency(ctx, tx, tenantID, principalID, key)
+		return err
+	})
+	return rec, err
+}
+
+// CreateDocumentIdempotent is CreateDocument plus the idempotency claim in ONE
+// transaction. When the key was already used (before, or by a concurrent
+// request that committed first) nothing is created and the stored record is
+// returned; the caller must compare its RequestHash.
+func (s *PgStore) CreateDocumentIdempotent(ctx context.Context, claim domain.IdempotencyClaim, doc *domain.Document, firstVersion *domain.DocumentVersion, correlationID string) (*domain.IdempotencyRecord, error) {
+	var existing *domain.IdempotencyRecord
+	err := s.withTenant(ctx, func(tx pgx.Tx, tenantID string) error {
+		rec, err := loadIdempotency(ctx, tx, tenantID, claim.PrincipalID, claim.Key)
+		if err != nil {
+			return err
+		}
+		if rec != nil {
+			existing = rec
+			return nil
+		}
+		if err := s.createDocumentTx(ctx, tx, tenantID, doc, firstVersion, correlationID); err != nil {
+			return err
+		}
+		body, err := json.Marshal(doc)
+		if err != nil {
+			return fmt.Errorf("encode idempotent response: %w", err)
+		}
+		ok, err := claimIdempotency(ctx, tx, tenantID, claim, http.StatusCreated, body)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return errIdempotentLost
+		}
+		return nil
+	})
+	if errors.Is(err, errIdempotentLost) {
+		return s.GetIdempotency(ctx, claim.PrincipalID, claim.Key)
+	}
+	return existing, err
+}
+
+// AddVersionIdempotent is AddVersion plus the idempotency claim in one
+// transaction; see CreateDocumentIdempotent.
+func (s *PgStore) AddVersionIdempotent(ctx context.Context, claim domain.IdempotencyClaim, documentID string, v *domain.DocumentVersion, correlationID string) (*domain.Document, *domain.IdempotencyRecord, error) {
+	var (
+		out      *domain.Document
+		existing *domain.IdempotencyRecord
+	)
+	err := s.withTenant(ctx, func(tx pgx.Tx, tenantID string) error {
+		rec, err := loadIdempotency(ctx, tx, tenantID, claim.PrincipalID, claim.Key)
+		if err != nil {
+			return err
+		}
+		if rec != nil {
+			existing = rec
+			return nil
+		}
+		out, err = s.addVersionTx(ctx, tx, tenantID, documentID, v, correlationID)
+		if err != nil {
+			return err
+		}
+		body, err := json.Marshal(out)
+		if err != nil {
+			return fmt.Errorf("encode idempotent response: %w", err)
+		}
+		ok, err := claimIdempotency(ctx, tx, tenantID, claim, http.StatusCreated, body)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return errIdempotentLost
+		}
+		return nil
+	})
+	if errors.Is(err, errIdempotentLost) {
+		rec, gerr := s.GetIdempotency(ctx, claim.PrincipalID, claim.Key)
+		return nil, rec, gerr
+	}
+	return out, existing, err
 }
 
 // DeclareRecord marks the document's CURRENT version (as of this call) the
@@ -479,6 +643,27 @@ func (s *PgStore) classifyArchiveFailure(ctx context.Context, tx pgx.Tx, tenantI
 func (s *PgStore) RequestDisposition(ctx context.Context, p domain.RequestDispositionParams, correlationID string) (*domain.Document, error) {
 	var out domain.Document
 	err := s.withTenant(ctx, func(tx pgx.Tx, tenantID string) error {
+		// DRC-I10 / DRC-008: a legal hold blocks ordinary disposition. A
+		// document whose declared record is a target of an active (applied,
+		// unreleased) hold is not eligible; nothing is mutated.
+		var holdID string
+		holdErr := tx.QueryRow(ctx, `
+			SELECT t.hold_id::text
+			FROM legal_hold_targets t
+			JOIN records r ON r.record_id = t.record_id AND r.tenant_id = t.tenant_id
+			WHERE r.document_id = $1 AND r.tenant_id = $2::uuid
+			  AND t.applied_at IS NOT NULL AND t.released_at IS NULL
+			LIMIT 1`, p.DocumentID, tenantID).Scan(&holdID)
+		if holdErr == nil {
+			return fmt.Errorf("%w (hold %s)", domain.ErrRecordUnderLegalHold, holdID)
+		}
+		if !errors.Is(holdErr, pgx.ErrNoRows) {
+			if mapped := mapPgError(holdErr); errors.Is(mapped, domain.ErrDocumentNotFound) {
+				return mapped
+			}
+			return fmt.Errorf("document store unavailable: %w", holdErr)
+		}
+
 		row := tx.QueryRow(ctx, `
 			UPDATE documents
 			SET status = 'PURGE_PENDING', disposition_requested_at = now(), disposition_requested_by_principal_id = $3, disposition_reason = $4, updated_at = now()
@@ -857,4 +1042,29 @@ func ensureDocument(ctx context.Context, tx pgx.Tx, documentID, tenantID string)
 		return domain.ErrDocumentNotFound
 	}
 	return nil
+}
+
+// Canonical document events (ZS-SVC-S-001 §9.3), written to the outbox in the same
+// transaction as the change they announce.
+const (
+	evtDocumentCreated          = "document_created"
+	evtDocumentVersionCommitted = "document_version_committed"
+	evtRecordSuperseded         = "record_superseded"
+)
+
+// versionCommittedPayload is §9.3's document_version_committed:
+// version_id, document_id, content_hash, region. region is null when the document
+// has no residency region. The remaining keys are context this service has always
+// carried on its version event.
+func versionCommittedPayload(documentID, tenantID, legalEntityID string, v *domain.DocumentVersion, region *string) map[string]any {
+	return map[string]any{
+		"version_id":      v.DocumentVersionID,
+		"document_id":     documentID,
+		"content_hash":    v.ChecksumSHA256,
+		"region":          region,
+		"tenant_id":       tenantID,
+		"legal_entity_id": legalEntityID,
+		"version":         v.Version,
+		"checksum_sha256": v.ChecksumSHA256,
+	}
 }

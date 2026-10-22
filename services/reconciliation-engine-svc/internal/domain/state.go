@@ -29,11 +29,13 @@ const (
 
 type CertificationState string
 
-// REVOKED is deliberately absent: revocation is A12 and out of scope here.
+// REVOKED (A12/B34) withdraws a certification prospectively: the run stays
+// Certified and keeps its sealed certification, and only this dimension moves.
 const (
 	CertUncertified CertificationState = "UNCERTIFIED"
 	CertEligible    CertificationState = "ELIGIBLE"
 	CertCertified   CertificationState = "CERTIFIED"
+	CertRevoked     CertificationState = "REVOKED"
 	CertSuperseded  CertificationState = "SUPERSEDED"
 )
 
@@ -78,6 +80,9 @@ var lifecycleEdges = map[RunStatus][]RunStatus{
 	RunExceptionsOpen: {RunRunning, RunReperformed, RunFailed},
 	RunReperformed:    {RunRunning, RunExceptionsOpen, RunCertified, RunFailed},
 	// A certified or failed run is never edited; it can only be superseded.
+	// Revoking a certification (ValidateCertificationRevocation) moves the
+	// certification dimension only: the status stays Certified, because the
+	// run was certified and that history does not change.
 	RunCertified:  {RunSuperseded},
 	RunFailed:     {RunSuperseded},
 	RunSuperseded: {},
@@ -127,7 +132,9 @@ func ValidateLifecycleTransition(from, to RunStatus, result ResultState, cert Ce
 			return fmt.Errorf("%w: ExceptionsOpen requires result VARIANCE, not %s", ErrInvalidTransition, result)
 		}
 	case RunCertified:
-		if cert != CertCertified {
+		// A Certified run's certification is CERTIFIED, or REVOKED once it has
+		// been revoked; a run only ever enters Certified CERTIFIED.
+		if cert != CertCertified && !(from == RunCertified && cert == CertRevoked) {
 			return fmt.Errorf("%w: cannot enter Certified without certification CERTIFIED", ErrInvalidTransition)
 		}
 	case RunFailed:
@@ -145,6 +152,10 @@ func ValidateLifecycleTransition(from, to RunStatus, result ResultState, cert Ce
 	}
 	if to != RunCertified && cert == CertCertified {
 		return fmt.Errorf("%w: certification CERTIFIED requires status Certified", ErrInvalidTransition)
+	}
+	// A revoked run stays Certified, or is later superseded and stays REVOKED.
+	if cert == CertRevoked && to != RunCertified && to != RunSuperseded {
+		return fmt.Errorf("%w: certification REVOKED requires status Certified or Superseded", ErrInvalidTransition)
 	}
 	return nil
 }
@@ -177,8 +188,27 @@ func ValidateResultTransition(fromStatus RunStatus, from, to ResultState) error 
 var certificationEdges = map[CertificationState][]CertificationState{
 	CertUncertified: {CertEligible},
 	CertEligible:    {CertUncertified, CertCertified},
-	CertCertified:   {CertSuperseded},
-	CertSuperseded:  {},
+	CertCertified:   {CertRevoked, CertSuperseded},
+	// REVOKED is terminal: a revoked run superseded later keeps REVOKED.
+	CertRevoked:    {},
+	CertSuperseded: {},
+}
+
+// ValidateCertificationRevocation guards the one certification move that has
+// no accompanying status move: CERTIFIED -> REVOKED on a Certified run
+// (ZS-SVC-Z-001 §5: REVOKED is a certification state, not a lifecycle one).
+// The result is frozen and the status does not change, so a revoked run is
+// Certified + REVOKED, the combination migration 000011's CHECK admits.
+// REVOKED has no edge out, so a second revocation is refused, and a
+// superseded run's certification (SUPERSEDED) cannot be revoked.
+func ValidateCertificationRevocation(status RunStatus, cert CertificationState) error {
+	if status != RunCertified {
+		return fmt.Errorf("%w: only a Certified run's certification can be revoked (run is %s)", ErrInvalidTransition, status)
+	}
+	if cert == CertRevoked {
+		return fmt.Errorf("%w: the run's certification is already REVOKED", ErrInvalidTransition)
+	}
+	return ValidateCertificationTransition(cert, CertRevoked)
 }
 
 // ValidateCertificationTransition: from == to is "no change".

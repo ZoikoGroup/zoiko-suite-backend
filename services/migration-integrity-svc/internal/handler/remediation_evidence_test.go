@@ -20,11 +20,12 @@ import (
 func createJobWithViolation(t *testing.T, router http.Handler) domain.MigrationJob {
 	t.Helper()
 	validateReq := domain.ValidateMigrationRequest{
-		LegalEntityID:  "LE-6001",
-		MigrationName:  "Remediation evidence test",
-		SourceSystem:   "LEGACY_ERP",
-		TargetService:  "ledger-svc",
-		RequiredFields: []string{"amount"},
+		LegalEntityID:    "LE-6001",
+		MigrationName:    "Remediation evidence test",
+		SourceSystem:     "LEGACY_ERP",
+		TargetService:    "ledger-svc",
+		ExceptionOwnerID: "owner-1",
+		RequiredFields:   []string{"amount"},
 		Records: []domain.MigrationRecord{
 			{Ref: "REC-100", Fields: map[string]string{"amount": "N/A"}},
 		},

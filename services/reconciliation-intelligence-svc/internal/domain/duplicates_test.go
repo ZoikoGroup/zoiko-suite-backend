@@ -15,9 +15,9 @@ func refLine(id, amount, ref string) BankStatementLine {
 // test if any line is the subject of more than one suggestion — the
 // suppress rule: a copy gets DUPLICATE_ENTRY only, never also a write-off
 // or review recommendation.
-func subjects(t *testing.T, items []UnmatchedItem) map[string]UnmatchedItem {
+func subjects(t *testing.T, items []ReconciliationSuggestion) map[string]ReconciliationSuggestion {
 	t.Helper()
-	out := map[string]UnmatchedItem{}
+	out := map[string]ReconciliationSuggestion{}
 	for _, it := range items {
 		if _, dup := out[it.StatementLineID]; dup {
 			t.Fatalf("line %s is the subject of more than one suggestion", it.StatementLineID)
@@ -41,11 +41,14 @@ func TestDuplicates_ExactReference(t *testing.T) {
 	if dup.DiscrepancyType != DiscrepancyDuplicateEntry || dup.Recommendation != RecommendationConfirmDuplicate {
 		t.Fatalf("copy: got %s / %s, want DUPLICATE_ENTRY / CONFIRM_DUPLICATE", dup.DiscrepancyType, dup.Recommendation)
 	}
-	if dup.CounterpartStatementLineID != "sl-1" || dup.TransactionRefB != "REF 123" || dup.DiscrepancyAmount != "0" {
-		t.Fatalf("copy: counterpart %q, ref_b %q, discrepancy %s", dup.CounterpartStatementLineID, dup.TransactionRefB, dup.DiscrepancyAmount)
+	if dup.CounterpartStatementLineID != "sl-1" || dup.SourceRecordB != "REF 123" || dup.DiscrepancyAmount != "0" {
+		t.Fatalf("copy: counterpart %q, ref_b %q, discrepancy %s", dup.CounterpartStatementLineID, dup.SourceRecordB, dup.DiscrepancyAmount)
 	}
-	if dup.ConfidenceScore != duplicateExactReferenceConfidence || dup.ResolutionStatus != StatusRecommended {
-		t.Fatalf("copy: confidence %.1f status %s", dup.ConfidenceScore, dup.ResolutionStatus)
+	if dup.ConfidenceScore != duplicateExactReferenceConfidence || dup.SuggestionStatus != StatusRecommended {
+		t.Fatalf("copy: confidence %.1f status %s", dup.ConfidenceScore, dup.SuggestionStatus)
+	}
+	if dup.HeuristicRule != HeuristicDuplicateExact || dup.ToleranceVersion != 7 {
+		t.Fatalf("copy: rule %q version %d, want %q / 7", dup.HeuristicRule, dup.ToleranceVersion, HeuristicDuplicateExact)
 	}
 	for _, want := range []string{"heuristic rule", "sl-2 probably duplicates statement line sl-1", "identical ignoring case and whitespace"} {
 		if !strings.Contains(dup.ResolutionNotes, want) {
@@ -82,6 +85,9 @@ func TestDuplicates_SuffixedReference_AnchorIsTheOriginal(t *testing.T) {
 		}
 		if it.ConfidenceScore != duplicateSuffixedReferenceConfidence || !strings.Contains(it.ResolutionNotes, "plus a trailing sequence suffix") {
 			t.Fatalf("%s: confidence %.1f, rationale %q", id, it.ConfidenceScore, it.ResolutionNotes)
+		}
+		if it.HeuristicRule != HeuristicDuplicateSuffixed {
+			t.Fatalf("%s: rule %q, want %q", id, it.HeuristicRule, HeuristicDuplicateSuffixed)
 		}
 	}
 	if by["sl-9"].DiscrepancyType != DiscrepancyMissingReference || !strings.Contains(by["sl-9"].ResolutionNotes, "(sl-1, sl-2)") {

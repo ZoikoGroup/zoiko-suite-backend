@@ -2,6 +2,7 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"time"
 
@@ -36,7 +37,11 @@ type RunEvidenceBundle struct {
 	Populations   []domain.PopulationSnapshot `json:"population_snapshots"`
 	Exceptions    []ExceptionExport           `json:"exceptions"`
 	Evidence      *domain.EvidencePackage     `json:"evidence_package"`
-	Manifest      BundleManifest              `json:"manifest"`
+	// Certification is the run's ControlCertification, read directly from
+	// control_certifications rather than inferred from RunTransition. Nil for an
+	// uncertified run, or one certified before certifications were recorded.
+	Certification *domain.ControlCertification `json:"certification"`
+	Manifest      BundleManifest               `json:"manifest"`
 }
 
 type BundleManifest struct {
@@ -122,6 +127,10 @@ func (h *Handler) ExportRunEvidence(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	verified := b.Evidence != nil && b.Evidence.Verified != nil && *b.Evidence.Verified
+	if b.Certification, err = h.store.GetCertification(ctx, tenantID, run.RunID); err != nil && !errors.Is(err, domain.ErrNotFound) {
+		fail(err)
+		return
+	}
 
 	// Digest everything except the manifest itself.
 	raw, err := json.Marshal(b)

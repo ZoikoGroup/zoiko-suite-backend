@@ -102,6 +102,26 @@ func (h *Handler) CreateMetricDefinition(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	effectiveFrom, err := time.Parse(time.RFC3339, req.EffectiveFrom)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "effective_from must be RFC3339")
+		return
+	}
+
+	// Identity and authorization come BEFORE the replay lookup. The checks
+	// above only parse and validate the request; they read no stored state. A
+	// replay returns a stored definition, so it must not be reachable by a
+	// caller who has not been authenticated and authorized to create metrics —
+	// otherwise knowing a metric_code and an Idempotency-Key was enough to read
+	// a definition with no identity at all.
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, ReportMetricCreate) {
+		return
+	}
+
 	// ── Idempotent replay (ZS-ARCH-SVC-001 v2.0 §4, INV-08) ─────────────────
 	//
 	// The envelope middleware already refuses a request with no
@@ -123,20 +143,6 @@ func (h *Handler) CreateMetricDefinition(w http.ResponseWriter, r *http.Request)
 			writeJSON(w, http.StatusCreated, existing)
 			return
 		}
-	}
-
-	effectiveFrom, err := time.Parse(time.RFC3339, req.EffectiveFrom)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "effective_from must be RFC3339")
-		return
-	}
-
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-	if !h.authorize(w, r, principalID, ReportMetricCreate) {
-		return
 	}
 
 	d := &domain.ReportMetricDefinition{
@@ -244,18 +250,31 @@ func (h *Handler) ListMetricVersions(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) PublishNewVersion(w http.ResponseWriter, r *http.Request) {
 	metricCode := chi.URLParam(r, "metric_code")
 
+	// Identity and authorization come first, before ANY read of stored state:
+	// the replay lookup returns a stored version, and the existing-definition
+	// lookup below answers 404 for an absent code — either of which, reached
+	// without identity, would let an anonymous caller read a definition or tell
+	// an existing metric_code from an absent one.
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, ReportMetricPublish) {
+		return
+	}
+
 	// ── Idempotent replay (ZS-ARCH-SVC-001 v2.0 §4, INV-08) ─────────────────
 	//
-	// Checked before anything else, including decoding the body: unlike
-	// CreateMetricDefinition (where metric_code's own unique index coincides
-	// with a replay and naturally rejects a duplicate INSERT), the supersede
-	// step below is NOT self-protecting — it unconditionally marks whatever
-	// row is currently ACTIVE as SUPERSEDED. If a retried call were allowed
-	// to reach that statement, it would supersede whatever a legitimate
-	// LATER publish had since made ACTIVE, corrupting the version history
-	// instead of safely no-opping. So a replay must be caught here, before
-	// any read or write of report_metric_definitions, and must return the
-	// ORIGINAL version row unconditionally.
+	// Checked before decoding the body: unlike CreateMetricDefinition (where
+	// metric_code's own unique index coincides with a replay and naturally
+	// rejects a duplicate INSERT), the supersede step below is NOT
+	// self-protecting — it unconditionally marks whatever row is currently
+	// ACTIVE as SUPERSEDED. If a retried call were allowed to reach that
+	// statement, it would supersede whatever a legitimate LATER publish had
+	// since made ACTIVE, corrupting the version history instead of safely
+	// no-opping. So a replay must be caught here, before any read or write of
+	// the version rows it could disturb, and must return the ORIGINAL version
+	// row unconditionally.
 	idempotencyKey := r.Header.Get("Idempotency-Key")
 	if idempotencyKey != "" {
 		existing, err := h.store.FindByIdempotencyKey(r.Context(), metricCode, idempotencyKey)
@@ -292,14 +311,6 @@ func (h *Handler) PublishNewVersion(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "failed to fetch current metric definition")
-		return
-	}
-
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-	if !h.authorize(w, r, principalID, ReportMetricPublish) {
 		return
 	}
 

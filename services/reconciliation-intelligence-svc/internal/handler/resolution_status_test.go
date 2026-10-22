@@ -29,8 +29,8 @@ func TestApplyResolution_EnforcesDecisionPath(t *testing.T) {
 		t.Fatalf("analyze body: %v %s", err, rec.Body.String())
 	}
 
-	apply := func(status domain.ResolutionStatus) *httptest.ResponseRecorder {
-		b, _ := json.Marshal(domain.ApplyResolutionRequest{ResolutionStatus: status, ResolutionNotes: "decision"})
+	apply := func(status domain.SuggestionStatus) *httptest.ResponseRecorder {
+		b, _ := json.Marshal(domain.ApplyResolutionRequest{SuggestionStatus: status, ResolutionNotes: "decision"})
 		r := httptest.NewRequest(http.MethodPost,
 			"/v1/reconciliations/"+job.ID+"/resolutions/"+job.UnmatchedItems[0].ID+"/apply", bytes.NewBuffer(b))
 		withEnvelope(r)

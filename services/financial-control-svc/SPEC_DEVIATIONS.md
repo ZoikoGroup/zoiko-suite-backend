@@ -18,62 +18,44 @@ policies a run pins.
 
 ## A. Not implemented / weaker than the spec
 
-- **A1. A certification cannot be revoked.** `CertRevoked` and the
-  `CERTIFIED → REVOKED` edge exist in `internal/domain/state.go`, but no command
-  reaches them. Today the only way out of CERTIFIED is a new run with
-  `prior_run_id` for the same entity and period, which supersedes it. That
-  covers "replace with a better result" but not "this result is wrong and
-  nothing replaces it yet".
-
-  *What the specification does say* (checked against the source text):
-  ZS-CONTROL-001 §7 names Revoked as a certification state (it is not a
-  lifecycle state); §27 "Reopen/supersede certified run — restricted command,
-  reason, evidence, prior certification retained"; §25 requires a reason for
-  reopen and idempotency, `If-Match` and re-authorization on material commands;
-  Invariant 2 "corrections create a new run, superseding certification or
-  documented reopen workflow"; scenario 12 "certified run later found erroneous
-  — original certification retained; controlled superseding/reopen workflow
-  required". ZS-SVC-Z-001 (the data-quality certification analogue) adds "new
-  material evidence may revoke certification prospectively; prior
-  certification history remains", runbook RB-05 "revoke affected certification
-  prospectively, preserve prior evidence, assess blast radius", NP-47
-  "certification revoked with no reason/evidence" must fail safe, and an event
-  carrying prior certification id, reason and effective time. Not relevant
-  here: scenario 11 ("certification authority revoked before sign-off") is the
-  *certifier's IAM authority* being withdrawn; `CertifyRun` already re-checks
-  authorization when it is called.
-
-  *Why it was not built* (2026-10-16): the specification does not say
-  (a) which **lifecycle** state a run takes when its certification is revoked
-  — §7 has no lifecycle Revoked, the only edge out of lifecycle CERTIFIED is
-  SUPERSEDED, and the `control_runs` CHECK forbids lifecycle CERTIFIED with any
-  other certification state, so a choice has to be made and the constraint
-  migrated; (b) what happens **downstream** (A11); (c) **who** may revoke —
-  "restricted command" names no role. Once those are decided, the command is
-  small: `POST /controls/v1/runs/{id}/revoke-certification` with mandatory
-  reason and evidence reference (NP-47), `If-Match`, `Idempotency-Key`, its own
-  action (not `FINCTRL_CERTIFY`), the original certification transition kept,
-  event `control.run.certification_revoked` (prior state, reason, effective
-  time), and a test that the close gate reports closed for that control
-  afterwards (the gate reads the latest run's states).
-- **A2. No ControlCertification record (§6, Invariant 9).** Certifying changes
-  the run's states and appends a transition row (actor, reason, time). Invariant
-  9 requires the certified result to identify the certifier, *certification
-  authority*, time, run version, *unresolved exceptions* and *impact
-  assessment*. Not stored: which grant/role authorized the certifier at that
-  moment (authority snapshot), the list of waived/carried-forward exceptions
-  accepted by this certification, assessed exposure, and a link to an evidence
-  package sealed for this certification (the package is sealed at execution).
-  The evidence export reconstructs part of this from history. Scope: an
-  append-only `control_certifications` table written in the certify
-  transaction, included in `GET …/evidence` and the export.
-- **A3. Certification has no idempotency key.** §25: idempotency is mandatory
-  for run creation, execution, reperformance and certification. Create and
-  execute require `Idempotency-Key` (`command_idempotency` table); `POST
-  …/certification`, `POST …/submit-for-certification` and exception
-  transitions (including REPERFORMED) rely on `If-Match` only. A client that
-  retries a successful CERTIFY after a lost response gets 412 instead of the
-  original result. Scope: reuse `command_idempotency` for those commands.
+- **A1. A certification cannot be revoked. — Closed (B6).**
+  `POST /controls/v1/runs/{run_id}/revoke-certification` moves a CERTIFIED
+  run's certification dimension CERTIFIED → REVOKED. The lifecycle stays
+  CERTIFIED and the result is untouched (§7: Revoked is a certification state,
+  not a lifecycle state). The original certification is retained (§27):
+  nothing in the run's history changes, and an append-only
+  `control_certification_revocations` row references the certification
+  transition it revokes. The request needs a mandatory reason and at least
+  one evidence reference (§25, NP-47), plus `If-Match` and `Idempotency-Key`.
+  It is authorized by its own action, `FINCTRL_REVOKE`, and the principal who
+  certified the run cannot revoke it. It emits
+  `control.run.certification_revoked` (prior state, prior certification,
+  reason, evidence, effective time). The close gate reports the control as
+  blocking with reason `CERTIFICATION_REVOKED`. The three questions this item
+  left open were settled as follows: (a) the lifecycle stays CERTIFIED
+  (migration 000006 relaxes the CHECK); (b) the downstream effect is
+  prospective only (RB-05; see A11); (c) who may revoke: holders of
+  `FINCTRL_REVOKE` other than the certifier. **Deployment prerequisite:**
+  see B6, `FINCTRL_REVOKE` must be registered in access-control-svc first.
+- **A2. No ControlCertification record (§6, Invariant 9). — Closed (B7).**
+  Every CERTIFY decision now writes one append-only `control_certifications`
+  row (migration 000007) inside `CertifyRun`'s own transaction, under the
+  run's row lock. It holds §6's canonical fields: `run_id`, certifier,
+  authority snapshot, result, unresolved exceptions, assessed exposure,
+  timestamp and evidence package. It also holds Invariant 9's run version
+  and the certification transition it records. `GET …/evidence` and the
+  evidence export serve the record as a `certification` field, read directly
+  from the table instead of being inferred from the transition history.
+- **A3. Certification has no idempotency key. — Closed (B8).** `POST
+  …/certification`, `POST …/submit-for-certification` and `POST
+  /controls/v1/exceptions/{id}/transition` (every target state, including
+  REPERFORMED) now require `Idempotency-Key` (400 `missing_idempotency_key`),
+  in addition to `If-Match`. Each claims the key in `command_idempotency`
+  exactly as `BeginExecution` does. A repeat of the key for the same command
+  on the same target returns the original result (`Idempotent-Replay: true`,
+  the target as it now stands) instead of a 409/412. The same key used for
+  another target or decision is a 409. Migration 000008 adds the
+  `exception_id` an exception transition needs, and widens `command`.
 - **A4. Tolerance and materiality approval is self-declared.**
   `CreateTolerancePolicy` / `CreateMaterialityPolicy` take `approved_by` as a
   free-text body field; the only check is `approved_by != caller`. No second
@@ -102,17 +84,44 @@ policies a run pins.
   new run with `prior_run_id` (documented in `financial-control-wave7.md`).
   Whether a run-level reperform is still needed is a design decision; if not,
   the two unused states should be removed or documented as reserved.
-- **A7. Late data after freeze/certification is not detected (Invariant 14,
-  scenarios 05 and 21).** A frozen population is immutable and later source
-  data is picked up by a new run — but nothing notices that a source's
-  watermark has moved after a run was CERTIFIED, so a certified population can
-  go stale silently. `LATE_DATA` exists only as a category an `EXCEPTION_SCAN`
-  rule may emit. The §7 attention signals derived today are CONTROL_FAILED,
-  CONTROL_STALE (run never started), RESULT_INDETERMINATE, OVERDUE, SLA_BREACH
-  and MATERIAL; `DATA_LATE` and `RECURRENT` are not derived. Scope: a sweeper
-  that re-reads the watermark (page 1, `limit=1`) for the latest certified run
-  of each control/entity/period, and on change opens a `LATE_DATA` exception
-  or attention signal and, per policy, reports the close gate closed.
+- **A7. Late data after certification is not detected (Invariant 14,
+  scenarios 05 and 21). — Closed (B9).** A late-data sweep now runs on the
+  service's housekeeping schedule. For the latest CERTIFIED run of each
+  control, entity and period, it re-reads each side's source watermark (page
+  1, `limit=1`, through the same `source` client request execution builds
+  populations with) and compares it with the watermark the run froze. When
+  it has moved, it opens one `LATE_DATA` exception on that run, with reason
+  `LATE_DATA_AFTER_CERTIFICATION`, through the same insert, transition and
+  `control.exception.opened` event execution uses. The close gate then
+  reports the control as `BLOCKING` with that reason, at the same decision
+  point (`EvaluateGate`) as every other reason. It stays blocked until the
+  exception is resolved under authority or a new run supersedes the
+  certified one. Nothing is mutated: the run row, its history, its frozen
+  population, its evidence and its `control_certifications` row are never
+  written. The integration test compares their `row_to_json` before and
+  after.
+  **Not built:**
+  1. There is no configurable per-control or per-population late-data
+     policy (§9 "Late-data rule"). Every moved watermark on a latest
+     certified run blocks the gate until it is resolved.
+  2. Late data on a run that has frozen its population but is not yet
+     certified (READY_TO_CERTIFY, EXCEPTION_REVIEW) is not detected, so a
+     certifier can still certify a population the source has already moved
+     past.
+  3. Detection runs at the sweep's cadence (every 10 minutes, each run at
+     most every 30), not on a source event, so a gate read in between does
+     not see it yet.
+  4. A source the sweep cannot read is recorded as `UNVERIFIED` in
+     `control_watermark_checks` and logged. It does not affect the gate, and
+     no endpoint exposes it.
+  5. The `DATA_LATE` and `RECURRENT` attention signals are still not derived.
+     The exception was chosen as the shape (B9), and `GET
+     …/monitoring/metrics`' late-data count already includes these
+     exceptions.
+  6. As in A11, nothing subscribes to the event, so a period closed before
+     the late data arrived is not flagged anywhere.
+  7. Scenario 21's consolidation population belongs to consolidation-svc.
+     This covers this service's populations only.
 - **A8. No cross-currency matching (§10, ZS-SVC-Z-001 INV-10).** Records in
   different currencies on one reference raise `CURRENCY_MISMATCH`; nothing
   normalizes through an approved FX basis. Blocked on an FX-rate read capability
@@ -123,22 +132,28 @@ policies a run pins.
 - **A10. 25 catalogue controls are blocked or partial.** See
   `financial-control-closure.md` §7 and `GET /controls/v1/catalogue/status`;
   not repeated here.
-- **A11. Downstream effect of a revoked (or superseded) certification is
-  unspecified.** A certification is consumed elsewhere: financial-close-svc's
-  readiness check calls `GET /controls/v1/close-gate` before a period is
-  closed, and reporting is released from that closed period (ZS-CONTROL-001
-  §22, Invariants 10 and 17). Neither ZS-CONTROL-001 nor ZS-SVC-Z-001 says
-  what happens when a certification that a period was **already** closed on is
-  revoked: whether the period must be reopened, whether released reports are
-  marked or withdrawn, or whether consumers are only notified. ZS-SVC-Z-001
-  RB-05 says only "assess blast radius", and its revocation is "prospective".
-  The close gate in this service would report the gate closed for future
-  readiness checks, but nothing tells financial-close-svc or reporting that a
-  past decision rested on a revoked certification. This needs an owner's
-  decision (Finance Controls / close governance) before A1 is built, and
-  probably a consumer of `control.run.certification_revoked` in
-  financial-close-svc. The same question applies today to a certified run that
-  is superseded by a failing one after its period closed.
+- **A11. Downstream effect of a revoked (or superseded) certification —
+  narrowed: the decision is made, consumers are not yet wired.**
+  ZS-SVC-Z-001 RB-05 answers the question this item asked: revocation is
+  **prospective**. Its downstream effect is flagging and notification from
+  the revocation onward. It does not reopen a period already closed on the
+  certification, and it does not withdraw reports already released from that
+  period. This service now does both of its parts (A1/B6): the close gate
+  reports the control as `BLOCKING` with reason `CERTIFICATION_REVOKED`, the
+  revocation time and its reason; and `control.run.certification_revoked`
+  is emitted with the prior certification, reason, evidence and effective
+  time. financial-close-svc already reads each gate item's `reason`, so a
+  readiness check made after a revocation sees it without any change there.
+  **Still open, and outside this service:** (1) nothing subscribes to
+  `control.run.certification_revoked`. financial-close-svc only asks the
+  gate when it closes a period, so a period closed *before* the revocation
+  is not flagged anywhere until someone queries the gate for it again;
+  (2) RB-05's "assess blast radius" has no query yet. Nothing lists the
+  closed periods, or released reports, whose close rested on a now-revoked
+  certification. Both are consumer-side work (financial-close-svc and
+  reporting). The same applies to a certified run superseded by a failing
+  one after its period closed: the gate reflects it, and
+  `control.run.superseded` is emitted, but nothing acts on it.
 
 ## B. Interpretations and additions (decisions a reviewer may want to reverse)
 
@@ -164,3 +179,211 @@ policies a run pins.
 - **B5. ZS-EVENT-001 CloudEvents naming is not used.** Events use the
   platform's shared envelope with ZS-EVENT attributes as extra fields; a
   platform-wide decision is needed (closure §5).
+- **B6. How certification revocation works (A1).**
+  - *State.* Only the certification dimension moves, CERTIFIED → REVOKED.
+    `domain.ValidateCertificationRevocation` admits it only on a lifecycle
+    CERTIFIED run, and REVOKED has no outgoing edge, so a second revocation
+    is refused (422). Migration 000006 replaces 000001's CHECK (lifecycle
+    CERTIFIED ⇒ certification CERTIFIED) with
+    `chk_certified_lifecycle_certification` (… IN CERTIFIED, REVOKED), and
+    adds `chk_revoked_follows_certification` (REVOKED only on lifecycle
+    CERTIFIED or SUPERSEDED). The down migration refuses while any revoked
+    run exists. A revoked run can still be superseded by a later run that
+    names it as `prior_run_id`. Its lifecycle then moves to SUPERSEDED and
+    its certification stays REVOKED, so the history reads "revoked, then
+    replaced".
+  - *Shape.* Mirrors `CertifyRun`: `h.caller`, mandatory `If-Match`
+    (`parseIfMatch`), `h.authorize` on the run's legal entity, and one
+    store transaction holding the `FOR UPDATE` lock. It also requires
+    `Idempotency-Key` and uses `command_idempotency` (command
+    `REVOKE_CERTIFICATION`) the way `BeginExecution` does. A retry gets its
+    original result (`Idempotent-Replay: true`) instead of a 422 on the
+    now-revoked run, the key is claimed only after every check passes, and
+    reusing a key for another run is a 409.
+  - *Retained, additive only.* The run's certification transition row, and
+    every other history row, is unchanged. The test compares their
+    `row_to_json` text before and after. The new CERTIFICATION
+    CERTIFIED → REVOKED transition records the revoker and reason. The new
+    `control_certification_revocations` row records
+    `certification_transition_id`, `certified_by`/`certified_at`, the reason,
+    `evidence_refs`, `revoked_by`/`revoked_at` and the correlation id. It is
+    one row per run (UNIQUE), immutable (`reject_control_mutation`), FORCE
+    RLS, and CHECKed for a non-blank reason, at least one evidence reference,
+    and `revoked_by <> certified_by`.
+  - *Who.* `FINCTRL_REVOKE` is a separate grant from `FINCTRL_CERTIFY`
+    (§27 "restricted command"). `domain.CheckRevokerIndependence` refuses
+    whoever moved the run to CERTIFIED (403 `segregation_of_duties`), on the
+    pattern of reconciliation-engine-svc's `CheckCertifierIndependence`. The
+    run's preparers are not barred: revoking is the fail-safe direction.
+  - ***Deployment prerequisite:*** access-control-svc validates every
+    permission bundle against its `permission_definitions` registry
+    (its migration 000008), and new actions are registered there by
+    migration. Until `FINCTRL_REVOKE` is added there (and to the
+    `FINCTRL_FULL` bundle in `deployments/scripts/seed-demo-rbac.ps1`), it
+    cannot be granted, so every revocation is denied (fail-closed). Both
+    files belong outside this service and were not changed here.
+  - *Gate.* `EvaluateGate` reports a lifecycle CERTIFIED + certification
+    REVOKED latest run as `BLOCKING` with reason `CERTIFICATION_REVOKED`.
+    Before this it would have fallen through to `LATEST_RUN_CERTIFIED_PASS`.
+    The item also carries `certification_revoked_at` and
+    `revocation_reason`, both additive JSON fields.
+- **B7. The ControlCertification record (A2).**
+  - *Authority snapshot.* authorization-svc's `/v1/authorize` already
+    returns `access_decision_id` (the key of its append-only
+    AccessDecisionLog, which holds the matched grants), `decision_basis`
+    (e.g. `rbac:role=…`), `decision`, `policy_set_version` and
+    `reason_codes`; this service used to keep only the outcome. A new
+    `authz.Client.Decide` returns them, and `CertifyRun` now authorizes
+    through it (`authorizeWithAuthority`). `Decide` always asks live,
+    bypassing the 5-second decision cache, so the recorded authority is the
+    decision taken for this certification and never one reused from
+    another request. A GRANTED answer with no `access_decision_id` cannot be
+    traced and is refused as `authorization_unavailable` (503). The store
+    also refuses a CERTIFY whose snapshot is missing, untraceable, or for
+    another principal, and a CHECK requires `access_decision_id` and
+    `decision_outcome = GRANTED`. The snapshot is stored as authorization-svc
+    gave it, plus the principal, entity, action and the time it was
+    received. Every other command still uses the cached `CheckAllowed`;
+    only certification records its authority.
+  - *Unresolved exceptions.* Every exception of the run not CLOSED at
+    certification: in practice the WAIVED_UNDER_AUTHORITY and
+    CARRIED_FORWARD_UNDER_AUTHORITY ones a PASS_WITH_APPROVED_EXCEPTIONS
+    result accepts. Each is recorded with state, category, reason code,
+    severity, exact exposure and currency, plus the `authority_ref` and
+    `carry_to_period` of the exception transition that put it there.
+  - *Assessed exposure.* `domain.AssessExposure`, which is the existing
+    `Summarise` (exact `big.Rat` totals per currency and severity) applied
+    to those exceptions, against the materiality policy the **run pinned
+    at creation**, not the entity's current one. A run that pinned none
+    gets totals with `aggregate_material: null` (not assessable). No FX is
+    applied; other currencies are listed as unassessed.
+  - *Evidence package.* A reference to the package sealed at execution
+    (the latest, if reperformed), by `evidence_package_id` (foreign key) and
+    `evidence_digest`. No new package is sealed for the certification. A
+    run with no sealed package cannot be certified (422).
+  - *Scope.* Only CERTIFY writes a record; a REJECT is a transition, not a
+    certification. One row per run (UNIQUE), immutable
+    (`reject_control_mutation`), FORCE RLS. `certification_transition_id`
+    is the same CERTIFICATION → CERTIFIED row a revocation (B6) references.
+    No backfill: runs certified before 000007 had no authority recorded,
+    none is invented, and their `certification` is absent or null. The
+    `control.run.certified` event payload is unchanged.
+  - *Reads.* `GET …/evidence` adds `certification` to the package fields
+    (omitted when there is none). The export adds `certification` (null when
+    none) inside the bundle's manifest digest. `run_transitions` stays in
+    the export as history, but is no longer the only place a certification
+    can be seen.
+- **B8. Idempotency of certification, resubmission and exception
+  transitions (A3).**
+  - *One mechanism.* The same `command_idempotency` table and rule as
+    `BeginExecution` (and `RevokeCertification`, B6, which is unchanged): the
+    key is looked up first, the command runs, and the key is claimed in the
+    same transaction only once the command has succeeded, so a refused
+    command (segregation, a stale version, an invalid transition) never
+    consumes it. The three commands share `internal/store/idempotency.go`
+    (`lookupCommandKey`/`recordCommandKey`). `BeginExecution` and
+    `RevokeCertification` keep their own inline copies, which apply the same
+    rule.
+  - *What a key is bound to.* The run, and for an exception transition the
+    exception too: migration 000008 adds `command_idempotency.exception_id`.
+    Without it, one key retried against two exceptions of the same run would
+    read as a replay of the first. The command name records what was decided
+    (`CERTIFY` or `REJECT`, `SUBMIT_FOR_CERTIFICATION`,
+    `EXCEPTION:<to_state>`), so a key cannot replay a different decision on
+    the same target; that 409s instead. `command` is widened to
+    VARCHAR(64) for `EXCEPTION:CARRIED_FORWARD_UNDER_AUTHORITY`. A key from
+    another command (e.g. the run's `EXECUTE` key) is a 409.
+  - *Replay.* Like `BeginExecution`, a replay returns the target as it now
+    stands, not a stored copy of the original response. It is checked
+    before the `If-Match` version, because the retry carries the version the
+    client saw before its first attempt. The response carries
+    `Idempotent-Replay: true` and the current ETag.
+  - *Concurrency.* Unlike `BeginExecution`, these commands take the
+    target's row lock **before** looking the key up. Two concurrent first
+    attempts with one key are therefore serialised: one applies and the
+    other replays it, rather than the second failing on the version
+    (covered by a concurrent integration test).
+  - *Order of checks in the handler.* Idempotency-Key, then If-Match (428),
+    then the body, then authorization, matching `ExecuteRun` and
+    `RevokeCertification`. Authorization is re-evaluated on a replay too
+    (§25: on every material command). No caller outside this service uses
+    these three endpoints, so making the header mandatory breaks no client
+    in the repository.
+  - *Rollback.* 000008's down migration deletes the claims the old schema
+    cannot hold (exception transitions, commands longer than 32 characters).
+    They are retry protection, not records.
+
+- **B9. How late data after certification is detected (A7).**
+  - *Trigger.* The service already had an in-process scheduler. `cmd/server`
+    runs the housekeeping `Sweep` (run expiry, SLA breaches) on a 10-minute
+    ticker under the relay context, and the late-data sweep is a second loop
+    of the same shape: `engine.LateDataSweeper.Sweep(ctx, 100)` every 10
+    minutes, re-checking a run at most every 30 minutes, least recently
+    checked first. It is not computed lazily on close-gate reads, for three
+    reasons:
+    1. The gate would then make one or two source calls per mandatory
+       control on every read, and a source outage would make the gate's
+       answer depend on that source.
+    2. A GET would have to write the exception.
+    3. Invariant 14 wants the exception to exist when the late data is
+       there, not only once someone asks the gate. Monitoring and exception
+       queues see it too.
+
+    It is a separate loop rather than another step in `Sweep` so that a slow
+    source (each read is bounded at 10 seconds) cannot delay run expiry or
+    SLA events. `Sweep` lives in `store`, which has no source client.
+  - *Shape.* An exception, not an attention signal. `LATE_DATA` is already a
+    `control_exceptions` category, the one `EXCEPTION_SCAN` rules emit. The
+    exception lifecycle already carries owner, due date, authority, evidence
+    and root cause, which is how a late-data finding gets resolved, and
+    monitoring already counts the category. Attention signals are derived
+    from stored fields on read, which a watermark re-check cannot be.
+    `domain.LateDataException` builds it with:
+    - severity HIGH, owner = the definition's owner role, due date from the
+      HIGH SLA;
+    - side = the side that moved, `record_ids` = the stale frozen
+      `population_id`;
+    - exposure 0 in `XXX` (there is no amount yet);
+    - detail naming both watermarks.
+
+    Its reason `LATE_DATA_AFTER_CERTIFICATION` is reserved (`validateScan`
+    refuses it), so the gate cannot confuse it with a `LATE_DATA` finding the
+    certifier already saw.
+  - *Population read.* `source.HTTPFetcher.Watermark` calls the same `page`
+    request `Fetch` loops over, now taking its limit, with `limit=1` and no
+    cursor. The spec is resolved as `Execute` resolves it (definition spec,
+    bound to the run's scope) and must give the frozen snapshot's `spec_ref`,
+    or the check is `UNVERIFIED`. As at execution, the source authorizes the
+    human caller (control-population-contract.md): the read forwards the
+    principal who executed the run, the actor of its PREPARING transition.
+    If that principal has since lost the source's read action, the source
+    refuses and the check is `UNVERIFIED`. *A reviewer may prefer a service
+    principal here; the contract has none today.*
+  - *Recording.* `PgStore.RecordWatermarkCheck` runs in one transaction
+    under the run's `FOR UPDATE` lock, so replicas sweeping at once open the
+    exception once (covered by a concurrent test). It first re-checks that
+    the run is still CERTIFIED/CERTIFIED and still the latest run of its
+    control, entity and period. It opens an exception only when no
+    unresolved late-data exception exists for that side and the observed
+    watermark is not the one the last such exception was opened for. Once
+    that one is resolved, the same watermark is not reported again, but a
+    further move is. Migration 000009's `control_watermark_checks` (one
+    mutable row per run and side, FORCE RLS) holds the last check (CURRENT,
+    MOVED, or UNVERIFIED with its error) and that reported watermark. It is
+    the sweep's state, not a record: the exception, its transition and its
+    event are the record.
+  - *Gate.* `PgStore.CloseGate` reads the latest run's oldest unresolved
+    `LATE_DATA_AFTER_CERTIFICATION` exception into `GateInput`. When the
+    run is CERTIFIED/CERTIFIED, `EvaluateGate` reports `BLOCKING` with that
+    reason, plus `late_data_exception_id` and `late_data_detected_at`. A
+    revoked certification still reports `CERTIFICATION_REVOKED`. Two things
+    clear it:
+    - resolving the exception (closure, waiver or carry-forward under
+      authority, through the existing transition endpoint);
+    - a new run, which becomes the latest. Naming the certified run as
+      prior supersedes it, as before.
+  - *Rollback.* 000009's down migration refuses while any check records a
+    late-data exception it opened. That reported watermark is what stops a
+    resolved one being reported again after a re-apply. Otherwise it drops
+    the table. The same `DO $$ … RAISE EXCEPTION` guard as 000006/000007,
+    with a table check so it can be re-run.

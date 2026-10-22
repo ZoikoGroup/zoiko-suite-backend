@@ -2,10 +2,12 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
 	"zoiko.io/document-vault-svc/internal/domain"
@@ -16,13 +18,13 @@ import (
 const retentionRuleColumns = `
 	retention_rule_version_id, tenant_id, record_class, jurisdiction_selector, legal_basis_ref, purpose_ref,
 	trigger_type, duration_days, disposition_action, status, created_by_principal_id, created_at,
-	approved_by_principal_id, approved_at, superseded_by_version_id
+	approved_by_principal_id, approved_at, superseded_by_version_id, effective_from, effective_to
 `
 
 func scanRetentionRule(row pgx.Row, rr *domain.RetentionRuleVersion) error {
 	return row.Scan(&rr.RetentionRuleVersionID, &rr.TenantID, &rr.RecordClass, &rr.JurisdictionSelector, &rr.LegalBasisRef, &rr.PurposeRef,
 		&rr.TriggerType, &rr.DurationDays, &rr.DispositionAction, &rr.Status, &rr.CreatedByPrincipalID, &rr.CreatedAt,
-		&rr.ApprovedByPrincipalID, &rr.ApprovedAt, &rr.SupersededByVersionID)
+		&rr.ApprovedByPrincipalID, &rr.ApprovedAt, &rr.SupersededByVersionID, &rr.EffectiveFrom, &rr.EffectiveTo)
 }
 
 func (s *PgStore) CreateRetentionRuleVersion(ctx context.Context, p domain.CreateRetentionRuleVersionParams) (*domain.RetentionRuleVersion, error) {
@@ -41,16 +43,21 @@ func (s *PgStore) CreateRetentionRuleVersion(ctx context.Context, p domain.Creat
 	if p.DurationDays <= 0 {
 		return nil, fmt.Errorf("duration_days must be positive")
 	}
+	if p.EffectiveFrom != nil && p.EffectiveTo != nil && !p.EffectiveTo.After(*p.EffectiveFrom) {
+		return nil, domain.ErrInvalidEffectiveWindow
+	}
 
 	var out domain.RetentionRuleVersion
 	err := s.withTenant(ctx, func(tx pgx.Tx, tenantID string) error {
 		row := tx.QueryRow(ctx, `
 			INSERT INTO retention_rule_versions (tenant_id, record_class, jurisdiction_selector, legal_basis_ref,
-				purpose_ref, trigger_type, duration_days, disposition_action, created_by_principal_id)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+				purpose_ref, trigger_type, duration_days, disposition_action, created_by_principal_id,
+				effective_from, effective_to)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 			RETURNING `+retentionRuleColumns,
 			tenantID, p.RecordClass, p.JurisdictionSelector, p.LegalBasisRef, p.PurposeRef,
 			p.TriggerType, p.DurationDays, p.DispositionAction, p.CreatedByPrincipalID,
+			p.EffectiveFrom, p.EffectiveTo,
 		)
 		return scanRetentionRule(row, &out)
 	})
@@ -147,13 +154,13 @@ func (s *PgStore) ActivateRetentionRuleVersion(ctx context.Context, retentionRul
 const retentionStateColumns = `
 	retention_state_id, tenant_id, record_id, retention_rule_version_id, trigger_date, due_at, state,
 	review_notes, reviewed_by_principal_id, reviewed_at, approved_for_disposition_by_principal_id,
-	approved_for_disposition_at, created_by_principal_id, created_at
+	approved_for_disposition_at, created_by_principal_id, created_at, disposition_approval_ref
 `
 
 func scanRetentionState(row pgx.Row, st *domain.RecordRetentionState) error {
 	return row.Scan(&st.RetentionStateID, &st.TenantID, &st.RecordID, &st.RetentionRuleVersionID, &st.TriggerDate, &st.DueAt, &st.State,
 		&st.ReviewNotes, &st.ReviewedByPrincipalID, &st.ReviewedAt, &st.ApprovedForDispositionByPrincipalID,
-		&st.ApprovedForDispositionAt, &st.CreatedByPrincipalID, &st.CreatedAt)
+		&st.ApprovedForDispositionAt, &st.CreatedByPrincipalID, &st.CreatedAt, &st.DispositionApprovalRef)
 }
 
 // BindRetentionRule binds a record to an ACTIVE retention rule version
@@ -190,6 +197,10 @@ func (s *PgStore) BindRetentionRule(ctx context.Context, p domain.BindRetentionR
 			d := p.TriggerDate.AddDate(0, 0, rule.DurationDays)
 			dueAt = &d
 		}
+		legalEntityID, err := recordLegalEntity(ctx, tx, tenantID, p.RecordID)
+		if err != nil {
+			return err
+		}
 
 		row := tx.QueryRow(ctx, `
 			INSERT INTO record_retention_states (tenant_id, record_id, retention_rule_version_id, trigger_date, due_at, state, created_by_principal_id)
@@ -203,12 +214,32 @@ func (s *PgStore) BindRetentionRule(ctx context.Context, p domain.BindRetentionR
 			}
 			return fmt.Errorf("document store unavailable: %w", mapPgError(err))
 		}
-		return nil
+		return enqueueDRCEvent(ctx, tx, "RECORD", p.RecordID, evtRetentionScheduleResolved, tenantID, legalEntityID,
+			p.CreatedByPrincipalID, "", scheduleResolvedPayload(&out, rule.TriggerType))
 	})
 	if err != nil {
 		return nil, err
 	}
 	return &out, nil
+}
+
+// scheduleResolvedPayload is §9.3's retention_schedule_resolved anchors:
+// record_id, schedule_version_id, trigger, due_at/condition. While the trigger
+// has not happened the "condition" is WAITING_FOR_TRIGGER and due_at is null.
+func scheduleResolvedPayload(st *domain.RecordRetentionState, trigger domain.RetentionTriggerType) map[string]any {
+	condition := "TRIGGER_RESOLVED"
+	if st.State == domain.RetentionWaitingForTrigger {
+		condition = "WAITING_FOR_TRIGGER"
+	}
+	return map[string]any{
+		"record_id":           st.RecordID,
+		"retention_state_id":  st.RetentionStateID,
+		"schedule_version_id": st.RetentionRuleVersionID,
+		"trigger":             string(trigger),
+		"trigger_date":        st.TriggerDate,
+		"due_at":              st.DueAt,
+		"condition":           condition,
+	}
 }
 
 func (s *PgStore) GetRecordRetentionState(ctx context.Context, retentionStateID string) (*domain.RecordRetentionState, error) {
@@ -282,7 +313,15 @@ func (s *PgStore) RecordTriggerEvent(ctx context.Context, p domain.RecordTrigger
 			WHERE retention_state_id = $1 RETURNING `+retentionStateColumns,
 			p.RetentionStateID, p.TriggerDate, dueAt,
 		)
-		return scanRetentionState(row, &out)
+		if err := scanRetentionState(row, &out); err != nil {
+			return err
+		}
+		legalEntityID, err := recordLegalEntity(ctx, tx, tenantID, out.RecordID)
+		if err != nil {
+			return err
+		}
+		return enqueueDRCEvent(ctx, tx, "RECORD", out.RecordID, evtRetentionScheduleResolved, tenantID, legalEntityID,
+			p.TriggeredByPrincipalID, "", scheduleResolvedPayload(&out, rule.TriggerType))
 	})
 	if err != nil {
 		return nil, err
@@ -307,7 +346,24 @@ func (s *PgStore) EvaluateDue(ctx context.Context, p domain.EvaluateDueParams) (
 		}
 		row := tx.QueryRow(ctx, `UPDATE record_retention_states SET state = 'DUE' WHERE retention_state_id = $1 RETURNING `+retentionStateColumns,
 			p.RetentionStateID)
-		return scanRetentionState(row, &out)
+		if err := scanRetentionState(row, &out); err != nil {
+			return err
+		}
+		legalEntityID, err := recordLegalEntity(ctx, tx, tenantID, out.RecordID)
+		if err != nil {
+			return err
+		}
+		holdState, err := activeHoldState(ctx, tx, tenantID, out.RecordID)
+		if err != nil {
+			return err
+		}
+		return enqueueDRCEvent(ctx, tx, "RECORD", out.RecordID, evtRecordDispositionDue, tenantID, legalEntityID,
+			p.EvaluatedByPrincipalID, "", map[string]any{
+				"record_id":          out.RecordID,
+				"retention_state_id": out.RetentionStateID,
+				"due_at":             out.DueAt,
+				"hold_state":         holdState,
+			})
 	})
 	if err != nil {
 		return nil, err
@@ -354,22 +410,18 @@ func (s *PgStore) ApproveForDisposition(ctx context.Context, p domain.ApproveFor
 			return domain.ErrRetentionStateNotReviewRequired
 		}
 
-		var underHold bool
-		if err := tx.QueryRow(ctx, `SELECT EXISTS(
-			SELECT 1 FROM legal_hold_targets
-			WHERE record_id = $1 AND tenant_id::text = $2 AND applied_at IS NOT NULL AND released_at IS NULL)`,
-			st.RecordID, tenantID).Scan(&underHold); err != nil {
-			return fmt.Errorf("document store unavailable: %w", err)
-		}
-		if underHold {
-			return domain.ErrRecordUnderLegalHold
+		if holdID, err := activeHoldID(ctx, tx, tenantID, st.RecordID); err != nil {
+			return err
+		} else if holdID != "" {
+			return fmt.Errorf("%w (hold %s)", domain.ErrRecordUnderLegalHold, holdID)
 		}
 
 		row := tx.QueryRow(ctx, `
 			UPDATE record_retention_states SET state = 'APPROVED_FOR_DISPOSITION',
-				approved_for_disposition_by_principal_id = $2, approved_for_disposition_at = now()
+				approved_for_disposition_by_principal_id = $2, approved_for_disposition_at = now(),
+				disposition_approval_ref = $3
 			WHERE retention_state_id = $1 RETURNING `+retentionStateColumns,
-			p.RetentionStateID, p.ApprovedByPrincipalID,
+			p.RetentionStateID, p.ApprovedByPrincipalID, nullableString(p.ApprovalRef),
 		)
 		return scanRetentionState(row, &out)
 	})
@@ -435,6 +487,9 @@ func (s *PgStore) CreateLegalHold(ctx context.Context, p domain.CreateLegalHoldP
 				tenantID, out.HoldID, recordID); err != nil {
 				return fmt.Errorf("document store unavailable: %w", mapPgError(err))
 			}
+			if err := s.enqueueHoldTargetAdded(ctx, tx, tenantID, out.HoldID, recordID, false, p.IssuedByPrincipalID); err != nil {
+				return err
+			}
 		}
 		return nil
 	})
@@ -486,8 +541,9 @@ func (s *PgStore) ActivateLegalHold(ctx context.Context, p domain.ActivateLegalH
 		if h.Status != domain.LegalHoldDraft {
 			return domain.ErrLegalHoldNotDraft
 		}
-		if _, err := tx.Exec(ctx, `UPDATE legal_hold_targets SET applied_at = now() WHERE hold_id = $1 AND tenant_id::text = $2 AND applied_at IS NULL`,
-			p.HoldID, tenantID); err != nil {
+		tag, err := tx.Exec(ctx, `UPDATE legal_hold_targets SET applied_at = now() WHERE hold_id = $1 AND tenant_id::text = $2 AND applied_at IS NULL`,
+			p.HoldID, tenantID)
+		if err != nil {
 			return fmt.Errorf("document store unavailable: %w", mapPgError(err))
 		}
 		row := tx.QueryRow(ctx, `
@@ -495,7 +551,18 @@ func (s *PgStore) ActivateLegalHold(ctx context.Context, p domain.ActivateLegalH
 			WHERE hold_id = $1 RETURNING `+legalHoldColumns,
 			p.HoldID, p.ActivatedByPrincipalID,
 		)
-		return scanLegalHold(row, &out)
+		if err := scanLegalHold(row, &out); err != nil {
+			return err
+		}
+		// scope_version is not modelled (a hold has no versions), so it is not
+		// invented; the anchors this service can supply are sent.
+		return enqueueDRCEvent(ctx, tx, "LEGAL_HOLD", out.HoldID, evtLegalHoldActivated, tenantID, "",
+			p.ActivatedByPrincipalID, "", map[string]any{
+				"hold_id":         out.HoldID,
+				"authority_ref":   out.AuthorityRef,
+				"matter_ref":      out.MatterRef,
+				"targets_applied": tag.RowsAffected(),
+			})
 	})
 	if err != nil {
 		return nil, err
@@ -536,7 +603,7 @@ func (s *PgStore) AddLegalHoldTarget(ctx context.Context, p domain.AddLegalHoldT
 			}
 			return fmt.Errorf("document store unavailable: %w", mapPgError(err))
 		}
-		return nil
+		return s.enqueueHoldTargetAdded(ctx, tx, tenantID, p.HoldID, p.RecordID, appliedNow, p.CreatedByPrincipalID)
 	})
 	if err != nil {
 		return nil, err
@@ -563,10 +630,11 @@ func (s *PgStore) ReleaseLegalHold(ctx context.Context, p domain.ReleaseLegalHol
 		if p.ReleasedByPrincipalID == p.ReleaseApprovedByPrincipalID {
 			return domain.ErrLegalHoldSelfRelease
 		}
-		if _, err := tx.Exec(ctx, `
+		tag, err := tx.Exec(ctx, `
 			UPDATE legal_hold_targets SET released_at = now()
 			WHERE hold_id = $1 AND tenant_id::text = $2 AND applied_at IS NOT NULL AND released_at IS NULL`,
-			p.HoldID, tenantID); err != nil {
+			p.HoldID, tenantID)
+		if err != nil {
 			return fmt.Errorf("document store unavailable: %w", mapPgError(err))
 		}
 		row := tx.QueryRow(ctx, `
@@ -575,7 +643,19 @@ func (s *PgStore) ReleaseLegalHold(ctx context.Context, p domain.ReleaseLegalHol
 			WHERE hold_id = $1 RETURNING `+legalHoldColumns,
 			p.HoldID, p.ReleaseReason, p.ReleasedByPrincipalID, p.ReleaseApprovedByPrincipalID,
 		)
-		return scanLegalHold(row, &out)
+		if err := scanLegalHold(row, &out); err != nil {
+			return err
+		}
+		// Releasing a hold never deletes anything (DRC-I11); retention is
+		// re-evaluated through the normal path. release_approval_ref is the
+		// approving principal recorded on the hold: a workflow decision
+		// reference is not available to this service.
+		return enqueueDRCEvent(ctx, tx, "LEGAL_HOLD", out.HoldID, evtLegalHoldReleased, tenantID, "",
+			p.ReleasedByPrincipalID, "", map[string]any{
+				"hold_id":              out.HoldID,
+				"release_approval_ref": p.ReleaseApprovedByPrincipalID,
+				"targets_released":     tag.RowsAffected(),
+			})
 	})
 	if err != nil {
 		return nil, err
@@ -605,4 +685,189 @@ func (s *PgStore) ListLegalHoldTargets(ctx context.Context, holdID string) ([]do
 		return nil, err
 	}
 	return out, nil
+}
+
+// enqueueHoldTargetAdded announces a new hold target (§9.3 legal_hold_target_added).
+func (s *PgStore) enqueueHoldTargetAdded(ctx context.Context, tx pgx.Tx, tenantID, holdID, recordID string, applied bool, actorID string) error {
+	var versionID string
+	if err := tx.QueryRow(ctx, `SELECT document_version_id::text FROM records WHERE record_id = $1 AND tenant_id::text = $2`,
+		recordID, tenantID).Scan(&versionID); err != nil {
+		return fmt.Errorf("document store unavailable: %w", err)
+	}
+	return enqueueDRCEvent(ctx, tx, "LEGAL_HOLD", holdID, evtLegalHoldTargetAdded, tenantID, "", actorID, "", map[string]any{
+		"hold_id":             holdID,
+		"record_id":           recordID,
+		"document_version_id": versionID,
+		"applied":             applied,
+	})
+}
+
+// activeHoldID returns one ACTIVE legal hold covering the record, or "" when none.
+func activeHoldID(ctx context.Context, tx pgx.Tx, tenantID, recordID string) (string, error) {
+	var holdID string
+	err := tx.QueryRow(ctx, `
+		SELECT hold_id::text FROM legal_hold_targets
+		WHERE record_id::text = $1 AND tenant_id::text = $2 AND applied_at IS NOT NULL AND released_at IS NULL
+		ORDER BY hold_id LIMIT 1`, recordID, tenantID).Scan(&holdID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("document store unavailable: %w", err)
+	}
+	return holdID, nil
+}
+
+// CreateDispositionCandidate is POST /v1/dispositions (§9.2: "Create
+// disposition candidate/job. Hold check + expected retention state."). In this
+// service the disposition lifecycle of a record is its retention state (§5.4,
+// §8.1 record_retention_states), so a candidate is the DUE -> REVIEW_REQUIRED
+// step, taken only when:
+//   - the record's state is the one the caller expected (else ErrRetentionStateMismatch);
+//   - that state is DUE (else ErrRetentionStateNotDue) — nothing is ever made a
+//     candidate before its retention has elapsed;
+//   - no ACTIVE legal hold covers the record (else ErrRecordUnderLegalHold, naming
+//     the hold; DRC-I10 / DRC-008). Nothing is mutated on a refusal.
+//
+// It deletes nothing. Execution of a disposition is not implemented (see README).
+func (s *PgStore) CreateDispositionCandidate(ctx context.Context, p domain.CreateDispositionCandidateParams) (*domain.RecordRetentionState, error) {
+	var out domain.RecordRetentionState
+	err := s.withTenant(ctx, func(tx pgx.Tx, tenantID string) error {
+		row := tx.QueryRow(ctx, `SELECT `+retentionStateColumns+` FROM record_retention_states
+			WHERE record_id::text = $1 AND tenant_id::text = $2 FOR UPDATE`, p.RecordID, tenantID)
+		var st domain.RecordRetentionState
+		if err := scanRetentionState(row, &st); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) || errors.Is(mapPgError(err), domain.ErrRecordNotFound) {
+				return domain.ErrRetentionStateNotFound
+			}
+			return fmt.Errorf("document store unavailable: %w", err)
+		}
+		if st.State != p.ExpectedState {
+			return domain.ErrRetentionStateMismatch
+		}
+		if st.State != domain.RetentionDue {
+			return domain.ErrRetentionStateNotDue
+		}
+		if holdID, err := activeHoldID(ctx, tx, tenantID, st.RecordID); err != nil {
+			return err
+		} else if holdID != "" {
+			return fmt.Errorf("%w (hold %s)", domain.ErrRecordUnderLegalHold, holdID)
+		}
+		upd := tx.QueryRow(ctx, `
+			UPDATE record_retention_states SET state = 'REVIEW_REQUIRED', review_notes = $2,
+				reviewed_by_principal_id = $3, reviewed_at = now()
+			WHERE retention_state_id = $1 RETURNING `+retentionStateColumns,
+			st.RetentionStateID, p.ReviewNotes, p.CreatedByPrincipalID)
+		return scanRetentionState(upd, &out)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// ResolveLegalHoldTargets is POST /v1/legal-holds/{id}:resolve-targets (§9.2:
+// "Resolve/refresh scope. Records result snapshot and partial failures.") for the
+// explicit-object scope.
+//
+// In ONE transaction it makes every named record a target of the hold (applied at
+// once when the hold is ACTIVE, pending until activation when it is DRAFT), and
+// records an immutable snapshot of what happened to each record:
+//
+//	ADDED           became a target (legal_hold_target_added is published, as for
+//	                the single-target route)
+//	ALREADY_TARGET  already a target; nothing changed — so repeating the call
+//	                refreshes the snapshot and changes no target
+//	unresolved      the record does not exist in the caller's tenant
+//
+// A record that cannot be resolved does NOT fail the call: it is reported in the
+// snapshot and the others still resolve — that is the "partial failures" the route
+// is specified to record. When any is unresolved, legal_hold_partial_application
+// is published with the unresolved ids and the response says complete=false (§5.6:
+// "expose unresolved targets rather than presenting the hold as complete"). The
+// hold's own status is not changed: PARTIALLY_APPLIED is deliberately not modelled
+// (see migration 000010), so the snapshot and the event carry that condition.
+//
+// A RELEASED hold takes no new targets (ErrLegalHoldReleased).
+func (s *PgStore) ResolveLegalHoldTargets(ctx context.Context, p domain.ResolveLegalHoldTargetsParams) (*domain.HoldResolution, error) {
+	if len(p.RecordIDs) == 0 {
+		return nil, domain.ErrNoRecordIDsToResolve
+	}
+	out := domain.HoldResolution{HoldID: p.HoldID, Resolved: []domain.ResolvedTarget{}, Unresolved: []domain.UnresolvedTarget{}}
+	err := s.withTenant(ctx, func(tx pgx.Tx, tenantID string) error {
+		h, err := loadLegalHoldForUpdate(ctx, tx, tenantID, p.HoldID)
+		if err != nil {
+			return err
+		}
+		if h.Status == domain.LegalHoldReleased {
+			return domain.ErrLegalHoldReleased
+		}
+		out.HoldStatus = h.Status
+		appliedNow := h.Status == domain.LegalHoldActive
+
+		for _, recordID := range p.RecordIDs {
+			var recordExists bool
+			if _, perr := uuid.Parse(recordID); perr == nil {
+				if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM records WHERE record_id = $1 AND tenant_id::text = $2)`,
+					recordID, tenantID).Scan(&recordExists); err != nil {
+					return fmt.Errorf("document store unavailable: %w", err)
+				}
+			}
+			if !recordExists {
+				out.Unresolved = append(out.Unresolved, domain.UnresolvedTarget{RecordID: recordID, Reason: domain.UnresolvedRecordNotFound})
+				continue
+			}
+			var targetID string
+			err := tx.QueryRow(ctx, `
+				INSERT INTO legal_hold_targets (tenant_id, hold_id, record_id, applied_at)
+				VALUES ($1, $2, $3, CASE WHEN $4 THEN now() ELSE NULL END)
+				ON CONFLICT (hold_id, record_id) DO NOTHING
+				RETURNING hold_target_id`, tenantID, p.HoldID, recordID, appliedNow).Scan(&targetID)
+			switch {
+			case err == nil:
+				if err := s.enqueueHoldTargetAdded(ctx, tx, tenantID, p.HoldID, recordID, appliedNow, p.ResolvedByPrincipalID); err != nil {
+					return err
+				}
+				out.Resolved = append(out.Resolved, domain.ResolvedTarget{RecordID: recordID, Outcome: domain.TargetAdded, Applied: appliedNow})
+			case errors.Is(err, pgx.ErrNoRows):
+				var applied bool
+				if err := tx.QueryRow(ctx, `SELECT applied_at IS NOT NULL FROM legal_hold_targets WHERE hold_id = $1 AND record_id = $2 AND tenant_id::text = $3`,
+					p.HoldID, recordID, tenantID).Scan(&applied); err != nil {
+					return fmt.Errorf("document store unavailable: %w", err)
+				}
+				out.Resolved = append(out.Resolved, domain.ResolvedTarget{RecordID: recordID, Outcome: domain.TargetAlreadyTarget, Applied: applied})
+			default:
+				return fmt.Errorf("document store unavailable: %w", mapPgError(err))
+			}
+		}
+
+		out.Complete = len(out.Unresolved) == 0
+		snapshot, err := json.Marshal(map[string]any{"resolved_targets": out.Resolved, "unresolved_targets": out.Unresolved})
+		if err != nil {
+			return fmt.Errorf("encode resolution snapshot: %w", err)
+		}
+		if err := tx.QueryRow(ctx, `
+			INSERT INTO legal_hold_resolutions (tenant_id, hold_id, resolved_by_principal_id, snapshot, unresolved_count)
+			VALUES ($1, $2, $3, $4, $5) RETURNING resolution_id, resolved_at`,
+			tenantID, p.HoldID, p.ResolvedByPrincipalID, snapshot, len(out.Unresolved)).Scan(&out.ResolutionID, &out.ResolvedAt); err != nil {
+			return fmt.Errorf("document store unavailable: %w", mapPgError(err))
+		}
+		if len(out.Unresolved) > 0 {
+			ids := make([]string, 0, len(out.Unresolved))
+			for _, u := range out.Unresolved {
+				ids = append(ids, u.RecordID)
+			}
+			return enqueueDRCEvent(ctx, tx, "LEGAL_HOLD", p.HoldID, evtLegalHoldPartialApplied, tenantID, "",
+				p.ResolvedByPrincipalID, "", map[string]any{
+					"hold_id":            p.HoldID,
+					"unresolved_targets": ids,
+					"resolution_id":      out.ResolutionID,
+				})
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
 }

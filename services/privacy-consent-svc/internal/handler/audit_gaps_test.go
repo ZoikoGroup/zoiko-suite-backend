@@ -352,21 +352,23 @@ func TestGap7_LookupFailure_FailsClosed_AndExecutesNothing(t *testing.T) {
 	}
 }
 
-func TestGap7_SaveFailure_IsReported_NotIgnored(t *testing.T) {
+func TestGap7_SaveFailure_FailsTheWholeOperation_NothingPersisted(t *testing.T) {
 	st := newStubStore()
 	st.idempotencySaveErr = errors.New("db down")
 	r := newTestRouter(st, &stubAuthz{}, grantingPurposeRegistry())
-	w := doRequest(r, http.MethodPost, "/privacy/consents", grantBody("s-save"), testTenant)
-	if w.Code != http.StatusInternalServerError || errorCodeOf(t, w) != domain.ErrCodeIdempotencyNotRecorded {
-		t.Fatalf("want 500 %s, got %d %s", domain.ErrCodeIdempotencyNotRecorded, w.Code, w.Body.String())
+	hdr := map[string]string{"Idempotency-Key": "k-save"}
+	w := doRequestWithHeaders(r, http.MethodPost, "/privacy/consents", grantBody("s-save"), testTenant, "principal-01", hdr)
+	if w.Code != http.StatusServiceUnavailable || errorCodeOf(t, w) != domain.ErrCodeStoreUnavailable {
+		t.Fatalf("want 503 %s, got %d %s", domain.ErrCodeStoreUnavailable, w.Code, w.Body.String())
 	}
-	m := decodeMap(t, w)
-	if m["committed"] != true {
-		t.Fatalf("the response must say the operation committed: %v", m)
+	if len(st.consentReceipts) != 0 || len(st.idempotency) != 0 {
+		t.Fatalf("a failed idempotency save must persist neither the receipt nor the key (%d receipts, %d keys)", len(st.consentReceipts), len(st.idempotency))
 	}
-	result, _ := m["result"].(map[string]any)
-	if result["receipt_id"] == nil || len(st.consentReceipts) != 1 {
-		t.Fatalf("the committed result must be returned so the caller need not repeat the operation: %v", m)
+	// The retry is a fresh, successful execution (nothing was half-done).
+	st.idempotencySaveErr = nil
+	w = doRequestWithHeaders(r, http.MethodPost, "/privacy/consents", grantBody("s-save"), testTenant, "principal-01", hdr)
+	if w.Code != http.StatusCreated || w.Header().Get("Idempotency-Replay") == "true" || len(st.consentReceipts) != 1 {
+		t.Fatalf("retry must be a fresh success, got %d replay=%q receipts=%d", w.Code, w.Header().Get("Idempotency-Replay"), len(st.consentReceipts))
 	}
 }
 

@@ -10,8 +10,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/go-chi/chi/v5"
-	chimiddleware "github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
@@ -19,8 +17,6 @@ import (
 	"zoiko.io/privacy-purpose-registry-svc/internal/config"
 	"zoiko.io/privacy-purpose-registry-svc/internal/events"
 	"zoiko.io/privacy-purpose-registry-svc/internal/handler"
-	"zoiko.io/privacy-purpose-registry-svc/internal/health"
-	"zoiko.io/privacy-purpose-registry-svc/internal/middleware"
 	"zoiko.io/privacy-purpose-registry-svc/internal/store"
 )
 
@@ -79,21 +75,11 @@ func main() {
 
 	h := handler.New(pgStore, authzClient, logger)
 
-	r := chi.NewRouter()
-	r.Use(chimiddleware.RequestID)
-	r.Use(chimiddleware.RealIP)
-	r.Use(chimiddleware.Recoverer)
-
-	// /healthz and /readyz stay OUTSIDE the tenant gate — liveness/readiness
-	// probes carry no tenant, same doctrine as every other service in this
-	// platform.
-	r.Get("/healthz", health.HealthzHandler)
-	r.Get("/readyz", health.ReadyzHandler(pool))
-
-	r.Group(func(r chi.Router) {
-		r.Use(middleware.TenantContext())
-		handler.RegisterRoutes(r, h)
-	})
+	// handler.NewRouter keeps /healthz and /readyz outside the tenant gate,
+	// puts every registry route behind it, and gives transport-level errors
+	// (404, 405, recovered panic, failed readiness) the same error envelope as
+	// handler errors.
+	r := handler.NewRouter(h, logger, pool)
 
 	srv := &http.Server{
 		Addr:         ":" + cfg.Port,

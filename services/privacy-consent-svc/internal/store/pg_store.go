@@ -3,6 +3,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -61,8 +62,15 @@ type Store interface {
 	SetPreference(ctx context.Context, tenantID string, req domain.SetPreferenceRequest) (*domain.PreferenceAssertion, error)
 	ResolvePreference(ctx context.Context, subjectRef, channelOrPurpose string) (*domain.PreferenceAssertion, error)
 
-	GetIdempotency(ctx context.Context, tenantID, key string) (*domain.IdempotencyRecord, error)
-	SaveIdempotency(ctx context.Context, rec domain.IdempotencyRecord) error
+	// GetIdempotency looks up a stored response by (tenant, principal, key).
+	GetIdempotency(ctx context.Context, tenantID, principalID, key string) (*domain.IdempotencyRecord, error)
+	// RunIdempotent claims the idempotency key, runs fn, and stores the
+	// replayable response in ONE transaction: every store call fn makes joins
+	// that transaction (see withTenant), so the evidence rows, the outbox
+	// event and the idempotency record commit together or not at all, and
+	// concurrent identical requests execute exactly once. When the key was
+	// already claimed it runs nothing and returns the stored record.
+	RunIdempotent(ctx context.Context, claim domain.IdempotencyRecord, fn func(ctx context.Context) (status int, payload any, err error)) (existing *domain.IdempotencyRecord, status int, payload any, err error)
 }
 
 type PgStore struct {
@@ -74,7 +82,14 @@ func NewPgStore(pool *pgxpool.Pool, log *zap.Logger) *PgStore {
 	return &PgStore{pool: pool, log: log}
 }
 
+// ambientTxKey carries the transaction opened by RunIdempotent so the store
+// calls made inside it join it instead of opening their own.
+type ambientTxKey struct{}
+
 func (s *PgStore) withTenant(ctx context.Context, fn func(pgx.Tx) error) error {
+	if tx, ok := ctx.Value(ambientTxKey{}).(pgx.Tx); ok {
+		return fn(tx) // commit/rollback belongs to RunIdempotent
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -967,35 +982,55 @@ func (s *PgStore) ResolveConsentStatus(ctx context.Context, subjectRef, purposeI
 
 // ── preferences ──────────────────────────────────────────────────────────────
 
+// preferenceColumns reads the effective time; rows written before migration
+// 000008 have none stored and read as their recording time (the evidence table
+// is append-only, so they are not rewritten).
+const preferenceColumns = `preference_assertion_id, tenant_id, subject_ref, channel_or_purpose, value, source,
+	COALESCE(effective_at, created_at), created_at`
+
 func (s *PgStore) SetPreference(ctx context.Context, tenantID string, req domain.SetPreferenceRequest) (*domain.PreferenceAssertion, error) {
 	id := uuid.New().String()
 	var p domain.PreferenceAssertion
+	// Deterministic instant handling: UTC, microsecond precision (what
+	// timestamptz stores), so what is returned is exactly what is stored.
+	var effective any // nil -> the database's recording instant
+	if req.EffectiveAt != nil {
+		effective = req.EffectiveAt.UTC().Truncate(time.Microsecond)
+	}
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx, `
-			INSERT INTO preference_assertions (preference_assertion_id, tenant_id, subject_ref, channel_or_purpose, value, source)
-			VALUES ($1, $2, $3, $4, $5, $6)
-			RETURNING preference_assertion_id, tenant_id, subject_ref, channel_or_purpose, value, source, created_at`,
-			id, strPtrOrNil(tenantID), req.SubjectRef, req.ChannelOrPurpose, req.Value, req.Source,
-		).Scan(&p.PreferenceAssertionID, &p.TenantID, &p.SubjectRef, &p.ChannelOrPurpose, &p.Value, &p.Source, &p.CreatedAt)
+			INSERT INTO preference_assertions (preference_assertion_id, tenant_id, subject_ref, channel_or_purpose, value, source, effective_at)
+			VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7::timestamptz, NOW()))
+			RETURNING `+preferenceColumns,
+			id, strPtrOrNil(tenantID), req.SubjectRef, req.ChannelOrPurpose, req.Value, req.Source, effective,
+		).Scan(&p.PreferenceAssertionID, &p.TenantID, &p.SubjectRef, &p.ChannelOrPurpose, &p.Value, &p.Source, &p.EffectiveAt, &p.CreatedAt)
 	})
 	if err != nil {
 		s.log.Error("pg SetPreference failed", zap.Error(err))
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
+	p.EffectiveAt = p.EffectiveAt.UTC() // the driver returns the host's zone; the contract is UTC
 	return &p, nil
 }
 
+// ResolvePreference returns the assertion in force NOW for (subject, channel or
+// purpose): among assertions whose effective time has been reached, the one
+// with the latest effective time (ties: the one recorded last). An assertion
+// dated in the future is not yet in force and does not govern; a later-recorded
+// assertion with an EARLIER effective time does not override one that took
+// effect after it. With none in force the answer is NOT_APPLICABLE.
 func (s *PgStore) ResolvePreference(ctx context.Context, subjectRef, channelOrPurpose string) (*domain.PreferenceAssertion, error) {
 	var p domain.PreferenceAssertion
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx, `
-			SELECT preference_assertion_id, tenant_id, subject_ref, channel_or_purpose, value, source, created_at
+			SELECT `+preferenceColumns+`
 			FROM preference_assertions
 			WHERE subject_ref = $1 AND channel_or_purpose = $2
-			ORDER BY created_at DESC
+			  AND COALESCE(effective_at, created_at) <= NOW()
+			ORDER BY COALESCE(effective_at, created_at) DESC, created_at DESC
 			LIMIT 1`,
 			subjectRef, channelOrPurpose,
-		).Scan(&p.PreferenceAssertionID, &p.TenantID, &p.SubjectRef, &p.ChannelOrPurpose, &p.Value, &p.Source, &p.CreatedAt)
+		).Scan(&p.PreferenceAssertionID, &p.TenantID, &p.SubjectRef, &p.ChannelOrPurpose, &p.Value, &p.Source, &p.EffectiveAt, &p.CreatedAt)
 	})
 	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		p = domain.PreferenceAssertion{SubjectRef: subjectRef, ChannelOrPurpose: channelOrPurpose, Value: domain.PreferenceNotApplicable}
@@ -1005,20 +1040,34 @@ func (s *PgStore) ResolvePreference(ctx context.Context, subjectRef, channelOrPu
 		s.log.Error("pg ResolvePreference failed", zap.Error(err))
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
+	p.EffectiveAt = p.EffectiveAt.UTC()
 	return &p, nil
 }
 
 // ── idempotency (§18.1) ──────────────────────────────────────────────────────
 
-func (s *PgStore) GetIdempotency(ctx context.Context, tenantID, key string) (*domain.IdempotencyRecord, error) {
+var errReplay = errors.New("idempotent replay")
+
+func getIdempotencyTx(ctx context.Context, tx pgx.Tx, tenantID, principalID, key string) (*domain.IdempotencyRecord, error) {
 	var rec domain.IdempotencyRecord
+	err := tx.QueryRow(ctx, `
+		SELECT idempotency_key, tenant_id, principal_id, endpoint, request_hash, response_code, response_body, created_at
+		FROM consent_idempotency_keys
+		WHERE tenant_id = $1 AND principal_id = $2 AND idempotency_key = $3`,
+		tenantID, principalID, key,
+	).Scan(&rec.Key, &rec.TenantID, &rec.PrincipalID, &rec.Endpoint, &rec.RequestHash, &rec.ResponseCode, &rec.ResponseBody, &rec.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &rec, nil
+}
+
+func (s *PgStore) GetIdempotency(ctx context.Context, tenantID, principalID, key string) (*domain.IdempotencyRecord, error) {
+	var rec *domain.IdempotencyRecord
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
-		return tx.QueryRow(ctx, `
-			SELECT idempotency_key, tenant_id, endpoint, request_hash, response_code, response_body, created_at
-			FROM consent_idempotency_keys
-			WHERE idempotency_key = $1`,
-			key,
-		).Scan(&rec.Key, &rec.TenantID, &rec.Endpoint, &rec.RequestHash, &rec.ResponseCode, &rec.ResponseBody, &rec.CreatedAt)
+		r, err := getIdempotencyTx(ctx, tx, tenantID, principalID, key)
+		rec = r
+		return err
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
@@ -1027,17 +1076,62 @@ func (s *PgStore) GetIdempotency(ctx context.Context, tenantID, key string) (*do
 		s.log.Error("pg GetIdempotency failed", zap.Error(err))
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
-	return &rec, nil
+	return rec, nil
 }
 
-func (s *PgStore) SaveIdempotency(ctx context.Context, rec domain.IdempotencyRecord) error {
-	return s.withTenant(ctx, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `
-			INSERT INTO consent_idempotency_keys (idempotency_key, tenant_id, endpoint, request_hash, response_code, response_body, created_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7)
-			ON CONFLICT (tenant_id, idempotency_key) DO NOTHING`,
-			rec.Key, rec.TenantID, rec.Endpoint, rec.RequestHash, rec.ResponseCode, rec.ResponseBody, rec.CreatedAt,
-		)
-		return err
+func (s *PgStore) RunIdempotent(ctx context.Context, claim domain.IdempotencyRecord, fn func(ctx context.Context) (int, any, error)) (*domain.IdempotencyRecord, int, any, error) {
+	if strings.TrimSpace(claim.TenantID) == "" || strings.TrimSpace(middleware.TenantFromContext(ctx)) != strings.TrimSpace(claim.TenantID) {
+		return nil, 0, nil, fmt.Errorf("%w: idempotency claim does not match the verified tenant", domain.ErrStoreUnavailable)
+	}
+	var existing *domain.IdempotencyRecord
+	var status int
+	var payload any
+	var opErr error
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
+			INSERT INTO consent_idempotency_keys
+				(idempotency_key, tenant_id, principal_id, endpoint, request_hash, response_code, response_body, created_at)
+			VALUES ($1, $2, $3, $4, $5, 0, ''::bytea, NOW())
+			ON CONFLICT (tenant_id, principal_id, idempotency_key) DO NOTHING`,
+			claim.Key, claim.TenantID, claim.PrincipalID, claim.Endpoint, claim.RequestHash)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			rec, err := getIdempotencyTx(ctx, tx, claim.TenantID, claim.PrincipalID, claim.Key)
+			if err != nil {
+				return err
+			}
+			existing = rec
+			return errReplay
+		}
+		st, v, err := fn(context.WithValue(ctx, ambientTxKey{}, tx))
+		if err != nil {
+			opErr = err
+			return err // roll back the claim and every change made by fn
+		}
+		body, err := json.Marshal(v)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE consent_idempotency_keys SET response_code = $1, response_body = $2
+			WHERE tenant_id = $3 AND principal_id = $4 AND idempotency_key = $5`,
+			st, body, claim.TenantID, claim.PrincipalID, claim.Key); err != nil {
+			return err
+		}
+		status, payload = st, v
+		return nil
 	})
+	switch {
+	case errors.Is(err, errReplay):
+		return existing, 0, nil, nil
+	case err == nil:
+		return nil, status, payload, nil
+	case opErr != nil:
+		return nil, 0, nil, opErr // a domain error the handler maps (404/409/422…)
+	default:
+		s.log.Error("pg RunIdempotent failed", zap.Error(err))
+		return nil, 0, nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
 }

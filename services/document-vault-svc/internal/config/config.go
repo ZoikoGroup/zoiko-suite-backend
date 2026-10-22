@@ -42,7 +42,8 @@ type Config struct {
 	AuthZServiceURL string
 
 	// ClamAVURL is the host:port of clamd for virus scanning (e.g. "clamav:3310").
-	// If empty, the service falls back to scan.NoOpScanner for local/dev.
+	// If empty, uploads are refused (scan.UnconfiguredScanner fails closed);
+	// there is no scan-less fallback.
 	ClamAVURL string
 
 	Kafka KafkaConfig

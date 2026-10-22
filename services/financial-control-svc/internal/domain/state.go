@@ -59,6 +59,9 @@ var lifecycleEdges = map[LifecycleState][]LifecycleState{
 	// A rejected certification returns the run to controlled workflow (§26).
 	LifecycleReadyToCertify: {LifecycleCertified, LifecycleExceptionReview, LifecycleSuperseded, LifecycleFailed},
 	// A certified run is never edited; it can only be superseded (Invariant 2).
+	// Revoking its certification (ValidateCertificationRevocation) moves the
+	// certification dimension only: the lifecycle stays CERTIFIED, because the
+	// run was certified and that history does not change.
 	LifecycleCertified:  {LifecycleSuperseded},
 	LifecycleFailed:     {},
 	LifecycleExpired:    {},
@@ -129,6 +132,20 @@ var certificationEdges = map[CertificationState][]CertificationState{
 	CertCertified:   {CertRevoked, CertSuperseded},
 	CertRevoked:     {},
 	CertSuperseded:  {},
+}
+
+// ValidateCertificationRevocation guards the one certification move that has
+// no accompanying lifecycle move: CERTIFIED -> REVOKED on a run whose
+// lifecycle is CERTIFIED (ZS-CONTROL-001 §7: Revoked is a certification
+// state, not a lifecycle state). The result is frozen and the lifecycle does
+// not change, so a revoked run is lifecycle CERTIFIED + certification
+// REVOKED, the combination the control_runs CHECK admits since migration
+// 000006. REVOKED is terminal: there is no edge out of it.
+func ValidateCertificationRevocation(lifecycle LifecycleState, cert CertificationState) error {
+	if lifecycle != LifecycleCertified {
+		return fmt.Errorf("%w: only a CERTIFIED run's certification can be revoked (run is %s)", ErrInvalidTransition, lifecycle)
+	}
+	return ValidateCertificationTransition(cert, CertRevoked)
 }
 
 func ValidateCertificationTransition(from, to CertificationState) error {

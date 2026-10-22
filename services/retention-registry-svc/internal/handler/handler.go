@@ -96,6 +96,40 @@ func (h *Handler) resolveTenantScope(w http.ResponseWriter, r *http.Request, dec
 	return strPtrOrNil(verified), true
 }
 
+// checkBodyTenant validates a tenant_id supplied in a create-policy/create-hold
+// body against the verified X-Tenant-Id, and writes the refusal itself.
+//
+// A body tenant_id is never a source of tenant identity: it may only AGREE with
+// the verified header. It is refused when malformed (400), when it disagrees
+// with the verified tenant (403), and also when there is NO verified tenant at
+// all (403) — there is nothing for it to agree with. That last case used to pass
+// this check, reach authorization, and then fail at the database's row-level
+// security WITH CHECK as an opaque 500. RLS is unchanged and remains the
+// backstop; this only makes the client error deterministic and ahead of it.
+//
+// An empty body tenant_id (a platform-wide policy or hold) is always acceptable
+// here; whether the caller may act at platform scope is the authorization
+// check's job, and middleware.TenantContext stays permissive on purpose.
+func (h *Handler) checkBodyTenant(w http.ResponseWriter, r *http.Request, bodyTenant string) bool {
+	if bodyTenant == "" {
+		return true
+	}
+	if _, err := uuid.Parse(bodyTenant); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid tenant_id: must be a valid UUID")
+		return false
+	}
+	verified := svcmiddleware.TenantFromContext(r.Context())
+	if verified == "" {
+		writeError(w, http.StatusForbidden, "tenant_id requires a matching verified X-Tenant-Id")
+		return false
+	}
+	if bodyTenant != verified {
+		writeError(w, http.StatusForbidden, "tenant_id does not match the verified X-Tenant-Id")
+		return false
+	}
+	return true
+}
+
 func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID, tenantID, actionType string) bool {
 	return h.authorizePrincipal(w, r, principalID, tenantID, actionType, "not authorized to perform this action")
 }
@@ -164,16 +198,8 @@ func (h *Handler) CreateRetentionPolicy(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	verifiedTenant := svcmiddleware.TenantFromContext(r.Context())
-	if verifiedTenant != "" && req.TenantID != "" && req.TenantID != verifiedTenant {
-		writeError(w, http.StatusForbidden, "tenant_id does not match the verified X-Tenant-Id")
+	if !h.checkBodyTenant(w, r, req.TenantID) {
 		return
-	}
-	if req.TenantID != "" {
-		if _, err := uuid.Parse(req.TenantID); err != nil {
-			writeError(w, http.StatusBadRequest, "invalid tenant_id: must be a valid UUID")
-			return
-		}
 	}
 
 	principalID, ok := h.requirePrincipal(w, r)
@@ -256,16 +282,8 @@ func (h *Handler) CreateLegalHold(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	verifiedTenant := svcmiddleware.TenantFromContext(r.Context())
-	if verifiedTenant != "" && req.TenantID != "" && req.TenantID != verifiedTenant {
-		writeError(w, http.StatusForbidden, "tenant_id does not match the verified X-Tenant-Id")
+	if !h.checkBodyTenant(w, r, req.TenantID) {
 		return
-	}
-	if req.TenantID != "" {
-		if _, err := uuid.Parse(req.TenantID); err != nil {
-			writeError(w, http.StatusBadRequest, "invalid tenant_id: must be a valid UUID")
-			return
-		}
 	}
 
 	principalID, ok := h.requirePrincipal(w, r)
@@ -330,28 +348,31 @@ func (h *Handler) CreateLegalHold(w http.ResponseWriter, r *http.Request) {
 
 // GetLegalHold handles GET /v1/legal-holds/{id}.
 //
-// THIS ROUTE HAD NO IDENTITY CHECK OF ANY KIND. It called
-// FindLegalHoldByID(id) with no principal, no tenant, and no authorization —
-// so anything that could reach the port could read any hold in any tenant by
-// id, and a hold names the court or regulator that ordered the freeze, the
-// matter, and the custodians holding the evidence. Reading it now requires a
-// verified principal and is scoped to the caller's tenant.
+// This route used to have no identity check of any kind: it called
+// FindLegalHoldByID(id) with no principal, tenant or authorization, so anything
+// that could reach the port could read any hold in any tenant by id. A hold
+// names the court or regulator that ordered the freeze, the matter, and the
+// custodians holding the evidence.
 //
-// No authz action is checked beyond the tenant scope, matching the create/list
-// posture: a hold in your own tenant is visible to your own principals, and it
-// is the RELEASE that is privileged. Widening that to a per-read grant is a
-// defensible position, but it is a policy change rather than a defect fix and
-// would need the grant seeding to change with it.
+// It now applies two gates, in this order:
 //
-// BOTH GATES ARE NOW PRESENT. The read is scoped to the caller's verified
-// tenant in the store, and it is additionally authorized against LEGAL_HOLD_READ
-// for the hold's own tenant. The tenant scope answers "whose hold is this"; the
-// action grant answers "may this principal read holds at all". Fetch-then-
-// authorize, in that order and matching ReleaseLegalHold: the store already
-// refuses another tenant's hold with the same ErrLegalHoldNotFound a genuinely
-// absent id produces, so authorizing against a caller-supplied scope first would
-// let a caller nominate an entity they hold a grant for and probe for holds
-// outside it.
+//  1. Identity and tenant scope. A verified principal (401 if absent) and a
+//     verified tenant (401 if absent) are required, and the store read is scoped
+//     to that tenant. A hold in another tenant, or an id that does not exist,
+//     both answer 404 — indistinguishable, so a probe cannot confirm that an id
+//     exists. Platform-wide holds (tenant_id NULL) are readable by every tenant.
+//  2. Action grant. The caller must hold LEGAL_HOLD_READ at the hold's own scope
+//     (its tenant, or the platform scope for a platform-wide hold): 403 if
+//     denied, 503 if authorization-svc cannot be reached (fail closed).
+//
+// The fetch comes first and the authorization second, matching ReleaseLegalHold:
+// authorizing against a caller-supplied scope before the tenant-scoped fetch
+// would let a caller nominate an entity they hold a grant for and probe for
+// holds outside it.
+//
+// The LEGAL_HOLD_READ gate is implemented behavior, but the audit file does not
+// list it as a requirement of this route, so it is tracked as a documentation
+// alignment question rather than as settled contract.
 func (h *Handler) GetLegalHold(w http.ResponseWriter, r *http.Request) {
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {

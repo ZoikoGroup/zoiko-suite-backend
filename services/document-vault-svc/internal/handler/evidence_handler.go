@@ -86,6 +86,17 @@ func (h *evidenceHandler) RegisterEvidence(w http.ResponseWriter, r *http.Reques
 	if !decodeJSON(w, r, &req) {
 		return
 	}
+	// legal_entity_id is the authorization scope, so it is read first; the rest
+	// of the body is validated only for a caller who is allowed to register
+	// evidence there. An unauthorized caller gets 403 whatever else is wrong
+	// with the body.
+	if req.LegalEntityID == "" {
+		writeError(w, http.StatusBadRequest, "missing_field", "legal_entity_id")
+		return
+	}
+	if !h.authorize(w, r, principalID, req.LegalEntityID, actionAuditEvidenceRegister) {
+		return
+	}
 	if req.EvidenceSource == "" {
 		writeError(w, http.StatusBadRequest, "missing_field", "evidence_source")
 		return
@@ -96,9 +107,6 @@ func (h *evidenceHandler) RegisterEvidence(w http.ResponseWriter, r *http.Reques
 	}
 	if req.CorrelationID == "" {
 		writeError(w, http.StatusBadRequest, "missing_field", "correlation_id")
-		return
-	}
-	if !h.authorize(w, r, principalID, req.LegalEntityID, actionAuditEvidenceRegister) {
 		return
 	}
 	evidence, created, err := h.store.RegisterEvidence(r.Context(), domain.RegisterEvidenceParams{
