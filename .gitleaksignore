@@ -23,3 +23,12 @@ a1293aaceb57d44dd7a69bfd2134ac94bcd4d1f2:services/notification-svc/scripts/READM
 69c89a8ea0da7964337d541cf1d501ccb803dddb:services/connectivity-api-bridge-svc/internal/domain/lifecycle_test.go:stripe-access-token:140
 2fa30a2739ade5ee10d995d63ea196a803f7e077:services/gateway-auth-svc/internal/admin/admin_test.go:generic-api-key:15
 b4634f13b0fe152baeb1971abbf6c1c68a7c8852:services/eventing/integration/integration_test.go:private-key:455
+
+# ZS-SVC-T-001 wave 1 (PR #229): deliberately fake `sk_live_...` values in two
+# negative-path registry tests, which prove a credential-shaped credential_class
+# is refused and never echoed. The lines are marked `// gitleaks:allow` in the
+# current code; these fingerprints cover the commit already pushed.
+6b72bd5d221ffcf0db45fdac10cb22ffd4cc2ecf:services/connectivity-api-bridge-svc/internal/handler/registry_test.go:stripe-access-token:493
+6b72bd5d221ffcf0db45fdac10cb22ffd4cc2ecf:services/connectivity-api-bridge-svc/internal/handler/registry_test.go:stripe-access-token:498
+6b72bd5d221ffcf0db45fdac10cb22ffd4cc2ecf:services/connectivity-api-bridge-svc/internal/registry/validate_test.go:stripe-access-token:257
+6b72bd5d221ffcf0db45fdac10cb22ffd4cc2ecf:services/connectivity-api-bridge-svc/internal/registry/validate_test.go:stripe-access-token:259

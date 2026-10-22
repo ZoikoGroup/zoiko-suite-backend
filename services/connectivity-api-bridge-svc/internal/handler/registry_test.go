@@ -495,12 +495,12 @@ func TestRegistryHTTP_ProblemsNeverEchoContractValues(t *testing.T) {
 	h := newRegHarness(t)
 	h.connector(t, "bank-x")
 	in := registrytest.Input("1.0.0")
-	in.Content.Profiles[0].Spec = json.RawMessage(`{"mechanism":"OAUTH2_CLIENT_CREDENTIALS","audience":"","scopes_required":[],"credential_class":"sk_live_SUPERSECRET"}`)
+	in.Content.Profiles[0].Spec = json.RawMessage(`{"mechanism":"OAUTH2_CLIENT_CREDENTIALS","audience":"","scopes_required":[],"credential_class":"sk_live_SUPERSECRET"}`) // gitleaks:allow (fake value: proves a credential-shaped credential_class is refused)
 	w := h.call("POST", "/v1/connectors/bank-x/versions", platformTenant, "author", in)
 	var v registry.ContractVersion
 	decodeInto(t, w, &v)
 	w = h.command(t, v.ContractVersionID, "validate", "author", map[string]any{"expected_version": v.RowVersion}, 422)
-	if strings.Contains(w.Body.String(), "sk_live_SUPERSECRET") {
+	if strings.Contains(w.Body.String(), "sk_live_SUPERSECRET") { // gitleaks:allow
 		t.Fatalf("a contract value leaked into a problem: %s", w.Body.String())
 	}
 }

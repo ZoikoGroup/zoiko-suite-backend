@@ -272,9 +272,9 @@ func TestValidationRules(t *testing.T) {
 
 func TestIssuesCarryNoContractValues(t *testing.T) {
 	c := registrytest.Clone(registrytest.Content())
-	c.Profiles[0].Spec = json.RawMessage(`{"mechanism":"OAUTH2_CLIENT_CREDENTIALS","audience":"","scopes_required":[],"credential_class":"sk_live_SECRETVALUE"}`)
+	c.Profiles[0].Spec = json.RawMessage(`{"mechanism":"OAUTH2_CLIENT_CREDENTIALS","audience":"","scopes_required":[],"credential_class":"sk_live_SECRETVALUE"}`) // gitleaks:allow (fake value: proves a credential-shaped credential_class is refused)
 	raw, _ := json.Marshal(issues(c))
-	if strings.Contains(string(raw), "sk_live_SECRETVALUE") {
+	if strings.Contains(string(raw), "sk_live_SECRETVALUE") { // gitleaks:allow
 		t.Fatalf("a contract value leaked into an issue: %s", raw)
 	}
 }
