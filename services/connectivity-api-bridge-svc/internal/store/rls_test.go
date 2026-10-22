@@ -126,7 +126,10 @@ func TestRLS_EnabledAndForced(t *testing.T) {
 	admin := openAdminPool(t)
 
 	for _, table := range []string{"api_bridges", "ingestion_logs", "connector_changes", "connector_approvals", "connector_health",
-		"connector_health_transitions", "sync_checkpoints", "checkpoint_reset_requests", "external_profiles", "eventing_outbox", "eventing_repair_log"} {
+		"connector_health_transitions", "sync_checkpoints", "checkpoint_reset_requests", "external_profiles", "eventing_outbox", "eventing_repair_log",
+		"xic_connectors", "xic_contract_versions", "xic_mapping_versions", "xic_contract_gates", "xic_validation_runs", "xic_contract_transitions", "xic_idempotency",
+		"xic_connections", "xic_credential_bindings", "xic_connection_events", "xic_connection_checks", "xic_certifications", "xic_authorization_sessions", "xic_connection_requests", "xic_conn_idempotency",
+		"xic_handoff_targets", "xic_inbound_exchanges", "xic_inbound_events", "xic_quarantine_requests"} {
 		var enabled, forced bool
 		if err := admin.QueryRow(ctx,
 			`SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname = $1`, table,
@@ -222,7 +225,13 @@ func resetGovernanceObjects(ctx context.Context, pool *pgxpool.Pool) {
 	_, _ = pool.Exec(ctx, `
 		DROP TABLE IF EXISTS checkpoint_reset_requests, sync_checkpoints, connector_health_transitions, connector_health,
 			connector_approvals, connector_changes, external_profiles, eventing_outbox, eventing_repair_log,
-			ingestion_logs, api_bridges CASCADE;
+			ingestion_logs, api_bridges, xic_idempotency, xic_contract_transitions, xic_validation_runs, xic_contract_gates,
+			xic_mapping_versions, xic_contract_versions, xic_connectors,
+			xic_conn_idempotency, xic_connection_requests, xic_authorization_sessions, xic_certifications,
+			xic_quarantine_requests, xic_inbound_events, xic_inbound_exchanges, xic_handoff_targets,
+			xic_connection_checks, xic_connection_events, xic_credential_bindings, xic_connections CASCADE;
 		DROP FUNCTION IF EXISTS connector_append_only(), sync_checkpoints_guard(), external_profiles_guard(),
-			eventing_outbox_payload_immutable(), eventing_repair_log_immutable() CASCADE;`)
+			eventing_outbox_payload_immutable(), eventing_repair_log_immutable(), xic_is_platform(), xic_append_only(),
+			xic_connectors_guard(), xic_cv_guard(), xic_mv_guard(), xic_gate_guard(), xic_conn_guard(), xic_conn_insert_guard(),
+			xic_bind_guard(), xic_session_guard(), xic_req_guard(), xic_target_guard(), xic_ix_guard(), xic_qr_guard() CASCADE;`)
 }

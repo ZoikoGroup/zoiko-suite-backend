@@ -20,11 +20,14 @@ import (
 	svcenvelope "zoiko.io/connectivity-api-bridge-svc/internal/envelope"
 	"zoiko.io/connectivity-api-bridge-svc/internal/handler"
 	"zoiko.io/connectivity-api-bridge-svc/internal/health"
+	"zoiko.io/connectivity-api-bridge-svc/internal/inbound"
 	"zoiko.io/connectivity-api-bridge-svc/internal/middleware"
 	"zoiko.io/connectivity-api-bridge-svc/internal/mtls"
+	"zoiko.io/connectivity-api-bridge-svc/internal/registry"
 	"zoiko.io/connectivity-api-bridge-svc/internal/store"
 	"zoiko.io/connectivity-api-bridge-svc/internal/telemetry"
 	"zoiko.io/connectivity-api-bridge-svc/internal/vault"
+	"zoiko.io/connectivity-api-bridge-svc/internal/xicconn"
 	"zoiko.io/eventing/egress"
 	"zoiko.io/eventing/kafkaout"
 	"zoiko.io/eventing/outbox"
@@ -69,6 +72,20 @@ func main() {
 	// on the first request that enqueues an event. Fail here, at deploy time.
 	if err := outbox.VerifySchema(ctx, dbpool); err != nil {
 		logger.Fatal("eventing outbox schema missing — apply migration 003_connector_management.sql", zap.Error(err))
+	}
+
+	// The contract registry (XIC-01) is migration 004. Fail at deploy time, not on the first contract request.
+	var registryTable *string
+	if err := dbpool.QueryRow(ctx, `SELECT to_regclass('public.xic_contract_versions')::text`).Scan(&registryTable); err != nil || registryTable == nil {
+		logger.Fatal("contract registry schema missing — apply migration 004_xic_registry.sql", zap.Error(err))
+	}
+	var connTable *string
+	if err := dbpool.QueryRow(ctx, `SELECT to_regclass('public.xic_connections')::text`).Scan(&connTable); err != nil || connTable == nil {
+		logger.Fatal("connection schema missing — apply migration 005_xic_connections.sql", zap.Error(err))
+	}
+	var inboundTable *string
+	if err := dbpool.QueryRow(ctx, `SELECT to_regclass('public.xic_inbound_exchanges')::text`).Scan(&inboundTable); err != nil || inboundTable == nil {
+		logger.Fatal("inbound schema missing — apply migration 006_xic_inbound.sql", zap.Error(err))
 	}
 
 	st := store.NewPgStore(dbpool, store.WithEventRegion(cfg.EventResidencyRegion))
@@ -132,11 +149,54 @@ func main() {
 	}
 	h := handler.New(svc, st, authzClient, logger)
 
+	regRepo := store.NewRegistryRepo(st)
+	regSvc := &registry.Service{Repo: regRepo, Limits: registry.Limits{
+		MaxPayloadBytes: cfg.XICMaxPayloadBytes, IdempotencyMinDays: cfg.XICIdempotencyMinDays,
+		IdempotencyMaxDays: cfg.XICIdempotencyMaxDays, CertificationMaxDays: cfg.XICCertificationMaxDays,
+	}}
+	rh := handler.NewRegistry(regSvc, regRepo, authzClient, logger)
+
+	connRepo := store.NewXICConnRepo(st)
+	connSvc := &xicconn.Service{
+		Repo: connRepo, Contracts: regRepo, Vault: vaultClient, Egress: egressPolicy(cfg, logger),
+		AllowedRegions: cfg.EgressAllowedRegions, RedirectAllowlist: cfg.XICRedirectAllowlist,
+		Cfg: xicconn.Config{
+			AuthSessionTTL: time.Duration(cfg.XICAuthSessionMinutes) * time.Minute, ExpiryWarning: time.Duration(cfg.XICExpiryWarningDays) * 24 * time.Hour,
+			MaxGrace: time.Duration(cfg.XICMaxGraceHours) * time.Hour, RotationInterval: time.Duration(cfg.XICRotationDays) * 24 * time.Hour,
+			BreakGlassMax: time.Duration(cfg.XICBreakGlassMaxMinutes) * time.Minute,
+		},
+	}
+	ch := handler.NewConnection(connSvc, connRepo, authzClient, logger)
+	evalCtx, stopEval := context.WithCancel(context.Background())
+	defer stopEval()
+	go connSvc.RunEvaluator(evalCtx, time.Duration(cfg.XICEvaluatorIntervalSecs)*time.Second, 200, func(n int, err error) {
+		if err != nil {
+			logger.Warn("connection evaluator", zap.Int("due", n), zap.Error(err))
+		}
+	})
+
+	// XIC-03 inbound gateway (ZS-SVC-T-001 section 8): the handoff worker, the management API and, when enabled, the
+	// public ingest endpoint. Credential material comes from the vault through its narrow use operation.
+	inRepo := store.NewInboundRepo(st)
+	gw := &inbound.Service{
+		Repo: inRepo, Conns: connSvc, Secrets: inbound.NewVaultSecrets(cfg.VaultServiceURL, "connectivity-api-bridge-svc"), EdgeSecret: []byte(cfg.XICEdgeSecret),
+		Cfg: inbound.Config{MaxBodyBytes: cfg.XICInboundMaxBodyBytes, RawRetention: time.Duration(cfg.XICRawRetentionDays) * 24 * time.Hour, RawMaxBytes: cfg.XICRawMaxBytes,
+			RawDenyClasses: cfg.XICRawDenyClasses, HandoffMaxAttempts: cfg.XICHandoffMaxAttempts, HandoffBackoffBase: 5 * time.Second, HandoffBackoffMax: 15 * time.Minute,
+			HandoffLease: time.Minute, ConnRatePerMin: cfg.XICConnRatePerMin, IPRatePerMin: cfg.XICIPRatePerMin},
+		Handoff: inbound.HandoffDeps{Egress: egressPolicy(cfg, logger), AllowedRegions: cfg.EgressAllowedRegions, Principal: "system:xic-inbound-gateway"},
+	}
+	inAdmin := handler.NewInboundAdmin(gw, inRepo, authzClient, logger)
+	go gw.RunHandoff(evalCtx, time.Duration(cfg.XICHandoffIntervalSecs)*time.Second, 100, func(n int, err error) {
+		if err != nil {
+			logger.Warn("inbound handoff", zap.Int("due", n), zap.Error(err))
+		}
+	})
+
+	// api carries every ZoikoSuite-authenticated route behind the tenant and envelope middleware. The ingest endpoint
+	// is mounted beside it, NOT inside it: an external sender has no tenant header, and its identity is proven by the
+	// contract's authentication profile, never by headers it could set itself.
 	r := chi.NewRouter()
-	r.Use(chimiddleware.RequestID)
 	r.Use(chimiddleware.RealIP)
-	r.Use(chimiddleware.Logger)
-	r.Use(chimiddleware.Recoverer)
 	r.Use(middleware.TenantContext)
 
 	// Canonical Service Input Contract (ZS-ARCH-SVC-001 v2.0 §4). Runs after
@@ -148,10 +208,23 @@ func main() {
 
 	r.Get("/healthz", health.Handler())
 	handler.RegisterRoutes(r, h)
+	handler.RegisterRegistryRoutes(r, rh)
+	handler.RegisterConnectionRoutes(r, ch)
+	handler.RegisterInboundAdminRoutes(r, inAdmin)
+
+	root := chi.NewRouter()
+	root.Use(chimiddleware.RequestID)
+	root.Use(chimiddleware.Logger)
+	root.Use(chimiddleware.Recoverer)
+	if cfg.XICInboundEnabled {
+		root.Mount("/v1/inbound", handler.NewIngest(gw, cfg.XICInboundMaxBodyBytes, cfg.XICInboundTrustXFF, logger).Router())
+		logger.Info("inbound ingest endpoint enabled")
+	}
+	root.Mount("/", r)
 
 	srv := &http.Server{
 		Addr:         ":" + cfg.Port,
-		Handler:      r,
+		Handler:      root,
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 15 * time.Second,
 		IdleTimeout:  60 * time.Second,
