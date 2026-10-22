@@ -384,6 +384,48 @@ func (s *PgStore) GetLatestCashBalance(ctx context.Context, bankAccountID string
 	return &bal, nil
 }
 
+// GetLatestCashBalances returns the latest balance of each of the given
+// accounts in one query, keyed by bank_account_id; an account with no
+// balance on file is simply absent. The cash-position paths used to call
+// GetLatestCashBalance once per account, each in its own transaction.
+func (s *PgStore) GetLatestCashBalances(ctx context.Context, bankAccountIDs []string) (map[string]*domain.CashBalance, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	out := make(map[string]*domain.CashBalance, len(bankAccountIDs))
+	if len(bankAccountIDs) == 0 {
+		return out, nil
+	}
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT DISTINCT ON (bank_account_id)
+			       balance_id, tenant_id, bank_account_id, ledger_balance,
+			       available_balance, as_of_timestamp, correlation_id, created_at
+			FROM cash_balances
+			WHERE tenant_id = $1 AND bank_account_id = ANY($2::uuid[])
+			ORDER BY bank_account_id, as_of_timestamp DESC
+		`, tenantID, bankAccountIDs)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var bal domain.CashBalance
+			if err := rows.Scan(&bal.BalanceID, &bal.TenantID, &bal.BankAccountID, &bal.LedgerBalance,
+				&bal.AvailableBalance, &bal.AsOfTimestamp, &bal.CorrelationID, &bal.CreatedAt); err != nil {
+				return err
+			}
+			out[bal.BankAccountID] = &bal
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // SetLiquidityThreshold registers/replaces minimum liquidity requirements.
 func (s *PgStore) SetLiquidityThreshold(ctx context.Context, threshold *domain.LiquidityThreshold) error {
 	tenantID := tenantFromCtxOrFallback(ctx, threshold.TenantID)

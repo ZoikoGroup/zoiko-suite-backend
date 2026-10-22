@@ -23,6 +23,7 @@ type Store interface {
 	UpdateBankAccountStatus(ctx context.Context, bankAccountID, status string) error
 	CreateCashBalance(ctx context.Context, bal *domain.CashBalance) error
 	GetLatestCashBalance(ctx context.Context, bankAccountID string) (*domain.CashBalance, error)
+	GetLatestCashBalances(ctx context.Context, bankAccountIDs []string) (map[string]*domain.CashBalance, error)
 	SetLiquidityThreshold(ctx context.Context, threshold *domain.LiquidityThreshold) error
 	GetLiquidityThreshold(ctx context.Context, legalEntityID, currencyCode string) (*domain.LiquidityThreshold, error)
 
@@ -59,6 +60,7 @@ type Store interface {
 
 	// BNK-08 — see internal/store/bnk08_store.go's own doc comments.
 	CreateCashPositionSnapshot(ctx context.Context, p domain.CalculateCashPositionParams, calc domain.CashPositionCalculation) (*domain.CashPositionSnapshot, error)
+	RefreshCashPositionSnapshot(ctx context.Context, p domain.RefreshCashPositionParams, calc domain.CashPositionCalculation) (*domain.CashPositionSnapshot, error)
 	GetCashPositionSnapshot(ctx context.Context, tenantID, snapshotID string) (*domain.CashPositionSnapshot, error)
 	GetLatestCashPosition(ctx context.Context, tenantID, legalEntityID, reportingCurrency string) (*domain.CashPositionSnapshot, error)
 	GetCashPositionAsOf(ctx context.Context, tenantID, legalEntityID, reportingCurrency string, asOf time.Time) (*domain.CashPositionSnapshot, error)
@@ -369,13 +371,21 @@ func (h *Handler) GetCashPositions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ids := make([]string, 0, len(accts))
+	for _, acct := range accts {
+		ids = append(ids, acct.BankAccountID)
+	}
+	// One batched read; a store failure fails closed instead of silently
+	// omitting accounts.
+	balances, err := h.store.GetLatestCashBalances(r.Context(), ids)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "store_error", err.Error())
+		return
+	}
+
 	var out []domain.CashPositionResponse
 	for _, acct := range accts {
-		bal, err := h.store.GetLatestCashBalance(r.Context(), acct.BankAccountID)
-		if err != nil {
-			continue
-		}
-		if bal != nil {
+		if bal := balances[acct.BankAccountID]; bal != nil {
 			out = append(out, domain.CashPositionResponse{
 				BankAccountID:    acct.BankAccountID,
 				AccountName:      acct.AccountName,
@@ -450,42 +460,21 @@ func (h *Handler) GetEffectiveCash(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 1. Current bank balance
-	accts, err := h.store.ListBankAccounts(r.Context(), legalEntityID)
-	if err != nil {
-		writeError(w, http.StatusServiceUnavailable, "store_error", err.Error())
-		return
-	}
-
-	// oldestBankBalanceAsOf tracks the LEAST recent as_of_timestamp across
-	// every account composed into bankSum — the position as a whole is
-	// only as fresh as its stalest contributing account, so a single
-	// out-of-date account is enough to flag the composed figure.
-	var bankSum float64
-	var oldestBankBalanceAsOf time.Time
-	var haveBankBalance bool
-	for _, acct := range accts {
-		if acct.CurrencyCode == currencyCode && acct.AccountStatus == "ACTIVE" {
-			bal, err := h.store.GetLatestCashBalance(r.Context(), acct.BankAccountID)
-			if err == nil && bal != nil {
-				bankSum += bal.AvailableBalance
-				if !haveBankBalance || bal.AsOfTimestamp.Before(oldestBankBalanceAsOf) {
-					oldestBankBalanceAsOf = bal.AsOfTimestamp
-				}
-				haveBankBalance = true
-			}
-		}
-	}
+	// 1. Current bank balance — the same composition the BNK-08 snapshot
+	// uses: one batched read, fail closed on a store error, and an ACTIVE
+	// account with no balance marks the figure partial. The position as a
+	// whole is only as fresh as its oldest contributing balance.
+	//
 	// Flagged, not blocked: unlike AP/obligations being fully unreachable
 	// (nothing to show at all, so this handler fails closed), a stale
 	// bank balance is real data that's merely old — the doc's rule is
 	// "never show it AS CURRENT," which HasStaleComponent/IsStale below
 	// satisfies by labeling it, not by withholding the whole response.
-	bankBalanceStale := haveBankBalance && time.Since(oldestBankBalanceAsOf) > domain.BankBalanceStalenessThreshold
-	if bankBalanceStale {
-		h.log.Warn("effective cash: bank balance component is stale",
-			zap.String("legal_entity_id", legalEntityID), zap.Time("oldest_as_of", oldestBankBalanceAsOf))
+	breakdown, bankSum, bankBalanceStale, ok := h.composeBankBalances(w, r, legalEntityID, currencyCode)
+	if !ok {
+		return
 	}
+	oldestBankBalanceAsOf, _ := domain.OldestBankBalanceAsOf(breakdown)
 
 	// 2. Pending AP Commitments — fail closed: if AP is unavailable the figure is
 	// unreliable; return an error rather than presenting a partial cash position
@@ -585,14 +574,22 @@ func (h *Handler) GetForecasts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var currentCash float64
+	var ids []string
 	for _, acct := range accts {
 		if acct.CurrencyCode == currencyCode && acct.AccountStatus == "ACTIVE" {
-			bal, err := h.store.GetLatestCashBalance(r.Context(), acct.BankAccountID)
-			if err == nil && bal != nil {
-				currentCash += bal.AvailableBalance
-			}
+			ids = append(ids, acct.BankAccountID)
 		}
+	}
+	// One batched read; a store failure fails closed instead of silently
+	// leaving accounts out of the starting balance.
+	balances, err := h.store.GetLatestCashBalances(r.Context(), ids)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "store_error", err.Error())
+		return
+	}
+	var currentCash float64
+	for _, bal := range balances {
+		currentCash += bal.AvailableBalance
 	}
 
 	// 2. Fetch forecast data from clients

@@ -234,6 +234,19 @@ func (m *mockStore) GetLatestCashBalance(ctx context.Context, bankAccountID stri
 	return m.cashBalances[bankAccountID], nil
 }
 
+func (m *mockStore) GetLatestCashBalances(ctx context.Context, bankAccountIDs []string) (map[string]*domain.CashBalance, error) {
+	if m.balErr != nil {
+		return nil, m.balErr
+	}
+	out := map[string]*domain.CashBalance{}
+	for _, id := range bankAccountIDs {
+		if bal := m.cashBalances[id]; bal != nil {
+			out[id] = bal
+		}
+	}
+	return out, nil
+}
+
 func (m *mockStore) SetLiquidityThreshold(ctx context.Context, threshold *domain.LiquidityThreshold) error {
 	if m.threshErr != nil {
 		return m.threshErr
@@ -524,6 +537,29 @@ func (m *mockStore) CreateCashPositionSnapshot(ctx context.Context, p domain.Cal
 		CalculatedByPrincipalID: p.ActorPrincipalID, CorrelationID: p.CorrelationID, CreatedAt: time.Now().UTC(),
 	}
 	m.cashPositions[snap.SnapshotID] = snap
+	return snap, nil
+}
+
+func (m *mockStore) RefreshCashPositionSnapshot(ctx context.Context, p domain.RefreshCashPositionParams, calc domain.CashPositionCalculation) (*domain.CashPositionSnapshot, error) {
+	if p.PriorSnapshotID != "" {
+		prior, ok := m.cashPositions[p.PriorSnapshotID]
+		if !ok {
+			return nil, domain.ErrCashPositionSnapshotNotFound
+		}
+		if !domain.CanSupersedeCashPosition(prior.Status) {
+			return nil, domain.ErrInvalidCashPositionTransition
+		}
+		if prior.LegalEntityID != p.LegalEntityID || prior.ReportingCurrency != p.ReportingCurrency {
+			return nil, domain.ErrCashPositionScopeMismatch
+		}
+	}
+	snap, err := m.CreateCashPositionSnapshot(ctx, p.CalculateCashPositionParams, calc)
+	if err != nil || p.PriorSnapshotID == "" {
+		return snap, err
+	}
+	prior := m.cashPositions[p.PriorSnapshotID]
+	prior.Status = domain.CashPositionSuperseded
+	prior.SupersededBy = &snap.SnapshotID
 	return snap, nil
 }
 

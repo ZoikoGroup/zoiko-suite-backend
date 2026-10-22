@@ -24,6 +24,33 @@ const (
 	CashPositionSuperseded = "SUPERSEDED"
 )
 
+// OldestBankBalanceAsOf is the as-of time of the oldest bank balance a
+// snapshot composed — the time the position as a whole is only as fresh
+// as. ok is false when it composed none.
+func OldestBankBalanceAsOf(lines []CashPositionAccountLine) (oldest time.Time, ok bool) {
+	for _, l := range lines {
+		if !ok || l.AsOfTimestamp.Before(oldest) {
+			oldest, ok = l.AsOfTimestamp, true
+		}
+	}
+	return oldest, ok
+}
+
+// CashPositionStale is "stale is derived from source freshness, not
+// operator choice", evaluated at now rather than frozen at calculation:
+// true when the calculation itself found a stale or missing bank balance,
+// or when the oldest bank balance it composed has since aged past
+// BankBalanceStalenessThreshold. A snapshot calculated and published from
+// fresh balances therefore becomes stale as those balances age, instead of
+// being served as current indefinitely.
+func CashPositionStale(staleAtCalculation bool, lines []CashPositionAccountLine, now time.Time) bool {
+	if staleAtCalculation {
+		return true
+	}
+	oldest, ok := OldestBankBalanceAsOf(lines)
+	return ok && now.Sub(oldest) > BankBalanceStalenessThreshold
+}
+
 // CanPublishCashPosition additionally requires !HasStaleComponent at the
 // call site (checked in the store, not here, since it needs the row's own
 // value) — the doc's "never silently carry forward old bank balance as
@@ -70,7 +97,10 @@ type CashPositionSnapshot struct {
 	// EffectiveStatus is Status, except PUBLISHED becomes "STALE" (never
 	// stored) when HasStaleComponent — see this file's own doc comment.
 	// Computed by the store on every read, never persisted.
-	EffectiveStatus        string     `json:"effective_status"`
+	EffectiveStatus string `json:"effective_status"`
+	// HasStaleComponent is CashPositionStale at the time of the read: the
+	// flag stored at calculation, or the composed bank balances having aged
+	// past the threshold since.
 	HasStaleComponent      bool       `json:"has_stale_component"`
 	PublishedByPrincipalID string     `json:"published_by_principal_id,omitempty"`
 	PublishedAt            *time.Time `json:"published_at,omitempty"`
@@ -112,7 +142,8 @@ type CashPositionCalculation struct {
 // RefreshCashPositionParams recalculates and, if PriorSnapshotID is set,
 // atomically supersedes that prior snapshot with the new one in the same
 // transaction — "refresh" is "calculate again, then retire the old one,"
-// not a separate mechanism from Calculate/Supersede.
+// not a separate mechanism from Calculate/Supersede. The prior snapshot
+// must be for the same legal entity and reporting currency.
 type RefreshCashPositionParams struct {
 	CalculateCashPositionParams
 	PriorSnapshotID string
@@ -133,4 +164,9 @@ var (
 	// PublishCashPositionSnapshot: a snapshot with a stale component
 	// cannot be marked authoritative — recalculate first.
 	ErrCashPositionStaleCannotPublish = errorString("cash position snapshot has a stale component and cannot be published as current")
+	// ErrCashPositionScopeMismatch: a snapshot can only be superseded by a
+	// different, live snapshot for the same legal entity and reporting
+	// currency — never by one for another entity, which would let a
+	// caller authorized for one entity retire another's position.
+	ErrCashPositionScopeMismatch = errorString("a cash position snapshot can only be superseded by another live snapshot for the same legal entity and reporting currency")
 )

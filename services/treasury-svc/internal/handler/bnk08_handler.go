@@ -26,6 +26,8 @@ func (h *Handler) writeCashPositionErr(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusConflict, "invalid_transition", err.Error())
 	case errors.Is(err, domain.ErrCashPositionStaleCannotPublish):
 		writeError(w, http.StatusConflict, "stale_cannot_publish", err.Error())
+	case errors.Is(err, domain.ErrCashPositionScopeMismatch):
+		writeError(w, http.StatusConflict, "snapshot_scope_mismatch", err.Error())
 	default:
 		h.log.Error("cash position operation failed", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_error", err.Error())
@@ -38,36 +40,9 @@ func (h *Handler) writeCashPositionErr(w http.ResponseWriter, err error) {
 // snapshot needs for GetAccountDrilldown. Reused by both
 // CalculateCashPosition and RefreshCashPosition rather than duplicated.
 func (h *Handler) composeCashPosition(w http.ResponseWriter, r *http.Request, tenantID, legalEntityID, currencyCode string) (*domain.CashPositionCalculation, bool) {
-	accts, err := h.store.ListBankAccounts(r.Context(), legalEntityID)
-	if err != nil {
-		writeError(w, http.StatusServiceUnavailable, "store_error", err.Error())
+	breakdown, bankSum, bankBalanceStale, ok := h.composeBankBalances(w, r, legalEntityID, currencyCode)
+	if !ok {
 		return nil, false
-	}
-
-	var bankSum float64
-	var oldestBankBalanceAsOf time.Time
-	var haveBankBalance bool
-	var breakdown []domain.CashPositionAccountLine
-	for _, acct := range accts {
-		if acct.CurrencyCode != currencyCode || acct.AccountStatus != "ACTIVE" {
-			continue
-		}
-		bal, err := h.store.GetLatestCashBalance(r.Context(), acct.BankAccountID)
-		if err != nil || bal == nil {
-			continue
-		}
-		bankSum += bal.AvailableBalance
-		breakdown = append(breakdown, domain.CashPositionAccountLine{
-			BankAccountID: acct.BankAccountID, AccountName: acct.AccountName, Balance: bal.AvailableBalance, AsOfTimestamp: bal.AsOfTimestamp,
-		})
-		if !haveBankBalance || bal.AsOfTimestamp.Before(oldestBankBalanceAsOf) {
-			oldestBankBalanceAsOf = bal.AsOfTimestamp
-		}
-		haveBankBalance = true
-	}
-	bankBalanceStale := haveBankBalance && time.Since(oldestBankBalanceAsOf) > domain.BankBalanceStalenessThreshold
-	if bankBalanceStale {
-		h.log.Warn("cash position: bank balance component is stale", zap.String("legal_entity_id", legalEntityID))
 	}
 
 	apSum, err := h.clients.GetPendingAPCommitments(r.Context(), tenantID, legalEntityID, currencyCode)
@@ -87,6 +62,55 @@ func (h *Handler) composeCashPosition(w http.ResponseWriter, r *http.Request, te
 		BankBalance: bankSum, PendingAPCommitments: apSum, PayrollObligations: payrollSum, TaxLiabilities: taxSum,
 		AccountBreakdown: breakdown, HasStaleComponent: bankBalanceStale, AsOfTimestamp: time.Now().UTC(),
 	}, true
+}
+
+// composeBankBalances is the bank-balance half of a cash position: the
+// latest balance of every ACTIVE account the legal entity holds in
+// currencyCode, read in one query. A store failure fails closed (503)
+// rather than dropping accounts from the sum, and an ACTIVE account with
+// no balance at all marks the position stale (partial) instead of being
+// skipped silently. Before, both cases were a silent `continue`, so a
+// failed read understated cash with nothing to show the figure was
+// incomplete.
+func (h *Handler) composeBankBalances(w http.ResponseWriter, r *http.Request, legalEntityID, currencyCode string) (breakdown []domain.CashPositionAccountLine, bankSum float64, stale bool, ok bool) {
+	accts, err := h.store.ListBankAccounts(r.Context(), legalEntityID)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "store_error", err.Error())
+		return nil, 0, false, false
+	}
+	var eligible []domain.BankAccount
+	var ids []string
+	for _, acct := range accts {
+		if acct.CurrencyCode == currencyCode && acct.AccountStatus == domain.BankAccountActive {
+			eligible = append(eligible, acct)
+			ids = append(ids, acct.BankAccountID)
+		}
+	}
+	balances, err := h.store.GetLatestCashBalances(r.Context(), ids)
+	if err != nil {
+		h.log.Error("cash position: bank balances unavailable — failing closed", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_error", "bank balances cannot be read; cash position cannot be calculated reliably")
+		return nil, 0, false, false
+	}
+	missing := false
+	for _, acct := range eligible {
+		bal := balances[acct.BankAccountID]
+		if bal == nil {
+			missing = true
+			h.log.Warn("cash position: active account has no bank balance — position is partial",
+				zap.String("legal_entity_id", legalEntityID), zap.String("bank_account_id", acct.BankAccountID))
+			continue
+		}
+		bankSum += bal.AvailableBalance
+		breakdown = append(breakdown, domain.CashPositionAccountLine{
+			BankAccountID: acct.BankAccountID, AccountName: acct.AccountName, Balance: bal.AvailableBalance, AsOfTimestamp: bal.AsOfTimestamp,
+		})
+	}
+	stale = domain.CashPositionStale(missing, breakdown, time.Now())
+	if stale {
+		h.log.Warn("cash position: bank balance component is stale or partial", zap.String("legal_entity_id", legalEntityID))
+	}
+	return breakdown, bankSum, stale, true
 }
 
 type calculateCashPositionRequest struct {
@@ -172,24 +196,21 @@ func (h *Handler) RefreshCashPosition(w http.ResponseWriter, r *http.Request) {
 	}
 	calc.AvailableCash = calc.BankBalance - req.RestrictedAmount - calc.PendingAPCommitments - calc.PayrollObligations - calc.TaxLiabilities
 
-	snap, err := h.store.CreateCashPositionSnapshot(r.Context(), domain.CalculateCashPositionParams{
-		TenantID: tenantID, LegalEntityID: req.LegalEntityID, ReportingCurrency: req.ReportingCurrency,
-		RestrictedAmount: req.RestrictedAmount, CorrelationID: req.CorrelationID, ActorPrincipalID: principalID,
+	// One transaction: the new snapshot exists only if the prior one (when
+	// given) was superseded by it, and the prior one must be for this same
+	// legal entity and currency.
+	snap, err := h.store.RefreshCashPositionSnapshot(r.Context(), domain.RefreshCashPositionParams{
+		CalculateCashPositionParams: domain.CalculateCashPositionParams{
+			TenantID: tenantID, LegalEntityID: req.LegalEntityID, ReportingCurrency: req.ReportingCurrency,
+			RestrictedAmount: req.RestrictedAmount, CorrelationID: req.CorrelationID, ActorPrincipalID: principalID,
+		},
+		PriorSnapshotID: req.PriorSnapshotID,
 	}, *calc)
 	if err != nil {
 		h.writeCashPositionErr(w, err)
 		return
 	}
 	h.publishCashPositionCalculated(r.Context(), r.Header.Get("X-Correlation-ID"), principalID, *snap)
-
-	if req.PriorSnapshotID != "" {
-		if _, err := h.store.SupersedeCashPositionSnapshot(r.Context(), domain.SupersedeCashPositionParams{
-			TenantID: tenantID, SnapshotID: req.PriorSnapshotID, NewSnapshotID: snap.SnapshotID,
-		}); err != nil {
-			h.writeCashPositionErr(w, err)
-			return
-		}
-	}
 	writeJSON(w, http.StatusCreated, snap)
 }
 
@@ -349,6 +370,29 @@ func (h *Handler) GetCashPositionAsOf(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, snap)
 }
 
+// authorizedCashPositionSnapshot loads the {snapshotID} snapshot for a
+// principal with view permission in its legal entity — the same check
+// every other cash-position read makes. Before, the freshness and
+// drill-down reads needed only a principal, so anyone in the tenant could
+// read any entity's per-account balances.
+func (h *Handler) authorizedCashPositionSnapshot(w http.ResponseWriter, r *http.Request) (*domain.CashPositionSnapshot, bool) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return nil, false
+	}
+	tenantID := svcmiddleware.TenantFromContext(r.Context())
+	snap, err := h.store.GetCashPositionSnapshot(r.Context(), tenantID, chi.URLParam(r, "snapshotID"))
+	if err != nil {
+		h.writeCashPositionErr(w, err)
+		return nil, false
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, snap.LegalEntityID, actionViewPositions); err != nil {
+		h.writeAuthzErr(w, err)
+		return nil, false
+	}
+	return snap, true
+}
+
 type sourceFreshnessResponse struct {
 	SnapshotID string                      `json:"snapshot_id"`
 	Components []domain.ComponentFreshness `json:"components"`
@@ -358,21 +402,24 @@ type sourceFreshnessResponse struct {
 // GET /v1/treasury/cash-position/{snapshotID}/freshness — the doc's own
 // GetSourceFreshness query, reusing ComponentFreshness's shape exactly as
 // GetEffectiveCash's response already does.
+//
+// The bank-balance component reports the as-of time of the oldest balance
+// the snapshot composed — before, it reported the calculation time, so a
+// days-old balance looked as fresh as the moment it was summed — and its
+// staleness as of this read.
 func (h *Handler) GetSourceFreshness(w http.ResponseWriter, r *http.Request) {
-	tenantID := svcmiddleware.TenantFromContext(r.Context())
-	snapshotID := chi.URLParam(r, "snapshotID")
-	if _, ok := h.requirePrincipal(w, r); !ok {
+	snap, ok := h.authorizedCashPositionSnapshot(w, r)
+	if !ok {
 		return
 	}
-	snap, err := h.store.GetCashPositionSnapshot(r.Context(), tenantID, snapshotID)
-	if err != nil {
-		h.writeCashPositionErr(w, err)
-		return
+	bankAsOf, composed := domain.OldestBankBalanceAsOf(snap.AccountBreakdown)
+	if !composed {
+		bankAsOf = snap.AsOfTimestamp
 	}
 	writeJSON(w, http.StatusOK, sourceFreshnessResponse{
 		SnapshotID: snap.SnapshotID,
 		Components: []domain.ComponentFreshness{
-			{Component: "current_bank_balance", AsOfTimestamp: snap.AsOfTimestamp, StalenessThresholdSeconds: int(domain.BankBalanceStalenessThreshold.Seconds()), IsStale: snap.HasStaleComponent},
+			{Component: "current_bank_balance", AsOfTimestamp: bankAsOf, StalenessThresholdSeconds: int(domain.BankBalanceStalenessThreshold.Seconds()), IsStale: snap.HasStaleComponent},
 			{Component: "pending_ap_commitments", AsOfTimestamp: snap.CreatedAt, StalenessThresholdSeconds: 0, IsStale: false},
 			{Component: "payroll_obligations", AsOfTimestamp: snap.CreatedAt, StalenessThresholdSeconds: 0, IsStale: false},
 			{Component: "tax_liabilities", AsOfTimestamp: snap.CreatedAt, StalenessThresholdSeconds: 0, IsStale: false},
@@ -385,14 +432,8 @@ func (h *Handler) GetSourceFreshness(w http.ResponseWriter, r *http.Request) {
 // GetAccountDrilldown query, reading back the per-account breakdown
 // captured at calculate time.
 func (h *Handler) GetAccountDrilldown(w http.ResponseWriter, r *http.Request) {
-	tenantID := svcmiddleware.TenantFromContext(r.Context())
-	snapshotID := chi.URLParam(r, "snapshotID")
-	if _, ok := h.requirePrincipal(w, r); !ok {
-		return
-	}
-	snap, err := h.store.GetCashPositionSnapshot(r.Context(), tenantID, snapshotID)
-	if err != nil {
-		h.writeCashPositionErr(w, err)
+	snap, ok := h.authorizedCashPositionSnapshot(w, r)
+	if !ok {
 		return
 	}
 	lines := snap.AccountBreakdown
