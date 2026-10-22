@@ -221,7 +221,7 @@ func Load() *Config {
 		XICBatchScanTimeoutSecs:         nonNegInt("XIC_BATCH_SCAN_TIMEOUT_SECS", 30),
 		XICSFTPPollIntervalSecs:         nonNegInt("XIC_SFTP_POLL_INTERVAL_SECS", 60),
 		XICSFTPInbox:                    getEnv("XIC_SFTP_INBOX", "inbox"),
-		XICSFTPDone:                     getEnv("XIC_SFTP_DONE", "processed"),
+		XICSFTPDone:                     getEnv("XIC_SFTP_DONE", "inbox/processed"),
 		XICSFTPDefaultPort:              nonNegInt("XIC_SFTP_DEFAULT_PORT", 22),
 		XICReconWorkerIntervalSecs:      nonNegInt("XIC_RECON_WORKER_INTERVAL_SECS", 10),
 		XICReconScheduleEverySecs:       nonNegInt("XIC_RECON_SCHEDULE_EVERY_SECS", 60),

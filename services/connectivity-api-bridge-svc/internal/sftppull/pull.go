@@ -48,7 +48,7 @@ type Ingester interface {
 // Config holds the puller's limits.
 type Config struct {
 	Inbox        string        // remote directory holding one directory per batch
-	Done         string        // remote directory a taken batch is moved under
+	Done         string        // remote directory a taken batch is moved under; inside the inbox, because a provider account is usually chrooted and can write only there
 	Timeout      time.Duration // the whole of one connection's pull
 	MaxFileBytes int64         // the most read of any one file; one byte more is read so an oversize file is seen as one
 	MaxManifest  int64
@@ -59,7 +59,7 @@ type Config struct {
 
 // DefaultConfig returns safe defaults.
 func DefaultConfig() Config {
-	return Config{Inbox: "inbox", Done: "processed", Timeout: 5 * time.Minute, MaxFileBytes: batch.DefaultConfig().MaxFileBytes, MaxManifest: 1 << 20,
+	return Config{Inbox: "inbox", Done: "inbox/processed", Timeout: 5 * time.Minute, MaxFileBytes: batch.DefaultConfig().MaxFileBytes, MaxManifest: 1 << 20,
 		MaxFiles: 1000, MaxBatches: 20, Port: 22}
 }
 
@@ -327,7 +327,8 @@ func (p *Puller) collect(ctx context.Context, cl *sftp.Client, cfg Config, conn 
 	}
 	var dirs []string
 	for _, e := range entries {
-		if e.IsDir() && !strings.HasPrefix(e.Name(), ".") {
+		// the directory taken batches are moved to lives inside the inbox and is never itself a batch
+		if e.IsDir() && !strings.HasPrefix(e.Name(), ".") && path.Join(cfg.Inbox, e.Name()) != path.Clean(cfg.Done) {
 			dirs = append(dirs, e.Name())
 		}
 	}

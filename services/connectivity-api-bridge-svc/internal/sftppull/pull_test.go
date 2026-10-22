@@ -288,11 +288,11 @@ func TestPull_TakesACompleteBatchAndMovesItAside(t *testing.T) {
 	if len(e.ing.got) != 1 || string(e.ing.got[0].files["stmt-0001.csv"]) != "a,b\n1,2\n" || !strings.Contains(e.ing.got[0].manifest, `"B-1"`) {
 		t.Fatalf("%+v", e.ing.got)
 	}
-	in := e.srv.list(t, "inbox")
+	in := without(e.srv.list(t, "inbox"), "processed")
 	if len(in) != 1 || in[0] != "B-2" {
 		t.Fatalf("inbox: %v", in)
 	}
-	done := e.srv.list(t, "processed")
+	done := e.srv.list(t, "inbox/processed")
 	if len(done) != 1 || !strings.HasPrefix(done[0], "B-1.taken.") {
 		t.Fatalf("processed: %v", done)
 	}
@@ -375,14 +375,14 @@ func TestPull_ATransientRefusalLeavesTheBatchAndAFinalOneMovesItWithItsOutcome(t
 	if n, _ := e.p.PollOnce(context.Background()); n != 0 {
 		t.Fatalf("%d", n)
 	}
-	if in := e.srv.list(t, "inbox"); len(in) != 1 {
+	if in := without(e.srv.list(t, "inbox"), "processed"); len(in) != 1 {
 		t.Fatalf("%v", in)
 	}
 	e.ing.status = 422 // refused with evidence: not read again
 	if n, _ := e.p.PollOnce(context.Background()); n != 1 {
 		t.Fatalf("%d", n)
 	}
-	if d := e.srv.list(t, "processed"); len(d) != 1 || !strings.HasPrefix(d[0], "B-1.rejected.") {
+	if d := e.srv.list(t, "inbox/processed"); len(d) != 1 || !strings.HasPrefix(d[0], "B-1.rejected.") {
 		t.Fatalf("%v", d)
 	}
 	e.drop(t, "B-2", map[string]string{"stmt-0001.csv": "y"}, true)
@@ -426,4 +426,14 @@ func TestPull_ConnectionsThatMayNotRunTheOperationAreNotPulled(t *testing.T) {
 	if !strings.Contains(e.reasons(), "pull_refused:NOT_CONFIGURED") {
 		t.Fatal(e.reasons())
 	}
+}
+
+func without(l []string, drop string) []string {
+	var out []string
+	for _, x := range l {
+		if x != drop {
+			out = append(out, x)
+		}
+	}
+	return out
 }
