@@ -31,10 +31,10 @@ state. All five named queries exist. Seven of the nine named commands exist;
 `ConfirmSettlement` and `RecordRejection` do not (A1). The material gaps are
 that two spec states (`SUBMITTED` and `PENDING_UNKNOWN`) are unreachable or
 unrepresentable (A4), `PollPaymentStatus` is caller-attested rather than a
-provider poll and emits no event (A2/A3), `RecordPaymentStatus` is not
-idempotent (A5), the legacy webhook is tenant-blind and weaker than the
-profile path (A6/A7), finality evidence is thin (A9), and the manual finality
-commands require assertion rather than evidence (A10/A11). Roughly 65% of
+provider poll and emits no event (A2/A3), the legacy webhook is tenant-blind
+and weaker than the profile path (A6/A7), finality evidence is thin (A9), and
+the manual finality commands require assertion rather than evidence (A10/A11).
+`RecordPaymentStatus` idempotency (A5) is closed in this pass. Roughly 65% of
 BNK-07.
 
 ## A. Not implemented / weaker than the spec
@@ -105,22 +105,30 @@ BNK-07.
   `CanCancel`, `ListUnresolvedPayments`, the provider status profile and every
   consumer's status mapping; it needs its own migration and state-machine
   review, not an improvised enum value.
-- **A5. `RecordPaymentStatus` is not idempotent.** Every call generates a new
-  UUID and inserts a new `payment_execution_states` row. There is no
-  `Idempotency-Key` handling, no unique constraint on
-  `(tenant_id, provider_request_id)`, `(tenant_id, source_reference)` or any
-  caller-supplied identity, and no lookup-before-insert. A lost `201` response
-  followed by a retry therefore creates a second execution state for the same
-  BNK-06 attempt. Each row can later receive its own callbacks and emit its own
-  `PaymentSettled`, which is exactly the duplicate-accounting effect
-  negative-path #3 is meant to prevent. The callback deduplication is per
-  `payment_id`, so it does not help across two payment rows. §4 requires
-  durable idempotency and "Duplicate calls return the original stable
-  attempt/result rather than create a second effect". *Why it was not fixed
-  here:* the natural key is a contract decision (BNK-06 attempt id, provider
-  request id, or a caller key), `provider_request_id` is allowed to be empty,
-  and a migration/backfill plus caller changes in AR and payment-run are
-  needed.
+- **A5. `RecordPaymentStatus` was not idempotent — closed in this pass.** Every
+  call previously generated a new UUID and inserted a new
+  `payment_execution_states` row. A lost `201` followed by a retry therefore
+  created a second execution state for the same BNK-06 attempt, each able to
+  receive its own callbacks and emit its own `PaymentSettled` — exactly the
+  duplicate-accounting effect negative-path #3 is meant to prevent. The
+  natural key is now `(tenant_id, source_reference)`, **not**
+  `provider_request_id` (which the contract allows to be empty):
+  `source_reference` is the same field and concept the BNK-06 idempotent-dedup
+  fix uses (`uq_payment_initiation_attempts_unresolved_source_reference`,
+  migration `000007_unresolved_source_reference`). Migration
+  `000007_unresolved_source_reference` adds
+  `uq_payment_execution_states_unresolved_source_reference` on
+  `(COALESCE(tenant_id::text, ''), source_reference)` for the not-yet-resolved
+  statuses `PREPARED`, `SUBMITTED`, `ACCEPTED` and `PENDING`; an empty
+  `source_reference` is excluded. `RecordPaymentStatus` now looks up an
+  existing unresolved row before inserting and returns it unchanged on a
+  sequential retry, and maps a specific unique-constraint loss under a
+  concurrent race back to the winning row — the same pattern
+  `PrepareAttempt` uses. A duplicate retry creates no second status event or
+  outbox event. Test:
+  `TestPgStore_RecordPaymentStatus_ConcurrentSameSourceReference_OneRow`
+  (plus the sequential-retry, empty-reference and resolved-reuse tests in the
+  same file). See B11 for the key and status-set decision.
 - **A6. The legacy webhook is tenant-blind and materially weaker than the
   profile-driven endpoint.** `POST /bnk07/webhooks/provider-callback` is
   registered outside the tenant middleware, so its context has an empty tenant
@@ -353,8 +361,26 @@ BNK-07.
   UUID-filter validation (handler), legacy/poll conflict blocking (handler and
   store), profile conflict/provider blocking and non-decision (store),
   entity-scoped unresolved listing (store), invalid resolution status
-  (handler/store), empty-secret fail-closed (handler), and poll finality
-  permission/SoD (handler). The existing forged-callback, duplicate,
+  (handler/store), empty-secret fail-closed (handler), poll finality
+  permission/SoD (handler), and concurrent/sequential `source_reference`
+  idempotency (store). The existing forged-callback, duplicate,
   out-of-order, statement-conflict, return and cancellation tests still pass.
   `payment-run-svc` and `payable-open-item-svc` were updated for the
   principal-forwarding contract; their tests pass with the same change.
+- **B11. `RecordPaymentStatus` deduplicates on `(tenant_id, source_reference)`
+  only while the execution state is unresolved.** The key is BNK-06's
+  `source_reference`, not `provider_request_id`: the latter is optional and
+  may be empty, so it cannot identify a retry. The index covers `PREPARED`,
+  `SUBMITTED`, `ACCEPTED` and `PENDING` — this service's pre-terminal states,
+  i.e. the complement of `domain.finalStates`. SETTLED, REJECTED, CANCELLED
+  and RETURNED are resolved, so the index deliberately releases the reference
+  for a genuine later instruction, mirroring BNK-06's
+  `uq_payment_initiation_attempts_unresolved_source_reference` (migration
+  `000007`). The pre-insert lookup uses the same tenant/status predicate as the
+  index; the index, not the lookup, is the concurrency guarantee. NULL tenant
+  ids are coalesced to the empty string so legacy tenant-less rows still
+  collide with each other, and an empty `source_reference` is excluded from
+  both the lookup and the index. A reviewer could prefer deduplicating after a
+  resolution too, but that would make an exhausted source_reference
+  permanently unusable, which is why BNK-06's precedent scopes it to
+  unresolved attempts.

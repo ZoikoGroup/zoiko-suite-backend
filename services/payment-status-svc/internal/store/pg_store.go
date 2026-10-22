@@ -29,6 +29,26 @@ func isUniqueViolation(err error) bool {
 	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }
 
+func pgConstraint(err error) string {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.ConstraintName
+	}
+	return ""
+}
+
+// unresolvedSourceReferenceIndex is migration 000007's partial unique index.
+// Naming it here lets RecordPaymentStatus tell a concurrent duplicate
+// source_reference (return the existing execution state) from any other
+// unique violation.
+const unresolvedSourceReferenceIndex = "uq_payment_execution_states_unresolved_source_reference"
+
+// unresolvedStatusesSQL is the status predicate shared by RecordPaymentStatus's
+// pre-insert lookup and migration 000007's partial unique index. These are this
+// service's not-yet-resolved states - the complement of domain.finalStates.
+// Keep it in lockstep with the migration.
+const unresolvedStatusesSQL = "('PREPARED', 'SUBMITTED', 'ACCEPTED', 'PENDING')"
+
 // isRegressionBlocked reports whether err is the custom SQLSTATE ZK002
 // raised by the payment_execution_states trigger when a status update
 // would regress a governed final state — see the migration.
@@ -215,6 +235,28 @@ func (s *PgStore) RecordPaymentStatus(ctx context.Context, tenantID string, req 
 	id := uuid.New().String()
 	var p *domain.PaymentExecutionState
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		// A retry of the same BNK-06 instruction must return the execution
+		// state that already exists, not create a second one. An empty
+		// source_reference has nothing to dedupe against (the index excludes
+		// it too).
+		if req.SourceReference != "" {
+			existing, lookupErr := scanState(tx.QueryRow(ctx, `
+				SELECT `+stateColumns+` FROM payment_execution_states
+				WHERE COALESCE(tenant_id::text, '') = $1
+				  AND source_reference = $2
+				  AND status IN `+unresolvedStatusesSQL+`
+				ORDER BY created_at ASC
+				LIMIT 1
+			`, tenantID, req.SourceReference))
+			if lookupErr == nil {
+				p = existing
+				return nil
+			}
+			if !errors.Is(lookupErr, pgx.ErrNoRows) {
+				return lookupErr
+			}
+		}
+
 		var err error
 		p, err = scanState(tx.QueryRow(ctx, `
 			INSERT INTO payment_execution_states (`+stateColumns+`)
@@ -231,9 +273,47 @@ func (s *PgStore) RecordPaymentStatus(ctx context.Context, tenantID string, req 
 		return s.enqueueEvent(ctx, tx, canonicalForLegacy("PAYMENT_EXECUTION_STATE_RECORDED"), "PAYMENT_EXECUTION_STATE_RECORDED",
 			"payment-execution-state", id, tenantID, req.LegalEntityID, principalID, correlationID, p)
 	})
+	if isUniqueViolation(err) && pgConstraint(err) == unresolvedSourceReferenceIndex {
+		// The pre-insert check and the INSERT are not atomic without the
+		// index: two concurrent calls for one source_reference can both pass
+		// the check, and exactly one insert then loses here. Return the
+		// winner, the same answer a sequential retry gets.
+		existing, findErr := s.findUnresolvedBySourceReference(ctx, tenantID, req.SourceReference)
+		if findErr == nil {
+			return existing, nil
+		}
+		s.log.Error("pg RecordPaymentStatus: lost source_reference race but could not find the winner", zap.Error(findErr))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, findErr)
+	}
 	if err != nil {
 		s.log.Error("pg RecordPaymentStatus failed", zap.Error(err))
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return p, nil
+}
+
+// findUnresolvedBySourceReference returns the execution state that currently
+// owns a source_reference under migration 000007's unique index, in the same
+// tenant scope the insert used. COALESCE matches the index expression exactly.
+func (s *PgStore) findUnresolvedBySourceReference(ctx context.Context, tenantID, sourceReference string) (*domain.PaymentExecutionState, error) {
+	var p *domain.PaymentExecutionState
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		var err error
+		p, err = scanState(tx.QueryRow(ctx, `
+			SELECT `+stateColumns+` FROM payment_execution_states
+			WHERE COALESCE(tenant_id::text, '') = $1
+			  AND source_reference = $2
+			  AND status IN `+unresolvedStatusesSQL+`
+			ORDER BY created_at ASC
+			LIMIT 1
+		`, tenantID, sourceReference))
+		return err
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrPaymentNotFound
+	}
+	if err != nil {
+		return nil, err
 	}
 	return p, nil
 }
