@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -506,7 +507,7 @@ func BuildEnvelope(region, tenantID string, ev domain.OutboxEvent) (*envelope.En
 		data = map[string]any{} // the envelope requires a JSON object; an event with nothing to say still says it happened
 	}
 	return envelope.New(envelope.Spec{
-		Type:             "com.zoikosuite.connectivity." + ev.Type,
+		Type:             eventType(ev.Type),
 		LegacyType:       ev.LegacyType,
 		Service:          EventService,
 		SchemaVersion:    "1.0.0",
@@ -536,4 +537,13 @@ func (p *PgStore) enqueue(ctx context.Context, tx pgx.Tx, tenantID string, ev do
 		return fmt.Errorf("enqueue %s event: %w", ev.Type, err)
 	}
 	return nil
+}
+
+// eventType places a registry event ("integration.*", the ZS-SVC-T-001 event families) in the integration
+// domain; every other event of this service stays in the connectivity domain.
+func eventType(t string) string {
+	if strings.HasPrefix(t, "integration.") {
+		return "com.zoikosuite." + t
+	}
+	return "com.zoikosuite.connectivity." + t
 }
