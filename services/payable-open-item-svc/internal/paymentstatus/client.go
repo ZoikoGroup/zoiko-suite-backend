@@ -18,7 +18,7 @@ import (
 var ErrUnavailable = errors.New("payment-status-svc unavailable")
 
 type Client interface {
-	GetStatus(ctx context.Context, tenantID, paymentID string) (*PaymentState, error)
+	GetStatus(ctx context.Context, tenantID, principalID, paymentID string) (*PaymentState, error)
 }
 
 // PaymentState is the subset of BNK-07's PaymentExecutionState (PascalCase
@@ -40,12 +40,13 @@ func NewHTTPClient(baseURL string, log *zap.Logger) *HTTPClient {
 	return &HTTPClient{baseURL: baseURL, log: log, http: &http.Client{Timeout: 3 * time.Second}}
 }
 
-func (c *HTTPClient) GetStatus(ctx context.Context, tenantID, paymentID string) (*PaymentState, error) {
+func (c *HTTPClient) GetStatus(ctx context.Context, tenantID, principalID, paymentID string) (*PaymentState, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/bnk07/payments/"+paymentID, nil)
 	if err != nil {
 		return nil, ErrUnavailable
 	}
 	req.Header.Set("X-Tenant-Id", tenantID)
+	req.Header.Set("X-Principal-Id", principalID)
 
 	resp, err := c.http.Do(req)
 	if err != nil {

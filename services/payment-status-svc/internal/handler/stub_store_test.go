@@ -45,7 +45,7 @@ func (s *stubStore) RecordPaymentStatus(_ context.Context, tenantID string, req 
 	now := time.Now().UTC()
 	p := &domain.PaymentExecutionState{
 		PaymentID: uuid.New().String(), TenantID: strp(tenantID), LegalEntityID: req.LegalEntityID,
-		ProviderRequestID: req.ProviderRequestID, SourceReference: req.SourceReference,
+		ProviderRequestID: req.ProviderRequestID, SourceReference: req.SourceReference, ProviderKey: req.ProviderKey,
 		Status: domain.StatusPrepared, CreatedByPrincipalID: principalID, CreatedAt: now, UpdatedAt: now,
 	}
 	s.payments[p.PaymentID] = p
@@ -65,6 +65,9 @@ func (s *stubStore) ApplyCallbackStatus(_ context.Context, paymentID string, pay
 	p, ok := s.payments[paymentID]
 	if !ok {
 		return nil, false, domain.ErrPaymentNotFound
+	}
+	if p.HasOpenConflict {
+		return p, false, domain.ErrOpenConflictExists
 	}
 	if payload.ProviderEventRef != "" {
 		if s.appliedEvents[paymentID][payload.ProviderEventRef] {
@@ -98,6 +101,9 @@ func (s *stubStore) LinkStatement(_ context.Context, paymentID string, req domai
 }
 
 func (s *stubStore) ResolveConflict(_ context.Context, paymentID string, req domain.ResolveConflictRequest, principalID, _ string) (*domain.PaymentExecutionState, error) {
+	if !domain.ValidResolutionStatus(req.FinalStatus) {
+		return nil, domain.ErrInvalidResolution
+	}
 	p, ok := s.payments[paymentID]
 	if !ok || !p.HasOpenConflict {
 		return nil, domain.ErrInvalidTransition
@@ -144,10 +150,10 @@ func (s *stubStore) ListEvents(_ context.Context, paymentID string) ([]domain.St
 	return s.events[paymentID], nil
 }
 
-func (s *stubStore) ListUnresolved(_ context.Context) ([]domain.PaymentExecutionState, error) {
+func (s *stubStore) ListUnresolved(_ context.Context, legalEntityID string) ([]domain.PaymentExecutionState, error) {
 	var out []domain.PaymentExecutionState
 	for _, p := range s.payments {
-		if p.HasOpenConflict {
+		if p.HasOpenConflict && p.LegalEntityID == legalEntityID {
 			out = append(out, *p)
 		}
 	}

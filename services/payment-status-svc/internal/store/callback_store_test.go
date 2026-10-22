@@ -345,6 +345,160 @@ func TestCallback_TheStateGuardIsTheBackstop(t *testing.T) {
 	assert.Error(t, err)
 }
 
+// a callback blocked by an open conflict is NOT decided: it may be retried, and
+// once the conflict is resolved the same event reaches the state machine instead
+// of being consumed as a duplicate.
+func TestCallback_OpenConflictBlocksAndDoesNotDecideTheEvent(t *testing.T) {
+	st := app(t)
+	tenant := uuid.NewString()
+	ref := "PRV-" + uuid.NewString()
+	p := newPayment(t, st, tenant, ref)
+
+	res, err := st.ApplyProviderCallback(tctx(tenant), cb("simbank", "E-accepted", ref, domain.StatusAccepted, nil))
+	require.NoError(t, err)
+	require.Equal(t, store.OutcomeApplied, res.Outcome)
+
+	_, conflict, err := st.LinkStatement(tctx(tenant), p.PaymentID, domain.LinkStatementRequest{
+		StatementReference: "stmt-conflict", ReportedStatus: domain.StatusSettled,
+	}, "clerk", "corr")
+	require.NoError(t, err)
+	require.True(t, conflict)
+	require.Equal(t, domain.StatusAccepted, status(t, st, tenant, p.PaymentID))
+
+	for i := 0; i < 2; i++ {
+		res, err = st.ApplyProviderCallback(tctx(tenant), cb("simbank", "E-settled", ref, domain.StatusSettled, nil))
+		require.NoError(t, err)
+		assert.Equal(t, store.OutcomeConflictBlocked, res.Outcome, "conflict must block the callback")
+	}
+	assert.Equal(t, 2, receiptCount(t, tenant, "simbank", "E-settled", store.OutcomeConflictBlocked))
+	assert.Equal(t, domain.StatusAccepted, status(t, st, tenant, p.PaymentID), "a blocked callback changes nothing")
+
+	_, err = st.ResolveConflict(tctx(tenant), p.PaymentID, domain.ResolveConflictRequest{
+		FinalStatus: domain.StatusSettled, Reason: "provider evidence confirmed",
+	}, "reviewer", "corr")
+	require.NoError(t, err)
+
+	// the blocked receipts did not consume the event's one-decision slot
+	res, err = st.ApplyProviderCallback(tctx(tenant), cb("simbank", "E-settled", ref, domain.StatusSettled, nil))
+	require.NoError(t, err)
+	assert.Equal(t, store.OutcomeStaleIgnored, res.Outcome, "not DUPLICATE: the event was never decided")
+	assert.Equal(t, 1, receiptCount(t, tenant, "simbank", "E-settled", store.OutcomeStaleIgnored))
+	assert.Equal(t, 0, receiptCount(t, tenant, "simbank", "E-settled", store.OutcomeDuplicate))
+}
+
+// The legacy webhook and the manual poll share ApplyCallbackStatus. An open
+// conflict must refuse both, rather than letting either overwrite the
+// evidence that only ResolveStatusConflict may decide.
+func TestLegacyCallbackAndPollCannotDecideAnOpenConflict(t *testing.T) {
+	st := app(t)
+	tenant := uuid.NewString()
+	p := newPayment(t, st, tenant, "PRV-"+uuid.NewString())
+
+	_, conflict, err := st.LinkStatement(tctx(tenant), p.PaymentID, domain.LinkStatementRequest{
+		StatementReference: "stmt-legacy-conflict", ReportedStatus: domain.StatusSettled,
+	}, "clerk", "corr")
+	require.NoError(t, err)
+	require.True(t, conflict)
+	require.Equal(t, domain.StatusPrepared, status(t, st, tenant, p.PaymentID))
+
+	for _, tc := range []struct {
+		name   string
+		source string
+		emit   bool
+	}{
+		{"legacy webhook", "PROVIDER_CALLBACK", true},
+		{"manual poll", "MANUAL_POLL", false},
+	} {
+		updated, applied, err := st.ApplyCallbackStatus(tctx(tenant), p.PaymentID, domain.ProviderCallbackPayload{
+			PaymentID: p.PaymentID, ProviderEventRef: "evt-legacy-" + tc.name, ReportedStatus: domain.StatusSettled, MappingVersion: "legacy:v1",
+		}, domain.EventPaymentSettled, tc.source, "operator", tc.name, tc.emit)
+		require.ErrorIs(t, err, domain.ErrOpenConflictExists, tc.name)
+		assert.False(t, applied, tc.name)
+		require.NotNil(t, updated, tc.name)
+		assert.Equal(t, domain.StatusPrepared, updated.Status, tc.name)
+	}
+	assert.Equal(t, domain.StatusPrepared, status(t, st, tenant, p.PaymentID))
+}
+
+// a payment is owned by one provider: the first applied callback binds it, a
+// callback from any other provider is refused and changes nothing.
+func TestCallback_ProviderMismatchIsRefused(t *testing.T) {
+	st := app(t)
+	tenant := uuid.NewString()
+
+	// unbound at record time, bound by the first applied callback
+	ref := "PRV-" + uuid.NewString()
+	p := newPayment(t, st, tenant, ref)
+	res, err := st.ApplyProviderCallback(tctx(tenant), cb("simbank", "E-bind", ref, domain.StatusAccepted, nil))
+	require.NoError(t, err)
+	require.Equal(t, store.OutcomeApplied, res.Outcome)
+
+	res, err = st.ApplyProviderCallback(tctx(tenant), cb("otherbank", "E-impostor", ref, domain.StatusSettled, nil))
+	require.NoError(t, err)
+	assert.Equal(t, store.OutcomeProviderMismatch, res.Outcome)
+	assert.Equal(t, domain.StatusAccepted, status(t, st, tenant, p.PaymentID))
+	assert.Equal(t, 1, receiptCount(t, tenant, "otherbank", "E-impostor", store.OutcomeProviderMismatch))
+
+	// the owning provider still moves the payment forward
+	res, err = st.ApplyProviderCallback(tctx(tenant), cb("simbank", "E-settled", ref, domain.StatusSettled, nil))
+	require.NoError(t, err)
+	assert.Equal(t, store.OutcomeApplied, res.Outcome)
+	assert.Equal(t, domain.StatusSettled, status(t, st, tenant, p.PaymentID))
+
+	// a provider key supplied at record time is bound immediately
+	ref2 := "PRV-" + uuid.NewString()
+	p2, err := st.RecordPaymentStatus(tctx(tenant), tenant, domain.RecordPaymentStatusRequest{
+		LegalEntityID: uuid.NewString(), ProviderRequestID: ref2, SourceReference: "src-" + uuid.NewString(), ProviderKey: "simbank",
+	}, "maker", "corr")
+	require.NoError(t, err)
+	res, err = st.ApplyProviderCallback(tctx(tenant), cb("otherbank", "E-impostor-2", ref2, domain.StatusSettled, nil))
+	require.NoError(t, err)
+	assert.Equal(t, store.OutcomeProviderMismatch, res.Outcome)
+	assert.Equal(t, domain.StatusPrepared, status(t, st, tenant, p2.PaymentID))
+}
+
+func TestListUnresolved_FiltersByLegalEntityAndTenant(t *testing.T) {
+	st := app(t)
+	tenant := uuid.NewString()
+	entityA, entityB := uuid.NewString(), uuid.NewString()
+	mk := func(entity string) *domain.PaymentExecutionState {
+		p, err := st.RecordPaymentStatus(tctx(tenant), tenant, domain.RecordPaymentStatusRequest{
+			LegalEntityID: entity, ProviderRequestID: "PRV-" + uuid.NewString(), SourceReference: "src-" + uuid.NewString(),
+		}, "maker", "corr")
+		require.NoError(t, err)
+		return p
+	}
+	a, b := mk(entityA), mk(entityB)
+	for _, p := range []*domain.PaymentExecutionState{a, b} {
+		_, conflict, err := st.LinkStatement(tctx(tenant), p.PaymentID, domain.LinkStatementRequest{
+			StatementReference: "stmt-" + p.PaymentID, ReportedStatus: domain.StatusPending,
+		}, "clerk", "corr")
+		require.NoError(t, err)
+		require.True(t, conflict)
+	}
+
+	list, err := st.ListUnresolved(tctx(tenant), entityA)
+	require.NoError(t, err)
+	require.Len(t, list, 1)
+	assert.Equal(t, a.PaymentID, list[0].PaymentID)
+
+	other, err := st.ListUnresolved(tctx(uuid.NewString()), entityA)
+	require.NoError(t, err)
+	assert.Empty(t, other, "another tenant cannot list this entity's unresolved payments")
+
+	listB, err := st.ListUnresolved(tctx(tenant), entityB)
+	require.NoError(t, err)
+	require.Len(t, listB, 1)
+	assert.Equal(t, b.PaymentID, listB[0].PaymentID)
+
+	// a conflict is resolved only to a governed final status
+	_, err = st.ResolveConflict(tctx(tenant), a.PaymentID, domain.ResolveConflictRequest{
+		FinalStatus: domain.StatusPending, Reason: "not a resolution status",
+	}, "reviewer", "corr")
+	assert.ErrorIs(t, err, domain.ErrInvalidResolution)
+	assert.Equal(t, domain.StatusPrepared, status(t, st, tenant, a.PaymentID))
+}
+
 // INT-NP-043 / INT-CTRL-034: a callback that cannot be correlated to a durable payment changes nothing, is quarantined
 // for a named owner, and raises one event so an alert can route to that owner. A provider's retries do not re-raise it.
 func TestCallback_UncorrelatedIsQuarantinedForANamedOwnerOnce(t *testing.T) {

@@ -9,6 +9,7 @@ import (
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 
 	authzpkg "zoiko.io/payment-status-svc/internal/authz"
@@ -158,8 +159,15 @@ func (h *Handler) RecordPaymentStatus(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) GetPaymentStatus(w http.ResponseWriter, r *http.Request) {
 	paymentID := chi.URLParam(r, "paymentID")
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
 	p, ok := h.fetchPaymentForAuth(w, r, paymentID)
 	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, p.LegalEntityID, PaymentStatusRead) {
 		return
 	}
 	writeJSON(w, http.StatusOK, p)
@@ -167,7 +175,15 @@ func (h *Handler) GetPaymentStatus(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) GetStatusHistory(w http.ResponseWriter, r *http.Request) {
 	paymentID := chi.URLParam(r, "paymentID")
-	if _, ok := h.fetchPaymentForAuth(w, r, paymentID); !ok {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	p, ok := h.fetchPaymentForAuth(w, r, paymentID)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, p.LegalEntityID, PaymentStatusRead) {
 		return
 	}
 	events, err := h.store.ListEvents(r.Context(), paymentID)
@@ -184,8 +200,15 @@ func (h *Handler) GetStatusHistory(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) GetFinalityEvidence(w http.ResponseWriter, r *http.Request) {
 	paymentID := chi.URLParam(r, "paymentID")
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
 	p, ok := h.fetchPaymentForAuth(w, r, paymentID)
 	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, p.LegalEntityID, PaymentStatusRead) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
@@ -195,15 +218,41 @@ func (h *Handler) GetFinalityEvidence(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) GetProviderReference(w http.ResponseWriter, r *http.Request) {
 	paymentID := chi.URLParam(r, "paymentID")
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
 	p, ok := h.fetchPaymentForAuth(w, r, paymentID)
 	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, p.LegalEntityID, PaymentStatusRead) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"payment_id": paymentID, "provider_request_id": p.ProviderRequestID})
 }
 
+// ListUnresolvedPayments is scoped to one legal entity: an unscoped list would
+// cross both entities and, for a principal entitled in several, leak rows they
+// are not entitled to see.
 func (h *Handler) ListUnresolvedPayments(w http.ResponseWriter, r *http.Request) {
-	payments, err := h.store.ListUnresolved(r.Context())
+	legalEntityID := r.URL.Query().Get("legal_entity_id")
+	if legalEntityID == "" {
+		writeError(w, http.StatusBadRequest, "legal_entity_id is required")
+		return
+	}
+	if _, err := uuid.Parse(legalEntityID); err != nil {
+		writeError(w, http.StatusBadRequest, "legal_entity_id must be a UUID")
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, legalEntityID, PaymentStatusRead) {
+		return
+	}
+	payments, err := h.store.ListUnresolved(r.Context(), legalEntityID)
 	if err != nil {
 		h.log.Error("ListUnresolvedPayments: store unavailable", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store unavailable")
@@ -221,6 +270,14 @@ func (h *Handler) ListUnresolvedPayments(w http.ResponseWriter, r *http.Request)
 // accepted"). See internal/webhook's package doc for why this, not
 // X-Principal-Id, is this endpoint's only authentication.
 func (h *Handler) ProcessProviderCallback(w http.ResponseWriter, r *http.Request) {
+	// Fail closed: without a configured secret no signature can be verified, so
+	// accepting anything would accept unsigned, unattributable callbacks. The
+	// endpoint is off rather than trusting a development default.
+	if len(h.webhookSecret) == 0 {
+		h.log.Error("ProcessProviderCallback: no WEBHOOK_SHARED_SECRET configured — refusing every callback")
+		writeError(w, http.StatusServiceUnavailable, "webhook receiver is not configured")
+		return
+	}
 	rawBody, err := io.ReadAll(r.Body)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "failed to read request body")
@@ -251,6 +308,10 @@ func (h *Handler) ProcessProviderCallback(w http.ResponseWriter, r *http.Request
 	if err != nil {
 		if errors.Is(err, domain.ErrPaymentNotFound) {
 			writeError(w, http.StatusNotFound, "payment execution state not found")
+			return
+		}
+		if errors.Is(err, domain.ErrOpenConflictExists) {
+			writeError(w, http.StatusConflict, domain.ErrOpenConflictExists.Error())
 			return
 		}
 		h.log.Error("ProcessProviderCallback: store unavailable", zap.Error(err))
@@ -327,6 +388,10 @@ func (h *Handler) ResolveStatusConflict(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "reason is required")
 		return
 	}
+	if !domain.ValidResolutionStatus(req.FinalStatus) {
+		writeError(w, http.StatusBadRequest, domain.ErrInvalidResolution.Error())
+		return
+	}
 
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
@@ -334,6 +399,9 @@ func (h *Handler) ResolveStatusConflict(w http.ResponseWriter, r *http.Request) 
 	}
 	p, ok := h.fetchPaymentForAuth(w, r, paymentID)
 	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, p.LegalEntityID, PaymentFinalityConfirm) {
 		return
 	}
 	if !p.HasOpenConflict {
@@ -344,12 +412,13 @@ func (h *Handler) ResolveStatusConflict(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusForbidden, domain.ErrSelfResolutionForbidden.Error())
 		return
 	}
-	if !h.authorize(w, r, principalID, p.LegalEntityID, PaymentFinalityConfirm) {
-		return
-	}
 
 	updated, err := h.store.ResolveConflict(r.Context(), paymentID, req, principalID, r.Header.Get("X-Correlation-ID"))
 	if err != nil {
+		if errors.Is(err, domain.ErrInvalidResolution) {
+			writeError(w, http.StatusBadRequest, domain.ErrInvalidResolution.Error())
+			return
+		}
 		if errors.Is(err, domain.ErrInvalidTransition) {
 			writeError(w, http.StatusConflict, "payment has no open conflict to resolve")
 			return
@@ -386,15 +455,15 @@ func (h *Handler) RecordReturn(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if !h.authorize(w, r, principalID, p.LegalEntityID, PaymentFinalityConfirm) {
+		return
+	}
 	if !domain.CanReturn(p.Status) {
 		writeError(w, http.StatusConflict, "only a SETTLED payment may be returned")
 		return
 	}
 	if p.CreatedByPrincipalID != "" && p.CreatedByPrincipalID == principalID {
 		writeError(w, http.StatusForbidden, domain.ErrSelfResolutionForbidden.Error())
-		return
-	}
-	if !h.authorize(w, r, principalID, p.LegalEntityID, PaymentFinalityConfirm) {
 		return
 	}
 
@@ -428,11 +497,11 @@ func (h *Handler) CancelPaymentWhereSupported(w http.ResponseWriter, r *http.Req
 	if !ok {
 		return
 	}
-	if !domain.CanCancel(p.Status) {
-		writeError(w, http.StatusConflict, "payment can no longer be cancelled")
+	if !h.authorize(w, r, principalID, p.LegalEntityID, PaymentStatusResolve) {
 		return
 	}
-	if !h.authorize(w, r, principalID, p.LegalEntityID, PaymentStatusResolve) {
+	if !domain.CanCancel(p.Status) {
+		writeError(w, http.StatusConflict, "payment can no longer be cancelled")
 		return
 	}
 
@@ -477,6 +546,16 @@ func (h *Handler) PollPaymentStatus(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// A poll asserting a governed final status is a manual finality claim:
+	// it needs the stronger payment.finality.confirm action, not merely
+	// ingest. Intermediate progress reports stay on the ingest action.
+	action := PaymentStatusIngest
+	if domain.IsFinal(payload.ReportedStatus) {
+		action = PaymentFinalityConfirm
+	}
+	if !h.authorize(w, r, principalID, p.LegalEntityID, action) {
+		return
+	}
 	// SoD: the same actor who created this payment must not also be the
 	// one manually asserting it into a governed final state (SETTLED/
 	// REJECTED) — PollPaymentStatus is the de facto manual-settlement
@@ -489,9 +568,6 @@ func (h *Handler) PollPaymentStatus(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, domain.ErrSelfResolutionForbidden.Error())
 		return
 	}
-	if !h.authorize(w, r, principalID, p.LegalEntityID, PaymentStatusIngest) {
-		return
-	}
 
 	// emitEvent=false: PollPaymentStatus never published an event in the
 	// old dual-write (see ApplyCallbackStatus's own doc comment) — this
@@ -501,6 +577,10 @@ func (h *Handler) PollPaymentStatus(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if errors.Is(err, domain.ErrPaymentNotFound) {
 			writeError(w, http.StatusNotFound, "payment execution state not found")
+			return
+		}
+		if errors.Is(err, domain.ErrOpenConflictExists) {
+			writeError(w, http.StatusConflict, domain.ErrOpenConflictExists.Error())
 			return
 		}
 		h.log.Error("PollPaymentStatus: store unavailable", zap.Error(err))

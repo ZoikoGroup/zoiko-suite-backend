@@ -89,12 +89,30 @@ func ValidCallbackStatus(s ExecutionStatus) bool {
 func CanCancel(s ExecutionStatus) bool { return s == StatusPrepared || s == StatusSubmitted }
 func CanReturn(s ExecutionStatus) bool { return s == StatusSettled }
 
+// ValidResolutionStatus reports whether s is a status an operator may set
+// when closing a provider/statement conflict. A conflict is resolved to a
+// governed final outcome, not to an intermediate stage; RETURNED is excluded
+// because it has its own command (RecordReturn) and its own preconditions.
+func ValidResolutionStatus(s ExecutionStatus) bool {
+	switch s {
+	case StatusSettled, StatusRejected, StatusCancelled:
+		return true
+	default:
+		return false
+	}
+}
+
 type PaymentExecutionState struct {
 	PaymentID         string
 	TenantID          *string
 	LegalEntityID     string
 	ProviderRequestID string // correlates to BNK-06's PaymentInitiationAttempt
 	SourceReference   string
+	// ProviderKey is the certified provider profile that owns this payment.
+	// It is optional at RecordPaymentStatus (a caller may not know it yet) and
+	// is bound by the first applied callback; once set, a callback from a
+	// different provider is refused rather than allowed to mutate the state.
+	ProviderKey string
 
 	Status ExecutionStatus
 
@@ -145,6 +163,10 @@ type RecordPaymentStatusRequest struct {
 	LegalEntityID     string
 	ProviderRequestID string
 	SourceReference   string
+	// ProviderKey optionally binds the execution state to the certified
+	// provider profile BNK-06 used. Empty leaves it unbound; the first
+	// applied callback then binds it.
+	ProviderKey string
 }
 
 // ProviderCallbackPayload is the parsed body of a real webhook call — its
@@ -193,6 +215,7 @@ const (
 	ErrInvalidTransition     = sentinel("invalid payment execution state transition")
 	ErrInvalidSignature      = sentinel("webhook signature is invalid or missing")
 	ErrInvalidCallbackStatus = sentinel("reported_status must be ACCEPTED, PENDING, SETTLED, or REJECTED")
+	ErrInvalidResolution     = sentinel("final_status must be SETTLED, REJECTED or CANCELLED")
 	ErrOpenConflictExists    = sentinel("payment already has an open, unresolved status conflict")
 	ErrStoreUnavailable      = sentinel("store unavailable")
 	// ErrSelfResolutionForbidden is the SoD rule the spec names as "manual

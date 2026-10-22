@@ -61,7 +61,7 @@ type Store interface {
 	CancelPayment(ctx context.Context, paymentID string, req domain.CancelRequest, principalID, correlationID string) (*domain.PaymentExecutionState, error)
 
 	ListEvents(ctx context.Context, paymentID string) ([]domain.StatusEvent, error)
-	ListUnresolved(ctx context.Context) ([]domain.PaymentExecutionState, error)
+	ListUnresolved(ctx context.Context, legalEntityID string) ([]domain.PaymentExecutionState, error)
 }
 
 type PgStore struct {
@@ -197,13 +197,13 @@ func (s *PgStore) recordEvent(ctx context.Context, tx pgx.Tx, tenantID *string, 
 }
 
 const stateColumns = `
-	payment_id, tenant_id, legal_entity_id, provider_request_id, source_reference, status,
+	payment_id, tenant_id, legal_entity_id, provider_request_id, source_reference, provider_key, status,
 	finality_source, mapping_version, has_open_conflict, conflict_reason, created_by_principal_id, created_at, updated_at`
 
 func scanState(row pgx.Row) (*domain.PaymentExecutionState, error) {
 	p := &domain.PaymentExecutionState{}
 	err := row.Scan(&p.PaymentID, &p.TenantID, &p.LegalEntityID, &nullString{&p.ProviderRequestID},
-		&nullString{&p.SourceReference}, &p.Status, &nullString{&p.FinalitySource}, &nullString{&p.MappingVersion},
+		&nullString{&p.SourceReference}, &nullString{&p.ProviderKey}, &p.Status, &nullString{&p.FinalitySource}, &nullString{&p.MappingVersion},
 		&p.HasOpenConflict, &nullString{&p.ConflictReason}, &p.CreatedByPrincipalID, &p.CreatedAt, &p.UpdatedAt)
 	if err != nil {
 		return nil, err
@@ -218,9 +218,9 @@ func (s *PgStore) RecordPaymentStatus(ctx context.Context, tenantID string, req 
 		var err error
 		p, err = scanState(tx.QueryRow(ctx, `
 			INSERT INTO payment_execution_states (`+stateColumns+`)
-			VALUES ($1, $2, $3, $4, $5, 'PREPARED', '', '', FALSE, '', $6, NOW(), NOW())
+			VALUES ($1, $2, $3, $4, $5, $6, 'PREPARED', '', '', FALSE, '', $7, NOW(), NOW())
 			RETURNING `+stateColumns,
-			id, nullableTenant(tenantID), req.LegalEntityID, req.ProviderRequestID, req.SourceReference, principalID,
+			id, nullableTenant(tenantID), req.LegalEntityID, req.ProviderRequestID, req.SourceReference, req.ProviderKey, principalID,
 		))
 		if err != nil {
 			return err
@@ -278,11 +278,23 @@ func (s *PgStore) ApplyCallbackStatus(ctx context.Context, paymentID string, pay
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
 		var tenantID *string
 		var fromStatus string
-		if err := tx.QueryRow(ctx, `SELECT tenant_id, status FROM payment_execution_states WHERE payment_id = $1`, paymentID).Scan(&tenantID, &fromStatus); err != nil {
+		var hasOpenConflict bool
+		if err := tx.QueryRow(ctx, `SELECT tenant_id, status, has_open_conflict FROM payment_execution_states WHERE payment_id = $1 FOR UPDATE`, paymentID).Scan(&tenantID, &fromStatus, &hasOpenConflict); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 				return domain.ErrPaymentNotFound
 			}
 			return err
+		}
+		if hasOpenConflict {
+			// Conflicting provider/statement evidence is an exception: it must
+			// be resolved through ResolveStatusConflict, never overwritten by a
+			// later poll or legacy callback.
+			var scanErr error
+			p, scanErr = scanState(tx.QueryRow(ctx, `SELECT `+stateColumns+` FROM payment_execution_states WHERE payment_id = $1`, paymentID))
+			if scanErr != nil {
+				return scanErr
+			}
+			return domain.ErrOpenConflictExists
 		}
 
 		// Both recovery branches below run a follow-up query on THIS SAME
@@ -378,6 +390,9 @@ func (s *PgStore) ApplyCallbackStatus(ctx context.Context, paymentID string, pay
 	if errors.Is(err, domain.ErrPaymentNotFound) {
 		return nil, false, domain.ErrPaymentNotFound
 	}
+	if errors.Is(err, domain.ErrOpenConflictExists) {
+		return p, false, domain.ErrOpenConflictExists
+	}
 	if err != nil {
 		s.log.Error("pg ApplyCallbackStatus failed", zap.Error(err))
 		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
@@ -392,7 +407,7 @@ func (s *PgStore) LinkStatement(ctx context.Context, paymentID string, req domai
 	var p *domain.PaymentExecutionState
 	conflict := false
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
-		current, err := scanState(tx.QueryRow(ctx, `SELECT `+stateColumns+` FROM payment_execution_states WHERE payment_id = $1`, paymentID))
+		current, err := scanState(tx.QueryRow(ctx, `SELECT `+stateColumns+` FROM payment_execution_states WHERE payment_id = $1 FOR UPDATE`, paymentID))
 		if err != nil {
 			return err
 		}
@@ -439,10 +454,13 @@ func (s *PgStore) LinkStatement(ctx context.Context, paymentID string, req domai
 }
 
 func (s *PgStore) ResolveConflict(ctx context.Context, paymentID string, req domain.ResolveConflictRequest, principalID, correlationID string) (*domain.PaymentExecutionState, error) {
+	if !domain.ValidResolutionStatus(req.FinalStatus) {
+		return nil, domain.ErrInvalidResolution
+	}
 	var p *domain.PaymentExecutionState
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
 		var fromStatus string
-		if err := tx.QueryRow(ctx, `SELECT status FROM payment_execution_states WHERE payment_id = $1 AND has_open_conflict = TRUE`, paymentID).Scan(&fromStatus); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT status FROM payment_execution_states WHERE payment_id = $1 AND has_open_conflict = TRUE FOR UPDATE`, paymentID).Scan(&fromStatus); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 				return domain.ErrInvalidTransition
 			}
@@ -452,11 +470,14 @@ func (s *PgStore) ResolveConflict(ctx context.Context, paymentID string, req dom
 		p, err = scanState(tx.QueryRow(ctx, `
 			UPDATE payment_execution_states SET status = $2, has_open_conflict = FALSE, conflict_reason = '',
 				finality_source = 'MANUAL_OVERRIDE', updated_at = NOW()
-			WHERE payment_id = $1
+			WHERE payment_id = $1 AND has_open_conflict = TRUE
 			RETURNING `+stateColumns,
 			paymentID, string(req.FinalStatus),
 		))
 		if isRegressionBlocked(err) {
+			return domain.ErrInvalidTransition
+		}
+		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.ErrInvalidTransition
 		}
 		if err != nil {
@@ -588,10 +609,12 @@ func (s *PgStore) ListEvents(ctx context.Context, paymentID string) ([]domain.St
 	return out, nil
 }
 
-func (s *PgStore) ListUnresolved(ctx context.Context) ([]domain.PaymentExecutionState, error) {
+func (s *PgStore) ListUnresolved(ctx context.Context, legalEntityID string) ([]domain.PaymentExecutionState, error) {
 	var out []domain.PaymentExecutionState
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
-		rows, err := tx.Query(ctx, `SELECT `+stateColumns+` FROM payment_execution_states WHERE has_open_conflict = TRUE ORDER BY updated_at ASC`)
+		rows, err := tx.Query(ctx, `SELECT `+stateColumns+` FROM payment_execution_states
+			WHERE has_open_conflict = TRUE AND legal_entity_id = $1::uuid
+			ORDER BY updated_at ASC`, legalEntityID)
 		if err != nil {
 			return err
 		}

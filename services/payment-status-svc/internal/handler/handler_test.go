@@ -9,20 +9,26 @@ import (
 	"testing"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 
 	authzpkg "zoiko.io/payment-status-svc/internal/authz"
 	"zoiko.io/payment-status-svc/internal/domain"
 	"zoiko.io/payment-status-svc/internal/handler"
 	"zoiko.io/payment-status-svc/internal/middleware"
+	"zoiko.io/payment-status-svc/internal/store"
 	"zoiko.io/payment-status-svc/internal/webhook"
 )
 
 // ── stub authz ───────────────────────────────────────────────────────────────
 
-type stubAuthz struct{ deny bool }
+type stubAuthz struct {
+	deny    bool
+	actions []string
+}
 
-func (a *stubAuthz) CheckAllowed(_ context.Context, _, _, _ string) error {
+func (a *stubAuthz) CheckAllowed(_ context.Context, _, _, actionType string) error {
+	a.actions = append(a.actions, actionType)
 	if a.deny {
 		return authzpkg.ErrAuthorizationDenied
 	}
@@ -41,6 +47,30 @@ func newTestRouter(st *stubStore, az *stubAuthz) chi.Router {
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h, middleware.TenantContext())
 	return r
+}
+
+func newTestRouterWithCallbacks(st *stubStore, az *stubAuthz, receipts store.CallbackStore) chi.Router {
+	h := handler.New(st, az, testSecret, zap.NewNop()).WithCallbacks(nil, receipts)
+	r := chi.NewRouter()
+	handler.RegisterRoutes(r, h, middleware.TenantContext())
+	return r
+}
+
+// stubReceipts records what ListCallbackReceipts asked for.
+type stubReceipts struct {
+	entity  string
+	payment string
+	calls   int
+}
+
+func (s *stubReceipts) ApplyProviderCallback(context.Context, store.CallbackInput) (*store.CallbackResult, error) {
+	return nil, nil
+}
+
+func (s *stubReceipts) ListReceipts(_ context.Context, entity string, _ bool, paymentID string, _ int) ([]store.Receipt, error) {
+	s.entity, s.payment = entity, paymentID
+	s.calls++
+	return nil, nil
 }
 
 func doRequest(r http.Handler, method, path string, body interface{}, tenantID string) *httptest.ResponseRecorder {
@@ -177,6 +207,42 @@ func TestProcessProviderCallback_RegressionBlocked(t *testing.T) {
 	}
 }
 
+// A legacy provider callback and a manual poll share ApplyCallbackStatus; an
+// open conflict must block both, because neither may overwrite evidence that
+// only ResolveStatusConflict can decide.
+func TestProcessProviderCallback_OpenConflictIsRefused(t *testing.T) {
+	st := newStubStore()
+	r := newTestRouter(st, &stubAuthz{})
+	p := recordPayment(t, r)
+	st.payments[p.PaymentID].HasOpenConflict = true
+
+	w := postWebhook(r, domain.ProviderCallbackPayload{
+		PaymentID: p.PaymentID, ProviderEventRef: "evt-conflicted", ReportedStatus: domain.StatusSettled,
+	}, testSecret)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409 while a conflict is open, got %d: %s", w.Code, w.Body.String())
+	}
+	if p.Status != domain.StatusPrepared {
+		t.Fatalf("a blocked callback must not change the payment, got %s", p.Status)
+	}
+}
+
+func TestPollPaymentStatus_OpenConflictIsRefused(t *testing.T) {
+	st := newStubStore()
+	r := newTestRouter(st, &stubAuthz{})
+	p := recordPayment(t, r)
+	st.payments[p.PaymentID].HasOpenConflict = true
+
+	w := doRequestAs(r, http.MethodPost, "/bnk07/payments/"+p.PaymentID+"/poll",
+		domain.ProviderCallbackPayload{ReportedStatus: domain.StatusAccepted}, testTenant, "principal-reviewer")
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409 while a conflict is open, got %d: %s", w.Code, w.Body.String())
+	}
+	if p.Status != domain.StatusPrepared {
+		t.Fatalf("a blocked poll must not change the payment, got %s", p.Status)
+	}
+}
+
 // TestLinkStatementConfirmation_Conflict is negative-path #4.
 func TestLinkStatementConfirmation_Conflict(t *testing.T) {
 	r := newTestRouter(newStubStore(), &stubAuthz{})
@@ -284,6 +350,39 @@ func TestPollPaymentStatus_SamePrincipalAsCreator_IntermediateStatus_Allowed(t *
 	}
 }
 
+// TestPollPaymentStatus_UsesFinalityPermissionForFinalStatus proves the
+// permission boundary: a progress report needs payment.status.ingest, but a
+// poll that asserts SETTLED/REJECTED needs payment.finality.confirm.
+func TestPollPaymentStatus_UsesFinalityPermissionForFinalStatus(t *testing.T) {
+	az := &stubAuthz{}
+	r := newTestRouter(newStubStore(), az)
+	p := recordPayment(t, r)
+
+	az.actions = nil
+	if w := doRequestAs(r, http.MethodPost, "/bnk07/payments/"+p.PaymentID+"/poll",
+		domain.ProviderCallbackPayload{ReportedStatus: domain.StatusAccepted}, testTenant, "principal-reviewer"); w.Code != http.StatusOK {
+		t.Fatalf("accepted: %d %s", w.Code, w.Body.String())
+	}
+	if len(az.actions) != 1 || az.actions[0] != handler.PaymentStatusIngest {
+		t.Fatalf("intermediate poll expected PAYMENT_STATUS_INGEST, got %v", az.actions)
+	}
+
+	az.actions = nil
+	if w := doRequestAs(r, http.MethodPost, "/bnk07/payments/"+p.PaymentID+"/poll",
+		domain.ProviderCallbackPayload{ReportedStatus: domain.StatusSettled}, testTenant, "principal-reviewer"); w.Code != http.StatusOK {
+		t.Fatalf("settled: %d %s", w.Code, w.Body.String())
+	}
+	if len(az.actions) != 1 || az.actions[0] != handler.PaymentFinalityConfirm {
+		t.Fatalf("final poll expected PAYMENT_FINALITY_CONFIRM, got %v", az.actions)
+	}
+
+	az.deny = true
+	if w := doRequestAs(r, http.MethodPost, "/bnk07/payments/"+p.PaymentID+"/poll",
+		domain.ProviderCallbackPayload{ReportedStatus: domain.StatusRejected}, testTenant, "principal-reviewer"); w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 when finality permission is denied, got %d", w.Code)
+	}
+}
+
 // TestPollPaymentStatus_DifferentPrincipal_AssertingSettled_Succeeds is
 // the positive control.
 func TestPollPaymentStatus_DifferentPrincipal_AssertingSettled_Succeeds(t *testing.T) {
@@ -361,5 +460,160 @@ func TestGetPaymentStatus_NotFound(t *testing.T) {
 	w := doRequest(r, http.MethodGet, "/bnk07/payments/does-not-exist", nil, testTenant)
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("expected 404, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// ── read authorization ──────────────────────────────────────────────────────
+
+func TestReadEndpointsRequireAPrincipal(t *testing.T) {
+	r := newTestRouter(newStubStore(), &stubAuthz{})
+	p := recordPayment(t, r)
+	for _, path := range []string{
+		"/bnk07/payments/" + p.PaymentID,
+		"/bnk07/payments/" + p.PaymentID + "/history",
+		"/bnk07/payments/" + p.PaymentID + "/finality-evidence",
+		"/bnk07/payments/" + p.PaymentID + "/provider-reference",
+	} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("X-Tenant-Id", testTenant)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusUnauthorized {
+			t.Errorf("%s: expected 401 without a principal, got %d", path, w.Code)
+		}
+	}
+}
+
+func TestReadEndpointsRequirePaymentStatusRead(t *testing.T) {
+	az := &stubAuthz{}
+	r := newTestRouter(newStubStore(), az)
+	p := recordPayment(t, r)
+
+	for _, path := range []string{
+		"/bnk07/payments/" + p.PaymentID,
+		"/bnk07/payments/" + p.PaymentID + "/history",
+		"/bnk07/payments/" + p.PaymentID + "/finality-evidence",
+		"/bnk07/payments/" + p.PaymentID + "/provider-reference",
+	} {
+		az.actions = nil
+		if w := doRequest(r, http.MethodGet, path, nil, testTenant); w.Code != http.StatusOK {
+			t.Fatalf("%s: expected 200, got %d: %s", path, w.Code, w.Body.String())
+		}
+		if len(az.actions) != 1 || az.actions[0] != handler.PaymentStatusRead {
+			t.Errorf("%s: expected PAYMENT_STATUS_READ, got %v", path, az.actions)
+		}
+	}
+
+	az.deny = true
+	for _, path := range []string{
+		"/bnk07/payments/" + p.PaymentID,
+		"/bnk07/payments/" + p.PaymentID + "/history",
+		"/bnk07/payments/" + p.PaymentID + "/finality-evidence",
+		"/bnk07/payments/" + p.PaymentID + "/provider-reference",
+	} {
+		if w := doRequest(r, http.MethodGet, path, nil, testTenant); w.Code != http.StatusForbidden {
+			t.Errorf("%s: expected 403 when denied, got %d", path, w.Code)
+		}
+	}
+}
+
+func TestListUnresolvedPaymentsIsEntityScopedAndAuthorized(t *testing.T) {
+	az := &stubAuthz{}
+	r := newTestRouter(newStubStore(), az)
+	entityA, entityB := uuid.NewString(), uuid.NewString()
+	mk := func(entity string) *domain.PaymentExecutionState {
+		w := doRequest(r, http.MethodPost, "/bnk07/payments/", domain.RecordPaymentStatusRequest{
+			LegalEntityID: entity, ProviderRequestID: "prv-" + uuid.NewString(), SourceReference: "src-" + uuid.NewString(),
+		}, testTenant)
+		if w.Code != http.StatusCreated {
+			t.Fatalf("record: %d %s", w.Code, w.Body.String())
+		}
+		var p domain.PaymentExecutionState
+		_ = json.Unmarshal(w.Body.Bytes(), &p)
+		return &p
+	}
+	a, b := mk(entityA), mk(entityB)
+	for _, p := range []*domain.PaymentExecutionState{a, b} {
+		w := doRequest(r, http.MethodPost, "/bnk07/payments/"+p.PaymentID+"/link-statement",
+			domain.LinkStatementRequest{StatementReference: "stmt-" + uuid.NewString(), ReportedStatus: domain.StatusPending}, testTenant)
+		if w.Code != http.StatusOK {
+			t.Fatalf("link conflict: %d %s", w.Code, w.Body.String())
+		}
+	}
+
+	if w := doRequest(r, http.MethodGet, "/bnk07/payments/unresolved", nil, testTenant); w.Code != http.StatusBadRequest {
+		t.Errorf("no legal_entity_id: expected 400, got %d", w.Code)
+	}
+	if w := doRequest(r, http.MethodGet, "/bnk07/payments/unresolved?legal_entity_id=not-a-uuid", nil, testTenant); w.Code != http.StatusBadRequest {
+		t.Errorf("invalid legal_entity_id: expected 400, got %d", w.Code)
+	}
+	if w := doRequest(r, http.MethodGet, "/bnk07/payments/unresolved?legal_entity_id="+entityA, nil, testTenant); w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var list struct {
+		Data  []domain.PaymentExecutionState `json:"data"`
+		Count int                            `json:"count"`
+	}
+	_ = json.Unmarshal(doRequest(r, http.MethodGet, "/bnk07/payments/unresolved?legal_entity_id="+entityA, nil, testTenant).Body.Bytes(), &list)
+	if list.Count != 1 || len(list.Data) != 1 || list.Data[0].PaymentID != a.PaymentID {
+		t.Fatalf("expected only entity A's conflict, got %+v", list)
+	}
+	if az.actions[len(az.actions)-1] != handler.PaymentStatusRead {
+		t.Fatalf("expected PAYMENT_STATUS_READ, got %s", az.actions[len(az.actions)-1])
+	}
+	az.deny = true
+	if w := doRequest(r, http.MethodGet, "/bnk07/payments/unresolved?legal_entity_id="+entityA, nil, testTenant); w.Code != http.StatusForbidden {
+		t.Errorf("expected 403 when denied, got %d", w.Code)
+	}
+}
+
+func TestResolveStatusConflictRejectsANonFinalStatus(t *testing.T) {
+	r := newTestRouter(newStubStore(), &stubAuthz{})
+	p := recordPayment(t, r)
+	doRequest(r, http.MethodPost, "/bnk07/payments/"+p.PaymentID+"/link-statement",
+		domain.LinkStatementRequest{StatementReference: "stmt-invalid-resolution", ReportedStatus: domain.StatusPending}, testTenant)
+
+	for _, final := range []domain.ExecutionStatus{domain.StatusAccepted, domain.StatusPending, domain.StatusPrepared, domain.StatusReturned, ""} {
+		w := doRequestAs(r, http.MethodPost, "/bnk07/payments/"+p.PaymentID+"/resolve-conflict",
+			domain.ResolveConflictRequest{FinalStatus: final, Reason: "not a resolution status"}, testTenant, "principal-reviewer")
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("%q: expected 400, got %d: %s", final, w.Code, w.Body.String())
+		}
+	}
+}
+
+func TestProcessProviderCallbackWithoutAConfiguredSecretFailsClosed(t *testing.T) {
+	h := handler.New(newStubStore(), &stubAuthz{}, "", zap.NewNop())
+	r := chi.NewRouter()
+	handler.RegisterRoutes(r, h, middleware.TenantContext())
+
+	w := postWebhook(r, domain.ProviderCallbackPayload{
+		PaymentID: uuid.NewString(), ProviderEventRef: "evt-unsigned", ReportedStatus: domain.StatusSettled,
+	}, "")
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 when no secret is configured, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestListCallbackReceiptsValidatesUUIDFilters(t *testing.T) {
+	receipts := &stubReceipts{}
+	r := newTestRouterWithCallbacks(newStubStore(), &stubAuthz{}, receipts)
+	for _, path := range []string{
+		"/bnk07/callback-receipts?legal_entity_id=not-a-uuid",
+		"/bnk07/callback-receipts?legal_entity_id=" + uuid.NewString() + "&payment_id=not-a-uuid",
+	} {
+		if w := doRequest(r, http.MethodGet, path, nil, testTenant); w.Code != http.StatusBadRequest {
+			t.Errorf("%s: expected 400, got %d: %s", path, w.Code, w.Body.String())
+		}
+	}
+	if receipts.calls != 0 {
+		t.Fatalf("invalid filters must never reach the store")
+	}
+	entity := uuid.NewString()
+	if w := doRequest(r, http.MethodGet, "/bnk07/callback-receipts?legal_entity_id="+entity, nil, testTenant); w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if receipts.calls != 1 || receipts.entity != entity {
+		t.Fatalf("expected one scoped list call, got %+v", receipts)
 	}
 }
