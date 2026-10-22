@@ -24,46 +24,46 @@ type EventHandler interface {
 
 // EntityCreatedEvent represents the entity.created event.
 type EntityCreatedEvent struct {
-	EventID       string `json:"event_id"`
-	EventType     string `json:"event_type"`
-	EventVersion  string `json:"event_version"`
-	EmittedAt     string `json:"emitted_at"`
-	SchemaVersion string `json:"schema_version"`
-	SourceService string `json:"source_service"`
-	TenantID      string `json:"tenant_id"`
-	LegalEntityID string `json:"legal_entity_id"`
-	ActorID       string `json:"actor_id"`
-	CorrelationID string `json:"correlation_id"`
+	EventID       string          `json:"event_id"`
+	EventType     string          `json:"event_type"`
+	EventVersion  string          `json:"event_version"`
+	EmittedAt     string          `json:"emitted_at"`
+	SchemaVersion string          `json:"schema_version"`
+	SourceService string          `json:"source_service"`
+	TenantID      string          `json:"tenant_id"`
+	LegalEntityID string          `json:"legal_entity_id"`
+	ActorID       string          `json:"actor_id"`
+	CorrelationID string          `json:"correlation_id"`
 	Payload       json.RawMessage `json:"payload"`
 }
 
 // RoleUpdatedEvent represents the role.updated event.
 type RoleUpdatedEvent struct {
-	EventID       string `json:"event_id"`
-	EventType     string `json:"event_type"`
-	EventVersion  string `json:"event_version"`
-	EmittedAt     string `json:"emitted_at"`
-	SchemaVersion string `json:"schema_version"`
-	SourceService string `json:"source_service"`
-	TenantID      string `json:"tenant_id"`
-	LegalEntityID string `json:"legal_entity_id"`
-	ActorID       string `json:"actor_id"`
-	CorrelationID string `json:"correlation_id"`
+	EventID       string          `json:"event_id"`
+	EventType     string          `json:"event_type"`
+	EventVersion  string          `json:"event_version"`
+	EmittedAt     string          `json:"emitted_at"`
+	SchemaVersion string          `json:"schema_version"`
+	SourceService string          `json:"source_service"`
+	TenantID      string          `json:"tenant_id"`
+	LegalEntityID string          `json:"legal_entity_id"`
+	ActorID       string          `json:"actor_id"`
+	CorrelationID string          `json:"correlation_id"`
 	Payload       json.RawMessage `json:"payload"`
 }
 
 // AuthorityDelegatedEvent represents the authority.delegated event.
 type AuthorityDelegatedEvent struct {
-	EventID       string `json:"event_id"`
-	EventType     string `json:"event_type"`
-	EventVersion  string `json:"event_version"`
-	EmittedAt     string `json:"emitted_at"`
-	SchemaVersion string `json:"schema_version"`
-	SourceService string `json:"source_service"`
-	TenantID      string `json:"tenant_id"`
-	LegalEntityID string `json:"legal_entity_id"`
-	ActorID       string `json:"actor_id"`
-	CorrelationID string `json:"correlation_id"`
+	EventID       string          `json:"event_id"`
+	EventType     string          `json:"event_type"`
+	EventVersion  string          `json:"event_version"`
+	EmittedAt     string          `json:"emitted_at"`
+	SchemaVersion string          `json:"schema_version"`
+	SourceService string          `json:"source_service"`
+	TenantID      string          `json:"tenant_id"`
+	LegalEntityID string          `json:"legal_entity_id"`
+	ActorID       string          `json:"actor_id"`
+	CorrelationID string          `json:"correlation_id"`
 	Payload       json.RawMessage `json:"payload"`
 }
 
@@ -95,11 +95,11 @@ type topicReader struct {
 
 // Consumer is the Kafka consumer for policy-relevant events.
 type Consumer struct {
-	readers  []*topicReader
-	handler  EventHandler
-	log      *zap.Logger
-	stopCh   chan struct{}
-	doneCh   chan struct{}
+	readers []*topicReader
+	handler EventHandler
+	log     *zap.Logger
+	stopCh  chan struct{}
+	doneCh  chan struct{}
 }
 
 // NewConsumer constructs a new event consumer.
@@ -114,8 +114,14 @@ func NewConsumer(cfg ConsumerConfig, handler EventHandler, log *zap.Logger) *Con
 			MaxBytes:       cfg.MaxBytes,
 			CommitInterval: 5 * time.Second,
 			StartOffset:    kafka.LastOffset,
-			Logger:         kafka.LoggerFunc(func(s string, args ...interface{}) { log.Debug("kafka consumer", zap.String("msg", s), zap.String("topic", topic)) }),
-			ErrorLogger:    kafka.LoggerFunc(func(s string, args ...interface{}) { log.Error("kafka consumer error", zap.String("msg", s), zap.String("topic", topic)) }),
+			// kafka-go passes a format string and its arguments; logging only
+			// the format printed "%v" in place of every error.
+			Logger: kafka.LoggerFunc(func(s string, args ...interface{}) {
+				log.Debug("kafka consumer", zap.String("detail", fmt.Sprintf(s, args...)), zap.String("topic", topic))
+			}),
+			ErrorLogger: kafka.LoggerFunc(func(s string, args ...interface{}) {
+				log.Error("kafka consumer error", zap.String("detail", fmt.Sprintf(s, args...)), zap.String("topic", topic))
+			}),
 		})
 		readers[i] = &topicReader{topic: topic, reader: reader}
 	}

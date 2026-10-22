@@ -87,7 +87,7 @@ func TestClientIdentity_MutualTLS_AndRevokedServerRefused(t *testing.T) {
 		t.Fatal(err)
 	}
 	ledger, _ := OpenLedger(t.TempDir())
-	issued, err := c.IssueLeaf("127.0.0.1", nil, time.Hour)
+	issued, err := c.IssueLeaf("127.0.0.1", nil, nil, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}

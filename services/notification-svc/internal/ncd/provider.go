@@ -28,6 +28,11 @@ type ProviderEvent struct {
 	ProviderMessageID string    `json:"provider_message_id,omitempty"`
 	OccurredAt        time.Time `json:"occurred_at"`
 	Detail            string    `json:"detail,omitempty"`
+	// AttachmentHashes is the provider's post-upload manifest, keyed by slot.
+	// nil means the adapter did not report attachments; a non-nil empty map
+	// means it reported none. When present it must match the pinned manifest
+	// exactly (NP-34).
+	AttachmentHashes map[string]string `json:"attachment_hashes,omitempty"`
 	// Corrects names an earlier provider event this one corrects (NP-59).
 	Corrects string `json:"corrects_event_id,omitempty"`
 }
@@ -148,12 +153,40 @@ func (s *Service) ingestProviderEvents(ctx context.Context, b *Binding, evs []Pr
 			if !ok {
 				return Invalid("unknown_event_type", "event_type %q is not a normalized provider event", ev.EventType)
 			}
-			if ev.Detail != "" && (norm.AttemptState == AttemptFailed || norm.AttemptState == AttemptBounced) {
-				att.FailureReason = norm.NormalizedState + ": " + ev.Detail
-			}
 			observed := ev.OccurredAt
 			if observed.IsZero() {
 				observed = s.now()
+			}
+			// NP-34: a provider that reports post-upload attachment hashes must
+			// match the pinned DRC manifest exactly. A mismatch is evidence and
+			// an incident, never a delivery claim.
+			if ev.AttachmentHashes != nil {
+				mismatch, detail, err := pinnedAttachmentMismatch(tx, att, ev.AttachmentHashes)
+				if err != nil {
+					return err
+				}
+				if mismatch {
+					c, err := tx.GetCommunication(att.CommunicationID, true)
+					if err != nil {
+						return err
+					}
+					if _, err := tx.InsertException(&Exception{ExceptionID: uuid.NewString(), TenantID: tx.TenantID(),
+						CommunicationID: c.CommunicationID, AttemptID: att.AttemptID, Kind: "ATTACHMENT_HASH_MISMATCH",
+						ReasonCode: NCD016EvidenceInsufficient, Detail: detail, CreatedAt: s.now()}); err != nil {
+						return err
+					}
+					return s.recordEvidence(tx, s.workerActor(ref.TenantID, ev.EventID), c, &Evidence{
+						AttemptID: att.AttemptID, EvidenceType: "ATTACHMENT_MISMATCH", NormalizedState: "QUARANTINED",
+						Source: "PROVIDER_CALLBACK", Confidence: "HIGH",
+						DoesNotProve: "that the provider delivered the pinned attachment package",
+						BindingID:    b.BindingID, ProviderEventID: ev.EventID,
+						PayloadHash: SHA256Hex("callback", string(raw)), ObservedAt: observed,
+						Details: map[string]any{"detail": detail, "attachment_hashes": ev.AttachmentHashes},
+					})
+				}
+			}
+			if ev.Detail != "" && (norm.AttemptState == AttemptFailed || norm.AttemptState == AttemptBounced) {
+				att.FailureReason = norm.NormalizedState + ": " + ev.Detail
 			}
 			details := map[string]any{"detail": ev.Detail}
 			if ev.Corrects != "" {

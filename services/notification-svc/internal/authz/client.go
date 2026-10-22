@@ -23,6 +23,7 @@ import (
 
 	"github.com/go-chi/chi/v5/middleware"
 	"go.uber.org/zap"
+	idenv "zoiko.io/identity-envelope"
 
 	"zoiko.io/notification-svc/internal/domain"
 	svcenvelope "zoiko.io/notification-svc/internal/envelope"
@@ -236,6 +237,12 @@ func (c *Client) checkAllowedLive(ctx context.Context, principalID, legalEntityI
 	// several actions, and each is a separate decision to record — a key of the
 	// request alone would make the second look like a replay of the first.
 	req.Header.Set("Idempotency-Key", requestID+":"+actionType)
+
+	// Forward the caller's canonical envelope for downstream traceability
+	svcenvelope.ForwardTo(ctx, req)
+	// The verified identity envelope too, so the next hop can check who
+	// is asking instead of trusting X-Principal-Id (X-R3).
+	idenv.Forward(ctx, req)
 
 	resp, err := c.client.Do(req)
 	if err != nil {

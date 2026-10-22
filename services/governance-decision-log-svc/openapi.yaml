@@ -11,9 +11,20 @@ info:
     (ZS-ARCH-SVC-001 v2.0 §4). Writes (POST) are refused with 400
     `envelope_incomplete` unless all of these are present: `X-Tenant-Id`,
     `X-Principal-Id` (or `X-Workload-Id`), `X-Request-Id`, `X-Correlation-ID`,
-    `X-Source-Channel`, `Idempotency-Key`, `X-Legal-Entity-Id`,
-    `X-Purpose-Context` (plus `X-Source-System` when the channel is `import` or
-    `integration`). Every error, envelope refusals included, is RFC 9457
+    `X-Source-Channel`, `Idempotency-Key`, `X-Legal-Entity-Id` (plus
+    `X-Source-System` when the channel is `import` or `integration`). Reads
+    must carry `X-Purpose-Context`, the reason for access; an evidence append
+    is not access and needs none (decision D-06, 21 Oct 2026). Under the
+    default `write-strict` enforcement a read without it is admitted and marked
+    `X-Envelope-Contract: violated`; `strict` refuses it.
+
+    **Identity.** identity-context-svc's signed envelope (Authorization:
+    Bearer), verified against its JWKS and session status, replaces
+    `X-Principal-Id` / `X-Tenant-Id`; a service may call over verified mTLS as a
+    registered peer workload (`IDENTITY_VERIFY`: require outside local). Replay
+    forwards the verified envelope to policy-svc.
+
+    **Errors.** Every error, envelope refusals included, is RFC 9457
     `application/problem+json` with a GCP §16-style class in `type`
     (`ENVELOPE_INCOMPLETE` / `UNAUTHORIZED` for a refusal, which also keeps the
     platform's `error`, `service` and `violations` members).

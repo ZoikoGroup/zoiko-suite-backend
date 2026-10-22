@@ -1,0 +1,15 @@
+# Used by BuildKit for builds with -f services/obligations-svc/Dockerfile.
+# The context is the repository root (see the Dockerfile), so everything is
+# excluded except the two modules the image is built from.
+*
+!services/obligations-svc/
+!services/identity-envelope/
+
+# Not needed inside the image.
+services/obligations-svc/.gotmp/
+services/obligations-svc/server
+services/obligations-svc/healthcheck
+services/obligations-svc/**/*.exe
+services/obligations-svc/**/*_test.go
+services/obligations-svc/deployments/
+services/identity-envelope/**/*_test.go

@@ -9,6 +9,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
+	authzpkg "zoiko.io/evidence-manifest-svc/internal/authz"
 	"zoiko.io/evidence-manifest-svc/internal/domain"
 )
 
@@ -101,21 +102,48 @@ func (h *Handler) ListAuditPopulations(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	engagementID := chi.URLParam(r, "engagement_id")
-	// No single legal_entity_id is known before the query; the store
-	// scopes by tenant+engagement, and each returned population's own
-	// legal_entity_id was already set at DefinePopulation authz time — a
-	// list read is therefore checked against the caller's tenant-wide
-	// read grant rather than per-row, mirroring GetManifest's own posture
-	// of authorizing after the tenant-scoped fetch.
 	pops, err := h.store.ListAuditPopulationsByEngagement(r.Context(), "", engagementID)
 	if err != nil {
 		h.writePopulationErr(w, err)
 		return
 	}
-	if len(pops) > 0 && !h.authorize(w, r, principalID, pops[0].LegalEntityID, AuditPopulationRead) {
+
+	// An engagement can span legal entities, and AUDIT_POPULATION_READ is
+	// granted per legal entity — so every distinct legal entity in the result
+	// is authorized on its own and a population is returned only when ITS
+	// entity is. (This previously authorized pops[0] alone and returned all.)
+	// authorization-svc being unreachable fails the whole request closed. If
+	// populations exist but none is readable the answer is 403, as it is for
+	// GET on a single population; if only some are, the rest are omitted
+	// rather than named. An empty result discloses nothing and has no entity
+	// to authorize against, so it is returned as is.
+	allowed := map[string]bool{}
+	visible := make([]*domain.AuditPopulation, 0, len(pops))
+	for _, pop := range pops {
+		ok, seen := allowed[pop.LegalEntityID]
+		if !seen {
+			err := h.authz.CheckAllowed(r.Context(), principalID, pop.LegalEntityID, AuditPopulationRead)
+			switch {
+			case err == nil:
+				ok = true
+			case errors.Is(err, authzpkg.ErrAuthorizationDenied):
+				ok = false
+			default:
+				h.log.Error("authorization check failed", zap.Error(err))
+				writeError(w, http.StatusServiceUnavailable, "authorization_unavailable", "")
+				return
+			}
+			allowed[pop.LegalEntityID] = ok
+		}
+		if ok {
+			visible = append(visible, pop)
+		}
+	}
+	if len(pops) > 0 && len(visible) == 0 {
+		writeError(w, http.StatusForbidden, "not_authorized", "")
 		return
 	}
-	writeJSON(w, http.StatusOK, pops)
+	writeJSON(w, http.StatusOK, visible)
 }
 
 type buildPopulationRequest struct {
@@ -133,6 +161,7 @@ func (h *Handler) BuildPopulation(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	principalID, _ := h.requirePrincipal(w, r) // already verified by the access check above
 	correlationID := r.Header.Get("X-Correlation-ID")
 	if correlationID == "" {
 		writeError(w, http.StatusBadRequest, "missing_correlation_id", "")
@@ -147,7 +176,7 @@ func (h *Handler) BuildPopulation(w http.ResponseWriter, r *http.Request) {
 	for i, rr := range req.Rows {
 		rows[i] = domain.BuildPopulationRow{SourceRecordID: rr.SourceRecordID, Amount: rr.Amount, RowSnapshot: rr.RowSnapshot}
 	}
-	updated, _, err := h.store.BuildPopulation(r.Context(), domain.BuildPopulationParams{PopulationID: pop.PopulationID, TenantID: "", CorrelationID: correlationID, Rows: rows})
+	updated, _, err := h.store.BuildPopulation(r.Context(), domain.BuildPopulationParams{PopulationID: pop.PopulationID, TenantID: "", CorrelationID: correlationID, ActorPrincipalID: principalID, Rows: rows})
 	if err != nil {
 		h.writePopulationErr(w, err)
 		return
@@ -190,12 +219,13 @@ func (h *Handler) FreezePopulation(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	principalID, _ := h.requirePrincipal(w, r) // already verified by the access check above
 	correlationID := r.Header.Get("X-Correlation-ID")
 	if correlationID == "" {
 		writeError(w, http.StatusBadRequest, "missing_correlation_id", "")
 		return
 	}
-	updated, _, err := h.store.FreezePopulation(r.Context(), domain.FreezePopulationParams{PopulationID: pop.PopulationID, TenantID: "", CorrelationID: correlationID})
+	updated, _, err := h.store.FreezePopulation(r.Context(), domain.FreezePopulationParams{PopulationID: pop.PopulationID, TenantID: "", CorrelationID: correlationID, ActorPrincipalID: principalID})
 	if err != nil {
 		if errors.Is(err, domain.ErrPopulationControlTotalMismatch) {
 			writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": "control_total_mismatch", "population": updated})
@@ -216,6 +246,7 @@ func (h *Handler) SupersedePopulation(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	principalID, _ := h.requirePrincipal(w, r) // already verified by the access check above
 	correlationID := r.Header.Get("X-Correlation-ID")
 	if correlationID == "" {
 		writeError(w, http.StatusBadRequest, "missing_correlation_id", "")
@@ -223,7 +254,7 @@ func (h *Handler) SupersedePopulation(w http.ResponseWriter, r *http.Request) {
 	}
 	var req supersedePopulationRequest
 	_ = json.NewDecoder(r.Body).Decode(&req)
-	updated, _, err := h.store.SupersedePopulation(r.Context(), domain.SupersedePopulationParams{PopulationID: pop.PopulationID, TenantID: "", Reason: req.Reason, CorrelationID: correlationID})
+	updated, _, err := h.store.SupersedePopulation(r.Context(), domain.SupersedePopulationParams{PopulationID: pop.PopulationID, TenantID: "", Reason: req.Reason, CorrelationID: correlationID, ActorPrincipalID: principalID})
 	if err != nil {
 		h.writePopulationErr(w, err)
 		return

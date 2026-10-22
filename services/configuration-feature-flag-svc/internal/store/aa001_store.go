@@ -824,9 +824,26 @@ func (s *PgStore) PublishDefinition(ctx context.Context, params domain.PublishDe
 	default:
 		return nil, domain.ErrValueConstraintFailed
 	}
+	// The enqueue below writes an outbox row and the policy admits a
+	// request-path row only for the session tenant — or for a named
+	// background escape, and publish is neither the relay nor the sweep.
+	// Without the caller's tenant the INSERT was refused (42501), and because
+	// the enqueue shares the publish's transaction the whole publish failed
+	// with a 503 that named nothing. Refused explicitly, same doctrine as
+	// every other write: a row owned by nobody is refused rather than
+	// defaulted.
+	if strings.TrimSpace(params.CallerTenantID) == "" {
+		return nil, domain.ErrCallerTenantMissing
+	}
 
 	var out *domain.ConfigDefinitionVersion
 	err := s.withDefinitionAdmin(ctx, func(tx pgx.Tx) error {
+		// Name the caller's tenant for the transaction: the definition
+		// tables' policies key on definition_admin, so this only widens what
+		// the outbox INSERT is allowed to do.
+		if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", params.CallerTenantID); err != nil {
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
 		working, err := scanDefinition(tx.QueryRow(ctx, `
 			SELECT `+definitionColumns+`
 			FROM config_definitions
@@ -894,9 +911,10 @@ func (s *PgStore) PublishDefinition(ctx context.Context, params domain.PublishDe
 
 		// config.version.published is enqueued in the same transaction that
 		// produced the version: a resolver that misses it would keep reading
-		// the previous invention forever.
+		// the previous invention forever. Owned by the CALLER's tenant, the
+		// same as every request-path event.
 		outEv, evErr := events.VersionPublished(*v, working.Key, params.ActorPrincipalID, params.CorrelationID)
-		if err := enqueueEvent(ctx, tx, "", outEv, evErr); err != nil {
+		if err := enqueueEvent(ctx, tx, params.CallerTenantID, outEv, evErr); err != nil {
 			return err
 		}
 		out = v

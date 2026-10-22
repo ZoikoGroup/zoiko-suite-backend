@@ -101,12 +101,21 @@ func main() {
 
 	// Kafka is not a fail-fast dependency: control state is durable in Postgres
 	// and events are relayed from the outbox whenever the broker is reachable.
+	//
+	// RequiredAcks is explicit: kafka-go defaults to RequireNone
+	// (fire-and-forget), under which WriteMessages returns success before any
+	// broker has durably stored the record. The relay then marks the row
+	// published and never retries — a lost broker write becomes a silently
+	// lost event, exactly what the transactional outbox exists to prevent
+	// (ZS-EVENT-001 §6-7; tracker item 106, which found this unset across the
+	// whole estate except services/eventing's adopters).
 	kafkaWriter := &kafka.Writer{
 		Addr:                   kafka.TCP(cfg.Kafka.Brokers...),
 		Topic:                  cfg.Kafka.Topic,
 		Balancer:               &kafka.LeastBytes{},
 		AllowAutoTopicCreation: true,
 		BatchTimeout:           10 * time.Millisecond,
+		RequiredAcks:           kafka.RequireAll,
 	}
 	defer func() { _ = kafkaWriter.Close() }()
 
@@ -114,6 +123,13 @@ func main() {
 	relayCtx, stopRelay := context.WithCancel(context.Background())
 	defer stopRelay()
 	go outbox.NewRelay(pool, publisher, 0, 0, log).Start(relayCtx)
+
+	endpoints, err := source.ParseEndpoints(cfg.SourceEndpoints)
+	if err != nil {
+		log.Fatal("invalid SOURCE_ENDPOINTS", zap.Error(err))
+	}
+	log.Info("control source systems registered", zap.Int("count", len(endpoints)))
+	fetcher := source.NewHTTPFetcher(endpoints, nil)
 
 	// Housekeeping: expire runs nobody executed and announce SLA breaches, once each.
 	go func() {
@@ -130,6 +146,30 @@ func main() {
 				} else if res.ExpiredRuns+res.SLABreaches+res.Errors > 0 {
 					log.Info("housekeeping sweep", zap.Int("expired_runs", res.ExpiredRuns),
 						zap.Int("sla_breaches", res.SLABreaches), zap.Int("errors", res.Errors))
+				}
+			}
+		}
+	}()
+
+	// Late data after certification (Invariant 14, SPEC_DEVIATIONS A7): re-read the
+	// source watermark of each latest certified run, at most every 30 minutes, and
+	// open a LATE_DATA exception where it has moved. A loop of its own, like the
+	// housekeeping one above, so slow sources cannot delay run expiry or SLA events.
+	lateData := engine.NewLateDataSweeper(pgStore, fetcher, log, 30*time.Minute)
+	go func() {
+		t := time.NewTicker(10 * time.Minute)
+		defer t.Stop()
+		for {
+			select {
+			case <-relayCtx.Done():
+				return
+			case <-t.C:
+				res, err := lateData.Sweep(relayCtx, 100)
+				if err != nil {
+					log.Warn("late-data sweep failed", zap.Error(err))
+				} else if res.Moved+res.Unverified+res.Errors > 0 {
+					log.Info("late-data sweep", zap.Int("runs", res.Runs), zap.Int("moved", res.Moved),
+						zap.Int("opened", res.Opened), zap.Int("unverified", res.Unverified), zap.Int("errors", res.Errors))
 				}
 			}
 		}
@@ -157,12 +197,7 @@ func main() {
 	r.Use(middleware.Logger)
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
-	endpoints, err := source.ParseEndpoints(cfg.SourceEndpoints)
-	if err != nil {
-		log.Fatal("invalid SOURCE_ENDPOINTS", zap.Error(err))
-	}
-	log.Info("control source systems registered", zap.Int("count", len(endpoints)))
-	executor := engine.New(pgStore, source.NewHTTPFetcher(endpoints, nil), log)
+	executor := engine.New(pgStore, fetcher, log)
 
 	handler.RegisterRoutes(r, handler.New(pgStore, authzClient, executor, log))
 

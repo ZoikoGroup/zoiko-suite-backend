@@ -17,10 +17,13 @@
 4. **Transfer Impact Assessments (§16.1, §17):** Records append-only TIA/DPIA evaluation evidence with reviewer identity, residual risk, review triggers (`review_trigger_at`), and structured assessment measures (`government_access_risk`, `technical_measures`, `organizational_measures`).
 5. **Runtime Transfer Evaluation (§16.1, §17.2):** Evaluates proposed personal data transfers, enforcing fail-closed doctrine:
    - Processor relationship must exist and be `ACTIVE` (`PRV-015: PROCESSOR_RELATIONSHIP_NOT_ACTIVE` if inactive).
+   - The controller's processing instructions must be present (`PRV-017: PROCESSOR_INSTRUCTION_MISSING` if absent).
+   - Every attached subprocessor must carry a §16.1 notification/approval model (`PRV-018: SUBPROCESSOR_NOT_APPROVED` otherwise — an unapproved downstream subprocessor blocks the transfer).
    - Governed mechanism must exist and be valid as of execution time (`PRV-015: TRANSFER_MECHANISM_INVALID_OR_EXPIRED` if expired).
    - If assessment is required, the latest assessment on file must be approved and not expired (`PRV-015: ASSESSMENT_REJECTED`, `PRV-016: ASSESSMENT_REQUIRED_NOT_FOUND`, `PRV-016: ASSESSMENT_EXPIRED`).
    - Any dependency lookup failure fails closed to `REVIEW_REQUIRED` (`PRV-019: PRIVACY_CONTEXT_INDETERMINATE`).
-6. **Integration with PRV-03:** Serves as the authoritative transfer control plane queried by `privacy-decision-svc` during step 4 of runtime data operation evaluation.
+6. **Transfer Context (§16.1):** The transfer evaluation records the caller-declared `exporter_role`, `importer_role`, `origin_jurisdiction`, `destination_jurisdiction`, `route_provider` and `frequency_volume_class` as part of the append-only authorization evidence. These are **data only** — the spec names no taxonomy for them, so they are recorded verbatim and are optional on the wire (making them mandatory would break the existing workbench client). `data_categories`, `subject_classes` and the relationship's `purpose_activity_refs` complete §16.1's TransferContext field list.
+7. **Integration with PRV-03:** Serves as the authoritative transfer control plane queried by `privacy-decision-svc` during step 4 of runtime data operation evaluation.
 
 ---
 
@@ -57,21 +60,54 @@ Enforced at the PostgreSQL level via trigger functions:
 - `transfer_decisions_append_only`: Prevents `UPDATE` or `DELETE` on transfer decision records.
 
 ### 2. Row-Level Security (RLS) & Multi-Tenancy
-Row-Level Security (`FORCE ROW LEVEL SECURITY`) is applied to all tables:
-- `processor_relationships`
-- `subprocessors`
-- `transfer_mechanisms`
-- `transfer_assessments`
-- `transfer_decisions`
-- `transfer_idempotency_keys`
+`FORCE ROW LEVEL SECURITY` is applied to `processor_relationships`, `subprocessors`, `transfer_mechanisms`, `transfer_assessments`, `transfer_decisions`, `transfer_idempotency_keys` and `event_outbox`. Since migration `000005_strict_tenant_isolation` **no policy has a `tenant_id IS NULL` exception**: a row is visible and writable only when its `tenant_id` equals the transaction-local `app.tenant_id`, so a row with no tenant is visible to nobody (it used to be visible to, and writable by, every tenant).
 
-Tenant isolation is enforced fail-closed via `tenant_isolation_policy` binding to `app.tenant_id`.
+- The verified `X-Tenant-Id` is required on every request (`internal/middleware`, 401), and the store refuses to open a transaction without one.
+- A body `tenant_id` that differs from the verified header is `403`; records are always stamped with the verified tenant.
+- **Migration 000005 never deletes or rewrites a row.** It adds `CHECK (tenant_id IS NOT NULL) NOT VALID` (new NULL-tenant rows are refused) and sets `NOT NULL` only when no legacy NULL row exists. Legacy NULL-tenant rows (append-only evidence) are left in place, are invisible to the application role, and raise a `WARNING` with the count — they need an operator-assigned owner: **BLOCKED — DATA MIGRATION REQUIRES AUTHORITATIVE TENANT MAPPING.** No tenant is guessed.
+- Whether the runtime database role is a superuser is a deployment matter (the compose default is `zoiko_app`); a superuser bypasses RLS regardless of any policy, so production must use a `NOSUPERUSER NOBYPASSRLS` role. This repository's tests connect as such a role.
 
-### 3. §18.1 Idempotency Key Handling
-All mutating APIs enforce the `Idempotency-Key` header:
-- First execution stores the request hash, status, and response body in `transfer_idempotency_keys`.
-- Retried execution with the same key and identical payload replays the cached response with `Idempotency-Replay: true`.
-- Retried execution with the same key but conflicting payload returns HTTP 409 Conflict with `PRV-020: IMMUTABLE_EVIDENCE_CONFLICT`.
+### 3. §18.1 Idempotency
+All mutating APIs require `Idempotency-Key` (`X-Idempotency-Key` is an alias honoured everywhere, including the replay lookup):
+- **Scope:** (tenant, principal, key) — a key never replays another principal's response.
+- **Binding:** the stored hash covers method + path (the `/v1` prefix is normalised) + body; the same key on a different operation or payload is `409` `PRV-020: IMMUTABLE_EVIDENCE_CONFLICT`.
+- **Order:** tenant (applied by the `TenantContext` middleware, which wraps every API route and so runs before the handler) → principal → correlation / key presence → authorization → replay lookup → validation → execution, so a revoked grant cannot replay a cached success. See "Mandatory request headers" for the exact order of the first two.
+- **Atomic:** the key claim, the business change, the outbox event and the stored replay response are one transaction. If any step fails nothing persists and a retry re-executes cleanly; concurrent identical requests execute exactly once.
+- **Fail closed:** an idempotency lookup failure refuses the request (`503`) — it never proceeds without the lookup — and a failed save fails the whole operation.
+- Replay returns the original body with `Idempotency-Replay: true`; refused attempts are not stored.
+
+### 4. §18.1 Concurrency (version/etag) — architecture clarification
+
+§18.1 states that "conditional updates use version/etag to prevent lost updates to draft/admin state." PRV-05 has no draft/admin lifecycle analogous to PRV-01's processing-activity `DRAFT`/`APPROVED` workflow: relationships, subprocessors, mechanisms, assessments and decisions are append-only evidence enforced at the PostgreSQL level (immutability triggers above), so an `UPDATE`/`DELETE` can never overwrite a prior record. The only mutable field anywhere in the service is a relationship's two-value `status` enum (`ACTIVE`/`INACTIVE`), whose transitions are idempotent set-operations rather than read-modify-write deltas. No lost-update-able draft/admin state exists here, and requiring `If-Match` on the status route would break the existing workbench client (which sends no validator). This is therefore recorded as an **architecture clarification**, not implemented as an invented concurrency mechanism.
+
+---
+
+## Event Contracts (§19)
+
+PRV-05 emits exactly the three §19 events it owns, and no others:
+
+| Event | §19 minimum payload | Emitted when | §19 required consumers |
+|---|---|---|---|
+| `privacy.processor.changed` | processor/subprocessor, activity scope, state, effective time | relationship created, relationship status changed, subprocessor attached | XIC, procurement/vendor systems, domain owners |
+| `privacy.transfer.authorization_changed` | authorization, route/provider scope, state, conditions, expiry | a transfer decision is recorded (enqueued in the same transaction as the decision) | GTRM, XIC, data export services |
+| `privacy.assessment.expiring` | assessment, scope, expiry/review trigger | an assessment is recorded **with** a `review_trigger_at` (§17.1's expiry/review trigger). PRV-05 has no scheduler, so the event announces the trigger date for consumer-side expiry tracking | WFC/privacy owner; never silently renew |
+
+Per §19.1, events communicate already-committed state and survive a bus outage: every event is written to the transactional outbox **in the same transaction** as the change it announces (and the replay response), and a relay is the only component that talks to Kafka (retry with backoff, full broker acknowledgement). A change that rolls back leaves no event; a committed one leaves exactly one; a replay emits nothing. Events carry the verified tenant, the acting principal and the correlation id. The service previously emitted two non-spec names (`privacy.processor_relationship.created`, `privacy.transfer_decision.evaluated`); both had no consumers anywhere in this repository — the sole downstream, `privacy-decision-svc`, integrates over HTTP rather than Kafka — and were not in the §19 catalogue, so they are superseded rather than emitted alongside undeclared events.
+
+### Mandatory request headers (§18.1)
+
+Every request is tenant-scoped by the verified `X-Tenant-Id` header — a missing, empty or whitespace-only value is refused with `401` before any business logic (a request is never defaulted to the platform tenant). Every mutating route additionally requires:
+
+| Header | Missing / blank | Purpose |
+|---|---|---|
+| `X-Tenant-Id` | `401 Unauthorized` | Tenant-scope carrier, enforced for all routes except `/healthz` and `/readyz`. |
+| `X-Principal-Id` | `401 Unauthorized` | Verified actor; also forwarded to `authorization-svc`. |
+| `X-Correlation-ID` | `400 Bad Request` | §18.1 correlation ID; echoed into emitted events. |
+| `Idempotency-Key` (or `X-Idempotency-Key`) | `400 Bad Request` | §18.1 idempotency key (see §18.1 Idempotency Key Handling above). |
+
+**Order of the checks.** The tenant check is made by the `TenantContext` middleware, before the handler runs; the handler then checks the principal, then (mutating routes) the correlation id and the idempotency key, then the `authorization-svc` grant. A request with neither the tenant nor the principal is therefore refused for the **tenant** (`401`, "X-Tenant-Id header is required"); with a tenant but no principal, for the principal (`401`, "X-Principal-Id header is required"). ZS-SVC-W-001 §18.1 requires both headers but prescribes no order between them; this is the order the service applies. Both refusals are `401`, and nothing is read, written or authorized before both headers are present.
+
+Authentication, the §18.1 headers and the `authorization-svc` grant (on the caller's verified tenant) are decided **before** any lookup, so 404-vs-403 cannot be used to probe ids, and before any idempotency lookup, database mutation or event; body validation follows.
 
 ---
 
@@ -82,26 +118,77 @@ Both canonical `/privacy/...` and versioned `/v1/privacy/...` routes are mounted
 | Method | Route | Description | Auth / Gating |
 |---|---|---|---|
 | `POST` | `/privacy/processor-relationships` | Create controller-processor relationship | `PRIVACY_TRANSFER_RELATIONSHIP_MANAGE` |
-| `GET` | `/privacy/processor-relationships` | List processor relationships | Tenant verified |
-| `GET` | `/privacy/processor-relationships/{id}` | Get relationship by ID | Tenant verified |
+| `GET` | `/privacy/processor-relationships` | List processor relationships | `PRIVACY_TRANSFER_RELATIONSHIP_MANAGE` |
+| `GET` | `/privacy/processor-relationships/{id}` | Get relationship by ID | `PRIVACY_TRANSFER_RELATIONSHIP_MANAGE` |
 | `POST` | `/privacy/processor-relationships/{id}/status` | Update relationship status (`ACTIVE`/`INACTIVE`) | `PRIVACY_TRANSFER_RELATIONSHIP_MANAGE` |
 | `POST` | `/privacy/processor-relationships/{id}/subprocessors` | Attach subprocessor to relationship | `PRIVACY_TRANSFER_RELATIONSHIP_MANAGE` |
-| `GET` | `/privacy/processor-relationships/{id}/subprocessors` | List subprocessors for relationship | Tenant verified |
+| `GET` | `/privacy/processor-relationships/{id}/subprocessors` | List subprocessors for relationship | `PRIVACY_TRANSFER_RELATIONSHIP_MANAGE` |
 | `POST` | `/privacy/transfer-mechanisms` | Create governed transfer mechanism | `PRIVACY_TRANSFER_MECHANISM_MANAGE` |
-| `GET` | `/privacy/transfer-mechanisms/{id}` | Get transfer mechanism by ID | Tenant verified |
+| `GET` | `/privacy/transfer-mechanisms/{id}` | Get transfer mechanism by ID | `PRIVACY_TRANSFER_MECHANISM_MANAGE` |
 | `POST` | `/privacy/transfer-assessments` | Record TIA/DPIA assessment review | `PRIVACY_TRANSFER_ASSESSMENT_RECORD` |
-| `GET` | `/privacy/transfer-assessments?relationship_id=...` | Get latest assessment for relationship | Tenant verified |
-| `POST` | `/privacy/transfer-decisions` | Evaluate cross-border transfer authorization | Tenant verified (`X-Principal-Id`) |
-| `GET` | `/privacy/transfer-decisions/{id}` | Lookup transfer decision by ID | Tenant verified |
+| `GET` | `/privacy/transfer-assessments?relationship_id=...` | Get latest assessment for relationship | `PRIVACY_TRANSFER_ASSESSMENT_RECORD` |
+| `POST` | `/privacy/transfer-assessments/evaluate-triggers` | Evaluate all 8 mandatory §17.1 reassessment triggers (writes nothing) | `PRIVACY_TRANSFER_DECISION_EVALUATE` |
+| `GET` | `/privacy/transfer-assessments/triggers?relationship_id=...` | Same §17.1 trigger evaluation, via GET | `PRIVACY_TRANSFER_DECISION_EVALUATE` |
+| `POST` | `/privacy/transfer-decisions` | Evaluate cross-border transfer authorization | `PRIVACY_TRANSFER_DECISION_EVALUATE` |
+| `GET` | `/privacy/transfer-decisions/{id}` | Lookup transfer decision by ID | `PRIVACY_TRANSFER_DECISION_EVALUATE` |
+
+---
+
+The specification names **no read permission**, and none was invented: each read route reuses the existing action of the resource it exposes (relationships and subprocessors → `…RELATIONSHIP_MANAGE`, mechanisms → `…MECHANISM_MANAGE`, assessments → `…ASSESSMENT_RECORD`, decisions and trigger evaluation → `…DECISION_EVALUATE`). Whether dedicated read actions are wanted is a needs-clarification item; the grants live in `authorization-svc` (external).
+
+---
+
+## §17.1 Reassessment triggers
+
+`EvaluateTransfer` and the trigger endpoint use one evaluation (`computeTriggers`) **and the same stored evidence**: both read the relationship's latest assessment and its subprocessors whether or not `assessment_required` is set, so for the same inputs they report the same triggers (a derived trigger makes `EvaluateTransfer` return `REVIEW_REQUIRED` with that trigger's reason code, including trigger 8, `ASSESSMENT_EXPIRED`). `assessment_required` controls only the assessment **gate** — a missing assessment, a `REJECT` or `REMEDIATE` outcome, and an expired review date are enforced only when it is true — and whether the assessment's measures, `assessment_id` and review date enter the decision. Triggers established from stored evidence: **1** a sensitive category (exact membership in the sensitive taxonomy, a local copy of the registry's — drift is a clarification item) the relationship was not registered for; **3** a destination outside the relationship's jurisdictions, or a **subprocessor attached after the latest assessment**; **4** a mechanism recorded after the assessment; **6** a minors subject class the relationship does not cover; **8** the assessment's review date has passed. Triggers **2** (new automated decisioning), **5** (material architecture change) and **7** (security/privacy incident) concern facts that originate in other systems and are recorded nowhere in this service, so they can only be **caller-declared** — a CROSS-SERVICE / EXTERNAL DEPENDENCY, not something this service can derive. A declared trigger must be one of the eight §17.1 names (anything else is `400`, never echoed into a reason code). Evidence lookups fail closed (an outage is a `503`, never "no trigger").
+
+---
+
+## Registry integration (external dependency)
+
+`CreateRelationship` validates `purpose_activity_refs` against `privacy-purpose-registry-svc`. The caller's verified `X-Principal-Id` and `X-Tenant-Id` are forwarded; PRV-01 additionally requires a read grant for that principal in `authorization-svc`. Provisioning that grant is outside this service (**BLOCKED — EXTERNAL DEPENDENCY** for end-to-end verification; the client's behaviour is covered by unit tests against a stub registry only).
+
+---
+
+## Migrations
+
+`deployments/migrations` holds eight `*.up.sql` files. They are applied **in filename order** — the platform loader (`deployments/migrate.py`) sorts the file names and records each applied migration by its **full file name**, and the test harness sorts the same way — so the order is:
+
+1. `000001_initial_schema`
+2. `000002_immutability` — append-only and content-immutability triggers
+3. `000003_add_rls`
+4. `000004_idempotency_and_measures` — `transfer_idempotency_keys` and the assessment measures
+5. `000005_decision_conditions_and_expiry` — `conditions`, `expires_at` on decisions
+6. `000005_strict_tenant_isolation` — strict RLS, FORCE RLS, `tenant_id IS NOT NULL` checks (the "migration 000005" the sections above refer to)
+7. `000006_idempotency_principal_and_outbox` — principal in the idempotency key, `event_outbox`
+8. `000006_transfer_context` — the §16.1 transfer-context columns
+
+Two numeric prefixes are therefore shared (`000005` and `000006`, two files each). That is deliberate history, not a defect: the loader does not key on the number, the pairs touch different objects and apply correctly in name order, and renaming an already-applied file would make the loader treat it as new. New migrations should take the next unused number (`000007`).
+
+---
+
+## Running tests
+
+```bash
+go test ./...            # DB-backed tests SKIP without TEST_DATABASE_URL
+go vet ./... && go build ./...
+```
+Real PostgreSQL (a throwaway database per test; the app connects as a `NOSUPERUSER NOBYPASSRLS` role):
+```powershell
+$env:TEST_DATABASE_URL="postgres://postgres:pgsuper@localhost:55432/postgres?sslmode=disable"
+$env:REQUIRE_DB_TESTS="1"
+go test -count=1 -v ./...
+```
+Latest run: **with** the database 62 top-level tests pass, 0 skipped (handler 54, store 8); **without** it 53 pass and 9 are skipped (8 store tests + 1 handler test that needs a real database) — a run without a database proves nothing about RLS, atomicity, the outbox or the migrations. Not performed: Docker rebuild, live compose stack, live `authorization-svc` / purpose registry, frontend.
 
 ---
 
 ## §32 Stable Error & Reason Code Contract
 
-- `PRV-015: TRANSFER_NOT_AUTHORIZED` — Transfer blocked due to inactive relationship, expired mechanism, or rejected assessment.
+- `PRV-015: TRANSFER_NOT_AUTHORIZED` — Transfer blocked due to inactive relationship, expired/absent mechanism, or rejected assessment. The service emits the stable §32 code carrying the specific symbol as the conventional `code: SYMBOL` pair (e.g. `PRV-015: PROCESSOR_RELATIONSHIP_NOT_ACTIVE`, `PRV-015: TRANSFER_MECHANISM_NOT_FOUND`, `PRV-015: TRANSFER_MECHANISM_INVALID_OR_EXPIRED`, `PRV-015: ASSESSMENT_REJECTED`), so a consumer matching the `PRV-015` prefix remains correct.
 - `PRV-016: ASSESSMENT_REQUIRED` — Assessment missing, expired, or requires remediation.
 - `PRV-017: PROCESSOR_INSTRUCTION_MISSING` — Processing instructions missing on relationship.
-- `PRV-018: SUBPROCESSOR_NOT_APPROVED` — Subprocessor unauthorized or unapproved.
+- `PRV-018: SUBPROCESSOR_NOT_APPROVED` — An attached subprocessor carries no §16.1 notification/approval model on file (unapproved downstream subprocessor).
 - `PRV-019: PRIVACY_CONTEXT_INDETERMINATE` — Upstream service or store dependency unavailable.
 - `PRV-020: IMMUTABLE_EVIDENCE_CONFLICT` — Idempotency key replayed with mismatched payload.
 

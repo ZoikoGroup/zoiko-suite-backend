@@ -32,3 +32,11 @@ b4634f13b0fe152baeb1971abbf6c1c68a7c8852:services/eventing/integration/integrati
 6b72bd5d221ffcf0db45fdac10cb22ffd4cc2ecf:services/connectivity-api-bridge-svc/internal/handler/registry_test.go:stripe-access-token:498
 6b72bd5d221ffcf0db45fdac10cb22ffd4cc2ecf:services/connectivity-api-bridge-svc/internal/registry/validate_test.go:stripe-access-token:257
 6b72bd5d221ffcf0db45fdac10cb22ffd4cc2ecf:services/connectivity-api-bridge-svc/internal/registry/validate_test.go:stripe-access-token:259
+# PR #226 (shashi-changes, TOTP second factor in 75ca7b90): neither is a secret.
+#   - docker-compose.yml: the local stack's MFA_SECRET_KEY (base64 of
+#     "local-dev-mfa-key-32-bytes-long!"); identity-context-svc refuses it in
+#     staging and production (config.localMFAKey).
+#   - config_mfa_test.go: bytes 0x00..0x1f, a test vector.
+# Both lines now carry `gitleaks:allow`; these cover the commit already pushed.
+75ca7b900d4ba4afc2bbeff36c78409750fc6b90:deployments/docker-compose.yml:generic-api-key:674
+75ca7b900d4ba4afc2bbeff36c78409750fc6b90:services/identity-context-svc/internal/config/config_mfa_test.go:generic-api-key:8

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+	idenv "zoiko.io/identity-envelope"
 
 	"zoiko.io/gateway-auth-svc/internal/admin"
 	"zoiko.io/gateway-auth-svc/internal/admission"
@@ -82,6 +83,19 @@ func main() {
 		}
 	}
 
+	// Plain clients for a peer whose mTLS is off. Both constructors keep the
+	// client exactly as given, so the nil left above for a non-mTLS peer
+	// panicked on the first /verify (found live, 14 Oct 2026): every gated
+	// request answered 500 on any deployment with IDENTITY_JWKS_MTLS_ENABLED
+	// unset, and every tenant resolution would have done the same with
+	// TENANT_REGISTRY_URL set and TENANT_REGISTRY_MTLS_ENABLED unset.
+	if jwksHTTPClient == nil {
+		jwksHTTPClient = &http.Client{Timeout: 5 * time.Second}
+	}
+	if tenantRegistryHTTPClient == nil {
+		tenantRegistryHTTPClient = &http.Client{Timeout: 5 * time.Second}
+	}
+
 	jwksClient := jwks.NewClientWithHTTPClient(cfg.JWKSURL, cfg.JWKSCacheTTL, jwksHTTPClient)
 	cartaClient := carta.New(cfg.CartaServiceURL, log)
 	siemClient := siem.New(cfg.SIEMServiceURL, "gateway-auth-svc", log)
@@ -103,6 +117,27 @@ func main() {
 	} else {
 		log.Warn("tenant context resolution DISABLED — set TENANT_REGISTRY_URL to enable GOV-01 " +
 			"resolution; tenant operability and cross-tenant entity ownership are not checked at the gateway")
+	}
+
+	h := handler.New(cfg, jwksClient, cartaClient, siemClient, tenantResolver, log).UseMetrics(metrics)
+
+	// AU-01: a verified envelope's session is checked at identity-context-svc
+	// (live answers reused for the revocation TTL), so a logout stops passing
+	// the edge at once instead of when the envelope expires.
+	if cfg.IdentityRevocation == "on" {
+		fail := idenv.FailClosed
+		if cfg.RevocationFail == "open" {
+			fail = idenv.FailOpen
+		}
+		h.UseRevocation(idenv.NewRevocation(idenv.RevocationOptions{
+			Source:    idenv.NewIntrospector(cfg.IdentityIntrospectURL, jwksHTTPClient),
+			ActiveTTL: cfg.RevocationTTL,
+			Fail:      fail,
+		}))
+		log.Info("identity session revocation check on", zap.String("introspect_url", cfg.IdentityIntrospectURL),
+			zap.Duration("ttl", cfg.RevocationTTL), zap.String("fail", string(fail)))
+	} else {
+		log.Warn("IDENTITY_REVOCATION=off — a revoked session keeps passing the edge until its envelope expires (ENV=local only)")
 	}
 
 	// INT-01 admission: quota, request-shape and version admission, overload
@@ -131,7 +166,7 @@ func main() {
 		log.Warn("a gateway admission protection is DISABLED by configuration (a limit of 0)")
 	}
 
-	h := handler.New(cfg, jwksClient, cartaClient, siemClient, tenantResolver, log).UseMetrics(metrics).UseAdmission(adm)
+	h.UseAdmission(adm)
 	r := router.New(h, jwksClient, metrics)
 
 	// Read-only decision queries: a second port of this same service, served

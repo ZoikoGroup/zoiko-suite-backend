@@ -1,0 +1,10 @@
+[
+  {
+    "client_id": "local-dev-cli",
+    "client_type": "public",
+    "redirect_uris": ["http://127.0.0.1:8765/callback"],
+    "grant_types": ["authorization_code", "refresh_token"],
+    "scopes": ["openid", "profile", "email", "offline_access"],
+    "source_channel": "api"
+  }
+]

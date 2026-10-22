@@ -312,6 +312,45 @@ func (s *Service) block(tx Tx, a Actor, c *Communication, r *Refusal) error {
 	})
 }
 
+// pinnedAttachmentMismatch compares a provider's post-upload manifest with the
+// exact attachment manifest pinned into the attempt's render (NP-34). The
+// comparison is exact: a missing, extra or changed slot is a mismatch.
+func pinnedAttachmentMismatch(tx Tx, att *Attempt, got map[string]string) (bool, string, error) {
+	renders, err := tx.ListRenders(att.CommunicationID)
+	if err != nil {
+		return false, "", err
+	}
+	var pinned []Attachment
+	found := false
+	for _, r := range renders {
+		if r.RenderID == att.RenderID {
+			pinned, found = r.AttachmentManifest, true
+			break
+		}
+	}
+	if !found {
+		return true, "provider reported attachment hashes but the pinned render " + att.RenderID + " is unavailable", nil
+	}
+	expected := make(map[string]string, len(pinned))
+	for _, a := range pinned {
+		expected[a.Slot] = a.SHA256
+	}
+	if len(expected) != len(got) {
+		return true, fmt.Sprintf("provider reported %d attachment hash(es), pinned manifest has %d", len(got), len(expected)), nil
+	}
+	for slot, want := range expected {
+		hash, ok := got[slot]
+		if !ok {
+			return true, "provider did not report pinned attachment slot " + slot, nil
+		}
+		hash = strings.TrimPrefix(strings.ToLower(strings.TrimSpace(hash)), "sha256:")
+		if hash != want {
+			return true, "attachment " + slot + " hash changed after provider upload", nil
+		}
+	}
+	return false, "", nil
+}
+
 // checkAttachments enforces the intent's attachment contract (§4.1, INV-18).
 func checkAttachments(intent Intent, atts []Attachment) *Refusal {
 	have := map[string]bool{}

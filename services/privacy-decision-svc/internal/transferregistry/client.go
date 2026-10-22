@@ -14,6 +14,38 @@ import (
 
 var ErrUnavailable = errors.New("privacy-transfer-svc unavailable")
 
+// ErrMissingRequestContext is returned, without any network call, when the
+// request context carries no correlation id or idempotency key. EvaluateTransfer
+// is a mutating route on privacy-transfer-svc (§18.1): it refuses a call
+// without both, so sending one would only produce a 400 the caller would then
+// misread as an outage. The decision fails closed either way.
+var ErrMissingRequestContext = errors.New("transfer call needs a correlation id and an idempotency key")
+
+type requestContextKey struct{}
+
+type requestContext struct{ correlationID, idempotencyKey string }
+
+// WithRequestContext attaches the §18.1 context of the decision request that
+// triggers a transfer evaluation: its X-Correlation-ID and its Idempotency-Key.
+// The client derives the transfer call's own key from the latter.
+func WithRequestContext(ctx context.Context, correlationID, idempotencyKey string) context.Context {
+	return context.WithValue(ctx, requestContextKey{}, requestContext{
+		correlationID:  strings.TrimSpace(correlationID),
+		idempotencyKey: strings.TrimSpace(idempotencyKey),
+	})
+}
+
+// TransferIdempotencyKey is the Idempotency-Key sent to privacy-transfer-svc for
+// a decision request that carried callerKey. It is DETERMINISTIC: a retry of
+// the same decision request (same key, same tenant and principal) repeats the
+// same transfer key and body, so privacy-transfer-svc replays its original
+// authorization instead of recording a second one, while a different decision
+// request — a different key — gets its own transfer evaluation. The suffix keeps
+// it distinct from the caller's key.
+func TransferIdempotencyKey(callerKey string) string {
+	return strings.TrimSpace(callerKey) + ":transfer"
+}
+
 type EvaluateTransferRequest struct {
 	TenantID                string `json:"tenant_id,omitempty"`
 	RelationshipID          string `json:"relationship_id"`
@@ -23,12 +55,13 @@ type EvaluateTransferRequest struct {
 }
 
 type TransferDecision struct {
-	DecisionID              string   `json:"decision_id"`
-	Result                  string   `json:"result"` // AUTHORIZED, CONDITIONAL, BLOCKED, REVIEW_REQUIRED
-	ReasonCodes             []string `json:"reason_codes"`
-	TransferMechanismID     string   `json:"transfer_mechanism_id"`
-	RelationshipID          string   `json:"relationship_id"`
-	DestinationJurisdiction string   `json:"destination_jurisdiction,omitempty"`
+	DecisionID              string     `json:"decision_id"`
+	Result                  string     `json:"result"` // AUTHORIZED, CONDITIONAL, BLOCKED, REVIEW_REQUIRED
+	ReasonCodes             []string   `json:"reason_codes"`
+	TransferMechanismID     string     `json:"transfer_mechanism_id"`
+	RelationshipID          string     `json:"relationship_id"`
+	DestinationJurisdiction string     `json:"destination_jurisdiction,omitempty"`
+	ExpiresAt               *time.Time `json:"expires_at,omitempty"`
 }
 
 type Client struct {
@@ -58,6 +91,13 @@ func (c *Client) EvaluateTransfer(ctx context.Context, tenantID, principalID str
 		return nil, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	// §18.1 context privacy-transfer-svc requires on every mutating call.
+	rc, _ := ctx.Value(requestContextKey{}).(requestContext)
+	if rc.correlationID == "" || rc.idempotencyKey == "" {
+		return nil, ErrMissingRequestContext
+	}
+	httpReq.Header.Set("X-Correlation-ID", rc.correlationID)
+	httpReq.Header.Set("Idempotency-Key", TransferIdempotencyKey(rc.idempotencyKey))
 	if principalID != "" {
 		httpReq.Header.Set("X-Principal-Id", principalID)
 	}

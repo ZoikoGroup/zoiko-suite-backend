@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -23,17 +24,24 @@ const (
 
 	ActionMigrationJobValidate = "MIGRATION_JOB_VALIDATE"
 	ActionMigrationJobArchive  = "MIGRATION_JOB_ARCHIVE"
+	ActionMigrationJobView     = "MIGRATION_JOB_VIEW"
 	ActionAuditEntryRemediate  = "AUDIT_ENTRY_REMEDIATE"
 )
 
 type Handler struct {
-	store  store.Store
-	authz  *authz.Client
-	logger *zap.Logger
+	store                   store.Store
+	authz                   *authz.Client
+	logger                  *zap.Logger
+	integrityScoreThreshold float64
 }
 
-func NewHandler(s store.Store, a *authz.Client, l *zap.Logger) *Handler {
-	return &Handler{store: s, authz: a, logger: l}
+// NewHandler wires the handler. integrityScoreThreshold is the service-level
+// acceptance bar for validation results (config.IntegrityScoreThreshold): a
+// job scoring below it is FAILED, and the bar is stored on every job it
+// decides so the acceptance stays auditable after the default changes
+// (SPEC_DEVIATIONS A11).
+func NewHandler(s store.Store, a *authz.Client, l *zap.Logger, integrityScoreThreshold float64) *Handler {
+	return &Handler{store: s, authz: a, logger: l, integrityScoreThreshold: integrityScoreThreshold}
 }
 
 func NewRouter(h *Handler) http.Handler {
@@ -101,24 +109,26 @@ func (h *Handler) ValidateMigration(w http.ResponseWriter, r *http.Request) {
 
 	checks, entries, validCount, invalidCount, score := domain.PerformIntegrityValidation(&req, jobID, tenantID)
 
-	status := domain.JobStatusCompleted
-	if invalidCount == len(req.Records) {
-		status = domain.JobStatusFailed
-	}
+	// An MQ0 entry fails the job at any score (SPEC_DEVIATIONS A6): the
+	// acceptance decision is the one place this service can "stop" a run.
+	blockers := domain.CountBlockers(entries)
+	status := domain.EvaluateJobStatus(score, validCount, invalidCount, blockers, h.integrityScoreThreshold)
 
 	job := &domain.MigrationJob{
-		ID:                  jobID,
-		LegalEntityID:       req.LegalEntityID,
-		MigrationName:       req.MigrationName,
-		SourceSystem:        req.SourceSystem,
-		TargetService:       req.TargetService,
-		TotalRecordsCount:   len(req.Records),
-		ValidRecordsCount:   validCount,
-		InvalidRecordsCount: invalidCount,
-		IntegrityScore:      score,
-		Status:              status,
-		StartedAt:           &now,
-		CompletedAt:         &now,
+		ID:                      jobID,
+		LegalEntityID:           req.LegalEntityID,
+		MigrationName:           req.MigrationName,
+		SourceSystem:            req.SourceSystem,
+		TargetService:           req.TargetService,
+		TotalRecordsCount:       len(req.Records),
+		ValidRecordsCount:       validCount,
+		InvalidRecordsCount:     invalidCount,
+		IntegrityScore:          score,
+		IntegrityScoreThreshold: h.integrityScoreThreshold,
+		BlockerCount:            blockers,
+		Status:                  status,
+		StartedAt:               &now,
+		CompletedAt:             &now,
 	}
 
 	if err := h.store.CreateJob(r.Context(), tenantID, job, checks, entries, principalID, r.Header.Get("X-Correlation-ID")); err != nil {
@@ -134,18 +144,50 @@ func (h *Handler) GetJobByID(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetTenantID(r.Context())
 	id := chi.URLParam(r, "id")
 
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+
 	job, err := h.store.GetJobByID(r.Context(), tenantID, id)
 	if err != nil {
 		h.errJSON(w, http.StatusNotFound, "migration job not found")
 		return
 	}
+
+	// Reads are authorized per legal entity, like the writes: tenant scope
+	// (RLS) alone let any principal of the tenant read every entity's
+	// migration jobs. The job is fetched first because its own legal entity
+	// is what must be authorized — the caller names no entity on this route.
+	if !h.checkAllowed(w, r, principalID, job.LegalEntityID, ActionMigrationJobView) {
+		return
+	}
+
 	h.okJSON(w, http.StatusOK, job)
 }
 
+// ListJobs lists migration jobs for one legal entity, authorized at that
+// entity. The entity is REQUIRED: this is the read that used to hand any
+// principal of the tenant every entity's jobs, and a tenant-wide listing has
+// no legal entity to authorize against. A caller holding view rights for the
+// entity gets the list; a caller without gets a 403, not a silently filtered
+// subset (which would read as "there is nothing there").
 func (h *Handler) ListJobs(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetTenantID(r.Context())
 	legalEntityID := r.URL.Query().Get("legal_entity_id")
 	status := r.URL.Query().Get("status")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if legalEntityID == "" {
+		h.errJSON(w, http.StatusBadRequest, "legal_entity_id is required to list migration jobs (reads are authorized per legal entity)")
+		return
+	}
+	if !h.checkAllowed(w, r, principalID, legalEntityID, ActionMigrationJobView) {
+		return
+	}
 
 	jobs, err := h.store.ListJobs(r.Context(), tenantID, legalEntityID, status)
 	if err != nil {
@@ -180,9 +222,29 @@ func (h *Handler) RemediateEntry(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req domain.RemediateRequest
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.errJSON(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if err := req.Validate(); err != nil {
+		h.errJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
-	entry, err := h.store.RemediateEntry(r.Context(), tenantID, jobID, entryID, req.Notes, principalID, r.Header.Get("X-Correlation-ID"))
+	// An MQ0's disposition is "executive/domain owner resolution required"
+	// (§16): holding AUDIT_ENTRY_REMEDIATE is not enough, the resolver must
+	// be the owner named on the entry. Entries recorded before owners
+	// existed carry none and fall back to the action check alone (A6).
+	for _, e := range job.AuditEntries {
+		if e.ID == entryID && e.Severity.Blocks() && e.OwnerID != "" && e.OwnerID != principalID {
+			h.errJSON(w, http.StatusForbidden, "an MQ0 blocker can only be resolved by its owner")
+			return
+		}
+	}
+
+	entry, err := h.store.RemediateEntry(r.Context(), tenantID, jobID, entryID,
+		strings.TrimSpace(req.RemediationReason), strings.TrimSpace(req.RemediationEvidenceRef),
+		principalID, r.Header.Get("X-Correlation-ID"))
 	if err != nil {
 		h.errJSON(w, http.StatusNotFound, err.Error())
 		return
@@ -242,9 +304,10 @@ func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (stri
 	return principalID, true
 }
 
-// checkAllowed enforces a fail-closed authorization check against
-// authorization-svc before any write mutation. It writes the appropriate
-// error response and returns false when the action must not proceed.
+// checkAllowed enforces a fail-closed per-legal-entity authorization check
+// against authorization-svc before a read or write proceeds. It writes the
+// appropriate error response and returns false when the action must not
+// proceed.
 func (h *Handler) checkAllowed(w http.ResponseWriter, r *http.Request, principalID, legalEntityID, actionType string) bool {
 	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionType); err != nil {
 		if errors.Is(err, authz.ErrAuthorizationDenied) {

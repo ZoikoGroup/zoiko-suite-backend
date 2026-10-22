@@ -464,6 +464,21 @@ The sections below apply this structure to the most important services first.
 
 - validate threshold applicability
 
+*Physical routes (recorded 14 Oct 2026 from the implemented, audited surface; the GOV-05 operation each one realises in brackets — GOV-05's `/internal/v1/gov05/...` paths are its "illustrative contract surface"; route and permission table in `services/policy-svc/progress.md`):*
+
+- `GET /v1/policies?policy_type=` — get applicable policy set (as of a business time and a knowledge time)
+- `GET /v1/policies/resolve?policy_type=` — validate threshold applicability (ResolveEffectivePolicy: RESOLVED / NOT_APPLICABLE / CONFLICTED)
+- `GET /v1/policies/explain?policy_type=` — ExplainPolicyResolution (every candidate version and why it does or does not govern)
+- `POST /v1/policies/evaluate` — evaluate policy against action context (returns `evidence_id`; a repeated `decision_id` returns the original result)
+- `POST /v1/policies`, `GET /v1/policies/{policy_id}` — policy families (tenant-owned by default; `scope: GLOBAL` for platform families)
+- `POST /v1/policies/{policy_id}/versions`, `GET /v1/policies/{policy_id}/versions` — CreatePolicyDraft; retrieve policy version history
+- `POST /v1/policies/{policy_id}/versions/{version_id}/submit-review | approve | activate | schedule | suspend | review-suspension | retire` — SubmitPolicyReview, ApprovePolicy, ActivatePolicy, ScheduleActivation, EmergencySuspendPolicy (and its independent review), retirement; SupersedePolicy is the activation of a successor. Each needs `If-Match` / `expected_version`
+- `GET /v1/policy-versions/{version_id}`, `GET /v1/policy-versions/compare?base=&target=`, `GET /v1/policy-versions/{version_id}/transitions` — GetPolicyVersion, ComparePolicyVersions, lifecycle evidence
+- `GET /v1/policy-evaluations/{evidence_id}` — evaluation evidence
+- Control tests and attestations (doc7 §E3 / §E6, traceability GOV-02): `POST /v1/control-test-definitions`, `GET /v1/control-test-definitions/{id}`, `POST`/`GET /v1/control-test-definitions/{id}/executions`, `GET /v1/controls/{control_ref}/effectiveness`, `POST /v1/attestations`, `GET /v1/attestations/{id}`, `POST /v1/attestations/{id}/revoke`
+
+Errors carry the GCP §16 stable class in `code`. A conflict between two equally specific policies is `POLICY_CONFLICTED`, V-001 §5's applicability state CONFLICTED, for which §16 has no class.
+
 **Published Events**
 
 - policy.created
@@ -473,6 +488,8 @@ The sections below apply this structure to the most important services first.
 - policy.version.activated
 
 - policy.rule.retired
+
+*Also published (recorded 14 Oct 2026 for the GOV-05 lifecycle, in the same naming pending group decision C3):* `policy.version.submitted`, `policy.version.approved`, `policy.version.scheduled`, `policy.version.suspended`, `policy.version.suspension_reviewed`, `policy.applicability.conflicted`. `policy.rule.retired` covers both supersession and retirement (its payload names which).
 
 **Consumed Events**
 
@@ -681,6 +698,14 @@ The sections below apply this structure to the most important services first.
 
 - workflow.completed
 
+- workflow.expired *(added 21 Oct 2026: an open instance passed its deadline)*
+
+- workflow.reopened *(added 21 Oct 2026: changes requested; a new review cycle starts)*
+
+- workflow.approval.invalidated *(the bound subject changed after approval, ZS-STATE-001 §6.1)*
+
+*A cancellation stays workflow.completed with status CANCELLED (decision C3, 21 Oct 2026).*
+
 **Consumed Events**
 
 - authorization.denied
@@ -688,6 +713,8 @@ The sections below apply this structure to the most important services first.
 - policy.updated
 
 - authority.delegated
+
+*Behaviour (21 Oct 2026): each flags the PENDING instances whose current approver it concerns (all of the tenant's for a policy change, also policy.version.activated / suspended and authority.revoked / expired / suspended); a timer pass re-authorizes their approvers and escalates an instance whose approver may no longer approve. Physical surface: `services/workflow-svc/openapi.yaml`.*
 
 **Evidence Obligations**
 
@@ -732,6 +759,12 @@ The sections below apply this structure to the most important services first.
 
 - obligation.closed
 
+- obligation.definition.changed *(added 21 Oct 2026: definition created, versioned or retired)*
+
+- obligation.entity_mapping.changed *(added 21 Oct 2026: a definition bound to, or released from, a legal entity)*
+
+*Physical surface (21 Oct 2026): `services/obligations-svc/openapi.yaml`. obligation.updated also covers attribute edits, workflow link changes and filing-status changes, naming them in `changed_fields`.*
+
 **Critical Enhancement**
  Supports **Atomic Linking** — every obligation must be able to point to the originating source, including specific contract clause, filing rule, policy mandate, or jurisdictional rule reference.
 
@@ -760,6 +793,8 @@ The sections below apply this structure to the most important services first.
 - evidence.requirement.missing
 
 - evidence.requirement.satisfied
+
+*Physical surface (21 Oct 2026): `services/evidence-requirements-svc/openapi.yaml` — `POST /v1/evidence/evaluate` (outcomes SATISFIED / MISSING / NO_REQUIREMENTS_DEFINED; the last is never reported as satisfied and the caller decides), the requirement catalogue under `/v1/evidence-requirements` and `/v1/admin/evidence-requirements`, and the provided-by-client workflow under `/v1/pbc`.*
 
 **Critical Constraint**
  No finalization path may skip required evidence states.

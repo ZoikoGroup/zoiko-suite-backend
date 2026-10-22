@@ -86,10 +86,18 @@ $services = @{
     "schema-registry-svc" = "services/schema-registry-svc"
 }
 
+# Services whose go.mod replaces a sibling module are built from the
+# repository root, so the build context contains both modules.
+$rootContext = @{ "identity-svc" = $true }
+
 foreach ($svcName in $services.Keys) {
     $svcPath = $services[$svcName]
     Write-Host "Building image: $svcName:latest from $svcPath..." -ForegroundColor Yellow
-    docker build -t "$svcName:latest" "$svcPath"
+    if ($rootContext[$svcName]) {
+        docker build -t "$svcName:latest" -f "$svcPath/Dockerfile" .
+    } else {
+        docker build -t "$svcName:latest" "$svcPath"
+    }
 }
 Write-Host "Docker images built successfully." -ForegroundColor Green
 

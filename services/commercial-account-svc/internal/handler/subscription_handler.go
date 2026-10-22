@@ -12,7 +12,6 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/commercial-account-svc/internal/domain"
-	"zoiko.io/commercial-account-svc/internal/events"
 )
 
 const (
@@ -473,10 +472,6 @@ func (h *Handler) ConfirmSubscriptionChange(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "commercial_subscription.plan_changed", EntityID: updated.SubscriptionID, TenantID: updated.CommercialAccountID,
-		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: updated,
-	})
 	writeJSON(w, http.StatusOK, updated)
 }
 
@@ -557,10 +552,6 @@ func (h *Handler) SetSubscriptionStatus(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusInternalServerError, "failed to fetch updated subscription")
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "commercial_subscription.status_changed", EntityID: updated.SubscriptionID, TenantID: updated.CommercialAccountID,
-		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: updated,
-	})
 	writeJSON(w, http.StatusOK, updated)
 }
 
@@ -683,9 +674,5 @@ func (h *Handler) TransferBillingSource(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "commercial_subscription.billing_source_transferred", EntityID: transfer.TransferID, TenantID: transfer.CommercialAccountID,
-		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: transfer,
-	})
 	writeJSON(w, http.StatusCreated, transfer)
 }

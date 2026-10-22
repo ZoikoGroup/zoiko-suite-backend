@@ -36,6 +36,7 @@ require (
 require (
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
+	github.com/golang-jwt/jwt/v5 v5.2.1
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
@@ -57,6 +58,9 @@ require (
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.40.0
 	google.golang.org/protobuf v1.36.11 // indirect
+	zoiko.io/identity-envelope v0.0.0
 )
 
 replace zoiko.io/search-client => ../search-client
+
+replace zoiko.io/identity-envelope => ../identity-envelope

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -15,26 +16,36 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/privacy-transfer-svc/internal/domain"
+	"zoiko.io/privacy-transfer-svc/internal/events"
 	"zoiko.io/privacy-transfer-svc/internal/middleware"
 )
 
+// §19 events owned by PRV-05, enqueued through the transactional outbox
+// (§19.1: events communicate already-committed state and must survive a bus
+// outage) — in the SAME transaction as the state change they announce.
+const (
+	// EventTransferAuthorizationChanged — "authorization, route/provider
+	// scope, state, conditions, expiry". Emitted when a decision is recorded.
+	EventTransferAuthorizationChanged = "privacy.transfer.authorization_changed"
+	// EventProcessorChanged — "processor/subprocessor, activity scope, state,
+	// effective time". Emitted on relationship create, status change and
+	// subprocessor attach.
+	EventProcessorChanged = "privacy.processor.changed"
+	// EventAssessmentExpiring — "assessment, scope, expiry/review trigger".
+	// Emitted when an assessment that declares a review trigger is recorded.
+	EventAssessmentExpiring = "privacy.assessment.expiring"
+)
+
 // isInvalidUUID reports whether err is Postgres's own "invalid input
-// syntax for type uuid" error (SQLSTATE 22P02) — see
-// privacy-purpose-registry-svc's identical helper for the full rationale.
+// syntax for type uuid" error (SQLSTATE 22P02).
 func isInvalidUUID(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == "22P02"
 }
 
 // nullString bridges a nullable TEXT column onto a plain (non-pointer)
-// string field — several domain types here (ProcessingInstructions,
-// ContractEvidenceRef, EvidenceRef, Conditions, ResidualRisk, ...)
-// deliberately model "not present" as "" on the wire rather than a JSON
-// null, but the underlying columns are nullable and written via
-// strPtrOrNil. Without this, scanning a NULL directly into *string
-// fails outright ("cannot scan NULL into *string") — caught by live-
-// stack testing, not the unit suite, whose stub store has no real SQL
-// NULL to expose the mismatch.
+// string field — several domain types deliberately model "not present" as ""
+// on the wire rather than a JSON null.
 type nullString struct{ dest *string }
 
 func (n *nullString) Scan(src interface{}) error {
@@ -47,28 +58,52 @@ func (n *nullString) Scan(src interface{}) error {
 	return nil
 }
 
-// Store is the interface the handler depends on.
+// Meta is the actor/trace context of one mutation, carried into its event.
+type Meta struct {
+	PrincipalID   string
+	CorrelationID string
+}
+
+// Idem is the idempotency claim of one mutation (§18.1). The claim, the
+// business change, the outbox event and the stored replay response are written
+// in ONE transaction: either all of them exist or none does, so a retry after
+// any failure re-executes cleanly and concurrent identical requests execute
+// exactly once.
+type Idem struct {
+	Key         string
+	PrincipalID string
+	Endpoint    string
+	RequestHash string
+	// Render builds the HTTP status and body to replay from the operation's
+	// typed result.
+	Render func(result any) (status int, body []byte, err error)
+}
+
+// Store is the interface the handler depends on. Every mutating method takes
+// the idempotency claim and returns the already-stored record instead of
+// executing when the key was claimed before.
 type Store interface {
-	CreateRelationship(ctx context.Context, tenantID string, req domain.CreateProcessorRelationshipRequest, principalID string) (*domain.ProcessorRelationship, error)
+	CreateRelationship(ctx context.Context, tenantID string, req domain.CreateProcessorRelationshipRequest, m Meta, idem *Idem) (*domain.ProcessorRelationship, *domain.IdempotencyRecord, error)
 	FindRelationship(ctx context.Context, relationshipID string) (*domain.ProcessorRelationship, error)
 	ListRelationships(ctx context.Context) ([]domain.ProcessorRelationship, error)
-	UpdateRelationshipStatus(ctx context.Context, relationshipID string, status domain.RelationshipStatus) (*domain.ProcessorRelationship, error)
+	UpdateRelationshipStatus(ctx context.Context, relationshipID string, status domain.RelationshipStatus, m Meta, idem *Idem) (*domain.ProcessorRelationship, *domain.IdempotencyRecord, error)
 
-	AttachSubprocessor(ctx context.Context, relationshipID string, req domain.AttachSubprocessorRequest, principalID string) (*domain.Subprocessor, error)
+	AttachSubprocessor(ctx context.Context, relationshipID string, req domain.AttachSubprocessorRequest, m Meta, idem *Idem) (*domain.Subprocessor, *domain.IdempotencyRecord, error)
 	ListSubprocessors(ctx context.Context, relationshipID string) ([]domain.Subprocessor, error)
 
-	CreateMechanism(ctx context.Context, tenantID string, req domain.CreateTransferMechanismRequest, principalID string) (*domain.TransferMechanism, error)
+	CreateMechanism(ctx context.Context, tenantID string, req domain.CreateTransferMechanismRequest, m Meta, idem *Idem) (*domain.TransferMechanism, *domain.IdempotencyRecord, error)
 	FindMechanism(ctx context.Context, mechanismID string) (*domain.TransferMechanism, error)
 
-	RecordAssessment(ctx context.Context, tenantID string, req domain.RecordTransferAssessmentRequest, principalID string) (*domain.TransferAssessment, error)
+	RecordAssessment(ctx context.Context, tenantID string, req domain.RecordTransferAssessmentRequest, m Meta, idem *Idem) (*domain.TransferAssessment, *domain.IdempotencyRecord, error)
 	FindLatestAssessment(ctx context.Context, relationshipID string) (*domain.TransferAssessment, error)
 
-	RecordDecision(ctx context.Context, tenantID string, d *domain.TransferDecision) error
+	// RecordDecision persists the decision, its authorization_changed event and
+	// the replay response atomically.
+	RecordDecision(ctx context.Context, tenantID string, d *domain.TransferDecision, m Meta, idem *Idem) (*domain.IdempotencyRecord, error)
 	FindDecision(ctx context.Context, decisionID string) (*domain.TransferDecision, error)
 
-	// Idempotency (§18.1)
-	GetIdempotency(ctx context.Context, tenantID, key string) (*domain.IdempotencyRecord, error)
-	SaveIdempotency(ctx context.Context, rec domain.IdempotencyRecord) error
+	// GetIdempotency looks up a stored response by (tenant, principal, key).
+	GetIdempotency(ctx context.Context, tenantID, principalID, key string) (*domain.IdempotencyRecord, error)
 }
 
 type PgStore struct {
@@ -80,20 +115,96 @@ func NewPgStore(pool *pgxpool.Pool, log *zap.Logger) *PgStore {
 	return &PgStore{pool: pool, log: log}
 }
 
+// withTenant runs fn in a transaction scoped by the verified tenant carried in
+// ctx (transaction-local app.tenant_id). A missing tenant is refused outright
+// rather than degrading to an empty scope.
 func (s *PgStore) withTenant(ctx context.Context, fn func(pgx.Tx) error) error {
+	tenant := strings.TrimSpace(middleware.TenantFromContext(ctx))
+	if tenant == "" {
+		return errors.New("verified tenant is required for store operations")
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", middleware.TenantFromContext(ctx)); err != nil {
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenant); err != nil {
 		return fmt.Errorf("set_config app.tenant_id: %w", err)
 	}
 	if err := fn(tx); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+var errReplay = errors.New("idempotent replay")
+
+func isDomainError(err error) bool {
+	for _, e := range []error{domain.ErrRelationshipNotFound, domain.ErrMechanismNotFound, domain.ErrDecisionNotFound} {
+		if errors.Is(err, e) {
+			return true
+		}
+	}
+	return false
+}
+
+// mutate runs fn atomically with the idempotency claim (when idem != nil).
+// On a prior claim it executes nothing and returns the stored record.
+func (s *PgStore) mutate(ctx context.Context, op string, idem *Idem, fn func(tx pgx.Tx) (any, error)) (any, *domain.IdempotencyRecord, error) {
+	tenant := strings.TrimSpace(middleware.TenantFromContext(ctx))
+	var result any
+	var existing *domain.IdempotencyRecord
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		if idem != nil {
+			tag, err := tx.Exec(ctx, `
+				INSERT INTO transfer_idempotency_keys
+					(idempotency_key, tenant_id, principal_id, endpoint, request_hash, response_code, response_body, created_at)
+				VALUES ($1, $2, $3, $4, $5, 0, ''::bytea, NOW())
+				ON CONFLICT (tenant_id, principal_id, idempotency_key) DO NOTHING`,
+				idem.Key, tenant, idem.PrincipalID, idem.Endpoint, idem.RequestHash)
+			if err != nil {
+				return err
+			}
+			if tag.RowsAffected() == 0 {
+				rec, err := getIdempotencyTx(ctx, tx, tenant, idem.PrincipalID, idem.Key)
+				if err != nil {
+					return err
+				}
+				existing = rec
+				return errReplay
+			}
+		}
+		r, err := fn(tx)
+		if err != nil {
+			return err
+		}
+		result = r
+		if idem != nil {
+			code, body, err := idem.Render(r)
+			if err != nil {
+				return err
+			}
+			if _, err := tx.Exec(ctx, `
+				UPDATE transfer_idempotency_keys SET response_code = $1, response_body = $2
+				WHERE tenant_id = $3 AND principal_id = $4 AND idempotency_key = $5`,
+				code, body, tenant, idem.PrincipalID, idem.Key); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	switch {
+	case errors.Is(err, errReplay):
+		return nil, existing, nil
+	case err == nil:
+		return result, nil, nil
+	case isDomainError(err):
+		return nil, nil, err
+	default:
+		s.log.Error("pg "+op+" failed", zap.Error(err))
+		return nil, nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
 }
 
 func strPtrOrNil(s string) *string {
@@ -119,6 +230,13 @@ func unmarshalSlice(raw []byte, dest *[]string) {
 	_ = json.Unmarshal(raw, dest)
 }
 
+func enqueue(ctx context.Context, tx pgx.Tx, eventType, entityID, tenantID string, m Meta, payload any) error {
+	return events.EnqueueTx(ctx, tx, events.PublishParams{
+		EventType: eventType, EntityID: entityID, TenantID: tenantID,
+		ActorID: m.PrincipalID, CorrelationID: m.CorrelationID, Payload: payload,
+	})
+}
+
 // ── processor relationships ──────────────────────────────────────────────────
 
 const relationshipColumns = `
@@ -142,26 +260,29 @@ func scanRelationship(row pgx.Row) (*domain.ProcessorRelationship, error) {
 	return r, nil
 }
 
-func (s *PgStore) CreateRelationship(ctx context.Context, tenantID string, req domain.CreateProcessorRelationshipRequest, principalID string) (*domain.ProcessorRelationship, error) {
+func (s *PgStore) CreateRelationship(ctx context.Context, tenantID string, req domain.CreateProcessorRelationshipRequest, m Meta, idem *Idem) (*domain.ProcessorRelationship, *domain.IdempotencyRecord, error) {
 	id := uuid.New().String()
-	var r *domain.ProcessorRelationship
-	err := s.withTenant(ctx, func(tx pgx.Tx) error {
-		var err error
-		r, err = scanRelationship(tx.QueryRow(ctx, `
+	res, ex, err := s.mutate(ctx, "CreateRelationship", idem, func(tx pgx.Tx) (any, error) {
+		r, err := scanRelationship(tx.QueryRow(ctx, `
 			INSERT INTO processor_relationships (`+relationshipColumns+`)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'ACTIVE', NOW(), $12)
 			RETURNING `+relationshipColumns,
 			id, strPtrOrNil(tenantID), req.ControllerRef, req.ProcessorRef, req.Service, strPtrOrNil(req.ProcessingInstructions),
 			marshalSlice(req.PurposeActivityRefs), marshalSlice(req.DataCategories), marshalSlice(req.SubjectClasses),
-			strPtrOrNil(req.ContractEvidenceRef), marshalSlice(req.Jurisdictions), principalID,
+			strPtrOrNil(req.ContractEvidenceRef), marshalSlice(req.Jurisdictions), m.PrincipalID,
 		))
-		return err
+		if err != nil {
+			return nil, err
+		}
+		if err := enqueue(ctx, tx, EventProcessorChanged, r.RelationshipID, tenantID, m, r); err != nil {
+			return nil, err
+		}
+		return r, nil
 	})
-	if err != nil {
-		s.log.Error("pg CreateRelationship failed", zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	if err != nil || ex != nil {
+		return nil, ex, err
 	}
-	return r, nil
+	return res.(*domain.ProcessorRelationship), nil, nil
 }
 
 func (s *PgStore) FindRelationship(ctx context.Context, relationshipID string) (*domain.ProcessorRelationship, error) {
@@ -205,41 +326,46 @@ func (s *PgStore) ListRelationships(ctx context.Context) ([]domain.ProcessorRela
 	return out, nil
 }
 
-func (s *PgStore) UpdateRelationshipStatus(ctx context.Context, relationshipID string, status domain.RelationshipStatus) (*domain.ProcessorRelationship, error) {
-	var r *domain.ProcessorRelationship
-	err := s.withTenant(ctx, func(tx pgx.Tx) error {
-		var err error
-		r, err = scanRelationship(tx.QueryRow(ctx, `
+func (s *PgStore) UpdateRelationshipStatus(ctx context.Context, relationshipID string, status domain.RelationshipStatus, m Meta, idem *Idem) (*domain.ProcessorRelationship, *domain.IdempotencyRecord, error) {
+	tenant := middleware.TenantFromContext(ctx)
+	res, ex, err := s.mutate(ctx, "UpdateRelationshipStatus", idem, func(tx pgx.Tx) (any, error) {
+		r, err := scanRelationship(tx.QueryRow(ctx, `
 			UPDATE processor_relationships SET status = $2 WHERE relationship_id = $1
 			RETURNING `+relationshipColumns,
 			relationshipID, status,
 		))
-		return err
+		if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
+			return nil, domain.ErrRelationshipNotFound
+		}
+		if err != nil {
+			return nil, err
+		}
+		// A status transition is a processor state change consumers must see.
+		if err := enqueue(ctx, tx, EventProcessorChanged, r.RelationshipID, tenant, m, r); err != nil {
+			return nil, err
+		}
+		return r, nil
 	})
-	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
-		return nil, domain.ErrRelationshipNotFound
+	if err != nil || ex != nil {
+		return nil, ex, err
 	}
-	if err != nil {
-		s.log.Error("pg UpdateRelationshipStatus failed", zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	return r, nil
+	return res.(*domain.ProcessorRelationship), nil, nil
 }
 
 // ── subprocessors ────────────────────────────────────────────────────────────
 
-func (s *PgStore) AttachSubprocessor(ctx context.Context, relationshipID string, req domain.AttachSubprocessorRequest, principalID string) (*domain.Subprocessor, error) {
+func (s *PgStore) AttachSubprocessor(ctx context.Context, relationshipID string, req domain.AttachSubprocessorRequest, m Meta, idem *Idem) (*domain.Subprocessor, *domain.IdempotencyRecord, error) {
 	id := uuid.New().String()
-	var sp domain.Subprocessor
-	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+	res, ex, err := s.mutate(ctx, "AttachSubprocessor", idem, func(tx pgx.Tx) (any, error) {
 		var tenantID *string
 		if err := tx.QueryRow(ctx, `SELECT tenant_id FROM processor_relationships WHERE relationship_id = $1`, relationshipID).Scan(&tenantID); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
-				return domain.ErrRelationshipNotFound
+				return nil, domain.ErrRelationshipNotFound
 			}
-			return err
+			return nil, err
 		}
 
+		var sp domain.Subprocessor
 		var locationsRaw, onwardRaw []byte
 		if err := tx.QueryRow(ctx, `
 			INSERT INTO subprocessors (subprocessor_id, tenant_id, relationship_id, provider_identity, service, purpose,
@@ -250,23 +376,26 @@ func (s *PgStore) AttachSubprocessor(ctx context.Context, relationshipID string,
 				processing_locations, onward_subprocessors, notification_approval_model, contract_evidence_ref, created_at, created_by_principal_id`,
 			id, tenantID, relationshipID, req.ProviderIdentity, req.Service, strPtrOrNil(req.Purpose), strPtrOrNil(req.DataScope),
 			marshalSlice(req.ProcessingLocations), marshalSlice(req.OnwardSubprocessors), strPtrOrNil(req.NotificationApprovalModel),
-			strPtrOrNil(req.ContractEvidenceRef), principalID,
+			strPtrOrNil(req.ContractEvidenceRef), m.PrincipalID,
 		).Scan(&sp.SubprocessorID, &sp.TenantID, &sp.RelationshipID, &sp.ProviderIdentity, &sp.Service, &nullString{&sp.Purpose}, &nullString{&sp.DataScope},
 			&locationsRaw, &onwardRaw, &nullString{&sp.NotificationApprovalModel}, &nullString{&sp.ContractEvidenceRef}, &sp.CreatedAt, &sp.CreatedByPrincipalID); err != nil {
-			return err
+			return nil, err
 		}
 		unmarshalSlice(locationsRaw, &sp.ProcessingLocations)
 		unmarshalSlice(onwardRaw, &sp.OnwardSubprocessors)
-		return nil
+		tenant := ""
+		if tenantID != nil {
+			tenant = *tenantID
+		}
+		if err := enqueue(ctx, tx, EventProcessorChanged, sp.SubprocessorID, tenant, m, &sp); err != nil {
+			return nil, err
+		}
+		return &sp, nil
 	})
-	if errors.Is(err, domain.ErrRelationshipNotFound) {
-		return nil, domain.ErrRelationshipNotFound
+	if err != nil || ex != nil {
+		return nil, ex, err
 	}
-	if err != nil {
-		s.log.Error("pg AttachSubprocessor failed", zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	return &sp, nil
+	return res.(*domain.Subprocessor), nil, nil
 }
 
 func (s *PgStore) ListSubprocessors(ctx context.Context, relationshipID string) ([]domain.Subprocessor, error) {
@@ -313,26 +442,22 @@ func scanMechanism(row pgx.Row) (*domain.TransferMechanism, error) {
 	return m, nil
 }
 
-func (s *PgStore) CreateMechanism(ctx context.Context, tenantID string, req domain.CreateTransferMechanismRequest, principalID string) (*domain.TransferMechanism, error) {
+func (s *PgStore) CreateMechanism(ctx context.Context, tenantID string, req domain.CreateTransferMechanismRequest, m Meta, idem *Idem) (*domain.TransferMechanism, *domain.IdempotencyRecord, error) {
 	id := uuid.New().String()
 	validFrom := timeOrNow(req.ValidFrom)
-	var m *domain.TransferMechanism
-	err := s.withTenant(ctx, func(tx pgx.Tx) error {
-		var err error
-		m, err = scanMechanism(tx.QueryRow(ctx, `
+	res, ex, err := s.mutate(ctx, "CreateMechanism", idem, func(tx pgx.Tx) (any, error) {
+		return scanMechanism(tx.QueryRow(ctx, `
 			INSERT INTO transfer_mechanisms (`+mechanismColumns+`)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), $8)
 			RETURNING `+mechanismColumns,
 			id, strPtrOrNil(tenantID), req.MechanismType, strPtrOrNil(req.EvidenceRef), strPtrOrNil(req.Conditions),
-			validFrom, req.ValidUntil, principalID,
+			validFrom, req.ValidUntil, m.PrincipalID,
 		))
-		return err
 	})
-	if err != nil {
-		s.log.Error("pg CreateMechanism failed", zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	if err != nil || ex != nil {
+		return nil, ex, err
 	}
-	return m, nil
+	return res.(*domain.TransferMechanism), nil, nil
 }
 
 func (s *PgStore) FindMechanism(ctx context.Context, mechanismID string) (*domain.TransferMechanism, error) {
@@ -354,23 +479,32 @@ func (s *PgStore) FindMechanism(ctx context.Context, mechanismID string) (*domai
 
 // ── transfer assessments ─────────────────────────────────────────────────────
 
-func (s *PgStore) RecordAssessment(ctx context.Context, tenantID string, req domain.RecordTransferAssessmentRequest, principalID string) (*domain.TransferAssessment, error) {
+func (s *PgStore) RecordAssessment(ctx context.Context, tenantID string, req domain.RecordTransferAssessmentRequest, m Meta, idem *Idem) (*domain.TransferAssessment, *domain.IdempotencyRecord, error) {
 	id := uuid.New().String()
-	var a domain.TransferAssessment
-	err := s.withTenant(ctx, func(tx pgx.Tx) error {
-		return tx.QueryRow(ctx, `
+	res, ex, err := s.mutate(ctx, "RecordAssessment", idem, func(tx pgx.Tx) (any, error) {
+		var a domain.TransferAssessment
+		if err := tx.QueryRow(ctx, `
 			INSERT INTO transfer_assessments (assessment_id, tenant_id, relationship_id, outcome, reviewer_principal_id, residual_risk, evidence_ref, government_access_risk, technical_measures, organizational_measures, review_trigger_at, created_at)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
 			RETURNING assessment_id, tenant_id, relationship_id, outcome, reviewer_principal_id, residual_risk, evidence_ref, government_access_risk, technical_measures, organizational_measures, review_trigger_at, created_at`,
-			id, strPtrOrNil(tenantID), req.RelationshipID, req.Outcome, principalID, strPtrOrNil(req.ResidualRisk),
+			id, strPtrOrNil(tenantID), req.RelationshipID, req.Outcome, m.PrincipalID, strPtrOrNil(req.ResidualRisk),
 			strPtrOrNil(req.EvidenceRef), strPtrOrNil(req.GovernmentAccessRisk), strPtrOrNil(req.TechnicalMeasures), strPtrOrNil(req.OrganizationalMeasures), req.ReviewTriggerAt,
-		).Scan(&a.AssessmentID, &a.TenantID, &a.RelationshipID, &a.Outcome, &a.ReviewerPrincipalID, &nullString{&a.ResidualRisk}, &nullString{&a.EvidenceRef}, &nullString{&a.GovernmentAccessRisk}, &nullString{&a.TechnicalMeasures}, &nullString{&a.OrganizationalMeasures}, &a.ReviewTriggerAt, &a.CreatedAt)
+		).Scan(&a.AssessmentID, &a.TenantID, &a.RelationshipID, &a.Outcome, &a.ReviewerPrincipalID, &nullString{&a.ResidualRisk}, &nullString{&a.EvidenceRef}, &nullString{&a.GovernmentAccessRisk}, &nullString{&a.TechnicalMeasures}, &nullString{&a.OrganizationalMeasures}, &a.ReviewTriggerAt, &a.CreatedAt); err != nil {
+			return nil, err
+		}
+		// §19 privacy.assessment.expiring — announced when the assessment
+		// declares its §17.1 expiry/review trigger.
+		if a.ReviewTriggerAt != nil {
+			if err := enqueue(ctx, tx, EventAssessmentExpiring, a.AssessmentID, tenantID, m, &a); err != nil {
+				return nil, err
+			}
+		}
+		return &a, nil
 	})
-	if err != nil {
-		s.log.Error("pg RecordAssessment failed", zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	if err != nil || ex != nil {
+		return nil, ex, err
 	}
-	return &a, nil
+	return res.(*domain.TransferAssessment), nil, nil
 }
 
 func (s *PgStore) FindLatestAssessment(ctx context.Context, relationshipID string) (*domain.TransferAssessment, error) {
@@ -393,7 +527,7 @@ func (s *PgStore) FindLatestAssessment(ctx context.Context, relationshipID strin
 
 // ── transfer decisions ───────────────────────────────────────────────────────
 
-func (s *PgStore) RecordDecision(ctx context.Context, tenantID string, d *domain.TransferDecision) error {
+func (s *PgStore) RecordDecision(ctx context.Context, tenantID string, d *domain.TransferDecision, m Meta, idem *Idem) (*domain.IdempotencyRecord, error) {
 	if d.DecisionID == "" {
 		d.DecisionID = uuid.New().String()
 	}
@@ -401,23 +535,28 @@ func (s *PgStore) RecordDecision(ctx context.Context, tenantID string, d *domain
 		d.AuthorizationID = d.DecisionID
 	}
 	reasonRaw := marshalSlice(d.ReasonCodes)
-	err := s.withTenant(ctx, func(tx pgx.Tx) error {
-		return tx.QueryRow(ctx, `
+	_, ex, err := s.mutate(ctx, "RecordDecision", idem, func(tx pgx.Tx) (any, error) {
+		if err := tx.QueryRow(ctx, `
 			INSERT INTO transfer_decisions (decision_id, tenant_id, relationship_id, transfer_mechanism_id, destination_jurisdiction,
-				assessment_id, result, reason_codes, actor_principal_id, correlation_id, conditions, expires_at, decided_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW())
+				assessment_id, result, reason_codes, actor_principal_id, correlation_id, conditions, expires_at,
+				exporter_role, importer_role, origin_jurisdiction, route_provider, frequency_volume_class, decided_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, NOW())
 			RETURNING decided_at`,
 			d.DecisionID, strPtrOrNil(tenantID), d.RelationshipID, d.TransferMechanismID, strPtrOrNil(d.DestinationJurisdiction),
 			d.AssessmentID, d.Result, reasonRaw, d.ActorPrincipalID, strPtrOrNil(d.CorrelationID),
 			strPtrOrNil(d.Conditions), d.ExpiresAt,
-		).Scan(&d.DecidedAt)
+			strPtrOrNil(d.ExporterRole), strPtrOrNil(d.ImporterRole), strPtrOrNil(d.OriginJurisdiction),
+			strPtrOrNil(d.RouteProvider), strPtrOrNil(d.FrequencyVolumeClass),
+		).Scan(&d.DecidedAt); err != nil {
+			return nil, err
+		}
+		d.TenantID = strPtrOrNil(tenantID)
+		if err := enqueue(ctx, tx, EventTransferAuthorizationChanged, d.DecisionID, tenantID, m, d); err != nil {
+			return nil, err
+		}
+		return d, nil
 	})
-	if err != nil {
-		s.log.Error("pg RecordDecision failed", zap.Error(err))
-		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	d.TenantID = strPtrOrNil(tenantID)
-	return nil
+	return ex, err
 }
 
 func (s *PgStore) FindDecision(ctx context.Context, decisionID string) (*domain.TransferDecision, error) {
@@ -427,10 +566,13 @@ func (s *PgStore) FindDecision(ctx context.Context, decisionID string) (*domain.
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx, `
 			SELECT decision_id, tenant_id, relationship_id, transfer_mechanism_id, destination_jurisdiction, assessment_id,
-				result, reason_codes, actor_principal_id, correlation_id, conditions, expires_at, decided_at
+				result, reason_codes, actor_principal_id, correlation_id, conditions, expires_at,
+				exporter_role, importer_role, origin_jurisdiction, route_provider, frequency_volume_class, decided_at
 			FROM transfer_decisions WHERE decision_id = $1`, decisionID,
 		).Scan(&d.DecisionID, &d.TenantID, &d.RelationshipID, &d.TransferMechanismID, &destJurisdiction, &d.AssessmentID,
-			&d.Result, &reasonRaw, &d.ActorPrincipalID, &correlationID, &conditions, &d.ExpiresAt, &d.DecidedAt)
+			&d.Result, &reasonRaw, &d.ActorPrincipalID, &correlationID, &conditions, &d.ExpiresAt,
+			&nullString{&d.ExporterRole}, &nullString{&d.ImporterRole}, &nullString{&d.OriginJurisdiction},
+			&nullString{&d.RouteProvider}, &nullString{&d.FrequencyVolumeClass}, &d.DecidedAt)
 	})
 	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		return nil, domain.ErrDecisionNotFound
@@ -462,15 +604,26 @@ func timeOrNow(t *time.Time) time.Time {
 
 // ── Idempotency (§18.1) ──────────────────────────────────────────────────────
 
-func (s *PgStore) GetIdempotency(ctx context.Context, tenantID, key string) (*domain.IdempotencyRecord, error) {
+func getIdempotencyTx(ctx context.Context, tx pgx.Tx, tenantID, principalID, key string) (*domain.IdempotencyRecord, error) {
 	var rec domain.IdempotencyRecord
+	err := tx.QueryRow(ctx, `
+		SELECT idempotency_key, tenant_id, principal_id, endpoint, request_hash, response_code, response_body, created_at
+		FROM transfer_idempotency_keys
+		WHERE tenant_id = $1 AND principal_id = $2 AND idempotency_key = $3`,
+		tenantID, principalID, key,
+	).Scan(&rec.IdempotencyKey, &rec.TenantID, &rec.PrincipalID, &rec.Endpoint, &rec.RequestHash, &rec.ResponseCode, &rec.ResponseBody, &rec.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &rec, nil
+}
+
+func (s *PgStore) GetIdempotency(ctx context.Context, tenantID, principalID, key string) (*domain.IdempotencyRecord, error) {
+	var rec *domain.IdempotencyRecord
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
-		return tx.QueryRow(ctx, `
-			SELECT idempotency_key, tenant_id, endpoint, request_hash, response_code, response_body, created_at
-			FROM transfer_idempotency_keys
-			WHERE idempotency_key = $1`,
-			key,
-		).Scan(&rec.IdempotencyKey, &rec.TenantID, &rec.Endpoint, &rec.RequestHash, &rec.ResponseCode, &rec.ResponseBody, &rec.CreatedAt)
+		r, err := getIdempotencyTx(ctx, tx, tenantID, principalID, key)
+		rec = r
+		return err
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
@@ -479,22 +632,5 @@ func (s *PgStore) GetIdempotency(ctx context.Context, tenantID, key string) (*do
 		s.log.Error("pg GetIdempotency failed", zap.Error(err))
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
-	return &rec, nil
-}
-
-func (s *PgStore) SaveIdempotency(ctx context.Context, rec domain.IdempotencyRecord) error {
-	err := s.withTenant(ctx, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `
-			INSERT INTO transfer_idempotency_keys (idempotency_key, tenant_id, endpoint, request_hash, response_code, response_body, created_at)
-			VALUES ($1, $2, $3, $4, $5, $6, NOW())
-			ON CONFLICT (tenant_id, idempotency_key) DO NOTHING`,
-			rec.IdempotencyKey, rec.TenantID, rec.Endpoint, rec.RequestHash, rec.ResponseCode, rec.ResponseBody,
-		)
-		return err
-	})
-	if err != nil {
-		s.log.Error("pg SaveIdempotency failed", zap.Error(err))
-		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	return nil
+	return rec, nil
 }

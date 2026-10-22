@@ -97,7 +97,8 @@ func (s *PgStore) FindSessionContext(
 			       retention_class, disposition_due_at, disposed_at,
 			       source_channel, source_channel_basis, workload_id, workload_id_basis,
 			       causation_id, ingress_binding_version, ingress_cache_state,
-			       entitlement_context_ref, entitlement_context_status
+			       entitlement_context_ref, entitlement_context_status,
+			       COALESCE(auth_session_id, '')
 			  FROM session_contexts
 			 WHERE session_context_id = $1 AND tenant_id = $2`,
 			sessionContextID, tenantID,
@@ -112,6 +113,7 @@ func (s *PgStore) FindSessionContext(
 			&sourceChannel, &sourceChannelBasis, &workloadID, &workloadBasis,
 			&causationID, &ingressVersion, &ingressCacheState,
 			&sc.EntitlementContextRef, &entitlementStatus,
+			&sc.AuthSessionID,
 		)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {

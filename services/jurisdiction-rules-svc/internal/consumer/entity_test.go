@@ -87,8 +87,8 @@ func TestEntityConsumer_SkipsWhatCannotBeApplied(t *testing.T) {
 			"legal_entity_id": entity, "assignment_id": "a", "jurisdiction_id": jur, "change_type": "END_DATED", "effective_from": "2026-01-01T00:00:00Z"}),
 		"unknown change type": envelope(t, EventEntityJurisdictionChanged, tenant, 2, map[string]any{
 			"legal_entity_id": entity, "assignment_id": "a", "jurisdiction_id": jur, "change_type": "MOVED", "effective_from": "2026-01-01T00:00:00Z"}),
-		"not json":       []byte("{"),
-		"other event":    envelope(t, "entity.status.changed", tenant, 1, map[string]any{}),
+		"not json":    []byte("{"),
+		"other event": envelope(t, "entity.status.changed", tenant, 1, map[string]any{}),
 	}
 	for name, raw := range bad {
 		if err := c.Handle(context.Background(), raw); err != nil {

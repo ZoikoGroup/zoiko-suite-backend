@@ -49,15 +49,15 @@ func TestSessionControlsIT_JITApprovalReviewAndEvents(t *testing.T) {
 
 	// The database refuses a non-independent approver even past the handler.
 	for _, approver := range []string{"subject-1", "requester-1"} {
-		if _, err := f.s.DecidePrivilegedSession(f.ctx, ps.SessionID, f.tenant, approver, true); err == nil {
+		if _, err := f.s.DecidePrivilegedSession(f.ctx, ps.SessionID, f.tenant, approver, true, nil); err == nil {
 			t.Errorf("approval by %s was stored", approver)
 		}
 	}
-	approved, err := f.s.DecidePrivilegedSession(f.ctx, ps.SessionID, f.tenant, "approver-1", true)
+	approved, err := f.s.DecidePrivilegedSession(f.ctx, ps.SessionID, f.tenant, "approver-1", true, nil)
 	if err != nil || approved.Status != domain.PrivilegedSessionStatusActive || approved.ApprovedBy == nil || *approved.ApprovedBy != "approver-1" {
 		t.Fatalf("independent approval: %+v %v", approved, err)
 	}
-	if _, err := f.s.DecidePrivilegedSession(f.ctx, ps.SessionID, f.tenant, "approver-2", true); !errors.Is(err, domain.ErrSessionNotPending) {
+	if _, err := f.s.DecidePrivilegedSession(f.ctx, ps.SessionID, f.tenant, "approver-2", true, nil); !errors.Is(err, domain.ErrSessionNotPending) {
 		t.Errorf("second decision: err %v, want ErrSessionNotPending", err)
 	}
 

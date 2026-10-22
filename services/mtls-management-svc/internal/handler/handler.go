@@ -3,9 +3,13 @@ package handler
 import (
 	"context"
 	"crypto/subtle"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
+	"fmt"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -199,6 +203,7 @@ func NewRouter(h *Handler) http.Handler {
 		r.Get("/certificates/{id}", h.GetCert)
 		r.Post("/certificates/{id}/rotate", h.RotateCert)
 		r.Delete("/certificates/{id}", h.RevokeCert)
+		r.Post("/certificates/csr", h.SignCSR) // CSR signing per O-2
 		r.Post("/policies", h.CreatePolicy)
 		r.Get("/policies", h.ListPolicies)
 	})
@@ -313,7 +318,12 @@ func (h *Handler) ProvisionCert(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.logger.Info("mtls: self-provisioning via bootstrap token", zap.String("service_name", service))
-		issued, err := h.ca.IssueLeaf(service, []string{service}, time.Duration(req.RotationDays)*24*time.Hour)
+		env := os.Getenv("ENV")
+		if env == "" {
+			env = "local"
+		}
+		uriSANs := []string{fmt.Sprintf("spiffe://zoiko/%s/%s", env, service)}
+		issued, err := h.ca.IssueLeaf(service, []string{service}, uriSANs, time.Duration(req.RotationDays)*24*time.Hour)
 		if err != nil {
 			h.logger.Error("failed to issue leaf certificate", zap.String("common_name", service), zap.Error(err))
 			h.errJSON(w, 500, "failed to issue certificate")
@@ -331,7 +341,13 @@ func (h *Handler) ProvisionCert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	issued, err := h.ca.IssueLeaf(req.CommonName, []string{req.ServiceName}, time.Duration(req.RotationDays)*24*time.Hour)
+	// Build URI SAN for SPIFFE identity per O-1: spiffe://zoiko/<env>/<service>
+	env := os.Getenv("ENV")
+	if env == "" {
+		env = "local"
+	}
+	uriSANs := []string{fmt.Sprintf("spiffe://zoiko/%s/%s", env, req.ServiceName)}
+	issued, err := h.ca.IssueLeaf(req.CommonName, []string{req.ServiceName}, uriSANs, time.Duration(req.RotationDays)*24*time.Hour)
 	if err != nil {
 		h.logger.Error("failed to issue leaf certificate", zap.String("common_name", req.CommonName), zap.Error(err))
 		h.errJSON(w, 500, "failed to issue certificate")
@@ -469,7 +485,12 @@ func (h *Handler) RotateCert(w http.ResponseWriter, r *http.Request) {
 	// the same CA — it is not a metadata refresh. The old private key
 	// (which this service never retained anyway) becomes unusable the
 	// moment the requesting service adopts the new one.
-	issued, err := h.ca.IssueLeaf(existing.CommonName, []string{existing.ServiceName}, time.Duration(existing.RotationDays)*24*time.Hour)
+	env := os.Getenv("ENV")
+	if env == "" {
+		env = "local"
+	}
+	uriSANs := []string{fmt.Sprintf("spiffe://zoiko/%s/%s", env, existing.ServiceName)}
+	issued, err := h.ca.IssueLeaf(existing.CommonName, []string{existing.ServiceName}, uriSANs, time.Duration(existing.RotationDays)*24*time.Hour)
 	if err != nil {
 		h.logger.Error("failed to issue rotated certificate", zap.String("id", id), zap.Error(err))
 		h.errJSON(w, 500, "failed to rotate certificate")
@@ -622,6 +643,148 @@ func (h *Handler) ListPolicies(w http.ResponseWriter, r *http.Request) {
 		pols = []domain.CommunicationPolicy{}
 	}
 	h.okJSON(w, 200, map[string]interface{}{"data": pols, "count": len(pols)})
+}
+
+// SignCSR handles POST /v1/mtls/certificates/csr — signs a CSR and returns
+// only the certificate, never a private key (per O-2).
+func (h *Handler) SignCSR(w http.ResponseWriter, r *http.Request) {
+	tenantID, ok := requireTenant(w, r)
+	if !ok {
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+
+	var req struct {
+		CSR           string `json:"csr"`
+		RotationDays  int    `json:"rotation_days"`
+		ServiceName   string `json:"service_name"`
+		LegalEntityID string `json:"legal_entity_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.errJSON(w, 400, "invalid body")
+		return
+	}
+	if req.CSR == "" {
+		h.errJSON(w, 400, "csr is required")
+		return
+	}
+	if req.ServiceName == "" {
+		h.errJSON(w, 400, "service_name is required")
+		return
+	}
+	if req.LegalEntityID == "" {
+		h.errJSON(w, 400, "legal_entity_id is required")
+		return
+	}
+	// Same decision as ProvisionCert: at the legal entity the certificate is for.
+	if !h.authorize(w, r, principalID, req.LegalEntityID, MtlsCertProvision) {
+		return
+	}
+	if req.RotationDays <= 0 {
+		req.RotationDays = 1
+	}
+	if req.RotationDays > 90 {
+		req.RotationDays = 90
+	}
+
+	// Parse the CSR
+	csrPEM := []byte(req.CSR)
+	block, _ := pem.Decode(csrPEM)
+	if block == nil || block.Type != "CERTIFICATE REQUEST" {
+		h.errJSON(w, 400, "invalid csr")
+		return
+	}
+	csr, err := x509.ParseCertificateRequest(block.Bytes)
+	if err != nil {
+		h.errJSON(w, 400, "invalid csr: "+err.Error())
+		return
+	}
+	if err := csr.CheckSignature(); err != nil {
+		h.errJSON(w, 400, "csr signature invalid")
+		return
+	}
+
+	// Verify the CSR's subject matches the requested service name
+	if csr.Subject.CommonName != req.ServiceName {
+		h.errJSONCode(w, 400, "csr_subject_mismatch", "CSR common name must match service_name")
+		return
+	}
+
+	// Verify the CSR's DNSNames include the service name
+	found := false
+	for _, dns := range csr.DNSNames {
+		if dns == req.ServiceName {
+			found = true
+			break
+		}
+	}
+	if !found {
+		h.errJSONCode(w, 400, "csr_dns_mismatch", "CSR DNS names must include service_name")
+		return
+	}
+
+	// Verify the CSR's URI SANs include the expected SPIFFE URI
+	env := os.Getenv("ENV")
+	if env == "" {
+		env = "local"
+	}
+	expectedURI := fmt.Sprintf("spiffe://zoiko/%s/%s", env, req.ServiceName)
+	foundURI := false
+	for _, uri := range csr.URIs {
+		if uri.String() == expectedURI {
+			foundURI = true
+			break
+		}
+	}
+	if !foundURI {
+		h.errJSONCode(w, 400, "csr_uri_mismatch", "CSR URI SANs must include "+expectedURI)
+		return
+	}
+
+	// Sign the CSR
+	issued, err := h.ca.SignCSR(csr, time.Duration(req.RotationDays)*24*time.Hour)
+	if err != nil {
+		h.logger.Error("failed to sign CSR", zap.String("service_name", req.ServiceName), zap.Error(err))
+		h.errJSON(w, 500, "failed to sign certificate")
+		return
+	}
+
+	// Record the certificate in the store
+	now := time.Now()
+	cert := &domain.MtlsCertificate{
+		TenantID:       tenantID,
+		LegalEntityID:  req.LegalEntityID,
+		ServiceName:    req.ServiceName,
+		CommonName:     req.ServiceName,
+		Issuer:         "ZoikoSuite Internal CA",
+		SerialNumber:   issued.SerialNumber,
+		Fingerprint:    issued.Fingerprint,
+		CertificatePEM: string(issued.CertificatePEM),
+		ValidFrom:      issued.NotBefore,
+		ValidTo:        issued.NotAfter,
+		RotationDays:   req.RotationDays,
+		AutoRotate:     true,
+		Status:         domain.CertStatusActive,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+	if err := h.store.CreateCert(r.Context(), tenantID, cert); err != nil {
+		h.errJSON(w, 500, "failed to provision certificate")
+		return
+	}
+
+	// Record audit
+	h.siem.Stream(r.Context(), tenantID, "certificate.issued", siem.SeverityLow,
+		"Certificate issued for "+req.ServiceName+" via CSR by "+principalID)
+
+	// Return only the certificate (no private key)
+	h.okJSON(w, 201, domain.ProvisionCertResult{
+		Certificate: *cert,
+		CACertPEM:   string(h.ca.CertificatePEM()),
+	})
 }
 
 func (h *Handler) okJSON(w http.ResponseWriter, code int, v interface{}) {

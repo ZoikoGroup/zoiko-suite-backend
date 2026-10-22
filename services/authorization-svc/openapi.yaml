@@ -1,0 +1,2949 @@
+openapi: "3.1.0"
+
+info:
+  title: Authorization Service
+  version: "1.0.0"
+  description: |
+    The platform's policy decision point (ZS-IAM-001). It answers `/v1/authorize`
+    and the ZS-IAM-001 §8 canonical decision API, serves the §8.3 inbound
+    evaluation APIs, and administers roles, assignments, delegations, SoD, ABAC,
+    workload bindings, privileged (JIT), break-glass and support sessions.
+
+    **Identity (register A-01).** Every route except the evaluation routes
+    (and probes) identifies the caller by the identity envelope
+    identity-context-svc minted, sent as `Authorization: Bearer <envelope>`
+    and verified against its JWKS. A presented envelope that does not verify
+    is `401 identity_assertion_invalid`. With none, a registered delegate
+    service (mTLS certificate CN, never a header) may act for the principal
+    it forwards; otherwise `AUTHZ_IDENTITY_ASSERTION=require` (the default
+    outside `ENV=local`) answers `401 identity_assertion_required`.
+
+    **Evaluation routes** (`/v1/authorize`, `/v1/sod/evaluate`,
+    `/v1/sod/validate`, `/v1/entity-scope/validate`,
+    `/v1/delegated-access/evaluate`, every `/internal/*` route) are gated by
+    the caller's client certificate (`AUTHZ_EVALUATION_MTLS=require` outside
+    `ENV=local`): no certificate is `401 client_certificate_required`; a CN
+    not on `AUTHZ_PEP_ALLOWLIST` is `403 workload_not_registered`; an
+    `X-Workload-Id` that names anyone but the CN is
+    `403 workload_identity_mismatch`. They take the subject from the request
+    body, not the identity envelope.
+
+    **Permissions.** Each admin route requires the named Authorization
+    Standard (ZS-IAM-001 Appendix A) permission, held at tenant scope unless
+    the route says *platform*. Missing it is `403 authorization_denied`, and
+    every gate check — including approvals and read gates — is itself
+    recorded as a decision. A SUSPENDED / DISABLED / TERMINATED principal is
+    refused wherever they hold the permission, with basis
+    `principal_status:<status>`.
+
+    **Errors.** `{"error": "<code>", "message": "...", "error_class":
+    "<class>"}`. `error` is the stable code callers match on; `error_class`
+    is the Governance Control Plane A16 class (`CONTEXT_UNRESOLVED`,
+    `AUTHORIZATION_DENIED`, `SOD_CONFLICT`, `APPROVAL_INVALIDATED`,
+    `CONCURRENCY_CONFLICT`, `IDEMPOTENCY_MISMATCH`), present where one
+    applies.
+
+    **Idempotency.** Every material write honours `Idempotency-Key`: a retry
+    returns the first response (`X-Idempotent-Replay: true`, `201` answered
+    as `200`); the same key with a different body is
+    `409 idempotency_mismatch`. Material writes also require
+    `X-Source-Channel` (`400 envelope_incomplete` otherwise).
+
+    **A16 command fields.** Privileged and destructive commands (marked **R**
+    in the route summaries) take `reason_code` and/or `purpose`; with
+    `AUTHZ_COMMAND_CONTRACT=enforce` (the default) a missing reason is `400
+    missing_field`. With `warn` it is admitted and marked
+    `X-Command-Contract: violated`.
+
+    **Optimistic concurrency.** Commands marked **V** take an optional
+    `expected_version`; a stale one is `409 version_conflict`.
+
+    **Tenant resolution.** The tenant of an evaluation is resolved on the
+    server, from `X-Tenant-Id` / body `tenant_id` and
+    tenant-entity-registry-svc's entity projection. A claimed tenant that
+    disagrees with the registry is `403 tenant_scope_mismatch`; an entity the
+    registry does not know is `403 tenant_scope_mismatch`; a tenantless
+    request whose principal holds nothing anywhere is `403 tenant_required`
+    (or `400 missing_tenant_scope` under
+    `AUTHZ_ENFORCE_TENANT_ON_AUTHORIZE=true`).
+
+    **Decision cache.** Decisions are cached in-process for 5 seconds per
+    (principal, scope, action, target), grants and denials alike;
+    `authorization.cache.invalidated` events drop the entry on every replica
+    within a few seconds. A revoked grant can therefore still authorize for
+    up to that window on a replica that cached it. `AUTHZ_CACHE_TTL_SECONDS=0`
+    disables the cache.
+
+    **Step-up.** Issuing or approving a privileged session and issuing a
+    break-glass session need a verified envelope with
+    `session_trust_posture.mfa_verified=true` and `auth_time` no older than
+    `AUTHZ_SESSION_STEP_UP_MAX_AGE_SECONDS` (900): otherwise `401
+    step_up_required`. Certain actions (reopen-class, `AUTHZ_STEP_UP_ACTIONS`)
+    need a recent authentication on the request itself: `X-Authn-Age-Seconds`
+    within `AUTHZ_STEP_UP_MAX_AUTHN_AGE_SECONDS` (300), else `STEP_UP`.
+
+    **Session maximums (B-01).** JIT 8 h, break-glass 2 h, support 4 h —
+    refused (`400`), never silently shortened.
+
+servers:
+  - url: http://localhost:8089
+    description: Local development
+  - url: https://api.zoiko.internal/authorization
+    description: Internal cluster ingress (gateway strips the /authorization prefix)
+
+tags:
+  - name: Evaluation
+    description: The inbound decision APIs other services call (ZS-IAM-001 §8.1–§8.3)
+  - name: Roles & Bundles
+    description: Role catalogue and permission bundles
+  - name: Role Assignments
+    description: Assignment grants with maker-checker on privileged roles
+  - name: Delegations
+    description: Time-boxed delegated authority (ZS-IAM-001 §11)
+  - name: Segregation of Duties
+    description: SoD rules and compensating-control exceptions (GOV-04)
+  - name: ABAC Rules
+    description: Attribute-based access rules
+  - name: Workload Bindings
+    description: Workload identity action bindings (ZS-IAM-001 §16)
+  - name: Privileged Sessions
+    description: Just-in-time privileged access management (ZS-IAM-001 §13)
+  - name: Break-Glass Sessions
+    description: Emergency incident sessions (ZS-IAM-001 §14)
+  - name: Support Sessions
+    description: Purpose-bound tenant support access (ZS-IAM-001 §15)
+  - name: Decision Log
+    description: ExplainAuthorization — retrieval of recorded decisions (GOV-03)
+  - name: GOV-03 Commands
+    description: Cache invalidation and effective-access recompute
+  - name: Read Surfaces
+    description: Available actions and caller capabilities
+
+security:
+  - identityEnvelope: []
+
+paths:
+  /v1/authorize:
+    post:
+      tags: [Evaluation]
+      summary: Make an authorization decision (ZS-IAM-001 §8.1)
+      description: |
+        The pipeline: identity → tenant resolution → RBAC (with ABAC conditions)
+        → delegation → SoD → JIT/break-glass/support elevation → step-up.
+        Decision is `GRANTED`, `DENIED` or `STEP_UP`; the `basis` names the
+        layer (`rbac:role=<code>`, `delegated:from=<principal>`,
+        `sod:conflict_with=<action>`, `abac:require_failed=<attr>`,
+        `principal_status:<status>`, `no_grant`, …). Recorded in
+        `access_decision_log` (append-only). Gated by client certificate, not
+        the identity envelope.
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - $ref: '#/components/parameters/LegalEntityHeader'
+        - $ref: '#/components/parameters/CorrelationID'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/WorkloadID'
+        - $ref: '#/components/parameters/AuthnAge'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AuthorizeRequest'
+      responses:
+        '200':
+          description: A decision was reached.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Decision'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: tenant_scope_mismatch / tenant_required / workload_not_registered / authorization_denied — fail-closed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          $ref: '#/components/responses/StoreUnavailable'
+
+  /internal/authorization/decisions:
+    post:
+      tags: [Evaluation]
+      summary: Canonical authorization decision API (ZS-IAM-001 §8.1/§8.2)
+      description: |
+        The same pipeline as `/v1/authorize`, with `subject_id`, `action`,
+        `resource_*`, `environment`, and the optional session ids; returns the
+        §8.2 decision (`PERMIT` / `DENY` / `STEP_UP` / `REQUIRE_APPROVAL`).
+        Gated by client certificate.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CanonicalDecisionRequest'
+      responses:
+        '200':
+          description: A canonical decision.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Decision'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '503':
+          $ref: '#/components/responses/StoreUnavailable'
+
+  /v1/entity-scope/validate:
+    post:
+      tags: [Evaluation]
+      summary: Validate that an entity scope belongs to the caller's tenant
+      description: |
+        ZS-IAM-001 §8.3. Another principal needs `iam.assignment.read`.
+        Gated by client certificate.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Principal, legal entity and the tenant to validate against.
+              additionalProperties: true
+      responses:
+        '200':
+          description: The scope resolution result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EntityScopeValidation'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /v1/sod/validate:
+    post:
+      tags: [Evaluation]
+      summary: Validate proposed grants against SoD rules
+      description: ZS-IAM-001 §8.3. Gated by client certificate.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        '200':
+          description: Conflicts found, if any.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SoDValidation'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /v1/sod/evaluate:
+    post:
+      tags: [Evaluation]
+      summary: Evaluate SoD for a principal and action
+      description: ZS-IAM-001 §8.3. Gated by client certificate.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        '200':
+          description: The SoD evaluation result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SoDValidation'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /v1/delegated-access/evaluate:
+    post:
+      tags: [Evaluation]
+      summary: Evaluate delegated access for a principal and action
+      description: |
+        ZS-IAM-001 §8.3. Gated by client certificate.
+
+        With `delegator_principal_id` (and `action_type`, then required) the
+        question narrows to one delegator: does the principal hold the action
+        by a live delegation FROM that principal. The answer then carries
+        `delegation_id`. Workflow approval uses this for a delegate acting on a
+        stage that names its approver.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                principal_id: { type: string }
+                legal_entity_id: { type: string }
+                action_type: { type: string }
+                delegator_principal_id: { type: string }
+              required: [principal_id, legal_entity_id]
+              additionalProperties: true
+      responses:
+        '200':
+          description: The delegation evaluation result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DelegatedAccessEvaluation'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /v1/{resource_type}/{resource_id}/available-actions:
+    get:
+      tags: [Read Surfaces]
+      summary: Actions the caller may take on a resource
+      description: |
+        Classified by the same pipeline as `/v1/authorize`. The legal entity
+        must belong to the caller's tenant (`403 tenant_scope_mismatch`
+        otherwise). Another principal needs `iam.assignment.read`.
+
+        The router serves this path under two spellings —
+        `/v1/{resource_type}/{resource_id}/available-actions` and
+        `/v1/{resource}/{id}/available-actions`. They are the same route; the
+        document carries the canonical one only, because OpenAPI forbids two
+        conflicting templates.
+      parameters:
+        - name: resource_type
+          in: path
+          required: true
+          schema: { type: string }
+        - name: resource_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Available actions for the caller.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AvailableActions'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /v1/me/capabilities:
+    get:
+      tags: [Read Surfaces]
+      summary: The caller's own capabilities
+      description: Uses the verified caller only.
+      responses:
+        '200':
+          description: The caller's capabilities.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Capabilities'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /v1/access-decisions:
+    get:
+      tags: [Decision Log]
+      summary: List access decisions (GOV-03 ExplainAuthorization)
+      description: |
+        `iam.policy.read` for the tenant's log. Without it, only the caller's
+        own decisions, with `decision_basis` redacted to `"redacted"` and
+        matched grants / delegation removed — the reason codes remain.
+        Asking for another principal is `403`.
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - name: principal_id
+          in: query
+          schema: { type: string }
+        - name: action_type
+          in: query
+          schema: { type: string }
+        - name: decision
+          in: query
+          schema: { type: string, enum: [PERMIT, DENY, STEP_UP, REQUIRE_APPROVAL] }
+        - name: limit
+          in: query
+          schema: { type: integer, maximum: 100, default: 50 }
+        - name: offset
+          in: query
+          schema: { type: integer, default: 0 }
+      responses:
+        '200':
+          description: A page of decisions.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  decisions:
+                    type: array
+                    items: { $ref: '#/components/schemas/AccessDecision' }
+                  count: { type: integer }
+                  limit: { type: integer }
+                  offset: { type: integer }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /v1/access-decisions/{access_decision_id}:
+    get:
+      tags: [Decision Log]
+      summary: Retrieve one decision by id
+      description: Another principal's decision without `iam.policy.read` is `404`.
+      parameters:
+        - name: access_decision_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: The decision.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccessDecision'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/admin/roles:
+    post:
+      tags: [Roles & Bundles]
+      summary: Create a role
+      description: '`iam.role.manage`. Idempotent on (tenant, role_code): `201` / `200`.'
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - $ref: '#/components/parameters/LegalEntityHeader'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/SourceChannel'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateRoleRequest'
+      responses:
+        '201':
+          description: Role created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Role'
+        '200':
+          description: Idempotent replay of a role already created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Role'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+    get:
+      tags: [Roles & Bundles]
+      summary: List the tenant's roles
+      description: '`iam.role.read`. Tenant-scoped catalogue.'
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - $ref: '#/components/parameters/LegalEntityHeader'
+      responses:
+        '200':
+          description: The tenant's roles.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  roles:
+                    type: array
+                    items: { $ref: '#/components/schemas/Role' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /v1/admin/roles/{role_id}/retire:
+    post:
+      tags: [Roles & Bundles]
+      summary: Retire a role (R, V)
+      description: '`iam.role.manage`. Takes `reason_code` or `purpose` and optional `expected_version`.'
+      parameters:
+        - name: role_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        $ref: '#/components/requestBodies/CommandBody'
+      responses:
+        '200':
+          description: Role retired.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Role'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: 'Forbidden — including `self_grant_not_allowed` on reactivation of a held role.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: 'Conflict — `version_conflict`, or `sod_conflict` naming the holders.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/admin/roles/{role_id}/reactivate:
+    post:
+      tags: [Roles & Bundles]
+      summary: Reactivate a role (R, V)
+      description: '`iam.role.manage`. Reactivating a role you hold is `403 self_grant_not_allowed`; reactivating one that would give a holder an SoD conflict is `409 sod_conflict` listing the holders.'
+      parameters:
+        - name: role_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        $ref: '#/components/requestBodies/CommandBody'
+      responses:
+        '200':
+          description: Role reactivated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Role'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: 'Forbidden — including `self_grant_not_allowed`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: 'Conflict — `version_conflict` or `sod_conflict`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/admin/roles/{role_id}/permission-bundles:
+    post:
+      tags: [Roles & Bundles]
+      summary: Create or replace a permission bundle (V)
+      description: |
+        `iam.permission_bundle.manage` — *platform* if the bundle names a
+        protected platform-admin permission (`SOD_RULE_MANAGE_GLOBAL`,
+        `ABAC_RULE_MANAGE_GLOBAL`, `security.*`, `platform.*`). Replace only:
+        `201` created / `200` replaced. Refused on a role you hold (`403`) or
+        if it gives a holder an SoD conflict (`409`).
+      parameters:
+        - name: role_id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/SourceChannel'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreatePermissionBundleRequest'
+      responses:
+        '201':
+          description: Bundle created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PermissionBundle'
+        '200':
+          description: Bundle replaced.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PermissionBundle'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+    get:
+      tags: [Roles & Bundles]
+      summary: List a role's permission bundles
+      description: '`iam.role.read`. Includes retired bundles.'
+      parameters:
+        - name: role_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: The role's bundles.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  permission_bundles:
+                    type: array
+                    items: { $ref: '#/components/schemas/PermissionBundle' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/admin/permission-bundles/{permission_bundle_id}/retire:
+    post:
+      tags: [Roles & Bundles]
+      summary: Retire a permission bundle (R, V)
+      description: '`iam.permission_bundle.manage`.'
+      parameters:
+        - name: permission_bundle_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        $ref: '#/components/requestBodies/CommandBody'
+      responses:
+        '200':
+          description: Bundle retired.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PermissionBundle'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /v1/admin/permission-bundles/{permission_bundle_id}/reactivate:
+    post:
+      tags: [Roles & Bundles]
+      summary: Reactivate a permission bundle (R, V)
+      description: '`iam.permission_bundle.manage`. Reactivation checks self-grant and SoD as creation does.'
+      parameters:
+        - name: permission_bundle_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        $ref: '#/components/requestBodies/CommandBody'
+      responses:
+        '200':
+          description: Bundle reactivated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PermissionBundle'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /v1/admin/role-assignments:
+    post:
+      tags: [Role Assignments]
+      summary: Grant a role assignment (maker-checker on privileged roles)
+      description: |
+        `iam.assignment.grant` (*platform* for `legal_entity_id` = the
+        platform scope). Self-assignment `403`; SoD conflict at the
+        assignment's scope `409`. A privileged role (one granting any `iam.*`
+        or protected platform action), or a platform-scope assignment by a
+        caller without `iam.assignment.approve_privileged`, is recorded
+        `PENDING_APPROVAL` (`202`) and grants nothing until approved; with it,
+        `201` `APPROVED`, `approved_by` = caller.
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - $ref: '#/components/parameters/LegalEntityHeader'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/SourceChannel'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateRoleAssignmentRequest'
+      responses:
+        '201':
+          description: Assignment approved and active.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoleAssignment'
+        '202':
+          description: PENDING_APPROVAL — recorded but granting nothing until an independent approver approves.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoleAssignment'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: 'Forbidden — including `self_grant_not_allowed`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: 'Conflict — `sod_conflict` at the assignment scope, or `idempotency_mismatch`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+    get:
+      tags: [Role Assignments]
+      summary: List role assignments
+      description: '`iam.assignment.read`. Shows `approval_status`.'
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - $ref: '#/components/parameters/LegalEntityHeader'
+        - name: principal_id
+          in: query
+          schema: { type: string }
+      responses:
+        '200':
+          description: The tenant's assignments.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  role_assignments:
+                    type: array
+                    items: { $ref: '#/components/schemas/RoleAssignment' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /v1/admin/role-assignments/{assignment_id}/approve:
+    post:
+      tags: [Role Assignments]
+      summary: Approve a pending assignment (R)
+      description: |
+        `iam.assignment.approve_privileged` (*platform* for a platform-scope
+        assignment). The checker must be neither the requester nor the target
+        (`403 checker_not_independent`); approval re-runs the SoD check.
+        Pending requests expire after 72 h (`409 approval_expired`).
+      parameters:
+        - name: assignment_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        $ref: '#/components/requestBodies/CommandBody'
+      responses:
+        '200':
+          description: Assignment approved.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoleAssignment'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: 'Forbidden — including `checker_not_independent`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: 'Conflict — `approval_expired`, `sod_conflict` after re-check, or `version_conflict`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/admin/role-assignments/{assignment_id}/reject:
+    post:
+      tags: [Role Assignments]
+      summary: Reject a pending assignment (R)
+      description: '`iam.assignment.approve_privileged` (*platform* for a platform-scope assignment).'
+      parameters:
+        - name: assignment_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        $ref: '#/components/requestBodies/CommandBody'
+      responses:
+        '200':
+          description: Assignment rejected and grants nothing.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoleAssignment'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /v1/admin/role-assignments/{assignment_id}/revoke:
+    post:
+      tags: [Role Assignments]
+      summary: Revoke an assignment (R)
+      description: '`iam.assignment.revoke` (*platform* for a platform-scope assignment). `{"effective_to": ...}` schedules the end instead of ending now.'
+      parameters:
+        - name: assignment_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason_code: { type: string }
+                purpose: { type: string }
+                effective_to:
+                  type: string
+                  format: date-time
+                expected_version: { type: integer }
+              additionalProperties: true
+      responses:
+        '200':
+          description: Assignment revoked or scheduled to end.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoleAssignment'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /v1/admin/delegated-authorities:
+    post:
+      tags: [Delegations]
+      summary: Grant delegated authority (ZS-IAM-001 §11)
+      description: |
+        `iam.delegation.grant`. The delegator must be the caller; no
+        self-delegation. `delegated_actions` may not name an `iam.*` or
+        protected platform action (`400 protected_privilege_not_delegable`),
+        and a full-authority delegation never confers them. `effective_to` is
+        required under `enforce`; under `warn` it defaults to 90 days.
+        `reason` (R) and `approval_reference` are recorded.
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - $ref: '#/components/parameters/LegalEntityHeader'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/SourceChannel'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateDelegationRequest'
+      responses:
+        '201':
+          description: Delegation granted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Delegation'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+    get:
+      tags: [Delegations]
+      summary: List delegations
+      description: '`iam.delegation.read`.'
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - $ref: '#/components/parameters/LegalEntityHeader'
+      responses:
+        '200':
+          description: The tenant's delegations.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  delegations:
+                    type: array
+                    items: { $ref: '#/components/schemas/Delegation' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /v1/admin/delegated-authorities/{delegation_id}/revoke:
+    post:
+      tags: [Delegations]
+      summary: Revoke a delegation (R)
+      description: '`iam.delegation.revoke`. Delegator only.'
+      parameters:
+        - name: delegation_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        $ref: '#/components/requestBodies/CommandBody'
+      responses:
+        '200':
+          description: Delegation revoked.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Delegation'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /v1/admin/sod-rules:
+    post:
+      tags: [Segregation of Duties]
+      summary: Create a SoD rule
+      description: '`iam.sod_rule.manage`; *platform* `SOD_RULE_MANAGE_GLOBAL` for a rule with no `tenant_id`.'
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/SourceChannel'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateSoDRuleRequest'
+      responses:
+        '201':
+          description: Rule created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SoDRule'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: 'Forbidden — a tenant-wide rule without `SOD_RULE_MANAGE_GLOBAL` is `403 authorization_denied`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          $ref: '#/components/responses/Conflict'
+    get:
+      tags: [Segregation of Duties]
+      summary: List SoD rules
+      description: '`iam.sod_rule.read`. Tenant and platform-wide rules.'
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+      responses:
+        '200':
+          description: The rules visible to the tenant.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sod_rules:
+                    type: array
+                    items: { $ref: '#/components/schemas/SoDRule' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /v1/admin/sod-rules/{sod_rule_id}/retire:
+    post:
+      tags: [Segregation of Duties]
+      summary: Retire a SoD rule (R, V)
+      description: '`iam.sod_rule.manage`. A principal holding either action of the rule cannot retire it (`403 sod_self_interest`).'
+      parameters:
+        - name: sod_rule_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        $ref: '#/components/requestBodies/CommandBody'
+      responses:
+        '200':
+          description: Rule retired.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SoDRule'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: 'Forbidden — including `sod_self_interest`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /v1/admin/sod-rules/{sod_rule_id}/reactivate:
+    post:
+      tags: [Segregation of Duties]
+      summary: Reactivate a SoD rule (R, V)
+      description: '`iam.sod_rule.manage`.'
+      parameters:
+        - name: sod_rule_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        $ref: '#/components/requestBodies/CommandBody'
+      responses:
+        '200':
+          description: Rule reactivated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SoDRule'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /v1/sod/conflicting-permissions:
+    get:
+      tags: [Segregation of Duties]
+      summary: List permissions conflicting with an action (GOV-04)
+      description: GOV-04 ListConflictingPermissions.
+      parameters:
+        - name: action_type
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: The conflicting actions, by rule.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /v1/admin/sod-exceptions:
+    post:
+      tags: [Segregation of Duties]
+      summary: Request a compensating-control exception
+      description: |
+        `iam.sod_rule.manage`. `sod_rule_id`, `principal_id`,
+        `compensating_control`, `reason`, `effective_from?`, `expires_at`
+        (required — exceptions always expire). Recorded `REQUESTED`.
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/SourceChannel'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateSoDExceptionRequest'
+      responses:
+        '201':
+          description: Exception requested.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SoDException'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+    get:
+      tags: [Segregation of Duties]
+      summary: List SoD exceptions
+      description: '`iam.sod_rule.read`.'
+      parameters:
+        - name: principal_id
+          in: query
+          schema: { type: string }
+        - name: status
+          in: query
+          schema: { type: string, enum: [REQUESTED, APPROVED, REJECTED, REVOKED, EXPIRED] }
+      responses:
+        '200':
+          description: The exceptions matching the filter.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sod_exceptions:
+                    type: array
+                    items: { $ref: '#/components/schemas/SoDException' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /v1/admin/sod-exceptions/{sod_exception_id}/approve:
+    post:
+      tags: [Segregation of Duties]
+      summary: Approve a SoD exception (R)
+      description: |
+        `iam.sod_rule.publish`. Never by the requester or the subject (also a
+        database CHECK). While APPROVED and in its period the conflict permits
+        with obligation `COMPENSATING_CONTROL:<control>` and reason code
+        `SOD_EXCEPTION_APPLIED`; it stops the instant it expires.
+      parameters:
+        - name: sod_exception_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        $ref: '#/components/requestBodies/CommandBody'
+      responses:
+        '200':
+          description: Exception approved.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SoDException'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: 'Forbidden — requester or subject: `checker_not_independent`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /v1/admin/sod-exceptions/{sod_exception_id}/reject:
+    post:
+      tags: [Segregation of Duties]
+      summary: Reject a SoD exception (R)
+      description: '`iam.sod_rule.publish`. Never by the requester or the subject.'
+      parameters:
+        - name: sod_exception_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        $ref: '#/components/requestBodies/CommandBody'
+      responses:
+        '200':
+          description: Exception rejected.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SoDException'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /v1/admin/sod-exceptions/{sod_exception_id}/revoke:
+    post:
+      tags: [Segregation of Duties]
+      summary: Revoke a SoD exception (R)
+      description: '`iam.sod_rule.manage`.'
+      parameters:
+        - name: sod_exception_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        $ref: '#/components/requestBodies/CommandBody'
+      responses:
+        '200':
+          description: Exception revoked.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SoDException'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /v1/admin/abac-rules:
+    post:
+      tags: [ABAC Rules]
+      summary: Create an ABAC rule
+      description: '`iam.abac_rule.manage`; *platform* `ABAC_RULE_MANAGE_GLOBAL` for a platform-wide rule.'
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/SourceChannel'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: 'Rule code, action, effect and conditions. A REQUIRE rule whose attribute the caller does not send is a denial (`abac:require_failed`).'
+              additionalProperties: true
+      responses:
+        '201':
+          description: Rule created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ABACRule'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+    get:
+      tags: [ABAC Rules]
+      summary: List ABAC rules
+      description: '`iam.policy.read`.'
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+      responses:
+        '200':
+          description: The rules visible to the tenant.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  abac_rules:
+                    type: array
+                    items: { $ref: '#/components/schemas/ABACRule' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /v1/admin/abac-rules/{abac_rule_id}/retire:
+    post:
+      tags: [ABAC Rules]
+      summary: Retire an ABAC rule (R, V)
+      description: '`iam.abac_rule.manage`.'
+      parameters:
+        - name: abac_rule_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        $ref: '#/components/requestBodies/CommandBody'
+      responses:
+        '200':
+          description: Rule retired.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ABACRule'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /v1/admin/abac-rules/{abac_rule_id}/reactivate:
+    post:
+      tags: [ABAC Rules]
+      summary: Reactivate an ABAC rule (R, V)
+      description: '`iam.abac_rule.manage`.'
+      parameters:
+        - name: abac_rule_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        $ref: '#/components/requestBodies/CommandBody'
+      responses:
+        '200':
+          description: Rule reactivated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ABACRule'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /v1/admin/workload-bindings:
+    post:
+      tags: [Workload Bindings]
+      summary: Save a workload binding (R)
+      description: '`iam.workload.manage`. `{workload_id, allowed_audience, allowed_actions[]}`; creates or replaces the binding in the caller''s tenant. Wildcard audience or action, or no actions → `400`.'
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/SourceChannel'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [workload_id, allowed_audience, allowed_actions]
+              properties:
+                workload_id: { type: string }
+                allowed_audience: { type: string }
+                allowed_actions:
+                  type: array
+                  minItems: 1
+                  items: { type: string }
+      responses:
+        '200':
+          description: Binding saved.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkloadBinding'
+        '201':
+          description: Binding created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkloadBinding'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    get:
+      tags: [Workload Bindings]
+      summary: List workload bindings
+      description: '`iam.workload.manage`. The tenant''s bindings, active and not.'
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+      responses:
+        '200':
+          description: The tenant's bindings.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  workload_bindings:
+                    type: array
+                    items: { $ref: '#/components/schemas/WorkloadBinding' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /v1/admin/workload-bindings/{workload_id}/deactivate:
+    post:
+      tags: [Workload Bindings]
+      summary: Deactivate a workload binding (R)
+      description: '`iam.workload.manage`. Unknown binding → `404`.'
+      parameters:
+        - name: workload_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        $ref: '#/components/requestBodies/CommandBody'
+      responses:
+        '200':
+          description: Binding deactivated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkloadBinding'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/admin/workload-bindings/{workload_id}/reactivate:
+    post:
+      tags: [Workload Bindings]
+      summary: Reactivate a workload binding (R)
+      description: '`iam.workload.manage`. Unknown binding → `404`.'
+      parameters:
+        - name: workload_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        $ref: '#/components/requestBodies/CommandBody'
+      responses:
+        '200':
+          description: Binding reactivated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkloadBinding'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /admin/v1/privileged-sessions:
+    post:
+      tags: [Privileged Sessions]
+      summary: Issue a JIT privileged session (R)
+      description: |
+        `iam.pam.manage`. Body: `principal_id` (default the caller),
+        `requested_actions`, `ticket_ref`, `reason`, `duration_seconds`,
+        `resource_scope`, `target_environment` — all mandatory (§13). The
+        subject must hold `iam.pam.eligible`. Any action that is not a pure
+        read → `202 PENDING_APPROVAL`, granting nothing; otherwise `201`
+        ACTIVE. Needs the caller's step-up (`401 step_up_required`
+        otherwise). Max `AUTHZ_MAX_JIT_SECONDS` (8 h); longer is `400
+        duration_exceeds_maximum`.
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/SourceChannel'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreatePrivilegedSessionRequest'
+      responses:
+        '201':
+          description: Session ACTIVE (read-only request).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PrivilegedSession'
+        '202':
+          description: PENDING_APPROVAL — grants nothing until an independent approver approves.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PrivilegedSession'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/StepUpRequired'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    get:
+      tags: [Privileged Sessions]
+      summary: List privileged sessions
+      description: Registers need `iam.pam.manage`; your own sessions are readable without it, another principal's session by id is `404`.
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+      responses:
+        '200':
+          description: The sessions visible to the caller.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sessions:
+                    type: array
+                    items: { $ref: '#/components/schemas/PrivilegedSession' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /v1/admin/privileged-sessions:
+    post:
+      tags: [Privileged Sessions]
+      summary: Issue a JIT privileged session (R) — /v1/admin spelling
+      description: Identical to `POST /admin/v1/privileged-sessions`; both spellings are served.
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/SourceChannel'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreatePrivilegedSessionRequest'
+      responses:
+        '201':
+          description: Session ACTIVE (read-only request).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PrivilegedSession'
+        '202':
+          description: PENDING_APPROVAL.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PrivilegedSession'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/StepUpRequired'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    get:
+      tags: [Privileged Sessions]
+      summary: List privileged sessions — /v1/admin spelling
+      description: Identical to `GET /admin/v1/privileged-sessions`.
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+      responses:
+        '200':
+          description: The sessions visible to the caller.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sessions:
+                    type: array
+                    items: { $ref: '#/components/schemas/PrivilegedSession' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /admin/v1/privileged-sessions/{session_id}/approve:
+    post:
+      tags: [Privileged Sessions]
+      summary: Approve a pending JIT session (R)
+      description: '`iam.pam.approve`. Never the subject or the requester (`403 checker_not_independent`; also a DB CHECK). Approval needs the approver''s own step-up; rejection does not. The clock starts at approval. Pending requests expire after 24 h.'
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        $ref: '#/components/requestBodies/CommandBody'
+      responses:
+        '200':
+          description: Session ACTIVE.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PrivilegedSession'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/StepUpRequired'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /v1/admin/privileged-sessions/{session_id}/approve:
+    post:
+      tags: [Privileged Sessions]
+      summary: Approve a pending JIT session (R) — /v1/admin spelling
+      description: Identical to `POST /admin/v1/privileged-sessions/{session_id}/approve`.
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        $ref: '#/components/requestBodies/CommandBody'
+      responses:
+        '200':
+          description: Session ACTIVE.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PrivilegedSession'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/StepUpRequired'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/v1/privileged-sessions/{session_id}/reject:
+    post:
+      tags: [Privileged Sessions]
+      summary: Reject a pending JIT session (R)
+      description: '`iam.pam.approve`. Never the subject or the requester.'
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        $ref: '#/components/requestBodies/CommandBody'
+      responses:
+        '200':
+          description: Session rejected.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PrivilegedSession'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /v1/admin/privileged-sessions/{session_id}/reject:
+    post:
+      tags: [Privileged Sessions]
+      summary: Reject a pending JIT session (R) — /v1/admin spelling
+      description: Identical to `POST /admin/v1/privileged-sessions/{session_id}/reject`.
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        $ref: '#/components/requestBodies/CommandBody'
+      responses:
+        '200':
+          description: Session rejected.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PrivilegedSession'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/v1/privileged-sessions/{session_id}/revoke:
+    post:
+      tags: [Privileged Sessions]
+      summary: Revoke a privileged session (R)
+      description: '`iam.pam.manage`.'
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        $ref: '#/components/requestBodies/CommandBody'
+      responses:
+        '200':
+          description: Session revoked.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PrivilegedSession'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /v1/admin/privileged-sessions/{session_id}/revoke:
+    post:
+      tags: [Privileged Sessions]
+      summary: Revoke a privileged session (R) — /v1/admin spelling
+      description: Identical to `POST /admin/v1/privileged-sessions/{session_id}/revoke`.
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        $ref: '#/components/requestBodies/CommandBody'
+      responses:
+        '200':
+          description: Session revoked.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PrivilegedSession'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/v1/privileged-sessions/{session_id}/review:
+    post:
+      tags: [Privileged Sessions]
+      summary: Review an ended JIT session
+      description: |
+        `iam.session.review`. `{"outcome": "ATTESTED" | "FLAGGED", "notes"}`;
+        FLAGGED needs notes and raises a CRITICAL SIEM alert. Reviewer is never
+        the subject or the requester. A review is opened when a high-impact
+        JIT session ends.
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SessionReviewRequest'
+      responses:
+        '200':
+          description: Review recorded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PrivilegedSession'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /v1/admin/privileged-sessions/{session_id}/review:
+    post:
+      tags: [Privileged Sessions]
+      summary: Review an ended JIT session — /v1/admin spelling
+      description: Identical to `POST /admin/v1/privileged-sessions/{session_id}/review`.
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SessionReviewRequest'
+      responses:
+        '200':
+          description: Review recorded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PrivilegedSession'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/v1/break-glass-sessions:
+    post:
+      tags: [Break-Glass Sessions]
+      summary: Issue a break-glass session (R)
+      description: |
+        `iam.break_glass.manage`. `incident_id` (A16), `reason`,
+        `requested_actions`. The subject must hold `iam.break_glass.eligible`.
+        No payment / posting / filing power (§14 "separately constrained").
+        CRITICAL SIEM alert on issue. Needs the caller's step-up. Max
+        `AUTHZ_MAX_BREAK_GLASS_SECONDS` (2 h); longer is `400`.
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/SourceChannel'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateBreakGlassSessionRequest'
+      responses:
+        '201':
+          description: Session ACTIVE.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BreakGlassSession'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/StepUpRequired'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    get:
+      tags: [Break-Glass Sessions]
+      summary: List break-glass sessions
+      description: Registers need the administering permission; your own are readable without it.
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+      responses:
+        '200':
+          description: The sessions visible to the caller.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sessions:
+                    type: array
+                    items: { $ref: '#/components/schemas/BreakGlassSession' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /v1/admin/break-glass-sessions:
+    post:
+      tags: [Break-Glass Sessions]
+      summary: Issue a break-glass session (R) — /v1/admin spelling
+      description: Identical to `POST /admin/v1/break-glass-sessions`.
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/SourceChannel'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateBreakGlassSessionRequest'
+      responses:
+        '201':
+          description: Session ACTIVE.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BreakGlassSession'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/StepUpRequired'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    get:
+      tags: [Break-Glass Sessions]
+      summary: List break-glass sessions — /v1/admin spelling
+      description: Identical to `GET /admin/v1/break-glass-sessions`.
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+      responses:
+        '200':
+          description: The sessions visible to the caller.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sessions:
+                    type: array
+                    items: { $ref: '#/components/schemas/BreakGlassSession' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /admin/v1/break-glass-sessions/{session_id}:
+    get:
+      tags: [Break-Glass Sessions]
+      summary: Retrieve a break-glass session
+      description: Another principal's session by id is `404` without the administering permission.
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: The session.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BreakGlassSession'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/admin/break-glass-sessions/{session_id}:
+    get:
+      tags: [Break-Glass Sessions]
+      summary: Retrieve a break-glass session — /v1/admin spelling
+      description: Identical to `GET /admin/v1/break-glass-sessions/{session_id}`.
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: The session.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BreakGlassSession'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /admin/v1/break-glass-sessions/{session_id}/revoke:
+    post:
+      tags: [Break-Glass Sessions]
+      summary: Revoke a break-glass session (R)
+      description: '`iam.break_glass.manage`.'
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        $ref: '#/components/requestBodies/CommandBody'
+      responses:
+        '200':
+          description: Session revoked.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BreakGlassSession'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /v1/admin/break-glass-sessions/{session_id}/revoke:
+    post:
+      tags: [Break-Glass Sessions]
+      summary: Revoke a break-glass session (R) — /v1/admin spelling
+      description: Identical to `POST /admin/v1/break-glass-sessions/{session_id}/revoke`.
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        $ref: '#/components/requestBodies/CommandBody'
+      responses:
+        '200':
+          description: Session revoked.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BreakGlassSession'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/v1/break-glass-sessions/{session_id}/review:
+    post:
+      tags: [Break-Glass Sessions]
+      summary: Review a break-glass session
+      description: '`iam.session.review`. A review is opened for any break-glass session that ends. FLAGGED needs notes and raises a CRITICAL SIEM alert. Reviewer is never the subject or the requester.'
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SessionReviewRequest'
+      responses:
+        '200':
+          description: Review recorded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BreakGlassSession'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /v1/admin/break-glass-sessions/{session_id}/review:
+    post:
+      tags: [Break-Glass Sessions]
+      summary: Review a break-glass session — /v1/admin spelling
+      description: Identical to `POST /admin/v1/break-glass-sessions/{session_id}/review`.
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SessionReviewRequest'
+      responses:
+        '200':
+          description: Review recorded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BreakGlassSession'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /v1/support/sessions:
+    post:
+      tags: [Support Sessions]
+      summary: Open a tenant support session (R)
+      description: |
+        `iam.support.manage`. `ticket_ref`, `purpose`, and
+        `tenant_consent_obtained` stated explicitly (400 if omitted).
+        Read-only by default: grants read verbs only. A writable session also
+        grants only the writes named in `allowed_actions`. No consent →
+        nothing granted. Bulk export off unless `allow_bulk_export`. Max
+        `AUTHZ_MAX_SUPPORT_SECONDS` (4 h); longer is `400`.
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/SourceChannel'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateSupportSessionRequest'
+      responses:
+        '201':
+          description: Session opened.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SupportSession'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    get:
+      tags: [Support Sessions]
+      summary: List support sessions
+      description: Registers need the administering permission; your own are readable without it.
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+      responses:
+        '200':
+          description: The sessions visible to the caller.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sessions:
+                    type: array
+                    items: { $ref: '#/components/schemas/SupportSession' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /v1/support/sessions/{session_id}:
+    get:
+      tags: [Support Sessions]
+      summary: Retrieve a support session
+      description: Another principal's session by id is `404` without the administering permission.
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: The session.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SupportSession'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/support/sessions/{session_id}/revoke:
+    post:
+      tags: [Support Sessions]
+      summary: Revoke a support session (R)
+      description: '`iam.support.manage`.'
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        $ref: '#/components/requestBodies/CommandBody'
+      responses:
+        '200':
+          description: Session revoked.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SupportSession'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /v1/admin/authorization-cache/invalidate:
+    post:
+      tags: [GOV-03 Commands]
+      summary: Invalidate this replica's authorization cache (R)
+      description: |
+        `iam.policy.publish`. Drops this replica's cache for the tenant and
+        emits `authorization.cache.invalidated`; every replica's invalidator
+        (own consumer group per replica) drops its own.
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/SourceChannel'
+      responses:
+        '200':
+          description: Cache invalidated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /internal/v1/gov03/commands/invalidateAuthorizationCache:
+    post:
+      tags: [GOV-03 Commands]
+      summary: Invalidate this replica's authorization cache (internal alias)
+      description: Identical to `POST /v1/admin/authorization-cache/invalidate`, under the GOV-03 command path.
+      security: []
+      requestBody:
+        $ref: '#/components/requestBodies/CommandBody'
+      responses:
+        '200':
+          description: Cache invalidated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /v1/admin/subjects/{principal_id}/effective-access/recompute:
+    post:
+      tags: [GOV-03 Commands]
+      summary: Recompute a subject's effective access
+      description: '`iam.assignment.read` for another subject. Recomputes from the store: each assignment, whether it grants now, its actions, and the union.'
+      parameters:
+        - name: principal_id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/TenantHeader'
+      responses:
+        '200':
+          description: The recomputed effective access.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EffectiveAccess'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /internal/v1/gov03/commands/recomputeSubjectEffectiveAccess:
+    post:
+      tags: [GOV-03 Commands]
+      summary: Recompute a subject's effective access (internal alias)
+      description: Identical to `POST /v1/admin/subjects/{principal_id}/effective-access/recompute`; `principal_id` in body.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [principal_id]
+              properties:
+                principal_id: { type: string }
+      responses:
+        '200':
+          description: The recomputed effective access.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EffectiveAccess'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+components:
+  securitySchemes:
+    identityEnvelope:
+      type: http
+      scheme: bearer
+      description: |
+        The identity envelope identity-context-svc minted (RS256 JWT, verified
+        against its JWKS: issuer, audience, expiry). Principal and tenant come
+        from the envelope. Evaluation routes instead require a client
+        certificate (`AUTHZ_EVALUATION_MTLS`); the canonical and gov03
+        internal routes accept either.
+
+  parameters:
+    TenantHeader:
+      name: X-Tenant-Id
+      in: header
+      required: false
+      schema: { type: string }
+      description: Caller's tenant; must agree with the identity envelope when present.
+    LegalEntityHeader:
+      name: X-Legal-Entity-Id
+      in: header
+      required: false
+      schema: { type: string }
+      description: Legal-entity scope of the request.
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: { type: string }
+      description: 'Required on material writes. Retry returns the first response (`X-Idempotent-Replay: true`); same key with a different body is `409 idempotency_mismatch`.'
+    SourceChannel:
+      name: X-Source-Channel
+      in: header
+      required: true
+      schema: { type: string }
+      description: Required on material writes; a missing channel is `400 envelope_incomplete`.
+    CorrelationID:
+      name: X-Correlation-ID
+      in: header
+      required: false
+      schema: { type: string }
+      description: Correlation id echoed on the response and recorded with the decision.
+    WorkloadID:
+      name: X-Workload-Id
+      in: header
+      required: false
+      schema: { type: string }
+      description: Set from the client certificate CN; naming anyone else is `403 workload_identity_mismatch`.
+    AuthnAge:
+      name: X-Authn-Age-Seconds
+      in: header
+      required: false
+      schema: { type: integer }
+      description: Age of the caller's last authentication; required for step-up-gated actions under `AUTHZ_STEP_UP_UNKNOWN_AGE=step_up`.
+
+  requestBodies:
+    CommandBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              reason_code: { type: string }
+              purpose: { type: string }
+              expected_version: { type: integer }
+            additionalProperties: true
+      description: A16 command fields; `reason_code` or `purpose` required where the route is marked R, `expected_version` honoured where marked V.
+
+  responses:
+    BadRequest:
+      description: 'Bad request — `400`. Codes include `missing_field`, `envelope_incomplete`, `invalid_json`, `duration_exceeds_maximum`, `protected_privilege_not_delegable`, `missing_tenant_scope`.'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unauthorized:
+      description: 'Unauthorized — `401`. Codes include `identity_assertion_required`, `identity_assertion_invalid`, `client_certificate_required`, `step_up_required`.'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Forbidden:
+      description: 'Forbidden — `403`. Codes include `authorization_denied`, `tenant_scope_mismatch`, `tenant_required`, `identity_mismatch`, `self_grant_not_allowed`, `checker_not_independent`, `sod_self_interest`, `workload_not_registered`, `workload_identity_mismatch`.'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: 'Not found — `404`.'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Conflict:
+      description: 'Conflict — `409`. Codes include `sod_conflict`, `version_conflict`, `idempotency_mismatch`, `approval_expired`.'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    StepUpRequired:
+      description: 'Step-up required — `401 step_up_required` with the reason and `WWW-Authenticate: Bearer error="insufficient_user_authentication"`.'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/StepUpRequired'
+    StoreUnavailable:
+      description: '`503` — cannot answer: `store_unavailable`, or `entity_registry_unavailable` when the registry lookup fails. Fail-closed: a 503 is never "no".'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error: { type: string, description: Stable code callers match on. }
+        error_class:
+          type: string
+          enum: [CONTEXT_UNRESOLVED, AUTHORIZATION_DENIED, SOD_CONFLICT, APPROVAL_INVALIDATED, CONCURRENCY_CONFLICT, IDEMPOTENCY_MISMATCH]
+        message: { type: string }
+        field: { type: string }
+        violations:
+          type: array
+          items:
+            type: object
+            properties:
+              field: { type: string }
+              message: { type: string }
+      additionalProperties: true
+
+    StepUpRequired:
+      type: object
+      properties:
+        error: { type: string, const: step_up_required }
+        reason:
+          type: string
+          enum: [no_verified_identity, delegated_caller, single_factor, step_up_stale, authn_time_unknown, authn_time_in_future, assertion_principal_mismatch]
+        required_assurance: { type: string, const: MFA }
+        max_authn_age_seconds: { type: integer }
+      additionalProperties: true
+
+    AuthorizeRequest:
+      type: object
+      required: [principal_id, legal_entity_id, action_type]
+      properties:
+        principal_id: { type: string }
+        legal_entity_id: { type: string, description: The scope entity; the platform-scope sentinel for a platform-wide act. }
+        action_type: { type: string, description: 'The action, e.g. `invoice.approve`. `*` is never accepted.' }
+        tenant_id: { type: string, description: Fallback tenant source; `X-Tenant-Id` wins and disagreement is refused. }
+        book_id: { type: string }
+        org_unit_id: { type: string }
+        resource_owner_principal_id: { type: string, description: Dynamic SoD "a preparer cannot approve their own object". }
+        attributes:
+          type: object
+          additionalProperties: { type: string }
+          description: ABAC attributes; values are strings even when numeric.
+        privileged_session_id: { type: string, description: JIT session id (ZS-IAM-001 §13). }
+        break_glass_session_id: { type: string, description: Break-glass session id (§14). }
+        support_session_id: { type: string, description: Support session id (§15). }
+        principal_type: { type: string, description: '`WORKLOAD` narrows to the binding; bound principals are evaluated as workloads regardless.' }
+        audience: { type: string }
+        initiating_subject_id: { type: string }
+        resource_type: { type: string }
+        resource_id: { type: string }
+        resource_version: { type: string }
+
+    CanonicalDecisionRequest:
+      type: object
+      required: [subject_id, action]
+      properties:
+        subject_id: { type: string }
+        action: { type: string }
+        resource_type: { type: string }
+        resource_id: { type: string }
+        environment:
+          type: object
+          additionalProperties: true
+        session_id: { type: string, description: JIT session (ZS-IAM-001 §8.1). }
+        break_glass_session_id: { type: string }
+        support_session_id: { type: string }
+      additionalProperties: true
+
+    Decision:
+      type: object
+      description: |
+        `/v1/authorize` answers `GRANTED` / `DENIED` / `STEP_UP`; the §8.2
+        canonical API answers `PERMIT` / `DENY` / `STEP_UP` /
+        `REQUIRE_APPROVAL`.
+      properties:
+        decision: { type: string, enum: [GRANTED, DENIED, STEP_UP, PERMIT, DENY, REQUIRE_APPROVAL] }
+        basis: { type: string, description: 'e.g. `rbac:role=<code>`, `delegated:from=<principal>`, `sod:conflict_with=<action>`, `abac:require_failed=<attr>`, `principal_status:<status>`, `no_grant`. Redacted to "redacted" for another principal''s decision without `iam.policy.read`.' }
+        obligations:
+          type: array
+          items: { type: string }
+          description: 'e.g. `COMPENSATING_CONTROL:<control>`.'
+        reason_codes:
+          type: array
+          items: { type: string }
+          description: 'e.g. `SOD_EXCEPTION_APPLIED`.'
+        matched_grants: { type: array, items: { type: string } }
+        policy_set_version: { type: string, description: '`cfg.<n>` — the configuration watermark; replayable from `authz_config_history`.' }
+        delegation_id: { type: string }
+        on_behalf_of: { type: string }
+        expires_at: { type: string, format: date-time }
+      additionalProperties: true
+
+    AccessDecision:
+      type: object
+      properties:
+        access_decision_id: { type: string }
+        decision: { type: string, enum: [PERMIT, DENY, STEP_UP, REQUIRE_APPROVAL] }
+        principal_id: { type: string }
+        tenant_id: { type: string }
+        action_type: { type: string }
+        resource_type: { type: string }
+        resource_id: { type: string }
+        decision_basis: { type: string }
+        obligations: { type: array, items: { type: string } }
+        reason_codes: { type: array, items: { type: string } }
+        matched_grants: { type: array, items: { type: string } }
+        policy_set_version: { type: string }
+        on_behalf_of: { type: string }
+        delegation_id: { type: string }
+        expires_at: { type: string, format: date-time }
+        created_at: { type: string, format: date-time }
+      additionalProperties: true
+
+    Role:
+      type: object
+      properties:
+        role_id: { type: string }
+        tenant_id: { type: string }
+        role_code: { type: string }
+        role_name: { type: string }
+        description: { type: string }
+        status: { type: string, enum: [ACTIVE, RETIRED] }
+        version: { type: integer }
+        created_at: { type: string, format: date-time }
+      additionalProperties: true
+
+    CreateRoleRequest:
+      type: object
+      required: [role_code]
+      properties:
+        role_code: { type: string }
+        role_name: { type: string }
+        description: { type: string }
+      additionalProperties: true
+
+    PermissionBundle:
+      type: object
+      properties:
+        permission_bundle_id: { type: string }
+        role_id: { type: string }
+        bundle_code: { type: string }
+        permitted_actions: { type: array, items: { type: string } }
+        status: { type: string, enum: [ACTIVE, RETIRED] }
+        version: { type: integer }
+      additionalProperties: true
+
+    CreatePermissionBundleRequest:
+      type: object
+      required: [bundle_code, permitted_actions]
+      properties:
+        bundle_code: { type: string }
+        permitted_actions: { type: array, items: { type: string } }
+      additionalProperties: true
+
+    RoleAssignment:
+      type: object
+      properties:
+        assignment_id: { type: string }
+        principal_id: { type: string }
+        role_id: { type: string }
+        legal_entity_id: { type: string, nullable: true, description: Null means tenant-wide. }
+        book_id: { type: string }
+        org_unit_id: { type: string }
+        effective_from: { type: string, format: date-time }
+        effective_to: { type: string, format: date-time }
+        approval_status: { type: string, enum: [APPROVED, PENDING_APPROVAL, REJECTED, EXPIRED] }
+        approved_by: { type: string }
+        approval_reference: { type: string }
+        version: { type: integer }
+      additionalProperties: true
+
+    CreateRoleAssignmentRequest:
+      type: object
+      required: [principal_id, role_id, effective_from]
+      properties:
+        principal_id: { type: string }
+        role_id: { type: string }
+        legal_entity_id: { type: string }
+        book_id: { type: string }
+        org_unit_id: { type: string }
+        effective_from: { type: string, format: date-time }
+        effective_to: { type: string, format: date-time }
+        approval_reference: { type: string }
+        reason_code: { type: string }
+        purpose: { type: string }
+      additionalProperties: true
+
+    Delegation:
+      type: object
+      properties:
+        delegation_id: { type: string }
+        delegator_principal_id: { type: string }
+        delegate_principal_id: { type: string }
+        delegated_actions: { type: array, items: { type: string } }
+        effective_from: { type: string, format: date-time }
+        effective_to: { type: string, format: date-time }
+        reason: { type: string }
+        approval_reference: { type: string }
+        status: { type: string }
+      additionalProperties: true
+
+    CreateDelegationRequest:
+      type: object
+      required: [delegate_principal_id, delegated_actions, reason]
+      properties:
+        delegate_principal_id: { type: string }
+        delegated_actions: { type: array, items: { type: string } }
+        effective_from: { type: string, format: date-time }
+        effective_to: { type: string, format: date-time }
+        reason: { type: string }
+        approval_reference: { type: string }
+      additionalProperties: true
+
+    SoDRule:
+      type: object
+      properties:
+        sod_rule_id: { type: string }
+        tenant_id: { type: string, nullable: true, description: Null means platform-wide (SOD_RULE_MANAGE_GLOBAL). }
+        rule_code: { type: string }
+        action_a: { type: string }
+        action_b: { type: string }
+        severity: { type: string }
+        status: { type: string, enum: [ACTIVE, RETIRED] }
+        version: { type: integer }
+      additionalProperties: true
+
+    CreateSoDRuleRequest:
+      type: object
+      required: [rule_code]
+      properties:
+        rule_code: { type: string }
+        action_a: { type: string }
+        action_b: { type: string }
+        severity: { type: string }
+        tenant_id: { type: string, description: Omit for a platform-wide rule (needs SOD_RULE_MANAGE_GLOBAL). }
+        reason_code: { type: string }
+        purpose: { type: string }
+      additionalProperties: true
+
+    SoDException:
+      type: object
+      properties:
+        sod_exception_id: { type: string }
+        sod_rule_id: { type: string }
+        principal_id: { type: string }
+        compensating_control: { type: string }
+        reason: { type: string }
+        status: { type: string, enum: [REQUESTED, APPROVED, REJECTED, REVOKED, EXPIRED] }
+        effective_from: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time }
+      additionalProperties: true
+
+    CreateSoDExceptionRequest:
+      type: object
+      required: [sod_rule_id, principal_id, compensating_control, reason, expires_at]
+      properties:
+        sod_rule_id: { type: string }
+        principal_id: { type: string }
+        compensating_control: { type: string }
+        reason: { type: string }
+        effective_from: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time, description: Required — exceptions always expire. }
+      additionalProperties: true
+
+    ABACRule:
+      type: object
+      properties:
+        abac_rule_id: { type: string }
+        tenant_id: { type: string }
+        rule_code: { type: string }
+        action_type: { type: string }
+        effect: { type: string, enum: [REQUIRE, DENY] }
+        status: { type: string, enum: [ACTIVE, RETIRED] }
+        version: { type: integer }
+      additionalProperties: true
+
+    WorkloadBinding:
+      type: object
+      properties:
+        workload_id: { type: string }
+        tenant_id: { type: string }
+        allowed_audience: { type: string }
+        allowed_actions: { type: array, items: { type: string } }
+        active: { type: boolean }
+      additionalProperties: true
+
+    PrivilegedSession:
+      type: object
+      properties:
+        session_id: { type: string }
+        principal_id: { type: string }
+        requested_actions: { type: array, items: { type: string } }
+        ticket_ref: { type: string }
+        reason: { type: string }
+        duration_seconds: { type: integer }
+        resource_scope: { type: string }
+        target_environment: { type: string }
+        status: { type: string, enum: [ACTIVE, PENDING_APPROVAL, REJECTED, REVOKED, EXPIRED, ENDED] }
+        requester_step_up: { $ref: '#/components/schemas/StepUpEvidence' }
+        approver_step_up: { $ref: '#/components/schemas/StepUpEvidence' }
+      additionalProperties: true
+
+    StepUpEvidence:
+      type: object
+      properties:
+        assurance: { type: string }
+        authn_at: { type: string, format: date-time }
+        session_context_id: { type: string }
+      additionalProperties: true
+
+    CreatePrivilegedSessionRequest:
+      type: object
+      required: [requested_actions, ticket_ref, reason, duration_seconds, resource_scope, target_environment]
+      properties:
+        principal_id: { type: string, description: Defaults to the caller. }
+        requested_actions: { type: array, items: { type: string } }
+        ticket_ref: { type: string }
+        reason: { type: string }
+        duration_seconds: { type: integer }
+        resource_scope: { type: string }
+        target_environment: { type: string }
+      additionalProperties: true
+
+    BreakGlassSession:
+      type: object
+      properties:
+        session_id: { type: string }
+        principal_id: { type: string }
+        incident_id: { type: string }
+        reason: { type: string }
+        requested_actions: { type: array, items: { type: string } }
+        status: { type: string, enum: [ACTIVE, REVOKED, EXPIRED, ENDED] }
+      additionalProperties: true
+
+    CreateBreakGlassSessionRequest:
+      type: object
+      required: [incident_id, reason, requested_actions]
+      properties:
+        incident_id: { type: string }
+        reason: { type: string }
+        requested_actions: { type: array, items: { type: string } }
+      additionalProperties: true
+
+    SupportSession:
+      type: object
+      properties:
+        session_id: { type: string }
+        principal_id: { type: string }
+        ticket_ref: { type: string }
+        purpose: { type: string }
+        tenant_consent_obtained: { type: boolean }
+        allowed_actions: { type: array, items: { type: string } }
+        allow_bulk_export: { type: boolean }
+        status: { type: string, enum: [ACTIVE, REVOKED, EXPIRED, ENDED] }
+      additionalProperties: true
+
+    CreateSupportSessionRequest:
+      type: object
+      required: [ticket_ref, purpose, tenant_consent_obtained]
+      properties:
+        ticket_ref: { type: string }
+        purpose: { type: string }
+        tenant_consent_obtained: { type: boolean }
+        allowed_actions: { type: array, items: { type: string }, description: Writes a writable session may exercise. }
+        allow_bulk_export: { type: boolean, default: false }
+        duration_seconds: { type: integer }
+      additionalProperties: true
+
+    SessionReviewRequest:
+      type: object
+      required: [outcome]
+      properties:
+        outcome: { type: string, enum: [ATTESTED, FLAGGED] }
+        notes: { type: string, description: Required when FLAGGED. }
+      additionalProperties: true
+
+    CommandResult:
+      type: object
+      properties:
+        tenant_id: { type: string }
+        invalidated: { type: boolean }
+      additionalProperties: true
+
+    EffectiveAccess:
+      type: object
+      properties:
+        principal_id: { type: string }
+        assignments:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        effective_actions: { type: array, items: { type: string } }
+      additionalProperties: true
+
+    EntityScopeValidation:
+      type: object
+      properties:
+        in_scope: { type: boolean }
+      additionalProperties: true
+
+    SoDValidation:
+      type: object
+      properties:
+        conflicts:
+          type: array
+          items:
+            type: object
+            properties:
+              sod_rule_id: { type: string }
+              action_a: { type: string }
+              action_b: { type: string }
+              severity: { type: string }
+            additionalProperties: true
+      additionalProperties: true
+
+    DelegatedAccessEvaluation:
+      type: object
+      properties:
+        has_delegated_access: { type: boolean }
+        basis: { type: string, description: "delegated:from=<delegator> or no_delegated_grant" }
+        delegated_actions: { type: array, items: { type: string } }
+        held_directly: { type: boolean }
+        delegation_id: { type: string, description: "Set when delegator_principal_id was asked about and access is held." }
+      additionalProperties: true
+
+    AvailableActions:
+      type: object
+      properties:
+        available_actions: { type: array, items: { type: string } }
+      additionalProperties: true
+
+    Capabilities:
+      type: object
+      properties:
+        principal_id: { type: string }
+        capabilities: { type: array, items: { type: string } }
+      additionalProperties: true

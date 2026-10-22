@@ -31,6 +31,9 @@ type Config struct {
 	APServiceURL             string
 	ARServiceURL             string
 	VaultServiceURL          string
+	// EvidenceRequirementsURL is the base URL of evidence-requirements-svc.
+	// Period close is a finalization path and must not skip required evidence.
+	EvidenceRequirementsURL string
 	// AssetServiceURL is asset-management-svc — ACC-06's own third
 	// subledger source (ASSETS), satisfying the AST/INV/PRJ domain
 	// spec's own §9 "Assets → GL" reconciliation assertion.
@@ -221,14 +224,15 @@ func Load() (*Config, error) {
 		ARServiceURL:             env("AR_SERVICE_URL", "http://accounts-receivable-svc:8101"),
 		// 8094 is the port document-vault-svc listens on. This defaulted to
 		// 8092, which nothing in this platform serves.
-		VaultServiceURL:      env("VAULT_SERVICE_URL", "http://document-vault-svc:8094"),
-		AssetServiceURL:      env("ASSET_SERVICE_URL", "http://asset-management-svc:8167"),
-		InventoryServiceURL:  env("INVENTORY_SERVICE_URL", "http://inventory-management-svc:8168"),
-		ProjectServiceURL:    env("PROJECT_SERVICE_URL", "http://project-accounting-svc:8169"),
-		AssetEventsTopic:     env("ASSET_EVENTS_TOPIC", "zoiko.asset.events"),
-		InventoryEventsTopic: env("INVENTORY_EVENTS_TOPIC", "zoiko.inventory.events"),
-		ProjectEventsTopic:   env("PROJECT_EVENTS_TOPIC", "zoiko.project.events"),
-		CloseSigningKey:      signingKey,
+		VaultServiceURL:         env("VAULT_SERVICE_URL", "http://document-vault-svc:8094"),
+		EvidenceRequirementsURL: env("EVIDENCE_REQUIREMENTS_URL", "http://evidence-requirements-svc:8130"),
+		AssetServiceURL:         env("ASSET_SERVICE_URL", "http://asset-management-svc:8167"),
+		InventoryServiceURL:     env("INVENTORY_SERVICE_URL", "http://inventory-management-svc:8168"),
+		ProjectServiceURL:       env("PROJECT_SERVICE_URL", "http://project-accounting-svc:8169"),
+		AssetEventsTopic:        env("ASSET_EVENTS_TOPIC", "zoiko.asset.events"),
+		InventoryEventsTopic:    env("INVENTORY_EVENTS_TOPIC", "zoiko.inventory.events"),
+		ProjectEventsTopic:      env("PROJECT_EVENTS_TOPIC", "zoiko.project.events"),
+		CloseSigningKey:         signingKey,
 
 		FinancialControlServiceURL: env("FINCTRL_SERVICE_URL", "http://financial-control-svc:8171"),
 		CloseGateMode:              gateMode,

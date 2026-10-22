@@ -1,15 +1,24 @@
 // Package handler exposes privacy-purpose-registry-svc's REST API — PRV-01.
+//
+// Every route — read or write — runs the same pre-flight, in this order:
+//
+//  1. X-Principal-Id          -> 401 AUTHENTICATION_FAILED
+//  2. X-Tenant-Id             -> 401 TENANT_SCOPE_REQUIRED (never "platform by omission")
+//  3. authorization-svc grant -> 403 AUTHORIZATION_DENIED / 503 (fail closed)
+//  4. mutating only: X-Correlation-ID -> 400 CORRELATION_ID_REQUIRED
+//  5. mutating only: Idempotency-Key  -> 400 IDEMPOTENCY_KEY_REQUIRED, then replay
+//
+// Authentication and authorization strictly precede the idempotent replay, so
+// a principal whose grant has been revoked cannot replay a cached success.
 package handler
 
 import (
-	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -17,20 +26,16 @@ import (
 
 	authzpkg "zoiko.io/privacy-purpose-registry-svc/internal/authz"
 	"zoiko.io/privacy-purpose-registry-svc/internal/domain"
-	"zoiko.io/privacy-purpose-registry-svc/internal/events"
 	svcmiddleware "zoiko.io/privacy-purpose-registry-svc/internal/middleware"
 	"zoiko.io/privacy-purpose-registry-svc/internal/store"
 )
 
 // Action constants passed to authorization-svc as action_type — SCREAMING_
-// SNAKE_CASE, same convention as every other service in this platform
-// (see master-register-findings-2026-08-27.md §2.5: the spec's own
-// dotted-lowercase convention was reviewed and declined estate-wide, so
-// this new service follows the codebase's actual convention, not the
-// unadopted one).
+// SNAKE_CASE, same convention as every other service in this platform.
 const (
 	PrivacyPurposeCreate  = "PRIVACY_PURPOSE_CREATE"
 	PrivacyPurposePublish = "PRIVACY_PURPOSE_PUBLISH"
+	PrivacyPurposeRead    = "PRIVACY_PURPOSE_READ"
 
 	PrivacyActivityCreate   = "PRIVACY_ACTIVITY_CREATE"
 	PrivacyActivityValidate = "PRIVACY_ACTIVITY_VALIDATE"
@@ -41,30 +46,40 @@ const (
 	PrivacyActivitySuspend  = "PRIVACY_ACTIVITY_SUSPEND"
 	PrivacyActivityResume   = "PRIVACY_ACTIVITY_RESUME"
 	PrivacyActivityRetire   = "PRIVACY_ACTIVITY_RETIRE"
+	PrivacyActivityRead     = "PRIVACY_ACTIVITY_READ"
+
+	// PrivacyRopaRead gates the Article 30 inventory projection separately
+	// from single-activity reads: §8.1 limits callers to privacy admins,
+	// approved domain owners, the change pipeline and compliance services,
+	// and the whole-inventory view is the most sensitive of the reads.
+	PrivacyRopaRead = "PRIVACY_ROPA_READ"
 )
 
-// platformScopeID mirrors authorization-svc's platform entity UUID
-// ("00000000-0000-0000-0000-00000000f001"). Purpose records may be platform-wide or
-// tenant-scoped; when an incoming request carries an empty tenant (or
-// explicitly claims platform scope), this is the scope passed to the
-// authorization check.
-const platformScopeID = "00000000-0000-0000-0000-00000000f001"
+// maxBodyBytes bounds a request body; registry payloads are small lists of
+// identifiers and a sentence of text.
+const maxBodyBytes = 1 << 20
+
+// effectiveTimeTolerance is the clock-skew allowance for a caller-supplied
+// effective_from on activation — see activateSpec.
+const effectiveTimeTolerance = 60 * time.Second
 
 // AuthzChecker is the authorization-svc contract this handler depends on.
 type AuthzChecker interface {
 	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
 }
 
-// Handler wires HTTP routes to domain logic and data stores.
+// Handler wires HTTP routes to domain logic and data stores. It holds no
+// event publisher: every event is enqueued by the store inside the same
+// transaction as the state change (internal/events/outbox.go).
 type Handler struct {
-	store     store.Store
-	publisher events.Publisher
-	authz     AuthzChecker
-	log       *zap.Logger
+	store store.Store
+	authz AuthzChecker
+	log   *zap.Logger
+	now   func() time.Time
 }
 
-func New(st store.Store, pub events.Publisher, az AuthzChecker, log *zap.Logger) *Handler {
-	return &Handler{store: st, publisher: pub, authz: az, log: log}
+func New(st store.Store, az AuthzChecker, log *zap.Logger) *Handler {
+	return &Handler{store: st, authz: az, log: log, now: func() time.Time { return time.Now().UTC() }}
 }
 
 // RegisterRoutes registers all routes for PRV-01 on the provided router.
@@ -112,7 +127,7 @@ func (h *Handler) Routes(r chi.Router) {
 	r.Get("/privacy/ropa", h.ListROPA)
 }
 
-// ── helpers ──────────────────────────────────────────────────────────────────
+// ── responses & errors ───────────────────────────────────────────────────────
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
@@ -120,1083 +135,280 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-func writeError(w http.ResponseWriter, status int, msg string) {
-	writeJSON(w, status, map[string]string{"error": msg})
+// errorResponse is the stable error envelope (§32). error_code is always
+// present; findings accompanies an activation refusal so the caller sees every
+// failed gate, each with its own §32 code.
+type errorResponse struct {
+	Error     string                     `json:"error"`
+	ErrorCode string                     `json:"error_code"`
+	Findings  []domain.ValidationFinding `json:"findings,omitempty"`
 }
 
-func readBodyBytes(r *http.Request) ([]byte, error) {
-	if r.Body == nil {
-		return nil, nil
-	}
-	bodyBytes, err := io.ReadAll(r.Body)
-	if err != nil {
-		return nil, err
-	}
-	r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-	return bodyBytes, nil
+func writeCoded(w http.ResponseWriter, status int, code, msg string) {
+	writeJSON(w, status, errorResponse{Error: msg, ErrorCode: code})
 }
 
-func computeRequestHash(method, path string, body []byte) string {
-	h := sha256.New()
-	h.Write([]byte(method))
-	h.Write([]byte(path))
-	h.Write(body)
-	return hex.EncodeToString(h.Sum(nil))
+func (h *Handler) storeUnavailable(w http.ResponseWriter, op string, err error) {
+	h.log.Error(op+": store unavailable", zap.Error(err))
+	writeCoded(w, http.StatusServiceUnavailable, domain.ErrCodeStoreUnavailable, "store unavailable")
 }
 
-// checkIdempotency checks if the request has an Idempotency-Key header (§18.1).
-func (h *Handler) checkIdempotency(w http.ResponseWriter, r *http.Request, tenantID, principalID string, body []byte) (replayed bool, handled bool, key string, hash string) {
-	key = r.Header.Get("Idempotency-Key")
-	if key == "" {
-		return false, false, "", ""
-	}
-	hash = computeRequestHash(r.Method, r.URL.Path, body)
-	rec, err := h.store.GetIdempotency(r.Context(), tenantID, principalID, key)
-	if err != nil {
-		h.log.Error("GetIdempotency failed", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
-		return false, true, key, hash
-	}
-	if rec != nil {
-		if rec.RequestHash != hash {
-			writeError(w, http.StatusConflict, "idempotency key reused with different request payload")
-			return false, true, key, hash
-		}
-		w.Header().Set("Idempotency-Replay", "true")
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(rec.ResponseStatus)
-		_, _ = w.Write(rec.ResponseBody)
-		return true, true, key, hash
-	}
-	return false, false, key, hash
+// ── pre-flight ───────────────────────────────────────────────────────────────
+
+// callContext is the verified identity and scope of one request.
+type callContext struct {
+	Principal   string
+	Scope       string // the verified X-Tenant-Id; domain.PlatformScopeID for the platform plane
+	Platform    bool
+	Correlation string // "" on reads
 }
 
-// writeJSONWithIdempotency serializes the payload, stores the idempotency record (if key provided),
-// and writes the HTTP response.
-func (h *Handler) writeJSONWithIdempotency(ctx context.Context, w http.ResponseWriter, tenantID, principalID, op, key, hash string, status int, v interface{}) {
-	payload, err := json.Marshal(v)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to serialize response")
-		return
+// RecordTenant is the tenant a new row is stamped with, and the tenant the
+// idempotency record is filed under: "" (SQL NULL) for the platform plane.
+func (c *callContext) RecordTenant() string {
+	if c.Platform {
+		return ""
 	}
-	if key != "" && hash != "" {
-		var tID *string
-		if tenantID != "" {
-			tID = &tenantID
-		}
-		if err := h.store.SaveIdempotency(ctx, domain.IdempotencyRecord{
-			IdempotencyKey: key,
-			TenantID:       tID,
-			PrincipalID:    principalID,
-			Operation:      op,
-			RequestHash:    hash,
-			ResponseStatus: status,
-			ResponseBody:   payload,
-			CreatedAt:      time.Now().UTC(),
-		}); err != nil {
-			h.log.Warn("SaveIdempotency failed", zap.String("key", key), zap.Error(err))
-		}
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_, _ = w.Write(payload)
+	return c.Scope
 }
 
-// requirePrincipal reads the caller's identity from X-Principal-Id, set by
-// the gateway after identity verification. A request with no resolved
-// principal never passed identity verification — fail closed with 401.
+// OwnsRecord reports whether this request's scope may mutate a record owned by
+// recordTenant (nil = platform record). A tenant may mutate only its own
+// records; the platform plane only platform records. Row-level security
+// enforces the same rule underneath — this is the 403 that tells the caller why.
+func (c *callContext) OwnsRecord(recordTenant *string) bool {
+	if c.Platform {
+		return recordTenant == nil
+	}
+	return recordTenant != nil && *recordTenant == c.Scope
+}
+
 func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
-	principalID := r.Header.Get("X-Principal-Id")
+	principalID := strings.TrimSpace(r.Header.Get("X-Principal-Id"))
 	if principalID == "" {
-		writeError(w, http.StatusUnauthorized, "X-Principal-Id header is required")
+		writeCoded(w, http.StatusUnauthorized, domain.ErrCodeAuthenticationFailed, "X-Principal-Id header is required")
 		return "", false
 	}
 	return principalID, true
 }
 
-// authorize asks authorization-svc whether principalID may perform
-// actionType within tenantID's scope (or the platform scope, if
-// tenantID is empty).
-func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID, tenantID, actionType string) bool {
-	scope := platformScopeID
-	if tenantID != "" {
-		scope = tenantID
+// requireTenant refuses a request that carries no X-Tenant-Id. §18.1 makes
+// tenant scope mandatory; it used to be read and, if absent, silently treated
+// as platform scope, so a caller who sent no tenant at all could read the
+// platform's records and write platform-wide ones. Platform scope must now be
+// asked for explicitly, by sending domain.PlatformScopeID.
+func (h *Handler) requireTenant(w http.ResponseWriter, r *http.Request) (string, bool) {
+	scope := svcmiddleware.TenantFromContext(r.Context())
+	if scope == "" {
+		writeCoded(w, http.StatusUnauthorized, domain.ErrCodeTenantScopeRequired,
+			"X-Tenant-Id header is required (send the platform scope id to act in the platform plane)")
+		return "", false
 	}
+	return scope, true
+}
+
+func (h *Handler) requireCorrelationID(w http.ResponseWriter, r *http.Request) (string, bool) {
+	corrID := strings.TrimSpace(r.Header.Get("X-Correlation-ID"))
+	if corrID == "" {
+		writeCoded(w, http.StatusBadRequest, domain.ErrCodeCorrelationRequired, "X-Correlation-ID header is required")
+		return "", false
+	}
+	w.Header().Set("X-Correlation-ID", corrID)
+	return corrID, true
+}
+
+// authorize asks authorization-svc whether principalID may perform
+// actionType within scope (a tenant, or the platform scope id). Fail closed:
+// anything other than an explicit GRANTED is a refusal.
+func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID, scope, actionType string) bool {
 	if err := h.authz.CheckAllowed(r.Context(), principalID, scope, actionType); err != nil {
 		if errors.Is(err, authzpkg.ErrAuthorizationDenied) {
-			writeError(w, http.StatusForbidden, "not authorized to perform this action")
+			writeCoded(w, http.StatusForbidden, domain.ErrCodeAuthorizationDenied, "not authorized to perform this action")
 			return false
 		}
 		h.log.Error("authorization check failed", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "authorization service unavailable")
+		writeCoded(w, http.StatusServiceUnavailable, domain.ErrCodeAuthzUnavailable, "authorization service unavailable")
 		return false
 	}
 	return true
 }
 
-func parseAsOf(r *http.Request) time.Time {
-	raw := r.URL.Query().Get("as_of")
-	if raw == "" {
-		return time.Now().UTC()
-	}
-	if t, err := time.Parse(time.RFC3339Nano, raw); err == nil {
-		return t
-	}
-	if t, err := time.Parse(time.RFC3339, raw); err == nil {
-		return t
-	}
-	return time.Now().UTC()
-}
-
-func (h *Handler) resolveLatestVersion(w http.ResponseWriter, r *http.Request, activityID string) (*domain.ProcessingActivityVersion, bool) {
-	latest, err := h.store.FindLatestActivityVersion(r.Context(), activityID)
-	if err != nil {
-		if errors.Is(err, domain.ErrActivityNotFound) || errors.Is(err, domain.ErrActivityVersionNotFound) {
-			writeError(w, http.StatusNotFound, "processing activity not found")
-			return nil, false
-		}
-		h.log.Error("resolveLatestVersion: lookup failed", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+// begin runs steps 1-4 of the pre-flight. mutating adds the correlation-ID
+// requirement. On false the response has been written.
+func (h *Handler) begin(w http.ResponseWriter, r *http.Request, actionType string, mutating bool) (*callContext, bool) {
+	principal, ok := h.requirePrincipal(w, r)
+	if !ok {
 		return nil, false
 	}
-	return latest, true
+	scope, ok := h.requireTenant(w, r)
+	if !ok {
+		return nil, false
+	}
+	if !h.authorize(w, r, principal, scope, actionType) {
+		return nil, false
+	}
+	cc := &callContext{Principal: principal, Scope: scope, Platform: svcmiddleware.IsPlatformScope(r.Context())}
+	if mutating {
+		corr, ok := h.requireCorrelationID(w, r)
+		if !ok {
+			return nil, false
+		}
+		cc.Correlation = corr
+	}
+	return cc, true
 }
 
-// ── purposes ─────────────────────────────────────────────────────────────────
-
-// CreatePurpose handles POST /privacy/purposes.
-func (h *Handler) CreatePurpose(w http.ResponseWriter, r *http.Request) {
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
+func (h *Handler) readBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
+	if r.Body == nil {
+		return nil, true
 	}
-
-	bodyBytes, err := readBodyBytes(r)
+	b, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "failed to read request body")
-		return
+		writeCoded(w, http.StatusBadRequest, domain.ErrCodeValidationFailed, "failed to read request body")
+		return nil, false
 	}
-	var req domain.CreatePurposeRequest
-	if err := json.Unmarshal(bodyBytes, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-	if req.Statement == "" || req.CompatibilityClass == "" {
-		writeError(w, http.StatusBadRequest, "statement and compatibility_class are required")
-		return
-	}
-
-	verifiedTenant := svcmiddleware.TenantFromContext(r.Context())
-	if req.TenantID != "" && req.TenantID != verifiedTenant {
-		writeError(w, http.StatusForbidden, "tenant_id does not match the verified X-Tenant-Id")
-		return
-	}
-	tenantID := req.TenantID
-	if tenantID == "" {
-		tenantID = verifiedTenant
-	}
-
-	_, handled, idemKey, reqHash := h.checkIdempotency(w, r, tenantID, principalID, bodyBytes)
-	if handled {
-		return
-	}
-
-	if !h.authorize(w, r, principalID, tenantID, PrivacyPurposeCreate) {
-		return
-	}
-
-	_, version, err := h.store.CreatePurpose(r.Context(), tenantID, req, principalID)
-	if err != nil {
-		h.log.Error("CreatePurpose: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
-		return
-	}
-	h.writeJSONWithIdempotency(r.Context(), w, tenantID, principalID, "CreatePurpose", idemKey, reqHash, http.StatusCreated, version)
+	return b, true
 }
 
-// CreatePurposeVersion handles POST /privacy/purposes/{purposeID}/versions.
-func (h *Handler) CreatePurposeVersion(w http.ResponseWriter, r *http.Request) {
-	purposeID := chi.URLParam(r, "purposeID")
+// ── idempotency (§18.1) ──────────────────────────────────────────────────────
 
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
+// idempotency enforces the mandatory Idempotency-Key and serves replays. It
+// runs AFTER begin(), i.e. after authentication and authorization, so a replay
+// is never a way around either. handled=true means a response was written.
+//
+// The request hash covers method, path and body, so the same key reused on a
+// different operation or payload is a 409, never a silent replay of the wrong
+// answer. The record is scoped to (tenant-or-platform, principal, key).
+func (h *Handler) idempotency(w http.ResponseWriter, r *http.Request, cc *callContext, body []byte) (key, hash string, handled bool) {
+	key = strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	if key == "" {
+		writeCoded(w, http.StatusBadRequest, domain.ErrCodeIdempotencyRequired, "Idempotency-Key header is required on mutating requests")
+		return "", "", true
 	}
-
-	bodyBytes, err := readBodyBytes(r)
+	hash = computeRequestHash(r.Method, r.URL.Path, body)
+	rec, err := h.store.GetIdempotency(r.Context(), cc.RecordTenant(), cc.Principal, key)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "failed to read request body")
-		return
+		h.storeUnavailable(w, "GetIdempotency", err)
+		return key, hash, true
 	}
-	var req domain.CreatePurposeVersionRequest
-	if err := json.Unmarshal(bodyBytes, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
-		return
+	if rec != nil {
+		writeReplay(w, rec, hash)
+		return key, hash, true
 	}
-	if req.ParentVersionID == "" || req.Statement == "" || req.CompatibilityClass == "" {
-		writeError(w, http.StatusBadRequest, "parent_version_id, statement and compatibility_class are required")
-		return
-	}
-
-	verifiedTenant := svcmiddleware.TenantFromContext(r.Context())
-	_, handled, idemKey, reqHash := h.checkIdempotency(w, r, verifiedTenant, principalID, bodyBytes)
-	if handled {
-		return
-	}
-
-	if !h.authorize(w, r, principalID, verifiedTenant, PrivacyPurposeCreate) {
-		return
-	}
-
-	version, err := h.store.CreatePurposeVersion(r.Context(), purposeID, req, principalID)
-	if err != nil {
-		if errors.Is(err, domain.ErrPurposeVersionNotFound) {
-			writeError(w, http.StatusNotFound, "parent purpose version not found")
-			return
-		}
-		h.log.Error("CreatePurposeVersion: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
-		return
-	}
-	h.writeJSONWithIdempotency(r.Context(), w, verifiedTenant, principalID, "CreatePurposeVersion", idemKey, reqHash, http.StatusCreated, version)
+	return key, hash, false
 }
 
-// PublishPurposeVersion handles POST /privacy/purposes/{purposeID}/versions/{versionID}/publish.
-// Segregation of Duties (Maker-Checker, §18): A maker cannot publish their own purpose version.
-func (h *Handler) PublishPurposeVersion(w http.ResponseWriter, r *http.Request) {
-	purposeID := chi.URLParam(r, "purposeID")
-	versionID := chi.URLParam(r, "versionID")
-
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
+// execute runs fn and the idempotency claim in ONE transaction: the change, its
+// audit row, its outbox event and the stored replay response all commit or none
+// does (store.RunIdempotent — every store call fn makes joins the transaction).
+// A failed save therefore fails the whole operation instead of being logged and
+// ignored, and concurrent identical requests execute exactly once. When the key
+// was claimed meanwhile, the stored record is returned instead.
+func (h *Handler) execute(r *http.Request, cc *callContext, op, key, hash string, status int, fn func(ctx context.Context) (any, error)) (payload any, existing *domain.IdempotencyRecord, err error) {
+	var tID *string
+	if t := cc.RecordTenant(); t != "" {
+		tID = &t
 	}
-
-	bodyBytes, err := readBodyBytes(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "failed to read request body")
-		return
-	}
-
-	verifiedTenant := svcmiddleware.TenantFromContext(r.Context())
-	_, handled, idemKey, reqHash := h.checkIdempotency(w, r, verifiedTenant, principalID, bodyBytes)
-	if handled {
-		return
-	}
-
-	if !h.authorize(w, r, principalID, verifiedTenant, PrivacyPurposePublish) {
-		return
-	}
-
-	// Segregation of Duties check
-	existing, err := h.store.FindPurposeVersion(r.Context(), purposeID, versionID)
-	if err != nil {
-		if errors.Is(err, domain.ErrPurposeVersionNotFound) {
-			writeError(w, http.StatusNotFound, "purpose version not found")
-			return
-		}
-		h.log.Error("PublishPurposeVersion: FindPurposeVersion failed", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
-		return
-	}
-	if existing.CreatedByPrincipalID != "" && existing.CreatedByPrincipalID == principalID {
-		writeError(w, http.StatusForbidden, "maker cannot publish their own purpose version (segregation of duties)")
-		return
-	}
-
-	version, err := h.store.PublishPurposeVersion(r.Context(), purposeID, versionID)
-	if err != nil {
-		switch {
-		case errors.Is(err, domain.ErrPurposeVersionNotFound):
-			writeError(w, http.StatusNotFound, "purpose version not found")
-		case errors.Is(err, domain.ErrPurposeAlreadyPublished):
-			writeError(w, http.StatusConflict, "purpose version is already published")
-		default:
-			h.log.Error("PublishPurposeVersion: store unavailable", zap.Error(err))
-			writeError(w, http.StatusServiceUnavailable, "store unavailable")
-		}
-		return
-	}
-
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "privacy.purpose.published", EntityID: version.PurposeID, TenantID: verifiedTenant,
-		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: version,
+	claim := domain.IdempotencyRecord{IdempotencyKey: key, TenantID: tID, PrincipalID: cc.Principal, Operation: op, RequestHash: hash}
+	existing, _, payload, err = h.store.RunIdempotent(r.Context(), claim, func(ctx context.Context) (int, any, error) {
+		v, e := fn(ctx)
+		return status, v, e
 	})
-	h.writeJSONWithIdempotency(r.Context(), w, verifiedTenant, principalID, "PublishPurposeVersion", idemKey, reqHash, http.StatusOK, version)
+	return payload, existing, err
 }
 
-func (h *Handler) GetPurpose(w http.ResponseWriter, r *http.Request) {
-	purposeID := chi.URLParam(r, "purposeID")
-	version, err := h.store.ResolvePurposeAsOf(r.Context(), purposeID, parseAsOf(r))
+// finish writes the first-execution response, or the replay when a concurrent
+// request won the claim.
+func (h *Handler) finish(w http.ResponseWriter, existing *domain.IdempotencyRecord, hash string, status int, payload interface{}) {
+	if existing != nil {
+		writeReplay(w, existing, hash)
+		return
+	}
+	b, err := json.Marshal(payload)
 	if err != nil {
-		if errors.Is(err, domain.ErrPurposeNotFound) {
-			writeError(w, http.StatusNotFound, "purpose not found")
-			return
+		writeCoded(w, http.StatusInternalServerError, domain.ErrCodeInternal, "failed to serialize response")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, _ = w.Write(b)
+}
+
+// writeReplay returns the stored original response, or 409 when the key was
+// used with a different request.
+func writeReplay(w http.ResponseWriter, rec *domain.IdempotencyRecord, hash string) {
+	if rec.RequestHash != hash {
+		writeCoded(w, http.StatusConflict, domain.ErrCodeIdempotencyMismatch, "idempotency key reused with different request payload")
+		return
+	}
+	w.Header().Set("Idempotency-Replay", "true")
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(rec.ResponseStatus)
+	_, _ = w.Write(rec.ResponseBody)
+}
+
+// ── small helpers ────────────────────────────────────────────────────────────
+
+// scopeMismatch refuses a body tenant_id that disagrees with the verified
+// X-Tenant-Id. An empty body tenant_id is fine; the verified scope governs.
+func scopeMismatch(w http.ResponseWriter, bodyTenantID string, cc *callContext) bool {
+	if bodyTenantID != "" && bodyTenantID != cc.Scope {
+		writeCoded(w, http.StatusForbidden, domain.ErrCodeTenantScopeMismatch, "tenant_id does not match the verified X-Tenant-Id")
+		return true
+	}
+	return false
+}
+
+// wrongPlane refuses a mutation of a record the caller's scope does not own.
+func wrongPlane(w http.ResponseWriter, cc *callContext, recordTenant *string) bool {
+	if cc.OwnsRecord(recordTenant) {
+		return false
+	}
+	if recordTenant == nil {
+		writeCoded(w, http.StatusForbidden, domain.ErrCodePlatformScope,
+			"this is a platform record: it can only be changed from the platform plane (X-Tenant-Id = platform scope id) by a principal holding the platform grant")
+	} else {
+		writeCoded(w, http.StatusForbidden, domain.ErrCodePlatformScope,
+			"this record belongs to a tenant: it cannot be changed from the platform plane or another tenant")
+	}
+	return true
+}
+
+// parseInstants reads as_of (valid time, default now) and known_as_of
+// (knowledge time, default now). A value that is present but not RFC 3339 is a
+// 400, never a silent fall-back to "now": a historical-evidence query that
+// quietly answers about today is worse than one that fails.
+func (h *Handler) parseInstants(w http.ResponseWriter, r *http.Request) (asOf, knownAsOf time.Time, ok bool) {
+	now := h.now()
+	parse := func(name string) (time.Time, bool) {
+		raw := r.URL.Query().Get(name)
+		if raw == "" {
+			return now, true
 		}
-		h.log.Error("GetPurpose: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
-		return
-	}
-	writeJSON(w, http.StatusOK, version)
-}
-
-func (h *Handler) ListPurposes(w http.ResponseWriter, r *http.Request) {
-	versions, err := h.store.ListPurposes(r.Context())
-	if err != nil {
-		h.log.Error("ListPurposes: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
-		return
-	}
-	if versions == nil {
-		versions = []domain.PurposeVersion{}
-	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"data": versions, "count": len(versions)})
-}
-
-// ── processing activities ────────────────────────────────────────────────────
-
-func (h *Handler) CreateActivity(w http.ResponseWriter, r *http.Request) {
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-
-	bodyBytes, err := readBodyBytes(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "failed to read request body")
-		return
-	}
-	var req domain.CreateActivityRequest
-	if err := json.Unmarshal(bodyBytes, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-	if !domain.PrivacyRole(req.PrivacyRole).Valid() {
-		writeError(w, http.StatusBadRequest, "privacy_role must be one of CONTROLLER, PROCESSOR, JOINT_CONTROLLER")
-		return
-	}
-	if req.Owner == "" {
-		writeError(w, http.StatusBadRequest, "owner is required")
-		return
-	}
-	if req.NoticeConsentDependency != "" && !domain.NoticeConsentDependency(req.NoticeConsentDependency).Valid() {
-		writeError(w, http.StatusBadRequest, "notice_consent_dependency must be REQUIRED, NOT_REQUIRED, or CONDITIONAL")
-		return
-	}
-	if req.DPIATIAStatus != "" && !domain.DPIATIAStatus(req.DPIATIAStatus).Valid() {
-		writeError(w, http.StatusBadRequest, "dpia_tia_status must be RESOLVED, REVIEW_REQUIRED, or NOT_REQUIRED")
-		return
-	}
-
-	verifiedTenant := svcmiddleware.TenantFromContext(r.Context())
-	if req.TenantID != "" && req.TenantID != verifiedTenant {
-		writeError(w, http.StatusForbidden, "tenant_id does not match the verified X-Tenant-Id")
-		return
-	}
-	tenantID := req.TenantID
-	if tenantID == "" {
-		tenantID = verifiedTenant
-	}
-
-	_, handled, idemKey, reqHash := h.checkIdempotency(w, r, tenantID, principalID, bodyBytes)
-	if handled {
-		return
-	}
-
-	if !h.authorize(w, r, principalID, tenantID, PrivacyActivityCreate) {
-		return
-	}
-
-	_, version, err := h.store.CreateActivity(r.Context(), tenantID, req, principalID)
-	if err != nil {
-		h.log.Error("CreateActivity: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
-		return
-	}
-	h.writeJSONWithIdempotency(r.Context(), w, tenantID, principalID, "CreateActivity", idemKey, reqHash, http.StatusCreated, version)
-}
-
-func (h *Handler) CreateActivityVersion(w http.ResponseWriter, r *http.Request) {
-	activityID := chi.URLParam(r, "activityID")
-
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-
-	bodyBytes, err := readBodyBytes(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "failed to read request body")
-		return
-	}
-	var req domain.CreateActivityVersionRequest
-	if err := json.Unmarshal(bodyBytes, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-	if req.ParentVersionID == "" {
-		writeError(w, http.StatusBadRequest, "parent_version_id is required")
-		return
-	}
-	if !domain.PrivacyRole(req.PrivacyRole).Valid() {
-		writeError(w, http.StatusBadRequest, "privacy_role must be one of CONTROLLER, PROCESSOR, JOINT_CONTROLLER")
-		return
-	}
-	if req.Owner == "" {
-		writeError(w, http.StatusBadRequest, "owner is required")
-		return
-	}
-	if req.NoticeConsentDependency != "" && !domain.NoticeConsentDependency(req.NoticeConsentDependency).Valid() {
-		writeError(w, http.StatusBadRequest, "notice_consent_dependency must be REQUIRED, NOT_REQUIRED, or CONDITIONAL")
-		return
-	}
-	if req.DPIATIAStatus != "" && !domain.DPIATIAStatus(req.DPIATIAStatus).Valid() {
-		writeError(w, http.StatusBadRequest, "dpia_tia_status must be RESOLVED, REVIEW_REQUIRED, or NOT_REQUIRED")
-		return
-	}
-
-	verifiedTenant := svcmiddleware.TenantFromContext(r.Context())
-	_, handled, idemKey, reqHash := h.checkIdempotency(w, r, verifiedTenant, principalID, bodyBytes)
-	if handled {
-		return
-	}
-
-	if !h.authorize(w, r, principalID, verifiedTenant, PrivacyActivityCreate) {
-		return
-	}
-
-	version, err := h.store.CreateActivityVersion(r.Context(), activityID, req, principalID)
-	if err != nil {
-		if errors.Is(err, domain.ErrActivityVersionNotFound) {
-			writeError(w, http.StatusNotFound, "parent processing activity version not found")
-			return
+		t, err := time.Parse(time.RFC3339Nano, raw)
+		if err != nil {
+			writeCoded(w, http.StatusBadRequest, domain.ErrCodeInvalidAsOf, name+" must be an RFC 3339 timestamp, e.g. 2026-01-02T15:04:05Z")
+			return time.Time{}, false
 		}
-		h.log.Error("CreateActivityVersion: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+		return t.UTC(), true
+	}
+	if asOf, ok = parse("as_of"); !ok {
 		return
 	}
-	h.writeJSONWithIdempotency(r.Context(), w, verifiedTenant, principalID, "CreateActivityVersion", idemKey, reqHash, http.StatusCreated, version)
+	if knownAsOf, ok = parse("known_as_of"); !ok {
+		return
+	}
+	return asOf, knownAsOf, true
 }
 
-func (h *Handler) GetActivity(w http.ResponseWriter, r *http.Request) {
-	activityID := chi.URLParam(r, "activityID")
-	version, err := h.store.ResolveActivityAsOf(r.Context(), activityID, parseAsOf(r))
-	if err != nil {
-		if errors.Is(err, domain.ErrActivityNotFound) {
-			writeError(w, http.StatusNotFound, "processing activity not found")
-			return
-		}
-		h.log.Error("GetActivity: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
-		return
-	}
-	writeJSON(w, http.StatusOK, version)
-}
-
-func (h *Handler) GetActivityVersion(w http.ResponseWriter, r *http.Request) {
-	activityID := chi.URLParam(r, "activityID")
-	versionID := chi.URLParam(r, "versionID")
-	version, err := h.store.FindActivityVersion(r.Context(), activityID, versionID)
-	if err != nil {
-		if errors.Is(err, domain.ErrActivityVersionNotFound) {
-			writeError(w, http.StatusNotFound, "processing activity version not found")
-			return
-		}
-		h.log.Error("GetActivityVersion: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
-		return
-	}
-	writeJSON(w, http.StatusOK, version)
-}
-
-func (h *Handler) ValidateActivityVersion(w http.ResponseWriter, r *http.Request) {
-	activityID := chi.URLParam(r, "activityID")
-	versionID := chi.URLParam(r, "versionID")
-	h.validateActivityVersionInternal(w, r, activityID, versionID)
-}
-
-func (h *Handler) ValidateLatestActivity(w http.ResponseWriter, r *http.Request) {
-	activityID := chi.URLParam(r, "activityID")
-	latest, ok := h.resolveLatestVersion(w, r, activityID)
-	if !ok {
-		return
-	}
-	h.validateActivityVersionInternal(w, r, activityID, latest.ActivityVersionID)
-}
-
-func (h *Handler) validateActivityVersionInternal(w http.ResponseWriter, r *http.Request, activityID, versionID string) {
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-
-	bodyBytes, err := readBodyBytes(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "failed to read request body")
-		return
-	}
-
-	verifiedTenant := svcmiddleware.TenantFromContext(r.Context())
-	if !h.authorize(w, r, principalID, verifiedTenant, PrivacyActivityValidate) {
-		return
-	}
-
-	_, handled, idemKey, reqHash := h.checkIdempotency(w, r, verifiedTenant, principalID, bodyBytes)
-	if handled {
-		return
-	}
-
-	existing, err := h.store.FindActivityVersion(r.Context(), activityID, versionID)
-	if err != nil {
-		if errors.Is(err, domain.ErrActivityVersionNotFound) {
-			writeError(w, http.StatusNotFound, "processing activity version not found")
-			return
-		}
-		h.log.Error("ValidateActivityVersion: lookup failed", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
-		return
-	}
-	if existing.VersionStatus != domain.ActivityStatusDraft {
-		writeError(w, http.StatusConflict, "only a DRAFT version may be validated")
-		return
-	}
-
-	findings := h.runStructuralValidation(r.Context(), existing)
-
-	updated, err := h.store.SetValidationOutcome(r.Context(), activityID, versionID, findings)
-	if err != nil {
-		if errors.Is(err, domain.ErrActivityVersionNotFound) {
-			writeError(w, http.StatusNotFound, "processing activity version not found")
-			return
-		}
-		h.log.Error("ValidateActivityVersion: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
-		return
-	}
-	h.writeJSONWithIdempotency(r.Context(), w, verifiedTenant, principalID, "ValidateActivity", idemKey, reqHash, http.StatusOK, updated)
-}
-
-// runStructuralValidation implements all 8 minimum activation gates (§8.2)
-// using the exact error codes specified in §32:
-// 1. Accountable owner (PRV-003)
-// 2. Controller/processor role resolved (PRV-003)
-// 3/4. Purpose statement & published purpose references (PRV-001)
-// 5. Jurisdictions (PRV-004), subject classes and data categories (PRV-010)
-// 6. Retention rule references identified (PRV-014)
-// 7. Notice/consent dependency explicitly set (PRV-006)
-// 8. DPIA/TIA requirement resolved or marked review-required (PRV-016)
-// Any finding means the version stays DRAFT (PRV-I13: findings are never partial-permit).
-func (h *Handler) runStructuralValidation(ctx context.Context, v *domain.ProcessingActivityVersion) []domain.ValidationFinding {
-	var findings []domain.ValidationFinding
-
-	// Gate 1: Accountable owner
-	if v.Owner == "" {
-		findings = append(findings, domain.ValidationFinding{
-			Code: "PRV-003", Field: "owner", Message: "accountable owner is required",
-		})
-	}
-
-	// Gate 2: Controller/processor role resolved
-	if !domain.PrivacyRole(v.PrivacyRole).Valid() {
-		findings = append(findings, domain.ValidationFinding{
-			Code: "PRV-003", Field: "privacy_role", Message: "privacy_role must be one of CONTROLLER, PROCESSOR, JOINT_CONTROLLER",
-		})
-	}
-
-	// Gate 3 & 4: Registered, published purpose references
-	if len(v.PurposeIDs) == 0 {
-		findings = append(findings, domain.ValidationFinding{
-			Code: "PRV-001", Field: "purpose_ids", Message: "at least one purpose_id is required",
-		})
-	}
-	for _, pid := range v.PurposeIDs {
-		published, err := h.store.IsPurposePublished(ctx, pid)
-		if err != nil || !published {
-			findings = append(findings, domain.ValidationFinding{
-				Code: "PRV-001", Field: "purpose_ids",
-				Message: "purpose " + pid + " is not a registered, published purpose",
-			})
-			continue
-		}
-		// Gate 4 (§8.2): "Approved lawful-basis ... references from PDC."
-		// This service has no established PDC integration contract (no
-		// client/adapter exists anywhere in this codebase), so "approved" is
-		// enforced structurally — the published purpose version must itself
-		// carry at least one lawful-basis reference — rather than by calling
-		// PDC for a live approval decision, which would require inventing an
-		// external contract. The special-category/other-condition reference
-		// half of gate 4 is not enforced: no such field exists anywhere in
-		// this service's schema yet, and adding one was judged out of scope
-		// for a validation fix (see audit notes).
-		pv, err := h.store.ResolvePurposeAsOf(ctx, pid, time.Now())
-		if err != nil || pv == nil || len(pv.LawfulBasisRefs) == 0 {
-			findings = append(findings, domain.ValidationFinding{
-				Code: "PRV-005", Field: "purpose_ids",
-				Message: "purpose " + pid + " has no approved lawful-basis reference",
-			})
+func nonBlank(xs []string) []string {
+	out := make([]string, 0, len(xs))
+	for _, x := range xs {
+		if strings.TrimSpace(x) != "" {
+			out = append(out, x)
 		}
 	}
-
-	// Gate 5: Data subjects, categories, and jurisdictions enumerated (§32: PRV-004 for jurisdictions, PRV-010 for categories/subjects)
-	if len(v.Jurisdictions) == 0 {
-		findings = append(findings, domain.ValidationFinding{
-			Code: "PRV-004", Field: "jurisdictions", Message: "at least one jurisdiction is required",
-		})
-	}
-	if len(v.SubjectClasses) == 0 {
-		findings = append(findings, domain.ValidationFinding{
-			Code: "PRV-010", Field: "subject_classes", Message: "at least one subject class is required",
-		})
-	}
-	if len(v.DataCategories) == 0 {
-		findings = append(findings, domain.ValidationFinding{
-			Code: "PRV-010", Field: "data_categories", Message: "at least one data category is required",
-		})
-	}
-
-	// Gate 6: Retention/DRC rule references identified (§32: PRV-014)
-	if len(v.RetentionRuleRefs) == 0 {
-		findings = append(findings, domain.ValidationFinding{
-			Code: "PRV-014", Field: "retention_rule_refs", Message: "at least one retention rule reference is required",
-		})
-	}
-
-	// Gate 6 (continued): "... and transfer/processor dependencies
-	// identified" (§8.2). This schema has no explicit cross-border/recipient
-	// flag, so multiple jurisdictions on one version is the only
-	// structurally determinable signal that a transfer dependency applies —
-	// a conservative, documented reading, not an invented one. A
-	// single-jurisdiction activity is not required to populate this.
-	if len(v.Jurisdictions) > 1 && len(v.TransferRefs) == 0 {
-		findings = append(findings, domain.ValidationFinding{
-			Code: "PRV-015", Field: "transfer_refs",
-			Message: "transfer dependencies must be identified when processing spans multiple jurisdictions",
-		})
-	}
-
-	// Gate 7: Notice/consent dependency explicitly set — never left implicit (§32: PRV-006)
-	if v.NoticeConsentDependency == "" || !domain.NoticeConsentDependency(v.NoticeConsentDependency).Valid() {
-		findings = append(findings, domain.ValidationFinding{
-			Code: "PRV-006", Field: "notice_consent_dependency",
-			Message: "notice_consent_dependency must be explicitly set to REQUIRED, NOT_REQUIRED, or CONDITIONAL — never left implicit",
-		})
-	}
-
-	// Gate 8: DPIA/TIA requirement resolved by policy or marked review-required (§32: PRV-016)
-	if v.DPIATIAStatus == "" || !domain.DPIATIAStatus(v.DPIATIAStatus).Valid() {
-		findings = append(findings, domain.ValidationFinding{
-			Code: "PRV-016", Field: "dpia_tia_status",
-			Message: "dpia_tia_status must be resolved (RESOLVED, NOT_REQUIRED) or marked REVIEW_REQUIRED",
-		})
-	}
-
-	return findings
+	return out
 }
 
-func (h *Handler) transitionAction(w http.ResponseWriter, r *http.Request, activityID, versionID, actionType string, from, to domain.ActivityVersionStatus, eventType string) {
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-
-	bodyBytes, err := readBodyBytes(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "failed to read request body")
-		return
-	}
-
-	verifiedTenant := svcmiddleware.TenantFromContext(r.Context())
-	if !h.authorize(w, r, principalID, verifiedTenant, actionType) {
-		return
-	}
-
-	_, handled, idemKey, reqHash := h.checkIdempotency(w, r, verifiedTenant, principalID, bodyBytes)
-	if handled {
-		return
-	}
-
-	if !domain.ValidActivityTransition(from, to) {
-		writeError(w, http.StatusInternalServerError, "misconfigured transition")
-		return
-	}
-
-	updated, err := h.store.TransitionActivity(r.Context(), activityID, versionID, from, to)
-	if err != nil {
-		switch {
-		case errors.Is(err, domain.ErrActivityVersionNotFound):
-			writeError(w, http.StatusNotFound, "processing activity version not found")
-		case errors.Is(err, domain.ErrInvalidTransition):
-			writeError(w, http.StatusConflict, "version is not in the required "+string(from)+" state")
-		default:
-			h.log.Error("transitionAction: store unavailable", zap.String("action", actionType), zap.Error(err))
-			writeError(w, http.StatusServiceUnavailable, "store unavailable")
-		}
-		return
-	}
-
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: eventType, EntityID: updated.ActivityID, TenantID: verifiedTenant,
-		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: updated,
-	})
-	h.writeJSONWithIdempotency(r.Context(), w, verifiedTenant, principalID, actionType, idemKey, reqHash, http.StatusOK, updated)
-}
-
-func (h *Handler) SubmitActivityVersion(w http.ResponseWriter, r *http.Request) {
-	activityID := chi.URLParam(r, "activityID")
-	versionID := chi.URLParam(r, "versionID")
-	h.transitionAction(w, r, activityID, versionID, PrivacyActivitySubmit, domain.ActivityStatusValidated, domain.ActivityStatusSubmitted, "privacy.processing_activity.submitted")
-}
-
-func (h *Handler) SubmitLatestActivity(w http.ResponseWriter, r *http.Request) {
-	activityID := chi.URLParam(r, "activityID")
-	latest, ok := h.resolveLatestVersion(w, r, activityID)
-	if !ok {
-		return
-	}
-	h.transitionAction(w, r, activityID, latest.ActivityVersionID, PrivacyActivitySubmit, domain.ActivityStatusValidated, domain.ActivityStatusSubmitted, "privacy.processing_activity.submitted")
-}
-
-func (h *Handler) ApproveActivityVersion(w http.ResponseWriter, r *http.Request) {
-	activityID := chi.URLParam(r, "activityID")
-	versionID := chi.URLParam(r, "versionID")
-	h.approveActivityVersionInternal(w, r, activityID, versionID)
-}
-
-func (h *Handler) ApproveLatestActivity(w http.ResponseWriter, r *http.Request) {
-	activityID := chi.URLParam(r, "activityID")
-	latest, ok := h.resolveLatestVersion(w, r, activityID)
-	if !ok {
-		return
-	}
-	h.approveActivityVersionInternal(w, r, activityID, latest.ActivityVersionID)
-}
-
-func (h *Handler) approveActivityVersionInternal(w http.ResponseWriter, r *http.Request, activityID, versionID string) {
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-
-	bodyBytes, err := readBodyBytes(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "failed to read request body")
-		return
-	}
-
-	verifiedTenant := svcmiddleware.TenantFromContext(r.Context())
-	if !h.authorize(w, r, principalID, verifiedTenant, PrivacyActivityApprove) {
-		return
-	}
-
-	_, handled, idemKey, reqHash := h.checkIdempotency(w, r, verifiedTenant, principalID, bodyBytes)
-	if handled {
-		return
-	}
-
-	// Segregation of Duties (Maker-Checker, §18): Maker cannot approve their own activity version.
-	existing, err := h.store.FindActivityVersion(r.Context(), activityID, versionID)
-	if err != nil {
-		if errors.Is(err, domain.ErrActivityVersionNotFound) {
-			writeError(w, http.StatusNotFound, "processing activity version not found")
-			return
-		}
-		h.log.Error("ApproveActivity: lookup failed", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
-		return
-	}
-	if existing.CreatedByPrincipalID != "" && existing.CreatedByPrincipalID == principalID {
-		writeError(w, http.StatusForbidden, "maker cannot approve their own processing activity version (segregation of duties)")
-		return
-	}
-
-	updated, err := h.store.TransitionActivity(r.Context(), activityID, versionID, domain.ActivityStatusSubmitted, domain.ActivityStatusApproved)
-	if err != nil {
-		switch {
-		case errors.Is(err, domain.ErrActivityVersionNotFound):
-			writeError(w, http.StatusNotFound, "processing activity version not found")
-		case errors.Is(err, domain.ErrInvalidTransition):
-			writeError(w, http.StatusConflict, "version is not in the required SUBMITTED state")
-		default:
-			h.log.Error("ApproveActivity: store unavailable", zap.Error(err))
-			writeError(w, http.StatusServiceUnavailable, "store unavailable")
-		}
-		return
-	}
-
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "privacy.processing_activity.approved", EntityID: updated.ActivityID, TenantID: verifiedTenant,
-		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: updated,
-	})
-	h.writeJSONWithIdempotency(r.Context(), w, verifiedTenant, principalID, "ApproveActivity", idemKey, reqHash, http.StatusOK, updated)
-}
-
-func (h *Handler) SuspendActivityVersion(w http.ResponseWriter, r *http.Request) {
-	activityID := chi.URLParam(r, "activityID")
-	versionID := chi.URLParam(r, "versionID")
-	h.transitionAction(w, r, activityID, versionID, PrivacyActivitySuspend, domain.ActivityStatusActive, domain.ActivityStatusSuspended, "privacy.processing_activity.suspended")
-}
-
-func (h *Handler) SuspendLatestActivity(w http.ResponseWriter, r *http.Request) {
-	activityID := chi.URLParam(r, "activityID")
-	latest, ok := h.resolveLatestVersion(w, r, activityID)
-	if !ok {
-		return
-	}
-	h.transitionAction(w, r, activityID, latest.ActivityVersionID, PrivacyActivitySuspend, domain.ActivityStatusActive, domain.ActivityStatusSuspended, "privacy.processing_activity.suspended")
-}
-
-func (h *Handler) ResumeActivityVersion(w http.ResponseWriter, r *http.Request) {
-	activityID := chi.URLParam(r, "activityID")
-	versionID := chi.URLParam(r, "versionID")
-	h.transitionAction(w, r, activityID, versionID, PrivacyActivityResume, domain.ActivityStatusSuspended, domain.ActivityStatusActive, "privacy.processing_activity.resumed")
-}
-
-func (h *Handler) ResumeLatestActivity(w http.ResponseWriter, r *http.Request) {
-	activityID := chi.URLParam(r, "activityID")
-	latest, ok := h.resolveLatestVersion(w, r, activityID)
-	if !ok {
-		return
-	}
-	h.transitionAction(w, r, activityID, latest.ActivityVersionID, PrivacyActivityResume, domain.ActivityStatusSuspended, domain.ActivityStatusActive, "privacy.processing_activity.resumed")
-}
-
-func (h *Handler) RetireActivityVersion(w http.ResponseWriter, r *http.Request) {
-	activityID := chi.URLParam(r, "activityID")
-	versionID := chi.URLParam(r, "versionID")
-	h.retireActivityVersionInternal(w, r, activityID, versionID)
-}
-
-func (h *Handler) RetireLatestActivity(w http.ResponseWriter, r *http.Request) {
-	activityID := chi.URLParam(r, "activityID")
-	latest, ok := h.resolveLatestVersion(w, r, activityID)
-	if !ok {
-		return
-	}
-	h.retireActivityVersionInternal(w, r, activityID, latest.ActivityVersionID)
-}
-
-func (h *Handler) retireActivityVersionInternal(w http.ResponseWriter, r *http.Request, activityID, versionID string) {
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-
-	bodyBytes, err := readBodyBytes(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "failed to read request body")
-		return
-	}
-
-	verifiedTenant := svcmiddleware.TenantFromContext(r.Context())
-	if !h.authorize(w, r, principalID, verifiedTenant, PrivacyActivityRetire) {
-		return
-	}
-
-	_, handled, idemKey, reqHash := h.checkIdempotency(w, r, verifiedTenant, principalID, bodyBytes)
-	if handled {
-		return
-	}
-
-	existing, err := h.store.FindActivityVersion(r.Context(), activityID, versionID)
-	if err != nil {
-		if errors.Is(err, domain.ErrActivityVersionNotFound) {
-			writeError(w, http.StatusNotFound, "processing activity version not found")
-			return
-		}
-		h.log.Error("RetireActivityVersion: lookup failed", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
-		return
-	}
-	if !domain.ValidActivityTransition(existing.VersionStatus, domain.ActivityStatusRetired) {
-		writeError(w, http.StatusConflict, "version must be ACTIVE or SUSPENDED to retire")
-		return
-	}
-
-	updated, err := h.store.TransitionActivity(r.Context(), activityID, versionID, existing.VersionStatus, domain.ActivityStatusRetired)
-	if err != nil {
-		switch {
-		case errors.Is(err, domain.ErrActivityVersionNotFound):
-			writeError(w, http.StatusNotFound, "processing activity version not found")
-		case errors.Is(err, domain.ErrInvalidTransition):
-			writeError(w, http.StatusConflict, "version must be ACTIVE or SUSPENDED to retire")
-		default:
-			h.log.Error("RetireActivityVersion: store unavailable", zap.Error(err))
-			writeError(w, http.StatusServiceUnavailable, "store unavailable")
-		}
-		return
-	}
-
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "privacy.processing_activity.retired", EntityID: updated.ActivityID, TenantID: verifiedTenant,
-		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: updated,
-	})
-	h.writeJSONWithIdempotency(r.Context(), w, verifiedTenant, principalID, "RetireActivity", idemKey, reqHash, http.StatusOK, updated)
-}
-
-func (h *Handler) RejectActivityVersion(w http.ResponseWriter, r *http.Request) {
-	activityID := chi.URLParam(r, "activityID")
-	versionID := chi.URLParam(r, "versionID")
-	h.rejectActivityVersionInternal(w, r, activityID, versionID)
-}
-
-func (h *Handler) RejectLatestActivity(w http.ResponseWriter, r *http.Request) {
-	activityID := chi.URLParam(r, "activityID")
-	latest, ok := h.resolveLatestVersion(w, r, activityID)
-	if !ok {
-		return
-	}
-	h.rejectActivityVersionInternal(w, r, activityID, latest.ActivityVersionID)
-}
-
-func (h *Handler) rejectActivityVersionInternal(w http.ResponseWriter, r *http.Request, activityID, versionID string) {
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-
-	bodyBytes, err := readBodyBytes(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "failed to read request body")
-		return
-	}
-	var req domain.RejectActivityRequest
-	if err := json.Unmarshal(bodyBytes, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-	if req.Reason == "" {
-		writeError(w, http.StatusBadRequest, "reason is required")
-		return
-	}
-
-	verifiedTenant := svcmiddleware.TenantFromContext(r.Context())
-	if !h.authorize(w, r, principalID, verifiedTenant, PrivacyActivityReject) {
-		return
-	}
-
-	_, handled, idemKey, reqHash := h.checkIdempotency(w, r, verifiedTenant, principalID, bodyBytes)
-	if handled {
-		return
-	}
-
-	// Segregation of Duties (Maker-Checker, §18): Maker cannot reject their own activity version.
-	existing, err := h.store.FindActivityVersion(r.Context(), activityID, versionID)
-	if err != nil {
-		if errors.Is(err, domain.ErrActivityVersionNotFound) {
-			writeError(w, http.StatusNotFound, "processing activity version not found")
-			return
-		}
-		h.log.Error("RejectActivityVersion: lookup failed", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
-		return
-	}
-	if existing.CreatedByPrincipalID != "" && existing.CreatedByPrincipalID == principalID {
-		writeError(w, http.StatusForbidden, "maker cannot reject their own processing activity version (segregation of duties)")
-		return
-	}
-
-	updated, err := h.store.RejectActivity(r.Context(), activityID, versionID, req.Reason)
-	if err != nil {
-		switch {
-		case errors.Is(err, domain.ErrActivityVersionNotFound):
-			writeError(w, http.StatusNotFound, "processing activity version not found")
-		case errors.Is(err, domain.ErrInvalidTransition):
-			writeError(w, http.StatusConflict, "version is not in the required SUBMITTED state")
-		default:
-			h.log.Error("RejectActivityVersion: store unavailable", zap.Error(err))
-			writeError(w, http.StatusServiceUnavailable, "store unavailable")
-		}
-		return
-	}
-
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "privacy.processing_activity.rejected", EntityID: updated.ActivityID, TenantID: verifiedTenant,
-		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: updated,
-	})
-	h.writeJSONWithIdempotency(r.Context(), w, verifiedTenant, principalID, "RejectActivity", idemKey, reqHash, http.StatusOK, updated)
-}
-
-func (h *Handler) ActivateActivityVersion(w http.ResponseWriter, r *http.Request) {
-	activityID := chi.URLParam(r, "activityID")
-	versionID := chi.URLParam(r, "versionID")
-	h.activateActivityVersionInternal(w, r, activityID, versionID)
-}
-
-func (h *Handler) ActivateLatestActivity(w http.ResponseWriter, r *http.Request) {
-	activityID := chi.URLParam(r, "activityID")
-	latest, ok := h.resolveLatestVersion(w, r, activityID)
-	if !ok {
-		return
-	}
-	h.activateActivityVersionInternal(w, r, activityID, latest.ActivityVersionID)
-}
-
-func (h *Handler) activateActivityVersionInternal(w http.ResponseWriter, r *http.Request, activityID, versionID string) {
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-
-	bodyBytes, err := readBodyBytes(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "failed to read request body")
-		return
-	}
-	var req domain.ActivateActivityRequest
-	if len(bodyBytes) > 0 {
-		if err := json.Unmarshal(bodyBytes, &req); err != nil {
-			writeError(w, http.StatusBadRequest, "invalid request body")
-			return
-		}
-	}
-	effectiveFrom := time.Now().UTC()
-	if req.EffectiveFrom != nil {
-		effectiveFrom = *req.EffectiveFrom
-	}
-
-	verifiedTenant := svcmiddleware.TenantFromContext(r.Context())
-	if !h.authorize(w, r, principalID, verifiedTenant, PrivacyActivityActivate) {
-		return
-	}
-
-	_, handled, idemKey, reqHash := h.checkIdempotency(w, r, verifiedTenant, principalID, bodyBytes)
-	if handled {
-		return
-	}
-
-	updated, err := h.store.ActivateActivity(r.Context(), activityID, versionID, effectiveFrom)
-	if err != nil {
-		switch {
-		case errors.Is(err, domain.ErrActivityVersionNotFound):
-			writeError(w, http.StatusNotFound, "processing activity version not found")
-		case errors.Is(err, domain.ErrInvalidTransition):
-			writeError(w, http.StatusConflict, "version is not in the required APPROVED state")
-		default:
-			h.log.Error("ActivateActivityVersion: store unavailable", zap.Error(err))
-			writeError(w, http.StatusServiceUnavailable, "store unavailable")
-		}
-		return
-	}
-
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "privacy.processing_activity.activated", EntityID: updated.ActivityID, TenantID: verifiedTenant,
-		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: updated,
-	})
-	h.writeJSONWithIdempotency(r.Context(), w, verifiedTenant, principalID, "ActivateActivity", idemKey, reqHash, http.StatusOK, updated)
-}
-
-func (h *Handler) ListROPA(w http.ResponseWriter, r *http.Request) {
-	role := r.URL.Query().Get("role")
-	jurisdiction := r.URL.Query().Get("jurisdiction")
-
-	versions, err := h.store.ListActiveActivities(r.Context(), role, jurisdiction)
-	if err != nil {
-		h.log.Error("ListROPA: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
-		return
-	}
-	if versions == nil {
-		versions = []domain.ProcessingActivityVersion{}
-	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"data": versions, "count": len(versions)})
-}
+func hasBlank(xs []string) bool { return len(nonBlank(xs)) != len(xs) }

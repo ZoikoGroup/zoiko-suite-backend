@@ -26,6 +26,20 @@ func (c Classification) Valid() bool {
 	return false
 }
 
+// DocumentStateFor maps this service's DocumentStatus onto the §3.2
+// document_state enum (DRAFT, ACTIVE, LOCKED, SUPERSEDED, WITHDRAWN,
+// QUARANTINED). Only identical names map. RETAINED, PURGE_PENDING and ARCHIVED
+// are this service's own states with no §3.2 counterpart, so they return "".
+func DocumentStateFor(s DocumentStatus) string {
+	switch s {
+	case StatusActive:
+		return "ACTIVE"
+	case StatusSuperseded:
+		return "SUPERSEDED"
+	}
+	return ""
+}
+
 type DocumentStatus string
 
 const (
@@ -83,18 +97,25 @@ const (
 // version lineage live in DocumentVersion rows — this row is mutable only for
 // current_version/status/updated_at; everything evidentiary is append-only.
 type Document struct {
-	DocumentID           string         `json:"document_id"`
-	TenantID             string         `json:"tenant_id"`
-	LegalEntityID        string         `json:"legal_entity_id"`
-	Title                string         `json:"title"`
-	Classification       Classification `json:"classification"`
-	RetentionPolicy      string         `json:"retention_policy"`
-	ResidencyRegionCode  *string        `json:"residency_region_code,omitempty"`
-	CurrentVersion       int            `json:"current_version"`
-	Status               DocumentStatus `json:"status"`
-	CreatedByPrincipalID string         `json:"created_by_principal_id"`
-	CreatedAt            time.Time      `json:"created_at"`
-	UpdatedAt            time.Time      `json:"updated_at"`
+	DocumentID          string         `json:"document_id"`
+	TenantID            string         `json:"tenant_id"`
+	LegalEntityID       string         `json:"legal_entity_id"`
+	Title               string         `json:"title"`
+	Classification      Classification `json:"classification"`
+	RetentionPolicy     string         `json:"retention_policy"`
+	ResidencyRegionCode *string        `json:"residency_region_code,omitempty"`
+	CurrentVersion      int            `json:"current_version"`
+	Status              DocumentStatus `json:"status"`
+	// DocumentState is ZS-SVC-S-001 §3.2 document_state. It is set only when the
+	// service's own status IS one of the §3.2 states (see DocumentStateFor); the
+	// other statuses have no §3.2 equivalent and are left out, not guessed.
+	DocumentState string `json:"document_state,omitempty"`
+	// RowVersion is §3.2 row_version: the database-maintained optimistic
+	// concurrency token, 1 at creation and +1 on every change to the row.
+	RowVersion           int64     `json:"row_version"`
+	CreatedByPrincipalID string    `json:"created_by_principal_id"`
+	CreatedAt            time.Time `json:"created_at"`
+	UpdatedAt            time.Time `json:"updated_at"`
 
 	// DeclaredVersion/DeclaredAt/DeclaredByPrincipalID (Wave 2): set together,
 	// exactly once, by DeclareRecord — "record declaration tracked
@@ -133,6 +154,10 @@ type DocumentVersion struct {
 	ContentType          string    `json:"content_type"`
 	CreatedByPrincipalID string    `json:"created_by_principal_id"`
 	CreatedAt            time.Time `json:"created_at"`
+	// DetectedContentType is the server-side content sniff taken at ingest
+	// (DRC-I19). ContentType above is what the caller DECLARED. Empty for versions
+	// written before migration 000015 — none is invented for them.
+	DetectedContentType string `json:"detected_content_type,omitempty"`
 }
 
 // DocumentAccessLog is one append-only record of a read (§8.3 "access

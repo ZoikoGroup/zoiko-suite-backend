@@ -113,6 +113,9 @@ func (c *Client) EvaluateSufficient(ctx context.Context, tenantID, legalEntityID
 			evidenceSourceChannel = string(env.SourceChannel)
 		}
 	}
+	if evidenceRequestID == "" {
+		evidenceRequestID = correlationID
+	}
 	req.Header.Set("X-Request-Id", evidenceRequestID)
 	req.Header.Set("X-Source-Channel", evidenceSourceChannel)
 	// One evaluation per (request, correlation): correlationID already

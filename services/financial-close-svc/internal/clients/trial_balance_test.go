@@ -92,21 +92,28 @@ func newClients(t *testing.T, ledgerURL string) *clients.Clients {
 // ledger semantics a second time.
 func TestCompileTrialBalance_ParsesLinesIntoMap(t *testing.T) {
 	var gotBody map[string]string
-	var gotTenant, gotPrincipal string
+	var gotTenant, gotPrincipal, gotLegalEntity, gotRequestID, gotSourceChannel, gotCorrelationID string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/trial-balance/compile" || r.Method != http.MethodPost {
 			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
 		}
 		gotTenant = r.Header.Get("X-Tenant-Id")
 		gotPrincipal = r.Header.Get("X-Principal-Id")
+		gotLegalEntity = r.Header.Get("X-Legal-Entity-Id")
+		gotRequestID = r.Header.Get("X-Request-Id")
+		gotSourceChannel = r.Header.Get("X-Source-Channel")
+		gotCorrelationID = r.Header.Get("X-Correlation-ID")
 		_ = json.NewDecoder(r.Body).Decode(&gotBody)
 		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"trial_balance_snapshot_id": "tb-1",
 			"ledger_watermark":          42,
 			"lines": []map[string]any{
-				{"account_code": "1000-Cash", "net_balance": 250},
-				{"account_code": "4000-Rev", "net_balance": -250},
+				// Decimal strings, matching general-ledger-svc's real wire
+				// format (NUMERIC(18,2) scanned into a Go string, never a
+				// float64 — ZS-DATA-001 D06).
+				{"account_code": "1000-Cash", "net_balance": "250.00"},
+				{"account_code": "4000-Rev", "net_balance": "-250.00"},
 			},
 		})
 	}))
@@ -124,6 +131,18 @@ func TestCompileTrialBalance_ParsesLinesIntoMap(t *testing.T) {
 	}
 	if gotTenant != "tenant-1" || gotPrincipal != "principal-1" {
 		t.Fatalf("expected tenant/principal forwarded, got tenant=%q principal=%q", gotTenant, gotPrincipal)
+	}
+	if gotLegalEntity != "le-1" {
+		t.Fatalf("expected X-Legal-Entity-Id forwarded, got %q", gotLegalEntity)
+	}
+	if gotRequestID == "" {
+		t.Fatalf("expected X-Request-Id forwarded, got empty")
+	}
+	if gotSourceChannel == "" {
+		t.Fatalf("expected X-Source-Channel forwarded, got empty")
+	}
+	if gotCorrelationID == "" {
+		t.Fatalf("expected X-Correlation-ID forwarded, got empty")
 	}
 	if gotBody["legal_entity_id"] != "le-1" || gotBody["fiscal_period"] != "2026-01" {
 		t.Fatalf("expected legal_entity_id/fiscal_period sent in the request body, got %+v", gotBody)

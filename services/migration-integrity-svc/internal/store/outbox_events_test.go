@@ -72,11 +72,13 @@ func createJob(t *testing.T, s *store.PgStore, tenantID string, invalidCount int
 		ID: uuid.NewString(), LegalEntityID: "le-uk-1", MigrationName: "fy26 ledger cutover",
 		SourceSystem: "LEGACY_ERP", TargetService: "general-ledger-svc",
 		TotalRecordsCount: 10, ValidRecordsCount: 10 - invalidCount, InvalidRecordsCount: invalidCount,
-		IntegrityScore: float64(10-invalidCount) * 10, Status: status, StartedAt: &now, CompletedAt: &now,
+		IntegrityScore: float64(10-invalidCount) * 10, IntegrityScoreThreshold: 95,
+		Status: status, StartedAt: &now, CompletedAt: &now,
 	}
 	var entries []domain.AuditEntry
 	for i := 0; i < invalidCount; i++ {
-		entries = append(entries, domain.AuditEntry{RecordRef: "rec-" + uuid.NewString()[:8], FieldName: "amount", ViolationType: domain.ViolationMissingRequired})
+		entries = append(entries, domain.AuditEntry{RecordRef: "rec-" + uuid.NewString()[:8], FieldName: "amount", ViolationType: domain.ViolationMissingRequired,
+			Severity: domain.SeverityMQ2, ReasonFamily: domain.ReasonSchema, OwnerID: "owner-1"})
 	}
 	require.NoError(t, s.CreateJob(context.Background(), tenantID, job, nil, entries, "principal-1", "corr-1"))
 	return job
@@ -138,11 +140,23 @@ func TestPgStore_RemediateEntry_EnqueuesOnEntry_ReplayEmitsNothing(t *testing.T)
 	job := createJob(t, s, tenantID, 1)
 	entryID := job.AuditEntries[0].ID
 
-	got, err := s.RemediateEntry(context.Background(), tenantID, job.ID, entryID, "fixed at source", "principal-3", "corr-4")
+	got, err := s.RemediateEntry(context.Background(), tenantID, job.ID, entryID,
+		"source corrected and reloaded", "ticket-MIG-42", "principal-3", "corr-4")
 	require.NoError(t, err)
 	assert.True(t, got.IsRemediated)
-	_, err = s.RemediateEntry(context.Background(), tenantID, job.ID, entryID, "fixed at source", "principal-3", "corr-5")
+	assert.Equal(t, "source corrected and reloaded", got.RemediationReason)
+	assert.Equal(t, "ticket-MIG-42", got.RemediationEvidenceRef)
+	assert.Equal(t, "principal-3", got.RemediatedBy)
+	require.NotNil(t, got.RemediatedAt)
+
+	// A replay with different evidence still succeeds but must neither emit a
+	// second remediation event nor rewrite the recorded decision.
+	replayed, err := s.RemediateEntry(context.Background(), tenantID, job.ID, entryID,
+		"a later, different story", "ticket-OTHER", "principal-9", "corr-5")
 	require.NoError(t, err, "replay still succeeds")
+	assert.Equal(t, "source corrected and reloaded", replayed.RemediationReason, "replay must not overwrite the reason")
+	assert.Equal(t, "ticket-MIG-42", replayed.RemediationEvidenceRef, "replay must not overwrite the evidence ref")
+	assert.Equal(t, "principal-3", replayed.RemediatedBy, "replay must not overwrite the actor")
 
 	rows := outboxRows(t, tenantID, entryID)
 	require.Len(t, rows, 1, "aggregate is the entry (the old subject_id); a replay must not record a second remediation")
@@ -153,6 +167,25 @@ func TestPgStore_RemediateEntry_EnqueuesOnEntry_ReplayEmitsNothing(t *testing.T)
 	assert.Contains(t, p, `"legal_entity_id":"le-uk-1"`)
 	assert.Contains(t, p, `"is_remediated":true`)
 	assert.Contains(t, p, `"job_id":"`+job.ID+`"`)
+	assert.Contains(t, p, `"remediation_reason":"source corrected and reloaded"`)
+	assert.Contains(t, p, `"remediation_evidence_ref":"ticket-MIG-42"`)
+	assert.Contains(t, p, `"remediated_by":"principal-3"`)
+	assert.Contains(t, p, `"remediated_at":`)
+
+	// And the evidence survives a read of the job.
+	read, err := s.GetJobByID(context.Background(), tenantID, job.ID)
+	require.NoError(t, err)
+	var found bool
+	for _, e := range read.AuditEntries {
+		if e.ID == entryID {
+			found = true
+			assert.Equal(t, "source corrected and reloaded", e.RemediationReason)
+			assert.Equal(t, "ticket-MIG-42", e.RemediationEvidenceRef)
+			assert.Equal(t, "principal-3", e.RemediatedBy)
+			require.NotNil(t, e.RemediatedAt)
+		}
+	}
+	assert.True(t, found, "the remediated entry must still be returned by the read")
 }
 
 func TestPgStore_RemediateEntry_OtherTenant_RefusedAndEmitsNothing(t *testing.T) {
@@ -161,7 +194,8 @@ func TestPgStore_RemediateEntry_OtherTenant_RefusedAndEmitsNothing(t *testing.T)
 	job := createJob(t, s, tenantID, 1)
 	entryID := job.AuditEntries[0].ID
 
-	_, err := s.RemediateEntry(context.Background(), uuid.NewString(), job.ID, entryID, "", "intruder", "corr-x")
+	_, err := s.RemediateEntry(context.Background(), uuid.NewString(), job.ID, entryID,
+		"r", "e", "intruder", "corr-x")
 	require.Error(t, err)
 	assert.Empty(t, outboxRows(t, tenantID, entryID))
 }

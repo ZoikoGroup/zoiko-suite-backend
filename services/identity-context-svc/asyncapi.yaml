@@ -68,11 +68,24 @@ channels:
         oneOf:
           - $ref: "#/components/messages/ContextResolved"
           - $ref: "#/components/messages/ResolutionFailed"
-          - $ref: "#/components/messages/SessionInvalidated"
+          - $ref: "#/components/messages/SessionRevoked"
           - $ref: "#/components/messages/RiskSignalUnavailable"
           - $ref: "#/components/messages/PrincipalStatusChanged"
+          - $ref: "#/components/messages/SubjectDisabled"
+          - $ref: "#/components/messages/SubjectEnabled"
+          - $ref: "#/components/messages/LoginSessionStarted"
+          - $ref: "#/components/messages/LoginSessionEnded"
+          - $ref: "#/components/messages/RefreshTokenReuseDetected"
+          - $ref: "#/components/messages/AuthorizationCodeReplayed"
+          - $ref: "#/components/messages/AuthenticationThrottled"
+          - $ref: "#/components/messages/TokenExchanged"
           - $ref: "#/components/messages/AuthenticationSucceeded"
           - $ref: "#/components/messages/AuthenticationFailed"
+          - $ref: "#/components/messages/MFAFactorEnrolled"
+          - $ref: "#/components/messages/MFAFactorRevoked"
+          - $ref: "#/components/messages/MFAFactorReset"
+          - $ref: "#/components/messages/StepUpSucceeded"
+          - $ref: "#/components/messages/StepUpFailed"
           - $ref: "#/components/messages/TenantContextCacheInvalidated"
           - $ref: "#/components/messages/TenantContextInvalidated"
           - $ref: "#/components/messages/SupportContextAttached"
@@ -137,6 +150,19 @@ channels:
 
 components:
   schemas:
+    PrincipalStatusPayload:
+      type: object
+      properties:
+        payload:
+          type: object
+          properties:
+            principal_id: { type: string }
+            tenant_id: { type: string }
+            new_status: { type: string, enum: [ACTIVE, SUSPENDED, DISABLED] }
+            actor: { type: string }
+            reason: { type: string }
+            correlation_id: { type: string }
+
     Envelope:
       type: object
       description: |
@@ -225,9 +251,12 @@ components:
                       - residency_denied
                       - trust_posture_blocked
 
-    SessionInvalidated:
-      name: session.invalidated
+    SessionRevoked:
+      name: identity.session.revoked
       title: One session was revoked
+      summary: |
+        ZS-IAM-001 §23's name. Emitted as `session.invalidated` until 16 Oct
+        2026; no service consumed the old name, so it was retired outright.
       payload:
         allOf:
           - $ref: "#/components/schemas/Envelope"
@@ -272,11 +301,97 @@ components:
 
     PrincipalStatusChanged:
       name: principal.status.changed
-      title: A principal was suspended or reactivated
+      title: A principal was enabled, suspended or disabled
+      summary: |
+        Written in the same transaction as the status change (PUT
+        /v1/principals/{id}/status), together with identity.subject.disabled
+        or identity.subject.enabled. authorization-svc's principal-status
+        projection and cache invalidator consume this name; ZS-IAM-001 names
+        the identity.subject.* pair, so both are emitted. Until 19 Oct 2026
+        the status route emitted neither (Group 1 re-audit F-3).
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - $ref: "#/components/schemas/PrincipalStatusPayload"
+
+    SubjectDisabled:
+      name: identity.subject.disabled
+      title: A principal was suspended or disabled (ZS-IAM-001 §23)
+      summary: Emitted with principal.status.changed; every session the principal held is then ended.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - $ref: "#/components/schemas/PrincipalStatusPayload"
+
+    SubjectEnabled:
+      name: identity.subject.enabled
+      title: A principal was (re)activated (ZS-IAM-001 §23)
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - $ref: "#/components/schemas/PrincipalStatusPayload"
+
+    LoginSessionStarted:
+      name: identity.login_session.started
+      title: A hosted login completed and a login session (sid) began
       payload:
         allOf:
           - $ref: "#/components/schemas/Envelope"
           - type: object
+            properties:
+              payload:
+                type: object
+                properties:
+                  sid: { type: string }
+                  principal_id: { type: string }
+                  tenant_id: { type: string }
+                  client_id: { type: string }
+                  amr: { type: array, items: { type: string } }
+                  assurance_level: { type: string }
+
+    LoginSessionEnded:
+      name: identity.login_session.ended
+      title: A login session ended (logout, refresh or code reuse, disable, admin revoke)
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+            properties:
+              payload:
+                type: object
+                properties:
+                  sid: { type: string }
+                  tenant_id: { type: string }
+                  reason: { type: string }
+                  session_contexts_ended: { type: integer }
+
+    RefreshTokenReuseDetected:
+      name: identity.refresh_token.reuse_detected
+      title: A rotated refresh token was presented again; its family was revoked and the login session ended
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+
+    AuthorizationCodeReplayed:
+      name: identity.authorization_code.replayed
+      title: An authorization code was redeemed twice; the login session it came from was ended
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+
+    AuthenticationThrottled:
+      name: identity.authentication.throttled
+      title: A hosted login was refused 429 by the source throttle (AU-04)
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+
+    TokenExchanged:
+      name: identity.token.exchanged
+      title: A workload exchanged an envelope for a narrower audience (RFC 8693)
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
 
     AuthenticationSucceeded:
       name: identity.authentication.succeeded
@@ -300,6 +415,66 @@ components:
         failures against addresses that do not exist is the signature of an
         enumeration sweep, and dropping those would hide exactly the attack the
         constant-time verification path defends against.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+
+    MFAFactorEnrolled:
+      name: identity.mfa_factor.enrolled
+      title: A TOTP factor was proven and is now active
+      summary: |
+        Written through the outbox in the transaction that activates the
+        factor (and retires any previous one). Payload: principal_id,
+        tenant_id, factor_id, factor_type, correlation_id. Never any secret.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+
+    MFAFactorRevoked:
+      name: identity.mfa_factor.revoked
+      title: A principal revoked its own TOTP factor
+      summary: |
+        Requires a recent step-up. Payload: principal_id, tenant_id, factor_id,
+        reason, actor, correlation_id.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+
+    MFAFactorReset:
+      name: identity.mfa_factor.reset
+      title: An administrator reset another principal's second factor
+      summary: |
+        Credential recovery (ZS-IAM-001 §3). Payload: principal_id (the
+        subject), tenant_id, reason_code, purpose, actor (the administrator),
+        correlation_id. Also streamed to SIEM at high severity.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+
+    StepUpSucceeded:
+      name: identity.step_up.succeeded
+      title: A session was stepped up with a second factor
+      summary: |
+        Written with the accepted code. Payload: principal_id, tenant_id,
+        factor_id, session_context_id, amr, correlation_id. Doc 05 §13.2 names
+        MFA/step-up events a required SIEM signal.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+
+    StepUpFailed:
+      name: identity.step_up.failed
+      title: A second-factor code was refused
+      summary: |
+        A wrong, replayed or locked code, on step-up or activation. Payload:
+        principal_id, tenant_id, credential_type, action, failure_reason,
+        correlation_id. The reason is here and in access_decision_log, never on
+        the wire.
       payload:
         allOf:
           - $ref: "#/components/schemas/Envelope"

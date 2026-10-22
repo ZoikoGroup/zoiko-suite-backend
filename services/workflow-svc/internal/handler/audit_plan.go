@@ -16,15 +16,6 @@ const (
 	actionAuditPlanRead    = "AUDIT_PLAN_READ"
 )
 
-func (h *Handler) requireCorrelationID(w http.ResponseWriter, r *http.Request) (string, bool) {
-	correlationID := r.Header.Get("X-Correlation-ID")
-	if correlationID == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_correlation_id"})
-		return "", false
-	}
-	return correlationID, true
-}
-
 // CreateAuditPlan creates AUD-02's own AuditPlan container for an
 // engagement that must already exist.
 func (h *Handler) CreateAuditPlan(w http.ResponseWriter, r *http.Request) {

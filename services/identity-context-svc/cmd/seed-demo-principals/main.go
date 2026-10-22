@@ -193,7 +193,8 @@ func main() {
 	if err := conn.QueryRow(ctx, `
 		SELECT COUNT(*) FROM principals p
 		JOIN principal_credentials c ON c.principal_id = p.principal_id
-		WHERE p.tenant_id = $1 AND p.status = 'ACTIVE' AND c.status = 'ACTIVE'`,
+		WHERE p.tenant_id = $1 AND p.status = 'ACTIVE' AND c.status = 'ACTIVE'
+		  AND c.credential_type = 'PASSWORD'`,
 		demoTenant).Scan(&n); err != nil {
 		fail("verify: %v", err)
 	}

@@ -383,6 +383,7 @@ func (h *Handler) UpdateRole(w http.ResponseWriter, r *http.Request) {
 	var req domain.UpdateRoleRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.roleWrite(telemetry.WriteInvalidRequest)
+		h.recordRefusal(r.Context(), "", "", "", "", "UPDATE_ROLE", "invalid_json", "invalid_json", err.Error(), req)
 		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
 		return
 	}
@@ -411,6 +412,8 @@ func (h *Handler) UpdateRole(w http.ResponseWriter, r *http.Request) {
 	// caller can act on.
 	if req.Status != "" && req.Status != string(domain.RoleStatusActive) && req.Status != string(domain.RoleStatusRetired) {
 		h.roleWrite(telemetry.WriteInvalidRequest)
+		h.recordRefusal(r.Context(), updateTenantID, req.LegalEntityID, principalID, req.CorrelationID, "UPDATE_ROLE", "invalid_status", "invalid_status",
+			fmt.Sprintf("status must be %s or %s, got %q", domain.RoleStatusActive, domain.RoleStatusRetired, req.Status), req)
 		writeError(w, http.StatusBadRequest, "invalid_status",
 			fmt.Sprintf("status must be %s or %s, got %q", domain.RoleStatusActive, domain.RoleStatusRetired, req.Status))
 		return

@@ -38,6 +38,7 @@ import (
 	"zoiko.io/general-ledger-svc/internal/config"
 	svcenvelope "zoiko.io/general-ledger-svc/internal/envelope"
 	"zoiko.io/general-ledger-svc/internal/events"
+	"zoiko.io/general-ledger-svc/internal/evidencereq"
 	"zoiko.io/general-ledger-svc/internal/handler"
 	"zoiko.io/general-ledger-svc/internal/health"
 	svcmiddleware "zoiko.io/general-ledger-svc/internal/middleware"
@@ -225,7 +226,8 @@ func main() {
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
-	h := handler.New(pgStore, publisher, authzClient, closeClient, log)
+	h := handler.New(pgStore, publisher, authzClient, closeClient, log).
+		WithEvidenceGate(evidencereq.NewClient(cfg.EvidenceRequirementsURL))
 	handler.RegisterRoutes(r, h)
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────

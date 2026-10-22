@@ -39,7 +39,7 @@ func server(t *testing.T, data []domain.PopulationRecord, tweak func(page int, r
 		off, _ := strconv.Atoi(r.URL.Query().Get("cursor"))
 		limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 		end := off + limit
-		resp := pageResponse{Watermark: "wm-1"}
+		resp := pageResponse{Watermark: "wm-1", DeclaredTotals: declare(data)}
 		if end < len(data) {
 			resp.NextCursor = strconv.Itoa(end)
 		} else {
@@ -53,6 +53,21 @@ func server(t *testing.T, data []domain.PopulationRecord, tweak func(page int, r
 	}))
 	t.Cleanup(s.Close)
 	return s, &seen
+}
+
+// declare computes the honest whole-population totals a conforming source sends.
+// Data a test made deliberately invalid gets totals of nothing; the record check
+// refuses it before totals are compared.
+func declare(data []domain.PopulationRecord) *declaredTotals {
+	d := &declaredTotals{RowCount: len(data), Totals: map[string]string{}}
+	got, err := domain.ComputeTotals(data)
+	if err != nil {
+		return d
+	}
+	for _, c := range got {
+		d.Totals[c.Currency] = c.Total
+	}
+	return d
 }
 
 var scope = Scope{TenantID: "t1", PrincipalID: "alice", LegalEntityID: "e1", PeriodID: "2026-09", CorrelationID: "c1"}
@@ -116,6 +131,29 @@ func TestFetch_DeclaredTotalsMustTie(t *testing.T) {
 		_, err := fetcher(s).Fetch(context.Background(), spec, scope)
 		assert.ErrorIs(t, err, ErrSourceInconsistent, name)
 	}
+}
+
+func TestFetch_MissingDeclaredTotalsFails(t *testing.T) {
+	for name, page := range map[string]int{"first page": 0, "later page": 1} {
+		page := page
+		s, _ := server(t, recs(1500), func(p int, r *pageResponse) {
+			if p == page {
+				r.DeclaredTotals = nil
+			}
+		})
+		_, err := fetcher(s).Fetch(context.Background(), spec, scope)
+		assert.ErrorIs(t, err, ErrSourceInconsistent, "%s: the contract requires declared_totals on every page", name)
+	}
+}
+
+func TestFetch_DeclaredTotalsChangingBetweenPagesFails(t *testing.T) {
+	s, _ := server(t, recs(1500), func(page int, r *pageResponse) {
+		if page == 1 {
+			r.DeclaredTotals = &declaredTotals{RowCount: 1500, Totals: map[string]string{"USD": "2250.01"}}
+		}
+	})
+	_, err := fetcher(s).Fetch(context.Background(), spec, scope)
+	assert.ErrorIs(t, err, ErrSourceInconsistent, "whole-population totals cannot differ between pages of one extraction")
 }
 
 func TestFetch_TruncatedTransferDetectedByDeclaredCount(t *testing.T) {
@@ -228,7 +266,7 @@ func TestParamsAreForwardedToTheSourceAndValidated(t *testing.T) {
 	var seen map[string][]string
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		seen = r.URL.Query()
-		_ = json.NewEncoder(w).Encode(pageResponse{Watermark: "w"})
+		_ = json.NewEncoder(w).Encode(pageResponse{Watermark: "w", DeclaredTotals: declare(nil)})
 	}))
 	defer s.Close()
 	f := NewHTTPFetcher(map[string]string{"ar": s.URL}, nil)
@@ -253,7 +291,7 @@ func TestNoPeriodSpecOmitsPeriodIDFromTheRequest(t *testing.T) {
 	var seen map[string][]string
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		seen = r.URL.Query()
-		_ = json.NewEncoder(w).Encode(pageResponse{Watermark: "w"})
+		_ = json.NewEncoder(w).Encode(pageResponse{Watermark: "w", DeclaredTotals: declare(nil)})
 	}))
 	defer s.Close()
 	f := NewHTTPFetcher(map[string]string{"ar": s.URL}, nil)
@@ -277,4 +315,52 @@ func TestNoPeriodSpecOmitsPeriodIDFromTheRequest(t *testing.T) {
 	kept, err := ResolveScopeParams(Spec{System: "ar", Population: "p", NoPeriod: true, Params: map[string]string{"a": "${scope.k}"}}, []byte(`{"k":"v"}`))
 	require.NoError(t, err)
 	assert.True(t, kept.NoPeriod, "scope binding preserves the flag")
+}
+
+// Watermark reads page 1 with limit=1 through the same request Fetch makes: same
+// path, verified scope headers, entity/period and params, and no cursor.
+func TestWatermark_ReadsOnePageWithLimitOne(t *testing.T) {
+	var queries []map[string][]string
+	s, seen := server(t, recs(2500), func(_ int, r *pageResponse) { r.Watermark = "wm-now" })
+	wrapped := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		queries = append(queries, r.URL.Query())
+		s.Config.Handler.ServeHTTP(w, r)
+	}))
+	t.Cleanup(wrapped.Close)
+
+	sp := Spec{System: "ar", Population: "invoices", Params: map[string]string{"status": "open"}}
+	wm, err := NewHTTPFetcher(map[string]string{"ar": wrapped.URL}, nil).Watermark(context.Background(), sp, scope)
+	require.NoError(t, err)
+	assert.Equal(t, "wm-now", wm)
+	require.Len(t, queries, 1, "one page only, however large the population")
+	q := queries[0]
+	assert.Equal(t, []string{"1"}, q["limit"])
+	assert.Equal(t, []string{"e1"}, q["legal_entity_id"])
+	assert.Equal(t, []string{"2026-09"}, q["period_id"])
+	assert.Equal(t, []string{"open"}, q["status"])
+	assert.NotContains(t, q, "cursor")
+	require.Len(t, *seen, 1)
+	h := (*seen)[0]
+	assert.Equal(t, "t1", h.Get("X-Tenant-Id"))
+	assert.Equal(t, "alice", h.Get("X-Principal-Id"))
+	assert.Equal(t, "e1", h.Get("X-Legal-Entity-Id"))
+	assert.Equal(t, "c1", h.Get("X-Correlation-ID"))
+}
+
+// Fails closed like Fetch: no watermark, an outage or an unknown system is an
+// error, never an empty watermark a caller could compare.
+func TestWatermark_FailsClosed(t *testing.T) {
+	s, _ := server(t, recs(1), func(_ int, r *pageResponse) { r.Watermark = " " })
+	_, err := fetcher(s).Watermark(context.Background(), spec, scope)
+	assert.True(t, errors.Is(err, ErrSourceInconsistent), "%v", err)
+
+	down := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(down.Close)
+	_, err = fetcher(down).Watermark(context.Background(), spec, scope)
+	assert.True(t, errors.Is(err, ErrSourceUnavailable), "%v", err)
+
+	_, err = fetcher(s).Watermark(context.Background(), Spec{System: "nope", Population: "invoices"}, scope)
+	assert.True(t, errors.Is(err, ErrSourceUnknown), "%v", err)
 }

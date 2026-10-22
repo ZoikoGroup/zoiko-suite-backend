@@ -2,6 +2,7 @@ package context_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,7 @@ import (
 
 	identityctx "zoiko.io/identity-context-svc/internal/context"
 	"zoiko.io/identity-context-svc/internal/domain"
+	svcenvelope "zoiko.io/identity-context-svc/internal/envelope"
 )
 
 // Authorization and session-scoping tests for identity-context-svc
@@ -301,5 +303,78 @@ func TestResolveDoesNotRequireIdentityHeaders(t *testing.T) {
 	if w.Code == http.StatusForbidden {
 		t.Fatalf("POST /v1/context/resolve must not consult authorization — the denying stub should not affect it; got 403: %s",
 			w.Body.String())
+	}
+}
+
+// ── The entity forwarded to authorization-svc (2026-10-16) ───────────────────
+
+// capturingAuthz records the exact scope it was asked about.
+type capturingAuthz struct {
+	legalEntityID string
+	actionType    string
+	tenantID      string
+	err           error
+}
+
+func (c *capturingAuthz) CheckAllowed(_ context.Context, _, legalEntityID, actionType, tenantID string) error {
+	c.legalEntityID, c.actionType, c.tenantID = legalEntityID, actionType, tenantID
+	return c.err
+}
+
+func statusUpdateRequest() *http.Request {
+	body, _ := json.Marshal(domain.UpdateStatusRequest{Status: domain.PrincipalStatusActive})
+	req := httptest.NewRequest(http.MethodPut, "/v1/principals/p-1/status", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Tenant-Id", "tenant-a")
+	req.Header.Set("X-Principal-Id", "p-1")
+	return req
+}
+
+// The regression test for the live outage: authorize passed the TENANT id in
+// the legal-entity position, so authorization-svc refused with 403
+// tenant_scope_mismatch (a tenant id is not an entity) and every guarded
+// command failed closed as 503. The envelope's legal entity must travel in
+// the entity position, and the tenant only in the tenant position.
+func TestAuthorizeForwardsTheEnvelopeLegalEntityNotTheTenant(t *testing.T) {
+	store := &mockPrincipalStore{principal: &domain.Principal{PrincipalID: "p-1", TenantID: "tenant-a"}}
+	az := &capturingAuthz{}
+	r := chi.NewRouter()
+	h := identityctx.NewHandler(nil, nil, nil, store, az, zap.NewNop())
+	identityctx.RegisterRoutes(r, h)
+
+	req := statusUpdateRequest()
+	req.Header.Set("X-Legal-Entity-Id", "le-7")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if az.legalEntityID != "le-7" {
+		t.Fatalf("the entity position must carry the envelope legal entity le-7, got %q", az.legalEntityID)
+	}
+	if az.tenantID != "tenant-a" {
+		t.Fatalf("the tenant position must carry tenant-a, got %q", az.tenantID)
+	}
+	if az.actionType != identityctx.IdentityPrincipalStatus {
+		t.Fatalf("the action must be %q, got %q", identityctx.IdentityPrincipalStatus, az.actionType)
+	}
+}
+
+// When the envelope middleware has run, its parsed (validated) envelope on
+// the context is the source — not the raw header.
+func TestAuthorizePrefersTheParsedEnvelopeOnContext(t *testing.T) {
+	store := &mockPrincipalStore{principal: &domain.Principal{PrincipalID: "p-1", TenantID: "tenant-a"}}
+	az := &capturingAuthz{}
+	r := chi.NewRouter()
+	h := identityctx.NewHandler(nil, nil, nil, store, az, zap.NewNop())
+	identityctx.RegisterRoutes(r, h)
+
+	req := statusUpdateRequest()
+	req.Header.Set("X-Legal-Entity-Id", "le-header")
+	req = req.WithContext(svcenvelope.WithEnvelope(req.Context(),
+		svcenvelope.Envelope{LegalEntityID: "le-parsed"}))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if az.legalEntityID != "le-parsed" {
+		t.Fatalf("the parsed envelope on the context must win, got %q", az.legalEntityID)
 	}
 }

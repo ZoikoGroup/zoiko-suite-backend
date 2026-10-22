@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 	"time"
 
@@ -16,8 +18,8 @@ import (
 	"zoiko.io/general-ledger-svc/internal/domain"
 	svcenvelope "zoiko.io/general-ledger-svc/internal/envelope"
 	"zoiko.io/general-ledger-svc/internal/handler"
-	"zoiko.io/general-ledger-svc/internal/store"
 	svcmiddleware "zoiko.io/general-ledger-svc/internal/middleware"
+	"zoiko.io/general-ledger-svc/internal/store"
 )
 
 // ── stubs ────────────────────────────────────────────────────────────────────
@@ -51,9 +53,13 @@ type stubStore struct {
 	// for, so a test can assert the handler passed the right scope down.
 	lastCompileLegalEntityID, lastCompileFiscalPeriod string
 
-	accounts         map[string]*domain.Account // by account_id
-	accountsByCode   map[string]*domain.Account // by "tenant|code"
+	accounts         map[string]*domain.Account          // by account_id
+	accountsByCode   map[string]*domain.Account          // by "tenant|code"
+	accountVersions  map[string][]*domain.AccountVersion // by "tenant|code"
 	createAccountErr error
+	amendAccountErr  error
+	// commandIdempotency mirrors command_idempotency rows, by "tenant|key".
+	commandIdempotency map[string]commandIdempotencyEntry
 
 	currentMappings map[string]*domain.AccountMapping // by "tenant|mapping_key"
 	setMappingErr   error
@@ -76,18 +82,34 @@ type stubStore struct {
 	markFailedErr     error
 }
 
+// commandIdempotencyEntry is one claimed Idempotency-Key: the command that
+// claimed it and the account it ran on, mirroring one command_idempotency row.
+type commandIdempotencyEntry struct {
+	command     string
+	accountCode string
+}
+
+// Command names recorded in the stub's idempotency map; same values the real
+// store writes to command_idempotency.command.
+const (
+	commandStubAmendAccount    = "AMEND_ACCOUNT_VERSION"
+	commandStubReparentAccount = "REPARENT_ACCOUNT"
+)
+
 func newStubStore() *stubStore {
 	return &stubStore{
-		journals:          map[string]*domain.JournalHeader{},
-		lines:             map[string][]domain.JournalLine{},
-		byCorrelation:     map[string]string{},
-		trialBalances:     map[string]*domain.TrialBalanceSnapshot{},
-		accounts:          map[string]*domain.Account{},
-		accountsByCode:    map[string]*domain.Account{},
-		currentMappings:   map[string]*domain.AccountMapping{},
-		postingExecutions: map[string]*domain.PostingExecution{},
-		bySourceEvent:     map[string]string{},
-		claimedAt:         map[string]time.Time{},
+		journals:           map[string]*domain.JournalHeader{},
+		lines:              map[string][]domain.JournalLine{},
+		byCorrelation:      map[string]string{},
+		trialBalances:      map[string]*domain.TrialBalanceSnapshot{},
+		accounts:           map[string]*domain.Account{},
+		accountsByCode:     map[string]*domain.Account{},
+		accountVersions:    map[string][]*domain.AccountVersion{},
+		currentMappings:    map[string]*domain.AccountMapping{},
+		postingExecutions:  map[string]*domain.PostingExecution{},
+		bySourceEvent:      map[string]string{},
+		claimedAt:          map[string]time.Time{},
+		commandIdempotency: map[string]commandIdempotencyEntry{},
 	}
 }
 
@@ -234,7 +256,7 @@ func (s *stubStore) CompileTrialBalance(_ context.Context, tenantID, legalEntity
 		}
 	}
 	for code, bal := range balances {
-		snap.Lines = append(snap.Lines, domain.TrialBalanceLine{AccountCode: code, NetBalance: bal})
+		snap.Lines = append(snap.Lines, domain.TrialBalanceLine{AccountCode: code, NetBalance: fmt.Sprintf("%.2f", bal)})
 	}
 	s.trialBalances[snap.TrialBalanceSnapshotID] = snap
 	return snap, nil
@@ -264,9 +286,97 @@ func (s *stubStore) CreateAccount(_ context.Context, a *domain.Account) error {
 	if _, exists := s.accountsByCode[key]; exists {
 		return domain.ErrAccountAlreadyExists
 	}
+	a.Version = 1
 	s.accounts[a.AccountID] = a
 	s.accountsByCode[key] = a
+	s.accountVersions[key] = []*domain.AccountVersion{{
+		AccountVersionID: "v1-" + key, AccountID: a.AccountID, TenantID: a.TenantID,
+		AccountCode: a.AccountCode, Version: 1, AccountName: a.AccountName,
+		AccountType: a.AccountType, ParentAccountID: a.ParentAccountID,
+		IsControlAccount: a.IsControlAccount, DirectPostingRestricted: a.DirectPostingRestricted,
+		Status: a.Status, EffectiveFrom: a.CreatedAt, ChangeKind: "CREATED",
+		CreatedAt: a.CreatedAt, CreatedByPrincipalID: a.CreatedByPrincipalID,
+	}}
 	return nil
+}
+
+// replayCommand mirrors the real store's command_idempotency lookup: a key
+// already claimed by the same command and account replays the account as it
+// now stands; a key claimed by a different command or account is the
+// idempotency conflict; an unclaimed key returns ok=false to execute.
+func (s *stubStore) replayCommand(tenantID, idempotencyKey, command, accountCode string) (bool, *domain.Account, bool, error) {
+	entry, claimed := s.commandIdempotency[tenantID+"|"+idempotencyKey]
+	if !claimed {
+		return false, nil, false, nil
+	}
+	if entry.command != command || entry.accountCode != accountCode {
+		return false, nil, false, fmt.Errorf("%w: key was claimed by %s on %s",
+			domain.ErrIdempotencyKeyConflict, entry.command, entry.accountCode)
+	}
+	a, ok := s.accountsByCode[tenantID+"|"+accountCode]
+	if !ok {
+		return false, nil, false, domain.ErrAccountNotFound
+	}
+	return true, a, true, nil
+}
+
+// claimCommand records a key once its command has succeeded, mirroring the
+// real store's insert after the write in the same transaction.
+func (s *stubStore) claimCommand(tenantID, idempotencyKey, command, accountCode string) {
+	s.commandIdempotency[tenantID+"|"+idempotencyKey] = commandIdempotencyEntry{
+		command: command, accountCode: accountCode,
+	}
+}
+
+// AmendAccountVersion mirrors the real store's core invariants: expected
+// version is enforced, a new version is appended, and the head row advances.
+// An Idempotency-Key already claimed by this command and account replays the
+// account instead of appending a second version.
+func (s *stubStore) AmendAccountVersion(_ context.Context, tenantID, accountCode, idempotencyKey string, expectedVersion int64, effectiveFrom time.Time, a *domain.Account, reason string, evidence []string, principalID string) (*domain.Account, bool, error) {
+	if s.amendAccountErr != nil {
+		return nil, false, s.amendAccountErr
+	}
+	if replay, acct, ok, err := s.replayCommand(tenantID, idempotencyKey, commandStubAmendAccount, accountCode); err != nil {
+		return nil, false, err
+	} else if ok {
+		return acct, replay, nil
+	}
+	key := tenantID + "|" + accountCode
+	cur, ok := s.accountsByCode[key]
+	if !ok {
+		return nil, false, domain.ErrAccountNotFound
+	}
+	if expectedVersion > 0 && cur.Version != expectedVersion {
+		return nil, false, domain.ErrAccountVersionConflict
+	}
+	versions := s.accountVersions[key]
+	if len(versions) > 0 {
+		prev := versions[len(versions)-1]
+		if effectiveFrom.Before(prev.EffectiveFrom) {
+			return nil, false, domain.ErrAccountEffectiveDate
+		}
+		prev.EffectiveTo = &effectiveFrom
+	}
+	updated := *cur
+	updated.AccountName = a.AccountName
+	updated.AccountType = a.AccountType
+	updated.ParentAccountID = a.ParentAccountID
+	updated.IsControlAccount = a.IsControlAccount
+	updated.DirectPostingRestricted = a.DirectPostingRestricted
+	updated.Status = a.Status
+	updated.Version = cur.Version + 1
+	*cur = updated
+	s.accountVersions[key] = append(versions, &domain.AccountVersion{
+		AccountVersionID: "v" + fmt.Sprint(updated.Version) + "-" + key,
+		AccountID:        updated.AccountID, TenantID: updated.TenantID, AccountCode: updated.AccountCode,
+		Version: updated.Version, AccountName: updated.AccountName, AccountType: updated.AccountType,
+		ParentAccountID: updated.ParentAccountID, IsControlAccount: updated.IsControlAccount,
+		DirectPostingRestricted: updated.DirectPostingRestricted, Status: updated.Status,
+		EffectiveFrom: effectiveFrom, ChangeKind: "AMENDED", ChangeReason: reason,
+		EvidenceRefs: evidence, CreatedAt: time.Now().UTC(), CreatedByPrincipalID: principalID,
+	})
+	s.claimCommand(tenantID, idempotencyKey, commandStubAmendAccount, accountCode)
+	return cur, false, nil
 }
 
 func (s *stubStore) GetAccountByCode(_ context.Context, tenantID, accountCode string) (*domain.Account, error) {
@@ -287,13 +397,147 @@ func (s *stubStore) ListAccounts(_ context.Context, tenantID string) ([]domain.A
 	return out, nil
 }
 
-func (s *stubStore) DeactivateAccount(_ context.Context, tenantID, accountCode string) error {
-	a, ok := s.accountsByCode[tenantID+"|"+accountCode]
-	if !ok {
-		return domain.ErrAccountNotFound
+// GetAccountAsOf mirrors the real store's half-open interval lookup
+// [effective_from, effective_to) over the stub's own version history.
+func (s *stubStore) GetAccountAsOf(_ context.Context, tenantID, accountCode string, asOf time.Time) (*domain.AccountVersion, error) {
+	var found *domain.AccountVersion
+	for _, v := range s.accountVersions[tenantID+"|"+accountCode] {
+		if v.EffectiveFrom.After(asOf) {
+			continue
+		}
+		if v.EffectiveTo != nil && !asOf.Before(*v.EffectiveTo) {
+			continue
+		}
+		if found == nil || v.Version > found.Version {
+			found = v
+		}
 	}
-	a.Status = "INACTIVE"
-	return nil
+	if found == nil {
+		return nil, domain.ErrAccountNotFound
+	}
+	return found, nil
+}
+
+// ReparentAccount mirrors the real store's guards: cycles are refused by
+// walking the ancestors of the prospective parent, and a backdated effective
+// date is refused before any version is written. An Idempotency-Key already
+// claimed by this command and account replays the account instead of
+// appending a second version.
+func (s *stubStore) ReparentAccount(_ context.Context, tenantID, accountCode, idempotencyKey string, parentAccountID *string, expectedVersion int64, effectiveFrom time.Time, reason string, evidence []string, principalID string) (*domain.Account, bool, error) {
+	if replay, acct, ok, err := s.replayCommand(tenantID, idempotencyKey, commandStubReparentAccount, accountCode); err != nil {
+		return nil, false, err
+	} else if ok {
+		return acct, replay, nil
+	}
+	key := tenantID + "|" + accountCode
+	a, ok := s.accountsByCode[key]
+	if !ok {
+		return nil, false, domain.ErrAccountNotFound
+	}
+	if expectedVersion > 0 && a.Version != expectedVersion {
+		return nil, false, domain.ErrAccountVersionConflict
+	}
+	if parentAccountID != nil {
+		if *parentAccountID == a.AccountID {
+			return nil, false, domain.ErrAccountHierarchyCycle
+		}
+		ancestor, ok := s.accounts[*parentAccountID]
+		if !ok {
+			return nil, false, domain.ErrParentAccountNotFound
+		}
+		seen := map[string]bool{}
+		for ancestor != nil {
+			if ancestor.AccountID == a.AccountID {
+				return nil, false, domain.ErrAccountHierarchyCycle
+			}
+			if seen[ancestor.AccountID] {
+				break
+			}
+			seen[ancestor.AccountID] = true
+			if ancestor.ParentAccountID == nil {
+				break
+			}
+			ancestor = s.accounts[*ancestor.ParentAccountID]
+		}
+	}
+	sameParent := (a.ParentAccountID == nil && parentAccountID == nil) ||
+		(a.ParentAccountID != nil && parentAccountID != nil && *a.ParentAccountID == *parentAccountID)
+	if sameParent {
+		return a, false, nil
+	}
+	effective := effectiveFrom
+	if effective.IsZero() {
+		effective = time.Now().UTC()
+	}
+	if effective.Before(time.Now().UTC().Truncate(24 * time.Hour)) {
+		return nil, false, domain.ErrAccountHierarchyBackdated
+	}
+	versions := s.accountVersions[key]
+	if len(versions) > 0 {
+		prev := versions[len(versions)-1]
+		if effective.Before(prev.EffectiveFrom) {
+			return nil, false, domain.ErrAccountEffectiveDate
+		}
+		prev.EffectiveTo = &effective
+	}
+	a.ParentAccountID = parentAccountID
+	a.Version++
+	s.accountVersions[key] = append(versions, &domain.AccountVersion{
+		AccountVersionID: "v" + fmt.Sprint(a.Version) + "-" + key,
+		AccountID:        a.AccountID, TenantID: a.TenantID, AccountCode: a.AccountCode,
+		Version: a.Version, AccountName: a.AccountName, AccountType: a.AccountType,
+		ParentAccountID: a.ParentAccountID, IsControlAccount: a.IsControlAccount,
+		DirectPostingRestricted: a.DirectPostingRestricted, Status: a.Status,
+		EffectiveFrom: effective, ChangeKind: "REPARENTED", ChangeReason: reason,
+		EvidenceRefs: evidence, CreatedAt: time.Now().UTC(), CreatedByPrincipalID: principalID,
+	})
+	s.claimCommand(tenantID, idempotencyKey, commandStubReparentAccount, accountCode)
+	return a, false, nil
+}
+
+func (s *stubStore) ActivateAccount(_ context.Context, tenantID, accountCode string, expectedVersion int64, effectiveFrom time.Time, reason string, evidence []string, principalID string) (*domain.Account, error) {
+	return s.changeAccountStatus(tenantID, accountCode, "ACTIVE", "ACTIVATED", expectedVersion, effectiveFrom, reason, evidence, principalID)
+}
+
+func (s *stubStore) DeactivateAccount(_ context.Context, tenantID, accountCode string, expectedVersion int64, effectiveFrom time.Time, reason string, evidence []string, principalID string) (*domain.Account, error) {
+	return s.changeAccountStatus(tenantID, accountCode, "INACTIVE", "DEACTIVATED", expectedVersion, effectiveFrom, reason, evidence, principalID)
+}
+
+// changeAccountStatus mirrors the real store's transition invariants: idempotent
+// when already in the target status, version-guarded, and one appended version
+// per real transition.
+func (s *stubStore) changeAccountStatus(tenantID, accountCode, newStatus, changeKind string, expectedVersion int64, effectiveFrom time.Time, reason string, evidence []string, principalID string) (*domain.Account, error) {
+	key := tenantID + "|" + accountCode
+	a, ok := s.accountsByCode[key]
+	if !ok {
+		return nil, domain.ErrAccountNotFound
+	}
+	if expectedVersion > 0 && a.Version != expectedVersion {
+		return nil, domain.ErrAccountVersionConflict
+	}
+	if a.Status == newStatus {
+		return a, nil
+	}
+	versions := s.accountVersions[key]
+	if len(versions) > 0 {
+		prev := versions[len(versions)-1]
+		if effectiveFrom.Before(prev.EffectiveFrom) {
+			return nil, domain.ErrAccountEffectiveDate
+		}
+		prev.EffectiveTo = &effectiveFrom
+	}
+	a.Status = newStatus
+	a.Version++
+	s.accountVersions[key] = append(versions, &domain.AccountVersion{
+		AccountVersionID: "v" + fmt.Sprint(a.Version) + "-" + key,
+		AccountID:        a.AccountID, TenantID: a.TenantID, AccountCode: a.AccountCode,
+		Version: a.Version, AccountName: a.AccountName, AccountType: a.AccountType,
+		ParentAccountID: a.ParentAccountID, IsControlAccount: a.IsControlAccount,
+		DirectPostingRestricted: a.DirectPostingRestricted, Status: a.Status,
+		EffectiveFrom: effectiveFrom, ChangeKind: changeKind, ChangeReason: reason,
+		EvidenceRefs: evidence, CreatedAt: time.Now().UTC(), CreatedByPrincipalID: principalID,
+	})
+	return a, nil
 }
 
 // SetAccountMapping mirrors the real store's own validation rule (the
@@ -548,9 +792,24 @@ func (p *stubPublisher) PublishJournalReversed(_ context.Context, _ domain.Journ
 
 type stubAuthZ struct {
 	err error
+
+	// denyAction narrows err to a single action code, so a test can prove a
+	// command needs its OWN grant rather than any authorization at all.
+	denyAction string
+	// actions records every action checked, in order.
+	actions []string
 }
 
-func (a *stubAuthZ) CheckAllowed(_ context.Context, _, _, _ string) error { return a.err }
+func (a *stubAuthZ) CheckAllowed(_ context.Context, _, _, action string) error {
+	a.actions = append(a.actions, action)
+	if a.denyAction != "" && action == a.denyAction {
+		return a.err
+	}
+	if a.denyAction != "" {
+		return nil
+	}
+	return a.err
+}
 
 type stubClose struct {
 	err error
@@ -607,6 +866,13 @@ func doRequestAs(r chi.Router, method, path string, body any, principalID, tenan
 // the body — book_id and evidence_refs.
 func doRequestWithHeaders(r chi.Router, method, path string, body any, principalID string, headers map[string]string) *httptest.ResponseRecorder {
 	return sendRequest(r, method, path, body, principalID, testTenantID, headers)
+}
+
+// doIdempotentRequest sends an AmendAccountVersion or ReparentAccount request
+// with the mandatory Idempotency-Key header those two commands require.
+func doIdempotentRequest(r chi.Router, method, path string, body any, principalID, idempotencyKey string) *httptest.ResponseRecorder {
+	return doRequestWithHeaders(r, method, path, body, principalID,
+		map[string]string{"Idempotency-Key": idempotencyKey})
 }
 
 func sendRequest(r chi.Router, method, path string, body any, principalID, tenantID string, headers map[string]string) *httptest.ResponseRecorder {
@@ -1169,11 +1435,11 @@ func TestCompileTrialBalance_OnlyFinalizedJournalsContribute(t *testing.T) {
 	if snap.LedgerWatermark != 1 {
 		t.Errorf("expected watermark reflecting exactly 1 included journal, got %d", snap.LedgerWatermark)
 	}
-	byAccount := map[string]float64{}
+	byAccount := map[string]string{}
 	for _, l := range snap.Lines {
 		byAccount[l.AccountCode] = l.NetBalance
 	}
-	if byAccount["1000"] != 100 || byAccount["4000"] != -100 {
+	if byAccount["1000"] != "100.00" || byAccount["4000"] != "-100.00" {
 		t.Errorf("expected only the FINALIZED journal's lines counted, got %+v", byAccount)
 	}
 }
@@ -1257,6 +1523,563 @@ func TestCreateAccount_DuplicateCode_Returns409(t *testing.T) {
 	rec := doRequest(r, http.MethodPost, "/v1/chart-of-accounts/", req, "principal-1")
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("expected 409, got %d", rec.Code)
+	}
+}
+
+func TestAmendAccountVersion_UpdatesHeadAndAppendsVersion(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1000-Cash", AccountName: "Cash", AccountType: domain.AccountTypeAsset})
+
+	rec := doIdempotentRequest(r, http.MethodPost, "/v1/chart-of-accounts/1000-Cash/amend", map[string]any{
+		"account_name": "Cash on hand",
+		"reason":       "renamed by finance",
+	}, "principal-1", "amend-1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var updated domain.Account
+	if err := json.Unmarshal(rec.Body.Bytes(), &updated); err != nil {
+		t.Fatalf("amended account is not valid JSON: %v", err)
+	}
+	if updated.AccountName != "Cash on hand" || updated.Version != 2 {
+		t.Fatalf("expected name %q at version 2, got %q at version %d",
+			"Cash on hand", updated.AccountName, updated.Version)
+	}
+
+	rec = doRequest(r, http.MethodGet, "/v1/chart-of-accounts/1000-Cash", nil, "principal-1")
+	var fetched domain.Account
+	if err := json.Unmarshal(rec.Body.Bytes(), &fetched); err != nil {
+		t.Fatalf("fetched account is not valid JSON: %v", err)
+	}
+	if fetched.Version != 2 || fetched.AccountName != "Cash on hand" {
+		t.Fatalf("GetAccount did not read the amended head: %+v", fetched)
+	}
+	if got := len(s.accountVersions["t1|1000-Cash"]); got != 2 {
+		t.Fatalf("expected two account versions after amendment, got %d", got)
+	}
+}
+
+func TestAmendAccountVersion_ExpectedVersionConflict_Returns409(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1000-Cash", AccountName: "Cash", AccountType: domain.AccountTypeAsset})
+
+	rec := doIdempotentRequest(r, http.MethodPost, "/v1/chart-of-accounts/1000-Cash/amend", map[string]any{
+		"account_name":     "Stale rename",
+		"expected_version": 99,
+	}, "principal-1", "amend-stale")
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 on stale expected_version, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if got := len(s.accountVersions["t1|1000-Cash"]); got != 1 {
+		t.Fatalf("a refused amendment must not append a version; got %d versions", got)
+	}
+}
+
+func TestAmendAccountVersion_UnknownAccount_Returns404(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	rec := doIdempotentRequest(r, http.MethodPost, "/v1/chart-of-accounts/no-such/amend", map[string]any{
+		"account_name": "Nope",
+	}, "principal-1", "amend-missing")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAmendAccountVersion_ExplicitNullParentClearsParent(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1000", AccountName: "Assets", AccountType: domain.AccountTypeAsset})
+	parent := s.accountsByCode["t1|1000"].AccountID
+	createAccount(t, r, domain.CreateAccountRequest{
+		AccountCode: "1010", AccountName: "Cash", AccountType: domain.AccountTypeAsset, ParentAccountID: &parent,
+	})
+
+	rec := doIdempotentRequest(r, http.MethodPost, "/v1/chart-of-accounts/1010/amend", map[string]any{
+		"parent_account_id": nil,
+	}, "principal-1", "amend-clear-parent")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var updated domain.Account
+	if err := json.Unmarshal(rec.Body.Bytes(), &updated); err != nil {
+		t.Fatalf("amended account is not valid JSON: %v", err)
+	}
+	if updated.ParentAccountID != nil {
+		t.Fatalf("explicit null parent_account_id should clear the parent, got %v", *updated.ParentAccountID)
+	}
+}
+
+func TestActivateAccount_ReactivatesAndAppendsVersion(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1000-Cash", AccountName: "Cash", AccountType: domain.AccountTypeAsset})
+	doRequest(r, http.MethodPost, "/v1/chart-of-accounts/1000-Cash/deactivate", nil, "principal-1")
+
+	rec := doRequest(r, http.MethodPost, "/v1/chart-of-accounts/1000-Cash/activate", map[string]any{
+		"reason": "cash desk reopened",
+	}, "principal-1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var activated domain.Account
+	if err := json.Unmarshal(rec.Body.Bytes(), &activated); err != nil {
+		t.Fatalf("activated account is not valid JSON: %v", err)
+	}
+	if activated.Status != "ACTIVE" || activated.Version != 3 {
+		t.Fatalf("expected ACTIVE at version 3, got %s at version %d", activated.Status, activated.Version)
+	}
+
+	// A reactivated account must be postable again: the original Deactivate
+	// path blocked it, and an Activate that does not inverse that exactly is
+	// worse than no Activate at all.
+	rec = doRequest(r, http.MethodPost, "/v1/journals/", validCreateReq(), "principal-1")
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected posting to succeed after reactivation, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestActivateAccount_AlreadyActive_IsIdempotentNoNewVersion(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1000-Cash", AccountName: "Cash", AccountType: domain.AccountTypeAsset})
+
+	rec := doRequest(r, http.MethodPost, "/v1/chart-of-accounts/1000-Cash/activate", nil, "principal-1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if got := len(s.accountVersions["t1|1000-Cash"]); got != 1 {
+		t.Fatalf("activating an already-active account must not append a version, got %d", got)
+	}
+}
+
+func TestActivateAccount_ExpectedVersionConflict_Returns409(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1000-Cash", AccountName: "Cash", AccountType: domain.AccountTypeAsset})
+	doRequest(r, http.MethodPost, "/v1/chart-of-accounts/1000-Cash/deactivate", nil, "principal-1")
+
+	rec := doRequest(r, http.MethodPost, "/v1/chart-of-accounts/1000-Cash/activate", map[string]any{
+		"expected_version": 1,
+	}, "principal-1")
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 on stale expected_version, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestReparentAccount_MovesAccountAndAppendsVersion(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1000", AccountName: "Assets", AccountType: domain.AccountTypeAsset})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1010", AccountName: "Cash", AccountType: domain.AccountTypeAsset})
+
+	assetsID := s.accountsByCode["t1|1000"].AccountID
+	rec := doIdempotentRequest(r, http.MethodPost, "/v1/chart-of-accounts/1010/reparent", map[string]any{
+		"parent_account_id": assetsID,
+		"reason":            "moving cash under assets",
+	}, "principal-1", "reparent-move")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var moved domain.Account
+	if err := json.Unmarshal(rec.Body.Bytes(), &moved); err != nil {
+		t.Fatalf("reparented account is not valid JSON: %v", err)
+	}
+	if moved.ParentAccountID == nil || *moved.ParentAccountID != assetsID {
+		t.Fatalf("expected parent %s, got %v", assetsID, moved.ParentAccountID)
+	}
+	if moved.Version != 2 {
+		t.Fatalf("expected version 2 after reparent, got %d", moved.Version)
+	}
+}
+
+func TestReparentAccount_CycleRefused_Returns422(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1000", AccountName: "Assets", AccountType: domain.AccountTypeAsset})
+	assetsID := s.accountsByCode["t1|1000"].AccountID
+	createAccount(t, r, domain.CreateAccountRequest{
+		AccountCode: "1010", AccountName: "Cash", AccountType: domain.AccountTypeAsset, ParentAccountID: &assetsID,
+	})
+
+	// Assets cannot become a child of its own child.
+	rec := doIdempotentRequest(r, http.MethodPost, "/v1/chart-of-accounts/1000/reparent", map[string]any{
+		"parent_account_id": s.accountsByCode["t1|1010"].AccountID,
+	}, "principal-1", "reparent-cycle")
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 for a hierarchy cycle, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if s.accountsByCode["t1|1000"].Version != 1 {
+		t.Fatal("a refused cycle must not append a version")
+	}
+}
+
+func TestReparentAccount_SelfParentRefused_Returns422(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1000", AccountName: "Assets", AccountType: domain.AccountTypeAsset})
+
+	rec := doIdempotentRequest(r, http.MethodPost, "/v1/chart-of-accounts/1000/reparent", map[string]any{
+		"parent_account_id": s.accountsByCode["t1|1000"].AccountID,
+	}, "principal-1", "reparent-self")
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 for self-parenting, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestReparentAccount_BackdatedEffectiveDate_Returns422(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1000", AccountName: "Assets", AccountType: domain.AccountTypeAsset})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1010", AccountName: "Cash", AccountType: domain.AccountTypeAsset})
+
+	rec := doIdempotentRequest(r, http.MethodPost, "/v1/chart-of-accounts/1010/reparent", map[string]any{
+		"parent_account_id": s.accountsByCode["t1|1000"].AccountID,
+		"effective_from":    "2020-01-01T00:00:00Z",
+	}, "principal-1", "reparent-backdated")
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 for a backdated hierarchy change, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if s.accountsByCode["t1|1010"].Version != 1 {
+		t.Fatal("a refused backdated change must not append a version")
+	}
+}
+
+func TestReparentAccount_MissingParentField_Returns400(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1010", AccountName: "Cash", AccountType: domain.AccountTypeAsset})
+
+	rec := doIdempotentRequest(r, http.MethodPost, "/v1/chart-of-accounts/1010/reparent", map[string]any{
+		"reason": "no parent named",
+	}, "principal-1", "reparent-missing-parent")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 when parent_account_id is absent, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// ── ACC-01 Idempotency-Key (SPEC_DEVIATIONS A6/B12) ──────────────────────────
+
+func TestAmendAccountVersion_MissingIdempotencyKey_Returns400(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1000", AccountName: "Cash", AccountType: domain.AccountTypeAsset})
+
+	rec := doRequest(r, http.MethodPost, "/v1/chart-of-accounts/1000/amend", map[string]any{
+		"account_name": "Cash on hand",
+	}, "principal-1")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 without an Idempotency-Key, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if got := len(s.accountVersions["t1|1000"]); got != 1 {
+		t.Fatalf("a request without a key must not amend the account; got %d versions", got)
+	}
+}
+
+func TestReparentAccount_MissingIdempotencyKey_Returns400(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1000", AccountName: "Assets", AccountType: domain.AccountTypeAsset})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1010", AccountName: "Cash", AccountType: domain.AccountTypeAsset})
+
+	rec := doRequest(r, http.MethodPost, "/v1/chart-of-accounts/1010/reparent", map[string]any{
+		"parent_account_id": s.accountsByCode["t1|1000"].AccountID,
+	}, "principal-1")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 without an Idempotency-Key, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if s.accountsByCode["t1|1010"].Version != 1 {
+		t.Fatal("a request without a key must not reparent the account")
+	}
+}
+
+// TestAmendAccountVersion_IdempotencyKeyReplayDoesNotAppendVersion is the A6
+// regression test: a retry with the same Idempotency-Key returns the recorded
+// result instead of appending a second identical version.
+func TestAmendAccountVersion_IdempotencyKeyReplayDoesNotAppendVersion(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1000", AccountName: "Cash", AccountType: domain.AccountTypeAsset})
+
+	body := map[string]any{"account_name": "Cash on hand", "reason": "renamed by finance"}
+	rec := doIdempotentRequest(r, http.MethodPost, "/v1/chart-of-accounts/1000/amend", body, "principal-1", "amend-retry-key")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("first amend: expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("Idempotent-Replay") != "" {
+		t.Fatalf("first call must not be a replay, got Idempotent-Replay: %s", rec.Header().Get("Idempotent-Replay"))
+	}
+
+	rec = doIdempotentRequest(r, http.MethodPost, "/v1/chart-of-accounts/1000/amend", body, "principal-1", "amend-retry-key")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("replayed amend: expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("Idempotent-Replay") != "true" {
+		t.Fatalf("a retried key must answer Idempotent-Replay: true, got %q", rec.Header().Get("Idempotent-Replay"))
+	}
+	var replayed domain.Account
+	if err := json.Unmarshal(rec.Body.Bytes(), &replayed); err != nil {
+		t.Fatalf("replayed account is not valid JSON: %v", err)
+	}
+	if replayed.Version != 2 || replayed.AccountName != "Cash on hand" {
+		t.Fatalf("expected the recorded result at version 2, got %q at version %d", replayed.AccountName, replayed.Version)
+	}
+	if got := len(s.accountVersions["t1|1000"]); got != 2 {
+		t.Fatalf("a replayed key must not append a second version; got %d versions", got)
+	}
+}
+
+func TestReparentAccount_IdempotencyKeyReplayDoesNotAppendVersion(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1000", AccountName: "Assets", AccountType: domain.AccountTypeAsset})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1010", AccountName: "Cash", AccountType: domain.AccountTypeAsset})
+
+	body := map[string]any{"parent_account_id": s.accountsByCode["t1|1000"].AccountID, "reason": "move"}
+	rec := doIdempotentRequest(r, http.MethodPost, "/v1/chart-of-accounts/1010/reparent", body, "principal-1", "reparent-retry-key")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("first reparent: expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	rec = doIdempotentRequest(r, http.MethodPost, "/v1/chart-of-accounts/1010/reparent", body, "principal-1", "reparent-retry-key")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("replayed reparent: expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("Idempotent-Replay") != "true" {
+		t.Fatalf("a retried key must answer Idempotent-Replay: true, got %q", rec.Header().Get("Idempotent-Replay"))
+	}
+	if got := len(s.accountVersions["t1|1010"]); got != 2 {
+		t.Fatalf("a replayed key must not append a second version; got %d versions", got)
+	}
+}
+
+func TestAmendAccountVersion_IdempotencyKeyReusedForOtherCommand_Returns409(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1000", AccountName: "Assets", AccountType: domain.AccountTypeAsset})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1010", AccountName: "Cash", AccountType: domain.AccountTypeAsset})
+
+	rec := doIdempotentRequest(r, http.MethodPost, "/v1/chart-of-accounts/1000/amend", map[string]any{
+		"account_name": "Assets (renamed)",
+	}, "principal-1", "one-key-one-command")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("amend: expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// The same key on a different command must conflict, not execute.
+	rec = doIdempotentRequest(r, http.MethodPost, "/v1/chart-of-accounts/1010/reparent", map[string]any{
+		"parent_account_id": s.accountsByCode["t1|1000"].AccountID,
+	}, "principal-1", "one-key-one-command")
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 when a key is reused for another command, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if s.accountsByCode["t1|1010"].Version != 1 {
+		t.Fatal("a conflicting key must not execute the other command")
+	}
+}
+
+func TestResolvePostingEligibility_UnregisteredAccount_StaysEligible(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	rec := doRequest(r, http.MethodGet, "/v1/chart-of-accounts/no-such/posting-eligibility", nil, "principal-1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var result domain.PostingEligibility
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatalf("eligibility is not valid JSON: %v", err)
+	}
+	if result.Registered || !result.Eligible || result.Status != "UNREGISTERED" {
+		t.Fatalf("unregistered codes must stay postable (the bootstrap gap), got %+v", result)
+	}
+}
+
+func TestResolvePostingEligibility_InactiveAccount_NotEligible(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1000", AccountName: "Cash", AccountType: domain.AccountTypeAsset})
+	doRequest(r, http.MethodPost, "/v1/chart-of-accounts/1000/deactivate", nil, "principal-1")
+
+	rec := doRequest(r, http.MethodGet, "/v1/chart-of-accounts/1000/posting-eligibility", nil, "principal-1")
+	var result domain.PostingEligibility
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatalf("eligibility is not valid JSON: %v", err)
+	}
+	if result.Eligible || !result.Registered || result.Status != "INACTIVE" {
+		t.Fatalf("inactive account must not be eligible, got %+v", result)
+	}
+}
+
+func TestResolvePostingEligibility_ControlRestricted_RequiresOverride(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	createAccount(t, r, domain.CreateAccountRequest{
+		AccountCode: "2100", AccountName: "AP Control", AccountType: domain.AccountTypeLiability,
+		IsControlAccount: true, DirectPostingRestricted: true,
+	})
+
+	rec := doRequest(r, http.MethodGet, "/v1/chart-of-accounts/2100/posting-eligibility", nil, "principal-1")
+	var result domain.PostingEligibility
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatalf("eligibility is not valid JSON: %v", err)
+	}
+	if result.Eligible || !result.RequiresOverride || result.OverrideApplied {
+		t.Fatalf("restricted control account must report override required, got %+v", result)
+	}
+}
+
+func TestResolvePostingEligibility_ControlRestricted_OverrideGranted(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	createAccount(t, r, domain.CreateAccountRequest{
+		AccountCode: "2100", AccountName: "AP Control", AccountType: domain.AccountTypeLiability,
+		IsControlAccount: true, DirectPostingRestricted: true,
+	})
+
+	rec := doRequest(r, http.MethodPost, "/v1/chart-of-accounts/2100/posting-eligibility", map[string]any{
+		"override_control_account_restriction": true,
+		"legal_entity_id":                      "e1",
+	}, "principal-1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var result domain.PostingEligibility
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatalf("eligibility is not valid JSON: %v", err)
+	}
+	if !result.Eligible || !result.RequiresOverride || !result.OverrideApplied {
+		t.Fatalf("authorized override should make the account eligible, got %+v", result)
+	}
+}
+
+func TestResolvePostingEligibility_OverrideDenied_Returns403(t *testing.T) {
+	s := newStubStore()
+	authz := &stubAuthZ{err: domain.ErrAuthorizationDenied, denyAction: "COA_CONTROL_ACCOUNT_POSTING_OVERRIDE"}
+	r := newRouter(s, &stubPublisher{}, authz)
+	createAccount(t, r, domain.CreateAccountRequest{
+		AccountCode: "2100", AccountName: "AP Control", AccountType: domain.AccountTypeLiability,
+		IsControlAccount: true, DirectPostingRestricted: true,
+	})
+
+	rec := doRequest(r, http.MethodGet,
+		"/v1/chart-of-accounts/2100/posting-eligibility?override_control_account_restriction=true&legal_entity_id=e1",
+		nil, "principal-1")
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 when only the override action is denied, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestResolvePostingEligibility_StaticRouteReadsAccountCodeFromBody(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1000", AccountName: "Cash", AccountType: domain.AccountTypeAsset})
+
+	rec := doRequest(r, http.MethodPost, "/v1/chart-of-accounts/resolve-posting-eligibility", map[string]any{
+		"account_code": "1000",
+	}, "principal-1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var result domain.PostingEligibility
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatalf("eligibility is not valid JSON: %v", err)
+	}
+	if !result.Registered || !result.Eligible || result.Version != 1 {
+		t.Fatalf("expected the registered account to be eligible at version 1, got %+v", result)
+	}
+}
+
+func TestGetAccountAsOf_ReturnsVersionInForceAtInstant(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1000", AccountName: "Cash", AccountType: domain.AccountTypeAsset})
+
+	created := s.accountVersions["t1|1000"][0].EffectiveFrom
+	amendAt := created.Add(time.Hour).Truncate(time.Second)
+	rec := doIdempotentRequest(r, http.MethodPost, "/v1/chart-of-accounts/1000/amend", map[string]any{
+		"account_name":   "Cash on hand",
+		"effective_from": amendAt.Format(time.RFC3339),
+	}, "principal-1", "amend-as-of")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("amend: expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Between creation and the amendment, version 1 was in force — with its
+	// interval closed exactly at the amendment.
+	rec = doRequest(r, http.MethodGet,
+		"/v1/chart-of-accounts/1000/as-of?as_of="+url.QueryEscape(created.Add(30*time.Minute).Format(time.RFC3339)),
+		nil, "principal-1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var v1 domain.AccountVersion
+	if err := json.Unmarshal(rec.Body.Bytes(), &v1); err != nil {
+		t.Fatalf("as-of result is not valid JSON: %v", err)
+	}
+	if v1.Version != 1 || v1.AccountName != "Cash" {
+		t.Fatalf("expected version 1 named %q, got version %d named %q", "Cash", v1.Version, v1.AccountName)
+	}
+	if v1.EffectiveTo == nil || !v1.EffectiveTo.Equal(amendAt) {
+		t.Fatalf("version 1 interval must close at the amendment, got %v", v1.EffectiveTo)
+	}
+
+	// At the amendment instant the interval is half-open, so version 2 applies.
+	rec = doRequest(r, http.MethodGet,
+		"/v1/chart-of-accounts/1000/as-of?as_of="+url.QueryEscape(amendAt.Format(time.RFC3339)),
+		nil, "principal-1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var v2 domain.AccountVersion
+	if err := json.Unmarshal(rec.Body.Bytes(), &v2); err != nil {
+		t.Fatalf("as-of result is not valid JSON: %v", err)
+	}
+	if v2.Version != 2 || v2.AccountName != "Cash on hand" || v2.EffectiveTo != nil {
+		t.Fatalf("expected the open version 2 named %q at the amendment instant, got %+v", "Cash on hand", v2)
+	}
+}
+
+func TestGetAccountAsOf_MissingAsOf_Returns400(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	rec := doRequest(r, http.MethodGet, "/v1/chart-of-accounts/1000/as-of", nil, "principal-1")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 when as_of is absent, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestGetAccountAsOf_BeforeAccountExisted_Returns404(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1000", AccountName: "Cash", AccountType: domain.AccountTypeAsset})
+
+	created := s.accountVersions["t1|1000"][0].EffectiveFrom
+	before := created.Add(-time.Hour).Format(time.RFC3339)
+	rec := doRequest(r, http.MethodGet,
+		"/v1/chart-of-accounts/1000/as-of?as_of="+url.QueryEscape(before), nil, "principal-1")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 before the account's first version, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestGetAccountAsOf_StaticRouteReadsAccountCodeFromBody(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1000", AccountName: "Cash", AccountType: domain.AccountTypeAsset})
+
+	created := s.accountVersions["t1|1000"][0].EffectiveFrom
+	rec := doRequest(r, http.MethodPost, "/v1/chart-of-accounts/as-of", map[string]any{
+		"account_code": "1000",
+		"as_of":        created.Add(time.Second).Format(time.RFC3339),
+	}, "principal-1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var result domain.AccountVersion
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatalf("as-of result is not valid JSON: %v", err)
+	}
+	if result.Version != 1 || result.AccountName != "Cash" {
+		t.Fatalf("expected the creation version, got %+v", result)
 	}
 }
 

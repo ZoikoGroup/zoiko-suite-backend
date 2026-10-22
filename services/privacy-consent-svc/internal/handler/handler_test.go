@@ -9,35 +9,24 @@ import (
 	"testing"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 
 	authzpkg "zoiko.io/privacy-consent-svc/internal/authz"
 	"zoiko.io/privacy-consent-svc/internal/domain"
-	"zoiko.io/privacy-consent-svc/internal/events"
 	"zoiko.io/privacy-consent-svc/internal/handler"
 	"zoiko.io/privacy-consent-svc/internal/middleware"
 )
 
-// ── stub publisher ───────────────────────────────────────────────────────────
-
-type stubPublisher struct {
-	calls      int
-	eventTypes []string
-}
-
-func (p *stubPublisher) Publish(_ context.Context, params events.PublishParams) error {
-	p.calls++
-	p.eventTypes = append(p.eventTypes, params.EventType)
-	return nil
-}
-
-var _ events.Publisher = (*stubPublisher)(nil)
-
 // ── stub authz ───────────────────────────────────────────────────────────────
 
-type stubAuthz struct{ deny bool }
+type stubAuthz struct {
+	deny  bool
+	calls int // how many checks were made — proves ordering ("authorize before lookup")
+}
 
 func (a *stubAuthz) CheckAllowed(_ context.Context, _, _, _ string) error {
+	a.calls++
 	if a.deny {
 		return authzpkg.ErrAuthorizationDenied
 	}
@@ -55,7 +44,7 @@ type stubPurposeRegistry struct {
 	err       error
 }
 
-func (p *stubPurposeRegistry) IsPublished(_ context.Context, _, purposeID string) (bool, error) {
+func (p *stubPurposeRegistry) IsPublished(_ context.Context, _, _, purposeID string) (bool, error) {
 	if p.err != nil {
 		return false, p.err
 	}
@@ -64,15 +53,24 @@ func (p *stubPurposeRegistry) IsPublished(_ context.Context, _, purposeID string
 
 // ── test harness ─────────────────────────────────────────────────────────────
 
-func newTestRouter(st *stubStore, pub *stubPublisher, az *stubAuthz, purposes *stubPurposeRegistry) chi.Router {
+func newTestRouter(st *stubStore, az *stubAuthz, purposes *stubPurposeRegistry) chi.Router {
 	logger := zap.NewNop()
-	h := handler.New(st, pub, az, purposes, logger)
+	h := handler.New(st, az, purposes, logger)
 	r := chi.NewRouter()
 	r.Use(middleware.TenantContext())
 	handler.RegisterRoutes(r, h)
 	return r
 }
 
+// doRequestWithHeaders defaults Idempotency-Key and X-Correlation-ID to a
+// fresh UUID on every call — §18.1 makes both mandatory on mutating APIs
+// (handler.checkIdempotency / requireCorrelationID), and a test that does
+// not care about replay behavior should not have to send them by hand to
+// avoid a 400 it isn't testing for. A caller that DOES care (the explicit
+// replay/conflict tests, and the two negative tests proving the header is
+// mandatory) overrides the default via headers — including setting it to
+// "" to simulate "the caller sent nothing," the same convention already
+// used for X-Principal-Id below.
 func doRequestWithHeaders(r http.Handler, method, path string, body interface{}, tenantID, principalID string, headers map[string]string) *httptest.ResponseRecorder {
 	var buf bytes.Buffer
 	if body != nil {
@@ -88,6 +86,8 @@ func doRequestWithHeaders(r http.Handler, method, path string, body interface{},
 	if tenantID != "" {
 		req.Header.Set("X-Tenant-Id", tenantID)
 	}
+	req.Header.Set("Idempotency-Key", uuid.NewString())
+	req.Header.Set("X-Correlation-ID", uuid.NewString())
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
@@ -137,15 +137,21 @@ func createPublishedNotice(t *testing.T, r http.Handler) *domain.NoticeVersion {
 
 func TestNoticeFullLifecycle(t *testing.T) {
 	st := newStubStore()
-	pub := &stubPublisher{}
-	r := newTestRouter(st, pub, &stubAuthz{}, grantingPurposeRegistry())
+	r := newTestRouter(st, &stubAuthz{}, grantingPurposeRegistry())
 
 	published := createPublishedNotice(t, r)
 	if published.VersionStatus != domain.NoticeStatusPublished {
 		t.Fatalf("expected PUBLISHED, got %s", published.VersionStatus)
 	}
-	if pub.eventTypes[len(pub.eventTypes)-1] != "privacy.notice.published" {
-		t.Fatalf("expected privacy.notice.published event, got %v", pub.eventTypes)
+	// The event is now enqueued by the store, in the same transaction as
+	// the PUBLISHED transition, rather than published by a separate
+	// fire-and-forget call the handler used to make — see
+	// stubStore.PublishNoticeVersion's own comment.
+	if len(st.outboxEvents) == 0 || st.outboxEvents[len(st.outboxEvents)-1] != "privacy.notice.published" {
+		t.Fatalf("expected privacy.notice.published event enqueued, got %v", st.outboxEvents)
+	}
+	if published.PublishedByPrincipalID == nil || *published.PublishedByPrincipalID != "principal-publisher" {
+		t.Fatalf("expected published_by_principal_id=principal-publisher, got %v", published.PublishedByPrincipalID)
 	}
 
 	base := "/privacy/notices/" + published.NoticeID + "/versions/" + published.NoticeVersionID
@@ -166,7 +172,7 @@ func TestNoticeFullLifecycle(t *testing.T) {
 // simultaneously PUBLISHED versions of the same notice.
 func TestPublishNotice_SupersedesPrior(t *testing.T) {
 	st := newStubStore()
-	r := newTestRouter(st, &stubPublisher{}, &stubAuthz{}, grantingPurposeRegistry())
+	r := newTestRouter(st, &stubAuthz{}, grantingPurposeRegistry())
 
 	first := createPublishedNotice(t, r)
 
@@ -203,7 +209,7 @@ func TestPublishNotice_SupersedesPrior(t *testing.T) {
 
 func TestPublishNotice_SkippingApproval_Rejected(t *testing.T) {
 	st := newStubStore()
-	r := newTestRouter(st, &stubPublisher{}, &stubAuthz{}, grantingPurposeRegistry())
+	r := newTestRouter(st, &stubAuthz{}, grantingPurposeRegistry())
 
 	w := doRequestWithPrincipal(r, http.MethodPost, "/privacy/notices", domain.CreateNoticeRequest{
 		Locale: "en-US", Audience: "CUSTOMER", ContentHash: "sha256:abc123",
@@ -221,7 +227,7 @@ func TestPublishNotice_SkippingApproval_Rejected(t *testing.T) {
 
 func TestRecordPresentation(t *testing.T) {
 	st := newStubStore()
-	r := newTestRouter(st, &stubPublisher{}, &stubAuthz{}, grantingPurposeRegistry())
+	r := newTestRouter(st, &stubAuthz{}, grantingPurposeRegistry())
 
 	notice := createPublishedNotice(t, r)
 	session := "session-xyz"
@@ -260,7 +266,7 @@ func TestRecordPresentation(t *testing.T) {
 // record presentation-receipt evidence for any notice.
 func TestRecordPresentation_MissingPrincipal_Returns401(t *testing.T) {
 	st := newStubStore()
-	r := newTestRouter(st, &stubPublisher{}, &stubAuthz{}, grantingPurposeRegistry())
+	r := newTestRouter(st, &stubAuthz{}, grantingPurposeRegistry())
 	notice := createPublishedNotice(t, r)
 
 	w := doRequestWithHeaders(r, http.MethodPost, "/privacy/notices/"+notice.NoticeID+"/versions/"+notice.NoticeVersionID+"/presentation-receipts",
@@ -273,10 +279,10 @@ func TestRecordPresentation_MissingPrincipal_Returns401(t *testing.T) {
 
 func TestRecordPresentation_AuthorizationDenied(t *testing.T) {
 	st := newStubStore()
-	setupRouter := newTestRouter(st, &stubPublisher{}, &stubAuthz{}, grantingPurposeRegistry())
+	setupRouter := newTestRouter(st, &stubAuthz{}, grantingPurposeRegistry())
 	notice := createPublishedNotice(t, setupRouter)
 
-	deniedRouter := newTestRouter(st, &stubPublisher{}, &stubAuthz{deny: true}, grantingPurposeRegistry())
+	deniedRouter := newTestRouter(st, &stubAuthz{deny: true}, grantingPurposeRegistry())
 	w := doRequest(deniedRouter, http.MethodPost, "/privacy/notices/"+notice.NoticeID+"/versions/"+notice.NoticeVersionID+"/presentation-receipts",
 		domain.RecordPresentationRequest{SubjectRef: "subject-1", Channel: "WEB_SIGNUP"}, testTenant)
 	if w.Code != http.StatusForbidden {
@@ -289,7 +295,7 @@ func TestRecordPresentation_AuthorizationDenied(t *testing.T) {
 func TestRecordConsent_UnregisteredPurpose_Rejected(t *testing.T) {
 	st := newStubStore()
 	// Empty published map — nothing is registered.
-	r := newTestRouter(st, &stubPublisher{}, &stubAuthz{}, &stubPurposeRegistry{published: map[string]bool{}})
+	r := newTestRouter(st, &stubAuthz{}, &stubPurposeRegistry{published: map[string]bool{}})
 
 	w := doRequest(r, http.MethodPost, "/privacy/consents", domain.RecordConsentRequest{
 		SubjectRef: "subject-1", PurposeID: "purpose-does-not-exist", Action: "GRANTED", CaptureChannel: "WEB_SIGNUP",
@@ -301,10 +307,11 @@ func TestRecordConsent_UnregisteredPurpose_Rejected(t *testing.T) {
 
 func TestRecordConsent_GrantThenResolve(t *testing.T) {
 	st := newStubStore()
-	r := newTestRouter(st, &stubPublisher{}, &stubAuthz{}, grantingPurposeRegistry())
+	r := newTestRouter(st, &stubAuthz{}, grantingPurposeRegistry())
 
 	w := doRequest(r, http.MethodPost, "/privacy/consents", domain.RecordConsentRequest{
 		SubjectRef: "subject-1", PurposeID: testPurpose, Action: "GRANTED", CaptureChannel: "WEB_SIGNUP",
+		NoticeVersionID: testPublishedNoticeVersionID,
 	}, testTenant)
 	if w.Code != http.StatusCreated {
 		t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
@@ -324,10 +331,11 @@ func TestRecordConsent_GrantThenResolve(t *testing.T) {
 // Also tests PRV-N05: replayed withdrawal must be idempotent and return original receipt.
 func TestWithdrawConsent_ThenResolveShowsWithdrawn_ButOriginalReceiptUntouched(t *testing.T) {
 	st := newStubStore()
-	r := newTestRouter(st, &stubPublisher{}, &stubAuthz{}, grantingPurposeRegistry())
+	r := newTestRouter(st, &stubAuthz{}, grantingPurposeRegistry())
 
 	w := doRequest(r, http.MethodPost, "/privacy/consents", domain.RecordConsentRequest{
 		SubjectRef: "subject-1", PurposeID: testPurpose, Action: "GRANTED", CaptureChannel: "WEB_SIGNUP",
+		NoticeVersionID: testPublishedNoticeVersionID,
 	}, testTenant)
 	var receipt domain.ConsentReceipt
 	_ = json.Unmarshal(w.Body.Bytes(), &receipt)
@@ -365,7 +373,7 @@ func TestWithdrawConsent_ThenResolveShowsWithdrawn_ButOriginalReceiptUntouched(t
 
 func TestGetConsentStatus_NoReceipt_NotRequested(t *testing.T) {
 	st := newStubStore()
-	r := newTestRouter(st, &stubPublisher{}, &stubAuthz{}, grantingPurposeRegistry())
+	r := newTestRouter(st, &stubAuthz{}, grantingPurposeRegistry())
 
 	w := doRequest(r, http.MethodGet, "/privacy/consents?subject_ref=nobody&purpose_id="+testPurpose, nil, testTenant)
 	var res domain.ConsentResolution
@@ -377,7 +385,7 @@ func TestGetConsentStatus_NoReceipt_NotRequested(t *testing.T) {
 
 func TestRecordConsent_PurposeRegistryUnavailable_FailsClosed(t *testing.T) {
 	st := newStubStore()
-	r := newTestRouter(st, &stubPublisher{}, &stubAuthz{}, &stubPurposeRegistry{err: context.DeadlineExceeded})
+	r := newTestRouter(st, &stubAuthz{}, &stubPurposeRegistry{err: context.DeadlineExceeded})
 
 	w := doRequest(r, http.MethodPost, "/privacy/consents", domain.RecordConsentRequest{
 		SubjectRef: "subject-1", PurposeID: testPurpose, Action: "GRANTED", CaptureChannel: "WEB_SIGNUP",
@@ -391,7 +399,7 @@ func TestRecordConsent_PurposeRegistryUnavailable_FailsClosed(t *testing.T) {
 
 func TestSetAndGetPreference(t *testing.T) {
 	st := newStubStore()
-	r := newTestRouter(st, &stubPublisher{}, &stubAuthz{}, grantingPurposeRegistry())
+	r := newTestRouter(st, &stubAuthz{}, grantingPurposeRegistry())
 
 	w := doRequest(r, http.MethodPost, "/privacy/preferences", domain.SetPreferenceRequest{
 		SubjectRef: "subject-1", ChannelOrPurpose: "EMAIL_MARKETING", Value: "DISABLED", Source: "ACCOUNT_SETTINGS",
@@ -412,7 +420,7 @@ func TestSetAndGetPreference(t *testing.T) {
 // setting a preference must never create or affect a consent resolution.
 func TestPreference_NeverImpliesConsent(t *testing.T) {
 	st := newStubStore()
-	r := newTestRouter(st, &stubPublisher{}, &stubAuthz{}, grantingPurposeRegistry())
+	r := newTestRouter(st, &stubAuthz{}, grantingPurposeRegistry())
 
 	doRequest(r, http.MethodPost, "/privacy/preferences", domain.SetPreferenceRequest{
 		SubjectRef: "subject-1", ChannelOrPurpose: testPurpose, Value: "ENABLED", Source: "ACCOUNT_SETTINGS",
@@ -428,7 +436,7 @@ func TestPreference_NeverImpliesConsent(t *testing.T) {
 
 func TestCreateNotice_AuthorizationDenied(t *testing.T) {
 	st := newStubStore()
-	r := newTestRouter(st, &stubPublisher{}, &stubAuthz{deny: true}, grantingPurposeRegistry())
+	r := newTestRouter(st, &stubAuthz{deny: true}, grantingPurposeRegistry())
 
 	w := doRequest(r, http.MethodPost, "/privacy/notices", domain.CreateNoticeRequest{
 		Locale: "en-US", Audience: "CUSTOMER", ContentHash: "sha256:abc123",
@@ -442,7 +450,7 @@ func TestCreateNotice_AuthorizationDenied(t *testing.T) {
 
 func TestNotice_MakerChecker_SoD_Enforcement(t *testing.T) {
 	st := newStubStore()
-	r := newTestRouter(st, &stubPublisher{}, &stubAuthz{}, grantingPurposeRegistry())
+	r := newTestRouter(st, &stubAuthz{}, grantingPurposeRegistry())
 
 	// Maker creates notice
 	wCreate := doRequestWithPrincipal(r, http.MethodPost, "/privacy/notices", domain.CreateNoticeRequest{
@@ -491,7 +499,7 @@ func TestNotice_MakerChecker_SoD_Enforcement(t *testing.T) {
 
 func TestConsent_ProxyValidation(t *testing.T) {
 	st := newStubStore()
-	r := newTestRouter(st, &stubPublisher{}, &stubAuthz{}, grantingPurposeRegistry())
+	r := newTestRouter(st, &stubAuthz{}, grantingPurposeRegistry())
 
 	// 1. IsProxy: true, but representative_subject_ref missing -> 400 Bad Request
 	wMissingSubject := doRequest(r, http.MethodPost, "/privacy/consents", domain.RecordConsentRequest{
@@ -528,6 +536,7 @@ func TestConsent_ProxyValidation(t *testing.T) {
 		PurposeID:                  testPurpose,
 		Action:                     "GRANTED",
 		CaptureChannel:             "LEGAL_PORTAL",
+		NoticeVersionID:            testPublishedNoticeVersionID,
 		IsProxy:                    true,
 		RepresentativeSubjectRef:   repSub,
 		RepresentativeAuthorityRef: repAuth,
@@ -561,13 +570,14 @@ func TestConsent_ProxyValidation(t *testing.T) {
 
 func TestConsent_PRVN04_Deduplication(t *testing.T) {
 	st := newStubStore()
-	r := newTestRouter(st, &stubPublisher{}, &stubAuthz{}, grantingPurposeRegistry())
+	r := newTestRouter(st, &stubAuthz{}, grantingPurposeRegistry())
 
 	req := domain.RecordConsentRequest{
-		SubjectRef:     "subject-dedup",
-		PurposeID:      testPurpose,
-		Action:         "GRANTED",
-		CaptureChannel: "WEB_SIGNUP",
+		SubjectRef:      "subject-dedup",
+		PurposeID:       testPurpose,
+		Action:          "GRANTED",
+		CaptureChannel:  "WEB_SIGNUP",
+		NoticeVersionID: testPublishedNoticeVersionID,
 	}
 
 	// First submission
@@ -599,16 +609,17 @@ func TestConsent_PRVN04_Deduplication(t *testing.T) {
 
 func TestConsent_IdempotencyKey_ReplayAndConflict(t *testing.T) {
 	st := newStubStore()
-	r := newTestRouter(st, &stubPublisher{}, &stubAuthz{}, grantingPurposeRegistry())
+	r := newTestRouter(st, &stubAuthz{}, grantingPurposeRegistry())
 
 	key := "idem-key-test-999"
 	headers := map[string]string{"Idempotency-Key": key}
 
 	req1 := domain.RecordConsentRequest{
-		SubjectRef:     "subject-idem-1",
-		PurposeID:      testPurpose,
-		Action:         "GRANTED",
-		CaptureChannel: "MOBILE_APP",
+		SubjectRef:      "subject-idem-1",
+		PurposeID:       testPurpose,
+		Action:          "GRANTED",
+		CaptureChannel:  "MOBILE_APP",
+		NoticeVersionID: testPublishedNoticeVersionID,
 	}
 
 	// 1. Initial request with Idempotency-Key
@@ -628,10 +639,11 @@ func TestConsent_IdempotencyKey_ReplayAndConflict(t *testing.T) {
 
 	// 3. Different payload with same Idempotency-Key -> 409 Conflict
 	req2 := domain.RecordConsentRequest{
-		SubjectRef:     "subject-DIFFERENT",
-		PurposeID:      testPurpose,
-		Action:         "DENIED",
-		CaptureChannel: "WEB_SIGNUP",
+		SubjectRef:      "subject-DIFFERENT",
+		PurposeID:       testPurpose,
+		Action:          "DENIED",
+		CaptureChannel:  "WEB_SIGNUP",
+		NoticeVersionID: testPublishedNoticeVersionID,
 	}
 	w3 := doRequestWithHeaders(r, http.MethodPost, "/privacy/consents", req2, testTenant, "principal-01", headers)
 	if w3.Code != http.StatusConflict {
@@ -643,7 +655,7 @@ func TestConsent_IdempotencyKey_ReplayAndConflict(t *testing.T) {
 
 func TestNotice_CanonicalRoutes(t *testing.T) {
 	st := newStubStore()
-	r := newTestRouter(st, &stubPublisher{}, &stubAuthz{}, grantingPurposeRegistry())
+	r := newTestRouter(st, &stubAuthz{}, grantingPurposeRegistry())
 
 	wCreate := doRequestWithPrincipal(r, http.MethodPost, "/privacy/notices", domain.CreateNoticeRequest{
 		Locale: "en-US", Audience: "CUSTOMER", ContentHash: "sha256:canonical",

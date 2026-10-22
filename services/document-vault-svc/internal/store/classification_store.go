@@ -31,71 +31,118 @@ func scanClassification(row pgx.Row, c *domain.RecordClassification) error {
 // classification — Reclassify (a later wave) is the command for that
 // case, not a second ClassifyRecord.
 func (s *PgStore) ClassifyRecord(ctx context.Context, p domain.ClassifyRecordParams) (*domain.RecordClassification, error) {
+	if err := validateClassifyParams(p); err != nil {
+		return nil, err
+	}
+
+	var out *domain.RecordClassification
+	err := s.withTenant(ctx, func(tx pgx.Tx, tenantID string) error {
+		c, err := s.classifyRecordTx(ctx, tx, tenantID, p)
+		out = c
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func validateClassifyParams(p domain.ClassifyRecordParams) error {
 	if p.Source != domain.ClassificationSourceHuman && p.Source != domain.ClassificationSourceAI {
-		return nil, domain.ErrInvalidClassificationSource
+		return domain.ErrInvalidClassificationSource
 	}
 	if p.Source == domain.ClassificationSourceAI && p.Confidence == nil {
-		return nil, domain.ErrAIConfidenceRequired
+		return domain.ErrAIConfidenceRequired
 	}
 	if p.Source == domain.ClassificationSourceHuman && p.Confidence != nil {
-		return nil, domain.ErrHumanConfidenceNotAllowed
+		return domain.ErrHumanConfidenceNotAllowed
+	}
+	return nil
+}
+
+// BulkClassifyRecords proposes a classification for every listed document in
+// ONE database transaction: either every proposal and its classification.proposed
+// outbox event commits, or nothing does. The first failure rolls the whole batch
+// back and is returned as a *domain.BulkClassifyError naming the document.
+//
+// Authorization is the caller's job and is done per document before this runs;
+// the transaction only guarantees that no partial result can be left behind.
+func (s *PgStore) BulkClassifyRecords(ctx context.Context, ps []domain.ClassifyRecordParams) ([]*domain.RecordClassification, error) {
+	for _, p := range ps {
+		if err := validateClassifyParams(p); err != nil {
+			return nil, &domain.BulkClassifyError{DocumentID: p.DocumentID, Err: err}
+		}
+	}
+
+	out := make([]*domain.RecordClassification, 0, len(ps))
+	err := s.withTenant(ctx, func(tx pgx.Tx, tenantID string) error {
+		for _, p := range ps {
+			c, err := s.classifyRecordTx(ctx, tx, tenantID, p)
+			if err != nil {
+				return &domain.BulkClassifyError{DocumentID: p.DocumentID, Err: err}
+			}
+			out = append(out, c)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// classifyRecordTx is ClassifyRecord's body inside a caller-owned transaction,
+// shared with BulkClassifyRecords so both apply exactly the same rules.
+func (s *PgStore) classifyRecordTx(ctx context.Context, tx pgx.Tx, tenantID string, p domain.ClassifyRecordParams) (*domain.RecordClassification, error) {
+	var legalEntityID string
+	if err := tx.QueryRow(ctx, `SELECT legal_entity_id::text FROM documents WHERE document_id = $1 AND tenant_id = $2::uuid`,
+		p.DocumentID, tenantID).Scan(&legalEntityID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, domain.ErrDocumentNotFound
+		}
+		return nil, fmt.Errorf("document store unavailable: %w", err)
+	}
+
+	var existingStatus *string
+	if err := tx.QueryRow(ctx, `
+		SELECT status FROM record_classifications
+		WHERE document_id = $1 AND status IN ('CONFIRMED', 'RESTRICTED')
+		ORDER BY proposed_at DESC LIMIT 1
+	`, p.DocumentID).Scan(&existingStatus); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("document store unavailable: %w", err)
+	}
+	if existingStatus != nil {
+		return nil, domain.ErrClassificationNotCandidate
 	}
 
 	var out domain.RecordClassification
-	err := s.withTenant(ctx, func(tx pgx.Tx, tenantID string) error {
-		var legalEntityID string
-		if err := tx.QueryRow(ctx, `SELECT legal_entity_id::text FROM documents WHERE document_id = $1 AND tenant_id = $2::uuid`,
-			p.DocumentID, tenantID).Scan(&legalEntityID); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				return domain.ErrDocumentNotFound
-			}
-			return fmt.Errorf("document store unavailable: %w", err)
-		}
+	row := tx.QueryRow(ctx, `
+		INSERT INTO record_classifications (
+			document_id, tenant_id, legal_entity_id, classification_value, source,
+			confidence, rule_model_version, source_evidence, proposed_by_principal_id, correlation_id
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		RETURNING `+classificationColumns,
+		p.DocumentID, tenantID, legalEntityID, string(p.ClassificationValue), string(p.Source),
+		p.Confidence, nullableString(p.RuleModelVersion), nullableString(p.SourceEvidence), p.ProposedByPrincipalID, nullableString(p.CorrelationID),
+	)
+	if err := scanClassification(row, &out); err != nil {
+		return nil, fmt.Errorf("document store unavailable: %w", err)
+	}
 
-		var existingStatus *string
-		if err := tx.QueryRow(ctx, `
-			SELECT status FROM record_classifications
-			WHERE document_id = $1 AND status IN ('CONFIRMED', 'RESTRICTED')
-			ORDER BY proposed_at DESC LIMIT 1
-		`, p.DocumentID).Scan(&existingStatus); err != nil && !errors.Is(err, pgx.ErrNoRows) {
-			return fmt.Errorf("document store unavailable: %w", err)
-		}
-		if existingStatus != nil {
-			return domain.ErrClassificationNotCandidate
-		}
-
-		row := tx.QueryRow(ctx, `
-			INSERT INTO record_classifications (
-				document_id, tenant_id, legal_entity_id, classification_value, source,
-				confidence, rule_model_version, source_evidence, proposed_by_principal_id, correlation_id
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-			RETURNING `+classificationColumns,
-			p.DocumentID, tenantID, legalEntityID, string(p.ClassificationValue), string(p.Source),
-			p.Confidence, nullableString(p.RuleModelVersion), nullableString(p.SourceEvidence), p.ProposedByPrincipalID, nullableString(p.CorrelationID),
-		)
-		if err := scanClassification(row, &out); err != nil {
-			return fmt.Errorf("document store unavailable: %w", err)
-		}
-
-		return s.insertDocumentOutboxEvent(ctx, tx, "classification.proposed", p.DocumentID, tenantID,
-			legalEntityID, p.ProposedByPrincipalID, p.CorrelationID, map[string]any{
-				"classification_id":    out.ClassificationID,
-				"document_id":          p.DocumentID,
-				"tenant_id":            tenantID,
-				"legal_entity_id":      legalEntityID,
-				"classification_value": string(p.ClassificationValue),
-				"source":               string(p.Source),
-			})
-	})
-	if err != nil {
+	if err := s.insertDocumentOutboxEvent(ctx, tx, "classification.proposed", p.DocumentID, tenantID,
+		legalEntityID, p.ProposedByPrincipalID, p.CorrelationID, map[string]any{
+			"classification_id":    out.ClassificationID,
+			"document_id":          p.DocumentID,
+			"tenant_id":            tenantID,
+			"legal_entity_id":      legalEntityID,
+			"classification_value": string(p.ClassificationValue),
+			"source":               string(p.Source),
+		}); err != nil {
 		return nil, err
 	}
 	return &out, nil
 }
 
-// FindClassificationByID is a read-only lookup used to authorize
-// ConfirmClassification BEFORE any mutation runs — see the handler's own
-// doc comment on why fetch must happen first.
 func (s *PgStore) FindClassificationByID(ctx context.Context, classificationID string) (*domain.RecordClassification, error) {
 	var out domain.RecordClassification
 	err := s.withTenant(ctx, func(tx pgx.Tx, tenantID string) error {

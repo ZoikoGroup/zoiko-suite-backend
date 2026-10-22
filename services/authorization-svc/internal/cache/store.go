@@ -113,7 +113,7 @@ type Inner interface {
 	FindPrivilegedSessionByID(ctx context.Context, sessionID, tenantID string) (*domain.PrivilegedSession, error)
 	ListPrivilegedSessions(ctx context.Context, tenantID, principalID string, activeOnly bool) ([]domain.PrivilegedSession, error)
 	RevokePrivilegedSession(ctx context.Context, sessionID, tenantID, revokedBy string) (*domain.PrivilegedSession, error)
-	DecidePrivilegedSession(ctx context.Context, sessionID, tenantID, approver string, approve bool) (*domain.PrivilegedSession, error)
+	DecidePrivilegedSession(ctx context.Context, sessionID, tenantID, approver string, approve bool, stepUp *domain.StepUpEvidence) (*domain.PrivilegedSession, error)
 	ReviewSession(ctx context.Context, kind, sessionID, tenantID, reviewer, outcome, notes string) error
 
 	// Break-Glass Emergency Sessions (ZS-IAM-001 §14 & §21).
@@ -830,6 +830,18 @@ func (s *Store) FindDelegationSource(ctx context.Context, delegatePrincipalID, l
 	return f.FindDelegationSource(ctx, delegatePrincipalID, legalEntityID, tenantID, bookID, orgUnitID, actionType)
 }
 
+// FindDelegationFrom passes through uncached: a delegation question names
+// one delegator and must see a revocation at once.
+func (s *Store) FindDelegationFrom(ctx context.Context, delegatePrincipalID, delegatorPrincipalID, legalEntityID, tenantID, actionType string) (string, error) {
+	f, ok := s.inner.(interface {
+		FindDelegationFrom(ctx context.Context, delegatePrincipalID, delegatorPrincipalID, legalEntityID, tenantID, actionType string) (string, error)
+	})
+	if !ok {
+		return "", domain.ErrStoreUnavailable
+	}
+	return f.FindDelegationFrom(ctx, delegatePrincipalID, delegatorPrincipalID, legalEntityID, tenantID, actionType)
+}
+
 // DecideRoleAssignment approves or rejects a pending privileged assignment.
 // An approval starts granting, so cached grant sources are dropped.
 func (s *Store) DecideRoleAssignment(ctx context.Context, assignmentID, tenantID, decision, deciderPrincipalID string) (*domain.PrincipalRoleAssignment, error) {
@@ -1046,8 +1058,8 @@ func (s *Store) RevokePrivilegedSession(ctx context.Context, sessionID, tenantID
 
 // DecidePrivilegedSession and ReviewSession are uncached writes; sessions are
 // read uncached at decision time, so an approval grants from the next call.
-func (s *Store) DecidePrivilegedSession(ctx context.Context, sessionID, tenantID, approver string, approve bool) (*domain.PrivilegedSession, error) {
-	return s.inner.DecidePrivilegedSession(ctx, sessionID, tenantID, approver, approve)
+func (s *Store) DecidePrivilegedSession(ctx context.Context, sessionID, tenantID, approver string, approve bool, stepUp *domain.StepUpEvidence) (*domain.PrivilegedSession, error) {
+	return s.inner.DecidePrivilegedSession(ctx, sessionID, tenantID, approver, approve, stepUp)
 }
 
 func (s *Store) ReviewSession(ctx context.Context, kind, sessionID, tenantID, reviewer, outcome, notes string) error {

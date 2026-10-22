@@ -30,6 +30,7 @@ import (
 	"github.com/riandyrn/otelchi"
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
+	idenv "zoiko.io/identity-envelope"
 
 	"zoiko.io/governance-decision-log-svc/internal/authz"
 	"zoiko.io/governance-decision-log-svc/internal/config"
@@ -169,13 +170,27 @@ func main() {
 		}
 	}
 
+	// Identity gate (Governance audit A1 / D-05, X5). X-Principal-Id and
+	// X-Tenant-Id were trusted as sent and port 8083 is published, so anyone who
+	// could reach it could write decisions as any principal. The gate verifies
+	// identity-context-svc's signed envelope (JWKS) and that its session is still
+	// live (AU-01), and makes the verified claims the only source of those
+	// headers. IDENTITY_VERIFY: require (default outside local) | warn.
+	gate, gateSettings, err := idenv.NewGateFromEnv("governance-decision-log-svc", log, idenv.EnvOptions{})
+	if err != nil {
+		log.Fatal("identity gate configuration refused", zap.Error(err))
+	}
+	log.Info("identity gate", gateSettings.Fields()...)
+
 	// ── 6. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()
+	r.Use(idenv.RequestID)
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
 	r.Use(middleware.Recoverer)
 	r.Use(otelchi.Middleware("governance-decision-log-svc", otelchi.WithChiRoutes(r)))
 	r.Use(metrics.HTTPMiddleware)
+	r.Use(gate.Middleware)
 	r.Use(correlationIDMiddleware)
 	r.Use(middleware.Logger)
 
@@ -244,13 +259,15 @@ func main() {
 	log.Info("server stopped")
 }
 
-// correlationIDMiddleware propagates X-Correlation-ID through every request.
+// correlationIDMiddleware echoes the caller's X-Correlation-ID. It used to
+// invent one from the request id before the input contract could refuse a
+// request without one: correlation_id is mandatory end to end (§4), and a
+// made-up one traces nothing.
 func correlationIDMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("X-Correlation-ID") == "" {
-			r.Header.Set("X-Correlation-ID", middleware.GetReqID(r.Context()))
+		if id := r.Header.Get("X-Correlation-ID"); id != "" {
+			w.Header().Set("X-Correlation-ID", id)
 		}
-		w.Header().Set("X-Correlation-ID", r.Header.Get("X-Correlation-ID"))
 		next.ServeHTTP(w, r)
 	})
 }

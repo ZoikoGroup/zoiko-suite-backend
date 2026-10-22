@@ -164,7 +164,7 @@ var _ payeeidentity.Client = (*stubPayee)(nil)
 
 type stubPolicy struct{ result string }
 
-func (p *stubPolicy) EvaluateApprovalThreshold(_ context.Context, _, _, _ string, _ float64) (string, string, error) {
+func (p *stubPolicy) EvaluateApprovalThreshold(_ context.Context, _ policy.Caller, _, _ string, _ float64) (string, string, error) {
 	if p.result == "" {
 		return "WITHIN_THRESHOLD", "policy-version-1", nil
 	}

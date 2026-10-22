@@ -27,6 +27,7 @@ import (
 	"zoiko.io/financial-close-svc/internal/config"
 	"zoiko.io/financial-close-svc/internal/consumer"
 	svcenvelope "zoiko.io/financial-close-svc/internal/envelope"
+	"zoiko.io/financial-close-svc/internal/evidencereq"
 	"zoiko.io/financial-close-svc/internal/handler"
 	"zoiko.io/financial-close-svc/internal/health"
 	svckafka "zoiko.io/financial-close-svc/internal/kafka"
@@ -245,6 +246,7 @@ func main() {
 	}, pgStore, nil, periodmirror.NewMetrics(prometheus.DefaultRegisterer), log)
 
 	h := handler.New(pgStore, clientsWrapper, clientsWrapper, []byte(cfg.CloseSigningKey), log).
+		WithEvidenceGate(evidencereq.NewClient(cfg.EvidenceRequirementsURL)).
 		SetCloseGateEnforced(cfg.CloseGateMode == "enforce").
 		SetWorkflowRefs(pgStore, cfg.WorkflowRefCallers).
 		SetSubledgerControlGateEnforced(cfg.SubledgerControlGateMode == "enforce").

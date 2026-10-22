@@ -6,19 +6,21 @@
 # Idempotent: safe to re-run. Touches three databases:
 #
 #   identity_context     a role assignment, so the admin principal resolves
-#   authorization_svc    a role + permission bundle + two assignments, so the
-#                        three privileged GOV-01 commands are GRANTED rather
-#                        than DENIED
+#   authorization_svc    a role + permission bundle + an assignment, so the
+#                        privileged GOV-01 commands are GRANTED rather than
+#                        DENIED
 #
 # It does NOT seed the password credential — `cmd/seed-local-admin` does that,
 # and this script tells you to run it.
 #
-# WHY TWO ASSIGNMENTS IN authorization_svc. identity-context-svc authorizes its
-# tenant-scoped commands against the TENANT id in the legal_entity position —
-# "may this principal invalidate context for this tenant" — while ordinary
-# entity-scoped reads use the real legal entity. Granting only one of the two
-# produces a DENIED with basis `no_grant` that looks like the role never
-# applied. Both are seeded; that is not a duplicate.
+# WHY ONE ASSIGNMENT AT THE REAL ENTITY. identity-context-svc forwards the
+# legal entity named by the caller's verified envelope (X-Legal-Entity-Id) to
+# authorization-svc, which resolves that entity's owning tenant and refuses a
+# tenant id in the entity position (tenant_scope_mismatch). Until 2026-10-16
+# the service passed the TENANT id there and this script compensated with a
+# second assignment keyed at legal_entity_id = tenant id; authorization-svc's
+# entity-scope enforcement made that convention unusable, so the extra
+# assignment is gone. One assignment at the real legal entity is correct.
 set -u
 
 PG=${PG:-zoiko-postgres}
@@ -55,19 +57,11 @@ VALUES ('$BUNDLE_ID','$ROLE_ID','IDENTITY_CONTEXT_FULL',
 ON CONFLICT (permission_bundle_id) DO UPDATE
   SET permitted_actions = EXCLUDED.permitted_actions, active_flag = true;"
 
-echo "== authorization_svc: assignment at ENTITY scope =="
+echo "== authorization_svc: assignment at the legal entity =="
 psql_do authorization_svc "
 INSERT INTO principal_role_assignments
   (principal_role_assignment_id, principal_id, role_id, legal_entity_id, effective_from, effective_to, assigned_by)
 VALUES ('cccc0000-0000-0000-0000-00000000cccc','$PRINCIPAL','$ROLE_ID','$ENTITY',
-        now() - interval '1 day', now() + interval '365 days','$PRINCIPAL')
-ON CONFLICT (principal_role_assignment_id) DO NOTHING;"
-
-echo "== authorization_svc: assignment at TENANT scope (see header) =="
-psql_do authorization_svc "
-INSERT INTO principal_role_assignments
-  (principal_role_assignment_id, principal_id, role_id, legal_entity_id, effective_from, effective_to, assigned_by)
-VALUES ('dddd0000-0000-0000-0000-00000000dddd','$PRINCIPAL','$ROLE_ID','$TENANT',
         now() - interval '1 day', now() + interval '365 days','$PRINCIPAL')
 ON CONFLICT (principal_role_assignment_id) DO NOTHING;"
 

@@ -31,7 +31,9 @@ import (
 	"github.com/riandyrn/otelchi"
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
+	idenv "zoiko.io/identity-envelope"
 
+	"zoiko.io/jurisdiction-rules-svc/internal/approval"
 	"zoiko.io/jurisdiction-rules-svc/internal/authz"
 	"zoiko.io/jurisdiction-rules-svc/internal/config"
 	"zoiko.io/jurisdiction-rules-svc/internal/consumer"
@@ -144,13 +146,27 @@ func main() {
 		defer outboxWorker.Stop()
 	}
 
+	// Identity gate (Governance audit J-01, X5). X-Principal-Id was trusted as
+	// sent and port 8082 is published, so anyone who could reach it could act
+	// as any principal. The gate verifies identity-context-svc's signed
+	// envelope (JWKS) and that its session is still live (AU-01), and makes the
+	// verified claims the only source of the identity headers.
+	// IDENTITY_VERIFY: require (default outside local) | warn.
+	gate, gateSettings, err := idenv.NewGateFromEnv("jurisdiction-rules-svc", log, idenv.EnvOptions{})
+	if err != nil {
+		log.Fatal("identity gate configuration refused", zap.Error(err))
+	}
+	log.Info("identity gate", gateSettings.Fields()...)
+
 	// ── 6. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()
+	r.Use(idenv.RequestID)
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
 	r.Use(middleware.Recoverer)
 	r.Use(otelchi.Middleware("jurisdiction-rules-svc", otelchi.WithChiRoutes(r)))
 	r.Use(metrics.HTTPMiddleware)
+	r.Use(gate.Middleware)
 	r.Use(correlationIDMiddleware)
 	r.Use(middleware.Logger)
 
@@ -214,6 +230,16 @@ func main() {
 		log.Warn("pack signing disabled: PACK_SIGNING_KEY_REF/PACK_SIGNING_KEY_FILE are not set; the sign command will answer 503")
 	}
 	h.WithEntityApplicability(pgStore)
+
+	// J-02: activation confirms its X-Approval-Reference with workflow-svc.
+	switch {
+	case cfg.WorkflowServiceURL != "":
+		h.WithApprovalVerifier(approval.New(cfg.WorkflowServiceURL))
+	case cfg.Env != "local" && cfg.Env != "dev":
+		log.Fatal("WORKFLOW_SERVICE_URL is required outside local/dev: a rule activation must cite an approval workflow-svc confirms")
+	default:
+		log.Warn("WORKFLOW_SERVICE_URL unset — activation approval references are recorded, not confirmed (local/dev only)")
+	}
 	handler.RegisterRoutes(r, h)
 
 	// Entity consumer (Doc 03 §8.2 consumed events): projects entity.created and
@@ -346,10 +372,11 @@ func newPublisher(cfg *config.Config, log *zap.Logger, pgStore *store.PgStore) (
 // correlationIDMiddleware propagates X-Correlation-ID through every request.
 func correlationIDMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("X-Correlation-ID") == "" {
-			r.Header.Set("X-Correlation-ID", middleware.GetReqID(r.Context()))
+		// Echoed, never invented: a correlation id made up here, before the
+		// input contract can refuse a request without one, traces nothing.
+		if id := r.Header.Get("X-Correlation-ID"); id != "" {
+			w.Header().Set("X-Correlation-ID", id)
 		}
-		w.Header().Set("X-Correlation-ID", r.Header.Get("X-Correlation-ID"))
 		next.ServeHTTP(w, r)
 	})
 }

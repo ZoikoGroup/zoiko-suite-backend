@@ -69,9 +69,12 @@ type ExecutionPlan struct {
 	// Offset paging is not offered at all: NP-21 forbids unbounded windows and
 	// a from/size API invites exactly that.
 	SearchAfter []any
-	// Sort is the tie-broken sort order. The final key is always _id so a
-	// cursor is stable across equal scores; without it search_after skips or
-	// repeats documents at a score boundary.
+	// Sort is the caller's sort order. compile() appends _score and then
+	// source_id as the final key, so a cursor is stable across equal scores.
+	// source_id is unique only within one tenant and source_type: two source
+	// types in the same scope that share an id can still tie. The ESR contract
+	// does not prescribe the final tie-break key, so this is recorded as an
+	// open clarification rather than changed here.
 	Sort []SortKey
 
 	// Vector, when set, makes this a semantic plan: approximate nearest
@@ -140,6 +143,15 @@ type FacetBucket struct {
 // ExecutePlan runs a compiled plan against a target, which is always an ALIAS
 // and never a concrete index chosen by a caller.
 func (c *client) ExecutePlan(ctx context.Context, target string, plan ExecutionPlan) (Result, error) {
+	// Both checks are local and run before any network call: a plan that is
+	// unscoped, or a target that expands, never reaches the engine (INV-02,
+	// INV-03, INV-04, INV-07).
+	if err := validateTarget(target); err != nil {
+		return Result{}, err
+	}
+	if err := plan.validate(); err != nil {
+		return Result{}, err
+	}
 	body, err := json.Marshal(plan.compile())
 	if err != nil {
 		return Result{}, fmt.Errorf("searchclient: ExecutePlan marshal: %w", err)
@@ -239,9 +251,14 @@ var ErrNoActiveGeneration = fmt.Errorf("searchclient: scope has no active index 
 func (p ExecutionPlan) compile() map[string]any {
 	filter := make([]map[string]any, 0, len(p.MandatoryFilters)+len(p.UserFilters))
 	for _, f := range p.MandatoryFilters {
-		if c := f.clause(); c != nil {
-			filter = append(filter, c)
+		c := f.clause()
+		if c == nil {
+			// Never drop a mandatory filter. ExecutePlan refuses such a plan
+			// before it gets here; if compile is ever reached with one, the
+			// filter becomes match_none, not an absent constraint (INV-04).
+			c = map[string]any{"match_none": map[string]any{}}
 		}
+		filter = append(filter, c)
 	}
 	for _, f := range p.UserFilters {
 		if c := f.clause(); c != nil {
@@ -327,9 +344,10 @@ func (p ExecutionPlan) compile() map[string]any {
 		sorts = append(sorts, map[string]any{s.Field: map[string]any{"order": dir}})
 	}
 	sorts = append(sorts, map[string]any{"_score": map[string]any{"order": "desc"}})
-	// Always last. Without a unique tie-break, search_after can skip or repeat
-	// documents whose sort values are equal — a cursor that silently loses
-	// rows is worse than no cursor.
+	// Always last, as the tie-break. Within one tenant and source_type it is
+	// unique, which keeps search_after from skipping or repeating documents
+	// whose sort values are equal. It is not unique across source types — see
+	// ExecutionPlan.Sort.
 	sorts = append(sorts, map[string]any{"source_id": map[string]any{"order": "asc"}})
 	body["sort"] = sorts
 
@@ -541,7 +559,9 @@ func maxInt(a, b int) int {
 }
 
 // StripHighlightMarkers removes the private-use sentinels compile() asked the
-// engine to wrap matches in, returning the plain text and the matched spans.
+// engine to wrap matches in, and returns the plain text only. It does not
+// return the matched spans: the retrieval layer finds them itself, from the
+// exported HighlightOpen and HighlightClose, before calling this.
 //
 // The retrieval layer escapes the plain text first and re-inserts real markup
 // around the spans afterwards, so stored HTML in an indexed body cannot reach a

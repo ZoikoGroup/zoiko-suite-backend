@@ -60,6 +60,10 @@ type stubStore struct {
 	// FindDelegationSource's answer for a delegated grant.
 	delegationSourceDelegator string
 	delegationSourceID        string
+	// FindDelegationFrom: delegationsFrom maps "delegate/delegator/action"
+	// to a delegation id; lastFromEntity records the entity it was asked about.
+	delegationsFrom map[string]string
+	lastFromEntity  string
 	// FindGrantingAssignments' answer for an RBAC grant.
 	granting []domain.GrantingAssignment
 
@@ -255,7 +259,6 @@ type stubStore struct {
 	findWorkloadBindingErr   error
 	createdWorkloadBinding   *domain.WorkloadBinding
 	createWorkloadBindingErr error
-
 }
 
 func (s *stubStore) CreateRole(_ context.Context, _ domain.CreateRoleParams) (*domain.Role, bool, error) {
@@ -457,12 +460,17 @@ func (s *stubStore) FindGrantingAssignments(_ context.Context, _, _, _, _, _, _ 
 func (s *stubStore) FindDelegationSource(_ context.Context, _, _, _, _, _, _ string) (string, string, error) {
 	return s.delegationSourceDelegator, s.delegationSourceID, nil
 }
+func (s *stubStore) FindDelegationFrom(_ context.Context, delegate, delegator, entity, _, action string) (string, error) {
+	s.lastFromEntity = entity
+	return s.delegationsFrom[delegate+"/"+delegator+"/"+action], nil
+}
 func (s *stubStore) FindEntityStatus(_ context.Context, _, _ string) (string, error) {
 	return s.entityStatus, s.entityStatusErr
 }
 func (s *stubStore) FindEntityTenant(_ context.Context, _ string) (string, error) {
 	return s.entityTenant, s.entityTenantErr
 }
+
 // FindPrincipalTenants answers principalTenants when the test set it. When it
 // did not, a principal the stub grants anything (RBAC or delegated) holds
 // authority in one tenant — the consistent world — so tests about other layers
@@ -551,7 +559,7 @@ func privilegedStatusFor(p domain.CreatePrivilegedSessionParams) string {
 	return domain.PrivilegedSessionStatusActive
 }
 
-func (s *stubStore) DecidePrivilegedSession(_ context.Context, sessionID, tenantID, approver string, approve bool) (*domain.PrivilegedSession, error) {
+func (s *stubStore) DecidePrivilegedSession(_ context.Context, sessionID, tenantID, approver string, approve bool, _ *domain.StepUpEvidence) (*domain.PrivilegedSession, error) {
 	s.decidedBy, s.decidedApprove = approver, approve
 	if s.sessionDecideErr != nil {
 		return nil, s.sessionDecideErr

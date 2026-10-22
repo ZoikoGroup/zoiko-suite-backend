@@ -17,8 +17,6 @@ import (
 
 	"zoiko.io/privacy-decision-svc/internal/consentregistry"
 	"zoiko.io/privacy-decision-svc/internal/domain"
-	"zoiko.io/privacy-decision-svc/internal/events"
-	svcmiddleware "zoiko.io/privacy-decision-svc/internal/middleware"
 	"zoiko.io/privacy-decision-svc/internal/purposeregistry"
 	"zoiko.io/privacy-decision-svc/internal/retentionregistry"
 	"zoiko.io/privacy-decision-svc/internal/store"
@@ -28,16 +26,17 @@ import (
 // PurposeChecker, ConsentChecker, HoldChecker and TransferChecker are the narrow
 // interfaces the handler depends on.
 type PurposeChecker interface {
-	ResolveActivity(ctx context.Context, tenantID, activityID string) (*purposeregistry.ActivityVersion, error)
-	ResolvePurpose(ctx context.Context, tenantID, purposeID string) (*purposeregistry.PurposeVersion, error)
+	ResolveActivity(ctx context.Context, tenantID, principalID, activityID string) (*purposeregistry.ActivityVersion, error)
+	ResolveActivityVersion(ctx context.Context, tenantID, principalID, activityID, versionID string) (*purposeregistry.ActivityVersion, error)
+	ResolvePurpose(ctx context.Context, tenantID, principalID, purposeID string) (*purposeregistry.PurposeVersion, error)
 }
 
 type ConsentChecker interface {
-	ResolveStatus(ctx context.Context, tenantID, subjectRef, purposeID string) (*consentregistry.ConsentResolution, error)
+	ResolveStatus(ctx context.Context, tenantID, principalID, subjectRef, purposeID string) (*consentregistry.ConsentResolution, error)
 }
 
 type HoldChecker interface {
-	Resolve(ctx context.Context, tenantID, recordClass, entityRef string) (*retentionregistry.RetentionResolution, error)
+	Resolve(ctx context.Context, tenantID, principalID, recordClass, entityRef string) (*retentionregistry.RetentionResolution, error)
 }
 
 type TransferChecker interface {
@@ -46,7 +45,6 @@ type TransferChecker interface {
 
 type Handler struct {
 	store     store.Store
-	pub       events.Publisher
 	purposes  PurposeChecker
 	consents  ConsentChecker
 	holds     HoldChecker
@@ -56,7 +54,6 @@ type Handler struct {
 
 func New(
 	st store.Store,
-	pub events.Publisher,
 	purposes PurposeChecker,
 	consents ConsentChecker,
 	holds HoldChecker,
@@ -65,7 +62,6 @@ func New(
 ) *Handler {
 	return &Handler{
 		store:     st,
-		pub:       pub,
 		purposes:  purposes,
 		consents:  consents,
 		holds:     holds,
@@ -88,28 +84,41 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	})
 }
 
+type errorResponse struct {
+	Error     string `json:"error"`
+	ErrorCode string `json:"error_code"`
+}
+
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-func writeError(w http.ResponseWriter, status int, msg string) {
-	writeJSON(w, status, map[string]string{"error": msg})
+func writeCoded(w http.ResponseWriter, status int, code, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(errorResponse{Error: msg, ErrorCode: code})
 }
 
 func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
-	principalID := r.Header.Get("X-Principal-Id")
+	principalID := strings.TrimSpace(r.Header.Get("X-Principal-Id"))
 	if principalID == "" {
-		writeError(w, http.StatusUnauthorized, "X-Principal-Id header is required")
+		writeCoded(w, http.StatusUnauthorized, domain.ErrCodeAuthenticationFailed, "X-Principal-Id header is required")
 		return "", false
 	}
 	return principalID, true
 }
 
-// dedupeReasons preserves order while removing duplicate reason codes —
-// e.g. a MINOR subject with a SENSITIVE data flag would otherwise report
-// PRV-010 twice.
+func (h *Handler) requireTenant(w http.ResponseWriter, r *http.Request) (string, bool) {
+	tenantID := strings.TrimSpace(r.Header.Get("X-Tenant-Id"))
+	if tenantID == "" {
+		writeCoded(w, http.StatusBadRequest, domain.ErrCodeTenantScopeRequired, "X-Tenant-Id header is required")
+		return "", false
+	}
+	return tenantID, true
+}
+
 func dedupeReasons(reasons []string) []string {
 	seen := make(map[string]bool, len(reasons))
 	out := make([]string, 0, len(reasons))
@@ -127,11 +136,20 @@ func hashBody(body []byte) string {
 	return hex.EncodeToString(h[:])
 }
 
-func readBodyBytes(r *http.Request) ([]byte, error) {
+// maxBodyBytes bounds a request body (1 MiB), the same limit the sibling privacy
+// services apply. A decision request is a handful of identifiers and short enums.
+const maxBodyBytes = 1 << 20
+
+// readBodyBytes reads the request body through http.MaxBytesReader, so a body
+// larger than maxBodyBytes is refused after at most maxBodyBytes+1 bytes have
+// been read instead of being buffered whole; the server also stops reading the
+// connection. The caller answers a read error as 400 VALIDATION_FAILED, the
+// established refusal for an unreadable body.
+func readBodyBytes(w http.ResponseWriter, r *http.Request) ([]byte, error) {
 	if r.Body == nil {
 		return []byte{}, nil
 	}
-	body, err := io.ReadAll(r.Body)
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 	if err != nil {
 		return nil, err
 	}
@@ -139,100 +157,91 @@ func readBodyBytes(r *http.Request) ([]byte, error) {
 	return body, nil
 }
 
-func (h *Handler) checkIdempotency(w http.ResponseWriter, r *http.Request, tenantID, principalID string, body []byte) (*domain.IdempotencyRecord, bool, string, string) {
-	key := r.Header.Get("Idempotency-Key")
-	if key == "" {
-		return nil, false, "", ""
-	}
-	reqHash := hashBody(body)
-	existing, err := h.store.GetIdempotency(r.Context(), tenantID, key)
-	if err != nil {
-		h.log.Warn("idempotency lookup error", zap.Error(err))
-		return nil, false, key, reqHash
-	}
-	if existing != nil {
-		if existing.RequestHash != reqHash {
-			writeError(w, http.StatusConflict, domain.ErrIdempotencyConflict.Error())
-			return existing, true, key, reqHash
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Idempotency-Replay", "true")
-		w.WriteHeader(existing.ResponseCode)
-		_, _ = w.Write(existing.ResponseBody)
-		return existing, true, key, reqHash
-	}
-	return nil, false, key, reqHash
-}
-
-func (h *Handler) writeJSONWithIdempotency(ctx context.Context, w http.ResponseWriter, tenantID, principalID, endpoint, key, reqHash string, status int, v interface{}) {
-	body, err := json.Marshal(v)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to marshal response")
-		return
-	}
-	if key != "" {
-		_ = h.store.SaveIdempotency(ctx, domain.IdempotencyRecord{
-			Key:          key,
-			TenantID:     tenantID,
-			Endpoint:     endpoint,
-			RequestHash:  reqHash,
-			ResponseCode: status,
-			ResponseBody: body,
-		})
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_, _ = w.Write(body)
-}
-
 // EvaluateDecision handles POST /privacy/decisions and POST /v1/privacy/decisions —
-// the runtime purpose-binding decision described in ZS-SVC-W-001 §12/§13.
+// the runtime purpose-binding decision described in ZS-SVC-W-001 §12/§13, §18.
+//
+// Error contract (status / error_code), all JSON {"error","error_code"}:
+//
+//	401 AUTHENTICATION_FAILED        missing X-Principal-Id
+//	400 TENANT_SCOPE_REQUIRED        missing X-Tenant-Id
+//	400 CORRELATION_ID_REQUIRED      missing X-Correlation-ID
+//	400 IDEMPOTENCY_KEY_REQUIRED     missing Idempotency-Key
+//	400 VALIDATION_FAILED            unreadable body (incl. larger than 1 MiB), invalid body or required field
+//	403 TENANT_SCOPE_MISMATCH        body tenant_id != X-Tenant-Id
+//	409 PRV-020                      Idempotency-Key reused with a different payload
+//	503 STORE_UNAVAILABLE            lookup or the atomic decision+idempotency commit failed
+//	500 INTERNAL_ERROR               response could not be rendered
 func (h *Handler) EvaluateDecision(w http.ResponseWriter, r *http.Request) {
+	// 1. Mandatory Actor Authentication
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
 	}
 
-	bodyBytes, err := readBodyBytes(r)
+	// 2. Mandatory Tenant Scope
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	// 3. Mandatory Correlation ID (§18.1), echoed on every response from here on.
+	correlationID := strings.TrimSpace(r.Header.Get("X-Correlation-ID"))
+	if correlationID == "" {
+		writeCoded(w, http.StatusBadRequest, domain.ErrCodeCorrelationRequired, "X-Correlation-ID header is required")
+		return
+	}
+	w.Header().Set("X-Correlation-ID", correlationID)
+
+	// 4. Mandatory Idempotency Key (§18.1)
+	idemKey := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	if idemKey == "" {
+		writeCoded(w, http.StatusBadRequest, domain.ErrCodeIdempotencyRequired, "Idempotency-Key header is required")
+		return
+	}
+
+	bodyBytes, err := readBodyBytes(w, r)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "failed to read request body")
+		writeCoded(w, http.StatusBadRequest, domain.ErrCodeValidationFailed, "failed to read request body (the body must not exceed 1 MiB)")
+		return
+	}
+	reqHash := hashBody(bodyBytes)
+
+	// 5. Idempotency replay check before processing (§18.1). Scope is
+	// (tenant, principal, key): a key never replays another principal's decision.
+	existing, err := h.store.GetIdempotency(r.Context(), tenantID, principalID, idemKey)
+	if err != nil {
+		h.log.Error("EvaluateDecision: idempotency lookup failed", zap.Error(err))
+		writeCoded(w, http.StatusServiceUnavailable, domain.ErrCodeStoreUnavailable, "store unavailable")
+		return
+	}
+	if existing != nil {
+		h.writeReplay(w, existing, reqHash)
 		return
 	}
 
-	verifiedTenant := svcmiddleware.TenantFromContext(r.Context())
-
-	// Check idempotency (§18.1)
-	_, handled, idemKey, reqHash := h.checkIdempotency(w, r, verifiedTenant, principalID, bodyBytes)
-	if handled {
-		return
-	}
-
+	// 6. Request payload validation
 	var req domain.EvaluateDecisionRequest
 	if err := json.Unmarshal(bodyBytes, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
+		writeCoded(w, http.StatusBadRequest, domain.ErrCodeValidationFailed, "invalid request body")
 		return
 	}
-	if req.SubjectRef == "" || req.ProcessingActivityID == "" || req.PurposeID == "" {
-		writeError(w, http.StatusBadRequest, "subject_ref, processing_activity_id and purpose_id are required")
+	if req.TenantID != "" && req.TenantID != tenantID {
+		writeCoded(w, http.StatusForbidden, domain.ErrCodeTenantScopeMismatch, "tenant_id does not match the verified X-Tenant-Id")
+		return
+	}
+	if strings.TrimSpace(req.SubjectRef) == "" || strings.TrimSpace(req.ProcessingActivityID) == "" || strings.TrimSpace(req.PurposeID) == "" {
+		writeCoded(w, http.StatusBadRequest, domain.ErrCodeValidationFailed, "subject_ref, processing_activity_id and purpose_id are required")
 		return
 	}
 	if !req.ProposedOperation.Valid() {
-		writeError(w, http.StatusBadRequest, "proposed_operation is missing or not a recognized value")
+		writeCoded(w, http.StatusBadRequest, domain.ErrCodeValidationFailed, "proposed_operation is missing or not a recognized value")
 		return
 	}
 
-	if req.TenantID != "" && req.TenantID != verifiedTenant {
-		writeError(w, http.StatusForbidden, "tenant_id does not match the verified X-Tenant-Id")
-		return
-	}
-	tenantID := req.TenantID
-	if tenantID == "" {
-		tenantID = verifiedTenant
-	}
-
-	correlationID := r.Header.Get("X-Correlation-ID")
+	fingerprint := domain.ComputeInputFingerprint(&req, tenantID)
 	decision := &domain.PrivacyDecision{
-		InputFingerprint:     domain.ComputeInputFingerprint(&req, tenantID),
+		InputFingerprint:     fingerprint,
+		ContextHash:          fingerprint,
 		SubjectRef:           req.SubjectRef,
 		SubjectContext:       req.SubjectContext,
 		DataContext:          req.DataContext,
@@ -243,241 +252,102 @@ func (h *Handler) EvaluateDecision(w http.ResponseWriter, r *http.Request) {
 		ActorPrincipalID:     principalID,
 		CorrelationID:        correlationID,
 		Constraints:          []domain.DecisionConstraint{},
+		PolicyRefs:           []string{},
+	}
+	// Only a registered secondary-purpose ID is ever recorded; free text is
+	// never stored as a purpose identifier (I14, N02).
+	if sp := strings.TrimSpace(req.SecondaryPurposeID); sp != "" {
+		decision.SecondaryPurposeID = &sp
 	}
 
-	if req.SecondaryPurposeID != "" {
-		decision.SecondaryPurposeID = &req.SecondaryPurposeID
-	} else if req.ProposedSecondaryPurpose != "" {
-		decision.SecondaryPurposeID = &req.ProposedSecondaryPurpose
+	// 7. Core runtime evaluation sequence
+	// The correlation id and idempotency key of THIS request travel with the
+	// evaluation, so the call to privacy-transfer-svc (a mutating route there)
+	// carries the §18.1 context it requires.
+	evalCtx := transferregistry.WithRequestContext(r.Context(), correlationID, idemKey)
+	out := h.evaluate(evalCtx, tenantID, principalID, &req, decision)
+	decision.Result = out.result
+	decision.ReasonCodes = out.reasons
+	if out.constraints != nil {
+		decision.Constraints = out.constraints
 	}
+	decision.ExpiresAt = out.expiresAt
 
-	result, reasonCodes, constraints := h.evaluate(r.Context(), tenantID, principalID, &req, decision)
-	decision.Result = result
-	decision.ReasonCodes = reasonCodes
-	if constraints != nil {
-		decision.Constraints = constraints
+	// 8. Durable record + idempotency record in ONE transaction (§13.2, §18.1).
+	claim := domain.IdempotencyRecord{
+		Key: idemKey, TenantID: tenantID, PrincipalID: principalID,
+		Endpoint: "EvaluateDecision", RequestHash: reqHash,
 	}
-
-	if err := h.store.RecordDecision(r.Context(), tenantID, decision); err != nil {
-		h.log.Error("EvaluateDecision: failed to record decision", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+	var renderErr error
+	existing, err = h.store.CommitDecision(r.Context(), claim, decision, func(d *domain.PrivacyDecision) (int, []byte, error) {
+		body, mErr := json.Marshal(d)
+		if mErr != nil {
+			renderErr = mErr
+		}
+		return http.StatusOK, body, mErr
+	})
+	if err != nil {
+		if renderErr != nil {
+			writeCoded(w, http.StatusInternalServerError, domain.ErrCodeInternal, "failed to marshal response")
+			return
+		}
+		h.log.Error("EvaluateDecision: atomic commit failed; nothing persisted, safe to retry", zap.Error(err))
+		writeCoded(w, http.StatusServiceUnavailable, domain.ErrCodeStoreUnavailable, "store unavailable")
+		return
+	}
+	if existing != nil {
+		// A concurrent request with the same key won the claim.
+		h.writeReplay(w, existing, reqHash)
 		return
 	}
 
-	_ = h.pub.Publish(r.Context(), events.PublishParams{
-		EventType: "privacy.decision.evaluated", EntityID: decision.DecisionID, TenantID: tenantID,
-		ActorID: principalID, CorrelationID: correlationID, Payload: decision,
-	})
-
-	h.writeJSONWithIdempotency(r.Context(), w, tenantID, principalID, "EvaluateDecision", idemKey, reqHash, http.StatusOK, decision)
+	respBody, err := json.Marshal(decision)
+	if err != nil {
+		writeCoded(w, http.StatusInternalServerError, domain.ErrCodeInternal, "failed to marshal response")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(respBody)
 }
 
-// evaluate implements the runtime privacy decision sequence from ZS-SVC-W-001 §13.
-// Any material dependency failure fails closed as INDETERMINATE (§12.2).
-func (h *Handler) evaluate(
-	ctx context.Context,
-	tenantID, principalID string,
-	req *domain.EvaluateDecisionRequest,
-	decision *domain.PrivacyDecision,
-) (domain.DecisionResult, []string, []domain.DecisionConstraint) {
-	// Step 1: Resolve the processing activity — must be ACTIVE (§13 step 1, §32 PRV-002).
-	activity, err := h.purposes.ResolveActivity(ctx, tenantID, req.ProcessingActivityID)
-	if err != nil {
-		h.log.Error("evaluate: purpose registry unavailable (activity)", zap.Error(err))
-		return domain.ResultIndeterminate, []string{domain.PRV019PrivacyContextIndeterminate}, nil
+// writeReplay returns the stored original response, or 409 PRV-020 when the
+// key was used with a different payload.
+func (h *Handler) writeReplay(w http.ResponseWriter, existing *domain.IdempotencyRecord, reqHash string) {
+	if existing.RequestHash != reqHash {
+		writeCoded(w, http.StatusConflict, domain.ErrCodeImmutableEvidenceConflict, domain.ErrIdempotencyConflict.Error())
+		return
 	}
-	if activity == nil || activity.VersionStatus != "ACTIVE" {
-		return domain.ResultBlock, []string{domain.PRV002ProcessingActivityInactive}, nil
-	}
-	decision.ActivityVersionID = &activity.ActivityVersionID
-
-	// Step 1b: Purpose limitation (§13 step 1, PRV-C01, §13.1 Safeguard 1: No implicit same-tenant exemption).
-	boundToActivity := false
-	for _, p := range activity.PurposeIDs {
-		if p == req.PurposeID {
-			boundToActivity = true
-			break
-		}
-	}
-	if !boundToActivity {
-		return domain.ResultBlock, []string{domain.PRV009PurposeIncompatible}, nil
-	}
-
-	// Resolve the purpose itself — must be PUBLISHED (§13 step 1, §32 PRV-001).
-	purpose, err := h.purposes.ResolvePurpose(ctx, tenantID, req.PurposeID)
-	if err != nil {
-		h.log.Error("evaluate: purpose registry unavailable (purpose)", zap.Error(err))
-		return domain.ResultIndeterminate, []string{domain.PRV019PrivacyContextIndeterminate}, nil
-	}
-	if purpose == nil || purpose.VersionStatus != "PUBLISHED" {
-		return domain.ResultBlock, []string{domain.PRV001PurposeNotRegistered}, nil
-	}
-	decision.PurposeVersionID = &purpose.PurposeVersionID
-
-	// Step 2: Assessment requirement (§12.2 REVIEW_REQUIRED, §32 PRV-016).
-	if activity.DpiaTiaStatus == "REVIEW_REQUIRED" || activity.DpiaTiaStatus == "UNDER_REVIEW" {
-		return domain.ResultReviewRequired, []string{domain.PRV016AssessmentRequired}, nil
-	}
-
-	// Step 3: §13.1 Mandatory Safeguards for proposed operations.
-	//
-	// Safeguard 4 ("no model-training/analytics purpose inherited from
-	// telemetry unless separately registered and permitted") is already
-	// enforced structurally by Step 1b above: TRAIN_MODEL can only proceed
-	// against a purpose_id that is one of the activity's own registered,
-	// PUBLISHED purposes. A separate purpose-name/ID substring heuristic
-	// (e.g. checking for "TRAIN"/"MODEL"/"AI" in the purpose_id) would be
-	// an invented rule with no basis in the registered purpose data or in
-	// §13.1's text — this service does not fabricate PDC's job, same
-	// doctrine as the rest of this domain (see domain/types.go).
-
-	// Safeguard 6: No anonymous-data claim without approved de-identification control.
-	if req.ProposedOperation == domain.OperationAnonymize || (req.DataContext != nil && req.DataContext.Classification == "ANONYMOUS") {
-		if req.DeidentificationControlRef == "" {
-			return domain.ResultBlock, []string{domain.PRV010DataCategoryRestricted}, nil
-		}
-	}
-
-	// Step 4: Consent evaluation (§12.1 + PRV-C04 + Activity Dependency).
-	consentRequired := (req.ConsentCheck != nil && req.ConsentCheck.Required) || activity.NoticeConsentDependency == "REQUIRED"
-	if consentRequired {
-		resolution, err := h.consents.ResolveStatus(ctx, tenantID, req.SubjectRef, req.PurposeID)
-		if err != nil {
-			h.log.Error("evaluate: consent registry unavailable", zap.Error(err))
-			return domain.ResultIndeterminate, []string{domain.PRV019PrivacyContextIndeterminate}, nil
-		}
-		if resolution.LatestReceipt != nil {
-			decision.ConsentReceiptID = &resolution.LatestReceipt.ConsentReceiptID
-			if resolution.LatestReceipt.NoticeVersionID != "" {
-				decision.NoticeVersionID = &resolution.LatestReceipt.NoticeVersionID
-			}
-		}
-		if resolution.Status == "WITHDRAWN" {
-			return domain.ResultBlock, []string{domain.PRV007ConsentWithdrawn}, nil
-		}
-		if resolution.Status != "GRANTED" {
-			return domain.ResultBlock, []string{domain.PRV006ConsentRequiredMissing}, nil
-		}
-	}
-
-	// Step 5: Legal hold evaluation (§13 step 4, §32 PRV-014).
-	if req.LegalHoldCheck != nil && req.LegalHoldCheck.RecordClass != "" {
-		resolution, err := h.holds.Resolve(ctx, tenantID, req.LegalHoldCheck.RecordClass, req.LegalHoldCheck.EntityRef)
-		if err != nil {
-			h.log.Error("evaluate: retention registry unavailable", zap.Error(err))
-			return domain.ResultIndeterminate, []string{domain.PRV019PrivacyContextIndeterminate}, nil
-		}
-		if resolution.Blocked {
-			if resolution.MatchedHold != nil {
-				decision.LegalHoldID = &resolution.MatchedHold.LegalHoldID
-			}
-			return domain.ResultBlock, []string{domain.PRV014RetentionOrHoldBlock}, nil
-		}
-	}
-
-	// Step 6: Transfer state evaluation (PRV-05 integration, §12.1 + §13 step 4, §32 PRV-015).
-	isTransfer := req.ProposedOperation == domain.OperationExport ||
-		(req.ProposedOperation == domain.OperationDisclose && req.RecipientContext != nil && req.RecipientContext.DestinationJurisdiction != "") ||
-		req.TransferCheck != nil
-
-	var transferConstraints []domain.DecisionConstraint
-	if isTransfer {
-		if req.TransferCheck == nil {
-			// Cross-border export without transfer mechanism details is prohibited (§13.1, §17.2)
-			if req.ProposedOperation == domain.OperationExport {
-				return domain.ResultBlock, []string{domain.PRV015TransferNotAuthorized}, nil
-			}
-		} else if h.transfers != nil {
-			tResp, err := h.transfers.EvaluateTransfer(ctx, tenantID, principalID, &transferregistry.EvaluateTransferRequest{
-				TenantID:                tenantID,
-				RelationshipID:          req.TransferCheck.RelationshipID,
-				TransferMechanismID:     req.TransferCheck.TransferMechanismID,
-				DestinationJurisdiction: req.TransferCheck.DestinationJurisdiction,
-				AssessmentRequired:      req.TransferCheck.AssessmentCheck,
-			})
-			if err != nil {
-				h.log.Error("evaluate: transfer service unavailable", zap.Error(err))
-				return domain.ResultIndeterminate, []string{domain.PRV019PrivacyContextIndeterminate}, nil
-			}
-			decision.TransferDecisionID = &tResp.DecisionID
-			if tResp.Result == "BLOCKED" {
-				return domain.ResultBlock, []string{domain.PRV015TransferNotAuthorized}, nil
-			}
-			if tResp.Result == "REVIEW_REQUIRED" {
-				return domain.ResultReviewRequired, []string{domain.PRV016AssessmentRequired}, nil
-			}
-			if tResp.Result == "CONDITIONAL" {
-				transferConstraints = append(transferConstraints, domain.DecisionConstraint{
-					Type:        "RECIPIENT_LIMITATION",
-					Description: "Transfer conditional on recipient adhering to processor contractual obligations and destination jurisdiction safeguards",
-					Parameters: map[string]interface{}{
-						"destination_jurisdiction": req.TransferCheck.DestinationJurisdiction,
-						"mechanism_id":             req.TransferCheck.TransferMechanismID,
-					},
-				})
-			}
-		}
-	}
-
-	// Step 7: Minimization / sensitive-data / secondary-purpose review gate.
-	//
-	// §13.1 Safeguard 5 (no sensitive-data downgrade), I14 (secondary
-	// purpose requires explicit compatibility/policy evaluation), and the
-	// HR domain-adoption pattern's "special/sensitive categories require
-	// explicit category/condition references" (§21.1) all name conditions
-	// this service can detect from caller-declared context but cannot
-	// itself adjudicate — doing so would mean inventing the exact
-	// minimization/compatibility rules §13 step 5 assigns to PDC (no PDC
-	// exists anywhere in this codebase; same documented gap as PRV-01/05).
-	// The platform's own fail-closed doctrine for this situation is
-	// explicit (§26 runbooks: "otherwise INDETERMINATE/REVIEW_REQUIRED —
-	// never 'best guess'"), so a detected-but-unresolvable condition here
-	// routes to REVIEW_REQUIRED with a real §32 reason code, not a
-	// fabricated RESTRICT constraint.
-	var reviewReasons []string
-	if req.SecondaryPurposeID != "" || req.ProposedSecondaryPurpose != "" {
-		reviewReasons = append(reviewReasons, domain.PRV009PurposeIncompatible)
-	}
-	if req.SubjectContext != nil && strings.ToUpper(req.SubjectContext.AgeBand) == "MINOR" {
-		reviewReasons = append(reviewReasons, domain.PRV010DataCategoryRestricted)
-	}
-	if req.DataContext != nil {
-		for _, flag := range req.DataContext.SensitivityFlags {
-			u := strings.ToUpper(flag)
-			if u == "SENSITIVE" || u == "SPECIAL_CATEGORY" || u == "HEALTH" || u == "BIOMETRIC" || u == "HIGH_RISK" {
-				reviewReasons = append(reviewReasons, domain.PRV010DataCategoryRestricted)
-				break
-			}
-		}
-	}
-	if len(reviewReasons) > 0 {
-		return domain.ResultReviewRequired, dedupeReasons(reviewReasons), nil
-	}
-
-	// A real CONDITIONAL transfer authorization is the one legitimate
-	// source of RESTRICT constraint content this version has: it comes
-	// from privacy-transfer-svc's own already-evaluated decision, not
-	// invented here.
-	if len(transferConstraints) > 0 {
-		return domain.ResultRestrict, []string{domain.PRV011MinimizationRequired}, transferConstraints
-	}
-
-	// Step 8: All conditions satisfied — PERMIT (§12.2).
-	return domain.ResultPermit, []string{}, nil
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Idempotency-Replay", "true")
+	w.WriteHeader(existing.ResponseCode)
+	_, _ = w.Write(existing.ResponseBody)
 }
 
 // GetDecision handles GET /privacy/decisions/{decisionID} and GET /v1/privacy/decisions/{decisionID} —
 // retrieving a past decision's durable evidence record per §13.2.
+// Authenticated and strictly scoped to caller's verified tenant to prevent cross-tenant access.
 func (h *Handler) GetDecision(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	if c := strings.TrimSpace(r.Header.Get("X-Correlation-ID")); c != "" {
+		w.Header().Set("X-Correlation-ID", c)
+	}
+
 	decisionID := chi.URLParam(r, "decisionID")
-	d, err := h.store.FindDecision(r.Context(), decisionID)
+	d, err := h.store.FindDecision(r.Context(), tenantID, decisionID)
 	if err != nil {
 		if errors.Is(err, domain.ErrDecisionNotFound) {
-			writeError(w, http.StatusNotFound, "privacy decision not found")
+			writeCoded(w, http.StatusNotFound, domain.ErrCodeNotFound, "privacy decision not found")
 			return
 		}
 		h.log.Error("GetDecision: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+		writeCoded(w, http.StatusServiceUnavailable, domain.ErrCodeStoreUnavailable, "store unavailable")
 		return
 	}
 	writeJSON(w, http.StatusOK, d)

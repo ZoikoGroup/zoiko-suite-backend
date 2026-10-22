@@ -25,6 +25,7 @@ import (
 	"github.com/riandyrn/otelchi"
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
+	idenv "zoiko.io/identity-envelope"
 
 	"zoiko.io/delegated-authority-svc/internal/config"
 	"zoiko.io/delegated-authority-svc/internal/domain"
@@ -513,13 +514,26 @@ func main() {
 	}()
 
 	// ── 5. Router + handler ───────────────────────────────────────────────────
+	// Identity gate (X5 / X-R3, decision 21 Oct 2026): identity-context-svc's
+	// signed envelope is verified (JWKS) with its session status (AU-01), and
+	// its claims become the only source of X-Principal-Id / X-Tenant-Id; a peer
+	// over verified mTLS may vouch for them instead. Until now this service took
+	// those headers as sent. IDENTITY_VERIFY: require (default outside local) | warn.
+	gate, gateSettings, err := idenv.NewGateFromEnv("delegated-authority-svc", log, idenv.EnvOptions{DefaultPeers: nil})
+	if err != nil {
+		log.Fatal("identity gate configuration refused", zap.Error(err))
+	}
+	log.Info("identity gate", gateSettings.Fields()...)
+
 	r := chi.NewRouter()
+	r.Use(idenv.RequestID)
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
 	r.Use(middleware.Recoverer)
 	r.Use(otelchi.Middleware("delegated-authority-svc", otelchi.WithChiRoutes(r)))
 	r.Use(metrics.HTTPMiddleware)
 	r.Use(correlationIDMiddleware)
+	r.Use(gate.Middleware)
 	r.Use(svcmiddleware.TenantContext())
 	r.Use(middleware.Logger)
 
@@ -620,10 +634,11 @@ func main() {
 
 func correlationIDMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("X-Correlation-ID") == "" {
-			r.Header.Set("X-Correlation-ID", middleware.GetReqID(r.Context()))
+		// Echoed, never invented: a correlation id made up here, before the
+		// input contract can refuse a request without one, traces nothing.
+		if id := r.Header.Get("X-Correlation-ID"); id != "" {
+			w.Header().Set("X-Correlation-ID", id)
 		}
-		w.Header().Set("X-Correlation-ID", r.Header.Get("X-Correlation-ID"))
 		next.ServeHTTP(w, r)
 	})
 }

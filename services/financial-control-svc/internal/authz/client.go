@@ -35,6 +35,14 @@ type Client interface {
 	// domain.ErrAuthorizationServiceUnavailable if it cannot be reached —
 	// callers must fail-closed on the latter.
 	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
+
+	// Decide is CheckAllowed for a command that must record its authority
+	// (Invariant 9: a certification identifies its certification authority).
+	// It always asks authorization-svc live, never the decision cache, and on
+	// GRANTED returns the decision as authorization-svc recorded it. A GRANTED
+	// answer that names no access decision cannot be traced, so it is treated
+	// as authorization-svc being unavailable (fail-closed).
+	Decide(ctx context.Context, principalID, legalEntityID, actionType string) (*domain.AuthoritySnapshot, error)
 }
 
 // decisionCacheTTL bounds how long a GRANTED/DENIED decision from
@@ -104,8 +112,15 @@ type authorizeRequest struct {
 	ActionType    string `json:"action_type"`
 }
 
+// authorizeResponse is the part of authorization-svc's /v1/authorize answer
+// this service reads.
 type authorizeResponse struct {
-	DecisionOutcome string `json:"decision_outcome"`
+	DecisionOutcome  string   `json:"decision_outcome"`
+	DecisionBasis    string   `json:"decision_basis"`
+	AccessDecisionID string   `json:"access_decision_id"`
+	Decision         string   `json:"decision"`
+	PolicySetVersion string   `json:"policy_set_version"`
+	ReasonCodes      []string `json:"reason_codes"`
 }
 
 func (c *HTTPClient) CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error {
@@ -166,14 +181,50 @@ func (c *HTTPClient) storeCache(key string, decision error) {
 
 // checkAllowedLive is the real, uncached call to authorization-svc.
 func (c *HTTPClient) checkAllowedLive(ctx context.Context, principalID, legalEntityID, actionType string) error {
+	out, err := c.authorizeLive(ctx, principalID, legalEntityID, actionType)
+	if err != nil {
+		return err
+	}
+	if out.DecisionOutcome != "GRANTED" {
+		return domain.ErrAuthorizationDenied
+	}
+	return nil
+}
+
+// Decide asks authorization-svc live (see Client.Decide) and returns the
+// decision it recorded.
+func (c *HTTPClient) Decide(ctx context.Context, principalID, legalEntityID, actionType string) (*domain.AuthoritySnapshot, error) {
+	out, err := c.authorizeLive(ctx, principalID, legalEntityID, actionType)
+	if err != nil {
+		return nil, err
+	}
+	if out.DecisionOutcome != "GRANTED" {
+		return nil, domain.ErrAuthorizationDenied
+	}
+	if out.AccessDecisionID == "" {
+		c.log.Error("authorization-svc granted without an access decision id — failing closed",
+			zap.String("principal_id", principalID), zap.String("action_type", actionType))
+		return nil, domain.ErrAuthorizationServiceUnavailable
+	}
+	return &domain.AuthoritySnapshot{
+		Source: "authorization-svc", PrincipalID: principalID, LegalEntityID: legalEntityID, ActionType: actionType,
+		AccessDecisionID: out.AccessDecisionID, DecisionOutcome: out.DecisionOutcome, Decision: out.Decision,
+		DecisionBasis: out.DecisionBasis, PolicySetVersion: out.PolicySetVersion, ReasonCodes: out.ReasonCodes,
+		DecidedAt: time.Now().UTC(),
+	}, nil
+}
+
+// authorizeLive performs one uncached /v1/authorize call. Any transport,
+// status or decoding failure is domain.ErrAuthorizationServiceUnavailable.
+func (c *HTTPClient) authorizeLive(ctx context.Context, principalID, legalEntityID, actionType string) (*authorizeResponse, error) {
 	body, err := json.Marshal(authorizeRequest{PrincipalID: principalID, LegalEntityID: legalEntityID, ActionType: actionType})
 	if err != nil {
-		return fmt.Errorf("marshal authorize request: %w", err)
+		return nil, fmt.Errorf("marshal authorize request: %w", err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/authorize", bytes.NewReader(body))
 	if err != nil {
-		return domain.ErrAuthorizationServiceUnavailable
+		return nil, domain.ErrAuthorizationServiceUnavailable
 	}
 	req.Header.Set("Content-Type", "application/json")
 
@@ -181,7 +232,7 @@ func (c *HTTPClient) checkAllowedLive(ctx context.Context, principalID, legalEnt
 	if err != nil {
 		c.log.Error("authorization-svc unreachable — failing closed",
 			zap.String("principal_id", principalID), zap.String("action_type", actionType), zap.Error(err))
-		return domain.ErrAuthorizationServiceUnavailable
+		return nil, domain.ErrAuthorizationServiceUnavailable
 	}
 	defer resp.Body.Close()
 
@@ -189,15 +240,12 @@ func (c *HTTPClient) checkAllowedLive(ctx context.Context, principalID, legalEnt
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 		c.log.Error("unexpected response from authorization-svc — failing closed",
 			zap.Int("status", resp.StatusCode), zap.ByteString("body", respBody))
-		return domain.ErrAuthorizationServiceUnavailable
+		return nil, domain.ErrAuthorizationServiceUnavailable
 	}
 
 	var out authorizeResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return domain.ErrAuthorizationServiceUnavailable
+		return nil, domain.ErrAuthorizationServiceUnavailable
 	}
-	if out.DecisionOutcome != "GRANTED" {
-		return domain.ErrAuthorizationDenied
-	}
-	return nil
+	return &out, nil
 }

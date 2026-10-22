@@ -26,6 +26,7 @@ import (
 	svcenvelope "zoiko.io/secret-vault-integration-svc/internal/envelope"
 
 	"go.uber.org/zap"
+	idenv "zoiko.io/identity-envelope"
 )
 
 // Sentinel errors, mapped to HTTP status codes by the handler.
@@ -270,6 +271,13 @@ func (c *HTTPClient) checkAllowedLive(ctx context.Context, principalID, legalEnt
 	// One decision per (request, action): an inbound request may authorize
 	// several actions, and each is its own decision to record.
 	req.Header.Set("Idempotency-Key", authzRequestID+":"+actionType)
+
+	// Forward the caller's canonical envelope for downstream traceability
+	svcenvelope.ForwardTo(ctx, req)
+	// The verified identity envelope too, so the next hop can check who
+	// is asking instead of trusting X-Principal-Id (X-R3).
+	idenv.Forward(ctx, req)
+
 	resp, err := c.http.Do(req)
 	if err != nil {
 		c.log.Error("authorization-svc unreachable — failing closed",

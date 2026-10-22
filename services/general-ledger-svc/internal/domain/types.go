@@ -16,7 +16,10 @@
 // spec's own Cross-Service Accounting Authority Matrix.
 package domain
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 // JournalStatus implements the Tri-Phase Commit States required by the spec:
 // Pending -> Validated -> Finalized. REVERSED is a fourth, terminal state
@@ -294,9 +297,16 @@ type TrialBalanceSnapshot struct {
 // TrialBalanceLine is one account's net balance (debit - credit) within a
 // TrialBalanceSnapshot, summed across every FINALIZED/REVERSED journal
 // line for that account at the snapshot's watermark.
+//
+// NetBalance is an exact decimal string, never float64 — ZS-DATA-001 D06,
+// the same rule SumLines's own doc comment explains for this package. The
+// underlying trial_balance_lines.net_balance column is NUMERIC(18,2); a
+// float64 field here would silently reintroduce the exactness this
+// snapshot otherwise guarantees, for every consumer that reads it back
+// (e.g. REP-01's ACC-16 ingestion), not just for GL's own code.
 type TrialBalanceLine struct {
-	AccountCode string  `json:"account_code"`
-	NetBalance  float64 `json:"net_balance"`
+	AccountCode string `json:"account_code"`
+	NetBalance  string `json:"net_balance"`
 }
 
 // AccountType is one of the five fundamental account classes.
@@ -316,6 +326,52 @@ var validAccountTypes = map[AccountType]bool{
 }
 
 func IsValidAccountType(t AccountType) bool { return validAccountTypes[t] }
+
+// Normal balance sides (ACC-01 "Required source inputs": normal_balance).
+const (
+	NormalBalanceDebit  = "DEBIT"
+	NormalBalanceCredit = "CREDIT"
+)
+
+// NormalBalance is the side on which an account of this type normally
+// carries its balance, by standard accounting convention: ASSET and EXPENSE
+// are debit-normal; LIABILITY, EQUITY and REVENUE are credit-normal.
+//
+// Derived from the type, never stored (SPEC_DEVIATIONS A2/B11): a separate
+// editable column could contradict the class. An unrecognised type returns
+// "", never a guess.
+func (t AccountType) NormalBalance() string {
+	switch t {
+	case AccountTypeAsset, AccountTypeExpense:
+		return NormalBalanceDebit
+	case AccountTypeLiability, AccountTypeEquity, AccountTypeRevenue:
+		return NormalBalanceCredit
+	default:
+		return ""
+	}
+}
+
+// MarshalJSON adds the read-only, derived normal_balance to every account
+// response (CreateAccount, GetAccount, ListAccounts, AmendAccountVersion,
+// Activate/Deactivate/ReparentAccount all return Account). It is computed
+// from AccountType on the way out, so it cannot disagree with it.
+func (a Account) MarshalJSON() ([]byte, error) {
+	type account Account // drops this method, so no recursion
+	return json.Marshal(struct {
+		account
+		NormalBalance string `json:"normal_balance,omitempty"`
+	}{account(a), a.AccountType.NormalBalance()})
+}
+
+// MarshalJSON adds normal_balance to an account version (GetAccountAsOf),
+// derived from the type in force in that version.
+func (v AccountVersion) MarshalJSON() ([]byte, error) {
+	type accountVersion AccountVersion
+	return json.Marshal(struct {
+		accountVersion
+		NormalBalance string `json:"normal_balance,omitempty"`
+	}{accountVersion(v), v.AccountType.NormalBalance()})
+}
 
 // Account is ACC-01's Chart of Accounts entry — the platform's first real
 // posting-account master (see migration 000007's doc comment). Kept as
@@ -340,6 +396,11 @@ type Account struct {
 	Status               string    `json:"status"` // ACTIVE | INACTIVE
 	CreatedAt            time.Time `json:"created_at"`
 	CreatedByPrincipalID string    `json:"created_by_principal_id"`
+
+	// Version is the current head version. Version 1 is written with the
+	// account itself; every later AmendAccountVersion/state/hierarchy command
+	// appends a new immutable account_versions row and advances this number.
+	Version int64 `json:"version"`
 }
 
 type CreateAccountRequest struct {
@@ -349,6 +410,211 @@ type CreateAccountRequest struct {
 	ParentAccountID         *string     `json:"parent_account_id,omitempty"`
 	IsControlAccount        bool        `json:"is_control_account,omitempty"`
 	DirectPostingRestricted bool        `json:"direct_posting_restricted,omitempty"`
+}
+
+// AccountVersion is one immutable row of ACC-01's AccountHierarchyVersion
+// history. EffectiveTo is nil for the currently effective version; an
+// amendment/state/hierarchy change closes the prior interval at the new
+// version's EffectiveFrom. GetAccountAsOf reconstructs the version in force at
+// a caller-supplied instant from exactly these intervals.
+type AccountVersion struct {
+	AccountVersionID        string      `json:"account_version_id"`
+	AccountID               string      `json:"account_id"`
+	TenantID                string      `json:"tenant_id"`
+	AccountCode             string      `json:"account_code"`
+	Version                 int64       `json:"version"`
+	AccountName             string      `json:"account_name"`
+	AccountType             AccountType `json:"account_type"`
+	ParentAccountID         *string     `json:"parent_account_id,omitempty"`
+	IsControlAccount        bool        `json:"is_control_account"`
+	DirectPostingRestricted bool        `json:"direct_posting_restricted"`
+	Status                  string      `json:"status"`
+	EffectiveFrom           time.Time   `json:"effective_from"`
+	EffectiveTo             *time.Time  `json:"effective_to,omitempty"`
+	ChangeKind              string      `json:"change_kind"`
+	ChangeReason            string      `json:"change_reason,omitempty"`
+	EvidenceRefs            []string    `json:"evidence_refs,omitempty"`
+	CreatedAt               time.Time   `json:"created_at"`
+	CreatedByPrincipalID    string      `json:"created_by_principal_id"`
+}
+
+// AmendAccountVersionRequest is a partial amendment of an existing account:
+// omitted fields keep their current values, so a caller changing one field
+// does not have to echo the whole master. To clear a parent, send
+// "parent_account_id": null explicitly (the handler distinguishes an absent
+// field from an explicit null). ExpectedVersion is optional for compatibility
+// with this service's existing commands, but when supplied it is enforced as a
+// real optimistic-concurrency check.
+type AmendAccountVersionRequest struct {
+	ExpectedVersion         int64          `json:"expected_version,omitempty"`
+	EffectiveFrom           *EffectiveDate `json:"effective_from,omitempty"`
+	AccountName             *string        `json:"account_name,omitempty"`
+	AccountType             *AccountType   `json:"account_type,omitempty"`
+	ParentAccountID         *string        `json:"parent_account_id,omitempty"`
+	ParentAccountIDSet      bool           `json:"-"`
+	IsControlAccount        *bool          `json:"is_control_account,omitempty"`
+	DirectPostingRestricted *bool          `json:"direct_posting_restricted,omitempty"`
+	Reason                  string         `json:"reason,omitempty"`
+	EvidenceRefs            []string       `json:"evidence_refs,omitempty"`
+}
+
+// ActivateAccountRequest and DeactivateAccountRequest are the optional request
+// bodies of the two status commands. Both fields beyond the path are optional:
+// the existing DeactivateAccount accepted no body at all, so requiring one now
+// would break every current caller. expected_version, when supplied, is a real
+// optimistic-concurrency check.
+type ActivateAccountRequest struct {
+	ExpectedVersion int64          `json:"expected_version,omitempty"`
+	EffectiveFrom   *EffectiveDate `json:"effective_from,omitempty"`
+	Reason          string         `json:"reason,omitempty"`
+	EvidenceRefs    []string       `json:"evidence_refs,omitempty"`
+}
+
+// DeactivateAccountRequest is the DeactivateAccount body — a separate named
+// type so the two commands' contracts can diverge later without an alias.
+type DeactivateAccountRequest struct {
+	ExpectedVersion int64          `json:"expected_version,omitempty"`
+	EffectiveFrom   *EffectiveDate `json:"effective_from,omitempty"`
+	Reason          string         `json:"reason,omitempty"`
+	EvidenceRefs    []string       `json:"evidence_refs,omitempty"`
+}
+
+// ResolvePostingEligibilityRequest is ACC-01's read-side answer to "may this
+// account be posted to right now". AccountCode is optional when the route
+// already names the account. LegalEntityID is only used as the authorization
+// scope when the caller asks for the control-account override.
+type ResolvePostingEligibilityRequest struct {
+	AccountCode                       string `json:"account_code,omitempty"`
+	LegalEntityID                     string `json:"legal_entity_id,omitempty"`
+	OverrideControlAccountRestriction bool   `json:"override_control_account_restriction,omitempty"`
+}
+
+// PostingEligibility is the resolver's answer. It formalises the exact rules
+// PostAccountingEvent already enforces inline (see
+// handler.checkAccountRestrictions): an account the chart has never heard of
+// remains postable (the deliberate bootstrap gap), an INACTIVE account is not,
+// and a control account with direct_posting_restricted needs an explicit,
+// separately authorized override.
+type PostingEligibility struct {
+	AccountID               string `json:"account_id,omitempty"`
+	AccountCode             string `json:"account_code"`
+	Registered              bool   `json:"registered"`
+	Eligible                bool   `json:"eligible"`
+	Status                  string `json:"status,omitempty"`
+	Version                 int64  `json:"version,omitempty"`
+	IsControlAccount        bool   `json:"is_control_account"`
+	DirectPostingRestricted bool   `json:"direct_posting_restricted"`
+	RequiresOverride        bool   `json:"requires_override"`
+	OverrideApplied         bool   `json:"override_applied"`
+	Reason                  string `json:"reason,omitempty"`
+}
+
+// EvaluatePostingEligibility applies ACC-01's posting rules to an account. A
+// nil account is the unregistered case: the caller gets an explicit
+// registered=false answer rather than a 404, because ACC-04 must still be able
+// to accept the legacy codes nothing has registered.
+func EvaluatePostingEligibility(accountCode string, a *Account, override bool) PostingEligibility {
+	if a == nil {
+		return PostingEligibility{
+			AccountCode: accountCode,
+			Registered:  false,
+			Eligible:    true,
+			Status:      "UNREGISTERED",
+			Reason:      "account is not registered in the Chart of Accounts; legacy posting remains permitted",
+		}
+	}
+	result := PostingEligibility{
+		AccountID:               a.AccountID,
+		AccountCode:             a.AccountCode,
+		Registered:              true,
+		Status:                  a.Status,
+		Version:                 a.Version,
+		IsControlAccount:        a.IsControlAccount,
+		DirectPostingRestricted: a.DirectPostingRestricted,
+	}
+	if a.Status != "ACTIVE" {
+		result.Reason = ErrAccountInactive.Error()
+		return result
+	}
+	if a.IsControlAccount && a.DirectPostingRestricted {
+		result.RequiresOverride = true
+		if !override {
+			result.Reason = ErrControlAccountPostingRestricted.Error()
+			return result
+		}
+		result.OverrideApplied = true
+	}
+	result.Eligible = true
+	return result
+}
+
+// GetAccountAsOfRequest is the point-in-time read over the version history.
+// AsOf is required; a request without one is refused rather than defaulted to
+// "now", because a historical read with an accidental current-time default
+// returns a plausible wrong answer.
+type GetAccountAsOfRequest struct {
+	AccountCode string         `json:"account_code,omitempty"`
+	AsOf        *EffectiveDate `json:"as_of,omitempty"`
+}
+
+// ReparentAccountRequest changes an account's parent in the chart hierarchy.
+// The parent field is required but may be null: an explicit null makes the
+// account a root, while omitting the field entirely is refused so an
+// accidental empty body cannot silently detach an account. The alias
+// new_parent_account_id is accepted for callers reading the command name
+// literally.
+type ReparentAccountRequest struct {
+	ExpectedVersion    int64          `json:"expected_version,omitempty"`
+	ParentAccountID    *string        `json:"parent_account_id"`
+	ParentAccountIDSet bool           `json:"-"`
+	EffectiveFrom      *EffectiveDate `json:"effective_from,omitempty"`
+	Reason             string         `json:"reason,omitempty"`
+	EvidenceRefs       []string       `json:"evidence_refs,omitempty"`
+}
+
+// UnmarshalJSON accepts both parent_account_id and new_parent_account_id and
+// records whether either key was present.
+func (r *ReparentAccountRequest) UnmarshalJSON(b []byte) error {
+	type plain ReparentAccountRequest
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return err
+	}
+	var p plain
+	if err := json.Unmarshal(b, &p); err != nil {
+		return err
+	}
+	*r = ReparentAccountRequest(p)
+	if v, ok := raw["new_parent_account_id"]; ok {
+		var parent *string
+		if err := json.Unmarshal(v, &parent); err != nil {
+			return err
+		}
+		r.ParentAccountID = parent
+		r.ParentAccountIDSet = true
+		return nil
+	}
+	_, r.ParentAccountIDSet = raw["parent_account_id"]
+	return nil
+}
+
+// UnmarshalJSON records whether parent_account_id was present at all. A plain
+// *string cannot tell "clear the parent" from "leave the parent unchanged",
+// and silently treating one as the other would move an account in the chart
+// hierarchy without the caller having asked for it.
+func (r *AmendAccountVersionRequest) UnmarshalJSON(b []byte) error {
+	type plain AmendAccountVersionRequest
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return err
+	}
+	var p plain
+	if err := json.Unmarshal(b, &p); err != nil {
+		return err
+	}
+	*r = AmendAccountVersionRequest(p)
+	_, r.ParentAccountIDSet = raw["parent_account_id"]
+	return nil
 }
 
 // AccountMapping is ACC-02's effective-dated mapping of a caller-declared
@@ -461,7 +727,7 @@ type PostAccountingEventRequest struct {
 }
 
 type PostApprovedJournalRequest struct {
-	JournalID               string `json:"journal_id"`
+	JournalID string `json:"journal_id"`
 
 	// OverrideSoftClose and SoftCloseOverrideReason mirror the fields on
 	// CreateJournalRequest — see those field docs for semantics.
@@ -470,8 +736,8 @@ type PostApprovedJournalRequest struct {
 }
 
 type CreateReversalPostingRequest struct {
-	OriginalJournalID       string `json:"original_journal_id"`
-	Reason                  string `json:"reason"`
+	OriginalJournalID string `json:"original_journal_id"`
+	Reason            string `json:"reason"`
 
 	// OverrideSoftClose and SoftCloseOverrideReason mirror the fields on
 	// CreateJournalRequest — see those field docs for semantics.
@@ -513,6 +779,15 @@ type LedgerEntry struct {
 // never itself a source of truth. Grouped by entity/book/account/period
 // and a canonicalized dimensions key, matching the spec's "by entity,
 // book, account, dimension and period."
+//
+// DebitTotal/CreditTotal/NetBalance are exact decimal strings, never
+// float64 (ZS-DATA-001 D06: binary floating point is prohibited for
+// monetary values — the same rule SumLines's own doc comment already
+// explains for this package). The underlying ledger_balances columns are
+// NUMERIC; these fields used to lose that exactness the moment Go scanned
+// them into a float64, which also meant equality comparisons on NetBalance
+// anywhere downstream were comparing binary floats representing decimal
+// money, exactly the defect class SumLines exists to avoid.
 type LedgerBalance struct {
 	TenantID          string    `json:"tenant_id"`
 	LegalEntityID     string    `json:"legal_entity_id"`
@@ -520,9 +795,9 @@ type LedgerBalance struct {
 	AccountCode       string    `json:"account_code"`
 	FiscalPeriod      string    `json:"fiscal_period"`
 	DimensionsKey     string    `json:"dimensions_key,omitempty"`
-	DebitTotal        float64   `json:"debit_total"`
-	CreditTotal       float64   `json:"credit_total"`
-	NetBalance        float64   `json:"net_balance"`
+	DebitTotal        string    `json:"debit_total"`
+	CreditTotal       string    `json:"credit_total"`
+	NetBalance        string    `json:"net_balance"`
 	WatermarkEntrySeq int64     `json:"watermark_entry_seq"`
 	RebuiltAt         time.Time `json:"rebuilt_at"`
 }
@@ -633,8 +908,8 @@ type CreateJournalRequest struct {
 }
 
 type ReverseJournalRequest struct {
-	Reason                  string `json:"reason"`
-	CorrelationID           string `json:"correlation_id"`
+	Reason        string `json:"reason"`
+	CorrelationID string `json:"correlation_id"`
 
 	// OverrideSoftClose and SoftCloseOverrideReason mirror the fields on
 	// CreateJournalRequest — see those field docs for semantics.
@@ -733,7 +1008,7 @@ var (
 	// closed, same pattern as schema-registry-svc.
 	ErrIdentityMissing = errorString("caller identity missing")
 
-	ErrPeriodLocked            = errorString("accounting period is closed or locked")
+	ErrPeriodLocked              = errorString("accounting period is closed or locked")
 	ErrSoftCloseOverrideRequired = errorString("soft-close override required: elevated finance role and non-empty reason must be provided")
 	ErrPeriodHardClosed          = errorString("accounting period is hard-closed and cannot be posted to")
 	ErrCloseServiceUnavailable   = errorString("financial-close-svc unavailable")
@@ -765,6 +1040,13 @@ var (
 	ErrInvalidAccountType    = errorString("account_type must be one of ASSET, LIABILITY, EQUITY, REVENUE, EXPENSE")
 	ErrParentAccountNotFound = errorString("parent_account_id does not name an existing account")
 	ErrAccountInactive       = errorString("account is INACTIVE and may not be posted to")
+
+	// ACC-01 versioned account master.
+	ErrAccountVersionConflict       = errorString("account version conflict: expected_version does not match the current account version")
+	ErrAccountEffectiveDate         = errorString("effective_from cannot precede the currently effective account version")
+	ErrAccountHierarchyCycle        = errorString("reparent would create a cycle in the account hierarchy")
+	ErrAccountHierarchyBackdated    = errorString("hierarchy change cannot be backdated before the current UTC accounting date")
+	ErrAccountEffectiveDateRequired = errorString("as_of is required and must be an ISO date or RFC3339 timestamp")
 
 	// ErrControlAccountPostingRestricted is invariant #7 enforced: a
 	// control account with direct_posting_restricted=true was named on an

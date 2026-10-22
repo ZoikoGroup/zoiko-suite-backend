@@ -424,7 +424,12 @@ func (h *Handler) ApprovePayment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	policyResult, policyVersionID, err := h.policy.EvaluateApprovalThreshold(r.Context(), principalID, verifiedTenant, a.LegalEntityID, a.NetAmount)
+	policyResult, policyVersionID, err := h.policy.EvaluateApprovalThreshold(r.Context(), policy.Caller{
+		PrincipalID:   principalID,
+		Authorization: r.Header.Get("Authorization"),
+		RequestID:     r.Header.Get("X-Request-Id"),
+		CorrelationID: r.Header.Get("X-Correlation-ID"),
+	}, verifiedTenant, a.LegalEntityID, a.NetAmount)
 	if err != nil {
 		h.log.Error("ApprovePayment: policy evaluation failed", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "policy-svc unavailable")

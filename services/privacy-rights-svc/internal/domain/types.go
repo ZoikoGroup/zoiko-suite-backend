@@ -117,27 +117,62 @@ func (o Outcome) Valid() bool {
 	return false
 }
 
+// RightsClassification is the §18 create-response view of a request's
+// right/jurisdiction classification — the canonical API table lists
+// "classification" as a critical create-response field (the §14.1
+// pipeline's "CLASSIFY RIGHT/JURISDICTION" step). It is derived from
+// RightFamily and Jurisdiction and is not separately persisted.
+type RightsClassification struct {
+	RightFamily  RightFamily `json:"right_family"`
+	Jurisdiction string      `json:"jurisdiction,omitempty"`
+}
+
 // RightsRequest is the case record — PRV-04's own privacy-meaning state,
 // not a workflow/task list.
 type RightsRequest struct {
-	RequestID               string        `json:"request_id"`
-	TenantID                *string       `json:"tenant_id,omitempty"`
-	SubjectRef              string        `json:"subject_ref"`
-	RightFamily             RightFamily   `json:"right_family"`
-	Jurisdiction            string        `json:"jurisdiction,omitempty"`
-	RequesterRef            string        `json:"requester_ref,omitempty"` // proxy/representative, if not the subject themselves
-	SubmittedVia            string        `json:"submitted_via,omitempty"`
-	Status                  RequestStatus `json:"status"`
-	IdentityVerified        bool          `json:"identity_verified"`
-	Outcome                 *Outcome      `json:"outcome,omitempty"`
-	ResponseEvidenceHash    *string       `json:"response_evidence_hash,omitempty"`
-	ResponsePackageVersion  int           `json:"response_package_version,omitempty"` // I21: response package versioning — increments on every approved response; change invalidates prior approval
+	RequestID              string        `json:"request_id"`
+	TenantID               *string       `json:"tenant_id,omitempty"`
+	SubjectRef             string        `json:"subject_ref"`
+	RightFamily            RightFamily   `json:"right_family"`
+	Jurisdiction           string        `json:"jurisdiction,omitempty"`
+	RequesterRef           string        `json:"requester_ref,omitempty"` // proxy/representative, if not the subject themselves
+	SubmittedVia           string        `json:"submitted_via,omitempty"`
+	Status                 RequestStatus `json:"status"`
+	IdentityVerified       bool          `json:"identity_verified"`
+	Outcome                *Outcome      `json:"outcome,omitempty"`
+	ResponseEvidenceHash   *string       `json:"response_evidence_hash,omitempty"`
+	ResponsePackageVersion int           `json:"response_package_version,omitempty"` // I21: response package versioning — increments on every approved response; change invalidates prior approval
 	// WFCProcessRef is optional and caller-supplied — see the package doc
 	// comment on why this service never creates it itself.
 	WFCProcessRef        *string    `json:"wfc_process_ref,omitempty"`
 	CreatedAt            time.Time  `json:"created_at"`
 	CreatedByPrincipalID string     `json:"created_by_principal_id"`
 	ClosedAt             *time.Time `json:"closed_at,omitempty"`
+	// Classification and IdentityState are the §18 canonical response
+	// fields. They are derived from the stored record at response time
+	// (see WithCanonicalResponseFields) and are never persisted.
+	Classification *RightsClassification `json:"classification,omitempty"`
+	IdentityState  string                `json:"identity_state,omitempty"`
+}
+
+// WithCanonicalResponseFields attaches the §18 canonical response fields
+// (classification, identity_state) that are derived from the stored record
+// rather than persisted themselves. identity_state is always recomputed
+// from identity_verified so it stays correct as the case advances. It
+// returns the same receiver for convenient inline use.
+func (r *RightsRequest) WithCanonicalResponseFields() *RightsRequest {
+	if r == nil {
+		return r
+	}
+	if r.Classification == nil {
+		r.Classification = &RightsClassification{RightFamily: r.RightFamily, Jurisdiction: r.Jurisdiction}
+	}
+	if r.IdentityVerified {
+		r.IdentityState = "VERIFIED"
+	} else {
+		r.IdentityState = "UNVERIFIED"
+	}
+	return r
 }
 
 // IdentityVerificationEvent is append-only evidence of one verification
@@ -170,6 +205,23 @@ type DiscoveryManifest struct {
 	EvidenceRef            string    `json:"evidence_ref,omitempty"`
 	SubmittedByPrincipalID string    `json:"submitted_by_principal_id"`
 	CreatedAt              time.Time `json:"created_at"`
+	// Hash is the §18 canonical response field for the manifest's content
+	// hash (the canonical API table names it "hash"). It is derived from
+	// ContentHash at response time and is never persisted.
+	Hash string `json:"hash,omitempty"`
+}
+
+// WithCanonicalResponseFields attaches the §18 canonical "hash" response
+// field, derived from the stored ContentHash. It is safe to call more than
+// once and returns the same receiver for convenient inline use.
+func (m *DiscoveryManifest) WithCanonicalResponseFields() *DiscoveryManifest {
+	if m == nil {
+		return m
+	}
+	if m.Hash == "" {
+		m.Hash = m.ContentHash
+	}
+	return m
 }
 
 // ── Request DTOs ─────────────────────────────────────────────────────────────
@@ -218,32 +270,33 @@ var (
 	ErrIdentityNotVerified  = errorString("identity has not been verified for this request")
 	ErrNoDiscoveryManifest  = errorString("no discovery manifest has been recorded for this request")
 	ErrStoreUnavailable     = errorString("privacy-rights store unavailable")
+	ErrInvalidManifestHash  = errorString("content_hash must be a SHA-256 digest: 64 hexadecimal characters, optionally prefixed with \"sha256:\"")
 	ErrIdempotencyConflict  = errorString("PRV-020: IMMUTABLE_EVIDENCE_CONFLICT: idempotency key already used with different payload")
 )
 
 // ── §32 Stable Error and Reason Codes ────────────────────────────────────────
 
 const (
-	PRV001PurposeNotRegistered            = "PRV-001: PURPOSE_NOT_REGISTERED"
-	PRV002ProcessingActivityInactive      = "PRV-002: PROCESSING_ACTIVITY_INACTIVE"
-	PRV003PrivacyRoleUnresolved           = "PRV-003: PRIVACY_ROLE_UNRESOLVED"
-	PRV004JurisdictionUnresolved          = "PRV-004: JURISDICTION_UNRESOLVED"
-	PRV005PolicyUnavailable               = "PRV-005: POLICY_UNAVAILABLE"
-	PRV006ConsentRequiredMissing          = "PRV-006: CONSENT_REQUIRED_MISSING"
-	PRV007ConsentWithdrawn                = "PRV-007: CONSENT_WITHDRAWN"
-	PRV008NoticeVersionInvalid            = "PRV-008: NOTICE_VERSION_INVALID"
-	PRV009PurposeIncompatible             = "PRV-009: PURPOSE_INCOMPATIBLE"
-	PRV010DataCategoryRestricted          = "PRV-010: DATA_CATEGORY_RESTRICTED"
-	PRV011MinimizationRequired            = "PRV-011: MINIMIZATION_REQUIRED"
-	PRV012IdentityAssuranceInsufficient   = "PRV-012: IDENTITY_ASSURANCE_INSUFFICIENT"
-	PRV013ThirdPartyReviewRequired        = "PRV-013: THIRD_PARTY_REVIEW_REQUIRED"
-	PRV014RetentionOrHoldBlock            = "PRV-014: RETENTION_OR_HOLD_BLOCK"
-	PRV015TransferNotAuthorized           = "PRV-015: TRANSFER_NOT_AUTHORIZED"
-	PRV016AssessmentRequired              = "PRV-016: ASSESSMENT_REQUIRED"
-	PRV017ProcessorInstructionMissing     = "PRV-017: PROCESSOR_INSTRUCTION_MISSING"
-	PRV018SubprocessorNotApproved         = "PRV-018: SUBPROCESSOR_NOT_APPROVED"
-	PRV019PrivacyContextIndeterminate     = "PRV-019: PRIVACY_CONTEXT_INDETERMINATE"
-	PRV020ImmutableEvidenceConflict       = "PRV-020: IMMUTABLE_EVIDENCE_CONFLICT"
+	PRV001PurposeNotRegistered          = "PRV-001: PURPOSE_NOT_REGISTERED"
+	PRV002ProcessingActivityInactive    = "PRV-002: PROCESSING_ACTIVITY_INACTIVE"
+	PRV003PrivacyRoleUnresolved         = "PRV-003: PRIVACY_ROLE_UNRESOLVED"
+	PRV004JurisdictionUnresolved        = "PRV-004: JURISDICTION_UNRESOLVED"
+	PRV005PolicyUnavailable             = "PRV-005: POLICY_UNAVAILABLE"
+	PRV006ConsentRequiredMissing        = "PRV-006: CONSENT_REQUIRED_MISSING"
+	PRV007ConsentWithdrawn              = "PRV-007: CONSENT_WITHDRAWN"
+	PRV008NoticeVersionInvalid          = "PRV-008: NOTICE_VERSION_INVALID"
+	PRV009PurposeIncompatible           = "PRV-009: PURPOSE_INCOMPATIBLE"
+	PRV010DataCategoryRestricted        = "PRV-010: DATA_CATEGORY_RESTRICTED"
+	PRV011MinimizationRequired          = "PRV-011: MINIMIZATION_REQUIRED"
+	PRV012IdentityAssuranceInsufficient = "PRV-012: IDENTITY_ASSURANCE_INSUFFICIENT"
+	PRV013ThirdPartyReviewRequired      = "PRV-013: THIRD_PARTY_REVIEW_REQUIRED"
+	PRV014RetentionOrHoldBlock          = "PRV-014: RETENTION_OR_HOLD_BLOCK"
+	PRV015TransferNotAuthorized         = "PRV-015: TRANSFER_NOT_AUTHORIZED"
+	PRV016AssessmentRequired            = "PRV-016: ASSESSMENT_REQUIRED"
+	PRV017ProcessorInstructionMissing   = "PRV-017: PROCESSOR_INSTRUCTION_MISSING"
+	PRV018SubprocessorNotApproved       = "PRV-018: SUBPROCESSOR_NOT_APPROVED"
+	PRV019PrivacyContextIndeterminate   = "PRV-019: PRIVACY_CONTEXT_INDETERMINATE"
+	PRV020ImmutableEvidenceConflict     = "PRV-020: IMMUTABLE_EVIDENCE_CONFLICT"
 )
 
 // ── Idempotency (§18.1) ──────────────────────────────────────────────────────
@@ -252,9 +305,33 @@ const (
 type IdempotencyRecord struct {
 	Key          string    `json:"idempotency_key"`
 	TenantID     string    `json:"tenant_id"`
+	PrincipalID  string    `json:"principal_id"`
 	Endpoint     string    `json:"endpoint"`
 	RequestHash  string    `json:"request_hash"`
 	ResponseCode int       `json:"response_code"`
 	ResponseBody []byte    `json:"response_body"`
 	CreatedAt    time.Time `json:"created_at"`
 }
+
+// ── Stable error_code values ─────────────────────────────────────────────────
+//
+// Every error body is {"error": <message>, "error_code": <code>}. §32 codes
+// keep their §32 meaning (the message keeps the long "PRV-nnn: NAME" form);
+// the rest are local symbolic codes for conditions §32 has no code for.
+const (
+	ErrCodeIdentityInsufficient = "PRV-012"
+	ErrCodeThirdPartyReview     = "PRV-013"
+	ErrCodeImmutableEvidence    = "PRV-020"
+
+	ErrCodeAuthenticationFailed = "AUTHENTICATION_FAILED"
+	ErrCodeAuthorizationDenied  = "AUTHORIZATION_DENIED"
+	ErrCodeAuthzUnavailable     = "AUTHORIZATION_SERVICE_UNAVAILABLE"
+	ErrCodeTenantScopeRequired  = "TENANT_SCOPE_REQUIRED"
+	ErrCodeTenantScopeMismatch  = "TENANT_SCOPE_MISMATCH"
+	ErrCodeCorrelationRequired  = "CORRELATION_ID_REQUIRED"
+	ErrCodeIdempotencyRequired  = "IDEMPOTENCY_KEY_REQUIRED"
+	ErrCodeValidationFailed     = "VALIDATION_FAILED"
+	ErrCodeNotFound             = "NOT_FOUND"
+	ErrCodeStoreUnavailable     = "STORE_UNAVAILABLE"
+	ErrCodeInternal             = "INTERNAL_ERROR"
+)

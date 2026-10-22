@@ -25,8 +25,10 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+	idenv "zoiko.io/identity-envelope"
 
 	"zoiko.io/notification-svc/internal/domain"
+	svcenvelope "zoiko.io/notification-svc/internal/envelope"
 	svcmiddleware "zoiko.io/notification-svc/internal/middleware"
 )
 
@@ -130,6 +132,11 @@ func (c *Client) Decide(ctx context.Context, r Request) (*Decision, error) {
 	if r.CorrelationID != "" {
 		req.Header.Set("X-Correlation-ID", r.CorrelationID)
 	}
+
+	svcenvelope.ForwardTo(ctx, req)
+	// The verified identity envelope too, so the next hop can check who
+	// is asking instead of trusting X-Principal-Id (X-R3).
+	idenv.Forward(ctx, req)
 
 	resp, err := c.http.Do(req)
 	if err != nil {

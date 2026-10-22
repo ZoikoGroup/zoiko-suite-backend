@@ -28,12 +28,12 @@ type denyOneAuthz struct {
 	checked []string
 }
 
-func (a *denyOneAuthz) CheckApprovalAllowed(_ context.Context, principalID, _, _ string) error {
+func (a *denyOneAuthz) CheckApprovalAllowed(_ context.Context, principalID, _, _ string, _ map[string]string) (domain.ActionAuthority, error) {
 	a.checked = append(a.checked, principalID)
 	if principalID == a.denied {
-		return domain.ErrAuthorizationDenied
+		return domain.ActionAuthority{}, domain.ErrAuthorizationDenied
 	}
-	return nil
+	return domain.ActionAuthority{AccessDecisionID: "ad-1"}, nil
 }
 
 func createWith(t *testing.T, stages string, az *denyOneAuthz) *httptest.ResponseRecorder {
@@ -49,7 +49,7 @@ func createWith(t *testing.T, stages string, az *denyOneAuthz) *httptest.Respons
 	r.Use(svcmiddleware.TenantContext())
 	handler.RegisterRoutes(r, handler.New(store, &stubPublisher{}, az, &stubDocuments{}, zap.NewNop()))
 
-	body := `{"tenant_id":"t-1","legal_entity_id":"le-1","workflow_type":"PURCHASE_APPROVAL","stages":` + stages + `}`
+	body := `{"tenant_id":"11111111-1111-4111-8111-111111111111","legal_entity_id":"22222222-2222-4222-8222-222222222222","workflow_type":"PURCHASE_APPROVAL","stages":` + stages + `}`
 	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows", bytes.NewBufferString(body)), "requester-1")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)

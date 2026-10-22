@@ -56,6 +56,9 @@ func scPost(r chi.Router, caller, path, body string) *httptest.ResponseRecorder 
 	req := httptest.NewRequest(http.MethodPost, path, bytes.NewBufferString(body))
 	req.Header.Set("X-Tenant-Id", scTenant)
 	req.Header.Set("X-Principal-Id", caller)
+	// A verified envelope with a recent TOTP step-up, as identity.Gate
+	// attaches it; the refusals without one are session_step_up_test.go.
+	req = withStepUp(req, caller)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	return w

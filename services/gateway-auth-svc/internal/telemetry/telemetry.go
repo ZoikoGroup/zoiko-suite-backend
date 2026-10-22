@@ -171,6 +171,7 @@ func NewMetrics(serviceName string) *Metrics {
 		OutcomeAllowed, OutcomeNoToken, OutcomeInvalidToken, OutcomeIncompleteClaims,
 		OutcomeTenantHostnameMismatch, OutcomeCartaBlocked,
 		OutcomeTenantContextDenied, OutcomeTenantContextUnresolved,
+		OutcomeSessionRevoked, OutcomeSessionStatusUnavailable, OutcomeStepUpRequired, OutcomeCartaUnavailable,
 		OutcomeRateLimited, OutcomeOverloaded, OutcomeRequestTooLarge, OutcomeRequestEncodingRefused,
 		OutcomeMalformedRequest, OutcomeVersionUnsupported,
 	} {
@@ -206,7 +207,7 @@ const (
 	OutcomeIncompleteClaims = "incomplete_claims"
 	// OutcomeTenantHostnameMismatch — a validly-signed token presented against
 	// a different tenant's hostname. The one outcome here that is evidence of
-	// an attack rather than of a misconfiguration.
+	// an attack rather than a misconfiguration.
 	OutcomeTenantHostnameMismatch = "tenant_hostname_mismatch"
 	// OutcomeCartaBlocked — continuous risk assessment returned ISOLATE or DENY.
 	OutcomeCartaBlocked = "carta_blocked"
@@ -216,6 +217,18 @@ const (
 	// OutcomeTenantContextUnresolved — the registry could not be reached, so no
 	// decision exists. Fail-closed, and an outage rather than a refusal.
 	OutcomeTenantContextUnresolved = "tenant_context_unresolved"
+	// OutcomeSessionRevoked — the envelope verified but its session has ended
+	// at identity-context-svc (logout, invalidation, suspension). AU-01.
+	OutcomeSessionRevoked = "session_revoked"
+	// OutcomeSessionStatusUnavailable — identity-context-svc could not say
+	// whether the session stands; fail-closed.
+	OutcomeSessionStatusUnavailable = "session_status_unavailable"
+	// OutcomeStepUpRequired — continuous risk assessment asked for a fresh
+	// second factor (STEP_UP_MFA); the caller steps up and retries. AU-23.
+	OutcomeStepUpRequired = "step_up_required"
+	// OutcomeCartaUnavailable — carta-svc is configured but gave no assessment
+	// for a material write, which fails closed (reads proceed unscored). AU-23.
+	OutcomeCartaUnavailable = "carta_unavailable"
 	// OutcomeRateLimited — a client or tenant quota was exhausted (INT-RATE-007).
 	OutcomeRateLimited = "rate_limited"
 	// OutcomeOverloaded — the gateway shed the request above its concurrency

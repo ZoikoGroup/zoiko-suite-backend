@@ -14,12 +14,12 @@ import (
 
 // Worker polls the outbox table and publishes events to Kafka.
 type Worker struct {
-	pool        *pgxpool.Pool
-	kafkaWriter *kafka.Writer
-	log         *zap.Logger
+	pool         *pgxpool.Pool
+	kafkaWriter  *kafka.Writer
+	log          *zap.Logger
 	pollInterval time.Duration
-	batchSize   int
-	stopCh      chan struct{}
+	batchSize    int
+	stopCh       chan struct{}
 }
 
 // NewWorker creates a new outbox worker.
@@ -96,11 +96,21 @@ func (w *Worker) processBatch(ctx context.Context) {
 			EmittedAt:     row.CreatedAt,
 			SchemaVersion: "1.0",
 			SourceService: "evidence-requirements-svc",
-			TenantID:      payload["tenant_id"].(string),
-			LegalEntityID: payload["legal_entity_id"].(string),
-			ActorID:       payload["evaluated_for_principal_id"].(string),
-			CorrelationID: payload["correlation_id"].(string),
-			Payload:       row.Payload,
+			TenantID:      stringField(payload, "tenant_id"),
+			LegalEntityID: stringField(payload, "legal_entity_id"),
+			ActorID:       stringField(payload, "evaluated_for_principal_id"),
+			CorrelationID: stringField(payload, "correlation_id"),
+
+			CausationID:         stringField(payload, "causation_id"),
+			JurisdictionContext: stringField(payload, "jurisdiction_context"),
+			AggregateType:       row.AggregateType,
+			AggregateID:         row.AggregateID,
+			Payload:             row.Payload,
+		}
+		if ids, ok := payload["requirement_ids"]; ok {
+			if refs, err := json.Marshal(map[string]any{"requirement_ids": ids}); err == nil {
+				env.GoverningRefs = refs
+			}
 		}
 		envBytes, err := json.Marshal(env)
 		if err != nil {
@@ -112,8 +122,9 @@ func (w *Worker) processBatch(ctx context.Context) {
 		}
 
 		// Publish to Kafka
+		// Partition key hash(tenant, aggregate) (Event Catalogue §5.3).
 		msg := kafka.Message{
-			Key:   []byte(row.AggregateID),
+			Key:   []byte(env.TenantID + "/" + row.AggregateID),
 			Value: envBytes,
 		}
 		if err := w.kafkaWriter.WriteMessages(ctx, msg); err != nil {
@@ -151,8 +162,23 @@ type outboxRow struct {
 	CreatedAt     time.Time
 }
 
+// stringField reads an optional envelope field without panicking. A payload
+// missing actor/correlation data must still be publishable (or explicitly
+// failed), not crash the whole service from a background goroutine.
+func stringField(m map[string]any, key string) string {
+	if v, ok := m[key].(string); ok {
+		return v
+	}
+	return ""
+}
+
 func (w *Worker) claimEvents(ctx context.Context) ([]outboxRow, error) {
-	rows, err := w.pool.Query(ctx, `SELECT * FROM claim_outbox_events($1)`, w.batchSize)
+	// Explicit columns: the function returns the whole outbox row (ten
+	// columns), while this scan only consumes six. SELECT * therefore made
+	// every claim fail with a field-count mismatch and no event was ever
+	// published.
+	rows, err := w.pool.Query(ctx, `SELECT outbox_id, aggregate_type, aggregate_id, event_type, payload, created_at
+		FROM claim_outbox_events($1)`, w.batchSize)
 	if err != nil {
 		return nil, err
 	}
@@ -181,15 +207,23 @@ func (w *Worker) markFailed(ctx context.Context, ids []string, errMsg string) er
 
 // EventEnvelope is the domain event envelope (copied from events/publisher.go)
 type EventEnvelope struct {
-	EventID       string          `json:"event_id"`
-	EventType     string          `json:"event_type"`
-	EventVersion  string          `json:"event_version"`
-	EmittedAt     time.Time       `json:"emitted_at"`
-	SchemaVersion string          `json:"schema_version"`
-	SourceService string          `json:"source_service"`
-	TenantID      string          `json:"tenant_id,omitempty"`
-	LegalEntityID string          `json:"legal_entity_id,omitempty"`
-	ActorID       string          `json:"actor_id,omitempty"`
-	CorrelationID string          `json:"correlation_id"`
-	Payload       json.RawMessage `json:"payload"`
+	EventID       string    `json:"event_id"`
+	EventType     string    `json:"event_type"`
+	EventVersion  string    `json:"event_version"`
+	EmittedAt     time.Time `json:"emitted_at"`
+	SchemaVersion string    `json:"schema_version"`
+	SourceService string    `json:"source_service"`
+	TenantID      string    `json:"tenant_id,omitempty"`
+	LegalEntityID string    `json:"legal_entity_id,omitempty"`
+	ActorID       string    `json:"actor_id,omitempty"`
+	CorrelationID string    `json:"correlation_id"`
+	// GCP §16 / Doc 03 §19 event minimum: what caused this, under which
+	// jurisdiction, and the governing references (the requirement set the
+	// determination was tested against).
+	CausationID         string          `json:"causation_id,omitempty"`
+	JurisdictionContext string          `json:"jurisdiction_context,omitempty"`
+	AggregateType       string          `json:"aggregate_type,omitempty"`
+	AggregateID         string          `json:"aggregate_id,omitempty"`
+	GoverningRefs       json.RawMessage `json:"governing_refs,omitempty"`
+	Payload             json.RawMessage `json:"payload"`
 }

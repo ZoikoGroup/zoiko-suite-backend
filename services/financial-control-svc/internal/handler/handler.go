@@ -51,14 +51,16 @@ type Store interface {
 	GetLatestEvidence(ctx context.Context, tenantID, runID string) (*domain.EvidencePackage, error)
 
 	// Wave 5.
-	CertifyRun(ctx context.Context, tenantID, runID, actor, correlationID string, expectedVersion int, req domain.CertifyRequest) (*domain.ControlRun, error)
+	CertifyRun(ctx context.Context, tenantID, runID, actor, correlationID, idempotencyKey string, expectedVersion int, req domain.CertifyRequest, authority *domain.AuthoritySnapshot) (*domain.ControlRun, bool, error)
+	GetCertification(ctx context.Context, tenantID, runID string) (*domain.ControlCertification, error)
+	RevokeCertification(ctx context.Context, tenantID, runID, actor, correlationID, idempotencyKey string, expectedVersion int, req domain.RevokeCertificationRequest) (*domain.ControlRun, bool, error)
 	CloseGate(ctx context.Context, tenantID, legalEntityID, periodID string) (*domain.CloseGate, error)
 	ExceptionSummary(ctx context.Context, tenantID, legalEntityID, periodID string) (*domain.ExceptionSummary, error)
 
 	// Wave 7.
-	ResolveException(ctx context.Context, tenantID, exceptionID, actor, correlationID string, expectedVersion int, req domain.ResolveExceptionRequest) (*domain.ControlException, error)
+	ResolveException(ctx context.Context, tenantID, exceptionID, actor, correlationID, idempotencyKey string, expectedVersion int, req domain.ResolveExceptionRequest) (*domain.ControlException, bool, error)
 	ListExceptionTransitions(ctx context.Context, tenantID, exceptionID string) ([]domain.ExceptionTransition, error)
-	SubmitForCertification(ctx context.Context, tenantID, runID, actor, correlationID string, expectedVersion int, reason string) (*domain.ControlRun, error)
+	SubmitForCertification(ctx context.Context, tenantID, runID, actor, correlationID, idempotencyKey string, expectedVersion int, reason string) (*domain.ControlRun, bool, error)
 
 	// Wave 7/8.
 	Monitoring(ctx context.Context, tenantID, legalEntityID, periodID string, now time.Time) (*domain.MonitoringSnapshot, error)
@@ -72,6 +74,9 @@ type Executor interface {
 // AuthZClient is the authorization contract (fail-closed).
 type AuthZClient interface {
 	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
+	// Decide is the live, uncached check whose decision is recorded as the
+	// certification authority (Invariant 9); see internal/authz.
+	Decide(ctx context.Context, principalID, legalEntityID, actionType string) (*domain.AuthoritySnapshot, error)
 }
 
 // Action types checked against authorization-svc.
@@ -127,6 +132,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 			r.Get("/{run_id}/exceptions", h.ListExceptions)
 			r.Get("/{run_id}/evidence", h.GetEvidence)
 			r.Post("/{run_id}/certification", h.CertifyRun)
+			r.Post("/{run_id}/revoke-certification", h.RevokeCertification)
 			r.Post("/{run_id}/submit-for-certification", h.SubmitForCertification)
 			r.Get("/{run_id}/evidence-export", h.ExportRunEvidence)
 		})
@@ -510,6 +516,49 @@ func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principal, e
 	return false
 }
 
+// requireIdempotencyKey reads the mandatory Idempotency-Key of a command that
+// ZS-CONTROL-001 makes idempotent ("Mandatory for run creation, execution,
+// reperformance and certification commands"), answering 400 itself when it is
+// missing or too long for command_idempotency.
+func requireIdempotencyKey(w http.ResponseWriter, r *http.Request, what string) (string, bool) {
+	key := r.Header.Get("Idempotency-Key")
+	if key == "" {
+		writeError(w, http.StatusBadRequest, "missing_idempotency_key", "Idempotency-Key header is required to "+what)
+		return "", false
+	}
+	if len(key) > 255 {
+		writeError(w, http.StatusBadRequest, "invalid_idempotency_key", "Idempotency-Key must be at most 255 characters")
+		return "", false
+	}
+	return key, true
+}
+
+// writeCommandResult answers a replayable command: the target as it now stands,
+// its ETag, and Idempotent-Replay: true when this was a repeat of a completed key.
+func writeCommandResult(w http.ResponseWriter, version int, replay bool, v any) {
+	if replay {
+		w.Header().Set("Idempotent-Replay", "true")
+	}
+	setETag(w, version)
+	writeJSON(w, http.StatusOK, v)
+}
+
+// authorizeWithAuthority is authorize for a command that must record the authority it
+// acted under: it asks authorization-svc live and returns the decision.
+func (h *Handler) authorizeWithAuthority(w http.ResponseWriter, r *http.Request, principal, entity, action string) (*domain.AuthoritySnapshot, bool) {
+	a, err := h.authz.Decide(r.Context(), principal, entity, action)
+	switch {
+	case err == nil:
+		return a, true
+	case errors.Is(err, domain.ErrAuthorizationDenied):
+		writeError(w, http.StatusForbidden, "forbidden", err.Error())
+	default:
+		h.log.Error("authorization unavailable — failing closed", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "authorization_unavailable", "")
+	}
+	return nil, false
+}
+
 func (h *Handler) writeErr(w http.ResponseWriter, op string, err error) {
 	switch {
 	case errors.Is(err, domain.ErrNotFound):
@@ -518,7 +567,7 @@ func (h *Handler) writeErr(w http.ResponseWriter, op string, err error) {
 		writeError(w, http.StatusForbidden, "not_exception_owner", err.Error())
 	case errors.Is(err, domain.ErrNotIndependent):
 		writeError(w, http.StatusForbidden, "segregation_of_duties", err.Error())
-	case errors.Is(err, domain.ErrSegregation):
+	case errors.Is(err, domain.ErrSegregation), errors.Is(err, domain.ErrRevokerIsCertifier):
 		writeError(w, http.StatusForbidden, "segregation_of_duties", err.Error())
 	case errors.Is(err, domain.ErrSelfApproval):
 		writeError(w, http.StatusForbidden, "self_approval", err.Error())

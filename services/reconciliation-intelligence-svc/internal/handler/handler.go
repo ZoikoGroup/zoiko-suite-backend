@@ -9,9 +9,9 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"go.uber.org/zap"
 	"zoiko.io/reconciliation-intelligence-svc/internal/authz"
+	"zoiko.io/reconciliation-intelligence-svc/internal/bankrec"
 	"zoiko.io/reconciliation-intelligence-svc/internal/domain"
 	svcenvelope "zoiko.io/reconciliation-intelligence-svc/internal/envelope"
-	"zoiko.io/reconciliation-intelligence-svc/internal/events"
 	"zoiko.io/reconciliation-intelligence-svc/internal/financialcontrol"
 	"zoiko.io/reconciliation-intelligence-svc/internal/health"
 	customMiddleware "zoiko.io/reconciliation-intelligence-svc/internal/middleware"
@@ -19,25 +19,30 @@ import (
 )
 
 const (
+	RECONCILIATION_READ             = "RECONCILIATION_READ"
 	RECONCILIATION_ANALYZE          = "RECONCILIATION_ANALYZE"
 	RECONCILIATION_APPLY_RESOLUTION = "RECONCILIATION_APPLY_RESOLUTION"
 	RECONCILIATION_ARCHIVE          = "RECONCILIATION_ARCHIVE"
 )
 
+// maxBodyBytes bounds a request body. Every route here takes a small,
+// fixed-shape document.
+const maxBodyBytes = 64 << 10
+
 type Handler struct {
 	store            store.Store
-	publisher        *events.Publisher
 	authz            *authz.Client
 	financialControl *financialcontrol.Client
+	bankRec          *bankrec.Client
 	logger           *zap.Logger
 }
 
-func NewHandler(s store.Store, p *events.Publisher, a *authz.Client, fc *financialcontrol.Client, l *zap.Logger) *Handler {
+func NewHandler(s store.Store, a *authz.Client, fc *financialcontrol.Client, br *bankrec.Client, l *zap.Logger) *Handler {
 	return &Handler{
 		store:            s,
-		publisher:        p,
 		authz:            a,
 		financialControl: fc,
+		bankRec:          br,
 		logger:           l,
 	}
 }
@@ -79,12 +84,22 @@ func NewRouter(h *Handler) http.Handler {
 	return r
 }
 
+// AnalyzeReconciliation produces advisory suggestions for the UNMATCHED
+// statement lines of one bank-reconciliation run. The lines are read from
+// bank-reconciliation-svc by run id; the caller names the run, it does not
+// supply transactions. Nothing is written back to bank-reconciliation-svc.
 func (h *Handler) AnalyzeReconciliation(w http.ResponseWriter, r *http.Request) {
 	tenantID := customMiddleware.GetTenantID(r.Context())
 
+	// Unknown fields are refused: a caller still sending the old
+	// transactions_a / transactions_b body must be told those are no longer
+	// read, not have them silently dropped.
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
 	var req domain.AnalyzeReconciliationRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondError(w, http.StatusBadRequest, "invalid request body")
+	if err := dec.Decode(&req); err != nil {
+		h.respondError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 		return
 	}
 
@@ -97,22 +112,38 @@ func (h *Handler) AnalyzeReconciliation(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, RECONCILIATION_ANALYZE); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), tenantID, principalID, req.LegalEntityID, RECONCILIATION_ANALYZE); err != nil {
 		h.writeAuthzErr(w, err)
 		return
 	}
 
-	// ZS-SVC-Z-001 INV-09: tolerance must be explicit and versioned.
-	// Both governed tolerances are fetched from financial-control-svc
-	// before any recommendation is produced — an unreachable service or
-	// a legal entity with no policy configured yet refuses the whole
-	// analyze call rather than falling back to a guessed default.
-	amountMismatchTolerance, err := h.financialControl.GetActiveAbsoluteTolerance(
-		r.Context(), tenantID, principalID, req.LegalEntityID, domain.MetricAmountMismatchWriteOffTolerance)
+	scope := bankrec.Scope{TenantID: tenantID, PrincipalID: principalID, LegalEntityID: req.LegalEntityID}
+	run, err := h.bankRec.GetRun(r.Context(), scope, req.BankReconciliationRunID)
 	if err != nil {
-		h.writeToleranceErr(w, err, domain.MetricAmountMismatchWriteOffTolerance)
+		h.writeBankRecErr(w, err)
 		return
 	}
+	// The caller was authorized against req.LegalEntityID; the run must be
+	// that entity's, or the authorization and the data would be about
+	// different entities.
+	if run.LegalEntityID != req.LegalEntityID {
+		h.respondError(w, http.StatusForbidden, "bank reconciliation run does not belong to legal_entity_id")
+		return
+	}
+	if run.Superseded() {
+		msg := "bank reconciliation run is superseded"
+		if run.SupersededByRunID != nil {
+			msg += " by run " + *run.SupersededByRunID
+		}
+		h.respondError(w, http.StatusConflict, msg)
+		return
+	}
+
+	// ZS-SVC-Z-001 INV-09: tolerance must be explicit and versioned. The
+	// governed tolerance is fetched from financial-control-svc before any
+	// recommendation is produced — an unreachable service or a legal entity
+	// with no policy configured yet refuses the whole analyze call rather
+	// than falling back to a guessed default.
 	missingReferenceTolerance, err := h.financialControl.GetActiveAbsoluteTolerance(
 		r.Context(), tenantID, principalID, req.LegalEntityID, domain.MetricMissingReferenceTolerance)
 	if err != nil {
@@ -120,53 +151,59 @@ func (h *Handler) AnalyzeReconciliation(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	matched, unmatched, rate, items := domain.PerformIntelligentReconciliation(&req, "", tenantID, amountMismatchTolerance, missingReferenceTolerance)
-
-	job := &domain.ReconciliationJob{
-		LegalEntityID:       req.LegalEntityID,
-		JobName:             req.JobName,
-		SourceSystemA:       req.SourceSystemA,
-		SourceSystemB:       req.SourceSystemB,
-		TotalProcessedCount: len(req.TransactionsA),
-		MatchedCount:        matched,
-		UnmatchedCount:      unmatched,
-		ReconciliationRate:  rate,
-		Status:              "COMPLETED",
+	lines, err := h.bankRec.ListUnmatchedLines(r.Context(), scope, run)
+	if err != nil {
+		h.writeBankRecErr(w, err)
+		return
 	}
 
-	if err := h.store.CreateJob(r.Context(), tenantID, job, items); err != nil {
+	items, err := domain.AnalyzeUnmatchedStatementLines(lines, run.RunID, tenantID, missingReferenceTolerance)
+	if err != nil {
+		h.logger.Error("analysis of bank reconciliation lines failed", zap.String("run_id", run.RunID), zap.Error(err))
+		h.respondError(w, http.StatusBadGateway, "bank-reconciliation-svc returned lines that could not be analyzed")
+		return
+	}
+
+	job := &domain.ReconciliationJob{
+		LegalEntityID:           req.LegalEntityID,
+		JobName:                 req.JobName,
+		BankReconciliationRunID: run.RunID,
+		SourceSystemA:           domain.SourceBankStatement,
+		TotalProcessedCount:     len(lines),
+		UnmatchedCount:          len(items),
+		Status:                  "COMPLETED",
+	}
+
+	if err := h.store.CreateJob(r.Context(), tenantID, job, items, principalID, r.Header.Get("X-Correlation-ID")); err != nil {
 		h.logger.Error("failed to save reconciliation job", zap.Error(err))
 		h.respondError(w, http.StatusInternalServerError, "failed to run reconciliation analysis")
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "reconciliation.analyzed", SubjectID: job.ID, TenantID: tenantID,
-		LegalEntityID: job.LegalEntityID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: job,
-	})
-
-	if unmatched > 0 {
-		_ = h.publisher.Publish(r.Context(), events.PublishParams{
-			EventType: "reconciliation.unmatched_flagged", SubjectID: job.ID, TenantID: tenantID,
-			LegalEntityID: job.LegalEntityID, ActorID: principalID,
-			CorrelationID: r.Header.Get("X-Correlation-ID"),
-			Payload: map[string]interface{}{
-				"job_id":          job.ID,
-				"unmatched_count": unmatched,
-				"rate":            rate,
-			},
-		})
-	}
-
 	h.respondJSON(w, http.StatusCreated, job)
 }
 
+// ListJobs lists one legal entity's jobs. legal_entity_id is required: a
+// read is authorized per entity, and "every entity in the tenant" is not
+// something a single authorization decision can grant.
 func (h *Handler) ListJobs(w http.ResponseWriter, r *http.Request) {
 	tenantID := customMiddleware.GetTenantID(r.Context())
 	legalEntityID := r.URL.Query().Get("legal_entity_id")
 	sourceA := r.URL.Query().Get("source_system_a")
 	status := r.URL.Query().Get("status")
+
+	if legalEntityID == "" {
+		h.respondError(w, http.StatusBadRequest, "legal_entity_id is required")
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), tenantID, principalID, legalEntityID, RECONCILIATION_READ); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
 
 	jobs, err := h.store.ListJobs(r.Context(), tenantID, legalEntityID, sourceA, status)
 	if err != nil {
@@ -185,13 +222,25 @@ func (h *Handler) ListJobs(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// GetJobByID is authorized against the job's own legal entity, in the same
+// order the write routes use: load (tenant-scoped by RLS), then check.
 func (h *Handler) GetJobByID(w http.ResponseWriter, r *http.Request) {
 	tenantID := customMiddleware.GetTenantID(r.Context())
 	id := chi.URLParam(r, "id")
 
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+
 	job, err := h.store.GetJobByID(r.Context(), tenantID, id)
 	if err != nil {
 		h.respondError(w, http.StatusNotFound, "reconciliation job not found")
+		return
+	}
+
+	if err := h.authz.CheckAllowed(r.Context(), tenantID, principalID, job.LegalEntityID, RECONCILIATION_READ); err != nil {
+		h.writeAuthzErr(w, err)
 		return
 	}
 
@@ -209,8 +258,12 @@ func (h *Handler) ApplyResolution(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.ResolutionStatus == "" {
-		req.ResolutionStatus = domain.StatusApproved
+	if req.SuggestionStatus == "" {
+		req.SuggestionStatus = domain.StatusApproved
+	}
+	if err := domain.ValidateResolutionTarget(req.SuggestionStatus); err != nil {
+		h.respondError(w, http.StatusBadRequest, err.Error())
+		return
 	}
 
 	job, err := h.store.GetJobByID(r.Context(), tenantID, jobID)
@@ -223,22 +276,21 @@ func (h *Handler) ApplyResolution(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), principalID, job.LegalEntityID, RECONCILIATION_APPLY_RESOLUTION); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), tenantID, principalID, job.LegalEntityID, RECONCILIATION_APPLY_RESOLUTION); err != nil {
 		h.writeAuthzErr(w, err)
 		return
 	}
 
-	item, err := h.store.ApplyResolution(r.Context(), tenantID, jobID, itemID, req.ResolutionStatus, req.ResolutionNotes)
+	item, err := h.store.ApplyResolution(r.Context(), tenantID, jobID, itemID, req.SuggestionStatus, req.ResolutionNotes,
+		job.LegalEntityID, principalID, r.Header.Get("X-Correlation-ID"))
+	if errors.Is(err, domain.ErrResolutionTransition) {
+		h.respondError(w, http.StatusConflict, err.Error())
+		return
+	}
 	if err != nil {
 		h.respondError(w, http.StatusNotFound, err.Error())
 		return
 	}
-
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "reconciliation.resolution_recommended", SubjectID: itemID, TenantID: tenantID,
-		LegalEntityID: job.LegalEntityID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: item,
-	})
 
 	h.respondJSON(w, http.StatusOK, item)
 }
@@ -257,7 +309,7 @@ func (h *Handler) ArchiveJob(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), principalID, job.LegalEntityID, RECONCILIATION_ARCHIVE); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), tenantID, principalID, job.LegalEntityID, RECONCILIATION_ARCHIVE); err != nil {
 		h.writeAuthzErr(w, err)
 		return
 	}
@@ -305,6 +357,26 @@ func (h *Handler) writeAuthzErr(w http.ResponseWriter, err error) {
 	}
 	h.logger.Error("authorization check failed", zap.Error(err))
 	h.respondError(w, http.StatusServiceUnavailable, "authorization service unavailable")
+}
+
+// writeBankRecErr maps a bank-reconciliation-svc read failure. Every case
+// refuses the analysis — no suggestion is ever produced from a population
+// that could not be read completely and exactly.
+func (h *Handler) writeBankRecErr(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, bankrec.ErrRunNotFound):
+		h.respondError(w, http.StatusNotFound, "bank reconciliation run not found")
+	case errors.Is(err, bankrec.ErrPopulationTooLarge):
+		h.respondError(w, http.StatusUnprocessableEntity, err.Error())
+	case errors.Is(err, bankrec.ErrServiceUnavailable):
+		h.logger.Error("bank-reconciliation-svc read failed", zap.Error(err))
+		h.respondError(w, http.StatusServiceUnavailable, "bank-reconciliation-svc unavailable")
+	default:
+		// ErrRequestRefused, ErrInconsistent, ErrScopeMissing: the upstream
+		// answered, but not with something this service can stand behind.
+		h.logger.Error("bank-reconciliation-svc read failed", zap.Error(err))
+		h.respondError(w, http.StatusBadGateway, "bank-reconciliation-svc returned an unusable response")
+	}
 }
 
 // writeToleranceErr responds to a failure resolving a governed tolerance

@@ -19,6 +19,7 @@ import (
 	"zoiko.io/vat-gst-svc/internal/config"
 	svcenvelope "zoiko.io/vat-gst-svc/internal/envelope"
 	"zoiko.io/vat-gst-svc/internal/events"
+	"zoiko.io/vat-gst-svc/internal/evidencereq"
 	"zoiko.io/vat-gst-svc/internal/handler"
 	"zoiko.io/vat-gst-svc/internal/health"
 	"zoiko.io/vat-gst-svc/internal/middleware"
@@ -79,7 +80,8 @@ func main() {
 		authzClient = authz.NewClient(cfg.AuthzServiceURL)
 	}
 
-	h := handler.New(pgStore, publisher, authzClient, logger)
+	h := handler.New(pgStore, publisher, authzClient, logger).
+		WithEvidenceGate(evidencereq.NewClient(cfg.EvidenceRequirementsURL))
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)

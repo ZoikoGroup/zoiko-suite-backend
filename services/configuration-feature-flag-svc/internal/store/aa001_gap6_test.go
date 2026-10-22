@@ -26,7 +26,7 @@ func declareSecret(t *testing.T, s *store.PgStore, key string) {
 	}
 	if _, err := s.PublishDefinition(ctx, domain.PublishDefinitionParams{
 		DefinitionID: def.DefinitionID, Lifecycle: domain.LifecyclePublished, ActorPrincipalID: "admin-1",
-		ApprovalReference: "CAB-2026-002",
+		ApprovalReference: "CAB-2026-002", CallerTenantID: testCallerTenant,
 	}); err != nil {
 		t.Fatalf("publish %s: %v", key, err)
 	}

@@ -3,13 +3,17 @@ package handler
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
+	"zoiko.io/comments-collaboration-svc/internal/authz"
 	"zoiko.io/comments-collaboration-svc/internal/domain"
 	svcmiddleware "zoiko.io/comments-collaboration-svc/internal/middleware"
 	"zoiko.io/comments-collaboration-svc/internal/store"
@@ -127,6 +131,7 @@ type addCommentRequest struct {
 	LinkedObjectType string `json:"linked_object_type"`
 	LinkedObjectID   string `json:"linked_object_id"`
 	Restricted       bool   `json:"restricted,omitempty"`
+	Classification   string `json:"classification,omitempty"`
 	ParentCommentID  string `json:"parent_comment_id,omitempty"`
 	Body             string `json:"body"`
 }
@@ -146,6 +151,10 @@ func (h *Handler) AddComment(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "legal_entity_id, linked_object_type, linked_object_id and body are required")
 		return
 	}
+	if req.Classification != "" && !domain.ValidClassification(req.Classification) {
+		writeError(w, http.StatusBadRequest, domain.ErrClassificationInvalid.Error())
+		return
+	}
 	action := actionCommentCreate
 	if req.Restricted {
 		action = actionCommentReadRestricted
@@ -155,16 +164,20 @@ func (h *Handler) AddComment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	idem := newIdem(r, principalID, "AddComment", "", req)
 	comment, thread, err := h.store.AddComment(r.Context(), domain.AddCommentParams{
 		TenantID: svcmiddleware.TenantFromContext(r.Context()), LegalEntityID: req.LegalEntityID,
-		LinkedObjectType: req.LinkedObjectType, LinkedObjectID: req.LinkedObjectID, Restricted: req.Restricted,
-		ParentCommentID: req.ParentCommentID, Body: req.Body, CreatedByPrincipalID: principalID,
+		LinkedObjectType: req.LinkedObjectType, LinkedObjectID: req.LinkedObjectID, Restricted: req.Restricted, Classification: req.Classification,
+		ParentCommentID: req.ParentCommentID, Body: req.Body, CreatedByPrincipalID: principalID, Idem: idem,
 	})
 	if err != nil {
 		h.writeCommentErr(w, err)
 		return
 	}
-	h.publisher.PublishCommentAdded(r.Context(), r.Header.Get("X-Correlation-ID"), principalID, thread.TenantID, thread.LegalEntityID, *comment, *thread)
+	if !idem.IsReplay() {
+		h.publisher.PublishCommentAdded(r.Context(), r.Header.Get("X-Correlation-ID"), principalID, thread.TenantID, thread.LegalEntityID, *comment, *thread)
+	}
+	markReplay(w, idem)
 	writeJSON(w, http.StatusCreated, map[string]any{"comment": comment, "thread": thread})
 }
 
@@ -201,22 +214,51 @@ func (h *Handler) EditComment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	idem := newIdem(r, principalID, "EditComment", commentID, req)
 	comment, err := h.store.EditComment(r.Context(), domain.EditCommentParams{
-		CommentID: commentID, TenantID: tenantID, ActorPrincipalID: principalID, Body: req.Body,
+		CommentID: commentID, TenantID: tenantID, ActorPrincipalID: principalID, Body: req.Body, Idem: idem,
 	})
 	if err != nil {
 		h.writeCommentErr(w, err)
 		return
 	}
-	h.publisher.PublishCommentEdited(r.Context(), r.Header.Get("X-Correlation-ID"), principalID, tenantID, thread.LegalEntityID, *comment)
+	if !idem.IsReplay() {
+		h.publisher.PublishCommentEdited(r.Context(), r.Header.Get("X-Correlation-ID"), principalID, tenantID, thread.LegalEntityID, *comment)
+	}
+	markReplay(w, idem)
 	writeJSON(w, http.StatusOK, comment)
+}
+
+// authorizeRead gates every read on the thread's own legal entity: an
+// ordinary thread needs COMMENT_READ, a restricted one COMMENT_READ_RESTRICTED
+// (BIZ-09: "restricted threads require purpose and membership controls").
+// The thread is fetched under row-level security first, so another tenant's
+// thread is simply not found. A denial is 403 and an authorization-svc
+// outage is 503 — both fail closed.
+func (h *Handler) authorizeRead(w http.ResponseWriter, r *http.Request, principalID string, t *domain.CommentThread) bool {
+	action := actionCommentRead
+	if t.Restricted {
+		action = actionCommentReadRestricted
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, t.LegalEntityID, action); err != nil {
+		h.writeAuthzErr(w, err)
+		return false
+	}
+	return true
 }
 
 // GetThread — BIZ-09's own GetThread query.
 func (h *Handler) GetThread(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
 	t, err := h.store.GetThread(r.Context(), chi.URLParam(r, "thread_id"))
 	if err != nil {
 		h.writeCommentErr(w, err)
+		return
+	}
+	if !h.authorizeRead(w, r, principalID, t) {
 		return
 	}
 	writeJSON(w, http.StatusOK, t)
@@ -224,8 +266,20 @@ func (h *Handler) GetThread(w http.ResponseWriter, r *http.Request) {
 
 // ListComments — BIZ-09's own ListComments query.
 func (h *Handler) ListComments(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
 	threadID := chi.URLParam(r, "thread_id")
 	tenantID := svcmiddleware.TenantFromContext(r.Context())
+	t, err := h.store.GetThread(r.Context(), threadID)
+	if err != nil {
+		h.writeCommentErr(w, err)
+		return
+	}
+	if !h.authorizeRead(w, r, principalID, t) {
+		return
+	}
 	list, err := h.store.ListComments(r.Context(), tenantID, threadID)
 	if err != nil {
 		h.writeCommentErr(w, err)
@@ -239,8 +293,20 @@ func (h *Handler) ListComments(w http.ResponseWriter, r *http.Request) {
 
 // GetCommentHistory — BIZ-09's own GetCommentHistory query.
 func (h *Handler) GetCommentHistory(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
 	commentID := chi.URLParam(r, "comment_id")
 	tenantID := svcmiddleware.TenantFromContext(r.Context())
+	_, thread, err := h.store.GetComment(r.Context(), tenantID, commentID)
+	if err != nil {
+		h.writeCommentErr(w, err)
+		return
+	}
+	if !h.authorizeRead(w, r, principalID, thread) {
+		return
+	}
 	history, err := h.store.GetCommentHistory(r.Context(), tenantID, commentID)
 	if err != nil {
 		h.writeCommentErr(w, err)
@@ -263,8 +329,37 @@ func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (stri
 	return principalID, true
 }
 
+// writeAuthzErr fails closed either way: an authorization-svc outage is
+// 503, anything else (a denial) is 403.
 func (h *Handler) writeAuthzErr(w http.ResponseWriter, err error) {
+	if errors.Is(err, authz.ErrAuthzServiceUnavailable) {
+		writeError(w, http.StatusServiceUnavailable, "authorization service unavailable")
+		return
+	}
 	writeError(w, http.StatusForbidden, "authorization denied: "+err.Error())
+}
+
+func writeMentionRefused(w http.ResponseWriter) {
+	writeError(w, http.StatusForbidden, "mention refused")
+}
+
+// newIdem builds the persistent idempotency claim for a material write, or
+// nil when the caller sent no Idempotency-Key (the envelope middleware
+// requires one on writes; direct callers of the handler may omit it).
+func newIdem(r *http.Request, principalID, operation, target string, req any) *domain.Idempotency {
+	key := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	if key == "" {
+		return nil
+	}
+	body, _ := json.Marshal(req)
+	sum := sha256.Sum256([]byte(operation + "\x00" + target + "\x00" + string(body)))
+	return &domain.Idempotency{Key: key, PrincipalID: principalID, Operation: operation, RequestHash: hex.EncodeToString(sum[:])}
+}
+
+func markReplay(w http.ResponseWriter, idem *domain.Idempotency) {
+	if idem.IsReplay() {
+		w.Header().Set("Idempotent-Replayed", "true")
+	}
 }
 
 type deleteCommentRequest struct {
@@ -317,13 +412,15 @@ func (h *Handler) DeleteComment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	idem := newIdem(r, principalID, "DeleteComment", commentID, req)
 	comment, err := h.store.DeleteComment(r.Context(), domain.DeleteCommentParams{
-		CommentID: commentID, TenantID: tenantID, ActorPrincipalID: principalID, Reason: req.Reason,
+		CommentID: commentID, TenantID: tenantID, ActorPrincipalID: principalID, Reason: req.Reason, Idem: idem,
 	})
 	if err != nil {
 		h.writeCommentErr(w, err)
 		return
 	}
+	markReplay(w, idem)
 	writeJSON(w, http.StatusOK, comment)
 }
 
@@ -353,19 +450,35 @@ func (h *Handler) Mention(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tenantID := svcmiddleware.TenantFromContext(r.Context())
+
+	// Every refusal on this path — unknown (or other-tenant) comment, caller
+	// not authorized, no visibility checker for the object type, mentioned
+	// principal cannot see the object — answers with the SAME 403 body, so a
+	// caller cannot use Mention to learn whether a comment or its linked
+	// object exists (BIZ-CTRL-018 / T29). Only a dependency outage is
+	// distinguishable (503), and it carries no information about the target.
 	_, thread, err := h.store.GetComment(r.Context(), tenantID, commentID)
+	if errors.Is(err, domain.ErrCommentNotFound) {
+		writeMentionRefused(w)
+		return
+	}
 	if err != nil {
 		h.writeCommentErr(w, err)
 		return
 	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, thread.LegalEntityID, actionCommentManage); err != nil {
-		h.writeAuthzErr(w, err)
+		if errors.Is(err, authz.ErrAuthzServiceUnavailable) {
+			h.writeAuthzErr(w, err)
+			return
+		}
+		writeMentionRefused(w)
 		return
 	}
 
 	checker, registered := h.visibilityCheckers[thread.LinkedObjectType]
 	if !registered {
-		writeError(w, http.StatusForbidden, domain.ErrNoVisibilityCheckRegistered.Error())
+		h.logger.Info("mention refused", zap.String("linked_object_type", thread.LinkedObjectType), zap.Error(domain.ErrNoVisibilityCheckRegistered))
+		writeMentionRefused(w)
 		return
 	}
 	canView, err := checker.CanView(r.Context(), req.MentionedPrincipalID, tenantID, thread.LegalEntityID, thread.LinkedObjectID)
@@ -375,25 +488,42 @@ func (h *Handler) Mention(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !canView {
-		writeError(w, http.StatusForbidden, domain.ErrMentionNotVisible.Error())
+		h.logger.Info("mention refused", zap.Error(domain.ErrMentionNotVisible))
+		writeMentionRefused(w)
 		return
 	}
 
+	idem := newIdem(r, principalID, "Mention", commentID, req)
 	mention, err := h.store.Mention(r.Context(), domain.MentionParams{
-		CommentID: commentID, TenantID: tenantID, MentionedPrincipalID: req.MentionedPrincipalID, VisibilityGranted: true,
+		CommentID: commentID, TenantID: tenantID, MentionedPrincipalID: req.MentionedPrincipalID, VisibilityGranted: true, Idem: idem,
 	})
 	if err != nil {
 		h.writeCommentErr(w, err)
 		return
 	}
-	h.publisher.PublishMentionCreated(r.Context(), r.Header.Get("X-Correlation-ID"), principalID, tenantID, thread.LegalEntityID, *mention)
+	if !idem.IsReplay() {
+		h.publisher.PublishMentionCreated(r.Context(), r.Header.Get("X-Correlation-ID"), principalID, tenantID, thread.LegalEntityID, *mention)
+	}
+	markReplay(w, idem)
 	writeJSON(w, http.StatusCreated, mention)
 }
 
 // GetMentions — BIZ-09's own GetMentions query.
 func (h *Handler) GetMentions(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
 	commentID := chi.URLParam(r, "comment_id")
 	tenantID := svcmiddleware.TenantFromContext(r.Context())
+	_, thread, err := h.store.GetComment(r.Context(), tenantID, commentID)
+	if err != nil {
+		h.writeCommentErr(w, err)
+		return
+	}
+	if !h.authorizeRead(w, r, principalID, thread) {
+		return
+	}
 	list, err := h.store.GetMentions(r.Context(), tenantID, commentID)
 	if err != nil {
 		h.writeCommentErr(w, err)
@@ -436,13 +566,15 @@ func (h *Handler) React(w http.ResponseWriter, r *http.Request) {
 		h.writeAuthzErr(w, err)
 		return
 	}
+	idem := newIdem(r, principalID, "React", commentID, req)
 	added, err := h.store.React(r.Context(), domain.ReactParams{
-		CommentID: commentID, TenantID: tenantID, PrincipalID: principalID, ReactionType: req.ReactionType,
+		CommentID: commentID, TenantID: tenantID, PrincipalID: principalID, ReactionType: req.ReactionType, Idem: idem,
 	})
 	if err != nil {
 		h.writeCommentErr(w, err)
 		return
 	}
+	markReplay(w, idem)
 	writeJSON(w, http.StatusOK, map[string]bool{"added": added})
 }
 
@@ -464,6 +596,10 @@ func (h *Handler) Moderate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
+	if req.Action == "" {
+		writeError(w, http.StatusBadRequest, domain.ErrActionRequired.Error())
+		return
+	}
 	if req.Reason == "" {
 		writeError(w, http.StatusBadRequest, domain.ErrReasonRequired.Error())
 		return
@@ -478,21 +614,37 @@ func (h *Handler) Moderate(w http.ResponseWriter, r *http.Request) {
 		h.writeAuthzErr(w, err)
 		return
 	}
+	idem := newIdem(r, principalID, "Moderate", commentID, req)
 	comment, err := h.store.Moderate(r.Context(), domain.ModerateParams{
-		CommentID: commentID, TenantID: tenantID, ModeratorPrincipalID: principalID, Action: req.Action, Reason: req.Reason,
+		CommentID: commentID, TenantID: tenantID, ModeratorPrincipalID: principalID, Action: req.Action, Reason: req.Reason, Idem: idem,
 	})
 	if err != nil {
 		h.writeCommentErr(w, err)
 		return
 	}
-	h.publisher.PublishCommentModerated(r.Context(), r.Header.Get("X-Correlation-ID"), principalID, tenantID, thread.LegalEntityID, *comment)
+	if !idem.IsReplay() {
+		h.publisher.PublishCommentModerated(r.Context(), r.Header.Get("X-Correlation-ID"), principalID, tenantID, thread.LegalEntityID, *comment)
+	}
+	markReplay(w, idem)
 	writeJSON(w, http.StatusOK, comment)
 }
 
 // GetModerationTrail — BIZ-09's own GetModerationTrail query.
 func (h *Handler) GetModerationTrail(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
 	commentID := chi.URLParam(r, "comment_id")
 	tenantID := svcmiddleware.TenantFromContext(r.Context())
+	_, thread, err := h.store.GetComment(r.Context(), tenantID, commentID)
+	if err != nil {
+		h.writeCommentErr(w, err)
+		return
+	}
+	if !h.authorizeRead(w, r, principalID, thread) {
+		return
+	}
 	list, err := h.store.GetModerationTrail(r.Context(), tenantID, commentID)
 	if err != nil {
 		h.writeCommentErr(w, err)
@@ -530,14 +682,18 @@ func (h *Handler) ResolveThread(w http.ResponseWriter, r *http.Request) {
 		h.writeAuthzErr(w, err)
 		return
 	}
+	idem := newIdem(r, principalID, "ResolveThread", threadID, req)
 	thread, err := h.store.ResolveThread(r.Context(), domain.ResolveThreadParams{
-		ThreadID: threadID, TenantID: tenantID, ActorPrincipalID: principalID, ResolutionNote: req.ResolutionNote,
+		ThreadID: threadID, TenantID: tenantID, ActorPrincipalID: principalID, ResolutionNote: req.ResolutionNote, Idem: idem,
 	})
 	if err != nil {
 		h.writeCommentErr(w, err)
 		return
 	}
-	h.publisher.PublishThreadResolved(r.Context(), r.Header.Get("X-Correlation-ID"), principalID, tenantID, thread.LegalEntityID, *thread)
+	if !idem.IsReplay() {
+		h.publisher.PublishThreadResolved(r.Context(), r.Header.Get("X-Correlation-ID"), principalID, tenantID, thread.LegalEntityID, *thread)
+	}
+	markReplay(w, idem)
 	writeJSON(w, http.StatusOK, thread)
 }
 
@@ -574,14 +730,16 @@ func (h *Handler) AttachReference(w http.ResponseWriter, r *http.Request) {
 		h.writeAuthzErr(w, err)
 		return
 	}
+	idem := newIdem(r, principalID, "AttachReference", commentID, req)
 	attachment, err := h.store.AttachReference(r.Context(), domain.AttachReferenceParams{
 		CommentID: commentID, TenantID: tenantID, LinkedObjectType: req.LinkedObjectType, LinkedObjectID: req.LinkedObjectID,
-		AttachedByPrincipalID: principalID,
+		AttachedByPrincipalID: principalID, Idem: idem,
 	})
 	if err != nil {
 		h.writeCommentErr(w, err)
 		return
 	}
+	markReplay(w, idem)
 	writeJSON(w, http.StatusCreated, attachment)
 }
 
@@ -601,6 +759,16 @@ func (h *Handler) writeCommentErr(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusBadRequest, err.Error())
 	case errors.Is(err, domain.ErrReasonRequired):
 		writeError(w, http.StatusBadRequest, err.Error())
+	case errors.Is(err, domain.ErrClassificationRequired), errors.Is(err, domain.ErrClassificationInvalid):
+		writeError(w, http.StatusBadRequest, err.Error())
+	case errors.Is(err, domain.ErrClassificationMismatch):
+		writeError(w, http.StatusConflict, err.Error())
+	case errors.Is(err, domain.ErrActionRequired):
+		writeError(w, http.StatusBadRequest, err.Error())
+	case errors.Is(err, domain.ErrThreadRestrictionMismatch):
+		writeError(w, http.StatusConflict, err.Error())
+	case errors.Is(err, domain.ErrIdempotencyConflict):
+		writeError(w, http.StatusConflict, err.Error())
 	default:
 		h.logger.Error("comments store error", zap.Error(err))
 		writeError(w, http.StatusInternalServerError, "comments store unavailable")

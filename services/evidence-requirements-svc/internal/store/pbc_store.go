@@ -14,6 +14,37 @@ import (
 const evidenceRequestColumns = `request_id, tenant_id, legal_entity_id, requirement_id, title, description, assigned_to_principal_id,
 	due_at, status, created_by_principal_id, correlation_id, created_at`
 
+// storeWrap preserves the domain errors callers are allowed to branch on and
+// reclassifies raw driver failures as a store outage. In particular 22P02
+// (malformed UUID) becomes ErrInvalidIdentifier instead of a 503.
+func storeWrap(err error) error {
+	if err == nil {
+		return nil
+	}
+	for _, sentinel := range []error{
+		domain.ErrStoreUnavailable,
+		domain.ErrInvalidIdentifier,
+		domain.ErrIdempotencyMismatch,
+		domain.ErrEvidenceRequestNotFound,
+		domain.ErrEvidenceRequestInvalidState,
+		domain.ErrResponseNotFound,
+		domain.ErrSelfEvaluationNotAllowed,
+		domain.ErrArtifactNotScanned,
+	} {
+		if errors.Is(err, sentinel) {
+			return err
+		}
+	}
+	return fmt.Errorf("%w: %w", domain.ErrStoreUnavailable, mapPgError(err))
+}
+
+func optionalUUIDEqual(a, b *string) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
+}
+
 func scanEvidenceRequest(row pgx.Row) (*domain.EvidenceRequest, error) {
 	r := &domain.EvidenceRequest{}
 	err := row.Scan(&r.RequestID, &r.TenantID, &r.LegalEntityID, &r.RequirementID, &r.Title, &r.Description, &r.AssignedToPrincipalID,
@@ -40,10 +71,28 @@ func (s *PgStore) CreateEvidenceRequest(ctx context.Context, requestID string, p
 			return err
 		}
 		out, err = scanEvidenceRequest(tx.QueryRow(ctx, `SELECT `+evidenceRequestColumns+` FROM evidence_requests WHERE tenant_id=$1 AND correlation_id=$2`, p.TenantID, p.CorrelationID))
-		return err
+		if err != nil {
+			return err
+		}
+		// The same correlation id must describe the same request. Returning
+		// the original for a different title/entity/assignee would report a
+		// write that never happened (API standard: IDEMPOTENCY_MISMATCH).
+		if out.LegalEntityID != p.LegalEntityID ||
+			!optionalUUIDEqual(out.RequirementID, p.RequirementID) ||
+			out.Title != p.Title ||
+			out.Description != p.Description ||
+			out.AssignedToPrincipalID != p.AssignedToPrincipalID ||
+			// Postgres timestamptz has microsecond precision; a retried body
+			// carrying nanoseconds (Go's RFC3339Nano) is the same request,
+			// not a mismatch.
+			!out.DueAt.UTC().Truncate(time.Microsecond).Equal(p.DueAt.UTC().Truncate(time.Microsecond)) ||
+			out.CreatedByPrincipalID != p.CreatedByPrincipalID {
+			return domain.ErrIdempotencyMismatch
+		}
+		return nil
 	})
 	if err != nil {
-		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		return nil, false, storeWrap(err)
 	}
 	return out, created, nil
 }
@@ -59,7 +108,28 @@ func (s *PgStore) GetEvidenceRequest(ctx context.Context, tenantID, requestID st
 		return nil, domain.ErrEvidenceRequestNotFound
 	}
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		return nil, storeWrap(err)
+	}
+	return out, nil
+}
+
+// GetResponseRequest resolves a response to its parent request. The scan
+// callback needs the request's legal entity to authorize the write; without
+// this lookup the handler could only check tenant scope, which is too broad.
+func (s *PgStore) GetResponseRequest(ctx context.Context, tenantID, responseID string) (*domain.EvidenceRequest, error) {
+	var out *domain.EvidenceRequest
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		var err error
+		out, err = scanEvidenceRequest(tx.QueryRow(ctx, `SELECT `+evidenceRequestColumns+` FROM evidence_requests
+			WHERE request_id = (SELECT request_id FROM evidence_request_responses WHERE response_id=$1 AND tenant_id=$2)
+			  AND tenant_id=$2`, responseID, tenantID))
+		return err
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrResponseNotFound
+	}
+	if err != nil {
+		return nil, storeWrap(err)
 	}
 	return out, nil
 }
@@ -67,7 +137,12 @@ func (s *PgStore) GetEvidenceRequest(ctx context.Context, tenantID, requestID st
 func (s *PgStore) ListOpenEvidenceRequests(ctx context.Context, tenantID, legalEntityID string) ([]*domain.EvidenceRequest, error) {
 	var out []*domain.EvidenceRequest
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		rows, err := tx.Query(ctx, `SELECT `+evidenceRequestColumns+` FROM evidence_requests WHERE tenant_id=$1 AND legal_entity_id=$2 AND status NOT IN ('SATISFIED','CLOSED') ORDER BY due_at`,
+		// An empty filter means "all entities in the tenant". Comparing an
+		// empty string against a uuid column used to raise 22P02 and surface
+		// as a 503 for the collection's default call.
+		rows, err := tx.Query(ctx, `SELECT `+evidenceRequestColumns+` FROM evidence_requests
+			WHERE tenant_id=$1 AND ($2='' OR legal_entity_id::text=$2)
+			  AND status NOT IN ('SATISFIED','CLOSED') ORDER BY due_at`,
 			tenantID, legalEntityID)
 		if err != nil {
 			return err
@@ -83,7 +158,7 @@ func (s *PgStore) ListOpenEvidenceRequests(ctx context.Context, tenantID, legalE
 		return rows.Err()
 	})
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		return nil, storeWrap(err)
 	}
 	return out, nil
 }
@@ -120,7 +195,7 @@ func (s *PgStore) SendEvidenceRequest(ctx context.Context, p domain.SendEvidence
 		return nil, err
 	}
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		return nil, storeWrap(err)
 	}
 	return out, nil
 }
@@ -137,7 +212,7 @@ func (s *PgStore) ReassignEvidenceRequest(ctx context.Context, p domain.Reassign
 		return nil, domain.ErrEvidenceRequestNotFound
 	}
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		return nil, storeWrap(err)
 	}
 	return out, nil
 }
@@ -154,7 +229,7 @@ func (s *PgStore) ExtendDueDate(ctx context.Context, p domain.ExtendDueDateParam
 		return nil, domain.ErrEvidenceRequestNotFound
 	}
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		return nil, storeWrap(err)
 	}
 	return out, nil
 }
@@ -177,7 +252,7 @@ func (s *PgStore) ViewEvidenceRequest(ctx context.Context, p domain.ViewEvidence
 		return nil, domain.ErrEvidenceRequestNotFound
 	}
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		return nil, storeWrap(err)
 	}
 	return out, nil
 }
@@ -201,32 +276,60 @@ func (s *PgStore) SubmitResponse(ctx context.Context, p domain.SubmitResponsePar
 	var out *domain.EvidenceRequestResponse
 	created := false
 	err := s.withRLS(ctx, p.TenantID, func(tx pgx.Tx) error {
+		// Lock the parent request so two concurrent submissions cannot both
+		// read MAX(version) and race to insert the same version.
+		var lockedRequestID string
+		if err := tx.QueryRow(ctx,
+			`SELECT request_id FROM evidence_requests WHERE request_id=$1 AND tenant_id=$2 FOR UPDATE`,
+			p.RequestID, p.TenantID).Scan(&lockedRequestID); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return domain.ErrEvidenceRequestNotFound
+			}
+			return err
+		}
+
 		var priorResponseID string
 		err := tx.QueryRow(ctx, `SELECT response_id FROM evidence_request_responses WHERE tenant_id=$1 AND correlation_id=$2`, p.TenantID, p.CorrelationID).Scan(&priorResponseID)
 		if err == nil {
 			out, err = scanResponse(tx.QueryRow(ctx, `SELECT `+responseColumns+` FROM evidence_request_responses WHERE response_id=$1`, priorResponseID))
-			return err
+			if err != nil {
+				return err
+			}
+			if out.RequestID != p.RequestID ||
+				out.SubmittedByPrincipalID != p.SubmittedByPrincipalID ||
+				!optionalUUIDEqual(out.ArtifactDocumentID, p.ArtifactDocumentID) {
+				return domain.ErrIdempotencyMismatch
+			}
+			return nil
 		}
 		if !errors.Is(err, pgx.ErrNoRows) {
 			return err
-		}
-
-		var exists bool
-		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM evidence_requests WHERE request_id=$1 AND tenant_id=$2)`, p.RequestID, p.TenantID).Scan(&exists); err != nil {
-			return err
-		}
-		if !exists {
-			return domain.ErrEvidenceRequestNotFound
 		}
 
 		var nextVersion int
 		if err := tx.QueryRow(ctx, `SELECT COALESCE(MAX(version),0)+1 FROM evidence_request_responses WHERE request_id=$1`, p.RequestID).Scan(&nextVersion); err != nil {
 			return err
 		}
-		row := tx.QueryRow(ctx, `INSERT INTO evidence_request_responses (request_id, tenant_id, version, submitted_by_principal_id, artifact_document_id, correlation_id)
-			VALUES ($1,$2,$3,$4,$5,$6) RETURNING `+responseColumns,
-			p.RequestID, p.TenantID, nextVersion, p.SubmittedByPrincipalID, p.ArtifactDocumentID, p.CorrelationID)
-		out, err = scanResponse(row)
+		out, err = scanResponse(tx.QueryRow(ctx, `INSERT INTO evidence_request_responses (request_id, tenant_id, version, submitted_by_principal_id, artifact_document_id, correlation_id)
+			VALUES ($1,$2,$3,$4,$5,$6)
+			ON CONFLICT (tenant_id, correlation_id) DO NOTHING
+			RETURNING `+responseColumns,
+			p.RequestID, p.TenantID, nextVersion, p.SubmittedByPrincipalID, p.ArtifactDocumentID, p.CorrelationID))
+		if errors.Is(err, pgx.ErrNoRows) {
+			// A concurrent request using the same correlation id inserted
+			// first. Return that row, but only if it describes the same
+			// submission.
+			out, err = scanResponse(tx.QueryRow(ctx, `SELECT `+responseColumns+` FROM evidence_request_responses WHERE tenant_id=$1 AND correlation_id=$2`, p.TenantID, p.CorrelationID))
+			if err != nil {
+				return err
+			}
+			if out.RequestID != p.RequestID ||
+				out.SubmittedByPrincipalID != p.SubmittedByPrincipalID ||
+				!optionalUUIDEqual(out.ArtifactDocumentID, p.ArtifactDocumentID) {
+				return domain.ErrIdempotencyMismatch
+			}
+			return nil
+		}
 		if err != nil {
 			return err
 		}
@@ -238,11 +341,11 @@ func (s *PgStore) SubmitResponse(ctx context.Context, p domain.SubmitResponsePar
 		created = true
 		return nil
 	})
-	if errors.Is(err, domain.ErrEvidenceRequestNotFound) {
+	if errors.Is(err, domain.ErrEvidenceRequestNotFound) || errors.Is(err, domain.ErrIdempotencyMismatch) {
 		return nil, false, err
 	}
 	if err != nil {
-		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		return nil, false, storeWrap(err)
 	}
 	return out, created, nil
 }
@@ -260,7 +363,7 @@ func (s *PgStore) RecordScanResult(ctx context.Context, p domain.ScanResultParam
 		return nil, domain.ErrResponseNotFound
 	}
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		return nil, storeWrap(err)
 	}
 	return out, nil
 }
@@ -289,7 +392,7 @@ func (s *PgStore) AcknowledgeReceipt(ctx context.Context, p domain.AcknowledgeRe
 		return nil, err
 	}
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		return nil, storeWrap(err)
 	}
 	return out, nil
 }
@@ -297,6 +400,13 @@ func (s *PgStore) AcknowledgeReceipt(ctx context.Context, p domain.AcknowledgeRe
 func (s *PgStore) AddRequestNote(ctx context.Context, p domain.AddRequestNoteParams) (*domain.EvidenceRequestNote, error) {
 	var out *domain.EvidenceRequestNote
 	err := s.withRLS(ctx, p.TenantID, func(tx pgx.Tx) error {
+		var exists bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM evidence_requests WHERE request_id=$1 AND tenant_id=$2)`, p.RequestID, p.TenantID).Scan(&exists); err != nil {
+			return err
+		}
+		if !exists {
+			return domain.ErrEvidenceRequestNotFound
+		}
 		row := tx.QueryRow(ctx, `INSERT INTO evidence_request_notes (request_id, tenant_id, author_principal_id, body, visibility)
 			VALUES ($1,$2,$3,$4,$5) RETURNING note_id, request_id, author_principal_id, body, visibility, created_at`,
 			p.RequestID, p.TenantID, p.AuthorPrincipalID, p.Body, p.Visibility)
@@ -308,7 +418,7 @@ func (s *PgStore) AddRequestNote(ctx context.Context, p domain.AddRequestNotePar
 		return nil
 	})
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		return nil, storeWrap(err)
 	}
 	return out, nil
 }
@@ -325,7 +435,7 @@ func (s *PgStore) RequestClarification(ctx context.Context, p domain.RequestClar
 		return nil, domain.ErrEvidenceRequestInvalidState
 	}
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		return nil, storeWrap(err)
 	}
 	return out, nil
 }
@@ -376,7 +486,7 @@ func (s *PgStore) MarkSatisfied(ctx context.Context, p domain.MarkSatisfiedParam
 		return nil, err
 	}
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		return nil, storeWrap(err)
 	}
 	return out, nil
 }
@@ -400,7 +510,7 @@ func (s *PgStore) CloseEvidenceRequest(ctx context.Context, p domain.CloseEviden
 		return nil, domain.ErrEvidenceRequestNotFound
 	}
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		return nil, storeWrap(err)
 	}
 	return out, nil
 }

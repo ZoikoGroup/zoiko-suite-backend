@@ -79,11 +79,27 @@ func producedEventTypes() []string {
 	return append([]string{
 		events.EventContextResolved,
 		events.EventResolutionFailed,
-		events.EventSessionInvalidated,
+		events.EventSessionRevoked,
 		events.EventRiskSignalUnavailable,
+		// The status pair, emitted together by PUT /v1/principals/{id}/status
+		// since 19 Oct 2026 (internal/lifecycle.SetStatus).
 		events.EventPrincipalStatusChanged,
+		events.EventSubjectDisabled,
+		events.EventSubjectEnabled,
 		events.EventAuthenticationSucceeded,
 		events.EventAuthenticationFailed,
+		events.EventMFAFactorEnrolled,
+		events.EventMFAFactorRevoked,
+		events.EventMFAFactorReset,
+		events.EventStepUpSucceeded,
+		events.EventStepUpFailed,
+		// The OIDC provider's (internal/oidc), wired 19 Oct 2026.
+		events.EventLoginSessionStarted,
+		events.EventLoginSessionEnded,
+		events.EventRefreshReuseDetected,
+		events.EventAuthCodeReplayed,
+		events.EventLoginThrottled,
+		events.EventTokenExchanged,
 		events.EventTenantContextCacheInvalidated,
 		events.EventTenantContextInvalidated,
 		events.EventSupportContextAttached,
@@ -107,6 +123,31 @@ func TestEveryProducedEventIsPublishedInTheContract(t *testing.T) {
 
 	assert.Empty(t, missing,
 		"these events are emitted but not in asyncapi.yaml — nobody who built from the document can consume them")
+}
+
+// TestEveryPublishedContractEventIsProduced is the other direction: a message
+// the document says this service publishes must be one it emits. Without it
+// the document went on promising session.invalidated after the code stopped
+// sending it (Group 1 re-audit, 19 Oct 2026).
+func TestEveryPublishedContractEventIsProduced(t *testing.T) {
+	doc := loadAsyncAPI(t)
+	produced := map[string]bool{}
+	for _, name := range producedEventTypes() {
+		produced[name] = true
+	}
+	var promised []string
+	for _, ch := range doc.Channels {
+		for _, m := range ch.Publish.Message.OneOf {
+			key := filepath.Base(m.Ref)
+			name := doc.Components.Messages[key].Name
+			require.NotEmpty(t, name, "publish ref %s names no message", m.Ref)
+			if !produced[name] {
+				promised = append(promised, name)
+			}
+		}
+	}
+	sort.Strings(promised)
+	assert.Empty(t, promised, "asyncapi.yaml promises these but nothing emits them — a consumer would wait forever")
 }
 
 // TestEveryConsumedEventIsInTheContract covers the inbound half.
@@ -174,14 +215,14 @@ func TestRiskSignalAlarmIsNotNamedLikeASignal(t *testing.T) {
 // TestPublishedEventsAreNamespacedToThisService guards the class rather than
 // the instance.
 //
-// Every event this service produces should be recognisably ours. The two that
-// are not — session.invalidated and principal.status.changed — predate the
-// convention and are consumed under those names across the estate, so renaming
-// them would be a breaking change for somebody else's service. They are named
+// Every event this service produces should be recognisably ours. The one that
+// is not — principal.status.changed — predates the convention and is consumed
+// under that name by authorization-svc, so it is emitted alongside the
+// namespaced identity.subject.* pair rather than renamed. (session.invalidated
+// had no consumer and was retired for identity.session.revoked.) It is named
 // here so the exception is deliberate rather than an oversight that grows.
 func TestPublishedEventsAreNamespacedToThisService(t *testing.T) {
 	grandfathered := map[string]bool{
-		events.EventSessionInvalidated:     true,
 		events.EventPrincipalStatusChanged: true,
 	}
 

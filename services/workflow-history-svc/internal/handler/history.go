@@ -14,6 +14,11 @@
 //	  Cross-workflow query for all transitions within a time window for a
 //	  specific tenant and legal entity.
 //
+//	Both routes order by (recorded_at, event_id) — a deterministic total order —
+//	and support opt-in cursor pagination (page_size, cursor); see pagination.go.
+//	Without those parameters they return the full list as a bare array, which is
+//	what evidence-manifest-svc's aggregator decodes.
+//
 //	  evidence-manifest-svc's aggregator (internal/aggregator/clients.go,
 //	  WorkflowHistoryClient.ListByEntityAndDateRange) calls this endpoint
 //	  directly for its workflow-history time-window source — wired as of
@@ -173,7 +178,20 @@ func (h *Handler) GetInstanceHistory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	events, err := h.read.ListByInstance(r.Context(), tenantID, instanceID)
+	scope := instanceScope(tenantID, instanceID)
+	page, ok := parsePage(w, r, scope)
+	if !ok {
+		return
+	}
+
+	var events []store.WorkflowHistoryEvent
+	var err error
+	if page.Paged {
+		// One extra row is fetched to learn whether another page follows.
+		events, err = h.read.ListByInstancePage(r.Context(), tenantID, instanceID, page.After, page.Size+1)
+	} else {
+		events, err = h.read.ListByInstance(r.Context(), tenantID, instanceID)
+	}
 	if err != nil {
 		h.log.Error("GetInstanceHistory: store error",
 			zap.String("workflow_instance_id", instanceID),
@@ -184,6 +202,12 @@ func (h *Handler) GetInstanceHistory(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(events) == 0 {
+		// A page past the end of an instance's history is an empty page, not a
+		// missing instance; only a first request (no cursor) can be a 404.
+		if page.Paged && page.After != nil {
+			writeJSON(w, http.StatusOK, pageOut(nil, page, scope))
+			return
+		}
 		writeError(w, http.StatusNotFound, "no history found for workflow_instance_id")
 		return
 	}
@@ -198,6 +222,11 @@ func (h *Handler) GetInstanceHistory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if page.Paged {
+		writeJSON(w, http.StatusOK, pageOut(events, page, scope))
+		return
+	}
+
 	resp := make([]historyEventResponse, len(events))
 	for i, e := range events {
 		resp[i] = toResponse(e)
@@ -208,17 +237,22 @@ func (h *Handler) GetInstanceHistory(w http.ResponseWriter, r *http.Request) {
 
 // GetCrossWorkflowHistory handles GET /v1/workflows/history.
 //
-// Query parameters (all required):
-//   - tenant_id:       tenant scope for the query
-//   - legal_entity_id: legal entity scope for the query
-//   - from:            start of the time window (RFC3339)
-//   - to:              end of the time window (RFC3339)
+// Query parameters:
+//   - legal_entity_id: required; the legal entity scope for the query, and the
+//     scope authorization-svc is asked about
+//   - from:            required; start of the time window (RFC3339, inclusive)
+//   - to:              required; end of the time window (RFC3339, inclusive);
+//     must be after from
+//   - tenant_id:       optional; the tenant is the verified X-Tenant-Id header.
+//     If supplied it must equal the header, otherwise 403
 //
-// Returns all workflow history events for the given tenant and entity within
-// the specified time window, ordered by recorded_at ASC.
+// Returns all workflow history events for the verified tenant and the given
+// entity within the time window, ordered by recorded_at ASC. 401 if X-Tenant-Id
+// or X-Principal-Id is missing, 400 for a missing or invalid parameter, 403 if
+// authorization is denied, 503 if authorization-svc is unavailable.
 //
-// v1 Known Gap: evidence-manifest-svc is not wired to this endpoint.
-// See package doc for details.
+// evidence-manifest-svc's aggregator calls this endpoint for its workflow-history
+// time-window source (see package doc).
 func (h *Handler) GetCrossWorkflowHistory(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	legalEntityID := q.Get("legal_entity_id")
@@ -275,7 +309,18 @@ func (h *Handler) GetCrossWorkflowHistory(w http.ResponseWriter, r *http.Request
 		To:            to,
 	}
 
-	events, err := h.read.ListByFilter(r.Context(), filter)
+	scope := windowScope(tenantID, legalEntityID, from, to)
+	page, ok := parsePage(w, r, scope)
+	if !ok {
+		return
+	}
+
+	var events []store.WorkflowHistoryEvent
+	if page.Paged {
+		events, err = h.read.ListByFilterPage(r.Context(), filter, page.After, page.Size+1)
+	} else {
+		events, err = h.read.ListByFilter(r.Context(), filter)
+	}
 	if err != nil {
 		h.log.Error("GetCrossWorkflowHistory: store error",
 			zap.String("tenant_id", tenantID),
@@ -283,6 +328,11 @@ func (h *Handler) GetCrossWorkflowHistory(w http.ResponseWriter, r *http.Request
 			zap.Error(err),
 		)
 		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+
+	if page.Paged {
+		writeJSON(w, http.StatusOK, pageOut(events, page, scope))
 		return
 	}
 

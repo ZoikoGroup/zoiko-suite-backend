@@ -15,13 +15,13 @@ import (
 // stubCore records PerformRotation calls against a closure-controlled
 // result, standing in for *handler.Handler.
 type stubCore struct {
-	err             error
-	calls           atomic.Int32
-	lastPolicyID    string
-	lastRequestID   string
-	lastActorID     string
-	rotateOK        bool
-	expectedPath    string
+	err           error
+	calls         atomic.Int32
+	lastPolicyID  string
+	lastRequestID string
+	lastActorID   string
+	rotateOK      bool
+	expectedPath  string
 }
 
 func (c *stubCore) PerformRotation(_ context.Context, secretPolicyID, rotatedByPrincipalID string, _ *string, requestID, _ string) (string, int, time.Time, error) {
@@ -121,6 +121,7 @@ func TestSweeper_UpdateFailureDoesNotFailSweep(t *testing.T) {
 		t.Fatalf("expected rotation to have completed despite reschedule failure")
 	}
 }
+
 // Two sweeps over the same due listing (two replicas, or one slow pass
 // re-listing) must rotate once. The request id used to embed time.Now().
 func TestSweeper_SameDueSlotRotatesOnceAcrossSweepers(t *testing.T) {

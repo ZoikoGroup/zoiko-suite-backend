@@ -4,7 +4,10 @@
 // Scanner before its bytes ever reach storage or a database row.
 package scan
 
-import "context"
+import (
+	"context"
+	"errors"
+)
 
 // Result is a scan verdict for one upload attempt. Reason is populated
 // only when Clean is false, and is returned to the caller and recorded
@@ -22,18 +25,22 @@ type Scanner interface {
 	Scan(ctx context.Context, content []byte, contentType string) (Result, error)
 }
 
-// NoOpScanner is the only Scanner this repo has today. It is NOT a real
-// malware/type scanner — no scanning engine is integrated anywhere in
-// this codebase, and this service has never had one. It exists so the
-// GATE is real and exercised (the interface, the call site in
-// CreateDocument/AddVersion, the 422 rejection path, and the tests
-// proving a positive Result actually blocks an upload before it touches
-// storage), while being explicit, not silent, about what is not yet
-// backed by a real scan. Swapping in a real implementation is a
-// cmd/server wiring change; CreateDocument/AddVersion would not need to
-// change at all.
-type NoOpScanner struct{}
+// ErrNotConfigured is returned by UnconfiguredScanner. The handlers treat any
+// scanner error as "scan unavailable" and refuse the upload (503
+// scan_unavailable) before anything is stored.
+var ErrNotConfigured = errors.New("no malware scanner configured (CLAMAV_URL is unset)")
 
-func (NoOpScanner) Scan(_ context.Context, _ []byte, _ string) (Result, error) {
-	return Result{Clean: true}, nil
+// UnconfiguredScanner is what the service runs with when no scanning engine is
+// configured. It FAILS CLOSED: every Scan returns ErrNotConfigured, so every
+// upload and every new version is refused until a scanner is configured.
+//
+// This replaces NoOpScanner, which reported every upload as clean. An absent
+// scanner is not a clean result — treating it as one made DRC-I18 ("Malware /
+// quarantined content cannot become ACTIVE") true only on deployments that
+// happened to set CLAMAV_URL, and the service gave no sign of which kind it
+// was. Reads, record, retention and preservation routes are unaffected.
+type UnconfiguredScanner struct{}
+
+func (UnconfiguredScanner) Scan(_ context.Context, _ []byte, _ string) (Result, error) {
+	return Result{}, ErrNotConfigured
 }

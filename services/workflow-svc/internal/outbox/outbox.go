@@ -6,12 +6,16 @@
 // that "the fact is durably true" is never decoupled from event publication.
 //
 // A background Relay then polls unpublished rows using FOR UPDATE SKIP LOCKED
-// to provide multi-replica concurrency safety and at-least-once delivery to Kafka.
+// to provide multi-replica concurrency safety and at-least-once delivery.
+// Each row names its destination: "kafka" (domain events) or "decision_log"
+// (the governance ledger record of an approval decision, 000020), and one
+// Relay serves one destination.
 package outbox
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -21,9 +25,18 @@ import (
 	"go.uber.org/zap"
 )
 
-// MaxPublishAttempts defines the maximum number of publish attempts before an event
-// is considered dead-lettered and excluded from active polling cycles.
-const MaxPublishAttempts = 10
+// MaxPublishAttempts is how many consecutive failed deliveries park an event
+// (it then needs an operator). With the backoff below — 2^n seconds, capped
+// at five minutes — that is about 16 hours of continuous failure. It used to
+// be 10 attempts at a 1.5 s poll: a Kafka outage of ~15 seconds stranded
+// every pending event for good.
+const MaxPublishAttempts = 200
+
+// Destinations.
+const (
+	DestinationKafka       = "kafka"
+	DestinationDecisionLog = "decision_log"
+)
 
 // Event is one row to be written to outbox_events inside a domain transaction.
 type Event struct {
@@ -37,6 +50,8 @@ type Event struct {
 	CorrelationID *string
 	Headers       map[string]string
 	Payload       any
+	// Destination defaults to DestinationKafka.
+	Destination string
 }
 
 // StoredEvent represents an unpublished event row fetched for relaying.
@@ -52,6 +67,23 @@ type StoredEvent struct {
 	Headers       map[string]string
 	Payload       json.RawMessage
 	Attempts      int
+	CreatedAt     time.Time
+}
+
+// Actor and Correlation are the nullable columns as plain strings.
+func (e StoredEvent) Actor() string {
+	if e.ActorID == nil {
+		return ""
+	}
+	return *e.ActorID
+}
+
+// Correlation returns the correlation id, "" when unset.
+func (e StoredEvent) Correlation() string {
+	if e.CorrelationID == nil {
+		return ""
+	}
+	return *e.CorrelationID
 }
 
 // Insert writes e into outbox_events using the caller's active pgx.Tx transaction.
@@ -62,6 +94,9 @@ func Insert(ctx context.Context, tx pgx.Tx, e Event) error {
 	}
 	if e.OutboxEventID == "" {
 		e.OutboxEventID = uuid.NewString()
+	}
+	if e.Destination == "" {
+		e.Destination = DestinationKafka
 	}
 	payloadJSON, err := json.Marshal(e.Payload)
 	if err != nil {
@@ -80,12 +115,12 @@ func Insert(ctx context.Context, tx pgx.Tx, e Event) error {
 	const sql = `
 		INSERT INTO outbox_events (
 			outbox_event_id, aggregate_type, aggregate_id, event_type,
-			tenant_id, legal_entity_id, actor_id, correlation_id, headers, payload
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+			tenant_id, legal_entity_id, actor_id, correlation_id, headers, payload, destination
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 	`
 	_, err = tx.Exec(ctx, sql,
 		e.OutboxEventID, e.AggregateType, e.AggregateID, e.EventType,
-		e.TenantID, e.LegalEntityID, e.ActorID, e.CorrelationID, headersJSON, payloadJSON,
+		e.TenantID, e.LegalEntityID, e.ActorID, e.CorrelationID, headersJSON, payloadJSON, e.Destination,
 	)
 	if err != nil {
 		return fmt.Errorf("insert outbox event: %w", err)
@@ -93,10 +128,21 @@ func Insert(ctx context.Context, tx pgx.Tx, e Event) error {
 	return nil
 }
 
-// Publisher is the narrow interface the Relay depends on to emit events to Kafka.
-type Publisher interface {
-	PublishOutbox(ctx context.Context, outboxEventID, eventType, correlationID, tenantID, legalEntityID, actorID string, payload []byte) error
+// ErrPermanent marks a delivery failure no retry can fix (the destination
+// already holds a different record under this id). The relay parks the event
+// at once instead of retrying it for hours.
+var ErrPermanent = errors.New("delivery refused permanently")
+
+// Deliverer sends one stored event to the relay's destination.
+type Deliverer interface {
+	Deliver(ctx context.Context, e StoredEvent) error
 }
+
+// DelivererFunc adapts a function to Deliverer.
+type DelivererFunc func(ctx context.Context, e StoredEvent) error
+
+// Deliver calls f.
+func (f DelivererFunc) Deliver(ctx context.Context, e StoredEvent) error { return f(ctx, e) }
 
 // PgxPool defines the database interface needed by the Relay.
 type PgxPool interface {
@@ -105,30 +151,36 @@ type PgxPool interface {
 	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
 }
 
-// Relay polls outbox_events for unpublished rows and publishes them to Kafka.
-// Uses FOR UPDATE SKIP LOCKED to prevent duplicate publishes across multiple replicas.
+// Relay polls outbox_events for one destination's unpublished, due rows and
+// delivers them. FOR UPDATE SKIP LOCKED keeps replicas from claiming the same
+// row; a failed delivery is retried with exponential backoff.
 type Relay struct {
-	pool      PgxPool
-	publisher Publisher
-	interval  time.Duration
-	batchSize int
-	log       *zap.Logger
+	pool        PgxPool
+	deliverer   Deliverer
+	destination string
+	interval    time.Duration
+	batchSize   int
+	log         *zap.Logger
 }
 
-// NewRelay constructs a new outbox Relay worker.
-func NewRelay(pool PgxPool, publisher Publisher, interval time.Duration, batchSize int, log *zap.Logger) *Relay {
+// NewRelay constructs a Relay for destination.
+func NewRelay(pool PgxPool, deliverer Deliverer, destination string, interval time.Duration, batchSize int, log *zap.Logger) *Relay {
 	if interval <= 0 {
 		interval = 1500 * time.Millisecond
 	}
 	if batchSize <= 0 {
 		batchSize = 50
 	}
+	if destination == "" {
+		destination = DestinationKafka
+	}
 	return &Relay{
-		pool:      pool,
-		publisher: publisher,
-		interval:  interval,
-		batchSize: batchSize,
-		log:       log,
+		pool:        pool,
+		deliverer:   deliverer,
+		destination: destination,
+		interval:    interval,
+		batchSize:   batchSize,
+		log:         log,
 	}
 }
 
@@ -138,6 +190,7 @@ func (r *Relay) Start(ctx context.Context) {
 	defer ticker.Stop()
 
 	r.log.Info("outbox relay: started",
+		zap.String("destination", r.destination),
 		zap.Duration("interval", r.interval),
 		zap.Int("batch_size", r.batchSize),
 	)
@@ -145,7 +198,7 @@ func (r *Relay) Start(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			r.log.Info("outbox relay: stopping due to context cancellation")
+			r.log.Info("outbox relay: stopping due to context cancellation", zap.String("destination", r.destination))
 			return
 		case <-ticker.C:
 			r.RelayOnce(ctx)
@@ -153,7 +206,7 @@ func (r *Relay) Start(ctx context.Context) {
 	}
 }
 
-// RelayOnce processes a single batch of unpublished outbox events using FOR UPDATE SKIP LOCKED.
+// RelayOnce processes a single batch of due events for this destination.
 func (r *Relay) RelayOnce(ctx context.Context) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
@@ -165,15 +218,17 @@ func (r *Relay) RelayOnce(ctx context.Context) {
 	const pollSQL = `
 		SELECT outbox_event_id, aggregate_type, aggregate_id, event_type,
 		       tenant_id, legal_entity_id, actor_id, correlation_id, headers,
-		       payload, publish_attempts
+		       payload, publish_attempts, created_at
 		FROM outbox_events
 		WHERE published_at IS NULL
+		  AND destination = $3
+		  AND next_attempt_at <= NOW()
 		  AND publish_attempts < $2
 		ORDER BY created_at ASC
 		LIMIT $1
 		FOR UPDATE SKIP LOCKED
 	`
-	rows, err := tx.Query(ctx, pollSQL, r.batchSize, MaxPublishAttempts)
+	rows, err := tx.Query(ctx, pollSQL, r.batchSize, MaxPublishAttempts, r.destination)
 	if err != nil {
 		r.log.Error("outbox relay: poll failed", zap.Error(err))
 		return
@@ -187,7 +242,7 @@ func (r *Relay) RelayOnce(ctx context.Context) {
 		if scanErr := rows.Scan(
 			&e.OutboxEventID, &e.AggregateType, &e.AggregateID, &e.EventType,
 			&e.TenantID, &e.LegalEntityID, &actorID, &correlationID, &headersJSON,
-			&e.Payload, &e.Attempts,
+			&e.Payload, &e.Attempts, &e.CreatedAt,
 		); scanErr != nil {
 			r.log.Error("outbox relay: scan failed", zap.Error(scanErr))
 			rows.Close()
@@ -207,44 +262,45 @@ func (r *Relay) RelayOnce(ctx context.Context) {
 	}
 
 	for _, e := range pending {
-		actor := ""
-		if e.ActorID != nil {
-			actor = *e.ActorID
-		}
-		correlation := ""
-		if e.CorrelationID != nil {
-			correlation = *e.CorrelationID
-		}
-
-		if pubErr := r.publisher.PublishOutbox(ctx, e.OutboxEventID, e.EventType, correlation, e.TenantID, e.LegalEntityID, actor, e.Payload); pubErr != nil {
+		if delErr := r.deliverer.Deliver(ctx, e); delErr != nil {
 			newAttempts := e.Attempts + 1
-			_, _ = tx.Exec(ctx, `
+			if errors.Is(delErr, ErrPermanent) {
+				newAttempts = MaxPublishAttempts
+			}
+			if _, err := tx.Exec(ctx, `
 				UPDATE outbox_events
-				SET publish_attempts = publish_attempts + 1, last_error = $2
+				SET publish_attempts = GREATEST(publish_attempts + 1, $3),
+				    last_error = $2,
+				    next_attempt_at = NOW() + LEAST(POWER(2, LEAST(publish_attempts, 16)), 300) * INTERVAL '1 second'
 				WHERE outbox_event_id = $1
-			`, e.OutboxEventID, pubErr.Error())
+			`, e.OutboxEventID, delErr.Error(), newAttempts); err != nil {
+				r.log.Error("outbox relay: recording a failed delivery failed", zap.Error(err))
+			}
 			if newAttempts >= MaxPublishAttempts {
-				r.log.Error("outbox relay: event reached dead-letter ceiling, moving to dead-letter",
+				r.log.Error("outbox relay: event parked after repeated failures — needs an operator",
+					zap.String("destination", r.destination),
 					zap.String("outbox_event_id", e.OutboxEventID),
 					zap.String("event_type", e.EventType),
 					zap.Int("publish_attempts", newAttempts),
-					zap.Int("max_publish_attempts", MaxPublishAttempts),
-					zap.Error(pubErr),
+					zap.Error(delErr),
 				)
 			} else {
-				r.log.Warn("outbox relay: publish failed, will retry",
+				r.log.Warn("outbox relay: delivery failed, will retry with backoff",
+					zap.String("destination", r.destination),
 					zap.String("outbox_event_id", e.OutboxEventID),
 					zap.String("event_type", e.EventType),
 					zap.Int("publish_attempts", newAttempts),
-					zap.Error(pubErr),
+					zap.Error(delErr),
 				)
 			}
-		} else {
-			_, _ = tx.Exec(ctx, `
-				UPDATE outbox_events
-				SET published_at = NOW()
-				WHERE outbox_event_id = $1
-			`, e.OutboxEventID)
+			continue
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE outbox_events
+			SET published_at = NOW(), last_error = NULL
+			WHERE outbox_event_id = $1
+		`, e.OutboxEventID); err != nil {
+			r.log.Error("outbox relay: marking a delivery failed", zap.Error(err))
 		}
 	}
 

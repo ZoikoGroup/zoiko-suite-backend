@@ -37,6 +37,10 @@ CREATE TABLE eventing_outbox (
         (publish_state <> 'claimed' OR claimed_until IS NOT NULL)
 );
 
+-- Everything not yet delivered, oldest first. Serves the dispatcher's claim
+-- scan and the backlog signals; published rows (which accumulate until
+-- retention removes them) are outside it, so neither query slows as history
+-- grows.
 CREATE INDEX eventing_outbox_backlog_idx ON eventing_outbox (created_at)
     WHERE publish_state IN ('pending', 'failed', 'claimed');
 CREATE INDEX eventing_outbox_quarantined_idx ON eventing_outbox (created_at)

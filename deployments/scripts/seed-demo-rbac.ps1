@@ -95,6 +95,14 @@ $SEED_ADMIN_ROLE_ID = "5eed0000-0000-4000-8000-00000000a002"
 $ACS_SERVICE_ID      = "svc-access-control"
 $ACS_SERVICE_ROLE_ID = "5eed0000-0000-4000-8000-00000000a003"
 
+# policy-svc's own identity (POLICY_LEDGER_PRINCIPAL_ID). Its evidence relay
+# writes every policy evaluation to governance-decision-log-svc as this
+# principal (decision D-02), so it holds GOVERNANCE_DECISION_RECORD and nothing
+# else: on the platform scope (evaluations no entity scopes) and on the legal
+# entity (evaluations scoped to it).
+$POLICY_SERVICE_ID      = "svc-policy"
+$POLICY_SERVICE_ROLE_ID = "5eed0000-0000-4000-8000-00000000a004"
+
 $ROLE_CODE = "CONSOLE_DEMO_OPERATOR"
 
 # Platform-scope records (decisions, config, flags, secret policies, policy
@@ -360,15 +368,16 @@ $BUNDLES = @(
     },
     @{
         # financial-control-svc (ZS-CONTROL-001). DEFINE / APPROVE_RULE / EXECUTE / CERTIFY /
-        # EXCEPTION_WAIVE / REPERFORM are deliberately separate actions: a real tenant should grant
-        # them through separate roles. The service itself also refuses a certifier who created or
-        # took part in a run, and a waiver from the exception's own owner, whatever is granted here.
+        # EXCEPTION_WAIVE / REPERFORM / REVOKE are deliberately separate actions: a real tenant
+        # should grant them through separate roles. The service itself also refuses a certifier
+        # who created or took part in a run, a waiver from the exception's own owner, and a
+        # revoker who certified the run being revoked, whatever is granted here.
         Code    = "FINCTRL_FULL"
         Service = "financial-control-svc"
         Actions = @("FINCTRL_DEFINE", "FINCTRL_APPROVE_RULE", "FINCTRL_POLICY_MANAGE", "FINCTRL_RUN_CREATE",
                     "FINCTRL_READ", "FINCTRL_EXECUTE", "FINCTRL_EXCEPTION_ASSIGN", "FINCTRL_CERTIFY",
                     "FINCTRL_EXCEPTION_RESOLVE", "FINCTRL_EXCEPTION_WAIVE", "FINCTRL_REPERFORM",
-                    "FINCTRL_EVIDENCE_EXPORT")
+                    "FINCTRL_EVIDENCE_EXPORT", "FINCTRL_REVOKE")
     },
     @{
         # The source services authorize the HUMAN caller of a control population (the control service
@@ -381,6 +390,20 @@ $BUNDLES = @(
                     "INVENTORY_CONTROL_POPULATION_READ", "INTERCOMPANY_CONTROL_POPULATION_READ",
                     "CONSOLIDATION_CONTROL_POPULATION_READ", "FINANCIAL_CLOSE_CONTROL_POPULATION_READ",
                     "PAYEE_BANKING_CONTROL_POPULATION_READ", "TAX_AUTHORITY_CONTROL_POPULATION_READ")
+    },
+    @{
+        # reconciliation-engine-svc (DATA-07, ZS-SVC-Z-001 DQC-03). DEFINE/RUN/MATCH stay under
+        # MANAGE as preparation steps; CERTIFY, ACCEPT_RISK, APPROVE_RULES and REVOKE are
+        # deliberately separate actions, the same posture as FINCTRL_FULL above — a real tenant
+        # should grant them through separate roles. The service itself also refuses a certifier
+        # who prepared the run, a revoker who certified it, and a self-accepted risk, whatever is
+        # granted here. None of these five actions had a permission_definitions row before
+        # migration 000008 (MANAGE/READ) and 000018 (the other four) — without that row no role
+        # can hold the action at all.
+        Code    = "RECONCILIATION_FULL"
+        Service = "reconciliation-engine-svc"
+        Actions = @("RECONCILIATION_MANAGE", "RECONCILIATION_READ", "RECONCILIATION_CERTIFY",
+                    "RECONCILIATION_ACCEPT_RISK", "RECONCILIATION_APPROVE_RULES", "RECONCILIATION_REVOKE")
     },
     @{
         # spend-controls-svc separates setting a limit from spending against it,
@@ -412,14 +435,32 @@ $BUNDLES = @(
         Actions = @("GOVERNANCE_DECISION_RECORD")
     },
     @{
-        # policy-svc checks POLICY_CREATE / POLICY_VERSION_CREATE /
-        # POLICY_VERSION_ACTIVATE against the legal entity when the policy is
-        # entity-scoped and against authzPlatformScopeID when it is not. The
-        # console always creates entity-scoped policies, but the platform-scope
-        # assignment below also carries these so both paths are granted.
+        # policy-svc checks its actions against the legal entity when the
+        # policy is entity-scoped and against authzPlatformScopeID when it is
+        # not, so the platform-scope assignment below carries them too. The
+        # GOV-05 lifecycle (14 Oct 2026) added review, approval, suspension,
+        # retirement, the _GLOBAL variants, reads and evaluation. Both demo
+        # principals hold this role; policy-svc itself refuses the author
+        # approving or activating, and the suspender reviewing, so the
+        # maker-checker paths stay testable with $PRINCIPAL_ID and $APPROVER_ID.
         Code    = "POLICY_FULL"
         Service = "policy-svc"
-        Actions = @("POLICY_CREATE", "POLICY_VERSION_CREATE", "POLICY_VERSION_ACTIVATE")
+        Actions = @("POLICY_CREATE", "POLICY_CREATE_GLOBAL", "POLICY_READ", "POLICY_EVALUATE",
+                    "POLICY_VERSION_CREATE", "POLICY_VERSION_CREATE_GLOBAL",
+                    "POLICY_VERSION_APPROVE", "POLICY_VERSION_APPROVE_GLOBAL",
+                    "POLICY_VERSION_ACTIVATE", "POLICY_VERSION_ACTIVATE_GLOBAL",
+                    "POLICY_VERSION_SUSPEND", "POLICY_VERSION_SUSPEND_GLOBAL",
+                    "POLICY_VERSION_RETIRE", "POLICY_VERSION_RETIRE_GLOBAL")
+    },
+    @{
+        # policy-svc's control tests and attestations (doc7 E3/E6) authorize
+        # against the platform scope.
+        Code    = "CONTROL_TESTS_FULL"
+        Service = "policy-svc"
+        Actions = @("CONTROL_TEST_DEFINITION_CREATE", "CONTROL_TEST_DEFINITION_READ",
+                    "CONTROL_TEST_EXECUTION_RECORD", "CONTROL_TEST_EXECUTION_READ",
+                    "CONTROL_EFFECTIVENESS_READ", "ATTESTATION_CREATE", "ATTESTATION_READ",
+                    "ATTESTATION_REVOKE")
     },
     @{
         # configuration-feature-flag-svc authorizes config and flag writes
@@ -841,7 +882,7 @@ $ALL_ACTIONS = $BUNDLES | ForEach-Object { $_.Actions } | Sort-Object -Unique
 # missing, and the run would skip the bundles entirely -- never granting the
 # platform scope. It then reported success and had granted nothing.
 $PLATFORM_SCOPED_ACTION_CODES = @(
-    "GOVERNANCE_FULL", "CONFIG_FULL", "VAULT_FULL", "POLICY_FULL",
+    "GOVERNANCE_FULL", "CONFIG_FULL", "VAULT_FULL", "POLICY_FULL", "CONTROL_TESTS_FULL",
     "SCHEMA_FULL", "JURISDICTION_FULL", "JURISDICTION_PACK_REGISTRY_FULL", "JURISDICTION_RESOLVER_CALLER",
     # retention-registry-svc falls back to the platform scope when a hold or
     # policy names no tenant -- the console offers that as a "platform-wide"
@@ -1168,6 +1209,33 @@ try {
     }
 }
 
+# -- policy-svc's ledger writer -----------------------------------------------------
+#
+# Runs on every invocation, like the SoD approver above: it is one role with one
+# bundle and two assignments, written idempotently. Direct SQL, as for the other
+# service identities in the bootstrap block -- DEVELOPMENT ONLY.
+if ((Get-Decision -Action "GOVERNANCE_DECISION_RECORD" -Scope $PLATFORM_SCOPE -Principal $POLICY_SERVICE_ID).decision_outcome -ne "GRANTED" -or
+    (Get-Decision -Action "GOVERNANCE_DECISION_RECORD" -Scope $LEGAL_ENTITY -Principal $POLICY_SERVICE_ID).decision_outcome -ne "GRANTED") {
+    Write-Host "grant $POLICY_SERVICE_ID GOVERNANCE_DECISION_RECORD (policy evidence relay)" -NoNewline
+    $sql = @"
+INSERT INTO roles (role_id, tenant_id, role_code, role_name, role_scope_type, active_flag, created_by_principal_id)
+VALUES ('$POLICY_SERVICE_ROLE_ID', '$TENANT_ID', 'SVC_POLICY_LEDGER', 'policy-svc evidence relay', 'LEGAL_ENTITY', true, 'seed-bootstrap')
+ON CONFLICT DO NOTHING;
+INSERT INTO permission_bundles (role_id, bundle_code, permitted_actions, active_flag)
+VALUES ('$POLICY_SERVICE_ROLE_ID', 'LEDGER_WRITE', '["GOVERNANCE_DECISION_RECORD"]'::jsonb, true)
+ON CONFLICT (role_id, bundle_code) DO UPDATE SET permitted_actions = EXCLUDED.permitted_actions, active_flag = true;
+INSERT INTO principal_role_assignments (principal_id, role_id, legal_entity_id, effective_from, assigned_by)
+SELECT '$POLICY_SERVICE_ID', '$POLICY_SERVICE_ROLE_ID', scope, now() - interval '1 minute', 'seed-bootstrap'
+FROM (VALUES ('$PLATFORM_SCOPE'::uuid), ('$LEGAL_ENTITY'::uuid)) AS s(scope)
+WHERE NOT EXISTS (SELECT 1 FROM principal_role_assignments
+                  WHERE principal_id = '$POLICY_SERVICE_ID' AND role_id = '$POLICY_SERVICE_ROLE_ID' AND legal_entity_id = s.scope);
+"@
+    $sql | docker exec -i $PgContainer psql -U postgres -d authorization_svc -v ON_ERROR_STOP=1 -q | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "policy-svc ledger grant into authorization_svc failed (container $PgContainer)" }
+    Start-Sleep -Seconds 6
+    Write-Host "  -> done" -ForegroundColor Green
+}
+
 # -- REF-04 / REF-05 maker-checker roles -------------------------------------------
 #
 # Which action belongs to which service (copied from the `Action*` constants in
@@ -1399,6 +1467,120 @@ foreach ($principal in @($PRINCIPAL_ID, $APPROVER_ID)) {
         } else {
             Write-Host ("     {0} holds {1} of [{2}]" -f $principal, $held.Count, ($pair -join ' / ')) -ForegroundColor Green
         }
+    }
+}
+
+# -- REP-01 financial-statements-svc maker-checker roles --------------------------
+#
+# Actions (copied from the Action* constants in
+# services/financial-statements-svc/internal/service/service.go -- re-grep
+# them before editing): FINANCIAL_STATEMENT_SET_CREATE, _VIEW, _REFRESH,
+# _VALIDATE, _REVIEW, _APPROVE, _CERTIFY, _PUBLISH.
+#
+# _REVIEW covers both SubmitForReview (maker side) and RequestChanges
+# (checker side) -- one action, like accounting-period-svc's
+# PERIOD_STATE_COMMAND above, because the service's own in-code Preparer()
+# check is the real control, not an RBAC split. The genuine SoD boundary the
+# service enforces is "the preparer may not also Approve or Certify their own
+# work" (ZS-SVC-H-001 4.1) -- that is a per-row identity comparison against
+# whoever created or last refreshed the set, never just "does this principal
+# hold the APPROVE/CERTIFY grant". The two roles below exist so a demo run
+# has two DISTINCT principals to prove that with, same purpose as REF05's
+# maker/checker pair.
+$REF01_ROLES = @(
+    @{
+        RoleId     = "88888888-8888-8888-8888-888888888883"
+        Code       = "REF01_STATEMENT_MAKER"
+        Name       = "REP-01 Statement Maker"
+        Principal  = $PRINCIPAL_ID
+        BundleCode = "REF01_MAKER"
+        Actions    = @(
+            "FINANCIAL_STATEMENT_SET_CREATE", "FINANCIAL_STATEMENT_SET_VIEW",
+            "FINANCIAL_STATEMENT_SET_REFRESH", "FINANCIAL_STATEMENT_SET_VALIDATE",
+            "FINANCIAL_STATEMENT_SET_REVIEW"
+        )
+    },
+    @{
+        RoleId     = "88888888-8888-8888-8888-888888888884"
+        Code       = "REF01_STATEMENT_CHECKER"
+        Name       = "REP-01 Statement Checker"
+        Principal  = $APPROVER_ID
+        BundleCode = "REF01_CHECKER"
+        Actions    = @(
+            "FINANCIAL_STATEMENT_SET_VIEW", "FINANCIAL_STATEMENT_SET_REVIEW",
+            "FINANCIAL_STATEMENT_SET_APPROVE", "FINANCIAL_STATEMENT_SET_CERTIFY",
+            "FINANCIAL_STATEMENT_SET_PUBLISH"
+        )
+    }
+)
+# Not RBAC-exclusive pairs (both are checked below only to confirm the two
+# demo principals are genuinely distinct grants, not to assert the platform
+# would refuse one principal holding both -- it would not; the service's own
+# Preparer() check is what actually refuses that, and is NOT exercised by
+# this seed script).
+$REF01_SOD_PAIRS = @(
+    @("FINANCIAL_STATEMENT_SET_CREATE", "FINANCIAL_STATEMENT_SET_APPROVE"),
+    @("FINANCIAL_STATEMENT_SET_CREATE", "FINANCIAL_STATEMENT_SET_CERTIFY")
+)
+
+foreach ($r in $REF01_ROLES) {
+    $roleMissing = @()
+    foreach ($action in $r.Actions) {
+        foreach ($scope in @($LEGAL_ENTITY, $PLATFORM_SCOPE)) {
+            $probe = Invoke-Authz -Path "/v1/authorize" -Body @{
+                principal_id = $r.Principal; legal_entity_id = $scope; action_type = $action
+            }
+            if ($probe.body.decision_outcome -ne "GRANTED") { $roleMissing += "$action@$scope" }
+        }
+    }
+    if ($roleMissing.Count -eq 0) {
+        Write-Host "$($r.Code): already granted to $($r.Principal)" -ForegroundColor Green
+        continue
+    }
+    Write-Host "$($r.Code): $($roleMissing.Count) grants missing" -ForegroundColor Yellow
+    Write-Host "role $($r.Code)" -NoNewline
+    try {
+        $role = Invoke-Authz -Path "/v1/admin/roles" -Body @{
+            role_id                 = $r.RoleId
+            tenant_id               = $TENANT_ID
+            role_code               = $r.Code
+            role_name               = $r.Name
+            role_scope_type         = "LEGAL_ENTITY"
+            created_by_principal_id = $PRINCIPAL_ID
+        }
+        Write-Host "  -> $($role.status)"
+    } catch {
+        Write-Host "  -> already exists, or could not be created; continuing to the bundle" -ForegroundColor DarkGray
+    }
+    $bundle = Invoke-Authz -Path "/v1/admin/roles/$($r.RoleId)/permission-bundles" -Body @{
+        bundle_code       = $r.BundleCode
+        permitted_actions = $r.Actions
+    }
+    Write-Host "bundle $($r.BundleCode)  -> $($bundle.status) [$($bundle.body.permitted_actions -join ', ')]"
+    Add-Ref05Assignment -PrincipalId $r.Principal -RoleId $r.RoleId -Scope $LEGAL_ENTITY -Label "legal entity"
+    Add-Ref05Assignment -PrincipalId $r.Principal -RoleId $r.RoleId -Scope $PLATFORM_SCOPE -Label "platform scope"
+}
+
+Write-Host "Verifying REP-01 maker-checker roles:" -ForegroundColor Cyan
+foreach ($r in $REF01_ROLES) {
+    foreach ($action in $r.Actions) {
+        foreach ($scope in @($LEGAL_ENTITY, $PLATFORM_SCOPE)) {
+            $probe = Invoke-Authz -Path "/v1/authorize" -Body @{
+                principal_id = $r.Principal; legal_entity_id = $scope; action_type = $action
+            }
+            if ($probe.body.decision_outcome -ne "GRANTED") { $failed += "$action ($($r.Code) on $scope)" }
+        }
+    }
+}
+foreach ($pair in $REF01_SOD_PAIRS) {
+    $makerHas = (Invoke-Authz -Path "/v1/authorize" -Body @{
+        principal_id = $PRINCIPAL_ID; legal_entity_id = $LEGAL_ENTITY; action_type = $pair[1]
+    }).body.decision_outcome -eq "GRANTED"
+    if ($makerHas) {
+        $failed += "$PRINCIPAL_ID (the REP-01 maker) unexpectedly holds the checker-only action $($pair[1])"
+        Write-Host "     maker unexpectedly holds $($pair[1])" -ForegroundColor Red
+    } else {
+        Write-Host ("     maker/checker split holds for {0}" -f $pair[1]) -ForegroundColor Green
     }
 }
 

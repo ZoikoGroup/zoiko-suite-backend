@@ -30,8 +30,8 @@ type stubStore struct {
 	rulesErr      error
 	err           error
 
-	rulePack    *domain.RulePack
-	rulePackErr error
+	rulePack      *domain.RulePack
+	rulePackErr   error
 	rulePackQuery domain.RulePackQuery
 
 	// admin-mutation fields — configured per-test, unused by the read tests above

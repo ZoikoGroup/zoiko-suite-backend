@@ -65,8 +65,32 @@ spec:
           value: "postgres"
         - name: DB_SSLMODE
           value: "disable"
+        # The real authorization-svc. This pointed back at jurisdiction-svc
+        # itself, the "authz points back" placeholder compose dropped long ago;
+        # every admin mutation failed closed in the cluster.
         - name: AUTHZ_SERVICE_URL
-          value: "http://jurisdiction-svc.zoiko-governance.svc.cluster.local:8082"
+          value: "http://authorization-svc.zoiko-governance.svc.cluster.local:8089"
+        - name: AUTHZ_PLATFORM_SCOPE_ID
+          value: "00000000-0000-0000-0000-00000000f001"
+        - name: KAFKA_BROKERS
+          value: "kafka.zoiko-infra.svc.cluster.local:9092"
+        - name: KAFKA_EVENTS_TOPIC
+          value: "zoiko.jurisdiction.events"
+        # Rule activation confirms its approval with workflow-svc (J-02).
+        - name: WORKFLOW_SERVICE_URL
+          value: "http://workflow-svc.zoiko-governance.svc.cluster.local:8090"
+        # Identity gate (J-01): warn until every caller forwards the envelope.
+        - name: IDENTITY_VERIFY
+          value: "warn"
+        - name: IDENTITY_JWKS_URL
+          value: "http://identity-svc.zoiko-identity.svc.cluster.local:8080/.well-known/jwks.json"
+        - name: IDENTITY_INTROSPECT_URL
+          value: "http://identity-svc.zoiko-identity.svc.cluster.local:8080/v1/context/session/introspect"
+        - name: IDENTITY_ISSUER
+          value: "identity-context-svc"
+        # ZS-JUR resolver on (J-07); the local cluster serves every RELEASED pack.
+        - name: RESOLVER_ENABLED
+          value: "true"
         livenessProbe:
           httpGet:
             path: /healthz

@@ -143,6 +143,56 @@ ON CONFLICT (principal_role_assignment_id) DO UPDATE
         effective_to   = NULL,
         legal_entity_id = NULL;
 
+-- ── 4. The governance-ledger writers ─────────────────────────────────────────
+-- policy-svc and workflow-svc deliver their decision evidence to
+-- governance-decision-log-svc from an outbox relay, as their own service
+-- principal (decision D-02, 14 Oct 2026; workflow 21 Oct 2026): the person who
+-- decided travels in evaluation_context, and only the writer needs
+-- GOVERNANCE_DECISION_RECORD. Until now nothing granted it: compose named
+-- svc-policy as policy-svc's writer with no grant, so every evaluation's ledger
+-- record waited in the outbox, and workflow-svc borrowed the test
+-- administrator above. This role holds that one action and nothing else.
+INSERT INTO authorization_svc.roles
+    (role_id, tenant_id, role_code, role_name, role_scope_type,
+     active_flag, created_by_principal_id)
+VALUES
+    ('a0000000-0000-4000-8000-000000000002',
+     '11111111-1111-1111-1111-111111111111',
+     'GOVERNANCE_LEDGER_WRITER',
+     'Governance ledger writer (service principals)',
+     'TENANT',
+     TRUE,
+     'servicectl-seed')
+ON CONFLICT (tenant_id, role_code) DO UPDATE
+    SET active_flag = TRUE,
+        role_name   = EXCLUDED.role_name;
+
+INSERT INTO authorization_svc.permission_bundles
+    (permission_bundle_id, role_id, bundle_code, permitted_actions, active_flag)
+VALUES
+    ('b0000000-0000-4000-8000-000000000002',
+     'a0000000-0000-4000-8000-000000000002',
+     'GOVERNANCE_LEDGER_WRITER_BUNDLE',
+     '["GOVERNANCE_DECISION_RECORD"]'::jsonb,
+     TRUE)
+ON CONFLICT (role_id, bundle_code) DO UPDATE
+    SET permitted_actions = EXCLUDED.permitted_actions,
+        active_flag       = TRUE;
+
+-- Tenant-wide (legal_entity_id NULL), for the reason section 3 gives.
+INSERT INTO authorization_svc.principal_role_assignments
+    (principal_role_assignment_id, principal_id, role_id, legal_entity_id,
+     effective_from, effective_to, assigned_by)
+VALUES
+    ('c0000000-0000-4000-8000-000000000002', 'svc-workflow',
+     'a0000000-0000-4000-8000-000000000002', NULL, NOW() - INTERVAL '1 minute', NULL, 'servicectl-seed'),
+    ('c0000000-0000-4000-8000-000000000003', 'svc-policy',
+     'a0000000-0000-4000-8000-000000000002', NULL, NOW() - INTERVAL '1 minute', NULL, 'servicectl-seed')
+ON CONFLICT (principal_role_assignment_id) DO UPDATE
+    SET effective_from  = EXCLUDED.effective_from,
+        effective_to    = NULL,
+        legal_entity_id = NULL;
+
 -- =============================================================================
 -- VERIFICATION — this reproduces the service's own evaluation query
 -- =============================================================================

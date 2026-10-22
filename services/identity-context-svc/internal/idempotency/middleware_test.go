@@ -332,9 +332,50 @@ func TestLiveClaimInsideTheLeaseIsStillInFlight(t *testing.T) {
 	assert.Zero(t, h.calls)
 }
 
+// ── A router refusal never strands the claim (2026-10-16) ────────────────────
+
+// chi answers an unknown path with a plain-text 404. That body cannot be
+// stored in the jsonb response_body column, so completion failed (logged
+// only) and the claim stayed at status 0: every retry of the same path got
+// IDEMPOTENCY_IN_FLIGHT instead of the router's 404 until the lease expired,
+// after which the cycle repeated. A router refusal is not a command outcome.
+func TestNonJSONRouterRefusalReleasesTheClaim(t *testing.T) {
+	s := newFakeStore()
+	notFound := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte("404 page not found\n"))
+	})
+
+	first := serve(s, notFound, request("/v1/context/no-such-route", "k", `{}`))
+	require.Equal(t, http.StatusNotFound, first.Code)
+	assert.Empty(t, s.records, "a router refusal must not be recorded as the command's outcome")
+
+	second := serve(s, notFound, request("/v1/context/no-such-route", "k", `{}`))
+	assert.Equal(t, http.StatusNotFound, second.Code,
+		"the retry must be answered by the router, not IDEMPOTENCY_IN_FLIGHT")
+}
+
+// A 204 has no body and must still complete — releasing it would re-execute
+// the revoked-context command on every retry.
+func TestEmptyBodyStillCompletes(t *testing.T) {
+	s := newFakeStore()
+	noContent := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	serve(s, noContent, request("/v1/context/support/sc-1", "k", `{}`))
+	require.Len(t, s.records, 1, "a 204 is a terminal answer and must be recorded")
+
+	w := serve(s, noContent, request("/v1/context/support/sc-1", "k", `{}`))
+	assert.Equal(t, http.StatusNoContent, w.Code)
+	assert.Equal(t, "true", w.Header().Get(headerReplayed))
+}
+
+// Federated login, like the password login, mints a bearer credential;
+// recording its response would put a working credential into a table with a
+// retention period.
 func TestFederatedLoginIsNeverRecordedForReplay(t *testing.T) {
-	// like the password login it mints a bearer credential; recording its response would put a working
-	// credential into a table with a retention period
 	for _, p := range []string{"/v1/authenticate", "/v1/authenticate/federated", "/v1/context/resolve"} {
 		if !exemptPaths[p] {
 			t.Errorf("%s must be exempt from replay recording", p)

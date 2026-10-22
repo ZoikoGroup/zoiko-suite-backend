@@ -1,0 +1,710 @@
+openapi: 3.1.0
+info:
+  title: obligations-svc
+  version: 1.2.0
+  description: |
+    Obligations Service (Doc 03 §8.5, Doc 04 §13). Owns obligation definitions,
+    obligation state, due dates, obligation-to-entity and obligation-to-workflow
+    mappings, and source-origin references. Every obligation is entity-bound
+    (the legal entity must exist in the caller's tenant, tenant-entity-registry-svc)
+    and jurisdiction-bound (jurisdiction-rules-svc), fail-closed.
+
+    Identity: requests carry identity-context-svc's signed envelope
+    (`Authorization: Bearer`), verified against its JWKS and session status;
+    X-Principal-Id / X-Tenant-Id are then set from the verified claims.
+    Errors are RFC 9457 `application/problem+json` documents; `error` keeps the
+    legacy code and `error_class` names the Governance Control Plane §16 class.
+
+    Events (transactional outbox, topic zoiko.obligations.events, key
+    `<tenant>/<aggregate>`): obligation.created, obligation.updated,
+    obligation.overdue, obligation.closed, obligation.definition.changed,
+    obligation.entity_mapping.changed.
+servers:
+  - url: http://localhost:8088
+security:
+  - identityEnvelope: []
+tags:
+  - name: obligations
+  - name: filing
+  - name: applicability
+  - name: definitions
+  - name: probes
+paths:
+  /v1/obligations:
+    post:
+      tags: [obligations]
+      operationId: createObligation
+      summary: Create an obligation (idempotent on obligation_code and Idempotency-Key)
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}, {$ref: '#/components/parameters/LegalEntityHeader'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CreateObligation'}
+      responses:
+        '201':
+          description: Created
+          headers:
+            Location: {$ref: '#/components/headers/Location'}
+            ETag: {$ref: '#/components/headers/ETag'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Obligation'}
+        '200':
+          description: Replay of an obligation already recorded with the same code and attributes, or the same Idempotency-Key and body
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Obligation'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '422': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+    get:
+      tags: [obligations]
+      operationId: listObligations
+      summary: List obligations of one legal entity (cursor pagination)
+      parameters:
+        - {name: legal_entity_id, in: query, required: true, schema: {type: string}}
+        - {name: jurisdiction_id, in: query, schema: {type: string}}
+        - {name: obligation_type, in: query, schema: {type: string}}
+        - {name: status, in: query, schema: {$ref: '#/components/schemas/ObligationStatus'}}
+        - {name: due_before, in: query, schema: {type: string, format: date-time}}
+        - {name: due_after, in: query, schema: {type: string, format: date-time}}
+        - {$ref: '#/components/parameters/Limit'}
+        - {$ref: '#/components/parameters/Cursor'}
+        - {name: offset, in: query, deprecated: true, schema: {type: integer, minimum: 0}}
+      responses:
+        '200':
+          description: One page, newest first; a full page carries the next cursor
+          headers:
+            X-Next-Cursor: {description: Opaque cursor for the next page, schema: {type: string}}
+            Link: {description: 'RFC 8288 rel="next"', schema: {type: string}}
+          content:
+            application/json:
+              schema: {type: array, items: {$ref: '#/components/schemas/Obligation'}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /v1/obligations/{obligation_id}:
+    parameters: [{$ref: '#/components/parameters/ObligationID'}]
+    get:
+      tags: [obligations]
+      operationId: getObligation
+      responses:
+        '200':
+          description: The obligation
+          headers:
+            ETag: {$ref: '#/components/headers/ETag'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Obligation'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+    patch:
+      tags: [obligations]
+      operationId: updateObligation
+      summary: Change due date, severity or responsible function (If-Match required)
+      parameters: [{$ref: '#/components/parameters/IfMatch'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/UpdateObligation'}
+      responses:
+        '200':
+          description: Updated (or unchanged when nothing differed)
+          headers:
+            ETag: {$ref: '#/components/headers/ETag'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Obligation'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '412': {$ref: '#/components/responses/Problem'}
+        '428': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /v1/obligations/{obligation_id}/status:
+    parameters: [{$ref: '#/components/parameters/ObligationID'}]
+    post:
+      tags: [obligations]
+      operationId: updateObligationStatus
+      parameters: [{$ref: '#/components/parameters/IfMatchOptional'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [obligation_status]
+              additionalProperties: false
+              properties:
+                obligation_status: {$ref: '#/components/schemas/ObligationStatus'}
+      responses:
+        '200':
+          description: Transitioned, or already in that status
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Obligation'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '412': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /v1/obligations/{obligation_id}/workflow:
+    parameters: [{$ref: '#/components/parameters/ObligationID'}]
+    post:
+      tags: [obligations]
+      operationId: linkWorkflow
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [workflow_id]
+              additionalProperties: false
+              properties:
+                workflow_id: {type: string}
+      responses:
+        '200': {description: Linked, content: {application/json: {schema: {$ref: '#/components/schemas/Obligation'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+    delete:
+      tags: [obligations]
+      operationId: unlinkWorkflow
+      responses:
+        '200': {description: Unlinked, content: {application/json: {schema: {$ref: '#/components/schemas/Obligation'}}}}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+  /v1/obligations/{obligation_id}/filing-requirements:
+    parameters: [{$ref: '#/components/parameters/ObligationID'}]
+    post:
+      tags: [filing]
+      operationId: createFilingRequirement
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [filing_type, filing_authority, submission_channel]
+              additionalProperties: false
+              properties:
+                filing_requirement_id: {type: string}
+                filing_type: {type: string}
+                filing_authority: {type: string}
+                submission_channel: {type: string}
+      responses:
+        '201':
+          description: Created (or the existing identical requirement)
+          headers:
+            Location: {$ref: '#/components/headers/Location'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/FilingRequirement'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+    get:
+      tags: [filing]
+      operationId: listFilingRequirements
+      parameters: [{$ref: '#/components/parameters/Limit'}]
+      responses:
+        '200': {description: Newest first, content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/FilingRequirement'}}}}}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+  /v1/obligations/{obligation_id}/filing-requirements/{filing_requirement_id}:
+    parameters: [{$ref: '#/components/parameters/ObligationID'}, {$ref: '#/components/parameters/FilingRequirementID'}]
+    get:
+      tags: [filing]
+      operationId: getFilingRequirement
+      responses:
+        '200': {description: The filing requirement, content: {application/json: {schema: {$ref: '#/components/schemas/FilingRequirement'}}}}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+  /v1/obligations/{obligation_id}/filing-requirements/{filing_requirement_id}/status:
+    parameters: [{$ref: '#/components/parameters/ObligationID'}, {$ref: '#/components/parameters/FilingRequirementID'}]
+    post:
+      tags: [filing]
+      operationId: updateFilingStatus
+      summary: 'PENDING → IN_PREPARATION → SUBMITTED → ACCEPTED | REJECTED; WITHDRAWN as an exit'
+      parameters: [{$ref: '#/components/parameters/IfMatchOptional'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [filing_status]
+              additionalProperties: false
+              properties:
+                filing_status: {$ref: '#/components/schemas/FilingStatus'}
+                reason: {type: string, description: Required for REJECTED and WITHDRAWN}
+                expected_version: {type: integer}
+      responses:
+        '200': {description: Moved (or already in that status), content: {application/json: {schema: {$ref: '#/components/schemas/FilingRequirement'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '412': {$ref: '#/components/responses/Problem'}
+  /v1/obligations/{obligation_id}/filing-requirements/{filing_requirement_id}/transitions:
+    parameters: [{$ref: '#/components/parameters/ObligationID'}, {$ref: '#/components/parameters/FilingRequirementID'}]
+    get:
+      tags: [filing]
+      operationId: listFilingTransitions
+      responses:
+        '200':
+          description: Append-only history, oldest first
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    transition_id: {type: string}
+                    filing_requirement_id: {type: string}
+                    from_status: {$ref: '#/components/schemas/FilingStatus'}
+                    to_status: {$ref: '#/components/schemas/FilingStatus'}
+                    reason: {type: [string, 'null']}
+                    actor_principal_id: {type: string}
+                    correlation_id: {type: string}
+                    created_at: {type: string, format: date-time}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+  /v1/obligations/{obligation_id}/applicability-decisions:
+    parameters: [{$ref: '#/components/parameters/ObligationID'}]
+    post:
+      tags: [applicability]
+      operationId: createApplicabilityDecision
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CreateApplicabilityDecision'}
+      responses:
+        '201':
+          description: Recorded
+          headers:
+            Location: {$ref: '#/components/headers/Location'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ApplicabilityDecision'}
+        '200': {description: Replay of the same Idempotency-Key and body, content: {application/json: {schema: {$ref: '#/components/schemas/ApplicabilityDecision'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+    get:
+      tags: [applicability]
+      operationId: listApplicabilityDecisions
+      parameters:
+        - {name: jurisdiction_code, in: query, required: true, schema: {type: string}}
+        - {name: entity_ref, in: query, required: true, schema: {type: string}}
+        - {$ref: '#/components/parameters/Limit'}
+      responses:
+        '200': {description: Versioned history, content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/ApplicabilityDecision'}}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+  /v1/obligations/{obligation_id}/applicability:
+    parameters: [{$ref: '#/components/parameters/ObligationID'}]
+    get:
+      tags: [applicability]
+      operationId: getCurrentApplicability
+      parameters:
+        - {name: jurisdiction_code, in: query, required: true, schema: {type: string}}
+        - {name: entity_ref, in: query, required: true, schema: {type: string}}
+      responses:
+        '200':
+          description: The decision in force now, or UNASSESSED
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  obligation_id: {type: string}
+                  jurisdiction_code: {type: string}
+                  entity_ref: {type: string}
+                  status: {type: string, enum: [UNASSESSED, APPLICABLE, NOT_APPLICABLE, UNCERTAIN]}
+                  decision: {$ref: '#/components/schemas/ApplicabilityDecision'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+  /v1/obligation-definitions:
+    post:
+      tags: [definitions]
+      operationId: createDefinition
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - type: object
+                  required: [definition_code]
+                  properties:
+                    definition_code: {type: string, maxLength: 128}
+                - {$ref: '#/components/schemas/DefinitionContent'}
+      responses:
+        '201':
+          description: Created at version 1
+          headers:
+            Location: {$ref: '#/components/headers/Location'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ObligationDefinition'}
+        '200': {description: Same code and content already defined, content: {application/json: {schema: {$ref: '#/components/schemas/ObligationDefinition'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+    get:
+      tags: [definitions]
+      operationId: listDefinitions
+      parameters:
+        - {name: status, in: query, schema: {type: string, enum: [ACTIVE, RETIRED]}}
+        - {$ref: '#/components/parameters/Limit'}
+        - {$ref: '#/components/parameters/Cursor'}
+      responses:
+        '200': {description: Code order, content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/ObligationDefinition'}}}}}
+        '403': {$ref: '#/components/responses/Problem'}
+  /v1/obligation-definitions/{definition_id}:
+    parameters: [{$ref: '#/components/parameters/DefinitionID'}]
+    get:
+      tags: [definitions]
+      operationId: getDefinition
+      responses:
+        '200': {description: The definition with its current version, content: {application/json: {schema: {$ref: '#/components/schemas/ObligationDefinition'}}}}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+  /v1/obligation-definitions/{definition_id}/versions:
+    parameters: [{$ref: '#/components/parameters/DefinitionID'}]
+    get:
+      tags: [definitions]
+      operationId: listDefinitionVersions
+      responses:
+        '200': {description: 'Every version, newest first', content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/DefinitionVersion'}}}}}
+        '404': {$ref: '#/components/responses/Problem'}
+    post:
+      tags: [definitions]
+      operationId: newDefinitionVersion
+      summary: Supersede the current version (If-Match required)
+      parameters: [{$ref: '#/components/parameters/IfMatch'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - {$ref: '#/components/schemas/DefinitionContent'}
+                - type: object
+                  required: [change_reason]
+                  properties:
+                    change_reason: {type: string}
+                    expected_version: {type: integer}
+      responses:
+        '200': {description: New current version, content: {application/json: {schema: {$ref: '#/components/schemas/ObligationDefinition'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '412': {$ref: '#/components/responses/Problem'}
+        '428': {$ref: '#/components/responses/Problem'}
+  /v1/obligation-definitions/{definition_id}/retire:
+    parameters: [{$ref: '#/components/parameters/DefinitionID'}]
+    post:
+      tags: [definitions]
+      operationId: retireDefinition
+      parameters: [{$ref: '#/components/parameters/IfMatchOptional'}]
+      responses:
+        '200': {description: Retired (no new obligations; existing ones unchanged), content: {application/json: {schema: {$ref: '#/components/schemas/ObligationDefinition'}}}}
+        '404': {$ref: '#/components/responses/Problem'}
+        '412': {$ref: '#/components/responses/Problem'}
+  /v1/obligation-definitions/{definition_id}/entity-mappings:
+    parameters: [{$ref: '#/components/parameters/DefinitionID'}]
+    post:
+      tags: [definitions]
+      operationId: createEntityMapping
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [legal_entity_id]
+              additionalProperties: false
+              properties:
+                legal_entity_id: {type: string}
+                effective_from: {type: string, format: date-time}
+      responses:
+        '201':
+          description: Mapping opened
+          headers:
+            Location: {$ref: '#/components/headers/Location'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/EntityMapping'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '422': {$ref: '#/components/responses/Problem'}
+    get:
+      tags: [definitions]
+      operationId: listEntityMappings
+      responses:
+        '200': {description: Open and ended mappings, content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/EntityMapping'}}}}}
+        '404': {$ref: '#/components/responses/Problem'}
+  /v1/obligation-definitions/{definition_id}/entity-mappings/{mapping_id}/end:
+    parameters:
+      - {$ref: '#/components/parameters/DefinitionID'}
+      - {name: mapping_id, in: path, required: true, schema: {type: string}}
+    post:
+      tags: [definitions]
+      operationId: endEntityMapping
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                effective_to: {type: string, format: date-time}
+      responses:
+        '200': {description: Ended (or already ended), content: {application/json: {schema: {$ref: '#/components/schemas/EntityMapping'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+  /healthz:
+    get:
+      tags: [probes]
+      operationId: liveness
+      security: []
+      responses:
+        '200': {description: Process up}
+  /readyz:
+    get:
+      tags: [probes]
+      operationId: readiness
+      security: []
+      responses:
+        '200': {description: Database reachable}
+        '503': {description: Not ready}
+components:
+  securitySchemes:
+    identityEnvelope:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: identity-context-svc's signed identity envelope (RS256, JWKS); its session must still be live.
+  headers:
+    Location:
+      description: URL of the created resource
+      schema: {type: string}
+    ETag:
+      description: The aggregate's version, for If-Match
+      schema: {type: string}
+  parameters:
+    ObligationID: {name: obligation_id, in: path, required: true, schema: {type: string, format: uuid}}
+    FilingRequirementID: {name: filing_requirement_id, in: path, required: true, schema: {type: string, format: uuid}}
+    DefinitionID: {name: definition_id, in: path, required: true, schema: {type: string, format: uuid}}
+    IdempotencyKey: {name: Idempotency-Key, in: header, required: true, schema: {type: string}}
+    LegalEntityHeader: {name: X-Legal-Entity-Id, in: header, required: true, description: Must equal the body's legal_entity_id, schema: {type: string}}
+    IfMatch: {name: If-Match, in: header, required: true, description: 'The version this change is based on, e.g. "3"', schema: {type: string}}
+    IfMatchOptional: {name: If-Match, in: header, required: false, schema: {type: string}}
+    Limit: {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 200, default: 50}}
+    Cursor: {name: cursor, in: query, description: X-Next-Cursor from the previous page, schema: {type: string}}
+  responses:
+    Problem:
+      description: RFC 9457 problem document
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+  schemas:
+    Problem:
+      type: object
+      required: [type, title, status, code]
+      properties:
+        type: {type: string}
+        title: {type: string}
+        status: {type: integer}
+        detail: {type: string}
+        instance: {type: string}
+        code: {type: string}
+        error: {type: string, description: Legacy snake_case code}
+        error_class: {type: string, description: 'Governance Control Plane §16 stable class, when the code has one'}
+        retryable: {type: boolean}
+        request_id: {type: string}
+        correlation_id: {type: string}
+      additionalProperties: true
+    ObligationStatus: {type: string, enum: [OPEN, IN_PROGRESS, OVERDUE, CLOSED]}
+    FilingStatus: {type: string, enum: [PENDING, IN_PREPARATION, SUBMITTED, ACCEPTED, REJECTED, WITHDRAWN]}
+    Obligation:
+      type: object
+      properties:
+        obligation_id: {type: string, format: uuid}
+        legal_entity_id: {type: string}
+        jurisdiction_id: {type: string}
+        workflow_id: {type: [string, 'null']}
+        obligation_source_type: {type: string}
+        obligation_source_id: {type: string}
+        obligation_code: {type: string}
+        obligation_type: {type: string}
+        obligation_status: {$ref: '#/components/schemas/ObligationStatus'}
+        due_date: {type: string, format: date-time}
+        severity_level: {type: string}
+        responsible_function: {type: string}
+        source_reference: {type: string}
+        created_at: {type: string, format: date-time}
+        created_by_principal_id: {type: string}
+        updated_at: {type: string, format: date-time}
+        closed_at: {type: [string, 'null'], format: date-time}
+        version: {type: integer}
+        obligation_definition_id: {type: string}
+        definition_version: {type: integer}
+    CreateObligation:
+      type: object
+      required: [legal_entity_id, obligation_code, due_date, created_by_principal_id]
+      additionalProperties: false
+      description: |
+        jurisdiction_id, obligation_type, obligation_source_type, obligation_source_id,
+        source_reference, severity_level and responsible_function are required unless
+        obligation_definition_id is given, in which case they are taken from the
+        definition's current version (or must equal it).
+      properties:
+        obligation_id: {type: string, format: uuid}
+        legal_entity_id: {type: string}
+        jurisdiction_id: {type: string}
+        obligation_source_type: {type: string}
+        obligation_source_id: {type: string}
+        obligation_code: {type: string, maxLength: 128}
+        obligation_type: {type: string}
+        due_date: {type: string, format: date-time}
+        severity_level: {type: string}
+        responsible_function: {type: string}
+        source_reference: {type: string}
+        created_by_principal_id: {type: string, description: Must equal the authenticated principal}
+        workflow_id: {type: string}
+        obligation_definition_id: {type: string}
+        definition_version: {type: integer}
+    UpdateObligation:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        due_date: {type: string, format: date-time}
+        severity_level: {type: string}
+        responsible_function: {type: string}
+        expected_version: {type: integer}
+    FilingRequirement:
+      type: object
+      properties:
+        filing_requirement_id: {type: string}
+        obligation_id: {type: string}
+        filing_type: {type: string}
+        filing_authority: {type: string}
+        submission_channel: {type: string}
+        filing_status: {$ref: '#/components/schemas/FilingStatus'}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+        row_version: {type: integer}
+    CreateApplicabilityDecision:
+      type: object
+      required: [jurisdiction_code, entity_ref, decision, source_rule_ref, source_rule_version, effective_from, created_by_principal_id]
+      additionalProperties: false
+      description: Exactly one of decided_by_principal_id (the caller) or decided_by_system.
+      properties:
+        applicability_decision_id: {type: string}
+        jurisdiction_code: {type: string}
+        entity_ref: {type: string}
+        activity_ref: {type: string}
+        product_process_ref: {type: string}
+        decision: {type: string, enum: [APPLICABLE, NOT_APPLICABLE, UNCERTAIN]}
+        source_rule_ref: {type: string}
+        source_rule_version: {type: string}
+        effective_from: {type: string, format: date-time}
+        effective_to: {type: string, format: date-time}
+        facts_used: {type: object}
+        confidence: {type: number}
+        uncertainty_notes: {type: string}
+        decided_by_principal_id: {type: string}
+        decided_by_system: {type: string}
+        review_required: {type: boolean}
+        created_by_principal_id: {type: string}
+    ApplicabilityDecision:
+      type: object
+      properties:
+        applicability_decision_id: {type: string}
+        obligation_id: {type: string}
+        jurisdiction_code: {type: string}
+        entity_ref: {type: string}
+        decision: {type: string}
+        source_rule_ref: {type: string}
+        source_rule_version: {type: string}
+        effective_from: {type: string, format: date-time}
+        effective_to: {type: [string, 'null'], format: date-time}
+        facts_used: {type: object}
+        decided_by_principal_id: {type: [string, 'null']}
+        decided_by_system: {type: [string, 'null']}
+        review_required: {type: boolean}
+        created_at: {type: string, format: date-time}
+        created_by_principal_id: {type: string}
+      additionalProperties: true
+    DefinitionContent:
+      type: object
+      required: [jurisdiction_id, obligation_type, obligation_source_type, obligation_source_id, source_reference, severity_level, responsible_function]
+      properties:
+        jurisdiction_id: {type: string}
+        obligation_type: {type: string}
+        obligation_source_type: {type: string}
+        obligation_source_id: {type: string}
+        source_reference: {type: string}
+        severity_level: {type: string}
+        responsible_function: {type: string}
+        description: {type: string}
+    DefinitionVersion:
+      allOf:
+        - {$ref: '#/components/schemas/DefinitionContent'}
+        - type: object
+          properties:
+            obligation_definition_id: {type: string}
+            version: {type: integer}
+            change_reason: {type: string}
+            created_at: {type: string, format: date-time}
+            created_by_principal_id: {type: string}
+    ObligationDefinition:
+      type: object
+      properties:
+        obligation_definition_id: {type: string}
+        definition_code: {type: string}
+        current_version: {type: integer}
+        definition_status: {type: string, enum: [ACTIVE, RETIRED]}
+        created_at: {type: string, format: date-time}
+        created_by_principal_id: {type: string}
+        updated_at: {type: string, format: date-time}
+        retired_at: {type: [string, 'null'], format: date-time}
+        current: {$ref: '#/components/schemas/DefinitionVersion'}
+    EntityMapping:
+      type: object
+      properties:
+        mapping_id: {type: string}
+        obligation_definition_id: {type: string}
+        legal_entity_id: {type: string}
+        effective_from: {type: string, format: date-time}
+        effective_to: {type: [string, 'null'], format: date-time}
+        created_at: {type: string, format: date-time}
+        created_by_principal_id: {type: string}
+        ended_by_principal_id: {type: [string, 'null']}

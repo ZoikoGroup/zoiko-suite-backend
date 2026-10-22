@@ -36,7 +36,7 @@ import (
 	"golang.org/x/text/unicode/norm"
 
 	"zoiko.io/search-indexer-svc/internal/domain"
-	"zoiko.io/search-indexer-svc/internal/envelope"
+	svcenvelope "zoiko.io/search-indexer-svc/internal/envelope"
 )
 
 var (
@@ -215,15 +215,17 @@ func (p *HTTPProvider) Embed(ctx context.Context, spec domain.EmbeddingSpec, inp
 		req.Header.Set("Authorization", "Bearer "+p.token)
 	}
 	// Trace headers only, and only when there is a request behind this call.
-	// NOT the caller's identity: the provider is a processor of text, not a
-	// party to the authorization decision, and handing it principal ids would
-	// widen what it learns about who searches for what (§9.2).
-	if env, ok := envelope.FromContext(ctx); ok {
+	// NOT the caller's identity, and NOT svcenvelope.ForwardTo: the provider
+	// is a processor of text, not a party to the authorization decision, and
+	// handing it principal, tenant and entity ids alongside the query would
+	// tell it who searches for what (AB-001 §9.2). ForwardTo was put here on
+	// 15 Oct and reverted on 19 Oct (Group 1 re-audit F-6); a test pins it.
+	if env, ok := svcenvelope.FromContext(ctx); ok {
 		if env.RequestID != "" {
-			req.Header.Set(envelope.HeaderRequestID, env.RequestID)
+			req.Header.Set(svcenvelope.HeaderRequestID, env.RequestID)
 		}
 		if env.CorrelationID != "" {
-			req.Header.Set(envelope.HeaderCorrelationID, env.CorrelationID)
+			req.Header.Set(svcenvelope.HeaderCorrelationID, env.CorrelationID)
 		}
 	}
 

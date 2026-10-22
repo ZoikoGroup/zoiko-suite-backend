@@ -18,16 +18,16 @@ Headers forwarded from the verified caller: X-Tenant-Id, X-Principal-Id,
   ],
   "next_cursor": "",            // empty on the last page
   "watermark": "…",             // REQUIRED, identical on every page of one extraction
-  "declared_totals": {          // REQUIRED for Wave 2 sources
+  "declared_totals": {          // REQUIRED from every source, identical on every page
     "row_count": 1234,
     "totals": { "USD": "98765.43" }
   }
 }
 ```
 
-A *population name* is `a-z 0-9 _ -`. A control definition references it as
+A *population name* is 1–64 characters of `a-z 0-9 _ -`, starting with a letter or digit. A control definition references it as
 `{"system": "<registered name>", "population": "<name>", "params": {"k": "v"}}` in
-`source_spec` (side A) and `target_spec` (side B). `params` keys are `a-z_` (max 32 chars),
+`source_spec` (side A) and `target_spec` (side B). At most 8 `params`; keys are `a-z_` (max 32 chars),
 values max 512 chars; the reserved names `legal_entity_id`, `period_id`, `limit`, `cursor`
 cannot be used. **A source must reject (400) any query parameter it does not define** —
 a misspelt filter must never silently widen or narrow a population.
@@ -54,7 +54,7 @@ a misspelt filter must never silently widen or narrow a population.
 The control **fails closed**. Any of the following ends the run `FAILED` with result
 `INDETERMINATE` — never `PASS`: source unreachable / non-200 / unreadable body; system not
 registered in `SOURCE_ENDPOINTS`; no `watermark` or one that changed between pages;
-`declared_totals` not tying to the received records; an invalid record; more than 200,000
+no `declared_totals`, or ones that differ between pages or do not tie to the received records; an invalid record; more than 200,000
 records.
 
 ## Wave 2 population definitions
@@ -129,6 +129,29 @@ For each side the control freezes an **append-only** snapshot: row count, per-cu
 control totals, `sha256` population hash, the source `watermark`, and every record. The
 snapshot is referenced by the sealed evidence package. Data arriving later at the source
 never changes a frozen population; it is picked up by a **new run**.
+
+## Late-data re-checks after certification
+
+`financial-control-svc` polls this contract again after a run is certified, not only
+during execution. A background sweep (every 10 minutes; each certified run checked at
+most once per 30 minutes, oldest-checked first) re-reads each side's current
+`watermark` with `limit=1` and no `cursor`, using the exact population spec the run
+itself resolved and the identity of the principal who executed it (per this
+contract's own rule that the source authorizes the human caller, not the service —
+see "Rules every source must honour" above). It never re-reads the frozen records and
+never mutates anything the source holds.
+
+If the watermark no longer matches the one the run froze, the service opens a
+`LATE_DATA` exception on that run and reports the close gate blocking
+(`LATE_DATA_AFTER_CERTIFICATION`) until the exception is resolved under authority or a
+new run supersedes the certified one (ZS-CONTROL-001 Invariant 14).
+
+**Expect, for as long as a run stays the latest certified one for a control:** roughly
+one `limit=1` request every 30 minutes, indefinitely, from the same principal who
+originally executed the run — not a one-time read at execution. If that source is
+unreachable during a check, the run is not failed and the gate is not blocked; the
+check is recorded as `UNVERIFIED` and logged, distinct from a confirmed watermark
+change.
 
 ## Implementation status (Wave 2)
 

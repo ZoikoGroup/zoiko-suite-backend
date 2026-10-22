@@ -37,6 +37,21 @@ type Config struct {
 	// context.md §11.2 for why this decision went the strict way).
 	DocumentVaultServiceURL string
 
+	// TenantRegistryURL is tenant-entity-registry-svc's base URL: the legal
+	// entity an evaluation or requirement names is confirmed there (exists,
+	// in the caller's tenant), fail-closed. Required outside local/dev.
+	TenantRegistryURL string
+
+	// EvaluateAuthzMode gates POST /v1/evidence/evaluate on EVIDENCE_EVALUATE
+	// at the legal entity: "enforce" (default) or "warn" (log a refusal and
+	// admit, while the gated callers' principals are being granted).
+	EvaluateAuthzMode string
+
+	// ReadAuthzMode gates the catalogue and ledger reads on
+	// EVIDENCE_REQUIREMENT_READ / EVIDENCE_EVALUATION_READ: "enforce"
+	// (default) or "warn".
+	ReadAuthzMode string
+
 	// OTELExporterEndpoint is where internal/telemetry sends OTLP/HTTP
 	// traces (03-microservices.md §3.8's Observability Baseline).
 	OTELExporterEndpoint string
@@ -93,8 +108,20 @@ func Load() (*Config, error) {
 		AuthzMTLSURL:             env("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),
 		MTLSManagementServiceURL: env("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
 		DocumentVaultServiceURL:  env("DOCUMENT_VAULT_SERVICE_URL", "http://document-vault-svc:8094"),
+		TenantRegistryURL:        os.Getenv("TENANT_REGISTRY_URL"),
+		EvaluateAuthzMode:        strings.ToLower(env("EVIDENCE_EVALUATE_AUTHZ", "enforce")),
+		ReadAuthzMode:            strings.ToLower(env("EVIDENCE_READ_AUTHZ", "enforce")),
 		OTELExporterEndpoint:     env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 	}, nil
+}
+
+// LocalEnv reports whether Env names a developer tier.
+func (c *Config) LocalEnv() bool {
+	switch strings.ToLower(c.Env) {
+	case "local", "dev", "development", "test":
+		return true
+	}
+	return false
 }
 
 func env(key, def string) string {
