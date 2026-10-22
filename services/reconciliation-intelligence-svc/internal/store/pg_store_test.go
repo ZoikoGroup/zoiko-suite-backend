@@ -45,6 +45,8 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 		"000002_add_eventing_outbox.up.sql",
 		"000003_bank_reconciliation_source.up.sql",
 		"000004_suggestion_counterpart_line.up.sql",
+		"000005_suggestion_score_provenance.up.sql",
+		"000006_suggestion_data_model_names.up.sql",
 	} {
 		sql, err := os.ReadFile(filepath.Join(base, "../../deployments/migrations", migration))
 		if err != nil {
@@ -66,7 +68,7 @@ const (
 // newTestJob is a run-sourced job: one suggestion about one UNMATCHED
 // bank-reconciliation statement line. Match counters are nil — not measured
 // by this service.
-func newTestJob(legalEntityID string) (*domain.ReconciliationJob, []domain.UnmatchedItem) {
+func newTestJob(legalEntityID string) (*domain.ReconciliationJob, []domain.ReconciliationSuggestion) {
 	job := &domain.ReconciliationJob{
 		LegalEntityID:           legalEntityID,
 		JobName:                 "test-job",
@@ -76,17 +78,19 @@ func newTestJob(legalEntityID string) (*domain.ReconciliationJob, []domain.Unmat
 		UnmatchedCount:          1,
 		Status:                  "COMPLETED",
 	}
-	items := []domain.UnmatchedItem{{
+	items := []domain.ReconciliationSuggestion{{
 		BankReconciliationRunID: testRunID,
 		StatementLineID:         testLineID,
-		TransactionRefA:         "REF-1",
+		SourceRecordA:           "REF-1",
 		AmountA:                 "100.25",
 		AmountB:                 "132.5",
 		DiscrepancyAmount:       "32.25",
 		DiscrepancyType:         domain.DiscrepancyMissingReference,
 		ConfidenceScore:         60,
+		HeuristicRule:           domain.HeuristicMissingReferenceManualReview,
+		ToleranceVersion:        3,
 		Recommendation:          domain.RecommendationManualReview,
-		ResolutionStatus:        "RECOMMENDED",
+		SuggestionStatus:        "RECOMMENDED",
 		ResolutionNotes:         "heuristic: above tolerance",
 	}}
 	return job, items
@@ -177,6 +181,14 @@ func TestPgStore_ApplyResolution_EnqueuesResolutionEvent(t *testing.T) {
 	if count != 1 {
 		t.Fatalf("expected exactly 1 resolution-recommended outbox event, got %d", count)
 	}
+
+	var status string
+	if err := pool.QueryRow(ctx, `SELECT suggestion_status FROM reconciliation_unmatched_items WHERE id = $1`, itemID).Scan(&status); err != nil {
+		t.Fatalf("status select: %v", err)
+	}
+	if status != string(domain.StatusApproved) {
+		t.Fatalf("stored suggestion_status = %q, want APPROVED", status)
+	}
 }
 
 // TestPgStore_AmountsRoundTripExactly proves money survives NUMERIC(18,4)
@@ -221,6 +233,75 @@ func TestPgStore_AmountsRoundTripExactly(t *testing.T) {
 	}
 	if resolved.AmountA != "100.25" || resolved.AmountB != "132.5" || resolved.DiscrepancyAmount != "32.25" {
 		t.Fatalf("ApplyResolution amounts = %s / %s / %s, want 100.25 / 132.5 / 32.25", resolved.AmountA, resolved.AmountB, resolved.DiscrepancyAmount)
+	}
+}
+
+// TestPgStore_ScoreProvenanceRoundTrips proves A8's two provenance fields
+// survive storage and read-back: the named rule that fired and the exact
+// tolerance-policy version the suggestion was evaluated against.
+func TestPgStore_ScoreProvenanceRoundTrips(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.NewPgStore(pool, store.WithEventRegion("test"))
+
+	tenantID := uuid.New().String()
+	ctx := context.Background()
+
+	job, items := newTestJob("le-us")
+	if err := s.CreateJob(ctx, tenantID, job, items, "actor-1", "corr-1"); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+
+	var rule string
+	var version int
+	if err := pool.QueryRow(ctx, `SELECT heuristic_rule, tolerance_version
+		FROM reconciliation_unmatched_items WHERE job_id = $1`, job.ID).Scan(&rule, &version); err != nil {
+		t.Fatalf("raw select: %v", err)
+	}
+	if rule != string(domain.HeuristicMissingReferenceManualReview) || version != 3 {
+		t.Fatalf("stored provenance = %q / %d, want %q / 3",
+			rule, version, domain.HeuristicMissingReferenceManualReview)
+	}
+
+	got, err := s.GetJobByID(ctx, tenantID, job.ID)
+	if err != nil {
+		t.Fatalf("GetJobByID: %v", err)
+	}
+	it := got.UnmatchedItems[0]
+	if it.HeuristicRule != domain.HeuristicMissingReferenceManualReview || it.ToleranceVersion != 3 {
+		t.Fatalf("read-back provenance = %q / %d, want %q / 3",
+			it.HeuristicRule, it.ToleranceVersion, domain.HeuristicMissingReferenceManualReview)
+	}
+}
+
+// TestPgStore_SuggestionCarriesItsLegalEntity proves A9's item-level
+// legal_entity_id is written from the job and survives the read path, not
+// merely stored on the job.
+func TestPgStore_SuggestionCarriesItsLegalEntity(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.NewPgStore(pool, store.WithEventRegion("test"))
+
+	tenantID := uuid.New().String()
+	ctx := context.Background()
+
+	job, items := newTestJob("le-suggestion")
+	if err := s.CreateJob(ctx, tenantID, job, items, "actor-1", "corr-1"); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+
+	var stored string
+	if err := pool.QueryRow(ctx, `SELECT legal_entity_id FROM reconciliation_unmatched_items WHERE job_id = $1`, job.ID).Scan(&stored); err != nil {
+		t.Fatalf("raw select: %v", err)
+	}
+	if stored != "le-suggestion" {
+		t.Fatalf("stored legal_entity_id = %q, want le-suggestion", stored)
+	}
+
+	got, err := s.GetJobByID(ctx, tenantID, job.ID)
+	if err != nil {
+		t.Fatalf("GetJobByID: %v", err)
+	}
+	if got.UnmatchedItems[0].LegalEntityID != "le-suggestion" {
+		t.Fatalf("read-back legal_entity_id = %q, want le-suggestion", got.UnmatchedItems[0].LegalEntityID)
 	}
 }
 

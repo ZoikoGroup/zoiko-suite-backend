@@ -77,7 +77,8 @@ func createJob(t *testing.T, s *store.PgStore, tenantID string, invalidCount int
 	}
 	var entries []domain.AuditEntry
 	for i := 0; i < invalidCount; i++ {
-		entries = append(entries, domain.AuditEntry{RecordRef: "rec-" + uuid.NewString()[:8], FieldName: "amount", ViolationType: domain.ViolationMissingRequired})
+		entries = append(entries, domain.AuditEntry{RecordRef: "rec-" + uuid.NewString()[:8], FieldName: "amount", ViolationType: domain.ViolationMissingRequired,
+			Severity: domain.SeverityMQ2, ReasonFamily: domain.ReasonSchema, OwnerID: "owner-1"})
 	}
 	require.NoError(t, s.CreateJob(context.Background(), tenantID, job, nil, entries, "principal-1", "corr-1"))
 	return job

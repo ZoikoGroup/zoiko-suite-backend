@@ -40,7 +40,7 @@ func TestReconciliation_HappyPath_MatchAndCertify(t *testing.T) {
 		t.Fatalf("match results: %+v", results)
 	}
 
-	cert, err := f.s.Certify(f.ctx, orgA, run.RunID, "certifier", f.claim("Certify", run.RunID))
+	cert, err := f.s.Certify(f.ctx, orgA, run.RunID, "certifier", grant("certifier"), f.claim("Certify", run.RunID))
 	if err != nil {
 		t.Fatalf("certify: %v", err)
 	}
@@ -94,7 +94,7 @@ func TestReconciliation_EqualTotalsDifferentComposition_SurfacesExceptions(t *te
 		t.Fatalf("expected 4 exceptions (one per item), got %d: %+v", len(exceptions), exceptions)
 	}
 
-	if _, err := f.s.Certify(f.ctx, orgA, run.RunID, "test-operator", f.claim("Certify", run.RunID)); !errors.Is(err, domain.ErrOpenExceptionsRemain) {
+	if _, err := f.s.Certify(f.ctx, orgA, run.RunID, "test-operator", grant("test-operator"), f.claim("Certify", run.RunID)); !errors.Is(err, domain.ErrOpenExceptionsRemain) {
 		t.Fatalf("certify with open exceptions: %v", err)
 	}
 }
@@ -112,7 +112,7 @@ func TestReconciliation_ToleranceCannotBeWidenedOnCertifiedRun(t *testing.T) {
 	if _, err := f.s.Match(f.ctx, orgA, run.RunID, domain.MatchRequest{}, "test-operator", f.claim("Match", run.RunID)); err != nil {
 		t.Fatalf("match: %v", err)
 	}
-	if _, err := f.s.Certify(f.ctx, orgA, run.RunID, "certifier", f.claim("Certify", run.RunID)); err != nil {
+	if _, err := f.s.Certify(f.ctx, orgA, run.RunID, "certifier", grant("certifier"), f.claim("Certify", run.RunID)); err != nil {
 		t.Fatalf("certify: %v", err)
 	}
 
@@ -235,7 +235,7 @@ func (f *fixture) matchAndCertify(runID string) {
 	if _, err := f.s.Match(f.ctx, orgA, runID, domain.MatchRequest{}, "test-operator", f.claim("Match", runID)); err != nil {
 		f.t.Fatalf("match %s: %v", runID, err)
 	}
-	if _, err := f.s.Certify(f.ctx, orgA, runID, "certifier", f.claim("Certify", runID)); err != nil {
+	if _, err := f.s.Certify(f.ctx, orgA, runID, "certifier", grant("certifier"), f.claim("Certify", runID)); err != nil {
 		f.t.Fatalf("certify %s: %v", runID, err)
 	}
 }
@@ -335,7 +335,7 @@ func TestReconciliation_EmptySide_SurfacesExceptionsAndBlocksCertify(t *testing.
 	if items != 2 || balances != 1 {
 		t.Fatalf("expected 2 item exceptions and 1 balance exception, got %d and %d: %+v", items, balances, exceptions)
 	}
-	if _, err := f.s.Certify(f.ctx, orgA, run.RunID, "test-operator", f.claim("Certify", run.RunID)); !errors.Is(err, domain.ErrOpenExceptionsRemain) {
+	if _, err := f.s.Certify(f.ctx, orgA, run.RunID, "test-operator", grant("test-operator"), f.claim("Certify", run.RunID)); !errors.Is(err, domain.ErrOpenExceptionsRemain) {
 		t.Fatalf("certify with an empty side: %v, want ErrOpenExceptionsRemain", err)
 	}
 }

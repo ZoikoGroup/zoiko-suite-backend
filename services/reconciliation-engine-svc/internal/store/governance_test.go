@@ -183,7 +183,7 @@ func TestGovernance_AcceptedRiskStaysVariance(t *testing.T) {
 	if r.Assessment == nil || len(r.Assessment.AcceptedRiskIDs) != len(exs) || r.Assessment.Certifiable {
 		t.Fatalf("the run must show its accepted risks: %+v", r.Assessment)
 	}
-	_, err := f.s.Certify(f.ctx, orgA, run.RunID, "certifier", f.claim("Certify", run.RunID))
+	_, err := f.s.Certify(f.ctx, orgA, run.RunID, "certifier", grant("certifier"), f.claim("Certify", run.RunID))
 	if !errors.Is(err, domain.ErrRunNotEligible) || !strings.Contains(err.Error(), "profile") {
 		t.Fatalf("certify over accepted risk without a permitting profile: %v", err)
 	}
@@ -221,7 +221,7 @@ func TestGovernance_CertifyOverPermittedImmaterialRisk(t *testing.T) {
 	r, _ = f.s.GetRun(f.ctx, orgA, run.RunID)
 	wantStates(t, r, domain.RunRunning, domain.ResultVariance, domain.CertEligible)
 
-	cert, err := f.s.Certify(f.ctx, orgA, run.RunID, "certifier", f.claim("Certify", run.RunID))
+	cert, err := f.s.Certify(f.ctx, orgA, run.RunID, "certifier", grant("certifier"), f.claim("Certify", run.RunID))
 	if err != nil {
 		t.Fatalf("certify: %v", err)
 	}
@@ -262,7 +262,7 @@ func TestGovernance_MaterialInAggregateBlocksCertification(t *testing.T) {
 	if a.Certifiable || a.Currencies[0].AcceptedRisk != domain.Material || a.Currencies[0].AcceptedRiskMinor != "1500" {
 		t.Fatalf("aggregate assessment: %+v", a)
 	}
-	if _, err := f.s.Certify(f.ctx, orgA, run.RunID, "certifier", f.claim("Certify", run.RunID)); !errors.Is(err, domain.ErrRunNotEligible) ||
+	if _, err := f.s.Certify(f.ctx, orgA, run.RunID, "certifier", grant("certifier"), f.claim("Certify", run.RunID)); !errors.Is(err, domain.ErrRunNotEligible) ||
 		!strings.Contains(err.Error(), "MATERIAL in aggregate") {
 		t.Fatalf("certify material aggregate: %v", err)
 	}
@@ -392,7 +392,7 @@ func TestGovernance_PreparerCannotCertify(t *testing.T) {
 		t.Fatalf("reperform: %v", err)
 	}
 	for _, preparer := range []string{"test-operator", "matcher", "reperformer"} {
-		if _, err := f.s.Certify(f.ctx, orgA, run.RunID, preparer, f.claim("Certify", run.RunID)); !errors.Is(err, domain.ErrNotIndependentCertifier) {
+		if _, err := f.s.Certify(f.ctx, orgA, run.RunID, preparer, grant(preparer), f.claim("Certify", run.RunID)); !errors.Is(err, domain.ErrNotIndependentCertifier) {
 			t.Fatalf("%s certified a run they prepared: %v", preparer, err)
 		}
 	}
@@ -400,7 +400,7 @@ func TestGovernance_PreparerCannotCertify(t *testing.T) {
 	if r.Status == domain.RunCertified {
 		t.Fatal("a refused certification changed the run")
 	}
-	cert, err := f.s.Certify(f.ctx, orgA, run.RunID, "certifier", f.claim("Certify", run.RunID))
+	cert, err := f.s.Certify(f.ctx, orgA, run.RunID, "certifier", grant("certifier"), f.claim("Certify", run.RunID))
 	if err != nil {
 		t.Fatalf("independent certifier: %v", err)
 	}

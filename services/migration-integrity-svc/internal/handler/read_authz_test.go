@@ -71,11 +71,12 @@ func newRouterWithAuthz(t *testing.T, decide func(body map[string]string) string
 func validateOneJob(t *testing.T, router http.Handler, tenantID, entityID, principalID string) domain.MigrationJob {
 	t.Helper()
 	validateReq := domain.ValidateMigrationRequest{
-		LegalEntityID:  entityID,
-		MigrationName:  "read authorization fixture",
-		SourceSystem:   "LEGACY_ERP",
-		TargetService:  "ledger-svc",
-		RequiredFields: []string{"amount"},
+		LegalEntityID:    entityID,
+		MigrationName:    "read authorization fixture",
+		SourceSystem:     "LEGACY_ERP",
+		TargetService:    "ledger-svc",
+		ExceptionOwnerID: "owner-1",
+		RequiredFields:   []string{"amount"},
 		Records: []domain.MigrationRecord{
 			{Ref: "REC-READ-1", Fields: map[string]string{"amount": "12.00"}},
 		},
@@ -199,11 +200,12 @@ func TestReads_SourceValuesOnlyForAuthorizedReaders(t *testing.T) {
 	newJobWithRawValue := func(t *testing.T, router http.Handler, principalID string) domain.MigrationJob {
 		t.Helper()
 		validateReq := domain.ValidateMigrationRequest{
-			LegalEntityID:  "LE-READ-VALUE",
-			MigrationName:  "raw source value fixture",
-			SourceSystem:   "LEGACY_ERP",
-			TargetService:  "payroll-svc",
-			RequiredFields: []string{"salary"},
+			LegalEntityID:    "LE-READ-VALUE",
+			MigrationName:    "raw source value fixture",
+			SourceSystem:     "LEGACY_ERP",
+			TargetService:    "payroll-svc",
+			ExceptionOwnerID: "owner-1",
+			RequiredFields:   []string{"salary"},
 			Records: []domain.MigrationRecord{
 				{Ref: "REC-VALUE-1", Fields: map[string]string{"salary": rawSalary}},
 			},

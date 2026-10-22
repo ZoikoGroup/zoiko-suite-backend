@@ -108,11 +108,11 @@ func (s *PgStore) CreateJob(ctx context.Context, tenantID string, job *domain.Mi
 		INSERT INTO migration_jobs
 		  (id, tenant_id, legal_entity_id, migration_name, source_system, target_service,
 		   total_records_count, valid_records_count, invalid_records_count, integrity_score,
-		   integrity_score_threshold, status, started_at, completed_at, created_at, updated_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
+		   integrity_score_threshold, blocker_count, status, started_at, completed_at, created_at, updated_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
 		job.ID, tenantID, job.LegalEntityID, job.MigrationName, job.SourceSystem, job.TargetService,
 		job.TotalRecordsCount, job.ValidRecordsCount, job.InvalidRecordsCount, job.IntegrityScore,
-		job.IntegrityScoreThreshold, string(job.Status), job.StartedAt, job.CompletedAt, job.CreatedAt, job.UpdatedAt,
+		job.IntegrityScoreThreshold, job.BlockerCount, string(job.Status), job.StartedAt, job.CompletedAt, job.CreatedAt, job.UpdatedAt,
 	)
 	if err != nil {
 		return fmt.Errorf("insert migration_job: %w", err)
@@ -141,10 +141,12 @@ func (s *PgStore) CreateJob(ctx context.Context, tenantID string, job *domain.Mi
 		entries[i].JobID = job.ID
 		_, err = tx.Exec(ctx, `
 			INSERT INTO migration_audit_entries
-			  (id, tenant_id, job_id, record_ref, field_name, source_value, target_value, violation_type, is_remediated, created_at)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+			  (id, tenant_id, job_id, record_ref, field_name, source_value, target_value, violation_type,
+			   severity, reason_family, owner_id, is_remediated, created_at)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NULLIF($11,''),$12,$13)`,
 			entries[i].ID, tenantID, job.ID, entries[i].RecordRef, entries[i].FieldName,
 			entries[i].SourceValue, entries[i].TargetValue, string(entries[i].ViolationType),
+			string(entries[i].Severity), string(entries[i].ReasonFamily), entries[i].OwnerID,
 			entries[i].IsRemediated, now,
 		)
 		if err != nil {
@@ -157,6 +159,7 @@ func (s *PgStore) CreateJob(ctx context.Context, tenantID string, job *domain.Mi
 			"job_id":          job.ID,
 			"integrity_score": job.IntegrityScore,
 			"status":          string(job.Status),
+			"blocker_count":   job.BlockerCount,
 		}); err != nil {
 		return err
 	}
@@ -191,12 +194,12 @@ func (s *PgStore) GetJobByID(ctx context.Context, tenantID, id string) (*domain.
 	err = tx.QueryRow(ctx, `
 		SELECT id, tenant_id, legal_entity_id, migration_name, source_system, target_service,
 		       total_records_count, valid_records_count, invalid_records_count, integrity_score,
-		       integrity_score_threshold, status, started_at, completed_at, created_at, updated_at
+		       integrity_score_threshold, blocker_count, status, started_at, completed_at, created_at, updated_at
 		FROM migration_jobs
 		WHERE id = $1`, id).Scan(
 		&job.ID, &job.TenantID, &job.LegalEntityID, &job.MigrationName, &job.SourceSystem, &job.TargetService,
 		&job.TotalRecordsCount, &job.ValidRecordsCount, &job.InvalidRecordsCount, &job.IntegrityScore,
-		&job.IntegrityScoreThreshold, &job.Status, &startedAt, &completedAt, &job.CreatedAt, &job.UpdatedAt,
+		&job.IntegrityScoreThreshold, &job.BlockerCount, &job.Status, &startedAt, &completedAt, &job.CreatedAt, &job.UpdatedAt,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("migration job not found: %w", err)
@@ -218,17 +221,22 @@ func (s *PgStore) GetJobByID(ctx context.Context, tenantID, id string) (*domain.
 	}
 
 	arows, err := tx.Query(ctx, `
-		SELECT id, tenant_id, job_id, record_ref, field_name, source_value, target_value, violation_type, is_remediated, created_at,
+		SELECT id, tenant_id, job_id, record_ref, field_name, source_value, target_value, violation_type,
+		       severity, reason_family, owner_id, is_remediated, created_at,
 		       remediation_reason, remediation_evidence_ref, remediated_by, remediated_at
 		FROM migration_audit_entries WHERE job_id = $1 ORDER BY created_at ASC`, id)
 	if err == nil {
 		defer arows.Close()
 		for arows.Next() {
 			var e domain.AuditEntry
-			var fieldName, srcVal, tgtVal, reasonVal, evidenceVal, remediatedBy *string
+			var fieldName, srcVal, tgtVal, ownerID, reasonVal, evidenceVal, remediatedBy *string
 			var remediatedAt *time.Time
-			if err := arows.Scan(&e.ID, &e.TenantID, &e.JobID, &e.RecordRef, &fieldName, &srcVal, &tgtVal, &e.ViolationType, &e.IsRemediated, &e.CreatedAt,
+			if err := arows.Scan(&e.ID, &e.TenantID, &e.JobID, &e.RecordRef, &fieldName, &srcVal, &tgtVal, &e.ViolationType,
+				&e.Severity, &e.ReasonFamily, &ownerID, &e.IsRemediated, &e.CreatedAt,
 				&reasonVal, &evidenceVal, &remediatedBy, &remediatedAt); err == nil {
+				if ownerID != nil {
+					e.OwnerID = *ownerID
+				}
 				if fieldName != nil {
 					e.FieldName = *fieldName
 				}
@@ -271,7 +279,7 @@ func (s *PgStore) ListJobs(ctx context.Context, tenantID, legalEntityID, status 
 	query := `
 		SELECT id, tenant_id, legal_entity_id, migration_name, source_system, target_service,
 		       total_records_count, valid_records_count, invalid_records_count, integrity_score,
-		       integrity_score_threshold, status, started_at, completed_at, created_at, updated_at
+		       integrity_score_threshold, blocker_count, status, started_at, completed_at, created_at, updated_at
 		FROM migration_jobs
 		WHERE 1=1`
 	var args []interface{}
@@ -301,7 +309,7 @@ func (s *PgStore) ListJobs(ctx context.Context, tenantID, legalEntityID, status 
 		if err := rows.Scan(
 			&j.ID, &j.TenantID, &j.LegalEntityID, &j.MigrationName, &j.SourceSystem, &j.TargetService,
 			&j.TotalRecordsCount, &j.ValidRecordsCount, &j.InvalidRecordsCount, &j.IntegrityScore,
-			&j.IntegrityScoreThreshold, &j.Status, &startedAt, &completedAt, &j.CreatedAt, &j.UpdatedAt,
+			&j.IntegrityScoreThreshold, &j.BlockerCount, &j.Status, &startedAt, &completedAt, &j.CreatedAt, &j.UpdatedAt,
 		); err == nil {
 			j.StartedAt = startedAt
 			j.CompletedAt = completedAt
@@ -362,7 +370,7 @@ func (s *PgStore) RemediateEntry(ctx context.Context, tenantID, jobID, entryID, 
 	}
 
 	var e domain.AuditEntry
-	var fieldName, srcVal, tgtVal, reasonVal, evidenceVal, remediatedBy *string
+	var fieldName, srcVal, tgtVal, ownerID, reasonVal, evidenceVal, remediatedBy *string
 	var remediatedAt *time.Time
 	var wasRemediated bool
 	var legalEntityID string
@@ -382,11 +390,12 @@ func (s *PgStore) RemediateEntry(ctx context.Context, tenantID, jobID, entryID, 
 		) prev
 		WHERE e.id = prev.id
 		RETURNING e.id, e.tenant_id, e.job_id, e.record_ref, e.field_name, e.source_value, e.target_value,
-		          e.violation_type, e.is_remediated, e.created_at,
+		          e.violation_type, e.severity, e.reason_family, e.owner_id, e.is_remediated, e.created_at,
 		          e.remediation_reason, e.remediation_evidence_ref, e.remediated_by, e.remediated_at,
 		          prev.is_remediated, prev.legal_entity_id`,
 		entryID, jobID, tenantID, reason, evidenceRef, actorID, time.Now()).Scan(
-		&e.ID, &e.TenantID, &e.JobID, &e.RecordRef, &fieldName, &srcVal, &tgtVal, &e.ViolationType, &e.IsRemediated, &e.CreatedAt,
+		&e.ID, &e.TenantID, &e.JobID, &e.RecordRef, &fieldName, &srcVal, &tgtVal, &e.ViolationType,
+		&e.Severity, &e.ReasonFamily, &ownerID, &e.IsRemediated, &e.CreatedAt,
 		&reasonVal, &evidenceVal, &remediatedBy, &remediatedAt,
 		&wasRemediated, &legalEntityID,
 	)
@@ -401,6 +410,9 @@ func (s *PgStore) RemediateEntry(ctx context.Context, tenantID, jobID, entryID, 
 	}
 	if tgtVal != nil {
 		e.TargetValue = *tgtVal
+	}
+	if ownerID != nil {
+		e.OwnerID = *ownerID
 	}
 	if reasonVal != nil {
 		e.RemediationReason = *reasonVal

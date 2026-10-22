@@ -13,10 +13,16 @@ import (
 
 // TestMain boots an embedded Postgres and points TEST_DATABASE_URL at it, so
 // the service's Postgres tests (which skip when the variable is unset) run
-// for real, same pattern as intercompany-accounting-svc's harness.
+// for real, same pattern as intercompany-accounting-svc's harness. A
+// TEST_DATABASE_URL supplied by the caller wins, so CI can point the suite at
+// a disposable Postgres container and never touch a shared database.
 //
 // Run: go test -tags=integration -count=1 -timeout=400s ./internal/store/
 func TestMain(m *testing.M) {
+	if os.Getenv("TEST_DATABASE_URL") != "" {
+		os.Exit(m.Run())
+	}
+
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		fmt.Printf("free port: %v\n", err)

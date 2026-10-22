@@ -17,10 +17,43 @@ import (
 	"zoiko.io/intercompany-accounting-svc/internal/store"
 )
 
+// migrations is every up migration, in order. openTestPool applies all of
+// them; a migration test applies a prefix, seeds rows the way the older
+// schema allowed, then applies the rest.
+var migrations = []string{
+	"000001_initial_schema.up.sql",
+	"000002_add_idempotency_index.up.sql",
+	"000003_add_acc11_lifecycle.up.sql",
+	"000004_add_eventing_outbox.up.sql",
+	"000005_pair_counterparty_period_dimensions.up.sql",
+	"000006_pair_closed_state_transitions.up.sql",
+	"000007_match_attempts.up.sql",
+	"000008_source_journal_checks.up.sql",
+}
+
+// resetTables is every table the migrations create, children first.
+// DROP ... CASCADE on a parent drops only the child's foreign key, not the
+// child table, so each is dropped by name.
+var resetTables = []string{
+	"intercompany_match_attempts",
+	"intercompany_pair_transitions",
+	"intercompany_entries",
+	"eventing_outbox",
+}
+
 // openTestPool connects to a real Postgres and reapplies the migrations
 // from a clean slate. Skips (not fails) if TEST_DATABASE_URL isn't set —
 // same convention as every other service in this platform.
 func openTestPool(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+	pool := openEmptyPool(t)
+	applyMigrations(t, pool, migrations...)
+	return pool
+}
+
+// openEmptyPool connects and drops every table the migrations create, so
+// the caller decides how far to migrate.
+func openEmptyPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
@@ -34,18 +67,19 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	}
 	t.Cleanup(pool.Close)
 
+	for _, table := range resetTables {
+		if _, err := pool.Exec(ctx, `DROP TABLE IF EXISTS `+table+` CASCADE`); err != nil {
+			t.Fatalf("drop %s: %v", table, err)
+		}
+	}
+	return pool
+}
+
+func applyMigrations(t *testing.T, pool *pgxpool.Pool, names ...string) {
+	t.Helper()
 	_, filename, _, _ := runtime.Caller(0)
 	base := filepath.Dir(filename)
-
-	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS intercompany_entries CASCADE;`)
-	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS eventing_outbox CASCADE;`)
-
-	for _, migration := range []string{
-		"000001_initial_schema.up.sql",
-		"000002_add_idempotency_index.up.sql",
-		"000003_add_acc11_lifecycle.up.sql",
-		"000004_add_eventing_outbox.up.sql",
-	} {
+	for _, migration := range names {
 		sql, err := os.ReadFile(filepath.Join(base, "../../deployments/migrations", migration))
 		if err != nil {
 			t.Fatalf("failed to read migration %s: %v", migration, err)
@@ -56,12 +90,10 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 		// rejects. Strip it here so this test exercises the same SQL psql
 		// would actually apply.
 		sql = bytes.TrimPrefix(sql, []byte("\xef\xbb\xbf"))
-		if _, err := pool.Exec(ctx, string(sql)); err != nil {
+		if _, err := pool.Exec(context.Background(), string(sql)); err != nil {
 			t.Fatalf("failed to apply migration %s: %v", migration, err)
 		}
 	}
-
-	return pool
 }
 
 func newTestEntry(tenantID, sourceJournalID string) *domain.IntercompanyEntry {
@@ -72,11 +104,12 @@ func newTestEntry(tenantID, sourceJournalID string) *domain.IntercompanyEntry {
 		SourceLegalEntityID: "le-us",
 		TargetLegalEntityID: "le-uk",
 		SourceJournalID:     sourceJournalID,
-		Amount:              5000,
-		CurrencyCode:        "USD",
-		MatchStatus:         "UNMATCHED",
-		CreatedAt:           now,
-		UpdatedAt:           now,
+		Amount:              "5000",
+		CounterpartyAmount:  "5000", CounterpartyCurrencyCode: "USD",
+		CurrencyCode: "USD",
+		MatchStatus:  "UNMATCHED",
+		CreatedAt:    now,
+		UpdatedAt:    now,
 	}
 }
 
@@ -146,4 +179,27 @@ func TestPgStore_RLS_TenantIsolation(t *testing.T) {
 	if err == nil {
 		t.Fatal("RLS failure: tenant B's session was able to read tenant A's intercompany entry")
 	}
+}
+
+// testAttempt is the minimal evidence UpdateMatch requires for the outcome
+// entry already carries, for tests whose subject is not the attempt itself.
+func testAttempt(entry *domain.IntercompanyEntry) *domain.MatchAttempt {
+	a := &domain.MatchAttempt{
+		IntercompanyEntryID: entry.IntercompanyEntryID,
+		Outcome:             entry.MatchStatus,
+		Source: domain.MatchAttemptSide{
+			JournalID: &entry.SourceJournalID, ExpectedAmount: entry.Amount, ExpectedCurrency: entry.CurrencyCode,
+		},
+		Target: domain.MatchAttemptSide{
+			JournalID: entry.TargetJournalID, ExpectedAmount: entry.CounterpartyAmount, ExpectedCurrency: entry.CounterpartyCurrencyCode,
+		},
+		ExaminedJournalIDs: []string{},
+		Tolerance:          "0.001",
+		AttemptedBy:        "test",
+	}
+	if entry.MatchStatus == domain.MatchStatusMismatch {
+		rule := domain.MatchRuleAmountMismatch
+		a.FailedRule, a.Message = &rule, entry.MismatchReason
+	}
+	return a
 }

@@ -17,6 +17,15 @@ import (
 //
 // Run: go test -tags=integration -count=1 -timeout=400s ./internal/store/
 func TestMain(m *testing.M) {
+	// A disposable Postgres supplied by the caller (e.g. a fresh docker
+	// container) wins over the embedded one. This is what lets the full
+	// suite run against a container the caller controls. Like every
+	// TEST_DATABASE_URL consumer in this service, the tests drop and
+	// recreate their tables: point it only at a database nobody else uses.
+	if os.Getenv("TEST_DATABASE_URL") != "" {
+		os.Exit(m.Run())
+	}
+
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		fmt.Printf("free port: %v\n", err)

@@ -130,6 +130,29 @@ control totals, `sha256` population hash, the source `watermark`, and every reco
 snapshot is referenced by the sealed evidence package. Data arriving later at the source
 never changes a frozen population; it is picked up by a **new run**.
 
+## Late-data re-checks after certification
+
+`financial-control-svc` polls this contract again after a run is certified, not only
+during execution. A background sweep (every 10 minutes; each certified run checked at
+most once per 30 minutes, oldest-checked first) re-reads each side's current
+`watermark` with `limit=1` and no `cursor`, using the exact population spec the run
+itself resolved and the identity of the principal who executed it (per this
+contract's own rule that the source authorizes the human caller, not the service —
+see "Rules every source must honour" above). It never re-reads the frozen records and
+never mutates anything the source holds.
+
+If the watermark no longer matches the one the run froze, the service opens a
+`LATE_DATA` exception on that run and reports the close gate blocking
+(`LATE_DATA_AFTER_CERTIFICATION`) until the exception is resolved under authority or a
+new run supersedes the certified one (ZS-CONTROL-001 Invariant 14).
+
+**Expect, for as long as a run stays the latest certified one for a control:** roughly
+one `limit=1` request every 30 minutes, indefinitely, from the same principal who
+originally executed the run — not a one-time read at execution. If that source is
+unreachable during a check, the run is not failed and the gate is not blocked; the
+check is recorded as `UNVERIFIED` and logged, distinct from a confirmed watermark
+change.
+
 ## Implementation status (Wave 2)
 
 | Source | Populations | Authz action (must be granted to callers of the control) | limit default / max |

@@ -360,15 +360,16 @@ $BUNDLES = @(
     },
     @{
         # financial-control-svc (ZS-CONTROL-001). DEFINE / APPROVE_RULE / EXECUTE / CERTIFY /
-        # EXCEPTION_WAIVE / REPERFORM are deliberately separate actions: a real tenant should grant
-        # them through separate roles. The service itself also refuses a certifier who created or
-        # took part in a run, and a waiver from the exception's own owner, whatever is granted here.
+        # EXCEPTION_WAIVE / REPERFORM / REVOKE are deliberately separate actions: a real tenant
+        # should grant them through separate roles. The service itself also refuses a certifier
+        # who created or took part in a run, a waiver from the exception's own owner, and a
+        # revoker who certified the run being revoked, whatever is granted here.
         Code    = "FINCTRL_FULL"
         Service = "financial-control-svc"
         Actions = @("FINCTRL_DEFINE", "FINCTRL_APPROVE_RULE", "FINCTRL_POLICY_MANAGE", "FINCTRL_RUN_CREATE",
                     "FINCTRL_READ", "FINCTRL_EXECUTE", "FINCTRL_EXCEPTION_ASSIGN", "FINCTRL_CERTIFY",
                     "FINCTRL_EXCEPTION_RESOLVE", "FINCTRL_EXCEPTION_WAIVE", "FINCTRL_REPERFORM",
-                    "FINCTRL_EVIDENCE_EXPORT")
+                    "FINCTRL_EVIDENCE_EXPORT", "FINCTRL_REVOKE")
     },
     @{
         # The source services authorize the HUMAN caller of a control population (the control service
@@ -381,6 +382,20 @@ $BUNDLES = @(
                     "INVENTORY_CONTROL_POPULATION_READ", "INTERCOMPANY_CONTROL_POPULATION_READ",
                     "CONSOLIDATION_CONTROL_POPULATION_READ", "FINANCIAL_CLOSE_CONTROL_POPULATION_READ",
                     "PAYEE_BANKING_CONTROL_POPULATION_READ", "TAX_AUTHORITY_CONTROL_POPULATION_READ")
+    },
+    @{
+        # reconciliation-engine-svc (DATA-07, ZS-SVC-Z-001 DQC-03). DEFINE/RUN/MATCH stay under
+        # MANAGE as preparation steps; CERTIFY, ACCEPT_RISK, APPROVE_RULES and REVOKE are
+        # deliberately separate actions, the same posture as FINCTRL_FULL above — a real tenant
+        # should grant them through separate roles. The service itself also refuses a certifier
+        # who prepared the run, a revoker who certified it, and a self-accepted risk, whatever is
+        # granted here. None of these five actions had a permission_definitions row before
+        # migration 000008 (MANAGE/READ) and 000018 (the other four) — without that row no role
+        # can hold the action at all.
+        Code    = "RECONCILIATION_FULL"
+        Service = "reconciliation-engine-svc"
+        Actions = @("RECONCILIATION_MANAGE", "RECONCILIATION_READ", "RECONCILIATION_CERTIFY",
+                    "RECONCILIATION_ACCEPT_RISK", "RECONCILIATION_APPROVE_RULES", "RECONCILIATION_REVOKE")
     },
     @{
         # spend-controls-svc separates setting a limit from spending against it,

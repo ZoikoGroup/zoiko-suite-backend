@@ -114,7 +114,7 @@ func TestMatching_SubDimensionCannotHideInAggregate(t *testing.T) {
 			t.Fatalf("balance exception: %+v / %+v", e, d)
 		}
 	}
-	if _, err := f.s.Certify(f.ctx, orgA, run.RunID, "test-operator", f.claim("Certify", run.RunID)); !errors.Is(err, domain.ErrOpenExceptionsRemain) {
+	if _, err := f.s.Certify(f.ctx, orgA, run.RunID, "test-operator", grant("test-operator"), f.claim("Certify", run.RunID)); !errors.Is(err, domain.ErrOpenExceptionsRemain) {
 		t.Fatalf("certify with an unbalanced sub-dimension: %v", err)
 	}
 	// Reperforming re-reads both populations (A8): the re-read freezes a new
@@ -350,7 +350,7 @@ func TestCertification_PerCurrencyTotalsOnly(t *testing.T) {
 		}
 	}
 	f.match(run.RunID)
-	cert, err := f.s.Certify(f.ctx, orgA, run.RunID, "certifier", f.claim("Certify", run.RunID))
+	cert, err := f.s.Certify(f.ctx, orgA, run.RunID, "certifier", grant("certifier"), f.claim("Certify", run.RunID))
 	if err != nil {
 		t.Fatalf("certify: %v", err)
 	}

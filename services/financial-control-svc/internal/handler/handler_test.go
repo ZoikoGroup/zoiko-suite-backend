@@ -31,6 +31,12 @@ type fakeStore struct {
 	w1        wave1State
 	w5        wave5State
 	w7        wave7State
+	rv        revokeState
+
+	// idemKey is the Idempotency-Key the last replayable command received;
+	// idemReplay makes the fake report that command as a replay.
+	idemKey    string
+	idemReplay bool
 }
 
 func (f *fakeStore) CreateDefinition(_ context.Context, _, _, _ string, req domain.CreateControlDefinitionRequest) (*domain.ControlDefinition, error) {
@@ -90,12 +96,26 @@ type fakeAuthz struct {
 	err     error
 	actions []string
 	entity  []string
+	decided []string // actions checked live via Decide
 }
 
 func (a *fakeAuthz) CheckAllowed(_ context.Context, _, entity, action string) error {
 	a.actions = append(a.actions, action)
 	a.entity = append(a.entity, entity)
 	return a.err
+}
+
+// Decide records the call like CheckAllowed and, when allowed, returns the
+// decision authorization-svc would have recorded.
+func (a *fakeAuthz) Decide(_ context.Context, principal, entity, action string) (*domain.AuthoritySnapshot, error) {
+	a.actions = append(a.actions, action)
+	a.entity = append(a.entity, entity)
+	a.decided = append(a.decided, action)
+	if a.err != nil {
+		return nil, a.err
+	}
+	return &domain.AuthoritySnapshot{Source: "authorization-svc", PrincipalID: principal, LegalEntityID: entity,
+		ActionType: action, AccessDecisionID: "decision-1", DecisionOutcome: "GRANTED", DecisionBasis: "rbac:role=CERTIFIER"}, nil
 }
 
 func newServer(s *fakeStore, a *fakeAuthz) http.Handler {

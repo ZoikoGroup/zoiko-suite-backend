@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -52,7 +53,11 @@ type Store interface {
 	CreateAccount(ctx context.Context, a *domain.Account) error
 	GetAccountByCode(ctx context.Context, tenantID, accountCode string) (*domain.Account, error)
 	ListAccounts(ctx context.Context, tenantID string) ([]domain.Account, error)
-	DeactivateAccount(ctx context.Context, tenantID, accountCode string) error
+	AmendAccountVersion(ctx context.Context, tenantID, accountCode, idempotencyKey string, expectedVersion int64, effectiveFrom time.Time, a *domain.Account, reason string, evidenceRefs []string, principalID string) (*domain.Account, bool, error)
+	ActivateAccount(ctx context.Context, tenantID, accountCode string, expectedVersion int64, effectiveFrom time.Time, reason string, evidenceRefs []string, principalID string) (*domain.Account, error)
+	DeactivateAccount(ctx context.Context, tenantID, accountCode string, expectedVersion int64, effectiveFrom time.Time, reason string, evidenceRefs []string, principalID string) (*domain.Account, error)
+	ReparentAccount(ctx context.Context, tenantID, accountCode, idempotencyKey string, parentAccountID *string, expectedVersion int64, effectiveFrom time.Time, reason string, evidenceRefs []string, principalID string) (*domain.Account, bool, error)
+	GetAccountAsOf(ctx context.Context, tenantID, accountCode string, asOf time.Time) (*domain.AccountVersion, error)
 
 	// ACC-02 Account Mapping — see migration 000008's doc comment.
 	SetAccountMapping(ctx context.Context, m *domain.AccountMapping) error
@@ -135,7 +140,10 @@ const (
 	// it's co-deployed in this same process.
 	actionCreateAccount     = "COA_ACCOUNT_CREATE"
 	actionViewAccount       = "COA_ACCOUNT_VIEW"
+	actionAmendAccount      = "COA_ACCOUNT_AMEND"
+	actionActivateAccount   = "COA_ACCOUNT_ACTIVATE"
 	actionDeactivateAccount = "COA_ACCOUNT_DEACTIVATE"
+	actionReparentAccount   = "COA_ACCOUNT_REPARENT"
 	// actionOverridePostingRestriction gates the invariant #7 override —
 	// deliberately a distinct, more sensitive action than actionCreateJournal
 	// itself, so it can be granted to a narrower group.
@@ -289,8 +297,19 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Route("/v1/chart-of-accounts", func(r chi.Router) {
 		r.Post("/", h.CreateAccount)
 		r.Get("/", h.ListAccounts)
+		r.Get("/resolve-posting-eligibility", h.ResolvePostingEligibility)
+		r.Post("/resolve-posting-eligibility", h.ResolvePostingEligibility)
+		r.Get("/as-of", h.GetAccountAsOf)
+		r.Post("/as-of", h.GetAccountAsOf)
 		r.Get("/{account_code}", h.GetAccount)
+		r.Get("/{account_code}/as-of", h.GetAccountAsOf)
+		r.Post("/{account_code}/as-of", h.GetAccountAsOf)
+		r.Get("/{account_code}/posting-eligibility", h.ResolvePostingEligibility)
+		r.Post("/{account_code}/posting-eligibility", h.ResolvePostingEligibility)
+		r.Post("/{account_code}/amend", h.AmendAccountVersion)
+		r.Post("/{account_code}/activate", h.ActivateAccount)
 		r.Post("/{account_code}/deactivate", h.DeactivateAccount)
+		r.Post("/{account_code}/reparent", h.ReparentAccount)
 	})
 	r.Route("/v1/account-mappings", func(r chi.Router) {
 		r.Post("/", h.SetAccountMapping)
@@ -420,14 +439,14 @@ func (h *Handler) CreateJournal(w http.ResponseWriter, r *http.Request) {
 		SourceEventID:        req.SourceEventID,
 		GovernanceDecisionID: req.GovernanceDecisionID,
 
-		JournalType:              req.JournalType,
-		TransactionDate:          req.TransactionDate,
-		PostingDate:              req.PostingDate,
-		CurrencyCode:             req.CurrencyCode,
-		BookID:                   bookID,
-		ReportingBasis:           reportingBasis,
-		EvidenceRefs:             mergeEvidenceRefs(req.EvidenceRefs, env.EvidenceRefs),
-		SoftCloseOverrideReason:  &req.SoftCloseOverrideReason,
+		JournalType:             req.JournalType,
+		TransactionDate:         req.TransactionDate,
+		PostingDate:             req.PostingDate,
+		CurrencyCode:            req.CurrencyCode,
+		BookID:                  bookID,
+		ReportingBasis:          reportingBasis,
+		EvidenceRefs:            mergeEvidenceRefs(req.EvidenceRefs, env.EvidenceRefs),
+		SoftCloseOverrideReason: &req.SoftCloseOverrideReason,
 
 		// ACC-03: every ordinary journal a human creates starts as a
 		// proposal nobody has acted on yet — explicit here rather than
@@ -769,6 +788,330 @@ func (h *Handler) CreateAccount(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, a)
 }
 
+// AmendAccountVersion appends a new version of an existing account. Omitted
+// fields keep their current values; an explicit null parent clears the parent.
+// The current chart row is advanced as a projection, but the prior version is
+// never overwritten — account_versions retains the full prior interval and
+// GetAccountAsOf reconstructs it.
+func (h *Handler) AmendAccountVersion(w http.ResponseWriter, r *http.Request) {
+	accountCode := chi.URLParam(r, "account_code")
+	var req domain.AmendAccountVersionRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+
+	// Idempotency-Key is mandatory on this command (SPEC_DEVIATIONS A6/B12):
+	// it appends a version, and expected_version alone cannot stop a retry
+	// from appending a second one.
+	idempotencyKey := strings.TrimSpace(r.Header.Get(svcenvelope.HeaderIdempotencyKey))
+	if idempotencyKey == "" {
+		writeError(w, http.StatusBadRequest, "missing_idempotency_key", "Idempotency-Key header is required for account amendments")
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, coaPlatformScopeID, actionAmendAccount); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	current, err := h.store.GetAccountByCode(r.Context(), tenantID, accountCode)
+	if errors.Is(err, domain.ErrAccountNotFound) {
+		writeError(w, http.StatusNotFound, "account_not_found", "")
+		return
+	}
+	if err != nil {
+		h.log.Error("AmendAccountVersion: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+
+	updated := *current
+	if req.AccountName != nil {
+		name := strings.TrimSpace(*req.AccountName)
+		if name == "" {
+			writeError(w, http.StatusBadRequest, "invalid_field", "account_name must not be empty")
+			return
+		}
+		updated.AccountName = name
+	}
+	if req.AccountType != nil {
+		if !domain.IsValidAccountType(*req.AccountType) {
+			writeError(w, http.StatusBadRequest, "invalid_field", domain.ErrInvalidAccountType.Error())
+			return
+		}
+		updated.AccountType = *req.AccountType
+	}
+	if req.ParentAccountIDSet {
+		updated.ParentAccountID = req.ParentAccountID
+	}
+	if req.IsControlAccount != nil {
+		updated.IsControlAccount = *req.IsControlAccount
+	}
+	if req.DirectPostingRestricted != nil {
+		updated.DirectPostingRestricted = *req.DirectPostingRestricted
+	}
+
+	effectiveFrom := time.Now().UTC()
+	if req.EffectiveFrom != nil {
+		effectiveFrom = req.EffectiveFrom.Time
+	}
+	result, replay, err := h.store.AmendAccountVersion(r.Context(), tenantID, accountCode, idempotencyKey,
+		req.ExpectedVersion, effectiveFrom, &updated, req.Reason, req.EvidenceRefs, principalID)
+	if err != nil {
+		if h.writeAccountVersionErr(w, err) {
+			return
+		}
+		h.log.Error("AmendAccountVersion: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+	if replay {
+		// A retried command returns the recorded result without executing
+		// again; the header says so explicitly.
+		w.Header().Set("Idempotent-Replay", "true")
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+// writeAccountVersionErr maps the shared versioned-account failures to stable
+// API errors. It returns true when the error was recognised.
+func (h *Handler) writeAccountVersionErr(w http.ResponseWriter, err error) bool {
+	switch {
+	case errors.Is(err, domain.ErrAccountNotFound):
+		writeError(w, http.StatusNotFound, "account_not_found", "")
+	case errors.Is(err, domain.ErrAccountVersionConflict):
+		writeError(w, http.StatusConflict, "account_version_conflict", err.Error())
+	case errors.Is(err, domain.ErrIdempotencyKeyConflict):
+		writeError(w, http.StatusConflict, "idempotency_key_conflict", err.Error())
+	case errors.Is(err, domain.ErrParentAccountNotFound):
+		writeError(w, http.StatusBadRequest, "parent_account_not_found", err.Error())
+	case errors.Is(err, domain.ErrAccountEffectiveDate):
+		writeError(w, http.StatusUnprocessableEntity, "effective_date_invalid", err.Error())
+	case errors.Is(err, domain.ErrAccountHierarchyCycle):
+		writeError(w, http.StatusUnprocessableEntity, "hierarchy_cycle", err.Error())
+	case errors.Is(err, domain.ErrAccountHierarchyBackdated):
+		writeError(w, http.StatusUnprocessableEntity, "hierarchy_backdated", err.Error())
+	default:
+		return false
+	}
+	return true
+}
+
+// ResolvePostingEligibility is ACC-01's read contract used by the posting
+// engine before a journal line is accepted. It reproduces ACC-04's inline
+// rules exactly — unregistered codes stay postable, INACTIVE accounts do not,
+// control accounts with direct posting restricted need the same explicit,
+// separately authorized override — while answering with a stable shape a
+// caller can persist or explain rather than only a boolean.
+func (h *Handler) ResolvePostingEligibility(w http.ResponseWriter, r *http.Request) {
+	var req domain.ResolvePostingEligibilityRequest
+	if r.Method == http.MethodPost {
+		if !decodeOptionalJSON(w, r, &req) {
+			return
+		}
+	}
+
+	accountCode := chi.URLParam(r, "account_code")
+	if accountCode == "" {
+		accountCode = req.AccountCode
+	}
+	q := r.URL.Query()
+	if accountCode == "" {
+		accountCode = q.Get("account_code")
+	}
+	if accountCode == "" {
+		writeError(w, http.StatusBadRequest, "missing_field", "account_code is required")
+		return
+	}
+	if req.LegalEntityID == "" {
+		req.LegalEntityID = q.Get("legal_entity_id")
+	}
+	if !req.OverrideControlAccountRestriction {
+		if v := q.Get("override_control_account_restriction"); v != "" {
+			override, err := strconv.ParseBool(v)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, "invalid_field", "override_control_account_restriction must be true or false")
+				return
+			}
+			req.OverrideControlAccountRestriction = override
+		}
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, coaPlatformScopeID, actionViewAccount); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	acct, err := h.store.GetAccountByCode(r.Context(), tenantID, accountCode)
+	if errors.Is(err, domain.ErrAccountNotFound) {
+		writeJSON(w, http.StatusOK, domain.EvaluatePostingEligibility(accountCode, nil, false))
+		return
+	}
+	if err != nil {
+		h.log.Error("ResolvePostingEligibility: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+
+	eligibility := domain.EvaluatePostingEligibility(accountCode, acct, req.OverrideControlAccountRestriction)
+	if eligibility.RequiresOverride && req.OverrideControlAccountRestriction {
+		scope := req.LegalEntityID
+		if scope == "" {
+			scope = coaPlatformScopeID
+		}
+		if err := h.authz.CheckAllowed(r.Context(), principalID, scope, actionOverridePostingRestriction); err != nil {
+			h.writeAuthzErr(w, err)
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, eligibility)
+}
+
+// GetAccountAsOf answers the point-in-time read over AmendAccountVersion's
+// history: which version of this account was in force at as_of. The natural
+// callers are audit/reporting reconstructions and any consumer that must
+// explain what the posting engine could have seen on an earlier date.
+func (h *Handler) GetAccountAsOf(w http.ResponseWriter, r *http.Request) {
+	var req domain.GetAccountAsOfRequest
+	if r.Method == http.MethodPost {
+		if !decodeOptionalJSON(w, r, &req) {
+			return
+		}
+	}
+	q := r.URL.Query()
+	accountCode := chi.URLParam(r, "account_code")
+	if accountCode == "" {
+		accountCode = req.AccountCode
+	}
+	if accountCode == "" {
+		accountCode = q.Get("account_code")
+	}
+	if accountCode == "" {
+		writeError(w, http.StatusBadRequest, "missing_field", "account_code is required")
+		return
+	}
+
+	asOf := req.AsOf
+	if asOf == nil {
+		for _, key := range []string{"as_of", "at", "effective_at"} {
+			if raw := q.Get(key); raw != "" {
+				var parsed domain.EffectiveDate
+				if err := json.Unmarshal([]byte(strconv.Quote(raw)), &parsed); err != nil {
+					writeError(w, http.StatusBadRequest, "invalid_field", domain.ErrAccountEffectiveDateRequired.Error())
+					return
+				}
+				asOf = &parsed
+				break
+			}
+		}
+	}
+	if asOf == nil {
+		writeError(w, http.StatusBadRequest, "missing_field", domain.ErrAccountEffectiveDateRequired.Error())
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, coaPlatformScopeID, actionViewAccount); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	version, err := h.store.GetAccountAsOf(r.Context(), tenantID, accountCode, asOf.Time)
+	if errors.Is(err, domain.ErrAccountNotFound) {
+		writeError(w, http.StatusNotFound, "account_not_found", "")
+		return
+	}
+	if err != nil {
+		h.log.Error("GetAccountAsOf: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+	writeJSON(w, http.StatusOK, version)
+}
+
+// ReparentAccount changes an account's position in the chart hierarchy. The
+// store enforces the cycle guard and refuses a backdated effective date; the
+// handler's own guard is the structural one — a request that never names the
+// parent key at all is refused rather than treated as "make it a root".
+func (h *Handler) ReparentAccount(w http.ResponseWriter, r *http.Request) {
+	accountCode := chi.URLParam(r, "account_code")
+	var req domain.ReparentAccountRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+
+	// Idempotency-Key is mandatory on this command (SPEC_DEVIATIONS A6/B12):
+	// it appends a version, and expected_version alone cannot stop a retry
+	// from appending a second one.
+	idempotencyKey := strings.TrimSpace(r.Header.Get(svcenvelope.HeaderIdempotencyKey))
+	if idempotencyKey == "" {
+		writeError(w, http.StatusBadRequest, "missing_idempotency_key", "Idempotency-Key header is required for a hierarchy change")
+		return
+	}
+
+	if !req.ParentAccountIDSet {
+		writeError(w, http.StatusBadRequest, "missing_field", "parent_account_id is required; send an explicit null to make the account a root")
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, coaPlatformScopeID, actionReparentAccount); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	effectiveFrom := time.Now().UTC()
+	if req.EffectiveFrom != nil {
+		effectiveFrom = req.EffectiveFrom.Time
+	}
+	updated, replay, err := h.store.ReparentAccount(r.Context(), tenantID, accountCode, idempotencyKey,
+		req.ParentAccountID, req.ExpectedVersion, effectiveFrom, req.Reason, req.EvidenceRefs, principalID)
+	if err != nil {
+		if h.writeAccountVersionErr(w, err) {
+			return
+		}
+		h.log.Error("ReparentAccount: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+	if replay {
+		// A retried command returns the recorded result without executing
+		// again; the header says so explicitly.
+		w.Header().Set("Idempotent-Replay", "true")
+	}
+	writeJSON(w, http.StatusOK, updated)
+}
+
 func (h *Handler) GetAccount(w http.ResponseWriter, r *http.Request) {
 	accountCode := chi.URLParam(r, "account_code")
 
@@ -824,8 +1167,29 @@ func (h *Handler) ListAccounts(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, accounts)
 }
 
+// ActivateAccount reactivates a previously deactivated account. It mirrors
+// DeactivateAccount exactly — same path, same identity/authz requirements, an
+// optional body rather than a required one — and only the direction of the
+// status transition differs. The historical version capture is shared by both.
+func (h *Handler) ActivateAccount(w http.ResponseWriter, r *http.Request) {
+	h.changeAccountState(w, r, "ActivateAccount", actionActivateAccount, h.store.ActivateAccount)
+}
+
 func (h *Handler) DeactivateAccount(w http.ResponseWriter, r *http.Request) {
+	h.changeAccountState(w, r, "DeactivateAccount", actionDeactivateAccount, h.store.DeactivateAccount)
+}
+
+func (h *Handler) changeAccountState(
+	w http.ResponseWriter,
+	r *http.Request,
+	opName, action string,
+	op func(ctx context.Context, tenantID, accountCode string, expectedVersion int64, effectiveFrom time.Time, reason string, evidenceRefs []string, principalID string) (*domain.Account, error),
+) {
 	accountCode := chi.URLParam(r, "account_code")
+	var req domain.DeactivateAccountRequest
+	if !decodeOptionalJSON(w, r, &req) {
+		return
+	}
 
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
@@ -835,21 +1199,25 @@ func (h *Handler) DeactivateAccount(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), principalID, coaPlatformScopeID, actionDeactivateAccount); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), principalID, coaPlatformScopeID, action); err != nil {
 		h.writeAuthzErr(w, err)
 		return
 	}
 
-	if err := h.store.DeactivateAccount(r.Context(), tenantID, accountCode); err != nil {
-		if errors.Is(err, domain.ErrAccountNotFound) {
-			writeError(w, http.StatusNotFound, "account_not_found", "")
+	effectiveFrom := time.Now().UTC()
+	if req.EffectiveFrom != nil {
+		effectiveFrom = req.EffectiveFrom.Time
+	}
+	updated, err := op(r.Context(), tenantID, accountCode, req.ExpectedVersion, effectiveFrom, req.Reason, req.EvidenceRefs, principalID)
+	if err != nil {
+		if h.writeAccountVersionErr(w, err) {
 			return
 		}
-		h.log.Error("DeactivateAccount: store unavailable", zap.Error(err))
+		h.log.Error(opName+": store unavailable", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"account_code": accountCode, "status": "INACTIVE"})
+	writeJSON(w, http.StatusOK, updated)
 }
 
 // ── ACC-02 Account Mapping ───────────────────────────────────────────────────
@@ -1163,16 +1531,16 @@ func (h *Handler) ReverseJournal(w http.ResponseWriter, r *http.Request) {
 	// underlying document has not changed.
 
 	reversingHeader := &domain.JournalHeader{
-		JournalID:              uuid.NewString(),
-		TenantID:               header.TenantID,
-		LegalEntityID:          header.LegalEntityID,
-		FiscalPeriod:           header.FiscalPeriod,
-		Status:                 domain.JournalStatusFinalized,
-		ReversalOfJournalID:    &reversalID,
-		Description:            "Reversal of " + journalID + ": " + req.Reason,
-		CreatedByPrincipalID:   principalID,
-		PostedByPrincipalID:    &principalID,
-		CorrelationID:          req.CorrelationID,
+		JournalID:               uuid.NewString(),
+		TenantID:                header.TenantID,
+		LegalEntityID:           header.LegalEntityID,
+		FiscalPeriod:            header.FiscalPeriod,
+		Status:                  domain.JournalStatusFinalized,
+		ReversalOfJournalID:     &reversalID,
+		Description:             "Reversal of " + journalID + ": " + req.Reason,
+		CreatedByPrincipalID:    principalID,
+		PostedByPrincipalID:     &principalID,
+		CorrelationID:           req.CorrelationID,
 		SoftCloseOverrideReason: &req.SoftCloseOverrideReason,
 
 		JournalType:     domain.JournalTypeReversal,
@@ -2002,20 +2370,20 @@ func (h *Handler) PostAccountingEvent(w http.ResponseWriter, r *http.Request) {
 func eventJournal(tenantID, principalID string, req domain.PostAccountingEventRequest, resolvedLines []domain.CreateJournalLineInput) (*domain.JournalHeader, []domain.JournalLine) {
 	sourceEventID := req.SourceEventID
 	header := &domain.JournalHeader{
-		JournalID:                uuid.NewString(),
-		TenantID:                 tenantID,
-		LegalEntityID:            req.LegalEntityID,
-		FiscalPeriod:             req.FiscalPeriod,
-		Status:                   domain.JournalStatusPending,
-		Description:              req.Description,
-		CreatedByPrincipalID:     principalID,
-		CorrelationID:            req.CorrelationID,
-		SourceEventID:            &sourceEventID,
-		JournalType:              domain.JournalTypeStandard,
-		TransactionDate:          req.DocumentDate,
-		PostingDate:              req.PostingDate,
-		CurrencyCode:             req.TransactionCurrency,
-		SoftCloseOverrideReason:  &req.SoftCloseOverrideReason,
+		JournalID:               uuid.NewString(),
+		TenantID:                tenantID,
+		LegalEntityID:           req.LegalEntityID,
+		FiscalPeriod:            req.FiscalPeriod,
+		Status:                  domain.JournalStatusPending,
+		Description:             req.Description,
+		CreatedByPrincipalID:    principalID,
+		CorrelationID:           req.CorrelationID,
+		SourceEventID:           &sourceEventID,
+		JournalType:             domain.JournalTypeStandard,
+		TransactionDate:         req.DocumentDate,
+		PostingDate:             req.PostingDate,
+		CurrencyCode:            req.TransactionCurrency,
+		SoftCloseOverrideReason: &req.SoftCloseOverrideReason,
 		// System-originated: this bypasses ACC-03's human Draft/Submit/
 		// Approve workflow entirely (already gated by actionPostingExecute,
 		// which a deployment grants only to internal service identities —
@@ -3042,6 +3410,27 @@ const maxRequestBytes = 256 << 10 // 256 KiB
 func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
 	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeError(w, http.StatusRequestEntityTooLarge, "request_too_large", "")
+			return false
+		}
+		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+		return false
+	}
+	return true
+}
+
+// decodeOptionalJSON behaves like decodeJSON but treats a genuinely empty body
+// as "no fields supplied". DeactivateAccount accepted no body at all before
+// expected_version/reason existed, so an empty body must keep working; a
+// malformed non-empty body is still a 400.
+func decodeOptionalJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
+	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
+		if errors.Is(err, io.EOF) {
+			return true
+		}
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
 			writeError(w, http.StatusRequestEntityTooLarge, "request_too_large", "")

@@ -36,7 +36,7 @@ func failedRunWithTwoExceptions(t *testing.T, w *wave2) (*domain.ControlRun, []d
 
 func step(t *testing.T, w *wave2, e *domain.ControlException, actor string, req domain.ResolveExceptionRequest) (*domain.ControlException, error) {
 	t.Helper()
-	out, err := testStore.ResolveException(ctx, w.tenant, e.ExceptionID, actor, "c", e.Version, req)
+	out, err := resolveException(ctx, w.tenant, e.ExceptionID, actor, "c", e.Version, req)
 	if err == nil {
 		*e = *out
 	}
@@ -53,7 +53,7 @@ func TestWave7_ExceptionLifecycle_MakerCheckerAndRollup(t *testing.T) {
 	require.ErrorIs(t, err, domain.ErrNotOwner)
 	_, err = step(t, w, x, "olivia", domain.ResolveExceptionRequest{ToState: "CLOSED", Reason: "skip ahead"})
 	require.ErrorIs(t, err, domain.ErrInvalidTransition, "no shortcut to CLOSED")
-	_, err = testStore.ResolveException(ctx, w.tenant, x.ExceptionID, "olivia", "c", x.Version+9, domain.ResolveExceptionRequest{ToState: "INVESTIGATING", Reason: "r"})
+	_, err = resolveException(ctx, w.tenant, x.ExceptionID, "olivia", "c", x.Version+9, domain.ResolveExceptionRequest{ToState: "INVESTIGATING", Reason: "r"})
 	require.ErrorIs(t, err, domain.ErrConflict)
 
 	// Full remediation path for x.
@@ -95,21 +95,21 @@ func TestWave7_ExceptionLifecycle_MakerCheckerAndRollup(t *testing.T) {
 
 	// Certification follows: rejection returns the run, resubmission brings it back, and the
 	// same certifier may then decide, but the operator who produced the result never can.
-	rej, err := testStore.CertifyRun(ctx, w.tenant, run.RunID, "checker", "c", cur.Version, domain.CertifyRequest{Decision: "REJECT", Reason: "attach the waiver memo"})
+	rej, err := certifyRun(ctx, w.tenant, run.RunID, "checker", "c", cur.Version, domain.CertifyRequest{Decision: "REJECT", Reason: "attach the waiver memo"}, testAuthority("checker", w.tenant))
 	require.NoError(t, err)
 	assert.Equal(t, domain.LifecycleExceptionReview, rej.LifecycleState)
 	assert.Equal(t, domain.CertRejected, rej.CertificationState)
 
-	_, err = testStore.SubmitForCertification(ctx, w.tenant, run.RunID, "prep", "c", rej.Version+3, "memo attached")
+	_, err = submitForCertification(ctx, w.tenant, run.RunID, "prep", "c", rej.Version+3, "memo attached")
 	require.ErrorIs(t, err, domain.ErrConflict)
-	sub, err := testStore.SubmitForCertification(ctx, w.tenant, run.RunID, "prep", "c", rej.Version, "memo attached")
+	sub, err := submitForCertification(ctx, w.tenant, run.RunID, "prep", "c", rej.Version, "memo attached")
 	require.NoError(t, err)
 	assert.Equal(t, domain.LifecycleReadyToCertify, sub.LifecycleState)
 	assert.Equal(t, domain.CertPending, sub.CertificationState)
 
-	_, err = testStore.CertifyRun(ctx, w.tenant, run.RunID, "prep", "c", sub.Version, domain.CertifyRequest{Decision: "CERTIFY"})
+	_, err = certifyRun(ctx, w.tenant, run.RunID, "prep", "c", sub.Version, domain.CertifyRequest{Decision: "CERTIFY"}, testAuthority("prep", w.tenant))
 	require.ErrorIs(t, err, domain.ErrSegregation)
-	done, err := testStore.CertifyRun(ctx, w.tenant, run.RunID, "checker", "c", sub.Version, domain.CertifyRequest{Decision: "CERTIFY"})
+	done, err := certifyRun(ctx, w.tenant, run.RunID, "checker", "c", sub.Version, domain.CertifyRequest{Decision: "CERTIFY"}, testAuthority("checker", w.tenant))
 	require.NoError(t, err, "the certifier who rejected may certify the corrected run")
 	assert.Equal(t, domain.LifecycleCertified, done.LifecycleState)
 	assert.Equal(t, domain.ResultPassWithApprovedEx, done.ResultState)
@@ -120,7 +120,7 @@ func TestWave7_SubmitForCertification_RefusedWhileExceptionsAreOpen(t *testing.T
 	run, _ := failedRunWithTwoExceptions(t, w)
 	cur, err := testStore.GetRun(ctx, w.tenant, run.RunID)
 	require.NoError(t, err)
-	_, err = testStore.SubmitForCertification(ctx, w.tenant, run.RunID, "prep", "c", cur.Version, "trying")
+	_, err = submitForCertification(ctx, w.tenant, run.RunID, "prep", "c", cur.Version, "trying")
 	require.ErrorIs(t, err, domain.ErrInvalidTransition)
 }
 
@@ -155,7 +155,7 @@ func TestWave7_RerunSupersedesTheCertifiedRunAndOnlyThat(t *testing.T) {
 	w := newWave5(t)
 	w.src.set(catalogue.SysGL, "journal-balances", "wm", journalBal("j1", "5", "5"))
 	first, final := w.run("FIN-CTRL-020", fiscal)
-	done, err := testStore.CertifyRun(ctx, w.tenant, first.RunID, "checker", "c", final.Version, domain.CertifyRequest{Decision: "CERTIFY"})
+	done, err := certifyRun(ctx, w.tenant, first.RunID, "checker", "c", final.Version, domain.CertifyRequest{Decision: "CERTIFY"}, testAuthority("checker", w.tenant))
 	require.NoError(t, err)
 	require.Equal(t, domain.LifecycleCertified, done.LifecycleState)
 

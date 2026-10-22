@@ -316,3 +316,51 @@ func TestNoPeriodSpecOmitsPeriodIDFromTheRequest(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, kept.NoPeriod, "scope binding preserves the flag")
 }
+
+// Watermark reads page 1 with limit=1 through the same request Fetch makes: same
+// path, verified scope headers, entity/period and params, and no cursor.
+func TestWatermark_ReadsOnePageWithLimitOne(t *testing.T) {
+	var queries []map[string][]string
+	s, seen := server(t, recs(2500), func(_ int, r *pageResponse) { r.Watermark = "wm-now" })
+	wrapped := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		queries = append(queries, r.URL.Query())
+		s.Config.Handler.ServeHTTP(w, r)
+	}))
+	t.Cleanup(wrapped.Close)
+
+	sp := Spec{System: "ar", Population: "invoices", Params: map[string]string{"status": "open"}}
+	wm, err := NewHTTPFetcher(map[string]string{"ar": wrapped.URL}, nil).Watermark(context.Background(), sp, scope)
+	require.NoError(t, err)
+	assert.Equal(t, "wm-now", wm)
+	require.Len(t, queries, 1, "one page only, however large the population")
+	q := queries[0]
+	assert.Equal(t, []string{"1"}, q["limit"])
+	assert.Equal(t, []string{"e1"}, q["legal_entity_id"])
+	assert.Equal(t, []string{"2026-09"}, q["period_id"])
+	assert.Equal(t, []string{"open"}, q["status"])
+	assert.NotContains(t, q, "cursor")
+	require.Len(t, *seen, 1)
+	h := (*seen)[0]
+	assert.Equal(t, "t1", h.Get("X-Tenant-Id"))
+	assert.Equal(t, "alice", h.Get("X-Principal-Id"))
+	assert.Equal(t, "e1", h.Get("X-Legal-Entity-Id"))
+	assert.Equal(t, "c1", h.Get("X-Correlation-ID"))
+}
+
+// Fails closed like Fetch: no watermark, an outage or an unknown system is an
+// error, never an empty watermark a caller could compare.
+func TestWatermark_FailsClosed(t *testing.T) {
+	s, _ := server(t, recs(1), func(_ int, r *pageResponse) { r.Watermark = " " })
+	_, err := fetcher(s).Watermark(context.Background(), spec, scope)
+	assert.True(t, errors.Is(err, ErrSourceInconsistent), "%v", err)
+
+	down := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(down.Close)
+	_, err = fetcher(down).Watermark(context.Background(), spec, scope)
+	assert.True(t, errors.Is(err, ErrSourceUnavailable), "%v", err)
+
+	_, err = fetcher(s).Watermark(context.Background(), Spec{System: "nope", Population: "invoices"}, scope)
+	assert.True(t, errors.Is(err, ErrSourceUnknown), "%v", err)
+}
