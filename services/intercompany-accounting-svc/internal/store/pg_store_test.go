@@ -29,12 +29,14 @@ var migrations = []string{
 	"000006_pair_closed_state_transitions.up.sql",
 	"000007_match_attempts.up.sql",
 	"000008_source_journal_checks.up.sql",
+	"000009_command_idempotency.up.sql",
 }
 
 // resetTables is every table the migrations create, children first.
 // DROP ... CASCADE on a parent drops only the child's foreign key, not the
 // child table, so each is dropped by name.
 var resetTables = []string{
+	"command_idempotency",
 	"intercompany_match_attempts",
 	"intercompany_pair_transitions",
 	"intercompany_entries",
