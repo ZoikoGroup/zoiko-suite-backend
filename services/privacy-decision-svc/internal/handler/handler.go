@@ -136,11 +136,20 @@ func hashBody(body []byte) string {
 	return hex.EncodeToString(h[:])
 }
 
-func readBodyBytes(r *http.Request) ([]byte, error) {
+// maxBodyBytes bounds a request body (1 MiB), the same limit the sibling privacy
+// services apply. A decision request is a handful of identifiers and short enums.
+const maxBodyBytes = 1 << 20
+
+// readBodyBytes reads the request body through http.MaxBytesReader, so a body
+// larger than maxBodyBytes is refused after at most maxBodyBytes+1 bytes have
+// been read instead of being buffered whole; the server also stops reading the
+// connection. The caller answers a read error as 400 VALIDATION_FAILED, the
+// established refusal for an unreadable body.
+func readBodyBytes(w http.ResponseWriter, r *http.Request) ([]byte, error) {
 	if r.Body == nil {
 		return []byte{}, nil
 	}
-	body, err := io.ReadAll(r.Body)
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 	if err != nil {
 		return nil, err
 	}
@@ -157,7 +166,7 @@ func readBodyBytes(r *http.Request) ([]byte, error) {
 //	400 TENANT_SCOPE_REQUIRED        missing X-Tenant-Id
 //	400 CORRELATION_ID_REQUIRED      missing X-Correlation-ID
 //	400 IDEMPOTENCY_KEY_REQUIRED     missing Idempotency-Key
-//	400 VALIDATION_FAILED            unreadable/invalid body or required field
+//	400 VALIDATION_FAILED            unreadable body (incl. larger than 1 MiB), invalid body or required field
 //	403 TENANT_SCOPE_MISMATCH        body tenant_id != X-Tenant-Id
 //	409 PRV-020                      Idempotency-Key reused with a different payload
 //	503 STORE_UNAVAILABLE            lookup or the atomic decision+idempotency commit failed
@@ -190,9 +199,9 @@ func (h *Handler) EvaluateDecision(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	bodyBytes, err := readBodyBytes(r)
+	bodyBytes, err := readBodyBytes(w, r)
 	if err != nil {
-		writeCoded(w, http.StatusBadRequest, domain.ErrCodeValidationFailed, "failed to read request body")
+		writeCoded(w, http.StatusBadRequest, domain.ErrCodeValidationFailed, "failed to read request body (the body must not exceed 1 MiB)")
 		return
 	}
 	reqHash := hashBody(bodyBytes)
@@ -252,7 +261,11 @@ func (h *Handler) EvaluateDecision(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 7. Core runtime evaluation sequence
-	out := h.evaluate(r.Context(), tenantID, principalID, &req, decision)
+	// The correlation id and idempotency key of THIS request travel with the
+	// evaluation, so the call to privacy-transfer-svc (a mutating route there)
+	// carries the §18.1 context it requires.
+	evalCtx := transferregistry.WithRequestContext(r.Context(), correlationID, idemKey)
+	out := h.evaluate(evalCtx, tenantID, principalID, &req, decision)
 	decision.Result = out.result
 	decision.ReasonCodes = out.reasons
 	if out.constraints != nil {

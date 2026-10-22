@@ -10,6 +10,7 @@ package compat
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 
 	"zoiko.io/schema-registry-svc/internal/domain"
 )
@@ -44,6 +45,17 @@ func parse(raw json.RawMessage) (domain.Shape, error) {
 //
 // Adding a new optional field, or removing a field that was never required,
 // is always safe.
+//
+// The violations are returned sorted, so the result is deterministic.
+//
+// Supported subset (everything else is not compared): per property, the
+// declared `type` (a single string), `properties`/`required` of nested objects
+// and the `items` schema of arrays (type and, for object items, nested
+// properties/required). Keywords such as enum, format, pattern, minimum,
+// additionalProperties, $ref, allOf/anyOf/oneOf and `type` given as an array
+// are not analysed; a schema whose `type` is an array is refused at
+// registration (domain.ErrSchemaShapeInvalid) because it cannot be parsed into
+// this shape.
 func Check(oldRaw, newRaw json.RawMessage) ([]string, error) {
 	oldShape, err := parse(oldRaw)
 	if err != nil {
@@ -55,6 +67,12 @@ func Check(oldRaw, newRaw json.RawMessage) ([]string, error) {
 	}
 
 	violations := checkProperties("", oldShape.Properties, newShape.Properties, oldShape.Required, newShape.Required)
+	// checkProperties walks Go maps, whose iteration order is random, so the
+	// same pair of schemas used to yield the same violations in a different
+	// order from one call to the next. Every message starts with the quoted
+	// field path, so a plain sort orders them by path and is stable. Nothing is
+	// added, removed or reworded.
+	sort.Strings(violations)
 	return violations, nil
 }
 

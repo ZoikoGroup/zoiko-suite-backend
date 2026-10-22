@@ -15,6 +15,7 @@ package consumer
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"go.uber.org/zap"
@@ -97,6 +98,19 @@ type auditEngagementPayload struct {
 	ActorPrincipalID string `json:"actor_principal_id"`
 }
 
+// ErrMalformedEvent is returned (wrapped) by Handle for a message that can never
+// be stored as a valid audit event: unparsable envelope, a missing mandatory
+// field, or a payload that fails its event type's validation. It is a permanent
+// condition, so retrying is pointless; the Kafka runner dead-letters such a
+// message (original bytes intact, reason in a header) instead of dropping it,
+// so the message is never silently lost. Store failures are NOT malformed
+// events and keep their own retry-then-DLQ path.
+var ErrMalformedEvent = errors.New("malformed event")
+
+func malformed(reason string) error {
+	return fmt.Errorf("%w: %s", ErrMalformedEvent, reason)
+}
+
 // Consumer receives raw event messages (bytes), validates them, and delegates
 // to the Store for append-only persistence.
 type Consumer struct {
@@ -112,10 +126,12 @@ func New(s store.Store, log *zap.Logger) *Consumer {
 // Handle dispatches a raw message to the appropriate handler based on event_type.
 //
 // Contract:
-//   - If the message cannot be parsed or the event_type is unknown, the message
-//     is rejected (logged at error level) and nil is returned.  The consumer
-//     loop must NOT requeue unrecognised events — they would loop forever.
-//   - If a required field is missing the message is rejected without partial storage.
+//   - If the message cannot be parsed or a required field is missing, nothing is
+//     stored and an error wrapping ErrMalformedEvent is returned (also logged at
+//     error level). The runner dead-letters it without retrying — retrying a
+//     permanently invalid message would loop forever — so it is not silently
+//     lost. A valid event of any event_type is stored (generic domain handler).
+//   - A message is never partially stored.
 //   - Duplicate event_ids (same eventID delivered twice) are handled atomically
 //     by the store layer (INSERT … ON CONFLICT DO NOTHING).
 //
@@ -127,7 +143,7 @@ func (c *Consumer) Handle(ctx context.Context, eventID string, raw []byte) error
 		c.log.Error("rejected: event_id is empty",
 			zap.ByteString("raw_message", raw),
 		)
-		return nil // non-fatal: do not crash the consumer loop
+		return malformed("event_id is empty")
 	}
 
 	var env envelope
@@ -136,28 +152,28 @@ func (c *Consumer) Handle(ctx context.Context, eventID string, raw []byte) error
 			zap.String("event_id", eventID),
 			zap.Error(err),
 		)
-		return nil
+		return malformed("cannot unmarshal event envelope")
 	}
 
 	if env.EventType == "" {
 		c.log.Error("rejected: event_type is missing",
 			zap.String("event_id", eventID),
 		)
-		return nil
+		return malformed("event_type is missing")
 	}
 	if env.SourceService == "" {
 		c.log.Error("rejected: source_service is missing",
 			zap.String("event_id", eventID),
 			zap.String("event_type", env.EventType),
 		)
-		return nil
+		return malformed("source_service is missing")
 	}
 	if env.SchemaVersion == "" {
 		c.log.Error("rejected: schema_version is missing",
 			zap.String("event_id", eventID),
 			zap.String("event_type", env.EventType),
 		)
-		return nil
+		return malformed("schema_version is missing")
 	}
 
 	switch env.EventType {
@@ -253,23 +269,23 @@ func (c *Consumer) handleGenericDomainEvent(ctx context.Context, eventID string,
 func (c *Consumer) handleAuditEngagement(ctx context.Context, eventID string, env envelope) error {
 	if env.SourceService != "workflow-svc" {
 		c.log.Error("rejected: audit engagement event from unexpected source", zap.String("event_id", eventID), zap.String("source_service", env.SourceService))
-		return nil
+		return malformed("audit engagement event from unexpected source")
 	}
 	var p auditEngagementPayload
 	if err := json.Unmarshal(env.Payload, &p); err != nil {
 		c.log.Error("rejected: cannot unmarshal audit engagement payload", zap.String("event_id", eventID), zap.Error(err))
-		return nil
+		return malformed("cannot unmarshal audit engagement payload")
 	}
 	if p.EngagementID == "" || p.TenantID == "" || p.LegalEntityID == "" || p.ActorPrincipalID == "" || env.CorrelationID == "" {
 		c.log.Error("rejected: audit engagement payload lacks required audit context", zap.String("event_id", eventID), zap.String("event_type", env.EventType))
-		return nil
+		return malformed("audit engagement payload lacks required audit context")
 	}
 	// Scope appears in both the canonical envelope and payload. Refuse a
 	// disagreement so no malformed producer can place a cross-tenant fact in
 	// the hash chain under an apparently valid payload.
 	if env.TenantID != p.TenantID || env.LegalEntityID != p.LegalEntityID || env.ActorID != p.ActorPrincipalID {
 		c.log.Error("rejected: audit engagement envelope/payload scope mismatch", zap.String("event_id", eventID))
-		return nil
+		return malformed("audit engagement envelope/payload scope mismatch")
 	}
 	evt := &store.AuditEvent{
 		EventID: eventID, EventType: env.EventType, TenantID: p.TenantID, LegalEntityID: p.LegalEntityID,
@@ -294,7 +310,7 @@ func (c *Consumer) handleContextResolved(ctx context.Context, eventID string, en
 			zap.String("event_id", eventID),
 			zap.Error(err),
 		)
-		return nil
+		return malformed("cannot unmarshal identity.context.resolved payload")
 	}
 
 	if err := validateContextResolved(p); err != nil {
@@ -302,7 +318,7 @@ func (c *Consumer) handleContextResolved(ctx context.Context, eventID string, en
 			zap.String("event_id", eventID),
 			zap.Error(err),
 		)
-		return nil
+		return malformed("identity.context.resolved payload validation failed")
 	}
 
 	// Envelope-level correlation_id wins if a producer sets it; otherwise
@@ -350,20 +366,20 @@ func (c *Consumer) handleEntityStatusChanged(ctx context.Context, eventID string
 			zap.String("event_id", eventID),
 			zap.Error(err),
 		)
-		return nil
+		return malformed("cannot unmarshal entity.status.changed payload")
 	}
 
 	if p.TenantID == "" {
 		c.log.Error("rejected: entity.status.changed missing tenant_id",
 			zap.String("event_id", eventID),
 		)
-		return nil
+		return malformed("entity.status.changed missing tenant_id")
 	}
 	if p.LegalEntityID == "" {
 		c.log.Error("rejected: entity.status.changed missing legal_entity_id",
 			zap.String("event_id", eventID),
 		)
-		return nil
+		return malformed("entity.status.changed missing legal_entity_id")
 	}
 
 	evt := &store.AuditEvent{

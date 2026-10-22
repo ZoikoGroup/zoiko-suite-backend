@@ -75,12 +75,15 @@ func (h *Handler) CreateActivity(w http.ResponseWriter, r *http.Request) {
 	req.TransferRefs = domain.NormalizeRefs(req.TransferRefs)
 	req.ProcessorRefs = domain.NormalizeRefs(req.ProcessorRefs)
 
-	_, version, err := h.store.CreateActivity(r.Context(), cc.RecordTenant(), req, cc.Principal)
+	payload, existing, err := h.execute(r, cc, "CreateActivity", key, hash, http.StatusCreated, func(ctx context.Context) (any, error) {
+		_, version, err := h.store.CreateActivity(ctx, cc.RecordTenant(), req, cc.Principal)
+		return version, err
+	})
 	if err != nil {
 		h.storeUnavailable(w, "CreateActivity", err)
 		return
 	}
-	h.respond(r.Context(), w, cc, "CreateActivity", key, hash, http.StatusCreated, version)
+	h.finish(w, existing, hash, http.StatusCreated, payload)
 }
 
 func (h *Handler) CreateActivityVersion(w http.ResponseWriter, r *http.Request) {
@@ -135,7 +138,9 @@ func (h *Handler) CreateActivityVersion(w http.ResponseWriter, r *http.Request) 
 	req.TransferRefs = domain.NormalizeRefs(req.TransferRefs)
 	req.ProcessorRefs = domain.NormalizeRefs(req.ProcessorRefs)
 
-	version, err := h.store.CreateActivityVersion(r.Context(), activityID, req, cc.Principal)
+	payload, existing, err := h.execute(r, cc, "CreateActivityVersion", key, hash, http.StatusCreated, func(ctx context.Context) (any, error) {
+		return h.store.CreateActivityVersion(ctx, activityID, req, cc.Principal)
+	})
 	if err != nil {
 		if errors.Is(err, domain.ErrActivityVersionNotFound) {
 			writeCoded(w, http.StatusNotFound, domain.ErrCodeNotFound, "parent processing activity version not found")
@@ -144,7 +149,7 @@ func (h *Handler) CreateActivityVersion(w http.ResponseWriter, r *http.Request) 
 		h.storeUnavailable(w, "CreateActivityVersion", err)
 		return
 	}
-	h.respond(r.Context(), w, cc, "CreateActivityVersion", key, hash, http.StatusCreated, version)
+	h.finish(w, existing, hash, http.StatusCreated, payload)
 }
 
 // ── reads ────────────────────────────────────────────────────────────────────
@@ -276,7 +281,9 @@ func (h *Handler) lifecycleAction(w http.ResponseWriter, r *http.Request, activi
 		}
 	}
 
-	updated, err := s.run(r.Context(), cc, existing, arg)
+	payload, replay, err := h.execute(r, cc, s.op, key, hash, http.StatusOK, func(ctx context.Context) (any, error) {
+		return s.run(ctx, cc, existing, arg)
+	})
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrActivityVersionNotFound):
@@ -288,7 +295,7 @@ func (h *Handler) lifecycleAction(w http.ResponseWriter, r *http.Request, activi
 		}
 		return
 	}
-	h.respond(r.Context(), w, cc, s.op, key, hash, http.StatusOK, updated)
+	h.finish(w, replay, hash, http.StatusOK, payload)
 }
 
 // requireState returns a check that insists on one source state.

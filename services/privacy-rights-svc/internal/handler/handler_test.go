@@ -15,21 +15,9 @@ import (
 
 	authzpkg "zoiko.io/privacy-rights-svc/internal/authz"
 	"zoiko.io/privacy-rights-svc/internal/domain"
-	"zoiko.io/privacy-rights-svc/internal/events"
 	"zoiko.io/privacy-rights-svc/internal/handler"
 	"zoiko.io/privacy-rights-svc/internal/middleware"
 )
-
-// ── stub publisher ───────────────────────────────────────────────────────────
-
-type stubPublisher struct{ calls int }
-
-func (p *stubPublisher) Publish(_ context.Context, _ events.PublishParams) error {
-	p.calls++
-	return nil
-}
-
-var _ events.Publisher = (*stubPublisher)(nil)
 
 // ── stub authz ───────────────────────────────────────────────────────────────
 
@@ -46,9 +34,16 @@ func (a *stubAuthz) CheckAllowed(_ context.Context, _, _, _ string) error {
 
 const testTenant = "tenant-rights-1"
 
-func newTestRouter(st *stubStore, pub *stubPublisher, az *stubAuthz) chi.Router {
+func tctx() context.Context { return middleware.WithTenant(context.Background(), testTenant) }
+
+const (
+	hashABC = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	hashCRM = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+)
+
+func newTestRouter(st *stubStore, az handler.AuthzChecker) chi.Router {
 	logger := zap.NewNop()
-	h := handler.New(st, pub, az, logger)
+	h := handler.New(st, az, logger)
 	r := chi.NewRouter()
 	r.Use(middleware.TenantContext())
 	handler.RegisterRoutes(r, h)
@@ -124,7 +119,7 @@ func createRequest(t *testing.T, r http.Handler) *domain.RightsRequest {
 // ── tests ────────────────────────────────────────────────────────────────────
 
 func TestCreateRequest_Received(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{})
+	r := newTestRouter(newStubStore(), &stubAuthz{})
 	req := createRequest(t, r)
 	if req.Status != domain.StatusReceived {
 		t.Fatalf("expected RECEIVED, got %s", req.Status)
@@ -135,7 +130,7 @@ func TestCreateRequest_Received(t *testing.T) {
 }
 
 func TestCreateRequest_InvalidRightFamily_Rejected(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{})
+	r := newTestRouter(newStubStore(), &stubAuthz{})
 	w := doRequest(r, http.MethodPost, "/privacy/rights-requests", map[string]string{
 		"subject_ref": "subject-1", "right_family": "NOT_REAL",
 	}, testTenant)
@@ -146,7 +141,7 @@ func TestCreateRequest_InvalidRightFamily_Rejected(t *testing.T) {
 
 func TestIdentityVerification_FailedAttempt_DoesNotAdvanceStatus(t *testing.T) {
 	st := newStubStore()
-	r := newTestRouter(st, &stubPublisher{}, &stubAuthz{})
+	r := newTestRouter(st, &stubAuthz{})
 	req := createRequest(t, r)
 
 	w := doRequest(r, http.MethodPost, "/privacy/rights-requests/"+req.RequestID+"/identity-verification",
@@ -155,7 +150,7 @@ func TestIdentityVerification_FailedAttempt_DoesNotAdvanceStatus(t *testing.T) {
 		t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
 	}
 
-	updated, err := st.FindRequest(context.Background(), req.RequestID)
+	updated, err := st.FindRequest(tctx(), req.RequestID)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -169,13 +164,13 @@ func TestIdentityVerification_FailedAttempt_DoesNotAdvanceStatus(t *testing.T) {
 
 func TestIdentityVerification_SuccessfulAttempt_Advances(t *testing.T) {
 	st := newStubStore()
-	r := newTestRouter(st, &stubPublisher{}, &stubAuthz{})
+	r := newTestRouter(st, &stubAuthz{})
 	req := createRequest(t, r)
 
 	doRequest(r, http.MethodPost, "/privacy/rights-requests/"+req.RequestID+"/identity-verification",
 		domain.RecordIdentityVerificationRequest{Verified: true, Method: "GOVT_ID_MATCH"}, testTenant)
 
-	updated, _ := st.FindRequest(context.Background(), req.RequestID)
+	updated, _ := st.FindRequest(tctx(), req.RequestID)
 	if updated.Status != domain.StatusIdentityVerified || !updated.IdentityVerified {
 		t.Fatalf("expected IDENTITY_VERIFIED and identity_verified=true, got status=%s verified=%v", updated.Status, updated.IdentityVerified)
 	}
@@ -183,18 +178,18 @@ func TestIdentityVerification_SuccessfulAttempt_Advances(t *testing.T) {
 
 func TestAttachDiscoveryManifest_AdvancesToInDiscovery(t *testing.T) {
 	st := newStubStore()
-	r := newTestRouter(st, &stubPublisher{}, &stubAuthz{})
+	r := newTestRouter(st, &stubAuthz{})
 	req := createRequest(t, r)
 	doRequest(r, http.MethodPost, "/privacy/rights-requests/"+req.RequestID+"/identity-verification",
 		domain.RecordIdentityVerificationRequest{Verified: true, Method: "GOVT_ID_MATCH"}, testTenant)
 
 	w := doRequest(r, http.MethodPost, "/privacy/rights-requests/"+req.RequestID+"/discovery-manifests",
-		domain.AttachDiscoveryManifestRequest{Domain: "accounts-receivable-svc", ContentHash: "sha256:abc", CandidateCount: 3}, testTenant)
+		domain.AttachDiscoveryManifestRequest{Domain: "accounts-receivable-svc", ContentHash: hashABC, CandidateCount: 3}, testTenant)
 	if w.Code != http.StatusCreated {
 		t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
 	}
 
-	updated, _ := st.FindRequest(context.Background(), req.RequestID)
+	updated, _ := st.FindRequest(tctx(), req.RequestID)
 	if updated.Status != domain.StatusInDiscovery {
 		t.Fatalf("expected IN_DISCOVERY, got %s", updated.Status)
 	}
@@ -206,7 +201,7 @@ func TestAttachDiscoveryManifest_AdvancesToInDiscovery(t *testing.T) {
 // of the gate specifically, so this doesn't just get caught by the
 // other (no-manifest) precondition instead.
 func TestClose_Fulfilled_WithoutIdentityVerification_Blocked(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{})
+	r := newTestRouter(newStubStore(), &stubAuthz{})
 	req := createRequest(t, r)
 	// Deliberately no identity-verification call.
 
@@ -215,7 +210,7 @@ func TestClose_Fulfilled_WithoutIdentityVerification_Blocked(t *testing.T) {
 	// IN_DISCOVERY), but the manifest ROW itself is still recorded either
 	// way — enough to isolate the identity check specifically.
 	doRequest(r, http.MethodPost, "/privacy/rights-requests/"+req.RequestID+"/discovery-manifests",
-		domain.AttachDiscoveryManifestRequest{Domain: "accounts-receivable-svc", ContentHash: "sha256:abc", CandidateCount: 3}, testTenant)
+		domain.AttachDiscoveryManifestRequest{Domain: "accounts-receivable-svc", ContentHash: hashABC, CandidateCount: 3}, testTenant)
 
 	w := doRequest(r, http.MethodPost, "/privacy/rights-requests/"+req.RequestID+"/close",
 		domain.CloseRequestRequest{Outcome: domain.OutcomeFulfilled}, testTenant)
@@ -233,7 +228,7 @@ func TestClose_Fulfilled_WithoutIdentityVerification_Blocked(t *testing.T) {
 // TestClose_Fulfilled_WithoutDiscoveryManifest_Blocked is the other half
 // of the same gate: identity alone is not enough either.
 func TestClose_Fulfilled_WithoutDiscoveryManifest_Blocked(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{})
+	r := newTestRouter(newStubStore(), &stubAuthz{})
 	req := createRequest(t, r)
 	doRequest(r, http.MethodPost, "/privacy/rights-requests/"+req.RequestID+"/identity-verification",
 		domain.RecordIdentityVerificationRequest{Verified: true, Method: "GOVT_ID_MATCH"}, testTenant)
@@ -247,12 +242,12 @@ func TestClose_Fulfilled_WithoutDiscoveryManifest_Blocked(t *testing.T) {
 
 func TestClose_Fulfilled_WithBothPreconditions_Succeeds(t *testing.T) {
 	st := newStubStore()
-	r := newTestRouter(st, &stubPublisher{}, &stubAuthz{})
+	r := newTestRouter(st, &stubAuthz{})
 	req := createRequest(t, r)
 	doRequest(r, http.MethodPost, "/privacy/rights-requests/"+req.RequestID+"/identity-verification",
 		domain.RecordIdentityVerificationRequest{Verified: true, Method: "GOVT_ID_MATCH"}, testTenant)
 	doRequest(r, http.MethodPost, "/privacy/rights-requests/"+req.RequestID+"/discovery-manifests",
-		domain.AttachDiscoveryManifestRequest{Domain: "accounts-receivable-svc", ContentHash: "sha256:abc", CandidateCount: 3}, testTenant)
+		domain.AttachDiscoveryManifestRequest{Domain: "accounts-receivable-svc", ContentHash: hashABC, CandidateCount: 3}, testTenant)
 
 	w := doRequest(r, http.MethodPost, "/privacy/rights-requests/"+req.RequestID+"/close",
 		domain.CloseRequestRequest{Outcome: domain.OutcomeFulfilled, ResponseEvidenceHash: "sha256:response"}, testTenant)
@@ -270,7 +265,7 @@ func TestClose_Fulfilled_WithBothPreconditions_Succeeds(t *testing.T) {
 // carry no DISCLOSURE GATE precondition — a request can be rejected
 // precisely because identity could never be verified.
 func TestClose_Rejected_NoPreconditionsRequired(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{})
+	r := newTestRouter(newStubStore(), &stubAuthz{})
 	req := createRequest(t, r)
 
 	w := doRequest(r, http.MethodPost, "/privacy/rights-requests/"+req.RequestID+"/close",
@@ -281,7 +276,7 @@ func TestClose_Rejected_NoPreconditionsRequired(t *testing.T) {
 }
 
 func TestClose_AlreadyClosed_Conflict(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{})
+	r := newTestRouter(newStubStore(), &stubAuthz{})
 	req := createRequest(t, r)
 	doRequest(r, http.MethodPost, "/privacy/rights-requests/"+req.RequestID+"/close",
 		domain.CloseRequestRequest{Outcome: domain.OutcomeWithdrawn}, testTenant)
@@ -295,7 +290,7 @@ func TestClose_AlreadyClosed_Conflict(t *testing.T) {
 
 func TestAttachWFCProcessRef(t *testing.T) {
 	st := newStubStore()
-	r := newTestRouter(st, &stubPublisher{}, &stubAuthz{})
+	r := newTestRouter(st, &stubAuthz{})
 	req := createRequest(t, r)
 
 	w := doRequest(r, http.MethodPost, "/privacy/rights-requests/"+req.RequestID+"/wfc-process-ref",
@@ -303,7 +298,7 @@ func TestAttachWFCProcessRef(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
-	updated, _ := st.FindRequest(context.Background(), req.RequestID)
+	updated, _ := st.FindRequest(tctx(), req.RequestID)
 	if updated.WFCProcessRef == nil || *updated.WFCProcessRef != "wf-instance-123" {
 		t.Fatalf("expected wfc_process_ref recorded, got %v", updated.WFCProcessRef)
 	}
@@ -316,7 +311,7 @@ func TestAttachWFCProcessRef(t *testing.T) {
 // itself already uses for a double-close — rather than falling through to
 // a generic 503/PRV-019 as if the backing store were merely unavailable.
 func TestAttachWFCProcessRef_OnClosedRequest_Conflict(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{})
+	r := newTestRouter(newStubStore(), &stubAuthz{})
 	req := createRequest(t, r)
 	doRequest(r, http.MethodPost, "/privacy/rights-requests/"+req.RequestID+"/close",
 		domain.CloseRequestRequest{Outcome: domain.OutcomeWithdrawn}, testTenant)
@@ -329,7 +324,7 @@ func TestAttachWFCProcessRef_OnClosedRequest_Conflict(t *testing.T) {
 }
 
 func TestRecordIdentityVerification_OnClosedRequest_Conflict(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{})
+	r := newTestRouter(newStubStore(), &stubAuthz{})
 	req := createRequest(t, r)
 	doRequest(r, http.MethodPost, "/privacy/rights-requests/"+req.RequestID+"/close",
 		domain.CloseRequestRequest{Outcome: domain.OutcomeWithdrawn}, testTenant)
@@ -342,20 +337,20 @@ func TestRecordIdentityVerification_OnClosedRequest_Conflict(t *testing.T) {
 }
 
 func TestAttachDiscoveryManifest_OnClosedRequest_Conflict(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{})
+	r := newTestRouter(newStubStore(), &stubAuthz{})
 	req := createRequest(t, r)
 	doRequest(r, http.MethodPost, "/privacy/rights-requests/"+req.RequestID+"/close",
 		domain.CloseRequestRequest{Outcome: domain.OutcomeWithdrawn}, testTenant)
 
 	w := doRequest(r, http.MethodPost, "/privacy/rights-requests/"+req.RequestID+"/discovery-manifests",
-		domain.AttachDiscoveryManifestRequest{Domain: "accounts-receivable-svc", ContentHash: "sha256:abc", CandidateCount: 3}, testTenant)
+		domain.AttachDiscoveryManifestRequest{Domain: "accounts-receivable-svc", ContentHash: hashABC, CandidateCount: 3}, testTenant)
 	if w.Code != http.StatusConflict {
 		t.Fatalf("expected 409 attaching a discovery manifest to a CLOSED request, got %d: %s", w.Code, w.Body.String())
 	}
 }
 
 func TestListRequestsBySubject(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{})
+	r := newTestRouter(newStubStore(), &stubAuthz{})
 	createRequest(t, r)
 	createRequest(t, r)
 
@@ -373,7 +368,7 @@ func TestListRequestsBySubject(t *testing.T) {
 }
 
 func TestCreateRequest_AuthorizationDenied(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{deny: true})
+	r := newTestRouter(newStubStore(), &stubAuthz{deny: true})
 	w := doRequest(r, http.MethodPost, "/privacy/rights-requests", domain.CreateRightsRequestRequest{
 		SubjectRef: "subject-1", RightFamily: domain.RightAccess,
 	}, testTenant)
@@ -383,7 +378,7 @@ func TestCreateRequest_AuthorizationDenied(t *testing.T) {
 }
 
 func TestGetRequest_NotFound(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{})
+	r := newTestRouter(newStubStore(), &stubAuthz{})
 	w := doRequest(r, http.MethodGet, "/privacy/rights-requests/does-not-exist", nil, testTenant)
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("expected 404, got %d", w.Code)
@@ -392,7 +387,7 @@ func TestGetRequest_NotFound(t *testing.T) {
 
 func TestCreateRequest_IdempotencyKey_ReplayAndConflict(t *testing.T) {
 	st := newStubStore()
-	r := newTestRouter(st, &stubPublisher{}, &stubAuthz{})
+	r := newTestRouter(st, &stubAuthz{})
 
 	payload := domain.CreateRightsRequestRequest{
 		SubjectRef:   "subject-idem-1",
@@ -446,7 +441,7 @@ func TestCreateRequest_IdempotencyKey_ReplayAndConflict(t *testing.T) {
 
 func TestClose_ResponsePackageVersion_IncrementedOnFulfilled(t *testing.T) {
 	st := newStubStore()
-	r := newTestRouter(st, &stubPublisher{}, &stubAuthz{})
+	r := newTestRouter(st, &stubAuthz{})
 	req := createRequest(t, r)
 
 	// Verify identity
@@ -454,7 +449,7 @@ func TestClose_ResponsePackageVersion_IncrementedOnFulfilled(t *testing.T) {
 		domain.RecordIdentityVerificationRequest{Verified: true, Method: "GOVT_ID_MATCH"}, testTenant)
 	// Attach discovery manifest
 	doRequest(r, http.MethodPost, "/privacy/rights-requests/"+req.RequestID+"/discovery-manifests",
-		domain.AttachDiscoveryManifestRequest{Domain: "crm-svc", ContentHash: "sha256:crm123", CandidateCount: 5}, testTenant)
+		domain.AttachDiscoveryManifestRequest{Domain: "crm-svc", ContentHash: hashCRM, CandidateCount: 5}, testTenant)
 
 	// Close as FULFILLED
 	w := doRequest(r, http.MethodPost, "/privacy/rights-requests/"+req.RequestID+"/close",
@@ -470,7 +465,7 @@ func TestClose_ResponsePackageVersion_IncrementedOnFulfilled(t *testing.T) {
 }
 
 func TestV1Routes_Succeed(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{})
+	r := newTestRouter(newStubStore(), &stubAuthz{})
 	w := doRequest(r, http.MethodPost, "/v1/privacy/rights-requests", domain.CreateRightsRequestRequest{
 		SubjectRef: "subject-v1", RightFamily: domain.RightPortability, Jurisdiction: "EU",
 	}, testTenant)
@@ -501,7 +496,7 @@ func mutationCases(reqID string) []struct {
 	}{
 		{"create", "/privacy/rights-requests", domain.CreateRightsRequestRequest{SubjectRef: "s", RightFamily: domain.RightAccess}},
 		{"identity-verification", "/privacy/rights-requests/" + reqID + "/identity-verification", domain.RecordIdentityVerificationRequest{Verified: true, Method: "GOVT_ID_MATCH"}},
-		{"discovery-manifest", "/privacy/rights-requests/" + reqID + "/discovery-manifests", domain.AttachDiscoveryManifestRequest{Domain: "d", ContentHash: "sha256:x"}},
+		{"discovery-manifest", "/privacy/rights-requests/" + reqID + "/discovery-manifests", domain.AttachDiscoveryManifestRequest{Domain: "d", ContentHash: hashABC}},
 		{"wfc-process-ref", "/privacy/rights-requests/" + reqID + "/wfc-process-ref", domain.AttachWFCProcessRefRequest{WFCProcessRef: "wf-1"}},
 		{"close", "/privacy/rights-requests/" + reqID + "/close", domain.CloseRequestRequest{Outcome: domain.OutcomeWithdrawn}},
 	}
@@ -511,7 +506,7 @@ func mutationCases(reqID string) []struct {
 // route and proves both §18.1 headers are mandatory: omitting or blanking
 // either yields 400 before any idempotency record, store mutation or event.
 func TestMutations_RequireCorrelationIDAndIdempotencyKey(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{})
+	r := newTestRouter(newStubStore(), &stubAuthz{})
 	req := createRequest(t, r)
 
 	for _, tc := range mutationCases(req.RequestID) {
@@ -550,7 +545,7 @@ func TestMutations_RequireCorrelationIDAndIdempotencyKey(t *testing.T) {
 // X-Tenant-Id is refused fail-closed (401) before any handler runs, while a
 // whitespace-padded id is accepted (trimmed) — mirroring the RLS boundary.
 func TestMutations_RequireTenantScope(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{})
+	r := newTestRouter(newStubStore(), &stubAuthz{})
 	req := createRequest(t, r)
 
 	for _, tc := range mutationCases(req.RequestID) {
@@ -586,7 +581,7 @@ func TestMutations_RequireTenantScope(t *testing.T) {
 func TestCreateRequest_AuthorizationRunsBeforeIdempotencyReplay(t *testing.T) {
 	st := newStubStore()
 	az := &stubAuthz{}
-	r := newTestRouter(st, &stubPublisher{}, az)
+	r := newTestRouter(st, az)
 
 	payload := domain.CreateRightsRequestRequest{
 		SubjectRef: "subject-authz-first", RightFamily: domain.RightErasure, Jurisdiction: "GDPR",
@@ -618,7 +613,7 @@ func TestCreateRequest_AuthorizationRunsBeforeIdempotencyReplay(t *testing.T) {
 // the §18 create-response critical fields are present additively (the
 // pre-existing right_family/identity_verified fields are unchanged).
 func TestCreateResponse_IncludesCanonicalClassificationAndIdentityState(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{})
+	r := newTestRouter(newStubStore(), &stubAuthz{})
 	w := doRequest(r, http.MethodPost, "/privacy/rights-requests", domain.CreateRightsRequestRequest{
 		SubjectRef: "subject-classify", RightFamily: domain.RightAccess, Jurisdiction: "EU",
 	}, testTenant)
@@ -650,7 +645,7 @@ func TestCreateResponse_IncludesCanonicalClassificationAndIdentityState(t *testi
 
 func TestIdentityVerificationResponse_IdentityStateBecomesVerified(t *testing.T) {
 	st := newStubStore()
-	r := newTestRouter(st, &stubPublisher{}, &stubAuthz{})
+	r := newTestRouter(st, &stubAuthz{})
 	req := createRequest(t, r)
 
 	w := doRequest(r, http.MethodPost, "/privacy/rights-requests/"+req.RequestID+"/identity-verification",
@@ -673,11 +668,11 @@ func TestIdentityVerificationResponse_IdentityStateBecomesVerified(t *testing.T)
 // discovery-manifest "hash" field is exposed additively on both the attach
 // response and the list response (content_hash is unchanged).
 func TestDiscoveryManifestResponse_IncludesCanonicalHash(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{})
+	r := newTestRouter(newStubStore(), &stubAuthz{})
 	req := createRequest(t, r)
 
 	w := doRequest(r, http.MethodPost, "/privacy/rights-requests/"+req.RequestID+"/discovery-manifests",
-		domain.AttachDiscoveryManifestRequest{Domain: "accounts-receivable-svc", ContentHash: "sha256:abc", CandidateCount: 3}, testTenant)
+		domain.AttachDiscoveryManifestRequest{Domain: "accounts-receivable-svc", ContentHash: hashABC, CandidateCount: 3}, testTenant)
 	if w.Code != http.StatusCreated {
 		t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
 	}
@@ -699,7 +694,7 @@ func TestDiscoveryManifestResponse_IncludesCanonicalHash(t *testing.T) {
 		} `json:"data"`
 	}
 	_ = json.Unmarshal(lw.Body.Bytes(), &list)
-	if len(list.Data) != 1 || list.Data[0].Hash != "sha256:abc" {
+	if len(list.Data) != 1 || list.Data[0].Hash != hashABC {
 		t.Fatalf("expected listed manifest hash sha256:abc, got %+v", list.Data)
 	}
 }
@@ -708,14 +703,14 @@ func TestDiscoveryManifestResponse_IncludesCanonicalHash(t *testing.T) {
 // no longer borrows PRV-001 (PURPOSE_NOT_REGISTERED); §32 declares no
 // not-found code, so a plain structured error is returned consistently.
 func TestNotFound_ReturnsPlainMessageWithoutMisusedCode(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{})
+	r := newTestRouter(newStubStore(), &stubAuthz{})
 
 	w := doRequest(r, http.MethodGet, "/privacy/rights-requests/missing-1", nil, testTenant)
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("expected 404, got %d: %s", w.Code, w.Body.String())
 	}
-	if body := w.Body.String(); strings.Contains(body, "PRV-") {
-		t.Fatalf("not-found must not carry a misused §32 code, got %s", body)
+	if body := w.Body.String(); strings.Contains(body, "PRV-") || !strings.Contains(body, `"error_code":"NOT_FOUND"`) {
+		t.Fatalf("not-found must carry NOT_FOUND and no misused §32 code, got %s", body)
 	}
 
 	mw := doRequest(r, http.MethodPost, "/privacy/rights-requests/missing-2/wfc-process-ref",
@@ -732,7 +727,7 @@ func TestNotFound_ReturnsPlainMessageWithoutMisusedCode(t *testing.T) {
 // validation no longer borrows PRV-005 (POLICY_UNAVAILABLE); §32 declares no
 // input-validation code, so a plain structured 400 is returned.
 func TestValidation_ReturnsPlainMessageWithoutMisusedCode(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{})
+	r := newTestRouter(newStubStore(), &stubAuthz{})
 
 	w := doRequest(r, http.MethodPost, "/privacy/rights-requests", map[string]string{
 		"subject_ref": "s", "right_family": "NOT_REAL",
@@ -740,21 +735,7 @@ func TestValidation_ReturnsPlainMessageWithoutMisusedCode(t *testing.T) {
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
 	}
-	if body := w.Body.String(); strings.Contains(body, "PRV-") {
-		t.Fatalf("input validation must not carry a misused §32 code, got %s", body)
-	}
-}
-
-// TestNoUndeclaredEventsPublished is the GAP-8 regression: §19 declares no
-// rights-intake or rights-closure event, so the service must publish nothing
-// for those transitions rather than emit undeclared event names.
-func TestNoUndeclaredEventsPublished(t *testing.T) {
-	pub := &stubPublisher{}
-	r := newTestRouter(newStubStore(), pub, &stubAuthz{})
-	req := createRequest(t, r)
-	doRequest(r, http.MethodPost, "/privacy/rights-requests/"+req.RequestID+"/close",
-		domain.CloseRequestRequest{Outcome: domain.OutcomeWithdrawn}, testTenant)
-	if pub.calls != 0 {
-		t.Fatalf("no §19-declared event exists for rights intake/closure; expected 0 publishes, got %d", pub.calls)
+	if body := w.Body.String(); strings.Contains(body, "PRV-") || !strings.Contains(body, `"error_code":"VALIDATION_FAILED"`) {
+		t.Fatalf("input validation must carry VALIDATION_FAILED and no misused §32 code, got %s", body)
 	}
 }

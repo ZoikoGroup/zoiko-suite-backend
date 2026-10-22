@@ -16,7 +16,9 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -24,6 +26,18 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 )
+
+// EventTypeWorkflowStarted is the one event type that carries tenant_id and
+// legal_entity_id, and therefore the only authoritative source of that context
+// for the rest of an instance's events.
+const EventTypeWorkflowStarted = "workflow.started"
+
+// ErrAmbiguousTenantContext is returned by GetTenantContext when the
+// workflow.started rows recorded for one workflow_instance_id disagree about
+// tenant or legal entity. The schema keys rows on event_id only, so it does not
+// prevent two tenants from emitting the same instance id; the service refuses
+// to guess which one a later event belongs to.
+var ErrAmbiguousTenantContext = errors.New("workflow.started rows for this workflow_instance_id disagree on tenant or legal entity")
 
 // WorkflowHistoryEvent is the normalised representation stored in the
 // workflow_history_events table. Fields map 1-to-1 to the schema columns
@@ -68,6 +82,13 @@ type QueryFilter struct {
 	To            time.Time
 }
 
+// PageCursor is the keyset position a page starts after: the last row of the
+// previous page, in the store's total order (recorded_at, then event_id).
+type PageCursor struct {
+	RecordedAt time.Time
+	EventID    string
+}
+
 // AppendStore is the write interface for the workflow history store.
 // Implementations MUST be idempotent: inserting the same EventID twice MUST
 // succeed without error and without storing a duplicate row.
@@ -80,20 +101,32 @@ type AppendStore interface {
 // ReadStore is the read interface for the workflow history store.
 type ReadStore interface {
 	// ListByInstance returns all events for the given workflow instance
-	// scoped to tenantID, ordered chronologically (recorded_at ASC).
+	// scoped to tenantID, ordered chronologically (recorded_at ASC, then
+	// event_id ASC so that rows sharing a timestamp have one stable order).
 	// Returns an empty slice (not an error) if no events exist, including
 	// when the instance exists but belongs to a different tenant.
 	ListByInstance(ctx context.Context, tenantID, workflowInstanceID string) ([]WorkflowHistoryEvent, error)
 
+	// ListByInstancePage is ListByInstance restricted to the rows strictly after
+	// `after` (nil = from the start), at most limit rows, in the same total
+	// order. Tenant scoping is applied to every page.
+	ListByInstancePage(ctx context.Context, tenantID, workflowInstanceID string, after *PageCursor, limit int) ([]WorkflowHistoryEvent, error)
+
 	// ListByFilter returns events matching the given filter ordered by
-	// recorded_at ASC. All filter fields are required.
+	// recorded_at ASC, then event_id ASC. All filter fields are required.
 	ListByFilter(ctx context.Context, f QueryFilter) ([]WorkflowHistoryEvent, error)
 
-	// GetTenantContext retrieves the tenant_id and legal_entity_id recorded
-	// in the earliest event for the given workflow instance. This is used by
-	// the consumer to inherit governance context for non-started events that
-	// do not carry tenant/entity IDs in their payload.
-	// Returns a zero-value TenantContext and false if no rows exist yet.
+	// ListByFilterPage is ListByFilter restricted to the rows strictly after
+	// `after` (nil = from the start), at most limit rows, in the same total order.
+	ListByFilterPage(ctx context.Context, f QueryFilter, after *PageCursor, limit int) ([]WorkflowHistoryEvent, error)
+
+	// GetTenantContext retrieves the tenant_id and legal_entity_id recorded on
+	// the workflow.started row(s) for the given workflow instance. Only
+	// workflow.started rows are consulted — never a transition row, whatever
+	// its age. This is used by the consumer to inherit governance context for
+	// non-started events that do not carry tenant/entity IDs in their payload.
+	// Returns a zero-value TenantContext and false if no workflow.started row
+	// exists yet, and ErrAmbiguousTenantContext if the started rows disagree.
 	GetTenantContext(ctx context.Context, workflowInstanceID string) (TenantContext, bool, error)
 }
 
@@ -191,7 +224,7 @@ SELECT event_id, workflow_instance_id, event_type, correlation_id,
        tenant_id, legal_entity_id, payload, recorded_at
 FROM workflow_history_events
 WHERE workflow_instance_id = $1 AND tenant_id = $2
-ORDER BY recorded_at ASC`
+ORDER BY recorded_at ASC, event_id ASC`
 
 	var events []WorkflowHistoryEvent
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
@@ -210,7 +243,81 @@ ORDER BY recorded_at ASC`
 	return events, nil
 }
 
-// ListByFilter returns events matching the given filter ordered by recorded_at ASC.
+// cursorArgs splits a cursor into the two nullable query arguments of the keyset
+// predicate.
+func cursorArgs(after *PageCursor) (*time.Time, *string) {
+	if after == nil {
+		return nil, nil
+	}
+	t, id := after.RecordedAt, after.EventID
+	return &t, &id
+}
+
+// ListByInstancePage returns one keyset page of an instance's events. The
+// predicate (recorded_at, event_id) > (cursor) is evaluated against the same
+// total order as ORDER BY, so pages never overlap or skip rows, including rows
+// that share a recorded_at.
+func (s *PgStore) ListByInstancePage(ctx context.Context, tenantID, workflowInstanceID string, after *PageCursor, limit int) ([]WorkflowHistoryEvent, error) {
+	const q = `
+SELECT event_id, workflow_instance_id, event_type, correlation_id,
+       tenant_id, legal_entity_id, payload, recorded_at
+FROM workflow_history_events
+WHERE workflow_instance_id = $1 AND tenant_id = $2
+  AND ($3::timestamptz IS NULL OR (recorded_at, event_id) > ($3::timestamptz, $4::text))
+ORDER BY recorded_at ASC, event_id ASC
+LIMIT $5`
+
+	afterAt, afterID := cursorArgs(after)
+	var events []WorkflowHistoryEvent
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, queryErr := tx.Query(ctx, q, workflowInstanceID, tenantID, afterAt, afterID, limit)
+		if queryErr != nil {
+			return queryErr
+		}
+		defer rows.Close()
+		var scanErr error
+		events, scanErr = scanRows(rows)
+		return scanErr
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list workflow history page by instance %q: %w", workflowInstanceID, err)
+	}
+	return events, nil
+}
+
+// ListByFilterPage returns one keyset page of the cross-workflow window query.
+func (s *PgStore) ListByFilterPage(ctx context.Context, f QueryFilter, after *PageCursor, limit int) ([]WorkflowHistoryEvent, error) {
+	const q = `
+SELECT event_id, workflow_instance_id, event_type, correlation_id,
+       tenant_id, legal_entity_id, payload, recorded_at
+FROM workflow_history_events
+WHERE tenant_id = $1
+  AND legal_entity_id = $2
+  AND recorded_at >= $3
+  AND recorded_at <= $4
+  AND ($5::timestamptz IS NULL OR (recorded_at, event_id) > ($5::timestamptz, $6::text))
+ORDER BY recorded_at ASC, event_id ASC
+LIMIT $7`
+
+	afterAt, afterID := cursorArgs(after)
+	var events []WorkflowHistoryEvent
+	err := s.withRLS(ctx, f.TenantID, func(tx pgx.Tx) error {
+		rows, queryErr := tx.Query(ctx, q, f.TenantID, f.LegalEntityID, f.From, f.To, afterAt, afterID, limit)
+		if queryErr != nil {
+			return queryErr
+		}
+		defer rows.Close()
+		var scanErr error
+		events, scanErr = scanRows(rows)
+		return scanErr
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list workflow history page by filter: %w", err)
+	}
+	return events, nil
+}
+
+// ListByFilter returns events matching the given filter ordered by recorded_at ASC, event_id ASC.
 func (s *PgStore) ListByFilter(ctx context.Context, f QueryFilter) ([]WorkflowHistoryEvent, error) {
 	const q = `
 SELECT event_id, workflow_instance_id, event_type, correlation_id,
@@ -220,7 +327,7 @@ WHERE tenant_id = $1
   AND legal_entity_id = $2
   AND recorded_at >= $3
   AND recorded_at <= $4
-ORDER BY recorded_at ASC`
+ORDER BY recorded_at ASC, event_id ASC`
 
 	var events []WorkflowHistoryEvent
 	err := s.withRLS(ctx, f.TenantID, func(tx pgx.Tx) error {
@@ -239,9 +346,16 @@ ORDER BY recorded_at ASC`
 	return events, nil
 }
 
-// GetTenantContext retrieves the tenant_id and legal_entity_id from the earliest
-// stored event for the given workflow instance. Returns (zero, false, nil) if no
-// row exists yet.
+// GetTenantContext retrieves the tenant_id and legal_entity_id from the
+// workflow.started row for the given workflow instance — the contract's
+// authoritative source — and from nothing else. Returns (zero, false, nil) if
+// no workflow.started row exists yet, and ErrAmbiguousTenantContext if started
+// rows for the same instance id carry different tenant or legal entity values.
+//
+// The lookup necessarily runs without a tenant (the tenant is the value being
+// looked up), so it sets the internal app.bypass_rls flag for this one
+// read-only transaction. It is called only by the Kafka consumer and never
+// from an HTTP-reachable path.
 func (s *PgStore) GetTenantContext(ctx context.Context, workflowInstanceID string) (TenantContext, bool, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -255,25 +369,39 @@ func (s *PgStore) GetTenantContext(ctx context.Context, workflowInstanceID strin
 		return TenantContext{}, false, fmt.Errorf("set bypass_rls context: %w", err)
 	}
 
+	// LIMIT 2 is enough to tell "one context" from "conflicting contexts".
 	const q = `
-SELECT tenant_id, legal_entity_id
+SELECT DISTINCT tenant_id, legal_entity_id
 FROM workflow_history_events
-WHERE workflow_instance_id = $1
-ORDER BY recorded_at ASC
-LIMIT 1`
+WHERE workflow_instance_id = $1 AND event_type = $2
+LIMIT 2`
 
-	var tc TenantContext
-	err = tx.QueryRow(ctx, q, workflowInstanceID).Scan(&tc.TenantID, &tc.LegalEntityID)
+	rows, err := tx.Query(ctx, q, workflowInstanceID, EventTypeWorkflowStarted)
 	if err != nil {
-		if err == pgx.ErrNoRows {
-			return TenantContext{}, false, nil
-		}
 		return TenantContext{}, false, fmt.Errorf("get tenant context for instance %q: %w", workflowInstanceID, err)
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return TenantContext{}, false, fmt.Errorf("commit transaction: %w", err)
+	var found []TenantContext
+	for rows.Next() {
+		var tc TenantContext
+		if err := rows.Scan(&tc.TenantID, &tc.LegalEntityID); err != nil {
+			rows.Close()
+			return TenantContext{}, false, fmt.Errorf("scan tenant context for instance %q: %w", workflowInstanceID, err)
+		}
+		found = append(found, tc)
 	}
-	return tc, true, nil
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return TenantContext{}, false, fmt.Errorf("get tenant context for instance %q: %w", workflowInstanceID, err)
+	}
+
+	switch len(found) {
+	case 0:
+		return TenantContext{}, false, nil
+	case 1:
+		return found[0], true, nil
+	default:
+		return TenantContext{}, false, fmt.Errorf("instance %q: %w", workflowInstanceID, ErrAmbiguousTenantContext)
+	}
 }
 
 func scanRows(rows pgx.Rows) ([]WorkflowHistoryEvent, error) {
@@ -335,9 +463,32 @@ func (f *FakeStore) Append(_ context.Context, e WorkflowHistoryEvent) error {
 	return nil
 }
 
+// SortEvents orders events as the Postgres queries do: recorded_at ASC, then
+// event_id ASC. Exported so test doubles outside this package can mirror the
+// real store's total order.
+func SortEvents(events []WorkflowHistoryEvent) {
+	sort.SliceStable(events, func(i, j int) bool {
+		if !events[i].RecordedAt.Equal(events[j].RecordedAt) {
+			return events[i].RecordedAt.Before(events[j].RecordedAt)
+		}
+		return events[i].EventID < events[j].EventID
+	})
+}
+
+// AfterCursor reports whether e sorts strictly after the cursor in the store's
+// total order. A nil cursor admits everything.
+func AfterCursor(e WorkflowHistoryEvent, after *PageCursor) bool {
+	if after == nil {
+		return true
+	}
+	if !e.RecordedAt.Equal(after.RecordedAt) {
+		return e.RecordedAt.After(after.RecordedAt)
+	}
+	return e.EventID > after.EventID
+}
+
 // ListByInstance returns all events for the given workflowInstanceID scoped
-// to tenantID, ordered by RecordedAt ASC (insertion order in the fake, since
-// Append stamps RecordedAt).
+// to tenantID, ordered like the Postgres query (RecordedAt ASC, EventID ASC).
 func (f *FakeStore) ListByInstance(_ context.Context, tenantID, workflowInstanceID string) ([]WorkflowHistoryEvent, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -347,10 +498,36 @@ func (f *FakeStore) ListByInstance(_ context.Context, tenantID, workflowInstance
 			out = append(out, e)
 		}
 	}
+	SortEvents(out)
 	return out, nil
 }
 
-// ListByFilter returns events matching the given filter, ordered by RecordedAt ASC.
+// ListByInstancePage mirrors PgStore.ListByInstancePage.
+func (f *FakeStore) ListByInstancePage(ctx context.Context, tenantID, workflowInstanceID string, after *PageCursor, limit int) ([]WorkflowHistoryEvent, error) {
+	all, _ := f.ListByInstance(ctx, tenantID, workflowInstanceID)
+	return pageOf(all, after, limit), nil
+}
+
+func pageOf(sorted []WorkflowHistoryEvent, after *PageCursor, limit int) []WorkflowHistoryEvent {
+	var out []WorkflowHistoryEvent
+	for _, e := range sorted {
+		if AfterCursor(e, after) {
+			out = append(out, e)
+			if len(out) == limit {
+				break
+			}
+		}
+	}
+	return out
+}
+
+// ListByFilterPage mirrors PgStore.ListByFilterPage.
+func (f *FakeStore) ListByFilterPage(ctx context.Context, filter QueryFilter, after *PageCursor, limit int) ([]WorkflowHistoryEvent, error) {
+	all, _ := f.ListByFilter(ctx, filter)
+	return pageOf(all, after, limit), nil
+}
+
+// ListByFilter returns events matching the given filter, ordered by RecordedAt ASC, EventID ASC.
 func (f *FakeStore) ListByFilter(_ context.Context, filter QueryFilter) ([]WorkflowHistoryEvent, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -363,19 +540,39 @@ func (f *FakeStore) ListByFilter(_ context.Context, filter QueryFilter) ([]Workf
 			out = append(out, e)
 		}
 	}
+	SortEvents(out)
 	return out, nil
 }
 
-// GetTenantContext returns the tenant context from the first event for the instance.
+// GetTenantContext mirrors PgStore: only workflow.started rows count, and
+// conflicting started rows are ErrAmbiguousTenantContext.
 func (f *FakeStore) GetTenantContext(_ context.Context, workflowInstanceID string) (TenantContext, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	var found []TenantContext
 	for _, e := range f.events {
-		if e.WorkflowInstanceID == workflowInstanceID {
-			return TenantContext{TenantID: e.TenantID, LegalEntityID: e.LegalEntityID}, true, nil
+		if e.WorkflowInstanceID != workflowInstanceID || e.EventType != EventTypeWorkflowStarted {
+			continue
+		}
+		tc := TenantContext{TenantID: e.TenantID, LegalEntityID: e.LegalEntityID}
+		dup := false
+		for _, x := range found {
+			if x == tc {
+				dup = true
+			}
+		}
+		if !dup {
+			found = append(found, tc)
 		}
 	}
-	return TenantContext{}, false, nil
+	switch len(found) {
+	case 0:
+		return TenantContext{}, false, nil
+	case 1:
+		return found[0], true, nil
+	default:
+		return TenantContext{}, false, fmt.Errorf("instance %q: %w", workflowInstanceID, ErrAmbiguousTenantContext)
+	}
 }
 
 // Count returns the total number of stored events (test helper).

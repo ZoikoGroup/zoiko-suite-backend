@@ -2,28 +2,52 @@ openapi: "3.1.0"
 
 info:
   title: Schema Registry Service
-  version: "1.1.0"
+  version: "1.2.0"
   description: |
     Canonical registry of event payload contracts for ZoikoSuite.
 
     Implements the schema-governance requirements of
-    docs/architecture/04-data-model.md §17: all event schemas are centrally
-    registered, compatibility mode is declared per version, and breaking
-    changes are possible only under an explicitly recorded exemption.
+    docs/architecture/04-data-model.md §2.12 and §17: all event schemas are
+    centrally registered, compatibility mode is declared per version, and
+    breaking changes are possible only under an explicitly recorded exemption.
+    Access to the registry is protected per docs/architecture/05-security.md
+    §14.6.
 
     **Invariants**
-    - Versions are immutable and append-only. There is no update and no delete;
-      evolution registers a new version and the old one stays readable forever.
+    - Versions are immutable and append-only. There is no update and no delete
+      route, and the database enforces it: triggers on `event_schemas` reject
+      UPDATE, DELETE and TRUNCATE (migration 000005); INSERT is unaffected. The
+      primary key alone would not do this — it only refuses a duplicate key.
+      Evolution registers a new version and the old one stays readable
+      forever. (A database superuser or table owner can still disable the
+      triggers; that is an administrative act, not something the service does.)
     - The version number is assigned by the service, never by the caller. Two
       concurrent registrations cannot collide — the later one is refused with
       409 and must re-read and resubmit, because its schema was checked against
       a version that is no longer latest.
     - Compatibility is evaluated against the current latest version only, and
-      at the top level only (`properties` and `required`). Nested object and
-      array evolution is NOT analysed — a documented v1 limit.
-    - Registration is governed: authorization-svc must grant SCHEMA_PUBLISH.
-      An unreachable authorization service refuses the write (fail-closed); it
-      is never treated as permission.
+      only under `BACKWARD` (the default); `NONE` skips the check and is
+      recorded on the version. The analysis recurses into nested object
+      properties and array item schemas, but it compares a **subset** of JSON
+      Schema only: the declared `type` (a single string), `properties`,
+      `required`, and the `items` schema of arrays. It does NOT compare `enum`,
+      `format`, `pattern`, numeric or length bounds, `additionalProperties`,
+      `$ref`, or `allOf`/`anyOf`/`oneOf`; a change confined to those is
+      accepted. A schema that declares `type` as an array (for example
+      `["string","null"]`) is refused at registration with 400, because it
+      cannot be compared. Violations are returned in a stable, sorted order.
+    - Reads require a verified principal (`X-Principal-Id`). No separate read
+      permission is checked — the requirement for one is not specified.
+    - Registration is governed: authorization-svc must grant SCHEMA_PUBLISH on
+      the caller's legal entity, or on the platform scope when the request names
+      none. An unreachable authorization service refuses the write
+      (fail-closed); it is never treated as permission.
+    - Idempotency: `Idempotency-Key` is required on registration by the
+      canonical service input contract. A retry with a key already used for the
+      same event returns the originally stored version (201) instead of
+      claiming a new one. The key is scoped to the event name; whether it is
+      also bound to the request body or the principal is not specified, so a
+      different body under the same key also receives the original version.
     - This registry records what a contract is meant to be. Nothing validates
       published events against it at runtime.
 
@@ -44,15 +68,24 @@ paths:
     get:
       tags: [Schemas]
       summary: List every event name with at least one registered version
+      security:
+        - GatewayIdentity: []
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Offset"
       responses:
         "200":
-          description: Event names. Empty array when nothing is registered — never null.
+          description: Event names, sorted, one page. Empty array when nothing is registered or the page is beyond the end — never null.
           content:
             application/json:
               schema:
                 type: array
                 items: { type: string }
               example: ["entity.status.changed", "jurisdiction.rule.updated"]
+        "400":
+          $ref: "#/components/responses/InvalidPaging"
+        "401":
+          $ref: "#/components/responses/IdentityMissing"
         "503":
           $ref: "#/components/responses/StoreUnavailable"
 
@@ -62,14 +95,23 @@ paths:
     get:
       tags: [Schemas]
       summary: List every registered version of an event, oldest first
+      security:
+        - GatewayIdentity: []
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Offset"
       responses:
         "200":
-          description: All versions.
+          description: One page of versions. A page beyond the end of an existing event's history is an empty array.
           content:
             application/json:
               schema:
                 type: array
                 items: { $ref: "#/components/schemas/EventSchema" }
+        "400":
+          $ref: "#/components/responses/InvalidPaging"
+        "401":
+          $ref: "#/components/responses/IdentityMissing"
         "404":
           $ref: "#/components/responses/NotFound"
         "503":
@@ -81,6 +123,11 @@ paths:
         The version number is assigned by the service from the current maximum.
         The caller does not supply it and cannot influence it.
 
+        Order of checks: canonical envelope, then identity, then the
+        SCHEMA_PUBLISH grant, then the event name, then idempotent replay, then
+        the body. An unauthenticated or unauthorized caller therefore learns
+        nothing about what the service considers a well-formed name or schema.
+
         A 409 carries two distinct meanings, distinguished by the body:
         a `violations` array means the proposed schema breaks the current
         contract and must be changed; its absence means a concurrent
@@ -88,6 +135,9 @@ paths:
         against the new latest and resubmitted unchanged.
       security:
         - GatewayIdentity: []
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/LegalEntityId"
       requestBody:
         required: true
         content:
@@ -95,24 +145,42 @@ paths:
             schema: { $ref: "#/components/schemas/RegisterSchemaRequest" }
       responses:
         "201":
-          description: Registered. The body carries the assigned version.
+          description: |
+            Registered — or, when `Idempotency-Key` was already used for this
+            event, the originally stored version (also 201; no replay marker is
+            defined). The body carries the assigned version.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/EventSchema" }
         "400":
           description: |
-            Malformed body, missing or non-JSON `json_schema`, or a
-            `compatibility_mode` this service cannot enforce. An unrecognised
-            mode is refused rather than defaulted to BACKWARD, so the registry
-            never records a discipline it is not applying.
+            One of: the canonical service input contract is incomplete
+            (`envelope_incomplete`, with `violations`); the event name is not
+            dotted lowercase or exceeds 255 characters; the body is malformed or
+            contains an unknown field; `json_schema` is missing, is not a JSON
+            object, is empty, or has a `properties`/`required`/`type` the
+            registry cannot read (including `type` given as an array);
+            `owning_service` exceeds 255 characters; or `compatibility_mode` is
+            one this service cannot enforce — an unrecognised mode is refused
+            rather than defaulted to BACKWARD, so the registry never records a
+            discipline it is not applying.
           content:
             application/json:
-              schema: { $ref: "#/components/schemas/Error" }
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/Error"
+                  - $ref: "#/components/schemas/EnvelopeError"
         "401":
-          description: No verified principal — the request did not carry gateway-resolved identity.
+          description: |
+            No verified principal or tenant — the request did not carry
+            gateway-resolved identity (`caller identity missing`, or
+            `envelope_incomplete` when the missing field is the tenant or actor).
           content:
             application/json:
-              schema: { $ref: "#/components/schemas/Error" }
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/Error"
+                  - $ref: "#/components/schemas/EnvelopeError"
         "403":
           description: authorization-svc denied SCHEMA_PUBLISH for this principal.
           content:
@@ -132,7 +200,7 @@ paths:
                   value:
                     error: "incompatible schema change"
                     violations:
-                      - "field \"tenant_id\" was required in v1 and is missing from the proposed schema"
+                      - "field \"tenant_id\" was required and has been removed"
                 raced:
                   summary: Concurrent registration won
                   value:
@@ -151,12 +219,16 @@ paths:
     get:
       tags: [Schemas]
       summary: The current contract for an event
+      security:
+        - GatewayIdentity: []
       responses:
         "200":
           description: The highest-numbered version.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/EventSchema" }
+        "401":
+          $ref: "#/components/responses/IdentityMissing"
         "404":
           $ref: "#/components/responses/NotFound"
         "503":
@@ -172,6 +244,8 @@ paths:
     get:
       tags: [Schemas]
       summary: One specific version
+      security:
+        - GatewayIdentity: []
       responses:
         "200":
           description: The requested version.
@@ -179,10 +253,12 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/EventSchema" }
         "400":
-          description: version was not an integer.
+          description: version was not an integer, or was less than 1.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          $ref: "#/components/responses/IdentityMissing"
         "404":
           $ref: "#/components/responses/NotFound"
         "503":
@@ -194,7 +270,7 @@ paths:
       summary: Liveness
       responses:
         "200":
-          description: Process is alive.
+          description: Process is alive. Body `{"status":"ok"}`.
 
   /readyz:
     get:
@@ -202,9 +278,9 @@ paths:
       summary: Readiness
       responses:
         "200":
-          description: Ready — the database responded.
+          description: Ready — the database responded. Body `{"status":"ok"}`.
         "503":
-          description: Not ready.
+          description: Not ready — the database did not respond. Body `{"status":"unavailable","reason":"db_unreachable"}`.
 
 components:
   securitySchemes:
@@ -216,19 +292,69 @@ components:
         Set by Traefik from gateway-auth-svc's ForwardAuth verification of the
         caller's signed identity envelope. The service does not parse tokens
         itself; a request without this header never passed verification and is
-        refused with 401.
+        refused with 401. Required on every `/v1/schemas` route, reads included.
 
   parameters:
     EventName:
       name: eventName
       in: path
       required: true
-      schema: { type: string }
+      description: |
+        Dotted lowercase name with at least two segments, at most 255
+        characters. A name that cannot be registered reads as 404 on a GET and
+        is refused with 400 on a POST (after authentication and authorization).
+      schema:
+        type: string
+        maxLength: 255
+        pattern: '^[a-z][a-z0-9]*(\.[a-z0-9]+)+$'
       example: entity.status.changed
+    Limit:
+      name: limit
+      in: query
+      required: false
+      schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+      description: Page size. Anything outside 1–500, or not an integer, is 400.
+    Offset:
+      name: offset
+      in: query
+      required: false
+      schema: { type: integer, minimum: 0, default: 0 }
+      description: Rows to skip. Negative or not an integer is 400.
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        Required on registration by the canonical service input contract. A
+        retry with a key already used for the same event returns the original
+        version. The other canonical envelope headers — `X-Tenant-Id`,
+        `X-Principal-Id`, `X-Request-Id`, `X-Correlation-ID`,
+        `X-Source-Channel` — are also required on this write.
+      schema: { type: string, maxLength: 255 }
+      # A key longer than 255 characters is refused with 400 (field too long).
+    LegalEntityId:
+      name: X-Legal-Entity-Id
+      in: header
+      required: false
+      description: |
+        Optional. Event contracts are platform-wide, so when it is absent
+        SCHEMA_PUBLISH is checked against the platform scope
+        (`AUTHZ_PLATFORM_SCOPE_ID`, default `00000000-0000-0000-0000-00000000f001`).
+      schema: { type: string }
 
   responses:
     NotFound:
-      description: No such event or version.
+      description: No such event or version (or a name that cannot be registered).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    IdentityMissing:
+      description: No verified principal — `caller identity missing`.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    InvalidPaging:
+      description: limit was not an integer in 1–500, or offset was not a non-negative integer.
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
@@ -259,6 +385,7 @@ components:
           $ref: "#/components/schemas/CompatibilityMode"
         owning_service:
           type: string
+          maxLength: 255
           description: The service that produces this event (04-data-model.md §17.1).
           example: "identity-context-svc"
         registered_by:
@@ -275,10 +402,13 @@ components:
         force each time.
 
         - `BACKWARD` — the default. A new version must not break existing
-          consumers of the current latest version.
+          consumers of the current latest version, as far as the compared subset
+          of JSON Schema (see the invariants) can tell.
         - `NONE` — the check is skipped. Exists for the controlled-rollout case
           in §17.2; recorded on the row so the exemption is visible rather than
-          inferred from a schema that changed shape.
+          inferred from a schema that changed shape. It needs no approval beyond
+          SCHEMA_PUBLISH; whether a rollout approval step is required is not
+          specified.
 
         FORWARD and FULL are absent deliberately: the service refuses any mode
         it cannot enforce rather than accepting it and applying something else.
@@ -286,13 +416,19 @@ components:
     RegisterSchemaRequest:
       type: object
       required: [json_schema]
+      additionalProperties: false
       properties:
         json_schema:
           type: object
+          minProperties: 1
           additionalProperties: true
+          description: |
+            A JSON object with at least one member. `properties` must be an
+            object and `required` an array of strings; a property's `type`, if
+            given, must be a single string.
         compatibility_mode:
           $ref: "#/components/schemas/CompatibilityMode"
-        owning_service: { type: string }
+        owning_service: { type: string, maxLength: 255 }
       example:
         json_schema:
           type: object
@@ -315,5 +451,24 @@ components:
         error: { type: string, example: "incompatible schema change" }
         violations:
           type: array
-          description: One entry per breaking change, naming the field that broke.
+          description: |
+            One entry per breaking change, naming the field that broke, in a
+            stable sorted order (the same two schemas always yield the same list).
           items: { type: string }
+
+    EnvelopeError:
+      type: object
+      required: [error, detail, violations]
+      description: Refusal by the canonical service input contract, before any handler runs.
+      properties:
+        error: { type: string, example: "envelope_incomplete" }
+        detail: { type: string }
+        service: { type: string, example: "schema-registry-svc" }
+        violations:
+          type: array
+          items:
+            type: object
+            properties:
+              field: { type: string }
+              header: { type: string }
+              reason: { type: string }

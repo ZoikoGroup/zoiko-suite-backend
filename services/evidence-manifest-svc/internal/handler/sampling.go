@@ -167,12 +167,13 @@ func (h *Handler) SelectSample(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	principalID, _ := h.requirePrincipal(w, r) // already verified by the access check above
 	correlationID := r.Header.Get("X-Correlation-ID")
 	if correlationID == "" {
 		writeError(w, http.StatusBadRequest, "missing_correlation_id", "")
 		return
 	}
-	sel, items, _, err := h.store.SelectSample(r.Context(), domain.SelectSampleParams{DesignID: design.DesignID, CorrelationID: correlationID})
+	sel, items, _, err := h.store.SelectSample(r.Context(), domain.SelectSampleParams{DesignID: design.DesignID, CorrelationID: correlationID, ActorPrincipalID: principalID})
 	if err != nil {
 		h.writeSamplingErr(w, err)
 		return
@@ -299,12 +300,13 @@ func (h *Handler) EvaluateSample(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	principalID, _ := h.requirePrincipal(w, r) // already verified by the access check above
 	correlationID := r.Header.Get("X-Correlation-ID")
 	if correlationID == "" {
 		writeError(w, http.StatusBadRequest, "missing_correlation_id", "")
 		return
 	}
-	eval, _, err := h.store.EvaluateSample(r.Context(), domain.EvaluateSampleParams{DesignID: design.DesignID, CorrelationID: correlationID})
+	eval, _, err := h.store.EvaluateSample(r.Context(), domain.EvaluateSampleParams{DesignID: design.DesignID, CorrelationID: correlationID, ActorPrincipalID: principalID})
 	if errors.Is(err, domain.ErrSampleEvaluationIncomplete) {
 		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": "evaluation_incomplete", "evaluation": eval})
 		return
