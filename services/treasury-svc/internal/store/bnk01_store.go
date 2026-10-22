@@ -158,14 +158,23 @@ func (s *PgStore) IsOwnershipVerified(ctx context.Context, tenantID, bankAccount
 	return verified, nil
 }
 
+// AmendBankAccountMetadata changes the supplied fields only — an empty one
+// keeps its current value, in the same statement, so nothing read earlier
+// can be written back stale. bank_identifier is never touched here: it
+// changes only through RotateAccountIdentifierToken.
 func (s *PgStore) AmendBankAccountMetadata(ctx context.Context, p domain.AmendBankAccountMetadataParams) (*domain.BankAccount, error) {
 	var acct domain.BankAccount
 	err := s.withRLS(ctx, p.TenantID, func(tx pgx.Tx) error {
 		row := tx.QueryRow(ctx, `
-			UPDATE bank_accounts SET account_name = $3, branch_ref = $4, bank_identifier = $5, country = $6, account_type = $7, updated_at = now()
+			UPDATE bank_accounts SET
+				account_name = COALESCE(NULLIF($3, ''), account_name),
+				branch_ref   = COALESCE(NULLIF($4, ''), branch_ref),
+				country      = COALESCE(NULLIF($5, ''), country),
+				account_type = COALESCE(NULLIF($6, ''), account_type),
+				updated_at = now()
 			WHERE bank_account_id = $1 AND tenant_id = $2 AND account_status IN ('DRAFT','PENDING_VERIFICATION','ACTIVE','SUSPENDED')
 			RETURNING `+bankAccountColumns,
-			p.BankAccountID, p.TenantID, p.AccountName, p.BranchRef, p.BankIdentifier, p.Country, p.AccountType,
+			p.BankAccountID, p.TenantID, p.AccountName, p.BranchRef, p.Country, p.AccountType,
 		)
 		if err := scanBankAccount(row, &acct); err != nil {
 			return err

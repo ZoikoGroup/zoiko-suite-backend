@@ -134,7 +134,12 @@ func (m *mockStore) transition(bankAccountID string, allowed func(string) bool, 
 
 func (m *mockStore) AmendBankAccountMetadata(ctx context.Context, p domain.AmendBankAccountMetadataParams) (*domain.BankAccount, error) {
 	return m.transition(p.BankAccountID, domain.CanAmendMetadata, func(a *domain.BankAccount) {
-		a.AccountName, a.BranchRef, a.BankIdentifier, a.Country, a.AccountType = p.AccountName, p.BranchRef, p.BankIdentifier, p.Country, p.AccountType
+		// Same rule as the real store: an empty field keeps its value.
+		for dst, v := range map[*string]string{&a.AccountName: p.AccountName, &a.BranchRef: p.BranchRef, &a.Country: p.Country, &a.AccountType: p.AccountType} {
+			if v != "" {
+				*dst = v
+			}
+		}
 	})
 }
 

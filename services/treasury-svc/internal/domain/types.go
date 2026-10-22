@@ -112,10 +112,13 @@ type VerifyOwnershipParams struct {
 	VerifiedByPrincipalID           string
 }
 
+// AmendBankAccountMetadataParams: an empty field keeps its current value.
+// bank_identifier is not here — it changes only through
+// RotateAccountIdentifierToken.
 type AmendBankAccountMetadataParams struct {
-	BankAccountID, TenantID                                      string
-	AccountName, BranchRef, BankIdentifier, Country, AccountType string
-	ActorPrincipalID                                             string
+	BankAccountID, TenantID                      string
+	AccountName, BranchRef, Country, AccountType string
+	ActorPrincipalID                             string
 }
 
 type ChangeOperationalUseParams struct {

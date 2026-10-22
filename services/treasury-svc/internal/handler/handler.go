@@ -315,18 +315,24 @@ func (h *Handler) RegisterBankAccount(w http.ResponseWriter, r *http.Request) {
 
 // ── GET /v1/treasury/accounts ────────────────────────────────────────────────────
 
+// ListBankAccounts lists one legal entity's accounts. legal_entity_id is
+// required: permission is granted per legal entity, and without one there
+// was nothing to authorize against — the list skipped the permission check
+// and returned every account in the tenant.
 func (h *Handler) ListBankAccounts(w http.ResponseWriter, r *http.Request) {
 	legalEntityID := r.URL.Query().Get("legal_entity_id")
+	if legalEntityID == "" {
+		writeError(w, http.StatusBadRequest, "missing_field", "legal_entity_id is required")
+		return
+	}
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
 	}
 
-	if legalEntityID != "" {
-		if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionViewPositions); err != nil {
-			h.writeAuthzErr(w, err)
-			return
-		}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionViewPositions); err != nil {
+		h.writeAuthzErr(w, err)
+		return
 	}
 
 	list, err := h.store.ListBankAccounts(r.Context(), legalEntityID)
