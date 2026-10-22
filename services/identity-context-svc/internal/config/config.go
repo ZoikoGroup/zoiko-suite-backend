@@ -538,6 +538,13 @@ func Load() (*Config, error) {
 		// discovered during an incident.
 		return nil, fmt.Errorf("MFA_SECRET_KEY is required in %s: without it no second factor exists and no privileged session can be issued", cfg.Environment)
 	}
+	if cfg.Environment == "production" || cfg.Environment == "staging" {
+		for id, k := range keys {
+			if string(k) == localMFAKey {
+				return nil, fmt.Errorf("MFA key %q is the local key published in deployments/docker-compose.yml: %s needs its own from the secret store", id, cfg.Environment)
+			}
+		}
+	}
 	if cfg.MFAMaxFailedAttempts < 1 {
 		return nil, errors.New("MFA_MAX_FAILED_ATTEMPTS must be at least 1")
 	}
@@ -626,6 +633,11 @@ func envBool(key string, def bool) bool {
 	}
 	return b
 }
+
+// localMFAKey is the key deployments/docker-compose.yml publishes for local
+// stacks (MFA_SECRET_KEY is its base64). It is in git, so it protects nothing:
+// staging and production refuse it anywhere in the keyring.
+const localMFAKey = "local-dev-mfa-key-32-bytes-long!"
 
 // envPairs parses "a=b,c=d" into a map; blanks and malformed pairs are skipped.
 // mfaKeyring decodes the TOTP secret keyring. current is MFA_SECRET_KEY under

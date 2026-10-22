@@ -675,7 +675,7 @@ services:
       # encrypted under this key. LOCAL VALUE ONLY — staging and production
       # refuse to start without their own (from the secret store), and a
       # factor enrolled under one key cannot be used under another.
-      MFA_SECRET_KEY: "bG9jYWwtZGV2LW1mYS1rZXktMzItYnl0ZXMtbG9uZyE="
+      MFA_SECRET_KEY: "bG9jYWwtZGV2LW1mYS1rZXktMzItYnl0ZXMtbG9uZyE=" # gitleaks:allow -- local-only key; identity-context-svc refuses it in staging/production
       MFA_SECRET_KEY_ID: "local-1"
       MFA_RECENT_AUTH_SECONDS: "900"
       # ── OIDC provider and login throttling (wired 19 Oct 2026, F-5) ─────────

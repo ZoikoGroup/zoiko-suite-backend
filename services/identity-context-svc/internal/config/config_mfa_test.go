@@ -1,11 +1,12 @@
 package config
 
 import (
+	"encoding/base64"
 	"strings"
 	"testing"
 )
 
-const testMFAKey = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=" // 32 bytes
+const testMFAKey = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=" // gitleaks:allow -- bytes 0x00..0x1f, a test vector rather than a key
 
 func mfaBaseEnv(t *testing.T) {
 	t.Helper()
@@ -37,7 +38,27 @@ func TestMFAKey_RequiredInProtectedTiers(t *testing.T) {
 			if len(cfg.MFASecretKeys["k1"]) != 32 || cfg.MFASecretKeyID != "k1" {
 				t.Fatalf("keyring not loaded: %v %s", len(cfg.MFASecretKeys), cfg.MFASecretKeyID)
 			}
+			// The compose file's key is public: refused as current or previous.
+			local := base64.StdEncoding.EncodeToString([]byte(localMFAKey))
+			t.Setenv("MFA_SECRET_KEY", local)
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), "docker-compose") {
+				t.Fatalf("want local-key refusal for the current key, got %v", err)
+			}
+			t.Setenv("MFA_SECRET_KEY", testMFAKey)
+			t.Setenv("MFA_SECRET_PREVIOUS_KEYS", "k0:"+local)
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), "docker-compose") {
+				t.Fatalf("want local-key refusal for a previous key, got %v", err)
+			}
 		})
+	}
+}
+
+func TestMFAKey_LocalKeyAcceptedLocally(t *testing.T) {
+	mfaBaseEnv(t)
+	t.Setenv("DEPLOY_ENVIRONMENT", "local")
+	t.Setenv("MFA_SECRET_KEY", base64.StdEncoding.EncodeToString([]byte(localMFAKey)))
+	if _, err := Load(); err != nil {
+		t.Fatalf("the compose stack's key was refused locally: %v", err)
 	}
 }
 
