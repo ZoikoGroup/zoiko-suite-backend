@@ -165,12 +165,16 @@ type RejectTreasuryTransferParams struct {
 
 // AmendTreasuryTransferParams: only the maker may amend, and only while
 // still DRAFT. Every protected field is re-suppliable — the store
-// recomputes protected_field_hash from the amended values.
+// recomputes protected_field_hash from the amended values. IsCrossEntity
+// is re-derived by the handler from the amended accounts' legal entities,
+// exactly as CreateTreasuryTransfer derives it, so changing an account
+// can never leave a cross-entity movement classified as same-entity.
 type AmendTreasuryTransferParams struct {
 	TenantID, TransferID                     string
 	SourceBankAccountID, TargetBankAccountID string
 	Amount                                   float64
 	CurrencyCode                             string
+	IsCrossEntity                            bool
 	ActorPrincipalID                         string
 }
 

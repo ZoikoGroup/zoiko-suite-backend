@@ -321,9 +321,11 @@ func (m *mockStore) ListTransfers(ctx context.Context, p domain.ListTransfersPar
 	var out []domain.TreasuryTransfer
 	for _, t := range m.transfers {
 		if p.LegalEntityID != "" {
-			// mockStore has no bank-account-to-legal-entity join; tests
-			// that need legal_entity_id filtering exercise the real store.
-			continue
+			// Same rule as the real store: a transfer belongs to its
+			// source account's legal entity.
+			if src := m.bankAccounts[t.SourceBankAccountID]; src == nil || src.LegalEntityID != p.LegalEntityID {
+				continue
+			}
 		}
 		if p.Status != "" && t.Status != p.Status {
 			continue
@@ -404,6 +406,7 @@ func (m *mockStore) AmendTreasuryTransfer(ctx context.Context, p domain.AmendTre
 	t.TargetBankAccountID = p.TargetBankAccountID
 	t.Amount = p.Amount
 	t.CurrencyCode = p.CurrencyCode
+	t.IsCrossEntity = p.IsCrossEntity
 	return t, nil
 }
 
@@ -846,10 +849,14 @@ type mockAuthz struct {
 	// permission it's supposed to (e.g. the masked read using a distinct,
 	// lower-privilege action from the full detail read).
 	lastAction string
+	// entities records the legalEntityID of every CheckAllowed call, in
+	// order, so a test can assert which legal entities a route checked.
+	entities []string
 }
 
 func (m *mockAuthz) CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error {
 	m.lastAction = actionType
+	m.entities = append(m.entities, legalEntityID)
 	if m.err != nil {
 		return m.err
 	}
@@ -1578,6 +1585,29 @@ func doTransferJSONRequest(t *testing.T, r http.Handler, method, path string, bo
 	return rr
 }
 
+// withAccounts gives a transfer fixture the two bank accounts every BNK-09
+// command now authorizes against: default IDs when the fixture names none,
+// and ACTIVE accounts for any it names that are not already seeded — in two
+// legal entities when the transfer is cross-entity, otherwise in one.
+func withAccounts(s *mockStore, t *domain.TreasuryTransfer) *domain.TreasuryTransfer {
+	if t.SourceBankAccountID == "" {
+		t.SourceBankAccountID = "acct-src-" + t.TransferID
+	}
+	if t.TargetBankAccountID == "" {
+		t.TargetBankAccountID = "acct-tgt-" + t.TransferID
+	}
+	targetEntity := "ent-src"
+	if t.IsCrossEntity {
+		targetEntity = "ent-tgt"
+	}
+	for id, entity := range map[string]string{t.SourceBankAccountID: "ent-src", t.TargetBankAccountID: targetEntity} {
+		if _, ok := s.bankAccounts[id]; !ok {
+			s.bankAccounts[id] = &domain.BankAccount{BankAccountID: id, TenantID: "tenant-abc", LegalEntityID: entity, CurrencyCode: "USD", AccountStatus: domain.BankAccountActive}
+		}
+	}
+	return t
+}
+
 func newWave12Router(s *mockStore) chi.Router {
 	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop())
 	r := chi.NewRouter()
@@ -1587,7 +1617,9 @@ func newWave12Router(s *mockStore) chi.Router {
 
 func TestHandler_AmendTreasuryTransfer_DraftOnly_OnlyMaker(t *testing.T) {
 	s := newMockStore()
-	s.transfers["t1"] = &domain.TreasuryTransfer{TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferDraft, MakerPrincipalID: "maker-1", Amount: 100, CurrencyCode: "USD"}
+	s.transfers["t1"] = withAccounts(s, &domain.TreasuryTransfer{TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferDraft, MakerPrincipalID: "maker-1", Amount: 100, CurrencyCode: "USD"})
+	s.bankAccounts["src"] = &domain.BankAccount{BankAccountID: "src", TenantID: "tenant-abc", LegalEntityID: "ent-src", CurrencyCode: "USD", AccountStatus: domain.BankAccountActive}
+	s.bankAccounts["tgt"] = &domain.BankAccount{BankAccountID: "tgt", TenantID: "tenant-abc", LegalEntityID: "ent-src", CurrencyCode: "USD", AccountStatus: domain.BankAccountActive}
 	r := newWave12Router(s)
 
 	// A non-maker cannot amend.
@@ -1612,7 +1644,7 @@ func TestHandler_AmendTreasuryTransfer_DraftOnly_OnlyMaker(t *testing.T) {
 
 func TestHandler_SubmitTransferForApproval_MovesDraftToPendingApproval(t *testing.T) {
 	s := newMockStore()
-	s.transfers["t1"] = &domain.TreasuryTransfer{TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferDraft, MakerPrincipalID: "maker-1"}
+	s.transfers["t1"] = withAccounts(s, &domain.TreasuryTransfer{TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferDraft, MakerPrincipalID: "maker-1"})
 	r := newWave12Router(s)
 
 	rr := doTransferJSONRequest(t, r, http.MethodPost, "/v1/treasury/transfers/t1/submit-for-approval", nil, "maker-1")
@@ -1628,7 +1660,7 @@ func TestHandler_SubmitTransferForApproval_MovesDraftToPendingApproval(t *testin
 
 func TestHandler_CancelBeforeSubmission_PublishesCancelledEvent(t *testing.T) {
 	s := newMockStore()
-	s.transfers["t1"] = &domain.TreasuryTransfer{TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferPendingApproval, MakerPrincipalID: "maker-1"}
+	s.transfers["t1"] = withAccounts(s, &domain.TreasuryTransfer{TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferPendingApproval, MakerPrincipalID: "maker-1"})
 	r := newWave12Router(s)
 
 	rr := doTransferJSONRequest(t, r, http.MethodPost, "/v1/treasury/transfers/t1/cancel", map[string]string{"reason": "no longer needed"}, "maker-1")
@@ -1649,7 +1681,7 @@ func TestHandler_CancelBeforeSubmission_PublishesCancelledEvent(t *testing.T) {
 // refused — CancelBeforeSubmission means before.
 func TestHandler_CancelBeforeSubmission_AfterSubmission_Rejected(t *testing.T) {
 	s := newMockStore()
-	s.transfers["t1"] = &domain.TreasuryTransfer{TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferSubmitted, MakerPrincipalID: "maker-1"}
+	s.transfers["t1"] = withAccounts(s, &domain.TreasuryTransfer{TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferSubmitted, MakerPrincipalID: "maker-1"})
 	r := newWave12Router(s)
 
 	rr := doTransferJSONRequest(t, r, http.MethodPost, "/v1/treasury/transfers/t1/cancel", map[string]string{"reason": "too late"}, "maker-1")
@@ -1660,7 +1692,7 @@ func TestHandler_CancelBeforeSubmission_AfterSubmission_Rejected(t *testing.T) {
 
 func TestHandler_MarkTransferReturned_PublishesReturnedEvent(t *testing.T) {
 	s := newMockStore()
-	s.transfers["t1"] = &domain.TreasuryTransfer{TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferSubmitted, MakerPrincipalID: "maker-1"}
+	s.transfers["t1"] = withAccounts(s, &domain.TreasuryTransfer{TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferSubmitted, MakerPrincipalID: "maker-1"})
 	r := newWave12Router(s)
 
 	rr := doTransferJSONRequest(t, r, http.MethodPost, "/v1/treasury/transfers/t1/mark-returned", map[string]string{"reason": "destination account closed"}, "ops-1")
@@ -1678,7 +1710,7 @@ func TestHandler_MarkTransferReturned_PublishesReturnedEvent(t *testing.T) {
 
 func TestHandler_MarkTransferReturned_MissingReason_Returns400(t *testing.T) {
 	s := newMockStore()
-	s.transfers["t1"] = &domain.TreasuryTransfer{TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferSubmitted, MakerPrincipalID: "maker-1"}
+	s.transfers["t1"] = withAccounts(s, &domain.TreasuryTransfer{TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferSubmitted, MakerPrincipalID: "maker-1"})
 	r := newWave12Router(s)
 
 	rr := doTransferJSONRequest(t, r, http.MethodPost, "/v1/treasury/transfers/t1/mark-returned", map[string]string{}, "ops-1")
@@ -1689,10 +1721,10 @@ func TestHandler_MarkTransferReturned_MissingReason_Returns400(t *testing.T) {
 
 func TestHandler_ResolveTreasuryTransfer_Resubmit(t *testing.T) {
 	s := newMockStore()
-	s.transfers["t1"] = &domain.TreasuryTransfer{
+	s.transfers["t1"] = withAccounts(s, &domain.TreasuryTransfer{
 		TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferReturned, MakerPrincipalID: "maker-1",
 		CheckerPrincipalID: "checker-1", PaymentAttemptID: "attempt-1",
-	}
+	})
 	r := newWave12Router(s)
 
 	rr := doTransferJSONRequest(t, r, http.MethodPost, "/v1/treasury/transfers/t1/resolve",
@@ -1712,7 +1744,7 @@ func TestHandler_ResolveTreasuryTransfer_Resubmit(t *testing.T) {
 
 func TestHandler_ResolveTreasuryTransfer_Cancel_PublishesCancelledEvent(t *testing.T) {
 	s := newMockStore()
-	s.transfers["t1"] = &domain.TreasuryTransfer{TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferReturned, MakerPrincipalID: "maker-1"}
+	s.transfers["t1"] = withAccounts(s, &domain.TreasuryTransfer{TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferReturned, MakerPrincipalID: "maker-1"})
 	r := newWave12Router(s)
 
 	rr := doTransferJSONRequest(t, r, http.MethodPost, "/v1/treasury/transfers/t1/resolve",
@@ -1731,7 +1763,7 @@ func TestHandler_ResolveTreasuryTransfer_Cancel_PublishesCancelledEvent(t *testi
 
 func TestHandler_ResolveTreasuryTransfer_InvalidResolution_Returns400(t *testing.T) {
 	s := newMockStore()
-	s.transfers["t1"] = &domain.TreasuryTransfer{TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferReturned, MakerPrincipalID: "maker-1"}
+	s.transfers["t1"] = withAccounts(s, &domain.TreasuryTransfer{TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferReturned, MakerPrincipalID: "maker-1"})
 	r := newWave12Router(s)
 
 	rr := doTransferJSONRequest(t, r, http.MethodPost, "/v1/treasury/transfers/t1/resolve",
@@ -1745,11 +1777,11 @@ func TestHandler_ResolveTreasuryTransfer_InvalidResolution_Returns400(t *testing
 
 func TestHandler_GetTreasuryTransferFingerprint_IsStableAndReDerivable(t *testing.T) {
 	s := newMockStore()
-	s.transfers["t1"] = &domain.TreasuryTransfer{
+	s.transfers["t1"] = withAccounts(s, &domain.TreasuryTransfer{
 		TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferApproved,
 		Amount: 250.5, CurrencyCode: "USD", SourceBankAccountID: "src-1", TargetBankAccountID: "tgt-2",
 		MakerPrincipalID: "maker-1", CheckerPrincipalID: "checker-1",
-	}
+	})
 	r := newWave12Router(s)
 
 	rr := doTransferJSONRequest(t, r, http.MethodGet, "/v1/treasury/transfers/t1/fingerprint", nil, "usr-999")
@@ -1819,11 +1851,11 @@ func TestHandler_ExecuteTreasuryTransfer_SendsMatchingFingerprint(t *testing.T) 
 		SourceBankAccountID: "src-1", TargetBankAccountID: "tgt-2", CheckerPrincipalID: "checker-1",
 	}
 	want := domain.TransferFingerprint(approvedSnapshot)
-	s.transfers["t1"] = &domain.TreasuryTransfer{
+	s.transfers["t1"] = withAccounts(s, &domain.TreasuryTransfer{
 		TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferApproved,
 		Amount: 250.5, CurrencyCode: "USD", SourceBankAccountID: "src-1", TargetBankAccountID: "tgt-2",
 		MakerPrincipalID: "maker-1", CheckerPrincipalID: "checker-1",
-	}
+	})
 	tc := &capturingTransferClients{}
 	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, tc, nil, zap.NewNop())
 	r := chi.NewRouter()
@@ -1848,11 +1880,11 @@ func TestHandler_ExecuteTreasuryTransfer_CrossEntityApproved_RequiresAuthorizati
 	s := newMockStore()
 	s.bankAccounts["src-1"] = &domain.BankAccount{BankAccountID: "src-1", LegalEntityID: "ent-123", CurrencyCode: "USD", AccountStatus: "ACTIVE"}
 	s.bankAccounts["tgt-2"] = &domain.BankAccount{BankAccountID: "tgt-2", LegalEntityID: "ent-456", CurrencyCode: "USD", AccountStatus: "ACTIVE"}
-	s.transfers["t1"] = &domain.TreasuryTransfer{
+	s.transfers["t1"] = withAccounts(s, &domain.TreasuryTransfer{
 		TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferApproved, IsCrossEntity: true,
 		Amount: 250.5, CurrencyCode: "USD", SourceBankAccountID: "src-1", TargetBankAccountID: "tgt-2",
 		MakerPrincipalID: "maker-1", CheckerPrincipalID: "checker-1",
-	}
+	})
 	r := newWave12Router(s)
 
 	rr := doTransferJSONRequest(t, r, http.MethodPost, "/v1/treasury/transfers/t1/execute", nil, "checker-1")
@@ -1871,11 +1903,11 @@ func TestHandler_AuthorizeTreasuryTransfer_ThenExecute_Succeeds(t *testing.T) {
 	s := newMockStore()
 	s.bankAccounts["src-1"] = &domain.BankAccount{BankAccountID: "src-1", LegalEntityID: "ent-123", CurrencyCode: "USD", AccountStatus: "ACTIVE"}
 	s.bankAccounts["tgt-2"] = &domain.BankAccount{BankAccountID: "tgt-2", LegalEntityID: "ent-456", CurrencyCode: "USD", AccountStatus: "ACTIVE"}
-	s.transfers["t1"] = &domain.TreasuryTransfer{
+	s.transfers["t1"] = withAccounts(s, &domain.TreasuryTransfer{
 		TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferApproved, IsCrossEntity: true,
 		Amount: 250.5, CurrencyCode: "USD", SourceBankAccountID: "src-1", TargetBankAccountID: "tgt-2",
 		MakerPrincipalID: "maker-1", CheckerPrincipalID: "checker-1",
-	}
+	})
 	tc := &capturingTransferClients{}
 	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, tc, nil, zap.NewNop())
 	r := chi.NewRouter()
@@ -1903,10 +1935,10 @@ func TestHandler_AuthorizeTreasuryTransfer_ThenExecute_Succeeds(t *testing.T) {
 // real proof of the doc's SoD line: "Maker cannot authorize own transfer."
 func TestHandler_AuthorizeTreasuryTransfer_SelfAuthorization_Forbidden(t *testing.T) {
 	s := newMockStore()
-	s.transfers["t1"] = &domain.TreasuryTransfer{
+	s.transfers["t1"] = withAccounts(s, &domain.TreasuryTransfer{
 		TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferApproved, IsCrossEntity: true,
 		Amount: 100, CurrencyCode: "USD", MakerPrincipalID: "maker-1", CheckerPrincipalID: "checker-1",
-	}
+	})
 	r := newWave12Router(s)
 
 	rr := doTransferJSONRequest(t, r, http.MethodPost, "/v1/treasury/transfers/t1/authorize", nil, "maker-1")
@@ -1941,8 +1973,8 @@ func TestHandler_CreateTreasuryTransfer_PublishesCreatedEvent(t *testing.T) {
 // TreasuryTransferApproved/Rejected both fire.
 func TestHandler_ApproveRejectTreasuryTransfer_PublishEvents(t *testing.T) {
 	s := newMockStore()
-	s.transfers["t1"] = &domain.TreasuryTransfer{TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferPendingApproval, MakerPrincipalID: "maker-1"}
-	s.transfers["t2"] = &domain.TreasuryTransfer{TransferID: "t2", TenantID: "tenant-abc", Status: domain.TransferPendingApproval, MakerPrincipalID: "maker-1"}
+	s.transfers["t1"] = withAccounts(s, &domain.TreasuryTransfer{TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferPendingApproval, MakerPrincipalID: "maker-1"})
+	s.transfers["t2"] = withAccounts(s, &domain.TreasuryTransfer{TransferID: "t2", TenantID: "tenant-abc", Status: domain.TransferPendingApproval, MakerPrincipalID: "maker-1"})
 	r := newWave12Router(s)
 
 	approveRR := doTransferJSONRequest(t, r, http.MethodPost, "/v1/treasury/transfers/t1/approve", nil, "checker-1")
@@ -1968,11 +2000,11 @@ func TestHandler_ExecuteTreasuryTransfer_SameEntity_PublishesSettled(t *testing.
 	s := newMockStore()
 	s.bankAccounts["src-1"] = &domain.BankAccount{BankAccountID: "src-1", LegalEntityID: "ent-123", CurrencyCode: "USD", AccountStatus: "ACTIVE"}
 	s.bankAccounts["tgt-2"] = &domain.BankAccount{BankAccountID: "tgt-2", LegalEntityID: "ent-123", CurrencyCode: "USD", AccountStatus: "ACTIVE"}
-	s.transfers["t1"] = &domain.TreasuryTransfer{
+	s.transfers["t1"] = withAccounts(s, &domain.TreasuryTransfer{
 		TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferApproved, IsCrossEntity: false,
 		Amount: 100, CurrencyCode: "USD", SourceBankAccountID: "src-1", TargetBankAccountID: "tgt-2",
 		MakerPrincipalID: "maker-1", CheckerPrincipalID: "checker-1",
-	}
+	})
 	tc := &capturingTransferClients{}
 	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, tc, nil, zap.NewNop())
 	r := chi.NewRouter()
@@ -1996,11 +2028,11 @@ func TestHandler_InitiateTreasuryTransfer_IsAliasForExecute(t *testing.T) {
 	s := newMockStore()
 	s.bankAccounts["src-1"] = &domain.BankAccount{BankAccountID: "src-1", LegalEntityID: "ent-123", CurrencyCode: "USD", AccountStatus: "ACTIVE"}
 	s.bankAccounts["tgt-2"] = &domain.BankAccount{BankAccountID: "tgt-2", LegalEntityID: "ent-123", CurrencyCode: "USD", AccountStatus: "ACTIVE"}
-	s.transfers["t1"] = &domain.TreasuryTransfer{
+	s.transfers["t1"] = withAccounts(s, &domain.TreasuryTransfer{
 		TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferApproved, IsCrossEntity: false,
 		Amount: 100, CurrencyCode: "USD", SourceBankAccountID: "src-1", TargetBankAccountID: "tgt-2",
 		MakerPrincipalID: "maker-1", CheckerPrincipalID: "checker-1",
-	}
+	})
 	r := newWave12Router(s)
 
 	rr := doTransferJSONRequest(t, r, http.MethodPost, "/v1/treasury/transfers/t1/initiate", nil, "checker-1")
@@ -2015,10 +2047,10 @@ func TestHandler_InitiateTreasuryTransfer_IsAliasForExecute(t *testing.T) {
 // TestHandler_ListTransfers_ReturnsCreated proves GET /transfers works.
 func TestHandler_ListTransfers_ReturnsCreated(t *testing.T) {
 	s := newMockStore()
-	s.transfers["t1"] = &domain.TreasuryTransfer{TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferPendingApproval, MakerPrincipalID: "maker-1"}
+	s.transfers["t1"] = withAccounts(s, &domain.TreasuryTransfer{TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferPendingApproval, MakerPrincipalID: "maker-1"})
 	r := newWave12Router(s)
 
-	rr := doTransferJSONRequest(t, r, http.MethodGet, "/v1/treasury/transfers", nil, "usr-1")
+	rr := doTransferJSONRequest(t, r, http.MethodGet, "/v1/treasury/transfers?legal_entity_id=ent-src", nil, "usr-1")
 	if rr.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
 	}
@@ -2035,10 +2067,10 @@ func TestHandler_ListTransfers_ReturnsCreated(t *testing.T) {
 // the two new projection queries return the expected fields.
 func TestHandler_GetTransferApprovalAndExecution_ReturnProjections(t *testing.T) {
 	s := newMockStore()
-	s.transfers["t1"] = &domain.TreasuryTransfer{
+	s.transfers["t1"] = withAccounts(s, &domain.TreasuryTransfer{
 		TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferSubmitted,
 		MakerPrincipalID: "maker-1", CheckerPrincipalID: "checker-1", PaymentAttemptID: "attempt-1",
-	}
+	})
 	r := newWave12Router(s)
 
 	approvalRR := doTransferJSONRequest(t, r, http.MethodGet, "/v1/treasury/transfers/t1/approval", nil, "usr-1")
@@ -2066,7 +2098,7 @@ func TestHandler_GetTransferApprovalAndExecution_ReturnProjections(t *testing.T)
 // doc's GetAvailableActions query for BNK-09.
 func TestHandler_GetTransferAvailableActions_ReflectsCurrentState(t *testing.T) {
 	s := newMockStore()
-	s.transfers["t1"] = &domain.TreasuryTransfer{TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferPendingApproval, MakerPrincipalID: "maker-1"}
+	s.transfers["t1"] = withAccounts(s, &domain.TreasuryTransfer{TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferPendingApproval, MakerPrincipalID: "maker-1"})
 	r := newWave12Router(s)
 
 	rr := doTransferJSONRequest(t, r, http.MethodGet, "/v1/treasury/transfers/t1/available-actions", nil, "usr-1")

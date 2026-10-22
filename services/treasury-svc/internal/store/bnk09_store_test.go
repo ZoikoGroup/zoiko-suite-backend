@@ -622,6 +622,10 @@ func TestPgStore_TreasuryTransfer_CrossEntitySagaIsResumable(t *testing.T) {
 	if _, err := s.ApproveTreasuryTransfer(ctx, domain.ApproveTreasuryTransferParams{TenantID: tenantID, TransferID: transfer.TransferID, CheckerPrincipalID: "checker-1"}); err != nil {
 		t.Fatalf("approve: %v", err)
 	}
+	// Cross-entity: AUTHORIZED is the only state it is submitted from.
+	if _, err := s.AuthorizeTreasuryTransfer(ctx, domain.AuthorizeTreasuryTransferParams{TenantID: tenantID, TransferID: transfer.TransferID, AuthorizerPrincipalID: "authorizer-1"}); err != nil {
+		t.Fatalf("authorize: %v", err)
+	}
 	if _, err := s.MarkTransferSubmitted(ctx, tenantID, transfer.TransferID, "attempt-1"); err != nil {
 		t.Fatalf("mark submitted: %v", err)
 	}
@@ -652,5 +656,137 @@ func TestPgStore_TreasuryTransfer_CrossEntitySagaIsResumable(t *testing.T) {
 	// step again — must fail rather than silently re-applying.
 	if _, err := s.MarkTransferIntercompanyPaired(ctx, tenantID, transfer.TransferID, "ic-entry-2"); err == nil {
 		t.Fatal("expected MarkTransferIntercompanyPaired to fail once the transfer is COMPLETED")
+	}
+}
+
+// approvedAndAuthorizedCrossEntity walks a cross-entity transfer through
+// the handler's real order: create, approve, authorize.
+func approvedAndAuthorizedCrossEntity(t *testing.T, ctx context.Context, tenantID, correlationID string) *domain.TreasuryTransfer {
+	t.Helper()
+	s := testStore
+	src, tgt := seedTransferPair(t, ctx, tenantID)
+	transfer, _, err := s.CreateTreasuryTransfer(ctx, domain.CreateTreasuryTransferParams{
+		TenantID: tenantID, SourceBankAccountID: src, TargetBankAccountID: tgt,
+		Amount: 300, CurrencyCode: "USD", IsCrossEntity: true, CorrelationID: correlationID, MakerPrincipalID: "maker-1",
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := s.ApproveTreasuryTransfer(ctx, domain.ApproveTreasuryTransferParams{TenantID: tenantID, TransferID: transfer.TransferID, CheckerPrincipalID: "checker-1"}); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	authorized, err := s.AuthorizeTreasuryTransfer(ctx, domain.AuthorizeTreasuryTransferParams{TenantID: tenantID, TransferID: transfer.TransferID, AuthorizerPrincipalID: "authorizer-1"})
+	if err != nil {
+		t.Fatalf("authorize: %v", err)
+	}
+	return authorized
+}
+
+// A cross-entity transfer is submitted from AUTHORIZED, the only state
+// ExecuteTreasuryTransfer submits it from. Before, MarkTransferSubmitted
+// only accepted APPROVED: the payment attempt had already gone to BNK-06
+// and the transfer could never record it, so the ledger and intercompany
+// steps never ran.
+func TestPgStore_CrossEntityTransfer_SubmittedFromAuthorized(t *testing.T) {
+	cleanTables(t)
+	s := testStore
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+
+	authorized := approvedAndAuthorizedCrossEntity(t, ctx, tenantID, "corr-cross-submit")
+	submitted, err := s.MarkTransferSubmitted(ctx, tenantID, authorized.TransferID, "attempt-1")
+	if err != nil || submitted.Status != domain.TransferSubmitted || submitted.PaymentAttemptID != "attempt-1" {
+		t.Fatalf("submit an AUTHORIZED cross-entity transfer: %+v err=%v", submitted, err)
+	}
+}
+
+// The store refuses to submit a cross-entity transfer that skipped
+// authorization, and a same-entity one that somehow holds AUTHORIZED. The
+// handler already checks the first; this is the second line.
+func TestPgStore_CrossEntityTransfer_NotSubmittedWithoutAuthorization(t *testing.T) {
+	cleanTables(t)
+	s := testStore
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+	src, tgt := seedTransferPair(t, ctx, tenantID)
+
+	transfer, _, err := s.CreateTreasuryTransfer(ctx, domain.CreateTreasuryTransferParams{
+		TenantID: tenantID, SourceBankAccountID: src, TargetBankAccountID: tgt,
+		Amount: 300, CurrencyCode: "USD", IsCrossEntity: true, CorrelationID: "corr-cross-unauthorized", MakerPrincipalID: "maker-1",
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := s.ApproveTreasuryTransfer(ctx, domain.ApproveTreasuryTransferParams{TenantID: tenantID, TransferID: transfer.TransferID, CheckerPrincipalID: "checker-1"}); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	if _, err := s.MarkTransferSubmitted(ctx, tenantID, transfer.TransferID, "attempt-1"); !errors.Is(err, domain.ErrInvalidTransferTransition) {
+		t.Fatalf("expected ErrInvalidTransferTransition submitting an unauthorized cross-entity transfer, got %v", err)
+	}
+}
+
+// CancelBeforeSubmission covers AUTHORIZED, as domain.CanCancelBeforeSubmission
+// and GetTransferAvailableActions already say: the bank has not seen it.
+func TestPgStore_CrossEntityTransfer_CancelWhileAuthorized(t *testing.T) {
+	cleanTables(t)
+	s := testStore
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+
+	authorized := approvedAndAuthorizedCrossEntity(t, ctx, tenantID, "corr-cross-cancel")
+	cancelled, err := s.CancelBeforeSubmission(ctx, domain.CancelBeforeSubmissionParams{
+		TenantID: tenantID, TransferID: authorized.TransferID, Reason: "no longer needed", ActorPrincipalID: "maker-1",
+	})
+	if err != nil || cancelled.Status != domain.TransferCancelled {
+		t.Fatalf("cancel an AUTHORIZED transfer: %+v err=%v", cancelled, err)
+	}
+}
+
+// AmendTreasuryTransfer stores the cross-entity classification the handler
+// re-derives from the amended accounts.
+func TestPgStore_AmendTreasuryTransfer_StoresReclassification(t *testing.T) {
+	cleanTables(t)
+	s := testStore
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+	src, tgt := seedTransferPair(t, ctx, tenantID)
+
+	draft, _, err := s.CreateTreasuryTransfer(ctx, domain.CreateTreasuryTransferParams{
+		TenantID: tenantID, SourceBankAccountID: src, TargetBankAccountID: tgt,
+		Amount: 10, CurrencyCode: "USD", CorrelationID: "corr-amend-reclassify", MakerPrincipalID: "maker-1", SaveAsDraft: true,
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	amended, err := s.AmendTreasuryTransfer(ctx, domain.AmendTreasuryTransferParams{
+		TenantID: tenantID, TransferID: draft.TransferID, SourceBankAccountID: src, TargetBankAccountID: tgt,
+		Amount: 10, CurrencyCode: "USD", IsCrossEntity: true, ActorPrincipalID: "maker-1",
+	})
+	if err != nil || !amended.IsCrossEntity {
+		t.Fatalf("amend: %+v err=%v", amended, err)
+	}
+}
+
+// RESUBMIT starts a fresh maker-checker cycle, so the prior cross-entity
+// authorizer is cleared along with the prior checker.
+func TestPgStore_ResolveResubmit_ClearsPriorAuthorizer(t *testing.T) {
+	cleanTables(t)
+	s := testStore
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+
+	authorized := approvedAndAuthorizedCrossEntity(t, ctx, tenantID, "corr-resubmit-authorizer")
+	if _, err := s.MarkTransferSubmitted(ctx, tenantID, authorized.TransferID, "attempt-1"); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if _, err := s.MarkTransferReturned(ctx, domain.MarkTransferReturnedParams{TenantID: tenantID, TransferID: authorized.TransferID, Reason: "returned", ActorPrincipalID: "ops-1"}); err != nil {
+		t.Fatalf("return: %v", err)
+	}
+	resubmitted, err := s.ResolveTreasuryTransfer(ctx, domain.ResolveTreasuryTransferParams{TenantID: tenantID, TransferID: authorized.TransferID, Resolution: domain.ResolutionResubmit, ActorPrincipalID: "ops-1"})
+	if err != nil {
+		t.Fatalf("resubmit: %v", err)
+	}
+	if resubmitted.CheckerPrincipalID != "" || resubmitted.AuthorizerPrincipalID != "" {
+		t.Fatalf("resubmitted transfer kept a prior approval: checker=%q authorizer=%q", resubmitted.CheckerPrincipalID, resubmitted.AuthorizerPrincipalID)
 	}
 }

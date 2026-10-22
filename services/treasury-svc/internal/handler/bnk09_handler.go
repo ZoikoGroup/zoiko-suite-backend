@@ -45,6 +45,96 @@ func (h *Handler) writeTransferErr(w http.ResponseWriter, err error) {
 	}
 }
 
+// transferAccounts loads a transfer's source and target bank accounts.
+// Every BNK-09 command authorizes against the legal entities that own
+// them, and a store failure is a 503, never a silent "not found".
+func (h *Handler) transferAccounts(w http.ResponseWriter, r *http.Request, sourceID, targetID string) (src, tgt *domain.BankAccount, ok bool) {
+	src, err := h.store.GetBankAccount(r.Context(), sourceID)
+	if err != nil {
+		h.log.Error("treasury transfer: source account read failed", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_error", "cannot load the source bank account")
+		return nil, nil, false
+	}
+	if src == nil {
+		writeError(w, http.StatusNotFound, "source_account_not_found", "")
+		return nil, nil, false
+	}
+	tgt, err = h.store.GetBankAccount(r.Context(), targetID)
+	if err != nil {
+		h.log.Error("treasury transfer: target account read failed", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_error", "cannot load the target bank account")
+		return nil, nil, false
+	}
+	if tgt == nil {
+		writeError(w, http.StatusNotFound, "target_account_not_found", "")
+		return nil, nil, false
+	}
+	return src, tgt, true
+}
+
+// authorizeTransferEntities checks action against the source account's
+// legal entity and, when the movement crosses legal entities, the target's
+// as well — the same pair CreateTreasuryTransfer has always checked. The
+// accounts' own legal entities decide this, not the stored flag.
+func (h *Handler) authorizeTransferEntities(w http.ResponseWriter, r *http.Request, principalID string, src, tgt *domain.BankAccount, action string) bool {
+	if err := h.authz.CheckAllowed(r.Context(), principalID, src.LegalEntityID, action); err != nil {
+		h.writeAuthzErr(w, err)
+		return false
+	}
+	if tgt.LegalEntityID != src.LegalEntityID {
+		if err := h.authz.CheckAllowed(r.Context(), principalID, tgt.LegalEntityID, action); err != nil {
+			h.writeAuthzErr(w, err)
+			return false
+		}
+	}
+	return true
+}
+
+// loadAuthorizedTransfer is the common opening of every BNK-09 command and
+// query on an existing transfer: the transfer, its two accounts, and the
+// caller's permission for action in the legal entities they belong to.
+func (h *Handler) loadAuthorizedTransfer(w http.ResponseWriter, r *http.Request, principalID, action string) (*domain.TreasuryTransfer, *domain.BankAccount, *domain.BankAccount, bool) {
+	tenantID := svcmiddleware.TenantFromContext(r.Context())
+	transfer, err := h.store.GetTreasuryTransfer(r.Context(), tenantID, chi.URLParam(r, "transferID"))
+	if err != nil {
+		h.writeTransferErr(w, err)
+		return nil, nil, nil, false
+	}
+	src, tgt, ok := h.transferAccounts(w, r, transfer.SourceBankAccountID, transfer.TargetBankAccountID)
+	if !ok {
+		return nil, nil, nil, false
+	}
+	if !h.authorizeTransferEntities(w, r, principalID, src, tgt, action) {
+		return nil, nil, nil, false
+	}
+	return transfer, src, tgt, true
+}
+
+// accountUsableForTransfer is BNK-01's "unverified or suspended account
+// blocks protected outbound use" and BNK-09's "inactive account blocks
+// completion": the account must be ACTIVE and its ownership verified.
+// Checked when a transfer is created or amended, and again immediately
+// before the payment attempt is sent, since either fact can change after
+// approval. Fails closed on a store error.
+func (h *Handler) accountUsableForTransfer(w http.ResponseWriter, r *http.Request, acct *domain.BankAccount, role string) bool {
+	if acct.AccountStatus != domain.BankAccountActive {
+		writeError(w, http.StatusPreconditionFailed, role+"_account_not_active",
+			role+" bank account is "+acct.AccountStatus+", not ACTIVE")
+		return false
+	}
+	verified, err := h.store.IsOwnershipVerified(r.Context(), acct.TenantID, acct.BankAccountID)
+	if err != nil {
+		h.log.Error("failed to check "+role+" account ownership verification — failing closed", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "ownership_check_failed", "cannot verify "+role+" account ownership before transfer")
+		return false
+	}
+	if !verified {
+		writeError(w, http.StatusPreconditionFailed, role+"_account_unverified", role+" bank account ownership has not been verified")
+		return false
+	}
+	return true
+}
+
 // CreateTreasuryTransfer handles POST /v1/treasury/transfers — BNK-09's
 // maker entry point. Reuses InitiateTransferRequest's shape (unchanged on
 // the wire) and the same dual-legal-entity authorization and
@@ -76,50 +166,19 @@ func (h *Handler) CreateTreasuryTransfer(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	srcAcct, err := h.store.GetBankAccount(r.Context(), req.SourceBankAccountID)
-	if err != nil || srcAcct == nil {
-		writeError(w, http.StatusNotFound, "source_account_not_found", "")
+	srcAcct, tgtAcct, ok := h.transferAccounts(w, r, req.SourceBankAccountID, req.TargetBankAccountID)
+	if !ok {
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), principalID, srcAcct.LegalEntityID, actionInitiateTransfer); err != nil {
-		h.writeAuthzErr(w, err)
-		return
-	}
-
-	tgtAcct, err := h.store.GetBankAccount(r.Context(), req.TargetBankAccountID)
-	if err != nil || tgtAcct == nil {
-		writeError(w, http.StatusNotFound, "target_account_not_found", "")
+	if !h.authorizeTransferEntities(w, r, principalID, srcAcct, tgtAcct, actionInitiateTransfer) {
 		return
 	}
 	isCrossEntity := tgtAcct.LegalEntityID != srcAcct.LegalEntityID
-	if isCrossEntity {
-		if err := h.authz.CheckAllowed(r.Context(), principalID, tgtAcct.LegalEntityID, actionInitiateTransfer); err != nil {
-			h.writeAuthzErr(w, err)
-			return
-		}
-	}
 
 	// BNK-01's own negative path ("unverified account used for payment")
 	// — a treasury transfer is exactly the protected outbound use
 	// IsOwnershipVerified exists to gate. Fail closed on either check.
-	srcVerified, err := h.store.IsOwnershipVerified(r.Context(), srcAcct.TenantID, srcAcct.BankAccountID)
-	if err != nil {
-		h.log.Error("failed to check source account ownership verification — failing closed", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "ownership_check_failed", "cannot verify source account ownership before transfer")
-		return
-	}
-	if !srcVerified {
-		writeError(w, http.StatusPreconditionFailed, "source_account_unverified", "source bank account ownership has not been verified")
-		return
-	}
-	tgtVerified, err := h.store.IsOwnershipVerified(r.Context(), tgtAcct.TenantID, tgtAcct.BankAccountID)
-	if err != nil {
-		h.log.Error("failed to check target account ownership verification — failing closed", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "ownership_check_failed", "cannot verify target account ownership before transfer")
-		return
-	}
-	if !tgtVerified {
-		writeError(w, http.StatusPreconditionFailed, "target_account_unverified", "target bank account ownership has not been verified")
+	if !h.accountUsableForTransfer(w, r, srcAcct, "source") || !h.accountUsableForTransfer(w, r, tgtAcct, "target") {
 		return
 	}
 
@@ -162,12 +221,17 @@ func (h *Handler) CreateTreasuryTransfer(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, status, transfer)
 }
 
+// GetTreasuryTransfer and the other BNK-09 reads below need a principal
+// with the treasury view permission in the transfer's legal entities —
+// the same TREASURY_POSITIONS_VIEW every other treasury read checks.
+// Before, they needed only a tenant header.
 func (h *Handler) GetTreasuryTransfer(w http.ResponseWriter, r *http.Request) {
-	tenantID := svcmiddleware.TenantFromContext(r.Context())
-	transferID := chi.URLParam(r, "transferID")
-	transfer, err := h.store.GetTreasuryTransfer(r.Context(), tenantID, transferID)
-	if err != nil {
-		h.writeTransferErr(w, err)
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	transfer, _, _, ok := h.loadAuthorizedTransfer(w, r, principalID, actionViewPositions)
+	if !ok {
 		return
 	}
 	writeJSON(w, http.StatusOK, transfer)
@@ -178,11 +242,10 @@ func (h *Handler) GetTreasuryTransfer(w http.ResponseWriter, r *http.Request) {
 // service-to-service read payment-initiation-adapter-svc calls to
 // independently re-derive and compare domain.TransferFingerprint,
 // instead of trusting the fingerprint SubmitTreasuryPayment sent it.
-// Same no-extra-authz-gate posture as GetTreasuryTransfer above: tenant
-// isolation is enforced by RLS via the request's tenant context, not a
-// principal-level permission check, since this is a narrow read of
-// exactly what the caller already has (the transfer ID) plus its own
-// live status/fingerprint.
+// Unlike GetTreasuryTransfer it has no principal-level permission check:
+// it is a service-to-service read, tenant isolation is enforced by RLS via
+// the request's tenant context, and it returns only an opaque hash and
+// status of a transfer whose ID the caller already holds.
 func (h *Handler) GetTreasuryTransferFingerprint(w http.ResponseWriter, r *http.Request) {
 	tenantID := svcmiddleware.TenantFromContext(r.Context())
 	transferID := chi.URLParam(r, "transferID")
@@ -209,13 +272,7 @@ func (h *Handler) ApproveTreasuryTransfer(w http.ResponseWriter, r *http.Request
 	if !ok {
 		return
 	}
-	transfer, err := h.store.GetTreasuryTransfer(r.Context(), tenantID, transferID)
-	if err != nil {
-		h.writeTransferErr(w, err)
-		return
-	}
-	if err := h.authz.CheckAllowed(r.Context(), principalID, transfer.TenantID, actionApproveTransfer); err != nil {
-		h.writeAuthzErr(w, err)
+	if _, _, _, ok := h.loadAuthorizedTransfer(w, r, principalID, actionApproveTransfer); !ok {
 		return
 	}
 	updated, err := h.store.ApproveTreasuryTransfer(r.Context(), domain.ApproveTreasuryTransferParams{
@@ -239,13 +296,7 @@ func (h *Handler) AuthorizeTreasuryTransfer(w http.ResponseWriter, r *http.Reque
 	if !ok {
 		return
 	}
-	transfer, err := h.store.GetTreasuryTransfer(r.Context(), tenantID, transferID)
-	if err != nil {
-		h.writeTransferErr(w, err)
-		return
-	}
-	if err := h.authz.CheckAllowed(r.Context(), principalID, transfer.TenantID, actionAuthorizeTransfer); err != nil {
-		h.writeAuthzErr(w, err)
+	if _, _, _, ok := h.loadAuthorizedTransfer(w, r, principalID, actionAuthorizeTransfer); !ok {
 		return
 	}
 	updated, err := h.store.AuthorizeTreasuryTransfer(r.Context(), domain.AuthorizeTreasuryTransferParams{
@@ -258,6 +309,9 @@ func (h *Handler) AuthorizeTreasuryTransfer(w http.ResponseWriter, r *http.Reque
 	writeJSON(w, http.StatusOK, updated)
 }
 
+// RejectTreasuryTransfer is the checker's other answer to a pending
+// transfer, so it needs the same permission as approving it. Before, it
+// had no permission check at all.
 func (h *Handler) RejectTreasuryTransfer(w http.ResponseWriter, r *http.Request) {
 	tenantID := svcmiddleware.TenantFromContext(r.Context())
 	transferID := chi.URLParam(r, "transferID")
@@ -267,6 +321,9 @@ func (h *Handler) RejectTreasuryTransfer(w http.ResponseWriter, r *http.Request)
 	_ = json.NewDecoder(r.Body).Decode(&req)
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
+		return
+	}
+	if _, _, _, ok := h.loadAuthorizedTransfer(w, r, principalID, actionApproveTransfer); !ok {
 		return
 	}
 	updated, err := h.store.RejectTreasuryTransfer(r.Context(), domain.RejectTreasuryTransferParams{
@@ -280,10 +337,25 @@ func (h *Handler) RejectTreasuryTransfer(w http.ResponseWriter, r *http.Request)
 }
 
 // ListTransfers handles GET /v1/treasury/transfers — the doc's own
-// ListTransfers query. legal_entity_id/status are optional filters.
+// ListTransfers query, scoped to one legal entity (the transfers whose
+// source account it owns) the caller may view; status is an optional
+// filter. legal_entity_id is required: permission is granted per legal
+// entity, so a tenant-wide list has nothing to be authorized against.
 func (h *Handler) ListTransfers(w http.ResponseWriter, r *http.Request) {
 	tenantID := svcmiddleware.TenantFromContext(r.Context())
 	q := r.URL.Query()
+	if q.Get("legal_entity_id") == "" {
+		writeError(w, http.StatusBadRequest, "missing_field", "legal_entity_id is required")
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, q.Get("legal_entity_id"), actionViewPositions); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
 	limit := 0
 	if v := q.Get("limit"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
@@ -314,11 +386,12 @@ func (h *Handler) ListTransfers(w http.ResponseWriter, r *http.Request) {
 // TreasuryTransfer itself), so this is an honest projection of the
 // existing fields rather than a fabricated sub-entity.
 func (h *Handler) GetTransferApproval(w http.ResponseWriter, r *http.Request) {
-	tenantID := svcmiddleware.TenantFromContext(r.Context())
-	transferID := chi.URLParam(r, "transferID")
-	transfer, err := h.store.GetTreasuryTransfer(r.Context(), tenantID, transferID)
-	if err != nil {
-		h.writeTransferErr(w, err)
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	transfer, _, _, ok := h.loadAuthorizedTransfer(w, r, principalID, actionViewPositions)
+	if !ok {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
@@ -338,11 +411,12 @@ func (h *Handler) GetTransferApproval(w http.ResponseWriter, r *http.Request) {
 // — the doc's own GetTransferExecution query, projecting the same
 // execution-lineage fields ExecuteTreasuryTransfer's saga already writes.
 func (h *Handler) GetTransferExecution(w http.ResponseWriter, r *http.Request) {
-	tenantID := svcmiddleware.TenantFromContext(r.Context())
-	transferID := chi.URLParam(r, "transferID")
-	transfer, err := h.store.GetTreasuryTransfer(r.Context(), tenantID, transferID)
-	if err != nil {
-		h.writeTransferErr(w, err)
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	transfer, _, _, ok := h.loadAuthorizedTransfer(w, r, principalID, actionViewPositions)
+	if !ok {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
@@ -362,11 +436,12 @@ func (h *Handler) GetTransferExecution(w http.ResponseWriter, r *http.Request) {
 // pattern: a direct, mechanical read of which of this aggregate's own
 // existing transition guards currently pass, not new business logic.
 func (h *Handler) GetTransferAvailableActions(w http.ResponseWriter, r *http.Request) {
-	tenantID := svcmiddleware.TenantFromContext(r.Context())
-	transferID := chi.URLParam(r, "transferID")
-	transfer, err := h.store.GetTreasuryTransfer(r.Context(), tenantID, transferID)
-	if err != nil {
-		h.writeTransferErr(w, err)
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	transfer, _, _, ok := h.loadAuthorizedTransfer(w, r, principalID, actionViewPositions)
+	if !ok {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{
@@ -400,9 +475,8 @@ func (h *Handler) ExecuteTreasuryTransfer(w http.ResponseWriter, r *http.Request
 	}
 	correlationID := r.Header.Get("X-Correlation-ID")
 
-	transfer, err := h.store.GetTreasuryTransfer(r.Context(), tenantID, transferID)
-	if err != nil {
-		h.writeTransferErr(w, err)
+	transfer, srcAcct, tgtAcct, ok := h.loadAuthorizedTransfer(w, r, principalID, actionExecuteTransfer)
+	if !ok {
 		return
 	}
 	if transfer.Status == domain.TransferCompleted {
@@ -413,19 +487,18 @@ func (h *Handler) ExecuteTreasuryTransfer(w http.ResponseWriter, r *http.Request
 		h.writeTransferErr(w, domain.ErrInvalidTransferTransition)
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), principalID, transfer.TenantID, actionExecuteTransfer); err != nil {
-		h.writeAuthzErr(w, err)
-		return
-	}
+	var err error
 
-	srcAcct, err := h.store.GetBankAccount(r.Context(), transfer.SourceBankAccountID)
-	if err != nil || srcAcct == nil {
-		writeError(w, http.StatusInternalServerError, "source_account_missing", "source bank account for this transfer could not be loaded")
-		return
-	}
-	tgtAcct, err := h.store.GetBankAccount(r.Context(), transfer.TargetBankAccountID)
-	if err != nil || tgtAcct == nil {
-		writeError(w, http.StatusInternalServerError, "target_account_missing", "target bank account for this transfer could not be loaded")
+	// The accounts' legal entities, not the stored flag, decide whether
+	// this movement crosses entities. A transfer whose flag disagrees with
+	// them would run the wrong saga — a cross-entity movement completed as
+	// same-entity skips the ledger and intercompany steps entirely — so it
+	// is refused, not executed.
+	if (srcAcct.LegalEntityID != tgtAcct.LegalEntityID) != transfer.IsCrossEntity {
+		h.log.Error("treasury transfer cross-entity classification disagrees with its accounts",
+			zap.String("transfer_id", transfer.TransferID), zap.Bool("is_cross_entity", transfer.IsCrossEntity))
+		writeError(w, http.StatusConflict, "cross_entity_classification_mismatch",
+			"the transfer's cross-entity classification does not match its accounts' legal entities")
 		return
 	}
 
@@ -439,6 +512,12 @@ func (h *Handler) ExecuteTreasuryTransfer(w http.ResponseWriter, r *http.Request
 	}
 
 	if transfer.Status == domain.TransferApproved || transfer.Status == domain.TransferAuthorized {
+		// An account suspended, closed or left unverified after approval
+		// blocks the payment from leaving. After submission it does not:
+		// the money has moved, and the ledger steps must still record it.
+		if !h.accountUsableForTransfer(w, r, srcAcct, "source") || !h.accountUsableForTransfer(w, r, tgtAcct, "target") {
+			return
+		}
 		// Wave 11b: computed from the transfer's live APPROVED/AUTHORIZED
 		// state (still the status at this point — MarkTransferSubmitted
 		// hasn't run yet), so it matches what GetTreasuryTransferFingerprint
@@ -516,7 +595,12 @@ func (h *Handler) ExecuteTreasuryTransfer(w http.ResponseWriter, r *http.Request
 // the maker's own DRAFT-only correction path. Reuses
 // InitiateTransferRequest's shape (source/target account, amount,
 // currency) since it's the same protected-field set CreateTreasuryTransfer
-// itself accepts.
+// itself accepts, and puts the amended accounts through the same checks
+// CreateTreasuryTransfer does: permission in their legal entities, ACTIVE,
+// ownership verified, and a cross-entity flag re-derived from them. Before,
+// an amended account kept the original flag, so a same-entity draft could
+// be pointed at another entity's account and then executed as same-entity,
+// skipping the authorize step, the ledger posting and intercompany pairing.
 func (h *Handler) AmendTreasuryTransfer(w http.ResponseWriter, r *http.Request) {
 	tenantID := svcmiddleware.TenantFromContext(r.Context())
 	transferID := chi.URLParam(r, "transferID")
@@ -533,18 +617,23 @@ func (h *Handler) AmendTreasuryTransfer(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
-	transfer, err := h.store.GetTreasuryTransfer(r.Context(), tenantID, transferID)
-	if err != nil {
-		h.writeTransferErr(w, err)
+	if _, _, _, ok := h.loadAuthorizedTransfer(w, r, principalID, actionModifyTransfer); !ok {
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), principalID, transfer.TenantID, actionModifyTransfer); err != nil {
-		h.writeAuthzErr(w, err)
+	srcAcct, tgtAcct, ok := h.transferAccounts(w, r, req.SourceBankAccountID, req.TargetBankAccountID)
+	if !ok {
+		return
+	}
+	if !h.authorizeTransferEntities(w, r, principalID, srcAcct, tgtAcct, actionInitiateTransfer) {
+		return
+	}
+	if !h.accountUsableForTransfer(w, r, srcAcct, "source") || !h.accountUsableForTransfer(w, r, tgtAcct, "target") {
 		return
 	}
 	updated, err := h.store.AmendTreasuryTransfer(r.Context(), domain.AmendTreasuryTransferParams{
 		TenantID: tenantID, TransferID: transferID, SourceBankAccountID: req.SourceBankAccountID,
 		TargetBankAccountID: req.TargetBankAccountID, Amount: req.Amount, CurrencyCode: req.CurrencyCode,
+		IsCrossEntity:    srcAcct.LegalEntityID != tgtAcct.LegalEntityID,
 		ActorPrincipalID: principalID,
 	})
 	if err != nil {
@@ -568,13 +657,7 @@ func (h *Handler) SubmitTransferForApproval(w http.ResponseWriter, r *http.Reque
 	if !ok {
 		return
 	}
-	transfer, err := h.store.GetTreasuryTransfer(r.Context(), tenantID, transferID)
-	if err != nil {
-		h.writeTransferErr(w, err)
-		return
-	}
-	if err := h.authz.CheckAllowed(r.Context(), principalID, transfer.TenantID, actionModifyTransfer); err != nil {
-		h.writeAuthzErr(w, err)
+	if _, _, _, ok := h.loadAuthorizedTransfer(w, r, principalID, actionModifyTransfer); !ok {
 		return
 	}
 	updated, err := h.store.SubmitTransferForApproval(r.Context(), domain.SubmitTransferForApprovalParams{
@@ -601,13 +684,7 @@ func (h *Handler) CancelBeforeSubmission(w http.ResponseWriter, r *http.Request)
 	if !ok {
 		return
 	}
-	transfer, err := h.store.GetTreasuryTransfer(r.Context(), tenantID, transferID)
-	if err != nil {
-		h.writeTransferErr(w, err)
-		return
-	}
-	if err := h.authz.CheckAllowed(r.Context(), principalID, transfer.TenantID, actionModifyTransfer); err != nil {
-		h.writeAuthzErr(w, err)
+	if _, _, _, ok := h.loadAuthorizedTransfer(w, r, principalID, actionModifyTransfer); !ok {
 		return
 	}
 	updated, err := h.store.CancelBeforeSubmission(r.Context(), domain.CancelBeforeSubmissionParams{
@@ -641,13 +718,7 @@ func (h *Handler) MarkTransferReturned(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	transfer, err := h.store.GetTreasuryTransfer(r.Context(), tenantID, transferID)
-	if err != nil {
-		h.writeTransferErr(w, err)
-		return
-	}
-	if err := h.authz.CheckAllowed(r.Context(), principalID, transfer.TenantID, actionResolveTransfer); err != nil {
-		h.writeAuthzErr(w, err)
+	if _, _, _, ok := h.loadAuthorizedTransfer(w, r, principalID, actionResolveTransfer); !ok {
 		return
 	}
 	updated, err := h.store.MarkTransferReturned(r.Context(), domain.MarkTransferReturnedParams{
@@ -679,13 +750,7 @@ func (h *Handler) ResolveTreasuryTransfer(w http.ResponseWriter, r *http.Request
 	if !ok {
 		return
 	}
-	transfer, err := h.store.GetTreasuryTransfer(r.Context(), tenantID, transferID)
-	if err != nil {
-		h.writeTransferErr(w, err)
-		return
-	}
-	if err := h.authz.CheckAllowed(r.Context(), principalID, transfer.TenantID, actionResolveTransfer); err != nil {
-		h.writeAuthzErr(w, err)
+	if _, _, _, ok := h.loadAuthorizedTransfer(w, r, principalID, actionResolveTransfer); !ok {
 		return
 	}
 	updated, err := h.store.ResolveTreasuryTransfer(r.Context(), domain.ResolveTreasuryTransferParams{

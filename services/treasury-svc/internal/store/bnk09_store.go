@@ -278,12 +278,19 @@ func (s *PgStore) RejectTreasuryTransfer(ctx context.Context, p domain.RejectTre
 // ExecuteTreasuryTransfer's resumable handler loop — see
 // internal/handler/bnk09_handler.go.
 
+// MarkTransferSubmitted records BNK-06 accepting the payment attempt. A
+// same-entity transfer is submitted from APPROVED; a cross-entity one only
+// from AUTHORIZED, the extra dual-control step ExecuteTreasuryTransfer
+// requires first. The predecessor is tied to is_cross_entity here too, so
+// the store cannot record a cross-entity submission that skipped
+// authorization.
 func (s *PgStore) MarkTransferSubmitted(ctx context.Context, tenantID, transferID, paymentAttemptID string) (*domain.TreasuryTransfer, error) {
 	var t domain.TreasuryTransfer
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		row := tx.QueryRow(ctx, `
 			UPDATE treasury_transfers SET status=$3, payment_attempt_id=$4, updated_at=now()
-			WHERE transfer_id=$1 AND tenant_id=$2 AND status='APPROVED'
+			WHERE transfer_id=$1 AND tenant_id=$2
+				AND ((status='APPROVED' AND NOT is_cross_entity) OR (status='AUTHORIZED' AND is_cross_entity))
 			RETURNING `+treasuryTransferColumns,
 			transferID, tenantID, domain.TransferSubmitted, paymentAttemptID)
 		if err := scanTreasuryTransfer(row, &t); err != nil {
@@ -361,10 +368,11 @@ func (s *PgStore) AmendTreasuryTransfer(ctx context.Context, p domain.AmendTreas
 	err = s.withRLS(ctx, p.TenantID, func(tx pgx.Tx) error {
 		row := tx.QueryRow(ctx, `
 			UPDATE treasury_transfers
-			SET source_bank_account_id=$3, target_bank_account_id=$4, amount=$5, currency_code=$6, protected_field_hash=$7, updated_at=now()
+			SET source_bank_account_id=$3, target_bank_account_id=$4, amount=$5, currency_code=$6, protected_field_hash=$7,
+			    is_cross_entity=$8, updated_at=now()
 			WHERE transfer_id=$1 AND tenant_id=$2 AND status='DRAFT'
 			RETURNING `+treasuryTransferColumns,
-			p.TransferID, p.TenantID, p.SourceBankAccountID, p.TargetBankAccountID, p.Amount, p.CurrencyCode, hash)
+			p.TransferID, p.TenantID, p.SourceBankAccountID, p.TargetBankAccountID, p.Amount, p.CurrencyCode, hash, p.IsCrossEntity)
 		return scanTreasuryTransfer(row, &t)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -406,9 +414,10 @@ func (s *PgStore) SubmitTransferForApproval(ctx context.Context, p domain.Submit
 	return &t, nil
 }
 
-// CancelBeforeSubmission moves DRAFT/PENDING_APPROVAL/APPROVED straight
-// to the terminal CANCELLED state. Only the maker may cancel their own
-// transfer.
+// CancelBeforeSubmission moves DRAFT/PENDING_APPROVAL/APPROVED/AUTHORIZED
+// straight to the terminal CANCELLED state — the same set
+// domain.CanCancelBeforeSubmission names: the bank has not seen any of
+// them. Only the maker may cancel their own transfer.
 func (s *PgStore) CancelBeforeSubmission(ctx context.Context, p domain.CancelBeforeSubmissionParams) (*domain.TreasuryTransfer, error) {
 	existing, err := s.GetTreasuryTransfer(ctx, p.TenantID, p.TransferID)
 	if err != nil {
@@ -421,7 +430,7 @@ func (s *PgStore) CancelBeforeSubmission(ctx context.Context, p domain.CancelBef
 	err = s.withRLS(ctx, p.TenantID, func(tx pgx.Tx) error {
 		row := tx.QueryRow(ctx, `
 			UPDATE treasury_transfers SET status=$3, cancel_reason=$4, updated_at=now()
-			WHERE transfer_id=$1 AND tenant_id=$2 AND status IN ('DRAFT','PENDING_APPROVAL','APPROVED')
+			WHERE transfer_id=$1 AND tenant_id=$2 AND status IN ('DRAFT','PENDING_APPROVAL','APPROVED','AUTHORIZED')
 			RETURNING `+treasuryTransferColumns,
 			p.TransferID, p.TenantID, domain.TransferCancelled, p.Reason)
 		if err := scanTreasuryTransfer(row, &t); err != nil {
@@ -489,12 +498,14 @@ func (s *PgStore) ResolveTreasuryTransfer(ctx context.Context, p domain.ResolveT
 	err := s.withRLS(ctx, p.TenantID, func(tx pgx.Tx) error {
 		var row pgx.Row
 		if p.Resolution == domain.ResolutionResubmit {
-			// A fresh maker-checker cycle: the prior checker and the
-			// failed attempt's correlation ids are cleared, not reused.
+			// A fresh maker-checker cycle: the prior checker, the prior
+			// cross-entity authorizer and the failed attempt's correlation
+			// ids are cleared, not reused.
 			row = tx.QueryRow(ctx, `
 				UPDATE treasury_transfers
 				SET status=$3, resolution_note=$4, updated_at=now(),
-				    checker_principal_id='', payment_attempt_id='', source_journal_id='', intercompany_entry_id=''
+				    checker_principal_id='', authorizer_principal_id='',
+				    payment_attempt_id='', source_journal_id='', intercompany_entry_id=''
 				WHERE transfer_id=$1 AND tenant_id=$2 AND status='RETURNED'
 				RETURNING `+treasuryTransferColumns,
 				p.TransferID, p.TenantID, domain.TransferPendingApproval, p.Note)
