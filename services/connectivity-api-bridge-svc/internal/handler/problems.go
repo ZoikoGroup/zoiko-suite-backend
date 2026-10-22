@@ -142,3 +142,5 @@ func writeProblem(w http.ResponseWriter, r *http.Request, err error) {
 	w.WriteHeader(o.status)
 	_ = json.NewEncoder(w).Encode(body)
 }
+
+func encodeJSON(w http.ResponseWriter, v any) error { return json.NewEncoder(w).Encode(v) }
