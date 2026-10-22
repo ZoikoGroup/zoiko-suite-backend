@@ -29,6 +29,7 @@ type EndpointInfo struct {
 	Hosts   []string
 	Regions []string
 	Schemes []string
+	Ports   []int
 }
 
 // CertInfo is the CERTIFICATION profile of a contract.
@@ -91,7 +92,7 @@ func (v *ContractVersion) UsedEndpointProfiles() map[string]EndpointInfo {
 		if json.Unmarshal(p.Spec, &e) != nil {
 			continue
 		}
-		out[p.Name] = EndpointInfo{Name: p.Name, Hosts: e.Hosts, Regions: e.Regions, Schemes: e.Schemes}
+		out[p.Name] = EndpointInfo{Name: p.Name, Hosts: e.Hosts, Regions: e.Regions, Schemes: e.Schemes, Ports: e.Ports}
 	}
 	return out
 }

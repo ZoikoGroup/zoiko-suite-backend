@@ -88,6 +88,16 @@ type Config struct {
 	XICHandoffMaxAttempts  int
 	XICConnRatePerMin      int
 	XICIPRatePerMin        int
+
+	// XIC-04 outbound engine.
+	XICOutboundResolverIntervalSecs int // 0 turns the resolver worker off
+	XICOutboundBodyRetentionHours   int // how long an OPEN attempt may keep its request body; 0 keeps none
+	XICOutboundBodyMaxBytes         int
+	XICOutboundBodyDenyClasses      []string
+	XICOutboundRequestTimeoutSecs   int
+	XICOutboundSubmitLeaseSecs      int
+	XICOutboundResolveBackoffSecs   int
+	XICOutboundMaxUnknownAgeHours   int // OD-13
 }
 
 func Load() *Config {
@@ -117,28 +127,36 @@ func Load() *Config {
 		SchemaGatePrincipal:         getEnv("SCHEMA_GATE_PRINCIPAL", "connectivity-api-bridge-svc"),
 		SchemaGateAllowUnregistered: getEnv("SCHEMA_GATE_ALLOW_UNREGISTERED", "true") == "true",
 
-		XICMaxPayloadBytes:       int64Env("XIC_MAX_PAYLOAD_BYTES", 25<<20),
-		XICIdempotencyMinDays:    intEnv("XIC_IDEMPOTENCY_MIN_DAYS", 1),
-		XICIdempotencyMaxDays:    intEnv("XIC_IDEMPOTENCY_MAX_DAYS", 3650),
-		XICCertificationMaxDays:  intEnv("XIC_CERTIFICATION_MAX_DAYS", 365),
-		XICRedirectAllowlist:     exactCSV(os.Getenv("XIC_REDIRECT_ALLOWLIST")),
-		XICAuthSessionMinutes:    intEnv("XIC_AUTH_SESSION_MINUTES", 10),
-		XICExpiryWarningDays:     intEnv("XIC_EXPIRY_WARNING_DAYS", 14),
-		XICRotationDays:          intEnv("XIC_ROTATION_DAYS", 90),
-		XICMaxGraceHours:         intEnv("XIC_MAX_GRACE_HOURS", 168),
-		XICBreakGlassMaxMinutes:  intEnv("XIC_BREAK_GLASS_MAX_MINUTES", 240),
-		XICEvaluatorIntervalSecs: nonNegInt("XIC_EVALUATOR_INTERVAL_SECONDS", 300),
-		XICInboundEnabled:        getEnv("XIC_INBOUND_ENABLED", "false") == "true",
-		XICInboundMaxBodyBytes:   int64Env("XIC_INBOUND_MAX_BODY_BYTES", 5<<20),
-		XICInboundTrustXFF:       getEnv("XIC_INBOUND_TRUST_XFF", "false") == "true",
-		XICEdgeSecret:            os.Getenv("XIC_EDGE_SECRET"),
-		XICRawRetentionDays:      nonNegInt("XIC_RAW_RETENTION_DAYS", 30),
-		XICRawMaxBytes:           intEnv("XIC_RAW_MAX_BYTES", 1<<20),
-		XICRawDenyClasses:        upperCSV(getEnv("XIC_RAW_DENY_CLASSES", "PERSONAL,RESTRICTED")),
-		XICHandoffIntervalSecs:   nonNegInt("XIC_HANDOFF_INTERVAL_SECONDS", 5),
-		XICHandoffMaxAttempts:    intEnv("XIC_HANDOFF_MAX_ATTEMPTS", 8),
-		XICConnRatePerMin:        nonNegInt("XIC_INBOUND_CONN_RATE_PER_MIN", 600),
-		XICIPRatePerMin:          nonNegInt("XIC_INBOUND_IP_RATE_PER_MIN", 1200),
+		XICMaxPayloadBytes:              int64Env("XIC_MAX_PAYLOAD_BYTES", 25<<20),
+		XICIdempotencyMinDays:           intEnv("XIC_IDEMPOTENCY_MIN_DAYS", 1),
+		XICIdempotencyMaxDays:           intEnv("XIC_IDEMPOTENCY_MAX_DAYS", 3650),
+		XICCertificationMaxDays:         intEnv("XIC_CERTIFICATION_MAX_DAYS", 365),
+		XICRedirectAllowlist:            exactCSV(os.Getenv("XIC_REDIRECT_ALLOWLIST")),
+		XICAuthSessionMinutes:           intEnv("XIC_AUTH_SESSION_MINUTES", 10),
+		XICExpiryWarningDays:            intEnv("XIC_EXPIRY_WARNING_DAYS", 14),
+		XICRotationDays:                 intEnv("XIC_ROTATION_DAYS", 90),
+		XICMaxGraceHours:                intEnv("XIC_MAX_GRACE_HOURS", 168),
+		XICBreakGlassMaxMinutes:         intEnv("XIC_BREAK_GLASS_MAX_MINUTES", 240),
+		XICEvaluatorIntervalSecs:        nonNegInt("XIC_EVALUATOR_INTERVAL_SECONDS", 300),
+		XICInboundEnabled:               getEnv("XIC_INBOUND_ENABLED", "false") == "true",
+		XICInboundMaxBodyBytes:          int64Env("XIC_INBOUND_MAX_BODY_BYTES", 5<<20),
+		XICInboundTrustXFF:              getEnv("XIC_INBOUND_TRUST_XFF", "false") == "true",
+		XICEdgeSecret:                   os.Getenv("XIC_EDGE_SECRET"),
+		XICRawRetentionDays:             nonNegInt("XIC_RAW_RETENTION_DAYS", 30),
+		XICRawMaxBytes:                  intEnv("XIC_RAW_MAX_BYTES", 1<<20),
+		XICRawDenyClasses:               upperCSV(getEnv("XIC_RAW_DENY_CLASSES", "PERSONAL,RESTRICTED")),
+		XICHandoffIntervalSecs:          nonNegInt("XIC_HANDOFF_INTERVAL_SECONDS", 5),
+		XICHandoffMaxAttempts:           intEnv("XIC_HANDOFF_MAX_ATTEMPTS", 8),
+		XICConnRatePerMin:               nonNegInt("XIC_INBOUND_CONN_RATE_PER_MIN", 600),
+		XICIPRatePerMin:                 nonNegInt("XIC_INBOUND_IP_RATE_PER_MIN", 1200),
+		XICOutboundResolverIntervalSecs: nonNegInt("XIC_OUTBOUND_RESOLVER_INTERVAL_SECONDS", 15),
+		XICOutboundBodyRetentionHours:   nonNegInt("XIC_OUTBOUND_BODY_RETENTION_HOURS", 168),
+		XICOutboundBodyMaxBytes:         intEnv("XIC_OUTBOUND_BODY_MAX_BYTES", 256<<10),
+		XICOutboundBodyDenyClasses:      upperCSV(getEnv("XIC_OUTBOUND_BODY_DENY_CLASSES", "PERSONAL,RESTRICTED")),
+		XICOutboundRequestTimeoutSecs:   intEnv("XIC_OUTBOUND_REQUEST_TIMEOUT_SECONDS", 20),
+		XICOutboundSubmitLeaseSecs:      intEnv("XIC_OUTBOUND_SUBMIT_LEASE_SECONDS", 120),
+		XICOutboundResolveBackoffSecs:   intEnv("XIC_OUTBOUND_RESOLVE_BACKOFF_SECONDS", 30),
+		XICOutboundMaxUnknownAgeHours:   intEnv("XIC_OUTBOUND_MAX_UNKNOWN_AGE_HOURS", 24),
 	}
 }
 

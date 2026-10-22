@@ -23,6 +23,7 @@ import (
 	"zoiko.io/connectivity-api-bridge-svc/internal/inbound"
 	"zoiko.io/connectivity-api-bridge-svc/internal/middleware"
 	"zoiko.io/connectivity-api-bridge-svc/internal/mtls"
+	"zoiko.io/connectivity-api-bridge-svc/internal/outbound"
 	"zoiko.io/connectivity-api-bridge-svc/internal/registry"
 	"zoiko.io/connectivity-api-bridge-svc/internal/store"
 	"zoiko.io/connectivity-api-bridge-svc/internal/telemetry"
@@ -192,6 +193,24 @@ func main() {
 		}
 	})
 
+	// XIC-04 outbound engine (ZS-SVC-T-001 section 9): durable attempts, ambiguity-safe submission and resolution.
+	// Destinations come from connections' governed endpoint profiles and are checked against egress policy before any
+	// credential is fetched; credential material comes from the vault's use operation.
+	obRepo := store.NewOutboundRepo(st)
+	obSvc := &outbound.Service{
+		Repo: obRepo, Conns: connSvc, Secrets: outbound.NewVaultSecrets(cfg.VaultServiceURL, "connectivity-api-bridge-svc"), Egress: egressPolicy(cfg, logger),
+		Cfg: outbound.Config{BodyRetention: time.Duration(cfg.XICOutboundBodyRetentionHours) * time.Hour, BodyMaxBytes: cfg.XICOutboundBodyMaxBytes,
+			BodyDenyClasses: cfg.XICOutboundBodyDenyClasses, RequestTimeout: time.Duration(cfg.XICOutboundRequestTimeoutSecs) * time.Second,
+			SubmitLease: time.Duration(cfg.XICOutboundSubmitLeaseSecs) * time.Second, ResolveBackoff: time.Duration(cfg.XICOutboundResolveBackoffSecs) * time.Second,
+			ResolveBackoffMax: 15 * time.Minute, MaxUnknownAge: time.Duration(cfg.XICOutboundMaxUnknownAgeHours) * time.Hour, MaxResponseBytes: 64 << 10},
+	}
+	obHandler := handler.NewOutbound(obSvc, obRepo, authzClient, logger)
+	go obSvc.RunResolver(evalCtx, time.Duration(cfg.XICOutboundResolverIntervalSecs)*time.Second, 100, func(n int, err error) {
+		if err != nil {
+			logger.Warn("outbound resolver", zap.Int("due", n), zap.Error(err))
+		}
+	})
+
 	// api carries every ZoikoSuite-authenticated route behind the tenant and envelope middleware. The ingest endpoint
 	// is mounted beside it, NOT inside it: an external sender has no tenant header, and its identity is proven by the
 	// contract's authentication profile, never by headers it could set itself.
@@ -211,6 +230,7 @@ func main() {
 	handler.RegisterRegistryRoutes(r, rh)
 	handler.RegisterConnectionRoutes(r, ch)
 	handler.RegisterInboundAdminRoutes(r, inAdmin)
+	handler.RegisterOutboundRoutes(r, obHandler)
 
 	root := chi.NewRouter()
 	root.Use(chimiddleware.RequestID)

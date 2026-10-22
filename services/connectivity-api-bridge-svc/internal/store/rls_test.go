@@ -129,7 +129,8 @@ func TestRLS_EnabledAndForced(t *testing.T) {
 		"connector_health_transitions", "sync_checkpoints", "checkpoint_reset_requests", "external_profiles", "eventing_outbox", "eventing_repair_log",
 		"xic_connectors", "xic_contract_versions", "xic_mapping_versions", "xic_contract_gates", "xic_validation_runs", "xic_contract_transitions", "xic_idempotency",
 		"xic_connections", "xic_credential_bindings", "xic_connection_events", "xic_connection_checks", "xic_certifications", "xic_authorization_sessions", "xic_connection_requests", "xic_conn_idempotency",
-		"xic_handoff_targets", "xic_inbound_exchanges", "xic_inbound_events", "xic_quarantine_requests"} {
+		"xic_handoff_targets", "xic_inbound_exchanges", "xic_inbound_events", "xic_quarantine_requests",
+		"xic_outbound_attempts", "xic_outbound_events"} {
 		var enabled, forced bool
 		if err := admin.QueryRow(ctx,
 			`SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname = $1`, table,
@@ -228,10 +229,11 @@ func resetGovernanceObjects(ctx context.Context, pool *pgxpool.Pool) {
 			ingestion_logs, api_bridges, xic_idempotency, xic_contract_transitions, xic_validation_runs, xic_contract_gates,
 			xic_mapping_versions, xic_contract_versions, xic_connectors,
 			xic_conn_idempotency, xic_connection_requests, xic_authorization_sessions, xic_certifications,
+			xic_outbound_events, xic_outbound_attempts,
 			xic_quarantine_requests, xic_inbound_events, xic_inbound_exchanges, xic_handoff_targets,
 			xic_connection_checks, xic_connection_events, xic_credential_bindings, xic_connections CASCADE;
 		DROP FUNCTION IF EXISTS connector_append_only(), sync_checkpoints_guard(), external_profiles_guard(),
 			eventing_outbox_payload_immutable(), eventing_repair_log_immutable(), xic_is_platform(), xic_append_only(),
 			xic_connectors_guard(), xic_cv_guard(), xic_mv_guard(), xic_gate_guard(), xic_conn_guard(), xic_conn_insert_guard(),
-			xic_bind_guard(), xic_session_guard(), xic_req_guard(), xic_target_guard(), xic_ix_guard(), xic_qr_guard() CASCADE;`)
+			xic_bind_guard(), xic_session_guard(), xic_req_guard(), xic_target_guard(), xic_ix_guard(), xic_qr_guard(), xic_oa_guard() CASCADE;`)
 }
