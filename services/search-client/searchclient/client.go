@@ -38,7 +38,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"strings"
 
 	opensearch "github.com/opensearch-project/opensearch-go/v4"
 	"github.com/opensearch-project/opensearch-go/v4/opensearchapi"
@@ -163,20 +162,15 @@ func New(cfg Config) (Client, error) {
 
 // EnsureIndex creates index if it does not already exist.
 func (c *client) EnsureIndex(ctx context.Context, index IndexName) error {
-	resp, err := c.os.Indices.Exists(ctx, opensearchapi.IndicesExistsReq{
-		Indices: []string{string(index)},
-	})
+	// The status code on the response decides "exists" (indexExists), never a
+	// substring of the error text: an unrelated failure whose message merely
+	// contains "404" must not be read as "index missing" (audit finding S6-2).
+	exists, err := c.indexExists(ctx, string(index))
 	if err != nil {
-		if !strings.Contains(err.Error(), "404") {
-			return fmt.Errorf("searchclient: EnsureIndex exists check: %w", err)
-		}
-	} else {
-		if resp != nil && resp.Body != nil {
-			_ = resp.Body.Close()
-		}
-		if resp != nil && resp.StatusCode == 200 {
-			return nil // already exists
-		}
+		return fmt.Errorf("searchclient: EnsureIndex exists check: %w", err)
+	}
+	if exists {
+		return nil // already exists
 	}
 
 	// Create with basic mappings that enforce tenant_id and legal_entity_id
@@ -199,12 +193,19 @@ func (c *client) EnsureIndex(ctx context.Context, index IndexName) error {
 		Body:  bytes.NewReader(body),
 	})
 	if err != nil {
+		// A concurrent creator that won the check-then-create race is success,
+		// not failure — two replicas starting together must not fight over an
+		// index (README: safe to call on every startup).
+		if isAlreadyExists(err.Error()) {
+			return nil
+		}
 		return fmt.Errorf("searchclient: EnsureIndex create: %w", err)
 	}
-	defer createResp.Inspect().Response.Body.Close()
 
-	if createResp.Inspect().Response.IsError() {
-		raw, _ := io.ReadAll(createResp.Inspect().Response.Body)
+	if raw, isErr := drain(createResp.Inspect().Response); isErr {
+		if isAlreadyExists(raw) {
+			return nil
+		}
 		return fmt.Errorf("searchclient: EnsureIndex create failed [%d]: %s", createResp.Inspect().Response.StatusCode, raw)
 	}
 	return nil

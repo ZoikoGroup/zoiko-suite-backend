@@ -36,6 +36,7 @@ import (
 	"sort"
 	"strings"
 
+	opensearch "github.com/opensearch-project/opensearch-go/v4"
 	"github.com/opensearch-project/opensearch-go/v4/opensearchapi"
 )
 
@@ -456,6 +457,12 @@ func (c *client) DropIndex(ctx context.Context, physicalIndex string) error {
 	return nil
 }
 
+// isAlreadyExists recognises the engine's refusal to create an index that a
+// concurrent creator just made.
+func isAlreadyExists(s string) bool {
+	return strings.Contains(s, "resource_already_exists_exception")
+}
+
 func (c *client) indexExists(ctx context.Context, physicalIndex string) (bool, error) {
 	resp, err := c.os.Indices.Exists(ctx, opensearchapi.IndicesExistsReq{Indices: []string{physicalIndex}})
 
@@ -506,6 +513,16 @@ func (c *client) indexExists(ctx context.Context, physicalIndex string) (bool, e
 func isMissing(err error) bool {
 	if err == nil {
 		return false
+	}
+	// The structured status is exact; prefer it to any text. A StructError's
+	// status IS the HTTP status, so a non-404 can never be read as missing.
+	var sp *opensearch.StructError
+	if errors.As(err, &sp) && sp != nil {
+		return sp.Status == 404
+	}
+	var sv opensearch.StructError
+	if errors.As(err, &sv) {
+		return sv.Status == 404
 	}
 	s := strings.ToLower(err.Error())
 	return strings.Contains(s, "index_not_found") ||
