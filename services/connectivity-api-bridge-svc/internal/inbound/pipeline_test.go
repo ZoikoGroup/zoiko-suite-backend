@@ -258,6 +258,9 @@ func TestReceive_AuthenticationFailsClosedAndNeverLeaksSecrets(t *testing.T) {
 			if in.Content.Profiles[i].Name == "hmac-in" {
 				in.Content.Profiles[i].Spec = json.RawMessage(`{"mechanism":"OAUTH2_CLIENT_CREDENTIALS","audience":"x","scopes_required":["a"],"credential_class":"PROVIDER_CREDENTIAL"}`)
 			}
+			if in.Content.Profiles[i].Name == "cb" { // the callback follows the profile it names
+				in.Content.Profiles[i].Spec = json.RawMessage(`{"mechanism":"OAUTH2","replay_window_seconds":300,"dedupe_key_source":"body:/event_id","schema":"payment-cb@1","tenant_binding":"CONNECTION","transitions":{"PENDING":["SETTLED"]},"auth_profile":"hmac-in","reference_pointer":"/payment_id","status_pointer":"/status"}`)
+			}
 		}
 	})
 	_ = v2

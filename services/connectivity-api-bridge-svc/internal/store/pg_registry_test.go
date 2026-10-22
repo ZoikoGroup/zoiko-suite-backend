@@ -101,7 +101,7 @@ func (e *regEnv) attestAll(t *testing.T, v *registry.ContractVersion) {
 		who    registry.Actor
 		gate   string
 		detail json.RawMessage
-	}{{rSecurity, registry.GateSecurity, nil}, {rPrivacy, registry.GatePrivacy, nil}, {rQA, registry.GateNegativeTests, registrytest.Passed()},
+	}{{rSecurity, registry.GateSecurity, nil}, {rPrivacy, registry.GatePrivacy, nil}, {rQA, registry.GateNegativeTests, registrytest.PassedFor(v.Content)},
 		{rDomain, registry.GateDomainAcceptance, nil}, {rRelease, registry.GateRollback, nil}} {
 		if _, err := e.svc.Attest(platform(), registry.PlatformScopeID, a.who, v.ContractVersionID,
 			registry.AttestInput{Gate: a.gate, Outcome: registry.GatePassed, EvidenceRef: "REVIEW-" + a.gate, Detail: a.detail}); err != nil {

@@ -158,6 +158,24 @@ func TestValidationRules(t *testing.T) {
 		{"callback unknown schema", func(c *registry.Content) {
 			setProfile(c, "CALLBACK", "cb", `{"mechanism":"HMAC","signature_algorithm":"HMAC-SHA256","replay_window_seconds":300,"timestamp_header":"X-Timestamp","dedupe_key_source":"provider_event_id","schema":"nope@1","tenant_binding":"CONNECTION","transitions":{"PENDING":["SETTLED"]}}`)
 		}, ".schema"},
+		{"callback names no credential", func(c *registry.Content) {
+			setProfile(c, "CALLBACK", "cb", `{"mechanism":"HMAC","signature_algorithm":"HMAC-SHA256","replay_window_seconds":300,"timestamp_header":"X-Timestamp","dedupe_key_source":"body:/event_id","schema":"payment-cb@1","tenant_binding":"CONNECTION","transitions":{"PENDING":["SETTLED"]},"reference_pointer":"/payment_id","status_pointer":"/status"}`)
+		}, ".auth_profile"},
+		{"callback names an AUTH profile that does not exist", func(c *registry.Content) {
+			setProfile(c, "CALLBACK", "cb", `{"mechanism":"HMAC","signature_algorithm":"HMAC-SHA256","replay_window_seconds":300,"timestamp_header":"X-Timestamp","dedupe_key_source":"body:/event_id","schema":"payment-cb@1","tenant_binding":"CONNECTION","transitions":{"PENDING":["SETTLED"]},"auth_profile":"nope","reference_pointer":"/payment_id","status_pointer":"/status"}`)
+		}, ".auth_profile"},
+		{"callback verified by a credential of another mechanism", func(c *registry.Content) {
+			setProfile(c, "CALLBACK", "cb", `{"mechanism":"HMAC","signature_algorithm":"HMAC-SHA256","replay_window_seconds":300,"timestamp_header":"X-Timestamp","dedupe_key_source":"body:/event_id","schema":"payment-cb@1","tenant_binding":"CONNECTION","transitions":{"PENDING":["SETTLED"]},"auth_profile":"oauth","reference_pointer":"/payment_id","status_pointer":"/status"}`)
+		}, ".auth_profile"},
+		{"callback does not say where the provider reference is", func(c *registry.Content) {
+			setProfile(c, "CALLBACK", "cb", `{"mechanism":"HMAC","signature_algorithm":"HMAC-SHA256","replay_window_seconds":300,"timestamp_header":"X-Timestamp","dedupe_key_source":"body:/event_id","schema":"payment-cb@1","tenant_binding":"CONNECTION","transitions":{"PENDING":["SETTLED"]},"auth_profile":"hmac-in","status_pointer":"/status"}`)
+		}, ".reference_pointer"},
+		{"callback status pointer is not a pointer", func(c *registry.Content) {
+			setProfile(c, "CALLBACK", "cb", `{"mechanism":"HMAC","signature_algorithm":"HMAC-SHA256","replay_window_seconds":300,"timestamp_header":"X-Timestamp","dedupe_key_source":"body:/event_id","schema":"payment-cb@1","tenant_binding":"CONNECTION","transitions":{"PENDING":["SETTLED"]},"auth_profile":"hmac-in","reference_pointer":"/payment_id","status_pointer":"status"}`)
+		}, ".status_pointer"},
+		{"callback tenant claim pointer is not a pointer", func(c *registry.Content) {
+			setProfile(c, "CALLBACK", "cb", `{"mechanism":"HMAC","signature_algorithm":"HMAC-SHA256","replay_window_seconds":300,"timestamp_header":"X-Timestamp","dedupe_key_source":"body:/event_id","schema":"payment-cb@1","tenant_binding":"CONNECTION","transitions":{"PENDING":["SETTLED"]},"auth_profile":"hmac-in","reference_pointer":"/payment_id","status_pointer":"/status","tenant_pointer":"tenant"}`)
+		}, ".tenant_pointer"},
 
 		// certification
 		{"no certification profile", func(c *registry.Content) {

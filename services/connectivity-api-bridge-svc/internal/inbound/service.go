@@ -61,6 +61,8 @@ type Service struct {
 	EdgeSecret []byte
 	Cfg        Config
 	Clock      func() time.Time
+	// Versions reads a contract version by id: a replay evaluates a stored body under the version it arrived under.
+	Versions Contracts
 	// Handoff holds the delivery collaborators: egress policy, allowed regions, the HTTP client and workload identity.
 	Handoff HandoffDeps
 	// Observe receives a short reason for every refusal and outcome, for metrics. It must not block.
@@ -319,8 +321,19 @@ func dflt(v, d string) string {
 
 func (s *Service) authenticate(ctx context.Context, conn *xicconn.Connection, v *registry.ContractVersion, op *registry.Operation, req Request, now time.Time) (AuthResult, error) {
 	info, ok := v.UsedAuthProfiles()[op.AuthProfile]
-	b := conn.BindingFor(op.AuthProfile)
-	if !ok || b == nil || b.Status == xicconn.BindingRevoked || b.Status == xicconn.BindingExpired || (b.ExpiresAt != nil && !b.ExpiresAt.After(now)) {
+	if !ok {
+		return AuthResult{}, ErrAuthFailed
+	}
+	return Authenticate(ctx, s.Secrets, s.EdgeSecret, conn, info, req.Header, req.Body, now)
+}
+
+// Authenticate verifies a sender against the credential bound on the connection to the AUTH profile info describes:
+// the signature, the key, or the attested client certificate. It is the one verification routine of the service, used
+// by the inbound gateway and by provider callbacks alike. A revoked, expired or missing binding is an authentication
+// failure; a credential store that cannot answer is ErrSecretUnavailable (retry), never a pass.
+func Authenticate(ctx context.Context, secrets Secrets, edgeSecret []byte, conn *xicconn.Connection, info registry.AuthInfo, h http.Header, body []byte, now time.Time) (AuthResult, error) {
+	b := conn.BindingFor(info.Name)
+	if b == nil || b.Status == xicconn.BindingRevoked || b.Status == xicconn.BindingExpired || (b.ExpiresAt != nil && !b.ExpiresAt.After(now)) {
 		return AuthResult{}, ErrAuthFailed
 	}
 	refs := []KeyUse{{Ref: b.CurrentRef}}
@@ -336,7 +349,7 @@ func (s *Service) authenticate(ctx context.Context, conn *xicconn.Connection, v 
 	var labels []string
 	defer func() { zero(keys) }()
 	for _, k := range refs {
-		secret, err := s.Secrets.Secret(ctx, conn.TenantID, k.Ref)
+		secret, err := secrets.Secret(ctx, conn.TenantID, k.Ref)
 		switch {
 		case err == nil:
 			keys = append(keys, secret)
@@ -350,11 +363,11 @@ func (s *Service) authenticate(ctx context.Context, conn *xicconn.Connection, v 
 	}
 	switch info.Mechanism {
 	case "HMAC":
-		return VerifyHMAC(info, req.Header, req.Body, keys, labels, now)
+		return VerifyHMAC(info, h, body, keys, labels, now)
 	case "API_KEY_HEADER":
-		return VerifyAPIKey(info, req.Header, keys, labels)
+		return VerifyAPIKey(info, h, keys, labels)
 	default:
-		return VerifyMTLS(req.Header, s.EdgeSecret, keys, labels, now)
+		return VerifyMTLS(h, edgeSecret, keys, labels, now)
 	}
 }
 
@@ -472,13 +485,23 @@ func (s *Service) evaluate(ctx context.Context, conn *xicconn.Connection, v *reg
 	if sch == nil || sch.Direction != registry.Inbound || v.MappingFor(sourceRef) == nil {
 		return quarantine(ClassSchema, "SCHEMA_VERSION_UNSUPPORTED", integration.XICSchemaVersionUnsupported, http.StatusUnprocessableEntity, "the source schema version is not supported")
 	}
-	if sch.MediaType != "application/json" || contentType != "application/json" {
+	// a row of a file delivery (csv or ndjson) reaches the pipeline as a JSON object and is validated against its
+	// row schema; everything after this point is the same for a row and for a real-time delivery
+	isRow := sch.MediaType == "text/csv" || sch.MediaType == "application/x-ndjson"
+	if (!isRow && sch.MediaType != "application/json") || contentType != "application/json" {
 		return quarantine(ClassSchema, "MEDIA_TYPE_UNSUPPORTED", integration.XICSchemaVersionUnsupported, http.StatusUnsupportedMediaType, "the media type is not supported on this channel")
 	}
-	if int64(len(body)) > sch.MaxSizeBytes {
+	if !isRow && int64(len(body)) > sch.MaxSizeBytes {
 		return quarantine(ClassSchema, "SCHEMA_SIZE_EXCEEDED", "", http.StatusRequestEntityTooLarge, "the payload exceeds the schema's size limit")
 	}
-	compiled, err := adapter.CompileSchema(sch.ValidationProfile)
+	profile := sch.ValidationProfile
+	if info, ok := sch.CSVLayout(); ok {
+		profile = info.RowSchema
+		if len(profile) == 0 {
+			profile = []byte(`{"type":"object"}`)
+		}
+	}
+	compiled, err := adapter.CompileSchema(profile)
 	if err != nil {
 		return quarantine(ClassSchema, "SCHEMA_UNUSABLE", integration.XICContractVersionMismatch, http.StatusUnprocessableEntity, "the contract's schema cannot be applied")
 	}

@@ -26,7 +26,9 @@ type regHarness struct {
 	r      chi.Router
 	strict chi.Router
 	repo   *registry.MemRepo
-	authz  *fakeAuthz
+	// fileContract extends the contracts it creates with the CSV file operation.
+	fileContract bool
+	authz        *fakeAuthz
 }
 
 func newRegHarness(t *testing.T) *regHarness {
@@ -98,6 +100,9 @@ func (h *regHarness) connector(t *testing.T, id string) {
 func (h *regHarness) version(t *testing.T, connectorID, semver string) registry.ContractVersion {
 	t.Helper()
 	in := registrytest.Input(semver)
+	if h.fileContract {
+		in.Content = registrytest.WithFileOperation(in.Content)
+	}
 	w := h.call("POST", "/v1/connectors/"+connectorID+"/versions", platformTenant, "author", in)
 	if w.Code != http.StatusCreated {
 		t.Fatalf("create version: %d %s", w.Code, w.Body.String())
@@ -129,7 +134,7 @@ func (h *regHarness) publishedOverHTTP(t *testing.T, connectorID, semver string)
 	for _, a := range []struct {
 		who, gate string
 		detail    any
-	}{{"security-reviewer", "SECURITY", nil}, {"privacy-reviewer", "PRIVACY", nil}, {"qa-lead", "NEGATIVE_TESTS", json.RawMessage(registrytest.Passed())},
+	}{{"security-reviewer", "SECURITY", nil}, {"privacy-reviewer", "PRIVACY", nil}, {"qa-lead", "NEGATIVE_TESTS", json.RawMessage(registrytest.PassedFor(v.Content))},
 		{"domain-owner", "DOMAIN_ACCEPTANCE", nil}, {"release-manager", "ROLLBACK", nil}} {
 		body := map[string]any{"gate": a.gate, "outcome": "PASSED", "evidence_ref": "REVIEW-" + a.gate}
 		if a.detail != nil {

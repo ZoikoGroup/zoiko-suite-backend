@@ -547,3 +547,63 @@ func (r *InboundRepo) RecordSignal(ctx context.Context, tenant string, ev inboun
 		return r.enqueue(ctx, tx, tenant, ev)
 	})
 }
+
+// Summaries implements inbound.Repo.
+func (r *InboundRepo) Summaries(ctx context.Context, ids []string) (map[string]inbound.ExchangeSummary, error) {
+	out := map[string]inbound.ExchangeSummary{}
+	var valid []string
+	for _, id := range ids {
+		if _, err := uuid.Parse(id); err == nil {
+			valid = append(valid, id)
+		}
+	}
+	if len(valid) == 0 {
+		return out, nil
+	}
+	err := r.p.withTenant(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `SELECT exchange_id::text, state, domain_outcome, COALESCE(quarantine_class, ''), reason_code, canonical_hash
+			FROM xic_inbound_exchanges WHERE exchange_id = ANY($1::uuid[])`, valid)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id string
+			var s inbound.ExchangeSummary
+			if err := rows.Scan(&id, &s.State, &s.DomainOutcome, &s.QuarantineClass, &s.ReasonCode, &s.CanonicalHash); err != nil {
+				return err
+			}
+			out[id] = s
+		}
+		return rows.Err()
+	})
+	return out, err
+}
+
+// Held implements inbound.Repo.
+func (r *InboundRepo) Held(ctx context.Context, connectionID, operationID string, from, to time.Time, limit int) ([]string, error) {
+	if _, err := uuid.Parse(connectionID); err != nil {
+		return nil, nil
+	}
+	if limit < 1 || limit > 100000 {
+		limit = 1000
+	}
+	var out []string
+	err := r.p.withTenant(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `SELECT exchange_id::text FROM xic_inbound_exchanges WHERE connection_id=$1::uuid AND operation_id=$2 AND state='QUARANTINED'
+			AND received_at >= $3 AND received_at <= $4 ORDER BY received_at, exchange_id LIMIT $5`, connectionID, operationID, from, to, limit)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				return err
+			}
+			out = append(out, id)
+		}
+		return rows.Err()
+	})
+	return out, err
+}

@@ -234,6 +234,12 @@ type Repo interface {
 	MutateTarget(ctx context.Context, id string, fn func(t *Target) (*OutEvent, error)) (*Target, error)
 	// RecordSignal writes a security-signal event in its own transaction.
 	RecordSignal(ctx context.Context, tenant string, ev OutEvent) error
+
+	// Summaries reads what became of a set of exchanges (state and domain outcome), for the batch engine that
+	// reports on rows. An id that is not the caller's tenant's is simply absent.
+	Summaries(ctx context.Context, ids []string) (map[string]ExchangeSummary, error)
+	// Held lists the QUARANTINED exchanges of one connection and operation received within [from, to], oldest first.
+	Held(ctx context.Context, connectionID, operationID string, from, to time.Time, limit int) ([]string, error)
 }
 
 // DueRef names an exchange the handoff worker should drive.
@@ -257,4 +263,13 @@ var EventTypes = []string{
 	"integration.handoff-target.created", "integration.handoff-target.activated", "integration.handoff-target.suspended",
 	"integration.security.inbound-tenant-claim-mismatch", "integration.security.inbound-account-claim-mismatch",
 	"integration.security.handoff-egress-blocked", "integration.security.handoff-region-blocked",
+}
+
+// ExchangeSummary is the part of an exchange a batch needs to report on a row.
+type ExchangeSummary struct {
+	State           string
+	DomainOutcome   string
+	QuarantineClass string
+	ReasonCode      string
+	CanonicalHash   string
 }

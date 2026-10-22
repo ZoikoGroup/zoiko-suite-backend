@@ -70,6 +70,7 @@ const (
 	ProfileIdempotency   = "IDEMPOTENCY"
 	ProfileCallback      = "CALLBACK"
 	ProfileCertification = "CERTIFICATION"
+	ProfileBatch         = "BATCH"
 )
 
 // Publication gates (§6.3). SCHEMA_COMPAT is evidenced by the registry's own validation; the rest are attested
@@ -202,9 +203,12 @@ type Operation struct {
 	EndpointProfile    string `json:"endpoint_profile,omitempty"`
 	IdempotencyProfile string `json:"idempotency_profile,omitempty"`
 	CallbackProfile    string `json:"callback_profile,omitempty"`
-	RequestSchema      string `json:"request_schema,omitempty"`
-	ResponseSchema     string `json:"response_schema,omitempty"`
-	Irreversible       bool   `json:"irreversible,omitempty"`
+	// BatchProfile names the BATCH profile of a file operation (SFTP or OBJECT, inbound): the file naming, integrity,
+	// size and decompression limits a delivery must satisfy before any row is processed (I-21).
+	BatchProfile   string `json:"batch_profile,omitempty"`
+	RequestSchema  string `json:"request_schema,omitempty"`
+	ResponseSchema string `json:"response_schema,omitempty"`
+	Irreversible   bool   `json:"irreversible,omitempty"`
 	// ProviderIdempotency says whether the provider honours an idempotency key on this operation, and the
 	// header that carries it. OD-07: an irreversible operation cannot be published without it.
 	ProviderIdempotency ProviderIdempotency `json:"provider_idempotency"`

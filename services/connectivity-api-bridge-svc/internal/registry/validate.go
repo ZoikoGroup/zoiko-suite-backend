@@ -145,8 +145,32 @@ func ValidateContent(c *Content, l Limits) []Issue {
 			validateCallback(at, p.Spec, schemas, &is)
 		case ProfileCertification:
 			validateCertification(at, p.Spec, l, &is)
+		case ProfileBatch:
+			validateBatch(at, p.Spec, &is)
 		default:
 			add(at+".kind", "not a supported profile kind")
+		}
+	}
+
+	// a callback is authenticated with a credential of its own: the AUTH profile it names must exist and use the
+	// same mechanism as the callback (I-16)
+	for i := range c.Profiles {
+		p := &c.Profiles[i]
+		if p.Kind != ProfileCallback {
+			continue
+		}
+		var cb callbackSpec
+		if json.Unmarshal(p.Spec, &cb) != nil || cb.AuthProfile == "" {
+			continue
+		}
+		ap, ok := byKind[ProfileAuth][cb.AuthProfile]
+		if !ok {
+			add(fmt.Sprintf("profiles[%d].spec.auth_profile", i), "names no AUTH profile of this contract")
+			continue
+		}
+		var a authSpec
+		if json.Unmarshal(ap.Spec, &a) == nil && a.Mechanism != cb.Mechanism && !(cb.Mechanism == "OAUTH2" && strings.HasPrefix(a.Mechanism, "OAUTH2")) {
+			add(fmt.Sprintf("profiles[%d].spec.auth_profile", i), "the AUTH profile's mechanism must be the callback's mechanism")
 		}
 	}
 
@@ -248,11 +272,33 @@ func validateProfileDoc(at string, s *Schema, is *[]Issue) {
 		}
 	case "text/csv":
 		var p struct {
-			Format  string   `json:"format"`
-			Columns []string `json:"columns"`
+			Format    string          `json:"format"`
+			Columns   []string        `json:"columns"`
+			Delimiter string          `json:"delimiter,omitempty"`
+			Header    *bool           `json:"header,omitempty"`
+			RowSchema json.RawMessage `json:"row_schema,omitempty"`
 		}
 		if json.Unmarshal(s.ValidationProfile, &p) != nil || p.Format != "csv" || len(p.Columns) == 0 {
 			add(".validation_profile", "a csv schema declares format \"csv\" and its columns")
+			return
+		}
+		if len(p.Columns) > 512 {
+			add(".validation_profile.columns", "at most 512 columns")
+		}
+		seen := map[string]bool{}
+		for _, c := range p.Columns {
+			if !columnRE.MatchString(c) || seen[c] {
+				add(".validation_profile.columns", "column names are unique identifiers (letters, digits, underscore)")
+			}
+			seen[c] = true
+		}
+		if p.Delimiter != "" && (len(p.Delimiter) != 1 || strings.ContainsAny(p.Delimiter, "\"\r\n") || p.Delimiter[0] > 126 || p.Delimiter[0] < 9) {
+			add(".validation_profile.delimiter", "one printable character")
+		}
+		if len(p.RowSchema) > 0 {
+			if _, err := adapter.CompileSchema(p.RowSchema); err != nil {
+				add(".validation_profile.row_schema", "not a valid schema in the supported subset")
+			}
 		}
 	case "application/xml", "text/xml":
 		var p struct {
@@ -295,6 +341,7 @@ type authSpec struct {
 
 var authMechanisms = map[string]bool{
 	"OAUTH2_CLIENT_CREDENTIALS": true, "OAUTH2_AUTH_CODE": true, "MTLS": true, "HMAC": true, "API_KEY_HEADER": true,
+	"SFTP_PASSWORD": true, "SFTP_KEY": true,
 }
 var hmacAlgorithms = map[string]bool{"HMAC-SHA256": true, "HMAC-SHA384": true, "HMAC-SHA512": true}
 
@@ -358,7 +405,10 @@ type endpointSpec struct {
 	Redirects             string   `json:"redirects"`
 	ApprovedRedirectHosts []string `json:"approved_redirect_hosts,omitempty"`
 	PrivateEndpoint       bool     `json:"private_endpoint,omitempty"`
-	Failover              []struct {
+	// HostKeys are the SHA-256 fingerprints (SHA256:base64) of the provider's SSH host keys. An SFTP endpoint is
+	// never trusted on first use: a connection to a host whose key is not listed is refused.
+	HostKeys []string `json:"host_keys,omitempty"`
+	Failover []struct {
 		Host   string `json:"host"`
 		Region string `json:"region"`
 	} `json:"failover,omitempty"`
@@ -390,6 +440,18 @@ func validateEndpoint(at string, raw json.RawMessage, is *[]Issue) {
 	}
 	if len(e.Hosts) == 0 || len(e.Hosts) > 32 {
 		add(".hosts", "between 1 and 32 hosts")
+	}
+	if contains(e.Schemes, "sftp") {
+		if len(e.HostKeys) == 0 || len(e.HostKeys) > 16 {
+			add(".host_keys", "an sftp endpoint pins the provider's host keys (SHA256:<base64>); it is never trusted on first use")
+		}
+		for _, k := range e.HostKeys {
+			if !hostKeyRE.MatchString(k) {
+				add(".host_keys", "a host key fingerprint is SHA256: followed by the base64 digest")
+			}
+		}
+	} else if len(e.HostKeys) > 0 {
+		add(".host_keys", "only valid on an sftp endpoint")
 	}
 	for _, h := range e.Hosts {
 		if !validHost(h) {
@@ -487,6 +549,20 @@ type callbackSpec struct {
 	Schema              string              `json:"schema"`
 	TenantBinding       string              `json:"tenant_binding"`
 	Transitions         map[string][]string `json:"transitions"`
+
+	// AuthProfile names the AUTH profile of this contract whose bound credential verifies the callback: the key
+	// that authenticates a provider's callbacks is its own, never the one that authenticates our outbound calls.
+	AuthProfile string `json:"auth_profile,omitempty"`
+	// How a callback is tied to the ORIGINAL outbound attempt, and what it says. ReferencePointer and StatusPointer
+	// are JSON pointers into the (schema-validated) callback body; ClientRefPointer, when present, carries the
+	// domain request reference and lets a callback that beats the submit response still find its attempt (NP-24).
+	ReferencePointer string `json:"reference_pointer,omitempty"`
+	StatusPointer    string `json:"status_pointer,omitempty"`
+	ClientRefPointer string `json:"client_ref_pointer,omitempty"`
+	// Claims the provider makes about whose callback this is. They are corroboration, never authority: a
+	// disagreement with the authenticated connection is a security event (NP-26).
+	TenantPointer  string `json:"tenant_pointer,omitempty"`
+	AccountPointer string `json:"account_pointer,omitempty"`
 }
 
 // callbackGraph is the ONLY set of outbound-attempt transitions a callback may ever drive. A contract's map is
@@ -536,6 +612,22 @@ func validateCallback(at string, raw json.RawMessage, schemas map[string]*Schema
 	}
 	if c.TenantBinding != "CONNECTION" {
 		add(".tenant_binding", "CONNECTION: the callback's tenant is resolved from the connection, never the payload")
+	}
+	if c.Mechanism == "HMAC" || c.Mechanism == "MTLS" {
+		if strings.TrimSpace(c.AuthProfile) == "" || !nameRE.MatchString(c.AuthProfile) {
+			add(".auth_profile", "names the AUTH profile whose credential verifies this callback")
+		}
+	}
+	if !pointerRE.MatchString(c.ReferencePointer) {
+		add(".reference_pointer", "a JSON pointer to the provider's reference in the callback body")
+	}
+	if !pointerRE.MatchString(c.StatusPointer) {
+		add(".status_pointer", "a JSON pointer to the status in the callback body")
+	}
+	for name, ptr := range map[string]string{".client_ref_pointer": c.ClientRefPointer, ".tenant_pointer": c.TenantPointer, ".account_pointer": c.AccountPointer} {
+		if ptr != "" && !pointerRE.MatchString(ptr) {
+			add(name, "not a JSON pointer")
+		}
 	}
 	if len(c.Transitions) == 0 {
 		add(".transitions", "required")
@@ -617,7 +709,7 @@ func RequiredNegativeTests(c *Content) []string {
 				add("NP-02", "NP-22", "NP-23")
 			}
 		case o.Direction == Inbound && (o.Channel == "SFTP" || o.Channel == "OBJECT"):
-			add("NP-33", "NP-35", "NP-37")
+			add("NP-33", "NP-34", "NP-35", "NP-36", "NP-37", "NP-38")
 		case o.Direction == Outbound && o.Channel == "HTTPS":
 			add("NP-28", "NP-29")
 			if sideEffecting(&o) {
@@ -702,8 +794,18 @@ func validateOperation(at string, o *Operation, ops map[string]*Operation, schem
 			}
 		}
 	} else if o.EndpointProfile != "" {
-		add(".endpoint_profile", "an inbound operation has no destination")
+		// the one inbound operation with a destination is an SFTP PULL: the platform connects to the provider's pinned
+		// server and collects what it has published
+		if ep, ok := byKind[ProfileEndpoint][o.EndpointProfile]; o.Channel != "SFTP" || !ok {
+			add(".endpoint_profile", "an inbound operation has no destination (only an SFTP pull names an ENDPOINT profile)")
+		} else {
+			var e endpointSpec
+			if json.Unmarshal(ep.Spec, &e) == nil && !contains(e.Schemes, "sftp") {
+				add(".endpoint_profile", "an SFTP pull needs an endpoint profile that permits sftp")
+			}
+		}
 	}
+	validateBatchOperation(at, o, schemas, byKind, is)
 	// idempotency and callbacks
 	if o.IdempotencyProfile != "" {
 		if _, ok := byKind[ProfileIdempotency][o.IdempotencyProfile]; !ok {

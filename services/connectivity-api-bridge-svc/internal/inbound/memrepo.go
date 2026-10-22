@@ -298,3 +298,44 @@ func (m *MemRepo) Types() []string {
 
 var _ Repo = (*MemRepo)(nil)
 var _ = json.Marshal
+
+// Summaries implements Repo.
+func (m *MemRepo) Summaries(ctx context.Context, ids []string) (map[string]ExchangeSummary, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := map[string]ExchangeSummary{}
+	for _, id := range ids {
+		if e, ok := m.owned(ctx, id); ok {
+			out[id] = ExchangeSummary{State: e.State, DomainOutcome: e.DomainOutcome, QuarantineClass: e.QuarantineClass, ReasonCode: e.ReasonCode, CanonicalHash: e.CanonicalHash}
+		}
+	}
+	return out, nil
+}
+
+// Held implements Repo.
+func (m *MemRepo) Held(ctx context.Context, connectionID, operationID string, from, to time.Time, limit int) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var hit []*Exchange
+	for _, e := range m.ex {
+		if e.TenantID != middleware.GetTenantID(ctx) || e.ConnectionID != connectionID || e.OperationID != operationID || e.State != StateQuarantined ||
+			e.ReceivedAt.Before(from) || e.ReceivedAt.After(to) {
+			continue
+		}
+		hit = append(hit, e)
+	}
+	sort.Slice(hit, func(i, j int) bool {
+		if !hit[i].ReceivedAt.Equal(hit[j].ReceivedAt) {
+			return hit[i].ReceivedAt.Before(hit[j].ReceivedAt)
+		}
+		return hit[i].ExchangeID < hit[j].ExchangeID
+	})
+	var out []string
+	for _, e := range hit {
+		out = append(out, e.ExchangeID)
+		if limit > 0 && len(out) >= limit {
+			break
+		}
+	}
+	return out, nil
+}

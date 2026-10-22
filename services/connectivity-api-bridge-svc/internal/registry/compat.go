@@ -108,7 +108,7 @@ func Classify(baseline *ContractVersion, candidate *ContractVersion) *CompatRepo
 			default:
 				var a, b callbackSpec
 				if json.Unmarshal(oc.Spec, &a) == nil && json.Unmarshal(nc.Spec, &b) == nil &&
-					(a.Mechanism != b.Mechanism || a.SignatureAlgorithm != b.SignatureAlgorithm) {
+					(a.Mechanism != b.Mechanism || a.SignatureAlgorithm != b.SignatureAlgorithm || a.AuthProfile != b.AuthProfile) {
 					// a new signing algorithm is a new version, never a silent fallback (NP-49)
 					add(ClassMaterialSecurity, "callback_signing_changed", path+".callback_profile")
 				}
@@ -119,7 +119,7 @@ func Classify(baseline *ContractVersion, candidate *ContractVersion) *CompatRepo
 			var a, b endpointSpec
 			if json.Unmarshal(oe.Spec, &a) == nil && json.Unmarshal(ne.Spec, &b) == nil &&
 				(!sameSet(a.Hosts, b.Hosts) || !sameSet(a.Regions, b.Regions) || !sameSet(a.Schemes, b.Schemes) || !sameInts(a.Ports, b.Ports) ||
-					!sameSet(a.ApprovedRedirectHosts, b.ApprovedRedirectHosts) || a.PrivateEndpoint != b.PrivateEndpoint || a.Redirects != b.Redirects) {
+					!sameSet(a.ApprovedRedirectHosts, b.ApprovedRedirectHosts) || !sameSet(a.HostKeys, b.HostKeys) || a.PrivateEndpoint != b.PrivateEndpoint || a.Redirects != b.Redirects) {
 				add(ClassMaterialEgress, "endpoint_changed", path+".endpoint_profile")
 			}
 		}

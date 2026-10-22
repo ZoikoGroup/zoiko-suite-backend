@@ -126,6 +126,9 @@ func TestCompatibilityClassification(t *testing.T) {
 		{"change callback signing algorithm (NP-49)", func(c *registry.Content) {
 			setProfile(c, "CALLBACK", "cb", `{"mechanism":"HMAC","signature_algorithm":"HMAC-SHA512","replay_window_seconds":300,"timestamp_header":"X-Timestamp","dedupe_key_source":"body:/event_id","schema":"payment-cb@1","tenant_binding":"CONNECTION","transitions":{"PENDING":["SETTLED"]}}`)
 		}, registry.ClassMaterialSecurity, "callback_signing_changed"},
+		{"change the credential that verifies callbacks (NP-49)", func(c *registry.Content) {
+			setProfile(c, "CALLBACK", "cb", `{"mechanism":"HMAC","signature_algorithm":"HMAC-SHA256","replay_window_seconds":300,"timestamp_header":"X-Timestamp","dedupe_key_source":"body:/event_id","schema":"payment-cb@1","tenant_binding":"CONNECTION","transitions":{"SUBMITTING":["PENDING","SETTLED","FAILED"],"PENDING":["SETTLED","FAILED"],"UNKNOWN":["SETTLED","FAILED","PENDING"]},"auth_profile":"another-key","reference_pointer":"/payment_id","status_pointer":"/status","client_ref_pointer":"/client_ref"}`)
+		}, registry.ClassMaterialSecurity, "callback_signing_changed"},
 		{"change mapping semantics", func(c *registry.Content) {
 			c.Mappings[0].Spec = json.RawMessage(strings.Replace(registrytest.MappingSpec, `"scale":2`, `"scale":4`, 1))
 		}, registry.ClassMaterialBusiness, "mapping_semantics_changed"},

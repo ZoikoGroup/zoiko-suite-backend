@@ -30,6 +30,10 @@ type EndpointInfo struct {
 	Regions []string
 	Schemes []string
 	Ports   []int
+
+	// Redirects is NONE, SAME_HOST or APPROVED_HOSTS: a redirect is never implicit.
+	Redirects             string
+	ApprovedRedirectHosts []string
 }
 
 // CertInfo is the CERTIFICATION profile of a contract.
@@ -52,8 +56,13 @@ func (v *ContractVersion) Operation(id string) *Operation {
 // UsedAuthProfiles returns the AUTH profiles the contract's operations actually reference, by name.
 func (v *ContractVersion) UsedAuthProfiles() map[string]AuthInfo {
 	used := map[string]bool{}
-	for _, o := range v.Content.Operations {
+	for i := range v.Content.Operations {
+		o := &v.Content.Operations[i]
 		used[o.AuthProfile] = true
+		// the credential that verifies an operation's callbacks is bound on the connection like any other
+		if cb := v.CallbackFor(o); cb != nil && cb.AuthProfile != "" {
+			used[cb.AuthProfile] = true
+		}
 	}
 	out := map[string]AuthInfo{}
 	for _, p := range v.Content.Profiles {
@@ -92,7 +101,8 @@ func (v *ContractVersion) UsedEndpointProfiles() map[string]EndpointInfo {
 		if json.Unmarshal(p.Spec, &e) != nil {
 			continue
 		}
-		out[p.Name] = EndpointInfo{Name: p.Name, Hosts: e.Hosts, Regions: e.Regions, Schemes: e.Schemes, Ports: e.Ports}
+		out[p.Name] = EndpointInfo{Name: p.Name, Hosts: e.Hosts, Regions: e.Regions, Schemes: e.Schemes, Ports: e.Ports,
+			Redirects: e.Redirects, ApprovedRedirectHosts: e.ApprovedRedirectHosts}
 	}
 	return out
 }
@@ -153,4 +163,42 @@ type IdempotencyInfo struct {
 	Scope         string
 	RetentionDays int
 	OnBodyChange  string
+}
+
+// CallbackInfo is the CALLBACK profile of an outbound operation, decoded: how a provider's callback is
+// authenticated, deduplicated, tied to the original attempt and limited in the transitions it may drive.
+type CallbackInfo struct {
+	Name                string
+	Mechanism           string
+	SignatureAlgorithm  string
+	ReplayWindowSeconds int
+	TimestampHeader     string
+	DedupeKeySource     string
+	Schema              string
+	AuthProfile         string
+	ReferencePointer    string
+	StatusPointer       string
+	ClientRefPointer    string
+	TenantPointer       string
+	AccountPointer      string
+	Transitions         map[string][]string
+}
+
+// CallbackFor returns the callback profile of an outbound operation, or nil when it declares none.
+func (v *ContractVersion) CallbackFor(o *Operation) *CallbackInfo {
+	if o == nil || o.CallbackProfile == "" {
+		return nil
+	}
+	p := profileOf(&v.Content, ProfileCallback, o.CallbackProfile)
+	if p == nil {
+		return nil
+	}
+	var s callbackSpec
+	if json.Unmarshal(p.Spec, &s) != nil {
+		return nil
+	}
+	return &CallbackInfo{Name: p.Name, Mechanism: s.Mechanism, SignatureAlgorithm: s.SignatureAlgorithm, ReplayWindowSeconds: s.ReplayWindowSeconds,
+		TimestampHeader: s.TimestampHeader, DedupeKeySource: s.DedupeKeySource, Schema: s.Schema, AuthProfile: s.AuthProfile,
+		ReferencePointer: s.ReferencePointer, StatusPointer: s.StatusPointer, ClientRefPointer: s.ClientRefPointer, TenantPointer: s.TenantPointer,
+		AccountPointer: s.AccountPointer, Transitions: s.Transitions}
 }

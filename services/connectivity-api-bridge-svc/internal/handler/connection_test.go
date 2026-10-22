@@ -49,7 +49,10 @@ type connHarness struct {
 	v       registry.ContractVersion
 }
 
-func newConnHarness(t *testing.T) *connHarness {
+func newConnHarness(t *testing.T) *connHarness { return newConnHarnessWith(t, false) }
+
+// newConnHarnessWith can publish the reference contract extended with a CSV file operation (XIC-05).
+func newConnHarnessWith(t *testing.T, file bool) *connHarness {
 	t.Helper()
 	rh := newRegHarness(t)
 	conns := xicconn.NewMemRepo()
@@ -67,6 +70,7 @@ func newConnHarness(t *testing.T) *connHarness {
 	strict.Use(svcenvelope.MiddlewareWithMode(svcenvelope.ServicePolicy(), svcenvelope.ModeStrict, nil))
 	RegisterConnectionRoutes(strict, ch)
 	h := &connHarness{regHarness: rh, cr: r, cstrict: strict, conns: conns, svc: svc}
+	rh.fileContract = file
 	rh.connector(t, "bank-x")
 	h.v = rh.publishedOverHTTP(t, "bank-x", "1.0.0")
 	return h
