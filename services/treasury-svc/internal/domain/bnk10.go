@@ -112,6 +112,19 @@ const (
 	FXExposureSuperseded = "SUPERSEDED"
 )
 
+// FXExposureStale is BNK-10's staleness evaluated at now rather than
+// frozen at calculation, mirroring CashPositionStale: true when the
+// calculation itself used a stale rate, or when the recorded rate it used
+// has since aged past FXRateStalenessThreshold. A same-currency snapshot
+// (rateVersion empty: the identity rate, no recorded rate behind it) never
+// goes stale on rate age.
+func FXExposureStale(staleAtCalculation bool, rateVersion string, rateAsOf, now time.Time) bool {
+	if staleAtCalculation {
+		return true
+	}
+	return rateVersion != "" && now.Sub(rateAsOf) > FXRateStalenessThreshold
+}
+
 func CanPublishFXExposure(status string) bool { return status == FXExposureCalculated }
 func CanSupersedeFXExposure(status string) bool {
 	return status == FXExposureCalculated || status == FXExposurePublished
@@ -192,4 +205,8 @@ var (
 	// ErrCashPositionStaleCannotPublish — a snapshot calculated from a
 	// stale FX rate cannot be marked authoritative.
 	ErrFXExposureStaleCannotPublish = errorString("fx exposure snapshot was calculated from a stale rate and cannot be published as current")
+	// ErrFXExposureScopeMismatch mirrors ErrCashPositionScopeMismatch: a
+	// snapshot is superseded only by a different, live snapshot for the
+	// same legal entity and currency pair.
+	ErrFXExposureScopeMismatch = errorString("an fx exposure snapshot can only be superseded by another live snapshot for the same legal entity and currency pair")
 )

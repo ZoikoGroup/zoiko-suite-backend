@@ -51,6 +51,7 @@ type Store interface {
 	RecordFXRate(ctx context.Context, p domain.RecordFXRateParams) (*domain.FXRate, error)
 	GetLatestFXRate(ctx context.Context, tenantID, currencyPair string) (*domain.FXRate, error)
 	CreateFXExposureSnapshot(ctx context.Context, p domain.CalculateFXExposureParams, calc domain.FXExposureCalculation) (*domain.FXExposureSnapshot, error)
+	RefreshFXExposureSnapshot(ctx context.Context, p domain.RefreshFXExposureParams, calc domain.FXExposureCalculation) (*domain.FXExposureSnapshot, error)
 	GetFXExposureSnapshot(ctx context.Context, tenantID, snapshotID string) (*domain.FXExposureSnapshot, error)
 	GetLatestFXExposure(ctx context.Context, tenantID, legalEntityID, exposureCurrency, functionalCurrency string) (*domain.FXExposureSnapshot, error)
 	GetFXExposureAsOf(ctx context.Context, tenantID, legalEntityID, exposureCurrency, functionalCurrency string, asOf time.Time) (*domain.FXExposureSnapshot, error)

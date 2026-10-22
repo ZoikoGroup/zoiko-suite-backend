@@ -22,6 +22,13 @@ import (
 
 const actionRecordFXRate = "TREASURY_FX_RATE_RECORD"
 
+// platformScope is authorization-svc's sentinel for a platform-level
+// decision (validation.go's PlatformScopeSentinel), the same literal
+// financial-control-svc and governance-decision-log-svc send. An empty
+// legal_entity_id is a 400 there, which the authz client reports as the
+// authorization plane being unavailable.
+const platformScope = "PLATFORM"
+
 func fxCurrencyPair(exposureCurrency, functionalCurrency string) string {
 	return exposureCurrency + "/" + functionalCurrency
 }
@@ -57,10 +64,12 @@ func (h *Handler) RecordFXRate(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	// Platform-level action (no legal_entity_id): an FX rate isn't scoped
-	// to one legal entity, it's a market observation shared across every
-	// entity that reports in that currency pair.
-	if err := h.authz.CheckAllowed(r.Context(), principalID, "", actionRecordFXRate); err != nil {
+	// Platform-level action: an FX rate isn't scoped to one legal entity,
+	// it's a market observation shared across every entity that reports in
+	// that currency pair. Before, this sent an empty legal_entity_id, which
+	// authorization-svc refuses with a 400, so every RecordFXRate failed as
+	// 503 authz_unavailable.
+	if err := h.authz.CheckAllowed(r.Context(), principalID, platformScope, actionRecordFXRate); err != nil {
 		h.writeAuthzErr(w, err)
 		return
 	}
@@ -214,22 +223,18 @@ func (h *Handler) RunFXScenario(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	currentRate := 1.0
-	var currentRateAsOf time.Time
-	var currentRateIsStale bool
-	if req.ExposureCurrency != req.FunctionalCurrency {
-		fxRate, err := h.store.GetLatestFXRate(r.Context(), tenantID, fxCurrencyPair(req.ExposureCurrency, req.FunctionalCurrency))
-		if err != nil && !errors.Is(err, domain.ErrFXRateNotFound) {
-			writeError(w, http.StatusServiceUnavailable, "store_error", err.Error())
-			return
-		}
-		if fxRate != nil {
-			currentRate = fxRate.Rate
-			currentRateAsOf = fxRate.EffectiveAt
-			currentRateIsStale = time.Since(currentRateAsOf) > domain.FXRateStalenessThreshold
-		}
-	} else {
-		currentRateAsOf = time.Now().UTC()
+	// The "current" side of the comparison needs a recorded rate, exactly
+	// as GetFXExposure does. Before, a missing rate silently became 1.0 with
+	// a zero as-of time and no staleness flag, so the delta compared the
+	// hypothetical rate against parity and presented that as current.
+	currentRate, currentRateAsOf, _, currentRateIsStale, notRecorded, err := h.resolveExposureRate(r, tenantID, req.ExposureCurrency, req.FunctionalCurrency)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "store_error", err.Error())
+		return
+	}
+	if notRecorded {
+		writeError(w, http.StatusUnprocessableEntity, "fx_rate_not_recorded", string(domain.ErrFXRateNotFound))
+		return
 	}
 
 	current, err := h.buildExposure(r, tenantID, req.LegalEntityID, req.ExposureCurrency, req.FunctionalCurrency, currentRate, currentRateAsOf, currentRateIsStale)
@@ -259,6 +264,8 @@ func (h *Handler) writeFXExposureErr(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusConflict, "invalid_transition", err.Error())
 	case errors.Is(err, domain.ErrFXExposureStaleCannotPublish):
 		writeError(w, http.StatusConflict, "stale_cannot_publish", err.Error())
+	case errors.Is(err, domain.ErrFXExposureScopeMismatch):
+		writeError(w, http.StatusConflict, "snapshot_scope_mismatch", err.Error())
 	default:
 		h.log.Error("fx exposure snapshot operation failed", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_error", err.Error())
@@ -403,23 +410,20 @@ func (h *Handler) RefreshFXExposure(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "upstream_dependency_unavailable", "cannot compose FX exposure")
 		return
 	}
-	snap, err := h.store.CreateFXExposureSnapshot(r.Context(), domain.CalculateFXExposureParams{
-		TenantID: tenantID, LegalEntityID: req.LegalEntityID, ExposureCurrency: req.ExposureCurrency, FunctionalCurrency: req.FunctionalCurrency,
-		NettingScope: "SINGLE_ENTITY:" + req.LegalEntityID, CorrelationID: req.CorrelationID, ActorPrincipalID: principalID,
+	// One transaction, and the prior snapshot must be for this same legal
+	// entity and currency pair — see RefreshCashPosition.
+	snap, err := h.store.RefreshFXExposureSnapshot(r.Context(), domain.RefreshFXExposureParams{
+		CalculateFXExposureParams: domain.CalculateFXExposureParams{
+			TenantID: tenantID, LegalEntityID: req.LegalEntityID, ExposureCurrency: req.ExposureCurrency, FunctionalCurrency: req.FunctionalCurrency,
+			NettingScope: "SINGLE_ENTITY:" + req.LegalEntityID, CorrelationID: req.CorrelationID, ActorPrincipalID: principalID,
+		},
+		PriorSnapshotID: req.PriorSnapshotID,
 	}, *calc)
 	if err != nil {
 		h.writeFXExposureErr(w, err)
 		return
 	}
 	h.publishFXExposureCalculated(r.Context(), r.Header.Get("X-Correlation-ID"), principalID, *snap)
-	if req.PriorSnapshotID != "" {
-		if _, err := h.store.SupersedeFXExposureSnapshot(r.Context(), domain.SupersedeFXExposureParams{
-			TenantID: tenantID, SnapshotID: req.PriorSnapshotID, NewSnapshotID: snap.SnapshotID,
-		}); err != nil {
-			h.writeFXExposureErr(w, err)
-			return
-		}
-	}
 	writeJSON(w, http.StatusCreated, snap)
 }
 
@@ -648,12 +652,24 @@ func (h *Handler) GetMaturityProfile(w http.ResponseWriter, r *http.Request) {
 // fields the snapshot already records (rate version/as-of, netting
 // scope, calculation actor, correlation) — see the doc's own "Evidence &
 // lineage" build requirement for BNK-10.
+//
+// Like every other FX exposure read it needs a principal with view
+// permission in the snapshot's legal entity; before, a tenant header was
+// enough.
 func (h *Handler) GetSourceLineage(w http.ResponseWriter, r *http.Request) {
 	tenantID := svcmiddleware.TenantFromContext(r.Context())
 	snapshotID := chi.URLParam(r, "snapshotID")
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
 	snap, err := h.store.GetFXExposureSnapshot(r.Context(), tenantID, snapshotID)
 	if err != nil {
 		h.writeFXExposureErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, snap.LegalEntityID, actionViewPositions); err != nil {
+		h.writeAuthzErr(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{

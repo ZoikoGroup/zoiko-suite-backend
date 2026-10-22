@@ -667,6 +667,29 @@ func (m *mockStore) CreateFXExposureSnapshot(ctx context.Context, p domain.Calcu
 	return snap, nil
 }
 
+func (m *mockStore) RefreshFXExposureSnapshot(ctx context.Context, p domain.RefreshFXExposureParams, calc domain.FXExposureCalculation) (*domain.FXExposureSnapshot, error) {
+	if p.PriorSnapshotID != "" {
+		prior, ok := m.fxExposures[p.PriorSnapshotID]
+		if !ok {
+			return nil, domain.ErrFXExposureSnapshotNotFound
+		}
+		if !domain.CanSupersedeFXExposure(prior.Status) {
+			return nil, domain.ErrInvalidFXExposureTransition
+		}
+		if prior.LegalEntityID != p.LegalEntityID || prior.ExposureCurrency != p.ExposureCurrency || prior.FunctionalCurrency != p.FunctionalCurrency {
+			return nil, domain.ErrFXExposureScopeMismatch
+		}
+	}
+	snap, err := m.CreateFXExposureSnapshot(ctx, p.CalculateFXExposureParams, calc)
+	if err != nil || p.PriorSnapshotID == "" {
+		return snap, err
+	}
+	prior := m.fxExposures[p.PriorSnapshotID]
+	prior.Status = domain.FXExposureSuperseded
+	prior.SupersededBy = &snap.SnapshotID
+	return snap, nil
+}
+
 func (m *mockStore) GetFXExposureSnapshot(ctx context.Context, tenantID, snapshotID string) (*domain.FXExposureSnapshot, error) {
 	snap, ok := m.fxExposures[snapshotID]
 	if !ok {
