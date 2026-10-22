@@ -98,6 +98,45 @@ type Config struct {
 	XICOutboundSubmitLeaseSecs      int
 	XICOutboundResolveBackoffSecs   int
 	XICOutboundMaxUnknownAgeHours   int // OD-13
+
+	// XIC-04 provider callbacks. OFF by default: the endpoint is reachable by external systems.
+	XICCallbacksEnabled       bool
+	XICCallbackMaxBodyBytes   int64
+	XICCallbackConnRatePerMin int
+	XICCallbackIPRatePerMin   int
+	XICCallbackInvalidPerMin  int
+
+	// XIC-05 batch and file exchange. OFF by default: the HTTPS object channel is reachable by external systems.
+	XICBatchEnabled              bool
+	XICBatchMaxRequestBytes      int64
+	XICBatchMaxFileBytes         int64
+	XICBatchMaxDecompressedBytes int64
+	XICBatchContentRetentionHrs  int
+	XICBatchProcessingGraceMins  int
+	XICBatchContentDenyClasses   []string
+	XICBatchConnRatePerMin       int
+	XICBatchIPRatePerMin         int
+	XICBatchWorkerIntervalSecs   int // 0 turns the batch worker off
+	XICBatchRowChunk             int
+	XICReplayMaxItems            int
+	XICReplayApprovalRows        int
+	XICReplayWindowMaxHours      int
+	XICReplayRegulatedClasses    []string
+	XICBatchClamAVAddr           string // a malware scanner is required unless built-in checks only are accepted
+	XICBatchAllowBuiltinScanOnly bool
+	XICBatchScanTimeoutSecs      int
+	XICSFTPPollIntervalSecs      int // 0 turns the SFTP pull poller off
+	XICSFTPInbox                 string
+	XICSFTPDone                  string
+	XICSFTPDefaultPort           int
+
+	// XIC-05 reconciliation and signals.
+	XICReconWorkerIntervalSecs int // 0 turns the reconciliation worker and scheduler off
+	XICReconScheduleEverySecs  int
+	XICReconMaxPeriodHours     int
+	XICReconPoliciesJSON       string // optional per-family overrides (OD-12)
+	XICMetricsToken            string // /metrics is mounted only when a token is configured
+	XICMetricsWindowHours      int
 }
 
 func Load() *Config {
@@ -157,6 +196,39 @@ func Load() *Config {
 		XICOutboundSubmitLeaseSecs:      intEnv("XIC_OUTBOUND_SUBMIT_LEASE_SECONDS", 120),
 		XICOutboundResolveBackoffSecs:   intEnv("XIC_OUTBOUND_RESOLVE_BACKOFF_SECONDS", 30),
 		XICOutboundMaxUnknownAgeHours:   intEnv("XIC_OUTBOUND_MAX_UNKNOWN_AGE_HOURS", 24),
+		XICCallbacksEnabled:             getEnv("XIC_CALLBACKS_ENABLED", "false") == "true",
+		XICCallbackMaxBodyBytes:         int64Env("XIC_CALLBACK_MAX_BODY_BYTES", 1<<20),
+		XICCallbackConnRatePerMin:       nonNegInt("XIC_CALLBACK_CONN_RATE_PER_MIN", 600),
+		XICCallbackIPRatePerMin:         nonNegInt("XIC_CALLBACK_IP_RATE_PER_MIN", 1200),
+		XICCallbackInvalidPerMin:        nonNegInt("XIC_CALLBACK_INVALID_EVIDENCE_PER_MIN", 30),
+		XICBatchEnabled:                 getEnv("XIC_BATCH_ENABLED", "false") == "true",
+		XICBatchMaxRequestBytes:         int64Env("XIC_BATCH_MAX_REQUEST_BYTES", 64<<20),
+		XICBatchMaxFileBytes:            int64Env("XIC_BATCH_MAX_FILE_BYTES", 25<<20),
+		XICBatchMaxDecompressedBytes:    int64Env("XIC_BATCH_MAX_DECOMPRESSED_BYTES", 256<<20),
+		XICBatchContentRetentionHrs:     nonNegInt("XIC_BATCH_CONTENT_RETENTION_HOURS", 168),
+		XICBatchProcessingGraceMins:     nonNegInt("XIC_BATCH_PROCESSING_GRACE_MINUTES", 60),
+		XICBatchContentDenyClasses:      upperCSVDefault("XIC_BATCH_CONTENT_DENY_CLASSES", "PERSONAL,RESTRICTED"),
+		XICBatchConnRatePerMin:          nonNegInt("XIC_BATCH_CONN_RATE_PER_MIN", 60),
+		XICBatchIPRatePerMin:            nonNegInt("XIC_BATCH_IP_RATE_PER_MIN", 120),
+		XICBatchWorkerIntervalSecs:      nonNegInt("XIC_BATCH_WORKER_INTERVAL_SECS", 5),
+		XICBatchRowChunk:                nonNegInt("XIC_BATCH_ROW_CHUNK", 100),
+		XICReplayMaxItems:               nonNegInt("XIC_REPLAY_MAX_ITEMS", 50000),
+		XICReplayApprovalRows:           nonNegInt("XIC_REPLAY_APPROVAL_ROWS", 100),
+		XICReplayWindowMaxHours:         nonNegInt("XIC_REPLAY_WINDOW_MAX_HOURS", 168),
+		XICReplayRegulatedClasses:       upperCSVDefault("XIC_REPLAY_REGULATED_CLASSES", "REGULATED,PAYROLL,TAX"),
+		XICBatchClamAVAddr:              os.Getenv("XIC_BATCH_CLAMAV_ADDR"),
+		XICBatchAllowBuiltinScanOnly:    getEnv("XIC_BATCH_ALLOW_BUILTIN_SCAN_ONLY", "false") == "true",
+		XICBatchScanTimeoutSecs:         nonNegInt("XIC_BATCH_SCAN_TIMEOUT_SECS", 30),
+		XICSFTPPollIntervalSecs:         nonNegInt("XIC_SFTP_POLL_INTERVAL_SECS", 60),
+		XICSFTPInbox:                    getEnv("XIC_SFTP_INBOX", "inbox"),
+		XICSFTPDone:                     getEnv("XIC_SFTP_DONE", "processed"),
+		XICSFTPDefaultPort:              nonNegInt("XIC_SFTP_DEFAULT_PORT", 22),
+		XICReconWorkerIntervalSecs:      nonNegInt("XIC_RECON_WORKER_INTERVAL_SECS", 10),
+		XICReconScheduleEverySecs:       nonNegInt("XIC_RECON_SCHEDULE_EVERY_SECS", 60),
+		XICReconMaxPeriodHours:          nonNegInt("XIC_RECON_MAX_PERIOD_HOURS", 744),
+		XICReconPoliciesJSON:            os.Getenv("XIC_RECON_POLICIES_JSON"),
+		XICMetricsToken:                 os.Getenv("XIC_METRICS_TOKEN"),
+		XICMetricsWindowHours:           nonNegInt("XIC_METRICS_WINDOW_HOURS", 24),
 	}
 }
 
@@ -236,4 +308,14 @@ func upperCSV(v string) []string {
 		}
 	}
 	return out
+}
+
+// upperCSVDefault reads a comma list in upper case, or the default when the variable is unset. An empty value set on
+// purpose means an empty list.
+func upperCSVDefault(key, def string) []string {
+	v, ok := os.LookupEnv(key)
+	if !ok {
+		v = def
+	}
+	return upperCSV(v)
 }

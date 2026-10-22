@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"os"
 	"os/signal"
@@ -15,6 +16,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/connectivity-api-bridge-svc/internal/authz"
+	"zoiko.io/connectivity-api-bridge-svc/internal/batch"
 	"zoiko.io/connectivity-api-bridge-svc/internal/config"
 	"zoiko.io/connectivity-api-bridge-svc/internal/connector"
 	svcenvelope "zoiko.io/connectivity-api-bridge-svc/internal/envelope"
@@ -24,7 +26,10 @@ import (
 	"zoiko.io/connectivity-api-bridge-svc/internal/middleware"
 	"zoiko.io/connectivity-api-bridge-svc/internal/mtls"
 	"zoiko.io/connectivity-api-bridge-svc/internal/outbound"
+	"zoiko.io/connectivity-api-bridge-svc/internal/recon"
 	"zoiko.io/connectivity-api-bridge-svc/internal/registry"
+	"zoiko.io/connectivity-api-bridge-svc/internal/sftppull"
+	"zoiko.io/connectivity-api-bridge-svc/internal/signals"
 	"zoiko.io/connectivity-api-bridge-svc/internal/store"
 	"zoiko.io/connectivity-api-bridge-svc/internal/telemetry"
 	"zoiko.io/connectivity-api-bridge-svc/internal/vault"
@@ -32,6 +37,7 @@ import (
 	"zoiko.io/eventing/egress"
 	"zoiko.io/eventing/kafkaout"
 	"zoiko.io/eventing/outbox"
+	"zoiko.io/eventing/scan"
 )
 
 func main() {
@@ -88,6 +94,19 @@ func main() {
 	if err := dbpool.QueryRow(ctx, `SELECT to_regclass('public.xic_inbound_exchanges')::text`).Scan(&inboundTable); err != nil || inboundTable == nil {
 		logger.Fatal("inbound schema missing — apply migration 006_xic_inbound.sql", zap.Error(err))
 	}
+
+	var batchTable *string
+	if err := dbpool.QueryRow(ctx, `SELECT to_regclass('public.xic_batches')::text`).Scan(&batchTable); err != nil || batchTable == nil {
+		logger.Fatal("batch schema missing — apply migration 009_xic_batch.sql", zap.Error(err))
+	}
+
+	var reconTable *string
+	if err := dbpool.QueryRow(ctx, `SELECT to_regclass('public.xic_reconciliation_runs')::text`).Scan(&reconTable); err != nil || reconTable == nil {
+		logger.Fatal("reconciliation schema missing — apply migration 010_xic_reconciliation.sql", zap.Error(err))
+	}
+
+	// counters from every engine feed /metrics; the hooks are set where each service is built
+	metrics := signals.NewMetrics()
 
 	st := store.NewPgStore(dbpool, store.WithEventRegion(cfg.EventResidencyRegion))
 
@@ -185,6 +204,7 @@ func main() {
 			RawDenyClasses: cfg.XICRawDenyClasses, HandoffMaxAttempts: cfg.XICHandoffMaxAttempts, HandoffBackoffBase: 5 * time.Second, HandoffBackoffMax: 15 * time.Minute,
 			HandoffLease: time.Minute, ConnRatePerMin: cfg.XICConnRatePerMin, IPRatePerMin: cfg.XICIPRatePerMin},
 		Handoff: inbound.HandoffDeps{Egress: egressPolicy(cfg, logger), AllowedRegions: cfg.EgressAllowedRegions, Principal: "system:xic-inbound-gateway"},
+		Observe: metrics.Hook("inbound"),
 	}
 	inAdmin := handler.NewInboundAdmin(gw, inRepo, authzClient, logger)
 	go gw.RunHandoff(evalCtx, time.Duration(cfg.XICHandoffIntervalSecs)*time.Second, 100, func(n int, err error) {
@@ -202,12 +222,80 @@ func main() {
 		Cfg: outbound.Config{BodyRetention: time.Duration(cfg.XICOutboundBodyRetentionHours) * time.Hour, BodyMaxBytes: cfg.XICOutboundBodyMaxBytes,
 			BodyDenyClasses: cfg.XICOutboundBodyDenyClasses, RequestTimeout: time.Duration(cfg.XICOutboundRequestTimeoutSecs) * time.Second,
 			SubmitLease: time.Duration(cfg.XICOutboundSubmitLeaseSecs) * time.Second, ResolveBackoff: time.Duration(cfg.XICOutboundResolveBackoffSecs) * time.Second,
-			ResolveBackoffMax: 15 * time.Minute, MaxUnknownAge: time.Duration(cfg.XICOutboundMaxUnknownAgeHours) * time.Hour, MaxResponseBytes: 64 << 10},
+			ResolveBackoffMax: 15 * time.Minute, MaxUnknownAge: time.Duration(cfg.XICOutboundMaxUnknownAgeHours) * time.Hour, MaxResponseBytes: 64 << 10,
+			CallbackMaxBodyBytes: cfg.XICCallbackMaxBodyBytes, CallbackConnRatePerMin: cfg.XICCallbackConnRatePerMin, CallbackIPRatePerMin: cfg.XICCallbackIPRatePerMin,
+			CallbackInvalidPerMin: cfg.XICCallbackInvalidPerMin},
+		EdgeSecret: []byte(cfg.XICEdgeSecret), Observe: metrics.Hook("outbound"),
 	}
 	obHandler := handler.NewOutbound(obSvc, obRepo, authzClient, logger)
 	go obSvc.RunResolver(evalCtx, time.Duration(cfg.XICOutboundResolverIntervalSecs)*time.Second, 100, func(n int, err error) {
 		if err != nil {
 			logger.Warn("outbound resolver", zap.Int("due", n), zap.Error(err))
+		}
+	})
+
+	// XIC-05 batch and file exchange and replay (ZS-SVC-T-001 section 10): the HTTPS object channel, the SFTP pull
+	// poller, the batch worker and the replay governance API. Every parsed byte passes a malware scanner; a deployment
+	// with no scanner does not get a "clean" default, so the channel stays closed (fail closed).
+	inRepoVersions := regRepo
+	gw.Versions = inRepoVersions
+	batchRepo := store.NewBatchRepo(st)
+	var batchSvc *batch.Service
+	if cfg.XICBatchEnabled || cfg.XICSFTPPollIntervalSecs > 0 {
+		chain, scanErr := scan.Require(cfg.XICBatchClamAVAddr, cfg.XICBatchAllowBuiltinScanOnly, cfg.XICBatchMaxFileBytes, time.Duration(cfg.XICBatchScanTimeoutSecs)*time.Second)
+		if scanErr != nil {
+			logger.Error("batch intake is REFUSED: no malware scanner is configured (set XIC_BATCH_CLAMAV_ADDR; development may set XIC_BATCH_ALLOW_BUILTIN_SCAN_ONLY=true)")
+		} else {
+			batchSvc = &batch.Service{
+				Repo: batchRepo, Conns: connSvc, In: gw, Secrets: inbound.NewVaultSecrets(cfg.VaultServiceURL, "connectivity-api-bridge-svc"), EdgeSecret: []byte(cfg.XICEdgeSecret), Scanner: chain,
+				Observe: metrics.Hook("batch"),
+				Cfg: batch.Config{MaxRequestBytes: cfg.XICBatchMaxRequestBytes, MaxFileBytes: cfg.XICBatchMaxFileBytes, MaxDecompressedBytes: cfg.XICBatchMaxDecompressedBytes,
+					ContentRetention: time.Duration(cfg.XICBatchContentRetentionHrs) * time.Hour, ProcessingGrace: time.Duration(cfg.XICBatchProcessingGraceMins) * time.Minute,
+					ContentDenyClasses: cfg.XICBatchContentDenyClasses, ConnRatePerMin: cfg.XICBatchConnRatePerMin, IPRatePerMin: cfg.XICBatchIPRatePerMin,
+					ProcessLease: 2 * time.Minute, RowChunk: cfg.XICBatchRowChunk, RefreshPending: 30 * time.Second, RefreshPartial: 5 * time.Minute, ProcessBackoff: 30 * time.Second,
+					ReplayMaxItems: cfg.XICReplayMaxItems, ReplayApprovalRows: cfg.XICReplayApprovalRows, ReplayWindowMax: time.Duration(cfg.XICReplayWindowMaxHours) * time.Hour,
+					RegulatedClasses: cfg.XICReplayRegulatedClasses, ReplayLease: 5 * time.Minute},
+			}
+			go batchSvc.RunWorker(evalCtx, time.Duration(cfg.XICBatchWorkerIntervalSecs)*time.Second, 100, func(n int, err error) {
+				if err != nil {
+					logger.Warn("batch worker", zap.Int("due", n), zap.Error(err))
+				}
+			})
+			if cfg.XICSFTPPollIntervalSecs > 0 {
+				puller := &sftppull.Puller{Conns: connSvc, Source: connRepo, Batches: batchSvc, Secrets: inbound.NewVaultSecrets(cfg.VaultServiceURL, "connectivity-api-bridge-svc"),
+					Egress: egressPolicy(cfg, logger), Cfg: sftppull.Config{Inbox: cfg.XICSFTPInbox, Done: cfg.XICSFTPDone, MaxFileBytes: cfg.XICBatchMaxFileBytes, Port: cfg.XICSFTPDefaultPort}}
+				go puller.Run(evalCtx, time.Duration(cfg.XICSFTPPollIntervalSecs)*time.Second, func(n int, err error) {
+					if err != nil {
+						logger.Warn("sftp pull", zap.Int("taken", n), zap.Error(err))
+					}
+				})
+				logger.Info("sftp pull poller enabled")
+			}
+		}
+	}
+
+	// XIC-05 reconciliation (ZS-SVC-T-001 section 10.4) and operational signals (section 17.1). The comparison reads the
+	// real exchange, attempt, receipt and batch tables; a scheduled run needs no declaration because it reconciles what
+	// the provider already declared (callbacks, manifests). Counters from every engine feed /metrics.
+	sigRepo := store.NewSignalsRepo(st)
+	reconRepo := store.NewReconRepo(st)
+	policies := recon.DefaultPolicies()
+	if cfg.XICReconPoliciesJSON != "" {
+		var over map[string]recon.Policy
+		if err := json.Unmarshal([]byte(cfg.XICReconPoliciesJSON), &over); err != nil {
+			logger.Fatal("XIC_RECON_POLICIES_JSON is invalid", zap.Error(err))
+		}
+		for k, v := range over {
+			v.Domain = k
+			policies[k] = v
+		}
+	}
+	reconSvc := &recon.Service{Repo: reconRepo, Conns: connSvc, Connectors: regRepo, Live: connRepo, Policies: policies,
+		Cfg:     recon.Config{MaxPeriod: time.Duration(cfg.XICReconMaxPeriodHours) * time.Hour, Lease: 5 * time.Minute, ScheduleEvery: time.Duration(cfg.XICReconScheduleEverySecs) * time.Second, MaxExternalRef: 10000},
+		Observe: metrics.Hook("reconciliation")}
+	go reconSvc.RunWorker(evalCtx, time.Duration(cfg.XICReconWorkerIntervalSecs)*time.Second, 100, func(n int, err error) {
+		if err != nil {
+			logger.Warn("reconciliation worker", zap.Int("due", n), zap.Error(err))
 		}
 	})
 
@@ -231,6 +319,11 @@ func main() {
 	handler.RegisterConnectionRoutes(r, ch)
 	handler.RegisterInboundAdminRoutes(r, inAdmin)
 	handler.RegisterOutboundRoutes(r, obHandler)
+	handler.RegisterCallbackAdminRoutes(r, handler.NewCallbackAdmin(obRepo, authzClient, logger))
+	handler.RegisterReconRoutes(r, handler.NewRecon(reconSvc, reconRepo, sigRepo, authzClient, logger))
+	if batchSvc != nil {
+		handler.RegisterBatchAdminRoutes(r, handler.NewBatchAdmin(batchSvc, batchRepo, authzClient, logger))
+	}
 
 	root := chi.NewRouter()
 	root.Use(chimiddleware.RequestID)
@@ -239,6 +332,18 @@ func main() {
 	if cfg.XICInboundEnabled {
 		root.Mount("/v1/inbound", handler.NewIngest(gw, cfg.XICInboundMaxBodyBytes, cfg.XICInboundTrustXFF, logger).Router())
 		logger.Info("inbound ingest endpoint enabled")
+	}
+	if cfg.XICCallbacksEnabled {
+		root.Mount("/v1/callbacks", handler.NewCallback(obSvc, cfg.XICCallbackMaxBodyBytes, cfg.XICInboundTrustXFF, logger).Router())
+		logger.Info("provider callback endpoint enabled")
+	}
+	if cfg.XICBatchEnabled && batchSvc != nil {
+		root.Mount("/v1/batch-intake", handler.NewBatchIntake(batchSvc, cfg.XICBatchMaxRequestBytes, cfg.XICInboundTrustXFF, logger).Router())
+		logger.Info("batch intake endpoint enabled")
+	}
+	if cfg.XICMetricsToken != "" {
+		root.Method("GET", "/metrics", handler.NewMetrics(metrics, sigRepo, cfg.XICMetricsToken, time.Duration(cfg.XICMetricsWindowHours)*time.Hour, logger))
+		logger.Info("metrics endpoint enabled")
 	}
 	root.Mount("/", r)
 
