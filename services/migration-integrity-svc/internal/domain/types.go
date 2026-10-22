@@ -12,6 +12,7 @@ import (
 
 type CheckType string
 type Severity string
+type ReasonFamily string
 type ViolationType string
 type JobStatus string
 
@@ -24,10 +25,56 @@ const (
 	CheckFormatCheck        CheckType = "FORMAT_CHECK"
 )
 
+// Severity is the ZS-MIG-001 §16 quarantine severity. Each class carries a
+// required disposition, not just a label; what this service does about each
+// one is stated per value (SPEC_DEVIATIONS A6, B3).
 const (
-	SeverityInfo     Severity = "INFO"
-	SeverityWarning  Severity = "WARNING"
-	SeverityCritical Severity = "CRITICAL"
+	// SeverityMQ0 — Blocker: threatens tenant isolation, ledger balance, legal
+	// entity, regulatory filing, financial completeness or cutover integrity.
+	// Disposition: stop the affected batch/cutover; executive/domain owner
+	// resolution required. Here: any MQ0 entry makes the job FAILED whatever
+	// its score (EvaluateJobStatus), and only the entry's named owner may
+	// resolve it.
+	SeverityMQ0 Severity = "MQ0"
+	// SeverityMQ1 — Material: financial/regulatory/business effect above
+	// approved materiality. Disposition: must resolve or receive a formally
+	// approved, time-limited migration exception. Here: owner required; the
+	// exception object and the certificate it gates do not exist (A1–A3).
+	SeverityMQ1 Severity = "MQ1"
+	// SeverityMQ2 — Significant: operational impact, not financially
+	// material. Disposition: owned remediation; may proceed only if the
+	// acceptance criteria permit. Here: the record counts as invalid and the
+	// integrity-score threshold (A11) is the acceptance criterion.
+	SeverityMQ2 Severity = "MQ2"
+	// SeverityMQ3 — Minor: non-material presentation/reference defect.
+	// Disposition: documented remediation/backlog.
+	SeverityMQ3 Severity = "MQ3"
+	// SeverityMQ4 — Informational: quality observation with no current
+	// effect. Disposition: track/monitor. Also the severity of a check that
+	// found nothing.
+	SeverityMQ4 Severity = "MQ4"
+)
+
+// Blocks reports whether the severity's disposition stops the run: only an
+// MQ0 does. Everything below it is decided by the acceptance threshold.
+func (s Severity) Blocks() bool { return s == SeverityMQ0 }
+
+// ReasonFamily is the ZS-MIG-001 §16 reason family. It is a separate
+// dimension from ViolationType: the same violation can belong to different
+// families depending on the field it concerns (a type mismatch on a date is
+// TEMPORAL, on a currency REFERENCE), so the family is assigned where the
+// violation is raised, never derived from the violation type.
+const (
+	ReasonIdentity  ReasonFamily = "IDENTITY"  // duplicate, collision, missing canonical relationship
+	ReasonReference ReasonFamily = "REFERENCE" // unknown account, tax code, currency, dimension, entity
+	ReasonTemporal  ReasonFamily = "TEMPORAL"  // invalid date, effective-date conflict, cutoff outside window
+	ReasonFinancial ReasonFamily = "FINANCIAL" // unbalanced journal, control mismatch, currency inconsistency
+	ReasonSubledger ReasonFamily = "SUBLEDGER" // open-item amount/aging/allocation inconsistency
+	ReasonTax       ReasonFamily = "TAX"       // registration/rule/return relationship unresolved
+	ReasonDocument  ReasonFamily = "DOCUMENT"  // missing/corrupt/unlinked/unsafe file
+	ReasonSchema    ReasonFamily = "SCHEMA"    // unexpected type/field/version
+	ReasonSecurity  ReasonFamily = "SECURITY"  // residency/classification/access violation
+	ReasonSource    ReasonFamily = "SOURCE"    // source population incomplete or extract integrity failure
 )
 
 const (
@@ -58,6 +105,8 @@ type MigrationRecord struct {
 // acceptance bar the run was actually judged against (the config value at
 // validation time), stored per job so a PASS/FAIL decision remains
 // auditable after the configured default changes (SPEC_DEVIATIONS A11).
+// BlockerCount is the number of MQ0 audit entries the run produced; any
+// blocker makes the job FAILED regardless of score (A6).
 type MigrationJob struct {
 	ID                      string           `json:"id"`
 	TenantID                string           `json:"tenant_id"`
@@ -70,6 +119,7 @@ type MigrationJob struct {
 	InvalidRecordsCount     int              `json:"invalid_records_count"`
 	IntegrityScore          float64          `json:"integrity_score"`
 	IntegrityScoreThreshold float64          `json:"integrity_score_threshold"`
+	BlockerCount            int              `json:"blocker_count"`
 	Status                  JobStatus        `json:"status"`
 	IntegrityChecks         []IntegrityCheck `json:"integrity_checks,omitempty"`
 	AuditEntries            []AuditEntry     `json:"audit_entries,omitempty"`
@@ -112,6 +162,13 @@ type AuditEntry struct {
 	ViolationType ViolationType `json:"violation_type"`
 	IsRemediated  bool          `json:"is_remediated"`
 
+	// §16 classification and ownership (MIG-INV-12 "owner, reason code and
+	// disposition"; MIG-C37 "all MQ0–MQ2 items named owner"). The owner is
+	// the exception owner named on the validation request.
+	Severity     Severity     `json:"severity"`
+	ReasonFamily ReasonFamily `json:"reason_family"`
+	OwnerID      string       `json:"owner_id,omitempty"`
+
 	// Remediation evidence (ZS-MIG-001 MIG-INV-12: owner, reason code and
 	// disposition). Recorded on the first remediation only; a replayed
 	// remediate request returns the original decision unchanged.
@@ -132,6 +189,11 @@ type ValidateMigrationRequest struct {
 	TargetService  string            `json:"target_service"`
 	RequiredFields []string          `json:"required_fields"`
 	Records        []MigrationRecord `json:"records"`
+
+	// ExceptionOwnerID is the principal accountable for resolving the
+	// run's quarantine items. Required: every audit entry carries an owner
+	// (MIG-INV-12), and an MQ0 can only be resolved by its owner.
+	ExceptionOwnerID string `json:"exception_owner_id"`
 }
 
 // RemediateRequest is the body of
@@ -162,6 +224,9 @@ func (r *ValidateMigrationRequest) Validate() error {
 	if len(r.Records) == 0 {
 		return fmt.Errorf("records cannot be empty")
 	}
+	if strings.TrimSpace(r.ExceptionOwnerID) == "" {
+		return fmt.Errorf("exception_owner_id is required")
+	}
 	return nil
 }
 
@@ -183,8 +248,17 @@ func (r *RemediateRequest) Validate() error {
 // PerformIntegrityValidation runs schema, source identity, duplicate, and
 // format integrity checks on the provided migration records. Returns checks,
 // audit entries, valid count, invalid count, and an integrity score (0–100%).
+//
+// Every audit entry is classified where it is raised (§16 severity and
+// reason family) and owned by the request's exception owner. The
+// classification rule (SPEC_DEVIATIONS B3): a defect that defeats the
+// completeness accounting is MQ0; a defect on a value the service knows is
+// financial, or an identity collision, is MQ1 because no materiality figure
+// exists here to show it is immaterial; a defect on a caller-declared field
+// of unknown meaning is MQ2, left to the acceptance threshold.
 func PerformIntegrityValidation(req *ValidateMigrationRequest, jobID, tenantID string) ([]IntegrityCheck, []AuditEntry, int, int, float64) {
 	now := time.Now()
+	owner := strings.TrimSpace(req.ExceptionOwnerID)
 	var checks []IntegrityCheck
 	var auditEntries []AuditEntry
 	totalRecords := len(req.Records)
@@ -209,6 +283,9 @@ func PerformIntegrityValidation(req *ValidateMigrationRequest, jobID, tenantID s
 					FieldName:     field,
 					SourceValue:   "",
 					ViolationType: ViolationMissingRequired,
+					Severity:      SeverityMQ2,
+					ReasonFamily:  ReasonSchema,
+					OwnerID:       owner,
 					IsRemediated:  false,
 					CreatedAt:     now,
 				})
@@ -226,7 +303,7 @@ func PerformIntegrityValidation(req *ValidateMigrationRequest, jobID, tenantID s
 		RecordsChecked: totalRecords,
 		RecordsPassed:  totalRecords - schemaFailed,
 		RecordsFailed:  schemaFailed,
-		Severity:       sev(schemaFailed, SeverityCritical),
+		Severity:       sev(schemaFailed, SeverityMQ2),
 		Detail:         fmt.Sprintf("Validated %d required fields across %d records", len(req.RequiredFields), totalRecords),
 		CreatedAt:      now,
 	})
@@ -234,7 +311,10 @@ func PerformIntegrityValidation(req *ValidateMigrationRequest, jobID, tenantID s
 	// ── Check 2: Source Identity Presence ─────────────────────────────────────
 	// A blank ref is not just another value: the record has no source identity
 	// at all (MIG-INV-02 "every object preserves source identity"), which is a
-	// different defect from a duplicated one. Reported here, before duplicate
+	// different defect from a duplicated one. MQ0: a record with no source
+	// identity cannot be accounted for in "loaded + quarantined + excluded =
+	// source population" (§17), so it threatens financial completeness and
+	// stops the run. Reported here, before duplicate
 	// detection, so several blank refs are each reported for what they are
 	// rather than only as "duplicates" of one another.
 	//
@@ -253,6 +333,9 @@ func PerformIntegrityValidation(req *ValidateMigrationRequest, jobID, tenantID s
 				JobID:         jobID,
 				RecordRef:     rec.Ref,
 				ViolationType: ViolationMissingSourceIdentity,
+				Severity:      SeverityMQ0,
+				ReasonFamily:  ReasonIdentity,
+				OwnerID:       owner,
 				IsRemediated:  false,
 				CreatedAt:     now,
 			})
@@ -266,7 +349,7 @@ func PerformIntegrityValidation(req *ValidateMigrationRequest, jobID, tenantID s
 		RecordsChecked: totalRecords,
 		RecordsPassed:  totalRecords - identityFailed,
 		RecordsFailed:  identityFailed,
-		Severity:       sev(identityFailed, SeverityCritical),
+		Severity:       sev(identityFailed, SeverityMQ0),
 		Detail:         fmt.Sprintf("Scanned %d records for a source reference", totalRecords),
 		CreatedAt:      now,
 	})
@@ -285,6 +368,8 @@ func PerformIntegrityValidation(req *ValidateMigrationRequest, jobID, tenantID s
 	}
 	// Every record of a duplicated ref fails: which copy is authoritative is
 	// unknowable here, so none is silently preferred (ZS-MIG-001 MIG-N05).
+	// MQ1: an identity collision risks a duplicate economic effect
+	// (MIG-N09/N10) of a size this service cannot measure.
 	dupFailed := 0
 	for i, rec := range req.Records {
 		if refBlank[i] {
@@ -303,6 +388,9 @@ func PerformIntegrityValidation(req *ValidateMigrationRequest, jobID, tenantID s
 				RecordRef:     ref,
 				SourceValue:   fmt.Sprintf("appears %d times", count),
 				ViolationType: ViolationDuplicate,
+				Severity:      SeverityMQ1,
+				ReasonFamily:  ReasonIdentity,
+				OwnerID:       owner,
 				IsRemediated:  false,
 				CreatedAt:     now,
 			})
@@ -316,12 +404,14 @@ func PerformIntegrityValidation(req *ValidateMigrationRequest, jobID, tenantID s
 		RecordsChecked: totalRecords,
 		RecordsPassed:  totalRecords - dupFailed,
 		RecordsFailed:  dupFailed,
-		Severity:       sev(dupFailed, SeverityWarning),
+		Severity:       sev(dupFailed, SeverityMQ1),
 		Detail:         fmt.Sprintf("Scanned %d records for duplicate reference IDs", totalRecords),
 		CreatedAt:      now,
 	})
 
 	// ── Check 4: Numeric Format Check ─────────────────────────────────────────
+	// These four fields are amounts and quantities, so an unreadable value is
+	// a financial value that cannot load: MQ1, family SCHEMA (unexpected type).
 	numericFields := []string{"amount", "salary", "balance", "quantity"}
 	fmtFailed := 0
 	fmtFailedRecs := make(map[int]bool)
@@ -345,6 +435,9 @@ func PerformIntegrityValidation(req *ValidateMigrationRequest, jobID, tenantID s
 					FieldName:     field,
 					SourceValue:   val,
 					ViolationType: ViolationTypeMismatch,
+					Severity:      SeverityMQ1,
+					ReasonFamily:  ReasonSchema,
+					OwnerID:       owner,
 					IsRemediated:  false,
 					CreatedAt:     now,
 				})
@@ -359,7 +452,7 @@ func PerformIntegrityValidation(req *ValidateMigrationRequest, jobID, tenantID s
 		RecordsChecked: totalRecords,
 		RecordsPassed:  totalRecords - fmtFailed,
 		RecordsFailed:  fmtFailed,
-		Severity:       sev(fmtFailed, SeverityWarning),
+		Severity:       sev(fmtFailed, SeverityMQ1),
 		Detail:         "Validated numeric formats for amount, salary, balance, quantity fields",
 		CreatedAt:      now,
 	})
@@ -379,12 +472,28 @@ func PerformIntegrityValidation(req *ValidateMigrationRequest, jobID, tenantID s
 	return checks, auditEntries, validCount, invalidCount, score
 }
 
+// CountBlockers returns how many entries carry a blocking severity (MQ0).
+func CountBlockers(entries []AuditEntry) int {
+	n := 0
+	for _, e := range entries {
+		if e.Severity.Blocks() {
+			n++
+		}
+	}
+	return n
+}
+
 // EvaluateJobStatus derives a job's acceptance result from its integrity
 // score and the acceptance bar the service applied: below the bar is FAILED,
 // at or above is COMPLETED. A run in which every record is invalid is FAILED
 // at any bar -- a migration with nothing intact is not an accepted migration,
-// whatever the configured threshold says (SPEC_DEVIATIONS A11).
-func EvaluateJobStatus(score float64, validCount, invalidCount int, threshold float64) JobStatus {
+// whatever the configured threshold says (SPEC_DEVIATIONS A11). A run with
+// any MQ0 blocker is FAILED at any score: the blocker's disposition is "stop
+// the affected batch", which no score can outweigh (A6).
+func EvaluateJobStatus(score float64, validCount, invalidCount, blockerCount int, threshold float64) JobStatus {
+	if blockerCount > 0 {
+		return JobStatusFailed
+	}
 	if validCount == 0 && invalidCount > 0 {
 		return JobStatusFailed
 	}
@@ -402,5 +511,5 @@ func sev(failCount int, whenFailed Severity) Severity {
 	if failCount > 0 {
 		return whenFailed
 	}
-	return SeverityInfo
+	return SeverityMQ4
 }

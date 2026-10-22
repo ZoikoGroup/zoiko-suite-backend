@@ -76,7 +76,7 @@ func createdRun(t *testing.T, pool *pgxpool.Pool) (context.Context, string, *dom
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 	run := newTestRun(tenantID, "group-le-1")
 	run.Status = "RUNNING"
-	require.NoError(t, newTestStore(pool).CreateRun(ctx, run, "principal-1", "corr-1"))
+	require.NoError(t, createRun(newTestStore(pool), ctx, run, "principal-1", "corr-1"))
 	return ctx, tenantID, run
 }
 
@@ -99,7 +99,7 @@ func TestPgStore_CreateRun_InsertFailure_EnqueuesNothing(t *testing.T) {
 	ctx, tenantID, run := createdRun(t, pool)
 
 	// Same primary key again: the INSERT fails, so the event must roll back with it.
-	err := newTestStore(pool).CreateRun(ctx, run, "principal-1", "corr-2")
+	err := createRun(newTestStore(pool), ctx, run, "principal-1", "corr-2")
 	require.Error(t, err)
 
 	rows := outboxRowsFor(t, pool, tenantID, run.ConsolidationRunID)

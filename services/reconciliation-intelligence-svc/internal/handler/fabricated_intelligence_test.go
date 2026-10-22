@@ -55,7 +55,7 @@ func TestApplyResolution_EmptyHumanNote_PreservesMachineRationale(t *testing.T) 
 	// Approve with NO note — the common case, and the one that used to erase
 	// the rationale.
 	applyBody, _ := json.Marshal(domain.ApplyResolutionRequest{
-		ResolutionStatus: domain.StatusApproved, ResolutionNotes: "",
+		SuggestionStatus: domain.StatusApproved, ResolutionNotes: "",
 	})
 	applyReq := httptest.NewRequest(http.MethodPost,
 		"/v1/reconciliations/"+job.ID+"/resolutions/"+itemID+"/apply", bytes.NewReader(applyBody))
@@ -69,12 +69,12 @@ func TestApplyResolution_EmptyHumanNote_PreservesMachineRationale(t *testing.T) 
 		t.Fatalf("apply: expected 200, got %d: %s", applyRec.Code, applyRec.Body.String())
 	}
 
-	var applied domain.UnmatchedItem
+	var applied domain.ReconciliationSuggestion
 	if err := json.Unmarshal(applyRec.Body.Bytes(), &applied); err != nil {
 		t.Fatalf("decode applied item: %v", err)
 	}
-	if applied.ResolutionStatus != domain.StatusApproved {
-		t.Fatalf("expected APPROVED, got %s", applied.ResolutionStatus)
+	if applied.SuggestionStatus != domain.StatusApproved {
+		t.Fatalf("expected APPROVED, got %s", applied.SuggestionStatus)
 	}
 	if !strings.Contains(applied.ResolutionNotes, "heuristic rule") {
 		t.Fatalf("REGRESSION: an empty-note approval erased the machine's rationale, got %q", applied.ResolutionNotes)
@@ -102,7 +102,7 @@ func TestApplyResolution_HumanNote_AppendedNotOverwritten(t *testing.T) {
 	itemID := job.UnmatchedItems[0].ID
 
 	applyBody, _ := json.Marshal(domain.ApplyResolutionRequest{
-		ResolutionStatus: domain.StatusApproved, ResolutionNotes: "confirmed with controller, approved",
+		SuggestionStatus: domain.StatusApproved, ResolutionNotes: "confirmed with controller, approved",
 	})
 	applyReq := httptest.NewRequest(http.MethodPost,
 		"/v1/reconciliations/"+job.ID+"/resolutions/"+itemID+"/apply", bytes.NewReader(applyBody))
@@ -113,7 +113,7 @@ func TestApplyResolution_HumanNote_AppendedNotOverwritten(t *testing.T) {
 	applyRec := httptest.NewRecorder()
 	router.ServeHTTP(applyRec, applyReq)
 
-	var applied domain.UnmatchedItem
+	var applied domain.ReconciliationSuggestion
 	if err := json.Unmarshal(applyRec.Body.Bytes(), &applied); err != nil {
 		t.Fatalf("decode: %v", err)
 	}

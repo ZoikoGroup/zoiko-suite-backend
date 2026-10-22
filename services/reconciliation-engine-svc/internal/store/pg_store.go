@@ -44,7 +44,9 @@ type Store interface {
 	Match(ctx context.Context, tenantID, runID string, req domain.MatchRequest, actor string, claim domain.IdempotencyClaim) (*domain.ReconciliationRun, error)
 	RaiseException(ctx context.Context, tenantID, runID string, req domain.RaiseExceptionRequest, actor string, claim domain.IdempotencyClaim) (*domain.ReconciliationException, error)
 	Reperform(ctx context.Context, tenantID, runID string, pops []domain.FrozenPopulation, actor string, claim domain.IdempotencyClaim) (*domain.ReconciliationRun, error)
-	Certify(ctx context.Context, tenantID, runID string, actor string, claim domain.IdempotencyClaim) (*domain.Certification, error)
+	Certify(ctx context.Context, tenantID, runID string, actor string, authority *domain.AuthoritySnapshot, claim domain.IdempotencyClaim) (*domain.Certification, error)
+	RevokeCertification(ctx context.Context, tenantID, runID string, req domain.RevokeCertificationRequest, actor string,
+		authority *domain.AuthoritySnapshot, claim domain.IdempotencyClaim) (*domain.CertificationRevocation, error)
 	SupersedeRun(ctx context.Context, tenantID, runID string, req domain.SupersedeRunRequest, actor string, claim domain.IdempotencyClaim) (*domain.ReconciliationRun, error)
 
 	GetRun(ctx context.Context, tenantID, runID string) (*domain.ReconciliationRun, error)
@@ -275,22 +277,29 @@ func (s *PgStore) GetRun(ctx context.Context, tenantID, runID string) (*domain.R
 // instead of re-reading populations that may since have moved.
 func (s *PgStore) CheckIdempotency(ctx context.Context, tenantID string, c domain.IdempotencyClaim) error {
 	return s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
-		var reqHash, resourceID string
-		err := tx.QueryRow(ctx, `
-			SELECT request_sha256, resource_id FROM idempotency_keys
-			WHERE tenant_id = $1 AND owner_scope = $2 AND principal_id = $3 AND idempotency_key = $4`,
-			tenantID, c.OwnerScope, c.PrincipalID, c.Key).Scan(&reqHash, &resourceID)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil
-		}
-		if err != nil {
-			return fmt.Errorf("read idempotency claim: %w", err)
-		}
-		if reqHash != c.RequestSHA256 {
-			return domain.ErrIdempotencyKeyReused
-		}
-		return &domain.IdempotentReplayError{ResourceID: resourceID}
+		return peekIdempotency(ctx, tx, tenantID, c)
 	})
+}
+
+// peekIdempotency is CheckIdempotency inside a caller's transaction: a command
+// that must refuse a state it already produced (RevokeCertification) asks it
+// under the row lock, so a retry of a completed command replays instead.
+func peekIdempotency(ctx context.Context, tx pgx.Tx, tenantID string, c domain.IdempotencyClaim) error {
+	var reqHash, resourceID string
+	err := tx.QueryRow(ctx, `
+		SELECT request_sha256, resource_id FROM idempotency_keys
+		WHERE tenant_id = $1 AND owner_scope = $2 AND principal_id = $3 AND idempotency_key = $4`,
+		tenantID, c.OwnerScope, c.PrincipalID, c.Key).Scan(&reqHash, &resourceID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read idempotency claim: %w", err)
+	}
+	if reqHash != c.RequestSHA256 {
+		return domain.ErrIdempotencyKeyReused
+	}
+	return &domain.IdempotentReplayError{ResourceID: resourceID}
 }
 
 // StartRun freezes the two populations the caller read from their sources —
@@ -891,11 +900,24 @@ func applyManualMatch(ctx context.Context, tx pgx.Tx, tenantID, runID, actor str
 
 	refID := pair[0].RefID
 
+	// The evidence beside the operator's reason (A12, §10 "reason and
+	// evidence"): both frozen items, their generation, and the comparison under
+	// the pinned tolerance that let the pairing through. Recorded with the match,
+	// never reconstructed later.
+	var generation int
+	if err := tx.QueryRow(ctx, `SELECT MAX(generation) FROM population_snapshots WHERE run_id = $1`, runID).Scan(&generation); err != nil {
+		return fmt.Errorf("read snapshot generation: %w", err)
+	}
+	evidence, err := json.Marshal(domain.NewManualMatchEvidence(pair[0], pair[1], generation, pol))
+	if err != nil {
+		return fmt.Errorf("encode manual match evidence: %w", err)
+	}
+
 	mrID := newID(domain.PrefixMatchResult)
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO match_results (match_result_id, tenant_id, run_id, item_a_id, item_b_id, ref_id, manual, reason, matched_by)
-		VALUES ($1, $2, $3, $4, $5, $6, TRUE, $7, $8)`,
-		mrID, tenantID, runID, m.ItemAID, m.ItemBID, refID, m.Reason, actor); err != nil {
+		INSERT INTO match_results (match_result_id, tenant_id, run_id, item_a_id, item_b_id, ref_id, manual, reason, matched_by, evidence)
+		VALUES ($1, $2, $3, $4, $5, $6, TRUE, $7, $8, $9)`,
+		mrID, tenantID, runID, m.ItemAID, m.ItemBID, refID, m.Reason, actor, evidence); err != nil {
 		return fmt.Errorf("insert manual match: %w", err)
 	}
 
@@ -1234,14 +1256,34 @@ func (s *PgStore) Reperform(ctx context.Context, tenantID, runID string, pops []
 // ── Certify ──────────────────────────────────────────────────────────────────
 
 const certificationColumns = `certification_id, tenant_id, run_id, definition_version, matched_count, exception_count,
-	total_asserted_minor_units, control_totals, result_state, assessment, manifest_sha256, sealed_at, sealed_by`
+	total_asserted_minor_units, control_totals, result_state, assessment, authority_snapshot, populations, manual_matches,
+	manifest_sha256, sealed_at, sealed_by`
 
 func scanCertification(row pgx.Row) (*domain.Certification, error) {
 	var c domain.Certification
-	var totals, assessment []byte
+	var totals, assessment, authority, populations, manual []byte
 	if err := row.Scan(&c.CertificationID, &c.TenantID, &c.RunID, &c.DefinitionVersion, &c.MatchedCount, &c.ExceptionCount,
-		&c.TotalAssertedMinor, &totals, &c.ResultState, &assessment, &c.ManifestSHA256, &c.SealedAt, &c.SealedBy); err != nil {
+		&c.TotalAssertedMinor, &totals, &c.ResultState, &assessment, &authority, &populations, &manual,
+		&c.ManifestSHA256, &c.SealedAt, &c.SealedBy); err != nil {
 		return nil, err
+	}
+	// Certifications sealed before migration 000010 have none of the three; none
+	// is reconstructed.
+	if len(authority) > 0 {
+		c.Authority = &domain.AuthoritySnapshot{}
+		if err := json.Unmarshal(authority, c.Authority); err != nil {
+			return nil, fmt.Errorf("decode certification authority: %w", err)
+		}
+	}
+	if len(populations) > 0 {
+		if err := json.Unmarshal(populations, &c.Populations); err != nil {
+			return nil, fmt.Errorf("decode certification populations: %w", err)
+		}
+	}
+	if len(manual) > 0 {
+		if err := json.Unmarshal(manual, &c.ManualMatches); err != nil {
+			return nil, fmt.Errorf("decode certification manual matches: %w", err)
+		}
 	}
 	if len(assessment) > 0 {
 		c.Assessment = &domain.RunAssessment{}
@@ -1272,7 +1314,14 @@ type certificationManifest struct {
 	MatchedCount         int64                             `json:"matched_count"`
 	ExceptionCount       int64                             `json:"exception_count"`
 	ControlTotals        map[string][]domain.CurrencyTotal `json:"control_totals"`
-	SealedAt             time.Time                         `json:"sealed_at"`
+	// A12: the populations certified (latest generation, by content hash), every
+	// manual match with its reason and evidence, and the certifier with the
+	// authorization decision that let them certify.
+	Populations   []domain.CertifiedPopulation  `json:"populations"`
+	ManualMatches []domain.CertifiedManualMatch `json:"manual_matches"`
+	Certifier     string                        `json:"certifier"`
+	Authority     domain.AuthoritySnapshot      `json:"authority_snapshot"`
+	SealedAt      time.Time                     `json:"sealed_at"`
 }
 
 // sideControlTotals returns each side's per-currency control totals, of the
@@ -1303,6 +1352,69 @@ func sideControlTotals(ctx context.Context, tx pgx.Tx, runID string) (map[string
 			t = []domain.CurrencyTotal{}
 		}
 		out[side] = t
+	}
+	return out, rows.Err()
+}
+
+// certifiedPopulations is every side of the run's latest snapshot generation,
+// the generation certified (A8, A12), by snapshot id and content hash.
+func certifiedPopulations(ctx context.Context, tx pgx.Tx, runID string) ([]domain.CertifiedPopulation, error) {
+	rows, err := tx.Query(ctx, `SELECT `+snapshotColumns+` FROM population_snapshots WHERE run_id = $1
+		AND generation = (SELECT MAX(generation) FROM population_snapshots WHERE run_id = $1) ORDER BY side`, runID)
+	if err != nil {
+		return nil, fmt.Errorf("load certified populations: %w", err)
+	}
+	defer rows.Close()
+	out := []domain.CertifiedPopulation{}
+	for rows.Next() {
+		p, err := scanSnapshot(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, domain.CertifiedPopulation{SnapshotID: p.SnapshotID, Side: p.Side, Generation: p.Generation,
+			SourceSystem: p.SourceSystem, SpecRef: p.SpecRef, SourceWatermark: p.SourceWatermark, ItemCount: p.ItemCount,
+			DeclaredRowCount: p.DeclaredRowCount, DeclaredTotals: p.DeclaredTotals, ContentHash: p.ContentHash})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("%w: the run has no frozen population to certify", domain.ErrRunNotEligible)
+	}
+	return out, nil
+}
+
+// certifiedManualMatches is every manual match of the run, of any generation
+// (an earlier generation's match closed exceptions the assessment counts), with
+// its reason, its recorded evidence and the exceptions it resolved.
+func certifiedManualMatches(ctx context.Context, tx pgx.Tx, runID string) ([]domain.CertifiedManualMatch, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT m.match_result_id, m.item_a_id, m.item_b_id, m.reason, m.matched_by, m.matched_at, m.evidence,
+			COALESCE(array_agg(e.exception_id ORDER BY e.exception_id) FILTER (WHERE e.exception_id IS NOT NULL), '{}')
+		FROM match_results m
+		LEFT JOIN reconciliation_exceptions e ON e.resolved_by_match_id = m.match_result_id
+		WHERE m.run_id = $1 AND m.manual
+		GROUP BY m.match_result_id
+		ORDER BY m.matched_at, m.match_result_id`, runID)
+	if err != nil {
+		return nil, fmt.Errorf("load manual matches: %w", err)
+	}
+	defer rows.Close()
+	out := []domain.CertifiedManualMatch{}
+	for rows.Next() {
+		var m domain.CertifiedManualMatch
+		var evidence []byte
+		if err := rows.Scan(&m.MatchResultID, &m.ItemAID, &m.ItemBID, &m.Reason, &m.MatchedBy, &m.MatchedAt, &evidence,
+			&m.ResolvedExceptionIDs); err != nil {
+			return nil, err
+		}
+		if len(evidence) > 0 {
+			m.Evidence = &domain.ManualMatchEvidence{}
+			if err := json.Unmarshal(evidence, m.Evidence); err != nil {
+				return nil, fmt.Errorf("decode manual match evidence: %w", err)
+			}
+		}
+		out = append(out, m)
 	}
 	return out, rows.Err()
 }
@@ -1343,7 +1455,17 @@ func runPreparers(ctx context.Context, tx pgx.Tx, run *domain.ReconciliationRun)
 // to Failed on its own — it either certifies or refuses with a clear
 // reason, leaving Failed reachable only through an explicit future
 // extension rather than an invented, ungoverned auto-fail path.
-func (s *PgStore) Certify(ctx context.Context, tenantID, runID string, actor string, claim domain.IdempotencyClaim) (*domain.Certification, error) {
+//
+// The certification binds what it certified (A12): the content hash of every
+// side of the generation certified, every manual match with its reason and
+// evidence, and the certifier's authority — authorization-svc's live decision,
+// which the handler obtains and which must be the certifier's own and
+// traceable, or nothing is certified.
+func (s *PgStore) Certify(ctx context.Context, tenantID, runID string, actor string, authority *domain.AuthoritySnapshot,
+	claim domain.IdempotencyClaim) (*domain.Certification, error) {
+	if !authority.Traceable(actor) {
+		return nil, domain.ErrAuthorityUntraceable
+	}
 	var out *domain.Certification
 	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
 		run, err := loadRunForUpdate(ctx, tx, tenantID, runID)
@@ -1405,6 +1527,26 @@ func (s *PgStore) Certify(ctx context.Context, tenantID, runID string, actor str
 		if err != nil {
 			return fmt.Errorf("encode control totals: %w", err)
 		}
+		populations, err := certifiedPopulations(ctx, tx, runID)
+		if err != nil {
+			return err
+		}
+		manual, err := certifiedManualMatches(ctx, tx, runID)
+		if err != nil {
+			return err
+		}
+		authorityJSON, err := json.Marshal(authority)
+		if err != nil {
+			return fmt.Errorf("encode certification authority: %w", err)
+		}
+		populationsJSON, err := json.Marshal(populations)
+		if err != nil {
+			return fmt.Errorf("encode certified populations: %w", err)
+		}
+		manualJSON, err := json.Marshal(manual)
+		if err != nil {
+			return fmt.Errorf("encode manual matches: %w", err)
+		}
 
 		sealedAt := time.Now().UTC()
 		manifest, err := json.Marshal(certificationManifest{
@@ -1412,7 +1554,8 @@ func (s *PgStore) Certify(ctx context.Context, tenantID, runID string, actor str
 			MatchKeyFields: run.MatchKeyFields, BalanceDimensions: run.BalanceDimensions,
 			Materiality: run.Materiality, CertificationProfile: run.CertificationProfile, ResultState: run.ResultState,
 			Assessment:   assessment,
-			MatchedCount: matchedCount, ExceptionCount: exceptionCount, ControlTotals: totals, SealedAt: sealedAt,
+			MatchedCount: matchedCount, ExceptionCount: exceptionCount, ControlTotals: totals,
+			Populations: populations, ManualMatches: manual, Certifier: actor, Authority: *authority, SealedAt: sealedAt,
 		})
 		if err != nil {
 			return fmt.Errorf("marshal certification manifest: %w", err)
@@ -1421,11 +1564,12 @@ func (s *PgStore) Certify(ctx context.Context, tenantID, runID string, actor str
 		certID := newID(domain.PrefixCertification)
 		cert, err := scanCertification(tx.QueryRow(ctx, `
 			INSERT INTO certifications (certification_id, tenant_id, run_id, definition_version, matched_count,
-				exception_count, control_totals, result_state, assessment, manifest_sha256, sealed_at, sealed_by)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+				exception_count, control_totals, result_state, assessment, authority_snapshot, populations, manual_matches,
+				manifest_sha256, sealed_at, sealed_by)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 			RETURNING `+certificationColumns,
 			certID, tenantID, runID, run.DefinitionVersion, matchedCount, exceptionCount, totalsJSON, string(run.ResultState),
-			assessmentJSON, sha256Hex(manifest), sealedAt, actor))
+			assessmentJSON, authorityJSON, populationsJSON, manualJSON, sha256Hex(manifest), sealedAt, actor))
 		if err != nil {
 			return fmt.Errorf("seal certification: %w", err)
 		}
@@ -1455,8 +1599,16 @@ func (s *PgStore) GetCertification(ctx context.Context, tenantID, runID string) 
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.ErrRunNotFound
 		}
+		if err != nil {
+			return err
+		}
+		// A revoked certification is still served whole, with its revocation
+		// beside it, so a reader never mistakes it for one still in force.
+		if c.Revocation, err = runRevocation(ctx, tx, tenantID, runID); err != nil {
+			return err
+		}
 		out = c
-		return err
+		return nil
 	})
 	return out, err
 }
@@ -1594,17 +1746,24 @@ func (s *PgStore) GetPopulationSnapshots(ctx context.Context, tenantID, runID st
 	return out, err
 }
 
-const matchResultColumns = `match_result_id, tenant_id, run_id, item_a_id, item_b_id, ref_id, manual, reason, matched_by, matched_at`
+const matchResultColumns = `match_result_id, tenant_id, run_id, item_a_id, item_b_id, ref_id, manual, reason, matched_by, matched_at, evidence`
 
 func scanMatchResult(row pgx.Row) (*domain.MatchResult, error) {
 	var m domain.MatchResult
 	var reason *string
+	var evidence []byte
 	if err := row.Scan(&m.MatchResultID, &m.TenantID, &m.RunID, &m.ItemAID, &m.ItemBID, &m.RefID, &m.Manual, &reason,
-		&m.MatchedBy, &m.MatchedAt); err != nil {
+		&m.MatchedBy, &m.MatchedAt, &evidence); err != nil {
 		return nil, err
 	}
 	if reason != nil {
 		m.Reason = *reason
+	}
+	if len(evidence) > 0 {
+		m.Evidence = &domain.ManualMatchEvidence{}
+		if err := json.Unmarshal(evidence, m.Evidence); err != nil {
+			return nil, fmt.Errorf("decode manual match evidence: %w", err)
+		}
 	}
 	return &m, nil
 }

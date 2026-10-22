@@ -13,13 +13,19 @@ import (
 // ResolveException — POST /controls/v1/exceptions/{exception_id}/transition (§21).
 //
 // Body: {"to_state","reason", and per target state "evidence_ref" | "authority_ref" | "carry_to_period"}.
-// If-Match with the exception's ETag is mandatory. The action demanded depends on the
+// If-Match with the exception's ETag is mandatory, and so is Idempotency-Key
+// (reperformance is one of ZS-CONTROL-001's mandatorily idempotent commands; the
+// other transitions share the endpoint and the rule). The action demanded depends on the
 // target: waiving or carrying forward needs FINCTRL_EXCEPTION_WAIVE, reperformance needs
 // FINCTRL_REPERFORM, everything else FINCTRL_EXCEPTION_RESOLVE. Independence rules (owner
 // works it; owner cannot waive it; remediator cannot reperform it) are enforced by the
 // store under the row lock, so they cannot be raced.
 func (h *Handler) ResolveException(w http.ResponseWriter, r *http.Request) {
 	tenantID, principal, ok := h.caller(w, r)
+	if !ok {
+		return
+	}
+	key, ok := requireIdempotencyKey(w, r, "transition an exception")
 	if !ok {
 		return
 	}
@@ -48,14 +54,13 @@ func (h *Handler) ResolveException(w http.ResponseWriter, r *http.Request) {
 	if !h.authorize(w, r, principal, ex.LegalEntityID, req.RequiredAction()) {
 		return
 	}
-	out, err := h.store.ResolveException(r.Context(), tenantID, id, principal, corrID(r), expected, req)
+	out, replay, err := h.store.ResolveException(r.Context(), tenantID, id, principal, corrID(r), key, expected, req)
 	if err != nil {
 		h.writeErr(w, "resolve exception", err)
 		return
 	}
 	out.Attention = out.DeriveAttention(time.Now().UTC())
-	setETag(w, out.Version)
-	writeJSON(w, http.StatusOK, out)
+	writeCommandResult(w, out.Version, replay, out)
 }
 
 // ListExceptionTransitions — GET /controls/v1/exceptions/{exception_id}/transitions.
@@ -95,6 +100,10 @@ func (h *Handler) SubmitForCertification(w http.ResponseWriter, r *http.Request)
 	if !ok {
 		return
 	}
+	key, ok := requireIdempotencyKey(w, r, "submit a run for certification")
+	if !ok {
+		return
+	}
 	expected, ok := parseIfMatch(w, r, -2)
 	if !ok {
 		return
@@ -120,11 +129,10 @@ func (h *Handler) SubmitForCertification(w http.ResponseWriter, r *http.Request)
 	if !h.authorize(w, r, principal, run.LegalEntityID, domain.ActionResolve) {
 		return
 	}
-	out, err := h.store.SubmitForCertification(r.Context(), tenantID, runID, principal, corrID(r), expected, req.Reason)
+	out, replay, err := h.store.SubmitForCertification(r.Context(), tenantID, runID, principal, corrID(r), key, expected, req.Reason)
 	if err != nil {
 		h.writeErr(w, "submit for certification", err)
 		return
 	}
-	setETag(w, out.Version)
-	writeJSON(w, http.StatusOK, out)
+	writeCommandResult(w, out.Version, replay, out)
 }

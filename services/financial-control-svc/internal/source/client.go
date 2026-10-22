@@ -178,7 +178,7 @@ func (f *HTTPFetcher) Fetch(ctx context.Context, spec Spec, scope Scope) (*Fetch
 		if page > maxPagesGuard {
 			return nil, ErrPopulationTooLarge
 		}
-		resp, err := f.page(ctx, base, spec, scope, cursor)
+		resp, err := f.page(ctx, base, spec, scope, cursor, pageSize)
 		if err != nil {
 			return nil, err
 		}
@@ -226,6 +226,35 @@ func (f *HTTPFetcher) Fetch(ctx context.Context, spec Spec, scope Scope) (*Fetch
 		return nil, err
 	}
 	return &Fetched{Records: all, Watermark: watermark}, nil
+}
+
+// WatermarkReader reads a source's current watermark for a population without
+// building it.
+type WatermarkReader interface {
+	Watermark(ctx context.Context, spec Spec, scope Scope) (string, error)
+}
+
+// Watermark returns the source's current watermark for spec: page 1 with
+// limit=1, the same request Fetch makes for its first page. The contract makes
+// the watermark describe the whole in-scope set on every page, so one record is
+// enough to learn whether the dataset has changed since a population was frozen
+// (Invariant 14). A missing watermark is ErrSourceInconsistent, as in Fetch.
+func (f *HTTPFetcher) Watermark(ctx context.Context, spec Spec, scope Scope) (string, error) {
+	base, ok := f.endpoints[spec.System]
+	if !ok {
+		return "", fmt.Errorf("%w: %q", ErrSourceUnknown, spec.System)
+	}
+	if !populationNameRe.MatchString(spec.Population) {
+		return "", fmt.Errorf("%w: population name", domain.ErrInvalidArgument)
+	}
+	resp, err := f.page(ctx, base, spec, scope, "", 1)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(resp.Watermark) == "" {
+		return "", fmt.Errorf("%w: %s returned no watermark", ErrSourceInconsistent, spec.Ref())
+	}
+	return resp.Watermark, nil
 }
 
 // sameDeclared compares two pages' declared totals by row count and exact
@@ -276,13 +305,13 @@ func sameDecimal(a, b string) bool {
 	return ok1 && ok2 && x.Cmp(y) == 0
 }
 
-func (f *HTTPFetcher) page(ctx context.Context, base string, spec Spec, scope Scope, cursor string) (*pageResponse, error) {
+func (f *HTTPFetcher) page(ctx context.Context, base string, spec Spec, scope Scope, cursor string, limit int) (*pageResponse, error) {
 	q := url.Values{}
 	q.Set("legal_entity_id", scope.LegalEntityID)
 	if scope.PeriodID != "" && !spec.NoPeriod {
 		q.Set("period_id", scope.PeriodID)
 	}
-	q.Set("limit", strconv.Itoa(pageSize))
+	q.Set("limit", strconv.Itoa(limit))
 	if cursor != "" {
 		q.Set("cursor", cursor)
 	}

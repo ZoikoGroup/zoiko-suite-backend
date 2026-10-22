@@ -208,16 +208,22 @@ func Compare(a, b MatchItem, p TolerancePolicy) (string, *ExceptionDetail) {
 			&ExceptionDetail{Rule: RuleAmountTolerance, Currency: a.Currency, DifferenceMinor: &diff, AllowedMinor: &allowed}
 	}
 	if p.DateDays != nil {
-		days := int64(a.OccurredAt.UTC().Truncate(24*time.Hour).Sub(b.OccurredAt.UTC().Truncate(24*time.Hour)) / (24 * time.Hour))
-		if days < 0 {
-			days = -days
-		}
+		days := dayDifference(a.OccurredAt, b.OccurredAt)
 		if days > int64(*p.DateDays) {
 			return fmt.Sprintf("timing difference of %d days exceeds date tolerance %d", days, *p.DateDays),
 				&ExceptionDetail{Rule: RuleDateTolerance, Currency: a.Currency, DateDifferenceDays: &days, AllowedDays: p.DateDays}
 		}
 	}
 	return "", nil
+}
+
+// dayDifference is the absolute number of UTC calendar days between a and b.
+func dayDifference(a, b time.Time) int64 {
+	days := int64(a.UTC().Truncate(24*time.Hour).Sub(b.UTC().Truncate(24*time.Hour)) / (24 * time.Hour))
+	if days < 0 {
+		days = -days
+	}
+	return days
 }
 
 // signedDiff returns a-b and absDiff |a-b|, each reporting overflow (ok=false)

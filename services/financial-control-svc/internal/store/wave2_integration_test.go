@@ -28,7 +28,8 @@ type wave2 struct {
 	entity string
 	src    *fakeSources
 	exec   *engine.Executor
-	defs   map[string]string // control code -> definition id
+	fetch  *source.HTTPFetcher // the fetcher exec reads sources with (set by newWave5)
+	defs   map[string]string   // control code -> definition id
 }
 
 var wave2Now = time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)

@@ -34,12 +34,12 @@ type Store interface {
 	// CreateJob enqueues "reconciliation.analyzed" (and, when the job found
 	// unmatched items, "reconciliation.unmatched_flagged") in the same
 	// transaction as the insert.
-	CreateJob(ctx context.Context, tenantID string, job *domain.ReconciliationJob, items []domain.UnmatchedItem, actorID, correlationID string) error
+	CreateJob(ctx context.Context, tenantID string, job *domain.ReconciliationJob, items []domain.ReconciliationSuggestion, actorID, correlationID string) error
 	GetJobByID(ctx context.Context, tenantID, id string) (*domain.ReconciliationJob, error)
 	ListJobs(ctx context.Context, tenantID, legalEntityID, sourceA, status string) ([]domain.ReconciliationJob, error)
 	// ApplyResolution enqueues "reconciliation.resolution_recommended" in
 	// the same transaction as the update.
-	ApplyResolution(ctx context.Context, tenantID, jobID, itemID string, status domain.ResolutionStatus, notes, legalEntityID, actorID, correlationID string) (*domain.UnmatchedItem, error)
+	ApplyResolution(ctx context.Context, tenantID, jobID, itemID string, status domain.SuggestionStatus, notes, legalEntityID, actorID, correlationID string) (*domain.ReconciliationSuggestion, error)
 	ArchiveJob(ctx context.Context, tenantID, id string) error
 }
 
@@ -100,7 +100,7 @@ func (s *PgStore) enqueueReconciliationEvent(ctx context.Context, tx pgx.Tx, fac
 	return nil
 }
 
-func (s *PgStore) CreateJob(ctx context.Context, tenantID string, job *domain.ReconciliationJob, items []domain.UnmatchedItem, actorID, correlationID string) error {
+func (s *PgStore) CreateJob(ctx context.Context, tenantID string, job *domain.ReconciliationJob, items []domain.ReconciliationSuggestion, actorID, correlationID string) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -136,24 +136,28 @@ func (s *PgStore) CreateJob(ctx context.Context, tenantID string, job *domain.Re
 
 	queryItem := `
 		INSERT INTO reconciliation_unmatched_items (
-			id, tenant_id, job_id, transaction_ref_a, transaction_ref_b, amount_a, amount_b,
-			discrepancy_amount, discrepancy_type, confidence_score, recommendation, resolution_status, resolution_notes, created_at, updated_at,
+			id, tenant_id, legal_entity_id, job_id, source_record_a, source_record_b, amount_a, amount_b,
+			discrepancy_amount, discrepancy_type, confidence_score, heuristic_rule, tolerance_version,
+			recommendation, suggestion_status, resolution_notes, created_at, updated_at,
 			bank_reconciliation_run_id, statement_line_id, counterpart_statement_line_id
-		) VALUES ($1, $2, $3, $4, $5, $6::numeric, $7::numeric, $8::numeric, $9, $10, $11, $12, $13, $14, $15,
-			NULLIF($16, '')::uuid, NULLIF($17, '')::uuid, NULLIF($18, '')::uuid)`
+		) VALUES ($1, $2, $3, $4, $5, $6, $7::numeric, $8::numeric, $9::numeric, $10, $11, $12, $13, $14, $15, $16, $17, $18,
+			NULLIF($19, '')::uuid, NULLIF($20, '')::uuid, NULLIF($21, '')::uuid)`
 
 	for i := range items {
 		item := &items[i]
 		item.ID = uuid.New().String()
 		item.TenantID = tenantID
+		// The suggestion carries its own legal entity (A9), not only its job.
+		item.LegalEntityID = job.LegalEntityID
 		item.JobID = job.ID
 		item.CreatedAt = time.Now()
 		item.UpdatedAt = time.Now()
 
 		_, err := tx.Exec(ctx, queryItem,
-			item.ID, tenantID, job.ID, item.TransactionRefA, item.TransactionRefB, item.AmountA, item.AmountB,
-			item.DiscrepancyAmount, string(item.DiscrepancyType), item.ConfidenceScore, string(item.Recommendation),
-			string(item.ResolutionStatus), item.ResolutionNotes, item.CreatedAt, item.UpdatedAt,
+			item.ID, tenantID, item.LegalEntityID, job.ID, item.SourceRecordA, item.SourceRecordB, item.AmountA, item.AmountB,
+			item.DiscrepancyAmount, string(item.DiscrepancyType), item.ConfidenceScore,
+			nullableHeuristicRule(item.HeuristicRule), nullableToleranceVersion(item.ToleranceVersion), string(item.Recommendation),
+			string(item.SuggestionStatus), item.ResolutionNotes, item.CreatedAt, item.UpdatedAt,
 			item.BankReconciliationRunID, item.StatementLineID, item.CounterpartStatementLineID,
 		)
 		if err != nil {
@@ -220,7 +224,7 @@ func (s *PgStore) GetJobByID(ctx context.Context, tenantID, id string) (*domain.
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var item domain.UnmatchedItem
+		var item domain.ReconciliationSuggestion
 		if err := scanItem(rows, &item); err != nil {
 			return nil, fmt.Errorf("scan unmatched item: %w", err)
 		}
@@ -241,8 +245,9 @@ const jobColumns = `id, tenant_id, legal_entity_id, job_name, source_system_a, C
 	total_processed_count, matched_count, unmatched_count, reconciliation_rate, status, analyzed_at, created_at,
 	COALESCE(bank_reconciliation_run_id::text, '')`
 
-const itemColumns = `id, tenant_id, job_id, transaction_ref_a, transaction_ref_b, amount_a, amount_b,
-	discrepancy_amount, discrepancy_type, confidence_score, recommendation, resolution_status,
+const itemColumns = `id, tenant_id, legal_entity_id, job_id, source_record_a, source_record_b, amount_a, amount_b,
+	discrepancy_amount, discrepancy_type, confidence_score, COALESCE(heuristic_rule, ''),
+	COALESCE(tolerance_version, 0), recommendation, suggestion_status,
 	COALESCE(resolution_notes, ''), created_at, updated_at,
 	COALESCE(bank_reconciliation_run_id::text, ''), COALESCE(statement_line_id::text, ''),
 	COALESCE(counterpart_statement_line_id::text, '')`
@@ -255,11 +260,12 @@ func scanJob(row pgx.Row, j *domain.ReconciliationJob) error {
 	)
 }
 
-func scanItem(row pgx.Row, item *domain.UnmatchedItem) error {
+func scanItem(row pgx.Row, item *domain.ReconciliationSuggestion) error {
 	if err := row.Scan(
-		&item.ID, &item.TenantID, &item.JobID, &item.TransactionRefA, &item.TransactionRefB,
+		&item.ID, &item.TenantID, &item.LegalEntityID, &item.JobID, &item.SourceRecordA, &item.SourceRecordB,
 		&item.AmountA, &item.AmountB, &item.DiscrepancyAmount, &item.DiscrepancyType, &item.ConfidenceScore,
-		&item.Recommendation, &item.ResolutionStatus, &item.ResolutionNotes, &item.CreatedAt, &item.UpdatedAt,
+		&item.HeuristicRule, &item.ToleranceVersion,
+		&item.Recommendation, &item.SuggestionStatus, &item.ResolutionNotes, &item.CreatedAt, &item.UpdatedAt,
 		&item.BankReconciliationRunID, &item.StatementLineID, &item.CounterpartStatementLineID,
 	); err != nil {
 		return err
@@ -316,7 +322,7 @@ func (s *PgStore) ListJobs(ctx context.Context, tenantID, legalEntityID, sourceA
 	return jobs, nil
 }
 
-func (s *PgStore) ApplyResolution(ctx context.Context, tenantID, jobID, itemID string, status domain.ResolutionStatus, notes, legalEntityID, actorID, correlationID string) (*domain.UnmatchedItem, error) {
+func (s *PgStore) ApplyResolution(ctx context.Context, tenantID, jobID, itemID string, status domain.SuggestionStatus, notes, legalEntityID, actorID, correlationID string) (*domain.ReconciliationSuggestion, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -327,7 +333,7 @@ func (s *PgStore) ApplyResolution(ctx context.Context, tenantID, jobID, itemID s
 		return nil, err
 	}
 
-	var item domain.UnmatchedItem
+	var item domain.ReconciliationSuggestion
 	queryItem := `SELECT ` + itemColumns + `
 		FROM reconciliation_unmatched_items WHERE id = $1 AND job_id = $2
 		FOR UPDATE`
@@ -335,7 +341,7 @@ func (s *PgStore) ApplyResolution(ctx context.Context, tenantID, jobID, itemID s
 	if err := scanItem(tx.QueryRow(ctx, queryItem, itemID, jobID), &item); err != nil {
 		return nil, fmt.Errorf("unmatched item not found: %w", err)
 	}
-	if err := domain.ValidateResolutionTransition(item.ResolutionStatus, status); err != nil {
+	if err := domain.ValidateResolutionTransition(item.SuggestionStatus, status); err != nil {
 		return nil, err
 	}
 
@@ -349,11 +355,11 @@ func (s *PgStore) ApplyResolution(ctx context.Context, tenantID, jobID, itemID s
 	// at exactly the moment a decision is made.
 	combinedNotes := appendResolutionNote(item.ResolutionNotes, notes)
 
-	item.ResolutionStatus = status
+	item.SuggestionStatus = status
 	item.ResolutionNotes = combinedNotes
 	item.UpdatedAt = time.Now()
 
-	updateQuery := `UPDATE reconciliation_unmatched_items SET resolution_status = $1, resolution_notes = $2, updated_at = $3 WHERE id = $4`
+	updateQuery := `UPDATE reconciliation_unmatched_items SET suggestion_status = $1, resolution_notes = $2, updated_at = $3 WHERE id = $4`
 	_, err = tx.Exec(ctx, updateQuery, string(status), combinedNotes, item.UpdatedAt, itemID)
 	if err != nil {
 		return nil, err
@@ -368,8 +374,12 @@ func (s *PgStore) ApplyResolution(ctx context.Context, tenantID, jobID, itemID s
 			"bank_reconciliation_run_id":    item.BankReconciliationRunID,
 			"statement_line_id":             item.StatementLineID,
 			"counterpart_statement_line_id": item.CounterpartStatementLineID,
-			"resolution_status":             string(item.ResolutionStatus),
-			"resolution_notes":              item.ResolutionNotes,
+			// suggestion_status is canonical; resolution_status is the
+			// pre-rename alias kept for one release (A9/B5). Both carry the
+			// same value, so they cannot disagree.
+			"suggestion_status": string(item.SuggestionStatus),
+			"resolution_status": string(item.SuggestionStatus),
+			"resolution_notes":  item.ResolutionNotes,
 		}); err != nil {
 		return nil, err
 	}
@@ -402,10 +412,30 @@ func (s *PgStore) ArchiveJob(ctx context.Context, tenantID, id string) error {
 	return tx.Commit(ctx)
 }
 
+// nullableHeuristicRule stores an unset rule as NULL. That is only possible
+// for rows written before migration 000005 or for an item a test constructs
+// by hand; a produced suggestion always names its rule. NULL keeps "not
+// recorded" distinct from an empty rule name.
+func nullableHeuristicRule(rule domain.HeuristicRule) any {
+	if rule == "" {
+		return nil
+	}
+	return string(rule)
+}
+
+// nullableToleranceVersion stores an unset version as NULL for the same
+// reason: 0 is not a policy version that was ever approved.
+func nullableToleranceVersion(version int) any {
+	if version == 0 {
+		return nil
+	}
+	return version
+}
+
 // canonicalizeItemAmounts rewrites the NUMERIC(18,4) text Postgres returns
 // ("32.0000") into the canonical decimal form the analyze response used
 // ("32"), so one amount reads the same however it is fetched.
-func canonicalizeItemAmounts(item *domain.UnmatchedItem) error {
+func canonicalizeItemAmounts(item *domain.ReconciliationSuggestion) error {
 	for _, f := range []*string{&item.AmountA, &item.AmountB, &item.DiscrepancyAmount} {
 		r, err := domain.ParseAmount(*f)
 		if err != nil {
@@ -432,7 +462,7 @@ func NewMemoryStore() *MemoryStore {
 
 // CreateJob never emits an event: MemoryStore is a test double with no
 // transaction to enqueue an outbox row into.
-func (m *MemoryStore) CreateJob(ctx context.Context, tenantID string, job *domain.ReconciliationJob, items []domain.UnmatchedItem, actorID, correlationID string) error {
+func (m *MemoryStore) CreateJob(ctx context.Context, tenantID string, job *domain.ReconciliationJob, items []domain.ReconciliationSuggestion, actorID, correlationID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -444,6 +474,7 @@ func (m *MemoryStore) CreateJob(ctx context.Context, tenantID string, job *domai
 	for i := range items {
 		items[i].ID = uuid.New().String()
 		items[i].TenantID = tenantID
+		items[i].LegalEntityID = job.LegalEntityID
 		items[i].JobID = job.ID
 		items[i].CreatedAt = time.Now()
 		items[i].UpdatedAt = time.Now()
@@ -488,7 +519,7 @@ func (m *MemoryStore) ListJobs(ctx context.Context, tenantID, legalEntityID, sou
 	return result, nil
 }
 
-func (m *MemoryStore) ApplyResolution(ctx context.Context, tenantID, jobID, itemID string, status domain.ResolutionStatus, notes, legalEntityID, actorID, correlationID string) (*domain.UnmatchedItem, error) {
+func (m *MemoryStore) ApplyResolution(ctx context.Context, tenantID, jobID, itemID string, status domain.SuggestionStatus, notes, legalEntityID, actorID, correlationID string) (*domain.ReconciliationSuggestion, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -499,13 +530,13 @@ func (m *MemoryStore) ApplyResolution(ctx context.Context, tenantID, jobID, item
 
 	for i := range j.UnmatchedItems {
 		if j.UnmatchedItems[i].ID == itemID {
-			if err := domain.ValidateResolutionTransition(j.UnmatchedItems[i].ResolutionStatus, status); err != nil {
+			if err := domain.ValidateResolutionTransition(j.UnmatchedItems[i].SuggestionStatus, status); err != nil {
 				return nil, err
 			}
 			// Append rather than overwrite — mirrors PgStore exactly. See its
 			// comment: the machine's rationale must survive a human's
 			// empty-note approval.
-			j.UnmatchedItems[i].ResolutionStatus = status
+			j.UnmatchedItems[i].SuggestionStatus = status
 			j.UnmatchedItems[i].ResolutionNotes = appendResolutionNote(j.UnmatchedItems[i].ResolutionNotes, notes)
 			j.UnmatchedItems[i].UpdatedAt = time.Now()
 			return &j.UnmatchedItems[i], nil

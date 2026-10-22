@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -241,7 +242,21 @@ func (h *Handler) GetEvidence(w http.ResponseWriter, r *http.Request) {
 	if pkg.Verified != nil && !*pkg.Verified {
 		h.log.Error("evidence integrity check FAILED", zap.String("run_id", run.RunID), zap.String("package_id", pkg.PackageID))
 	}
-	writeJSON(w, http.StatusOK, pkg)
+	cert, err := h.store.GetCertification(r.Context(), tenantID, run.RunID)
+	if err != nil && !errors.Is(err, domain.ErrNotFound) {
+		h.writeErr(w, "get evidence", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, runEvidence{EvidencePackage: pkg, Certification: cert})
+}
+
+// runEvidence is GET .../evidence: the sealed package, plus the run's
+// ControlCertification (Invariant 9) read directly from control_certifications.
+// Certification is omitted for a run that is not certified, or was certified
+// before certifications were recorded.
+type runEvidence struct {
+	*domain.EvidencePackage
+	Certification *domain.ControlCertification `json:"certification,omitempty"`
 }
 
 // parseIfMatch reads an If-Match ETag (`"3"` or `3`). When absent it returns

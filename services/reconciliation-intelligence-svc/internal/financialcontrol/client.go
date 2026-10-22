@@ -15,7 +15,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math/big"
 	"net/http"
 	"net/url"
 	"time"
@@ -60,18 +59,22 @@ type listTolerancePoliciesResponse struct {
 }
 
 // GetActiveAbsoluteTolerance fetches the current (highest-version)
-// governed absolute tolerance for (legalEntityID, metric). Fails
-// closed: unreachable, non-200, or a malformed body all return
-// ErrServiceUnavailable; a reachable service with no policy configured
-// yet returns ErrToleranceNotConfigured. Neither case ever falls back
-// to a guessed default — see the package doc comment.
+// governed absolute tolerance for (legalEntityID, metric), returning both the
+// value and the version it was approved under. Fails closed: unreachable,
+// non-200, or a malformed body all return ErrServiceUnavailable; a reachable
+// service with no policy configured yet returns ErrToleranceNotConfigured.
+// Neither case ever falls back to a guessed default — see the package doc
+// comment.
 //
 // financial-control-svc returns the tolerance as an exact decimal string;
 // it is parsed straight into a big.Rat, never float64 (ZS-DATA-001 D06),
 // so the governed limit a suggestion is compared against is the exact
-// value that was approved. A negative tolerance is malformed and also
-// fails closed.
-func (c *Client) GetActiveAbsoluteTolerance(ctx context.Context, tenantID, principalID, legalEntityID, metric string) (*big.Rat, error) {
+// value that was approved. A negative tolerance or a non-positive version
+// is malformed and also fails closed.
+//
+// The version used to be discarded. It is now returned so every suggestion
+// can record which policy version its score basis rests on (A8).
+func (c *Client) GetActiveAbsoluteTolerance(ctx context.Context, tenantID, principalID, legalEntityID, metric string) (*domain.GovernedTolerance, error) {
 	q := url.Values{"legal_entity_id": {legalEntityID}, "metric": {metric}}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/controls/v1/tolerance-policies?"+q.Encode(), nil)
 	if err != nil {
@@ -107,7 +110,10 @@ func (c *Client) GetActiveAbsoluteTolerance(ctx context.Context, tenantID, princ
 	if err != nil || tolerance.Sign() < 0 {
 		return nil, fmt.Errorf("%w: malformed absolute_tolerance %q", ErrServiceUnavailable, latest.AbsoluteTolerance)
 	}
-	return tolerance, nil
+	if latest.ToleranceVersion <= 0 {
+		return nil, fmt.Errorf("%w: malformed tolerance_version %d", ErrServiceUnavailable, latest.ToleranceVersion)
+	}
+	return &domain.GovernedTolerance{Amount: tolerance, Version: latest.ToleranceVersion}, nil
 }
 
 // setEnvelopeHeaders forwards the canonical service input envelope

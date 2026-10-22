@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 
 	"zoiko.io/consolidation-svc/internal/clients"
@@ -25,10 +26,22 @@ type stubStore struct {
 	snapshots     map[string][]domain.BalanceSnapshot
 	contributions map[string][]domain.BalanceContribution
 	contribErr    error
+	eliminations  map[string][]domain.Elimination
+	elimErr       error
 
 	adjustments map[string]*domain.ConsolidationAdjustment
+	histories   map[string]*domain.AdjustmentHistory
 	groupHasRun map[string]bool
 	hasSnapshot map[string]bool
+
+	// commandKeys mirrors command_idempotency by Idempotency-Key, so the
+	// handler's replay path is exercised against the same rule the store
+	// applies: same command and target replays, anything else conflicts.
+	commandKeys map[string]stubCommandKey
+
+	// completeErr makes CompleteRun fail, for the A14 test that the response
+	// reports the run's persisted state instead of 201 COMPLETED.
+	completeErr error
 
 	// What the handler handed the store for the run's events; the enqueue
 	// itself happens inside PgStore and is proven in outbox_events_test.go.
@@ -39,21 +52,54 @@ type stubStore struct {
 	completedExceptions []string
 }
 
+// stubCommandKey is one command_idempotency row.
+type stubCommandKey struct {
+	command      string
+	runID        string
+	adjustmentID string
+}
+
 func newStubStore() *stubStore {
 	return &stubStore{
 		runs:          make(map[string]*domain.ConsolidationRun),
 		snapshots:     make(map[string][]domain.BalanceSnapshot),
 		contributions: make(map[string][]domain.BalanceContribution),
+		eliminations:  make(map[string][]domain.Elimination),
 		adjustments:   make(map[string]*domain.ConsolidationAdjustment),
+		histories:     make(map[string]*domain.AdjustmentHistory),
 		groupHasRun:   make(map[string]bool),
 		hasSnapshot:   make(map[string]bool),
+		commandKeys:   make(map[string]stubCommandKey),
 	}
 }
 
-func (s *stubStore) CreateRun(_ context.Context, run *domain.ConsolidationRun, actorID, _ string) error {
+func (s *stubStore) recordCommandKey(key, command, runID, adjustmentID string) {
+	s.commandKeys[key] = stubCommandKey{command: command, runID: runID, adjustmentID: adjustmentID}
+}
+
+func (s *stubStore) CreateRun(_ context.Context, run *domain.ConsolidationRun, idempotencyKey, actorID, _ string) (*domain.ConsolidationRun, bool, error) {
+	if idempotencyKey == "" {
+		return nil, false, domain.ErrIdempotencyKeyRequired
+	}
+	if rec, ok := s.commandKeys[idempotencyKey]; ok {
+		if rec.command != domain.CommandStartRun || rec.runID == "" {
+			return nil, false, domain.ErrIdempotencyKeyConflict
+		}
+		existing, ok := s.runs[rec.runID]
+		if !ok {
+			return nil, false, domain.ErrRunNotFound
+		}
+		if existing.GroupLegalEntityID != run.GroupLegalEntityID ||
+			existing.FiscalPeriod != run.FiscalPeriod ||
+			existing.TargetCurrency != run.TargetCurrency {
+			return nil, false, domain.ErrIdempotencyKeyConflict
+		}
+		return existing, true, nil
+	}
 	s.runs[run.ConsolidationRunID] = run
 	s.createRunActor = actorID
-	return nil
+	s.recordCommandKey(idempotencyKey, domain.CommandStartRun, run.ConsolidationRunID, "")
+	return run, false, nil
 }
 
 func (s *stubStore) GetRun(_ context.Context, id string) (*domain.ConsolidationRun, error) {
@@ -76,6 +122,9 @@ func (s *stubStore) ListRuns(_ context.Context, groupLegalEntityID string) ([]do
 }
 
 func (s *stubStore) CompleteRun(_ context.Context, id, status string, exceptionCount int, completedAt time.Time, actorID, _ string, snapshotCount int, exceptions []string) error {
+	if s.completeErr != nil {
+		return s.completeErr
+	}
 	run, ok := s.runs[id]
 	if !ok {
 		return domain.ErrRunNotFound
@@ -126,6 +175,20 @@ func (s *stubStore) ListContributionsByRun(_ context.Context, runID string) ([]d
 	return c, nil
 }
 
+func (s *stubStore) CreateEliminations(_ context.Context, rows []domain.Elimination) error {
+	if s.elimErr != nil {
+		return s.elimErr
+	}
+	for _, e := range rows {
+		s.eliminations[e.ConsolidationRunID] = append(s.eliminations[e.ConsolidationRunID], e)
+	}
+	return nil
+}
+
+func (s *stubStore) ListEliminationsByRun(_ context.Context, runID string) ([]domain.Elimination, error) {
+	return s.eliminations[runID], nil
+}
+
 func (s *stubStore) GroupEntityHasRun(_ context.Context, groupLegalEntityID string) (bool, error) {
 	return s.groupHasRun[groupLegalEntityID], nil
 }
@@ -134,9 +197,28 @@ func (s *stubStore) HasSnapshotForPeriod(_ context.Context, groupLegalEntityID, 
 	return s.hasSnapshot[groupLegalEntityID+"|"+fiscalPeriod], nil
 }
 
-func (s *stubStore) CreateAdjustment(_ context.Context, a *domain.ConsolidationAdjustment) error {
+func (s *stubStore) CreateAdjustment(_ context.Context, a *domain.ConsolidationAdjustment, idempotencyKey, _ string) (*domain.ConsolidationAdjustment, bool, error) {
+	if idempotencyKey == "" {
+		return nil, false, domain.ErrIdempotencyKeyRequired
+	}
+	if rec, ok := s.commandKeys[idempotencyKey]; ok {
+		if rec.command != domain.CommandCreateAdjustment || rec.adjustmentID == "" {
+			return nil, false, domain.ErrIdempotencyKeyConflict
+		}
+		existing, ok := s.adjustments[rec.adjustmentID]
+		if !ok {
+			return nil, false, domain.ErrAdjustmentNotFound
+		}
+		if existing.GroupLegalEntityID != a.GroupLegalEntityID ||
+			existing.FiscalPeriod != a.FiscalPeriod ||
+			existing.AdjustmentType != a.AdjustmentType {
+			return nil, false, domain.ErrIdempotencyKeyConflict
+		}
+		return existing, true, nil
+	}
 	s.adjustments[a.ConsolidationAdjustmentID] = a
-	return nil
+	s.recordCommandKey(idempotencyKey, domain.CommandCreateAdjustment, "", a.ConsolidationAdjustmentID)
+	return a, false, nil
 }
 
 func (s *stubStore) GetAdjustment(_ context.Context, id string) (*domain.ConsolidationAdjustment, error) {
@@ -145,6 +227,14 @@ func (s *stubStore) GetAdjustment(_ context.Context, id string) (*domain.Consoli
 		return nil, domain.ErrAdjustmentNotFound
 	}
 	return a, nil
+}
+
+func (s *stubStore) GetAdjustmentHistory(_ context.Context, id string) (*domain.AdjustmentHistory, error) {
+	h, ok := s.histories[id]
+	if !ok {
+		return nil, domain.ErrAdjustmentNotFound
+	}
+	return h, nil
 }
 
 func (s *stubStore) ListAdjustments(_ context.Context, groupLegalEntityID, fiscalPeriod string) ([]domain.ConsolidationAdjustment, error) {
@@ -161,35 +251,88 @@ func (s *stubStore) ListAdjustments(_ context.Context, groupLegalEntityID, fisca
 	return out, nil
 }
 
-func (s *stubStore) ApproveAdjustment(_ context.Context, id, principalID string) error {
+func (s *stubStore) ApproveAdjustment(_ context.Context, id, principalID, idempotencyKey, _ string) (*domain.ConsolidationAdjustment, bool, error) {
+	if idempotencyKey == "" {
+		return nil, false, domain.ErrIdempotencyKeyRequired
+	}
 	a, ok := s.adjustments[id]
-	if !ok || a.Status != domain.AdjustmentStatusPendingApproval {
-		return domain.ErrInvalidAdjustmentTransition
+	if !ok {
+		return nil, false, domain.ErrAdjustmentNotFound
+	}
+	if rec, ok := s.commandKeys[idempotencyKey]; ok {
+		if rec.command != domain.CommandApproveAdjustment || rec.adjustmentID != id {
+			return nil, false, domain.ErrIdempotencyKeyConflict
+		}
+		return a, true, nil
+	}
+	if a.Status != domain.AdjustmentStatusPendingApproval {
+		return nil, false, domain.ErrInvalidAdjustmentTransition
 	}
 	now := time.Now().UTC()
 	a.Status, a.ApprovedAt, a.ApprovedByPrincipalID = domain.AdjustmentStatusApproved, &now, &principalID
-	return nil
+	s.recordCommandKey(idempotencyKey, domain.CommandApproveAdjustment, "", id)
+	return a, false, nil
 }
 
-func (s *stubStore) MarkAdjustmentPosted(_ context.Context, id, principalID, journalID string) error {
+func (s *stubStore) MarkAdjustmentPosted(_ context.Context, id, principalID, journalID, idempotencyKey, _ string) (*domain.ConsolidationAdjustment, bool, error) {
+	if idempotencyKey == "" {
+		return nil, false, domain.ErrIdempotencyKeyRequired
+	}
 	a, ok := s.adjustments[id]
-	if !ok || a.Status != domain.AdjustmentStatusApproved {
-		return domain.ErrInvalidAdjustmentTransition
+	if !ok {
+		return nil, false, domain.ErrAdjustmentNotFound
+	}
+	if rec, ok := s.commandKeys[idempotencyKey]; ok {
+		if rec.command != domain.CommandPostAdjustment || rec.adjustmentID != id {
+			return nil, false, domain.ErrIdempotencyKeyConflict
+		}
+		return a, true, nil
+	}
+	if a.Status != domain.AdjustmentStatusApproved {
+		return nil, false, domain.ErrInvalidAdjustmentTransition
 	}
 	now := time.Now().UTC()
 	a.Status, a.PostedAt, a.PostedByPrincipalID, a.ConsolidationBookJournalID = domain.AdjustmentStatusPosted, &now, &principalID, &journalID
-	return nil
+	s.recordCommandKey(idempotencyKey, domain.CommandPostAdjustment, "", id)
+	return a, false, nil
 }
 
-func (s *stubStore) ReverseAdjustment(_ context.Context, id, principalID, reason string, supersededBy *string) error {
+func (s *stubStore) ReverseAdjustment(_ context.Context, id, principalID, reason string, supersededBy *string, idempotencyKey, _ string) (*domain.ConsolidationAdjustment, bool, error) {
+	if idempotencyKey == "" {
+		return nil, false, domain.ErrIdempotencyKeyRequired
+	}
 	a, ok := s.adjustments[id]
-	if !ok || a.Status != domain.AdjustmentStatusPosted {
-		return domain.ErrInvalidAdjustmentTransition
+	if !ok {
+		return nil, false, domain.ErrAdjustmentNotFound
+	}
+	if rec, ok := s.commandKeys[idempotencyKey]; ok {
+		if rec.command != domain.CommandReverseAdjustment || rec.adjustmentID != id {
+			return nil, false, domain.ErrIdempotencyKeyConflict
+		}
+		return a, true, nil
+	}
+	if a.Status != domain.AdjustmentStatusPosted {
+		return nil, false, domain.ErrInvalidAdjustmentTransition
 	}
 	now := time.Now().UTC()
 	a.Status, a.ReversedAt, a.ReversedByPrincipalID, a.ReversalReason, a.SupersededByAdjustmentID =
 		domain.AdjustmentStatusReversed, &now, &principalID, &reason, supersededBy
-	return nil
+	s.recordCommandKey(idempotencyKey, domain.CommandReverseAdjustment, "", id)
+	return a, false, nil
+}
+
+func (s *stubStore) ReplayedAdjustmentCommand(_ context.Context, id, command, idempotencyKey string) (bool, error) {
+	if idempotencyKey == "" {
+		return false, domain.ErrIdempotencyKeyRequired
+	}
+	rec, ok := s.commandKeys[idempotencyKey]
+	if !ok {
+		return false, nil
+	}
+	if rec.command != command || rec.adjustmentID != id {
+		return false, domain.ErrIdempotencyKeyConflict
+	}
+	return true, nil
 }
 
 // Compile-time proof the stub still satisfies the contract the handler
@@ -204,23 +347,37 @@ type stubClients struct {
 	glBalances map[string]map[string]float64
 	glErr      error
 
+	// trialBalanceReads counts FetchTrialBalance calls, so an A14 replay can
+	// prove it did not run the run's GL work a second time.
+	trialBalanceReads int
+
 	intercompanyEntries []clients.IntercompanyEntry
 	intercompanyErr     error
-	principalIDReceived string // captures what FetchMatchedIntercompanyEntries was called with
+	principalIDReceived string // captures what FetchEliminableIntercompanyEntries was called with
 
-	// journalLines maps journal_id -> its real posted lines, for the
-	// elimination path (FetchJournalLines). journalLinesErr, keyed the
-	// same way, lets a test simulate one specific journal's lookup failing.
-	journalLines    map[string][]clients.JournalLine
-	journalLinesErr map[string]error
+	reciprocalBalances *domain.ReciprocalBalances
+	reciprocalErr      error
+	reciprocalEntityA  string
+	reciprocalEntityB  string
+	reciprocalPeriod   string
+
+	// journals maps journal_id -> the journal general-ledger-svc serves,
+	// for the elimination path (FetchJournal). journalErr, keyed the same
+	// way, lets a test simulate one specific journal's lookup failing.
+	journals     map[string]*domain.PostedJournal
+	journalErr   map[string]error
+	journalReads []string
 
 	postJournalID           string
 	postErr                 error
+	postCalls               int
 	reverseErr              error
+	reverseCalls            int
 	lastPostedLegalEntityID string
 }
 
 func (c *stubClients) FetchTrialBalance(_ context.Context, _, legalEntityID, _ string) (map[string]float64, error) {
+	c.trialBalanceReads++
 	if c.glErr != nil {
 		return nil, c.glErr
 	}
@@ -232,7 +389,7 @@ func (c *stubClients) FetchTrialBalance(_ context.Context, _, legalEntityID, _ s
 	return map[string]float64{"1000-Cash": 10000.0}, nil
 }
 
-func (c *stubClients) FetchMatchedIntercompanyEntries(_ context.Context, _, principalID string) ([]clients.IntercompanyEntry, error) {
+func (c *stubClients) FetchEliminableIntercompanyEntries(_ context.Context, _, principalID string) ([]clients.IntercompanyEntry, error) {
 	c.principalIDReceived = principalID
 	if c.intercompanyErr != nil {
 		return nil, c.intercompanyErr
@@ -240,14 +397,35 @@ func (c *stubClients) FetchMatchedIntercompanyEntries(_ context.Context, _, prin
 	return c.intercompanyEntries, nil
 }
 
-func (c *stubClients) FetchJournalLines(_ context.Context, _, journalID string) ([]clients.JournalLine, error) {
-	if err, ok := c.journalLinesErr[journalID]; ok {
-		return nil, err
+func (c *stubClients) FetchReciprocalBalances(_ context.Context, _, principalID, entityA, entityB, fiscalPeriod string) (*domain.ReciprocalBalances, error) {
+	c.principalIDReceived = principalID
+	c.reciprocalEntityA, c.reciprocalEntityB, c.reciprocalPeriod = entityA, entityB, fiscalPeriod
+	if c.reciprocalErr != nil {
+		return nil, c.reciprocalErr
 	}
-	return c.journalLines[journalID], nil
+	return c.reciprocalBalances, nil
 }
 
+func (c *stubClients) FetchJournal(_ context.Context, _, journalID string) (*domain.PostedJournal, error) {
+	c.journalReads = append(c.journalReads, journalID)
+	if err, ok := c.journalErr[journalID]; ok {
+		return nil, err
+	}
+	if j, ok := c.journals[journalID]; ok {
+		return j, nil
+	}
+	return nil, domain.ErrGLServiceUnavailable
+}
+
+// finalized is a FINALIZED journal of entity in period with lines.
+func finalized(id, entity, period string, lines ...domain.PostedLine) *domain.PostedJournal {
+	return &domain.PostedJournal{JournalID: id, LegalEntityID: entity, FiscalPeriod: period, Status: "FINALIZED", Lines: lines}
+}
+
+func strPtr(s string) *string { return &s }
+
 func (c *stubClients) PostConsolidationAdjustmentJournal(_ context.Context, _, _, legalEntityID, _, _, _, _ string, _ []clients.JournalLine) (string, error) {
+	c.postCalls++
 	c.lastPostedLegalEntityID = legalEntityID
 	if c.postErr != nil {
 		return "", c.postErr
@@ -259,6 +437,7 @@ func (c *stubClients) PostConsolidationAdjustmentJournal(_ context.Context, _, _
 }
 
 func (c *stubClients) ReverseConsolidationAdjustmentJournal(_ context.Context, _, _, _, _ string) error {
+	c.reverseCalls++
 	return c.reverseErr
 }
 
@@ -277,13 +456,23 @@ func newRouter(s *stubStore, authz *stubAuthZ, cl *stubClients) chi.Router {
 	return r
 }
 
+// doReq sends a command with a fresh Idempotency-Key: every mutating route in
+// this service requires one. Tests that need to retry under the same key use
+// doReqWithKey; the missing-key path uses doReqWithKey with "".
 func doReq(r chi.Router, method, path string, body any, principalID string) *httptest.ResponseRecorder {
+	return doReqWithKey(r, method, path, body, principalID, uuid.NewString())
+}
+
+func doReqWithKey(r chi.Router, method, path string, body any, principalID, idempotencyKey string) *httptest.ResponseRecorder {
 	var buf bytes.Buffer
 	if body != nil {
 		_ = json.NewEncoder(&buf).Encode(body)
 	}
 	req := httptest.NewRequest(method, path, &buf)
 	req.Header.Set("Content-Type", "application/json")
+	if idempotencyKey != "" {
+		req.Header.Set("Idempotency-Key", idempotencyKey)
+	}
 	if principalID != "" {
 		req.Header.Set("X-Principal-Id", principalID)
 	}
@@ -392,21 +581,24 @@ func TestStartRun_EliminatesMatchedIntercompanyEntry(t *testing.T) {
 				TargetLegalEntityID: "le-uk",
 				SourceJournalID:     "journal-us-1",
 				TargetJournalID:     &tgtJournal,
-				Amount:              500.0,
+				Amount:              "500",
+				CounterpartyAmount:  "500",
+				FiscalPeriod:        strPtr("2024-Q1"),
 				MatchStatus:         "MATCHED",
 			},
 		},
-		journalLines: map[string][]clients.JournalLine{
-			"journal-us-1": {{AccountCode: "1500-IC-Receivable", DebitAmount: 500.0, CreditAmount: 0}},
-			"journal-uk-1": {{AccountCode: "2500-IC-Payable", DebitAmount: 0, CreditAmount: 500.0}},
+		journals: map[string]*domain.PostedJournal{
+			"journal-us-1": finalized("journal-us-1", "le-us", "2024-Q1", domain.PostedLine{LineNumber: 1, AccountCode: "1500-IC-Receivable", DebitAmount: 500.0}),
+			"journal-uk-1": finalized("journal-uk-1", "le-uk", "2024-Q1", domain.PostedLine{LineNumber: 1, AccountCode: "2500-IC-Payable", CreditAmount: 500.0}),
 		},
 	}
 	r := newRouter(s, &stubAuthZ{}, cl)
 	rr := doReq(r, http.MethodPost, "/v1/consolidation/runs/", map[string]any{
-		"group_legal_entity_id":  "le-group",
-		"child_legal_entity_ids": []string{"le-us", "le-uk"},
-		"fiscal_period":          "2024-Q1",
-		"target_currency":        "USD",
+		"group_legal_entity_id":      "le-group",
+		"child_legal_entity_ids":     []string{"le-us", "le-uk"},
+		"fiscal_period":              "2024-Q1",
+		"target_currency":            "USD",
+		"intercompany_account_codes": []string{"1500-IC-Receivable", "2500-IC-Payable"},
 	}, "principal-1")
 
 	if rr.Code != http.StatusCreated {
@@ -442,36 +634,44 @@ func TestStartRun_EliminatesMatchedIntercompanyEntry(t *testing.T) {
 }
 
 // TestStartRun_EliminationFetchFailure_RecordsVisibleException proves a
-// failed elimination leg surfaces as a real, visible exception on the run
-// — never a silent warning, and never a run that reports 0 exceptions
-// while quietly having skipped elimination.
+// leg that cannot be read leaves the whole pair uneliminated: the pair is a
+// BLOCKED elimination row and a visible exception on the run, and the
+// readable leg is not subtracted on its own (no half-eliminated pair).
 func TestStartRun_EliminationFetchFailure_RecordsVisibleException(t *testing.T) {
 	s := newStubStore()
 	tgtJournal := "journal-uk-1"
 	cl := &stubClients{
 		glBalances: map[string]map[string]float64{
-			"le-us": {"1000-Cash": 5000.0},
-			"le-uk": {"1000-Cash": 3000.0},
+			"le-us": {"1000-Cash": 5000.0, "1500-IC-Receivable": 500.0},
+			"le-uk": {"1000-Cash": 3000.0, "2500-IC-Payable": -500.0},
 		},
 		intercompanyEntries: []clients.IntercompanyEntry{
 			{
 				IntercompanyEntryID: "ic-1",
+				SourceLegalEntityID: "le-us",
+				TargetLegalEntityID: "le-uk",
 				SourceJournalID:     "journal-us-1",
 				TargetJournalID:     &tgtJournal,
-				Amount:              500.0,
+				Amount:              "500",
+				CounterpartyAmount:  "500",
+				FiscalPeriod:        strPtr("2024-Q1"),
 				MatchStatus:         "MATCHED",
 			},
 		},
-		journalLinesErr: map[string]error{
-			"journal-us-1": domain.ErrGLServiceUnavailable,
+		journals: map[string]*domain.PostedJournal{
+			"journal-us-1": finalized("journal-us-1", "le-us", "2024-Q1", domain.PostedLine{LineNumber: 1, AccountCode: "1500-IC-Receivable", DebitAmount: 500.0}),
+		},
+		journalErr: map[string]error{
+			"journal-uk-1": domain.ErrGLServiceUnavailable,
 		},
 	}
 	r := newRouter(s, &stubAuthZ{}, cl)
 	rr := doReq(r, http.MethodPost, "/v1/consolidation/runs/", map[string]any{
-		"group_legal_entity_id":  "le-group",
-		"child_legal_entity_ids": []string{"le-us", "le-uk"},
-		"fiscal_period":          "2024-Q1",
-		"target_currency":        "USD",
+		"group_legal_entity_id":      "le-group",
+		"child_legal_entity_ids":     []string{"le-us", "le-uk"},
+		"fiscal_period":              "2024-Q1",
+		"target_currency":            "USD",
+		"intercompany_account_codes": []string{"1500-IC-Receivable", "2500-IC-Payable"},
 	}, "principal-1")
 
 	if rr.Code != http.StatusCreated {
@@ -487,6 +687,15 @@ func TestStartRun_EliminationFetchFailure_RecordsVisibleException(t *testing.T) 
 	// exception.detected enqueue: TestPgStore_CompleteRun_WithExceptions_EnqueuesExceptionDetectedEvent.
 	if len(s.completedExceptions) != 1 {
 		t.Errorf("expected the 1 elimination exception handed to CompleteRun, got %v", s.completedExceptions)
+	}
+	for _, snap := range resp.Snapshots {
+		if snap.AccountCode == "1500-IC-Receivable" && snap.ConsolidatedBalance != 500 {
+			t.Errorf("the readable source leg was eliminated on its own: receivable = %v", snap.ConsolidatedBalance)
+		}
+	}
+	rows := s.eliminations[resp.ConsolidationRunID]
+	if len(rows) != 1 || rows[0].Outcome != domain.EliminationOutcomeBlocked || rows[0].BlockedReason == nil || len(rows[0].Lines) != 0 {
+		t.Fatalf("expected one BLOCKED elimination row with no lines, got %+v", rows)
 	}
 }
 

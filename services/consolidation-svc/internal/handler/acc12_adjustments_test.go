@@ -26,7 +26,7 @@ func seedAdjustment(s *stubStore, id, status, createdBy string) *domain.Consolid
 	return a
 }
 
-func stubClientsWithMatched(amount float64) *stubClients {
+func stubClientsWithMatched(amount domain.Decimal) *stubClients {
 	return &stubClients{
 		intercompanyEntries: []clients.IntercompanyEntry{
 			{IntercompanyEntryID: "ic-1", Amount: amount, MatchStatus: "MATCHED"},
@@ -81,7 +81,7 @@ func TestCreateEliminationProposal_EliminationExceedsMatchedBalance_Refused(t *t
 	s := newStubStore()
 	s.groupHasRun["group-1"] = true
 	// Only 50 of matched intercompany balance exists; the proposal below asks for 100.
-	r := newRouter(s, &stubAuthZ{}, stubClientsWithMatched(50))
+	r := newRouter(s, &stubAuthZ{}, stubClientsWithMatched("50"))
 
 	resp := doReq(r, http.MethodPost, "/v1/consolidation/adjustments", validAdjustmentReq(domain.AdjustmentTypeElimination), "preparer-1")
 	if resp.Code != http.StatusUnprocessableEntity {
@@ -92,7 +92,7 @@ func TestCreateEliminationProposal_EliminationExceedsMatchedBalance_Refused(t *t
 func TestCreateEliminationProposal_EliminationWithinMatchedBalance_Allowed(t *testing.T) {
 	s := newStubStore()
 	s.groupHasRun["group-1"] = true
-	r := newRouter(s, &stubAuthZ{}, stubClientsWithMatched(500))
+	r := newRouter(s, &stubAuthZ{}, stubClientsWithMatched("500"))
 
 	resp := doReq(r, http.MethodPost, "/v1/consolidation/adjustments", validAdjustmentReq(domain.AdjustmentTypeElimination), "preparer-1")
 	if resp.Code != http.StatusCreated {

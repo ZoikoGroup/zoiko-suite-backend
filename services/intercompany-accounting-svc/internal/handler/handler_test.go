@@ -39,6 +39,9 @@ type stubStoreReal struct {
 	createdEvents []eventRecord
 	matchEvents   []eventRecord
 
+	transitions map[string][]domain.PairTransition
+	attempts    map[string][]domain.MatchAttempt
+
 	// updateMatchErr, when set, is returned by UpdateMatch without writing.
 	updateMatchErr error
 
@@ -50,19 +53,38 @@ type stubStoreReal struct {
 }
 
 func newStubStoreReal() *stubStoreReal {
-	return &stubStoreReal{entries: make(map[string]*domain.IntercompanyEntry), bySourceJournal: make(map[string]string)}
+	return &stubStoreReal{entries: make(map[string]*domain.IntercompanyEntry), bySourceJournal: make(map[string]string),
+		attempts: make(map[string][]domain.MatchAttempt)}
 }
 
-func (s *stubStoreReal) CreateEntry(_ context.Context, entry *domain.IntercompanyEntry, actorID, correlationID string) (bool, error) {
+func (s *stubStoreReal) CreateEntry(ctx context.Context, entry *domain.IntercompanyEntry, actorID, correlationID string) (bool, error) {
+	return s.CreateEntryWithAttempt(ctx, entry, nil, actorID, correlationID)
+}
+
+func (s *stubStoreReal) CreateEntryWithAttempt(_ context.Context, entry *domain.IntercompanyEntry, attempt *domain.MatchAttempt, actorID, correlationID string) (bool, error) {
 	key := entry.TenantID + "|" + entry.SourceJournalID
 	if existingID, ok := s.bySourceJournal[key]; ok {
 		*entry = *s.entries[existingID]
 		return false, nil
 	}
+	if attempt != nil {
+		entry.MismatchReason = attempt.Message
+		s.attempts[entry.IntercompanyEntryID] = append(s.attempts[entry.IntercompanyEntryID], *attempt)
+	}
 	s.bySourceJournal[key] = entry.IntercompanyEntryID
 	s.entries[entry.IntercompanyEntryID] = entry
 	s.createdEvents = append(s.createdEvents, eventRecord{entry: *entry, actorID: actorID, correlationID: correlationID})
 	return true, nil
+}
+
+func (s *stubStoreReal) GetEntryBySourceJournal(_ context.Context, sourceJournalID string) (*domain.IntercompanyEntry, error) {
+	for _, entry := range s.entries {
+		if entry.SourceJournalID == sourceJournalID {
+			cp := *entry
+			return &cp, nil
+		}
+	}
+	return nil, domain.ErrEntryNotFound
 }
 
 func (s *stubStoreReal) GetEntry(_ context.Context, id string) (*domain.IntercompanyEntry, error) {
@@ -91,7 +113,7 @@ func (s *stubStoreReal) ListEntries(_ context.Context, sourceEntityID, targetEnt
 	return out, nil
 }
 
-func (s *stubStoreReal) UpdateMatch(_ context.Context, entry *domain.IntercompanyEntry, actorID, correlationID string) error {
+func (s *stubStoreReal) UpdateMatch(_ context.Context, entry *domain.IntercompanyEntry, attempt *domain.MatchAttempt, actorID, correlationID string) error {
 	if s.updateMatchErr != nil {
 		return s.updateMatchErr
 	}
@@ -104,13 +126,14 @@ func (s *stubStoreReal) UpdateMatch(_ context.Context, entry *domain.Intercompan
 	}
 	existing.TargetJournalID = entry.TargetJournalID
 	existing.MatchStatus = entry.MatchStatus
-	existing.MismatchReason = entry.MismatchReason
+	existing.MismatchReason = attempt.Message
 	existing.UpdatedAt = time.Now().UTC()
+	s.attempts[entry.IntercompanyEntryID] = append(s.attempts[entry.IntercompanyEntryID], *attempt)
 	s.matchEvents = append(s.matchEvents, eventRecord{entry: *existing, actorID: actorID, correlationID: correlationID})
 	return nil
 }
 
-func (s *stubStoreReal) AcknowledgeCounterparty(_ context.Context, id, principalID string) error {
+func (s *stubStoreReal) AcknowledgeCounterparty(_ context.Context, id, principalID, _ string) error {
 	entry, ok := s.entries[id]
 	if !ok || entry.MatchStatus != domain.MatchStatusUnmatched {
 		return domain.ErrInvalidPairTransition
@@ -120,7 +143,7 @@ func (s *stubStoreReal) AcknowledgeCounterparty(_ context.Context, id, principal
 	return nil
 }
 
-func (s *stubStoreReal) DisputeIntercompany(_ context.Context, id, principalID, reason string) error {
+func (s *stubStoreReal) DisputeIntercompany(_ context.Context, id, principalID, reason, _ string) error {
 	entry, ok := s.entries[id]
 	if !ok || entry.MatchStatus != domain.MatchStatusMismatch {
 		return domain.ErrInvalidPairTransition
@@ -130,14 +153,36 @@ func (s *stubStoreReal) DisputeIntercompany(_ context.Context, id, principalID, 
 	return nil
 }
 
-func (s *stubStoreReal) ResolveMismatch(_ context.Context, id, principalID, resolutionNote string) error {
+func (s *stubStoreReal) ResolveMismatch(_ context.Context, id, principalID, resolutionNote, outcome, _ string) error {
 	entry, ok := s.entries[id]
 	if !ok || entry.MatchStatus != domain.MatchStatusDisputed {
 		return domain.ErrInvalidPairTransition
 	}
 	now := time.Now().UTC()
 	entry.MatchStatus, entry.ResolvedAt, entry.ResolvedByPrincipalID, entry.ResolutionNote = domain.MatchStatusResolved, &now, &principalID, &resolutionNote
+	entry.ResolutionOutcome = &outcome
 	return nil
+}
+
+func (s *stubStoreReal) ClosePair(_ context.Context, id, principalID, reason, _ string) error {
+	entry, ok := s.entries[id]
+	if !ok {
+		return domain.ErrEntryNotFound
+	}
+	if entry.MatchStatus != domain.MatchStatusMatched {
+		return domain.ErrInvalidPairTransition
+	}
+	now := time.Now().UTC()
+	entry.MatchStatus, entry.ClosedAt, entry.ClosedByPrincipalID, entry.CloseReason = domain.MatchStatusClosed, &now, &principalID, &reason
+	return nil
+}
+
+func (s *stubStoreReal) ListMatchAttempts(_ context.Context, id string) ([]domain.MatchAttempt, error) {
+	return s.attempts[id], nil
+}
+
+func (s *stubStoreReal) ListTransitions(_ context.Context, id string) ([]domain.PairTransition, error) {
+	return s.transitions[id], nil
 }
 
 // Compile-time proof the stub still satisfies the contract the handler
@@ -163,9 +208,20 @@ func (l *stubLedger) GetJournal(_ context.Context, _, _ string) (*ledger.Journal
 	return l.journal, nil
 }
 
+// ledgerWithSourceJournal is a general-ledger-svc stub answering with a
+// journal that passes CreateIntercompanyPair's four source checks
+// (SPEC_DEVIATIONS A6): it exists, belongs to entity, is FINALIZED and is in
+// currency.
+func ledgerWithSourceJournal(entity, currency string) *stubLedger {
+	return &stubLedger{journal: &ledger.JournalDetail{
+		JournalID: "source-journal", LegalEntityID: entity, Status: "FINALIZED", CurrencyCode: currency,
+		Lines: []ledger.JournalLine{{AccountCode: "1300", DebitAmount: "5000"}},
+	}}
+}
+
 // ── router factory ─────────────────────────────────────────────────────────────
 
-func newRouter(s *stubStoreReal, authz *stubAuthZ, leg *stubLedger) chi.Router {
+func newRouter(s *stubStoreReal, authz handler.AuthZClient, leg *stubLedger) chi.Router {
 	r := chi.NewRouter()
 	r.Use(func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -239,7 +295,7 @@ func TestCreateEntry_NegativeAmount(t *testing.T) {
 
 func TestCreateEntry_HappyPath(t *testing.T) {
 	s := newStubStoreReal()
-	r := newRouter(s, &stubAuthZ{}, &stubLedger{})
+	r := newRouter(s, &stubAuthZ{}, ledgerWithSourceJournal("le-us", "USD"))
 	rr := doReq(r, http.MethodPost, "/v1/intercompany/entries/", map[string]any{
 		"source_legal_entity_id": "le-us",
 		"target_legal_entity_id": "le-uk",
@@ -264,7 +320,7 @@ func TestCreateEntry_HappyPath(t *testing.T) {
 
 func TestCreateEntry_RetriedSourceJournalID_ReturnsOriginalNotDuplicate(t *testing.T) {
 	s := newStubStoreReal()
-	r := newRouter(s, &stubAuthZ{}, &stubLedger{})
+	r := newRouter(s, &stubAuthZ{}, ledgerWithSourceJournal("le-us", "USD"))
 	body := map[string]any{
 		"source_legal_entity_id": "le-us",
 		"target_legal_entity_id": "le-uk",
@@ -307,9 +363,10 @@ func TestMatchEntry_AlreadyMatched(t *testing.T) {
 		TenantID:            "tenant-abc",
 		SourceLegalEntityID: "le-us",
 		TargetLegalEntityID: "le-uk",
-		Amount:              5000.0,
-		MatchStatus:         "MATCHED",
-		TargetJournalID:     &targetJ,
+		Amount:              "5000",
+		CurrencyCode:        "USD", CounterpartyAmount: "5000", CounterpartyCurrencyCode: "USD",
+		MatchStatus:     "MATCHED",
+		TargetJournalID: &targetJ,
 	}
 	r := newRouter(s, &stubAuthZ{}, &stubLedger{})
 	rr := doReq(r, http.MethodPost, "/v1/intercompany/entries/entry-matched/match", map[string]any{
@@ -327,15 +384,16 @@ func TestMatchEntry_TargetEntityMismatch(t *testing.T) {
 		TenantID:            "tenant-abc",
 		SourceLegalEntityID: "le-us",
 		TargetLegalEntityID: "le-uk",
-		Amount:              5000.0,
-		MatchStatus:         "UNMATCHED",
+		Amount:              "5000",
+		CurrencyCode:        "USD", CounterpartyAmount: "5000", CounterpartyCurrencyCode: "USD",
+		MatchStatus: "UNMATCHED",
 	}
 	leg := &stubLedger{
 		journal: &ledger.JournalDetail{
 			JournalID:     "target-j-wrong-entity",
 			LegalEntityID: "le-de", // Doesn't match target le-uk
-			Status:        "FINALIZED",
-			Lines:         []ledger.JournalLine{{AccountCode: "1000", DebitAmount: 5000.0}},
+			Status:        "FINALIZED", CurrencyCode: "USD",
+			Lines: []ledger.JournalLine{{AccountCode: "1000", DebitAmount: "5000"}},
 		},
 	}
 	r := newRouter(s, &stubAuthZ{}, leg)
@@ -361,15 +419,16 @@ func TestMatchEntry_HappyPath(t *testing.T) {
 		TenantID:            "tenant-abc",
 		SourceLegalEntityID: "le-us",
 		TargetLegalEntityID: "le-uk",
-		Amount:              5000.0,
-		MatchStatus:         "UNMATCHED",
+		Amount:              "5000",
+		CurrencyCode:        "USD", CounterpartyAmount: "5000", CounterpartyCurrencyCode: "USD",
+		MatchStatus: "UNMATCHED",
 	}
 	leg := &stubLedger{
 		journal: &ledger.JournalDetail{
 			JournalID:     "target-j-001",
 			LegalEntityID: "le-uk",
-			Status:        "FINALIZED",
-			Lines:         []ledger.JournalLine{{AccountCode: "1000", DebitAmount: 5000.0}},
+			Status:        "FINALIZED", CurrencyCode: "USD",
+			Lines: []ledger.JournalLine{{AccountCode: "1000", DebitAmount: "5000"}},
 		},
 	}
 	r := newRouter(s, &stubAuthZ{}, leg)
@@ -381,7 +440,7 @@ func TestMatchEntry_HappyPath(t *testing.T) {
 		t.Fatalf("expected 200 got %d: %s", rr.Code, rr.Body.String())
 	}
 	if len(s.matchEvents) != 1 || s.matchEvents[0].entry.MatchStatus != "MATCHED" {
-		t.Errorf("expected 1 posted event got %d", len(s.matchEvents))
+		t.Errorf("expected 1 matched event got %d", len(s.matchEvents))
 	}
 	if s.entries["entry-1"].MatchStatus != "MATCHED" {
 		t.Errorf("expected store match_status to be MATCHED, got %q", s.entries["entry-1"].MatchStatus)
@@ -400,13 +459,14 @@ func TestMatchEntry_MismatchNotRecorded_Is503(t *testing.T) {
 		TenantID:            "tenant-abc",
 		SourceLegalEntityID: "le-us",
 		TargetLegalEntityID: "le-uk",
-		Amount:              5000.0,
-		MatchStatus:         domain.MatchStatusUnmatched,
+		Amount:              "5000",
+		CurrencyCode:        "USD", CounterpartyAmount: "5000", CounterpartyCurrencyCode: "USD",
+		MatchStatus: domain.MatchStatusUnmatched,
 	}
 	s.updateMatchErr = errors.New("connection reset")
 	leg := &stubLedger{journal: &ledger.JournalDetail{
-		JournalID: "target-j-001", LegalEntityID: "le-uk", Status: "FINALIZED",
-		Lines: []ledger.JournalLine{{AccountCode: "1000", DebitAmount: 4000.0}}, // amount mismatch
+		JournalID: "target-j-001", LegalEntityID: "le-uk", Status: "FINALIZED", CurrencyCode: "USD",
+		Lines: []ledger.JournalLine{{AccountCode: "1000", DebitAmount: "4000"}}, // amount mismatch
 	}}
 	r := newRouter(s, &stubAuthZ{}, leg)
 	rr := doReq(r, http.MethodPost, "/v1/intercompany/entries/entry-1/match", map[string]any{
@@ -431,13 +491,14 @@ func TestMatchEntry_StatusMovedSinceRead_Is422(t *testing.T) {
 		TenantID:            "tenant-abc",
 		SourceLegalEntityID: "le-us",
 		TargetLegalEntityID: "le-uk",
-		Amount:              5000.0,
-		MatchStatus:         domain.MatchStatusMismatch,
+		Amount:              "5000",
+		CurrencyCode:        "USD", CounterpartyAmount: "5000", CounterpartyCurrencyCode: "USD",
+		MatchStatus: domain.MatchStatusMismatch,
 	}
 	s.updateMatchErr = domain.ErrInvalidPairTransition
 	leg := &stubLedger{journal: &ledger.JournalDetail{
-		JournalID: "target-j-001", LegalEntityID: "le-uk", Status: "FINALIZED",
-		Lines: []ledger.JournalLine{{AccountCode: "1000", DebitAmount: 5000.0}},
+		JournalID: "target-j-001", LegalEntityID: "le-uk", Status: "FINALIZED", CurrencyCode: "USD",
+		Lines: []ledger.JournalLine{{AccountCode: "1000", DebitAmount: "5000"}},
 	}}
 	r := newRouter(s, &stubAuthZ{}, leg)
 	rr := doReq(r, http.MethodPost, "/v1/intercompany/entries/entry-1/match", map[string]any{

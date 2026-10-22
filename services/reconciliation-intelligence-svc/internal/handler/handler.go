@@ -258,10 +258,10 @@ func (h *Handler) ApplyResolution(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.ResolutionStatus == "" {
-		req.ResolutionStatus = domain.StatusApproved
+	if req.SuggestionStatus == "" {
+		req.SuggestionStatus = domain.StatusApproved
 	}
-	if err := domain.ValidateResolutionTarget(req.ResolutionStatus); err != nil {
+	if err := domain.ValidateResolutionTarget(req.SuggestionStatus); err != nil {
 		h.respondError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -281,7 +281,7 @@ func (h *Handler) ApplyResolution(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	item, err := h.store.ApplyResolution(r.Context(), tenantID, jobID, itemID, req.ResolutionStatus, req.ResolutionNotes,
+	item, err := h.store.ApplyResolution(r.Context(), tenantID, jobID, itemID, req.SuggestionStatus, req.ResolutionNotes,
 		job.LegalEntityID, principalID, r.Header.Get("X-Correlation-ID"))
 	if errors.Is(err, domain.ErrResolutionTransition) {
 		h.respondError(w, http.StatusConflict, err.Error())

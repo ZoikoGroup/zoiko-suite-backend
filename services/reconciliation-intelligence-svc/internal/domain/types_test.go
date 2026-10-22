@@ -17,8 +17,9 @@ import (
 // The tolerance is passed explicitly here, mirroring what a real caller
 // fetches from financial-control-svc's governed TolerancePolicy registry
 // (internal/financialcontrol) — it is not a package constant (ZS-SVC-Z-001
-// INV-09).
-var testMissingReferenceTolerance = big.NewRat(10, 1)
+// INV-09). Version 7 stands in for the policy version that must be recorded
+// on every suggestion (A8).
+var testMissingReferenceTolerance = &GovernedTolerance{Amount: big.NewRat(10, 1), Version: 7}
 
 const testRunID = "6f1c2a8e-3b7d-4c55-9a10-2d4e8f7b9c01"
 
@@ -29,7 +30,7 @@ func line(id, amount string) BankStatementLine {
 	}
 }
 
-func analyze(t *testing.T, lines ...BankStatementLine) []UnmatchedItem {
+func analyze(t *testing.T, lines ...BankStatementLine) []ReconciliationSuggestion {
 	t.Helper()
 	items, err := AnalyzeUnmatchedStatementLines(lines, testRunID, "tenant-1", testMissingReferenceTolerance)
 	if err != nil {
@@ -103,9 +104,25 @@ func TestAnalyze_EveryLineYieldsOneTraceableSuggestion(t *testing.T) {
 		if it.StatementLineID != id || it.BankReconciliationRunID != testRunID {
 			t.Fatalf("item %d: source = run %q line %q, want run %q line %q", i, it.BankReconciliationRunID, it.StatementLineID, testRunID, id)
 		}
-		if it.TransactionRefA != "REF-"+id || it.DiscrepancyType != DiscrepancyMissingReference || it.ResolutionStatus != StatusRecommended {
-			t.Fatalf("item %d: got ref %q type %s status %s", i, it.TransactionRefA, it.DiscrepancyType, it.ResolutionStatus)
+		if it.SourceRecordA != "REF-"+id || it.DiscrepancyType != DiscrepancyMissingReference || it.SuggestionStatus != StatusRecommended {
+			t.Fatalf("item %d: got ref %q type %s status %s", i, it.SourceRecordA, it.DiscrepancyType, it.SuggestionStatus)
 		}
+	}
+}
+
+// A8: the score's basis is a named rule and a specific tolerance-policy
+// version, not an unexplained number plus prose.
+func TestAnalyze_RecordsScoreProvenance(t *testing.T) {
+	writeOff := analyze(t, line("write-off", "5.00"))[0]
+	if writeOff.HeuristicRule != HeuristicMissingReferenceWriteOff || writeOff.ToleranceVersion != 7 {
+		t.Fatalf("write-off provenance = %q / %d, want %q / 7",
+			writeOff.HeuristicRule, writeOff.ToleranceVersion, HeuristicMissingReferenceWriteOff)
+	}
+
+	review := analyze(t, line("review", "50.00"))[0]
+	if review.HeuristicRule != HeuristicMissingReferenceManualReview || review.ToleranceVersion != 7 {
+		t.Fatalf("manual-review provenance = %q / %d, want %q / 7",
+			review.HeuristicRule, review.ToleranceVersion, HeuristicMissingReferenceManualReview)
 	}
 }
 
@@ -136,6 +153,12 @@ func TestAnalyze_NilToleranceRefused(t *testing.T) {
 	if _, err := AnalyzeUnmatchedStatementLines([]BankStatementLine{line("x", "1")}, testRunID, "t", nil); err == nil {
 		t.Fatal("expected an error for a missing governed tolerance")
 	}
+	// A value with no policy version is not provenance: refuse it rather
+	// than store an item whose score basis cannot name the policy used.
+	if _, err := AnalyzeUnmatchedStatementLines([]BankStatementLine{line("x", "1")}, testRunID, "t",
+		&GovernedTolerance{Amount: big.NewRat(10, 1)}); err == nil {
+		t.Fatal("expected an error for a governed tolerance with no version")
+	}
 }
 
 func TestAnalyzeReconciliationRequest_Validate(t *testing.T) {
@@ -158,7 +181,7 @@ func TestAnalyzeReconciliationRequest_Validate(t *testing.T) {
 }
 
 func TestValidateResolutionTransition(t *testing.T) {
-	allowed := [][2]ResolutionStatus{
+	allowed := [][2]SuggestionStatus{
 		{StatusRecommended, StatusApproved}, {StatusRecommended, StatusRejected}, {StatusApproved, StatusExecuted},
 	}
 	for _, e := range allowed {
@@ -166,7 +189,7 @@ func TestValidateResolutionTransition(t *testing.T) {
 			t.Fatalf("%s -> %s should be allowed: %v", e[0], e[1], err)
 		}
 	}
-	refused := [][2]ResolutionStatus{
+	refused := [][2]SuggestionStatus{
 		{StatusRecommended, StatusExecuted}, {StatusApproved, StatusRejected}, {StatusApproved, StatusApproved},
 		{StatusRejected, StatusApproved}, {StatusRejected, StatusExecuted}, {StatusExecuted, StatusRejected},
 		{StatusRecommended, StatusRecommended}, {StatusRecommended, "BOGUS"},

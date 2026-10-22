@@ -173,7 +173,7 @@ func TestAnalyze_DuplicateEntry_EndToEnd(t *testing.T) {
 	if job.TotalProcessedCount != 2 || len(job.UnmatchedItems) != 2 {
 		t.Fatalf("expected 2 lines processed and 2 suggestions, got %d / %d", job.TotalProcessedCount, len(job.UnmatchedItems))
 	}
-	got := map[string]domain.UnmatchedItem{}
+	got := map[string]domain.ReconciliationSuggestion{}
 	for _, it := range job.UnmatchedItems {
 		got[it.StatementLineID] = it
 	}

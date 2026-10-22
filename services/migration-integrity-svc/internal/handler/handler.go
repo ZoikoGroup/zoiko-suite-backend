@@ -109,7 +109,10 @@ func (h *Handler) ValidateMigration(w http.ResponseWriter, r *http.Request) {
 
 	checks, entries, validCount, invalidCount, score := domain.PerformIntegrityValidation(&req, jobID, tenantID)
 
-	status := domain.EvaluateJobStatus(score, validCount, invalidCount, h.integrityScoreThreshold)
+	// An MQ0 entry fails the job at any score (SPEC_DEVIATIONS A6): the
+	// acceptance decision is the one place this service can "stop" a run.
+	blockers := domain.CountBlockers(entries)
+	status := domain.EvaluateJobStatus(score, validCount, invalidCount, blockers, h.integrityScoreThreshold)
 
 	job := &domain.MigrationJob{
 		ID:                      jobID,
@@ -122,6 +125,7 @@ func (h *Handler) ValidateMigration(w http.ResponseWriter, r *http.Request) {
 		InvalidRecordsCount:     invalidCount,
 		IntegrityScore:          score,
 		IntegrityScoreThreshold: h.integrityScoreThreshold,
+		BlockerCount:            blockers,
 		Status:                  status,
 		StartedAt:               &now,
 		CompletedAt:             &now,
@@ -225,6 +229,17 @@ func (h *Handler) RemediateEntry(w http.ResponseWriter, r *http.Request) {
 	if err := req.Validate(); err != nil {
 		h.errJSON(w, http.StatusBadRequest, err.Error())
 		return
+	}
+
+	// An MQ0's disposition is "executive/domain owner resolution required"
+	// (§16): holding AUDIT_ENTRY_REMEDIATE is not enough, the resolver must
+	// be the owner named on the entry. Entries recorded before owners
+	// existed carry none and fall back to the action check alone (A6).
+	for _, e := range job.AuditEntries {
+		if e.ID == entryID && e.Severity.Blocks() && e.OwnerID != "" && e.OwnerID != principalID {
+			h.errJSON(w, http.StatusForbidden, "an MQ0 blocker can only be resolved by its owner")
+			return
+		}
 	}
 
 	entry, err := h.store.RemediateEntry(r.Context(), tenantID, jobID, entryID,
