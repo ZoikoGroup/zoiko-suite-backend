@@ -77,6 +77,25 @@ func TestE2E_FullLifecycleOverHTTP_OneEventAndOneAuditRowPerTransition(t *testin
 	if n := queryInt(t, db, `SELECT count(*) FROM activity_lifecycle_audit WHERE actor_principal_id IN ('maker-01','checker-01','ops-01')`); n != 9 {
 		t.Errorf("every audit row must carry the real acting principal, matched %d of 9", n)
 	}
+	// The audit trail is readable over HTTP, oldest first, with the real actors; another tenant sees nothing.
+	trail := decode[[]domain.ActivityLifecycleAudit](t, call(r, http.MethodGet, activitiesPath+"/"+v1.ActivityID+"/audit", nil, tenantA, "reader"))
+	if len(trail) != 9 {
+		t.Fatalf("GET audit: want 9 rows for the activity (5 + 4), got %d", len(trail))
+	}
+	for i := 1; i < len(trail); i++ {
+		if trail[i].RecordedAt.Before(trail[i-1].RecordedAt) {
+			t.Fatalf("GET audit rows must be oldest first")
+		}
+	}
+	if trail[0].Action != "VALIDATE" || trail[0].ActorPrincipalID == "" {
+		t.Fatalf("first audit row must be the validate by a real principal: %+v", trail[0])
+	}
+	if other := decode[[]domain.ActivityLifecycleAudit](t, call(r, http.MethodGet, activitiesPath+"/"+v1.ActivityID+"/audit", nil, tenantB, "reader")); len(other) != 0 {
+		t.Fatalf("another tenant must see no audit rows, got %d", len(other))
+	}
+	if bad := decode[[]domain.ActivityLifecycleAudit](t, call(r, http.MethodGet, activitiesPath+"/not-a-uuid/audit", nil, tenantA, "reader")); len(bad) != 0 {
+		t.Fatalf("a malformed activity id must yield an empty list, got %d", len(bad))
+	}
 	// The actor on the activated event is the HTTP principal, tenant and correlation carried through.
 	if n := queryInt(t, db, `SELECT count(*) FROM event_outbox WHERE event_type='privacy.processing_activity.activated' AND actor_id='ops-01' AND tenant_id=$1 AND correlation_id LIKE 'corr-%'`, tenantA); n != 2 {
 		t.Errorf("activated events must carry actor, tenant and correlation id; matched %d of 2", n)

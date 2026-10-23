@@ -194,6 +194,25 @@ func (h *Handler) GetActivityVersion(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, version)
 }
 
+// GetActivityAudit returns an activity's append-only lifecycle audit rows (who
+// did what, when, under which correlation id). It uses the existing activity
+// read action; an unknown activity, or one in another tenant, returns an empty
+// list rather than revealing that it exists.
+func (h *Handler) GetActivityAudit(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.begin(w, r, PrivacyActivityRead, false); !ok {
+		return
+	}
+	rows, err := h.store.ListActivityAudit(r.Context(), chi.URLParam(r, "activityID"))
+	if err != nil {
+		h.storeUnavailable(w, "GetActivityAudit", err)
+		return
+	}
+	if rows == nil {
+		rows = []domain.ActivityLifecycleAudit{}
+	}
+	writeJSON(w, http.StatusOK, rows)
+}
+
 func (h *Handler) ListROPA(w http.ResponseWriter, r *http.Request) {
 	if _, ok := h.begin(w, r, PrivacyRopaRead, false); !ok {
 		return

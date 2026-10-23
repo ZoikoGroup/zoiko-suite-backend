@@ -625,6 +625,21 @@ func (h *Handler) EvaluateTransfer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A decision is durable evidence that references the relationship and the
+	// mechanism by foreign key, so one that names an id which does not exist (or
+	// is not visible to this tenant) cannot be recorded. Answer with the
+	// service's usual 404 for an unknown id rather than letting the foreign-key
+	// violation surface as 503 "store unavailable". A lookup that fails for any
+	// other reason falls through to evaluate, which fails closed as before.
+	if _, err := h.store.FindRelationship(r.Context(), req.RelationshipID); errors.Is(err, domain.ErrRelationshipNotFound) {
+		h.storeError(w, "EvaluateTransfer", err)
+		return
+	}
+	if _, err := h.store.FindMechanism(r.Context(), req.TransferMechanismID); errors.Is(err, domain.ErrMechanismNotFound) {
+		h.storeError(w, "EvaluateTransfer", err)
+		return
+	}
+
 	decision := &domain.TransferDecision{
 		RelationshipID: req.RelationshipID, TransferMechanismID: req.TransferMechanismID,
 		DestinationJurisdiction: req.DestinationJurisdiction, ActorPrincipalID: cc.Principal, CorrelationID: cc.Correlation,

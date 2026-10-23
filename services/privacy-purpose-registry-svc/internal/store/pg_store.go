@@ -64,6 +64,9 @@ type Store interface {
 	// platform had already approved by knownAsOf (knowledge time) — §9.1/§20.3.
 	ResolveActivityAsOf(ctx context.Context, activityID string, asOf, knownAsOf time.Time) (*domain.ProcessingActivityVersion, error)
 	ListActiveActivities(ctx context.Context, role, jurisdiction string) ([]domain.ProcessingActivityVersion, error)
+	// ListActivityAudit returns the append-only lifecycle audit rows of one activity, oldest first,
+	// visible to the caller's tenant only (row-level security). An unknown or invisible id yields none.
+	ListActivityAudit(ctx context.Context, activityID string) ([]domain.ActivityLifecycleAudit, error)
 
 	SetValidationOutcome(ctx context.Context, activityID, versionID string, findings []domain.ValidationFinding, principalID, correlationID string) (*domain.ProcessingActivityVersion, error)
 	TransitionActivity(ctx context.Context, activityID, versionID string, from, to domain.ActivityVersionStatus, principalID, correlationID string) (*domain.ProcessingActivityVersion, error)
@@ -810,6 +813,44 @@ func (s *PgStore) ListActiveActivities(ctx context.Context, role, jurisdiction s
 	})
 	if err != nil {
 		s.log.Error("pg ListActiveActivities failed", zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return out, nil
+}
+
+// ListActivityAudit reads activity_lifecycle_audit for one activity under the
+// caller's tenant context. Rows of another tenant are invisible (RLS), and a
+// malformed id simply matches nothing, so existence is never disclosed.
+func (s *PgStore) ListActivityAudit(ctx context.Context, activityID string) ([]domain.ActivityLifecycleAudit, error) {
+	out := []domain.ActivityLifecycleAudit{}
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT audit_id::text, tenant_id::text, activity_id::text, activity_version_id::text, action,
+			       from_status, to_status, actor_principal_id, correlation_id, reason,
+			       superseded_by_version_id::text, effective_from, effective_to, recorded_at
+			FROM activity_lifecycle_audit
+			WHERE activity_id = $1
+			ORDER BY recorded_at ASC, audit_id ASC`, activityID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var a domain.ActivityLifecycleAudit
+			if err := rows.Scan(&a.AuditID, &a.TenantID, &a.ActivityID, &a.ActivityVersionID, &a.Action,
+				&a.FromStatus, &a.ToStatus, &a.ActorPrincipalID, &a.CorrelationID, &a.Reason,
+				&a.SupersededByVersionID, &a.EffectiveFrom, &a.EffectiveTo, &a.RecordedAt); err != nil {
+				return err
+			}
+			out = append(out, a)
+		}
+		return rows.Err()
+	})
+	if isInvalidUUID(err) {
+		return []domain.ActivityLifecycleAudit{}, nil
+	}
+	if err != nil {
+		s.log.Error("pg ListActivityAudit failed", zap.Error(err))
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	return out, nil
