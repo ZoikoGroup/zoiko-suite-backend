@@ -391,3 +391,13 @@ var EventTypes = []string{
 	"integration.security.cross-tenant-credential", "integration.security.tenant-scope-mismatch",
 	"integration.connection.break-glass-denied",
 }
+
+type budgetKey struct{}
+
+// WithoutBudget marks a call to Operable that re-checks work already admitted (a submit of a reserved attempt, a
+// status query, a readiness check): the staged rollout still applies its stage and allowlist but takes nothing from
+// the pilot's daily budget.
+func WithoutBudget(ctx context.Context) context.Context { return context.WithValue(ctx, budgetKey{}, true) }
+
+// BudgetFree reports whether the call carries WithoutBudget.
+func BudgetFree(ctx context.Context) bool { v, _ := ctx.Value(budgetKey{}).(bool); return v }

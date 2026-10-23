@@ -60,6 +60,9 @@ type Config struct {
 	PeriodGateMode string
 	// AccountingPeriodURL is accounting-period-svc (REF-05).
 	AccountingPeriodURL string
+
+	// CurrencyRegistryURL is currency-registry-svc (REF-02): the accounting kernel reads currency precision from it.
+	CurrencyRegistryURL string
 	// PeriodGateShadowTimeout bounds each shadow resolve call.
 	PeriodGateShadowTimeout time.Duration
 }
@@ -137,6 +140,7 @@ func Load() (*Config, error) {
 		OTELExporterEndpoint:     env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 		PeriodGateMode:           mode,
 		AccountingPeriodURL:      env("ACCOUNTING_PERIOD_URL", "http://accounting-period-svc:8174"),
+		CurrencyRegistryURL:      env("CURRENCY_REGISTRY_URL", "http://currency-registry-svc:8172"),
 		PeriodGateShadowTimeout:  timeout,
 	}, nil
 }

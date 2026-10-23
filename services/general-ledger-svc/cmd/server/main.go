@@ -36,11 +36,13 @@ import (
 	"zoiko.io/general-ledger-svc/internal/authz"
 	"zoiko.io/general-ledger-svc/internal/close"
 	"zoiko.io/general-ledger-svc/internal/config"
+	"zoiko.io/general-ledger-svc/internal/currency"
 	svcenvelope "zoiko.io/general-ledger-svc/internal/envelope"
 	"zoiko.io/general-ledger-svc/internal/events"
 	"zoiko.io/general-ledger-svc/internal/evidencereq"
 	"zoiko.io/general-ledger-svc/internal/handler"
 	"zoiko.io/general-ledger-svc/internal/health"
+	"zoiko.io/general-ledger-svc/internal/kernel"
 	svcmiddleware "zoiko.io/general-ledger-svc/internal/middleware"
 	"zoiko.io/general-ledger-svc/internal/mtls"
 	"zoiko.io/general-ledger-svc/internal/periodgate"
@@ -229,6 +231,11 @@ func main() {
 	h := handler.New(pgStore, publisher, authzClient, closeClient, log).
 		WithEvidenceGate(evidencereq.NewClient(cfg.EvidenceRequirementsURL))
 	handler.RegisterRoutes(r, h)
+
+	// Global Accounting Kernel (Wave 0): books, accounting events, posting rule sets, dry-run evaluation, dimensions.
+	kernelRepo := store.NewKernelRepo(pool, cfg.EventResidencyRegion)
+	kernelSvc := &kernel.Service{Repo: kernelRepo}
+	handler.RegisterKernelRoutes(r, handler.NewKernel(kernelSvc, kernelRepo, kernelRepo, currency.New(cfg.CurrencyRegistryURL), nil, authzClient, log))
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────
 	healthH := health.New(pool, log)
