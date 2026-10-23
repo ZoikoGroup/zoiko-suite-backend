@@ -7,7 +7,7 @@ Statuses: TODO · IN PROGRESS · DONE · BLOCKED. DONE needs a filled evidence b
 
 | Task | Title | Status | Commit(s) | Note |
 |---|---|---|---|---|
-| P0-1 | Commit pending authorization work | TODO | | |
+| P0-1 | Commit pending authorization work | DONE | 58c810e4, c7581e77, a1574241 | authz 90 store+IT / 467 handler pass, 0 fail; vet clean |
 | P0-2 | Register JURISDICTION_RULE_VALIDATE | TODO | | |
 | P0-3 | Fix stale resolve.go comment | TODO | | |
 | API-1 | Shared apicontract package | TODO | | |
@@ -102,3 +102,21 @@ Statuses: TODO · IN PROGRESS · DONE · BLOCKED. DONE needs a filled evidence b
 ## Evidence blocks
 
 <!-- One block per task, in the plan §7 format. Newest at the bottom. -->
+
+### P0-1 — Commit the pending authorization work
+Status: DONE
+Commits: 58c810e4 feat(access-control-svc): register the governed-change approval actions; c7581e77 feat(authorization-svc): governed changes for break-glass, authority limits and rule publication; a1574241 docs: add the 23 Oct implementation plan and progress tracker
+Migrations: authorization-svc/000034_break_glass_approval_and_session_evidence, 000035_authority_limit_governance, 000036_rule_publication_approval (up+down); access-control-svc/000022_register_governed_change_actions (up+down). Applied fresh: yes (all up files applied in order to scratch `authz_it_test` and `access_control_test`). Applied via migrate.py: no — Python is not installed on this Windows host (`python` resolves to the Store alias); applied with `psql -v ON_ERROR_STOP=1` instead.
+Permissions registered: access-control 000022 — iam.break_glass.approve, iam.authority_limit.manage, iam.authority_limit.approve, iam.sod_rule.publish, iam.policy.publish (all CRITICAL, protected)
+Routes: no new routes; governed-change routes were already in authorization-svc/openapi.yaml (unchanged contract, request/response schemas only extended)
+Wiring: authz `grep -n SetBreakGlassApprovals cmd/server/main.go` → line 299 `h.SetBreakGlassApprovals(cfg.BreakGlassApprovals)`; `grep -n "AUTHZ_BREAK_GLASS_APPROVALS" internal/config/config.go` → envInt at Load() default 1
+Tests:
+- `TEST_DATABASE_URL=…/authz_store_test go test -count=1 -skip IT_ ./internal/store` → `zoiko.io/authorization-svc/internal/store`: 79 passed, 0 failed, 0 skipped
+- `AUTHZ_IT_DSN=…/authz_it_test (app_authorization, NOBYPASSRLS) go test -run IT_ ./internal/store` → 33 passed, 0 failed, 1 deliberate skip (harness-gated); that test also run with `AUTHZ_IT_PRINCIPAL_TABLE_GONE=1` and the table renamed → 1 passed, restored afterwards. IT total: 34/34 pass.
+- `go test -count=1 ./internal/handler` → 467 passed, 0 failed, 0 skipped
+- `go vet ./...` (authorization-svc): clean; `go vet ./... && go test ./...` (access-control-svc): all packages ok
+Negative-path tests: TestGovernedIT_BreakGlassRejectAndLapse, TestGovernedIT_SoDRulePublication, TestGovernedIT_ABACRulePublication, TestGovernedIT_AuthorityLimitLifecycle, TestSecondPassIT_MakerChecker ↔ GOV-12 / ZS-IAM-001 §12, §21, AU-02/03/17
+Live probe (if run): none
+Spec rows closed: AU-02, AU-03, AU-17 (governed-change approval groundwork; full re-score in CLOSE-1)
+Blocked / limits: migrate.py could not be exercised on this host (no Python). No functional block; CI with Python still covers that path.
+
