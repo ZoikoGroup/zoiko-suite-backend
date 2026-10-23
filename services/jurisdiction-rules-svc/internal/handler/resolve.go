@@ -17,12 +17,13 @@ import (
 
 // ZS-JUR-001 Wave 2: the runtime rule-resolution API (s25).
 //
-// Scope note: s25 also lists POST /jurisdiction-decisions:resolve and
-// POST /regulatory-calculations:execute. They are NOT built: the first needs
-// authoritative entity/counterparty/transaction facts and product rules for
-// place of supply that do not exist yet, the second needs a rule formula
-// language (s38). Answering either today would be inventing a legal
-// conclusion, so there is no endpoint rather than a fake one.
+// Scope note: s25 lists POST /jurisdiction-decisions:resolve and
+// POST /regulatory-calculations:execute. The calculation endpoint is built
+// (tax.go). The decision endpoint is not: it needs authoritative legal-entity,
+// establishment, registration and counterparty facts, and those arrive with
+// ORG-5..ORG-7 in tenant-entity-registry-svc. Answering it today would be
+// inventing a legal conclusion, so there is no endpoint rather than a fake one.
+// JUR-1 builds it once those facts exist.
 
 // WithResolver enables the runtime resolution routes.
 func (h *Handler) WithResolver(r *resolver.Resolver) *Handler {
