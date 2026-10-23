@@ -27,6 +27,9 @@ type RowInput struct {
 	Body          []byte
 	SourceRef     string
 	CorrelationID string
+	// RowKey names the row (file and row number). It is stored with the exchange so a row that meets its own exchange
+	// again, because the exchange committed and the row's record was lost, can tell it from a duplicate in the data.
+	RowKey string
 }
 
 // RowResult is what became of a row.
@@ -37,8 +40,10 @@ type RowResult struct {
 	Reason             string
 	Duplicate          bool
 	OriginalExchangeID string
-	CanonicalHash      string
-	MappingVersionID   string
+	// Own is set on a duplicate whose original is this very row's earlier exchange.
+	Own              bool
+	CanonicalHash    string
+	MappingVersionID string
 }
 
 // AdmitRow runs one row through the pipeline. Per-row outbox events are not emitted: the batch reports its own,
@@ -49,7 +54,7 @@ func (s *Service) AdmitRow(ctx context.Context, in RowInput) (*RowResult, error)
 	ictx := withTenant(ctx, conn.TenantID)
 	base := &Exchange{ExchangeID: uuid.NewString(), TenantID: conn.TenantID, ConnectionID: conn.ConnectionID, ConnectorID: conn.ConnectorID,
 		OperationID: op.ID, ContractVersionID: v.ContractVersionID, DomainOutcome: DomainNA, BodyHash: hashBytes(in.Body), BodySize: len(in.Body),
-		ContentType: "application/json", SourceSchema: in.SourceRef, AuthMechanism: "BATCH_FILE", CorrelationID: in.CorrelationID, AttemptNo: 1, Version: 1,
+		ContentType: "application/json", SourceSchema: in.SourceRef, AuthMechanism: "BATCH_FILE", CorrelationID: rowCorrelation(in), AttemptNo: 1, Version: 1,
 		ReceivedAt: now, UpdatedAt: now}
 	idem := v.IdempotencyOf(op)
 	if idem == nil {
@@ -79,9 +84,25 @@ func (s *Service) AdmitRow(ctx context.Context, in RowInput) (*RowResult, error)
 		s.observe("row_"+base.State, base.ReasonCode)
 		return resultOf(base), nil
 	case errors.Is(err, ErrDedupe):
-		return s.rowOutcome(s.duplicate(ictx, base, existing, idem, "batch"))
+		res, rerr := s.rowOutcome(s.duplicate(ictx, base, existing, idem, "batch"))
+		if rerr == nil && res != nil && in.RowKey != "" && existing != nil && existing.CorrelationID == base.CorrelationID {
+			res.Own = true
+		}
+		return res, rerr
 	}
 	return nil, fmt.Errorf("%w: %v", ErrDependency, err)
+}
+
+// rowCorrelation is the correlation id stored with a row's exchange: the batch's, plus the row's key.
+func rowCorrelation(in RowInput) string {
+	if in.RowKey == "" {
+		return in.CorrelationID
+	}
+	c := in.CorrelationID
+	if len(c) > 70 {
+		c = c[:70] // the column holds 128 characters
+	}
+	return c + "|" + in.RowKey
 }
 
 func resultOf(e *Exchange) *RowResult {

@@ -54,8 +54,18 @@ type Service struct {
 	AllowedRegions []string
 	// RedirectAllowlist is the set of pre-registered OAuth redirect targets, exact match.
 	RedirectAllowlist []string
-	Cfg               Config
-	Clock             func() time.Time
+	// Stage, when set, applies the staged production rollout (Wave 8) to every operation of a production
+	// connection. A nil gate leaves production connections ungated.
+	Stage StageGate
+	Cfg   Config
+	Clock func() time.Time
+}
+
+// StageGate decides whether a production connection's staged rollout admits an operation now. It returns nil to
+// admit, a *Refusal when the stage refuses, and any other error when the stage cannot be read (the caller fails
+// closed).
+type StageGate interface {
+	Admit(ctx context.Context, c *Connection, operationID string, now time.Time) error
 }
 
 func (s *Service) now() time.Time {
@@ -1512,6 +1522,12 @@ func (s *Service) Operable(ctx context.Context, tenant, connectionID, operationI
 		if st, _ := CertificationState(c, v, certs, now); st != CertValid {
 			return nil, &Refusal{Code: CodeCertStale, Detail: "the production certification is " + strings.ToLower(st), ConnectionID: c.ConnectionID}
 		}
+		if s.Stage != nil {
+			// last of the gates: a refused operation takes nothing from the pilot budget
+			if err := s.Stage.Admit(withTenantCtx(ctx, c.TenantID), c, operationID, now); err != nil {
+				return nil, err
+			}
+		}
 	}
 	d := &Decision{ConnectionID: c.ConnectionID, TenantID: c.TenantID, Environment: c.Environment, ConnectorID: c.ConnectorID,
 		ContractVersionID: v.ContractVersionID, Operation: *op, Region: c.Region, Degraded: c.Status == StatusDegraded}
@@ -1548,6 +1564,7 @@ const (
 	CodeNotActive        RefusalCode = "XIC-001"
 	CodeContractMismatch RefusalCode = "XIC-002"
 	CodeTenantScope      RefusalCode = "XIC-008"
+	CodeRateLimited      RefusalCode = "XIC-012"
 	CodeResidency        RefusalCode = "XIC-016"
 	CodeCertStale        RefusalCode = "XIC-017"
 )
@@ -1615,4 +1632,69 @@ func (s *Service) PinnedContract(ctx context.Context, c *Connection) (*registry.
 		return nil, fmt.Errorf("%w: %v", ErrDependency, err)
 	}
 	return s.pinned(tctx, EffectivePin(c, reqs, s.now()))
+}
+
+// CertStatus is a connection's certification standing: the computed state, the run it rests on and how long it has.
+// RetestDue is true when the certification is not VALID for a production connection, or is VALID but inside the
+// warning window before it expires, so a retest can be scheduled before production is blocked (OD-11, NP-47).
+type CertStatus struct {
+	ConnectionID  string         `json:"connection_id"`
+	Environment   string         `json:"environment"`
+	State         string         `json:"state"`
+	Certification *Certification `json:"certification,omitempty"`
+	DaysRemaining *int           `json:"days_remaining,omitempty"`
+	RetestDue     bool           `json:"retest_due"`
+	// Reasons say why a production connection is not covered: the materiality triggers of §7.3 and NP-47/48.
+	Reasons []string `json:"reasons,omitempty"`
+}
+
+// CertificationStatus reports a connection's certification state against the contract it runs now.
+func (s *Service) CertificationStatus(ctx context.Context, id string) (*CertStatus, error) {
+	c, err := s.Repo.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	return s.CertificationStatusOf(ctx, c)
+}
+
+// CertificationStatusOf is CertificationStatus for a connection already read.
+func (s *Service) CertificationStatusOf(ctx context.Context, c *Connection) (*CertStatus, error) {
+	tctx := withTenantCtx(ctx, c.TenantID)
+	certs, err := s.Repo.ListCertifications(tctx, c.ConnectionID)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrDependency, err)
+	}
+	v, err := s.PinnedContract(ctx, c)
+	if err != nil {
+		v = nil // a contract that cannot be read is reported as it is: the state falls back to what the run says
+	}
+	now := s.now()
+	st, latest := CertificationState(c, v, certs, now)
+	out := &CertStatus{ConnectionID: c.ConnectionID, Environment: c.Environment, State: st, Certification: latest}
+	if latest != nil && st == CertValid {
+		d := int(latest.ExpiresAt.Sub(now).Hours() / 24)
+		out.DaysRemaining = &d
+	}
+	if c.Environment == EnvProduction {
+		switch st {
+		case CertValid:
+			out.RetestDue = latest.ExpiresAt.Sub(now) <= s.cfg().ExpiryWarning
+			if out.RetestDue {
+				out.Reasons = append(out.Reasons, "EXPIRING")
+			}
+		case CertStale:
+			out.RetestDue = true
+			out.Reasons = append(out.Reasons, "MATERIAL_CHANGE") // contract/mapping/auth/endpoint change since the run (I-29)
+		case CertExpired:
+			out.RetestDue = true
+			out.Reasons = append(out.Reasons, "EXPIRED")
+		case CertMissing:
+			out.RetestDue = true
+			out.Reasons = append(out.Reasons, "NEVER_CERTIFIED")
+		case CertFailed:
+			out.RetestDue = true
+			out.Reasons = append(out.Reasons, "LAST_RUN_FAILED")
+		}
+	}
+	return out, nil
 }

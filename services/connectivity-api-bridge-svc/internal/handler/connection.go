@@ -60,6 +60,7 @@ func RegisterConnectionRoutes(r chi.Router, h *ConnectionHandler) {
 		r.Post("/{idcmd}", h.Command)
 		r.Get("/{id}/checks", h.Checks)
 		r.Get("/{id}/certifications", h.Certifications)
+		r.Get("/{id}/certification-status", h.CertificationStatus)
 		r.Get("/{id}/events", h.Events)
 		r.Get("/{id}/requests", h.Requests)
 		r.Get("/{id}/operability", h.Operability)
@@ -269,7 +270,7 @@ func (h *ConnectionHandler) Operability(w http.ResponseWriter, r *http.Request) 
 		writeConnProblem(w, r, &xicconn.Validation{Issues: []registry.Issue{{Path: "operation", Rule: "required"}}})
 		return
 	}
-	d, err := h.svc.Operable(r.Context(), middleware.GetTenantID(r.Context()), chi.URLParam(r, "id"), op)
+	d, err := h.svc.Operable(xicconn.WithoutBudget(r.Context()), middleware.GetTenantID(r.Context()), chi.URLParam(r, "id"), op)
 	if err != nil {
 		// over HTTP another tenant's connection is indistinguishable from a missing one; the XIC-008 signal was
 		// already raised for operators, and server-side callers of Operable get the code itself
@@ -501,3 +502,17 @@ func (h *ConnectionHandler) DecideRequest(w http.ResponseWriter, r *http.Request
 }
 
 var _ = time.Second
+
+// CertificationStatus answers whether the connection's certification still covers what it runs and when a retest is
+// due (§7.3, OD-11, NP-47).
+func (h *ConnectionHandler) CertificationStatus(w http.ResponseWriter, r *http.Request) {
+	if !h.guard(w, r, ActionConnRead) {
+		return
+	}
+	st, err := h.svc.CertificationStatus(r.Context(), chi.URLParam(r, "id"))
+	if err != nil {
+		writeConnProblem(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, st)
+}

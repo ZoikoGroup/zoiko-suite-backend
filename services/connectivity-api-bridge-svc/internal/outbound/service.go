@@ -326,7 +326,7 @@ func (p *prepared) wipe() {
 // endpoint binding, checks it against egress policy BEFORE any credential is fetched, and then fetches the credential.
 // Any failure here means nothing was sent.
 func (s *Service) prepare(ctx context.Context, a *Attempt, operationID string, query url.Values) (*prepared, error) {
-	d, err := s.Conns.Operable(ctx, a.TenantID, a.ConnectionID, operationID)
+	d, err := s.Conns.Operable(xicconn.WithoutBudget(ctx), a.TenantID, a.ConnectionID, operationID)
 	if err != nil {
 		return nil, err
 	}

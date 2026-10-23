@@ -132,7 +132,8 @@ func TestRLS_EnabledAndForced(t *testing.T) {
 		"xic_handoff_targets", "xic_inbound_exchanges", "xic_inbound_events", "xic_quarantine_requests",
 		"xic_outbound_attempts", "xic_outbound_events", "xic_callback_receipts",
 		"xic_batches", "xic_batch_files", "xic_batch_rows", "xic_batch_events", "xic_replay_jobs", "xic_replay_items",
-		"xic_reconciliation_runs", "xic_reconciliation_variances", "xic_reconciliation_events"} {
+		"xic_reconciliation_runs", "xic_reconciliation_variances", "xic_reconciliation_events",
+		"xic_rollout_requests", "xic_rollouts", "xic_rollout_usage", "xic_rollout_events", "xic_legacy_connectors", "xic_legacy_exchanges", "xic_legacy_parity_runs"} {
 		var enabled, forced bool
 		if err := admin.QueryRow(ctx,
 			`SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname = $1`, table,
@@ -226,7 +227,7 @@ func TestRLS_WithCheckRefusesForeignTenantWrite(t *testing.T) {
 // matter: CASCADE removes the dependent foreign keys and triggers.
 func resetGovernanceObjects(ctx context.Context, pool *pgxpool.Pool) {
 	_, _ = pool.Exec(ctx, `
-		DROP TABLE IF EXISTS xic_reconciliation_events, xic_reconciliation_variances, xic_reconciliation_runs, xic_replay_items, xic_replay_jobs, xic_batch_events, xic_batch_rows, xic_batch_files, xic_batches, checkpoint_reset_requests, sync_checkpoints, connector_health_transitions, connector_health,
+		DROP TABLE IF EXISTS xic_legacy_parity_runs, xic_legacy_exchanges, xic_legacy_connectors, xic_rollout_events, xic_rollout_usage, xic_rollouts, xic_rollout_requests, xic_reconciliation_events, xic_reconciliation_variances, xic_reconciliation_runs, xic_replay_items, xic_replay_jobs, xic_batch_events, xic_batch_rows, xic_batch_files, xic_batches, checkpoint_reset_requests, sync_checkpoints, connector_health_transitions, connector_health,
 			connector_approvals, connector_changes, external_profiles, eventing_outbox, eventing_repair_log,
 			ingestion_logs, api_bridges, xic_idempotency, xic_contract_transitions, xic_validation_runs, xic_contract_gates,
 			xic_mapping_versions, xic_contract_versions, xic_connectors,

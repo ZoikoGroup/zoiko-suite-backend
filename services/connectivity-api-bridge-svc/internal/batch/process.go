@@ -480,7 +480,7 @@ func (s *Service) admit(ctx context.Context, p *prepared, parsed []parsedFile) (
 			if r.body == nil {
 				row.State, row.ReasonCode = RowRejected, r.badness
 			} else {
-				res, err := s.In.AdmitRow(ctx, inbound.RowInput{Conn: p.conn, V: p.v, Op: p.op, Body: r.body, SourceRef: p.op.RequestSchema, CorrelationID: p.b.CorrelationID})
+				res, err := s.In.AdmitRow(ctx, inbound.RowInput{Conn: p.conn, V: p.v, Op: p.op, Body: r.body, SourceRef: p.op.RequestSchema, CorrelationID: p.b.CorrelationID, RowKey: fmt.Sprintf("%s:%d", pf.file.FileID, r.no)})
 				if err != nil {
 					rerr = err
 					return err
@@ -492,7 +492,13 @@ func (s *Service) admit(ctx context.Context, p *prepared, parsed []parsedFile) (
 				case inbound.StateQuarantined:
 					row.State = RowQuarantined
 				case inbound.StateDuplicate:
-					row.State = RowDuplicate
+					// a row whose exchange committed before the row itself was saved meets its own exchange on resume: that
+					// is not a duplicate in the file, so it is picked up as pending and the refresh settles it
+					if res.Own {
+						row.State, row.ReasonCode = RowPending, ""
+					} else {
+						row.State = RowDuplicate
+					}
 				default:
 					row.State = RowRejected
 				}

@@ -28,6 +28,7 @@ import (
 	"zoiko.io/connectivity-api-bridge-svc/internal/outbound"
 	"zoiko.io/connectivity-api-bridge-svc/internal/recon"
 	"zoiko.io/connectivity-api-bridge-svc/internal/registry"
+	"zoiko.io/connectivity-api-bridge-svc/internal/rollout"
 	"zoiko.io/connectivity-api-bridge-svc/internal/sftppull"
 	"zoiko.io/connectivity-api-bridge-svc/internal/signals"
 	"zoiko.io/connectivity-api-bridge-svc/internal/store"
@@ -103,6 +104,11 @@ func main() {
 	var reconTable *string
 	if err := dbpool.QueryRow(ctx, `SELECT to_regclass('public.xic_reconciliation_runs')::text`).Scan(&reconTable); err != nil || reconTable == nil {
 		logger.Fatal("reconciliation schema missing — apply migration 010_xic_reconciliation.sql", zap.Error(err))
+	}
+
+	var rolloutTable *string
+	if err := dbpool.QueryRow(ctx, `SELECT to_regclass('public.xic_rollouts')::text`).Scan(&rolloutTable); err != nil || rolloutTable == nil {
+		logger.Fatal("rollout schema missing — apply migration 011_xic_rollout.sql", zap.Error(err))
 	}
 
 	// counters from every engine feed /metrics; the hooks are set where each service is built
@@ -186,6 +192,9 @@ func main() {
 			BreakGlassMax: time.Duration(cfg.XICBreakGlassMaxMinutes) * time.Minute,
 		},
 	}
+	// Wave 8: the staged rollout is applied wherever an exchange starts (xicconn.Operable), so no path goes around it.
+	rolloutRepo := store.NewRolloutRepo(st)
+	connSvc.Stage = &rollout.Gate{Repo: rolloutRepo, Required: cfg.XICRolloutRequired, Observe: metrics.Hook("rollout")}
 	ch := handler.NewConnection(connSvc, connRepo, authzClient, logger)
 	evalCtx, stopEval := context.WithCancel(context.Background())
 	defer stopEval()
@@ -299,6 +308,18 @@ func main() {
 		}
 	})
 
+	// Wave 8: staged production rollout and migration of ad-hoc connectors (ZS-SVC-T-001 sections 18.2-18.3). The pilot
+	// evaluator rolls a misbehaving pilot back by itself; a step forward is always decided by a second person.
+	rolloutSvc := &rollout.Service{Repo: rolloutRepo, Conns: connSvc, Observe: metrics.Hook("rollout"), Cfg: rollout.Config{
+		RequestTTL: time.Duration(cfg.XICRolloutRequestTTLHours) * time.Hour, MaxPilotDailyCap: 100000, DefaultSoakHours: 24, DefaultSuccess: 20, DefaultFailPct: 5,
+		UnknownSLA: time.Duration(cfg.XICUnknownSLAHours) * time.Hour, MinPilotSample: 10, ParityMinSamples: cfg.XICParityMinSamples,
+		ParityMaxAge: time.Duration(cfg.XICParityMaxAgeHours) * time.Hour, ShadowMinHours: cfg.XICShadowMinHours, RetireAfterHours: 72, MaxPerCall: 500}}
+	go rolloutSvc.RunWorker(evalCtx, time.Duration(cfg.XICRolloutWorkerSecs)*time.Second, 100, func(n int, err error) {
+		if err != nil {
+			logger.Warn("rollout evaluator", zap.Int("pilots", n), zap.Error(err))
+		}
+	})
+
 	// api carries every ZoikoSuite-authenticated route behind the tenant and envelope middleware. The ingest endpoint
 	// is mounted beside it, NOT inside it: an external sender has no tenant header, and its identity is proven by the
 	// contract's authentication profile, never by headers it could set itself.
@@ -321,6 +342,7 @@ func main() {
 	handler.RegisterOutboundRoutes(r, obHandler)
 	handler.RegisterCallbackAdminRoutes(r, handler.NewCallbackAdmin(obRepo, authzClient, logger))
 	handler.RegisterReconRoutes(r, handler.NewRecon(reconSvc, reconRepo, sigRepo, authzClient, logger))
+	handler.RegisterRolloutRoutes(r, handler.NewRollout(rolloutSvc, rolloutRepo, authzClient, logger))
 	if batchSvc != nil {
 		handler.RegisterBatchAdminRoutes(r, handler.NewBatchAdmin(batchSvc, batchRepo, authzClient, logger))
 	}

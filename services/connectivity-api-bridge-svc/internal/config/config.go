@@ -137,6 +137,15 @@ type Config struct {
 	XICReconPoliciesJSON       string // optional per-family overrides (OD-12)
 	XICMetricsToken            string // /metrics is mounted only when a token is configured
 	XICMetricsWindowHours      int
+
+	// Wave 8: staged rollout and legacy migration.
+	XICRolloutRequired        bool // a production connection with no rollout carries nothing
+	XICRolloutWorkerSecs      int  // 0 turns the pilot evaluator off
+	XICRolloutRequestTTLHours int
+	XICUnknownSLAHours        int // OD-13: an UNKNOWN attempt older than this blocks a step forward and rolls a pilot back
+	XICParityMinSamples       int
+	XICParityMaxAgeHours      int
+	XICShadowMinHours         int
 }
 
 func Load() *Config {
@@ -229,6 +238,13 @@ func Load() *Config {
 		XICReconPoliciesJSON:            os.Getenv("XIC_RECON_POLICIES_JSON"),
 		XICMetricsToken:                 os.Getenv("XIC_METRICS_TOKEN"),
 		XICMetricsWindowHours:           nonNegInt("XIC_METRICS_WINDOW_HOURS", 24),
+		XICRolloutRequired:              getEnv("XIC_ROLLOUT_REQUIRED", "false") == "true",
+		XICRolloutWorkerSecs:            nonNegInt("XIC_ROLLOUT_WORKER_INTERVAL_SECS", 30),
+		XICRolloutRequestTTLHours:       nonNegInt("XIC_ROLLOUT_REQUEST_TTL_HOURS", 72),
+		XICUnknownSLAHours:              nonNegInt("XIC_UNKNOWN_SLA_HOURS", 24),
+		XICParityMinSamples:             nonNegInt("XIC_PARITY_MIN_SAMPLES", 20),
+		XICParityMaxAgeHours:            nonNegInt("XIC_PARITY_MAX_AGE_HOURS", 24),
+		XICShadowMinHours:               nonNegInt("XIC_SHADOW_MIN_HOURS", 24),
 	}
 }
 
