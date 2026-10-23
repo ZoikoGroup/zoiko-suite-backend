@@ -3,6 +3,7 @@
 package handler
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strings"
@@ -85,6 +86,17 @@ func RegisterDunningRoutes(r chi.Router, h *DunningHandler) {
 
 func (h *DunningHandler) fail(w http.ResponseWriter, r *http.Request, err error) {
 	writeFailure(w, r, h.logger, err)
+}
+
+type dunningCaseSellerReader interface {
+	GetDunningCaseAsSeller(ctx context.Context, caseID string) (*domain.DunningCase, error)
+}
+
+func (h *DunningHandler) caseForReplay(ctx context.Context, caseID string) (*domain.DunningCase, error) {
+	if reader, ok := h.store.(dunningCaseSellerReader); ok {
+		return reader.GetDunningCaseAsSeller(ctx, caseID)
+	}
+	return h.store.GetDunningCase(ctx, caseID)
 }
 
 func (h *DunningHandler) principal(w http.ResponseWriter, r *http.Request) (string, bool) {
@@ -183,6 +195,14 @@ func (h *DunningHandler) PublishDunningPolicy(w http.ResponseWriter, r *http.Req
 	}
 	got, err := h.store.PublishDunningPolicy(r.Context(), p, cmd.claim)
 	if err != nil {
+		var replay *domain.IdempotentReplayError
+		if errors.As(err, &replay) {
+			if existing, gerr := h.store.GetEffectiveDunningPolicy(r.Context(), h.now()); gerr == nil && existing != nil {
+				w.Header().Set("Idempotent-Replayed", "true")
+				writeJSON(w, http.StatusCreated, existing)
+				return
+			}
+		}
 		h.fail(w, r, err)
 		return
 	}
@@ -210,6 +230,14 @@ func (h *DunningHandler) StartDunning(w http.ResponseWriter, r *http.Request) {
 	}
 	c, err := h.store.StartDunning(r.Context(), id, invoiceID, principal, h.now(), cmd.claim)
 	if err != nil {
+		var replay *domain.IdempotentReplayError
+		if errors.As(err, &replay) {
+			if existing, gerr := h.caseForReplay(r.Context(), replay.ResourceID); gerr == nil {
+				w.Header().Set("Idempotent-Replayed", "true")
+				writeJSON(w, http.StatusCreated, existing)
+				return
+			}
+		}
 		h.fail(w, r, err)
 		return
 	}
@@ -254,7 +282,7 @@ func (h *DunningHandler) DunningCaseAction(w http.ResponseWriter, r *http.Reques
 		c, err = h.store.AdvanceDunning(r.Context(), id, principal, h.now(), cmd.claim)
 		if err != nil {
 			if HandleIdempotentReplay(w, r, err, func(resourceID string) (any, error) {
-				return h.store.GetDunningCase(r.Context(), resourceID)
+				return h.caseForReplay(r.Context(), resourceID)
 			}) {
 				return
 			}
@@ -265,7 +293,7 @@ func (h *DunningHandler) DunningCaseAction(w http.ResponseWriter, r *http.Reques
 		c, err = h.store.StopDunning(r.Context(), id, principal, req.Reason, h.now(), cmd.claim)
 		if err != nil {
 			if HandleIdempotentReplay(w, r, err, func(resourceID string) (any, error) {
-				return h.store.GetDunningCase(r.Context(), resourceID)
+				return h.caseForReplay(r.Context(), resourceID)
 			}) {
 				return
 			}
@@ -331,6 +359,15 @@ func (h *DunningHandler) ReconcileCommercialAccount(w http.ResponseWriter, r *ht
 	}
 	rec, err := h.store.ReconcileCommercialAccount(r.Context(), org, principal, h.now(), cmd.claim)
 	if err != nil {
+		var replay *domain.IdempotentReplayError
+		if errors.As(err, &replay) {
+			ctx := svcmiddleware.WithTenant(r.Context(), org)
+			if existing, gerr := h.store.GetCommercialReconciliation(ctx, org); gerr == nil {
+				w.Header().Set("Idempotent-Replayed", "true")
+				writeJSON(w, http.StatusCreated, existing)
+				return
+			}
+		}
 		h.fail(w, r, err)
 		return
 	}

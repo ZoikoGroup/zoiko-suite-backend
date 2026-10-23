@@ -271,9 +271,39 @@ func (s *PgStore) GetCreditNote(ctx context.Context, creditNoteID string) (*doma
 	return out, err
 }
 
+// GetCreditNoteAsSeller is the replay reader for IssueCreditNote, whose
+// claim resource id is the credit-note id and whose caller has no tenant
+// context yet.
+func (s *PgStore) GetCreditNoteAsSeller(ctx context.Context, creditNoteID string) (*domain.CreditNote, error) {
+	var out *domain.CreditNote
+	err := s.creditSellerTx(ctx, func(tx pgx.Tx) error {
+		c, err := scanCreditNote(tx.QueryRow(ctx, `SELECT `+creditNoteColumns+` FROM credit_notes WHERE credit_note_id = $1`, creditNoteID))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrCreditNoteNotFound
+		}
+		out = c
+		return err
+	})
+	return out, err
+}
+
 func (s *PgStore) GetWriteOff(ctx context.Context, writeOffID string) (*domain.WriteOff, error) {
 	var out *domain.WriteOff
 	err := s.creditTx(ctx, func(tx pgx.Tx) error {
+		w, err := scanWriteOff(tx.QueryRow(ctx, `SELECT `+writeOffColumns+` FROM write_offs WHERE write_off_id = $1`, writeOffID))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrWriteOffNotFound
+		}
+		out = w
+		return err
+	})
+	return out, err
+}
+
+// GetWriteOffAsSeller is the replay reader for ApplyWriteOff.
+func (s *PgStore) GetWriteOffAsSeller(ctx context.Context, writeOffID string) (*domain.WriteOff, error) {
+	var out *domain.WriteOff
+	err := s.creditSellerTx(ctx, func(tx pgx.Tx) error {
 		w, err := scanWriteOff(tx.QueryRow(ctx, `SELECT `+writeOffColumns+` FROM write_offs WHERE write_off_id = $1`, writeOffID))
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.ErrWriteOffNotFound
@@ -411,6 +441,17 @@ func (s *PgStore) SettleRefund(ctx context.Context, req domain.SettleRefundReque
 func (s *PgStore) GetRefundRequest(ctx context.Context, refundID string) (*domain.RefundRequest, error) {
 	var out *domain.RefundRequest
 	err := s.creditTx(ctx, func(tx pgx.Tx) error {
+		r, err := loadRefund(ctx, tx, refundID, false)
+		out = r
+		return err
+	})
+	return out, err
+}
+
+// GetRefundRequestAsSeller is the replay reader for RequestRefund/SettleRefund.
+func (s *PgStore) GetRefundRequestAsSeller(ctx context.Context, refundID string) (*domain.RefundRequest, error) {
+	var out *domain.RefundRequest
+	err := s.creditSellerTx(ctx, func(tx pgx.Tx) error {
 		r, err := loadRefund(ctx, tx, refundID, false)
 		out = r
 		return err

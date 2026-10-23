@@ -1041,6 +1041,12 @@ func (s *PgStore) RejectPriceVersion(ctx context.Context, versionID string, expe
 // what is published is exactly what was approved.
 func (s *PgStore) PublishPriceVersion(ctx context.Context, versionID string, expectedVersion int, actor string, now time.Time, claim domain.IdempotencyClaim) (*domain.PriceVersion, error) {
 	return s.transition(ctx, versionID, expectedVersion, domain.PriceVersionApproved, claim, func(tx pgx.Tx, v *domain.PriceVersion) error {
+		// COM-01 §4.1 maker-checker: the publisher may not be the approver.
+		// ApprovePriceVersion already prevents the approver from being the
+		// creator/submitter; this is the second half of the same control.
+		if v.ApprovedByPrincipalID == nil || actor == *v.ApprovedByPrincipalID {
+			return domain.ErrSoDViolation
+		}
 		if v.ApprovedContentSHA256 == nil || domain.ContentHash(v) != *v.ApprovedContentSHA256 {
 			return domain.ErrContentHashMismatch
 		}

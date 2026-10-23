@@ -271,20 +271,25 @@ func gatherMeterKeys(items []domain.SubscriptionItem, pvs map[string]*domain.Pri
 // to bill a METERED component that needed one and found none.
 func loadUsageBasis(ctx context.Context, tx pgx.Tx, subscriptionID string, termNo int, meterKeys []string) (map[string]domain.UsageBasis, error) {
 	out := map[string]domain.UsageBasis{}
-	for _, mk := range meterKeys {
-		var statementID, totalQuantity string
-		err := tx.QueryRow(ctx, `SELECT statement_id, total_quantity::text FROM usage_statements
-			WHERE subscription_id = $1 AND term_no = $2 AND meter_key = $3 AND status IN ('CERTIFIED', 'ADJUSTED')`,
-			subscriptionID, termNo, mk).Scan(&statementID, &totalQuantity)
-		if errors.Is(err, pgx.ErrNoRows) {
-			continue
-		}
-		if err != nil {
+	if len(meterKeys) == 0 {
+		return out, nil
+	}
+	rows, err := tx.Query(ctx, `SELECT meter_key, statement_id, total_quantity::text FROM usage_statements
+		WHERE subscription_id = $1 AND term_no = $2 AND meter_key = ANY($3)
+		  AND status IN ('CERTIFIED', 'ADJUSTED')`, subscriptionID, termNo, meterKeys)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var meterKey string
+		var basis domain.UsageBasis
+		if err := rows.Scan(&meterKey, &basis.StatementID, &basis.TotalQuantity); err != nil {
 			return nil, err
 		}
-		out[mk] = domain.UsageBasis{StatementID: statementID, TotalQuantity: totalQuantity}
+		out[meterKey] = basis
 	}
-	return out, nil
+	return out, rows.Err()
 }
 
 func (s *PgStore) GenerateInvoiceCandidate(ctx context.Context, req domain.GenerateInvoiceCandidateRequest, claim domain.IdempotencyClaim) (*domain.InvoiceCandidate, error) {
@@ -459,19 +464,48 @@ func (s *PgStore) IssueInvoice(ctx context.Context, candidateID, actor string, n
 		// query.
 		type statementFact struct{ status, totalQty string }
 		statementEvidence := map[string]statementFact{}
+		statementIDs := make([]string, 0, len(c.Lines))
+		seenStatements := map[string]bool{}
+		for _, l := range c.Lines {
+			if l.Kind != domain.LineUsage || l.StatementID == nil || seenStatements[*l.StatementID] {
+				continue
+			}
+			seenStatements[*l.StatementID] = true
+			statementIDs = append(statementIDs, *l.StatementID)
+		}
+		if len(statementIDs) > 0 {
+			rows, err := tx.Query(ctx, `SELECT statement_id, status, total_quantity::text
+				FROM usage_statements WHERE statement_id = ANY($1)`, statementIDs)
+			if err != nil {
+				return err
+			}
+			for rows.Next() {
+				var statementID string
+				var fact statementFact
+				if err := rows.Scan(&statementID, &fact.status, &fact.totalQty); err != nil {
+					rows.Close()
+					return err
+				}
+				statementEvidence[statementID] = fact
+			}
+			rows.Close()
+			if err := rows.Err(); err != nil {
+				return err
+			}
+		}
 		for _, l := range c.Lines {
 			if l.Kind != domain.LineUsage {
 				continue
 			}
-			var status, totalQuantity string
-			if err := tx.QueryRow(ctx, `SELECT status, total_quantity::text FROM usage_statements WHERE statement_id = $1`,
-				*l.StatementID).Scan(&status, &totalQuantity); err != nil {
-				return err
-			}
-			if (status != "CERTIFIED" && status != "ADJUSTED") || totalQuantity != *l.StatementTotalQuantityAtGenerate {
+			if l.StatementID == nil {
 				return domain.ErrInvoiceBasisChanged
 			}
-			statementEvidence[*l.StatementID] = statementFact{status: status, totalQty: totalQuantity}
+			fact, ok := statementEvidence[*l.StatementID]
+			if !ok || l.StatementTotalQuantityAtGenerate == nil ||
+				(fact.status != "CERTIFIED" && fact.status != "ADJUSTED") ||
+				fact.totalQty != *l.StatementTotalQuantityAtGenerate {
+				return domain.ErrInvoiceBasisChanged
+			}
 		}
 
 		ba, err := loadBillingAccountByOrg(ctx, tx, c.OrganizationID)
@@ -619,6 +653,20 @@ func loadInvoice(ctx context.Context, tx pgx.Tx, invoiceID string) (*domain.Plat
 func (s *PgStore) GetInvoiceCandidate(ctx context.Context, candidateID string) (*domain.InvoiceCandidate, error) {
 	var out *domain.InvoiceCandidate
 	err := s.billingTx(ctx, func(tx pgx.Tx) error {
+		c, err := loadCandidate(ctx, tx, candidateID, false)
+		out = c
+		return err
+	})
+	return out, err
+}
+
+// GetInvoiceCandidateAsSeller resolves a candidate on the seller plane. It is
+// for idempotent replay of seller commands whose claim resource id is a
+// candidate id and whose caller therefore has no tenant context yet. It is
+// not part of the BillingStore interface: normal reads stay tenant-scoped.
+func (s *PgStore) GetInvoiceCandidateAsSeller(ctx context.Context, candidateID string) (*domain.InvoiceCandidate, error) {
+	var out *domain.InvoiceCandidate
+	err := s.billingSellerTx(ctx, "", func(tx pgx.Tx) error {
 		c, err := loadCandidate(ctx, tx, candidateID, false)
 		out = c
 		return err

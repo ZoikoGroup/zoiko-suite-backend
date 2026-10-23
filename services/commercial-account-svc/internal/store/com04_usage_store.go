@@ -164,51 +164,70 @@ func (s *PgStore) ListMeterDefinitions(ctx context.Context) ([]domain.MeterDefin
 // not retired right now? Read on the seller plane (meter_definitions has no
 // tenant dimension), so it works inside the price book's own seller-plane
 // transaction without needing a second one.
-func loadRegisteredMeters(ctx context.Context, tx pgx.Tx, components []domain.PriceComponent) (map[string]bool, error) {
+type meterVersionRef struct {
+	key     string
+	version int
+}
+
+// loadRegisteredMeterSet is the one batched meter lookup shared by the two
+// submission checks below. It replaces a per-component/per-capability query
+// loop with a single ANY-based read.
+func loadRegisteredMeterSet(ctx context.Context, tx pgx.Tx, refs []meterVersionRef) (map[string]bool, error) {
 	out := map[string]bool{}
+	if len(refs) == 0 {
+		return out, nil
+	}
+	keys := make([]string, 0, len(refs))
+	versions := make([]int32, 0, len(refs))
+	for _, r := range refs {
+		keys = append(keys, r.key)
+		versions = append(versions, int32(r.version))
+	}
+	rows, err := tx.Query(ctx, `SELECT meter_key, meter_version, retired_at
+		FROM meter_definitions
+		WHERE (meter_key, meter_version) IN (SELECT * FROM unnest($1::text[], $2::int[]))`,
+		keys, versions)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var key string
+		var version int
+		var retiredAt *time.Time
+		if err := rows.Scan(&key, &version, &retiredAt); err != nil {
+			return nil, err
+		}
+		if retiredAt == nil {
+			out[domain.RegisteredMeterKey(key, version)] = true
+		}
+	}
+	return out, rows.Err()
+}
+
+func loadRegisteredMeters(ctx context.Context, tx pgx.Tx, components []domain.PriceComponent) (map[string]bool, error) {
+	refs := make([]meterVersionRef, 0, len(components))
 	for _, c := range components {
 		if c.ComponentType != domain.ComponentMetered || c.MeterKey == nil || c.MeterVersion == nil {
 			continue
 		}
-		var retiredAt *time.Time
-		err := tx.QueryRow(ctx, `SELECT retired_at FROM meter_definitions WHERE meter_key = $1 AND meter_version = $2`,
-			*c.MeterKey, *c.MeterVersion).Scan(&retiredAt)
-		if errors.Is(err, pgx.ErrNoRows) {
-			continue
-		}
-		if err != nil {
-			return nil, err
-		}
-		if retiredAt == nil {
-			out[domain.RegisteredMeterKey(*c.MeterKey, *c.MeterVersion)] = true
-		}
+		refs = append(refs, meterVersionRef{key: *c.MeterKey, version: *c.MeterVersion})
 	}
-	return out, nil
+	return loadRegisteredMeterSet(ctx, tx, refs)
 }
 
 // loadRegisteredMetersForCapabilities is loadRegisteredMeters' counterpart
 // for a price version's plan capabilities: of the meters a metered
 // capability's limit references, which are registered and not retired?
 func loadRegisteredMetersForCapabilities(ctx context.Context, tx pgx.Tx, caps []domain.PlanCapability) (map[string]bool, error) {
-	out := map[string]bool{}
+	refs := make([]meterVersionRef, 0, len(caps))
 	for _, c := range caps {
 		if c.MeterKey == nil || c.MeterVersion == nil {
 			continue
 		}
-		var retiredAt *time.Time
-		err := tx.QueryRow(ctx, `SELECT retired_at FROM meter_definitions WHERE meter_key = $1 AND meter_version = $2`,
-			*c.MeterKey, *c.MeterVersion).Scan(&retiredAt)
-		if errors.Is(err, pgx.ErrNoRows) {
-			continue
-		}
-		if err != nil {
-			return nil, err
-		}
-		if retiredAt == nil {
-			out[domain.RegisteredMeterKey(*c.MeterKey, *c.MeterVersion)] = true
-		}
+		refs = append(refs, meterVersionRef{key: *c.MeterKey, version: *c.MeterVersion})
 	}
-	return out, nil
+	return loadRegisteredMeterSet(ctx, tx, refs)
 }
 
 func loadMeterDefinition(ctx context.Context, tx pgx.Tx, meterKey string, version int) (*domain.MeterDefinition, error) {
@@ -424,7 +443,8 @@ func bumpStatement(ctx context.Context, tx pgx.Tx, statementID *string, quantity
 func (s *PgStore) registerLateEvent(ctx context.Context, tx pgx.Tx, organizationID, subscriptionID string, originTermNo int,
 	m domain.MeterDefinition, usageEventID string, in domain.EventInput, dimJSON []byte, observedAt time.Time, sourceService, reasonPrefix string) (*domain.UsageEventRecord, error) {
 	origin, err := scanStatement(tx.QueryRow(ctx, `SELECT `+usageStatementColumns+` FROM usage_statements
-		WHERE subscription_id = $1 AND term_no = $2 AND meter_key = $3`, subscriptionID, originTermNo, m.MeterKey))
+		WHERE subscription_id = $1 AND term_no = $2 AND meter_key = $3 AND status <> 'SUPERSEDED'
+		ORDER BY created_at DESC LIMIT 1`, subscriptionID, originTermNo, m.MeterKey))
 	if err != nil {
 		return nil, err
 	}
@@ -534,6 +554,20 @@ func (s *PgStore) CreateUsageAdjustment(ctx context.Context, targetStatementID, 
 		out = got
 		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "usage_adjustment", AggregateID: adjID,
 			EventType: "usage_adjustment.created", Payload: got})
+	})
+	return out, err
+}
+
+// GetUsageAdjustment is the replay reader for CreateUsageAdjustment, whose
+// claim resource id is target_statement/meter_key/source_event_id.
+func (s *PgStore) GetUsageAdjustment(ctx context.Context, targetStatementID, meterKey, sourceUsageEventID string) (*domain.UsageAdjustment, error) {
+	var out *domain.UsageAdjustment
+	err := s.usageTx(ctx, func(tx pgx.Tx) error {
+		a, err := scanUsageAdjustment(tx.QueryRow(ctx, `SELECT `+usageAdjustmentColumns+` FROM usage_adjustments
+			WHERE target_statement_id = $1 AND meter_key = $2 AND source_usage_event_id = $3`,
+			targetStatementID, meterKey, sourceUsageEventID))
+		out = a
+		return err
 	})
 	return out, err
 }
