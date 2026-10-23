@@ -29,6 +29,7 @@ import (
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 	idenv "zoiko.io/identity-envelope"
+	"zoiko.io/identity-envelope/apicontract"
 
 	"zoiko.io/tenant-entity-registry-svc/internal/authz"
 	"zoiko.io/tenant-entity-registry-svc/internal/config"
@@ -211,12 +212,12 @@ func main() {
 	log.Info("identity gate", gateSettings.Fields()...)
 
 	r := chi.NewRouter()
-	r.Use(idenv.RequestID)
-	r.Use(middleware.RequestID)
+	r.Use(apicontract.RequestID)
 	r.Use(middleware.RealIP)
 	r.Use(middleware.Recoverer)
 	r.Use(otelchi.Middleware("tenant-entity-registry-svc", otelchi.WithChiRoutes(r)))
 	r.Use(metrics.HTTPMiddleware)
+	r.Use(apicontract.DefaultCache)
 	r.Use(correlationIDMiddleware)
 	r.Use(gate.Middleware)
 	// Extract the caller's gateway-verified identity into the request context:
