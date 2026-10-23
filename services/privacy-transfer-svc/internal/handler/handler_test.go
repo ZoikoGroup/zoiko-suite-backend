@@ -296,6 +296,33 @@ func TestEvaluateTransfer_AuthorizationDenied_NoIdempotencyRecordCreated(t *test
 	}
 }
 
+// An unknown relationship or mechanism id is a 404 (the service's convention for
+// an id that does not resolve), never 503 "store unavailable", and nothing is
+// recorded or published for it.
+func TestEvaluateTransfer_UnknownRelationshipOrMechanism_Is404(t *testing.T) {
+	st := newStubStore()
+	pub := &stubPublisher{}
+	r := newTestRouter(st, pub, &stubAuthz{}, newStubPurposeRegistry())
+	rel := createRelationship(t, r)
+	mech := createValidMechanism(t, r)
+
+	w := doRequest(r, http.MethodPost, "/privacy/transfer-decisions", domain.EvaluateTransferRequest{
+		RelationshipID: rel.RelationshipID, TransferMechanismID: "00000000-0000-0000-0000-0000000000e2",
+	}, testTenant)
+	if w.Code != http.StatusNotFound || !strings.Contains(w.Body.String(), "transfer mechanism not found") {
+		t.Fatalf("unknown mechanism must be 404, got %d: %s", w.Code, w.Body.String())
+	}
+	w = doRequest(r, http.MethodPost, "/privacy/transfer-decisions", domain.EvaluateTransferRequest{
+		RelationshipID: "00000000-0000-0000-0000-0000000000e3", TransferMechanismID: mech.MechanismID,
+	}, testTenant)
+	if w.Code != http.StatusNotFound || !strings.Contains(w.Body.String(), "processor relationship not found") {
+		t.Fatalf("unknown relationship must be 404, got %d: %s", w.Code, w.Body.String())
+	}
+	if pub.published("privacy.transfer.authorization_changed") {
+		t.Fatal("no authorization event may be published for an unknown id")
+	}
+}
+
 func TestEvaluateTransfer_Blocked_RelationshipInactive(t *testing.T) {
 	st := newStubStore()
 	r := newTestRouter(st, &stubPublisher{}, &stubAuthz{}, newStubPurposeRegistry())

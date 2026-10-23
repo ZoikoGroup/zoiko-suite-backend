@@ -102,6 +102,7 @@ func (h *Handler) Routes(r chi.Router) {
 		r.Get("/{activityID}", h.GetActivity)
 		r.Post("/{activityID}/versions", h.CreateActivityVersion)
 		r.Get("/{activityID}/versions/{versionID}", h.GetActivityVersion)
+		r.Get("/{activityID}/audit", h.GetActivityAudit)
 
 		// Version-explicit routes
 		r.Post("/{activityID}/versions/{versionID}/validate", h.ValidateActivityVersion)
