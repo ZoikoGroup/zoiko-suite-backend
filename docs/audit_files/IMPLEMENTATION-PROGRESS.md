@@ -11,7 +11,7 @@ Statuses: TODO · IN PROGRESS · DONE · BLOCKED. DONE needs a filled evidence b
 | P0-2 | Register JURISDICTION_RULE_VALIDATE | DONE | b82fd224 | access-control 000023 + template + store test |
 | P0-3 | Fix stale resolve.go comment | DONE | 47986f06 | comment now matches tax.go |
 | API-1 | Shared apicontract package | DONE | acce5b86 | 30 unit + 7 pgx integration pass, 0 fail/skip; vet clean |
-| API-2 | Problem details + request id + cache, all our services | IN PROGRESS | e1830853 + [next commit] | tenant-entity-registry-svc + identity-context-svc done; 18 services remain |
+| API-2 | Problem details + request id + cache, all our services | IN PROGRESS | e1830853, f361be5e | tenant-entity-registry-svc + identity-context-svc done; 18 services remain |
 | API-3 | ETag / If-Match on aggregate mutations | TODO | | |
 | API-4 | Cursor pagination on lists | TODO | | |
 | API-5 | Async operations | TODO | | |
@@ -180,7 +180,7 @@ Blocked / limits: remaining 19 services need the same adoption
 
 ### API-2 — Problem details + request id + cache (identity-context-svc)
 Status: IN PROGRESS (code done; openapi Problem schema + parity test remaining)
-Commits: [next commit] feat(identity-context-svc): adopt RFC 9457 problem details and apicontract middleware
+Commits: f361be5e feat(identity-context-svc): adopt RFC 9457 problem details and apicontract middleware
 Migrations: none
 Permissions registered: none
 Routes: no new routes; all existing error paths now return application/problem+json via apicontract.WriteProblem
