@@ -295,6 +295,8 @@ func main() {
 	h.SetSessionLimits(handler.SessionLimits{
 		JIT: cfg.MaxJITSeconds, BreakGlass: cfg.MaxBreakGlassSeconds, Support: cfg.MaxSupportSeconds,
 	})
+	// AU-02: break-glass waits for this many independent, stepped-up approvers.
+	h.SetBreakGlassApprovals(cfg.BreakGlassApprovals)
 	if cfg.SessionStepUp == "off" {
 		log.Warn("AUTHZ_SESSION_STEP_UP=off — privileged and break-glass sessions are issued without a second factor (ENV=local only)")
 	}

@@ -111,6 +111,14 @@ func (h *Handler) ListAccessDecisions(w http.ResponseWriter, r *http.Request) {
 		Outcome:       strings.ToUpper(strings.TrimSpace(q.Get("decision_outcome"))),
 		ActionType:    strings.TrimSpace(q.Get("action_type")),
 		LegalEntityID: strings.TrimSpace(q.Get("legal_entity_id")),
+		// AU-13: the decisions made in one JIT, break-glass or support session.
+		SessionID: strings.TrimSpace(q.Get("session_id")),
+	}
+	if params.SessionID != "" && !validScope(params.SessionID) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "invalid_filter", "field": "session_id", "message": "session_id must be a UUID",
+		})
+		return
 	}
 
 	// An outcome that is neither GRANTED nor DENIED is REFUSED, not passed

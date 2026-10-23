@@ -3,7 +3,6 @@ package handler
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -71,6 +70,10 @@ type evalResult struct {
 	DeniedActions    []domain.DeniedActionInfo
 	StepUpActions    []domain.StepUpActionInfo
 	AllHeldActions   []string
+
+	// SessionKind / SessionID: the session the decision was made in (AU-13).
+	SessionKind string
+	SessionID   string
 }
 
 // evaluateCore is the central authorization evaluation engine shared by
@@ -96,8 +99,25 @@ func (h *Handler) evaluateCore(ctx context.Context, in evalContext, evaluationEn
 	return res, nil
 }
 
-// evaluateDecision runs the decision pipeline for in.ActionType alone.
+// evaluateDecision runs the decision pipeline for in.ActionType alone, then
+// tags the result with the session it was made in (AU-13). The tag is added
+// last because the layers replace reason codes and obligations as they go.
 func (h *Handler) evaluateDecision(ctx context.Context, in evalContext, evaluationEntityID string) (*evalResult, error) {
+	sess, err := h.resolveSessions(ctx, in)
+	if err != nil {
+		return nil, err
+	}
+	res, err := h.evaluateDecisionLayers(ctx, in, evaluationEntityID, sess)
+	if err != nil {
+		return nil, err
+	}
+	tagSessionEvidence(res, sess)
+	return res, nil
+}
+
+// evaluateDecisionLayers is the pipeline itself; sess holds the named
+// sessions that are active and belong to the principal.
+func (h *Handler) evaluateDecisionLayers(ctx context.Context, in evalContext, evaluationEntityID string, sess requestSessions) (*evalResult, error) {
 	res := &evalResult{
 		MatchedGrants:    make([]string, 0),
 		NegativeControls: make([]string, 0),
@@ -260,94 +280,72 @@ func (h *Handler) evaluateDecision(ctx context.Context, in evalContext, evaluati
 	}
 
 	// ── Layer 3: Privileged Access Management (JIT Elevation) ─────────────────
-	if in.PrivilegedSessionID != "" {
-		ps, err := h.store.FindPrivilegedSessionByID(ctx, in.PrivilegedSessionID, in.TenantID)
-		if err != nil && !errors.Is(err, domain.ErrPrivilegedSessionNotFound) {
-			return nil, fmt.Errorf("privileged session lookup: %w", err)
-		}
-		if err == nil && ps != nil {
-			if ps.PrincipalID == in.PrincipalID && ps.Status == domain.PrivilegedSessionStatusActive && time.Now().UTC().Before(ps.ExpiresAt) {
-				allHeldActions = append(allHeldActions, ps.RequestedActions...)
-				if !granted && contains(ps.RequestedActions, in.ActionType) {
-					granted = true
-					basis = fmt.Sprintf("pam:session=%s:ticket=%s", ps.SessionID, ps.TicketRef)
-					res.MatchedGrants = append(res.MatchedGrants, basis)
-				}
-			}
+	// The sessions were resolved once, before layer 0 (resolveSessions), so
+	// every decision made in one names it — denials included (AU-13).
+	if ps := sess.privileged; ps != nil {
+		allHeldActions = append(allHeldActions, ps.RequestedActions...)
+		if !granted && contains(ps.RequestedActions, in.ActionType) {
+			granted = true
+			basis = fmt.Sprintf("pam:session=%s:ticket=%s", ps.SessionID, ps.TicketRef)
+			res.MatchedGrants = append(res.MatchedGrants, basis)
 		}
 	}
 
 	// ── Layer 3.1: Break-Glass Emergency Session ──────────────────────────────
-	if in.BreakGlassSessionID != "" {
-		bg, err := h.store.FindBreakGlassSessionByID(ctx, in.BreakGlassSessionID, in.TenantID)
-		if err != nil && !errors.Is(err, domain.ErrBreakGlassSessionNotFound) {
-			return nil, fmt.Errorf("break-glass session lookup: %w", err)
-		}
-		if err == nil && bg != nil {
-			if bg.PrincipalID == in.PrincipalID && bg.IncidentID != "" && bg.Status == domain.BreakGlassSessionStatusActive && time.Now().UTC().Before(bg.ExpiresAt) {
-				allHeldActions = append(allHeldActions, bg.RequestedActions...)
-				if !granted && contains(bg.RequestedActions, in.ActionType) {
-					granted = true
-					basis = fmt.Sprintf("break_glass:session=%s:incident=%s", bg.SessionID, bg.IncidentID)
-					res.MatchedGrants = append(res.MatchedGrants, basis)
-				}
-			}
+	if bg := sess.breakGlass; bg != nil {
+		allHeldActions = append(allHeldActions, bg.RequestedActions...)
+		if !granted && contains(bg.RequestedActions, in.ActionType) {
+			granted = true
+			basis = fmt.Sprintf("break_glass:session=%s:incident=%s", bg.SessionID, bg.IncidentID)
+			res.MatchedGrants = append(res.MatchedGrants, basis)
 		}
 	}
 
 	// ── Layer 3.2: Support Session ────────────────────────────────────────────
-	if in.SupportSessionID != "" {
-		ss, err := h.store.FindSupportSessionByID(ctx, in.SupportSessionID, in.TenantID)
-		if err != nil && !errors.Is(err, domain.ErrSupportSessionNotFound) {
-			return nil, fmt.Errorf("support session lookup: %w", err)
+	if ss := sess.support; ss != nil {
+		// §15: consent stated, export off by default, read-only by
+		// default, and writes only when named. "Write" is anything that
+		// is not a read verb — so a legacy name like PAYMENT_RELEASE is
+		// a write, which the old suffix list (.create, .post, ...) missed.
+		if !ss.TenantConsentObtained {
+			res.Decision = domain.CanonicalDecisionDeny
+			res.Outcome = domain.OutcomeDenied
+			res.Basis = "support:consent_not_obtained"
+			res.Reason = "Support session has no tenant consent or support agreement on record"
+			res.ReasonCodes = []string{"SUPPORT_CONSENT_NOT_OBTAINED"}
+			res.NegativeControls = []string{"support:consent_not_obtained"}
+			return res, nil
 		}
-		if err == nil && ss != nil {
-			if ss.SupportOperatorID == in.PrincipalID && ss.Status == domain.SupportSessionStatusActive && time.Now().UTC().Before(ss.ExpiresAt) {
-				// §15: consent stated, export off by default, read-only by
-				// default, and writes only when named. "Write" is anything that
-				// is not a read verb — so a legacy name like PAYMENT_RELEASE is
-				// a write, which the old suffix list (.create, .post, ...) missed.
-				if !ss.TenantConsentObtained {
-					res.Decision = domain.CanonicalDecisionDeny
-					res.Outcome = domain.OutcomeDenied
-					res.Basis = "support:consent_not_obtained"
-					res.Reason = "Support session has no tenant consent or support agreement on record"
-					res.ReasonCodes = []string{"SUPPORT_CONSENT_NOT_OBTAINED"}
-					res.NegativeControls = []string{"support:consent_not_obtained"}
-					return res, nil
-				}
-				// Whole tokens (N-16): "export" is in SIEM_EXPORTER_READ, which
-				// names an exporter and moves no data.
-				exporting := isExportAction(in.ActionType)
-				isMutationAction := !domain.IsReadAction(in.ActionType)
+		// Whole tokens (N-16): "export" is in SIEM_EXPORTER_READ, which
+		// names an exporter and moves no data.
+		exporting := isExportAction(in.ActionType)
+		isMutationAction := !domain.IsReadAction(in.ActionType)
 
-				if exporting && !ss.AllowBulkExport && !contains(ss.AllowedActions, in.ActionType) {
-					res.Decision = domain.CanonicalDecisionDeny
-					res.Outcome = domain.OutcomeDenied
-					res.Basis = "support:bulk_export_prohibited"
-					res.Reason = "Bulk export prohibited in support session"
-					res.ReasonCodes = []string{"SUPPORT_BULK_EXPORT_PROHIBITED"}
-					res.NegativeControls = []string{"support:bulk_export_prohibited"}
-					return res, nil
-				}
+		if exporting && !ss.AllowBulkExport && !contains(ss.AllowedActions, in.ActionType) {
+			res.Decision = domain.CanonicalDecisionDeny
+			res.Outcome = domain.OutcomeDenied
+			res.Basis = "support:bulk_export_prohibited"
+			res.Reason = "Bulk export prohibited in support session"
+			res.ReasonCodes = []string{"SUPPORT_BULK_EXPORT_PROHIBITED"}
+			res.NegativeControls = []string{"support:bulk_export_prohibited"}
+			return res, nil
+		}
 
-				if isMutationAction && (ss.ReadOnly || !contains(ss.AllowedActions, in.ActionType)) {
-					res.Decision = domain.CanonicalDecisionDeny
-					res.Outcome = domain.OutcomeDenied
-					res.Basis = "support:read_only_session"
-					res.Reason = "Write operation prohibited in read-only support session"
-					res.ReasonCodes = []string{"SUPPORT_READ_ONLY_VIOLATION"}
-					res.NegativeControls = []string{"support:read_only_session"}
-					return res, nil
-				}
+		if isMutationAction && (ss.ReadOnly || !contains(ss.AllowedActions, in.ActionType)) {
+			res.Decision = domain.CanonicalDecisionDeny
+			res.Outcome = domain.OutcomeDenied
+			res.Basis = "support:read_only_session"
+			res.Reason = "Write operation prohibited in read-only support session"
+			res.ReasonCodes = []string{"SUPPORT_READ_ONLY_VIOLATION"}
+			res.NegativeControls = []string{"support:read_only_session"}
+			return res, nil
+		}
 
-				if !isMutationAction || contains(ss.AllowedActions, in.ActionType) {
-					granted = true
-					basis = fmt.Sprintf("support:session=%s:operator=%s:ticket=%s", ss.SessionID, ss.SupportOperatorID, ss.TicketRef)
-					res.MatchedGrants = append(res.MatchedGrants, basis)
-					allHeldActions = append(allHeldActions, in.ActionType)
-				}
-			}
+		if !isMutationAction || contains(ss.AllowedActions, in.ActionType) {
+			granted = true
+			basis = fmt.Sprintf("support:session=%s:operator=%s:ticket=%s", ss.SessionID, ss.SupportOperatorID, ss.TicketRef)
+			res.MatchedGrants = append(res.MatchedGrants, basis)
+			allHeldActions = append(allHeldActions, in.ActionType)
 		}
 	}
 

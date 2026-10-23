@@ -20,6 +20,16 @@ import (
 // ── stub store ────────────────────────────────────────────────────────────────
 
 type stubStore struct {
+	// Governed changes (governed_changes_test.go).
+	governedErr    error
+	bgDecided      *domain.BreakGlassSession
+	gotStepUp      *domain.StepUpEvidence
+	sodFound       *domain.SoDRule
+	abacFound      *domain.ABACRule
+	gotGoverned    *governedCall
+	authorityLimit *domain.AuthorityLimit
+	createdLimit   *domain.CreateAuthorityLimitParams
+
 	// denyAdmin withholds the tenant-scoped iam.* administration permissions
 	// requirePermission checks. By default the test caller is a tenant
 	// administrator (see FindGrantedActions).
@@ -394,6 +404,9 @@ var stubAdminActions = []string{
 	"iam.role.read", "iam.delegation.read", "iam.sod_rule.read",
 	// 000030 session controls: eligibility, approval, review.
 	"iam.pam.eligible", "iam.pam.approve", "iam.break_glass.eligible", "iam.session.review",
+	// 000034-000036 governed changes: approval and publication.
+	"iam.break_glass.approve", "iam.authority_limit.manage", "iam.authority_limit.approve",
+	"iam.sod_rule.publish", "iam.policy.publish",
 }
 
 // FindGrantedActions returns the seeded RBAC actions. requirePermission asks
@@ -725,12 +738,20 @@ func (s *stubStore) RevokeSupportSession(_ context.Context, sessionID, tenantID,
 	}, nil
 }
 
-func (s *stubStore) CreateAuthorityLimit(_ context.Context, _ domain.CreateAuthorityLimitParams) (*domain.AuthorityLimit, error) {
-	return &domain.AuthorityLimit{}, nil
+func (s *stubStore) CreateAuthorityLimit(_ context.Context, params domain.CreateAuthorityLimitParams) (*domain.AuthorityLimit, error) {
+	s.createdLimit = &params
+	if s.governedErr != nil {
+		return nil, s.governedErr
+	}
+	return &domain.AuthorityLimit{AuthorityLimitID: "al-new", Status: domain.AuthorityLimitPending, PrincipalID: params.PrincipalID,
+		RoleID: params.RoleID, AuthorityType: params.AuthorityType, Currency: params.Currency, UpperLimit: params.UpperLimit}, nil
 }
 
 func (s *stubStore) FindAuthorityLimitByID(_ context.Context, _, _ string) (*domain.AuthorityLimit, error) {
-	return &domain.AuthorityLimit{}, nil
+	if s.authorityLimit != nil {
+		return s.authorityLimit, nil
+	}
+	return nil, domain.ErrAuthorityLimitNotFound
 }
 
 func (s *stubStore) ListAuthorityLimits(_ context.Context, _, _, _, _ string) ([]domain.AuthorityLimit, error) {
@@ -1300,8 +1321,9 @@ func TestCreateSoDRule_NoJurisdiction_Created(t *testing.T) {
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
-	if w.Code != http.StatusCreated {
-		t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
+	// 202: proposed, published only once someone else approves it (AU-17).
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", w.Code, w.Body.String())
 	}
 }
 

@@ -259,6 +259,12 @@ func filterApplicableLimits(limits []domain.AuthorityLimit, in evalContext, eval
 	now := time.Now().UTC()
 
 	for _, al := range limits {
+		// Only a limit in force limits (000035, AU-03): a pending proposal,
+		// a rejected one, and a retired or superseded version do not. Empty
+		// is a row read without the status column.
+		if al.Status != "" && al.Status != domain.AuthorityLimitActive {
+			continue
+		}
 		// Effective period
 		if now.Before(al.EffectiveFrom) {
 			continue

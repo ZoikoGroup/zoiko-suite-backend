@@ -70,8 +70,9 @@ func TestRetireSoDRule_TenantComesFromHeaderNotQuery(t *testing.T) {
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", w.Code)
+	// 202: a retire / reactivate is a request, published by someone else (AU-17).
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d", w.Code)
 	}
 	if store.gotSoDActiveTenant != "11111111-1111-4111-8111-111111111111" {
 		t.Errorf("store scoped to %q; a query param overrode the verified header", store.gotSoDActiveTenant)
@@ -88,8 +89,9 @@ func TestRetireSoDRule_PassesFalse(t *testing.T) {
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", w.Code)
+	// 202: a retire / reactivate is a request, published by someone else (AU-17).
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d", w.Code)
 	}
 	if store.gotSoDActiveID != "rule-9" {
 		t.Errorf("rule id reached the store as %q, want rule-9", store.gotSoDActiveID)
@@ -109,8 +111,9 @@ func TestReactivateSoDRule_PassesTrue(t *testing.T) {
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", w.Code)
+	// 202: a retire / reactivate is a request, published by someone else (AU-17).
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d", w.Code)
 	}
 	if !store.gotSoDActiveValue {
 		t.Error("reactivate passed active=false")

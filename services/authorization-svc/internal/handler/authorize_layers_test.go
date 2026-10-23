@@ -506,8 +506,8 @@ func TestRetireAndReactivateABACRule(t *testing.T) {
 		req.Header.Set("X-Tenant-Id", testTenant)
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
-		if w.Code != http.StatusOK {
-			t.Fatalf("%s: expected 200, got %d: %s", path, w.Code, w.Body.String())
+		if w.Code != http.StatusAccepted {
+			t.Fatalf("%s: expected 202, got %d: %s", path, w.Code, w.Body.String())
 		}
 	}
 
