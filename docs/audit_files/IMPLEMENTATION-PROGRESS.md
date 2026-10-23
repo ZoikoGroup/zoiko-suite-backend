@@ -10,7 +10,7 @@ Statuses: TODO · IN PROGRESS · DONE · BLOCKED. DONE needs a filled evidence b
 | P0-1 | Commit pending authorization work | DONE | 58c810e4, c7581e77, a1574241 | authz 90 store+IT / 467 handler pass, 0 fail; vet clean |
 | P0-2 | Register JURISDICTION_RULE_VALIDATE | DONE | b82fd224 | access-control 000023 + template + store test |
 | P0-3 | Fix stale resolve.go comment | DONE | 47986f06 | comment now matches tax.go |
-| API-1 | Shared apicontract package | TODO | | |
+| API-1 | Shared apicontract package | DONE | acce5b86 | 30 unit + 7 pgx integration pass, 0 fail/skip; vet clean |
 | API-2 | Problem details + request id + cache, all our services | TODO | | |
 | API-3 | ETag / If-Match on aggregate mutations | TODO | | |
 | API-4 | Cursor pagination on lists | TODO | | |
@@ -146,4 +146,20 @@ Negative-path tests: none (comment only)
 Live probe (if run): none
 Spec rows closed: none; removes a misleading scope note ahead of JUR-1
 Blocked / limits: the note will be rewritten again in JUR-1 when the decision endpoint lands.
+
+### API-1 — Shared API contract package
+Status: DONE
+Commits: acce5b86 feat(identity-envelope): add the shared API wire-contract package
+Migrations: none here; `asyncpgx` ships `SchemaSQL` and `RLSSQL` constants for the service-owned migration in API-5, and creates no table in a service database.
+Permissions registered: none
+Routes: none; the package is a library consumed from API-2 onwards.
+Wiring: identity-envelope/go.mod now requires pgx v5.10.0 for the `apicontract/asyncpgx` subpackage. `gateway-auth-svc` still builds with no go.mod change because it does not import the subpackage; each service that imports it in API-5 will need `go mod tidy`.
+Tests:
+- `go test -count=1 ./apicontract` → 30 passed, 0 failed, 0 skipped. Covers the §12 problem members (type/title/status/detail/instance/code/request_id/correlation_id/retryable/errors[]/current_version) plus `Extra` merge without overriding contract fields; request-id echo/generate/legacy fallback; ETag parse plus 428/412/400 paths; default `private, no-store` and endpoint override; signed-cursor round trip, tampered payload/signature and tenant/route/filter/sort scope; pagination defaults, page-size bounds, unknown filter and unknown sort; Location sanitisation and 201 Created; Deprecation/Sunset/Link; async state transitions, validation and 202 Location.
+- `go test -tags=integration -count=1 ./apicontract/asyncpgx` against scratch `plan-pg`, database `apicontract_test` → 7 passed, 0 failed, 0 skipped. Covers idempotent replay and request-hash conflict, tenant-scoped Get, full lifecycle plus rejected backwards transition, cancel-request path and terminal cancel rejection, FindByKey, empty idempotency key, and started/finished timestamps.
+- `go test -count=1 ./...` → identity-envelope and apicontract ok; `go vet ./...` → clean; `gofmt -l apicontract` → empty.
+Negative-path tests: TestCursorRejectsTamperedPayloadAndSignature, TestCursorRejectsOutOfScope, TestCheckIfMatchRequiresHeader, TestCheckIfMatchRejectsStaleVersion, TestCheckIfMatchRejectsMalformed, TestCreateReplaysIdempotentRequest (same key, different hash)
+Live probe (if run): none
+Spec rows closed: ZS-API-001 §6, §10, §12, §15, §18, §26 and §29 groundwork (helpers only; adoption is API-2..API-6)
+Blocked / limits: the `asyncpgx` suite is build-tagged and needs PostgreSQL (`ASYNC_TEST_DSN`, defaulting to scratch `plan-pg`), so it is not part of the default `go test ./...`; it was run explicitly for this evidence. Python is still unavailable for `migrate.py` on this host.
 
