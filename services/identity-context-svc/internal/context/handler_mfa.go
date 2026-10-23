@@ -38,26 +38,26 @@ const (
 // a header naming anyone but the envelope's principal is refused, not obeyed.
 func (h *Handler) mfaCaller(w http.ResponseWriter, r *http.Request) (*MFACaller, bool) {
 	if h.mfa == nil {
-		writeError(w, http.StatusNotImplemented, "second factor is not wired on this deployment")
+		writeError(w, r, http.StatusNotImplemented, "second factor is not wired on this deployment")
 		return nil, false
 	}
 	bearer, ok := bearerToken(r.Header.Get("Authorization"))
 	if !ok {
-		writeCoded(w, http.StatusUnauthorized, errCodeSessionInvalid,
+		writeCoded(w, r, http.StatusUnauthorized, errCodeSessionInvalid,
 			"Authorization: Bearer <identity envelope> is required")
 		return nil, false
 	}
 	c, err := h.mfa.Authenticate(r.Context(), bearer)
 	if err != nil {
-		h.writeMFAError(w, err)
+		h.writeMFAError(w, r, err)
 		return nil, false
 	}
 	if hp := strings.TrimSpace(r.Header.Get("X-Principal-Id")); hp != "" && hp != c.Principal.PrincipalID {
-		writeCoded(w, http.StatusForbidden, errCodeIdentityMismatch, "X-Principal-Id does not match the session")
+		writeCoded(w, r, http.StatusForbidden, errCodeIdentityMismatch, "X-Principal-Id does not match the session")
 		return nil, false
 	}
 	if ht := strings.TrimSpace(r.Header.Get("X-Tenant-Id")); ht != "" && ht != c.Principal.TenantID {
-		writeCoded(w, http.StatusForbidden, errCodeIdentityMismatch, "X-Tenant-Id does not match the session")
+		writeCoded(w, r, http.StatusForbidden, errCodeIdentityMismatch, "X-Tenant-Id does not match the session")
 		return nil, false
 	}
 	return c, true
@@ -79,32 +79,32 @@ func mfaCorrelation(r *http.Request, body string) string {
 	return r.Header.Get("X-Correlation-ID")
 }
 
-func (h *Handler) writeMFAError(w http.ResponseWriter, err error) {
+func (h *Handler) writeMFAError(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
 	case errors.Is(err, ErrMFAUnavailable):
-		writeCoded(w, http.StatusServiceUnavailable, errCodeMFAUnavailable, err.Error())
+		writeCoded(w, r, http.StatusServiceUnavailable, errCodeMFAUnavailable, err.Error())
 	case errors.Is(err, ErrMFASessionInvalid):
-		writeCoded(w, http.StatusUnauthorized, errCodeSessionInvalid, err.Error())
+		writeCoded(w, r, http.StatusUnauthorized, errCodeSessionInvalid, err.Error())
 	case errors.Is(err, ErrReauthRequired):
-		writeCoded(w, http.StatusUnauthorized, errCodeReauthRequired, err.Error())
+		writeCoded(w, r, http.StatusUnauthorized, errCodeReauthRequired, err.Error())
 	case errors.Is(err, ErrMFAStepUpRequired):
-		writeCoded(w, http.StatusForbidden, errCodeStepUpRequired, err.Error())
+		writeCoded(w, r, http.StatusForbidden, errCodeStepUpRequired, err.Error())
 	case errors.Is(err, ErrMFANotEnrolled):
-		writeCoded(w, http.StatusConflict, errCodeMFANotEnrolled, err.Error())
+		writeCoded(w, r, http.StatusConflict, errCodeMFANotEnrolled, err.Error())
 	case errors.Is(err, ErrMFAFactorNotFound):
-		writeCoded(w, http.StatusNotFound, errCodeFactorNotFound, err.Error())
+		writeCoded(w, r, http.StatusNotFound, errCodeFactorNotFound, err.Error())
 	case errors.Is(err, ErrInvalidCode):
-		writeCoded(w, http.StatusUnauthorized, errCodeInvalidCode, err.Error())
+		writeCoded(w, r, http.StatusUnauthorized, errCodeInvalidCode, err.Error())
 	case errors.Is(err, ErrRequestInvalid):
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeError(w, r, http.StatusBadRequest, err.Error())
 	case errors.Is(err, domain.ErrPrincipalNotFound):
-		writeError(w, http.StatusNotFound, "principal not found")
+		writeError(w, r, http.StatusNotFound, "principal not found")
 	case errors.Is(err, ErrAuthUnavailable):
 		h.log.Error("mfa command unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "second factor unavailable")
+		writeError(w, r, http.StatusServiceUnavailable, "second factor unavailable")
 	default:
 		h.log.Error("unexpected mfa error", zap.Error(err))
-		writeError(w, http.StatusInternalServerError, "internal error")
+		writeError(w, r, http.StatusInternalServerError, "internal error")
 	}
 }
 
@@ -131,7 +131,7 @@ func (h *Handler) StepUp(w http.ResponseWriter, r *http.Request) {
 	}
 	var req domain.StepUpRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
+		writeError(w, r, http.StatusBadRequest, "invalid request body")
 		return
 	}
 	resp, err := h.mfa.StepUp(r.Context(), c, req.Code, mfaCorrelation(r, req.CorrelationID))
@@ -139,7 +139,7 @@ func (h *Handler) StepUp(w http.ResponseWriter, r *http.Request) {
 		h.limiter.Failure(r.Context(), ip, c.Principal.TenantID)
 	}
 	if err != nil {
-		h.writeMFAError(w, err)
+		h.writeMFAError(w, r, err)
 		return
 	}
 	noStore(w)
@@ -158,7 +158,7 @@ func (h *Handler) EnrollTOTP(w http.ResponseWriter, r *http.Request) {
 	}
 	resp, err := h.mfa.Enrol(r.Context(), c, r.Header.Get("X-Correlation-ID"))
 	if err != nil {
-		h.writeMFAError(w, err)
+		h.writeMFAError(w, r, err)
 		return
 	}
 	noStore(w)
@@ -182,12 +182,12 @@ func (h *Handler) ActivateTOTP(w http.ResponseWriter, r *http.Request) {
 	}
 	var req activateTOTPRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
+		writeError(w, r, http.StatusBadRequest, "invalid request body")
 		return
 	}
 	f, err := h.mfa.Activate(r.Context(), c, req.FactorID, req.Code, mfaCorrelation(r, req.CorrelationID))
 	if err != nil {
-		h.writeMFAError(w, err)
+		h.writeMFAError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, f)
@@ -209,11 +209,11 @@ func (h *Handler) RevokeTOTP(w http.ResponseWriter, r *http.Request) {
 	}
 	var req revokeTOTPRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
+		writeError(w, r, http.StatusBadRequest, "invalid request body")
 		return
 	}
 	if err := h.mfa.Revoke(r.Context(), c, req.FactorID, req.ReasonCode, mfaCorrelation(r, req.CorrelationID)); err != nil {
-		h.writeMFAError(w, err)
+		h.writeMFAError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"factor_id": req.FactorID, "status": domain.CredentialStatusRetired})
@@ -229,7 +229,7 @@ func (h *Handler) ListMFAFactors(w http.ResponseWriter, r *http.Request) {
 	}
 	out, err := h.mfa.List(r.Context(), c)
 	if err != nil {
-		h.writeMFAError(w, err)
+		h.writeMFAError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"factors": out, "count": len(out)})
@@ -254,17 +254,17 @@ func (h *Handler) ResetPrincipalMFA(w http.ResponseWriter, r *http.Request) {
 	}
 	subject := chi.URLParam(r, "principalID")
 	if subject == c.Principal.PrincipalID {
-		writeCoded(w, http.StatusForbidden, "self_reset_refused",
+		writeCoded(w, r, http.StatusForbidden, "self_reset_refused",
 			"an administrator cannot reset their own second factor; use /v1/mfa/totp/revoke")
 		return
 	}
 	var req resetMFARequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
+		writeError(w, r, http.StatusBadRequest, "invalid request body")
 		return
 	}
 	if strings.TrimSpace(req.ReasonCode) == "" {
-		writeError(w, http.StatusBadRequest, "reason_code is required")
+		writeError(w, r, http.StatusBadRequest, "reason_code is required")
 		return
 	}
 	if !h.authorize(w, r, c.Principal.PrincipalID, c.Principal.TenantID, ActionResetPrincipalMFA) {
@@ -272,7 +272,7 @@ func (h *Handler) ResetPrincipalMFA(w http.ResponseWriter, r *http.Request) {
 	}
 	n, err := h.mfa.ResetFactors(r.Context(), c, subject, req.ReasonCode, req.Purpose, r.Header.Get("X-Correlation-ID"))
 	if err != nil {
-		h.writeMFAError(w, err)
+		h.writeMFAError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"principal_id": subject, "factors_retired": n})

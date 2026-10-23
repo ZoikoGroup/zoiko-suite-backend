@@ -48,6 +48,7 @@ import (
 	"zoiko.io/identity-context-svc/internal/telemetry"
 	"zoiko.io/identity-context-svc/internal/upstream"
 	idenv "zoiko.io/identity-envelope"
+	"zoiko.io/identity-envelope/apicontract"
 )
 
 // kafkaWriterAdapter bridges the relay's broker-agnostic MessageWriter to
@@ -477,7 +478,8 @@ func main() {
 	r := chi.NewRouter()
 
 	// Platform middleware
-	r.Use(middleware.RequestID) // injects X-Request-Id
+	r.Use(apicontract.RequestID)    // echoes a well-formed client Zoiko-Request-Id, else generates one
+	r.Use(apicontract.DefaultCache) // Cache-Control: private, no-store
 	r.Use(middleware.RealIP)
 	r.Use(middleware.Recoverer) // never let a panic crash the Tier 0 service
 	r.Use(otelchi.Middleware("identity-context-svc", otelchi.WithChiRoutes(r)))

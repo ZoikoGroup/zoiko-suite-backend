@@ -11,6 +11,7 @@ import (
 
 	"zoiko.io/identity-context-svc/internal/domain"
 	"zoiko.io/identity-context-svc/internal/sod"
+	"zoiko.io/identity-envelope/apicontract"
 )
 
 // This file carries the four GOV-01 contract operations that had no
@@ -65,7 +66,7 @@ func (h *Handler) ExplainContext(w http.ResponseWriter, r *http.Request) {
 
 	sc, err := h.sessions.GetSessionContext(r.Context(), sessionContextID, tenantID)
 	if err != nil {
-		writeCoded(w, http.StatusServiceUnavailable, domain.ErrCodeUpstreamUnavailable,
+		writeCoded(w, r, http.StatusServiceUnavailable, domain.ErrCodeUpstreamUnavailable,
 			"could not read the session record")
 		return
 	}
@@ -73,7 +74,7 @@ func (h *Handler) ExplainContext(w http.ResponseWriter, r *http.Request) {
 		// 404 rather than 403 for a foreign session — a distinct forbidden
 		// would confirm the id exists, and session ids are what an attacker
 		// probes for.
-		writeCoded(w, http.StatusNotFound, domain.ErrCodeContextUnresolved, "session not found")
+		writeCoded(w, r, http.StatusNotFound, domain.ErrCodeContextUnresolved, "session not found")
 		return
 	}
 	if !h.authorizeUnlessSelf(w, r, callerPrincipalID, sc.PrincipalID, tenantID, ActionExplainContext) {
@@ -84,7 +85,7 @@ func (h *Handler) ExplainContext(w http.ResponseWriter, r *http.Request) {
 	if raw := r.URL.Query().Get("as_of"); raw != "" {
 		parsed, err := time.Parse(time.RFC3339, raw)
 		if err != nil {
-			writeCoded(w, http.StatusBadRequest, domain.ErrCodeContextUnresolved,
+			writeCoded(w, r, http.StatusBadRequest, domain.ErrCodeContextUnresolved,
 				"as_of must be an RFC3339 timestamp")
 			return
 		}
@@ -104,7 +105,7 @@ func (h *Handler) ExplainContext(w http.ResponseWriter, r *http.Request) {
 // denial-of-service primitive wearing a maintenance command's clothes.
 func (h *Handler) RefreshContextCache(w http.ResponseWriter, r *http.Request) {
 	if h.cache == nil {
-		writeCoded(w, http.StatusNotImplemented, domain.ErrCodeUpstreamUnavailable,
+		writeCoded(w, r, http.StatusNotImplemented, domain.ErrCodeUpstreamUnavailable,
 			"context cache commands are not configured in this deployment")
 		return
 	}
@@ -122,7 +123,7 @@ func (h *Handler) RefreshContextCache(w http.ResponseWriter, r *http.Request) {
 
 	var req domain.RefreshCacheRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeCoded(w, http.StatusBadRequest, domain.ErrCodeContextUnresolved, "invalid request body")
+		writeCoded(w, r, http.StatusBadRequest, domain.ErrCodeContextUnresolved, "invalid request body")
 		return
 	}
 	if req.CorrelationID == "" {
@@ -132,7 +133,7 @@ func (h *Handler) RefreshContextCache(w http.ResponseWriter, r *http.Request) {
 	resp, err := h.cache.Refresh(r.Context(), tenantID, req, callerPrincipalID)
 	if err != nil {
 		h.log.Error("refresh tenant context cache failed", zap.Error(err))
-		writeCoded(w, http.StatusServiceUnavailable, domain.ErrCodeUpstreamUnavailable,
+		writeCoded(w, r, http.StatusServiceUnavailable, domain.ErrCodeUpstreamUnavailable,
 			"could not refresh the context cache")
 		return
 	}
@@ -151,7 +152,7 @@ func (h *Handler) RefreshContextCache(w http.ResponseWriter, r *http.Request) {
 // sense in which revoking a whole tenant is an ordinary self-service action.
 func (h *Handler) InvalidateTenantContext(w http.ResponseWriter, r *http.Request) {
 	if h.cache == nil {
-		writeCoded(w, http.StatusNotImplemented, domain.ErrCodeUpstreamUnavailable,
+		writeCoded(w, r, http.StatusNotImplemented, domain.ErrCodeUpstreamUnavailable,
 			"context cache commands are not configured in this deployment")
 		return
 	}
@@ -169,7 +170,7 @@ func (h *Handler) InvalidateTenantContext(w http.ResponseWriter, r *http.Request
 
 	var req domain.InvalidateTenantContextRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeCoded(w, http.StatusBadRequest, domain.ErrCodeContextUnresolved, "invalid request body")
+		writeCoded(w, r, http.StatusBadRequest, domain.ErrCodeContextUnresolved, "invalid request body")
 		return
 	}
 	if req.CorrelationID == "" {
@@ -179,7 +180,7 @@ func (h *Handler) InvalidateTenantContext(w http.ResponseWriter, r *http.Request
 	resp, err := h.cache.InvalidateTenant(r.Context(), tenantID, req, callerPrincipalID)
 	if err != nil {
 		if errors.Is(err, ErrRequestInvalid) {
-			writeCoded(w, http.StatusBadRequest, domain.ErrCodeContextUnresolved, err.Error())
+			writeCoded(w, r, http.StatusBadRequest, domain.ErrCodeContextUnresolved, err.Error())
 			return
 		}
 		h.log.Error("tenant context invalidation failed", zap.Error(err))
@@ -196,7 +197,7 @@ func (h *Handler) InvalidateTenantContext(w http.ResponseWriter, r *http.Request
 			})
 			return
 		}
-		writeCoded(w, http.StatusInternalServerError, domain.ErrCodeUpstreamUnavailable,
+		writeCoded(w, r, http.StatusInternalServerError, domain.ErrCodeUpstreamUnavailable,
 			"tenant invalidation failed")
 		return
 	}
@@ -220,7 +221,7 @@ func (h *Handler) AttachSupportContext(w http.ResponseWriter, r *http.Request) {
 	if h.support == nil {
 		// 501 rather than a permissive default. An unconfigured privileged
 		// command should be unavailable, never silently open.
-		writeCoded(w, http.StatusNotImplemented, domain.ErrCodeUpstreamUnavailable,
+		writeCoded(w, r, http.StatusNotImplemented, domain.ErrCodeUpstreamUnavailable,
 			"support context is not configured in this deployment")
 		return
 	}
@@ -231,7 +232,7 @@ func (h *Handler) AttachSupportContext(w http.ResponseWriter, r *http.Request) {
 
 	var req domain.AttachSupportContextRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeCoded(w, http.StatusBadRequest, domain.ErrCodeContextUnresolved, "invalid request body")
+		writeCoded(w, r, http.StatusBadRequest, domain.ErrCodeContextUnresolved, "invalid request body")
 		return
 	}
 	if req.CorrelationID == "" {
@@ -247,7 +248,7 @@ func (h *Handler) AttachSupportContext(w http.ResponseWriter, r *http.Request) {
 	// support engineer may, and would authorize an elevation into any tenant
 	// on the platform.
 	if req.TenantID == "" {
-		writeCoded(w, http.StatusBadRequest, domain.ErrCodeContextUnresolved, "tenant_id is required")
+		writeCoded(w, r, http.StatusBadRequest, domain.ErrCodeContextUnresolved, "tenant_id is required")
 		return
 	}
 	if !h.authorize(w, r, callerPrincipalID, req.TenantID, ActionAttachSupportContext) {
@@ -256,7 +257,7 @@ func (h *Handler) AttachSupportContext(w http.ResponseWriter, r *http.Request) {
 
 	sc, err := h.support.Attach(r.Context(), req, callerPrincipalID)
 	if err != nil {
-		h.writeSupportError(w, err, req.CorrelationID)
+		h.writeSupportError(w, r, err, req.CorrelationID)
 		return
 	}
 
@@ -281,7 +282,7 @@ const ActionApproveSupportContext = "IDENTITY_SUPPORT_CONTEXT_APPROVE"
 // names, and never its requester or grantee.
 func (h *Handler) ApproveSupportContext(w http.ResponseWriter, r *http.Request) {
 	if h.support == nil {
-		writeCoded(w, http.StatusNotImplemented, domain.ErrCodeUpstreamUnavailable,
+		writeCoded(w, r, http.StatusNotImplemented, domain.ErrCodeUpstreamUnavailable,
 			"support context is not configured in this deployment")
 		return
 	}
@@ -299,7 +300,7 @@ func (h *Handler) ApproveSupportContext(w http.ResponseWriter, r *http.Request) 
 	correlationID := r.Header.Get("X-Correlation-ID")
 	sc, err := h.support.Approve(r.Context(), chi.URLParam(r, "supportContextID"), tenantID, callerPrincipalID, correlationID)
 	if err != nil {
-		h.writeSupportError(w, err, correlationID)
+		h.writeSupportError(w, r, err, correlationID)
 		return
 	}
 	writeJSON(w, http.StatusOK, domain.AttachSupportContextResponse{
@@ -314,7 +315,7 @@ func (h *Handler) ApproveSupportContext(w http.ResponseWriter, r *http.Request) 
 // reviewer who reconciles it.
 func (h *Handler) GetSupportContext(w http.ResponseWriter, r *http.Request) {
 	if h.support == nil {
-		writeCoded(w, http.StatusNotImplemented, domain.ErrCodeUpstreamUnavailable,
+		writeCoded(w, r, http.StatusNotImplemented, domain.ErrCodeUpstreamUnavailable,
 			"support context is not configured in this deployment")
 		return
 	}
@@ -333,12 +334,12 @@ func (h *Handler) GetSupportContext(w http.ResponseWriter, r *http.Request) {
 	supportContextID := chi.URLParam(r, "supportContextID")
 	sc, err := h.support.store.FindSupportContext(r.Context(), supportContextID, tenantID)
 	if err != nil {
-		writeCoded(w, http.StatusServiceUnavailable, domain.ErrCodeUpstreamUnavailable,
+		writeCoded(w, r, http.StatusServiceUnavailable, domain.ErrCodeUpstreamUnavailable,
 			"could not read the support context")
 		return
 	}
 	if sc == nil {
-		writeCoded(w, http.StatusNotFound, domain.ErrCodeBreakGlassRequired, "support context not found")
+		writeCoded(w, r, http.StatusNotFound, domain.ErrCodeBreakGlassRequired, "support context not found")
 		return
 	}
 	writeJSON(w, http.StatusOK, sc)
@@ -351,7 +352,7 @@ func (h *Handler) GetSupportContext(w http.ResponseWriter, r *http.Request) {
 // notices a problem may be unable to stop it.
 func (h *Handler) RevokeSupportContext(w http.ResponseWriter, r *http.Request) {
 	if h.support == nil {
-		writeCoded(w, http.StatusNotImplemented, domain.ErrCodeUpstreamUnavailable,
+		writeCoded(w, r, http.StatusNotImplemented, domain.ErrCodeUpstreamUnavailable,
 			"support context is not configured in this deployment")
 		return
 	}
@@ -377,11 +378,11 @@ func (h *Handler) RevokeSupportContext(w http.ResponseWriter, r *http.Request) {
 
 	if err := h.support.Revoke(r.Context(), supportContextID, tenantID, req.Reason, callerPrincipalID, correlationID); err != nil {
 		if errors.Is(err, domain.ErrSupportContextNotFound) {
-			writeCoded(w, http.StatusNotFound, domain.ErrCodeBreakGlassRequired, "support context not found")
+			writeCoded(w, r, http.StatusNotFound, domain.ErrCodeBreakGlassRequired, "support context not found")
 			return
 		}
 		h.log.Error("support context revocation failed", zap.Error(err))
-		writeCoded(w, http.StatusInternalServerError, domain.ErrCodeUpstreamUnavailable,
+		writeCoded(w, r, http.StatusInternalServerError, domain.ErrCodeUpstreamUnavailable,
 			"could not revoke the support context")
 		return
 	}
@@ -401,7 +402,7 @@ func (h *Handler) RevokeSupportContext(w http.ResponseWriter, r *http.Request) {
 // is worth exactly as much as its enforcement.
 func (h *Handler) ReviewSupportContext(w http.ResponseWriter, r *http.Request) {
 	if h.support == nil {
-		writeCoded(w, http.StatusNotImplemented, domain.ErrCodeUpstreamUnavailable,
+		writeCoded(w, r, http.StatusNotImplemented, domain.ErrCodeUpstreamUnavailable,
 			"support context is not configured in this deployment")
 		return
 	}
@@ -422,23 +423,23 @@ func (h *Handler) ReviewSupportContext(w http.ResponseWriter, r *http.Request) {
 	sc, err := h.support.store.FindSupportContext(r.Context(), supportContextID, tenantID)
 	if err != nil {
 		h.log.Error("support context lookup failed", zap.Error(err))
-		writeCoded(w, http.StatusServiceUnavailable, domain.ErrCodeUpstreamUnavailable,
+		writeCoded(w, r, http.StatusServiceUnavailable, domain.ErrCodeUpstreamUnavailable,
 			"could not read the support context")
 		return
 	}
 	if sc == nil {
-		writeCoded(w, http.StatusNotFound, domain.ErrCodeBreakGlassRequired, "support context not found")
+		writeCoded(w, r, http.StatusNotFound, domain.ErrCodeBreakGlassRequired, "support context not found")
 		return
 	}
 	if sc.SupportPrincipalID == callerPrincipalID || sc.ApproverPrincipalID == callerPrincipalID {
-		writeCoded(w, http.StatusForbidden, domain.ErrCodeSoDConflict,
+		writeCoded(w, r, http.StatusForbidden, domain.ErrCodeSoDConflict,
 			"a support context may not be reviewed by its grantee or its approver")
 		return
 	}
 
 	if err := h.support.MarkReviewed(r.Context(), supportContextID, tenantID, callerPrincipalID, r.Header.Get("X-Correlation-ID")); err != nil {
 		h.log.Error("support context review failed", zap.Error(err))
-		writeCoded(w, http.StatusInternalServerError, domain.ErrCodeUpstreamUnavailable,
+		writeCoded(w, r, http.StatusInternalServerError, domain.ErrCodeUpstreamUnavailable,
 			"could not record the review")
 		return
 	}
@@ -451,68 +452,64 @@ func (h *Handler) ReviewSupportContext(w http.ResponseWriter, r *http.Request) {
 // refused for a TTL that is too long, a missing approver and a segregation
 // conflict all need different responses from the operator, and all three used
 // to be indistinguishable message strings.
-func (h *Handler) writeSupportError(w http.ResponseWriter, err error, correlationID string) {
+func (h *Handler) writeSupportError(w http.ResponseWriter, r *http.Request, err error, correlationID string) {
 	switch {
 	case errors.Is(err, sod.ErrConflict) && errors.Is(err, domain.ErrSupportSelfApproval):
-		// The requester or the grantee approving their own request.
-		writeJSON(w, http.StatusForbidden, errorResponse{
-			Error:         err.Error(),
-			ErrorCode:     domain.ErrCodeSoDConflict,
-			CorrelationID: correlationID,
+		apicontract.WriteProblem(w, r, apicontract.Problem{
+			Status: http.StatusForbidden,
+			Code:   domain.ErrCodeSoDConflict,
+			Detail: err.Error(),
 		})
 	case errors.Is(err, sod.ErrConflict):
-		writeJSON(w, http.StatusConflict, errorResponse{
-			Error:         err.Error(),
-			ErrorCode:     domain.ErrCodeSoDConflict,
-			CorrelationID: correlationID,
+		apicontract.WriteProblem(w, r, apicontract.Problem{
+			Status: http.StatusConflict,
+			Code:   domain.ErrCodeSoDConflict,
+			Detail: err.Error(),
 		})
 	case errors.Is(err, domain.ErrSupportNotApprover):
-		writeJSON(w, http.StatusForbidden, errorResponse{
-			Error:         err.Error(),
-			ErrorCode:     domain.ErrCodeAuthorizationDenied,
-			CorrelationID: correlationID,
+		apicontract.WriteProblem(w, r, apicontract.Problem{
+			Status: http.StatusForbidden,
+			Code:   domain.ErrCodeAuthorizationDenied,
+			Detail: err.Error(),
 		})
 	case errors.Is(err, domain.ErrSupportNotPending):
-		writeJSON(w, http.StatusConflict, errorResponse{
-			Error:         err.Error(),
-			ErrorCode:     domain.ErrCodeBreakGlassRequired,
-			CorrelationID: correlationID,
+		apicontract.WriteProblem(w, r, apicontract.Problem{
+			Status: http.StatusConflict,
+			Code:   domain.ErrCodeBreakGlassRequired,
+			Detail: err.Error(),
 		})
 	case errors.Is(err, domain.ErrSupportApprovalLapsed):
-		writeJSON(w, http.StatusConflict, errorResponse{
-			Error:         err.Error(),
-			ErrorCode:     domain.ErrCodeBreakGlassExpired,
-			CorrelationID: correlationID,
+		apicontract.WriteProblem(w, r, apicontract.Problem{
+			Status: http.StatusConflict,
+			Code:   domain.ErrCodeBreakGlassExpired,
+			Detail: err.Error(),
 		})
 	case errors.Is(err, domain.ErrSupportContextNotFound):
-		writeJSON(w, http.StatusNotFound, errorResponse{
-			Error:         err.Error(),
-			ErrorCode:     domain.ErrCodeBreakGlassRequired,
-			CorrelationID: correlationID,
+		apicontract.WriteProblem(w, r, apicontract.Problem{
+			Status: http.StatusNotFound,
+			Code:   domain.ErrCodeBreakGlassRequired,
+			Detail: err.Error(),
 		})
 	case errors.Is(err, sod.ErrUnavailable):
-		// Fail closed, and say which control could not run. An operator told
-		// only "service unavailable" will retry; one told the SoD service is
-		// down will go and fix it.
-		writeJSON(w, http.StatusServiceUnavailable, errorResponse{
-			Error:         "segregation of duties could not be evaluated — refusing to grant",
-			ErrorCode:     domain.ErrCodeUpstreamUnavailable,
-			CorrelationID: correlationID,
+		apicontract.WriteProblem(w, r, apicontract.Problem{
+			Status: http.StatusServiceUnavailable,
+			Code:   domain.ErrCodeUpstreamUnavailable,
+			Detail: "segregation of duties could not be evaluated — refusing to grant",
 		})
 	case errors.Is(err, domain.ErrSupportSelfApproval),
 		errors.Is(err, domain.ErrSupportTTLExceeded),
 		errors.Is(err, ErrRequestInvalid):
-		writeJSON(w, http.StatusBadRequest, errorResponse{
-			Error:         err.Error(),
-			ErrorCode:     domain.ErrCodeBreakGlassRequired,
-			CorrelationID: correlationID,
+		apicontract.WriteProblem(w, r, apicontract.Problem{
+			Status: http.StatusBadRequest,
+			Code:   domain.ErrCodeBreakGlassRequired,
+			Detail: err.Error(),
 		})
 	default:
 		h.log.Error("attach support context failed", zap.Error(err))
-		writeJSON(w, http.StatusInternalServerError, errorResponse{
-			Error:         "could not attach the support context",
-			ErrorCode:     domain.ErrCodeUpstreamUnavailable,
-			CorrelationID: correlationID,
+		apicontract.WriteProblem(w, r, apicontract.Problem{
+			Status: http.StatusInternalServerError,
+			Code:   domain.ErrCodeUpstreamUnavailable,
+			Detail: "could not attach the support context",
 		})
 	}
 }
