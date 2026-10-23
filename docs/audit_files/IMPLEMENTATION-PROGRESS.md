@@ -9,7 +9,7 @@ Statuses: TODO · IN PROGRESS · DONE · BLOCKED. DONE needs a filled evidence b
 |---|---|---|---|---|
 | P0-1 | Commit pending authorization work | DONE | 58c810e4, c7581e77, a1574241 | authz 90 store+IT / 467 handler pass, 0 fail; vet clean |
 | P0-2 | Register JURISDICTION_RULE_VALIDATE | DONE | b82fd224 | access-control 000023 + template + store test |
-| P0-3 | Fix stale resolve.go comment | TODO | | |
+| P0-3 | Fix stale resolve.go comment | DONE | 47986f06 | comment now matches tax.go |
 | API-1 | Shared apicontract package | TODO | | |
 | API-2 | Problem details + request id + cache, all our services | TODO | | |
 | API-3 | ETag / If-Match on aggregate mutations | TODO | | |
@@ -133,4 +133,17 @@ Negative-path tests: `TestJurisdictionRuleValidate_IsRegisteredAndGrantedByItsTe
 Live probe (if run): none
 Spec rows closed: Doc 03 §8.2 J-06, row 4 (validate-action grantability)
 Blocked / limits: the endpoint's own behaviour tests live in jurisdiction-rules-svc (`validate_test.go`); P0-2 only closes the grant path.
+
+### P0-3 — Stale scope comment
+Status: DONE
+Commits: 47986f06 docs(jurisdiction-rules-svc): correct the stale resolve.go scope note
+Migrations: none
+Permissions registered: none
+Routes: none changed; `POST /v1/regulatory-calculations:execute` already routed at `internal/handler/tax.go:33`; `POST /v1/jurisdiction-decisions:resolve` still absent (JUR-1)
+Wiring: n/a (comment only)
+Tests: `go build ./...` and `go vet ./...` in jurisdiction-rules-svc: clean
+Negative-path tests: none (comment only)
+Live probe (if run): none
+Spec rows closed: none; removes a misleading scope note ahead of JUR-1
+Blocked / limits: the note will be rewritten again in JUR-1 when the decision endpoint lands.
 
