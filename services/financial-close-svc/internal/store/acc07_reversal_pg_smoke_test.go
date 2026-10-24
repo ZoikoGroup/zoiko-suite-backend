@@ -30,7 +30,7 @@ func recognizedAccrualInstance(t *testing.T, ctx context.Context, s *store.PgSto
 		DebitAccountCode: "6100-AuditFee", CreditAccountCode: "2100-AccruedLiabilities",
 		Status: domain.AccrualStatusApproved, CreatedAt: time.Now().UTC(), CreatedByPrincipalID: "preparer-1",
 	}
-	if err := s.CreateAccrualSchedule(ctx, sch); err != nil {
+	if _, err := s.CreateAccrualSchedule(ctx, sch, "key-"+sch.ScheduleID, testRequestHash); err != nil {
 		t.Fatalf("CreateAccrualSchedule: %v", err)
 	}
 	inst := &domain.RecognitionInstance{

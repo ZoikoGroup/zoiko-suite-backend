@@ -54,7 +54,12 @@ type Store interface {
 
 	// ACC-07 (Accruals) — see internal/domain's AccrualSchedule doc comment
 	// for the authority boundary these methods implement.
-	CreateAccrualSchedule(ctx context.Context, sch *domain.AccrualSchedule) error
+	//
+	// The four creates that mint a new aggregate with no natural key
+	// (accrual, prepayment, allocation rule, revaluation run) claim the
+	// caller's Idempotency-Key in command_idempotency in the same
+	// transaction; replay=true means *arg now holds what the key created.
+	CreateAccrualSchedule(ctx context.Context, sch *domain.AccrualSchedule, idempotencyKey, requestHash string) (replay bool, err error)
 	GetAccrualSchedule(ctx context.Context, scheduleID string) (*domain.AccrualSchedule, error)
 	ListAccrualSchedules(ctx context.Context, legalEntityID string) ([]domain.AccrualSchedule, error)
 	SubmitAccrualSchedule(ctx context.Context, scheduleID, principalID string, at time.Time) error
@@ -71,7 +76,7 @@ type Store interface {
 
 	// ACC-08 (Prepayments & Deferrals) — economically the mirror of ACC-07,
 	// see domain.PrepaymentSchedule's doc comment.
-	CreatePrepaymentSchedule(ctx context.Context, sch *domain.PrepaymentSchedule) error
+	CreatePrepaymentSchedule(ctx context.Context, sch *domain.PrepaymentSchedule, idempotencyKey, requestHash string) (replay bool, err error)
 	GetPrepaymentSchedule(ctx context.Context, scheduleID string) (*domain.PrepaymentSchedule, error)
 	ListPrepaymentSchedules(ctx context.Context, legalEntityID string) ([]domain.PrepaymentSchedule, error)
 	ApprovePrepaymentSchedule(ctx context.Context, scheduleID, principalID string, at time.Time) error
@@ -84,7 +89,7 @@ type Store interface {
 
 	// ACC-09 (Allocation Engine) — see domain.AllocationRule/AllocationRun's
 	// doc comments for the authority boundary these implement.
-	CreateAllocationRule(ctx context.Context, rule *domain.AllocationRule) error
+	CreateAllocationRule(ctx context.Context, rule *domain.AllocationRule, idempotencyKey, requestHash string) (replay bool, err error)
 	GetCurrentAllocationRule(ctx context.Context, ruleID string) (*domain.AllocationRule, error)
 	GetAllocationRuleVersion(ctx context.Context, ruleVersionID string) (*domain.AllocationRule, error)
 	ListAllocationRules(ctx context.Context, legalEntityID string) ([]domain.AllocationRule, error)
@@ -104,7 +109,10 @@ type Store interface {
 
 	// ACC-10 (Foreign Currency Revaluation) — see domain.FXRevaluationRun's
 	// doc comment for the authority boundary these implement.
-	CreateFXRevaluationRun(ctx context.Context, run *domain.FXRevaluationRun) error
+	CreateFXRevaluationRun(ctx context.Context, run *domain.FXRevaluationRun, idempotencyKey, requestHash string) (replay bool, err error)
+	// CreateFXReversalRun creates the one reversal a posted run may have;
+	// replay=true when it already existed (*run then holds it).
+	CreateFXReversalRun(ctx context.Context, run *domain.FXRevaluationRun) (replay bool, err error)
 	GetFXRevaluationRun(ctx context.Context, runID string) (*domain.FXRevaluationRun, error)
 	ListFXRevaluationRuns(ctx context.Context, legalEntityID, fiscalPeriod string) ([]domain.FXRevaluationRun, error)
 	ApproveFXRevaluationRun(ctx context.Context, runID, principalID string, at time.Time) error
@@ -148,6 +156,10 @@ type Store interface {
 	CreateQuarantinedLineageGap(ctx context.Context, g *domain.QuarantinedLineageGap) error
 	ListQuarantinedLineageGaps(ctx context.Context, legalEntityID string) ([]domain.QuarantinedLineageGap, error)
 	ListPostedJournalRefs(ctx context.Context, legalEntityID string) ([]domain.PostedJournalRef, error)
+	// ListPostedJournalLineage is the set-based completeness read: every
+	// posted journal ref with whether its edge exists and whether its gap was
+	// quarantined, in one query.
+	ListPostedJournalLineage(ctx context.Context, legalEntityID string) ([]domain.PostedJournalLineage, error)
 	GetLineageProjectionStatus(ctx context.Context, legalEntityID string) (*domain.LineageProjectionStatus, error)
 	UpsertLineageProjectionStatus(ctx context.Context, legalEntityID, status string, degradedReason *string, at *time.Time) error
 }
@@ -206,14 +218,16 @@ type Clients interface {
 	// ReverseGLJournal is ACC-07's own closure of "Auto-reversal
 	// duplicates" — see its doc comment in internal/clients.
 	ReverseGLJournal(ctx context.Context, tenantID, principalID, journalID, reason, correlationID string) (reversingJournalID string, err error)
-	// GetAccountStatus/PostAllocationJournal back ACC-09 — see their doc
-	// comments in internal/clients.
-	GetAccountStatus(ctx context.Context, tenantID, principalID, accountCode string) (status string, err error)
+	// PostAllocationJournal backs ACC-09 — see its doc comment in
+	// internal/clients. Account status/type checks for ACC-09/10/17 read
+	// ListChartOfAccounts once per command (see chartIndex).
 	PostAllocationJournal(ctx context.Context, tenantID, legalEntityID, fiscalPeriod, correlationID, principalID, description, sourceAccountCode string, sourceAmount float64, debitLines []domain.AllocationJournalLine) (journalID string, err error)
-	// GetAccountType/PostMultiLineJournal back ACC-10 — see their doc
-	// comments in internal/clients.
-	GetAccountType(ctx context.Context, tenantID, principalID, accountCode string) (accountType string, err error)
+	// PostMultiLineJournal backs ACC-10 and ACC-17 — see its doc comment in
+	// internal/clients.
 	PostMultiLineJournal(ctx context.Context, tenantID, legalEntityID, fiscalPeriod, correlationID, principalID, description string, lines []domain.JournalLineInput) (journalID string, err error)
+	// GetPostedJournal backs ACC-17's source-to-target reconciliation — see
+	// its doc comment in internal/clients.
+	GetPostedJournal(ctx context.Context, tenantID, journalID string) (*domain.PostedJournal, error)
 }
 
 const (
@@ -355,7 +369,6 @@ type Handler struct {
 	// statement must be dated on the period's last day itself.
 	bankReconCutoffDays int
 
-
 	// REF-05 cutover phase 1 (see period_mirror.go). All nil/empty by default,
 	// which means: no mirroring, and the workflow-ref endpoint refuses everyone.
 	mirror             PeriodMirror
@@ -413,7 +426,6 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{id}/remove", h.RemoveCloseRequirement)
 	})
 	r.Get("/v1/control-populations/migration-batch-tieout", h.GetMigrationBatchTieoutPopulation)
-	r.Get("/v1/close/workflow-refs/{ref}", h.GetWorkflowRef)
 	r.Get("/v1/close/workflow-refs/{ref}", h.GetWorkflowRef)
 	r.Route("/v1/close/periods", func(r chi.Router) {
 		r.Post("/", h.CreateFiscalPeriod)
@@ -1434,6 +1446,10 @@ func (h *Handler) CreateAccrual(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	idempotencyKey, ok := requireIdempotencyKey(w, r)
+	if !ok {
+		return
+	}
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
@@ -1463,12 +1479,16 @@ func (h *Handler) CreateAccrual(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:            time.Now().UTC(),
 		CreatedByPrincipalID: principalID,
 	}
-	if err := h.store.CreateAccrualSchedule(r.Context(), sch); err != nil {
+	replay, err := h.store.CreateAccrualSchedule(r.Context(), sch, idempotencyKey, requestFingerprint(req))
+	if err != nil {
+		if writeClaimErr(w, err) {
+			return
+		}
 		h.log.Error("failed to create accrual schedule", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
-	writeJSON(w, http.StatusCreated, sch)
+	writeCreateResult(w, replay, sch)
 }
 
 func (h *Handler) GetAccrual(w http.ResponseWriter, r *http.Request) {
@@ -1550,10 +1570,11 @@ func (h *Handler) SubmitAccrual(w http.ResponseWriter, r *http.Request) {
 }
 
 // ApproveAccrual is deliberately its own action (actionAccrualApprove) and
-// its own endpoint — segregation of duties, the whole reason an approval
-// step exists, requires it be independently grantable from
-// actionAccrualCreate rather than the preparer being able to approve their
-// own schedule.
+// its own endpoint. A separate permission is not segregation of duties on its
+// own — one principal can hold both grants — so the approver must also be
+// neither the schedule's creator nor its submitter (ACC-07: "Requester/
+// preparer separation"). Checked here for a clear answer; migration 000021's
+// sod_accrual_approver_independent makes the row refuse it too.
 func (h *Handler) ApproveAccrual(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	principalID, ok := h.requirePrincipal(w, r)
@@ -1570,6 +1591,10 @@ func (h *Handler) ApproveAccrual(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, sch.LegalEntityID, actionAccrualApprove); err != nil {
 		h.writeAuthzErr(w, err)
+		return
+	}
+	if sch.CreatedByPrincipalID == principalID || derefString(sch.SubmittedByPrincipalID) == principalID {
+		writeSelfApproval(w)
 		return
 	}
 	now := time.Now().UTC()
@@ -1941,6 +1966,8 @@ func (h *Handler) writeAccrualStoreErr(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusNotFound, "accrual_not_found", "")
 	case errors.Is(err, domain.ErrInvalidAccrualTransition):
 		writeError(w, http.StatusUnprocessableEntity, "invalid_transition", string(domain.ErrInvalidAccrualTransition))
+	case errors.Is(err, domain.ErrSelfApproval):
+		writeSelfApproval(w)
 	case errors.Is(err, domain.ErrIdentityMissing), errors.Is(err, domain.ErrTenantScopeMissing):
 		writeError(w, http.StatusUnauthorized, "tenant_scope_missing", string(domain.ErrTenantScopeMissing))
 	default:
@@ -1980,6 +2007,10 @@ func (h *Handler) CreatePrepayment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	idempotencyKey, ok := requireIdempotencyKey(w, r)
+	if !ok {
+		return
+	}
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
@@ -2007,12 +2038,16 @@ func (h *Handler) CreatePrepayment(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:            time.Now().UTC(),
 		CreatedByPrincipalID: principalID,
 	}
-	if err := h.store.CreatePrepaymentSchedule(r.Context(), sch); err != nil {
+	replay, err := h.store.CreatePrepaymentSchedule(r.Context(), sch, idempotencyKey, requestFingerprint(req))
+	if err != nil {
+		if writeClaimErr(w, err) {
+			return
+		}
 		h.log.Error("failed to create prepayment schedule", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
-	writeJSON(w, http.StatusCreated, sch)
+	writeCreateResult(w, replay, sch)
 }
 
 func (h *Handler) GetPrepayment(w http.ResponseWriter, r *http.Request) {
@@ -2065,6 +2100,9 @@ func (h *Handler) ListPrepayments(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, list)
 }
 
+// ApprovePrepayment — ACC-08 "Material manual schedule changes require
+// independent approval": the approver may not be the schedule's creator
+// (also migration 000021's sod_prepayment_approver_independent).
 func (h *Handler) ApprovePrepayment(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	principalID, ok := h.requirePrincipal(w, r)
@@ -2081,6 +2119,10 @@ func (h *Handler) ApprovePrepayment(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, sch.LegalEntityID, actionPrepaymentApprove); err != nil {
 		h.writeAuthzErr(w, err)
+		return
+	}
+	if sch.CreatedByPrincipalID == principalID {
+		writeSelfApproval(w)
 		return
 	}
 	now := time.Now().UTC()
@@ -2455,6 +2497,8 @@ func (h *Handler) writePrepaymentStoreErr(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusNotFound, "prepayment_not_found", "")
 	case errors.Is(err, domain.ErrInvalidPrepaymentTransition):
 		writeError(w, http.StatusUnprocessableEntity, "invalid_transition", string(domain.ErrInvalidPrepaymentTransition))
+	case errors.Is(err, domain.ErrSelfApproval):
+		writeSelfApproval(w)
 	case errors.Is(err, domain.ErrIdentityMissing), errors.Is(err, domain.ErrTenantScopeMissing):
 		writeError(w, http.StatusUnauthorized, "tenant_scope_missing", string(domain.ErrTenantScopeMissing))
 	default:
@@ -2486,6 +2530,10 @@ func (h *Handler) CreateAllocationRule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	idempotencyKey, ok := requireIdempotencyKey(w, r)
+	if !ok {
+		return
+	}
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
@@ -2513,12 +2561,16 @@ func (h *Handler) CreateAllocationRule(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:            time.Now().UTC(),
 		CreatedByPrincipalID: principalID,
 	}
-	if err := h.store.CreateAllocationRule(r.Context(), rule); err != nil {
+	replay, err := h.store.CreateAllocationRule(r.Context(), rule, idempotencyKey, requestFingerprint(req))
+	if err != nil {
+		if writeClaimErr(w, err) {
+			return
+		}
 		h.log.Error("failed to create allocation rule", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
-	writeJSON(w, http.StatusCreated, rule)
+	writeCreateResult(w, replay, rule)
 }
 
 func (h *Handler) GetAllocationRule(w http.ResponseWriter, r *http.Request) {
@@ -2578,6 +2630,10 @@ func (h *Handler) ListAllocationRules(w http.ResponseWriter, r *http.Request) {
 // resolve to a real, ACTIVE chart-registered account via GL). Both are
 // checked HERE, at approval, rather than at every execution — a rule that
 // passed approval can never later fail on these grounds mid-run.
+//
+// ACC-09 "Rule author cannot approve material allocation": the approver may
+// not be the version's creator (also migration 000021's
+// sod_allocation_rule_approver_independent).
 func (h *Handler) ApproveAllocationRule(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	principalID, ok := h.requirePrincipal(w, r)
@@ -2597,6 +2653,10 @@ func (h *Handler) ApproveAllocationRule(w http.ResponseWriter, r *http.Request) 
 		h.writeAuthzErr(w, err)
 		return
 	}
+	if rule.CreatedByPrincipalID == principalID {
+		writeSelfApproval(w)
+		return
+	}
 
 	var totalWeight float64
 	for _, d := range rule.Drivers {
@@ -2607,19 +2667,20 @@ func (h *Handler) ApproveAllocationRule(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	chart, err := h.chartIndex(r.Context(), tenantID, principalID)
+	if err != nil {
+		h.log.Error("ApproveAllocationRule: failed to read the chart of accounts", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "dependency_unavailable", err.Error())
+		return
+	}
 	for _, d := range rule.Drivers {
-		status, err := h.clients.GetAccountStatus(r.Context(), tenantID, principalID, d.RecipientAccountCode)
-		if err != nil {
-			if errors.Is(err, domain.ErrRecipientAccountInvalid) {
-				writeError(w, http.StatusUnprocessableEntity, "recipient_account_invalid",
-					string(domain.ErrRecipientAccountInvalid)+": "+d.RecipientAccountCode)
-				return
-			}
-			h.log.Error("ApproveAllocationRule: failed to verify recipient account", zap.Error(err))
-			writeError(w, http.StatusServiceUnavailable, "dependency_unavailable", err.Error())
+		acc, found := chart[d.RecipientAccountCode]
+		if !found {
+			writeError(w, http.StatusUnprocessableEntity, "recipient_account_invalid",
+				string(domain.ErrRecipientAccountInvalid)+": "+d.RecipientAccountCode)
 			return
 		}
-		if status != "ACTIVE" {
+		if acc.Status != "ACTIVE" {
 			writeError(w, http.StatusUnprocessableEntity, "recipient_account_invalid",
 				string(domain.ErrRecipientAccountInvalid)+": "+d.RecipientAccountCode+" is not ACTIVE")
 			return
@@ -2978,6 +3039,8 @@ func (h *Handler) writeAllocationErr(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusUnprocessableEntity, "invalid_transition", string(domain.ErrInvalidAllocationRuleTransition))
 	case errors.Is(err, domain.ErrInvalidAllocationRunTransition):
 		writeError(w, http.StatusUnprocessableEntity, "invalid_transition", string(domain.ErrInvalidAllocationRunTransition))
+	case errors.Is(err, domain.ErrSelfApproval):
+		writeSelfApproval(w)
 	case errors.Is(err, domain.ErrIdentityMissing), errors.Is(err, domain.ErrTenantScopeMissing):
 		writeError(w, http.StatusUnauthorized, "tenant_scope_missing", string(domain.ErrTenantScopeMissing))
 	default:
@@ -3003,6 +3066,10 @@ func (h *Handler) buildRevaluationItems(ctx context.Context, tenantID, principal
 	if err != nil {
 		return nil, err
 	}
+	chart, err := h.chartIndex(ctx, tenantID, principalID)
+	if err != nil {
+		return nil, err
+	}
 
 	out := make([]domain.FXRevaluationItem, len(items))
 	for i, in := range items {
@@ -3010,10 +3077,10 @@ func (h *Handler) buildRevaluationItems(ctx context.Context, tenantID, principal
 		if !ok {
 			return nil, domain.ErrRateMissingForCurrency
 		}
-		accountType, err := h.clients.GetAccountType(ctx, tenantID, principalID, in.AccountCode)
-		if err != nil {
-			return nil, err
-		}
+		// An account the chart does not know is refused as non-monetary, as
+		// the per-account lookup this replaced did: it cannot be shown to be
+		// a monetary balance.
+		accountType := chart[in.AccountCode].AccountType
 		if accountType != domain.AccountTypeAsset && accountType != domain.AccountTypeLiability {
 			return nil, domain.ErrNonMonetaryItemIncluded
 		}
@@ -3051,6 +3118,10 @@ func (h *Handler) StartRevaluation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	idempotencyKey, ok := requireIdempotencyKey(w, r)
+	if !ok {
+		return
+	}
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
@@ -3080,12 +3151,16 @@ func (h *Handler) StartRevaluation(w http.ResponseWriter, r *http.Request) {
 		CreatedByPrincipalID:  principalID,
 		Items:                 items,
 	}
-	if err := h.store.CreateFXRevaluationRun(r.Context(), run); err != nil {
+	replay, err := h.store.CreateFXRevaluationRun(r.Context(), run, idempotencyKey, requestFingerprint(req))
+	if err != nil {
+		if writeClaimErr(w, err) {
+			return
+		}
 		h.log.Error("failed to create FX revaluation run", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
-	writeJSON(w, http.StatusCreated, run)
+	writeCreateResult(w, replay, run)
 }
 
 // ReversePriorRevaluation implements "corrected/reversed via new run" —
@@ -3094,6 +3169,12 @@ func (h *Handler) StartRevaluation(w http.ResponseWriter, r *http.Request) {
 // account/currency/rate/book-amount lineage, AdjustmentAmount negated),
 // never recomputed against current data — a reversal must undo exactly
 // what was posted, not re-derive a different number.
+//
+// A prior run has at most one reversal (CreateFXReversalRun, migration
+// 000021). A second call returns that reversal with 200 instead of creating
+// another that could be approved and posted alongside it — the revaluation
+// undone twice. The natural key (the prior run) is the idempotency key here,
+// so no Idempotency-Key claim is needed.
 func (h *Handler) ReversePriorRevaluation(w http.ResponseWriter, r *http.Request) {
 	var req domain.ReversePriorRevaluationRequest
 	if !decodeJSON(w, r, &req) {
@@ -3153,14 +3234,18 @@ func (h *Handler) ReversePriorRevaluation(w http.ResponseWriter, r *http.Request
 		CreatedByPrincipalID:  principalID,
 		Items:                 items,
 	}
-	if err := h.store.CreateFXRevaluationRun(r.Context(), run); err != nil {
+	replay, err := h.store.CreateFXReversalRun(r.Context(), run)
+	if err != nil {
 		h.log.Error("failed to create reversal FX revaluation run", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
-	writeJSON(w, http.StatusCreated, run)
+	writeCreateResult(w, replay, run)
 }
 
+// ApproveRevaluation — the approver may not be the run's preparer (migration
+// 000021's sod_fx_revaluation_approver_independent; see SPEC_DEVIATIONS B1
+// for why ACC-10 gets the same rule as ACC-07/08/09).
 func (h *Handler) ApproveRevaluation(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	principalID, ok := h.requirePrincipal(w, r)
@@ -3177,6 +3262,10 @@ func (h *Handler) ApproveRevaluation(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, run.LegalEntityID, actionFXRevaluationApprove); err != nil {
 		h.writeAuthzErr(w, err)
+		return
+	}
+	if run.CreatedByPrincipalID == principalID {
+		writeSelfApproval(w)
 		return
 	}
 	now := time.Now().UTC()
@@ -3377,6 +3466,8 @@ func (h *Handler) writeFXRevaluationErr(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusNotFound, "fx_revaluation_run_not_found", "")
 	case errors.Is(err, domain.ErrInvalidFXRevaluationTransition):
 		writeError(w, http.StatusUnprocessableEntity, "invalid_transition", string(domain.ErrInvalidFXRevaluationTransition))
+	case errors.Is(err, domain.ErrSelfApproval):
+		writeSelfApproval(w)
 	case errors.Is(err, domain.ErrIdentityMissing), errors.Is(err, domain.ErrTenantScopeMissing):
 		writeError(w, http.StatusUnauthorized, "tenant_scope_missing", string(domain.ErrTenantScopeMissing))
 	default:
@@ -3516,6 +3607,15 @@ func (h *Handler) ValidateOpeningBalances(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// One chart read for the whole batch, not one GL call per entry: the
+	// target-account check below runs for every crosswalk row.
+	chart, err := h.chartIndex(r.Context(), tenantID, principalID)
+	if err != nil {
+		h.log.Error("ValidateOpeningBalances: failed to read the chart of accounts", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "dependency_unavailable", err.Error())
+		return
+	}
+
 	var totalDebits, totalCredits float64
 	for _, e := range batch.Entries {
 		totalDebits = roundCents(totalDebits + e.DebitAmount)
@@ -3526,18 +3626,13 @@ func (h *Handler) ValidateOpeningBalances(w http.ResponseWriter, r *http.Request
 			writeError(w, http.StatusUnprocessableEntity, "suspense_account_not_allowed", string(domain.ErrSuspenseAccountNotAllowed)+": "+e.TargetAccountCode)
 			return
 		}
-		status, err := h.clients.GetAccountStatus(r.Context(), tenantID, principalID, e.TargetAccountCode)
-		if err != nil {
-			if errors.Is(err, domain.ErrRecipientAccountInvalid) {
-				h.quarantineMigrationBatch(r.Context(), id, string(domain.ErrMigrationTargetAccountInvalid)+": "+e.TargetAccountCode)
-				writeError(w, http.StatusUnprocessableEntity, "target_account_invalid", string(domain.ErrMigrationTargetAccountInvalid)+": "+e.TargetAccountCode)
-				return
-			}
-			h.log.Error("ValidateOpeningBalances: failed to verify target account", zap.Error(err))
-			writeError(w, http.StatusServiceUnavailable, "dependency_unavailable", err.Error())
+		acc, found := chart[e.TargetAccountCode]
+		if !found {
+			h.quarantineMigrationBatch(r.Context(), id, string(domain.ErrMigrationTargetAccountInvalid)+": "+e.TargetAccountCode)
+			writeError(w, http.StatusUnprocessableEntity, "target_account_invalid", string(domain.ErrMigrationTargetAccountInvalid)+": "+e.TargetAccountCode)
 			return
 		}
-		if status != "ACTIVE" {
+		if acc.Status != "ACTIVE" {
 			h.quarantineMigrationBatch(r.Context(), id, string(domain.ErrMigrationTargetAccountInvalid)+": "+e.TargetAccountCode+" is not ACTIVE")
 			writeError(w, http.StatusUnprocessableEntity, "target_account_invalid", string(domain.ErrMigrationTargetAccountInvalid)+": "+e.TargetAccountCode+" is not ACTIVE")
 			return
@@ -3604,6 +3699,8 @@ func (h *Handler) quarantineMigrationBatch(ctx context.Context, batchID, reason 
 	}
 }
 
+// ApproveMigrationBatchHandler — the approver may not be the batch's preparer
+// (migration 000021's sod_migration_approver_independent).
 func (h *Handler) ApproveMigrationBatchHandler(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	principalID, ok := h.requirePrincipal(w, r)
@@ -3622,6 +3719,10 @@ func (h *Handler) ApproveMigrationBatchHandler(w http.ResponseWriter, r *http.Re
 		h.writeAuthzErr(w, err)
 		return
 	}
+	if batch.CreatedByPrincipalID == principalID {
+		writeSelfApproval(w)
+		return
+	}
 	now := time.Now().UTC()
 	if err := h.store.ApproveMigrationBatch(r.Context(), id, principalID, now); err != nil {
 		h.writeMigrationErr(w, err)
@@ -3633,10 +3734,18 @@ func (h *Handler) ApproveMigrationBatchHandler(w http.ResponseWriter, r *http.Re
 
 // CommitOpeningPosting is idempotent — the spec's own negative path,
 // "Commit repeated after timeout": a batch already POSTED (or beyond)
-// returns its existing state rather than posting a second journal.
-// Reconciliation happens automatically, immediately after a successful
-// post, rather than as a separately-triggered step — a deliberate v1
-// scope decision, see the findings section for why.
+// never posts a second journal.
+//
+// Reconciliation runs immediately after a successful post, rather than as a
+// separately-triggered step, and it is a real one: ACC-17 "No production
+// acceptance without source-to-target reconciliation". The journal is read
+// back from general-ledger-svc and compared, account by account, with the
+// batch's own crosswalk (which validation already tied to the source's
+// declared control totals). Only a match moves the batch to RECONCILED, the
+// one state CertifyMigrationAccounting accepts. A mismatch quarantines the
+// batch with the discrepancy as its reason. If the journal cannot be read
+// back, the batch stays POSTED and a repeated commit retries the
+// reconciliation — it never posts again.
 func (h *Handler) CommitOpeningPosting(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	principalID, ok := h.requirePrincipal(w, r)
@@ -3656,11 +3765,16 @@ func (h *Handler) CommitOpeningPosting(w http.ResponseWriter, r *http.Request) {
 		h.writeAuthzErr(w, err)
 		return
 	}
-	if batch.Status == domain.MigrationBatchStatusPosted || batch.Status == domain.MigrationBatchStatusReconciled || batch.Status == domain.MigrationBatchStatusCertified {
+	switch batch.Status {
+	case domain.MigrationBatchStatusReconciled, domain.MigrationBatchStatusCertified:
 		writeJSON(w, http.StatusOK, batch)
 		return
-	}
-	if batch.Status != domain.MigrationBatchStatusApproved {
+	case domain.MigrationBatchStatusPosted:
+		// Posted by an earlier attempt whose reconciliation did not finish.
+		h.reconcileMigrationBatch(w, r, tenantID, batch)
+		return
+	case domain.MigrationBatchStatusApproved:
+	default:
 		writeError(w, http.StatusUnprocessableEntity, "invalid_transition", string(domain.ErrInvalidMigrationBatchTransition))
 		return
 	}
@@ -3699,17 +3813,94 @@ func (h *Handler) CommitOpeningPosting(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.recordLineageEdge(r.Context(), batch.LegalEntityID, "migration_batch", batch.BatchID, "journal", journalID)
-	if err := h.store.MarkMigrationBatchReconciled(r.Context(), id, now); err != nil {
-		h.log.Error("failed to mark migration batch RECONCILED", zap.String("batch_id", id), zap.Error(err))
+
+	batch.Status, batch.JournalID, batch.PostedAt = domain.MigrationBatchStatusPosted, &journalID, &now
+	h.reconcileMigrationBatch(w, r, tenantID, batch)
+}
+
+// reconcileMigrationBatch proves a POSTED batch's journal against its
+// crosswalk and answers the commit. See CommitOpeningPosting.
+func (h *Handler) reconcileMigrationBatch(w http.ResponseWriter, r *http.Request, tenantID string, batch *domain.MigrationBatch) {
+	journalID := derefString(batch.JournalID)
+	journal, err := h.clients.GetPostedJournal(r.Context(), tenantID, journalID)
+	if err != nil {
+		h.log.Error("opening balances posted but the journal could not be read back to reconcile",
+			zap.String("batch_id", batch.BatchID), zap.String("journal_id", journalID), zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "reconciliation_unavailable",
+			"the opening balance journal IS posted ("+journalID+") but could not be read back from general-ledger-svc to reconcile it; "+
+				"the batch stays POSTED and cannot be certified — repeat the commit to retry the reconciliation (it will not post again)")
+		return
+	}
+	if discrepancy := migrationReconciliationDiscrepancy(batch, journal); discrepancy != "" {
+		reason := string(domain.ErrReconciliationMismatch) + ": " + discrepancy
+		if err := h.store.QuarantineMigrationBatch(r.Context(), batch.BatchID, domain.MigrationBatchStatusPosted, reason); err != nil {
+			h.log.Error("failed to record migration batch reconciliation quarantine", zap.String("batch_id", batch.BatchID), zap.Error(err))
+		}
+		writeError(w, http.StatusUnprocessableEntity, "migration_reconciliation_failed", reason)
+		return
+	}
+	if err := h.store.MarkMigrationBatchReconciled(r.Context(), batch.BatchID, time.Now().UTC()); err != nil && !errors.Is(err, domain.ErrInvalidMigrationBatchTransition) {
+		h.log.Error("migration batch reconciled but RECONCILED could not be recorded", zap.String("batch_id", batch.BatchID), zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
 	}
 
-	full, err := h.store.GetMigrationBatch(r.Context(), id)
+	full, err := h.store.GetMigrationBatch(r.Context(), batch.BatchID)
 	if err != nil {
-		h.log.Error("CommitOpeningPosting: failed to reload posted batch", zap.Error(err))
+		h.log.Error("CommitOpeningPosting: failed to reload reconciled batch", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, full)
+}
+
+// migrationReconciliationDiscrepancy compares the journal the ledger holds
+// with the batch's crosswalk: posted, in the batch's entity and period, and
+// for every account the same debit and credit totals, with no account on one
+// side only. Empty means reconciled. The first discrepancy in account order
+// is named, so the quarantine reason is deterministic.
+func migrationReconciliationDiscrepancy(batch *domain.MigrationBatch, journal *domain.PostedJournal) string {
+	if journal.Status != "POSTED" {
+		return fmt.Sprintf("journal %s is %s, not POSTED", journal.JournalID, journal.Status)
+	}
+	if journal.LegalEntityID != batch.LegalEntityID || journal.FiscalPeriod != batch.FiscalPeriod {
+		return fmt.Sprintf("journal %s is booked to %s/%s, not the batch's %s/%s",
+			journal.JournalID, journal.LegalEntityID, journal.FiscalPeriod, batch.LegalEntityID, batch.FiscalPeriod)
+	}
+	type sides struct{ debit, credit float64 }
+	expected, actual := map[string]sides{}, map[string]sides{}
+	for _, e := range batch.Entries {
+		s := expected[e.TargetAccountCode]
+		expected[e.TargetAccountCode] = sides{roundCents(s.debit + e.DebitAmount), roundCents(s.credit + e.CreditAmount)}
+	}
+	for _, l := range journal.Lines {
+		s := actual[l.AccountCode]
+		actual[l.AccountCode] = sides{roundCents(s.debit + l.DebitAmount), roundCents(s.credit + l.CreditAmount)}
+	}
+	codes := make([]string, 0, len(expected)+len(actual))
+	for code := range expected {
+		codes = append(codes, code)
+	}
+	for code := range actual {
+		if _, ok := expected[code]; !ok {
+			codes = append(codes, code)
+		}
+	}
+	sort.Strings(codes)
+	for _, code := range codes {
+		want, inBatch := expected[code]
+		got, inJournal := actual[code]
+		switch {
+		case !inJournal:
+			return fmt.Sprintf("account %s is in the crosswalk (Dr %.2f / Cr %.2f) but not in journal %s", code, want.debit, want.credit, journal.JournalID)
+		case !inBatch:
+			return fmt.Sprintf("journal %s posts to account %s (Dr %.2f / Cr %.2f), which is not in the crosswalk", journal.JournalID, code, got.debit, got.credit)
+		case want != got:
+			return fmt.Sprintf("account %s: crosswalk Dr %.2f / Cr %.2f, journal %s Dr %.2f / Cr %.2f",
+				code, want.debit, want.credit, journal.JournalID, got.debit, got.credit)
+		}
+	}
+	return ""
 }
 
 func (h *Handler) CertifyMigrationAccounting(w http.ResponseWriter, r *http.Request) {
@@ -3737,6 +3928,12 @@ func (h *Handler) CertifyMigrationAccounting(w http.ResponseWriter, r *http.Requ
 	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, batch.LegalEntityID, actionMigrationBatchCertify); err != nil {
 		h.writeAuthzErr(w, err)
+		return
+	}
+	// ACC-17: "Migration preparer cannot certify own material cutover" (also
+	// migration 000021's sod_migration_certifier_independent).
+	if batch.CreatedByPrincipalID == principalID {
+		writeSelfApproval(w)
 		return
 	}
 	now := time.Now().UTC()
@@ -3804,6 +4001,8 @@ func (h *Handler) writeMigrationErr(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusNotFound, "migration_batch_not_found", "")
 	case errors.Is(err, domain.ErrInvalidMigrationBatchTransition):
 		writeError(w, http.StatusUnprocessableEntity, "invalid_transition", string(domain.ErrInvalidMigrationBatchTransition))
+	case errors.Is(err, domain.ErrSelfApproval):
+		writeSelfApproval(w)
 	case errors.Is(err, domain.ErrIdentityMissing), errors.Is(err, domain.ErrTenantScopeMissing):
 		writeError(w, http.StatusUnauthorized, "tenant_scope_missing", string(domain.ErrTenantScopeMissing))
 	default:
@@ -4320,15 +4519,34 @@ func (h *Handler) TraceJournalToSource(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, []domain.LineageEdge{})
 		return
 	}
-	// A caller can only drill into an entity within their own authorized
-	// legal entity — the spec's own negative path, "User drills into
-	// unauthorized entity." All edges to one journal share a legal
-	// entity, so the first is authoritative for the check.
-	if err := h.authz.CheckAllowed(r.Context(), principalID, edges[0].LegalEntityID, actionLineageView); err != nil {
+	if err := h.authorizeLineageEdges(r.Context(), principalID, edges); err != nil {
 		h.writeAuthzErr(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, edges)
+}
+
+// authorizeLineageEdges requires LINEAGE_VIEW on EVERY legal entity the edges
+// belong to — the spec's own negative path, "User drills into unauthorized
+// entity", and "Lineage visibility follows current permissions". This used to
+// check only edges[0], on the assumption that every edge into one journal
+// shares an entity. Nothing enforces that: an edge's legal_entity_id is
+// whatever its recorder (a handler, or the Kafka lineage consumer) wrote, so
+// a caller authorized for the first entity was shown the rest. The answer is
+// refused whole rather than filtered: a trace with links silently removed
+// would read as complete. One authz call per distinct entity — normally one.
+func (h *Handler) authorizeLineageEdges(ctx context.Context, principalID string, edges []domain.LineageEdge) error {
+	checked := make(map[string]bool, 1)
+	for _, e := range edges {
+		if checked[e.LegalEntityID] {
+			continue
+		}
+		if err := h.authz.CheckAllowed(ctx, principalID, e.LegalEntityID, actionLineageView); err != nil {
+			return err
+		}
+		checked[e.LegalEntityID] = true
+	}
+	return nil
 }
 
 // VerifyLineageCompleteness answers ACC-18's own VerifyLineageCompleteness
@@ -4362,43 +4580,26 @@ func (h *Handler) VerifyLineageCompleteness(w http.ResponseWriter, r *http.Reque
 	writeJSON(w, http.StatusOK, report)
 }
 
+// buildCompletenessReport classifies every posted journal of the entity from
+// one set-based store read (ListPostedJournalLineage). It used to issue one
+// edge lookup per posted journal — at close time, every recognition,
+// allocation, revaluation and migration journal in the entity's history.
 func (h *Handler) buildCompletenessReport(ctx context.Context, legalEntityID string) (*domain.LineageCompletenessReport, error) {
-	refs, err := h.store.ListPostedJournalRefs(ctx, legalEntityID)
+	refs, err := h.store.ListPostedJournalLineage(ctx, legalEntityID)
 	if err != nil {
 		return nil, err
 	}
-	quarantined, err := h.store.ListQuarantinedLineageGaps(ctx, legalEntityID)
-	if err != nil {
-		return nil, err
-	}
-	isQuarantined := make(map[string]bool, len(quarantined))
-	for _, q := range quarantined {
-		isQuarantined[q.FromType+"|"+q.FromID+"|"+q.ToType+"|"+q.ToID] = true
-	}
-
 	report := &domain.LineageCompletenessReport{LegalEntityID: legalEntityID, CheckedCount: len(refs), Gaps: []domain.PostedJournalRef{}}
 	for _, ref := range refs {
-		edges, err := h.store.ListLineageEdgesTo(ctx, "journal", ref.JournalID)
-		if err != nil {
-			return nil, err
-		}
-		found := false
-		for _, e := range edges {
-			if e.FromType == ref.FromType && e.FromID == ref.FromID {
-				found = true
-				break
-			}
-		}
-		if found {
-			continue
-		}
-		// A quarantined gap was deliberately accepted as known — it stays
-		// out of Gaps but is still counted, never silently vanished.
-		if isQuarantined[ref.FromType+"|"+ref.FromID+"|journal|"+ref.JournalID] {
+		switch {
+		case ref.HasEdge:
+		case ref.Quarantined:
+			// A quarantined gap was deliberately accepted as known — it stays
+			// out of Gaps but is still counted, never silently vanished.
 			report.QuarantinedCount++
-			continue
+		default:
+			report.Gaps = append(report.Gaps, ref.PostedJournalRef)
 		}
-		report.Gaps = append(report.Gaps, ref)
 	}
 	report.Complete = len(report.Gaps) == 0
 	return report, nil
@@ -4437,7 +4638,7 @@ func (h *Handler) GetLineageAsOf(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, []domain.LineageEdge{})
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), principalID, edges[0].LegalEntityID, actionLineageView); err != nil {
+	if err := h.authorizeLineageEdges(r.Context(), principalID, edges); err != nil {
 		h.writeAuthzErr(w, err)
 		return
 	}
@@ -4468,6 +4669,9 @@ func (h *Handler) VerifyTracePath(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionLineageVerifyPath); err != nil {
 		h.writeAuthzErr(w, err)
 		return
@@ -4479,9 +4683,13 @@ func (h *Handler) VerifyTracePath(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
+	// Only an edge recorded for the entity the caller is authorized on counts.
+	// Matching any edge in the tenant let a principal authorized for entity A
+	// probe — and permanently record, under A's name — whether a path exists
+	// in entity B.
 	verified := false
 	for _, e := range edges {
-		if e.FromType == req.FromType && e.FromID == req.FromID {
+		if e.LegalEntityID == req.LegalEntityID && e.FromType == req.FromType && e.FromID == req.FromID {
 			verified = true
 			break
 		}
@@ -4526,6 +4734,9 @@ func (h *Handler) QuarantineBrokenLineage(w http.ResponseWriter, r *http.Request
 	if !ok {
 		return
 	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionLineageQuarantine); err != nil {
 		h.writeAuthzErr(w, err)
 		return
@@ -4547,7 +4758,10 @@ func (h *Handler) QuarantineBrokenLineage(w http.ResponseWriter, r *http.Request
 // RebuildLineageProjection re-derives every missing edge from the
 // already-built ACC capabilities' own posted records (never fabricating
 // one) and, if the projection was DEGRADED, restores it to CURRENT once
-// every gap is closed.
+// every gap is closed — verified by re-reading coverage after the rebuild,
+// not assumed. It used to mark CURRENT unconditionally, so an edge write that
+// failed during the rebuild (which marks DEGRADED) was immediately papered
+// over by the CURRENT that followed.
 func (h *Handler) RebuildLineageProjection(w http.ResponseWriter, r *http.Request) {
 	legalEntityID := r.URL.Query().Get("legal_entity_id")
 	if legalEntityID == "" {
@@ -4581,8 +4795,22 @@ func (h *Handler) RebuildLineageProjection(w http.ResponseWriter, r *http.Reques
 	}
 
 	now := time.Now().UTC()
-	if err := h.store.UpsertLineageProjectionStatus(r.Context(), legalEntityID, domain.LineageProjectionCurrent, nil, &now); err != nil {
-		h.log.Error("RebuildLineageProjection: failed to mark CURRENT", zap.Error(err))
+	after := report
+	if len(report.Gaps) > 0 {
+		if after, err = h.buildCompletenessReport(r.Context(), legalEntityID); err != nil {
+			h.log.Error("RebuildLineageProjection: failed to re-verify after rebuild", zap.Error(err))
+			writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+			return
+		}
+	}
+	finalStatus, reason := domain.LineageProjectionCurrent, (*string)(nil)
+	if !after.Complete {
+		finalStatus = domain.LineageProjectionDegraded
+		msg := fmt.Sprintf("rebuild left %d posted journal(s) without a lineage edge", len(after.Gaps))
+		reason = &msg
+	}
+	if err := h.store.UpsertLineageProjectionStatus(r.Context(), legalEntityID, finalStatus, reason, &now); err != nil {
+		h.log.Error("RebuildLineageProjection: failed to record the rebuilt status", zap.String("status", finalStatus), zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
@@ -5206,6 +5434,86 @@ func derefString(s *string) string {
 		return ""
 	}
 	return *s
+}
+
+// requireIdempotencyKey reads the Idempotency-Key a command that creates an
+// aggregate must carry (ZS-SVC-B-001 §22: "Mandatory for I2–I4 accounting
+// writes"). Without one a retried create after a lost response is a second
+// accrual, schedule, rule or revaluation run.
+func requireIdempotencyKey(w http.ResponseWriter, r *http.Request) (string, bool) {
+	key := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	if key == "" {
+		writeError(w, http.StatusBadRequest, "idempotency_key_required", string(domain.ErrIdempotencyKeyRequired))
+		return "", false
+	}
+	if len(key) > 255 {
+		writeError(w, http.StatusBadRequest, "invalid_idempotency_key", "Idempotency-Key must be at most 255 characters")
+		return "", false
+	}
+	return key, true
+}
+
+// requestFingerprint is the §22 "request fingerprint retained" with a claim:
+// sha256 of the decoded request re-encoded (struct field order and sorted map
+// keys make it deterministic), so whitespace or key order in the original
+// body does not turn a genuine retry into a conflict.
+func requestFingerprint(v any) string {
+	b, err := json.Marshal(v)
+	if err != nil {
+		// Every request type here is plain data; unreachable in practice, and
+		// a constant would make every body "the same request".
+		b = []byte(uuid.NewString())
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// writeCreateResult answers a claim-protected create: 201 for the first use
+// of the key, 200 with the original resource for a replay.
+func writeCreateResult(w http.ResponseWriter, replay bool, v any) {
+	if replay {
+		writeJSON(w, http.StatusOK, v)
+		return
+	}
+	writeJSON(w, http.StatusCreated, v)
+}
+
+// writeClaimErr maps the claim failures every claim-protected create shares;
+// false means err is something else for the caller to map.
+func writeClaimErr(w http.ResponseWriter, err error) bool {
+	switch {
+	case errors.Is(err, domain.ErrIdempotencyKeyConflict):
+		writeError(w, http.StatusConflict, "idempotency_key_conflict", err.Error())
+	case errors.Is(err, domain.ErrIdempotencyKeyRequired):
+		writeError(w, http.StatusBadRequest, "idempotency_key_required", string(domain.ErrIdempotencyKeyRequired))
+	default:
+		return false
+	}
+	return true
+}
+
+// writeSelfApproval answers a maker-checker refusal. Same code as a
+// self-approved reopen, so a client handles every SoD refusal one way.
+func writeSelfApproval(w http.ResponseWriter) {
+	writeError(w, http.StatusForbidden, "self_approval_forbidden", string(domain.ErrSelfApproval))
+}
+
+// chartIndex reads the tenant's chart of accounts once and indexes it by
+// code. ACC-09 approval, ACC-10 calculation and ACC-17 validation each check
+// every account they name; one listing per command replaces a GL round trip
+// per driver, item or crosswalk entry (an opening balance batch runs to
+// thousands). general-ledger-svc authorizes the listing exactly as it does a
+// single-account read.
+func (h *Handler) chartIndex(ctx context.Context, tenantID, principalID string) (map[string]clients.ChartOfAccountsEntry, error) {
+	accounts, err := h.clients.ListChartOfAccounts(ctx, tenantID, principalID)
+	if err != nil {
+		return nil, err
+	}
+	byCode := make(map[string]clients.ChartOfAccountsEntry, len(accounts))
+	for _, a := range accounts {
+		byCode[a.AccountCode] = a
+	}
+	return byCode, nil
 }
 
 // maxRequestBytes caps a JSON request body. A bare json.Decoder reads until EOF,

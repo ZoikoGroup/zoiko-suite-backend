@@ -304,8 +304,11 @@ type glJournalLine struct {
 }
 
 type glJournalWithLines struct {
-	JournalID string          `json:"journal_id"`
-	Lines     []glJournalLine `json:"lines"`
+	JournalID     string          `json:"journal_id"`
+	Status        string          `json:"status"`
+	LegalEntityID string          `json:"legal_entity_id"`
+	FiscalPeriod  string          `json:"fiscal_period"`
+	Lines         []glJournalLine `json:"lines"`
 }
 
 // unpostedStatuses are the journal states that have NOT reached the books. A
@@ -797,45 +800,6 @@ func (c *Clients) transitionGLJournal(ctx context.Context, tenantID, principalID
 	return nil
 }
 
-// glAccountLookup mirrors general-ledger-svc's own ACC-01 domain.Account
-// wire shape — only the fields this client needs.
-type glAccountLookup struct {
-	AccountCode string `json:"account_code"`
-	Status      string `json:"status"`
-}
-
-// GetAccountStatus resolves an account code against GL's own ACC-01 Chart
-// of Accounts — ACC-09 uses this to validate a driver's
-// recipient_account_code at rule approval time (the spec's own negative
-// path, "Recipient dimension invalid," made a real, blocking check rather
-// than trusting whatever code the caller typed).
-func (c *Clients) GetAccountStatus(ctx context.Context, tenantID, principalID, accountCode string) (status string, err error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.ledgerURL+"/v1/chart-of-accounts/"+url.PathEscape(accountCode), nil)
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("X-Tenant-Id", tenantID)
-	req.Header.Set("X-Principal-Id", principalID)
-
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return "", domain.ErrGLServiceUnavailable
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusNotFound {
-		return "", domain.ErrRecipientAccountInvalid
-	}
-	if resp.StatusCode != http.StatusOK {
-		return "", domain.ErrGLServiceUnavailable
-	}
-	var a glAccountLookup
-	if err := json.NewDecoder(resp.Body).Decode(&a); err != nil {
-		return "", err
-	}
-	return a.Status, nil
-}
-
 // ChartOfAccountsEntry mirrors general-ledger-svc's ACC-01 domain.Account
 // wire shape — only the fields a caller needs to classify a trial-balance
 // line onto a statement.
@@ -848,6 +812,10 @@ type ChartOfAccountsEntry struct {
 	// not translate between two different category vocabularies because
 	// there is only ever the one.
 	AccountType string `json:"account_type"`
+	// Status is ACTIVE or INACTIVE. ACC-09 approval, ACC-10 calculation and
+	// ACC-17 validation read every account they check from one chart listing
+	// instead of one GET per driver, item or crosswalk entry.
+	Status string `json:"status"`
 }
 
 // ListChartOfAccounts reads the WHOLE chart in one call — ACC-16's own
@@ -920,39 +888,6 @@ func (c *Clients) PostAllocationJournal(ctx context.Context, tenantID, legalEnti
 	return journal.JournalID, nil
 }
 
-// GetAccountType resolves an account's AccountType (ASSET, LIABILITY,
-// EQUITY, REVENUE, EXPENSE) via GL's own ACC-01 Chart of Accounts —
-// ACC-10 uses this to enforce its own negative path, "Non-monetary item
-// included": only ASSET/LIABILITY accounts carry a monetary balance
-// subject to revaluation.
-func (c *Clients) GetAccountType(ctx context.Context, tenantID, principalID, accountCode string) (accountType string, err error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.ledgerURL+"/v1/chart-of-accounts/"+url.PathEscape(accountCode), nil)
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("X-Tenant-Id", tenantID)
-	req.Header.Set("X-Principal-Id", principalID)
-
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return "", domain.ErrGLServiceUnavailable
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusNotFound {
-		return "", domain.ErrNonMonetaryItemIncluded
-	}
-	if resp.StatusCode != http.StatusOK {
-		return "", domain.ErrGLServiceUnavailable
-	}
-	var a struct {
-		AccountType string `json:"account_type"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&a); err != nil {
-		return "", err
-	}
-	return a.AccountType, nil
-}
 
 // PostMultiLineJournal posts one journal with arbitrary mixed debit/credit
 // lines — ACC-10's FX revaluation needs both signs in a single posting
@@ -1046,7 +981,15 @@ func (c *Clients) listJournals(ctx context.Context, tenantID, legalEntityID, fis
 }
 
 func (c *Clients) getJournalLines(ctx context.Context, tenantID, journalID string) ([]glJournalLine, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s/v1/journals/%s", c.ledgerURL, journalID), nil)
+	detail, err := c.getJournal(ctx, tenantID, journalID)
+	if err != nil {
+		return nil, err
+	}
+	return detail.Lines, nil
+}
+
+func (c *Clients) getJournal(ctx context.Context, tenantID, journalID string) (*glJournalWithLines, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s/v1/journals/%s", c.ledgerURL, url.PathEscape(journalID)), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -1066,8 +1009,29 @@ func (c *Clients) getJournalLines(ctx context.Context, tenantID, journalID strin
 	if err := json.NewDecoder(resp.Body).Decode(&detail); err != nil {
 		return nil, err
 	}
+	return &detail, nil
+}
 
-	return detail.Lines, nil
+// GetPostedJournal reads one journal back from general-ledger-svc, header and
+// lines, as the ledger holds it. ACC-17 uses it to reconcile an opening
+// balance batch to its target after posting: what the ledger recorded, not
+// what this service asked it to record. A 404 is reported as unavailable, not
+// as an empty journal — a journal this service was just given an id for and
+// cannot read back is something to retry, never a reconciliation pass.
+func (c *Clients) GetPostedJournal(ctx context.Context, tenantID, journalID string) (*domain.PostedJournal, error) {
+	detail, err := c.getJournal(ctx, tenantID, journalID)
+	if err != nil {
+		return nil, err
+	}
+	out := &domain.PostedJournal{
+		JournalID: detail.JournalID, Status: detail.Status,
+		LegalEntityID: detail.LegalEntityID, FiscalPeriod: detail.FiscalPeriod,
+		Lines: make([]domain.JournalLineInput, len(detail.Lines)),
+	}
+	for i, l := range detail.Lines {
+		out.Lines[i] = domain.JournalLineInput{AccountCode: l.AccountCode, DebitAmount: l.DebitAmount, CreditAmount: l.CreditAmount}
+	}
+	return out, nil
 }
 
 // ---------------------------------------------------------------------------

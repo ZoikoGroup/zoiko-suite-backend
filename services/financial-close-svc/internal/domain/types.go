@@ -684,9 +684,9 @@ var (
 	// snapshot cannot be built with an unclassified account, so this fails
 	// closed rather than guessing a category.
 	ErrChartOfAccountsEntryMissing = errorString("trial balance line references an account code not found in the chart of accounts")
-	ErrFinancialSnapshotNotFound = errorString("financial snapshot not found")
-	ErrInvalidSnapshotTransition = errorString("financial snapshot is not in a status that allows this action")
-	ErrSigningKeyUnavailable     = errorString("no valid signing key is available to seal this snapshot")
+	ErrFinancialSnapshotNotFound   = errorString("financial snapshot not found")
+	ErrInvalidSnapshotTransition   = errorString("financial snapshot is not in a status that allows this action")
+	ErrSigningKeyUnavailable       = errorString("no valid signing key is available to seal this snapshot")
 	// ErrSnapshotNotSealed is returned by VerifySnapshotIntegrity for a
 	// snapshot that has no content hash / signature yet — there is nothing
 	// to verify against, so this is neither a pass nor a failure.
@@ -742,6 +742,25 @@ type PostedJournalRef struct {
 	FromType  string `json:"from_type"`
 	FromID    string `json:"from_id"`
 	JournalID string `json:"journal_id"`
+}
+
+// PostedJournalLineage is one PostedJournalRef with what the lineage index
+// holds for it, classified in a single set-based query (see the store's
+// ListPostedJournalLineage) rather than one edge lookup per journal.
+type PostedJournalLineage struct {
+	PostedJournalRef
+	HasEdge     bool
+	Quarantined bool
+}
+
+// PostedJournal is general-ledger-svc's record of one journal as ACC-17's
+// source-to-target reconciliation reads it back after posting.
+type PostedJournal struct {
+	JournalID     string
+	Status        string
+	LegalEntityID string
+	FiscalPeriod  string
+	Lines         []JournalLineInput
 }
 
 // LineageCompletenessReport is ACC-18's own VerifyLineageCompleteness
@@ -1180,6 +1199,17 @@ var (
 	ErrLineageAsOfRequired             = errorString("as_of is required and must be RFC3339")
 
 	ErrReconciliationMismatch = errorString("posted journal balances do not match the batch's own crosswalk totals")
+
+	// ErrSelfApproval is the maker-checker refusal shared by ACC-07/08/09/10
+	// approval and ACC-17 approval/certification: the principal who prepared
+	// the item cannot be the one who approves or certifies it. Also enforced
+	// by migration 000021's sod_* constraints.
+	ErrSelfApproval = errorString("segregation of duties: the principal who prepared this item cannot approve or certify it")
+
+	// ErrIdempotencyKeyRequired/ErrIdempotencyKeyConflict back the
+	// command_idempotency claims (migration 000021).
+	ErrIdempotencyKeyRequired = errorString("Idempotency-Key header is required for this command")
+	ErrIdempotencyKeyConflict = errorString("Idempotency-Key was already used for a different command or request body")
 )
 
 // PostingBacklog is general-ledger-svc's posting backlog for one entity as a

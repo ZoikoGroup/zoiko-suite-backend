@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 
 	"zoiko.io/financial-close-svc/internal/clients"
@@ -99,6 +100,35 @@ type stubStore struct {
 	postedRefsErr          error
 	projectionStatus       map[string]*domain.LineageProjectionStatus
 	upsertStatusErr        error
+
+	// claims mirrors command_idempotency: key -> what it created.
+	claims map[string]stubClaim
+}
+
+type stubClaim struct{ command, hash, id string }
+
+// lookupClaim answers as the real store's createWithClaim does: no key is
+// ErrIdempotencyKeyRequired, the same key for another command or body is
+// ErrIdempotencyKeyConflict, and a match returns the id it created.
+func (s *stubStore) lookupClaim(key, command, hash string) (id string, replay bool, err error) {
+	if key == "" {
+		return "", false, domain.ErrIdempotencyKeyRequired
+	}
+	c, ok := s.claims[key]
+	if !ok {
+		return "", false, nil
+	}
+	if c.command != command || c.hash != hash {
+		return "", false, domain.ErrIdempotencyKeyConflict
+	}
+	return c.id, true, nil
+}
+
+func (s *stubStore) recordClaim(key, command, hash, id string) {
+	if s.claims == nil {
+		s.claims = map[string]stubClaim{}
+	}
+	s.claims[key] = stubClaim{command: command, hash: hash, id: id}
 }
 
 func newStubStore() *stubStore {
@@ -380,13 +410,20 @@ func (s *stubStore) ListControlRuns(_ context.Context, legalEntityID, fiscalPeri
 	return out, nil
 }
 
-func (s *stubStore) CreateAccrualSchedule(_ context.Context, sch *domain.AccrualSchedule) error {
+func (s *stubStore) CreateAccrualSchedule(_ context.Context, sch *domain.AccrualSchedule, key, hash string) (bool, error) {
 	if s.createAccrualErr != nil {
-		return s.createAccrualErr
+		return false, s.createAccrualErr
+	}
+	if id, replay, err := s.lookupClaim(key, "CreateAccrual", hash); err != nil || replay {
+		if replay {
+			*sch = *s.schedules[id]
+		}
+		return replay, err
 	}
 	cp := *sch
 	s.schedules[sch.ScheduleID] = &cp
-	return nil
+	s.recordClaim(key, "CreateAccrual", hash, sch.ScheduleID)
+	return false, nil
 }
 
 func (s *stubStore) GetAccrualSchedule(_ context.Context, scheduleID string) (*domain.AccrualSchedule, error) {
@@ -537,13 +574,20 @@ func (s *stubStore) CreateRecognitionReversal(_ context.Context, rev *domain.Rec
 	return true, nil
 }
 
-func (s *stubStore) CreatePrepaymentSchedule(_ context.Context, sch *domain.PrepaymentSchedule) error {
+func (s *stubStore) CreatePrepaymentSchedule(_ context.Context, sch *domain.PrepaymentSchedule, key, hash string) (bool, error) {
 	if s.createPrepaymentErr != nil {
-		return s.createPrepaymentErr
+		return false, s.createPrepaymentErr
+	}
+	if id, replay, err := s.lookupClaim(key, "CreateRecognitionSchedule", hash); err != nil || replay {
+		if replay {
+			*sch = *s.prepaymentSchedules[id]
+		}
+		return replay, err
 	}
 	cp := *sch
 	s.prepaymentSchedules[sch.ScheduleID] = &cp
-	return nil
+	s.recordClaim(key, "CreateRecognitionSchedule", hash, sch.ScheduleID)
+	return false, nil
 }
 
 func (s *stubStore) GetPrepaymentSchedule(_ context.Context, scheduleID string) (*domain.PrepaymentSchedule, error) {
@@ -652,13 +696,20 @@ func (s *stubStore) ListPrepaymentRecognitions(_ context.Context, scheduleID str
 	return s.prepaymentRecognitions[scheduleID], nil
 }
 
-func (s *stubStore) CreateAllocationRule(_ context.Context, rule *domain.AllocationRule) error {
+func (s *stubStore) CreateAllocationRule(_ context.Context, rule *domain.AllocationRule, key, hash string) (bool, error) {
 	if s.createRuleErr != nil {
-		return s.createRuleErr
+		return false, s.createRuleErr
+	}
+	if id, replay, err := s.lookupClaim(key, "CreateAllocationRule", hash); err != nil || replay {
+		if replay {
+			*rule = *s.allocationRules[id]
+		}
+		return replay, err
 	}
 	cp := *rule
 	s.allocationRules[rule.RuleID] = &cp
-	return nil
+	s.recordClaim(key, "CreateAllocationRule", hash, rule.RuleID)
+	return false, nil
 }
 
 func (s *stubStore) GetCurrentAllocationRule(_ context.Context, ruleID string) (*domain.AllocationRule, error) {
@@ -820,13 +871,36 @@ func (s *stubStore) ListAllocationExceptions(_ context.Context, legalEntityID st
 	return out, nil
 }
 
-func (s *stubStore) CreateFXRevaluationRun(_ context.Context, run *domain.FXRevaluationRun) error {
+func (s *stubStore) CreateFXRevaluationRun(_ context.Context, run *domain.FXRevaluationRun, key, hash string) (bool, error) {
 	if s.createFXRunErr != nil {
-		return s.createFXRunErr
+		return false, s.createFXRunErr
+	}
+	if id, replay, err := s.lookupClaim(key, "StartRevaluation", hash); err != nil || replay {
+		if replay {
+			*run = *s.fxRuns[id]
+		}
+		return replay, err
 	}
 	cp := *run
 	s.fxRuns[run.RunID] = &cp
-	return nil
+	s.recordClaim(key, "StartRevaluation", hash, run.RunID)
+	return false, nil
+}
+
+// CreateFXReversalRun mirrors the store: at most one reversal per prior run.
+func (s *stubStore) CreateFXReversalRun(_ context.Context, run *domain.FXRevaluationRun) (bool, error) {
+	if s.createFXRunErr != nil {
+		return false, s.createFXRunErr
+	}
+	for _, existing := range s.fxRuns {
+		if existing.ReversalOfRunID != nil && *existing.ReversalOfRunID == *run.ReversalOfRunID {
+			*run = *existing
+			return true, nil
+		}
+	}
+	cp := *run
+	s.fxRuns[run.RunID] = &cp
+	return false, nil
 }
 
 func (s *stubStore) GetFXRevaluationRun(_ context.Context, runID string) (*domain.FXRevaluationRun, error) {
@@ -1124,6 +1198,28 @@ func (s *stubStore) ListPostedJournalRefs(_ context.Context, legalEntityID strin
 	return s.postedJournalRefs, nil
 }
 
+// ListPostedJournalLineage classifies postedJournalRefs against lineageEdges
+// and quarantinedLineageGaps with the store query's rules: an edge matches on
+// from/to within the tenant, a quarantine on from/to within the entity.
+func (s *stubStore) ListPostedJournalLineage(_ context.Context, legalEntityID string) ([]domain.PostedJournalLineage, error) {
+	if s.postedRefsErr != nil {
+		return nil, s.postedRefsErr
+	}
+	out := make([]domain.PostedJournalLineage, 0, len(s.postedJournalRefs))
+	for _, ref := range s.postedJournalRefs {
+		l := domain.PostedJournalLineage{PostedJournalRef: ref}
+		for _, e := range s.lineageEdges {
+			l.HasEdge = l.HasEdge || (e.ToType == "journal" && e.ToID == ref.JournalID && e.FromType == ref.FromType && e.FromID == ref.FromID)
+		}
+		for _, g := range s.quarantinedLineageGaps {
+			l.Quarantined = l.Quarantined || (g.LegalEntityID == legalEntityID && g.FromType == ref.FromType && g.FromID == ref.FromID &&
+				g.ToType == "journal" && g.ToID == ref.JournalID)
+		}
+		out = append(out, l)
+	}
+	return out, nil
+}
+
 func (s *stubStore) GetLineageProjectionStatus(_ context.Context, legalEntityID string) (*domain.LineageProjectionStatus, error) {
 	if st, ok := s.projectionStatus[legalEntityID]; ok {
 		cp := *st
@@ -1246,17 +1342,25 @@ type stubClients struct {
 	lastAllocDebitLines  []domain.AllocationJournalLine
 	postAllocationCalls  int
 
-	accountTypes         map[string]string // account_code -> account_type
-	accountTypeErr       error
+	accountTypes   map[string]string // account_code -> account_type
+	accountTypeErr error
 
-	trialBalanceDecimal *clients.TrialBalanceForSnapshot
-	trialBalDecimalErr  error
-	chartOfAccounts     []clients.ChartOfAccountsEntry
-	chartOfAccountsErr  error
+	trialBalanceDecimal  *clients.TrialBalanceForSnapshot
+	trialBalDecimalErr   error
+	chartOfAccounts      []clients.ChartOfAccountsEntry
+	chartOfAccountsErr   error
+	chartCalls           int
 	postMultiLineErr     error
 	postedMultiJournalID string
 	lastMultiLines       []domain.JournalLineInput
+	lastMultiLegalEntity string
+	lastMultiPeriod      string
 	postMultiLineCalls   int
+
+	// ACC-17 reconciliation read-back.
+	postedJournal   *domain.PostedJournal
+	getJournalErr   error
+	getJournalCalls int
 }
 
 func (c *stubClients) GetUnpostedJournalsCount(_ context.Context, _, _, _ string) (int, error) {
@@ -1286,16 +1390,50 @@ func (c *stubClients) CompileTrialBalanceDecimal(_ context.Context, _, _, _, _ s
 	}, nil
 }
 
+// ListChartOfAccounts is the one chart read ACC-09/10/17 now make. Without an
+// explicit chartOfAccounts it is built from the per-account fixtures the
+// tests already declare (accountStatuses, accountTypes), and their error
+// fixtures become a failed listing — the GL outage they always simulated.
 func (c *stubClients) ListChartOfAccounts(_ context.Context, _, _ string) ([]clients.ChartOfAccountsEntry, error) {
-	if c.chartOfAccountsErr != nil {
-		return nil, c.chartOfAccountsErr
+	c.chartCalls++
+	for _, err := range []error{c.chartOfAccountsErr, c.accountStatusErr, c.accountTypeErr} {
+		if err != nil {
+			return nil, err
+		}
 	}
 	if c.chartOfAccounts != nil {
 		return c.chartOfAccounts, nil
 	}
-	return []clients.ChartOfAccountsEntry{
-		{AccountCode: "1000-Cash", AccountName: "Cash", AccountType: domain.AccountTypeAsset},
-	}, nil
+	if len(c.accountStatuses) == 0 && len(c.accountTypes) == 0 {
+		return []clients.ChartOfAccountsEntry{
+			{AccountCode: "1000-Cash", AccountName: "Cash", AccountType: domain.AccountTypeAsset, Status: "ACTIVE"},
+		}, nil
+	}
+	var out []clients.ChartOfAccountsEntry
+	for code, status := range c.accountStatuses {
+		out = append(out, clients.ChartOfAccountsEntry{AccountCode: code, AccountType: c.accountTypes[code], Status: status})
+	}
+	for code, accountType := range c.accountTypes {
+		if _, listed := c.accountStatuses[code]; !listed {
+			out = append(out, clients.ChartOfAccountsEntry{AccountCode: code, AccountType: accountType, Status: "ACTIVE"})
+		}
+	}
+	return out, nil
+}
+
+// GetPostedJournal reads back postedJournal when a test sets one; otherwise
+// the journal exactly as the last PostMultiLineJournal sent it — what a
+// healthy ledger would hold.
+func (c *stubClients) GetPostedJournal(_ context.Context, _, journalID string) (*domain.PostedJournal, error) {
+	c.getJournalCalls++
+	if c.getJournalErr != nil {
+		return nil, c.getJournalErr
+	}
+	if c.postedJournal != nil {
+		return c.postedJournal, nil
+	}
+	return &domain.PostedJournal{JournalID: journalID, Status: "POSTED", LegalEntityID: c.lastMultiLegalEntity,
+		FiscalPeriod: c.lastMultiPeriod, Lines: c.lastMultiLines}, nil
 }
 
 func (c *stubClients) ListBankAccounts(_ context.Context, _, _, _ string) ([]domain.BankAccountRef, error) {
@@ -1406,16 +1544,6 @@ func (c *stubClients) PostAccrualRecognitionJournal(_ context.Context, _, _, fis
 	return "journal-uuid-001", nil
 }
 
-func (c *stubClients) GetAccountStatus(_ context.Context, _, _, accountCode string) (string, error) {
-	if c.accountStatusErr != nil {
-		return "", c.accountStatusErr
-	}
-	if status, ok := c.accountStatuses[accountCode]; ok {
-		return status, nil
-	}
-	return "", domain.ErrRecipientAccountInvalid
-}
-
 func (c *stubClients) PostAllocationJournal(_ context.Context, _, _, _, _, _, _, _ string, _ float64, debitLines []domain.AllocationJournalLine) (string, error) {
 	c.postAllocationCalls++
 	c.lastAllocDebitLines = debitLines
@@ -1428,19 +1556,10 @@ func (c *stubClients) PostAllocationJournal(_ context.Context, _, _, _, _, _, _,
 	return "journal-alloc-001", nil
 }
 
-func (c *stubClients) GetAccountType(_ context.Context, _, _, accountCode string) (string, error) {
-	if c.accountTypeErr != nil {
-		return "", c.accountTypeErr
-	}
-	if t, ok := c.accountTypes[accountCode]; ok {
-		return t, nil
-	}
-	return "", domain.ErrNonMonetaryItemIncluded
-}
-
-func (c *stubClients) PostMultiLineJournal(_ context.Context, _, _, _, _, _, _ string, lines []domain.JournalLineInput) (string, error) {
+func (c *stubClients) PostMultiLineJournal(_ context.Context, _, legalEntityID, fiscalPeriod, _, _, _ string, lines []domain.JournalLineInput) (string, error) {
 	c.postMultiLineCalls++
 	c.lastMultiLines = lines
+	c.lastMultiLegalEntity, c.lastMultiPeriod = legalEntityID, fiscalPeriod
 	if c.postMultiLineErr != nil {
 		return "", c.postMultiLineErr
 	}
@@ -1489,8 +1608,14 @@ func doReq(r chi.Router, method, path string, body any, principalID string) *htt
 }
 
 // doReqAs sends a request as a caller the gateway verified as tenantID. An
-// empty tenantID sends no X-Tenant-Id at all.
+// empty tenantID sends no X-Tenant-Id at all. Every request carries a fresh
+// Idempotency-Key, as a well-behaved client's does; doReqKeyed controls it.
 func doReqAs(r chi.Router, method, path string, body any, principalID, tenantID string) *httptest.ResponseRecorder {
+	return doReqKeyed(r, method, path, body, principalID, tenantID, uuid.NewString())
+}
+
+// doReqKeyed sends a request with the given Idempotency-Key; "" sends none.
+func doReqKeyed(r chi.Router, method, path string, body any, principalID, tenantID, idempotencyKey string) *httptest.ResponseRecorder {
 	var buf bytes.Buffer
 	if body != nil {
 		_ = json.NewEncoder(&buf).Encode(body)
@@ -1502,6 +1627,9 @@ func doReqAs(r chi.Router, method, path string, body any, principalID, tenantID 
 	}
 	if tenantID != "" {
 		req.Header.Set("X-Tenant-Id", tenantID)
+	}
+	if idempotencyKey != "" {
+		req.Header.Set("Idempotency-Key", idempotencyKey)
 	}
 	rr := httptest.NewRecorder()
 	r.ServeHTTP(rr, req)

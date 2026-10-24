@@ -33,7 +33,7 @@ func approvedAllocationRule(t *testing.T, ctx context.Context, s *store.PgStore,
 		},
 		Status: domain.AllocationRuleStatusDraft, CreatedAt: time.Now().UTC(), CreatedByPrincipalID: "preparer-1",
 	}
-	if err := s.CreateAllocationRule(ctx, rule); err != nil {
+	if _, err := s.CreateAllocationRule(ctx, rule, "key-"+rule.RuleVersionID, testRequestHash); err != nil {
 		t.Fatalf("CreateAllocationRule: %v", err)
 	}
 	if err := s.ApproveAllocationRule(ctx, rule.RuleVersionID, "approver-1", time.Now().UTC()); err != nil {
@@ -105,7 +105,7 @@ func TestPgStore_ACC09_SupersedeAllocationRule_NoCurrentVersion_Refused(t *testi
 		Drivers: []domain.AllocationDriver{{RecipientAccountCode: "6100-Sales", WeightPercentage: 100}},
 		Status:  domain.AllocationRuleStatusDraft, CreatedAt: time.Now().UTC(), CreatedByPrincipalID: "preparer-1",
 	}
-	if err := s.CreateAllocationRule(ctx, draft); err != nil {
+	if _, err := s.CreateAllocationRule(ctx, draft, "key-"+draft.RuleVersionID, testRequestHash); err != nil {
 		t.Fatalf("CreateAllocationRule: %v", err)
 	}
 
