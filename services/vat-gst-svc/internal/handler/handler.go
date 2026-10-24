@@ -147,7 +147,7 @@ func (h *Handler) CreateVATReturn(w http.ResponseWriter, r *http.Request) {
 		InputTaxAmount:        req.InputTaxAmount,
 		Currency:              req.Currency,
 		EffectiveFrom:         req.EffectiveFrom,
-		CreatedBy:             req.CreatedBy,
+		CreatedBy:             principalID,
 	}
 
 	if err := h.store.CreateVATReturn(r.Context(), vret); err != nil {
@@ -211,6 +211,12 @@ func (h *Handler) UpdateVATReturn(w http.ResponseWriter, r *http.Request) {
 		}
 		h.logger.Error("failed to fetch vat return for update", zap.Error(err), zap.String("return_id", id))
 		writeError(w, http.StatusInternalServerError, "failed to fetch vat return")
+		return
+	}
+
+	// Immutability guard (INV-07 / D3): FILED vat returns are immutable.
+	if existing.Status == domain.StatusFiled {
+		writeError(w, http.StatusConflict, "cannot update a FILED vat return")
 		return
 	}
 
