@@ -214,3 +214,62 @@ func TestUpdateComplianceStatus(t *testing.T) {
 		t.Errorf("expected VERIFIED, got %s", updated.ComplianceStatus)
 	}
 }
+
+func TestUpdateCounterparty_Terminated_Conflict(t *testing.T) {
+	h := newTestHandler()
+	r := chi.NewRouter()
+	RegisterRoutes(r, h)
+
+	// Create counterparty
+	body := domain.CreateCounterpartyRequest{
+		LegalEntityID:    "le-001",
+		Name:             "Terminated Vendor Corp",
+		CounterpartyType: domain.TypeVendor,
+		JurisdictionID:   "uk-england",
+	}
+	wCreate := httptest.NewRecorder()
+	r.ServeHTTP(wCreate, buildRequest(http.MethodPost, "/v1/counterparties", body))
+	var created domain.Counterparty
+	_ = json.NewDecoder(wCreate.Body).Decode(&created)
+
+	// Manually set status to TERMINATED in store
+	created.Status = domain.StatusTerminated
+	_ = h.store.UpdateCounterparty(context.Background(), &created)
+
+	// Attempt PUT update on TERMINATED counterparty
+	updateBody := domain.UpdateCounterpartyRequest{
+		Name: "New Name Corp",
+	}
+	wUpdate := httptest.NewRecorder()
+	r.ServeHTTP(wUpdate, buildRequest(http.MethodPut, "/v1/counterparties/"+created.CounterpartyID, updateBody))
+	if wUpdate.Code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict when updating terminated counterparty, got %d: %s", wUpdate.Code, wUpdate.Body.String())
+	}
+}
+
+func TestUpdateCounterparty_CannotSetTerminatedViaPut(t *testing.T) {
+	h := newTestHandler()
+	r := chi.NewRouter()
+	RegisterRoutes(r, h)
+
+	body := domain.CreateCounterpartyRequest{
+		LegalEntityID:    "le-001",
+		Name:             "Active Vendor Corp",
+		CounterpartyType: domain.TypeVendor,
+		JurisdictionID:   "uk-england",
+	}
+	wCreate := httptest.NewRecorder()
+	r.ServeHTTP(wCreate, buildRequest(http.MethodPost, "/v1/counterparties", body))
+	var created domain.Counterparty
+	_ = json.NewDecoder(wCreate.Body).Decode(&created)
+
+	// Attempt to set status to TERMINATED via PUT
+	updateBody := domain.UpdateCounterpartyRequest{
+		Status: domain.StatusTerminated,
+	}
+	wUpdate := httptest.NewRecorder()
+	r.ServeHTTP(wUpdate, buildRequest(http.MethodPut, "/v1/counterparties/"+created.CounterpartyID, updateBody))
+	if wUpdate.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request when setting status to TERMINATED via PUT, got %d: %s", wUpdate.Code, wUpdate.Body.String())
+	}
+}

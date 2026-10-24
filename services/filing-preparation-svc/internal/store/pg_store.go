@@ -230,11 +230,14 @@ func (s *PgStore) Finalize(ctx context.Context, id string, req *domain.FinalizeD
 	if err != nil {
 		return nil, err
 	}
-	if d.ValidationStatus == domain.StatusBlocked {
-		return nil, domain.ErrValidationBlocked
-	}
-	if d.ValidationStatus == domain.StatusReadyForSubmission {
-		return nil, domain.ErrDraftAlreadyFinal
+	if d.ValidationStatus != domain.StatusPrepared {
+		if d.ValidationStatus == domain.StatusBlocked {
+			return nil, domain.ErrValidationBlocked
+		}
+		if d.ValidationStatus == domain.StatusReadyForSubmission {
+			return nil, domain.ErrDraftAlreadyFinal
+		}
+		return nil, domain.ErrValidationRequired
 	}
 
 	d.ValidationStatus = domain.StatusReadyForSubmission

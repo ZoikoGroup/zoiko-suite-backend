@@ -236,4 +236,19 @@ func TestCreateAndRemitObligation(t *testing.T) {
 	if remitted.Status != domain.StatusRemitted {
 		t.Errorf("expected status REMITTED, got %s", remitted.Status)
 	}
+
+	// Try to update the remitted obligation (should return 409 Conflict)
+	updatePayload := domain.CreateObligationRequest{
+		GrossPaymentAmount: 30000.0,
+	}
+	updateBody, _ := json.Marshal(updatePayload)
+	updateReq := httptest.NewRequest("PUT", "/v1/withholding-tax/"+created.ObligationID, bytes.NewBuffer(updateBody))
+	updateReq.Header.Set("Content-Type", "application/json")
+	updateReq.Header.Set("X-Principal-Id", "user-001")
+	updateW := httptest.NewRecorder()
+
+	r.ServeHTTP(updateW, updateReq)
+	if updateW.Code != http.StatusConflict {
+		t.Fatalf("expected status 409 Conflict when updating REMITTED obligation, got %d", updateW.Code)
+	}
 }
