@@ -22,21 +22,6 @@ func nilIfEmpty(s string) any {
 	return s
 }
 
-// LedgerPosition implements kernel.ReconRepo: the sums of the entries of one control type in one book up to a date and,
-// when upToSeq is given, up to a watermark, so the same position can be reproduced later.
-func (r *KernelRepo) LedgerPosition(ctx context.Context, tenant, entity, bookCode, control string, asOf time.Time, upToSeq int64) (kernel.LedgerPosition, error) {
-	var p kernel.LedgerPosition
-	err := r.tx(ctx, tenant, func(t pgx.Tx) error {
-		return t.QueryRow(ctx, `
-			SELECT COALESCE(max(entry_seq), 0), count(*), COALESCE(sum(debit_amount), 0)::text, COALESCE(sum(credit_amount), 0)::text,
-			       COALESCE(array_agg(DISTINCT account_code), '{}')
-			FROM ledger_entries
-			WHERE tenant_id = $1::uuid AND legal_entity_id = $2::uuid AND book_id = $3 AND control_type = $4 AND posting_date <= $5::date AND ($6::bigint = 0 OR entry_seq <= $6)`,
-			tenant, entity, bookCode, control, asOf, upToSeq).Scan(&p.Watermark, &p.Count, &p.DebitTotal, &p.CreditTotal, &p.AccountCodes)
-	})
-	return p, kernelErr(err)
-}
-
 // EventPosting implements kernel.ReconRepo: how many accounting events were registered up to a moment and how many of them have a
 // posting in the book as of that moment. The events that do not are listed (the first 200).
 func (r *KernelRepo) EventPosting(ctx context.Context, tenant, entity, bookID string, asOf time.Time, at time.Time) (kernel.EventPosting, error) {

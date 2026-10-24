@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"sort"
 	"strings"
 	"time"
 
@@ -22,7 +23,16 @@ const (
 	ReconAP           = "AP_GL"
 	ReconBank         = "BANK_GL"
 	ReconEventPosting = "EVENT_POSTING"
+	ReconPayroll      = "PAYROLL_GL"
+	ReconTax          = "TAX_GL"
+	ReconAsset        = "ASSET_GL"
+	ReconInventory    = "INVENTORY_GL"
 )
+
+// ReconTypes lists the reconciliation types the kernel runs.
+var ReconTypes = []string{ReconAR, ReconAP, ReconBank, ReconPayroll, ReconTax, ReconAsset, ReconInventory, ReconEventPosting}
+
+const reconTypeList = "AR_GL, AP_GL, BANK_GL, PAYROLL_GL, TAX_GL, ASSET_GL, INVENTORY_GL or EVENT_POSTING"
 
 // Case statuses.
 const (
@@ -38,20 +48,27 @@ const (
 var controlOf = map[string]struct {
 	Control     string
 	DebitNormal bool
-}{ReconAR: {"AR", true}, ReconAP: {"AP", false}, ReconBank: {"BANK", true}}
+}{
+	ReconAR: {"AR", true}, ReconAP: {"AP", false}, ReconBank: {"BANK", true},
+	// payroll and tax liabilities are credit-normal; the fixed-asset register (cost less accumulated depreciation) and inventory are debit-normal
+	ReconPayroll: {"PAYROLL", false}, ReconTax: {"TAX", false}, ReconAsset: {"ASSET", true}, ReconInventory: {"INVENTORY", true},
+}
 
 // ResolutionTypes are the controlled reasons a case is closed for (§27.2).
 var ResolutionTypes = []string{"TIMING", "MAPPING", "MISSING_EVENT", "DUPLICATE", "MANUAL_CORRECTION", "EXTERNAL_ISSUE", "OTHER"}
 
 // Population is one side of a reconciliation as the run recorded it.
 type Population struct {
-	Source    string         `json:"source"`
-	Reference string         `json:"reference,omitempty"`
-	Watermark string         `json:"watermark,omitempty"`
-	Count     int            `json:"count"`
-	Total     string         `json:"total"`
-	Currency  string         `json:"currency,omitempty"`
-	Detail    map[string]any `json:"detail,omitempty"`
+	Source    string `json:"source"`
+	Reference string `json:"reference,omitempty"`
+	Watermark string `json:"watermark,omitempty"`
+	Count     int    `json:"count"`
+	Total     string `json:"total"`
+	Currency  string `json:"currency,omitempty"`
+	// Groups breaks the total down by a dimension (an asset class, a location): when a run groups, each group is compared as well as
+	// the total, so two offsetting differences cannot hide inside a matching total.
+	Groups map[string]string `json:"groups,omitempty"`
+	Detail map[string]any    `json:"detail,omitempty"`
 }
 
 // Tolerance is a versioned threshold: a difference up to MatchAmount is a match, up to WarningAmount a warning, anything more a break.
@@ -117,6 +134,21 @@ type LedgerPosition struct {
 	DebitTotal   string
 	CreditTotal  string
 	AccountCodes []string
+	Groups       []GroupTotal
+}
+
+// PositionOpts widens or breaks down a ledger position. IncludeUnbooked adds the entity's entries that name no book (postings made
+// before books existed, or by services that do not name one); GroupBy sums the position by a dimension.
+type PositionOpts struct {
+	IncludeUnbooked bool
+	GroupBy         string
+}
+
+// GroupTotal is the ledger's debit and credit total for one value of the grouping dimension.
+type GroupTotal struct {
+	Key    string
+	Debit  string
+	Credit string
 }
 
 // EventPosting is the count of accounting events registered up to a moment and how many of them have a posting in the book.
@@ -135,7 +167,7 @@ type ReconFilter struct {
 
 // ReconRepo is the persistence boundary of reconciliation.
 type ReconRepo interface {
-	LedgerPosition(ctx context.Context, tenant, entity, bookCode, controlType string, asOf time.Time, upToSeq int64) (LedgerPosition, error)
+	LedgerPosition(ctx context.Context, tenant, entity, bookCode, controlType string, asOf time.Time, upToSeq int64, opts PositionOpts) (LedgerPosition, error)
 	EventPosting(ctx context.Context, tenant, entity, bookID string, asOf time.Time, at time.Time) (EventPosting, error)
 	PickTolerance(ctx context.Context, tenant, reconType, entity string, asOf time.Time) (*Tolerance, error)
 	InsertTolerance(ctx context.Context, t *Tolerance, out OutEvent) error
@@ -196,6 +228,10 @@ type RunRequest struct {
 	PopulationA  *Population `json:"population_a,omitempty"`
 	Owner        string      `json:"owner,omitempty"`
 	SLAHours     int         `json:"sla_hours,omitempty"`
+	// GroupBy names a dimension to compare group by group (population_a.groups gives the subledger's figure for each value);
+	// IncludeUnbooked also counts the entity's entries that name no book.
+	GroupBy         string `json:"group_by,omitempty"`
+	IncludeUnbooked bool   `json:"include_unbooked,omitempty"`
 }
 
 func ratFixed(r *big.Rat) string { return r.FloatString(6) }
@@ -216,7 +252,7 @@ func (s *ReconService) Run(ctx context.Context, tenant string, a Actor, req RunR
 	bad := func(f, why string) error { return exc(FamData, "RECON_INVALID", "%s: %s", f, why).with("field", f) }
 	spec, supported := controlOf[req.Type]
 	if !supported && req.Type != ReconEventPosting {
-		return nil, bad("reconciliation_type", "AR_GL, AP_GL, BANK_GL or EVENT_POSTING")
+		return nil, bad("reconciliation_type", reconTypeList)
 	}
 	if _, err := uuid.Parse(req.BookID); err != nil {
 		return nil, bad("book_id", "an accounting book id")
@@ -241,6 +277,7 @@ func (s *ReconService) Run(ctx context.Context, tenant string, a Actor, req RunR
 		AsOf: req.AsOf, Currency: bk.FunctionalCurrency, Evidence: []string{}, CreatedBy: a.PrincipalID, CreatedAt: now}
 
 	var expected, actual *big.Rat
+	groupWorst := new(big.Rat)
 	if req.Type == ReconEventPosting {
 		at := now
 		ep, err := s.Repo.EventPosting(ctx, tenant, bk.LegalEntityID, bk.BookID, asOf, at)
@@ -267,7 +304,32 @@ func (s *ReconService) Run(ctx context.Context, tenant string, a Actor, req RunR
 			return nil, err
 		}
 		pa.Currency, pa.Total = bk.FunctionalCurrency, ratFixed(expected)
-		pos, err := s.Repo.LedgerPosition(ctx, tenant, bk.LegalEntityID, bk.BookCode, spec.Control, asOf, 0)
+		opts := PositionOpts{IncludeUnbooked: req.IncludeUnbooked, GroupBy: strings.TrimSpace(req.GroupBy)}
+		var groupsA map[string]*big.Rat
+		if opts.GroupBy != "" {
+			if !codeRE.MatchString(opts.GroupBy) {
+				return nil, bad("group_by", "a dimension code")
+			}
+			if len(pa.Groups) == 0 {
+				return nil, bad("population_a.groups", "the subledger's figure for each value of the dimension")
+			}
+			groupsA = map[string]*big.Rat{}
+			sum := new(big.Rat)
+			for k, v := range pa.Groups {
+				g, gerr := parseAmount("population_a.groups."+k, v)
+				if gerr != nil {
+					return nil, gerr
+				}
+				groupsA[k] = g
+				sum.Add(sum, g)
+			}
+			if sum.Cmp(expected) != 0 {
+				return nil, bad("population_a.groups", "the groups must add up to the total")
+			}
+		} else if len(pa.Groups) > 0 {
+			return nil, bad("group_by", "population_a carries groups, so the dimension they are grouped by is required")
+		}
+		pos, err := s.Repo.LedgerPosition(ctx, tenant, bk.LegalEntityID, bk.BookCode, spec.Control, asOf, 0, opts)
 		if err != nil {
 			return nil, err
 		}
@@ -283,7 +345,13 @@ func (s *ReconService) Run(ctx context.Context, tenant string, a Actor, req RunR
 		}
 		run.PopulationA = pa
 		run.PopulationB = Population{Source: "LEDGER", Watermark: fmt.Sprint(pos.Watermark), Count: pos.Count, Total: ratFixed(actual), Currency: bk.FunctionalCurrency,
-			Detail: map[string]any{"control_type": spec.Control, "debit_total": pos.DebitTotal, "credit_total": pos.CreditTotal, "normal_side": map[bool]string{true: "DEBIT", false: "CREDIT"}[spec.DebitNormal], "account_codes": pos.AccountCodes}}
+			Detail: map[string]any{"control_type": spec.Control, "debit_total": pos.DebitTotal, "credit_total": pos.CreditTotal, "normal_side": map[bool]string{true: "DEBIT", false: "CREDIT"}[spec.DebitNormal], "account_codes": pos.AccountCodes,
+				"include_unbooked": opts.IncludeUnbooked}}
+		if opts.GroupBy != "" {
+			rows, worstGroup := compareGroups(groupsA, pos.Groups, spec.DebitNormal)
+			run.PopulationB.Detail["group_by"], run.PopulationB.Detail["groups"] = opts.GroupBy, rows
+			groupWorst = worstGroup
+		}
 	}
 	diff := new(big.Rat).Sub(expected, actual)
 	run.ExpectedTotal, run.ActualTotal, run.Difference = ratFixed(expected), ratFixed(actual), ratFixed(diff)
@@ -297,6 +365,9 @@ func (s *ReconService) Run(ctx context.Context, tenant string, a Actor, req RunR
 		run.ToleranceRuleID, run.ToleranceVersion = tol.ToleranceRuleID, tol.Version
 	}
 	abs := new(big.Rat).Abs(diff)
+	if groupWorst.Cmp(abs) > 0 {
+		abs = groupWorst // the case is judged by its worst figure: a matching total does not excuse a group that is out
+	}
 	var out *OutEvent
 	switch {
 	case abs.Cmp(match) <= 0:
@@ -325,6 +396,53 @@ func (s *ReconService) Run(ctx context.Context, tenant string, a Actor, req RunR
 		return nil, err
 	}
 	return run, nil
+}
+
+// compareGroups compares the subledger's figure for each group with the ledger's, and returns each group's difference with the largest
+// absolute one. A group on only one side is compared with zero on the other.
+func compareGroups(a map[string]*big.Rat, ledger []GroupTotal, debitNormal bool) ([]map[string]string, *big.Rat) {
+	actual := map[string]*big.Rat{}
+	for _, g := range ledger {
+		dr, cr := dec(g.Debit), dec(g.Credit)
+		if debitNormal {
+			actual[g.Key] = new(big.Rat).Sub(dr, cr)
+		} else {
+			actual[g.Key] = new(big.Rat).Sub(cr, dr)
+		}
+	}
+	keys := map[string]bool{}
+	for k := range a {
+		keys[k] = true
+	}
+	for k := range actual {
+		keys[k] = true
+	}
+	sorted := make([]string, 0, len(keys))
+	for k := range keys {
+		sorted = append(sorted, k)
+	}
+	sort.Strings(sorted)
+	rows := make([]map[string]string, 0, len(sorted))
+	worst := new(big.Rat)
+	for _, k := range sorted {
+		e, ac := a[k], actual[k]
+		if e == nil {
+			e = new(big.Rat)
+		}
+		if ac == nil {
+			ac = new(big.Rat)
+		}
+		d := new(big.Rat).Sub(e, ac)
+		if ad := new(big.Rat).Abs(d); ad.Cmp(worst) > 0 {
+			worst = ad
+		}
+		label := k
+		if label == "" {
+			label = "(none)"
+		}
+		rows = append(rows, map[string]string{"key": label, "expected": ratFixed(e), "actual": ratFixed(ac), "difference": ratFixed(d)})
+	}
+	return rows, worst
 }
 
 // Assign gives an open case an owner and an SLA.
@@ -372,6 +490,7 @@ func (s *ReconService) Verify(ctx context.Context, tenant, id string) (map[strin
 	}
 	asOf, _ := time.Parse("2006-01-02", run.AsOf)
 	var recomputed *big.Rat
+	groupsOK := true
 	if run.Type == ReconEventPosting {
 		at, perr := time.Parse(time.RFC3339Nano, run.PopulationA.Watermark)
 		if perr != nil {
@@ -390,7 +509,14 @@ func (s *ReconService) Verify(ctx context.Context, tenant, id string) (map[strin
 		}
 		var wm int64
 		fmt.Sscan(run.PopulationB.Watermark, &wm)
-		pos, err := s.Repo.LedgerPosition(ctx, tenant, run.LegalEntityID, bk.BookCode, spec.Control, asOf, wm)
+		opts := PositionOpts{}
+		if v, ok := run.PopulationB.Detail["include_unbooked"].(bool); ok {
+			opts.IncludeUnbooked = v
+		}
+		if v, ok := run.PopulationB.Detail["group_by"].(string); ok {
+			opts.GroupBy = v
+		}
+		pos, err := s.Repo.LedgerPosition(ctx, tenant, run.LegalEntityID, bk.BookCode, spec.Control, asOf, wm, opts)
 		if err != nil {
 			return nil, err
 		}
@@ -401,15 +527,45 @@ func (s *ReconService) Verify(ctx context.Context, tenant, id string) (map[strin
 		} else {
 			recomputed = new(big.Rat).Sub(cr, dr)
 		}
+		groupsOK = true
+		if stored, ok := run.PopulationB.Detail["groups"].([]any); ok {
+			again := map[string]string{}
+			for _, g := range pos.Groups {
+				label := g.Key
+				if label == "" {
+					label = "(none)"
+				}
+				a, c := dec(g.Debit), dec(g.Credit)
+				if spec.DebitNormal {
+					again[label] = ratFixed(new(big.Rat).Sub(a, c))
+				} else {
+					again[label] = ratFixed(new(big.Rat).Sub(c, a))
+				}
+			}
+			for _, row := range stored {
+				m, _ := row.(map[string]any)
+				key, _ := m["key"].(string)
+				actual, _ := m["actual"].(string)
+				if again[key] != actual && !(again[key] == "" && dec(actual).Sign() == 0) {
+					groupsOK = false
+				}
+				delete(again, key)
+			}
+			for _, v := range again {
+				if dec(v).Sign() != 0 {
+					groupsOK = false
+				}
+			}
+		}
 	}
 	stored, _ := new(big.Rat).SetString(run.ActualTotal)
-	return map[string]any{"reconciliation_run_id": run.RunID, "reproducible": stored.Cmp(recomputed) == 0, "stored_actual_total": run.ActualTotal, "recomputed_actual_total": ratFixed(recomputed)}, nil
+	return map[string]any{"reconciliation_run_id": run.RunID, "reproducible": stored.Cmp(recomputed) == 0 && groupsOK, "stored_actual_total": run.ActualTotal, "recomputed_actual_total": ratFixed(recomputed)}, nil
 }
 
 // CreateTolerance adds a new version of a tolerance rule.
 func (s *ReconService) CreateTolerance(ctx context.Context, tenant string, a Actor, t Tolerance) (*Tolerance, error) {
 	if _, ok := controlOf[t.ReconciliationType]; !ok && t.ReconciliationType != ReconEventPosting {
-		return nil, exc(FamData, "RECON_INVALID", "reconciliation_type: AR_GL, AP_GL, BANK_GL or EVENT_POSTING")
+		return nil, exc(FamData, "RECON_INVALID", "reconciliation_type: %s", reconTypeList)
 	}
 	if t.LegalEntityID != "" {
 		if _, err := uuid.Parse(t.LegalEntityID); err != nil {

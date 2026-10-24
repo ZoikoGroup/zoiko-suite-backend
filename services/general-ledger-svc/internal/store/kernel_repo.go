@@ -798,8 +798,8 @@ func (r *KernelRepo) SetAccountScope(ctx context.Context, tenant, code string, s
 		}
 		tag, e := t.Exec(ctx, `UPDATE chart_of_accounts SET applicable_book_ids=$3::uuid[], currency_restriction=NULLIF($4,''), control_type=NULLIF($5,''),
 				counterparty_required=$6, is_control_account = (NULLIF($5,'') IS NOT NULL OR is_control_account),
-				direct_posting_restricted = (NULLIF($5,'') IS NOT NULL OR direct_posting_restricted)
-			WHERE tenant_id=$1::uuid AND account_code=$2`, tenant, code, arg, sc.Currency, sc.ControlType, sc.CounterpartyRequired)
+				direct_posting_restricted = COALESCE($7::boolean, (NULLIF($5,'') IS NOT NULL OR direct_posting_restricted))
+			WHERE tenant_id=$1::uuid AND account_code=$2`, tenant, code, arg, sc.Currency, sc.ControlType, sc.CounterpartyRequired, sc.DirectPostingRestricted)
 		if e != nil {
 			return e
 		}

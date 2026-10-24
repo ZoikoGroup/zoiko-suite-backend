@@ -47,9 +47,15 @@ func content(tax []string, conds []Condition, lines ...LineTemplate) RuleContent
 var packAccounts = map[string]string{
 	"AR_CONTROL": "1100", "REVENUE": "4000", "OUTPUT_TAX": "2200", "BANK": "1000", "UNAPPLIED_CASH": "2150", "BAD_DEBT": "6900", "SALES_RETURNS": "4100",
 	"PROCESSOR_CLEARING": "1050", "PROCESSOR_FEES": "6950", "AP_CONTROL": "2000", "EXPENSE": "6000", "INPUT_TAX": "1300", "PAYMENT_CLEARING": "2050", "BANK_FEES": "6960", "FX_REALIZED_GAIN": "7100", "FX_REALIZED_LOSS": "7200",
+	"PAYROLL_EXPENSE": "6100", "EMPLOYER_CONTRIB_EXPENSE": "6110", "PAYROLL_TAX_LIABILITY": "2310", "EMPLOYEE_DEDUCTIONS_LIABILITY": "2320", "EMPLOYER_CONTRIB_LIABILITY": "2330", "NET_PAY_PAYABLE": "2340",
+	"FIXED_ASSET_COST": "1500", "ACCUMULATED_DEPRECIATION": "1590", "DEPRECIATION_EXPENSE": "6200", "IMPAIRMENT_LOSS": "6210", "REVALUATION_SURPLUS": "3100", "ASSET_CLEARING": "2060",
+	"DISPOSAL_GAIN": "7500", "DISPOSAL_LOSS": "7510", "INVENTORY": "1400", "GRNI": "2070", "COGS": "5000", "INVENTORY_VARIANCE": "5100",
+	"TAX_PAYABLE": "2210", "INCOME_TAX_EXPENSE": "8000", "DEFERRED_TAX": "2220", "TAX_ADJUSTMENT": "8100", "WITHHOLDING_RECEIVABLE": "1310",
+	"PREPAID_ASSET": "1200", "ACCRUED_LIABILITY": "2400", "DEFERRED_REVENUE": "2500",
 }
 
-var packControls = map[string]string{"1100": "AR", "2000": "AP", "1000": "BANK", "2150": "CLEARING", "1050": "CLEARING", "2050": "CLEARING"}
+var packControls = map[string]string{"1100": "AR", "2000": "AP", "1000": "BANK", "2150": "CLEARING", "1050": "CLEARING", "2050": "CLEARING",
+	"2310": "PAYROLL", "2320": "PAYROLL", "2330": "PAYROLL", "2340": "PAYROLL", "1500": "ASSET", "1590": "ASSET", "2060": "CLEARING", "1400": "INVENTORY", "2070": "CLEARING", "2210": "TAX", "2220": "TAX"}
 
 func golden(name, event, cp string, facts map[string]string, want ...ExpectedLine) TestCase {
 	return TestCase{Name: name, Event: TestEvent{EventType: event, TransactionCurrency: "GBP", Facts: facts, CounterpartyID: cp},
@@ -91,8 +97,10 @@ func withRealizedFX(c RuleContent) RuleContent {
 
 type f = map[string]string
 
-// Packs returns the standard rule packs.
-func Packs() []RulePack {
+// Packs returns the standard rule packs: the core AR, AP and bank packs and the subledger packs of the later waves.
+func Packs() []RulePack { return append(corePacks(), subledgerPacks()...) }
+
+func corePacks() []RulePack {
 	taxFacts := []string{"gross", "net", "tax"}
 	return []RulePack{
 		{

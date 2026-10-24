@@ -20,6 +20,10 @@ type AccountScope struct {
 	Currency             string
 	ControlType          string
 	CounterpartyRequired bool
+	// DirectPostingRestricted, when set, states whether manual journals are barred from the account. Left unset, an account that
+	// is given a control type becomes restricted. A control account that a subledger service still posts to through the legacy
+	// posting command is opened by setting it false, which is evented and is the operator's decision, not a default.
+	DirectPostingRestricted *bool
 }
 
 // AccountApplicability is the optional part of the chart that says where an account may be used: the books it is valid in and

@@ -115,10 +115,11 @@ type scopeStore interface {
 }
 
 type scopeBody struct {
-	BookIDs              []string `json:"book_ids"`
-	CurrencyRestriction  string   `json:"currency_restriction"`
-	ControlType          string   `json:"control_type"`
-	CounterpartyRequired bool     `json:"counterparty_required"`
+	BookIDs                 []string `json:"book_ids"`
+	CurrencyRestriction     string   `json:"currency_restriction"`
+	ControlType             string   `json:"control_type"`
+	CounterpartyRequired    bool     `json:"counterparty_required"`
+	DirectPostingRestricted *bool    `json:"direct_posting_restricted,omitempty"`
 }
 
 // ControlTypes are the areas that can own a control account (§12).
@@ -183,7 +184,7 @@ func (h *KernelHandler) SetAccountScope(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	code := chi.URLParam(r, "account_code")
-	sc := kernel.AccountScope{BookIDs: req.BookIDs, Currency: req.CurrencyRestriction, ControlType: req.ControlType, CounterpartyRequired: req.CounterpartyRequired}
+	sc := kernel.AccountScope{BookIDs: req.BookIDs, Currency: req.CurrencyRestriction, ControlType: req.ControlType, CounterpartyRequired: req.CounterpartyRequired, DirectPostingRestricted: req.DirectPostingRestricted}
 	if err := s.SetAccountScope(r.Context(), tenant, code, sc, a); err != nil {
 		h.fail(w, err)
 		return
