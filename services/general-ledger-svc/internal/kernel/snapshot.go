@@ -23,7 +23,9 @@ const (
 	SnapshotClose         = "CLOSE"
 	SnapshotReclose       = "RECLOSE"
 	SnapshotConsolidation = "CONSOLIDATION_FREEZE"
-	SnapshotAdHoc         = "AD_HOC"
+	// SnapshotConsolidationClose is the signed balance of a group book when its consolidation is certified.
+	SnapshotConsolidationClose = "CONSOLIDATION_CLOSE"
+	SnapshotAdHoc              = "AD_HOC"
 )
 
 // SnapshotLine is the balance of one account: cumulative to the as-of date, and the movement inside the period.
@@ -160,8 +162,8 @@ func (s *SnapshotService) Create(ctx context.Context, tenant string, a Actor, re
 	if purpose == "" {
 		purpose = SnapshotAdHoc
 	}
-	if purpose != SnapshotClose && purpose != SnapshotReclose && purpose != SnapshotConsolidation && purpose != SnapshotAdHoc {
-		return nil, bad("purpose", "CLOSE, RECLOSE, CONSOLIDATION_FREEZE or AD_HOC")
+	if purpose != SnapshotClose && purpose != SnapshotReclose && purpose != SnapshotConsolidation && purpose != SnapshotConsolidationClose && purpose != SnapshotAdHoc {
+		return nil, bad("purpose", "CLOSE, RECLOSE, CONSOLIDATION_FREEZE, CONSOLIDATION_CLOSE or AD_HOC")
 	}
 	pstart, pend, ok := periodBounds(req.FiscalPeriod)
 	if !ok {

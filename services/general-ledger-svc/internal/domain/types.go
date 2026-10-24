@@ -101,6 +101,11 @@ const (
 	// only the kernel originates it (standard §8.1).
 	JournalTypeRevaluation JournalType = "REVALUATION"
 
+	// JournalTypeConsolidation and JournalTypeElimination are the journals the kernel posts into a group book when it consolidates:
+	// the translated member balances and the intercompany eliminations. Like revaluation, only the kernel originates them.
+	JournalTypeConsolidation JournalType = "CONSOLIDATION"
+	JournalTypeElimination   JournalType = "ELIMINATION"
+
 	// JournalTypeUnspecified marks rows written before migration 000006 added
 	// the field. It is never accepted on a new journal — see ValidJournalType —
 	// and exists only so historical postings remain readable and identifiable
