@@ -379,7 +379,7 @@ func (h *Handler) RunAutomaticMatching(w http.ResponseWriter, r *http.Request) {
 				result.Reason = "banking connector integration not configured"
 				break
 			}
-			if err := h.verifyCanonicalMatch(r.Context(), l, c.TransactionID); err != nil {
+			if err := h.verifyCanonicalMatch(r.Context(), l, principalID, c.TransactionID); err != nil {
 				result.Reason = err.Error()
 				break
 			}

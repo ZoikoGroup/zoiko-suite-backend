@@ -40,8 +40,8 @@ service:
 
 The largest open risks are **A10/A11** (raw source and watermark absent),
 **A19/A21** (mapping version and normalization authority), **A1** (read
-authorization), and the cross-service BNK-05 principal/watermark mismatch in
-section C. None of those is a small local patch; they need a source-evidence
+authorization), and the cross-service BNK-05 watermark mismatch in section C
+(C1). The BNK-05 principal mismatch (C2) was closed on 2026-10-24. None of those is a small local patch; they need a source-evidence
 table, a versioned mapping registry, and a cross-service auth decision.
 
 Rough coverage after this pass: **BNK-02 ~65%, BNK-03 ~40%, BNK-04 ~55%.**
@@ -488,9 +488,9 @@ B7 against the current BNK-03 implementation. The `content_hash` it could
 read is caller-supplied, not a hash of source bytes, so it is not a
 substitute. **Do not treat BNK-05's watermark as integrated.**
 
-### C2. BNK-05's canonical-read client cannot satisfy this service's principal check
+### C2. Closed (2026-10-24) — BNK-05's canonical-read client did not satisfy this service's principal check
 
-`services/bank-reconciliation-svc/internal/banking/client.go` sends only
+**Finding (2026-10-22).** `services/bank-reconciliation-svc/internal/banking/client.go` sent only
 `X-Tenant-Id` to `GET /v1/banking/canonical-transactions/{id}`. This service's
 handler calls `requirePrincipal`, which requires `X-Principal-Id`, before
 looking up the transaction (`internal/handler/bnk0304_handler.go`, the
@@ -503,6 +503,50 @@ service's read guard. The fix is a cross-service decision: pass the
 originating principal through BNK-05's client, or introduce an explicit
 service-to-service identity that this service accepts. Do not remove the
 principal requirement just to make the call succeed.
+
+**Resolution.** The first option: BNK-05 now forwards the originating
+principal, which every one of its four canonical-verification entry points
+(`MatchStatementLine`, `ProposeMatch`, `ConfirmMatch`, `RunAutomaticMatching`)
+had already resolved through `requirePrincipal` before calling
+`verifyCanonicalMatch`. The defect was entirely on the client side; this
+service's handler and its principal requirement are unchanged.
+
+- `banking.Client.GetCanonicalTransaction` takes `principalID` as a required
+  argument and fails closed, without sending, when it is empty.
+- The client sends the §4 envelope with the vendored `envelope` header
+  constants, the same set `envelope.Resolver` sends on its own outbound call.
+  That set is tenant, principal, correlation id and request id (propagated
+  from the inbound envelope) and `X-Source-Channel: system`. Sending only the
+  principal would have fixed today's 401 but left the call refused with 400
+  `envelope_incomplete` once this service runs `ZS_ENVELOPE_ENFORCEMENT=strict`.
+  The cross-process run below confirmed this.
+- `ConfirmMatch` forwards the **checker's** principal, not the proposer's,
+  because the re-verification is a read made on the checker's behalf.
+
+Tests:
+
+- **This service:** `internal/store/canonical_read_contract_test.go`
+  (`TestCanonicalTransactionRead_CrossServiceContract`) runs the real handler,
+  the `cmd/server` middleware stack and a real Postgres row under RLS. It
+  asserts 401 with no principal, and 200 for exactly the reconciliation
+  client's header set under both `write-strict` and `strict`. It also asserts
+  that strict refuses a bare tenant+principal read with 400.
+- **bank-reconciliation-svc:** `internal/handler/canonical_principal_test.go`
+  covers all four entry points.
+- **Cross-process:** `internal/handler/connector_e2e_test.go` (integration
+  tag) drives the real BNK-05 handler and client against a running
+  banking-connector-svc binary. It failed before the fix (401 → 503
+  `banking_connector_unavailable`) and passes after.
+
+**Observed while verifying, not fixed (out of C2's scope).**
+
+- `GET /healthz` on this service answers 401, because `middleware.TenantContext`
+  runs before the health route and refuses a request with no `X-Tenant-Id`.
+  The envelope middleware exempts the probe paths, but the tenant middleware
+  does not, so an orchestrator liveness probe without a tenant header fails.
+- C4's treasury client still sends only `X-Tenant-Id`. That works today only
+  because `ListConnections` is unauthenticated (A1), and becomes this same
+  defect the moment read authz is added.
 
 ### C3. BNK-05 assumes mapping-version reproducibility and a re-performance signal
 
@@ -602,6 +646,28 @@ The integration harness’s original embedded-Postgres path was also exercised
 before the container run; both are disposable. No shared development
 database was used.
 
+### C2 fix verification (2026-10-24)
+
+- **Database:** a fresh disposable `postgres:16-alpine` container
+  (`c2-contract-pg`, `127.0.0.1:55433`). It held three databases:
+  `banking_test` for this suite, `recon_test` for bank-reconciliation-svc and
+  `connector_e2e` for the cross-process run. No shared development database
+  was used.
+- **Build and vet:** `go build ./...`, `go vet ./...` and
+  `go vet -tags=integration ./...` all pass.
+- **Test suites:** `go test -count=1 -p 1 ./...` and
+  `go test -tags=integration -count=1 -p 1 ./...` both pass with
+  `TEST_DATABASE_URL` set. The integration run had 79 passes and no skips.
+- **Migrations for the cross-process run:** applied file by file with
+  `psql --single-transaction -v ON_ERROR_STOP=1`.
+- **Connector binary:** connected as a `NOSUPERUSER NOBYPASSRLS` role and was
+  run twice, once in the default `write-strict` mode and once with
+  `ZS_ENVELOPE_ENFORCEMENT=strict`. bank-reconciliation-svc's
+  `TestCanonicalMatch_AgainstRealBankingConnector` passed against both.
+- **Negative control:** with the client's `X-Principal-Id` line removed, the
+  same test failed with `status 401: {"error":"X-Principal-Id header is
+  required"}` and the match returned 503.
+
 ## E. Priority for the next pass
 
 1. **P0 — BNK-03 source evidence.** Add a `BankStatementSource`-shaped table
@@ -611,10 +677,9 @@ database was used.
    `GetStatementRawReference`, `GetIngestionEvidence` and
    `GetImportWatermark`. This unblocks BNK-05 A12/B7 and the raw-evidence
    negative paths.
-2. **P0 — BNK-05 canonical access.** Decide the service identity and pass a
-   principal through BNK-05's `GetCanonicalTransaction` call, or add an
-   explicit service-auth path. Then add `mapping_version`/normalization
-   version lineage and a superseded event/re-performance signal.
+2. **P0 — BNK-05 canonical lineage.** The principal half is done (C2,
+   closed 2026-10-24). Remaining: add `mapping_version`/normalization
+   version lineage and a superseded event/re-performance signal (C3).
 3. **P0 — BNK-04 mapping registry.** Introduce immutable mapping versions or
    a `BankNormalizationVersion` row per canonical transaction; store the
    mapping id/version, parser/schema version and raw hash; make
@@ -635,6 +700,11 @@ database was used.
    canonical `QUARANTINED` state if the product wants the spec state exactly.
 
 ## F. Files changed in this pass
+
+C2 fix (2026-10-24): `internal/store/canonical_read_contract_test.go`
+(new) and this register. No production code in this service changed.
+
+Original survey (2026-10-22):
 
 - `internal/clients/bankaccount.go` — BNK-01 currency/entity fields and doc.
 - `internal/clients/bankaccount_test.go` — treasury response-shape regression

@@ -437,31 +437,6 @@ func (l *stubLedger) GetJournal(_ context.Context, _, _ string) (*ledger.Journal
 	return l.journal, l.err
 }
 
-// stubBanking is a no-op banking.Client that returns ErrTransactionNotFound by
-// default, so tests that don't care about canonical matching just get the
-// journal path. Assign txn/err to override.
-type stubBanking struct {
-	txn *bankingCanonical
-	err error
-}
-
-// bankingCanonical mirrors banking.CanonicalTransaction without importing it
-// (test package is external; we just need the interface).
-type bankingCanonical struct {
-	TransactionID string
-	TenantID      string
-	Amount        float64
-	Currency      string
-	Status        string
-}
-
-// GetCanonicalTransaction satisfies banking.Client.
-// We return nil / ErrTransactionNotFound by default so existing tests that
-// don't pass a transaction_id don't break.
-func (b *stubBanking) GetCanonicalTransaction(_ context.Context, _, _ string) (interface{}, error) {
-	return nil, nil // never called in existing tests
-}
-
 // stubClose is the Wave 13 test double for internal/close.Client — defaults
 // to "open" (nil error) so every pre-existing CertifyRun test, none of
 // which is about the closed-period check itself, keeps passing unchanged.

@@ -91,6 +91,72 @@ Migration 000014 is additive; its down migration drops only the two new
 columns. No existing row is rewritten except the backfill from its already-bound
 policy.
 
+## Cross-service fix: canonical reads now carry the principal (2026-10-24)
+
+This closes banking-connector-svc's `SPEC_DEVIATIONS.md` C2. The defect was
+in this service's client.
+
+- **The defect.** `banking.HTTPClient.GetCanonicalTransaction` sent only
+  `X-Tenant-Id` to banking-connector-svc's
+  `GET /v1/banking/canonical-transactions/{id}`. That handler requires
+  `X-Principal-Id` and answers 401 without it, and this client maps every
+  non-200 to `ErrUnavailable`.
+- **The impact.** Every canonical-transaction verification failed closed as
+  503 `banking_connector_unavailable`, or as an auto-match skip reason
+  "banking-connector-svc unavailable". It failed in any deployment where no
+  gateway injected the header on an internal call. Four entry points were
+  affected: `MatchStatementLine`, `ProposeMatch`, `ConfirmMatch` and
+  `RunAutomaticMatching`. Each had already resolved the principal before
+  calling `verifyCanonicalMatch`; it was simply never passed on.
+- **Why tests missed it.** No handler test reached the canonical path: every
+  test router passed `nil` for the banking client. The `stubBanking` double
+  didn't satisfy `banking.Client` and was never wired in. The client test
+  asserted only the tenant header.
+
+**What changed.**
+
+- `banking.Client.GetCanonicalTransaction(ctx, tenantID, principalID,
+  transactionID)`: the principal is a required argument. An empty tenant or
+  principal fails closed before any request is sent.
+- `verifyCanonicalMatch` takes the principal, and all four call sites pass
+  the one they resolved. `ConfirmMatch` passes the checker's own principal.
+- The client sets headers with the vendored `envelope` constants, matching
+  `envelope.Resolver`'s outbound call rather than introducing string
+  literals:
+  - `HeaderTenantID` and `HeaderActorSubjectID`;
+  - `HeaderCorrelationID` and `HeaderRequestID`, propagated from the inbound
+    envelope on the context;
+  - `HeaderSourceChannel = system`.
+- **Why the full envelope.** The connector in
+  `ZS_ENVELOPE_ENFORCEMENT=strict` refuses a read without correlation and
+  request ids, which a run against the real binary confirmed. This service's
+  own write-strict envelope policy already requires both on every match POST,
+  so they are always present to propagate in production.
+- The dead `stubBanking` double was removed from `handler_test.go`.
+
+**Tests.**
+
+- `internal/handler/canonical_principal_test.go` covers all four entry
+  points. It uses the real `banking.HTTPClient` against a server that refuses
+  a principal-less read the way the connector does. It asserts the forwarded
+  principal is the caller's own, and that correlation id propagates.
+  - Negative control: with the principal header line removed, all four
+    entry points and the correlation test fail (503, or the auto-match skip).
+- `internal/banking/client_test.go` asserts the principal and channel
+  headers, and `TestGetCanonicalTransaction_NoPrincipal_FailsClosedWithoutCalling`
+  covers the empty-principal case.
+- `internal/handler/connector_e2e_test.go` (integration tag; it runs only with
+  `BANKING_CONNECTOR_E2E_URL` and `BANKING_CONNECTOR_E2E_DATABASE_URL` set) is
+  the cross-process test. It seeds a canonical transaction into a real
+  banking-connector-svc database and drives this service's real handler and
+  client against the running connector binary. Results:
+  - Pre-fix client: fails with 401, and the match returns 503.
+  - Fixed client: passes against the connector in both `write-strict` and
+    `strict` mode.
+
+No migration. A1 (the one-sided book population) and the other A-items are
+unchanged by this fix.
+
 ## A. Not implemented / weaker than the spec
 
 - **A1. Reconciliation is one-sided: there is no book/ledger population and no
@@ -520,6 +586,22 @@ policy.
   certificate (B1), not that it differs from a generic control run.
 
 ## D. Verification
+
+**C2 cross-service fix (2026-10-24).**
+
+- Environment: a fresh disposable `postgres:16-alpine` container
+  (`c2-contract-pg`, `127.0.0.1:55433`, database `recon_test`), with
+  `TEST_DATABASE_URL` set.
+- `go build ./...`, `go vet ./...` and `go vet -tags=integration ./...` pass.
+- `go test -count=1 -p 1 ./...` and `go test -tags=integration -count=1 -p 1
+  ./...` pass: 119 passes and 1 skip.
+- The skip is `TestCanonicalMatch_AgainstRealBankingConnector`, which needs a
+  running connector. It was run separately against the real
+  banking-connector-svc binary on database `connector_e2e`, in both
+  enforcement modes; see banking-connector-svc's register, section D.
+
+**Original survey (2026-10-22).**
+
 
 - Before changes: `go test -count=1 ./...` passed.
 - After changes: `gofmt` applied; `go build ./...` passed;
