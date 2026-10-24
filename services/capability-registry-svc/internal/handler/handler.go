@@ -494,6 +494,10 @@ func (h *Handler) SetReleaseState(w http.ResponseWriter, r *http.Request) {
 		if finishOrReplay(w, err) {
 			return
 		}
+		if errors.Is(err, domain.ErrCapabilityNotFound) {
+			writeError(w, http.StatusNotFound, "capability not found")
+			return
+		}
 		h.logger.Error("set release state failed", zap.Error(err))
 		writeError(w, http.StatusInternalServerError, "failed to set release state")
 		return

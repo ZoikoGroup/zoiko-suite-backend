@@ -185,6 +185,9 @@ func (s *stubStore) UpdateIntegrationHealth(_ context.Context, id, status string
 
 func (s *stubStore) CreateRelease(_ context.Context, r *domain.Release, claim domain.IdempotencyClaim) error {
 	return s.withIdempotency(claim, func() error {
+		if _, ok := s.capabilities[r.CapabilityID]; !ok {
+			return domain.ErrCapabilityNotFound
+		}
 		s.releases[r.CapabilityID] = append(s.releases[r.CapabilityID], *r)
 		return nil
 	})
@@ -241,8 +244,9 @@ func (s *stubStore) GetCapabilityClaimByID(_ context.Context, id string) (*domai
 }
 
 // ResolveCapability mirrors pg_store.go's fail-closed logic exactly (2026-10-05
-// re-audit, Gap 1): an unrecognized release/market-release state, or an
-// integration health status that isn't one of the 4 defined values, must
+// re-audit, Gap 1, plus the GOV-11 legal-approval gate): an unrecognized
+// release/market-release state, an unapproved customer-facing market release,
+// or an integration health status that isn't one of the 4 defined values must
 // never be silently treated as the enabled/allowed path.
 func (s *stubStore) ResolveCapability(ctx context.Context, capabilityCode, marketCode string) (*domain.CapabilityResolution, error) {
 	cap, err := s.GetCapabilityByCode(ctx, capabilityCode)
@@ -270,9 +274,15 @@ func (s *stubStore) ResolveCapability(ctx context.Context, capabilityCode, marke
 		case domain.MarketReleaseRestricted, domain.MarketReleaseSuspended, domain.MarketReleaseRetired:
 			return &domain.CapabilityResolution{CapabilityCode: capabilityCode, Enabled: false, ReasonCode: "MARKET_BLOCKED"}, nil
 		case domain.MarketReleaseInternal, domain.MarketReleasePilot, domain.MarketReleaseBeta, domain.MarketReleaseGA:
-			// Recognized, non-blocking — fall through.
+			// Recognized, non-blocking — fall through to the legal check.
 		default:
 			return &domain.CapabilityResolution{CapabilityCode: capabilityCode, Enabled: false, ReasonCode: "MARKET_BLOCKED", Detail: "unrecognized market release state: " + string(m.State)}, nil
+		}
+		if m.State != domain.MarketReleaseInternal && m.LegalApprovalStatus != string(domain.LegalApprovalApproved) {
+			return &domain.CapabilityResolution{
+				CapabilityCode: capabilityCode, Enabled: false, ReasonCode: "MARKET_BLOCKED",
+				Detail: "legal approval status " + strconv.Quote(m.LegalApprovalStatus) + " for " + marketCode,
+			}, nil
 		}
 	}
 	for _, integ := range s.integrations[cap.CapabilityID] {
@@ -610,6 +620,67 @@ func TestCreateMarketRelease_LegalApprovalStatusValidation(t *testing.T) {
 				t.Fatalf("expected 400 for missing/invalid legal_approval_status %q, got %d: %s", value, w.Code, w.Body.String())
 			}
 		})
+	}
+}
+
+func TestSetReleaseState_InvalidCapabilityID_Returns404(t *testing.T) {
+	h := newTestHandler()
+	r := newTestRouter(h)
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, buildRequest(http.MethodPost, "/v1/capabilities/does-not-exist/release-state", domain.SetReleaseStateRequest{
+		State: "GA",
+	}))
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for nonexistent capability_id, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestResolveCapability_UnapprovedMarketReleaseFailsClosed(t *testing.T) {
+	for _, legalStatus := range []string{"PENDING", "REJECTED"} {
+		t.Run(legalStatus, func(t *testing.T) {
+			h := newTestHandler()
+			r := newTestRouter(h)
+			cap := createTestCapability(t, r, "LEGAL_GATE_"+legalStatus)
+
+			wMarket := httptest.NewRecorder()
+			r.ServeHTTP(wMarket, buildRequest(http.MethodPost, "/v1/capabilities/"+cap.CapabilityID+"/market-releases", domain.CreateMarketReleaseRequest{
+				MarketCode: "US", LegalApprovalStatus: legalStatus, State: "GA", EffectiveFrom: "2026-01-01T00:00:00Z",
+			}))
+			if wMarket.Code != http.StatusCreated {
+				t.Fatalf("expected 201 creating a %s market release, got %d: %s", legalStatus, wMarket.Code, wMarket.Body.String())
+			}
+
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, buildRequest(http.MethodGet, "/v1/capability-resolution/"+cap.CapabilityCode+"?market_code=US", nil))
+			var resolved domain.CapabilityResolution
+			_ = json.NewDecoder(w.Body).Decode(&resolved)
+			if resolved.Enabled || resolved.ReasonCode != "MARKET_BLOCKED" {
+				t.Fatalf("expected unapproved market release to fail closed, got %+v", resolved)
+			}
+		})
+	}
+}
+
+func TestResolveCapability_ApprovedMarketReleaseEnabled(t *testing.T) {
+	h := newTestHandler()
+	r := newTestRouter(h)
+	cap := createTestCapability(t, r, "LEGAL_GATE_APPROVED")
+
+	wMarket := httptest.NewRecorder()
+	r.ServeHTTP(wMarket, buildRequest(http.MethodPost, "/v1/capabilities/"+cap.CapabilityID+"/market-releases", domain.CreateMarketReleaseRequest{
+		MarketCode: "US", LegalApprovalStatus: "APPROVED", State: "GA", EffectiveFrom: "2026-01-01T00:00:00Z",
+	}))
+	if wMarket.Code != http.StatusCreated {
+		t.Fatalf("expected 201 creating an approved market release, got %d: %s", wMarket.Code, wMarket.Body.String())
+	}
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, buildRequest(http.MethodGet, "/v1/capability-resolution/"+cap.CapabilityCode+"?market_code=US", nil))
+	var resolved domain.CapabilityResolution
+	_ = json.NewDecoder(w.Body).Decode(&resolved)
+	if !resolved.Enabled || resolved.ReasonCode != "ENABLED" {
+		t.Fatalf("expected approved market release to remain enabled, got %+v", resolved)
 	}
 }
 

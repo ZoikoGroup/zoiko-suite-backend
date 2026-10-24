@@ -259,7 +259,10 @@ func (s *PgStore) GetMarketReleaseByID(ctx context.Context, marketReleaseID stri
 }
 
 // GetActiveMarketRelease returns the market release currently in effect for
-// (capabilityID, marketCode), most-recently-created first.
+// (capabilityID, marketCode), most-recently-created first. The created_at and
+// market_release_id tie-breakers make the choice deterministic when two
+// releases share an effective_from (the registry allows overlapping rows and
+// applies no uniqueness constraint).
 func (s *PgStore) GetActiveMarketRelease(ctx context.Context, capabilityID, marketCode string) (*domain.MarketRelease, error) {
 	now := time.Now().UTC()
 	var m domain.MarketRelease
@@ -271,7 +274,7 @@ func (s *PgStore) GetActiveMarketRelease(ctx context.Context, capabilityID, mark
 		FROM market_releases
 		WHERE capability_id = $1 AND market_code = $2
 		  AND effective_from <= $3 AND (effective_to IS NULL OR effective_to > $3)
-		ORDER BY effective_from DESC
+		ORDER BY effective_from DESC, created_at DESC, market_release_id DESC
 		LIMIT 1
 	`, capabilityID, marketCode, now).Scan(
 		&m.MarketReleaseID, &m.CapabilityID, &m.MarketCode, &m.LanguageCode,
@@ -392,6 +395,9 @@ func (s *PgStore) CreateRelease(ctx context.Context, r *domain.Release, claim do
 			r.CreatedAt, r.CreatedByPrincipalID,
 		)
 		if err != nil {
+			if isForeignKeyViolation(err) || isInvalidTextRepresentation(err) {
+				return fmt.Errorf("%w: capability_id %s", domain.ErrCapabilityNotFound, r.CapabilityID)
+			}
 			return fmt.Errorf("insert release: %w", err)
 		}
 		return insertOutboxEvent(ctx, tx, claim)
@@ -421,7 +427,9 @@ func (s *PgStore) GetReleaseByID(ctx context.Context, releaseID string) (*domain
 
 // GetCurrentRelease returns the most recent release row for capabilityID —
 // releases are append-only (see migration comment), so "current" means
-// latest by effective_from, not the result of any UPDATE.
+// latest by effective_from, not the result of any UPDATE. When two rows share
+// an effective_from, created_at and release_id break the tie deterministically
+// so resolution cannot flip between requests.
 func (s *PgStore) GetCurrentRelease(ctx context.Context, capabilityID string) (*domain.Release, error) {
 	var r domain.Release
 	var state string
@@ -429,7 +437,7 @@ func (s *PgStore) GetCurrentRelease(ctx context.Context, capabilityID string) (*
 		SELECT release_id, capability_id, state, reason, effective_from,
 		       created_at, created_by_principal_id
 		FROM releases WHERE capability_id = $1
-		ORDER BY effective_from DESC LIMIT 1
+		ORDER BY effective_from DESC, created_at DESC, release_id DESC LIMIT 1
 	`, capabilityID).Scan(
 		&r.ReleaseID, &r.CapabilityID, &state, &r.Reason, &r.EffectiveFrom,
 		&r.CreatedAt, &r.CreatedByPrincipalID,
@@ -562,10 +570,23 @@ func (s *PgStore) ResolveCapability(ctx context.Context, capabilityCode, marketC
 		case domain.MarketReleaseRestricted, domain.MarketReleaseSuspended, domain.MarketReleaseRetired:
 			return &domain.CapabilityResolution{CapabilityCode: capabilityCode, Enabled: false, ReasonCode: "MARKET_BLOCKED", Detail: string(marketRelease.State)}, nil
 		case domain.MarketReleaseInternal, domain.MarketReleasePilot, domain.MarketReleaseBeta, domain.MarketReleaseGA:
-			// Recognized, non-blocking states — fall through to the next dimension.
+			// Recognized, non-blocking states — fall through to the legal check.
 		default:
 			// Same fail-closed defense as the release-state switch above.
 			return &domain.CapabilityResolution{CapabilityCode: capabilityCode, Enabled: false, ReasonCode: "MARKET_BLOCKED", Detail: "unrecognized market release state: " + string(marketRelease.State)}, nil
+		}
+		// GOV-11: feature exposure "cannot ... activate unapproved contracts".
+		// A customer-facing market release whose legal approval is PENDING or
+		// REJECTED is not an approved contract, even when its state is GA/PILOT/
+		// BETA. INTERNAL is exempt because it is not a market activation.
+		// Anything other than APPROVED (including an empty legacy value) fails
+		// closed.
+		if marketRelease.State != domain.MarketReleaseInternal &&
+			marketRelease.LegalApprovalStatus != string(domain.LegalApprovalApproved) {
+			return &domain.CapabilityResolution{
+				CapabilityCode: capabilityCode, Enabled: false, ReasonCode: "MARKET_BLOCKED",
+				Detail: fmt.Sprintf("legal approval status %q for %s", marketRelease.LegalApprovalStatus, marketCode),
+			}, nil
 		}
 	}
 
