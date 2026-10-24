@@ -90,8 +90,9 @@ func newKEnv(t *testing.T) *kenv {
 	r.Use(svcmiddleware.TenantContext())
 	r.Use(svcenvelope.MiddlewareWithMode(svcenvelope.ServicePolicy(), svcenvelope.ModeObserve, nil))
 	handler.RegisterKernelRoutes(r, handler.NewKernel(e.svc, e.repo, e.repo, fakeUnits{"JPY": 0}, nil, fakeAuthz{e}, zap.NewNop()).
-		WithPeriodGate(handler.ClosePeriodGate{Close: e.periods, Authz: fakeAuthz{e}}))
-	handler.RegisterRoutes(r, handler.New(e.pg, nopPublisher{}, fakeAuthz{e}, e.periods, zap.NewNop()).
+		WithPeriodGate(handler.ClosePeriodGate{Close: e.periods, Authz: fakeAuthz{e}}).
+		WithSigner(kernel.HMACSigner{Key: []byte("test-signing-key-test-signing-key!!"), KeyID: "test-k1"}))
+	handler.RegisterRoutes(r, handler.New(e.pg, nopPublisher{}, fakeAuthz{e}, e.periods, kenvLogger()).
 		WithJournalControls(e.pg, handler.ManualJournalPolicy{EvidenceThresholdCents: 1000000}))
 	e.ts = httptest.NewServer(r)
 	t.Cleanup(e.ts.Close)

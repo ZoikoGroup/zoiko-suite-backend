@@ -354,7 +354,7 @@ func (s *Service) ReturnToDraft(ctx context.Context, tenant string, a Actor, id 
 type Resolver interface {
 	Directory
 	// FXBasis returns the rate basis for converting from a currency into the book's functional currency, or nil.
-	FXBasis(ctx context.Context, from, to string, asOf time.Time) (*FXBasis, error)
+	FXBasis(ctx context.Context, policyID, from, to string, asOf time.Time) (*FXBasis, error)
 }
 
 // EvaluateRequest names an event and the book whose consequence is wanted.
@@ -408,10 +408,19 @@ func (s *Service) Evaluate(ctx context.Context, tenant string, req EvaluateReque
 		}
 		return nil, exc(FamRule, "AMBIGUOUS_RULE", "%d active rule sets claim this event on %s", len(sets), pd.Format("2006-01-02")).with("candidates", ids)
 	}
+	if req.FX != nil && res != nil {
+		// Where a rate source is configured, a caller does not bring its own rate: that is what the override workflow is for.
+		if enf, ok := res.(interface{ RejectSuppliedFX() bool }); ok && enf.RejectSuppliedFX() {
+			return nil, exc(FamFX, "RATE_OVERRIDE_NOT_ALLOWED", "an exchange rate comes from the rate store; a hand-keyed rate goes through the override workflow, which needs a reason and a second person")
+		}
+	}
 	fx := req.FX
 	if fx == nil && bk.FunctionalCurrency != ev.TransactionCurrency && ev.TransactionCurrency != "" && res != nil {
 		var ferr error
-		if fx, ferr = res.FXBasis(ctx, ev.TransactionCurrency, bk.FunctionalCurrency, pd); ferr != nil {
+		if fx, ferr = res.FXBasis(ctx, sets[0].Content.FXPolicyID, ev.TransactionCurrency, bk.FunctionalCurrency, pd); ferr != nil {
+			if e, isExc := AsException(ferr); isExc {
+				return nil, e
+			}
 			return nil, exc(FamFX, "RATE_UNAVAILABLE", "no exchange rate could be resolved: %v", ferr)
 		}
 	}

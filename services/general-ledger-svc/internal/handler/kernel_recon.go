@@ -342,6 +342,10 @@ func (h *KernelHandler) ListRulePacks(w http.ResponseWriter, r *http.Request) {
 			for _, l := range ru.Content.LineTemplates {
 				keys[l.Account.MappingKey] = true
 			}
+			if ru.Content.RealizedFX != nil {
+				keys[ru.Content.RealizedFX.Gain.MappingKey] = true
+				keys[ru.Content.RealizedFX.Loss.MappingKey] = true
+			}
 		}
 		pv := packView{Name: p.Name, Description: p.Description, EventTypes: p.PackEventTypes(), MappingKeys: []string{}}
 		for k := range keys {

@@ -68,6 +68,11 @@ type Config struct {
 	// (MANUAL_JOURNAL_EVIDENCE_TYPES, e.g. "OPENING,CLOSING") are the journal types that always need evidence.
 	ManualJournalEvidenceThreshold string
 	ManualJournalEvidenceTypes     string
+	// SnapshotSigningKey (SNAPSHOT_SIGNING_KEY, at least 32 characters) signs retained balance snapshots; SnapshotSigningKeyID
+	// (SNAPSHOT_SIGNING_KEY_ID, default "k1") names it so a later rotation can still verify older snapshots. Without a key the
+	// snapshot command refuses.
+	SnapshotSigningKey   string
+	SnapshotSigningKeyID string
 	// PeriodGateShadowTimeout bounds each shadow resolve call.
 	PeriodGateShadowTimeout time.Duration
 }
@@ -148,6 +153,8 @@ func Load() (*Config, error) {
 		CurrencyRegistryURL:            env("CURRENCY_REGISTRY_URL", "http://currency-registry-svc:8172"),
 		ManualJournalEvidenceThreshold: env("MANUAL_JOURNAL_EVIDENCE_THRESHOLD", ""),
 		ManualJournalEvidenceTypes:     env("MANUAL_JOURNAL_EVIDENCE_TYPES", ""),
+		SnapshotSigningKey:             env("SNAPSHOT_SIGNING_KEY", ""),
+		SnapshotSigningKeyID:           env("SNAPSHOT_SIGNING_KEY_ID", "k1"),
 		PeriodGateShadowTimeout:        timeout,
 	}, nil
 }

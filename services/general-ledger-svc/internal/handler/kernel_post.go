@@ -67,7 +67,7 @@ func (h *KernelHandler) PostEvent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "period_gate_not_configured", "")
 		return
 	}
-	dir := kernel.TenantDirectory{Tenant: tenant, Ref: h.ref, Units: h.units, FX: h.fx}
+	dir := kernel.TenantDirectory{Tenant: tenant, Ref: h.ref, Units: h.units, FX: h.fxSource(tenant)}
 	res, err := h.svc.PostEvent(r.Context(), tenant, a, req, dir, h.gate)
 	if err != nil {
 		h.fail(w, err)

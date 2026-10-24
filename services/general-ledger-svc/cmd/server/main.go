@@ -240,8 +240,17 @@ func main() {
 	// Global Accounting Kernel (Wave 0): books, accounting events, posting rule sets, dry-run evaluation, dimensions.
 	kernelRepo := store.NewKernelRepo(pool, cfg.EventResidencyRegion)
 	kernelSvc := &kernel.Service{Repo: kernelRepo}
-	handler.RegisterKernelRoutes(r, handler.NewKernel(kernelSvc, kernelRepo, kernelRepo, currency.New(cfg.CurrencyRegistryURL), nil, authzClient, log).
-		WithPeriodGate(handler.ClosePeriodGate{Close: closeClient, Authz: authzClient}))
+	kernelH := handler.NewKernel(kernelSvc, kernelRepo, kernelRepo, currency.New(cfg.CurrencyRegistryURL), nil, authzClient, log).
+		WithPeriodGate(handler.ClosePeriodGate{Close: closeClient, Authz: authzClient})
+	if cfg.SnapshotSigningKey != "" {
+		if len(cfg.SnapshotSigningKey) < 32 {
+			log.Fatal("SNAPSHOT_SIGNING_KEY must be at least 32 characters")
+		}
+		kernelH.WithSigner(kernel.HMACSigner{Key: []byte(cfg.SnapshotSigningKey), KeyID: cfg.SnapshotSigningKeyID})
+	} else {
+		log.Warn("SNAPSHOT_SIGNING_KEY is not set: balance snapshots cannot be signed until it is")
+	}
+	handler.RegisterKernelRoutes(r, kernelH)
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────
 	healthH := health.New(pool, log)

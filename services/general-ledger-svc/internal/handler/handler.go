@@ -1603,8 +1603,13 @@ func (h *Handler) ReverseJournal(w http.ResponseWriter, r *http.Request) {
 		}
 		reversalPostingDate = req.PostingDate
 	}
+	// A reversal the caller dates explicitly belongs to the period that date falls in; without a date it stays in the original's.
+	reversalPeriod := header.FiscalPeriod
+	if !req.PostingDate.IsZero() {
+		reversalPeriod = reversalPostingDate.Format("2006-01")
+	}
 	if err := h.closeClient.CheckPeriodOpenAt(r.Context(), header.TenantID, close.PeriodRef{
-		LegalEntityID: header.LegalEntityID, PeriodName: header.FiscalPeriod,
+		LegalEntityID: header.LegalEntityID, PeriodName: reversalPeriod,
 		PostingDate: reversalPostingDate, JournalID: header.JournalID,
 	}); err != nil {
 		h.writePeriodErr(w, err)
@@ -1626,7 +1631,7 @@ func (h *Handler) ReverseJournal(w http.ResponseWriter, r *http.Request) {
 		JournalID:               uuid.NewString(),
 		TenantID:                header.TenantID,
 		LegalEntityID:           header.LegalEntityID,
-		FiscalPeriod:            header.FiscalPeriod,
+		FiscalPeriod:            reversalPeriod,
 		Status:                  domain.JournalStatusFinalized,
 		ReversalOfJournalID:     &reversalID,
 		Description:             "Reversal of " + journalID + ": " + req.Reason,
@@ -1685,6 +1690,10 @@ func (h *Handler) ReverseJournal(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, domain.ErrInvalidTransition) {
 			writeError(w, http.StatusUnprocessableEntity, "only_finalized_reversible",
 				domain.ErrOnlyFinalizedReversible.Error())
+			return
+		}
+		if errors.Is(err, domain.ErrPeriodLocked) {
+			writeError(w, http.StatusPreconditionFailed, "period_locked", err.Error())
 			return
 		}
 		h.log.Error("ReverseJournal: failed to post reversing journal", zap.Error(err))
@@ -3374,6 +3383,8 @@ func (h *Handler) handleTransitionErr(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, domain.ErrInvalidTransition):
 		writeError(w, http.StatusUnprocessableEntity, "invalid_transition", domain.ErrInvalidTransition.Error())
+	case errors.Is(err, domain.ErrPeriodLocked):
+		writeError(w, http.StatusPreconditionFailed, "period_locked", err.Error())
 	default:
 		h.log.Error("TransitionJournal: store unavailable", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")

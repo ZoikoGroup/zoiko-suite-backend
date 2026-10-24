@@ -420,7 +420,16 @@ func TestKernelPostingForeignCurrencyKeepsTheOriginalBasis(t *testing.T) {
 	if st, b := e.post(ev, book, nil); st != 422 || b["family"] != "AK-FX" {
 		t.Fatalf("no rate, no posting: %d %v", st, b)
 	}
-	st, res := e.post(ev, book, map[string]any{"fx_basis": map[string]any{"rate": "0.8", "rate_type": "SPOT", "source": "treasury", "as_of": "2026-03-10", "rate_id": "fx-1"}})
+	// a caller does not bring its own rate where the kernel has a rate store
+	if st, b := e.post(ev, book, map[string]any{"fx_basis": map[string]any{"rate": "0.8", "rate_type": "SPOT", "source": "treasury", "as_of": "2026-03-10"}}); st != 422 || b["code"] != "RATE_OVERRIDE_NOT_ALLOWED" {
+		t.Fatalf("%d %v", st, b)
+	}
+	st, rate := e.call("POST", "/v1/fx-rates", e.tenant, "treasury-feed", map[string]any{"base_currency": "USD", "quote_currency": "GBP", "rate": "0.8", "rate_type": "SPOT",
+		"effective_at": "2026-03-10T08:00:00Z", "source": "treasury", "source_rate_id": "usdgbp-0310"})
+	if st != 201 {
+		t.Fatalf("%d %v", st, rate)
+	}
+	st, res := e.post(ev, book, nil)
 	if st != 201 {
 		t.Fatalf("%d %v", st, res)
 	}
@@ -428,7 +437,7 @@ func TestKernelPostingForeignCurrencyKeepsTheOriginalBasis(t *testing.T) {
 	l := func(col string) string {
 		return e.scalar(t, `SELECT `+col+`::text FROM journal_lines WHERE journal_id=$1::uuid AND posting_rule_line_ref='L1'`, jid)
 	}
-	if l("debit_amount") != "96.00" || l("transaction_amount") != "120.00000000" || l("transaction_currency") != "USD" || l("exchange_rate") != "0.800000000000" || l("rate_ref") != "fx-1" {
+	if l("debit_amount") != "96.00" || l("transaction_amount") != "120.00000000" || l("transaction_currency") != "USD" || l("exchange_rate") != "0.800000000000" || l("rate_ref") != rate["fx_rate_id"] {
 		t.Fatalf("%s %s %s %s %s", l("debit_amount"), l("transaction_amount"), l("transaction_currency"), l("exchange_rate"), l("rate_ref"))
 	}
 	if e.scalar(t, `SELECT currency_code FROM journal_headers WHERE journal_id=$1::uuid`, jid) != "GBP" {

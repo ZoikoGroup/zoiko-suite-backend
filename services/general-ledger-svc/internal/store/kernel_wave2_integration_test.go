@@ -22,14 +22,16 @@ func w2Setup(t *testing.T) *w2 {
 	t.Helper()
 	e := newKEnv(t)
 	accounts := [][3]string{{"1000", "ASSET", "BANK"}, {"1050", "ASSET", "CLEARING"}, {"1100", "ASSET", "AR"}, {"1300", "ASSET", ""}, {"2000", "LIABILITY", "AP"}, {"2050", "LIABILITY", "CLEARING"},
-		{"2150", "LIABILITY", "CLEARING"}, {"2200", "LIABILITY", ""}, {"4000", "REVENUE", ""}, {"4100", "REVENUE", ""}, {"6000", "EXPENSE", ""}, {"6900", "EXPENSE", ""}, {"6950", "EXPENSE", ""}, {"6960", "EXPENSE", ""}}
+		{"2150", "LIABILITY", "CLEARING"}, {"2200", "LIABILITY", ""}, {"4000", "REVENUE", ""}, {"4100", "REVENUE", ""}, {"6000", "EXPENSE", ""}, {"6900", "EXPENSE", ""}, {"6950", "EXPENSE", ""}, {"6960", "EXPENSE", ""},
+		{"7100", "REVENUE", ""}, {"7200", "EXPENSE", ""}, {"7300", "REVENUE", ""}, {"7400", "EXPENSE", ""}}
 	for _, a := range accounts {
 		if err := e.exec(`INSERT INTO chart_of_accounts (account_id, tenant_id, account_code, account_name, account_type, created_by_principal_id) VALUES ($1,$2,$3,$4,$5,'seed')`, uuid.NewString(), e.tenant, a[0], a[0]+" account", a[1]); err != nil {
 			t.Fatal(err)
 		}
 	}
 	keys := map[string]string{"AR_CONTROL": "1100", "REVENUE": "4000", "OUTPUT_TAX": "2200", "BANK": "1000", "UNAPPLIED_CASH": "2150", "BAD_DEBT": "6900", "SALES_RETURNS": "4100", "PROCESSOR_CLEARING": "1050",
-		"PROCESSOR_FEES": "6950", "AP_CONTROL": "2000", "EXPENSE": "6000", "INPUT_TAX": "1300", "PAYMENT_CLEARING": "2050", "BANK_FEES": "6960"}
+		"PROCESSOR_FEES": "6950", "AP_CONTROL": "2000", "EXPENSE": "6000", "INPUT_TAX": "1300", "PAYMENT_CLEARING": "2050", "BANK_FEES": "6960",
+		"FX_REALIZED_GAIN": "7100", "FX_REALIZED_LOSS": "7200", "FX_UNREALIZED_GAIN": "7300", "FX_UNREALIZED_LOSS": "7400"}
 	for k, c := range keys {
 		if err := e.exec(`INSERT INTO account_mappings (account_mapping_id, tenant_id, mapping_key, account_code, effective_from, created_by_principal_id) VALUES ($1,$2,$3,$4,'2026-01-01','seed')`, uuid.NewString(), e.tenant, k, c); err != nil {
 			t.Fatal(err)

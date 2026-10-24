@@ -46,7 +46,7 @@ func content(tax []string, conds []Condition, lines ...LineTemplate) RuleContent
 // packAccounts are the account codes the golden cases resolve each mapping key to.
 var packAccounts = map[string]string{
 	"AR_CONTROL": "1100", "REVENUE": "4000", "OUTPUT_TAX": "2200", "BANK": "1000", "UNAPPLIED_CASH": "2150", "BAD_DEBT": "6900", "SALES_RETURNS": "4100",
-	"PROCESSOR_CLEARING": "1050", "PROCESSOR_FEES": "6950", "AP_CONTROL": "2000", "EXPENSE": "6000", "INPUT_TAX": "1300", "PAYMENT_CLEARING": "2050", "BANK_FEES": "6960",
+	"PROCESSOR_CLEARING": "1050", "PROCESSOR_FEES": "6950", "AP_CONTROL": "2000", "EXPENSE": "6000", "INPUT_TAX": "1300", "PAYMENT_CLEARING": "2050", "BANK_FEES": "6960", "FX_REALIZED_GAIN": "7100", "FX_REALIZED_LOSS": "7200",
 }
 
 var packControls = map[string]string{"1100": "AR", "2000": "AP", "1000": "BANK", "2150": "CLEARING", "1050": "CLEARING", "2050": "CLEARING"}
@@ -61,8 +61,33 @@ func refused(name, event, cp string, facts map[string]string, family string) Tes
 		Accounts: packAccounts, Controls: packControls, Expect: TestExpectation{Exception: family}}
 }
 
-func dr(code, amount string) ExpectedLine { return ExpectedLine{Side: Debit, AccountCode: code, Amount: amount} }
-func cr(code, amount string) ExpectedLine { return ExpectedLine{Side: Credit, AccountCode: code, Amount: amount} }
+func dr(code, amount string) ExpectedLine {
+	return ExpectedLine{Side: Debit, AccountCode: code, Amount: amount}
+}
+func cr(code, amount string) ExpectedLine {
+	return ExpectedLine{Side: Credit, AccountCode: code, Amount: amount}
+}
+
+// drf and crf also state the functional-currency amount, for the cases that are about the rate.
+func drf(code, amount, functional string) ExpectedLine {
+	return ExpectedLine{Side: Debit, AccountCode: code, Amount: amount, Functional: functional}
+}
+func crf(code, amount, functional string) ExpectedLine {
+	return ExpectedLine{Side: Credit, AccountCode: code, Amount: amount, Functional: functional}
+}
+
+// settledAt is a USD event in a GBP book at a settlement rate, for the realized-exchange cases.
+func settledAt(name, event, cp string, facts map[string]string, rate string, want ...ExpectedLine) TestCase {
+	return TestCase{Name: name, Event: TestEvent{EventType: event, TransactionCurrency: "USD", Facts: facts, CounterpartyID: cp}, Accounts: packAccounts, Controls: packControls,
+		Functional: "GBP", FX: &FXBasis{Rate: rate, RateType: "SPOT", Source: "golden", AsOf: "2026-03-10"}, Expect: TestExpectation{Lines: want}}
+}
+
+var realizedFX = &RealizedFX{Gain: AccountRef{MappingKey: "FX_REALIZED_GAIN"}, Loss: AccountRef{MappingKey: "FX_REALIZED_LOSS"}}
+
+func withRealizedFX(c RuleContent) RuleContent {
+	c.RealizedFX = realizedFX
+	return c
+}
 
 type f = map[string]string
 
@@ -104,6 +129,19 @@ func Packs() []RulePack {
 					Content: content(nil, []Condition{{Fact: "allocation_ref", Op: "exists"}}, line("L1", Debit, "UNAPPLIED_CASH", "amount"), line("L2", Credit, "AR_CONTROL", "amount")),
 					TestPack: []TestCase{
 						golden("allocation clears the unapplied cash", "AR.CASH_ALLOCATED", "CUST-1", f{"amount": "75.50", "allocation_ref": "ALLOC-2"}, dr("2150", "75.50"), cr("1100", "75.50")),
+					}},
+				{Name: "ar-cash-received-fx", Domain: "AR", EventType: "AR.CASH_RECEIVED_FX",
+					Content: withRealizedFX(RuleContent{Conditions: []Condition{{Fact: "allocation_ref", Op: "exists"}, {Fact: "carrying_functional", Op: "exists"}}, RoundingPolicyID: "HALF_EVEN",
+						LineTemplates: []LineTemplate{line("L1", Debit, "BANK", "amount"), {LineRef: "L2", Side: Credit, Account: AccountRef{MappingKey: "AR_CONTROL"}, Amount: "amount", Functional: "carrying_functional"}}}),
+					TestPack: []TestCase{
+						settledAt("settled at a better rate than recognised: a realized gain", "AR.CASH_RECEIVED_FX", "CUST-1", f{"amount": "100.00", "allocation_ref": "A-1", "carrying_functional": "80.00"}, "0.85",
+							drf("1000", "100.00", "85.00"), crf("1100", "100.00", "80.00"), crf("7100", "0.00", "5.00")),
+						settledAt("settled at a worse rate: a realized loss", "AR.CASH_RECEIVED_FX", "CUST-1", f{"amount": "100.00", "allocation_ref": "A-2", "carrying_functional": "90.00"}, "0.85",
+							drf("1000", "100.00", "85.00"), crf("1100", "100.00", "90.00"), drf("7200", "0.00", "5.00")),
+						settledAt("settled at the carrying amount: no exchange difference", "AR.CASH_RECEIVED_FX", "CUST-1", f{"amount": "100.00", "allocation_ref": "A-3", "carrying_functional": "85.00"}, "0.85",
+							drf("1000", "100.00", "85.00"), crf("1100", "100.00", "85.00")),
+						{Name: "the carrying amount comes from the subledger and is required", Event: TestEvent{EventType: "AR.CASH_RECEIVED_FX", TransactionCurrency: "USD", Facts: f{"amount": "100.00", "allocation_ref": "A-4"}, CounterpartyID: "CUST-1"},
+							Accounts: packAccounts, Controls: packControls, Functional: "GBP", FX: &FXBasis{Rate: "0.85", RateType: "SPOT", Source: "golden", AsOf: "2026-03-10"}, Expect: TestExpectation{Exception: FamRule}},
 					}},
 				{Name: "ar-write-off", Domain: "AR", EventType: "AR.WRITE_OFF",
 					Content: content(taxFacts, []Condition{{Fact: "reason_code", Op: "exists"}, {Fact: "authority_ref", Op: "exists"}}, line("L1", Debit, "BAD_DEBT", "net"), line("L2", Debit, "OUTPUT_TAX", "tax", gt0("tax")), line("L3", Credit, "AR_CONTROL", "gross")),
@@ -160,6 +198,15 @@ func Packs() []RulePack {
 					Content: content(nil, nil, line("L1", Debit, "PAYMENT_CLEARING", "amount"), line("L2", Credit, "BANK", "amount")),
 					TestPack: []TestCase{
 						golden("settlement credits the bank only now", "AP.PAYMENT_SETTLED", "SUP-1", f{"amount": "120.00"}, dr("2050", "120.00"), cr("1000", "120.00")),
+					}},
+				{Name: "ap-payment-settled-fx", Domain: "AP", EventType: "AP.PAYMENT_SETTLED_FX",
+					Content: withRealizedFX(RuleContent{Conditions: []Condition{{Fact: "carrying_functional", Op: "exists"}}, RoundingPolicyID: "HALF_EVEN",
+						LineTemplates: []LineTemplate{{LineRef: "L1", Side: Debit, Account: AccountRef{MappingKey: "PAYMENT_CLEARING"}, Amount: "amount", Functional: "carrying_functional"}, line("L2", Credit, "BANK", "amount")}}),
+					TestPack: []TestCase{
+						settledAt("a supplier payment settled at a worse rate: a realized loss", "AP.PAYMENT_SETTLED_FX", "SUP-1", f{"amount": "100.00", "carrying_functional": "80.00"}, "0.85",
+							drf("2050", "100.00", "80.00"), crf("1000", "100.00", "85.00"), drf("7200", "0.00", "5.00")),
+						settledAt("settled at a better rate: a realized gain", "AP.PAYMENT_SETTLED_FX", "SUP-1", f{"amount": "100.00", "carrying_functional": "90.00"}, "0.85",
+							drf("2050", "100.00", "90.00"), crf("1000", "100.00", "85.00"), crf("7100", "0.00", "5.00")),
 					}},
 				{Name: "ap-payment-rejected", Domain: "AP", EventType: "AP.PAYMENT_REJECTED",
 					Content: content(nil, nil, line("L1", Debit, "PAYMENT_CLEARING", "amount"), line("L2", Credit, "AP_CONTROL", "amount")),

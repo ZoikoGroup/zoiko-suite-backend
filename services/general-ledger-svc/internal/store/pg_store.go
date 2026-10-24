@@ -462,6 +462,9 @@ func (s *PgStore) ReverseJournal(
 		if !created {
 			return nil
 		}
+		if err := assertPeriodOpen(ctx, tx, tenantID, reversing.LegalEntityID, reversing.FiscalPeriod); err != nil {
+			return err
+		}
 
 		// A reversal of a kernel posting is itself an execution: it records who reversed what, why and under which
 		// rule version the original was posted (standard §11, §31.1).
@@ -693,13 +696,13 @@ func (s *PgStore) TransitionJournal(ctx context.Context, tenantID, journalID str
 		UPDATE journal_headers
 		SET status = $1, %s = $2, %s = $3
 		WHERE journal_id = $4 AND status = $5 AND tenant_id = $6
-		RETURNING legal_entity_id::text, correlation_id
+		RETURNING legal_entity_id::text, correlation_id, fiscal_period
 	`, actorColumn, timeColumn)
 
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		var legalEntityID, correlationID string
+		var legalEntityID, correlationID, fiscalPeriod string
 		err := tx.QueryRow(ctx, query, string(toStatus), actorPrincipalID, time.Now().UTC(), journalID, string(fromStatus), tenantID).
-			Scan(&legalEntityID, &correlationID)
+			Scan(&legalEntityID, &correlationID, &fiscalPeriod)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return domain.ErrInvalidTransition
@@ -720,6 +723,9 @@ func (s *PgStore) TransitionJournal(ctx context.Context, tenantID, journalID str
 			// flip — never a second call a future call site could forget,
 			// the same bug class already hit twice this session with
 			// MarkJournalPosted. See migration 000011's doc comment.
+			if err := assertPeriodOpen(ctx, tx, tenantID, legalEntityID, fiscalPeriod); err != nil {
+				return err
+			}
 			if err := appendLedgerEntries(ctx, tx, tenantID, journalID); err != nil {
 				return err
 			}
@@ -775,7 +781,7 @@ func appendLedgerEntries(ctx context.Context, tx pgx.Tx, tenantID, journalID str
 		       jl.debit_amount, jl.credit_amount, jl.dimensions,
 		       jh.legal_entity_id, COALESCE(jh.book_id, ''), jh.fiscal_period,
 		       jh.currency_code, jh.transaction_date, jh.posting_date,
-		       jh.source_event_id, jh.correlation_id, jl.counterparty_id, coa.control_type
+		       jh.source_event_id, jh.correlation_id, jl.counterparty_id, coa.control_type, jl.transaction_amount::text, jl.transaction_currency
 		FROM journal_lines jl
 		JOIN journal_headers jh ON jh.journal_id = jl.journal_id
 		LEFT JOIN chart_of_accounts coa ON coa.tenant_id = jh.tenant_id AND coa.account_code = jl.account_code
@@ -791,14 +797,14 @@ func appendLedgerEntries(ctx context.Context, tx pgx.Tx, tenantID, journalID str
 		dimensions                                                                            domain.Dimensions
 		transactionDate, postingDate                                                          domain.Date
 		sourceEventID                                                                         *string
-		counterparty, controlType                                                             *string
+		counterparty, controlType, txAmount, txCurrency                                       *string
 	}
 	var entries []entryRow
 	for rows.Next() {
 		var e entryRow
 		if err := rows.Scan(&e.lineID, &e.lineNumber, &e.accountCode, &e.debit, &e.credit, &e.dimensions,
 			&e.legalEntityID, &e.bookID, &e.fiscalPeriod, &e.currencyCode, &e.transactionDate, &e.postingDate,
-			&e.sourceEventID, &e.correlationID, &e.counterparty, &e.controlType); err != nil {
+			&e.sourceEventID, &e.correlationID, &e.counterparty, &e.controlType, &e.txAmount, &e.txCurrency); err != nil {
 			rows.Close()
 			return mapPgError(err)
 		}
@@ -816,13 +822,14 @@ func appendLedgerEntries(ctx context.Context, tx pgx.Tx, tenantID, journalID str
 				ledger_entry_id, tenant_id, legal_entity_id, book_id, fiscal_period,
 				journal_id, journal_line_id, line_number, account_code,
 				debit_amount, credit_amount, currency_code, dimensions,
-				transaction_date, posting_date, source_event_id, correlation_id, created_at, counterparty_id, control_type
-			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+				transaction_date, posting_date, source_event_id, correlation_id, created_at, counterparty_id, control_type,
+				transaction_amount, transaction_currency
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21::numeric,$22)
 			ON CONFLICT (tenant_id, journal_id, journal_line_id) DO NOTHING
 		`, uuid.NewString(), tenantID, e.legalEntityID, e.bookID, e.fiscalPeriod,
 			journalID, e.lineID, e.lineNumber, e.accountCode,
 			e.debit, e.credit, e.currencyCode, e.dimensions,
-			e.transactionDate, e.postingDate, e.sourceEventID, e.correlationID, now, e.counterparty, e.controlType); err != nil {
+			e.transactionDate, e.postingDate, e.sourceEventID, e.correlationID, now, e.counterparty, e.controlType, e.txAmount, e.txCurrency); err != nil {
 			return mapPgError(err)
 		}
 	}

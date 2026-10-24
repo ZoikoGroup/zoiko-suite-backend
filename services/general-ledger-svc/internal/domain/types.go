@@ -97,6 +97,10 @@ const (
 	JournalTypeClosing    JournalType = "CLOSING"
 	JournalTypeReclass    JournalType = "RECLASS"
 
+	// JournalTypeRevaluation is the journal the kernel posts for period-end revaluation. It is never accepted from a caller:
+	// only the kernel originates it (standard §8.1).
+	JournalTypeRevaluation JournalType = "REVALUATION"
+
 	// JournalTypeUnspecified marks rows written before migration 000006 added
 	// the field. It is never accepted on a new journal — see ValidJournalType —
 	// and exists only so historical postings remain readable and identifiable

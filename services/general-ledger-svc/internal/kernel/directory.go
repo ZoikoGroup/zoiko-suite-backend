@@ -37,7 +37,7 @@ type CurrencyUnits interface {
 
 // FXSource returns the rate basis for a conversion. A nil source means the caller must supply the rate.
 type FXSource interface {
-	Basis(ctx context.Context, from, to string, asOf time.Time) (*FXBasis, error)
+	Basis(ctx context.Context, policyID, from, to string, asOf time.Time) (*FXBasis, error)
 }
 
 // TenantDirectory is the engine's Directory (and the Evaluate Resolver) for one tenant.
@@ -97,9 +97,12 @@ func (d TenantDirectory) DimensionAllowed(ctx context.Context, dim, value, legal
 }
 
 // FXBasis implements Resolver.
-func (d TenantDirectory) FXBasis(ctx context.Context, from, to string, asOf time.Time) (*FXBasis, error) {
+// RejectSuppliedFX reports whether a caller-supplied rate is refused: it is wherever a rate source is configured.
+func (d TenantDirectory) RejectSuppliedFX() bool { return d.FX != nil }
+
+func (d TenantDirectory) FXBasis(ctx context.Context, policyID, from, to string, asOf time.Time) (*FXBasis, error) {
 	if d.FX == nil {
 		return nil, fmt.Errorf("no exchange-rate source is configured: supply fx_basis")
 	}
-	return d.FX.Basis(ctx, from, to, asOf)
+	return d.FX.Basis(ctx, policyID, from, to, asOf)
 }

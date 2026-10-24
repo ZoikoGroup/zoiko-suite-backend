@@ -101,6 +101,14 @@ func (r *KernelRepo) PostUnit(ctx context.Context, u *kernel.PostingUnit) (*kern
 			return e
 		}
 
+		// The period seal (§36): a posting that reaches here either commits before the seal's watermark or is refused by it.
+		if e := assertPeriodOpen(ctx, t, u.Tenant, u.Event.LegalEntityID, u.FiscalPeriod); e != nil {
+			if errors.Is(e, domain.ErrPeriodLocked) {
+				return &kernel.Exception{Family: kernel.FamPeriod, Code: "PERIOD_SEALED", Detail: e.Error(), Facts: map[string]any{"fiscal_period": u.FiscalPeriod}}
+			}
+			return e
+		}
+
 		p := u.Proposal
 		trace, e := json.Marshal(p)
 		if e != nil {
