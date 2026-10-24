@@ -1275,6 +1275,15 @@ type stubAuthZ struct{ err error }
 func (a *stubAuthZ) CheckAllowed(_ context.Context, _, _, _ string) error { return a.err }
 
 type stubClients struct {
+	// lastJournalMeta is the ACC-03 context (journal_type, dates, currency) the
+	// most recent posting carried, whichever path posted it; metaCalls counts
+	// postings that carried one.
+	lastJournalMeta domain.GLJournalMeta
+	metaCalls       int
+	// lastReverseLegalEntity is the legal entity ReverseGLJournal was given
+	// for general-ledger-svc's envelope.
+	lastReverseLegalEntity string
+
 	unpostedCount int
 	unpostedErr   error
 	// backlog is general-ledger-svc's posting backlog as the stub reports it;
@@ -1432,7 +1441,7 @@ func (c *stubClients) GetPostedJournal(_ context.Context, _, journalID string) (
 	if c.postedJournal != nil {
 		return c.postedJournal, nil
 	}
-	return &domain.PostedJournal{JournalID: journalID, Status: "POSTED", LegalEntityID: c.lastMultiLegalEntity,
+	return &domain.PostedJournal{JournalID: journalID, Status: domain.GLJournalStatusFinalized, LegalEntityID: c.lastMultiLegalEntity,
 		FiscalPeriod: c.lastMultiPeriod, Lines: c.lastMultiLines}, nil
 }
 
@@ -1519,8 +1528,9 @@ func (c *stubClients) GetInventoryUnapprovedVarianceCount(_ context.Context, _, 
 	return c.stockUnapprovedCount, c.stockUnapprovedErr
 }
 
-func (c *stubClients) ReverseGLJournal(_ context.Context, _, _, _, _, correlationID string) (string, error) {
+func (c *stubClients) ReverseGLJournal(_ context.Context, _, _, legalEntityID, _, _, correlationID string) (string, error) {
 	c.reverseJournalCalls++
+	c.lastReverseLegalEntity = legalEntityID
 	c.lastReverseCorrelationID = correlationID
 	if c.reverseJournalErr != nil {
 		return "", c.reverseJournalErr
@@ -1531,8 +1541,9 @@ func (c *stubClients) ReverseGLJournal(_ context.Context, _, _, _, _, correlatio
 	return "reversing-journal-generated", nil
 }
 
-func (c *stubClients) PostAccrualRecognitionJournal(_ context.Context, _, _, fiscalPeriod, _, _, _, _, _ string, amount float64) (string, error) {
+func (c *stubClients) PostAccrualRecognitionJournal(_ context.Context, _, _, fiscalPeriod, _, _, _, _, _ string, amount float64, meta domain.GLJournalMeta) (string, error) {
 	c.postJournalCalls++
+	c.lastJournalMeta, c.metaCalls = meta, c.metaCalls+1
 	c.lastPostedAmount = amount
 	c.lastPostedPeriod = fiscalPeriod
 	if c.postJournalErr != nil {
@@ -1544,8 +1555,9 @@ func (c *stubClients) PostAccrualRecognitionJournal(_ context.Context, _, _, fis
 	return "journal-uuid-001", nil
 }
 
-func (c *stubClients) PostAllocationJournal(_ context.Context, _, _, _, _, _, _, _ string, _ float64, debitLines []domain.AllocationJournalLine) (string, error) {
+func (c *stubClients) PostAllocationJournal(_ context.Context, _, _, _, _, _, _, _ string, _ float64, debitLines []domain.AllocationJournalLine, meta domain.GLJournalMeta) (string, error) {
 	c.postAllocationCalls++
+	c.lastJournalMeta, c.metaCalls = meta, c.metaCalls+1
 	c.lastAllocDebitLines = debitLines
 	if c.postAllocationErr != nil {
 		return "", c.postAllocationErr
@@ -1556,8 +1568,9 @@ func (c *stubClients) PostAllocationJournal(_ context.Context, _, _, _, _, _, _,
 	return "journal-alloc-001", nil
 }
 
-func (c *stubClients) PostMultiLineJournal(_ context.Context, _, legalEntityID, fiscalPeriod, _, _, _ string, lines []domain.JournalLineInput) (string, error) {
+func (c *stubClients) PostMultiLineJournal(_ context.Context, _, legalEntityID, fiscalPeriod, _, _, _ string, lines []domain.JournalLineInput, meta domain.GLJournalMeta) (string, error) {
 	c.postMultiLineCalls++
+	c.lastJournalMeta, c.metaCalls = meta, c.metaCalls+1
 	c.lastMultiLines = lines
 	c.lastMultiLegalEntity, c.lastMultiPeriod = legalEntityID, fiscalPeriod
 	if c.postMultiLineErr != nil {
@@ -1577,6 +1590,9 @@ func (c *stubClients) PostMultiLineJournal(_ context.Context, _, legalEntityID, 
 var testSigningKey = []byte("test-close-signing-key")
 
 const testTenantID = "tenant-abc"
+
+// testCurrency is the currency every fixture record is created in (A13).
+const testCurrency = "GBP"
 
 func newRouter(s *stubStore, authz *stubAuthZ, cl *stubClients) chi.Router {
 	r := chi.NewRouter()
@@ -2557,6 +2573,7 @@ func TestListSubledgerControlRuns_ReturnsOnlyMatchingEntityAndPeriod(t *testing.
 func createApprovedAccrual(t *testing.T, s *stubStore, r chi.Router, totalAmount float64, periodCount int, start string) string {
 	t.Helper()
 	req := domain.CreateAccrualRequest{
+		CurrencyCode:      testCurrency,
 		LegalEntityID:     "le-1",
 		Description:       "Q3 audit fee accrual",
 		PolicyVersion:     "policy-v1",
@@ -2585,6 +2602,7 @@ func createApprovedAccrual(t *testing.T, s *stubStore, r chi.Router, totalAmount
 func TestCreateAccrual_InvalidAmount_Returns400(t *testing.T) {
 	r := newRouter(newStubStore(), &stubAuthZ{}, &stubClients{})
 	req := domain.CreateAccrualRequest{
+		CurrencyCode:  testCurrency,
 		LegalEntityID: "le-1", Description: "x", PolicyVersion: "v1",
 		TotalAmount: 0, StartFiscalPeriod: "2026-01", PeriodCount: 3,
 		DebitAccountCode: "6100", CreditAccountCode: "2100",
@@ -2816,6 +2834,7 @@ func TestCancelFutureAccrual_FromApproved_Succeeds(t *testing.T) {
 func createApprovedPrepayment(t *testing.T, s *stubStore, r chi.Router, totalAmount float64, periodCount int, start string) string {
 	t.Helper()
 	req := domain.CreatePrepaymentRequest{
+		CurrencyCode:      testCurrency,
 		LegalEntityID:     "le-1",
 		Description:       "Annual insurance prepayment",
 		TotalAmount:       totalAmount,
@@ -3027,6 +3046,7 @@ func createApprovedAllocationRule(t *testing.T, s *stubStore, cl *stubClients, r
 		cl.accountStatuses[d.RecipientAccountCode] = "ACTIVE"
 	}
 	req := domain.CreateAllocationRuleRequest{
+		CurrencyCode:      testCurrency,
 		LegalEntityID:     "le-1",
 		Name:              "IT shared cost allocation",
 		SourceAccountCode: "5000-ITSharedCost",
@@ -3055,7 +3075,7 @@ func evenDrivers() []domain.AllocationDriver {
 
 func TestCreateAllocationRule_NoDrivers_Returns400(t *testing.T) {
 	r := newRouter(newStubStore(), &stubAuthZ{}, &stubClients{})
-	req := domain.CreateAllocationRuleRequest{LegalEntityID: "le-1", Name: "x", SourceAccountCode: "5000"}
+	req := domain.CreateAllocationRuleRequest{CurrencyCode: testCurrency, LegalEntityID: "le-1", Name: "x", SourceAccountCode: "5000"}
 	rr := doReq(r, http.MethodPost, "/v1/allocation-rules/", req, "preparer-1")
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 got %d: %s", rr.Code, rr.Body.String())
@@ -3067,6 +3087,7 @@ func TestApproveAllocationRule_DriversDoNotSumTo100_Returns422(t *testing.T) {
 	cl := &stubClients{accountStatuses: map[string]string{"6100-Sales": "ACTIVE", "6200-Ops": "ACTIVE"}}
 	r := newRouter(s, &stubAuthZ{}, cl)
 	req := domain.CreateAllocationRuleRequest{
+		CurrencyCode:  testCurrency,
 		LegalEntityID: "le-1", Name: "bad rule", SourceAccountCode: "5000-Shared",
 		Drivers: []domain.AllocationDriver{
 			{RecipientAccountCode: "6100-Sales", WeightPercentage: 40},
@@ -3091,6 +3112,7 @@ func TestApproveAllocationRule_InvalidRecipientAccount_Returns422(t *testing.T) 
 	cl := &stubClients{accountStatuses: map[string]string{"6100-Sales": "ACTIVE"}} // 6200-Ops never registered
 	r := newRouter(s, &stubAuthZ{}, cl)
 	req := domain.CreateAllocationRuleRequest{
+		CurrencyCode:  testCurrency,
 		LegalEntityID: "le-1", Name: "rule", SourceAccountCode: "5000-Shared",
 		Drivers: []domain.AllocationDriver{
 			{RecipientAccountCode: "6100-Sales", WeightPercentage: 60},
@@ -3314,7 +3336,7 @@ func TestReprocessAllocationRun_RetriesFailedRunWithSameAmounts(t *testing.T) {
 
 func TestStartRevaluation_NoItems_Returns400(t *testing.T) {
 	r := newRouter(newStubStore(), &stubAuthZ{}, &stubClients{})
-	req := domain.StartRevaluationRequest{LegalEntityID: "le-1", FiscalPeriod: "2026-01", FXGainLossAccountCode: "7100-FXGainLoss"}
+	req := domain.StartRevaluationRequest{CurrencyCode: testCurrency, LegalEntityID: "le-1", FiscalPeriod: "2026-01", FXGainLossAccountCode: "7100-FXGainLoss"}
 	rr := doReq(r, http.MethodPost, "/v1/fx-revaluations/", req, "preparer-1")
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 got %d: %s", rr.Code, rr.Body.String())
@@ -3329,6 +3351,7 @@ func TestStartRevaluation_RateMissingForCurrency_Returns422(t *testing.T) {
 	}
 	r := newRouter(s, &stubAuthZ{}, cl)
 	req := domain.StartRevaluationRequest{
+		CurrencyCode:  testCurrency,
 		LegalEntityID: "le-1", FiscalPeriod: "2026-01", FXGainLossAccountCode: "7100-FXGainLoss",
 		RateSet: map[string]float64{"GBP": 1.25}, // no EUR rate
 		Items:   []domain.RevaluationItemInput{{AccountCode: "1100-ForeignCash", CurrencyCode: "EUR", ForeignAmount: 4000}},
@@ -3347,6 +3370,7 @@ func TestStartRevaluation_NonMonetaryItemIncluded_Returns422(t *testing.T) {
 	}
 	r := newRouter(s, &stubAuthZ{}, cl)
 	req := domain.StartRevaluationRequest{
+		CurrencyCode:  testCurrency,
 		LegalEntityID: "le-1", FiscalPeriod: "2026-01", FXGainLossAccountCode: "7100-FXGainLoss",
 		RateSet: map[string]float64{"EUR": 1.10},
 		Items:   []domain.RevaluationItemInput{{AccountCode: "6100-Travel", CurrencyCode: "EUR", ForeignAmount: 2000}},
@@ -3365,6 +3389,7 @@ func TestStartRevaluation_AssetGain_ComputesCorrectAdjustment(t *testing.T) {
 	}
 	r := newRouter(s, &stubAuthZ{}, cl)
 	req := domain.StartRevaluationRequest{
+		CurrencyCode:  testCurrency,
 		LegalEntityID: "le-1", FiscalPeriod: "2026-01", FXGainLossAccountCode: "7100-FXGainLoss",
 		RateSet: map[string]float64{"EUR": 1.15}, // 4000 EUR * 1.15 = 4600.00
 		Items:   []domain.RevaluationItemInput{{AccountCode: "1100-ForeignCash", CurrencyCode: "EUR", ForeignAmount: 4000}},
@@ -3382,7 +3407,7 @@ func TestStartRevaluation_AssetGain_ComputesCorrectAdjustment(t *testing.T) {
 
 func TestApproveRevaluation_UsesDistinctAuthorizationAction(t *testing.T) {
 	s := newStubStore()
-	s.fxRuns["run-1"] = &domain.FXRevaluationRun{RunID: "run-1", LegalEntityID: "le-1", Status: domain.FXRevaluationStatusReview}
+	s.fxRuns["run-1"] = &domain.FXRevaluationRun{CurrencyCode: testCurrency, RunID: "run-1", LegalEntityID: "le-1", Status: domain.FXRevaluationStatusReview}
 	var seenAction string
 	authz := &recordingAuthZ{onCheck: func(_, _, action string) error {
 		seenAction = action
@@ -3404,6 +3429,7 @@ func TestApproveRevaluation_UsesDistinctAuthorizationAction(t *testing.T) {
 func TestPostRevaluation_Replay_DoesNotRepostJournal(t *testing.T) {
 	s := newStubStore()
 	s.fxRuns["run-1"] = &domain.FXRevaluationRun{
+		CurrencyCode: testCurrency, FiscalPeriod: "2026-01",
 		RunID: "run-1", LegalEntityID: "le-1", Status: domain.FXRevaluationStatusApproved, FXGainLossAccountCode: "7100-FXGainLoss",
 		Items: []domain.FXRevaluationItem{{AccountCode: "1100-ForeignCash", AccountType: domain.AccountTypeAsset, AdjustmentAmount: 200.00}},
 	}
@@ -3434,6 +3460,7 @@ func TestPostRevaluation_NetGainAndLossLinesBalance(t *testing.T) {
 	// credited to the FX account. Total debits = 200 (asset) + 50 (loss)
 	// = 250; total credits = 50 (liability) + 150 (fx gain) = 200 ...
 	s.fxRuns["run-1"] = &domain.FXRevaluationRun{
+		CurrencyCode: testCurrency, FiscalPeriod: "2026-01",
 		RunID: "run-1", LegalEntityID: "le-1", Status: domain.FXRevaluationStatusApproved, FXGainLossAccountCode: "7100-FXGainLoss",
 		Items: []domain.FXRevaluationItem{
 			{AccountCode: "1100-ForeignCash", AccountType: domain.AccountTypeAsset, AdjustmentAmount: 200.00},
@@ -3459,7 +3486,7 @@ func TestPostRevaluation_NetGainAndLossLinesBalance(t *testing.T) {
 
 func TestReversePriorRevaluation_PriorNotPosted_Returns422(t *testing.T) {
 	s := newStubStore()
-	s.fxRuns["run-1"] = &domain.FXRevaluationRun{RunID: "run-1", LegalEntityID: "le-1", Status: domain.FXRevaluationStatusReview}
+	s.fxRuns["run-1"] = &domain.FXRevaluationRun{CurrencyCode: testCurrency, RunID: "run-1", LegalEntityID: "le-1", Status: domain.FXRevaluationStatusReview}
 	r := newRouter(s, &stubAuthZ{}, &stubClients{})
 	rr := doReq(r, http.MethodPost, "/v1/fx-revaluations/reverse", domain.ReversePriorRevaluationRequest{PriorRunID: "run-1"}, "preparer-1")
 	if rr.Code != http.StatusUnprocessableEntity {
@@ -3471,7 +3498,8 @@ func TestReversePriorRevaluation_NegatesPriorAdjustments(t *testing.T) {
 	s := newStubStore()
 	postedAt := time.Now().UTC()
 	s.fxRuns["run-1"] = &domain.FXRevaluationRun{
-		RunID: "run-1", LegalEntityID: "le-1", FiscalPeriod: "2026-01", Status: domain.FXRevaluationStatusPosted,
+		CurrencyCode: testCurrency,
+		RunID:        "run-1", LegalEntityID: "le-1", FiscalPeriod: "2026-01", Status: domain.FXRevaluationStatusPosted,
 		FXGainLossAccountCode: "7100-FXGainLoss", PostedAt: &postedAt,
 		Items: []domain.FXRevaluationItem{
 			{AccountCode: "1100-ForeignCash", AccountType: domain.AccountTypeAsset, CurrencyCode: "EUR", ForeignAmount: 4000, BookAmount: 4400, ClosingRate: 1.15, RevaluedAmount: 4600, AdjustmentAmount: 200.00},
@@ -3510,6 +3538,7 @@ func createValidatedMigrationBatch(t *testing.T, s *stubStore, cl *stubClients, 
 	cl.accountStatuses["3000-OpeningEquity"] = "ACTIVE"
 
 	req := domain.CreateMigrationBatchRequest{
+		CurrencyCode:  testCurrency,
 		LegalEntityID: "le-1", FiscalPeriod: "2026-01", SourceSystemName: "LegacyERP", SourceExtractHash: "sha256:abc123",
 		ExpectedRowCount: 2, ExpectedTotalDebits: 10000.00, ExpectedTotalCredits: 10000.00,
 		Entries: balancedMigrationEntries(),
@@ -3530,6 +3559,7 @@ func createValidatedMigrationBatch(t *testing.T, s *stubStore, cl *stubClients, 
 func TestCreateMigrationBatch_DuplicateSourceReference_Returns400(t *testing.T) {
 	r := newRouter(newStubStore(), &stubAuthZ{}, &stubClients{})
 	req := domain.CreateMigrationBatchRequest{
+		CurrencyCode:  testCurrency,
 		LegalEntityID: "le-1", FiscalPeriod: "2026-01", SourceSystemName: "LegacyERP", SourceExtractHash: "sha256:x",
 		ExpectedRowCount: 2, Entries: []domain.MigrationCrosswalkEntry{
 			{SourceReferenceID: "SRC-1", TargetAccountCode: "1000-Cash", DebitAmount: 100},
@@ -3547,6 +3577,7 @@ func TestCreateMigrationBatch_Idempotent_ReturnsSameBatch(t *testing.T) {
 	cl := &stubClients{}
 	r := newRouter(s, &stubAuthZ{}, cl)
 	req := domain.CreateMigrationBatchRequest{
+		CurrencyCode:  testCurrency,
 		LegalEntityID: "le-1", FiscalPeriod: "2026-01", SourceSystemName: "LegacyERP", SourceExtractHash: "sha256:abc",
 		ExpectedRowCount: 2, ExpectedTotalDebits: 10000, ExpectedTotalCredits: 10000, Entries: balancedMigrationEntries(),
 	}
@@ -3573,6 +3604,7 @@ func TestValidateOpeningBalances_UnbalancedTB_QuarantinesBatch(t *testing.T) {
 	cl := &stubClients{accountStatuses: map[string]string{"1000-Cash": "ACTIVE", "3000-Equity": "ACTIVE"}}
 	r := newRouter(s, &stubAuthZ{}, cl)
 	req := domain.CreateMigrationBatchRequest{
+		CurrencyCode:  testCurrency,
 		LegalEntityID: "le-1", FiscalPeriod: "2026-01", SourceSystemName: "LegacyERP", SourceExtractHash: "sha256:x",
 		ExpectedRowCount: 2, ExpectedTotalDebits: 10000, ExpectedTotalCredits: 9000,
 		Entries: []domain.MigrationCrosswalkEntry{
@@ -3599,6 +3631,7 @@ func TestValidateOpeningBalances_SuspenseAccountTargeted_QuarantinesBatch(t *tes
 	cl := &stubClients{accountStatuses: map[string]string{"1000-Cash": "ACTIVE", "9999-Suspense": "ACTIVE"}}
 	r := newRouter(s, &stubAuthZ{}, cl)
 	req := domain.CreateMigrationBatchRequest{
+		CurrencyCode:  testCurrency,
 		LegalEntityID: "le-1", FiscalPeriod: "2026-01", SourceSystemName: "LegacyERP", SourceExtractHash: "sha256:x",
 		ExpectedRowCount: 2, ExpectedTotalDebits: 500, ExpectedTotalCredits: 500,
 		Entries: []domain.MigrationCrosswalkEntry{
@@ -3624,6 +3657,7 @@ func TestValidateOpeningBalances_ControlTotalsMismatch_QuarantinesBatch(t *testi
 	cl := &stubClients{accountStatuses: map[string]string{"1000-Cash": "ACTIVE", "3000-Equity": "ACTIVE"}}
 	r := newRouter(s, &stubAuthZ{}, cl)
 	req := domain.CreateMigrationBatchRequest{
+		CurrencyCode:  testCurrency,
 		LegalEntityID: "le-1", FiscalPeriod: "2026-01", SourceSystemName: "LegacyERP", SourceExtractHash: "sha256:x",
 		ExpectedRowCount: 2, ExpectedTotalDebits: 99999.00, ExpectedTotalCredits: 99999.00, // source declared this
 		Entries: []domain.MigrationCrosswalkEntry{

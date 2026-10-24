@@ -24,7 +24,8 @@ import (
 func recognizedAccrualInstance(t *testing.T, ctx context.Context, s *store.PgStore, tenantID string) *domain.RecognitionInstance {
 	t.Helper()
 	sch := &domain.AccrualSchedule{
-		ScheduleID: uuid.New().String(), TenantID: tenantID, LegalEntityID: "le-1",
+		CurrencyCode: storeTestCurrency,
+		ScheduleID:   uuid.New().String(), TenantID: tenantID, LegalEntityID: "le-1",
 		Description: "test accrual", PolicyVersion: "v1", TotalAmount: 900,
 		StartFiscalPeriod: "2026-01", PeriodCount: 3,
 		DebitAccountCode: "6100-AuditFee", CreditAccountCode: "2100-AccruedLiabilities",

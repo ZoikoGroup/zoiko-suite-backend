@@ -68,7 +68,7 @@ func TestApprove_PreparerCannotApproveOwnItem_ACC08_09_10_17(t *testing.T) {
 	s.allocationRules["rule-1"] = &domain.AllocationRule{RuleID: "rule-1", RuleVersionID: "rule-1", LegalEntityID: "le-1",
 		Status: domain.AllocationRuleStatusDraft, CreatedByPrincipalID: "preparer-1",
 		Drivers: []domain.AllocationDriver{{RecipientAccountCode: "6100-Sales", WeightPercentage: 100}}}
-	s.fxRuns["run-1"] = &domain.FXRevaluationRun{RunID: "run-1", LegalEntityID: "le-1",
+	s.fxRuns["run-1"] = &domain.FXRevaluationRun{CurrencyCode: testCurrency, RunID: "run-1", LegalEntityID: "le-1",
 		Status: domain.FXRevaluationStatusReview, CreatedByPrincipalID: "preparer-1"}
 	s.migrationBatches["batch-1"] = &domain.MigrationBatch{BatchID: "batch-1", LegalEntityID: "le-1",
 		Status: domain.MigrationBatchStatusValidated, CreatedByPrincipalID: "preparer-1"}
@@ -114,13 +114,13 @@ func TestApprove_StoreSelfApprovalIsForbiddenNotUnavailable(t *testing.T) {
 // ── B3. Command idempotency ──────────────────────────────────────────────────
 
 func TestCreateCommands_IdempotencyKey_RequiredReplayedAndConflicting(t *testing.T) {
-	accrual := domain.CreateAccrualRequest{LegalEntityID: "le-1", Description: "audit fee", PolicyVersion: "v1", TotalAmount: 900,
+	accrual := domain.CreateAccrualRequest{CurrencyCode: testCurrency, LegalEntityID: "le-1", Description: "audit fee", PolicyVersion: "v1", TotalAmount: 900,
 		StartFiscalPeriod: "2026-01", PeriodCount: 3, DebitAccountCode: "6100-AuditFee", CreditAccountCode: "2100-Accrued"}
-	prepayment := domain.CreatePrepaymentRequest{LegalEntityID: "le-1", Description: "insurance", TotalAmount: 1200,
+	prepayment := domain.CreatePrepaymentRequest{CurrencyCode: testCurrency, LegalEntityID: "le-1", Description: "insurance", TotalAmount: 1200,
 		StartFiscalPeriod: "2026-01", PeriodCount: 12, DebitAccountCode: "6200-Insurance", CreditAccountCode: "1400-Prepaid"}
-	rule := domain.CreateAllocationRuleRequest{LegalEntityID: "le-1", Name: "IT", SourceAccountCode: "5000-IT",
+	rule := domain.CreateAllocationRuleRequest{CurrencyCode: testCurrency, LegalEntityID: "le-1", Name: "IT", SourceAccountCode: "5000-IT",
 		Drivers: []domain.AllocationDriver{{RecipientAccountCode: "6100-Sales", WeightPercentage: 100}}}
-	revaluation := domain.StartRevaluationRequest{LegalEntityID: "le-1", FiscalPeriod: "2026-01", FXGainLossAccountCode: "7900-FX",
+	revaluation := domain.StartRevaluationRequest{CurrencyCode: testCurrency, LegalEntityID: "le-1", FiscalPeriod: "2026-01", FXGainLossAccountCode: "7900-FX",
 		RateSet: map[string]float64{"EUR": 1.1},
 		Items:   []domain.RevaluationItemInput{{AccountCode: "1100-EURCash", CurrencyCode: "EUR", ForeignAmount: 1000}}}
 
@@ -200,7 +200,7 @@ func mustDecode(t *testing.T, b []byte, v any) {
 
 func TestReversePriorRevaluation_SecondCallReturnsTheExistingReversal(t *testing.T) {
 	s := newStubStore()
-	s.fxRuns["run-1"] = &domain.FXRevaluationRun{RunID: "run-1", LegalEntityID: "le-1", FiscalPeriod: "2026-01",
+	s.fxRuns["run-1"] = &domain.FXRevaluationRun{CurrencyCode: testCurrency, RunID: "run-1", LegalEntityID: "le-1", FiscalPeriod: "2026-01",
 		Status: domain.FXRevaluationStatusPosted, CreatedByPrincipalID: "preparer-1",
 		Items: []domain.FXRevaluationItem{{ItemID: "i-1", AccountCode: "1100-EURCash", AccountType: domain.AccountTypeAsset, AdjustmentAmount: 20}}}
 	r := newRouter(s, &stubAuthZ{}, &stubClients{})
@@ -258,7 +258,7 @@ func TestCommitOpeningPosting_LedgerDisagrees_QuarantinesAndCannotBeCertified(t 
 
 	// The ledger holds a journal whose equity side was booked short: the
 	// kind of drift a status flag alone would have certified.
-	cl.postedJournal = &domain.PostedJournal{JournalID: "journal-fx-001", Status: "POSTED", LegalEntityID: "le-1", FiscalPeriod: "2026-01",
+	cl.postedJournal = &domain.PostedJournal{JournalID: "journal-fx-001", Status: domain.GLJournalStatusFinalized, LegalEntityID: "le-1", FiscalPeriod: "2026-01",
 		Lines: []domain.JournalLineInput{
 			{AccountCode: "1000-Cash", DebitAmount: 10000},
 			{AccountCode: "3000-OpeningEquity", CreditAmount: 9000},
@@ -324,6 +324,7 @@ func TestValidateOpeningBalances_ChartUnavailable_Returns503WithoutQuarantine(t 
 	cl := &stubClients{}
 	r := newRouter(s, &stubAuthZ{}, cl)
 	req := domain.CreateMigrationBatchRequest{
+		CurrencyCode:  testCurrency,
 		LegalEntityID: "le-1", FiscalPeriod: "2026-01", SourceSystemName: "LegacyERP", SourceExtractHash: "sha256:abc",
 		ExpectedRowCount: 2, ExpectedTotalDebits: 10000, ExpectedTotalCredits: 10000, Entries: balancedMigrationEntries(),
 	}

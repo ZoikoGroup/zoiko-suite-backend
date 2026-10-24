@@ -214,17 +214,17 @@ type Clients interface {
 	GetInventoryUnapprovedVarianceCount(ctx context.Context, tenantID, legalEntityID, fiscalPeriod string) (int, error)
 	// PostAccrualRecognitionJournal is ACC-07's only path to the ledger —
 	// see its doc comment in internal/clients for why.
-	PostAccrualRecognitionJournal(ctx context.Context, tenantID, legalEntityID, fiscalPeriod, correlationID, principalID, description, debitAccountCode, creditAccountCode string, amount float64) (journalID string, err error)
+	PostAccrualRecognitionJournal(ctx context.Context, tenantID, legalEntityID, fiscalPeriod, correlationID, principalID, description, debitAccountCode, creditAccountCode string, amount float64, meta domain.GLJournalMeta) (journalID string, err error)
 	// ReverseGLJournal is ACC-07's own closure of "Auto-reversal
 	// duplicates" — see its doc comment in internal/clients.
-	ReverseGLJournal(ctx context.Context, tenantID, principalID, journalID, reason, correlationID string) (reversingJournalID string, err error)
+	ReverseGLJournal(ctx context.Context, tenantID, principalID, legalEntityID, journalID, reason, correlationID string) (reversingJournalID string, err error)
 	// PostAllocationJournal backs ACC-09 — see its doc comment in
 	// internal/clients. Account status/type checks for ACC-09/10/17 read
 	// ListChartOfAccounts once per command (see chartIndex).
-	PostAllocationJournal(ctx context.Context, tenantID, legalEntityID, fiscalPeriod, correlationID, principalID, description, sourceAccountCode string, sourceAmount float64, debitLines []domain.AllocationJournalLine) (journalID string, err error)
+	PostAllocationJournal(ctx context.Context, tenantID, legalEntityID, fiscalPeriod, correlationID, principalID, description, sourceAccountCode string, sourceAmount float64, debitLines []domain.AllocationJournalLine, meta domain.GLJournalMeta) (journalID string, err error)
 	// PostMultiLineJournal backs ACC-10 and ACC-17 — see its doc comment in
 	// internal/clients.
-	PostMultiLineJournal(ctx context.Context, tenantID, legalEntityID, fiscalPeriod, correlationID, principalID, description string, lines []domain.JournalLineInput) (journalID string, err error)
+	PostMultiLineJournal(ctx context.Context, tenantID, legalEntityID, fiscalPeriod, correlationID, principalID, description string, lines []domain.JournalLineInput, meta domain.GLJournalMeta) (journalID string, err error)
 	// GetPostedJournal backs ACC-17's source-to-target reconciliation — see
 	// its doc comment in internal/clients.
 	GetPostedJournal(ctx context.Context, tenantID, journalID string) (*domain.PostedJournal, error)
@@ -1411,6 +1411,74 @@ func (h *Handler) writeSubledgerControlErr(w http.ResponseWriter, err error, dep
 // ("YYYY-MM", the same format FiscalPeriod.PeriodName already uses).
 const periodMonthLayout = "2006-01"
 
+// requireCurrencyCode refuses a create that does not name the currency its
+// journals will be booked in. ACC-03 makes currency a caller-supplied journal
+// input and general-ledger-svc refuses a journal without one (A13).
+func requireCurrencyCode(w http.ResponseWriter, code string) bool {
+	if code == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "currency_code is required")
+		return false
+	}
+	if !domain.ValidCurrencyCode(code) {
+		writeError(w, http.StatusBadRequest, "invalid_currency_code", string(domain.ErrInvalidCurrencyCode))
+		return false
+	}
+	return true
+}
+
+// glJournalMeta is the ACC-03 context for a journal posted into fiscalPeriod:
+// general-ledger-svc refuses a journal without journal_type, transaction and
+// posting dates, and currency (A13). Every journal this service posts is a
+// period-end consequence (recognition, allocation, revaluation, opening
+// balance), so both dates are the period's last day: the registered period's
+// period_end when fp is known, else the last day of a YYYY-MM name. A period
+// that is neither is refused, never guessed. A record written before
+// migration 000022 has no currency and cannot post until one is set.
+func glJournalMeta(fp *domain.FiscalPeriod, fiscalPeriod, currencyCode, journalType string) (domain.GLJournalMeta, error) {
+	if currencyCode == "" {
+		return domain.GLJournalMeta{}, domain.ErrCurrencyCodeMissing
+	}
+	var end time.Time
+	if fp != nil {
+		e := fp.PeriodEnd.UTC()
+		end = time.Date(e.Year(), e.Month(), e.Day(), 0, 0, 0, 0, time.UTC)
+	} else {
+		start, err := time.Parse(periodMonthLayout, fiscalPeriod)
+		if err != nil {
+			return domain.GLJournalMeta{}, domain.ErrPostingDateUnresolvable
+		}
+		end = start.AddDate(0, 1, -1)
+	}
+	return domain.GLJournalMeta{JournalType: journalType, TransactionDate: end, PostingDate: end, CurrencyCode: currencyCode}, nil
+}
+
+// loadGLJournalMeta is glJournalMeta for a path that has not already read
+// the period from the register.
+func (h *Handler) loadGLJournalMeta(ctx context.Context, legalEntityID, fiscalPeriod, currencyCode, journalType string) (domain.GLJournalMeta, error) {
+	if currencyCode == "" {
+		return domain.GLJournalMeta{}, domain.ErrCurrencyCodeMissing
+	}
+	fp, err := h.store.GetFiscalPeriodByName(ctx, legalEntityID, fiscalPeriod)
+	if err != nil && !errors.Is(err, domain.ErrFiscalPeriodNotFound) {
+		return domain.GLJournalMeta{}, err
+	}
+	return glJournalMeta(fp, fiscalPeriod, currencyCode, journalType)
+}
+
+// writeJournalMetaErr renders a glJournalMeta refusal. Both are the record's
+// own state, not a GL outage, so neither is a 503.
+func (h *Handler) writeJournalMetaErr(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, domain.ErrCurrencyCodeMissing):
+		writeError(w, http.StatusUnprocessableEntity, "currency_code_missing", err.Error())
+	case errors.Is(err, domain.ErrPostingDateUnresolvable):
+		writeError(w, http.StatusUnprocessableEntity, "posting_date_unresolvable", err.Error())
+	default:
+		h.log.Error("failed to read the fiscal period for a journal's posting date", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+	}
+}
+
 // periodIndex returns how many months target is after start (0 for start
 // itself). A negative or unparseable result is out of range.
 func periodIndex(start, target string) (int, error) {
@@ -1435,6 +1503,9 @@ func (h *Handler) CreateAccrual(w http.ResponseWriter, r *http.Request) {
 		req.StartFiscalPeriod == "" || req.DebitAccountCode == "" || req.CreditAccountCode == "" {
 		writeError(w, http.StatusBadRequest, "missing_fields",
 			"legal_entity_id, description, policy_version, start_fiscal_period, debit_account_code and credit_account_code are required")
+		return
+	}
+	if !requireCurrencyCode(w, req.CurrencyCode) {
 		return
 	}
 	if req.TotalAmount <= 0 || req.PeriodCount < 1 {
@@ -1475,6 +1546,7 @@ func (h *Handler) CreateAccrual(w http.ResponseWriter, r *http.Request) {
 		PeriodCount:          req.PeriodCount,
 		DebitAccountCode:     req.DebitAccountCode,
 		CreditAccountCode:    req.CreditAccountCode,
+		CurrencyCode:         req.CurrencyCode,
 		Status:               domain.AccrualStatusDraft,
 		CreatedAt:            time.Now().UTC(),
 		CreatedByPrincipalID: principalID,
@@ -1755,13 +1827,18 @@ func (h *Handler) RunAccrualRecognition(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusUnprocessableEntity, "period_locked", string(domain.ErrRecognitionPeriodLocked))
 		return
 	}
+	meta, err := glJournalMeta(fp, req.FiscalPeriod, sch.CurrencyCode, domain.GLJournalTypeAccrual)
+	if err != nil {
+		h.writeJournalMetaErr(w, err)
+		return
+	}
 
 	amount := recognitionAmountFor(sch, index)
 	correlationID := sch.ScheduleID + ":" + req.FiscalPeriod
 	description := sch.Description + " — recognition " + req.FiscalPeriod
 
 	journalID, err := h.clients.PostAccrualRecognitionJournal(r.Context(), tenantID, sch.LegalEntityID, req.FiscalPeriod,
-		correlationID, principalID, description, sch.DebitAccountCode, sch.CreditAccountCode, amount)
+		correlationID, principalID, description, sch.DebitAccountCode, sch.CreditAccountCode, amount, meta)
 	if err != nil {
 		h.log.Error("RunAccrualRecognition: journal posting failed", zap.String("schedule_id", id), zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "journal_posting_failed", err.Error())
@@ -1922,7 +1999,7 @@ func (h *Handler) ReverseAccrualRecognition(w http.ResponseWriter, r *http.Reque
 	// recognizing, and general-ledger-svc's ReverseJournal keys its own
 	// replay detection on whatever correlation_id this call sends.
 	reverseCorrelationID := "reverse:" + inst.RecognitionInstanceID
-	reversingJournalID, err := h.clients.ReverseGLJournal(r.Context(), tenantID, principalID, inst.JournalID, req.Reason, reverseCorrelationID)
+	reversingJournalID, err := h.clients.ReverseGLJournal(r.Context(), tenantID, principalID, sch.LegalEntityID, inst.JournalID, req.Reason, reverseCorrelationID)
 	if err != nil {
 		h.log.Error("ReverseAccrualRecognition: journal reversal failed", zap.String("schedule_id", id), zap.String("journal_id", inst.JournalID), zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "journal_reversal_failed", err.Error())
@@ -1998,6 +2075,9 @@ func (h *Handler) CreatePrepayment(w http.ResponseWriter, r *http.Request) {
 			"legal_entity_id, description, start_fiscal_period, debit_account_code and credit_account_code are required")
 		return
 	}
+	if !requireCurrencyCode(w, req.CurrencyCode) {
+		return
+	}
 	if req.TotalAmount <= 0 || req.PeriodCount < 1 {
 		writeError(w, http.StatusBadRequest, "invalid_amount", string(domain.ErrInvalidPrepaymentAmount))
 		return
@@ -2034,6 +2114,7 @@ func (h *Handler) CreatePrepayment(w http.ResponseWriter, r *http.Request) {
 		PeriodCount:          req.PeriodCount,
 		DebitAccountCode:     req.DebitAccountCode,
 		CreditAccountCode:    req.CreditAccountCode,
+		CurrencyCode:         req.CurrencyCode,
 		Status:               domain.PrepaymentStatusDraft,
 		CreatedAt:            time.Now().UTC(),
 		CreatedByPrincipalID: principalID,
@@ -2240,13 +2321,18 @@ func (h *Handler) RunPrepaymentRecognition(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusUnprocessableEntity, "period_locked", string(domain.ErrPrepaymentPeriodLocked))
 		return
 	}
+	meta, err := glJournalMeta(fp, req.FiscalPeriod, sch.CurrencyCode, domain.GLJournalTypeAccrual)
+	if err != nil {
+		h.writeJournalMetaErr(w, err)
+		return
+	}
 
 	amount := prepaymentRecognitionAmountFor(sch, index)
 	correlationID := sch.ScheduleID + ":" + req.FiscalPeriod
 	description := sch.Description + " — recognition " + req.FiscalPeriod
 
 	journalID, err := h.clients.PostAccrualRecognitionJournal(r.Context(), tenantID, sch.LegalEntityID, req.FiscalPeriod,
-		correlationID, principalID, description, sch.DebitAccountCode, sch.CreditAccountCode, amount)
+		correlationID, principalID, description, sch.DebitAccountCode, sch.CreditAccountCode, amount, meta)
 	if err != nil {
 		h.log.Error("RunPrepaymentRecognition: journal posting failed", zap.String("schedule_id", id), zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "journal_posting_failed", err.Error())
@@ -2451,10 +2537,15 @@ func (h *Handler) TerminatePrepayment(w http.ResponseWriter, r *http.Request) {
 				writeError(w, http.StatusUnprocessableEntity, "period_locked", string(domain.ErrPrepaymentPeriodLocked))
 				return
 			}
+			meta, err := glJournalMeta(fp, req.FiscalPeriod, sch.CurrencyCode, domain.GLJournalTypeAccrual)
+			if err != nil {
+				h.writeJournalMetaErr(w, err)
+				return
+			}
 
 			journalID, err := h.clients.PostAccrualRecognitionJournal(r.Context(), tenantID, sch.LegalEntityID, req.FiscalPeriod,
 				sch.ScheduleID+":"+domain.TerminationPseudoPeriod, principalID,
-				sch.Description+" — termination final settlement", sch.DebitAccountCode, sch.CreditAccountCode, remaining)
+				sch.Description+" — termination final settlement", sch.DebitAccountCode, sch.CreditAccountCode, remaining, meta)
 			if err != nil {
 				h.log.Error("TerminatePrepayment: final settlement journal posting failed", zap.String("schedule_id", id), zap.Error(err))
 				writeError(w, http.StatusServiceUnavailable, "journal_posting_failed", err.Error())
@@ -2525,6 +2616,9 @@ func (h *Handler) CreateAllocationRule(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "missing_fields", "legal_entity_id, name and source_account_code are required")
 		return
 	}
+	if !requireCurrencyCode(w, req.CurrencyCode) {
+		return
+	}
 	if len(req.Drivers) == 0 {
 		writeError(w, http.StatusBadRequest, "no_drivers", string(domain.ErrNoDriversDefined))
 		return
@@ -2557,6 +2651,7 @@ func (h *Handler) CreateAllocationRule(w http.ResponseWriter, r *http.Request) {
 		Name:                 req.Name,
 		SourceAccountCode:    req.SourceAccountCode,
 		Drivers:              req.Drivers,
+		CurrencyCode:         req.CurrencyCode,
 		Status:               domain.AllocationRuleStatusDraft,
 		CreatedAt:            time.Now().UTC(),
 		CreatedByPrincipalID: principalID,
@@ -2712,6 +2807,10 @@ func (h *Handler) SupersedeAllocationRule(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadRequest, "missing_fields", "name and source_account_code are required")
 		return
 	}
+	if req.CurrencyCode != "" && !domain.ValidCurrencyCode(req.CurrencyCode) {
+		writeError(w, http.StatusBadRequest, "invalid_currency_code", string(domain.ErrInvalidCurrencyCode))
+		return
+	}
 	if len(req.Drivers) == 0 {
 		writeError(w, http.StatusBadRequest, "no_drivers", string(domain.ErrNoDriversDefined))
 		return
@@ -2735,6 +2834,21 @@ func (h *Handler) SupersedeAllocationRule(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// The new version keeps the rule's currency. A rule written before
+	// migration 000022 has none, and this is how it acquires one; a currency
+	// the rule already has never changes.
+	currency := current.CurrencyCode
+	switch {
+	case currency == "" && req.CurrencyCode == "":
+		writeError(w, http.StatusBadRequest, "missing_fields", "currency_code is required: the current rule version has none")
+		return
+	case currency != "" && req.CurrencyCode != "" && req.CurrencyCode != currency:
+		writeError(w, http.StatusUnprocessableEntity, "currency_code_immutable", string(domain.ErrCurrencyCodeImmutable))
+		return
+	case currency == "":
+		currency = req.CurrencyCode
+	}
+
 	now := time.Now().UTC()
 	newVersion := &domain.AllocationRule{
 		RuleVersionID:        uuid.NewString(),
@@ -2742,6 +2856,7 @@ func (h *Handler) SupersedeAllocationRule(w http.ResponseWriter, r *http.Request
 		Name:                 req.Name,
 		SourceAccountCode:    req.SourceAccountCode,
 		Drivers:              req.Drivers,
+		CurrencyCode:         currency,
 		CreatedAt:            now,
 		CreatedByPrincipalID: principalID,
 	}
@@ -2840,6 +2955,13 @@ func (h *Handler) ExecuteAllocation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
+	// Resolved before the run is created, so a rule that cannot post never
+	// leaves a CALCULATED run behind.
+	meta, err := h.loadGLJournalMeta(r.Context(), rule.LegalEntityID, req.FiscalPeriod, rule.CurrencyCode, domain.GLJournalTypeReclass)
+	if err != nil {
+		h.writeJournalMetaErr(w, err)
+		return
+	}
 
 	balances, err := h.clients.CompileTrialBalance(r.Context(), tenantID, rule.LegalEntityID, req.FiscalPeriod, principalID)
 	if err != nil {
@@ -2888,7 +3010,7 @@ func (h *Handler) ExecuteAllocation(w http.ResponseWriter, r *http.Request) {
 
 	description := rule.Name + " — allocation " + req.FiscalPeriod
 	journalID, err := h.clients.PostAllocationJournal(r.Context(), tenantID, rule.LegalEntityID, req.FiscalPeriod,
-		run.RunID, principalID, description, rule.SourceAccountCode, sourceAmount, debitLines)
+		run.RunID, principalID, description, rule.SourceAccountCode, sourceAmount, debitLines, meta)
 	if err != nil {
 		h.log.Error("ExecuteAllocation: journal posting failed", zap.String("run_id", run.RunID), zap.Error(err))
 		if markErr := h.store.MarkAllocationRunFailed(r.Context(), run.RunID, err.Error()); markErr != nil {
@@ -2949,6 +3071,11 @@ func (h *Handler) ReprocessAllocationRun(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusUnprocessableEntity, "invalid_transition", string(domain.ErrInvalidAllocationRunTransition))
 		return
 	}
+	meta, err := h.loadGLJournalMeta(r.Context(), rule.LegalEntityID, run.FiscalPeriod, rule.CurrencyCode, domain.GLJournalTypeReclass)
+	if err != nil {
+		h.writeJournalMetaErr(w, err)
+		return
+	}
 
 	debitLines := make([]domain.AllocationJournalLine, len(run.ResultLines))
 	for i, l := range run.ResultLines {
@@ -2956,7 +3083,7 @@ func (h *Handler) ReprocessAllocationRun(w http.ResponseWriter, r *http.Request)
 	}
 	description := rule.Name + " — allocation " + run.FiscalPeriod
 	journalID, err := h.clients.PostAllocationJournal(r.Context(), tenantID, rule.LegalEntityID, run.FiscalPeriod,
-		run.RunID, principalID, description, rule.SourceAccountCode, run.SourceAmount, debitLines)
+		run.RunID, principalID, description, rule.SourceAccountCode, run.SourceAmount, debitLines, meta)
 	if err != nil {
 		h.log.Error("ReprocessAllocationRun: journal posting failed again", zap.String("run_id", run.RunID), zap.Error(err))
 		if markErr := h.store.MarkAllocationRunFailed(r.Context(), run.RunID, err.Error()); markErr != nil {
@@ -3113,6 +3240,9 @@ func (h *Handler) StartRevaluation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "missing_fields", "legal_entity_id, fiscal_period and fx_gain_loss_account_code are required")
 		return
 	}
+	if !requireCurrencyCode(w, req.CurrencyCode) {
+		return
+	}
 	if len(req.Items) == 0 {
 		writeError(w, http.StatusBadRequest, "no_items", string(domain.ErrNoRevaluationItems))
 		return
@@ -3146,6 +3276,7 @@ func (h *Handler) StartRevaluation(w http.ResponseWriter, r *http.Request) {
 		LegalEntityID:         req.LegalEntityID,
 		FiscalPeriod:          req.FiscalPeriod,
 		FXGainLossAccountCode: req.FXGainLossAccountCode,
+		CurrencyCode:          req.CurrencyCode,
 		Status:                domain.FXRevaluationStatusReview,
 		CreatedAt:             time.Now().UTC(),
 		CreatedByPrincipalID:  principalID,
@@ -3228,6 +3359,7 @@ func (h *Handler) ReversePriorRevaluation(w http.ResponseWriter, r *http.Request
 		LegalEntityID:         prior.LegalEntityID,
 		FiscalPeriod:          prior.FiscalPeriod,
 		FXGainLossAccountCode: prior.FXGainLossAccountCode,
+		CurrencyCode:          prior.CurrencyCode,
 		Status:                domain.FXRevaluationStatusReview,
 		ReversalOfRunID:       &priorRunID,
 		CreatedAt:             time.Now().UTC(),
@@ -3325,11 +3457,16 @@ func (h *Handler) PostRevaluation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	meta, err := h.loadGLJournalMeta(r.Context(), run.LegalEntityID, run.FiscalPeriod, run.CurrencyCode, domain.GLJournalTypeAdjustment)
+	if err != nil {
+		h.writeJournalMetaErr(w, err)
+		return
+	}
 	description := "FX revaluation " + run.FiscalPeriod
 	if run.ReversalOfRunID != nil {
 		description = "FX revaluation reversal of " + *run.ReversalOfRunID + " — " + run.FiscalPeriod
 	}
-	journalID, err := h.clients.PostMultiLineJournal(r.Context(), tenantID, run.LegalEntityID, run.FiscalPeriod, run.RunID, principalID, description, lines)
+	journalID, err := h.clients.PostMultiLineJournal(r.Context(), tenantID, run.LegalEntityID, run.FiscalPeriod, run.RunID, principalID, description, lines, meta)
 	if err != nil {
 		h.log.Error("PostRevaluation: journal posting failed", zap.String("run_id", id), zap.Float64("net_gain", netGain), zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "journal_posting_failed", err.Error())
@@ -3499,6 +3636,9 @@ func (h *Handler) CreateMigrationAccountingBatch(w http.ResponseWriter, r *http.
 			"legal_entity_id, fiscal_period, source_system_name and source_extract_hash are required")
 		return
 	}
+	if !requireCurrencyCode(w, req.CurrencyCode) {
+		return
+	}
 	if len(req.Entries) == 0 {
 		writeError(w, http.StatusBadRequest, "no_entries", string(domain.ErrNoMigrationEntries))
 		return
@@ -3557,6 +3697,7 @@ func (h *Handler) CreateMigrationAccountingBatch(w http.ResponseWriter, r *http.
 		ExpectedRowCount:     req.ExpectedRowCount,
 		ExpectedTotalDebits:  req.ExpectedTotalDebits,
 		ExpectedTotalCredits: req.ExpectedTotalCredits,
+		CurrencyCode:         req.CurrencyCode,
 		Status:               domain.MigrationBatchStatusLoaded,
 		CreatedAt:            time.Now().UTC(),
 		CreatedByPrincipalID: principalID,
@@ -3791,13 +3932,18 @@ func (h *Handler) CommitOpeningPosting(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnprocessableEntity, "period_locked", string(domain.ErrMigrationPeriodLocked))
 		return
 	}
+	meta, err := glJournalMeta(fp, batch.FiscalPeriod, batch.CurrencyCode, domain.GLJournalTypeOpening)
+	if err != nil {
+		h.writeJournalMetaErr(w, err)
+		return
+	}
 
 	lines := make([]domain.JournalLineInput, len(batch.Entries))
 	for i, e := range batch.Entries {
 		lines[i] = domain.JournalLineInput{AccountCode: e.TargetAccountCode, DebitAmount: e.DebitAmount, CreditAmount: e.CreditAmount}
 	}
 	description := "Opening balance migration from " + batch.SourceSystemName + " — " + batch.FiscalPeriod
-	journalID, err := h.clients.PostMultiLineJournal(r.Context(), tenantID, batch.LegalEntityID, batch.FiscalPeriod, batch.BatchID, principalID, description, lines)
+	journalID, err := h.clients.PostMultiLineJournal(r.Context(), tenantID, batch.LegalEntityID, batch.FiscalPeriod, batch.BatchID, principalID, description, lines, meta)
 	if err != nil {
 		h.log.Error("CommitOpeningPosting: journal posting failed", zap.String("batch_id", id), zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "journal_posting_failed", err.Error())
@@ -3860,8 +4006,8 @@ func (h *Handler) reconcileMigrationBatch(w http.ResponseWriter, r *http.Request
 // side only. Empty means reconciled. The first discrepancy in account order
 // is named, so the quarantine reason is deterministic.
 func migrationReconciliationDiscrepancy(batch *domain.MigrationBatch, journal *domain.PostedJournal) string {
-	if journal.Status != "POSTED" {
-		return fmt.Sprintf("journal %s is %s, not POSTED", journal.JournalID, journal.Status)
+	if journal.Status != domain.GLJournalStatusFinalized {
+		return fmt.Sprintf("journal %s is %s, not %s", journal.JournalID, journal.Status, domain.GLJournalStatusFinalized)
 	}
 	if journal.LegalEntityID != batch.LegalEntityID || journal.FiscalPeriod != batch.FiscalPeriod {
 		return fmt.Sprintf("journal %s is booked to %s/%s, not the batch's %s/%s",

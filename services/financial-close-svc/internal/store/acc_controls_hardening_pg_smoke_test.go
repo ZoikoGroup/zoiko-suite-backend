@@ -27,6 +27,10 @@ const testRequestHash = "0000000000000000000000000000000000000000000000000000000
 
 const otherRequestHash = "1111111111111111111111111111111111111111111111111111111111111111"
 
+// storeTestCurrency is the currency every fixture record is created in:
+// migration 000022 refuses a new row without one.
+const storeTestCurrency = "GBP"
+
 func newHardeningStore(t *testing.T) (*pgxpool.Pool, *store.PgStore, context.Context, string) {
 	t.Helper()
 	pool := openTestPool(t)
@@ -36,7 +40,8 @@ func newHardeningStore(t *testing.T) (*pgxpool.Pool, *store.PgStore, context.Con
 
 func draftAccrual(description string) *domain.AccrualSchedule {
 	return &domain.AccrualSchedule{
-		ScheduleID: uuid.New().String(), LegalEntityID: "le-1", Description: description, PolicyVersion: "v1",
+		CurrencyCode: storeTestCurrency,
+		ScheduleID:   uuid.New().String(), LegalEntityID: "le-1", Description: description, PolicyVersion: "v1",
 		TotalAmount: 900, StartFiscalPeriod: "2026-01", PeriodCount: 3,
 		DebitAccountCode: "6100-AuditFee", CreditAccountCode: "2100-AccruedLiabilities",
 		Status: domain.AccrualStatusDraft, CreatedAt: time.Now().UTC(), CreatedByPrincipalID: "preparer-1",
@@ -66,7 +71,8 @@ func TestPgStore_SoD_SelfApprovalRefusedByDatabase_RealDB(t *testing.T) {
 	}
 
 	ppy := &domain.PrepaymentSchedule{
-		ScheduleID: uuid.New().String(), LegalEntityID: "le-1", Description: "sod prepayment",
+		CurrencyCode: storeTestCurrency,
+		ScheduleID:   uuid.New().String(), LegalEntityID: "le-1", Description: "sod prepayment",
 		TotalAmount: 1200, StartFiscalPeriod: "2026-01", PeriodCount: 12,
 		DebitAccountCode: "6200-Insurance", CreditAccountCode: "1400-Prepaid",
 		Status: domain.PrepaymentStatusDraft, CreatedAt: now, CreatedByPrincipalID: "preparer-1",
@@ -80,6 +86,7 @@ func TestPgStore_SoD_SelfApprovalRefusedByDatabase_RealDB(t *testing.T) {
 
 	ruleID := uuid.New().String()
 	rule := &domain.AllocationRule{
+		CurrencyCode:  storeTestCurrency,
 		RuleVersionID: ruleID, RuleID: ruleID, Version: 1, LegalEntityID: "le-1", Name: "sod rule",
 		SourceAccountCode: "5000-Shared", Drivers: []domain.AllocationDriver{{RecipientAccountCode: "6100-Sales", WeightPercentage: 100}},
 		Status: domain.AllocationRuleStatusDraft, CreatedAt: now, CreatedByPrincipalID: "preparer-1",
@@ -92,7 +99,8 @@ func TestPgStore_SoD_SelfApprovalRefusedByDatabase_RealDB(t *testing.T) {
 	}
 
 	fx := &domain.FXRevaluationRun{
-		RunID: uuid.New().String(), LegalEntityID: "le-1", FiscalPeriod: "2026-01", FXGainLossAccountCode: "7900-FX",
+		CurrencyCode: storeTestCurrency,
+		RunID:        uuid.New().String(), LegalEntityID: "le-1", FiscalPeriod: "2026-01", FXGainLossAccountCode: "7900-FX",
 		Status: domain.FXRevaluationStatusReview, CreatedAt: now, CreatedByPrincipalID: "preparer-1",
 	}
 	if _, err := s.CreateFXRevaluationRun(ctx, fx, uuid.NewString(), testRequestHash); err != nil {
@@ -103,7 +111,8 @@ func TestPgStore_SoD_SelfApprovalRefusedByDatabase_RealDB(t *testing.T) {
 	}
 
 	batch := &domain.MigrationBatch{
-		BatchID: uuid.New().String(), LegalEntityID: "le-1", FiscalPeriod: "2026-01",
+		CurrencyCode: storeTestCurrency,
+		BatchID:      uuid.New().String(), LegalEntityID: "le-1", FiscalPeriod: "2026-01",
 		SourceSystemName: "LegacyERP", SourceExtractHash: "sha256:x", ExpectedRowCount: 1,
 		Status: domain.MigrationBatchStatusLoaded, CreatedAt: now, CreatedByPrincipalID: "preparer-1",
 		Entries: []domain.MigrationCrosswalkEntry{{EntryID: uuid.New().String(), SourceReferenceID: "R1", TargetAccountCode: "1000-Cash"}},
@@ -158,7 +167,8 @@ func TestPgStore_TransitionsWithSetClause_ApplyAgainstRealDB(t *testing.T) {
 	}
 
 	ppy := &domain.PrepaymentSchedule{
-		ScheduleID: uuid.New().String(), LegalEntityID: "le-1", Description: "terminate me", TotalAmount: 1200,
+		CurrencyCode: storeTestCurrency,
+		ScheduleID:   uuid.New().String(), LegalEntityID: "le-1", Description: "terminate me", TotalAmount: 1200,
 		StartFiscalPeriod: "2026-01", PeriodCount: 12, DebitAccountCode: "6200-Insurance", CreditAccountCode: "1400-Prepaid",
 		Status: domain.PrepaymentStatusDraft, CreatedAt: now, CreatedByPrincipalID: "preparer-1",
 	}
@@ -206,7 +216,8 @@ func TestPgStore_CommandIdempotency_ReplayConflictAndRace_RealDB(t *testing.T) {
 		t.Fatalf("same key, different body: want ErrIdempotencyKeyConflict, got %v", err)
 	}
 	ppy := &domain.PrepaymentSchedule{
-		ScheduleID: uuid.New().String(), LegalEntityID: "le-1", Description: "x", TotalAmount: 1, StartFiscalPeriod: "2026-01",
+		CurrencyCode: storeTestCurrency,
+		ScheduleID:   uuid.New().String(), LegalEntityID: "le-1", Description: "x", TotalAmount: 1, StartFiscalPeriod: "2026-01",
 		PeriodCount: 1, DebitAccountCode: "a", CreditAccountCode: "b", Status: domain.PrepaymentStatusDraft,
 		CreatedAt: time.Now().UTC(), CreatedByPrincipalID: "preparer-1",
 	}
@@ -269,7 +280,8 @@ func TestPgStore_FXReversal_AtMostOnePerPriorRun_RealDB(t *testing.T) {
 	now := time.Now().UTC()
 
 	prior := &domain.FXRevaluationRun{
-		RunID: uuid.New().String(), LegalEntityID: "le-1", FiscalPeriod: "2026-01", FXGainLossAccountCode: "7900-FX",
+		CurrencyCode: storeTestCurrency,
+		RunID:        uuid.New().String(), LegalEntityID: "le-1", FiscalPeriod: "2026-01", FXGainLossAccountCode: "7900-FX",
 		Status: domain.FXRevaluationStatusPosted, CreatedAt: now, CreatedByPrincipalID: "preparer-1",
 		Items: []domain.FXRevaluationItem{
 			{ItemID: uuid.New().String(), AccountCode: "1100-EURCash", AccountType: domain.AccountTypeAsset, CurrencyCode: "EUR",
@@ -289,7 +301,8 @@ func TestPgStore_FXReversal_AtMostOnePerPriorRun_RealDB(t *testing.T) {
 	reversal := func() *domain.FXRevaluationRun {
 		id := prior.RunID
 		return &domain.FXRevaluationRun{
-			RunID: uuid.New().String(), LegalEntityID: "le-1", FiscalPeriod: "2026-01", FXGainLossAccountCode: "7900-FX",
+			CurrencyCode: storeTestCurrency,
+			RunID:        uuid.New().String(), LegalEntityID: "le-1", FiscalPeriod: "2026-01", FXGainLossAccountCode: "7900-FX",
 			Status: domain.FXRevaluationStatusReview, ReversalOfRunID: &id, CreatedAt: now, CreatedByPrincipalID: "preparer-2",
 		}
 	}
@@ -443,7 +456,8 @@ func TestPgStore_ListPostedJournalLineage_ClassifiesInOneQuery_RealDB(t *testing
 	// A migration batch quarantined after posting still has a journal on the
 	// ledger, so it stays in the population.
 	batch := &domain.MigrationBatch{
-		BatchID: uuid.New().String(), LegalEntityID: "le-1", FiscalPeriod: "2026-01", SourceSystemName: "LegacyERP",
+		CurrencyCode: storeTestCurrency,
+		BatchID:      uuid.New().String(), LegalEntityID: "le-1", FiscalPeriod: "2026-01", SourceSystemName: "LegacyERP",
 		SourceExtractHash: "sha256:x", ExpectedRowCount: 1, Status: domain.MigrationBatchStatusLoaded, CreatedAt: now, CreatedByPrincipalID: "preparer-1",
 		Entries: []domain.MigrationCrosswalkEntry{{EntryID: uuid.New().String(), SourceReferenceID: "R1", TargetAccountCode: "1000-Cash"}},
 	}

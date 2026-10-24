@@ -41,6 +41,17 @@ func mapPgError(err error) error {
 	if errors.As(err, &pgErr) && pgErr.Code == "23514" && strings.HasPrefix(pgErr.ConstraintName, "sod_") {
 		return domain.ErrSelfApproval
 	}
+	// Migration 000022's journal-currency guards.
+	if errors.As(err, &pgErr) {
+		switch {
+		case pgErr.ConstraintName == "journal_currency_required":
+			return domain.ErrCurrencyCodeMissing
+		case pgErr.ConstraintName == "journal_currency_immutable":
+			return domain.ErrCurrencyCodeImmutable
+		case strings.HasSuffix(pgErr.ConstraintName, "_currency_format"):
+			return domain.ErrInvalidCurrencyCode
+		}
+	}
 	return err
 }
 
@@ -500,7 +511,7 @@ const accrualScheduleColumns = `
 	total_amount, start_fiscal_period, period_count, debit_account_code,
 	credit_account_code, status, created_at, created_by_principal_id,
 	submitted_at, submitted_by_principal_id, approved_at, approved_by_principal_id,
-	cancelled_at, cancelled_by_principal_id`
+	cancelled_at, cancelled_by_principal_id, COALESCE(currency_code, '')`
 
 func scanAccrualSchedule(row pgx.Row) (*domain.AccrualSchedule, error) {
 	var sch domain.AccrualSchedule
@@ -509,7 +520,7 @@ func scanAccrualSchedule(row pgx.Row) (*domain.AccrualSchedule, error) {
 		&sch.TotalAmount, &sch.StartFiscalPeriod, &sch.PeriodCount, &sch.DebitAccountCode,
 		&sch.CreditAccountCode, &sch.Status, &sch.CreatedAt, &sch.CreatedByPrincipalID,
 		&sch.SubmittedAt, &sch.SubmittedByPrincipalID, &sch.ApprovedAt, &sch.ApprovedByPrincipalID,
-		&sch.CancelledAt, &sch.CancelledByPrincipalID,
+		&sch.CancelledAt, &sch.CancelledByPrincipalID, &sch.CurrencyCode,
 	); err != nil {
 		return nil, err
 	}
@@ -527,11 +538,11 @@ func (s *PgStore) CreateAccrualSchedule(ctx context.Context, sch *domain.Accrual
 				INSERT INTO accrual_schedules (
 					schedule_id, tenant_id, legal_entity_id, description, policy_version,
 					total_amount, start_fiscal_period, period_count, debit_account_code,
-					credit_account_code, status, created_at, created_by_principal_id
-				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+					credit_account_code, status, created_at, created_by_principal_id, currency_code
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NULLIF($14, ''))
 			`, sch.ScheduleID, svcmiddleware.TenantFromContext(ctx), sch.LegalEntityID, sch.Description, sch.PolicyVersion,
 				sch.TotalAmount, sch.StartFiscalPeriod, sch.PeriodCount, sch.DebitAccountCode,
-				sch.CreditAccountCode, sch.Status, sch.CreatedAt, sch.CreatedByPrincipalID)
+				sch.CreditAccountCode, sch.Status, sch.CreatedAt, sch.CreatedByPrincipalID, sch.CurrencyCode)
 			return err
 		},
 		func(tx pgx.Tx, id string) error {
@@ -890,7 +901,8 @@ const prepaymentScheduleColumns = `
 	total_amount, start_fiscal_period, period_count, debit_account_code,
 	credit_account_code, status, created_at, created_by_principal_id,
 	approved_at, approved_by_principal_id,
-	terminated_at, terminated_by_principal_id, termination_reason, termination_final_treatment`
+	terminated_at, terminated_by_principal_id, termination_reason, termination_final_treatment,
+	COALESCE(currency_code, '')`
 
 func scanPrepaymentSchedule(row pgx.Row) (*domain.PrepaymentSchedule, error) {
 	var sch domain.PrepaymentSchedule
@@ -900,6 +912,7 @@ func scanPrepaymentSchedule(row pgx.Row) (*domain.PrepaymentSchedule, error) {
 		&sch.CreditAccountCode, &sch.Status, &sch.CreatedAt, &sch.CreatedByPrincipalID,
 		&sch.ApprovedAt, &sch.ApprovedByPrincipalID,
 		&sch.TerminatedAt, &sch.TerminatedByPrincipalID, &sch.TerminationReason, &sch.TerminationFinalTreatment,
+		&sch.CurrencyCode,
 	); err != nil {
 		return nil, err
 	}
@@ -915,11 +928,11 @@ func (s *PgStore) CreatePrepaymentSchedule(ctx context.Context, sch *domain.Prep
 				INSERT INTO prepayment_schedules (
 					schedule_id, tenant_id, legal_entity_id, description,
 					total_amount, start_fiscal_period, period_count, debit_account_code,
-					credit_account_code, status, created_at, created_by_principal_id
-				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+					credit_account_code, status, created_at, created_by_principal_id, currency_code
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NULLIF($13, ''))
 			`, sch.ScheduleID, svcmiddleware.TenantFromContext(ctx), sch.LegalEntityID, sch.Description,
 				sch.TotalAmount, sch.StartFiscalPeriod, sch.PeriodCount, sch.DebitAccountCode,
-				sch.CreditAccountCode, sch.Status, sch.CreatedAt, sch.CreatedByPrincipalID)
+				sch.CreditAccountCode, sch.Status, sch.CreatedAt, sch.CreatedByPrincipalID, sch.CurrencyCode)
 			return err
 		},
 		func(tx pgx.Tx, id string) error {
@@ -1144,14 +1157,14 @@ func (s *PgStore) ListPrepaymentRecognitions(ctx context.Context, scheduleID str
 const allocationRuleColumns = `
 	rule_version_id, rule_id, version, tenant_id, legal_entity_id, name,
 	source_account_code, status, created_at, created_by_principal_id,
-	approved_at, approved_by_principal_id, effective_to`
+	approved_at, approved_by_principal_id, effective_to, COALESCE(currency_code, '')`
 
 func scanAllocationRule(row pgx.Row) (*domain.AllocationRule, error) {
 	var rule domain.AllocationRule
 	if err := row.Scan(
 		&rule.RuleVersionID, &rule.RuleID, &rule.Version, &rule.TenantID, &rule.LegalEntityID, &rule.Name,
 		&rule.SourceAccountCode, &rule.Status, &rule.CreatedAt, &rule.CreatedByPrincipalID,
-		&rule.ApprovedAt, &rule.ApprovedByPrincipalID, &rule.EffectiveTo,
+		&rule.ApprovedAt, &rule.ApprovedByPrincipalID, &rule.EffectiveTo, &rule.CurrencyCode,
 	); err != nil {
 		return nil, err
 	}
@@ -1186,10 +1199,10 @@ func (s *PgStore) CreateAllocationRule(ctx context.Context, rule *domain.Allocat
 			_, err := tx.Exec(ctx, `
 				INSERT INTO allocation_rules (
 					rule_version_id, rule_id, version, tenant_id, legal_entity_id, name,
-					source_account_code, status, created_at, created_by_principal_id
-				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+					source_account_code, status, created_at, created_by_principal_id, currency_code
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULLIF($11, ''))
 			`, rule.RuleVersionID, rule.RuleID, rule.Version, svcmiddleware.TenantFromContext(ctx), rule.LegalEntityID, rule.Name,
-				rule.SourceAccountCode, rule.Status, rule.CreatedAt, rule.CreatedByPrincipalID)
+				rule.SourceAccountCode, rule.Status, rule.CreatedAt, rule.CreatedByPrincipalID, rule.CurrencyCode)
 			if err != nil {
 				return err
 			}
@@ -1388,10 +1401,11 @@ func (s *PgStore) SupersedeAllocationRule(ctx context.Context, ruleID string, ne
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO allocation_rules (
 				rule_version_id, rule_id, version, tenant_id, legal_entity_id, name,
-				source_account_code, status, created_at, created_by_principal_id
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+				source_account_code, status, created_at, created_by_principal_id, currency_code
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULLIF($11, ''))
 		`, newVersion.RuleVersionID, ruleID, newVersion.Version, tenantID, newVersion.LegalEntityID, newVersion.Name,
-			newVersion.SourceAccountCode, domain.AllocationRuleStatusDraft, newVersion.CreatedAt, newVersion.CreatedByPrincipalID); err != nil {
+			newVersion.SourceAccountCode, domain.AllocationRuleStatusDraft, newVersion.CreatedAt, newVersion.CreatedByPrincipalID,
+			newVersion.CurrencyCode); err != nil {
 			return mapPgError(err)
 		}
 		return mapPgError(insertAllocationDrivers(ctx, tx, newVersion.RuleVersionID, newVersion.Drivers))
@@ -1585,14 +1599,14 @@ func (s *PgStore) ListAllocationExceptions(ctx context.Context, legalEntityID st
 const fxRunColumns = `
 	run_id, tenant_id, legal_entity_id, fiscal_period, fx_gain_loss_account_code,
 	status, reversal_of_run_id, journal_id, created_at, created_by_principal_id,
-	approved_at, approved_by_principal_id, posted_at, posted_by_principal_id`
+	approved_at, approved_by_principal_id, posted_at, posted_by_principal_id, COALESCE(currency_code, '')`
 
 func scanFXRun(row pgx.Row) (*domain.FXRevaluationRun, error) {
 	var run domain.FXRevaluationRun
 	if err := row.Scan(
 		&run.RunID, &run.TenantID, &run.LegalEntityID, &run.FiscalPeriod, &run.FXGainLossAccountCode,
 		&run.Status, &run.ReversalOfRunID, &run.JournalID, &run.CreatedAt, &run.CreatedByPrincipalID,
-		&run.ApprovedAt, &run.ApprovedByPrincipalID, &run.PostedAt, &run.PostedByPrincipalID,
+		&run.ApprovedAt, &run.ApprovedByPrincipalID, &run.PostedAt, &run.PostedByPrincipalID, &run.CurrencyCode,
 	); err != nil {
 		return nil, err
 	}
@@ -1664,10 +1678,10 @@ func insertFXRun(ctx context.Context, tx pgx.Tx, tenantID string, run *domain.FX
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO fx_revaluation_runs (
 			run_id, tenant_id, legal_entity_id, fiscal_period, fx_gain_loss_account_code,
-			status, reversal_of_run_id, created_at, created_by_principal_id
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+			status, reversal_of_run_id, created_at, created_by_principal_id, currency_code
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULLIF($10, ''))
 	`, run.RunID, tenantID, run.LegalEntityID, run.FiscalPeriod, run.FXGainLossAccountCode,
-		run.Status, run.ReversalOfRunID, run.CreatedAt, run.CreatedByPrincipalID); err != nil {
+		run.Status, run.ReversalOfRunID, run.CreatedAt, run.CreatedByPrincipalID, run.CurrencyCode); err != nil {
 		return err
 	}
 	if len(run.Items) == 0 {
@@ -1816,7 +1830,7 @@ const migrationBatchColumns = `
 	source_extract_hash, expected_row_count, expected_total_debits, expected_total_credits,
 	status, quarantine_reason, journal_id, created_at, created_by_principal_id,
 	validated_at, approved_at, approved_by_principal_id, posted_at, reconciled_at,
-	certified_at, certified_by_principal_id, certification_reason`
+	certified_at, certified_by_principal_id, certification_reason, COALESCE(currency_code, '')`
 
 func scanMigrationBatch(row pgx.Row) (*domain.MigrationBatch, error) {
 	var b domain.MigrationBatch
@@ -1825,7 +1839,7 @@ func scanMigrationBatch(row pgx.Row) (*domain.MigrationBatch, error) {
 		&b.SourceExtractHash, &b.ExpectedRowCount, &b.ExpectedTotalDebits, &b.ExpectedTotalCredits,
 		&b.Status, &b.QuarantineReason, &b.JournalID, &b.CreatedAt, &b.CreatedByPrincipalID,
 		&b.ValidatedAt, &b.ApprovedAt, &b.ApprovedByPrincipalID, &b.PostedAt, &b.ReconciledAt,
-		&b.CertifiedAt, &b.CertifiedByPrincipalID, &b.CertificationReason,
+		&b.CertifiedAt, &b.CertifiedByPrincipalID, &b.CertificationReason, &b.CurrencyCode,
 	); err != nil {
 		return nil, err
 	}
@@ -1842,11 +1856,11 @@ func (s *PgStore) CreateMigrationBatch(ctx context.Context, b *domain.MigrationB
 			INSERT INTO migration_batches (
 				batch_id, tenant_id, legal_entity_id, fiscal_period, source_system_name,
 				source_extract_hash, expected_row_count, expected_total_debits, expected_total_credits,
-				status, created_at, created_by_principal_id
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+				status, created_at, created_by_principal_id, currency_code
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NULLIF($13, ''))
 		`, b.BatchID, tenantID, b.LegalEntityID, b.FiscalPeriod, b.SourceSystemName,
 			b.SourceExtractHash, b.ExpectedRowCount, b.ExpectedTotalDebits, b.ExpectedTotalCredits,
-			b.Status, b.CreatedAt, b.CreatedByPrincipalID)
+			b.Status, b.CreatedAt, b.CreatedByPrincipalID, b.CurrencyCode)
 		if err != nil {
 			return mapPgError(err)
 		}

@@ -519,6 +519,51 @@ func (c *Clients) CompileTrialBalanceDecimal(ctx context.Context, tenantID, lega
 	}, nil
 }
 
+// setLedgerEnvelope sets the §4 envelope general-ledger-svc's middleware
+// requires on a write in its default write-strict mode: tenant, actor, legal
+// entity, request id, correlation id and source channel. Without them every
+// write to GL is refused with 400 envelope_incomplete before it reaches a
+// handler (SPEC_DEVIATIONS A13). Inbound request, correlation and causation
+// ids carry through so GL's record is traceable to the command that caused
+// it; ones that are absent are minted. Returns the request id, which callers
+// whose write has no business key of its own build an Idempotency-Key from.
+func setLedgerEnvelope(ctx context.Context, req *http.Request, tenantID, principalID, legalEntityID string) string {
+	req.Header.Set("X-Tenant-Id", tenantID)
+	req.Header.Set("X-Principal-Id", principalID)
+	req.Header.Set("X-Legal-Entity-Id", legalEntityID)
+
+	requestID := middleware.GetReqID(ctx)
+	sourceChannel := "system"
+	correlationID := ""
+	if env, ok := svcenvelope.FromContext(ctx); ok {
+		if env.TenantID != "" {
+			req.Header.Set("X-Tenant-Id", env.TenantID)
+		}
+		if env.RequestID != "" {
+			requestID = env.RequestID
+		}
+		if env.SourceChannel != "" {
+			sourceChannel = string(env.SourceChannel)
+		}
+		if env.CorrelationID != "" {
+			correlationID = env.CorrelationID
+		}
+		if env.CausationID != "" {
+			req.Header.Set("X-Causation-Id", env.CausationID)
+		}
+	}
+	if requestID == "" {
+		requestID = uuid.NewString()
+	}
+	if correlationID == "" {
+		correlationID = uuid.NewString()
+	}
+	req.Header.Set("X-Request-Id", requestID)
+	req.Header.Set("X-Source-Channel", sourceChannel)
+	req.Header.Set("X-Correlation-ID", correlationID)
+	return requestID
+}
+
 // compileTrialBalance is the shared HTTP call both public methods above
 // wrap: ask general-ledger-svc's ACC-15 endpoint to compile the period and
 // decode its answer, without picking a representation for the balances —
@@ -533,47 +578,8 @@ func (c *Clients) compileTrialBalance(ctx context.Context, tenantID, legalEntity
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Tenant-Id", tenantID)
-	req.Header.Set("X-Principal-Id", principalID)
-	req.Header.Set("X-Legal-Entity-Id", legalEntityID)
-
-	// Forward canonical envelope headers so general-ledger-svc's envelope
-	// middleware (write-strict mode) accepts this write request. Mirrors
-	// the pattern in checkAllowedLive.
-	ledgerRequestID := middleware.GetReqID(ctx)
-	ledgerSourceChannel := "system"
-	ledgerCorrelationID := ""
-	if env, ok := svcenvelope.FromContext(ctx); ok {
-		if env.TenantID != "" {
-			req.Header.Set("X-Tenant-Id", env.TenantID)
-		}
-		if env.RequestID != "" {
-			ledgerRequestID = env.RequestID
-		}
-		if env.SourceChannel != "" {
-			ledgerSourceChannel = string(env.SourceChannel)
-		}
-		if env.CorrelationID != "" {
-			ledgerCorrelationID = env.CorrelationID
-		}
-		if env.CausationID != "" {
-			req.Header.Set("X-Causation-Id", env.CausationID)
-		}
-	}
-	// If no request ID from middleware or envelope, generate one for traceability.
-	if ledgerRequestID == "" {
-		ledgerRequestID = uuid.NewString()
-	}
-	req.Header.Set("X-Request-Id", ledgerRequestID)
-	req.Header.Set("X-Source-Channel", ledgerSourceChannel)
-	// If no correlation ID from envelope, generate one for end-to-end traceability.
-	if ledgerCorrelationID == "" {
-		ledgerCorrelationID = uuid.NewString()
-	}
-	req.Header.Set("X-Correlation-ID", ledgerCorrelationID)
-
-	// Idempotency key for general-ledger-svc's material write endpoint.
-	req.Header.Set("Idempotency-Key", ledgerRequestID+":compile-trial-balance:"+fiscalPeriod)
+	requestID := setLedgerEnvelope(ctx, req, tenantID, principalID, legalEntityID)
+	req.Header.Set("Idempotency-Key", requestID+":compile-trial-balance:"+fiscalPeriod)
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -644,6 +650,32 @@ type glCreateJournalRequest struct {
 	Description   string               `json:"description"`
 	CorrelationID string               `json:"correlation_id"`
 	Lines         []glJournalLineInput `json:"lines"`
+
+	// ACC-03 required source inputs; general-ledger-svc refuses a journal
+	// missing any of them (400 missing_field). Dates are YYYY-MM-DD.
+	JournalType     string `json:"journal_type"`
+	TransactionDate string `json:"transaction_date"`
+	PostingDate     string `json:"posting_date"`
+	CurrencyCode    string `json:"currency_code"`
+}
+
+const glDateLayout = "2006-01-02"
+
+// newGLCreateJournalRequest is the one place a create body is assembled, so
+// no posting path can leave out ACC-03's required inputs again.
+func newGLCreateJournalRequest(tenantID, legalEntityID, fiscalPeriod, description, correlationID string, meta domain.GLJournalMeta, lines []glJournalLineInput) glCreateJournalRequest {
+	return glCreateJournalRequest{
+		TenantID:        tenantID,
+		LegalEntityID:   legalEntityID,
+		FiscalPeriod:    fiscalPeriod,
+		Description:     description,
+		CorrelationID:   correlationID,
+		Lines:           lines,
+		JournalType:     meta.JournalType,
+		TransactionDate: meta.TransactionDate.UTC().Format(glDateLayout),
+		PostingDate:     meta.PostingDate.UTC().Format(glDateLayout),
+		CurrencyCode:    meta.CurrencyCode,
+	}
 }
 
 type glJournalLineInput struct {
@@ -672,30 +704,30 @@ type glJournalCreateResponse struct {
 // instead of a duplicate, satisfying the spec's own negative-path
 // requirement for "Recognition run replay" without this client needing to
 // implement replay detection itself.
-func (c *Clients) PostAccrualRecognitionJournal(ctx context.Context, tenantID, legalEntityID, fiscalPeriod, correlationID, principalID, description, debitAccountCode, creditAccountCode string, amount float64) (journalID string, err error) {
-	body := glCreateJournalRequest{
-		TenantID:      tenantID,
-		LegalEntityID: legalEntityID,
-		FiscalPeriod:  fiscalPeriod,
-		Description:   description,
-		CorrelationID: correlationID,
-		Lines: []glJournalLineInput{
-			{AccountCode: debitAccountCode, DebitAmount: amount, Description: description},
-			{AccountCode: creditAccountCode, CreditAmount: amount, Description: description},
-		},
-	}
+func (c *Clients) PostAccrualRecognitionJournal(ctx context.Context, tenantID, legalEntityID, fiscalPeriod, correlationID, principalID, description, debitAccountCode, creditAccountCode string, amount float64, meta domain.GLJournalMeta) (journalID string, err error) {
+	body := newGLCreateJournalRequest(tenantID, legalEntityID, fiscalPeriod, description, correlationID, meta, []glJournalLineInput{
+		{AccountCode: debitAccountCode, DebitAmount: amount, Description: description},
+		{AccountCode: creditAccountCode, CreditAmount: amount, Description: description},
+	})
+	return c.createValidatePost(ctx, tenantID, principalID, body)
+}
+
+// createValidatePost runs general-ledger-svc's Create -> Validate -> Post
+// lifecycle for one journal, resuming wherever a replayed create finds it
+// (CreateJournal is idempotent on correlation_id).
+func (c *Clients) createValidatePost(ctx context.Context, tenantID, principalID string, body glCreateJournalRequest) (string, error) {
 	journal, err := c.createGLJournal(ctx, tenantID, principalID, body)
 	if err != nil {
 		return "", err
 	}
 	if journal.Status == "PENDING" {
-		if err := c.transitionGLJournal(ctx, tenantID, principalID, journal.JournalID, "validate"); err != nil {
+		if err := c.transitionGLJournal(ctx, tenantID, principalID, body.LegalEntityID, journal.JournalID, "validate"); err != nil {
 			return "", err
 		}
 		journal.Status = "VALIDATED"
 	}
 	if journal.Status == "VALIDATED" {
-		if err := c.transitionGLJournal(ctx, tenantID, principalID, journal.JournalID, "post"); err != nil {
+		if err := c.transitionGLJournal(ctx, tenantID, principalID, body.LegalEntityID, journal.JournalID, "post"); err != nil {
 			return "", err
 		}
 	}
@@ -716,7 +748,7 @@ type glReverseJournalResponse struct {
 // the caller's own idempotency anchor, distinct from the recognition's
 // own correlation_id (schedule_id+fiscal_period) — reversing a posting is
 // a different idempotent operation from creating it.
-func (c *Clients) ReverseGLJournal(ctx context.Context, tenantID, principalID, journalID, reason, correlationID string) (reversingJournalID string, err error) {
+func (c *Clients) ReverseGLJournal(ctx context.Context, tenantID, principalID, legalEntityID, journalID, reason, correlationID string) (reversingJournalID string, err error) {
 	payload, err := json.Marshal(map[string]string{"reason": reason, "correlation_id": correlationID})
 	if err != nil {
 		return "", err
@@ -726,8 +758,8 @@ func (c *Clients) ReverseGLJournal(ctx context.Context, tenantID, principalID, j
 		return "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Tenant-Id", tenantID)
-	req.Header.Set("X-Principal-Id", principalID)
+	setLedgerEnvelope(ctx, req, tenantID, principalID, legalEntityID)
+	req.Header.Set("Idempotency-Key", "gl-journal-reverse:"+correlationID)
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -758,8 +790,10 @@ func (c *Clients) createGLJournal(ctx context.Context, tenantID, principalID str
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Tenant-Id", tenantID)
-	req.Header.Set("X-Principal-Id", principalID)
+	setLedgerEnvelope(ctx, req, tenantID, principalID, body.LegalEntityID)
+	// Keyed on the journal's own business key, so a retried posting presents
+	// the same key GL saw the first time.
+	req.Header.Set("Idempotency-Key", "gl-journal-create:"+body.CorrelationID)
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -780,13 +814,13 @@ func (c *Clients) createGLJournal(ctx context.Context, tenantID, principalID str
 	return &out, nil
 }
 
-func (c *Clients) transitionGLJournal(ctx context.Context, tenantID, principalID, journalID, action string) error {
+func (c *Clients) transitionGLJournal(ctx context.Context, tenantID, principalID, legalEntityID, journalID, action string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.ledgerURL+"/v1/journals/"+journalID+"/"+action, nil)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("X-Tenant-Id", tenantID)
-	req.Header.Set("X-Principal-Id", principalID)
+	setLedgerEnvelope(ctx, req, tenantID, principalID, legalEntityID)
+	req.Header.Set("Idempotency-Key", "gl-journal-"+action+":"+journalID)
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -855,39 +889,16 @@ func (c *Clients) ListChartOfAccounts(ctx context.Context, tenantID, principalID
 // ACC-07/08's fixed two-line PostAccrualRecognitionJournal, reusing the
 // same underlying createGLJournal/transitionGLJournal Create-Validate-Post
 // primitives rather than duplicating them.
-func (c *Clients) PostAllocationJournal(ctx context.Context, tenantID, legalEntityID, fiscalPeriod, correlationID, principalID, description, sourceAccountCode string, sourceAmount float64, debitLines []domain.AllocationJournalLine) (journalID string, err error) {
+func (c *Clients) PostAllocationJournal(ctx context.Context, tenantID, legalEntityID, fiscalPeriod, correlationID, principalID, description, sourceAccountCode string, sourceAmount float64, debitLines []domain.AllocationJournalLine, meta domain.GLJournalMeta) (journalID string, err error) {
 	lines := make([]glJournalLineInput, 0, len(debitLines)+1)
 	for _, l := range debitLines {
 		lines = append(lines, glJournalLineInput{AccountCode: l.AccountCode, DebitAmount: l.Amount, Description: description})
 	}
 	lines = append(lines, glJournalLineInput{AccountCode: sourceAccountCode, CreditAmount: sourceAmount, Description: description})
 
-	body := glCreateJournalRequest{
-		TenantID:      tenantID,
-		LegalEntityID: legalEntityID,
-		FiscalPeriod:  fiscalPeriod,
-		Description:   description,
-		CorrelationID: correlationID,
-		Lines:         lines,
-	}
-	journal, err := c.createGLJournal(ctx, tenantID, principalID, body)
-	if err != nil {
-		return "", err
-	}
-	if journal.Status == "PENDING" {
-		if err := c.transitionGLJournal(ctx, tenantID, principalID, journal.JournalID, "validate"); err != nil {
-			return "", err
-		}
-		journal.Status = "VALIDATED"
-	}
-	if journal.Status == "VALIDATED" {
-		if err := c.transitionGLJournal(ctx, tenantID, principalID, journal.JournalID, "post"); err != nil {
-			return "", err
-		}
-	}
-	return journal.JournalID, nil
+	return c.createValidatePost(ctx, tenantID, principalID,
+		newGLCreateJournalRequest(tenantID, legalEntityID, fiscalPeriod, description, correlationID, meta, lines))
 }
-
 
 // PostMultiLineJournal posts one journal with arbitrary mixed debit/credit
 // lines — ACC-10's FX revaluation needs both signs in a single posting
@@ -895,35 +906,13 @@ func (c *Clients) PostAllocationJournal(ctx context.Context, tenantID, legalEnti
 // ACC-09's fixed all-debits-plus-one-credit shape. Reuses the same
 // createGLJournal/transitionGLJournal Create-Validate-Post primitives
 // every other ACC posting client in this file already relies on.
-func (c *Clients) PostMultiLineJournal(ctx context.Context, tenantID, legalEntityID, fiscalPeriod, correlationID, principalID, description string, lines []domain.JournalLineInput) (journalID string, err error) {
+func (c *Clients) PostMultiLineJournal(ctx context.Context, tenantID, legalEntityID, fiscalPeriod, correlationID, principalID, description string, lines []domain.JournalLineInput, meta domain.GLJournalMeta) (journalID string, err error) {
 	glLines := make([]glJournalLineInput, len(lines))
 	for i, l := range lines {
 		glLines[i] = glJournalLineInput{AccountCode: l.AccountCode, DebitAmount: l.DebitAmount, CreditAmount: l.CreditAmount, Description: description}
 	}
-	body := glCreateJournalRequest{
-		TenantID:      tenantID,
-		LegalEntityID: legalEntityID,
-		FiscalPeriod:  fiscalPeriod,
-		Description:   description,
-		CorrelationID: correlationID,
-		Lines:         glLines,
-	}
-	journal, err := c.createGLJournal(ctx, tenantID, principalID, body)
-	if err != nil {
-		return "", err
-	}
-	if journal.Status == "PENDING" {
-		if err := c.transitionGLJournal(ctx, tenantID, principalID, journal.JournalID, "validate"); err != nil {
-			return "", err
-		}
-		journal.Status = "VALIDATED"
-	}
-	if journal.Status == "VALIDATED" {
-		if err := c.transitionGLJournal(ctx, tenantID, principalID, journal.JournalID, "post"); err != nil {
-			return "", err
-		}
-	}
-	return journal.JournalID, nil
+	return c.createValidatePost(ctx, tenantID, principalID,
+		newGLCreateJournalRequest(tenantID, legalEntityID, fiscalPeriod, description, correlationID, meta, glLines))
 }
 
 // listJournals fetches one page of journals and REFUSES a full page.

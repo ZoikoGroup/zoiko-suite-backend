@@ -97,6 +97,13 @@ type AccrualSchedule struct {
 	CreditAccountCode string  `json:"credit_account_code"`
 	Status            string  `json:"status"`
 
+	// CurrencyCode is the ISO 4217 currency this schedule's recognition journals are is booked in. ACC-03 makes
+	// currency a caller-supplied journal input and general-ledger-svc refuses
+	// a journal without one. Service-local until a REF-02 Currency Registry
+	// exists; "" only on a row written before migration 000022, which cannot
+	// post until one is set (SPEC_DEVIATIONS A13).
+	CurrencyCode string `json:"currency_code,omitempty"`
+
 	CreatedAt              time.Time  `json:"created_at"`
 	CreatedByPrincipalID   string     `json:"created_by_principal_id"`
 	SubmittedAt            *time.Time `json:"submitted_at,omitempty"`
@@ -116,6 +123,7 @@ type CreateAccrualRequest struct {
 	PeriodCount       int     `json:"period_count"`
 	DebitAccountCode  string  `json:"debit_account_code"`
 	CreditAccountCode string  `json:"credit_account_code"`
+	CurrencyCode      string  `json:"currency_code"`
 }
 
 type AmendFutureScheduleRequest struct {
@@ -195,6 +203,13 @@ type PrepaymentSchedule struct {
 	CreditAccountCode string  `json:"credit_account_code"`
 	Status            string  `json:"status"`
 
+	// CurrencyCode is the ISO 4217 currency this schedule's recognition and termination journals are is booked in. ACC-03 makes
+	// currency a caller-supplied journal input and general-ledger-svc refuses
+	// a journal without one. Service-local until a REF-02 Currency Registry
+	// exists; "" only on a row written before migration 000022, which cannot
+	// post until one is set (SPEC_DEVIATIONS A13).
+	CurrencyCode string `json:"currency_code,omitempty"`
+
 	CreatedAt                 time.Time  `json:"created_at"`
 	CreatedByPrincipalID      string     `json:"created_by_principal_id"`
 	ApprovedAt                *time.Time `json:"approved_at,omitempty"`
@@ -213,6 +228,7 @@ type CreatePrepaymentRequest struct {
 	PeriodCount       int     `json:"period_count"`
 	DebitAccountCode  string  `json:"debit_account_code"`
 	CreditAccountCode string  `json:"credit_account_code"`
+	CurrencyCode      string  `json:"currency_code"`
 }
 
 type ModifyFutureScheduleRequest struct {
@@ -306,6 +322,13 @@ type AllocationRule struct {
 	ApprovedAt            *time.Time         `json:"approved_at,omitempty"`
 	ApprovedByPrincipalID *string            `json:"approved_by_principal_id,omitempty"`
 	EffectiveTo           *time.Time         `json:"effective_to,omitempty"`
+
+	// CurrencyCode is the ISO 4217 currency this rule version's allocation journals are is booked in. ACC-03 makes
+	// currency a caller-supplied journal input and general-ledger-svc refuses
+	// a journal without one. Service-local until a REF-02 Currency Registry
+	// exists; "" only on a row written before migration 000022, which cannot
+	// post until one is set (SPEC_DEVIATIONS A13).
+	CurrencyCode string `json:"currency_code,omitempty"`
 }
 
 type CreateAllocationRuleRequest struct {
@@ -313,6 +336,7 @@ type CreateAllocationRuleRequest struct {
 	Name              string             `json:"name"`
 	SourceAccountCode string             `json:"source_account_code"`
 	Drivers           []AllocationDriver `json:"drivers"`
+	CurrencyCode      string             `json:"currency_code"`
 }
 
 // SupersedeAllocationRuleRequest is ACC-09's own SupersedeAllocationRule
@@ -327,6 +351,12 @@ type SupersedeAllocationRuleRequest struct {
 	Name              string             `json:"name"`
 	SourceAccountCode string             `json:"source_account_code"`
 	Drivers           []AllocationDriver `json:"drivers"`
+	// CurrencyCode is optional: the new version keeps the current version's
+	// currency. It is required only when the current version has none (a
+	// rule written before migration 000022), which makes a governed
+	// supersede-and-approve the way such a rule acquires one. It may not
+	// differ from a currency the rule already has.
+	CurrencyCode string `json:"currency_code,omitempty"`
 }
 
 // AllocationResultLine is one recipient's computed share within a run —
@@ -434,6 +464,14 @@ type FXRevaluationRun struct {
 	PostedAt              *time.Time          `json:"posted_at,omitempty"`
 	PostedByPrincipalID   *string             `json:"posted_by_principal_id,omitempty"`
 	Items                 []FXRevaluationItem `json:"items,omitempty"`
+
+	// CurrencyCode is the book (functional) currency the revaluation
+	// adjustment is booked in, not an item's foreign currency. Declared at
+	// StartRevaluation because no legal entity carries a functional currency
+	// anywhere on the platform yet (no REF-02 Currency Registry); a reversal
+	// run inherits it from the run it reverses. "" only on a run written
+	// before migration 000022 (SPEC_DEVIATIONS A13).
+	CurrencyCode string `json:"currency_code,omitempty"`
 }
 
 // FXRevaluationItem is one monetary balance's revaluation — permanent
@@ -475,6 +513,8 @@ type StartRevaluationRequest struct {
 	FXGainLossAccountCode string                 `json:"fx_gain_loss_account_code"`
 	RateSet               map[string]float64     `json:"rate_set"`
 	Items                 []RevaluationItemInput `json:"items"`
+	// CurrencyCode is the book currency of the adjustment journal.
+	CurrencyCode string `json:"currency_code"`
 }
 
 type ReversePriorRevaluationRequest struct {
@@ -526,6 +566,13 @@ type MigrationBatch struct {
 	CertifiedByPrincipalID *string                   `json:"certified_by_principal_id,omitempty"`
 	CertificationReason    *string                   `json:"certification_reason,omitempty"`
 	Entries                []MigrationCrosswalkEntry `json:"entries,omitempty"`
+
+	// CurrencyCode is the ISO 4217 currency this batch's opening-balance journal is is booked in. ACC-03 makes
+	// currency a caller-supplied journal input and general-ledger-svc refuses
+	// a journal without one. Service-local until a REF-02 Currency Registry
+	// exists; "" only on a row written before migration 000022, which cannot
+	// post until one is set (SPEC_DEVIATIONS A13).
+	CurrencyCode string `json:"currency_code,omitempty"`
 }
 
 // Crosswalk entry open-item types — see migration 000013's doc comment.
@@ -560,6 +607,7 @@ type CreateMigrationBatchRequest struct {
 	FiscalPeriod      string `json:"fiscal_period"`
 	SourceSystemName  string `json:"source_system_name"`
 	SourceExtractHash string `json:"source_extract_hash"`
+	CurrencyCode      string `json:"currency_code"`
 	// ExpectedRowCount/ExpectedTotalDebits/ExpectedTotalCredits are the
 	// SOURCE system's own declared control totals — independent of
 	// whatever Entries actually arrives with, so ValidateOpeningBalances
@@ -1210,7 +1258,56 @@ var (
 	// command_idempotency claims (migration 000021).
 	ErrIdempotencyKeyRequired = errorString("Idempotency-Key header is required for this command")
 	ErrIdempotencyKeyConflict = errorString("Idempotency-Key was already used for a different command or request body")
+
+	// ErrCurrencyCodeMissing, ErrInvalidCurrencyCode, ErrCurrencyCodeImmutable
+	// and ErrPostingDateUnresolvable back SPEC_DEVIATIONS A13: general-ledger-svc
+	// requires ACC-03's journal_type, dates and currency on every journal, so a
+	// record that cannot supply them is refused here, before any call to GL.
+	ErrCurrencyCodeMissing     = errorString("this record has no currency_code and general-ledger-svc requires one on every journal: it was created before currency was recorded and cannot post until one is set")
+	ErrInvalidCurrencyCode     = errorString("currency_code must be a three-letter upper-case ISO 4217 code")
+	ErrCurrencyCodeImmutable   = errorString("currency_code cannot change once set")
+	ErrPostingDateUnresolvable = errorString("cannot resolve a posting date: the fiscal period is not registered and its name is not YYYY-MM")
 )
+
+// GLJournalMeta is the ACC-03 journal context every journal this service
+// posts carries alongside its lines. general-ledger-svc refuses a journal
+// without journal_type, transaction and posting dates, and currency.
+type GLJournalMeta struct {
+	JournalType     string
+	TransactionDate time.Time
+	PostingDate     time.Time
+	CurrencyCode    string
+}
+
+// general-ledger-svc journal types this service posts. The kernel standard's
+// §8.1 list also names Allocation and Revaluation, which general-ledger-svc
+// does not accept; RECLASS and ADJUSTMENT are their nearest accepted values.
+const (
+	GLJournalTypeAccrual    = "ACCRUAL"    // ACC-07 accruals; ACC-08 prepayment/deferral recognition
+	GLJournalTypeReclass    = "RECLASS"    // ACC-09 allocation
+	GLJournalTypeAdjustment = "ADJUSTMENT" // ACC-10 FX revaluation
+	GLJournalTypeOpening    = "OPENING"    // ACC-17 opening balances
+)
+
+// GLJournalStatusFinalized is general-ledger-svc's posted state (its journals
+// move PENDING -> VALIDATED -> FINALIZED, and FINALIZED -> REVERSED). Only a
+// FINALIZED journal is posted accounting truth; a REVERSED one is not.
+const GLJournalStatusFinalized = "FINALIZED"
+
+// ValidCurrencyCode is general-ledger-svc's own rule (three upper-case ASCII
+// letters), applied when a record is created so a bad code is refused then
+// rather than at its first posting.
+func ValidCurrencyCode(s string) bool {
+	if len(s) != 3 {
+		return false
+	}
+	for i := 0; i < 3; i++ {
+		if s[i] < 'A' || s[i] > 'Z' {
+			return false
+		}
+	}
+	return true
+}
 
 // PostingBacklog is general-ledger-svc's posting backlog for one entity as a
 // close sees it: accounting events GL accepted before the cutoff that have not

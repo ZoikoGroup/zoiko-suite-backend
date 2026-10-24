@@ -33,6 +33,11 @@ ON_ERROR_STOP=1` applied 000001–000021 to an empty database, ran 000021 down
 and up again, and then attempted each new guard (results under B1, B2 and
 B4). No shared development database was used.
 
+Update (2026-10-24, A13 pass): closes A13, a severe defect found while
+tracing A4. Every financial-close-svc posting to general-ledger-svc was
+refused. Migration 000022 is added; the scope is now migrations
+000001–000022. Verification is under A13.
+
 ## Verified controls
 
 Checked against code and schema, not comments:
@@ -207,6 +212,10 @@ Failure scenario: an accrual recognized during close review is refused by GL
 close-journal path the state machine promises does not exist end to end.
 Fixing it needs a journal designation that GL accepts in those states, which
 is a general-ledger-svc change.
+
+Until A13 was closed (2026-10-24), this path could not be exercised: GL
+refused every journal from this service, in any period state, before its
+period check was reached. A4 is the next pass.
 
 ### A5. HardClosed is enforced at GL's API layer, not its data layer, and a posting can race the close
 
@@ -421,6 +430,171 @@ exception and the snapshot integrity failure. No ACC-07/08/09/10/17/18
 lifecycle event is emitted, so consumers named in §23 (close dashboard,
 evidence, reporting) cannot react to them.
 
+### A13. Every journal this service posted was refused by general-ledger-svc — closed 2026-10-24
+
+**Severity:** every ledger consequence this service owns was failing. This
+covered ACC-07 accrual recognition and reversal, ACC-08 prepayment
+recognition and termination settlement, ACC-09 allocation, ACC-10 FX
+revaluation and ACC-17 opening balances. They failed in every period state,
+OPEN included. Nothing was posted wrongly: each failure was fail-closed and
+surfaced as 503 `journal_posting_failed`. Nothing was posted at all.
+
+**Finding.** Commit d18abaa9 (2026-08-24, the §4 envelope rollout) made
+general-ledger-svc enforce two contracts this service's GL client never met.
+
+- *The envelope.* In its default `write-strict` mode GL's envelope middleware
+  refuses a write (400 `envelope_incomplete`) unless it carries
+  `X-Request-Id`, `X-Correlation-ID`, `X-Source-Channel`, `Idempotency-Key`
+  and `X-Legal-Entity-Id`. `createGLJournal`, `transitionGLJournal` (validate
+  and post) and `ReverseGLJournal` sent only tenant and principal.
+  `compileTrialBalance`, in the same file, already sent the full set.
+- *ACC-03's required journal inputs.* `CreateJournal` refuses a body without
+  `journal_type`, `transaction_date`, `posting_date` and `currency_code` (400
+  `missing_field`). ZS-SVC-B-001 ACC-03 makes these caller-supplied: "Required
+  source inputs: entity/book; journal type; document/transaction/posting
+  dates; currency; ...". Only the FX rate is server-resolved. GL enforcing
+  them is correct; this service not sending them was the defect.
+
+None of the five records that post journals carried a currency, so there was
+nothing to send. The handler tests stub the GL client, so neither contract
+was ever exercised.
+
+**Resolution.**
+
+- *One envelope helper.* `setLedgerEnvelope` sets the §4 headers on every GL
+  write. `compileTrialBalance`'s inline copy became it.
+- *Idempotency keys.* Each key is built from the write's business key, so a
+  retried posting presents the key GL saw the first time:
+  - create: `gl-journal-create:<correlation_id>`, where the correlation id is
+    schedule:period, run or batch;
+  - validate and post: `gl-journal-<action>:<journal_id>`;
+  - reverse: `gl-journal-reverse:<correlation_id>`.
+- *One body builder.* Every create body is built by
+  `newGLCreateJournalRequest` from a `domain.GLJournalMeta`, so no path can
+  leave ACC-03's inputs out again.
+- *Journal type per path.* general-ledger-svc accepts STANDARD, ADJUSTMENT,
+  ACCRUAL, REVERSAL, OPENING, CLOSING and RECLASS. The kernel standard's §8.1
+  also names Allocation and Revaluation, which GL does not accept.
+
+  | Path | `journal_type` |
+  |---|---|
+  | ACC-07 recognition | ACCRUAL |
+  | ACC-08 recognition and termination settlement | ACCRUAL |
+  | ACC-09 allocation | RECLASS (nearest to the kernel's Allocation) |
+  | ACC-10 revaluation | ADJUSTMENT (nearest to the kernel's Revaluation) |
+  | ACC-17 opening balances | OPENING |
+
+- *Dates.* Every journal this service posts is a period-end consequence, so
+  both dates are the period's last day. That is the registered period's
+  `period_end` when the period is in the register, and otherwise the last day
+  of a `YYYY-MM` name. Any other period name is refused with 422
+  `posting_date_unresolvable`, never guessed.
+- *Currency.* Migration 000022 adds `currency_code` to `accrual_schedules`,
+  `prepayment_schedules`, `allocation_rules`, `fx_revaluation_runs` and
+  `migration_batches`. For an FX run it is the book currency the adjustment
+  is booked in, not an item's foreign currency.
+  - All five create commands require it as a three-letter upper-case ISO 4217
+    code, otherwise 400.
+  - An allocation supersede keeps the rule's currency. An FX reversal
+    inherits the reversed run's.
+  - The column is sourced from a new service-local field because REF-02 (the
+    Currency Registry) doesn't exist yet. Reconcile it against the registry
+    once it ships. No functional currency exists on any legal entity
+    anywhere in the platform, so there is nothing to derive it from today.
+- *Data-layer guard.* Migration 000022's triggers refuse a new row without a
+  currency, which also catches an internal insert that forgets to copy one.
+  They also refuse changing a currency once set, because journals already
+  posted in it would disagree with the record that produced them. A format
+  CHECK refuses anything that is not three upper-case letters.
+
+**Legacy rows.** A record created before migration 000022 has a NULL
+currency, and the platform has nothing to backfill it from.
+
+- Its postings are refused before any GL call, and before any state moves,
+  with 422 `currency_code_missing`. They no longer reach GL as a 400 that
+  surfaced as "GL unavailable".
+- An ACC-09 rule acquires a currency through a governed supersede-and-approve:
+  the supersede may set one only when the current version has none.
+- The other four record types have no API to set one. The guard allows a
+  legacy NULL to be set exactly once (an operator `UPDATE`) and never changed
+  after that. A governed set-currency command for them is open.
+
+**Not changed (noted).**
+
+- `ErrJournalPostingFailed`'s text still reads "rejected the accrual
+  recognition journal" on every path, including FX and migration.
+- GL's `tenant_id` and `legal_entity_id` are uuid columns, so a non-UUID
+  entity id is refused there as a store error (503). Real ids are
+  registry-issued UUIDs, but this service does not validate the shape.
+
+**Tests.**
+
+- `internal/clients/gl_journal_contract_test.go`: create, validate, post and
+  reverse each carry the envelope; the create body carries the ACC-03 fields;
+  a retry presents the same Idempotency-Key.
+- `internal/handler/acc_journal_shape_test.go`:
+  - every path sends the right type, dates and currency;
+  - a registered `period_end` wins over the calendar month;
+  - an unresolvable period, or a legacy record without a currency, is
+    refused before GL;
+  - allocation leaves no run behind, and the migration batch stays APPROVED;
+  - all five creates require a valid currency;
+  - the supersede currency rules hold, and the FX reversal inherits;
+  - the reversal names the legal entity.
+- `internal/store/journal_currency_pg_smoke_test.go` (real Postgres):
+  - the insert guard, including FX reversal and supersede without a copied
+    currency;
+  - the format CHECK;
+  - immutability;
+  - a legacy NULL can be set once, and its status transitions still work.
+- `internal/handler/gl_journal_e2e_test.go` (integration tag, runs with
+  `GL_E2E_URL`): this service's real handlers and GL client against a running
+  general-ledger-svc binary. That means GL's real envelope middleware, handler
+  and Postgres under RLS, connected as a `NOSUPERUSER NOBYPASSRLS` role.
+  Authorization and close-period status were stubbed to grant and to report
+  OPEN.
+  - It replays the pre-fix request shape and gets 400 `envelope_incomplete`,
+    then, with the envelope, 400 `missing_field`.
+  - ACC-07 recognition and reversal, ACC-10 revaluation and ACC-17
+    commit-and-reconcile each post FINALIZED journals carrying the expected
+    type, posting date and currency. The ACC-17 case also exercises B6's
+    read-back reconciliation.
+  - Negative control: with the client's `journal_type` blanked, all three
+    posting paths fail with 503 `journal_posting_failed`.
+  - The run also found the B6 status defect (see B6).
+- Existing fixtures: the existing fixtures now carry a currency. The ACC-09
+  duplicate-version test now asserts `idx_allocation_rules_current_version`
+  by name. Without that, the new currency guard would have made it pass for
+  the wrong reason.
+
+**Verification (2026-10-24).**
+
+- *Database:* a fresh disposable `postgres:16-alpine` container, `a13-pg`.
+- *Build and vet:* `go build ./...`, `go vet ./...` and
+  `go vet -tags=integration ./...` pass.
+- *Test suites:* `go test -count=1 -p 1 ./...` and
+  `go test -tags=integration -count=1 -p 1 ./...` pass. The integration run
+  had `GL_E2E_URL` set, and recorded 413 passes and 17 skips. The 17 skips are
+  the REF-05 mirror tests' existing deliberate `t.Skip`.
+- *Migrations, by hand:* migrations 000001–000022 applied from empty with
+  `psql --single-transaction -v ON_ERROR_STOP=1`. 000022 down removed all
+  five columns, and 000022 up applied again over the now-legacy rows.
+- *Guards, by hand* (each case its own single-transaction script):
+
+  | Case | Result |
+  |---|---|
+  | Insert with no currency, each of the five tables | refused |
+  | Lower-case currency | refused by the format CHECK |
+  | Changing a set currency | refused |
+  | Changing a legacy row's currency after setting it once | refused |
+  | Insert with `GBP` | accepted |
+  | Legacy NULL row | accepted |
+  | Legacy row status change that leaves currency alone | accepted |
+  | Setting a legacy row's currency once | accepted |
+
+- *general-ledger-svc:* its code is unchanged by this pass. Its migrations
+  were applied the same way to the e2e database.
+
 ## B. Interpretations and additions (decisions a reviewer may reverse)
 
 - **B1. Maker-checker on approval and certification is unconditional.**
@@ -505,9 +679,17 @@ evidence, reporting) cannot react to them.
   `CommitOpeningPosting` used to set RECONCILED straight after posting, with
   nothing compared; `ErrReconciliationMismatch` was declared but never used.
   It now reads the posted journal back from GL (`GetPostedJournal`) and
-  requires: status POSTED, the batch's entity and period, and per-account
+  requires: status FINALIZED, the batch's entity and period, and per-account
   debit and credit totals equal to the crosswalk, with no account on one side
   only.
+  - *Correction (2026-10-24, A13 pass):* this pass first required status
+    `POSTED`. general-ledger-svc has no such status: its posted state is
+    `FINALIZED` (PENDING → VALIDATED → FINALIZED → REVERSED). Every correctly
+    posted batch would have been quarantined as a mismatch. The stub GL
+    reported `POSTED`, so the handler tests passed. A13's run against a real
+    general-ledger-svc found it. The check now uses
+    `domain.GLJournalStatusFinalized`; a REVERSED journal still does not
+    reconcile.
   - *On a mismatch:* the batch moves POSTED → QUARANTINED with the first
     discrepancy as its reason, the response is 422
     `migration_reconciliation_failed` (§22's `MIGRATION_RECONCILIATION_FAILED`
