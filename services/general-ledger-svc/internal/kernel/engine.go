@@ -28,6 +28,11 @@ type AccountInfo struct {
 	Active             bool
 	CurrencyRestricted []string          // empty = any
 	BookIDs            []string          // books the account is valid in; empty = every book
+	// ControlType is the subledger or system area that owns the account (AR, AP, BANK, ...); empty for an ordinary account.
+	// CounterpartyRequired makes a line on the account carry the counterparty (customer, supplier). The AR and AP control
+	// accounts always do: a receivable or payable with no one it is owed by or to cannot be reconciled to its subledger.
+	ControlType          string
+	CounterpartyRequired bool
 	DimensionPolicy    map[string]string // dimension -> REQUIRED | PROHIBITED | OPTIONAL
 }
 
@@ -61,6 +66,8 @@ type ProposalLine struct {
 	Dimensions       map[string]string `json:"dimensions,omitempty"`
 	Description      string            `json:"description,omitempty"`
 	Rounding         bool              `json:"rounding_residual,omitempty"`
+	CounterpartyID   string            `json:"counterparty_id,omitempty"`
+	ControlType      string            `json:"control_type,omitempty"`
 }
 
 // Provenance identifies the rule that produced a proposal (AK-INV-008).
@@ -110,6 +117,7 @@ type rawLine struct {
 	exact  *big.Rat
 	funcMn *big.Int
 	round  bool
+	cp     string
 }
 
 // Evaluate turns one event into a journal proposal under one rule set and one book. The same input always gives the same
@@ -209,7 +217,14 @@ func Evaluate(ctx context.Context, in EvalInput) (*Proposal, error) {
 		if derr != nil {
 			return nil, derr
 		}
-		lines = append(lines, &rawLine{t: t, minor: minor, acct: info, dims: dims, exact: exact})
+		cp := ""
+		if info.CounterpartyRequired || info.ControlType == "AR" || info.ControlType == "AP" {
+			if ev.CounterpartyID == "" {
+				return nil, exc(FamCOA, "COUNTERPARTY_REQUIRED", "%s posts to account %s, which needs the counterparty and the event carries none", t.LineRef, info.Code).with("line_ref", t.LineRef)
+			}
+			cp = ev.CounterpartyID
+		}
+		lines = append(lines, &rawLine{t: t, minor: minor, acct: info, dims: dims, exact: exact, cp: cp})
 	}
 	if len(lines) < 2 {
 		return nil, exc(FamRule, "NO_LINES", "the rule produced fewer than two lines for this event")
@@ -299,7 +314,7 @@ func Evaluate(ctx context.Context, in EvalInput) (*Proposal, error) {
 		prov.Branch = append(prov.Branch, l.t.LineRef)
 		p.Lines = append(p.Lines, ProposalLine{LineNo: i + 1, LineRef: l.t.LineRef, Side: l.t.Side, AccountCode: l.acct.Code,
 			AmountTx: FormatMinor(l.minor, tscale), Currency: tccy, AmountFunctional: FormatMinor(l.funcMn, fscale), Dimensions: l.dims,
-			Description: l.t.Description, Rounding: l.round})
+			Description: l.t.Description, Rounding: l.round, CounterpartyID: l.cp, ControlType: l.acct.ControlType})
 	}
 	p.Provenance, p.Trace = prov, trace
 	b, _ := json.Marshal(struct {
@@ -429,7 +444,7 @@ func RunTestPack(ctx context.Context, rs *RuleSet, book Book) []string {
 		}
 		ev := &AccountingEvent{AccountingEventID: "test", TenantID: bk.TenantID, LegalEntityID: bk.LegalEntityID, EventType: tc.Event.EventType,
 			TransactionCurrency: tc.Event.TransactionCurrency, Facts: tc.Event.Facts, Dimensions: tc.Event.Dimensions, CounterpartyID: tc.Event.CounterpartyID}
-		dir := testDirectory{accounts: tc.Accounts, units: tc.MinorUnits}
+		dir := testDirectory{accounts: tc.Accounts, units: tc.MinorUnits, controls: tc.Controls}
 		covered := *rs
 		covered.Status = RuleActive
 		p, err := Evaluate(ctx, EvalInput{Event: ev, Book: &bk, Rule: &covered, PostingDate: rs.EffectiveFrom, FX: tc.FX, Directory: dir})
@@ -474,6 +489,7 @@ func itoa(n int) string { return new(big.Int).SetInt64(int64(n)).String() }
 type testDirectory struct {
 	accounts map[string]string
 	units    map[string]int
+	controls map[string]string
 }
 
 func (d testDirectory) MinorUnits(_ context.Context, ccy string, _ time.Time) (int, error) {
@@ -491,7 +507,7 @@ func (d testDirectory) ResolveAccount(_ context.Context, ref AccountRef, _ strin
 			return nil, exc(FamCOA, "MAPPING_MISSING", "no account for mapping %q", ref.MappingKey)
 		}
 	}
-	return &AccountInfo{Code: code, Postable: true, Active: true}, nil
+	return &AccountInfo{Code: code, Postable: true, Active: true, ControlType: d.controls[code]}, nil
 }
 
 func (d testDirectory) DimensionAllowed(context.Context, string, string, string, string, time.Time) (bool, error) {

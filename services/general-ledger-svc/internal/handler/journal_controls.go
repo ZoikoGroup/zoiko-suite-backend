@@ -32,6 +32,8 @@ type JournalControlStore interface {
 	ListRecurringTemplates(ctx context.Context, tenantID, legalEntityID string) ([]domain.RecurringTemplate, error)
 	SetRecurringTemplateStatus(ctx context.Context, tenantID, id, status string) error
 	GenerateRecurringJournal(ctx context.Context, tenantID, templateID string, runDate domain.Date, principalID string) (*domain.JournalHeader, []domain.JournalLine, bool, error)
+	AccountControls(ctx context.Context, tenantID string, codes []string) (map[string]domain.AccountControl, error)
+	CheckReconciliationCase(ctx context.Context, tenantID, caseID, legalEntityID string) (bookCode string, err error)
 }
 
 // ManualJournalPolicy is the configured evidence rule of §9: evidence is mandatory above a threshold, or for designated
@@ -224,7 +226,7 @@ func (h *Handler) CopyJournal(w http.ResponseWriter, r *http.Request) {
 	for _, l := range lines {
 		cr.Lines = append(cr.Lines, domain.CreateJournalLineInput{
 			AccountCode: l.AccountCode, DebitAmount: l.DebitAmount, CreditAmount: l.CreditAmount, Description: l.Description,
-			TaxCode: l.TaxCode, TaxLogicSnapshotID: l.TaxLogicSnapshotID, Dimensions: l.Dimensions,
+			TaxCode: l.TaxCode, TaxLogicSnapshotID: l.TaxLogicSnapshotID, Dimensions: l.Dimensions, CounterpartyID: l.CounterpartyID,
 		})
 	}
 	if cr.JournalType == domain.JournalTypeAdjustment && cr.JournalPurpose == "" {
@@ -502,4 +504,65 @@ func ParseManualJournalPolicy(threshold, types string) (ManualJournalPolicy, err
 		p.EvidenceTypes[domain.JournalType(s)] = true
 	}
 	return p, nil
+}
+
+
+// checkWave2Controls applies the subledger-aware rules of §12 and §17 to a manual journal: a line on an AR or AP control
+// account (or any account flagged for it) names its counterparty, and a reconciliation adjustment names the open case it settles.
+// Writes its own response and returns false on a refusal.
+func (h *Handler) checkWave2Controls(w http.ResponseWriter, r *http.Request, req domain.CreateJournalRequest) (reconBook string, ok bool) {
+	adjustment := req.JournalPurpose == "RECONCILIATION_ADJUSTMENT"
+	if req.ReconciliationCaseID != "" && !adjustment {
+		writeError(w, http.StatusBadRequest, "invalid_reconciliation_case", "reconciliation_case_id belongs only to a RECONCILIATION_ADJUSTMENT journal")
+		return "", false
+	}
+	if h.ctl == nil {
+		if adjustment {
+			writeError(w, http.StatusNotImplemented, "journal_controls_not_configured", "")
+			return "", false
+		}
+		return "", true
+	}
+	if adjustment {
+		if req.ReconciliationCaseID == "" {
+			writeError(w, http.StatusUnprocessableEntity, "reconciliation_case_required", "a reconciliation adjustment names the open reconciliation case it settles")
+			return "", false
+		}
+		book, err := h.ctl.CheckReconciliationCase(r.Context(), req.TenantID, req.ReconciliationCaseID, req.LegalEntityID)
+		if err != nil {
+			switch {
+			case errors.Is(err, domain.ErrReconciliationCaseNotOpen):
+				writeError(w, http.StatusUnprocessableEntity, "reconciliation_case_not_open", err.Error())
+			case errors.Is(err, domain.ErrJournalNotFound):
+				writeError(w, http.StatusUnprocessableEntity, "reconciliation_case_unknown", "no such reconciliation case for this entity")
+			default:
+				h.log.Error("CheckReconciliationCase failed", zap.Error(err))
+				writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+			}
+			return "", false
+		}
+		reconBook = book
+	}
+	codes := make([]string, 0, len(req.Lines))
+	for _, l := range req.Lines {
+		codes = append(codes, l.AccountCode)
+	}
+	controls, err := h.ctl.AccountControls(r.Context(), req.TenantID, codes)
+	if err != nil {
+		h.log.Error("AccountControls failed", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return "", false
+	}
+	for i, l := range req.Lines {
+		c, ok := controls[l.AccountCode]
+		if !ok {
+			continue
+		}
+		if (c.CounterpartyRequired || c.ControlType == "AR" || c.ControlType == "AP") && (l.CounterpartyID == nil || strings.TrimSpace(*l.CounterpartyID) == "") {
+			writeError(w, http.StatusUnprocessableEntity, "counterparty_required",
+				fmt.Sprintf("line %d posts to account %s, which needs the counterparty (customer or supplier)", i+1, l.AccountCode))
+			return "", false
+		}
+	}
+	return reconBook, true
 }

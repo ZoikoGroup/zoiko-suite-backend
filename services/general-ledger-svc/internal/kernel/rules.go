@@ -103,6 +103,9 @@ type TestCase struct {
 	FX         *FXBasis          `json:"fx,omitempty"`
 	Functional string            `json:"functional_currency,omitempty"`
 	MinorUnits map[string]int    `json:"minor_units,omitempty"`
+	// Controls gives the control type of an account code the case resolves to (AR, AP, ...), so a case can exercise the
+	// counterparty rule of a control account.
+	Controls map[string]string `json:"control_types,omitempty"`
 	Expect     TestExpectation   `json:"expect"`
 }
 

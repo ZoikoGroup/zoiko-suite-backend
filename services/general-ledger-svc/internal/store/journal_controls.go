@@ -247,3 +247,49 @@ func (s *PgStore) GenerateRecurringJournal(ctx context.Context, tenantID, templa
 	}
 	return header, lines, created, nil
 }
+
+// AccountControls returns the counterparty rule of each of the given accounts that is in the chart; unregistered codes are absent.
+func (s *PgStore) AccountControls(ctx context.Context, tenantID string, codes []string) (map[string]domain.AccountControl, error) {
+	out := map[string]domain.AccountControl{}
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `SELECT account_code, COALESCE(control_type, ''), counterparty_required FROM chart_of_accounts
+			WHERE tenant_id = $1::uuid AND account_code = ANY($2)`, tenantID, codes)
+		if err != nil {
+			return mapPgError(err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var code string
+			var c domain.AccountControl
+			if err := rows.Scan(&code, &c.ControlType, &c.CounterpartyRequired); err != nil {
+				return err
+			}
+			out[code] = c
+		}
+		return rows.Err()
+	})
+	return out, err
+}
+
+// CheckReconciliationCase confirms that a reconciliation adjustment names a real case of the same entity that is still open, and
+// returns the code of the book the case was run in: the adjustment is posted in that book.
+func (s *PgStore) CheckReconciliationCase(ctx context.Context, tenantID, caseID, legalEntityID string) (string, error) {
+	var book string
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		var status string
+		err := tx.QueryRow(ctx, `SELECT r.status, b.book_code FROM reconciliation_runs r JOIN accounting_books b ON b.book_id = r.accounting_book_id
+			WHERE r.tenant_id = $1::uuid AND r.reconciliation_run_id = $2::uuid AND r.legal_entity_id = $3::uuid`,
+			tenantID, caseID, legalEntityID).Scan(&status, &book)
+		if errors.Is(err, pgx.ErrNoRows) || errors.Is(mapPgError(err), domain.ErrInvalidIdentifier) {
+			return domain.ErrJournalNotFound
+		}
+		if err != nil {
+			return mapPgError(err)
+		}
+		if status != "WARNING" && status != "BREAK" {
+			return domain.ErrReconciliationCaseNotOpen
+		}
+		return nil
+	})
+	return book, err
+}

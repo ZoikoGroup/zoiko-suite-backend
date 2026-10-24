@@ -749,17 +749,18 @@ func (r *KernelRepo) MappedAccount(ctx context.Context, tenant, key string, on t
 	return
 }
 
-// ── account applicability (standard §12) ───────────────────────────────────────
+// ── account scope: applicability and controls (standard §12) ───────────────────
 
 var _ kernel.AccountApplicability = (*KernelRepo)(nil)
 
-// AccountApplicability implements kernel.AccountApplicability: the books an account is valid in and its currency restriction.
-// An account with neither is valid everywhere, which is every account that existed before applicability did.
-func (r *KernelRepo) AccountApplicability(ctx context.Context, tenant, code string) (books []string, currency string, err error) {
+// AccountApplicability implements kernel.AccountApplicability: the books an account is valid in, its currency restriction, the
+// area that owns it and whether its lines need a counterparty. An account with none of these is valid everywhere and needs
+// nothing, which is every account that existed before the controls did.
+func (r *KernelRepo) AccountApplicability(ctx context.Context, tenant, code string) (sc kernel.AccountScope, err error) {
 	err = r.tx(ctx, tenant, func(t pgx.Tx) error {
-		var ccy *string
-		e := t.QueryRow(ctx, `SELECT COALESCE(applicable_book_ids, '{}'::uuid[])::text[], currency_restriction FROM chart_of_accounts WHERE tenant_id=$1::uuid AND account_code=$2`,
-			tenant, code).Scan(&books, &ccy)
+		var ccy, ctl *string
+		e := t.QueryRow(ctx, `SELECT COALESCE(applicable_book_ids, '{}'::uuid[])::text[], currency_restriction, control_type, counterparty_required
+			FROM chart_of_accounts WHERE tenant_id=$1::uuid AND account_code=$2`, tenant, code).Scan(&sc.BookIDs, &ccy, &ctl, &sc.CounterpartyRequired)
 		if errors.Is(e, pgx.ErrNoRows) {
 			return nil
 		}
@@ -767,19 +768,22 @@ func (r *KernelRepo) AccountApplicability(ctx context.Context, tenant, code stri
 			return e
 		}
 		if ccy != nil {
-			currency = strings.TrimSpace(*ccy)
+			sc.Currency = strings.TrimSpace(*ccy)
+		}
+		if ctl != nil {
+			sc.ControlType = *ctl
 		}
 		return nil
 	})
 	return
 }
 
-// SetAccountApplicability restricts an account to the given books (empty = every book) and to one currency (empty = any).
-// It changes the head row of the chart only; the reason it is safe is that applicability is checked at posting time against the
-// current value and every posting records the rule and accounts it used.
-func (r *KernelRepo) SetAccountApplicability(ctx context.Context, tenant, code string, books []string, currency string, actor kernel.Actor) error {
+// SetAccountScope sets where an account may be used and who owns it. A control type makes the account a control account whose
+// direct posting is restricted unless the caller states otherwise; the override authority already guarding control accounts
+// then applies to it.
+func (r *KernelRepo) SetAccountScope(ctx context.Context, tenant, code string, sc kernel.AccountScope, actor kernel.Actor) error {
 	return r.tx(ctx, tenant, func(t pgx.Tx) error {
-		for _, b := range books {
+		for _, b := range sc.BookIDs {
 			var ok bool
 			if e := t.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM accounting_books WHERE tenant_id=$1::uuid AND book_id=$2::uuid)`, tenant, b).Scan(&ok); e != nil {
 				return e
@@ -789,18 +793,21 @@ func (r *KernelRepo) SetAccountApplicability(ctx context.Context, tenant, code s
 			}
 		}
 		var arg any
-		if len(books) > 0 {
-			arg = books
+		if len(sc.BookIDs) > 0 {
+			arg = sc.BookIDs
 		}
-		tag, e := t.Exec(ctx, `UPDATE chart_of_accounts SET applicable_book_ids=$3::uuid[], currency_restriction=NULLIF($4,'') WHERE tenant_id=$1::uuid AND account_code=$2`,
-			tenant, code, arg, currency)
+		tag, e := t.Exec(ctx, `UPDATE chart_of_accounts SET applicable_book_ids=$3::uuid[], currency_restriction=NULLIF($4,''), control_type=NULLIF($5,''),
+				counterparty_required=$6, is_control_account = (NULLIF($5,'') IS NOT NULL OR is_control_account),
+				direct_posting_restricted = (NULLIF($5,'') IS NOT NULL OR direct_posting_restricted)
+			WHERE tenant_id=$1::uuid AND account_code=$2`, tenant, code, arg, sc.Currency, sc.ControlType, sc.CounterpartyRequired)
 		if e != nil {
 			return e
 		}
 		if tag.RowsAffected() == 0 {
 			return kernel.ErrNotFound
 		}
-		return r.enqueue(ctx, t, tenant, kernel.OutEvent{Fact: "account.applicability-changed", AggregateType: "account", AggregateID: code, Actor: actor.PrincipalID,
-			CorrelationID: actor.CorrelationID, Data: map[string]any{"account_code": code, "book_ids": books, "currency_restriction": currency}})
+		return r.enqueue(ctx, t, tenant, kernel.OutEvent{Fact: "account.scope-changed", AggregateType: "account", AggregateID: code, Actor: actor.PrincipalID,
+			CorrelationID: actor.CorrelationID, Data: map[string]any{"account_code": code, "book_ids": sc.BookIDs, "currency_restriction": sc.Currency,
+				"control_type": sc.ControlType, "counterparty_required": sc.CounterpartyRequired}})
 	})
 }

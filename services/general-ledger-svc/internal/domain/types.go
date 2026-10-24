@@ -259,6 +259,10 @@ type JournalHeader struct {
 	WithdrawnAt            *time.Time `json:"withdrawn_at,omitempty"`
 	WithdrawnByPrincipalID *string    `json:"withdrawn_by_principal_id,omitempty"`
 	WithdrawnReason        *string    `json:"withdrawn_reason,omitempty"`
+
+	// ReconciliationCaseID names the reconciliation case a reconciliation adjustment settles (standard §17): a bank or
+	// subledger adjustment is never a free-standing correction.
+	ReconciliationCaseID *string `json:"reconciliation_case_id,omitempty"`
 }
 
 // JournalLine is one debit or credit line within a journal. Exactly one of
@@ -303,6 +307,9 @@ type JournalLine struct {
 	ExchangeRate       *string `json:"exchange_rate,omitempty"`
 	RateRef            *string `json:"rate_ref,omitempty"`
 	PostingRuleLineRef *string `json:"posting_rule_line_ref,omitempty"`
+
+	// CounterpartyID is the customer or supplier a line on a subledger control account belongs to (standard §8.2, §12).
+	CounterpartyID *string `json:"counterparty_id,omitempty"`
 }
 
 // JournalWithLines is the full aggregate returned by read endpoints.
@@ -887,6 +894,10 @@ type CreateJournalLineInput struct {
 
 	// ACC-03 "dimensions". See JournalLine.Dimensions.
 	Dimensions Dimensions `json:"dimensions,omitempty"`
+
+	// CounterpartyID is required on a line posted to an account that needs one (AR, AP control accounts and any account
+	// flagged counterparty_required).
+	CounterpartyID *string `json:"counterparty_id,omitempty"`
 }
 
 type CreateJournalRequest struct {
@@ -913,6 +924,9 @@ type CreateJournalRequest struct {
 	// JournalPurpose is the controlled purpose of a manual journal (standard §9). Required for the adjusting journal
 	// types (ADJUSTMENT, ACCRUAL, RECLASS, OPENING, CLOSING), where free text alone is not enough.
 	JournalPurpose string `json:"journal_purpose,omitempty"`
+
+	// ReconciliationCaseID is required when the purpose is RECONCILIATION_ADJUSTMENT.
+	ReconciliationCaseID string `json:"reconciliation_case_id,omitempty"`
 
 	// EvidenceRefs may be sent in the body or, preferably, as the §4 envelope's
 	// X-Evidence-Refs header. The handler merges both — a caller that has

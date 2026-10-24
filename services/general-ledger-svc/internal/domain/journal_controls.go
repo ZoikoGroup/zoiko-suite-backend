@@ -5,7 +5,7 @@ package domain
 
 var journalPurposes = map[string]bool{
 	"ACCRUAL": true, "PREPAYMENT": true, "RECLASSIFICATION": true, "CORRECTION": true, "ESTIMATE_CHANGE": true, "POLICY_CHANGE": true,
-	"OPENING_BALANCE": true, "MIGRATION": true, "CLOSE_ADJUSTMENT": true, "ALLOCATION": true, "REVALUATION": true, "OTHER": true,
+	"OPENING_BALANCE": true, "MIGRATION": true, "CLOSE_ADJUSTMENT": true, "ALLOCATION": true, "REVALUATION": true, "RECONCILIATION_ADJUSTMENT": true, "OTHER": true,
 }
 
 // ValidJournalPurpose reports whether p is a controlled manual-journal purpose.
@@ -13,7 +13,7 @@ func ValidJournalPurpose(p string) bool { return journalPurposes[p] }
 
 // JournalPurposes lists the accepted purposes, for error messages and the console.
 func JournalPurposes() []string {
-	return []string{"ACCRUAL", "PREPAYMENT", "RECLASSIFICATION", "CORRECTION", "ESTIMATE_CHANGE", "POLICY_CHANGE", "OPENING_BALANCE", "MIGRATION", "CLOSE_ADJUSTMENT", "ALLOCATION", "REVALUATION", "OTHER"}
+	return []string{"ACCRUAL", "PREPAYMENT", "RECLASSIFICATION", "CORRECTION", "ESTIMATE_CHANGE", "POLICY_CHANGE", "OPENING_BALANCE", "MIGRATION", "CLOSE_ADJUSTMENT", "ALLOCATION", "REVALUATION", "RECONCILIATION_ADJUSTMENT", "OTHER"}
 }
 
 // PurposeRequired reports whether a journal of this type must carry a controlled purpose: the adjusting types, where free
@@ -74,3 +74,13 @@ var (
 	ErrTemplateExists       = errorString("a recurring journal template with that name already exists for the entity")
 	ErrNotWithdrawable      = errorString("only a draft journal can be withdrawn")
 )
+
+// ErrReconciliationCaseNotOpen is returned when a reconciliation adjustment names a case that is settled or accepted.
+var ErrReconciliationCaseNotOpen = errorString("the reconciliation case is not open: only a case in warning or break can be settled by an adjustment")
+
+// AccountControl is what the chart says about an account that a manual journal must respect beyond the restriction check:
+// the area that owns it and whether its lines need a counterparty.
+type AccountControl struct {
+	ControlType          string
+	CounterpartyRequired bool
+}

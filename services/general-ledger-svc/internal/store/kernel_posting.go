@@ -164,10 +164,10 @@ func (r *KernelRepo) PostUnit(ctx context.Context, u *kernel.PostingUnit) (*kern
 			txAmt, txCcy, ruleRef := l.AmountTx, l.Currency, l.LineRef
 			if _, e := t.Exec(ctx, `
 				INSERT INTO journal_lines (journal_line_id, journal_id, tenant_id, line_number, account_code, debit_amount, credit_amount,
-					description, dimensions, transaction_amount, transaction_currency, exchange_rate, rate_ref, posting_rule_line_ref)
-				VALUES ($1, $2, $3, $4, $5, $6::numeric, $7::numeric, $8, $9, $10::numeric, $11, $12::numeric, $13, $14)`,
+					description, dimensions, transaction_amount, transaction_currency, exchange_rate, rate_ref, posting_rule_line_ref, counterparty_id)
+				VALUES ($1, $2, $3, $4, $5, $6::numeric, $7::numeric, $8, $9, $10::numeric, $11, $12::numeric, $13, $14, NULLIF($15, ''))`,
 				uuid.NewString(), jid, u.Tenant, l.LineNo, l.AccountCode, debit, credit, l.Description, domain.Dimensions(l.Dimensions),
-				txAmt, txCcy, rate, rateRef, ruleRef); e != nil {
+				txAmt, txCcy, rate, rateRef, ruleRef, l.CounterpartyID); e != nil {
 				return mapPgError(e)
 			}
 		}
@@ -204,6 +204,13 @@ func (r *KernelRepo) PostUnit(ctx context.Context, u *kernel.PostingUnit) (*kern
 			VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5::uuid, $6::uuid, $7::uuid, $8, $9, $10)`,
 			u.Tenant, u.Event.AccountingEventID, u.Book.BookID, u.Basis, jid, u.ExecutionID, p.Provenance.RuleSetID, p.Provenance.RuleVersion, p.ProposalHash, now); e != nil {
 			return e
+		}
+		// A correction settles what its original could not: failed attempts at the event this one supersedes are resolved.
+		if u.Event.SupersedesEventID != "" {
+			if _, e := t.Exec(ctx, `UPDATE posting_executions SET status = 'RESOLVED'
+				WHERE tenant_id = $1::uuid AND accounting_event_id = $2::uuid AND status IN ('FAILED', 'QUARANTINED')`, u.Tenant, u.Event.SupersedesEventID); e != nil {
+				return e
+			}
 		}
 		// Earlier failed attempts for this event and book are no longer outstanding.
 		if _, e := t.Exec(ctx, `UPDATE posting_executions SET status = 'RESOLVED'

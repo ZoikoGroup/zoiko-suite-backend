@@ -13,11 +13,20 @@ type RefData interface {
 	DimensionAllowed(ctx context.Context, tenant, dimension, value, legalEntityID string, on time.Time) (bool, error)
 }
 
+// AccountScope is where and how an account may be used: the books it is valid in, its currency restriction, the area that
+// owns it (control type) and whether its lines must name a counterparty.
+type AccountScope struct {
+	BookIDs              []string
+	Currency             string
+	ControlType          string
+	CounterpartyRequired bool
+}
+
 // AccountApplicability is the optional part of the chart that says where an account may be used: the books it is valid in and
 // the one currency it is restricted to (standard §12). A RefData that does not implement it treats every account as valid
 // everywhere, which is what every account was before applicability existed.
 type AccountApplicability interface {
-	AccountApplicability(ctx context.Context, tenant, code string) (bookIDs []string, currency string, err error)
+	AccountApplicability(ctx context.Context, tenant, code string) (AccountScope, error)
 }
 
 // CurrencyUnits answers how many minor-unit decimals a currency has. Precision is reference data owned by the currency
@@ -70,13 +79,13 @@ func (d TenantDirectory) ResolveAccount(ctx context.Context, ref AccountRef, _ s
 	}
 	info := &AccountInfo{Code: code, Active: active, Postable: postable}
 	if ap, ok := d.Ref.(AccountApplicability); ok {
-		books, ccy, err := ap.AccountApplicability(ctx, d.Tenant, code)
+		sc, err := ap.AccountApplicability(ctx, d.Tenant, code)
 		if err != nil {
 			return nil, err
 		}
-		info.BookIDs = books
-		if ccy != "" {
-			info.CurrencyRestricted = []string{ccy}
+		info.BookIDs, info.ControlType, info.CounterpartyRequired = sc.BookIDs, sc.ControlType, sc.CounterpartyRequired
+		if sc.Currency != "" {
+			info.CurrencyRestricted = []string{sc.Currency}
 		}
 	}
 	return info, nil

@@ -472,6 +472,10 @@ func (h *Handler) createJournal(w http.ResponseWriter, r *http.Request, req doma
 	if !h.checkAccountRestrictions(w, r, req, principalID) {
 		return
 	}
+	reconBook, ok := h.checkWave2Controls(w, r, req)
+	if !ok {
+		return
+	}
 
 	// ACC-03's book input. §4 makes book_id server-resolvable, so an envelope
 	// value is preferred over the body's — the header is set by the gateway
@@ -483,6 +487,14 @@ func (h *Handler) createJournal(w http.ResponseWriter, r *http.Request, req doma
 	}
 	if env.ReportingBasis != "" {
 		reportingBasis = &env.ReportingBasis
+	}
+	if reconBook != "" {
+		// a reconciliation adjustment lands in the book of the case it settles, or the reconciliation could never see it
+		if bookID != nil && *bookID != reconBook {
+			writeError(w, http.StatusUnprocessableEntity, "book_mismatch", "a reconciliation adjustment belongs to the book of its case ("+reconBook+")")
+			return
+		}
+		bookID = &reconBook
 	}
 
 	header := &domain.JournalHeader{
@@ -507,6 +519,7 @@ func (h *Handler) createJournal(w http.ResponseWriter, r *http.Request, req doma
 		SoftCloseOverrideReason: &req.SoftCloseOverrideReason,
 		JournalPurpose:          optionalString(req.JournalPurpose),
 		CopyOfJournalID:         copyOf,
+		ReconciliationCaseID:    optionalString(req.ReconciliationCaseID),
 
 		// ACC-03: every ordinary journal a human creates starts as a
 		// proposal nobody has acted on yet — explicit here rather than
@@ -524,6 +537,7 @@ func (h *Handler) createJournal(w http.ResponseWriter, r *http.Request, req doma
 			TaxCode:            l.TaxCode,
 			TaxLogicSnapshotID: l.TaxLogicSnapshotID,
 			Dimensions:         l.Dimensions,
+			CounterpartyID:     l.CounterpartyID,
 		}
 	}
 
@@ -1653,7 +1667,7 @@ func (h *Handler) ReverseJournal(w http.ResponseWriter, r *http.Request) {
 
 			// The original foreign-currency basis and rule provenance are kept: the reversal neutralizes at the same rate.
 			TransactionAmount: l.TransactionAmount, TransactionCcy: l.TransactionCcy, ExchangeRate: l.ExchangeRate,
-			RateRef: l.RateRef, PostingRuleLineRef: l.PostingRuleLineRef,
+			RateRef: l.RateRef, PostingRuleLineRef: l.PostingRuleLineRef, CounterpartyID: l.CounterpartyID,
 		}
 	}
 

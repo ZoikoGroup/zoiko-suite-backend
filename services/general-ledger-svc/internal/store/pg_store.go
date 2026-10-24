@@ -66,7 +66,7 @@ const journalHeaderColumns = `
 	correction_of_journal_id, soft_close_override_reason,
 	journal_number, accounting_book_id, source_accounting_event_id, posting_execution_id, journal_hash,
 	journal_purpose, correction_kind, reversal_reason, copy_of_journal_id, recurring_template_id,
-	withdrawn_at, withdrawn_by_principal_id, withdrawn_reason`
+	withdrawn_at, withdrawn_by_principal_id, withdrawn_reason, reconciliation_case_id`
 
 // scanHeaderTargets returns scan destinations matching journalHeaderColumns,
 // column for column. status and approvalStatus are scanned into plain
@@ -93,7 +93,7 @@ func scanHeaderTargets(h *domain.JournalHeader, status, approvalStatus *string) 
 		&h.CorrectionOfJournalID, &h.SoftCloseOverrideReason,
 		&h.JournalNumber, &h.AccountingBookID, &h.SourceAccountingEventID, &h.PostingExecutionID, &h.JournalHash,
 		&h.JournalPurpose, &h.CorrectionKind, &h.ReversalReason, &h.CopyOfJournalID, &h.RecurringTemplateID,
-		&h.WithdrawnAt, &h.WithdrawnByPrincipalID, &h.WithdrawnReason,
+		&h.WithdrawnAt, &h.WithdrawnByPrincipalID, &h.WithdrawnReason, &h.ReconciliationCaseID,
 	}
 }
 
@@ -101,14 +101,14 @@ const journalLineColumns = `
 	journal_line_id, journal_id, line_number, account_code,
 	debit_amount, credit_amount, COALESCE(description, ''),
 	tax_code, tax_logic_snapshot_id, dimensions,
-	transaction_amount::text, transaction_currency, exchange_rate::text, rate_ref, posting_rule_line_ref`
+	transaction_amount::text, transaction_currency, exchange_rate::text, rate_ref, posting_rule_line_ref, counterparty_id`
 
 func scanLineTargets(l *domain.JournalLine) []any {
 	return []any{
 		&l.JournalLineID, &l.JournalID, &l.LineNumber, &l.AccountCode,
 		&l.DebitAmount, &l.CreditAmount, &l.Description,
 		&l.TaxCode, &l.TaxLogicSnapshotID, &l.Dimensions,
-		&l.TransactionAmount, &l.TransactionCcy, &l.ExchangeRate, &l.RateRef, &l.PostingRuleLineRef,
+		&l.TransactionAmount, &l.TransactionCcy, &l.ExchangeRate, &l.RateRef, &l.PostingRuleLineRef, &l.CounterpartyID,
 	}
 }
 
@@ -279,10 +279,10 @@ func insertJournal(ctx context.Context, tx pgx.Tx, tenantID string, h *domain.Jo
 			soft_close_override_reason,
 			journal_number, accounting_book_id, source_accounting_event_id, posting_execution_id, journal_hash,
 			journal_purpose, correction_kind, reversal_reason, copy_of_journal_id, recurring_template_id,
-			withdrawn_at, withdrawn_by_principal_id, withdrawn_reason
+			withdrawn_at, withdrawn_by_principal_id, withdrawn_reason, reconciliation_case_id
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
 		          $19, $20, $21, $22, $23, $24, $25, $26, $27,
-		          $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40)
+		          $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41)
 		ON CONFLICT (tenant_id, correlation_id) WHERE correlation_id != '' DO NOTHING
 	`, h.JournalID, tenantID, h.LegalEntityID, h.FiscalPeriod, string(h.Status),
 		h.ReversalOfJournalID, h.Description, h.CreatedByPrincipalID,
@@ -294,7 +294,7 @@ func insertJournal(ctx context.Context, tx pgx.Tx, tenantID string, h *domain.Jo
 		h.SoftCloseOverrideReason,
 		h.JournalNumber, h.AccountingBookID, h.SourceAccountingEventID, h.PostingExecutionID, h.JournalHash,
 		h.JournalPurpose, h.CorrectionKind, h.ReversalReason, h.CopyOfJournalID, h.RecurringTemplateID,
-		h.WithdrawnAt, h.WithdrawnByPrincipalID, h.WithdrawnReason)
+		h.WithdrawnAt, h.WithdrawnByPrincipalID, h.WithdrawnReason, h.ReconciliationCaseID)
 	if err != nil {
 		return nil, false, mapPgError(err)
 	}
@@ -331,12 +331,12 @@ func insertJournal(ctx context.Context, tx pgx.Tx, tenantID string, h *domain.Jo
 				journal_line_id, journal_id, tenant_id, line_number,
 				account_code, debit_amount, credit_amount, description,
 				tax_code, tax_logic_snapshot_id, dimensions,
-				transaction_amount, transaction_currency, exchange_rate, rate_ref, posting_rule_line_ref
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::numeric, $13, $14::numeric, $15, $16)
+				transaction_amount, transaction_currency, exchange_rate, rate_ref, posting_rule_line_ref, counterparty_id
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::numeric, $13, $14::numeric, $15, $16, $17)
 		`, lines[i].JournalLineID, h.JournalID, tenantID, lines[i].LineNumber,
 			lines[i].AccountCode, lines[i].DebitAmount, lines[i].CreditAmount, lines[i].Description,
 			lines[i].TaxCode, lines[i].TaxLogicSnapshotID, lines[i].Dimensions,
-			lines[i].TransactionAmount, lines[i].TransactionCcy, lines[i].ExchangeRate, lines[i].RateRef, lines[i].PostingRuleLineRef); err != nil {
+			lines[i].TransactionAmount, lines[i].TransactionCcy, lines[i].ExchangeRate, lines[i].RateRef, lines[i].PostingRuleLineRef, lines[i].CounterpartyID); err != nil {
 			return nil, false, mapPgError(err)
 		}
 	}
@@ -775,9 +775,10 @@ func appendLedgerEntries(ctx context.Context, tx pgx.Tx, tenantID, journalID str
 		       jl.debit_amount, jl.credit_amount, jl.dimensions,
 		       jh.legal_entity_id, COALESCE(jh.book_id, ''), jh.fiscal_period,
 		       jh.currency_code, jh.transaction_date, jh.posting_date,
-		       jh.source_event_id, jh.correlation_id
+		       jh.source_event_id, jh.correlation_id, jl.counterparty_id, coa.control_type
 		FROM journal_lines jl
 		JOIN journal_headers jh ON jh.journal_id = jl.journal_id
+		LEFT JOIN chart_of_accounts coa ON coa.tenant_id = jh.tenant_id AND coa.account_code = jl.account_code
 		WHERE jl.journal_id = $1 AND jh.tenant_id = $2
 	`, journalID, tenantID)
 	if err != nil {
@@ -790,13 +791,14 @@ func appendLedgerEntries(ctx context.Context, tx pgx.Tx, tenantID, journalID str
 		dimensions                                                                            domain.Dimensions
 		transactionDate, postingDate                                                          domain.Date
 		sourceEventID                                                                         *string
+		counterparty, controlType                                                             *string
 	}
 	var entries []entryRow
 	for rows.Next() {
 		var e entryRow
 		if err := rows.Scan(&e.lineID, &e.lineNumber, &e.accountCode, &e.debit, &e.credit, &e.dimensions,
 			&e.legalEntityID, &e.bookID, &e.fiscalPeriod, &e.currencyCode, &e.transactionDate, &e.postingDate,
-			&e.sourceEventID, &e.correlationID); err != nil {
+			&e.sourceEventID, &e.correlationID, &e.counterparty, &e.controlType); err != nil {
 			rows.Close()
 			return mapPgError(err)
 		}
@@ -814,13 +816,13 @@ func appendLedgerEntries(ctx context.Context, tx pgx.Tx, tenantID, journalID str
 				ledger_entry_id, tenant_id, legal_entity_id, book_id, fiscal_period,
 				journal_id, journal_line_id, line_number, account_code,
 				debit_amount, credit_amount, currency_code, dimensions,
-				transaction_date, posting_date, source_event_id, correlation_id, created_at
-			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+				transaction_date, posting_date, source_event_id, correlation_id, created_at, counterparty_id, control_type
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
 			ON CONFLICT (tenant_id, journal_id, journal_line_id) DO NOTHING
 		`, uuid.NewString(), tenantID, e.legalEntityID, e.bookID, e.fiscalPeriod,
 			journalID, e.lineID, e.lineNumber, e.accountCode,
 			e.debit, e.credit, e.currencyCode, e.dimensions,
-			e.transactionDate, e.postingDate, e.sourceEventID, e.correlationID, now); err != nil {
+			e.transactionDate, e.postingDate, e.sourceEventID, e.correlationID, now, e.counterparty, e.controlType); err != nil {
 			return mapPgError(err)
 		}
 	}

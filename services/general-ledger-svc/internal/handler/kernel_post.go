@@ -107,51 +107,56 @@ func (h *KernelHandler) GetPostingTrace(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusOK, tr)
 }
 
-// ── account applicability (standard §12) ───────────────────────────────────────
+// ── account scope: applicability and controls (standard §12) ───────────────────
 
-type applicabilityStore interface {
-	AccountApplicability(ctx context.Context, tenant, code string) ([]string, string, error)
-	SetAccountApplicability(ctx context.Context, tenant, code string, books []string, currency string, actor kernel.Actor) error
+type scopeStore interface {
+	AccountApplicability(ctx context.Context, tenant, code string) (kernel.AccountScope, error)
+	SetAccountScope(ctx context.Context, tenant, code string, sc kernel.AccountScope, actor kernel.Actor) error
 }
 
-type applicabilityBody struct {
-	BookIDs             []string `json:"book_ids"`
-	CurrencyRestriction string   `json:"currency_restriction"`
+type scopeBody struct {
+	BookIDs              []string `json:"book_ids"`
+	CurrencyRestriction  string   `json:"currency_restriction"`
+	ControlType          string   `json:"control_type"`
+	CounterpartyRequired bool     `json:"counterparty_required"`
 }
 
-func (h *KernelHandler) applicability(w http.ResponseWriter) (applicabilityStore, bool) {
-	s, ok := h.ref.(applicabilityStore)
+// ControlTypes are the areas that can own a control account (§12).
+var controlTypes = map[string]bool{"": true, "AR": true, "AP": true, "PAYROLL": true, "TAX": true, "INVENTORY": true, "ASSET": true, "BANK": true, "CLEARING": true, "INTERCOMPANY": true}
+
+func (h *KernelHandler) scopes(w http.ResponseWriter) (scopeStore, bool) {
+	s, ok := h.ref.(scopeStore)
 	if !ok {
-		writeError(w, http.StatusNotImplemented, "account_applicability_not_configured", "")
+		writeError(w, http.StatusNotImplemented, "account_scope_not_configured", "")
 	}
 	return s, ok
 }
 
-// GetAccountApplicability reports where an account may be used: the books it is valid in (none listed = every book) and its
-// currency restriction.
-func (h *KernelHandler) GetAccountApplicability(w http.ResponseWriter, r *http.Request) {
+// GetAccountScope reports where an account may be used and who owns it: the books it is valid in (none listed = every book),
+// its currency restriction, its control type and whether its lines need a counterparty.
+func (h *KernelHandler) GetAccountScope(w http.ResponseWriter, r *http.Request) {
 	tenant, _, ok := h.guard(w, r, actionViewAccount)
 	if !ok {
 		return
 	}
-	s, ok := h.applicability(w)
+	s, ok := h.scopes(w)
 	if !ok {
 		return
 	}
-	books, ccy, err := s.AccountApplicability(r.Context(), tenant, chi.URLParam(r, "account_code"))
+	sc, err := s.AccountApplicability(r.Context(), tenant, chi.URLParam(r, "account_code"))
 	if err != nil {
 		h.fail(w, err)
 		return
 	}
-	if books == nil {
-		books = []string{}
+	if sc.BookIDs == nil {
+		sc.BookIDs = []string{}
 	}
-	writeJSON(w, http.StatusOK, applicabilityBody{BookIDs: books, CurrencyRestriction: ccy})
+	writeJSON(w, http.StatusOK, scopeBody{BookIDs: sc.BookIDs, CurrencyRestriction: sc.Currency, ControlType: sc.ControlType, CounterpartyRequired: sc.CounterpartyRequired})
 }
 
-// SetAccountApplicability restricts an account to books and a currency. An empty list and an empty currency lift the restriction.
-func (h *KernelHandler) SetAccountApplicability(w http.ResponseWriter, r *http.Request) {
-	var req applicabilityBody
+// SetAccountScope sets an account's books, currency, control type and counterparty rule. An empty body lifts every restriction.
+func (h *KernelHandler) SetAccountScope(w http.ResponseWriter, r *http.Request) {
+	var req scopeBody
 	if !decodeJSON(w, r, &req) {
 		return
 	}
@@ -159,7 +164,7 @@ func (h *KernelHandler) SetAccountApplicability(w http.ResponseWriter, r *http.R
 	if !ok {
 		return
 	}
-	s, ok := h.applicability(w)
+	s, ok := h.scopes(w)
 	if !ok {
 		return
 	}
@@ -173,8 +178,13 @@ func (h *KernelHandler) SetAccountApplicability(w http.ResponseWriter, r *http.R
 		writeError(w, http.StatusBadRequest, "invalid_currency_code", domain.ErrInvalidCurrency.Error())
 		return
 	}
+	if !controlTypes[req.ControlType] {
+		writeError(w, http.StatusBadRequest, "invalid_control_type", "control_type is AR, AP, PAYROLL, TAX, INVENTORY, ASSET, BANK, CLEARING or INTERCOMPANY")
+		return
+	}
 	code := chi.URLParam(r, "account_code")
-	if err := s.SetAccountApplicability(r.Context(), tenant, code, req.BookIDs, req.CurrencyRestriction, a); err != nil {
+	sc := kernel.AccountScope{BookIDs: req.BookIDs, Currency: req.CurrencyRestriction, ControlType: req.ControlType, CounterpartyRequired: req.CounterpartyRequired}
+	if err := s.SetAccountScope(r.Context(), tenant, code, sc, a); err != nil {
 		h.fail(w, err)
 		return
 	}
