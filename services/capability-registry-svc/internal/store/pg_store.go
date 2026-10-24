@@ -66,6 +66,13 @@ type Store interface {
 	ListClaimsByCapability(ctx context.Context, capabilityID string) ([]domain.CapabilityClaim, error)
 	GetCapabilityClaimByID(ctx context.Context, claimID string) (*domain.CapabilityClaim, error)
 
+	// ResolveCapability deliberately takes no tenant argument. The five
+	// registry tables are platform-scope reference data (SPEC_DEVIATIONS B12):
+	// every tenant reads the same capability, release, market and provider
+	// facts. A per-tenant exposure answer needs GOV-11's absent
+	// FeaturePolicyVersion/ReleaseRingAssignment model, not a tenant_id on
+	// these tables. Do not add a tenant parameter here to make the signature
+	// look scoped — it would imply a boundary the data does not have.
 	ResolveCapability(ctx context.Context, capabilityCode, marketCode string) (*domain.CapabilityResolution, error)
 }
 

@@ -123,15 +123,16 @@ SoD rule. It does not affirmatively enforce the prohibition:
   *detected*, let alone refused. The negative path in GOV-11 (“Jurisdiction-
   prohibited feature cannot be tenant-enabled”) is not implemented.
 - **Tenant scoping:** the five resource tables have no `tenant_id` column
-  (`000001_initial_schema.up.sql`). The global envelope requires a tenant
-  header, but `ResolveCapability` ignores it; the store signature has no tenant
-  argument.
-- **Read authorization:** `ResolveCapability` has no service-level authz check.
-  In production the envelope middleware requires `tenant_id` and actor headers
-  on every request, but it does not check whether that actor may read the
-  capability. The handler test router bypasses the envelope, so the existing
-  “no principal required” test describes handler behavior, not deployed
-  authorization.
+  (`000001_initial_schema.up.sql`), and B12 concludes that is correct: they are
+  platform-scope catalogue data, not tenant records. `ResolveCapability` still
+  has no tenant argument, deliberately. Per-tenant exposure is GOV-11's absent
+  `FeaturePolicyVersion`/`ReleaseRingAssignment` model, not a column on these
+  tables.
+- **Read authorization:** closed in this pass. `ResolveCapability` now requires
+  `X-Principal-Id` and a `CAPABILITY_RESOLVE` grant at platform scope before it
+  reads anything, and the old “no principal required” test has been replaced by
+  one that runs through the real envelope middleware in both `write-strict`
+  (the deployed default) and `strict` modes. See A11 and B12.
 
 ### 4. Does `policy-svc` exist, and is it actually called?
 
@@ -188,11 +189,12 @@ not inferred from comments:
   also fails closed on an unrecognized persisted release/market state or an
   unknown integration health value.
 
-- **Authorization is present on 9 of 10 handlers.** Every command and every
-  query except `ResolveCapability` requires `X-Principal-Id` and calls
-  `authorization-svc`. The commands are platform-scoped
+- **Authorization is present on all 10 handlers.** Every command and every
+  query, including `ResolveCapability` since this pass, requires
+  `X-Principal-Id` and calls `authorization-svc`. Every action, including the
+  new `CAPABILITY_RESOLVE`, is checked at platform scope
   (`00000000-0000-0000-0000-00000000f001`), consistent with a platform
-  catalogue.
+  catalogue. See A11/B12.
 
 - **SQL error mapping is uniform on writes.** A nonexistent or malformed
   `capability_id` maps to `domain.ErrCapabilityNotFound` and HTTP 404 on all
@@ -550,25 +552,47 @@ cache, no cache-invalidation path, and no p95/cache-revocation SLO. The read is
 up to four sequential Postgres round trips; that is not a latency defect by
 itself, but it is not the specified cacheable/invalidatable profile.
 
-### A11. `ResolveCapability` is not tenant-scoped and has no authorization check
+### A11. `ResolveCapability` is not tenant-scoped and has no authorization check — Closed (B12)
 
 GOV-11's wireframe requires every query to be “Read-only; scoped; correlation
-required.” The global envelope middleware does require `tenant_id`,
-actor, request ID and correlation ID, so a production caller cannot reach the
-handler with no identity headers. But:
+required.” The original finding was:
 
-- `ResolveCapability` ignores the tenant in the request context; the store
+- `ResolveCapability` ignored the tenant in the request context; the store
   signature is `(capabilityCode, marketCode)` only.
-- There is no authorization call, so any identified actor can read any
+- There was no authorization call, so any identified actor could read any
   capability's technical availability.
 - The five resource tables have no tenant column, so even a future authz check
   could not scope the answer per tenant without a schema/model change.
-- The handler-level test that asserts “no principal required” runs on a router
-  without the envelope, so it does not prove the deployed posture.
+- The handler-level test that asserted “no principal required” ran on a router
+  without the envelope, so it did not prove the deployed posture.
 
-This is a read-scoping gap, not an IAM write. It matters because GOV-11's
-purpose is tenant/user exposure, and this endpoint cannot answer a tenant/user
-question.
+Two parts of that framing were wrong and are corrected here. First, the
+envelope's default mode is `write-strict`, and that mode deliberately admits an
+incomplete GET — so “a production caller cannot reach the handler with no
+identity headers” was not true; the handler was the only gate, and it had none.
+Second, a tenant column is not the right fix: these five tables are
+platform-scope reference data, and B12 states why.
+
+Closed in this pass:
+
+- `ResolveCapability` now requires `X-Principal-Id` and a new
+  `CAPABILITY_RESOLVE` grant at platform scope before it reads anything. The
+  existing authz client's 5-second decision cache preserves the cheap-read
+  posture that the old comment cited as the reason for leaving it open.
+- No migration was added and the five tables still have no `tenant_id`,
+  deliberately. Per-tenant exposure is GOV-11's absent
+  `FeaturePolicyVersion`/`ReleaseRingAssignment` model (A2/B7), not a column on
+  the catalogue.
+- The old `TestResolveCapability_AuthorizationNotWeakened` (which asserted a
+  200 with no principal) is gone. It is replaced by
+  `TestResolveCapability_NoPrincipal_Returns401`,
+  `TestResolveCapability_AuthzDenied_Returns403`,
+  `TestResolveCapability_Authorized_UsesPlatformScopeAction` (asserts the
+  action and platform scope sent to `authorization-svc`), and
+  `TestResolveCapability_DeployedEnvelopePosture`, which runs the real
+  `envelope.Middleware` in both `write-strict` (the deployed default) and
+  `strict` modes. The write-strict case proves the 401 comes from the handler's
+  own principal check, not from middleware that never enforced reads.
 
 ## B. Interpretations and additions (decisions a reviewer may reverse)
 
@@ -633,12 +657,15 @@ question.
   explicit precedence rule or a caller-side composition contract, decided in
   the ADR.
 
-- **B10. `ResolveCapability` remains without a service-level authz check.** A11
-  records the gap. Changing it would break the documented cheap-read posture
-  and require every caller to carry a capability-read grant. The global
-  envelope still requires identity headers in production. A reviewer could
-  require `CAPABILITY_RESOLVE` authorization; that is a contract change, not a
-  local patch.
+- **B10. Superseded by A11/B12: `ResolveCapability` now has a service-level
+  authz check.** The previous entry argued that adding one would break the
+  documented cheap-read posture and require every caller to carry a
+  capability-read grant. This pass reversed that judgment: the endpoint exposes
+  unreleased capabilities, incident restrictions and provider health, and the
+  authz client's 5-second decision cache absorbs repeat checks. A reviewer could
+  still decide that identity alone is sufficient and drop the
+  `CAPABILITY_RESOLVE` grant; that is now a small handler-and-test change, not
+  an architectural one.
 
 - **B11. No caching layer was added.** A10 records the NFR gap. The resolver
   issues at most four sequential queries, and a cache would need an invalidation
@@ -646,10 +673,88 @@ question.
   invalidatable cache is a separate change; the current code is correct but
   not cacheable as specified.
 
+- **B12. The five registry tables are platform-scope, so `ResolveCapability` is
+  deliberately not tenant-scoped — this is the A11 judgment call.** GOV-11's
+  purpose is “tenant/user exposure”, which makes a tenant-specific answer look
+  required. Read against the actual objects, it is not:
+
+  - `capabilities` is a global definition (code, module, risk class).
+  - `releases` is the capability's global operational state.
+  - `market_releases` is approval for a **market**, not a tenant.
+  - `integration_capabilities` is provider certification and health, also
+    global.
+  - `capability_claims` is approved marketing wording, shared by every tenant.
+
+  None of those facts can legitimately differ by tenant, and the per-tenant
+  dimensions GOV-11 actually names — entitlement, release ring, tenant policy,
+  tenant enable/disable, kill switch — live in objects this service does not
+  have (A2, A7, A8). Adding `tenant_id` to these five tables would duplicate the
+  catalogue per tenant and make the platform answer depend on which tenant
+  happened to create a row. That is the same trap the completion tracker records
+  for commercial-account-svc's `price_catalogs`/`plans`/`entitlement_limits`
+  (row 11b: “every tenant reads the same approved catalog”, so RLS there would
+  hide it from everybody).
+
+  The tenant header is still required by the platform envelope in strict mode
+  and is forwarded to `authorization-svc`, but it is not an input to
+  resolution. `market_code` is likewise the caller's requested market, not a
+  tenant jurisdiction; A5 records the missing jurisdiction check, which is a
+  different gap.
+
+  The reversible part: if the business decides `ResolveCapability` must answer
+  GOV-11's tenant-exposure question, the fix is **not** a tenant column on these
+  tables. It is GOV-11's `FeaturePolicyVersion` / `ReleaseRingAssignment` /
+  tenant-enablement model (B7) plus a new `EvaluateFeaturePolicy` read, or a
+  composed read that consults COM-03. That is a new build, not a schema tweak.
+
+  The authorization decision that accompanies this interpretation: the endpoint
+  is still not public. It requires an identified principal and a
+  `CAPABILITY_RESOLVE` grant at platform scope, because even platform-scope
+  technical availability reveals unreleased capabilities, incident restrictions
+  and provider health. A reviewer could choose identity-only; the reason for the
+  stricter choice is stated here rather than left implicit.
+
 ## Verification
 
-Verified in `services/capability-registry-svc` against a fresh disposable
-PostgreSQL 16 container, not the shared development database:
+Verified in `services/capability-registry-svc` against fresh disposable
+PostgreSQL 16 containers, not the shared development database.
+
+### A11/B12 pass (2026-10-24)
+
+- Image: `postgres:16-alpine`
+- Container: `capability-registry-test-20261024125043`
+- Database: `capability_registry_test`
+- `TEST_DATABASE_URL` pointed at the container's mapped port (`58898`)
+- All migrations `000001`–`000003` applied from empty by the isolated test
+  helper; each test uses a unique schema and drops it afterward
+- No migration was added or changed in this pass, so there was no down-migration
+  guard to exercise. B12 deliberately keeps the five catalogue tables
+  tenant-less.
+
+Commands and results:
+
+```text
+go build ./...        pass
+go vet ./...          pass
+go test ./... -count=1
+  internal/authz       ok
+  internal/events      ok
+  internal/handler     ok
+  internal/store       ok   (ran against PostgreSQL, not skipped)
+  (other packages: no test files)
+```
+
+New/changed tests in this pass:
+
+- `TestResolveCapability_NoPrincipal_Returns401`
+- `TestResolveCapability_AuthzDenied_Returns403`
+- `TestResolveCapability_Authorized_UsesPlatformScopeAction` (asserts that
+  `CAPABILITY_RESOLVE` and the platform scope reach `authorization-svc`)
+- `TestResolveCapability_DeployedEnvelopePosture` (real envelope middleware in
+  `write-strict` and `strict`; the old
+  `TestResolveCapability_AuthorizationNotWeakened` is removed)
+
+### Earlier pass (2026-10-24)
 
 - Image: `postgres:16-alpine`
 - Container: `capability-registry-test-20261024115136`
@@ -672,7 +777,7 @@ go test ./... -count=1
 ```
 
 The store package ran against PostgreSQL rather than skipping. New tests added
-in this pass:
+in that pass:
 
 - `TestPgStoreCreateRelease_NonexistentCapabilityMapsToNotFound` (23503 and
   22P02 → `ErrCapabilityNotFound`)
@@ -683,5 +788,5 @@ in this pass:
 - `TestResolveCapability_ApprovedMarketReleaseEnabled` (handler)
 - `TestSetReleaseState_InvalidCapabilityID_Returns404` (handler)
 
-No production database, shared schema or shared container was used. The
+No production database, shared schema or shared container was used. Each
 container was disposable and was removed after verification.

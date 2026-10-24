@@ -18,7 +18,9 @@ import (
 
 	authzpkg "zoiko.io/capability-registry-svc/internal/authz"
 	"zoiko.io/capability-registry-svc/internal/domain"
+	svcenvelope "zoiko.io/capability-registry-svc/internal/envelope"
 	"zoiko.io/capability-registry-svc/internal/events"
+	svcmiddleware "zoiko.io/capability-registry-svc/internal/middleware"
 )
 
 type stubStore struct {
@@ -293,9 +295,32 @@ func (s *stubStore) ResolveCapability(ctx context.Context, capabilityCode, marke
 	return &domain.CapabilityResolution{CapabilityCode: capabilityCode, Enabled: true, ReasonCode: "ENABLED"}, nil
 }
 
-type stubAuthz struct{ err error }
+type stubAuthzCall struct {
+	principalID   string
+	legalEntityID string
+	actionType    string
+}
 
-func (s *stubAuthz) CheckAllowed(_ context.Context, _, _, _ string) error { return s.err }
+type stubAuthz struct {
+	mu    sync.Mutex
+	err   error
+	calls []stubAuthzCall
+}
+
+func (s *stubAuthz) CheckAllowed(_ context.Context, principalID, legalEntityID, actionType string) error {
+	s.mu.Lock()
+	s.calls = append(s.calls, stubAuthzCall{
+		principalID: principalID, legalEntityID: legalEntityID, actionType: actionType,
+	})
+	s.mu.Unlock()
+	return s.err
+}
+
+func (s *stubAuthz) recordedCalls() []stubAuthzCall {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]stubAuthzCall(nil), s.calls...)
+}
 
 var _ AuthzChecker = (*stubAuthz)(nil)
 
@@ -330,6 +355,31 @@ func buildRequest(method, path string, body interface{}) *http.Request {
 	r.Header.Set("X-Principal-Id", "principal-test-01")
 	r.Header.Set("X-Tenant-Id", "tenant-test-01")
 	r.Header.Set("Idempotency-Key", "test-key-"+strconv.FormatUint(testRequestSequence.Add(1), 10))
+	return r
+}
+
+// newEnvelopeRouter mirrors cmd/server/main.go's middleware order: tenant
+// context, then the canonical input-contract envelope, then the routes. Tests
+// that make a claim about the deployed authorization posture must run through
+// this router rather than the bare newTestRouter above.
+func newEnvelopeRouter(h *Handler, mode svcenvelope.Mode) *chi.Mux {
+	r := chi.NewRouter()
+	r.Use(svcmiddleware.TenantContext())
+	r.Use(svcenvelope.MiddlewareWithMode(svcenvelope.ServicePolicy(), mode, nil))
+	RegisterRoutes(r, h)
+	return r
+}
+
+// envelopedRequest carries every unconditionally mandatory §4 field, so a
+// refusal in an envelope test is about the thing under test rather than a
+// missing header. GETs need no Idempotency-Key.
+func envelopedRequest(method, path string) *http.Request {
+	r := httptest.NewRequest(method, path, nil)
+	r.Header.Set("X-Tenant-Id", "tenant-test-01")
+	r.Header.Set("X-Principal-Id", "principal-test-01")
+	r.Header.Set("X-Request-Id", "request-test-01")
+	r.Header.Set("X-Correlation-ID", "correlation-test-01")
+	r.Header.Set("X-Source-Channel", "api")
 	return r
 }
 
@@ -893,18 +943,127 @@ func TestListCapabilityClaims_Authorized_Succeeds(t *testing.T) {
 	}
 }
 
-// TestResolveCapability_AuthorizationNotWeakened proves ResolveCapability
-// still requires no X-Principal-Id at all — its documented, deliberate
-// open-read posture must not have been touched by the Gap 2 fix above.
-func TestResolveCapability_AuthorizationNotWeakened(t *testing.T) {
+// ── ResolveCapability authorization (A11) ──────────────────────────────────
+
+// seedCapability puts a capability directly into the stub store, bypassing the
+// write path, for tests that are only about the read posture.
+func seedCapability(st *stubStore, code string) *domain.Capability {
+	c := &domain.Capability{
+		CapabilityID: "cap-" + code, CapabilityCode: code, ModuleDomain: "test",
+		Version: 1, ExecutionRiskClass: "LOW", CreatedAt: time.Now().UTC(),
+		CreatedByPrincipalID: "seed-principal",
+	}
+	st.capabilities[c.CapabilityID] = c
+	st.byCode[c.CapabilityCode] = c
+	return c
+}
+
+func TestResolveCapability_NoPrincipal_Returns401(t *testing.T) {
 	h := newTestHandler()
 	r := newTestRouter(h)
-	createTestCapability(t, r, "RESOLVE_STILL_PUBLIC")
+	createTestCapability(t, r, "RESOLVE_NO_PRINCIPAL")
+
+	req := buildRequest(http.MethodGet, "/v1/capability-resolution/RESOLVE_NO_PRINCIPAL", nil)
+	req.Header.Del("X-Principal-Id")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 with no X-Principal-Id, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestResolveCapability_AuthzDenied_Returns403(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	h := New(newStubStore(), &stubAuthz{err: authzpkg.ErrAuthorizationDenied}, logger)
+	r := newTestRouter(h)
 
 	w := httptest.NewRecorder()
-	r.ServeHTTP(w, rawRequest(http.MethodGet, "/v1/capability-resolution/RESOLVE_STILL_PUBLIC"))
+	r.ServeHTTP(w, buildRequest(http.MethodGet, "/v1/capability-resolution/ANY", nil))
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 when authz denies, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestResolveCapability_Authorized_UsesPlatformScopeAction(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	st := newStubStore()
+	az := &stubAuthz{}
+	h := New(st, az, logger)
+	seedCapability(st, "RESOLVE_AUTHORIZED")
+	r := newTestRouter(h)
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, buildRequest(http.MethodGet, "/v1/capability-resolution/RESOLVE_AUTHORIZED", nil))
 	if w.Code != http.StatusOK {
-		t.Fatalf("expected ResolveCapability to remain accessible with no X-Principal-Id, got %d: %s", w.Code, w.Body.String())
+		t.Fatalf("expected 200 for an authorized resolution, got %d: %s", w.Code, w.Body.String())
+	}
+
+	calls := az.recordedCalls()
+	if len(calls) != 1 {
+		t.Fatalf("expected exactly one authorization decision, got %+v", calls)
+	}
+	if calls[0].actionType != CapabilityResolve {
+		t.Fatalf("expected action %s, got %s", CapabilityResolve, calls[0].actionType)
+	}
+	if calls[0].legalEntityID != platformScopeID {
+		t.Fatalf("expected platform scope %s, got %s", platformScopeID, calls[0].legalEntityID)
+	}
+	if calls[0].principalID != "principal-test-01" {
+		t.Fatalf("expected the envelope actor to be authorized, got %s", calls[0].principalID)
+	}
+}
+
+// TestResolveCapability_DeployedEnvelopePosture replaces the old
+// TestResolveCapability_AuthorizationNotWeakened, which asserted the opposite
+// on a router without the envelope and therefore proved only handler behavior.
+//
+// capability-registry-svc sets no ZS_ENVELOPE_ENFORCEMENT in
+// deployments/docker-compose.yml, so the deployed mode is the envelope's
+// default write-strict. That mode deliberately admits an incomplete GET, which
+// means the 401 for a headerless resolution must come from the handler's own
+// principal check — not from the envelope. The test also runs in strict mode
+// for a deployment that turns read enforcement on. Both are the real
+// middleware, not a hand-rolled stand-in.
+func TestResolveCapability_DeployedEnvelopePosture(t *testing.T) {
+	for _, mode := range []svcenvelope.Mode{svcenvelope.ModeWriteStrict, svcenvelope.ModeStrict} {
+		t.Run(string(mode), func(t *testing.T) {
+			logger, _ := zap.NewDevelopment()
+			st := newStubStore()
+			h := New(st, &stubAuthz{}, logger)
+			capability := seedCapability(st, "RESOLVE_ENVELOPE")
+			r := newEnvelopeRouter(h, mode)
+			path := "/v1/capability-resolution/" + capability.CapabilityCode
+
+			// Nothing at all: the pre-A11 posture returned 200 here.
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+			if w.Code != http.StatusUnauthorized {
+				t.Fatalf("%s: expected 401 with no envelope/principal, got %d: %s", mode, w.Code, w.Body.String())
+			}
+
+			// A complete envelope with the actor slot removed. In write-strict
+			// the envelope admits the GET and the handler must refuse; in strict
+			// the envelope refuses first. Either way, no principal means no read.
+			req := envelopedRequest(http.MethodGet, path)
+			req.Header.Del("X-Principal-Id")
+			w = httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+			if w.Code != http.StatusUnauthorized {
+				t.Fatalf("%s: expected 401 without X-Principal-Id, got %d: %s", mode, w.Code, w.Body.String())
+			}
+
+			// The same envelope with a principal and a grant reaches the answer.
+			w = httptest.NewRecorder()
+			r.ServeHTTP(w, envelopedRequest(http.MethodGet, path))
+			if w.Code != http.StatusOK {
+				t.Fatalf("%s: expected 200 for an identified, authorized caller, got %d: %s", mode, w.Code, w.Body.String())
+			}
+			var resolved domain.CapabilityResolution
+			_ = json.NewDecoder(w.Body).Decode(&resolved)
+			if !resolved.Enabled || resolved.ReasonCode != "ENABLED" {
+				t.Fatalf("%s: expected the catalogue answer through the envelope, got %+v", mode, resolved)
+			}
+		})
 	}
 }
 
