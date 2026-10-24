@@ -27,6 +27,7 @@ type AccountInfo struct {
 	Postable           bool // header/parent accounts are not
 	Active             bool
 	CurrencyRestricted []string          // empty = any
+	BookIDs            []string          // books the account is valid in; empty = every book
 	DimensionPolicy    map[string]string // dimension -> REQUIRED | PROHIBITED | OPTIONAL
 }
 
@@ -197,6 +198,9 @@ func Evaluate(ctx context.Context, in EvalInput) (*Proposal, error) {
 		}
 		if info == nil || !info.Active || !info.Postable {
 			return nil, exc(FamCOA, "ACCOUNT_NOT_POSTABLE", "%s resolves to an account that is inactive or a header account", t.LineRef).with("line_ref", t.LineRef)
+		}
+		if len(info.BookIDs) > 0 && !containsStr(info.BookIDs, bk.BookID) {
+			return nil, exc(FamCOA, "ACCOUNT_NOT_IN_BOOK", "account %s is not valid in book %s", info.Code, bk.BookCode).with("line_ref", t.LineRef)
 		}
 		if len(info.CurrencyRestricted) > 0 && !containsStr(info.CurrencyRestricted, tccy) {
 			return nil, exc(FamCOA, "ACCOUNT_CURRENCY_RESTRICTED", "account %s does not take %s", info.Code, tccy).with("line_ref", t.LineRef)

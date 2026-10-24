@@ -63,6 +63,11 @@ type Config struct {
 
 	// CurrencyRegistryURL is currency-registry-svc (REF-02): the accounting kernel reads currency precision from it.
 	CurrencyRegistryURL string
+	// ManualJournalEvidenceThreshold (MANUAL_JOURNAL_EVIDENCE_THRESHOLD, e.g. "10000.00") is the total above which a manual
+	// journal must carry evidence before it can be submitted; empty or 0 disables the rule. ManualJournalEvidenceTypes
+	// (MANUAL_JOURNAL_EVIDENCE_TYPES, e.g. "OPENING,CLOSING") are the journal types that always need evidence.
+	ManualJournalEvidenceThreshold string
+	ManualJournalEvidenceTypes     string
 	// PeriodGateShadowTimeout bounds each shadow resolve call.
 	PeriodGateShadowTimeout time.Duration
 }
@@ -131,17 +136,19 @@ func Load() (*Config, error) {
 			GroupID: env("KAFKA_GROUP_ID", "general-ledger-svc"),
 			Topic:   env("KAFKA_EVENTS_TOPIC", "zoiko.general-ledger.events"),
 		},
-		AuthZServiceURL:          env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
-		AuthzMTLSEnabled:         os.Getenv("AUTHZ_MTLS_ENABLED") == "true",
-		AuthzMTLSURL:             env("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),
-		MTLSManagementServiceURL: env("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
-		CloseServiceURL:          env("CLOSE_SERVICE_URL", "http://financial-close-svc:8104"),
-		EvidenceRequirementsURL:  env("EVIDENCE_REQUIREMENTS_URL", "http://evidence-requirements-svc:8130"),
-		OTELExporterEndpoint:     env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
-		PeriodGateMode:           mode,
-		AccountingPeriodURL:      env("ACCOUNTING_PERIOD_URL", "http://accounting-period-svc:8174"),
-		CurrencyRegistryURL:      env("CURRENCY_REGISTRY_URL", "http://currency-registry-svc:8172"),
-		PeriodGateShadowTimeout:  timeout,
+		AuthZServiceURL:                env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
+		AuthzMTLSEnabled:               os.Getenv("AUTHZ_MTLS_ENABLED") == "true",
+		AuthzMTLSURL:                   env("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),
+		MTLSManagementServiceURL:       env("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
+		CloseServiceURL:                env("CLOSE_SERVICE_URL", "http://financial-close-svc:8104"),
+		EvidenceRequirementsURL:        env("EVIDENCE_REQUIREMENTS_URL", "http://evidence-requirements-svc:8130"),
+		OTELExporterEndpoint:           env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
+		PeriodGateMode:                 mode,
+		AccountingPeriodURL:            env("ACCOUNTING_PERIOD_URL", "http://accounting-period-svc:8174"),
+		CurrencyRegistryURL:            env("CURRENCY_REGISTRY_URL", "http://currency-registry-svc:8172"),
+		ManualJournalEvidenceThreshold: env("MANUAL_JOURNAL_EVIDENCE_THRESHOLD", ""),
+		ManualJournalEvidenceTypes:     env("MANUAL_JOURNAL_EVIDENCE_TYPES", ""),
+		PeriodGateShadowTimeout:        timeout,
 	}, nil
 }
 

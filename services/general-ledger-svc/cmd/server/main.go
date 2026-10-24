@@ -228,14 +228,20 @@ func main() {
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
+	manualPolicy, err := handler.ParseManualJournalPolicy(cfg.ManualJournalEvidenceThreshold, cfg.ManualJournalEvidenceTypes)
+	if err != nil {
+		log.Fatal("manual journal policy", zap.Error(err))
+	}
 	h := handler.New(pgStore, publisher, authzClient, closeClient, log).
-		WithEvidenceGate(evidencereq.NewClient(cfg.EvidenceRequirementsURL))
+		WithEvidenceGate(evidencereq.NewClient(cfg.EvidenceRequirementsURL)).
+		WithJournalControls(pgStore, manualPolicy)
 	handler.RegisterRoutes(r, h)
 
 	// Global Accounting Kernel (Wave 0): books, accounting events, posting rule sets, dry-run evaluation, dimensions.
 	kernelRepo := store.NewKernelRepo(pool, cfg.EventResidencyRegion)
 	kernelSvc := &kernel.Service{Repo: kernelRepo}
-	handler.RegisterKernelRoutes(r, handler.NewKernel(kernelSvc, kernelRepo, kernelRepo, currency.New(cfg.CurrencyRegistryURL), nil, authzClient, log))
+	handler.RegisterKernelRoutes(r, handler.NewKernel(kernelSvc, kernelRepo, kernelRepo, currency.New(cfg.CurrencyRegistryURL), nil, authzClient, log).
+		WithPeriodGate(handler.ClosePeriodGate{Close: closeClient, Authz: authzClient}))
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────
 	healthH := health.New(pool, log)

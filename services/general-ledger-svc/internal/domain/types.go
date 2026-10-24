@@ -232,6 +232,33 @@ type JournalHeader struct {
 	// with override_soft_close=true. Persisted per ZS-SVC-B-001 ACC-14 §10.1
 	// and emitted in the JournalCreated outbox event for audit traceability.
 	SoftCloseOverrideReason *string `json:"soft_close_override_reason,omitempty"`
+
+	// ── Accounting Kernel journal model (standard §8.1) ──────────────────────
+	//
+	// JournalNumber is the human-readable sequence, unique per entity+book+year and allocated when the journal is posted;
+	// it is never a relational key. AccountingBookID names the kernel book (BookID above stays the legacy book code that
+	// ledger entries are keyed by). SourceAccountingEventID and PostingExecutionID tie a system journal to the exact event
+	// and rule execution that produced it. JournalHash seals the posted content (AK-INV: posted journals are immutable).
+	JournalNumber           *string `json:"journal_number,omitempty"`
+	AccountingBookID        *string `json:"accounting_book_id,omitempty"`
+	SourceAccountingEventID *string `json:"source_accounting_event_id,omitempty"`
+	PostingExecutionID      *string `json:"posting_execution_id,omitempty"`
+	JournalHash             *string `json:"journal_hash,omitempty"`
+
+	// JournalPurpose is the controlled classification a manual journal must carry (§9). CorrectionKind and
+	// ReversalReason record the nature of a correction (§11), so a policy change is never filed as an error correction.
+	JournalPurpose *string `json:"journal_purpose,omitempty"`
+	CorrectionKind *string `json:"correction_kind,omitempty"`
+	ReversalReason *string `json:"reversal_reason,omitempty"`
+
+	// CopyOfJournalID and RecurringTemplateID record provenance: a copy or a generated instance is a new draft with a
+	// new identity, never a duplicate of posting identifiers (§9).
+	CopyOfJournalID     *string `json:"copy_of_journal_id,omitempty"`
+	RecurringTemplateID *string `json:"recurring_template_id,omitempty"`
+
+	WithdrawnAt            *time.Time `json:"withdrawn_at,omitempty"`
+	WithdrawnByPrincipalID *string    `json:"withdrawn_by_principal_id,omitempty"`
+	WithdrawnReason        *string    `json:"withdrawn_reason,omitempty"`
 }
 
 // JournalLine is one debit or credit line within a journal. Exactly one of
@@ -267,6 +294,15 @@ type JournalLine struct {
 	// values are valid for one, so the keys are recorded as supplied and not
 	// validated — the same posture as account_code with no Chart of Accounts.
 	Dimensions Dimensions `json:"dimensions,omitempty"`
+
+	// Foreign-currency and provenance data (standard §8.2). Debit/credit above are always in the book's functional
+	// currency; when the source transaction was in another currency the original amount, its currency and the rate that
+	// converted it are kept, and PostingRuleLineRef names the exact rule template that generated the line.
+	TransactionAmount  *string `json:"transaction_amount,omitempty"`
+	TransactionCcy     *string `json:"transaction_currency,omitempty"`
+	ExchangeRate       *string `json:"exchange_rate,omitempty"`
+	RateRef            *string `json:"rate_ref,omitempty"`
+	PostingRuleLineRef *string `json:"posting_rule_line_ref,omitempty"`
 }
 
 // JournalWithLines is the full aggregate returned by read endpoints.
@@ -874,6 +910,10 @@ type CreateJournalRequest struct {
 	BookID         *string `json:"book_id,omitempty"`
 	ReportingBasis *string `json:"reporting_basis,omitempty"`
 
+	// JournalPurpose is the controlled purpose of a manual journal (standard §9). Required for the adjusting journal
+	// types (ADJUSTMENT, ACCRUAL, RECLASS, OPENING, CLOSING), where free text alone is not enough.
+	JournalPurpose string `json:"journal_purpose,omitempty"`
+
 	// EvidenceRefs may be sent in the body or, preferably, as the §4 envelope's
 	// X-Evidence-Refs header. The handler merges both — a caller that has
 	// already put its evidence on the envelope should not have to repeat it.
@@ -910,6 +950,11 @@ type CreateJournalRequest struct {
 type ReverseJournalRequest struct {
 	Reason        string `json:"reason"`
 	CorrelationID string `json:"correlation_id"`
+
+	// CorrectionKind is the nature of the correction (§11); optional so existing callers keep working, validated when sent.
+	// PostingDate lets the caller choose the date the reversal takes effect (§32); it defaults as it always has.
+	CorrectionKind string `json:"correction_kind,omitempty"`
+	PostingDate    Date   `json:"posting_date,omitempty"`
 
 	// OverrideSoftClose and SoftCloseOverrideReason mirror the fields on
 	// CreateJournalRequest — see those field docs for semantics.

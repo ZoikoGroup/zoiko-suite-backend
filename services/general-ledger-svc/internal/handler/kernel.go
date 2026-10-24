@@ -40,12 +40,19 @@ type KernelHandler struct {
 	units kernel.CurrencyUnits
 	fx    kernel.FXSource
 	authz AuthZClient
+	gate  kernel.PeriodGate
 	log   *zap.Logger
 }
 
 // NewKernel builds the handler. fx may be nil, in which case a foreign-currency evaluation must carry its fx_basis.
 func NewKernel(svc *kernel.Service, repo kernel.Repo, ref kernel.RefData, units kernel.CurrencyUnits, fx kernel.FXSource, az AuthZClient, log *zap.Logger) *KernelHandler {
 	return &KernelHandler{svc: svc, repo: repo, ref: ref, units: units, fx: fx, authz: az, log: log}
+}
+
+// WithPeriodGate wires the server-side period gate that posting needs. Without one the posting command refuses (fails closed).
+func (h *KernelHandler) WithPeriodGate(g kernel.PeriodGate) *KernelHandler {
+	h.gate = g
+	return h
 }
 
 // RegisterKernelRoutes mounts the kernel routes.
@@ -75,6 +82,10 @@ func RegisterKernelRoutes(r chi.Router, h *KernelHandler) {
 		r.Post("/{id}/return-to-draft", h.ReturnToDraft)
 	})
 	r.Post("/v1/posting-evaluations", h.Evaluate)
+	r.Post("/v1/accounting-postings", h.PostEvent)
+	r.Get("/v1/posting-traces", h.GetPostingTrace)
+	r.Get("/v1/account-applicability/{account_code}", h.GetAccountApplicability)
+	r.Put("/v1/account-applicability/{account_code}", h.SetAccountApplicability)
 	r.Route("/v1/dimensions", func(r chi.Router) {
 		r.Post("/", h.CreateDimension)
 		r.Get("/", h.ListDimensions)

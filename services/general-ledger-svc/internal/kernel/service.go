@@ -97,6 +97,17 @@ type Repo interface {
 	ActiveRuleSets(ctx context.Context, tenant, eventType, bookType, framework string, on time.Time) ([]RuleSet, error)
 	RuleSetEvents(ctx context.Context, tenant, id string) ([]RuleEvent, error)
 
+	// FindPosting returns the posting consequence of an event in a book under a basis, or ErrNotFound.
+	FindPosting(ctx context.Context, tenant, eventID, bookID, basis string) (*PostResult, error)
+	// PostUnit writes the journal, its lines, the posting execution, the event-to-posting record, the ledger entries and the
+	// outbox event in one transaction, or nothing. When the consequence already exists (a concurrent or repeated post) it
+	// returns that one with Existing=true.
+	PostUnit(ctx context.Context, u *PostingUnit) (*PostResult, error)
+	// RecordPostingFailure stores the evidence of a posting that did not complete and raises it on the outbox.
+	RecordPostingFailure(ctx context.Context, f *PostingFailure) error
+	// PostingTrace resolves the lineage of a posting: event, rule, execution, journals, lines, relations and outbox ids.
+	PostingTrace(ctx context.Context, tenant string, q TraceQuery) (*Trace, error)
+
 	InsertDimension(ctx context.Context, tenant string, d *Dimension) error
 	ListDimensions(ctx context.Context, tenant string) ([]Dimension, error)
 	InsertDimensionValue(ctx context.Context, tenant string, v *DimensionValue) error
@@ -180,6 +191,18 @@ func (s *Service) RegisterEvent(ctx context.Context, tenant string, a Actor, e A
 	e.AccountingEventID, e.PayloadHash, e.RegisteredBy, e.RegisteredAt = NewEventID(), e.ComputeHash(), a.PrincipalID, s.now()
 	if e.Facts == nil {
 		e.Facts = map[string]string{}
+	}
+	if e.SupersedesEventID != "" {
+		prior, err := s.Repo.GetEvent(ctx, tenant, e.SupersedesEventID)
+		if err != nil {
+			if errors.Is(err, ErrNotFound) {
+				return nil, false, exc(FamData, "SUPERSEDED_EVENT_UNKNOWN", "the event this one supersedes does not exist").with("supersedes_event_id", e.SupersedesEventID)
+			}
+			return nil, false, err
+		}
+		if prior.LegalEntityID != e.LegalEntityID {
+			return nil, false, exc(FamAuth, "ENTITY_MISMATCH", "a correction belongs to the legal entity of the event it corrects")
+		}
 	}
 	return s.Repo.InsertEvent(ctx, &e, OutEvent{Fact: "event.registered", AggregateType: "accounting-event", AggregateID: e.AccountingEventID, Actor: a.PrincipalID,
 		CorrelationID: e.CorrelationID, LegalEntityID: e.LegalEntityID,

@@ -229,6 +229,10 @@ type Handler struct {
 	evidence    EvidenceChecker
 	log         *zap.Logger
 
+	// ctl and policy are the kernel's manual-journal controls (standard §9); see WithJournalControls.
+	ctl    JournalControlStore
+	policy ManualJournalPolicy
+
 	// clock supplies the reversal posting date. Injectable because a test that
 	// asserts which day a reversal posts to cannot do so against time.Now, and
 	// a reversal landing in the wrong period is exactly the bug worth a test.
@@ -316,6 +320,8 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{journal_id}/validate", h.ValidateJournal)
 		r.Post("/{journal_id}/post", h.PostJournal)
 		r.Post("/{journal_id}/reverse", h.ReverseJournal)
+		r.Post("/{journal_id}/withdraw", h.WithdrawJournal)
+		r.Post("/{journal_id}/copy", h.CopyJournal)
 
 		// ACC-03 journal proposal/approval lifecycle.
 		r.Post("/{journal_id}/amend", h.AmendDraftJournal)
@@ -326,6 +332,15 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{journal_id}/correct", h.RequestCorrection)
 		r.Get("/{journal_id}/available-actions", h.GetAvailableActions)
 		r.Get("/{journal_id}/history", h.GetJournalHistory)
+	})
+	r.Route("/v1/recurring-journal-templates", func(r chi.Router) {
+		r.Post("/", h.CreateRecurringTemplate)
+		r.Get("/", h.ListRecurringTemplates)
+		r.Get("/{template_id}", h.GetRecurringTemplate)
+		r.Post("/{template_id}/generate", h.GenerateRecurringJournal)
+		r.Post("/{template_id}/pause", h.SetRecurringStatus("PAUSED"))
+		r.Post("/{template_id}/resume", h.SetRecurringStatus("ACTIVE"))
+		r.Post("/{template_id}/end", h.SetRecurringStatus("ENDED"))
 	})
 	r.Route("/v1/trial-balance", func(r chi.Router) {
 		r.Post("/compile", h.CompileTrialBalance)
@@ -380,6 +395,12 @@ func (h *Handler) CreateJournal(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
+	h.createJournal(w, r, req, nil)
+}
+
+// createJournal is CreateJournal after the body is decoded, shared with CopyJournal: a copy is a new journal and passes
+// every check a new journal passes. copyOf is the journal being copied, or nil.
+func (h *Handler) createJournal(w http.ResponseWriter, r *http.Request, req domain.CreateJournalRequest, copyOf *string) {
 	if missing := requiredJournalFieldMissing(req); missing != "" {
 		writeError(w, http.StatusBadRequest, "missing_field", missing)
 		return
@@ -484,6 +505,8 @@ func (h *Handler) CreateJournal(w http.ResponseWriter, r *http.Request) {
 		ReportingBasis:          reportingBasis,
 		EvidenceRefs:            mergeEvidenceRefs(req.EvidenceRefs, env.EvidenceRefs),
 		SoftCloseOverrideReason: &req.SoftCloseOverrideReason,
+		JournalPurpose:          optionalString(req.JournalPurpose),
+		CopyOfJournalID:         copyOf,
 
 		// ACC-03: every ordinary journal a human creates starts as a
 		// proposal nobody has acted on yet — explicit here rather than
@@ -1456,6 +1479,9 @@ func (h *Handler) PostJournal(w http.ResponseWriter, r *http.Request) {
 	if !h.checkEvidence(w, r, header.TenantID, header.LegalEntityID, principalID, header.EvidenceRefs) {
 		return
 	}
+	if !h.refuseFutureDated(w, header) {
+		return
+	}
 
 	// Soft-close override: if the journal was created with a soft-close override
 	// reason, allow it through SOFT_CLOSE without requiring a new override at post time.
@@ -1508,6 +1534,10 @@ func (h *Handler) ReverseJournal(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "missing_field", "correlation_id")
 		return
 	}
+	if req.CorrectionKind != "" && !domain.ValidCorrectionKind(req.CorrectionKind) {
+		writeError(w, http.StatusBadRequest, "invalid_correction_kind", "correction_kind is the nature of the correction: ERROR_CORRECTION, ESTIMATE_CHANGE, POLICY_CHANGE, SOURCE_DOCUMENT_CORRECTION, COMMERCIAL_ADJUSTMENT, PERIOD_REOPEN_CORRECTION or MIGRATION_CORRECTION")
+		return
+	}
 
 	header, lines, err := h.store.GetJournal(r.Context(), journalID)
 	if err != nil {
@@ -1551,6 +1581,14 @@ func (h *Handler) ReverseJournal(w http.ResponseWriter, r *http.Request) {
 	// SHADOW DATE (site 3, ReverseJournal): the date the reversal journal will
 	// actually carry (see reversalPostingDate), computed once and reused below.
 	reversalPostingDate := h.reversalPostingDate(header)
+	if !req.PostingDate.IsZero() {
+		// The caller chooses the date the reversal takes effect (§32). It may not precede the document it neutralizes.
+		if req.PostingDate.Before(header.TransactionDate.Time) {
+			writeError(w, http.StatusBadRequest, "invalid_posting_date", domain.ErrPostingBeforeTransaction.Error())
+			return
+		}
+		reversalPostingDate = req.PostingDate
+	}
 	if err := h.closeClient.CheckPeriodOpenAt(r.Context(), header.TenantID, close.PeriodRef{
 		LegalEntityID: header.LegalEntityID, PeriodName: header.FiscalPeriod,
 		PostingDate: reversalPostingDate, JournalID: header.JournalID,
@@ -1590,6 +1628,17 @@ func (h *Handler) ReverseJournal(w http.ResponseWriter, r *http.Request) {
 		BookID:          header.BookID,
 		ReportingBasis:  header.ReportingBasis,
 		EvidenceRefs:    header.EvidenceRefs,
+
+		// Lineage (§11): the reversal stays in the original's book and under the original's accounting event, carries the
+		// reason and the nature of the correction, and — for a kernel posting — gets an execution record of its own.
+		AccountingBookID:        header.AccountingBookID,
+		SourceAccountingEventID: header.SourceAccountingEventID,
+		ReversalReason:          optionalString(req.Reason),
+		CorrectionKind:          optionalString(req.CorrectionKind),
+	}
+	if header.SourceAccountingEventID != nil {
+		execID := uuid.NewString()
+		reversingHeader.PostingExecutionID = &execID
 	}
 	reversingLines := make([]domain.JournalLine, len(lines))
 	for i, l := range lines {
@@ -1601,6 +1650,10 @@ func (h *Handler) ReverseJournal(w http.ResponseWriter, r *http.Request) {
 			TaxCode:            l.TaxCode, // same tax basis as the line being reversed
 			TaxLogicSnapshotID: l.TaxLogicSnapshotID,
 			Dimensions:         l.Dimensions, // reverse against the same analysis axes
+
+			// The original foreign-currency basis and rule provenance are kept: the reversal neutralizes at the same rate.
+			TransactionAmount: l.TransactionAmount, TransactionCcy: l.TransactionCcy, ExchangeRate: l.ExchangeRate,
+			RateRef: l.RateRef, PostingRuleLineRef: l.PostingRuleLineRef,
 		}
 	}
 
@@ -1801,6 +1854,9 @@ func (h *Handler) SubmitJournal(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnprocessableEntity, "unbalanced_journal", domain.ErrJournalUnbalancedAtSubmit.Error())
 		return
 	}
+	if !h.requireEvidence(w, header, debitTotal) {
+		return
+	}
 
 	if err := h.store.SubmitJournalForApproval(r.Context(), tenantID, journalID, principalID); err != nil {
 		if errors.Is(err, domain.ErrInvalidApprovalTransition) {
@@ -1847,7 +1903,7 @@ func (h *Handler) ApproveJournal(w http.ResponseWriter, r *http.Request) {
 		h.writeAuthzErr(w, err)
 		return
 	}
-	if header.SubmittedByPrincipalID != nil && *header.SubmittedByPrincipalID == principalID {
+	if (header.SubmittedByPrincipalID != nil && *header.SubmittedByPrincipalID == principalID) || header.CreatedByPrincipalID == principalID {
 		writeError(w, http.StatusForbidden, "self_approval_not_permitted", domain.ErrSelfApprovalNotPermitted.Error())
 		return
 	}
@@ -2728,6 +2784,9 @@ func (h *Handler) PostApprovedJournal(w http.ResponseWriter, r *http.Request) {
 		softCloseOverrideReason = *header.SoftCloseOverrideReason
 	}
 
+	if !h.refuseFutureDated(w, header) {
+		return
+	}
 	exec := &domain.PostingExecution{
 		ExecutionID: uuid.NewString(), TenantID: tenantID, LegalEntityID: header.LegalEntityID, Kind: domain.PostingExecutionKindApprovedJournal,
 		Status: domain.PostingExecutionStatusSubmitted, CalculationTrace: "{}", CorrelationID: header.CorrelationID,
@@ -3353,6 +3412,13 @@ func invalidJournalInput(req domain.CreateJournalRequest) (code, detail string) 
 	}
 	if req.PostingDate.Before(req.TransactionDate.Time) {
 		return "invalid_posting_date", domain.ErrPostingBeforeTransaction.Error()
+	}
+	// Standard §9: a manual journal selects a controlled purpose; free text alone is not enough.
+	if req.JournalPurpose != "" && !domain.ValidJournalPurpose(req.JournalPurpose) {
+		return "invalid_journal_purpose", "journal_purpose must be one of " + strings.Join(domain.JournalPurposes(), ", ")
+	}
+	if req.JournalPurpose == "" && domain.PurposeRequired(req.JournalType) {
+		return "journal_purpose_required", "a " + string(req.JournalType) + " journal needs a journal_purpose: " + strings.Join(domain.JournalPurposes(), ", ")
 	}
 	return "", ""
 }
