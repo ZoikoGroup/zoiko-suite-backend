@@ -22,6 +22,7 @@ import (
 	svcmiddleware "zoiko.io/secret-vault-integration-svc/internal/middleware"
 	"zoiko.io/secret-vault-integration-svc/internal/store"
 	"zoiko.io/secret-vault-integration-svc/internal/vault"
+	apicontract "zoiko.io/identity-envelope/apicontract"
 )
 
 // SecretVaultStore is the narrow interface the handler depends on.
@@ -242,13 +243,13 @@ func (h *Handler) CreateSecretPolicy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if missing := req.missingField(); missing != "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": missing})
+		writeError(w, r, http.StatusBadRequest, "missing_field", missing)
 		return
 	}
 
 	if req.DataClassification != "" {
 		if !classification.Classification(req.DataClassification).Valid() {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_classification", "message": "data_classification must be PUBLIC, INTERNAL, CONFIDENTIAL, or RESTRICTED"})
+			writeError(w, r, http.StatusBadRequest, "invalid_classification", "data_classification must be PUBLIC, INTERNAL, CONFIDENTIAL, or RESTRICTED")
 			return
 		}
 	}
@@ -263,10 +264,10 @@ func (h *Handler) CreateSecretPolicy(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrConflict):
-			writeJSON(w, http.StatusConflict, map[string]string{"error": "secret_policy_conflict", "secret_path": req.SecretPath})
+			writeError(w, r, http.StatusConflict, "secret_policy_conflict", req.SecretPath)
 		default:
 			h.log.Error("CreateSecretPolicy: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
 		}
 		return
 	}
@@ -335,21 +336,15 @@ func (h *Handler) CreateSecretPolicyVersion(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	if missing := req.missingField(); missing != "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": missing})
+		writeError(w, r, http.StatusBadRequest, "missing_field", missing)
 		return
 	}
 	if req.MaxLeaseDurationSeconds <= 0 {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error": "invalid_field", "field": "max_lease_duration_seconds", "message": "must be greater than 0",
-		})
+		writeError(w, r, http.StatusBadRequest, "invalid_field", "must be greater than 0")
 		return
 	}
 	if h.maxLeaseDurationCeiling > 0 && req.MaxLeaseDurationSeconds > h.maxLeaseDurationCeiling {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error":   "invalid_field",
-			"field":   "max_lease_duration_seconds",
-			"message": fmt.Sprintf("exceeds platform maximum of %d seconds", h.maxLeaseDurationCeiling),
-		})
+		writeError(w, r, http.StatusBadRequest, "invalid_field", fmt.Sprintf("exceeds platform maximum of %d seconds", h.maxLeaseDurationCeiling))
 		return
 	}
 	// tenant_id in the body used to be written straight through, so a caller
@@ -360,17 +355,14 @@ func (h *Handler) CreateSecretPolicyVersion(w http.ResponseWriter, r *http.Reque
 	if !ok {
 		return
 	}
-	if h.refuseForeignTenant(w, req.TenantID, tenantScope) {
+	if h.refuseForeignTenant(w, r, req.TenantID, tenantScope) {
 		return
 	}
 	// tenant_id nil means GLOBAL, and a global version bound to one legal entity
 	// is an incoherent scope: it would govern every tenant while naming an entity
 	// inside one of them.
 	if req.TenantID == nil && req.LegalEntityID != nil && *req.LegalEntityID != "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error":   "invalid_scope",
-			"message": "a global version (no tenant_id) cannot name a legal_entity_id",
-		})
+		writeError(w, r, http.StatusBadRequest, "invalid_scope", "a global version (no tenant_id) cannot name a legal_entity_id")
 		return
 	}
 
@@ -389,12 +381,12 @@ func (h *Handler) CreateSecretPolicyVersion(w http.ResponseWriter, r *http.Reque
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrSecretPolicyNotFound):
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "secret_policy_not_found", "secret_policy_id": secretPolicyID})
+			writeError(w, r, http.StatusNotFound, "secret_policy_not_found", secretPolicyID)
 		case errors.Is(err, domain.ErrConflict):
-			writeJSON(w, http.StatusConflict, map[string]string{"error": "secret_policy_version_conflict"})
+			writeError(w, r, http.StatusConflict, "secret_policy_version_conflict", "")
 		default:
 			h.log.Error("CreateSecretPolicyVersion: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
 		}
 		return
 	}
@@ -455,7 +447,7 @@ func (h *Handler) ActivateVersion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.ActivatedByPrincipalID == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "activated_by_principal_id"})
+		writeError(w, r, http.StatusBadRequest, "missing_field", "activated_by_principal_id")
 		return
 	}
 
@@ -463,15 +455,15 @@ func (h *Handler) ActivateVersion(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrSecretPolicyVersionNotFound):
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "secret_policy_version_not_found", "secret_policy_version_id": versionID})
+			writeError(w, r, http.StatusNotFound, "secret_policy_version_not_found", versionID)
 		default:
 			h.log.Error("ActivateVersion: lookup failed", zap.String("correlation_id", correlationID), zap.Error(err))
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
 		}
 		return
 	}
 	if existing.SecretPolicyID != secretPolicyID {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "secret_policy_version_not_found", "secret_policy_id": secretPolicyID})
+		writeError(w, r, http.StatusNotFound, "secret_policy_version_not_found", secretPolicyID)
 		return
 	}
 
@@ -479,10 +471,10 @@ func (h *Handler) ActivateVersion(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrInvalidTransition):
-			writeJSON(w, http.StatusConflict, map[string]string{"error": "invalid_transition", "secret_policy_version_id": versionID})
+			writeError(w, r, http.StatusConflict, "invalid_transition", versionID)
 		default:
 			h.log.Error("ActivateVersion: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
 		}
 		return
 	}
@@ -534,12 +526,12 @@ func (h *Handler) PutSecretMaterial(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.MaterialBase64 == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "material_base64"})
+		writeError(w, r, http.StatusBadRequest, "missing_field", "material_base64")
 		return
 	}
 	material, err := base64.StdEncoding.DecodeString(req.MaterialBase64)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_field", "field": "material_base64", "message": "must be valid base64"})
+		writeError(w, r, http.StatusBadRequest, "invalid_field", "must be valid base64")
 		return
 	}
 
@@ -547,10 +539,10 @@ func (h *Handler) PutSecretMaterial(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrSecretPolicyNotFound):
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "secret_policy_not_found", "secret_policy_id": secretPolicyID})
+			writeError(w, r, http.StatusNotFound, "secret_policy_not_found", secretPolicyID)
 		default:
 			h.log.Error("PutSecretMaterial: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
 		}
 		return
 	}
@@ -577,7 +569,7 @@ func (h *Handler) PutSecretMaterial(w http.ResponseWriter, r *http.Request) {
 	if err := h.vault.Put(r.Context(), policy.SecretPath, material); err != nil {
 		h.log.Error("PutSecretMaterial: vault backend put failed", zap.String("secret_path", policy.SecretPath), zap.Error(err))
 		h.metrics.VaultBackendError("put")
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "vault_backend_unavailable"})
+		writeError(w, r, http.StatusServiceUnavailable, "vault_backend_unavailable", "")
 		return
 	}
 
@@ -618,10 +610,10 @@ func (h *Handler) ListVersionHistory(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrSecretPolicyNotFound):
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "secret_policy_not_found", "secret_policy_id": secretPolicyID})
+			writeError(w, r, http.StatusNotFound, "secret_policy_not_found", secretPolicyID)
 		default:
 			h.log.Error("ListVersionHistory: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
 		}
 		return
 	}
@@ -642,7 +634,7 @@ func (h *Handler) ListApplicableSecretPolicyVersions(w http.ResponseWriter, r *h
 
 	secretClass := q.Get("secret_class")
 	if secretClass == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "secret_class"})
+		writeError(w, r, http.StatusBadRequest, "missing_field", "secret_class")
 		return
 	}
 
@@ -668,14 +660,14 @@ func (h *Handler) ListApplicableSecretPolicyVersions(w http.ResponseWriter, r *h
 	// ?tenant_id= used to be taken as the scope outright, so any caller could read
 	// the secret policies governing another tenant's paths. Omitting it still
 	// means "global versions only".
-	if h.refuseForeignTenant(w, tenantID, tenantScope) {
+	if h.refuseForeignTenant(w, r, tenantID, tenantScope) {
 		return
 	}
 
 	results, err := h.store.FindApplicableVersions(r.Context(), secretClass, tenantID, legalEntityID)
 	if err != nil {
 		h.log.Error("ListApplicableSecretPolicyVersions: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
 		return
 	}
 	if results == nil {
@@ -740,7 +732,7 @@ func (h *Handler) Broker(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if missing := req.missingField(); missing != "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": missing})
+		writeError(w, r, http.StatusBadRequest, "missing_field", missing)
 		return
 	}
 
@@ -752,7 +744,7 @@ func (h *Handler) Broker(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if h.refuseForeignTenant(w, req.TenantID, tenantScope) {
+	if h.refuseForeignTenant(w, r, req.TenantID, tenantScope) {
 		return
 	}
 
@@ -789,10 +781,7 @@ func (h *Handler) Broker(w http.ResponseWriter, r *http.Request) {
 			"requested_by_principal_id does not match the gateway-verified envelope identity (X-Principal-Id / X-Workload-Id)",
 			correlationID, env.Actor())
 		h.metrics.BrokerDecision("denied")
-		writeJSON(w, http.StatusForbidden, map[string]string{
-			"error":       "workload_identity_mismatch",
-			"secret_path": req.SecretPath,
-		})
+writeError(w, r, http.StatusForbidden, "workload_identity_mismatch", req.SecretPath)
 		return
 	}
 
@@ -809,11 +798,11 @@ func (h *Handler) Broker(w http.ResponseWriter, r *http.Request) {
 			// was ever resolved to read it from.
 			h.recordDenial(r.Context(), req, "", nil, "no applicable secret policy for this path/scope", correlationID, req.RequestedByPrincipalID)
 			h.metrics.BrokerDecision("no_policy")
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "no_applicable_secret_policy", "secret_path": req.SecretPath})
+			writeError(w, r, http.StatusNotFound, "no_applicable_secret_policy", req.SecretPath)
 		default:
 			h.log.Error("Broker: store unavailable resolving policy", zap.String("correlation_id", correlationID), zap.Error(err))
 			h.metrics.BrokerDecision("error")
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
 		}
 		return
 	}
@@ -823,7 +812,7 @@ func (h *Handler) Broker(w http.ResponseWriter, r *http.Request) {
 	if err := json.Unmarshal(applicable.AllowedWorkloadIDs, &allowedWorkloads); err != nil {
 		h.log.Error("Broker: policy version has invalid allowed_workload_ids", zap.String("secret_policy_version_id", applicable.SecretPolicyVersionID), zap.Error(err))
 		h.metrics.BrokerDecision("error")
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "invalid_policy_payload"})
+		writeError(w, r, http.StatusInternalServerError, "invalid_policy_payload", "")
 		return
 	}
 	if !contains(allowedWorkloads, req.RequestedByPrincipalID) {
@@ -832,7 +821,7 @@ func (h *Handler) Broker(w http.ResponseWriter, r *http.Request) {
 		// entry as complete evidence as a GRANTED one (context.md §5).
 		h.recordDenial(r.Context(), req, applicable.SecretClass, &applicable.SecretPolicyVersionID, "requesting principal not in allowed_workload_ids", correlationID, req.RequestedByPrincipalID)
 		h.metrics.BrokerDecision("denied")
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "access_denied", "secret_path": req.SecretPath})
+		writeError(w, r, http.StatusForbidden, "access_denied", req.SecretPath)
 		return
 	}
 
@@ -849,13 +838,13 @@ func (h *Handler) Broker(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			h.log.Error("Broker: exception lookup failed", zap.String("correlation_id", correlationID), zap.Error(err))
 			h.metrics.BrokerDecision("error")
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
 			return
 		}
 		if activeExceptionFor(exceptions, applicable.SecretPath, req.TenantID) == nil {
 			h.recordDenial(r.Context(), req, applicable.SecretClass, &applicable.SecretPolicyVersionID, "shared secret (multiple allowed workloads) has no active shared-secret exception", correlationID, req.RequestedByPrincipalID)
 			h.metrics.BrokerDecision("denied")
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": "shared_secret_exception_required", "secret_path": req.SecretPath})
+			writeError(w, r, http.StatusForbidden, "shared_secret_exception_required", req.SecretPath)
 			return
 		}
 	}
@@ -881,7 +870,7 @@ func (h *Handler) Broker(w http.ResponseWriter, r *http.Request) {
 		h.log.Error("Broker: vault backend unavailable", zap.String("secret_path", req.SecretPath), zap.Error(err))
 		h.metrics.VaultBackendError("get")
 		h.metrics.BrokerDecision("vault_error")
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "vault_backend_unavailable"})
+		writeError(w, r, http.StatusServiceUnavailable, "vault_backend_unavailable", "")
 		return
 	}
 
@@ -898,7 +887,7 @@ func (h *Handler) Broker(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		h.log.Error("Broker: failed to create lease", zap.String("correlation_id", correlationID), zap.Error(err))
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
 		return
 	}
 
@@ -912,7 +901,7 @@ func (h *Handler) Broker(w http.ResponseWriter, r *http.Request) {
 			h.log.Error("Broker: vault backend unavailable re-minting replayed lease token", zap.String("secret_path", lease.SecretPath), zap.Error(err))
 			h.metrics.VaultBackendError("get")
 			h.metrics.BrokerDecision("vault_error")
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "vault_backend_unavailable"})
+			writeError(w, r, http.StatusServiceUnavailable, "vault_backend_unavailable", "")
 			return
 		}
 	}
@@ -1025,17 +1014,17 @@ func (h *Handler) GetLease(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrLeaseNotFound):
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "lease_not_found", "lease_id": leaseID})
+			writeError(w, r, http.StatusNotFound, "lease_not_found", leaseID)
 		default:
 			h.log.Error("GetLease: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
 		}
 		return
 	}
 	// A lease says which principal holds live access to which secret path. Any id
 	// returned one, from any tenant. FindLeaseByID's own predicate is now the
 	// primary control; this stays as the belt-and-suspenders check it always was.
-	if h.refuseForeignRow(w, lease.TenantID, tenantScope, "lease_not_found", "lease_id", leaseID) {
+	if h.refuseForeignRow(w, r, lease.TenantID, tenantScope, "lease_not_found", "lease_id", leaseID) {
 		return
 	}
 	writeJSON(w, http.StatusOK, lease)
@@ -1072,7 +1061,7 @@ func (h *Handler) VerifyLease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.LeaseToken == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "lease_token"})
+		writeError(w, r, http.StatusBadRequest, "missing_field", "lease_token")
 		return
 	}
 
@@ -1089,7 +1078,7 @@ func (h *Handler) VerifyLease(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_lease_token"})
+		writeError(w, r, http.StatusBadRequest, "invalid_lease_token", "")
 		return
 	}
 
@@ -1097,14 +1086,14 @@ func (h *Handler) VerifyLease(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrLeaseNotFound):
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "lease_not_found", "lease_id": leaseID})
+			writeError(w, r, http.StatusNotFound, "lease_not_found", leaseID)
 		default:
 			h.log.Error("VerifyLease: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
 		}
 		return
 	}
-	if h.refuseForeignRow(w, lease.TenantID, tenantScope, "lease_not_found", "lease_id", leaseID) {
+	if h.refuseForeignRow(w, r, lease.TenantID, tenantScope, "lease_not_found", "lease_id", leaseID) {
 		return
 	}
 	// The token names the one lease it was minted for. Checking only the path
@@ -1118,7 +1107,7 @@ func (h *Handler) VerifyLease(w http.ResponseWriter, r *http.Request) {
 			zap.Bool("lease_binding_matches", lease.RequestID == info.RequestID),
 			zap.String("correlation_id", correlationID),
 		)
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "lease_token_mismatch"})
+		writeError(w, r, http.StatusBadRequest, "lease_token_mismatch", "")
 		return
 	}
 
@@ -1184,17 +1173,14 @@ func (h *Handler) ListLeases(w http.ResponseWriter, r *http.Request) {
 	// It is now the caller's verified scope, and a query parameter naming another
 	// tenant is refused rather than ignored.
 	if v := q.Get("tenant_id"); v != "" && v != tenantScope {
-		writeJSON(w, http.StatusForbidden, map[string]string{
-			"error":   "tenant_scope_mismatch",
-			"message": "request tenant_id does not match the caller's verified tenant scope",
-		})
+		writeError(w, r, http.StatusForbidden, "tenant_scope_mismatch", "request tenant_id does not match the caller's verified tenant scope")
 		return
 	}
 	filter.TenantID = &tenantScope
 	if v := q.Get("from"); v != "" {
 		t, err := time.Parse(time.RFC3339, v)
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_from"})
+			writeError(w, r, http.StatusBadRequest, "invalid_from", "")
 			return
 		}
 		filter.From = t
@@ -1202,7 +1188,7 @@ func (h *Handler) ListLeases(w http.ResponseWriter, r *http.Request) {
 	if v := q.Get("to"); v != "" {
 		t, err := time.Parse(time.RFC3339, v)
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_to"})
+			writeError(w, r, http.StatusBadRequest, "invalid_to", "")
 			return
 		}
 		filter.To = t
@@ -1221,7 +1207,7 @@ func (h *Handler) ListLeases(w http.ResponseWriter, r *http.Request) {
 	results, err := h.store.ListLeases(r.Context(), filter)
 	if err != nil {
 		h.log.Error("ListLeases: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
 		return
 	}
 	if results == nil {
@@ -1257,18 +1243,18 @@ func (h *Handler) RevokeLease(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrLeaseNotFound):
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "lease_not_found", "lease_id": leaseID})
+			writeError(w, r, http.StatusNotFound, "lease_not_found", leaseID)
 		default:
 			h.log.Error("RevokeLease: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
 		}
 		return
 	}
 	if existing == nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "lease_not_found", "lease_id": leaseID})
+		writeError(w, r, http.StatusNotFound, "lease_not_found", leaseID)
 		return
 	}
-	if h.refuseForeignRow(w, existing.TenantID, tenantScope, "lease_not_found", "lease_id", leaseID) {
+	if h.refuseForeignRow(w, r, existing.TenantID, tenantScope, "lease_not_found", "lease_id", leaseID) {
 		h.log.Warn("RevokeLease refused: lease belongs to another tenant",
 			zap.String("lease_id", leaseID),
 			zap.String("caller_tenant_id", tenantScope),
@@ -1281,12 +1267,12 @@ func (h *Handler) RevokeLease(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrLeaseNotFound):
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "lease_not_found", "lease_id": leaseID})
+			writeError(w, r, http.StatusNotFound, "lease_not_found", leaseID)
 		case errors.Is(err, domain.ErrInvalidTransition):
-			writeJSON(w, http.StatusConflict, map[string]string{"error": "invalid_transition", "lease_id": leaseID})
+			writeError(w, r, http.StatusConflict, "invalid_transition", leaseID)
 		default:
 			h.log.Error("RevokeLease: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
 		}
 		return
 	}
@@ -1392,11 +1378,11 @@ func (h *Handler) Rotate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.RequestID == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "request_id"})
+		writeError(w, r, http.StatusBadRequest, "missing_field", "request_id")
 		return
 	}
 	if req.RotatedByPrincipalID == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "rotated_by_principal_id"})
+		writeError(w, r, http.StatusBadRequest, "missing_field", "rotated_by_principal_id")
 		return
 	}
 
@@ -1404,7 +1390,7 @@ func (h *Handler) Rotate(w http.ResponseWriter, r *http.Request) {
 	existingEntry, err := h.store.FindAuditEntryByRotationRequestID(r.Context(), req.RequestID)
 	if err != nil {
 		h.log.Error("Rotate: idempotency check failed", zap.String("correlation_id", correlationID), zap.Error(err))
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
 		return
 	}
 	if existingEntry != nil {
@@ -1426,10 +1412,10 @@ func (h *Handler) Rotate(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrSecretPolicyNotFound):
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "secret_policy_not_found", "secret_policy_id": secretPolicyID})
+			writeError(w, r, http.StatusNotFound, "secret_policy_not_found", secretPolicyID)
 		default:
 			h.log.Error("Rotate: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
 		}
 		return
 	}
@@ -1603,7 +1589,7 @@ func (h *Handler) ListAuditLog(w http.ResponseWriter, r *http.Request) {
 	if v := q.Get("from"); v != "" {
 		t, err := time.Parse(time.RFC3339, v)
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_from"})
+			writeError(w, r, http.StatusBadRequest, "invalid_from", "")
 			return
 		}
 		filter.From = t
@@ -1611,7 +1597,7 @@ func (h *Handler) ListAuditLog(w http.ResponseWriter, r *http.Request) {
 	if v := q.Get("to"); v != "" {
 		t, err := time.Parse(time.RFC3339, v)
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_to"})
+			writeError(w, r, http.StatusBadRequest, "invalid_to", "")
 			return
 		}
 		filter.To = t
@@ -1630,7 +1616,7 @@ func (h *Handler) ListAuditLog(w http.ResponseWriter, r *http.Request) {
 	results, err := h.store.ListAuditLog(r.Context(), filter)
 	if err != nil {
 		h.log.Error("ListAuditLog: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
 		return
 	}
 	if results == nil {
@@ -1658,11 +1644,7 @@ func (h *Handler) ListAuditLog(w http.ResponseWriter, r *http.Request) {
 func requireUUIDParam(w http.ResponseWriter, r *http.Request, param string) (string, bool) {
 	raw := chi.URLParam(r, param)
 	if _, err := uuid.Parse(raw); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error":   "invalid_path_parameter",
-			"field":   param,
-			"message": param + " must be a UUID",
-		})
+		writeError(w, r, http.StatusBadRequest, "invalid_path_parameter", param+" must be a UUID", param)
 		return "", false
 	}
 	return raw, true
@@ -1675,6 +1657,16 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	if err := json.NewEncoder(w).Encode(v); err != nil {
 		_ = err
 	}
+}
+
+// writeError writes an RFC 9457 problem+json error response via apicontract.
+// If field is non-empty, it is included as a field error in the errors array.
+func writeError(w http.ResponseWriter, r *http.Request, status int, code, detail string, field ...string) {
+	p := apicontract.Problem{Status: status, Code: code, Detail: detail}
+	if len(field) > 0 && field[0] != "" {
+		p.Errors = []apicontract.FieldError{{Pointer: "#/" + field[0], Code: "invalid", Detail: "invalid value"}}
+	}
+	apicontract.WriteProblem(w, r, p)
 }
 
 // ── emergency material retrieval ─────────────────────────────────────────────
@@ -1714,13 +1706,13 @@ func (h *Handler) EmergencyRetrieval(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.RequestID == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "request_id"})
+		writeError(w, r, http.StatusBadRequest, "missing_field", "request_id")
 		return
 	}
 	// §13: emergency retrieval "requires privileged workflow and evidence".
 	// A break-glass act with no stated reason leaves evidence of nothing.
 	if strings.TrimSpace(req.Reason) == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "reason"})
+		writeError(w, r, http.StatusBadRequest, "missing_field", "reason")
 		return
 	}
 
@@ -1728,10 +1720,10 @@ func (h *Handler) EmergencyRetrieval(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrSecretPolicyNotFound):
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "secret_policy_not_found", "secret_policy_id": secretPolicyID})
+			writeError(w, r, http.StatusNotFound, "secret_policy_not_found", secretPolicyID)
 		default:
 			h.log.Error("EmergencyRetrieval: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
 		}
 		return
 	}
@@ -1748,12 +1740,12 @@ func (h *Handler) EmergencyRetrieval(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		h.log.Error("EmergencyRetrieval: exception lookup failed", zap.String("correlation_id", correlationID), zap.Error(err))
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
 		return
 	}
 	activeException := activeExceptionFor(exceptions, policy.SecretPath, nil)
 	if activeException == nil {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "no_active_exception"})
+		writeError(w, r, http.StatusForbidden, "no_active_exception", "")
 		return
 	}
 	// Two people: whoever approved the override may not be the one who uses
@@ -1761,11 +1753,7 @@ func (h *Handler) EmergencyRetrieval(w http.ResponseWriter, r *http.Request) {
 	// retrieves under it in two calls, and the "privileged workflow" is a
 	// formality the same person completes alone.
 	if activeException.ApprovedByPrincipalID == principalID {
-		writeJSON(w, http.StatusForbidden, map[string]string{
-			"error":        "exception_self_approval",
-			"exception_id": activeException.ExceptionID,
-			"message":      "the principal who approved this exception cannot perform the retrieval it authorizes",
-		})
+		writeError(w, r, http.StatusForbidden, "exception_self_approval", "the principal who approved this exception cannot perform the retrieval it authorizes")
 		return
 	}
 
@@ -1784,7 +1772,7 @@ func (h *Handler) EmergencyRetrieval(w http.ResponseWriter, r *http.Request) {
 		CorrelationID:          correlationID,
 	}); err != nil {
 		h.log.Error("EmergencyRetrieval: evidence write failed; material withheld", zap.String("correlation_id", correlationID), zap.Error(err))
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "evidence_unavailable"})
+		writeError(w, r, http.StatusServiceUnavailable, "evidence_unavailable", "")
 		return
 	}
 
@@ -1792,7 +1780,7 @@ func (h *Handler) EmergencyRetrieval(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		h.log.Error("EmergencyRetrieval: vault backend get failed", zap.String("secret_path", policy.SecretPath), zap.Error(err))
 		h.metrics.VaultBackendError("get_material")
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "vault_backend_unavailable"})
+		writeError(w, r, http.StatusServiceUnavailable, "vault_backend_unavailable", "")
 		return
 	}
 
@@ -1866,11 +1854,11 @@ func (h *Handler) CreateSharedSecretException(w http.ResponseWriter, r *http.Req
 		return
 	}
 	if missing := req.missingField(); missing != "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": missing})
+		writeError(w, r, http.StatusBadRequest, "missing_field", missing)
 		return
 	}
 	if !req.ExpiresAt.After(time.Now()) {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_field", "field": "expires_at", "message": "must be in the future"})
+		writeError(w, r, http.StatusBadRequest, "invalid_field", "must be in the future")
 		return
 	}
 
@@ -1886,10 +1874,10 @@ func (h *Handler) CreateSharedSecretException(w http.ResponseWriter, r *http.Req
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrConflict):
-			writeJSON(w, http.StatusConflict, map[string]string{"error": "shared_secret_exception_conflict"})
+			writeError(w, r, http.StatusConflict, "shared_secret_exception_conflict", "")
 		default:
 			h.log.Error("CreateSharedSecretException: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
 		}
 		return
 	}
@@ -1921,7 +1909,7 @@ func (h *Handler) ListSharedSecretExceptions(w http.ResponseWriter, r *http.Requ
 	})
 	if err != nil {
 		h.log.Error("ListSharedSecretExceptions: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
 		return
 	}
 	if results == nil {
@@ -1956,10 +1944,10 @@ func (h *Handler) RevokeSharedSecretException(w http.ResponseWriter, r *http.Req
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrInvalidTransition):
-			writeJSON(w, http.StatusConflict, map[string]string{"error": "invalid_transition", "except_id": exceptionID})
+			writeError(w, r, http.StatusConflict, "invalid_transition", exceptionID)
 		default:
 			h.log.Error("RevokeSharedSecretException: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
 		}
 		return
 	}
@@ -2014,10 +2002,7 @@ func (h *Handler) requireTenant(w http.ResponseWriter, r *http.Request) (string,
 	if id := strings.TrimSpace(svcmiddleware.TenantFromContext(r.Context())); id != "" {
 		return id, true
 	}
-	writeJSON(w, http.StatusUnauthorized, map[string]string{
-		"error":   "tenant_scope_missing",
-		"message": "X-Tenant-Id is required — the gateway sets it from a verified identity envelope",
-	})
+	writeError(w, r, http.StatusUnauthorized, "tenant_scope_missing", "X-Tenant-Id is required — the gateway sets it from a verified identity envelope")
 	return "", false
 }
 
@@ -2025,14 +2010,11 @@ func (h *Handler) requireTenant(w http.ResponseWriter, r *http.Request) (string,
 // caller's verified scope, answering 403 if so. A nil or empty claimed value is
 // not a disagreement: for secret policies nil means GLOBAL scope, a deliberate
 // request that authorization rather than scoping decides on.
-func (h *Handler) refuseForeignTenant(w http.ResponseWriter, claimed *string, tenantID string) bool {
+func (h *Handler) refuseForeignTenant(w http.ResponseWriter, r *http.Request, claimed *string, tenantID string) bool {
 	if claimed == nil || *claimed == "" || *claimed == tenantID {
 		return false
 	}
-	writeJSON(w, http.StatusForbidden, map[string]string{
-		"error":   "tenant_scope_mismatch",
-		"message": "request tenant_id does not match the caller's verified tenant scope",
-	})
+	writeError(w, r, http.StatusForbidden, "tenant_scope_mismatch", "request tenant_id does not match the caller's verified tenant scope")
 	return true
 }
 
@@ -2040,11 +2022,11 @@ func (h *Handler) refuseForeignTenant(w http.ResponseWriter, claimed *string, te
 // another tenant, answering 404 if so — the same answer as a row that does not
 // exist, so an id-addressed route cannot be used to probe for another tenant's
 // leases or policies. A row with no tenant at all is global and stays visible.
-func (h *Handler) refuseForeignRow(w http.ResponseWriter, rowTenantID *string, tenantID string, notFoundError, idField, idValue string) bool {
+func (h *Handler) refuseForeignRow(w http.ResponseWriter, r *http.Request, rowTenantID *string, tenantID string, notFoundError, idField, idValue string) bool {
 	if rowTenantID == nil || *rowTenantID == "" || *rowTenantID == tenantID {
 		return false
 	}
-	writeJSON(w, http.StatusNotFound, map[string]string{"error": notFoundError, idField: idValue})
+	writeError(w, r, http.StatusNotFound, notFoundError, idValue)
 	return true
 }
 
@@ -2052,10 +2034,7 @@ func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (stri
 	if id := strings.TrimSpace(r.Header.Get("X-Principal-Id")); id != "" {
 		return id, true
 	}
-	writeJSON(w, http.StatusUnauthorized, map[string]string{
-		"error":   "missing_principal",
-		"message": "X-Principal-Id is required — the gateway sets it from a verified identity envelope",
-	})
+	writeError(w, r, http.StatusUnauthorized, "missing_principal", "X-Principal-Id is required — the gateway sets it from a verified identity envelope")
 	return "", false
 }
 
@@ -2072,7 +2051,7 @@ func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID,
 		return true
 	case errors.Is(err, authz.ErrDenied):
 		h.metrics.AuthzDecision(actionType, "denied")
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "authorization_denied"})
+		writeError(w, r, http.StatusForbidden, "authorization_denied", "")
 	default:
 		// "unavailable", not "denied": this service fails closed, so an
 		// authorization-svc outage refuses every mutation. Without the
@@ -2084,7 +2063,7 @@ func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID,
 			zap.String("action_type", actionType),
 			zap.Error(err),
 		)
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "authz_unavailable"})
+		writeError(w, r, http.StatusServiceUnavailable, "authz_unavailable", "")
 	}
 	return false
 }
@@ -2103,10 +2082,10 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
-			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "request_too_large"})
+			writeError(w, r, http.StatusRequestEntityTooLarge, "request_too_large", "")
 			return false
 		}
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
+		writeError(w, r, http.StatusBadRequest, "invalid_json", err.Error())
 		return false
 	}
 	return true
@@ -2122,3 +2101,4 @@ func distinctCount(ids []string) int {
 	}
 	return len(seen)
 }
+

@@ -219,8 +219,8 @@ paths:
             `secret_policy_conflict` - the path exists under a different
             `secret_class`.
           content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
         "503": { $ref: "#/components/responses/Unavailable" }
 
     get:
@@ -261,8 +261,8 @@ paths:
         "400":
           description: "`missing_field` - `secret_class` was not supplied."
           content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
         "401": { $ref: "#/components/responses/Unauthenticated" }
         "503": { $ref: "#/components/responses/Unavailable" }
 
@@ -305,13 +305,13 @@ paths:
         "404":
           description: "`secret_policy_not_found`."
           content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
         "409":
           description: "`secret_policy_version_conflict`."
           content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
         "503": { $ref: "#/components/responses/Unavailable" }
 
     get:
@@ -387,13 +387,13 @@ paths:
         "404":
           description: "`secret_policy_version_not_found`, or the version belongs to another policy."
           content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
         "409":
           description: "`invalid_transition` - the version is SUPERSEDED or RETIRED."
           content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
         "503": { $ref: "#/components/responses/Unavailable" }
 
   /v1/secret-policies/{secret_policy_id}/material:
@@ -456,13 +456,13 @@ paths:
         "404":
           description: "`secret_policy_not_found`."
           content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
         "503":
           description: "`vault_backend_unavailable` or `store_unavailable`."
           content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
 
   /v1/secret-policies/{secret_policy_id}/emergency-retrieval:
     post:
@@ -531,18 +531,18 @@ paths:
             `exception_self_approval` - the caller approved the exception it is
             trying to use.
           content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
         "404":
           description: "`secret_policy_not_found`."
           content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
         "503":
           description: "`store_unavailable`, `vault_backend_unavailable`, or `evidence_unavailable` (the audit entry could not be written, so nothing was released)."
           content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
 
   /v1/secret-policies/{secret_policy_id}/rotate:
     post:
@@ -604,13 +604,13 @@ paths:
         "404":
           description: "`secret_policy_not_found`."
           content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
         "503":
           description: "`vault_backend_unavailable` - nothing was rotated and no lease was revoked."
           content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
 
   /v1/secrets/sign:
     post:
@@ -638,10 +638,11 @@ paths:
                 request_id: {type: string}
                 message_base64: {type: string}
                 algorithm: {type: string, enum: [HMAC-SHA256]}
+
       responses:
         "200": {description: "{secret_path, algorithm, signature_hex, secret_policy_version_id}"}
-        "400": {description: Invalid request, or the canonical input contract is incomplete}
-        "403": {description: Identity mismatch, not an allowed workload, or not a signing secret}
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": {description: "Identity mismatch, not an allowed workload, or not a signing secret"}
         "404": {description: No applicable secret policy}
         "503": {description: Vault backend or audit store unavailable (fails closed)}
 
@@ -673,8 +674,8 @@ paths:
                 request_id: {type: string}
       responses:
         "200": {description: "{secret_path, secret_class, credential_base64, secret_policy_version_id}"}
-        "400": {description: Invalid request, or the canonical input contract is incomplete}
-        "403": {description: Identity mismatch, not an allowed workload, or a class that may not be used}
+        "400": {description: "Invalid request, or the canonical input contract is incomplete"}
+        "403": {description: "Identity mismatch, not an allowed workload, or a class that may not be used"}
         "404": {description: No applicable secret policy}
         "503": {description: Vault backend or audit store unavailable (fails closed)}
 
@@ -745,8 +746,8 @@ paths:
             `requested_by_principal_id` and its actor is the verified caller,
             so the evidence does not vouch for the impersonated name.
           content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
         "404":
           description: |
             `no_applicable_secret_policy` - no policy exists for this path, or
@@ -757,21 +758,21 @@ paths:
             The commonest cause is a version left in `DRAFT`: step 3 of the
             access path was skipped.
           content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
         "500":
           description: "`invalid_policy_payload` - the stored `allowed_workload_ids` is not a JSON array."
           content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
         "503":
           description: |
             `vault_backend_unavailable` - policy allowed the request and the
             backend could not serve it. No lease row is written. The usual cause
             is step 4 of the access path: material was never seeded.
           content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
 
   /v1/secrets/leases/{lease_id}:
     get:
@@ -805,8 +806,8 @@ paths:
             `lease_not_found`. Returned identically for a lease that does not
             exist and one belonging to another tenant.
           content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
         "503": { $ref: "#/components/responses/Unavailable" }
 
   /v1/secrets/leases/{lease_id}/verify:
@@ -858,14 +859,14 @@ paths:
         "400":
           description: "`missing_field` (`lease_token`), `invalid_lease_token`, or `lease_token_mismatch`."
           content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
         "401": { $ref: "#/components/responses/Unauthenticated" }
         "404":
           description: "`lease_not_found`, including another tenant's lease."
           content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
         "503": { $ref: "#/components/responses/Unavailable" }
 
   /v1/secrets/leases:
@@ -907,14 +908,14 @@ paths:
         "400":
           description: "`invalid_from`, `invalid_to`, or `invalid_field`."
           content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
         "401": { $ref: "#/components/responses/Unauthenticated" }
         "403":
           description: "`tenant_scope_mismatch` - a `tenant_id` naming another tenant."
           content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
         "503": { $ref: "#/components/responses/Unavailable" }
 
   /v1/secrets/leases/{lease_id}/revoke:
@@ -968,13 +969,13 @@ paths:
         "404":
           description: "`lease_not_found`, including another tenant's lease."
           content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
         "409":
           description: "`invalid_transition` - the lease is EXPIRED."
           content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
         "503": { $ref: "#/components/responses/Unavailable" }
 
   /v1/secrets/audit:
@@ -1018,8 +1019,8 @@ paths:
         "400":
           description: "`invalid_from` or `invalid_to`."
           content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
         "401": { $ref: "#/components/responses/Unauthenticated" }
         "503": { $ref: "#/components/responses/Unavailable" }
 
@@ -1067,13 +1068,13 @@ paths:
         "403":
           description: "`tenant_scope_mismatch` if a `tenant_id` names another tenant."
           content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
         "409":
           description: "`shared_secret_exception_conflict` - an exception for this path with a different payload already exists."
           content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
         "503": { $ref: "#/components/responses/Unavailable" }
 
     get:
@@ -1140,8 +1141,8 @@ paths:
         "409":
           description: "`invalid_transition` - the exception is EXPIRED."
           content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
         "503": { $ref: "#/components/responses/Unavailable" }
 
 components:
@@ -1261,8 +1262,8 @@ components:
         `request_too_large`, or `envelope_incomplete` (a §4 header missing on a
         write). `field` names the offending input where one can be identified.
       content:
-        application/json:
-          schema: { $ref: "#/components/schemas/Error" }
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
     InvalidPathParameter:
       description: |
         `invalid_path_parameter` - an id in the path is not a UUID, with `field`
@@ -1273,29 +1274,29 @@ components:
         a caller's own bad id read as an outage and clients would retry, back
         off, and eventually page someone.
       content:
-        application/json:
-          schema: { $ref: "#/components/schemas/Error" }
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
     Unauthenticated:
       description: |
         `missing_principal` or `tenant_scope_missing` - no verified identity or
         tenant on the request, so it never passed the gateway.
       content:
-        application/json:
-          schema: { $ref: "#/components/schemas/Error" }
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
     AuthorizationDenied:
       description: |
         `authorization_denied` - authorization-svc refused this principal the
         required `SECRET_*` action.
       content:
-        application/json:
-          schema: { $ref: "#/components/schemas/Error" }
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
     Unavailable:
       description: |
         `store_unavailable`, `vault_backend_unavailable`, or `authz_unavailable`.
         All fail closed - nothing was written and nothing was permitted.
       content:
-        application/json:
-          schema: { $ref: "#/components/schemas/Error" }
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
 
   schemas:
     HealthStatus:
@@ -1303,18 +1304,28 @@ components:
       properties:
         status: { type: string, example: ok }
 
-    Error:
+    Problem:
       type: object
-      required: [error]
+      required: [type, title, status, code]
       properties:
-        error:
-          type: string
-          description: Stable machine-readable code. Match on this, not on prose.
-        field:
-          type: string
-          description: The offending input, when one can be identified.
-        secret_path: { type: string }
-        lease_id: { type: string }
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        code: { type: string }
+        request_id: { type: string }
+        correlation_id: { type: string }
+        retryable: { type: boolean }
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              pointer: { type: string }
+              code: { type: string }
+              detail: { type: string }
+        current_version: { type: integer, format: int64 }
 
     SecretClass:
       type: string
