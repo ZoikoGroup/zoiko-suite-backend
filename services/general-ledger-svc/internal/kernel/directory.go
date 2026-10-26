@@ -44,6 +44,12 @@ type FXSource interface {
 	Basis(ctx context.Context, policyID, from, to string, asOf time.Time) (*FXBasis, error)
 }
 
+// ScopedAccountStatuser is the optional part of RefData that answers whether an entity- or book-scoped version of an account changes
+// whether it is open for use in the book on a date. A RefData without it uses the tenant version for every book.
+type ScopedAccountStatuser interface {
+	ScopedAccountStatus(ctx context.Context, tenant, code, bookID string, on time.Time) (status string, overridden bool, err error)
+}
+
 // TenantDirectory is the engine's Directory (and the Evaluate Resolver) for one tenant.
 type TenantDirectory struct {
 	Tenant string
@@ -62,7 +68,7 @@ func (d TenantDirectory) MinorUnits(ctx context.Context, code string, asOf time.
 
 // ResolveAccount implements Directory: a mapping key resolves through the tenant's mapping in force on the date, and the
 // account must exist, be active and not be a header account.
-func (d TenantDirectory) ResolveAccount(ctx context.Context, ref AccountRef, _ string, asOf time.Time) (*AccountInfo, error) {
+func (d TenantDirectory) ResolveAccount(ctx context.Context, ref AccountRef, bookID string, asOf time.Time) (*AccountInfo, error) {
 	code := ref.AccountCode
 	if ref.MappingKey != "" {
 		c, found, err := d.Ref.MappedAccount(ctx, d.Tenant, ref.MappingKey, asOf)
@@ -82,6 +88,16 @@ func (d TenantDirectory) ResolveAccount(ctx context.Context, ref AccountRef, _ s
 		return nil, fmt.Errorf("account %q is not in the chart of accounts", code)
 	}
 	info := &AccountInfo{Code: code, Active: active, Postable: postable}
+	// an entity- or book-scoped version can close the account for this book (or open it again) without touching the tenant version
+	if ss, ok := d.Ref.(ScopedAccountStatuser); ok && bookID != "" {
+		st, overridden, serr := ss.ScopedAccountStatus(ctx, d.Tenant, code, bookID, asOf)
+		if serr != nil {
+			return nil, serr
+		}
+		if overridden {
+			info.Active = st == "ACTIVE"
+		}
+	}
 	if ap, ok := d.Ref.(AccountApplicability); ok {
 		sc, err := ap.AccountApplicability(ctx, d.Tenant, code)
 		if err != nil {
