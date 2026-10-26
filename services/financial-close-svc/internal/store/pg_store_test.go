@@ -53,8 +53,10 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 		migration_crosswalk_entries, migration_batches,
 		financial_snapshots,
 		lineage_edges, lineage_projection_status, lineage_trace_verifications, lineage_quarantined_gaps,
-		eventing_outbox
+		eventing_outbox, command_idempotency
 		CASCADE;`)
+	// Functions are not dropped with their tables, and 000021 creates its
+	// trigger functions with CREATE OR REPLACE, so a re-run is clean.
 
 	// The DROP list above must be kept in sync with every CREATE TABLE the
 	// glob below picks up: most of those CREATE TABLEs have no IF NOT EXISTS

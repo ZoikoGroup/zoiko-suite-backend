@@ -14,6 +14,7 @@ import (
 	"zoiko.io/reconciliation-intelligence-svc/internal/bankrec"
 	"zoiko.io/reconciliation-intelligence-svc/internal/financialcontrol"
 	"zoiko.io/reconciliation-intelligence-svc/internal/handler"
+	"zoiko.io/reconciliation-intelligence-svc/internal/ledger"
 	"zoiko.io/reconciliation-intelligence-svc/internal/store"
 )
 
@@ -27,6 +28,11 @@ type fakeRun struct {
 	Lines [][2]string
 	// Refs overrides a line's bank_reference (default "REF-" + its id).
 	Refs map[string]string
+	// CashAccount is every line's gl_cash_account_code; "" sends null, as
+	// bank-reconciliation-svc does for a line ingested without one.
+	CashAccount string
+	// Currency overrides every line's currency_code (default USD).
+	Currency string
 }
 
 // Standard fixtures. Each run's bank account is "ba-" + its id.
@@ -81,14 +87,22 @@ func newFakeBankRecServer(t *testing.T, runs map[string]fakeRun) *httptest.Serve
 			id := strings.TrimPrefix(r.URL.Query().Get("bank_account_id"), "ba-")
 			run := runs[id]
 			parts := make([]string, 0, len(run.Lines))
+			cash := "null"
+			if run.CashAccount != "" {
+				cash = fmt.Sprintf("%q", run.CashAccount)
+			}
+			currency := run.Currency
+			if currency == "" {
+				currency = "USD"
+			}
 			for _, l := range run.Lines {
 				ref, ok := run.Refs[l[0]]
 				if !ok {
 					ref = "REF-" + l[0]
 				}
 				parts = append(parts, fmt.Sprintf(
-					`{"statement_line_id":%q,"legal_entity_id":%q,"bank_account_id":%q,"statement_date":"2026-07-01T00:00:00Z","amount":%s,"currency_code":"USD","bank_reference":%q,"status":"UNMATCHED"}`,
-					l[0], run.LegalEntityID, "ba-"+id, l[1], ref))
+					`{"statement_line_id":%q,"legal_entity_id":%q,"bank_account_id":%q,"statement_date":"2026-07-01T00:00:00Z","amount":%s,"currency_code":%q,"bank_reference":%q,"status":"UNMATCHED","gl_cash_account_code":%s}`,
+					l[0], run.LegalEntityID, "ba-"+id, l[1], currency, ref, cash))
 			}
 			_, _ = w.Write([]byte("[" + strings.Join(parts, ",") + "]"))
 			return
@@ -150,13 +164,64 @@ func (a *recordingAuthz) asked(action string) []authzDecision {
 // newFixedToleranceServer stands in for financial-control-svc: every
 // TolerancePolicy lookup answers an absolute_tolerance of "10", the
 // small-amount write-off tolerance the tests' 5.00 / 75 lines sit either
-// side of.
+// side of, and a CALENDAR date tolerance of 3 days for the
+// candidate search.
 func newFixedToleranceServer(t *testing.T) *httptest.Server {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"items": []map[string]any{{"tolerance_version": 1, "absolute_tolerance": "10"}},
+			"items": []map[string]any{{"tolerance_version": 1, "absolute_tolerance": "10",
+				"date_tolerance_days": 3, "date_basis": "CALENDAR"}},
 		})
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// fakeLedgerEntry is one general-ledger-svc ledger entry the fake serves.
+type fakeLedgerEntry struct {
+	JournalID, TenantID, LegalEntityID, AccountCode, Currency, Date string
+	Debit, Credit                                                   string // raw JSON numbers; "" is 0
+}
+
+// newFakeLedgerServer stands in for general-ledger-svc's QueryLedger. It
+// applies the account, date-window and legal-entity filters the real route
+// applies, records every query, and fails the test on any non-GET: this
+// service must never write to the ledger.
+func newFakeLedgerServer(t *testing.T, entries []fakeLedgerEntry, queries *[]string) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/ledger/entries" {
+			t.Errorf("reconciliation-intelligence-svc sent %s %s to general-ledger-svc; it is read-only", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		q := r.URL.Query()
+		if queries != nil {
+			*queries = append(*queries, r.URL.RawQuery)
+		}
+		if q.Get("journal_status") != "FINALIZED" {
+			t.Errorf("candidate read must ask for FINALIZED journals only, got %q", q.Get("journal_status"))
+		}
+		parts := []string{}
+		for _, e := range entries {
+			if e.LegalEntityID != q.Get("legal_entity_id") || e.AccountCode != q.Get("account_code") ||
+				e.Date < q.Get("transaction_date_from") || e.Date > q.Get("transaction_date_to") {
+				continue
+			}
+			debit, credit := e.Debit, e.Credit
+			if debit == "" {
+				debit = "0"
+			}
+			if credit == "" {
+				credit = "0"
+			}
+			parts = append(parts, fmt.Sprintf(
+				`{"journal_id":%q,"tenant_id":%q,"legal_entity_id":%q,"account_code":%q,"debit_amount":%s,"credit_amount":%s,"currency_code":%q,"transaction_date":%q}`,
+				e.JournalID, e.TenantID, e.LegalEntityID, e.AccountCode, debit, credit, e.Currency, e.Date))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte("[" + strings.Join(parts, ",") + "]"))
 	}))
 	t.Cleanup(srv.Close)
 	return srv
@@ -171,6 +236,7 @@ type deps struct {
 	store               *store.MemoryStore
 	financialControlURL string
 	bankRecURL          string
+	ledgerURL           string
 }
 
 func newTestRouter(t *testing.T, d deps) http.Handler {
@@ -194,10 +260,15 @@ func newTestRouter(t *testing.T, d deps) http.Handler {
 	if d.authzURL == "" {
 		d.authzURL = d.authz.server(t).URL
 	}
+	if d.ledgerURL == "" {
+		d.ledgerURL = newFakeLedgerServer(t, nil, nil).URL
+	}
 	h := handler.NewHandler(d.store,
 		authz.NewClient(d.authzURL, logger),
 		financialcontrol.NewClient(d.financialControlURL, logger),
 		bankrec.NewClient(d.bankRecURL, logger),
+		ledger.NewClient(d.ledgerURL, logger),
+		31,
 		logger)
 	return handler.NewRouter(h)
 }

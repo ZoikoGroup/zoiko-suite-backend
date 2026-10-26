@@ -14,10 +14,10 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
-	"zoiko.io/payee-banking-identity-svc/internal/domain"
-	"zoiko.io/payee-banking-identity-svc/internal/middleware"
 	"zoiko.io/eventing/envelope"
 	"zoiko.io/eventing/outbox"
+	"zoiko.io/payee-banking-identity-svc/internal/domain"
+	"zoiko.io/payee-banking-identity-svc/internal/middleware"
 )
 
 func isInvalidUUID(err error) bool {
@@ -30,17 +30,29 @@ func isUniqueViolation(err error) bool {
 	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }
 
+// isCommandIdempotencyViolation distinguishes the command_idempotency primary
+// key from payee_destinations' own uniqueness indexes. Both are 23505, but
+// only the former means two first attempts raced on the same key.
+func isCommandIdempotencyViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == "command_idempotency_pkey"
+}
+
 type Store interface {
-	ProposeDestination(ctx context.Context, tenantID string, req domain.ProposeDestinationRequest, principalID, correlationID string) (*domain.PayeeDestination, error)
+	// Every command returns replay=true when the same (tenant,
+	// Idempotency-Key, command, destination) was already committed. The
+	// returned destination is the row as it now stands; no state change or
+	// event is produced by a replay.
+	ProposeDestination(ctx context.Context, tenantID string, req domain.ProposeDestinationRequest, principalID, correlationID, idempotencyKey string) (*domain.PayeeDestination, bool, error)
 	FindDestination(ctx context.Context, destinationID string) (*domain.PayeeDestination, error)
 	ListVersions(ctx context.Context, partyRef string) ([]domain.PayeeDestination, error)
 	FindActiveDestination(ctx context.Context, partyRef, scope string) (*domain.PayeeDestination, error)
 
-	VerifyDestination(ctx context.Context, destinationID string, req domain.VerifyDestinationRequest, principalID string) (*domain.PayeeDestination, error)
-	ApproveDestination(ctx context.Context, destinationID, principalID, correlationID string) (*domain.PayeeDestination, error)
-	ActivateDestination(ctx context.Context, destinationID, principalID, correlationID string) (*domain.PayeeDestination, error)
-	SuspendDestination(ctx context.Context, destinationID string, req domain.SuspendDestinationRequest, principalID, correlationID string) (*domain.PayeeDestination, error)
-	SupersedeDestination(ctx context.Context, destinationID string, req domain.SupersedeDestinationRequest, principalID, correlationID string) (*domain.PayeeDestination, error)
+	VerifyDestination(ctx context.Context, destinationID string, req domain.VerifyDestinationRequest, principalID, idempotencyKey string) (*domain.PayeeDestination, bool, error)
+	ApproveDestination(ctx context.Context, destinationID, principalID, correlationID, idempotencyKey string) (*domain.PayeeDestination, bool, error)
+	ActivateDestination(ctx context.Context, destinationID, principalID, correlationID, idempotencyKey string) (*domain.PayeeDestination, bool, error)
+	SuspendDestination(ctx context.Context, destinationID string, req domain.SuspendDestinationRequest, principalID, correlationID, idempotencyKey string) (*domain.PayeeDestination, bool, error)
+	SupersedeDestination(ctx context.Context, destinationID string, req domain.SupersedeDestinationRequest, principalID, correlationID, idempotencyKey string) (*domain.PayeeDestination, bool, error)
 
 	ListEvents(ctx context.Context, destinationID string) ([]domain.ChangeEvent, error)
 
@@ -170,7 +182,115 @@ func (s *PgStore) recordEvent(ctx context.Context, tx pgx.Tx, tenantID *string, 
 	return err
 }
 
-func (s *PgStore) ProposeDestination(ctx context.Context, tenantID string, req domain.ProposeDestinationRequest, principalID, correlationID string) (*domain.PayeeDestination, error) {
+// findCommandClaim reads the one idempotency claim for this tenant/key. It
+// deliberately returns the target as text: ProposeDestination has no target
+// before it inserts, so the caller decides whether a found claim is a replay
+// or a conflict.
+func (s *PgStore) findCommandClaim(ctx context.Context, tx pgx.Tx, tenantID, idempotencyKey string) (command, destinationID string, found bool, err error) {
+	err = tx.QueryRow(ctx, `
+		SELECT command, destination_id::text
+		FROM command_idempotency
+		WHERE tenant_id = $1 AND idempotency_key = $2`,
+		tenantID, idempotencyKey,
+	).Scan(&command, &destinationID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", "", false, nil
+	}
+	if err != nil {
+		return "", "", false, err
+	}
+	return command, destinationID, true, nil
+}
+
+func (s *PgStore) recordCommandClaim(ctx context.Context, tx pgx.Tx, tenantID, idempotencyKey, command, destinationID string) error {
+	_, err := tx.Exec(ctx, `
+		INSERT INTO command_idempotency (tenant_id, idempotency_key, command, destination_id)
+		VALUES ($1, $2, $3, $4)`,
+		tenantID, idempotencyKey, command, destinationID,
+	)
+	return err
+}
+
+// lockDestination takes the row lock before the idempotency lookup. Two
+// concurrent retries of the same command on the same destination then
+// serialize: the second one sees the winning claim and replays instead of
+// failing the old state guard.
+func (s *PgStore) lockDestination(ctx context.Context, tx pgx.Tx, destinationID string) (*domain.PayeeDestination, error) {
+	d, err := scanDestination(tx.QueryRow(ctx,
+		`SELECT `+destColumns+` FROM payee_destinations WHERE destination_id = $1 FOR UPDATE`, destinationID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrInvalidTransition
+	}
+	return d, err
+}
+
+func proposalMatches(d *domain.PayeeDestination, req domain.ProposeDestinationRequest) bool {
+	scope := req.Scope
+	if scope == "" {
+		scope = "DEFAULT"
+	}
+	return d.LegalEntityID == req.LegalEntityID &&
+		d.PartyRef == req.PartyRef &&
+		d.Scope == scope &&
+		d.FinancialInstitution == req.FinancialInstitution &&
+		d.AccountIdentifier == req.AccountIdentifier &&
+		d.CountryCode == req.CountryCode &&
+		d.Currency == req.Currency &&
+		d.PayeeName == req.PayeeName &&
+		d.SourceType == req.SourceType
+}
+
+// tryReplayProposal is the concurrent-first-attempt path: the losing INSERT
+// rolled back its whole transaction (including its destination), so re-read
+// the winner's claim in a fresh transaction and return the candidate it
+// created. found=false means there is no claim at all, which lets the caller
+// distinguish a genuine duplicate destination from a lost retry race.
+func (s *PgStore) tryReplayProposal(ctx context.Context, tenantID, idempotencyKey string, req domain.ProposeDestinationRequest) (*domain.PayeeDestination, bool, error) {
+	var out *domain.PayeeDestination
+	foundClaim := false
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		command, claimedDest, found, err := s.findCommandClaim(ctx, tx, tenantID, idempotencyKey)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return nil
+		}
+		foundClaim = true
+		if command != domain.CommandProposeDestination {
+			return domain.ErrIdempotencyKeyConflict
+		}
+		existing, err := scanDestination(tx.QueryRow(ctx,
+			`SELECT `+destColumns+` FROM payee_destinations WHERE destination_id = $1`, claimedDest))
+		if err != nil {
+			return err
+		}
+		if !proposalMatches(existing, req) {
+			return domain.ErrIdempotencyKeyConflict
+		}
+		out = existing
+		return nil
+	})
+	return out, foundClaim, err
+}
+
+// replayProposal is the command_idempotency primary-key race path, where a
+// claim is guaranteed to exist.
+func (s *PgStore) replayProposal(ctx context.Context, tenantID, idempotencyKey string, req domain.ProposeDestinationRequest) (*domain.PayeeDestination, error) {
+	existing, found, err := s.tryReplayProposal(ctx, tenantID, idempotencyKey, req)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, domain.ErrIdempotencyKeyConflict
+	}
+	return existing, nil
+}
+
+func (s *PgStore) ProposeDestination(ctx context.Context, tenantID string, req domain.ProposeDestinationRequest, principalID, correlationID, idempotencyKey string) (*domain.PayeeDestination, bool, error) {
+	if idempotencyKey == "" {
+		return nil, false, domain.ErrIdempotencyKeyRequired
+	}
 	destinationID := uuid.New().String()
 	fingerprint := domain.Fingerprint(req.FinancialInstitution, req.AccountIdentifier, req.Currency)
 	last4 := domain.Last4(req.AccountIdentifier)
@@ -179,8 +299,28 @@ func (s *PgStore) ProposeDestination(ctx context.Context, tenantID string, req d
 		scope = "DEFAULT"
 	}
 	var d *domain.PayeeDestination
+	replay := false
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
-		var err error
+		command, claimedDest, found, err := s.findCommandClaim(ctx, tx, tenantID, idempotencyKey)
+		if err != nil {
+			return err
+		}
+		if found {
+			if command != domain.CommandProposeDestination {
+				return domain.ErrIdempotencyKeyConflict
+			}
+			existing, err := scanDestination(tx.QueryRow(ctx,
+				`SELECT `+destColumns+` FROM payee_destinations WHERE destination_id = $1`, claimedDest))
+			if err != nil {
+				return err
+			}
+			if !proposalMatches(existing, req) {
+				return domain.ErrIdempotencyKeyConflict
+			}
+			d, replay = existing, true
+			return nil
+		}
+
 		d, err = scanDestination(tx.QueryRow(ctx, `
 			INSERT INTO payee_destinations (`+destColumns+`)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'CANDIDATE',
@@ -200,18 +340,45 @@ func (s *PgStore) ProposeDestination(ctx context.Context, tenantID string, req d
 		// the unmasked AccountIdentifier) — same doctrine as maskIfNotPrivileged
 		// at the HTTP layer, applied here because this is the one place the
 		// full account identifier could otherwise leak into Kafka.
-		return s.enqueueEvent(ctx, tx, "com.zoikosuite.banking.payee-destination.proposed", domain.EventPayeeDestinationProposed,
+		if err := s.enqueueEvent(ctx, tx, "com.zoikosuite.banking.payee-destination.proposed", domain.EventPayeeDestinationProposed,
 			"payee-destination", destinationID, tenantID, req.LegalEntityID, principalID, correlationID,
-			domain.NewDestinationEventPayload(d, tenantID))
+			domain.NewDestinationEventPayload(d, tenantID)); err != nil {
+			return err
+		}
+		return s.recordCommandClaim(ctx, tx, tenantID, idempotencyKey, domain.CommandProposeDestination, destinationID)
 	})
+	if errors.Is(err, domain.ErrIdempotencyKeyConflict) || errors.Is(err, domain.ErrIdempotencyKeyRequired) {
+		return nil, false, err
+	}
+	if isCommandIdempotencyViolation(err) {
+		existing, replayErr := s.replayProposal(ctx, tenantID, idempotencyKey, req)
+		if replayErr != nil {
+			return nil, false, replayErr
+		}
+		return existing, true, nil
+	}
 	if isUniqueViolation(err) {
-		return nil, domain.ErrDuplicateDestination
+		// The losing side of a concurrent same-key proposal can hit the
+		// destination fingerprint index before it ever reaches the
+		// command_idempotency insert: the winner's uncommitted destination
+		// blocks it, then the winner commits. If this key now has a matching
+		// claim, this was a retry race and must replay, not report a
+		// duplicate destination. A genuine duplicate with a fresh key has no
+		// claim and still returns ErrDuplicateDestination.
+		existing, found, replayErr := s.tryReplayProposal(ctx, tenantID, idempotencyKey, req)
+		if replayErr != nil {
+			return nil, false, replayErr
+		}
+		if found {
+			return existing, true, nil
+		}
+		return nil, false, domain.ErrDuplicateDestination
 	}
 	if err != nil {
 		s.log.Error("pg ProposeDestination failed", zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
-	return d, nil
+	return d, replay, nil
 }
 
 func (s *PgStore) FindDestination(ctx context.Context, destinationID string) (*domain.PayeeDestination, error) {
@@ -272,10 +439,29 @@ func (s *PgStore) FindActiveDestination(ctx context.Context, partyRef, scope str
 	return d, nil
 }
 
-func (s *PgStore) VerifyDestination(ctx context.Context, destinationID string, req domain.VerifyDestinationRequest, principalID string) (*domain.PayeeDestination, error) {
+func (s *PgStore) VerifyDestination(ctx context.Context, destinationID string, req domain.VerifyDestinationRequest, principalID, idempotencyKey string) (*domain.PayeeDestination, bool, error) {
+	if idempotencyKey == "" {
+		return nil, false, domain.ErrIdempotencyKeyRequired
+	}
 	var d *domain.PayeeDestination
+	replay := false
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
-		var err error
+		current, err := s.lockDestination(ctx, tx, destinationID)
+		if err != nil {
+			return err
+		}
+		command, claimedDest, found, err := s.findCommandClaim(ctx, tx, middleware.TenantFromContext(ctx), idempotencyKey)
+		if err != nil {
+			return err
+		}
+		if found {
+			if command != domain.CommandVerifyDestination || claimedDest != destinationID {
+				return domain.ErrIdempotencyKeyConflict
+			}
+			d, replay = current, true
+			return nil
+		}
+
 		d, err = scanDestination(tx.QueryRow(ctx, `
 			UPDATE payee_destinations SET status = 'VERIFIED', verification_method = $1, verification_evidence_ref = $2,
 				verified_by_principal_id = $3, verified_at = NOW(), updated_at = NOW()
@@ -286,22 +472,50 @@ func (s *PgStore) VerifyDestination(ctx context.Context, destinationID string, r
 		if err != nil {
 			return err
 		}
-		return s.recordEvent(ctx, tx, d.TenantID, destinationID, domain.EventPayeeDestinationVerified, req.VerificationMethod, principalID)
+		if err := s.recordEvent(ctx, tx, d.TenantID, destinationID, domain.EventPayeeDestinationVerified, req.VerificationMethod, principalID); err != nil {
+			return err
+		}
+		return s.recordCommandClaim(ctx, tx, middleware.TenantFromContext(ctx), idempotencyKey, domain.CommandVerifyDestination, destinationID)
 	})
-	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
-		return nil, domain.ErrInvalidTransition
+	if errors.Is(err, domain.ErrIdempotencyKeyConflict) || errors.Is(err, domain.ErrIdempotencyKeyRequired) {
+		return nil, false, err
+	}
+	if isCommandIdempotencyViolation(err) {
+		return nil, false, domain.ErrIdempotencyKeyConflict
+	}
+	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) || errors.Is(err, domain.ErrInvalidTransition) {
+		return nil, false, domain.ErrInvalidTransition
 	}
 	if err != nil {
 		s.log.Error("pg VerifyDestination failed", zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
-	return d, nil
+	return d, replay, nil
 }
 
-func (s *PgStore) ApproveDestination(ctx context.Context, destinationID, principalID, correlationID string) (*domain.PayeeDestination, error) {
+func (s *PgStore) ApproveDestination(ctx context.Context, destinationID, principalID, correlationID, idempotencyKey string) (*domain.PayeeDestination, bool, error) {
+	if idempotencyKey == "" {
+		return nil, false, domain.ErrIdempotencyKeyRequired
+	}
 	var d *domain.PayeeDestination
+	replay := false
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
-		var err error
+		current, err := s.lockDestination(ctx, tx, destinationID)
+		if err != nil {
+			return err
+		}
+		command, claimedDest, found, err := s.findCommandClaim(ctx, tx, middleware.TenantFromContext(ctx), idempotencyKey)
+		if err != nil {
+			return err
+		}
+		if found {
+			if command != domain.CommandApproveDestination || claimedDest != destinationID {
+				return domain.ErrIdempotencyKeyConflict
+			}
+			d, replay = current, true
+			return nil
+		}
+
 		d, err = scanDestination(tx.QueryRow(ctx, `
 			UPDATE payee_destinations SET status = 'APPROVAL_PENDING', approved_by_principal_id = $1, approved_at = NOW(), updated_at = NOW()
 			WHERE destination_id = $2 AND status = 'VERIFIED'
@@ -315,18 +529,27 @@ func (s *PgStore) ApproveDestination(ctx context.Context, destinationID, princip
 			return err
 		}
 		// Safe projection — see ProposeDestination's enqueueEvent call for why.
-		return s.enqueueEvent(ctx, tx, "com.zoikosuite.banking.payee-destination.approved", domain.EventPayeeDestinationApproved,
+		if err := s.enqueueEvent(ctx, tx, "com.zoikosuite.banking.payee-destination.approved", domain.EventPayeeDestinationApproved,
 			"payee-destination", destinationID, strOrEmpty(d.TenantID), d.LegalEntityID, principalID, correlationID,
-			domain.NewDestinationEventPayload(d, strOrEmpty(d.TenantID)))
+			domain.NewDestinationEventPayload(d, strOrEmpty(d.TenantID))); err != nil {
+			return err
+		}
+		return s.recordCommandClaim(ctx, tx, middleware.TenantFromContext(ctx), idempotencyKey, domain.CommandApproveDestination, destinationID)
 	})
-	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
-		return nil, domain.ErrInvalidTransition
+	if errors.Is(err, domain.ErrIdempotencyKeyConflict) || errors.Is(err, domain.ErrIdempotencyKeyRequired) {
+		return nil, false, err
+	}
+	if isCommandIdempotencyViolation(err) {
+		return nil, false, domain.ErrIdempotencyKeyConflict
+	}
+	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) || errors.Is(err, domain.ErrInvalidTransition) {
+		return nil, false, domain.ErrInvalidTransition
 	}
 	if err != nil {
 		s.log.Error("pg ApproveDestination failed", zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
-	return d, nil
+	return d, replay, nil
 }
 
 // ActivateDestination is where "only one active version per party/scope"
@@ -334,29 +557,59 @@ func (s *PgStore) ApproveDestination(ctx context.Context, destinationID, princip
 // transaction, supersedes whatever destination (if any) is currently
 // ACTIVE for the same party/scope — the database's own partial unique
 // index is the second, structural layer of the same guarantee.
-func (s *PgStore) ActivateDestination(ctx context.Context, destinationID, principalID, correlationID string) (*domain.PayeeDestination, error) {
+func (s *PgStore) ActivateDestination(ctx context.Context, destinationID, principalID, correlationID, idempotencyKey string) (*domain.PayeeDestination, bool, error) {
+	if idempotencyKey == "" {
+		return nil, false, domain.ErrIdempotencyKeyRequired
+	}
 	var d *domain.PayeeDestination
+	replay := false
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
-		var partyRef, scope string
-		if err := tx.QueryRow(ctx, `SELECT party_ref, scope FROM payee_destinations WHERE destination_id = $1 AND status = 'APPROVAL_PENDING'`, destinationID).
-			Scan(&partyRef, &scope); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				return domain.ErrInvalidTransition
-			}
+		current, err := s.lockDestination(ctx, tx, destinationID)
+		if err != nil {
 			return err
 		}
+		command, claimedDest, found, err := s.findCommandClaim(ctx, tx, middleware.TenantFromContext(ctx), idempotencyKey)
+		if err != nil {
+			return err
+		}
+		if found {
+			if command != domain.CommandActivateDestination || claimedDest != destinationID {
+				return domain.ErrIdempotencyKeyConflict
+			}
+			d, replay = current, true
+			return nil
+		}
+		if current.Status != domain.StatusApprovalPending {
+			return domain.ErrInvalidTransition
+		}
 
-		var oldActiveID *string
-		err := tx.QueryRow(ctx, `SELECT destination_id FROM payee_destinations WHERE party_ref = $1 AND scope = $2 AND status = 'ACTIVE'`, partyRef, scope).Scan(&oldActiveID)
+		var oldActive *domain.PayeeDestination
+		oldActive, err = scanDestination(tx.QueryRow(ctx, `
+			SELECT `+destColumns+` FROM payee_destinations
+			WHERE party_ref = $1 AND scope = $2 AND status = 'ACTIVE'
+			FOR UPDATE`, current.PartyRef, current.Scope))
 		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 			return err
 		}
-		if oldActiveID != nil {
-			if _, err := tx.Exec(ctx, `UPDATE payee_destinations SET status = 'SUPERSEDED', superseded_by_destination_id = $1, updated_at = NOW() WHERE destination_id = $2`,
-				destinationID, *oldActiveID); err != nil {
+		if oldActive != nil {
+			oldActive, err = scanDestination(tx.QueryRow(ctx, `
+				UPDATE payee_destinations
+				SET status = 'SUPERSEDED', superseded_by_destination_id = $1, updated_at = NOW()
+				WHERE destination_id = $2
+				RETURNING `+destColumns, destinationID, oldActive.DestinationID))
+			if err != nil {
 				return err
 			}
-			if err := s.recordEvent(ctx, tx, nil, *oldActiveID, domain.EventPayeeDestinationSuperseded, "superseded by "+destinationID, principalID); err != nil {
+			if err := s.recordEvent(ctx, tx, oldActive.TenantID, oldActive.DestinationID, domain.EventPayeeDestinationSuperseded, "superseded by "+destinationID, principalID); err != nil {
+				return err
+			}
+			// "Any active-destination change emits an immediate high-risk
+			// event": activation changing the party/scope's active row is
+			// such a change, not only an explicit SupersedeDestination.
+			// Safe projection — see ProposeDestination's enqueueEvent call.
+			if err := s.enqueueEvent(ctx, tx, "com.zoikosuite.banking.payee-destination.superseded", domain.EventPayeeDestinationSuperseded,
+				"payee-destination", oldActive.DestinationID, strOrEmpty(oldActive.TenantID), oldActive.LegalEntityID, principalID, correlationID,
+				domain.NewDestinationEventPayload(oldActive, strOrEmpty(oldActive.TenantID))); err != nil {
 				return err
 			}
 		}
@@ -373,33 +626,55 @@ func (s *PgStore) ActivateDestination(ctx context.Context, destinationID, princi
 		if err := s.recordEvent(ctx, tx, d.TenantID, destinationID, domain.EventPayeeDestinationActivated, "", principalID); err != nil {
 			return err
 		}
-		// The old destination auto-superseded above (if any) is recorded
-		// to the internal audit log (recordEvent) but was never published
-		// by the old dual-write — only the newly-activated destination's
-		// own event was. Not expanding scope here: only the activated
-		// event is enqueued, matching the exact prior behavior.
-		// Safe projection — see ProposeDestination's enqueueEvent call for why.
-		return s.enqueueEvent(ctx, tx, "com.zoikosuite.banking.payee-destination.activated", domain.EventPayeeDestinationActivated,
+		if err := s.enqueueEvent(ctx, tx, "com.zoikosuite.banking.payee-destination.activated", domain.EventPayeeDestinationActivated,
 			"payee-destination", destinationID, strOrEmpty(d.TenantID), d.LegalEntityID, principalID, correlationID,
-			domain.NewDestinationEventPayload(d, strOrEmpty(d.TenantID)))
+			domain.NewDestinationEventPayload(d, strOrEmpty(d.TenantID))); err != nil {
+			return err
+		}
+		return s.recordCommandClaim(ctx, tx, middleware.TenantFromContext(ctx), idempotencyKey, domain.CommandActivateDestination, destinationID)
 	})
+	if errors.Is(err, domain.ErrIdempotencyKeyConflict) || errors.Is(err, domain.ErrIdempotencyKeyRequired) {
+		return nil, false, err
+	}
+	if isCommandIdempotencyViolation(err) {
+		return nil, false, domain.ErrIdempotencyKeyConflict
+	}
 	if errors.Is(err, domain.ErrInvalidTransition) || isInvalidUUID(err) {
-		return nil, domain.ErrInvalidTransition
+		return nil, false, domain.ErrInvalidTransition
 	}
 	if isUniqueViolation(err) {
-		return nil, domain.ErrInvalidTransition
+		return nil, false, domain.ErrInvalidTransition
 	}
 	if err != nil {
 		s.log.Error("pg ActivateDestination failed", zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
-	return d, nil
+	return d, replay, nil
 }
 
-func (s *PgStore) SuspendDestination(ctx context.Context, destinationID string, req domain.SuspendDestinationRequest, principalID, correlationID string) (*domain.PayeeDestination, error) {
+func (s *PgStore) SuspendDestination(ctx context.Context, destinationID string, req domain.SuspendDestinationRequest, principalID, correlationID, idempotencyKey string) (*domain.PayeeDestination, bool, error) {
+	if idempotencyKey == "" {
+		return nil, false, domain.ErrIdempotencyKeyRequired
+	}
 	var d *domain.PayeeDestination
+	replay := false
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
-		var err error
+		current, err := s.lockDestination(ctx, tx, destinationID)
+		if err != nil {
+			return err
+		}
+		command, claimedDest, found, err := s.findCommandClaim(ctx, tx, middleware.TenantFromContext(ctx), idempotencyKey)
+		if err != nil {
+			return err
+		}
+		if found {
+			if command != domain.CommandSuspendDestination || claimedDest != destinationID {
+				return domain.ErrIdempotencyKeyConflict
+			}
+			d, replay = current, true
+			return nil
+		}
+
 		d, err = scanDestination(tx.QueryRow(ctx, `
 			UPDATE payee_destinations SET status = 'SUSPENDED', suspend_reason = $1, updated_at = NOW()
 			WHERE destination_id = $2 AND status = 'ACTIVE'
@@ -413,24 +688,52 @@ func (s *PgStore) SuspendDestination(ctx context.Context, destinationID string, 
 			return err
 		}
 		// Safe projection — see ProposeDestination's enqueueEvent call for why.
-		return s.enqueueEvent(ctx, tx, "com.zoikosuite.banking.payee-destination.suspended", domain.EventPayeeDestinationSuspended,
+		if err := s.enqueueEvent(ctx, tx, "com.zoikosuite.banking.payee-destination.suspended", domain.EventPayeeDestinationSuspended,
 			"payee-destination", destinationID, strOrEmpty(d.TenantID), d.LegalEntityID, principalID, correlationID,
-			domain.NewDestinationEventPayload(d, strOrEmpty(d.TenantID)))
+			domain.NewDestinationEventPayload(d, strOrEmpty(d.TenantID))); err != nil {
+			return err
+		}
+		return s.recordCommandClaim(ctx, tx, middleware.TenantFromContext(ctx), idempotencyKey, domain.CommandSuspendDestination, destinationID)
 	})
-	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
-		return nil, domain.ErrInvalidTransition
+	if errors.Is(err, domain.ErrIdempotencyKeyConflict) || errors.Is(err, domain.ErrIdempotencyKeyRequired) {
+		return nil, false, err
+	}
+	if isCommandIdempotencyViolation(err) {
+		return nil, false, domain.ErrIdempotencyKeyConflict
+	}
+	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) || errors.Is(err, domain.ErrInvalidTransition) {
+		return nil, false, domain.ErrInvalidTransition
 	}
 	if err != nil {
 		s.log.Error("pg SuspendDestination failed", zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
-	return d, nil
+	return d, replay, nil
 }
 
-func (s *PgStore) SupersedeDestination(ctx context.Context, destinationID string, req domain.SupersedeDestinationRequest, principalID, correlationID string) (*domain.PayeeDestination, error) {
+func (s *PgStore) SupersedeDestination(ctx context.Context, destinationID string, req domain.SupersedeDestinationRequest, principalID, correlationID, idempotencyKey string) (*domain.PayeeDestination, bool, error) {
+	if idempotencyKey == "" {
+		return nil, false, domain.ErrIdempotencyKeyRequired
+	}
 	var d *domain.PayeeDestination
+	replay := false
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
-		var err error
+		current, err := s.lockDestination(ctx, tx, destinationID)
+		if err != nil {
+			return err
+		}
+		command, claimedDest, found, err := s.findCommandClaim(ctx, tx, middleware.TenantFromContext(ctx), idempotencyKey)
+		if err != nil {
+			return err
+		}
+		if found {
+			if command != domain.CommandSupersedeDestination || claimedDest != destinationID {
+				return domain.ErrIdempotencyKeyConflict
+			}
+			d, replay = current, true
+			return nil
+		}
+
 		d, err = scanDestination(tx.QueryRow(ctx, `
 			UPDATE payee_destinations SET status = 'SUPERSEDED', updated_at = NOW()
 			WHERE destination_id = $1 AND status IN ('ACTIVE', 'APPROVAL_PENDING', 'VERIFIED')
@@ -444,18 +747,27 @@ func (s *PgStore) SupersedeDestination(ctx context.Context, destinationID string
 			return err
 		}
 		// Safe projection — see ProposeDestination's enqueueEvent call for why.
-		return s.enqueueEvent(ctx, tx, "com.zoikosuite.banking.payee-destination.superseded", domain.EventPayeeDestinationSuperseded,
+		if err := s.enqueueEvent(ctx, tx, "com.zoikosuite.banking.payee-destination.superseded", domain.EventPayeeDestinationSuperseded,
 			"payee-destination", destinationID, strOrEmpty(d.TenantID), d.LegalEntityID, principalID, correlationID,
-			domain.NewDestinationEventPayload(d, strOrEmpty(d.TenantID)))
+			domain.NewDestinationEventPayload(d, strOrEmpty(d.TenantID))); err != nil {
+			return err
+		}
+		return s.recordCommandClaim(ctx, tx, middleware.TenantFromContext(ctx), idempotencyKey, domain.CommandSupersedeDestination, destinationID)
 	})
-	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
-		return nil, domain.ErrInvalidTransition
+	if errors.Is(err, domain.ErrIdempotencyKeyConflict) || errors.Is(err, domain.ErrIdempotencyKeyRequired) {
+		return nil, false, err
+	}
+	if isCommandIdempotencyViolation(err) {
+		return nil, false, domain.ErrIdempotencyKeyConflict
+	}
+	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) || errors.Is(err, domain.ErrInvalidTransition) {
+		return nil, false, domain.ErrInvalidTransition
 	}
 	if err != nil {
 		s.log.Error("pg SupersedeDestination failed", zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
-	return d, nil
+	return d, replay, nil
 }
 
 func (s *PgStore) ListEvents(ctx context.Context, destinationID string) ([]domain.ChangeEvent, error) {

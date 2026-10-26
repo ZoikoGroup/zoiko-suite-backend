@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 
 	"github.com/go-chi/chi/v5"
@@ -21,17 +23,21 @@ import (
 // ── stub authz — including the own-object SoD layer and privileged-read gate ─
 
 type stubAuthz struct {
-	deny           bool
-	sodRules       bool
-	denyPrivileged bool
+	deny            bool
+	sodRules        bool
+	denyPrivileged  bool
+	privilegedCalls int
 }
 
 func (a *stubAuthz) CheckAllowed(_ context.Context, _, _, actionType string) error {
 	if a.deny {
 		return authzpkg.ErrAuthorizationDenied
 	}
-	if actionType == handler.PayeeMasterPrivilegedRead && a.denyPrivileged {
-		return authzpkg.ErrAuthorizationDenied
+	if actionType == handler.PayeeMasterPrivilegedRead {
+		a.privilegedCalls++
+		if a.denyPrivileged {
+			return authzpkg.ErrAuthorizationDenied
+		}
 	}
 	return nil
 }
@@ -82,7 +88,13 @@ func newTestRouter(st *stubStore, az *stubAuthz, party *stubParty) chi.Router {
 	return r
 }
 
-func doRequestAs(r http.Handler, method, path string, body interface{}, tenantID, principalID string) *httptest.ResponseRecorder {
+var requestSeq uint64
+
+func nextIdempotencyKey() string {
+	return fmt.Sprintf("test-key-%d", atomic.AddUint64(&requestSeq, 1))
+}
+
+func doRequestAsWithHeaders(r http.Handler, method, path string, body interface{}, tenantID, principalID string, headers map[string]string) *httptest.ResponseRecorder {
 	var buf bytes.Buffer
 	if body != nil {
 		_ = json.NewEncoder(&buf).Encode(body)
@@ -90,12 +102,24 @@ func doRequestAs(r http.Handler, method, path string, body interface{}, tenantID
 	req := httptest.NewRequest(method, path, &buf)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Principal-Id", principalID)
+	req.Header.Set("Idempotency-Key", nextIdempotencyKey())
 	if tenantID != "" {
 		req.Header.Set("X-Tenant-Id", tenantID)
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
 	}
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	return w
+}
+
+func doRequestAs(r http.Handler, method, path string, body interface{}, tenantID, principalID string) *httptest.ResponseRecorder {
+	return doRequestAsWithHeaders(r, method, path, body, tenantID, principalID, nil)
+}
+
+func doRequestWithKey(r http.Handler, method, path string, body interface{}, tenantID, principalID, idempotencyKey string) *httptest.ResponseRecorder {
+	return doRequestAsWithHeaders(r, method, path, body, tenantID, principalID, map[string]string{"Idempotency-Key": idempotencyKey})
 }
 
 func doRequest(r http.Handler, method, path string, body interface{}, tenantID string) *httptest.ResponseRecorder {

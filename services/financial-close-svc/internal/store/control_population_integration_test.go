@@ -24,8 +24,8 @@ func newTieBatch(t *testing.T, tenant string, expDebits, expCredits string, line
 	_, err := testPool.Exec(ctx, `
 		INSERT INTO migration_batches (batch_id, tenant_id, legal_entity_id, fiscal_period, source_system_name,
 			source_extract_hash, expected_row_count, expected_total_debits, expected_total_credits,
-			status, created_at, created_by_principal_id)
-		VALUES ($1,$2,$3,'2026-09','legacy','hash-1',$4,$5::numeric,$6::numeric,'LOADED','2026-09-01T23:30:00-05:00','p')`,
+			status, created_at, created_by_principal_id, currency_code)
+		VALUES ($1,$2,$3,'2026-09','legacy','hash-1',$4,$5::numeric,$6::numeric,'LOADED','2026-09-01T23:30:00-05:00','p','GBP')`,
 		f.batch, tenant, f.entity, len(lines), expDebits, expCredits)
 	require.NoError(t, err)
 	for i, l := range lines {

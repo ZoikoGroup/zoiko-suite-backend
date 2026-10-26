@@ -24,14 +24,14 @@ func TestPgStore_RecordFXRate_LatestWins(t *testing.T) {
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
 	older, err := s.RecordFXRate(ctx, domain.RecordFXRateParams{
-		TenantID: tenantID, CurrencyPair: "EUR/USD", Rate: 1.08,
+		TenantID: tenantID, CurrencyPair: "EUR/USD", Rate: "1.08",
 		EffectiveAt: time.Now().Add(-2 * time.Hour), RecordedByPrincipalID: "fx-admin-1",
 	})
 	if err != nil {
 		t.Fatalf("record older rate: %v", err)
 	}
 	newer, err := s.RecordFXRate(ctx, domain.RecordFXRateParams{
-		TenantID: tenantID, CurrencyPair: "EUR/USD", Rate: 1.09,
+		TenantID: tenantID, CurrencyPair: "EUR/USD", Rate: "1.09",
 		EffectiveAt: time.Now(), RecordedByPrincipalID: "fx-admin-1",
 	})
 	if err != nil {
@@ -64,7 +64,7 @@ func TestPgStore_FXRate_IsAppendOnly(t *testing.T) {
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
 	rate, err := s.RecordFXRate(ctx, domain.RecordFXRateParams{
-		TenantID: tenantID, CurrencyPair: "JPY/USD", Rate: 0.0067,
+		TenantID: tenantID, CurrencyPair: "JPY/USD", Rate: "0.0067",
 		EffectiveAt: time.Now(), RecordedByPrincipalID: "fx-admin-1",
 	})
 	if err != nil {
@@ -103,7 +103,7 @@ func TestPgStore_FXRate_TenantIsolation(t *testing.T) {
 	ctxB := svcmiddleware.WithTenant(context.Background(), tenantB)
 
 	if _, err := s.RecordFXRate(ctxA, domain.RecordFXRateParams{
-		TenantID: tenantA, CurrencyPair: "CHF/USD", Rate: 1.12, EffectiveAt: time.Now(), RecordedByPrincipalID: "fx-admin-1",
+		TenantID: tenantA, CurrencyPair: "CHF/USD", Rate: "1.12", EffectiveAt: time.Now(), RecordedByPrincipalID: "fx-admin-1",
 	}); err != nil {
 		t.Fatalf("record for tenant A: %v", err)
 	}
@@ -117,12 +117,12 @@ func TestPgStore_FXRate_TenantIsolation(t *testing.T) {
 
 func sampleFXExposureCalc(stale bool) domain.FXExposureCalculation {
 	return domain.FXExposureCalculation{
-		RateUsed: 1.08, RateAsOf: time.Now().UTC(), RateVersion: "rate-1", HasStaleComponent: stale,
+		RateUsed: "1.08", RateAsOf: time.Now().UTC(), RateVersion: "rate-1", HasStaleComponent: stale,
 		Buckets: []domain.FXExposureBucket{
-			{MaturityBucket: "0-30D", Category: "RECEIVABLE", ExposureCurrencyAmount: 1000, FunctionalCurrencyAmount: 1080},
-			{MaturityBucket: "31-90D", Category: "PAYABLE", ExposureCurrencyAmount: -400, FunctionalCurrencyAmount: -432},
+			{MaturityBucket: "0-30D", Category: "RECEIVABLE", ExposureCurrencyAmount: "1000", FunctionalCurrencyAmount: "1080"},
+			{MaturityBucket: "31-90D", Category: "PAYABLE", ExposureCurrencyAmount: "-400", FunctionalCurrencyAmount: "-432"},
 		},
-		GrossExposureAmount: 1512, NetExposureAmount: 648, AsOfTimestamp: time.Now().UTC(),
+		GrossExposureAmount: "1512", NetExposureAmount: "648", AsOfTimestamp: time.Now().UTC(),
 	}
 }
 
@@ -297,7 +297,7 @@ func TestPgStore_FXExposureSnapshot_AsOfReconstructsHistory(t *testing.T) {
 	time.Sleep(10 * time.Millisecond)
 
 	second := sampleFXExposureCalc(false)
-	second.NetExposureAmount = 9999
+	second.NetExposureAmount = "9999"
 	if _, err := s.CreateFXExposureSnapshot(ctx, domain.CalculateFXExposureParams{
 		TenantID: tenantID, LegalEntityID: legalEntityID, ExposureCurrency: "EUR", FunctionalCurrency: "USD",
 		NettingScope: "SINGLE_ENTITY:" + legalEntityID, ActorPrincipalID: "analyst-1",
@@ -309,12 +309,12 @@ func TestPgStore_FXExposureSnapshot_AsOfReconstructsHistory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetFXExposureAsOf: %v", err)
 	}
-	if asOf == nil || asOf.NetExposureAmount != 648 {
+	if asOf == nil || asOf.NetExposureAmount != domain.Decimal("648") {
 		t.Fatalf("expected the FIRST snapshot's net_exposure_amount=648 at the midpoint, got %+v", asOf)
 	}
 
 	current, err := s.GetFXExposureAsOf(ctx, tenantID, legalEntityID, "EUR", "USD", time.Now().UTC())
-	if err != nil || current == nil || current.NetExposureAmount != 9999 {
+	if err != nil || current == nil || current.NetExposureAmount != domain.Decimal("9999") {
 		t.Fatalf("expected the SECOND (latest) snapshot's net_exposure_amount=9999 as of now, got %+v err=%v", current, err)
 	}
 }

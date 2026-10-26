@@ -52,7 +52,15 @@ func NewClient(baseURL string, logger *zap.Logger) *Client {
 type tolerancePolicy struct {
 	ToleranceVersion  int    `json:"tolerance_version"`
 	AbsoluteTolerance string `json:"absolute_tolerance"`
+	DateToleranceDays *int   `json:"date_tolerance_days"`
+	DateBasis         string `json:"date_basis"`
 }
+
+// ErrUnsupportedDateBasis is a governed date tolerance counted in BUSINESS
+// days. No business-day calendar exists on the platform (financial-control-
+// svc's own matcher counts calendar days too), so it is refused rather than
+// silently counted as calendar days.
+var ErrUnsupportedDateBasis = errors.New("governed date tolerance uses date_basis BUSINESS, which has no business-day calendar to count against")
 
 type listTolerancePoliciesResponse struct {
 	Items []tolerancePolicy `json:"items"`
@@ -75,6 +83,43 @@ type listTolerancePoliciesResponse struct {
 // The version used to be discarded. It is now returned so every suggestion
 // can record which policy version its score basis rests on (A8).
 func (c *Client) GetActiveAbsoluteTolerance(ctx context.Context, tenantID, principalID, legalEntityID, metric string) (*domain.GovernedTolerance, error) {
+	latest, err := c.latestPolicy(ctx, tenantID, principalID, legalEntityID, metric)
+	if err != nil {
+		return nil, err
+	}
+	tolerance, err := domain.ParseAmount(latest.AbsoluteTolerance)
+	if err != nil || tolerance.Sign() < 0 {
+		return nil, fmt.Errorf("%w: malformed absolute_tolerance %q", ErrServiceUnavailable, latest.AbsoluteTolerance)
+	}
+	return &domain.GovernedTolerance{Amount: tolerance, Version: latest.ToleranceVersion}, nil
+}
+
+// GetActiveDateTolerance fetches the current governed date tolerance for
+// (legalEntityID, metric): the policy row's date_tolerance_days and version.
+// The same fail-closed rules as GetActiveAbsoluteTolerance apply — no policy
+// is ErrToleranceNotConfigured, never a default — and a BUSINESS basis is
+// ErrUnsupportedDateBasis.
+func (c *Client) GetActiveDateTolerance(ctx context.Context, tenantID, principalID, legalEntityID, metric string) (*domain.DateTolerance, error) {
+	latest, err := c.latestPolicy(ctx, tenantID, principalID, legalEntityID, metric)
+	if err != nil {
+		return nil, err
+	}
+	if latest.DateToleranceDays == nil || *latest.DateToleranceDays < 0 {
+		return nil, fmt.Errorf("%w: malformed date_tolerance_days", ErrServiceUnavailable)
+	}
+	switch latest.DateBasis {
+	case "CALENDAR":
+	case "BUSINESS":
+		return nil, ErrUnsupportedDateBasis
+	default:
+		return nil, fmt.Errorf("%w: malformed date_basis %q", ErrServiceUnavailable, latest.DateBasis)
+	}
+	return &domain.DateTolerance{Days: *latest.DateToleranceDays, Version: latest.ToleranceVersion}, nil
+}
+
+// latestPolicy reads the current (highest-version) policy row for
+// (legalEntityID, metric) and checks its version.
+func (c *Client) latestPolicy(ctx context.Context, tenantID, principalID, legalEntityID, metric string) (*tolerancePolicy, error) {
 	q := url.Values{"legal_entity_id": {legalEntityID}, "metric": {metric}}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/controls/v1/tolerance-policies?"+q.Encode(), nil)
 	if err != nil {
@@ -106,14 +151,10 @@ func (c *Client) GetActiveAbsoluteTolerance(ctx context.Context, tenantID, princ
 	// ascending, and CreateTolerancePolicy never edits a prior version
 	// in place — the last item is the current policy.
 	latest := out.Items[len(out.Items)-1]
-	tolerance, err := domain.ParseAmount(latest.AbsoluteTolerance)
-	if err != nil || tolerance.Sign() < 0 {
-		return nil, fmt.Errorf("%w: malformed absolute_tolerance %q", ErrServiceUnavailable, latest.AbsoluteTolerance)
-	}
 	if latest.ToleranceVersion <= 0 {
 		return nil, fmt.Errorf("%w: malformed tolerance_version %d", ErrServiceUnavailable, latest.ToleranceVersion)
 	}
-	return &domain.GovernedTolerance{Amount: tolerance, Version: latest.ToleranceVersion}, nil
+	return &latest, nil
 }
 
 // setEnvelopeHeaders forwards the canonical service input envelope

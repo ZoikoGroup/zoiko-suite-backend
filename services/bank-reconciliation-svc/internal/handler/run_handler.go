@@ -94,6 +94,23 @@ func (h *Handler) FreezePopulation(w http.ResponseWriter, r *http.Request) {
 	runID := chi.URLParam(r, "run_id")
 	correlationID := r.Header.Get("X-Correlation-ID")
 
+	// Freezing decides which population will be certified, so it is a
+	// preparation command and is authorized as one (BANKREC_RUN), against
+	// the run's own legal entity rather than a caller-supplied value.
+	run, err := h.store.GetRun(r.Context(), tenantID, runID)
+	if err != nil {
+		if errors.Is(err, domain.ErrRunNotFound) {
+			writeError(w, http.StatusNotFound, "run_not_found", "")
+			return
+		}
+		h.writeStoreErr(w, "FreezePopulation/GetRun", err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, run.LegalEntityID, actionRun); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
 	pop, created, err := h.store.FreezePopulation(r.Context(), tenantID, runID, principalID, correlationID)
 	if err != nil {
 		switch {
@@ -204,6 +221,8 @@ func (h *Handler) CertifyRun(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusConflict, "run_invalid_transition", err.Error())
 		case errors.Is(err, domain.ErrMaterialResidualBlocked):
 			writeError(w, http.StatusUnprocessableEntity, "material_residual_blocked", err.Error())
+		case errors.Is(err, domain.ErrUnresolvedExposureUnassessable):
+			writeError(w, http.StatusUnprocessableEntity, "unresolved_exposure_unassessable", err.Error())
 		case errors.Is(err, domain.ErrRunSelfCertificationForbidden):
 			writeError(w, http.StatusConflict, "self_certification_forbidden", err.Error())
 		default:
@@ -360,7 +379,7 @@ func (h *Handler) RunAutomaticMatching(w http.ResponseWriter, r *http.Request) {
 				result.Reason = "banking connector integration not configured"
 				break
 			}
-			if err := h.verifyCanonicalMatch(r.Context(), l, c.TransactionID); err != nil {
+			if err := h.verifyCanonicalMatch(r.Context(), l, principalID, c.TransactionID); err != nil {
 				result.Reason = err.Error()
 				break
 			}
@@ -413,7 +432,8 @@ func (h *Handler) BindPolicy(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if _, ok := h.requirePrincipal(w, r); !ok {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
 		return
 	}
 	runID := chi.URLParam(r, "run_id")
@@ -421,6 +441,24 @@ func (h *Handler) BindPolicy(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "missing_field", "policy_id")
 		return
 	}
+
+	// Binding a policy pins the thresholds the run will be certified
+	// against, so it is a run command, not an unauthenticated preference
+	// update. Authorize against the run's entity before the store sees it.
+	existing, err := h.store.GetRun(r.Context(), tenantID, runID)
+	if err != nil {
+		if errors.Is(err, domain.ErrRunNotFound) {
+			writeError(w, http.StatusNotFound, "run_not_found", "")
+			return
+		}
+		h.writeStoreErr(w, "BindPolicy/GetRun", err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionRun); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
 	run, err := h.store.BindPolicy(r.Context(), tenantID, runID, req.PolicyID)
 	if err != nil {
 		switch {

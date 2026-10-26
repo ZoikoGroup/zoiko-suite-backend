@@ -318,7 +318,7 @@ func (h *Handler) MatchStatementLine(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if h.banking != nil && req.TransactionID != "" {
-		if err := h.verifyCanonicalMatch(r.Context(), *l, req.TransactionID); err != nil {
+		if err := h.verifyCanonicalMatch(r.Context(), *l, principalID, req.TransactionID); err != nil {
 			switch {
 			case errors.Is(err, domain.ErrCanonicalTransactionNotFound):
 				writeError(w, http.StatusNotFound, "canonical_transaction_not_found", err.Error())
@@ -416,8 +416,8 @@ func (h *Handler) verifyJournalMatches(ctx context.Context, l domain.StatementLi
 	return nil
 }
 
-func (h *Handler) verifyCanonicalMatch(ctx context.Context, l domain.StatementLine, transactionID string) error {
-	t, err := h.banking.GetCanonicalTransaction(ctx, l.TenantID, transactionID)
+func (h *Handler) verifyCanonicalMatch(ctx context.Context, l domain.StatementLine, principalID, transactionID string) error {
+	t, err := h.banking.GetCanonicalTransaction(ctx, l.TenantID, principalID, transactionID)
 	if err != nil {
 		if errors.Is(err, banking.ErrTransactionNotFound) {
 			return domain.ErrCanonicalTransactionNotFound

@@ -5,17 +5,27 @@ package store
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 
 	"zoiko.io/treasury-svc/internal/domain"
 )
 
+// protectedHashV2Prefix marks a hash computed from exact decimal text. It
+// fits inside the existing VARCHAR(64) protected_field_hash column, so the
+// compatibility split needs no schema migration: pre-A34 rows are 64
+// lowercase hex characters, new rows are "v2:" plus a 43-character base64url
+// SHA-256. Hex cannot contain 'v' or ':', so the two formats are unambiguous.
+const protectedHashV2Prefix = "v2:"
+
 const treasuryTransferColumns = `
-	transfer_id, tenant_id, source_bank_account_id, target_bank_account_id, amount, currency_code, correlation_id, is_cross_entity,
+	transfer_id, tenant_id, source_bank_account_id, target_bank_account_id, amount::text, currency_code, correlation_id, is_cross_entity,
 	protected_field_hash, status, maker_principal_id, checker_principal_id, authorizer_principal_id, reject_reason, payment_attempt_id, source_journal_id, intercompany_entry_id,
 	cancel_reason, return_reason, resolution_note,
 	created_at, updated_at`
@@ -30,9 +40,65 @@ func scanTreasuryTransfer(row pgx.Row, t *domain.TreasuryTransfer) error {
 // protectedFieldHash hashes the fields a treasury transfer's approval must
 // stay honest about — recomputed at ApproveTreasuryTransfer time and
 // compared against the value captured at creation.
-func protectedFieldHash(amount float64, currencyCode, srcAcctID, tgtAcctID string) string {
-	sum := sha256.Sum256([]byte(fmt.Sprintf("%.4f|%s|%s|%s", amount, currencyCode, srcAcctID, tgtAcctID)))
+//
+// New rows hash the exact Decimal at the column's fixed four-place scale,
+// never through float64, and prefix the digest with protectedHashV2Prefix.
+// Older rows were hashed with fmt.Sprintf("%.4f", float64) and stored as
+// bare hex. Those are not byte-identical to exact decimal formatting for
+// every NUMERIC(20,4) value: above roughly 2^39 units the nearest float64 can
+// be far enough from the stored decimal that %.4f crosses a 0.0001 boundary
+// (for example 596267352650.6170 formats through float64 as
+// "596267352650.6169"). The version marker lets
+// protectedFieldHashMatches accept the legacy rendering only for old rows,
+// without also accepting a legacy rendering of a new row's exact hash. The
+// float64 parse is confined to that old-row comparison; it is never used to
+// compute a new hash or money.
+func protectedFieldHash(amount domain.Decimal, currencyCode, srcAcctID, tgtAcctID string) string {
+	sum := protectedFieldDigest(amount.MoneyText(), currencyCode, srcAcctID, tgtAcctID)
+	return protectedHashV2Prefix + base64.RawURLEncoding.EncodeToString(sum[:])
+}
+
+// legacyProtectedFieldHash reproduces the pre-A34 hash for an amount read
+// back from NUMERIC(20,4). It is verification-only compatibility, not a
+// money calculation: the exact decimal is parsed to the same float64 the old
+// code scanned and formatted with the same %.4f verb. An unparseable value
+// returns "", which can never equal a stored digest.
+func legacyProtectedFieldHash(amount domain.Decimal, currencyCode, srcAcctID, tgtAcctID string) string {
+	f, err := strconv.ParseFloat(amount.MoneyText(), 64)
+	if err != nil {
+		return ""
+	}
+	return hashProtectedFields(fmt.Sprintf("%.4f", f), currencyCode, srcAcctID, tgtAcctID)
+}
+
+// hashProtectedFields is the pre-A34 64-character hex rendering, retained so
+// an exact-hash row written by an intermediate build (before the version
+// marker) and a legacy float-formatted row can both still verify.
+func hashProtectedFields(amountText, currencyCode, srcAcctID, tgtAcctID string) string {
+	sum := protectedFieldDigest(amountText, currencyCode, srcAcctID, tgtAcctID)
 	return hex.EncodeToString(sum[:])
+}
+
+func protectedFieldDigest(amountText, currencyCode, srcAcctID, tgtAcctID string) [32]byte {
+	return sha256.Sum256([]byte(fmt.Sprintf("%s|%s|%s|%s", amountText, currencyCode, srcAcctID, tgtAcctID)))
+}
+
+// protectedFieldHashMatches accepts the exact versioned hash written by this
+// pass and, for rows written before it, either the exact unversioned hash or
+// the legacy float-formatted hash. A v2 hash is never checked against the
+// legacy rendering: at large magnitudes float64 can map two adjacent
+// four-decimal amounts to the same legacy text, and a new row must not accept
+// that ambiguity. A row is invalid only when no format valid for its stored
+// version matches, so tampering still fails closed.
+func protectedFieldHashMatches(amount domain.Decimal, currencyCode, srcAcctID, tgtAcctID, stored string) bool {
+	if stored == "" {
+		return false
+	}
+	if strings.HasPrefix(stored, protectedHashV2Prefix) {
+		return protectedFieldHash(amount, currencyCode, srcAcctID, tgtAcctID) == stored
+	}
+	return hashProtectedFields(amount.MoneyText(), currencyCode, srcAcctID, tgtAcctID) == stored ||
+		legacyProtectedFieldHash(amount, currencyCode, srcAcctID, tgtAcctID) == stored
 }
 
 // CreateTreasuryTransfer is BNK-09's maker entry point. Idempotent on
@@ -61,14 +127,14 @@ func (s *PgStore) CreateTreasuryTransfer(ctx context.Context, p domain.CreateTre
 			created = true
 			// Enqueue treasury_transfer.created event
 			return s.enqueueTreasuryTransferEvent(ctx, tx, "created", "treasury_transfer.created", p.TenantID, "", t.TransferID, p.MakerPrincipalID, p.CorrelationID, map[string]any{
-				"transfer_id":        t.TransferID,
-				"tenant_id":          t.TenantID,
-				"source_account_id":  t.SourceBankAccountID,
-				"target_account_id":  t.TargetBankAccountID,
-				"amount":             t.Amount,
-				"currency_code":      t.CurrencyCode,
-				"is_cross_entity":    t.IsCrossEntity,
-				"status":             t.Status,
+				"transfer_id":       t.TransferID,
+				"tenant_id":         t.TenantID,
+				"source_account_id": t.SourceBankAccountID,
+				"target_account_id": t.TargetBankAccountID,
+				"amount":            t.Amount,
+				"currency_code":     t.CurrencyCode,
+				"is_cross_entity":   t.IsCrossEntity,
+				"status":            t.Status,
 			})
 		}
 		if !errors.Is(err, pgx.ErrNoRows) {
@@ -118,7 +184,7 @@ func (s *PgStore) ApproveTreasuryTransfer(ctx context.Context, p domain.ApproveT
 	if existing.MakerPrincipalID == p.CheckerPrincipalID {
 		return nil, domain.ErrTransferSelfApproval
 	}
-	if protectedFieldHash(existing.Amount, existing.CurrencyCode, existing.SourceBankAccountID, existing.TargetBankAccountID) != existing.ProtectedFieldHash {
+	if !protectedFieldHashMatches(existing.Amount, existing.CurrencyCode, existing.SourceBankAccountID, existing.TargetBankAccountID, existing.ProtectedFieldHash) {
 		return nil, domain.ErrTransferHashMismatch
 	}
 
@@ -178,9 +244,9 @@ func (s *PgStore) AuthorizeTreasuryTransfer(ctx context.Context, p domain.Author
 		}
 		// Enqueue treasury_transfer.authorized event
 		return s.enqueueTreasuryTransferEvent(ctx, tx, "authorized", "treasury_transfer.authorized", p.TenantID, "", t.TransferID, p.AuthorizerPrincipalID, "", map[string]any{
-			"transfer_id":        t.TransferID,
-			"tenant_id":          t.TenantID,
-			"status":             t.Status,
+			"transfer_id":          t.TransferID,
+			"tenant_id":            t.TenantID,
+			"status":               t.Status,
 			"authorizer_principal": t.AuthorizerPrincipalID,
 		})
 	})
@@ -256,10 +322,10 @@ func (s *PgStore) RejectTreasuryTransfer(ctx context.Context, p domain.RejectTre
 		}
 		// Enqueue treasury_transfer.rejected event
 		return s.enqueueTreasuryTransferEvent(ctx, tx, "rejected", "treasury_transfer.rejected", p.TenantID, "", t.TransferID, p.CheckerPrincipalID, "", map[string]any{
-			"transfer_id":      t.TransferID,
-			"tenant_id":        t.TenantID,
-			"status":           t.Status,
-			"reject_reason":    t.RejectReason,
+			"transfer_id":       t.TransferID,
+			"tenant_id":         t.TenantID,
+			"status":            t.Status,
+			"reject_reason":     t.RejectReason,
 			"checker_principal": t.CheckerPrincipalID,
 		})
 	})
@@ -278,12 +344,19 @@ func (s *PgStore) RejectTreasuryTransfer(ctx context.Context, p domain.RejectTre
 // ExecuteTreasuryTransfer's resumable handler loop — see
 // internal/handler/bnk09_handler.go.
 
+// MarkTransferSubmitted records BNK-06 accepting the payment attempt. A
+// same-entity transfer is submitted from APPROVED; a cross-entity one only
+// from AUTHORIZED, the extra dual-control step ExecuteTreasuryTransfer
+// requires first. The predecessor is tied to is_cross_entity here too, so
+// the store cannot record a cross-entity submission that skipped
+// authorization.
 func (s *PgStore) MarkTransferSubmitted(ctx context.Context, tenantID, transferID, paymentAttemptID string) (*domain.TreasuryTransfer, error) {
 	var t domain.TreasuryTransfer
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		row := tx.QueryRow(ctx, `
 			UPDATE treasury_transfers SET status=$3, payment_attempt_id=$4, updated_at=now()
-			WHERE transfer_id=$1 AND tenant_id=$2 AND status='APPROVED'
+			WHERE transfer_id=$1 AND tenant_id=$2
+				AND ((status='APPROVED' AND NOT is_cross_entity) OR (status='AUTHORIZED' AND is_cross_entity))
 			RETURNING `+treasuryTransferColumns,
 			transferID, tenantID, domain.TransferSubmitted, paymentAttemptID)
 		if err := scanTreasuryTransfer(row, &t); err != nil {
@@ -291,10 +364,10 @@ func (s *PgStore) MarkTransferSubmitted(ctx context.Context, tenantID, transferI
 		}
 		// Enqueue treasury_transfer.submitted event
 		return s.enqueueTreasuryTransferEvent(ctx, tx, "submitted", "treasury_transfer.submitted", tenantID, "", transferID, "", paymentAttemptID, map[string]any{
-			"transfer_id":          t.TransferID,
-			"tenant_id":            t.TenantID,
-			"status":               t.Status,
-			"payment_attempt_id":   t.PaymentAttemptID,
+			"transfer_id":        t.TransferID,
+			"tenant_id":          t.TenantID,
+			"status":             t.Status,
+			"payment_attempt_id": t.PaymentAttemptID,
 		})
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -361,10 +434,11 @@ func (s *PgStore) AmendTreasuryTransfer(ctx context.Context, p domain.AmendTreas
 	err = s.withRLS(ctx, p.TenantID, func(tx pgx.Tx) error {
 		row := tx.QueryRow(ctx, `
 			UPDATE treasury_transfers
-			SET source_bank_account_id=$3, target_bank_account_id=$4, amount=$5, currency_code=$6, protected_field_hash=$7, updated_at=now()
+			SET source_bank_account_id=$3, target_bank_account_id=$4, amount=$5, currency_code=$6, protected_field_hash=$7,
+			    is_cross_entity=$8, updated_at=now()
 			WHERE transfer_id=$1 AND tenant_id=$2 AND status='DRAFT'
 			RETURNING `+treasuryTransferColumns,
-			p.TransferID, p.TenantID, p.SourceBankAccountID, p.TargetBankAccountID, p.Amount, p.CurrencyCode, hash)
+			p.TransferID, p.TenantID, p.SourceBankAccountID, p.TargetBankAccountID, p.Amount, p.CurrencyCode, hash, p.IsCrossEntity)
 		return scanTreasuryTransfer(row, &t)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -406,9 +480,10 @@ func (s *PgStore) SubmitTransferForApproval(ctx context.Context, p domain.Submit
 	return &t, nil
 }
 
-// CancelBeforeSubmission moves DRAFT/PENDING_APPROVAL/APPROVED straight
-// to the terminal CANCELLED state. Only the maker may cancel their own
-// transfer.
+// CancelBeforeSubmission moves DRAFT/PENDING_APPROVAL/APPROVED/AUTHORIZED
+// straight to the terminal CANCELLED state — the same set
+// domain.CanCancelBeforeSubmission names: the bank has not seen any of
+// them. Only the maker may cancel their own transfer.
 func (s *PgStore) CancelBeforeSubmission(ctx context.Context, p domain.CancelBeforeSubmissionParams) (*domain.TreasuryTransfer, error) {
 	existing, err := s.GetTreasuryTransfer(ctx, p.TenantID, p.TransferID)
 	if err != nil {
@@ -421,7 +496,7 @@ func (s *PgStore) CancelBeforeSubmission(ctx context.Context, p domain.CancelBef
 	err = s.withRLS(ctx, p.TenantID, func(tx pgx.Tx) error {
 		row := tx.QueryRow(ctx, `
 			UPDATE treasury_transfers SET status=$3, cancel_reason=$4, updated_at=now()
-			WHERE transfer_id=$1 AND tenant_id=$2 AND status IN ('DRAFT','PENDING_APPROVAL','APPROVED')
+			WHERE transfer_id=$1 AND tenant_id=$2 AND status IN ('DRAFT','PENDING_APPROVAL','APPROVED','AUTHORIZED')
 			RETURNING `+treasuryTransferColumns,
 			p.TransferID, p.TenantID, domain.TransferCancelled, p.Reason)
 		if err := scanTreasuryTransfer(row, &t); err != nil {
@@ -429,11 +504,11 @@ func (s *PgStore) CancelBeforeSubmission(ctx context.Context, p domain.CancelBef
 		}
 		// Enqueue treasury_transfer.cancelled event
 		return s.enqueueTreasuryTransferEvent(ctx, tx, "cancelled", "treasury_transfer.cancelled", p.TenantID, "", t.TransferID, p.ActorPrincipalID, "", map[string]any{
-			"transfer_id":      t.TransferID,
-			"tenant_id":        t.TenantID,
-			"status":           t.Status,
-			"cancel_reason":    t.CancelReason,
-			"actor_principal":  t.MakerPrincipalID, // reusing field
+			"transfer_id":     t.TransferID,
+			"tenant_id":       t.TenantID,
+			"status":          t.Status,
+			"cancel_reason":   t.CancelReason,
+			"actor_principal": t.MakerPrincipalID, // reusing field
 		})
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -489,12 +564,14 @@ func (s *PgStore) ResolveTreasuryTransfer(ctx context.Context, p domain.ResolveT
 	err := s.withRLS(ctx, p.TenantID, func(tx pgx.Tx) error {
 		var row pgx.Row
 		if p.Resolution == domain.ResolutionResubmit {
-			// A fresh maker-checker cycle: the prior checker and the
-			// failed attempt's correlation ids are cleared, not reused.
+			// A fresh maker-checker cycle: the prior checker, the prior
+			// cross-entity authorizer and the failed attempt's correlation
+			// ids are cleared, not reused.
 			row = tx.QueryRow(ctx, `
 				UPDATE treasury_transfers
 				SET status=$3, resolution_note=$4, updated_at=now(),
-				    checker_principal_id='', payment_attempt_id='', source_journal_id='', intercompany_entry_id=''
+				    checker_principal_id='', authorizer_principal_id='',
+				    payment_attempt_id='', source_journal_id='', intercompany_entry_id=''
 				WHERE transfer_id=$1 AND tenant_id=$2 AND status='RETURNED'
 				RETURNING `+treasuryTransferColumns,
 				p.TransferID, p.TenantID, domain.TransferPendingApproval, p.Note)
@@ -512,11 +589,11 @@ func (s *PgStore) ResolveTreasuryTransfer(ctx context.Context, p domain.ResolveT
 		// Enqueue treasury_transfer.cancelled event only for CANCEL resolution
 		if p.Resolution == domain.ResolutionCancel {
 			return s.enqueueTreasuryTransferEvent(ctx, tx, "cancelled", "treasury_transfer.cancelled", p.TenantID, "", t.TransferID, p.ActorPrincipalID, "", map[string]any{
-				"transfer_id":      t.TransferID,
-				"tenant_id":        t.TenantID,
-				"status":           t.Status,
-				"resolution_note":  t.ResolutionNote,
-				"actor_principal":  t.MakerPrincipalID,
+				"transfer_id":     t.TransferID,
+				"tenant_id":       t.TenantID,
+				"status":          t.Status,
+				"resolution_note": t.ResolutionNote,
+				"actor_principal": t.MakerPrincipalID,
 			})
 		}
 		return nil

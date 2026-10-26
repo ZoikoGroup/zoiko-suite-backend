@@ -42,7 +42,7 @@ func inStatus(t *testing.T, s *store.PgStore, ctx context.Context, e *domain.Int
 	case domain.MatchStatusMatched:
 		e.TargetJournalID = &targetJ
 		e.MatchStatus = domain.MatchStatusMatched
-		if err := s.UpdateMatch(ctx, e, testAttempt(e), "matcher", "corr-match"); err != nil {
+		if _, err := s.UpdateMatch(ctx, e, testAttempt(e), "k-match-"+e.IntercompanyEntryID, "matcher", "corr-match"); err != nil {
 			t.Fatalf("UpdateMatch(MATCHED): %v", err)
 		}
 	case domain.MatchStatusMismatch:
@@ -50,16 +50,16 @@ func inStatus(t *testing.T, s *store.PgStore, ctx context.Context, e *domain.Int
 		e.TargetJournalID = &targetJ
 		e.MatchStatus = domain.MatchStatusMismatch
 		e.MismatchReason = &reason
-		if err := s.UpdateMatch(ctx, e, testAttempt(e), "matcher", "corr-mismatch"); err != nil {
+		if _, err := s.UpdateMatch(ctx, e, testAttempt(e), "k-mismatch-"+e.IntercompanyEntryID, "matcher", "corr-mismatch"); err != nil {
 			t.Fatalf("UpdateMatch(MISMATCH): %v", err)
 		}
 	case domain.MatchStatusClosed:
 		e.TargetJournalID = &targetJ
 		e.MatchStatus = domain.MatchStatusMatched
-		if err := s.UpdateMatch(ctx, e, testAttempt(e), "matcher", "corr-match"); err != nil {
+		if _, err := s.UpdateMatch(ctx, e, testAttempt(e), "k-match-"+e.IntercompanyEntryID, "matcher", "corr-match"); err != nil {
 			t.Fatalf("UpdateMatch(MATCHED): %v", err)
 		}
-		if err := s.ClosePair(ctx, e.IntercompanyEntryID, "closer", "period consolidated", "corr-close"); err != nil {
+		if _, err := s.ClosePair(ctx, e.IntercompanyEntryID, "k-close-"+e.IntercompanyEntryID, "closer", "period consolidated", "corr-close"); err != nil {
 			t.Fatalf("ClosePair: %v", err)
 		}
 	default:

@@ -18,6 +18,7 @@ import (
 	"zoiko.io/reconciliation-intelligence-svc/internal/config"
 	"zoiko.io/reconciliation-intelligence-svc/internal/financialcontrol"
 	"zoiko.io/reconciliation-intelligence-svc/internal/handler"
+	"zoiko.io/reconciliation-intelligence-svc/internal/ledger"
 	"zoiko.io/reconciliation-intelligence-svc/internal/mtls"
 	"zoiko.io/reconciliation-intelligence-svc/internal/store"
 	"zoiko.io/reconciliation-intelligence-svc/internal/telemetry"
@@ -117,7 +118,9 @@ func main() {
 	financialControlClient := financialcontrol.NewClient(cfg.FinancialControlURL, logger)
 	bankRecClient := bankrec.NewClient(cfg.BankReconciliationURL, logger)
 
-	h := handler.NewHandler(dataStore, authzClient, financialControlClient, bankRecClient, logger)
+	ledgerClient := ledger.NewClient(cfg.GeneralLedgerURL, logger)
+
+	h := handler.NewHandler(dataStore, authzClient, financialControlClient, bankRecClient, ledgerClient, cfg.CandidateSearchHorizonDays, logger)
 	router := handler.NewRouter(h)
 
 	srv := &http.Server{

@@ -16,8 +16,8 @@ import (
 )
 
 const (
-	BANKING_STATEMENT_VALIDATE  = "BANKING_STATEMENT_VALIDATE"
-	BANKING_TRANSACTION_NORMALIZE = "BANKING_TRANSACTION_NORMALIZE"
+	BANKING_STATEMENT_VALIDATE        = "BANKING_STATEMENT_VALIDATE"
+	BANKING_TRANSACTION_NORMALIZE     = "BANKING_TRANSACTION_NORMALIZE"
 	BANKING_MAPPING_EXCEPTION_APPROVE = "BANKING_MAPPING_EXCEPTION_APPROVE"
 	BANKING_MAPPING_MANAGE            = "BANKING_MAPPING_MANAGE"
 )
@@ -106,6 +106,8 @@ func (h *BNK0304Handler) writeTransactionErr(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusForbidden, "the principal who raised this exception cannot approve it")
 	case errors.Is(err, domain.ErrStatementLineNotFound):
 		writeError(w, http.StatusNotFound, "statement line not found")
+	case errors.Is(err, domain.ErrTransactionEvidenceMismatch):
+		writeError(w, http.StatusUnprocessableEntity, "transaction date, amount or currency does not match the statement line")
 	case errors.Is(err, domain.ErrMappingAlreadyExists):
 		writeError(w, http.StatusConflict, "a mapping for this bank_code already exists for this tenant")
 	default:
@@ -361,4 +363,3 @@ func (h *BNK0304Handler) GetCanonicalTransaction(w http.ResponseWriter, r *http.
 	}
 	writeJSON(w, http.StatusOK, txn)
 }
-

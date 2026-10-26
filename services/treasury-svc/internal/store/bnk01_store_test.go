@@ -227,7 +227,7 @@ func TestPgStore_GetBankAccountAsOf_ReturnsHistoricalValues(t *testing.T) {
 
 	if _, err := s.AmendBankAccountMetadata(ctx, domain.AmendBankAccountMetadataParams{
 		BankAccountID: acct.BankAccountID, TenantID: tenantID, AccountName: "First Amendment", BranchRef: acct.BranchRef,
-		BankIdentifier: acct.BankIdentifier, Country: acct.Country, AccountType: acct.AccountType, ActorPrincipalID: "ops-1",
+		Country: acct.Country, AccountType: acct.AccountType, ActorPrincipalID: "ops-1",
 	}); err != nil {
 		t.Fatalf("first amend: %v", err)
 	}
@@ -242,7 +242,7 @@ func TestPgStore_GetBankAccountAsOf_ReturnsHistoricalValues(t *testing.T) {
 
 	if _, err := s.AmendBankAccountMetadata(ctx, domain.AmendBankAccountMetadataParams{
 		BankAccountID: acct.BankAccountID, TenantID: tenantID, AccountName: "Second Amendment", BranchRef: acct.BranchRef,
-		BankIdentifier: acct.BankIdentifier, Country: acct.Country, AccountType: acct.AccountType, ActorPrincipalID: "ops-1",
+		Country: acct.Country, AccountType: acct.AccountType, ActorPrincipalID: "ops-1",
 	}); err != nil {
 		t.Fatalf("second amend: %v", err)
 	}
@@ -361,5 +361,33 @@ func TestPgStore_CreateBankAccount_IdempotentOnCorrelationID(t *testing.T) {
 	}
 	if len(list) != 1 {
 		t.Fatalf("expected exactly 1 bank account for this correlation_id, got %d", len(list))
+	}
+}
+
+// An amend that supplies only some fields changes only those. Before, the
+// store wrote every field as sent: leaving out bank_identifier tripped the
+// identifier trigger (it changes only through a token rotation), so the
+// amend failed, and leaving out branch_ref, country or account_type blanked
+// them.
+func TestPgStore_AmendBankAccountMetadata_ChangesOnlySuppliedFields(t *testing.T) {
+	cleanTables(t)
+	s := testStore
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+	acct := newTestAccount(tenantID, uuid.New().String())
+	acct.BranchRef, acct.Country, acct.AccountType = "BR-1", "GB", "CHECKING"
+	if _, err := s.CreateBankAccount(ctx, acct); err != nil {
+		t.Fatalf("create account: %v", err)
+	}
+
+	amended, err := s.AmendBankAccountMetadata(ctx, domain.AmendBankAccountMetadataParams{
+		BankAccountID: acct.BankAccountID, TenantID: tenantID, AccountName: "Renamed", ActorPrincipalID: "ops-1",
+	})
+	if err != nil {
+		t.Fatalf("amend only the name: %v", err)
+	}
+	if amended.AccountName != "Renamed" || amended.BranchRef != "BR-1" || amended.Country != "GB" ||
+		amended.AccountType != "CHECKING" || amended.BankIdentifier != "SWIFT-TEST" || amended.TokenVersion != acct.TokenVersion {
+		t.Fatalf("amend changed fields it was not given: %+v", amended)
 	}
 }

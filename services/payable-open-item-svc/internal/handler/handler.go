@@ -508,7 +508,7 @@ func (h *Handler) ApplyConfirmedPayment(w http.ResponseWriter, r *http.Request) 
 
 	// Invariant #19: a payable is settled only from Banking's own
 	// confirmation, never from an initiation response or the caller's word.
-	state, err := h.bank.GetStatus(r.Context(), svcmiddleware.TenantFromContext(r.Context()), req.Bnk07PaymentID)
+	state, err := h.bank.GetStatus(r.Context(), svcmiddleware.TenantFromContext(r.Context()), principalID, req.Bnk07PaymentID)
 	if err != nil {
 		h.log.Error("ApplyConfirmedPayment: payment-status-svc lookup failed", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, domain.ErrBankingStatusUnavailable.Error())

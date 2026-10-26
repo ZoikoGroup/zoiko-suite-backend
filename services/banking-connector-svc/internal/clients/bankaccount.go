@@ -30,16 +30,20 @@ type BankAccountRef struct {
 	TenantID          string `json:"tenant_id"`
 	LegalEntityID     string `json:"legal_entity_id"`
 	OperationalStatus string `json:"account_status"`
+	// CurrencyCode is BNK-01's ISO 4217 code (treasury-svc's field name).
+	// BNK-02's connection row records the account's currency; it is never a
+	// caller-supplied or hardcoded default.
+	CurrencyCode string `json:"currency_code"`
 }
 
 // BankAccountClient is the narrow interface banking-connector-svc depends
 // on for BNK-02's link to BNK-01.
 type BankAccountClient interface {
 	// VerifyBankAccount resolves bankAccountID via treasury-svc's real
-	// GET /v1/treasury/accounts/{id} and confirms it belongs to
-	// tenantID — the concrete check behind CompleteConnectionAuthorization
-	// binding a connection to a real, owned account rather than an
-	// arbitrary caller-supplied string.
+	// GET /v1/treasury/accounts/{id} and confirms it belongs to tenantID.
+	// InitiateConnection uses it before writing a REQUESTED row, so a
+	// connection can never bind a caller-supplied account string that does
+	// not resolve to an owned BNK-01 account.
 	VerifyBankAccount(ctx context.Context, tenantID, bankAccountID, principalID, correlationID string) (*BankAccountRef, error)
 }
 

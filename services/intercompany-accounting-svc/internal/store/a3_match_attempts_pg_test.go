@@ -96,21 +96,21 @@ func TestPgStore_A3_AttemptsAreAppendedAndReasonIsTheLatest(t *testing.T) {
 	// Two failed attempts against different journals, then a match.
 	j1, j2, j3 := uuid.New().String(), uuid.New().String(), uuid.New().String()
 	entry.TargetJournalID, entry.MatchStatus = &j1, domain.MatchStatusMismatch
-	if err := s.UpdateMatch(ctx, entry, attemptFor(entry, domain.MatchRuleAmountMismatch, "amount_mismatch: first", "4000"), "matcher", "c1"); err != nil {
+	if _, err := s.UpdateMatch(ctx, entry, attemptFor(entry, domain.MatchRuleAmountMismatch, "amount_mismatch: first", "4000"), "k1", "matcher", "c1"); err != nil {
 		t.Fatalf("attempt 1: %v", err)
 	}
 	if r := reason(); r == nil || *r != "amount_mismatch: first" {
 		t.Fatalf("after attempt 1: %v", r)
 	}
 	entry.TargetJournalID = &j2
-	if err := s.UpdateMatch(ctx, entry, attemptFor(entry, domain.MatchRuleCurrencyMismatch, "currency_mismatch: second", "5000"), "matcher", "c2"); err != nil {
+	if _, err := s.UpdateMatch(ctx, entry, attemptFor(entry, domain.MatchRuleCurrencyMismatch, "currency_mismatch: second", "5000"), "k2", "matcher", "c2"); err != nil {
 		t.Fatalf("attempt 2: %v", err)
 	}
 	if r := reason(); r == nil || *r != "currency_mismatch: second" {
 		t.Fatalf("after attempt 2: %v", r)
 	}
 	entry.TargetJournalID, entry.MatchStatus = &j3, domain.MatchStatusMatched
-	if err := s.UpdateMatch(ctx, entry, attemptFor(entry, "", "", "5000"), "matcher", "c3"); err != nil {
+	if _, err := s.UpdateMatch(ctx, entry, attemptFor(entry, "", "", "5000"), "k3", "matcher", "c3"); err != nil {
 		t.Fatalf("attempt 3: %v", err)
 	}
 	if r := reason(); r != nil {
@@ -163,15 +163,15 @@ func TestPgStore_A3_RefusedAttemptIsNotRecorded(t *testing.T) {
 		t.Fatal(err)
 	}
 	mismatch(entry, "amount_mismatch: real")
-	if err := s.UpdateMatch(ctx, entry, testAttempt(entry), "a", "c"); err != nil {
+	if _, err := s.UpdateMatch(ctx, entry, testAttempt(entry), "k1", "a", "c"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.DisputeIntercompany(ctx, entry.IntercompanyEntryID, "d", "disputed", "c"); err != nil {
+	if _, err := s.DisputeIntercompany(ctx, entry.IntercompanyEntryID, "k-dispute", "d", "disputed", "c"); err != nil {
 		t.Fatal(err)
 	}
 
 	entry.MatchStatus, entry.MismatchReason = domain.MatchStatusMatched, nil
-	if err := s.UpdateMatch(ctx, entry, testAttempt(entry), "late", "c"); !errors.Is(err, domain.ErrInvalidPairTransition) {
+	if _, err := s.UpdateMatch(ctx, entry, testAttempt(entry), "k2", "late", "c"); !errors.Is(err, domain.ErrInvalidPairTransition) {
 		t.Fatalf("expected ErrInvalidPairTransition, got %v", err)
 	}
 	attempts, err := s.ListMatchAttempts(ctx, entry.IntercompanyEntryID)
@@ -201,7 +201,7 @@ func TestPgStore_A3_ObservedAmountsAreNotRounded(t *testing.T) {
 	}
 	mismatch(entry, "amount_mismatch: huge")
 	const observed = "123456789012345678.123456789"
-	if err := s.UpdateMatch(ctx, entry, attemptFor(entry, domain.MatchRuleAmountMismatch, "amount_mismatch: huge", observed), "a", "c"); err != nil {
+	if _, err := s.UpdateMatch(ctx, entry, attemptFor(entry, domain.MatchRuleAmountMismatch, "amount_mismatch: huge", observed), "k1", "a", "c"); err != nil {
 		t.Fatal(err)
 	}
 	got, err := s.ListMatchAttempts(ctx, entry.IntercompanyEntryID)
@@ -224,7 +224,7 @@ func TestPgStore_A3_AttemptsAreImmutableAndTenantIsolated(t *testing.T) {
 		t.Fatal(err)
 	}
 	mismatch(entry, "amount_mismatch: x")
-	if err := s.UpdateMatch(ctx, entry, testAttempt(entry), "a", "c"); err != nil {
+	if _, err := s.UpdateMatch(ctx, entry, testAttempt(entry), "k1", "a", "c"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -317,11 +317,11 @@ func TestMigration000007_DownWritesTheLatestReasonBack(t *testing.T) {
 		t.Fatal(err)
 	}
 	mismatch(entry, "amount_mismatch: older")
-	if err := s.UpdateMatch(ctx, entry, testAttempt(entry), "a", "c"); err != nil {
+	if _, err := s.UpdateMatch(ctx, entry, testAttempt(entry), "k1", "a", "c"); err != nil {
 		t.Fatal(err)
 	}
 	mismatch(entry, "currency_mismatch: latest")
-	if err := s.UpdateMatch(ctx, entry, testAttempt(entry), "a", "c"); err != nil {
+	if _, err := s.UpdateMatch(ctx, entry, testAttempt(entry), "k2", "a", "c"); err != nil {
 		t.Fatal(err)
 	}
 

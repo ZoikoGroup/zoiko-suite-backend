@@ -3,7 +3,9 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"strconv"
 	"time"
 
@@ -40,8 +42,9 @@ var _ EntitlementStore = (*PgStore)(nil)
 // bound capabilities as of now, from the caller's tenant-scoped transaction.
 // A tenant sees only its own subscription (RLS); the seller-plane price
 // version read behind it sees only published/retired content either way.
-func loadEntitlementBasis(ctx context.Context, tx pgx.Tx, now time.Time) (domain.SubscriptionEntitlementBasis, error) {
-	rows, err := tx.Query(ctx, `SELECT subscription_id FROM subscriptions WHERE starts_at <= $1 AND (ends_at IS NULL OR ends_at > $1)`, now)
+func loadEntitlementBasis(ctx context.Context, tx pgx.Tx, org string, now time.Time) (domain.SubscriptionEntitlementBasis, error) {
+	rows, err := tx.Query(ctx, `SELECT subscription_id FROM subscriptions
+		WHERE organization_id = $1 AND starts_at <= $2 AND (ends_at IS NULL OR ends_at > $2)`, org, now)
 	if err != nil {
 		return domain.SubscriptionEntitlementBasis{}, err
 	}
@@ -52,7 +55,7 @@ func loadEntitlementBasis(ctx context.Context, tx pgx.Tx, now time.Time) (domain
 	if len(ids) == 0 {
 		// No subscription live at now: could be none ever, or one that has
 		// already ended. Distinguish for the ended-grace calculation.
-		return loadMostRecentlyEnded(ctx, tx, now)
+		return loadMostRecentlyEnded(ctx, tx, org, now)
 	}
 
 	a, err := loadAggregate(ctx, tx, ids[0], false)
@@ -78,61 +81,160 @@ func loadEntitlementBasis(ctx context.Context, tx pgx.Tx, now time.Time) (domain
 			b.Capabilities[c.CapabilityKey] = c
 		}
 	}
-	for key, c := range b.Capabilities {
-		if c.MeterKey == nil || c.MeterVersion == nil {
-			continue
-		}
-		used, err := currentPeriodConsumption(ctx, tx, a.sub.SubscriptionID, *c.MeterKey, *c.MeterVersion, now)
-		if err != nil {
-			return domain.SubscriptionEntitlementBasis{}, err
-		}
-		if b.Consumption == nil {
-			b.Consumption = map[string]int64{}
-		}
-		b.Consumption[key] = used
+	consumption, err := currentPeriodConsumptions(ctx, tx, a.sub.SubscriptionID, b.Capabilities, now)
+	if err != nil {
+		return domain.SubscriptionEntitlementBasis{}, err
+	}
+	if len(consumption) > 0 {
+		b.Consumption = consumption
 	}
 	return b, nil
 }
 
-// currentPeriodConsumption is B1's gap fix: how much of a metered
-// capability's quota has been consumed in the subscription's current term,
-// as of now. Reuses COM-04's own term-resolution and live-aggregation
-// machinery rather than inventing a second running total: a CERTIFIED/
-// ADJUSTED statement's total_quantity is authoritative; an OPEN/FROZEN
-// statement (the common case, since a quota check happens mid-term) has no
-// live total_quantity by COM-04's own design ("no dashboard counter"), so
-// this sums its accepted events live with the same domain.Aggregate
-// ExplainAggregation/certifyStatement already use — a genuine on-demand
-// read of the real accepted rows, not a second cached counter that could
-// drift from them.
-func currentPeriodConsumption(ctx context.Context, tx pgx.Tx, subscriptionID, meterKey string, meterVersion int, now time.Time) (int64, error) {
+// currentPeriodConsumptions is the batched form of the quota read: one term
+// lookup, one statement read for every metered capability, one meter read,
+// and one accepted-event read. The earlier per-capability implementation
+// issued four queries per metered capability (an N+1 on the runtime decision
+// path); this keeps the same live domain.Aggregate semantics without the
+// loop. A CERTIFIED/ADJUSTED statement's total_quantity is authoritative; an
+// OPEN/FROZEN statement is aggregated from its accepted rows, exactly as
+// ExplainAggregation/certifyStatement do.
+func currentPeriodConsumptions(ctx context.Context, tx pgx.Tx, subscriptionID string, caps map[string]domain.PlanCapability, now time.Time) (map[string]int64, error) {
+	type meterCap struct {
+		keys []string
+	}
+	meters := map[string]*meterCap{}
+	for key, c := range caps {
+		if c.MeterKey == nil || c.MeterVersion == nil {
+			continue
+		}
+		mc := meters[*c.MeterKey]
+		if mc == nil {
+			mc = &meterCap{}
+			meters[*c.MeterKey] = mc
+		}
+		mc.keys = append(mc.keys, key)
+	}
+	if len(meters) == 0 {
+		return nil, nil
+	}
+	meterKeys := make([]string, 0, len(meters))
+	for key := range meters {
+		meterKeys = append(meterKeys, key)
+	}
+
 	termNo, err := resolveTerm(ctx, tx, subscriptionID, now)
 	if err != nil {
 		if errors.Is(err, domain.ErrStatementNotOpenForWindow) {
-			return 0, nil // no term covers this instant: nothing to have consumed
+			return nil, nil // no term covers this instant: nothing to have consumed
 		}
-		return 0, err
+		return nil, err
 	}
-	st, err := scanStatement(tx.QueryRow(ctx, `SELECT `+usageStatementColumns+` FROM usage_statements
-		WHERE subscription_id = $1 AND term_no = $2 AND meter_key = $3 AND status <> 'SUPERSEDED'`, subscriptionID, termNo, meterKey))
-	if errors.Is(err, pgx.ErrNoRows) {
-		return 0, nil
-	}
+	rows, err := tx.Query(ctx, `SELECT `+usageStatementColumns+` FROM usage_statements
+		WHERE subscription_id = $1 AND term_no = $2 AND meter_key = ANY($3) AND status <> 'SUPERSEDED'`,
+		subscriptionID, termNo, meterKeys)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	if st.Status == domain.StatementCertified || st.Status == domain.StatementAdjusted {
-		return decimalToInt64Ceil(st.TotalQuantity)
+	statements := map[string]*domain.UsageStatement{}
+	for rows.Next() {
+		st, err := scanStatement(rows)
+		if err != nil {
+			rows.Close()
+			return nil, err
+		}
+		statements[st.MeterKey] = st
 	}
-	m, err := loadMeterDefinition(ctx, tx, meterKey, meterVersion)
-	if err != nil {
-		return 0, err
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
-	events, err := acceptedEvents(ctx, tx, st.StatementID)
-	if err != nil {
-		return 0, err
+	if len(statements) == 0 {
+		return nil, nil
 	}
-	return decimalToInt64Ceil(domain.Aggregate(*m, events))
+
+	needMeters := make([]string, 0, len(statements))
+	needStatements := make([]string, 0, len(statements))
+	for key, st := range statements {
+		if st.Status == domain.StatementCertified || st.Status == domain.StatementAdjusted {
+			continue
+		}
+		needMeters = append(needMeters, key)
+		needStatements = append(needStatements, st.StatementID)
+	}
+	defs := map[string]*domain.MeterDefinition{}
+	if len(needMeters) > 0 {
+		rows, err := tx.Query(ctx, `SELECT `+meterDefinitionColumns+` FROM meter_definitions WHERE meter_key = ANY($1)`, needMeters)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			m, err := scanMeterDefinition(rows)
+			if err != nil {
+				rows.Close()
+				return nil, err
+			}
+			defs[m.MeterKey+":"+strconv.Itoa(m.MeterVersion)] = m
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+	}
+	events := map[string][]domain.AcceptedEvent{}
+	if len(needStatements) > 0 {
+		rows, err := tx.Query(ctx, `SELECT statement_id, usage_event_id, quantity::text, dimensions, occurred_at
+			FROM usage_event_records WHERE statement_id = ANY($1) AND status = 'ACCEPTED'
+			ORDER BY statement_id, usage_event_id`, needStatements)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var statementID string
+			var e domain.AcceptedEvent
+			var dimJSON []byte
+			if err := rows.Scan(&statementID, &e.EventID, &e.Quantity, &dimJSON, &e.OccurredAt); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			if len(dimJSON) > 0 {
+				if err := json.Unmarshal(dimJSON, &e.Dimensions); err != nil {
+					rows.Close()
+					return nil, fmt.Errorf("decode usage dimensions: %w", err)
+				}
+			}
+			events[statementID] = append(events[statementID], e)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+	}
+
+	out := map[string]int64{}
+	for meterKey, mc := range meters {
+		st := statements[meterKey]
+		if st == nil {
+			continue
+		}
+		var used int64
+		if st.Status == domain.StatementCertified || st.Status == domain.StatementAdjusted {
+			used, err = decimalToInt64Ceil(st.TotalQuantity)
+		} else {
+			m := defs[meterKey+":"+strconv.Itoa(st.MeterVersion)]
+			if m == nil {
+				return nil, domain.ErrMeterDefinitionNotFound
+			}
+			used, err = decimalToInt64Ceil(domain.Aggregate(*m, events[st.StatementID]))
+		}
+		if err != nil {
+			return nil, err
+		}
+		for _, key := range mc.keys {
+			out[key] = used
+		}
+	}
+	return out, nil
 }
 
 // decimalToInt64Ceil converts an exact decimal quantity to a whole-unit
@@ -149,10 +251,11 @@ func decimalToInt64Ceil(s string) (int64, error) {
 // loadMostRecentlyEnded finds an organization's most recently ended
 // subscription so its grace period can still be evaluated. An organization
 // that never subscribed returns the zero basis (Status == "": DENY).
-func loadMostRecentlyEnded(ctx context.Context, tx pgx.Tx, now time.Time) (domain.SubscriptionEntitlementBasis, error) {
+func loadMostRecentlyEnded(ctx context.Context, tx pgx.Tx, org string, now time.Time) (domain.SubscriptionEntitlementBasis, error) {
 	var subID string
-	err := tx.QueryRow(ctx, `SELECT subscription_id FROM subscriptions WHERE ends_at IS NOT NULL AND ends_at <= $1
-		ORDER BY ends_at DESC LIMIT 1`, now).Scan(&subID)
+	err := tx.QueryRow(ctx, `SELECT subscription_id FROM subscriptions
+		WHERE organization_id = $1 AND ends_at IS NOT NULL AND ends_at <= $2
+		ORDER BY ends_at DESC LIMIT 1`, org, now).Scan(&subID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.SubscriptionEntitlementBasis{}, nil
 	}
@@ -174,11 +277,11 @@ func loadMostRecentlyEnded(ctx context.Context, tx pgx.Tx, now time.Time) (domai
 		Capabilities: map[string]domain.PlanCapability{}}, nil
 }
 
-func loadActiveRestrictions(ctx context.Context, tx pgx.Tx) ([]domain.CommercialRestriction, error) {
+func loadActiveRestrictions(ctx context.Context, tx pgx.Tx, org string) ([]domain.CommercialRestriction, error) {
 	rows, err := tx.Query(ctx, `
 		SELECT restriction_id, organization_id::text, level, reason_code, policy_ref, basis_ref, applied_at,
 		       applied_by_principal_id, lifted_at, lifted_by_principal_id, lift_reason
-		FROM commercial_restrictions ORDER BY applied_at`)
+		FROM commercial_restrictions WHERE organization_id = $1 ORDER BY applied_at`, org)
 	if err != nil {
 		return nil, err
 	}
@@ -208,13 +311,14 @@ func loadEntitlementPolicyAt(ctx context.Context, tx pgx.Tx, now time.Time) (*do
 }
 
 func (s *PgStore) decide(ctx context.Context, capabilityKey string, requestedQuantity *int64, now time.Time) (*domain.CapabilityDecision, error) {
+	org := svcmiddleware.TenantFromContext(ctx)
 	var out *domain.CapabilityDecision
 	err := s.subscriptionTx(ctx, func(tx pgx.Tx) error {
-		basis, err := loadEntitlementBasis(ctx, tx, now)
+		basis, err := loadEntitlementBasis(ctx, tx, org, now)
 		if err != nil {
 			return err
 		}
-		restrictions, err := loadActiveRestrictions(ctx, tx)
+		restrictions, err := loadActiveRestrictions(ctx, tx, org)
 		if err != nil {
 			return err
 		}
@@ -242,13 +346,14 @@ func (s *PgStore) ExplainDecision(ctx context.Context, capabilityKey string, req
 }
 
 func (s *PgStore) GetEffectiveEntitlements(ctx context.Context, now time.Time) ([]domain.CapabilityDecision, error) {
+	org := svcmiddleware.TenantFromContext(ctx)
 	var out []domain.CapabilityDecision
 	err := s.subscriptionTx(ctx, func(tx pgx.Tx) error {
-		basis, err := loadEntitlementBasis(ctx, tx, now)
+		basis, err := loadEntitlementBasis(ctx, tx, org, now)
 		if err != nil {
 			return err
 		}
-		restrictions, err := loadActiveRestrictions(ctx, tx)
+		restrictions, err := loadActiveRestrictions(ctx, tx, org)
 		if err != nil {
 			return err
 		}
@@ -279,11 +384,11 @@ func (s *PgStore) GetEffectiveEntitlements(ctx context.Context, now time.Time) (
 // one transaction the public method already opens fixes that as a side
 // effect of the extraction, not a separate change.
 func recomputeEntitlementsTx(ctx context.Context, tx pgx.Tx, org, actor string, now time.Time) ([]domain.CapabilityDecision, error) {
-	basis, err := loadEntitlementBasis(ctx, tx, now)
+	basis, err := loadEntitlementBasis(ctx, tx, org, now)
 	if err != nil {
 		return nil, err
 	}
-	restrictions, err := loadActiveRestrictions(ctx, tx)
+	restrictions, err := loadActiveRestrictions(ctx, tx, org)
 	if err != nil {
 		return nil, err
 	}
@@ -455,8 +560,21 @@ func (s *PgStore) ApplyRestriction(ctx context.Context, r *domain.CommercialRest
 			return err
 		}
 		got, err := applyRestrictionTx(ctx, tx, r)
+		if err != nil {
+			return err
+		}
+		// COM-03 §4.3: a restriction changes the snapshot. Record the new
+		// decisions and emit EntitlementSnapshotChanged in the same
+		// transaction, so a cache-fronted consumer cannot keep an Allow
+		// decision after the restriction commits.
+		if err := declareOrgForSellerPlane(ctx, tx, r.OrganizationID); err != nil {
+			return err
+		}
+		if _, err := recomputeEntitlementsTx(ctx, tx, r.OrganizationID, r.AppliedByPrincipalID, r.AppliedAt); err != nil {
+			return err
+		}
 		out = got
-		return err
+		return nil
 	})
 	return out, err
 }
@@ -500,8 +618,17 @@ func (s *PgStore) RemoveRestriction(ctx context.Context, restrictionID, actor, r
 	var out *domain.CommercialRestriction
 	err := s.withSellerPlane(ctx, func(tx pgx.Tx) error {
 		got, err := removeRestrictionTx(ctx, tx, restrictionID, actor, reason, now)
+		if err != nil {
+			return err
+		}
+		if err := declareOrgForSellerPlane(ctx, tx, got.OrganizationID); err != nil {
+			return err
+		}
+		if _, err := recomputeEntitlementsTx(ctx, tx, got.OrganizationID, actor, now); err != nil {
+			return err
+		}
 		out = got
-		return err
+		return nil
 	})
 	return out, err
 }

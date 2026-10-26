@@ -25,7 +25,7 @@ func (s *PgStore) RecordFXRate(ctx context.Context, p domain.RecordFXRateParams)
 		row := tx.QueryRow(ctx, `
 			INSERT INTO fx_rates (tenant_id, currency_pair, rate, effective_at, recorded_by_principal_id)
 			VALUES ($1,$2,$3,$4,$5)
-			RETURNING rate_id, tenant_id, currency_pair, rate, effective_at, recorded_by_principal_id, created_at`,
+			RETURNING rate_id, tenant_id, currency_pair, rate::text, effective_at, recorded_by_principal_id, created_at`,
 			p.TenantID, p.CurrencyPair, p.Rate, p.EffectiveAt, p.RecordedByPrincipalID)
 		return row.Scan(&r.RateID, &r.TenantID, &r.CurrencyPair, &r.Rate, &r.EffectiveAt, &r.RecordedByPrincipalID, &r.CreatedAt)
 	})
@@ -41,7 +41,7 @@ func (s *PgStore) GetLatestFXRate(ctx context.Context, tenantID, currencyPair st
 	var r domain.FXRate
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		row := tx.QueryRow(ctx, `
-			SELECT rate_id, tenant_id, currency_pair, rate, effective_at, recorded_by_principal_id, created_at
+			SELECT rate_id, tenant_id, currency_pair, rate::text, effective_at, recorded_by_principal_id, created_at
 			FROM fx_rates WHERE tenant_id=$1 AND currency_pair=$2
 			ORDER BY effective_at DESC LIMIT 1`,
 			tenantID, currencyPair)
@@ -60,8 +60,8 @@ func (s *PgStore) GetLatestFXRate(ctx context.Context, tenantID, currencyPair st
 
 const fxExposureColumns = `
 	snapshot_id, tenant_id, legal_entity_id, exposure_currency, functional_currency, as_of_timestamp,
-	rate_used, rate_as_of, rate_version, netting_scope,
-	buckets, gross_exposure_amount, net_exposure_amount,
+	rate_used::text, rate_as_of, rate_version, netting_scope,
+	buckets, gross_exposure_amount::text, net_exposure_amount::text,
 	status, has_stale_component, published_by_principal_id, published_at, superseded_by,
 	calculated_by_principal_id, correlation_id, created_at`
 
@@ -80,6 +80,8 @@ func scanFXExposureSnapshot(row pgx.Row, s *domain.FXExposureSnapshot) error {
 			return err
 		}
 	}
+	// Derived on every read, never stored — see domain.FXExposureStale.
+	s.HasStaleComponent = domain.FXExposureStale(s.HasStaleComponent, s.RateVersion, s.RateAsOf, time.Now())
 	s.EffectiveStatus = s.Status
 	if s.Status == domain.FXExposurePublished && s.HasStaleComponent {
 		s.EffectiveStatus = "STALE"
@@ -91,56 +93,88 @@ func scanFXExposureSnapshot(row pgx.Row, s *domain.FXExposureSnapshot) error {
 // CALCULATED row, immutable from the moment it's written (see migration
 // 000009's own trigger).
 func (s *PgStore) CreateFXExposureSnapshot(ctx context.Context, p domain.CalculateFXExposureParams, calc domain.FXExposureCalculation) (*domain.FXExposureSnapshot, error) {
+	return s.RefreshFXExposureSnapshot(ctx, domain.RefreshFXExposureParams{CalculateFXExposureParams: p}, calc)
+}
+
+// RefreshFXExposureSnapshot writes a new CALCULATED snapshot and, when
+// PriorSnapshotID is set, supersedes the prior one with it in the same
+// transaction — the BNK-08 refresh rule: one transaction, and the prior
+// must be a live snapshot for the same legal entity and currency pair.
+func (s *PgStore) RefreshFXExposureSnapshot(ctx context.Context, p domain.RefreshFXExposureParams, calc domain.FXExposureCalculation) (*domain.FXExposureSnapshot, error) {
 	buckets, err := json.Marshal(calc.Buckets)
 	if err != nil {
 		return nil, err
 	}
 	var snap domain.FXExposureSnapshot
 	err = s.withRLS(ctx, p.TenantID, func(tx pgx.Tx) error {
-		row := tx.QueryRow(ctx, `
-			INSERT INTO fx_exposure_snapshots (
-				snapshot_id, tenant_id, legal_entity_id, exposure_currency, functional_currency, as_of_timestamp,
-				rate_used, rate_as_of, rate_version, netting_scope,
-				buckets, gross_exposure_amount, net_exposure_amount,
-				status, has_stale_component, calculated_by_principal_id, correlation_id
-			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'CALCULATED',$14,$15,$16)
-			RETURNING `+fxExposureColumns,
-			uuid.New().String(), p.TenantID, p.LegalEntityID, p.ExposureCurrency, p.FunctionalCurrency, calc.AsOfTimestamp,
-			calc.RateUsed, calc.RateAsOf, calc.RateVersion, p.NettingScope,
-			buckets, calc.GrossExposureAmount, calc.NetExposureAmount,
-			calc.HasStaleComponent, p.ActorPrincipalID, p.CorrelationID,
-		)
-		if err := scanFXExposureSnapshot(row, &snap); err != nil {
+		if err := s.insertFXExposureSnapshot(ctx, tx, p.CalculateFXExposureParams, calc, buckets, &snap); err != nil {
 			return err
 		}
-		// Enqueue fx_exposure.calculated event
-		if err := s.enqueueFXExposureEvent(ctx, tx, "calculated", "fx_exposure.calculated", p.TenantID, p.LegalEntityID, snap.SnapshotID, p.ActorPrincipalID, p.CorrelationID, map[string]any{
+		if p.PriorSnapshotID == "" {
+			return nil
+		}
+		_, err := supersedeFXExposure(ctx, tx, p.TenantID, p.PriorSnapshotID, snap.SnapshotID)
+		return err
+	})
+	if err != nil {
+		return nil, fxExposureStoreErr(err)
+	}
+	return &snap, nil
+}
+
+// fxExposureStoreErr passes the BNK-10 sentinels through and wraps
+// anything else as a store failure.
+func fxExposureStoreErr(err error) error {
+	for _, sentinel := range []error{domain.ErrFXExposureSnapshotNotFound, domain.ErrInvalidFXExposureTransition, domain.ErrFXExposureScopeMismatch} {
+		if errors.Is(err, sentinel) {
+			return sentinel
+		}
+	}
+	return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+}
+
+// insertFXExposureSnapshot inserts one CALCULATED snapshot and enqueues its
+// events inside tx.
+func (s *PgStore) insertFXExposureSnapshot(ctx context.Context, tx pgx.Tx, p domain.CalculateFXExposureParams, calc domain.FXExposureCalculation, buckets []byte, snap *domain.FXExposureSnapshot) error {
+	row := tx.QueryRow(ctx, `
+		INSERT INTO fx_exposure_snapshots (
+			snapshot_id, tenant_id, legal_entity_id, exposure_currency, functional_currency, as_of_timestamp,
+			rate_used, rate_as_of, rate_version, netting_scope,
+			buckets, gross_exposure_amount, net_exposure_amount,
+			status, has_stale_component, calculated_by_principal_id, correlation_id
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'CALCULATED',$14,$15,$16)
+		RETURNING `+fxExposureColumns,
+		uuid.New().String(), p.TenantID, p.LegalEntityID, p.ExposureCurrency, p.FunctionalCurrency, calc.AsOfTimestamp,
+		calc.RateUsed.OrZero(), calc.RateAsOf, calc.RateVersion, p.NettingScope,
+		buckets, calc.GrossExposureAmount.OrZero(), calc.NetExposureAmount.OrZero(),
+		calc.HasStaleComponent, p.ActorPrincipalID, p.CorrelationID,
+	)
+	if err := scanFXExposureSnapshot(row, snap); err != nil {
+		return err
+	}
+	// Enqueue fx_exposure.calculated event
+	if err := s.enqueueFXExposureEvent(ctx, tx, "calculated", "fx_exposure.calculated", p.TenantID, p.LegalEntityID, snap.SnapshotID, p.ActorPrincipalID, p.CorrelationID, map[string]any{
+		"snapshot_id":         snap.SnapshotID,
+		"tenant_id":           snap.TenantID,
+		"legal_entity_id":     snap.LegalEntityID,
+		"exposure_currency":   snap.ExposureCurrency,
+		"functional_currency": snap.FunctionalCurrency,
+		"status":              snap.Status,
+		"has_stale_component": snap.HasStaleComponent,
+	}); err != nil {
+		return err
+	}
+	// Enqueue fx_exposure.became_stale event if HasStaleComponent is true
+	if snap.HasStaleComponent {
+		return s.enqueueFXExposureEvent(ctx, tx, "became-stale", "fx_exposure.became_stale", p.TenantID, p.LegalEntityID, snap.SnapshotID, p.ActorPrincipalID, p.CorrelationID, map[string]any{
 			"snapshot_id":         snap.SnapshotID,
 			"tenant_id":           snap.TenantID,
 			"legal_entity_id":     snap.LegalEntityID,
 			"exposure_currency":   snap.ExposureCurrency,
 			"functional_currency": snap.FunctionalCurrency,
-			"status":              snap.Status,
-			"has_stale_component": snap.HasStaleComponent,
-		}); err != nil {
-			return err
-		}
-		// Enqueue fx_exposure.became_stale event if HasStaleComponent is true
-		if snap.HasStaleComponent {
-			return s.enqueueFXExposureEvent(ctx, tx, "became-stale", "fx_exposure.became_stale", p.TenantID, p.LegalEntityID, snap.SnapshotID, p.ActorPrincipalID, p.CorrelationID, map[string]any{
-				"snapshot_id":         snap.SnapshotID,
-				"tenant_id":           snap.TenantID,
-				"legal_entity_id":     snap.LegalEntityID,
-				"exposure_currency":   snap.ExposureCurrency,
-				"functional_currency": snap.FunctionalCurrency,
-			})
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		})
 	}
-	return &snap, nil
+	return nil
 }
 
 func (s *PgStore) GetFXExposureSnapshot(ctx context.Context, tenantID, snapshotID string) (*domain.FXExposureSnapshot, error) {
@@ -279,27 +313,54 @@ func (s *PgStore) PublishFXExposureSnapshot(ctx context.Context, p domain.Publis
 // SupersedeFXExposureSnapshot marks an existing, non-SUPERSEDED snapshot
 // SUPERSEDED, pointing at newSnapshotID.
 func (s *PgStore) SupersedeFXExposureSnapshot(ctx context.Context, p domain.SupersedeFXExposureParams) (*domain.FXExposureSnapshot, error) {
-	existing, err := s.GetFXExposureSnapshot(ctx, p.TenantID, p.SnapshotID)
+	var snap *domain.FXExposureSnapshot
+	err := s.withRLS(ctx, p.TenantID, func(tx pgx.Tx) error {
+		var err error
+		snap, err = supersedeFXExposure(ctx, tx, p.TenantID, p.SnapshotID, p.NewSnapshotID)
+		return err
+	})
 	if err != nil {
+		return nil, fxExposureStoreErr(err)
+	}
+	return snap, nil
+}
+
+// supersedeFXExposure retires snapshotID in favour of newSnapshotID inside
+// tx: the old snapshot is locked first, and the replacement must be a
+// different, live snapshot for the same legal entity and currency pair.
+// Before, any snapshot ID was accepted as the replacement.
+func supersedeFXExposure(ctx context.Context, tx pgx.Tx, tenantID, snapshotID, newSnapshotID string) (*domain.FXExposureSnapshot, error) {
+	var old, repl domain.FXExposureSnapshot
+	if err := scanFXExposureSnapshot(tx.QueryRow(ctx, `SELECT `+fxExposureColumns+` FROM fx_exposure_snapshots WHERE snapshot_id=$1 AND tenant_id=$2 FOR UPDATE`, snapshotID, tenantID), &old); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, domain.ErrFXExposureSnapshotNotFound
+		}
 		return nil, err
 	}
-	if !domain.CanSupersedeFXExposure(existing.Status) {
+	if !domain.CanSupersedeFXExposure(old.Status) {
 		return nil, domain.ErrInvalidFXExposureTransition
 	}
+	if err := scanFXExposureSnapshot(tx.QueryRow(ctx, `SELECT `+fxExposureColumns+` FROM fx_exposure_snapshots WHERE snapshot_id=$1 AND tenant_id=$2`, newSnapshotID, tenantID), &repl); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, domain.ErrFXExposureSnapshotNotFound
+		}
+		return nil, err
+	}
+	if repl.SnapshotID == old.SnapshotID || repl.Status == domain.FXExposureSuperseded || repl.LegalEntityID != old.LegalEntityID ||
+		repl.ExposureCurrency != old.ExposureCurrency || repl.FunctionalCurrency != old.FunctionalCurrency {
+		return nil, domain.ErrFXExposureScopeMismatch
+	}
 	var snap domain.FXExposureSnapshot
-	err = s.withRLS(ctx, p.TenantID, func(tx pgx.Tx) error {
-		row := tx.QueryRow(ctx, `
-			UPDATE fx_exposure_snapshots SET status='SUPERSEDED', superseded_by=$3
-			WHERE snapshot_id=$1 AND tenant_id=$2 AND status <> 'SUPERSEDED'
-			RETURNING `+fxExposureColumns,
-			p.SnapshotID, p.TenantID, p.NewSnapshotID)
-		return scanFXExposureSnapshot(row, &snap)
-	})
+	err := scanFXExposureSnapshot(tx.QueryRow(ctx, `
+		UPDATE fx_exposure_snapshots SET status='SUPERSEDED', superseded_by=$3
+		WHERE snapshot_id=$1 AND tenant_id=$2 AND status <> 'SUPERSEDED'
+		RETURNING `+fxExposureColumns,
+		snapshotID, tenantID, newSnapshotID), &snap)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, domain.ErrInvalidFXExposureTransition
 	}
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		return nil, err
 	}
 	return &snap, nil
 }

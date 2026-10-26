@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"testing"
+	"time"
 
 	"zoiko.io/banking-connector-svc/internal/domain"
 	"zoiko.io/banking-connector-svc/internal/middleware"
@@ -373,5 +374,59 @@ func TestBNK02_CreateRegionPolicy_RejectsDuplicate(t *testing.T) {
 		TenantID: "tenant-bnk02-region-c", LegalEntityID: "le-dup", Region: "APAC", ActorPrincipalID: "ops-admin",
 	}); err != domain.ErrRegionPolicyAlreadyExists {
 		t.Fatalf("expected ErrRegionPolicyAlreadyExists, got %v", err)
+	}
+}
+
+// TestBNK02_ConnectionQueries_ReturnFullProjection proves both the direct
+// read and the list read return the BNK-02 lifecycle columns, not just the
+// original nine. The lifecycle handlers and treasury-svc's BNK-01
+// ListConnectionOptions both depend on these fields; a partial row made
+// region enforcement and the vault calls no-ops, and made the BNK-01
+// account filter return nothing.
+func TestBNK02_ConnectionQueries_ReturnFullProjection(t *testing.T) {
+	admin := openAdminPool(t)
+	appPool := appRolePool(t, admin)
+	s := store.NewPgStore(appPool, store.WithEventRegion("uk"))
+
+	ctx := middleware.WithTenant(context.Background(), "tenant-bnk02-full")
+	conn := &domain.BankConnection{
+		LegalEntityID: "le-full", BankName: "Full Projection Bank", Status: domain.StatusConnected,
+	}
+	if err := s.CreateConnection(ctx, conn, "ops-1", "corr-full"); err != nil {
+		t.Fatalf("create connection: %v", err)
+	}
+
+	expires := time.Now().UTC().Add(time.Hour)
+	if _, err := admin.Exec(ctx, `
+		UPDATE bank_connections
+		SET bank_account_id=$2, provider_ref=$3, consent_scope=$4, token_lease_ref=$5,
+		    token_expires_at=$6, health_status=$7, region=$8
+		WHERE connection_id=$1`,
+		conn.ConnectionID, "acct-full", "provider-full", []string{"balances", "transactions"},
+		"lease-full", expires, "HEALTHY", "EU"); err != nil {
+		t.Fatalf("seed BNK-02 columns: %v", err)
+	}
+
+	got, err := s.GetConnectionByID(ctx, conn.ConnectionID)
+	if err != nil {
+		t.Fatalf("get connection: %v", err)
+	}
+	if got.BankAccountID != "acct-full" || got.ProviderRef != "provider-full" || got.TokenLeaseRef != "lease-full" ||
+		got.HealthStatus != "HEALTHY" || got.Region != "EU" || len(got.ConsentScope) != 2 {
+		t.Fatalf("GetConnectionByID returned a partial BNK-02 row: %+v", got)
+	}
+	if got.TokenExpiresAt == nil || !got.TokenExpiresAt.After(time.Now()) {
+		t.Fatalf("expected token expiry to round-trip, got %+v", got.TokenExpiresAt)
+	}
+
+	list, err := s.ListConnections(ctx, "le-full")
+	if err != nil {
+		t.Fatalf("list connections: %v", err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("expected 1 connection, got %d", len(list))
+	}
+	if list[0].BankAccountID != "acct-full" || list[0].Region != "EU" || list[0].TokenLeaseRef != "lease-full" {
+		t.Fatalf("ListConnections returned a partial BNK-02 row: %+v", list[0])
 	}
 }

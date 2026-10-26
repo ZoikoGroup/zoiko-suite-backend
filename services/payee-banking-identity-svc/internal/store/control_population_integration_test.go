@@ -33,7 +33,7 @@ func openPool(t *testing.T) *pgxpool.Pool {
 	}
 	t.Cleanup(pool.Close)
 
-	if _, err := pool.Exec(ctx, `DROP TABLE IF EXISTS payee_destination_events, payee_destinations, eventing_outbox CASCADE`); err != nil {
+	if _, err := pool.Exec(ctx, `DROP TABLE IF EXISTS command_idempotency, payee_destination_events, payee_destinations, eventing_outbox CASCADE`); err != nil {
 		t.Fatalf("drop: %v", err)
 	}
 	_, file, _, _ := runtime.Caller(0)

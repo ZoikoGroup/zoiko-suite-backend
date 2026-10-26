@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/go-chi/chi/v5"
@@ -11,8 +12,8 @@ import (
 
 	"zoiko.io/general-ledger-svc/internal/close"
 	"zoiko.io/general-ledger-svc/internal/domain"
-	"zoiko.io/general-ledger-svc/internal/handler"
 	svcenvelope "zoiko.io/general-ledger-svc/internal/envelope"
+	"zoiko.io/general-ledger-svc/internal/handler"
 	svcmiddleware "zoiko.io/general-ledger-svc/internal/middleware"
 )
 
@@ -30,7 +31,9 @@ func (c *stubCloseForPolicy) CheckPeriodOpen(_ context.Context, _, _, _ string) 
 		return nil
 	case "RESTRICTED":
 		return domain.ErrSoftCloseOverrideRequired
-	case "CLOSE_JOURNALS_ONLY", "CLOSED":
+	case "CLOSE_JOURNALS_ONLY":
+		return domain.ErrCloseJournalsOnly
+	case "CLOSED":
 		return domain.ErrPeriodHardClosed
 	default:
 		return domain.ErrPeriodHardClosed
@@ -175,8 +178,10 @@ func TestSoftCloseOverride_E_HARD_CLOSED_NoOverrideWorks(t *testing.T) {
 	}
 }
 
-// TestSoftCloseOverride_F_CLOSE_REVIEW_TreatedAsHardClosed verifies CLOSE_REVIEW is treated as HARD_CLOSED
-func TestSoftCloseOverride_F_CLOSE_REVIEW_TreatedAsHardClosed(t *testing.T) {
+// TestSoftCloseOverride_F_CLOSE_REVIEW_OverrideDoesNotBypass verifies the
+// SOFT_CLOSE override is not a CLOSE_REVIEW mechanism: an ordinary journal
+// carrying an override is still refused in CLOSE_REVIEW.
+func TestSoftCloseOverride_F_CLOSE_REVIEW_OverrideDoesNotBypass(t *testing.T) {
 	c := &stubCloseForPolicy{postingPolicy: "CLOSE_JOURNALS_ONLY", periodState: "CLOSE_REVIEW"}
 	authz := &recordingAuthZ{}
 	r := newSoftCloseRouter(newStubStore(), c, authz)
@@ -187,7 +192,10 @@ func TestSoftCloseOverride_F_CLOSE_REVIEW_TreatedAsHardClosed(t *testing.T) {
 	rec := doRequest(r, http.MethodPost, "/v1/journals/", req, "principal-1")
 
 	if rec.Code != http.StatusPreconditionFailed {
-		t.Fatalf("expected 412 for CLOSE_REVIEW treated as hard closed, got %d: %s", rec.Code, rec.Body.String())
+		t.Fatalf("expected 412 for an ordinary journal in CLOSE_REVIEW, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"error":"period_locked"`) {
+		t.Fatalf("expected period_locked, got %s", rec.Body.String())
 	}
 }
 

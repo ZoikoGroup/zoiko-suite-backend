@@ -74,17 +74,17 @@ func legacyEventTypeOf(t *testing.T, ctx context.Context, f *fixture, tenantID, 
 func proposeAndVerify(t *testing.T, f *fixture, tenantID string) *domain.PayeeDestination {
 	t.Helper()
 	ctx := middleware.WithTenant(context.Background(), tenantID)
-	d, err := f.s.ProposeDestination(ctx, tenantID, domain.ProposeDestinationRequest{
+	d, _, err := f.s.ProposeDestination(ctx, tenantID, domain.ProposeDestinationRequest{
 		LegalEntityID: f.entity, PartyRef: "party-" + uuid.New().String(), FinancialInstitution: "Outbox Test Bank",
 		AccountIdentifier: "GB29OTBK" + uuid.New().String()[:14], CountryCode: "GB", Currency: "GBP",
 		PayeeName: "Outbox Payee Ltd", SourceType: domain.SourceManualEntry,
-	}, "proposer-1", "corr-propose-1")
+	}, "proposer-1", "corr-propose-1", "key-propose-"+uuid.New().String())
 	if err != nil {
 		t.Fatalf("propose destination: %v", err)
 	}
-	verified, err := f.s.VerifyDestination(ctx, d.DestinationID, domain.VerifyDestinationRequest{
+	verified, _, err := f.s.VerifyDestination(ctx, d.DestinationID, domain.VerifyDestinationRequest{
 		VerificationMethod: "INDEPENDENT_CALL", VerificationEvidenceRef: "evidence-1",
-	}, "verifier-1")
+	}, "verifier-1", "key-verify-"+uuid.New().String())
 	if err != nil {
 		t.Fatalf("verify destination: %v", err)
 	}
@@ -95,11 +95,11 @@ func TestPgStore_Outbox_ProposeDestination_EnqueuesProposedEvent(t *testing.T) {
 	f := newFixture(t)
 	ctx := middleware.WithTenant(context.Background(), f.tenant)
 
-	d, err := f.s.ProposeDestination(ctx, f.tenant, domain.ProposeDestinationRequest{
+	d, _, err := f.s.ProposeDestination(ctx, f.tenant, domain.ProposeDestinationRequest{
 		LegalEntityID: f.entity, PartyRef: "party-outbox-1", FinancialInstitution: "Outbox Test Bank",
 		AccountIdentifier: "GB29OTBK60161331926819", CountryCode: "GB", Currency: "GBP",
 		PayeeName: "Outbox Payee Ltd", SourceType: domain.SourceManualEntry,
-	}, "proposer-1", "corr-propose-outbox-1")
+	}, "proposer-1", "corr-propose-outbox-1", "key-propose-outbox-1")
 	if err != nil {
 		t.Fatalf("propose destination: %v", err)
 	}
@@ -117,12 +117,11 @@ func TestPgStore_Outbox_ProposeDestination_EnqueuesProposedEvent(t *testing.T) {
 	}
 }
 
-// TestPgStore_Outbox_VerifyDestination_DoesNotEnqueue is a negative
-// control: VerifyDestination never published an event in the old
-// dual-write (no Publish call existed for it at all — the handler's own
-// doc comment calls this path caller-attested, not a decision to omit the
-// event). Confirms the fix did not accidentally add one.
-func TestPgStore_Outbox_VerifyDestination_DoesNotEnqueue(t *testing.T) {
+// TestPgStore_Outbox_VerifyDestination_KnownGap_NoVerifiedEvent records a
+// deviation, not a desirable behavior: §4.10's "Events produced" line names
+// PayeeDestinationVerified, but the outbox has no verified event yet. This
+// pass did not add one; see SPEC_DEVIATIONS A8.
+func TestPgStore_Outbox_VerifyDestination_KnownGap_NoVerifiedEvent(t *testing.T) {
 	f := newFixture(t)
 	verified := proposeAndVerify(t, f, f.tenant)
 	ctx := middleware.WithTenant(context.Background(), f.tenant)
@@ -130,7 +129,7 @@ func TestPgStore_Outbox_VerifyDestination_DoesNotEnqueue(t *testing.T) {
 	events := outboxEventsFor(t, ctx, f, f.tenant, verified.DestinationID)
 	for _, e := range events {
 		if e.eventType == "com.zoikosuite.banking.payee-destination.verified" {
-			t.Fatalf("VerifyDestination must not enqueue an event (it never did in the old dual-write), got %+v", events)
+			t.Fatalf("the known gap was closed unexpectedly; update SPEC_DEVIATIONS A8 and this test, got %+v", events)
 		}
 	}
 	// Only the earlier ProposeDestination event should be present.
@@ -144,7 +143,7 @@ func TestPgStore_Outbox_ApproveDestination_EnqueuesApprovedEvent(t *testing.T) {
 	verified := proposeAndVerify(t, f, f.tenant)
 	ctx := middleware.WithTenant(context.Background(), f.tenant)
 
-	approved, err := f.s.ApproveDestination(ctx, verified.DestinationID, "approver-1", "corr-approve-1")
+	approved, _, err := f.s.ApproveDestination(ctx, verified.DestinationID, "approver-1", "corr-approve-1", "key-approve-outbox-1")
 	if err != nil {
 		t.Fatalf("approve destination: %v", err)
 	}
@@ -165,36 +164,38 @@ func TestPgStore_Outbox_ApproveDestination_EnqueuesApprovedEvent(t *testing.T) {
 	}
 }
 
-// TestPgStore_Outbox_ActivateDestination_OnlyEnqueuesTheNewDestinationsEvent
-// proves two things: the newly-ACTIVE destination gets its activated event,
-// and the OLD destination ActivateDestination auto-supersedes does NOT get
-// an outbox event — the old dual-write only ever published the new
-// destination's "activated" event, never a "superseded" event for the one
-// it replaced (that fact was only ever recorded to the internal audit log,
-// recordEvent). This fix must not expand scope by starting to publish it.
-func TestPgStore_Outbox_ActivateDestination_OnlyEnqueuesTheNewDestinationsEvent(t *testing.T) {
+// TestPgStore_Outbox_ActivateDestination_EnqueuesBothSidesOfTheChange
+// proves the newly-ACTIVE destination gets its activated event and the OLD
+// destination ActivateDestination auto-supersedes gets a superseded event in
+// the same transaction. The spec's mandatory control is "Any
+// active-destination change emits an immediate high-risk event"; an
+// activation that replaces the active row is such a change. Before this
+// pass only the internal audit row existed for the old destination, so a
+// subscriber watching the outbox would see the new active version but never
+// the retirement of the previous one.
+func TestPgStore_Outbox_ActivateDestination_EnqueuesBothSidesOfTheChange(t *testing.T) {
 	f := newFixture(t)
 	ctx := middleware.WithTenant(context.Background(), f.tenant)
 	partyRef := "party-activate-" + uuid.New().String()
 
 	// First destination: propose -> verify -> approve -> activate.
-	first, err := f.s.ProposeDestination(ctx, f.tenant, domain.ProposeDestinationRequest{
+	first, _, err := f.s.ProposeDestination(ctx, f.tenant, domain.ProposeDestinationRequest{
 		LegalEntityID: f.entity, PartyRef: partyRef, FinancialInstitution: "Bank One",
 		AccountIdentifier: "GB29ONE160161331926819", CountryCode: "GB", Currency: "GBP",
 		PayeeName: "Payee One", SourceType: domain.SourceManualEntry,
-	}, "proposer-1", "corr-first-propose")
+	}, "proposer-1", "corr-first-propose", "key-first-propose")
 	if err != nil {
 		t.Fatalf("propose first: %v", err)
 	}
-	if _, err := f.s.VerifyDestination(ctx, first.DestinationID, domain.VerifyDestinationRequest{
+	if _, _, err := f.s.VerifyDestination(ctx, first.DestinationID, domain.VerifyDestinationRequest{
 		VerificationMethod: "INDEPENDENT_CALL", VerificationEvidenceRef: "ev-1",
-	}, "verifier-1"); err != nil {
+	}, "verifier-1", "key-first-verify"); err != nil {
 		t.Fatalf("verify first: %v", err)
 	}
-	if _, err := f.s.ApproveDestination(ctx, first.DestinationID, "approver-1", "corr-first-approve"); err != nil {
+	if _, _, err := f.s.ApproveDestination(ctx, first.DestinationID, "approver-1", "corr-first-approve", "key-first-approve"); err != nil {
 		t.Fatalf("approve first: %v", err)
 	}
-	firstActive, err := f.s.ActivateDestination(ctx, first.DestinationID, "activator-1", "corr-first-activate")
+	firstActive, _, err := f.s.ActivateDestination(ctx, first.DestinationID, "activator-1", "corr-first-activate", "key-first-activate")
 	if err != nil {
 		t.Fatalf("activate first: %v", err)
 	}
@@ -211,23 +212,23 @@ func TestPgStore_Outbox_ActivateDestination_OnlyEnqueuesTheNewDestinationsEvent(
 
 	// Second destination for the SAME party/scope: propose -> verify ->
 	// approve -> activate. This auto-supersedes the first.
-	second, err := f.s.ProposeDestination(ctx, f.tenant, domain.ProposeDestinationRequest{
+	second, _, err := f.s.ProposeDestination(ctx, f.tenant, domain.ProposeDestinationRequest{
 		LegalEntityID: f.entity, PartyRef: partyRef, FinancialInstitution: "Bank Two",
 		AccountIdentifier: "GB29TWO160161331926819", CountryCode: "GB", Currency: "GBP",
 		PayeeName: "Payee Two", SourceType: domain.SourceManualEntry,
-	}, "proposer-2", "corr-second-propose")
+	}, "proposer-2", "corr-second-propose", "key-second-propose")
 	if err != nil {
 		t.Fatalf("propose second: %v", err)
 	}
-	if _, err := f.s.VerifyDestination(ctx, second.DestinationID, domain.VerifyDestinationRequest{
+	if _, _, err := f.s.VerifyDestination(ctx, second.DestinationID, domain.VerifyDestinationRequest{
 		VerificationMethod: "INDEPENDENT_CALL", VerificationEvidenceRef: "ev-2",
-	}, "verifier-1"); err != nil {
+	}, "verifier-1", "key-second-verify"); err != nil {
 		t.Fatalf("verify second: %v", err)
 	}
-	if _, err := f.s.ApproveDestination(ctx, second.DestinationID, "approver-1", "corr-second-approve"); err != nil {
+	if _, _, err := f.s.ApproveDestination(ctx, second.DestinationID, "approver-1", "corr-second-approve", "key-second-approve"); err != nil {
 		t.Fatalf("approve second: %v", err)
 	}
-	secondActive, err := f.s.ActivateDestination(ctx, second.DestinationID, "activator-2", "corr-second-activate")
+	secondActive, _, err := f.s.ActivateDestination(ctx, second.DestinationID, "activator-2", "corr-second-activate", "key-second-activate")
 	if err != nil {
 		t.Fatalf("activate second: %v", err)
 	}
@@ -246,13 +247,24 @@ func TestPgStore_Outbox_ActivateDestination_OnlyEnqueuesTheNewDestinationsEvent(
 		t.Fatalf("expected the second destination's activated event, got %+v", secondEvents)
 	}
 
-	// The auto-superseded FIRST destination must have no outbox event for
-	// its supersession.
+	// The auto-superseded FIRST destination gets its own superseded event,
+	// with the safe projection, in the same transaction as the activation.
 	firstEventsAfterSupersede := outboxEventsFor(t, ctx, f, f.tenant, firstActive.DestinationID)
+	var sawFirstSuperseded bool
 	for _, e := range firstEventsAfterSupersede {
 		if e.eventType == "com.zoikosuite.banking.payee-destination.superseded" {
-			t.Fatalf("auto-superseded destination must not get its own outbox event (old dual-write never published it), got %+v", firstEventsAfterSupersede)
+			sawFirstSuperseded = true
 		}
+	}
+	if !sawFirstSuperseded {
+		t.Fatalf("expected the auto-superseded destination's superseded event, got %+v", firstEventsAfterSupersede)
+	}
+	payload := legacyEventTypeOf(t, ctx, f, f.tenant, firstActive.DestinationID, "com.zoikosuite.banking.payee-destination.superseded")
+	if !strings.Contains(payload, `"event_type":"PAYEE_DESTINATION_SUPERSEDED"`) {
+		t.Fatalf("legacy event_type missing or wrong in old destination payload: %s", payload)
+	}
+	if !strings.Contains(payload, `"status":"SUPERSEDED"`) {
+		t.Fatalf("old destination payload must carry its new SUPERSEDED status: %s", payload)
 	}
 }
 
@@ -260,17 +272,17 @@ func TestPgStore_Outbox_SuspendDestination_EnqueuesSuspendedEvent(t *testing.T) 
 	f := newFixture(t)
 	ctx := middleware.WithTenant(context.Background(), f.tenant)
 	verified := proposeAndVerify(t, f, f.tenant)
-	if _, err := f.s.ApproveDestination(ctx, verified.DestinationID, "approver-1", "corr-approve-suspend"); err != nil {
+	if _, _, err := f.s.ApproveDestination(ctx, verified.DestinationID, "approver-1", "corr-approve-suspend", "key-approve-suspend"); err != nil {
 		t.Fatalf("approve: %v", err)
 	}
-	active, err := f.s.ActivateDestination(ctx, verified.DestinationID, "activator-1", "corr-activate-suspend")
+	active, _, err := f.s.ActivateDestination(ctx, verified.DestinationID, "activator-1", "corr-activate-suspend", "key-activate-suspend")
 	if err != nil {
 		t.Fatalf("activate: %v", err)
 	}
 
-	suspended, err := f.s.SuspendDestination(ctx, active.DestinationID, domain.SuspendDestinationRequest{
+	suspended, _, err := f.s.SuspendDestination(ctx, active.DestinationID, domain.SuspendDestinationRequest{
 		Reason: "suspected fraud",
-	}, "suspender-1", "corr-suspend-1")
+	}, "suspender-1", "corr-suspend-1", "key-suspend-1")
 	if err != nil {
 		t.Fatalf("suspend: %v", err)
 	}
@@ -299,9 +311,9 @@ func TestPgStore_Outbox_SupersedeDestination_EnqueuesSupersededEvent(t *testing.
 	verified := proposeAndVerify(t, f, f.tenant)
 	ctx := middleware.WithTenant(context.Background(), f.tenant)
 
-	superseded, err := f.s.SupersedeDestination(ctx, verified.DestinationID, domain.SupersedeDestinationRequest{
+	superseded, _, err := f.s.SupersedeDestination(ctx, verified.DestinationID, domain.SupersedeDestinationRequest{
 		Reason: "replaced by corrected details",
-	}, "operator-1", "corr-supersede-1")
+	}, "operator-1", "corr-supersede-1", "key-supersede-1")
 	if err != nil {
 		t.Fatalf("supersede: %v", err)
 	}
@@ -333,37 +345,37 @@ func TestPgStore_Outbox_SupersedeDestination_EnqueuesSupersededEvent(t *testing.
 // that same proof, against the actual bytes written to eventing_outbox:
 // every lifecycle event uses domain.NewDestinationEventPayload's safe
 // projection, never the raw *domain.PayeeDestination (which carries the
-// full, unmasked AccountIdentifier) — across every one of the 5
-// event-producing paths, not just propose.
+// full, unmasked AccountIdentifier) — across every event-producing path,
+// not just propose.
 func TestPgStore_Outbox_NeverCarriesFullAccountIdentifier(t *testing.T) {
 	f := newFixture(t)
 	ctx := middleware.WithTenant(context.Background(), f.tenant)
 	const fullAccount = "GB29SECRET1234567890"
 	const institutionName = "Confidential Bank Of Testing"
 
-	d, err := f.s.ProposeDestination(ctx, f.tenant, domain.ProposeDestinationRequest{
+	d, _, err := f.s.ProposeDestination(ctx, f.tenant, domain.ProposeDestinationRequest{
 		LegalEntityID: f.entity, PartyRef: "party-" + uuid.New().String(), FinancialInstitution: institutionName,
 		AccountIdentifier: fullAccount, CountryCode: "GB", Currency: "GBP",
 		PayeeName: "Secret Payee Ltd", SourceType: domain.SourceManualEntry,
-	}, "proposer-1", "corr-secret-propose")
+	}, "proposer-1", "corr-secret-propose", "key-secret-propose")
 	if err != nil {
 		t.Fatalf("propose: %v", err)
 	}
-	if _, err := f.s.VerifyDestination(ctx, d.DestinationID, domain.VerifyDestinationRequest{
+	if _, _, err := f.s.VerifyDestination(ctx, d.DestinationID, domain.VerifyDestinationRequest{
 		VerificationMethod: "INDEPENDENT_CALL", VerificationEvidenceRef: "evidence-secret",
-	}, "verifier-1"); err != nil {
+	}, "verifier-1", "key-secret-verify"); err != nil {
 		t.Fatalf("verify: %v", err)
 	}
-	if _, err := f.s.ApproveDestination(ctx, d.DestinationID, "approver-1", "corr-secret-approve"); err != nil {
+	if _, _, err := f.s.ApproveDestination(ctx, d.DestinationID, "approver-1", "corr-secret-approve", "key-secret-approve"); err != nil {
 		t.Fatalf("approve: %v", err)
 	}
-	active, err := f.s.ActivateDestination(ctx, d.DestinationID, "activator-1", "corr-secret-activate")
+	active, _, err := f.s.ActivateDestination(ctx, d.DestinationID, "activator-1", "corr-secret-activate", "key-secret-activate")
 	if err != nil {
 		t.Fatalf("activate: %v", err)
 	}
-	if _, err := f.s.SuspendDestination(ctx, active.DestinationID, domain.SuspendDestinationRequest{
+	if _, _, err := f.s.SuspendDestination(ctx, active.DestinationID, domain.SuspendDestinationRequest{
 		Reason: "fraud review",
-	}, "suspender-1", "corr-secret-suspend"); err != nil {
+	}, "suspender-1", "corr-secret-suspend", "key-secret-suspend"); err != nil {
 		t.Fatalf("suspend: %v", err)
 	}
 

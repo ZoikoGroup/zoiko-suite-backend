@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -76,6 +77,28 @@ func (h *BNK02Handler) writeConnectionErr(w http.ResponseWriter, err error) {
 		h.logger.Error("bank connection operation failed", zap.Error(err))
 		writeError(w, http.StatusInternalServerError, "bank connection operation failed")
 	}
+}
+
+// requireNewCredentialExpiry rejects a missing or already-expired expiry on
+// every command that installs a token: "short-lived credentials preferred"
+// is only true if a caller cannot record a dead one as healthy.
+func (h *BNK02Handler) requireNewCredentialExpiry(w http.ResponseWriter, expiresAt time.Time) bool {
+	if expiresAt.IsZero() || !expiresAt.After(time.Now()) {
+		writeError(w, http.StatusBadRequest, "token_expires_at must be a future timestamp")
+		return false
+	}
+	return true
+}
+
+// requireUsableCredential guards the commands that return a connection to
+// ACTIVE on an existing token. An expired or absent lease is an explicit
+// degradation, never a silent activation.
+func (h *BNK02Handler) requireUsableCredential(w http.ResponseWriter, conn *domain.BankConnection) bool {
+	if conn.TokenLeaseRef == "" || conn.TokenExpiresAt == nil || !conn.TokenExpiresAt.After(time.Now()) {
+		writeError(w, http.StatusConflict, "bank connection authorization is expired; complete authorization again")
+		return false
+	}
+	return true
 }
 
 // enforceRegionPolicy is BNK-02's region/residency check: it must run
@@ -188,15 +211,29 @@ func (h *BNK02Handler) InitiateConnection(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if _, err := h.bankAccts.VerifyBankAccount(r.Context(), tenantID, req.BankAccountID, principalID, r.Header.Get("X-Correlation-ID")); err != nil {
+	account, err := h.bankAccts.VerifyBankAccount(r.Context(), tenantID, req.BankAccountID, principalID, r.Header.Get("X-Correlation-ID"))
+	if err != nil {
 		h.logger.Error("InitiateConnection: bank account verification failed", zap.Error(err))
 		writeError(w, http.StatusFailedDependency, "referenced bank_account_id could not be verified against treasury-svc")
+		return
+	}
+	// A connection may only bind an account owned by the legal entity the
+	// caller named. Without this, an operator authorized for entity A could
+	// attach entity B's account and consume it under A's consent.
+	if account.LegalEntityID == "" || account.LegalEntityID != req.LegalEntityID {
+		writeError(w, http.StatusUnprocessableEntity, "referenced bank_account_id does not belong to the requested legal entity")
+		return
+	}
+	currency := strings.ToUpper(strings.TrimSpace(account.CurrencyCode))
+	if currency == "" {
+		h.logger.Error("InitiateConnection: verified bank account has no currency", zap.String("bank_account_id", req.BankAccountID))
+		writeError(w, http.StatusFailedDependency, "verified bank account has no currency")
 		return
 	}
 
 	conn, created, err := h.bnk02Store.InitiateConnection(r.Context(), domain.InitiateConnectionParams{
 		TenantID: tenantID, LegalEntityID: req.LegalEntityID, BankAccountID: req.BankAccountID,
-		ProviderRef: req.ProviderRef, BankName: req.BankName, Region: req.Region,
+		ProviderRef: req.ProviderRef, BankName: req.BankName, Region: req.Region, Currency: currency,
 		RequestedScope: req.RequestedScope, CreatedByPrincipalID: principalID, CorrelationID: req.CorrelationID,
 		RequestCorrelationID: r.Header.Get("X-Correlation-ID"),
 	})
@@ -251,6 +288,9 @@ func (h *BNK02Handler) CompleteConnectionAuthorization(w http.ResponseWriter, r 
 		writeError(w, http.StatusBadRequest, "token_lease_ref is required")
 		return
 	}
+	if !h.requireNewCredentialExpiry(w, req.TokenExpiresAt) {
+		return
+	}
 	id := chi.URLParam(r, "id")
 	conn, ok := h.fetchConnectionForAuth(w, r, id)
 	if !ok {
@@ -258,6 +298,16 @@ func (h *BNK02Handler) CompleteConnectionAuthorization(w http.ResponseWriter, r 
 	}
 	if !domain.CanCompleteAuthorization(conn.Status) {
 		writeError(w, http.StatusConflict, "bank connection is not in a state that permits completing authorization")
+		return
+	}
+	// Authorizing a scope outside the connection's recorded consent set
+	// silently expands consent. InitiateConnection seeds consent_scope from
+	// the requested scopes; after an authorization the column holds the
+	// granted set. The service does not persist requested_scope separately,
+	// so this is deliberately conservative on a second reconsent cycle (see
+	// SPEC_DEVIATIONS.md B3).
+	if !domain.ScopeSubset(req.GrantedScope, conn.ConsentScope) {
+		writeError(w, http.StatusUnprocessableEntity, "granted_scope contains a scope that was not requested")
 		return
 	}
 	principalID, ok := h.requirePrincipal(w, r)
@@ -293,6 +343,9 @@ func (h *BNK02Handler) ActivateConnection(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusConflict, "bank connection is not AUTHORIZING and cannot be activated")
 		return
 	}
+	if !h.requireUsableCredential(w, conn) {
+		return
+	}
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
@@ -322,6 +375,13 @@ func (h *BNK02Handler) RefreshConnection(w http.ResponseWriter, r *http.Request)
 	var req refreshConnectionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.NewTokenLeaseRef == "" {
+		writeError(w, http.StatusBadRequest, "new_token_lease_ref is required")
+		return
+	}
+	if !h.requireNewCredentialExpiry(w, req.NewTokenExpiresAt) {
 		return
 	}
 	id := chi.URLParam(r, "id")
@@ -406,13 +466,10 @@ func (h *BNK02Handler) SuspendConnection(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	tenantID := middleware.GetTenantID(r.Context())
-	// Real vault call: a suspended connection's lease is revoked, not just
-	// locally flagged — see internal/clients/vault.go's own doc comment.
-	if err := h.vault.RevokeLease(r.Context(), tenantID, conn.TokenLeaseRef, principalID, r.Header.Get("X-Correlation-ID")); err != nil {
-		h.logger.Error("SuspendConnection: vault revoke failed", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "secret vault unavailable")
-		return
-	}
+	// Suspension is reversible: the spec's lifecycle allows SUSPENDED to
+	// recover through ReconnectProvider. Revoking the vault lease here left
+	// the recovered ACTIVE connection pointing at a dead credential. Only
+	// RevokeConnection (and rotation of the old lease) destroys credentials.
 	updated, err := h.bnk02Store.SuspendConnection(r.Context(), domain.SuspendConnectionParams{ConnectionID: id, TenantID: tenantID, Reason: req.Reason, ActorPrincipalID: principalID})
 	if err != nil {
 		h.writeConnectionErr(w, err)
@@ -469,6 +526,12 @@ func (h *BNK02Handler) ReconnectProvider(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusConflict, "bank connection is not in a state that permits reconnecting")
 		return
 	}
+	// DEGRADED/SUSPENDED recover on the existing provider session, so the
+	// lease must still be usable. RECONSENT_REQUIRED deliberately re-enters
+	// AUTHORIZING instead and gets a fresh credential there.
+	if conn.Status != domain.ConnStatusReconsentRequired && !h.requireUsableCredential(w, conn) {
+		return
+	}
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
@@ -499,6 +562,9 @@ func (h *BNK02Handler) RotateConnectionCredential(w http.ResponseWriter, r *http
 	}
 	if req.NewTokenLeaseRef == "" {
 		writeError(w, http.StatusBadRequest, "new_token_lease_ref is required")
+		return
+	}
+	if !h.requireNewCredentialExpiry(w, req.NewTokenExpiresAt) {
 		return
 	}
 	id := chi.URLParam(r, "id")

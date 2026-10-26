@@ -362,7 +362,7 @@ func (s *PgStore) logOnly(ctx context.Context, attemptID string, t providers.Tra
 
 // RejectUnsent is a definite refusal of an attempt nothing was ever sent for (the profile cannot carry it).
 func (s *PgStore) RejectUnsent(ctx context.Context, attemptID, reason, actor, correlationID string) (*domain.PaymentInitiationAttempt, error) {
-	a, err := s.MarkRejected(ctx, attemptID, reason, actor)
+	a, err := s.MarkRejected(ctx, attemptID, reason, actor, correlationID)
 	if errors.Is(err, domain.ErrInvalidTransition) {
 		return nil, providers.ErrInFlight
 	}

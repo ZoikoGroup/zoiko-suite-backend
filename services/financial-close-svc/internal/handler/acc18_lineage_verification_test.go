@@ -54,7 +54,7 @@ func TestVerifyTracePath_MissingFields_Returns400(t *testing.T) {
 func TestVerifyTracePath_EdgeExists_ReturnsVerifiedTrueAndPersists(t *testing.T) {
 	s := newStubStore()
 	s.lineageEdges = []domain.LineageEdge{
-		{FromType: "allocation_run", FromID: "run-1", ToType: "journal", ToID: "journal-1"},
+		{LegalEntityID: "le-1", FromType: "allocation_run", FromID: "run-1", ToType: "journal", ToID: "journal-1"},
 	}
 	r := newRouter(s, &stubAuthZ{}, &stubClients{})
 
@@ -70,6 +70,28 @@ func TestVerifyTracePath_EdgeExists_ReturnsVerifiedTrueAndPersists(t *testing.T)
 	}
 	if len(s.tracePathVerifications) != 1 {
 		t.Fatalf("expected the verification result to be persisted, got %d rows", len(s.tracePathVerifications))
+	}
+}
+
+// An edge recorded for another legal entity is not evidence for the entity
+// the caller is authorized on: verifying under le-1 must not confirm le-2's
+// path (and record that confirmation under le-1's name).
+func TestVerifyTracePath_EdgeInAnotherEntity_IsNotVerified(t *testing.T) {
+	s := newStubStore()
+	s.lineageEdges = []domain.LineageEdge{
+		{LegalEntityID: "le-2", FromType: "allocation_run", FromID: "run-1", ToType: "journal", ToID: "journal-1"},
+	}
+	r := newRouter(s, &stubAuthZ{}, &stubClients{})
+
+	req := domain.VerifyTracePathRequest{LegalEntityID: "le-1", FromType: "allocation_run", FromID: "run-1", ToID: "journal-1"}
+	rr := doReq(r, http.MethodPost, "/v1/lineage/verify-path", req, "auditor-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var result domain.TracePathVerification
+	_ = json.NewDecoder(rr.Body).Decode(&result)
+	if result.Verified {
+		t.Fatal("an edge recorded for le-2 verified a path under le-1")
 	}
 }
 

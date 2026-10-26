@@ -164,10 +164,7 @@ func TestPgStore_CreateReopenRequest_EnqueuesReopenRequestedEvent(t *testing.T) 
 	// CreateReopenRequest only accepts HARD_CLOSED/RECLOSED periods — get
 	// the fixture there first. No fact: this test is about the request
 	// event, not the close event (covered separately above).
-	_, err := testStore.ApplyPeriodTransition(ctx, f.fiscalPeriodID, []string{"OPEN"},
-		domain.PeriodUpdate{To: domain.PeriodHardClosed, PrincipalID: "closer-1", At: time.Now().UTC()},
-		"", "", "corr-setup-close", "closer-1")
-	require.NoError(t, err)
+	advancePeriod(t, ctx, f.fiscalPeriodID, domain.PeriodSoftClose, domain.PeriodCloseReview, domain.PeriodHardClosed)
 
 	req := &domain.ReopenRequest{
 		RequestID: uuid.New().String(), TenantID: f.tenantID, FiscalPeriodID: f.fiscalPeriodID,

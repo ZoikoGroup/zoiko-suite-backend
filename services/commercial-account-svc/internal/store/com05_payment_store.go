@@ -220,6 +220,18 @@ func (s *PgStore) GetPaymentAttempt(ctx context.Context, attemptID string) (*dom
 	return out, err
 }
 
+// GetPaymentAttemptAsSeller is the replay reader for CollectPayment and
+// RecordProviderOutcome, whose claim resource id is an attempt id.
+func (s *PgStore) GetPaymentAttemptAsSeller(ctx context.Context, attemptID string) (*domain.PaymentAttemptRef, error) {
+	var out *domain.PaymentAttemptRef
+	err := s.paymentSellerTx(ctx, func(tx pgx.Tx) error {
+		a, err := loadPaymentAttempt(ctx, tx, attemptID, false)
+		out = a
+		return err
+	})
+	return out, err
+}
+
 func (s *PgStore) GetPaymentAttempts(ctx context.Context, invoiceID string) ([]domain.PaymentAttemptRef, error) {
 	var out []domain.PaymentAttemptRef
 	err := s.paymentTx(ctx, func(tx pgx.Tx) error {

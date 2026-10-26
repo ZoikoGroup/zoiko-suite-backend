@@ -3,6 +3,7 @@
 package handler
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strings"
@@ -73,6 +74,17 @@ func RegisterPaymentRoutes(r chi.Router, h *PaymentHandler) {
 
 func (h *PaymentHandler) fail(w http.ResponseWriter, r *http.Request, err error) {
 	writeFailure(w, r, h.logger, err)
+}
+
+type paymentAttemptSellerReader interface {
+	GetPaymentAttemptAsSeller(ctx context.Context, attemptID string) (*domain.PaymentAttemptRef, error)
+}
+
+func (h *PaymentHandler) attemptForReplay(ctx context.Context, attemptID string) (*domain.PaymentAttemptRef, error) {
+	if reader, ok := h.store.(paymentAttemptSellerReader); ok {
+		return reader.GetPaymentAttemptAsSeller(ctx, attemptID)
+	}
+	return h.store.GetPaymentAttempt(ctx, attemptID)
 }
 
 func (h *PaymentHandler) principal(w http.ResponseWriter, r *http.Request) (string, bool) {
@@ -157,7 +169,7 @@ func (h *PaymentHandler) CollectPayment(w http.ResponseWriter, r *http.Request) 
 	if err != nil {
 		var replay *domain.IdempotentReplayError
 		if errors.As(err, &replay) {
-			if existing, gerr := h.store.GetPaymentAttempt(r.Context(), replay.ResourceID); gerr == nil {
+			if existing, gerr := h.attemptForReplay(r.Context(), replay.ResourceID); gerr == nil {
 				w.Header().Set("Idempotent-Replayed", "true")
 				writeJSON(w, http.StatusCreated, existing)
 				return
@@ -214,7 +226,7 @@ func (h *PaymentHandler) RecordProviderOutcome(w http.ResponseWriter, r *http.Re
 	a, err := h.store.RecordProviderOutcome(r.Context(), domainReq, cmd.claim)
 	if err != nil {
 		if HandleIdempotentReplay(w, r, err, func(resourceID string) (any, error) {
-			return h.store.GetPaymentAttempt(r.Context(), resourceID)
+			return h.attemptForReplay(r.Context(), resourceID)
 		}) {
 			return
 		}
