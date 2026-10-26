@@ -48,7 +48,7 @@ func scanGroup(row pgx.Row, g *kernel.ConsolGroup) error {
 }
 
 func loadMembers(ctx context.Context, t pgx.Tx, tenant, group string) ([]kernel.ConsolMember, error) {
-	rows, err := t.Query(ctx, `SELECT member_id::text, group_id::text, legal_entity_id::text, source_book_id::text, method, ownership_pct::text, effective_from::text, COALESCE(effective_to::text, '')
+	rows, err := t.Query(ctx, `SELECT member_id::text, group_id::text, legal_entity_id::text, source_book_id::text, method, ownership_pct::text, effective_from::text, COALESCE(effective_to::text, ''), investment_account, COALESCE(investor_entity_id::text, ''), equity_accounts
 		FROM consolidation_members WHERE tenant_id = $1::uuid AND group_id = $2::uuid ORDER BY legal_entity_id, effective_from`, tenant, group)
 	if err != nil {
 		return nil, err
@@ -57,9 +57,11 @@ func loadMembers(ctx context.Context, t pgx.Tx, tenant, group string) ([]kernel.
 	out := []kernel.ConsolMember{}
 	for rows.Next() {
 		var m kernel.ConsolMember
-		if err := rows.Scan(&m.MemberID, &m.GroupID, &m.LegalEntityID, &m.SourceBookID, &m.Method, &m.OwnershipPct, &m.EffectiveFrom, &m.EffectiveTo); err != nil {
+		var eq []byte
+		if err := rows.Scan(&m.MemberID, &m.GroupID, &m.LegalEntityID, &m.SourceBookID, &m.Method, &m.OwnershipPct, &m.EffectiveFrom, &m.EffectiveTo, &m.InvestmentAccount, &m.InvestorEntityID, &eq); err != nil {
 			return nil, err
 		}
+		_ = json.Unmarshal(eq, &m.EquityAccounts)
 		out = append(out, m)
 	}
 	return out, rows.Err()
@@ -124,9 +126,9 @@ func (r *KernelRepo) insertMember(ctx context.Context, tenant string, m *kernel.
 		if overlapping > 0 {
 			return kernel.ErrOverlap
 		}
-		if _, e := t.Exec(ctx, `INSERT INTO consolidation_members (member_id, tenant_id, group_id, legal_entity_id, source_book_id, method, ownership_pct, effective_from, created_by)
-			VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6, $7::numeric, $8::date, $9)`,
-			m.MemberID, tenant, m.GroupID, m.LegalEntityID, m.SourceBookID, m.Method, m.OwnershipPct, m.EffectiveFrom, actor); e != nil {
+		if _, e := t.Exec(ctx, `INSERT INTO consolidation_members (member_id, tenant_id, group_id, legal_entity_id, source_book_id, method, ownership_pct, effective_from, created_by, investment_account, investor_entity_id, equity_accounts)
+			VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6, $7::numeric, $8::date, $9, $10, NULLIF($11, '')::uuid, $12::jsonb)`,
+			m.MemberID, tenant, m.GroupID, m.LegalEntityID, m.SourceBookID, m.Method, m.OwnershipPct, m.EffectiveFrom, actor, m.InvestmentAccount, m.InvestorEntityID, equityJSON(m.EquityAccounts)); e != nil {
 			return e
 		}
 		return r.enqueue(ctx, t, tenant, out)
@@ -309,16 +311,16 @@ func (r *KernelRepo) ICPositions(ctx context.Context, tenant, entity, bookCode, 
 // ── runs ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
 
 const consolRunCols = `r.run_id::text, r.group_id::text, r.fiscal_period, r.as_of::text, r.status, r.mapping_version, COALESCE(r.prior_run_id::text, ''), r.population, r.blocking_count,
-	COALESCE(r.translation_journal_id::text, ''), COALESCE(tj.journal_number, ''), COALESCE(r.elimination_journal_id::text, ''), COALESCE(ej.journal_number, ''),
+	COALESCE(r.translation_journal_id::text, ''), COALESCE(tj.journal_number, ''), COALESCE(r.elimination_journal_id::text, ''), COALESCE(ej.journal_number, ''), COALESCE(r.adjustment_journal_id::text, ''), COALESCE(aj.journal_number, ''),
 	COALESCE(r.group_snapshot_id::text, ''), r.run_hash, r.created_by, r.created_at, COALESCE(r.certified_by, ''), r.certified_at, COALESCE(r.superseded_by, ''), r.superseded_at,
 	COALESCE(r.supersede_reason, '')`
 
-const consolRunFrom = ` FROM consolidation_runs r LEFT JOIN journal_headers tj ON tj.journal_id = r.translation_journal_id LEFT JOIN journal_headers ej ON ej.journal_id = r.elimination_journal_id`
+const consolRunFrom = ` FROM consolidation_runs r LEFT JOIN journal_headers tj ON tj.journal_id = r.translation_journal_id LEFT JOIN journal_headers ej ON ej.journal_id = r.elimination_journal_id LEFT JOIN journal_headers aj ON aj.journal_id = r.adjustment_journal_id`
 
 func scanConsolRun(row pgx.Row, v *kernel.ConsolRun) error {
 	var pop []byte
 	if err := row.Scan(&v.RunID, &v.GroupID, &v.FiscalPeriod, &v.AsOf, &v.Status, &v.MappingVersion, &v.PriorRunID, &pop, &v.BlockingCount, &v.TranslationJournalID, &v.TranslationNumber,
-		&v.EliminationJournalID, &v.EliminationNumber, &v.GroupSnapshotID, &v.RunHash, &v.CreatedBy, &v.CreatedAt, &v.CertifiedBy, &v.CertifiedAt, &v.SupersededBy, &v.SupersededAt,
+		&v.EliminationJournalID, &v.EliminationNumber, &v.AdjustmentJournalID, &v.AdjustmentNumber, &v.GroupSnapshotID, &v.RunHash, &v.CreatedBy, &v.CreatedAt, &v.CertifiedBy, &v.CertifiedAt, &v.SupersededBy, &v.SupersededAt,
 		&v.SupersedeReason); err != nil {
 		return err
 	}
@@ -462,11 +464,18 @@ func (r *KernelRepo) WriteConsolidation(ctx context.Context, p *kernel.ConsolPla
 		if ej != nil {
 			run.EliminationJournalID, run.EliminationNumber = ej.JournalID, ej.Number
 		}
+		aj, e := post(run.Population.AdjustmentPosted, domain.JournalTypeAdjustment, "GROUP_ADJUSTMENT", "KERNEL_GROUP_ADJ", "Group policy adjustments", "consol-adj:"+run.RunID)
+		if e != nil {
+			return e
+		}
+		if aj != nil {
+			run.AdjustmentJournalID, run.AdjustmentNumber = aj.JournalID, aj.Number
+		}
 		pop, _ := json.Marshal(run.Population)
 		if _, e := t.Exec(ctx, `INSERT INTO consolidation_runs (run_id, tenant_id, group_id, fiscal_period, as_of, status, mapping_version, prior_run_id, population, blocking_count,
-				translation_journal_id, elimination_journal_id, run_hash, created_by, created_at)
-			VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5::date, 'PROCESSED', $6, NULLIF($7, '')::uuid, $8::jsonb, $9, NULLIF($10, '')::uuid, NULLIF($11, '')::uuid, $12, $13, $14)`,
-			run.RunID, p.Tenant, p.Group.GroupID, run.FiscalPeriod, run.AsOf, run.MappingVersion, run.PriorRunID, string(pop), run.BlockingCount, run.TranslationJournalID, run.EliminationJournalID,
+				translation_journal_id, elimination_journal_id, adjustment_journal_id, run_hash, created_by, created_at)
+			VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5::date, 'PROCESSED', $6, NULLIF($7, '')::uuid, $8::jsonb, $9, NULLIF($10, '')::uuid, NULLIF($11, '')::uuid, NULLIF($12, '')::uuid, $13, $14, $15)`,
+			run.RunID, p.Tenant, p.Group.GroupID, run.FiscalPeriod, run.AsOf, run.MappingVersion, run.PriorRunID, string(pop), run.BlockingCount, run.TranslationJournalID, run.EliminationJournalID, run.AdjustmentJournalID,
 			run.RunHash, run.CreatedBy, run.CreatedAt); e != nil {
 			return e
 		}
@@ -512,9 +521,9 @@ func (r *KernelRepo) SupersedeRun(ctx context.Context, tenant, id, actor, reason
 		if e := consolLock(ctx, t, tenant, group.GroupID); e != nil {
 			return e
 		}
-		var status, period, trans, elim string
-		if e := t.QueryRow(ctx, `SELECT status, fiscal_period, COALESCE(translation_journal_id::text, ''), COALESCE(elimination_journal_id::text, '') FROM consolidation_runs
-			WHERE tenant_id = $1::uuid AND run_id = $2::uuid`, tenant, id).Scan(&status, &period, &trans, &elim); e != nil {
+		var status, period, trans, elim, adj string
+		if e := t.QueryRow(ctx, `SELECT status, fiscal_period, COALESCE(translation_journal_id::text, ''), COALESCE(elimination_journal_id::text, ''), COALESCE(adjustment_journal_id::text, '') FROM consolidation_runs
+			WHERE tenant_id = $1::uuid AND run_id = $2::uuid`, tenant, id).Scan(&status, &period, &trans, &elim, &adj); e != nil {
 			return e
 		}
 		if status == "SUPERSEDED" {
@@ -527,7 +536,7 @@ func (r *KernelRepo) SupersedeRun(ctx context.Context, tenant, id, actor, reason
 		if later > 0 {
 			return &kernel.Exception{Family: kernel.FamRule, Code: "SUPERSEDE_NOT_LATEST", Detail: "a later period has been consolidated on top of this run: supersede that one first"}
 		}
-		for n, jid := range []string{trans, elim} {
+		for n, jid := range []string{trans, elim, adj} {
 			if jid == "" {
 				continue
 			}
@@ -571,4 +580,12 @@ func (r *KernelRepo) SupersedeRun(ctx context.Context, tenant, id, actor, reason
 		return nil, kernelErr(err)
 	}
 	return r.GetConsolRun(ctx, tenant, id)
+}
+
+func equityJSON(a []string) string {
+	if len(a) == 0 {
+		return "[]"
+	}
+	b, _ := json.Marshal(a)
+	return string(b)
 }

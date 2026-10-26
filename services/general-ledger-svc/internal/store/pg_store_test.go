@@ -44,7 +44,7 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	base := filepath.Dir(filename)
 
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS
-		consolidation_runs, consolidation_mappings, consolidation_members, consolidation_groups,
+		allocation_runs, allocation_rules, consolidation_adjustments, consolidation_runs, consolidation_mappings, consolidation_members, consolidation_groups,
 		period_seal_events, period_seals, balance_snapshots, revaluation_runs, fx_rate_override_requests, fx_rates,
 		reconciliation_case_events, reconciliation_runs, reconciliation_tolerances,
 		recurring_journal_templates, event_posting_links, journal_number_counters,

@@ -32,6 +32,8 @@ var ICRoles = []string{RoleDueFrom, RoleDueTo, RoleICRevenue, RoleICExpense}
 const (
 	MapCTA          = "CTA"
 	MapICDifference = "IC_ELIM_DIFFERENCE"
+	MapGoodwill     = "GOODWILL"
+	MapNCIEquity    = "NCI_EQUITY"
 )
 
 // Default rate policies: balance-sheet accounts are translated at the closing rate, profit-and-loss accounts at the average rate.
@@ -84,6 +86,10 @@ type ConsolMember struct {
 	OwnershipPct  string `json:"ownership_pct"`
 	EffectiveFrom string `json:"effective_from"`
 	EffectiveTo   string `json:"effective_to,omitempty"`
+	// the capital consolidation of the member: the investor entity, the account that holds the investment, and the equity accounts of the member it is eliminated against
+	InvestmentAccount string   `json:"investment_account,omitempty"`
+	InvestorEntityID  string   `json:"investor_entity_id,omitempty"`
+	EquityAccounts    []string `json:"equity_accounts,omitempty"`
 }
 
 // ConsolMapping is one immutable version of the local-account to group-account map and the intercompany roles.
@@ -119,6 +125,10 @@ type ConsolInput struct {
 	ContentHash        string `json:"content_hash"`
 	LedgerWatermark    int64  `json:"ledger_watermark"`
 	Sealed             bool   `json:"sealed"`
+
+	InvestmentAccount string   `json:"investment_account,omitempty"`
+	InvestorEntityID  string   `json:"investor_entity_id,omitempty"`
+	EquityAccounts    []string `json:"equity_accounts,omitempty"`
 }
 
 // ConsolRate is a rate a run translated with.
@@ -184,23 +194,27 @@ type NCIItem struct {
 
 // ConsolPopulation is the immutable record of what a run consumed and produced.
 type ConsolPopulation struct {
-	PresentationCurrency string            `json:"presentation_currency"`
-	BalanceSheetPolicy   string            `json:"balance_sheet_policy"`
-	ProfitLossPolicy     string            `json:"profit_loss_policy"`
-	MappingVersion       int               `json:"mapping_version"`
-	Members              []ConsolInput     `json:"members"`
-	Rates                []ConsolRate      `json:"rates"`
-	Lines                []ConsolLine      `json:"lines"`
-	CTA                  map[string]string `json:"cta_by_entity"`
-	Translation          map[string]string `json:"translation"`  // group account -> cumulative translated net, CTA included
-	Elimination          map[string]string `json:"elimination"`  // group account -> cumulative elimination net
-	Consolidated         map[string]string `json:"consolidated"` // translation + elimination, zero accounts left out
-	Pairs                []ICPair          `json:"intercompany_pairs"`
-	NCI                  []NCIItem         `json:"non_controlling_interest"`
-	Exceptions           []ConsolException `json:"exceptions"`
-	TranslationPosted    map[string]string `json:"translation_posted"` // what this run posted: the change from the prior run
-	EliminationPosted    map[string]string `json:"elimination_posted"`
-	PriorRunID           string            `json:"prior_run_id,omitempty"`
+	PresentationCurrency string               `json:"presentation_currency"`
+	BalanceSheetPolicy   string               `json:"balance_sheet_policy"`
+	ProfitLossPolicy     string               `json:"profit_loss_policy"`
+	MappingVersion       int                  `json:"mapping_version"`
+	Members              []ConsolInput        `json:"members"`
+	Rates                []ConsolRate         `json:"rates"`
+	Lines                []ConsolLine         `json:"lines"`
+	CTA                  map[string]string    `json:"cta_by_entity"`
+	Translation          map[string]string    `json:"translation"`  // group account -> cumulative translated net, CTA included
+	Elimination          map[string]string    `json:"elimination"`  // group account -> cumulative elimination net
+	Consolidated         map[string]string    `json:"consolidated"` // translation + elimination, zero accounts left out
+	Pairs                []ICPair             `json:"intercompany_pairs"`
+	NCI                  []NCIItem            `json:"non_controlling_interest"`
+	Exceptions           []ConsolException    `json:"exceptions"`
+	TranslationPosted    map[string]string    `json:"translation_posted"` // what this run posted: the change from the prior run
+	EliminationPosted    map[string]string    `json:"elimination_posted"`
+	Adjustment           map[string]string    `json:"group_adjustment"`        // cumulative effect of the approved group adjustments
+	AdjustmentPosted     map[string]string    `json:"group_adjustment_posted"` // the change from the prior run
+	Adjustments          []AppliedAdjustment  `json:"group_adjustments"`
+	Capital              []CapitalElimination `json:"capital_eliminations"`
+	PriorRunID           string               `json:"prior_run_id,omitempty"`
 }
 
 // ConsolRun is a completed consolidation run.
@@ -218,6 +232,8 @@ type ConsolRun struct {
 	TranslationNumber    string           `json:"translation_journal_number,omitempty"`
 	EliminationJournalID string           `json:"elimination_journal_id,omitempty"`
 	EliminationNumber    string           `json:"elimination_journal_number,omitempty"`
+	AdjustmentJournalID  string           `json:"adjustment_journal_id,omitempty"`
+	AdjustmentNumber     string           `json:"adjustment_journal_number,omitempty"`
 	GroupSnapshotID      string           `json:"group_snapshot_id,omitempty"`
 	RunHash              string           `json:"run_hash"`
 	CreatedBy            string           `json:"created_by"`
@@ -257,6 +273,11 @@ type ConsolCompute struct {
 	CTAAccount   string
 	DiffAccount  string
 	Tolerance    *big.Rat
+
+	// GoodwillAccount and NCIAccount carry the capital consolidation; Adjustments are the approved group adjustments up to the period.
+	GoodwillAccount string
+	NCIAccount      string
+	Adjustments     []ConsolAdjustment
 }
 
 func rateKey(currency, class string) string { return currency + "|" + class }
@@ -386,6 +407,18 @@ func (c *ConsolCompute) Compute() (*ConsolPopulation, error) {
 	if err := c.eliminate(pop, members, memberSet, elimination); err != nil {
 		return nil, err
 	}
+	if err := c.capital(pop, members, memberSet, elimination); err != nil {
+		return nil, err
+	}
+	adjustment := map[string]*big.Rat{}
+	pop.Adjustments = []AppliedAdjustment{}
+	for _, adj := range c.Adjustments {
+		pop.Adjustments = append(pop.Adjustments, AppliedAdjustment{AdjustmentID: adj.AdjustmentID, FiscalPeriod: adj.FiscalPeriod, PolicyRef: adj.PolicyRef, EvidenceRef: adj.EvidenceRef})
+		for _, l := range adj.Lines {
+			addTo(adjustment, l.AccountCode, dec(l.Amount))
+		}
+	}
+	pop.Adjustment = nonZeroStrings(adjustment, c.Scale)
 
 	pop.Translation = nonZeroStrings(translation, c.Scale)
 	pop.Elimination = nonZeroStrings(elimination, c.Scale)
@@ -394,6 +427,9 @@ func (c *ConsolCompute) Compute() (*ConsolPopulation, error) {
 		addTo(cons, k, v)
 	}
 	for k, v := range elimination {
+		addTo(cons, k, v)
+	}
+	for k, v := range adjustment {
 		addTo(cons, k, v)
 	}
 	pop.Consolidated = nonZeroStrings(cons, c.Scale)
@@ -617,4 +653,128 @@ func (p *ConsolPopulation) Hash(group, period, asOf string) string {
 	}{group, period, asOf, p})
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
+}
+
+// AdjustmentLine is one line of a group adjustment: an account of the group chart and a signed amount, debit positive.
+type AdjustmentLine struct {
+	AccountCode string `json:"account_code"`
+	Amount      string `json:"amount"`
+	Description string `json:"description,omitempty"`
+}
+
+// ConsolAdjustment is a group policy adjustment: a balanced, evidenced journal that is part of the group figures, never of a member
+// ledger. Someone other than its author approves it; a run applies every approved one up to its period.
+type ConsolAdjustment struct {
+	AdjustmentID     string           `json:"adjustment_id"`
+	GroupID          string           `json:"group_id"`
+	FiscalPeriod     string           `json:"fiscal_period"`
+	Description      string           `json:"description"`
+	PolicyRef        string           `json:"policy_ref"`
+	EvidenceRef      string           `json:"evidence_ref"`
+	Lines            []AdjustmentLine `json:"lines"`
+	Status           string           `json:"status"`
+	CreatedBy        string           `json:"created_by"`
+	CreatedAt        time.Time        `json:"created_at"`
+	ApprovedBy       string           `json:"approved_by,omitempty"`
+	ApprovedAt       *time.Time       `json:"approved_at,omitempty"`
+	WithdrawnBy      string           `json:"withdrawn_by,omitempty"`
+	WithdrawnAt      *time.Time       `json:"withdrawn_at,omitempty"`
+	WithdrawalReason string           `json:"withdrawal_reason,omitempty"`
+}
+
+// AppliedAdjustment records which adjustment a run applied.
+type AppliedAdjustment struct {
+	AdjustmentID string `json:"adjustment_id"`
+	FiscalPeriod string `json:"fiscal_period"`
+	PolicyRef    string `json:"policy_ref"`
+	EvidenceRef  string `json:"evidence_ref"`
+}
+
+// CapitalElimination is the elimination of an investment against the equity it bought: the part held by the group, the part held by
+// others (non-controlling interest) and the difference, goodwill (or a gain on a bargain) when the cost differs from the share of equity.
+type CapitalElimination struct {
+	Subsidiary   string `json:"subsidiary"`
+	Investor     string `json:"investor"`
+	OwnershipPct string `json:"ownership_pct"`
+	Investment   string `json:"investment"`
+	Equity       string `json:"eliminated_equity"`
+	NCI          string `json:"non_controlling_interest"`
+	Goodwill     string `json:"goodwill"`
+}
+
+// capital eliminates each investment against the equity of the member it holds, journalling the non-controlling interest.
+func (c *ConsolCompute) capital(pop *ConsolPopulation, members []ConsolMemberData, memberSet map[string]ConsolInput, elimination map[string]*big.Rat) error {
+	idx := map[string]*big.Rat{}
+	for _, l := range pop.Lines {
+		addTo(idx, l.LegalEntityID+"|"+l.LocalAccount, dec(l.Translated))
+	}
+	var unmapped []map[string]any
+	for _, m := range members {
+		in := m.Input
+		if in.InvestmentAccount == "" {
+			continue
+		}
+		block := func(code, detail string) {
+			pop.Exceptions = append(pop.Exceptions, ConsolException{Code: code, Blocking: true, Entity: in.LegalEntityID, Detail: detail})
+		}
+		if _, ok := memberSet[in.InvestorEntityID]; !ok {
+			block("CAPITAL_INVESTOR_NOT_A_MEMBER", fmt.Sprintf("the investor %s is not a member of the group", in.InvestorEntityID))
+			continue
+		}
+		inv, held := idx[in.InvestorEntityID+"|"+in.InvestmentAccount]
+		if !held || inv.Sign() == 0 {
+			block("CAPITAL_INVESTMENT_MISSING", fmt.Sprintf("the investor holds nothing on account %s to eliminate", in.InvestmentAccount))
+			continue
+		}
+		invGA, ok := c.Mapping.AccountMap[in.InvestmentAccount]
+		if !ok {
+			unmapped = append(unmapped, map[string]any{"legal_entity_id": in.InvestorEntityID, "account_code": in.InvestmentAccount})
+			continue
+		}
+		part := map[string]*big.Rat{}
+		equity := new(big.Rat)
+		complete := true
+		for _, ea := range in.EquityAccounts {
+			net, has := idx[in.LegalEntityID+"|"+ea]
+			if !has || net.Sign() == 0 {
+				continue
+			}
+			ga, mapped := c.Mapping.AccountMap[ea]
+			if !mapped {
+				unmapped = append(unmapped, map[string]any{"legal_entity_id": in.LegalEntityID, "account_code": ea})
+				complete = false
+				continue
+			}
+			// the equity is a credit balance: eliminating it is a debit of the same size
+			amt := new(big.Rat).Neg(net)
+			addTo(part, ga, amt)
+			equity.Add(equity, amt)
+		}
+		if !complete {
+			continue
+		}
+		if equity.Sign() == 0 {
+			block("CAPITAL_EQUITY_MISSING", "the equity accounts named for the member hold nothing to eliminate against")
+			continue
+		}
+		pct := new(big.Rat).Quo(dec(in.OwnershipPct), big.NewRat(100, 1))
+		nci := c.translate(new(big.Rat).Mul(equity, new(big.Rat).Sub(big.NewRat(1, 1), pct)), "1")
+		goodwill := new(big.Rat).Sub(inv, new(big.Rat).Sub(equity, nci))
+		addTo(part, invGA, new(big.Rat).Neg(inv))
+		if nci.Sign() != 0 {
+			addTo(part, c.NCIAccount, new(big.Rat).Neg(nci))
+		}
+		if goodwill.Sign() != 0 {
+			addTo(part, c.GoodwillAccount, goodwill)
+		}
+		for k, v := range part {
+			addTo(elimination, k, v)
+		}
+		pop.Capital = append(pop.Capital, CapitalElimination{Subsidiary: in.LegalEntityID, Investor: in.InvestorEntityID, OwnershipPct: in.OwnershipPct, Investment: inv.FloatString(c.Scale),
+			Equity: equity.FloatString(c.Scale), NCI: nci.FloatString(c.Scale), Goodwill: goodwill.FloatString(c.Scale)})
+	}
+	if len(unmapped) > 0 {
+		return exc(FamCOA, "CONSOLIDATION_MAPPING_MISSING", "%d capital consolidation account(s) have no group account in mapping version %d", len(unmapped), c.Mapping.Version).with("accounts", unmapped)
+	}
+	return nil
 }

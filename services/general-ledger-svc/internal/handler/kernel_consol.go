@@ -291,3 +291,83 @@ func (h *KernelHandler) GetIntercompanyPairing(w http.ResponseWriter, r *http.Re
 	}
 	writeJSON(w, http.StatusOK, res)
 }
+
+// ProposeGroupAdjustment proposes a group policy adjustment: balanced, evidenced, inert until another person approves it.
+func (h *KernelHandler) ProposeGroupAdjustment(w http.ResponseWriter, r *http.Request) {
+	var req kernel.AdjustmentRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	tenant, a, ok := h.guard(w, r, actionConsolManage)
+	if !ok {
+		return
+	}
+	svc, ok := h.consol(w, tenant)
+	if !ok {
+		return
+	}
+	req.GroupID = chi.URLParam(r, "id")
+	adj, err := svc.CreateAdjustment(r.Context(), tenant, a, req)
+	if err != nil {
+		h.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, adj)
+}
+
+func (h *KernelHandler) ListGroupAdjustments(w http.ResponseWriter, r *http.Request) {
+	tenant, _, ok := h.guard(w, r, actionConsolRead)
+	if !ok {
+		return
+	}
+	svc, ok := h.consol(w, tenant)
+	if !ok {
+		return
+	}
+	list, err := svc.Repo.ListAdjustments(r.Context(), tenant, chi.URLParam(r, "id"), r.URL.Query().Get("fiscal_period"))
+	if err != nil {
+		h.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"adjustments": list, "total": len(list)})
+}
+
+func (h *KernelHandler) ApproveGroupAdjustment(w http.ResponseWriter, r *http.Request) {
+	tenant, a, ok := h.guard(w, r, actionConsolCertify)
+	if !ok {
+		return
+	}
+	svc, ok := h.consol(w, tenant)
+	if !ok {
+		return
+	}
+	adj, err := svc.ApproveAdjustment(r.Context(), tenant, a, chi.URLParam(r, "id"))
+	if err != nil {
+		h.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, adj)
+}
+
+func (h *KernelHandler) WithdrawGroupAdjustment(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Reason string `json:"reason"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	tenant, a, ok := h.guard(w, r, actionConsolManage)
+	if !ok {
+		return
+	}
+	svc, ok := h.consol(w, tenant)
+	if !ok {
+		return
+	}
+	adj, err := svc.WithdrawAdjustment(r.Context(), tenant, a, chi.URLParam(r, "id"), req.Reason)
+	if err != nil {
+		h.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, adj)
+}
