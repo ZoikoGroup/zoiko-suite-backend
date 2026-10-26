@@ -362,6 +362,8 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{account_code}/activate", h.ActivateAccount)
 		r.Post("/{account_code}/deactivate", h.DeactivateAccount)
 		r.Post("/{account_code}/reparent", h.ReparentAccount)
+		r.Post("/{account_code}/scoped-versions", h.CreateAccountScopeVersion)
+		r.Get("/{account_code}/scoped-versions", h.ListAccountScopeVersions)
 	})
 	r.Route("/v1/account-mappings", func(r chi.Router) {
 		r.Post("/", h.SetAccountMapping)
@@ -594,7 +596,23 @@ func (h *Handler) checkAccountRestrictions(w http.ResponseWriter, r *http.Reques
 			writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
 			return false
 		}
-		if acct.Status != "ACTIVE" {
+		status := acct.Status
+		bookRef := ""
+		if req.BookID != nil {
+			bookRef = *req.BookID
+		}
+		on := req.PostingDate.Time
+		if on.IsZero() {
+			on = time.Now().UTC()
+		}
+		if st, overridden, serr := h.scopedAccountStatus(r.Context(), req.TenantID, l.AccountCode, req.LegalEntityID, bookRef, on); serr != nil {
+			h.log.Error("checkAccountRestrictions: scoped account status unavailable", zap.Error(serr))
+			writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+			return false
+		} else if overridden {
+			status = st
+		}
+		if status != "ACTIVE" {
 			writeError(w, http.StatusUnprocessableEntity, "account_inactive",
 				domain.ErrAccountInactive.Error()+": "+l.AccountCode)
 			return false
@@ -1043,6 +1061,13 @@ func (h *Handler) ResolvePostingEligibility(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	if req.LegalEntityID != "" {
+		if st, overridden, serr := h.scopedAccountStatus(r.Context(), tenantID, accountCode, req.LegalEntityID, q.Get("book_id"), time.Now().UTC()); serr == nil && overridden {
+			scoped := *acct
+			scoped.Status = st
+			acct = &scoped
+		}
+	}
 	eligibility := domain.EvaluatePostingEligibility(accountCode, acct, req.OverrideControlAccountRestriction)
 	if eligibility.RequiresOverride && req.OverrideControlAccountRestriction {
 		scope := req.LegalEntityID
@@ -1113,6 +1138,22 @@ func (h *Handler) GetAccountAsOf(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if entity := q.Get("legal_entity_id"); entity != "" {
+		if st, ok := h.scopedAccounts(); ok {
+			scoped, err := st.GetScopedAccountAsOf(r.Context(), tenantID, accountCode, entity, q.Get("book_id"), asOf.Time)
+			if errors.Is(err, domain.ErrAccountNotFound) {
+				writeError(w, http.StatusNotFound, "account_not_found", "")
+				return
+			}
+			if err != nil {
+				h.log.Error("GetAccountAsOf: store unavailable", zap.Error(err))
+				writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+				return
+			}
+			writeJSON(w, http.StatusOK, scoped)
+			return
+		}
+	}
 	version, err := h.store.GetAccountAsOf(r.Context(), tenantID, accountCode, asOf.Time)
 	if errors.Is(err, domain.ErrAccountNotFound) {
 		writeError(w, http.StatusNotFound, "account_not_found", "")
@@ -2945,6 +2986,18 @@ func (h *Handler) CreateReversalPosting(w http.ResponseWriter, r *http.Request) 
 		PostedByPrincipalID:     &principalID,
 		CorrelationID:           correlationID,
 		SoftCloseOverrideReason: &req.SoftCloseOverrideReason,
+
+		// A reversal inherits the ACC-03 inputs of the journal it neutralizes (same book, currency and document); only its type and
+		// its posting date differ. Without them the journal header is incomplete and the ledger refuses it.
+		JournalType:      domain.JournalTypeReversal,
+		TransactionDate:  header.TransactionDate,
+		PostingDate:      h.reversalPostingDate(header),
+		CurrencyCode:     header.CurrencyCode,
+		BookID:           header.BookID,
+		ReportingBasis:   header.ReportingBasis,
+		EvidenceRefs:     header.EvidenceRefs,
+		AccountingBookID: header.AccountingBookID,
+		ReversalReason:   optionalString(req.Reason),
 	}
 	_, originalLines, err := h.store.GetJournal(r.Context(), req.OriginalJournalID)
 	if err != nil {
@@ -2954,7 +3007,9 @@ func (h *Handler) CreateReversalPosting(w http.ResponseWriter, r *http.Request) 
 	}
 	reversingLines := make([]domain.JournalLine, len(originalLines))
 	for i, l := range originalLines {
-		reversingLines[i] = domain.JournalLine{AccountCode: l.AccountCode, DebitAmount: l.CreditAmount, CreditAmount: l.DebitAmount, Description: l.Description}
+		reversingLines[i] = domain.JournalLine{AccountCode: l.AccountCode, DebitAmount: l.CreditAmount, CreditAmount: l.DebitAmount, Description: l.Description,
+			TaxCode: l.TaxCode, TaxLogicSnapshotID: l.TaxLogicSnapshotID, Dimensions: l.Dimensions,
+			TransactionAmount: l.TransactionAmount, TransactionCcy: l.TransactionCcy, ExchangeRate: l.ExchangeRate, RateRef: l.RateRef, PostingRuleLineRef: l.PostingRuleLineRef, CounterpartyID: l.CounterpartyID}
 	}
 
 	_, _, err = h.store.ReverseJournal(r.Context(), header.TenantID, req.OriginalJournalID, reversingHeader, reversingLines, principalID)

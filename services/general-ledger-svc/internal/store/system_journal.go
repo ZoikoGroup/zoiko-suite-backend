@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -27,6 +28,7 @@ type SysLine struct {
 	Counterparty  string
 	Description   string
 	RuleLineRef   string
+	Dimensions    map[string]string
 }
 
 // SysJournal is a posted journal the kernel originates. It is written exactly like an event posting: header, lines, ledger entries,
@@ -92,9 +94,9 @@ func (r *KernelRepo) postSystemJournal(ctx context.Context, t pgx.Tx, j *SysJour
 	for i, l := range j.Lines {
 		if _, e := t.Exec(ctx, `
 			INSERT INTO journal_lines (journal_line_id, journal_id, tenant_id, line_number, account_code, debit_amount, credit_amount, description, transaction_amount, transaction_currency,
-				exchange_rate, rate_ref, posting_rule_line_ref, counterparty_id)
-			VALUES ($1, $2, $3, $4, $5, $6::numeric, $7::numeric, $8, $9::numeric, NULLIF($10, ''), $11::numeric, NULLIF($12, ''), NULLIF($13, ''), NULLIF($14, ''))`,
-			uuid.NewString(), out.JournalID, j.Tenant, i+1, l.Account, l.Debit, l.Credit, l.Description, nilIfEmpty(l.TxAmount), l.TxCurrency, nilIfEmpty(l.ExchangeRate), l.RateRef, l.RuleLineRef, l.Counterparty); e != nil {
+				exchange_rate, rate_ref, posting_rule_line_ref, counterparty_id, dimensions)
+			VALUES ($1, $2, $3, $4, $5, $6::numeric, $7::numeric, $8, $9::numeric, NULLIF($10, ''), $11::numeric, NULLIF($12, ''), NULLIF($13, ''), NULLIF($14, ''), $15::jsonb)`,
+			uuid.NewString(), out.JournalID, j.Tenant, i+1, l.Account, l.Debit, l.Credit, l.Description, nilIfEmpty(l.TxAmount), l.TxCurrency, nilIfEmpty(l.ExchangeRate), l.RateRef, l.RuleLineRef, l.Counterparty, dimsJSON(l.Dimensions)); e != nil {
 			return nil, mapPgError(e)
 		}
 	}
@@ -139,4 +141,12 @@ func (r *KernelRepo) postSystemJournal(ctx context.Context, t pgx.Tx, j *SysJour
 		}
 	}
 	return out, nil
+}
+
+func dimsJSON(d map[string]string) any {
+	if len(d) == 0 {
+		return nil
+	}
+	b, _ := json.Marshal(d)
+	return string(b)
 }

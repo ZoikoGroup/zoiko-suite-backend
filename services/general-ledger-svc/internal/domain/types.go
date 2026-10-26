@@ -103,6 +103,7 @@ const (
 
 	// JournalTypeConsolidation and JournalTypeElimination are the journals the kernel posts into a group book when it consolidates:
 	// the translated member balances and the intercompany eliminations. Like revaluation, only the kernel originates them.
+	JournalTypeAllocation    JournalType = "ALLOCATION"
 	JournalTypeConsolidation JournalType = "CONSOLIDATION"
 	JournalTypeElimination   JournalType = "ELIMINATION"
 

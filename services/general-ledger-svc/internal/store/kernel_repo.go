@@ -124,21 +124,21 @@ func dateOrNil(t *time.Time) any {
 // ── books ──────────────────────────────────────────────────────────────────────
 
 const bookCols = `book_id::text, tenant_id::text, legal_entity_id::text, book_code, book_type, accounting_framework_id, functional_currency, fiscal_calendar_id,
-	chart_of_accounts_id, default_ledger_id, effective_from, effective_to, status, created_by, version, created_at, updated_at`
+	chart_of_accounts_id, default_ledger_id, effective_from, effective_to, status, created_by, version, created_at, updated_at, jurisdiction`
 
 func scanBook(row pgx.Row, b *kernel.Book) error {
 	return row.Scan(&b.BookID, &b.TenantID, &b.LegalEntityID, &b.BookCode, &b.BookType, &b.AccountingFrameworkID, &b.FunctionalCurrency, &b.FiscalCalendarID,
-		&b.ChartOfAccountsID, &b.DefaultLedgerID, &b.EffectiveFrom, &b.EffectiveTo, &b.Status, &b.CreatedBy, &b.Version, &b.CreatedAt, &b.UpdatedAt)
+		&b.ChartOfAccountsID, &b.DefaultLedgerID, &b.EffectiveFrom, &b.EffectiveTo, &b.Status, &b.CreatedBy, &b.Version, &b.CreatedAt, &b.UpdatedAt, &b.Jurisdiction)
 }
 
 // InsertBook implements kernel.Repo.
 func (r *KernelRepo) InsertBook(ctx context.Context, b *kernel.Book, out kernel.OutEvent) error {
 	return kernelErr(r.tx(ctx, b.TenantID, func(t pgx.Tx) error {
 		if _, err := t.Exec(ctx, `INSERT INTO accounting_books (book_id, tenant_id, legal_entity_id, book_code, book_type, accounting_framework_id, functional_currency, fiscal_calendar_id,
-			chart_of_accounts_id, default_ledger_id, effective_from, effective_to, status, created_by, version, created_at, updated_at)
-			VALUES ($1::uuid,$2::uuid,$3::uuid,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`, b.BookID, b.TenantID, b.LegalEntityID, b.BookCode, b.BookType,
+			chart_of_accounts_id, default_ledger_id, effective_from, effective_to, status, created_by, version, created_at, updated_at, jurisdiction)
+			VALUES ($1::uuid,$2::uuid,$3::uuid,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`, b.BookID, b.TenantID, b.LegalEntityID, b.BookCode, b.BookType,
 			b.AccountingFrameworkID, b.FunctionalCurrency, b.FiscalCalendarID, b.ChartOfAccountsID, b.DefaultLedgerID, b.EffectiveFrom, dateOrNil(b.EffectiveTo), b.Status,
-			b.CreatedBy, b.Version, b.CreatedAt, b.UpdatedAt); err != nil {
+			b.CreatedBy, b.Version, b.CreatedAt, b.UpdatedAt, b.Jurisdiction); err != nil {
 			return err
 		}
 		return r.enqueue(ctx, t, b.TenantID, out)
@@ -344,13 +344,13 @@ func (r *KernelRepo) ListEvents(ctx context.Context, tenant string, f kernel.Eve
 
 const ruleCols = `posting_rule_set_id::text, tenant_id::text, name, domain, event_type, book_type, accounting_framework_id, version, status, effective_from, effective_to,
 	content, content_hash, test_pack, test_pack_id, COALESCE(tests_passed_hash, ''), source_authority_refs, created_by, COALESCE(approved_by, ''), approved_at,
-	COALESCE(activated_by, ''), activated_at, row_version, created_at, updated_at`
+	COALESCE(activated_by, ''), activated_at, row_version, created_at, updated_at, jurisdiction`
 
 func scanRule(row pgx.Row, x *kernel.RuleSet) error {
 	var content, pack, auth []byte
 	if err := row.Scan(&x.RuleSetID, &x.TenantID, &x.Name, &x.Domain, &x.EventType, &x.BookType, &x.FrameworkID, &x.Version, &x.Status, &x.EffectiveFrom, &x.EffectiveTo,
 		&content, &x.ContentHash, &pack, &x.TestPackID, &x.TestsPassedHash, &auth, &x.CreatedBy, &x.ApprovedBy, &x.ApprovedAt, &x.ActivatedBy, &x.ActivatedAt,
-		&x.RowVersion, &x.CreatedAt, &x.UpdatedAt); err != nil {
+		&x.RowVersion, &x.CreatedAt, &x.UpdatedAt, &x.Jurisdiction); err != nil {
 		return err
 	}
 	if err := json.Unmarshal(content, &x.Content); err != nil {
@@ -377,10 +377,10 @@ func (r *KernelRepo) InsertRuleSet(ctx context.Context, x *kernel.RuleSet, ev ke
 	pack, _ := json.Marshal(x.TestPack)
 	return kernelErr(r.tx(ctx, x.TenantID, func(t pgx.Tx) error {
 		if _, err := t.Exec(ctx, `INSERT INTO posting_rule_sets (posting_rule_set_id, tenant_id, name, domain, event_type, book_type, accounting_framework_id, version, status,
-			effective_from, effective_to, content, content_hash, test_pack, test_pack_id, source_authority_refs, created_by, row_version, created_at, updated_at)
-			VALUES ($1::uuid,$2::uuid,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`, x.RuleSetID, x.TenantID, x.Name, x.Domain, x.EventType, x.BookType,
+			effective_from, effective_to, content, content_hash, test_pack, test_pack_id, source_authority_refs, created_by, row_version, created_at, updated_at, jurisdiction)
+			VALUES ($1::uuid,$2::uuid,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)`, x.RuleSetID, x.TenantID, x.Name, x.Domain, x.EventType, x.BookType,
 			x.FrameworkID, x.Version, x.Status, x.EffectiveFrom, dateOrNil(x.EffectiveTo), content, x.ContentHash, pack, x.TestPackID, jsonOrNil(x.SourceAuthority),
-			x.CreatedBy, x.RowVersion, x.CreatedAt, x.UpdatedAt); err != nil {
+			x.CreatedBy, x.RowVersion, x.CreatedAt, x.UpdatedAt, x.Jurisdiction); err != nil {
 			return err
 		}
 		if err := insertRuleEvent(ctx, t, x.TenantID, x.RuleSetID, ev); err != nil {
@@ -490,13 +490,13 @@ func (r *KernelRepo) ActivateRuleSet(ctx context.Context, tenant, id string, exp
 			return kernel.ErrState
 		}
 		// the scope lock the database trigger also takes: concurrent activations of one scope are serialized here first
-		if _, err := t.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, tenant+"|"+cur.EventType+"|"+cur.BookType+"|"+cur.FrameworkID); err != nil {
+		if _, err := t.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, tenant+"|"+cur.EventType+"|"+cur.BookType+"|"+cur.FrameworkID+"|"+cur.Jurisdiction); err != nil {
 			return err
 		}
 		// an active version that started before this one is closed where this one starts
 		rows, err := t.Query(ctx, `SELECT `+ruleCols+` FROM posting_rule_sets WHERE tenant_id=$1::uuid AND event_type=$2 AND book_type=$3 AND accounting_framework_id=$4
-			AND status='ACTIVE' AND posting_rule_set_id<>$5::uuid AND effective_from < $6 AND (effective_to IS NULL OR effective_to > $6) FOR UPDATE`,
-			tenant, cur.EventType, cur.BookType, cur.FrameworkID, id, cur.EffectiveFrom)
+			AND jurisdiction=$7 AND status='ACTIVE' AND posting_rule_set_id<>$5::uuid AND effective_from < $6 AND (effective_to IS NULL OR effective_to > $6) FOR UPDATE`,
+			tenant, cur.EventType, cur.BookType, cur.FrameworkID, id, cur.EffectiveFrom, cur.Jurisdiction)
 		if err != nil {
 			return err
 		}
@@ -548,11 +548,11 @@ func (r *KernelRepo) ActivateRuleSet(ctx context.Context, tenant, id string, exp
 }
 
 // ActiveRuleSets implements kernel.Repo.
-func (r *KernelRepo) ActiveRuleSets(ctx context.Context, tenant, eventType, bookType, framework string, on time.Time) ([]kernel.RuleSet, error) {
+func (r *KernelRepo) ActiveRuleSets(ctx context.Context, tenant, eventType, bookType, framework, jurisdiction string, on time.Time) ([]kernel.RuleSet, error) {
 	out := []kernel.RuleSet{}
 	err := r.tx(ctx, tenant, func(t pgx.Tx) error {
 		rows, err := t.Query(ctx, `SELECT `+ruleCols+` FROM posting_rule_sets WHERE tenant_id=$1::uuid AND event_type=$2 AND book_type=$3 AND accounting_framework_id=$4
-			AND status='ACTIVE' AND effective_from <= $5 AND (effective_to IS NULL OR effective_to > $5) ORDER BY effective_from DESC`, tenant, eventType, bookType, framework, on)
+			AND jurisdiction IN ('', $6) AND status='ACTIVE' AND effective_from <= $5 AND (effective_to IS NULL OR effective_to > $5) ORDER BY effective_from DESC`, tenant, eventType, bookType, framework, on, jurisdiction)
 		if err != nil {
 			return err
 		}

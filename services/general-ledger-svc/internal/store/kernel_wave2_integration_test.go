@@ -533,7 +533,7 @@ func TestOnlyOneApproverCanAcceptACase(t *testing.T) {
 
 func TestRulePackInstantiationIsGovernedAndRepeatable(t *testing.T) {
 	e := newKEnv(t)
-	if st, b := e.call("GET", "/v1/posting-rule-packs", e.tenant, "builder", nil); st != 200 || len(b["packs"].([]any)) != 8 {
+	if st, b := e.call("GET", "/v1/posting-rule-packs", e.tenant, "builder", nil); st != 200 || len(b["packs"].([]any)) != 10 {
 		t.Fatalf("%d %v", st, b)
 	}
 	body := map[string]any{"version": "1.0.0", "effective_from": "2026-01-01", "book_type": "PRIMARY_STATUTORY", "accounting_framework_id": "IFRS"}

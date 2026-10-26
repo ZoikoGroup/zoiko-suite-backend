@@ -262,3 +262,26 @@ The deliberate design decisions a reviewer may want to reverse are B1–B12.
   `command_idempotency` row counts read directly, cross-command conflict, and a
   stale-version refusal that does not consume the key so the corrected retry
   runs).
+
+- **B13. A1 is answered with entity- and book-scoped account versions, not a re-keyed chart.** The chart stays tenant-wide for what an
+  account *is*: its code, type and control nature mean the same thing in every entity of a tenant, and every journal line, ledger entry,
+  mapping and join keeps pointing at that one row. Re-keying the identity itself would change every one of those references and
+  every service that sends an `account_code`, for no behaviour a scoped version does not already give. What can legitimately differ by
+  entity or book is now versioned per scope (migration 000026, `account_scope_versions`, append-only, one open version per scope):
+  - *What a scoped version sets.* The account name, its parent in the hierarchy and whether it is open for use (ACTIVE or INACTIVE).
+    A field left unset inherits from the less specific version. The most specific version in force on a date wins, field by field:
+    book, then entity, then the tenant version. Each scope numbers its own versions; a newer one closes the one before it, and an
+    earlier date than the open one is refused (`effective_date_invalid`).
+  - *API.* `POST` and `GET /v1/chart-of-accounts/{code}/scoped-versions` (action `COA_ACCOUNT_AMEND` / `COA_ACCOUNT_VIEW`, checked on
+    the legal entity named). `GET .../as-of` and `.../posting-eligibility` take `legal_entity_id` (and `book_id`) and answer for that
+    scope, saying for each of name, parent and status whether it came from the BOOK, the ENTITY or the TENANT. Without them the answer is
+    the tenant version, exactly as before.
+  - *Where the scoped status is enforced.* The kernel posting engine (an account closed for a book is refused for that book, dated from
+    the version's effective date, so history is unchanged) and the legacy journal path (`account_inactive`). A closed account in one
+    entity stays open in another.
+  - *Scoped hierarchy.* A scoped parent is checked against the hierarchy as that scope sees it, so a loop is refused
+    (`hierarchy_cycle`); another entity can hold the opposite arrangement. It is for reading and reporting: whether an account may be
+    posted to (a header account has children) is still decided by the tenant hierarchy.
+  - *Still tenant-level.* Account type, control type, direct-posting restriction and book applicability (`PUT /v1/account-applicability`).
+    A1's consequence "two entities cannot hold different versions of the same account code" no longer holds for the facts above; it
+    still does for the type.

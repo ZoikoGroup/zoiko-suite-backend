@@ -1,0 +1,11 @@
+DROP TRIGGER IF EXISTS allocation_runs_guard_trg ON allocation_runs;
+DROP FUNCTION IF EXISTS allocation_runs_guard();
+DROP TABLE IF EXISTS allocation_runs;
+DROP TRIGGER IF EXISTS allocation_rules_guard_trg ON allocation_rules;
+DROP FUNCTION IF EXISTS allocation_rules_guard();
+DROP TABLE IF EXISTS allocation_rules;
+DROP TRIGGER IF EXISTS posting_rule_sets_jurisdiction_trg ON posting_rule_sets;
+DROP TRIGGER IF EXISTS accounting_books_jurisdiction_trg ON accounting_books;
+DROP FUNCTION IF EXISTS kernel_jurisdiction_fixed();
+ALTER TABLE posting_rule_sets DROP CONSTRAINT IF EXISTS posting_rule_sets_jurisdiction, DROP COLUMN IF EXISTS jurisdiction;
+ALTER TABLE accounting_books DROP CONSTRAINT IF EXISTS accounting_books_jurisdiction, DROP COLUMN IF EXISTS jurisdiction;

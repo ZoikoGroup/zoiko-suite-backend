@@ -52,6 +52,10 @@ var packAccounts = map[string]string{
 	"DISPOSAL_GAIN": "7500", "DISPOSAL_LOSS": "7510", "INVENTORY": "1400", "GRNI": "2070", "COGS": "5000", "INVENTORY_VARIANCE": "5100",
 	"TAX_PAYABLE": "2210", "INCOME_TAX_EXPENSE": "8000", "DEFERRED_TAX": "2220", "TAX_ADJUSTMENT": "8100", "WITHHOLDING_RECEIVABLE": "1310",
 	"PREPAID_ASSET": "1200", "ACCRUED_LIABILITY": "2400", "DEFERRED_REVENUE": "2500",
+	"GRNI_EXPENSE_RECLASS": "5200", "INVENTORY_WRITE_DOWN_EXPENSE": "5300", "LANDED_COST_OFFSET": "2080",
+	"PAYROLL_GROSS_EXPENSE": "6150", "PAYROLL_EMPLOYER_TAX_EXPENSE": "6151", "PAYROLL_EMPLOYER_SOCIAL_EXPENSE": "6152", "PAYROLL_EMPLOYER_PENSION_EXPENSE": "6154", "PAYROLL_EMPLOYER_BENEFIT_EXPENSE": "6153", "PAYROLL_EMPLOYER_OTHER_EXPENSE": "6155",
+	"PAYROLL_NET_PAY_PAYABLE": "2350", "PAYROLL_EMPLOYEE_DEDUCTION_PAYABLE": "2351", "PAYROLL_EMPLOYEE_TAX_PAYABLE": "2352", "PAYROLL_EMPLOYEE_SOCIAL_PAYABLE": "2353", "PAYROLL_EMPLOYEE_PENSION_PAYABLE": "2354", "PAYROLL_EMPLOYEE_BENEFIT_PAYABLE": "2355",
+	"PAYROLL_EMPLOYER_TAX_PAYABLE": "2361", "PAYROLL_EMPLOYER_SOCIAL_PAYABLE": "2362", "PAYROLL_EMPLOYER_BENEFIT_PAYABLE": "2363", "PAYROLL_EMPLOYER_PENSION_PAYABLE": "2364", "PAYROLL_EMPLOYER_OTHER_PAYABLE": "2365",
 }
 
 var packControls = map[string]string{"1100": "AR", "2000": "AP", "1000": "BANK", "2150": "CLEARING", "1050": "CLEARING", "2050": "CLEARING",
@@ -98,7 +102,9 @@ func withRealizedFX(c RuleContent) RuleContent {
 type f = map[string]string
 
 // Packs returns the standard rule packs: the core AR, AP and bank packs and the subledger packs of the later waves.
-func Packs() []RulePack { return append(corePacks(), subledgerPacks()...) }
+func Packs() []RulePack {
+	return append(append(append(corePacks(), subledgerPacks()...), payrollResultPacks()...), inventoryValuationPacks()...)
+}
 
 func corePacks() []RulePack {
 	taxFacts := []string{"gross", "net", "tax"}

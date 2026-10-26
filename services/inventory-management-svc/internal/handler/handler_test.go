@@ -1386,6 +1386,10 @@ type stubLedger struct {
 	reverseErr    error
 	reverseCalls  int
 	lastLines     []clients.LedgerLine
+
+	kernel       bool
+	kernelErr    error
+	kernelEvents []clients.KernelEvent
 }
 
 func (l *stubLedger) PostInventoryAccountingEvent(_ context.Context, _, _, _, _, _, sourceEventID, _ string, lines []clients.LedgerLine) (string, error) {

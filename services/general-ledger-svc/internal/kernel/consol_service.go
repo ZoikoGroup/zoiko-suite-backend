@@ -2,6 +2,7 @@ package kernel
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
@@ -38,6 +39,15 @@ type ConsolRepo interface {
 	InsertMapping(ctx context.Context, tenant string, m *ConsolMapping, out OutEvent) (*ConsolMapping, error)
 	ActiveMapping(ctx context.Context, tenant, groupID string) (*ConsolMapping, error)
 	ListMappings(ctx context.Context, tenant, groupID string) ([]ConsolMapping, error)
+
+	InsertAdjustment(ctx context.Context, tenant string, a *ConsolAdjustment, out OutEvent) error
+	GetAdjustment(ctx context.Context, tenant, id string) (*ConsolAdjustment, error)
+	GetAdjustmentBySourceRef(ctx context.Context, tenant, ref string) (*ConsolAdjustment, error)
+	ListAdjustments(ctx context.Context, tenant, groupID, period string) ([]ConsolAdjustment, error)
+	// ApprovedAdjustments lists the approved adjustments of the group up to and including the period.
+	ApprovedAdjustments(ctx context.Context, tenant, groupID, upToPeriod string) ([]ConsolAdjustment, error)
+	ApproveAdjustment(ctx context.Context, tenant, id, actor string, at time.Time, out OutEvent) error
+	WithdrawAdjustment(ctx context.Context, tenant, id, actor, reason string, at time.Time, out OutEvent) error
 
 	AccountTypes(ctx context.Context, tenant string) (map[string]string, error)
 	// ICPositions reads the intercompany positions of a book, to a ledger watermark when given.
@@ -144,6 +154,10 @@ type MemberRequest struct {
 	OwnershipPct  string `json:"ownership_pct"`
 	Method        string `json:"method,omitempty"`
 	EffectiveFrom string `json:"effective_from"`
+	// capital consolidation, optional and all together: the investor entity, the account holding the investment, the equity accounts of this member
+	InvestmentAccount string   `json:"investment_account,omitempty"`
+	InvestorEntityID  string   `json:"investor_entity_id,omitempty"`
+	EquityAccounts    []string `json:"equity_accounts,omitempty"`
 }
 
 // AddMember adds a member. The group's reporting entity cannot be a member: its own periods must stay open for the group book.
@@ -185,7 +199,19 @@ func (s *ConsolService) AddMember(ctx context.Context, tenant string, a Actor, g
 	case bk.Status != BookActive:
 		return nil, exc(FamRule, "MEMBER_INVALID", "book %s is %s", bk.BookCode, strings.ToLower(bk.Status))
 	}
-	m := &ConsolMember{MemberID: uuid.NewString(), GroupID: g.GroupID, LegalEntityID: req.LegalEntityID, SourceBookID: bk.BookID, Method: method, OwnershipPct: pct.FloatString(4), EffectiveFrom: from.Format("2006-01-02")}
+	capital := req.InvestmentAccount != "" || req.InvestorEntityID != "" || len(req.EquityAccounts) > 0
+	if capital {
+		if _, perr := uuid.Parse(req.InvestorEntityID); perr != nil || req.InvestmentAccount == "" || len(req.EquityAccounts) == 0 || req.InvestorEntityID == req.LegalEntityID {
+			return nil, consolBad("investor_entity_id", "the capital consolidation needs another entity as investor, the investment account and the equity accounts together")
+		}
+		for _, ea := range req.EquityAccounts {
+			if strings.TrimSpace(ea) == "" {
+				return nil, consolBad("equity_accounts", "non-empty account codes")
+			}
+		}
+	}
+	m := &ConsolMember{MemberID: uuid.NewString(), GroupID: g.GroupID, LegalEntityID: req.LegalEntityID, SourceBookID: bk.BookID, Method: method, OwnershipPct: pct.FloatString(4), EffectiveFrom: from.Format("2006-01-02"),
+		InvestmentAccount: req.InvestmentAccount, InvestorEntityID: req.InvestorEntityID, EquityAccounts: req.EquityAccounts}
 	if err := s.Repo.InsertMember(ctx, tenant, m, a.PrincipalID, OutEvent{Fact: "consolidation-member.added", AggregateType: "consolidation-group", AggregateID: g.GroupID, Actor: a.PrincipalID,
 		CorrelationID: a.CorrelationID, LegalEntityID: g.ParentEntityID, Data: map[string]any{"group_id": g.GroupID, "member_id": m.MemberID, "legal_entity_id": m.LegalEntityID, "ownership_pct": m.OwnershipPct, "effective_from": m.EffectiveFrom}}); err != nil {
 		return nil, err
@@ -411,6 +437,10 @@ func (s *ConsolService) Run(ctx context.Context, tenant string, a Actor, req Con
 		}
 		return nil, err
 	}
+	adjustments, err := s.Repo.ApprovedAdjustments(ctx, tenant, g.GroupID, req.FiscalPeriod)
+	if err != nil {
+		return nil, err
+	}
 	members, memberExc := activeMembers(g.Members, pstart, asOf)
 	if len(members) == 0 {
 		return nil, exc(FamRule, "NO_MEMBERS", "no member of the group is in force on %s", asOf.Format("2006-01-02"))
@@ -535,7 +565,7 @@ func (s *ConsolService) Run(ctx context.Context, tenant string, a Actor, req Con
 		}
 		data = append(data, ConsolMemberData{
 			Input: ConsolInput{LegalEntityID: l.m.LegalEntityID, BookID: l.book.BookID, BookCode: l.book.BookCode, FunctionalCurrency: l.book.FunctionalCurrency, OwnershipPct: l.m.OwnershipPct,
-				SnapshotID: snap.SnapshotID, ContentHash: snap.ContentHash, LedgerWatermark: snap.LedgerWatermark, Sealed: sealed},
+				SnapshotID: snap.SnapshotID, ContentHash: snap.ContentHash, LedgerWatermark: snap.LedgerWatermark, Sealed: sealed, InvestmentAccount: l.m.InvestmentAccount, InvestorEntityID: l.m.InvestorEntityID, EquityAccounts: l.m.EquityAccounts},
 			Lines: snap.Lines, Positions: pos})
 	}
 
@@ -543,7 +573,24 @@ func (s *ConsolService) Run(ctx context.Context, tenant string, a Actor, req Con
 	if tol == nil {
 		tol = new(big.Rat)
 	}
-	cc := &ConsolCompute{Group: *g, Mapping: *mapping, AccountTypes: types, Scale: scale, Members: data, Rates: rates, CTAAccount: ctaAcct, DiffAccount: diffAcct, Tolerance: tol}
+	cc := &ConsolCompute{Group: *g, Mapping: *mapping, AccountTypes: types, Scale: scale, Members: data, Rates: rates, CTAAccount: ctaAcct, DiffAccount: diffAcct, Tolerance: tol, Adjustments: adjustments}
+	for _, d := range data {
+		if d.Input.InvestmentAccount == "" {
+			continue
+		}
+		for _, key := range []string{MapGoodwill, MapNCIEquity} {
+			info, aerr := s.Dir.ResolveAccount(ctx, AccountRef{MappingKey: key}, gbook.BookID, asOf)
+			if aerr != nil || info == nil || !info.Active || !info.Postable {
+				return nil, exc(FamCOA, "CONSOLIDATION_ACCOUNT_UNAVAILABLE", "the mapping %s does not resolve to a postable account on %s: the capital consolidation needs it", key, asOf.Format("2006-01-02")).with("mapping_key", key)
+			}
+			if key == MapGoodwill {
+				cc.GoodwillAccount = info.Code
+			} else {
+				cc.NCIAccount = info.Code
+			}
+		}
+		break
+	}
 	pop, err := cc.Compute()
 	if err != nil {
 		return nil, err
@@ -556,15 +603,16 @@ func (s *ConsolService) Run(ctx context.Context, tenant string, a Actor, req Con
 				Detail: fmt.Sprintf("the member's period %s was not sealed when its population was frozen", req.FiscalPeriod)})
 		}
 	}
-	var priorTrans, priorElim map[string]string
+	var priorTrans, priorElim, priorAdj map[string]string
 	if prior != nil {
 		pop.PriorRunID = prior.RunID
-		priorTrans, priorElim = prior.Population.Translation, prior.Population.Elimination
+		priorTrans, priorElim, priorAdj = prior.Population.Translation, prior.Population.Elimination, prior.Population.Adjustment
 	}
 	pop.TranslationPosted = PostedDelta(pop.Translation, priorTrans, scale)
 	pop.EliminationPosted = PostedDelta(pop.Elimination, priorElim, scale)
+	pop.AdjustmentPosted = PostedDelta(pop.Adjustment, priorAdj, scale)
 
-	if s.Gate != nil && (len(pop.TranslationPosted) > 0 || len(pop.EliminationPosted) > 0) {
+	if s.Gate != nil && (len(pop.TranslationPosted) > 0 || len(pop.EliminationPosted) > 0 || len(pop.AdjustmentPosted) > 0) {
 		if err := s.Gate.CheckPostable(ctx, tenant, g.ParentEntityID, req.FiscalPeriod, asOf, false, "", a.PrincipalID); err != nil {
 			return nil, err
 		}
@@ -749,10 +797,148 @@ func (s *ConsolService) Supersede(ctx context.Context, tenant string, a Actor, r
 		return nil, err
 	}
 	asOf, _ := time.Parse("2006-01-02", run.AsOf)
-	if s.Gate != nil && (run.TranslationJournalID != "" || run.EliminationJournalID != "") {
+	if s.Gate != nil && (run.TranslationJournalID != "" || run.EliminationJournalID != "" || run.AdjustmentJournalID != "") {
 		if err := s.Gate.CheckPostable(ctx, tenant, g.ParentEntityID, run.FiscalPeriod, asOf, false, "", a.PrincipalID); err != nil {
 			return nil, err
 		}
 	}
 	return s.Repo.SupersedeRun(ctx, tenant, run.RunID, a.PrincipalID, strings.TrimSpace(reason), s.now(), asOf, *g, *gbook)
+}
+
+// AdjustmentRequest proposes a group policy adjustment.
+type AdjustmentRequest struct {
+	GroupID      string `json:"group_id"`
+	FiscalPeriod string `json:"fiscal_period"`
+	Description  string `json:"description"`
+	PolicyRef    string `json:"policy_ref"`
+	EvidenceRef  string `json:"evidence_ref"`
+	// SourceRef names the record in the submitting service this adjustment comes from: the same reference again is the same adjustment
+	SourceRef string           `json:"source_ref,omitempty"`
+	Lines     []AdjustmentLine `json:"lines"`
+}
+
+// CreateAdjustment proposes an adjustment. It must name the policy it applies and its evidence, move at least two accounts of the group
+// chart and balance exactly; it changes nothing until someone else approves it and a run applies it.
+func (s *ConsolService) CreateAdjustment(ctx context.Context, tenant string, a Actor, req AdjustmentRequest) (*ConsolAdjustment, error) {
+	g, gbook, err := s.loadGroup(ctx, tenant, req.GroupID)
+	if err != nil {
+		return nil, err
+	}
+	if _, _, ok := periodBounds(req.FiscalPeriod); !ok {
+		return nil, consolBad("fiscal_period", "a period, YYYY-MM")
+	}
+	for f, v := range map[string]string{"description": req.Description, "policy_ref": req.PolicyRef, "evidence_ref": req.EvidenceRef} {
+		if strings.TrimSpace(v) == "" {
+			return nil, consolBad(f, "required")
+		}
+	}
+	if len(req.Lines) < 2 {
+		return nil, consolBad("lines", "at least two lines")
+	}
+	sum := new(big.Rat)
+	norm := make([]AdjustmentLine, 0, len(req.Lines))
+	_, pend, _ := periodBounds(req.FiscalPeriod)
+	for _, l := range req.Lines {
+		amt, ok := new(big.Rat).SetString(l.Amount)
+		if !ok || amt.Sign() == 0 {
+			return nil, consolBad("lines", fmt.Sprintf("account %s needs a non-zero decimal amount", l.AccountCode))
+		}
+		info, aerr := s.Dir.ResolveAccount(ctx, AccountRef{AccountCode: l.AccountCode}, gbook.BookID, pend)
+		if aerr != nil || info == nil || !info.Active || !info.Postable {
+			return nil, exc(FamCOA, "GROUP_ACCOUNT_UNAVAILABLE", "group account %s is not an active, postable account of the chart", l.AccountCode).with("account_code", l.AccountCode)
+		}
+		sum.Add(sum, amt)
+		norm = append(norm, AdjustmentLine{AccountCode: l.AccountCode, Amount: amt.FloatString(2), Description: l.Description})
+	}
+	if sum.Sign() != 0 {
+		return nil, exc(FamBal, "ADJUSTMENT_UNBALANCED", "the lines of the adjustment add up to %s, not zero", sum.FloatString(2))
+	}
+	adj := &ConsolAdjustment{AdjustmentID: uuid.NewString(), GroupID: g.GroupID, FiscalPeriod: req.FiscalPeriod, Description: strings.TrimSpace(req.Description), PolicyRef: strings.TrimSpace(req.PolicyRef), SourceRef: strings.TrimSpace(req.SourceRef),
+		EvidenceRef: strings.TrimSpace(req.EvidenceRef), Lines: norm, Status: "PROPOSED", CreatedBy: a.PrincipalID, CreatedAt: s.now()}
+	if adj.SourceRef != "" {
+		if prior, perr := s.Repo.GetAdjustmentBySourceRef(ctx, tenant, adj.SourceRef); perr == nil {
+			return sameAdjustment(prior, adj)
+		} else if !errors.Is(perr, ErrNotFound) {
+			return nil, perr
+		}
+	}
+	if err := s.Repo.InsertAdjustment(ctx, tenant, adj, OutEvent{Fact: "consolidation-adjustment.proposed", AggregateType: "consolidation-adjustment", AggregateID: adj.AdjustmentID, Actor: a.PrincipalID,
+		CorrelationID: a.CorrelationID, LegalEntityID: g.ParentEntityID, Data: map[string]any{"adjustment_id": adj.AdjustmentID, "group_id": g.GroupID, "fiscal_period": adj.FiscalPeriod, "policy_ref": adj.PolicyRef, "source_ref": adj.SourceRef}}); err != nil {
+		if errors.Is(err, ErrExists) && adj.SourceRef != "" {
+			if prior, perr := s.Repo.GetAdjustmentBySourceRef(ctx, tenant, adj.SourceRef); perr == nil {
+				return sameAdjustment(prior, adj)
+			}
+		}
+		return nil, err
+	}
+	return adj, nil
+}
+
+// ApproveAdjustment approves a proposed adjustment; someone other than its author must.
+func (s *ConsolService) ApproveAdjustment(ctx context.Context, tenant string, a Actor, id string) (*ConsolAdjustment, error) {
+	adj, err := s.Repo.GetAdjustment(ctx, tenant, id)
+	if err != nil {
+		return nil, err
+	}
+	if adj.Status != "PROPOSED" {
+		return nil, ErrState
+	}
+	if adj.CreatedBy == a.PrincipalID {
+		return nil, ErrSelfApproval
+	}
+	g, err := s.Repo.GetGroup(ctx, tenant, adj.GroupID)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.Repo.ApproveAdjustment(ctx, tenant, id, a.PrincipalID, s.now(), OutEvent{Fact: "consolidation-adjustment.approved", AggregateType: "consolidation-adjustment", AggregateID: id, Actor: a.PrincipalID,
+		CorrelationID: a.CorrelationID, LegalEntityID: g.ParentEntityID, Data: map[string]any{"adjustment_id": id, "group_id": adj.GroupID, "fiscal_period": adj.FiscalPeriod}}); err != nil {
+		return nil, err
+	}
+	return s.Repo.GetAdjustment(ctx, tenant, id)
+}
+
+// WithdrawAdjustment withdraws a proposed or approved adjustment. One a live run has applied cannot be withdrawn: that run is superseded first.
+func (s *ConsolService) WithdrawAdjustment(ctx context.Context, tenant string, a Actor, id, reason string) (*ConsolAdjustment, error) {
+	if strings.TrimSpace(reason) == "" {
+		return nil, consolBad("reason", "required")
+	}
+	adj, err := s.Repo.GetAdjustment(ctx, tenant, id)
+	if err != nil {
+		return nil, err
+	}
+	if adj.Status == "WITHDRAWN" {
+		return nil, ErrState
+	}
+	live, err := s.Repo.LiveRuns(ctx, tenant, adj.GroupID)
+	if err != nil {
+		return nil, err
+	}
+	for _, r := range live {
+		for _, ap := range r.Population.Adjustments {
+			if ap.AdjustmentID == id {
+				return nil, exc(FamRule, "ADJUSTMENT_APPLIED", "the adjustment is in the group figures of the run for %s: supersede that run first", r.FiscalPeriod)
+			}
+		}
+	}
+	g, err := s.Repo.GetGroup(ctx, tenant, adj.GroupID)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.Repo.WithdrawAdjustment(ctx, tenant, id, a.PrincipalID, strings.TrimSpace(reason), s.now(), OutEvent{Fact: "consolidation-adjustment.withdrawn", AggregateType: "consolidation-adjustment", AggregateID: id,
+		Actor: a.PrincipalID, CorrelationID: a.CorrelationID, LegalEntityID: g.ParentEntityID, Data: map[string]any{"adjustment_id": id, "group_id": adj.GroupID, "reason": strings.TrimSpace(reason)}}); err != nil {
+		return nil, err
+	}
+	return s.Repo.GetAdjustment(ctx, tenant, id)
+}
+
+// sameAdjustment answers a repeated submission: the adjustment that already exists for the source reference when it says the same thing,
+// and a conflict when the same reference now comes with other content.
+func sameAdjustment(prior, now *ConsolAdjustment) (*ConsolAdjustment, error) {
+	a, _ := json.Marshal([]any{prior.GroupID, prior.FiscalPeriod, prior.Lines})
+	b, _ := json.Marshal([]any{now.GroupID, now.FiscalPeriod, now.Lines})
+	if string(a) != string(b) {
+		return nil, ErrIdempotency
+	}
+	prior.Existing = true
+	return prior, nil
 }
