@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"time"
 
@@ -479,7 +480,7 @@ func (s *PgStore) GetValuationRun(ctx context.Context, runID string) (*domain.Va
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		row := tx.QueryRow(ctx, `
 			SELECT run_id, legal_entity_id, fiscal_period, inventory_account_code, cogs_account_code, status, journal_id,
-				created_at, created_by_principal_id, approved_at, approved_by_principal_id, emitted_at
+				created_at, created_by_principal_id, approved_at, approved_by_principal_id, emitted_at, ledger_journal_ids
 			FROM inventory_valuation_runs WHERE run_id = $1 AND tenant_id = $2
 		`, runID, tenantID)
 		var err error
@@ -516,12 +517,14 @@ func (s *PgStore) GetValuationRun(ctx context.Context, runID string) (*domain.Va
 
 func scanValuationRun(row pgx.Row) (*domain.ValuationRun, error) {
 	var r domain.ValuationRun
+	var ids []byte
 	if err := row.Scan(
 		&r.RunID, &r.LegalEntityID, &r.FiscalPeriod, &r.InventoryAccountCode, &r.COGSAccountCode, &r.Status, &r.JournalID,
-		&r.CreatedAt, &r.CreatedByPrincipalID, &r.ApprovedAt, &r.ApprovedByPrincipalID, &r.EmittedAt,
+		&r.CreatedAt, &r.CreatedByPrincipalID, &r.ApprovedAt, &r.ApprovedByPrincipalID, &r.EmittedAt, &ids,
 	); err != nil {
 		return nil, err
 	}
+	_ = json.Unmarshal(ids, &r.LedgerJournalIDs)
 	return &r, nil
 }
 

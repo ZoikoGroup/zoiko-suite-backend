@@ -88,3 +88,54 @@ func TestPgStore_GetRunInboundValue_SplitsLinkedAndUnlinked(t *testing.T) {
 		t.Fatalf("expected linked=30 unlinked=20, got %+v", got)
 	}
 }
+
+func TestPgStore_ValuationRun_KernelPosting_SplitsInboundByStockAndRecordsEveryJournal(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool)
+
+	tenantID := uuid.New().String()
+	legalEntityID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+	itemID := newValuedTestItem(t, s, ctx, tenantID, legalEntityID, "SKU-KERNEL-1", domain.ValuationMethodFIFO)
+	locID := newActiveTestLocation(t, s, ctx, tenantID, legalEntityID, "WH-KERNEL-1")
+	linked := createCommittedReceipt(t, s, ctx, legalEntityID, itemID, locID, "idem-kernel-1a", 10)
+	unlinked := createCommittedReceipt(t, s, ctx, legalEntityID, itemID, locID, "idem-kernel-1b", 5)
+	now := time.Now().UTC()
+	if err := s.LinkMovementReceipt(ctx, linked.MovementID, "rcpt-200", "preparer-1", now); err != nil {
+		t.Fatal(err)
+	}
+	costA, costB := 3.0, 4.0
+	if _, _, err := s.ValueMovement(ctx, linked.MovementID, "preparer-1", &costA, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.ValueMovement(ctx, unlinked.MovementID, "preparer-1", &costB, now); err != nil {
+		t.Fatal(err)
+	}
+	run := &domain.ValuationRun{RunID: uuid.New().String(), LegalEntityID: legalEntityID, FiscalPeriod: linked.FiscalPeriod, InventoryAccountCode: "INV-ASSET", COGSAccountCode: "COGS",
+		CreatedAt: now, CreatedByPrincipalID: "preparer-1"}
+	if _, err := s.CreateValuationRun(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+
+	lines, err := s.RunInboundByStock(ctx, run.RunID)
+	if err != nil || len(lines) != 1 || lines[0].ItemID != itemID || lines[0].LocationID != locID || lines[0].ReceiptLinked != 30 {
+		t.Fatalf("only the receipt-linked value, by item and location: %+v %v", lines, err)
+	}
+	other := svcmiddleware.WithTenant(context.Background(), uuid.New().String())
+	if got, err := s.RunInboundByStock(other, run.RunID); err != nil || len(got) != 0 {
+		t.Fatalf("another tenant sees nothing: %+v %v", got, err)
+	}
+	if err := s.MarkValuationRunEmittedToKernel(ctx, run.RunID, "approver-1", nil, now); err == nil {
+		t.Fatal("a kernel posting with no journal is not a posting")
+	}
+	if err := s.MarkValuationRunEmittedToKernel(ctx, run.RunID, "approver-1", []string{"j-1", "j-2"}, now); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetValuationRun(ctx, run.RunID)
+	if err != nil || got.Status != domain.ValuationRunStatusAccountingEventEmitted || got.JournalID == nil || *got.JournalID != "j-1" || len(got.LedgerJournalIDs) != 2 {
+		t.Fatalf("%+v %v", got, err)
+	}
+	if err := s.MarkValuationRunEmittedToKernel(ctx, run.RunID, "approver-1", []string{"j-3"}, now); err == nil {
+		t.Fatal("a run is emitted once")
+	}
+}

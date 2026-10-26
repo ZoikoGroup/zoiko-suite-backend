@@ -415,6 +415,12 @@ type CreateInventoryMovementRequest struct {
 
 // RunInboundValue splits a valuation run's INBOUND value by whether the
 // movement is linked to an AP-03 receipt.
+// RunInboundLine is the receipt-linked inbound value of one item at one location in a run.
+type RunInboundLine struct {
+	ItemID, LocationID string
+	ReceiptLinked      float64
+}
+
 type RunInboundValue struct {
 	ReceiptLinked float64
 	Unlinked      float64
@@ -494,6 +500,7 @@ var (
 	ErrAPReceiptOnlyForReceipt   = errorString("ap_receipt_id is only valid on a RECEIPT movement")
 
 	ErrPeriodCheckUnavailable = errorString("financial-close-svc unavailable")
+	ErrLedgerUnavailable      = errorString("general-ledger-svc unavailable")
 	ErrPeriodLocked           = errorString("cannot commit a movement into a LOCKED fiscal period")
 )
 
@@ -569,6 +576,8 @@ type ValuationRun struct {
 	COGSAccountCode       string     `json:"cogs_account_code"`
 	Status                string     `json:"status"`
 	JournalID             *string    `json:"journal_id,omitempty"`
+	// LedgerJournalIDs lists every journal the run posted when it went through the kernel (per location and item type); JournalID is the first.
+	LedgerJournalIDs []string `json:"ledger_journal_ids,omitempty"`
 	CreatedAt             time.Time  `json:"created_at"`
 	CreatedByPrincipalID  string     `json:"created_by_principal_id"`
 	ApprovedAt            *time.Time `json:"approved_at,omitempty"`
