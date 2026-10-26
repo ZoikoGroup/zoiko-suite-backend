@@ -75,18 +75,18 @@ func (h *Handler) ResolveRule(w http.ResponseWriter, r *http.Request) {
 	}
 	if field := firstBlank(requiredField{"jurisdiction", req.Jurisdiction}, requiredField{"rule_domain", req.RuleDomain},
 		requiredField{"rule_code", req.RuleCode}, requiredField{"effective_at", req.EffectiveAt}); field != "" {
-		writeMissingField(w, field)
+		writeMissingField(w, r, field)
 		return
 	}
 	at, err := time.Parse(time.RFC3339Nano, req.EffectiveAt)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_effective_at", "effective_at must be an RFC3339 instant")
+		writeError(w, r, http.StatusBadRequest, "invalid_effective_at", "effective_at must be an RFC3339 instant")
 		return
 	}
 	var idemKey *string
 	if k := strings.TrimSpace(r.Header.Get("Idempotency-Key")); k != "" {
 		if len(k) > maxIdempotencyKey {
-			writeError(w, http.StatusBadRequest, "invalid_idempotency_key", "Idempotency-Key is too long")
+			writeError(w, r, http.StatusBadRequest, "invalid_idempotency_key", "Idempotency-Key is too long")
 			return
 		}
 		idemKey = &k
@@ -102,13 +102,13 @@ func (h *Handler) ResolveRule(w http.ResponseWriter, r *http.Request) {
 	d, err := h.resolver.Resolve(r.Context(), resolver.Request{Jurisdiction: req.Jurisdiction, RuleDomain: req.RuleDomain,
 		RuleCode: req.RuleCode, At: at, PackRef: req.PackRef, PackVersion: req.PackVersion})
 	if err != nil {
-		h.writeResolveError(w, err, corr)
+		h.writeResolveError(w, r, err, corr)
 		return
 	}
 
 	respJSON, err := json.Marshal(d)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "encode_failed", "could not encode the decision")
+		writeError(w, r, http.StatusInternalServerError, "encode_failed", "could not encode the decision")
 		return
 	}
 	rec := store.DecisionRecord{RequestedBy: actor, CorrelationID: corr, IdempotencyKey: idemKey, RequestDigest: reqDigest,
@@ -130,11 +130,11 @@ func (h *Handler) ResolveRule(w http.ResponseWriter, r *http.Request) {
 	stored, replayed, err := h.registry.RecordDecision(r.Context(), rec)
 	if err != nil {
 		if errors.Is(err, domain.ErrIdempotencyConflict) {
-			writeError(w, http.StatusConflict, "idempotency_conflict", err.Error())
+			writeError(w, r, http.StatusConflict, "idempotency_conflict", err.Error())
 			return
 		}
 		// Evidence is mandatory: an answer that cannot be recorded is not given.
-		h.writeRegistryError(w, err, corr)
+		h.writeRegistryError(w, r, err, corr)
 		return
 	}
 
@@ -148,7 +148,7 @@ func (h *Handler) ResolveRule(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, status, map[string]any{"decision_id": stored.DecisionID, "replayed": replayed, "decision": json.RawMessage(stored.Response)})
 }
 
-func (h *Handler) writeResolveError(w http.ResponseWriter, err error, corr string) {
+func (h *Handler) writeResolveError(w http.ResponseWriter, r *http.Request, err error, corr string) {
 	var ue *resolver.UnverifiedError
 	switch {
 	case errors.As(err, &ue):
@@ -156,13 +156,13 @@ func (h *Handler) writeResolveError(w http.ResponseWriter, err error, corr strin
 			"a pack covering this jurisdiction failed verification; no answer is given rather than a different one").
 			With("failures", ue.Failures))
 	case errors.Is(err, resolver.ErrBadRequest):
-		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		writeError(w, r, http.StatusBadRequest, "invalid_request", err.Error())
 	case errors.Is(err, resolver.ErrPinnedNotEligible):
-		writeError(w, http.StatusConflict, "pinned_pack_not_eligible", err.Error())
+		writeError(w, r, http.StatusConflict, "pinned_pack_not_eligible", err.Error())
 	case errors.Is(err, resolver.ErrPackNotFound), errors.Is(err, domain.ErrPackVersionNotFound):
-		writeError(w, http.StatusNotFound, "pack_version_not_found", "no such pack version")
+		writeError(w, r, http.StatusNotFound, "pack_version_not_found", "no such pack version")
 	default:
-		h.writeRegistryError(w, err, corr)
+		h.writeRegistryError(w, r, err, corr)
 	}
 }
 
@@ -174,10 +174,10 @@ func (h *Handler) GetRuleDecision(w http.ResponseWriter, r *http.Request) {
 	d, err := h.registry.GetDecision(r.Context(), chi.URLParam(r, "decision_id"))
 	if err != nil {
 		if errors.Is(err, domain.ErrDecisionNotFound) {
-			writeError(w, http.StatusNotFound, "decision_not_found", err.Error())
+			writeError(w, r, http.StatusNotFound, "decision_not_found", err.Error())
 			return
 		}
-		h.writeRegistryError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeRegistryError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	writeJSON(w, http.StatusOK, d)
@@ -189,21 +189,21 @@ func (h *Handler) PackCoverage(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	j := strings.TrimSpace(q.Get("jurisdiction"))
 	if j == "" {
-		writeMissingField(w, "jurisdiction")
+		writeMissingField(w, r, "jurisdiction")
 		return
 	}
 	at := time.Now().UTC()
 	if v := q.Get("effective_at"); v != "" {
 		t, err := time.Parse(time.RFC3339Nano, v)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, "invalid_effective_at", "effective_at must be an RFC3339 instant")
+			writeError(w, r, http.StatusBadRequest, "invalid_effective_at", "effective_at must be an RFC3339 instant")
 			return
 		}
 		at = t
 	}
 	entries, err := h.resolver.Coverage(r.Context(), j, at)
 	if err != nil {
-		h.writeRegistryError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeRegistryError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"jurisdiction": j, "effective_at": at, "packs": entries})
@@ -219,3 +219,4 @@ func (h *Handler) InvalidateResolverCache(w http.ResponseWriter, r *http.Request
 	hits, misses, refreshes := h.resolver.Stats()
 	writeJSON(w, http.StatusOK, map[string]any{"invalidated": true, "cache_hits": hits, "cache_misses": misses, "eligible_list_refreshes": refreshes})
 }
+

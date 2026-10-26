@@ -305,7 +305,7 @@ paths:
           description: "`missing_tenant` — no X-Tenant-Id."
           content:
             application/problem+json:
-              schema: { $ref: '#/components/schemas/Error' }
+              schema: { $ref: '#/components/schemas/Problem' }
         "503": { $ref: '#/components/responses/StoreUnavailable' }
 
   /v1/rules/{jurisdiction_rule_id}:
@@ -432,7 +432,7 @@ paths:
             `parent_jurisdiction_not_found` — the supplied parent does not exist.
           content:
             application/problem+json:
-              schema: { $ref: '#/components/schemas/Error' }
+              schema: { $ref: '#/components/schemas/Problem' }
         "409":
           description: |
             `conflict` — the dedup key matches an existing jurisdiction with different
@@ -441,7 +441,7 @@ paths:
             its own ancestor, so create never returns it.)
           content:
             application/problem+json:
-              schema: { $ref: '#/components/schemas/Error' }
+              schema: { $ref: '#/components/schemas/Problem' }
         "413": { $ref: '#/components/responses/BodyTooLarge' }
         "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
 
@@ -524,7 +524,7 @@ paths:
             `jurisdiction_not_found` — the jurisdiction is unknown or has been deactivated.
           content:
             application/problem+json:
-              schema: { $ref: '#/components/schemas/Error' }
+              schema: { $ref: '#/components/schemas/Problem' }
         "409":
           description: |
             `conflict` — dedup key matches an existing rule with a different payload,
@@ -534,7 +534,7 @@ paths:
             the one the chain implies.
           content:
             application/problem+json:
-              schema: { $ref: '#/components/schemas/Error' }
+              schema: { $ref: '#/components/schemas/Problem' }
         "413": { $ref: '#/components/responses/BodyTooLarge' }
         "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
 
@@ -591,7 +591,7 @@ paths:
             rule's creator tried to activate it.
           content:
             application/problem+json:
-              schema: { $ref: '#/components/schemas/Error' }
+              schema: { $ref: '#/components/schemas/Problem' }
         "404": { $ref: '#/components/responses/NotFound' }
         "409":
           description: |
@@ -600,12 +600,12 @@ paths:
             with the same `rule_code`.
           content:
             application/problem+json:
-              schema: { $ref: '#/components/schemas/Error' }
+              schema: { $ref: '#/components/schemas/Problem' }
         "412":
           description: "`precondition_failed` — If-Match named a row_version the rule no longer has."
           content:
             application/problem+json:
-              schema: { $ref: '#/components/schemas/Error' }
+              schema: { $ref: '#/components/schemas/Problem' }
         "413": { $ref: '#/components/responses/BodyTooLarge' }
         "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
 
@@ -653,7 +653,7 @@ paths:
           description: "`precondition_failed` — If-Match named a row_version the rule no longer has."
           content:
             application/problem+json:
-              schema: { $ref: '#/components/schemas/Error' }
+              schema: { $ref: '#/components/schemas/Problem' }
         "413": { $ref: '#/components/responses/BodyTooLarge' }
         "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
 
@@ -1922,7 +1922,7 @@ components:
         An unknown JSON field is rejected rather than ignored.
       content:
         application/problem+json:
-          schema: { $ref: '#/components/schemas/Error' }
+          schema: { $ref: '#/components/schemas/Problem' }
 
     MissingPrincipal:
       description: |
@@ -1931,13 +1931,13 @@ components:
         `X-Tenant-Id` or `X-Principal-Id` (a write-strict obligation).
       content:
         application/problem+json:
-          schema: { $ref: '#/components/schemas/Error' }
+          schema: { $ref: '#/components/schemas/Problem' }
 
     Forbidden:
       description: '`unauthorized` — the Authorization Service denied the action.'
       content:
         application/problem+json:
-          schema: { $ref: '#/components/schemas/Error' }
+          schema: { $ref: '#/components/schemas/Problem' }
 
     NotFound:
       description: |
@@ -1945,13 +1945,13 @@ components:
         which cannot name an existing row.
       content:
         application/problem+json:
-          schema: { $ref: '#/components/schemas/Error' }
+          schema: { $ref: '#/components/schemas/Problem' }
 
     BodyTooLarge:
       description: '`request_body_too_large` — the body exceeds 256 KiB.'
       content:
         application/problem+json:
-          schema: { $ref: '#/components/schemas/Error' }
+          schema: { $ref: '#/components/schemas/Problem' }
 
     StoreUnavailable:
       description: |
@@ -1959,7 +1959,7 @@ components:
         validating a `jurisdiction_id` must reject the write fail-closed.
       content:
         application/problem+json:
-          schema: { $ref: '#/components/schemas/Error' }
+          schema: { $ref: '#/components/schemas/Problem' }
 
     AuthzOrStoreUnavailable:
       description: |
@@ -1968,21 +1968,13 @@ components:
         Both fail closed: nothing was written.
       content:
         application/problem+json:
-          schema: { $ref: '#/components/schemas/Error' }
+          schema: { $ref: '#/components/schemas/Problem' }
 
   schemas:
 
-    Error:
+    Problem:
       type: object
       required: [type, title, status, code]
-      description: |
-        RFC 9457 Problem Details (API standard §12) plus the Zoiko extensions:
-        `code` is the stable machine-readable code clients branch on, and `error`
-        is a deprecated alias of `code` retained for one migration cycle.
-        `type` names the stable error class (Governance Control Plane §16) where
-        one applies. Additional extension fields — `field`, `jurisdiction_id`,
-        `reasons`, `report`, `failures`, `service` — appear inline as relevant.
-        Emitted as `application/problem+json`.
       properties:
         type:
           type: string
@@ -2005,9 +1997,6 @@ components:
         code:
           type: string
           description: Stable machine-readable code for client logic (e.g., "missing_field").
-        error:
-          type: string
-          description: Deprecated alias of `code`; clients should branch on `code`.
         request_id:
           type: string
           description: Request identifier for support/evidence (API standard §12).
@@ -2034,13 +2023,9 @@ components:
               detail:
                 type: string
                 description: Human-readable explanation of the violation.
-        field:
-          type: string
-          description: The offending field, when code is "missing_field".
-        jurisdiction_id:
-          type: string
-          format: uuid
-          description: The jurisdiction ID, when relevant.
+        current_version:
+          type: integer
+          format: int64
 
     Jurisdiction:
       type: object

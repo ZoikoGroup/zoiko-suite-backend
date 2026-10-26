@@ -82,28 +82,28 @@ func registerOpsRoutes(r chi.Router, h *Handler) {
 	r.Post("/v1/admin/source-change-notices/{notice_id}/close", h.CloseNotice)
 }
 
-func (h *Handler) writeOpsError(w http.ResponseWriter, err error, corr string) {
+func (h *Handler) writeOpsError(w http.ResponseWriter, r *http.Request, err error, corr string) {
 	var blocked *store.OpsBlocked
 	switch {
 	case errors.As(err, &blocked):
 		problem.Write(w, problem.New(http.StatusConflict, "operation_blocked",
 			"one or more gates are not met").With("reasons", blocked.Reasons))
 	case errors.Is(err, domain.ErrInvalidLifecycle):
-		writeError(w, http.StatusConflict, "invalid_lifecycle_state", err.Error())
+		writeError(w, r, http.StatusConflict, "invalid_lifecycle_state", err.Error())
 	case errors.Is(err, domain.ErrRingNotFound):
-		writeError(w, http.StatusNotFound, "ring_not_found", err.Error())
+		writeError(w, r, http.StatusNotFound, "ring_not_found", err.Error())
 	case errors.Is(err, domain.ErrRegionNotFound):
-		writeError(w, http.StatusNotFound, "region_not_found", err.Error())
+		writeError(w, r, http.StatusNotFound, "region_not_found", err.Error())
 	case errors.Is(err, domain.ErrDeploymentNotFound):
-		writeError(w, http.StatusNotFound, "deployment_not_found", err.Error())
+		writeError(w, r, http.StatusNotFound, "deployment_not_found", err.Error())
 	case errors.Is(err, domain.ErrHotfixNotFound):
-		writeError(w, http.StatusNotFound, "hotfix_not_found", err.Error())
+		writeError(w, r, http.StatusNotFound, "hotfix_not_found", err.Error())
 	case errors.Is(err, domain.ErrNoticeNotFound):
-		writeError(w, http.StatusNotFound, "notice_not_found", err.Error())
+		writeError(w, r, http.StatusNotFound, "notice_not_found", err.Error())
 	case errors.Is(err, domain.ErrNotAssignedReviewer):
-		writeError(w, http.StatusForbidden, "not_assigned_reviewer", err.Error())
+		writeError(w, r, http.StatusForbidden, "not_assigned_reviewer", err.Error())
 	default:
-		h.writeCertError(w, err, corr)
+		h.writeCertError(w, r, err, corr)
 	}
 }
 
@@ -130,12 +130,12 @@ func (h *Handler) CreateRegion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !scopeCodeRe.MatchString(req.RegionCode) {
-		writeError(w, http.StatusBadRequest, "invalid_region_code", "region_code must be lowercase letters, digits and . _ -")
+		writeError(w, r, http.StatusBadRequest, "invalid_region_code", "region_code must be lowercase letters, digits and . _ -")
 		return
 	}
 	x, created, err := h.registry.CreateRegion(r.Context(), req.RegionCode, req.Description, actor)
 	if err != nil {
-		h.writeOpsError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeOpsError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	if created {
@@ -148,7 +148,7 @@ func (h *Handler) CreateRegion(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) ListRegions(w http.ResponseWriter, r *http.Request) {
 	xs, err := h.registry.ListRegions(r.Context())
 	if err != nil {
-		h.writeOpsError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeOpsError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"regions": xs})
@@ -171,16 +171,16 @@ func (h *Handler) CreateRing(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !scopeCodeRe.MatchString(req.RingCode) {
-		writeError(w, http.StatusBadRequest, "invalid_ring_code", "ring_code must be lowercase letters, digits and . _ -")
+		writeError(w, r, http.StatusBadRequest, "invalid_ring_code", "ring_code must be lowercase letters, digits and . _ -")
 		return
 	}
 	if req.Ordinal < 1 || req.MinSoakSeconds < 0 {
-		writeError(w, http.StatusBadRequest, "invalid_ring", "ordinal must be at least 1 and min_soak_seconds cannot be negative")
+		writeError(w, r, http.StatusBadRequest, "invalid_ring", "ordinal must be at least 1 and min_soak_seconds cannot be negative")
 		return
 	}
 	x, created, err := h.registry.CreateRing(r.Context(), req.RingCode, req.Ordinal, req.MinSoakSeconds, req.Description, actor)
 	if err != nil {
-		h.writeOpsError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeOpsError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	if created {
@@ -193,7 +193,7 @@ func (h *Handler) CreateRing(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) ListRings(w http.ResponseWriter, r *http.Request) {
 	xs, err := h.registry.ListRings(r.Context())
 	if err != nil {
-		h.writeOpsError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeOpsError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"rings": xs})
@@ -219,17 +219,17 @@ func (h *Handler) lifecycle(w http.ResponseWriter, r *http.Request, action strin
 		}
 	}
 	if needReason && strings.TrimSpace(req.Reason) == "" {
-		writeMissingField(w, "reason")
+		writeMissingField(w, r, "reason")
 		return
 	}
 	if needEvidence && strings.TrimSpace(req.EvidenceRef) == "" {
-		writeMissingField(w, "evidence_ref")
+		writeMissingField(w, r, "evidence_ref")
 		return
 	}
 	ref, version := pathRefVersion(r)
 	res, err := run(ref, version, req.Reason, req.EvidenceRef, actor)
 	if err != nil {
-		h.writeOpsError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeOpsError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	if res.Changed {
@@ -288,13 +288,13 @@ func (h *Handler) DeployPackVersion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if field := firstBlank(requiredField{"ring", req.Ring}, requiredField{"region", req.Region}); field != "" {
-		writeMissingField(w, field)
+		writeMissingField(w, r, field)
 		return
 	}
 	ref, version := pathRefVersion(r)
 	d, created, err := h.registry.DeployPackVersion(r.Context(), ref, version, req.Ring, req.Region, actor, req.ExceptionReason)
 	if err != nil {
-		h.writeOpsError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeOpsError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	if created {
@@ -326,13 +326,13 @@ func (h *Handler) RollbackDeployment(w http.ResponseWriter, r *http.Request) {
 	}
 	if field := firstBlank(requiredField{"ring", req.Ring}, requiredField{"region", req.Region},
 		requiredField{"restore_version", req.RestoreVersion}, requiredField{"reason", req.Reason}); field != "" {
-		writeMissingField(w, field)
+		writeMissingField(w, r, field)
 		return
 	}
 	ref, version := pathRefVersion(r)
 	res, err := h.registry.RollbackDeployment(r.Context(), ref, version, req.Ring, req.Region, req.RestoreVersion, req.Reason, actor)
 	if err != nil {
-		h.writeOpsError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeOpsError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	h.emitRegistry(r, events.EventPackRolledBack, res.RolledBack.DeploymentID, actor, map[string]any{"pack_ref": ref, "version": version,
@@ -344,7 +344,7 @@ func (h *Handler) ListDeployments(w http.ResponseWriter, r *http.Request) {
 	ref, version := pathRefVersion(r)
 	ds, err := h.registry.ListDeployments(r.Context(), ref, version)
 	if err != nil {
-		h.writeOpsError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeOpsError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"deployments": ds})
@@ -372,19 +372,19 @@ func (h *Handler) DeclareHotfix(w http.ResponseWriter, r *http.Request) {
 	}
 	if field := firstBlank(requiredField{"scope_summary", req.ScopeSummary}, requiredField{"incident_ref", req.IncidentRef},
 		requiredField{"incident_commander", req.IncidentCommander}, requiredField{"rollback_target_version", req.RollbackTargetVersion}); field != "" {
-		writeMissingField(w, field)
+		writeMissingField(w, r, field)
 		return
 	}
 	sev := strings.ToUpper(strings.TrimSpace(req.Severity))
 	if sev != "P0" && sev != "P1" {
-		writeError(w, http.StatusBadRequest, "invalid_severity", "severity must be P0 or P1; anything lower is not an emergency path")
+		writeError(w, r, http.StatusBadRequest, "invalid_severity", "severity must be P0 or P1; anything lower is not an emergency path")
 		return
 	}
 	ref, version := pathRefVersion(r)
 	hf, created, err := h.registry.DeclareHotfix(r.Context(), ref, version, sev, req.ScopeSummary, req.IncidentRef,
 		req.IncidentCommander, req.RollbackTargetVersion, h.opsPolicy().HotfixRetroSLA, actor)
 	if err != nil {
-		h.writeOpsError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeOpsError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	if created {
@@ -407,7 +407,7 @@ func (h *Handler) GetHotfix(w http.ResponseWriter, r *http.Request) {
 	ref, version := pathRefVersion(r)
 	hf, err := h.registry.GetHotfix(r.Context(), ref, version)
 	if err != nil {
-		h.writeOpsError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeOpsError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	writeJSON(w, http.StatusOK, hf)
@@ -428,13 +428,13 @@ func (h *Handler) CompleteRetrospective(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if strings.TrimSpace(req.Note) == "" {
-		writeMissingField(w, "note")
+		writeMissingField(w, r, "note")
 		return
 	}
 	ref, version := pathRefVersion(r)
 	hf, changed, err := h.registry.CompleteRetrospective(r.Context(), ref, version, req.Note, actor)
 	if err != nil {
-		h.writeOpsError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeOpsError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	if changed {
@@ -472,23 +472,23 @@ func (h *Handler) CreateNotice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if field := firstBlank(requiredField{"authority", req.Authority}, requiredField{"change_type", req.ChangeType}, requiredField{"title", req.Title}); field != "" {
-		writeMissingField(w, field)
+		writeMissingField(w, r, field)
 		return
 	}
 	if !noticeTypes[strings.ToUpper(strings.TrimSpace(req.ChangeType))] {
-		writeError(w, http.StatusBadRequest, "invalid_change_type",
+		writeError(w, r, http.StatusBadRequest, "invalid_change_type",
 			"change_type must be one of FUTURE_DATED_LAW, SCHEMA_OR_CODE_LIST_UPDATE, CLARIFICATION, RETROACTIVE_CHANGE, AUTHORITY_PROCESS_CHANGE, SOURCE_WITHDRAWN, DISPUTED_INTERPRETATION (ZS-JUR-001 s31)")
 		return
 	}
 	if req.ObservedHash != nil && !domain.ValidDigest(*req.ObservedHash) {
-		writeError(w, http.StatusBadRequest, "invalid_observed_hash", "observed_hash must be sha256:<64 hex>")
+		writeError(w, r, http.StatusBadRequest, "invalid_observed_hash", "observed_hash must be sha256:<64 hex>")
 		return
 	}
 	n, err := h.registry.CreateNotice(r.Context(), store.CreateNoticeParams{JurisdictionID: req.JurisdictionID, AffectedSourceID: req.AffectedSourceID,
 		Authority: req.Authority, ChangeType: strings.ToUpper(strings.TrimSpace(req.ChangeType)), Title: req.Title, Location: req.Location,
 		ObservedHash: req.ObservedHash, Detail: req.Detail, CreatedBy: actor})
 	if err != nil {
-		h.writeOpsError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeOpsError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	h.emitRegistry(r, events.EventSourceChangeCaptured, n.NoticeID, actor, map[string]any{"notice_id": n.NoticeID, "change_type": n.ChangeType, "authority": n.Authority})
@@ -498,20 +498,20 @@ func (h *Handler) CreateNotice(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) GetNotice(w http.ResponseWriter, r *http.Request) {
 	n, err := h.registry.GetNotice(r.Context(), chi.URLParam(r, "notice_id"))
 	if err != nil {
-		h.writeOpsError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeOpsError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	writeJSON(w, http.StatusOK, n)
 }
 
 func (h *Handler) ListNotices(w http.ResponseWriter, r *http.Request) {
-	limit, offset, ok := h.parsePaging(w, r.URL.Query())
+	limit, offset, ok := h.parsePaging(w, r, r.URL.Query())
 	if !ok {
 		return
 	}
 	ns, err := h.registry.ListNotices(r.Context(), strings.ToUpper(r.URL.Query().Get("status")), limit, offset)
 	if err != nil {
-		h.writeOpsError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeOpsError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"notices": ns})
@@ -526,10 +526,10 @@ func (h *Handler) StartNoticeReview(w http.ResponseWriter, r *http.Request) {
 	n, changed, err := h.registry.StartNoticeReview(r.Context(), chi.URLParam(r, "notice_id"), actor)
 	if err != nil {
 		if errors.Is(err, domain.ErrNotIndependent) {
-			writeError(w, http.StatusForbidden, "segregation_of_duties", err.Error())
+			writeError(w, r, http.StatusForbidden, "segregation_of_duties", err.Error())
 			return
 		}
-		h.writeRegistryError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeRegistryError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	if changed {
@@ -558,16 +558,16 @@ func (h *Handler) CloseNotice(w http.ResponseWriter, r *http.Request) {
 	switch outcome {
 	case "NO_CHANGE", "INTERPRETATION_RECORDED", "RULE_CHANGE_PLANNED", "CAPABILITY_BLOCKED":
 	default:
-		writeError(w, http.StatusBadRequest, "invalid_outcome", "outcome must be NO_CHANGE, INTERPRETATION_RECORDED, RULE_CHANGE_PLANNED or CAPABILITY_BLOCKED")
+		writeError(w, r, http.StatusBadRequest, "invalid_outcome", "outcome must be NO_CHANGE, INTERPRETATION_RECORDED, RULE_CHANGE_PLANNED or CAPABILITY_BLOCKED")
 		return
 	}
 	if strings.TrimSpace(req.Note) == "" {
-		writeMissingField(w, "note")
+		writeMissingField(w, r, "note")
 		return
 	}
 	n, changed, err := h.registry.CloseNotice(r.Context(), chi.URLParam(r, "notice_id"), actor, outcome, req.Note, req.LinkedInterpretationID)
 	if err != nil {
-		h.writeOpsError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeOpsError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	if changed {
@@ -593,7 +593,7 @@ func (h *Handler) OpsMetrics(w http.ResponseWriter, r *http.Request) {
 		}
 		n, err := strconv.Atoi(v)
 		if err != nil || n < 1 || n > 24*365 {
-			writeError(w, http.StatusBadRequest, "invalid_"+name, name+" must be a positive integer")
+			writeError(w, r, http.StatusBadRequest, "invalid_"+name, name+" must be a positive integer")
 			return 0, false
 		}
 		return n, true
@@ -612,8 +612,9 @@ func (h *Handler) OpsMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 	m, err := h.registry.Metrics(r.Context(), win, age, up)
 	if err != nil {
-		h.writeOpsError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeOpsError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	writeJSON(w, http.StatusOK, m)
 }
+

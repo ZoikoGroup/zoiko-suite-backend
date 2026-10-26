@@ -57,10 +57,10 @@ func IdempotencyMiddleware(st IdempotencyStore, log *zap.Logger) func(http.Handl
 			if err != nil {
 				var maxErr *http.MaxBytesError
 				if errors.As(err, &maxErr) {
-					writeError(w, http.StatusRequestEntityTooLarge, "request_body_too_large", "request body exceeds 256 KiB")
+					writeError(w, r, http.StatusRequestEntityTooLarge, "request_body_too_large", "request body exceeds 256 KiB")
 					return
 				}
-				writeError(w, http.StatusBadRequest, "invalid_json", "request body could not be read")
+				writeError(w, r, http.StatusBadRequest, "invalid_json", "request body could not be read")
 				return
 			}
 			r.Body = io.NopCloser(bytes.NewReader(body))
@@ -82,10 +82,10 @@ func IdempotencyMiddleware(st IdempotencyStore, log *zap.Logger) func(http.Handl
 			if existing != nil {
 				switch {
 				case existing.RequestHash != reqHash:
-					writeError(w, http.StatusConflict, "idempotency_key_reused",
+					writeError(w, r, http.StatusConflict, "idempotency_key_reused",
 						"this Idempotency-Key was already used for a different request")
 				case existing.Status == 0:
-					writeError(w, http.StatusConflict, "request_in_progress",
+					writeError(w, r, http.StatusConflict, "request_in_progress",
 						"a request with this Idempotency-Key is still being processed")
 				default:
 					if existing.ContentType != "" {
@@ -145,3 +145,4 @@ func (c *capturingWriter) Write(b []byte) (int, error) {
 	}
 	return c.ResponseWriter.Write(b)
 }
+

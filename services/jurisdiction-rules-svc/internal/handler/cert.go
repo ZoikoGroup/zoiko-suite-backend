@@ -48,20 +48,20 @@ func registerCertRoutes(r chi.Router, h *Handler) {
 	r.Post("/v1/admin/packs/{pack_ref}/versions/{version}/certify", h.CertifyPackVersion)
 }
 
-func (h *Handler) writeCertError(w http.ResponseWriter, err error, corr string) {
+func (h *Handler) writeCertError(w http.ResponseWriter, r *http.Request, err error, corr string) {
 	var blocked *store.CertificationBlocked
 	switch {
 	case errors.As(err, &blocked):
 		problem.Write(w, problem.New(http.StatusConflict, "certification_blocked",
 			"one or more certification gates are not met").With("reasons", blocked.Reasons))
 	case errors.Is(err, domain.ErrBundleInvalid):
-		writeError(w, http.StatusBadRequest, "invalid_test_bundle", err.Error())
+		writeError(w, r, http.StatusBadRequest, "invalid_test_bundle", err.Error())
 	case errors.Is(err, domain.ErrNoTestBundle):
-		writeError(w, http.StatusConflict, "no_test_bundle", err.Error())
+		writeError(w, r, http.StatusConflict, "no_test_bundle", err.Error())
 	case errors.Is(err, domain.ErrNotCertified):
-		writeError(w, http.StatusNotFound, "not_certified", err.Error())
+		writeError(w, r, http.StatusNotFound, "not_certified", err.Error())
 	default:
-		h.writeCompileError(w, err, corr)
+		h.writeCompileError(w, r, err, corr)
 	}
 }
 
@@ -74,22 +74,22 @@ func (h *Handler) SubmitTestBundle(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
 	raw, err := io.ReadAll(r.Body)
 	if err != nil {
-		writeError(w, http.StatusRequestEntityTooLarge, "request_body_too_large", "test bundle too large")
+		writeError(w, r, http.StatusRequestEntityTooLarge, "request_body_too_large", "test bundle too large")
 		return
 	}
 	if _, err := domain.ParseTestBundle(raw); err != nil {
-		h.writeCertError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeCertError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	canonical, err := domain.CanonicalJSON(raw)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_test_bundle", err.Error())
+		writeError(w, r, http.StatusBadRequest, "invalid_test_bundle", err.Error())
 		return
 	}
 	digest, _ := domain.DigestOf(canonical)
 	rec, created, err := h.registry.SubmitTestBundle(r.Context(), chi.URLParam(r, "pack_ref"), chi.URLParam(r, "version"), canonical, digest, actor)
 	if err != nil {
-		h.writeCertError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeCertError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	if created {
@@ -102,7 +102,7 @@ func (h *Handler) SubmitTestBundle(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) GetTestBundle(w http.ResponseWriter, r *http.Request) {
 	rec, err := h.registry.GetLatestTestBundle(r.Context(), chi.URLParam(r, "pack_ref"), chi.URLParam(r, "version"))
 	if err != nil {
-		h.writeCertError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeCertError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	writeJSON(w, http.StatusOK, rec)
@@ -118,7 +118,7 @@ func (h *Handler) RunTests(w http.ResponseWriter, r *http.Request) {
 	ref, version := chi.URLParam(r, "pack_ref"), chi.URLParam(r, "version")
 	rec, err := h.registry.RunTests(r.Context(), ref, version, actor)
 	if err != nil {
-		h.writeCertError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeCertError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	h.emitRegistry(r, events.EventPackTestsRun, rec.RunID, actor, map[string]any{
@@ -128,13 +128,13 @@ func (h *Handler) RunTests(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListTestRuns(w http.ResponseWriter, r *http.Request) {
-	limit, _, ok := h.parsePaging(w, r.URL.Query())
+	limit, _, ok := h.parsePaging(w, r, r.URL.Query())
 	if !ok {
 		return
 	}
 	rs, err := h.registry.ListTestRuns(r.Context(), chi.URLParam(r, "pack_ref"), chi.URLParam(r, "version"), limit)
 	if err != nil {
-		h.writeCertError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeCertError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"runs": rs})
@@ -160,22 +160,22 @@ func (h *Handler) AddReview(w http.ResponseWriter, r *http.Request) {
 	}
 	role := strings.ToUpper(strings.TrimSpace(req.Role))
 	if !reviewRoleRe.MatchString(role) {
-		writeError(w, http.StatusBadRequest, "invalid_role", "role must be an UPPER_SNAKE label such as TAX, LEGAL, ACCOUNTING or TECHNICAL")
+		writeError(w, r, http.StatusBadRequest, "invalid_role", "role must be an UPPER_SNAKE label such as TAX, LEGAL, ACCOUNTING or TECHNICAL")
 		return
 	}
 	decision := strings.ToUpper(strings.TrimSpace(req.Decision))
 	if decision != "APPROVE" && decision != "REJECT" {
-		writeError(w, http.StatusBadRequest, "invalid_decision", "decision must be APPROVE or REJECT")
+		writeError(w, r, http.StatusBadRequest, "invalid_decision", "decision must be APPROVE or REJECT")
 		return
 	}
 	if decision == "REJECT" && strings.TrimSpace(req.Findings) == "" {
-		writeMissingField(w, "findings")
+		writeMissingField(w, r, "findings")
 		return
 	}
 	ref, version := chi.URLParam(r, "pack_ref"), chi.URLParam(r, "version")
 	rec, err := h.registry.AddReview(r.Context(), ref, version, actor, role, decision, req.Findings)
 	if err != nil {
-		h.writeCertError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeCertError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	h.emitRegistry(r, events.EventPackReviewed, rec.ReviewID, actor, map[string]any{
@@ -186,7 +186,7 @@ func (h *Handler) AddReview(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) ListReviews(w http.ResponseWriter, r *http.Request) {
 	rs, err := h.registry.ListReviews(r.Context(), chi.URLParam(r, "pack_ref"), chi.URLParam(r, "version"))
 	if err != nil {
-		h.writeCertError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeCertError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"reviews": rs})
@@ -200,7 +200,7 @@ func (h *Handler) CertifyPackVersion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if h.signer == nil {
-		h.writeCompileError(w, domain.ErrSigningNotConfigured, "")
+		h.writeCompileError(w, r, domain.ErrSigningNotConfigured, "")
 		return
 	}
 	min := h.minReviews
@@ -210,7 +210,7 @@ func (h *Handler) CertifyPackVersion(w http.ResponseWriter, r *http.Request) {
 	ref, version := chi.URLParam(r, "pack_ref"), chi.URLParam(r, "version")
 	rec, created, err := h.registry.CertifyPackVersion(r.Context(), ref, version, actor, min, h.signer)
 	if err != nil {
-		h.writeCertError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeCertError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	if created {
@@ -227,8 +227,9 @@ func (h *Handler) CertifyPackVersion(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) GetCertification(w http.ResponseWriter, r *http.Request) {
 	c, res, err := h.registry.GetCertification(r.Context(), chi.URLParam(r, "pack_ref"), chi.URLParam(r, "version"))
 	if err != nil {
-		h.writeCertError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeCertError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"certification": c, "verification": res})
 }
+

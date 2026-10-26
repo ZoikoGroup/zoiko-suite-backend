@@ -34,20 +34,20 @@ func registerRolloutRoutes(r chi.Router, h *Handler) {
 	r.Get("/v1/jurisdiction-support/{jurisdiction_code}", h.JurisdictionSupport)
 }
 
-func (h *Handler) writeRolloutError(w http.ResponseWriter, err error, corr string) {
+func (h *Handler) writeRolloutError(w http.ResponseWriter, r *http.Request, err error, corr string) {
 	var blocked *domain.RolloutBlockedError
 	switch {
 	case errors.As(err, &blocked):
 		writeJSON(w, http.StatusConflict, map[string]any{"error": "rollout_blocked", "message": blocked.Error(), "blockers": blocked.Blockers})
 	case errors.Is(err, domain.ErrRolloutNotFound):
-		writeError(w, http.StatusNotFound, "rollout_not_found", err.Error())
+		writeError(w, r, http.StatusNotFound, "rollout_not_found", err.Error())
 	default:
 		// The database independence and gate triggers surface as a conflict or a segregation-of-duties refusal.
 		if strings.Contains(err.Error(), "ck_rollout_independent") || strings.Contains(err.Error(), "cannot attest to or approve their own") {
-			writeError(w, http.StatusForbidden, "segregation_of_duties", "the rollout owner cannot attest to or approve their own rollout")
+			writeError(w, r, http.StatusForbidden, "segregation_of_duties", "the rollout owner cannot attest to or approve their own rollout")
 			return
 		}
-		h.writeRegistryError(w, err, corr)
+		h.writeRegistryError(w, r, err, corr)
 	}
 }
 
@@ -73,25 +73,25 @@ func (h *Handler) CreateRollout(w http.ResponseWriter, r *http.Request) {
 	}
 	if field := firstBlank(requiredField{"family_ref", req.FamilyRef}, requiredField{"display_name", req.DisplayName},
 		requiredField{"layer", req.Layer}, requiredField{"owner", req.Owner}); field != "" {
-		writeMissingField(w, field)
+		writeMissingField(w, r, field)
 		return
 	}
 	if !domain.ValidFamilyRef(req.FamilyRef) {
-		writeError(w, http.StatusBadRequest, "invalid_family_ref", "family_ref must be lower-case letters, digits, dot, underscore or hyphen, up to 64 characters (for example gb or us.state.ca)")
+		writeError(w, r, http.StatusBadRequest, "invalid_family_ref", "family_ref must be lower-case letters, digits, dot, underscore or hyphen, up to 64 characters (for example gb or us.state.ca)")
 		return
 	}
 	if !contains(domain.RolloutLayers, req.Layer) {
-		writeError(w, http.StatusBadRequest, "invalid_layer", "layer must be one of "+strings.Join(domain.RolloutLayers, ", "))
+		writeError(w, r, http.StatusBadRequest, "invalid_layer", "layer must be one of "+strings.Join(domain.RolloutLayers, ", "))
 		return
 	}
 	if (req.Layer == "COUNTRY" || req.Layer == "SUBDIVISION") && (req.JurisdictionCode == nil || strings.TrimSpace(*req.JurisdictionCode) == "") {
-		writeError(w, http.StatusBadRequest, "jurisdiction_code_required", "a COUNTRY or SUBDIVISION rollout must name its jurisdiction_code")
+		writeError(w, r, http.StatusBadRequest, "jurisdiction_code_required", "a COUNTRY or SUBDIVISION rollout must name its jurisdiction_code")
 		return
 	}
 	rec, err := h.registry.CreateRollout(r.Context(), store.CreateRolloutParams{FamilyRef: req.FamilyRef, DisplayName: req.DisplayName, Layer: req.Layer,
 		ScopeNote: req.ScopeNote, Owner: req.Owner, CreatedBy: actor, JurisdictionCode: req.JurisdictionCode, SupportOwner: req.SupportOwner})
 	if err != nil {
-		h.writeRolloutError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeRolloutError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	writeJSON(w, http.StatusCreated, rec)
@@ -105,7 +105,7 @@ func (h *Handler) SeedPortfolio(w http.ResponseWriter, r *http.Request) {
 	}
 	created, existing, err := h.registry.SeedPortfolio(r.Context(), actor)
 	if err != nil {
-		h.writeRolloutError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeRolloutError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"created": created, "already_present": existing,
@@ -116,18 +116,18 @@ func (h *Handler) ListRollouts(w http.ResponseWriter, r *http.Request) {
 	if _, ok := h.admin(w, r, "jurisdiction_rollout", "view"); !ok {
 		return
 	}
-	limit, offset, ok := h.parsePaging(w, r.URL.Query())
+	limit, offset, ok := h.parsePaging(w, r, r.URL.Query())
 	if !ok {
 		return
 	}
 	status := strings.ToUpper(r.URL.Query().Get("status"))
 	if status != "" && !domain.ValidRolloutStatus(status) {
-		writeError(w, http.StatusBadRequest, "invalid_status", "unknown rollout status")
+		writeError(w, r, http.StatusBadRequest, "invalid_status", "unknown rollout status")
 		return
 	}
 	out, err := h.registry.ListRollouts(r.Context(), status, limit, offset)
 	if err != nil {
-		h.writeRolloutError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeRolloutError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"rollouts": out})
@@ -140,7 +140,7 @@ func (h *Handler) GetRollout(w http.ResponseWriter, r *http.Request) {
 	}
 	d, err := h.registry.GetRollout(r.Context(), chi.URLParam(r, "rollout_id"))
 	if err != nil {
-		h.writeRolloutError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeRolloutError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	writeJSON(w, http.StatusOK, d)
@@ -161,12 +161,12 @@ func (h *Handler) SetRolloutOwner(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if strings.TrimSpace(req.Owner) == "" || req.Owner == domain.UnassignedOwner {
-		writeMissingField(w, "owner")
+		writeMissingField(w, r, "owner")
 		return
 	}
 	rec, err := h.registry.SetRolloutOwner(r.Context(), chi.URLParam(r, "rollout_id"), req.Owner, req.SupportOwner)
 	if err != nil {
-		h.writeRolloutError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeRolloutError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	writeJSON(w, http.StatusOK, rec)
@@ -187,17 +187,17 @@ func (h *Handler) LinkRolloutPacks(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(req.PackRefs) == 0 || len(req.PackRefs) > 50 {
-		writeError(w, http.StatusBadRequest, "invalid_pack_refs", "pack_refs needs 1 to 50 pack references")
+		writeError(w, r, http.StatusBadRequest, "invalid_pack_refs", "pack_refs needs 1 to 50 pack references")
 		return
 	}
 	id := chi.URLParam(r, "rollout_id")
 	if err := h.registry.LinkRolloutPacks(r.Context(), id, req.PackRefs, actor); err != nil {
-		h.writeRolloutError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeRolloutError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	d, err := h.registry.GetRollout(r.Context(), id)
 	if err != nil {
-		h.writeRolloutError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeRolloutError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"pack_refs": d.Packs})
@@ -223,15 +223,15 @@ func (h *Handler) AttestRollout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !domain.ChecklistHasItem(req.Checklist, req.ItemCode) {
-		writeError(w, http.StatusBadRequest, "invalid_item", "checklist must be READY or DONE and item_code one of its items (see GET /v1/rollout-checklists)")
+		writeError(w, r, http.StatusBadRequest, "invalid_item", "checklist must be READY or DONE and item_code one of its items (see GET /v1/rollout-checklists)")
 		return
 	}
 	if req.Met && strings.TrimSpace(req.EvidenceRef) == "" {
-		writeError(w, http.StatusBadRequest, "evidence_required", "a met item needs an evidence_ref (a document, report or record that shows it)")
+		writeError(w, r, http.StatusBadRequest, "evidence_required", "a met item needs an evidence_ref (a document, report or record that shows it)")
 		return
 	}
 	if err := h.registry.AddAttestation(r.Context(), chi.URLParam(r, "rollout_id"), req.Checklist, req.ItemCode, req.Met, strings.TrimSpace(req.EvidenceRef), actor); err != nil {
-		h.writeRolloutError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeRolloutError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{"checklist": req.Checklist, "item_code": req.ItemCode, "met": req.Met, "attested_by": actor})
@@ -255,15 +255,15 @@ func (h *Handler) ExpertApproveRollout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if field := firstBlank(requiredField{"qualification", req.Qualification}, requiredField{"scope", req.Scope}, requiredField{"decision", req.Decision}); field != "" {
-		writeMissingField(w, field)
+		writeMissingField(w, r, field)
 		return
 	}
 	if req.Decision != "APPROVE" && req.Decision != "REJECT" {
-		writeError(w, http.StatusBadRequest, "invalid_decision", "decision must be APPROVE or REJECT")
+		writeError(w, r, http.StatusBadRequest, "invalid_decision", "decision must be APPROVE or REJECT")
 		return
 	}
 	if err := h.registry.AddExpertApproval(r.Context(), chi.URLParam(r, "rollout_id"), actor, strings.TrimSpace(req.Qualification), strings.TrimSpace(req.Scope), req.Decision, req.Notes); err != nil {
-		h.writeRolloutError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeRolloutError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{"expert": actor, "decision": req.Decision})
@@ -285,12 +285,12 @@ func (h *Handler) TransitionRollout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !domain.ValidRolloutStatus(req.To) || req.To == domain.RolloutPlanned {
-		writeError(w, http.StatusBadRequest, "invalid_status", "to must be one of AUTHORING, READY, LAUNCHED, SUSPENDED, RETIRED")
+		writeError(w, r, http.StatusBadRequest, "invalid_status", "to must be one of AUTHORING, READY, LAUNCHED, SUSPENDED, RETIRED")
 		return
 	}
 	rec, err := h.registry.TransitionRollout(r.Context(), chi.URLParam(r, "rollout_id"), req.To, actor, strings.TrimSpace(req.Reason))
 	if err != nil {
-		h.writeRolloutError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeRolloutError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	writeJSON(w, http.StatusOK, rec)
@@ -312,13 +312,14 @@ func (h *Handler) JurisdictionSupport(w http.ResponseWriter, r *http.Request) {
 	}
 	code := strings.TrimSpace(chi.URLParam(r, "jurisdiction_code"))
 	if code == "" || len(code) > 32 {
-		writeError(w, http.StatusBadRequest, "invalid_jurisdiction_code", "jurisdiction_code is required (at most 32 characters)")
+		writeError(w, r, http.StatusBadRequest, "invalid_jurisdiction_code", "jurisdiction_code is required (at most 32 characters)")
 		return
 	}
 	v, err := h.registry.JurisdictionSupport(r.Context(), code)
 	if err != nil {
-		h.writeRolloutError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeRolloutError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	writeJSON(w, http.StatusOK, v)
 }
+

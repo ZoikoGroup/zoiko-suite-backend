@@ -72,7 +72,7 @@ func (h *Handler) ValidateAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.checkAuthz(r, principalID, "jurisdiction_rule", "validate"); err != nil {
-		h.writeAuthzError(w, err)
+		h.writeAuthzError(w, r, err)
 		return
 	}
 
@@ -80,23 +80,23 @@ func (h *Handler) ValidateAction(w http.ResponseWriter, r *http.Request) {
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+		writeError(w, r, http.StatusBadRequest, "invalid_json", err.Error())
 		return
 	}
 	switch {
 	case strings.TrimSpace(req.JurisdictionID) == "":
-		writeError(w, http.StatusBadRequest, "missing_field", "jurisdiction_id is required")
+		writeError(w, r, http.StatusBadRequest, "missing_field", "jurisdiction_id is required")
 		return
 	case strings.TrimSpace(req.EntityType) == "":
-		writeError(w, http.StatusBadRequest, "missing_field", "entity_type is required")
+		writeError(w, r, http.StatusBadRequest, "missing_field", "entity_type is required")
 		return
 	case len(req.Payload) > 0 && !bytes.HasPrefix(bytes.TrimSpace(req.Payload), []byte("{")):
-		writeError(w, http.StatusBadRequest, "invalid_field", "payload must be a JSON object")
+		writeError(w, r, http.StatusBadRequest, "invalid_field", "payload must be a JSON object")
 		return
 	}
 	ruleDomain, ruleCode, ok := splitActionType(req.ActionType)
 	if !ok {
-		writeError(w, http.StatusBadRequest, "invalid_action_type",
+		writeError(w, r, http.StatusBadRequest, "invalid_action_type",
 			"action_type must be <rule_domain>.<rule_code>, e.g. TAX.STD")
 		return
 	}
@@ -112,7 +112,7 @@ func (h *Handler) ValidateAction(w http.ResponseWriter, r *http.Request) {
 		RequiredCodes:  []string{ruleCode},
 	})
 	if err != nil {
-		h.writeStoreError(w, err, correlationID)
+		h.writeStoreError(w, r, err, correlationID)
 		return
 	}
 
@@ -148,3 +148,4 @@ func (h *Handler) ValidateAction(w http.ResponseWriter, r *http.Request) {
 		zap.String("correlation_id", correlationID))
 	writeJSON(w, status, resp)
 }
+
