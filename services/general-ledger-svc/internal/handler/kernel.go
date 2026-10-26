@@ -40,12 +40,20 @@ type KernelHandler struct {
 	units kernel.CurrencyUnits
 	fx    kernel.FXSource
 	authz AuthZClient
-	log   *zap.Logger
+	gate   kernel.PeriodGate
+	signer kernel.Signer
+	log    *zap.Logger
 }
 
 // NewKernel builds the handler. fx may be nil, in which case a foreign-currency evaluation must carry its fx_basis.
 func NewKernel(svc *kernel.Service, repo kernel.Repo, ref kernel.RefData, units kernel.CurrencyUnits, fx kernel.FXSource, az AuthZClient, log *zap.Logger) *KernelHandler {
 	return &KernelHandler{svc: svc, repo: repo, ref: ref, units: units, fx: fx, authz: az, log: log}
+}
+
+// WithPeriodGate wires the server-side period gate that posting needs. Without one the posting command refuses (fails closed).
+func (h *KernelHandler) WithPeriodGate(g kernel.PeriodGate) *KernelHandler {
+	h.gate = g
+	return h
 }
 
 // RegisterKernelRoutes mounts the kernel routes.
@@ -75,6 +83,60 @@ func RegisterKernelRoutes(r chi.Router, h *KernelHandler) {
 		r.Post("/{id}/return-to-draft", h.ReturnToDraft)
 	})
 	r.Post("/v1/posting-evaluations", h.Evaluate)
+	r.Post("/v1/accounting-postings", h.PostEvent)
+	r.Get("/v1/posting-traces", h.GetPostingTrace)
+	r.Post("/v1/fx-rates", h.IngestFXRate)
+	r.Get("/v1/fx-rates", h.ListFXRates)
+	r.Get("/v1/fx-rate-resolutions", h.ResolveFXRate)
+	r.Post("/v1/fx-rate-overrides", h.RequestFXOverride)
+	r.Get("/v1/fx-rate-overrides", h.ListFXOverrides)
+	r.Post("/v1/fx-rate-overrides/{id}/approve", h.decideFXOverride(true))
+	r.Post("/v1/fx-rate-overrides/{id}/reject", h.decideFXOverride(false))
+	r.Post("/v1/revaluation-runs", h.RunRevaluation)
+	r.Get("/v1/revaluation-runs", h.ListRevaluationRuns)
+	r.Get("/v1/foreign-positions", h.GetForeignPositions)
+	r.Route("/v1/consolidation-groups", func(r chi.Router) {
+		r.Post("/", h.CreateConsolidationGroup)
+		r.Get("/", h.ListConsolidationGroups)
+		r.Get("/{id}", h.GetConsolidationGroup)
+		r.Post("/{id}/members", h.AddConsolidationMember)
+		r.Post("/{id}/members/{member}/end", h.EndConsolidationMember)
+		r.Put("/{id}/mappings", h.PutConsolidationMapping)
+		r.Get("/{id}/mappings", h.ListConsolidationMappings)
+	})
+	r.Route("/v1/consolidation-runs", func(r chi.Router) {
+		r.Post("/", h.RunConsolidation)
+		r.Get("/", h.ListConsolidationRuns)
+		r.Get("/{id}", h.GetConsolidationRun)
+		r.Post("/{id}/certify", h.CertifyConsolidationRun)
+		r.Post("/{id}/supersede", h.SupersedeConsolidationRun)
+	})
+	r.Get("/v1/intercompany-pairings", h.GetIntercompanyPairing)
+	r.Post("/v1/balance-snapshots", h.CreateBalanceSnapshot)
+	r.Get("/v1/balance-snapshots", h.ListBalanceSnapshots)
+	r.Get("/v1/balance-snapshots/{id}", h.GetBalanceSnapshot)
+	r.Post("/v1/balance-snapshots/{id}/verify", h.VerifyBalanceSnapshot)
+	r.Get("/v1/close-evidence", h.GetCloseEvidence)
+	r.Post("/v1/period-seals", h.ApplyPeriodSeal)
+	r.Get("/v1/period-seals", h.ListPeriodSeals)
+	r.Get("/v1/period-seals/{entity}/{period}", h.GetPeriodSeal)
+	r.Route("/v1/reconciliation-runs", func(r chi.Router) {
+		r.Post("/", h.RunReconciliation)
+		r.Get("/", h.ListReconciliationRuns)
+		r.Get("/{id}", h.GetReconciliationRun)
+		r.Post("/{id}/assign", h.AssignReconciliationRun)
+		r.Post("/{id}/accept", h.AcceptReconciliationRun)
+		r.Post("/{id}/resolve", h.ResolveReconciliationRun)
+		r.Post("/{id}/verify", h.VerifyReconciliationRun)
+	})
+	r.Get("/v1/reconciliation-status", h.GetReconciliationStatus)
+	r.Post("/v1/reconciliation-tolerances", h.CreateReconciliationTolerance)
+	r.Get("/v1/reconciliation-tolerances", h.ListReconciliationTolerances)
+	r.Get("/v1/counterparty-balances", h.GetCounterpartyBalances)
+	r.Get("/v1/posting-rule-packs", h.ListRulePacks)
+	r.Post("/v1/posting-rule-packs/{name}/instantiate", h.InstantiateRulePack)
+	r.Get("/v1/account-applicability/{account_code}", h.GetAccountScope)
+	r.Put("/v1/account-applicability/{account_code}", h.SetAccountScope)
 	r.Route("/v1/dimensions", func(r chi.Router) {
 		r.Post("/", h.CreateDimension)
 		r.Get("/", h.ListDimensions)
@@ -454,7 +516,7 @@ func (h *KernelHandler) Evaluate(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	dir := kernel.TenantDirectory{Tenant: tenant, Ref: h.ref, Units: h.units, FX: h.fx}
+	dir := kernel.TenantDirectory{Tenant: tenant, Ref: h.ref, Units: h.units, FX: h.fxSource(tenant)}
 	p, err := h.svc.Evaluate(r.Context(), tenant, req, dir)
 	if err != nil {
 		h.fail(w, err)

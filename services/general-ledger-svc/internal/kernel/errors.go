@@ -69,3 +69,7 @@ var (
 	ErrNotTested    = errors.New("the rule set's test pack has not passed for this exact content")
 	ErrBadRequest   = errors.New("bad request")
 )
+
+// NewException builds an exception for a collaborator outside this package (the period gate), so every refusal reaches
+// the caller in the one AK-* taxonomy.
+func NewException(family, code, format string, a ...any) *Exception { return exc(family, code, format, a...) }

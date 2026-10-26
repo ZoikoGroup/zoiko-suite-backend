@@ -125,9 +125,12 @@ type AccountingEvent struct {
 	IdempotencyKey       string            `json:"idempotency_key"`
 	CorrelationID        string            `json:"correlation_id"`
 	CausationID          string            `json:"causation_id"`
-	PayloadHash          string            `json:"payload_hash"`
-	RegisteredBy         string            `json:"registered_by,omitempty"`
-	RegisteredAt         time.Time         `json:"registered_at"`
+	// SupersedesEventID names the event this one corrects (standard §11). The original keeps its history; the correction
+	// is a new economic fact with its own identity and posting.
+	SupersedesEventID string    `json:"supersedes_event_id,omitempty"`
+	PayloadHash       string    `json:"payload_hash"`
+	RegisteredBy      string    `json:"registered_by,omitempty"`
+	RegisteredAt      time.Time `json:"registered_at"`
 }
 
 var eventTypeRE = regexp.MustCompile(`^[A-Z][A-Z0-9]*(\.[A-Z][A-Z0-9_]*)+$`)
@@ -155,6 +158,11 @@ func (e *AccountingEvent) Validate() error {
 	}
 	if e.OccurredAt.After(time.Now().Add(24 * time.Hour)) {
 		return bad("occurred_at", "not in the future")
+	}
+	if e.SupersedesEventID != "" {
+		if _, err := uuid.Parse(e.SupersedesEventID); err != nil {
+			return bad("supersedes_event_id", "an accounting event id")
+		}
 	}
 	if e.TransactionCurrency != "" && !currencyRE.MatchString(e.TransactionCurrency) {
 		return bad("transaction_currency", "an ISO 4217 code")
@@ -193,8 +201,9 @@ func (e *AccountingEvent) ComputeHash() string {
 		Ccy, Cp                 string
 		F, D                    map[string]string
 		Ev                      []string
+		Sup                     string `json:",omitempty"`
 	}{e.EventType, e.LegalEntityID, e.SourceSystem, e.SourceObjectType, e.SourceObjectID, e.SourceEventID, e.EventVersion, e.OccurredAt.UTC(),
-		e.EffectiveAt, e.DocumentDate, e.PostingDateRequested, e.TransactionCurrency, e.CounterpartyID, e.Facts, e.Dimensions, sortedCopy(e.EvidenceRefs)}
+		e.EffectiveAt, e.DocumentDate, e.PostingDateRequested, e.TransactionCurrency, e.CounterpartyID, e.Facts, e.Dimensions, sortedCopy(e.EvidenceRefs), e.SupersedesEventID}
 	b, _ := json.Marshal(view)
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])

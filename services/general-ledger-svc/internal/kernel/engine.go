@@ -27,6 +27,12 @@ type AccountInfo struct {
 	Postable           bool // header/parent accounts are not
 	Active             bool
 	CurrencyRestricted []string          // empty = any
+	BookIDs            []string          // books the account is valid in; empty = every book
+	// ControlType is the subledger or system area that owns the account (AR, AP, BANK, ...); empty for an ordinary account.
+	// CounterpartyRequired makes a line on the account carry the counterparty (customer, supplier). The AR and AP control
+	// accounts always do: a receivable or payable with no one it is owed by or to cannot be reconciled to its subledger.
+	ControlType          string
+	CounterpartyRequired bool
 	DimensionPolicy    map[string]string // dimension -> REQUIRED | PROHIBITED | OPTIONAL
 }
 
@@ -60,6 +66,9 @@ type ProposalLine struct {
 	Dimensions       map[string]string `json:"dimensions,omitempty"`
 	Description      string            `json:"description,omitempty"`
 	Rounding         bool              `json:"rounding_residual,omitempty"`
+	RealizedFX       bool              `json:"realized_fx,omitempty"`
+	CounterpartyID   string            `json:"counterparty_id,omitempty"`
+	ControlType      string            `json:"control_type,omitempty"`
 }
 
 // Provenance identifies the rule that produced a proposal (AK-INV-008).
@@ -109,6 +118,10 @@ type rawLine struct {
 	exact  *big.Rat
 	funcMn *big.Int
 	round  bool
+	cp     string
+	// fixed is a functional amount the rule stated (carrying basis), exempt from conversion; realized marks the realized-FX line.
+	fixed    *big.Rat
+	realized bool
 }
 
 // Evaluate turns one event into a journal proposal under one rule set and one book. The same input always gives the same
@@ -198,6 +211,9 @@ func Evaluate(ctx context.Context, in EvalInput) (*Proposal, error) {
 		if info == nil || !info.Active || !info.Postable {
 			return nil, exc(FamCOA, "ACCOUNT_NOT_POSTABLE", "%s resolves to an account that is inactive or a header account", t.LineRef).with("line_ref", t.LineRef)
 		}
+		if len(info.BookIDs) > 0 && !containsStr(info.BookIDs, bk.BookID) {
+			return nil, exc(FamCOA, "ACCOUNT_NOT_IN_BOOK", "account %s is not valid in book %s", info.Code, bk.BookCode).with("line_ref", t.LineRef)
+		}
 		if len(info.CurrencyRestricted) > 0 && !containsStr(info.CurrencyRestricted, tccy) {
 			return nil, exc(FamCOA, "ACCOUNT_CURRENCY_RESTRICTED", "account %s does not take %s", info.Code, tccy).with("line_ref", t.LineRef)
 		}
@@ -205,7 +221,28 @@ func Evaluate(ctx context.Context, in EvalInput) (*Proposal, error) {
 		if derr != nil {
 			return nil, derr
 		}
-		lines = append(lines, &rawLine{t: t, minor: minor, acct: info, dims: dims, exact: exact})
+		cp := ""
+		if info.CounterpartyRequired || info.ControlType == "AR" || info.ControlType == "AP" {
+			if ev.CounterpartyID == "" {
+				return nil, exc(FamCOA, "COUNTERPARTY_REQUIRED", "%s posts to account %s, which needs the counterparty and the event carries none", t.LineRef, info.Code).with("line_ref", t.LineRef)
+			}
+			cp = ev.CounterpartyID
+		}
+		var fixed *big.Rat
+		if t.Functional != "" {
+			fexpr, ferr := ParseExpr(t.Functional)
+			if ferr != nil {
+				return nil, ferr
+			}
+			if fixed, ferr = fexpr.Eval(env); ferr != nil {
+				return nil, ferr
+			}
+			if fixed.Sign() < 0 {
+				return nil, exc(FamData, "NEGATIVE_AMOUNT", "line %s computes a negative functional amount (%s)", t.LineRef, ratString(fixed))
+			}
+			step("carrying", t.LineRef+": functional "+t.Functional+" = "+ratString(fixed)+" (retired at its carrying amount)")
+		}
+		lines = append(lines, &rawLine{t: t, minor: minor, acct: info, dims: dims, exact: exact, cp: cp, fixed: fixed})
 	}
 	if len(lines) < 2 {
 		return nil, exc(FamRule, "NO_LINES", "the rule produced fewer than two lines for this event")
@@ -256,6 +293,8 @@ func Evaluate(ctx context.Context, in EvalInput) (*Proposal, error) {
 	for _, l := range lines {
 		if l.funcMn != nil {
 			// a residual line already carries its functional amount
+		} else if l.fixed != nil {
+			l.funcMn = RoundMinor(l.fixed, fscale, pol.Mode)
 		} else if bk.FunctionalCurrency == tccy {
 			l.funcMn = new(big.Int).Set(l.minor)
 		} else {
@@ -266,6 +305,24 @@ func Evaluate(ctx context.Context, in EvalInput) (*Proposal, error) {
 			fdr.Add(fdr, l.funcMn)
 		} else {
 			fcr.Add(fcr, l.funcMn)
+		}
+	}
+	anyFixed := false
+	for _, l := range lines {
+		anyFixed = anyFixed || l.fixed != nil
+	}
+	if fdr.Cmp(fcr) != 0 && anyFixed && c.RealizedFX != nil {
+		if err := addRealizedFX(ctx, in, c, &lines, fdr, fcr); err != nil {
+			return nil, err
+		}
+		step("realized-fx", "the difference between the carrying amount retired and the value settled was posted as realized exchange difference")
+		fdr, fcr = new(big.Int), new(big.Int)
+		for _, l := range lines {
+			if l.t.Side == Debit {
+				fdr.Add(fdr, l.funcMn)
+			} else {
+				fcr.Add(fcr, l.funcMn)
+			}
 		}
 	}
 	if fdr.Cmp(fcr) != 0 {
@@ -295,7 +352,7 @@ func Evaluate(ctx context.Context, in EvalInput) (*Proposal, error) {
 		prov.Branch = append(prov.Branch, l.t.LineRef)
 		p.Lines = append(p.Lines, ProposalLine{LineNo: i + 1, LineRef: l.t.LineRef, Side: l.t.Side, AccountCode: l.acct.Code,
 			AmountTx: FormatMinor(l.minor, tscale), Currency: tccy, AmountFunctional: FormatMinor(l.funcMn, fscale), Dimensions: l.dims,
-			Description: l.t.Description, Rounding: l.round})
+			Description: l.t.Description, Rounding: l.round, RealizedFX: l.realized, CounterpartyID: l.cp, ControlType: l.acct.ControlType})
 	}
 	p.Provenance, p.Trace = prov, trace
 	b, _ := json.Marshal(struct {
@@ -307,6 +364,24 @@ func Evaluate(ctx context.Context, in EvalInput) (*Proposal, error) {
 	sum := sha256.Sum256(b)
 	p.ProposalHash = hex.EncodeToString(sum[:])
 	return p, nil
+}
+
+// addRealizedFX posts the functional difference of a settlement as an explicit realized exchange gain or loss: more debit than
+// credit needs a credit, which is a gain, and the reverse is a loss. The line carries no transaction amount: it is a pure
+// functional-currency difference.
+func addRealizedFX(ctx context.Context, in EvalInput, c RuleContent, lines *[]*rawLine, dr, cr *big.Int) error {
+	diff := new(big.Int).Sub(dr, cr)
+	ref, side := c.RealizedFX.Gain, Credit
+	if diff.Sign() < 0 {
+		ref, side = c.RealizedFX.Loss, Debit
+	}
+	info, err := in.Directory.ResolveAccount(ctx, ref, in.Book.BookID, in.PostingDate)
+	if err != nil || info == nil || !info.Active || !info.Postable {
+		return exc(FamCOA, "REALIZED_FX_ACCOUNT_UNAVAILABLE", "the realized exchange account %s cannot take the difference", ref)
+	}
+	*lines = append(*lines, &rawLine{t: LineTemplate{LineRef: "REALIZED_FX", Side: side, Description: "realized exchange difference"}, acct: info, realized: true,
+		minor: new(big.Int), funcMn: new(big.Int).Abs(diff), dims: map[string]string{}})
+	return nil
 }
 
 // addResidual posts a difference within the rounding policy's tolerance to the rule's rounding account as an explicit
@@ -425,7 +500,7 @@ func RunTestPack(ctx context.Context, rs *RuleSet, book Book) []string {
 		}
 		ev := &AccountingEvent{AccountingEventID: "test", TenantID: bk.TenantID, LegalEntityID: bk.LegalEntityID, EventType: tc.Event.EventType,
 			TransactionCurrency: tc.Event.TransactionCurrency, Facts: tc.Event.Facts, Dimensions: tc.Event.Dimensions, CounterpartyID: tc.Event.CounterpartyID}
-		dir := testDirectory{accounts: tc.Accounts, units: tc.MinorUnits}
+		dir := testDirectory{accounts: tc.Accounts, units: tc.MinorUnits, controls: tc.Controls}
 		covered := *rs
 		covered.Status = RuleActive
 		p, err := Evaluate(ctx, EvalInput{Event: ev, Book: &bk, Rule: &covered, PostingDate: rs.EffectiveFrom, FX: tc.FX, Directory: dir})
@@ -457,7 +532,7 @@ func compareLines(got []ProposalLine, want []ExpectedLine) string {
 		return "expected " + itoa(len(want)) + " lines and got " + itoa(len(got))
 	}
 	for i := range got {
-		if got[i].Side != want[i].Side || got[i].AccountCode != want[i].AccountCode || got[i].AmountTx != want[i].Amount {
+		if got[i].Side != want[i].Side || got[i].AccountCode != want[i].AccountCode || got[i].AmountTx != want[i].Amount || (want[i].Functional != "" && got[i].AmountFunctional != want[i].Functional) {
 			return "line " + itoa(i+1) + " is " + got[i].Side + " " + got[i].AccountCode + " " + got[i].AmountTx + ", expected " + want[i].Side + " " + want[i].AccountCode + " " + want[i].Amount
 		}
 	}
@@ -470,6 +545,7 @@ func itoa(n int) string { return new(big.Int).SetInt64(int64(n)).String() }
 type testDirectory struct {
 	accounts map[string]string
 	units    map[string]int
+	controls map[string]string
 }
 
 func (d testDirectory) MinorUnits(_ context.Context, ccy string, _ time.Time) (int, error) {
@@ -487,7 +563,7 @@ func (d testDirectory) ResolveAccount(_ context.Context, ref AccountRef, _ strin
 			return nil, exc(FamCOA, "MAPPING_MISSING", "no account for mapping %q", ref.MappingKey)
 		}
 	}
-	return &AccountInfo{Code: code, Postable: true, Active: true}, nil
+	return &AccountInfo{Code: code, Postable: true, Active: true, ControlType: d.controls[code]}, nil
 }
 
 func (d testDirectory) DimensionAllowed(context.Context, string, string, string, string, time.Time) (bool, error) {

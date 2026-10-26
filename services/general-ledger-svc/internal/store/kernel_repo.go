@@ -232,13 +232,13 @@ func (r *KernelRepo) UpdateBook(ctx context.Context, tenant, id string, fn func(
 
 const eventCols = `accounting_event_id::text, tenant_id::text, legal_entity_id::text, event_type, event_version, source_system, source_object_type, source_object_id,
 	source_event_id, occurred_at, effective_at, document_date, posting_date_requested, COALESCE(transaction_currency, ''), facts, COALESCE(counterparty_id, ''),
-	dimensions, evidence_refs, idempotency_key, correlation_id, causation_id, payload_hash, registered_by, registered_at`
+	dimensions, evidence_refs, idempotency_key, correlation_id, causation_id, payload_hash, registered_by, registered_at, COALESCE(supersedes_event_id::text, '')`
 
 func scanEvent(row pgx.Row, e *kernel.AccountingEvent) error {
 	var facts, dims, ev []byte
 	if err := row.Scan(&e.AccountingEventID, &e.TenantID, &e.LegalEntityID, &e.EventType, &e.EventVersion, &e.SourceSystem, &e.SourceObjectType, &e.SourceObjectID,
 		&e.SourceEventID, &e.OccurredAt, &e.EffectiveAt, &e.DocumentDate, &e.PostingDateRequested, &e.TransactionCurrency, &facts, &e.CounterpartyID, &dims, &ev,
-		&e.IdempotencyKey, &e.CorrelationID, &e.CausationID, &e.PayloadHash, &e.RegisteredBy, &e.RegisteredAt); err != nil {
+		&e.IdempotencyKey, &e.CorrelationID, &e.CausationID, &e.PayloadHash, &e.RegisteredBy, &e.RegisteredAt, &e.SupersedesEventID); err != nil {
 		return err
 	}
 	e.Facts = map[string]string{}
@@ -260,11 +260,11 @@ func (r *KernelRepo) InsertEvent(ctx context.Context, e *kernel.AccountingEvent,
 		facts, _ := json.Marshal(e.Facts)
 		tag, err := t.Exec(ctx, `INSERT INTO accounting_events (accounting_event_id, tenant_id, legal_entity_id, event_type, event_version, source_system, source_object_type,
 			source_object_id, source_event_id, occurred_at, effective_at, document_date, posting_date_requested, transaction_currency, facts, counterparty_id, dimensions,
-			evidence_refs, idempotency_key, correlation_id, causation_id, payload_hash, registered_by, registered_at)
-			VALUES ($1::uuid,$2::uuid,$3::uuid,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NULLIF($14,''),$15,NULLIF($16,''),$17,$18,$19,$20,$21,$22,$23,$24) ON CONFLICT DO NOTHING`,
+			evidence_refs, idempotency_key, correlation_id, causation_id, payload_hash, registered_by, registered_at, supersedes_event_id)
+			VALUES ($1::uuid,$2::uuid,$3::uuid,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NULLIF($14,''),$15,NULLIF($16,''),$17,$18,$19,$20,$21,$22,$23,$24,NULLIF($25,'')::uuid) ON CONFLICT DO NOTHING`,
 			e.AccountingEventID, e.TenantID, e.LegalEntityID, e.EventType, e.EventVersion, e.SourceSystem, e.SourceObjectType, e.SourceObjectID, e.SourceEventID, e.OccurredAt,
 			e.EffectiveAt, e.DocumentDate, e.PostingDateRequested, e.TransactionCurrency, facts, e.CounterpartyID, jsonOrNil(e.Dimensions), jsonOrNil(e.EvidenceRefs),
-			e.IdempotencyKey, e.CorrelationID, e.CausationID, e.PayloadHash, e.RegisteredBy, e.RegisteredAt)
+			e.IdempotencyKey, e.CorrelationID, e.CausationID, e.PayloadHash, e.RegisteredBy, e.RegisteredAt, e.SupersedesEventID)
 		if err != nil {
 			return err
 		}
@@ -747,4 +747,67 @@ func (r *KernelRepo) MappedAccount(ctx context.Context, tenant, key string, on t
 		return nil
 	})
 	return
+}
+
+// ── account scope: applicability and controls (standard §12) ───────────────────
+
+var _ kernel.AccountApplicability = (*KernelRepo)(nil)
+
+// AccountApplicability implements kernel.AccountApplicability: the books an account is valid in, its currency restriction, the
+// area that owns it and whether its lines need a counterparty. An account with none of these is valid everywhere and needs
+// nothing, which is every account that existed before the controls did.
+func (r *KernelRepo) AccountApplicability(ctx context.Context, tenant, code string) (sc kernel.AccountScope, err error) {
+	err = r.tx(ctx, tenant, func(t pgx.Tx) error {
+		var ccy, ctl *string
+		e := t.QueryRow(ctx, `SELECT COALESCE(applicable_book_ids, '{}'::uuid[])::text[], currency_restriction, control_type, counterparty_required
+			FROM chart_of_accounts WHERE tenant_id=$1::uuid AND account_code=$2`, tenant, code).Scan(&sc.BookIDs, &ccy, &ctl, &sc.CounterpartyRequired)
+		if errors.Is(e, pgx.ErrNoRows) {
+			return nil
+		}
+		if e != nil {
+			return e
+		}
+		if ccy != nil {
+			sc.Currency = strings.TrimSpace(*ccy)
+		}
+		if ctl != nil {
+			sc.ControlType = *ctl
+		}
+		return nil
+	})
+	return
+}
+
+// SetAccountScope sets where an account may be used and who owns it. A control type makes the account a control account whose
+// direct posting is restricted unless the caller states otherwise; the override authority already guarding control accounts
+// then applies to it.
+func (r *KernelRepo) SetAccountScope(ctx context.Context, tenant, code string, sc kernel.AccountScope, actor kernel.Actor) error {
+	return r.tx(ctx, tenant, func(t pgx.Tx) error {
+		for _, b := range sc.BookIDs {
+			var ok bool
+			if e := t.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM accounting_books WHERE tenant_id=$1::uuid AND book_id=$2::uuid)`, tenant, b).Scan(&ok); e != nil {
+				return e
+			}
+			if !ok {
+				return &kernel.Exception{Family: kernel.FamCOA, Code: "BOOK_UNKNOWN", Detail: "book " + b + " does not exist", Facts: map[string]any{"book_id": b}}
+			}
+		}
+		var arg any
+		if len(sc.BookIDs) > 0 {
+			arg = sc.BookIDs
+		}
+		tag, e := t.Exec(ctx, `UPDATE chart_of_accounts SET applicable_book_ids=$3::uuid[], currency_restriction=NULLIF($4,''), control_type=NULLIF($5,''),
+				counterparty_required=$6, is_control_account = (NULLIF($5,'') IS NOT NULL OR is_control_account),
+				direct_posting_restricted = COALESCE($7::boolean, (NULLIF($5,'') IS NOT NULL OR direct_posting_restricted))
+			WHERE tenant_id=$1::uuid AND account_code=$2`, tenant, code, arg, sc.Currency, sc.ControlType, sc.CounterpartyRequired, sc.DirectPostingRestricted)
+		if e != nil {
+			return e
+		}
+		if tag.RowsAffected() == 0 {
+			return kernel.ErrNotFound
+		}
+		return r.enqueue(ctx, t, tenant, kernel.OutEvent{Fact: "account.scope-changed", AggregateType: "account", AggregateID: code, Actor: actor.PrincipalID,
+			CorrelationID: actor.CorrelationID, Data: map[string]any{"account_code": code, "book_ids": sc.BookIDs, "currency_restriction": sc.Currency,
+				"control_type": sc.ControlType, "counterparty_required": sc.CounterpartyRequired}})
+	})
 }

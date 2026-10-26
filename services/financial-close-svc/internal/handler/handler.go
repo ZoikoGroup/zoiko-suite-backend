@@ -366,9 +366,30 @@ type Handler struct {
 
 	// REF-05 cutover phase 1 (see period_mirror.go). All nil/empty by default,
 	// which means: no mirroring, and the workflow-ref endpoint refuses everyone.
+	// The accounting kernel (general-ledger-svc): its close evidence as a readiness input and its period seal. Both are off unless
+	// SetKernelClose turns them on, and a nil kernel never consults anything.
+	kernel             KernelClose
+	kernelGate         bool
+	kernelSeal         bool
+	kernelRequire      []string
 	mirror             PeriodMirror
 	workflowRefs       WorkflowRefReader
 	workflowRefCallers map[string]struct{}
+}
+
+// KernelClose is what the period close asks of the accounting kernel.
+type KernelClose interface {
+	GetKernelCloseEvidence(ctx context.Context, tenantID, principalID, legalEntityID, fiscalPeriod string, require []string) (*domain.KernelCloseEvidence, error)
+	ApplyKernelPeriodSeal(ctx context.Context, tenantID, principalID, legalEntityID, fiscalPeriod, action, authorityRef, reason string) (changed bool, err error)
+}
+
+// SetKernelClose wires the accounting kernel into the close. gate makes the kernel's close evidence a readiness input (open
+// reconciliation cases, failed postings, unrevalued foreign items and journals in the review queue then block a close); seal makes
+// a close seal the period in the kernel, so no posting can reach the period after its watermark, and a reopen lift the seal under
+// the reopen's own authority. require names the reconciliations that must have been run. Both default to off.
+func (h *Handler) SetKernelClose(k KernelClose, gate, seal bool, require []string) *Handler {
+	h.kernel, h.kernelGate, h.kernelSeal, h.kernelRequire = k, gate, seal, require
+	return h
 }
 
 // SetCloseGateEnforced turns the financial-control-svc close-gate dependency
@@ -1032,6 +1053,34 @@ func (h *Handler) closeWithEvidence(w http.ResponseWriter, r *http.Request, mode
 		return
 	}
 
+	// Seal the period in the accounting kernel before anything is compiled from it: from here no posting can reach the period, so the
+	// trial balance taken next is of a ledger that can no longer move under it. A seal that cannot be taken stops the close (fail
+	// closed). If a later step fails, the seal this request took is lifted again, under an authority that says why.
+	sealedHere, closed := false, false
+	if h.kernel != nil && h.kernelSeal {
+		action := "SEAL"
+		if mode.reperform {
+			action = "RESEAL"
+		}
+		changed, err := h.kernel.ApplyKernelPeriodSeal(r.Context(), tenantID, principalID, fp.LegalEntityID, fp.PeriodName, action, "", "")
+		if err != nil {
+			h.log.Error("failed to seal the period in the accounting kernel", zap.String("period_id", id), zap.Error(err))
+			writeError(w, http.StatusServiceUnavailable, "close_failed", "cannot seal the period in the accounting kernel: "+err.Error())
+			return
+		}
+		sealedHere = changed
+	}
+	defer func() {
+		if sealedHere && !closed {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if _, err := h.kernel.ApplyKernelPeriodSeal(ctx, tenantID, principalID, fp.LegalEntityID, fp.PeriodName, "REOPEN", "close-aborted:"+correlationID, "the close did not complete"); err != nil {
+				h.log.Error("the close failed and the kernel seal it took could not be lifted: the period is sealed in the kernel but not closed here",
+					zap.String("period_id", id), zap.Error(err))
+			}
+		}
+	}()
+
 	// Step 2: Compile Trial Balance & Generate Evidence (FAIL CLOSED on error)
 	balances, err := h.clients.CompileTrialBalance(r.Context(), tenantID, fp.LegalEntityID, fp.PeriodName, principalID)
 	if err != nil {
@@ -1091,6 +1140,7 @@ func (h *Handler) closeWithEvidence(w http.ResponseWriter, r *http.Request, mode
 			// timeout on a close call that actually completed server-side) —
 			// return the current closed state rather than misreporting this
 			// as a store outage.
+			closed = true
 			writeJSON(w, http.StatusOK, domain.PeriodLockResponse{
 				FiscalPeriodID:     current.FiscalPeriodID,
 				PeriodName:         current.PeriodName,
@@ -1104,6 +1154,7 @@ func (h *Handler) closeWithEvidence(w http.ResponseWriter, r *http.Request, mode
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
+	closed = true // the period is closed here now, so the kernel seal stays
 
 	// Insert close evidence.
 	//
@@ -4841,6 +4892,20 @@ func (h *Handler) checkReadiness(ctx context.Context, tenantID, principalID stri
 		controlIssues, matched := requiredControlIssues(requiredControls(checklist), runs, fp.PeriodName, notBefore)
 		issues = append(issues, controlIssues...)
 		reliance.SubledgerControls = append(reliance.SubledgerControls, matched...)
+	}
+
+	if h.kernel != nil && h.kernelGate {
+		ev, err := h.kernel.GetKernelCloseEvidence(ctx, tenantID, principalID, fp.LegalEntityID, fp.PeriodName, h.kernelRequire)
+		if err != nil {
+			h.log.Error("failed to read the accounting kernel's close evidence", zap.Error(err))
+			return nil, nil, fmt.Errorf("general-ledger-svc (accounting kernel): %w", err)
+		}
+		for _, issue := range ev.BlockingIssues {
+			issues = append(issues, "accounting_kernel: "+issue)
+		}
+		if !ev.Ready && len(ev.BlockingIssues) == 0 {
+			issues = append(issues, "accounting_kernel: the kernel reports the period is not ready")
+		}
 	}
 
 	if h.enforceCloseGate {
