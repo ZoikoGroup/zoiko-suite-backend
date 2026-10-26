@@ -446,3 +446,56 @@ func TestPgStore_GetAccumulatedDepreciation_And_ListRunExceptions_RealDB(t *test
 		t.Fatalf("expected 0 exceptions once the schedule is covered by a run, got %+v", noLongerException)
 	}
 }
+
+func TestPgStore_DepreciationRun_KernelPosting_RecordsEveryJournalAndAssetCategories(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool)
+
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+	a := activeAssetInStore(t, ctx, s, tenantID, "le-1")
+	if err := s.CreateDepreciationSchedule(ctx, newTestSchedule(tenantID, a)); err != nil {
+		t.Fatal(err)
+	}
+	run := &domain.DepreciationRun{
+		RunID: uuid.New().String(), LegalEntityID: "le-1", FiscalPeriod: "2026-01", DepreciationExpenseAccountCode: "6400", AccumulatedDepreciationAccountCode: "1590",
+		Status: domain.DepreciationRunStatusDraft, CreatedAt: time.Now().UTC(), CreatedByPrincipalID: "preparer-1",
+	}
+	if err := s.CreateDepreciationRun(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if _, err := s.FreezeDepreciationPopulation(ctx, run.RunID, "le-1", now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ValidateDepreciationRun(ctx, run.RunID, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ApproveDepreciationRun(ctx, run.RunID, "approver-1", now); err != nil {
+		t.Fatal(err)
+	}
+
+	cats, err := s.AssetCategories(ctx, []string{a.AssetID, uuid.New().String()})
+	if err != nil || cats[a.AssetID] != a.AssetCategory || len(cats) != 1 {
+		t.Fatalf("%v %v", cats, err)
+	}
+	// another tenant sees no categories
+	other := svcmiddleware.WithTenant(context.Background(), uuid.New().String())
+	if got, err := s.AssetCategories(other, []string{a.AssetID}); err != nil || len(got) != 0 {
+		t.Fatalf("%v %v", got, err)
+	}
+	if err := s.MarkDepreciationRunEmittedToKernel(ctx, run.RunID, nil, now); err == nil {
+		t.Fatal("a kernel posting with no journal is not a posting")
+	}
+	if err := s.MarkDepreciationRunEmittedToKernel(ctx, run.RunID, []string{"j-1", "j-2"}, now); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetDepreciationRun(ctx, run.RunID)
+	if err != nil || got.Status != domain.DepreciationRunStatusAccountingEventEmitted || got.JournalID == nil || *got.JournalID != "j-1" ||
+		len(got.LedgerJournalIDs) != 2 || got.LedgerJournalIDs[1] != "j-2" {
+		t.Fatalf("%+v %v", got, err)
+	}
+	if err := s.MarkDepreciationRunEmittedToKernel(ctx, run.RunID, []string{"j-3"}, now); err == nil {
+		t.Fatal("a run is emitted once")
+	}
+}

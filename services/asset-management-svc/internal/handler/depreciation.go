@@ -489,6 +489,11 @@ func (h *Handler) EmitDepreciationAccountingEvent(w http.ResponseWriter, r *http
 		return
 	}
 
+	if kp, ok := h.ledger.(kernelDepreciationPoster); ok && kp.KernelPostingEnabled() {
+		h.emitDepreciationThroughKernel(w, r, kp, run, id, tenantID, principalID)
+		return
+	}
+
 	var lines []clients.LedgerLine
 	var total float64
 	for _, l := range run.Lines {
@@ -565,8 +570,12 @@ func (h *Handler) SupersedeDepreciationRun(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusServiceUnavailable, "ledger_client_not_configured", "")
 		return
 	}
-	if run.JournalID != nil {
-		if err := h.ledger.ReverseDepreciationJournal(r.Context(), tenantID, principalID, *run.JournalID, req.Reason); err != nil {
+	journals := run.LedgerJournalIDs
+	if len(journals) == 0 && run.JournalID != nil {
+		journals = []string{*run.JournalID}
+	}
+	for _, journalID := range journals {
+		if err := h.ledger.ReverseDepreciationJournal(r.Context(), tenantID, principalID, journalID, req.Reason); err != nil {
 			h.log.Error("SupersedeDepreciationRun: journal reversal failed", zap.Error(err))
 			writeError(w, http.StatusServiceUnavailable, "journal_reversal_failed", err.Error())
 			return

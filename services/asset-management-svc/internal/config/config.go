@@ -19,6 +19,10 @@ type Config struct {
 	// post through its ACC-04 system-originated posting path
 	// (POST /v1/postings/events), never a bespoke ledger write.
 	LedgerServiceURL string
+	// LedgerKernelBookID and LedgerKernelCurrency, both set, post depreciation through the accounting kernel of general-ledger-svc into that
+	// accounting book and in its functional currency, instead of the legacy posting command. Empty keeps the legacy path.
+	LedgerKernelBookID   string
+	LedgerKernelCurrency string
 	// CloseServiceURL is financial-close-svc's own base URL — AST-02
 	// depends on its ACC-06 subledger control per the spec's own
 	// Dependencies field.
@@ -84,6 +88,8 @@ func Load() (*Config, error) {
 		},
 		AuthZServiceURL:  env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
 		LedgerServiceURL: env("LEDGER_SERVICE_URL", "http://general-ledger-svc:8098"),
+		LedgerKernelBookID:   env("LEDGER_KERNEL_BOOK_ID", ""),
+		LedgerKernelCurrency: env("LEDGER_KERNEL_CURRENCY", ""),
 		CloseServiceURL:  env("CLOSE_SERVICE_URL", "http://financial-close-svc:8104"),
 
 		AuthzMTLSEnabled:         env("AUTHZ_MTLS_ENABLED", "false") == "true",
