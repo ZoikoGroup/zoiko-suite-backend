@@ -11,7 +11,7 @@ Statuses: TODO · IN PROGRESS · DONE · BLOCKED. DONE needs a filled evidence b
 | P0-2 | Register JURISDICTION_RULE_VALIDATE | DONE | b82fd224 | access-control 000023 + template + store test |
 | P0-3 | Fix stale resolve.go comment | DONE | 47986f06 | comment now matches tax.go |
 | API-1 | Shared apicontract package | DONE | acce5b86 | 30 unit + 7 pgx integration pass, 0 fail/skip; vet clean |
-| API-2 | Problem details + request id + cache, all our services | IN PROGRESS | e1830853, f361be5e, 8c8bb0a4 | tenant-entity-registry-svc + access-control-svc done; identity-context-svc code done, openapi gate pending; 18 services remain |
+| API-2 | Problem details + request id + cache, all our services | IN PROGRESS | e1830853, f361be5e, 8c8bb0a4, d33fa469 | tenant-entity-registry-svc + access-control-svc + identity-context-svc done; 17 services remain |
 | API-3 | ETag / If-Match on aggregate mutations | TODO | | |
 | API-4 | Cursor pagination on lists | TODO | | |
 | API-5 | Async operations | TODO | | |
@@ -192,6 +192,26 @@ Tests:
 Negative-path tests: existing handler/context tests now exercise apicontract problem bodies; error_code assertions updated to the `code` field per ZS-API-001 §12
 Spec rows closed: ZS-API-001 §6, §10, §12, §15, §18, §26, §29 adoption for identity-context-svc (code paths)
 Blocked / limits: openapi.yaml lacks the shared Problem schema and per-response problem+json references; no route-parity/openapi-validation test yet — these remain the openapi gate before identity-context-svc counts as fully API-2 DONE. 18 services remain after this one.
+
+### API-2 — Problem details + request id + cache (identity-context-svc)
+Status: DONE
+Commits: f361be5e feat(identity-context-svc): adopt RFC 9457 problem details and apicontract middleware; d33fa469 feat(identity-context-svc): complete API-2 openapi gate
+Migrations: none
+Permissions registered: none
+Routes: no new routes; all existing error responses now return application/problem+json via apicontract.WriteProblem
+Wiring: cmd/server/main.go mounts apicontract.RequestID (replaces middleware.RequestID) and apicontract.DefaultCache; internal/context writeError/writeCoded/writeSupportError/writeMFAError use apicontract.ProblemFor + apicontract.WriteProblem
+Tests:
+- `go build ./...` → clean; `go vet ./...` → clean
+- `go test -count=1 ./...` → all packages ok (cmd/server, internal/auth, authz, context, credential, envelope, events, federation, health, idempotency, keys, lifecycle, mfa, mtlslistener, oidc, outbox, ratelimit, retention, session, siem, sod, store, upstream; 0 fail)
+- `go test -count=1 ./internal/context` → all pass, including:
+  - TestOpenAPIDocumentIsValid (new): kin-openapi LoadFromData + Validate pass on openapi.yaml
+  - TestEveryRouteIsInThePublishedContract + TestEveryContractPathIsServed: served-vs-declared route parity both directions
+  - TestStableErrorCatalogueIsPublished: stable error codes published in Problem.code enum
+  - TestGov01OperationIdsArePublished: GOV-01 operationIds present
+  - TestEverySchemaReferenceResolves: no dangling $refs
+Negative-path tests: existing context/handler tests exercise apicontract problem bodies; error_code assertions updated to read the code field per ZS-API-001 §12
+Spec rows closed: ZS-API-001 §6, §10, §12, §15, §18, §26, §29 adoption for identity-context-svc (complete, incl. openapi gate)
+Blocked / limits: kin-openapi taken from local module cache (no network). contract_test.go struct relaxed to map[string]any to tolerate path-item-level parameters. 17 API-2 services remain.
 
 ### API-2 — Problem details + request id + cache (access-control-svc)
 Status: DONE
