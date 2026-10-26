@@ -424,7 +424,7 @@ func finalized(id, entity, period string, lines ...domain.PostedLine) *domain.Po
 
 func strPtr(s string) *string { return &s }
 
-func (c *stubClients) PostConsolidationAdjustmentJournal(_ context.Context, _, _, legalEntityID, _, _, _, _ string, _ []clients.JournalLine) (string, error) {
+func (c *stubClients) PostConsolidationAdjustmentJournal(_ context.Context, _, _, _, legalEntityID, _, _, _, _ string, _ []clients.JournalLine) (string, error) {
 	c.postCalls++
 	c.lastPostedLegalEntityID = legalEntityID
 	if c.postErr != nil {
@@ -436,7 +436,7 @@ func (c *stubClients) PostConsolidationAdjustmentJournal(_ context.Context, _, _
 	return "journal-generated", nil
 }
 
-func (c *stubClients) ReverseConsolidationAdjustmentJournal(_ context.Context, _, _, _, _ string) error {
+func (c *stubClients) ReverseConsolidationAdjustmentJournal(_ context.Context, _, _, _, _, _ string) error {
 	c.reverseCalls++
 	return c.reverseErr
 }

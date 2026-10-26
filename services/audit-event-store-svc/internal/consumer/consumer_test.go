@@ -149,7 +149,7 @@ func TestMalformedEventRejected(t *testing.T) {
 			"tenant_id": "", // deliberately omit to trigger validation failure
 		})
 		err := c.Handle(ctx, "evt-malformed-001", msg)
-		require.NoError(t, err, "malformed event must not return an error to the caller")
+		require.ErrorIs(t, err, consumer.ErrMalformedEvent, "a malformed event must be reported (so the runner dead-letters it), not silently dropped")
 		assert.Equal(t, 0, s.Count(), "malformed event must not be stored")
 	})
 
@@ -162,7 +162,7 @@ func TestMalformedEventRejected(t *testing.T) {
 			"legal_entity_id": "",
 		})
 		err := c.Handle(ctx, "evt-malformed-002", msg)
-		require.NoError(t, err)
+		require.ErrorIs(t, err, consumer.ErrMalformedEvent, "a malformed event must be reported (so the runner dead-letters it), not silently dropped")
 		assert.Equal(t, 0, s.Count())
 	})
 
@@ -175,7 +175,7 @@ func TestMalformedEventRejected(t *testing.T) {
 			"principal_id": "",
 		})
 		err := c.Handle(ctx, "evt-malformed-003", msg)
-		require.NoError(t, err)
+		require.ErrorIs(t, err, consumer.ErrMalformedEvent, "a malformed event must be reported (so the runner dead-letters it), not silently dropped")
 		assert.Equal(t, 0, s.Count())
 	})
 
@@ -188,7 +188,7 @@ func TestMalformedEventRejected(t *testing.T) {
 			"session_context_id": "",
 		})
 		err := c.Handle(ctx, "evt-malformed-004", msg)
-		require.NoError(t, err)
+		require.ErrorIs(t, err, consumer.ErrMalformedEvent, "a malformed event must be reported (so the runner dead-letters it), not silently dropped")
 		assert.Equal(t, 0, s.Count())
 	})
 
@@ -201,7 +201,7 @@ func TestMalformedEventRejected(t *testing.T) {
 			"correlation_id": "",
 		})
 		err := c.Handle(ctx, "evt-malformed-005", msg)
-		require.NoError(t, err)
+		require.ErrorIs(t, err, consumer.ErrMalformedEvent, "a malformed event must be reported (so the runner dead-letters it), not silently dropped")
 		assert.Equal(t, 0, s.Count())
 	})
 
@@ -211,7 +211,7 @@ func TestMalformedEventRejected(t *testing.T) {
 		ctx := context.Background()
 
 		err := c.Handle(ctx, "evt-malformed-bad-json", []byte(`{not valid json`))
-		require.NoError(t, err, "unparseable JSON must not return error to caller")
+		require.ErrorIs(t, err, consumer.ErrMalformedEvent, "a malformed event must be reported (so the runner dead-letters it), not silently dropped")
 		assert.Equal(t, 0, s.Count())
 	})
 
@@ -222,7 +222,7 @@ func TestMalformedEventRejected(t *testing.T) {
 
 		msg := buildContextResolvedMsg(t, "", nil)
 		err := c.Handle(ctx, "", msg) // empty event_id
-		require.NoError(t, err)
+		require.ErrorIs(t, err, consumer.ErrMalformedEvent, "a malformed event must be reported (so the runner dead-letters it), not silently dropped")
 		assert.Equal(t, 0, s.Count())
 	})
 }
@@ -307,7 +307,7 @@ func TestAuditEngagementEventRejectsScopeMismatch(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	require.NoError(t, c.Handle(context.Background(), "evt-audit-mismatch", msg))
+	require.ErrorIs(t, c.Handle(context.Background(), "evt-audit-mismatch", msg), consumer.ErrMalformedEvent)
 	assert.Equal(t, 0, s.Count())
 }
 

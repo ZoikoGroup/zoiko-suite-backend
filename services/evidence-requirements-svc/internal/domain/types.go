@@ -52,10 +52,10 @@ type EvidenceRequirement struct {
 	EvidenceRequirementID string `json:"evidence_requirement_id"`
 	TenantID              string `json:"tenant_id"`
 	// LegalEntityID nil = applies tenant-wide. See package doc.
-	LegalEntityID    *string `json:"legal_entity_id,omitempty"`
-	DomainCode       string  `json:"domain_code"`
-	ActionType       string  `json:"action_type"`
-	EvidenceType     string  `json:"evidence_type"`
+	LegalEntityID *string `json:"legal_entity_id,omitempty"`
+	DomainCode    string  `json:"domain_code"`
+	ActionType    string  `json:"action_type"`
+	EvidenceType  string  `json:"evidence_type"`
 	// RequirementPayload carries the sufficiency parameters as DATA
 	// (minimum_count, artifact_subtype, description). This is the
 	// extensibility seam that keeps the doctrine rule "no service may
@@ -100,12 +100,12 @@ type RequirementSpec struct {
 // evidence, satisfying 03-microservices.md §17.6 ("Every Material Service
 // Must Be Evidential") rather than only enforcing evidence on others.
 type EvidenceEvaluation struct {
-	EvaluationID       string  `json:"evaluation_id"`
-	TenantID           string  `json:"tenant_id"`
-	LegalEntityID      string  `json:"legal_entity_id"`
-	DomainCode         string  `json:"domain_code"`
-	ActionType         string  `json:"action_type"`
-	Outcome            Outcome `json:"outcome"`
+	EvaluationID  string  `json:"evaluation_id"`
+	TenantID      string  `json:"tenant_id"`
+	LegalEntityID string  `json:"legal_entity_id"`
+	DomainCode    string  `json:"domain_code"`
+	ActionType    string  `json:"action_type"`
+	Outcome       Outcome `json:"outcome"`
 	// UnmetPayload / PresentArtifactsPayload are frozen at decision time so
 	// the record stays truthful even after the catalog changes underneath it.
 	UnmetPayload            json.RawMessage `json:"unmet_payload"`
@@ -233,6 +233,12 @@ var (
 	// this as absent rather than as the database being down.
 	ErrInvalidIdentifier = errorString("identifier is not a valid UUID")
 
+	// ErrIdempotencyMismatch is returned when an Idempotency-Key or PBC
+	// correlation_id is replayed with a different request payload. The
+	// stored original is authoritative, so silently answering it would
+	// report success for a write that never happened.
+	ErrIdempotencyMismatch = errorString("idempotency key reused with a different request payload")
+
 	// ErrAlreadyRetired is returned when end-dating a requirement that
 	// already carries an effective_to. Surfaced as 422, never a silent
 	// no-op — invoice-approval-svc's non-atomic read-then-write is the
@@ -266,4 +272,9 @@ var (
 	ErrDocumentNotFound           = errorString("referenced document not found")
 	ErrDocumentMismatch           = errorString("referenced document belongs to a different tenant or legal entity")
 	ErrDocumentServiceUnavailable = errorString("document-vault-svc unavailable")
+
+	// The legal entity is not held by tenant-entity-registry-svc in the
+	// caller's tenant, or the registry could not answer (fail-closed).
+	ErrLegalEntityNotFound = errorString("legal entity does not exist in this tenant")
+	ErrRegistryUnavailable = errorString("tenant-entity-registry-svc unavailable")
 )

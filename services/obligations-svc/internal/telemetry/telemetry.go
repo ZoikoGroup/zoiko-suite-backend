@@ -54,10 +54,24 @@ func InitTracing(ctx context.Context, serviceName, otlpEndpoint string) (func(co
 }
 
 type Metrics struct {
-	HTTPRequestsTotal      *prometheus.CounterVec
-	HTTPRequestDuration    *prometheus.HistogramVec
-	ReadinessUp            prometheus.Gauge
-	EventPublishFailures   *prometheus.CounterVec
+	HTTPRequestsTotal    *prometheus.CounterVec
+	HTTPRequestDuration  *prometheus.HistogramVec
+	ReadinessUp          prometheus.Gauge
+	EventPublishFailures *prometheus.CounterVec
+
+	// Outbox state, for alerting: undelivered events growing, events parked
+	// after OutboxMaxAttempts failures (> 0 is an incident), and the age of
+	// the oldest undelivered event.
+	OutboxPending              prometheus.Gauge
+	OutboxFailed               prometheus.Gauge
+	OutboxOldestPendingSeconds prometheus.Gauge
+}
+
+// SetOutbox implements outbox.Gauges.
+func (m *Metrics) SetOutbox(pending, failed int, oldestPendingSeconds float64) {
+	m.OutboxPending.Set(float64(pending))
+	m.OutboxFailed.Set(float64(failed))
+	m.OutboxOldestPendingSeconds.Set(oldestPendingSeconds)
 }
 
 func NewMetrics(serviceName string) *Metrics {
@@ -83,8 +97,24 @@ func NewMetrics(serviceName string) *Metrics {
 			Help:        "Total event publish failures by event type.",
 			ConstLabels: prometheus.Labels{"service": serviceName},
 		}, []string{"event_type"}),
+		OutboxPending: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name:        "outbox_pending_events",
+			Help:        "Events written to the outbox and not yet delivered to Kafka.",
+			ConstLabels: prometheus.Labels{"service": serviceName},
+		}),
+		OutboxFailed: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name:        "outbox_failed_events",
+			Help:        "Events parked after repeated publish failures; any value above 0 needs an operator.",
+			ConstLabels: prometheus.Labels{"service": serviceName},
+		}),
+		OutboxOldestPendingSeconds: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name:        "outbox_oldest_pending_seconds",
+			Help:        "Age of the oldest undelivered outbox event.",
+			ConstLabels: prometheus.Labels{"service": serviceName},
+		}),
 	}
-	prometheus.MustRegister(m.HTTPRequestsTotal, m.HTTPRequestDuration, m.ReadinessUp, m.EventPublishFailures)
+	prometheus.MustRegister(m.HTTPRequestsTotal, m.HTTPRequestDuration, m.ReadinessUp, m.EventPublishFailures,
+		m.OutboxPending, m.OutboxFailed, m.OutboxOldestPendingSeconds)
 	return m
 }
 

@@ -12,21 +12,28 @@
 //
 // Fail-closed, like every other client on this platform: an unreachable
 // authorization-svc REFUSES the mutation, it never silently permits it.
+//
+// Circuit breaker added per 03-microservices.md §17.7: "All inter-service
+// calls must use circuit breakers, timeouts, retries, and dead-letter routing
+// where applicable. A Tier 2 failure must not collapse a Tier 0 process."
 package authz
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"net/http"
 	"github.com/go-chi/chi/v5/middleware"
+	"net/http"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
+	idenv "zoiko.io/identity-envelope"
 
+	"zoiko.io/obligations-svc/internal/circuitbreaker"
 	"zoiko.io/obligations-svc/internal/domain"
 	svcenvelope "zoiko.io/obligations-svc/internal/envelope"
 )
@@ -58,12 +65,25 @@ const (
 	ActionObligationRead         = "OBLIGATION_READ"
 	ActionFilingRequirementRead  = "FILING_REQUIREMENT_READ"
 	ActionApplicabilityRead      = "APPLICABILITY_DECISION_READ"
+
+	// 21 Oct 2026 completion pass (registered in access-control-svc 000021).
+	ActionObligationUpdate           = "OBLIGATION_UPDATE"
+	ActionFilingStatusUpdate         = "FILING_REQUIREMENT_STATUS_UPDATE"
+	ActionObligationDefinitionManage = "OBLIGATION_DEFINITION_MANAGE"
+	ActionObligationDefinitionRead   = "OBLIGATION_DEFINITION_READ"
+	ActionObligationMappingManage    = "OBLIGATION_ENTITY_MAPPING_MANAGE"
+
+	// PlatformScope is the legal-entity scope for tenant-wide actions (the
+	// definition catalogue has no entity); authorization-svc resolves it to
+	// the configured platform entity, within the caller's tenant.
+	PlatformScope = "PLATFORM"
 )
 
 type HTTPClient struct {
 	baseURL string
 	http    *http.Client
 	log     *zap.Logger
+	breaker *circuitbreaker.CircuitBreaker
 }
 
 func NewHTTPClient(baseURL string, log *zap.Logger) *HTTPClient {
@@ -71,6 +91,7 @@ func NewHTTPClient(baseURL string, log *zap.Logger) *HTTPClient {
 		baseURL: strings.TrimRight(baseURL, "/"),
 		http:    &http.Client{Timeout: 5 * time.Second},
 		log:     log,
+		breaker: circuitbreaker.NewCircuitBreaker("authorization-svc", circuitbreaker.DefaultConfig()),
 	}
 }
 
@@ -177,36 +198,56 @@ func (c *HTTPClient) CheckAllowed(ctx context.Context, principalID, legalEntityI
 	req.Header.Set("X-Source-Channel", authzSourceChannel)
 	req.Header.Set("Idempotency-Key", authzRequestID+":"+actionType)
 
-	resp, err := c.http.Do(req)
-	if err != nil {
-		c.log.Error("authorization-svc unreachable — failing closed",
+	// Forward the caller's canonical envelope for downstream traceability,
+	// and the verified identity envelope so authorization-svc attributes the
+	// decision to the person (X-82i) and sees the authentication age.
+	svcenvelope.ForwardTo(ctx, req)
+	idenv.Forward(ctx, req)
+
+	// Execute with circuit breaker
+	err = c.breaker.Execute(ctx, func() error {
+		resp, err := c.http.Do(req)
+		if err != nil {
+			c.log.Error("authorization-svc unreachable — failing closed",
+				zap.String("principal_id", principalID),
+				zap.String("action_type", actionType),
+				zap.Error(err))
+			return domain.ErrAuthorizationUnavailable
+		}
+		defer func() { _ = resp.Body.Close() }()
+
+		if resp.StatusCode != http.StatusOK {
+			return domain.ErrAuthorizationUnavailable
+		}
+
+		var out authorizeResponse
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			return domain.ErrAuthorizationUnavailable
+		}
+
+		switch out.DecisionOutcome {
+		case "GRANTED":
+			return nil
+		case "DENIED":
+			return domain.ErrAuthorizationDenied
+		default:
+			// Includes the empty string — the zero value, which is what a renamed
+			// field or a changed envelope produces. Refused as an unusable answer
+			// rather than reported as a denial, because it is not a decision this
+			// service was given.
+			return fmt.Errorf("%w: unrecognised decision_outcome %q",
+				domain.ErrAuthorizationUnavailable, out.DecisionOutcome)
+		}
+	})
+
+	if errors.Is(err, circuitbreaker.ErrCircuitOpen) {
+		c.log.Error("circuit breaker open for authorization-svc — failing closed",
 			zap.String("principal_id", principalID),
 			zap.String("action_type", actionType),
-			zap.Error(err))
-		return domain.ErrAuthorizationUnavailable
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
+			zap.String("breaker_state", c.breaker.GetState().String()),
+		)
 		return domain.ErrAuthorizationUnavailable
 	}
 
-	var out authorizeResponse
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return domain.ErrAuthorizationUnavailable
-	}
-
-	switch out.DecisionOutcome {
-	case "GRANTED":
-		return nil
-	case "DENIED":
-		return domain.ErrAuthorizationDenied
-	default:
-		// Includes the empty string — the zero value, which is what a renamed
-		// field or a changed envelope produces. Refused as an unusable answer
-		// rather than reported as a denial, because it is not a decision this
-		// service was given.
-		return fmt.Errorf("%w: unrecognised decision_outcome %q",
-			domain.ErrAuthorizationUnavailable, out.DecisionOutcome)
-	}
+	return err
 }

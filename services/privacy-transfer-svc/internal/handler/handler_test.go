@@ -46,8 +46,6 @@ func (p *stubPublisher) published(eventType string) bool {
 	return false
 }
 
-var _ events.Publisher = (*stubPublisher)(nil)
-
 // ── stub authz ───────────────────────────────────────────────────────────────
 
 type stubAuthz struct{ deny bool }
@@ -70,7 +68,7 @@ func newStubPurposeRegistry() *stubPurposeRegistry {
 	return &stubPurposeRegistry{activities: map[string]*purposeregistry.ActivityVersion{}}
 }
 
-func (p *stubPurposeRegistry) ResolveActivity(_ context.Context, _, activityID string) (*purposeregistry.ActivityVersion, error) {
+func (p *stubPurposeRegistry) ResolveActivity(_ context.Context, _, _, activityID string) (*purposeregistry.ActivityVersion, error) {
 	if p.err != nil {
 		return nil, p.err
 	}
@@ -81,9 +79,12 @@ func (p *stubPurposeRegistry) ResolveActivity(_ context.Context, _, activityID s
 
 const testTenant = "tenant-transfer-1"
 
-func newTestRouter(st *stubStore, pub *stubPublisher, az *stubAuthz, purposes *stubPurposeRegistry) chi.Router {
+func tctx() context.Context { return middleware.WithTenant(context.Background(), testTenant) }
+
+func newTestRouter(st *stubStore, pub *stubPublisher, az handler.AuthzChecker, purposes *stubPurposeRegistry) chi.Router {
 	logger := zap.NewNop()
-	h := handler.New(st, pub, az, purposes, logger)
+	st.pub = pub // the store "enqueues" events; the stub records the committed ones here
+	h := handler.New(st, az, purposes, logger)
 	r := chi.NewRouter()
 	r.Use(middleware.TenantContext())
 	handler.RegisterRoutes(r, h)
@@ -188,7 +189,7 @@ func TestUpdateRelationshipStatus_ToInactive(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
-	updated, _ := st.FindRelationship(context.Background(), rel.RelationshipID)
+	updated, _ := st.FindRelationship(tctx(), rel.RelationshipID)
 	if updated.Status != domain.RelationshipInactive {
 		t.Fatalf("expected INACTIVE, got %s", updated.Status)
 	}
@@ -292,6 +293,33 @@ func TestEvaluateTransfer_AuthorizationDenied_NoIdempotencyRecordCreated(t *test
 	_ = json.Unmarshal(allowed.Body.Bytes(), &d)
 	if d.Result != domain.ResultAuthorized {
 		t.Fatalf("expected AUTHORIZED, got %s", d.Result)
+	}
+}
+
+// An unknown relationship or mechanism id is a 404 (the service's convention for
+// an id that does not resolve), never 503 "store unavailable", and nothing is
+// recorded or published for it.
+func TestEvaluateTransfer_UnknownRelationshipOrMechanism_Is404(t *testing.T) {
+	st := newStubStore()
+	pub := &stubPublisher{}
+	r := newTestRouter(st, pub, &stubAuthz{}, newStubPurposeRegistry())
+	rel := createRelationship(t, r)
+	mech := createValidMechanism(t, r)
+
+	w := doRequest(r, http.MethodPost, "/privacy/transfer-decisions", domain.EvaluateTransferRequest{
+		RelationshipID: rel.RelationshipID, TransferMechanismID: "00000000-0000-0000-0000-0000000000e2",
+	}, testTenant)
+	if w.Code != http.StatusNotFound || !strings.Contains(w.Body.String(), "transfer mechanism not found") {
+		t.Fatalf("unknown mechanism must be 404, got %d: %s", w.Code, w.Body.String())
+	}
+	w = doRequest(r, http.MethodPost, "/privacy/transfer-decisions", domain.EvaluateTransferRequest{
+		RelationshipID: "00000000-0000-0000-0000-0000000000e3", TransferMechanismID: mech.MechanismID,
+	}, testTenant)
+	if w.Code != http.StatusNotFound || !strings.Contains(w.Body.String(), "processor relationship not found") {
+		t.Fatalf("unknown relationship must be 404, got %d: %s", w.Code, w.Body.String())
+	}
+	if pub.published("privacy.transfer.authorization_changed") {
+		t.Fatal("no authorization event may be published for an unknown id")
 	}
 }
 

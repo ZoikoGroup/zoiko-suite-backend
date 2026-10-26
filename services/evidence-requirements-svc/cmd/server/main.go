@@ -28,6 +28,7 @@ import (
 	"github.com/riandyrn/otelchi"
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
+	idenv "zoiko.io/identity-envelope"
 
 	"zoiko.io/evidence-requirements-svc/internal/authz"
 	"zoiko.io/evidence-requirements-svc/internal/config"
@@ -38,6 +39,7 @@ import (
 	svcmiddleware "zoiko.io/evidence-requirements-svc/internal/middleware"
 	"zoiko.io/evidence-requirements-svc/internal/mtls"
 	"zoiko.io/evidence-requirements-svc/internal/outbox"
+	"zoiko.io/evidence-requirements-svc/internal/registry"
 	"zoiko.io/evidence-requirements-svc/internal/store"
 	"zoiko.io/evidence-requirements-svc/internal/telemetry"
 )
@@ -163,13 +165,44 @@ func main() {
 	outboxWorker.Start(context.Background())
 	defer outboxWorker.Stop()
 
+	// ── 4c. Identity gate and legal-entity registry ──────────────────────────
+	// X-Tenant-Id / X-Principal-Id were trusted as sent while port 8130 was
+	// published (Governance audit X5). The gate verifies identity-context-
+	// svc's signed envelope and that its session is still live (AU-01), then
+	// sets those headers from the verified claims. IDENTITY_VERIFY: require
+	// (default outside local) | warn.
+	gate, gateSettings, err := idenv.NewGateFromEnv("evidence-requirements-svc", log, idenv.EnvOptions{})
+	if err != nil {
+		log.Fatal("identity gate configuration refused", zap.Error(err))
+	}
+	log.Info("identity gate", gateSettings.Fields()...)
+
+	var entityChecker handler.EntityChecker
+	switch {
+	case cfg.TenantRegistryURL != "":
+		entityChecker = registry.New(cfg.TenantRegistryURL, log)
+	case !cfg.LocalEnv():
+		log.Fatal("TENANT_REGISTRY_URL is required outside local/dev: the legal entity of every evaluation and requirement is server-validated")
+	default:
+		log.Warn("TENANT_REGISTRY_URL unset — legal entities are not confirmed against the registry (local/dev only)")
+		entityChecker = registry.Noop{}
+	}
+	evaluateMode := handler.ParseGateMode(cfg.EvaluateAuthzMode)
+	readMode := handler.ParseGateMode(cfg.ReadAuthzMode)
+	if (evaluateMode == handler.GateWarn || readMode == handler.GateWarn) && !cfg.LocalEnv() {
+		log.Warn("evidence authorization gate in WARN mode outside local/dev — refusals are logged and admitted",
+			zap.String("evaluate", string(evaluateMode)), zap.String("read", string(readMode)))
+	}
+
 	// ── 5. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()
+	r.Use(idenv.RequestID)
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
 	r.Use(middleware.Recoverer)
 	r.Use(otelchi.Middleware("evidence-requirements-svc", otelchi.WithChiRoutes(r)))
 	r.Use(metrics.HTTPMiddleware)
+	r.Use(gate.Middleware)
 	r.Use(correlationIDMiddleware)
 	// Reads the caller's tenant scope from X-Tenant-Id (set by
 	// gateway-auth-svc's ForwardAuth verification) into context, so every DB
@@ -185,7 +218,9 @@ func main() {
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
-	h := handler.New(pgStore, authzClient, docsClient, log)
+	h := handler.New(pgStore, authzClient, docsClient, log).
+		WithRegistry(entityChecker).
+		WithGateModes(evaluateMode, readMode)
 	handler.RegisterRoutes(r, h)
 	handler.RegisterPBCRoutes(r, h, pgStore)
 

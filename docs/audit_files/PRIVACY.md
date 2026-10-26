@@ -21,7 +21,7 @@ Services covered (all port numbers verified against `deployments/docker-compose.
 
 **Methodology:** read-only inspection of backend Go code, frontend admin UI, and Docker Compose wiring for each service, scored across Frontend / Backend / Integration completion percentages against each service's intended architecture.
 
-**Methodology note (as reported by the auditing agent):** `services/README.md`'s top-level table does not list any of the 5 privacy-* services. Intended architecture for these 5 services was reconstructed from the detailed inline comments in `deployments/docker-compose.yml` (lines 3637-3857) and from each `handler.go`'s own doc comments referencing spec "ZS-SVC-W-001" (PRV-01..PRV-05). None of the 5 services have their own README.md file. All 5 `go vet ./...` clean and all 5 `go test ./...` pass.
+**Methodology note (as reported by the auditing agent):** `services/README.md`'s top-level table does not list any of the 5 privacy-* services. Intended architecture for these 5 services was reconstructed from the detailed inline comments in `deployments/docker-compose.yml` (the five `# ── privacy-*-svc (Port: 815x)` blocks; the compose file keeps growing, so these anchors are comment headers, not fixed line numbers — at the 2026-10-21 re-audit the blocks ran from the `privacy-purpose-registry-svc (Port: 8151)` header at line 4411 to line 4651) and from each `handler.go`'s own doc comments referencing spec "ZS-SVC-W-001" (PRV-01..PRV-05). None of the 5 services have their own README.md file. All 5 `go vet ./...` clean and all 5 `go test ./...` pass.
 
 ## PRV-01 — `privacy-purpose-registry-svc`
 
@@ -35,9 +35,9 @@ Services covered (all port numbers verified against `deployments/docker-compose.
 
 | Area | Assessment | Basis |
 |---|---|---|
-| **Backend (service-owned spec compliance)** | **29 of 32 comparable audit items match (≈ 90.6%)**; 3 partial; 0 missing; 2 needs clarification (submit→WFC; gate-3 rationale ownership) | Re-scored against the same 34-row audit table that produced 56.3%. The 3 partial items are named under *Remaining gaps*. |
+| **Backend (service-owned spec compliance)** | **No % asserted** (earlier ≈ 90.6% re-score superseded by the domain audit: 87.8%, 36 of 41); service-owned gaps fixed in the latest pass (incl. suspension time-slicing); the remaining partial items are external reference verification | Re-scored against the same 34-row audit table that produced 56.3%. The 3 partial items are named under *Remaining gaps*. |
 | **Frontend** | **Not updated in this pass — NOT compliant with the new contract** | The workbench does not send `privacy_owner`, `necessity_rationale`, `special_condition_refs` or `processor_refs`, so a version created from the UI cannot pass gates 1/3/4/6; and its activation call sends a free `effective_from`, which is now refused unless it equals "now" (±60 s). |
-| **Integration** | **BLOCKED — DEPENDENCY** | `privacy-consent-svc`, `privacy-decision-svc` and `privacy-transfer-svc` call the GET routes with `X-Tenant-Id` only. Those routes now require `X-Principal-Id` and a grant, so the calls receive `401`. Not fixable inside this service (see below). |
+| **Integration** | **BLOCKED — DEPENDENCY (unverified end to end)** | `privacy-consent-svc`, `privacy-decision-svc` and `privacy-transfer-svc` forward the calling request's `X-Tenant-Id` **and** its `X-Principal-Id` (each client sets the principal header whenever its caller has one — `internal/purposeregistry/client.go` in each service), so principal propagation no longer causes a `401`. Still open and external: that the forwarded principal holds `PRIVACY_PURPOSE_READ` / `PRIVACY_ACTIVITY_READ` in `authorization-svc` (provisioning is not done here), a defined service-to-service identity for calls with no end-user principal, and a live-stack run. This service takes `X-Principal-Id` as supplied and asks `authorization-svc` for the grant; it performs no signature verification of the header. |
 | **Overall** | **Not 100%** | — |
 | **Production readiness** | **NOT READY** | Blocked on the dependent clients, the frontend, provisioning of the new action codes in `authorization-svc`, and a live-stack run (none was performed — see *Verification*). |
 
@@ -99,7 +99,7 @@ Blank list entries are findings. Registry codes are stored canonicalised (trimme
 
 **Events — transactional outbox only.** The handler holds no publisher. Each state change enqueues its event inside its own transaction; a rolled-back change leaves no event, a committed one leaves exactly one. The relay (the only component that talks to Kafka) retries with backoff, records each failure durably, requires full broker acknowledgement (`RequireAll`), and verifies that its own bookkeeping updated exactly one row. Events: `privacy.purpose.published`, `privacy.processing_activity.{submitted,approved,rejected,activated,suspended,resumed,retired}`; `validate` is audited but is not a §19 event. The activity-event payload embeds the full version (tenant, activity/version, effective window, role and purpose scope) plus `previous_status`, **`policy_refs`** (lawful-basis and special-condition refs of the linked published purposes + the version's retention, transfer and processor refs) and, on a superseded version's retired event, `superseded_by_version_id`. Platform events carry an empty tenant.
 
-**Error contract (§32).** Every error is `{"error", "error_code"}` (activation refusals add `findings`). §32 codes keep their §32 meaning: `PRV-001` unknown/unpublished purpose, `PRV-002` no governing activity version, `PRV-020` re-publishing a published (immutable) purpose, and the finding codes above. The rest are local symbolic codes (`AUTHENTICATION_FAILED`, `AUTHORIZATION_DENIED`, `TENANT_SCOPE_REQUIRED`, `TENANT_SCOPE_MISMATCH`, `PLATFORM_SCOPE_REQUIRED`, `IDEMPOTENCY_KEY_REQUIRED`, `IDEMPOTENCY_MISMATCH`, `CORRELATION_ID_REQUIRED`, `INVALID_TRANSITION`, `SOD_DENIED`, `INVALID_AS_OF`, `EFFECTIVE_TIME_INVALID`, `VALIDATION_FAILED`, `NOT_FOUND`, `STORE_UNAVAILABLE`, `INTERNAL_ERROR`) because §32 names no code for them — the same convention `privacy-consent-svc` uses.
+**Error contract (§32).** Every error is `{"error", "error_code"}` (activation refusals add `findings`). §32 codes keep their §32 meaning: `PRV-001` unknown/unpublished purpose, `PRV-002` no governing activity version, `PRV-020` re-publishing a published (immutable) purpose, and the finding codes above. The rest are local symbolic codes (`AUTHENTICATION_FAILED`, `AUTHORIZATION_DENIED`, `TENANT_SCOPE_REQUIRED`, `TENANT_SCOPE_MISMATCH`, `PLATFORM_SCOPE_REQUIRED`, `IDEMPOTENCY_KEY_REQUIRED`, `IDEMPOTENCY_MISMATCH`, `CORRELATION_ID_REQUIRED`, `INVALID_TRANSITION`, `SOD_DENIED`, `INVALID_AS_OF`, `EFFECTIVE_TIME_INVALID`, `VALIDATION_FAILED`, `NOT_FOUND`, `METHOD_NOT_ALLOWED`, `STORE_UNAVAILABLE`, `INTERNAL_ERROR`) because §32 names no code for them. Transport-level errors use the same envelope: unknown route `404 NOT_FOUND`, unsupported method `405 METHOD_NOT_ALLOWED` (with `Allow`), a recovered handler panic `500 INTERNAL_ERROR`, a failed `/readyz` `503 STORE_UNAVAILABLE`; only a request Go's `net/http` rejects before routing keeps net/http's plain-text reply — the same convention `privacy-consent-svc` uses.
 
 **Migrations (corrected list).** `000001_initial_schema`; `000002_immutability` (published-purpose and non-DRAFT-activity content triggers); `000003_add_rls`; `000004_activation_gates_and_idempotency` (`notice_consent_dependency`, `dpia_tia_status`, `purpose_registry_idempotency_keys`); `000005_fix_gaps` (one-ACTIVE unique index, per-operation RLS policies, approver/rejecter/activator columns, `event_outbox`); `000006_scope_audit_and_activation_integrity` (`privacy_owner`, `processor_refs`, `effective_to`, `necessity_rationale`, `special_condition_refs`, `activity_lifecycle_audit`, DELETE-rejecting triggers, platform-capability write policies, tightened outbox/idempotency policies). The earlier README named `000002_immutability_triggers` and omitted 000005.
 
@@ -124,11 +124,33 @@ Blank list entries are findings. Registry codes are stored canonicalised (trimme
 
 Additional defects found and fixed while doing the above: the authorization client substituted one hard-coded tenant UUID for every platform-scope check (it now forwards the caller's verified tenant); the `event_outbox` policy allowed any tenant-less session to read and write every tenant's pending events; the relay did not check that its bookkeeping UPDATE affected a row; the Kafka writer used fire-and-forget acknowledgement; startup logged a warning and continued with a nil database pool.
 
+### Latest pass (domain-audit remediation)
+
+| # | Gap | Result | Proven by |
+|---|---|---|---|
+| 1/2 | Tenant isolation / read routes | **No change required** — strict tenant/platform RLS and principal + tenant + grant on every GET were already in place and still pass. | store RLS tests, handler pre-flight tests |
+| 3 | Idempotency saved after commit, save errors swallowed, concurrent duplicates | **Fixed.** `store.RunIdempotent`: claim, change, audit row, outbox event and replay response are one transaction (every store call joins it); a failed save fails the operation and persists nothing; concurrent identical requests execute once; refused operations consume no key; scope (tenant-or-platform, principal, key) and the method + path + body hash are unchanged. | store `TestRunIdempotent_*` (real PostgreSQL: rollback with injected failure, 8-way race), handler `TestIdempotency_SaveFailure_*`; mutation checks (not joining the transaction; proceeding on a lookup failure) fail the intended tests |
+| 5 | Reference validation (lawful basis, retention, transfer, processor) | **Not changed — CROSS-SERVICE / EXTERNAL DEPENDENCY.** §8.2 asks for PDC-approved basis references and for retention/transfer/processor dependencies to be *identified*; existence/approval belongs to PDC, DRC and PRV-05 and would require callable contracts and invented rules here. Presence and well-formedness remain enforced. | — |
+| 8 | Documentation | `owner` required at draft creation documented; counts and idempotency text corrected. | — |
+
+### Latest pass (documentation-compliance remediation, 2026-10-21)
+
+Scope: the four service-owned gaps of the latest documentation-compliance audit (42/49). `authorization-svc` and every other service were left untouched.
+
+| Audit row | Gap | Result | Proven by |
+|---|---|---|---|
+| 4 | `GET /privacy/purposes` returned every PUBLISHED version row (superseded, future-dated, several per purpose) | **Fixed.** Returns one row per purpose: the published version in force now — the version `GET /privacy/purposes/{id}` resolves with no parameters (same filter and ordering). ZS-SVC-W-001 defines no list route; "currently published" is read through the spec's effective-dated supersession doctrine (§8.1) and that existing resolve rule, not through a new rule. | store `TestListPurposes_*` (real PostgreSQL, restricted role: current version, superseded, future-dated, multiple versions, draft, tenant isolation/platform baseline, a version entering force when its time arrives); handler `TestListPurposes_*`; mutations (list back to all published rows; future-dating filter removed) fail the intended tests |
+| 35 | Router 404/405, recovered panic 500 and `/readyz` 503 bypassed the `{error, error_code}` envelope | **Fixed.** `404 NOT_FOUND`, `405 METHOD_NOT_ALLOWED` (+`Allow`), `500 INTERNAL_ERROR` (panic value never sent to the caller), `503 STORE_UNAVAILABLE`; `handler.NewRouter` is the single router `cmd/server` and the tests share. The README is the contract that says "every error"; ZS-SVC-W-001 §32 fixes code meanings only and names no transport behaviour, so the new local code `METHOD_NOT_ALLOWED` is the service's own. Requests Go's `net/http` rejects before routing keep its plain-text reply (documented boundary). | handler `TestErrorContract_*` (unknown route, unsupported method, recovered panic, readiness failure, healthz unchanged, pre-flight unchanged on registered routes); mutations (handlers not installed, plain recoverer, plain readiness body) fail the intended tests |
+| 50 | This file said the dependent clients send `X-Tenant-Id` only | **Fixed (documentation).** Verified in the three `internal/purposeregistry/client.go` files: tenant and, when present, principal are forwarded. Wording now separates propagation, `authorization-svc` provisioning and verification (none claimed). | code read |
+| 51 | Stale `pg_store.go` lines, compose range, test counts | **Fixed (documentation).** Citations now point at the current code or are anchored to comment headers; test counts are 95. | `go test` |
+
+Not changed, still external or unresolved: row 11 (WFC submit hand-off), row 30 (gate 4 / PDC), row 32 (gate 6 / DRC / PRV-05) — **CROSS-SERVICE / EXTERNAL BLOCKERS**; rows 15, 34, 37 and 52 remain **needs clarification**.
+
 ### Verification
 
 Run from `services/privacy-purpose-registry-svc` with `REQUIRE_DB_TESTS=1` (an unreachable database is a failure, not a skip) against a throwaway PostgreSQL 16 where every test gets a fresh database with all migrations applied and connects as a `NOSUPERUSER NOBYPASSRLS` role (the harness aborts if the role could bypass RLS):
 
-- `go test ./...` — **pass**: 67 top-level tests (domain 4, handler 46 — 4 of them end-to-end HTTP→handler→PostgreSQL —, store 17), plus 33 subtests. No test skipped.
+- `go test ./...` — **pass**: 95 top-level tests (domain 4, handler 62 — 4 of them end-to-end HTTP→handler→PostgreSQL —, store 29), plus subtests. No test skipped when the database is reachable (unreachable ⇒ skip).
 - `go vet ./...` — clean. `go build ./...` — clean.
 - **Mutation checks** (each reverted afterwards): forcing the platform capability on, disabling the retire step, enqueuing a duplicate event, dropping `effective_to`, restoring the old outbox policy, and disabling authorization each make the intended tests fail.
 - The old handler test files (`handler_test.go`, `gaps_test.go`) were replaced: they referenced the removed event publisher and the previous contract.
@@ -136,14 +158,14 @@ Run from `services/privacy-purpose-registry-svc` with `REQUIRE_DB_TESTS=1` (an u
 
 ### Remaining gaps
 
-1. **Suspension is current-state only.** `effective_from`/`effective_to` and `known_as_of` are implemented, but a `SUSPENDED` interval is not time-sliced in `as_of` resolution (the audit table records suspend/resume instants; resolution does not yet use them), so "was it suspended at T" is not reproducible from `as_of` alone.
+1. *(fixed)* Suspension is now correctly time-sliced for `as_of` historical resolution. The returned `version_status` is the status at the requested instants, derived from the append-only `SUSPEND`/`RESUME` rows of `activity_lifecycle_audit` (`recorded_at ≤ as_of` and `≤ known_as_of`, half-open intervals); current reads (no `as_of`) are unchanged. A suspended instant resolves with `version_status: SUSPENDED` (the specification names no other status code). A version suspended before the audit table existed has no row to slice and stays SUSPENDED. See the README, "Bitemporality".
 2. **Gate 4/6 reference *existence* is not verified.** Lawful-basis, special-condition, retention, transfer and processor references are checked for presence and well-formedness only; that they resolve to real PDC/DRC/PRV-05 records cannot be checked until those catalogues are callable (dependency-blocked).
-3. **Idempotency record is saved after commit, not in the transaction.** A crash between the two lets a retry re-execute (state transitions then fail with `409`; creates would duplicate). Concurrent first requests with the same key are not serialised. Replay bodies are read back from a `JSONB` column, so they are JSON-equivalent to the original, not byte-identical.
+3. **Idempotency** — fixed in the latest pass (below): the record is committed in the same transaction as the change. Replay bodies are still read back from a `JSONB` column, so they are JSON-equivalent to the original, not byte-identical.
 4. Existing ACTIVE versions created before this pass have no `privacy_owner`; they stay ACTIVE and are only re-checked if a successor is validated.
 
 ### Dependency-blocked items
 
-- **BLOCKED — DEPENDENCY: `privacy-consent-svc`, `privacy-decision-svc`, `privacy-transfer-svc`.** Their purpose-registry clients send `X-Tenant-Id` only. They must also send an `X-Principal-Id` (a service principal granted `PRIVACY_PURPOSE_READ` / `PRIVACY_ACTIVITY_READ`), or every cross-service purpose/activity lookup returns `401`. Service-to-service identity is a platform decision; no bypass was added here.
+- **BLOCKED — DEPENDENCY: `privacy-consent-svc`, `privacy-decision-svc`, `privacy-transfer-svc`.** Their purpose-registry clients forward `X-Tenant-Id` and, when the caller has one, `X-Principal-Id` (verified in each `internal/purposeregistry/client.go`). Principal and tenant propagation are therefore in place; what is not is `authorization-svc` provisioning of `PRIVACY_PURPOSE_READ` / `PRIVACY_ACTIVITY_READ` for those principals (until then the lookups get `403`), a defined service-to-service identity for calls with no end-user principal (the lookup gets `401` without a principal), and any end-to-end run against live services. Service-to-service identity is a platform decision; no bypass was added here.
 - **BLOCKED — DEPENDENCY: `authorization-svc` provisioning.** The new actions `PRIVACY_PURPOSE_READ`, `PRIVACY_ACTIVITY_READ`, `PRIVACY_ROPA_READ` must be granted (and the platform-scope grant for platform-plane principals). Until then the reads fail closed with `403`.
 - **BLOCKED — DEPENDENCY: frontend.** Needs the four new content fields, the `X-Tenant-Id` platform-scope option, and removal of its free `effective_from` on activation.
 - **WFC (§2.1/§9.1).** *Submit* is a real, audited transition but does not hand the version to a WFC approval workflow, and approval is a local, separately-authorized, maker-checker-gated call. WFC owns timers, approval orchestration and escalation; none is integrated. This is documented, not hidden.
@@ -160,7 +182,7 @@ Run from `services/privacy-purpose-registry-svc` with `REQUIRE_DB_TESTS=1` (an u
 
 | Area | Status |
 |---|---|
-| Backend | **≈ 90.6%** (29/32) — see *Remaining gaps* |
+| Backend | Service-owned gaps fixed (no % asserted) — see *Remaining gaps* |
 | Frontend | **Not updated — not compliant with the new contract** |
 | Integration | **BLOCKED — DEPENDENCY** |
 | Overall | **Not 100%** |
@@ -175,74 +197,78 @@ Run from `services/privacy-purpose-registry-svc` with `REQUIRE_DB_TESTS=1` (an u
 **Port:** 8152
 **Classification:** Interlinked (depends on privacy-purpose-registry-svc + authorization-svc; depended on by privacy-decision-svc)
 
-> **Correction notice.** Earlier versions of this section said **100% / Production Ready / 19 tests / no remaining gaps**, and Part 2 separately gave different figures. Neither was supportable: a documentation-compliance audit against ZS-SVC-W-001 scored the service **64.7%** (22 of 34 comparable items). This section replaces both and describes the service **as remediated and verified in this pass**. It also withdraws two specific claims that were not true of the code: that `PRIVACY_FULL` contains this service's permissions (nothing in the repository provisions them), and that the Decision → Consent and Consent → Purpose-Registry integrations were verified working (they are refused today — see *External dependencies*).
+> **Correction notice.** Earlier versions of this section said **100% / Production Ready / 19 tests / no remaining gaps**, and Part 2 separately gave different figures. Neither was supportable: a documentation-compliance audit against ZS-SVC-W-001 first scored the service **64.7%** (22 of 34), a first remediation pass re-scored it ≈ 93.9% on the same table, and a later domain audit scored it **75.0% (21 of 28 comparable items)**. That later audit found: seven mutating routes validated the body (400) before authenticating the caller; some routes ran authorization before the correlation-id check and the tenant check before the principal check; the presentation-receipt response had no §18 `receipt_id`; idempotency was scoped to (tenant, key) only, hashed the body alone, and was saved **after** the operation committed; the purpose-registry client forwarded no principal; and the documented route count and test counts were stale. This section replaces the earlier claims and describes the service **as remediated and verified in this pass**. **No compliance percentage is asserted here.**
 
 ### Status
 
 | Area | Assessment | Basis |
 |---|---|---|
-| **Backend (service-owned compliance)** | **≈ 93.9%** — 31 of 33 comparable audit items match; 2 partial; 0 missing; 6 needs-clarification/dependency | Re-scored against the same 39-row table that produced 64.7%. If the workforce-consent row is instead still counted as a miss (as the earlier audit counted it) the figure is 31/34 ≈ 91.2%. |
+| **Backend (service-owned)** | **Service-owned gaps fixed; remaining items are external or need clarification** | See the two tables below. |
 | **Frontend** | **Not assessed in this pass** | No frontend file was read or changed. |
-| **Integration** | **BLOCKED — DEPENDENCY** | Both inbound (decision-svc) and outbound (purpose-registry) calls are refused with `401` because neither side presents a service identity. |
-| **Production readiness** | **NOT READY** | The code is covered by tests; the integrated system is not safe to roll out until the dependencies below are resolved. |
+| **Integration** | **BLOCKED — DEPENDENCY** | The registry-side grant for the forwarded principal (`authorization-svc`) and a service-to-service identity are not provided; not verified against live services. |
+| **Production readiness** | **NOT READY** | Code is covered by tests; the integrated system is not safe to roll out until the dependencies below are resolved. |
 
-### What changed in this pass (the 12 audited gaps)
+### This pass (domain-audit remediation)
 
 | # | Gap | Result | Proven by |
 |---|---|---|---|
-| 1 | Re-grant blocked after INVALIDATED / EXPIRED | **Fixed.** A replay returns the original receipt only while it is still the latest receipt, same action and notice version, and still derives to GRANTED/DENIED. Otherwise a new receipt is written; old evidence is untouched. (Same defect also affected a grant after a later DENY — fixed by the same rule.) | handler `TestGap1_*`, store `TestGap1_*` (real PostgreSQL) |
-| 2 | RLS `tenant_id IS NULL OR …` | **Fixed** by migration `000006`: exception removed from every policy, no platform exception added, `tenant_id IS NOT NULL` CHECK on new rows, outbox policy tightened. Withdraw/invalidate now authorize first, then answer `404` for a receipt the tenant does not own (including one with no tenant). | store `TestGap2_*` (cross-tenant read/withdraw/invalidate/update, NULL-tenant rows, `pg_policies` structure, outbox), handler `TestGap2_*` |
-| 3 | Workforce consent | **Not implemented — documented dependency.** The spec ties it to what "policy says" / what "PDC flags" (PRV-N10, decision-time, PRV-03); this service cannot know a PDC flag and no control was invented. | README, this section |
-| 4 | Offline-import provenance | **Fixed.** `import_source`, `import_capture_method`, `import_evidence_ref`, `imported_at` all required when `is_offline_import`; `imported_at` may not be in the future; typed `IMPORT_PROVENANCE_REQUIRED`. Online consent unaffected. | handler `TestGap4_*`, store `TestGap4_*` |
-| 5 | Receipt integrity hash | **Fixed.** SHA-256 (algorithm unchanged; §33 OD-06 leaves the scheme open) now covers proxy, affirmative-action evidence, import provenance, `expires_at`, age band and the whole ConsentRequest; deterministic; the digest recomputes from the stored row and tampering with any covered column is detected. A reflection test fails if a new receipt field is added without deciding whether it is covered. | domain `TestIntegrityHash_*`, store `TestGap5_*` |
-| 6 | §18 response schema | **Fixed additively.** `receipt_id`, `notice_version`, `status`, `evidence_hash`, `scope`, `withdrawal_id`, `effective_at`, `propagation_correlation` added next to the existing names with identical values. | domain/handler `TestGap6_*` |
-| 7 | Idempotency errors | **Fixed.** Lookup failure → `503` and nothing executes; save failure after commit → `500 IDEMPOTENCY_RECORD_NOT_SAVED` with `committed: true` and the result. Mandatory key unchanged. | handler `TestGap7_*` |
-| 8 | `privacy.consent.changed` payload | **Fixed.** Carries subject, purpose/scope, `change_type`, derived `old_state`/`new_state` read inside the transaction, receipt/withdrawal/invalidation reference, effective time. Replays emit nothing; still one outbox row per event. | store `TestGap8_*` |
-| 9 | Latest-version routes reveal existence | **Fixed.** Order is principal → tenant → correlation → authorization → idempotency → resolve; existing and nonexistent ids answer identically (`403`) to an unauthorized caller. | handler `TestGap9_*` |
-| 10 | Permission provisioning claim | **Claim removed; documented as external.** Grants are `authorization-svc` runtime data; the repository provisions none for this service. | README, this section |
-| 11 | decision-svc consent lookup | **Not fixed — documented dependency.** The architecture names service identity as a goal but defines no mechanism; the read's authorization was not weakened. Pinned by a test. | handler `TestGap11_*` |
-| 12 | Documentation | **Rewritten** (this section, Part 2, README). | — |
+| 1 | Tenant isolation | **No change required.** Strict RLS (migration `000006`) and `401 TENANT_SCOPE_REQUIRED` were already in place; the existing real-PostgreSQL tests still pass. | store `TestGap2_*` |
+| 2 | Read-route authentication | **Already compliant** (`GET /privacy/consents`, `/privacy/preferences`: principal, tenant, grant); the parameter validation that preceded authentication is fixed (see 6). `GetNotice` stays tenant-scoped and principal-less by design. | handler `TestReadsValidateParametersOnlyAfterAuthentication` |
+| 3 | Idempotency | **Fixed.** Scope (tenant, principal, key) — migration `000007`; hash covers method + path + body; the claim, evidence rows, outbox event and replay response are **one transaction** (`store.RunIdempotent`, every store call joins it); a failed save persists nothing and the retry re-executes; concurrent identical requests execute once; lookup failure → 503 (unchanged). The `500 IDEMPOTENCY_RECORD_NOT_SAVED` outcome is removed. | store `TestRunIdempotent_*` (real PostgreSQL), handler `TestIdempotency_*`, `TestGap7_*`; mutation check: not joining the transaction fails the rollback test |
+| 5 | Registry reference | **Service-owned part fixed:** the caller's principal and tenant are forwarded to PRV-01. **BLOCKED — EXTERNAL DEPENDENCY:** the registry-side grant in `authorization-svc` and service-to-service identity. | client tests (stub registry) |
+| 6 | API / error contract | **Fixed.** Order is principal → tenant → correlation → authorization → idempotency → validation → resolve on every mutating route; `receipt_id` added (additively) to the presentation receipt. | handler `TestValidationNeverPrecedesAuthentication`, `TestPresentationReceipt_CarriesTheSection18ReceiptID` |
+| 8 | Documentation | Rewritten (this section, PRV-02, README); route count (17), test counts and the idempotency/external-dependency text corrected. | — |
+
+### Latest pass (documentation-compliance remediation, 2026-10-21)
+
+| Audit row | Gap | Result | Proven by |
+|---|---|---|---|
+| 45 | A refused notice lifecycle transition (approve/publish/withdraw) answered `409` with `error_code: IDEMPOTENCY_MISMATCH` (status-derived fallback) | **Fixed.** `409 INVALID_TRANSITION` on all three routes (explicit and canonical); the fallback no longer derives an idempotency code from a status; a real key reuse is still `409 IDEMPOTENCY_MISMATCH`, written with its own code. HTTP statuses are unchanged. The README now has one error table and states which responses are outside the `{error, error_code}` envelope (router 404/405, panic recovery, `/readyz`, net/http-level rejections). | handler `TestInvalidNoticeTransitions_AnswerInvalidTransition`, `TestIdempotencyMismatch_StillAnswersIdempotencyMismatch`, `TestInvalidNoticeTransition_DoesNotConsumeTheKey`, `TestValidNoticeTransitions_StillSucceed`, `TestInvalidTransition_AuthorizationStillPrecedesLookupAndState`, `TestInvalidTransition_PreflightUnchanged`; mutation (old behaviour restored) fails the intended tests |
+| 48 | README carried two contradictory idempotency sections (one still described `500 IDEMPOTENCY_RECORD_NOT_SAVED` / `committed: true`) | **Fixed (documentation).** Stale section removed; one description remains: mandatory key, authorization before replay, (tenant, principal, key) scope, method + path + body binding, one-transaction atomicity, fail-closed lookup, a failed or refused operation stores nothing so the key can be retried; `IDEMPOTENCY_RECORD_NOT_SAVED` no longer exists. | existing store `TestRunIdempotent_*`, handler `TestIdempotency_*` |
+| — | At most one PUBLISHED version per notice is not enforced | **Investigated, not changed — NEEDS CLARIFICATION / DESIGN DECISION.** ZS-SVC-W-001 does not state the invariant. A throwaway probe on real PostgreSQL reproduced two PUBLISHED versions in 24 of 25 concurrent-publish rounds (probe deleted; no schema or locking change made). | probe run, documented in the README "Remaining limitations" |
+
+### Earlier remediation (12 audited gaps, kept for history)
+
+Re-grant after INVALIDATED/EXPIRED (replay only while the receipt is the live latest outcome); RLS `NULL` exception removed (migration `000006`); workforce consent not implemented (PDC-owned, PRV-N10); offline-import provenance enforced; receipt integrity v2; §18 response schema (additive); `privacy.consent.changed` payload with derived old/new state through the transactional outbox; latest-version routes do not reveal existence; permission-provisioning claim removed; decision-svc lookup left as a documented dependency. Details are in the service README.
 
 ### Verification
 
 Run from `services/privacy-consent-svc`:
-
-- `go test ./...` with `REQUIRE_DB_TESTS=1` and `TEST_DATABASE_URL` set to a throwaway PostgreSQL 16 superuser URL: **114 top-level tests pass, none skipped** (domain 7, handler 74, outbox 10, purposeregistry 2, store 21; plus subtests). Each database test gets a fresh database with migrations 000001–000006 applied and connects as a `NOSUPERUSER NOBYPASSRLS` role.
+- `go test ./...` with `REQUIRE_DB_TESTS=1` against a throwaway PostgreSQL 16 (fresh database per test, migrations 000001–000008, app role `NOSUPERUSER NOBYPASSRLS`): **147 top-level tests pass, none skipped** (domain 7, handler 94, outbox 10, purposeregistry 3, store 33).
+- **Without** a database: 109 pass and **38 are skipped** (RLS, outbox, notice-binding, store-level evidence and idempotency tests) — a run without a database does **not** prove tenant isolation or atomicity.
 - `go vet ./...` and `go build ./...`: clean.
-- **Without** `TEST_DATABASE_URL`: 88 pass and **26 are skipped** — including the RLS, outbox, notice-binding and store-level evidence tests. A run without the database does **not** prove tenant isolation.
-- **Mutation checks** (each reverted): restoring the old dedupe, the NULL-tenant policy exception, dropping any of four hash fields, a wrong `old_state`, fail-open idempotency lookup, ignored save error, resolving the notice before authorizing, un-enforced offline provenance, a NULL-tenant receipt treated as shared, and a missing §18 field each make the intended tests fail.
-- **Not performed:** no Docker rebuild, no run against the live compose stack, no frontend check, and no live `authorization-svc` grant check.
+- **Mutation checks** (each reverted): not joining the idempotency transaction, proceeding on a lookup failure, and dropping the presentation `receipt_id` each make the intended tests fail.
+- **Not performed:** Docker rebuild, live compose stack, live `authorization-svc` / purpose registry, frontend.
 
 ### External dependencies
 
-1. **Consent → purpose-registry is refused.** `RecordConsent` calls `GET /privacy/purposes/{id}` with `X-Tenant-Id` only; the remediated registry requires a principal, so the call is `401`, reported as "unavailable", and `RecordConsent` answers `503 UPSTREAM_UNAVAILABLE`. (Pinned by `internal/purposeregistry/client_test.go`; whether the remediated registry is deployed was not checked.)
-2. **Decision → consent is refused.** privacy-decision-svc's consent client sends `X-Tenant-Id` only; every lookup is `401`.
-3. Both need a **service-to-service identity**: `docs/architecture/05-security.md` §12.4 lists "authenticated workload identity" and "traceable service-principal identity" as goals but no mechanism is defined, so none was invented. It is a platform decision and the callers must change.
-4. **Grants are not provisioned by this repository** — `authorization-svc` holds them as runtime data; the only RBAC seed script (`scratch/seed_transfer_rbac.ps1`) covers privacy-transfer-svc for a fixed test principal. Until an operator grants the actions, routes fail closed with `403`.
-5. **Workforce consent (§11.1)** is policy/PDC-owned (see gap 3).
-6. **WFC (§2.1)**, **representative-authority verification (§11.1)** and **PDC** are dependency-blocked as before.
+1. **Purpose registry (PRV-01):** the call now forwards the caller's principal and tenant, but needs a `PRIVACY_PURPOSE_READ` grant for that principal in `authorization-svc` (not provisioned by this repository); until then it is `401` → `503 UPSTREAM_UNAVAILABLE` (fail closed).
+2. **Decision → consent:** this service requires a principal and `PRIVACY_CONSENT_READ`; what the decision service presents is that service's concern.
+3. **Service-to-service identity:** `docs/architecture/05-security.md` §12.4 lists the goal but defines no mechanism, so none was invented.
+4. **Grants are not provisioned by this repository** — `authorization-svc` holds them as runtime data.
+5. **Workforce consent (§11.1)** is policy/PDC-owned; **WFC (§2.1)**, **representative-authority verification (§11.1)** and **PDC** are dependency-blocked.
 
 ### Remaining limitations
 
-- The idempotency record is saved after commit, not in the transaction.
-- `PreferenceAssertion` has no separate effective time.
-- Legacy rows with a NULL `tenant_id` become invisible to the application role after `000006` (not deleted); the migration warns with counts and an operator must assign owners.
-- Receipts written before this pass keep the narrower `v1-legacy` digest.
+- *(fixed)* `PreferenceAssertion` now has the §10.1 separate effective time (`effective_at`, migration `000008`): optional RFC 3339 on write, UTC/µs, default = recording instant, returned on write and read, and used to resolve the assertion in force now. The specification names no field name, default or resolution rule, so those are the service's smallest reading (see the README, "Preference effective time").
+- Legacy rows with a NULL `tenant_id` are invisible to the application role after `000006` (not deleted); the migration warns with counts and an operator must assign owners.
+- Receipts written before the v2 digest keep the `v1-legacy` digest; idempotency rows written before `000007` are inert.
+- `GetNotice` treats an unparseable `as_of` as "now" (needs clarification).
 
 ### Final assessment — PRV-02
 
 | Area | Status |
 |---|---|
-| Backend | **≈ 93.9%** (31/33) |
+| Backend (service-owned) | Fixed (see above); no % asserted |
 | Frontend | **Not assessed** |
 | Integration | **BLOCKED — DEPENDENCY** |
 | Tenant isolation | Strict in code and RLS; verified on real PostgreSQL |
-| Documentation | Corrected here; PRV-03's section still contains its own unverified claim about this integration (not edited here) |
 | Production readiness | **NOT READY** |
 
+---
 
 ## Service: privacy-decision-svc
-**Port:** 8153  
+**Port:** 8153
 **Classification:** Interlinked (calls privacy-purpose-registry-svc, privacy-consent-svc, retention-registry-svc, privacy-transfer-svc)
 
 > **Correction notice.** Earlier versions of this section claimed **100% (34 of 34) / Production Ready**. That claim was withdrawn: a read-only audit against ZS-SVC-W-001 scored the service **66.7% (28/42 comparable items)**, and found, among other things, that migration `000005` deleted evidence the append-only trigger forbids deleting, the idempotency record was saved after commit, the input fingerprint omitted decision-affecting inputs, registered scope and model training were not enforced, the transfer gate failed open on unknown results, free-text secondary purposes were stored as purpose ids, requested version ids were ignored, `expires_at` was never populated, the correlation id was not echoed, and several documented behaviours (correlation echo, model-training BLOCK, "all dimensions evaluated", `IDEMPOTENCY_SAVE_FAILED`, `urn:`/`sha256:` formats) did not match the code. This section replaces those claims. **No compliance percentage is asserted here**; see `services/privacy-decision-svc/README.md` for behaviour.
@@ -272,16 +298,25 @@ Run from `services/privacy-consent-svc`:
 | 10 | Unknown values | **Fixed.** Age band, classification, source, flags, recipient type, DPIA status, notice/consent dependency, consent/transfer results, jurisdiction fail closed; regression table. |
 | 11 | `expires_at` never set | **Fixed** without inventing a TTL: earliest of consent-receipt and transfer-decision expiry; persisted, returned, replay-preserved. Default TTL = needs clarification. |
 | 12 | Correlation id not echoed | **Fixed** (POST first response and replay; GET when supplied). |
-| 13 | Error/status mismatch | **Fixed.** `IDEMPOTENCY_RECORD_NOT_SAVED`/`IDEMPOTENCY_SAVE_FAILED` removed (atomic); full table in README with a test over every error path. Spec defines no transport codes. |
+| 13 | Error/status mismatch | **Fixed.** `IDEMPOTENCY_RECORD_NOT_SAVED`/`IDEMPOTENCY_SAVE_FAILED` removed (atomic); full table in README with a test over every error path. Spec defines no transport codes. The "every error" statement is scoped to handler/middleware errors; framework/server responses are listed as exceptions (see the latest pass). |
 | 14 | `privacy.decision.evaluated` | **Removed.** §19 lists no such event; no consumer exists in the repository. |
 | 15 | Idempotency principal scope | **Fixed** (migration `000006`): scope is (tenant, principal, key). Spec silent → needs clarification. |
 | 16 | Formats | **Made consistent:** `evidence_ref = prv-dec:<id>`; `input_fingerprint = context_hash = v2:<hex>`. Spec silent → needs clarification. |
 
+### Latest pass (documentation-compliance remediation, 2026-10-21)
+
+| Audit item | Gap | Result | Proven by |
+|---|---|---|---|
+| Row 8 | README said "All errors are `{error, error_code}`", but chi's 404/405, the panic recoverer, `/readyz` and net/http rejections are not in that envelope | **Fixed in documentation.** The guarantee now covers errors produced by handlers and the middleware; the README lists the framework/server responses and exactly what each returns (observed with a throwaway probe, deleted). No code, error code or router behaviour was changed. | probe run |
+| Unscored hardening | `POST /privacy/decisions` read its body with an unbounded `io.ReadAll` | **Fixed in code.** The body is read through `http.MaxBytesReader` at 1 MiB (the sibling services' limit), after the four header checks and before the replay lookup. Over the limit → `400 VALIDATION_FAILED` ("unreadable body", the established refusal; no new code); nothing is evaluated, committed or stored, and the `Idempotency-Key` is not consumed. | handler `TestBodyLimit_*` (exactly 1 MiB accepted; 1 MiB+1 and 4 MiB refused before the first registry call and before any commit; key reusable; header checks still first; replay unchanged; real PostgreSQL: no decision or idempotency row left behind); mutations (no cap, cap halved, cap doubled) fail the intended tests |
+
+Not changed: authorization (the specification names no permission), and every clarification and external item listed below.
+
 ### Verification
 
 From `services/privacy-decision-svc`:
-- **With** `REQUIRE_DB_TESTS=1` and a throwaway PostgreSQL superuser URL: **64 top-level tests pass, 0 skipped** (domain 5, handler 44, store 13, consent client 2). The app role is `NOSUPERUSER NOBYPASSRLS`; each DB test gets a fresh database; migration tests cover a clean database and an "existing data" scenario (legacy NULL-tenant evidence preserved, not deleted).
-- **Without** a database: 49 pass, **15 skipped** — such a run does not prove RLS, atomicity or migrations.
+- **With** `REQUIRE_DB_TESTS=1` and a throwaway PostgreSQL superuser URL: **70 top-level tests pass, 0 skipped** (domain 5, handler 50, store 13, consent client 2). The app role is `NOSUPERUSER NOBYPASSRLS`; each DB test gets a fresh database; migration tests cover a clean database and an "existing data" scenario (legacy NULL-tenant evidence preserved, not deleted).
+- **Without** a database: 54 pass, **16 skipped** — such a run does not prove RLS, atomicity or migrations.
 - `go vet ./...`, `go build ./...`: clean.
 - **Mutation checks** (each reverted): restoring the `DELETE` of NULL-tenant rows, fail-open transfer default, omitting `consent_check` from the fingerprint, and saving the idempotency response outside the transaction each make the intended tests fail.
 - **Not performed:** Docker rebuild, live compose stack, frontend check, live downstream calls (downstream services are stubbed).
@@ -311,153 +346,61 @@ From `services/privacy-decision-svc`:
 **Port:** 8154
 **Classification:** Independent (depends on authorization-svc; workflow-svc integration is caller-supplied reference per §14.1; self-contained evidence service)
 
-**Service Health:** Working
+> **Correction notice.** Earlier versions of this section claimed **100% / Ready for Production / 0 gaps**. A documentation-compliance audit scored the service **70.8% (17 of 24 comparable items)** and found: the three read routes required no principal and no grant; the row-level-security policies still carried the `tenant_id IS NULL OR …` exception, so a row with no tenant was visible to (and writable by) every tenant; idempotency proceeded when its lookup failed, ignored save failures, and accepted `X-Idempotency-Key` in the mandatory check but not in the replay lookup; authorization ran only after the case had been looked up (a 404-vs-403 existence oracle); the §15.2 gate trusted a denormalised flag and any non-empty manifest hash; error bodies carried no `error_code`; and the documented test and README counts were stale. This section replaces those claims and describes the service **as remediated and verified in this pass**. The "events `privacy.rights_request.received` / `.closed`" claim is **withdrawn**: §19 of ZS-SVC-W-001 declares no such event and the service (deliberately) emits none.
 
-**Frontend Completion: 100%**
-Reason: `components/admin/privacy/PrivacyRightsWorkbench.tsx` (1005 lines, comprehensive UI) covers Case Intake, Identity Verification recording, Discovery Manifest attach/list, WFC Process Ref attachment (`POST /{id}/wfc-process-ref` via Sub-Form 2D), §15.2 Disclosure Gate closure, Response Package Versioning (I21), Case Inspector, and Subject Search — via `app/admin/privacy/rights-actions.ts` → `lib/api/privacy-rights.ts` → real fetch to :8154. Re-confirmed by direct source inspection in this re-audit: `Sub-Form 2D`, `attachWFCProcessRefAction`, and Case Inspector display of `wfc_process_ref` are all present and wired — the stale cross-cutting claim elsewhere in this file that PRV-04's WFC Process Ref is "not UI-complete" is corrected below. TypeScript check `npx tsc --noEmit` verified 100% clean with 0 errors across all privacy components; ESLint: 0 errors. There are 12 pre-existing `react-hooks/set-state-in-effect` warnings — these are an existing cross-cutting convention across the privacy frontend components, not a regression or a PRV-04-specific gap.
+### Status
 
-**Backend Completion: 100%**
-Reason: `internal/handler/handler.go` implements case intake across all 8 statutory right families, identity-verification evidence recording, discovery-manifest evidence recording/listing, wfc-process-ref attachment, and close with the DISCLOSURE GATE enforced verbatim (§15.2: FULFILLED requires identity verified AND ≥1 discovery manifest, returning 422 with `PRV-012`/`PRV-013`). Re-verified end-to-end in this pass with a fresh case: no identity verification + no discovery manifest → 422 `PRV-012`; identity verification only → 422 `PRV-013`; identity verification + discovery manifest → 200; successful `FULFILLED` closure increments `response_package_version`. Database immutability enforced at PostgreSQL layer via triggers `rights_requests_closed_immutable`, `identity_verification_events_append_only`, and `discovery_manifests_append_only` (migration 000002) — all 3 triggers reconfirmed live and installed via `pg_trigger` in this re-audit. The earlier closed-request-immutability regression (where `AttachWFCProcessRef`, `RecordIdentityVerification`, and `AttachDiscoveryManifest` could incorrectly return 503 instead of 409 `PRV-020` against a closed case) remains fixed — re-verified live against a closed case in this pass. Row-Level Security (RLS) and `tenant_isolation_policy` enforced (migration 000003); cross-tenant `GetRequest` re-confirmed returning 404, correct-tenant `GetRequest` returning 200. Response package versioning (I21) implemented with `response_package_version` incremented on approved closure (migration 000004) — live-tested in this pass, incrementing to 1 on a fresh `FULFILLED` closure. Full Idempotency-Key (§18.1) deduplication with `rights_idempotency_keys` table, `Idempotency-Replay: true` header on replay, and 409 Conflict on payload mismatch — re-verified live: replay returns cached 201, same key with conflicting payload returns 409 `PRV-020`. Contractual §32 error/reason codes (PRV-001 through PRV-020) implemented throughout; `PRV-012`, `PRV-013`, and `PRV-020` reconfirmed live. Authorization/RBAC reconfirmed in this pass: exactly 5 `requirePrincipal` calls and 5 `authorize` calls, correctly corresponding to the 5 mutating endpoints — no authorization gap exists. All 20 unit tests pass cleanly, and `go vet ./...` is 100% clean. No source code changes were required during this re-audit.
+| Area | Assessment | Basis |
+|---|---|---|
+| **Backend (service-owned)** | **Service-owned gaps fixed; one data item and the non-verifiable §15.2 elements are external** | See the table below. No compliance percentage is asserted. |
+| **Frontend** | **Not assessed** | Not part of this pass. |
+| **Integration** | **BLOCKED — DEPENDENCY** | Grants for the three actions must be provisioned in `authorization-svc`; not verified against a live instance. |
+| **Production readiness** | **NOT READY** | External dependencies below; legacy NULL-tenant rows, if any, need an operator mapping. |
 
-**Integration Completion: 100%**
-Reason: `deployments/docker-compose.yml:4037-4071` wires AUTHZ_SERVICE_URL, DATABASE_URL, KAFKA_BROKERS with `depends_on` `service_healthy`. Real PostgreSQL connection pool, fail-closed authorization-svc RBAC checks (`PRIVACY_RIGHTS_REQUEST_CREATE`, `PRIVACY_RIGHTS_REQUEST_PROCESS`, `PRIVACY_RIGHTS_REQUEST_CLOSE`), and Kafka publisher. Live container `privacy-rights-svc` verified Up (healthy) on port 8154. Live healthcheck probes `/healthz` and `/readyz` return HTTP 200 OK. Live API queries to `/privacy/rights-requests` return HTTP 200 OK. Tenant isolation re-confirmed end-to-end: cross-tenant `GetRequest` → 404, correct-tenant `GetRequest` → 200, consistent with the platform-wide Privacy RLS remediation.
+### What changed in this pass
 
-**Overall Completion: 100%**
+| # | Gap | Result |
+|---|---|---|
+| 1 | RLS `tenant_id IS NULL OR …` on every table | **Fixed** by migration `000005`: exception removed from all four policies; `CHECK (tenant_id IS NOT NULL) NOT VALID` for new rows; `NOT NULL` set only when no legacy NULL row exists. Nothing is deleted or rewritten; legacy NULL-tenant rows are preserved, invisible, and warned about — **BLOCKED — DATA MIGRATION REQUIRES AUTHORITATIVE TENANT MAPPING.** The store also refuses to run without a verified tenant. (`X-Tenant-Id` was already required by the middleware.) |
+| 2 | Read routes unauthenticated | **Fixed.** Principal (401), tenant (401) and an `authorization-svc` grant (403/503) on all three GETs. Authorization precedes any lookup on reads *and* mutations, so existing and missing ids answer alike. The specification names no read permission; none was invented — reads reuse `PRIVACY_RIGHTS_REQUEST_PROCESS` (needs clarification). |
+| 3 | Idempotency | **Fixed.** Scope (tenant, principal, key); hash binds method + path + body; lookup failure → 503; claim + business change + stored response are one transaction (failure persists nothing, concurrent identical requests execute once); `X-Idempotency-Key` honoured everywhere. |
+| 4 | §15.2 gate | **Fixed for what is verifiable:** a verified identity event must exist (a forged flag or a failed attempt does not pass); manifests must carry a SHA-256 digest and a non-negative candidate count. **External (WFC / reviewers / adapters):** applicable-right determination, scope review, exemptions, third-party protection, redaction, approved response assembly — the gate is necessary, not sufficient. |
+| 6 | API / error contract | **Fixed.** Every error the handlers and the tenant middleware produce carries `error_code` (chi/HTTP-server responses are documented exceptions — see the README, §7); body validation happens after authentication/authorization; tenant mismatch is `403 TENANT_SCOPE_MISMATCH` (it had borrowed `PRV-003`). §32 messages and statuses are unchanged. |
+| 7 | Events | **No change required.** §19 declares no rights intake/closure event. `privacy.rights.action_required` is not emitted; who owns it is not stated — needs clarification. |
+| 8 | Documentation | Rewritten (this section, PRV-04, README). |
 
-**Production Readiness:** Ready for Production
+### Latest pass (documentation-compliance remediation, 2026-10-21)
 
-**Commands:**
-- `POST /privacy/rights-requests` & `POST /v1/privacy/rights-requests` (Create case intake, requires `PRIVACY_RIGHTS_REQUEST_CREATE`)
-- `POST /privacy/rights-requests/{id}/identity-verification` (Record identity assurance attempt, requires `PRIVACY_RIGHTS_REQUEST_PROCESS`)
-- `POST /privacy/rights-requests/{id}/discovery-manifests` (Attach domain discovery manifest, requires `PRIVACY_RIGHTS_REQUEST_PROCESS`)
-- `POST /privacy/rights-requests/{id}/wfc-process-ref` (Attach workflow-svc process reference, requires `PRIVACY_RIGHTS_REQUEST_PROCESS`)
-- `POST /privacy/rights-requests/{id}/close` (Close case enforcing §15.2 Disclosure Gate, requires `PRIVACY_RIGHTS_REQUEST_CLOSE`)
+| Audit item | Gap | Result | Proven by |
+|---|---|---|---|
+| Row 20 | Documented pre-flight puts the principal check before the tenant check, but the tenant middleware runs before the handler, so a request with neither header answered `TENANT_SCOPE_REQUIRED` | **Fixed in code.** `TenantContext` now applies the principal check first (`401 AUTHENTICATION_FAILED`), then the tenant check (`401 TENANT_SCOPE_REQUIRED`), still before any handler and still fail-closed. Statuses are unchanged (both 401). | middleware `TestTenantContext_*`; handler `TestPreflightOrder_*` (all 16 route/prefix combinations); mutations (principal check removed, tenant check removed) fail the intended tests |
+| Row 28 | "Every error is `{error, error_code}`" overstated: chi's 404/405, the panic recoverer, `/readyz` and net/http rejections are not in the envelope | **Fixed in documentation.** The README now states the guarantee covers errors produced by handlers and the middleware, and lists the framework/server responses and exactly what they return (verified by a throwaway probe). No error code was invented for them and no framework behaviour was changed. | probe run (deleted) |
+| Unscored risk | The authorization client sent the `/v1/authorize` body with no identity or envelope headers | **Fixed in code and documented.** It now sends `X-Principal-Id`, `X-Legal-Entity-Id`, `X-Tenant-Id` (context), `X-Request-Id`, `X-Correlation-ID` (caller's when present), `X-Source-Channel: web` and a fresh `Idempotency-Key`, matching the sibling privacy services. No permission was added; `authorization-svc` was not touched or contacted. | authz `TestCheckAllowed_*`; handler `TestPreflight_AuthorizationCallCarriesTheVerifiedContext`; mutations (tenant, principal, correlation, idempotency headers) fail the intended tests |
 
-**Reads:**
-- `GET /privacy/rights-requests/{id}` & `GET /v1/privacy/rights-requests/{id}` (Get case by ID)
-- `GET /privacy/rights-requests?subject_ref=...` (List cases by data subject)
-- `GET /privacy/rights-requests/{id}/discovery-manifests` (List attached discovery manifests)
+Not changed: the eight clarification items and the other unscored observations (see below).
 
-**States:**
-- Status lifecycle: `RECEIVED → IDENTITY_VERIFIED → IN_DISCOVERY → CLOSED`
-- Outcome (recorded at closure): `FULFILLED` (requires §15.2 Disclosure Gate), `REJECTED`, `WITHDRAWN`
+### Verification
 
-**Events:**
-- `privacy.rights_request.received`
-- `privacy.rights_request.closed`
+Run from `services/privacy-rights-svc`:
+- `go test ./...` with `REQUIRE_DB_TESTS=1` against a throwaway PostgreSQL (fresh database per test, migrations 000001–000006, app role `NOSUPERUSER NOBYPASSRLS`): **66 top-level tests pass, none skipped** (handler 50, store 8, authz 6, middleware 2). Without a database: 58 pass, 8 skipped.
+- `go vet ./...` and `go build ./...`: clean.
+- **Mutation checks** (each reverted): restoring the NULL-tenant policy exception, trusting the denormalised identity flag, and proceeding on an idempotency lookup failure each make the intended tests fail.
+- Migration tests cover a clean database and an existing-data scenario (legacy NULL-tenant case and evidence preserved, not deleted, invisible, new NULL rows refused, append-only trigger still enforced).
+- **Not performed:** Docker rebuild, live compose stack, live `authorization-svc`, frontend.
 
-**Segregation of Duties & Auth:**
-- `X-Principal-Id` mandatory on all mutating endpoints (401 if missing).
-- RBAC permissions enforced fail-closed via `authorization-svc`: `PRIVACY_RIGHTS_REQUEST_CREATE`, `PRIVACY_RIGHTS_REQUEST_PROCESS`, `PRIVACY_RIGHTS_REQUEST_CLOSE`.
-- PostgreSQL-level immutability triggers prevent tampering once case is closed.
+### External dependencies
 
-**Fixed Gaps:**
-
-### Gap 1 — Database Immutability & Append-Only Triggers Enforced
-Status: ✅ Fixed
-Original Issue:
-Evidence tables and closed rights requests lacked PostgreSQL-level trigger enforcement to prevent updates or deletions once cases were closed or evidence was committed.
-Fix Verification:
-Implemented PostgreSQL trigger `rights_requests_closed_immutable` aborting any UPDATE on closed requests (`status = 'CLOSED'`), and append-only triggers `identity_verification_events_append_only` and `discovery_manifests_append_only` aborting any UPDATE/DELETE on evidence logs (migration 000002).
-Evidence:
-`deployments/migrations/000002_immutability.up.sql`, `internal/store/pg_store.go`, unit test `TestClose_AlreadyClosed_Conflict`.
-
-### Gap 2 — Idempotency-Key Support (§18.1)
-Status: ✅ Fixed
-Original Issue:
-Mutating endpoints lacked mandatory `Idempotency-Key` deduplication, replay headers, and payload conflict detection.
-Fix Verification:
-Created `rights_idempotency_keys` table with forced Row-Level Security (migration 000004). Implemented `checkIdempotency` and `writeJSONWithIdempotency` in `handler.go`. Identical requests return cached responses with header `Idempotency-Replay: true`; conflicting payloads with the same key return HTTP 409 Conflict (`PRV-020: IMMUTABLE_EVIDENCE_CONFLICT`).
-Evidence:
-`deployments/migrations/000004_response_version_and_idempotency.up.sql:12-37`, `internal/handler/handler.go:90-125`, unit test `TestCreateRequest_IdempotencyKey_ReplayAndConflict`.
-
-### Gap 3 — Response Package Versioning (I21)
-Status: ✅ Fixed
-Original Issue:
-The service did not track response package versioning on closed requests, violating non-bypassable invariant I21 requiring explicit version increments upon response package assembly/fulfilment.
-Fix Verification:
-Added `response_package_version INT NOT NULL DEFAULT 0` column to `rights_requests` (migration 000004). Handler increments `response_package_version` on every `FULFILLED` closure, and surfaces the version in API responses and the Workbench Case Inspector.
-Evidence:
-`deployments/migrations/000004_response_version_and_idempotency.up.sql:7-9`, `internal/store/pg_store.go`, unit test `TestClose_ResponsePackageVersion_IncrementedOnFulfilled`.
-
-### Gap 4 — Contractual Error and Reason Codes Aligned (§32)
-Status: ✅ Fixed
-Original Issue:
-Handler emitted ad-hoc error messages rather than standardized §32 contractual reason codes (`PRV-001` through `PRV-020`).
-Fix Verification:
-Standardized all handler error outputs to contractual §32 codes: `PRV-001: PURPOSE_NOT_REGISTERED`, `PRV-005: POLICY_UNAVAILABLE`, `PRV-012: IDENTITY_ASSURANCE_INSUFFICIENT`, `PRV-013: THIRD_PARTY_REVIEW_REQUIRED`, `PRV-019: PRIVACY_CONTEXT_INDETERMINATE`, `PRV-020: IMMUTABLE_EVIDENCE_CONFLICT`.
-Evidence:
-`internal/domain/types.go:120-145`, `internal/handler/handler.go:528-542`.
-
-### Gap 5 — Canonical & Versioned Route Compatibility Mounted
-Status: ✅ Fixed
-Original Issue:
-Endpoints were mounted only under a single path prefix without supporting canonical and `/v1/` compatibility aliases across all operations.
-Fix Verification:
-Mounted all routes under both `/privacy/rights-requests` and `/v1/privacy/rights-requests` (`CreateRequest`, `GetRequest`, `ListRequests`, `RecordIdentityVerification`, `AttachDiscoveryManifest`, `AttachWFCProcessRef`, `CloseRequest`).
-Evidence:
-`internal/handler/handler.go:40-61`, unit test `TestV1Routes_Succeed`.
-
-### Gap 6 — Frontend UI Control for AttachWFCProcessRef Implemented
-Status: ✅ Fixed
-Original Issue:
-Frontend workbench lacked a dedicated UI action and sub-form to attach a Workflow-svc process reference (`wfc_process_ref`) to an existing case.
-Fix Verification:
-Added Sub-Form 2D in `PrivacyRightsWorkbench.tsx` with dedicated input and submission button, wired to `attachWFCProcessRefAction` in `app/admin/privacy/rights-actions.ts` calling `lib/api/privacy-rights.ts`.
-Evidence:
-`PrivacyRightsWorkbench.tsx:420-475`, `app/admin/privacy/rights-actions.ts:160-195`, TypeScript check passes with 0 errors.
-
-### Gap 7 — Comprehensive Service Documentation (README.md)
-Status: ✅ Fixed
-Original Issue:
-The service lacked dedicated architectural and operational documentation, leaving requirements, invariants, and control gates undocumented.
-Fix Verification:
-Created comprehensive `README.md` documenting architecture, 8 right families, §15.2 Disclosure Gate, database immutability triggers, RLS tenant isolation, idempotency key handling, and API specifications.
-Evidence:
-`services/privacy-rights-svc/README.md` (85 lines, verified present).
-
-**Remaining Gaps:**
-- None (all service-owned requirements and compliance gaps fully resolved).
-
-**Dependency-Blocked Items:**
-- **WFC Workflow Engine Orchestration Boundary (§14.1):** PRV-04 owns the privacy meaning and immutable evidence of rights requests. Long-running workflow timers, approval orchestration, and task dispatch belong to `workflow-svc` via `wfc_process_ref`.
-- **Domain Search & Export Adapters (§14.1):** Actual discovery crawling across CRM, ERP, HR, and billing databases is performed by external domain adapters that submit hashed discovery manifests to PRV-04.
-
-**Needs-Clarification Items:**
-- **Signed Manifest Specification:** Spec §15.1 mentions "signed/hashed discovery manifests"; PRV-04 currently implements SHA-256 cryptographic hashing (`ContentHash`) and candidate counts. Asymmetric signature verification (e.g. PKI / ed25519) can be added if an external KMS/PKI infrastructure is specified.
-- **Third-Party Redaction Automation vs. Manual Review:** Automated redaction pipeline vs. human reviewer sign-off gate before response package assembly. Handled via the Disclosure Gate requiring evidence review before closure.
-
-**Verification Results:**
-- Backend Build: `go build ./...` clean.
-- Backend Unit Tests: 20/20 tests pass (`go test ./...`).
-- Backend Lint: `go vet ./...` passes with 0 issues.
-- Go Build: `go build ./cmd/server` and `./cmd/healthcheck` succeed.
-- Frontend TypeScript: `npx tsc --noEmit` passes with 0 errors.
-- Frontend ESLint: 0 errors (12 pre-existing `react-hooks/set-state-in-effect` warnings are an existing cross-cutting convention, not a regression or PRV-04-specific gap).
-- Database: all 3 immutability/append-only triggers confirmed installed live via `pg_trigger`.
-- Docker Health: Live container `privacy-rights-svc` Up (healthy) on port 8154.
-- Healthcheck Endpoints: `/healthz` returns 200 OK (`{"status":"ok"}`); `/readyz` returns 200 OK (`{"status":"ready"}`).
-- Live API: `GET /privacy/rights-requests` returns HTTP 200 OK.
-- Live Disclosure Gate: re-verified end-to-end with a fresh case (422 `PRV-012` → 422 `PRV-013` → 200 → `FULFILLED` closure increments `response_package_version`).
-- Live Idempotency: replay returns cached 201; same key with conflicting payload returns 409 `PRV-020`.
-- Live `/v1/` routes: exercised and confirmed working in this re-audit.
-- Live Tenant Isolation: cross-tenant `GetRequest` → 404; correct-tenant `GetRequest` → 200.
-- Live Authorization/RBAC: exactly 5 `requirePrincipal` calls and 5 `authorize` calls, corresponding to the 5 mutating endpoints — confirmed complete, no gap.
+`authorization-svc` grants; WFC / reviewers / domain adapters (§14.1, §15.2); operator tenant mapping; needs clarification: read-route action, `privacy.rights.action_required` ownership, asymmetric manifest signatures.
 
 ### Final Assessment — PRV-04
 
-| Metric | Result |
-|---|---:|
-| Frontend | **100%** |
-| Backend | **100%** |
-| Integration | **100%** |
-| Overall | **100%** |
-| Health | **Working** |
-| Tenant Isolation | **Fixed & Verified** |
-| Production Readiness | **Ready for Production** |
-| Service-owned gaps | **0** |
-
-**Final conclusion:** `privacy-rights-svc` is production ready. All 7 originally documented gaps were independently re-verified and remain fixed. 0 newly discovered implementation gaps; 0 code changes were required during this re-audit; 0 remaining service-owned gaps. RLS/tenant isolation is fixed and verified. The §15.2 Disclosure Gate is verified end-to-end. Authorization/RBAC coverage is complete for all 5 mutating endpoints. The frontend WFC Process Reference UI is confirmed complete — the stale cross-cutting claim that it is "not UI-complete" is corrected elsewhere in this file, as is the stale claim that this service has no append-only trigger. Documentation drift exists only in these stale cross-cutting claims and a stale `scratch/test_rights_live.ps1` citation (that file does not exist and is no longer cited as evidence); none of this is a service-owned implementation gap. Service remains **Ready for Production**.
+| Area | Status |
+|---|---|
+| Backend (service-owned) | Fixed (see above) |
+| Tenant isolation | Strict in code and RLS; verified on real PostgreSQL |
+| Frontend | Not assessed |
+| Integration | **BLOCKED — DEPENDENCY** |
+| Production readiness | **NOT READY** |
 
 ---
 
@@ -465,154 +408,61 @@ Evidence:
 **Port:** 8155
 **Classification:** Interlinked (depends on privacy-purpose-registry-svc + authorization-svc)
 
-**Service Health:** Working
+> **Correction notice.** Earlier versions of this section claimed **100% / Ready for Production**, listed the event `privacy.transfer_decision.evaluated`, said the README had 114 lines and the suite 24 tests, and said runtime isolation failed because services connect as the `postgres` superuser. A documentation-compliance audit scored the service **63.6% (14 of 22 comparable items)** and found: every read route (and the trigger-evaluation route) required no principal and no grant; the row-level-security policies still carried the `tenant_id IS NULL OR …` exception; authorization ran only after the record was looked up (a 404-vs-403 existence oracle); idempotency proceeded when its lookup failed, ignored save failures and was not atomic with the change; the §19 events were published after commit with errors discarded; reassessment triggers 2/5/7 were purely caller-declared while the documentation said "all 8 automated", the sensitive-category check was a substring match that missed registered categories, a declared trigger string was echoed into a reason code, and the purpose-registry client forwarded no principal. This section replaces those claims and describes the service **as remediated and verified in this pass**. The superuser statement is corrected: the compose default is `zoiko_app`; whether production runs as a superuser is a deployment matter (a superuser bypasses RLS regardless of policy).
 
-**Frontend Completion: 100%**
-Reason: `components/admin/privacy/PrivacyTransferWorkbench.tsx` (1772 lines, comprehensive UI) covers governed mechanism creation/catalog, processor-relationship creation/listing/status-toggle, subprocessor attach/list, transfer-assessment recording with structured measures (`government_access_risk`, `technical_measures`, `organizational_measures`), transfer-decision evaluation across all 4 outcomes (AUTHORIZED, CONDITIONAL with conditions and expiry, BLOCKED, REVIEW_REQUIRED), and §17.1 trigger evaluation — via `app/admin/privacy/transfer-actions.ts` (911 lines) → `lib/api/privacy-transfer.ts` → real fetch to :8155. Uniquely, this UI ships a built-in 12-scenario automated QA suite exercising real positive and negative paths end-to-end against the live backend (BLOCKED/REVIEW_REQUIRED/rejected-assessment/expired-mechanism/missing-assessment/CONDITIONAL-measures cases). TypeScript check passes with 0 errors across all privacy components. Two blocking `react-hooks/purity` ESLint errors caused by `Date.now()` being called during render have since been fixed; ESLint blocking errors are now 0.
+### Status
 
-**Backend Completion: 100%**
-Reason: `internal/handler/handler.go` implements processor-relationship CRUD+status+subprocessors, transfer-mechanism create/get, transfer-assessment record/get-latest, and transfer-decision evaluate/get with full §16/§17 fail-closed doctrine. `CONDITIONAL` authorization outcome is fully reachable when supplementary technical/organizational measures or explicit conditions exist, returning joined conditions and expiration timestamp. Structured assessment measures (`government_access_risk`, `technical_measures`, `organizational_measures`) persisted in PostgreSQL (migration 000004). All 8 mandatory reassessment triggers (§17.1) automated across runtime evaluation and `/privacy/transfer-assessments/evaluate-triggers`. Idempotency-Key support (§18.1) backed by `transfer_idempotency_keys` table with forced RLS, `Idempotency-Replay: true` header on replay, and 409 Conflict on payload mismatch. Stable contractual error/reason codes (`PRV-015` through `PRV-020`) implemented per §32. PostgreSQL database immutability triggers (migration 000002) and RLS (migration 000003) enforced. `EvaluateTransfer` (`POST /privacy/transfer-decisions`) now enforces a dedicated `PRIVACY_TRANSFER_DECISION_EVALUATE` permission check (see Gap 8 below — this was a confirmed missing-authorization gap, not present in the original audit pass, found and fixed in follow-up remediation). All 24 Go unit tests pass cleanly (22 original + 2 new RBAC regression tests), and `go vet ./...` is 100% clean.
+| Area | Assessment | Basis |
+|---|---|---|
+| **Backend (service-owned)** | **Service-owned gaps fixed; three triggers and registry end-to-end verification are external** | See the table below. No compliance percentage is asserted. |
+| **Frontend** | **Not assessed** | Not part of this pass. |
+| **Integration** | **BLOCKED — DEPENDENCY** | PRV-01 requires a read grant for the forwarded principal in `authorization-svc`; not verified against live services. |
+| **Production readiness** | **NOT READY** | External dependencies below; legacy NULL-tenant rows, if any, need an operator mapping. |
 
-**Integration Completion: 100%**
-Reason: `deployments/docker-compose.yml:4073-4107` wires `PURPOSE_REGISTRY_URL`, `AUTHZ_SERVICE_URL`, `DATABASE_URL`, and `KAFKA_BROKERS` with `depends_on` `service_healthy`. Cross-service purpose/activity validation confirmed live in code against `privacy-purpose-registry-svc:8151` (`ResolveActivity`), fail-closed RBAC checks enforced via `authorization-svc`, and event publishing on `privacy.transfer_decision.evaluated`. 10/10 live checks pass in `scratch/test_transfer_live.ps1` against running Docker container on port 8155. Real cross-service flow `privacy-decision-svc → privacy-transfer-svc` verified end-to-end against the running containers (not a fabricated/direct-only test): `privacy-decision-svc` call returned HTTP 200 `PERMIT` with a valid `transfer_decision_id`, matching the corresponding decision record persisted in `privacy-transfer-svc`.
+### What changed in this pass
 
-**Overall Completion: 100%** (service-owned scope)
+| # | Gap | Result |
+|---|---|---|
+| 1 | RLS `tenant_id IS NULL OR …` | **Fixed** by migration `000005_strict_tenant_isolation` on all five evidence tables: exception removed, `CHECK (tenant_id IS NOT NULL) NOT VALID` for new rows, `NOT NULL` only when no legacy NULL row exists. Nothing is deleted or rewritten; legacy NULL-tenant rows are preserved, invisible and warned about — **BLOCKED — DATA MIGRATION REQUIRES AUTHORITATIVE TENANT MAPPING.** The store refuses to run without a verified tenant. (`X-Tenant-Id` was already required by the middleware.) |
+| 2 | Read routes unauthenticated | **Fixed.** Principal (401), tenant (401) and an `authorization-svc` grant (403/503) on every GET and on trigger evaluation, **before** any lookup. The specification names no read permission; none was invented — each read reuses the existing action of the resource it exposes (needs clarification). |
+| 3 | Idempotency | **Fixed.** Scope (tenant, principal, key); hash binds method + path + body; lookup failure → 503; claim + change + event + stored response are one transaction (failure persists nothing; concurrent identical requests execute once). |
+| 4 | Reassessment triggers | **Fixed for what is derivable:** one shared evaluation for `EvaluateTransfer` and the trigger endpoint; exact sensitive-taxonomy membership; a subprocessor attached after the latest assessment is a trigger; lookup failures fail closed; a declared trigger must be one of the eight §17.1 names. **External:** triggers 2 (automated decisioning), 5 (architecture change) and 7 (incident) concern facts recorded in other systems, so they remain caller-declared. |
+| 5 | Registry integration | **Service-owned part fixed:** the caller's principal and tenant are forwarded to PRV-01. **BLOCKED — EXTERNAL DEPENDENCY:** the read grant in `authorization-svc`. |
+| 7 | Events | **Fixed.** The three §19 events (`privacy.processor.changed`, `privacy.transfer.authorization_changed`, `privacy.assessment.expiring`) go through a transactional outbox in the same transaction as the change; a relay is the only Kafka producer. (`privacy.transfer_decision.evaluated` in older text was never a §19 event and is not emitted.) |
+| 8 | Documentation | Rewritten (this section, PRV-05, README). |
 
-**Production Readiness:**
-- **Service-level RBAC remediation: ✅ Production Ready** — all service-owned PRV-05 gaps (including the `EvaluateTransfer` RBAC gap below) are fixed and verified.
-- **Platform-level tenant isolation: ❌ Not Fixed** — see Gap 8 and Dependency-Blocked Items below. Runtime database connections currently use the PostgreSQL `postgres` superuser, which bypasses Row-Level Security regardless of the RLS policies/migrations present in this service. This is a cross-service, platform-level infrastructure dependency, not a defect introduced by RBAC remediation and not specific to privacy-transfer-svc.
+### Latest pass (documentation-compliance remediation, 2026-10-21)
 
-**Commands:**
-- `POST /privacy/processor-relationships` & `POST /v1/privacy/processor-relationships` (Create relationship, requires `PRIVACY_TRANSFER_RELATIONSHIP_MANAGE`)
-- `POST /privacy/processor-relationships/{id}/status` & `POST /v1/privacy/processor-relationships/{id}/status` (Update status, requires `PRIVACY_TRANSFER_RELATIONSHIP_MANAGE`)
-- `POST /privacy/processor-relationships/{id}/subprocessors` & `POST /v1/privacy/processor-relationships/{id}/subprocessors` (Attach subprocessor, requires `PRIVACY_TRANSFER_RELATIONSHIP_MANAGE`)
-- `POST /privacy/transfer-mechanisms` & `POST /v1/privacy/transfer-mechanisms` (Create mechanism, requires `PRIVACY_TRANSFER_MECHANISM_MANAGE`)
-- `POST /privacy/transfer-assessments` & `POST /v1/privacy/transfer-assessments` (Record assessment, requires `PRIVACY_TRANSFER_ASSESSMENT_RECORD`)
-- `POST /privacy/transfer-decisions` & `POST /v1/privacy/transfer-decisions` (Evaluate transfer authorization)
-- `POST /privacy/transfer-assessments/evaluate-triggers` & `GET /privacy/transfer-assessments/triggers` (Evaluate §17.1 mandatory reassessment triggers)
+| Audit row | Gap | Result | Proven by |
+|---|---|---|---|
+| 17 | The README said `EvaluateTransfer` and the trigger endpoint "cannot disagree", but `EvaluateTransfer` read the latest assessment only when `assessment_required` was true, so triggers 3 (new subprocessor), 4 and 8 were invisible to it otherwise: with an approved assessment and a newly attached subprocessor it returned `AUTHORIZED` while the endpoint reported reassessment needed | **Fixed in code.** `EvaluateTransfer` now reads the latest assessment as trigger evidence regardless of `assessment_required`, feeds the same `computeTriggers`, and also honours trigger 8 (`ASSESSMENT_EXPIRED`) in the trigger loop. `assessment_required` still controls only the assessment gate (missing / REJECT / REMEDIATE / expired) and what enters the decision (measures, `assessment_id`, review date). A failing assessment lookup fails closed (`REVIEW_REQUIRED`, `PRV-019`). No new reason code, no duplicated trigger logic. ZS-SVC-W-001 §17.1 makes the eight triggers mandatory and makes none depend on a caller flag. | handler `TestTriggerConsistency_*` (the audited scenario for both flag values; a matrix of seven trigger scenarios × both flag values with POST and GET endpoints; `assessment_required` semantics unchanged; lookup failure; real PostgreSQL); mutations (old evidence gating, trigger 8 dropped, lookup failure ignored) fail the intended tests |
+| 25 | README said principal is checked before tenant; the tenant middleware actually runs first | **Fixed in documentation (no code change).** §18.1 requires both headers and prescribes no order, so the working fail-closed behaviour was kept and the docs now state the real order: tenant (middleware) → principal → correlation → idempotency key → authorization. A request with neither header is refused for the tenant; both are `401`. | handler `TestPreflightOrder_*` |
+| 38 | "Migration 000005" / "migrations 000001–000006" while eight files exist with two shared prefixes | **Fixed in documentation (no rename).** The README has a Migrations section listing the eight files in application order. The loader sorts by file name and tracks by full file name, so the layout is safe, and renaming applied files would make them re-run. | `deployments/migrate.py`, `internal/testdb` (both sort file names) |
 
-**Reads:**
-- `GET /privacy/processor-relationships` & `GET /v1/privacy/processor-relationships` (List relationships)
-- `GET /privacy/processor-relationships/{id}` & `GET /v1/privacy/processor-relationships/{id}` (Get relationship by ID)
-- `GET /privacy/processor-relationships/{id}/subprocessors` & `GET /v1/privacy/processor-relationships/{id}/subprocessors` (List subprocessors)
-- `GET /privacy/transfer-mechanisms/{id}` & `GET /v1/privacy/transfer-mechanisms/{id}` (Get mechanism by ID)
-- `GET /privacy/transfer-assessments?relationship_id={id}` & `GET /v1/privacy/transfer-assessments?relationship_id={id}` (Get latest assessment)
-- `GET /privacy/transfer-decisions/{id}` & `GET /v1/privacy/transfer-decisions/{id}` (Get decision by ID)
+Not changed: the privacy-decision-svc client (it omits the mandatory `X-Correlation-ID` and `Idempotency-Key`; that is the caller's to fix), authorization, and every clarification and external item below.
 
-**Segregation of Duties & Auth:**
-- `X-Principal-Id` mandatory on all mutating endpoints (401 if missing).
-- RBAC permissions enforced fail-closed via `authorization-svc`: `PRIVACY_TRANSFER_RELATIONSHIP_MANAGE`, `PRIVACY_TRANSFER_MECHANISM_MANAGE`, `PRIVACY_TRANSFER_ASSESSMENT_RECORD`, and `PRIVACY_TRANSFER_DECISION_EVALUATE` (added — see Gap 8; gates `POST /privacy/transfer-decisions` / `EvaluateTransfer`, previously unauthenticated-for-authorization-purposes).
-- `PRIVACY_TRANSFER_DECISION_EVALUATE` has been added to the `PRIVACY_TRANSFER_FULL` and `PRIVACY_FULL` permission bundles; the designated test principal was verified `GRANTED` through `authorization-svc`.
-- PostgreSQL-level immutability triggers prevent tampering with relationships, subprocessors, transfer mechanisms, transfer assessments, and transfer decisions once written.
+### Verification
 
-**Fixed Gaps:**
+Run from `services/privacy-transfer-svc`:
+- `go test ./...` with `REQUIRE_DB_TESTS=1` against a throwaway PostgreSQL (fresh database per test, all eight migration files — `000001`–`000006`, two files each sharing the `000005` and `000006` prefixes —, app role `NOSUPERUSER NOBYPASSRLS`): **62 top-level tests pass, none skipped** (handler 54, store 8). Without a database: 53 pass, 9 skipped.
+- `go vet ./...` and `go build ./...`: clean.
+- **Mutation checks** (each reverted): restoring the NULL-tenant exception, dropping the decision event, proceeding on an idempotency lookup failure, and reverting to a substring sensitivity match each make the intended tests fail.
+- Migration tests cover a clean database and an existing-data scenario (legacy NULL-tenant rows preserved, invisible, new NULL rows refused, append-only trigger still enforced).
+- **Not performed:** Docker rebuild, live compose stack, live `authorization-svc` / purpose registry, frontend.
 
-### Gap 1 — CONDITIONAL Transfer Authorization Outcome Unreachable / Never Produced
-Status: ✅ Fixed
-Original Issue:
-CONDITIONAL transfer-authorization outcome was contractually defined in wire schemas and §16.1/§18 but was never produced by runtime evaluation, leaving machine-enforceable conditions and supplementary measures unhandled.
-Fix Verification:
-Implemented condition evaluation in `evaluate()` (`handler.go:727-750`). When an assessment includes technical measures or organizational measures, or explicit conditions / mechanism conditions are enforced, `EvaluateTransfer` returns `ResultConditional` (`CONDITIONAL`) populated with joined conditions and `ExpiresAt`.
-Evidence:
-`internal/handler/handler.go:727-750`, unit test `TestEvaluateTransfer_ConditionalOutcomeWithMeasures`, live verification in `scratch/test_transfer_live.ps1` step 8a (`Result: CONDITIONAL`, conditions attached, expires_at populated), frontend `PrivacyTransferWorkbench.tsx`.
+### External dependencies
 
-### Gap 2 — Transfer Assessment Government-Access, Technical & Organizational Measures Schema Fields
-Status: ✅ Fixed
-Original Issue:
-TransferAssessment lacked structured database schema columns and DTO fields for `government_access_risk`, `technical_measures`, and `organizational_measures` required by §16.1 TIA/risk inputs.
-Fix Verification:
-Added `government_access_risk`, `technical_measures`, and `organizational_measures` text columns in migration 000004. Added fields to `TransferAssessment` domain model, store query mapping, and REST API payload.
-Evidence:
-`deployments/migrations/000004_idempotency_and_measures.up.sql:7-10`, `internal/domain/types.go:95-101`, `internal/store/pg_store.go`, unit test `TestTransferAssessment_MeasuresAndCanonicalV1`.
+`authorization-svc` grants (including PRV-01's read grant for the forwarded principal); the systems that originate triggers 2, 5 and 7; operator tenant mapping; needs clarification: read-route actions, taxonomy drift.
 
-### Gap 3 — Mandatory Reassessment Triggers (§17.1, 8 Triggers) Automated
-Status: ✅ Fixed
-Original Issue:
-The 8 mandatory reassessment triggers specified in §17.1 (new purpose/sensitive category, new automated decisioning, new processor/jurisdiction, changed mechanism, material architecture change, new minors context, security/privacy incident, expiry reached) were not evaluated at runtime.
-Fix Verification:
-Implemented automated trigger evaluation in `evaluate()` (`handler.go:695-725`) and dedicated trigger evaluation API `EvaluateTriggers` (`POST /privacy/transfer-assessments/evaluate-triggers` and `GET /privacy/transfer-assessments/triggers`). Tested with expired assessment, mechanism modification, jurisdiction mismatch, minors context, and explicit trigger declarations.
-Evidence:
-`internal/handler/handler.go:695-725, 767-850`, unit tests `TestEvaluateTransfer_MandatoryReassessmentTriggers`, `TestEvaluateTriggersEndpoint`, live HTTP probe to `/privacy/transfer-assessments/triggers`.
+### Final Assessment — PRV-05
 
-### Gap 4 — Idempotency-Key Support (§18.1)
-Status: ✅ Fixed
-Original Issue:
-Mutating endpoints lacked mandatory `Idempotency-Key` deduplication, replay headers, and payload conflict detection.
-Fix Verification:
-Created `transfer_idempotency_keys` table with forced Row-Level Security (migration 000004). Implemented `checkIdempotency` and `writeJSONWithIdempotency` in `handler.go`. Identical requests return cached responses with header `Idempotency-Replay: true`; conflicting payloads with the same key return HTTP 409 Conflict (`PRV-020: IMMUTABLE_EVIDENCE_CONFLICT`).
-Evidence:
-`deployments/migrations/000004_idempotency_and_measures.up.sql:12-38`, `internal/handler/handler.go:115-155`, unit tests `TestIdempotency_ReplayAndConflict`, `TestEvaluateTransfer_IdempotencyAndReasonCodes`, live verification in `scratch/test_transfer_live.ps1` steps 2-4.
-
-### Gap 5 — Contractual Error and Reason Codes Aligned (§32)
-Status: ✅ Fixed
-Original Issue:
-Handler emitted ad-hoc error messages rather than standardized §32 contractual reason codes (`PRV-015` through `PRV-020`).
-Fix Verification:
-Standardized all handler error outputs and decision reason codes to contractual §32 codes: `PRV-015: PROCESSOR_RELATIONSHIP_NOT_ACTIVE`, `PRV-015: TRANSFER_MECHANISM_INVALID_OR_EXPIRED`, `PRV-015: ASSESSMENT_REJECTED`, `PRV-016: ASSESSMENT_REQUIRED_NOT_FOUND`, `PRV-016: ASSESSMENT_REQUIRES_REMEDIATION`, `PRV-016: ASSESSMENT_EXPIRED`, `PRV-016: REASSESSMENT_TRIGGER_*`, `PRV-019: PRIVACY_CONTEXT_INDETERMINATE`, `PRV-020: IMMUTABLE_EVIDENCE_CONFLICT`.
-Evidence:
-`internal/domain/types.go:15-38`, `internal/handler/handler.go:880-925`, unit test `TestEvaluateTransfer_IdempotencyAndReasonCodes`.
-
-### Gap 6 — Canonical & Versioned Route Compatibility Mounted
-Status: ✅ Fixed
-Original Issue:
-Endpoints were mounted only under a single path prefix without supporting canonical and `/v1/` compatibility aliases across all operations.
-Fix Verification:
-Mounted all routes under both `/privacy/...` and `/v1/privacy/...` (`processor-relationships`, `transfer-mechanisms`, `transfer-assessments`, `transfer-decisions`).
-Evidence:
-`internal/handler/handler.go:58-86`, unit test `TestTransferAssessment_MeasuresAndCanonicalV1`.
-
-### Gap 7 — Comprehensive Service Documentation (README.md)
-Status: ✅ Fixed
-Original Issue:
-The service lacked dedicated architectural and operational documentation, leaving requirements, invariants, and control gates undocumented.
-Fix Verification:
-Created comprehensive `README.md` (114 lines) documenting architecture, 6 core §16.1 object models, 5 architectural invariants (PRV-I22 through PRV-I26), PostgreSQL immutability triggers, RLS multi-tenancy, §18.1 idempotency key handling, API route specifications, and §32 error codes.
-Evidence:
-`services/privacy-transfer-svc/README.md` (114 lines, verified present).
-
-### Gap 8 — EvaluateTransfer Missing RBAC Authorization (confirmed, high-severity; found and fixed post-initial-audit)
-Status: ✅ Fixed
-Original Issue:
-`EvaluateTransfer` (`POST /privacy/transfer-decisions`) performed no `authorization-svc` permission check at all — any caller presenting only `X-Principal-Id` could evaluate transfer authorization and have a decision persisted, with no RBAC gate. This was a confirmed high-severity gap missed by the initial audit pass (the original audit's Segregation-of-Duties note incorrectly stated this endpoint already had "separate RBAC checks" — corrected below).
-Fix Verification:
-`EvaluateTransfer` now calls `h.authorize(...)` against a dedicated new permission, `PRIVACY_TRANSFER_DECISION_EVALUATE`, performed after tenant resolution and before idempotency-check/persistence/event-publishing — so an unauthorized caller never creates a decision record and never triggers `privacy.transfer_decision.evaluated`. Existing `requirePrincipal` (401-if-missing) behavior is unchanged. `PRIVACY_TRANSFER_DECISION_EVALUATE` was added to the `PRIVACY_TRANSFER_FULL` and `PRIVACY_FULL` permission bundles; the test principal was confirmed `GRANTED` via `authorization-svc`.
-Live verification (authorized path): authorized principal → `EvaluateTransfer` → HTTP 200, `Result: AUTHORIZED`, decision persisted, `decision_id` returned.
-Live verification (unauthorized path): a random/non-existent principal → HTTP 403; a principal without the permission → HTTP 403; in both cases no decision record was created and no event was published.
-Live verification (real cross-service integration, not a fabricated/direct-only test): the actual `privacy-decision-svc → privacy-transfer-svc` flow was exercised end-to-end and returned HTTP 200, `PERMIT`, a valid `transfer_decision_id`, with a matching decision record confirmed in `privacy-transfer-svc`.
-Regression: 2 new RBAC regression tests added; full suite `go build ./...` clean, `go vet ./...` clean, `go test ./... -count=1` → 24/24 pass (22 original + 2 new). No regression found elsewhere in the service.
-Evidence:
-`internal/handler/handler.go` (`EvaluateTransfer`, `h.authorize` call site), `authorization-svc` permission bundle configuration (`PRIVACY_TRANSFER_FULL`, `PRIVACY_FULL`), new RBAC regression tests, live HTTP verification (authorized/unauthorized/cross-service).
-
-**Documentation correction:** the original audit's `TransferDecision (output)` state list stated `CONDITIONAL (unreachable)`. This was stale — Gap 1 above (and the PRV-05 diff table elsewhere in this file) already independently verifies `CONDITIONAL` is fully reachable. Corrected to: `AUTHORIZED | CONDITIONAL | BLOCKED | REVIEW_REQUIRED`.
-
-**Remaining Gaps:**
-- None within `privacy-transfer-svc`'s own service boundary (all service-owned requirements and compliance gaps, including Gap 8, fully resolved).
-- ❌ **Not Fixed (platform-level, not service-owned):** see Dependency-Blocked Items below — PostgreSQL superuser connections bypass RLS tenant isolation.
-
-**Dependency-Blocked Items:**
-- **PDC Legal-Rule Catalogue Boundary (§16.1):** Governed transfer mechanism IDs, approved model clauses, and standard adequacy declarations originate from PDC / legal catalogues; PRV-05 stores and evaluates validity, evidence, and conditions against controller-processor relationships.
-- **Cross-Service Transfer Enforcement by PRV-03 (§13 Step 4):** Runtime data operations evaluate transfer authorization via PRV-05 when cross-border or third-party processor attributes are present.
-- ❌ **Not Fixed — Platform-level PostgreSQL superuser / RLS bypass (separate platform dependency, not caused by this remediation):** RLS policies and append-only configuration exist and are correctly defined in this service's migrations, but services currently connect to PostgreSQL using the `postgres` superuser role. PostgreSQL superusers unconditionally bypass Row-Level Security, so effective runtime tenant isolation is **not actually enforced in the current environment** regardless of the RLS policies present. Remediation requires a dedicated, non-superuser application database role (`NOSUPERUSER NOBYPASSRLS`) and corresponding connection-string configuration — a platform/infrastructure change outside this service's own boundary.
-- ⚠️ **Operational risk / separate remediation — Docker image packages pre-built binaries:** The `privacy-transfer-svc` Dockerfile packages pre-built `server`/`healthcheck` binaries rather than compiling from source during the image build. During verification, fresh Linux binaries had to be regenerated and the image rebuilt to ensure the latest source changes (the Gap 8 RBAC fix) were actually deployed to the running container. This is an operational/build-process risk, not part of the RBAC defect itself.
-
-**Needs-Clarification Items:**
-- **Machine-Enforceable Condition Rules Engine:** Spec defines `CONDITIONAL` authorization with conditions string and expiry; automated real-time verification of supplementary encryption keys or HSM enclave proofs can be integrated when an external cryptographic attestation service is provisioned.
-
-**Verification Results:**
-- Backend Unit Tests: 24/24 tests pass (`go test ./... -count=1`) — 22 original + 2 new RBAC regression tests for Gap 8.
-- Backend Build: `go build ./...` clean.
-- Backend Lint: `go vet ./...` passes with 0 issues.
-- Go Build: `go build ./cmd/server` and `./cmd/healthcheck` succeed.
-- Frontend TypeScript: `npx tsc --noEmit` passes with 0 errors on privacy components.
-- Frontend ESLint: 0 blocking errors (the two `react-hooks/purity` `Date.now()`-during-render errors are fixed).
-- Docker Health: Live container `privacy-transfer-svc` Up (healthy) on port 8155.
-- Healthcheck Endpoints: `/healthz` returns 200 OK (`{"status":"ok"}`); `/readyz` returns 200 OK (`{"status":"ready"}`).
-- Live API: `POST /privacy/transfer-decisions` and `GET /privacy/transfer-assessments/triggers` verified operational.
-- Live RBAC — authorized: `EvaluateTransfer` with an authorized principal → HTTP 200, `Result: AUTHORIZED`, decision persisted, `decision_id` returned.
-- Live RBAC — unauthorized: random/non-existent principal → HTTP 403; principal without `PRIVACY_TRANSFER_DECISION_EVALUATE` → HTTP 403; no decision record created; no event published in either case.
-- Live cross-service integration: real `privacy-decision-svc → privacy-transfer-svc` flow verified end-to-end — HTTP 200, `PERMIT`, valid `transfer_decision_id`, matching decision record confirmed in `privacy-transfer-svc` (not a fabricated/direct-only test).
-- Live E2E Integration Suite: 10/10 checks pass in `scratch/test_transfer_live.ps1` against running container on port 8155.
-- Platform-level finding: PostgreSQL superuser connections bypass RLS — see Dependency-Blocked Items above (❌ Not Fixed, separate platform dependency).
+| Area | Status |
+|---|---|
+| Backend (service-owned) | Fixed (see above) |
+| Tenant isolation | Strict in code and RLS; verified on real PostgreSQL |
+| Frontend | Not assessed |
+| Integration | **BLOCKED — DEPENDENCY** |
+| Production readiness | **NOT READY** |
 
 ---
 
@@ -620,11 +470,11 @@ Evidence:
 
 | Service | FE % | BE % | Integration % | Overall % | Health | Readiness |
 |---------|------|------|---------------|-----------|--------|-----------|
-| privacy-purpose-registry-svc | **Not updated** | ≈ 90.6 (29/32 audit items) | **BLOCKED — DEPENDENCY** | **Not 100** | Working | **NOT READY — the earlier "100 / Ready for Production" predates a compliance audit that scored 56.3% and the remediation pass; see the PRV-01 sections for what is fixed and what is blocked (dependent clients send no principal; frontend not updated; new action codes not provisioned)** |
-| privacy-consent-svc | Not assessed | ≈ 93.9 (31/33 audit items; was 64.7) | **BLOCKED — DEPENDENCY** | Not 100 | Working | **NOT READY — the earlier "100 / Ready for Production" was unsupported; see the privacy-consent-svc and PRV-02 sections for what is fixed and what is blocked (service identity for decision-svc and purpose-registry calls; grants not provisioned by this repo)** |
+| privacy-purpose-registry-svc | **Not updated** | No % asserted (earlier ≈ 90.6 superseded; domain audit scored 87.8%) | **BLOCKED — DEPENDENCY** | **Not 100** | Working | **NOT READY — the earlier "100 / Ready for Production" predated the remediation; see the privacy-purpose-registry-svc and PRV-01 sections** |
+| privacy-consent-svc | Not assessed | No % asserted (earlier ≈ 93.9 withdrawn; domain audit scored 75.0% (21/28) before this remediation) | **BLOCKED — DEPENDENCY** | Not 100 | Working | **NOT READY — the earlier "100 / Ready for Production" was unsupported; see the privacy-consent-svc and PRV-02 sections** |
 | privacy-decision-svc | **Not assessed** | No % asserted (earlier "100 / 34 of 34" withdrawn; audit scored 66.7% before remediation) | **BLOCKED — DEPENDENCY** | **Not 100** | Working | **NOT PRODUCTION READY — BLOCKED BY EXTERNAL DEPENDENCY; see the privacy-decision-svc and PRV-03 sections for what is fixed and what is blocked (service identity, purpose-registry/PDC capabilities, legacy tenant mapping, frontend correlation header)** |
-| privacy-rights-svc | 100 | 100 | 100 | 100 | Working | PRODUCTION-READY |
-| privacy-transfer-svc | 95 | 90 | 88 | 91 | Working | Ready with Minor Gaps |
+| privacy-rights-svc | Not assessed | No % asserted (earlier 100 withdrawn; audit scored 70.8% before remediation) | BLOCKED — DEPENDENCY | Not 100 | Working | NOT READY — see the privacy-rights-svc and PRV-04 sections |
+| privacy-transfer-svc | Not assessed | No % asserted (earlier 95/90/88/91 withdrawn; audit scored 63.6% before remediation) | BLOCKED — DEPENDENCY | Not 100 | Working | NOT READY — see the privacy-transfer-svc and PRV-05 sections |
 
 **Average Frontend Completion %:** 91.6%
 **Average Backend Completion %:** 93.0%
@@ -639,10 +489,10 @@ Evidence:
 
 ## PART 1 — KEY EVIDENCE / CROSS-CUTTING FINDINGS
 
-1. This is the most mature domain audited by code volume-to-quality ratio: no TODO/FIXME/"not implemented"/`panic("unimplemented")` markers anywhere in `internal/` or `cmd/` across all 5 services (only comments in `*_test.go` describing intentional in-memory test doubles, e.g. `privacy-purpose-registry-svc/internal/store/pg_store.go:28,36` and `privacy-transfer-svc/internal/store/pg_store.go:36` — these are unit-test stubs, never used in the production binary, which always wires `store.NewPgStore(pool, ...)` in `cmd/server/main.go`).
+1. This is the most mature domain audited by code volume-to-quality ratio: no TODO/FIXME/"not implemented"/`panic("unimplemented")` markers anywhere in `internal/` or `cmd/` across all 5 services (only comments describing intentional in-memory test doubles, e.g. the test-only `stubStore` in `privacy-purpose-registry-svc/internal/handler/stub_store_test.go` and `privacy-transfer-svc/internal/store/pg_store.go:36` — these are unit-test stubs, never used in the production binary, which always wires `store.NewPgStore(pool, ...)` in `cmd/server/main.go`. **Correction (PRV-01):** the `pg_store.go:28,36` citation for this service was stale; those lines are now the `isInvalidUUID`/`isUniqueViolation` helpers).
 2. `go vet ./...` and `go test ./...` are clean/passing for all 5 services (handler package tests pass; no test files exist for store/config/authz/events packages, meaning DB-layer logic is exercised only via handler tests against an in-memory stub store, not against real Postgres — a real integration-test gap common to all 5). **Correction (PRV-01):** `privacy-purpose-registry-svc` now has a real-PostgreSQL integration suite (store package) and handler tests that run end-to-end against PostgreSQL under RLS as a non-superuser role; the "DB-layer exercised only via a stub" statement no longer applies to it.
 3. Fail-closed authorization is consistent and real: every mutating route calls a live HTTP client to authorization-svc (`POST /v1/authorize`), unreachable → 503, denied → 403, with a bounded 5s in-process decision cache (mirrored across all 5 `authz/client.go` files).
-4. Row-Level Security is not just declared but actually activated: `pg_store.go` wraps every transaction with `SELECT set_config('app.tenant_id', $1, true)` (confirmed in `privacy-purpose-registry-svc/internal/store/pg_store.go:81-82`) before touching tables with `FORCE ROW LEVEL SECURITY` policies (migration `000003_add_rls.up.sql`). **Correction (PRV-01):** the session variables are now `app.tenant_id` **and** `app.platform_scope` (migration 000006); `withTenant` moved, so the quoted line numbers are stale for this service.
+4. Row-Level Security is not just declared but actually activated: `pg_store.go` wraps every transaction with `SELECT set_config('app.tenant_id', $1, true)` (originally confirmed at `privacy-purpose-registry-svc/internal/store/pg_store.go:81-82`) before touching tables with `FORCE ROW LEVEL SECURITY` policies (migration `000003_add_rls.up.sql`). **Correction (PRV-01):** the session variables are now `app.tenant_id` **and** `app.platform_scope` (migration 000006); `withTenant` moved: it is now `PgStore.withTenant` in `pg_store.go` (the `set_config` call is at line 127 at the 2026-10-21 re-audit), so the originally quoted line numbers are stale for this service.
 5. Cross-service dependency chain (privacy-purpose-registry-svc ← privacy-consent-svc ← privacy-decision-svc, plus privacy-transfer-svc → privacy-purpose-registry-svc, plus privacy-decision-svc → retention-registry-svc) is real in both docker-compose `depends_on`/env vars AND in application code (dedicated `internal/purposeregistry`, `internal/consentregistry`, `internal/retentionregistry` client packages performing genuine HTTP calls, not mocks) — this is genuinely an Interlinked domain, with privacy-rights-svc as the sole Independent service.
 6. Frontend is server-action-based (Next.js "use server"), never calls the backend from the browser (client.ts:1-6 explains this is deliberate — Go services ship no CORS middleware), and every `lib/api/privacy-*.ts` client targets the real localhost ports (8151-8155) per `lib/api/config.ts:108-112`, with a documented gateway path alternative at lines 297-301.
 7. ~~Biggest recurring gap across the domain: known, documented, and intentional decision-outcome incompleteness — PRV-03 never produces RESTRICT/REVIEW_REQUIRED (only PERMIT/BLOCK/INDETERMINATE) and PRV-05 never produces CONDITIONAL — both because no jurisdiction-specific lawful-basis/PDC rules engine exists anywhere in the platform yet.~~ **Correction:** stale — both services now produce all documented outcomes. PRV-03 produces all 5 (PERMIT, RESTRICT, BLOCK, REVIEW_REQUIRED, INDETERMINATE; RESTRICT via the PRV-05 CONDITIONAL transfer integration — exercised against a stubbed transfer client in this service's tests, not live-verified in the latest pass). PRV-05 produces CONDITIONAL (see the PRV-05 section's Gap 1). This is no longer a gap in either service.
@@ -708,7 +558,7 @@ See the first PRV-01 section: *What the service does (current behaviour)*. 26 ro
 | 5 | `submit` | Send to governed WFC workflow | Local audited transition to SUBMITTED; no WFC hand-off | ⚠️ Needs Clarification | WFC not integrated (dependency-blocked) |
 | 6 | `activate` effective time | "Governed effective time" | Server instant; caller value only as "now ± 60 s"; backdate/post-date `422` | ✅ Match | Scheduled activation is WFC's (§2.1) |
 | 7 | `GET …/{id}?as_of=` | Exact valid/known version | Valid-time window + `known_as_of`; invalid value `400 INVALID_AS_OF` | ✅ Match | |
-| 8 | Effective **and knowledge** time (§20.3) | Both preserved | `effective_from/to`, `approved_at`, `known_as_of` | ⚠️ Partial | Suspended intervals not time-sliced in `as_of` resolution |
+| 8 | Effective **and knowledge** time (§20.3) | Both preserved | `effective_from/to`, `approved_at`, `known_as_of` | ✅ Match | Suspension time-sliced from `activity_lifecycle_audit`; the 200-with-status behaviour at a suspended instant is the service's reading (spec silent) |
 | 9 | `GET /privacy/ropa` | Filtered read-only projection | `PRIVACY_ROPA_READ`; ACTIVE and in force only | ✅ Match | |
 | 10 | Gate 1 owners | Business owner **and** privacy owner | Both required (`PRV-003`) | ✅ Match | `privacy_owner` added |
 | 11 | Gate 2 role | Resolved | `PRV-003` | ✅ Match | |
@@ -727,99 +577,85 @@ See the first PRV-01 section: *What the service does (current behaviour)*. 26 ro
 | 24 | Read-route auth | §8.1 caller set | `401`/`403` on all GETs | ✅ Match | |
 | 25 | Tenant scope mandatory | §18.1 | `401 TENANT_SCOPE_REQUIRED`; platform only via sentinel | ✅ Match | |
 | 26 | Tenant isolation | §24, §23.1 | Handler plane check + capability-gated RLS | ✅ Match | Real-Postgres verified |
-| 27 | Idempotency key | §18.1 mandatory | Mandatory; replay after authn+authz | ✅ Match | Caveat: saved after commit (see Remaining gaps 3) |
+| 27 | Idempotency key | §18.1 mandatory | Mandatory; replay after authn+authz; committed atomically with the change | ✅ Match | |
 | 28 | Correlation id | §18.1 | `400` if missing, echoed | ✅ Match | |
 | 29 | Transactional outbox | §19.1 | Store enqueues in-transaction; relay retries, full acks | ✅ Match | Outage test |
 | 30 | One event per change | §19 | Handler publishes nothing | ✅ Match | |
 | 31 | Superseded version's event | §9.2/§19 | `retired` event + audit row per superseded version | ✅ Match | |
 | 32 | §32 error contract | Stable codes | `error_code` on every error | ✅ Match | |
-| 33 | Tests | — | 67 top-level, real Postgres, mutation-checked | ✅ Match | |
+| 33 | Tests | — | 95 top-level, real Postgres, mutation-checked | ✅ Match | |
 | 34 | Documentation accuracy | — | This update | ✅ Match | |
 
 ### 4. Compliance score
 
-- **Comparable items:** 32 (34 minus rows 5 and 12). **Match 29, Partial 3 (rows 8, 13, 15), Missing 0.** **≈ 90.6%.** Was 18/32 = 56.3%.
-- **Backend:** ≈ 90.6%. **Frontend:** not updated, not compliant with the new contract. **Integration:** BLOCKED — DEPENDENCY on three clients, the frontend and `authorization-svc` provisioning. **Overall:** not 100%. **Production readiness: NOT READY.**
+- **Latest documentation-compliance re-audit (2026-10-21; 49 comparable items — a different, finer-grained item list than the older 34-row table and the 36/41 domain score below, which are historical):** before this pass 42 ✅ / 7 ⚠️ / 0 ❌ = 42/49 = 85.7%. Rows 4, 35, 50 and 51 are now ✅ → **46 ✅ / 3 ⚠️ / 0 ❌ = 46/49 = 93.9%**. The three remaining partials are rows 11, 30 and 32 (WFC, PDC, DRC/PRV-05 — external). Needs clarification and excluded: rows 15, 34, 37, 52. This is a compliance percentage only: **not production ready** — see the blockers and the unverified items above.
+- **Historical:** 29 of 32 comparable items (≈ 90.6%, was 18/32 = 56.3%) before the latest pass; the domain audit then scored 87.8% (36/41). **No percentage is asserted now.** Row 8 (suspension time-slicing) is now fixed; rows 13 and 15 (reference existence — external) remain partial; row 27 (idempotency) is now a full match.
+- **Backend:** service-owned gaps fixed. **Frontend:** not updated, not compliant with the new contract. **Integration:** BLOCKED — DEPENDENCY on three clients, the frontend and `authorization-svc` provisioning. **Overall:** not 100%. **Production readiness: NOT READY.**
 
 **Top remaining gaps by risk:**
-1. **Integration (blocking):** `privacy-consent-svc`, `privacy-decision-svc`, `privacy-transfer-svc` send no `X-Principal-Id`; their lookups now get `401`. Dependency-blocked.
+1. **Integration (blocking, external):** the three clients forward `X-Tenant-Id` and `X-Principal-Id`; whether those principals hold the new read grants in `authorization-svc`, how a call with no end-user principal is identified, and end-to-end behaviour on the live stack are unverified. Dependency-blocked.
 2. **Provisioning:** new actions `PRIVACY_PURPOSE_READ`, `PRIVACY_ACTIVITY_READ`, `PRIVACY_ROPA_READ` and platform-plane grants must exist in `authorization-svc`; platform-scope authorization unverified against the live service.
 3. **Frontend** cannot satisfy gates 1/3/4/6 or the new activation rule.
-4. Suspension intervals not time-sliced (row 8); reference existence unverifiable (rows 13, 15); idempotency record saved after commit.
+4. Reference existence unverifiable (rows 13, 15 — external). Suspension time-slicing (row 8) and atomic idempotency are fixed.
 
 ---
 
 ## PRV-02 — privacy-consent-svc (port 8152)
 
-> **Correction.** This section previously scored **100%** (later amended to "see §3/§4") and contradicted the Part 1 figures. A compliance audit then scored the service **64.7%**; after the remediation pass described in the PRV-02 section of Part 1 it re-scores **≈ 93.9%** on the same table. The table below is the corrected comparison; behaviour and evidence are in Part 1 and in `services/privacy-consent-svc/README.md`.
+> **Correction.** This section previously scored **100%**, then ≈ 93.9% (31/33), and the table's route count was stale. A later domain audit scored the service **75.0% (21/28)**; the remediation described in the "Service: privacy-consent-svc" section above addresses its service-owned findings. The table below is the corrected comparison against the code as it is now; it carries **no percentage**, and items that depend on other services are not counted as matches.
 
 ### 1. Extracted contract (§10-11, §18, §19)
 
 **§18:** `POST /privacy/consents` → `receipt_id`, purpose/scope, `notice_version`, `status`, `evidence_hash`; `POST /privacy/consents/{id}/withdraw` → `withdrawal_id`, `effective_at`, `propagation_correlation`; `POST /privacy/notices/{id}/presentation-receipts` → `receipt_id`, subject/session, version, timestamp, channel/template.
 
-**§10.1 objects:** NoticeVersion, PresentationReceipt, ConsentRequest (own object), ConsentReceipt (GRANTED/DENIED, affirmative-action evidence, subject/proxy, capture time/channel, notice version, **receipt integrity**), WithdrawalReceipt (prior linkage, prospective effect, propagation correlation), PreferenceAssertion (source, **effective time**, never promoted to consent).
+**§10.1 objects:** NoticeVersion, PresentationReceipt, ConsentRequest, ConsentReceipt (receipt integrity), WithdrawalReceipt, PreferenceAssertion (source, **effective time**). **§11.1:** workforce, proxy, minors, offline/imported, tracking. **§11.2:** withdrawal prospective, never deletes evidence. **§18.1:** tenant scope, actor, idempotency key and correlation id on every mutating API; append-only; replay returns the original. **§19/§19.1:** `privacy.consent.changed` from a transactional outbox. **§33 OD-06:** the integrity *scheme* is open.
 
-**§11.1:** workforce — flag contexts *where policy says* consent may be invalid due to imbalance; proxy — verify authority, preserve both identities; minors — age-band evidence; offline/imported — source, capture method, original evidence reference, migration provenance, never a fabricated current timestamp; tracking — vendor, lifetime, jurisdiction rule reference. **§11.2:** withdrawal is prospective and never deletes evidence. **§18.1:** tenant scope, actor, idempotency key and correlation id on every mutating API; append-only evidence; replay returns the original. **§19/§19.1:** `privacy.consent.changed` carries subject, purpose/scope, old/new state, receipt/withdrawal reference, effective time, delivered from a transactional outbox. **§33 OD-06:** the receipt integrity *scheme* is an open decision.
+### 2. Implementation (current)
 
-### 2. Implementation
+17 routes: notices 11 (create, get, create-version, canonical latest approve/publish/withdraw/presentation-receipts, explicit-version equivalents), consents 4 (record, get status, withdraw, **invalidate** — `PRIVACY_CONSENT_INVALIDATE`), preferences 2. Mutating pre-flight: principal → tenant → correlation → authorization → idempotency (key + replay) → validation → resolve. Idempotency scoped to (tenant, principal, key), bound to method + path + body, atomic with the evidence and the outbox event.
 
-See Part 1 (*What changed in this pass*) and the README.
-
-### 3. Diff table (the 39 rows of the 64.7% audit, re-scored)
+### 3. Diff table (fresh audit of the remediated service)
 
 | # | Item | Status | Notes |
 |---|---|---|---|
-| 1 | Routes (13) | ✅ Match | |
-| 2 | `POST /consents` response fields | ✅ Match | §18 names added beside the existing ones; `scope` only when a `consent_request` is supplied |
-| 3 | Withdraw response fields | ✅ Match | `effective_at` is the recording instant |
-| 4 | Presentation-receipt response | ✅ Match | |
-| 5 | NoticeVersion fields | ✅ Match | |
-| 6 | PresentationReceipt fields | ✅ Match | |
-| 7 | ConsentRequest as its own object | ✅ Match | |
-| 8 | ConsentReceipt evidence | ✅ Match | |
-| 9 | Receipt integrity | ✅ Match | v2 SHA-256 over all evidence fields; scheme itself is OD-06 (open) |
-| 10 | WithdrawalReceipt | ✅ Match | |
-| 11 | PreferenceAssertion | ⚠️ Partial | No separate effective time |
-| 12 | Bundled consent | ✅ Match | |
-| 13 | Preference never promoted to consent | ✅ Match | |
-| 14 | Receipt bound to a PUBLISHED notice version (PRV-008) | ✅ Match | |
-| 15 | Proxy authority verification | ⚠️ Needs Clarification | Presence checked only; no verification service exists |
-| 16 | Offline/imported consent provenance | ✅ Match | All four fields required; typed error |
-| 17 | Minors / age band | ✅ Match | |
-| 18 | Workforce consent | ⚠️ Needs Clarification | Policy/PDC-owned (§11.1 "where policy says"; PRV-N10). Earlier counted as ❌ Missing — see score |
-| 19 | Tracking-technology scope | ✅ Match | |
-| 20 | EXPIRED / INVALIDATED states | ✅ Match | |
-| 21 | PRV-N04 replay | ✅ Match | Replay only while the original is the live latest outcome |
-| 22 | PRV-N05 withdrawal replay | ✅ Match | |
-| 23 | Append-only evidence | ✅ Match | |
-| 24 | Notice separation of duties | ✅ Match | |
-| 25 | Mandatory request context | ✅ Match | |
-| 26 | RBAC on every route | ✅ Match | Authorization precedes any resource lookup |
-| 27 | Permissions provisioned | ⚠️ Needs Clarification | Not provisioned by this repository (external) |
-| 28 | Tenant isolation | ✅ Match | Strict RLS (000006), verified on real PostgreSQL |
-| 29 | `GetNotice` | ✅ Match | |
-| 30 | Purpose-registry integration | ⚠️ Partial | Code matches the spec; the call is refused by the remediated registry (`401`) → `503` |
-| 31 | Event delivery (outbox) | ✅ Match | |
-| 32 | `privacy.consent.changed` payload | ✅ Match | |
-| 33 | Typed error codes | ✅ Match | |
-| 34 | Idempotency robustness | ✅ Match | Fails safe; save is still post-commit (limitation) |
-| 35 | Canonical latest-version routes | ✅ Match | |
-| 36 | WFC boundary | ⚠️ Needs Clarification | Dependency |
-| 37 | Withdrawal blocks future processing | ⚠️ Needs Clarification | Enforced by privacy-decision-svc |
-| 38 | Integration with privacy-decision-svc | ⚠️ Needs Clarification | Refused today (`401`); service identity undefined |
-| 39 | Documentation accuracy | ✅ Match | This update |
+| 1 | Routes (17) | ✅ Match | Earlier "13" was stale |
+| 2 | `POST /consents` §18 fields | ✅ Match | |
+| 3 | Withdraw §18 fields | ✅ Match | |
+| 4 | Presentation-receipt §18 fields | ✅ Match | `receipt_id` added beside `presentation_receipt_id` |
+| 5 | Notice lifecycle and segregation of duties | ✅ Match | |
+| 6 | ConsentRequest object | ✅ Match | |
+| 7 | Receipt integrity | ✅ Match | v2; scheme is OD-06 (open) |
+| 8 | Offline-import provenance | ✅ Match | |
+| 9 | Minors / age band | ✅ Match | |
+| 10 | PRV-008 notice binding | ✅ Match | |
+| 11 | Replay (PRV-N04) | ✅ Match | |
+| 12 | Withdrawal / replay (PRV-N05) | ✅ Match | |
+| 13 | Invalidation | ✅ Match | |
+| 14 | Append-only evidence | ✅ Match | |
+| 15 | Mandatory request context | ✅ Match | |
+| 16 | Pre-flight order | ✅ Match | Validation follows authentication and authorization on every route |
+| 17 | RBAC on every route | ✅ Match | `GetNotice` intentionally principal-less; grants are external |
+| 18 | Strict RLS | ✅ Match | Verified on real PostgreSQL |
+| 19 | Foreign receipt → 404 after authorization | ✅ Match | |
+| 20 | Reads gated | ✅ Match | |
+| 21 | Purpose-registry integration | ⛔ BLOCKED — EXTERNAL DEPENDENCY | Principal and tenant forwarded; the registry grant is external |
+| 22 | Outbox events and payload | ✅ Match | |
+| 23 | Typed errors | ✅ Match | Invalid notice transitions are `409 INVALID_TRANSITION`; idempotency conflicts `409 IDEMPOTENCY_MISMATCH`; framework-level responses are documented as outside the envelope |
+| 24 | Idempotency: scope, binding, atomicity, fail-closed | ✅ Match | |
+| 25 | Latest-version routes | ✅ Match | |
+| 26 | Preference effective time | ✅ Match | `effective_at` persisted, returned and used for resolution; field name/default/resolution are the service's reading of §10.1 (spec silent) |
+| 27 | Documentation accuracy | ✅ Match | One idempotency description in the README; counts current |
 
-### 4. Compliance score
+Needs clarification / external (not scored): proxy authority verification, workforce consent (PDC), grant provisioning, WFC boundary, `GetNotice` invalid `as_of`. at most one PUBLISHED notice version per notice (design decision; not enforced, not stated by the spec).
 
-- **Comparable items: 33. Match 31, Partial 2 (rows 11, 30), Missing 0 → ≈ 93.9%.** Needs-clarification (not scored): rows 15, 18, 27, 36, 37, 38.
-- Row 18 moved from ❌ to needs-clarification because, on reading the exact §11.1/PRV-N10 wording, the behaviour is policy-owned rather than service-owned. Counting it as a miss as before gives 31/34 ≈ 91.2%.
-- **Backend ≈ 93.9% · Frontend not assessed · Integration BLOCKED — DEPENDENCY · Production readiness NOT READY.**
+**Latest documentation-compliance re-audit (2026-10-21; 48 comparable items):** before this pass 46 ✅ / 2 ⚠️ / 0 ❌ = 95.8%. Rows 45 and 48 are now ✅ → **48 ✅ / 0 ⚠️ / 0 ❌ = 48/48 = 100% of the comparable documented items.** This is a documentation-compliance figure only: eight clarification items and the one-PUBLISHED design decision are excluded, external dependencies are unresolved, and the service is **NOT production ready**.
+
+**Backend (service-owned): fixed · Frontend not assessed · Integration BLOCKED — DEPENDENCY · Production readiness NOT READY.** No compliance percentage is asserted.
 
 **Top remaining items by risk:**
-1. **Integration:** consent → registry and decision → consent calls are refused (no service identity); consent recording cannot succeed against the remediated registry.
+1. **Integration:** the registry grant for the forwarded principal and a service-to-service identity (external).
 2. **Provisioning:** the actions this service checks are not granted by anything in the repository.
 3. Legacy NULL-tenant rows need an operator-assigned owner.
-4. Idempotency record saved after commit; `PreferenceAssertion` effective time.
 
 ---
 
@@ -863,7 +699,7 @@ See the README. Key points: atomic decision + idempotency commit; `(tenant, prin
 | 10 | Unknown values fail closed | ✅ Match | Regression table |
 | 11 | `expires_at` from upstream evidence, persisted/returned/replayed | ✅ Match | Default TTL — needs clarification |
 | 12 | Correlation id echoed (first, replay, GET) | ✅ Match | |
-| 13 | Error/status contract documented and tested on every path | ✅ Match | Spec defines no transport codes |
+| 13 | Error/status contract documented and tested on every path | ✅ Match | Spec defines no transport codes; framework/server responses documented as outside the envelope; bodies over 1 MiB are `400 VALIDATION_FAILED` |
 | 14 | No undocumented decision event | ✅ Match | §19 lists none |
 | 15 | Idempotency scope (tenant, principal, key) | ✅ Match | Spec silent — needs clarification |
 | 16 | Formats consistent between code and docs | ✅ Match | Spec silent — needs clarification |
@@ -871,6 +707,8 @@ See the README. Key points: atomic decision + idempotency commit; `(tenant, prin
 | 18 | Service-to-service identity | ⛔ BLOCKED — EXTERNAL DEPENDENCY | Platform |
 | 19 | Frontend `X-Correlation-ID` | 🚫 NOT SERVICE-OWNED | |
 | 20 | Documentation accuracy | ✅ Match | This update; stale `handler.go:NN` references removed |
+
+**Latest documentation-compliance re-audit (2026-10-21):** the earlier figures above are historical. In the latest audit the service scored 36/37 = 97.3% (one partial: the error-envelope statement); that statement is now accurate, so 37/37 = 100% of the comparable documented items. The 1 MiB body limit is a hardening change, not a scored row. Nine clarification items are excluded, external dependencies are unresolved, and the service is **NOT production ready**.
 
 ### 4. Result
 
@@ -887,225 +725,97 @@ See the README. Key points: atomic decision + idempotency commit; `(tenant, prin
 
 ## PRV-04 — privacy-rights-svc (port 8154)
 
-### 1. Extracted contract (§14-15, §18)
+> **Correction.** This section previously scored **100%** and stated events `privacy.rights_request.received` / `.closed`. A later audit scored the service **70.8% (17/24)**; the remediation described in the "Service: privacy-rights-svc" section above addresses its service-owned findings. The earlier events claim is withdrawn (§19 declares none). Behaviour is documented in `services/privacy-rights-svc/README.md`; this section keeps the contract-versus-code view.
 
-**§18 API table entries:**
+### 1. Extracted contract (§14–15, §18, §18.1, §19, §31, §32)
 
-| API | Purpose | Critical response fields |
-|---|---|---|
-| POST /privacy/rights-requests | Create privacy request/case | request_id, classification, identity_state, **WFC_process_ref** |
-| POST /privacy/rights-requests/{id}/discovery-manifests | Attach domain discovery result | manifest_id, domain, hash, candidate_count, evidence_ref |
+- **§18:** `POST /privacy/rights-requests` → `request_id`, `classification`, `identity_state`, `WFC_process_ref`; `POST …/{id}/discovery-manifests` → `manifest_id`, `domain`, `hash`, `candidate_count`, `evidence_ref`.
+- **§14.2:** eight right families. **§15.1:** identity assurance, signed/hashed discovery manifests, third-party redaction, legal-privilege review, legal-hold interaction, response-package binding, late discovery, complaint clock (WFC).
+- **§15.2:** *"Finding a record is only discovery. Disclosure requires identity assurance, applicable-right determination, scope review, exemptions, third-party protection, redaction and approved response assembly."*
+- **§18.1:** tenant scope, actor, idempotency key and correlation id on every mutating API; evidence append-only. **§19:** no rights intake/closure event; `privacy.rights.action_required` exists. **Invariants:** I17–I21.
 
-**§14.2 supported right families (8):** Access/copy, Rectification, Erasure/deletion, Restriction, Portability, Objection/withdrawal, Automated-decision challenge, Privacy complaint.
+### 2. Implementation (current)
 
-**§15.1 identity/discovery control points:** duplicate identity resolution; signed/hashed discovery manifests; third-party redaction; legal privilege review; legal hold interaction; response package binding; late-discovery handling; complaint clock (WFC-owned).
+Eight routes (× `/v1` alias). Pre-flight on every route: principal → tenant → (mutating) correlation and idempotency key → authorization on the verified tenant → (mutating) replay lookup → validation → resolve. Atomic idempotency (claim, change and stored response in one transaction); strict RLS; closed-case and evidence immutability triggers; the disclosure gate verifies a **verified identity event** and a SHA-256-digested manifest; typed `error_code` envelope; no events.
 
-**§15.2 Disclosure Gate (explicit invariant):** "Finding a record is only discovery. Disclosure requires identity assurance, applicable-right determination, scope review, exemptions, third-party protection, redaction and approved response assembly."
+### 3. Diff table (fresh audit of the remediated service)
 
-**Relevant invariants (§31):** I17 (discovery ≠ disclosure), I18 (no unrelated third-party disclosure), I19 (erasure can't bypass legal hold), I20 (no destructive rewrite), I21 (response packages versioned, post-approval change invalidates).
+| # | Item | Status | Notes |
+|---|---|---|---|
+| 1 | Routes | ✅ Match | 8 routes × 2 prefixes |
+| 2 | Create response fields | ✅ Match | |
+| 3 | Manifest response fields | ✅ Match | |
+| 4 | Eight right families | ✅ Match | |
+| 5 | Disclosure gate: verified identity event + manifest | ✅ Match | Atomic, row-locked |
+| 6 | §15.2 elements the service cannot verify | ⛔ BLOCKED — EXTERNAL DEPENDENCY | WFC / reviewers / adapters |
+| 7 | Lifecycle | ✅ Match | |
+| 8 | Identity evidence (failed attempts recorded, not advancing) | ✅ Match | |
+| 9 | Requester vs subject | ✅ Match | |
+| 10 | Response package versioning (I21) | ✅ Match | |
+| 11 | Closed-case immutability + `409 PRV-020` | ✅ Match | Now also checked under the same lock as the write |
+| 12 | Append-only evidence | ✅ Match | |
+| 13 | Principal on every route | ✅ Match | Reads included; principal checked before tenant, in the middleware and again in each handler |
+| 14 | RBAC | ✅ Match | Read routes reuse `PROCESS` — needs clarification |
+| 15 | Correlation id and idempotency key mandatory | ✅ Match | |
+| 16 | Idempotency: scope, binding, atomicity, fail-closed | ✅ Match | |
+| 17 | Tenant isolation / strict RLS | ✅ Match | Legacy NULL rows: blocked data migration |
+| 18 | Read-route access control | ✅ Match | |
+| 19 | Events | ✅ Match | None emitted (§19) |
+| 20 | Error contract | ✅ Match | `error_code` on every handler/middleware error; chi/HTTP-server responses documented as exceptions |
+| 21 | Documentation accuracy | ✅ Match | This update; pre-flight order and error-envelope scope now exact |
+| 22 | WFC process reference | ✅ Match | |
+| 23 | Authorization client envelope | ✅ Match | New row (documented this pass): identity/envelope headers forwarded as in the sibling services |
 
-### 2. Extracted implementation
+**Latest documentation-compliance re-audit (2026-10-21):** before this pass 32 ✅ / 2 ⚠️ / 0 ❌ = 32/34 = 94.1% (rows 20 and 28 partial; the table above numbers the same items differently). Both partials are now ✅ → 34/34 = 100%. With the authorization-client row documented in this pass the comparable set is 35/35 = 100%. This is a documentation-compliance figure only: eight clarification items are excluded, external dependencies are unresolved, and the service is **NOT production ready**.
 
-**Commands (real routes, 10 endpoints mounted across canonical and versioned paths):**
-- `POST /privacy/rights-requests` & `POST /v1/privacy/rights-requests` (create request / case intake)
-- `POST /privacy/rights-requests/{id}/identity-verification` & `POST /v1/...` (record identity verification evidence)
-- `POST /privacy/rights-requests/{id}/discovery-manifests` & `POST /v1/...` (attach domain discovery manifest)
-- `POST /privacy/rights-requests/{id}/wfc-process-ref` & `POST /v1/...` (attach workflow-svc process reference)
-- `POST /privacy/rights-requests/{id}/close` & `POST /v1/...` (close request with §15.2 Disclosure Gate)
-
-**Reads:**
-- `GET /privacy/rights-requests/{id}` & `GET /v1/...` (lookup case by ID)
-- `GET /privacy/rights-requests?subject_ref=...` & `GET /v1/...` (list cases by subject)
-- `GET /privacy/rights-requests/{id}/discovery-manifests` & `GET /v1/...` (list discovery manifests)
-
-**States:** `RECEIVED → IDENTITY_VERIFIED → IN_DISCOVERY → CLOSED`; Outcome (set only at closure): `FULFILLED | REJECTED | WITHDRAWN`.
-
-**Events:** `privacy.rights_request.received`, `privacy.rights_request.closed`.
-
-**Disclosure gate — verified in code and live stack, verbatim match:** `CloseRequest` refuses `FULFILLED` with 422 unless `IdentityVerified == true` (`PRV-012: IDENTITY_ASSURANCE_INSUFFICIENT`) AND at least one `DiscoveryManifest` exists (`PRV-013: THIRD_PARTY_REVIEW_REQUIRED`). REJECTED/WITHDRAWN carry no such precondition.
-
-**WFCProcessRef:** implemented as an optional caller-supplied field (`POST /{id}/wfc-process-ref` with dedicated Sub-Form 2D in UI workbench) per §14.1 separation of concerns (PRV-04 owns privacy meaning/evidence; workflow-svc owns long-running task orchestration).
-
-**Response Package Versioning (I21):** `response_package_version` column increments on every `FULFILLED` closure (migration 000004); surfaced in API responses and UI Case Inspector.
-
-**Idempotency-Key handling (§18.1):** Fully enforced on all mutating routes via persistent `rights_idempotency_keys` table with RLS; returns cached response with `Idempotency-Replay: true` on replay, and 409 Conflict (`PRV-020`) on payload mismatch.
-
-**Append-only / DB immutability:** Enforced at database layer (migration 000002):
-- `rights_requests_closed_immutable` trigger aborts any UPDATE on closed cases (`status = 'CLOSED'`).
-- `identity_verification_events_append_only` trigger aborts UPDATE/DELETE on identity assurance evidence.
-- `discovery_manifests_append_only` trigger aborts UPDATE/DELETE on discovery manifests.
-
-**Auth / RBAC:** `X-Principal-Id` mandatory, fail-closed `authorization-svc` gating (`PRIVACY_RIGHTS_REQUEST_CREATE`, `PRIVACY_RIGHTS_REQUEST_PROCESS`, `PRIVACY_RIGHTS_REQUEST_CLOSE`), and Row-Level Security with `tenant_isolation_policy` (migration 000003). Re-confirmed in re-audit: exactly 5 `requirePrincipal` calls and 5 `authorize` calls, correctly corresponding to the 5 mutating endpoints (no authorization gap); tenant isolation live-verified end-to-end (cross-tenant `GetRequest` → 404, correct-tenant `GetRequest` → 200), consistent with the platform-wide Privacy RLS remediation.
-
-### 3. Diff table
-
-| Item | Documented | Implemented | Status | Notes |
-|---|---|---|---|---|
-| Disclosure gate (§15.2) | Non-negotiable precondition for FULFILLED | Enforced verbatim, 422 with §32 error codes | ✅ Match | Live verified against running container |
-| WFC_process_ref linkage | §14.1 / §18 linkage to workflow instance | Optional caller-supplied field + backend endpoint + frontend Sub-Form 2D control | ✅ Match | Clean service boundary documented per §14.1 |
-| Discovery manifest evidence | Signed/hashed, candidate count, evidence ref | `ContentHash, CandidateCount, EvidenceRef, Domain` | ✅ Match | Append-only evidence log enforced by DB trigger |
-| Identity assurance evidence | Proportionate auditable assurance (§15.1) | Both successful and failed attempts recorded; only successful advances status to IDENTITY_VERIFIED | ✅ Match | Append-only evidence log enforced by DB trigger |
-| Proxy/representative authority evidence | §15.1 requester vs subject modeling | `RequesterRef` field exists, distinguishes requester from subject | ✅ Match | Full wire and persistence fidelity |
-| Response package versioning / invalidate-on-change (I21) | Non-bypassable invariant | `response_package_version` column incremented on approved closure; displayed on UI | ✅ Match | Migration 000004 |
-| Idempotency-key on mutating APIs | §18.1 mandatory | `rights_idempotency_keys` table with RLS, replay header, 409 Conflict on payload mismatch | ✅ Match | Migration 000004 |
-| §32 error/reason codes | Stable numbered contract | Contractual codes `PRV-001` through `PRV-020` used throughout | ✅ Match | Standardized across handlers |
-| Append-only evidence & case immutability | Implied throughout / §31 I20 | Triggers on `rights_requests`, `identity_verification_events`, `discovery_manifests` | ✅ Match | Migration 000002; live SQL tests verified |
-| Frontend UI completeness | Full workbench | `PrivacyRightsWorkbench.tsx` with intake, identity, manifest, WFC process ref, close, search | ✅ Match | 100% clean TypeScript build |
-
-### 4. Compliance score
-
-- **Core disclosure-gate business rule:** perfect match — **100%**
-- **Object/schema fidelity:** all documented fields, versioning, and idempotency present — **100%**
-- **Data integrity (database immutability triggers, append-only logs, RLS):** fully enforced — **100%**
-- **Cross-cutting (idempotency, §32 error codes, route compatibility):** fully enforced — **100%**
-- **Frontend Completion:** **100%**
-- **Backend Completion:** **100%**
-- **Integration Completion:** **100%**
-
-**Overall compliance: 100%** (Production-ready; all service-owned gaps resolved and live-verified)
-
-**Production Readiness: PRODUCTION-READY**
-
-**Commands:**
-- `POST /privacy/rights-requests` & `POST /v1/privacy/rights-requests` (create case intake, requires `PRIVACY_RIGHTS_REQUEST_CREATE`)
-- `POST /privacy/rights-requests/{id}/identity-verification` & `POST /v1/...` (record identity assurance attempt, requires `PRIVACY_RIGHTS_REQUEST_PROCESS`)
-- `POST /privacy/rights-requests/{id}/discovery-manifests` & `POST /v1/...` (attach domain discovery manifest, requires `PRIVACY_RIGHTS_REQUEST_PROCESS`)
-- `POST /privacy/rights-requests/{id}/wfc-process-ref` & `POST /v1/...` (attach workflow-svc process reference, requires `PRIVACY_RIGHTS_REQUEST_PROCESS`)
-- `POST /privacy/rights-requests/{id}/close` & `POST /v1/...` (close request with §15.2 Disclosure Gate, requires `PRIVACY_RIGHTS_REQUEST_CLOSE`)
-
-**Reads:**
-- `GET /privacy/rights-requests/{id}` & `GET /v1/...` (lookup case by ID)
-- `GET /privacy/rights-requests?subject_ref=...` & `GET /v1/...` (list cases by subject)
-- `GET /privacy/rights-requests/{id}/discovery-manifests` & `GET /v1/...` (list attached discovery manifests)
-
-**States:**
-- Status lifecycle: `RECEIVED → IDENTITY_VERIFIED → IN_DISCOVERY → CLOSED`
-- Outcome (set only at closure): `FULFILLED` (requires §15.2 Disclosure Gate), `REJECTED`, `WITHDRAWN`
-
-**Events:**
-- `privacy.rights_request.received`
-- `privacy.rights_request.closed`
-
-**Segregation of Duties & Auth:**
-- `X-Principal-Id` mandatory on all mutating endpoints (401 if missing).
-- RBAC permissions enforced fail-closed via `authorization-svc`: `PRIVACY_RIGHTS_REQUEST_CREATE`, `PRIVACY_RIGHTS_REQUEST_PROCESS`, `PRIVACY_RIGHTS_REQUEST_CLOSE`.
-- PostgreSQL-level immutability triggers prevent tampering once case is closed.
-
-**Fixed Gaps:**
-1. **Database immutability & append-only triggers enforced:** `rights_requests_closed_immutable` trigger aborts any UPDATE on closed requests; `identity_verification_events_append_only` and `discovery_manifests_append_only` triggers abort any UPDATE/DELETE on evidence tables (migration 000002).
-2. **Idempotency-Key (§18.1) enforced:** Persistent `rights_idempotency_keys` table with RLS, replay header `Idempotency-Replay: true`, and 409 Conflict on payload mismatch (migration 000004).
-3. **Response package versioning (I21) implemented:** `response_package_version` column added; increments on every `FULFILLED` closure, displayed in Case Inspector.
-4. **§32 stable error/reason codes aligned:** Contractual codes `PRV-001` through `PRV-020` used throughout handler.
-5. **Canonical & versioned routes mounted:** Both `/privacy/rights-requests` and `/v1/privacy/rights-requests` fully supported.
-6. **Frontend UI control for AttachWFCProcessRef implemented:** Sub-Form 2D added in `PrivacyRightsWorkbench.tsx`, server action connected, state banner wired.
-7. **Created comprehensive README.md:** Architecture, responsibilities, invariants, and API documentation added.
-
-**Remaining Gaps:**
-- None (all service-owned requirements and compliance gaps fully resolved).
-
-**Dependency-Blocked Items:**
-- **WFC Workflow Engine Orchestration Boundary (§14.1):** PRV-04 owns the privacy meaning and immutable evidence of rights requests. Long-running workflow timers, approval orchestration, and task dispatch belong to `workflow-svc` via `wfc_process_ref`.
-- **Domain Search & Export Adapters (§14.1):** Actual discovery crawling across CRM, ERP, HR, and billing databases is performed by external domain adapters that submit hashed discovery manifests to PRV-04.
-
-**Needs-Clarification Items:**
-- **Signed Manifest Specification:** Spec §15.1 mentions "signed/hashed discovery manifests"; PRV-04 currently implements SHA-256 cryptographic hashing (`ContentHash`) and candidate counts. Asymmetric signature verification (e.g. PKI / ed25519) can be added if an external KMS/PKI infrastructure is specified.
-- **Third-Party Redaction Automation vs. Manual Review:** Automated redaction pipeline vs. human reviewer sign-off gate before response package assembly. Handled via the Disclosure Gate requiring evidence review before closure.
-
-**Verification Results:**
-- Backend Unit Tests: 20/20 tests pass (`go test ./...`).
-- Go Vet: `go vet ./...` passes with 0 issues.
-- Go Build: `go build ./cmd/server` and `./cmd/healthcheck` succeed.
-- Frontend TypeScript: `npx tsc --noEmit` passes with 0 errors; ESLint 0 errors (12 pre-existing `react-hooks/set-state-in-effect` warnings, cross-cutting convention, not a PRV-04-specific gap).
-- Docker Build: `docker build -t privacy-rights-svc:local .` succeeds.
-- Health Probes: `/healthz` returns 200 OK (`{"status":"ok"}`); `/readyz` returns 200 OK (`{"status":"ready"}`).
-- Live E2E Integration: Disclosure Gate, idempotency replay/conflict, `/v1/` routes, tenant isolation (cross-tenant 404 / same-tenant 200), and RBAC coverage (5 `requirePrincipal` + 5 `authorize` calls across the 5 mutating endpoints) all re-verified live against the running container on port 8154. **Documentation correction:** the previously-cited `scratch/test_rights_live.ps1` ("16/16 checks") is a stale/unverifiable citation — that file does not exist — and is no longer relied upon as evidence; the live verifications above were performed directly against the running container instead.
-
-**Top gaps ranked by risk:**
-- None remaining within `privacy-rights-svc` service boundary. All confirmed service-owned gaps are resolved and verified.
+Needs clarification (not scored): read-route action; owner of `privacy.rights.action_required`; asymmetric manifest signatures; live-container verification (not performed). **No compliance percentage is asserted.**
 
 ---
 
 ## PRV-05 — privacy-transfer-svc (port 8155)
 
-### 1. Extracted contract (§16-17, §18)
+> **Correction.** This section previously scored **100%**, named the event `privacy.transfer_decision.evaluated`, and carried an "❌ Not Fixed — superuser bypasses RLS" row. A later audit scored the service **63.6% (14/22)**; the remediation described in the "Service: privacy-transfer-svc" section above addresses its service-owned findings. Behaviour is documented in `services/privacy-transfer-svc/README.md`; this section keeps the contract-versus-code view.
 
-**§18 entry:** `POST /privacy/transfer-decisions | authorization_id, result, conditions, mechanism/assessment refs, expiry`.
+### 1. Extracted contract (§16–17, §18, §18.1, §19, §32)
 
-**§16.1 object model (6 objects):**
+- **§18:** `POST /privacy/transfer-decisions` → `authorization_id`, `result`, `conditions`, mechanism/assessment refs, `expiry`.
+- **§16.1 objects:** ProcessorRelationship, Subprocessor, TransferContext, TransferMechanism, TransferAssessment (TIA/risk inputs incl. government-access/technical/organizational measures), TransferAuthorization (`AUTHORIZED | CONDITIONAL | BLOCKED | REVIEW_REQUIRED`).
+- **§16.2 (I23):** technical reachability ≠ authorization. **§17.2:** missing/expired/conflicted DPIA/TIA or mechanism approval → `BLOCKED` or `REVIEW_REQUIRED`. **§17.1:** eight mandatory reassessment triggers.
+- **§18.1:** tenant scope, actor, idempotency key, correlation id on every mutating API; evidence append-only. **§19/§19.1:** `privacy.processor.changed`, `privacy.transfer.authorization_changed`, `privacy.assessment.expiring`; events communicate committed state and survive a bus outage.
 
-| Object | Required fields / controls |
-|---|---|
-| ProcessorRelationship | controller/processor parties, services, processing instructions, purpose/activity refs, categories/subjects, contract/evidence refs, jurisdictions, effective state |
-| Subprocessor | provider identity, service, purpose, data scope, processing locations, onward subprocessors, notification/approval model, contract/evidence refs |
-| TransferContext | exporter/importer roles, origin/destination jurisdictions, data categories, subject classes, purpose, route/provider, frequency/volume class |
-| TransferMechanism | governed mechanism ID/version from PDC/legal catalogue, contractual/adequacy/BCR/other evidence refs, validity and conditions |
-| TransferAssessment | TIA/risk inputs, **government-access/technical/organizational measures**, reviewer, residual risk, expiry/review trigger |
-| TransferAuthorization | AUTHORIZED / CONDITIONAL / BLOCKED / REVIEW_REQUIRED, exact scope, validity, conditions and evidence ID |
+### 2. Implementation (current)
 
-**§16.2 (invariant I23):** technical reachability ≠ transfer authorization.
+14 logical routes (× `/v1` alias). Pre-flight on every route: tenant (middleware) → principal → (mutating) correlation and key → authorization on the verified tenant → (mutating) replay lookup → validation → resolve. Atomic idempotency; strict RLS; append-only evidence triggers; a single trigger evaluation shared by `EvaluateTransfer` and the trigger endpoint, over the same stored evidence regardless of `assessment_required`; the three §19 events through a transactional outbox; caller principal forwarded to PRV-01.
 
-**§17.2 fail-closed doctrine:** missing/expired/conflicted DPIA/TIA or mechanism approval → BLOCKED or REVIEW_REQUIRED, never inferred permission from prior success.
+### 3. Diff table (fresh audit of the remediated service)
 
-**§17.1 mandatory reassessment triggers (8):** new purpose/sensitive category, new automated decisioning, new processor/jurisdiction, changed mechanism, material architecture change, new minors context, incident revealing unmodeled risk, expiry reached.
+| # | Item | Status | Notes |
+|---|---|---|---|
+| 1 | Routes | ✅ Match | |
+| 2 | ProcessorRelationship fields | ✅ Match | |
+| 3 | Subprocessor fields | ✅ Match | |
+| 4 | Mechanism validity window | ✅ Match | |
+| 5 | Fail-closed missing/expired/rejected assessment | ✅ Match | |
+| 6 | CONDITIONAL outcome | ✅ Match | |
+| 7 | Assessment measures fields | ✅ Match | |
+| 8 | Triggers derivable from evidence (1, 3, 4, 6, 8), shared evaluation and evidence, validated declarations | ✅ Match | Fixed 2026-10-21: both paths read the latest assessment whatever `assessment_required` says |
+| 8b | Triggers 2, 5, 7 | ⛔ BLOCKED — EXTERNAL DEPENDENCY | Facts originate in other systems; caller-declared only |
+| 9 | Idempotency: scope, binding, atomicity, fail-closed | ✅ Match | |
+| 10 | §32 reason codes | ✅ Match | |
+| 11 | Append-only evidence | ✅ Match | |
+| 12 | RBAC on mutating routes incl. `EvaluateTransfer` | ✅ Match | |
+| 13 | Principal / correlation / key on mutating routes | ✅ Match | |
+| 14 | Tenant isolation / strict RLS | ✅ Match | Legacy NULL rows: blocked data migration |
+| 15 | Read-route access control | ✅ Match | Reuse of existing actions — needs clarification |
+| 16 | §19 events, transactional | ✅ Match | |
+| 17 | Decision sequence documented incl. instruction (PRV-017), subprocessor approval (PRV-018) and triggers | ✅ Match | README |
+| 18 | Registry integration | ⛔ BLOCKED — EXTERNAL DEPENDENCY | Principal forwarded; PRV-01 read grant is external |
+| 19 | §18 decision fields | ✅ Match | |
+| 20 | Documentation accuracy | ✅ Match | This update |
 
-### 2. Extracted implementation
+**Latest documentation-compliance re-audit (2026-10-21):** in the latest audit the service scored 35/38 = 92.1% (three partials: shared-evaluation claim, pre-flight order, migration numbering). The first is fixed in code, the other two in documentation, so 38/38 = 100% of the comparable documented items (the earlier figures above are historical). Five clarification items are excluded, external dependencies are unresolved, and the service is **NOT production ready**. Separately, privacy-decision-svc's call to `POST /privacy/transfer-decisions` omits the mandatory `X-Correlation-ID` and `Idempotency-Key` and is refused with 400; that caller-owned defect is outside this service.
 
-**Commands (real routes, 8 write endpoints):** create-relationship, update-relationship-status, attach-subprocessor, create-mechanism, record-assessment, evaluate-transfer.
-
-**Reads:** list-relationships, get-relationship, list-subprocessors, get-mechanism, get-latest-assessment, get-decision.
-
-**States:** ProcessorRelationship: `ACTIVE | INACTIVE`. TransferAssessment: append-only, `APPROVE | REMEDIATE | REJECT` outcome. TransferDecision (output): `AUTHORIZED | CONDITIONAL | BLOCKED | REVIEW_REQUIRED` (⚠️ Documentation corrected — previously stated `CONDITIONAL (unreachable)`; the implementation is verified to produce a reachable `CONDITIONAL` outcome, see Gap 1 and the diff table below).
-
-**Events:** `privacy.transfer_decision.evaluated`.
-
-**Schema fidelity — the strongest of all 5 services:** `ProcessorRelationship` and `Subprocessor` implement **every single field** §16.1 names for them. `TransferMechanism` has a real `ValidAsOf()` expiry check. `TransferAssessment` is real append-only evidence with a `ReviewTriggerAt` expiry.
-
-**Decision sequence (`evaluate()`, verified line-by-line):** relationship must be ACTIVE → mechanism must exist and be valid-as-of-now → *if caller declares* `AssessmentRequired`, assessment must exist, not be REJECT/REMEDIATE outcome, and not be expired → else AUTHORIZED. Any dependency-lookup failure routes to **REVIEW_REQUIRED**.
-
-**Cross-service validation confirmed:** `ProcessorRelationship.PurposeActivityRefs` validated against a real call to privacy-purpose-registry-svc when supplied (`ErrPurposeNotActive`).
-
-**Auth:** every mutating route requires `X-Principal-Id` + fail-closed `authorization-svc` check.
-
-**Segregation of Duties:** not modeled — assessment recording (`RecordAssessment`) and transfer evaluation (`EvaluateTransfer`) are separate actions with no cross-check on which principal did which. ✅ Fixed (RBAC gap): `EvaluateTransfer` previously performed **no** `authorization-svc` permission check at all — this was a confirmed, high-severity gap missed by the original audit pass. It now requires the dedicated `PRIVACY_TRANSFER_DECISION_EVALUATE` permission, checked after tenant resolution and before idempotency/persistence/event-publishing; unauthorized callers get 403 and no decision record or event is created. See Gap 8 in the companion "Service: privacy-transfer-svc" section above for full fix/verification detail.
-
-**Idempotency-Key handling:** Fully implemented per §18.1 with `transfer_idempotency_keys` table, forced RLS, tenant isolation, request hashing, and cached replay/conflict detection.
-
-**Append-only:** DB migration confirmed (append-only trigger present) on decisions/assessments.
-
-**Reassessment triggers (§17.1, 8 documented):** Fully automated across transfer evaluation and dedicated trigger evaluation API (`/privacy/transfer-assessments/evaluate-triggers`).
-
-### 3. Diff table
-
-| Item | Documented | Implemented | Status | Notes |
-|---|---|---|---|---|
-| ProcessorRelationship fields | 9 named fields | All 9 present | ✅ Match | Verified |
-| Subprocessor fields | 8 named fields | All 8 present | ✅ Match | Verified |
-| Mechanism validity window | Governed mechanism + validity/conditions | Real `ValidFrom`/`ValidUntil` + `ValidAsOf()` check | ✅ Match | Verified |
-| Fail-closed on missing/expired/rejected assessment | §17.2, explicit | Encoded literally — REJECT→BLOCKED, REMEDIATE/expired→REVIEW_REQUIRED, missing→REVIEW_REQUIRED | ✅ Match | Best fail-closed implementation |
-| Reachability ≠ authorization (I23) | Non-bypassable invariant | Privacy authorization evaluated strictly independently from network topology | ✅ Match | |
-| CONDITIONAL outcome | 1 of 4 documented results | Produced when supplementary technical/organizational measures or explicit conditions exist | ✅ Match | Fully reachable, returned with conditions & expiry |
-| Assessment "government-access/technical/organizational measures" | Explicit sub-fields (§16.1) | Structured schema fields in DB (migration 000004), DTOs, and UI | ✅ Match | Added structured fields |
-| Mandatory reassessment triggers (§17.1, 8 triggers) | Documented list | All 8 triggers automated in runtime evaluation and dedicated trigger endpoint | ✅ Match | Full trigger automation |
-| Idempotency-key | §18.1 mandatory | `transfer_idempotency_keys` table with RLS, request hash, cache replay & conflict detection | ✅ Match | Enforced on all mutating routes |
-| §32 error/reason codes | Stable numbered contract | PRV-015 through PRV-020 codes prefixed on reason codes and API errors | ✅ Match | Dual symbol & numbered code compatibility |
-| Append-only decisions/assessments | Implied by "decision durability" pattern | DB migration confirmed | ✅ Match | Verified |
-| `EvaluateTransfer` RBAC authorization | Mutating/consequential action implied to require fail-closed RBAC, consistent with every other mutating route in this service | **Confirmed missing in original audit pass** — no `authorization-svc` check existed at all; ✅ Fixed — dedicated `PRIVACY_TRANSFER_DECISION_EVALUATE` permission now enforced after tenant resolution, before idempotency/persistence/event-publishing | ✅ Fixed | High-severity gap found post-initial-audit; granted via `PRIVACY_TRANSFER_FULL`/`PRIVACY_FULL`; authorized (200/AUTHORIZED), unauthorized (403, no record/event), and real `privacy-decision-svc → privacy-transfer-svc` cross-service paths all live-verified |
-| Runtime RLS tenant isolation | RLS policies + forced RLS migrations present | Policies exist, but all services (including this one) connect to PostgreSQL as the `postgres` **superuser**, which unconditionally bypasses RLS | ❌ Not Fixed | Separate platform-level infrastructure dependency — not caused by, and not part of, the RBAC remediation above; requires a dedicated non-superuser application DB role |
-
-### 4. Compliance score
-
-- **Frontend platform (FE): 100%** (Workbench supporting all 4 outcomes, structured measures inputs/cards, conditions/expiry receipts, automated 12-scenario QA matrix; TypeScript 0 errors; ESLint 0 blocking errors)
-- **Backend service (BE): 100%** (24/24 Go unit tests passing — 22 original + 2 new RBAC regression tests — go build clean, go vet clean, all 6 objects per §16.1, CONDITIONAL outcome, all 8 triggers automated, §18.1 idempotency, §32 reason codes, `EvaluateTransfer` RBAC gap fixed)
-- **Integration: 100%** (10/10 live E2E tests passing against Docker container on port 8155, real Postgres DB, live authorization-svc RBAC including authorized/unauthorized `EvaluateTransfer` paths, and real `privacy-decision-svc → privacy-transfer-svc` cross-service verification — **excludes** RLS tenant isolation, see below)
-- **Overall compliance (service-owned scope): 100%**
-- **Production Readiness:**
-  - **Service-level RBAC remediation: ✅ Production Ready**
-  - **Platform-level tenant isolation: ❌ Not Fixed** — PostgreSQL superuser connections bypass RLS; separate platform/infrastructure dependency, not caused by this remediation
-
-**Top gaps ranked by risk:**
-- ✅ Fixed (previously the top risk): `EvaluateTransfer` had no `authorization-svc` RBAC check at all — a confirmed high-severity gap missed by the original audit pass. Now gated by dedicated `PRIVACY_TRANSFER_DECISION_EVALUATE`, live-verified authorized/unauthorized/cross-service.
-- ❌ Not Fixed (platform-level, not service-owned): PostgreSQL `postgres` superuser connections bypass RLS tenant isolation across all services, including this one. Requires a dedicated non-superuser application database role — outside `privacy-transfer-svc`'s own service boundary.
-- No other gaps remaining within `privacy-transfer-svc` service boundary.
+Needs clarification (not scored): read-route actions; the DB role in production; live-container verification (not performed). **No compliance percentage is asserted.**
 
 ---
 
@@ -1128,11 +838,11 @@ These don't change the compliance percentages materially (they were already refl
 
 | Service | Compliance % | Top risk |
 |---|---|---|
-| privacy-purpose-registry-svc (PRV-01) | ≈ 90.6% (29/32; was 56.3%) | **Correction:** the earlier 100% was unsupported. Remaining risk: dependent services' clients send no `X-Principal-Id` (their lookups now `401`); frontend not updated; new `*_READ` action codes not provisioned. See the PRV-01 sections. **NOT READY.** |
-| privacy-consent-svc (PRV-02) | ≈ 93.9% (31/33; was 64.7%) | **Correction:** the earlier 100% was unsupported. Remaining risk: consent→registry and decision→consent calls are refused (no service identity is defined); the actions this service checks are not provisioned by this repository; legacy NULL-tenant rows need an owner. See the PRV-02 sections. **NOT READY.** |
+| privacy-purpose-registry-svc (PRV-01) | No % asserted (earlier ≈ 90.6% superseded; domain audit 87.8%) | **Correction:** the earlier 100% was unsupported. Service-owned gaps fixed (incl. atomic idempotency); remaining: reference existence (PDC/DRC/PRV-05), provisioning of the new actions, frontend. See the PRV-01 sections. **NOT READY.** |
+| privacy-consent-svc (PRV-02) | No % asserted (earlier ≈ 93.9% withdrawn; pre-remediation domain audit 75.0%) | **Correction:** the earlier 100% was unsupported. Service-owned gaps fixed (authentication-before-validation ordering, atomic principal-scoped idempotency, §18 presentation `receipt_id`, principal forwarded to the registry); remaining: registry grant and service-to-service identity, provisioning, legacy NULL-tenant rows. See the PRV-02 sections. **NOT READY.** |
 | privacy-decision-svc (PRV-03) | No % asserted (earlier 100% / 34-of-34 withdrawn; pre-remediation audit 66.7%) | **Correction:** the earlier 100% / Ready for Production was unsupported. Service-owned gaps are fixed; remaining risk is external: service-to-service identity, purpose-registry/PDC capabilities (training-purpose verification, secondary-purpose compatibility, exact historical purpose version), retention/as-of state, legacy NULL-tenant rows needing a tenant mapping, frontend correlation header. See the PRV-03 sections. **NOT PRODUCTION READY — BLOCKED BY EXTERNAL DEPENDENCY.** |
-| privacy-rights-svc (PRV-04) | 100% | None (Fully verified; external WFC orchestration and domain adapter boundary noted per §14.1) |
-| privacy-transfer-svc (PRV-05) | 100% | None (Fully verified; external PDC legal-rule catalogue boundary noted per §16.1) |
+| privacy-rights-svc (PRV-04) | No % asserted (earlier 100% withdrawn; pre-remediation audit 70.8%) | **Correction:** the earlier 100% / Ready for Production was unsupported. Service-owned gaps fixed (strict RLS, authenticated reads, atomic idempotency, verified §15.2 gate, typed errors); remaining: authorization-svc grants, WFC/reviewer-owned disclosure elements, legacy NULL-tenant rows. See the PRV-04 sections. **NOT READY.** |
+| privacy-transfer-svc (PRV-05) | No % asserted (earlier 100% withdrawn; pre-remediation audit 63.6%) | **Correction:** the earlier 100% was unsupported. Service-owned gaps fixed (strict RLS, authenticated reads, atomic idempotency, shared trigger evaluation, transactional §19 events, principal forwarded to PRV-01); remaining: PRV-01 read grant in authorization-svc, systems originating triggers 2/5/7, legacy NULL-tenant rows. See the PRV-05 sections. **NOT READY.** |
 
 **Domain average: ~68%**
 
@@ -1151,3 +861,206 @@ These don't change the compliance percentages materially (they were already refl
 ---
 
 *End of Privacy domain audit file. Generated from a read-only audit — no application code was modified in producing these results.*
+
+---
+
+# Privacy Domain Audit — Second Pass
+**Date:** 2026-10-21
+**Scope:** Privacy services, ports 8151–8155
+
+## Overall Result
+
+**Overall compliance: 98.6% on the service-level audits (204 of 207 comparable items), unchanged from the last pass.**
+
+The domain-level section of `docs/audit_files/PRIVACY.md` remains stale at 1 of 7. The five Privacy services are **not production ready**.
+
+This was a **read-only audit**. No code or documentation was changed during the audit. One agent checked the services one after another. For each service, `go vet`, `go build`, and the full test suite were re-run against the throwaway PostgreSQL database `pcs-test-pg`, and the results were compared with the README. Every handler line was not re-read; the contract and implementation extraction used the per-service audits completed earlier.
+
+Since the previous pass, `git status` showed one new functional change: the **decision → transfer client fix**.
+
+## Per-Service Results
+
+| Service | Port | Tests (with DB) | Tests (no DB) | README says | Vet / build | Compliance | Open partials |
+|---|---:|---:|---:|---:|---|---:|---:|
+| privacy-purpose-registry-svc | 8151 | 95 pass | 95 pass (falls back to the local DB) | 95 | clean / clean | **46/49 = 93.9%** | 3 external |
+| privacy-consent-svc | 8152 | 147 pass | 109 pass, 38 skip | 147 | clean / clean | **48/48 = 100%** | 0 |
+| privacy-decision-svc | 8153 | 78 pass | 62 pass, 16 skip | 78 | clean / clean | **37/37 = 100%** | 0 |
+| privacy-rights-svc | 8154 | 66 pass | 58 pass, 8 skip | 66 | clean / clean | **35/35 = 100%** | 0 |
+| privacy-transfer-svc | 8155 | 62 pass | 53 pass, 9 skip | 62 | clean / clean | **38/38 = 100%** | 0 |
+| **Total** | | | | | | **204/207 = 98.6%** | **3** |
+
+### Service-Level Findings
+
+- **privacy-purpose-registry-svc:** The three partials are the same documented external items:
+  - submit has no WFC hand-off;
+  - gate 4 checks the PDC reference for presence only;
+  - gate 6 checks the DRC/PRV-05 reference for presence only.
+
+- **privacy-consent-svc:** No open service-level partials.
+
+- **privacy-decision-svc:** No open service-level partials.
+
+- **privacy-rights-svc:** No open service-level partials.
+
+- **privacy-transfer-svc:** No open service-level partials.
+
+## Changes Since the Previous Pass
+
+- Decision's README now documents the call to transfer.
+- Decision's test count increased from 70 to 78.
+- The **decision → transfer HTTP 400 integration defect is fixed**.
+- The decision client now sends:
+  - `X-Tenant-Id`
+  - `X-Principal-Id`
+  - `X-Correlation-ID`
+  - deterministic `Idempotency-Key`
+- Four matching header references are present in the client.
+- The new header set was checked against the real transfer handler: the old header set returned 400, while the new header set returned 200, with replay returning the same decision.
+- README test counts for all five Privacy services now match the code.
+
+## Routes
+
+Route counts remain unchanged:
+
+- Registry: 26
+- Consent: 17
+- Decision: 2 × `/v1`
+- Rights: 8 × `/v1`
+- Transfer: 14 × `/v1`
+
+## Error Envelope
+
+- Registry's 404, 405, panic, and `/readyz` responses use `{error, error_code}`.
+- The other four services document those framework responses as outside the application error envelope.
+
+## Domain-Level Documentation Status
+
+The following stale items remain in `PRIVACY.md`:
+
+| # | Item | Status |
+|---|---|---|
+| D1 | Per-service sections (counts, README references, migrations) | ✅ Match, except decision, below |
+| D2 | Part 1 summary table and averages ("Services Ready: 1") | ⚠️ stale |
+| D3 | Key evidence #2: "no test files exist… DB layer only exercised via a stub" | ⚠️ stale; all five have real-PostgreSQL tests |
+| D4 | Key evidence #3: authorization decision cache "mirrored across all 5" `authz/client.go` files | ⚠️ inaccurate; only registry and consent cache |
+| D5 | Key evidence #9 and methodology note: "none of the 5 services has its own README" | ⚠️ stale; all five have one |
+| D6 | Part 2 summary: "Domain average ~68%" and the risk ranking | ⚠️ stale |
+| D7 | PRV-03 section still says 70 top-level tests and does not mention the transfer-call fix | ⚠️ stale; code and README say 78 |
+
+## Top Gaps — Ranked by Risk
+
+### Security and Authorization
+
+1. **privacy-decision-svc has no `authorization-svc` check on either route.** Any caller with a principal header and tenant header can create and read decisions. The specification names no permission, so this is excluded from the compliance score. A permission needs to be defined in `authorization-svc`.
+
+2. **Identity headers are accepted as supplied in all five services.** None verifies a signature on `X-Principal-Id` or `X-Tenant-Id`. The documentation treats this as the gateway's responsibility, and the gateway was not verified during this audit.
+
+3. **Grants are not provisioned anywhere in this repository.** No service-to-service identity is defined, so cross-service calls forward the end-user principal. Nothing was verified against a live `authorization-svc`.
+
+4. Consent's `GET /notices/{id}` takes no principal and only requires a tenant. This is documented and intentional.
+
+### Data Integrity
+
+5. Consent does not enforce at most one `PUBLISHED` version per notice. A probe produced two published versions in 24 of 25 concurrent-publish rounds. The specification does not require this, so it remains a design decision.
+
+6. Rights discards the `reason` sent on close, does not format-check `response_evidence_hash`, and has no reopen or supplement path. All three require clarification.
+
+7. Registry gates 4 and 6 accept references that may not exist, and submit does not go through WFC.
+
+8. Transfer triggers 2, 5, and 7 can only be declared by the caller.
+
+9. Legacy NULL-tenant rows in consent, decision, rights, and transfer are preserved but invisible. They require an operator tenant mapping.
+
+### Cosmetic / Documentation
+
+- D2–D7 above.
+- Shared migration prefixes in transfer are documented and harmless.
+- Decision returns 400 for a missing tenant while the other services return 401.
+- Stray `.exe` files exist in the rights directory.
+
+## Decision → Transfer Integration
+
+The decision → transfer integration defect identified in the previous audit is **no longer open**.
+
+The corrected client sends the required tenant, principal, correlation, and deterministic idempotency headers. The real transfer handler accepts the request with the corrected header set, returning 200, and replay returns the same decision.
+
+## Needs Clarification — Excluded From Scores
+
+The following clarification items remain unchanged from the earlier per-service audits.
+
+### Registry
+
+- "latest version" for the canonical routes
+- §32 gate code mapping
+- suspended `as_of` response
+- frontend status
+
+### Consent
+
+- invalid `as_of`
+- duplicate withdrawal evidence
+- preference `source`
+- presentation-receipt fields
+- default `affirmative_action_type`
+- `invalidate` caller
+- purpose-change carry-forward
+- OD-06
+
+### Decision
+
+- `authorization-svc` permission
+- default `expires_at`
+- identifier formats
+- idempotency principal scope
+- taxonomy drift
+- preference evidence
+- analytics safeguard
+- actor and service context
+- secondary-purpose version
+- missing-tenant status
+
+### Rights
+
+- `wfc_process_ref` on create
+- proxy authority evidence
+- late-discovered data and re-versioning
+- response-package binding
+- close `reason`
+- manifest signatures
+- who emits `privacy.rights.action_required`
+- read-route action
+
+### Transfer
+
+- read-route actions
+- taxonomy drift
+- mechanism types
+- activity-reference requirements
+- `privacy.processor.changed` payload
+
+## Verdict
+
+All five Privacy services match their own documentation closely, and the full suites pass.
+
+The only service-level partials are the Registry's three external dependencies. The **decision → transfer integration, which was the main functional blocker in the previous pass, now works**.
+
+The Privacy domain is **not production ready**. The remaining production blockers are external/dependency-level concerns:
+
+- missing authorization check and grants;
+- WFC dependency;
+- PDC and DRC dependencies;
+- tenant mapping for legacy NULL-tenant rows;
+- no end-to-end validation on the live stack.
+
+The domain-level `PRIVACY.md` summary is stale and should be refreshed separately as a documentation-only task.
+
+**Audit classification:** Second-pass read-only audit
+**Audit date:** 2026-10-21
+**Code changes made by this audit:** None
+**Documentation changes made by this audit:** None during audit; this section is being appended afterward as the audit record.
+**Production readiness:** ❌ Not Ready
+**Service-level compliance:** **204/207 = 98.6%**
+**Open service-level partials:** **3 external**
+**Decision → Transfer integration:** ✅ Fixed
+**Domain documentation:** ⚠️ Stale
+**End-to-end live-stack validation:** ❌ Not completed

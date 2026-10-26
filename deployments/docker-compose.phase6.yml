@@ -274,9 +274,11 @@ services:
       PORT: "8140"
       AUTHZ_SERVICE_URL: http://authorization-svc:8089
       SIEM_SERVICE_URL: http://siem-integration-svc:8141
-    depends_on:
-      authorization-svc:
-        condition: service_healthy
+    # No depends_on authorization-svc: this service only calls it per request,
+    # while docker-compose.yml makes authorization-svc wait for this one (it
+    # provisions its server certificate here at startup). With both edges,
+    # running this file alongside docker-compose.yml failed with
+    # "dependency cycle detected".
     restart: on-failure
     healthcheck:
       test: ["CMD", "/app/healthcheck"]

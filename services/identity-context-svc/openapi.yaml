@@ -57,6 +57,22 @@ components:
         password:
           type: string
           format: password
+        client_id:
+          type: string
+          description: |
+            The confidential OAuth client the person signs in through (the
+            console's server tier). When it proves `client_secret`, the token
+            carries it as a VERIFIED `azp`, which IDP_CLIENT_CHANNELS maps to a
+            verified source channel. Optional unless IDP_CLIENT_AUTH=required.
+            A presented client that fails is refused (401 `invalid_client`),
+            never downgraded to "no client".
+          example: zoiko-console
+        client_secret:
+          type: string
+          format: password
+          description: The client's secret. Never sent from a browser.
+        correlation_id:
+          type: string
       additionalProperties: false
 
     AuthenticateResponse:
@@ -88,10 +104,127 @@ components:
         mfa_required:
           type: boolean
           description: |
-            Whether a second factor is needed before trust posture can reach
-            MFA_VERIFIED. Always false today — no step-up factor is implemented
-            in the estate, so there is nothing a client could do in response to
-            true.
+            Always false: login is password-baseline (ZS-IAM-001 §3, "where
+            permitted by tenant policy"). A second factor is demanded at
+            POST /v1/authenticate/step-up, before a privileged session.
+        mfa_enrolled:
+          type: boolean
+          description: |
+            The principal holds an ACTIVE TOTP factor, so the client can offer
+            step-up rather than enrolment.
+        auth_time:
+          type: integer
+          format: int64
+          description: |
+            When this authentication happened (Unix seconds). Carried on the
+            token and then the envelope as `auth_time`; unlike the envelope's
+            `iat` it does not move on re-resolve.
+        amr:
+          type: array
+          items:
+            type: string
+          description: |
+            Authentication methods (RFC 8176): `["pwd"]` after a password,
+            `["pwd","otp"]` after a TOTP step-up.
+
+    StepUpRequest:
+      type: object
+      required: [code]
+      properties:
+        code:
+          type: string
+          description: The current 6-digit code from the enrolled authenticator.
+          example: "123456"
+        correlation_id:
+          type: string
+
+    TOTPEnrollment:
+      type: object
+      description: Returned once. The secret is never readable again.
+      properties:
+        factor_id:
+          type: string
+        secret:
+          type: string
+          description: Unpadded base32 shared secret (160 bits).
+        otpauth_uri:
+          type: string
+          description: Key Uri Format for an authenticator app's QR code.
+        algorithm:
+          type: string
+          enum: [SHA1]
+        digits:
+          type: integer
+          example: 6
+        period:
+          type: integer
+          example: 30
+        status:
+          type: string
+          enum: [PENDING]
+
+    MFAFactor:
+      type: object
+      description: A factor without any secret material.
+      properties:
+        factor_id:
+          type: string
+        principal_id:
+          type: string
+        type:
+          type: string
+          enum: [TOTP]
+        status:
+          type: string
+          enum: [PENDING, ACTIVE, RETIRED]
+        created_at:
+          type: string
+          format: date-time
+        activated_at:
+          type: string
+          format: date-time
+        last_used_at:
+          type: string
+          format: date-time
+        retired_reason:
+          type: string
+        failed_attempts:
+          type: integer
+        locked_until:
+          type: string
+          format: date-time
+
+    ActivateTOTPRequest:
+      type: object
+      required: [factor_id, code]
+      properties:
+        factor_id:
+          type: string
+        code:
+          type: string
+        correlation_id:
+          type: string
+
+    RevokeTOTPRequest:
+      type: object
+      required: [factor_id]
+      properties:
+        factor_id:
+          type: string
+        reason_code:
+          type: string
+        correlation_id:
+          type: string
+
+    ResetMFARequest:
+      type: object
+      required: [reason_code]
+      properties:
+        reason_code:
+          type: string
+          example: LOST_DEVICE
+        purpose:
+          type: string
 
     JWKSResponse:
       type: object
@@ -578,6 +711,9 @@ paths:
           description: |
             Invalid credentials. Covers unknown principal, absent credential,
             locked account and password mismatch — indistinguishable by design.
+            A presented client that does not authenticate is a separate 401
+            with `error_code: invalid_client`; it is checked before the account
+            is touched, so it costs the account no lockout attempt.
           content:
             application/json:
               schema:
@@ -599,10 +735,10 @@ paths:
       operationId: getJWKS
       security: []
       description: |
-        The RSA public key downstream services use to verify the
-        IdentityContextEnvelope. Envelopes are signed RS256 so verifiers hold no
-        secret; the bearer token from /v1/authenticate is separately HS256 and
-        is not verifiable with this key.
+        Every published signing key (RS256 or ES256): the active key and any
+        key still verifying live tokens during a rotation (JWT_SIGNING_KEYS,
+        JWT_VERIFY_ONLY_KEYS). Relying parties verify identity envelopes,
+        access tokens and ID tokens against this set; verifiers hold no secret.
       responses:
         "200":
           description: JSON Web Key Set
@@ -775,9 +911,18 @@ paths:
       summary: Transition principal status
       operationId: updatePrincipalStatus
       description: |
-        Status transitions only (ACTIVE → SUSPENDED → DISABLED). 
+        Status transitions only (ACTIVE, SUSPENDED, DISABLED).
         No soft-delete per doctrine (data-model §2.11).
         Idempotent — re-applying same status is a no-op.
+
+        One governed command: the status row, its decision-log entry and the
+        events `principal.status.changed` and `identity.subject.disabled` /
+        `identity.subject.enabled` are written in one transaction, and a
+        disable or suspension then ends every session the principal holds
+        (login sessions, their refresh tokens and resolved session contexts).
+        The actor is the verified caller (X-Principal-Id); every change needs
+        IDENTITY_PRINCIPAL_STATUS, including on yourself, and nobody may
+        disable or suspend their own account.
       parameters:
         - name: principalId
           in: path
@@ -785,11 +930,6 @@ paths:
           schema:
             type: string
         - name: X-Correlation-ID
-          in: header
-          required: true
-          schema:
-            type: string
-        - name: X-Actor-Principal-ID
           in: header
           required: true
           schema:
@@ -802,7 +942,17 @@ paths:
               $ref: "#/components/schemas/UpdatePrincipalStatusRequest"
       responses:
         "204":
-          description: Status updated
+          description: Status updated (or already in that status)
+        "400":
+          description: Malformed body, or a status other than ACTIVE, SUSPENDED or DISABLED
+        "403":
+          description: |
+            The caller lacks IDENTITY_PRINCIPAL_STATUS, or (`self_status_change`)
+            tried to disable or suspend their own account.
+        "501":
+          description: The status command is not configured in this deployment
+        "503":
+          description: authorization-svc is unreachable
 
   # -- GOV-01 contract operations ---------------------------------------------
   #
@@ -1257,6 +1407,447 @@ paths:
           description: Idempotency key reused with a different request body
         "501":
           description: Support context is not configured in this deployment
+
+  /v1/authenticate/step-up:
+    post:
+      summary: Step up the current session with a TOTP code
+      operationId: stepUp
+      description: |
+        ZS-IAM-001 §3: "Step-up creates a new assurance assertion with bounded
+        age." The caller's session envelope (Authorization) and a code from its
+        ACTIVE factor return a NEW login token with `mfa_done`, `auth_time` =
+        now and `amr` `["pwd","otp"]`. Exchange it at /v1/context/resolve for an
+        envelope with `mfa_verified: true`, which authorization-svc requires
+        before issuing or approving a JIT or break-glass session.
+
+        The caller is identified by the envelope, verified with this service's
+        key and checked against its live session record; X-Principal-Id and
+        X-Tenant-Id, when sent, must name the same principal and tenant (403
+        `identity_mismatch`). The session's verified client (azp) is carried
+        over. A code is accepted once (its time step is recorded), and the
+        factor locks after MFA_MAX_FAILED_ATTEMPTS wrong codes. The response is
+        never stored for idempotent replay: it is a credential.
+      parameters:
+        - name: X-Correlation-ID
+          in: header
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StepUpRequest"
+      responses:
+        "200":
+          description: Stepped up — a new login token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthenticateResponse"
+        "400":
+          description: The code is not 6 digits
+        "401":
+          description: |
+            `session_invalid` (bearer missing, forged, expired, or its session
+            invalidated, or the principal no longer active) or `invalid_code`
+            (wrong, replayed, or the factor is locked — one answer for all three).
+        "403":
+          description: "`identity_mismatch`: a header names someone other than the session"
+        "409":
+          description: "`mfa_not_enrolled`: no ACTIVE factor"
+        "503":
+          description: "`mfa_unavailable` (no MFA_SECRET_KEY) or the store is unreachable"
+
+  /v1/mfa/totp/enroll:
+    post:
+      summary: Start a TOTP enrolment
+      operationId: enrollTOTP
+      description: |
+        Creates a PENDING factor and returns its secret and otpauth:// URI
+        exactly once (no-store; never recorded for idempotent replay). A first
+        factor needs a login no older than MFA_RECENT_AUTH_SECONDS (401
+        `reauthentication_required`). Replacing an ACTIVE factor needs a recent
+        step-up with it (403 `step_up_required`), so a stolen password alone
+        cannot swap someone's second factor. The secret is AES-256-GCM
+        encrypted at rest, bound to its row.
+      responses:
+        "201":
+          description: Enrolment started
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TOTPEnrollment"
+        "401":
+          description: "`session_invalid` or `reauthentication_required`"
+        "403":
+          description: "`step_up_required` or `identity_mismatch`"
+        "503":
+          description: "`mfa_unavailable`"
+
+  /v1/mfa/totp/activate:
+    post:
+      summary: Prove a pending factor and make it active
+      operationId: activateTOTP
+      description: |
+        A code from the PENDING factor makes it ACTIVE and retires any previous
+        factor in the same transaction. Activation does not raise the current
+        session's assurance; step up for that.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ActivateTOTPRequest"
+      responses:
+        "200":
+          description: Factor active
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MFAFactor"
+        "400":
+          description: factor_id missing or the code is not 6 digits
+        "401":
+          description: "`session_invalid` or `invalid_code`"
+        "404":
+          description: "`factor_not_found`: no PENDING factor with that id for this principal"
+        "503":
+          description: "`mfa_unavailable`"
+
+  /v1/mfa/totp/revoke:
+    post:
+      summary: Revoke one of the caller's own factors
+      operationId: revokeTOTP
+      description: |
+        Needs a recent step-up (403 `step_up_required`): removing the factor
+        that guards privileged sessions is itself sensitive. A person who has
+        lost their device asks an administrator for a reset instead.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RevokeTOTPRequest"
+      responses:
+        "200":
+          description: Retired
+        "401":
+          description: "`session_invalid`"
+        "403":
+          description: "`step_up_required` or `identity_mismatch`"
+        "404":
+          description: "`factor_not_found`"
+
+  /v1/mfa/factors:
+    get:
+      summary: List the caller's own factors
+      operationId: listMFAFactors
+      responses:
+        "200":
+          description: Factors, without secrets
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  factors:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/MFAFactor"
+                  count:
+                    type: integer
+        "401":
+          description: "`session_invalid`"
+
+  /v1/principals/{principalId}/mfa/reset:
+    post:
+      summary: Reset another principal's second factor (administrator)
+      operationId: resetPrincipalMFA
+      description: |
+        Credential recovery for a lost device, "separately controlled"
+        (ZS-IAM-001 §3). The administrator is identified by their own session
+        envelope, must hold `IDENTITY_MFA_RESET` in authorization-svc, must have
+        stepped up within MFA_RECENT_AUTH_SECONDS, and cannot reset themselves.
+        Every ACTIVE and PENDING factor of the subject is retired;
+        `identity.mfa_factor.reset` is written with the change and streamed to
+        SIEM at high severity.
+      parameters:
+        - name: principalId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ResetMFARequest"
+      responses:
+        "200":
+          description: Factors retired
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  principal_id:
+                    type: string
+                  factors_retired:
+                    type: integer
+        "400":
+          description: reason_code missing
+        "401":
+          description: "`session_invalid`"
+        "403":
+          description: |
+            `self_reset_refused`, `step_up_required`, `identity_mismatch`, or
+            the administrator lacks IDENTITY_MFA_RESET.
+        "404":
+          description: No such principal in the tenant
+        "503":
+          description: authorization-svc or the store is unreachable
+
+  # -- OpenID Connect provider (internal/oidc; AU-01, AU-04, AU-06, AU-10, AU-12, AU-27) --
+  #
+  # Mounted outside the §4 envelope and the idempotency replay store: these
+  # endpoints speak RFC 6749 to browsers and OAuth clients, and their replay
+  # protection is the protocol's own (single-use codes, rotating refresh
+  # tokens, DPoP jti). Clients are registered in OIDC_CLIENTS_FILE.
+
+  /.well-known/openid-configuration:
+    get:
+      summary: OpenID Provider metadata
+      operationId: getOpenIDConfiguration
+      security: []
+      responses:
+        "200":
+          description: OIDC Discovery 1.0 metadata (issuer, endpoints, PKCE S256, DPoP algorithms)
+
+  /.well-known/oauth-authorization-server:
+    get:
+      summary: OAuth 2.0 authorization server metadata (RFC 8414)
+      operationId: getAuthorizationServerMetadata
+      security: []
+      responses:
+        "200":
+          description: Same document as /.well-known/openid-configuration
+
+  /oauth2/authorize:
+    get:
+      summary: Authorization endpoint (code flow with PKCE S256)
+      operationId: authorize
+      security: []
+      description: |
+        Authorization code flow only, PKCE S256 required for every client, exact
+        redirect-URI match. An unknown client or unregistered redirect URI is
+        answered here, never redirected. Renders the hosted login page, or
+        redirects with a code when a live single-sign-on session exists.
+      responses:
+        "200":
+          description: Hosted login page
+        "302":
+          description: Redirect to the client with `code`, `state` and `iss`, or with an OAuth error
+        "400":
+          description: Unknown client or unregistered redirect URI
+    post:
+      summary: Authorization endpoint (form post)
+      operationId: authorizePost
+      security: []
+      responses:
+        "200":
+          description: Hosted login page
+        "302":
+          description: Redirect to the client
+        "400":
+          description: Unknown client or unregistered redirect URI
+
+  /oauth2/login:
+    post:
+      summary: Hosted login, password step
+      operationId: loginPassword
+      security: []
+      description: Form post from the hosted login page, CSRF-bound to the pending authorization. Throttled per source IP and tenant (AU-04).
+      responses:
+        "200":
+          description: Login page again (error, or the second-factor step)
+        "302":
+          description: Login complete; redirect to the client with a code
+        "403":
+          description: The form's CSRF token did not verify
+        "429":
+          description: Too many attempts (Retry-After)
+
+  /oauth2/login/mfa:
+    post:
+      summary: Hosted login, TOTP second factor
+      operationId: loginTOTP
+      security: []
+      responses:
+        "200":
+          description: Login page again with an error
+        "302":
+          description: Login complete; redirect to the client with a code
+        "401":
+          description: Too many incorrect codes, or the account can no longer sign in
+        "429":
+          description: Too many attempts (Retry-After)
+
+  /oauth2/login/passkey/begin:
+    post:
+      summary: Hosted login, passkey challenge
+      operationId: loginPasskeyBegin
+      security: []
+      description: No WebAuthn backend is built yet, so this answers 400 `passkey_not_available`.
+      responses:
+        "400":
+          description: passkey_not_available
+
+  /oauth2/login/passkey/finish:
+    post:
+      summary: Hosted login, passkey assertion
+      operationId: loginPasskeyFinish
+      security: []
+      description: No WebAuthn backend is built yet, so this answers 400 `passkey_not_available`.
+      responses:
+        "400":
+          description: passkey_not_available
+
+  /oauth2/login/federate/{idpId}:
+    get:
+      summary: Hosted login, enterprise IdP hand-off
+      operationId: loginFederate
+      security: []
+      description: No federation backend is built yet, so this answers 404.
+      parameters:
+        - name: idpId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "404":
+          description: Enterprise sign-in is not configured
+
+  /oauth2/token:
+    post:
+      summary: Token endpoint
+      operationId: token
+      security: []
+      description: |
+        Grants: authorization_code (with code_verifier), refresh_token (rotated
+        on every use; a reused token revokes its family and ends the login
+        session), client_credentials (workload clients only) and RFC 8693
+        token exchange (workload clients only). DPoP-bound when the client
+        sends a proof or is registered dpop_bound.
+      responses:
+        "200":
+          description: Tokens (access_token, token_type, expires_in, refresh_token, id_token)
+        "400":
+          description: OAuth error (invalid_request, invalid_grant, unsupported_grant_type, invalid_dpop_proof, …)
+        "401":
+          description: invalid_client
+        "429":
+          description: slow_down (Retry-After)
+
+  /oauth2/userinfo:
+    get:
+      summary: UserInfo endpoint
+      operationId: userInfo
+      responses:
+        "200":
+          description: sub and tenant_id, plus email / name by scope
+        "401":
+          description: Invalid, revoked or session-ended access token
+    post:
+      summary: UserInfo endpoint (POST)
+      operationId: userInfoPost
+      responses:
+        "200":
+          description: sub and tenant_id, plus email / name by scope
+        "401":
+          description: Invalid, revoked or session-ended access token
+
+  /oauth2/revoke:
+    post:
+      summary: Token revocation (RFC 7009)
+      operationId: revokeToken
+      security: []
+      responses:
+        "200":
+          description: Revoked, or the token was unknown (RFC 7009 §2.2)
+        "401":
+          description: invalid_client
+
+  /oauth2/introspect:
+    post:
+      summary: Token introspection (RFC 7662)
+      operationId: introspectToken
+      security: []
+      description: Confidential and workload clients only. Answers for access tokens and identity envelopes.
+      responses:
+        "200":
+          description: "{active: true, …} or {active: false}"
+        "400":
+          description: unauthorized_client (public clients may not introspect)
+        "401":
+          description: invalid_client
+
+  /oauth2/logout:
+    get:
+      summary: RP-initiated logout
+      operationId: logout
+      security: []
+      responses:
+        "200":
+          description: Signed out
+        "302":
+          description: Redirect to a registered post_logout_redirect_uri
+    post:
+      summary: RP-initiated logout (POST)
+      operationId: logoutPost
+      security: []
+      responses:
+        "200":
+          description: Signed out
+        "302":
+          description: Redirect to a registered post_logout_redirect_uri
+
+  /v1/logout:
+    post:
+      summary: End the caller's own session (server tier)
+      operationId: apiLogout
+      description: The envelope in Authorization names the session; its login session ends with it, so a refresh token cannot mint a replacement.
+      responses:
+        "204":
+          description: Logged out
+        "401":
+          description: identity_assertion_required / identity_assertion_invalid
+        "503":
+          description: logout_unavailable
+
+  /v1/context/session/introspect:
+    post:
+      summary: Session status for relying parties (AU-01)
+      operationId: sessionStatus
+      security: []
+      description: |
+        POST {"token": "<envelope>"}. Answers whether the envelope's session is
+        still live: its session context exists and is not invalidated or
+        expired, its login session has not ended, and its principal is ACTIVE.
+      responses:
+        "200":
+          description: "{active, reason, session_context_id, sid, invalidated_at}"
+        "400":
+          description: token is required
+        "503":
+          description: session_status_unavailable
 
   # ── INT-10 identity federation ─────────────────────────────────────────────────
 

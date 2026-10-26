@@ -74,6 +74,12 @@ type CreateApplicabilityDecisionParams struct {
 	DecidedBySystem         string
 	ReviewRequired          bool
 	CreatedByPrincipalID    string
+
+	// IdempotencyKey and RequestHash make a retried append a replay: the same
+	// key with the same body returns the recorded decision; with a changed
+	// body it is refused (ErrIdempotencyKeyConflict).
+	IdempotencyKey string
+	RequestHash    string
 }
 
 // CurrentApplicability is the answer to "is this obligation applicable in

@@ -44,6 +44,7 @@ func (h *Handler) CreateDelegation(w http.ResponseWriter, r *http.Request) {
 		h.countGrant(telemetry.GrantInvalidRequest)
 		return
 	}
+	req.IdempotencyKey = r.Header.Get("Idempotency-Key")
 	// Identity first, so every refusal recorded below names a real caller.
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
@@ -434,6 +435,7 @@ func (h *Handler) ResumeDelegation(w http.ResponseWriter, r *http.Request) {
 	}
 	if caller != d.DelegatorPrincipalID {
 		if caller == d.DelegatePrincipalID {
+			h.recordRefusedEscalation(r.Context(), "self_dealing", requestOf(d, d.EffectiveTo), caller, r)
 			writeError(w, http.StatusForbidden, "self_dealing", "the delegate may not resume their own delegation")
 			return
 		}
@@ -518,6 +520,7 @@ func (h *Handler) ExtendDelegation(w http.ResponseWriter, r *http.Request) {
 	}
 	if caller != d.DelegatorPrincipalID {
 		if caller == d.DelegatePrincipalID {
+			h.recordRefusedEscalation(r.Context(), "self_dealing", requestOf(d, d.EffectiveTo), caller, r)
 			writeError(w, http.StatusForbidden, "self_dealing", "the delegate may not extend their own delegation")
 			return
 		}

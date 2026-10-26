@@ -5,6 +5,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"os"
 	"sync"
 	"time"
 )
@@ -46,7 +47,13 @@ func (ci *ClientIdentity) Certificate() (*tls.Certificate, error) {
 	if ci.current != nil && time.Now().Before(ci.renewAt) {
 		return ci.current, nil
 	}
-	issued, err := ci.ca.IssueLeaf(ci.service, []string{ci.service}, ci.lifetime)
+	// Same SPIFFE URI SAN as every certificate the handler issues (O-1).
+	env := os.Getenv("ENV")
+	if env == "" {
+		env = "local"
+	}
+	uriSANs := []string{fmt.Sprintf("spiffe://zoiko/%s/%s", env, ci.service)}
+	issued, err := ci.ca.IssueLeaf(ci.service, []string{ci.service}, uriSANs, ci.lifetime)
 	if err != nil {
 		return nil, err
 	}

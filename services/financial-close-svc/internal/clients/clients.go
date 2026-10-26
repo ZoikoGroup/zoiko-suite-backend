@@ -658,6 +658,12 @@ type glCreateJournalRequest struct {
 	PostingDate     string `json:"posting_date"`
 	CurrencyCode    string `json:"currency_code"`
 
+	// JournalPurpose is the accounting-kernel's controlled classification
+	// (standard §9), now required by general-ledger-svc for the adjusting
+	// types this service posts (ACCRUAL, RECLASS, ADJUSTMENT, OPENING).
+	// Omitted only for a journal type that does not require one.
+	JournalPurpose string `json:"journal_purpose,omitempty"`
+
 	// ACC-14 CLOSE_REVIEW / SOFT_CLOSE context. The designation is the
 	// journal-level fact GL validates; the override pair is the separate
 	// SOFT_CLOSE mechanism. Both are omitted for ordinary postings.
@@ -679,6 +685,7 @@ func newGLCreateJournalRequest(tenantID, legalEntityID, fiscalPeriod, descriptio
 		CorrelationID:           correlationID,
 		Lines:                   lines,
 		JournalType:             meta.JournalType,
+		JournalPurpose:          meta.JournalPurpose,
 		TransactionDate:         meta.TransactionDate.UTC().Format(glDateLayout),
 		PostingDate:             meta.PostingDate.UTC().Format(glDateLayout),
 		CurrencyCode:            meta.CurrencyCode,

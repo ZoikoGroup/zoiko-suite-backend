@@ -453,6 +453,12 @@ type PublishDefinitionParams struct {
 	ApprovalReference string
 	ActorPrincipalID  string
 	CorrelationID     string
+	// CallerTenantID owns the config.version.published outbox row. Publish is
+	// a platform-wide act, but the outbox policy admits a request-path row
+	// only for the session tenant or a named background escape — the same
+	// doctrine every other write follows: the row belongs to the caller,
+	// never to the (absent) scope.
+	CallerTenantID string
 }
 
 // ── Write-gate validation helpers ─────────────────────────────────────────────
@@ -786,16 +792,16 @@ type KillSwitch struct {
 
 // CreateKillSwitchParams carries a kill-switch write.
 type CreateKillSwitchParams struct {
-	FlagKey           string
-	Environment       string
-	TenantID          *string
-	Reason            string
-	IncidentID        *string
-	SafeBehavior      string
-	ExpiresAt         time.Time
-	CallerTenantID    string
-	ActorPrincipalID  string
-	CorrelationID     string
+	FlagKey          string
+	Environment      string
+	TenantID         *string
+	Reason           string
+	IncidentID       *string
+	SafeBehavior     string
+	ExpiresAt        time.Time
+	CallerTenantID   string
+	ActorPrincipalID string
+	CorrelationID    string
 }
 
 // ── Governed change sets (INV-14, Table 7, Table 21) ─────────────────────────

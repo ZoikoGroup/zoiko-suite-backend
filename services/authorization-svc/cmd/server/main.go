@@ -19,6 +19,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -30,6 +31,7 @@ import (
 	"github.com/riandyrn/otelchi"
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
+	idenv "zoiko.io/identity-envelope"
 
 	"zoiko.io/authorization-svc/internal/cache"
 	"zoiko.io/authorization-svc/internal/config"
@@ -38,15 +40,16 @@ import (
 	"zoiko.io/authorization-svc/internal/handler"
 	"zoiko.io/authorization-svc/internal/health"
 	"zoiko.io/authorization-svc/internal/idempotency"
+	idgate "zoiko.io/authorization-svc/internal/identity"
 	"zoiko.io/authorization-svc/internal/jurisdiction"
+	"zoiko.io/authorization-svc/internal/mtls"
 	"zoiko.io/authorization-svc/internal/outbox"
 	"zoiko.io/authorization-svc/internal/registry"
-	"zoiko.io/authorization-svc/internal/mtls"
-	"zoiko.io/authorization-svc/internal/workload"
 	"zoiko.io/authorization-svc/internal/retention"
 	"zoiko.io/authorization-svc/internal/siem"
 	"zoiko.io/authorization-svc/internal/store"
 	"zoiko.io/authorization-svc/internal/telemetry"
+	"zoiko.io/authorization-svc/internal/workload"
 )
 
 // platformScopeID is the legal_entity_id presented when provisioning this
@@ -195,6 +198,54 @@ func main() {
 	log.Info("evaluation workload gate configured",
 		zap.String("mode", string(workloadGate.Mode())), zap.Strings("registered_peps", workloadGate.Registered()))
 
+	// WHO is calling the admin, session and console routes (register A-01):
+	// the identity envelope in Authorization, verified against
+	// identity-context-svc's JWKS, or a registered delegate's verified
+	// certificate — never X-Principal-Id on its own. Evaluation routes keep
+	// the workload gate above. Ahead of the envelope contract so the actor
+	// it resolves is the verified principal.
+	//
+	// mtlsIdentity is filled once the mTLS listener's certificate is
+	// provisioned (below); an https JWKS URL presents it as a client
+	// certificate to identity-context-svc's mTLS listener.
+	var mtlsIdentity atomic.Pointer[mtls.RotatingIdentity]
+	if cfg.IdentityAssertion != string(idgate.ModeOff) {
+		jwksHTTP := &http.Client{Timeout: 5 * time.Second}
+		if strings.HasPrefix(cfg.IdentityJWKSURL, "https://") && cfg.MTLSEnabled {
+			jwksHTTP.Transport = &http.Transport{TLSClientConfig: mtls.ClientTLSConfig(mtlsIdentity.Load)}
+		}
+		keys := idgate.NewJWKS(cfg.IdentityJWKSURL, 5*time.Minute, jwksHTTP)
+		identityGate := idgate.NewGate(idgate.Mode(cfg.IdentityAssertion), keys,
+			cfg.IdentityIssuer, cfg.IdentityAudience, cfg.AdminDelegates, log)
+		// AU-01: a verified envelope's session is checked at identity-context-svc
+		// (cached for the revocation TTL), so a logout or suspension stops the
+		// admin routes now, not when the envelope expires.
+		if cfg.IdentityRevocation != "off" {
+			fail := idenv.FailClosed
+			if cfg.IdentityRevocationFail == "open" {
+				fail = idenv.FailOpen
+			}
+			identityGate.WithRevocation(idenv.NewRevocation(idenv.RevocationOptions{
+				Source:    idenv.NewIntrospector(cfg.IdentityIntrospectURL, jwksHTTP),
+				ActiveTTL: cfg.IdentityRevocationTTL,
+				Fail:      fail,
+			}))
+			log.Info("identity session revocation check on", zap.String("introspect_url", cfg.IdentityIntrospectURL),
+				zap.Duration("ttl", cfg.IdentityRevocationTTL), zap.String("fail", string(fail)))
+		} else {
+			log.Warn("AUTHZ_IDENTITY_REVOCATION=off — a revoked session keeps working until its envelope expires (ENV=local only)")
+		}
+		r.Use(identityGate.Middleware)
+		log.Info("identity assertion gate configured",
+			zap.String("mode", cfg.IdentityAssertion), zap.String("jwks_url", cfg.IdentityJWKSURL),
+			zap.Strings("admin_delegates", identityGate.Delegates()))
+		if cfg.IdentityAssertion == string(idgate.ModeWarn) {
+			log.Warn("AUTHZ_IDENTITY_ASSERTION=warn — admin routes without an identity envelope are admitted on X-Principal-Id alone; set require once every caller sends one")
+		}
+	} else {
+		log.Warn("AUTHZ_IDENTITY_ASSERTION=off — admin routes trust X-Principal-Id (ENV=local only)")
+	}
+
 	// Canonical Service Input Contract (ZS-ARCH-SVC-001 v2.0 §4). Runs after
 	// Recoverer and telemetry so a refusal is still traced, and ahead of every
 	// handler so no request reaches business logic without a resolved tenant,
@@ -233,6 +284,19 @@ func main() {
 	})
 	if cfg.StepUpUnknownAge == "permit" {
 		log.Warn("AUTHZ_STEP_UP_UNKNOWN_AGE=permit — a step-up action with no stated authentication age is treated as recent; set step_up once PEPs forward X-Authn-Age-Seconds")
+	}
+	// Session issue (registers A-03, B-01): a recent MFA step-up before a JIT
+	// or break-glass session is issued or approved, and maximum lengths that
+	// refuse rather than shorten.
+	h.SetSessionStepUp(handler.SessionStepUpPolicy{
+		Off:    cfg.SessionStepUp == "off",
+		MaxAge: time.Duration(cfg.SessionStepUpMaxAgeSeconds) * time.Second,
+	})
+	h.SetSessionLimits(handler.SessionLimits{
+		JIT: cfg.MaxJITSeconds, BreakGlass: cfg.MaxBreakGlassSeconds, Support: cfg.MaxSupportSeconds,
+	})
+	if cfg.SessionStepUp == "off" {
+		log.Warn("AUTHZ_SESSION_STEP_UP=off — privileged and break-glass sessions are issued without a second factor (ENV=local only)")
 	}
 	if cfg.EntityRegistryURL != "" {
 		h.SetEntityRegistry(registry.NewHTTPClient(cfg.EntityRegistryURL, log))
@@ -301,6 +365,7 @@ func main() {
 		if err != nil {
 			log.Fatal("mtls: failed to build server tls config", zap.Error(err))
 		}
+		mtlsIdentity.Store(identity)
 		// Renewed before it expires (Governance audit N-11): the 90-day
 		// certificate used to be frozen at boot, so the listener refused every
 		// handshake from day 91 until a restart.

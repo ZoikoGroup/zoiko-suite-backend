@@ -4,6 +4,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Config holds all runtime configuration for policy-svc.
@@ -31,12 +32,49 @@ type Config struct {
 	AuthZPlatformScopeID string
 
 	// GovernanceDecisionLogServiceURL is the base URL of
-	// governance-decision-log-svc. Evaluate calls POST /v1/decisions there
-	// after every evaluation to satisfy the "preserve evaluation basis for
-	// governed decisions" evidence obligation (03-microservices.md §8.1).
-	// Called synchronously but treated as best-effort — a failure here is
-	// logged, not surfaced (see internal/decisionlog.HTTPClient doc comment).
+	// governance-decision-log-svc. The evidence relay (internal/evidence)
+	// delivers every stored evaluation to POST /v1/decisions there.
 	GovernanceDecisionLogServiceURL string
+
+	// LedgerPrincipalID is the principal policy-svc writes to the governance
+	// ledger as (decision D-02). It must hold GOVERNANCE_DECISION_RECORD.
+	// Unset, evaluations still succeed and are stored, but stay PENDING.
+	LedgerPrincipalID string
+
+	// EvaluateAuthz and ReadAuthz gate POST /v1/policies/evaluate
+	// (POLICY_EVALUATE) and the read routes (POLICY_READ): "enforce" refuses
+	// without a GRANTED decision; "warn" checks and logs but admits, for the
+	// migration window while access-control-svc registers the actions and
+	// callers start forwarding X-Principal-Id. Anything else means enforce.
+	EvaluateAuthz string
+	ReadAuthz     string
+
+	// SchedulerInterval is how often due scheduled activations are promoted.
+	SchedulerInterval time.Duration
+
+	// EvidenceRelayInterval is how often the evidence outbox is drained.
+	EvidenceRelayInterval time.Duration
+
+	// IdentityVerify is how the caller's identity headers are checked
+	// (internal/identity): "enforce" (default) needs a signed envelope that
+	// agrees with them, or an mTLS peer certificate; "warn" logs what enforce
+	// would refuse; "off" trusts the headers (X5).
+	IdentityVerify   string
+	JWKSURL          string
+	JWKSCacheTTL     time.Duration
+	ExpectedIssuer   string
+	ExpectedAudience string
+
+	// MTLS* enable the mutual-TLS listener peers call (SEC-INV-05), the same
+	// listener identity-context-svc and tenant-entity-registry-svc serve.
+	MTLSEnabled            bool
+	MTLSPort               int
+	MTLSManagementURL      string
+	MTLSBootstrapTokenPath string
+	MTLSAllowedClients     []string
+
+	// EventResidencyRegion is stamped on every published event's envelope.
+	EventResidencyRegion string
 
 	Kafka KafkaConfig
 
@@ -56,8 +94,7 @@ type DBConfig struct {
 }
 
 // KafkaConfig mirrors identity-context-svc's and tenant-entity-registry-svc's
-// shape exactly. GroupID is unused today (this service only produces), kept
-// for shape consistency with the rest of the platform.
+// shape. GroupID is the consumer group for the consumed events (Doc 03 §8.1).
 type KafkaConfig struct {
 	Brokers []string
 	GroupID string
@@ -93,6 +130,22 @@ func Load() (*Config, error) {
 		AuthZServiceURL:                 env("AUTHZ_SERVICE_URL", "http://authorization-svc"),
 		AuthZPlatformScopeID:            env("AUTHZ_PLATFORM_SCOPE_ID", ""),
 		GovernanceDecisionLogServiceURL: env("GOVERNANCE_DECISION_LOG_SERVICE_URL", "http://governance-decision-log-svc:8083"),
+		LedgerPrincipalID:               env("POLICY_LEDGER_PRINCIPAL_ID", ""),
+		EvaluateAuthz:                   env("POLICY_EVALUATE_AUTHZ", "enforce"),
+		ReadAuthz:                       env("POLICY_READ_AUTHZ", "enforce"),
+		SchedulerInterval:               envDuration("POLICY_SCHEDULER_INTERVAL", 15*time.Second),
+		EvidenceRelayInterval:           envDuration("POLICY_EVIDENCE_RELAY_INTERVAL", 2*time.Second),
+		IdentityVerify:                  env("POLICY_IDENTITY_VERIFY", "enforce"),
+		JWKSURL:                         env("IDENTITY_JWKS_URL", "http://identity-svc:8080/.well-known/jwks.json"),
+		JWKSCacheTTL:                    envDuration("JWKS_CACHE_TTL", 5*time.Minute),
+		ExpectedIssuer:                  env("EXPECTED_ISSUER", "identity-context-svc"),
+		ExpectedAudience:                env("EXPECTED_AUDIENCE", "zoiko-internal"),
+		MTLSEnabled:                     env("MTLS_ENABLED", "false") == "true",
+		MTLSPort:                        envInt("MTLS_PORT", 8449),
+		MTLSManagementURL:               env("MTLS_MANAGEMENT_SERVICE_URL", ""),
+		MTLSBootstrapTokenPath:          env("MTLS_BOOTSTRAP_TOKEN_PATH", ""),
+		MTLSAllowedClients:              splitList(env("MTLS_ALLOWED_CLIENTS", "")),
+		EventResidencyRegion:            env("EVENT_RESIDENCY_REGION", ""),
 		OTELExporterEndpoint:            env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 		Kafka: KafkaConfig{
 			Brokers: strings.Split(env("KAFKA_BROKERS", "localhost:9092"), ","),
@@ -105,6 +158,23 @@ func Load() (*Config, error) {
 func env(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
+	}
+	return def
+}
+
+func splitList(s string) []string {
+	var out []string
+	for _, v := range strings.Split(s, ",") {
+		if v = strings.TrimSpace(v); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+func envDuration(key string, def time.Duration) time.Duration {
+	if d, err := time.ParseDuration(os.Getenv(key)); err == nil && d > 0 {
+		return d
 	}
 	return def
 }

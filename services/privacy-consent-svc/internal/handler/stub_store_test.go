@@ -1,6 +1,7 @@
 package handler_test
 
 import (
+	"encoding/json"
 	"context"
 	"strings"
 	"time"
@@ -27,6 +28,7 @@ type stubStore struct {
 	invalidations        map[string]*domain.ConsentInvalidation
 	preferences          []domain.PreferenceAssertion
 	idempotency          map[string]*domain.IdempotencyRecord
+	executions           int
 
 	// outboxEvents records every event this stub "enqueued" — the event
 	// types only, in order, mirroring what a test could learn by querying
@@ -428,51 +430,75 @@ func (s *stubStore) ResolveConsentStatus(ctx context.Context, subjectRef, purpos
 // ── preferences ──────────────────────────────────────────────────────────────
 
 func (s *stubStore) SetPreference(ctx context.Context, tenantID string, req domain.SetPreferenceRequest) (*domain.PreferenceAssertion, error) {
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	effective := now
+	if req.EffectiveAt != nil {
+		effective = req.EffectiveAt.UTC().Truncate(time.Microsecond)
+	}
 	p := domain.PreferenceAssertion{
 		PreferenceAssertionID: uuid.New().String(), TenantID: strp(tenantID), SubjectRef: req.SubjectRef,
 		ChannelOrPurpose: req.ChannelOrPurpose, Value: domain.PreferenceValue(req.Value), Source: req.Source,
-		CreatedAt: time.Now().UTC(),
+		EffectiveAt: effective, CreatedAt: now,
 	}
 	s.preferences = append(s.preferences, p)
 	return &p, nil
 }
 
 func (s *stubStore) ResolvePreference(ctx context.Context, subjectRef, channelOrPurpose string) (*domain.PreferenceAssertion, error) {
-	var latest *domain.PreferenceAssertion
+	now := time.Now().UTC()
+	var best *domain.PreferenceAssertion
 	for i := range s.preferences {
 		p := &s.preferences[i]
-		if p.SubjectRef != subjectRef || p.ChannelOrPurpose != channelOrPurpose {
+		if p.SubjectRef != subjectRef || p.ChannelOrPurpose != channelOrPurpose || p.EffectiveAt.After(now) {
 			continue
 		}
-		if latest == nil || p.CreatedAt.After(latest.CreatedAt) {
-			latest = p
+		if best == nil || p.EffectiveAt.After(best.EffectiveAt) ||
+			(p.EffectiveAt.Equal(best.EffectiveAt) && p.CreatedAt.After(best.CreatedAt)) {
+			best = p
 		}
 	}
-	if latest == nil {
+	if best == nil {
 		return &domain.PreferenceAssertion{SubjectRef: subjectRef, ChannelOrPurpose: channelOrPurpose, Value: domain.PreferenceNotApplicable}, nil
 	}
-	return latest, nil
+	return best, nil
 }
 
 // ── idempotency (§18.1) ──────────────────────────────────────────────────────
 
-func (s *stubStore) GetIdempotency(ctx context.Context, tenantID, key string) (*domain.IdempotencyRecord, error) {
+func (s *stubStore) GetIdempotency(ctx context.Context, tenantID, principalID, key string) (*domain.IdempotencyRecord, error) {
 	if s.idempotencyGetErr != nil {
 		return nil, s.idempotencyGetErr
 	}
-	k := tenantID + ":" + key
-	rec, ok := s.idempotency[k]
+	rec, ok := s.idempotency[tenantID+":"+principalID+":"+key]
 	if !ok {
 		return nil, nil
 	}
 	return rec, nil
 }
 
-func (s *stubStore) SaveIdempotency(ctx context.Context, rec domain.IdempotencyRecord) error {
-	if s.idempotencySaveErr != nil {
-		return s.idempotencySaveErr
+// RunIdempotent mirrors PgStore.RunIdempotent's all-or-nothing contract: a
+// prior claim returns the stored record without executing; a commit failure
+// (idempotencySaveErr) fails the operation BEFORE anything is persisted; a
+// failing operation stores nothing.
+func (s *stubStore) RunIdempotent(ctx context.Context, claim domain.IdempotencyRecord, fn func(ctx context.Context) (int, any, error)) (*domain.IdempotencyRecord, int, any, error) {
+	k := claim.TenantID + ":" + claim.PrincipalID + ":" + claim.Key
+	if rec, ok := s.idempotency[k]; ok {
+		return rec, 0, nil, nil
 	}
-	k := rec.TenantID + ":" + rec.Key
+	if s.idempotencySaveErr != nil {
+		return nil, 0, nil, domain.ErrStoreUnavailable
+	}
+	status, payload, err := fn(ctx)
+	if err != nil {
+		return nil, 0, nil, err
+	}
+	body, mErr := json.Marshal(payload)
+	if mErr != nil {
+		return nil, 0, nil, mErr
+	}
+	rec := claim
+	rec.ResponseCode, rec.ResponseBody = status, body
 	s.idempotency[k] = &rec
-	return nil
+	s.executions++
+	return nil, status, payload, nil
 }

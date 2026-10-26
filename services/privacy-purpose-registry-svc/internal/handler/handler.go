@@ -102,6 +102,7 @@ func (h *Handler) Routes(r chi.Router) {
 		r.Get("/{activityID}", h.GetActivity)
 		r.Post("/{activityID}/versions", h.CreateActivityVersion)
 		r.Get("/{activityID}/versions/{versionID}", h.GetActivityVersion)
+		r.Get("/{activityID}/audit", h.GetActivityAudit)
 
 		// Version-explicit routes
 		r.Post("/{activityID}/versions/{versionID}/validate", h.ValidateActivityVersion)
@@ -292,47 +293,59 @@ func (h *Handler) idempotency(w http.ResponseWriter, r *http.Request, cc *callCo
 		return key, hash, true
 	}
 	if rec != nil {
-		if rec.RequestHash != hash {
-			writeCoded(w, http.StatusConflict, domain.ErrCodeIdempotencyMismatch, "idempotency key reused with different request payload")
-			return key, hash, true
-		}
-		w.Header().Set("Idempotency-Replay", "true")
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(rec.ResponseStatus)
-		_, _ = w.Write(rec.ResponseBody)
+		writeReplay(w, rec, hash)
 		return key, hash, true
 	}
 	return key, hash, false
 }
 
-// respond serialises v, files it under the idempotency key, and writes it.
-func (h *Handler) respond(ctx context.Context, w http.ResponseWriter, cc *callContext, op, key, hash string, status int, v interface{}) {
-	payload, err := json.Marshal(v)
+// execute runs fn and the idempotency claim in ONE transaction: the change, its
+// audit row, its outbox event and the stored replay response all commit or none
+// does (store.RunIdempotent — every store call fn makes joins the transaction).
+// A failed save therefore fails the whole operation instead of being logged and
+// ignored, and concurrent identical requests execute exactly once. When the key
+// was claimed meanwhile, the stored record is returned instead.
+func (h *Handler) execute(r *http.Request, cc *callContext, op, key, hash string, status int, fn func(ctx context.Context) (any, error)) (payload any, existing *domain.IdempotencyRecord, err error) {
+	var tID *string
+	if t := cc.RecordTenant(); t != "" {
+		tID = &t
+	}
+	claim := domain.IdempotencyRecord{IdempotencyKey: key, TenantID: tID, PrincipalID: cc.Principal, Operation: op, RequestHash: hash}
+	existing, _, payload, err = h.store.RunIdempotent(r.Context(), claim, func(ctx context.Context) (int, any, error) {
+		v, e := fn(ctx)
+		return status, v, e
+	})
+	return payload, existing, err
+}
+
+// finish writes the first-execution response, or the replay when a concurrent
+// request won the claim.
+func (h *Handler) finish(w http.ResponseWriter, existing *domain.IdempotencyRecord, hash string, status int, payload interface{}) {
+	if existing != nil {
+		writeReplay(w, existing, hash)
+		return
+	}
+	b, err := json.Marshal(payload)
 	if err != nil {
 		writeCoded(w, http.StatusInternalServerError, domain.ErrCodeInternal, "failed to serialize response")
 		return
 	}
-	if key != "" && hash != "" {
-		var tID *string
-		if t := cc.RecordTenant(); t != "" {
-			tID = &t
-		}
-		if err := h.store.SaveIdempotency(ctx, domain.IdempotencyRecord{
-			IdempotencyKey: key,
-			TenantID:       tID,
-			PrincipalID:    cc.Principal,
-			Operation:      op,
-			RequestHash:    hash,
-			ResponseStatus: status,
-			ResponseBody:   payload,
-			CreatedAt:      h.now(),
-		}); err != nil {
-			h.log.Warn("SaveIdempotency failed", zap.String("key", key), zap.Error(err))
-		}
-	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_, _ = w.Write(payload)
+	_, _ = w.Write(b)
+}
+
+// writeReplay returns the stored original response, or 409 when the key was
+// used with a different request.
+func writeReplay(w http.ResponseWriter, rec *domain.IdempotencyRecord, hash string) {
+	if rec.RequestHash != hash {
+		writeCoded(w, http.StatusConflict, domain.ErrCodeIdempotencyMismatch, "idempotency key reused with different request payload")
+		return
+	}
+	w.Header().Set("Idempotency-Replay", "true")
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(rec.ResponseStatus)
+	_, _ = w.Write(rec.ResponseBody)
 }
 
 // ── small helpers ────────────────────────────────────────────────────────────

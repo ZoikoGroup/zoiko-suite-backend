@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -54,12 +55,15 @@ func (h *Handler) CreatePurpose(w http.ResponseWriter, r *http.Request) {
 	req.SpecialConditionRefs = domain.NormalizeRefs(req.SpecialConditionRefs)
 	req.NecessityRationale = strings.TrimSpace(req.NecessityRationale)
 
-	_, version, err := h.store.CreatePurpose(r.Context(), cc.RecordTenant(), req, cc.Principal)
+	payload, existing, err := h.execute(r, cc, "CreatePurpose", key, hash, http.StatusCreated, func(ctx context.Context) (any, error) {
+		_, version, err := h.store.CreatePurpose(ctx, cc.RecordTenant(), req, cc.Principal)
+		return version, err
+	})
 	if err != nil {
 		h.storeUnavailable(w, "CreatePurpose", err)
 		return
 	}
-	h.respond(r.Context(), w, cc, "CreatePurpose", key, hash, http.StatusCreated, version)
+	h.finish(w, existing, hash, http.StatusCreated, payload)
 }
 
 // CreatePurposeVersion handles POST /privacy/purposes/{purposeID}/versions.
@@ -105,7 +109,9 @@ func (h *Handler) CreatePurposeVersion(w http.ResponseWriter, r *http.Request) {
 	req.SpecialConditionRefs = domain.NormalizeRefs(req.SpecialConditionRefs)
 	req.NecessityRationale = strings.TrimSpace(req.NecessityRationale)
 
-	version, err := h.store.CreatePurposeVersion(r.Context(), purposeID, req, cc.Principal)
+	payload, existing, err := h.execute(r, cc, "CreatePurposeVersion", key, hash, http.StatusCreated, func(ctx context.Context) (any, error) {
+		return h.store.CreatePurposeVersion(ctx, purposeID, req, cc.Principal)
+	})
 	if err != nil {
 		if errors.Is(err, domain.ErrPurposeVersionNotFound) {
 			writeCoded(w, http.StatusNotFound, domain.ErrCodePurposeNotRegistered, "parent purpose version not found")
@@ -114,7 +120,7 @@ func (h *Handler) CreatePurposeVersion(w http.ResponseWriter, r *http.Request) {
 		h.storeUnavailable(w, "CreatePurposeVersion", err)
 		return
 	}
-	h.respond(r.Context(), w, cc, "CreatePurposeVersion", key, hash, http.StatusCreated, version)
+	h.finish(w, existing, hash, http.StatusCreated, payload)
 }
 
 // PublishPurposeVersion handles POST /privacy/purposes/{purposeID}/versions/{versionID}/publish.
@@ -152,7 +158,9 @@ func (h *Handler) PublishPurposeVersion(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	version, err := h.store.PublishPurposeVersion(r.Context(), purposeID, versionID, cc.Principal, cc.Correlation)
+	payload, existing2, err := h.execute(r, cc, "PublishPurposeVersion", key, hash, http.StatusOK, func(ctx context.Context) (any, error) {
+		return h.store.PublishPurposeVersion(ctx, purposeID, versionID, cc.Principal, cc.Correlation)
+	})
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrPurposeVersionNotFound):
@@ -166,7 +174,7 @@ func (h *Handler) PublishPurposeVersion(w http.ResponseWriter, r *http.Request) 
 		}
 		return
 	}
-	h.respond(r.Context(), w, cc, "PublishPurposeVersion", key, hash, http.StatusOK, version)
+	h.finish(w, existing2, hash, http.StatusOK, payload)
 }
 
 // GetPurpose handles GET /privacy/purposes/{purposeID}?as_of=&known_as_of=.

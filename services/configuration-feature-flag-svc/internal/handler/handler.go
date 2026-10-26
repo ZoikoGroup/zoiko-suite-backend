@@ -268,6 +268,20 @@ func (h *Handler) UpsertConfigEntry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
+		// The store's gates (INV-04/05/08/09) refuse with coded errors —
+		// key_not_registered for a key with no published declaration, a
+		// type/constraint refusal for a value the declaration does not admit.
+		// Those are the contract's 4xx, answered as such; only a genuine store
+		// outage answers 503.
+		if code, status, ok := codedRefusal(err); ok {
+			h.metrics.ConfigWrites.WithLabelValues(governedOutcome(status)).Inc()
+			writeJSON(w, status, map[string]string{
+				"error":   code,
+				"key":     req.Key,
+				"message": err.Error(),
+			})
+			return
+		}
 		h.metrics.ConfigWrites.WithLabelValues(telemetry.WriteStoreUnavailable).Inc()
 		h.log.Error("UpsertConfigEntry: store unavailable",
 			zap.String("key", req.Key),
@@ -540,6 +554,19 @@ func (h *Handler) UpsertFeatureFlag(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
+		// Same coded-refusal handling as UpsertConfigEntry: the flag gate
+		// refuses an undeclared key with key_not_registered, a non-flag key
+		// with value_constraint_failed, a retired key with flag_key_retired —
+		// each its documented 4xx, not a 503.
+		if code, status, ok := codedRefusal(err); ok {
+			h.metrics.FlagWrites.WithLabelValues(governedOutcome(status)).Inc()
+			writeJSON(w, status, map[string]string{
+				"error":   code,
+				"key":     req.Key,
+				"message": err.Error(),
+			})
+			return
+		}
 		h.metrics.FlagWrites.WithLabelValues(telemetry.WriteStoreUnavailable).Inc()
 		h.log.Error("UpsertFeatureFlag: store unavailable",
 			zap.String("key", req.Key),
@@ -882,6 +909,29 @@ var governedCodeStatus = map[string]int{
 	"snapshot_invalid": http.StatusInternalServerError,
 }
 
+// codedRefusal returns the contract's wire code and status for a store
+// refusal carrying a ZS-SVC-AA-001 code, or ok=false when the error carries
+// no code the contract pins.
+//
+// The direct write routes (POST /v1/config, POST /v1/flags) reach the same
+// store gates the governed routes do — the same published-definition lookup
+// refuses an unregistered key on either path. A coded refusal is the 4xx
+// openapi names for it, so the direct routes must answer it exactly as the
+// governed routes do; answering 503 store_unavailable for a permanent,
+// caller-fixable state said "outage, retry" about a request that could never
+// succeed.
+func codedRefusal(err error) (string, int, bool) {
+	c := domain.ErrorCode(err)
+	if c == "" {
+		return "", 0, false
+	}
+	s, ok := governedCodeStatus[c]
+	if !ok {
+		return "", 0, false
+	}
+	return c, s, true
+}
+
 // governedOutcome buckets a refusal's HTTP class into a GovernedWrites outcome.
 func governedOutcome(status int) string {
 	switch status {
@@ -1159,7 +1209,8 @@ func (h *Handler) PublishConfigDefinition(w http.ResponseWriter, r *http.Request
 	if !ok {
 		return
 	}
-	if _, ok := h.requireTenant(w, r); !ok {
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
 		return
 	}
 
@@ -1201,6 +1252,7 @@ func (h *Handler) PublishConfigDefinition(w http.ResponseWriter, r *http.Request
 		ApprovalReference: firstNonEmpty(req.ApprovalReference, r.Header.Get("X-Approval-Reference")),
 		ActorPrincipalID:  principalID,
 		CorrelationID:     correlationID,
+		CallerTenantID:    tenantScope,
 	})
 	if err != nil {
 		if errors.Is(err, domain.ErrKeyNotRegistered) {

@@ -138,9 +138,9 @@ type Config struct {
 	// no TLS_CERT_FILE/TLS_KEY_FILE is set.
 	AllowInsecureInbound bool
 
-// AllowPlaintextMasterKey permits the deprecated VAULT_MASTER_KEY_HEX
-// env-var key in staging/production. False (default) requires
-// VAULT_MASTER_KEY_FILE there.
+	// AllowPlaintextMasterKey permits the deprecated VAULT_MASTER_KEY_HEX
+	// env-var key in staging/production. False (default) requires
+	// VAULT_MASTER_KEY_FILE there.
 	AllowPlaintextMasterKey bool
 
 	// MaxLeaseDurationSeconds is the platform-wide ceiling for
@@ -193,9 +193,9 @@ func Load() (*Config, error) {
 			Password: env("DB_PASSWORD", ""),
 			SSLMode:  env("DB_SSLMODE", "require"),
 		},
-		VaultKeyPath:         env("VAULT_LOCAL_STORE_PATH", "./secret_store.local"),
-		VaultMasterKeyHex:    env("VAULT_MASTER_KEY_HEX", ""),
-		VaultMasterKeyFile:   env("VAULT_MASTER_KEY_FILE", ""),
+		VaultKeyPath:              env("VAULT_LOCAL_STORE_PATH", "./secret_store.local"),
+		VaultMasterKeyHex:         env("VAULT_MASTER_KEY_HEX", ""),
+		VaultMasterKeyFile:        env("VAULT_MASTER_KEY_FILE", ""),
 		VaultKEKProvider:          strings.ToLower(env("VAULT_KEK_PROVIDER", "local")),
 		VaultTransitAddr:          env("VAULT_TRANSIT_ADDR", ""),
 		VaultTransitMount:         env("VAULT_TRANSIT_MOUNT", "transit"),
@@ -204,25 +204,25 @@ func Load() (*Config, error) {
 		GCPKMSKeyName:             env("GCP_KMS_KEY_NAME", ""),
 		VaultMigrateLegacyKeyFile: env("VAULT_MIGRATE_LEGACY_KEY_FILE", ""),
 		AllowInProcessMasterKey:   env("ALLOW_IN_PROCESS_MASTER_KEY", "false") == "true",
-		TLSCertFile:          env("TLS_CERT_FILE", ""),
-		TLSKeyFile:           env("TLS_KEY_FILE", ""),
-		TLSClientCAFile:      env("TLS_CLIENT_CA_FILE", ""),
-		MTLSIdentityCheck:    identityCheckDefault(os.Getenv("MTLS_IDENTITY_CHECK"), os.Getenv("TLS_CLIENT_CA_FILE")),
-		MTLSTrustedForwarders: envList("MTLS_TRUSTED_FORWARDERS", nil),
+		TLSCertFile:               env("TLS_CERT_FILE", ""),
+		TLSKeyFile:                env("TLS_KEY_FILE", ""),
+		TLSClientCAFile:           env("TLS_CLIENT_CA_FILE", ""),
+		MTLSIdentityCheck:         identityCheckDefault(os.Getenv("MTLS_IDENTITY_CHECK"), os.Getenv("TLS_CLIENT_CA_FILE")),
+		MTLSTrustedForwarders:     envList("MTLS_TRUSTED_FORWARDERS", nil),
 		MTLSMaxClientCertLifetime: envDuration("MTLS_MAX_CLIENT_CERT_LIFETIME", 0),
 		MTLSRequiredURIPrefix:     env("MTLS_REQUIRED_URI_PREFIX", ""),
 		// On by default (§13 "rotation must be automated"): it acts only on
 		// versions that declare rotation_interval_seconds, so an estate with
 		// no schedules pays one indexed query per interval. 0 disables.
-		RotationSweepInterval: envDuration("ROTATION_SWEEP_INTERVAL", 15*time.Minute),
+		RotationSweepInterval:        envDuration("ROTATION_SWEEP_INTERVAL", 15*time.Minute),
 		RequireSharedSecretException: sharedSecretRuleDefault(os.Getenv("REQUIRE_SHARED_SECRET_EXCEPTION"), env("ENV", "local")),
-		RotationSweepActor:    env("ROTATION_SWEEP_ACTOR", "system:rotation-sweeper"),
-		AllowInsecureInbound:    env("ALLOW_INSECURE_INBOUND", "false") == "true",
-		AllowPlaintextMasterKey: env("ALLOW_PLAINTEXT_MASTER_KEY", "false") == "true",
-		MaxLeaseDurationSeconds: envInt("MAX_LEASE_DURATION_SECONDS", 86400), // 24h default
-		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
-		AuthZServiceURL:      env("AUTHZ_SERVICE_URL", "http://authorization-svc"),
-		AuthZPlatformScopeID: env("AUTHZ_PLATFORM_SCOPE_ID", ""),
+		RotationSweepActor:           env("ROTATION_SWEEP_ACTOR", "system:rotation-sweeper"),
+		AllowInsecureInbound:         env("ALLOW_INSECURE_INBOUND", "false") == "true",
+		AllowPlaintextMasterKey:      env("ALLOW_PLAINTEXT_MASTER_KEY", "false") == "true",
+		MaxLeaseDurationSeconds:      envInt("MAX_LEASE_DURATION_SECONDS", 86400), // 24h default
+		OTELExporterEndpoint:         env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
+		AuthZServiceURL:              env("AUTHZ_SERVICE_URL", "http://authorization-svc"),
+		AuthZPlatformScopeID:         env("AUTHZ_PLATFORM_SCOPE_ID", ""),
 
 		AuthzMTLSEnabled:         env("AUTHZ_MTLS_ENABLED", "false") == "true",
 		AuthzMTLSURL:             env("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),

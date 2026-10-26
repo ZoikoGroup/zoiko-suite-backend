@@ -91,8 +91,14 @@ func (m *mockStore) Finalize(ctx context.Context, id string, req *domain.Finaliz
 	if !ok {
 		return nil, domain.ErrDraftNotFound
 	}
-	if d.ValidationStatus == domain.StatusBlocked {
-		return nil, domain.ErrValidationBlocked
+	if d.ValidationStatus != domain.StatusPrepared {
+		if d.ValidationStatus == domain.StatusBlocked {
+			return nil, domain.ErrValidationBlocked
+		}
+		if d.ValidationStatus == domain.StatusReadyForSubmission {
+			return nil, domain.ErrDraftAlreadyFinal
+		}
+		return nil, domain.ErrValidationRequired
 	}
 	d.ValidationStatus = domain.StatusReadyForSubmission
 	d.UpdatedAt = time.Now().UTC()
@@ -317,3 +323,63 @@ func TestValidate_EvidenceServiceUnavailable_Returns503(t *testing.T) {
 		t.Errorf("draft status must not change when evidence check fails closed, got %s", st.items[created.DraftID].ValidationStatus)
 	}
 }
+
+// TestFinalize_DirectlyFromDraft_Returns422 proves that finalization cannot skip validation (D4).
+func TestFinalize_DirectlyFromDraft_Returns422(t *testing.T) {
+	st := newMockStore()
+	pub := &mockPublisher{}
+	authzSrv := newGrantingAuthzServer(t)
+	az := authz.NewClient(authzSrv.URL)
+	logger, _ := zap.NewDevelopment()
+	evidenceReq := &stubEvidenceReq{}
+	h := New(st, pub, az, evidenceReq, logger)
+	r := chi.NewRouter()
+	RegisterRoutes(r, h)
+
+	created := &domain.FilingDraft{DraftID: "fprep-test-301", LegalEntityID: "entity-001", FilingType: "VAT", ValidationStatus: domain.StatusDraft}
+	st.items[created.DraftID] = created
+
+	finBody, _ := json.Marshal(domain.FinalizeDraftRequest{FinalizedBy: "tax_head"})
+	finReq := httptest.NewRequest("POST", "/v1/filing-preparation/drafts/"+created.DraftID+"/finalize", bytes.NewBuffer(finBody))
+	finReq.Header.Set("Content-Type", "application/json")
+	finReq.Header.Set("X-Principal-Id", "user-001")
+	finW := httptest.NewRecorder()
+	r.ServeHTTP(finW, finReq)
+
+	if finW.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 Unprocessable Entity when finalizing DRAFT without Validate, got %d — %s", finW.Code, finW.Body.String())
+	}
+}
+
+// TestUpdate_FinalizedDraft_Returns409 proves that finalized drafts are immutable (INV-07 / D3).
+func TestUpdate_FinalizedDraft_Returns409(t *testing.T) {
+	st := newMockStore()
+	pub := &mockPublisher{}
+	authzSrv := newGrantingAuthzServer(t)
+	az := authz.NewClient(authzSrv.URL)
+	logger, _ := zap.NewDevelopment()
+	evidenceReq := &stubEvidenceReq{}
+	h := New(st, pub, az, evidenceReq, logger)
+	r := chi.NewRouter()
+	RegisterRoutes(r, h)
+
+	created := &domain.FilingDraft{
+		DraftID:          "fprep-test-302",
+		LegalEntityID:    "entity-001",
+		FilingType:       "VAT",
+		ValidationStatus: domain.StatusReadyForSubmission,
+	}
+	st.items[created.DraftID] = created
+
+	updBody, _ := json.Marshal(domain.CreateDraftRequest{Notes: "mutating finalized draft"})
+	updReq := httptest.NewRequest("PUT", "/v1/filing-preparation/drafts/"+created.DraftID, bytes.NewBuffer(updBody))
+	updReq.Header.Set("Content-Type", "application/json")
+	updReq.Header.Set("X-Principal-Id", "user-001")
+	updW := httptest.NewRecorder()
+	r.ServeHTTP(updW, updReq)
+
+	if updW.Code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict when updating finalized draft, got %d — %s", updW.Code, updW.Body.String())
+	}
+}
+

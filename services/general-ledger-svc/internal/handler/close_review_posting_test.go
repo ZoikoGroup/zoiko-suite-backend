@@ -48,6 +48,7 @@ func TestCloseReview_DesignatedCloseJournalAllowed(t *testing.T) {
 
 	req := validCreateReq()
 	req.JournalType = domain.JournalTypeAccrual
+	req.JournalPurpose = "ACCRUAL"
 	req.CloseJournalDesignation = domain.CloseJournalDesignationAccrualRecognition
 	rec := doRequest(r, http.MethodPost, "/v1/journals/", req, "principal-1")
 
@@ -80,6 +81,7 @@ func TestCloseReview_DesignatedCloseJournalRequiresDedicatedAction(t *testing.T)
 
 	req := validCreateReq()
 	req.JournalType = domain.JournalTypeAccrual
+	req.JournalPurpose = "ACCRUAL"
 	req.CloseJournalDesignation = domain.CloseJournalDesignationAccrualRecognition
 	rec := doRequest(r, http.MethodPost, "/v1/journals/", req, "principal-1")
 
@@ -134,6 +136,7 @@ func TestSoftClose_DesignationIsNotAnOverride(t *testing.T) {
 
 	req := validCreateReq()
 	req.JournalType = domain.JournalTypeAccrual
+	req.JournalPurpose = "ACCRUAL"
 	req.CloseJournalDesignation = domain.CloseJournalDesignationAccrualRecognition
 	rec := doRequest(r, http.MethodPost, "/v1/journals/", req, "principal-1")
 
@@ -155,6 +158,7 @@ func TestHardClosed_DesignatedCloseJournalStillRefused(t *testing.T) {
 
 	req := validCreateReq()
 	req.JournalType = domain.JournalTypeAccrual
+	req.JournalPurpose = "ACCRUAL"
 	req.CloseJournalDesignation = domain.CloseJournalDesignationAccrualRecognition
 	rec := doRequest(r, http.MethodPost, "/v1/journals/", req, "principal-1")
 
@@ -176,6 +180,7 @@ func TestPostJournal_CloseReviewDesignatedHeaderAllowed(t *testing.T) {
 
 	req := validCreateReq()
 	req.JournalType = domain.JournalTypeAccrual
+	req.JournalPurpose = "ACCRUAL"
 	req.CloseJournalDesignation = domain.CloseJournalDesignationAccrualRecognition
 	create := doRequest(r, http.MethodPost, "/v1/journals/", req, "principal-1")
 	if create.Code != http.StatusCreated {
@@ -209,6 +214,7 @@ func TestPostJournal_CloseReviewDesignatedHeaderRequiresActionAtPost(t *testing.
 
 	req := validCreateReq()
 	req.JournalType = domain.JournalTypeAccrual
+	req.JournalPurpose = "ACCRUAL"
 	req.CloseJournalDesignation = domain.CloseJournalDesignationAccrualRecognition
 	create := doRequest(r, http.MethodPost, "/v1/journals/", req, "principal-1")
 	if create.Code != http.StatusCreated {
@@ -268,6 +274,7 @@ func TestPostJournal_HardClosedDesignatedHeaderStillRefused(t *testing.T) {
 
 	req := validCreateReq()
 	req.JournalType = domain.JournalTypeAccrual
+	req.JournalPurpose = "ACCRUAL"
 	req.CloseJournalDesignation = domain.CloseJournalDesignationAccrualRecognition
 	create := doRequest(r, http.MethodPost, "/v1/journals/", req, "principal-1")
 	if create.Code != http.StatusCreated {

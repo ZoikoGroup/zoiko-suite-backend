@@ -31,6 +31,9 @@ type Config struct {
 	APServiceURL             string
 	ARServiceURL             string
 	VaultServiceURL          string
+	// EvidenceRequirementsURL is the base URL of evidence-requirements-svc.
+	// Period close is a finalization path and must not skip required evidence.
+	EvidenceRequirementsURL string
 	// AssetServiceURL is asset-management-svc — ACC-06's own third
 	// subledger source (ASSETS), satisfying the AST/INV/PRJ domain
 	// spec's own §9 "Assets → GL" reconciliation assertion.
@@ -53,6 +56,15 @@ type Config struct {
 	// silently disable a control; CloseGateModeInvalid records that it happened.
 	CloseGateMode        string
 	CloseGateModeInvalid bool
+
+	// KernelCloseGateMode (KERNEL_CLOSE_GATE_MODE, "off" by default) makes the accounting kernel's close evidence a readiness input;
+	// KernelPeriodSealMode (KERNEL_PERIOD_SEAL_MODE, "off" by default) makes a close seal the period in the kernel and a reopen lift
+	// the seal. An unrecognised value is read as "enforce" (fail closed) and recorded, as for the other gates. KernelRequiredReconciliations
+	// (KERNEL_REQUIRED_RECONCILIATIONS, e.g. "AR_GL,AP_GL,BANK_GL,EVENT_POSTING") names the reconciliations that must have been run.
+	KernelCloseGateMode           string
+	KernelPeriodSealMode          string
+	KernelModeInvalid             bool
+	KernelRequiredReconciliations []string
 
 	// SubledgerControlGateMode is "enforce" (the default) or "off". Enforced,
 	// a period closes only when its latest AR and AP subledger-to-GL control
@@ -181,6 +193,14 @@ func Load() (*Config, error) {
 	}
 
 	gateMode, gateModeInvalid := normalizeCloseGateMode(os.Getenv("FINCTRL_CLOSE_GATE_MODE"))
+	kernelGate, kernelGateInvalid := normalizeCloseGateMode(os.Getenv("KERNEL_CLOSE_GATE_MODE"))
+	kernelSeal, kernelSealInvalid := normalizeCloseGateMode(os.Getenv("KERNEL_PERIOD_SEAL_MODE"))
+	var kernelRequired []string
+	for _, t := range strings.Split(os.Getenv("KERNEL_REQUIRED_RECONCILIATIONS"), ",") {
+		if t = strings.ToUpper(strings.TrimSpace(t)); t != "" {
+			kernelRequired = append(kernelRequired, t)
+		}
+	}
 	mirrorOn, mirrorInvalid := normalizeMirrorMode(os.Getenv("PERIOD_SERVICE_MIRROR"))
 	reopenWindow, reopenAdjusted := normalizeReopenWindow(os.Getenv("PERIOD_MIRROR_REOPEN_WINDOW"))
 	subledgerMode, subledgerModeInvalid := normalizeSubledgerControlGateMode(os.Getenv("SUBLEDGER_CONTROL_GATE_MODE"))
@@ -221,18 +241,24 @@ func Load() (*Config, error) {
 		ARServiceURL:             env("AR_SERVICE_URL", "http://accounts-receivable-svc:8101"),
 		// 8094 is the port document-vault-svc listens on. This defaulted to
 		// 8092, which nothing in this platform serves.
-		VaultServiceURL:      env("VAULT_SERVICE_URL", "http://document-vault-svc:8094"),
-		AssetServiceURL:      env("ASSET_SERVICE_URL", "http://asset-management-svc:8167"),
-		InventoryServiceURL:  env("INVENTORY_SERVICE_URL", "http://inventory-management-svc:8168"),
-		ProjectServiceURL:    env("PROJECT_SERVICE_URL", "http://project-accounting-svc:8169"),
-		AssetEventsTopic:     env("ASSET_EVENTS_TOPIC", "zoiko.asset.events"),
-		InventoryEventsTopic: env("INVENTORY_EVENTS_TOPIC", "zoiko.inventory.events"),
-		ProjectEventsTopic:   env("PROJECT_EVENTS_TOPIC", "zoiko.project.events"),
-		CloseSigningKey:      signingKey,
+		VaultServiceURL:         env("VAULT_SERVICE_URL", "http://document-vault-svc:8094"),
+		EvidenceRequirementsURL: env("EVIDENCE_REQUIREMENTS_URL", "http://evidence-requirements-svc:8130"),
+		AssetServiceURL:         env("ASSET_SERVICE_URL", "http://asset-management-svc:8167"),
+		InventoryServiceURL:     env("INVENTORY_SERVICE_URL", "http://inventory-management-svc:8168"),
+		ProjectServiceURL:       env("PROJECT_SERVICE_URL", "http://project-accounting-svc:8169"),
+		AssetEventsTopic:        env("ASSET_EVENTS_TOPIC", "zoiko.asset.events"),
+		InventoryEventsTopic:    env("INVENTORY_EVENTS_TOPIC", "zoiko.inventory.events"),
+		ProjectEventsTopic:      env("PROJECT_EVENTS_TOPIC", "zoiko.project.events"),
+		CloseSigningKey:         signingKey,
 
 		FinancialControlServiceURL: env("FINCTRL_SERVICE_URL", "http://financial-control-svc:8171"),
 		CloseGateMode:              gateMode,
 		CloseGateModeInvalid:       gateModeInvalid,
+
+		KernelCloseGateMode:           kernelGate,
+		KernelPeriodSealMode:          kernelSeal,
+		KernelModeInvalid:             kernelGateInvalid || kernelSealInvalid,
+		KernelRequiredReconciliations: kernelRequired,
 
 		PeriodMirrorEnabled:              mirrorOn,
 		PeriodMirrorModeInvalid:          mirrorInvalid,

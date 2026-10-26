@@ -74,11 +74,18 @@ type RegistrationResolver interface {
 	ResolveSellerRegistration(ctx context.Context, tenantID, legalEntityID, jurisdictionID, supplyDate string) (*registry.Registration, error)
 }
 
+// RulesClient retrieves active dynamic tax rules. Interface allows testing without real HTTP calls.
+type RulesClient interface {
+	FetchActiveRule(ctx context.Context, tenantID, jurisdictionID, category string) (*rules.TaxRuleDTO, error)
+}
+
+var _ RulesClient = (*rules.Client)(nil)
+
 type Handler struct {
 	store        store.Store
 	publisher    events.Publisher
 	authz        AuthzChecker
-	rulesClient  *rules.Client
+	rulesClient  RulesClient
 	jurisdiction JurisdictionValidator
 	registry     RegistrationResolver
 	logger       *zap.Logger
@@ -88,7 +95,7 @@ func New(
 	st store.Store,
 	pub events.Publisher,
 	az AuthzChecker,
-	rc *rules.Client,
+	rc RulesClient,
 	jv JurisdictionValidator,
 	rr RegistrationResolver,
 	logger *zap.Logger,
@@ -267,14 +274,18 @@ func (h *Handler) DetermineTax(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Fetch dynamic tax rule from tax-rules-svc
+	// Fetch dynamic tax rule from tax-rules-svc (TAX-03 Invariant 3: missing rule must block, fail closed)
 	rule, err := h.rulesClient.FetchActiveRule(r.Context(), tenantID, req.JurisdictionID, req.TaxCategory)
 	if err != nil {
-		h.logger.Warn("failed to fetch tax rule, using zero tax fallback", zap.Error(err))
-		rule = &rules.TaxRuleDTO{
-			RuleID:            "trule-fallback",
-			TaxRatePercentage: 0,
+		h.logger.Error("failed to fetch active tax rule", zap.Error(err),
+			zap.String("jurisdiction_id", req.JurisdictionID),
+			zap.String("tax_category", req.TaxCategory))
+		if errors.Is(err, rules.ErrTaxRuleNotFound) || errors.Is(err, domain.ErrTaxRuleNotFound) {
+			writeError(w, http.StatusUnprocessableEntity, domain.ErrTaxRuleNotFound.Error())
+			return
 		}
+		writeError(w, http.StatusServiceUnavailable, domain.ErrTaxRulesServiceUnavailable.Error())
+		return
 	}
 
 	taxableAmount := req.GrossAmount - req.ExemptAmount

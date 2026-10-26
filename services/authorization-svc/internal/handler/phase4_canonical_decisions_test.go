@@ -38,9 +38,9 @@ func TestScenarioA06_PaymentReleaserChangedSupplierBank_CoolingWindowConflict_De
 		ResourceID:    "pmt-9988",
 		Action:        "payment.release",
 		ResourceAttributes: map[string]string{
-			"amount":                               "150000.00",
-			"currency":                             "USD",
-			"supplier_bank_changed_by":             releaserID, // Releaser changed the supplier bank details
+			"amount":                              "150000.00",
+			"currency":                            "USD",
+			"supplier_bank_changed_by":            releaserID, // Releaser changed the supplier bank details
 			"supplier_bank_cooling_window_active": "true",     // within cooling window
 		},
 		Environment: domain.EnvironmentContext{
@@ -167,9 +167,9 @@ func TestScenarioA06_IndependentReleaser_NotBlocked(t *testing.T) {
 		ResourceID:    "pmt-9988",
 		Action:        "payment.release",
 		ResourceAttributes: map[string]string{
-			"amount":                               "150000.00",
-			"currency":                             "USD",
-			"supplier_bank_changed_by":             bankChangerID, // Changed by someone else!
+			"amount":                              "150000.00",
+			"currency":                            "USD",
+			"supplier_bank_changed_by":            bankChangerID, // Changed by someone else!
 			"supplier_bank_cooling_window_active": "true",
 		},
 		Environment: domain.EnvironmentContext{
@@ -1091,8 +1091,8 @@ func TestCapabilities_ActivePrincipal_ReturnsModulesAndFeatures(t *testing.T) {
 
 func TestCapabilities_SuspendedPrincipal_Returns403(t *testing.T) {
 	const (
-		tenantID    = "11111111-1111-4111-8111-111111111111"
-		userID      = "usr-suspended-1"
+		tenantID = "11111111-1111-4111-8111-111111111111"
+		userID   = "usr-suspended-1"
 	)
 
 	store := &stubStore{
@@ -1116,9 +1116,9 @@ func TestCapabilities_SuspendedPrincipal_Returns403(t *testing.T) {
 // ── ValidateSoD Candidate Reporting with DynamicRestricted ───────────────────
 func TestValidateSoD_ReportsDynamicRestrictedActions(t *testing.T) {
 	const (
-		tenantID    = "11111111-1111-4111-8111-111111111111"
-		callerID    = "usr-admin-1"
-		subjectID   = "usr-user-1"
+		tenantID  = "11111111-1111-4111-8111-111111111111"
+		callerID  = "usr-admin-1"
+		subjectID = "usr-user-1"
 	)
 
 	store := &stubStore{
@@ -1147,8 +1147,8 @@ func TestValidateSoD_ReportsDynamicRestrictedActions(t *testing.T) {
 	}
 
 	var resp struct {
-		ConflictFree      bool          `json:"conflict_free"`
-		DynamicRestricted []string      `json:"dynamic_restricted"`
+		ConflictFree      bool     `json:"conflict_free"`
+		DynamicRestricted []string `json:"dynamic_restricted"`
 	}
 	_ = json.Unmarshal(w.Body.Bytes(), &resp)
 
@@ -1171,4 +1171,3 @@ func TestValidateSoD_ReportsDynamicRestrictedActions(t *testing.T) {
 		t.Errorf("expected dynamic_restricted to contain payment.release and invoice.approve, got %v", resp.DynamicRestricted)
 	}
 }
-

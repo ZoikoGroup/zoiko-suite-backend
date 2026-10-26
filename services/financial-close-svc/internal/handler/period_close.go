@@ -9,6 +9,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"go.uber.org/zap"
 
 	"zoiko.io/financial-close-svc/internal/domain"
 )
@@ -190,6 +191,20 @@ func (h *Handler) decideReopen(w http.ResponseWriter, r *http.Request, approve b
 		}
 		writeJSON(w, http.StatusOK, decided)
 		return
+	}
+	// The kernel's seal is lifted first, under this request's own authority. If it cannot be, the approval does not happen: a period
+	// that is reopened here but still sealed there would refuse every posting it was reopened for. If the approval then fails, the
+	// seal stays lifted, which is safe: this service's own gate still refuses postings while the period is locked.
+	if h.kernel != nil && h.kernelSeal {
+		why := req.Reason
+		if why == "" {
+			why = rr.Reason
+		}
+		if _, err := h.kernel.ApplyKernelPeriodSeal(r.Context(), tenantID, principalID, fp.LegalEntityID, fp.PeriodName, "REOPEN", "reopen-request:"+requestID, why); err != nil {
+			h.log.Error("failed to lift the period seal in the accounting kernel", zap.String("request_id", requestID), zap.Error(err))
+			writeError(w, http.StatusServiceUnavailable, "kernel_unavailable", "the period seal in the accounting kernel could not be lifted: "+err.Error())
+			return
+		}
 	}
 	decided, reopened, err := h.store.ApproveReopenRequest(r.Context(), requestID, principalID, req.Reason, now, correlationID, principalID)
 	if err != nil {

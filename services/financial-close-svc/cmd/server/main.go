@@ -27,6 +27,7 @@ import (
 	"zoiko.io/financial-close-svc/internal/config"
 	"zoiko.io/financial-close-svc/internal/consumer"
 	svcenvelope "zoiko.io/financial-close-svc/internal/envelope"
+	"zoiko.io/financial-close-svc/internal/evidencereq"
 	"zoiko.io/financial-close-svc/internal/handler"
 	"zoiko.io/financial-close-svc/internal/health"
 	svckafka "zoiko.io/financial-close-svc/internal/kafka"
@@ -245,11 +246,17 @@ func main() {
 	}, pgStore, nil, periodmirror.NewMetrics(prometheus.DefaultRegisterer), log)
 
 	h := handler.New(pgStore, clientsWrapper, clientsWrapper, []byte(cfg.CloseSigningKey), log).
+		WithEvidenceGate(evidencereq.NewClient(cfg.EvidenceRequirementsURL)).
 		SetCloseGateEnforced(cfg.CloseGateMode == "enforce").
 		SetWorkflowRefs(pgStore, cfg.WorkflowRefCallers).
 		SetSubledgerControlGateEnforced(cfg.SubledgerControlGateMode == "enforce").
 		SetBankReconciliationGate(cfg.BankReconGateMode == "enforce", cfg.BankReconCutoffDays).
+		SetKernelClose(clientsWrapper, cfg.KernelCloseGateMode == "enforce", cfg.KernelPeriodSealMode == "enforce", cfg.KernelRequiredReconciliations).
 		SetPeriodMirror(periodMirror)
+	if cfg.KernelModeInvalid {
+		log.Warn("unrecognised KERNEL_CLOSE_GATE_MODE or KERNEL_PERIOD_SEAL_MODE; treating as enforce (fail closed)")
+	}
+	log.Info("accounting kernel close integration", zap.String("close_gate", cfg.KernelCloseGateMode), zap.String("period_seal", cfg.KernelPeriodSealMode), zap.Strings("required_reconciliations", cfg.KernelRequiredReconciliations))
 	handler.RegisterRoutes(r, h)
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────

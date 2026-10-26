@@ -1,0 +1,13 @@
+DROP TABLE IF EXISTS period_seal_events;
+DROP TRIGGER IF EXISTS period_seal_guard_trg ON period_seals;
+DROP FUNCTION IF EXISTS period_seal_guard();
+DROP TABLE IF EXISTS period_seals;
+DROP TABLE IF EXISTS balance_snapshots;
+DROP TABLE IF EXISTS revaluation_runs;
+DROP TRIGGER IF EXISTS fx_override_guard_trg ON fx_rate_override_requests;
+DROP FUNCTION IF EXISTS fx_override_guard();
+DROP TABLE IF EXISTS fx_rate_override_requests;
+DROP TABLE IF EXISTS fx_rates;
+ALTER TABLE chart_of_accounts DROP COLUMN IF EXISTS monetary;
+DROP INDEX IF EXISTS idx_ledger_entries_fx;
+ALTER TABLE ledger_entries DROP COLUMN IF EXISTS transaction_amount, DROP COLUMN IF EXISTS transaction_currency;

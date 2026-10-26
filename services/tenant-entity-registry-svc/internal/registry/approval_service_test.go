@@ -95,7 +95,7 @@ func (denyApproveAuthZ) Authorize(_ context.Context, _, _, _, action string) err
 func TestMakerChecker_BodyApproverIsRefusedOnEveryCommand(t *testing.T) {
 	svc, ms := baseSvc(t)
 	ms.tenants[orgTenant].LifecycleState = domain.TenantLifecycleActive
-	seedEntityFor(ms, "ent-ro", orgTenant, "", "JUR-US")
+	seedEntityFor(ms, "e0000000-0000-4000-8000-00000000001a", orgTenant, "", "JUR-US")
 
 	// Not only on maker-checker commands: on a suspension it would have been
 	// written into lifecycle history as an approver of a command nobody
@@ -105,11 +105,11 @@ func TestMakerChecker_BodyApproverIsRefusedOnEveryCommand(t *testing.T) {
 	require.ErrorIs(t, err, registry.ErrApprovalRequired)
 	assert.Equal(t, domain.TenantLifecycleActive, ms.tenants[orgTenant].LifecycleState)
 
-	_, err = svc.ChangeRegisteredOffice(tenantCtx(orgTenant), "ent-ro", domain.ChangeRegisteredOfficeRequest{
+	_, err = svc.ChangeRegisteredOffice(tenantCtx(orgTenant), "e0000000-0000-4000-8000-00000000001a", domain.ChangeRegisteredOfficeRequest{
 		RegisteredOffice: `{"line1":"x"}`, ApprovedByPrincipalID: "a-colleague",
 	})
 	require.ErrorIs(t, err, registry.ErrApprovalRequired)
-	versions, _ := svc.ListEntityVersions(tenantCtx(orgTenant), "ent-ro")
+	versions, _ := svc.ListEntityVersions(tenantCtx(orgTenant), "e0000000-0000-4000-8000-00000000001a")
 	assert.Len(t, versions, 1, "no version was written")
 }
 
@@ -333,12 +333,12 @@ func TestGenericLifecycleRoute_CannotTerminateWithoutApproval(t *testing.T) {
 
 func TestUpdateEntity_LegalNameIsNotPatchable(t *testing.T) {
 	svc, ms := baseSvc(t)
-	seedEntityFor(ms, "ent-patch", orgTenant, "", "JUR-US")
+	seedEntityFor(ms, "e0000000-0000-4000-8000-000000000018", orgTenant, "", "JUR-US")
 	name := "Quietly Renamed Ltd"
 
-	_, err := svc.UpdateEntity(tenantCtx(orgTenant), "ent-patch", domain.UpdateEntityRequest{LegalName: &name})
+	_, err := svc.UpdateEntity(tenantCtx(orgTenant), "e0000000-0000-4000-8000-000000000018", domain.UpdateEntityRequest{LegalName: &name})
 	require.ErrorIs(t, err, registry.ErrApprovalRequired)
-	assert.Equal(t, "Original Name Ltd", ms.entities["ent-patch"].LegalName)
+	assert.Equal(t, "Original Name Ltd", ms.entities["e0000000-0000-4000-8000-000000000018"].LegalName)
 }
 
 // ---------------------------------------------------------------------------

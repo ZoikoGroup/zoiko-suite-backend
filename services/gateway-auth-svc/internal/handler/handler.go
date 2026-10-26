@@ -6,11 +6,13 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 	"go.uber.org/zap"
+	idenv "zoiko.io/identity-envelope"
 
 	"zoiko.io/gateway-auth-svc/internal/admission"
 	"zoiko.io/gateway-auth-svc/internal/carta"
@@ -37,6 +39,10 @@ type Handler struct {
 
 	// metrics is never nil — New installs nopMetrics.
 	metrics DomainMetrics
+
+	// revocation checks each verified envelope's session at
+	// identity-context-svc (AU-01). Nil skips the check (ENV=local only).
+	revocation *idenv.Revocation
 }
 
 // DomainMetrics records the outcomes this service's HTTP metrics cannot
@@ -108,6 +114,14 @@ func (h *Handler) UseMetrics(m DomainMetrics) *Handler {
 	return h
 }
 
+// UseRevocation makes /verify refuse an envelope whose session has ended. A
+// logout used to leave the envelope passing the edge until it expired (Auth
+// audit AU-01: revocation "must not wait for cache/token expiry").
+func (h *Handler) UseRevocation(r *idenv.Revocation) *Handler {
+	h.revocation = r
+	return h
+}
+
 // envelopeClaims mirrors only the fields this gateway needs to propagate
 // downstream. The full IdentityContextEnvelope shape is owned by
 // identity-context-svc — this service reads a signed token, it never mints
@@ -134,11 +148,27 @@ type envelopeClaims struct {
 	// session was issued with. A pointer so an envelope without the claim
 	// asserts nothing, rather than "single factor".
 	SessionTrustPosture struct {
-		MFAVerified *bool `json:"mfa_verified"`
+		MFAVerified      *bool  `json:"mfa_verified"`
+		SessionContextID string `json:"session_context_id"`
 	} `json:"session_trust_posture"`
+
+	// AuthTime is when the person last authenticated (OIDC auth_time, Unix
+	// seconds): the password login or a later TOTP step-up. NOT iat, which is
+	// when the envelope was minted and moves on every re-resolve. Zero when the
+	// envelope predates the claim, in which case no age is asserted.
+	AuthTime int64 `json:"auth_time"`
+
+	// SID is the login session the envelope descends from (OIDC sid).
+	SID string `json:"sid"`
 
 	jwt.RegisteredClaims
 }
+
+// maxAuthTimeSkew is how far in the future an auth_time may be before it is
+// treated as unknown rather than as a fresh login. The signature proves
+// identity-context-svc minted it; a clock ahead of ours must still never make a
+// login look more recent than "now".
+const maxAuthTimeSkew = time.Minute
 
 // Source-channel provenance, on X-Source-Channel-Basis.
 const (
@@ -234,6 +264,13 @@ func (h *Handler) Verify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// AU-01: the envelope verified, but its session may have ended since it
+	// was minted. Asked of identity-context-svc (cached for the revocation
+	// TTL), before anything is forwarded.
+	if !h.sessionLive(ctx, w, r, rc, rawToken, claims) {
+		return
+	}
+
 	// Token/hostname tenant mismatch defense — GTRM decision doc §6.2/§11
 	// (acceptance test O), which explicitly assigns this check to the
 	// application layer, not the router: "the app must reject a session
@@ -295,6 +332,17 @@ func (h *Handler) Verify(w http.ResponseWriter, r *http.Request) {
 		"MEDIUM",
 	)
 
+	// AU-23 (decision 21 Oct 2026): carta-svc configured but silent fails
+	// closed on a material write and open on a read. It used to fail open for
+	// everything, so an outage of the risk engine removed the control.
+	if assessment == nil && h.carta.Enabled() && materialWrite(originalMethod(r)) {
+		h.refuse(w, r, rc, refusal{
+			outcome: outcomeCartaUnavailable, code: problem.CodeAuthDenied, status: http.StatusServiceUnavailable,
+			detail: "continuous risk assessment unavailable", retryable: true,
+		})
+		return
+	}
+
 	if assessment != nil {
 		// Counted before the branch, so ALLOW and STEP_UP_MFA are visible too.
 		h.metrics.CartaDecision(string(assessment.Decision))
@@ -320,6 +368,23 @@ func (h *Handler) Verify(w http.ResponseWriter, r *http.Request) {
 		// value carta-svc adds later, or an empty one from a reply that
 		// parsed but carried no decision — and CARTA having answered is not
 		// the unreachable case that Evaluate deliberately fails open on.
+		// STEP_UP_MFA: a TOTP step-up now exists (identity-context-svc), so the
+		// answer is 401 step_up_required, which the console turns into a
+		// step-up and a retry, not a hard 403 (AU-23).
+		// X-Carta-Decision is set on these two refusals and nowhere else, so it
+		// is never attributed to a refusal the risk engine did not make.
+		if assessment.Decision == carta.DecisionStepUpMFA {
+			h.refuse(w, r, rc, refusal{
+				outcome: outcomeStepUpRequired, code: problem.CodeAuthDenied, status: http.StatusUnauthorized,
+				detail: "step-up authentication required", severity: severityFor(assessment.Decision), dedicated: true,
+				headers: [][2]string{
+					{"X-Carta-Decision", string(carta.DecisionStepUpMFA)},
+					// RFC 9470: authenticate again with a second factor and retry.
+					{"WWW-Authenticate", `Bearer error="insufficient_user_authentication", error_description="step-up authentication required"`},
+				},
+			})
+			return
+		}
 		h.refuse(w, r, rc, refusal{
 			outcome: outcomeCartaBlocked, code: problem.CodeAuthDenied, status: http.StatusForbidden,
 			detail: "access denied by continuous risk assessment", severity: severityFor(assessment.Decision), dedicated: true,
@@ -396,19 +461,26 @@ func (h *Handler) Verify(w http.ResponseWriter, r *http.Request) {
 //     caller could claim "system" or "scheduled_job". The verified value now
 //     wins. When the envelope names none, the caller's value is passed on, and
 //     X-Source-Channel-Basis says which of the two a backend is reading.
+//
 //   - X-Assurance-Level: MFA or SINGLE_FACTOR, from the session's
 //     mfa_verified. authorization-svc's step-up reads this header; through the
 //     edge it was whatever the client sent.
+//
 //   - X-Support-Context-Id: only a support elevation identity-context-svc
 //     verified at resolve time. Before, the edge stripped it outright, so no
 //     backend could see that a request ran under one.
 //
-// Nothing here can state how recently the user authenticated: the envelope's
-// iat is when the envelope was minted, not when the user logged in, and no
-// auth_time claim exists. X-Authn-Age-Seconds is therefore stripped and never
-// set (see the edge lists) rather than derived from a value that would
-// overstate freshness.
+//   - X-Authn-Age-Seconds (Group 1 register R-2, ZS-IAM-001 §3
+//     "Reauthentication age"): seconds since the envelope's auth_time, the
+//     moment the person last authenticated. Never derived from iat, which is
+//     when the envelope was minted and would overstate freshness on every
+//     re-resolve. With no auth_time (an envelope minted before the claim), or
+//     one more than maxAuthTimeSkew in the future, the header is not set: a
+//     backend reads an absent age as unknown, which authorization-svc's
+//     step-up treats as not recent. A client copy is always stripped (edge
+//     lists), so the only age a backend ever sees is this one.
 func setSessionContext(w http.ResponseWriter, r *http.Request, claims *envelopeClaims) {
+	setAuthnAge(w, claims.AuthTime, time.Now())
 	if ch := strings.TrimSpace(claims.SourceChannel); ch != "" {
 		w.Header().Set("X-Source-Channel", ch)
 		w.Header().Set("X-Source-Channel-Basis", channelVerified)
@@ -557,16 +629,20 @@ func bearerToken(header string) (string, bool) {
 // depend on internal/telemetry — see DomainMetrics. The audit script compares
 // the two lists so they cannot drift apart unnoticed.
 const (
-	outcomeAllowed                 = "allowed"
-	outcomeNoToken                 = "no_token"
-	outcomeInvalidToken            = "invalid_token"
-	outcomeIncompleteClaims        = "incomplete_claims"
-	outcomeTenantHostnameMismatch  = "tenant_hostname_mismatch"
-	outcomeCartaBlocked            = "carta_blocked"
-	outcomeTenantContextDenied     = "tenant_context_denied"
-	outcomeTenantContextUnresolved = "tenant_context_unresolved"
-	outcomeRateLimited             = "rate_limited"
-	outcomeOverloaded              = "overloaded"
+	outcomeAllowed                  = "allowed"
+	outcomeNoToken                  = "no_token"
+	outcomeInvalidToken             = "invalid_token"
+	outcomeIncompleteClaims         = "incomplete_claims"
+	outcomeTenantHostnameMismatch   = "tenant_hostname_mismatch"
+	outcomeCartaBlocked             = "carta_blocked"
+	outcomeTenantContextDenied      = "tenant_context_denied"
+	outcomeTenantContextUnresolved  = "tenant_context_unresolved"
+	outcomeSessionRevoked           = "session_revoked"
+	outcomeSessionStatusUnavailable = "session_status_unavailable"
+	outcomeStepUpRequired           = "step_up_required"
+	outcomeCartaUnavailable         = "carta_unavailable"
+	outcomeRateLimited              = "rate_limited"
+	outcomeOverloaded               = "overloaded"
 )
 
 // denialReasonHeader names why a request was refused, on every refusal.
@@ -575,3 +651,47 @@ const (
 // status, body and headers — so this reaches the caller and is what lets a
 // console tell the gateway's own refusals apart from the backend's.
 const denialReasonHeader = "X-Auth-Denial-Reason"
+
+// sessionLive runs the AU-01 revocation check and writes the refusal: 401
+// session_revoked for an ended session, 503 when identity-context-svc cannot
+// answer and the check fails closed.
+func (h *Handler) sessionLive(ctx context.Context, w http.ResponseWriter, r *http.Request, rc *reqCtx, token string, claims *envelopeClaims) bool {
+	if h.revocation == nil {
+		return true
+	}
+	c := &idenv.Claims{TenantID: claims.TenantID, SID: claims.SID}
+	c.Principal.PrincipalID = claims.Principal.PrincipalID
+	c.SessionTrustPosture.SessionContextID = claims.SessionTrustPosture.SessionContextID
+	err := h.revocation.Check(ctx, token, c)
+	switch {
+	case err == nil:
+		return true
+	case errors.Is(err, idenv.ErrRevoked):
+		h.log.Info("gateway refused a revoked session", zap.String("principal_id", claims.Principal.PrincipalID),
+			zap.String("session_context_id", c.SessionContextID()), zap.Error(err))
+		h.refuseAuth(w, r, rc, outcomeSessionRevoked, "session revoked")
+	default:
+		h.log.Error("identity session status unavailable — failing closed", zap.Error(err))
+		h.refuse(w, r, rc, refusal{
+			outcome: outcomeSessionStatusUnavailable, code: problem.CodeAuthDenied, status: http.StatusServiceUnavailable,
+			detail: "session status unavailable", retryable: true,
+		})
+	}
+	return false
+}
+
+// setAuthnAge stamps X-Authn-Age-Seconds from authTime (Unix seconds), or
+// leaves it unset when the age cannot be stated honestly.
+func setAuthnAge(w http.ResponseWriter, authTime int64, now time.Time) {
+	if authTime <= 0 {
+		return
+	}
+	age := now.Unix() - authTime
+	if age < -int64(maxAuthTimeSkew/time.Second) {
+		return
+	}
+	if age < 0 {
+		age = 0
+	}
+	w.Header().Set("X-Authn-Age-Seconds", strconv.FormatInt(age, 10))
+}

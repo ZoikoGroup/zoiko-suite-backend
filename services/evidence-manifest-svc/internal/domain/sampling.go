@@ -148,6 +148,9 @@ type ApproveSampleDesignParams struct {
 
 type SelectSampleParams struct {
 	DesignID, TenantID, CorrelationID string
+	// ActorPrincipalID is the verified principal; it is recorded on the
+	// SampleSelected event.
+	ActorPrincipalID string
 }
 
 type RecordItemResultParams struct {
@@ -165,6 +168,9 @@ type AddAlternativeProcedureParams struct {
 
 type EvaluateSampleParams struct {
 	DesignID, TenantID, CorrelationID string
+	// ActorPrincipalID is the verified principal; it is recorded on the
+	// SampleEvaluated event.
+	ActorPrincipalID string
 }
 
 // SupersedeSampleParams is AUD-04's own AUD-NEG-011 mechanism: since

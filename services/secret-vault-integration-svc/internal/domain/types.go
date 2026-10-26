@@ -143,9 +143,9 @@ type SharedSecretException struct {
 	ExpiresAt time.Time `json:"expires_at"`
 	Status    string    `json:"status"`
 
-	CreatedAt   time.Time   `json:"created_at"`
-	RevokedAt   *time.Time  `json:"revoked_at"`
-	RevokedBy   *string     `json:"revoked_by"`
+	CreatedAt time.Time  `json:"created_at"`
+	RevokedAt *time.Time `json:"revoked_at"`
+	RevokedBy *string    `json:"revoked_by"`
 }
 
 // DueRotation is one rotation due now: a scheduled secret policy version
@@ -238,8 +238,8 @@ type CreateSecretPolicyVersionParams struct {
 // ListSharedSecretExceptionsFilter holds input parameters for listing the
 // shared-secret exception register.
 type ListSharedSecretExceptionsFilter struct {
-	TenantID *string
-	Status   string // "" means all statuses.
+	TenantID   *string
+	Status     string // "" means all statuses.
 	SecretPath string
 }
 
@@ -294,14 +294,14 @@ type RecordAuditEntryParams struct {
 	// ActedByPrincipalID is the authenticated caller performing the act.
 	// Leave nil only where there is genuinely no actor to name; every
 	// handler in this service has one.
-	ActedByPrincipalID *string
-	TenantID           *string
-	LegalEntityID          *string
-	LeaseID                *string
-	SecretPolicyVersionID  *string
-	RequestID              *string
-	OutcomeDetail          string
-	CorrelationID          string
+	ActedByPrincipalID    *string
+	TenantID              *string
+	LegalEntityID         *string
+	LeaseID               *string
+	SecretPolicyVersionID *string
+	RequestID             *string
+	OutcomeDetail         string
+	CorrelationID         string
 }
 
 // ── errors ───────────────────────────────────────────────────────────────────

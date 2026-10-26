@@ -70,7 +70,7 @@ func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(tx pgx.T
 const delegationColumns = `
 	delegation_id, tenant_id, legal_entity_id, delegator_principal_id, delegate_principal_id,
 	action_type, effective_from, effective_to, status, created_by_principal_id, correlation_id,
-	created_at, updated_at, revoked_by_principal_id, revoked_at, expired_at,
+	idempotency_key, created_at, updated_at, revoked_by_principal_id, revoked_at, expired_at,
 	authority_limit_cents, authority_limit_currency, authority_limit_quantity,
 	version, reason, approved_by_principal_id, approved_at, approval_method,
 	suspended_by_principal_id, suspended_at, suspension_reason, revocation_reason
@@ -106,7 +106,7 @@ func scanDelegationPlus(row pgx.Row, d *domain.DelegationGrant, extra ...any) er
 	dest := []any{
 		&d.DelegationID, &d.TenantID, &d.LegalEntityID, &d.DelegatorPrincipalID, &d.DelegatePrincipalID,
 		&d.ActionType, &d.EffectiveFrom, &d.EffectiveTo, &status, &d.CreatedByPrincipalID, &d.CorrelationID,
-		&d.CreatedAt, &d.UpdatedAt, &d.RevokedByPrincipalID, &d.RevokedAt, &d.ExpiredAt,
+		&d.IdempotencyKey, &d.CreatedAt, &d.UpdatedAt, &d.RevokedByPrincipalID, &d.RevokedAt, &d.ExpiredAt,
 		&d.AuthorityLimitCents, &d.AuthorityLimitCurrency, &d.AuthorityLimitQuantity,
 		&d.Version, &reason, &d.ApprovedByPrincipalID, &d.ApprovedAt, &d.ApprovalMethod,
 		&d.SuspendedByPrincipalID, &d.SuspendedAt, &d.SuspensionReason, &d.RevocationReason,
@@ -136,14 +136,14 @@ func (s *PgStore) CreateDelegation(ctx context.Context, d *domain.DelegationGran
 			INSERT INTO delegation_grants (
 				delegation_id, tenant_id, legal_entity_id, delegator_principal_id, delegate_principal_id,
 				action_type, effective_from, effective_to, status, created_by_principal_id, correlation_id,
-				created_at, updated_at, revoked_by_principal_id, revoked_at, expired_at,
+				idempotency_key, created_at, updated_at, revoked_by_principal_id, revoked_at, expired_at,
 				authority_limit_cents, authority_limit_currency, authority_limit_quantity,
 				version, reason, approved_by_principal_id, approved_at, approval_method
-			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
 			ON CONFLICT (tenant_id, correlation_id, created_by_principal_id, action_type, legal_entity_id, effective_from, effective_to) DO NOTHING
 		`, d.DelegationID, tenantID, d.LegalEntityID, d.DelegatorPrincipalID, d.DelegatePrincipalID,
 			d.ActionType, d.EffectiveFrom, d.EffectiveTo, string(d.Status), d.CreatedByPrincipalID, d.CorrelationID,
-			d.CreatedAt, d.UpdatedAt, d.RevokedByPrincipalID, d.RevokedAt, d.ExpiredAt,
+			d.IdempotencyKey, d.CreatedAt, d.UpdatedAt, d.RevokedByPrincipalID, d.RevokedAt, d.ExpiredAt,
 			d.AuthorityLimitCents, d.AuthorityLimitCurrency, d.AuthorityLimitQuantity, 1,
 			d.Reason, d.ApprovedByPrincipalID, d.ApprovedAt, d.ApprovalMethod)
 		if err != nil {
@@ -177,6 +177,12 @@ func (s *PgStore) CreateDelegation(ctx context.Context, d *domain.DelegationGran
 		// in the unique key, so a reused correlation_id naming another
 		// delegate (or delegator, or ceiling) used to come back as a 200
 		// "replay" of a delegation the caller never asked for.
+		//
+		// The Idempotency-Key header is deliberately NOT part of this key
+		// (000013). A repeated key is already answered by the HTTP replay
+		// store before the handler runs; folding it in here only made a retry
+		// that carried a new key under the same correlation_id a second grant.
+		// idempotency_key records the first request's key, as evidence.
 		row := tx.QueryRow(ctx, "SELECT "+delegationColumns+" FROM delegation_grants WHERE tenant_id = $1 AND correlation_id = $2 AND created_by_principal_id = $3 AND action_type = $4 AND legal_entity_id = $5 AND effective_from = $6 AND effective_to = $7", tenantID, d.CorrelationID, d.CreatedByPrincipalID, d.ActionType, d.LegalEntityID, d.EffectiveFrom, d.EffectiveTo)
 		var existing domain.DelegationGrant
 		if err := scanDelegation(row, &existing); err != nil {

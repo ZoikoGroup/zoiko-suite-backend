@@ -97,6 +97,16 @@ const (
 	JournalTypeClosing    JournalType = "CLOSING"
 	JournalTypeReclass    JournalType = "RECLASS"
 
+	// JournalTypeRevaluation is the journal the kernel posts for period-end revaluation. It is never accepted from a caller:
+	// only the kernel originates it (standard §8.1).
+	JournalTypeRevaluation JournalType = "REVALUATION"
+
+	// JournalTypeConsolidation and JournalTypeElimination are the journals the kernel posts into a group book when it consolidates:
+	// the translated member balances and the intercompany eliminations. Like revaluation, only the kernel originates them.
+	JournalTypeAllocation    JournalType = "ALLOCATION"
+	JournalTypeConsolidation JournalType = "CONSOLIDATION"
+	JournalTypeElimination   JournalType = "ELIMINATION"
+
 	// JournalTypeUnspecified marks rows written before migration 000006 added
 	// the field. It is never accepted on a new journal — see ValidJournalType —
 	// and exists only so historical postings remain readable and identifiable
@@ -240,6 +250,37 @@ type JournalHeader struct {
 	// journal. A designation never admits a journal to CLOSED — it is only
 	// meaningful while the period's policy is CLOSE_JOURNALS_ONLY.
 	CloseJournalDesignation *string `json:"close_journal_designation,omitempty"`
+
+	// ── Accounting Kernel journal model (standard §8.1) ──────────────────────
+	//
+	// JournalNumber is the human-readable sequence, unique per entity+book+year and allocated when the journal is posted;
+	// it is never a relational key. AccountingBookID names the kernel book (BookID above stays the legacy book code that
+	// ledger entries are keyed by). SourceAccountingEventID and PostingExecutionID tie a system journal to the exact event
+	// and rule execution that produced it. JournalHash seals the posted content (AK-INV: posted journals are immutable).
+	JournalNumber           *string `json:"journal_number,omitempty"`
+	AccountingBookID        *string `json:"accounting_book_id,omitempty"`
+	SourceAccountingEventID *string `json:"source_accounting_event_id,omitempty"`
+	PostingExecutionID      *string `json:"posting_execution_id,omitempty"`
+	JournalHash             *string `json:"journal_hash,omitempty"`
+
+	// JournalPurpose is the controlled classification a manual journal must carry (§9). CorrectionKind and
+	// ReversalReason record the nature of a correction (§11), so a policy change is never filed as an error correction.
+	JournalPurpose *string `json:"journal_purpose,omitempty"`
+	CorrectionKind *string `json:"correction_kind,omitempty"`
+	ReversalReason *string `json:"reversal_reason,omitempty"`
+
+	// CopyOfJournalID and RecurringTemplateID record provenance: a copy or a generated instance is a new draft with a
+	// new identity, never a duplicate of posting identifiers (§9).
+	CopyOfJournalID     *string `json:"copy_of_journal_id,omitempty"`
+	RecurringTemplateID *string `json:"recurring_template_id,omitempty"`
+
+	WithdrawnAt            *time.Time `json:"withdrawn_at,omitempty"`
+	WithdrawnByPrincipalID *string    `json:"withdrawn_by_principal_id,omitempty"`
+	WithdrawnReason        *string    `json:"withdrawn_reason,omitempty"`
+
+	// ReconciliationCaseID names the reconciliation case a reconciliation adjustment settles (standard §17): a bank or
+	// subledger adjustment is never a free-standing correction.
+	ReconciliationCaseID *string `json:"reconciliation_case_id,omitempty"`
 }
 
 // JournalLine is one debit or credit line within a journal. Exactly one of
@@ -275,6 +316,18 @@ type JournalLine struct {
 	// values are valid for one, so the keys are recorded as supplied and not
 	// validated — the same posture as account_code with no Chart of Accounts.
 	Dimensions Dimensions `json:"dimensions,omitempty"`
+
+	// Foreign-currency and provenance data (standard §8.2). Debit/credit above are always in the book's functional
+	// currency; when the source transaction was in another currency the original amount, its currency and the rate that
+	// converted it are kept, and PostingRuleLineRef names the exact rule template that generated the line.
+	TransactionAmount  *string `json:"transaction_amount,omitempty"`
+	TransactionCcy     *string `json:"transaction_currency,omitempty"`
+	ExchangeRate       *string `json:"exchange_rate,omitempty"`
+	RateRef            *string `json:"rate_ref,omitempty"`
+	PostingRuleLineRef *string `json:"posting_rule_line_ref,omitempty"`
+
+	// CounterpartyID is the customer or supplier a line on a subledger control account belongs to (standard §8.2, §12).
+	CounterpartyID *string `json:"counterparty_id,omitempty"`
 }
 
 // JournalWithLines is the full aggregate returned by read endpoints.
@@ -870,6 +923,10 @@ type CreateJournalLineInput struct {
 
 	// ACC-03 "dimensions". See JournalLine.Dimensions.
 	Dimensions Dimensions `json:"dimensions,omitempty"`
+
+	// CounterpartyID is required on a line posted to an account that needs one (AR, AP control accounts and any account
+	// flagged counterparty_required).
+	CounterpartyID *string `json:"counterparty_id,omitempty"`
 }
 
 type CreateJournalRequest struct {
@@ -892,6 +949,13 @@ type CreateJournalRequest struct {
 	// Optional: no service can issue or validate these yet (REF-06).
 	BookID         *string `json:"book_id,omitempty"`
 	ReportingBasis *string `json:"reporting_basis,omitempty"`
+
+	// JournalPurpose is the controlled purpose of a manual journal (standard §9). Required for the adjusting journal
+	// types (ADJUSTMENT, ACCRUAL, RECLASS, OPENING, CLOSING), where free text alone is not enough.
+	JournalPurpose string `json:"journal_purpose,omitempty"`
+
+	// ReconciliationCaseID is required when the purpose is RECONCILIATION_ADJUSTMENT.
+	ReconciliationCaseID string `json:"reconciliation_case_id,omitempty"`
 
 	// EvidenceRefs may be sent in the body or, preferably, as the §4 envelope's
 	// X-Evidence-Refs header. The handler merges both — a caller that has
@@ -938,6 +1002,11 @@ type CreateJournalRequest struct {
 type ReverseJournalRequest struct {
 	Reason        string `json:"reason"`
 	CorrelationID string `json:"correlation_id"`
+
+	// CorrectionKind is the nature of the correction (§11); optional so existing callers keep working, validated when sent.
+	// PostingDate lets the caller choose the date the reversal takes effect (§32); it defaults as it always has.
+	CorrectionKind string `json:"correction_kind,omitempty"`
+	PostingDate    Date   `json:"posting_date,omitempty"`
 
 	// OverrideSoftClose and SoftCloseOverrideReason mirror the fields on
 	// CreateJournalRequest — see those field docs for semantics.

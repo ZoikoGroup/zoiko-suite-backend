@@ -227,11 +227,11 @@ type SupportContext struct {
 	SupportPrincipalID string `json:"support_principal_id"`
 	// SubjectPrincipalID narrows the grant to one principal's data. nil is a
 	// tenant-wide support context, which is the broader and rarer grant.
-	SubjectPrincipalID  *string   `json:"subject_principal_id"`
-	ReasonCode          string    `json:"reason_code"`
-	Justification       string    `json:"justification"`
-	TicketRef           string    `json:"ticket_ref"`
-	ApproverPrincipalID string    `json:"approver_principal_id"`
+	SubjectPrincipalID  *string `json:"subject_principal_id"`
+	ReasonCode          string  `json:"reason_code"`
+	Justification       string  `json:"justification"`
+	TicketRef           string  `json:"ticket_ref"`
+	ApproverPrincipalID string  `json:"approver_principal_id"`
 	// RequestedByPrincipalID made the request; ApprovalStatus is
 	// PENDING_APPROVAL until the named approver approves it with their own
 	// call (S1-1 / R-2). A pending request grants nothing: GrantedAt and

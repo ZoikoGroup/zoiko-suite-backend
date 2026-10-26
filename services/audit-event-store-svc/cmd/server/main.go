@@ -1,9 +1,12 @@
 // Package main is the entry point for audit-event-store-svc.
 //
 // This service is an append-only evidence store for domain events
-// (see docs/architecture/03-microservices.md §14.1).  It has no
-// outward-facing business HTTP API; the HTTP server exists solely to serve
-// health probes.  The real work is done by the Kafka consumer runners.
+// (see docs/architecture/03-microservices.md §14.1).  Ingestion is Kafka only:
+// one consumer runner per topic appends events to the hash chain.  The HTTP
+// server serves the health/metrics probes and six authenticated business
+// routes — GET /v1/events and POST /v1/events/verify (AUDIT_EVENT_READ) and the
+// four /v1/archives routes (AUDIT_ARCHIVE_MANAGE).  There is no HTTP ingestion
+// endpoint.
 //
 // Wiring order:
 //

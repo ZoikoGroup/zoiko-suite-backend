@@ -135,3 +135,18 @@ func TestPublish_OmitsTenantWhenTheContextCarriesNone(t *testing.T) {
 	require.NoError(t, json.Unmarshal(w.msgs[0].Value, &raw))
 	assert.NotContains(t, raw, "tenant_id")
 }
+
+// The relay must deliver the envelope the store recorded, not rebuild it —
+// a rebuilt envelope would get a new event_id and emitted_at, breaking the
+// promise that the event is the one that committed with the mutation.
+func TestPublishEnvelope_PreservesStoredBytesAndKey(t *testing.T) {
+	w := &fakeWriter{}
+	p := events.NewPublisherWithWriter(zap.NewNop(), "zoiko.obligations.events", w, nil)
+
+	stored := []byte(`{"event_id":"evt-stored","event_type":"obligation.updated","payload":{"obligation_id":"o-1"}}`)
+	require.NoError(t, p.PublishEnvelope(context.Background(), "o-1", stored))
+
+	require.Len(t, w.msgs, 1)
+	assert.Equal(t, []byte("o-1"), w.msgs[0].Key)
+	assert.Equal(t, stored, w.msgs[0].Value)
+}

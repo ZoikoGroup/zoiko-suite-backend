@@ -26,6 +26,11 @@ const tenantIDKey contextKey = "tenantID"
 // header-less caller besides pooled into the fabricated "default" bucket.
 func TenantContextMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/healthz", "/readyz", "/health":
+			next.ServeHTTP(w, r)
+			return
+		}
 		tenantID := r.Header.Get("X-Tenant-Id")
 		if tenantID == "" {
 			w.Header().Set("Content-Type", "application/json")

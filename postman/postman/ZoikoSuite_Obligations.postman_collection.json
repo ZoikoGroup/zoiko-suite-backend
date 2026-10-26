@@ -1,0 +1,151 @@
+{
+  "info": {
+    "_postman_id": "zoiko-obligations",
+    "name": "ZoikoSuite - Obligations",
+    "description": "obligations-svc (port 8088, Doc 03 §8.5). Send identity-context-svc's envelope as the bearer token ({{identityEnvelope}}, from POST /v1/context/resolve); in warn mode X-Principal-Id alone is still admitted. The collection pre-request script adds X-Tenant-Id, X-Principal-Id, X-Correlation-ID, X-Request-Id, X-Source-Channel and, on writes, a fresh Idempotency-Key and X-Legal-Entity-Id. Errors are RFC 9457 application/problem+json with error_class. Run the folders in order: each Create stores the id the later requests use.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [{"key": "token", "value": "{{identityEnvelope}}", "type": "string"}]
+  },
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "const v = (k) => pm.variables.get(k);",
+          "pm.request.headers.upsert({key: 'X-Tenant-Id', value: v('tenantId')});",
+          "pm.request.headers.upsert({key: 'X-Principal-Id', value: v('principalId')});",
+          "pm.request.headers.upsert({key: 'X-Correlation-ID', value: v('correlationId')});",
+          "pm.request.headers.upsert({key: 'X-Request-Id', value: 'req_' + Date.now() + Math.floor(Math.random()*1e6)});",
+          "pm.request.headers.upsert({key: 'X-Source-Channel', value: 'api'});",
+          "if (pm.request.method !== 'GET') {",
+          "  if (!pm.request.headers.has('Idempotency-Key')) { pm.request.headers.upsert({key: 'Idempotency-Key', value: pm.variables.replaceIn('{{$guid}}')}); }",
+          "  pm.request.headers.upsert({key: 'X-Legal-Entity-Id', value: v('legalEntityId')});",
+          "  pm.request.headers.upsert({key: 'Content-Type', value: 'application/json'});",
+          "}"
+        ]
+      }
+    }
+  ],
+  "variable": [
+    {"key": "baseUrl", "value": "http://localhost:8088"},
+    {"key": "identityEnvelope", "value": ""},
+    {"key": "tenantId", "value": "11111111-1111-1111-1111-111111111111"},
+    {"key": "principalId", "value": "demo-compliance-officer-01"},
+    {"key": "legalEntityId", "value": "22222222-2222-2222-2222-222222222222"},
+    {"key": "jurisdictionId", "value": "33333333-3333-3333-3333-333333333333"},
+    {"key": "correlationId", "value": "obligations-demo-01"},
+    {"key": "obligationId", "value": ""},
+    {"key": "obligationVersion", "value": "1"},
+    {"key": "filingRequirementId", "value": ""},
+    {"key": "definitionId", "value": ""},
+    {"key": "mappingId", "value": ""}
+  ],
+  "item": [
+    {
+      "name": "01 - Probes",
+      "item": [
+        {"name": "Liveness /healthz", "request": {"auth": {"type": "noauth"}, "method": "GET", "url": "{{baseUrl}}/healthz"}},
+        {"name": "Readiness /readyz", "request": {"auth": {"type": "noauth"}, "method": "GET", "url": "{{baseUrl}}/readyz"}}
+      ]
+    },
+    {
+      "name": "02 - Definitions and entity mappings",
+      "item": [
+        {
+          "name": "Create definition",
+          "event": [{"listen": "test", "script": {"type": "text/javascript", "exec": ["pm.test('201 or 200', () => pm.expect([200, 201]).to.include(pm.response.code));", "pm.collectionVariables.set('definitionId', pm.response.json().obligation_definition_id);"]}}],
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/obligation-definitions",
+            "body": {"mode": "raw", "raw": "{\n  \"definition_code\": \"GSTR-3B-MONTHLY\",\n  \"jurisdiction_id\": \"{{jurisdictionId}}\",\n  \"obligation_type\": \"FILING\",\n  \"obligation_source_type\": \"JURISDICTION_RULE\",\n  \"obligation_source_id\": \"IN-GST-RULE-07\",\n  \"source_reference\": \"IN-GST-FILING-RULE-07\",\n  \"severity_level\": \"HIGH\",\n  \"responsible_function\": \"Tax\",\n  \"description\": \"Monthly GSTR-3B return\"\n}"}
+          }
+        },
+        {"name": "Get definition", "request": {"method": "GET", "url": "{{baseUrl}}/v1/obligation-definitions/{{definitionId}}"}},
+        {
+          "name": "Map definition to legal entity",
+          "event": [{"listen": "test", "script": {"type": "text/javascript", "exec": ["pm.test('201', () => pm.response.to.have.status(201));", "pm.collectionVariables.set('mappingId', pm.response.json().mapping_id);"]}}],
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/obligation-definitions/{{definitionId}}/entity-mappings",
+            "body": {"mode": "raw", "raw": "{\n  \"legal_entity_id\": \"{{legalEntityId}}\",\n  \"effective_from\": \"2026-01-01T00:00:00Z\"\n}"}
+          }
+        },
+        {
+          "name": "New definition version (If-Match)",
+          "request": {
+            "method": "POST",
+            "header": [{"key": "If-Match", "value": "\"1\""}],
+            "url": "{{baseUrl}}/v1/obligation-definitions/{{definitionId}}/versions",
+            "body": {"mode": "raw", "raw": "{\n  \"jurisdiction_id\": \"{{jurisdictionId}}\",\n  \"obligation_type\": \"FILING\",\n  \"obligation_source_type\": \"JURISDICTION_RULE\",\n  \"obligation_source_id\": \"IN-GST-RULE-07\",\n  \"source_reference\": \"IN-GST-FILING-RULE-07\",\n  \"severity_level\": \"CRITICAL\",\n  \"responsible_function\": \"Tax\",\n  \"change_reason\": \"Penalty regime tightened\"\n}"}
+          }
+        },
+        {"name": "List definition versions", "request": {"method": "GET", "url": "{{baseUrl}}/v1/obligation-definitions/{{definitionId}}/versions"}}
+      ]
+    },
+    {
+      "name": "03 - Obligations",
+      "item": [
+        {
+          "name": "Raise obligation from definition",
+          "event": [{"listen": "test", "script": {"type": "text/javascript", "exec": ["pm.test('201 with Location', () => { pm.response.to.have.status(201); pm.expect(pm.response.headers.get('Location')).to.include('/v1/obligations/'); });", "const o = pm.response.json(); pm.collectionVariables.set('obligationId', o.obligation_id); pm.collectionVariables.set('obligationVersion', String(o.version));"]}}],
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/obligations",
+            "body": {"mode": "raw", "raw": "{\n  \"obligation_definition_id\": \"{{definitionId}}\",\n  \"legal_entity_id\": \"{{legalEntityId}}\",\n  \"obligation_code\": \"GSTR-3B-2026-10\",\n  \"due_date\": \"2026-11-20T18:29:59Z\",\n  \"created_by_principal_id\": \"{{principalId}}\"\n}"}
+          }
+        },
+        {"name": "Get obligation", "request": {"method": "GET", "url": "{{baseUrl}}/v1/obligations/{{obligationId}}"}},
+        {"name": "List obligations (cursor)", "request": {"method": "GET", "url": "{{baseUrl}}/v1/obligations?legal_entity_id={{legalEntityId}}&limit=50"}},
+        {
+          "name": "Update attributes (If-Match)",
+          "request": {
+            "method": "PATCH",
+            "header": [{"key": "If-Match", "value": "\"{{obligationVersion}}\""}],
+            "url": "{{baseUrl}}/v1/obligations/{{obligationId}}",
+            "body": {"mode": "raw", "raw": "{\n  \"responsible_function\": \"Indirect Tax\"\n}"}
+          }
+        },
+        {
+          "name": "Status → IN_PROGRESS",
+          "request": {"method": "POST", "url": "{{baseUrl}}/v1/obligations/{{obligationId}}/status", "body": {"mode": "raw", "raw": "{\n  \"obligation_status\": \"IN_PROGRESS\"\n}"}}
+        },
+        {
+          "name": "Status with an unknown value → 400",
+          "event": [{"listen": "test", "script": {"type": "text/javascript", "exec": ["pm.test('400 problem', () => { pm.response.to.have.status(400); pm.expect(pm.response.headers.get('Content-Type')).to.include('application/problem+json'); });"]}}],
+          "request": {"method": "POST", "url": "{{baseUrl}}/v1/obligations/{{obligationId}}/status", "body": {"mode": "raw", "raw": "{\n  \"obligation_status\": \"FOO\"\n}"}}
+        }
+      ]
+    },
+    {
+      "name": "04 - Filing requirements",
+      "item": [
+        {
+          "name": "Create filing requirement",
+          "event": [{"listen": "test", "script": {"type": "text/javascript", "exec": ["pm.collectionVariables.set('filingRequirementId', pm.response.json().filing_requirement_id);"]}}],
+          "request": {"method": "POST", "url": "{{baseUrl}}/v1/obligations/{{obligationId}}/filing-requirements", "body": {"mode": "raw", "raw": "{\n  \"filing_type\": \"GSTR-3B\",\n  \"filing_authority\": \"GSTN\",\n  \"submission_channel\": \"PORTAL\"\n}"}}
+        },
+        {"name": "Filing → SUBMITTED", "request": {"method": "POST", "url": "{{baseUrl}}/v1/obligations/{{obligationId}}/filing-requirements/{{filingRequirementId}}/status", "body": {"mode": "raw", "raw": "{\n  \"filing_status\": \"SUBMITTED\"\n}"}}},
+        {"name": "Filing history", "request": {"method": "GET", "url": "{{baseUrl}}/v1/obligations/{{obligationId}}/filing-requirements/{{filingRequirementId}}/transitions"}}
+      ]
+    },
+    {
+      "name": "05 - Applicability",
+      "item": [
+        {
+          "name": "Record applicability decision (idempotent)",
+          "request": {
+            "method": "POST",
+            "header": [{"key": "Idempotency-Key", "value": "applicability-demo-01"}],
+            "url": "{{baseUrl}}/v1/obligations/{{obligationId}}/applicability-decisions",
+            "body": {"mode": "raw", "raw": "{\n  \"jurisdiction_code\": \"IN-KA\",\n  \"entity_ref\": \"{{legalEntityId}}\",\n  \"decision\": \"APPLICABLE\",\n  \"source_rule_ref\": \"IN-GST-FILING-RULE-07\",\n  \"source_rule_version\": \"v3\",\n  \"effective_from\": \"2026-01-01T00:00:00Z\",\n  \"decided_by_system\": \"rule-engine\",\n  \"created_by_principal_id\": \"{{principalId}}\"\n}"}
+          }
+        },
+        {"name": "Current applicability", "request": {"method": "GET", "url": "{{baseUrl}}/v1/obligations/{{obligationId}}/applicability?jurisdiction_code=IN-KA&entity_ref={{legalEntityId}}"}}
+      ]
+    }
+  ]
+}

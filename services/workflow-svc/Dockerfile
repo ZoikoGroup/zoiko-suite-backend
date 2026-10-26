@@ -1,4 +1,15 @@
 # ─── Stage 1: builder ─────────────────────────────────────────────────────────
+# BUILT FROM THE REPOSITORY ROOT:
+#
+#   docker build -f services/workflow-svc/Dockerfile .
+#
+# go.mod replaces zoiko.io/identity-envelope with the sibling module
+# ../identity-envelope, so the build must see both. With the service folder as
+# the context (as before 21 Oct 2026) that path does not exist and the build
+# fails "replacement directory ../identity-envelope does not exist".
+# Dockerfile.dockerignore keeps the root context to the two modules this image
+# is built from.
+#
 # Use the exact Go toolchain version from go.mod (go 1.25).
 # The builder image produces a statically-linked binary so it runs on distroless.
 FROM golang:1.25-alpine AS builder
@@ -7,15 +18,17 @@ FROM golang:1.25-alpine AS builder
 # ca-certificates is needed for HTTPS module downloads.
 RUN apk add --no-cache git ca-certificates
 
-WORKDIR /build
+# The same relative layout as the repository, so the replace path resolves.
+WORKDIR /src/services/workflow-svc
 
 # Copy dependency manifests first to leverage Docker layer caching:
 # if go.mod / go.sum are unchanged the module download layer is reused.
-COPY go.mod go.sum ./
+COPY services/workflow-svc/go.mod services/workflow-svc/go.sum ./
+COPY services/identity-envelope/ /src/services/identity-envelope/
 RUN go mod download
 
 # Copy the rest of the source.
-COPY . .
+COPY services/workflow-svc/ ./
 
 # Build a statically-linked binary.
 # CGO_ENABLED=0     — pure Go; no libc dependency, runs on distroless/static.

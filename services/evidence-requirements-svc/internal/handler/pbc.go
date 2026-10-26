@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 
 	"zoiko.io/evidence-requirements-svc/internal/domain"
+	svcenvelope "zoiko.io/evidence-requirements-svc/internal/envelope"
 )
 
 // Action types checked against authorization-svc for PBC request actions.
@@ -26,6 +27,7 @@ const (
 type PBCStore interface {
 	CreateEvidenceRequest(ctx context.Context, requestID string, p domain.CreateEvidenceRequestParams) (*domain.EvidenceRequest, bool, error)
 	GetEvidenceRequest(ctx context.Context, tenantID, requestID string) (*domain.EvidenceRequest, error)
+	GetResponseRequest(ctx context.Context, tenantID, responseID string) (*domain.EvidenceRequest, error)
 	ListOpenEvidenceRequests(ctx context.Context, tenantID, legalEntityID string) ([]*domain.EvidenceRequest, error)
 	SendEvidenceRequest(ctx context.Context, p domain.SendEvidenceRequestParams) (*domain.EvidenceRequest, error)
 	ReassignEvidenceRequest(ctx context.Context, p domain.ReassignEvidenceRequestParams) (*domain.EvidenceRequest, error)
@@ -96,12 +98,33 @@ func (h *pbcHandler) CreateRequest(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "missing_field", "title, assigned_to_principal_id, and correlation_id are required")
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionCreateEvidenceRequest); err != nil {
+	// The envelope is the authoritative legal-entity scope on material
+	// writes. A body value may fill an absent header, but a disagreement is
+	// rejected rather than silently choosing one (same rule Evaluate uses).
+	env, _ := svcenvelope.FromContext(r.Context())
+	legalEntityID := req.LegalEntityID
+	if env.LegalEntityID != "" {
+		if legalEntityID != "" && legalEntityID != env.LegalEntityID {
+			writeError(w, http.StatusBadRequest, "legal_entity_mismatch",
+				"body legal_entity_id does not match envelope X-Legal-Entity-Id")
+			return
+		}
+		legalEntityID = env.LegalEntityID
+	}
+	if legalEntityID == "" {
+		writeError(w, http.StatusBadRequest, "missing_field", "legal_entity_id")
+		return
+	}
+	if !isUUID(legalEntityID) {
+		writeError(w, http.StatusBadRequest, "invalid_field", "legal_entity_id must be a UUID")
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionCreateEvidenceRequest); err != nil {
 		h.writeAuthzErr(w, err)
 		return
 	}
 	request, created, err := h.store.CreateEvidenceRequest(r.Context(), uuid.NewString(), domain.CreateEvidenceRequestParams{
-		TenantID: tenantID, LegalEntityID: req.LegalEntityID, RequirementID: req.RequirementID, Title: req.Title,
+		TenantID: tenantID, LegalEntityID: legalEntityID, RequirementID: req.RequirementID, Title: req.Title,
 		Description: req.Description, AssignedToPrincipalID: req.AssignedToPrincipalID, DueAt: req.DueAt,
 		CreatedByPrincipalID: principalID, CorrelationID: req.CorrelationID,
 	})
@@ -141,6 +164,10 @@ func (h *pbcHandler) ListOpenRequests(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	legalEntityID := r.URL.Query().Get("legal_entity_id")
+	if legalEntityID != "" && !isUUID(legalEntityID) {
+		writeError(w, http.StatusBadRequest, "invalid_field", "legal_entity_id must be a UUID")
+		return
+	}
 	reqs, err := h.store.ListOpenEvidenceRequests(r.Context(), tenantID, legalEntityID)
 	if err != nil {
 		h.writePBCErr(w, err)
@@ -285,7 +312,17 @@ func (h *pbcHandler) SubmitResponse(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), principalID, tenantID, actionSubmitEvidenceResponse); err != nil {
+	requestID := chi.URLParam(r, "request_id")
+	// Authorize against the request's own legal entity, not the tenant id.
+	// A tenant id is a valid UUID, so the old call did not fail �?" it just
+	// checked the wrong scope and passed any tenant-wide grant, including
+	// one that does not cover the entity the request belongs to.
+	evReq, err := h.store.GetEvidenceRequest(r.Context(), tenantID, requestID)
+	if err != nil {
+		h.writePBCErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, evReq.LegalEntityID, actionSubmitEvidenceResponse); err != nil {
 		h.writeAuthzErr(w, err)
 		return
 	}
@@ -294,13 +331,7 @@ func (h *pbcHandler) SubmitResponse(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "missing_field", "correlation_id")
 		return
 	}
-	requestID := chi.URLParam(r, "request_id")
 	if req.ArtifactDocumentID != nil {
-		evReq, err := h.store.GetEvidenceRequest(r.Context(), tenantID, requestID)
-		if err != nil {
-			h.writePBCErr(w, err)
-			return
-		}
 		if err := h.docs.VerifyDocument(r.Context(), tenantID, evReq.LegalEntityID, *req.ArtifactDocumentID, principalID); err != nil {
 			h.writeDocumentErr(w, err)
 			return
@@ -334,7 +365,23 @@ func (h *pbcHandler) RecordScanResult(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if _, ok := h.requirePrincipal(w, r); !ok {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	responseID := chi.URLParam(r, "response_id")
+	// A scan result is what unlocks MarkSatisfied, so it cannot be a
+	// self-service toggle for any principal in the tenant. Until a
+	// dedicated scanner identity/action exists, require the same
+	// management grant that governs the request (recorded in the authz
+	// decision log).
+	evReq, err := h.store.GetResponseRequest(r.Context(), tenantID, responseID)
+	if err != nil {
+		h.writePBCErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, evReq.LegalEntityID, actionManageEvidenceRequest); err != nil {
+		h.writeAuthzErr(w, err)
 		return
 	}
 	var req scanResultRequest
@@ -345,7 +392,7 @@ func (h *pbcHandler) RecordScanResult(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_field", "result must be CLEAN or QUARANTINED")
 		return
 	}
-	updated, err := h.store.RecordScanResult(r.Context(), domain.ScanResultParams{ResponseID: chi.URLParam(r, "response_id"), TenantID: tenantID, Result: req.Result})
+	updated, err := h.store.RecordScanResult(r.Context(), domain.ScanResultParams{ResponseID: responseID, TenantID: tenantID, Result: req.Result})
 	if err != nil {
 		h.writePBCErr(w, err)
 		return
@@ -448,11 +495,19 @@ func (h *pbcHandler) MarkSatisfied(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), principalID, tenantID, actionEvaluateEvidenceRequest); err != nil {
+	requestID := chi.URLParam(r, "request_id")
+	evReq, err := h.store.GetEvidenceRequest(r.Context(), tenantID, requestID)
+	if err != nil {
+		h.writePBCErr(w, err)
+		return
+	}
+	// Scope the check to the request's legal entity, not the tenant id: the
+	// latter is also a UUID and silently authorized the wrong scope.
+	if err := h.authz.CheckAllowed(r.Context(), principalID, evReq.LegalEntityID, actionEvaluateEvidenceRequest); err != nil {
 		h.writeAuthzErr(w, err)
 		return
 	}
-	updated, err := h.store.MarkSatisfied(r.Context(), domain.MarkSatisfiedParams{RequestID: chi.URLParam(r, "request_id"), TenantID: tenantID, ActorPrincipalID: principalID})
+	updated, err := h.store.MarkSatisfied(r.Context(), domain.MarkSatisfiedParams{RequestID: requestID, TenantID: tenantID, ActorPrincipalID: principalID})
 	if err != nil {
 		h.writePBCErr(w, err)
 		return
@@ -504,6 +559,10 @@ func (h *pbcHandler) writePBCErr(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusForbidden, "self_evaluation_not_allowed", "")
 	case errors.Is(err, domain.ErrArtifactNotScanned):
 		writeError(w, http.StatusUnprocessableEntity, "artifact_not_scanned", "")
+	case errors.Is(err, domain.ErrIdempotencyMismatch):
+		writeError(w, http.StatusConflict, "idempotency_mismatch", domain.ErrIdempotencyMismatch.Error())
+	case errors.Is(err, domain.ErrInvalidIdentifier):
+		writeError(w, http.StatusBadRequest, "invalid_identifier", domain.ErrInvalidIdentifier.Error())
 	default:
 		h.log.Error("pbc store error")
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")

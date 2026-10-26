@@ -81,7 +81,7 @@ func (h *Handler) CreateTaxRule(w http.ResponseWriter, r *http.Request) {
 		ExemptionsJSON:     req.ExemptionsJSON,
 		EffectiveFrom:      req.EffectiveFrom,
 		EffectiveTo:        req.EffectiveTo,
-		CreatedBy:          req.CreatedBy,
+		CreatedBy:          principalID,
 	}
 
 	if err := h.store.CreateTaxRule(r.Context(), rule); err != nil {
@@ -99,6 +99,9 @@ func (h *Handler) CreateTaxRule(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) GetTaxRule(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
 	id := chi.URLParam(r, "id")
 	rule, err := h.store.GetTaxRule(r.Context(), id)
 	if err != nil {
@@ -114,6 +117,9 @@ func (h *Handler) GetTaxRule(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListTaxRules(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
 	jurisdictionID := r.URL.Query().Get("jurisdiction_id")
 	category := r.URL.Query().Get("category")
 	status := r.URL.Query().Get("status")
@@ -141,6 +147,13 @@ func (h *Handler) UpdateTaxRule(w http.ResponseWriter, r *http.Request) {
 		}
 		h.logger.Error("fetch tax rule for update failed", zap.Error(err), zap.String("rule_id", id))
 		writeError(w, http.StatusInternalServerError, "failed to fetch tax rule")
+		return
+	}
+
+	// In-place edits to ACTIVE or DEPRECATED rules are prohibited (TAX-02 / D2 / S3).
+	// An active rate cannot be mutated in place; changes must be issued as a new rule version or supersession.
+	if existing.Status == domain.StatusActive || existing.Status == domain.StatusDeprecated {
+		writeError(w, http.StatusConflict, "ACTIVE or DEPRECATED tax rules cannot be modified in place")
 		return
 	}
 

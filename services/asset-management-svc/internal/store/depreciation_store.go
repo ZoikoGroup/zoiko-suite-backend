@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -125,19 +126,21 @@ const depreciationRunColumns = `
 	depreciation_expense_account_code, accumulated_depreciation_account_code,
 	status, journal_id, supersedes_run_id, superseded_by_run_id,
 	created_at, created_by_principal_id, frozen_at, validated_at,
-	approved_at, approved_by_principal_id, emitted_at, superseded_at, superseded_by_principal_id`
+	approved_at, approved_by_principal_id, emitted_at, superseded_at, superseded_by_principal_id, ledger_journal_ids`
 
 func scanDepreciationRun(row pgx.Row) (*domain.DepreciationRun, error) {
 	var r domain.DepreciationRun
+	var ids []byte
 	if err := row.Scan(
 		&r.RunID, &r.TenantID, &r.LegalEntityID, &r.FiscalPeriod,
 		&r.DepreciationExpenseAccountCode, &r.AccumulatedDepreciationAccountCode,
 		&r.Status, &r.JournalID, &r.SupersedesRunID, &r.SupersededByRunID,
 		&r.CreatedAt, &r.CreatedByPrincipalID, &r.FrozenAt, &r.ValidatedAt,
-		&r.ApprovedAt, &r.ApprovedByPrincipalID, &r.EmittedAt, &r.SupersededAt, &r.SupersededByPrincipalID,
+		&r.ApprovedAt, &r.ApprovedByPrincipalID, &r.EmittedAt, &r.SupersededAt, &r.SupersededByPrincipalID, &ids,
 	); err != nil {
 		return nil, err
 	}
+	_ = json.Unmarshal(ids, &r.LedgerJournalIDs)
 	return &r, nil
 }
 

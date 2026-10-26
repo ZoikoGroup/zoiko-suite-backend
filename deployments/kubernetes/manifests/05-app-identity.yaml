@@ -87,6 +87,11 @@ spec:
           value: "/keys/envelope_signing_key.pem"
         - name: JWT_KEY_ID
           value: "local-dev-key-1"
+        # Local cluster: the console still logs in through /v1/authenticate.
+        # The default is "internal" (mTLS tooling only); "open" is refused in
+        # staging and production.
+        - name: AUTHENTICATE_ENDPOINT
+          value: "open"
         - name: TENANT_REGISTRY_URL
           value: "http://tenant-svc.zoiko-identity.svc.cluster.local:8081"
         - name: DELEGATED_AUTHORITY_URL

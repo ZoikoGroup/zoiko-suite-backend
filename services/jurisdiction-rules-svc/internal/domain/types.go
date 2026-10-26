@@ -145,16 +145,16 @@ type DriftEvent struct {
 // RuleStatusHistory represents one entry in the bitemporal status history
 // (known_from/known_to tracks when the platform became aware of the status).
 type RuleStatusHistory struct {
-	HistoryID              string     `json:"history_id"`
-	JurisdictionRuleID     string     `json:"jurisdiction_rule_id"`
-	RuleStatus             string     `json:"rule_status"`
-	EffectiveFrom          time.Time  `json:"effective_from"`
-	EffectiveTo            *time.Time `json:"effective_to"`
-	KnownFrom              time.Time  `json:"known_from"`
-	KnownTo                *time.Time `json:"known_to"`
-	ChangedByPrincipalID   string     `json:"changed_by_principal_id"`
-	ChangeReason           *string    `json:"change_reason"`
-	SchemaVersion          string     `json:"schema_version"`
+	HistoryID            string     `json:"history_id"`
+	JurisdictionRuleID   string     `json:"jurisdiction_rule_id"`
+	RuleStatus           string     `json:"rule_status"`
+	EffectiveFrom        time.Time  `json:"effective_from"`
+	EffectiveTo          *time.Time `json:"effective_to"`
+	KnownFrom            time.Time  `json:"known_from"`
+	KnownTo              *time.Time `json:"known_to"`
+	ChangedByPrincipalID string     `json:"changed_by_principal_id"`
+	ChangeReason         *string    `json:"change_reason"`
+	SchemaVersion        string     `json:"schema_version"`
 }
 
 // RecordDriftParams holds input parameters for recording a drift transition.
@@ -273,24 +273,24 @@ type CreateJurisdictionParams struct {
 
 // CreateRuleParams holds input parameters for creating a rule.
 type CreateRuleParams struct {
-	JurisdictionRuleID      string     `json:"jurisdiction_rule_id"`
-	JurisdictionID          string     `json:"jurisdiction_id"`
-	RuleDomain              string     `json:"rule_domain"`
-	RuleCode                string     `json:"rule_code"`
-	RuleName                string     `json:"rule_name"`
-	EffectiveFrom           time.Time  `json:"effective_from"`
-	EffectiveTo             *time.Time `json:"effective_to"`
-	RulePayload             []byte     `json:"rule_payload"`
-	SourceReference         *string    `json:"source_reference"`
-	ExternalFeedReference   *string    `json:"external_feed_reference"`
-	RuleStatus              string     `json:"rule_status"`
-	RuleVersion             int        `json:"rule_version"`
-	SupersedesRuleID        *string    `json:"supersedes_rule_id"`
-	PrecedenceLevel         int        `json:"precedence_level"`
-	LegalDriftState         string     `json:"legal_drift_state"`
-	DataClassification      string     `json:"data_classification"`
-	CreatedByPrincipalID    string     `json:"created_by_principal_id"`
-	SchemaVersion           string     `json:"schema_version"`
+	JurisdictionRuleID    string     `json:"jurisdiction_rule_id"`
+	JurisdictionID        string     `json:"jurisdiction_id"`
+	RuleDomain            string     `json:"rule_domain"`
+	RuleCode              string     `json:"rule_code"`
+	RuleName              string     `json:"rule_name"`
+	EffectiveFrom         time.Time  `json:"effective_from"`
+	EffectiveTo           *time.Time `json:"effective_to"`
+	RulePayload           []byte     `json:"rule_payload"`
+	SourceReference       *string    `json:"source_reference"`
+	ExternalFeedReference *string    `json:"external_feed_reference"`
+	RuleStatus            string     `json:"rule_status"`
+	RuleVersion           int        `json:"rule_version"`
+	SupersedesRuleID      *string    `json:"supersedes_rule_id"`
+	PrecedenceLevel       int        `json:"precedence_level"`
+	LegalDriftState       string     `json:"legal_drift_state"`
+	DataClassification    string     `json:"data_classification"`
+	CreatedByPrincipalID  string     `json:"created_by_principal_id"`
+	SchemaVersion         string     `json:"schema_version"`
 }
 
 // ErrJurisdictionNotFound is returned when the jurisdiction_id does not exist

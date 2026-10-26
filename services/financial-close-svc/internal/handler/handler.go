@@ -20,6 +20,7 @@ import (
 
 	"zoiko.io/financial-close-svc/internal/clients"
 	"zoiko.io/financial-close-svc/internal/domain"
+	"zoiko.io/financial-close-svc/internal/evidencereq"
 	svcmiddleware "zoiko.io/financial-close-svc/internal/middleware"
 )
 
@@ -166,6 +167,13 @@ type Store interface {
 
 type AuthZClient interface {
 	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
+}
+
+// EvidenceChecker is the evidence-requirements contract the handler depends
+// on. A nil checker leaves the gate unwired (tests); production always wires
+// it in main.
+type EvidenceChecker interface {
+	EvaluateSufficient(ctx context.Context, tenantID, legalEntityID, domainCode, actionType, correlationID, principalID string, evidenceRefs []string) error
 }
 
 type Clients interface {
@@ -348,9 +356,10 @@ const (
 )
 
 type Handler struct {
-	store   Store
-	authz   AuthZClient
-	clients Clients
+	store    Store
+	authz    AuthZClient
+	clients  Clients
+	evidence EvidenceChecker
 	// signingKey is the HMAC secret for close evidence. See signEvidence.
 	signingKey []byte
 	log        *zap.Logger
@@ -371,9 +380,30 @@ type Handler struct {
 
 	// REF-05 cutover phase 1 (see period_mirror.go). All nil/empty by default,
 	// which means: no mirroring, and the workflow-ref endpoint refuses everyone.
+	// The accounting kernel (general-ledger-svc): its close evidence as a readiness input and its period seal. Both are off unless
+	// SetKernelClose turns them on, and a nil kernel never consults anything.
+	kernel             KernelClose
+	kernelGate         bool
+	kernelSeal         bool
+	kernelRequire      []string
 	mirror             PeriodMirror
 	workflowRefs       WorkflowRefReader
 	workflowRefCallers map[string]struct{}
+}
+
+// KernelClose is what the period close asks of the accounting kernel.
+type KernelClose interface {
+	GetKernelCloseEvidence(ctx context.Context, tenantID, principalID, legalEntityID, fiscalPeriod string, require []string) (*domain.KernelCloseEvidence, error)
+	ApplyKernelPeriodSeal(ctx context.Context, tenantID, principalID, legalEntityID, fiscalPeriod, action, authorityRef, reason string) (changed bool, err error)
+}
+
+// SetKernelClose wires the accounting kernel into the close. gate makes the kernel's close evidence a readiness input (open
+// reconciliation cases, failed postings, unrevalued foreign items and journals in the review queue then block a close); seal makes
+// a close seal the period in the kernel, so no posting can reach the period after its watermark, and a reopen lift the seal under
+// the reopen's own authority. require names the reconciliations that must have been run. Both default to off.
+func (h *Handler) SetKernelClose(k KernelClose, gate, seal bool, require []string) *Handler {
+	h.kernel, h.kernelGate, h.kernelSeal, h.kernelRequire = k, gate, seal, require
+	return h
 }
 
 // SetCloseGateEnforced turns the financial-control-svc close-gate dependency
@@ -413,6 +443,44 @@ func New(store Store, authz AuthZClient, clients Clients, signingKey []byte, log
 		log:                 log,
 		bankReconCutoffDays: defaultBankReconCutoffDays,
 	}
+}
+
+// WithEvidenceGate wires the evidence-requirements gate into period close.
+// Without it the gate is not consulted.
+func (h *Handler) WithEvidenceGate(c EvidenceChecker) *Handler {
+	h.evidence = c
+	return h
+}
+
+// checkEvidence refuses a close when required evidence is missing or the
+// evidence service cannot answer.
+func (h *Handler) checkEvidence(w http.ResponseWriter, r *http.Request, tenantID, legalEntityID, principalID, actionType string) bool {
+	if h.evidence == nil {
+		return true
+	}
+	refs := evidenceRefsFromHeader(r.Header.Get("X-Evidence-Refs"))
+	err := h.evidence.EvaluateSufficient(r.Context(), tenantID, legalEntityID,
+		"FINANCE", actionType, r.Header.Get("X-Correlation-ID"), principalID, refs)
+	switch {
+	case err == nil:
+		return true
+	case errors.Is(err, evidencereq.ErrEvidenceMissing):
+		writeError(w, http.StatusUnprocessableEntity, "evidence_missing", "required evidence is missing")
+	default:
+		h.log.Error("evidence gate unavailable — failing closed", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "evidence_service_unavailable", "")
+	}
+	return false
+}
+
+func evidenceRefsFromHeader(raw string) []string {
+	var refs []string
+	for _, ref := range strings.Split(raw, ",") {
+		if ref = strings.TrimSpace(ref); ref != "" {
+			refs = append(refs, ref)
+		}
+	}
+	return refs
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
@@ -936,6 +1004,7 @@ func (h *Handler) closeWithEvidence(w http.ResponseWriter, r *http.Request, mode
 	if correlationID == "" {
 		correlationID = uuid.NewString()
 	}
+	r.Header.Set("X-Correlation-ID", correlationID)
 
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
@@ -955,6 +1024,14 @@ func (h *Handler) closeWithEvidence(w http.ResponseWriter, r *http.Request, mode
 
 	if err := h.authz.CheckAllowed(r.Context(), principalID, fp.LegalEntityID, actionCloseApprove); err != nil {
 		h.writeAuthzErr(w, err)
+		return
+	}
+
+	evidenceAction := "PERIOD_LOCK"
+	if mode.reperform {
+		evidenceAction = "PERIOD_RECLOSE"
+	}
+	if !h.checkEvidence(w, r, tenantID, fp.LegalEntityID, principalID, evidenceAction) {
 		return
 	}
 
@@ -988,6 +1065,34 @@ func (h *Handler) closeWithEvidence(w http.ResponseWriter, r *http.Request, mode
 		})
 		return
 	}
+
+	// Seal the period in the accounting kernel before anything is compiled from it: from here no posting can reach the period, so the
+	// trial balance taken next is of a ledger that can no longer move under it. A seal that cannot be taken stops the close (fail
+	// closed). If a later step fails, the seal this request took is lifted again, under an authority that says why.
+	sealedHere, closed := false, false
+	if h.kernel != nil && h.kernelSeal {
+		action := "SEAL"
+		if mode.reperform {
+			action = "RESEAL"
+		}
+		changed, err := h.kernel.ApplyKernelPeriodSeal(r.Context(), tenantID, principalID, fp.LegalEntityID, fp.PeriodName, action, "", "")
+		if err != nil {
+			h.log.Error("failed to seal the period in the accounting kernel", zap.String("period_id", id), zap.Error(err))
+			writeError(w, http.StatusServiceUnavailable, "close_failed", "cannot seal the period in the accounting kernel: "+err.Error())
+			return
+		}
+		sealedHere = changed
+	}
+	defer func() {
+		if sealedHere && !closed {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if _, err := h.kernel.ApplyKernelPeriodSeal(ctx, tenantID, principalID, fp.LegalEntityID, fp.PeriodName, "REOPEN", "close-aborted:"+correlationID, "the close did not complete"); err != nil {
+				h.log.Error("the close failed and the kernel seal it took could not be lifted: the period is sealed in the kernel but not closed here",
+					zap.String("period_id", id), zap.Error(err))
+			}
+		}
+	}()
 
 	// Step 2: Compile Trial Balance & Generate Evidence (FAIL CLOSED on error)
 	balances, err := h.clients.CompileTrialBalance(r.Context(), tenantID, fp.LegalEntityID, fp.PeriodName, principalID)
@@ -1048,6 +1153,7 @@ func (h *Handler) closeWithEvidence(w http.ResponseWriter, r *http.Request, mode
 			// timeout on a close call that actually completed server-side) —
 			// return the current closed state rather than misreporting this
 			// as a store outage.
+			closed = true
 			writeJSON(w, http.StatusOK, domain.PeriodLockResponse{
 				FiscalPeriodID:     current.FiscalPeriodID,
 				PeriodName:         current.PeriodName,
@@ -1061,6 +1167,7 @@ func (h *Handler) closeWithEvidence(w http.ResponseWriter, r *http.Request, mode
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
+	closed = true // the period is closed here now, so the kernel seal stays
 
 	// Insert close evidence.
 	//
@@ -1434,7 +1541,7 @@ func requireCurrencyCode(w http.ResponseWriter, code string) bool {
 // period_end when fp is known, else the last day of a YYYY-MM name. A period
 // that is neither is refused, never guessed. A record written before
 // migration 000022 has no currency and cannot post until one is set.
-func glJournalMeta(fp *domain.FiscalPeriod, fiscalPeriod, currencyCode, journalType string) (domain.GLJournalMeta, error) {
+func glJournalMeta(fp *domain.FiscalPeriod, fiscalPeriod, currencyCode, journalType, journalPurpose string) (domain.GLJournalMeta, error) {
 	if currencyCode == "" {
 		return domain.GLJournalMeta{}, domain.ErrCurrencyCodeMissing
 	}
@@ -1449,7 +1556,7 @@ func glJournalMeta(fp *domain.FiscalPeriod, fiscalPeriod, currencyCode, journalT
 		}
 		end = start.AddDate(0, 1, -1)
 	}
-	return domain.GLJournalMeta{JournalType: journalType, TransactionDate: end, PostingDate: end, CurrencyCode: currencyCode}, nil
+	return domain.GLJournalMeta{JournalType: journalType, JournalPurpose: journalPurpose, TransactionDate: end, PostingDate: end, CurrencyCode: currencyCode}, nil
 }
 
 // closeJournalMeta is glJournalMeta plus the ACC-14 context for one of the
@@ -1461,8 +1568,8 @@ func glJournalMeta(fp *domain.FiscalPeriod, fiscalPeriod, currencyCode, journalT
 // and its own GL_CLOSE_REVIEW_POSTING authorization check. A hard-closed
 // period never reaches this helper: CloseJournalsAllowed has already refused
 // it in the calling handler.
-func closeJournalMeta(fp *domain.FiscalPeriod, fiscalPeriod, currencyCode, journalType, designation string) (domain.GLJournalMeta, error) {
-	meta, err := glJournalMeta(fp, fiscalPeriod, currencyCode, journalType)
+func closeJournalMeta(fp *domain.FiscalPeriod, fiscalPeriod, currencyCode, journalType, journalPurpose, designation string) (domain.GLJournalMeta, error) {
+	meta, err := glJournalMeta(fp, fiscalPeriod, currencyCode, journalType, journalPurpose)
 	if err != nil {
 		return meta, err
 	}
@@ -1477,7 +1584,7 @@ func closeJournalMeta(fp *domain.FiscalPeriod, fiscalPeriod, currencyCode, journ
 
 // loadGLJournalMeta is glJournalMeta for a path that has not already read
 // the period from the register.
-func (h *Handler) loadGLJournalMeta(ctx context.Context, legalEntityID, fiscalPeriod, currencyCode, journalType string) (domain.GLJournalMeta, error) {
+func (h *Handler) loadGLJournalMeta(ctx context.Context, legalEntityID, fiscalPeriod, currencyCode, journalType, journalPurpose string) (domain.GLJournalMeta, error) {
 	if currencyCode == "" {
 		return domain.GLJournalMeta{}, domain.ErrCurrencyCodeMissing
 	}
@@ -1485,7 +1592,7 @@ func (h *Handler) loadGLJournalMeta(ctx context.Context, legalEntityID, fiscalPe
 	if err != nil && !errors.Is(err, domain.ErrFiscalPeriodNotFound) {
 		return domain.GLJournalMeta{}, err
 	}
-	return glJournalMeta(fp, fiscalPeriod, currencyCode, journalType)
+	return glJournalMeta(fp, fiscalPeriod, currencyCode, journalType, journalPurpose)
 }
 
 // writeJournalMetaErr renders a glJournalMeta refusal. Both are the record's
@@ -1851,7 +1958,7 @@ func (h *Handler) RunAccrualRecognition(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	meta, err := closeJournalMeta(fp, req.FiscalPeriod, sch.CurrencyCode, domain.GLJournalTypeAccrual,
-		domain.GLCloseJournalAccrualRecognition)
+		domain.GLJournalPurposeAccrual, domain.GLCloseJournalAccrualRecognition)
 	if err != nil {
 		h.writeJournalMetaErr(w, err)
 		return
@@ -2346,7 +2453,7 @@ func (h *Handler) RunPrepaymentRecognition(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	meta, err := closeJournalMeta(fp, req.FiscalPeriod, sch.CurrencyCode, domain.GLJournalTypeAccrual,
-		domain.GLCloseJournalPrepaymentRecognition)
+		domain.GLJournalPurposePrepayment, domain.GLCloseJournalPrepaymentRecognition)
 	if err != nil {
 		h.writeJournalMetaErr(w, err)
 		return
@@ -2563,7 +2670,7 @@ func (h *Handler) TerminatePrepayment(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			meta, err := closeJournalMeta(fp, req.FiscalPeriod, sch.CurrencyCode, domain.GLJournalTypeAccrual,
-				domain.GLCloseJournalPrepaymentTermination)
+				domain.GLJournalPurposePrepayment, domain.GLCloseJournalPrepaymentTermination)
 			if err != nil {
 				h.writeJournalMetaErr(w, err)
 				return
@@ -2983,7 +3090,7 @@ func (h *Handler) ExecuteAllocation(w http.ResponseWriter, r *http.Request) {
 	}
 	// Resolved before the run is created, so a rule that cannot post never
 	// leaves a CALCULATED run behind.
-	meta, err := h.loadGLJournalMeta(r.Context(), rule.LegalEntityID, req.FiscalPeriod, rule.CurrencyCode, domain.GLJournalTypeReclass)
+	meta, err := h.loadGLJournalMeta(r.Context(), rule.LegalEntityID, req.FiscalPeriod, rule.CurrencyCode, domain.GLJournalTypeReclass, domain.GLJournalPurposeAllocation)
 	if err != nil {
 		h.writeJournalMetaErr(w, err)
 		return
@@ -3097,7 +3204,7 @@ func (h *Handler) ReprocessAllocationRun(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusUnprocessableEntity, "invalid_transition", string(domain.ErrInvalidAllocationRunTransition))
 		return
 	}
-	meta, err := h.loadGLJournalMeta(r.Context(), rule.LegalEntityID, run.FiscalPeriod, rule.CurrencyCode, domain.GLJournalTypeReclass)
+	meta, err := h.loadGLJournalMeta(r.Context(), rule.LegalEntityID, run.FiscalPeriod, rule.CurrencyCode, domain.GLJournalTypeReclass, domain.GLJournalPurposeAllocation)
 	if err != nil {
 		h.writeJournalMetaErr(w, err)
 		return
@@ -3483,7 +3590,7 @@ func (h *Handler) PostRevaluation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	meta, err := h.loadGLJournalMeta(r.Context(), run.LegalEntityID, run.FiscalPeriod, run.CurrencyCode, domain.GLJournalTypeAdjustment)
+	meta, err := h.loadGLJournalMeta(r.Context(), run.LegalEntityID, run.FiscalPeriod, run.CurrencyCode, domain.GLJournalTypeAdjustment, domain.GLJournalPurposeRevaluation)
 	if err != nil {
 		h.writeJournalMetaErr(w, err)
 		return
@@ -3958,7 +4065,7 @@ func (h *Handler) CommitOpeningPosting(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnprocessableEntity, "period_locked", string(domain.ErrMigrationPeriodLocked))
 		return
 	}
-	meta, err := glJournalMeta(fp, batch.FiscalPeriod, batch.CurrencyCode, domain.GLJournalTypeOpening)
+	meta, err := glJournalMeta(fp, batch.FiscalPeriod, batch.CurrencyCode, domain.GLJournalTypeOpening, domain.GLJournalPurposeOpeningBalance)
 	if err != nil {
 		h.writeJournalMetaErr(w, err)
 		return
@@ -5186,6 +5293,20 @@ func (h *Handler) checkReadiness(ctx context.Context, tenantID, principalID stri
 		controlIssues, matched := requiredControlIssues(requiredControls(checklist), runs, fp.PeriodName, notBefore)
 		issues = append(issues, controlIssues...)
 		reliance.SubledgerControls = append(reliance.SubledgerControls, matched...)
+	}
+
+	if h.kernel != nil && h.kernelGate {
+		ev, err := h.kernel.GetKernelCloseEvidence(ctx, tenantID, principalID, fp.LegalEntityID, fp.PeriodName, h.kernelRequire)
+		if err != nil {
+			h.log.Error("failed to read the accounting kernel's close evidence", zap.Error(err))
+			return nil, nil, fmt.Errorf("general-ledger-svc (accounting kernel): %w", err)
+		}
+		for _, issue := range ev.BlockingIssues {
+			issues = append(issues, "accounting_kernel: "+issue)
+		}
+		if !ev.Ready && len(ev.BlockingIssues) == 0 {
+			issues = append(issues, "accounting_kernel: the kernel reports the period is not ready")
+		}
 	}
 
 	if h.enforceCloseGate {

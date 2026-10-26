@@ -63,6 +63,8 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+
+	svcenvelope "zoiko.io/gateway-auth-svc/internal/envelope"
 )
 
 type Severity string
@@ -230,12 +232,47 @@ func (c *Client) deliver(e event) {
 	}
 }
 
+// streamToInternal is the internal implementation that accepts an envelope context
+// for ForwardTo propagation.
+func (c *Client) streamTo(ctx context.Context, tenantID, exporterID, eventType string, severity Severity, message string) error {
+	body, err := json.Marshal(streamRequest{
+		ExporterID: exporterID,
+		SourceSvc:  c.sourceSvc,
+		EventType:  eventType,
+		Severity:   severity,
+		Message:    message,
+	})
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/siem/stream", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Tenant-ID", tenantID)
+
+	// Forward the caller's canonical envelope for downstream traceability
+	svcenvelope.ForwardTo(ctx, req)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	return nil
+}
+
 func (c *Client) activeExporters(ctx context.Context, tenantID string) ([]exporter, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/v1/siem/exporters", nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("X-Tenant-ID", tenantID)
+
+	// Forward the caller's canonical envelope for downstream traceability
+	svcenvelope.ForwardTo(ctx, req)
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -258,31 +295,4 @@ func (c *Client) activeExporters(ctx context.Context, tenantID string) ([]export
 		}
 	}
 	return active, nil
-}
-
-func (c *Client) streamTo(ctx context.Context, tenantID, exporterID, eventType string, severity Severity, message string) error {
-	body, err := json.Marshal(streamRequest{
-		ExporterID: exporterID,
-		SourceSvc:  c.sourceSvc,
-		EventType:  eventType,
-		Severity:   severity,
-		Message:    message,
-	})
-	if err != nil {
-		return err
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/siem/stream", bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Tenant-ID", tenantID)
-
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	return nil
 }

@@ -19,6 +19,7 @@ import (
 	"zoiko.io/corporate-tax-svc/internal/config"
 	svcenvelope "zoiko.io/corporate-tax-svc/internal/envelope"
 	"zoiko.io/corporate-tax-svc/internal/events"
+	"zoiko.io/corporate-tax-svc/internal/evidencereq"
 	"zoiko.io/corporate-tax-svc/internal/handler"
 	"zoiko.io/corporate-tax-svc/internal/health"
 	"zoiko.io/corporate-tax-svc/internal/middleware"
@@ -74,7 +75,8 @@ func main() {
 		authzClient = authz.NewClient(cfg.AuthzServiceURL)
 	}
 
-	h := handler.New(pgStore, publisher, authzClient, logger)
+	h := handler.New(pgStore, publisher, authzClient, logger).
+		WithEvidenceGate(evidencereq.NewClient(cfg.EvidenceRequirementsURL))
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)

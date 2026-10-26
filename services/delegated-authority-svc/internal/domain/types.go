@@ -61,6 +61,7 @@ type DelegationGrant struct {
 	Status               DelegationStatus `json:"status"`
 	CreatedByPrincipalID string           `json:"created_by_principal_id"`
 	CorrelationID        string           `json:"correlation_id"`
+	IdempotencyKey       string           `json:"idempotency_key,omitempty"`
 	CreatedAt            time.Time        `json:"created_at"`
 	UpdatedAt            time.Time        `json:"updated_at"`
 	RevokedByPrincipalID *string          `json:"revoked_by_principal_id,omitempty"`
@@ -200,6 +201,7 @@ type CreateDelegationRequest struct {
 	EffectiveFrom        time.Time `json:"effective_from"`
 	EffectiveTo          time.Time `json:"effective_to"`
 	CorrelationID        string    `json:"correlation_id"`
+	IdempotencyKey       string    `json:"-"` // read from Idempotency-Key header, not the body
 
 	// AuthorityLimit: optional monetary ceiling in minor units (cents) + ISO 4217 currency.
 	AuthorityLimitCents    *int64  `json:"authority_limit_cents,omitempty"`

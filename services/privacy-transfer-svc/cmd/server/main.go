@@ -59,11 +59,20 @@ func main() {
 
 	pgStore := store.NewPgStore(pool, logger)
 	brokers := strings.Split(cfg.KafkaBrokers, ",")
-	publisher := events.NewKafkaPublisher(brokers, cfg.KafkaEventsTopic, logger)
 	authzClient := authz.NewClient(cfg.AuthzServiceURL)
 	purposeClient := purposeregistry.NewClient(cfg.PurposeRegistryURL)
 
-	h := handler.New(pgStore, publisher, authzClient, purposeClient, logger)
+	// The transactional outbox is the ONLY event path: the store enqueues
+	// inside the transaction that changes state; this relay is the only thing
+	// that talks to Kafka, retrying with backoff until a broker acknowledges.
+	kafkaWriter := events.NewKafkaWriter(brokers, cfg.KafkaEventsTopic)
+	defer func() { _ = kafkaWriter.Close() }()
+	relay := events.NewOutboxRelay(pool, kafkaWriter, cfg.KafkaEventsTopic, logger)
+	relayCtx, cancelRelay := context.WithCancel(context.Background())
+	defer cancelRelay()
+	go relay.Start(relayCtx, 3*time.Second)
+
+	h := handler.New(pgStore, authzClient, purposeClient, logger)
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)

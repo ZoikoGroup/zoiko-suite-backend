@@ -1,7 +1,8 @@
 # notification-svc: ZS-SVC-Y-001 certification matrix
 
 Every row of §14 (NP-01…60), §15 (INV-01…30) and §16 (TC-01…20), scored
-against the code and its evidence on **6 October 2026**.
+against the code and its evidence on **6 October 2026**, re-scored on
+**19 October 2026** after the NP-34/NP-57/INV-29/TC-03/TC-18 tests were added.
 
 **Scoring rule.** **Met** means the control is implemented *and* a test or live
 check proves it. **Partial** means it is implemented only in part, or
@@ -17,24 +18,26 @@ service. Test names are Go test functions in `internal/`.
 
 | Matrix | Rows | Met | Partial | Not met |
 |---|---|---|---|---|
-| §14 NP-01…60 | 60 | 55 | 4 | 1 |
-| §15 INV-01…30 | 30 | 27 | 2 | 1 |
-| §16 TC-01…20 | 20 | 13 | 6 | 1 |
-| **All** | **110** | **95 (86%)** | **12** | **3** |
+| §14 NP-01…60 | 60 | 57 | 2 | 1 |
+| §15 INV-01…30 | 30 | 28 | 1 | 1 |
+| §16 TC-01…20 | 20 | 15 | 4 | 1 |
+| **All** | **110** | **100 (91%)** | **7** | **3** |
 
-Weighted, with partial counted as half: **92%**.
+Weighted, with partial counted as half: **94%**.
 
-Ten of the 15 rows short of met are blocked on something outside this
-service: the estate (no caller adoption, no bypass prevention), PRV, DRC, WFC,
-XIC, MDM/IAM integration tests, or open decision OD-05. On the **100 rows this
-service can close by itself**, it scores **95 met, 5 partial, 0 not met:
-95% (97.5% weighted)**.
+All ten rows short of met are blocked on something outside this service: the
+estate (no caller adoption, no bypass prevention), PRV, DRC, WFC, XIC, MDM/IAM
+integration tests, or open decision OD-05. On the **100 rows this service can
+close by itself**, it scores **100 met, 0 partial, 0 not met: 100%**.
 
-Eight rows had correct code with nothing proving it: NP-10, NP-39, NP-56,
-NP-60, and the invariants resting on them, INV-06, INV-18, INV-24 and INV-25.
-Five tests were added during this scoring (NP-56's confirmed with a negative
-control). Before those tests the matrix stood at 87 met, 20 partial, 3 not met:
-**79% (88% weighted)**.
+An earlier pass added tests for eight rows that had correct code but no proof:
+NP-10, NP-39, NP-56, NP-60, and INV-06/18/24/25. This pass added five more:
+NP-34 (provider attachment manifest compared exactly with the pinned render),
+NP-57 (stranded SUBMITTING attempt becomes UNKNOWN), INV-29 (read-only
+projection cannot write authoritative tables), TC-03 (fuzz tests) and TC-18
+(sensitive-content exposure). NP-34's block is proven with a simulated provider
+manifest; certified provider adapters must still send `attachment_hashes` for
+the check to operate live.
 
 ## §14 Negative-path matrix
 
@@ -73,7 +76,7 @@ control). Before those tests the matrix stood at 87 met, 20 partial, 3 not met:
 | NP-31 | S3 payload not exposed on a low-confidentiality surface | Met | TestNCD01_ValidationBlocksUnsafeContent ("S3 in email body" blocked, allowed in-app). No SMS/push channel exists yet (OD-03/04). |
 | NP-32 | Sensitive fact in the subject blocked | Met | TestNCD01_ValidationBlocksUnsafeContent ("S3 in subject") |
 | NP-33 | Forwarded secure-link token is not sufficient alone | **Partial** (Owner: OD-05) | Action links are single-use and scanner-safe (`internal/actionlink`) but not bound to an authenticated audience. The secure-link model is open decision OD-05. |
-| NP-34 | Attachment hash differs after provider upload: block | **Partial** | Attachments are pinned by version and hash into the content hash (INV-18). No provider transmits attachments yet, so no post-upload comparison exists. |
+| NP-34 | Attachment hash differs after provider upload: block | Met | **TestNP34_ProviderAttachmentHashMismatchIsQuarantined** (added 19 Oct): a provider `attachment_hashes` manifest is compared exactly with the pinned render; a missing, extra or changed slot raises `ATTACHMENT_HASH_MISMATCH`, records `ATTACHMENT_MISMATCH`, and blocks the delivery claim. Certified adapters must send the manifest for the check to operate live. |
 | NP-35 | "Provider accepted" is never labelled delivered | Met | TestNCD03_HappyPathEvidenceIsPrecise; legacy `status` precise (console Playwright 21/21) |
 | NP-36 | Mailbox accepted shown per semantics, not as read | Met | TestNCD04_CallbacksDeduplicateAndNeverRollBack |
 | NP-37 | A missing open pixel never implies non-receipt | Met | TestNCD04_CallbacksDeduplicateAndNeverRollBack; TestEngagementSignalsAreLowConfidenceAndChangeNothing |
@@ -96,7 +99,7 @@ control). Before those tests the matrix stood at 87 met, 20 partial, 3 not met:
 | NP-54 | Unavailable external assets: local assets or block | Met | TestNCD01_ValidationBlocksUnsafeContent (external image and tracking pixel blocked in sensitive templates) |
 | NP-55 | DMARC/DKIM break suspends the email stream | Met | TestSMTPProvider_HeldWhileSenderAuthenticationIsBroken; senderauth tests; proven live 5 Oct; alert `NotificationSenderAuthBroken` (6 Oct) |
 | NP-56 | Suppression store unavailable: fail closed | Met | **TestNP56_LegacyGateFailsClosedWhenSuppressionsUnreadable** (added 6 Oct, negative control recorded) |
-| NP-57 | Evidence write fails after provider delivery: never lose it | **Partial** | An attempt left SUBMITTING becomes UNKNOWN (`MarkStranded`) and the outbox is transactional. Proven for the legacy register (TestSubmission_StrandedAfterSubmitBecomesUnknown); the NCD `MarkStranded` path has no test. |
+| NP-57 | Evidence write fails after provider delivery: never lose it | Met | **TestNP57_StrandedSubmittingAttemptBecomesUnknown** (added 19 Oct): an attempt left SUBMITTING becomes UNKNOWN, gets a resolution deadline and a durable `PROVIDER_UNKNOWN` evidence row. The test manufactures SUBMITTING by disabling the transition trigger for setup; the production trigger still rejects ACCEPTED→SUBMITTING. |
 | NP-58 | DRC declaration failure escalates, delivery stands | Met | TestNCD05_AcknowledgmentBindsActorAndExactVersion (`RECORD_HANDOFF_PENDING`); gauge and alert added 6 Oct |
 | NP-59 | Late provider correction appends with lineage | Met | TestNCD04_CallbacksDeduplicateAndNeverRollBack |
 | NP-60 | Tenant admin cannot disable unsubscribe/complaint handling | Met | **TestNCDHTTP_UnsubscribeHandlingCannotBeDisabled** (added 6 Oct) |
@@ -133,7 +136,7 @@ control). Before those tests the matrix stood at 87 met, 20 partial, 3 not met:
 | INV-26 | Provider credentials stay in XIC/Vault/KMS | **Partial** (Owner: XIC) | Credentials never enter templates or domain code, but they are env vars, not vault-brokered (G-3). secret-vault-integration-svc exists. |
 | INV-27 | Callbacks need authentication, dedup, valid transitions | Met | NP-24…26 tests; legacy webhook HMAC (TestWebhook_HTTPHandler_Routing) |
 | INV-28 | Evidence durable even when analytics are down | Met | Transactional outbox; `000023` evidence refuses DELETE; TestHousekeepingStore_DeliveryEvidenceIsNeverDeleted |
-| INV-29 | Projections cannot mutate authoritative state | **Partial** | True by construction (every write route needs a principal and authorization, or a signed callback, and the service consumes no projection), but no test asserts it |
+| INV-29 | Projections cannot mutate authoritative state | Met | **TestINV29_ProjectionRoleCannotMutateAuthoritativeState** (added 19 Oct): a read-only transaction can select from `ncd_communications`, `ncd_attempts` and `ncd_suppressions` but every update is refused. This proves the database mechanism, not a deployed projection role. |
 | INV-30 | No fail-open turns BLOCK/INDETERMINATE into permission | Met | NP-17 and NP-56 tests |
 
 ## §16 Control traceability
@@ -142,7 +145,7 @@ control). Before those tests the matrix stood at 87 met, 20 partial, 3 not met:
 |---|---|---|---|
 | TC-01 | Direct provider bypass prevention | **Not met** (Owner: estate/XIC) | As NP-01 |
 | TC-02 | Immutable template publication | Met | API test plus DB trigger |
-| TC-03 | Typed variable schema and escaping (fuzz/security tests) | **Partial** | Table-driven security tests (script, handlers, CRLF, undeclared vars); no fuzz test |
+| TC-03 | Typed variable schema and escaping (fuzz/security tests) | Met | Table-driven security tests plus **FuzzRenderEscapesAndRefusesHeaderInjection** and **FuzzValidateVariablesTypes** (added 19 Oct) over arbitrary values and every variable type. |
 | TC-04 | Locale and legal wording control | Met | TestNCD01_EffectiveIsBitemporal; NP-09 test |
 | TC-05 | Recipient provenance (integration tests) | **Partial** (Owner: MDM/IAM) | Provenance tested with a stand-in resolver; no integration test against identity-context-svc, and no MDM |
 | TC-06 | Privacy/marketing permission (decision-contract tests) | **Partial** (Owner: PRV) | NCD's side is tested; no contract test against privacy-decision-svc (G-1) |
@@ -157,6 +160,6 @@ control). Before those tests the matrix stood at 87 met, 20 partial, 3 not met:
 | TC-15 | Regulated notice evidence bundle end to end | **Partial** (Owner: WFC/DRC) | NCD-05 tested in-service; no end-to-end run through WFC and DRC (G-2, G-5) |
 | TC-16 | Ack exact-version binding | Met | NCD05 ack tests |
 | TC-17 | Correction lineage, historical reconstruction | Met | TestNCD01_EffectiveIsBitemporal; NP-43 test |
-| TC-18 | Sensitive-content exposure (DLP/content tests) | **Partial** | Content tests exist; no DLP engine or DLP test |
+| TC-18 | Sensitive-content exposure (DLP/content tests) | Met | **TestTC18_SensitiveValuesBlockedOnLowConfidentialitySurfaces** (added 19 Oct): S2/S3 values are refused in email subject, body and links (S2 is allowed only on the authenticated in-app surface); named sensitive terms are refused. This is template validation, not a general DLP engine. |
 | TC-19 | Email authentication posture (DNS monitoring) | Met | senderauth monitor tests; live NP-55 |
 | TC-20 | Communication-to-record lineage (reconciliation) | **Partial** (Owner: DRC) | Record-handoff state, exception, gauge and alert exist; no reconciliation against document-vault-svc (G-2) |

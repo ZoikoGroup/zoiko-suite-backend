@@ -1271,9 +1271,15 @@ var (
 
 // GLJournalMeta is the ACC-03 journal context every journal this service
 // posts carries alongside its lines. general-ledger-svc refuses a journal
-// without journal_type, transaction and posting dates, and currency.
+// without journal_type, transaction and posting dates, and currency — and,
+// for the adjusting types this service posts (ACCRUAL, RECLASS, ADJUSTMENT,
+// OPENING), a controlled journal_purpose from its own closed vocabulary
+// (accounting-kernel standard §9). JournalPurpose is a classification tag,
+// distinct from JournalType: it never changes what type is sent, only adds
+// the required explanation for why.
 type GLJournalMeta struct {
 	JournalType     string
+	JournalPurpose  string
 	TransactionDate time.Time
 	PostingDate     time.Time
 	CurrencyCode    string
@@ -1303,6 +1309,19 @@ const (
 	GLJournalTypeReclass    = "RECLASS"    // ACC-09 allocation
 	GLJournalTypeAdjustment = "ADJUSTMENT" // ACC-10 FX revaluation
 	GLJournalTypeOpening    = "OPENING"    // ACC-17 opening balances
+)
+
+// general-ledger-svc's controlled journal_purpose vocabulary (accounting-kernel
+// standard §9), limited to the values this service's four posting paths use.
+// Each names the specific workflow more precisely than the journal_type alone
+// (ACC-08's recognition/termination and ACC-07's recognition share
+// GLJournalTypeAccrual, but are a different purpose).
+const (
+	GLJournalPurposeAccrual        = "ACCRUAL"         // ACC-07 recognition
+	GLJournalPurposePrepayment     = "PREPAYMENT"       // ACC-08 recognition and termination
+	GLJournalPurposeAllocation     = "ALLOCATION"       // ACC-09 allocation
+	GLJournalPurposeRevaluation    = "REVALUATION"      // ACC-10 FX revaluation
+	GLJournalPurposeOpeningBalance = "OPENING_BALANCE"  // ACC-17 opening balances
 )
 
 // general-ledger-svc's closed close-journal designations (its

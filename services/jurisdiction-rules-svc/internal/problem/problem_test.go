@@ -25,10 +25,10 @@ func TestProblem_ContractShape(t *testing.T) {
 		t.Fatalf("decode: %v", err)
 	}
 	want := map[string]any{
-		"type":     "https://api.zoikosuite.com/problems/sod-conflict",
-		"code":     "segregation_of_duties",
-		"error":    "segregation_of_duties",
-		"status":   float64(403),
+		"type":      "https://api.zoikosuite.com/problems/sod-conflict",
+		"code":      "segregation_of_duties",
+		"error":     "segregation_of_duties",
+		"status":    float64(403),
 		"retryable": false,
 	}
 	for k, v := range want {

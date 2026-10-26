@@ -555,7 +555,7 @@ func (s *Service) AmendLegalProfile(
 	legalEntityID string,
 	req domain.AmendLegalProfileRequest,
 ) (*domain.LegalEntityProfileVersion, error) {
-	if err := s.authorize(ctx, "entity", "profile.amend"); err != nil {
+	if err := s.authorizeEntity(ctx, legalEntityID, "entity", "profile.amend"); err != nil {
 		return nil, err
 	}
 
@@ -1058,7 +1058,7 @@ func (s *Service) ListRegistryConflicts(ctx context.Context, openOnly bool) ([]*
 // two records are duplicates is a finding, and acting on that finding is a
 // separate governed operation this service does not perform.
 func (s *Service) ResolveRegistryConflict(ctx context.Context, conflictID string, req domain.ResolveRegistryConflictRequest) error {
-	if err := s.authorize(ctx, "entity.registry-conflict", "resolve"); err != nil {
+	if err := s.authorizeConflict(ctx, conflictID, "resolve"); err != nil {
 		return err
 	}
 	if !domain.ValidRegistryConflictResolution(req.Status) {

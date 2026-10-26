@@ -1,0 +1,15 @@
+# Used by BuildKit for builds with -f services/search-indexer-svc/Dockerfile.
+# The context is the repository root (see the Dockerfile), so everything is
+# excluded except the modules the image is built from.
+*
+!services/search-indexer-svc/
+!services/identity-envelope/
+!services/search-client/
+
+# Not needed inside the image.
+services/search-indexer-svc/.gotmp/
+services/search-indexer-svc/**/*.exe
+services/search-indexer-svc/**/*_test.go
+services/search-indexer-svc/deployments/
+services/identity-envelope/**/*_test.go
+services/search-client/**/*_test.go

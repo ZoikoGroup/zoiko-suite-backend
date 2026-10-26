@@ -28,23 +28,24 @@ import (
 // system side effect of activating a newer version in the same scope,
 // not a principal-driven transition.
 type Envelope struct {
-	EventID            string          `json:"event_id"`
-	EventType          string          `json:"event_type"`
-	EventVersion       string          `json:"event_version"`
-	EmittedAt          time.Time       `json:"emitted_at"`
-	SchemaVersion      string          `json:"schema_version"`
-	SourceService      string          `json:"source_service"`
-	TenantID           string          `json:"tenant_id,omitempty"`
-	LegalEntityID      string          `json:"legal_entity_id,omitempty"`
-	ActorID            string          `json:"actor_id,omitempty"`
-	CorrelationID      string          `json:"correlation_id"`
-	CausationID        string          `json:"causation_id,omitempty"`
-	Classification     string          `json:"classification,omitempty"`
-	PayloadHash        string          `json:"payload_hash,omitempty"`
-	AggregateVersion   string          `json:"aggregate_version,omitempty"`
-	ResidencyRegion    string          `json:"residency_region,omitempty"`
-	PublishedAt        time.Time       `json:"published_at"`
-	Payload            json.RawMessage `json:"payload"`
+	EventID             string          `json:"event_id"`
+	EventType           string          `json:"event_type"`
+	EventVersion        string          `json:"event_version"`
+	EmittedAt           time.Time       `json:"emitted_at"`
+	SchemaVersion       string          `json:"schema_version"`
+	SourceService       string          `json:"source_service"`
+	TenantID            string          `json:"tenant_id,omitempty"`
+	LegalEntityID       string          `json:"legal_entity_id,omitempty"`
+	ActorID             string          `json:"actor_id,omitempty"`
+	CorrelationID       string          `json:"correlation_id"`
+	CausationID         string          `json:"causation_id,omitempty"`
+	JurisdictionContext string          `json:"jurisdiction_context,omitempty"`
+	Classification      string          `json:"classification,omitempty"`
+	PayloadHash         string          `json:"payload_hash,omitempty"`
+	AggregateVersion    string          `json:"aggregate_version,omitempty"`
+	ResidencyRegion     string          `json:"residency_region,omitempty"`
+	PublishedAt         time.Time       `json:"published_at"`
+	Payload             json.RawMessage `json:"payload"`
 }
 
 // MessageWriter is the one method Publisher needs from *kafka.Writer.

@@ -24,9 +24,12 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
 	"go.uber.org/zap"
+	idenv "zoiko.io/identity-envelope"
 
 	"github.com/go-chi/chi/v5/middleware"
 
@@ -72,7 +75,8 @@ func NewHTTPClient(baseURL string, log *zap.Logger) *HTTPClient {
 }
 
 func (c *HTTPClient) VerifyDocument(ctx context.Context, tenantID, legalEntityID, documentID, principalID string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/v1/documents/"+documentID, nil)
+	// The id is caller input: escape it so it can only name one path segment.
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/v1/documents/"+url.PathEscape(strings.TrimSpace(documentID)), nil)
 	if err != nil {
 		return domain.ErrDocumentServiceUnavailable
 	}
@@ -111,6 +115,9 @@ func (c *HTTPClient) VerifyDocument(ctx context.Context, tenantID, legalEntityID
 	req.Header.Set("X-Principal-Id", principalID)
 	req.Header.Set("X-Request-Id", requestID)
 	req.Header.Set("X-Source-Channel", sourceChannel)
+	// The caller's verified identity envelope, so document-vault-svc checks
+	// DOCUMENT_READ for the person whose evaluation this is.
+	idenv.Forward(ctx, req)
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -139,7 +146,9 @@ func (c *HTTPClient) VerifyDocument(ctx context.Context, tenantID, legalEntityID
 	if s.DocumentID == "" {
 		return domain.ErrDocumentNotFound
 	}
-	if s.TenantID != tenantID || s.LegalEntityID != legalEntityID {
+	// UUIDs compare case-insensitively: the same id in another case is the
+	// same tenant or entity, not a mismatch.
+	if !strings.EqualFold(s.TenantID, tenantID) || !strings.EqualFold(s.LegalEntityID, legalEntityID) {
 		return domain.ErrDocumentMismatch
 	}
 	return nil

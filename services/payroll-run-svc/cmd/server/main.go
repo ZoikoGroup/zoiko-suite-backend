@@ -386,7 +386,7 @@ func main() {
 
 	// WFP-05: payroll journal bridge. The dispatcher is the only code that talks to the
 	// ledger, and only through general-ledger-svc's posting API.
-	ledgerClient := ledger.New(cfg.LedgerServiceURL, cfg.GLPostingPrincipalID, nil, log)
+	ledgerClient := ledger.New(cfg.LedgerServiceURL, cfg.GLPostingPrincipalID, nil, log).WithKernelBook(cfg.LedgerKernelBookID)
 	handler.RegisterWFPAccountingRoutes(r, handler.NewWFPAccounting(pgStore, authzClient, ledgerClient, cfg.AccountingBook, log))
 
 	// WFP-06: payroll liabilities. Authorities are validated against counterparty-management-svc and

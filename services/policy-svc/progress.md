@@ -1,6 +1,131 @@
 # Policy Service — Progress & Phase Plan
 
-Status: **All 3 original batches (A, B, C) plus follow-ups Batch D, E, and
+## Governance Platform audit closure — 2026-10-14 (current status)
+
+This section supersedes the status paragraphs below them. Those describe the
+July build; several of their claims stopped being true when the canonical
+envelope was enforced (for example "decision log verified live 2026-07-07":
+from enforcement until today every evidence write was refused with 400 and
+only logged). The audit is `docs/audit_files/Governance Platform-audit-2026-09-28.md`,
+section 3/7, and its closing record "policy-svc — gap closure (14 October 2026)".
+
+**Decisions (user, 14 Oct):** GOV-05 + Doc 03 §8.1 bind this service (V-001's
+PDC-05 suite is roadmap); Evaluate stores evidence locally in the same
+transaction and the ledger copy follows from an outbox (C6); the ledger writer
+is this service's own principal, `POLICY_LEDGER_PRINCIPAL_ID` (D-02); policy
+families are tenant-owned by default (Q5). Decided from the documents: Evaluate
+is exempt from `MaterialWrite`, as authorization-svc's `/v1/authorize` is (C5).
+
+**What changed (migration `000007_gov05_lifecycle` + code):**
+
+- GOV-05 lifecycle: DRAFT → REVIEW → APPROVED → ACTIVE (or SCHEDULED when
+  `effective_from` is in the future) → SUPERSEDED / SUSPENDED / RETIRED. The
+  author can neither approve nor activate (403 `SOD_CONFLICT`); nothing goes
+  live unapproved (409 `APPROVAL_REQUIRED`). Every transition is in
+  `policy_version_transitions`; `If-Match` / `expected_version` give
+  optimistic concurrency (`row_version`, returned as `ETag`).
+- Bitemporal resolution (`internal/resolve`): `as_of` and `known_at`;
+  effective windows gate; a successor takes over at its own effective time;
+  a suspended version never hands control back to its predecessor; two
+  policies tied at the most specific scope are CONFLICTED, never
+  latest-by-timestamp. Activation of an overlapping same-scope policy of the
+  same type is refused (409 `POLICY_CONFLICTED`).
+- Evaluate: actor from `X-Principal-Id`, authorized as `POLICY_EVALUATE`;
+  legal entity reconciled with `X-Legal-Entity-Id`; a repeated `decision_id`
+  returns the stored result (different input: 409 `IDEMPOTENCY_MISMATCH`);
+  the payload is checked against its server-derived `artifact_digest`; the
+  evaluation (input fingerprint, evaluator version, selected rule ids, as-of
+  and known-at) is stored with its ledger outbox row before 200, and
+  `evidence_id` is returned. `internal/evidence` delivers it to
+  governance-decision-log-svc with the full envelope, the caller's tenant in
+  the header (no more `"GLOBAL"` body tenant) and `PLATFORM` for unscoped
+  entities.
+- Reads are authorized (`POLICY_READ`). Mode switches `POLICY_EVALUATE_AUTHZ`
+  and `POLICY_READ_AUTHZ` (`enforce` default, `warn` in compose until the
+  callers and grants below are ready).
+- Released content is immutable in the database (triggers on UPDATE, DELETE,
+  TRUNCATE); policies, versions, transitions, evaluations, control-test
+  executions and attestations are under FORCE RLS.
+- The transactional outbox is now transactional (events are written in the
+  business transaction) and actually publishes (the relay used to set a topic
+  kafka-go refuses); event ids are stable per row; backlogs are exported as
+  `outbox_pending`, `outbox_oldest_pending_seconds`, `policy_evidence_pending`
+  and `policy_evidence_failed`.
+- Resolution cache (`internal/cache`) keyed by type, tenant and entity,
+  valid only while `policy_resolution_watermark` is unchanged.
+- Stable error classes (GCP §16) in a `code` field; the old `error` value is
+  kept for existing callers. Malformed ids and over-length strings are 400.
+
+**API surface** (REST; GOV-05's `/internal/v1/gov05/...` paths are
+"illustrative contract surface"):
+
+| Route | GOV-05 / Doc 03 operation | Permission |
+|---|---|---|
+| `POST /v1/policies` (`scope` TENANT \| GLOBAL) | CreatePolicyDraft (family) | `POLICY_CREATE` / `POLICY_CREATE_GLOBAL` |
+| `GET /v1/policies/{id}` | — | `POLICY_READ` |
+| `POST /v1/policies/{id}/versions` | CreatePolicyDraft (version) | `POLICY_VERSION_CREATE[_GLOBAL]` |
+| `POST …/versions/{vid}/submit-review` | SubmitPolicyReview | `POLICY_VERSION_CREATE[_GLOBAL]` |
+| `POST …/versions/{vid}/approve` | ApprovePolicy | `POLICY_VERSION_APPROVE[_GLOBAL]` |
+| `POST …/versions/{vid}/activate` | ActivatePolicy (schedules when future) | `POLICY_VERSION_ACTIVATE[_GLOBAL]` |
+| `POST …/versions/{vid}/schedule` | ScheduleActivation | `POLICY_VERSION_ACTIVATE[_GLOBAL]` |
+| `POST …/versions/{vid}/suspend` (`reason_code` required) | EmergencySuspendPolicy | `POLICY_VERSION_SUSPEND[_GLOBAL]` |
+| `POST …/versions/{vid}/retire` (`reason_code` required) | retirement; SupersedePolicy happens on activation of a successor | `POLICY_VERSION_RETIRE[_GLOBAL]` |
+| `GET /v1/policies?policy_type=` | get applicable policy set | `POLICY_READ` |
+| `GET /v1/policies/resolve?policy_type=` | ResolveEffectivePolicy; validate threshold applicability | `POLICY_READ` |
+| `GET /v1/policies/explain?policy_type=` | ExplainPolicyResolution | `POLICY_READ` |
+| `POST /v1/policies/evaluate` | evaluate policy against action context | `POLICY_EVALUATE` |
+| `GET /v1/policies/{id}/versions` | retrieve policy version history | `POLICY_READ` |
+| `GET /v1/policy-versions/{vid}` | GetPolicyVersion | `POLICY_READ` |
+| `GET /v1/policy-versions/compare?base=&target=` | ComparePolicyVersions | `POLICY_READ` |
+| `GET /v1/policy-versions/{vid}/transitions` | approval / activation / suspension evidence | `POLICY_READ` |
+| `GET /v1/policy-evaluations/{evidence_id}` | evaluation evidence | `POLICY_READ` |
+| `POST /v1/control-test-definitions`, `GET …/{id}`, `POST`/`GET …/{id}/executions`, `GET /v1/controls/{ref}/effectiveness`, `POST /v1/attestations`, `GET …/{id}`, `POST …/{id}/revoke` | doc7 §E3 / §E6 (traceability GOV-02) | `CONTROL_TEST_*`, `CONTROL_EFFECTIVENESS_READ`, `ATTESTATION_*` |
+
+Events (Doc 03 dotted names, pending group decision C3): `policy.created`,
+`policy.updated`, `policy.version.submitted`, `policy.version.approved`,
+`policy.version.scheduled`, `policy.version.activated`,
+`policy.version.suspended`, `policy.rule.retired` (supersession and
+retirement), `policy.applicability.conflicted`.
+
+**Deploy order:** apply `000007` (`deployments/migrate.py up`) before the new
+binary. Set `POLICY_LEDGER_PRINCIPAL_ID` and grant it
+`GOVERNANCE_DECISION_RECORD`. Existing DRAFT versions must now go through
+submit-review and approve before activation. A create-version retry is
+replayed by its `Idempotency-Key` (or `policy_version_id`), no longer by
+(scope, effective_from).
+
+**Round 2 (same day):** access-control-svc migration 000019 registers the 9
+new actions; expense-claim-svc and payment-authorization-svc forward
+`X-Principal-Id`, the signed envelope, request and correlation ids;
+`deployments/scripts/seed-demo-rbac.ps1` grants the actions and gives
+`svc-policy` `GOVERNANCE_DECISION_RECORD`; compose enforces both gates.
+Added: identity verification (`internal/identity`; the signed envelope from
+identity-context-svc's JWKS must agree with the identity headers, or the
+caller is an mTLS peer on the new `:8449` listener, `internal/mtlslistener`);
+mandatory `If-Match` / `expected_version` on lifecycle commands (428);
+`POST …/review-suspension` (independent review of an emergency suspension,
+migration 000008); `jurisdiction_context` and `residency_region` on events; the
+version's author sent to authorization-svc as the resource owner, so its
+own-object SoD rules apply too. Verified live against the real
+authorization-svc (24/24 + 3/3).
+
+**Still open:** evaluation for SPEND_CONTROL, SIGNATORY_MATRIX and SOD_RULE
+(no spec defines them); compose keeps `POLICY_IDENTITY_VERIFY=warn` until
+governance-decision-log-svc's replay forwards the signed envelope (P-12);
+`X-Purpose-Context: policy_evaluation_evidence` is sent because the decision log
+requires it on appends (its open decision D-06).
+
+**Verification (14 Oct):** unit and handler suites; 13 database tests run as
+a NOSUPERUSER NOBYPASSRLS role on Postgres 16 (migration backfill and
+round-trip included); 10/10 mutants killed; race detector clean; live run of
+both real binaries (policy-svc and governance-decision-log-svc) with a stub
+authorization-svc: 44/44 negative-path checks, including ledger rows for
+tenant-scoped and global evaluations. The live run found the missing
+`X-Purpose-Context`, which no unit test could.
+
+---
+
+Status (July 2026, superseded by the section above): **All 3 original batches (A, B, C) plus follow-ups Batch D, E, and
 F built.** A, B, C, D, and E were tested and verified live in a prior
 session — including a real Docker image build and a real second live
 service (`governance-decision-log-svc`) for cross-service proof. **Batch F

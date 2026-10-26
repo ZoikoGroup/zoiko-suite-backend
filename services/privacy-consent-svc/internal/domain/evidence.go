@@ -202,6 +202,23 @@ func (w WithdrawalReceipt) MarshalJSON() ([]byte, error) {
 	})
 }
 
+// MarshalJSON adds §18's POST /privacy/notices/{id}/presentation-receipts
+// critical field `receipt_id` (the id of the presentation receipt) beside the
+// existing presentation_receipt_id, with the same value. The remaining §18
+// members already travel on the receipt: subject (subject_ref), session
+// (session_ref), version (notice_version_id), timestamp (created_at) and
+// channel/template (channel, template_version).
+func (p PresentationReceipt) MarshalJSON() ([]byte, error) {
+	type plain PresentationReceipt
+	return json.Marshal(struct {
+		plain
+		ReceiptID string `json:"receipt_id"`
+	}{
+		plain:     plain(p),
+		ReceiptID: p.PresentationReceiptID,
+	})
+}
+
 // ── §19 privacy.consent.changed ──────────────────────────────────────────────
 
 // ConsentChangedPayload is the payload of privacy.consent.changed. §19's

@@ -146,14 +146,14 @@ func TestNP4_TerminatedAndOffboardingTenantsAlsoRefused(t *testing.T) {
 func TestNP4_SuspendedTenantCanStillBeRead(t *testing.T) {
 	svc, ms := baseSvc(t)
 	ms.tenants[orgTenant].LifecycleState = domain.TenantLifecycleSuspended
-	seedEntityFor(ms, "ent-read", orgTenant, "", "JUR-US")
+	seedEntityFor(ms, "e0000000-0000-4000-8000-000000000019", orgTenant, "", "JUR-US")
 
 	// NP4's required result is "Deny protected write; controlled read policy
 	// only if allowed". Reads staying open is the controlled-read half: an
 	// operator has to be able to see what they have to resolve the suspension.
-	got, err := svc.GetEntity(tenantCtx(orgTenant), "ent-read")
+	got, err := svc.GetEntity(tenantCtx(orgTenant), "e0000000-0000-4000-8000-000000000019")
 	require.NoError(t, err)
-	assert.Equal(t, "ent-read", got.LegalEntityID)
+	assert.Equal(t, "e0000000-0000-4000-8000-000000000019", got.LegalEntityID)
 }
 
 func TestNP4_OnboardingTenantMayStillTransact(t *testing.T) {
@@ -193,7 +193,7 @@ func TestNP4_ResumeTenantIsNotBlockedByTheGuardItLifts(t *testing.T) {
 
 func TestNP5_DuplicateRegistryNumberIsQuarantinedAndEntityNotCreated(t *testing.T) {
 	svc, ms := baseSvc(t)
-	seedEntityFor(ms, "ent-incumbent", orgTenant, "RC-12345", "JUR-US")
+	seedEntityFor(ms, "e0000000-0000-4000-8000-000000000011", orgTenant, "RC-12345", "JUR-US")
 
 	_, err := svc.CreateEntity(tenantCtx(orgTenant), domain.CreateEntityRequest{
 		TenantID:              orgTenant,
@@ -217,7 +217,7 @@ func TestNP5_DuplicateRegistryNumberIsQuarantinedAndEntityNotCreated(t *testing.
 	require.NoError(t, err)
 	require.Len(t, conflicts, 1)
 	assert.Equal(t, "RC-12345", conflicts[0].RegistrationNumber)
-	assert.Equal(t, "ent-incumbent", conflicts[0].ExistingLegalEntityID)
+	assert.Equal(t, "e0000000-0000-4000-8000-000000000011", conflicts[0].ExistingLegalEntityID)
 	assert.Equal(t, domain.RegistryConflictOpen, conflicts[0].Status)
 	assert.Equal(t, "Impostor Ltd", conflicts[0].AttemptedPayload["legal_name"],
 		"the rejected claim must be preserved: there is no row to point at")
@@ -225,7 +225,7 @@ func TestNP5_DuplicateRegistryNumberIsQuarantinedAndEntityNotCreated(t *testing.
 
 func TestNP5_SameNumberInADifferentJurisdictionIsNotAConflict(t *testing.T) {
 	svc, ms := baseSvc(t)
-	seedEntityFor(ms, "ent-us", orgTenant, "RC-12345", "JUR-US")
+	seedEntityFor(ms, "e0000000-0000-4000-8000-000000000020", orgTenant, "RC-12345", "JUR-US")
 
 	// Registry numbers are only unique within a registry. Two jurisdictions
 	// issuing the same string are unrelated facts.
@@ -240,7 +240,7 @@ func TestNP5_SameNumberInADifferentJurisdictionIsNotAConflict(t *testing.T) {
 
 func TestNP5_DissolvedIncumbentDoesNotBlockReRegistration(t *testing.T) {
 	svc, ms := baseSvc(t)
-	e := seedEntityFor(ms, "ent-dead", orgTenant, "RC-999", "JUR-US")
+	e := seedEntityFor(ms, "e0000000-0000-4000-8000-00000000000e", orgTenant, "RC-999", "JUR-US")
 	e.EntityStatus = domain.EntityStatusDissolved
 
 	// NP5's wording is "two ACTIVE entities". A dissolved entity's number is
@@ -257,13 +257,13 @@ func TestNP5_DissolvedIncumbentDoesNotBlockReRegistration(t *testing.T) {
 
 func TestNP5_AmendmentOntoAnotherEntitysRegistryNumberIsAlsoQuarantined(t *testing.T) {
 	svc, ms := baseSvc(t)
-	seedEntityFor(ms, "ent-incumbent", orgTenant, "RC-777", "JUR-US")
-	seedEntityFor(ms, "ent-other", orgTenant, "RC-111", "JUR-US")
+	seedEntityFor(ms, "e0000000-0000-4000-8000-000000000011", orgTenant, "RC-777", "JUR-US")
+	seedEntityFor(ms, "e0000000-0000-4000-8000-000000000016", orgTenant, "RC-111", "JUR-US")
 
 	// The more dangerous door: creation is guarded, so an attacker or a
 	// mistaken import reaches the same invalid state by amending instead.
 	num := "RC-777"
-	_, err := svc.AmendLegalProfile(tenantCtx(orgTenant), "ent-other",
+	_, err := svc.AmendLegalProfile(tenantCtx(orgTenant), "e0000000-0000-4000-8000-000000000016",
 		domain.AmendLegalProfileRequest{
 			RegistrationNumber: &num,
 			ChangeReason:       domain.ProfileChangeAmendment,
@@ -312,12 +312,12 @@ func TestResolveRegistryConflict_RequiresATerminalStatusAndANote(t *testing.T) {
 
 func TestNP6_LegalNameChangeCreatesAVersionAndHistoryResolvesTheOriginal(t *testing.T) {
 	svc, ms := baseSvc(t)
-	e := seedEntityFor(ms, "ent-np6", orgTenant, "RC-NP6", "JUR-US")
+	e := seedEntityFor(ms, "e0000000-0000-4000-8000-000000000015", orgTenant, "RC-NP6", "JUR-US")
 	incorporated := e.CreatedAt
 	ctx := tenantCtx(orgTenant)
 
 	renamedAt := time.Now().UTC().Add(-1 * time.Hour)
-	_, err := svc.ChangeLegalName(ctx, "ent-np6", domain.ChangeLegalNameRequest{
+	_, err := svc.ChangeLegalName(ctx, "e0000000-0000-4000-8000-000000000015", domain.ChangeLegalNameRequest{
 		LegalName:         "Renamed Holdings Plc",
 		EffectiveFrom:     renamedAt,
 		SourceEvidenceRef: "companies-house/filing/NM01",
@@ -327,7 +327,7 @@ func TestNP6_LegalNameChangeCreatesAVersionAndHistoryResolvesTheOriginal(t *test
 	assert.Equal(t, domain.ProfileChangeLegalNameChange, v2.ChangeReason)
 
 	// The present resolves to the new name.
-	now, err := svc.GetLegalEntityAsOf(ctx, "ent-np6", time.Now().UTC())
+	now, err := svc.GetLegalEntityAsOf(ctx, "e0000000-0000-4000-8000-000000000015", time.Now().UTC())
 	require.NoError(t, err)
 	require.NotNil(t, now.Profile)
 	assert.Equal(t, "Renamed Holdings Plc", now.Profile.LegalName)
@@ -335,25 +335,25 @@ func TestNP6_LegalNameChangeCreatesAVersionAndHistoryResolvesTheOriginal(t *test
 	// The instant the financial history was booked under resolves to the
 	// ORIGINAL name. This is the assertion NP6 exists for: an in-place update
 	// would have destroyed it.
-	then, err := svc.GetLegalEntityAsOf(ctx, "ent-np6", incorporated.Add(24*time.Hour))
+	then, err := svc.GetLegalEntityAsOf(ctx, "e0000000-0000-4000-8000-000000000015", incorporated.Add(24*time.Hour))
 	require.NoError(t, err)
 	require.NotNil(t, then.Profile)
 	assert.Equal(t, "Original Name Ltd", then.Profile.LegalName)
 	assert.Equal(t, 1, then.Profile.VersionNumber)
 
 	// Both versions remain listed — nothing was rewritten.
-	versions, err := svc.ListEntityVersions(ctx, "ent-np6")
+	versions, err := svc.ListEntityVersions(ctx, "e0000000-0000-4000-8000-000000000015")
 	require.NoError(t, err)
 	require.Len(t, versions, 2)
 }
 
 func TestNP6_AsOfBoundaryBelongsToTheLaterVersion(t *testing.T) {
 	svc, ms := baseSvc(t)
-	seedEntityFor(ms, "ent-b", orgTenant, "", "JUR-US")
+	seedEntityFor(ms, "e0000000-0000-4000-8000-00000000000b", orgTenant, "", "JUR-US")
 	ctx := tenantCtx(orgTenant)
 
 	boundary := time.Now().UTC().Add(-2 * time.Hour)
-	_, err := svc.ChangeLegalName(ctx, "ent-b", domain.ChangeLegalNameRequest{
+	_, err := svc.ChangeLegalName(ctx, "e0000000-0000-4000-8000-00000000000b", domain.ChangeLegalNameRequest{
 		LegalName:     "Second Name Ltd",
 		EffectiveFrom: boundary,
 	})
@@ -362,22 +362,22 @@ func TestNP6_AsOfBoundaryBelongsToTheLaterVersion(t *testing.T) {
 	// The interval is half-open [from, to): the exact boundary instant belongs
 	// to the version starting there, not the one ending there. Without this the
 	// two versions would both match and the answer would depend on ordering.
-	at, err := svc.GetLegalEntityAsOf(ctx, "ent-b", boundary)
+	at, err := svc.GetLegalEntityAsOf(ctx, "e0000000-0000-4000-8000-00000000000b", boundary)
 	require.NoError(t, err)
 	assert.Equal(t, "Second Name Ltd", at.Profile.LegalName)
 
-	justBefore, err := svc.GetLegalEntityAsOf(ctx, "ent-b", boundary.Add(-time.Nanosecond))
+	justBefore, err := svc.GetLegalEntityAsOf(ctx, "e0000000-0000-4000-8000-00000000000b", boundary.Add(-time.Nanosecond))
 	require.NoError(t, err)
 	assert.Equal(t, "Original Name Ltd", justBefore.Profile.LegalName)
 }
 
 func TestAmendLegalProfile_CarriesForwardUnmentionedFields(t *testing.T) {
 	svc, ms := baseSvc(t)
-	seedEntityFor(ms, "ent-cf", orgTenant, "RC-CF", "JUR-US")
+	seedEntityFor(ms, "e0000000-0000-4000-8000-00000000000c", orgTenant, "RC-CF", "JUR-US")
 	ctx := tenantCtx(orgTenant)
 
 	office := `{"line1":"1 New Street"}`
-	v2, err := svc.ChangeRegisteredOffice(ctx, "ent-cf", domain.ChangeRegisteredOfficeRequest{
+	v2, err := svc.ChangeRegisteredOffice(ctx, "e0000000-0000-4000-8000-00000000000c", domain.ChangeRegisteredOfficeRequest{
 		RegisteredOffice: office,
 	})
 	require.NoError(t, err)
@@ -392,14 +392,14 @@ func TestAmendLegalProfile_CarriesForwardUnmentionedFields(t *testing.T) {
 
 func TestAmendLegalProfile_ServiceAssignedChangeReasonsAreRefused(t *testing.T) {
 	svc, ms := baseSvc(t)
-	seedEntityFor(ms, "ent-cr", orgTenant, "", "JUR-US")
+	seedEntityFor(ms, "e0000000-0000-4000-8000-00000000000d", orgTenant, "", "JUR-US")
 
 	for _, reason := range []domain.ProfileChangeReason{
 		domain.ProfileChangeInitial,
 		domain.ProfileChangeInitialBackfill,
 	} {
 		name := "New"
-		_, err := svc.AmendLegalProfile(tenantCtx(orgTenant), "ent-cr",
+		_, err := svc.AmendLegalProfile(tenantCtx(orgTenant), "e0000000-0000-4000-8000-00000000000d",
 			domain.AmendLegalProfileRequest{
 				LegalName:    &name,
 				ChangeReason: reason,
@@ -415,37 +415,37 @@ func TestAmendLegalProfile_ServiceAssignedChangeReasonsAreRefused(t *testing.T) 
 
 func TestAmendLegalProfile_LegalIdentityChangeRequiresAnIndependentApprover(t *testing.T) {
 	svc, ms := baseSvc(t)
-	seedEntityFor(ms, "ent-sod", orgTenant, "", "JUR-US")
+	seedEntityFor(ms, "e0000000-0000-4000-8000-00000000001c", orgTenant, "", "JUR-US")
 	ctx := tenantCtx(orgTenant)
 	name := "Renamed Ltd"
 
 	// The old self-asserted approver field is refused, whoever it names.
 	for _, named := range []string{testPrincipal, "someone-else"} {
-		_, err := svc.AmendLegalProfile(ctx, "ent-sod", domain.AmendLegalProfileRequest{
+		_, err := svc.AmendLegalProfile(ctx, "e0000000-0000-4000-8000-00000000001c", domain.AmendLegalProfileRequest{
 			LegalName: &name, ChangeReason: domain.ProfileChangeLegalNameChange,
 			ApprovedByPrincipalID: named,
 		})
 		require.ErrorIs(t, err, registry.ErrApprovalRequired, "body approver %q", named)
 	}
-	assert.Equal(t, "Original Name Ltd", ms.entities["ent-sod"].LegalName)
+	assert.Equal(t, "Original Name Ltd", ms.entities["e0000000-0000-4000-8000-00000000001c"].LegalName)
 
 	// Without it, the change is filed, not applied.
-	_, err := svc.AmendLegalProfile(ctx, "ent-sod", domain.AmendLegalProfileRequest{
+	_, err := svc.AmendLegalProfile(ctx, "e0000000-0000-4000-8000-00000000001c", domain.AmendLegalProfileRequest{
 		LegalName: &name, ChangeReason: domain.ProfileChangeLegalNameChange,
 	})
 	a := pendingOf(t, err)
 	assert.Equal(t, "ChangeLegalName", a.CommandName)
-	assert.Equal(t, "Original Name Ltd", ms.entities["ent-sod"].LegalName)
+	assert.Equal(t, "Original Name Ltd", ms.entities["e0000000-0000-4000-8000-00000000001c"].LegalName)
 
 	// "Maker cannot approve legal-name/registry/jurisdiction change" (§4.3).
 	_, err = svc.ApproveRequest(ctx, a.ApprovalRequestID,
 		domain.ApproveRequestBody{PayloadFingerprint: a.PayloadFingerprint})
 	require.ErrorIs(t, err, registry.ErrSelfApproval)
-	assert.Equal(t, "Original Name Ltd", ms.entities["ent-sod"].LegalName)
+	assert.Equal(t, "Original Name Ltd", ms.entities["e0000000-0000-4000-8000-00000000001c"].LegalName)
 
 	// A second verified principal releases it, and becomes approver of record.
 	v := approveByID(t, svc, orgTenant, a.ApprovalRequestID).Result.(*domain.LegalEntityProfileVersion)
-	assert.Equal(t, "Renamed Ltd", ms.entities["ent-sod"].LegalName)
+	assert.Equal(t, "Renamed Ltd", ms.entities["e0000000-0000-4000-8000-00000000001c"].LegalName)
 	assert.Equal(t, testPrincipal, v.CreatedByPrincipalID)
 	require.NotNil(t, v.ApprovedByPrincipalID)
 	assert.Equal(t, approverPrincipal, *v.ApprovedByPrincipalID)
@@ -455,13 +455,13 @@ func TestAmendLegalProfile_LegalIdentityChangeRequiresAnIndependentApprover(t *t
 
 func TestAmendLegalProfile_NonIdentityFieldsNeedNoApprover(t *testing.T) {
 	svc, ms := baseSvc(t)
-	seedEntityFor(ms, "ent-tn", orgTenant, "", "JUR-US")
+	seedEntityFor(ms, "e0000000-0000-4000-8000-00000000001f", orgTenant, "", "JUR-US")
 
 	// Trading name is not one of the three fields §4.3 puts under SoD.
 	// Requiring an approver for every field would make the control routine and
 	// therefore ignored.
 	trading := "ACME"
-	_, err := svc.AmendLegalProfile(tenantCtx(orgTenant), "ent-tn",
+	_, err := svc.AmendLegalProfile(tenantCtx(orgTenant), "e0000000-0000-4000-8000-00000000001f",
 		domain.AmendLegalProfileRequest{TradingName: &trading})
 	require.NoError(t, err)
 }
@@ -706,8 +706,8 @@ func TestORGReads_RefuseACrossTenantRequest(t *testing.T) {
 
 func TestFindByRegistryNumber_ReturnsAllCandidatesNotOne(t *testing.T) {
 	svc, ms := baseSvc(t)
-	seedEntityFor(ms, "ent-1", orgTenant, "RC-SAME", "JUR-US")
-	e2 := seedEntityFor(ms, "ent-2", orgTenant, "RC-SAME", "JUR-US")
+	seedEntityFor(ms, "e0000000-0000-4000-8000-000000000004", orgTenant, "RC-SAME", "JUR-US")
+	e2 := seedEntityFor(ms, "e0000000-0000-4000-8000-000000000006", orgTenant, "RC-SAME", "JUR-US")
 	e2.EntityStatus = domain.EntityStatusDissolved
 
 	// §4.3: "registry+jurisdiction is dedup signal not universal identifier".

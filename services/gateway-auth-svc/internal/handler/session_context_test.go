@@ -3,7 +3,9 @@ package handler_test
 import (
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
+	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/stretchr/testify/assert"
@@ -70,9 +72,36 @@ func TestVerify_SupportContextOnlyFromEnvelope(t *testing.T) {
 	assert.Empty(t, rec.Header().Get("X-Support-Context-Id"), "a client-written support context must never be echoed")
 }
 
-// The envelope's iat is when it was minted, not when the user logged in, so
-// the gateway never claims a login age; the header is only ever stripped.
-func TestVerify_NeverSetsAuthnAge(t *testing.T) {
-	rec := verifyClaims(t, validClaims(), map[string]string{"X-Authn-Age-Seconds": "1"})
+// The envelope's iat is when it was minted, not when the user logged in, so an
+// envelope without auth_time asserts no age at all, whatever the client wrote
+// and however recent its iat.
+func TestVerify_NoAuthTimeMeansNoAuthnAge(t *testing.T) {
+	claims := validClaims()
+	claims["iat"] = time.Now().Unix()
+	rec := verifyClaims(t, claims, map[string]string{"X-Authn-Age-Seconds": "1"})
 	assert.Empty(t, rec.Header().Get("X-Authn-Age-Seconds"))
+}
+
+// R-2: the age comes from auth_time, the moment of authentication.
+func TestVerify_AuthnAgeFromAuthTime(t *testing.T) {
+	claims := validClaims()
+	claims["iat"] = time.Now().Unix()                               // freshly re-resolved envelope...
+	claims["auth_time"] = time.Now().Add(-600 * time.Second).Unix() // ...for a 10-minute-old login
+	rec := verifyClaims(t, claims, map[string]string{"X-Authn-Age-Seconds": "1"})
+	age, err := strconv.Atoi(rec.Header().Get("X-Authn-Age-Seconds"))
+	require.NoError(t, err)
+	assert.InDelta(t, 600, age, 5, "the age is since auth_time, never since iat or the client's value")
+}
+
+// An auth_time well in the future is not a fresh login; within the skew
+// allowance it reads as 0.
+func TestVerify_FutureAuthTime(t *testing.T) {
+	claims := validClaims()
+	claims["auth_time"] = time.Now().Add(10 * time.Minute).Unix()
+	rec := verifyClaims(t, claims, nil)
+	assert.Empty(t, rec.Header().Get("X-Authn-Age-Seconds"))
+
+	claims["auth_time"] = time.Now().Add(20 * time.Second).Unix()
+	rec = verifyClaims(t, claims, nil)
+	assert.Equal(t, "0", rec.Header().Get("X-Authn-Age-Seconds"))
 }

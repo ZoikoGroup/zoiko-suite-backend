@@ -274,16 +274,27 @@ func (s *Service) approvalAuthz(ctx context.Context, a *domain.ApprovalRequest) 
 		return s.authorizeIn(ctx, s.platformScopeID, "tenant", "provision.approve")
 	case domain.ApprovalSubjectTenantCommand:
 		return s.authorize(ctx, "tenant", domain.TenantCommand(a.CommandName).AuthzAction()+".approve")
+	// Entity subjects are decided at the entity the request changes, as their
+	// proposals are (F-2, 19 Oct 2026): a checker scoped to one entity could
+	// otherwise approve another entity's legal-name change.
 	case domain.ApprovalSubjectLegalProfileAmendment:
-		return s.authorize(ctx, "entity", "profile.amend.approve")
+		return s.authorizeEntity(ctx, a.SubjectID, "entity", "profile.amend.approve")
 	case domain.ApprovalSubjectRegistryConflictResolution:
-		return s.authorize(ctx, "entity.registry-conflict", "resolve.approve")
+		return s.authorizeConflict(ctx, a.SubjectID, "resolve.approve")
 	case domain.ApprovalSubjectLegalEntityVerification:
-		return s.authorize(ctx, "entity", "verify.approve")
+		return s.authorizeEntity(ctx, a.SubjectID, "entity", "verify.approve")
 	case domain.ApprovalSubjectLegalEntityMerge:
-		return s.authorize(ctx, "entity", "merge.approve")
+		var m struct {
+			SurvivorLegalEntityID string `json:"survivor_legal_entity_id"`
+		}
+		_ = json.Unmarshal(a.Payload, &m)
+		ids := []string{a.SubjectID}
+		if strings.TrimSpace(m.SurvivorLegalEntityID) != "" {
+			ids = append(ids, m.SurvivorLegalEntityID)
+		}
+		return s.authorizeEntities(ctx, "entity", "merge.approve", ids...)
 	case domain.ApprovalSubjectLegalEntityUnmerge:
-		return s.authorize(ctx, "entity", "unmerge.approve")
+		return s.authorizeEntity(ctx, a.SubjectID, "entity", "unmerge.approve")
 	case domain.ApprovalSubjectTenantHomeRegion:
 		// Platform authority, like the proposal: a hard isolation identifier.
 		return s.authorizeIn(ctx, s.platformScopeID, "tenant", domain.TenantCommandChangeHomeRegion.AuthzAction()+".approve")

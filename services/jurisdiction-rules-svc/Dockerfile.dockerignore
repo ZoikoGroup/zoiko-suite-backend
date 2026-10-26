@@ -1,0 +1,13 @@
+# Used by BuildKit for builds with -f services/jurisdiction-rules-svc/Dockerfile.
+# The context is the repository root (see the Dockerfile), so everything is
+# excluded except the modules the image is built from.
+*
+!services/jurisdiction-rules-svc/
+!services/identity-envelope/
+
+# Not needed inside the image.
+services/jurisdiction-rules-svc/.gotmp/
+services/jurisdiction-rules-svc/**/*.exe
+services/jurisdiction-rules-svc/**/*_test.go
+services/jurisdiction-rules-svc/deployments/
+services/identity-envelope/**/*_test.go

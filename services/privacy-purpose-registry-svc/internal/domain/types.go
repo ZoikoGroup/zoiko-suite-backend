@@ -424,3 +424,23 @@ type ActivityEventPayload struct {
 	// that stopped governing because a later version was activated.
 	SupersededByVersionID *string `json:"superseded_by_version_id,omitempty"`
 }
+
+// ActivityLifecycleAudit is one append-only row of activity_lifecycle_audit: who
+// moved which activity version between which statuses, and under which
+// correlation id. It is evidence; the service only ever reads it back.
+type ActivityLifecycleAudit struct {
+	AuditID               string     `json:"audit_id"`
+	TenantID              *string    `json:"tenant_id,omitempty"`
+	ActivityID            string     `json:"activity_id"`
+	ActivityVersionID     string     `json:"activity_version_id"`
+	Action                string     `json:"action"`
+	FromStatus            *string    `json:"from_status,omitempty"`
+	ToStatus              string     `json:"to_status"`
+	ActorPrincipalID      string     `json:"actor_principal_id"`
+	CorrelationID         string     `json:"correlation_id"`
+	Reason                *string    `json:"reason,omitempty"`
+	SupersededByVersionID *string    `json:"superseded_by_version_id,omitempty"`
+	EffectiveFrom         *time.Time `json:"effective_from,omitempty"`
+	EffectiveTo           *time.Time `json:"effective_to,omitempty"`
+	RecordedAt            time.Time  `json:"recorded_at"`
+}

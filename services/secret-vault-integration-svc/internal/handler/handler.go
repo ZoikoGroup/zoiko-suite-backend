@@ -82,11 +82,11 @@ type EventPublisher interface {
 type Handler struct {
 	// requireSharedException: see RequireSharedSecretException.
 	requireSharedException bool
-	store     SecretVaultStore
-	vault     VaultBackend
-	publisher EventPublisher
-	authz     authz.Client
-	log       *zap.Logger
+	store                  SecretVaultStore
+	vault                  VaultBackend
+	publisher              EventPublisher
+	authz                  authz.Client
+	log                    *zap.Logger
 
 	// authzPlatformScopeID is the legal_entity_id used for secret policy
 	// administration, which is platform-scoped rather than entity-scoped.
@@ -136,14 +136,14 @@ func (nopMetrics) VaultBackendError(string)     {}
 // New constructs a Handler.
 func New(store SecretVaultStore, vault VaultBackend, publisher EventPublisher, authzClient authz.Client, authzPlatformScopeID string, maxLeaseDurationCeiling int, log *zap.Logger) *Handler {
 	return &Handler{
-		store:                    store,
-		vault:                    vault,
-		publisher:                publisher,
-		authz:                    authzClient,
-		authzPlatformScopeID:     authzPlatformScopeID,
-		maxLeaseDurationCeiling:  maxLeaseDurationCeiling,
-		log:                      log,
-		metrics:                  nopMetrics{},
+		store:                   store,
+		vault:                   vault,
+		publisher:               publisher,
+		authz:                   authzClient,
+		authzPlatformScopeID:    authzPlatformScopeID,
+		maxLeaseDurationCeiling: maxLeaseDurationCeiling,
+		log:                     log,
+		metrics:                 nopMetrics{},
 	}
 }
 
@@ -1825,10 +1825,10 @@ func activeExceptionFor(exceptions []*domain.SharedSecretException, secretPath s
 // ── shared-secret exception register ─────────────────────────────────────────
 
 type createSharedSecretExceptionRequest struct {
-	SecretPath        string `json:"secret_path"`
-	Reason            string `json:"reason"`
-	EvidenceReference string `json:"evidence_reference"`
-	TenantID          *string `json:"tenant_id,omitempty"`
+	SecretPath        string    `json:"secret_path"`
+	Reason            string    `json:"reason"`
+	EvidenceReference string    `json:"evidence_reference"`
+	TenantID          *string   `json:"tenant_id,omitempty"`
 	ExpiresAt         time.Time `json:"expires_at"`
 }
 
@@ -1875,13 +1875,13 @@ func (h *Handler) CreateSharedSecretException(w http.ResponseWriter, r *http.Req
 	}
 
 	e, created, err := h.store.CreateSharedSecretException(r.Context(), domain.SharedSecretException{
-		ExceptionID:          uuid.NewString(),
-		SecretPath:           req.SecretPath,
-		Reason:               req.Reason,
-		EvidenceReference:    req.EvidenceReference,
+		ExceptionID:           uuid.NewString(),
+		SecretPath:            req.SecretPath,
+		Reason:                req.Reason,
+		EvidenceReference:     req.EvidenceReference,
 		ApprovedByPrincipalID: principalID,
-		TenantID:             req.TenantID,
-		ExpiresAt:            req.ExpiresAt,
+		TenantID:              req.TenantID,
+		ExpiresAt:             req.ExpiresAt,
 	})
 	if err != nil {
 		switch {
@@ -1996,10 +1996,10 @@ const (
 	ActionSecretExceptionRevoke       = "SECRET_EXCEPTION_REVOKE"
 
 	// Read actions
-	ActionSecretPolicyList          = "SECRET_POLICY_LIST"
-	ActionSecretPolicyVersionList   = "SECRET_POLICY_VERSION_LIST"
-	ActionSecretLeaseRead           = "SECRET_LEASE_READ"
-	ActionSecretAuditRead           = "SECRET_AUDIT_READ"
+	ActionSecretPolicyList        = "SECRET_POLICY_LIST"
+	ActionSecretPolicyVersionList = "SECRET_POLICY_VERSION_LIST"
+	ActionSecretLeaseRead         = "SECRET_LEASE_READ"
+	ActionSecretAuditRead         = "SECRET_AUDIT_READ"
 )
 
 // requirePrincipal resolves the acting principal from the gateway-verified

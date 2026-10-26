@@ -12,9 +12,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/go-chi/chi/v5/middleware"
+	svcenvelope "zoiko.io/corporate-actions-svc/internal/envelope"
 )
 
 // Sentinel errors. Callers must fail closed: any error returned means the
@@ -91,7 +95,29 @@ func (c *Client) EvaluateSufficient(ctx context.Context, tenantID, legalEntityID
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Tenant-Id", tenantID)
 	req.Header.Set("X-Principal-Id", principalID)
+	req.Header.Set("X-Legal-Entity-Id", legalEntityID)
 	req.Header.Set("X-Correlation-ID", correlationID)
+
+	// evidence-requirements-svc enforces the canonical input envelope and
+	// answers 401/400 without it. Forward the same verified context this
+	// service already forwards to authorization-svc, and use the business
+	// correlation id as the evaluation's idempotency key.
+	evidenceRequestID := middleware.GetReqID(ctx)
+	evidenceSourceChannel := "system"
+	if env, ok := svcenvelope.FromContext(ctx); ok {
+		if env.RequestID != "" {
+			evidenceRequestID = env.RequestID
+		}
+		if env.SourceChannel != "" {
+			evidenceSourceChannel = string(env.SourceChannel)
+		}
+	}
+	if evidenceRequestID == "" {
+		evidenceRequestID = correlationID
+	}
+	req.Header.Set("X-Request-Id", evidenceRequestID)
+	req.Header.Set("X-Source-Channel", evidenceSourceChannel)
+	req.Header.Set("Idempotency-Key", correlationID)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -108,8 +134,13 @@ func (c *Client) EvaluateSufficient(ctx context.Context, tenantID, legalEntityID
 		return ErrServiceUnavailable
 	}
 
-	if res.Outcome == "MISSING" {
+	// Allow-list, not a deny-list: an empty or unknown outcome must not pass.
+	switch res.Outcome {
+	case "SATISFIED", "NO_REQUIREMENTS_DEFINED":
+		return nil
+	case "MISSING":
 		return ErrEvidenceMissing
+	default:
+		return fmt.Errorf("%w: unrecognised evaluation outcome %q", ErrServiceUnavailable, res.Outcome)
 	}
-	return nil
 }

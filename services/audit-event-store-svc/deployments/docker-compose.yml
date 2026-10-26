@@ -15,6 +15,26 @@
 #
 # Log limits: all containers cap at 10 MB / 3 rotated files to prevent unbounded disk use.
 #
+# REDUCED DEVELOPMENT TOPOLOGY (deliberate, not a parity bug):
+#   This stack is a deliberately minimal single-service sandbox, NOT an
+#   equivalent of the platform deployment in <repo-root>/deployments/
+#   docker-compose.yml. Two consequences are intentional and documented so
+#   nobody mistakes them for drift:
+#
+#   1. TOPICS. KAFKA_TOPICS below lists two topics, not the ~79 platform-wide
+#      `zoiko.*.events` topics the platform stack subscribes this service to
+#      (AUD-01 universal ingestion). A reduced topic set is enough to exercise
+#      the consumer loop locally; it does NOT consume the complete platform
+#      event set. Use the platform stack to validate full ingestion.
+#   2. AUTHORIZATION. No authorization-svc runs here. AUTHZ_SERVICE_URL is set
+#      explicitly anyway (rather than left to the compiled-in default) so the
+#      dependency is visible: with it unreachable, every business route fails
+#      CLOSED with 503 (never a silent 200) — see internal/handler/authorize.
+#      /healthz and /readyz are unaffected and still serve 200.
+#
+#   Both are configuration, not code: the service's behaviour (six routes, all
+#   gated on principal + tenant, fail-closed RBAC) is identical in both stacks.
+#
 # Usage:
 #   docker compose up --build          # build & start everything
 #   docker compose up -d --build       # background mode
@@ -44,7 +64,17 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
     volumes:
+      # All five migrations, applied in filename order on first init so the
+      # local schema matches production: initial schema, hash-chain fields,
+      # audit_events RLS (000003), archive tables (000004) and archive tenant
+      # isolation (000005). initdb only runs on an EMPTY volume — an existing
+      # dev volume from before this change keeps its old schema; `docker
+      # compose down -v` drops it for a clean rebuild.
       - ./migrations/000001_initial_schema.up.sql:/docker-entrypoint-initdb.d/001_init.sql:ro
+      - ./migrations/000002_add_hash_chain_fields.up.sql:/docker-entrypoint-initdb.d/002_hash_chain_fields.sql:ro
+      - ./migrations/000003_add_rls.up.sql:/docker-entrypoint-initdb.d/003_rls.sql:ro
+      - ./migrations/000004_add_archives.up.sql:/docker-entrypoint-initdb.d/004_archives.sql:ro
+      - ./migrations/000005_add_archive_tenant_isolation.up.sql:/docker-entrypoint-initdb.d/005_archive_tenant_isolation.sql:ro
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d audit_event_store"]
@@ -128,7 +158,14 @@ services:
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_GROUP_ID: audit-event-store-svc
+      # Reduced dev topic set — see REDUCED DEVELOPMENT TOPOLOGY note at the
+      # top of this file. The platform stack subscribes to the full ~79-topic
+      # set for AUD-01 universal ingestion; this sandbox does not.
       KAFKA_TOPICS: "zoiko.identity.events,zoiko.entity.events"
+      # Explicit rather than relying on the compiled-in default, so the
+      # authorization dependency is visible. No authorization-svc runs in this
+      # stack, so business routes fail closed with 503 — by design.
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       GOMAXPROCS: "1"
     depends_on:
       postgres:

@@ -1,6 +1,7 @@
 package handler_test
 
 import (
+	"encoding/json"
 	"context"
 	"time"
 
@@ -29,14 +30,25 @@ type stubStore struct {
 	activities       map[string]*domain.ProcessingActivity
 	activityVersions map[string]*domain.ProcessingActivityVersion
 	idempotency      map[string]*domain.IdempotencyRecord
+	// suspensions mirrors the SUSPEND/RESUME rows of activity_lifecycle_audit,
+	// per version, in the order they happened.
+	suspensions map[string][]stubSuspension
 
 	// idempotencyErr, when set, makes GetIdempotency fail (fail-closed test).
 	idempotencyErr error
+	// idempotencySaveErr, when set, makes the atomic commit fail (nothing persists).
+	idempotencySaveErr error
+	executions         int
 
 	// seq mirrors the real PgStore's sequence_no column: a monotonic,
 	// collision-proof insertion ordinal used to break effective_from ties.
 	nextSeq int
 	seq     map[string]int
+}
+
+type stubSuspension struct {
+	action string // SUSPEND | RESUME
+	at     time.Time
 }
 
 func newStubStore() *stubStore {
@@ -47,6 +59,7 @@ func newStubStore() *stubStore {
 		activityVersions: map[string]*domain.ProcessingActivityVersion{},
 		idempotency:      map[string]*domain.IdempotencyRecord{},
 		seq:              map[string]int{},
+		suspensions:      map[string][]stubSuspension{},
 	}
 }
 
@@ -172,11 +185,19 @@ func (s *stubStore) ResolvePurposeAsOf(ctx context.Context, purposeID string, as
 	return best, nil
 }
 
+// ListPurposes mirrors PgStore.ListPurposes: one row per visible purpose — the
+// published version in force now (ResolvePurposeAsOf at the current instant).
 func (s *stubStore) ListPurposes(ctx context.Context) ([]domain.PurposeVersion, error) {
 	var out []domain.PurposeVersion
+	now := time.Now().UTC()
+	seen := map[string]bool{}
 	for _, v := range s.purposeVersions {
-		if v.VersionStatus == domain.PurposeStatusPublished && visible(ctx, v.TenantID) {
-			out = append(out, *v)
+		if seen[v.PurposeID] || v.VersionStatus != domain.PurposeStatusPublished || !visible(ctx, v.TenantID) {
+			continue
+		}
+		seen[v.PurposeID] = true
+		if cur, err := s.ResolvePurposeAsOf(ctx, v.PurposeID, now, now); err == nil {
+			out = append(out, *cur)
 		}
 	}
 	return out, nil
@@ -271,7 +292,42 @@ func (s *stubStore) ResolveActivityAsOf(ctx context.Context, activityID string, 
 	if best == nil {
 		return nil, domain.ErrActivityNotFound
 	}
-	return best, nil
+	// Same rule as PgStore.statusAt: the status at the requested instants, not
+	// today's stored status.
+	out := *best
+	out.VersionStatus = s.statusAt(best, asOf, knownAsOf)
+	return &out, nil
+}
+
+func (s *stubStore) statusAt(v *domain.ProcessingActivityVersion, asOf, knownAsOf time.Time) domain.ActivityVersionStatus {
+	now := time.Now().UTC()
+	if !asOf.Before(now) && !knownAsOf.Before(now) && v.VersionStatus != domain.ActivityStatusRetired {
+		return v.VersionStatus
+	}
+	events := s.suspensions[v.ActivityVersionID]
+	var last *stubSuspension
+	for i := range events {
+		e := &events[i]
+		if e.at.After(asOf) || e.at.After(knownAsOf) {
+			continue
+		}
+		if last == nil || !e.at.Before(last.at) {
+			last = e
+		}
+	}
+	switch {
+	case last != nil && last.action == "SUSPEND":
+		return domain.ActivityStatusSuspended
+	case last != nil:
+		return domain.ActivityStatusActive
+	case len(events) == 0 && v.VersionStatus == domain.ActivityStatusSuspended:
+		return domain.ActivityStatusSuspended
+	}
+	return domain.ActivityStatusActive
+}
+
+func (s *stubStore) ListActivityAudit(_ context.Context, _ string) ([]domain.ActivityLifecycleAudit, error) {
+	return []domain.ActivityLifecycleAudit{}, nil
 }
 
 func (s *stubStore) ListActiveActivities(ctx context.Context, role, jurisdiction string) ([]domain.ProcessingActivityVersion, error) {
@@ -326,6 +382,10 @@ func (s *stubStore) TransitionActivity(ctx context.Context, activityID, versionI
 	now := time.Now().UTC()
 	v.VersionStatus = to
 	switch to {
+	case domain.ActivityStatusSuspended:
+		s.suspensions[versionID] = append(s.suspensions[versionID], stubSuspension{"SUSPEND", now})
+	case domain.ActivityStatusActive:
+		s.suspensions[versionID] = append(s.suspensions[versionID], stubSuspension{"RESUME", now})
 	case domain.ActivityStatusApproved:
 		v.ApprovedByPrincipalID = &principalID
 		v.ApprovedAt = &now
@@ -397,11 +457,33 @@ func (s *stubStore) GetIdempotency(ctx context.Context, tenantID, principalID, k
 	return s.idempotency[tenantID+":"+principalID+":"+key], nil
 }
 
-func (s *stubStore) SaveIdempotency(ctx context.Context, record domain.IdempotencyRecord) error {
+// RunIdempotent mirrors PgStore.RunIdempotent's all-or-nothing contract: a
+// prior claim returns the stored record without executing; a commit failure
+// (idempotencySaveErr) fails the operation BEFORE anything is persisted; a
+// failing operation stores nothing and consumes no key.
+func (s *stubStore) RunIdempotent(ctx context.Context, claim domain.IdempotencyRecord, fn func(ctx context.Context) (int, any, error)) (*domain.IdempotencyRecord, int, any, error) {
 	tenantStr := ""
-	if record.TenantID != nil {
-		tenantStr = *record.TenantID
+	if claim.TenantID != nil {
+		tenantStr = *claim.TenantID
 	}
-	s.idempotency[tenantStr+":"+record.PrincipalID+":"+record.IdempotencyKey] = &record
-	return nil
+	k := tenantStr + ":" + claim.PrincipalID + ":" + claim.IdempotencyKey
+	if rec, ok := s.idempotency[k]; ok {
+		return rec, 0, nil, nil
+	}
+	if s.idempotencySaveErr != nil {
+		return nil, 0, nil, domain.ErrStoreUnavailable
+	}
+	status, payload, err := fn(ctx)
+	if err != nil {
+		return nil, 0, nil, err
+	}
+	body, mErr := json.Marshal(payload)
+	if mErr != nil {
+		return nil, 0, nil, mErr
+	}
+	rec := claim
+	rec.ResponseStatus, rec.ResponseBody = status, body
+	s.idempotency[k] = &rec
+	s.executions++
+	return nil, status, payload, nil
 }

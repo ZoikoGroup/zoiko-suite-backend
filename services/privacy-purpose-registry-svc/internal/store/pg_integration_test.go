@@ -843,7 +843,9 @@ func TestRLS_OutboxAndIdempotencyDoNotLeakAcrossScopes(t *testing.T) {
 
 	// Idempotency records: cached bodies must not cross scopes.
 	rec := domain.IdempotencyRecord{IdempotencyKey: "k1", TenantID: ptr(tenantA), PrincipalID: "p", Operation: "op", RequestHash: "h", ResponseStatus: 201, ResponseBody: []byte(`{"secret":1}`)}
-	if err := st.SaveIdempotency(tctx(tenantA), rec); err != nil {
+	if _, _, _, err := st.RunIdempotent(tctx(tenantA), rec, func(context.Context) (int, any, error) {
+		return 201, map[string]int{"secret": 1}, nil
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if got, _ := st.GetIdempotency(tctx(tenantA), tenantA, "p", "k1"); got == nil {
@@ -855,7 +857,9 @@ func TestRLS_OutboxAndIdempotencyDoNotLeakAcrossScopes(t *testing.T) {
 	if got, _ := st.GetIdempotency(tctx(platform), "", "p", "k1"); got != nil {
 		t.Error("the platform plane read a tenant's cached response")
 	}
-	if err := st.SaveIdempotency(context.Background(), domain.IdempotencyRecord{IdempotencyKey: "k2", PrincipalID: "p", Operation: "op", RequestHash: "h", ResponseStatus: 200, ResponseBody: []byte(`{}`)}); err == nil {
+	if _, _, _, err := st.RunIdempotent(context.Background(), domain.IdempotencyRecord{IdempotencyKey: "k2", PrincipalID: "p", Operation: "op", RequestHash: "h"}, func(context.Context) (int, any, error) {
+		return 200, map[string]int{}, nil
+	}); err == nil {
 		t.Error("a tenant-less context stored a platform idempotency record")
 	}
 }

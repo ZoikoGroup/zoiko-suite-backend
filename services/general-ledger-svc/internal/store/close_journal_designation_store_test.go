@@ -1,6 +1,6 @@
 package store_test
 
-// Migration 000018 adds the journal-level close-journal designation that
+// Migration 000027 adds the journal-level close-journal designation that
 // ACC-14's CLOSE_REVIEW policy consults. These tests prove the column survives
 // a real Postgres round trip, that the database itself refuses an unrecognised
 // designation or one that disagrees with journal_type, and that the down
@@ -154,7 +154,7 @@ func TestPgStore_CloseJournalDesignation_DatabaseRejectsInvalidValues(t *testing
 	}
 }
 
-func TestMigration000018_DownRefusesWhileDesignationExists(t *testing.T) {
+func TestMigration000027_DownRefusesWhileDesignationExists(t *testing.T) {
 	pool := openTestPool(t)
 	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
 
@@ -174,11 +174,11 @@ func TestMigration000018_DownRefusesWhileDesignationExists(t *testing.T) {
 
 	_, filename, _, _ := runtime.Caller(0)
 	migrationDir := filepath.Join(filepath.Dir(filename), "../../deployments/migrations")
-	downSQL, err := os.ReadFile(filepath.Join(migrationDir, "000018_add_close_journal_designation.down.sql"))
+	downSQL, err := os.ReadFile(filepath.Join(migrationDir, "000027_add_close_journal_designation.down.sql"))
 	if err != nil {
 		t.Fatalf("read down migration: %v", err)
 	}
-	upSQL, err := os.ReadFile(filepath.Join(migrationDir, "000018_add_close_journal_designation.up.sql"))
+	upSQL, err := os.ReadFile(filepath.Join(migrationDir, "000027_add_close_journal_designation.up.sql"))
 	if err != nil {
 		t.Fatalf("read up migration: %v", err)
 	}
@@ -195,7 +195,7 @@ func TestMigration000018_DownRefusesWhileDesignationExists(t *testing.T) {
 	if err == nil {
 		t.Fatal("down migration succeeded while a journal still carried a close-journal designation")
 	}
-	if !strings.Contains(err.Error(), "cannot roll back 000018") {
+	if !strings.Contains(err.Error(), "cannot roll back 000027") {
 		t.Fatalf("down migration refused for the wrong reason: %v", err)
 	}
 

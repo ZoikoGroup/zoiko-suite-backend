@@ -113,7 +113,7 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 		PayloadData:         req.PayloadData,
 		EvidenceManifestRef: req.EvidenceManifestRef,
 		Notes:               req.Notes,
-		CreatedBy:           req.CreatedBy,
+		CreatedBy:           principal,
 	}
 
 	if err := h.store.Create(r.Context(), d); err != nil {
@@ -183,6 +183,12 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !h.checkAuthorized(w, r, principal, existing.LegalEntityID, ActionFilingDraftUpdate) {
+		return
+	}
+
+	// Immutability guard (INV-07 / D3): Finalized drafts are immutable.
+	if existing.ValidationStatus == domain.StatusReadyForSubmission {
+		writeError(w, http.StatusConflict, "cannot update a finalized filing draft")
 		return
 	}
 
@@ -338,6 +344,8 @@ func (h *Handler) Finalize(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "filing draft not found")
 		case errors.Is(err, domain.ErrValidationBlocked):
 			writeError(w, http.StatusUnprocessableEntity, "filing draft is blocked by validation errors")
+		case errors.Is(err, domain.ErrValidationRequired):
+			writeError(w, http.StatusUnprocessableEntity, "filing draft must be validated before finalization")
 		case errors.Is(err, domain.ErrDraftAlreadyFinal):
 			writeError(w, http.StatusConflict, "filing draft is already finalized")
 		default:

@@ -519,3 +519,19 @@ consolidation entries in a group entity's statutory ledger.
     refuses while a claim exists.
   - *Suite.* `go test -tags=integration -count=1 -timeout=400s ./...` ran
     against a fresh, disposable `postgres:16-alpine` container and passed.
+
+- **B12. Adjustments post to the group book of general-ledger-svc, not to an entity ledger (A1 closed; A8 answered there).**
+  - *What changed.* `PostConsolidationAdjustment` no longer calls `/v1/postings/events`. It finds the consolidation group of the
+    general-ledger-svc group book whose reporting entity is the adjustment's `group_legal_entity_id`, submits the adjustment there as a
+    group adjustment (source reference = this adjustment's id, evidence reference likewise, lines as signed amounts, debit positive) and
+    approves it there as the principal who approved it here. The id it records in `consolidation_book_journal_id` is now
+    general-ledger-svc's group adjustment id; nothing in an entity ledger is written. A retried post is the same adjustment (source
+    reference), and an entity that is nobody's reporting entity is refused with 422 `no_group_book`.
+  - *Reversal.* `ReverseConsolidationAdjustment` withdraws that group adjustment. One that a consolidation run of the group book has
+    already applied answers 409 `adjustment_in_group_run`: the run is superseded there first.
+  - *A8.* general-ledger-svc's consolidation run applies every approved group adjustment up to its period, in the group book only, and
+    records which. This service's own runs still do not read `consolidation_adjustments` (A8 stays open here); the group figures that
+    count are the group book's.
+  - *Still open.* Entries posted between 2026-09-07 and 2026-09-30 into a group entity's statutory ledger (see the top of this file)
+    are not found or moved by this change. The group adjustment is approved by forwarding the recorded approver's principal id on an
+    internal call, as every other call here forwards its caller.

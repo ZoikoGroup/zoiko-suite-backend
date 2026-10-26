@@ -49,6 +49,13 @@ var (
 	// resolved. Also fail-closed: a determination that silently omits the
 	// seller's registration status is one whose central fact is unknown.
 	ErrRegistryUnavailable = errors.New("seller tax registration could not be resolved — tenant-entity-registry-svc unreachable")
+
+	// ErrTaxRuleNotFound enforces Invariant 3: a missing tax rule blocks determination
+	// rather than falling back to 0%.
+	ErrTaxRuleNotFound = errors.New("no active tax rule found matching jurisdiction and category — missing rule blocks determination")
+
+	// ErrTaxRulesServiceUnavailable enforces fail-closed semantics when tax-rules-svc is unreachable.
+	ErrTaxRulesServiceUnavailable = errors.New("tax-rules-svc could not be reached — fail closed")
 )
 
 // ValidCurrencyCode reports whether s has the shape of an ISO 4217 alphabetic

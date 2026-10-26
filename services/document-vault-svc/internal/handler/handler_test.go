@@ -40,6 +40,11 @@ type stubStore struct {
 	linkSeq           int
 	classificationSeq int
 	createErr         error
+	idem              map[string]*domain.IdempotencyRecord
+	idemLookupErr     error
+	dispositionErr    error
+	createCalls       int
+	addVersionCalls   int
 	addVersionErr     error
 	findErr           error
 	recordErr         error
@@ -50,6 +55,7 @@ func newStubStore() *stubStore {
 }
 
 func (s *stubStore) CreateDocument(_ context.Context, doc *domain.Document, v *domain.DocumentVersion, _ string) error {
+	s.createCalls++
 	if s.createErr != nil {
 		return s.createErr
 	}
@@ -80,6 +86,7 @@ func (s *stubStore) CreateDocument(_ context.Context, doc *domain.Document, v *d
 }
 
 func (s *stubStore) AddVersion(_ context.Context, documentID string, v *domain.DocumentVersion, _ string) (*domain.Document, error) {
+	s.addVersionCalls++
 	if s.addVersionErr != nil {
 		return nil, s.addVersionErr
 	}
@@ -93,6 +100,51 @@ func (s *stubStore) AddVersion(_ context.Context, documentID string, v *domain.D
 	v.DocumentVersionID = "ver-new"
 	s.versions[documentID] = append(s.versions[documentID], *v)
 	return doc, nil
+}
+
+// ── idempotency (mirrors PgStore: the claim commits with the operation) ──────
+
+func (s *stubStore) idemKey(principalID, key string) string { return principalID + "|" + key }
+
+func (s *stubStore) GetIdempotency(_ context.Context, principalID, key string) (*domain.IdempotencyRecord, error) {
+	if s.idemLookupErr != nil {
+		return nil, s.idemLookupErr
+	}
+	return s.idem[s.idemKey(principalID, key)], nil
+}
+
+func (s *stubStore) claim(c domain.IdempotencyClaim, body any) {
+	if s.idem == nil {
+		s.idem = map[string]*domain.IdempotencyRecord{}
+	}
+	b, _ := json.Marshal(body)
+	s.idem[s.idemKey(c.PrincipalID, c.Key)] = &domain.IdempotencyRecord{
+		PrincipalID: c.PrincipalID, Key: c.Key, Operation: c.Operation, RequestHash: c.RequestHash,
+		ResponseStatus: http.StatusCreated, ResponseBody: b,
+	}
+}
+
+func (s *stubStore) CreateDocumentIdempotent(ctx context.Context, c domain.IdempotencyClaim, doc *domain.Document, v *domain.DocumentVersion, corr string) (*domain.IdempotencyRecord, error) {
+	if rec := s.idem[s.idemKey(c.PrincipalID, c.Key)]; rec != nil {
+		return rec, nil
+	}
+	if err := s.CreateDocument(ctx, doc, v, corr); err != nil {
+		return nil, err
+	}
+	s.claim(c, doc)
+	return nil, nil
+}
+
+func (s *stubStore) AddVersionIdempotent(ctx context.Context, c domain.IdempotencyClaim, documentID string, v *domain.DocumentVersion, corr string) (*domain.Document, *domain.IdempotencyRecord, error) {
+	if rec := s.idem[s.idemKey(c.PrincipalID, c.Key)]; rec != nil {
+		return nil, rec, nil
+	}
+	doc, err := s.AddVersion(ctx, documentID, v, corr)
+	if err != nil {
+		return nil, nil, err
+	}
+	s.claim(c, doc)
+	return doc, nil, nil
 }
 
 func (s *stubStore) DeclareRecord(_ context.Context, p domain.DeclareRecordParams, _ string) (*domain.Document, error) {
@@ -152,6 +204,9 @@ func (s *stubStore) MoveToArchive(_ context.Context, p domain.MoveToArchiveParam
 }
 
 func (s *stubStore) RequestDisposition(_ context.Context, p domain.RequestDispositionParams, _ string) (*domain.Document, error) {
+	if s.dispositionErr != nil {
+		return nil, s.dispositionErr
+	}
 	doc, ok := s.docs[p.DocumentID]
 	if !ok {
 		return nil, domain.ErrDocumentNotFound
@@ -437,6 +492,23 @@ func (s *stubStore) GetClassification(_ context.Context, documentID string) (*do
 	return latest, nil
 }
 
+// BulkClassifyRecords mirrors PgStore: all proposals apply or none do. On the
+// first failure the proposals made so far are discarded.
+func (s *stubStore) BulkClassifyRecords(ctx context.Context, ps []domain.ClassifyRecordParams) ([]*domain.RecordClassification, error) {
+	keep, seq := len(s.classifications), s.classificationSeq
+	out := make([]*domain.RecordClassification, 0, len(ps))
+	for _, p := range ps {
+		c, err := s.ClassifyRecord(ctx, p)
+		if err != nil {
+			s.classifications = s.classifications[:keep]
+			s.classificationSeq = seq
+			return nil, &domain.BulkClassifyError{DocumentID: p.DocumentID, Err: err}
+		}
+		out = append(out, c)
+	}
+	return out, nil
+}
+
 func (s *stubStore) FindDocumentByID(_ context.Context, documentID string) (*domain.Document, error) {
 	if s.findErr != nil {
 		return nil, s.findErr
@@ -539,17 +611,24 @@ func (a *stubAuthz) called(principal, action string) bool {
 
 // ── stub scanner ─────────────────────────────────────────────────────────────
 
-// stubScanner defaults to clean, same posture as the real NoOpScanner —
-// tests that want a quarantine set clean=false explicitly.
+// stubScanner defaults to clean — tests that want a quarantine set clean=false
+// explicitly. (The service itself has no scan-less default: with no scanner
+// configured it refuses every upload; see scan.UnconfiguredScanner.)
 type stubScanner struct {
 	clean  bool
 	reason string
 	err    error
+	// calls and gotType record what the handler asked the scanner to scan, so
+	// tests can prove the scanner receives the DETECTED type.
+	calls   int
+	gotType string
 }
 
 func newStubScanner() *stubScanner { return &stubScanner{clean: true} }
 
-func (s *stubScanner) Scan(_ context.Context, _ []byte, _ string) (scan.Result, error) {
+func (s *stubScanner) Scan(_ context.Context, _ []byte, contentType string) (scan.Result, error) {
+	s.calls++
+	s.gotType = contentType
 	if s.err != nil {
 		return scan.Result{}, s.err
 	}
@@ -1520,25 +1599,27 @@ func TestBulkClassify_Success_PerDocumentResults(t *testing.T) {
 	}
 }
 
-func TestBulkClassify_UnknownDocumentDoesNotBlockOthers(t *testing.T) {
+// Atomic since the audit: one unknown document stops the WHOLE batch. The
+// earlier test of this name asserted the opposite ("does not block others");
+// the documented contract is "atomic bulk classification", so that behaviour
+// was the defect. Full coverage is in access_and_bulk_test.go.
+func TestBulkClassify_UnknownDocumentStopsTheWholeBatch(t *testing.T) {
 	st := newTestStorage(t)
 	s := newStubStore()
 	r := newRouter(s, &stubResidency{}, st)
 	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/documents", bytes.NewReader(createBody(t, "CONFIDENTIAL", "one"))))
+	before := len(s.classifications)
 
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/documents/bulk-classify", bytes.NewReader(bulkClassifyBody(t, []string{"doc-1", "nope"}, "RESTRICTED"))))
-	require.Equal(t, http.StatusOK, rec.Code, "one bad document ID must not fail the whole batch")
+	require.Equal(t, http.StatusNotFound, rec.Code)
 
-	var results []bulkClassifyResultDTO
-	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &results))
-	require.Len(t, results, 2)
-	assert.Equal(t, "doc-1", results[0].DocumentID)
-	assert.Empty(t, results[0].Error)
-	require.NotNil(t, results[0].Classification)
-	assert.Equal(t, "nope", results[1].DocumentID)
-	assert.Equal(t, "document_not_found", results[1].Error)
-	assert.Nil(t, results[1].Classification)
+	var failure map[string]any
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &failure))
+	assert.Equal(t, "document_not_found", failure["error"])
+	assert.Equal(t, "nope", failure["failed_document_id"])
+	assert.Equal(t, true, failure["rolled_back"])
+	assert.Len(t, s.classifications, before, "doc-1 must not have been classified")
 }
 
 func TestBulkClassify_EmptyDocumentIDs_Returns400(t *testing.T) {
@@ -1566,22 +1647,23 @@ func TestBulkClassify_InvalidClassificationValue_Returns400(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
 }
 
-func TestBulkClassify_AuthorizationDenied_ResultsCarryForbidden(t *testing.T) {
+func TestBulkClassify_AuthorizationDenied_StopsTheWholeBatch(t *testing.T) {
 	st := newTestStorage(t)
 	s := newStubStore()
 	az := &stubAuthz{denied: map[string]bool{testPrincipal + "|" + authz.ActionClassifyRecord: true}}
 	r := newRouterAuthz(s, &stubResidency{}, st, az)
 	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/documents", bytes.NewReader(createBody(t, "CONFIDENTIAL", "one"))))
+	before := len(s.classifications)
 
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/documents/bulk-classify", bytes.NewReader(bulkClassifyBody(t, []string{"doc-1"}, "RESTRICTED"))))
-	require.Equal(t, http.StatusOK, rec.Code, "a per-document denial is carried in the result, not the HTTP status")
+	require.Equal(t, http.StatusForbidden, rec.Code, "a denial refuses the batch; it is no longer a per-item result under a 200")
 
-	var results []bulkClassifyResultDTO
-	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &results))
-	require.Len(t, results, 1)
-	assert.Equal(t, "forbidden", results[0].Error)
-	assert.Nil(t, results[0].Classification)
+	var failure map[string]any
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &failure))
+	assert.Equal(t, "forbidden", failure["error"])
+	assert.Equal(t, "doc-1", failure["failed_document_id"])
+	assert.Len(t, s.classifications, before)
 }
 
 // ── GetAsOfClassification / ListClassificationHistory / ListUnclassified /
@@ -1594,6 +1676,12 @@ func TestGetAsOfClassification_ReturnsWhatGovernedAtThatTime(t *testing.T) {
 	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/documents", bytes.NewReader(createBody(t, "CONFIDENTIAL", "content"))))
 	original := confirmFirstClassification(t, r, s)
 	beforeReclassify := time.Now().UTC()
+	// The reclassification below is stamped with time.Now() by the stub. On a
+	// coarse clock (Windows resolution is ~15ms) that stamp can equal
+	// beforeReclassify, so the as-of query would count it as already governing and
+	// this test failed about 1 run in 30. Waiting past one clock tick makes the
+	// ordering strict without changing what is asserted.
+	time.Sleep(30 * time.Millisecond)
 
 	reclassifyReq := httptest.NewRequest(http.MethodPost, "/v1/documents/doc-1/reclassify", bytes.NewReader(classifyBody(t, "RESTRICTED", "HUMAN", nil)))
 	reclassifyRec := httptest.NewRecorder()

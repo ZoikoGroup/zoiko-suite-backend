@@ -25,6 +25,9 @@ type Config struct {
 	// hold GL_POSTING_EXECUTE and GL_POSTING_REVERSE. AccountingBook is the single
 	// default book (carried, not sent: the ledger has no book field yet).
 	LedgerServiceURL string
+	// LedgerKernelBookID, when set, posts payroll results through the accounting kernel of general-ledger-svc into this accounting book
+	// (as PAYROLL.RESULT_ACCEPTED events) instead of the legacy posting command. Empty keeps the legacy path. Reversals are unchanged.
+	LedgerKernelBookID string
 
 	// CounterpartyURL validates WFP-06 liability authorities; PaymentStatusURL is the Banking
 	// evidence for a settlement. Both fail closed.
@@ -181,6 +184,7 @@ func Load() (*Config, error) {
 		CompensationURL:               env("COMPENSATION_URL", "http://compensation-svc:8111"),
 		BenefitsURL:                   env("BENEFITS_URL", "http://benefits-svc:8112"),
 		LedgerServiceURL:              env("LEDGER_SERVICE_URL", "http://general-ledger-svc:8098"),
+		LedgerKernelBookID:            env("LEDGER_KERNEL_BOOK_ID", ""),
 		CounterpartyURL:               env("COUNTERPARTY_URL", "http://counterparty-management-svc:8124"),
 		PaymentStatusURL:              env("PAYMENT_STATUS_URL", "http://payment-status-svc:8163"),
 		PayeeBankingURL:               env("PAYEE_BANKING_URL", "http://payee-banking-identity-svc:8166"),

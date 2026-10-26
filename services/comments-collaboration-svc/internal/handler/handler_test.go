@@ -328,6 +328,7 @@ func TestGetThread_UnknownThread_Returns404(t *testing.T) {
 	_, r := newTestHandler(st, pub, az)
 
 	req := withTenant(httptest.NewRequest(http.MethodGet, "/v1/threads/thread-missing", nil))
+	req.Header.Set("X-Principal-Id", "reviewer-1")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -338,9 +339,14 @@ func TestGetThread_UnknownThread_Returns404(t *testing.T) {
 
 func TestGetCommentHistory_ReturnsEmptyArrayNotNull(t *testing.T) {
 	st, pub, az := newStubStore(), &stubPublisher{}, &stubAuthZ{}
+	_, _, _ = st.AddComment(context.Background(), domain.AddCommentParams{
+		TenantID: "default", LegalEntityID: "le-1", LinkedObjectType: "DOCUMENT", LinkedObjectID: "doc-1",
+		Body: "hello", CreatedByPrincipalID: "reviewer-1",
+	})
 	_, r := newTestHandler(st, pub, az)
 
-	req := withTenant(httptest.NewRequest(http.MethodGet, "/v1/comments/comment-none/history", nil))
+	req := withTenant(httptest.NewRequest(http.MethodGet, "/v1/comments/comment-1/history", nil))
+	req.Header.Set("X-Principal-Id", "reviewer-1")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 

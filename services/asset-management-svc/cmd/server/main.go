@@ -234,7 +234,7 @@ func main() {
 		authzBaseURL = cfg.AuthzMTLSURL
 	}
 	authzClient := &httpAuthzClient{baseURL: authzBaseURL, client: httpClientForAuthz, log: log, cache: make(map[string]cachedDecision)}
-	ledgerClient := clients.New(cfg.LedgerServiceURL, cfg.CloseServiceURL, log)
+	ledgerClient := clients.New(cfg.LedgerServiceURL, cfg.CloseServiceURL, log).WithKernelBook(cfg.LedgerKernelBookID, cfg.LedgerKernelCurrency)
 
 	// ── 5. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()

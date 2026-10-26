@@ -18,21 +18,24 @@ import (
 // stand-in for whether the control actually works. That answer lives
 // exclusively on ControlTestExecution.Result.
 type ControlTestDefinition struct {
-	ControlTestDefinitionID string    `json:"control_test_definition_id"`
-	ControlRef              string    `json:"control_ref"`
-	TestCode                string    `json:"test_code"`
-	Title                   string    `json:"title"`
-	Methodology             string    `json:"methodology"`
-	SampleApproach          string    `json:"sample_approach,omitempty"`
-	TestFrequency           string    `json:"test_frequency"`
-	DesignStatus            string    `json:"design_status"`
-	CreatedAt               time.Time `json:"created_at"`
-	CreatedByPrincipalID    string    `json:"created_by_principal_id"`
+	ControlTestDefinitionID string `json:"control_test_definition_id"`
+	// TenantID is the owning tenant; nil marks a platform catalogue entry.
+	TenantID             *string   `json:"tenant_id"`
+	ControlRef           string    `json:"control_ref"`
+	TestCode             string    `json:"test_code"`
+	Title                string    `json:"title"`
+	Methodology          string    `json:"methodology"`
+	SampleApproach       string    `json:"sample_approach,omitempty"`
+	TestFrequency        string    `json:"test_frequency"`
+	DesignStatus         string    `json:"design_status"`
+	CreatedAt            time.Time `json:"created_at"`
+	CreatedByPrincipalID string    `json:"created_by_principal_id"`
 }
 
 // CreateControlTestDefinitionParams holds input for creating a definition.
 type CreateControlTestDefinitionParams struct {
 	ControlTestDefinitionID string
+	TenantID                string
 	ControlRef              string
 	TestCode                string
 	Title                   string
@@ -52,6 +55,7 @@ type CreateControlTestDefinitionParams struct {
 // is never copied back onto ControlTestDefinition.
 type ControlTestExecution struct {
 	ControlTestExecutionID  string     `json:"control_test_execution_id"`
+	TenantID                *string    `json:"tenant_id"`
 	ControlTestDefinitionID string     `json:"control_test_definition_id"`
 	PeriodStart             time.Time  `json:"period_start"`
 	PeriodEnd               time.Time  `json:"period_end"`
@@ -71,6 +75,7 @@ type ControlTestExecution struct {
 // CreateControlTestExecutionParams holds input for recording an execution.
 type CreateControlTestExecutionParams struct {
 	ControlTestExecutionID  string
+	TenantID                string
 	ControlTestDefinitionID string
 	PeriodStart             time.Time
 	PeriodEnd               time.Time
@@ -102,6 +107,7 @@ type ControlEffectiveness struct {
 // ControlTestExecution's result.
 type Attestation struct {
 	AttestationID        string     `json:"attestation_id"`
+	TenantID             *string    `json:"tenant_id"`
 	Statement            string     `json:"statement"`
 	StatementVersion     string     `json:"statement_version"`
 	SubjectRef           string     `json:"subject_ref"`
@@ -121,6 +127,7 @@ type Attestation struct {
 // CreateAttestationParams holds input for creating an attestation.
 type CreateAttestationParams struct {
 	AttestationID        string
+	TenantID             string
 	Statement            string
 	StatementVersion     string
 	SubjectRef           string

@@ -29,8 +29,8 @@ func TestLegalForm_ELFCodeNeedsItsSourceAndLocalText(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			svc, ms := baseSvc(t)
-			seedEntityFor(ms, "ent-lf", orgTenant, "", "JUR-US")
-			_, err := svc.AmendLegalProfile(tenantCtx(orgTenant), "ent-lf", domain.AmendLegalProfileRequest{
+			seedEntityFor(ms, "e0000000-0000-4000-8000-000000000013", orgTenant, "", "JUR-US")
+			_, err := svc.AmendLegalProfile(tenantCtx(orgTenant), "e0000000-0000-4000-8000-000000000013", domain.AmendLegalProfileRequest{
 				LegalFormCode: tc.code, LegalFormSource: tc.source, LegalFormLocalText: tc.local,
 			})
 			if tc.want == nil {
