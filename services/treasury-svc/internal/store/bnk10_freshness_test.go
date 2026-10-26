@@ -19,8 +19,8 @@ func createFXExposure(t *testing.T, ctx context.Context, tenantID, legalEntityID
 		TenantID: tenantID, LegalEntityID: legalEntityID, ExposureCurrency: "EUR", FunctionalCurrency: "USD",
 		NettingScope: "SINGLE_ENTITY:" + legalEntityID, ActorPrincipalID: "analyst-1",
 	}, domain.FXExposureCalculation{
-		RateUsed: 1.1, RateAsOf: rateAsOf, RateVersion: rateVersion, AsOfTimestamp: time.Now().UTC(),
-		Buckets: []domain.FXExposureBucket{{MaturityBucket: "0-30D", Category: "RECEIVABLE", ExposureCurrencyAmount: 100, FunctionalCurrencyAmount: 110}},
+		RateUsed: "1.1", RateAsOf: rateAsOf, RateVersion: rateVersion, AsOfTimestamp: time.Now().UTC(),
+		Buckets: []domain.FXExposureBucket{{MaturityBucket: "0-30D", Category: "RECEIVABLE", ExposureCurrencyAmount: "100", FunctionalCurrencyAmount: "110"}},
 	})
 	if err != nil {
 		t.Fatalf("create fx snapshot: %v", err)

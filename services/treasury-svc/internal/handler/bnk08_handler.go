@@ -72,11 +72,11 @@ func (h *Handler) composeCashPosition(w http.ResponseWriter, r *http.Request, te
 // skipped silently. Before, both cases were a silent `continue`, so a
 // failed read understated cash with nothing to show the figure was
 // incomplete.
-func (h *Handler) composeBankBalances(w http.ResponseWriter, r *http.Request, legalEntityID, currencyCode string) (breakdown []domain.CashPositionAccountLine, bankSum float64, stale bool, ok bool) {
+func (h *Handler) composeBankBalances(w http.ResponseWriter, r *http.Request, legalEntityID, currencyCode string) (breakdown []domain.CashPositionAccountLine, bankSum domain.Decimal, stale bool, ok bool) {
 	accts, err := h.store.ListBankAccounts(r.Context(), legalEntityID)
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, "store_error", err.Error())
-		return nil, 0, false, false
+		return nil, "0", false, false
 	}
 	var eligible []domain.BankAccount
 	var ids []string
@@ -90,8 +90,9 @@ func (h *Handler) composeBankBalances(w http.ResponseWriter, r *http.Request, le
 	if err != nil {
 		h.log.Error("cash position: bank balances unavailable — failing closed", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_error", "bank balances cannot be read; cash position cannot be calculated reliably")
-		return nil, 0, false, false
+		return nil, "0", false, false
 	}
+	bankSum = "0"
 	missing := false
 	for _, acct := range eligible {
 		bal := balances[acct.BankAccountID]
@@ -101,7 +102,12 @@ func (h *Handler) composeBankBalances(w http.ResponseWriter, r *http.Request, le
 				zap.String("legal_entity_id", legalEntityID), zap.String("bank_account_id", acct.BankAccountID))
 			continue
 		}
-		bankSum += bal.AvailableBalance
+		bankSum, err = bankSum.Add(bal.AvailableBalance)
+		if err != nil {
+			h.log.Error("cash position: invalid stored balance", zap.Error(err))
+			writeError(w, http.StatusInternalServerError, "invalid_amount", err.Error())
+			return nil, "0", false, false
+		}
 		breakdown = append(breakdown, domain.CashPositionAccountLine{
 			BankAccountID: acct.BankAccountID, AccountName: acct.AccountName, Balance: bal.AvailableBalance, AsOfTimestamp: bal.AsOfTimestamp,
 		})
@@ -114,10 +120,10 @@ func (h *Handler) composeBankBalances(w http.ResponseWriter, r *http.Request, le
 }
 
 type calculateCashPositionRequest struct {
-	LegalEntityID     string  `json:"legal_entity_id"`
-	ReportingCurrency string  `json:"reporting_currency"`
-	RestrictedAmount  float64 `json:"restricted_amount"`
-	CorrelationID     string  `json:"correlation_id"`
+	LegalEntityID     string         `json:"legal_entity_id"`
+	ReportingCurrency string         `json:"reporting_currency"`
+	RestrictedAmount  domain.Decimal `json:"restricted_amount"`
+	CorrelationID     string         `json:"correlation_id"`
 }
 
 // CalculateCashPosition handles POST /v1/treasury/cash-position/calculate
@@ -134,6 +140,13 @@ func (h *Handler) CalculateCashPosition(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "missing_fields", "legal_entity_id and reporting_currency are required")
 		return
 	}
+	if req.RestrictedAmount == "" {
+		req.RestrictedAmount = "0"
+	}
+	if _, err := domain.ValidateNonNegativeMoney(req.RestrictedAmount); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_amount", err.Error())
+		return
+	}
 	tenantID := svcmiddleware.TenantFromContext(r.Context())
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
@@ -147,7 +160,12 @@ func (h *Handler) CalculateCashPosition(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
-	calc.AvailableCash = calc.BankBalance - req.RestrictedAmount - calc.PendingAPCommitments - calc.PayrollObligations - calc.TaxLiabilities
+	available, err := domain.NetDecimals(calc.BankBalance, req.RestrictedAmount, calc.PendingAPCommitments, calc.PayrollObligations, calc.TaxLiabilities)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "invalid_amount", err.Error())
+		return
+	}
+	calc.AvailableCash = available
 
 	snap, err := h.store.CreateCashPositionSnapshot(r.Context(), domain.CalculateCashPositionParams{
 		TenantID: tenantID, LegalEntityID: req.LegalEntityID, ReportingCurrency: req.ReportingCurrency,
@@ -181,6 +199,13 @@ func (h *Handler) RefreshCashPosition(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "missing_fields", "legal_entity_id and reporting_currency are required")
 		return
 	}
+	if req.RestrictedAmount == "" {
+		req.RestrictedAmount = "0"
+	}
+	if _, err := domain.ValidateNonNegativeMoney(req.RestrictedAmount); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_amount", err.Error())
+		return
+	}
 	tenantID := svcmiddleware.TenantFromContext(r.Context())
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
@@ -194,7 +219,12 @@ func (h *Handler) RefreshCashPosition(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	calc.AvailableCash = calc.BankBalance - req.RestrictedAmount - calc.PendingAPCommitments - calc.PayrollObligations - calc.TaxLiabilities
+	available, err := domain.NetDecimals(calc.BankBalance, req.RestrictedAmount, calc.PendingAPCommitments, calc.PayrollObligations, calc.TaxLiabilities)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "invalid_amount", err.Error())
+		return
+	}
+	calc.AvailableCash = available
 
 	// One transaction: the new snapshot exists only if the prior one (when
 	// given) was superseded by it, and the prior one must be for this same

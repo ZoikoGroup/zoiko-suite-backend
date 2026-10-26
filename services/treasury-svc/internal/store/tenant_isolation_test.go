@@ -201,7 +201,7 @@ func TestPgStore_CreateTreasuryTransfer_RetriedCorrelationID_DoesNotCreateASecon
 
 	params := domain.CreateTreasuryTransferParams{
 		TenantID: tenantID, SourceBankAccountID: src.BankAccountID, TargetBankAccountID: tgt.BankAccountID,
-		Amount: 200.0, CurrencyCode: "USD", CorrelationID: "corr-retry-1", MakerPrincipalID: "maker-1",
+		Amount: "200", CurrencyCode: "USD", CorrelationID: "corr-retry-1", MakerPrincipalID: "maker-1",
 	}
 	first, created1, err := s.CreateTreasuryTransfer(ctx, params)
 	if err != nil {
@@ -310,7 +310,7 @@ func TestPgStore_CreateTreasuryTransfer_Isolation(t *testing.T) {
 
 	created, _, err := s.CreateTreasuryTransfer(ctxA, domain.CreateTreasuryTransferParams{
 		TenantID: tenantA, SourceBankAccountID: acctA1.BankAccountID, TargetBankAccountID: acctA2.BankAccountID,
-		Amount: 200.0, CurrencyCode: "USD", CorrelationID: "valid-transfer", MakerPrincipalID: "maker-1",
+		Amount: "200", CurrencyCode: "USD", CorrelationID: "valid-transfer", MakerPrincipalID: "maker-1",
 	})
 	if err != nil {
 		t.Fatalf("transfer creation failed: %v", err)

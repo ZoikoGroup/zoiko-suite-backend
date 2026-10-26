@@ -18,8 +18,8 @@ func createCashPosition(t *testing.T, ctx context.Context, tenantID, legalEntity
 	snap, err := testStore.CreateCashPositionSnapshot(ctx, domain.CalculateCashPositionParams{
 		TenantID: tenantID, LegalEntityID: legalEntityID, ReportingCurrency: "USD", ActorPrincipalID: "analyst-1",
 	}, domain.CashPositionCalculation{
-		BankBalance: 100, AvailableCash: 100, AsOfTimestamp: time.Now().UTC(),
-		AccountBreakdown: []domain.CashPositionAccountLine{{BankAccountID: "acct-1", Balance: 100, AsOfTimestamp: balanceAsOf}},
+		BankBalance: "100", AvailableCash: "100", AsOfTimestamp: time.Now().UTC(),
+		AccountBreakdown: []domain.CashPositionAccountLine{{BankAccountID: "acct-1", Balance: "100", AsOfTimestamp: balanceAsOf}},
 	})
 	if err != nil {
 		t.Fatalf("create snapshot: %v", err)
@@ -148,9 +148,9 @@ func TestPgStore_GetLatestCashBalances_LatestPerAccount(t *testing.T) {
 	now := time.Now().UTC()
 	for _, b := range []struct {
 		acct   string
-		amount float64
+		amount domain.Decimal
 		asOf   time.Time
-	}{{withTwo.BankAccountID, 1, now.Add(-time.Hour)}, {withTwo.BankAccountID, 2, now}, {withOne.BankAccountID, 3, now}} {
+	}{{withTwo.BankAccountID, "1", now.Add(-time.Hour)}, {withTwo.BankAccountID, "2", now}, {withOne.BankAccountID, "3", now}} {
 		if err := testStore.CreateCashBalance(ctx, &domain.CashBalance{BalanceID: uuid.New().String(), TenantID: tenantID, BankAccountID: b.acct, LedgerBalance: b.amount, AvailableBalance: b.amount, AsOfTimestamp: b.asOf}); err != nil {
 			t.Fatalf("create balance: %v", err)
 		}
@@ -160,7 +160,7 @@ func TestPgStore_GetLatestCashBalances_LatestPerAccount(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetLatestCashBalances: %v", err)
 	}
-	if len(got) != 2 || got[withTwo.BankAccountID].AvailableBalance != 2 || got[withOne.BankAccountID].AvailableBalance != 3 || got[withNone.BankAccountID] != nil {
+	if len(got) != 2 || got[withTwo.BankAccountID].AvailableBalance != domain.Decimal("2") || got[withOne.BankAccountID].AvailableBalance != domain.Decimal("3") || got[withNone.BankAccountID] != nil {
 		t.Fatalf("latest balances: %+v", got)
 	}
 }

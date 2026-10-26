@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math/big"
 	"net/http"
 	"time"
 
@@ -36,9 +37,9 @@ func fxCurrencyPair(exposureCurrency, functionalCurrency string) string {
 // ── POST /v1/treasury/fx/rates ────────────────────────────────────────────
 
 type recordFXRateRequest struct {
-	CurrencyPair string    `json:"currency_pair"`
-	Rate         float64   `json:"rate"`
-	EffectiveAt  time.Time `json:"effective_at"`
+	CurrencyPair string         `json:"currency_pair"`
+	Rate         domain.Decimal `json:"rate"`
+	EffectiveAt  time.Time      `json:"effective_at"`
 }
 
 func (h *Handler) RecordFXRate(w http.ResponseWriter, r *http.Request) {
@@ -51,8 +52,10 @@ func (h *Handler) RecordFXRate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "missing_field", "currency_pair")
 		return
 	}
-	if req.Rate <= 0 {
-		writeError(w, http.StatusBadRequest, "invalid_rate", string(domain.ErrInvalidFXRate))
+	// NUMERIC(20,8): a rate with more than eight decimal places is refused,
+	// never rounded by the column.
+	if _, err := domain.ValidateRate(req.Rate); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_rate", err.Error())
 		return
 	}
 	if req.EffectiveAt.IsZero() {
@@ -91,14 +94,28 @@ func (h *Handler) RecordFXRate(w http.ResponseWriter, r *http.Request) {
 // functional currency at the given rate. Shared by GetFXExposure (the
 // real recorded rate) and RunFXScenario (a caller-supplied hypothetical
 // one) so both use identical bucketing logic.
-func (h *Handler) buildExposure(r *http.Request, tenantID, legalEntityID, exposureCurrency, functionalCurrency string, rate float64, rateAsOf time.Time, rateIsStale bool) (*domain.FXExposureResponse, error) {
+func (h *Handler) buildExposure(r *http.Request, tenantID, legalEntityID, exposureCurrency, functionalCurrency string, rate domain.Decimal, rateAsOf time.Time, rateIsStale bool) (*domain.FXExposureResponse, error) {
 	inflows, outflows, err := h.clients.GetLiquidityForecastData(r.Context(), tenantID, legalEntityID, exposureCurrency)
 	if err != nil {
 		return nil, err
 	}
 
 	type bucketKey struct{ bucket, category string }
-	sums := map[bucketKey]float64{}
+	sums := map[bucketKey]*big.Rat{}
+	add := func(key bucketKey, amount domain.Decimal, sign int) error {
+		rr, rerr := amount.Rat()
+		if rerr != nil {
+			return rerr
+		}
+		if sums[key] == nil {
+			sums[key] = new(big.Rat)
+		}
+		if sign < 0 {
+			rr.Neg(rr)
+		}
+		sums[key].Add(sums[key], rr)
+		return nil
+	}
 	bucketOf := func(due time.Time) string {
 		days := int(time.Until(due).Hours() / 24)
 		switch {
@@ -115,10 +132,19 @@ func (h *Handler) buildExposure(r *http.Request, tenantID, legalEntityID, exposu
 		}
 	}
 	for _, f := range inflows {
-		sums[bucketKey{bucketOf(f.DueDate), f.Category}] += f.Amount
+		if err := add(bucketKey{bucketOf(f.DueDate), f.Category}, f.Amount, 1); err != nil {
+			return nil, err
+		}
 	}
 	for _, f := range outflows {
-		sums[bucketKey{bucketOf(f.DueDate), f.Category}] -= f.Amount
+		if err := add(bucketKey{bucketOf(f.DueDate), f.Category}, f.Amount, -1); err != nil {
+			return nil, err
+		}
+	}
+
+	rateRat, err := rate.Rat()
+	if err != nil {
+		return nil, err
 	}
 
 	resp := &domain.FXExposureResponse{
@@ -127,15 +153,34 @@ func (h *Handler) buildExposure(r *http.Request, tenantID, legalEntityID, exposu
 		RateUsed: rate, RateAsOf: rateAsOf, RateIsStale: rateIsStale,
 		AsOfTimestamp: time.Now().UTC(),
 	}
+	totalExposure := new(big.Rat)
+	totalFunctional := new(big.Rat)
 	for k, amount := range sums {
-		functionalAmount := amount * rate
+		// Exposure-currency sums are exact until this point. Both figures
+		// are rendered at the NUMERIC(20,4) money scale, halves away from
+		// zero: the persisted snapshot columns cannot hold more, and
+		// rounding the bucket (not just the total) keeps the total equal
+		// to the sum of the buckets the API returns.
+		exposure, err := domain.Decimal(domain.CanonicalAmount(amount)).Rounded(domain.MoneyScale)
+		if err != nil {
+			return nil, err
+		}
+		functionalExact := new(big.Rat).Mul(amount, rateRat)
+		functional, err := domain.Decimal(domain.CanonicalAmount(functionalExact)).Rounded(domain.MoneyScale)
+		if err != nil {
+			return nil, err
+		}
 		resp.Buckets = append(resp.Buckets, domain.FXExposureBucket{
 			MaturityBucket: k.bucket, Category: k.category,
-			ExposureCurrencyAmount: amount, FunctionalCurrencyAmount: functionalAmount,
+			ExposureCurrencyAmount: exposure, FunctionalCurrencyAmount: functional,
 		})
-		resp.TotalExposureAmount += amount
-		resp.TotalFunctionalAmount += functionalAmount
+		er, _ := exposure.Rat()
+		fr, _ := functional.Rat()
+		totalExposure.Add(totalExposure, er)
+		totalFunctional.Add(totalFunctional, fr)
 	}
+	resp.TotalExposureAmount = domain.Decimal(domain.CanonicalAmount(totalExposure))
+	resp.TotalFunctionalAmount = domain.Decimal(domain.CanonicalAmount(totalFunctional))
 	return resp, nil
 }
 
@@ -161,7 +206,7 @@ func (h *Handler) GetFXExposure(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rate := 1.0
+	rate := domain.Decimal("1")
 	var rateAsOf time.Time
 	var rateIsStale bool
 	if exposureCurrency != functionalCurrency {
@@ -208,8 +253,13 @@ func (h *Handler) RunFXScenario(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "missing_fields", "legal_entity_id, exposure_currency and functional_currency are required")
 		return
 	}
-	if req.HypotheticalRate <= 0 {
-		writeError(w, http.StatusBadRequest, "invalid_rate", string(domain.ErrInvalidFXRate))
+	if req.HypotheticalRate == "" {
+		writeError(w, http.StatusBadRequest, "missing_field", "hypothetical_rate")
+		return
+	}
+	// Same NUMERIC(20,8) rule as a recorded rate: refuse, never round.
+	if _, err := domain.ValidateRate(req.HypotheticalRate); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_rate", err.Error())
 		return
 	}
 
@@ -248,9 +298,14 @@ func (h *Handler) RunFXScenario(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	delta, err := scenario.TotalFunctionalAmount.Sub(current.TotalFunctionalAmount)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "invalid_amount", err.Error())
+		return
+	}
 	writeJSON(w, http.StatusOK, domain.FXScenarioResponse{
 		Current: *current, Scenario: *scenario,
-		FunctionalAmountDelta: scenario.TotalFunctionalAmount - current.TotalFunctionalAmount,
+		FunctionalAmountDelta: delta,
 	})
 }
 
@@ -275,16 +330,16 @@ func (h *Handler) writeFXExposureErr(w http.ResponseWriter, err error) {
 // resolveExposureRate is the same rate-resolution GetFXExposure already
 // does, factored out so CalculateFXExposure can reuse it without
 // duplicating the same-currency/no-rate-recorded/staleness logic.
-func (h *Handler) resolveExposureRate(r *http.Request, tenantID, exposureCurrency, functionalCurrency string) (rate float64, rateAsOf time.Time, rateVersion string, rateIsStale bool, notRecorded bool, err error) {
+func (h *Handler) resolveExposureRate(r *http.Request, tenantID, exposureCurrency, functionalCurrency string) (rate domain.Decimal, rateAsOf time.Time, rateVersion string, rateIsStale bool, notRecorded bool, err error) {
 	if exposureCurrency == functionalCurrency {
-		return 1.0, time.Now().UTC(), "", false, false, nil
+		return "1", time.Now().UTC(), "", false, false, nil
 	}
 	fxRate, ferr := h.store.GetLatestFXRate(r.Context(), tenantID, fxCurrencyPair(exposureCurrency, functionalCurrency))
 	if ferr != nil {
 		if errors.Is(ferr, domain.ErrFXRateNotFound) {
-			return 0, time.Time{}, "", false, true, nil
+			return "", time.Time{}, "", false, true, nil
 		}
-		return 0, time.Time{}, "", false, false, ferr
+		return "", time.Time{}, "", false, false, ferr
 	}
 	return fxRate.Rate, fxRate.EffectiveAt, fxRate.RateID, time.Since(fxRate.EffectiveAt) > domain.FXRateStalenessThreshold, false, nil
 }
@@ -311,13 +366,17 @@ func (h *Handler) buildFXExposureCalculation(r *http.Request, tenantID, legalEnt
 	if err != nil {
 		return nil, err
 	}
-	var gross float64
+	grossParts := make([]domain.Decimal, 0, len(resp.Buckets))
 	for _, b := range resp.Buckets {
-		if b.FunctionalCurrencyAmount < 0 {
-			gross -= b.FunctionalCurrencyAmount
-		} else {
-			gross += b.FunctionalCurrencyAmount
+		abs, aerr := b.FunctionalCurrencyAmount.Abs()
+		if aerr != nil {
+			return nil, aerr
 		}
+		grossParts = append(grossParts, abs)
+	}
+	gross, err := domain.SumDecimals(grossParts...)
+	if err != nil {
+		return nil, err
 	}
 	return &domain.FXExposureCalculation{
 		RateUsed: rate, RateAsOf: rateAsOf, RateVersion: rateVersion, HasStaleComponent: rateIsStale,

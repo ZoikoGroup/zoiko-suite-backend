@@ -148,8 +148,11 @@ func (h *Handler) CreateTreasuryTransfer(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
 		return
 	}
-	if req.Amount <= 0 {
-		writeError(w, http.StatusBadRequest, "invalid_amount", string(domain.ErrInvalidAmount))
+	// Exact decimal, column-scale validation: an amount NUMERIC(20,4)
+	// would round is refused here, not silently changed before it reaches
+	// the hash, the threshold check, BNK-06, or the ledger.
+	if _, err := domain.ValidatePositiveMoney(req.Amount); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_amount", err.Error())
 		return
 	}
 	correlationID := r.Header.Get("X-Correlation-ID")
@@ -198,10 +201,24 @@ func (h *Handler) CreateTreasuryTransfer(w http.ResponseWriter, r *http.Request)
 			writeError(w, http.StatusServiceUnavailable, "threshold_check_failed", "cannot verify liquidity threshold before transfer")
 			return
 		}
-		if threshold != nil && bal.AvailableBalance-req.Amount < threshold.MinimumRequiredBalance {
-			h.log.Warn("transfer blocked: threshold breach on source account", zap.String("account_id", req.SourceBankAccountID))
-			writeError(w, http.StatusPreconditionFailed, "minimum_balance_breach", string(domain.ErrMinimumBalanceBreach))
-			return
+		if threshold != nil {
+			remaining, calcErr := domain.NetDecimals(bal.AvailableBalance, req.Amount)
+			if calcErr != nil {
+				h.log.Error("threshold check: exact decimal arithmetic failed", zap.Error(calcErr))
+				writeError(w, http.StatusInternalServerError, "invalid_amount", calcErr.Error())
+				return
+			}
+			cmp, cmpErr := remaining.Cmp(threshold.MinimumRequiredBalance)
+			if cmpErr != nil {
+				h.log.Error("threshold check: exact decimal comparison failed", zap.Error(cmpErr))
+				writeError(w, http.StatusInternalServerError, "invalid_amount", cmpErr.Error())
+				return
+			}
+			if cmp < 0 {
+				h.log.Warn("transfer blocked: threshold breach on source account", zap.String("account_id", req.SourceBankAccountID))
+				writeError(w, http.StatusPreconditionFailed, "minimum_balance_breach", string(domain.ErrMinimumBalanceBreach))
+				return
+			}
 		}
 	}
 
@@ -609,8 +626,8 @@ func (h *Handler) AmendTreasuryTransfer(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
 		return
 	}
-	if req.Amount <= 0 {
-		writeError(w, http.StatusBadRequest, "invalid_amount", string(domain.ErrInvalidAmount))
+	if _, err := domain.ValidatePositiveMoney(req.Amount); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_amount", err.Error())
 		return
 	}
 	principalID, ok := h.requirePrincipal(w, r)

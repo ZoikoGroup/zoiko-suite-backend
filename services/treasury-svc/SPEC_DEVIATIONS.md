@@ -62,13 +62,17 @@ Both are closed in this pass, together with:
   refresh that could retire another entity's snapshot (A13).
 - BNK-10: RecordFXRate failing on every call (A29) and a scenario silently
   using parity (A30).
+- Cross-cutting: `float64` money and rates end to end (A34), replaced with
+  exact decimals while keeping the JSON wire shape and pre-existing hashes
+  verifiable.
 
 The largest open items are structural:
 - Nothing feeds real bank balances into the service (A9).
 - Treasury transfers "complete" on BNK-06 acceptance rather than BNK-07
   settlement (A23), and a returned-then-resubmitted transfer reuses its
   original payment attempt (A24).
-- Money is `float64` throughout (A34).
+- BNK-09's four-decimal transfer amounts and BNK-06's two-decimal payment
+  amounts disagree on scale (A36).
 
 Rough coverage after this pass: BNK-01 ~70%, BNK-08 ~45%, BNK-09 ~55%, BNK-10
 ~50%.
@@ -537,16 +541,67 @@ These BNK-10 rules are met and verified in the code:
 
 ### Cross-cutting
 
-- **A34. Money is `float64` end to end.** Transfer amounts, balances,
-  thresholds, snapshot figures and FX rates are `float64` in Go, over
-  `NUMERIC(20,4)` and `NUMERIC(20,8)` columns. The transfer fingerprint and
-  protected-field hash format the float with `%.4f`, and the amount goes to
-  BNK-06 as a JSON float. This is the same ZS-DATA-001 D06 class closed in
-  payment-initiation-adapter-svc (A6 there). BNK-06 now refuses an amount its
-  column would round, but this service can still lose digits before sending.
-  *Why not fixed:* it touches every BNK-09 path, the hash and fingerprint
-  formats (which BNK-06 re-derives), and every snapshot. It deserves its own
-  pass with the `Decimal` type.
+- **A34. Money is `float64` end to end — closed in this pass.** Transfer
+  amounts, balances, thresholds, snapshot figures and FX rates were
+  `float64` in Go, over `NUMERIC(20,4)` and `NUMERIC(20,8)` columns. This is
+  the same ZS-DATA-001 D06 class closed in payment-initiation-adapter-svc
+  (A6 there). The fix follows that service's `Decimal` design:
+  - `internal/domain/decimal.go` is a string-backed `Decimal` parsed into
+    `big.Rat`; it never routes money or rates through `float64`. It has
+    separate `NUMERIC(20,4)` money and `NUMERIC(20,8)` rate validators, so an
+    input the column would round or overflow is refused, never changed.
+  - Every treasury money field and every FX rate/amount uses it: cash
+    balances, thresholds, effective cash, forecasts, BNK-08 snapshot figures,
+    BNK-09 transfer amounts and BNK-10 rates, buckets and scenario output.
+    Stores select the numeric columns with `::text`; no pgx numeric-to-float
+    conversion remains.
+  - JSON stays backward compatible: `Decimal` marshals as a bare JSON
+    number and accepts either a number or a quoted string on input. BNK-06
+    receives the exact digits as a JSON number.
+  - Arithmetic is exact `big.Rat` (`Add`, `Sub`, `Mul`, `Cmp`, `SumDecimals`,
+    `NetDecimals`). The only deliberate rounding is BNK-10's FX conversion:
+    each bucket and its functional-currency conversion are rounded to four
+    decimal places, halves away from zero, and the totals are the sums of the
+    rounded buckets so the persisted snapshot's total equals its buckets.
+  - AP/AR amounts are validated at the client boundary before they enter a
+    sum, so an upstream value the snapshot column would round fails closed.
+  - Hash compatibility was checked against real legacy values, not assumed.
+    New rows hash the exact four-place decimal text and store
+    `v2:<base64url sha256>` (46 characters, inside the existing
+    `VARCHAR(64)` column, so no schema migration). The old
+    `fmt.Sprintf("%.4f", float64)` is **not** byte-identical to that text for
+    every `NUMERIC(20,4)` value: for example the stored decimal
+    `596267352650.6170` formats through float64 as `596267352650.6169`.
+    Approval accepts the v2 exact hash for v2 rows; for an unversioned
+    64-hex row it accepts either the exact hash or the legacy float-formatted
+    hash, so a row written before this pass verifies exactly as it did under
+    the old read-back comparison. The marker matters: at large magnitudes one
+    float64 can represent two adjacent four-decimal amounts, so a legacy
+    rendering of a different amount can equal a new row's exact text. A v2
+    row is never checked against the legacy rendering. (A create-time input
+    with more than four decimals was already at risk of failing the old
+    comparison because the column rounded it; the fallback neither makes
+    that case worse nor silently accepts a changed amount.) The float64
+    parse is confined to the old-row verification fallback; it is never used
+    for a new hash, a fingerprint or money. Because the marker changes the
+    stored string, a pre-A34 instance cannot approve a v2 row: deploy this
+    service as one version. It fails closed, never silently accepts.
+  - The fingerprint is live and not stored by treasury-svc.
+    payment-initiation-adapter-svc re-fetches `/transfers/{id}/fingerprint`
+    and compares the current string, so both sides use the same algorithm;
+    BNK-06 does not hardcode the old rendering. An already-prepared BNK-06
+    attempt executes without re-verification; a repeated PrepareAttempt
+    carrying an old fingerprint fails closed rather than accepting a changed
+    value.
+  - Verification: `go build ./...`, `go vet ./...`, `go test ./...` and
+    `go test -tags integration ./internal/store -count=1` all pass against a
+    fresh disposable Postgres instance (the suite starts an embedded one when
+    `TEST_DATABASE_URL` is unset; the final run used a fresh Postgres 16
+    container), never the shared dev database. The decimal,
+    hash-compatibility and exact threshold tests are the
+    reproductions/proofs. No new N+1 queries:
+    validation and arithmetic are local, and the existing batched balance
+    reads are unchanged.
 - **A35. Efficiency and transactionality, as asked.**
   - N+1: the cash views read balances one query and one transaction per
     account. Fixed: one `DISTINCT ON` query (`GetLatestCashBalances`).
@@ -564,6 +619,16 @@ These BNK-10 rules are met and verified in the code:
     transaction, so a snapshot's components are not a single consistent
     read. That is acceptable for an analytical view; the freshness record
     says so per component.
+- **A36. BNK-09 accepts four decimal places; BNK-06 accepts two.** Treasury's
+  transfer amount is `NUMERIC(20,4)` and A34 now preserves all four digits
+  exactly. payment-initiation-adapter-svc's attempt amount is
+  `NUMERIC(18,2)`, and its A6 validator refuses a third or fourth decimal
+  rather than rounding it. A transfer with 3–4 decimals can therefore be
+  created and approved but will be refused when Execute calls BNK-06. It is
+  not silently rounded, but it also cannot execute. Resolving this needs a
+  cross-service scale decision — widen BNK-06's column or reject more than
+  two decimals at BNK-09 create/amend — so it is recorded rather than
+  invented here.
 
 ## B. Interpretations and additions (decisions a reviewer may want to reverse)
 

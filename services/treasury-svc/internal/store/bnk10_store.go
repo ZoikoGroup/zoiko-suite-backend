@@ -25,7 +25,7 @@ func (s *PgStore) RecordFXRate(ctx context.Context, p domain.RecordFXRateParams)
 		row := tx.QueryRow(ctx, `
 			INSERT INTO fx_rates (tenant_id, currency_pair, rate, effective_at, recorded_by_principal_id)
 			VALUES ($1,$2,$3,$4,$5)
-			RETURNING rate_id, tenant_id, currency_pair, rate, effective_at, recorded_by_principal_id, created_at`,
+			RETURNING rate_id, tenant_id, currency_pair, rate::text, effective_at, recorded_by_principal_id, created_at`,
 			p.TenantID, p.CurrencyPair, p.Rate, p.EffectiveAt, p.RecordedByPrincipalID)
 		return row.Scan(&r.RateID, &r.TenantID, &r.CurrencyPair, &r.Rate, &r.EffectiveAt, &r.RecordedByPrincipalID, &r.CreatedAt)
 	})
@@ -41,7 +41,7 @@ func (s *PgStore) GetLatestFXRate(ctx context.Context, tenantID, currencyPair st
 	var r domain.FXRate
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		row := tx.QueryRow(ctx, `
-			SELECT rate_id, tenant_id, currency_pair, rate, effective_at, recorded_by_principal_id, created_at
+			SELECT rate_id, tenant_id, currency_pair, rate::text, effective_at, recorded_by_principal_id, created_at
 			FROM fx_rates WHERE tenant_id=$1 AND currency_pair=$2
 			ORDER BY effective_at DESC LIMIT 1`,
 			tenantID, currencyPair)
@@ -60,8 +60,8 @@ func (s *PgStore) GetLatestFXRate(ctx context.Context, tenantID, currencyPair st
 
 const fxExposureColumns = `
 	snapshot_id, tenant_id, legal_entity_id, exposure_currency, functional_currency, as_of_timestamp,
-	rate_used, rate_as_of, rate_version, netting_scope,
-	buckets, gross_exposure_amount, net_exposure_amount,
+	rate_used::text, rate_as_of, rate_version, netting_scope,
+	buckets, gross_exposure_amount::text, net_exposure_amount::text,
 	status, has_stale_component, published_by_principal_id, published_at, superseded_by,
 	calculated_by_principal_id, correlation_id, created_at`
 
@@ -145,8 +145,8 @@ func (s *PgStore) insertFXExposureSnapshot(ctx context.Context, tx pgx.Tx, p dom
 		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'CALCULATED',$14,$15,$16)
 		RETURNING `+fxExposureColumns,
 		uuid.New().String(), p.TenantID, p.LegalEntityID, p.ExposureCurrency, p.FunctionalCurrency, calc.AsOfTimestamp,
-		calc.RateUsed, calc.RateAsOf, calc.RateVersion, p.NettingScope,
-		buckets, calc.GrossExposureAmount, calc.NetExposureAmount,
+		calc.RateUsed.OrZero(), calc.RateAsOf, calc.RateVersion, p.NettingScope,
+		buckets, calc.GrossExposureAmount.OrZero(), calc.NetExposureAmount.OrZero(),
 		calc.HasStaleComponent, p.ActorPrincipalID, p.CorrelationID,
 	)
 	if err := scanFXExposureSnapshot(row, snap); err != nil {

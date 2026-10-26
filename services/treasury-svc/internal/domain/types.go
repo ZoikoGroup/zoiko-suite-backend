@@ -74,20 +74,20 @@ type OwnershipEvidence struct {
 // next entry.
 type AccountHistoryEntry struct {
 	HistoryID               string    `json:"history_id"`
-	BankAccountID            string    `json:"bank_account_id"`
-	TenantID                 string    `json:"tenant_id"`
-	AccountName              string    `json:"account_name"`
-	MaskedAccountNumber      string    `json:"masked_account_number"`
-	BankIdentifier            string    `json:"bank_identifier"`
-	AccountStatus              string    `json:"account_status"`
-	BranchRef                    string    `json:"branch_ref"`
-	Country                       string    `json:"country"`
-	AccountType                   string    `json:"account_type"`
-	RequestedOperationalUse       string    `json:"requested_operational_use"`
-	TokenVersion                   int       `json:"token_version"`
-	ChangedByPrincipalID       string    `json:"changed_by_principal_id"`
-	EffectiveAt                  time.Time `json:"effective_at"`
-	SupersededBy                  *string   `json:"superseded_by,omitempty"`
+	BankAccountID           string    `json:"bank_account_id"`
+	TenantID                string    `json:"tenant_id"`
+	AccountName             string    `json:"account_name"`
+	MaskedAccountNumber     string    `json:"masked_account_number"`
+	BankIdentifier          string    `json:"bank_identifier"`
+	AccountStatus           string    `json:"account_status"`
+	BranchRef               string    `json:"branch_ref"`
+	Country                 string    `json:"country"`
+	AccountType             string    `json:"account_type"`
+	RequestedOperationalUse string    `json:"requested_operational_use"`
+	TokenVersion            int       `json:"token_version"`
+	ChangedByPrincipalID    string    `json:"changed_by_principal_id"`
+	EffectiveAt             time.Time `json:"effective_at"`
+	SupersededBy            *string   `json:"superseded_by,omitempty"`
 }
 
 // ConnectionOption is one BNK-02 connection reported for a bank account
@@ -148,8 +148,8 @@ type CashBalance struct {
 	BalanceID        string    `json:"balance_id"`
 	TenantID         string    `json:"tenant_id"`
 	BankAccountID    string    `json:"bank_account_id"`
-	LedgerBalance    float64   `json:"ledger_balance"`
-	AvailableBalance float64   `json:"available_balance"`
+	LedgerBalance    Decimal   `json:"ledger_balance"`
+	AvailableBalance Decimal   `json:"available_balance"`
 	AsOfTimestamp    time.Time `json:"as_of_timestamp"`
 	CorrelationID    string    `json:"correlation_id"`
 	CreatedAt        time.Time `json:"created_at"`
@@ -161,7 +161,7 @@ type LiquidityThreshold struct {
 	TenantID               string    `json:"tenant_id"`
 	LegalEntityID          string    `json:"legal_entity_id"`
 	CurrencyCode           string    `json:"currency_code"`
-	MinimumRequiredBalance float64   `json:"minimum_required_balance"`
+	MinimumRequiredBalance Decimal   `json:"minimum_required_balance"`
 	EscalationEmail        string    `json:"escalation_email"`
 	CreatedAt              time.Time `json:"created_at"`
 }
@@ -188,7 +188,7 @@ type RegisterBankAccountRequest struct {
 type SetThresholdRequest struct {
 	LegalEntityID          string  `json:"legal_entity_id"`
 	CurrencyCode           string  `json:"currency_code"`
-	MinimumRequiredBalance float64 `json:"minimum_required_balance"`
+	MinimumRequiredBalance Decimal `json:"minimum_required_balance"`
 	EscalationEmail        string  `json:"escalation_email"`
 }
 
@@ -197,8 +197,8 @@ type CashPositionResponse struct {
 	BankAccountID    string    `json:"bank_account_id"`
 	AccountName      string    `json:"account_name"`
 	CurrencyCode     string    `json:"currency_code"`
-	LedgerBalance    float64   `json:"ledger_balance"`
-	AvailableBalance float64   `json:"available_balance"`
+	LedgerBalance    Decimal   `json:"ledger_balance"`
+	AvailableBalance Decimal   `json:"available_balance"`
 	AsOfTimestamp    time.Time `json:"as_of_timestamp"`
 }
 
@@ -214,12 +214,12 @@ type EffectiveCashResponse struct {
 	TenantID                 string                `json:"tenant_id"`
 	LegalEntityID            string                `json:"legal_entity_id"`
 	CurrencyCode             string                `json:"currency_code"`
-	CurrentBankBalance       float64               `json:"current_bank_balance"`
-	PendingAPCommitments     float64               `json:"pending_ap_commitments"`
-	PayrollObligations       float64               `json:"payroll_obligations"`
-	TaxLiabilities           float64               `json:"tax_liabilities"`
-	ReservedPendingApprovals float64               `json:"reserved_pending_approvals"`
-	EffectiveAvailableCash   float64               `json:"effective_available_cash"`
+	CurrentBankBalance       Decimal               `json:"current_bank_balance"`
+	PendingAPCommitments     Decimal               `json:"pending_ap_commitments"`
+	PayrollObligations       Decimal               `json:"payroll_obligations"`
+	TaxLiabilities           Decimal               `json:"tax_liabilities"`
+	ReservedPendingApprovals Decimal               `json:"reserved_pending_approvals"`
+	EffectiveAvailableCash   Decimal               `json:"effective_available_cash"`
 	AsOfTimestamp            time.Time             `json:"as_of_timestamp"`
 	ThresholdDetails         *ThresholdAlertDetail `json:"threshold_details,omitempty"`
 
@@ -248,7 +248,7 @@ const BankBalanceStalenessThreshold = 24 * time.Hour
 
 // ThresholdAlertDetail output sub-model.
 type ThresholdAlertDetail struct {
-	MinimumRequiredBalance float64 `json:"minimum_required_balance"`
+	MinimumRequiredBalance Decimal `json:"minimum_required_balance"`
 	IsBreached             bool    `json:"is_breached"`
 }
 
@@ -256,7 +256,7 @@ type ThresholdAlertDetail struct {
 type InitiateTransferRequest struct {
 	SourceBankAccountID string  `json:"source_bank_account_id"`
 	TargetBankAccountID string  `json:"target_bank_account_id"`
-	Amount              float64 `json:"amount"`
+	Amount              Decimal `json:"amount"`
 	CurrencyCode        string  `json:"currency_code"`
 	CorrelationID       string  `json:"correlation_id"`
 	// SaveAsDraft creates the transfer in DRAFT instead of the default
@@ -293,7 +293,7 @@ var (
 )
 
 type ExpectedCashFlow struct {
-	Amount   float64   `json:"amount"`
+	Amount   Decimal   `json:"amount"`
 	DueDate  time.Time `json:"due_date"`
 	Category string    `json:"category"` // RECEIVABLE, PAYABLE, OBLIGATION
 }
@@ -302,7 +302,7 @@ type LiquidityForecastResponse struct {
 	TenantID           string                 `json:"tenant_id"`
 	LegalEntityID      string                 `json:"legal_entity_id"`
 	CurrencyCode       string                 `json:"currency_code"`
-	CurrentCashBalance float64                `json:"current_cash_balance"`
+	CurrentCashBalance Decimal                `json:"current_cash_balance"`
 	AsOfTimestamp      time.Time              `json:"as_of_timestamp"`
 	Forecast7Day       ForecastIntervalDetail `json:"forecast_7_day"`
 	Forecast30Day      ForecastIntervalDetail `json:"forecast_30_day"`
@@ -311,7 +311,7 @@ type LiquidityForecastResponse struct {
 
 type ForecastIntervalDetail struct {
 	IntervalDays      int     `json:"interval_days"`
-	ExpectedInflows   float64 `json:"expected_inflows"`
-	ExpectedOutflows  float64 `json:"expected_outflows"`
-	ForecastedBalance float64 `json:"forecasted_balance"`
+	ExpectedInflows   Decimal `json:"expected_inflows"`
+	ExpectedOutflows  Decimal `json:"expected_outflows"`
+	ForecastedBalance Decimal `json:"forecasted_balance"`
 }

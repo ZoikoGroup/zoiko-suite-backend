@@ -27,7 +27,7 @@ type FXRate struct {
 	RateID                string    `json:"rate_id"`
 	TenantID              string    `json:"tenant_id"`
 	CurrencyPair          string    `json:"currency_pair"`
-	Rate                  float64   `json:"rate"`
+	Rate                  Decimal   `json:"rate"`
 	EffectiveAt           time.Time `json:"effective_at"`
 	RecordedByPrincipalID string    `json:"recorded_by_principal_id"`
 	CreatedAt             time.Time `json:"created_at"`
@@ -35,7 +35,7 @@ type FXRate struct {
 
 type RecordFXRateParams struct {
 	TenantID, CurrencyPair string
-	Rate                   float64
+	Rate                   Decimal
 	EffectiveAt            time.Time
 	RecordedByPrincipalID  string
 }
@@ -46,8 +46,8 @@ type RecordFXRateParams struct {
 type FXExposureBucket struct {
 	MaturityBucket           string  `json:"maturity_bucket"`
 	Category                 string  `json:"category"`
-	ExposureCurrencyAmount   float64 `json:"exposure_currency_amount"`
-	FunctionalCurrencyAmount float64 `json:"functional_currency_amount"`
+	ExposureCurrencyAmount   Decimal `json:"exposure_currency_amount"`
+	FunctionalCurrencyAmount Decimal `json:"functional_currency_amount"`
 }
 
 // FXExposureResponse is GetFXExposure's live composition result.
@@ -59,12 +59,12 @@ type FXExposureResponse struct {
 	LegalEntityID         string             `json:"legal_entity_id"`
 	ExposureCurrency      string             `json:"exposure_currency"`
 	FunctionalCurrency    string             `json:"functional_currency"`
-	RateUsed              float64            `json:"rate_used"`
+	RateUsed              Decimal            `json:"rate_used"`
 	RateAsOf              time.Time          `json:"rate_as_of"`
 	RateIsStale           bool               `json:"rate_is_stale"`
 	Buckets               []FXExposureBucket `json:"buckets"`
-	TotalExposureAmount   float64            `json:"total_exposure_currency_amount"`
-	TotalFunctionalAmount float64            `json:"total_functional_currency_amount"`
+	TotalExposureAmount   Decimal            `json:"total_exposure_currency_amount"`
+	TotalFunctionalAmount Decimal            `json:"total_functional_currency_amount"`
 	AsOfTimestamp         time.Time          `json:"as_of_timestamp"`
 }
 
@@ -77,7 +77,7 @@ type RunFXScenarioRequest struct {
 	LegalEntityID      string  `json:"legal_entity_id"`
 	ExposureCurrency   string  `json:"exposure_currency"`
 	FunctionalCurrency string  `json:"functional_currency"`
-	HypotheticalRate   float64 `json:"hypothetical_rate"`
+	HypotheticalRate   Decimal `json:"hypothetical_rate"`
 }
 
 // FXScenarioResponse reuses FXExposureResponse's shape for the
@@ -87,7 +87,7 @@ type RunFXScenarioRequest struct {
 type FXScenarioResponse struct {
 	Current               FXExposureResponse `json:"current"`
 	Scenario              FXExposureResponse `json:"scenario"`
-	FunctionalAmountDelta float64            `json:"functional_amount_delta"`
+	FunctionalAmountDelta Decimal            `json:"functional_amount_delta"`
 }
 
 var (
@@ -139,19 +139,19 @@ type FXExposureSnapshot struct {
 	FunctionalCurrency string    `json:"functional_currency"`
 	AsOfTimestamp      time.Time `json:"as_of_timestamp"`
 
-	RateUsed  float64   `json:"rate_used"`
-	RateAsOf  time.Time `json:"rate_as_of"`
-	RateVersion string  `json:"rate_version,omitempty"`
+	RateUsed    Decimal   `json:"rate_used"`
+	RateAsOf    time.Time `json:"rate_as_of"`
+	RateVersion string    `json:"rate_version,omitempty"`
 	// NettingScope records what this calculation's scope actually was —
 	// see this file's own doc comment: always single-entity today, never
 	// silently implying a netting algorithm that doesn't exist.
 	NettingScope string `json:"netting_scope"`
 
 	Buckets             []FXExposureBucket `json:"buckets"`
-	GrossExposureAmount float64            `json:"gross_exposure_amount"`
-	NetExposureAmount   float64            `json:"net_exposure_amount"`
+	GrossExposureAmount Decimal            `json:"gross_exposure_amount"`
+	NetExposureAmount   Decimal            `json:"net_exposure_amount"`
 
-	Status                 string     `json:"status"`
+	Status string `json:"status"`
 	// EffectiveStatus mirrors BNK-08's own derived-staleness pattern:
 	// PUBLISHED becomes "STALE" (never stored) when HasStaleComponent.
 	EffectiveStatus        string     `json:"effective_status"`
@@ -168,14 +168,14 @@ type FXExposureSnapshot struct {
 // FXExposureCalculation is buildExposure's result, handed to the store to
 // persist — same "handler composes, store persists" split Wave 14 uses.
 type FXExposureCalculation struct {
-	RateUsed      float64
-	RateAsOf      time.Time
-	RateVersion   string
-	HasStaleComponent bool
-	Buckets       []FXExposureBucket
-	GrossExposureAmount float64
-	NetExposureAmount   float64
-	AsOfTimestamp time.Time
+	RateUsed            Decimal
+	RateAsOf            time.Time
+	RateVersion         string
+	HasStaleComponent   bool
+	Buckets             []FXExposureBucket
+	GrossExposureAmount Decimal
+	NetExposureAmount   Decimal
+	AsOfTimestamp       time.Time
 }
 
 type CalculateFXExposureParams struct {

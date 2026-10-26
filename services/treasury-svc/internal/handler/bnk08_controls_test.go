@@ -10,7 +10,7 @@ import (
 	"zoiko.io/treasury-svc/internal/domain"
 )
 
-func seedCashAccount(s *mockStore, id string, balance *float64) {
+func seedCashAccount(s *mockStore, id string, balance *domain.Decimal) {
 	s.bankAccounts[id] = &domain.BankAccount{BankAccountID: id, TenantID: "tenant-abc", LegalEntityID: "ent-1", CurrencyCode: "USD", AccountStatus: domain.BankAccountActive}
 	if balance != nil {
 		s.cashBalances[id] = &domain.CashBalance{BankAccountID: id, AvailableBalance: *balance, LedgerBalance: *balance, AsOfTimestamp: time.Now().UTC()}
@@ -21,7 +21,7 @@ func seedCashAccount(s *mockStore, id string, balance *float64) {
 // was skipped and the snapshot understated cash with nothing to say so.
 func TestHandler_CalculateCashPosition_BalanceReadFailureFailsClosed(t *testing.T) {
 	s := newMockStore()
-	hundred := 100.0
+	hundred := domain.Decimal("100")
 	seedCashAccount(s, "a1", &hundred)
 	s.balErr = errors.New("connection reset")
 	r := newTransferRouter(s, &mockAuthz{allowed: true}, &mockTransferClients{})
@@ -40,7 +40,7 @@ func TestHandler_CalculateCashPosition_BalanceReadFailureFailsClosed(t *testing.
 // snapshot is stale and cannot be published as current.
 func TestHandler_CalculateCashPosition_MissingBalanceIsPartial(t *testing.T) {
 	s := newMockStore()
-	hundred := 100.0
+	hundred := domain.Decimal("100")
 	seedCashAccount(s, "a1", &hundred)
 	seedCashAccount(s, "a2", nil)
 	r := newTransferRouter(s, &mockAuthz{allowed: true}, &mockTransferClients{})
@@ -52,7 +52,7 @@ func TestHandler_CalculateCashPosition_MissingBalanceIsPartial(t *testing.T) {
 	}
 	var snap domain.CashPositionSnapshot
 	_ = json.Unmarshal(rr.Body.Bytes(), &snap)
-	if !snap.HasStaleComponent || snap.BankBalance != 100 {
+	if !snap.HasStaleComponent || snap.BankBalance != domain.Decimal("100") {
 		t.Fatalf("position with one account's balance missing: stale=%v bank=%v, want stale and 100", snap.HasStaleComponent, snap.BankBalance)
 	}
 }
@@ -62,7 +62,7 @@ func TestHandler_CalculateCashPosition_MissingBalanceIsPartial(t *testing.T) {
 // any principal in the tenant could read any entity's account balances.
 func TestHandler_CashPositionSnapshotReads_RequirePermission(t *testing.T) {
 	s := newMockStore()
-	hundred := 100.0
+	hundred := domain.Decimal("100")
 	seedCashAccount(s, "a1", &hundred)
 	allowed := newTransferRouter(s, &mockAuthz{allowed: true}, &mockTransferClients{})
 	rr := doTransferJSONRequest(t, allowed, http.MethodPost, "/v1/treasury/cash-position/calculate",
@@ -89,7 +89,7 @@ func TestHandler_CashPositionSnapshotReads_RequirePermission(t *testing.T) {
 // nothing when it does.
 func TestHandler_RefreshCashPosition_PriorMustBeSameEntity(t *testing.T) {
 	s := newMockStore()
-	hundred := 100.0
+	hundred := domain.Decimal("100")
 	seedCashAccount(s, "a1", &hundred)
 	r := newTransferRouter(s, &mockAuthz{allowed: true}, &mockTransferClients{})
 	rr := doTransferJSONRequest(t, r, http.MethodPost, "/v1/treasury/cash-position/calculate",

@@ -64,12 +64,12 @@ func (s *PgStore) VerifyBankAccountOwnership(ctx context.Context, p domain.Verif
 		}
 		// Enqueue bank_account.ownership_verified event
 		return s.enqueueBankAccountEvent(ctx, tx, "ownership-verified", "bank_account.ownership_verified", p.TenantID, acct.LegalEntityID, p.BankAccountID, p.VerifiedByPrincipalID, "", map[string]any{
-			"bank_account_id":      acct.BankAccountID,
-			"tenant_id":            acct.TenantID,
-			"legal_entity_id":      acct.LegalEntityID,
-			"account_status":       acct.AccountStatus,
-			"evidence_id":          e.EvidenceID,
-			"verification_method":  e.VerificationMethod,
+			"bank_account_id":     acct.BankAccountID,
+			"tenant_id":           acct.TenantID,
+			"legal_entity_id":     acct.LegalEntityID,
+			"account_status":      acct.AccountStatus,
+			"evidence_id":         e.EvidenceID,
+			"verification_method": e.VerificationMethod,
 		})
 	})
 	if errors.Is(err, domain.ErrBankAccountNotFound) {
@@ -216,10 +216,10 @@ func (s *PgStore) ChangeOperationalUse(ctx context.Context, p domain.ChangeOpera
 		}
 		// Enqueue bank_account.operational_use_changed event
 		return s.enqueueBankAccountEvent(ctx, tx, "operational-use-changed", "bank_account.operational_use_changed", p.TenantID, acct.LegalEntityID, p.BankAccountID, p.ActorPrincipalID, "", map[string]any{
-			"bank_account_id":          acct.BankAccountID,
-			"tenant_id":                acct.TenantID,
-			"legal_entity_id":          acct.LegalEntityID,
-			"account_status":           acct.AccountStatus,
+			"bank_account_id":           acct.BankAccountID,
+			"tenant_id":                 acct.TenantID,
+			"legal_entity_id":           acct.LegalEntityID,
+			"account_status":            acct.AccountStatus,
 			"requested_operational_use": acct.RequestedOperationalUse,
 		})
 	})

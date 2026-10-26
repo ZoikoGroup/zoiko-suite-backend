@@ -342,8 +342,8 @@ func (s *PgStore) CreateCashBalance(ctx context.Context, bal *domain.CashBalance
 				balance_id, tenant_id, bank_account_id, ledger_balance,
 				available_balance, as_of_timestamp, correlation_id, created_at
 			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-		`, bal.BalanceID, tenantID, bal.BankAccountID, bal.LedgerBalance,
-			bal.AvailableBalance, bal.AsOfTimestamp, bal.CorrelationID, now)
+		`, bal.BalanceID, tenantID, bal.BankAccountID, bal.LedgerBalance.OrZero(),
+			bal.AvailableBalance.OrZero(), bal.AsOfTimestamp, bal.CorrelationID, now)
 		if err != nil {
 			return err
 		}
@@ -363,8 +363,8 @@ func (s *PgStore) GetLatestCashBalance(ctx context.Context, bankAccountID string
 	var bal domain.CashBalance
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		row := tx.QueryRow(ctx, `
-			SELECT balance_id, tenant_id, bank_account_id, ledger_balance,
-			       available_balance, as_of_timestamp, correlation_id, created_at
+			SELECT balance_id, tenant_id, bank_account_id, ledger_balance::text,
+			       available_balance::text, as_of_timestamp, correlation_id, created_at
 			FROM cash_balances
 			WHERE bank_account_id = $1 AND tenant_id = $2
 			ORDER BY as_of_timestamp DESC
@@ -400,8 +400,8 @@ func (s *PgStore) GetLatestCashBalances(ctx context.Context, bankAccountIDs []st
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `
 			SELECT DISTINCT ON (bank_account_id)
-			       balance_id, tenant_id, bank_account_id, ledger_balance,
-			       available_balance, as_of_timestamp, correlation_id, created_at
+			       balance_id, tenant_id, bank_account_id, ledger_balance::text,
+			       available_balance::text, as_of_timestamp, correlation_id, created_at
 			FROM cash_balances
 			WHERE tenant_id = $1 AND bank_account_id = ANY($2::uuid[])
 			ORDER BY bank_account_id, as_of_timestamp DESC
@@ -442,7 +442,7 @@ func (s *PgStore) SetLiquidityThreshold(ctx context.Context, threshold *domain.L
 				minimum_required_balance = EXCLUDED.minimum_required_balance,
 				escalation_email = EXCLUDED.escalation_email
 		`, threshold.ThresholdID, tenantID, threshold.LegalEntityID, threshold.CurrencyCode,
-			threshold.MinimumRequiredBalance, threshold.EscalationEmail, now)
+			threshold.MinimumRequiredBalance.OrZero(), threshold.EscalationEmail, now)
 		if err != nil {
 			return err
 		}
@@ -463,7 +463,7 @@ func (s *PgStore) GetLiquidityThreshold(ctx context.Context, legalEntityID, curr
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		row := tx.QueryRow(ctx, `
 			SELECT threshold_id, tenant_id, legal_entity_id, currency_code,
-			       minimum_required_balance, escalation_email, created_at
+			       minimum_required_balance::text, escalation_email, created_at
 			FROM liquidity_thresholds
 			WHERE tenant_id = $1 AND legal_entity_id = $2 AND currency_code = $3
 			ORDER BY created_at DESC

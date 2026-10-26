@@ -66,7 +66,7 @@ func TestHandler_GetSourceLineage_RequiresPermission(t *testing.T) {
 // side silently used 1.0 and reported a delta against parity.
 func TestHandler_RunFXScenario_RequiresRecordedRate(t *testing.T) {
 	s := newMockStore()
-	c := &mockClients{inflowsData: []domain.ExpectedCashFlow{{Amount: 1000, DueDate: time.Now().UTC().AddDate(0, 0, 10), Category: "RECEIVABLE"}}}
+	c := &mockClients{inflowsData: []domain.ExpectedCashFlow{{Amount: "1000", DueDate: time.Now().UTC().AddDate(0, 0, 10), Category: "RECEIVABLE"}}}
 	h := newTransferRouterWithClients(s, c)
 
 	rr := doTransferJSONRequest(t, h, http.MethodPost, "/v1/treasury/fx/scenario",

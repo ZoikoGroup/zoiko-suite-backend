@@ -71,7 +71,7 @@ func CanSupersedeCashPosition(status string) bool {
 type CashPositionAccountLine struct {
 	BankAccountID string    `json:"bank_account_id"`
 	AccountName   string    `json:"account_name"`
-	Balance       float64   `json:"balance"`
+	Balance       Decimal   `json:"balance"`
 	AsOfTimestamp time.Time `json:"as_of_timestamp"`
 }
 
@@ -83,17 +83,17 @@ type CashPositionSnapshot struct {
 	ReportingCurrency string    `json:"reporting_currency"`
 	AsOfTimestamp     time.Time `json:"as_of_timestamp"`
 
-	BankBalance          float64 `json:"bank_balance"`
-	RestrictedAmount     float64 `json:"restricted_amount"`
-	PendingAPCommitments float64 `json:"pending_ap_commitments"`
-	PayrollObligations   float64 `json:"payroll_obligations"`
-	TaxLiabilities       float64 `json:"tax_liabilities"`
-	AvailableCash        float64 `json:"available_cash"`
+	BankBalance          Decimal `json:"bank_balance"`
+	RestrictedAmount     Decimal `json:"restricted_amount"`
+	PendingAPCommitments Decimal `json:"pending_ap_commitments"`
+	PayrollObligations   Decimal `json:"payroll_obligations"`
+	TaxLiabilities       Decimal `json:"tax_liabilities"`
+	AvailableCash        Decimal `json:"available_cash"`
 
-	FXRateVersion    string                     `json:"fx_rate_version,omitempty"`
+	FXRateVersion    string                    `json:"fx_rate_version,omitempty"`
 	AccountBreakdown []CashPositionAccountLine `json:"account_breakdown"`
 
-	Status                 string     `json:"status"`
+	Status string `json:"status"`
 	// EffectiveStatus is Status, except PUBLISHED becomes "STALE" (never
 	// stored) when HasStaleComponent — see this file's own doc comment.
 	// Computed by the store on every read, never persisted.
@@ -118,7 +118,7 @@ type CashPositionSnapshot struct {
 // Payroll - Tax) is real here.
 type CalculateCashPositionParams struct {
 	TenantID, LegalEntityID, ReportingCurrency string
-	RestrictedAmount                           float64
+	RestrictedAmount                           Decimal
 	CorrelationID                              string
 	ActorPrincipalID                           string
 }
@@ -128,11 +128,11 @@ type CalculateCashPositionParams struct {
 // performs — computed by the handler (which owns the cross-service
 // clients), then handed to the store to persist as a new snapshot row.
 type CashPositionCalculation struct {
-	BankBalance          float64
-	PendingAPCommitments float64
-	PayrollObligations   float64
-	TaxLiabilities       float64
-	AvailableCash        float64
+	BankBalance          Decimal
+	PendingAPCommitments Decimal
+	PayrollObligations   Decimal
+	TaxLiabilities       Decimal
+	AvailableCash        Decimal
 	AccountBreakdown     []CashPositionAccountLine
 	HasStaleComponent    bool
 	AsOfTimestamp        time.Time

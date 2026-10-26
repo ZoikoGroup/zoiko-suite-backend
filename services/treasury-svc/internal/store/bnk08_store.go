@@ -17,7 +17,7 @@ import (
 
 const cashPositionColumns = `
 	snapshot_id, tenant_id, legal_entity_id, reporting_currency, as_of_timestamp,
-	bank_balance, restricted_amount, pending_ap_commitments, payroll_obligations, tax_liabilities, available_cash,
+	bank_balance::text, restricted_amount::text, pending_ap_commitments::text, payroll_obligations::text, tax_liabilities::text, available_cash::text,
 	fx_rate_version, account_breakdown,
 	status, has_stale_component, published_by_principal_id, published_at, superseded_by,
 	calculated_by_principal_id, correlation_id, created_at`
@@ -108,7 +108,7 @@ func (s *PgStore) insertCashPositionSnapshot(ctx context.Context, tx pgx.Tx, p d
 		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'CALCULATED',$14,$15,$16)
 		RETURNING `+cashPositionColumns,
 		uuid.New().String(), p.TenantID, p.LegalEntityID, p.ReportingCurrency, calc.AsOfTimestamp,
-		calc.BankBalance, p.RestrictedAmount, calc.PendingAPCommitments, calc.PayrollObligations, calc.TaxLiabilities, calc.AvailableCash,
+		calc.BankBalance.OrZero(), p.RestrictedAmount.OrZero(), calc.PendingAPCommitments.OrZero(), calc.PayrollObligations.OrZero(), calc.TaxLiabilities.OrZero(), calc.AvailableCash.OrZero(),
 		calc.FXRateVersion, breakdown,
 		calc.HasStaleComponent, p.ActorPrincipalID, p.CorrelationID,
 	)

@@ -27,7 +27,7 @@ func TestHandler_TransferCommands_AuthorizeInAccountEntities(t *testing.T) {
 	s := newMockStore()
 	s.transfers["t1"] = withAccounts(s, &domain.TreasuryTransfer{
 		TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferPendingApproval, IsCrossEntity: true,
-		Amount: 100, CurrencyCode: "USD", MakerPrincipalID: "maker-1",
+		Amount: "100", CurrencyCode: "USD", MakerPrincipalID: "maker-1",
 	})
 	authz := &mockAuthz{allowed: true}
 	r := newTransferRouter(s, authz, &mockTransferClients{})
@@ -69,14 +69,14 @@ func TestHandler_RejectTreasuryTransfer_RequiresPermission(t *testing.T) {
 func TestHandler_AmendTreasuryTransfer_ReclassifiesCrossEntity(t *testing.T) {
 	s := newMockStore()
 	s.transfers["t1"] = withAccounts(s, &domain.TreasuryTransfer{
-		TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferDraft, MakerPrincipalID: "maker-1", Amount: 100, CurrencyCode: "USD",
+		TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferDraft, MakerPrincipalID: "maker-1", Amount: "100", CurrencyCode: "USD",
 	})
 	s.bankAccounts["other-entity"] = &domain.BankAccount{BankAccountID: "other-entity", TenantID: "tenant-abc", LegalEntityID: "ent-other", CurrencyCode: "USD", AccountStatus: domain.BankAccountActive}
 	authz := &mockAuthz{allowed: true}
 	r := newTransferRouter(s, authz, &mockTransferClients{})
 
 	rr := doTransferJSONRequest(t, r, http.MethodPost, "/v1/treasury/transfers/t1/amend",
-		domain.InitiateTransferRequest{SourceBankAccountID: "acct-src-t1", TargetBankAccountID: "other-entity", Amount: 100, CurrencyCode: "USD"}, "maker-1")
+		domain.InitiateTransferRequest{SourceBankAccountID: "acct-src-t1", TargetBankAccountID: "other-entity", Amount: "100", CurrencyCode: "USD"}, "maker-1")
 	if rr.Code != http.StatusOK {
 		t.Fatalf("amend: %d %s", rr.Code, rr.Body.String())
 	}
@@ -96,7 +96,7 @@ func TestHandler_AmendTreasuryTransfer_ReclassifiesCrossEntity(t *testing.T) {
 	// An amended account must be usable, as on create.
 	s.bankAccounts["suspended"] = &domain.BankAccount{BankAccountID: "suspended", TenantID: "tenant-abc", LegalEntityID: "ent-src", CurrencyCode: "USD", AccountStatus: domain.BankAccountSuspended}
 	rr = doTransferJSONRequest(t, r, http.MethodPost, "/v1/treasury/transfers/t1/amend",
-		domain.InitiateTransferRequest{SourceBankAccountID: "acct-src-t1", TargetBankAccountID: "suspended", Amount: 100, CurrencyCode: "USD"}, "maker-1")
+		domain.InitiateTransferRequest{SourceBankAccountID: "acct-src-t1", TargetBankAccountID: "suspended", Amount: "100", CurrencyCode: "USD"}, "maker-1")
 	if rr.Code != http.StatusPreconditionFailed {
 		t.Fatalf("amend to a suspended account: %d %s, want 412", rr.Code, rr.Body.String())
 	}
@@ -108,7 +108,7 @@ func TestHandler_ExecuteTreasuryTransfer_RefusesInactiveAccount(t *testing.T) {
 	s := newMockStore()
 	s.transfers["t1"] = withAccounts(s, &domain.TreasuryTransfer{
 		TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferApproved,
-		Amount: 100, CurrencyCode: "USD", MakerPrincipalID: "maker-1", CheckerPrincipalID: "checker-1",
+		Amount: "100", CurrencyCode: "USD", MakerPrincipalID: "maker-1", CheckerPrincipalID: "checker-1",
 	})
 	s.bankAccounts["acct-src-t1"].AccountStatus = domain.BankAccountSuspended
 	tc := &capturingTransferClients{}
@@ -136,7 +136,7 @@ func TestHandler_ExecuteTreasuryTransfer_RefusesMisclassifiedTransfer(t *testing
 	s.transfers["t1"] = &domain.TreasuryTransfer{
 		TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferApproved, IsCrossEntity: false,
 		SourceBankAccountID: "src", TargetBankAccountID: "tgt",
-		Amount: 100, CurrencyCode: "USD", MakerPrincipalID: "maker-1", CheckerPrincipalID: "checker-1",
+		Amount: "100", CurrencyCode: "USD", MakerPrincipalID: "maker-1", CheckerPrincipalID: "checker-1",
 	}
 	tc := &capturingTransferClients{}
 	r := newTransferRouter(s, &mockAuthz{allowed: true}, tc)
