@@ -119,6 +119,17 @@ func Wave2(o Wave2Options) ([]domain.CreateControlDefinitionRequest, error) {
 				"key_fields": []string{"attr:vendor_id", "amount", "currency", "date"}}),
 		},
 		{
+			// The aging limit is a controlled decision (§34), so the cut-off is not baked in: the run scope carries
+			// {"unapplied_before": "YYYY-MM-DD"} = run date minus the approved limit.
+			ControlCode: "FIN-CTRL-029", Name: "Unapplied cash aging", Domain: "AR / Treasury",
+			ControlType: "MONITORING", Assertions: []string{"CLASSIFICATION", "ACCURACY"}, RiskTier: "STANDARD",
+			Frequency: "DAILY", OwnerRole: "AR_ACCOUNTING_OWNER", ReviewerRole: "SENIOR_ACCOUNTANT",
+			SourceSpec: j(map[string]any{"system": SysAR, "population": "aged-unapplied-receipts", "no_period": true,
+				"params": map[string]string{"unapplied_before": "${scope.unapplied_before}"}}),
+			InitialLogic: j(map[string]any{"kind": "EXCEPTION_SCAN", "finding_category": "CLASSIFICATION",
+				"finding_reason": "UNAPPLIED_CASH_AGED", "finding_assertion": "CLASSIFICATION"}),
+		},
+		{
 			ControlCode: "FIN-CTRL-032", Name: "Bank feed completeness", Domain: "Treasury / Integration",
 			ControlType: "INTERFACE", Assertions: []string{"COMPLETENESS"}, RiskTier: "STANDARD",
 			Frequency: "DAILY", OwnerRole: "TREASURY_OWNER",

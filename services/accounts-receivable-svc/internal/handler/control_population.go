@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -44,13 +46,36 @@ func (h *Handler) GetControlPopulation(w http.ResponseWriter, r *http.Request) {
 	}
 
 	q := r.URL.Query()
-	for name := range q {
+	own := populationParamNames(population)
+	for name, vals := range q {
 		switch name {
-		case "legal_entity_id", "period_id", "limit", "cursor":
+		case "legal_entity_id", "limit", "cursor":
+		case "period_id":
+			if len(own) > 0 {
+				writeError(w, http.StatusBadRequest, "unknown_parameter", "period_id is not defined for this population")
+				return
+			}
 		default:
-			writeError(w, http.StatusBadRequest, "unknown_parameter", fmt.Sprintf("query parameter %q is not defined for this population", name))
+			if !slices.Contains(own, name) {
+				writeError(w, http.StatusBadRequest, "unknown_parameter", fmt.Sprintf("query parameter %q is not defined for this population", name))
+				return
+			}
+			if len(vals) != 1 {
+				writeError(w, http.StatusBadRequest, "invalid_field", fmt.Sprintf("query parameter %q must be given once", name))
+				return
+			}
+		}
+	}
+	var params map[string]string
+	for _, name := range own {
+		if strings.TrimSpace(q.Get(name)) == "" {
+			writeError(w, http.StatusBadRequest, "invalid_field", fmt.Sprintf("%s is required", name))
 			return
 		}
+		if params == nil {
+			params = map[string]string{}
+		}
+		params[name] = q.Get(name)
 	}
 
 	legalEntityID := q.Get("legal_entity_id")
@@ -106,8 +131,13 @@ func (h *Handler) GetControlPopulation(w http.ResponseWriter, r *http.Request) {
 		CutOff:        cutOff,
 		Limit:         limit,
 		AfterRecordID: after,
+		Params:        params,
 	})
 	if err != nil {
+		if errors.Is(err, domain.ErrInvalidPopulationParam) {
+			writeError(w, http.StatusBadRequest, "invalid_field", err.Error())
+			return
+		}
 		if errors.Is(err, domain.ErrPopulationTooLarge) {
 			writeError(w, http.StatusUnprocessableEntity, "population_too_large", err.Error())
 			return

@@ -211,6 +211,39 @@ func recAt(id, ref, amt, date string) domain.PopulationRecord {
 	return x
 }
 
+// ── FIN-CTRL-029: unapplied cash aging ───────────────────────────────────────
+
+func TestWave2_UnappliedCashAging_EveryAgedReceiptIsAFindingAndTheCutOffIsPerRun(t *testing.T) {
+	w := newWave2(t)
+	w.src.noPeriod[catalogue.SysAR+"/aged-unapplied-receipts"] = true // the real endpoint rejects period_id
+	sc := func(js string) func(*domain.CreateRunRequest) {
+		return func(r *domain.CreateRunRequest) { r.Scope = json.RawMessage(js) }
+	}
+
+	w.src.set(catalogue.SysAR, "aged-unapplied-receipts", "wm")
+	_, final := w.run("FIN-CTRL-029", sc(`{"unapplied_before":"2026-09-01"}`))
+	assert.Equal(t, domain.ResultPass, final.ResultState, "no aged unapplied cash: pass")
+
+	w.src.set(catalogue.SysAR, "aged-unapplied-receipts", "wm2",
+		r("rc1", "SET-1", "100.00"), r("rc2", "SET-2", "150.00"))
+	run, final := w.run("FIN-CTRL-029", sc(`{"unapplied_before":"2026-09-01"}`))
+	assert.Equal(t, domain.ResultFail, final.ResultState)
+	ex, err := testStore.ListExceptions(ctx, w.tenant, run.RunID, store.ListExceptionsFilter{})
+	require.NoError(t, err)
+	require.Len(t, ex, 2)
+	for _, e := range ex {
+		assert.Equal(t, "CLASSIFICATION", e.Category)
+		assert.Equal(t, "UNAPPLIED_CASH_AGED", e.ReasonCode)
+	}
+	assert.Equal(t, "2026-09-01", w.src.lastQuery(catalogue.SysAR).Get("unapplied_before"))
+	assert.Empty(t, w.src.lastQuery(catalogue.SysAR).Get("period_id"))
+
+	// a run without the cut-off cannot silently widen the population: it fails closed, never passes
+	_, final = w.run("FIN-CTRL-029", nil)
+	assert.NotEqual(t, domain.ResultPass, final.ResultState)
+	assert.Equal(t, domain.ResultIndeterminate, final.ResultState)
+}
+
 // ── FIN-CTRL-027 / 028 / 032 ─────────────────────────────────────────────────
 
 func TestWave2_InvoiceSequenceGaps(t *testing.T) {
@@ -297,7 +330,7 @@ func TestWave2_TenantIsolationAcrossSeededCatalogue(t *testing.T) {
 	assert.ErrorIs(t, err, domain.ErrNotFound, "another tenant cannot run this tenant's control")
 	defs, err := testStore.ListDefinitions(ctx, w.tenant, 50)
 	require.NoError(t, err)
-	assert.Len(t, defs, 6)
+	assert.Len(t, defs, 7)
 }
 
 // A rule version's logic cannot change under an approved/pinned run: a newer, looser
