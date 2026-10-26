@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -71,6 +72,8 @@ func RegisterRoutes(r chi.Router, h *Handler, tenantMiddleware func(http.Handler
 			r.Post("/{paymentID}/return", h.RecordReturn)
 			r.Post("/{paymentID}/cancel", h.CancelPaymentWhereSupported)
 			r.Post("/{paymentID}/poll", h.PollPaymentStatus)
+			r.Post("/{paymentID}/confirm-settlement", h.ConfirmSettlement)
+			r.Post("/{paymentID}/record-rejection", h.RecordRejection)
 		})
 	})
 	r.Post("/bnk07/webhooks/provider-callback", h.ProcessProviderCallback)
@@ -98,6 +101,23 @@ func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (stri
 		return "", false
 	}
 	return principalID, true
+}
+
+// requireIdempotencyKey is the command-idempotency contract for the two manual
+// finality commands. Older BNK-07 commands dedupe on a natural provider/event
+// reference; a manual finality decision has no provider event to use, so it
+// carries the platform's explicit Idempotency-Key instead.
+func (h *Handler) requireIdempotencyKey(w http.ResponseWriter, r *http.Request) (string, bool) {
+	key := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	if key == "" {
+		writeError(w, http.StatusBadRequest, domain.ErrIdempotencyKeyRequired.Error())
+		return "", false
+	}
+	if len(key) > 200 {
+		writeError(w, http.StatusBadRequest, "Idempotency-Key must be at most 200 characters")
+		return "", false
+	}
+	return key, true
 }
 
 func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID, legalEntityID, actionType string) bool {
@@ -211,8 +231,18 @@ func (h *Handler) GetFinalityEvidence(w http.ResponseWriter, r *http.Request) {
 	if !h.authorize(w, r, principalID, p.LegalEntityID, PaymentStatusRead) {
 		return
 	}
+	evidence, err := h.store.ListFinalityEvidence(r.Context(), paymentID)
+	if err != nil {
+		h.log.Error("GetFinalityEvidence: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+		return
+	}
+	if evidence == nil {
+		evidence = []domain.FinalityEvidence{}
+	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"payment_id": paymentID, "status": p.Status, "finality_source": p.FinalitySource, "mapping_version": p.MappingVersion,
+		"payment_id": paymentID, "status": p.Status, "finality_source": p.FinalitySource,
+		"mapping_version": p.MappingVersion, "evidence": evidence,
 	})
 }
 
@@ -558,12 +588,13 @@ func (h *Handler) PollPaymentStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	// SoD: the same actor who created this payment must not also be the
 	// one manually asserting it into a governed final state (SETTLED/
-	// REJECTED) — PollPaymentStatus is the de facto manual-settlement
-	// path, since there is no separate ConfirmSettlement command (see
-	// this handler's own doc comment). Intermediate progress reports
-	// (ACCEPTED/PENDING) are not a finality claim and remain unrestricted
-	// — same scoping as ResolveStatusConflict/RecordReturn, which only
-	// gate the commands that actually assert/change finality.
+	// REJECTED). ConfirmSettlement/RecordRejection are now the first-class
+	// evidence-bearing paths, but this compatibility poll can still assert
+	// a final status, so it keeps the same creator-different rule.
+	// Intermediate progress reports (ACCEPTED/PENDING) are not a finality
+	// claim and remain unrestricted — same scoping as
+	// ResolveStatusConflict/RecordReturn, which only gate the commands that
+	// actually assert/change finality.
 	if domain.IsFinal(payload.ReportedStatus) && p.CreatedByPrincipalID != "" && p.CreatedByPrincipalID == principalID {
 		writeError(w, http.StatusForbidden, domain.ErrSelfResolutionForbidden.Error())
 		return
@@ -588,4 +619,116 @@ func (h *Handler) PollPaymentStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"payment": updated, "applied": applied})
+}
+
+// ConfirmSettlement is BNK-07's first-class, evidence-bearing manual settlement
+// command. Unlike PollPaymentStatus it does not accept a bare asserted status:
+// it requires a provider/bank reference, a reason, an effective date and an
+// evidence reference (optionally a SHA-256 evidence hash). It always requires
+// PAYMENT_FINALITY_CONFIRM and a creator-different principal, and emits
+// PaymentSettled through the outbox in the same transaction as the state
+// change.
+func (h *Handler) ConfirmSettlement(w http.ResponseWriter, r *http.Request) {
+	paymentID := chi.URLParam(r, "paymentID")
+	var req domain.ConfirmSettlementRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if err := req.Validate(); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	idempotencyKey, ok := h.requireIdempotencyKey(w, r)
+	if !ok {
+		return
+	}
+	p, ok := h.fetchPaymentForAuth(w, r, paymentID)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, p.LegalEntityID, PaymentFinalityConfirm) {
+		return
+	}
+	if p.CreatedByPrincipalID != "" && p.CreatedByPrincipalID == principalID {
+		writeError(w, http.StatusForbidden, domain.ErrSelfResolutionForbidden.Error())
+		return
+	}
+
+	updated, evidence, replay, err := h.store.ConfirmSettlement(r.Context(), paymentID, req, principalID, idempotencyKey, r.Header.Get("X-Correlation-ID"))
+	h.writeFinalityResult(w, "ConfirmSettlement", updated, evidence, replay, err)
+}
+
+// RecordRejection is the rejection counterpart to ConfirmSettlement. It uses
+// the same evidence and SoD rules and emits PaymentRejected through the outbox.
+func (h *Handler) RecordRejection(w http.ResponseWriter, r *http.Request) {
+	paymentID := chi.URLParam(r, "paymentID")
+	var req domain.RecordRejectionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if err := req.Validate(); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	idempotencyKey, ok := h.requireIdempotencyKey(w, r)
+	if !ok {
+		return
+	}
+	p, ok := h.fetchPaymentForAuth(w, r, paymentID)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, p.LegalEntityID, PaymentFinalityConfirm) {
+		return
+	}
+	if p.CreatedByPrincipalID != "" && p.CreatedByPrincipalID == principalID {
+		writeError(w, http.StatusForbidden, domain.ErrSelfResolutionForbidden.Error())
+		return
+	}
+
+	updated, evidence, replay, err := h.store.RecordRejection(r.Context(), paymentID, req, principalID, idempotencyKey, r.Header.Get("X-Correlation-ID"))
+	h.writeFinalityResult(w, "RecordRejection", updated, evidence, replay, err)
+}
+
+func (h *Handler) writeFinalityResult(w http.ResponseWriter, operation string, updated *domain.PaymentExecutionState, evidence *domain.FinalityEvidence, replay bool, err error) {
+	if err != nil {
+		switch {
+		case errors.Is(err, domain.ErrPaymentNotFound):
+			writeError(w, http.StatusNotFound, "payment execution state not found")
+		case errors.Is(err, domain.ErrSelfResolutionForbidden):
+			writeError(w, http.StatusForbidden, domain.ErrSelfResolutionForbidden.Error())
+		case errors.Is(err, domain.ErrOpenConflictExists):
+			writeError(w, http.StatusConflict, domain.ErrOpenConflictExists.Error())
+		case errors.Is(err, domain.ErrInvalidTransition):
+			writeError(w, http.StatusConflict, "payment is already in a governed final state or cannot accept this finality decision")
+		case errors.Is(err, domain.ErrIdempotencyKeyConflict):
+			writeError(w, http.StatusConflict, domain.ErrIdempotencyKeyConflict.Error())
+		case errors.Is(err, domain.ErrInvalidFinalityRequest):
+			writeError(w, http.StatusBadRequest, err.Error())
+		default:
+			h.log.Error(operation+": store unavailable", zap.Error(err))
+			writeError(w, http.StatusServiceUnavailable, "store unavailable")
+		}
+		return
+	}
+	if replay {
+		w.Header().Set("Idempotent-Replay", "true")
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"payment":  updated,
+		"evidence": evidence,
+		"replayed": replay,
+	})
 }

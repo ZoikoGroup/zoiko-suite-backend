@@ -82,6 +82,10 @@ func doRequest(r http.Handler, method, path string, body interface{}, tenantID s
 // RecordReturn, where the resolving principal must differ from whoever
 // created the payment.
 func doRequestAs(r http.Handler, method, path string, body interface{}, tenantID, principalID string) *httptest.ResponseRecorder {
+	return doRequestWithIdempotency(r, method, path, body, tenantID, principalID, "")
+}
+
+func doRequestWithIdempotency(r http.Handler, method, path string, body interface{}, tenantID, principalID, idempotencyKey string) *httptest.ResponseRecorder {
 	var buf bytes.Buffer
 	if body != nil {
 		_ = json.NewEncoder(&buf).Encode(body)
@@ -91,6 +95,9 @@ func doRequestAs(r http.Handler, method, path string, body interface{}, tenantID
 	req.Header.Set("X-Principal-Id", principalID)
 	if tenantID != "" {
 		req.Header.Set("X-Tenant-Id", tenantID)
+	}
+	if idempotencyKey != "" {
+		req.Header.Set("Idempotency-Key", idempotencyKey)
 	}
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)

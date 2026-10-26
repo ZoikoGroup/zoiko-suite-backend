@@ -12,7 +12,8 @@ Duplicate callback creates duplicate accounting effect; Provider says settled
 but statement evidence conflicts and is ignored" of §12, and the §3 authority
 row ("BNK-07 | Canonical payment execution/finality status and evidence |
 Payment subject mutation, ledger write, business approval").
-First survey of this service against the spec (2026-10-22).
+First survey of this service against the spec (2026-10-22); A1 closure pass
+(2026-10-26).
 
 Citation check: every BNK-07 line cited in the review request was compared with
 the docx text. The commands, queries, state model, permissions, SoD, events,
@@ -27,32 +28,81 @@ the command surface suggests. It verifies a per-tenant vault secret, enforces a
 provider profile and replay window, maps provider statuses under a versioned
 profile, serialises callbacks on the payment row, writes an append-only receipt
 for every authenticated callback, and refuses to regress a governed final
-state. All five named queries exist. Seven of the nine named commands exist;
-`ConfirmSettlement` and `RecordRejection` do not (A1). The material gaps are
-that two spec states (`SUBMITTED` and `PENDING_UNKNOWN`) are unreachable or
+state. All five named queries exist. All nine named commands now exist:
+`ConfirmSettlement` and `RecordRejection` are the first-class, evidence-bearing
+manual finality commands added in this pass (A1). The remaining material gaps
+are that two spec states (`SUBMITTED` and `PENDING_UNKNOWN`) are unreachable or
 unrepresentable (A4), `PollPaymentStatus` is caller-attested rather than a
 provider poll and emits no event (A2/A3), the legacy webhook is tenant-blind
-and weaker than the profile path (A6/A7), finality evidence is thin (A9), and
-the manual finality commands require assertion rather than evidence (A10/A11).
-`RecordPaymentStatus` idempotency (A5) is closed in this pass. Roughly 65% of
-BNK-07.
+and weaker than the profile path (A6/A7), callback finality evidence is still
+thin (A9), and the older manual commands (`ResolveStatusConflict`,
+`RecordReturn`, `CancelPaymentWhereSupported`) still rely on assertion rather
+than evidence (A10/A11). `RecordPaymentStatus` idempotency (A5) and A1 are
+closed in this pass. Roughly 70% of BNK-07.
 
 ## A. Not implemented / weaker than the spec
 
-- **A1. `ConfirmSettlement` and `RecordRejection` are not implemented.** The
-  §7 command line names `RecordPaymentStatus; ProcessProviderCallback;
-  PollPaymentStatus; LinkStatementConfirmation; ConfirmSettlement;
-  RecordReturn; RecordRejection; CancelPaymentWhereSupported;
-  ResolveStatusConflict`. There is no route or store method for
-  `ConfirmSettlement` or `RecordRejection`. `PollPaymentStatus` is the only
-  manual SETTLED/REJECTED path, and `ResolveStatusConflict` only works when an
-  evidence conflict is already open. There is therefore no first-class,
-  evidence-bearing command to confirm settlement or record a rejection with a
-  provider/bank reference, reason and effective date. That also means the §7
-  events `PaymentSettled`/`PaymentRejected` can only be produced by a callback
-  or by the caller-attested poll. *Why it was not fixed here:* adding two
-  commands changes the request/response contract, the permission mapping and
-  the SoD/evidence rules; it is not a small local patch.
+- **A1. `ConfirmSettlement` and `RecordRejection` were not implemented — closed
+  in this pass.** The §7 command line names `RecordPaymentStatus;
+  ProcessProviderCallback; PollPaymentStatus; LinkStatementConfirmation;
+  ConfirmSettlement; RecordReturn; RecordRejection; CancelPaymentWhereSupported;
+  ResolveStatusConflict`. Both missing commands now exist as first-class,
+  evidence-bearing paths:
+
+  * `POST /bnk07/payments/{paymentID}/confirm-settlement` and
+    `POST /bnk07/payments/{paymentID}/record-rejection`. BNK-07 §7 names the
+    commands and their shared contract fields (provider/bank refs, confirmation/
+    reject evidence, effective timestamps, finality basis) but does not
+    prescribe a per-command JSON schema. The request shape is therefore
+    `provider_reference`, `bank_reference`, `reason`, `effective_date` (RFC3339
+    or `YYYY-MM-DD`), `evidence_reference` and optional `evidence_hash`
+    (SHA-256 hex); at least one provider/bank reference, a reason, an effective
+    date and an evidence reference are required. The response is
+    `{payment, evidence, replayed}`.
+  * Both commands require `Idempotency-Key`. The key is claimed in the same
+    transaction as the status change, the append-only
+    `payment_finality_evidence` row, the `status_events` row and the
+    `PaymentSettled`/`PaymentRejected` outbox event (migration `000008`). A
+    retry with the same key and request returns the committed result with
+    `Idempotent-Replay: true`; the same key for a different command, payment or
+    request is a 409 conflict; a refused command never consumes its key. This
+    is the platform command-idempotency pattern, not the natural-key dedup the
+    older BNK-07 commands use, because a manual finality decision has no
+    provider event reference to dedupe on.
+  * Both commands require `PAYMENT_FINALITY_CONFIRM`, the same action
+    `PollPaymentStatus` uses for a final status, and enforce creator-different
+    SoD in the handler and again in the store: the principal who created the
+    payment cannot manually assert its final settlement/rejection. An open
+    evidence conflict is refused (409); a payment already in a governed-final
+    state is refused (409) unless the request is the exact idempotent replay.
+  * `GetFinalityEvidence` now returns the stored manual finality evidence rows
+    in addition to the state-level source/version. The four BNK-07 actions are
+    now registered in access-control-svc migration
+    `000020_register_payment_status_actions` (`PAYMENT_FINALITY_CONFIRM` as
+    HIGH risk; the other three STANDARD), closing the pre-existing grantability
+    gap that would otherwise make these commands permanently 403 in a real
+    environment. Deploy access-control `000020` before enabling the new
+    payment-status commands; the action cannot be granted until it exists in the
+    registry.
+  * Tests: `TestPgStore_ConfirmSettlement_EvidenceAndOutbox`,
+    `TestPgStore_ConfirmSettlement_DuplicateSameKeyReplaysWithoutSecondEffect`,
+    `TestPgStore_ConfirmSettlement_AlreadyTerminalWithNewKeyRefused`,
+    `TestPgStore_ConfirmSettlement_SameKeyDifferentRequestConflict`,
+    `TestPgStore_ConfirmSettlement_SameCreatorForbidden`,
+    `TestPgStore_ConfirmSettlement_OpenConflictRefused`,
+    `TestPgStore_ConfirmSettlement_ConcurrentSameKeyOneEffect`,
+    `TestPgStore_RecordRejection_EvidenceAndOutbox`,
+    `TestPgStore_RecordRejection_MissingEvidenceDoesNotConsumeKey`,
+    `TestPgStore_FinalityEvidence_TenantIsolation`, and the migration down-guard
+    test; plus the handler success/duplicate/terminal/missing-evidence/SoD/
+    permission tests in `internal/handler/finality_handler_test.go`. The
+    access-control integration suite also proves the four actions are
+    registered and that 000020's down migration refuses while a bundle names
+    one.
+  * A4 is not a precursor for A1: both commands accept any non-final state
+    (`CanConfirmFinality` is `!IsFinal`), so a future `PENDING_UNKNOWN` would be
+    accepted without changing them. A4 remains a separate state-model item
+    (below).
 - **A2. `PollPaymentStatus` is caller-attested, not a provider poll, and has no
   polling policy.** The handler accepts `reported_status` and an optional
   `mapping_version` in the request body and applies them through the same
@@ -84,11 +134,14 @@ BNK-07.
   path emits one final event, both a conflict-resolved and a final event, or a
   distinct manual-override event is a downstream contract decision; emitting
   from the poll would also change the behavior this service has had since the
-  dual-write.
+  dual-write. The new A1 commands do emit `PaymentSettled`/`PaymentRejected`
+  directly through the outbox, so the first-class manual command path is no
+  longer silent; the compatibility poll and `ResolveStatusConflict` still are.
 - **A4. Two spec states are unreachable or unrepresentable: `SUBMITTED` and
-  `PENDING_UNKNOWN`.** The §7 state model is "Prepared → Submitted →
-  Accepted/Pending → Settled or Rejected/Returned/Cancelled; PendingUnknown
-  may occur". `StatusSubmitted` exists in the domain, the table CHECK and
+  `PENDING_UNKNOWN` — still open; A1 does not depend on it.** The §7 state
+  model is "Prepared → Submitted → Accepted/Pending → Settled or
+  Rejected/Returned/Cancelled; PendingUnknown may occur". `StatusSubmitted`
+  exists in the domain, the table CHECK and
   `CanCancel`, but no command or callback can set it: `RecordPaymentStatus`
   hard-codes `PREPARED`, `ValidCallbackStatus` excludes `SUBMITTED`, and there
   is no BNK-06 event consumer or explicit "mark submitted" transition. A
@@ -104,7 +157,14 @@ BNK-07.
   new state changes the CHECK constraint, the terminal/regression rules,
   `CanCancel`, `ListUnresolvedPayments`, the provider status profile and every
   consumer's status mapping; it needs its own migration and state-machine
-  review, not an improvised enum value.
+  review, not an improvised enum value. A1 did not close A4: the new finality
+  commands operate from any non-final state, so they do not need
+  `PENDING_UNKNOWN` to exist first, and adding that state without a producer
+  for `SUBMITTED` would leave the state model only partly closed. Closing A4
+  still needs a BNK-06 event consumer or explicit "mark submitted" transition
+  for `SUBMITTED`, a `PENDING_UNKNOWN` transition/consumer for ambiguous
+  provider outcomes, and the corresponding terminal/regression, cancellation
+  and consumer-mapping review.
 - **A5. `RecordPaymentStatus` was not idempotent — closed in this pass.** Every
   call previously generated a new UUID and inserted a new
   `payment_execution_states` row. A lost `201` followed by a retry therefore
@@ -178,35 +238,44 @@ BNK-07.
   and pagination are still missing. *Why it was not fixed here:* "unresolved"
   is a product/control definition (which statuses, age thresholds, conflict vs
   unknown vs stale) and pagination changes the response shape.
-- **A9. Finality evidence is much thinner than the contract.** §7 requires
+- **A9. Finality evidence is much thinner than the contract — partly improved
+  for manual commands, still open for callbacks.** §7 requires
   "Authenticated raw response/reference, mapping/version, sequence/order
   decision, provider/bank refs, finality source, timestamps and conflict
-  resolution evidence". `GetFinalityEvidence` returns only `payment_id`,
+  resolution evidence". `GetFinalityEvidence` now returns the append-only
+  manual finality evidence rows added by migration `000008` (provider/bank
+  refs, reason, effective timestamp, evidence reference/hash, mapping version,
+  finality source, actor and idempotency key) in addition to `payment_id`,
   `status`, `finality_source` and `mapping_version`; `GetProviderReference`
-  returns only `provider_request_id`. The `provider_callback_receipts` table
-  does store `body_hash`, `scheme`, `event_time`, `outcome`, `received_at` and
-  the provider/event refs, but no read endpoint joins a receipt to the
+  still returns only `provider_request_id`. The `provider_callback_receipts`
+  table does store `body_hash`, `scheme`, `event_time`, `outcome`, `received_at`
+  and the provider/event refs, but no read endpoint joins a receipt to the
   payment's finality evidence, and `status_events` has no raw hash or external
   reference column. A conflict's reason is written into `status_events.detail`
   and then cleared from `conflict_reason`; it is not returned as resolution
   evidence either. *Why it was not fixed here:* an evidence view needs schema,
   retention and masking decisions (invariant 2 covers bank identifiers) and a
   contract for which raw response may be retained.
-- **A10. The manual finality commands require an assertion, not evidence, and
-  lack dual control.** `ResolveStatusConflict` now validates that the target
-  is SETTLED/REJECTED/CANCELLED and locks the row, but it accepts a free-text
-  `reason` only: no statement or provider evidence reference, no second
-  approver, and no check that the chosen final status is supported by either
-  side's evidence. `RecordReturn` checks SETTLED, requires a reason and a
+- **A10. The older manual commands still require an assertion, not evidence;
+  the new settlement/rejection commands close that part but not the rest.**
+  `ConfirmSettlement` and `RecordRejection` now require provider/bank refs,
+  evidence, an effective date, a reason, `PAYMENT_FINALITY_CONFIRM` and a
+  creator-different principal, so the first-class settlement/rejection path is
+  no longer assertion-only. `ResolveStatusConflict` still validates that the
+  target is SETTLED/REJECTED/CANCELLED and locks the row, but it accepts a
+  free-text `reason` only: no statement or provider evidence reference, no
+  second approver, and no check that the chosen final status is supported by
+  either side's evidence. `RecordReturn` checks SETTLED, requires a reason and a
   different principal, but does not verify that a return actually happened; a
-  caller can move SETTLED to RETURNED on their word. `CancelPaymentWhereSupported`
-  moves PREPARED/SUBMITTED to CANCELLED without asking the provider whether
-  cancellation is supported or succeeded, and emits `PaymentCancelled`
-  regardless. §7 says "manual finality override requires exceptional controlled
-  workflow and evidence"; permission separation plus a non-creator check is
-  necessary but not sufficient for that sentence. *Why it was not fixed here:*
-  it needs evidence/workflow contracts (and, for cancellation, a provider
-  capability profile and a cancel-requested state) rather than a local patch.
+  caller can move SETTLED to RETURNED on their word.
+  `CancelPaymentWhereSupported` moves PREPARED/SUBMITTED to CANCELLED without
+  asking the provider whether cancellation is supported or succeeded, and emits
+  `PaymentCancelled` regardless. §7 says "manual finality override requires
+  exceptional controlled workflow and evidence"; permission separation plus a
+  non-creator check is necessary but not sufficient for that sentence. *Why it
+  was not fixed here:* it needs evidence/workflow contracts (and, for
+  cancellation, a provider capability profile and a cancel-requested state)
+  rather than a local patch.
 - **A11. Conflicts cannot be recorded or resolved on terminal states because
   the immutability trigger rejects every update.** `LinkStatement` updates
   `has_open_conflict`/`conflict_reason` in place. The trigger rejects any
@@ -353,20 +422,28 @@ BNK-07.
   negative path ("provider says settled but statement evidence conflicts and is
   ignored"), but it is not independent evidence. A10 records the related
   evidence gap for manual resolution.
-- **B10. Verification in this pass.** `go test ./...` passes for the service.
-  The full integration suite (`go test -tags=integration -count=1
-  -timeout=400s ./...`) was run against a fresh, disposable
-  `postgres:16-alpine` container through `TEST_DATABASE_URL` and passed; the
-  container was removed afterwards. New coverage: read authorization and
-  UUID-filter validation (handler), legacy/poll conflict blocking (handler and
-  store), profile conflict/provider blocking and non-decision (store),
-  entity-scoped unresolved listing (store), invalid resolution status
-  (handler/store), empty-secret fail-closed (handler), poll finality
-  permission/SoD (handler), and concurrent/sequential `source_reference`
-  idempotency (store). The existing forged-callback, duplicate,
-  out-of-order, statement-conflict, return and cancellation tests still pass.
-  `payment-run-svc` and `payable-open-item-svc` were updated for the
-  principal-forwarding contract; their tests pass with the same change.
+- **B10. Verification.** `go build ./...`, `go vet ./...` (including
+  `go vet -tags=integration ./...`) and `go test ./...` pass. The full
+  integration suite (`go test -tags=integration -count=1
+  -timeout=900s ./...`) was run against a fresh, disposable embedded Postgres
+  16 instance with a pid-derived runtime path; no shared dev database was used.
+  The access-control-svc integration store suite was run the same way and
+  passes, including the 000020 registration and down-guard test. A1 coverage:
+  command success/evidence/outbox, duplicate replay with no second effect,
+  terminal-state refusal with a new key, key/request conflict, creator-different
+  SoD, open-conflict refusal, concurrent same-key one-effect, rejection evidence
+  and missing-evidence key preservation, tenant isolation of the new evidence,
+  and all three 000008 down guards (evidence, idempotency claim, manual-finality
+  state). Previous coverage still passes: read authorization and UUID-filter
+  validation (handler), legacy/poll conflict blocking (handler and store),
+  profile conflict/provider blocking and non-decision (store), entity-scoped
+  unresolved listing (store), invalid resolution status (handler/store),
+  empty-secret fail-closed (handler), poll finality permission/SoD (handler),
+  and concurrent/sequential `source_reference` idempotency (store). The
+  existing forged-callback, duplicate, out-of-order, statement-conflict, return
+  and cancellation tests still pass. `payment-run-svc` and
+  `payable-open-item-svc` were updated for the principal-forwarding contract;
+  their tests pass with the same change.
 - **B11. `RecordPaymentStatus` deduplicates on `(tenant_id, source_reference)`
   only while the execution state is unresolved.** The key is BNK-06's
   `source_reference`, not `provider_request_id`: the latter is optional and
@@ -384,3 +461,21 @@ BNK-07.
   resolution too, but that would make an exhausted source_reference
   permanently unusable, which is why BNK-06's precedent scopes it to
   unresolved attempts.
+- **B12. Manual finality commands use header idempotency and a service-owned
+  finality basis.** BNK-07 §7 names `ConfirmSettlement`/`RecordRejection` and
+  requires provider/bank references, evidence, effective timestamps and a
+  finality basis, but it does not define a per-command JSON schema. The chosen
+  request fields are the minimum that records that evidence. The
+  `Idempotency-Key` is a header rather than a body field so it is handled
+  uniformly by middleware and cannot be confused with payment data; it is
+  scoped per tenant, and the stored request hash covers command, payment and
+  every evidence field. A replay returns the current state plus the stored
+  evidence, not a cached HTTP body. The finality source and mapping version are
+  service-owned constants, not caller input, so a caller cannot label a manual
+  command as a provider callback or statement link. Creator-different SoD is
+  enforced in addition to `PAYMENT_FINALITY_CONFIRM`; the spec does not name a
+  separate second-approver record, so none is invented here. If a later
+  interpretation requires maker-checker, the right change is an approval
+  record/state in front of this command, not weakening the existing checks.
+  The provider/bank references are recorded as evidence but are not
+  independently verified against BNK-06/BNK-03 in this pass (A10).

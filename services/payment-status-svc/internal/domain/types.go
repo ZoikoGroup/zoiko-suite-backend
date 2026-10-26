@@ -52,7 +52,12 @@
 // approvals, AP-11's ReconcilePaymentRunStatus).
 package domain
 
-import "time"
+import (
+	"encoding/hex"
+	"fmt"
+	"strings"
+	"time"
+)
 
 type ExecutionStatus string
 
@@ -89,6 +94,14 @@ func ValidCallbackStatus(s ExecutionStatus) bool {
 func CanCancel(s ExecutionStatus) bool { return s == StatusPrepared || s == StatusSubmitted }
 func CanReturn(s ExecutionStatus) bool { return s == StatusSettled }
 
+// CanConfirmFinality reports whether a manual finality command may act on s.
+// Both ConfirmSettlement and RecordRejection are evidence-bearing decisions
+// from any not-yet-governed state; a SETTLED state can still move to RETURNED
+// through RecordReturn, but no final state may be re-confirmed. Keeping this
+// predicate in the domain means a future PENDING_UNKNOWN state (A4) is accepted
+// here without another handler change.
+func CanConfirmFinality(s ExecutionStatus) bool { return !IsFinal(s) }
+
 // ValidResolutionStatus reports whether s is a status an operator may set
 // when closing a provider/statement conflict. A conflict is resolved to a
 // governed final outcome, not to an intermediate stage; RETURNED is excluded
@@ -116,7 +129,7 @@ type PaymentExecutionState struct {
 
 	Status ExecutionStatus
 
-	FinalitySource string // "PROVIDER_CALLBACK" | "STATEMENT" | "MANUAL_POLL" | "MANUAL_OVERRIDE"
+	FinalitySource string // "PROVIDER_CALLBACK" | "STATEMENT" | "MANUAL_POLL" | "MANUAL_OVERRIDE" | "MANUAL_CONFIRMATION" | "MANUAL_REJECTION"
 	MappingVersion string
 
 	HasOpenConflict bool
@@ -155,6 +168,21 @@ const (
 	EventCallbackRejectedForgery       = "PAYMENT_CALLBACK_REJECTED_FORGERY"
 	EventCallbackRejectedRegression    = "PAYMENT_CALLBACK_REJECTED_REGRESSION"
 	EventCallbackDuplicateIgnored      = "PAYMENT_CALLBACK_DUPLICATE_IGNORED"
+)
+
+// Manual finality command identities, persisted with their evidence and used
+// as the operation discriminator in the command-idempotency record. They are
+// deliberately distinct: reusing one Idempotency-Key for a settlement and a
+// rejection is a conflict, not a replay.
+const (
+	CommandConfirmSettlement = "CONFIRM_SETTLEMENT"
+	CommandRecordRejection   = "RECORD_REJECTION"
+
+	FinalitySourceManualConfirmation = "MANUAL_CONFIRMATION"
+	FinalitySourceManualRejection    = "MANUAL_REJECTION"
+
+	ManualConfirmationMappingVersion = "payment-status-svc.confirm-settlement.v1"
+	ManualRejectionMappingVersion    = "payment-status-svc.record-rejection.v1"
 )
 
 // ── request DTOs ────────────────────────────────────────────────────────────
@@ -204,6 +232,117 @@ type CancelRequest struct {
 	Reason string
 }
 
+// ConfirmSettlementRequest is the first-class manual settlement command. BNK-07
+// §7 names the command and its contract fields (provider/bank references,
+// confirmation evidence, effective timestamps, finality basis) but does not
+// prescribe a per-command JSON schema; these fields are the minimum needed to
+// record that evidence. At least one of provider_reference and bank_reference
+// is required, as is an evidence reference. effective_date accepts RFC3339 or
+// YYYY-MM-DD.
+type ConfirmSettlementRequest struct {
+	ProviderReference string `json:"provider_reference"`
+	BankReference     string `json:"bank_reference"`
+	Reason            string `json:"reason"`
+	EffectiveDate     string `json:"effective_date"`
+	EvidenceReference string `json:"evidence_reference"`
+	EvidenceHash      string `json:"evidence_hash,omitempty"`
+}
+
+func (r ConfirmSettlementRequest) Validate() error {
+	return validateFinalityRequest(r.ProviderReference, r.BankReference, r.Reason, r.EffectiveDate, r.EvidenceReference, r.EvidenceHash)
+}
+
+// RecordRejectionRequest is the rejection counterpart. A rejection always needs
+// a reason as well as the same provider/bank and evidence fields.
+type RecordRejectionRequest struct {
+	ProviderReference string `json:"provider_reference"`
+	BankReference     string `json:"bank_reference"`
+	Reason            string `json:"reason"`
+	EffectiveDate     string `json:"effective_date"`
+	EvidenceReference string `json:"evidence_reference"`
+	EvidenceHash      string `json:"evidence_hash,omitempty"`
+}
+
+func (r RecordRejectionRequest) Validate() error {
+	return validateFinalityRequest(r.ProviderReference, r.BankReference, r.Reason, r.EffectiveDate, r.EvidenceReference, r.EvidenceHash)
+}
+
+// FinalityEvidence is the append-only record written by ConfirmSettlement or
+// RecordRejection in the same transaction as the final status change and its
+// outbox event. It is returned by the command and by GetFinalityEvidence.
+type FinalityEvidence struct {
+	EvidenceID        string    `json:"evidence_id"`
+	TenantID          *string   `json:"tenant_id,omitempty"`
+	PaymentID         string    `json:"payment_id"`
+	Command           string    `json:"command"`
+	ProviderReference string    `json:"provider_reference,omitempty"`
+	BankReference     string    `json:"bank_reference,omitempty"`
+	Reason            string    `json:"reason"`
+	EffectiveAt       time.Time `json:"effective_at"`
+	EvidenceReference string    `json:"evidence_reference"`
+	EvidenceHash      string    `json:"evidence_hash,omitempty"`
+	MappingVersion    string    `json:"mapping_version"`
+	FinalitySource    string    `json:"finality_source"`
+	ActorPrincipalID  string    `json:"actor_principal_id"`
+	IdempotencyKey    string    `json:"idempotency_key,omitempty"`
+	CreatedAt         time.Time `json:"created_at"`
+}
+
+// ParseEffectiveDate accepts the two forms an external evidence feed commonly
+// supplies: a full RFC3339 timestamp, or a date-only value (interpreted as UTC
+// midnight).
+func ParseEffectiveDate(raw string) (time.Time, error) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return time.Time{}, fmt.Errorf("%w: effective_date is required", ErrInvalidFinalityRequest)
+	}
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t.UTC(), nil
+	}
+	if t, err := time.Parse("2006-01-02", s); err == nil {
+		return t.UTC(), nil
+	}
+	return time.Time{}, fmt.Errorf("%w: effective_date must be RFC3339 or YYYY-MM-DD", ErrInvalidFinalityRequest)
+}
+
+func validateFinalityRequest(providerReference, bankReference, reason, effectiveDate, evidenceReference, evidenceHash string) error {
+	providerReference = strings.TrimSpace(providerReference)
+	bankReference = strings.TrimSpace(bankReference)
+	reason = strings.TrimSpace(reason)
+	evidenceReference = strings.TrimSpace(evidenceReference)
+	if providerReference == "" && bankReference == "" {
+		return fmt.Errorf("%w: provider_reference or bank_reference is required", ErrInvalidFinalityRequest)
+	}
+	if len(providerReference) > 256 || len(bankReference) > 256 {
+		return fmt.Errorf("%w: provider_reference and bank_reference must be at most 256 characters", ErrInvalidFinalityRequest)
+	}
+	if reason == "" {
+		return fmt.Errorf("%w: reason is required", ErrInvalidFinalityRequest)
+	}
+	if len(reason) > 2000 {
+		return fmt.Errorf("%w: reason must be at most 2000 characters", ErrInvalidFinalityRequest)
+	}
+	if _, err := ParseEffectiveDate(effectiveDate); err != nil {
+		return err
+	}
+	if evidenceReference == "" {
+		return fmt.Errorf("%w: evidence_reference is required", ErrInvalidFinalityRequest)
+	}
+	if len(evidenceReference) > 512 {
+		return fmt.Errorf("%w: evidence_reference must be at most 512 characters", ErrInvalidFinalityRequest)
+	}
+	h := strings.TrimSpace(evidenceHash)
+	if h != "" {
+		if len(h) != 64 {
+			return fmt.Errorf("%w: evidence_hash must be a 64-character SHA-256 hex digest", ErrInvalidFinalityRequest)
+		}
+		if _, err := hex.DecodeString(h); err != nil {
+			return fmt.Errorf("%w: evidence_hash must be hexadecimal", ErrInvalidFinalityRequest)
+		}
+	}
+	return nil
+}
+
 // ── sentinel errors ─────────────────────────────────────────────────────────
 
 type sentinel string
@@ -218,6 +357,16 @@ const (
 	ErrInvalidResolution     = sentinel("final_status must be SETTLED, REJECTED or CANCELLED")
 	ErrOpenConflictExists    = sentinel("payment already has an open, unresolved status conflict")
 	ErrStoreUnavailable      = sentinel("store unavailable")
+	// ErrInvalidFinalityRequest is the evidence/contract validation for
+	// ConfirmSettlement and RecordRejection.
+	ErrInvalidFinalityRequest = sentinel("invalid finality command request")
+	// ErrIdempotencyKeyRequired/Conflict are the same command-idempotency
+	// rules consolidation-svc and the platform's command_idempotency pattern
+	// use: the key is claimed in the transaction that makes the change, a
+	// repeat with the same request replays the result, and the same key for a
+	// different command, payment or request is refused.
+	ErrIdempotencyKeyRequired = sentinel("Idempotency-Key header is required for this command")
+	ErrIdempotencyKeyConflict = sentinel("Idempotency-Key was already used with a different request")
 	// ErrSelfResolutionForbidden is the SoD rule the spec names as "manual
 	// finality override requires exceptional controlled workflow and
 	// evidence": the principal who created a payment cannot also be the

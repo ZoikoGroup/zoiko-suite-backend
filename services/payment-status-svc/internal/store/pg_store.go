@@ -80,7 +80,15 @@ type Store interface {
 	RecordReturn(ctx context.Context, paymentID string, req domain.RecordReturnRequest, principalID string) (*domain.PaymentExecutionState, error)
 	CancelPayment(ctx context.Context, paymentID string, req domain.CancelRequest, principalID, correlationID string) (*domain.PaymentExecutionState, error)
 
+	// ConfirmSettlement and RecordRejection are the first-class, evidence-bearing
+	// manual finality commands. They claim idempotencyKey in the same transaction
+	// as the status change, evidence row and outbox event; replay reports that
+	// this call returned the already-committed result.
+	ConfirmSettlement(ctx context.Context, paymentID string, req domain.ConfirmSettlementRequest, principalID, idempotencyKey, correlationID string) (*domain.PaymentExecutionState, *domain.FinalityEvidence, bool, error)
+	RecordRejection(ctx context.Context, paymentID string, req domain.RecordRejectionRequest, principalID, idempotencyKey, correlationID string) (*domain.PaymentExecutionState, *domain.FinalityEvidence, bool, error)
+
 	ListEvents(ctx context.Context, paymentID string) ([]domain.StatusEvent, error)
+	ListFinalityEvidence(ctx context.Context, paymentID string) ([]domain.FinalityEvidence, error)
 	ListUnresolved(ctx context.Context, legalEntityID string) ([]domain.PaymentExecutionState, error)
 }
 
