@@ -42,6 +42,7 @@ type Book struct {
 	BookCode              string     `json:"book_code"`
 	BookType              string     `json:"book_type"`
 	AccountingFrameworkID string     `json:"accounting_framework_id"`
+	Jurisdiction          string     `json:"jurisdiction,omitempty"`
 	FunctionalCurrency    string     `json:"functional_currency"`
 	FiscalCalendarID      string     `json:"fiscal_calendar_id"`
 	ChartOfAccountsID     string     `json:"chart_of_accounts_id"`
@@ -81,6 +82,9 @@ func (b *Book) ValidateNew() error {
 		if !codeRE.MatchString(v) {
 			return bad(f, "a controlled identifier, not free text")
 		}
+	}
+	if !jurisdictionRE.MatchString(b.Jurisdiction) {
+		return bad("jurisdiction", "an ISO 3166 country code, optionally with a subdivision (DE, US-CA), or empty")
 	}
 	if !currencyRE.MatchString(b.FunctionalCurrency) {
 		return bad("functional_currency", "an ISO 4217 code")

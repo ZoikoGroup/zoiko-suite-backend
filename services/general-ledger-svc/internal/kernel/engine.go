@@ -137,7 +137,7 @@ func Evaluate(ctx context.Context, in EvalInput) (*Proposal, error) {
 	if !bk.InForce(in.PostingDate) {
 		return nil, exc(FamRule, "BOOK_NOT_IN_FORCE", "book %s is %s on %s", bk.BookCode, strings.ToLower(bk.Status), in.PostingDate.Format("2006-01-02"))
 	}
-	if rs.EventType != ev.EventType || rs.BookType != bk.BookType || rs.FrameworkID != bk.AccountingFrameworkID {
+	if rs.EventType != ev.EventType || rs.BookType != bk.BookType || rs.FrameworkID != bk.AccountingFrameworkID || !rs.AppliesToJurisdiction(bk.Jurisdiction) {
 		return nil, exc(FamRule, "RULE_NOT_APPLICABLE", "the rule set is for %s / %s / %s", rs.EventType, rs.BookType, rs.FrameworkID)
 	}
 	if !rs.Covers(in.PostingDate) {

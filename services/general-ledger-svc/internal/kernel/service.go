@@ -94,7 +94,7 @@ type Repo interface {
 	// ActivateRuleSet makes an approved rule set ACTIVE and supersedes the open-ended active version it replaces, in one
 	// transaction under the scope lock. It returns the ids it superseded.
 	ActivateRuleSet(ctx context.Context, tenant, id string, expectedRowVersion int64, actor string, out OutEvent) (*RuleSet, []string, error)
-	ActiveRuleSets(ctx context.Context, tenant, eventType, bookType, framework string, on time.Time) ([]RuleSet, error)
+	ActiveRuleSets(ctx context.Context, tenant, eventType, bookType, framework, jurisdiction string, on time.Time) ([]RuleSet, error)
 	RuleSetEvents(ctx context.Context, tenant, id string) ([]RuleEvent, error)
 
 	// FindPosting returns the posting consequence of an event in a book under a basis, or ErrNotFound.
@@ -249,7 +249,7 @@ func (s *Service) TestRuleSet(ctx context.Context, tenant string, a Actor, id st
 	if err != nil {
 		return nil, nil, err
 	}
-	if bk.BookType != rs.BookType || bk.AccountingFrameworkID != rs.FrameworkID {
+	if bk.BookType != rs.BookType || bk.AccountingFrameworkID != rs.FrameworkID || !rs.AppliesToJurisdiction(bk.Jurisdiction) {
 		return nil, nil, exc(FamRule, "BOOK_NOT_APPLICABLE", "the book is %s / %s and the rule set is for %s / %s", bk.BookType, bk.AccountingFrameworkID, rs.BookType, rs.FrameworkID)
 	}
 	if rs.Status != RuleDraft && rs.Status != RuleTest {
@@ -392,10 +392,11 @@ func (s *Service) Evaluate(ctx context.Context, tenant string, req EvaluateReque
 		}
 	}
 	pd = today(pd)
-	sets, err := s.Repo.ActiveRuleSets(ctx, tenant, ev.EventType, bk.BookType, bk.AccountingFrameworkID, pd)
+	sets, err := s.Repo.ActiveRuleSets(ctx, tenant, ev.EventType, bk.BookType, bk.AccountingFrameworkID, bk.Jurisdiction, pd)
 	if err != nil {
 		return nil, err
 	}
+	sets = preferJurisdiction(sets, bk.Jurisdiction)
 	switch len(sets) {
 	case 0:
 		return nil, exc(FamRule, "NO_RULE", "no active rule set for %s in a %s book under %s on %s", ev.EventType, bk.BookType, bk.AccountingFrameworkID, pd.Format("2006-01-02")).

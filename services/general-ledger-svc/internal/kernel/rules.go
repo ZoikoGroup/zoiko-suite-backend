@@ -155,6 +155,7 @@ type RuleSet struct {
 	EventType       string      `json:"event_type"`
 	BookType        string      `json:"book_type"`
 	FrameworkID     string      `json:"accounting_framework_id"`
+	Jurisdiction    string      `json:"jurisdiction,omitempty"`
 	Version         string      `json:"version"`
 	Status          string      `json:"status"`
 	EffectiveFrom   time.Time   `json:"effective_from"`
@@ -212,6 +213,9 @@ func (r *RuleSet) Validate() error {
 	}
 	if !codeRE.MatchString(r.FrameworkID) {
 		return bad("accounting_framework_id", "a controlled identifier")
+	}
+	if !jurisdictionRE.MatchString(r.Jurisdiction) {
+		return bad("jurisdiction", "an ISO 3166 country code, optionally with a subdivision (DE, US-CA), or empty for global")
 	}
 	if !semverRE.MatchString(r.Version) {
 		return bad("version", "a semantic version such as 1.0.0")
@@ -451,7 +455,9 @@ func evalConditions(ev *AccountingEvent, cs []Condition) bool {
 }
 
 // Scope is what two rule sets must not both claim on the same date: an event type for a book type and framework.
-func (r *RuleSet) Scope() string { return r.EventType + "|" + r.BookType + "|" + r.FrameworkID }
+func (r *RuleSet) Scope() string {
+	return r.EventType + "|" + r.BookType + "|" + r.FrameworkID + "|" + r.Jurisdiction
+}
 
 // Covers reports whether the rule set applies on the date.
 func (r *RuleSet) Covers(d time.Time) bool {
@@ -502,4 +508,30 @@ func sortedKeys[V any](m map[string]V) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// jurisdictionRE is the shape of a jurisdiction code: an ISO 3166 country with an optional subdivision, or empty for global.
+var jurisdictionRE = regexp.MustCompile(`^([A-Z]{2}(-[A-Z0-9]{1,5})?)?$`)
+
+// preferJurisdiction applies the rule hierarchy (§6.1): where an extension rule set for the book's jurisdiction is active for the
+// event, it replaces the framework's global rule set; otherwise the global one stands.
+func preferJurisdiction(sets []RuleSet, jurisdiction string) []RuleSet {
+	if jurisdiction == "" {
+		return sets
+	}
+	var own []RuleSet
+	for _, s := range sets {
+		if s.Jurisdiction == jurisdiction {
+			own = append(own, s)
+		}
+	}
+	if len(own) > 0 {
+		return own
+	}
+	return sets
+}
+
+// AppliesToJurisdiction reports whether a rule set may be used in a book kept under the jurisdiction.
+func (r *RuleSet) AppliesToJurisdiction(bookJurisdiction string) bool {
+	return r.Jurisdiction == "" || r.Jurisdiction == bookJurisdiction
 }
