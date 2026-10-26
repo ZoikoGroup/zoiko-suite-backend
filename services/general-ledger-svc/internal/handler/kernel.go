@@ -103,6 +103,8 @@ func RegisterKernelRoutes(r chi.Router, h *KernelHandler) {
 		r.Post("/{id}/members/{member}/end", h.EndConsolidationMember)
 		r.Put("/{id}/mappings", h.PutConsolidationMapping)
 		r.Get("/{id}/mappings", h.ListConsolidationMappings)
+		r.Post("/{id}/adjustments", h.ProposeGroupAdjustment)
+		r.Get("/{id}/adjustments", h.ListGroupAdjustments)
 	})
 	r.Route("/v1/consolidation-runs", func(r chi.Router) {
 		r.Post("/", h.RunConsolidation)
@@ -112,6 +114,8 @@ func RegisterKernelRoutes(r chi.Router, h *KernelHandler) {
 		r.Post("/{id}/supersede", h.SupersedeConsolidationRun)
 	})
 	r.Get("/v1/intercompany-pairings", h.GetIntercompanyPairing)
+	r.Post("/v1/consolidation-adjustments/{id}/approve", h.ApproveGroupAdjustment)
+	r.Post("/v1/consolidation-adjustments/{id}/withdraw", h.WithdrawGroupAdjustment)
 	r.Route("/v1/allocation-rules", func(r chi.Router) {
 		r.Post("/", h.CreateAllocationRule)
 		r.Get("/", h.ListAllocationRules)
