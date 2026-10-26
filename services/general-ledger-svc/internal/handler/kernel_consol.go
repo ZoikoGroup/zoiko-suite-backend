@@ -69,6 +69,15 @@ func (h *KernelHandler) ListConsolidationGroups(w http.ResponseWriter, r *http.R
 		h.fail(w, err)
 		return
 	}
+	if pe := r.URL.Query().Get("parent_entity_id"); pe != "" {
+		kept := list[:0]
+		for _, g := range list {
+			if g.ParentEntityID == pe {
+				kept = append(kept, g)
+			}
+		}
+		list = kept
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"groups": list, "total": len(list)})
 }
 
@@ -312,7 +321,12 @@ func (h *KernelHandler) ProposeGroupAdjustment(w http.ResponseWriter, r *http.Re
 		h.fail(w, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, adj)
+	status := http.StatusCreated
+	if adj.Existing {
+		status = http.StatusOK
+		w.Header().Set("Idempotent-Replay", "true")
+	}
+	writeJSON(w, status, adj)
 }
 
 func (h *KernelHandler) ListGroupAdjustments(w http.ResponseWriter, r *http.Request) {

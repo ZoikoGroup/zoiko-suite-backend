@@ -262,103 +262,118 @@ func (c *Clients) FetchReciprocalBalances(ctx context.Context, tenantID, princip
 	return &balances, nil
 }
 
-// postingEventLine mirrors general-ledger-svc's own
-// domain.PostingEventLineInput — account_code only, never a mapping_key:
-// a consolidation adjustment names its own accounts explicitly.
-type postingEventLine struct {
-	AccountCode  string  `json:"account_code"`
-	DebitAmount  float64 `json:"debit_amount,omitempty"`
-	CreditAmount float64 `json:"credit_amount,omitempty"`
-}
-
-type postAccountingEventRequest struct {
-	LegalEntityID string             `json:"legal_entity_id"`
-	FiscalPeriod  string             `json:"fiscal_period"`
-	Description   string             `json:"description"`
-	SourceEventID string             `json:"source_event_id"`
-	CorrelationID string             `json:"correlation_id"`
-	Lines         []postingEventLine `json:"lines"`
-}
-
-type postingExecutionResponse struct {
-	JournalID *string `json:"journal_id"`
-	Status    string  `json:"status"`
-}
-
-// PostConsolidationAdjustmentJournal is ACC-12's own real "ACC-04/05
-// consolidation book" dependency: it posts the adjustment's lines to
-// general-ledger-svc via ACC-04's PostAccountingEvent — the system-
-// originated posting path already built for exactly this shape of
-// entry (see general-ledger-svc's own doc comment: "System-originated
-// postings... deliberately skip the human workflow"). sourceEventID is
-// the adjustment's own ID, making a retried Post call idempotent against
-// general-ledger-svc's own UNIQUE(tenant_id, source_event_id) — never a
-// second journal for the same adjustment.
-func (c *Clients) PostConsolidationAdjustmentJournal(ctx context.Context, tenantID, principalID, legalEntityID, fiscalPeriod, description, sourceEventID, correlationID string, lines []JournalLine) (journalID string, err error) {
-	body := postAccountingEventRequest{
-		LegalEntityID: legalEntityID, FiscalPeriod: fiscalPeriod, Description: description,
-		SourceEventID: sourceEventID, CorrelationID: correlationID,
+// glCall is one request to general-ledger-svc's group-book API. The caller is identified the way every internal call here is: tenant,
+// principal and the legal entity the principal acts on.
+func (c *Clients) glCall(ctx context.Context, method, path, tenantID, principalID, legalEntityID string, body any, out any) (int, error) {
+	var rdr *bytes.Reader
+	if body != nil {
+		payload, err := json.Marshal(body)
+		if err != nil {
+			return 0, err
+		}
+		rdr = bytes.NewReader(payload)
+	} else {
+		rdr = bytes.NewReader(nil)
 	}
+	req, err := http.NewRequestWithContext(ctx, method, c.ledgerURL+path, rdr)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Tenant-Id", tenantID)
+	req.Header.Set("X-Principal-Id", principalID)
+	req.Header.Set("X-Legal-Entity-Id", legalEntityID)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		c.log.Error("general-ledger-svc group-book call failed", zap.String("path", path), zap.Error(err))
+		return 0, domain.ErrGLServiceUnavailable
+	}
+	defer resp.Body.Close()
+	if out != nil && resp.StatusCode < 300 {
+		if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+			return resp.StatusCode, err
+		}
+	}
+	if resp.StatusCode >= 300 {
+		var problem struct {
+			Code string `json:"code"`
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&problem)
+		if problem.Code == "ADJUSTMENT_APPLIED" {
+			return resp.StatusCode, domain.ErrAdjustmentInGroupRun
+		}
+	}
+	return resp.StatusCode, nil
+}
+
+type glGroup struct {
+	GroupID        string `json:"group_id"`
+	ParentEntityID string `json:"parent_entity_id"`
+}
+
+type glAdjustment struct {
+	AdjustmentID string `json:"adjustment_id"`
+	Status       string `json:"status"`
+}
+
+// PostConsolidationAdjustmentJournal submits an approved consolidation adjustment to general-ledger-svc's group book. It never reaches an
+// entity ledger: general-ledger-svc keeps the adjustment as a group adjustment of the consolidation group whose reporting entity is
+// legalEntityID, and a consolidation run there applies it, in the group book only. The adjustment id is the source reference, so a
+// retried post is the same adjustment. The adjustment was approved here by approverPrincipalID, who is not its author, and the same
+// separation is enforced there by approving it as that principal. The id it returns is general-ledger-svc's adjustment id.
+func (c *Clients) PostConsolidationAdjustmentJournal(ctx context.Context, tenantID, principalID, approverPrincipalID, legalEntityID, fiscalPeriod, description, sourceEventID, correlationID string, lines []JournalLine) (adjustmentID string, err error) {
+	var groups struct {
+		Groups []glGroup `json:"groups"`
+	}
+	status, err := c.glCall(ctx, http.MethodGet, "/v1/consolidation-groups?parent_entity_id="+url.QueryEscape(legalEntityID), tenantID, principalID, legalEntityID, nil, &groups)
+	if err != nil {
+		return "", err
+	}
+	if status != http.StatusOK {
+		return "", fmt.Errorf("%w: general-ledger-svc returned status %d listing the consolidation groups", domain.ErrGLServiceUnavailable, status)
+	}
+	if len(groups.Groups) != 1 {
+		return "", fmt.Errorf("%w: %d consolidation groups of the kernel have %s as their reporting entity", domain.ErrNoGroupBook, len(groups.Groups), legalEntityID)
+	}
+	type line struct {
+		AccountCode string `json:"account_code"`
+		Amount      string `json:"amount"`
+	}
+	body := map[string]any{"fiscal_period": fiscalPeriod, "description": description, "policy_ref": "consolidation-svc adjustment", "evidence_ref": sourceEventID, "source_ref": sourceEventID}
+	var ls []line
 	for _, l := range lines {
-		body.Lines = append(body.Lines, postingEventLine{AccountCode: l.AccountCode, DebitAmount: l.DebitAmount, CreditAmount: l.CreditAmount})
+		ls = append(ls, line{AccountCode: l.AccountCode, Amount: fmt.Sprintf("%.2f", l.DebitAmount-l.CreditAmount)})
 	}
-	payload, err := json.Marshal(body)
+	body["lines"] = ls
+	var adj glAdjustment
+	status, err = c.glCall(ctx, http.MethodPost, "/v1/consolidation-groups/"+groups.Groups[0].GroupID+"/adjustments", tenantID, principalID, legalEntityID, body, &adj)
 	if err != nil {
 		return "", err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.ledgerURL+"/v1/postings/events", bytes.NewReader(payload))
-	if err != nil {
-		return "", err
+	if status != http.StatusCreated && status != http.StatusOK {
+		return "", fmt.Errorf("%w: general-ledger-svc returned status %d for the group adjustment", domain.ErrGLServiceUnavailable, status)
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Tenant-Id", tenantID)
-	req.Header.Set("X-Principal-Id", principalID)
-
-	resp, err := c.http.Do(req)
-	if err != nil {
-		c.log.Error("failed to post consolidation adjustment journal to general-ledger-svc", zap.Error(err))
-		return "", domain.ErrGLServiceUnavailable
+	if adj.Status == "PROPOSED" {
+		status, err = c.glCall(ctx, http.MethodPost, "/v1/consolidation-adjustments/"+adj.AdjustmentID+"/approve", tenantID, approverPrincipalID, legalEntityID, nil, &adj)
+		if err != nil {
+			return "", err
+		}
+		if status != http.StatusOK {
+			return "", fmt.Errorf("%w: general-ledger-svc returned status %d approving the group adjustment", domain.ErrGLServiceUnavailable, status)
+		}
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		return "", fmt.Errorf("%w: general-ledger-svc returned status %d", domain.ErrGLServiceUnavailable, resp.StatusCode)
-	}
-	var execResp postingExecutionResponse
-	if err := json.NewDecoder(resp.Body).Decode(&execResp); err != nil {
-		return "", err
-	}
-	if execResp.JournalID == nil {
-		return "", fmt.Errorf("%w: general-ledger-svc reported no journal_id for a %s posting execution", domain.ErrGLServiceUnavailable, execResp.Status)
-	}
-	return *execResp.JournalID, nil
+	return adj.AdjustmentID, nil
 }
 
-// ReverseConsolidationAdjustmentJournal calls ACC-04's own
-// CreateReversalPosting — the same reversal primitive every other posted
-// journal on this platform uses, rather than a bespoke undo this service
-// would have to invent.
-func (c *Clients) ReverseConsolidationAdjustmentJournal(ctx context.Context, tenantID, principalID, journalID, reason string) error {
-	payload, err := json.Marshal(map[string]string{"original_journal_id": journalID, "reason": reason})
+// ReverseConsolidationAdjustmentJournal withdraws the group adjustment general-ledger-svc holds for a posted adjustment. An adjustment a
+// consolidation run there has already applied is not withdrawn behind that run's back: the run is superseded first.
+func (c *Clients) ReverseConsolidationAdjustmentJournal(ctx context.Context, tenantID, principalID, legalEntityID, adjustmentID, reason string) error {
+	status, err := c.glCall(ctx, http.MethodPost, "/v1/consolidation-adjustments/"+adjustmentID+"/withdraw", tenantID, principalID, legalEntityID, map[string]string{"reason": reason}, nil)
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.ledgerURL+"/v1/postings/reversals", bytes.NewReader(payload))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Tenant-Id", tenantID)
-	req.Header.Set("X-Principal-Id", principalID)
-
-	resp, err := c.http.Do(req)
-	if err != nil {
-		c.log.Error("failed to reverse consolidation adjustment journal via general-ledger-svc", zap.Error(err))
-		return domain.ErrGLServiceUnavailable
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		return fmt.Errorf("%w: general-ledger-svc returned status %d", domain.ErrGLServiceUnavailable, resp.StatusCode)
+	if status != http.StatusOK {
+		return fmt.Errorf("%w: general-ledger-svc returned status %d withdrawing the group adjustment", domain.ErrGLServiceUnavailable, status)
 	}
 	return nil
 }

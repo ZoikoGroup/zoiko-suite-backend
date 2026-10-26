@@ -12,12 +12,12 @@ import (
 )
 
 const adjCols = `adjustment_id::text, group_id::text, fiscal_period, description, policy_ref, evidence_ref, lines, status, created_by, created_at, COALESCE(approved_by, ''), approved_at,
-	COALESCE(withdrawn_by, ''), withdrawn_at, COALESCE(withdrawal_reason, '')`
+	COALESCE(withdrawn_by, ''), withdrawn_at, COALESCE(withdrawal_reason, ''), COALESCE(source_ref, '')`
 
 func scanAdjustment(row pgx.Row, a *kernel.ConsolAdjustment) error {
 	var lines []byte
 	if err := row.Scan(&a.AdjustmentID, &a.GroupID, &a.FiscalPeriod, &a.Description, &a.PolicyRef, &a.EvidenceRef, &lines, &a.Status, &a.CreatedBy, &a.CreatedAt, &a.ApprovedBy, &a.ApprovedAt,
-		&a.WithdrawnBy, &a.WithdrawnAt, &a.WithdrawalReason); err != nil {
+		&a.WithdrawnBy, &a.WithdrawnAt, &a.WithdrawalReason, &a.SourceRef); err != nil {
 		return err
 	}
 	return json.Unmarshal(lines, &a.Lines)
@@ -27,9 +27,9 @@ func scanAdjustment(row pgx.Row, a *kernel.ConsolAdjustment) error {
 func (r *KernelRepo) InsertAdjustment(ctx context.Context, tenant string, a *kernel.ConsolAdjustment, out kernel.OutEvent) error {
 	return kernelErr(r.tx(ctx, tenant, func(t pgx.Tx) error {
 		lines, _ := json.Marshal(a.Lines)
-		if _, e := t.Exec(ctx, `INSERT INTO consolidation_adjustments (adjustment_id, tenant_id, group_id, fiscal_period, description, policy_ref, evidence_ref, lines, status, created_by, created_at)
-			VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7, $8::jsonb, 'PROPOSED', $9, $10)`, a.AdjustmentID, tenant, a.GroupID, a.FiscalPeriod, a.Description, a.PolicyRef, a.EvidenceRef,
-			string(lines), a.CreatedBy, a.CreatedAt); e != nil {
+		if _, e := t.Exec(ctx, `INSERT INTO consolidation_adjustments (adjustment_id, tenant_id, group_id, fiscal_period, description, policy_ref, evidence_ref, lines, status, created_by, created_at, source_ref)
+			VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7, $8::jsonb, 'PROPOSED', $9, $10, NULLIF($11, ''))`, a.AdjustmentID, tenant, a.GroupID, a.FiscalPeriod, a.Description, a.PolicyRef, a.EvidenceRef,
+			string(lines), a.CreatedBy, a.CreatedAt, a.SourceRef); e != nil {
 			return e
 		}
 		return r.enqueue(ctx, t, tenant, out)
@@ -118,4 +118,16 @@ func (r *KernelRepo) WithdrawAdjustment(ctx context.Context, tenant, id, actor, 
 		}
 		return r.enqueue(ctx, t, tenant, out)
 	}))
+}
+
+// GetAdjustmentBySourceRef implements kernel.ConsolRepo.
+func (r *KernelRepo) GetAdjustmentBySourceRef(ctx context.Context, tenant, ref string) (*kernel.ConsolAdjustment, error) {
+	var a kernel.ConsolAdjustment
+	err := r.tx(ctx, tenant, func(t pgx.Tx) error {
+		return scanAdjustment(t.QueryRow(ctx, `SELECT `+adjCols+` FROM consolidation_adjustments WHERE tenant_id = $1::uuid AND source_ref = $2`, tenant, ref), &a)
+	})
+	if err != nil {
+		return nil, kernelErr(err)
+	}
+	return &a, nil
 }

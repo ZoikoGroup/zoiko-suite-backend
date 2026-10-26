@@ -194,3 +194,35 @@ func TestCapitalConsolidationNeedsItsAccountsAndBlocksWhatItCannotEliminate(t *t
 		t.Fatalf("%d", st)
 	}
 }
+
+func TestAdjustmentSubmittedByAnotherServiceIsIdempotentOnItsSourceReference(t *testing.T) {
+	c := consolSetup(t)
+	path := "/v1/consolidation-groups/" + c.groupID + "/adjustments"
+	body := func(amt string) map[string]any {
+		b := adjBody(c.groupID, "from consolidation-svc", amt)
+		b["source_ref"] = "cons-adj-1"
+		return b
+	}
+	st, first := c.call("POST", path, c.tenant, "poster", body("25.00"))
+	if st != 201 || first["source_ref"] != "cons-adj-1" {
+		t.Fatalf("%d %v", st, first)
+	}
+	st, again := c.call("POST", path, c.tenant, "poster", body("25.00"))
+	if st != 200 || again["adjustment_id"] != first["adjustment_id"] || again["existing"] != true {
+		t.Fatalf("a retry is the same adjustment: %d %v", st, again)
+	}
+	if st, b := c.call("POST", path, c.tenant, "poster", body("26.00")); st != 409 {
+		t.Fatalf("the same reference with other content is a conflict: %d %v", st, b)
+	}
+	if n := c.count(t, `SELECT count(*) FROM consolidation_adjustments WHERE tenant_id = $1::uuid`, c.tenant); n != 1 {
+		t.Fatalf("%d", n)
+	}
+	// the group is found by its reporting entity
+	st, gl := c.call("GET", "/v1/consolidation-groups?parent_entity_id="+c.group, c.tenant, "reader", nil)
+	if st != 200 || gl["total"].(float64) != 1 {
+		t.Fatalf("%d %v", st, gl)
+	}
+	if st, gl = c.call("GET", "/v1/consolidation-groups?parent_entity_id="+c.uk, c.tenant, "reader", nil); st != 200 || gl["total"].(float64) != 0 {
+		t.Fatalf("%d %v", st, gl)
+	}
+}

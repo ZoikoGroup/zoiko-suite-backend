@@ -2,6 +2,7 @@ package kernel
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
@@ -41,6 +42,7 @@ type ConsolRepo interface {
 
 	InsertAdjustment(ctx context.Context, tenant string, a *ConsolAdjustment, out OutEvent) error
 	GetAdjustment(ctx context.Context, tenant, id string) (*ConsolAdjustment, error)
+	GetAdjustmentBySourceRef(ctx context.Context, tenant, ref string) (*ConsolAdjustment, error)
 	ListAdjustments(ctx context.Context, tenant, groupID, period string) ([]ConsolAdjustment, error)
 	// ApprovedAdjustments lists the approved adjustments of the group up to and including the period.
 	ApprovedAdjustments(ctx context.Context, tenant, groupID, upToPeriod string) ([]ConsolAdjustment, error)
@@ -805,12 +807,14 @@ func (s *ConsolService) Supersede(ctx context.Context, tenant string, a Actor, r
 
 // AdjustmentRequest proposes a group policy adjustment.
 type AdjustmentRequest struct {
-	GroupID      string           `json:"group_id"`
-	FiscalPeriod string           `json:"fiscal_period"`
-	Description  string           `json:"description"`
-	PolicyRef    string           `json:"policy_ref"`
-	EvidenceRef  string           `json:"evidence_ref"`
-	Lines        []AdjustmentLine `json:"lines"`
+	GroupID      string `json:"group_id"`
+	FiscalPeriod string `json:"fiscal_period"`
+	Description  string `json:"description"`
+	PolicyRef    string `json:"policy_ref"`
+	EvidenceRef  string `json:"evidence_ref"`
+	// SourceRef names the record in the submitting service this adjustment comes from: the same reference again is the same adjustment
+	SourceRef string           `json:"source_ref,omitempty"`
+	Lines     []AdjustmentLine `json:"lines"`
 }
 
 // CreateAdjustment proposes an adjustment. It must name the policy it applies and its evidence, move at least two accounts of the group
@@ -849,10 +853,22 @@ func (s *ConsolService) CreateAdjustment(ctx context.Context, tenant string, a A
 	if sum.Sign() != 0 {
 		return nil, exc(FamBal, "ADJUSTMENT_UNBALANCED", "the lines of the adjustment add up to %s, not zero", sum.FloatString(2))
 	}
-	adj := &ConsolAdjustment{AdjustmentID: uuid.NewString(), GroupID: g.GroupID, FiscalPeriod: req.FiscalPeriod, Description: strings.TrimSpace(req.Description), PolicyRef: strings.TrimSpace(req.PolicyRef),
+	adj := &ConsolAdjustment{AdjustmentID: uuid.NewString(), GroupID: g.GroupID, FiscalPeriod: req.FiscalPeriod, Description: strings.TrimSpace(req.Description), PolicyRef: strings.TrimSpace(req.PolicyRef), SourceRef: strings.TrimSpace(req.SourceRef),
 		EvidenceRef: strings.TrimSpace(req.EvidenceRef), Lines: norm, Status: "PROPOSED", CreatedBy: a.PrincipalID, CreatedAt: s.now()}
+	if adj.SourceRef != "" {
+		if prior, perr := s.Repo.GetAdjustmentBySourceRef(ctx, tenant, adj.SourceRef); perr == nil {
+			return sameAdjustment(prior, adj)
+		} else if !errors.Is(perr, ErrNotFound) {
+			return nil, perr
+		}
+	}
 	if err := s.Repo.InsertAdjustment(ctx, tenant, adj, OutEvent{Fact: "consolidation-adjustment.proposed", AggregateType: "consolidation-adjustment", AggregateID: adj.AdjustmentID, Actor: a.PrincipalID,
-		CorrelationID: a.CorrelationID, LegalEntityID: g.ParentEntityID, Data: map[string]any{"adjustment_id": adj.AdjustmentID, "group_id": g.GroupID, "fiscal_period": adj.FiscalPeriod, "policy_ref": adj.PolicyRef}}); err != nil {
+		CorrelationID: a.CorrelationID, LegalEntityID: g.ParentEntityID, Data: map[string]any{"adjustment_id": adj.AdjustmentID, "group_id": g.GroupID, "fiscal_period": adj.FiscalPeriod, "policy_ref": adj.PolicyRef, "source_ref": adj.SourceRef}}); err != nil {
+		if errors.Is(err, ErrExists) && adj.SourceRef != "" {
+			if prior, perr := s.Repo.GetAdjustmentBySourceRef(ctx, tenant, adj.SourceRef); perr == nil {
+				return sameAdjustment(prior, adj)
+			}
+		}
 		return nil, err
 	}
 	return adj, nil
@@ -913,4 +929,16 @@ func (s *ConsolService) WithdrawAdjustment(ctx context.Context, tenant string, a
 		return nil, err
 	}
 	return s.Repo.GetAdjustment(ctx, tenant, id)
+}
+
+// sameAdjustment answers a repeated submission: the adjustment that already exists for the source reference when it says the same thing,
+// and a conflict when the same reference now comes with other content.
+func sameAdjustment(prior, now *ConsolAdjustment) (*ConsolAdjustment, error) {
+	a, _ := json.Marshal([]any{prior.GroupID, prior.FiscalPeriod, prior.Lines})
+	b, _ := json.Marshal([]any{now.GroupID, now.FiscalPeriod, now.Lines})
+	if string(a) != string(b) {
+		return nil, ErrIdempotency
+	}
+	prior.Existing = true
+	return prior, nil
 }

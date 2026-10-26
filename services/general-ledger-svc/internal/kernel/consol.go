@@ -680,6 +680,8 @@ type ConsolAdjustment struct {
 	WithdrawnBy      string           `json:"withdrawn_by,omitempty"`
 	WithdrawnAt      *time.Time       `json:"withdrawn_at,omitempty"`
 	WithdrawalReason string           `json:"withdrawal_reason,omitempty"`
+	SourceRef        string           `json:"source_ref,omitempty"`
+	Existing         bool             `json:"existing,omitempty"`
 }
 
 // AppliedAdjustment records which adjustment a run applied.
