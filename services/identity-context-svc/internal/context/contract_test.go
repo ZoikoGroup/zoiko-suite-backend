@@ -35,12 +35,41 @@ import (
 // spec's NAMED surface rather than something that merely resembles it.
 
 type openAPIDoc struct {
-	Paths map[string]map[string]struct {
-		OperationID string `yaml:"operationId"`
-	} `yaml:"paths"`
+	Paths map[string]map[string]any `yaml:"paths"`
 	Components struct {
 		Schemas map[string]any `yaml:"schemas"`
 	} `yaml:"components"`
+}
+
+// opKeys returns the HTTP method keys under a path item, ignoring path-item
+// level fields such as "parameters" and "servers".
+func opKeys(methods map[string]any) []string {
+	var ops []string
+	for k := range methods {
+		if httpMethod(k) {
+			ops = append(ops, k)
+		}
+	}
+	return ops
+}
+
+func httpMethod(k string) bool {
+	switch strings.ToUpper(k) {
+	case "GET", "PUT", "POST", "DELETE", "PATCH", "OPTIONS", "HEAD", "TRACE":
+		return true
+	}
+	return false
+}
+
+func opID(op any) string {
+	m, ok := op.(map[string]any)
+	if !ok {
+		return ""
+	}
+	if id, ok := m["operationId"].(string); ok {
+		return id
+	}
+	return ""
 }
 
 func loadSpec(t *testing.T) openAPIDoc {
@@ -101,7 +130,7 @@ func TestEveryRouteIsInThePublishedContract(t *testing.T) {
 
 	specPaths := map[string]bool{}
 	for path, methods := range doc.Paths {
-		for method := range methods {
+		for _, method := range opKeys(methods) {
 			specPaths[normaliseParams(strings.ToUpper(method)+" "+path)] = true
 		}
 	}
@@ -165,7 +194,7 @@ func TestEveryContractPathIsServed(t *testing.T) {
 
 	var unserved []string
 	for path, methods := range doc.Paths {
-		for method := range methods {
+		for _, method := range opKeys(methods) {
 			key := normaliseParams(strings.ToUpper(method) + " " + path)
 			if mountedElsewhere[key] || normalisedServed[key] {
 				continue
@@ -189,9 +218,9 @@ func TestGov01OperationIdsArePublished(t *testing.T) {
 
 	found := map[string]bool{}
 	for _, methods := range doc.Paths {
-		for _, op := range methods {
-			if op.OperationID != "" {
-				found[op.OperationID] = true
+		for _, method := range opKeys(methods) {
+			if id := opID(methods[method]); id != "" {
+				found[id] = true
 			}
 		}
 	}

@@ -321,35 +321,28 @@ components:
     # internal/context/contract_test.go now does, and found this duplicate on
     # its first run.
 
-    ErrorResponse:
+    Problem:
       type: object
-      description: |
-        Every refusal from this service carries one of the control plane's
-        stable error classes. The message is for a human reading a log; the
-        CODE is what a client branches on, and it is the half that must not
-        change with a refactor. Before these existed a caller could only
-        distinguish a wrong password from a residency denial by matching prose.
+      required: [type, title, status, code]
       properties:
-        error:
-          type: string
-        error_code:
-          type: string
-          enum:
-            - CONTEXT_UNRESOLVED
-            - RESIDENCY_DENIED
-            - AUTHORIZATION_DENIED
-            - SOD_CONFLICT
-            - BREAK_GLASS_REQUIRED
-            - BREAK_GLASS_EXPIRED
-            - LEGAL_HOLD_ACTIVE
-            - IDEMPOTENCY_MISMATCH
-            - TRUST_POSTURE_BLOCKED
-            - UPSTREAM_UNAVAILABLE
-            - UNSUPPORTED
-        correlation_id:
-          type: string
-        evidence_id:
-          type: string
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        code: { type: string, enum: [CONTEXT_UNRESOLVED, RESIDENCY_DENIED, SOD_CONFLICT, BREAK_GLASS_REQUIRED, BREAK_GLASS_EXPIRED, LEGAL_HOLD_ACTIVE, IDEMPOTENCY_MISMATCH, TRUST_POSTURE_BLOCKED, UPSTREAM_UNAVAILABLE, UNSUPPORTED, AUTHORIZATION_DENIED] }
+        request_id: { type: string }
+        correlation_id: { type: string }
+        retryable: { type: boolean }
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              pointer: { type: string }
+              code: { type: string }
+              detail: { type: string }
+        current_version: { type: integer, format: int64 }
 
     ResolveResponseV2:
       type: object
@@ -704,9 +697,9 @@ paths:
         "400":
           description: tenant_id, email or password absent
           content:
-            application/json:
+            application/problem+json:
               schema:
-                $ref: "#/components/schemas/ErrorResponse"
+                $ref: "#/components/schemas/Problem"
         "401":
           description: |
             Invalid credentials. Covers unknown principal, absent credential,
@@ -715,9 +708,9 @@ paths:
             with `error_code: invalid_client`; it is checked before the account
             is touched, so it costs the account no lockout attempt.
           content:
-            application/json:
+            application/problem+json:
               schema:
-                $ref: "#/components/schemas/ErrorResponse"
+                $ref: "#/components/schemas/Problem"
         "503":
           description: |
             The attempt could not be decided — credential store unreachable, the
@@ -725,9 +718,9 @@ paths:
             401 on purpose: reporting "we cannot tell" as "you are wrong" sends
             a user to a password reset that cannot help.
           content:
-            application/json:
+            application/problem+json:
               schema:
-                $ref: "#/components/schemas/ErrorResponse"
+                $ref: "#/components/schemas/Problem"
 
   /.well-known/jwks.json:
     get:
@@ -776,15 +769,15 @@ paths:
         "401":
           description: Token invalid, principal inactive, or trust posture BLOCKED
           content:
-            application/json:
+            application/problem+json:
               schema:
-                $ref: "#/components/schemas/ErrorResponse"
+                $ref: "#/components/schemas/Problem"
         "503":
           description: Upstream dependency unavailable — failing closed
           content:
-            application/json:
+            application/problem+json:
               schema:
-                $ref: "#/components/schemas/ErrorResponse"
+                $ref: "#/components/schemas/Problem"
 
   /v1/context/session/{sessionContextId}:
     get:
@@ -1907,10 +1900,10 @@ paths:
         the outage behaviour (FAIL_CLOSED, or CACHED_KEYS with a bounded grace) and whether just-in-time
         provisioning is allowed. Naming `connection_id` proposes a new version; the approved one keeps serving.
       responses:
-        "202": { description: Proposed; awaiting approval }
+        "202": { description: "Proposed; awaiting approval" }
         "400": { description: Invalid configuration }
         "403": { description: Not authorized }
-        "409": { description: A version is already awaiting approval, or the connection is revoked }
+        "409": { description: "A version is already awaiting approval, or the connection is revoked" }
     get:
       summary: List the tenant's federation connections
       operationId: listFederationConnections
@@ -1921,11 +1914,26 @@ paths:
     get:
       summary: GetFederationConfig — a connection with every version
       operationId: getFederationConfig
+      security: []
+      parameters:
+        - name: connectionId
+          in: path
+          required: true
+          schema: { type: string }
       responses:
         "200": { description: The connection }
         "404": { description: Not found in this tenant }
 
   /v1/federation/connections/{connectionId}/versions/{version}/approve:
+    parameters:
+      - name: connectionId
+        in: path
+        required: true
+        schema: { type: string }
+      - name: version
+        in: path
+        required: true
+        schema: { type: string }
     post:
       summary: ApproveFederation
       operationId: approveFederation
@@ -1935,10 +1943,19 @@ paths:
         per tenant. Approval supersedes the version it replaces.
       responses:
         "200": { description: Approved }
-        "403": { description: Self-approval, or not authorized }
-        "409": { description: Fingerprint mismatch, already decided, or issuer already trusted by another connection }
+        "403": { description: "Self-approval, or not authorized" }
+        "409": { description: "Fingerprint mismatch, already decided, or issuer already trusted by another connection" }
 
   /v1/federation/connections/{connectionId}/versions/{version}/reject:
+    parameters:
+      - name: connectionId
+        in: path
+        required: true
+        schema: { type: string }
+      - name: version
+        in: path
+        required: true
+        schema: { type: string }
     post:
       summary: Reject a proposed version (a reason is required)
       operationId: rejectFederationVersion
@@ -1946,6 +1963,11 @@ paths:
         "200": { description: Rejected }
 
   /v1/federation/connections/{connectionId}/rotate-metadata:
+    parameters:
+      - name: connectionId
+        in: path
+        required: true
+        schema: { type: string }
     post:
       summary: RotateMetadataOrCertificateRef — propose a new key location
       operationId: rotateMetadataOrCertificateRef
@@ -1955,21 +1977,36 @@ paths:
         "400": { description: Unchanged or forbidden destination }
 
   /v1/federation/connections/{connectionId}/keys/refresh:
+    parameters:
+      - name: connectionId
+        in: path
+        required: true
+        schema: { type: string }
     post:
       summary: Fetch the signing keys now from the approved location
       operationId: refreshFederationKeys
       responses:
-        "200": { description: Refreshed; key_count returned }
+        "200": { description: "Refreshed; key_count returned" }
         "503": { description: The identity provider's keys could not be obtained }
 
   /v1/federation/connections/{connectionId}/suspend:
+    parameters:
+      - name: connectionId
+        in: path
+        required: true
+        schema: { type: string }
     post:
       summary: SuspendFederation (a reason is required)
       operationId: suspendFederation
       responses:
-        "200": { description: Suspended; new logins are refused }
+        "200": { description: "Suspended; new logins are refused" }
 
   /v1/federation/connections/{connectionId}/resume:
+    parameters:
+      - name: connectionId
+        in: path
+        required: true
+        schema: { type: string }
     post:
       summary: Return a suspended connection to service
       operationId: resumeFederation
@@ -1978,6 +2015,11 @@ paths:
         "409": { description: Not suspended }
 
   /v1/federation/connections/{connectionId}/revoke:
+    parameters:
+      - name: connectionId
+        in: path
+        required: true
+        schema: { type: string }
     post:
       summary: Revoke a connection (final; a reason is required)
       operationId: revokeFederation
@@ -1985,6 +2027,11 @@ paths:
         "200": { description: Revoked }
 
   /v1/federation/connections/{connectionId}/logins:
+    parameters:
+      - name: connectionId
+        in: path
+        required: true
+        schema: { type: string }
     get:
       summary: Evidence of recent federated logins whose signature verified
       operationId: listFederationLogins
@@ -1998,7 +2045,7 @@ paths:
       responses:
         "201": { description: Linked }
         "409": { description: The external subject or the principal is already linked }
-        "422": { description: Unknown principal, or one of another tenant }
+        "422": { description: "Unknown principal, or one of another tenant" }
     get:
       summary: List external-subject links
       operationId: listExternalSubjectLinks
@@ -2006,6 +2053,11 @@ paths:
         "200": { description: The links }
 
   /v1/federation/links/{linkId}:
+    parameters:
+      - name: linkId
+        in: path
+        required: true
+        schema: { type: string }
     get:
       summary: GetExternalSubjectLink
       operationId: getExternalSubjectLink
@@ -2014,6 +2066,11 @@ paths:
         "404": { description: Not found in this tenant }
 
   /v1/federation/connections/{connectionId}/mapping:
+    parameters:
+      - name: connectionId
+        in: path
+        required: true
+        schema: { type: string }
     post:
       summary: ConfigureProvisioningMapping — propose how directory attributes map to baseline roles
       operationId: configureProvisioningMapping
@@ -2025,7 +2082,7 @@ paths:
         independent approver and the roles are checked again at approval.
       responses:
         "202": { description: Proposed }
-        "400": { description: Invalid, or names a role that is not baseline }
+        "400": { description: "Invalid, or names a role that is not baseline" }
         "503": { description: Eligibility could not be established }
     get:
       summary: The mapping versions of a connection and the one in force
@@ -2034,6 +2091,15 @@ paths:
         "200": { description: The mapping }
 
   /v1/federation/connections/{connectionId}/mapping/versions/{version}/approve:
+    parameters:
+      - name: connectionId
+        in: path
+        required: true
+        schema: { type: string }
+      - name: version
+        in: path
+        required: true
+        schema: { type: string }
     post:
       summary: Approve a proposed mapping (by fingerprint; not by its author)
       operationId: approveProvisioningMapping
@@ -2044,6 +2110,15 @@ paths:
         "409": { description: Fingerprint mismatch or already decided }
 
   /v1/federation/connections/{connectionId}/mapping/versions/{version}/reject:
+    parameters:
+      - name: connectionId
+        in: path
+        required: true
+        schema: { type: string }
+      - name: version
+        in: path
+        required: true
+        schema: { type: string }
     post:
       summary: Reject a proposed mapping
       operationId: rejectProvisioningMapping
@@ -2051,6 +2126,11 @@ paths:
         "200": { description: Rejected }
 
   /v1/federation/connections/{connectionId}/scim-token:
+    parameters:
+      - name: connectionId
+        in: path
+        required: true
+        schema: { type: string }
     post:
       summary: Issue the connection's SCIM bearer token
       operationId: issueScimToken
@@ -2059,6 +2139,11 @@ paths:
         "201": { description: Issued (never cacheable) }
 
   /v1/federation/connections/{connectionId}/scim-token/revoke:
+    parameters:
+      - name: connectionId
+        in: path
+        required: true
+        schema: { type: string }
     post:
       summary: Revoke the connection's SCIM token
       operationId: revokeScimToken
@@ -2066,13 +2151,23 @@ paths:
         "200": { description: Number revoked }
 
   /v1/federation/connections/{connectionId}/provisioning/status:
+    parameters:
+      - name: connectionId
+        in: path
+        required: true
+        schema: { type: string }
     get:
       summary: GetProvisioningStatus
       operationId: getProvisioningStatus
       responses:
-        "200": { description: Links, events, assignments, open exceptions, deprovision backlog }
+        "200": { description: "Links, events, assignments, open exceptions, deprovision backlog" }
 
   /v1/federation/connections/{connectionId}/provisioning/events:
+    parameters:
+      - name: connectionId
+        in: path
+        required: true
+        schema: { type: string }
     get:
       summary: The provisioning event ledger
       operationId: listProvisioningEvents
@@ -2080,13 +2175,27 @@ paths:
         "200": { description: Newest first }
 
   /v1/federation/connections/{connectionId}/provisioning/exceptions:
+    parameters:
+      - name: connectionId
+        in: path
+        required: true
+        schema: { type: string }
     get:
       summary: ListSyncExceptions — what provisioning could not settle by itself
       operationId: listSyncExceptions
       responses:
-        "200": { description: Quarantined identities and mappings, refused or unreachable assignments, late deprovisioning }
+        "200": { description: "Quarantined identities and mappings, refused or unreachable assignments, late deprovisioning" }
 
   /v1/federation/connections/{connectionId}/provisioning/exceptions/{exceptionId}/resolve:
+    parameters:
+      - name: connectionId
+        in: path
+        required: true
+        schema: { type: string }
+      - name: exceptionId
+        in: path
+        required: true
+        schema: { type: string }
     post:
       summary: Close an exception with a note
       operationId: resolveSyncException
@@ -2095,13 +2204,23 @@ paths:
         "409": { description: Not open }
 
   /v1/federation/connections/{connectionId}/provisioning/deprovision-latency:
+    parameters:
+      - name: connectionId
+        in: path
+        required: true
+        schema: { type: string }
     get:
       summary: GetDeprovisionLatency — how long deprovisioning took to take effect, against its objective
       operationId: getDeprovisionLatency
       responses:
-        "200": { description: Per person, plus completed, pending, escalated, median and maximum }
+        "200": { description: "Per person, plus completed, pending, escalated, median and maximum" }
 
   /v1/federation/connections/{connectionId}/provisioning/reconcile:
+    parameters:
+      - name: connectionId
+        in: path
+        required: true
+        schema: { type: string }
     post:
       summary: ReconcileDirectorySync — a directory snapshot as a safety net for deprovisioning never sent
       operationId: reconcileDirectorySync
@@ -2112,7 +2231,7 @@ paths:
       responses:
         "200": { description: Report }
         "400": { description: Empty or malformed snapshot }
-        "409": { description: Over the safety limit, or already run }
+        "409": { description: "Over the safety limit, or already run" }
 
   # SCIM 2.0. Served outside the platform envelope and replay middleware: a directory has no platform identity. The
   # connection's bearer token, with the tenant and connection in the path, authenticates every request before anything
@@ -2123,14 +2242,32 @@ paths:
       summary: SCIM ServiceProviderConfig
       operationId: scimServiceProviderConfig
       security: []
+      parameters:
+        - name: tenantId
+          in: path
+          required: true
+          schema: { type: string }
+        - name: connectionId
+          in: path
+          required: true
+          schema: { type: string }
       responses:
-        "200": { description: Patch and filter supported; bulk, sort, change-password and etag are not }
+        "200": { description: "Patch and filter supported; bulk, sort, change-password and etag are not" }
 
   /scim/v2/{tenantId}/{connectionId}/Users:
     post:
       summary: Provision a user
       operationId: scimCreateUser
       security: []
+      parameters:
+        - name: tenantId
+          in: path
+          required: true
+          schema: { type: string }
+        - name: connectionId
+          in: path
+          required: true
+          schema: { type: string }
       description: |
         `externalId` (the directory's stable identifier) is required: it, not the userName or email, is the identity.
         An email already held by a different principal quarantines the record (409 uniqueness) rather than merging
@@ -2140,15 +2277,24 @@ paths:
         minutes is absorbed. A user is not created inactive.
       responses:
         "201": { description: Created }
-        "200": { description: The user already existed, or a replay }
+        "200": { description: "The user already existed, or a replay" }
         "400": { description: Invalid }
         "401": { description: Bad token }
         "403": { description: The connection is suspended }
-        "409": { description: Quarantined, or the event id was reused with a different request }
+        "409": { description: "Quarantined, or the event id was reused with a different request" }
     get:
       summary: Look a user up by filter
       operationId: scimListUsers
       security: []
+      parameters:
+        - name: tenantId
+          in: path
+          required: true
+          schema: { type: string }
+        - name: connectionId
+          in: path
+          required: true
+          schema: { type: string }
       description: Only `userName eq "…"` and `externalId eq "…"` are understood; anything else is 400 invalidFilter. Without a filter the result is empty.
       responses:
         "200": { description: ListResponse }
@@ -2158,6 +2304,19 @@ paths:
       summary: Read a user
       operationId: scimGetUser
       security: []
+      parameters:
+        - name: tenantId
+          in: path
+          required: true
+          schema: { type: string }
+        - name: connectionId
+          in: path
+          required: true
+          schema: { type: string }
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
       responses:
         "200": { description: The user }
         "404": { description: No such user }
@@ -2165,12 +2324,38 @@ paths:
       summary: Replace a user (externalId cannot change)
       operationId: scimReplaceUser
       security: []
+      parameters:
+        - name: tenantId
+          in: path
+          required: true
+          schema: { type: string }
+        - name: connectionId
+          in: path
+          required: true
+          schema: { type: string }
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
       responses:
         "200": { description: Replaced }
     patch:
       summary: Patch a user (add/replace/remove on active, userName, displayName, emails, groups, roles, title, userType, department)
       operationId: scimPatchUser
       security: []
+      parameters:
+        - name: tenantId
+          in: path
+          required: true
+          schema: { type: string }
+        - name: connectionId
+          in: path
+          required: true
+          schema: { type: string }
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
       description: |
         Applied to a copy, so a patch that fails changes nothing. `active:false` deprovisions: the principal is disabled
         in the same transaction, live sessions are ended, and assignment revocation is queued and retried (revocations
@@ -2179,11 +2364,24 @@ paths:
       responses:
         "200": { description: Patched }
         "400": { description: Unsupported path or operation }
-        "409": { description: Concurrent change, or the earlier deprovisioning is still in progress }
+        "409": { description: "Concurrent change, or the earlier deprovisioning is still in progress" }
     delete:
       summary: Deprovision a user (the principal is disabled; nothing is erased)
       operationId: scimDeleteUser
       security: []
+      parameters:
+        - name: tenantId
+          in: path
+          required: true
+          schema: { type: string }
+        - name: connectionId
+          in: path
+          required: true
+          schema: { type: string }
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
       responses:
         "204": { description: Deprovisioned }
         "404": { description: No such user }
