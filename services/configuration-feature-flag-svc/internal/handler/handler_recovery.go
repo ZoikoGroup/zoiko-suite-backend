@@ -110,10 +110,10 @@ func (h *Handler) ActivateKillSwitch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if missing := req.missingField(); missing != "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": missing})
+		writeError(w, r, http.StatusBadRequest, "missing_field", missing)
 		return
 	}
-	if h.refuseForeignTenant(w, req.TenantID, tenantScope) {
+	if h.refuseForeignTenant(w, r, req.TenantID, tenantScope) {
 		return
 	}
 	action := governedAction("flag", req.TenantID)

@@ -356,7 +356,7 @@ paths:
           description: '`key_not_registered` — the key was never declared. A `404`, not a `400`: the request is fine, the registry has no such key.'
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+              schema: { $ref: '#/components/schemas/Problem' }
         '503': { $ref: '#/components/responses/Unavailable' }
 
   /v1/config/definitions/{key}/publish:
@@ -397,7 +397,7 @@ paths:
           description: '`key_not_registered` — there is no declaration to publish.'
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+              schema: { $ref: '#/components/schemas/Problem' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '413': { $ref: '#/components/responses/TooLarge' }
         '503': { $ref: '#/components/responses/Unavailable' }
@@ -437,7 +437,7 @@ paths:
           description: '`no_attested_snapshot` — nothing is pinned in this environment yet; failing closed rather than guessing.'
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+              schema: { $ref: '#/components/schemas/Problem' }
         '422': { $ref: '#/components/responses/StaleSnapshot' }
         '503': { $ref: '#/components/responses/Unavailable' }
 
@@ -486,18 +486,18 @@ paths:
           description: '`invalid_snapshot_id` — the path segment is not a UUID.'
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+              schema: { $ref: '#/components/schemas/Problem' }
         '401':
           description: '`missing_principal` / `tenant_scope_missing`.'
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+              schema: { $ref: '#/components/schemas/Problem' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404':
           description: '`snapshot_not_found` — no snapshot has this id.'
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+              schema: { $ref: '#/components/schemas/Problem' }
         '503': { $ref: '#/components/responses/Unavailable' }
 
   /v1/config/overrides/{scope}:
@@ -632,17 +632,17 @@ paths:
           description: '`change_not_found` — no such change id.'
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+              schema: { $ref: '#/components/schemas/Problem' }
         '403':
           description: '`change_self_approval` — the proposer of a C2/C3 change approving it; or no grant.'
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+              schema: { $ref: '#/components/schemas/Problem' }
         '409':
           description: '`change_not_approvable` — the change is no longer awaiting a decision.'
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+              schema: { $ref: '#/components/schemas/Problem' }
         '413': { $ref: '#/components/responses/TooLarge' }
         '503': { $ref: '#/components/responses/Unavailable' }
 
@@ -679,7 +679,7 @@ paths:
           description: '`change_not_found` — no such change id.'
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+              schema: { $ref: '#/components/schemas/Problem' }
         '409': { $ref: '#/components/responses/GovernedConflict' }
         '503': { $ref: '#/components/responses/Unavailable' }
 
@@ -787,7 +787,7 @@ paths:
           description: '`change_not_found` — no such emergency change id.'
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+              schema: { $ref: '#/components/schemas/Problem' }
         '503': { $ref: '#/components/responses/Unavailable' }
 
   /v1/emergency-changes/{emergency_change_id}/retrospective:
@@ -1794,17 +1794,28 @@ components:
             database: ok
             authorization-svc: ok
 
-    Error:
+    Problem:
       type: object
-      required: [error]
+      required: [type, title, status, code]
       properties:
-        error:
-          type: string
-          description: Stable machine-readable code. Clients branch on this.
-        field: { type: string }
-        key: { type: string }
-        action: { type: string }
-        message: { type: string }
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        code: { type: string }
+        request_id: { type: string }
+        correlation_id: { type: string }
+        retryable: { type: boolean }
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              pointer: { type: string }
+              code: { type: string }
+              detail: { type: string }
+        current_version: { type: integer, format: int64 }
 
   responses:
     BadRequest:
@@ -1822,8 +1833,8 @@ components:
         `emergency_change_no_expiry` — a break-glass change must carry `expires_at`.
         `context_incomplete` — the evaluation context lacked a required attribute.
       content:
-        application/json:
-          schema: { $ref: '#/components/schemas/Error' }
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
     Unauthorized:
       description: |
         `tenant_scope_missing` — no `X-Tenant-Id`.
@@ -1831,8 +1842,8 @@ components:
         `missing_principal` — no `X-Principal-Id`.
         `envelope_incomplete` — a §4 mandatory field was absent.
       content:
-        application/json:
-          schema: { $ref: '#/components/schemas/Error' }
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
     Forbidden:
       description: |
         `authorization_denied` — the caller holds no grant for the named action.
@@ -1847,8 +1858,8 @@ components:
         `runtime_identity_mismatch` — `runtime_id` is not the calling workload.
         `change_self_approval` — the proposer of a C2/C3 change cannot approve it.
       content:
-        application/json:
-          schema: { $ref: '#/components/schemas/Error' }
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
     NotFound:
       description: |
         `config_entry_not_found` / `feature_flag_not_found` — nothing is
@@ -1861,8 +1872,8 @@ components:
         `change_not_found` — no such change id.
         `snapshot_not_found` — no snapshot has this id.
       content:
-        application/json:
-          schema: { $ref: '#/components/schemas/Error' }
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
     ScopeRaceConflict:
       description: |
         `scope_race_conflict` — a concurrent writer created this scope first.
@@ -1870,8 +1881,8 @@ components:
         the ordinary compare-and-update path. This used to answer `503`, which
         said the opposite.
       content:
-        application/json:
-          schema: { $ref: '#/components/schemas/Error' }
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
     GovernedConflict:
       description: |
         `override_conflict` — another layer or race already set this key.
@@ -1892,8 +1903,8 @@ components:
         `retrospective_not_pending` — the emergency change has no retrospective pending.
         `rollback_target_invalid` — only a `VERIFIED` change that has not been rolled back can be rolled back.
       content:
-        application/json:
-          schema: { $ref: '#/components/schemas/Error' }
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
     StaleSnapshot:
       description: |
         `snapshot_stale` — the pinned snapshot has expired its freshness
@@ -1901,18 +1912,18 @@ components:
         `safe_fallback_active` — a kill-switch safe-fallback value is being
         served instead of the emergent one.
       content:
-        application/json:
-          schema: { $ref: '#/components/schemas/Error' }
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
     GovernedServerError:
       description: '`snapshot_invalid` — the snapshot could not be minted or re-read; internal state is inconsistent.'
       content:
-        application/json:
-          schema: { $ref: '#/components/schemas/Error' }
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
     TooLarge:
       description: '`request_too_large` — the body exceeded 256 KiB.'
       content:
-        application/json:
-          schema: { $ref: '#/components/schemas/Error' }
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
     Unavailable:
       description: |
         `store_unavailable` — the database could not be reached. Fails closed:
@@ -1920,5 +1931,5 @@ components:
         `authz_unavailable` — no authorization decision could be obtained, so
         the write was refused rather than allowed unchecked.
       content:
-        application/json:
-          schema: { $ref: '#/components/schemas/Error' }
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }

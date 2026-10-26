@@ -32,6 +32,7 @@ import (
 	"github.com/riandyrn/otelchi"
 	"go.uber.org/zap"
 	idenv "zoiko.io/identity-envelope"
+	apicontract "zoiko.io/identity-envelope/apicontract"
 
 	"github.com/segmentio/kafka-go"
 
@@ -154,8 +155,8 @@ func main() {
 	log.Info("identity gate", gateSettings.Fields()...)
 
 	r := chi.NewRouter()
-	r.Use(idenv.RequestID)
-	r.Use(middleware.RequestID)
+	r.Use(apicontract.RequestID)
+	r.Use(apicontract.DefaultCache)
 	r.Use(middleware.RealIP)
 	r.Use(middleware.Recoverer)
 	r.Use(otelchi.Middleware("configuration-feature-flag-svc", otelchi.WithChiRoutes(r)))

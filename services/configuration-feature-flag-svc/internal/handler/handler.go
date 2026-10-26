@@ -18,6 +18,7 @@ import (
 	svcmiddleware "zoiko.io/configuration-feature-flag-svc/internal/middleware"
 	"zoiko.io/configuration-feature-flag-svc/internal/store"
 	"zoiko.io/configuration-feature-flag-svc/internal/telemetry"
+	apicontract "zoiko.io/identity-envelope/apicontract"
 )
 
 // ConfigStore is the narrow interface the handler depends on.
@@ -212,13 +213,10 @@ func (h *Handler) UpsertConfigEntry(w http.ResponseWriter, r *http.Request) {
 	}
 	if missing := req.missingField(); missing != "" {
 		h.metrics.ConfigWrites.WithLabelValues(telemetry.WriteInvalidRequest).Inc()
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error": "missing_field",
-			"field": missing,
-		})
+		writeError(w, r, http.StatusBadRequest, "missing_field", missing)
 		return
 	}
-	if h.refuseForeignTenant(w, req.TenantID, tenantScope) {
+	if 	h.refuseForeignTenant(w, r, req.TenantID, tenantScope) {
 		h.metrics.ConfigWrites.WithLabelValues(telemetry.WriteTenantMismatch).Inc()
 		return
 	}
@@ -260,11 +258,7 @@ func (h *Handler) UpsertConfigEntry(w http.ResponseWriter, r *http.Request) {
 		// takes the ordinary compare-and-update path. This used to answer 503,
 		// which said the opposite.
 		h.metrics.ConfigWrites.WithLabelValues(telemetry.WriteConflict).Inc()
-		writeJSON(w, http.StatusConflict, map[string]string{
-			"error":   "scope_race_conflict",
-			"key":     req.Key,
-			"message": domain.ErrScopeRaceConflict.Error(),
-		})
+		writeError(w, r, http.StatusConflict, "scope_race_conflict", domain.ErrScopeRaceConflict.Error())
 		return
 	}
 	if err != nil {
@@ -275,11 +269,7 @@ func (h *Handler) UpsertConfigEntry(w http.ResponseWriter, r *http.Request) {
 		// outage answers 503.
 		if code, status, ok := codedRefusal(err); ok {
 			h.metrics.ConfigWrites.WithLabelValues(governedOutcome(status)).Inc()
-			writeJSON(w, status, map[string]string{
-				"error":   code,
-				"key":     req.Key,
-				"message": err.Error(),
-			})
+			writeError(w, r, status, code, err.Error())
 			return
 		}
 		h.metrics.ConfigWrites.WithLabelValues(telemetry.WriteStoreUnavailable).Inc()
@@ -288,7 +278,7 @@ func (h *Handler) UpsertConfigEntry(w http.ResponseWriter, r *http.Request) {
 			zap.String("correlation_id", correlationID),
 			zap.Error(err),
 		)
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
 		return
 	}
 
@@ -335,10 +325,7 @@ func (h *Handler) GetConfigEntry(w http.ResponseWriter, r *http.Request) {
 
 	environment := q.Get("environment")
 	if environment == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error": "missing_field",
-			"field": "environment",
-		})
+		writeError(w, r, http.StatusBadRequest, "missing_field", "environment")
 		return
 	}
 	tenantScope, ok := h.requireTenant(w, r)
@@ -351,7 +338,7 @@ func (h *Handler) GetConfigEntry(w http.ResponseWriter, r *http.Request) {
 	}
 	// Omitting ?tenant_id= still asks for the GLOBAL default for this
 	// environment, which is a real scope. Naming another tenant is refused.
-	if h.refuseForeignTenant(w, tenantID, tenantScope) {
+	if 	h.refuseForeignTenant(w, r, tenantID, tenantScope) {
 		return
 	}
 
@@ -359,17 +346,14 @@ func (h *Handler) GetConfigEntry(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrConfigEntryNotFound):
-			writeJSON(w, http.StatusNotFound, map[string]string{
-				"error": "config_entry_not_found",
-				"key":   key,
-			})
+			writeError(w, r, http.StatusNotFound, "config_entry_not_found", key)
 		default:
 			h.log.Error("GetConfigEntry: store unavailable",
 				zap.String("key", key),
 				zap.String("correlation_id", correlationID),
 				zap.Error(err),
 			)
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
 		}
 		return
 	}
@@ -400,10 +384,7 @@ func (h *Handler) ListConfigEntries(w http.ResponseWriter, r *http.Request) {
 	// defaults that apply to it — which is what "what applies to me" asks for,
 	// and never another tenant's rows.
 	if claimed := q.Get("tenant_id"); claimed != "" && claimed != tenantScope {
-		writeJSON(w, http.StatusForbidden, map[string]string{
-			"error":   "tenant_scope_mismatch",
-			"message": "request tenant_id does not match the caller's verified tenant scope",
-		})
+		writeError(w, r, http.StatusForbidden, "tenant_scope_mismatch", "request tenant_id does not match the caller's verified tenant scope")
 		return
 	}
 	filter := store.ListFilter{
@@ -418,7 +399,7 @@ func (h *Handler) ListConfigEntries(w http.ResponseWriter, r *http.Request) {
 			zap.String("correlation_id", correlationID),
 			zap.Error(err),
 		)
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
 		return
 	}
 
@@ -491,10 +472,7 @@ func (h *Handler) UpsertFeatureFlag(w http.ResponseWriter, r *http.Request) {
 	}
 	if missing := req.missingField(); missing != "" {
 		h.metrics.FlagWrites.WithLabelValues(telemetry.WriteInvalidRequest).Inc()
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error": "missing_field",
-			"field": missing,
-		})
+		writeError(w, r, http.StatusBadRequest, "missing_field", missing)
 		return
 	}
 
@@ -504,15 +482,11 @@ func (h *Handler) UpsertFeatureFlag(w http.ResponseWriter, r *http.Request) {
 	}
 	if rollout < 0 || rollout > 100 {
 		h.metrics.FlagWrites.WithLabelValues(telemetry.WriteInvalidRequest).Inc()
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error":   "invalid_field",
-			"field":   "rollout_percentage",
-			"message": "must be between 0 and 100",
-		})
+		writeError(w, r, http.StatusBadRequest, "invalid_field", "must be between 0 and 100")
 		return
 	}
 
-	if h.refuseForeignTenant(w, req.TenantID, tenantScope) {
+	if 	h.refuseForeignTenant(w, r, req.TenantID, tenantScope) {
 		h.metrics.FlagWrites.WithLabelValues(telemetry.WriteTenantMismatch).Inc()
 		return
 	}
@@ -546,11 +520,7 @@ func (h *Handler) UpsertFeatureFlag(w http.ResponseWriter, r *http.Request) {
 	flag, created, err := h.store.UpsertFeatureFlag(r.Context(), params)
 	if errors.Is(err, domain.ErrScopeRaceConflict) {
 		h.metrics.FlagWrites.WithLabelValues(telemetry.WriteConflict).Inc()
-		writeJSON(w, http.StatusConflict, map[string]string{
-			"error":   "scope_race_conflict",
-			"key":     req.Key,
-			"message": domain.ErrScopeRaceConflict.Error(),
-		})
+		writeError(w, r, http.StatusConflict, "scope_race_conflict", domain.ErrScopeRaceConflict.Error())
 		return
 	}
 	if err != nil {
@@ -560,11 +530,7 @@ func (h *Handler) UpsertFeatureFlag(w http.ResponseWriter, r *http.Request) {
 		// each its documented 4xx, not a 503.
 		if code, status, ok := codedRefusal(err); ok {
 			h.metrics.FlagWrites.WithLabelValues(governedOutcome(status)).Inc()
-			writeJSON(w, status, map[string]string{
-				"error":   code,
-				"key":     req.Key,
-				"message": err.Error(),
-			})
+			writeError(w, r, status, code, err.Error())
 			return
 		}
 		h.metrics.FlagWrites.WithLabelValues(telemetry.WriteStoreUnavailable).Inc()
@@ -573,7 +539,7 @@ func (h *Handler) UpsertFeatureFlag(w http.ResponseWriter, r *http.Request) {
 			zap.String("correlation_id", correlationID),
 			zap.Error(err),
 		)
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
 		return
 	}
 
@@ -617,10 +583,7 @@ func (h *Handler) GetFeatureFlag(w http.ResponseWriter, r *http.Request) {
 
 	environment := q.Get("environment")
 	if environment == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error": "missing_field",
-			"field": "environment",
-		})
+		writeError(w, r, http.StatusBadRequest, "missing_field", "environment")
 		return
 	}
 	tenantScope, ok := h.requireTenant(w, r)
@@ -631,7 +594,7 @@ func (h *Handler) GetFeatureFlag(w http.ResponseWriter, r *http.Request) {
 	if v := q.Get("tenant_id"); v != "" {
 		tenantID = &v
 	}
-	if h.refuseForeignTenant(w, tenantID, tenantScope) {
+	if 	h.refuseForeignTenant(w, r, tenantID, tenantScope) {
 		return
 	}
 
@@ -639,17 +602,14 @@ func (h *Handler) GetFeatureFlag(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrFeatureFlagNotFound):
-			writeJSON(w, http.StatusNotFound, map[string]string{
-				"error": "feature_flag_not_found",
-				"key":   key,
-			})
+			writeError(w, r, http.StatusNotFound, "feature_flag_not_found", key)
 		default:
 			h.log.Error("GetFeatureFlag: store unavailable",
 				zap.String("key", key),
 				zap.String("correlation_id", correlationID),
 				zap.Error(err),
 			)
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
 		}
 		return
 	}
@@ -673,10 +633,7 @@ func (h *Handler) ListFeatureFlags(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if claimed := q.Get("tenant_id"); claimed != "" && claimed != tenantScope {
-		writeJSON(w, http.StatusForbidden, map[string]string{
-			"error":   "tenant_scope_mismatch",
-			"message": "request tenant_id does not match the caller's verified tenant scope",
-		})
+		writeError(w, r, http.StatusForbidden, "tenant_scope_mismatch", "request tenant_id does not match the caller's verified tenant scope")
 		return
 	}
 	filter := store.ListFilter{
@@ -691,7 +648,7 @@ func (h *Handler) ListFeatureFlags(w http.ResponseWriter, r *http.Request) {
 			zap.String("correlation_id", correlationID),
 			zap.Error(err),
 		)
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
 		return
 	}
 
@@ -710,6 +667,11 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 		// At this point headers are already sent — log only.
 		_ = err
 	}
+}
+
+// writeError writes an RFC 9457 problem+json error response via apicontract.
+func writeError(w http.ResponseWriter, r *http.Request, status int, code, detail string) {
+	apicontract.WriteProblem(w, r, apicontract.Problem{Status: status, Code: code, Detail: detail})
 }
 
 // ── authorization ────────────────────────────────────────────────────────────
@@ -746,10 +708,7 @@ func (h *Handler) requireTenant(w http.ResponseWriter, r *http.Request) (string,
 	if id := strings.TrimSpace(svcmiddleware.TenantFromContext(r.Context())); id != "" {
 		return id, true
 	}
-	writeJSON(w, http.StatusUnauthorized, map[string]string{
-		"error":   "tenant_scope_missing",
-		"message": "X-Tenant-Id is required — the gateway sets it from a verified identity envelope",
-	})
+	writeError(w, r, http.StatusUnauthorized, "tenant_scope_missing", "X-Tenant-Id is required — the gateway sets it from a verified identity envelope")
 	return "", false
 }
 
@@ -757,14 +716,11 @@ func (h *Handler) requireTenant(w http.ResponseWriter, r *http.Request) (string,
 // caller's verified scope, answering 403 if so. A nil or empty claimed value is
 // not a disagreement: nil tenant_id means the GLOBAL default for that
 // environment, which is a deliberate scope rather than an omission.
-func (h *Handler) refuseForeignTenant(w http.ResponseWriter, claimed *string, tenantID string) bool {
+func (h *Handler) refuseForeignTenant(w http.ResponseWriter, r *http.Request, claimed *string, tenantID string) bool {
 	if claimed == nil || *claimed == "" || *claimed == tenantID {
 		return false
 	}
-	writeJSON(w, http.StatusForbidden, map[string]string{
-		"error":   "tenant_scope_mismatch",
-		"message": "request tenant_id does not match the caller's verified tenant scope",
-	})
+		writeError(w, r, http.StatusForbidden, "tenant_scope_mismatch", "request tenant_id does not match the caller's verified tenant scope")
 	return true
 }
 
@@ -772,10 +728,7 @@ func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (stri
 	if id := strings.TrimSpace(r.Header.Get("X-Principal-Id")); id != "" {
 		return id, true
 	}
-	writeJSON(w, http.StatusUnauthorized, map[string]string{
-		"error":   "missing_principal",
-		"message": "X-Principal-Id is required — the gateway sets it from a verified identity envelope",
-	})
+	writeError(w, r, http.StatusUnauthorized, "missing_principal", "X-Principal-Id is required — the gateway sets it from a verified identity envelope")
 	return "", false
 }
 
@@ -799,11 +752,7 @@ func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID,
 	case errors.Is(err, authz.ErrDenied):
 		h.metrics.AuthZDecisions.WithLabelValues(actionType, telemetry.AuthZDenied).Inc()
 		writes.WithLabelValues(telemetry.WriteForbidden).Inc()
-		writeJSON(w, http.StatusForbidden, map[string]string{
-			"error":   "authorization_denied",
-			"action":  actionType,
-			"message": "the caller holds no grant for " + actionType,
-		})
+		writeError(w, r, http.StatusForbidden, "authorization_denied", "the caller holds no grant for "+actionType)
 	default:
 		h.metrics.AuthZDecisions.WithLabelValues(actionType, telemetry.AuthZUnavailable).Inc()
 		writes.WithLabelValues(telemetry.WriteAuthzUnavailable).Inc()
@@ -812,7 +761,7 @@ func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID,
 			zap.String("action_type", actionType),
 			zap.Error(err),
 		)
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "authz_unavailable"})
+		writeError(w, r, http.StatusServiceUnavailable, "authz_unavailable", "")
 	}
 	return false
 }
@@ -838,13 +787,13 @@ func (h *Handler) decodeJSON(w http.ResponseWriter, r *http.Request, dst any, wr
 			if writes != nil {
 				writes.WithLabelValues(telemetry.WriteTooLarge).Inc()
 			}
-			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "request_too_large"})
+			writeError(w, r, http.StatusRequestEntityTooLarge, "request_too_large", "")
 			return false
 		}
 		if writes != nil {
 			writes.WithLabelValues(telemetry.WriteInvalidRequest).Inc()
 		}
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
+		writeError(w, r, http.StatusBadRequest, "invalid_json", err.Error())
 		return false
 	}
 	return true
@@ -978,11 +927,7 @@ func (h *Handler) authorizeGoverned(w http.ResponseWriter, r *http.Request, prin
 		return ""
 	case errors.Is(err, authz.ErrDenied):
 		h.metrics.AuthZDecisions.WithLabelValues(action, telemetry.AuthZDenied).Inc()
-		writeJSON(w, http.StatusForbidden, map[string]string{
-			"error":   "authorization_denied",
-			"action":  action,
-			"message": "the caller holds no grant for " + action,
-		})
+		writeError(w, r, http.StatusForbidden, "authorization_denied", "the caller holds no grant for "+action)
 		return telemetry.WriteForbidden
 	default:
 		h.metrics.AuthZDecisions.WithLabelValues(action, telemetry.AuthZUnavailable).Inc()
@@ -991,7 +936,7 @@ func (h *Handler) authorizeGoverned(w http.ResponseWriter, r *http.Request, prin
 			zap.String("action_type", action),
 			zap.Error(err),
 		)
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "authz_unavailable"})
+		writeError(w, r, http.StatusServiceUnavailable, "authz_unavailable", "")
 		return telemetry.WriteAuthzUnavailable
 	}
 }
@@ -1088,10 +1033,7 @@ func (h *Handler) CreateConfigDefinition(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	if missing := req.missingField(); missing != "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error": "missing_field",
-			"field": missing,
-		})
+		writeError(w, r, http.StatusBadRequest, "missing_field", missing)
 		return
 	}
 
@@ -1160,18 +1102,14 @@ func (h *Handler) FindConfigDefinition(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrKeyNotRegistered):
-			writeJSON(w, http.StatusNotFound, map[string]string{
-				"error":   "key_not_registered",
-				"key":     key,
-				"message": domain.ErrKeyNotRegistered.Error(),
-			})
+			writeError(w, r, http.StatusNotFound, "key_not_registered", domain.ErrKeyNotRegistered.Error())
 		default:
 			h.log.Error("FindConfigDefinition: store unavailable",
 				zap.String("key", key),
 				zap.String("correlation_id", correlationID),
 				zap.Error(err),
 			)
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
 		}
 		return
 	}
@@ -1219,10 +1157,7 @@ func (h *Handler) PublishConfigDefinition(w http.ResponseWriter, r *http.Request
 		return
 	}
 	if req.Lifecycle == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error": "missing_field",
-			"field": "lifecycle",
-		})
+		writeError(w, r, http.StatusBadRequest, "missing_field", "lifecycle")
 		return
 	}
 
@@ -1235,11 +1170,7 @@ func (h *Handler) PublishConfigDefinition(w http.ResponseWriter, r *http.Request
 	if err != nil {
 		if errors.Is(err, domain.ErrKeyNotRegistered) {
 			h.metrics.GovernedWrites.WithLabelValues(telemetry.ActionConfigGlobalWrite, telemetry.WriteConflict).Inc()
-			writeJSON(w, http.StatusNotFound, map[string]string{
-				"error":   "key_not_registered",
-				"key":     key,
-				"message": domain.ErrKeyNotRegistered.Error(),
-			})
+			writeError(w, r, http.StatusNotFound, "key_not_registered", domain.ErrKeyNotRegistered.Error())
 			return
 		}
 		h.governedRefusal(w, telemetry.ActionConfigGlobalWrite, "PublishConfigDefinition:resolve", correlationID, err)
@@ -1257,11 +1188,7 @@ func (h *Handler) PublishConfigDefinition(w http.ResponseWriter, r *http.Request
 	if err != nil {
 		if errors.Is(err, domain.ErrKeyNotRegistered) {
 			h.metrics.GovernedWrites.WithLabelValues(telemetry.ActionConfigGlobalWrite, telemetry.WriteConflict).Inc()
-			writeJSON(w, http.StatusNotFound, map[string]string{
-				"error":   "key_not_registered",
-				"key":     key,
-				"message": domain.ErrKeyNotRegistered.Error(),
-			})
+			writeError(w, r, http.StatusNotFound, "key_not_registered", domain.ErrKeyNotRegistered.Error())
 			return
 		}
 		h.governedRefusal(w, telemetry.ActionConfigGlobalWrite, "PublishConfigDefinition", correlationID, err)
@@ -1313,13 +1240,10 @@ func (h *Handler) ResolveConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Environment == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error": "missing_field",
-			"field": "environment",
-		})
+		writeError(w, r, http.StatusBadRequest, "missing_field", "environment")
 		return
 	}
-	if h.refuseForeignTenant(w, req.TenantID, tenantScope) {
+	if 	h.refuseForeignTenant(w, r, req.TenantID, tenantScope) {
 		return
 	}
 
@@ -1382,10 +1306,7 @@ func (h *Handler) GetSnapshot(w http.ResponseWriter, r *http.Request) {
 	// Checked before the store sees it: a non-UUID would otherwise fail the
 	// column cast and answer as an outage.
 	if _, err := uuid.Parse(snapshotID); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error": "invalid_snapshot_id",
-			"field": "snapshot_id",
-		})
+		writeError(w, r, http.StatusBadRequest, "invalid_snapshot_id", "snapshot_id")
 		return
 	}
 	if outcome := h.authorizeGoverned(w, r, principalID, telemetry.ActionConfigGlobalWrite); outcome != "" {
@@ -1468,11 +1389,7 @@ func (h *Handler) ActivateOverride(w http.ResponseWriter, r *http.Request) {
 	case "user_preference":
 		layer = domain.LayerUserPreference
 	default:
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error":   "invalid_field",
-			"field":   "scope",
-			"message": `must be one of "environment", "service", "tenant", "org_unit", "user_preference"`,
-		})
+		writeError(w, r, http.StatusBadRequest, "invalid_field", `must be one of "environment", "service", "tenant", "org_unit", "user_preference"`)
 		return
 	}
 
@@ -1481,10 +1398,7 @@ func (h *Handler) ActivateOverride(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if missing := req.missingField(); missing != "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error": "missing_field",
-			"field": missing,
-		})
+		writeError(w, r, http.StatusBadRequest, "missing_field", missing)
 		return
 	}
 
@@ -1493,22 +1407,18 @@ func (h *Handler) ActivateOverride(w http.ResponseWriter, r *http.Request) {
 	// here, before anything is written.
 	switch {
 	case layer == domain.ScopeTenant:
-		if h.refuseForeignTenant(w, req.ScopeID, tenantScope) {
+		if 	h.refuseForeignTenant(w, r, req.ScopeID, tenantScope) {
 			return
 		}
 	case domain.IsExtendedLayer(layer):
 		// SERVICE names a service, ORG_UNIT an org unit, USER_PREFERENCE a
 		// principal; each needs its scope id.
 		if req.ScopeID == nil || strings.TrimSpace(*req.ScopeID) == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "scope_id"})
+			writeError(w, r, http.StatusBadRequest, "missing_field", "scope_id")
 			return
 		}
 	case req.ScopeID != nil:
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error":   "invalid_field",
-			"field":   "scope_id",
-			"message": "scope_id is not valid for the environment layer",
-		})
+		writeError(w, r, http.StatusBadRequest, "invalid_field", "scope_id is not valid for the environment layer")
 		return
 	}
 
@@ -1636,13 +1546,10 @@ func (h *Handler) CreateChange(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if missing := req.missingField(); missing != "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error": "missing_field",
-			"field": missing,
-		})
+		writeError(w, r, http.StatusBadRequest, "missing_field", missing)
 		return
 	}
-	if h.refuseForeignTenant(w, req.TenantID, tenantScope) {
+	if 	h.refuseForeignTenant(w, r, req.TenantID, tenantScope) {
 		return
 	}
 
@@ -1756,10 +1663,7 @@ func (h *Handler) ApproveChange(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if errors.Is(err, domain.ErrChangeNotFound) {
 			h.metrics.GovernedWrites.WithLabelValues(action, telemetry.WriteConflict).Inc()
-			writeJSON(w, http.StatusNotFound, map[string]string{
-				"error":     "change_not_found",
-				"change_id": changeID,
-			})
+			writeError(w, r, http.StatusNotFound, "change_not_found", changeID)
 			return
 		}
 		h.governedRefusal(w, action, "ApproveChange", correlationID, err)
@@ -1813,10 +1717,7 @@ func (h *Handler) ActivateChange(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if errors.Is(err, domain.ErrChangeNotFound) {
 			h.metrics.GovernedWrites.WithLabelValues(action, telemetry.WriteConflict).Inc()
-			writeJSON(w, http.StatusNotFound, map[string]string{
-				"error":     "change_not_found",
-				"change_id": changeID,
-			})
+			writeError(w, r, http.StatusNotFound, "change_not_found", changeID)
 			return
 		}
 		h.governedRefusal(w, action, "ActivateChange", correlationID, err)
@@ -1894,13 +1795,10 @@ func (h *Handler) CreateEmergencyChange(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if missing := req.missingField(); missing != "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error": "missing_field",
-			"field": missing,
-		})
+		writeError(w, r, http.StatusBadRequest, "missing_field", missing)
 		return
 	}
-	if h.refuseForeignTenant(w, req.TenantID, tenantScope) {
+	if 	h.refuseForeignTenant(w, r, req.TenantID, tenantScope) {
 		return
 	}
 
@@ -1971,10 +1869,7 @@ func (h *Handler) ActivateEmergencyChange(w http.ResponseWriter, r *http.Request
 	if err != nil {
 		if errors.Is(err, domain.ErrChangeNotFound) {
 			h.metrics.GovernedWrites.WithLabelValues(action, telemetry.WriteConflict).Inc()
-			writeJSON(w, http.StatusNotFound, map[string]string{
-				"error":               "change_not_found",
-				"emergency_change_id": emergencyChangeID,
-			})
+			writeError(w, r, http.StatusNotFound, "change_not_found", emergencyChangeID)
 			return
 		}
 		h.governedRefusal(w, action, "ActivateEmergencyChange", correlationID, err)
@@ -2046,13 +1941,10 @@ func (h *Handler) RecordAttestation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if missing := req.missingField(); missing != "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error": "missing_field",
-			"field": missing,
-		})
+		writeError(w, r, http.StatusBadRequest, "missing_field", missing)
 		return
 	}
-	if h.refuseForeignTenant(w, req.TenantID, tenantScope) {
+	if 	h.refuseForeignTenant(w, r, req.TenantID, tenantScope) {
 		return
 	}
 	// §10.1 "workload identity": a runtime attests for itself. runtime_id
@@ -2061,17 +1953,11 @@ func (h *Handler) RecordAttestation(w http.ResponseWriter, r *http.Request) {
 	// clear drift — on behalf of another.
 	workload := strings.TrimSpace(r.Header.Get("X-Workload-Id"))
 	if workload == "" {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{
-			"error":   "workload_identity_missing",
-			"message": "X-Workload-Id is required — attestation is made by a verified workload",
-		})
+		writeError(w, r, http.StatusUnauthorized, "workload_identity_missing", "X-Workload-Id is required — attestation is made by a verified workload")
 		return
 	}
 	if workload != req.RuntimeID {
-		writeJSON(w, http.StatusForbidden, map[string]string{
-			"error":   "runtime_identity_mismatch",
-			"message": "runtime_id must be the calling workload's verified identity",
-		})
+		writeError(w, r, http.StatusForbidden, "runtime_identity_mismatch", "runtime_id must be the calling workload's verified identity")
 		return
 	}
 
@@ -2159,20 +2045,14 @@ func (h *Handler) CreateReleasePlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Environment == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error": "missing_field",
-			"field": "environment",
-		})
+		writeError(w, r, http.StatusBadRequest, "missing_field", "environment")
 		return
 	}
 	if req.Strategy == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error": "missing_field",
-			"field": "strategy",
-		})
+		writeError(w, r, http.StatusBadRequest, "missing_field", "strategy")
 		return
 	}
-	if h.refuseForeignTenant(w, req.TenantID, tenantScope) {
+	if 	h.refuseForeignTenant(w, r, req.TenantID, tenantScope) {
 		return
 	}
 
@@ -2247,20 +2127,14 @@ func (h *Handler) EvaluateFlag(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Environment == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error": "missing_field",
-			"field": "environment",
-		})
+		writeError(w, r, http.StatusBadRequest, "missing_field", "environment")
 		return
 	}
 	if req.SubjectKey == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error": "missing_field",
-			"field": "subject_key",
-		})
+		writeError(w, r, http.StatusBadRequest, "missing_field", "subject_key")
 		return
 	}
-	if h.refuseForeignTenant(w, req.TenantID, tenantScope) {
+	if 	h.refuseForeignTenant(w, r, req.TenantID, tenantScope) {
 		return
 	}
 
