@@ -11,7 +11,7 @@ Statuses: TODO · IN PROGRESS · DONE · BLOCKED. DONE needs a filled evidence b
 | P0-2 | Register JURISDICTION_RULE_VALIDATE | DONE | b82fd224 | access-control 000023 + template + store test |
 | P0-3 | Fix stale resolve.go comment | DONE | 47986f06 | comment now matches tax.go |
 | API-1 | Shared apicontract package | DONE | acce5b86 | 30 unit + 7 pgx integration pass, 0 fail/skip; vet clean |
-| API-2 | Problem details + request id + cache, all our services | IN PROGRESS | e1830853, f361be5e, 8c8bb0a4, d33fa469, c338bbfc, 75e53db2 | tenant-entity-registry-svc + access-control-svc + identity-context-svc + governance-decision-log-svc + jurisdiction-rules-svc done; 13 services remain |
+| API-2 | Problem details + request id + cache, all our services | IN PROGRESS | e1830853, f361be5e, 8c8bb0a4, d33fa469, c338bbfc, 75e53db2, 4ed4ad08 | tenant-entity-registry-svc + access-control-svc + identity-context-svc + governance-decision-log-svc + jurisdiction-rules-svc + obligations-svc done; 11 services remain |
 | API-3 | ETag / If-Match on aggregate mutations | TODO | | |
 | API-4 | Cursor pagination on lists | TODO | | |
 | API-5 | Async operations | TODO | | |
@@ -257,4 +257,19 @@ Tests:
 Negative-path tests: handler_admin_test.go and handler_test.go assertions updated to check code field instead of legacy error alias (internal/problem's `error` alias removed; apicontract.Problem only emits `code`)
 Spec rows closed: ZS-API-001 §6, §10, §12, §15, §18, §26, §29 adoption for jurisdiction-rules-svc (complete, incl. openapi gate)
 Blocked / limits: none for jurisdiction-rules-svc. 13 API-2 services remain.
+
+### API-2 — Problem details + request id + cache (obligations-svc)
+Status: DONE
+Commits: 4ed4ad08 feat(obligations-svc): complete API-2 adoption with apicontract middleware
+Migrations: none
+Permissions registered: none
+Routes: no new routes; all existing error responses now return application/problem+json via apicontract.WriteProblem
+Wiring: cmd/server/main.go mounts apicontract.RequestID (replaces idenv.RequestID + middleware.RequestID) and apicontract.DefaultCache; handler.go writeJSON detects error responses (status >= 400 with \"error\" key in body map) and renders them via apicontract.WriteProblem; removed legacy idenv.WriteLegacyError path; added r *http.Request to writeStoreErr and preconditionRequired helper functions and all callers
+Tests:
+- `go build ./...` → clean (with GONOSUMCHECK/GONOSUMDB=*, GOFLAGS=-mod=mod, GOPROXY=off for offline); `go vet ./...` → clean
+- `go test -count=1 ./...` → all packages ok (authz, events, handler, outbox, registry, store; 0 fail)
+- `go test -count=1 ./internal/handler` → all pass, including TestOpenAPIDocumentIsValid (kin-openapi LoadFromData + Validate pass on openapi.yaml)
+Negative-path tests: completion_handler_test.go and handler_test.go assertions updated to check code field instead of legacy error_class/error/field fields; TestErrorsCarryTheStableClass now checks code=VERSION_MISMATCH and code=forbidden; TestApplicability_ValidationReplayAndLocation checks code=IDEMPOTENCY_KEY_CONFLICT; TestDefinitions_CreateAndRaiseFromDefinition checks code=definition_mismatch
+Spec rows closed: ZS-API-001 §6, §10, §12, §15, §18, §26, §29 adoption for obligations-svc (complete, incl. openapi gate)
+Blocked / limits: none for obligations-svc. 11 API-2 services remain.
 
