@@ -2945,6 +2945,18 @@ func (h *Handler) CreateReversalPosting(w http.ResponseWriter, r *http.Request) 
 		PostedByPrincipalID:     &principalID,
 		CorrelationID:           correlationID,
 		SoftCloseOverrideReason: &req.SoftCloseOverrideReason,
+
+		// A reversal inherits the ACC-03 inputs of the journal it neutralizes (same book, currency and document); only its type and
+		// its posting date differ. Without them the journal header is incomplete and the ledger refuses it.
+		JournalType:      domain.JournalTypeReversal,
+		TransactionDate:  header.TransactionDate,
+		PostingDate:      h.reversalPostingDate(header),
+		CurrencyCode:     header.CurrencyCode,
+		BookID:           header.BookID,
+		ReportingBasis:   header.ReportingBasis,
+		EvidenceRefs:     header.EvidenceRefs,
+		AccountingBookID: header.AccountingBookID,
+		ReversalReason:   optionalString(req.Reason),
 	}
 	_, originalLines, err := h.store.GetJournal(r.Context(), req.OriginalJournalID)
 	if err != nil {
@@ -2954,7 +2966,9 @@ func (h *Handler) CreateReversalPosting(w http.ResponseWriter, r *http.Request) 
 	}
 	reversingLines := make([]domain.JournalLine, len(originalLines))
 	for i, l := range originalLines {
-		reversingLines[i] = domain.JournalLine{AccountCode: l.AccountCode, DebitAmount: l.CreditAmount, CreditAmount: l.DebitAmount, Description: l.Description}
+		reversingLines[i] = domain.JournalLine{AccountCode: l.AccountCode, DebitAmount: l.CreditAmount, CreditAmount: l.DebitAmount, Description: l.Description,
+			TaxCode: l.TaxCode, TaxLogicSnapshotID: l.TaxLogicSnapshotID, Dimensions: l.Dimensions,
+			TransactionAmount: l.TransactionAmount, TransactionCcy: l.TransactionCcy, ExchangeRate: l.ExchangeRate, RateRef: l.RateRef, PostingRuleLineRef: l.PostingRuleLineRef, CounterpartyID: l.CounterpartyID}
 	}
 
 	_, _, err = h.store.ReverseJournal(r.Context(), header.TenantID, req.OriginalJournalID, reversingHeader, reversingLines, principalID)
