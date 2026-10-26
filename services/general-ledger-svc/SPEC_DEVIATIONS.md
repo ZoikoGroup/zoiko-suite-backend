@@ -12,6 +12,7 @@ ACC-01 surface completed in the command-per-commit pass — `AmendAccountVersion
 `ActivateAccount`, `ReparentAccount`, `ResolvePostingEligibility`,
 `GetAccountAsOf` (on top of the existing `CreateAccount`, `GetAccount`,
 `ListAccounts`, `DeactivateAccount`). Later ACC-0x surfaces will extend it.
+The 2026-10-26 ACC-14 close-review extension is recorded in A14 and B13.
 
 Overall: all nine named commands/queries now exist with real guards (cycles,
 optimistic version checks, append-only version history, half-open effective
@@ -134,6 +135,18 @@ The deliberate design decisions a reviewer may want to reverse are B1–B12.
   `/resolve-posting-eligibility` and `/as-of` variants that read the code from
   body/query. An internal alias surface was not added; if a gateway contract
   needs one it should be a routing change, not a second implementation.
+- **A14. The period-state guard is still API-layer only; no database guard.**
+  This service decides HardClosed / CLOSE_REVIEW / SOFT_CLOSE by calling
+  financial-close-svc before create, validate-commit, post, approved-post,
+  adopt and reprocess. There is no database constraint or trigger that refuses
+  a direct INSERT/UPDATE of a journal row into a closed period; a future
+  DB-level guard is financial-close-svc's A5 and is deliberately not fixed
+  here. The new `journal_headers.close_journal_designation` column is part of
+  the row such a guard must consult: a guard that knows only the period state
+  would either refuse a legitimate designated close journal or be too
+  permissive. Migration 000018's down migration refuses while any row still
+  carries a designation, so the evidence cannot be erased while a journal
+  depends on it.
 
 ## B. Interpretations and additions (decisions a reviewer may want to reverse)
 
@@ -262,3 +275,42 @@ The deliberate design decisions a reviewer may want to reverse are B1–B12.
   `command_idempotency` row counts read directly, cross-command conflict, and a
   stale-version refusal that does not consume the key so the corrected retry
   runs).
+- **B13. CLOSE_REVIEW admits a journal-level designated close journal, not a
+  permission-only bypass (closes financial-close-svc A4).** ACC-14's posting
+  table says CLOSE_REVIEW permits "Only designated close journals/workflows"
+  but defines neither the designation nor the mechanism. This service now
+  persists a nullable `journal_headers.close_journal_designation` (migration
+  `000018_add_close_journal_designation`) from a closed allowlist:
+  `ACCRUAL_RECOGNITION` (ACC-07), `PREPAYMENT_RECOGNITION` and
+  `PREPAYMENT_TERMINATION` (ACC-08). Every value must agree with the journal's
+  ACC-03 type — all three are `ACCRUAL` — and the database CHECK repeats that
+  rule. A caller cannot invent a designation; an unrecognised value or a
+  type mismatch is 422 `invalid_close_journal_designation` even in an OPEN
+  period. The designation is not the SOFT_CLOSE override: `SOFT_CLOSE`
+  (`RESTRICTED`) still requires `override_soft_close=true`, a non-empty
+  `soft_close_override_reason`, and `GL_SOFT_CLOSE_POSTING_OVERRIDE`; that
+  override is not a CLOSE_REVIEW mechanism and an ordinary journal carrying it
+  is still refused in CLOSE_REVIEW. During `CLOSE_JOURNALS_ONLY`, a valid
+  designation is honored only when the poster also holds the separate
+  `GL_CLOSE_REVIEW_POSTING` action (registered by access-control-svc migration
+  `000019`), checked at creation, validation-commit, posting, approved posting,
+  adoption and reprocessing. Registration only makes the action authorable; a
+  deployment must still grant it to the principal that posts close journals
+  (financial-close-svc uses the human request principal). A `CLOSED` period
+  returns `ErrPeriodHardClosed` and is never turned into an allowance by a
+  designation.
+  The external refusal for an ordinary non-designated journal in CLOSE_REVIEW
+  remains HTTP 412 `period_locked`, exactly as before; internally the close
+  client now distinguishes `ErrCloseJournalsOnly` from
+  `ErrPeriodHardClosed` so the handler can make the designated-only decision.
+  The created outbox event carries the designation as audit evidence.
+  Verification: handler tests in `internal/handler/close_review_posting_test.go`
+  (ordinary CLOSE_REVIEW refusal, designated create/post, missing action,
+  invalid and type-mismatched designations, hard-closed refusal),
+  `internal/handler/posting_engine_test.go` (ordinary ACC-04 event refusal),
+  `internal/close/client_test.go` (policy mapping), store integration tests in
+  `internal/store/close_journal_designation_store_test.go` (round trip, outbox,
+  DB CHECK, and the guarded down migration refusing while a row depends), and
+  financial-close-svc's `internal/handler/close_journal_meta_test.go` plus
+  `internal/clients/gl_journal_contract_test.go` (request shape for ACC-07/08
+  recognition and termination, SOFT_CLOSE override only in SOFT_CLOSE).

@@ -1277,6 +1277,22 @@ type GLJournalMeta struct {
 	TransactionDate time.Time
 	PostingDate     time.Time
 	CurrencyCode    string
+
+	// CloseJournalDesignation names the close workflow for a journal that
+	// ACC-14's CLOSE_REVIEW policy admits as a "designated close journal".
+	// Empty for every other posting path. general-ledger-svc validates it
+	// against its own closed allowlist; this service does not get to invent
+	// a value.
+	CloseJournalDesignation string
+
+	// OverrideSoftClose and SoftCloseOverrideReason are sent only for a
+	// designated close journal posting while the period is SOFT_CLOSE.
+	// general-ledger-svc's SOFT_CLOSE rule is a separate mechanism from
+	// CLOSE_REVIEW's designation: it requires an elevated action and a
+	// reason, and this service supplies both rather than treating the
+	// designation as an override.
+	OverrideSoftClose       bool
+	SoftCloseOverrideReason string
 }
 
 // general-ledger-svc journal types this service posts. The kernel standard's
@@ -1287,6 +1303,16 @@ const (
 	GLJournalTypeReclass    = "RECLASS"    // ACC-09 allocation
 	GLJournalTypeAdjustment = "ADJUSTMENT" // ACC-10 FX revaluation
 	GLJournalTypeOpening    = "OPENING"    // ACC-17 opening balances
+)
+
+// general-ledger-svc's closed close-journal designations (its
+// internal/domain/close_journal.go). These are the only values GL accepts, and
+// each must agree with the journal type; this service sends the designation
+// that matches the workflow it is running.
+const (
+	GLCloseJournalAccrualRecognition    = "ACCRUAL_RECOGNITION"    // ACC-07
+	GLCloseJournalPrepaymentRecognition = "PREPAYMENT_RECOGNITION" // ACC-08
+	GLCloseJournalPrepaymentTermination = "PREPAYMENT_TERMINATION" // ACC-08
 )
 
 // GLJournalStatusFinalized is general-ledger-svc's posted state (its journals

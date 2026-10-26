@@ -49,7 +49,7 @@ const MaxListLimit = 1000
 // journalHeaderColumns is the header SELECT list. It is a single const, and
 // scanHeaderTargets below is derived from it in the same order, because the
 // two drifting apart is the failure mode that hand-written pairs invite: this
-// service has four read paths over the same eighteen columns.
+// service has four read paths over the same columns.
 const journalHeaderColumns = `
 	journal_id, tenant_id, legal_entity_id, fiscal_period, status,
 	reversal_of_journal_id, description, created_by_principal_id,
@@ -63,7 +63,8 @@ const journalHeaderColumns = `
 	approved_at, approved_by_principal_id,
 	rejected_at, rejected_by_principal_id, rejection_reason,
 	posting_requested_at, posting_requested_by_principal_id,
-	correction_of_journal_id, soft_close_override_reason`
+	correction_of_journal_id, soft_close_override_reason,
+	close_journal_designation`
 
 // scanHeaderTargets returns scan destinations matching journalHeaderColumns,
 // column for column. status and approvalStatus are scanned into plain
@@ -88,6 +89,7 @@ func scanHeaderTargets(h *domain.JournalHeader, status, approvalStatus *string) 
 		&h.RejectedAt, &h.RejectedByPrincipalID, &h.RejectionReason,
 		&h.PostingRequestedAt, &h.PostingRequestedByPrincipalID,
 		&h.CorrectionOfJournalID, &h.SoftCloseOverrideReason,
+		&h.CloseJournalDesignation,
 	}
 }
 
@@ -268,9 +270,9 @@ func insertJournal(ctx context.Context, tx pgx.Tx, tenantID string, h *domain.Jo
 			source_event_id, governance_decision_id,
 			journal_type, transaction_date, posting_date, currency_code,
 			book_id, reporting_basis, evidence_refs, approval_status,
-			soft_close_override_reason
+			soft_close_override_reason, close_journal_designation
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
-		          $19, $20, $21, $22, $23, $24, $25, $26, $27)
+		          $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)
 		ON CONFLICT (tenant_id, correlation_id) WHERE correlation_id != '' DO NOTHING
 	`, h.JournalID, tenantID, h.LegalEntityID, h.FiscalPeriod, string(h.Status),
 		h.ReversalOfJournalID, h.Description, h.CreatedByPrincipalID,
@@ -279,7 +281,7 @@ func insertJournal(ctx context.Context, tx pgx.Tx, tenantID string, h *domain.Jo
 		h.SourceEventID, h.GovernanceDecisionID,
 		h.JournalType, h.TransactionDate, h.PostingDate, h.CurrencyCode,
 		h.BookID, h.ReportingBasis, h.EvidenceRefs, string(h.ApprovalStatus),
-		h.SoftCloseOverrideReason)
+		h.SoftCloseOverrideReason, h.CloseJournalDesignation)
 	if err != nil {
 		return nil, false, mapPgError(err)
 	}
@@ -394,6 +396,12 @@ func (s *PgStore) CreateJournal(ctx context.Context, h *domain.JournalHeader, li
 		// discoverable from the event stream, not only by querying this row.
 		if h.SoftCloseOverrideReason != nil && *h.SoftCloseOverrideReason != "" {
 			createdData["soft_close_override_reason"] = *h.SoftCloseOverrideReason
+		}
+		// The designation is the evidence that CLOSE_REVIEW's admission was
+		// based on a named close workflow, not on the caller's permission
+		// alone. Emit it alongside the created fact.
+		if h.CloseJournalDesignation != nil && *h.CloseJournalDesignation != "" {
+			createdData["close_journal_designation"] = *h.CloseJournalDesignation
 		}
 		if err := s.enqueueJournalEvent(ctx, tx, "created", h.TenantID, h.LegalEntityID,
 			h.JournalID, h.CreatedByPrincipalID, h.CorrelationID, createdData); err != nil {

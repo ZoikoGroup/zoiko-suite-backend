@@ -657,6 +657,13 @@ type glCreateJournalRequest struct {
 	TransactionDate string `json:"transaction_date"`
 	PostingDate     string `json:"posting_date"`
 	CurrencyCode    string `json:"currency_code"`
+
+	// ACC-14 CLOSE_REVIEW / SOFT_CLOSE context. The designation is the
+	// journal-level fact GL validates; the override pair is the separate
+	// SOFT_CLOSE mechanism. Both are omitted for ordinary postings.
+	CloseJournalDesignation string `json:"close_journal_designation,omitempty"`
+	OverrideSoftClose       bool   `json:"override_soft_close,omitempty"`
+	SoftCloseOverrideReason string `json:"soft_close_override_reason,omitempty"`
 }
 
 const glDateLayout = "2006-01-02"
@@ -665,16 +672,19 @@ const glDateLayout = "2006-01-02"
 // no posting path can leave out ACC-03's required inputs again.
 func newGLCreateJournalRequest(tenantID, legalEntityID, fiscalPeriod, description, correlationID string, meta domain.GLJournalMeta, lines []glJournalLineInput) glCreateJournalRequest {
 	return glCreateJournalRequest{
-		TenantID:        tenantID,
-		LegalEntityID:   legalEntityID,
-		FiscalPeriod:    fiscalPeriod,
-		Description:     description,
-		CorrelationID:   correlationID,
-		Lines:           lines,
-		JournalType:     meta.JournalType,
-		TransactionDate: meta.TransactionDate.UTC().Format(glDateLayout),
-		PostingDate:     meta.PostingDate.UTC().Format(glDateLayout),
-		CurrencyCode:    meta.CurrencyCode,
+		TenantID:                tenantID,
+		LegalEntityID:           legalEntityID,
+		FiscalPeriod:            fiscalPeriod,
+		Description:             description,
+		CorrelationID:           correlationID,
+		Lines:                   lines,
+		JournalType:             meta.JournalType,
+		TransactionDate:         meta.TransactionDate.UTC().Format(glDateLayout),
+		PostingDate:             meta.PostingDate.UTC().Format(glDateLayout),
+		CurrencyCode:            meta.CurrencyCode,
+		CloseJournalDesignation: meta.CloseJournalDesignation,
+		OverrideSoftClose:       meta.OverrideSoftClose,
+		SoftCloseOverrideReason: meta.SoftCloseOverrideReason,
 	}
 }
 

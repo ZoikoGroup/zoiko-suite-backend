@@ -155,6 +155,14 @@ const (
 	// a different (typically narrower) group.
 	actionOverrideSoftClose = "GL_SOFT_CLOSE_POSTING_OVERRIDE"
 
+	// actionCloseReviewPosting gates use of a journal's close-journal
+	// designation in CLOSE_REVIEW (posting_policy CLOSE_JOURNALS_ONLY). It is
+	// a separate action from actionOverrideSoftClose because CLOSE_REVIEW's
+	// "only designated close journals/workflows" rule is not a soft-close
+	// exception: it admits a specific class of journal, not an arbitrary
+	// posting with a reason. It never bypasses a hard-closed period.
+	actionCloseReviewPosting = "GL_CLOSE_REVIEW_POSTING"
+
 	// ACC-02 Account Mapping actions.
 	actionSetAccountMapping  = "COA_MAPPING_SET"
 	actionViewAccountMapping = "COA_MAPPING_VIEW"
@@ -384,6 +392,17 @@ func (h *Handler) CreateJournal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A designation is validated even in OPEN: an unrecognised value or one
+	// that disagrees with the journal type is a bad request, not something to
+	// store and discover at posting time. The dedicated authorization action
+	// is checked only when CLOSE_REVIEW actually relies on the designation, so
+	// ordinary open-period postings do not need the close-review grant.
+	if !domain.ValidCloseJournalDesignation(req.CloseJournalDesignation, req.JournalType) {
+		writeError(w, http.StatusUnprocessableEntity, "invalid_close_journal_designation",
+			domain.ErrInvalidCloseJournalDesignation.Error())
+		return
+	}
+
 	// Enforce Period Lock Check with soft-close override support
 	if err := h.closeClient.CheckPeriodOpenAt(r.Context(), req.TenantID, close.PeriodRef{
 		LegalEntityID: req.LegalEntityID, PeriodName: req.FiscalPeriod,
@@ -391,12 +410,18 @@ func (h *Handler) CreateJournal(w http.ResponseWriter, r *http.Request) {
 		// validated non-zero by requiredJournalFieldMissing above.
 		PostingDate: req.PostingDate,
 	}); err != nil {
-		if errors.Is(err, domain.ErrSoftCloseOverrideRequired) {
+		switch {
+		case errors.Is(err, domain.ErrSoftCloseOverrideRequired):
 			if !h.checkSoftCloseOverride(w, r, req.OverrideSoftClose, req.SoftCloseOverrideReason, principalID, req.LegalEntityID) {
 				return
 			}
 			// Override allowed — fall through to create the journal
-		} else {
+		case errors.Is(err, domain.ErrCloseJournalsOnly):
+			if !h.closeReviewPostingAllowed(w, r, principalID, req.LegalEntityID, req.CloseJournalDesignation, req.JournalType) {
+				return
+			}
+			// Designated close journal, authorized — fall through
+		default:
 			h.writePeriodErr(w, err)
 			return
 		}
@@ -427,6 +452,12 @@ func (h *Handler) CreateJournal(w http.ResponseWriter, r *http.Request) {
 		reportingBasis = &env.ReportingBasis
 	}
 
+	var closeJournalDesignation *string
+	if req.CloseJournalDesignation != "" {
+		d := req.CloseJournalDesignation
+		closeJournalDesignation = &d
+	}
+
 	header := &domain.JournalHeader{
 		JournalID:            uuid.NewString(),
 		TenantID:             req.TenantID,
@@ -447,6 +478,7 @@ func (h *Handler) CreateJournal(w http.ResponseWriter, r *http.Request) {
 		ReportingBasis:          reportingBasis,
 		EvidenceRefs:            mergeEvidenceRefs(req.EvidenceRefs, env.EvidenceRefs),
 		SoftCloseOverrideReason: &req.SoftCloseOverrideReason,
+		CloseJournalDesignation: closeJournalDesignation,
 
 		// ACC-03: every ordinary journal a human creates starts as a
 		// proposal nobody has acted on yet — explicit here rather than
@@ -564,6 +596,53 @@ func (h *Handler) checkSoftCloseOverride(w http.ResponseWriter, r *http.Request,
 		return false
 	}
 	return true
+}
+
+// authorizeCloseReviewPosting is the CLOSE_REVIEW gate for a designated close
+// journal. It is deliberately separate from checkSoftCloseOverride: SOFT_CLOSE
+// admits an arbitrary posting only with an elevated reason, while CLOSE_REVIEW
+// admits only a journal whose persisted designation names a recognised close
+// workflow. An empty designation is an ordinary journal and is refused with
+// ErrCloseJournalsOnly; the caller must also hold GL_CLOSE_REVIEW_POSTING.
+//
+// The period state itself is checked by the close client before this runs.
+// Nothing here can turn a CLOSED result into an allowance: the handler only
+// calls this for ErrCloseJournalsOnly.
+func (h *Handler) authorizeCloseReviewPosting(ctx context.Context, principalID, legalEntityID, designation string, journalType domain.JournalType) error {
+	if designation == "" {
+		return domain.ErrCloseJournalsOnly
+	}
+	if !domain.ValidCloseJournalDesignation(designation, journalType) {
+		return domain.ErrInvalidCloseJournalDesignation
+	}
+	return h.authz.CheckAllowed(ctx, principalID, legalEntityID, actionCloseReviewPosting)
+}
+
+// closeReviewPostingAllowed is authorizeCloseReviewPosting with the HTTP
+// response written for the handler paths that have a ResponseWriter.
+func (h *Handler) closeReviewPostingAllowed(w http.ResponseWriter, r *http.Request, principalID, legalEntityID, designation string, journalType domain.JournalType) bool {
+	err := h.authorizeCloseReviewPosting(r.Context(), principalID, legalEntityID, designation, journalType)
+	switch {
+	case err == nil:
+		return true
+	case errors.Is(err, domain.ErrCloseJournalsOnly):
+		h.writePeriodErr(w, err)
+	case errors.Is(err, domain.ErrInvalidCloseJournalDesignation):
+		writeError(w, http.StatusUnprocessableEntity, "invalid_close_journal_designation", err.Error())
+	default:
+		h.writeAuthzErr(w, err)
+	}
+	return false
+}
+
+// closeJournalDesignationOf returns a stored designation, or "" when the
+// journal is ordinary. It keeps the nil-pointer handling out of every period
+// check that needs to ask "is this a designated close journal?".
+func closeJournalDesignationOf(header *domain.JournalHeader) string {
+	if header.CloseJournalDesignation == nil {
+		return ""
+	}
+	return *header.CloseJournalDesignation
 }
 
 // ── GET /v1/journals/{journal_id} ────────────────────────────────────────────
@@ -1424,12 +1503,19 @@ func (h *Handler) PostJournal(w http.ResponseWriter, r *http.Request) {
 		softCloseOverrideReason = *header.SoftCloseOverrideReason
 	}
 	if err := h.closeClient.CheckPeriodOpenAt(r.Context(), header.TenantID, periodRefOf(header)); err != nil {
-		if errors.Is(err, domain.ErrSoftCloseOverrideRequired) && softCloseOverrideReason != "" {
+		switch {
+		case errors.Is(err, domain.ErrSoftCloseOverrideRequired) && softCloseOverrideReason != "":
 			if !h.checkSoftCloseOverride(w, r, true, softCloseOverrideReason, principalID, header.LegalEntityID) {
 				return
 			}
 			// Override allowed — fall through
-		} else {
+		case errors.Is(err, domain.ErrCloseJournalsOnly):
+			if !h.closeReviewPostingAllowed(w, r, principalID, header.LegalEntityID,
+				closeJournalDesignationOf(header), header.JournalType) {
+				return
+			}
+			// Designated close journal, authorized — fall through
+		default:
 			h.writePeriodErr(w, err)
 			return
 		}
@@ -2195,11 +2281,22 @@ func (h *Handler) commitJournal(ctx context.Context, header *domain.JournalHeade
 		domain.JournalStatusPending, domain.JournalStatusValidated, principalID); err != nil {
 		return err
 	}
-	// Re-check period with soft-close override from journal header if present
+	// Re-check period with the override/designation declared at journal
+	// creation. A close-journal designation is only usable here when the
+	// period is actually CLOSE_JOURNALS_ONLY; a CLOSED result is returned
+	// unchanged and cannot be overridden.
 	if err := h.closeClient.CheckPeriodOpenAt(ctx, header.TenantID, periodRefOf(header)); err != nil {
-		if errors.Is(err, domain.ErrSoftCloseOverrideRequired) && header.SoftCloseOverrideReason != nil && *header.SoftCloseOverrideReason != "" {
+		switch {
+		case errors.Is(err, domain.ErrSoftCloseOverrideRequired) &&
+			header.SoftCloseOverrideReason != nil && *header.SoftCloseOverrideReason != "":
 			// Override was declared at journal creation — honor it
-		} else {
+		case errors.Is(err, domain.ErrCloseJournalsOnly):
+			if authErr := h.authorizeCloseReviewPosting(ctx, principalID, header.LegalEntityID,
+				closeJournalDesignationOf(header), header.JournalType); authErr != nil {
+				return authErr
+			}
+			// Designated close journal, authorized — fall through
+		default:
 			return err
 		}
 	}
@@ -2568,12 +2665,20 @@ func (h *Handler) adoptExistingJournal(w http.ResponseWriter, r *http.Request, t
 			softCloseOverrideReason = *header.SoftCloseOverrideReason
 		}
 		if err := h.closeClient.CheckPeriodOpen(ctx, header.TenantID, header.LegalEntityID, header.FiscalPeriod); err != nil {
-			if errors.Is(err, domain.ErrSoftCloseOverrideRequired) && softCloseOverrideReason != "" {
+			switch {
+			case errors.Is(err, domain.ErrSoftCloseOverrideRequired) && softCloseOverrideReason != "":
 				if !h.checkSoftCloseOverride(w, r, true, softCloseOverrideReason, principalID, header.LegalEntityID) {
 					return "", false
 				}
 				// Override allowed — fall through to commit
-			} else {
+			case errors.Is(err, domain.ErrCloseJournalsOnly):
+				if !h.closeReviewPostingAllowed(w, r, principalID, header.LegalEntityID,
+					closeJournalDesignationOf(header), header.JournalType) {
+					h.failExecution(ctx, tenantID, exec.ExecutionID, err)
+					return "", false
+				}
+				// Designated close journal, authorized — commitJournal re-checks
+			default:
 				h.failExecution(ctx, tenantID, exec.ExecutionID, err)
 				h.writePeriodErr(w, err)
 				return "", false
@@ -2613,8 +2718,21 @@ func (h *Handler) writePeriodErr(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusPreconditionFailed, "soft_close_override_required", err.Error())
 		return
 	}
-	if errors.Is(err, domain.ErrPeriodHardClosed) || errors.Is(err, domain.ErrPeriodLocked) {
+	// CLOSE_JOURNALS_ONLY keeps the same external refusal ordinary posting
+	// has always received. The distinction is internal: the handler uses it
+	// to decide whether a designated close journal may pass, and never
+	// exposes a different code that would make the state look hard-closed.
+	if errors.Is(err, domain.ErrCloseJournalsOnly) ||
+		errors.Is(err, domain.ErrPeriodHardClosed) || errors.Is(err, domain.ErrPeriodLocked) {
 		writeError(w, http.StatusPreconditionFailed, "period_locked", err.Error())
+		return
+	}
+	if errors.Is(err, domain.ErrInvalidCloseJournalDesignation) {
+		writeError(w, http.StatusUnprocessableEntity, "invalid_close_journal_designation", err.Error())
+		return
+	}
+	if errors.Is(err, domain.ErrAuthorizationDenied) || errors.Is(err, domain.ErrAuthorizationServiceUnavailable) {
+		h.writeAuthzErr(w, err)
 		return
 	}
 	if errors.Is(err, domain.ErrUnbalancedJournal) {
@@ -2700,12 +2818,20 @@ func (h *Handler) PostApprovedJournal(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.closeClient.CheckPeriodOpenAt(r.Context(), header.TenantID, periodRefOf(header)); err != nil {
-		if errors.Is(err, domain.ErrSoftCloseOverrideRequired) && softCloseOverrideReason != "" {
+		switch {
+		case errors.Is(err, domain.ErrSoftCloseOverrideRequired) && softCloseOverrideReason != "":
 			if !h.checkSoftCloseOverride(w, r, true, softCloseOverrideReason, principalID, header.LegalEntityID) {
 				return
 			}
 			// Override allowed — fall through
-		} else {
+		case errors.Is(err, domain.ErrCloseJournalsOnly):
+			if !h.closeReviewPostingAllowed(w, r, principalID, header.LegalEntityID,
+				closeJournalDesignationOf(header), header.JournalType) {
+				h.failExecution(r.Context(), tenantID, exec.ExecutionID, err)
+				return
+			}
+			// Designated close journal, authorized — fall through
+		default:
 			h.failExecution(r.Context(), tenantID, exec.ExecutionID, err)
 			h.writePeriodErr(w, err)
 			return
@@ -2916,9 +3042,17 @@ func (h *Handler) ReprocessFailedPosting(w http.ResponseWriter, r *http.Request)
 		}
 	} else if header.Status == domain.JournalStatusValidated {
 		if err := h.closeClient.CheckPeriodOpenAt(r.Context(), header.TenantID, periodRefOf(header)); err != nil {
-			h.failExecution(r.Context(), tenantID, executionID, err)
-			h.writePeriodErr(w, err)
-			return
+			if errors.Is(err, domain.ErrCloseJournalsOnly) &&
+				h.closeReviewPostingAllowed(w, r, principalID, header.LegalEntityID,
+					closeJournalDesignationOf(header), header.JournalType) {
+				// Designated close journal, authorized — fall through
+			} else {
+				h.failExecution(r.Context(), tenantID, executionID, err)
+				if !errors.Is(err, domain.ErrCloseJournalsOnly) {
+					h.writePeriodErr(w, err)
+				}
+				return
+			}
 		}
 		if err := h.store.TransitionJournal(r.Context(), header.TenantID, header.JournalID,
 			domain.JournalStatusValidated, domain.JournalStatusFinalized, principalID); err != nil {

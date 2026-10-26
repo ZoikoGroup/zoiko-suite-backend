@@ -218,6 +218,23 @@ func TestPostAccountingEvent_ResolvesMappingKeyThroughACC02(t *testing.T) {
 // Negative path #4 (verbatim): "Closed period race during commit." The
 // period is open when the journal is created and LOCKED by the time the
 // posting is actually committed.
+func TestPostAccountingEvent_CloseReviewRefusesOrdinaryEvent(t *testing.T) {
+	s := newStubStore()
+	closeClient := &countingClose{failFrom: 1, err: domain.ErrCloseJournalsOnly}
+	r := newRouterWithClose(s, &stubPublisher{}, &stubAuthZ{}, closeClient)
+
+	rec := doRequest(r, http.MethodPost, "/v1/postings/events", validPostEventReq(), "svc-ap")
+	if rec.Code != http.StatusPreconditionFailed {
+		t.Fatalf("ordinary event in CLOSE_REVIEW must be refused with 412, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"error":"period_locked"`) {
+		t.Fatalf("ordinary event must keep the existing period_locked refusal, got %s", rec.Body.String())
+	}
+	if len(s.journals) != 0 {
+		t.Fatalf("a refused ordinary event must not create a journal, got %d", len(s.journals))
+	}
+}
+
 func TestPostAccountingEvent_ClosedPeriodRaceDuringCommit_BlocksAndRecordsFailure(t *testing.T) {
 	s := newStubStore()
 	// Call 1 = the pre-create check (open); call 2 = the re-check immediately

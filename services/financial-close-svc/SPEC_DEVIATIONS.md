@@ -38,6 +38,15 @@ tracing A4. Every financial-close-svc posting to general-ledger-svc was
 refused. Migration 000022 is added; the scope is now migrations
 000001–000022. Verification is under A13.
 
+Update (2026-10-26, A4 pass): closes A4. general-ledger-svc migration 000018
+adds `journal_headers.close_journal_designation` and the separate
+`GL_CLOSE_REVIEW_POSTING` action (registered by access-control-svc migration
+000019); this service now sends the designation on ACC-07/08 recognition and
+termination and the existing SOFT_CLOSE override only during SOFT_CLOSE.
+A5 remains open and now records the new GL column a future DB-level guard must
+consult. Verification is under A4; the full plain and integration-tagged
+suites were re-run against a fresh disposable `postgres:16` container.
+
 ## Verified controls
 
 Checked against code and schema, not comments:
@@ -196,26 +205,65 @@ approved. A fix needs schedule versions with a pending-amendment approval
 step, and a remaining-balance spread. Left open rather than patched, because
 the spread rule is an accounting-policy decision.
 
-### A4. Designated close journals cannot actually post in SOFT_CLOSE or CLOSE_REVIEW
+### A4. Designated close journals cannot actually post in SOFT_CLOSE or CLOSE_REVIEW — Closed (2026-10-26)
 
 The kernel posting table quoted in `domain/period_state.go` gives CLOSE_REVIEW
 as "Only designated close journals/workflows permitted", and
 `CloseJournalsAllowed` lets ACC-07/08 recognition and termination through
-SOFT_CLOSE and CLOSE_REVIEW. general-ledger-svc refuses both states for these
-journals. Its period check answers `RESTRICTED` with
-`soft_close_override_required` and treats `CLOSE_JOURNALS_ONLY` as hard
-closed, and this service's GL client sends neither an override nor a
-close-journal designation.
+SOFT_CLOSE and CLOSE_REVIEW. general-ledger-svc used to refuse both states for
+these journals: its period check answered `RESTRICTED` with
+`soft_close_override_required` and treated `CLOSE_JOURNALS_ONLY` as hard
+closed, and this service's GL client sent neither an override nor a
+close-journal designation. An accrual recognized during close review was
+therefore refused by GL (503 `journal_posting_failed`) — fail-safe, but the
+designated close-journal path the state machine promises did not exist end to
+end.
 
-Failure scenario: an accrual recognized during close review is refused by GL
-(503 `journal_posting_failed`). This is fail-safe, but the designated
-close-journal path the state machine promises does not exist end to end.
-Fixing it needs a journal designation that GL accepts in those states, which
-is a general-ledger-svc change.
+Resolution (general-ledger-svc change, plus the client wiring here):
 
-Until A13 was closed (2026-10-24), this path could not be exercised: GL
-refused every journal from this service, in any period state, before its
-period check was reached. A4 is the next pass.
+- GL now distinguishes `CLOSE_JOURNALS_ONLY` (`ErrCloseJournalsOnly`) from
+  `CLOSED` (`ErrPeriodHardClosed`). A hard-closed period still refuses every
+  journal, designated or not.
+- GL migration `000018_add_close_journal_designation` adds a nullable
+  `journal_headers.close_journal_designation` with a closed allowlist:
+  `ACCRUAL_RECOGNITION` (ACC-07), `PREPAYMENT_RECOGNITION` and
+  `PREPAYMENT_TERMINATION` (ACC-08). Every value must agree with the journal's
+  ACC-03 type (all three are `ACCRUAL`); the database CHECK repeats the rule.
+  The designation is journal-level evidence, not a caller-trusted permission.
+- A separate `GL_CLOSE_REVIEW_POSTING` action (registered by access-control-svc
+  migration `000019`) is checked whenever a designation is actually used in
+  CLOSE_REVIEW, at create, validate-commit, post, approved-post, adopt and
+  reprocess. The designation alone does not grant access. Registration makes
+  the action authorable; it does not grant it to anyone. Deployments must grant
+  it to the principal that posts close journals — this service uses the human
+  request principal, and the same is true for the existing
+  `GL_SOFT_CLOSE_POSTING_OVERRIDE` grant.
+- This service's GL client now sends the matching designation on ACC-07
+  accrual recognition, ACC-08 prepayment recognition and ACC-08 prepayment
+  termination. During `SOFT_CLOSE` only, it also sends the existing
+  `override_soft_close=true` + non-empty `soft_close_override_reason` pair, so
+  GL's `GL_SOFT_CLOSE_POSTING_OVERRIDE` path is satisfied. CLOSE_REVIEW sends
+  the designation and no override: the two mechanisms remain distinct.
+- An ordinary, non-designated posting during CLOSE_REVIEW is still refused
+  with HTTP 412 `period_locked` and the same `period_locked` error code as
+  before. The internal sentinel changed; the external refusal did not.
+- ACC-07 reversal through `ReverseGLJournal` still sends neither a designation
+  nor an override. Reversal is outside the recognition/termination scope this
+  A4 pass covers and remains a separate narrow path if the close policy is
+  ever extended to it.
+
+Evidence: `general-ledger-svc/internal/handler/close_review_posting_test.go`
+(ordinary refusal, designated create/post, missing action, invalid and
+type-mismatched designations, hard-closed refusal),
+`internal/handler/posting_engine_test.go` (ordinary ACC-04 event refusal),
+`internal/close/client_test.go`
+(policy mapping), `internal/store/close_journal_designation_store_test.go`
+(round trip, outbox evidence, DB CHECK, guarded down migration), and this
+service's `internal/handler/close_journal_meta_test.go` plus
+`internal/clients/gl_journal_contract_test.go` (ACC-07/08 request shape and
+SOFT_CLOSE override only in SOFT_CLOSE). Both services' plain and
+integration-tagged suites are green against a fresh disposable Postgres
+container.
 
 ### A5. HardClosed is enforced at GL's API layer, not its data layer, and a posting can race the close
 
@@ -242,6 +290,14 @@ In practice the window is narrow. GL refuses ordinary postings from
 SOFT_CLOSE onwards (A4's override rule), and hard close re-reads unposted
 journals, the posting backlog and the trial balance at close time. But it is
 not zero, and it is not data-layer enforcement.
+
+A4's new `journal_headers.close_journal_designation` column (GL migration
+`000018`) is part of the row a future DB-level guard must consult. A guard that
+knows only the period state would either refuse a legitimate designated close
+journal in CLOSE_REVIEW or be too permissive; a guard that consults the
+designation must still refuse every journal in CLOSED. The migration's down
+migration refuses while any row carries a designation. This is a note for the
+future A5 fix, not a fix: GL still has no DB-level period guard.
 
 This service's side is now data-layer enforced (B4). Closing the GL side
 needs GL to check period state transactionally, for example a period-version

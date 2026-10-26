@@ -134,6 +134,42 @@ func TestPostAccrualRecognitionJournal_SendsACC03FieldsAndEnvelopeOnEveryWrite(t
 
 // A retried posting must present the same Idempotency-Key GL saw the first
 // time, or the envelope's replay protection protects nothing.
+func TestPostAccrualRecognitionJournal_SendsCloseJournalContext(t *testing.T) {
+	c, l := newJournalClients(t)
+	m := meta(domain.GLJournalTypeAccrual)
+	m.CloseJournalDesignation = domain.GLCloseJournalAccrualRecognition
+	m.OverrideSoftClose = true
+	m.SoftCloseOverrideReason = "designated close journal for period 2026-01"
+	if _, err := c.PostAccrualRecognitionJournal(context.Background(), "t1", "le-1", "2026-01", "sch-1:2026-01", "p1",
+		"d", "6100", "2100", 300, m); err != nil {
+		t.Fatal(err)
+	}
+	body := l.recorded()[0].body
+	if got, _ := body["close_journal_designation"].(string); got != domain.GLCloseJournalAccrualRecognition {
+		t.Errorf("close_journal_designation = %q, want %q", got, domain.GLCloseJournalAccrualRecognition)
+	}
+	if got, _ := body["override_soft_close"].(bool); !got {
+		t.Errorf("override_soft_close = %v, want true", got)
+	}
+	if got, _ := body["soft_close_override_reason"].(string); got == "" {
+		t.Error("soft_close_override_reason must be sent when the override is set")
+	}
+}
+
+func TestPostAccrualRecognitionJournal_OmitsCloseContextForOrdinaryJournal(t *testing.T) {
+	c, l := newJournalClients(t)
+	if _, err := c.PostAccrualRecognitionJournal(context.Background(), "t1", "le-1", "2026-01", "sch-1:2026-01", "p1",
+		"d", "6100", "2100", 300, meta(domain.GLJournalTypeAccrual)); err != nil {
+		t.Fatal(err)
+	}
+	body := l.recorded()[0].body
+	for _, field := range []string{"close_journal_designation", "override_soft_close", "soft_close_override_reason"} {
+		if _, ok := body[field]; ok {
+			t.Errorf("ordinary journal body unexpectedly carries %s: %v", field, body[field])
+		}
+	}
+}
+
 func TestPostAccrualRecognitionJournal_RetryPresentsTheSameIdempotencyKey(t *testing.T) {
 	c, l := newJournalClients(t)
 	for i := 0; i < 2; i++ {

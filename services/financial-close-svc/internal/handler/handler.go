@@ -1452,6 +1452,29 @@ func glJournalMeta(fp *domain.FiscalPeriod, fiscalPeriod, currencyCode, journalT
 	return domain.GLJournalMeta{JournalType: journalType, TransactionDate: end, PostingDate: end, CurrencyCode: currencyCode}, nil
 }
 
+// closeJournalMeta is glJournalMeta plus the ACC-14 context for one of the
+// designated close journals. The designation is always carried so GL can
+// persist it as the journal-level fact CLOSE_REVIEW checks. During SOFT_CLOSE
+// this helper also satisfies GL's separate soft-close override mechanism with
+// a non-empty reason; it does not treat the designation as an override.
+// CLOSE_REVIEW needs no override — GL admits the journal on its designation
+// and its own GL_CLOSE_REVIEW_POSTING authorization check. A hard-closed
+// period never reaches this helper: CloseJournalsAllowed has already refused
+// it in the calling handler.
+func closeJournalMeta(fp *domain.FiscalPeriod, fiscalPeriod, currencyCode, journalType, designation string) (domain.GLJournalMeta, error) {
+	meta, err := glJournalMeta(fp, fiscalPeriod, currencyCode, journalType)
+	if err != nil {
+		return meta, err
+	}
+	meta.CloseJournalDesignation = designation
+	if fp != nil && fp.PostingPolicy(time.Now().UTC()) == domain.PostingRestricted {
+		meta.OverrideSoftClose = true
+		meta.SoftCloseOverrideReason = fmt.Sprintf(
+			"designated close journal %s for fiscal period %s", designation, fiscalPeriod)
+	}
+	return meta, nil
+}
+
 // loadGLJournalMeta is glJournalMeta for a path that has not already read
 // the period from the register.
 func (h *Handler) loadGLJournalMeta(ctx context.Context, legalEntityID, fiscalPeriod, currencyCode, journalType string) (domain.GLJournalMeta, error) {
@@ -1827,7 +1850,8 @@ func (h *Handler) RunAccrualRecognition(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusUnprocessableEntity, "period_locked", string(domain.ErrRecognitionPeriodLocked))
 		return
 	}
-	meta, err := glJournalMeta(fp, req.FiscalPeriod, sch.CurrencyCode, domain.GLJournalTypeAccrual)
+	meta, err := closeJournalMeta(fp, req.FiscalPeriod, sch.CurrencyCode, domain.GLJournalTypeAccrual,
+		domain.GLCloseJournalAccrualRecognition)
 	if err != nil {
 		h.writeJournalMetaErr(w, err)
 		return
@@ -2321,7 +2345,8 @@ func (h *Handler) RunPrepaymentRecognition(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusUnprocessableEntity, "period_locked", string(domain.ErrPrepaymentPeriodLocked))
 		return
 	}
-	meta, err := glJournalMeta(fp, req.FiscalPeriod, sch.CurrencyCode, domain.GLJournalTypeAccrual)
+	meta, err := closeJournalMeta(fp, req.FiscalPeriod, sch.CurrencyCode, domain.GLJournalTypeAccrual,
+		domain.GLCloseJournalPrepaymentRecognition)
 	if err != nil {
 		h.writeJournalMetaErr(w, err)
 		return
@@ -2537,7 +2562,8 @@ func (h *Handler) TerminatePrepayment(w http.ResponseWriter, r *http.Request) {
 				writeError(w, http.StatusUnprocessableEntity, "period_locked", string(domain.ErrPrepaymentPeriodLocked))
 				return
 			}
-			meta, err := glJournalMeta(fp, req.FiscalPeriod, sch.CurrencyCode, domain.GLJournalTypeAccrual)
+			meta, err := closeJournalMeta(fp, req.FiscalPeriod, sch.CurrencyCode, domain.GLJournalTypeAccrual,
+				domain.GLCloseJournalPrepaymentTermination)
 			if err != nil {
 				h.writeJournalMetaErr(w, err)
 				return
