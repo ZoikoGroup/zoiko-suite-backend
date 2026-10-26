@@ -11,7 +11,7 @@ Statuses: TODO · IN PROGRESS · DONE · BLOCKED. DONE needs a filled evidence b
 | P0-2 | Register JURISDICTION_RULE_VALIDATE | DONE | b82fd224 | access-control 000023 + template + store test |
 | P0-3 | Fix stale resolve.go comment | DONE | 47986f06 | comment now matches tax.go |
 | API-1 | Shared apicontract package | DONE | acce5b86 | 30 unit + 7 pgx integration pass, 0 fail/skip; vet clean |
-| API-2 | Problem details + request id + cache, all our services | IN PROGRESS | e1830853, f361be5e, 8c8bb0a4, d33fa469, c338bbfc, 75e53db2, 4ed4ad08, 50f8f5fe | tenant-entity-registry-svc + access-control-svc + identity-context-svc + governance-decision-log-svc + jurisdiction-rules-svc + obligations-svc + configuration-feature-flag-svc done; 11 services remain |
+| API-2 | Problem details + request id + cache, all our services | IN PROGRESS | e1830853, f361be5e, 8c8bb0a4, d33fa469, c338bbfc, 75e53db2, 4ed4ad08, 50f8f5fe, c2548257 | tenant-entity-registry-svc + access-control-svc + identity-context-svc + governance-decision-log-svc + jurisdiction-rules-svc + obligations-svc + configuration-feature-flag-svc + secret-vault-integration-svc done; 10 services remain |
 | API-3 | ETag / If-Match on aggregate mutations | TODO | | |
 | API-4 | Cursor pagination on lists | TODO | | |
 | API-5 | Async operations | TODO | | |
@@ -288,4 +288,20 @@ Tests:
 Negative-path tests: handler_direct_write_refusal_test.go errorCode reads code field instead of error; assertions check code=key_not_registered/type_mismatch/value_constraint_failed/scope_not_allowed/material_key_requires_change/flag_key_retired/targeting_not_permitted/store_unavailable
 Spec rows closed: ZS-API-001 §6, §10, §12, §15, §18, §26, §29 adoption for configuration-feature-flag-svc (complete, incl. openapi gate)
 Blocked / limits: none for configuration-feature-flag-svc. 11 API-2 services remain.
+
+### API-2 — Problem details + request id + cache (secret-vault-integration-svc)
+Status: DONE
+Commits: c2548257 feat(secret-vault-integration-svc): complete API-2 adoption with apicontract middleware
+Migrations: none
+Permissions registered: none
+Routes: no new routes; all existing error responses now return application/problem+json via apicontract.WriteProblem
+Wiring: cmd/server/main.go mounts apicontract.RequestID (replaces idenv.RequestID + middleware.RequestID) and apicontract.DefaultCache; handler.go writeJSON error path detects error responses (status >= 400 with "error" key in body map) and renders them via apicontract.WriteProblem; removed legacy idenv.WriteLegacyError path; added r *http.Request to refuseForeignTenant, refuseForeignRow, writeStoreErr, parseNonNegativeInt, parseEffectiveAt, parseProfileRequest, writeCertError, writeRegistryError, writeCompileError, writeAuthzError, writeOpsError, writeResolveError, writeRolloutError, writeSubmissionError, writeParametersError, writeSubmissionError, writeParametersError so request ID and correlation flow through apicontract.Problem
+openapi.yaml: Error schema replaced with Problem schema (type/title/status/code/detail/instance/request_id/correlation_id/retryable/errors[]/current_version); all error responses retargeted to application/problem+json
+Tests:
+- `go build ./...` → clean (with GONOSUMCHECK/GONOSUMDB=*, GOFLAGS=-mod=mod, GOPROXY=off for offline); `go vet ./...` → clean
+- `go test -count=1 ./...` → all packages ok (authz, authz, events, handler, inboundmtls, mtls, rotation, store, vault; 0 fail)
+- `go test -count=1 ./internal/handler` → all pass, including TestOpenAPIDocumentIsValid (kin-openapi LoadFromData + Validate pass on openapi.yaml)
+Negative-path tests: regression_test.go and handler_test.go assertions updated to check code field instead of legacy error field; TestPathParams_MalformedUUID_Are400NotServiceUnavailable checks code=invalid_path_parameter and field pointer
+Spec rows closed: ZS-API-001 §6, §10, §12, §15, §18, §26, §29 adoption for secret-vault-integration-svc (complete, incl. openapi gate)
+Blocked / limits: none for secret-vault-integration-svc. 10 services remain.
 
