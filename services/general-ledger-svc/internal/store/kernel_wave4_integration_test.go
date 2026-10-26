@@ -333,14 +333,14 @@ func TestLegacySubledgerPostingsAreCountedWhenAskedFor(t *testing.T) {
 func TestEverySubledgerPackIsListedAndGoverned(t *testing.T) {
 	e := newKEnv(t)
 	st, b := e.call("GET", "/v1/posting-rule-packs", e.tenant, "builder", nil)
-	if st != 200 || len(b["packs"].([]any)) != 9 {
+	if st != 200 || len(b["packs"].([]any)) != 10 {
 		t.Fatalf("%d %v", st, b)
 	}
 	seen := map[string]bool{}
 	for _, p := range b["packs"].([]any) {
 		seen[p.(map[string]any)["name"].(string)] = true
 	}
-	for _, n := range []string{"ar-standard", "ap-standard", "bank-standard", "payroll-standard", "assets-standard", "inventory-standard", "tax-standard", "schedules-standard", "payroll-results"} {
+	for _, n := range []string{"ar-standard", "ap-standard", "bank-standard", "payroll-standard", "assets-standard", "inventory-standard", "tax-standard", "schedules-standard", "payroll-results", "inventory-valuation"} {
 		if !seen[n] {
 			t.Fatalf("missing pack %s", n)
 		}

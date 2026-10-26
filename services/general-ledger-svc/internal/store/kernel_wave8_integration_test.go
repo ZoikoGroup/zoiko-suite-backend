@@ -107,3 +107,62 @@ func TestGranularPayrollResultRefusesWhatDoesNotAddUpAndRoundsFourDecimals(t *te
 		t.Fatalf("only the balanced result was posted: %d", n)
 	}
 }
+
+// ── inventory valuation pack ────────────────────────────────────────────────────────────────────────────────────────
+
+func (w *w2) inventoryValuationSetup(t *testing.T) {
+	t.Helper()
+	for _, a := range [][2]string{{"5200", "EXPENSE"}, {"5300", "EXPENSE"}, {"2080", "LIABILITY"}} {
+		if err := w.exec(`INSERT INTO chart_of_accounts (account_id, tenant_id, account_code, account_name, account_type, created_by_principal_id) VALUES ($1,$2,$3,$4,$5,'seed')`, uuid.NewString(), w.tenant, a[0], a[0]+" account", a[1]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for k, c := range map[string]string{"GRNI_EXPENSE_RECLASS": "5200", "INVENTORY_WRITE_DOWN_EXPENSE": "5300", "LANDED_COST_OFFSET": "2080"} {
+		if err := w.exec(`INSERT INTO account_mappings (account_mapping_id, tenant_id, mapping_key, account_code, effective_from, created_by_principal_id) VALUES ($1,$2,$3,$4,'2026-01-01','seed')`, uuid.NewString(), w.tenant, k, c); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st, b := w.call("POST", "/v1/posting-rule-packs/inventory-valuation/instantiate", w.tenant, "builder", map[string]any{"version": "1.0.0", "effective_from": "2026-01-01", "book_type": "PRIMARY_STATUTORY", "accounting_framework_id": "IFRS"})
+	if st != 201 {
+		t.Fatalf("instantiate: %d %v", st, b)
+	}
+	for _, rs := range b["rule_sets"].([]any) {
+		id := rs.(map[string]any)["posting_rule_set_id"].(string)
+		for _, step := range [][2]string{{"test", "builder"}, {"approve", "approver"}, {"activate", "releaser"}} {
+			if st, b := w.call("POST", "/v1/posting-rule-sets/"+id+"/"+step[0], w.tenant, step[1], map[string]any{"book_id": w.book}); st != 200 {
+				t.Fatalf("%s: %d %v", step[0], st, b)
+			}
+		}
+	}
+}
+
+func TestInventoryValuationEventsPostByLocationAndRefuseMissingEvidence(t *testing.T) {
+	w := w4Setup(t)
+	w.inventoryValuationSetup(t)
+	wh1 := map[string]string{"location": "WH-1", "item_class": "FINISHED"}
+	wh2 := map[string]string{"location": "WH-2", "item_class": "FINISHED"}
+
+	w.mustPostD(t, "INVENTORY.COGS_RECOGNIZED", "", wh1, map[string]any{"amount": "1800.00", "run_ref": "VR-1", "valuation_policy": "fifo"})
+	w.mustPostD(t, "INVENTORY.COGS_RECOGNIZED", "", wh2, map[string]any{"amount": "700.00", "run_ref": "VR-1", "valuation_policy": "fifo"})
+	w.mustPostD(t, "INVENTORY.GRNI_EXPENSE_RECLASSIFIED", "", wh1, map[string]any{"amount": "950.00", "run_ref": "VR-1", "receipt_basis": "ap-linked"})
+	w.mustPostD(t, "INVENTORY.LANDED_COST_ALLOCATED", "", wh1, map[string]any{"amount": "100.00", "inventory_share": "60.00", "cogs_share": "40.00", "allocation_ref": "LC-1", "valuation_evidence_ref": "freight-7"})
+	w.mustPostD(t, "INVENTORY.NRV_WRITE_DOWN", "", wh2, map[string]any{"amount": "400.00", "write_down_ref": "WD-1", "valuation_evidence_ref": "nrv-3"})
+
+	// cost of sales 1800 + 700 + 40 of landed cost; stock: -2500 of issues, +950 reclassified in, +60 landed cost, -400 written down
+	for acct, want := range map[string]string{"5000": "2540.00", "5200": "-950.00", "2080": "-100.00", "5300": "400.00", "1400": "-1890.00"} {
+		if got := w.net(t, acct); got != want {
+			t.Fatalf("account %s: %s, want %s", acct, got, want)
+		}
+	}
+	// the inventory control account reads by location: WH-1 and WH-2 each carry their own movement
+	if got := w.scalar(t, `SELECT COALESCE(sum(debit_amount - credit_amount), 0)::text FROM ledger_entries WHERE tenant_id = $1::uuid AND account_code = '1400' AND dimensions->>'location' = 'WH-2'`, w.tenant); got != "-1100.00" {
+		t.Fatalf("WH-2: %s", got)
+	}
+	// shares that do not add up, and a write-down without its evidence, post nothing
+	if st, b := w.postD(t, "INVENTORY.LANDED_COST_ALLOCATED", "", wh1, map[string]any{"amount": "100.00", "inventory_share": "60.00", "cogs_share": "30.00", "allocation_ref": "LC-2", "valuation_evidence_ref": "x"}); st != 422 || b["family"] != "AK-BAL" {
+		t.Fatalf("%d %v", st, b)
+	}
+	if st, b := w.postD(t, "INVENTORY.NRV_WRITE_DOWN", "", wh1, map[string]any{"amount": "400.00", "write_down_ref": "WD-2"}); st != 422 || b["family"] != "AK-RULE" {
+		t.Fatalf("%d %v", st, b)
+	}
+}
