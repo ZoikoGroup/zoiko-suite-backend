@@ -31,6 +31,7 @@ import (
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 	idenv "zoiko.io/identity-envelope"
+	apicontract "zoiko.io/identity-envelope/apicontract"
 
 	"zoiko.io/governance-decision-log-svc/internal/authz"
 	"zoiko.io/governance-decision-log-svc/internal/config"
@@ -184,8 +185,8 @@ func main() {
 
 	// ── 6. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()
-	r.Use(idenv.RequestID)
-	r.Use(middleware.RequestID)
+	r.Use(apicontract.RequestID)
+	r.Use(apicontract.DefaultCache)
 	r.Use(middleware.RealIP)
 	r.Use(middleware.Recoverer)
 	r.Use(otelchi.Middleware("governance-decision-log-svc", otelchi.WithChiRoutes(r)))
