@@ -13,6 +13,9 @@ ACC-01 surface completed in the command-per-commit pass — `AmendAccountVersion
 `GetAccountAsOf` (on top of the existing `CreateAccount`, `GetAccount`,
 `ListAccounts`, `DeactivateAccount`). Later ACC-0x surfaces will extend it.
 The 2026-10-26 ACC-14 close-review extension is recorded in A14 and B13.
+The 2026-10-26 ACC-05 `QueryLedger` date-window extension (for
+reconciliation-intelligence-svc's A2a candidate search) is recorded in A15 and
+B14.
 
 Overall: all nine named commands/queries now exist with real guards (cycles,
 optimistic version checks, append-only version history, half-open effective
@@ -147,6 +150,20 @@ The deliberate design decisions a reviewer may want to reverse are B1–B12.
   permissive. Migration 000018's down migration refuses while any row still
   carries a designation, so the evidence cannot be erased while a journal
   depends on it.
+- **A15. `QueryLedger` has no cursor and returns float amounts.** ACC-05's
+  read contract is a bounded list.
+  - *No cursor.* It is capped at 1000 entries, and a larger `limit` is
+    silently replaced by the default of 200. A reader cannot tell a full
+    page from a truncated one. reconciliation-intelligence-svc therefore
+    asks for exactly 1000 and refuses a full page (422) rather than trust
+    it.
+  - *Float amounts.* `LedgerEntry.debit_amount`/`credit_amount` are float64
+    on the wire. The columns are exact NUMERIC. A reader that needs
+    exactness parses the JSON number text directly, never through float64.
+    That is exact for any amount below about 2^53 minor units; this read
+    does not offer the exact decimal string `LedgerBalance` already does.
+  - *Needed:* a keyset cursor (`after_entry_seq`) and exact decimal strings
+    on `LedgerEntry`.
 
 ## B. Interpretations and additions (decisions a reviewer may want to reverse)
 
@@ -314,3 +331,38 @@ The deliberate design decisions a reviewer may want to reverse are B1–B12.
   financial-close-svc's `internal/handler/close_journal_meta_test.go` plus
   `internal/clients/gl_journal_contract_test.go` (request shape for ACC-07/08
   recognition and termination, SOFT_CLOSE override only in SOFT_CLOSE).
+- **B14. `QueryLedger` gains a transaction-date window and a journal-status
+  filter (2026-10-26).** Added for reconciliation-intelligence-svc's A2a: it
+  proposes the book side of an UNMATCHED bank statement line from one cash
+  account's entries near the statement date. ACC-05 names `QueryLedger` as
+  its read contract, so this extends that route in its existing `?field=`
+  style rather than adding a search route.
+  - *Parameters:* `transaction_date_from` / `transaction_date_to`
+    (YYYY-MM-DD, inclusive, either end optional) and `journal_status`. They
+    are accepted on `/v1/ledger/entries` and on `/v1/ledger/as-of`, which
+    builds the same filter.
+  - *Validation (400):* a malformed date, `from` after `to`, or a status
+    other than FINALIZED or REVERSED.
+  - *Why a status filter:* `ledger_entries` is append-only, so a REVERSED
+    journal's entries stay listed. bank-reconciliation-svc refuses to match
+    a journal that is not FINALIZED, so a reader looking for live postings
+    asks for `journal_status=FINALIZED`. The filter is one EXISTS probe on
+    `journal_headers`' primary key per candidate row, not a second query.
+  - *transaction_date, not posting_date:* the business date of the cash
+    movement is what a bank statement date reflects. posting_date can be
+    the period end of an accrual.
+  - *Index:* migration 000019 adds `idx_ledger_entries_account_txn_date`
+    `(tenant_id, legal_entity_id, account_code, transaction_date)`. The
+    existing scope index puts `book_id` before `account_code` and carries no
+    date.
+  - *Why the down migration has no refusal guard:* the up adds only an
+    index, which holds no data. Dropping it loses nothing a re-run cannot
+    rebuild; the read stays correct, only slower.
+  - *Verification:*
+    - handler tests in `internal/handler/acc05_ledger_test.go`: the filter
+      reaches the store from both routes, and malformed input gets 400;
+    - `internal/store/ledger_window_pg_smoke_test.go` on real Postgres: the
+      window is inclusive at both ends, and FINALIZED drops a reversed
+      journal and keeps its reversal;
+    - 000001–000019 applied from empty with `psql --single-transaction -v
+      ON_ERROR_STOP=1`, and 000019 taken down and up again by hand.

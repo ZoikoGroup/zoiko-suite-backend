@@ -140,9 +140,11 @@ func (s *PgStore) CreateJob(ctx context.Context, tenantID string, job *domain.Re
 			id, tenant_id, legal_entity_id, job_id, source_record_a, source_record_b, amount_a, amount_b,
 			discrepancy_amount, discrepancy_type, confidence_score, heuristic_rule, tolerance_version,
 			recommendation, suggestion_status, resolution_notes, created_at, updated_at,
-			bank_reconciliation_run_id, statement_line_id, counterpart_statement_line_id
+			bank_reconciliation_run_id, statement_line_id, counterpart_statement_line_id,
+			counterpart_journal_id, candidate_search_outcome, date_tolerance_version
 		) VALUES ($1, $2, $3, $4, $5, $6, $7::numeric, $8::numeric, $9::numeric, $10, $11, $12, $13, $14, $15, $16, $17, $18,
-			NULLIF($19, '')::uuid, NULLIF($20, '')::uuid, NULLIF($21, '')::uuid)`
+			NULLIF($19, '')::uuid, NULLIF($20, '')::uuid, NULLIF($21, '')::uuid,
+			NULLIF($22, '')::uuid, NULLIF($23, ''), NULLIF($24, 0))`
 
 	for i := range items {
 		item := &items[i]
@@ -160,6 +162,7 @@ func (s *PgStore) CreateJob(ctx context.Context, tenantID string, job *domain.Re
 			nullableHeuristicRule(item.HeuristicRule), nullableToleranceVersion(item.ToleranceVersion), string(item.Recommendation),
 			string(item.SuggestionStatus), item.ResolutionNotes, item.CreatedAt, item.UpdatedAt,
 			item.BankReconciliationRunID, item.StatementLineID, item.CounterpartStatementLineID,
+			item.CounterpartJournalID, string(item.CandidateSearchOutcome), item.DateToleranceVersion,
 		)
 		if err != nil {
 			return fmt.Errorf("insert reconciliation_unmatched_item failed: %w", err)
@@ -252,7 +255,8 @@ const itemColumns = `id, tenant_id, legal_entity_id, job_id, source_record_a, so
 	COALESCE(resolution_notes, ''), created_at, updated_at,
 	COALESCE(bank_reconciliation_run_id::text, ''), COALESCE(statement_line_id::text, ''),
 	COALESCE(counterpart_statement_line_id::text, ''),
-	COALESCE(authoritative_ref_kind, ''), COALESCE(authoritative_ref_id::text, '')`
+	COALESCE(authoritative_ref_kind, ''), COALESCE(authoritative_ref_id::text, ''),
+	COALESCE(counterpart_journal_id::text, ''), COALESCE(candidate_search_outcome, ''), COALESCE(date_tolerance_version, 0)`
 
 func scanJob(row pgx.Row, j *domain.ReconciliationJob) error {
 	return row.Scan(
@@ -271,6 +275,7 @@ func scanItem(row pgx.Row, item *domain.ReconciliationSuggestion) error {
 		&item.Recommendation, &item.SuggestionStatus, &item.ResolutionNotes, &item.CreatedAt, &item.UpdatedAt,
 		&item.BankReconciliationRunID, &item.StatementLineID, &item.CounterpartStatementLineID,
 		&refKind, &refID,
+		&item.CounterpartJournalID, &item.CandidateSearchOutcome, &item.DateToleranceVersion,
 	); err != nil {
 		return err
 	}
@@ -394,6 +399,12 @@ func (s *PgStore) ApplyResolution(ctx context.Context, tenantID, jobID, itemID s
 			"bank_reconciliation_run_id":    item.BankReconciliationRunID,
 			"statement_line_id":             item.StatementLineID,
 			"counterpart_statement_line_id": item.CounterpartStatementLineID,
+			// The general-ledger-svc journal an AUTO_MATCH / DATE_SKEW
+			// proposal named (A2a), and what the candidate search found; ""
+			// when not applicable. A decision here matches nothing: the
+			// match is made in bank-reconciliation-svc.
+			"counterpart_journal_id":   item.CounterpartJournalID,
+			"candidate_search_outcome": string(item.CandidateSearchOutcome),
 			// suggestion_status is canonical; resolution_status is the
 			// pre-rename alias kept for one release (A9/B5). Both carry the
 			// same value, so they cannot disagree.

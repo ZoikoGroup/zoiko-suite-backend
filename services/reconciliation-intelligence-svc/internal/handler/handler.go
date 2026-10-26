@@ -1,9 +1,12 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -14,6 +17,7 @@ import (
 	svcenvelope "zoiko.io/reconciliation-intelligence-svc/internal/envelope"
 	"zoiko.io/reconciliation-intelligence-svc/internal/financialcontrol"
 	"zoiko.io/reconciliation-intelligence-svc/internal/health"
+	"zoiko.io/reconciliation-intelligence-svc/internal/ledger"
 	customMiddleware "zoiko.io/reconciliation-intelligence-svc/internal/middleware"
 	"zoiko.io/reconciliation-intelligence-svc/internal/store"
 )
@@ -34,16 +38,22 @@ type Handler struct {
 	authz            *authz.Client
 	financialControl *financialcontrol.Client
 	bankRec          *bankrec.Client
-	logger           *zap.Logger
+	ledger           *ledger.Client
+	// searchHorizonDays bounds the candidate search's ledger read; see
+	// config.CandidateSearchHorizonDays.
+	searchHorizonDays int
+	logger            *zap.Logger
 }
 
-func NewHandler(s store.Store, a *authz.Client, fc *financialcontrol.Client, br *bankrec.Client, l *zap.Logger) *Handler {
+func NewHandler(s store.Store, a *authz.Client, fc *financialcontrol.Client, br *bankrec.Client, gl *ledger.Client, searchHorizonDays int, l *zap.Logger) *Handler {
 	return &Handler{
-		store:            s,
-		authz:            a,
-		financialControl: fc,
-		bankRec:          br,
-		logger:           l,
+		store:             s,
+		authz:             a,
+		financialControl:  fc,
+		bankRec:           br,
+		ledger:            gl,
+		searchHorizonDays: searchHorizonDays,
+		logger:            l,
 	}
 }
 
@@ -150,6 +160,15 @@ func (h *Handler) AnalyzeReconciliation(w http.ResponseWriter, r *http.Request) 
 		h.writeToleranceErr(w, err, domain.MetricMissingReferenceTolerance)
 		return
 	}
+	// The candidate search's date tolerance is governed the same way (A2a):
+	// AUTO_MATCH versus DATE_SKEW is decided by an approved, versioned
+	// policy, never a constant in this service.
+	dateTolerance, err := h.financialControl.GetActiveDateTolerance(
+		r.Context(), tenantID, principalID, req.LegalEntityID, domain.MetricCandidateDateTolerance)
+	if err != nil {
+		h.writeToleranceErr(w, err, domain.MetricCandidateDateTolerance)
+		return
+	}
 
 	lines, err := h.bankRec.ListUnmatchedLines(r.Context(), scope, run)
 	if err != nil {
@@ -157,7 +176,13 @@ func (h *Handler) AnalyzeReconciliation(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	items, err := domain.AnalyzeUnmatchedStatementLines(lines, run.RunID, tenantID, missingReferenceTolerance)
+	search, err := h.readCandidates(r.Context(), ledger.Scope(scope), lines, dateTolerance)
+	if err != nil {
+		h.writeLedgerErr(w, err)
+		return
+	}
+
+	items, err := domain.AnalyzeUnmatchedStatementLines(lines, run.RunID, tenantID, missingReferenceTolerance, search)
 	if err != nil {
 		h.logger.Error("analysis of bank reconciliation lines failed", zap.String("run_id", run.RunID), zap.Error(err))
 		h.respondError(w, http.StatusBadGateway, "bank-reconciliation-svc returned lines that could not be analyzed")
@@ -389,6 +414,61 @@ func (h *Handler) writeBankRecErr(w http.ResponseWriter, err error) {
 	}
 }
 
+// readCandidates reads, for each distinct cash account the run's lines post
+// to, that account's FINALIZED ledger entries in a window around the
+// statement date — one read per account, not per line. Every line of a run
+// shares one bank account and one statement date, so this is normally a
+// single read. The window is the search horizon, never narrower than the
+// governed date tolerance.
+func (h *Handler) readCandidates(ctx context.Context, scope ledger.Scope, lines []domain.BankStatementLine, tol *domain.DateTolerance) (*domain.CandidateSearch, error) {
+	horizon := h.searchHorizonDays
+	if tol.Days > horizon {
+		horizon = tol.Days
+	}
+	search := &domain.CandidateSearch{Tolerance: *tol, HorizonDays: horizon, EntriesByAccount: map[string][]domain.LedgerEntry{}}
+
+	type window struct{ account, date string }
+	seen := map[window]bool{}
+	for _, l := range lines {
+		if l.GLCashAccountCode == "" {
+			continue
+		}
+		wnd := window{l.GLCashAccountCode, l.StatementDate}
+		if seen[wnd] {
+			continue
+		}
+		seen[wnd] = true
+		date, err := time.Parse("2006-01-02", l.StatementDate)
+		if err != nil {
+			return nil, fmt.Errorf("%w: statement line %s date %q", ledger.ErrInconsistent, l.StatementLineID, l.StatementDate)
+		}
+		from := date.AddDate(0, 0, -horizon).Format("2006-01-02")
+		to := date.AddDate(0, 0, horizon).Format("2006-01-02")
+		entries, err := h.ledger.ListCashAccountEntries(ctx, scope, l.GLCashAccountCode, from, to)
+		if err != nil {
+			return nil, err
+		}
+		search.EntriesByAccount[l.GLCashAccountCode] = append(search.EntriesByAccount[l.GLCashAccountCode], entries...)
+	}
+	return search, nil
+}
+
+// writeLedgerErr responds to a failed candidate-search read. Nothing is
+// analyzed without it: a missing read would turn "could not look" into
+// "no candidate", which is a false statement.
+func (h *Handler) writeLedgerErr(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, ledger.ErrWindowTooLarge):
+		h.respondError(w, http.StatusUnprocessableEntity, "the cash account has too many ledger entries in the candidate search window to read completely")
+	case errors.Is(err, ledger.ErrServiceUnavailable):
+		h.logger.Error("general-ledger-svc candidate read failed", zap.Error(err))
+		h.respondError(w, http.StatusServiceUnavailable, "general-ledger-svc unavailable")
+	default:
+		h.logger.Error("general-ledger-svc candidate read was refused or inconsistent", zap.Error(err))
+		h.respondError(w, http.StatusBadGateway, "general-ledger-svc returned ledger entries that could not be used")
+	}
+}
+
 // writeToleranceErr responds to a failure resolving a governed tolerance
 // policy (ZS-SVC-Z-001 INV-09). ErrToleranceNotConfigured is a 424
 // (Failed Dependency) — the request itself was fine, but the legal
@@ -399,6 +479,10 @@ func (h *Handler) writeBankRecErr(w http.ResponseWriter, err error) {
 func (h *Handler) writeToleranceErr(w http.ResponseWriter, err error, metric string) {
 	if errors.Is(err, financialcontrol.ErrToleranceNotConfigured) {
 		h.respondError(w, http.StatusFailedDependency, "no governed tolerance policy configured for metric "+metric)
+		return
+	}
+	if errors.Is(err, financialcontrol.ErrUnsupportedDateBasis) {
+		h.respondError(w, http.StatusFailedDependency, "governed tolerance policy for metric "+metric+" uses date_basis BUSINESS, which has no business-day calendar to count against; configure CALENDAR")
 		return
 	}
 	h.logger.Error("financial-control-svc tolerance lookup failed", zap.String("metric", metric), zap.Error(err))

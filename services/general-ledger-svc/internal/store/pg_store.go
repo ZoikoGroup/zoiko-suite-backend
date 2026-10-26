@@ -822,6 +822,21 @@ func (s *PgStore) QueryLedger(ctx context.Context, tenantID string, filter domai
 		args = append(args, *filter.MaxEntrySeq)
 		query += fmt.Sprintf(" AND entry_seq <= $%d", len(args))
 	}
+	if !filter.TransactionDateFrom.IsZero() {
+		args = append(args, filter.TransactionDateFrom.Time)
+		query += fmt.Sprintf(" AND transaction_date >= $%d", len(args))
+	}
+	if !filter.TransactionDateTo.IsZero() {
+		args = append(args, filter.TransactionDateTo.Time)
+		query += fmt.Sprintf(" AND transaction_date <= $%d", len(args))
+	}
+	if filter.JournalStatus != "" {
+		// The journal's current status, one indexed probe per candidate row
+		// (journal_headers' primary key), not a second query per entry.
+		args = append(args, string(filter.JournalStatus))
+		query += fmt.Sprintf(` AND EXISTS (SELECT 1 FROM journal_headers jh
+			WHERE jh.journal_id = ledger_entries.journal_id AND jh.tenant_id = ledger_entries.tenant_id AND jh.status = $%d)`, len(args))
+	}
 	args = append(args, limit)
 	query += fmt.Sprintf(" ORDER BY entry_seq ASC LIMIT $%d", len(args))
 

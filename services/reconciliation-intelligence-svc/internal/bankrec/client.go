@@ -103,6 +103,10 @@ type statementLine struct {
 	CurrencyCode    string      `json:"currency_code"`
 	BankReference   string      `json:"bank_reference"`
 	Status          string      `json:"status"`
+	// GLCashAccountCode is bank-reconciliation-svc's general-ledger cash
+	// account for the line's bank account; null on lines it ingested before
+	// recording one.
+	GLCashAccountCode *string `json:"gl_cash_account_code"`
 }
 
 type Client struct {
@@ -187,7 +191,7 @@ func (c *Client) ListUnmatchedLines(ctx context.Context, scope Scope, run *Run) 
 		if err != nil {
 			return nil, fmt.Errorf("%w: line %s amount: %v", ErrInconsistent, l.StatementLineID, err)
 		}
-		out = append(out, domain.BankStatementLine{
+		line := domain.BankStatementLine{
 			StatementLineID: l.StatementLineID,
 			LegalEntityID:   l.LegalEntityID,
 			BankAccountID:   l.BankAccountID,
@@ -195,7 +199,11 @@ func (c *Client) ListUnmatchedLines(ctx context.Context, scope Scope, run *Run) 
 			Amount:          domain.CanonicalAmount(amount),
 			CurrencyCode:    l.CurrencyCode,
 			BankReference:   l.BankReference,
-		})
+		}
+		if l.GLCashAccountCode != nil {
+			line.GLCashAccountCode = *l.GLCashAccountCode
+		}
+		out = append(out, line)
 	}
 	return out, nil
 }

@@ -21,6 +21,10 @@ import (
 // on every suggestion (A8).
 var testMissingReferenceTolerance = &GovernedTolerance{Amount: big.NewRat(10, 1), Version: 7}
 
+// testNoCandidates is a candidate search that reads no ledger entries: the
+// lines in these tests are about the missing-reference and duplicate rules.
+var testNoCandidates = &CandidateSearch{Tolerance: DateTolerance{Days: 2, Version: 3}, HorizonDays: 31}
+
 const testRunID = "6f1c2a8e-3b7d-4c55-9a10-2d4e8f7b9c01"
 
 func line(id, amount string) BankStatementLine {
@@ -32,7 +36,7 @@ func line(id, amount string) BankStatementLine {
 
 func analyze(t *testing.T, lines ...BankStatementLine) []ReconciliationSuggestion {
 	t.Helper()
-	items, err := AnalyzeUnmatchedStatementLines(lines, testRunID, "tenant-1", testMissingReferenceTolerance)
+	items, err := AnalyzeUnmatchedStatementLines(lines, testRunID, "tenant-1", testMissingReferenceTolerance, testNoCandidates)
 	if err != nil {
 		t.Fatalf("AnalyzeUnmatchedStatementLines: %v", err)
 	}
@@ -143,20 +147,20 @@ func TestAnalyze_LargeAmountIsExact(t *testing.T) {
 
 func TestAnalyze_UnstorableAmountRefused(t *testing.T) {
 	for _, amt := range []string{"", "abc", "1.00001", "100000000000000"} {
-		if _, err := AnalyzeUnmatchedStatementLines([]BankStatementLine{line("x", amt)}, testRunID, "t", testMissingReferenceTolerance); err == nil {
+		if _, err := AnalyzeUnmatchedStatementLines([]BankStatementLine{line("x", amt)}, testRunID, "t", testMissingReferenceTolerance, testNoCandidates); err == nil {
 			t.Errorf("%q: expected an error", amt)
 		}
 	}
 }
 
 func TestAnalyze_NilToleranceRefused(t *testing.T) {
-	if _, err := AnalyzeUnmatchedStatementLines([]BankStatementLine{line("x", "1")}, testRunID, "t", nil); err == nil {
+	if _, err := AnalyzeUnmatchedStatementLines([]BankStatementLine{line("x", "1")}, testRunID, "t", nil, testNoCandidates); err == nil {
 		t.Fatal("expected an error for a missing governed tolerance")
 	}
 	// A value with no policy version is not provenance: refuse it rather
 	// than store an item whose score basis cannot name the policy used.
 	if _, err := AnalyzeUnmatchedStatementLines([]BankStatementLine{line("x", "1")}, testRunID, "t",
-		&GovernedTolerance{Amount: big.NewRat(10, 1)}); err == nil {
+		&GovernedTolerance{Amount: big.NewRat(10, 1)}, testNoCandidates); err == nil {
 		t.Fatal("expected an error for a governed tolerance with no version")
 	}
 }

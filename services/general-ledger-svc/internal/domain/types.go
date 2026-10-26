@@ -821,6 +821,17 @@ type QueryLedgerFilter struct {
 	FiscalPeriod  string
 	JournalID     string
 	MaxEntrySeq   *int64 // set by QueryLedgerAsOf to reconstruct a point-in-time view
+
+	// TransactionDateFrom/To bound entries by transaction_date, inclusive at
+	// both ends; a zero Date leaves that end open. A bank reconciliation
+	// looks for the book side of a statement line inside a date window on
+	// one cash account, and a fiscal_period is too coarse for that.
+	TransactionDateFrom Date
+	TransactionDateTo   Date
+	// JournalStatus keeps only entries whose journal is currently in this
+	// status. ledger_entries is append-only, so a REVERSED journal's entries
+	// stay listed; a reader that needs live postings asks for FINALIZED.
+	JournalStatus JournalStatus
 }
 
 // QueryAccountBalanceRequest is QueryAccountBalance's input — reads the
@@ -1149,6 +1160,7 @@ var (
 	// guard against "Cross-book query leakage": legal_entity_id must
 	// always be supplied and is never inferred or defaulted.
 	ErrLedgerScopeRequired = errorString("legal_entity_id is required to query the ledger")
+	ErrLedgerDateWindow    = errorString("transaction_date_from must not be after transaction_date_to")
 )
 
 // ValidCurrencyCode reports whether s has the shape of an ISO 4217 alphabetic

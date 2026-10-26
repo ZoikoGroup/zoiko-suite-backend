@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -3202,6 +3203,9 @@ func (h *Handler) QueryLedger(w http.ResponseWriter, r *http.Request) {
 		FiscalPeriod:  q.Get("fiscal_period"),
 		JournalID:     q.Get("journal_id"),
 	}
+	if !parseLedgerWindow(w, q, &filter) {
+		return
+	}
 	entries, err := h.store.QueryLedger(r.Context(), tenantID, filter, limit)
 	if err != nil {
 		h.log.Error("QueryLedger: store unavailable", zap.Error(err))
@@ -3212,6 +3216,43 @@ func (h *Handler) QueryLedger(w http.ResponseWriter, r *http.Request) {
 		entries = []domain.LedgerEntry{}
 	}
 	writeJSON(w, http.StatusOK, entries)
+}
+
+// parseLedgerWindow reads QueryLedger's optional transaction-date window and
+// journal-status narrowing into filter, answering 400 itself on a malformed
+// value. Dates are YYYY-MM-DD and inclusive. journal_status is FINALIZED or
+// REVERSED: those are the only statuses a journal with ledger entries can be
+// in, so any other value could only ever return nothing.
+func parseLedgerWindow(w http.ResponseWriter, q url.Values, filter *domain.QueryLedgerFilter) bool {
+	for _, f := range []struct {
+		param string
+		into  *domain.Date
+	}{{"transaction_date_from", &filter.TransactionDateFrom}, {"transaction_date_to", &filter.TransactionDateTo}} {
+		raw := q.Get(f.param)
+		if raw == "" {
+			continue
+		}
+		d, err := domain.ParseDate(raw)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_field", f.param+": "+err.Error())
+			return false
+		}
+		*f.into = d
+	}
+	if !filter.TransactionDateFrom.IsZero() && !filter.TransactionDateTo.IsZero() &&
+		filter.TransactionDateFrom.After(filter.TransactionDateTo.Time) {
+		writeError(w, http.StatusBadRequest, "invalid_field", domain.ErrLedgerDateWindow.Error())
+		return false
+	}
+	switch status := domain.JournalStatus(q.Get("journal_status")); status {
+	case "":
+	case domain.JournalStatusFinalized, domain.JournalStatusReversed:
+		filter.JournalStatus = status
+	default:
+		writeError(w, http.StatusBadRequest, "invalid_field", "journal_status must be FINALIZED or REVERSED")
+		return false
+	}
+	return true
 }
 
 // QueryLedgerAsOf is QueryLedger scoped to entries whose entry_seq does not
@@ -3257,6 +3298,9 @@ func (h *Handler) QueryLedgerAsOf(w http.ResponseWriter, r *http.Request) {
 		AccountCode:   q.Get("account_code"),
 		FiscalPeriod:  q.Get("fiscal_period"),
 		MaxEntrySeq:   &watermark,
+	}
+	if !parseLedgerWindow(w, q, &filter) {
+		return
 	}
 	entries, err := h.store.QueryLedger(r.Context(), tenantID, filter, limit)
 	if err != nil {
