@@ -1190,27 +1190,32 @@ func (h *Handler) ListFilingRequirements(w http.ResponseWriter, r *http.Request)
 // problem+json via apicontract.WriteProblem instead.
 func writeJSON(w http.ResponseWriter, r *http.Request, status int, v any) {
 	if status >= 400 {
-		switch m := v.(type) {
+		var m map[string]any
+		switch t := v.(type) {
 		case map[string]any:
-			code, _ := m["error"].(string)
-			if code != "" {
-				detail, _ := m["detail"].(string)
-				if detail == "" {
-					detail, _ = m["field"].(string)
-				}
-				apicontract.WriteProblem(w, r, apicontract.Problem{Status: status, Code: code, Detail: detail})
-				return
-			}
+			m = t
 		case map[string]string:
-			code := m["error"]
-			if code != "" {
-				detail := m["detail"]
-				if detail == "" {
-					detail = m["field"]
-				}
-				apicontract.WriteProblem(w, r, apicontract.Problem{Status: status, Code: code, Detail: detail})
-				return
+			m = make(map[string]any, len(t))
+			for k, s := range t {
+				m[k] = s
 			}
+		}
+		if code, _ := m["error"].(string); code != "" {
+			// error becomes code, detail (or the offending field) becomes
+			// detail, and every other member (obligation_id, header_value, …)
+			// stays on the problem as an extension member.
+			p := apicontract.Problem{Status: status, Code: code, Extra: map[string]any{}}
+			p.Detail, _ = m["detail"].(string)
+			if p.Detail == "" {
+				p.Detail, _ = m["field"].(string)
+			}
+			for k, val := range m {
+				if k != "error" && k != "detail" {
+					p.Extra[k] = val
+				}
+			}
+			apicontract.WriteProblem(w, r, p)
+			return
 		}
 	}
 	w.Header().Set("Content-Type", "application/json")
