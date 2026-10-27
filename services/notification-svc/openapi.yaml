@@ -37,7 +37,7 @@ paths:
         '200':
           description: OK
           content: &id001
-            application/json:
+            application/problem+json:
               schema:
                 type: object
         '400':
@@ -2695,7 +2695,7 @@ paths:
       requestBody:
         required: true
         content:
-          application/json:
+          application/problem+json:
             schema:
               type: object
               required: [recipient_principal_id, address, verification_ref, reason]
@@ -2709,7 +2709,7 @@ paths:
         '202':
           description: Recorded PENDING; honoured only once a second principal approves it.
           content:
-            application/json:
+            application/problem+json:
               schema:
                 type: object
                 additionalProperties: true
@@ -3076,7 +3076,7 @@ paths:
       requestBody:
         required: true
         content:
-          application/json:
+          application/problem+json:
             schema: {type: object, required: [legal_entity_id, name, destination_url, event_types, signing_key_path, destination_region]}
       responses:
         "201": {description: Created (DRAFT)}
@@ -3202,26 +3202,30 @@ components:
         type: string
       description: Mandatory on writes (INV-08); a repeat is answered from the first response.
   schemas:
-    Error:
+    Problem:
       type: object
-      required:
-      - error_code
+      required: [type, title, status, code]
       properties:
-        error_code:
-          type: string
-        error_message:
-          type: string
-    EnvelopeError:
-      type: object
-      properties:
-        error:
-          type: string
-        detail:
-          type: string
-        violations:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        code: { type: string }
+        request_id: { type: string }
+        correlation_id: { type: string }
+        retryable: { type: boolean }
+        retry_after: { type: integer }
+        errors:
           type: array
           items:
             type: object
+            properties:
+              pointer: { type: string }
+              code: { type: string }
+              detail: { type: string }
+        current_version: { type: integer, format: int64 }
+        decision_id: { type: string }
     Refusal:
       type: object
       required:
@@ -3261,44 +3265,42 @@ components:
     Invalid:
       description: Invalid request, or the 4-envelope is incomplete
       content:
-        application/json:
+        application/problem+json:
           schema:
-            oneOf:
-            - $ref: '#/components/schemas/Error'
-            - $ref: '#/components/schemas/EnvelopeError'
+            $ref: '#/components/schemas/Problem'
     Unauthenticated:
       description: No principal or tenant, or an unauthenticated callback
       content:
-        application/json:
+        application/problem+json:
           schema:
-            $ref: '#/components/schemas/Error'
+            $ref: '#/components/schemas/Problem'
     Forbidden:
       description: Not granted, or segregation of duties
       content:
-        application/json:
+        application/problem+json:
           schema:
-            $ref: '#/components/schemas/Error'
+            $ref: '#/components/schemas/Problem'
     NotFound:
       description: Not found in this tenant
       content:
-        application/json:
+        application/problem+json:
           schema:
-            $ref: '#/components/schemas/Error'
+            $ref: '#/components/schemas/Problem'
     Conflict:
       description: The object's state does not permit the command
       content:
-        application/json:
+        application/problem+json:
           schema:
-            $ref: '#/components/schemas/Error'
+            $ref: '#/components/schemas/Problem'
     Refused:
       description: A 10.3 coded refusal (NCD-001 to NCD-020)
       content:
-        application/json:
+        application/problem+json:
           schema:
-            $ref: '#/components/schemas/Refusal'
+            $ref: '#/components/schemas/Problem'
     Unavailable:
       description: A dependency or the store is unavailable; nothing was done
       content:
-        application/json:
+        application/problem+json:
           schema:
-            $ref: '#/components/schemas/Error'
+            $ref: '#/components/schemas/Problem'

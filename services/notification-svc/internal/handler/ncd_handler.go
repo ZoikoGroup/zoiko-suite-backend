@@ -113,12 +113,12 @@ func RegisterNCDRoutes(r chi.Router, h *NCDHandler) {
 func (h *NCDHandler) actor(w http.ResponseWriter, r *http.Request) (ncd.Actor, bool) {
 	p := r.Header.Get("X-Principal-Id")
 	if p == "" {
-		writeError(w, http.StatusUnauthorized, "identity_missing", string(domain.ErrIdentityMissing))
+		writeError(w, r, http.StatusUnauthorized, "identity_missing", string(domain.ErrIdentityMissing))
 		return ncd.Actor{}, false
 	}
 	t := svcmiddleware.TenantFromContext(r.Context())
 	if t == "" {
-		writeError(w, http.StatusUnauthorized, "tenant_missing", "X-Tenant-Id is required")
+		writeError(w, r, http.StatusUnauthorized, "tenant_missing", "X-Tenant-Id is required")
 		return ncd.Actor{}, false
 	}
 	return ncd.Actor{TenantID: t, PrincipalID: p, CorrelationID: getCorrelationID(r)}, true
@@ -126,14 +126,14 @@ func (h *NCDHandler) actor(w http.ResponseWriter, r *http.Request) (ncd.Actor, b
 
 func (h *NCDHandler) allow(w http.ResponseWriter, r *http.Request, a ncd.Actor, legalEntityID, action string) bool {
 	if legalEntityID == "" {
-		writeError(w, http.StatusBadRequest, "missing_legal_entity", "a legal entity scope is required for this action")
+		writeError(w, r, http.StatusBadRequest, "missing_legal_entity", "a legal entity scope is required for this action")
 		return false
 	}
 	if err := h.authz.CheckAllowed(r.Context(), a.PrincipalID, legalEntityID, action); err != nil {
 		if errors.Is(err, domain.ErrAuthorizationDenied) {
-			writeError(w, http.StatusForbidden, "forbidden", err.Error())
+			writeError(w, r, http.StatusForbidden, "forbidden", err.Error())
 		} else {
-			writeError(w, http.StatusServiceUnavailable, "authz_unavailable", err.Error())
+			writeError(w, r, http.StatusServiceUnavailable, "authz_unavailable", err.Error())
 		}
 		return false
 	}
@@ -149,7 +149,7 @@ func headerEntity(r *http.Request) string {
 	return r.Header.Get("X-Legal-Entity-Id")
 }
 
-func (h *NCDHandler) fail(w http.ResponseWriter, err error) {
+func (h *NCDHandler) fail(w http.ResponseWriter, r *http.Request, err error) {
 	e := ncd.AsError(err)
 	status := http.StatusServiceUnavailable
 	switch e.Kind {
@@ -170,7 +170,7 @@ func (h *NCDHandler) fail(w http.ResponseWriter, err error) {
 	if status == http.StatusServiceUnavailable {
 		h.log.Error("ncd operation failed", zap.Error(err))
 	}
-	writeError(w, status, e.Code, e.Detail)
+	writeError(w, r, status, e.Code, e.Detail)
 }
 
 func (h *NCDHandler) decode(w http.ResponseWriter, r *http.Request, dst any) bool {
@@ -186,7 +186,7 @@ func (h *NCDHandler) decode(w http.ResponseWriter, r *http.Request, dst any) boo
 func (h *NCDHandler) intentEntity(w http.ResponseWriter, r *http.Request, a ncd.Actor, id string) (string, bool) {
 	le, err := h.svc.IntentEntity(r.Context(), a, id)
 	if err != nil {
-		h.fail(w, err)
+		h.fail(w, r, err)
 		return "", false
 	}
 	return le, true
@@ -195,7 +195,7 @@ func (h *NCDHandler) intentEntity(w http.ResponseWriter, r *http.Request, a ncd.
 func (h *NCDHandler) commFor(w http.ResponseWriter, r *http.Request, a ncd.Actor, id, action string) (*ncd.Communication, bool) {
 	c, err := h.svc.Communication(r.Context(), a, id)
 	if err != nil {
-		h.fail(w, err)
+		h.fail(w, r, err)
 		return nil, false
 	}
 	return c, h.allow(w, r, a, c.LegalEntityID, action)
@@ -214,7 +214,7 @@ func (h *NCDHandler) createIntent(w http.ResponseWriter, r *http.Request) {
 	}
 	i, err := h.svc.CreateIntent(r.Context(), a, in)
 	if err != nil {
-		h.fail(w, err)
+		h.fail(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, i)
@@ -233,7 +233,7 @@ func (h *NCDHandler) getIntent(w http.ResponseWriter, r *http.Request) {
 	v, _ := strconv.Atoi(r.URL.Query().Get("version"))
 	i, all, err := h.svc.GetIntent(r.Context(), a, id, v)
 	if err != nil {
-		h.fail(w, err)
+		h.fail(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"intent": i, "versions": all})
@@ -255,7 +255,7 @@ func (h *NCDHandler) createIntentVersion(w http.ResponseWriter, r *http.Request)
 	}
 	i, err := h.svc.CreateIntentVersion(r.Context(), a, id, in)
 	if err != nil {
-		h.fail(w, err)
+		h.fail(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, i)
@@ -275,7 +275,7 @@ func (h *NCDHandler) activateIntent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if in.Version < 1 {
-		writeError(w, http.StatusBadRequest, "missing_fields", "version is required")
+		writeError(w, r, http.StatusBadRequest, "missing_fields", "version is required")
 		return
 	}
 	le, ok := h.intentEntity(w, r, a, id)
@@ -284,7 +284,7 @@ func (h *NCDHandler) activateIntent(w http.ResponseWriter, r *http.Request) {
 	}
 	i, err := h.svc.ActivateIntent(r.Context(), a, id, in.Version, in.EffectiveFrom)
 	if err != nil {
-		h.fail(w, err)
+		h.fail(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, i)
@@ -302,7 +302,7 @@ func (h *NCDHandler) retireIntent(w http.ResponseWriter, r *http.Request) {
 	}
 	i, err := h.svc.RetireIntent(r.Context(), a, id)
 	if err != nil {
-		h.fail(w, err)
+		h.fail(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, i)
@@ -320,7 +320,7 @@ func (h *NCDHandler) listTemplates(w http.ResponseWriter, r *http.Request) {
 	}
 	ts, err := h.svc.ListTemplates(r.Context(), a, id)
 	if err != nil {
-		h.fail(w, err)
+		h.fail(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"templates": ts})
@@ -341,7 +341,7 @@ func (h *NCDHandler) createTemplate(w http.ResponseWriter, r *http.Request) {
 	}
 	tv, err := h.svc.CreateTemplate(r.Context(), a, in)
 	if err != nil {
-		h.fail(w, err)
+		h.fail(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, tv)
@@ -354,7 +354,7 @@ func (h *NCDHandler) getTemplate(w http.ResponseWriter, r *http.Request) {
 	}
 	tv, err := h.svc.GetTemplate(r.Context(), a, chi.URLParam(r, "id"))
 	if err != nil {
-		h.fail(w, err)
+		h.fail(w, r, err)
 		return
 	}
 	if !h.allow(w, r, a, tv.LegalEntityID, actionTemplateManage) {
@@ -378,7 +378,7 @@ func (h *NCDHandler) templateAction(kind string) http.HandlerFunc {
 		}
 		le, err := h.svc.TemplateEntity(r.Context(), a, id)
 		if err != nil {
-			h.fail(w, err)
+			h.fail(w, r, err)
 			return
 		}
 		action := actionTemplateApprove
@@ -402,7 +402,7 @@ func (h *NCDHandler) templateAction(kind string) http.HandlerFunc {
 			tv, err = h.svc.RetireTemplate(r.Context(), a, id)
 		}
 		if err != nil {
-			h.fail(w, err)
+			h.fail(w, r, err)
 			return
 		}
 		status := http.StatusOK
@@ -426,7 +426,7 @@ func (h *NCDHandler) renderPreview(w http.ResponseWriter, r *http.Request) {
 	}
 	le, err := h.svc.TemplateEntity(r.Context(), a, in.TemplateVersionID)
 	if err != nil {
-		h.fail(w, err)
+		h.fail(w, r, err)
 		return
 	}
 	if !h.allow(w, r, a, le, actionTemplateManage) {
@@ -434,7 +434,7 @@ func (h *NCDHandler) renderPreview(w http.ResponseWriter, r *http.Request) {
 	}
 	p, err := h.svc.RenderPreview(r.Context(), a, in)
 	if err != nil {
-		h.fail(w, err)
+		h.fail(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, p)
@@ -452,7 +452,7 @@ func (h *NCDHandler) effective(w http.ResponseWriter, r *http.Request) {
 		if raw := r.URL.Query().Get(name); raw != "" {
 			t, err := time.Parse(time.RFC3339, raw)
 			if err != nil {
-				writeError(w, http.StatusBadRequest, "invalid_time", name+" must be RFC 3339")
+				writeError(w, r, http.StatusBadRequest, "invalid_time", name+" must be RFC 3339")
 				return
 			}
 			*dst = t.UTC()
@@ -462,10 +462,10 @@ func (h *NCDHandler) effective(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		var e *ncd.Error
 		if errors.As(err, &e) && e.Kind == ncd.KindNotFound {
-			h.fail(w, ncd.Refused(ncd.Refuse(ncd.NCD001IntentNotFound, "no intent "+id)))
+			h.fail(w, r, ncd.Refused(ncd.Refuse(ncd.NCD001IntentNotFound, "no intent "+id)))
 			return
 		}
-		h.fail(w, err)
+		h.fail(w, r, err)
 		return
 	}
 	if !h.allow(w, r, a, le, actionView) {
@@ -473,7 +473,7 @@ func (h *NCDHandler) effective(w http.ResponseWriter, r *http.Request) {
 	}
 	set, err := h.svc.Effective(r.Context(), a, id, txTime, knownAt)
 	if err != nil {
-		h.fail(w, err)
+		h.fail(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, set)
@@ -496,7 +496,7 @@ func (h *NCDHandler) recipientResolution(w http.ResponseWriter, r *http.Request)
 	}
 	p, err := h.svc.ResolveRecipient(r.Context(), a, in)
 	if err != nil {
-		h.fail(w, err)
+		h.fail(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, p)
@@ -513,7 +513,7 @@ func (h *NCDHandler) channelDecision(w http.ResponseWriter, r *http.Request) {
 	}
 	p, err := h.svc.GetPlan(r.Context(), a, in.RecipientPlanID)
 	if err != nil {
-		h.fail(w, err)
+		h.fail(w, r, err)
 		return
 	}
 	if !h.allow(w, r, a, p.LegalEntityID, actionSend) {
@@ -521,7 +521,7 @@ func (h *NCDHandler) channelDecision(w http.ResponseWriter, r *http.Request) {
 	}
 	d, err := h.svc.ChannelDecision(r.Context(), a, in)
 	if err != nil {
-		h.fail(w, err)
+		h.fail(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, d)
@@ -541,7 +541,7 @@ func (h *NCDHandler) listSuppressions(w http.ResponseWriter, r *http.Request) {
 	}
 	list, err := h.svc.ListSuppressions(r.Context(), a, q)
 	if err != nil {
-		h.fail(w, err)
+		h.fail(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"suppressions": list})
@@ -561,7 +561,7 @@ func (h *NCDHandler) addSuppression(w http.ResponseWriter, r *http.Request) {
 	}
 	s, created, err := h.svc.AddSuppression(r.Context(), a, in)
 	if err != nil {
-		h.fail(w, err)
+		h.fail(w, r, err)
 		return
 	}
 	status := http.StatusCreated
@@ -582,7 +582,7 @@ func (h *NCDHandler) liftSuppression(w http.ResponseWriter, r *http.Request) {
 	}
 	s, appr, err := h.svc.LiftSuppression(r.Context(), a, chi.URLParam(r, "id"), in)
 	if err != nil {
-		h.fail(w, err)
+		h.fail(w, r, err)
 		return
 	}
 	if appr != nil {
@@ -606,7 +606,7 @@ func (h *NCDHandler) requestEndpointException(w http.ResponseWriter, r *http.Req
 	}
 	appr, err := h.svc.RequestEndpointException(r.Context(), a, in)
 	if err != nil {
-		h.fail(w, err)
+		h.fail(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]any{"approval": appr,
@@ -624,7 +624,7 @@ func (h *NCDHandler) setPreference(w http.ResponseWriter, r *http.Request) {
 	}
 	p, err := h.svc.SetPreference(r.Context(), a, in)
 	if err != nil {
-		h.fail(w, err)
+		h.fail(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, p)
@@ -637,7 +637,7 @@ func (h *NCDHandler) getPreference(w http.ResponseWriter, r *http.Request) {
 	}
 	p, err := h.svc.GetPreference(r.Context(), a)
 	if err != nil {
-		h.fail(w, err)
+		h.fail(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, p)
@@ -659,7 +659,7 @@ func (h *NCDHandler) revalidate(w http.ResponseWriter, r *http.Request) {
 	}
 	c, d, err := h.svc.Revalidate(r.Context(), a, in.CommunicationID)
 	if err != nil {
-		h.fail(w, err)
+		h.fail(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"communication": c, "channel_decision": d})
@@ -678,7 +678,7 @@ func (h *NCDHandler) createCommunication(w http.ResponseWriter, r *http.Request)
 	}
 	c, created, err := h.svc.CreateCommunication(r.Context(), a, in)
 	if err != nil {
-		h.fail(w, err)
+		h.fail(w, r, err)
 		return
 	}
 	if !created {
@@ -698,7 +698,7 @@ func (h *NCDHandler) getCommunication(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	c, err := h.svc.Communication(r.Context(), a, id)
 	if err != nil {
-		h.fail(w, err)
+		h.fail(w, r, err)
 		return
 	}
 	if c.RecipientPrincipalID != a.PrincipalID && !h.allow(w, r, a, c.LegalEntityID, actionView) {
@@ -706,7 +706,7 @@ func (h *NCDHandler) getCommunication(w http.ResponseWriter, r *http.Request) {
 	}
 	v, err := h.svc.GetCommunication(r.Context(), a, id)
 	if err != nil {
-		h.fail(w, err)
+		h.fail(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, v)
@@ -723,7 +723,7 @@ func (h *NCDHandler) prepare(w http.ResponseWriter, r *http.Request) {
 	}
 	p, err := h.svc.Prepare(r.Context(), a, id)
 	if err != nil {
-		h.fail(w, err)
+		h.fail(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, p)
@@ -740,7 +740,7 @@ func (h *NCDHandler) dispatch(w http.ResponseWriter, r *http.Request) {
 	}
 	c, job, err := h.svc.Dispatch(r.Context(), a, id)
 	if err != nil {
-		h.fail(w, err)
+		h.fail(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]any{"communication": c, "job": job})
@@ -763,7 +763,7 @@ func (h *NCDHandler) cancel(w http.ResponseWriter, r *http.Request) {
 	}
 	c, n, err := h.svc.Cancel(r.Context(), a, id, in.Reason)
 	if err != nil {
-		h.fail(w, err)
+		h.fail(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"communication": c, "jobs_cancelled": n})
@@ -784,7 +784,7 @@ func (h *NCDHandler) resend(w http.ResponseWriter, r *http.Request) {
 	}
 	job, appr, err := h.svc.Resend(r.Context(), a, id, in)
 	if err != nil {
-		h.fail(w, err)
+		h.fail(w, r, err)
 		return
 	}
 	if appr != nil {
@@ -810,7 +810,7 @@ func (h *NCDHandler) resolveAttempt(w http.ResponseWriter, r *http.Request) {
 	}
 	att, err := h.svc.ResolveUnknown(r.Context(), a, id, chi.URLParam(r, "attempt_id"), in)
 	if err != nil {
-		h.fail(w, err)
+		h.fail(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, att)
@@ -833,7 +833,7 @@ func (h *NCDHandler) misdelivery(w http.ResponseWriter, r *http.Request) {
 	}
 	c, err := h.svc.Misdelivery(r.Context(), a, id, in.Reason)
 	if err != nil {
-		h.fail(w, err)
+		h.fail(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, c)
@@ -850,7 +850,7 @@ func (h *NCDHandler) evidence(w http.ResponseWriter, r *http.Request) {
 	}
 	b, err := h.svc.Evidence(r.Context(), a, id)
 	if err != nil {
-		h.fail(w, err)
+		h.fail(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, b)
@@ -869,7 +869,7 @@ func (h *NCDHandler) acknowledge(w http.ResponseWriter, r *http.Request) {
 	// the service refuses anyone else (INV-21).
 	ack, err := h.svc.Acknowledge(r.Context(), a, in)
 	if err != nil {
-		h.fail(w, err)
+		h.fail(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, ack)
@@ -881,7 +881,7 @@ func (h *NCDHandler) acknowledge(w http.ResponseWriter, r *http.Request) {
 func (h *NCDHandler) providerEvents(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "unreadable_body", err.Error())
+		writeError(w, r, http.StatusBadRequest, "unreadable_body", err.Error())
 		return
 	}
 	binding := chi.URLParam(r, "binding")
@@ -896,14 +896,14 @@ func (h *NCDHandler) providerEvents(w http.ResponseWriter, r *http.Request) {
 		} else if e.Kind == ncd.KindUnavailable {
 			status = http.StatusServiceUnavailable
 		}
-		writeError(w, status, e.Code, e.Detail)
+		writeError(w, r, status, e.Code, e.Detail)
 		return
 	}
 	var in struct {
 		Events []ncd.ProviderEvent `json:"events"`
 	}
 	if err := json.Unmarshal(body, &in); err != nil || len(in.Events) == 0 || len(in.Events) > 500 {
-		writeError(w, http.StatusBadRequest, "invalid_payload", "body must be {\"events\":[...]} with 1..500 events")
+		writeError(w, r, http.StatusBadRequest, "invalid_payload", "body must be {\"events\":[...]} with 1..500 events")
 		return
 	}
 	results := h.svc.IngestProviderEvents(context.WithoutCancel(r.Context()), b, in.Events)
@@ -925,7 +925,7 @@ func (h *NCDHandler) listBindings(w http.ResponseWriter, r *http.Request) {
 	}
 	bs, err := h.svc.ListBindings(r.Context())
 	if err != nil {
-		h.fail(w, err)
+		h.fail(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"bindings": bs})
@@ -944,7 +944,7 @@ func (h *NCDHandler) setCircuit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.svc.SetCircuit(r.Context(), a, chi.URLParam(r, "id"), in.Open, in.Reason); err != nil {
-		h.fail(w, err)
+		h.fail(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"binding_id": chi.URLParam(r, "id"), "circuit_open": in.Open})
@@ -964,7 +964,7 @@ func (h *NCDHandler) setStream(w http.ResponseWriter, r *http.Request) {
 	}
 	stream := chi.URLParam(r, "stream")
 	if err := h.svc.SetStream(r.Context(), a, stream, in.State, in.Reason); err != nil {
-		h.fail(w, err)
+		h.fail(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"stream": stream, "state": in.State})
@@ -977,7 +977,7 @@ func (h *NCDHandler) reputation(w http.ResponseWriter, r *http.Request) {
 	}
 	v, err := h.svc.Reputation(r.Context(), a)
 	if err != nil {
-		h.fail(w, err)
+		h.fail(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, v)
@@ -990,7 +990,7 @@ func (h *NCDHandler) exceptions(w http.ResponseWriter, r *http.Request) {
 	}
 	xs, err := h.svc.ListExceptions(r.Context(), a, r.URL.Query().Get("open") != "false")
 	if err != nil {
-		h.fail(w, err)
+		h.fail(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"exceptions": xs})
@@ -1007,7 +1007,7 @@ func (h *NCDHandler) previewBulk(w http.ResponseWriter, r *http.Request) {
 	}
 	b, appr, err := h.svc.PreviewBulk(r.Context(), a, in)
 	if err != nil {
-		h.fail(w, err)
+		h.fail(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{"bulk_send": b, "approval": appr})
@@ -1026,7 +1026,7 @@ func (h *NCDHandler) dispatchBulk(w http.ResponseWriter, r *http.Request) {
 	}
 	b, err := h.svc.GetBulk(r.Context(), a, chi.URLParam(r, "id"))
 	if err != nil {
-		h.fail(w, err)
+		h.fail(w, r, err)
 		return
 	}
 	if !h.allow(w, r, a, b.LegalEntityID, actionSend) {
@@ -1034,7 +1034,7 @@ func (h *NCDHandler) dispatchBulk(w http.ResponseWriter, r *http.Request) {
 	}
 	b, results, err := h.svc.DispatchBulk(r.Context(), a, b.BulkID, in.AudienceHash)
 	if err != nil {
-		h.fail(w, err)
+		h.fail(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]any{"bulk_send": b, "results": results})
@@ -1065,7 +1065,7 @@ func (h *NCDHandler) getApproval(w http.ResponseWriter, r *http.Request) {
 	}
 	ap, err := h.svc.GetApproval(r.Context(), a, chi.URLParam(r, "id"))
 	if err != nil {
-		h.fail(w, err)
+		h.fail(w, r, err)
 		return
 	}
 	if ap.RequestedBy != a.PrincipalID && !h.allow(w, r, a, h.approvalEntity(r, ap), approvalAction(ap.Kind)) {
@@ -1088,7 +1088,7 @@ func (h *NCDHandler) decideApproval(approve bool) http.HandlerFunc {
 		}
 		ap, err := h.svc.GetApproval(r.Context(), a, chi.URLParam(r, "id"))
 		if err != nil {
-			h.fail(w, err)
+			h.fail(w, r, err)
 			return
 		}
 		if !h.allow(w, r, a, h.approvalEntity(r, ap), approvalAction(ap.Kind)) {
@@ -1096,7 +1096,7 @@ func (h *NCDHandler) decideApproval(approve bool) http.HandlerFunc {
 		}
 		ap, result, err := h.svc.DecideApproval(r.Context(), a, ap.ApprovalID, approve, in.Note)
 		if err != nil {
-			h.fail(w, err)
+			h.fail(w, r, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"approval": ap, "result": result})
@@ -1119,7 +1119,7 @@ func (h *NCDHandler) createNotice(w http.ResponseWriter, r *http.Request) {
 	}
 	n, err := h.svc.CreateNotice(r.Context(), a, in)
 	if err != nil {
-		h.fail(w, err)
+		h.fail(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, n)
@@ -1133,7 +1133,7 @@ func (h *NCDHandler) getNotice(w http.ResponseWriter, r *http.Request) {
 	v, _ := strconv.Atoi(r.URL.Query().Get("version"))
 	nv, c, err := h.svc.GetNotice(r.Context(), a, chi.URLParam(r, "id"), v)
 	if err != nil {
-		h.fail(w, err)
+		h.fail(w, r, err)
 		return
 	}
 	if c.RecipientPrincipalID != a.PrincipalID && !h.allow(w, r, a, c.LegalEntityID, actionView) {
@@ -1146,7 +1146,7 @@ func (h *NCDHandler) noticeComm(w http.ResponseWriter, r *http.Request, a ncd.Ac
 	id := chi.URLParam(r, "id")
 	_, c, err := h.svc.GetNotice(r.Context(), a, id, 0)
 	if err != nil {
-		h.fail(w, err)
+		h.fail(w, r, err)
 		return "", false
 	}
 	return id, h.allow(w, r, a, c.LegalEntityID, action)
@@ -1167,7 +1167,7 @@ func (h *NCDHandler) manualEvidence(w http.ResponseWriter, r *http.Request) {
 	}
 	appr, err := h.svc.RequestManualEvidence(r.Context(), a, id, in)
 	if err != nil {
-		h.fail(w, err)
+		h.fail(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]any{"approval": appr,
@@ -1191,7 +1191,7 @@ func (h *NCDHandler) declareRecord(w http.ResponseWriter, r *http.Request) {
 	}
 	n, err := h.svc.DeclareRecord(r.Context(), a, id, in.DRCRecordRef)
 	if err != nil {
-		h.fail(w, err)
+		h.fail(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, n)

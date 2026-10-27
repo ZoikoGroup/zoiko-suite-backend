@@ -15,6 +15,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
+	apicontract "zoiko.io/identity-envelope/apicontract"
 
 	"zoiko.io/notification-svc/internal/domain"
 	"zoiko.io/notification-svc/internal/identity"
@@ -377,12 +378,12 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 	usingStaticTemplate := req.Template != ""
 	usingGovernedTemplate := req.TemplateID != ""
 	if usingStaticTemplate && usingGovernedTemplate {
-		writeError(w, http.StatusBadRequest, "conflicting_content",
+		writeError(w, r, http.StatusBadRequest, "conflicting_content",
 			"supply either template or template_id, not both")
 		return
 	}
 	if (usingStaticTemplate || usingGovernedTemplate) && req.Body != "" {
-		writeError(w, http.StatusBadRequest, "conflicting_content",
+		writeError(w, r, http.StatusBadRequest, "conflicting_content",
 			"supply either a template (with variables) or subject and body, not both")
 		return
 	}
@@ -393,20 +394,20 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 		case nil:
 			req.Subject, req.Body = subject, body
 		case templates.ErrUnknownTemplate:
-			writeError(w, http.StatusBadRequest, "unknown_template", e.Error())
+			writeError(w, r, http.StatusBadRequest, "unknown_template", e.Error())
 			return
 		case templates.ErrMissingVariables:
 			// Refusing beats sending a message with a blank organization name
 			// or an empty login link.
-			writeError(w, http.StatusBadRequest, "missing_template_variables", e.Error())
+			writeError(w, r, http.StatusBadRequest, "missing_template_variables", e.Error())
 			return
 		case templates.ErrUnexpectedVariables:
-			writeError(w, http.StatusBadRequest, "unexpected_template_variables", e.Error())
+			writeError(w, r, http.StatusBadRequest, "unexpected_template_variables", e.Error())
 			return
 		default:
 			h.log.Error("failed to render notification template",
 				zap.String("template", req.Template), zap.Error(err))
-			writeError(w, http.StatusInternalServerError, "template_render_failed", e.Error())
+			writeError(w, r, http.StatusInternalServerError, "template_render_failed", e.Error())
 			return
 		}
 	}
@@ -418,20 +419,20 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 	// happens further down, AFTER authorization — see that block's own
 	// comment on why it cannot happen here.
 	if usingGovernedTemplate && req.Locale == "" {
-		writeError(w, http.StatusBadRequest, "missing_fields", "locale is required when template_id is set")
+		writeError(w, r, http.StatusBadRequest, "missing_fields", "locale is required when template_id is set")
 		return
 	}
 
 	if req.RecipientPrincipalID == "" || req.LegalEntityID == "" || req.Channel == "" ||
 		(req.Subject == "" && !usingGovernedTemplate) || req.CorrelationID == "" {
-		writeError(w, http.StatusBadRequest, "missing_fields",
+		writeError(w, r, http.StatusBadRequest, "missing_fields",
 			"recipient_principal_id, legal_entity_id, channel, correlation_id are required, plus either subject or template")
 		return
 	}
 
 	// An unrecognised channel is a caller mistake, not a delivery failure.
 	if !supportedChannels[req.Channel] {
-		writeError(w, http.StatusBadRequest, "unsupported_channel",
+		writeError(w, r, http.StatusBadRequest, "unsupported_channel",
 			"channel must be one of EMAIL, IN_APP, WEBHOOK")
 		return
 	}
@@ -441,13 +442,13 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 	// lifecycle mail are not a direct send: they need the ledger pipeline's stream
 	// identity and one-click unsubscribe (INV-07).
 	if req.CommunicationClass != "" && !domain.ValidDirectPathClass(req.CommunicationClass) {
-		writeError(w, http.StatusBadRequest, "invalid_communication_class",
+		writeError(w, r, http.StatusBadRequest, "invalid_communication_class",
 			"communication_class must be one of "+strings.Join(domain.DirectPathClasses, ", ")+
 				" on the direct send path; marketing (M1) and lifecycle (L1) mail use the ledger pipeline")
 		return
 	}
 	if err := domain.ValidateSchedule(req.Channel, req.NotBefore, req.ExpiresAt, time.Now().UTC()); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_schedule", err.Error())
+		writeError(w, r, http.StatusBadRequest, "invalid_schedule", err.Error())
 		return
 	}
 
@@ -459,14 +460,14 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 	// server for a typo in the request that produced it.
 	if req.RecipientAddress != "" {
 		if !domain.ChannelNeedsAddress(req.Channel) {
-			writeError(w, http.StatusBadRequest, "address_not_applicable",
+			writeError(w, r, http.StatusBadRequest, "address_not_applicable",
 				"recipient_address is only meaningful for EMAIL and SMS; "+
 					"an IN_APP notice is delivered by being recorded, and WEBHOOK is not this service's channel")
 			return
 		}
 		if req.Channel == domain.ChannelEmail {
 			if _, err := mail.ParseAddress(req.RecipientAddress); err != nil {
-				writeError(w, http.StatusBadRequest, "invalid_recipient_address", err.Error())
+				writeError(w, r, http.StatusBadRequest, "invalid_recipient_address", err.Error())
 				return
 			}
 		}
@@ -482,7 +483,7 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionSend); err != nil {
-		h.writeAuthzErr(w, err)
+		h.writeAuthzErr(w, r, err)
 		return
 	}
 
@@ -505,11 +506,11 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 			// LOCALE (NCD-005), never silently replaced by another language; one with nothing
 			// published is simply not published (NCD-003).
 			if errors.Is(err, domain.ErrTemplateVersionNotFound) && h.otherLocalePublished(r.Context(), req.TemplateID, req.Locale) {
-				writeError(w, http.StatusUnprocessableEntity, "locale_not_approved",
+				writeError(w, r, http.StatusUnprocessableEntity, "locale_not_approved",
 					"NCD-005 LOCALE_NOT_APPROVED: the template has no approved version in locale "+req.Locale+"; another language is never substituted")
 				return
 			}
-			h.handleTemplateError(w, err)
+			h.handleTemplateError(w, r, err)
 			return
 		}
 		// A template published for a different legal entity than the one this
@@ -517,7 +518,7 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 		// it anyway would let a caller borrow another entity's approved wording
 		// under this send's own legal_entity_id.
 		if published.LegalEntityID != req.LegalEntityID {
-			writeError(w, http.StatusBadRequest, "template_legal_entity_mismatch",
+			writeError(w, r, http.StatusBadRequest, "template_legal_entity_mismatch",
 				"the published template belongs to a different legal_entity_id than this notification is being sent under")
 			return
 		}
@@ -527,7 +528,7 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 		// typed contract, and the message is pinned to the exact version.
 		tmplDef, derr := h.store.GetTemplate(r.Context(), req.TemplateID)
 		if derr != nil {
-			h.handleTemplateError(w, derr)
+			h.handleTemplateError(w, r, derr)
 			return
 		}
 		if tmplDef.IntentID != nil {
@@ -542,12 +543,12 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 		// wording under unreviewed text (F-05). A version without one is legacy and
 		// still needs the caller's.
 		if published.Subject != nil && req.Subject != "" {
-			writeError(w, http.StatusBadRequest, "conflicting_content",
+			writeError(w, r, http.StatusBadRequest, "conflicting_content",
 				"this template version defines its own subject; do not supply one")
 			return
 		}
 		if published.Subject == nil && req.Subject == "" {
-			writeError(w, http.StatusBadRequest, "missing_fields",
+			writeError(w, r, http.StatusBadRequest, "missing_fields",
 				"subject is required: this template version does not define one")
 			return
 		}
@@ -555,7 +556,7 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 			VersionID: published.VersionID, Variables: req.Variables,
 		})
 		if err != nil {
-			h.handleTemplateError(w, err)
+			h.handleTemplateError(w, r, err)
 			return
 		}
 		if published.Subject != nil {
@@ -581,7 +582,7 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 		idempotencyKey = purposeScopedKey(tenantID, req, purpose)
 	}
 	if len(purpose) > 255 || len(idempotencyKey) > 500 {
-		writeError(w, http.StatusBadRequest, "invalid_idempotency",
+		writeError(w, r, http.StatusBadRequest, "invalid_idempotency",
 			"purpose_context may be at most 255 characters and idempotency_key at most 500")
 		return
 	}
@@ -643,12 +644,12 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 		h.log.Warn("send refused: quota exceeded",
 			zap.String("tenant_id", tenantID), zap.String("dimension", exceeded.Dimension), zap.Int("limit", exceeded.Limit))
 		w.Header().Set("Retry-After", strconv.Itoa(int(exceeded.RetryAfter.Seconds())))
-		writeError(w, http.StatusTooManyRequests, "quota_exceeded", exceeded.Error())
+		writeError(w, r, http.StatusTooManyRequests, "quota_exceeded", exceeded.Error())
 		return
 	}
 	if err != nil {
 		h.log.Error("failed to create notification", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
 
@@ -705,7 +706,7 @@ func (h *Handler) submitAndDeliver(w http.ResponseWriter, r *http.Request, n *do
 	if n.Channel != domain.ChannelInApp {
 		if err := h.store.BeginSubmission(r.Context(), n.NotificationID, tenantID, time.Now().UTC()); err != nil {
 			h.log.Error("failed to mark the submission; the provider was not called", zap.Error(err))
-			writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+			writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 			return domain.DeliveryOutcome{}, false
 		}
 	}
@@ -755,7 +756,7 @@ func (h *Handler) recordAttemptOutcome(w http.ResponseWriter, r *http.Request, n
 		// transaction as the transition — see PgStore.MarkOutcomeUnknown.
 		if err := h.store.MarkOutcomeUnknown(outcomeCtx, notification.NotificationID, tenantID, outcome.Reason, attemptedAt, correlationID, meta); err != nil {
 			h.log.Error("failed to record ambiguous delivery outcome", zap.Error(err))
-			writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+			writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 			return
 		}
 		h.metrics.ObserveConclusion(notification.Channel, domain.StatusPendingUnknown)
@@ -784,7 +785,7 @@ func (h *Handler) recordAttemptOutcome(w http.ResponseWriter, r *http.Request, n
 			if err := h.store.ScheduleRetry(outcomeCtx, notification.NotificationID,
 				tenantID, outcome.Reason, attemptedAt, next, meta); err != nil {
 				h.log.Error("failed to schedule delivery retry", zap.Error(err))
-				writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+				writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 				return
 			}
 			h.metrics.ObserveRetryScheduled(notification.Channel)
@@ -823,7 +824,7 @@ func (h *Handler) recordAttemptOutcome(w http.ResponseWriter, r *http.Request, n
 	if err := h.store.CompleteDelivery(outcomeCtx, notification.NotificationID,
 		newStatus, outcome.Reason, outcome.ProviderResponse, &attemptedAt, correlationID, meta); err != nil {
 		h.log.Error("failed to record delivery outcome", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
 	h.metrics.ObserveConclusion(notification.Channel, newStatus)
@@ -916,12 +917,12 @@ func (h *Handler) ListNotifications(w http.ResponseWriter, r *http.Request) {
 
 	if filter.LegalEntityID != "" {
 		if err := h.authz.CheckAllowed(r.Context(), principalID, filter.LegalEntityID, actionView); err != nil {
-			h.writeAuthzErr(w, err)
+			h.writeAuthzErr(w, r, err)
 			return
 		}
 	} else {
 		if filter.RecipientPrincipalID != "" && filter.RecipientPrincipalID != principalID {
-			writeError(w, http.StatusForbidden, "forbidden",
+			writeError(w, r, http.StatusForbidden, "forbidden",
 				"reading another principal's notifications requires legal_entity_id and a NOTIFICATION_VIEW grant on it")
 			return
 		}
@@ -931,7 +932,7 @@ func (h *Handler) ListNotifications(w http.ResponseWriter, r *http.Request) {
 	list, err := h.store.ListNotifications(r.Context(), filter)
 	if err != nil {
 		h.log.Error("failed to list notifications", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
 	if list == nil {
@@ -955,17 +956,17 @@ func (h *Handler) GetNotification(w http.ResponseWriter, r *http.Request) {
 
 	notification, err := h.store.GetNotification(r.Context(), id)
 	if errors.Is(err, domain.ErrNotificationNotFound) {
-		writeError(w, http.StatusNotFound, "notification_not_found", "")
+		writeError(w, r, http.StatusNotFound, "notification_not_found", "")
 		return
 	}
 	if err != nil {
 		h.log.Error("failed to fetch notification", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
 
 	if err := h.authz.CheckAllowed(r.Context(), principalID, notification.LegalEntityID, actionView); err != nil {
-		h.writeAuthzErr(w, err)
+		h.writeAuthzErr(w, r, err)
 		return
 	}
 
@@ -1005,22 +1006,22 @@ func (h *Handler) MarkRead(w http.ResponseWriter, r *http.Request) {
 	// has no read state. Those are 404, 403 and 400 respectively.
 	notification, err := h.store.GetNotification(r.Context(), id)
 	if errors.Is(err, domain.ErrNotificationNotFound) {
-		writeError(w, http.StatusNotFound, "notification_not_found", "")
+		writeError(w, r, http.StatusNotFound, "notification_not_found", "")
 		return
 	}
 	if err != nil {
 		h.log.Error("failed to fetch notification", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
 
 	if notification.RecipientPrincipalID != principalID {
-		writeError(w, http.StatusForbidden, "forbidden",
+		writeError(w, r, http.StatusForbidden, "forbidden",
 			"only the recipient may mark a notification read")
 		return
 	}
 	if notification.Channel != domain.ChannelInApp {
-		writeError(w, http.StatusBadRequest, "channel_has_no_read_state",
+		writeError(w, r, http.StatusBadRequest, "channel_has_no_read_state",
 			"read state applies to IN_APP notifications only; this service cannot observe "+
 				"whether a message delivered by an external provider was opened")
 		return
@@ -1029,11 +1030,11 @@ func (h *Handler) MarkRead(w http.ResponseWriter, r *http.Request) {
 	readAt := time.Now().UTC()
 	if err := h.store.MarkRead(r.Context(), id, principalID, readAt); err != nil {
 		if errors.Is(err, domain.ErrNotificationNotFound) {
-			writeError(w, http.StatusNotFound, "notification_not_found", "")
+			writeError(w, r, http.StatusNotFound, "notification_not_found", "")
 			return
 		}
 		h.log.Error("failed to mark notification read", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
 
@@ -1052,7 +1053,7 @@ func (h *Handler) MarkRead(w http.ResponseWriter, r *http.Request) {
 	updated, err := h.store.GetNotification(r.Context(), id)
 	if err != nil {
 		h.log.Error("failed to re-read notification after marking read", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, updated)
@@ -1087,17 +1088,17 @@ func (h *Handler) GetDeliveryStatus(w http.ResponseWriter, r *http.Request) {
 
 	notification, err := h.store.GetNotification(r.Context(), id)
 	if errors.Is(err, domain.ErrNotificationNotFound) {
-		writeError(w, http.StatusNotFound, "notification_not_found", "")
+		writeError(w, r, http.StatusNotFound, "notification_not_found", "")
 		return
 	}
 	if err != nil {
 		h.log.Error("failed to fetch notification", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
 
 	if err := h.authz.CheckAllowed(r.Context(), principalID, notification.LegalEntityID, actionView); err != nil {
-		h.writeAuthzErr(w, err)
+		h.writeAuthzErr(w, r, err)
 		return
 	}
 
@@ -1132,11 +1133,11 @@ func (h *Handler) ResolveDeliveryOutcome(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	if req.ResolvedStatus != domain.StatusSent && req.ResolvedStatus != domain.StatusFailed {
-		writeError(w, http.StatusBadRequest, "invalid_resolved_status", domain.ErrInvalidResolvedStatus.Error())
+		writeError(w, r, http.StatusBadRequest, "invalid_resolved_status", domain.ErrInvalidResolvedStatus.Error())
 		return
 	}
 	if req.ResolutionNote == "" {
-		writeError(w, http.StatusBadRequest, "missing_fields", domain.ErrResolutionNoteRequired.Error())
+		writeError(w, r, http.StatusBadRequest, "missing_fields", domain.ErrResolutionNoteRequired.Error())
 		return
 	}
 
@@ -1151,22 +1152,22 @@ func (h *Handler) ResolveDeliveryOutcome(w http.ResponseWriter, r *http.Request)
 
 	notification, err := h.store.GetNotification(r.Context(), id)
 	if errors.Is(err, domain.ErrNotificationNotFound) {
-		writeError(w, http.StatusNotFound, "notification_not_found", "")
+		writeError(w, r, http.StatusNotFound, "notification_not_found", "")
 		return
 	}
 	if err != nil {
 		h.log.Error("failed to fetch notification", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
 
 	if err := h.authz.CheckAllowed(r.Context(), principalID, notification.LegalEntityID, actionResolveOutcome); err != nil {
-		h.writeAuthzErr(w, err)
+		h.writeAuthzErr(w, r, err)
 		return
 	}
 
 	if notification.Status != domain.StatusPendingUnknown {
-		writeError(w, http.StatusConflict, "not_pending_unknown", domain.ErrNotPendingUnknown.Error())
+		writeError(w, r, http.StatusConflict, "not_pending_unknown", domain.ErrNotPendingUnknown.Error())
 		return
 	}
 
@@ -1184,18 +1185,18 @@ func (h *Handler) ResolveDeliveryOutcome(w http.ResponseWriter, r *http.Request)
 			// A race: the row moved (or vanished under a replay) between
 			// the fetch above and this call. 409 rather than 404 — the
 			// notification exists, it just stopped being PENDING_UNKNOWN.
-			writeError(w, http.StatusConflict, "not_pending_unknown", domain.ErrNotPendingUnknown.Error())
+			writeError(w, r, http.StatusConflict, "not_pending_unknown", domain.ErrNotPendingUnknown.Error())
 			return
 		}
 		h.log.Error("failed to resolve delivery outcome", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
 
 	updated, err := h.store.GetNotification(r.Context(), id)
 	if err != nil {
 		h.log.Error("failed to re-read notification after resolving outcome", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
 
@@ -1222,7 +1223,7 @@ func (h *Handler) UnreadCount(w http.ResponseWriter, r *http.Request) {
 	count, err := h.store.CountUnread(r.Context(), principalID)
 	if err != nil {
 		h.log.Error("failed to count unread notifications", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
 
@@ -1261,11 +1262,11 @@ func (h *Handler) CreateTemplate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.LegalEntityID == "" || req.Name == "" || req.BusinessPurpose == "" {
-		writeError(w, http.StatusBadRequest, "missing_fields", "legal_entity_id, name and business_purpose are required")
+		writeError(w, r, http.StatusBadRequest, "missing_fields", "legal_entity_id, name and business_purpose are required")
 		return
 	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionTemplateManage); err != nil {
-		h.writeAuthzErr(w, err)
+		h.writeAuthzErr(w, r, err)
 		return
 	}
 
@@ -1275,11 +1276,11 @@ func (h *Handler) CreateTemplate(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		if isIntentBindingError(err) {
-			h.writeIntentError(w, err)
+			h.writeIntentError(w, r, err)
 			return
 		}
 		h.log.Error("failed to create template", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusCreated, tmpl)
@@ -1297,11 +1298,11 @@ func (h *Handler) GetTemplate(w http.ResponseWriter, r *http.Request) {
 	templateID := chi.URLParam(r, "templateID")
 	tmpl, err := h.store.GetTemplate(r.Context(), templateID)
 	if err != nil {
-		h.handleTemplateError(w, err)
+		h.handleTemplateError(w, r, err)
 		return
 	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, tmpl.LegalEntityID, actionTemplateManage); err != nil {
-		h.writeAuthzErr(w, err)
+		h.writeAuthzErr(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, tmpl)
@@ -1336,17 +1337,17 @@ func (h *Handler) CreateVersion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Locale == "" || req.Content == "" {
-		writeError(w, http.StatusBadRequest, "missing_fields", "locale and content are required")
+		writeError(w, r, http.StatusBadRequest, "missing_fields", "locale and content are required")
 		return
 	}
 	templateID := chi.URLParam(r, "templateID")
 	tmpl, err := h.store.GetTemplate(r.Context(), templateID)
 	if err != nil {
-		h.handleTemplateError(w, err)
+		h.handleTemplateError(w, r, err)
 		return
 	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, tmpl.LegalEntityID, actionTemplateManage); err != nil {
-		h.writeAuthzErr(w, err)
+		h.writeAuthzErr(w, r, err)
 		return
 	}
 
@@ -1357,7 +1358,7 @@ func (h *Handler) CreateVersion(w http.ResponseWriter, r *http.Request) {
 		CreatedByPrincipalID: principalID,
 	})
 	if err != nil {
-		h.handleTemplateError(w, err)
+		h.handleTemplateError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, version)
@@ -1377,17 +1378,17 @@ func (h *Handler) ValidateTemplate(w http.ResponseWriter, r *http.Request) {
 	versionID := chi.URLParam(r, "versionID")
 	existing, err := h.store.GetTemplateVersion(r.Context(), versionID)
 	if err != nil {
-		h.handleTemplateError(w, err)
+		h.handleTemplateError(w, r, err)
 		return
 	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionTemplateManage); err != nil {
-		h.writeAuthzErr(w, err)
+		h.writeAuthzErr(w, r, err)
 		return
 	}
 
 	version, err := h.store.ValidateTemplate(r.Context(), versionID)
 	if err != nil {
-		h.handleTemplateError(w, err)
+		h.handleTemplateError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, version)
@@ -1409,11 +1410,11 @@ func (h *Handler) ApproveTemplate(w http.ResponseWriter, r *http.Request) {
 	versionID := chi.URLParam(r, "versionID")
 	existing, err := h.store.GetTemplateVersion(r.Context(), versionID)
 	if err != nil {
-		h.handleTemplateError(w, err)
+		h.handleTemplateError(w, r, err)
 		return
 	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionTemplateApprove); err != nil {
-		h.writeAuthzErr(w, err)
+		h.writeAuthzErr(w, r, err)
 		return
 	}
 
@@ -1421,7 +1422,7 @@ func (h *Handler) ApproveTemplate(w http.ResponseWriter, r *http.Request) {
 		VersionID: versionID, ApprovedByPrincipalID: principalID, CorrelationID: getCorrelationID(r),
 	})
 	if err != nil {
-		h.handleTemplateError(w, err)
+		h.handleTemplateError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, version)
@@ -1439,11 +1440,11 @@ func (h *Handler) PublishTemplate(w http.ResponseWriter, r *http.Request) {
 	versionID := chi.URLParam(r, "versionID")
 	existing, err := h.store.GetTemplateVersion(r.Context(), versionID)
 	if err != nil {
-		h.handleTemplateError(w, err)
+		h.handleTemplateError(w, r, err)
 		return
 	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionTemplateApprove); err != nil {
-		h.writeAuthzErr(w, err)
+		h.writeAuthzErr(w, r, err)
 		return
 	}
 
@@ -1451,7 +1452,7 @@ func (h *Handler) PublishTemplate(w http.ResponseWriter, r *http.Request) {
 		VersionID: versionID, PublishedByPrincipalID: principalID, CorrelationID: getCorrelationID(r),
 	})
 	if err != nil {
-		h.handleTemplateError(w, err)
+		h.handleTemplateError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, version)
@@ -1469,22 +1470,22 @@ func (h *Handler) GetPublishedVersion(w http.ResponseWriter, r *http.Request) {
 	templateID := chi.URLParam(r, "templateID")
 	locale := r.URL.Query().Get("locale")
 	if locale == "" {
-		writeError(w, http.StatusBadRequest, "missing_fields", "locale query parameter is required")
+		writeError(w, r, http.StatusBadRequest, "missing_fields", "locale query parameter is required")
 		return
 	}
 	tmpl, err := h.store.GetTemplate(r.Context(), templateID)
 	if err != nil {
-		h.handleTemplateError(w, err)
+		h.handleTemplateError(w, r, err)
 		return
 	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, tmpl.LegalEntityID, actionTemplateManage); err != nil {
-		h.writeAuthzErr(w, err)
+		h.writeAuthzErr(w, r, err)
 		return
 	}
 
 	version, err := h.store.GetPublishedVersion(r.Context(), templateID, locale)
 	if err != nil {
-		h.handleTemplateError(w, err)
+		h.handleTemplateError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, version)
@@ -1502,11 +1503,11 @@ func (h *Handler) RetireTemplate(w http.ResponseWriter, r *http.Request) {
 	templateID := chi.URLParam(r, "templateID")
 	tmpl, err := h.store.GetTemplate(r.Context(), templateID)
 	if err != nil {
-		h.handleTemplateError(w, err)
+		h.handleTemplateError(w, r, err)
 		return
 	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, tmpl.LegalEntityID, actionTemplateApprove); err != nil {
-		h.writeAuthzErr(w, err)
+		h.writeAuthzErr(w, r, err)
 		return
 	}
 
@@ -1514,7 +1515,7 @@ func (h *Handler) RetireTemplate(w http.ResponseWriter, r *http.Request) {
 		TemplateID: templateID, RetiredByPrincipalID: principalID, CorrelationID: getCorrelationID(r),
 	})
 	if err != nil {
-		h.handleTemplateError(w, err)
+		h.handleTemplateError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, retired)
@@ -1542,17 +1543,17 @@ func (h *Handler) RenderPreview(w http.ResponseWriter, r *http.Request) {
 	versionID := chi.URLParam(r, "versionID")
 	existing, err := h.store.GetTemplateVersion(r.Context(), versionID)
 	if err != nil {
-		h.handleTemplateError(w, err)
+		h.handleTemplateError(w, r, err)
 		return
 	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionTemplateManage); err != nil {
-		h.writeAuthzErr(w, err)
+		h.writeAuthzErr(w, r, err)
 		return
 	}
 
 	result, err := h.store.RenderPreview(r.Context(), domain.RenderPreviewParams{VersionID: versionID, Variables: req.Variables, Placeholders: true})
 	if err != nil {
-		h.handleTemplateError(w, err)
+		h.handleTemplateError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, result)
@@ -1572,23 +1573,23 @@ func (h *Handler) CompareVersions(w http.ResponseWriter, r *http.Request) {
 	versionA := r.URL.Query().Get("version_a")
 	versionB := r.URL.Query().Get("version_b")
 	if versionA == "" || versionB == "" {
-		writeError(w, http.StatusBadRequest, "missing_fields", "version_a and version_b query parameters are required")
+		writeError(w, r, http.StatusBadRequest, "missing_fields", "version_a and version_b query parameters are required")
 		return
 	}
 	templateID := chi.URLParam(r, "templateID")
 	tmpl, err := h.store.GetTemplate(r.Context(), templateID)
 	if err != nil {
-		h.handleTemplateError(w, err)
+		h.handleTemplateError(w, r, err)
 		return
 	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, tmpl.LegalEntityID, actionTemplateManage); err != nil {
-		h.writeAuthzErr(w, err)
+		h.writeAuthzErr(w, r, err)
 		return
 	}
 
 	result, err := h.store.CompareVersions(r.Context(), versionA, versionB)
 	if err != nil {
-		h.handleTemplateError(w, err)
+		h.handleTemplateError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, result)
@@ -1606,17 +1607,17 @@ func (h *Handler) ListLocales(w http.ResponseWriter, r *http.Request) {
 	templateID := chi.URLParam(r, "templateID")
 	tmpl, err := h.store.GetTemplate(r.Context(), templateID)
 	if err != nil {
-		h.handleTemplateError(w, err)
+		h.handleTemplateError(w, r, err)
 		return
 	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, tmpl.LegalEntityID, actionTemplateManage); err != nil {
-		h.writeAuthzErr(w, err)
+		h.writeAuthzErr(w, r, err)
 		return
 	}
 
 	locales, err := h.store.ListLocales(r.Context(), templateID)
 	if err != nil {
-		h.handleTemplateError(w, err)
+		h.handleTemplateError(w, r, err)
 		return
 	}
 	if locales == nil {
@@ -1625,54 +1626,54 @@ func (h *Handler) ListLocales(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, locales)
 }
 
-func (h *Handler) handleTemplateError(w http.ResponseWriter, err error) {
+func (h *Handler) handleTemplateError(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
 	case errors.Is(err, domain.ErrTemplateNotFound):
-		writeError(w, http.StatusNotFound, "template_not_found", "")
+		writeError(w, r, http.StatusNotFound, "template_not_found", "")
 	case errors.Is(err, domain.ErrTemplateVersionNotFound):
-		writeError(w, http.StatusNotFound, "template_version_not_found", "")
+		writeError(w, r, http.StatusNotFound, "template_version_not_found", "")
 	case errors.Is(err, domain.ErrTemplateRetired):
-		writeError(w, http.StatusConflict, "template_retired", err.Error())
+		writeError(w, r, http.StatusConflict, "template_retired", err.Error())
 	case errors.Is(err, domain.ErrTemplateAlreadyRetired):
-		writeError(w, http.StatusConflict, "already_retired", err.Error())
+		writeError(w, r, http.StatusConflict, "already_retired", err.Error())
 	case errors.Is(err, domain.ErrTemplateVersionNotDraft):
-		writeError(w, http.StatusConflict, "not_draft", err.Error())
+		writeError(w, r, http.StatusConflict, "not_draft", err.Error())
 	case errors.Is(err, domain.ErrTemplateVersionNotReview):
-		writeError(w, http.StatusConflict, "not_review", err.Error())
+		writeError(w, r, http.StatusConflict, "not_review", err.Error())
 	case errors.Is(err, domain.ErrTemplateVersionNotApproved):
-		writeError(w, http.StatusConflict, "not_approved", err.Error())
+		writeError(w, r, http.StatusConflict, "not_approved", err.Error())
 	case errors.Is(err, domain.ErrTemplateVersionSelfApproval):
-		writeError(w, http.StatusForbidden, "self_approval_forbidden", err.Error())
+		writeError(w, r, http.StatusForbidden, "self_approval_forbidden", err.Error())
 	case errors.Is(err, domain.ErrTemplateContentInvalid):
-		writeError(w, http.StatusBadRequest, "invalid_content", err.Error())
+		writeError(w, r, http.StatusBadRequest, "invalid_content", err.Error())
 	case errors.Is(err, domain.ErrSubjectInvalid):
-		writeError(w, http.StatusBadRequest, "invalid_subject", err.Error())
+		writeError(w, r, http.StatusBadRequest, "invalid_subject", err.Error())
 	case isIntentBindingError(err):
-		h.writeIntentError(w, err)
+		h.writeIntentError(w, r, err)
 	case errors.Is(err, domain.ErrTemplateLocaleRequired):
-		writeError(w, http.StatusBadRequest, "missing_fields", err.Error())
+		writeError(w, r, http.StatusBadRequest, "missing_fields", err.Error())
 	case errors.Is(err, domain.ErrTemplateVersionsBelongToDifferentTemplates):
-		writeError(w, http.StatusBadRequest, "version_template_mismatch", err.Error())
+		writeError(w, r, http.StatusBadRequest, "version_template_mismatch", err.Error())
 	default:
 		var missing domain.ErrTemplateVariablesMissing
 		if errors.As(err, &missing) {
-			writeError(w, http.StatusBadRequest, "missing_variables", missing.Error())
+			writeError(w, r, http.StatusBadRequest, "missing_variables", missing.Error())
 			return
 		}
 		var unexpected domain.ErrTemplateVariablesUnexpected
 		if errors.As(err, &unexpected) {
-			writeError(w, http.StatusBadRequest, "unexpected_variables", unexpected.Error())
+			writeError(w, r, http.StatusBadRequest, "unexpected_variables", unexpected.Error())
 			return
 		}
 		h.log.Error("template store error", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
 	}
 }
 
 func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
 	principalID := r.Header.Get("X-Principal-Id")
 	if principalID == "" {
-		writeError(w, http.StatusUnauthorized, "identity_missing", string(domain.ErrIdentityMissing))
+		writeError(w, r, http.StatusUnauthorized, "identity_missing", string(domain.ErrIdentityMissing))
 		return "", false
 	}
 	return principalID, true
@@ -1688,7 +1689,7 @@ func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (stri
 func (h *Handler) requireTenant(w http.ResponseWriter, r *http.Request) (string, bool) {
 	tenantID := svcmiddleware.TenantFromContext(r.Context())
 	if tenantID == "" {
-		writeError(w, http.StatusUnauthorized, "tenant_missing", "X-Tenant-Id is required")
+		writeError(w, r, http.StatusUnauthorized, "tenant_missing", "X-Tenant-Id is required")
 		return "", false
 	}
 	return tenantID, true
@@ -1710,11 +1711,11 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 	if err := dec.Decode(dst); err != nil {
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
-			writeError(w, http.StatusRequestEntityTooLarge, "request_too_large",
+			writeError(w, r, http.StatusRequestEntityTooLarge, "request_too_large",
 				"request body exceeds 256 KiB")
 			return false
 		}
-		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+		writeError(w, r, http.StatusBadRequest, "invalid_json", err.Error())
 		return false
 	}
 	return true
@@ -1733,7 +1734,7 @@ func parsePaging(w http.ResponseWriter, r *http.Request) (limit, offset int, ok 
 	if raw := r.URL.Query().Get("limit"); raw != "" {
 		n, err := strconv.Atoi(raw)
 		if err != nil || n < 1 || n > maxLimit {
-			writeError(w, http.StatusBadRequest, "invalid_limit",
+			writeError(w, r, http.StatusBadRequest, "invalid_limit",
 				"limit must be an integer between 1 and "+strconv.Itoa(maxLimit))
 			return 0, 0, false
 		}
@@ -1742,7 +1743,7 @@ func parsePaging(w http.ResponseWriter, r *http.Request) (limit, offset int, ok 
 	if raw := r.URL.Query().Get("offset"); raw != "" {
 		n, err := strconv.Atoi(raw)
 		if err != nil || n < 0 {
-			writeError(w, http.StatusBadRequest, "invalid_offset", "offset must be a non-negative integer")
+			writeError(w, r, http.StatusBadRequest, "invalid_offset", "offset must be a non-negative integer")
 			return 0, 0, false
 		}
 		offset = n
@@ -1750,11 +1751,11 @@ func parsePaging(w http.ResponseWriter, r *http.Request) (limit, offset int, ok 
 	return limit, offset, true
 }
 
-func (h *Handler) writeAuthzErr(w http.ResponseWriter, err error) {
+func (h *Handler) writeAuthzErr(w http.ResponseWriter, r *http.Request, err error) {
 	if errors.Is(err, domain.ErrAuthorizationDenied) {
-		writeError(w, http.StatusForbidden, "forbidden", err.Error())
+		writeError(w, r, http.StatusForbidden, "forbidden", err.Error())
 	} else {
-		writeError(w, http.StatusServiceUnavailable, "authz_unavailable", err.Error())
+		writeError(w, r, http.StatusServiceUnavailable, "authz_unavailable", err.Error())
 	}
 }
 
@@ -1766,20 +1767,18 @@ func getCorrelationID(r *http.Request) string {
 	return cid
 }
 
-func writeError(w http.ResponseWriter, status int, code, msg string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	body := map[string]string{
-		"error_code":    code,
-		"error_message": msg,
-	}
-	// Where the condition is exactly one the standard names, the stable code (section 10.3)
-	// rides beside the service's own. Added, never substituted: existing callers keep working.
+func writeError(w http.ResponseWriter, r *http.Request, status int, code, msg string) {
+	extra := map[string]any{}
 	if stable, ok := ncdcode.ForAPIError(code); ok {
-		body["reason_code"] = stable
-		body["reason"] = ncdcode.Names[stable]
+		extra["reason_code"] = stable
+		extra["reason"] = ncdcode.Names[stable]
 	}
-	_ = json.NewEncoder(w).Encode(body)
+	apicontract.WriteProblem(w, r, apicontract.Problem{
+		Status:  status,
+		Code:    code,
+		Detail:  msg,
+		Extra:   extra,
+	})
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -1795,7 +1794,7 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 // deterministic render, ledger recording, and delivery dispatch.
 func (h *Handler) IngestEvent(w http.ResponseWriter, r *http.Request) {
 	if h.orchestrator == nil {
-		writeError(w, http.StatusServiceUnavailable, "service_unavailable", "orchestrator not configured")
+		writeError(w, r, http.StatusServiceUnavailable, "service_unavailable", "orchestrator not configured")
 		return
 	}
 
@@ -1829,7 +1828,7 @@ func (h *Handler) IngestEvent(w http.ResponseWriter, r *http.Request) {
 	// Strictly validate mandatory request attributes
 	if req.EventID == "" || req.EventType == "" || req.RecipientPrincipalID == "" ||
 		req.TemplateKey == "" || req.LegalEntityID == "" || req.CorrelationID == "" {
-		writeError(w, http.StatusBadRequest, "missing_fields",
+		writeError(w, r, http.StatusBadRequest, "missing_fields",
 			"event_id, event_type, recipient_principal_id, template_key, legal_entity_id, correlation_id are required")
 		return
 	}
@@ -1837,7 +1836,7 @@ func (h *Handler) IngestEvent(w http.ResponseWriter, r *http.Request) {
 	// Authorization check
 	if h.authz != nil {
 		if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionSend); err != nil {
-			h.writeAuthzErr(w, err)
+			h.writeAuthzErr(w, r, err)
 			return
 		}
 	}
@@ -1846,23 +1845,23 @@ func (h *Handler) IngestEvent(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		switch {
 		case errors.Is(err, ledger.ErrMissingTenantContext):
-			writeError(w, http.StatusUnauthorized, "tenant_missing", err.Error())
+			writeError(w, r, http.StatusUnauthorized, "tenant_missing", err.Error())
 		case errors.Is(err, ledger.ErrInvalidIngestRequest):
-			writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+			writeError(w, r, http.StatusBadRequest, "invalid_request", err.Error())
 		case errors.Is(err, ledger.ErrTemplateNotFound):
-			writeError(w, http.StatusBadRequest, "unknown_template", err.Error())
+			writeError(w, r, http.StatusBadRequest, "unknown_template", err.Error())
 		case errors.Is(err, ledger.ErrMissingVariables):
-			writeError(w, http.StatusBadRequest, "missing_template_variables", err.Error())
+			writeError(w, r, http.StatusBadRequest, "missing_template_variables", err.Error())
 		case errors.Is(err, ledger.ErrHashMismatch):
 			h.log.Error("template integrity verification failed", zap.String("template_key", req.TemplateKey), zap.Error(err))
-			writeError(w, http.StatusInternalServerError, "template_integrity_failure", "template hash integrity check failed")
+			writeError(w, r, http.StatusInternalServerError, "template_integrity_failure", "template hash integrity check failed")
 		case errors.Is(err, ledger.ErrRecipientEmailUnresolved):
-			writeError(w, http.StatusUnprocessableEntity, "recipient_unresolved", err.Error())
+			writeError(w, r, http.StatusUnprocessableEntity, "recipient_unresolved", err.Error())
 		case errors.Is(err, ledger.ErrUnsubscribeUnavailable):
-			writeError(w, http.StatusServiceUnavailable, "unsubscribe_unavailable", err.Error())
+			writeError(w, r, http.StatusServiceUnavailable, "unsubscribe_unavailable", err.Error())
 		default:
 			h.log.Error("event orchestration failed", zap.String("event_id", req.EventID), zap.Error(err))
-			writeError(w, http.StatusInternalServerError, "orchestration_failed", err.Error())
+			writeError(w, r, http.StatusInternalServerError, "orchestration_failed", err.Error())
 		}
 		return
 	}
@@ -1884,7 +1883,7 @@ type IntentDetailResponse struct {
 // GetIntent retrieves a message intent and associated render under strict tenant RLS.
 func (h *Handler) GetIntent(w http.ResponseWriter, r *http.Request) {
 	if h.ledgerStore == nil {
-		writeError(w, http.StatusServiceUnavailable, "service_unavailable", "ledger store not configured")
+		writeError(w, r, http.StatusServiceUnavailable, "service_unavailable", "ledger store not configured")
 		return
 	}
 
@@ -1899,24 +1898,24 @@ func (h *Handler) GetIntent(w http.ResponseWriter, r *http.Request) {
 
 	id := chi.URLParam(r, "id")
 	if _, err := uuid.Parse(id); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_id", "id must be a valid UUID")
+		writeError(w, r, http.StatusBadRequest, "invalid_id", "id must be a valid UUID")
 		return
 	}
 
 	intent, err := h.ledgerStore.GetMessageIntent(r.Context(), tenantID, id)
 	if err != nil {
 		if errors.Is(err, store.ErrIntentNotFound) {
-			writeError(w, http.StatusNotFound, "intent_not_found", "message intent not found")
+			writeError(w, r, http.StatusNotFound, "intent_not_found", "message intent not found")
 			return
 		}
 		h.log.Error("failed to get message intent", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
 
 	if h.authz != nil && intent.LegalEntityID != "" {
 		if err := h.authz.CheckAllowed(r.Context(), principalID, intent.LegalEntityID, actionView); err != nil {
-			h.writeAuthzErr(w, err)
+			h.writeAuthzErr(w, r, err)
 			return
 		}
 	}
@@ -1951,23 +1950,23 @@ func (h *Handler) ListAttempts(w http.ResponseWriter, r *http.Request) {
 
 	notification, err := h.store.GetNotification(r.Context(), id)
 	if errors.Is(err, domain.ErrNotificationNotFound) {
-		writeError(w, http.StatusNotFound, "notification_not_found", "")
+		writeError(w, r, http.StatusNotFound, "notification_not_found", "")
 		return
 	}
 	if err != nil {
 		h.log.Error("failed to fetch notification", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, notification.LegalEntityID, actionView); err != nil {
-		h.writeAuthzErr(w, err)
+		h.writeAuthzErr(w, r, err)
 		return
 	}
 
 	attempts, err := h.store.ListAttempts(r.Context(), id)
 	if err != nil {
 		h.log.Error("failed to list delivery attempts", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
 	if attempts == nil {

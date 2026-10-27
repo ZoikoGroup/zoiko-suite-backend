@@ -10,10 +10,10 @@ import (
 )
 
 type apiError struct {
-	ErrorCode string `json:"error_code"`
-	Message   string `json:"error_message"`
-	Reason    string `json:"reason"`
-	Stable    string `json:"reason_code"`
+	Code       string                 `json:"code"`
+	Detail     string                 `json:"detail"`
+	ReasonCode string                 `json:"reason_code"`
+	Reason     string                 `json:"reason"`
 }
 
 func decodeAPIError(t *testing.T, body []byte) apiError {
@@ -40,10 +40,10 @@ func TestStableCodes_AnUnapprovedLocaleIsNotAnUnpublishedTemplate(t *testing.T) 
 		t.Fatalf("status = %d, want 422: %s", rr.Code, rr.Body.String())
 	}
 	e := decodeAPIError(t, rr.Body.Bytes())
-	if e.ErrorCode != "locale_not_approved" || e.Stable != "NCD-005" || !strings.Contains(e.Message, "NCD-005 LOCALE_NOT_APPROVED") {
+	if e.Code != "locale_not_approved" || e.ReasonCode != "NCD-005" || !strings.Contains(e.Detail, "NCD-005 LOCALE_NOT_APPROVED") {
 		t.Errorf("unexpected error: %+v", e)
 	}
-	if !strings.Contains(e.Message, "fr-FR") {
+	if !strings.Contains(e.Detail, "fr-FR") {
 		t.Error("the refusal should name the locale that was asked for")
 	}
 }

@@ -31,7 +31,7 @@ func (h *Handler) CancelNotification(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Reason == "" {
-		writeError(w, http.StatusBadRequest, "missing_fields", domain.ErrCancelReasonRequired.Error())
+		writeError(w, r, http.StatusBadRequest, "missing_fields", domain.ErrCancelReasonRequired.Error())
 		return
 	}
 	principalID, ok := h.requirePrincipal(w, r)
@@ -44,29 +44,29 @@ func (h *Handler) CancelNotification(w http.ResponseWriter, r *http.Request) {
 	}
 	existing, err := h.store.GetNotification(r.Context(), id)
 	if errors.Is(err, domain.ErrNotificationNotFound) {
-		writeError(w, http.StatusNotFound, "notification_not_found", "")
+		writeError(w, r, http.StatusNotFound, "notification_not_found", "")
 		return
 	}
 	if err != nil {
 		h.log.Error("failed to fetch notification", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionSend); err != nil {
-		h.writeAuthzErr(w, err)
+		h.writeAuthzErr(w, r, err)
 		return
 	}
 	n, err := h.store.CancelNotification(r.Context(), id, tenantID, principalID, req.Reason, time.Now().UTC())
 	switch {
 	case errors.Is(err, domain.ErrCancelNotAllowed):
-		writeError(w, http.StatusConflict, "not_cancellable", err.Error())
+		writeError(w, r, http.StatusConflict, "not_cancellable", err.Error())
 		return
 	case errors.Is(err, domain.ErrNotificationNotFound):
-		writeError(w, http.StatusNotFound, "notification_not_found", "")
+		writeError(w, r, http.StatusNotFound, "notification_not_found", "")
 		return
 	case err != nil:
 		h.log.Error("failed to cancel notification", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, n)

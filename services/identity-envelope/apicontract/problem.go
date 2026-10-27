@@ -67,6 +67,12 @@ func WriteProblem(w http.ResponseWriter, r *http.Request, p Problem) {
 			p.Title = "Error"
 		}
 	}
+	// Transient conditions are always worth a retry (ZS-API-001 §12); the
+	// caller still has to respect idempotency and Retry-After.
+	switch p.Status {
+	case http.StatusTooManyRequests, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		p.Retryable = true
+	}
 	if r != nil {
 		if p.RequestID == "" {
 			p.RequestID = RequestIDFrom(r)
