@@ -12,7 +12,6 @@ import (
 
 	"zoiko.io/jurisdiction-rules-svc/internal/domain"
 	"zoiko.io/jurisdiction-rules-svc/internal/events"
-	"zoiko.io/jurisdiction-rules-svc/internal/problem"
 	"zoiko.io/jurisdiction-rules-svc/internal/store"
 )
 
@@ -86,8 +85,8 @@ func (h *Handler) writeOpsError(w http.ResponseWriter, r *http.Request, err erro
 	var blocked *store.OpsBlocked
 	switch {
 	case errors.As(err, &blocked):
-		problem.Write(w, problem.New(http.StatusConflict, "operation_blocked",
-			"one or more gates are not met").With("reasons", blocked.Reasons))
+		writeProblemWith(w, r, http.StatusConflict, "operation_blocked",
+			"one or more gates are not met", map[string]any{"reasons": blocked.Reasons})
 	case errors.Is(err, domain.ErrInvalidLifecycle):
 		writeError(w, r, http.StatusConflict, "invalid_lifecycle_state", err.Error())
 	case errors.Is(err, domain.ErrRingNotFound):

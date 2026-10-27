@@ -12,7 +12,6 @@ import (
 
 	"go.uber.org/zap"
 
-	"zoiko.io/jurisdiction-rules-svc/internal/problem"
 	"zoiko.io/jurisdiction-rules-svc/internal/store"
 )
 
@@ -76,7 +75,7 @@ func IdempotencyMiddleware(st IdempotencyStore, log *zap.Logger) func(http.Handl
 			ctx := r.Context()
 			existing, err := st.ClaimIdempotencyKey(ctx, principal, key, r.Method, r.URL.Path, reqHash)
 			if err != nil {
-				problem.Write(w, problem.New(http.StatusServiceUnavailable, "store_unavailable", ""))
+				writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
 				return
 			}
 			if existing != nil {

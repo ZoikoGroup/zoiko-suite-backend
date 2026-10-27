@@ -2,6 +2,7 @@ package handler
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
@@ -10,7 +11,6 @@ import (
 
 	"zoiko.io/jurisdiction-rules-svc/internal/domain"
 	"zoiko.io/jurisdiction-rules-svc/internal/events"
-	"zoiko.io/jurisdiction-rules-svc/internal/problem"
 	"zoiko.io/jurisdiction-rules-svc/internal/store"
 )
 
@@ -42,8 +42,8 @@ func (h *Handler) writeCompileError(w http.ResponseWriter, r *http.Request, err 
 	var cf *store.CompileFailure
 	switch {
 	case errors.As(err, &cf):
-		problem.Write(w, problem.New(http.StatusUnprocessableEntity, "compile_failed",
-			"the pack has errors and no artifact was produced").With("report", cf.Report))
+		writeProblemWith(w, r, http.StatusUnprocessableEntity, "compile_failed",
+			"the pack has errors and no artifact was produced", map[string]any{"report": cf.Report})
 	case errors.Is(err, domain.ErrNotUnderReview):
 		writeError(w, r, http.StatusConflict, "not_under_review", err.Error())
 	case errors.Is(err, domain.ErrAlreadyCompiled):
@@ -134,7 +134,8 @@ func (h *Handler) VerifyPackArtifact(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, domain.ErrNotCompiled) {
 			h.emitRegistry(r, events.EventPackVerificationFailed, ref+"@"+version, actor, map[string]any{
 				"pack_ref": ref, "version": version, "reasons": []string{domain.ReasonUnsigned, "not_compiled"}})
-			writeJSON(w, http.StatusConflict, map[string]any{"verified": false, "reasons": []string{"not_compiled"}})
+			writeProblemWith(w, r, http.StatusConflict, "artifact_unverified", "the pack version has no compiled artifact",
+				map[string]any{"verified": false, "reasons": []string{"not_compiled"}})
 			return
 		}
 		h.writeCompileError(w, r, err, r.Header.Get("X-Correlation-ID"))
@@ -143,7 +144,11 @@ func (h *Handler) VerifyPackArtifact(w http.ResponseWriter, r *http.Request) {
 	if !res.Verified {
 		h.emitRegistry(r, events.EventPackVerificationFailed, a.PackVersionID, actor, map[string]any{
 			"pack_version_id": a.PackVersionID, "pack_ref": ref, "version": version, "reasons": res.Reasons})
-		writeJSON(w, http.StatusConflict, res)
+		// The verification result stays on the problem as extension members.
+		extra := map[string]any{}
+		raw, _ := json.Marshal(res)
+		_ = json.Unmarshal(raw, &extra)
+		writeProblemWith(w, r, http.StatusConflict, "artifact_unverified", "the pack artifact failed verification", extra)
 		return
 	}
 	writeJSON(w, http.StatusOK, res)

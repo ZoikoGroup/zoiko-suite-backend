@@ -272,10 +272,10 @@ func TestSourceToApprovedInterpretation_EnforcesIndependentReview(t *testing.T) 
 	// The author cannot approve; an unreviewed source blocks even an independent approver.
 	code, r := e.do("POST", "/v1/admin/interpretations/"+iid+"/approve", "author", nil)
 	mustStatus(t, 403, code, r)
-	assert.Equal(t, "segregation_of_duties", r["error"])
+	assert.Equal(t, "segregation_of_duties", r["code"])
 	code, r = e.do("POST", "/v1/admin/interpretations/"+iid+"/approve", "approver", nil)
 	mustStatus(t, 409, code, r)
-	assert.Equal(t, "source_not_ready", r["error"])
+	assert.Equal(t, "source_not_ready", r["code"])
 
 	// The author cannot review their own source; an independent reviewer can, once.
 	code, r = e.do("POST", "/v1/admin/sources/"+sid+"/review", "author", nil)
@@ -364,7 +364,7 @@ func TestRuleProvenance_NeedsApprovedInterpretation_AndFreezesWhenActive(t *test
 
 	code, r := e.do("PUT", path, "author", req)
 	mustStatus(t, 409, code, r)
-	assert.Equal(t, "interpretation_not_approved", r["error"], "JUR-NEG-18: unapproved interpretation cannot back a rule")
+	assert.Equal(t, "interpretation_not_approved", r["code"], "JUR-NEG-18: unapproved interpretation cannot back a rule")
 
 	_, _ = e.do("POST", "/v1/admin/sources/"+sid+"/review", "reviewer", nil)
 	code, r = e.do("POST", "/v1/admin/interpretations/"+iid+"/approve", "approver", nil)
@@ -388,7 +388,7 @@ func TestRuleProvenance_NeedsApprovedInterpretation_AndFreezesWhenActive(t *test
 	require.NoError(t, err)
 	code, r = e.do("PUT", path, "author", req)
 	mustStatus(t, 409, code, r)
-	assert.Equal(t, "not_draft", r["error"])
+	assert.Equal(t, "not_draft", r["code"])
 	_, err = pool.Exec(ctx, `UPDATE jurisdiction_rules SET precedence=99 WHERE jurisdiction_rule_id=$1`, rule.JurisdictionRuleID)
 	require.Error(t, err)
 	_, err = pool.Exec(ctx, `DELETE FROM rule_sources WHERE jurisdiction_rule_id=$1`, rule.JurisdictionRuleID)
@@ -450,7 +450,7 @@ func TestPackVersioning_Immutability_AndDigest(t *testing.T) {
 	// Versions must increase; numeric ordering (10 > 9).
 	code, r = e.do("POST", vpath, "author", manifest(ref, "2026.08.0", j.JurisdictionCode, nil))
 	mustStatus(t, 409, code, r)
-	assert.Equal(t, "version_not_newer", r["error"])
+	assert.Equal(t, "version_not_newer", r["code"])
 	code, r = e.do("POST", vpath, "author", manifest(ref, "2026.08.9", j.JurisdictionCode, nil))
 	mustStatus(t, 201, code, r)
 	code, r = e.do("POST", vpath, "author", manifest(ref, "2026.08.10", j.JurisdictionCode, nil))
@@ -468,7 +468,7 @@ func TestPackVersioning_Immutability_AndDigest(t *testing.T) {
 	mustStatus(t, 400, code, r)
 	code, r = e.do("POST", vpath, "author", manifest("jur.other.tax.core", "2026.09.1", j.JurisdictionCode, nil))
 	mustStatus(t, 400, code, r)
-	assert.Equal(t, "pack_mismatch", r["error"])
+	assert.Equal(t, "pack_mismatch", r["code"])
 
 	// DRAFT -> REVIEW once; afterwards the content is frozen in SQL too.
 	code, r = e.do("POST", vpath+"/2026.08.1/submit-review", "author", nil)

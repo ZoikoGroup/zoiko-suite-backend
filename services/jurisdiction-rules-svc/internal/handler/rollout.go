@@ -38,7 +38,7 @@ func (h *Handler) writeRolloutError(w http.ResponseWriter, r *http.Request, err 
 	var blocked *domain.RolloutBlockedError
 	switch {
 	case errors.As(err, &blocked):
-		writeJSON(w, http.StatusConflict, map[string]any{"error": "rollout_blocked", "message": blocked.Error(), "blockers": blocked.Blockers})
+		writeProblemWith(w, r, http.StatusConflict, "rollout_blocked", blocked.Error(), map[string]any{"blockers": blocked.Blockers})
 	case errors.Is(err, domain.ErrRolloutNotFound):
 		writeError(w, r, http.StatusNotFound, "rollout_not_found", err.Error())
 	default:

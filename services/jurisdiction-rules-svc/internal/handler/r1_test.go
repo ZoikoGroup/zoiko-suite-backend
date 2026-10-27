@@ -125,6 +125,9 @@ func TestGetRule_ReturnsETag(t *testing.T) {
 
 func decodeErrorAnyStatus(t *testing.T, rr *httptest.ResponseRecorder) map[string]any {
 	t.Helper()
+	if ct := rr.Header().Get("Content-Type"); ct != "application/problem+json" {
+		t.Fatalf("expected Content-Type application/problem+json, got %q", ct)
+	}
 	var body map[string]any
 	_ = json.NewDecoder(rr.Body).Decode(&body)
 	return body

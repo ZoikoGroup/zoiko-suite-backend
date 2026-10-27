@@ -10,7 +10,6 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"zoiko.io/jurisdiction-rules-svc/internal/domain"
-	"zoiko.io/jurisdiction-rules-svc/internal/problem"
 	"zoiko.io/jurisdiction-rules-svc/internal/resolver"
 	"zoiko.io/jurisdiction-rules-svc/internal/store"
 )
@@ -152,9 +151,8 @@ func (h *Handler) writeResolveError(w http.ResponseWriter, r *http.Request, err 
 	var ue *resolver.UnverifiedError
 	switch {
 	case errors.As(err, &ue):
-		problem.Write(w, problem.New(http.StatusServiceUnavailable, "pack_unverified",
-			"a pack covering this jurisdiction failed verification; no answer is given rather than a different one").
-			With("failures", ue.Failures))
+		writeProblemWith(w, r, http.StatusServiceUnavailable, "pack_unverified",
+			"a pack covering this jurisdiction failed verification; no answer is given rather than a different one", map[string]any{"failures": ue.Failures})
 	case errors.Is(err, resolver.ErrBadRequest):
 		writeError(w, r, http.StatusBadRequest, "invalid_request", err.Error())
 	case errors.Is(err, resolver.ErrPinnedNotEligible):

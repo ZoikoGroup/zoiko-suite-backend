@@ -1407,6 +1407,14 @@ func writeError(w http.ResponseWriter, r *http.Request, status int, code, messag
 	apicontract.WriteProblem(w, r, apicontract.Problem{Status: status, Code: code, Detail: message})
 }
 
+// writeProblemWith is writeError with extension members (gate reasons, compile
+// reports, verification results) kept beside the contract members.
+func writeProblemWith(w http.ResponseWriter, r *http.Request, status int, code, message string, extra map[string]any) {
+	p := apicontract.ProblemFor(status, code, message)
+	p.Extra = extra
+	apicontract.WriteProblem(w, r, p)
+}
+
 // writeJSON serialises v as JSON and writes it to w with the given status code.
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
