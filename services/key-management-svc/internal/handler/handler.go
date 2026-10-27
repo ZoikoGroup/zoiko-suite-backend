@@ -9,6 +9,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	chimw "github.com/go-chi/chi/v5/middleware"
 	"go.uber.org/zap"
+	apicontract "zoiko.io/identity-envelope/apicontract"
 	authzpkg "zoiko.io/key-management-svc/internal/authz"
 	"zoiko.io/key-management-svc/internal/domain"
 	svcenvelope "zoiko.io/key-management-svc/internal/envelope"
@@ -39,11 +40,11 @@ import (
 func requireTenant(w http.ResponseWriter, r *http.Request) (string, bool) {
 	tenantID := r.Header.Get("X-Tenant-ID")
 	if tenantID == "" {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusUnauthorized)
-		_ = json.NewEncoder(w).Encode(map[string]string{
-			"error":   "missing_tenant_scope",
-			"message": "X-Tenant-ID is required — the gateway sets it from a verified identity envelope",
+		apicontract.WriteProblem(w, r, apicontract.Problem{
+			Status:    http.StatusUnauthorized,
+			Code:      "missing_tenant_scope",
+			Detail:    "X-Tenant-ID is required — the gateway sets it from a verified identity envelope",
+			Retryable: false,
 		})
 		return "", false
 	}
@@ -90,7 +91,7 @@ type Handler struct {
 func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
 	principalID := r.Header.Get("X-Principal-Id")
 	if principalID == "" {
-		h.errJSON(w, http.StatusUnauthorized,
+		h.errJSON(w, r, http.StatusUnauthorized,
 			"X-Principal-Id is required — the gateway sets it from a verified identity envelope")
 		return "", false
 	}
@@ -112,11 +113,11 @@ func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (stri
 func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID, legalEntityID, actionType string) bool {
 	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionType); err != nil {
 		if errors.Is(err, authzpkg.ErrAuthorizationDenied) {
-			h.errJSON(w, http.StatusForbidden, "not authorized to perform this action")
+			h.errJSON(w, r, http.StatusForbidden, "not authorized to perform this action")
 			return false
 		}
 		h.logger.Error("authorization check failed", zap.Error(err))
-		h.errJSON(w, http.StatusServiceUnavailable, "authorization service unavailable")
+		h.errJSON(w, r, http.StatusServiceUnavailable, "authorization service unavailable")
 		return false
 	}
 	return true
@@ -157,11 +158,11 @@ func (h *Handler) RegisterKey(w http.ResponseWriter, r *http.Request) {
 	}
 	var req domain.RegisterKeyRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.errJSON(w, 400, "invalid body")
+		h.errJSON(w, r, 400, "invalid body")
 		return
 	}
 	if err := req.Validate(); err != nil {
-		h.errJSON(w, 400, err.Error())
+		h.errJSON(w, r, 400, err.Error())
 		return
 	}
 	principalID, ok := h.requirePrincipal(w, r)
@@ -179,10 +180,10 @@ func (h *Handler) RegisterKey(w http.ResponseWriter, r *http.Request) {
 		ExternalKeyARN: req.ExternalKeyARN,
 	}
 	if err := h.store.CreateKey(r.Context(), tenantID, key); err != nil {
-		h.errJSON(w, 500, "failed to register key")
+		h.errJSON(w, r, 500, "failed to register key")
 		return
 	}
-	h.okJSON(w, 201, key)
+	h.okJSON(w, r, 201, key)
 }
 
 func (h *Handler) GetKey(w http.ResponseWriter, r *http.Request) {
@@ -196,13 +197,13 @@ func (h *Handler) GetKey(w http.ResponseWriter, r *http.Request) {
 	}
 	key, err := h.store.GetKeyByID(r.Context(), tenantID, chi.URLParam(r, "id"))
 	if err != nil {
-		h.errJSON(w, 404, "key not found")
+		h.errJSON(w, r, 404, "key not found")
 		return
 	}
 	if !h.authorize(w, r, principalID, key.LegalEntityID, KeyRead) {
 		return
 	}
-	h.okJSON(w, 200, key)
+	h.okJSON(w, r, 200, key)
 }
 
 func (h *Handler) ListKeys(w http.ResponseWriter, r *http.Request) {
@@ -221,7 +222,7 @@ func (h *Handler) ListKeys(w http.ResponseWriter, r *http.Request) {
 	// the tenant across all legal entities.
 	legalEntityID := r.URL.Query().Get("legal_entity_id")
 	if legalEntityID == "" {
-		h.errJSON(w, http.StatusBadRequest,
+		h.errJSON(w, r, http.StatusBadRequest,
 			"legal_entity_id query parameter is required — it is the authorization scope for this listing")
 		return
 	}
@@ -232,7 +233,7 @@ func (h *Handler) ListKeys(w http.ResponseWriter, r *http.Request) {
 	if keys == nil {
 		keys = []domain.CustomerKey{}
 	}
-	h.okJSON(w, 200, map[string]interface{}{"data": keys, "count": len(keys)})
+	h.okJSON(w, r, 200, map[string]interface{}{"data": keys, "count": len(keys)})
 }
 
 func (h *Handler) RotateKey(w http.ResponseWriter, r *http.Request) {
@@ -252,7 +253,7 @@ func (h *Handler) RotateKey(w http.ResponseWriter, r *http.Request) {
 	// mutation, which means fetching the row purely to learn whose it is.
 	existing, err := h.store.GetKeyByID(r.Context(), tenantID, id)
 	if err != nil {
-		h.errJSON(w, 404, "key not found")
+		h.errJSON(w, r, 404, "key not found")
 		return
 	}
 	if !h.authorize(w, r, principalID, existing.LegalEntityID, KeyRotate) {
@@ -261,7 +262,7 @@ func (h *Handler) RotateKey(w http.ResponseWriter, r *http.Request) {
 
 	key, err := h.store.RotateKey(r.Context(), tenantID, id)
 	if err != nil {
-		h.errJSON(w, 404, "key not found")
+		h.errJSON(w, r, 404, "key not found")
 		return
 	}
 	// Doc 05 §13.2 names "secret retrieval" and key lifecycle events as
@@ -269,7 +270,7 @@ func (h *Handler) RotateKey(w http.ResponseWriter, r *http.Request) {
 	// this service can report with certainty (it happened, right now, to
 	// this specific key), unlike a bare GetKey which returns only metadata.
 	h.siem.Stream(r.Context(), tenantID, "key.rotated", siem.SeverityMedium, "Key rotated: "+id)
-	h.okJSON(w, 200, key)
+	h.okJSON(w, r, 200, key)
 }
 
 func (h *Handler) DisableKey(w http.ResponseWriter, r *http.Request) {
@@ -289,7 +290,7 @@ func (h *Handler) DisableKey(w http.ResponseWriter, r *http.Request) {
 	// until after disabling it.
 	existing, err := h.store.GetKeyByID(r.Context(), tenantID, id)
 	if err != nil {
-		h.errJSON(w, 404, "key not found")
+		h.errJSON(w, r, 404, "key not found")
 		return
 	}
 	if !h.authorize(w, r, principalID, existing.LegalEntityID, KeyDisable) {
@@ -297,18 +298,23 @@ func (h *Handler) DisableKey(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.store.DisableKey(r.Context(), tenantID, id); err != nil {
-		h.errJSON(w, 404, "key not found")
+		h.errJSON(w, r, 404, "key not found")
 		return
 	}
 	h.siem.Stream(r.Context(), tenantID, "key.disabled", siem.SeverityHigh, "Key disabled: "+id)
-	h.okJSON(w, 200, map[string]string{"message": "key disabled"})
+	h.okJSON(w, r, 200, map[string]string{"message": "key disabled"})
 }
 
-func (h *Handler) okJSON(w http.ResponseWriter, code int, v interface{}) {
+func (h *Handler) okJSON(w http.ResponseWriter, r *http.Request, code int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(v)
 }
-func (h *Handler) errJSON(w http.ResponseWriter, code int, msg string) {
-	h.okJSON(w, code, map[string]string{"error": msg})
+func (h *Handler) errJSON(w http.ResponseWriter, r *http.Request, code int, msg string) {
+	apicontract.WriteProblem(w, r, apicontract.Problem{
+		Status:    code,
+		Code:      "internal_error",
+		Detail:    msg,
+		Retryable: code >= 500,
+	})
 }

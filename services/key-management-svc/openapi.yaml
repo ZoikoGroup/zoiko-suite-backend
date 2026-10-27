@@ -1,0 +1,292 @@
+openapi: 3.1.0
+info:
+  title: key-management-svc
+  version: 1.0.0
+  description: |
+    Customer key metadata registry for BYOK/HYOK key management.
+
+    ## Authentication & Authorization
+
+    Every endpoint requires the standard ZS-ARCH-SVC-001 §4
+    identity envelope headers (`X-Tenant-Id`, `X-Principal-Id`,
+    `X-Correlation-Id`, `Idempotency-Key`). Missing or unverified headers
+    result in 401. Authorization is enforced via `authorization-svc` at
+    the legal entity scope (see per-route descriptions).
+
+    Unlike siem-integration-svc or carta-svc, ALL routes in this service
+    require a verified principal. Verified: no service-to-service callers
+    exist for this service's routes, so no exemptions are needed.
+
+    ## Error responses (RFC 9457)
+
+    All error responses are `application/problem+json` with the stable
+    `code` field. The legacy `error` string is preserved in the body for
+    backward compatibility. Clients should branch on `code`, not on the
+    human-readable `detail`.
+
+servers:
+  - url: http://localhost:8143
+    description: Local development
+
+paths:
+  /healthz:
+    get:
+      summary: Liveness probe
+      operationId: Healthz
+      responses:
+        '200':
+          description: Service is running
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+                  service: { type: string, example: key-management-svc }
+
+  /v1/keys:
+    post:
+      summary: Register a customer key
+      description: |
+        Registers a new BYOK/HYOK key with the given alias, model, and
+        provider. The external key ARN references the KMS where the key
+        material lives. Authorized on `KEY_REGISTER` at the provided
+        `legal_entity_id`.
+      operationId: RegisterKey
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterKeyRequest'
+      responses:
+        '201':
+          description: Key registered
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CustomerKey' }
+        '400':
+          description: Invalid request body or validation error
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401':
+          description: Missing tenant or principal
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '403':
+          description: Not authorized to register a key at that entity
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '500':
+          description: Failed to register key
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+    get:
+      summary: List customer keys
+      description: |
+        Returns keys in the caller's tenant, filtered by required
+        `legal_entity_id` (the authorization scope). Requires principal and
+        authorization on `KEY_READ` at the specified legal entity.
+      operationId: ListKeys
+      parameters:
+        - name: legal_entity_id
+          in: query
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: List of keys
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/KeyListResponse' }
+        '400':
+          description: Missing legal_entity_id
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401':
+          description: Missing tenant or principal
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '403':
+          description: Not authorized to read keys for that entity
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /v1/keys/{id}:
+    get:
+      summary: Get a customer key by ID
+      operationId: GetKey
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Key
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CustomerKey' }
+        '401':
+          description: Missing tenant or principal
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '403':
+          description: Not authorized to read that key
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404':
+          description: Key not found in this tenant
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+    post:
+      summary: Rotate a customer key
+      description: |
+        Advances the key's version by registering a new key with the same
+        alias and external ARN. The old key version is retired. Authorized
+        on `KEY_ROTATE` at the key's own `legal_entity_id` (taken from the
+        row, never from the caller).
+      operationId: RotateKey
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Rotated key
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CustomerKey' }
+        '401':
+          description: Missing tenant or principal
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '403':
+          description: Not authorized to rotate that key
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404':
+          description: Key not found
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '500':
+          description: Failed to rotate key
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+    delete:
+      summary: Disable a customer key
+      description: |
+        Disables the key (the destructive operation for this metadata-only
+        service; tracker row 82 notes it does not yet drive real KMS
+        operations). Authorized on `KEY_DISABLE` at the key's own
+        `legal_entity_id`. This route flips a status field; on future
+        integration with a real KMS it will revoke the underlying key
+        material, which is why the authorization boundary is drawn
+        separately from ROTATE.
+      operationId: DisableKey
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Key disabled
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DisableResult' }
+        '401':
+          description: Missing tenant or principal
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '403':
+          description: Not authorized to disable that key
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404':
+          description: Key not found
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+components:
+  schemas:
+    Problem:
+      type: object
+      required: [type, title, status, code]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        code: { type: string }
+        request_id: { type: string }
+        correlation_id: { type: string }
+        retryable: { type: boolean }
+        retry_after: { type: integer }
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              pointer: { type: string }
+              code: { type: string }
+              detail: { type: string }
+        current_version: { type: integer, format: int64 }
+        decision_id: { type: string }
+
+    RegisterKeyRequest:
+      type: object
+      required: [legal_entity_id, key_alias, key_model, key_provider, external_key_arn]
+      properties:
+        legal_entity_id: { type: string, format: uuid }
+        key_alias: { type: string }
+        key_model: { type: string }
+        key_provider: { type: string }
+        external_key_arn: { type: string, format: uri }
+
+    CustomerKey:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        legal_entity_id: { type: string, format: uuid }
+        key_alias: { type: string }
+        key_model: { type: string }
+        key_provider: { type: string }
+        external_key_arn: { type: string, format: uri }
+        status: { type: string, enum: [ACTIVE, DISABLED, ROTATED] }
+        version: { type: integer }
+        prior_version_id: { type: string, format: uuid }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    KeyListResponse:
+      type: object
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/CustomerKey' }
+        count: { type: integer }
+
+    DisableResult:
+      type: object
+      properties:
+        message: { type: string }
