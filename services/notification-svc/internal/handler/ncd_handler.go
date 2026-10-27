@@ -12,6 +12,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
+	"zoiko.io/identity-envelope/apicontract"
 	"zoiko.io/notification-svc/internal/domain"
 	svcmiddleware "zoiko.io/notification-svc/internal/middleware"
 	"zoiko.io/notification-svc/internal/ncd"
@@ -162,9 +163,9 @@ func (h *NCDHandler) fail(w http.ResponseWriter, r *http.Request, err error) {
 	case ncd.KindConflict:
 		status = http.StatusConflict
 	case ncd.KindRefused:
-		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{
-			"error_code": e.Code, "error_message": e.Detail, "reason": e.Refusal.Name, "reason_code": e.Refusal.Code,
-		})
+		p := apicontract.ProblemFor(http.StatusUnprocessableEntity, e.Code, e.Detail)
+		p.Extra = map[string]any{"reason": e.Refusal.Name, "reason_code": e.Refusal.Code}
+		apicontract.WriteProblem(w, r, p)
 		return
 	}
 	if status == http.StatusServiceUnavailable {

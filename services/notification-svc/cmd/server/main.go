@@ -455,6 +455,9 @@ func main() {
 		}
 		return false
 	}
+	// The vendored envelope middleware answers refusals as legacy JSON; render
+	// them as RFC 9457 problem+json like every other error (ZS-API-001 §12).
+	r.Use(apicontract.EnvelopeRefusals)
 	r.Use(svcenvelope.Middleware(envelopePolicy, svcenvelope.DefaultReporter()))
 	// Idempotency-Key is honoured, not merely demanded: a repeated command is
 	// answered from its first response (migration 000015).
