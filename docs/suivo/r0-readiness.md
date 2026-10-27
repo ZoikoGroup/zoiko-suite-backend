@@ -29,7 +29,7 @@ TEST-ONLY fixtures with the fake model; it proves mechanisms, not production beh
 | Missing Security, SRE or QA sign-off | All PENDING |
 | Rollback or kill switch cannot be executed | Drills pass in dev; not yet executed on staging |
 | Handoff/CRM false-success state | Route-only; prohibited phrases blocked; no CRM/case code in R0 |
-| P0 accessibility obstruction | Not assessed — widget not built (STEP 13, frontend repo) |
+| P0 accessibility obstruction | Widget built (public site + console). Keyboard, focus return, live region, 44 px buttons, 375 px layout checked in a browser; no screen-reader (NVDA/VoiceOver) or 200%/400% zoom pass yet |
 
 ## Operational artefacts
 
@@ -41,7 +41,7 @@ TEST-ONLY fixtures with the fake model; it proves mechanisms, not production beh
 
 ## Known gaps
 
-- Widget (STEP 13) not built; WCAG, browser and responsive testing therefore not done.
+- Widget built; full WCAG 2.2 AA audit (screen readers, zoom, contrast tooling) and automated browser tests not done.
 - No load/latency measurement; proposed p95 ≤ 8 s is unverified.
 - No alert rules or dashboards wired (OTel attributes are defined in Doc 08 App. B; exporter not added).
 - Kafka publishing is implemented but only exercised with the log publisher locally.

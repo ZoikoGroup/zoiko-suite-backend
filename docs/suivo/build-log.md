@@ -203,3 +203,22 @@ Each entry records what a build step changed and the verified result of
 - Checks: frontend `tsc --noEmit` and eslint clean; backend build, vet, all tests (incl. Postgres) pass.
 - Not done: automated browser/a11y tests (the console repo has no test runner), screen-reader pass with
   NVDA/VoiceOver, 200%/400% zoom check, answer quality (the fake model is extractive; real model is DEC-05).
+
+## STEP 13b — Widget on the public website (per Documents 01 and 11)
+
+- Repo `ZoikoSuite-NextJS` (public site), branch `suivo/public-assistant`: `lib/publicAi.ts` (browser client),
+  `components/assistant/AssistantWidget.tsx`, mounted site-wide in `app/layout.tsx`.
+- Design (Doc 04 §05 zone Z0 → Z1): the visitor's browser calls public-ai-svc directly, so the Origin
+  allowlist and per-visitor rate limits work as designed (a server-side proxy would make every visitor look
+  like one IP). `credentials: "omit"` so no site cookies reach the API; grant held in memory only.
+- Page-aware starter chips by canonical page context (pricing, core modules; general elsewhere — Doc 02 §22);
+  page_context sent to the API from an allowlist, never the raw URL. Site brand colours.
+- Configuration: `NEXT_PUBLIC_PUBLIC_AI_URL` (defaults to http://localhost:18080); the site origin must be in
+  `PUBLIC_AI_ALLOWED_ORIGINS`. The repo ignores all `.env*` files, so no example file is committed.
+- Verified in a real browser (site :3002, backend dev mode :18080): CORS preflight allowed only for the
+  configured origin; pricing chip → clarify → Growth price from the verified claim with source link and
+  "View pricing"; SOC 2 → not claimed, "Open Trust Center"; all links resolve to approved URLs; Escape returns
+  focus to the launcher; 375 px full-screen sheet, no horizontal scroll.
+- Checks: `tsc --noEmit` and eslint clean.
+- The console widget (`zoiko-suite-frontend-platform`, branch `suivo/assistant-widget`) remains as built;
+  keep one or both — the docs intend the public website.
