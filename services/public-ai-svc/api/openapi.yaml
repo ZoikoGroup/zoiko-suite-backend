@@ -210,6 +210,59 @@ paths:
         "422": {$ref: "#/components/responses/Problem"}
         "429": {$ref: "#/components/responses/Problem"}
         "503": {$ref: "#/components/responses/Problem"}
+  /turns/{turn_id}/feedback:
+    post:
+      summary: Rate one of the caller's own answers (Doc 01 FR-09). Enums only, no free text. Extension (ADR-005).
+      security: [{publicChatSession: []}]
+      parameters:
+        - {name: turn_id, in: path, required: true, schema: {type: string}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [schema_version, session_id, rating]
+              properties:
+                schema_version: {const: "1.0"}
+                session_id: {type: string}
+                rating: {type: string, enum: [useful, not_useful]}
+                reason: {type: string, enum: [incorrect, incomplete, not_relevant, unclear, other]}
+      responses:
+        "204": {description: Recorded}
+        "401": {$ref: "#/components/responses/Problem"}
+        "404": {$ref: "#/components/responses/Problem"}
+        "422": {$ref: "#/components/responses/Problem"}
+  /handoffs:
+    post:
+      summary: Visitor opened an official route. Emits chat.handoff.clicked.v1; never creates a case, ticket, lead or booking. Extension (ADR-005).
+      security: [{publicChatSession: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [schema_version, session_id, route_key]
+              properties:
+                schema_version: {const: "1.0"}
+                session_id: {type: string}
+                route_key: {type: string}
+      responses:
+        "200":
+          description: Approved URL for the route
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [route_key, url]
+                properties:
+                  route_key: {type: string}
+                  url: {type: string, format: uri}
+        "401": {$ref: "#/components/responses/Problem"}
+        "404": {$ref: "#/components/responses/Problem"}
   /turns/{turn_id}/events:
     get:
       summary: Progress stream. Disabled in R0 (stream_enabled=false) and always 404.

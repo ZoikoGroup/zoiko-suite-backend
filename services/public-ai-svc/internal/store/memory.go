@@ -200,6 +200,49 @@ func (m *Memory) AbortTurn(_ context.Context, sessionID, turnID string) error {
 	return nil
 }
 
+func (m *Memory) SetFeedback(_ context.Context, sessionID, turnID, rating, reason string, _ time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, t := range m.turns {
+		if t.SessionID == sessionID && t.TurnID == turnID && t.Completed {
+			t.FeedbackRating, t.FeedbackReason = rating, reason
+			return nil
+		}
+	}
+	return ErrNotFound
+}
+
+func (m *Memory) PurgeSessions(_ context.Context, cutoff time.Time) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for id, s := range m.sessions {
+		if s.ExpiresAt.Before(cutoff) || (s.DeletedAt != nil && s.DeletedAt.Before(cutoff)) {
+			delete(m.sessions, id)
+			delete(m.byGrant, string(s.GrantHash))
+			for k, t := range m.turns {
+				if t.SessionID == id {
+					delete(m.turns, k)
+				}
+			}
+			for k, e := range m.sessionIdem {
+				if e.sessionID == id {
+					delete(m.sessionIdem, k)
+				}
+			}
+			n++
+		}
+	}
+	return n, nil
+}
+
+func (m *Memory) AppendEvents(_ context.Context, events []OutboxEvent) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.appendOutbox(events)
+	return nil
+}
+
 func (m *Memory) PutRelease(_ context.Context, r Release) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

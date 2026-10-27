@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"mime"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -143,6 +144,18 @@ func (s *statusRecorder) WriteHeader(code int) {
 	s.ResponseWriter.WriteHeader(code)
 }
 
+var traceparentRe = regexp.MustCompile(`^00-([0-9a-f]{32})-([0-9a-f]{16})-[0-9a-f]{2}$`)
+
+// TraceID returns the trace id of a W3C traceparent header only when it is
+// well formed and non-zero (Doc 05 §06: propagate only after validation).
+func TraceID(header string) string {
+	m := traceparentRe.FindStringSubmatch(strings.TrimSpace(header))
+	if m == nil || strings.Trim(m[1], "0") == "" || strings.Trim(m[2], "0") == "" {
+		return ""
+	}
+	return m[1]
+}
+
 // AccessLog logs one line per request with allowlisted fields only. It never
 // logs bodies, query strings, headers or the session grant (Doc 05 §24).
 func AccessLog(log *zap.Logger) func(http.Handler) http.Handler {
@@ -157,6 +170,7 @@ func AccessLog(log *zap.Logger) func(http.Handler) http.Handler {
 			}
 			log.Info("http_request",
 				zap.String("request_id", w.Header().Get("X-Request-ID")),
+				zap.String("trace_id", TraceID(r.Header.Get("traceparent"))),
 				zap.String("method", r.Method),
 				zap.String("route", route),
 				zap.Int("status", rec.status),

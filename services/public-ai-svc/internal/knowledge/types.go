@@ -108,4 +108,7 @@ type Manifest struct {
 	Sources            []Source  `json:"sources"`
 	Chunks             []Chunk   `json:"chunks"`
 	Routes             []Route   `json:"routes"`
+	// Synonyms is the signed alias lexicon (Doc 03 §13), e.g. "ar" →
+	// "accounts receivable". Keys are lower-case visitor words.
+	Synonyms map[string][]string `json:"synonyms,omitempty"`
 }

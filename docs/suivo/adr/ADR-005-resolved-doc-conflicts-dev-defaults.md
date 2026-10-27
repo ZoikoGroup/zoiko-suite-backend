@@ -21,3 +21,5 @@
 - Dev defaults: As listed above.
 
 - Config extension (STEP 13 prep): `GET /config` adds `citation_links` [{url_key, url, title}] so the widget can link citations. URLs come only from the signed release's source registry (allowlisted HTTPS origins), never from model output; Doc 05 §15 does not list this field. Approver: Backend Lead.
+
+- Extensions for Docs 01/05 gaps (Approver: Backend Lead + Product): `POST /turns/{turn_id}/feedback` (Doc 01 FR-09, enums only, no free text) and `POST /handoffs` (emits `chat.handoff.clicked.v1`, Doc 05 §21; route-only, returns the approved URL). Neither is in the Doc 05 §07 endpoint list. Retention purge uses `PUBLIC_AI_RETENTION` (dev default 24h) pending DEC-06.

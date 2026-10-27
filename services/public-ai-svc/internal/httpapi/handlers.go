@@ -264,6 +264,72 @@ func (s *Server) postTurn(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(body)
 }
 
+// postFeedback records "useful / not useful" for one of the caller's own
+// completed turns (Doc 01 FR-09, S09). Enums only; no free text.
+func (s *Server) postFeedback(w http.ResponseWriter, r *http.Request) {
+	sess, err := s.deps.Sessions.Authenticate(r.Context(), r.Header.Get(sessionHeader))
+	if err != nil {
+		problem.Write(w, r, problem.SessionExpired, "")
+		return
+	}
+	var req contract.FeedbackRequest
+	if !decodeStrict(w, r, &req) {
+		return
+	}
+	if err := req.Validate(); err != nil {
+		writeValidationError(w, r, err)
+		return
+	}
+	if req.SessionID != sess.SessionID {
+		problem.Write(w, r, problem.ScopeDenied, "")
+		return
+	}
+	err = s.deps.Store.SetFeedback(r.Context(), sess.SessionID, chi.URLParam(r, "turn_id"), req.Rating, req.Reason, time.Now().UTC())
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		problem.Write(w, r, problem.NotFound, "")
+	case err != nil:
+		s.log.Error("feedback failed", zap.String("request_id", w.Header().Get("X-Request-ID")), zap.Error(err))
+		problem.Write(w, r, problem.ServiceUnavailable, "")
+	default:
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+// postHandoff records that the visitor opened an official route and returns
+// its approved URL (Doc 05 §21 chat.handoff.clicked.v1). Route-only: no case,
+// ticket, lead or booking is created (Doc 09 §11).
+func (s *Server) postHandoff(w http.ResponseWriter, r *http.Request) {
+	sess, err := s.deps.Sessions.Authenticate(r.Context(), r.Header.Get(sessionHeader))
+	if err != nil {
+		problem.Write(w, r, problem.SessionExpired, "")
+		return
+	}
+	var req contract.HandoffRequest
+	if !decodeStrict(w, r, &req) {
+		return
+	}
+	if req.SchemaVersion != contract.SchemaVersion {
+		problem.Write(w, r, problem.UnsupportedSchema, "")
+		return
+	}
+	if req.SessionID != sess.SessionID {
+		problem.Write(w, r, problem.ScopeDenied, "")
+		return
+	}
+	url, ok := s.deps.Routes.ResolveRoute(req.RouteKey, sess.MarketCode)
+	if !ok {
+		problem.Write(w, r, problem.NotFound, "")
+		return
+	}
+	if ev, err := events.HandoffClicked(req.RouteKey, sess.MarketCode, false, time.Now().UTC()); err == nil {
+		if err := s.deps.Store.AppendEvents(r.Context(), []store.OutboxEvent{ev}); err != nil {
+			s.log.Warn("handoff event not recorded", zap.String("request_id", w.Header().Get("X-Request-ID")), zap.Error(err))
+		}
+	}
+	writeJSON(w, http.StatusOK, contract.HandoffResponse{RouteKey: req.RouteKey, URL: url})
+}
+
 const unavailableText = "I can't answer right now. Please use the official ZoikoSuite pages for pricing, demos and support."
 
 func firstNonEmpty(a, b string) string {

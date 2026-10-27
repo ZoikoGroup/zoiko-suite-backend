@@ -28,12 +28,18 @@ type ConfigSource interface {
 	PublicConfig() contract.ConfigResponse
 }
 
+// RouteResolver resolves an official route key to its approved URL.
+type RouteResolver interface {
+	ResolveRoute(key, market string) (string, bool)
+}
+
 // Deps are the server's collaborators. Nil members disable their routes.
 type Deps struct {
 	Store    store.Store
 	Sessions *session.Service
 	Answerer orchestrator.Answerer
 	Config   ConfigSource
+	Routes   RouteResolver
 	Ready    ReadinessFunc
 	// Limiter, when set, is applied to the public API (STEP 11).
 	Limiter func(http.Handler) http.Handler
@@ -93,6 +99,10 @@ func (s *Server) Router() http.Handler {
 		}
 		if s.deps.Sessions != nil && s.deps.Store != nil && s.deps.Answerer != nil {
 			api.Post("/turns", s.postTurn)
+			api.Post("/turns/{turn_id}/feedback", s.postFeedback)
+		}
+		if s.deps.Sessions != nil && s.deps.Store != nil && s.deps.Routes != nil {
+			api.Post("/handoffs", s.postHandoff)
 		}
 	})
 

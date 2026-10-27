@@ -256,6 +256,16 @@ func (r *Runtime) Run(ctx context.Context, interval time.Duration, onErr func(er
 	}
 }
 
+// ResolveRoute returns the approved URL for an official route key in market.
+func (r *Runtime) ResolveRoute(key, market string) (string, bool) {
+	snap, err := r.Snapshot()
+	if err != nil {
+		return "", false
+	}
+	rt, ok := snap.Route(key, market, time.Now())
+	return rt.URL, ok
+}
+
 // PublicConfig implements httpapi.ConfigSource from the active releases.
 func (r *Runtime) PublicConfig() contract.ConfigResponse {
 	cfg := contract.ConfigResponse{

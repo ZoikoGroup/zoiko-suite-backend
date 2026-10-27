@@ -53,6 +53,7 @@ type Index struct {
 	df        map[string]int
 	lengths   []int
 	avgLen    float64
+	synonyms  map[string][]string
 }
 
 var tokenRe = regexp.MustCompile(`[a-z0-9]+`)
@@ -93,7 +94,7 @@ func stem(t string) string {
 
 // NewIndex builds an index over a verified manifest.
 func NewIndex(m Manifest) *Index {
-	idx := &Index{releaseID: m.ReleaseID, df: map[string]int{}, sources: map[string]Source{}}
+	idx := &Index{releaseID: m.ReleaseID, df: map[string]int{}, sources: map[string]Source{}, synonyms: m.Synonyms}
 	for _, s := range m.Sources {
 		idx.sources[s.SourceVersionID] = s
 	}
@@ -221,7 +222,7 @@ func (x *Index) score(i int, qtoks []string) (float64, int) {
 // Search runs filtered retrieval and decides answerability.
 func (x *Index) Search(q Query, rev Revocations) Result {
 	res := Result{Answerability: NotFound, ReleaseID: x.releaseID}
-	qtoks := uniq(Tokens(q.Text))
+	qtoks := uniq(Tokens(x.expand(q.Text)))
 	if len(qtoks) == 0 || len(x.chunks) == 0 {
 		return res
 	}
@@ -294,6 +295,20 @@ func hasIntent(ids []string, id string) bool {
 		}
 	}
 	return false
+}
+
+// expand appends signed synonym expansions for visitor words (Doc 03 §13).
+func (x *Index) expand(text string) string {
+	if len(x.synonyms) == 0 {
+		return text
+	}
+	out := text
+	for _, w := range tokenRe.FindAllString(strings.ToLower(text), -1) {
+		for _, alt := range x.synonyms[w] {
+			out += " " + alt
+		}
+	}
+	return out
 }
 
 // ByIntent returns eligible chunks from sources tagged for intent, in

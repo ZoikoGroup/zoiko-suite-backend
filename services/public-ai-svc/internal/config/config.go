@@ -24,10 +24,13 @@ type Config struct {
 	PolicyVersion  string
 	Region         string
 
-	TokenBudgetPerTurn        int
-	MaxActiveTurnsPerSession  int
-	SessionTTL                time.Duration
-	IdempotencyTTL            time.Duration
+	TokenBudgetPerTurn       int
+	MaxActiveTurnsPerSession int
+	SessionTTL               time.Duration
+	IdempotencyTTL           time.Duration
+	// Retention is how long expired/deleted sessions and their turns are
+	// kept before purge. Dev default pending DPO approval (DEC-06).
+	Retention                 time.Duration
 	MaxBodyBytes              int64
 	ModelTimeout              time.Duration
 	RateLimitPerIPPerMinute   int
@@ -62,6 +65,7 @@ func Load() (Config, error) {
 		MaxActiveTurnsPerSession:  envInt("PUBLIC_AI_MAX_ACTIVE_TURNS_PER_SESSION", 1),
 		SessionTTL:                envDuration("PUBLIC_AI_SESSION_TTL", 30*time.Minute),
 		IdempotencyTTL:            envDuration("PUBLIC_AI_IDEMPOTENCY_TTL", 24*time.Hour),
+		Retention:                 envDuration("PUBLIC_AI_RETENTION", 24*time.Hour),
 		MaxBodyBytes:              int64(envInt("PUBLIC_AI_MAX_BODY_BYTES", 16*1024)),
 		ModelTimeout:              envDuration("PUBLIC_AI_MODEL_TIMEOUT", 6*time.Second),
 		RateLimitPerIPPerMinute:   envInt("PUBLIC_AI_RATE_LIMIT_IP_PER_MIN", 60),

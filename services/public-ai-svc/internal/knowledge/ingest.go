@@ -46,11 +46,12 @@ type SourceFile struct {
 
 // IngestConfig is the release-level input (allowed hosts, taxonomy, routes).
 type IngestConfig struct {
-	AllowedHosts  []string `json:"allowed_hosts"`
-	CapabilityIDs []string `json:"capability_ids"`
-	Routes        []Route  `json:"routes"`
-	ApprovedBy    []string `json:"approved_by"`
-	EvalRunID     string   `json:"eval_run_id"`
+	AllowedHosts  []string            `json:"allowed_hosts"`
+	CapabilityIDs []string            `json:"capability_ids"`
+	Routes        []Route             `json:"routes"`
+	ApprovedBy    []string            `json:"approved_by"`
+	EvalRunID     string              `json:"eval_run_id"`
+	Synonyms      map[string][]string `json:"synonyms"`
 }
 
 // Report is the per-source pipeline outcome.
@@ -101,7 +102,7 @@ func Ingest(cfg IngestConfig, inputs []namedSource, releaseID string, now time.T
 		ReleaseID: releaseID, Kind: KindKB, IndexSchemaVersion: SchemaVersion, CreatedAt: now.UTC(),
 		ApprovedBy: cfg.ApprovedBy, EvalRunID: cfg.EvalRunID, ChunkPolicy: fmt.Sprintf("words<=%d overlap=%d", chunkMaxWords, chunkOverlapWords),
 		RedactionPolicy: "public-only-v1", AllowedHosts: cfg.AllowedHosts, Routes: validRoutes(cfg),
-		Sources: []Source{}, Chunks: []Chunk{},
+		Sources: []Source{}, Chunks: []Chunk{}, Synonyms: cfg.Synonyms,
 	}
 	caps := map[string]bool{}
 	for _, c := range cfg.CapabilityIDs {

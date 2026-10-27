@@ -236,3 +236,22 @@ Trigger: in the console, "What plans are available?" asked for a country, and th
   or a policy-correct refusal; screenshot flow re-verified in the console (dark mode).
 - Golden set v2: 37 cases (12 added from the probe), 37/37 pass. Drills 5/5. All 14 test packages pass.
 - Still true: answers come from the extractive fake model (DEC-05), so wording is plain.
+
+## Docs 01–05 gap closure
+
+- Backend: `POST /turns/{turn_id}/feedback` (Doc 01 FR-09; enums only; own completed turns only; migration
+  000003), `POST /handoffs` emitting `chat.handoff.clicked.v1` (Doc 05 §21; route-only), retention purge of
+  expired/deleted sessions (`PUBLIC_AI_RETENTION`, dev default 24 h, DEC-06), W3C `traceparent` validation
+  (Doc 05 §06), signed synonym lexicon in the KB release (Doc 03 §13), `api/asyncapi.yaml` (Doc 05 §20),
+  OpenAPI updated, ADR-005 notes for the two extension endpoints.
+- Console widget: per-answer "Was this helpful?" with reasons, Stop while thinking (S02), Get help link on
+  errors (S08), retention notice (S09), official-link clicks recorded, mobile back button closes the sheet
+  (W02), focus returns to the launcher after any close.
+- Verified in the browser: synonym question answered; not-helpful + reason → "Thanks for the feedback"
+  (backend 204); link click → backend 200 + `chat.handoff.clicked.v1` in the outbox log; backend down → error
+  with Try again + Get help, Try again recovers after restart; 375 px back button closes the sheet and keeps
+  the URL; Escape returns focus. Stop was not exercised live (the fake model answers instantly).
+- Tests: feedback (own turn, enums, free text rejected, other session refused), handoff (approved URL,
+  unknown route refused, event payload), traceparent, synonyms, store conformance for feedback/purge/
+  append-events on memory and Postgres. All 14 packages pass; golden 37/37; drills 5/5.
+- Record: `docs/suivo/docs-01-05-compliance.md`.

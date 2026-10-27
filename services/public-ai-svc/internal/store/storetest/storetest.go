@@ -20,6 +20,7 @@ func Run(t *testing.T, newStore func(t *testing.T) store.Store) {
 	t.Run("Releases", func(t *testing.T) { testReleases(t, newStore(t)) })
 	t.Run("Revocations", func(t *testing.T) { testRevocations(t, newStore(t)) })
 	t.Run("FlagsUsageOutbox", func(t *testing.T) { testFlagsUsageOutbox(t, newStore(t)) })
+	t.Run("FeedbackPurge", func(t *testing.T) { testFeedbackPurge(t, newStore(t)) })
 }
 
 var ctx = context.Background()
@@ -156,6 +157,41 @@ func testTurns(t *testing.T, s store.Store) {
 	}
 	if n, _ := s.Usage(ctx, "day:x"); n != 42 {
 		t.Fatalf("usage = %d", n)
+	}
+}
+
+func testFeedbackPurge(t *testing.T, s store.Store) {
+	sess := mkSession(t, s, "pub_s_ffffffffffff")
+	b, err := s.BeginTurn(ctx, turn(sess.SessionID, "pub_t_f1", "cf1", "h"), time.Now().Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetFeedback(ctx, sess.SessionID, "pub_t_f1", "useful", "", time.Now()); err == nil {
+		t.Fatal("feedback on an unfinished turn must be refused")
+	}
+	done := b.Turn
+	done.Status, done.Response = "ANSWERED", []byte(`{}`)
+	if err := s.CompleteTurn(ctx, done, nil, 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetFeedback(ctx, sess.SessionID, "pub_t_f1", "not_useful", "incorrect", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetFeedback(ctx, "pub_s_other0000000", "pub_t_f1", "useful", "", time.Now()); err == nil {
+		t.Fatal("another session must not rate this turn")
+	}
+	if err := s.AppendEvents(ctx, []store.OutboxEvent{{EventID: "ev-h", Topic: "t", EventType: "chat.handoff.clicked.v1", Payload: []byte(`{}`), CreatedAt: time.Now()}}); err != nil {
+		t.Fatal(err)
+	}
+	// Retention: a session expired before the cutoff is removed with its turns.
+	if n, err := s.PurgeSessions(ctx, time.Now().Add(-time.Hour)); err != nil || n != 0 {
+		t.Fatalf("live session purged: %d %v", n, err)
+	}
+	if n, err := s.PurgeSessions(ctx, time.Now().Add(2*time.Hour)); err != nil || n != 1 {
+		t.Fatalf("expired session not purged: %d %v", n, err)
+	}
+	if _, err := s.SessionByGrant(ctx, sess.GrantHash); err == nil {
+		t.Fatal("purged session still present")
 	}
 }
 

@@ -272,6 +272,30 @@ func (p *Postgres) AbortTurn(ctx context.Context, sessionID, turnID string) erro
 	})
 }
 
+func (p *Postgres) SetFeedback(ctx context.Context, sessionID, turnID, rating, reason string, at time.Time) error {
+	tag, err := p.pool.Exec(ctx, `UPDATE public_ai.turns SET feedback_rating = $3, feedback_reason = NULLIF($4, ''), feedback_at = $5
+		WHERE session_id = $1 AND turn_id = $2 AND completed = TRUE`, sessionID, turnID, rating, reason, at)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (p *Postgres) PurgeSessions(ctx context.Context, cutoff time.Time) (int, error) {
+	tag, err := p.pool.Exec(ctx, `DELETE FROM public_ai.sessions WHERE expires_at < $1 OR (deleted_at IS NOT NULL AND deleted_at < $1)`, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	return int(tag.RowsAffected()), nil
+}
+
+func (p *Postgres) AppendEvents(ctx context.Context, events []OutboxEvent) error {
+	return pgx.BeginFunc(ctx, p.pool, func(tx pgx.Tx) error { return insertOutbox(ctx, tx, events) })
+}
+
 func (p *Postgres) PutRelease(ctx context.Context, r Release) error {
 	_, err := p.pool.Exec(ctx, `INSERT INTO public_ai.releases (release_id, kind, manifest, signature, created_at)
 		VALUES ($1,$2,$3,$4,$5) ON CONFLICT (release_id) DO NOTHING`, r.ReleaseID, r.Kind, r.Manifest, r.Signature, r.CreatedAt)

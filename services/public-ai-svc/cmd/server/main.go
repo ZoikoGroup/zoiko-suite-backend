@@ -94,6 +94,14 @@ func main() {
 			log.Error("flag refresh failed; assistant disabled", zap.Error(err))
 		}
 	})
+	// Retention: purge expired/deleted sessions and their turns (DEC-06 pending).
+	go runEvery(ctx, 10*time.Minute, func() {
+		if n, err := st.PurgeSessions(ctx, time.Now().Add(-cfg.Retention)); err != nil {
+			log.Error("retention purge failed", zap.Error(err))
+		} else if n > 0 {
+			log.Info("retention purge", zap.Int("sessions", n))
+		}
+	})
 	relay := &events.Relay{Store: st, Pub: pub, Log: log}
 	go relay.Run(ctx, time.Second)
 
@@ -103,7 +111,7 @@ func main() {
 	}
 	guard := limits.New(cfg, st, fl)
 	api := httpapi.New(cfg, log, httpapi.Deps{
-		Store: st, Sessions: session.New(st, cfg.SessionTTL), Answerer: guard.Wrap(pipeline), Config: rt,
+		Store: st, Sessions: session.New(st, cfg.SessionTTL), Answerer: guard.Wrap(pipeline), Config: rt, Routes: rt,
 		Limiter: guard.Middleware,
 		Ready: func() bool {
 			return cfg.Enabled && rt.Ready(3*refreshInterval) && fl.Healthy() && fl.Values().PublicAIEnabled

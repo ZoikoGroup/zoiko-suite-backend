@@ -235,6 +235,45 @@ func (e *Envelope) Validate() error {
 	return nil
 }
 
+// FeedbackRequest is the body of POST /turns/{turn_id}/feedback (Doc 01
+// FR-09 "useful / not useful"; extension recorded in ADR-005). Enums only.
+type FeedbackRequest struct {
+	SchemaVersion string `json:"schema_version"`
+	SessionID     string `json:"session_id"`
+	Rating        string `json:"rating"`
+	Reason        string `json:"reason,omitempty"`
+}
+
+var feedbackReasons = map[string]bool{"": true, "incorrect": true, "incomplete": true, "not_relevant": true, "unclear": true, "other": true}
+
+// Validate checks a feedback request.
+func (f *FeedbackRequest) Validate() error {
+	if f.SchemaVersion != SchemaVersion {
+		return ErrUnsupportedSchema
+	}
+	if f.Rating != "useful" && f.Rating != "not_useful" {
+		return &FieldError{"rating", "must be useful or not_useful"}
+	}
+	if !feedbackReasons[f.Reason] || (f.Rating == "useful" && f.Reason != "") {
+		return &FieldError{"reason", "unsupported value"}
+	}
+	return nil
+}
+
+// HandoffRequest is the body of POST /handoffs: a visitor opened an official
+// route (Doc 05 §21 chat.handoff.clicked.v1). It never creates a case.
+type HandoffRequest struct {
+	SchemaVersion string `json:"schema_version"`
+	SessionID     string `json:"session_id"`
+	RouteKey      string `json:"route_key"`
+}
+
+// HandoffResponse returns the approved URL for the route.
+type HandoffResponse struct {
+	RouteKey string `json:"route_key"`
+	URL      string `json:"url"`
+}
+
 // PublicRoute is an official destination the widget may open. URLs come only
 // from the signed route registry, never from model output (Doc 05 §15).
 type PublicRoute struct {

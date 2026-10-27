@@ -46,6 +46,9 @@ type Turn struct {
 	Response     []byte
 	Completed    bool
 	CreatedAt    time.Time
+	// FeedbackRating is "useful", "not_useful" or "" (Doc 01 FR-09).
+	FeedbackRating string
+	FeedbackReason string
 }
 
 // BeginResult tells the caller whether to run a new turn or replay one.
@@ -132,6 +135,14 @@ type Store interface {
 	// AbortTurn releases the slot and forgets an unfinished turn so the
 	// client can retry with the same key.
 	AbortTurn(ctx context.Context, sessionID, turnID string) error
+	// SetFeedback records a rating on a completed turn of sessionID
+	// (ErrNotFound otherwise). Repeating it replaces the previous rating.
+	SetFeedback(ctx context.Context, sessionID, turnID, rating, reason string, at time.Time) error
+	// PurgeSessions deletes sessions (and their turns) that expired or were
+	// deleted before cutoff, returning how many were removed (retention).
+	PurgeSessions(ctx context.Context, cutoff time.Time) (int, error)
+	// AppendEvents writes events to the outbox on their own.
+	AppendEvents(ctx context.Context, events []OutboxEvent) error
 
 	PutRelease(ctx context.Context, r Release) error
 	GetRelease(ctx context.Context, releaseID string) (Release, error)
