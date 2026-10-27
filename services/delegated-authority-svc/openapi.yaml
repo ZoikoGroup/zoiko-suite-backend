@@ -99,14 +99,14 @@ paths:
       requestBody:
         required: true
         content:
-          application/problem+json:
+          application/json:
             schema:
               $ref: '#/components/schemas/CreateDelegationRequest'
       responses:
         '201':
           description: Delegation created.
           content:
-            application/problem+json:
+            application/json:
               schema: { $ref: '#/components/schemas/DelegationGrant' }
         '200':
           description: |
@@ -116,7 +116,7 @@ paths:
             `correlation_id` naming a different grant is a 409
             `correlation_reused`, never a replay.
           content:
-            application/problem+json:
+            application/json:
               schema: { $ref: '#/components/schemas/DelegationGrant' }
         '400':
           description: |
@@ -128,12 +128,18 @@ paths:
               examples:
                 delegate_is_delegator:
                   value:
-                    error_code: delegate_is_delegator
-                    error_message: delegate_principal_id must differ from delegator_principal_id
+                    type: https://api.zoikosuite.com/problems/delegate-is-delegator
+                    title: Bad Request
+                    status: 400
+                    code: delegate_is_delegator
+                    detail: delegate_principal_id must differ from delegator_principal_id
                 invalid_time_window:
                   value:
-                    error_code: invalid_time_window
-                    error_message: effective_to must be after effective_from
+                    type: https://api.zoikosuite.com/problems/invalid-time-window
+                    title: Bad Request
+                    status: 400
+                    code: invalid_time_window
+                    detail: effective_to must be after effective_from
         '401':
           $ref: '#/components/responses/Unauthenticated'
         '403':
@@ -162,16 +168,25 @@ paths:
               examples:
                 delegator_mismatch:
                   value:
-                    error_code: delegator_mismatch
-                    error_message: caller may only delegate their own authority
+                    type: https://api.zoikosuite.com/problems/delegator-mismatch
+                    title: Forbidden
+                    status: 403
+                    code: delegator_mismatch
+                    detail: caller may only delegate their own authority
                 self_dealing:
                   value:
-                    error_code: self_dealing
-                    error_message: a delegation administered for another principal may not name the caller as delegate
+                    type: https://api.zoikosuite.com/problems/self-dealing
+                    title: Forbidden
+                    status: 403
+                    code: self_dealing
+                    detail: a delegation administered for another principal may not name the caller as delegate
                 delegator_lacks_authority:
                   value:
-                    error_code: delegator_lacks_authority
-                    error_message: delegator does not hold the authority being delegated
+                    type: https://api.zoikosuite.com/problems/delegator-lacks-authority
+                    title: Forbidden
+                    status: 403
+                    code: delegator_lacks_authority
+                    detail: delegator does not hold the authority being delegated
         '409':
           description: |
             `overlap_conflict` — the delegate already holds this action on this
@@ -237,7 +252,7 @@ paths:
         '200':
           description: The register, in the scope described above.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 type: array
                 items: { $ref: '#/components/schemas/DelegationGrant' }
@@ -271,7 +286,7 @@ paths:
         '200':
           description: The grant.
           content:
-            application/problem+json:
+            application/json:
               schema: { $ref: '#/components/schemas/DelegationGrant' }
         '401':
           $ref: '#/components/responses/Unauthenticated'
@@ -317,13 +332,13 @@ paths:
       requestBody:
         required: true
         content:
-          application/problem+json:
+          application/json:
             schema: { $ref: '#/components/schemas/TransitionRequest' }
       responses:
         '200':
           description: Revoked. `revoked_by_principal_id`, `revoked_at` and `revocation_reason` are set.
           content:
-            application/problem+json:
+            application/json:
               schema: { $ref: '#/components/schemas/DelegationGrant' }
         '401':
           $ref: '#/components/responses/Unauthenticated'
@@ -382,14 +397,14 @@ paths:
       requestBody:
         required: true
         content:
-          application/problem+json:
+          application/json:
             schema:
               $ref: '#/components/schemas/ExtendDelegationRequest'
       responses:
         '200':
           description: Extended. `effective_to` and `updated_at` are updated.
           content:
-            application/problem+json:
+            application/json:
               schema: { $ref: '#/components/schemas/DelegationGrant' }
         '400':
           description: '`missing_fields`, `invalid_json`, or `invalid_time_window` (new_effective_to not after current).'
@@ -446,13 +461,13 @@ paths:
       requestBody:
         required: false
         content:
-          application/problem+json:
+          application/json:
             schema: { $ref: '#/components/schemas/TransitionRequest' }
       responses:
         '200':
           description: Applied; the grant at its new version.
           content:
-            application/problem+json:
+            application/json:
               schema: { $ref: '#/components/schemas/DelegationGrant' }
         '400':
           description: '`reason_required`, `invalid_expected_version` or `invalid_json`.'
@@ -503,13 +518,13 @@ paths:
       requestBody:
         required: true
         content:
-          application/problem+json:
+          application/json:
             schema: { $ref: '#/components/schemas/TransitionRequest' }
       responses:
         '200':
           description: Applied; the grant at its new version.
           content:
-            application/problem+json:
+            application/json:
               schema: { $ref: '#/components/schemas/DelegationGrant' }
         '400':
           description: '`reason_required`, `invalid_expected_version` or `invalid_json`.'
@@ -559,13 +574,13 @@ paths:
       requestBody:
         required: false
         content:
-          application/problem+json:
+          application/json:
             schema: { $ref: '#/components/schemas/TransitionRequest' }
       responses:
         '200':
           description: Applied; the grant at its new version.
           content:
-            application/problem+json:
+            application/json:
               schema: { $ref: '#/components/schemas/DelegationGrant' }
         '400':
           description: '`reason_required`, `invalid_expected_version` or `invalid_json`.'
@@ -618,7 +633,7 @@ paths:
         '200':
           description: The chain; `found` is false when no path exists.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 type: object
                 properties:
@@ -943,7 +958,7 @@ components:
         effective_to: { type: string, format: date-time }
         status: { $ref: '#/components/schemas/DelegationStatus' }
 
-    Error:
+    Problem:
       type: object
       required: [type, title, status, code]
       properties:
@@ -956,7 +971,6 @@ components:
         request_id: { type: string }
         correlation_id: { type: string }
         retryable: { type: boolean }
-        retry_after: { type: integer }
         errors:
           type: array
           items:
@@ -966,4 +980,3 @@ components:
               code: { type: string }
               detail: { type: string }
         current_version: { type: integer, format: int64 }
-        decision_id: { type: string }
