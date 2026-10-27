@@ -1,6 +1,6 @@
 # ADR-005: Resolved doc conflicts (dev defaults)
 
-- Status: Proposed — pending <role>
+- Status: Proposed — pending Global CTO + Backend Lead
 - Date: 2026-10-27
 - Context: Conflicts between docs (idempotency header vs client_turn_id, market_code malformed vs unsupported). Must use dev defaults and record.
 - Decision: Apply defaults from IMPLEMENTATION_PROMPT.md:
@@ -9,5 +9,13 @@
 - Assistant display name default "ZoikoSuite assistant" until brand clearance DEC-04.
 - Route fixtures use https://example.invalid/... until DEC-10.
 - TTL/budget/rate limits are dev defaults pending DEC-07/DEC-08/D06-05.
+- Additional dev defaults (from Sections 3–5, with conflicts cited):
+  - Citations: schema max 5 (Doc 04/05), orchestrator emits at most 3 (Doc 01/03). `claim_ids[]` included in citations (Doc 05 §10) vs internal-trace only (Doc 03 §15) — carry `claim_ids[]` in citation objects and validate against resolved claims.
+  - Actions: schema max 3, at most 1 primary CTA emitted (Doc 02 §16).
+  - Error codes: 415 `unsupported_media_type` added (Doc 05 CT-005 vs §13 table).
+  - SSE: `GET /public-ai/v1/turns/{turn_id}/events` returns 404 in R0 (stream_enabled=false).
+  - Events: exactly the six Doc 05 §21 events — `chat.turn.completed.v1`, `chat.handoff.clicked.v1`, `kb.release.promoted.v1`, `kb.source.revoked.v1`, `publicai.kill_switch.changed.v1`, `chat.security.signal.v1`.
+  - Gate numbering: Doc 11 G0–G7 is the master gate list; Docs 05/06/07/08 gate numbers are mapped to it.
+  - Status enum: Doc 05 status enum is master; Doc 01/02/03 answer classes and abstention codes map onto it.
 - Consequences: Deterministic behavior now; must be revisited on approval.
 - Dev defaults: As listed above.
