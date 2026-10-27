@@ -20,7 +20,8 @@
     "intent_ids": [
       "I05",
       "I06",
-      "I07"
+      "I07",
+      "I28"
     ],
     "approval_state": "APPROVED",
     "approval_ts": "2026-01-02T00:00:00Z",
@@ -39,5 +40,5 @@
     "url_key": "pricing",
     "title": "Plans and pricing"
   },
-  "body": "TEST-ONLY synthetic fixture. Not ZoikoSuite fact.\n\n# Plans\nThe test plans are TEST_STARTER, TEST_GROWTH and an enterprise option. Prices depend on the market and billing term and are published on the pricing page.\n# Trials\nTrials are offered only where a trial is enabled for the market and plan."
+  "body": "TEST-ONLY synthetic fixture. Not ZoikoSuite fact.\n\n# Plans\nZoikoSuite is offered in three plans: TEST_STARTER for small teams, TEST_GROWTH for growing finance teams, and an Enterprise plan for larger organisations that need single sign-on, multiple entities and custom terms.\n# How pricing works\nPrices depend on the market and billing term and are published on the pricing page; Enterprise pricing is agreed with the sales team.\n# Trials\nTrials of TEST_STARTER and TEST_GROWTH are offered only in markets where a trial is enabled. No payment details are collected in chat."
 }

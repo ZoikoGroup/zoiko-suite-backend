@@ -35,7 +35,7 @@
     "source_version_id": "src-integrations-v1",
     "origin_uri": "https://example.invalid/integrations",
     "url_key": "integrations",
-    "title": "Integrations"
+    "title": "Integrations and API"
   },
-  "body": "TEST-ONLY synthetic fixture. Not ZoikoSuite fact.\n\n# Integrations\nThe FixtureBooks connector synchronises chart of accounts and journal entries through the public API.\n# API\nA public REST API with webhooks is documented for integration partners. Connector availability is labelled built, beta, planned or unsupported."
+  "body": "TEST-ONLY synthetic fixture. Not ZoikoSuite fact.\n\n# Integrations\nZoikoSuite connects to banks, payroll providers, HR systems and accounting tools through connectors and a public REST API. Each connector is labelled built, beta, planned or unsupported.\n# Connectors\nThe FixtureBooks connector synchronises chart of accounts and journal entries.\n# API\nA public REST API with webhooks is documented for integration partners, with sandbox credentials issued after sign-up."
 }

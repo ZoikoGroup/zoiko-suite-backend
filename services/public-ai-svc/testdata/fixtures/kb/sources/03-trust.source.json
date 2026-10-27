@@ -18,9 +18,7 @@
     "plan_codes": [],
     "capability_ids": [],
     "intent_ids": [
-      "I12",
-      "I13",
-      "I14"
+      "I12"
     ],
     "approval_state": "APPROVED",
     "approval_ts": "2026-01-02T00:00:00Z",
@@ -39,5 +37,5 @@
     "url_key": "trust",
     "title": "Trust and security overview"
   },
-  "body": "TEST-ONLY synthetic fixture. Not ZoikoSuite fact.\n\n# Security overview\nSecurity information is published on the trust center. Data is encrypted in transit and at rest in this test fixture.\n# Certifications\nCertification and audit status is stated only from the signed claims registry; readiness is never described as certification."
+  "body": "TEST-ONLY synthetic fixture. Not ZoikoSuite fact.\n\n# Security overview\nCustomer data is encrypted in transit and at rest, access is role-based with single sign-on and multi-factor authentication, and every change is recorded in an audit trail.\n# Certifications\nCertification and audit status is stated only from the signed claims registry; readiness work is never described as certification.\n# Reporting a security issue\nSecurity concerns are reported through the trust center so the security team can review them."
 }

@@ -222,14 +222,15 @@ func TestClaimDecisions(t *testing.T) {
 		want string
 	}{
 		{"verified price", claims.Request{Subject: claims.Price, SubjectID: "TEST_GROWTH", Market: "US", BillingTerm: "monthly"}, claims.Verified},
-		{"contradicting GB prices", claims.Request{Subject: claims.Price, SubjectID: "TEST_GROWTH", Market: "GB"}, claims.Contradicted},
+		{"contradicting IE prices", claims.Request{Subject: claims.Price, SubjectID: "TEST_GROWTH", Market: "IE"}, claims.Contradicted},
+		{"consistent GB price", claims.Request{Subject: claims.Price, SubjectID: "TEST_GROWTH", Market: "GB"}, claims.Verified},
 		{"expired annual price", claims.Request{Subject: claims.Price, SubjectID: "TEST_GROWTH", Market: "US", BillingTerm: "annual"}, claims.ExpiredDecision},
 		{"no market", claims.Request{Subject: claims.Price, SubjectID: "TEST_GROWTH"}, claims.MarketRequired},
 		{"unpublished market", claims.Request{Subject: claims.Price, SubjectID: "TEST_GROWTH", Market: "DE"}, claims.InsufficientEvidence},
 		{"SOC 2 readiness is never certification", claims.Request{Subject: claims.Certification, SubjectID: "SOC2"}, claims.InsufficientEvidence},
 		{"ISO certified", claims.Request{Subject: claims.Certification, SubjectID: "ISO27001"}, claims.Verified},
 		{"trial US", claims.Request{Subject: claims.Trial, Market: "US"}, claims.Verified},
-		{"trial GB", claims.Request{Subject: claims.Trial, Market: "GB"}, claims.InsufficientEvidence},
+		{"trial DE", claims.Request{Subject: claims.Trial, Market: "DE"}, claims.InsufficientEvidence},
 		{"integration", claims.Request{Subject: claims.IntegrationStatus, SubjectID: "fixturebooks"}, claims.Verified},
 	}
 	for _, c := range cases {
@@ -260,8 +261,8 @@ func TestTrialRouteGatedByClaim(t *testing.T) {
 	if _, ok := snap.Route("signup_or_trial", "US", now); !ok {
 		t.Fatal("US trial route should be offered")
 	}
-	if _, ok := snap.Route("signup_or_trial", "GB", now); ok {
-		t.Fatal("GB has no verified trial: route must be hidden")
+	if _, ok := snap.Route("signup_or_trial", "DE", now); ok {
+		t.Fatal("DE has no verified trial: route must be hidden")
 	}
 	if _, ok := snap.Route("evil", "US", now); ok {
 		t.Fatal("javascript: route must never exist")
@@ -278,7 +279,7 @@ func TestTrialRouteGatedByClaim(t *testing.T) {
 	if len(cfg.CitationLinks) == 0 {
 		t.Fatal("citation links missing")
 	}
-	if cfg.ConfigRevision == "" || len(cfg.MarketChoices) != 2 {
+	if cfg.ConfigRevision == "" || len(cfg.MarketChoices) != 3 {
 		t.Fatalf("config: %+v", cfg)
 	}
 }

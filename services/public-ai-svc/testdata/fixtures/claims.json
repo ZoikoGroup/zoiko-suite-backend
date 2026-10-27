@@ -5,7 +5,8 @@
   },
   "markets": [
     "US",
-    "GB"
+    "GB",
+    "IE"
   ],
   "approved_by": [
     "approval-commercial",
@@ -19,7 +20,7 @@
       "subject_id": "TEST_GROWTH",
       "predicate": "list_price",
       "normalized_value": "XTS 49.00/user/month",
-      "public_statement": "TEST-ONLY: The TEST_GROWTH plan is listed at XTS 49.00 per user per month in the US, billed monthly, before tax.",
+      "public_statement": "TEST-ONLY: The TEST_GROWTH plan is listed at XTS 49.00 per user per month in US, billed monthly, before tax.",
       "market": "US",
       "plan": "TEST_GROWTH",
       "segment": "",
@@ -49,7 +50,7 @@
       "subject_id": "TEST_STARTER",
       "predicate": "list_price",
       "normalized_value": "XTS 19.00/user/month",
-      "public_statement": "TEST-ONLY: The TEST_STARTER plan is listed at XTS 19.00 per user per month in the US, billed monthly, before tax.",
+      "public_statement": "TEST-ONLY: The TEST_STARTER plan is listed at XTS 19.00 per user per month in US, billed monthly, before tax.",
       "market": "US",
       "plan": "TEST_STARTER",
       "segment": "",
@@ -73,13 +74,13 @@
       "conflict_ids": []
     },
     {
-      "claim_id": "c-price-gb-growth-m-a",
+      "claim_id": "c-price-gb-growth-m",
       "claim_revision": 1,
       "claim_type": "PRICE",
       "subject_id": "TEST_GROWTH",
       "predicate": "list_price",
       "normalized_value": "XTS 39.00/user/month",
-      "public_statement": "TEST-ONLY: The TEST_GROWTH plan is listed at XTS 39.00 per user per month in GB.",
+      "public_statement": "TEST-ONLY: The TEST_GROWTH plan is listed at XTS 39.00 per user per month in GB, billed monthly, before tax.",
       "market": "GB",
       "plan": "TEST_GROWTH",
       "segment": "",
@@ -103,14 +104,74 @@
       "conflict_ids": []
     },
     {
-      "claim_id": "c-price-gb-growth-m-b",
+      "claim_id": "c-price-gb-starter-m",
+      "claim_revision": 1,
+      "claim_type": "PRICE",
+      "subject_id": "TEST_STARTER",
+      "predicate": "list_price",
+      "normalized_value": "XTS 15.00/user/month",
+      "public_statement": "TEST-ONLY: The TEST_STARTER plan is listed at XTS 15.00 per user per month in GB, billed monthly, before tax.",
+      "market": "GB",
+      "plan": "TEST_STARTER",
+      "segment": "",
+      "locale": "en-US",
+      "billing_term": "monthly",
+      "currency": "XTS",
+      "status": "ACTIVE",
+      "operationally_enabled": true,
+      "publicly_publishable": true,
+      "valid_from": "2026-01-01T00:00:00Z",
+      "valid_until": "2099-12-31T00:00:00Z",
+      "authority_ref": "TEST-PRICE-BOOK",
+      "evidence_source_version_ids": [
+        "src-pricing-v1"
+      ],
+      "citation_url_key": "pricing",
+      "approval_refs": [
+        "approval-commercial",
+        "approval-finance"
+      ],
+      "conflict_ids": []
+    },
+    {
+      "claim_id": "c-price-ie-growth-m-a",
       "claim_revision": 1,
       "claim_type": "PRICE",
       "subject_id": "TEST_GROWTH",
       "predicate": "list_price",
-      "normalized_value": "XTS 41.00/user/month",
-      "public_statement": "TEST-ONLY: The TEST_GROWTH plan is listed at XTS 41.00 per user per month in GB.",
-      "market": "GB",
+      "normalized_value": "XTS 44.00/user/month",
+      "public_statement": "TEST-ONLY: The TEST_GROWTH plan is listed at XTS 44.00 per user per month in IE, billed monthly, before tax.",
+      "market": "IE",
+      "plan": "TEST_GROWTH",
+      "segment": "",
+      "locale": "en-US",
+      "billing_term": "monthly",
+      "currency": "XTS",
+      "status": "ACTIVE",
+      "operationally_enabled": true,
+      "publicly_publishable": true,
+      "valid_from": "2026-01-01T00:00:00Z",
+      "valid_until": "2099-12-31T00:00:00Z",
+      "authority_ref": "TEST-PRICE-BOOK",
+      "evidence_source_version_ids": [
+        "src-pricing-v1"
+      ],
+      "citation_url_key": "pricing",
+      "approval_refs": [
+        "approval-commercial",
+        "approval-finance"
+      ],
+      "conflict_ids": []
+    },
+    {
+      "claim_id": "c-price-ie-growth-m-b",
+      "claim_revision": 1,
+      "claim_type": "PRICE",
+      "subject_id": "TEST_GROWTH",
+      "predicate": "list_price",
+      "normalized_value": "XTS 46.00/user/month",
+      "public_statement": "TEST-ONLY: The TEST_GROWTH plan is listed at XTS 46.00 per user per month in IE, billed monthly, before tax.",
+      "market": "IE",
       "plan": "TEST_GROWTH",
       "segment": "",
       "locale": "en-US",
@@ -139,7 +200,7 @@
       "subject_id": "TEST_GROWTH",
       "predicate": "list_price",
       "normalized_value": "XTS 470.00/user/year",
-      "public_statement": "TEST-ONLY: The TEST_GROWTH plan is listed at XTS 470.00 per user per year in the US.",
+      "public_statement": "TEST-ONLY: The TEST_GROWTH plan is listed at XTS 470.00 per user per year in US, billed annual, before tax.",
       "market": "US",
       "plan": "TEST_GROWTH",
       "segment": "",
@@ -171,6 +232,66 @@
       "normalized_value": "true",
       "public_statement": "TEST-ONLY: A TEST_STARTER trial is available in the US where enabled; no payment details are collected in this chat.",
       "market": "US",
+      "plan": "TEST_STARTER",
+      "segment": "",
+      "locale": "en-US",
+      "billing_term": "",
+      "currency": "",
+      "status": "ACTIVE",
+      "operationally_enabled": true,
+      "publicly_publishable": true,
+      "valid_from": "2026-01-01T00:00:00Z",
+      "valid_until": "2099-12-31T00:00:00Z",
+      "authority_ref": "TEST-PRICE-BOOK",
+      "evidence_source_version_ids": [
+        "src-pricing-v1"
+      ],
+      "citation_url_key": "pricing",
+      "approval_refs": [
+        "approval-commercial",
+        "approval-finance"
+      ],
+      "conflict_ids": []
+    },
+    {
+      "claim_id": "c-trial-us-growth",
+      "claim_revision": 1,
+      "claim_type": "TRIAL",
+      "subject_id": "TEST_GROWTH",
+      "predicate": "trial_available",
+      "normalized_value": "true",
+      "public_statement": "TEST-ONLY: A TEST_GROWTH trial is available in the US where enabled; no payment details are collected in this chat.",
+      "market": "US",
+      "plan": "TEST_GROWTH",
+      "segment": "",
+      "locale": "en-US",
+      "billing_term": "",
+      "currency": "",
+      "status": "ACTIVE",
+      "operationally_enabled": true,
+      "publicly_publishable": true,
+      "valid_from": "2026-01-01T00:00:00Z",
+      "valid_until": "2099-12-31T00:00:00Z",
+      "authority_ref": "TEST-PRICE-BOOK",
+      "evidence_source_version_ids": [
+        "src-pricing-v1"
+      ],
+      "citation_url_key": "pricing",
+      "approval_refs": [
+        "approval-commercial",
+        "approval-finance"
+      ],
+      "conflict_ids": []
+    },
+    {
+      "claim_id": "c-trial-gb-starter",
+      "claim_revision": 1,
+      "claim_type": "TRIAL",
+      "subject_id": "TEST_STARTER",
+      "predicate": "trial_available",
+      "normalized_value": "true",
+      "public_statement": "TEST-ONLY: A TEST_STARTER trial is available in GB where enabled; no payment details are collected in this chat.",
+      "market": "GB",
       "plan": "TEST_STARTER",
       "segment": "",
       "locale": "en-US",
@@ -273,9 +394,39 @@
       "valid_until": "2099-12-31T00:00:00Z",
       "authority_ref": "TEST-PRICE-BOOK",
       "evidence_source_version_ids": [
-        "src-overview-v1"
+        "src-markets-v1"
       ],
-      "citation_url_key": "core-modules",
+      "citation_url_key": "markets",
+      "approval_refs": [
+        "approval-commercial",
+        "approval-finance"
+      ],
+      "conflict_ids": []
+    },
+    {
+      "claim_id": "c-market-gb",
+      "claim_revision": 1,
+      "claim_type": "MARKET_AVAILABILITY",
+      "subject_id": "zoikosuite",
+      "predicate": "offered",
+      "normalized_value": "true",
+      "public_statement": "TEST-ONLY: ZoikoSuite is offered to customers in GB.",
+      "market": "GB",
+      "plan": "",
+      "segment": "",
+      "locale": "en-US",
+      "billing_term": "",
+      "currency": "",
+      "status": "ACTIVE",
+      "operationally_enabled": true,
+      "publicly_publishable": true,
+      "valid_from": "2026-01-01T00:00:00Z",
+      "valid_until": "2099-12-31T00:00:00Z",
+      "authority_ref": "TEST-PRICE-BOOK",
+      "evidence_source_version_ids": [
+        "src-markets-v1"
+      ],
+      "citation_url_key": "markets",
       "approval_refs": [
         "approval-commercial",
         "approval-finance"

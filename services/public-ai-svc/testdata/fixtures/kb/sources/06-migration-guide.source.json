@@ -37,5 +37,5 @@
     "url_key": "migration",
     "title": "Migration guide"
   },
-  "body": "TEST-ONLY synthetic fixture. Not ZoikoSuite fact.\n\n# Migration\nData migration from spreadsheets uses guided import templates with validation reports and a migration review call."
+  "body": "TEST-ONLY synthetic fixture. Not ZoikoSuite fact.\n\n# Migration\nData migration from spreadsheets uses guided import templates with validation reports and a migration review call.\n# Moving from another system\nOpening balances, suppliers, customers and chart of accounts can be imported from another accounting system using the same templates."
 }

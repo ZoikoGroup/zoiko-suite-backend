@@ -213,3 +213,26 @@ Each entry records what a build step changed and the verified result of
 - Consequence to record for approvers: Docs 01/11 describe a public-website assistant for anonymous visitors.
   In the console only signed-in staff can use it. The backend is unchanged by this choice and still serves
   any allowlisted first-party origin, so a later move to the public site is a frontend-only change.
+
+## STEP 13c — Answer coverage fixes found by probing the console widget
+
+Trigger: in the console, "What plans are available?" asked for a country, and the follow-up "uk" got
+"information is being reviewed". A probe of 24 typical visitor questions found more gaps. All fixed in
+`zoiko-suite-backend` only; the console widget needed no change.
+
+| Gap | Fix (document basis) |
+|---|---|
+| "hi" / "What is ZoikoSuite?" → "couldn't verify" | Greeting → welcome template (Doc 02 T01); intent-tagged page fallback when a question's words are too generic to rank (I01) |
+| "What plans are available?" treated as a price question | Only price questions ("how much", "cost", "price"…) need a market and P1 claims; plan catalogue answered from the approved pricing page (Doc 02 I05) |
+| "uk" after the plans answer lost context | Plans/trial answers carry intent and slots (never text) so a market reply returns that market's verified prices |
+| Deliberate price conflict sat on GB | Conflict fixture moved to IE; GB gets consistent prices and a trial (fixtures are TEST-ONLY) |
+| Thin knowledge: payroll, VAT, integrations, GDPR, multi-entity, AI, deployment… | Fixtures v2: 15 approved sources tagged to Doc 02 intents (still synthetic; no compliance or certification claims outside signed claims) |
+| "How is data secured?" answered from the migration page | Intent-aware ranking boost; better stemming; small sections packed into coherent chunks with their headings |
+| "Which countries do you support?" asked for a country | Lists every market whose availability is VERIFIED, verbatim from claims (Doc 02 I04) |
+| Revoked page's question answered from an unrelated page | If the best match is revoked/expired, abstain instead of using a weaker page (Doc 03 §15) |
+| "How does it compare to NetSuite?" | Route template: ZoikoSuite facts only (Doc 02 I26) |
+
+- Probe after fixes: 24/24 questions get a grounded answer, a correct clarification, a route-only handoff
+  or a policy-correct refusal; screenshot flow re-verified in the console (dark mode).
+- Golden set v2: 37 cases (12 added from the probe), 37/37 pass. Drills 5/5. All 14 test packages pass.
+- Still true: answers come from the extractive fake model (DEC-05), so wording is plain.

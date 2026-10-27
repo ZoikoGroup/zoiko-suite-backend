@@ -90,6 +90,10 @@ type Route struct {
 	RequiresClaim string `json:"requires_claim,omitempty"`
 }
 
+// HeadingPrefix marks the start of a section inside chunk text. Retrieval and
+// the extractive model use it as context; it is stripped from answers.
+func HeadingPrefix(heading string) string { return "\u00a7" + heading + "\u00a7 " }
+
 // Manifest is a signed knowledge release.
 type Manifest struct {
 	ReleaseID          string    `json:"release_id"`

@@ -247,13 +247,28 @@ func chunkSource(src Source, text, releaseID string) []Chunk {
 			cur = section{anchor: strings.Trim(slugRe.ReplaceAllString(strings.ToLower(h), "-"), "-"), title: h}
 			continue
 		}
+		if strings.TrimSpace(cur.text) == "" && cur.title != "" && strings.TrimSpace(line) != "" {
+			line = HeadingPrefix(cur.title) + line
+		}
 		cur.text += line + "\n"
 	}
 	flush()
 
+	// Pack consecutive small sections together (headings kept as sentences)
+	// so a chunk is a coherent passage, then window anything still too long.
+	var packed []section
+	for _, sec := range sections {
+		n := len(strings.Fields(sec.text))
+		if k := len(packed); k > 0 && len(strings.Fields(packed[k-1].text))+n <= chunkMaxWords {
+			packed[k-1].text += sec.text
+			continue
+		}
+		packed = append(packed, sec)
+	}
+
 	var out []Chunk
 	seg := 0
-	for _, sec := range sections {
+	for _, sec := range packed {
 		words := strings.Fields(sec.text)
 		for start := 0; start < len(words); {
 			end := start + chunkMaxWords

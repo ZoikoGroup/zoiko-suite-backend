@@ -85,9 +85,9 @@ var intentRules = map[string]*regexp.Regexp{
 	"I09": pattern("enterprise", "large organization", "large organisation", "sso", "scim", "solutions architect", "custom contract", "volume discount", "procurement team"),
 	"I10": pattern("integrat*", "connector*", "connect to", "connect with", "api", "apis", "webhook*", "quickbooks", "salesforce", "sync with", "bank feeds"),
 	"I11": pattern("migrat*", "switch from", "move from", "moving from", "import our data", "import data", "data import", "onboarding data"),
-	"I12": pattern("soc 2", "soc2", "iso 27001", "iso27001", "certif*", "security", "encrypt*", "penetration test", "pentest", "secure", "trust center", "compliance report"),
+	"I12": pattern("soc 2", "soc2", "iso 27001", "iso27001", "certif*", "secur*", "encrypt*", "penetration test", "pentest", "trust center", "compliance report", "mfa", "single sign-on"),
 	"I13": pattern("privacy", "gdpr", "dpa", "data processing agreement", "personal data", "data protection", "ccpa", "subprocessor*", "delete my data"),
-	"I14": pattern("data residency", "where is the data stored", "where is my data", "where is data stored", "data stored", "hosted", "hosting", "data center", "data centre", "eu data", "uk data"),
+	"I14": pattern("data residency", "where is the data stored", "where is my data", "where is data stored", "data stored", "hosted", "hosting", "data center", "data centre", "eu data", "uk data", "deploy*", "on-premise", "on premise", "on-prem", "self-host*", "private cloud"),
 	"I15": pattern("governance", "approval workflow*", "approvals", "audit trail", "segregation of duties", "controls", "policy engine"),
 	"I16": pattern("evidence", "audit evidence", "audit-ready", "audit ready", "auditor*"),
 	"I17": pattern("tax", "vat", "gst", "sales tax", "tax compliance", "corporate tax", "withholding"),
@@ -102,7 +102,7 @@ var intentRules = map[string]*regexp.Regexp{
 	"I26": pattern("compare", "comparison", "vs", "versus", "better than", "alternative to", "competitor*", "netsuite", "sage intacct"),
 	"I27": pattern("accessibility", "screen reader", "wcag", "accessible", "keyboard navigation"),
 	"I28": pattern("billing", "payment method", "receipt*", "charged", "invoice from zoikosuite", "update my card", "billing address"),
-	"I30": pattern("responsible ai", "how do you use ai", "ai model", "which model", "training data", "train on my data", "trained on", "hallucinat*", "are you an ai", "are you a bot"),
+	"I30": pattern("responsible ai", "how do you use ai", "use ai", "uses ai", "artificial intelligence", "ai features", "ai model", "which model", "training data", "train on my data", "trained on", "hallucinat*", "are you an ai", "are you a bot"),
 }
 
 var tieOrder = []string{"I22", "I24", "I12", "I13", "I14", "I05", "I06", "I08", "I09", "I10", "I11", "I17", "I18", "I19", "I03", "I04", "I07", "I15", "I16", "I20", "I25", "I26", "I27", "I28", "I30", "I23", "I21", "I02", "I01"}
@@ -124,6 +124,18 @@ type Decision struct {
 	Slots     Slots
 	Redaction Redaction
 }
+
+var (
+	greetingRe = regexp.MustCompile(`(?i)^\s*(hi|hello|hey|hiya|good (morning|afternoon|evening)|thanks|thank you|thx)(\s+there)?[\s!.,]*$`)
+	priceRe    = pattern("how much", "cost", "costs", "price*", "per user", "per month", "per year", "fee", "fees", "quote", "expensive", "cheap*", "charge*")
+)
+
+// IsGreeting reports whether the whole message is a greeting or thanks.
+func IsGreeting(text string) bool { return greetingRe.MatchString(text) }
+
+// AsksPrice reports whether the message asks for a price (as opposed to,
+// say, which plans exist). Only price questions need a market (Doc 02 I05).
+func AsksPrice(text string) bool { return priceRe.MatchString(text) }
 
 // LooksLikeInjection reports whether text contains instruction-injection
 // patterns. Ingestion uses it to quarantine poisoned knowledge (Doc 03 §09).

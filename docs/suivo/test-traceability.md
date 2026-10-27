@@ -27,7 +27,7 @@ apply to the approved holdout set, real content and the approved model, none of 
 | Kill switch, flags, static fallback | `TestKillSwitchAndFlags`, `flags` via kbctl run | Covered |
 | Rate, concurrency, spend limits (T10) | `limits.*` | Covered (thresholds unapproved) |
 | Events (six only, redacted, outbox, DLQ) | `events.*`, `e2e` | Covered |
-| Golden set partitions A–D | `eval.TestGoldenSet` (25 cases, dev set) | Covered; partition E holdout and F drift sentinel **not covered** (need independent authors / production) |
+| Golden set partitions A–D | `eval.TestGoldenSet` (37 cases, dev set v2) | Covered; partition E holdout and F drift sentinel **not covered** (need independent authors / production) |
 | Semantic rubric + human grading lanes (Doc 07 §08) | — | Not covered (harness is deterministic lane only) |
 | WCAG 2.2 AA (QA-T050–056) | — | Not covered: widget not built (STEP 13) |
 | Load / p95 latency (QA-T057–063) | — | Not covered: needs staging + agreed reference load |

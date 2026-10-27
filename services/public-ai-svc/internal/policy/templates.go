@@ -55,6 +55,8 @@ var (
 	TplUnavailable       = Template{contract.Unavailable, "I can't answer right now. Please use the official ZoikoSuite pages for pricing, demos and support.", "support", false}
 	TplOutOfScope        = Template{contract.Abstain, "I can help with questions about ZoikoSuite's products, plans, integrations and security. Could you rephrase your question about ZoikoSuite?", "", false}
 	TplClarifyGiveUp     = Template{contract.Abstain, "I'm not sure I can help with that here. The support team can point you in the right direction.", "support", false}
+	// TplWelcome answers a bare greeting (Doc 02 T01).
+	TplWelcome = Template{contract.Clarify, "Hi! I'm the ZoikoSuite assistant. I can answer questions about ZoikoSuite's modules, plans, integrations and security. What would you like to know?", "core_modules", false}
 )
 
 // RouteTemplates are route-only intents: the assistant offers an official
@@ -64,6 +66,8 @@ var RouteTemplates = map[string]Template{
 	"I22": {contract.Handoff, "I can't access accounts or sign you in. Please use the official ZoikoSuite sign-in or support page.", "support", false},
 	"I23": {contract.Handoff, "I can't open support requests from this chat. Please contact the support team through the official support page.", "support", false},
 	"I24": {contract.Handoff, "I can't connect you to a person from this chat, and I haven't created a request. You can reach the team through the official contact page.", "support", true},
+	// Doc 02 I26: ZoikoSuite facts only, never claims about other vendors.
+	"I26": {contract.Abstain, "I can only describe ZoikoSuite, not other vendors' products. You can explore ZoikoSuite's modules to compare them with your requirements.", "core_modules", false},
 	"I28": {contract.Handoff, "I can't see billing details. Please use your ZoikoSuite account or the official support page for billing questions.", "support", false},
 }
 

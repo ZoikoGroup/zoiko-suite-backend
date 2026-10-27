@@ -130,8 +130,8 @@ func TestConflictingPricesAbstain(t *testing.T) {
 	e := newEnv(t)
 	cc := &conflictCounter{Store: e.Store}
 	e.Pipeline.Store = cc
-	r := ask(e, "What is the Growth plan price in the UK?", "")
-	if r.Status != contract.Abstain || strings.Contains(r.Text, "39") || strings.Contains(r.Text, "41") {
+	r := ask(e, "What is the Growth plan price in Ireland?", "")
+	if r.Status != contract.Abstain || strings.Contains(r.Text, "44") || strings.Contains(r.Text, "46") {
 		t.Fatalf("got %+v", r)
 	}
 	if cc.n.Load() != 1 {
@@ -299,9 +299,9 @@ func TestTrialRouteOnlyWhereVerified(t *testing.T) {
 	if r.Status != contract.Answered || action(r) != "signup_or_trial" {
 		t.Fatalf("US trial: %+v", r)
 	}
-	r = ask(e, "Is there a free trial in the UK?", "")
+	r = ask(e, "Is there a free trial in Germany?", "")
 	if r.Status != contract.Abstain || action(r) == "signup_or_trial" {
-		t.Fatalf("GB trial: %+v", r)
+		t.Fatalf("DE trial: %+v", r)
 	}
 }
 

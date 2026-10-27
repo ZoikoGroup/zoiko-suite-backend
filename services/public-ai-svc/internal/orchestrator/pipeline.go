@@ -100,12 +100,16 @@ func (p *Pipeline) Answer(ctx context.Context, in Input) Result {
 		}
 		return res
 	}
+	if policy.IsGreeting(in.Message) && in.Pending == nil {
+		return p.fromTemplate(policy.TplWelcome, "I01", snap, market, now, releaseID)
+	}
 	intent := dec.Primary
 	clarifications := 0
+	carried := false
 	if pd := in.Pending; pd != nil && (intent == pd.Intent || intent == "I29" || intent == "I04") {
 		// A reply to our clarifying question: keep the original question's
 		// intent and slots, add what the visitor just supplied.
-		intent, clarifications = pd.Intent, pd.Clarifications
+		intent, clarifications, carried = pd.Intent, pd.Clarifications, true
 		if dec.Slots.PlanName == "" {
 			dec.Slots.PlanName = pd.PlanName
 		}
@@ -124,7 +128,16 @@ func (p *Pipeline) Answer(ctx context.Context, in Input) Result {
 	}
 	// P1 claims first (Doc 05 §11 step 3).
 	var verified []claims.Claim
-	if req, ok := claimRequest(intent, dec, in.Message, snap.Claims, market, now); ok {
+	if intent == "I04" && market == "" {
+		// "Which countries do you support?": list every market whose
+		// availability is VERIFIED, verbatim from the signed registry.
+		for _, m := range snap.Claims.Markets() {
+			d := snap.Claims.Resolve(claims.Request{Subject: claims.MarketAvailability, SubjectID: "zoikosuite", Market: m, AsOf: now}, snap)
+			if d.Decision == claims.Verified {
+				verified = append(verified, d.Verified...)
+			}
+		}
+	} else if req, ok := claimRequest(intent, dec, in.Message, snap.Claims, market, now, carried); ok {
 		if (req.Subject == claims.Price || req.Subject == claims.Trial) && !fv.PricingClaimsEnabled {
 			return p.fromTemplate(withRoute(policy.TplAbstainNoEvidence, "pricing"), intent, snap, market, now, releaseID)
 		}
@@ -154,7 +167,11 @@ func (p *Pipeline) Answer(ctx context.Context, in Input) Result {
 	// P2/P3 retrieval with mandatory filters (only when no claim answers it).
 	var hits []knowledge.Hit
 	if len(verified) == 0 {
-		r := snap.KB.Search(knowledge.Query{Text: dec.Redaction.Text, Market: market, Locale: in.Locale, Now: now, MaxChunks: 4}, snap)
+		kq := knowledge.Query{Text: dec.Redaction.Text, Market: market, Locale: in.Locale, Now: now, MaxChunks: 4, IntentID: intent}
+		r := snap.KB.Search(kq, snap)
+		if r.Answerability == knowledge.NotFound && intent != "I29" {
+			r = snap.KB.ByIntent(kq, snap)
+		}
 		switch r.Answerability {
 		case knowledge.Answerable:
 			hits = r.Hits
@@ -211,11 +228,17 @@ func (p *Pipeline) Answer(ctx context.Context, in Input) Result {
 	if intent == "I06" && len(verified) > 0 && fv.TrialCTAEnabled {
 		routeKey = "signup_or_trial"
 	}
-	return Result{
+	res := Result{
 		Status: contract.Answered, IntentID: intent, Text: text, Citations: citations,
 		Actions: p.actions(snap, routeKey, market, now), KnowledgeReleaseID: releaseID,
 		Tokens: int64(draft.InputTokens + draft.OutputTokens),
 	}
+	if (intent == "I05" || intent == "I06") && len(verified) == 0 {
+		// Plans/trials explained without a market: a reply naming a country
+		// ("uk") should get that market's verified prices or trial next.
+		res.Pending = &Pending{Intent: intent, PlanName: dec.Slots.PlanName, BillingCadence: dec.Slots.BillingCadence}
+	}
+	return res
 }
 
 func (p *Pipeline) generate(ctx context.Context, intent, msg string, cards []model.ClaimCard, evidence []model.Evidence) (string, model.Draft, error) {
@@ -355,16 +378,22 @@ var (
 )
 
 // claimRequest maps an intent to the P1 subject it must be answered from.
-func claimRequest(intent string, dec policy.Decision, msg string, reg *claims.Resolver, market string, now time.Time) (claims.Request, bool) {
+func claimRequest(intent string, dec policy.Decision, msg string, reg *claims.Resolver, market string, now time.Time, carried bool) (claims.Request, bool) {
 	q := claims.Request{Market: market, AsOf: now}
 	switch intent {
 	case "I05", "I07":
+		if !carried && !policy.AsksPrice(msg) {
+			return q, false // "Which plans are there?" is answered from the approved pricing page
+		}
 		q.Subject, q.SubjectID, q.BillingTerm = claims.Price, reg.PlanCode(dec.Slots.PlanName), dec.Slots.BillingCadence
 	case "I06":
 		q.Subject, q.SubjectID = claims.Trial, reg.PlanCode(dec.Slots.PlanName)
 	case "I04":
 		q.Subject, q.SubjectID = claims.MarketAvailability, "zoikosuite"
 	case "I14":
+		if market == "" {
+			return q, false // general hosting/deployment questions come from approved pages
+		}
 		q.Subject = claims.Residency
 	case "I12":
 		switch {

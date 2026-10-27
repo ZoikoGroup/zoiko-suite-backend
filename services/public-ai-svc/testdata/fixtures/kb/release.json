@@ -6,7 +6,12 @@
     "CAP-GL",
     "CAP-AP",
     "CAP-AR",
-    "CAP-TREASURY"
+    "CAP-TREASURY",
+    "CAP-PAYROLL",
+    "CAP-HR",
+    "CAP-TAX",
+    "CAP-LEGAL",
+    "CAP-COMPLIANCE"
   ],
   "approved_by": [
     "approver-a",

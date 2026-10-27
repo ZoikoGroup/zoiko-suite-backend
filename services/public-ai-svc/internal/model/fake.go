@@ -32,7 +32,10 @@ type Fake struct {
 
 func (f *Fake) Name() string { return "fake-v0" }
 
-var sentenceRe = regexp.MustCompile(`[^.!?]+[.!?]`)
+var (
+	sentenceRe = regexp.MustCompile(`[^.!?]+[.!?]`)
+	headingRe  = regexp.MustCompile(`^\x{00a7}([^\x{00a7}]*)\x{00a7}\s*(.*)$`)
+)
 
 func (f *Fake) Generate(ctx context.Context, req Request) (Draft, error) {
 	f.calls++
@@ -56,45 +59,56 @@ func (f *Fake) Generate(ctx context.Context, req Request) (Draft, error) {
 			d.ClaimRefs = append(d.ClaimRefs, c.Ref)
 		}
 	} else if len(req.Evidence) > 0 {
+		// Extractive answer from the best-ranked evidence only (evidence
+		// arrives in rank order): up to two sentences that share words with
+		// the question, in document order, else the section's first sentence.
 		q := words(req.Message)
+		top := req.Evidence[0]
+		var sentences, headings []string
+		heading := top.Title
+		for _, s := range sentenceRe.FindAllString(top.Text, -1) {
+			s = strings.TrimSpace(s)
+			if m := headingRe.FindStringSubmatch(s); m != nil {
+				heading, s = m[1], strings.TrimSpace(m[2])
+			}
+			if strings.HasPrefix(s, "TEST-ONLY") || strings.HasPrefix(s, "Not ZoikoSuite fact") || s == "" {
+				continue
+			}
+			sentences = append(sentences, s)
+			headings = append(headings, heading)
+		}
 		type cand struct {
 			s     string
-			ref   string
 			score int
 			order int
 		}
 		var cands []cand
-		for i, e := range req.Evidence {
-			for j, s := range sentenceRe.FindAllString(e.Text, -1) {
-				s = strings.TrimSpace(s)
-				if strings.HasPrefix(s, "TEST-ONLY") || strings.HasPrefix(s, "Not ZoikoSuite fact") {
-					continue
+		for j, s := range sentences {
+			sc := 0
+			for w := range words(s + " " + headings[j]) {
+				if q[w] {
+					sc++
 				}
-				sc := 0
-				for w := range words(s) {
-					if q[w] {
-						sc++
-					}
-				}
-				cands = append(cands, cand{s, e.Ref, sc, i*1000 + j})
 			}
+			cands = append(cands, cand{s, sc, j})
 		}
-		sort.SliceStable(cands, func(i, j int) bool {
-			if cands[i].score != cands[j].score {
-				return cands[i].score > cands[j].score
-			}
-			return cands[i].order < cands[j].order
-		})
-		seen := map[string]bool{}
+		sort.SliceStable(cands, func(i, j int) bool { return cands[i].score > cands[j].score })
+		var picked []cand
 		for _, c := range cands {
-			if len(parts) == 2 || c.score == 0 {
+			if len(picked) == 2 || c.score == 0 {
 				break
 			}
+			picked = append(picked, c)
+		}
+		if len(picked) == 0 && len(cands) > 0 {
+			picked = append(picked, cand{sentences[0], 0, 0})
+		}
+		sort.Slice(picked, func(i, j int) bool { return picked[i].order < picked[j].order })
+		for _, c := range picked {
 			parts = append(parts, c.s)
-			if !seen[c.ref] {
-				seen[c.ref] = true
-				d.EvidenceRefs = append(d.EvidenceRefs, c.ref)
-			}
+		}
+		if len(parts) > 0 {
+			d.EvidenceRefs = append(d.EvidenceRefs, top.Ref)
 		}
 	}
 	d.Text = strings.Join(parts, " ")

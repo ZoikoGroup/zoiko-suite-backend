@@ -27,6 +27,8 @@ type Query struct {
 	Locale    string
 	Now       time.Time
 	MaxChunks int
+	// IntentID boosts chunks whose source is tagged for the classified intent.
+	IntentID string
 }
 
 // Hit is one eligible chunk with its score.
@@ -78,7 +80,7 @@ func Tokens(s string) []string {
 }
 
 func stem(t string) string {
-	for _, suf := range []string{"ations", "ation", "ings", "ing", "ies", "es", "s"} {
+	for _, suf := range []string{"ations", "ation", "ities", "ity", "ings", "ing", "ies", "ed", "es", "s", "e"} {
 		if len(t) > len(suf)+3 && strings.HasSuffix(t, suf) {
 			if suf == "ies" {
 				return t[:len(t)-3] + "y"
@@ -231,6 +233,9 @@ func (x *Index) Search(q Query, rev Revocations) Result {
 	bestIneligibleScore := 0.0
 	for i, c := range x.chunks {
 		sc, matched := x.score(i, qtoks)
+		if q.IntentID != "" && hasIntent(c.IntentIDs, q.IntentID) {
+			sc *= intentBoost
+		}
 		if sc < minScore || matched < need {
 			continue
 		}
@@ -256,13 +261,60 @@ func (x *Index) Search(q Query, rev Revocations) Result {
 	if len(res.Hits) > max {
 		res.Hits = res.Hits[:max]
 	}
+	bestEligible := 0.0
+	if len(res.Hits) > 0 {
+		bestEligible = res.Hits[0].Score
+	}
 	switch {
+	case bestIneligible != eligible && bestIneligibleScore > bestEligible:
+		res.Hits = nil
+		if bestIneligible == revoked {
+			res.Answerability = Revoked
+		} else {
+			res.Answerability = Stale
+		}
 	case len(res.Hits) > 0:
 		res.Answerability = Answerable
 	case bestIneligible == revoked:
 		res.Answerability = Revoked
 	case bestIneligible == expired:
 		res.Answerability = Stale
+	}
+	return res
+}
+
+// intentBoost favours sources tagged for the visitor's intent, so "How is
+// data secured?" lands on the trust page rather than any page saying "data".
+const intentBoost = 2.0
+
+func hasIntent(ids []string, id string) bool {
+	for _, x := range ids {
+		if x == id {
+			return true
+		}
+	}
+	return false
+}
+
+// ByIntent returns eligible chunks from sources tagged for intent, in
+// document order. It is the fallback when a question's words are too generic
+// to rank (for example "What is ZoikoSuite?"); every mandatory filter applies.
+func (x *Index) ByIntent(q Query, rev Revocations) Result {
+	res := Result{Answerability: NotFound, ReleaseID: x.releaseID}
+	if q.IntentID == "" {
+		return res
+	}
+	for _, c := range x.chunks {
+		if !hasIntent(c.IntentIDs, q.IntentID) || x.eligibilityOf(c, q, rev) != eligible {
+			continue
+		}
+		res.Hits = append(res.Hits, Hit{Chunk: c})
+		if len(res.Hits) == 2 {
+			break
+		}
+	}
+	if len(res.Hits) > 0 {
+		res.Answerability = Answerable
 	}
 	return res
 }
