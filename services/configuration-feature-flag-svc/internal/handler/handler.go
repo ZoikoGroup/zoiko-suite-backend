@@ -945,7 +945,7 @@ func (h *Handler) authorizeGoverned(w http.ResponseWriter, r *http.Request, prin
 // refusal answers the status the contract pins; anything else is a store
 // outage and answers 503. action names the GovernedWrites series ("" on the
 // pure-read routes, which do not count).
-func (h *Handler) governedRefusal(w http.ResponseWriter, action, logOp, correlationID string, err error) {
+func (h *Handler) governedRefusal(w http.ResponseWriter, r *http.Request, action, logOp, correlationID string, err error) {
 	status := http.StatusServiceUnavailable
 	code := "store_unavailable"
 	if c := domain.ErrorCode(err); c != "" {
@@ -962,7 +962,7 @@ func (h *Handler) governedRefusal(w http.ResponseWriter, action, logOp, correlat
 		zap.Int("status", status),
 		zap.Error(err),
 	)
-	writeJSON(w, status, map[string]string{"error": code, "message": err.Error()})
+	writeError(w, r, status, code, err.Error())
 }
 
 // ── POST /v1/config/definitions ──────────────────────────────────────────────
@@ -1066,7 +1066,7 @@ func (h *Handler) CreateConfigDefinition(w http.ResponseWriter, r *http.Request)
 
 	def, err := h.store.CreateDefinition(r.Context(), params)
 	if err != nil {
-		h.governedRefusal(w, telemetry.ActionConfigWrite, "CreateConfigDefinition", correlationID, err)
+		h.governedRefusal(w, r, telemetry.ActionConfigWrite, "CreateConfigDefinition", correlationID, err)
 		return
 	}
 
@@ -1173,7 +1173,7 @@ func (h *Handler) PublishConfigDefinition(w http.ResponseWriter, r *http.Request
 			writeError(w, r, http.StatusNotFound, "key_not_registered", domain.ErrKeyNotRegistered.Error())
 			return
 		}
-		h.governedRefusal(w, telemetry.ActionConfigGlobalWrite, "PublishConfigDefinition:resolve", correlationID, err)
+		h.governedRefusal(w, r, telemetry.ActionConfigGlobalWrite, "PublishConfigDefinition:resolve", correlationID, err)
 		return
 	}
 
@@ -1191,7 +1191,7 @@ func (h *Handler) PublishConfigDefinition(w http.ResponseWriter, r *http.Request
 			writeError(w, r, http.StatusNotFound, "key_not_registered", domain.ErrKeyNotRegistered.Error())
 			return
 		}
-		h.governedRefusal(w, telemetry.ActionConfigGlobalWrite, "PublishConfigDefinition", correlationID, err)
+		h.governedRefusal(w, r, telemetry.ActionConfigGlobalWrite, "PublishConfigDefinition", correlationID, err)
 		return
 	}
 
@@ -1260,7 +1260,7 @@ func (h *Handler) ResolveConfig(w http.ResponseWriter, r *http.Request) {
 		Subject: strings.TrimSpace(r.Header.Get("X-Principal-Id")),
 	})
 	if err != nil {
-		h.governedRefusal(w, "", "ResolveConfig", correlationID, err)
+		h.governedRefusal(w, r, "", "ResolveConfig", correlationID, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, snap)
@@ -1315,7 +1315,7 @@ func (h *Handler) GetSnapshot(w http.ResponseWriter, r *http.Request) {
 
 	snap, err := h.store.GetSnapshot(r.Context(), snapshotID)
 	if err != nil {
-		h.governedRefusal(w, "", "GetSnapshot", correlationID, err)
+		h.governedRefusal(w, r, "", "GetSnapshot", correlationID, err)
 		return
 	}
 	w.Header().Set("Cache-Control", "private, max-age=31536000, immutable")
@@ -1439,7 +1439,7 @@ func (h *Handler) ActivateOverride(w http.ResponseWriter, r *http.Request) {
 		CorrelationID:    correlationID,
 	})
 	if err != nil {
-		h.governedRefusal(w, action, "ActivateOverride", correlationID, err)
+		h.governedRefusal(w, r, action, "ActivateOverride", correlationID, err)
 		return
 	}
 
@@ -1589,7 +1589,7 @@ func (h *Handler) CreateChange(w http.ResponseWriter, r *http.Request) {
 		CorrelationID:      correlationID,
 	})
 	if err != nil {
-		h.governedRefusal(w, action, "CreateChange", correlationID, err)
+		h.governedRefusal(w, r, action, "CreateChange", correlationID, err)
 		return
 	}
 
@@ -1666,7 +1666,7 @@ func (h *Handler) ApproveChange(w http.ResponseWriter, r *http.Request) {
 			writeError(w, r, http.StatusNotFound, "change_not_found", changeID)
 			return
 		}
-		h.governedRefusal(w, action, "ApproveChange", correlationID, err)
+		h.governedRefusal(w, r, action, "ApproveChange", correlationID, err)
 		return
 	}
 
@@ -1720,7 +1720,7 @@ func (h *Handler) ActivateChange(w http.ResponseWriter, r *http.Request) {
 			writeError(w, r, http.StatusNotFound, "change_not_found", changeID)
 			return
 		}
-		h.governedRefusal(w, action, "ActivateChange", correlationID, err)
+		h.governedRefusal(w, r, action, "ActivateChange", correlationID, err)
 		return
 	}
 
@@ -1821,7 +1821,7 @@ func (h *Handler) CreateEmergencyChange(w http.ResponseWriter, r *http.Request) 
 		CorrelationID:    correlationID,
 	})
 	if err != nil {
-		h.governedRefusal(w, action, "CreateEmergencyChange", correlationID, err)
+		h.governedRefusal(w, r, action, "CreateEmergencyChange", correlationID, err)
 		return
 	}
 
@@ -1872,7 +1872,7 @@ func (h *Handler) ActivateEmergencyChange(w http.ResponseWriter, r *http.Request
 			writeError(w, r, http.StatusNotFound, "change_not_found", emergencyChangeID)
 			return
 		}
-		h.governedRefusal(w, action, "ActivateEmergencyChange", correlationID, err)
+		h.governedRefusal(w, r, action, "ActivateEmergencyChange", correlationID, err)
 		return
 	}
 
@@ -1980,7 +1980,7 @@ func (h *Handler) RecordAttestation(w http.ResponseWriter, r *http.Request) {
 		CorrelationID:      correlationID,
 	})
 	if err != nil {
-		h.governedRefusal(w, action, "RecordAttestation", correlationID, err)
+		h.governedRefusal(w, r, action, "RecordAttestation", correlationID, err)
 		return
 	}
 
@@ -2075,7 +2075,7 @@ func (h *Handler) CreateReleasePlan(w http.ResponseWriter, r *http.Request) {
 		CorrelationID:    correlationID,
 	})
 	if err != nil {
-		h.governedRefusal(w, action, "CreateReleasePlan", correlationID, err)
+		h.governedRefusal(w, r, action, "CreateReleasePlan", correlationID, err)
 		return
 	}
 
@@ -2149,7 +2149,7 @@ func (h *Handler) EvaluateFlag(w http.ResponseWriter, r *http.Request) {
 		Region:        trustedRegion(r),
 	})
 	if err != nil {
-		h.governedRefusal(w, "", "EvaluateFlag", correlationID, err)
+		h.governedRefusal(w, r, "", "EvaluateFlag", correlationID, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, result)

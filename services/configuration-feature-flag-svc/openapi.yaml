@@ -355,7 +355,7 @@ paths:
         '404':
           description: '`key_not_registered` — the key was never declared. A `404`, not a `400`: the request is fine, the registry has no such key.'
           content:
-            application/json:
+            application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
         '503': { $ref: '#/components/responses/Unavailable' }
 
@@ -396,7 +396,7 @@ paths:
         '404':
           description: '`key_not_registered` — there is no declaration to publish.'
           content:
-            application/json:
+            application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '413': { $ref: '#/components/responses/TooLarge' }
@@ -436,7 +436,7 @@ paths:
         '404':
           description: '`no_attested_snapshot` — nothing is pinned in this environment yet; failing closed rather than guessing.'
           content:
-            application/json:
+            application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
         '422': { $ref: '#/components/responses/StaleSnapshot' }
         '503': { $ref: '#/components/responses/Unavailable' }
@@ -485,18 +485,18 @@ paths:
         '400':
           description: '`invalid_snapshot_id` — the path segment is not a UUID.'
           content:
-            application/json:
+            application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
         '401':
           description: '`missing_principal` / `tenant_scope_missing`.'
           content:
-            application/json:
+            application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404':
           description: '`snapshot_not_found` — no snapshot has this id.'
           content:
-            application/json:
+            application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
         '503': { $ref: '#/components/responses/Unavailable' }
 
@@ -631,17 +631,17 @@ paths:
         '404':
           description: '`change_not_found` — no such change id.'
           content:
-            application/json:
+            application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
         '403':
           description: '`change_self_approval` — the proposer of a C2/C3 change approving it; or no grant.'
           content:
-            application/json:
+            application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
         '409':
           description: '`change_not_approvable` — the change is no longer awaiting a decision.'
           content:
-            application/json:
+            application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
         '413': { $ref: '#/components/responses/TooLarge' }
         '503': { $ref: '#/components/responses/Unavailable' }
@@ -678,7 +678,7 @@ paths:
         '404':
           description: '`change_not_found` — no such change id.'
           content:
-            application/json:
+            application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
         '409': { $ref: '#/components/responses/GovernedConflict' }
         '503': { $ref: '#/components/responses/Unavailable' }
@@ -786,7 +786,7 @@ paths:
         '404':
           description: '`change_not_found` — no such emergency change id.'
           content:
-            application/json:
+            application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
         '503': { $ref: '#/components/responses/Unavailable' }
 
