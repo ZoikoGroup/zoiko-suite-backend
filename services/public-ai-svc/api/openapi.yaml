@@ -2,10 +2,212 @@ openapi: 3.1.0
 info:
   title: ZoikoSuite public AI assistant API (zoikosuite-public-ai)
   version: "1.0"
-  description: Public anonymous API for Release R0. Filled in by STEP 3/4.
+  description: >
+    Anonymous public API for Release R0 (Doc 05 §06–§15). Target contract, PROPOSED.
+    Business outcomes (ABSTAIN, REFUSED_ACTION, ...) are HTTP 200; errors are RFC 9457 problems.
+servers:
+  - url: /public-ai/v1
+components:
+  securitySchemes:
+    publicChatSession:
+      type: apiKey
+      in: header
+      name: X-Public-Chat-Session
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: {type: string, minLength: 8, maxLength: 128}
+  schemas:
+    PageContext:
+      type: string
+      enum: [home, pricing, core_modules, demo, support, other]
+    Capabilities:
+      type: object
+      additionalProperties: false
+      properties:
+        streaming: {type: boolean}
+        lead_capture: {type: boolean}
+        file_upload: {type: boolean}
+        authenticated: {type: boolean}
+    SessionRequest:
+      type: object
+      additionalProperties: false
+      required: [schema_version]
+      properties:
+        schema_version: {const: "1.0"}
+        locale: {type: string}
+        market_code: {type: string, pattern: "^[A-Z]{2}$"}
+        page_context: {$ref: "#/components/schemas/PageContext"}
+    SessionResponse:
+      type: object
+      required: [schema_version, session_id, session_grant, expires_at, policy_version, capabilities]
+      properties:
+        schema_version: {const: "1.0"}
+        session_id: {type: string}
+        session_grant: {type: string, description: Opaque short-lived bearer grant. Never log it.}
+        expires_at: {type: string, format: date-time}
+        policy_version: {type: string}
+        capabilities: {$ref: "#/components/schemas/Capabilities"}
+    TurnRequest:
+      type: object
+      additionalProperties: false
+      required: [schema_version, session_id, client_turn_id, message]
+      properties:
+        schema_version: {const: "1.0"}
+        session_id: {type: string, minLength: 12}
+        client_turn_id: {type: string, format: uuid}
+        message: {type: string, minLength: 1, maxLength: 2000}
+        locale: {type: string}
+        market_code: {type: string, pattern: "^[A-Z]{2}$"}
+        page_context: {$ref: "#/components/schemas/PageContext"}
+        requested_response_mode: {type: string, enum: [json]}
+    Citation:
+      type: object
+      additionalProperties: false
+      required: [source_version_id, claim_ids, url_key]
+      properties:
+        source_version_id: {type: string}
+        claim_ids: {type: array, items: {type: string}}
+        url_key: {type: string}
+    Action:
+      type: object
+      additionalProperties: false
+      required: [type, route_key]
+      properties:
+        type: {const: OPEN_OFFICIAL_ROUTE}
+        route_key: {type: string}
+    TurnResponse:
+      title: zs-public-answer-v1
+      type: object
+      additionalProperties: false
+      required: [schema_version, turn_id, request_id, turn_sequence, status, intent_id, text, citations, actions, knowledge_release_id, policy_version]
+      properties:
+        schema_version: {const: "1.0"}
+        turn_id: {type: string}
+        request_id: {type: string}
+        turn_sequence: {type: integer, minimum: 1}
+        status: {type: string, enum: [ANSWERED, CLARIFY, REFUSED_ACTION, ABSTAIN, HANDOFF, UNAVAILABLE]}
+        intent_id: {type: string, pattern: "^(I(0[1-9]|[12][0-9]|30)|X(0[1-9]|10)|UNKNOWN)$"}
+        text: {type: string, maxLength: 5000}
+        citations: {type: array, maxItems: 5, items: {$ref: "#/components/schemas/Citation"}}
+        actions: {type: array, maxItems: 3, items: {$ref: "#/components/schemas/Action"}}
+        knowledge_release_id: {type: string}
+        policy_version: {type: string}
+        flags:
+          type: object
+          properties:
+            requires_human: {type: boolean}
+    ConfigResponse:
+      type: object
+      required: [config_revision, assistant_display_name, capabilities, supported_locales, market_choices, public_routes, privacy_notice_key]
+      properties:
+        config_revision: {type: string}
+        assistant_display_name: {type: string}
+        capabilities: {$ref: "#/components/schemas/Capabilities"}
+        supported_locales: {type: array, items: {type: string}}
+        market_choices: {type: array, items: {type: string}}
+        public_routes: {type: array, items: {type: string}}
+        privacy_notice_key: {type: string}
+    Problem:
+      type: object
+      required: [type, title, status, instance, code, request_id, retryable]
+      properties:
+        type: {type: string}
+        title: {type: string}
+        status: {type: integer}
+        detail: {type: string}
+        instance: {type: string}
+        code:
+          type: string
+          enum:
+            - publicai.invalid_request
+            - publicai.unsupported_schema
+            - publicai.idempotency_header_mismatch
+            - publicai.session_expired
+            - publicai.origin_denied
+            - publicai.scope_denied
+            - publicai.not_found
+            - publicai.turn_conflict
+            - publicai.payload_too_large
+            - publicai.unsupported_media_type
+            - publicai.validation_failed
+            - publicai.idempotency_mismatch
+            - publicai.rate_limited
+            - publicai.dependency_failed
+            - publicai.service_unavailable
+            - publicai.timeout
+            - publicai.internal_error
+        request_id: {type: string}
+        retryable: {type: boolean}
+  responses:
+    Problem:
+      description: RFC 9457 problem
+      content:
+        application/problem+json:
+          schema: {$ref: "#/components/schemas/Problem"}
 paths:
-  /public-ai/v1/health/public:
-    get:
+  /sessions:
+    post:
+      summary: Create an anonymous session
+      parameters: [{$ref: "#/components/parameters/IdempotencyKey"}]
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: "#/components/schemas/SessionRequest"}}}
       responses:
-        "200": {description: Service available}
-        "503": {description: Service unavailable}
+        "201": {description: Created, content: {application/json: {schema: {$ref: "#/components/schemas/SessionResponse"}}}}
+        "400": {$ref: "#/components/responses/Problem"}
+        "403": {$ref: "#/components/responses/Problem"}
+        "413": {$ref: "#/components/responses/Problem"}
+        "415": {$ref: "#/components/responses/Problem"}
+        "422": {$ref: "#/components/responses/Problem"}
+        "429": {$ref: "#/components/responses/Problem"}
+  /sessions/{session_id}:
+    delete:
+      summary: End the caller's session (repeat delete of own session is 204)
+      security: [{publicChatSession: []}]
+      parameters:
+        - {name: session_id, in: path, required: true, schema: {type: string}}
+      responses:
+        "204": {description: Ended}
+        "401": {$ref: "#/components/responses/Problem"}
+        "404": {$ref: "#/components/responses/Problem"}
+  /turns:
+    post:
+      summary: Submit one visitor turn
+      security: [{publicChatSession: []}]
+      parameters: [{$ref: "#/components/parameters/IdempotencyKey"}]
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: "#/components/schemas/TurnRequest"}}}
+      responses:
+        "200": {description: Typed outcome, content: {application/json: {schema: {$ref: "#/components/schemas/TurnResponse"}}}}
+        "400": {$ref: "#/components/responses/Problem"}
+        "401": {$ref: "#/components/responses/Problem"}
+        "403": {$ref: "#/components/responses/Problem"}
+        "409": {$ref: "#/components/responses/Problem"}
+        "413": {$ref: "#/components/responses/Problem"}
+        "415": {$ref: "#/components/responses/Problem"}
+        "422": {$ref: "#/components/responses/Problem"}
+        "429": {$ref: "#/components/responses/Problem"}
+        "503": {$ref: "#/components/responses/Problem"}
+  /turns/{turn_id}/events:
+    get:
+      summary: Progress stream. Disabled in R0 (stream_enabled=false) and always 404.
+      parameters:
+        - {name: turn_id, in: path, required: true, schema: {type: string}}
+      responses:
+        "404": {$ref: "#/components/responses/Problem"}
+  /config:
+    get:
+      summary: Public widget configuration
+      responses:
+        "200": {description: OK, content: {application/json: {schema: {$ref: "#/components/schemas/ConfigResponse"}}}}
+        "304": {description: Not modified}
+  /health/public:
+    get:
+      summary: Coarse public health (no provider or region names)
+      responses:
+        "200": {description: Available}
+        "503": {description: Unavailable}

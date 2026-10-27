@@ -96,7 +96,7 @@ func (m *Memory) RotateGrant(_ context.Context, sessionID string, newHash []byte
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	s, ok := m.sessions[sessionID]
-	if !ok {
+	if !ok || s.DeletedAt != nil {
 		return ErrNotFound
 	}
 	delete(m.byGrant, string(s.GrantHash))
@@ -115,7 +115,7 @@ func (m *Memory) DeleteSession(_ context.Context, sessionID string, at time.Time
 	if s.DeletedAt == nil {
 		s.DeletedAt = &at
 	}
-	delete(m.byGrant, string(s.GrantHash))
+	s.Locale, s.MarketCode, s.PageContext, s.activeTurnID = "", "", "", ""
 	for k, t := range m.turns {
 		if t.SessionID == sessionID {
 			delete(m.turns, k)

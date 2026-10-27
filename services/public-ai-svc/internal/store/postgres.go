@@ -135,7 +135,7 @@ func (p *Postgres) SessionByIdempotencyKey(ctx context.Context, key string) (Ses
 
 func (p *Postgres) SessionByGrant(ctx context.Context, grantHash []byte) (Session, error) {
 	return scanSession(p.pool.QueryRow(ctx, `SELECT `+sessionCols+` FROM public_ai.sessions s
-		WHERE s.grant_hash = $1 AND s.deleted_at IS NULL`, grantHash))
+		WHERE s.grant_hash = $1`, grantHash))
 }
 
 func (p *Postgres) RotateGrant(ctx context.Context, sessionID string, newHash []byte) error {
@@ -151,9 +151,10 @@ func (p *Postgres) RotateGrant(ctx context.Context, sessionID string, newHash []
 
 func (p *Postgres) DeleteSession(ctx context.Context, sessionID string, at time.Time) error {
 	return pgx.BeginFunc(ctx, p.pool, func(tx pgx.Tx) error {
-		// The grant hash is replaced so the old grant can never authenticate again.
+		// The grant hash is kept so a repeat DELETE by the same visitor is a
+		// 204; deleted_at makes the grant useless for anything else.
 		tag, err := tx.Exec(ctx, `UPDATE public_ai.sessions
-			SET deleted_at = COALESCE(deleted_at, $2), grant_hash = sha256(session_id::bytea || 'deleted'::bytea),
+			SET deleted_at = COALESCE(deleted_at, $2),
 			    active_turn_id = NULL, locale = '', market_code = '', page_context = ''
 			WHERE session_id = $1`, sessionID, at)
 		if err != nil {

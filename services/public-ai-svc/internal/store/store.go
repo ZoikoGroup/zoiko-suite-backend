@@ -109,6 +109,8 @@ type Store interface {
 	// SessionByIdempotencyKey returns the session created under key, with the
 	// stored request hash, or ErrNotFound.
 	SessionByIdempotencyKey(ctx context.Context, key string) (Session, []byte, error)
+	// SessionByGrant also returns deleted sessions (DeletedAt set); callers
+	// must refuse them for everything except a repeat DELETE.
 	SessionByGrant(ctx context.Context, grantHash []byte) (Session, error)
 	RotateGrant(ctx context.Context, sessionID string, newGrantHash []byte) error
 	DeleteSession(ctx context.Context, sessionID string, at time.Time) error

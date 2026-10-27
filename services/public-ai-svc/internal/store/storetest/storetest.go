@@ -66,8 +66,14 @@ func testSessions(t *testing.T, s store.Store) {
 	if err := s.DeleteSession(ctx, sess.SessionID, time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.SessionByGrant(ctx, []byte("grant-2")); !errors.Is(err, store.ErrNotFound) {
-		t.Fatal("deleted session grant must stop working")
+	if del, err := s.SessionByGrant(ctx, []byte("grant-2")); err != nil || del.DeletedAt == nil || del.Locale != "" {
+		t.Fatalf("deleted session must be reported as deleted with context wiped: %v %+v", err, del)
+	}
+	if err := s.RotateGrant(ctx, sess.SessionID, []byte("grant-3")); !errors.Is(err, store.ErrNotFound) {
+		t.Fatal("a deleted session's grant must not be rotated")
+	}
+	if _, err := s.BeginTurn(ctx, turn(sess.SessionID, "pub_t_d", "cd", "hd"), time.Now().Add(time.Minute)); !errors.Is(err, store.ErrNotFound) {
+		t.Fatal("a deleted session must not start turns")
 	}
 	if err := s.DeleteSession(ctx, sess.SessionID, time.Now()); err != nil {
 		t.Fatalf("second delete of an existing session must succeed: %v", err)

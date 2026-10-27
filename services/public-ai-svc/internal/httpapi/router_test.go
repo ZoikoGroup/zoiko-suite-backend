@@ -35,7 +35,7 @@ func do(t *testing.T, h http.Handler, method, path, origin, contentType, body st
 
 // CT-003 / SEC-T: a non-allowlisted origin is refused with 403 origin_denied.
 func TestCT003_OriginDenied(t *testing.T) {
-	h := New(testConfig(), nil, nil).Router()
+	h := New(testConfig(), nil, Deps{}).Router()
 	w := do(t, h, http.MethodPost, "/public-ai/v1/sessions", "https://evil.example", "application/json", "{}")
 	if w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "publicai.origin_denied") {
 		t.Fatalf("got %d %s", w.Code, w.Body.String())
@@ -43,7 +43,7 @@ func TestCT003_OriginDenied(t *testing.T) {
 }
 
 func TestMissingOriginDenied(t *testing.T) {
-	h := New(testConfig(), nil, nil).Router()
+	h := New(testConfig(), nil, Deps{}).Router()
 	w := do(t, h, http.MethodPost, "/public-ai/v1/sessions", "", "application/json", "{}")
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("got %d", w.Code)
@@ -52,7 +52,7 @@ func TestMissingOriginDenied(t *testing.T) {
 
 // CT-004: body above the cap is refused with 413 before any handler runs.
 func TestCT004_OversizedBody(t *testing.T) {
-	h := New(testConfig(), nil, nil).Router()
+	h := New(testConfig(), nil, Deps{}).Router()
 	w := do(t, h, http.MethodPost, "/public-ai/v1/turns", testOrigin, "application/json", strings.Repeat("a", 17*1024))
 	if w.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("got %d", w.Code)
@@ -61,7 +61,7 @@ func TestCT004_OversizedBody(t *testing.T) {
 
 // CT-005: non-JSON content type is refused with 415.
 func TestCT005_WrongContentType(t *testing.T) {
-	h := New(testConfig(), nil, nil).Router()
+	h := New(testConfig(), nil, Deps{}).Router()
 	w := do(t, h, http.MethodPost, "/public-ai/v1/turns", testOrigin, "text/plain", "{}")
 	if w.Code != http.StatusUnsupportedMediaType {
 		t.Fatalf("got %d", w.Code)
@@ -69,7 +69,7 @@ func TestCT005_WrongContentType(t *testing.T) {
 }
 
 func TestPreflightAllowedOrigin(t *testing.T) {
-	h := New(testConfig(), nil, nil).Router()
+	h := New(testConfig(), nil, Deps{}).Router()
 	w := do(t, h, http.MethodOptions, "/public-ai/v1/turns", testOrigin, "", "")
 	if w.Code != http.StatusNoContent {
 		t.Fatalf("got %d", w.Code)
@@ -83,7 +83,7 @@ func TestPreflightAllowedOrigin(t *testing.T) {
 }
 
 func TestRequestIDIssuedByServer(t *testing.T) {
-	h := New(testConfig(), nil, nil).Router()
+	h := New(testConfig(), nil, Deps{}).Router()
 	req := httptest.NewRequest(http.MethodGet, "/health/live", nil)
 	req.Header.Set("X-Request-ID", "attacker-controlled")
 	w := httptest.NewRecorder()
@@ -95,11 +95,11 @@ func TestRequestIDIssuedByServer(t *testing.T) {
 }
 
 func TestReadinessReflectsDependencies(t *testing.T) {
-	notReady := New(testConfig(), nil, func() bool { return false }).Router()
+	notReady := New(testConfig(), nil, Deps{Ready: func() bool { return false }}).Router()
 	if w := do(t, notReady, http.MethodGet, "/health/ready", "", "", ""); w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("ready should be 503, got %d", w.Code)
 	}
-	ready := New(testConfig(), nil, func() bool { return true }).Router()
+	ready := New(testConfig(), nil, Deps{Ready: func() bool { return true }}).Router()
 	if w := do(t, ready, http.MethodGet, "/health/ready", "", "", ""); w.Code != http.StatusOK {
 		t.Fatalf("ready should be 200, got %d", w.Code)
 	}
@@ -109,7 +109,7 @@ func TestReadinessReflectsDependencies(t *testing.T) {
 }
 
 func TestPublicHealthIsGeneric(t *testing.T) {
-	h := New(testConfig(), nil, func() bool { return true }).Router()
+	h := New(testConfig(), nil, Deps{Ready: func() bool { return true }}).Router()
 	w := do(t, h, http.MethodGet, "/public-ai/v1/health/public", testOrigin, "", "")
 	if w.Code != http.StatusOK || strings.TrimSpace(w.Body.String()) != `{"status":"ok"}` {
 		t.Fatalf("got %d %s", w.Code, w.Body.String())
@@ -118,7 +118,7 @@ func TestPublicHealthIsGeneric(t *testing.T) {
 
 // SSE is disabled in R0 (stream_enabled=false, ADR-005).
 func TestTurnEventsDisabledInR0(t *testing.T) {
-	h := New(testConfig(), nil, nil).Router()
+	h := New(testConfig(), nil, Deps{}).Router()
 	w := do(t, h, http.MethodGet, "/public-ai/v1/turns/pub_t_x/events", testOrigin, "", "")
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("got %d", w.Code)
