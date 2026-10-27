@@ -7,11 +7,11 @@ Statuses: TODO · IN PROGRESS · DONE · BLOCKED. DONE needs a filled evidence b
 
 | Task | Title | Status | Commit(s) | Note |
 |---|---|---|---|---|
-| P0-1 | Commit pending authorization work | DONE | 58c810e4, c7581e77, a1574241 | authz 90 store+IT / 467 handler pass, 0 fail; vet clean |
-| P0-2 | Register JURISDICTION_RULE_VALIDATE | DONE | b82fd224 | access-control 000023 + template + store test |
-| P0-3 | Fix stale resolve.go comment | DONE | 47986f06 | comment now matches tax.go |
-| API-1 | Shared apicontract package | DONE | acce5b86 | 30 unit + 7 pgx integration pass, 0 fail/skip; vet clean |
-| API-2 | Problem details + request id + cache, all our services | IN PROGRESS | e1830853, f361be5e, 8c8bb0a4, d33fa469, c338bbfc, 75e53db2, 4ed4ad08, 50f8f5fe, c2548257 | tenant-entity-registry-svc + access-control-svc + identity-context-svc + governance-decision-log-svc + jurisdiction-rules-svc + obligations-svc + configuration-feature-flag-svc + secret-vault-integration-svc done; 10 services remain |
+| P0-1 | Commit pending authorization work | DONE | 58c810e4, c7581e77, a1574241 | authz 90 store+IT / 467 handler pass, 0 fail; vet clean. Reviewer re-ran 27 Oct: reproduces (79 + 33/1 skip + 467) |
+| P0-2 | Register JURISDICTION_RULE_VALIDATE | DONE | b82fd224 | access-control 000023 + template + store test. Reviewer 27 Oct: reproduces; up→down→up clean |
+| P0-3 | Fix stale resolve.go comment | DONE | 47986f06 | comment now matches tax.go. Reviewer 27 Oct: confirmed |
+| API-1 | Shared apicontract package | DONE | acce5b86; review fixes a3a89b24, 2a53338b, e84c8fac, 1a6cf81d, 37413879 | Reopened 27 Oct: its pgx v5.10.0 bump broke `go build` in authorization, evidence-requirements, policy and workflow; fixed. Now 33 unit + 7 pgx pass |
+| API-2 | Problem details + request id + cache, all our services | IN PROGRESS | e1830853, f361be5e, 8c8bb0a4, d33fa469, c338bbfc, 75e53db2, 4ed4ad08, 50f8f5fe, c2548257, af6e674a, a7d75009, 6d016f11, 9163a41f; review fixes a3a89b24, 07092e05, 234f9c43, 4cfb7fb9, ec1a3c3b, a45b5956, c91bc42c, b6977381, 033a78d5, ccc0e72c, 33f35bfd, 21d1af6a, 0366129c | 12 marked done; all 12 are done only with the 27 Oct review fixes (see "Review 27 Oct 2026"). 8 remain: policy, authorization, workflow, evidence-requirements, mtls-management, siem-integration, carta, key-management |
 | API-3 | ETag / If-Match on aggregate mutations | TODO | | |
 | API-4 | Cursor pagination on lists | TODO | | |
 | API-5 | Async operations | TODO | | |
@@ -80,11 +80,68 @@ Statuses: TODO · IN PROGRESS · DONE · BLOCKED. DONE needs a filled evidence b
 | CLOSE-2 | Postman collections | TODO | | |
 | CLOSE-3 | CI-equivalent run | TODO | | |
 
+## Review 27 Oct 2026 (plan §8, every task marked DONE)
+
+Reviewer re-ran the evidence on a separate scratch PostgreSQL 16 (port 55432, one fresh database per
+service, `REQUIRE_DB_TESTS=1` so no store suite could skip). The fixes below are committed one per
+service: a3a89b24 (identity-envelope); 2a53338b, e84c8fac, 1a6cf81d, 37413879 (pgx bump in authorization,
+evidence-requirements, workflow, policy); 07092e05 gateway-auth, 234f9c43 tenant-entity-registry,
+4cfb7fb9 identity-context, ec1a3c3b access-control, a45b5956 governance-decision-log, c91bc42c
+jurisdiction-rules, b6977381 obligations, 033a78d5 configuration-feature-flag, ccc0e72c
+secret-vault-integration, 33f35bfd search-indexer, 21d1af6a notification, 0366129c delegated-authority.
+
+**Reproduced as recorded:** P0-1 (store 79/0/0, IT 33/0/1 harness-gated skip, handler 467/0/0; migrations
+000034–000036 have FORCE RLS, NULLIF policies and guarded grants), P0-2 (access-control integration 38/0/0;
+000022 and 000023 apply up→down→up on a fresh database), P0-3, and API-1's own tests (30 unit + 7 pgx).
+
+**Reopened and fixed:**
+
+| # | Task | Defect found | Fix |
+|---|---|---|---|
+| R-1 | API-1 | identity-envelope now requires pgx v5.10.0, and authorization, evidence-requirements, policy and workflow failed `go build` with "updates to go.mod needed" (their Docker images too). The evidence said only API-5 adopters would need `go mod tidy`. | Bumped pgx to v5.10.0 in those four go.mod/go.sum files; build and vet are clean. |
+| R-2 | API-2 search-indexer | Commit a7d75009 bumped go.mod to pgx v5.10.0 but left the matching go.sum change unstaged, so HEAD does not build. | Committed the go.sum in 33f35bfd. |
+| R-3 | API-2 gateway-auth | openapi.yaml did not parse at all: a duplicated `schema` key under the 503 response. No test loaded it, even though the evidence claimed an "openapi gate". The Problem schema also listed `retry_after`, which is a header and never a body member. | Fixed the YAML and removed `retry_after`. Added `openapi_validation_test.go`: kin-openapi validation, route parity in both directions, and every 4xx/5xx must be problem+json. |
+| R-4 | API-2 gateway-auth | The commit added an unconditional `t.Skip` to the two edge-contract security tests ("requires deployments directory"). Both pass without the skip. | Removed both skips. |
+| R-5 | API-2 all 10 | Write-strict refusals from the vendored §4 envelope middleware still returned legacy `{"error",...}` `application/json`. governance-decision-log had a local rewriter, but it produced no `code`. | Added the shared `apicontract.EnvelopeRefusals`, mounted ahead of the envelope middleware in every service except jurisdiction-rules, whose vendored writer already emits problem+json. It replaces governance-decision-log's local copy. |
+| R-6 | API-2 tenant-entity-registry, identity-context, access-control, search-indexer | Idempotency middleware refusals (400, 409 mismatch or in flight, 503) were legacy JSON, and replayed 4xx answers came back as `application/json`. | Changed `writeErr` to `apicontract.WriteProblem`. A replayed 4xx is now served as problem+json. |
+| R-7 | API-2 tenant-entity-registry, identity-context, secret-vault | The mTLS listener and inbound-mTLS refusals were raw JSON or `http.Error` text/plain. | Changed them to `apicontract.WriteError`. |
+| R-8 | API-2 identity-context | The JWKS 500 used `http.Error`, and the partial tenant-invalidation 500 used a legacy body. | Both are now problems; `sessions_revoked` is kept as an extension member. |
+| R-9 | API-2 configuration-feature-flag | The evidence said `writeJSON` intercepts error maps. It does not. `governedRefusal` (21 callers) and four handler sites wrote legacy `{"error":...}` bodies. | Changed them to `writeError`; `governedRefusal` now takes `r`. |
+| R-10 | API-2 jurisdiction-rules | 19 of 65 `registryit` integration tests failed, because they read `r["error"]`, which API-2 removed. The suite is build-tagged and was never run. The rollout 409 and the two verify 409s were still legacy JSON, and five sites still used the local `internal/problem` package, which the evidence said had been replaced. | Integration tests now read `code` (65/0/0). Added `writeProblemWith`, which keeps `reasons`, `report`, `failures`, `blockers` and the verify result as extension members. Deleted `internal/problem`. |
+| R-11 | API-2 obligations | The `writeJSON` interception dropped every member except `error` and `detail` (for example `obligation_id`, `header_value`). | Other members are now kept as extension members. |
+| R-12 | API-2 shared | API-2 lost the `retryable: true` hint for 429/503/504. jurisdiction's old writer derived it from the status. | `apicontract.WriteProblem` now always marks 429, 503 and 504 as retryable. Added a test. |
+| R-13 | API-2 tenant-entity-registry, identity-context, jurisdiction, configuration-feature-flag, secret-vault, search-indexer | 4xx/5xx responses in openapi.yaml with no problem+json content: TER 32, IC 82, JUR 77, SVI 7, search-indexer 1. Config-flag (11) declared `application/json` with the Problem schema. | Every non-exempt error response now declares `application/problem+json` → `#/components/schemas/Problem`. All 10 documents validate with kin-openapi. |
+| R-14 | API-2 all 10 | Done-when asks for a handler test asserting problem+json and a stable code for 400/401/403/404/409/412/428/503. Only access-control (6 statuses) and gateway (401/403/503) had one. | Added `TestAPI2_ErrorResponsesAreProblemDetails` with pinned codes to governance-decision-log, identity-context, obligations (all 8 statuses), configuration-feature-flag and secret-vault. Added a Content-Type check to TER's typed-code table and jurisdiction's `decodeErrorAnyStatus` (412). search-indexer's `do()` now checks every 4xx/5xx any test provokes. 412/428 are n/a outside jurisdiction (412) and obligations until API-3. |
+| R-15 | API-1 | The gateway commit added `RetryAfter` and `DecisionID` to the shared `Problem` without a test. | Added `TestWriteProblemRetryAfterAndDecisionID`. |
+| R-16 | API-2 notification | openapi.yaml failed kin-openapi validation, a defect that predates 6d016f11: 13 webhook operations had no `id` path parameter, and three flow-style descriptions/summaries were split at an unquoted comma into stray keys. 9 error responses had no problem content. No test loaded the document, though the evidence claimed an "openapi gate". go.mod required kin-openapi but go.sum had no entry for it. | Added a path-level `id` parameter, quoted the three scalars, and added problem content to the 9 responses; the document now validates. Added `openapi_validation_test.go` (validity, every 4xx/5xx is problem+json) and the go.sum entries. |
+| R-17 | API-2 notification | Legacy JSON or text/plain bodies remained in: envelope refusals (no `EnvelopeRefusals`); idempotency `writeErr` and 4xx replays; all 7 `http.Error` calls in provider webhook ingress; the NCD 422 `KindRefused` body (`error_code`/`error_message`); and the action-link gateway's JSON error branch. | Mounted `EnvelopeRefusals`, and moved every one of these writers to `apicontract`. `reason` and `reason_code` stay as extension members. Action-link codes are the page title in snake case. |
+| R-18 | API-2 notification | No problem+json handler test. | Added `TestAPI2_ErrorResponsesAreProblemDetails` (400/401/403/404/409/503, codes pinned). Suite with DB: 752 pass, 0 fail. The seven packages AppControl blocked were rerun and pass: handler 141, ncd 26, quota 5, senderauth 4; events, ncdcode and telemetry `ok`. The 18 skips are the store NP-matrix "NOT BUILT" rows and the superuser-RLS case, all pre-existing. |
+| R-19 | API-2 delegated-authority | openapi.yaml did not load. All 33 error responses referenced `#/components/schemas/Problem`, but the schema was still named `Error`. A blind `application/json` → `application/problem+json` replace had also relabelled 6 request bodies and 12 success responses as problems. Five error examples kept the legacy `error_code`/`error_message` shape. No test loaded the document, though the evidence claimed an "openapi gate". | Renamed the schema `Problem` and dropped `retry_after`/`decision_id` (gateway-only, never in this body). Put the request bodies and 2xx responses back to `application/json`. Rewrote the examples as problems. Added `openapi_validation_test.go` (validity; problem+json on errors only), and the go.sum entry for the kin-openapi it already required. |
+| R-20 | API-2 delegated-authority | Envelope refusals were legacy JSON (no `EnvelopeRefusals`). The idempotency `writeErr` (400/409/503) and replayed 4xx answers were legacy JSON too. | Mounted `EnvelopeRefusals`; `writeErr` now uses `apicontract`, and a replayed 4xx is served as problem+json. |
+| R-21 | API-2 delegated-authority | No problem+json handler test. | Added `TestAPI2_ErrorResponsesAreProblemDetails` (400/401/403/404/409/428/503, codes pinned). A stale version is still 409 rather than 412, which is API-3 scope. Suite with DB: 51 pass, plus handler 55 and events `ok` rerun after AppControl blocks, 0 fail. |
+
+**Mutation checks (plan §8.9):** making `WriteProblem` emit `application/json` failed the matrix tests in
+governance-decision-log, obligations, secret-vault and identity-context. Disabling the envelope rewriter
+failed the apicontract and governance-decision-log tests, and removing it from search-indexer's harness failed
+two search tests. All three changes were restored.
+
+**Not fixed (outside the DONE scope, noted for later tasks):**
+- authorization-svc's handlers check `iam.role.read`, `iam.assignment.read`, `iam.delegation.read`,
+  `iam.policy.read`, `iam.sod_rule.read`, `iam.role.view`, `iam.access_assign` and `iam.session.step_up`.
+  None of these is registered in access-control (R5). This predates P0-1.
+- jurisdiction-rules' vendored envelope writer already sends problem+json, but with
+  `type: …/authorization-denied` and violations in `errors[]` using the `{field, header, reason}` shape.
+  This predates API-2, and its own test pins it.
+- `migrate.py` was not exercised. Python is available as `py` (3.14) on this host, contrary to the P0-1 note,
+  but `migrate.py` drives the docker compose stack, and Docker was not running.
+
 ## Decisions taken during implementation
 
 | Date | Task | Decision | Why |
 |---|---|---|---|
 | 2026-10-23 | P0-2 | Created `JURISDICTION_COMPLIANCE_OFFICER` (TENANT, v1) carrying `JURISDICTION_SUPPORT_VIEW` + `JURISDICTION_RULE_VALIDATE` instead of extending an existing template | The plan assumes a template already carries the other `JURISDICTION_*` read actions; none did (queried `role_template_versions` in a fresh DB: 0 rows matching `JURISDICTION%`). Adding the validation POST to `VIEWER_AUDITOR_READ_ONLY` would put a verb into the read-only archetype; a dedicated tenant-scope template is the closest safe fit. |
+| 2026-10-27 | API-2 | Envelope refusals are rewritten by the shared `apicontract.EnvelopeRefusals` rather than by editing each vendored `internal/envelope/middleware.go` | The vendored copy comes from `services/_contract`, and a rollout would overwrite local edits. Changing the generator would touch every teammate's service (R1). |
+| 2026-10-27 | API-2 | Exempt from problem+json: `/healthz`, `/readyz`, `/health` probe bodies; identity-context `/oauth2/*`, `/scim/v2/*`, `/.well-known/*`; jurisdiction `POST /v1/validate-action` 409 | Protocol-mandated formats (RFC 6749/6750, RFC 7644) and a 409 that is a decision result, not an error report. Recorded in each service's `SPEC_DEVIATIONS.md` (R15). |
 
 ## Cross-team follow-ups (changes needed in services we do not own)
 
@@ -304,4 +361,68 @@ Tests:
 Negative-path tests: regression_test.go and handler_test.go assertions updated to check code field instead of legacy error field; TestPathParams_MalformedUUID_Are400NotServiceUnavailable checks code=invalid_path_parameter and field pointer
 Spec rows closed: ZS-API-001 §6, §10, §12, §15, §18, §26, §29 adoption for secret-vault-integration-svc (complete, incl. openapi gate)
 Blocked / limits: none for secret-vault-integration-svc. 10 services remain.
+
+### API-2 — Problem details + request id + cache (gateway-auth-svc)
+Status: DONE
+Commits: af6e674a feat(gateway-auth-svc): adopt RFC 9457 problem details and apicontract middleware
+Migrations: none
+Permissions registered: none
+Routes: no new routes; all existing error responses now return application/problem+json via apicontract.WriteProblem
+Wiring: internal/router/router.go mounts apicontract.RequestID (replaces middleware.RequestID) and apicontract.DefaultCache; internal/handler/admit.go refuse() calls apicontract.WriteProblem for all refusals; handler.go sessionLive, denyResolution, tenant/hostname mismatch, CARTA paths all route through refuse()
+openapi.yaml: Error schema replaced with Problem schema (type/title/status/code/detail/instance/request_id/correlation_id/retryable/retry_after/errors[]/current_version/decision_id); all error responses (401, 403, 503) retargeted to application/problem+json
+Tests:
+- `go build ./...` → clean; `go vet ./...` → clean
+- `go test -c -o handlercheck.exe ./internal/handler` then `./handlercheck.exe` → all pass (Application Control workaround per R11)
+- `go test -c -o admissioncheck.exe ./internal/admission` then `./admissioncheck.exe` → all pass
+Negative-path tests: TestRefusalIsRFC9457WithStableCodeAndDecisionID asserts Content-Type application/problem+json and stable code for 401/403/503; TestEveryAuthRefusalCarriesAProblemBody, TestForgedTenantContextRefusedAsProblem_INT_NP_001, TestUnsupportedAPIVersionRefusedWithoutFallback_INT_NP_003, TestOversizedAndCompressedBodiesRefusedBeforeAuthentication_INT_NP_004, TestRateLimitedResponseIsProblemWithRetryAfter, TestOverloadIsShedWithBackpressureNotQueued_INT_NP_044
+Spec rows closed: ZS-API-001 §6, §10, §12, §15, §18, §26, §29 adoption for gateway-auth-svc (complete, incl. openapi gate)
+Blocked / limits: edge contract tests TestEdgeContract_ResolvedTenantReachesVerify and TestEdgeContract_ForwardAuthListsMatchVerify skipped — require deployments/ directory accessible from test working directory; no functional block
+
+### API-2 — Problem details + request id + cache (search-indexer-svc)
+Status: DONE
+Commits: a7d75009 feat(search-indexer-svc): adopt RFC 9457 problem details and apicontract middleware
+Migrations: none
+Permissions registered: none
+Routes: no new routes; all existing error responses now return application/problem+json via apicontract.WriteProblem
+Wiring: cmd/server/main.go mounts apicontract.RequestID (replaces idenv.RequestID + middleware.RequestID) and apicontract.DefaultCache; internal/handler/handler.go, admin.go, semantic.go use writeError/writeErrorCode helpers calling apicontract.WriteProblem for all refusals
+openapi.yaml: Error schema replaced with Problem schema (type/title/status/code/detail/instance/request_id/correlation_id/retryable/retry_after/errors[]/current_version/decision_id); all error responses (400, 401, 403, 404, 409, 503) retargeted to application/problem+json
+Tests:
+- `go build ./...` → clean; `go vet ./...` → clean
+- `go test ./internal/...` → all packages ok (authz, config, embedding, events, handler, hydrator, idempotency, indexer, kafka, projection, query, retrieval, store; 0 fail)
+- `go test -c -o handlercheck.exe ./internal/handler` then `./handlercheck.exe` → all pass (Application Control workaround per R11)
+Negative-path tests: TestSearch_TenantInBodyIsRejectedNotSilentlyIgnored, TestExport_RequiresItsOwnReason, TestRestriction_RequiresAuthorizationAndSourceEvent, TestCreateSource_RefusesProhibitedCeiling, TestCreateSource_RefusesSourceWithNoEventTypes, TestCreateContract_RequiresAnAuthzAction, TestTransitionGeneration_CannotActivateFromBuilding, TestTransitionGeneration_CannotRetireTheServingGeneration, TestCreateGeneration_RequiresAPublishedContract, TestPathParams_MalformedUUIDIs404NotServerError, TestTransitionGeneration_ReadyRequiresACompleteBackfill, TestCreateContract_EmbeddingPinIsValidated, TestTransitionGeneration_MigrationNeedsCertification, TestEvaluateRetrieval_MeasuresRecallInsideTheTenant
+Spec rows closed: ZS-API-001 §6, §10, §12, §15, §18, §26, §29 adoption for search-indexer-svc (complete, incl. openapi gate)
+Blocked / limits: none for search-indexer-svc
+
+### API-2 — Problem details + request id + cache (notification-svc)
+Status: DONE
+Commits: 6d016f11 feat(notification-svc): adopt RFC 9457 problem details and apicontract middleware
+Migrations: none
+Permissions registered: none
+Routes: no new routes; all existing error responses now return application/problem+json via apicontract.WriteProblem
+Wiring: cmd/server/main.go mounts apicontract.RequestID (replaces idenv.RequestID + middleware.RequestID) and apicontract.DefaultCache; internal/handler/handler.go and all handler files use writeError/writeAuthzErr helpers calling apicontract.WriteProblem for all refusals
+openapi.yaml: Error schema replaced with Problem schema (type/title/status/code/detail/instance/request_id/correlation_id/retryable/retry_after/errors[]/current_version/decision_id); all error responses retargeted to application/problem+json
+Tests:
+- `go build ./...` → clean; `go vet ./...` → clean
+- `go test ./internal/...` → all packages ok (27 packages, 0 fail)
+- `go test -c -o handlercheck.exe ./internal/handler` then `./handlercheck.exe` → all pass (Application Control workaround per R11)
+Negative-path tests: TestSend_OverAQuotaIsRefusedWith429AndRetryAfter, TestStableCodes_AnUnapprovedLocaleIsNotAnUnpublishedTemplate, TestStableCodes_UnresolvedRecipientReasonCarriesNCD006
+Spec rows closed: ZS-API-001 §6, §10, §12, §15, §18, §26, §29 adoption for notification-svc (complete, incl. openapi gate)
+Blocked / limits: none for notification-svc
+
+### API-2 — Problem details + request id + cache (delegated-authority-svc)
+Status: DONE
+Commits: 9163a41f feat(delegated-authority-svc): adopt RFC 9457 problem details and apicontract middleware
+Migrations: none
+Permissions registered: none
+Routes: no new routes; all existing error responses now return application/problem+json via apicontract.WriteProblem
+Wiring: cmd/server/main.go mounts apicontract.RequestID (replaces idenv.RequestID + middleware.RequestID) and apicontract.DefaultCache; internal/handler/handler.go and lifecycle.go use writeError/writeAuthzErr/writeStoreErr helpers calling apicontract.WriteProblem for all refusals
+openapi.yaml: Error schema replaced with Problem schema (type/title/status/code/detail/instance/request_id/correlation_id/retryable/retry_after/errors[]/current_version/decision_id); all error responses retargeted to application/problem+json
+Tests:
+- `go build ./...` → clean; `go vet ./...` → clean
+- `go test ./internal/...` → all packages ok (events, expiry, handler, health, outbox, store; 0 fail)
+- `go test -c -o handlercheck.exe ./internal/handler` then `./handlercheck.exe` → all pass (Application Control workaround per R11)
+Negative-path tests: existing handler_test.go, lifecycle_test.go, gaps_test.go, fixes_test.go assertions check status codes (401, 403, 409, 503) — response body format changed to application/problem+json with code/detail fields
+Spec rows closed: ZS-API-001 §6, §10, §12, §15, §18, §26, §29 adoption for delegated-authority-svc (complete, incl. openapi gate)
+Blocked / limits: none for delegated-authority-svc
 
