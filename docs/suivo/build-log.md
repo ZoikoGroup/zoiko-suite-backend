@@ -106,3 +106,38 @@ Each entry records what a build step changed and the verified result of
   kb.release.promoted.v1 ×2, kb.source.revoked.v1, publicai.kill_switch.changed.v1;
   `stream_enabled=true` refused.
 - Result: build ok, vet ok, all tests pass, gofmt clean.
+
+## STEPs 8–11 — Model gateway, output validation, vertical slice, events, limits, kill switch
+
+- Files: `internal/model` (gateway: tools hard-coded off, deadline, one transient retry, layered prompt
+  with evidence escaped as non-instructional data; deterministic `Fake` provider with fault modes),
+  `internal/validate` (post-generation gate), `internal/orchestrator/pipeline.go` (full pipeline),
+  `internal/fixtureenv` (in-process stack on TEST-ONLY fixtures), `internal/events/relay.go`
+  (outbox → Kafka/log, at-least-once, DLQ after 10 attempts), `internal/limits`, `cmd/server`
+  (Postgres mode + local dev mode on fixtures), `internal/e2e`.
+- Pipeline order: kill switch → verified snapshot (none → UNAVAILABLE, never model memory) →
+  redaction + X-exceptions (templates, security signal) → per-intent disable → route-only intents →
+  P1 claims (MARKET_REQUIRED → CLARIFY; CONTRADICTED → ABSTAIN + conflict record; REVOKED/EXPIRED →
+  ABSTAIN; INSUFFICIENT → ABSTAIN) → retrieval (STALE/REVOKED → ABSTAIN; NOT_FOUND → ABSTAIN or
+  out-of-scope for I29) → generation (claims are used verbatim) → validation (one repair) → ≤3
+  citations from what was actually used → revocation re-check at commit → ≤1 official CTA.
+- Validation: unknown claim/evidence refs, markup/script, instruction leakage, prohibited commitment
+  phrases (unless a signed claim contains them), and ANY number not present in the supplied claims or
+  evidence are rejected; model URLs/emails/phones removed; ≤120 words at sentence boundaries.
+- Degraded modes: provider error/timeout → UNAVAILABLE + route; `approved_fallback_mode=static` and
+  `model_generation_enabled=false` serve signed claim statements only; `pricing_claims_enabled=false`
+  → no numbers; `public_ai_enabled=false` → UNAVAILABLE and readiness false.
+- Limits: per-IP (IPv6 /64) and per-session token buckets, global in-flight cap → 429 + Retry-After;
+  daily/monthly token ceilings stop the model path (fail closed if usage unreadable).
+- Events: chat.turn.completed.v1 and chat.security.signal.v1 written in the turn transaction;
+  chat.handoff.clicked.v1 is defined but not emitted in R0 (no click endpoint in the Doc 05 contract).
+- Tests: vertical slice (grounded answer, verified price, clarify, conflict + record, SOC 2 never
+  certified, ISO verified, private data/actions refused, injection + signal, sensitive input never
+  echoed, provider error/timeout/transient, 5 misbehaving-model faults, revocation mid-flight, revoked
+  source, kill switch, pricing off, static mode, per-intent disable, trial CTA gating, demo route-only,
+  expired evidence, no knowledge), validator unit tests, gateway deadline + prompt escaping, relay
+  delivery/no-resend/DLQ, six event types only, limiter tests, spend ceiling, HTTP e2e incl. SEC-T039
+  (no visitor text or secrets in any event).
+- Live smoke test: server in dev mode answered 4 sample questions correctly over HTTP; server log
+  contained 0 occurrences of visitor text or grants.
+- Result: build ok, vet ok, all tests pass (incl. Postgres), gofmt clean.

@@ -15,6 +15,8 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/public-ai-svc/internal/contract"
+	"zoiko.io/public-ai-svc/internal/events"
+	"zoiko.io/public-ai-svc/internal/limits"
 	"zoiko.io/public-ai-svc/internal/orchestrator"
 	"zoiko.io/public-ai-svc/internal/problem"
 	"zoiko.io/public-ai-svc/internal/session"
@@ -233,8 +235,8 @@ func (s *Server) postTurn(w http.ResponseWriter, r *http.Request) {
 
 	done := begun.Turn
 	done.Status, done.IntentID, done.Response = string(env.Status), env.IntentID, body
-	events := s.turnEvents(env, res, now)
-	if err := s.deps.Store.CompleteTurn(runCtx, done, usageBuckets(now), res.Tokens, events); err != nil {
+	evs := s.turnEvents(env, res, now)
+	if err := s.deps.Store.CompleteTurn(runCtx, done, usageBuckets(now), res.Tokens, evs); err != nil {
 		s.log.Error("turn completion failed", zap.String("request_id", rid), zap.Error(err))
 		_ = s.deps.Store.AbortTurn(context.WithoutCancel(ctx), sess.SessionID, turnID)
 		problem.Write(w, r, problem.ServiceUnavailable, "")
@@ -270,11 +272,22 @@ func nonNilA(a []contract.Action) []contract.Action {
 
 // usageBuckets are the spend-ceiling counters a turn contributes to.
 func usageBuckets(now time.Time) []string {
-	return []string{"tokens:day:" + now.Format("2006-01-02"), "tokens:month:" + now.Format("2006-01")}
+	day, month := limits.UsageBuckets(now)
+	return []string{day, month}
 }
 
-// turnEvents returns the redacted outbox events for a completed turn
-// (filled in by STEP 10).
-func (s *Server) turnEvents(contract.Envelope, orchestrator.Result, time.Time) []store.OutboxEvent {
-	return nil
+// turnEvents returns the redacted outbox events for a completed turn. They
+// carry identifiers, enums and coarse buckets only (Doc 05 §21).
+func (s *Server) turnEvents(env contract.Envelope, res orchestrator.Result, start time.Time) []store.OutboxEvent {
+	now := time.Now().UTC()
+	var out []store.OutboxEvent
+	if ev, err := events.TurnCompleted(env.RequestID, env.IntentID, string(env.Status), now.Sub(start), env.KnowledgeReleaseID, now); err == nil {
+		out = append(out, ev)
+	}
+	if res.SecuritySignal != "" {
+		if ev, err := events.SecuritySignal(res.SecuritySignal, env.RequestID, "MEDIUM", now); err == nil {
+			out = append(out, ev)
+		}
+	}
+	return out
 }
