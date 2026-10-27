@@ -115,12 +115,22 @@ func (h *findingHandler) AccumulateMisstatement(w http.ResponseWriter, r *http.R
 	if !ok {
 		return
 	}
+	findingID := chi.URLParam(r, "finding_id")
+	finding, err := h.store.GetFinding(r.Context(), findingID)
+	if err != nil {
+		h.writeFindingErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, finding.LegalEntityID, actionFindingManage); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
 	var req accumulateMisstatementRequest
 	if !decodeFindingJSON(w, r, &req) {
 		return
 	}
 	m, err := h.store.AccumulateMisstatement(r.Context(), domain.AccumulateMisstatementParams{
-		FindingID: chi.URLParam(r, "finding_id"), TenantID: middleware.GetTenantID(r.Context()), Amount: req.Amount,
+		FindingID: findingID, TenantID: middleware.GetTenantID(r.Context()), Amount: req.Amount,
 		CorrectsMisstatementID: req.CorrectsMisstatementID, RecordedByPrincipalID: principalID,
 	})
 	if err != nil {
@@ -140,12 +150,22 @@ func (h *findingHandler) RecordMaterialityEvaluation(w http.ResponseWriter, r *h
 	if !ok {
 		return
 	}
+	findingID := chi.URLParam(r, "finding_id")
+	finding, err := h.store.GetFinding(r.Context(), findingID)
+	if err != nil {
+		h.writeFindingErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, finding.LegalEntityID, actionFindingManage); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
 	var req recordMaterialityEvaluationRequest
 	if !decodeFindingJSON(w, r, &req) {
 		return
 	}
 	e, err := h.store.RecordMaterialityEvaluation(r.Context(), domain.RecordMaterialityEvaluationParams{
-		FindingID: chi.URLParam(r, "finding_id"), TenantID: middleware.GetTenantID(r.Context()), IsMaterial: req.IsMaterial,
+		FindingID: findingID, TenantID: middleware.GetTenantID(r.Context()), IsMaterial: req.IsMaterial,
 		QualitativeNotes: req.QualitativeNotes, EvaluatedByPrincipalID: principalID,
 	})
 	if err != nil {
@@ -156,7 +176,21 @@ func (h *findingHandler) RecordMaterialityEvaluation(w http.ResponseWriter, r *h
 }
 
 func (h *findingHandler) CommunicateFinding(w http.ResponseWriter, r *http.Request) {
-	updated, err := h.store.CommunicateFinding(r.Context(), domain.CommunicateFindingParams{FindingID: chi.URLParam(r, "finding_id"), TenantID: middleware.GetTenantID(r.Context())})
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	findingID := chi.URLParam(r, "finding_id")
+	finding, err := h.store.GetFinding(r.Context(), findingID)
+	if err != nil {
+		h.writeFindingErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, finding.LegalEntityID, actionFindingManage); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	updated, err := h.store.CommunicateFinding(r.Context(), domain.CommunicateFindingParams{FindingID: findingID, TenantID: middleware.GetTenantID(r.Context())})
 	if err != nil {
 		h.writeFindingErr(w, err)
 		return
@@ -174,12 +208,22 @@ func (h *findingHandler) RecordManagementResponse(w http.ResponseWriter, r *http
 	if !ok {
 		return
 	}
+	findingID := chi.URLParam(r, "finding_id")
+	finding, err := h.store.GetFinding(r.Context(), findingID)
+	if err != nil {
+		h.writeFindingErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, finding.LegalEntityID, actionFindingManage); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
 	var req recordManagementResponseRequest
 	if !decodeFindingJSON(w, r, &req) {
 		return
 	}
 	m, err := h.store.RecordManagementResponse(r.Context(), domain.RecordManagementResponseParams{
-		FindingID: chi.URLParam(r, "finding_id"), TenantID: middleware.GetTenantID(r.Context()), ResponseText: req.ResponseText,
+		FindingID: findingID, TenantID: middleware.GetTenantID(r.Context()), ResponseText: req.ResponseText,
 		RemediationPlan: req.RemediationPlan, RespondedByPrincipalID: principalID,
 	})
 	if err != nil {
@@ -199,13 +243,23 @@ func (h *findingHandler) LinkRemediation(w http.ResponseWriter, r *http.Request)
 	if !ok {
 		return
 	}
+	findingID := chi.URLParam(r, "finding_id")
+	finding, err := h.store.GetFinding(r.Context(), findingID)
+	if err != nil {
+		h.writeFindingErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, finding.LegalEntityID, actionFindingManage); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
 	var req linkRemediationRequest
 	if !decodeFindingJSON(w, r, &req) || req.EvidenceRef == "" {
 		writeError(w, http.StatusBadRequest, "evidence_ref is required")
 		return
 	}
 	rem, err := h.store.LinkRemediation(r.Context(), domain.LinkRemediationParams{
-		FindingID: chi.URLParam(r, "finding_id"), TenantID: middleware.GetTenantID(r.Context()), EvidenceRef: req.EvidenceRef,
+		FindingID: findingID, TenantID: middleware.GetTenantID(r.Context()), EvidenceRef: req.EvidenceRef,
 		Reperformed: req.Reperformed, RecordedByPrincipalID: principalID,
 	})
 	if err != nil {
@@ -224,13 +278,23 @@ func (h *findingHandler) RecordScopeLimitation(w http.ResponseWriter, r *http.Re
 	if !ok {
 		return
 	}
+	findingID := chi.URLParam(r, "finding_id")
+	finding, err := h.store.GetFinding(r.Context(), findingID)
+	if err != nil {
+		h.writeFindingErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, finding.LegalEntityID, actionFindingManage); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
 	var req recordScopeLimitationRequest
 	if !decodeFindingJSON(w, r, &req) || req.Description == "" {
 		writeError(w, http.StatusBadRequest, "description is required")
 		return
 	}
 	l, err := h.store.RecordScopeLimitation(r.Context(), domain.RecordScopeLimitationParams{
-		FindingID: chi.URLParam(r, "finding_id"), TenantID: middleware.GetTenantID(r.Context()), Description: req.Description, RecordedByPrincipalID: principalID,
+		FindingID: findingID, TenantID: middleware.GetTenantID(r.Context()), Description: req.Description, RecordedByPrincipalID: principalID,
 	})
 	if err != nil {
 		h.writeFindingErr(w, err)
@@ -243,7 +307,16 @@ func (h *findingHandler) RecordScopeLimitation(w http.ResponseWriter, r *http.Re
 // record of having once impacted the report — see migration 000002's
 // reject_scope_limitation_mutation and AUD-NEG-029.
 func (h *findingHandler) ResolveScopeLimitation(w http.ResponseWriter, r *http.Request) {
-	updated, err := h.store.ResolveScopeLimitation(r.Context(), domain.ResolveScopeLimitationParams{LimitationID: chi.URLParam(r, "limitation_id"), TenantID: middleware.GetTenantID(r.Context())})
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID := middleware.GetTenantID(r.Context())
+	if err := h.authz.CheckAllowed(r.Context(), principalID, tenantID, actionFindingManage); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	updated, err := h.store.ResolveScopeLimitation(r.Context(), domain.ResolveScopeLimitationParams{LimitationID: chi.URLParam(r, "limitation_id"), TenantID: tenantID})
 	if err != nil {
 		h.writeFindingErr(w, err)
 		return
@@ -304,13 +377,23 @@ func (h *findingHandler) ReopenFinding(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	findingID := chi.URLParam(r, "finding_id")
+	finding, err := h.store.GetFinding(r.Context(), findingID)
+	if err != nil {
+		h.writeFindingErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, finding.LegalEntityID, actionFindingManage); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
 	var req reopenFindingRequest
 	if !decodeFindingJSON(w, r, &req) || req.Reason == "" {
 		writeError(w, http.StatusBadRequest, "reason is required")
 		return
 	}
 	updated, err := h.store.ReopenFinding(r.Context(), domain.ReopenFindingParams{
-		FindingID: chi.URLParam(r, "finding_id"), TenantID: middleware.GetTenantID(r.Context()), ActorPrincipalID: principalID, Reason: req.Reason,
+		FindingID: findingID, TenantID: middleware.GetTenantID(r.Context()), ActorPrincipalID: principalID, Reason: req.Reason,
 	})
 	if err != nil {
 		h.writeFindingErr(w, err)

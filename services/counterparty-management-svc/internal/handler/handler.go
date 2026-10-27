@@ -196,6 +196,12 @@ func (h *Handler) UpdateCounterparty(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Terminal state guard: TERMINATED counterparties are immutable.
+	if existing.Status == domain.StatusTerminated {
+		writeError(w, http.StatusConflict, "cannot update a terminated counterparty")
+		return
+	}
+
 	if req.Name != "" {
 		existing.Name = req.Name
 	}
@@ -215,6 +221,10 @@ func (h *Handler) UpdateCounterparty(w http.ResponseWriter, r *http.Request) {
 		existing.RiskCategory = req.RiskCategory
 	}
 	if req.Status != "" {
+		if req.Status == domain.StatusTerminated {
+			writeError(w, http.StatusBadRequest, "status cannot be set to TERMINATED via update")
+			return
+		}
 		existing.Status = req.Status
 	}
 	if req.ContactEmail != "" {
