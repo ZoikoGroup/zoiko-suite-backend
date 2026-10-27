@@ -399,6 +399,9 @@ func main() {
 	// handler so no request reaches business logic without a resolved tenant,
 	// actor, correlation and — on material writes — an idempotency key.
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
+	// The vendored envelope middleware answers refusals as legacy JSON; render
+	// them as RFC 9457 problem+json like every other error (ZS-API-001 §12).
+	r.Use(apicontract.EnvelopeRefusals)
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
 	// After the envelope check (a write without a key is already refused
