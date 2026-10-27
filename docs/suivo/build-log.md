@@ -20,3 +20,20 @@ Each entry records what a build step changed and the verified result of
   readiness vs liveness, generic public health, SSE 404 in R0, SEC-T049 isolation (module-wide, plus a
   test proving a cross-service import is rejected), config guards, problem format.
 - Result: build ok, vet ok, all tests pass, gofmt clean.
+
+## STEP 2 — Database migrations and store
+
+- Files: `deployments/migrations/000001_initial_schema.{up,down}.sql` + embed package,
+  `internal/store` (`Store` interface, `Memory`, `Postgres`, `Migrate`/`MigrateDown`),
+  `internal/store/storetest` (conformance suite run against both implementations).
+- Schema `public_ai`: sessions (grant stored only as SHA-256), session_idempotency, turns (exact
+  response bytes for byte-identical replay; never the raw message), releases (signed, immutable),
+  release_pointer (atomic swap), revocations (append-only, enforced by trigger), conflicts, flags,
+  usage_counters, outbox.
+- Design change recorded in ADR-002: knowledge lives in signed release bundles rather than editable
+  source/chunk tables (Doc 03 §11 forbids in-place edits).
+- Tests: memory + Postgres conformance (sessions, grant rotation, delete, turn begin/replay/mismatch/
+  conflict/abort/expired lock, sequence, releases immutability + pointer kind check, monotonic
+  revocations, flags, usage, outbox dedupe/publish), migrations up/down/up, revocation append-only.
+- Found by the real-Postgres run: JSONB re-formats stored responses; switched to BYTEA.
+- Result: build ok, vet ok, all tests pass (Postgres 16 via TEST_DATABASE_URL), gofmt clean.
