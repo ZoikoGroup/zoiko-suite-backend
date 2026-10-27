@@ -48,10 +48,10 @@ type governedStore interface {
 	DecideAuthorityLimit(ctx context.Context, limitID, tenantID, decider string, approve bool) (*domain.AuthorityLimit, error)
 }
 
-func (h *Handler) governedStore(w http.ResponseWriter) (governedStore, bool) {
+func (h *Handler) governedStore(w http.ResponseWriter, r *http.Request) (governedStore, bool) {
 	g, ok := h.store.(governedStore)
 	if !ok {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "", nil)
 	}
 	return g, ok
 }
@@ -70,11 +70,11 @@ func (h *Handler) breakGlassQuorum() int {
 }
 
 // governedErr maps the store's diagnosis of a refused governed change.
-func (h *Handler) writeGovernedErr(w http.ResponseWriter, op string, err error) {
+func (h *Handler) writeGovernedErr(w http.ResponseWriter, r *http.Request, op string, err error) {
 	switch {
 	case errors.Is(err, domain.ErrBreakGlassSessionNotFound), errors.Is(err, domain.ErrSoDRuleNotFound),
 		errors.Is(err, domain.ErrABACRuleNotFound), errors.Is(err, domain.ErrAuthorityLimitNotFound):
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not_found"})
+		writeError(w, r, http.StatusNotFound, "not_found", "", nil)
 	case errors.Is(err, domain.ErrCheckerNotIndependent):
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "checker_not_independent",
 			"message": "a change is approved or rejected by someone other than the person who asked for it, and other than the person it is about"})
@@ -102,7 +102,7 @@ func (h *Handler) writeGovernedErr(w http.ResponseWriter, op string, err error) 
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_authority_limit", "message": err.Error()})
 	default:
 		h.log.Error(op+": store unavailable", zap.Error(err))
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "", nil)
 	}
 }
 
@@ -219,7 +219,7 @@ func (h *Handler) sessionActivity(w http.ResponseWriter, r *http.Request, kind s
 	for _, p := range []string{domain.PermissionSessionReview, manage} {
 		held, err := h.holdsPermission(r, caller, tenantScope, p)
 		if err != nil {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "", nil)
 			return
 		}
 		if held {
@@ -244,11 +244,11 @@ func (h *Handler) sessionActivity(w http.ResponseWriter, r *http.Request, kind s
 		_, err = h.store.FindSupportSessionByID(r.Context(), sessionID, tenantScope)
 	}
 	if errors.Is(err, domain.ErrPrivilegedSessionNotFound) || errors.Is(err, domain.ErrBreakGlassSessionNotFound) || errors.Is(err, domain.ErrSupportSessionNotFound) {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session_not_found"})
+		writeError(w, r, http.StatusNotFound, "session_not_found", "", nil)
 		return
 	}
 	if err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "", nil)
 		return
 	}
 
@@ -257,7 +257,7 @@ func (h *Handler) sessionActivity(w http.ResponseWriter, r *http.Request, kind s
 	})
 	if err != nil {
 		h.log.Error("sessionActivity: decision read failed", zap.Error(err))
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "", nil)
 		return
 	}
 	act := domain.SessionActivity{SessionKind: kind, SessionID: sessionID, Decisions: page.Decisions,
@@ -322,18 +322,18 @@ func (h *Handler) decideBreakGlass(w http.ResponseWriter, r *http.Request, appro
 	if _, ok := h.readCommand(w, &r); !ok {
 		return
 	}
-	g, ok := h.governedStore(w)
+	g, ok := h.governedStore(w, r)
 	if !ok {
 		return
 	}
 	sessionID := chi.URLParam(r, "session_id")
 	bg, err := h.store.FindBreakGlassSessionByID(r.Context(), sessionID, tenantScope)
 	if err != nil {
-		h.writeGovernedErr(w, "decideBreakGlass", err)
+		h.writeGovernedErr(w, r, "decideBreakGlass", err)
 		return
 	}
 	if approver == bg.PrincipalID || (bg.RequestedBy != nil && approver == *bg.RequestedBy) {
-		h.writeGovernedErr(w, "decideBreakGlass", domain.ErrCheckerNotIndependent)
+		h.writeGovernedErr(w, r, "decideBreakGlass", domain.ErrCheckerNotIndependent)
 		return
 	}
 
@@ -348,7 +348,7 @@ func (h *Handler) decideBreakGlass(w http.ResponseWriter, r *http.Request, appro
 		decided, err = g.RejectBreakGlassSession(r.Context(), sessionID, tenantScope, approver)
 	}
 	if err != nil {
-		h.writeGovernedErr(w, "decideBreakGlass", err)
+		h.writeGovernedErr(w, r, "decideBreakGlass", err)
 		return
 	}
 	if decided.Status == domain.BreakGlassSessionStatusActive {
@@ -379,14 +379,14 @@ func (h *Handler) decideSoDRule(w http.ResponseWriter, r *http.Request, approve 
 	if !ok {
 		return
 	}
-	g, ok := h.governedStore(w)
+	g, ok := h.governedStore(w, r)
 	if !ok {
 		return
 	}
 	ruleID := chi.URLParam(r, "sod_rule_id")
 	rule, err := g.FindSoDRule(r.Context(), ruleID, tenantScope)
 	if err != nil {
-		h.writeGovernedErr(w, "decideSoDRule", err)
+		h.writeGovernedErr(w, r, "decideSoDRule", err)
 		return
 	}
 	platformWide := rule.TenantID == nil
@@ -403,7 +403,7 @@ func (h *Handler) decideSoDRule(w http.ResponseWriter, r *http.Request, approve 
 		return
 	}
 	if rule.ChangeRequestedBy != nil && *rule.ChangeRequestedBy == decider {
-		h.writeGovernedErr(w, "decideSoDRule", domain.ErrCheckerNotIndependent)
+		h.writeGovernedErr(w, r, "decideSoDRule", domain.ErrCheckerNotIndependent)
 		return
 	}
 	// The interested-party rule that guards asking for a retirement guards
@@ -418,7 +418,7 @@ func (h *Handler) decideSoDRule(w http.ResponseWriter, r *http.Request, approve 
 	}
 	decided, err := g.DecideSoDRuleChange(r.Context(), ruleID, scope, platformWide, decider, approve)
 	if err != nil {
-		h.writeGovernedErr(w, "decideSoDRule", err)
+		h.writeGovernedErr(w, r, "decideSoDRule", err)
 		return
 	}
 	h.log.Info("sod rule change decided", zap.String("sod_rule_id", ruleID), zap.Bool("approve", approve),
@@ -445,14 +445,14 @@ func (h *Handler) decideABACRule(w http.ResponseWriter, r *http.Request, approve
 	if !ok {
 		return
 	}
-	g, ok := h.governedStore(w)
+	g, ok := h.governedStore(w, r)
 	if !ok {
 		return
 	}
 	ruleID := chi.URLParam(r, "abac_rule_id")
 	rule, err := g.FindABACRule(r.Context(), ruleID, tenantScope)
 	if err != nil {
-		h.writeGovernedErr(w, "decideABACRule", err)
+		h.writeGovernedErr(w, r, "decideABACRule", err)
 		return
 	}
 	platformWide := rule.TenantID == nil
@@ -467,7 +467,7 @@ func (h *Handler) decideABACRule(w http.ResponseWriter, r *http.Request, approve
 		return
 	}
 	if rule.ChangeRequestedBy != nil && *rule.ChangeRequestedBy == decider {
-		h.writeGovernedErr(w, "decideABACRule", domain.ErrCheckerNotIndependent)
+		h.writeGovernedErr(w, r, "decideABACRule", domain.ErrCheckerNotIndependent)
 		return
 	}
 	scope := tenantScope
@@ -476,7 +476,7 @@ func (h *Handler) decideABACRule(w http.ResponseWriter, r *http.Request, approve
 	}
 	decided, err := g.DecideABACRuleChange(r.Context(), ruleID, scope, platformWide, decider, approve)
 	if err != nil {
-		h.writeGovernedErr(w, "decideABACRule", err)
+		h.writeGovernedErr(w, r, "decideABACRule", err)
 		return
 	}
 	h.log.Info("abac rule change decided", zap.String("abac_rule_id", ruleID), zap.Bool("approve", approve),
@@ -585,7 +585,7 @@ func (h *Handler) ListAuthorityLimits(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	limits, err := h.store.ListAuthorityLimits(r.Context(), tenantScope, q.Get("principal_id"), q.Get("role_id"), q.Get("authority_type"))
 	if err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "", nil)
 		return
 	}
 	status := strings.ToUpper(strings.TrimSpace(q.Get("status")))
@@ -651,7 +651,7 @@ func (h *Handler) CreateAuthorityLimit(w http.ResponseWriter, r *http.Request) {
 		EffectiveFrom: from, EffectiveTo: to, RequestedBy: maker, RequestReason: req.reason(),
 	})
 	if err != nil {
-		h.writeGovernedErr(w, "CreateAuthorityLimit", err)
+		h.writeGovernedErr(w, r, "CreateAuthorityLimit", err)
 		return
 	}
 	writeJSON(w, http.StatusAccepted, al)
@@ -684,7 +684,7 @@ func (h *Handler) ChangeAuthorityLimit(w http.ResponseWriter, r *http.Request) {
 	}
 	cur, err := h.store.FindAuthorityLimitByID(r.Context(), chi.URLParam(r, "authority_limit_id"), tenantScope)
 	if err != nil {
-		h.writeGovernedErr(w, "ChangeAuthorityLimit", err)
+		h.writeGovernedErr(w, r, "ChangeAuthorityLimit", err)
 		return
 	}
 	if req.ExpectedVersion > 0 && req.ExpectedVersion != cur.Version {
@@ -692,11 +692,11 @@ func (h *Handler) ChangeAuthorityLimit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if cur.Status != domain.AuthorityLimitActive {
-		h.writeGovernedErr(w, "ChangeAuthorityLimit", domain.ErrInvalidTransition)
+		h.writeGovernedErr(w, r, "ChangeAuthorityLimit", domain.ErrInvalidTransition)
 		return
 	}
 	if cur.PendingAction != nil {
-		h.writeGovernedErr(w, "ChangeAuthorityLimit", domain.ErrChangePending)
+		h.writeGovernedErr(w, r, "ChangeAuthorityLimit", domain.ErrChangePending)
 		return
 	}
 	// Unset fields keep their current value.
@@ -723,7 +723,7 @@ func (h *Handler) ChangeAuthorityLimit(w http.ResponseWriter, r *http.Request) {
 		EffectiveFrom: from, EffectiveTo: to, RequestedBy: maker, RequestReason: req.reason(), SupersedesID: cur.AuthorityLimitID,
 	})
 	if err != nil {
-		h.writeGovernedErr(w, "ChangeAuthorityLimit", err)
+		h.writeGovernedErr(w, r, "ChangeAuthorityLimit", err)
 		return
 	}
 	writeJSON(w, http.StatusAccepted, al)
@@ -747,14 +747,14 @@ func (h *Handler) RetireAuthorityLimit(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	g, ok := h.governedStore(w)
+	g, ok := h.governedStore(w, r)
 	if !ok {
 		return
 	}
 	_, _, reason := domain.AuditFrom(r.Context())
 	al, err := g.RequestAuthorityLimitRetire(r.Context(), chi.URLParam(r, "authority_limit_id"), tenantScope, maker, reason, expectedVersion)
 	if err != nil {
-		h.writeGovernedErr(w, "RetireAuthorityLimit", err)
+		h.writeGovernedErr(w, r, "RetireAuthorityLimit", err)
 		return
 	}
 	writeJSON(w, http.StatusAccepted, al)
@@ -788,23 +788,23 @@ func (h *Handler) decideAuthorityLimit(w http.ResponseWriter, r *http.Request, a
 	if _, ok := h.readCommand(w, &r); !ok {
 		return
 	}
-	g, ok := h.governedStore(w)
+	g, ok := h.governedStore(w, r)
 	if !ok {
 		return
 	}
 	limitID := chi.URLParam(r, "authority_limit_id")
 	cur, err := h.store.FindAuthorityLimitByID(r.Context(), limitID, tenantScope)
 	if err != nil {
-		h.writeGovernedErr(w, "decideAuthorityLimit", err)
+		h.writeGovernedErr(w, r, "decideAuthorityLimit", err)
 		return
 	}
 	if (cur.RequestedBy != nil && *cur.RequestedBy == checker) || (cur.PrincipalID != nil && *cur.PrincipalID == checker) {
-		h.writeGovernedErr(w, "decideAuthorityLimit", domain.ErrCheckerNotIndependent)
+		h.writeGovernedErr(w, r, "decideAuthorityLimit", domain.ErrCheckerNotIndependent)
 		return
 	}
 	decided, err := g.DecideAuthorityLimit(r.Context(), limitID, tenantScope, checker, approve)
 	if err != nil {
-		h.writeGovernedErr(w, "decideAuthorityLimit", err)
+		h.writeGovernedErr(w, r, "decideAuthorityLimit", err)
 		return
 	}
 	h.log.Info("authority limit decision recorded", zap.String("authority_limit_id", limitID),

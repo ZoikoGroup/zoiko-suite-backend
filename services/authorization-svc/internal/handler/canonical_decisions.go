@@ -870,7 +870,7 @@ func (h *Handler) HandleCanonicalDecision(w http.ResponseWriter, r *http.Request
 	evalRes, err := h.evaluateCore(r.Context(), in, evaluationEntityID)
 	if err != nil {
 		h.log.Error("CanonicalDecision: evaluation failed", zap.String("correlation_id", correlationID), zap.Error(err))
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "", nil)
 		return
 	}
 
@@ -1037,20 +1037,20 @@ func (h *Handler) GetAvailableActions(w http.ResponseWriter, r *http.Request) {
 	rbacActions, _, err := h.store.FindGrantedActionsScoped(r.Context(), principalID, evaluationEntityID, tenantScope, bookID, orgUnitID)
 	if err != nil {
 		h.log.Error("GetAvailableActions: rbac lookup failed", zap.Error(err))
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "", nil)
 		return
 	}
 	delegatedActions, _, err := h.store.FindDelegatedActionsScoped(r.Context(), principalID, evaluationEntityID, tenantScope, bookID, orgUnitID)
 	if err != nil {
 		h.log.Error("GetAvailableActions: delegation lookup failed", zap.Error(err))
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "", nil)
 		return
 	}
 
 	res.AllHeldActions = deduplicate(append(rbacActions, delegatedActions...))
 	if err := h.computeAvailableActions(r.Context(), in, evaluationEntityID, res); err != nil {
 		h.log.Error("GetAvailableActions: evaluation failed", zap.Error(err))
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "", nil)
 		return
 	}
 
@@ -1328,7 +1328,7 @@ func (h *Handler) GetMyCapabilities(w http.ResponseWriter, r *http.Request) {
 	principalStatus, err := h.store.FindPrincipalStatus(r.Context(), principalID, tenantScope)
 	if err != nil {
 		h.log.Error("GetMyCapabilities: principal status lookup failed", zap.Error(err))
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "", nil)
 		return
 	}
 	if principalStatus != domain.PrincipalStatusActive {
@@ -1342,13 +1342,13 @@ func (h *Handler) GetMyCapabilities(w http.ResponseWriter, r *http.Request) {
 	rbacActions, _, err := h.store.FindGrantedActionsScoped(r.Context(), principalID, evaluationEntityID, tenantScope, bookID, orgUnitID)
 	if err != nil {
 		h.log.Error("GetMyCapabilities: rbac lookup failed", zap.Error(err))
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "", nil)
 		return
 	}
 	delegatedActions, _, err := h.store.FindDelegatedActionsScoped(r.Context(), principalID, evaluationEntityID, tenantScope, bookID, orgUnitID)
 	if err != nil {
 		h.log.Error("GetMyCapabilities: delegation lookup failed", zap.Error(err))
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "", nil)
 		return
 	}
 

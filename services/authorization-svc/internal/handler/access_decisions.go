@@ -91,16 +91,14 @@ func (h *Handler) ListAccessDecisions(w http.ResponseWriter, r *http.Request) {
 	// code, not by internal basis.
 	fullRead, err := h.holdsPermission(r, callerPrincipal, tenantScope, PermissionPolicyRead)
 	if err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "", nil)
 		return
 	}
 	requestedPrincipal := strings.TrimSpace(q.Get("principal_id"))
 	if !fullRead {
 		if requestedPrincipal != "" && requestedPrincipal != callerPrincipal {
-			writeJSON(w, http.StatusForbidden, map[string]string{
-				"error":   "authorization_denied",
-				"message": PermissionPolicyRead + " is required to read another principal's decisions",
-			})
+			writeError(w, r, http.StatusForbidden, "authorization_denied",
+				PermissionPolicyRead+" is required to read another principal's decisions", nil)
 			return
 		}
 		requestedPrincipal = callerPrincipal
@@ -115,24 +113,20 @@ func (h *Handler) ListAccessDecisions(w http.ResponseWriter, r *http.Request) {
 		SessionID: strings.TrimSpace(q.Get("session_id")),
 	}
 	if params.SessionID != "" && !validScope(params.SessionID) {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error": "invalid_filter", "field": "session_id", "message": "session_id must be a UUID",
-		})
+		writeError(w, r, http.StatusBadRequest, "invalid_filter",
+			"session_id must be a UUID", map[string]any{"field": "session_id"})
 		return
 	}
 
-	// An outcome that is neither GRANTED nor DENIED is REFUSED, not passed
-	// through to match nothing. A listing that is empty because of a typo
-	// ("Denied", "DENY") looks exactly like a tenant that has denied nobody,
-	// and on an audit read those two answers must not be confusable.
-	if params.Outcome != "" && !decisionOutcomes[params.Outcome] {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error":   "invalid_filter",
-			"field":   "decision_outcome",
-			"message": domain.ErrInvalidDecisionOutcomeFilter.Error(),
-		})
-		return
-	}
+// An outcome that is neither GRANTED nor DENIED is REFUSED, not passed
+// through to match nothing. A listing that is empty because of a typo
+// ("Denied", "DENY") looks exactly like a tenant that has denied nobody,
+// and on an audit read those two answers must not be confusable.
+if params.Outcome != "" && !decisionOutcomes[params.Outcome] {
+	writeError(w, r, http.StatusBadRequest, "invalid_filter",
+		domain.ErrInvalidDecisionOutcomeFilter.Error(), map[string]any{"field": "decision_outcome"})
+	return
+}
 
 	// legal_entity_id is compared as a uuid in the store, so a malformed one
 	// would surface as a driver error and be reported as a 503 — this
@@ -140,11 +134,8 @@ func (h *Handler) ListAccessDecisions(w http.ResponseWriter, r *http.Request) {
 	// input as an outage, which known-gaps.md records for the /v1/authorize
 	// path. Validated here so it is a 400 that names the field.
 	if params.LegalEntityID != "" && !validScope(params.LegalEntityID) {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error":   "invalid_filter",
-			"field":   "legal_entity_id",
-			"message": "legal_entity_id must be a UUID",
-		})
+		writeError(w, r, http.StatusBadRequest, "invalid_filter",
+			"legal_entity_id must be a UUID", map[string]any{"field": "legal_entity_id"})
 		return
 	}
 
@@ -159,26 +150,20 @@ func (h *Handler) ListAccessDecisions(w http.ResponseWriter, r *http.Request) {
 		params.DecidedTo = to
 	}
 
-	// An inverted window is refused rather than answered with an empty page,
-	// for the same reason a bad outcome filter is: it returns nothing, and
-	// nothing is a legitimate answer to a well-formed question.
-	if params.DecidedFrom != nil && params.DecidedTo != nil && !params.DecidedTo.After(*params.DecidedFrom) {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error":   "invalid_filter",
-			"field":   "decided_to",
-			"message": "decided_to must be after decided_from",
-		})
-		return
-	}
+// An inverted window is refused rather than answered with an empty page,
+// for the same reason a bad outcome filter is: it returns nothing, and
+// nothing is a legitimate answer to a well-formed question.
+if params.DecidedFrom != nil && params.DecidedTo != nil && !params.DecidedTo.After(*params.DecidedFrom) {
+	writeError(w, r, http.StatusBadRequest, "invalid_filter",
+		"decided_to must be after decided_from", map[string]any{"field": "decided_to"})
+	return
+}
 
 	if raw := strings.TrimSpace(q.Get("limit")); raw != "" {
 		n, err := strconv.Atoi(raw)
 		if err != nil || n < 1 {
-			writeJSON(w, http.StatusBadRequest, map[string]string{
-				"error":   "invalid_filter",
-				"field":   "limit",
-				"message": "limit must be a positive integer",
-			})
+			writeError(w, r, http.StatusBadRequest, "invalid_filter",
+				"limit must be a positive integer", map[string]any{"field": "limit"})
 			return
 		}
 		// A limit ABOVE the cap is clamped by the store rather than refused:
@@ -191,11 +176,9 @@ func (h *Handler) ListAccessDecisions(w http.ResponseWriter, r *http.Request) {
 
 	cursor, err := domain.DecodeAccessDecisionCursor(strings.TrimSpace(q.Get("cursor")))
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error":   "invalid_cursor",
-			"field":   "cursor",
-			"message": "cursor is not one this service issued — start from the first page rather than constructing one",
-		})
+		writeError(w, r, http.StatusBadRequest, "invalid_cursor",
+			"cursor is not one this service issued — start from the first page rather than constructing one",
+			map[string]any{"field": "cursor"})
 		return
 	}
 	params.Cursor = cursor
@@ -204,12 +187,12 @@ func (h *Handler) ListAccessDecisions(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if errors.Is(err, domain.ErrTenantScopeRequired) {
 			// Defence in depth behind requireTenant, which has already run.
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing_tenant_scope"})
+			writeError(w, r, http.StatusUnauthorized, "missing_tenant_scope", "", nil)
 			return
 		}
 		h.log.Error("ListAccessDecisions: store unavailable",
 			zap.String("correlation_id", correlationID), zap.Error(err))
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "", nil)
 		return
 	}
 

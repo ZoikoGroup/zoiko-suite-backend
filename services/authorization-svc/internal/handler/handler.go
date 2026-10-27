@@ -16,6 +16,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
+	apicontract "zoiko.io/identity-envelope/apicontract"
 
 	"zoiko.io/authorization-svc/internal/domain"
 	"zoiko.io/authorization-svc/internal/jurisdiction"
@@ -2048,7 +2049,7 @@ func (h *Handler) setSoDRuleActive(w http.ResponseWriter, r *http.Request, activ
 	if !ok {
 		return
 	}
-	g, ok := h.governedStore(w)
+	g, ok := h.governedStore(w, r)
 	if !ok {
 		return
 	}
@@ -2065,7 +2066,7 @@ func (h *Handler) setSoDRuleActive(w http.ResponseWriter, r *http.Request, activ
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "sod_rule_not_found"})
 			return
 		}
-		h.writeGovernedErr(w, "setSoDRuleActive", err)
+		h.writeGovernedErr(w, r, "setSoDRuleActive", err)
 		return
 	}
 
@@ -2344,7 +2345,7 @@ func (h *Handler) setABACRuleActive(w http.ResponseWriter, r *http.Request, acti
 	if !ok {
 		return
 	}
-	g, ok := h.governedStore(w)
+	g, ok := h.governedStore(w, r)
 	if !ok {
 		return
 	}
@@ -2360,7 +2361,7 @@ func (h *Handler) setABACRuleActive(w http.ResponseWriter, r *http.Request, acti
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "abac_rule_not_found"})
 			return
 		}
-		h.writeGovernedErr(w, "setABACRuleActive", err)
+		h.writeGovernedErr(w, r, "setABACRuleActive", err)
 		return
 	}
 
@@ -4102,10 +4103,26 @@ func (h *Handler) RevokeSupportSession(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusConflict, map[string]string{"error": "invalid_transition", "message": err.Error()})
 		default:
 			h.log.Error("RevokeSupportSession: store failed", zap.Error(err))
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "", nil)
 		}
 		return
 	}
 
 	writeJSON(w, http.StatusOK, ss)
+}
+
+// writeError writes a RFC 9457 problem details response using the shared apicontract package.
+// legacy is the original error code (kept for backward compatibility with callers matching on it).
+// detail is the human-readable message; if empty, legacy is used as the detail.
+func writeError(w http.ResponseWriter, r *http.Request, status int, legacy, detail string, extra map[string]any) {
+	if detail == "" {
+		detail = legacy
+	}
+	apicontract.WriteProblem(w, r, apicontract.Problem{
+		Status:    status,
+		Code:      legacy,
+		Detail:    detail,
+		Retryable: status >= 500,
+		Extra:     extra,
+	})
 }

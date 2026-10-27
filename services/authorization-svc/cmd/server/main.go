@@ -25,13 +25,14 @@ import (
 
 	"github.com/exaring/otelpgx"
 	"github.com/go-chi/chi/v5"
-	"github.com/go-chi/chi/v5/middleware"
+	chimiddleware "github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/riandyrn/otelchi"
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 	idenv "zoiko.io/identity-envelope"
+	apicontract "zoiko.io/identity-envelope/apicontract"
 
 	"zoiko.io/authorization-svc/internal/cache"
 	"zoiko.io/authorization-svc/internal/config"
@@ -181,13 +182,14 @@ func main() {
 	jurisdictionValidator := jurisdiction.NewHTTPValidator(cfg.JurisdictionRulesURL, log)
 
 	r := chi.NewRouter()
-	r.Use(middleware.RequestID)
-	r.Use(middleware.RealIP)
-	r.Use(middleware.Recoverer)
+	r.Use(apicontract.RequestID)
+	r.Use(apicontract.DefaultCache)
+	r.Use(chimiddleware.RealIP)
+	r.Use(chimiddleware.Recoverer)
 	r.Use(otelchi.Middleware("authorization-svc", otelchi.WithChiRoutes(r)))
 	r.Use(metrics.HTTPMiddleware)
 	r.Use(correlationIDMiddleware)
-	r.Use(middleware.Logger)
+	r.Use(chimiddleware.Logger)
 
 	// Which SERVICE may ask for a decision (register A-02). Both listeners
 	// share this router; on the plaintext one r.TLS is nil, so in require
@@ -649,7 +651,7 @@ func kafkaErrorLogger(log *zap.Logger, topics string) kafka.LoggerFunc {
 func correlationIDMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("X-Correlation-ID") == "" {
-			r.Header.Set("X-Correlation-ID", middleware.GetReqID(r.Context()))
+			r.Header.Set("X-Correlation-ID", chimiddleware.GetReqID(r.Context()))
 		}
 		w.Header().Set("X-Correlation-ID", r.Header.Get("X-Correlation-ID"))
 		next.ServeHTTP(w, r)
