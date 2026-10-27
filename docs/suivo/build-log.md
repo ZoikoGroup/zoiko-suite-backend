@@ -60,3 +60,22 @@ Each entry records what a build step changed and the verified result of
   expired session, delete semantics, config ETag, contract validation, NFC normalization, envelope
   schema (ANSWERED requires provenance, non-route actions rejected).
 - Result: build ok, vet ok, all tests pass (memory + Postgres), gofmt clean.
+
+## STEP 5 — Sanitize, redaction, intercepts, intent rules
+
+- Files: `internal/policy` (`redact.go`, `classify.go`, `templates.go`).
+- Sensitive-input interception before any model call: payment cards (Luhn-checked), IBAN (mod-97),
+  US SSN, UK NINO, labelled tax IDs, API keys/tokens/private keys, passwords, one-time codes, bank
+  account numbers → masked as `[REDACTED:<kind>]` and exception X03. Templates never echo the message.
+- Exception classes X01–X08 by deterministic rules, highest risk first:
+  X03 > X06 > X05 > X02 > X01 > X04 > X08 > X07 (X09 is set by the claim stage, X10 by the limiter).
+- Intent rules I01–I30 with scored phrase matching and a fixed tie order; unmatched → I29.
+- Slots from the visitor's own words only (market, plan word, billing cadence, entity band,
+  integration name); never inferred from IP.
+- Templates: neutral DEV DRAFT wording for exceptions, abstention, clarification, unavailability and
+  route-only intents (I08/I22/I23/I24/I28) that never claim a booking, ticket or callback; unresolved
+  placeholders fail rendering. Copy needs Legal/Product review (Doc 06 App. B).
+- Tests: detection for each kind, no false positives on plan sizes/years/IDs failing checksums,
+  exception precedence (incl. injection + private data, sensitive + injection), negative cases for
+  ordinary product questions, 13 intent samples, slot extraction, template rendering.
+- Result: build ok, vet ok, all tests pass, gofmt clean.
