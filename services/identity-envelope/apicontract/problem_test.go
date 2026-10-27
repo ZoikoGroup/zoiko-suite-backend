@@ -82,3 +82,49 @@ func TestProblemError(t *testing.T) {
 		t.Fatalf("error = %q", got)
 	}
 }
+
+// RetryAfter is a header, never a body member, and only on a retryable
+// problem; DecisionID is both (gateway-auth-svc's admission refusals).
+func TestWriteProblemRetryAfterAndDecisionID(t *testing.T) {
+	w := httptest.NewRecorder()
+	p := ProblemFor(503, "dependency_unavailable", "")
+	p.Retryable, p.RetryAfter, p.DecisionID = true, 5, "dec-1"
+	WriteProblem(w, httptest.NewRequest("GET", "/verify", nil), p)
+	if got := w.Header().Get("Retry-After"); got != "5" {
+		t.Fatalf("Retry-After = %q", got)
+	}
+	if got := w.Header().Get("X-Gateway-Decision-Id"); got != "dec-1" {
+		t.Fatalf("decision id header = %q", got)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if _, leaked := body["retry_after"]; leaked || body["decision_id"] != "dec-1" {
+		t.Fatalf("body members wrong: %v", body)
+	}
+
+	w = httptest.NewRecorder()
+	p = ProblemFor(400, "invalid", "")
+	p.RetryAfter = 5
+	WriteProblem(w, httptest.NewRequest("GET", "/verify", nil), p)
+	if got := w.Header().Get("Retry-After"); got != "" {
+		t.Fatalf("Retry-After on a non-retryable problem = %q", got)
+	}
+}
+
+// 429, 503 and 504 carry the retry hint even when the caller built the
+// problem as a struct literal; anything else keeps what the caller set.
+func TestWriteProblemMarksTransientStatusesRetryable(t *testing.T) {
+	for status, want := range map[int]bool{429: true, 503: true, 504: true, 500: false, 409: false} {
+		w := httptest.NewRecorder()
+		WriteProblem(w, httptest.NewRequest("GET", "/v1/x", nil), Problem{Status: status, Code: "c"})
+		var body map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		if body["retryable"] != want {
+			t.Fatalf("status %d: retryable = %v, want %v", status, body["retryable"], want)
+		}
+	}
+}
