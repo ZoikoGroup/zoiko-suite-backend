@@ -29,6 +29,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
+	apicontract "zoiko.io/identity-envelope/apicontract"
 	idenv "zoiko.io/identity-envelope"
 
 	"zoiko.io/evidence-requirements-svc/internal/domain"
@@ -160,7 +161,7 @@ func (h *Handler) gate(w http.ResponseWriter, r *http.Request, mode GateMode, pr
 			zap.String("scope", scope), zap.Error(err))
 		return true
 	}
-	h.writeAuthzErr(w, err)
+	h.writeAuthzErr(w, r, err)
 	return false
 }
 
@@ -172,11 +173,11 @@ func (h *Handler) checkEntity(w http.ResponseWriter, r *http.Request, tenantID, 
 	case err == nil:
 		return true
 	case errors.Is(err, domain.ErrLegalEntityNotFound):
-		writeError(w, http.StatusUnprocessableEntity, "legal_entity_not_found",
+		writeError(w, r, http.StatusUnprocessableEntity, "legal_entity_not_found",
 			"the legal entity does not exist in this tenant (tenant-entity-registry-svc)")
 	default:
 		h.log.Error("legal entity check failed — failing closed", zap.String("legal_entity_id", legalEntityID), zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "registry_unavailable", "")
+		writeError(w, r, http.StatusServiceUnavailable, "registry_unavailable", "")
 	}
 	return false
 }
@@ -209,16 +210,16 @@ func (h *Handler) Evaluate(w http.ResponseWriter, r *http.Request) {
 	}
 	switch {
 	case req.LegalEntityID == "":
-		writeError(w, http.StatusBadRequest, "missing_field", "legal_entity_id")
+		writeError(w, r, http.StatusBadRequest, "missing_field", "legal_entity_id")
 		return
 	case req.DomainCode == "":
-		writeError(w, http.StatusBadRequest, "missing_field", "domain_code")
+		writeError(w, r, http.StatusBadRequest, "missing_field", "domain_code")
 		return
 	case req.ActionType == "":
-		writeError(w, http.StatusBadRequest, "missing_field", "action_type")
+		writeError(w, r, http.StatusBadRequest, "missing_field", "action_type")
 		return
 	case req.CorrelationID == "":
-		writeError(w, http.StatusBadRequest, "missing_field", "correlation_id")
+		writeError(w, r, http.StatusBadRequest, "missing_field", "correlation_id")
 		return
 	}
 
@@ -240,7 +241,7 @@ func (h *Handler) Evaluate(w http.ResponseWriter, r *http.Request) {
 	idempotencyKey := env.IdempotencyKey
 	if idempotencyKey == "" {
 		// Should never happen in write-strict mode, but defensive
-		writeError(w, http.StatusBadRequest, "missing_field", "idempotency_key")
+		writeError(w, r, http.StatusBadRequest, "missing_field", "idempotency_key")
 		return
 	}
 	envelopeLegalEntityID := env.LegalEntityID
@@ -248,7 +249,7 @@ func (h *Handler) Evaluate(w http.ResponseWriter, r *http.Request) {
 	// Validate body's legal_entity_id is a valid UUID before hitting the DB
 	// (otherwise 22P02 maps to 503 store_unavailable per X10).
 	if !isUUID(req.LegalEntityID) {
-		writeError(w, http.StatusBadRequest, "invalid_field", "legal_entity_id must be a UUID")
+		writeError(w, r, http.StatusBadRequest, "invalid_field", "legal_entity_id must be a UUID")
 		return
 	}
 
@@ -257,7 +258,7 @@ func (h *Handler) Evaluate(w http.ResponseWriter, r *http.Request) {
 	// RequiredOnWrite), so a mismatch means the caller is trying to evaluate
 	// for a different entity than the one their identity context establishes.
 	if envelopeLegalEntityID != "" && req.LegalEntityID != envelopeLegalEntityID {
-		writeError(w, http.StatusBadRequest, "legal_entity_mismatch",
+		writeError(w, r, http.StatusBadRequest, "legal_entity_mismatch",
 			"body legal_entity_id does not match envelope X-Legal-Entity-Id")
 		return
 	}
@@ -285,7 +286,7 @@ func (h *Handler) Evaluate(w http.ResponseWriter, r *http.Request) {
 	effective, err := h.store.EffectiveRequirements(r.Context(), tenantID, effectiveLegalEntityID, req.DomainCode, req.ActionType, asOf)
 	if err != nil {
 		h.log.Error("Evaluate: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
 		return
 	}
 
@@ -297,7 +298,7 @@ func (h *Handler) Evaluate(w http.ResponseWriter, r *http.Request) {
 	checked, err := h.checkArtifacts(r.Context(), tenantID, effectiveLegalEntityID, principalID, req.PresentArtifacts)
 	if err != nil {
 		h.log.Error("Evaluate: artifact verification unavailable — failing closed", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "document_service_unavailable", "")
+		writeError(w, r, http.StatusServiceUnavailable, "document_service_unavailable", "")
 		return
 	}
 
@@ -306,13 +307,13 @@ func (h *Handler) Evaluate(w http.ResponseWriter, r *http.Request) {
 	unmetJSON, err := json.Marshal(unmet)
 	if err != nil {
 		h.log.Error("Evaluate: failed to marshal unmet payload", zap.Error(err))
-		writeError(w, http.StatusInternalServerError, "internal_error", "")
+		writeError(w, r, http.StatusInternalServerError, "internal_error", "")
 		return
 	}
 	presentJSON, err := json.Marshal(req.PresentArtifacts)
 	if err != nil {
 		h.log.Error("Evaluate: failed to marshal present artifacts payload", zap.Error(err))
-		writeError(w, http.StatusInternalServerError, "internal_error", "")
+		writeError(w, r, http.StatusInternalServerError, "internal_error", "")
 		return
 	}
 
@@ -376,7 +377,7 @@ func (h *Handler) Evaluate(w http.ResponseWriter, r *http.Request) {
 	created, err := h.store.RecordEvaluation(r.Context(), eval, outboxEvent)
 	if err != nil {
 		h.log.Error("Evaluate: failed to record evaluation", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
 		return
 	}
 
@@ -396,7 +397,7 @@ func (h *Handler) Evaluate(w http.ResponseWriter, r *http.Request) {
 			eval.LegalEntityID != effectiveLegalEntityID ||
 			eval.EvaluatedForPrincipalID != principalID ||
 			!jsonSemanticallyEqual(eval.PresentArtifactsPayload, presentJSON) {
-			writeError(w, http.StatusConflict, "idempotency_mismatch",
+			writeError(w, r, http.StatusConflict, "idempotency_mismatch",
 				"Idempotency-Key was already used for a different evaluation request")
 			return
 		}
@@ -406,7 +407,7 @@ func (h *Handler) Evaluate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	writeJSON(w, http.StatusOK, domain.EvaluateResponse{
+	writeJSON(w, r, http.StatusOK, domain.EvaluateResponse{
 		EvaluationID:  eval.EvaluationID,
 		Outcome:       eval.Outcome,
 		Unmet:         unmet,
@@ -610,11 +611,11 @@ func (h *Handler) GetEvaluation(w http.ResponseWriter, r *http.Request) {
 	eval, err := h.store.GetEvaluation(r.Context(), chi.URLParam(r, "evaluation_id"))
 	if err != nil {
 		h.log.Error("GetEvaluation: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
 		return
 	}
 	if eval == nil {
-		writeError(w, http.StatusNotFound, "evaluation_not_found", "")
+		writeError(w, r, http.StatusNotFound, "evaluation_not_found", "")
 		return
 	}
 	// The ledger holds the asserted artifact references: read it at the
@@ -622,7 +623,7 @@ func (h *Handler) GetEvaluation(w http.ResponseWriter, r *http.Request) {
 	if !h.gate(w, r, h.readMode, principalID, eval.LegalEntityID, actionReadEvaluation) {
 		return
 	}
-	writeJSON(w, http.StatusOK, eval)
+	writeJSON(w, r, http.StatusOK, eval)
 }
 
 // ── GET /v1/evidence-requirements ──────────────────────────────────────────────
@@ -641,7 +642,7 @@ func (h *Handler) ListRequirements(w http.ResponseWriter, r *http.Request) {
 	}
 	q := r.URL.Query()
 	if claimed := q.Get("tenant_id"); claimed != "" && claimed != tenantID {
-		writeError(w, http.StatusForbidden, "tenant_scope_mismatch", domain.ErrTenantScopeMismatch.Error())
+		writeError(w, r, http.StatusForbidden, "tenant_scope_mismatch", domain.ErrTenantScopeMismatch.Error())
 		return
 	}
 	// legal_entity_id is compared as `legal_entity_id::text = $n`, casting the
@@ -650,7 +651,7 @@ func (h *Handler) ListRequirements(w http.ResponseWriter, r *http.Request) {
 	// entity has no requirements", which for an evidence gate reads as permission.
 	legalEntityID := q.Get("legal_entity_id")
 	if legalEntityID != "" && !isUUID(legalEntityID) {
-		writeError(w, http.StatusBadRequest, "invalid_field", "legal_entity_id must be a UUID")
+		writeError(w, r, http.StatusBadRequest, "invalid_field", "legal_entity_id must be a UUID")
 		return
 	}
 	principalID, ok := h.requirePrincipal(w, r)
@@ -681,7 +682,7 @@ func (h *Handler) ListRequirements(w http.ResponseWriter, r *http.Request) {
 	default:
 		t, err := time.Parse(time.RFC3339, v)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, "invalid_field", "as_of must be RFC3339 or 'now'")
+			writeError(w, r, http.StatusBadRequest, "invalid_field", "as_of must be RFC3339 or 'now'")
 			return
 		}
 		filter.AsOf = t
@@ -693,17 +694,17 @@ func (h *Handler) ListRequirements(w http.ResponseWriter, r *http.Request) {
 		// uuid comparison left here. A gateway that forwarded a non-UUID tenant
 		// scope is a fault worth naming rather than reporting as a dead store.
 		if errors.Is(err, domain.ErrInvalidIdentifier) {
-			writeError(w, http.StatusBadRequest, "invalid_field", "tenant scope must be a UUID")
+			writeError(w, r, http.StatusBadRequest, "invalid_field", "tenant scope must be a UUID")
 			return
 		}
 		h.log.Error("ListRequirements: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
 		return
 	}
 	if list == nil {
 		list = []domain.EvidenceRequirement{}
 	}
-	writeJSON(w, http.StatusOK, list)
+	writeJSON(w, r, http.StatusOK, list)
 }
 
 // ── GET /v1/evidence-requirements/{evidence_requirement_id} ────────────────────
@@ -715,11 +716,11 @@ func (h *Handler) GetRequirement(w http.ResponseWriter, r *http.Request) {
 	req, err := h.store.GetRequirement(r.Context(), chi.URLParam(r, "evidence_requirement_id"))
 	if err != nil {
 		h.log.Error("GetRequirement: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
 		return
 	}
 	if req == nil {
-		writeError(w, http.StatusNotFound, "requirement_not_found", "")
+		writeError(w, r, http.StatusNotFound, "requirement_not_found", "")
 		return
 	}
 	principalID, ok := h.requirePrincipal(w, r)
@@ -733,7 +734,7 @@ func (h *Handler) GetRequirement(w http.ResponseWriter, r *http.Request) {
 	if !h.gate(w, r, h.readMode, principalID, readScope, actionReadRequirement) {
 		return
 	}
-	writeJSON(w, http.StatusOK, req)
+	writeJSON(w, r, http.StatusOK, req)
 }
 
 // ── POST /v1/admin/evidence-requirements ───────────────────────────────────────
@@ -745,19 +746,19 @@ func (h *Handler) CreateRequirement(w http.ResponseWriter, r *http.Request) {
 	}
 	switch {
 	case req.TenantID == "":
-		writeError(w, http.StatusBadRequest, "missing_field", "tenant_id")
+		writeError(w, r, http.StatusBadRequest, "missing_field", "tenant_id")
 		return
 	case req.DomainCode == "":
-		writeError(w, http.StatusBadRequest, "missing_field", "domain_code")
+		writeError(w, r, http.StatusBadRequest, "missing_field", "domain_code")
 		return
 	case req.ActionType == "":
-		writeError(w, http.StatusBadRequest, "missing_field", "action_type")
+		writeError(w, r, http.StatusBadRequest, "missing_field", "action_type")
 		return
 	case req.EvidenceType == "":
-		writeError(w, http.StatusBadRequest, "missing_field", "evidence_type")
+		writeError(w, r, http.StatusBadRequest, "missing_field", "evidence_type")
 		return
 	case req.CorrelationID == "":
-		writeError(w, http.StatusBadRequest, "missing_field", "correlation_id")
+		writeError(w, r, http.StatusBadRequest, "missing_field", "correlation_id")
 		return
 	}
 
@@ -770,7 +771,7 @@ func (h *Handler) CreateRequirement(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.TenantID != tenantID {
-		writeError(w, http.StatusForbidden, "tenant_scope_mismatch",
+		writeError(w, r, http.StatusForbidden, "tenant_scope_mismatch",
 			"body tenant_id does not match the caller's verified tenant scope")
 		return
 	}
@@ -781,7 +782,7 @@ func (h *Handler) CreateRequirement(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.LegalEntityID != nil && *req.LegalEntityID != "" && !isUUID(*req.LegalEntityID) {
-		writeError(w, http.StatusBadRequest, "invalid_field", "legal_entity_id must be a UUID")
+		writeError(w, r, http.StatusBadRequest, "invalid_field", "legal_entity_id must be a UUID")
 		return
 	}
 
@@ -790,7 +791,7 @@ func (h *Handler) CreateRequirement(w http.ResponseWriter, r *http.Request) {
 	idempotencyKey := env.IdempotencyKey
 	if idempotencyKey == "" {
 		// Should never happen in write-strict mode for admin writes
-		writeError(w, http.StatusBadRequest, "missing_field", "idempotency_key")
+		writeError(w, r, http.StatusBadRequest, "missing_field", "idempotency_key")
 		return
 	}
 
@@ -804,7 +805,7 @@ func (h *Handler) CreateRequirement(w http.ResponseWriter, r *http.Request) {
 		authzScope = *req.LegalEntityID
 	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, authzScope, actionCreateRequirement); err != nil {
-		h.writeAuthzErr(w, err)
+		h.writeAuthzErr(w, r, err)
 		return
 	}
 	if req.LegalEntityID != nil && *req.LegalEntityID != "" && !h.checkEntity(w, r, tenantID, *req.LegalEntityID) {
@@ -817,7 +818,7 @@ func (h *Handler) CreateRequirement(w http.ResponseWriter, r *http.Request) {
 		// Prevent retroactive effective_from (before now) — a requirement
 		// cannot govern actions that already happened.
 		if effectiveFrom.Before(time.Now().UTC().Add(-time.Minute)) {
-			writeError(w, http.StatusBadRequest, "invalid_field",
+			writeError(w, r, http.StatusBadRequest, "invalid_field",
 				"effective_from cannot be retroactive (before now)")
 			return
 		}
@@ -829,7 +830,7 @@ func (h *Handler) CreateRequirement(w http.ResponseWriter, r *http.Request) {
 	// action (fail-closed, but caused by a rule nobody could have meant).
 	if len(req.RequirementPayload) > 0 {
 		if msg := validateRequirementPayload(req.RequirementPayload); msg != "" {
-			writeError(w, http.StatusBadRequest, "invalid_field", msg)
+			writeError(w, r, http.StatusBadRequest, "invalid_field", msg)
 			return
 		}
 	}
@@ -851,7 +852,7 @@ func (h *Handler) CreateRequirement(w http.ResponseWriter, r *http.Request) {
 	created, err := h.store.CreateRequirement(r.Context(), er)
 	if err != nil {
 		h.log.Error("CreateRequirement: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
 		return
 	}
 
@@ -869,7 +870,7 @@ func (h *Handler) CreateRequirement(w http.ResponseWriter, r *http.Request) {
 			er.CreatedByPrincipalID != principalID ||
 			!effectiveFromMatches ||
 			!jsonSemanticallyEqual(er.RequirementPayload, requestedPayload) {
-			writeError(w, http.StatusConflict, "idempotency_mismatch",
+			writeError(w, r, http.StatusConflict, "idempotency_mismatch",
 				"Idempotency-Key was already used for a different requirement")
 			return
 		}
@@ -880,7 +881,7 @@ func (h *Handler) CreateRequirement(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusCreated
 		w.Header().Set("Location", "/v1/evidence-requirements/"+er.EvidenceRequirementID)
 	}
-	writeJSON(w, status, er)
+	writeJSON(w, r, status, er)
 }
 
 // validateRequirementPayload checks a requirement_payload against
@@ -916,7 +917,7 @@ func (h *Handler) EndDateRequirement(w http.ResponseWriter, r *http.Request) {
 	if req.Reason == "" {
 		// A retirement with no stated reason is not useful evidence — same
 		// rationale as purchase-order-svc's required amendment reason.
-		writeError(w, http.StatusBadRequest, "missing_field", "reason")
+		writeError(w, r, http.StatusBadRequest, "missing_field", "reason")
 		return
 	}
 
@@ -928,11 +929,11 @@ func (h *Handler) EndDateRequirement(w http.ResponseWriter, r *http.Request) {
 	existing, err := h.store.GetRequirement(r.Context(), requirementID)
 	if err != nil {
 		h.log.Error("EndDateRequirement: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
 		return
 	}
 	if existing == nil {
-		writeError(w, http.StatusNotFound, "requirement_not_found", "")
+		writeError(w, r, http.StatusNotFound, "requirement_not_found", "")
 		return
 	}
 
@@ -945,7 +946,7 @@ func (h *Handler) EndDateRequirement(w http.ResponseWriter, r *http.Request) {
 		authzScope = *existing.LegalEntityID
 	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, authzScope, actionRetireRequirement); err != nil {
-		h.writeAuthzErr(w, err)
+		h.writeAuthzErr(w, r, err)
 		return
 	}
 
@@ -955,13 +956,13 @@ func (h *Handler) EndDateRequirement(w http.ResponseWriter, r *http.Request) {
 	}
 	// Validate effective_to is after effective_from (DB constraint also enforces this)
 	if !effectiveTo.After(existing.EffectiveFrom) {
-		writeError(w, http.StatusBadRequest, "invalid_field",
+		writeError(w, r, http.StatusBadRequest, "invalid_field",
 			"effective_to must be after effective_from")
 		return
 	}
 	// Prevent retroactive retirement that changes historical governance
 	if effectiveTo.Before(time.Now().UTC().Add(-time.Minute)) {
-		writeError(w, http.StatusBadRequest, "invalid_field",
+		writeError(w, r, http.StatusBadRequest, "invalid_field",
 			"effective_to cannot be retroactive (before now)")
 		return
 	}
@@ -969,26 +970,26 @@ func (h *Handler) EndDateRequirement(w http.ResponseWriter, r *http.Request) {
 	updated, err := h.store.EndDateRequirement(r.Context(), tenantID, requirementID, effectiveTo, req.Reason, principalID)
 	switch {
 	case err == nil:
-		writeJSON(w, http.StatusOK, updated)
+		writeJSON(w, r, http.StatusOK, updated)
 	case errors.Is(err, domain.ErrAlreadyRetired):
-		writeError(w, http.StatusUnprocessableEntity, "already_retired", domain.ErrAlreadyRetired.Error())
+		writeError(w, r, http.StatusUnprocessableEntity, "already_retired", domain.ErrAlreadyRetired.Error())
 	case errors.Is(err, domain.ErrRequirementNotFound):
-		writeError(w, http.StatusNotFound, "requirement_not_found", "")
+		writeError(w, r, http.StatusNotFound, "requirement_not_found", "")
 	default:
 		h.log.Error("EndDateRequirement: store failure", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
 	}
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-func (h *Handler) writeAuthzErr(w http.ResponseWriter, err error) {
+func (h *Handler) writeAuthzErr(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
 	case errors.Is(err, domain.ErrAuthorizationDenied):
-		writeError(w, http.StatusForbidden, "authorization_denied", "")
+		writeError(w, r, http.StatusForbidden, "authorization_denied", "")
 	default:
 		h.log.Error("authorization check failed — failing closed", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "authorization_service_unavailable", "")
+		writeError(w, r, http.StatusServiceUnavailable, "authorization_service_unavailable", "")
 	}
 }
 
@@ -1034,7 +1035,7 @@ func (h *Handler) requireTenant(w http.ResponseWriter, r *http.Request) (string,
 		// 401 like the envelope's own refusal: an unscoped caller is an
 		// unauthenticated one. Reads answered 400 and writes 401 for the
 		// same fault.
-		writeError(w, http.StatusUnauthorized, "missing_tenant", domain.ErrTenantMissing.Error())
+		writeError(w, r, http.StatusUnauthorized, "missing_tenant", domain.ErrTenantMissing.Error())
 		return "", false
 	}
 	return tenantID, true
@@ -1053,31 +1054,43 @@ func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (stri
 		principalID = r.Header.Get(idenv.HeaderWorkloadID)
 	}
 	if principalID == "" {
-		writeError(w, http.StatusUnauthorized, "identity_missing", domain.ErrIdentityMissing.Error())
+		writeError(w, r, http.StatusUnauthorized, "identity_missing", domain.ErrIdentityMissing.Error())
 		return "", false
 	}
 	return principalID, true
 }
 
+// writeError writes a RFC 9457 problem details response using the shared apicontract package.
+func writeError(w http.ResponseWriter, r *http.Request, status int, code, detail string) {
+	apicontract.WriteProblem(w, r, apicontract.Problem{
+		Status:    status,
+		Code:      code,
+		Detail:    detail,
+		Retryable: status >= 500,
+	})
+}
+
 // writeJSON writes body as JSON. An error body is rendered as RFC 9457
-// application/problem+json with the §16 error_class (Governance audit X9);
-// "error" keeps the legacy code callers read.
-func writeJSON(w http.ResponseWriter, status int, body any) {
-	if idenv.WriteLegacyError(w, nil, status, body) {
-		return
+// application/problem+json with the §16 error_class via apicontract.
+func writeJSON(w http.ResponseWriter, r *http.Request, status int, body any) {
+	if errResp, ok := body.(map[string]any); ok {
+		if errCode, ok := errResp["error"].(string); ok {
+			message := ""
+			if msg, ok := errResp["detail"].(string); ok {
+				message = msg
+			}
+			apicontract.WriteProblem(w, r, apicontract.Problem{
+				Status:    status,
+				Code:      errCode,
+				Detail:    message,
+				Retryable: status >= 500,
+			})
+			return
+		}
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(body)
-}
-
-type errorResponse struct {
-	Error  string `json:"error"`
-	Detail string `json:"detail,omitempty"`
-}
-
-func writeError(w http.ResponseWriter, status int, code, detail string) {
-	writeJSON(w, status, errorResponse{Error: code, Detail: detail})
 }
 
 // maxRequestBytes caps a JSON request body. A bare json.Decoder reads until EOF,
@@ -1094,10 +1107,10 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
-			writeError(w, http.StatusRequestEntityTooLarge, "request_too_large", "")
+			writeError(w, r, http.StatusRequestEntityTooLarge, "request_too_large", "")
 			return false
 		}
-		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+		writeError(w, r, http.StatusBadRequest, "invalid_json", err.Error())
 		return false
 	}
 	return true
