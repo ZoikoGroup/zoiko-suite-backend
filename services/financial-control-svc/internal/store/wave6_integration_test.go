@@ -24,6 +24,7 @@ var wave6Pops = map[string]string{
 	catalogue.SysTaxAuthority:   "unacknowledged-filings",
 	catalogue.SysPayeeBanking:   "destination-changes",
 	catalogue.SysTreasury:       "bank-account-ownership",
+	catalogue.SysDataIngestion:  "import-batch-tieout",
 }
 
 func newWave6(t *testing.T) *wave2 {
@@ -58,6 +59,71 @@ func tieout(dr, cr, rows, xdr, xcr, xrows string) domain.PopulationRecord {
 	x.Currency = "XXX"
 	return attrs(x, "expected_total_debits", dr, "expected_total_credits", cr, "expected_row_count", rows,
 		"crosswalk_debits", xdr, "crosswalk_credits", xcr, "crosswalk_row_count", xrows, "batch_status", "LOADED")
+}
+
+// batchRec is the raw import-batch facts a data-ingestion-svc batch reports; "" is an absent declared value.
+func batchRec(declRows, rows, valid, invalid, imported, quarantined, failed, skipped, declTotal, compTotal string) domain.PopulationRecord {
+	x := r("imb_1", "imb_1", "0")
+	x.Currency = "XXX"
+	return attrs(x, "batch_status", "COMPLETED", "declared_rows", declRows, "row_count", rows, "valid_rows", valid, "invalid_rows", invalid,
+		"imported_items", imported, "quarantined_items", quarantined, "failed_items", failed, "skipped_items", skipped,
+		"declared_control_total", declTotal, "computed_control_total", compTotal)
+}
+
+func TestWave6_ImportBatchCompleteness_EachTieBreaksOnItsOwn_AndAbsenceIsNeverAPass(t *testing.T) {
+	w := newWave6(t)
+	sc := scope(`{"batch_id":"imb_1"}`)
+
+	// 10 rows: 9 valid + 1 invalid; 9 imported + 1 skipped. But "every row is imported" is a real tie, so even this
+	// careful batch is a finding: the skipped (invalid) row never reached the owning domain.
+	w.src.set(catalogue.SysDataIngestion, "import-batch-tieout", "wm", batchRec("10", "10", "9", "1", "9", "0", "0", "1", "500.00", "500.00"))
+	run, final := w.run("FIN-CTRL-033", sc)
+	assert.Equal(t, domain.ResultFail, final.ResultState)
+	ex, err := testStore.ListExceptions(ctx, w.tenant, run.RunID, store.ListExceptionsFilter{})
+	require.NoError(t, err)
+	require.Len(t, ex, 1, "only the every-row-is-imported tie breaks")
+	assert.Contains(t, ex[0].Detail, "every_row_is_imported")
+	assert.Equal(t, "imb_1", w.src.lastQuery(catalogue.SysDataIngestion).Get("batch_id"))
+
+	// A fully imported batch ties everywhere.
+	w.src.set(catalogue.SysDataIngestion, "import-batch-tieout", "wm", batchRec("10", "10", "10", "0", "10", "0", "0", "0", "500.00", "500.00"))
+	_, final = w.run("FIN-CTRL-033", sc)
+	assert.Equal(t, domain.ResultPass, final.ResultState)
+
+	// Each tie is detectable on its own.
+	cases := map[string]domain.PopulationRecord{
+		"declared rows differ":     batchRec("11", "10", "10", "0", "10", "0", "0", "0", "500.00", "500.00"),
+		"valid+invalid miss a row": batchRec("10", "10", "9", "0", "10", "0", "0", "0", "500.00", "500.00"),
+		"a row has no outcome":     batchRec("10", "10", "10", "0", "9", "0", "0", "0", "500.00", "500.00"),
+		"a row was quarantined":    batchRec("10", "10", "10", "0", "9", "1", "0", "0", "500.00", "500.00"),
+		"a row failed":             batchRec("10", "10", "10", "0", "9", "0", "1", "0", "500.00", "500.00"),
+		"control total differs":    batchRec("10", "10", "10", "0", "10", "0", "0", "0", "500.00", "499.99"),
+	}
+	for name, rec := range cases {
+		w.src.set(catalogue.SysDataIngestion, "import-batch-tieout", "wm", rec)
+		run, final := w.run("FIN-CTRL-033", sc)
+		assert.Equal(t, domain.ResultFail, final.ResultState, name)
+		list, err := testStore.ListExceptions(ctx, w.tenant, run.RunID, store.ListExceptionsFilter{})
+		require.NoError(t, err)
+		assert.NotEmpty(t, list, name)
+	}
+
+	// A batch that declared nothing cannot be proven complete against its source: the empty operand is an exception,
+	// never a silent pass.
+	w.src.set(catalogue.SysDataIngestion, "import-batch-tieout", "wm", batchRec("", "10", "10", "0", "10", "0", "0", "0", "", ""))
+	run, final = w.run("FIN-CTRL-033", sc)
+	assert.Equal(t, domain.ResultFail, final.ResultState)
+	list, err := testStore.ListExceptions(ctx, w.tenant, run.RunID, store.ListExceptionsFilter{})
+	require.NoError(t, err)
+	reasons := map[string]bool{}
+	for _, x := range list {
+		reasons[x.ReasonCode] = true
+	}
+	assert.True(t, reasons[domain.ReasonOperandInvalid], "declared rows and control total are missing: %v", reasons)
+
+	// An unbound run cannot resolve batch_id and fails closed.
+	_, final = w.run("FIN-CTRL-033", nil)
+	assert.Equal(t, domain.ResultIndeterminate, final.ResultState)
 }
 
 func TestWave6_OpeningBalanceTieOut_TiesAndDetectsEachBreak(t *testing.T) {

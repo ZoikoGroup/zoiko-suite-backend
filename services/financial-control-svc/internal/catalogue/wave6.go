@@ -16,6 +16,9 @@ const (
 
 // FIN-CTRL-044 reads treasury-svc (SysTreasury, defined with the Wave 2 systems).
 
+// SysDataIngestion is data-ingestion-svc, the owner of controlled import batches (FIN-CTRL-033).
+const SysDataIngestion = "data-ingestion"
+
 // Wave6 returns the migration, filing-acknowledgement and bank-detail controls that
 // can run on data the platform holds today. Five controls of the wave (033-036, 044)
 // and 039 remain BLOCKED — see Status() for the missing capability of each.
@@ -24,6 +27,7 @@ const (
 //
 //	037  {"submitted_before": "<RFC3339 or YYYY-MM-DD>"}
 //	038  {"batch_id": "<migration batch uuid>"}
+//	033  {"batch_id": "<import batch id, imb_...>"}
 //	045  {"changed_from": "YYYY-MM-DD", "changed_to": "YYYY-MM-DD"}
 func Wave6(effectiveFrom string) ([]domain.CreateControlDefinitionRequest, error) {
 	if effectiveFrom == "" {
@@ -42,6 +46,26 @@ func Wave6(effectiveFrom string) ([]domain.CreateControlDefinitionRequest, error
 			SourceSpec: pop(SysTaxAuthority, "unacknowledged-filings", map[string]string{"submitted_before": "${scope.submitted_before}"}),
 			InitialLogic: j(map[string]any{"kind": "EXCEPTION_SCAN", "finding_category": "EXTERNAL_STATUS",
 				"finding_reason": "FILING_NOT_ACKNOWLEDGED", "finding_assertion": "COMPLETENESS"}),
+		},
+		{
+			// One run per import batch, after it has run: scope {"batch_id": "imb_..."}. The control re-performs the
+			// ties from the batch's raw counters and never trusts the batch's own reconciliation verdict. A batch that
+			// declared no row count or control total has an EMPTY operand, which is an exception: completeness against
+			// the source cannot be proven, so it is never a pass.
+			ControlCode: "FIN-CTRL-033", Name: "Import batch completeness", Domain: "Integration",
+			ControlType: "INTERFACE", Assertions: []string{"COMPLETENESS", "ACCURACY"}, RiskTier: "STANDARD",
+			Frequency: "ON_DEMAND", OwnerRole: "INTEGRATION_OWNER", ReviewerRole: "SENIOR_ACCOUNTANT", CertifierRole: "CONTROLLER",
+			SourceSpec: pop(SysDataIngestion, "import-batch-tieout", map[string]string{"batch_id": "${scope.batch_id}"}),
+			InitialLogic: j(map[string]any{
+				"kind": "ARITHMETIC",
+				"equations": []map[string]any{
+					{"name": "rows_tie_to_declared", "plus": []string{"attr:row_count"}, "equals": "attr:declared_rows"},
+					{"name": "rows_split_into_valid_and_invalid", "plus": []string{"attr:valid_rows", "attr:invalid_rows"}, "equals": "attr:row_count"},
+					{"name": "every_row_has_an_outcome", "plus": []string{"attr:imported_items", "attr:quarantined_items", "attr:failed_items", "attr:skipped_items"}, "equals": "attr:row_count"},
+					{"name": "every_row_is_imported", "plus": []string{"attr:imported_items"}, "equals": "attr:row_count"},
+					{"name": "control_total_ties_to_declared", "plus": []string{"attr:computed_control_total"}, "equals": "attr:declared_control_total"},
+				},
+			}),
 		},
 		{
 			ControlCode: "FIN-CTRL-038", Name: "Opening balance migration tie-out", Domain: "Migration",

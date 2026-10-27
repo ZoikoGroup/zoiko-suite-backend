@@ -10,11 +10,12 @@ import (
 	"zoiko.io/financial-control-svc/internal/source"
 )
 
-func TestWave6_FourSingleSidedNoPeriodControls(t *testing.T) {
+func TestWave6_FiveSingleSidedNoPeriodControls(t *testing.T) {
 	defs, err := Wave6("2026-09-01")
 	require.NoError(t, err)
-	require.Len(t, defs, 4)
+	require.Len(t, defs, 5)
 	want := map[string][2]string{
+		"FIN-CTRL-033": {SysDataIngestion, domain.KindArithmetic},
 		"FIN-CTRL-037": {SysTaxAuthority, domain.KindExceptionScan},
 		"FIN-CTRL-038": {SysFinancialClose, domain.KindArithmetic},
 		"FIN-CTRL-044": {SysTreasury, domain.KindExceptionScan},
@@ -40,12 +41,34 @@ func TestWave6_ScopeBinding(t *testing.T) {
 		switch d.ControlCode {
 		case "FIN-CTRL-037":
 			assert.Equal(t, "${scope.submitted_before}", s.Params["submitted_before"])
-		case "FIN-CTRL-038":
+		case "FIN-CTRL-038", "FIN-CTRL-033":
 			assert.Equal(t, "${scope.batch_id}", s.Params["batch_id"])
 		case "FIN-CTRL-045":
 			assert.Equal(t, "${scope.changed_from}", s.Params["changed_from"])
 			assert.Equal(t, "${scope.changed_to}", s.Params["changed_to"])
 		}
+	}
+}
+
+// FIN-CTRL-033 re-performs five ties from the batch's raw counters; each is its own named equation so an exception says
+// exactly which tie broke.
+func TestWave6_ImportBatchCompletenessCoversRowsOutcomesAndControlTotal(t *testing.T) {
+	defs, _ := Wave6("2026-09-01")
+	for _, d := range defs {
+		if d.ControlCode != "FIN-CTRL-033" {
+			continue
+		}
+		l, err := domain.ParseRuleLogic(d.InitialLogic)
+		require.NoError(t, err)
+		names := map[string]bool{}
+		for _, e := range l.Equations {
+			names[e.Name] = true
+		}
+		for _, n := range []string{"rows_tie_to_declared", "rows_split_into_valid_and_invalid", "every_row_has_an_outcome",
+			"every_row_is_imported", "control_total_ties_to_declared"} {
+			assert.True(t, names[n], n)
+		}
+		assert.False(t, d.CloseGating)
 	}
 }
 
