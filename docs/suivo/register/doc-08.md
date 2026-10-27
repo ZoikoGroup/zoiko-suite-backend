@@ -1,0 +1,21 @@
+# Doc 08 register entry
+- Filename: ZoikoSuite_Suivo_Chatbot_Document_08_Deployment_DevOps_Observability_and_Production_Readiness_Playbook.md
+- Document ID (exact): ZS-SUIVO-ENG-008
+- Title (exact, from the title line, not the ID line): Deployment, DevOps, Observability & Production Readiness Playbook
+- Version (exact): VERSION 1.0
+- Date (exact): 24 OCTOBER 2026
+- Status / approval wording (quote the full sentence): DOCUMENT STATUS PROPOSED FOR FOUNDER / GLOBAL CTO / PLATFORM-SRE APPROVAL. This is an implementation and operations specification—not evidence that Kubernetes, a particular cloud, an APM vendor, a model vendor, or specific SLOs are already deployed. Existing ZoikoSuite repositories and infrastructure must be inspected before adopting the illustrative designs.
+- Approver roles (exactly as written in the status or approval text): FOUNDER / GLOBAL CTO / PLATFORM-SRE
+- Classification (if stated): Internal engineering / confidential
+- Other document IDs mentioned in lines 1—80 (list each ID + the line number):
+  - ZS-SUIVO-ENG-008 (line 18)
+  - 01 (line 20), 02 (line 20), 03 (line 20), 04 (line 20), 05 (line 20), 06 (line 20), 07 (line 20)
+- Line numbers where each value above was found:
+  - Document ID (exact): line 18
+  - Title (exact): line 7
+  - Version (exact): line 9
+  - Date (exact): line 9
+  - Status / approval wording: line 13
+  - Approver roles: line 13
+  - Classification: not found in lines 1—80
+  - Other document IDs: line 18, line 20 (01-07)

@@ -1,0 +1,44 @@
+{
+  "source": {
+    "source_type": "WEB_PAGE",
+    "product_id": "zoikosuite",
+    "audience": "PUBLIC_ANONYMOUS",
+    "classification": "PUBLIC_APPROVED",
+    "pii_state": "CLEAR",
+    "authority_tier": "P3",
+    "subject_type": "CAPABILITY",
+    "owner_id": "owner-web",
+    "approver_ids": [
+      "approver-a"
+    ],
+    "market_codes": [
+      "ALL"
+    ],
+    "locale": "en-US",
+    "plan_codes": [],
+    "capability_ids": [
+      "CAP-PAYROLL",
+      "CAP-HR"
+    ],
+    "intent_ids": [
+      "I18"
+    ],
+    "approval_state": "APPROVED",
+    "approval_ts": "2026-01-02T00:00:00Z",
+    "effective_from": "2026-01-01T00:00:00Z",
+    "effective_until": null,
+    "review_due_at": "2027-01-01T00:00:00Z",
+    "expires_at": "2099-12-31T00:00:00Z",
+    "content_sha256": "",
+    "signing_ref": "kbctl-dev",
+    "license": "OWNED_PUBLIC",
+    "supersedes": "",
+    "revocation_reason": "",
+    "source_id": "src-workforce",
+    "source_version_id": "src-workforce-v1",
+    "origin_uri": "https://example.invalid/workforce",
+    "url_key": "workforce",
+    "title": "Workforce and payroll"
+  },
+  "body": "TEST-ONLY synthetic fixture. Not ZoikoSuite fact.\n\n# Workforce\nThe Workforce domain covers payroll and human resources, including employee records, leave, benefits and payroll runs with approval before payment.\n# Payroll by country\nPayroll coverage differs by country, so the countries supported for payroll are confirmed with the team before you commit."
+}

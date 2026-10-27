@@ -1,0 +1,21 @@
+# Doc 06 register entry
+- Filename: ZoikoSuite_Suivo_Chatbot_Document_06_Security_Privacy_Abuse_Prevention_and_Trust_Controls.md
+- Document ID (exact): ZS-SUIVO-ENG-006
+- Title (exact, from the title line, not the ID line): Security, Privacy, Abuse Prevention & Trust Controls
+- Version (exact): VERSION 1.0
+- Date (exact): 24 OCTOBER 2026
+- Status / approval wording (quote the full sentence): SUBMISSION AND VERIFICATION STATUS PROPOSED FOR APPROVAL. This is a reference security specification, not a declaration of implemented controls, legal compliance, certification or penetration-testing completion. The ZoikoSuite repository, cloud accounts, vendor contracts, production IAM, session implementation and DPIA were not provided for verification. Every such item appears as a release gate.
+- Approver roles (exactly as written in the status or approval text): not stated in the status cell
+- Classification (if stated): not stated in lines 1—80
+- Other document IDs mentioned in lines 1—80 (list each ID + the line number):
+  - ZS-SUIVO-ENG-006 (line 18)
+  - Docs 01—05 (line 21)
+- Line numbers where each value above was found:
+  - Document ID (exact): line 18
+  - Title (exact): line 7
+  - Version (exact): line 9
+  - Date (exact): line 9
+  - Status / approval wording: line 13
+  - Approver roles: line 13
+  - Classification: not found in lines 1—80
+  - Other document IDs: line 18, line 21

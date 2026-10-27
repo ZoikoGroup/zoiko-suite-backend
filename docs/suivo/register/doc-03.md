@@ -1,0 +1,21 @@
+﻿# Doc 03 register entry
+- Filename: ZoikoSuite_Suivo_Chatbot_Document_03_Knowledge_Base_Architecture_and_Source_Governance.md
+- Document ID (exact): ZS-AI-PUB-003
+- Title (exact, from the title line, not the ID line): KNOWLEDGE BASE ARCHITECTURE & SOURCE GOVERNANCE
+- Version (exact): Version 1.0
+- Date (exact): 24 October 2026
+- Status / approval wording (quote the full sentence): Status: PROPOSED FOR FOUNDER / CTO / PRODUCT / SECURITY / LEGAL APPROVAL
+- Approver roles (exactly as written in the status or approval text): FOUNDER / CTO / PRODUCT / SECURITY / LEGAL
+- Classification (if stated): not stated in lines 1–80
+- Other document IDs mentioned in lines 1–80 (list each ID + the line number):
+  - ZS-AI-PUB-003 (line 10)
+  - ZS-AI-PUB-001 (line 34)
+  - ZS-AI-PUB-002 (line 34)
+- Line numbers where each value above was found:
+- Document ID (exact): line 11
+- Title (exact): line 9
+- Version (exact): line 13
+- Date (exact): line 13
+- Status / approval wording: line 15
+- Approver roles: line 15
+- Other document IDs: line 11 (ZS-AI-PUB-003), line 36 (ZS-AI-PUB-001, ZS-AI-PUB-002)
