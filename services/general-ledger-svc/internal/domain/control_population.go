@@ -116,6 +116,15 @@ type ClearingBalanceAgingQuery struct {
 	AfterRecordID string
 }
 
+// PostSealEntriesQuery scopes one page of the post-seal-entries population: ledger
+// entries of the entity written after the close watermark of a period that is
+// currently SEALED.
+type PostSealEntriesQuery struct {
+	LegalEntityID string
+	Limit         int
+	AfterRecordID string
+}
+
 // EventJournalBreaksQuery scopes one page of the event-journal-breaks
 // population: accounting-event/journal linkage breaks strictly before
 // CreatedBefore.

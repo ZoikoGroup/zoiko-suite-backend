@@ -113,6 +113,23 @@ func TestWave5_UnpostedEvents_ScopeBindsTheCutoff(t *testing.T) {
 	assert.Equal(t, domain.ResultIndeterminate, final.ResultState)
 }
 
+func TestWave5_PostSealEntries_EveryEntryPastTheWatermarkIsAFindingNeedingNoScope(t *testing.T) {
+	w := newWave5(t)
+	w.src.set(catalogue.SysGL, "post-seal-entries", "wm")
+	_, final := w.run("FIN-CTRL-024", nil)
+	assert.Equal(t, domain.ResultPass, final.ResultState, "nothing past any seal watermark: pass")
+
+	w.src.set(catalogue.SysGL, "post-seal-entries", "wm2", r("e1", "J-1", "25.00"), r("e2", "J-1", "-25.00"))
+	run, final := w.run("FIN-CTRL-024", nil)
+	assert.Equal(t, domain.ResultFail, final.ResultState)
+	ex, err := testStore.ListExceptions(ctx, w.tenant, run.RunID, store.ListExceptionsFilter{})
+	require.NoError(t, err)
+	require.Len(t, ex, 2)
+	assert.Equal(t, "LATE_DATA", ex[0].Category)
+	assert.Equal(t, "POSTING_AFTER_PERIOD_SEAL", ex[0].ReasonCode)
+	assert.Equal(t, "CUTOFF", ex[0].Assertion)
+}
+
 func TestWave5_ClearingBalanceAging_EveryAgedBalanceIsAFindingAndTheCutOffIsPerRun(t *testing.T) {
 	w := newWave5(t)
 	sc := func(r *domain.CreateRunRequest) { r.Scope = json.RawMessage(`{"aged_before":"2026-09-01"}`) }

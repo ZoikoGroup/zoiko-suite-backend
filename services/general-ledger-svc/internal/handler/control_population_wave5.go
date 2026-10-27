@@ -113,6 +113,24 @@ func (h *Handler) getUnpostedEvents(w http.ResponseWriter, r *http.Request, prin
 	h.writeControlPopulationPage(w, page, err)
 }
 
+const populationPostSealEntries = "post-seal-entries"
+
+var postSealEntriesParams = map[string]bool{"legal_entity_id": true, "limit": true, "cursor": true}
+
+func (h *Handler) getPostSealEntries(w http.ResponseWriter, r *http.Request, principalID, tenantID string) {
+	entity, limit, after, ok := parseCommonPopulationParams(w, r.URL.Query(), postSealEntriesParams)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, entity, actionControlPopulationRead); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	page, err := h.store.QueryPostSealEntries(r.Context(), tenantID, domain.PostSealEntriesQuery{
+		LegalEntityID: entity, Limit: limit, AfterRecordID: after})
+	h.writeControlPopulationPage(w, page, err)
+}
+
 const populationClearingBalanceAging = "clearing-balance-aging"
 
 var clearingBalanceAgingParams = map[string]bool{

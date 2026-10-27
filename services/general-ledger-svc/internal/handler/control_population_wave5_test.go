@@ -20,6 +20,7 @@ type wave5Stub struct {
 	unposted   []domain.UnpostedEventsQuery
 	breaks     []domain.EventJournalBreaksQuery
 	aging      []domain.ClearingBalanceAgingQuery
+	postSeal   []domain.PostSealEntriesQuery
 	tenantSeen []string
 }
 

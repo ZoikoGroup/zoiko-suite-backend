@@ -71,6 +71,9 @@ func (h *Handler) GetControlPopulation(w http.ResponseWriter, r *http.Request) {
 	case populationEventJournalBreaks:
 		h.getEventJournalBreaks(w, r, principalID, tenantID)
 		return
+	case populationPostSealEntries:
+		h.getPostSealEntries(w, r, principalID, tenantID)
+		return
 	case populationClearingBalanceAging:
 		h.getClearingBalanceAging(w, r, principalID, tenantID)
 		return

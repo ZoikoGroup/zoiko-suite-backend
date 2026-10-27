@@ -17,9 +17,9 @@ import (
 //	020/021/023  scope {"fiscal_period": "<ledger fiscal period text>"}
 //	022          scope {"created_before": "<RFC3339 or YYYY-MM-DD cut-off>"}
 //	031          scope {"aged_before": "<YYYY-MM-DD cut-off>"}
+//	024          no scope (lifetime population: every entry past a sealed period's watermark)
 //
-// 024 (closed-period block) stays BLOCKED — see Status(). 041/042 are computed by
-// the control service itself.
+// 041/042 are computed by the control service itself.
 func Wave5(effectiveFrom string) ([]domain.CreateControlDefinitionRequest, error) {
 	if effectiveFrom == "" {
 		return nil, fmt.Errorf("%w: catalogue needs effective_from", domain.ErrInvalidArgument)
@@ -65,6 +65,18 @@ func Wave5(effectiveFrom string) ([]domain.CreateControlDefinitionRequest, error
 			SourceSpec: glPop("unposted-events", map[string]string{"created_before": "${scope.created_before}"}),
 			InitialLogic: j(map[string]any{"kind": "EXCEPTION_SCAN", "finding_category": "LATE_DATA",
 				"finding_reason": "UNPOSTED_ACCOUNTING_EVENT", "finding_assertion": "COMPLETENESS"}),
+		},
+		{
+			// Detective test of the preventive seal: the ledger refuses a sealed period, so any entry past a SEALED
+			// period's close watermark came in out of band. No run scope is needed. Deliberately NOT close-gating by
+			// default: which controls gate a close is a controlled decision (§34), and enabling it here would widen
+			// the mandatory set of every tenant that re-seeds this wave. Set close_gating when the entity decides.
+			ControlCode: "FIN-CTRL-024", Name: "Closed-period posting block", Domain: "Accounting Kernel",
+			ControlType: "PREVENTIVE", Assertions: []string{"CUTOFF", "AUTHORIZATION"}, RiskTier: "KEY",
+			Frequency: "CONTINUOUS", OwnerRole: "GL_OWNER", ReviewerRole: "SENIOR_ACCOUNTANT", CertifierRole: "CONTROLLER",
+			SourceSpec: glPop("post-seal-entries", map[string]string{}),
+			InitialLogic: j(map[string]any{"kind": "EXCEPTION_SCAN", "finding_category": "LATE_DATA",
+				"finding_reason": "POSTING_AFTER_PERIOD_SEAL", "finding_assertion": "CUTOFF"}),
 		},
 		{
 			// The aging limit is a controlled decision (§34); the run scope carries the cut-off.

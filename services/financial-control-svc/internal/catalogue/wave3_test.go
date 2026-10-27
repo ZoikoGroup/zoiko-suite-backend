@@ -168,7 +168,7 @@ func TestStatus_BlockedControlsAlwaysNameTheirBlocker(t *testing.T) {
 			assert.GreaterOrEqual(t, c.Wave, 4, "%s: a not-started control belongs to a later wave", c.Code)
 		}
 	}
-	assert.Equal(t, 18, blocked)
+	assert.Equal(t, 17, blocked)
 }
 
 // The status report must agree with what the catalogue can actually create.
@@ -212,8 +212,8 @@ func TestStatus_KeyBlockersAreSpecific(t *testing.T) {
 	assert.Contains(t, by["FIN-CTRL-011"].BlockedBy[0], "PostAccountingEvent")
 	assert.Contains(t, by["FIN-CTRL-013"].Note, "valuation")
 	sum := Summary(Status())
-	assert.Equal(t, 18, sum[StateBlocked])
+	assert.Equal(t, 17, sum[StateBlocked])
 	assert.Equal(t, 15, sum[StateImplemented], "9 catalogue controls (001,002,003,020,027,028,029,030,032) + 4 payroll extensions + 041, 042 computed in-service")
-	assert.Equal(t, 16, sum[StatePartial], "005, 006, 013, 014, 015, 017, 019, 021, 022, 023, 026, 031, 037, 038, 044, 045")
+	assert.Equal(t, 17, sum[StatePartial], "005, 006, 013, 014, 015, 017, 019, 021, 022, 023, 024, 026, 031, 037, 038, 044, 045")
 	assert.Equal(t, 0, sum[StateNotStarted], "every catalogue control now has a stated position")
 }
