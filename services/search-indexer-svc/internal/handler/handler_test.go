@@ -419,6 +419,26 @@ func bodyOf(t *testing.T, w *httptest.ResponseRecorder) map[string]any {
 	return out
 }
 
+func errorCode(t *testing.T, w *httptest.ResponseRecorder) string {
+	t.Helper()
+	body := bodyOf(t, w)
+	if code, ok := body["code"].(string); ok {
+		return code
+	}
+	return ""
+}
+
+func reasonCode(t *testing.T, w *httptest.ResponseRecorder) string {
+	t.Helper()
+	body := bodyOf(t, w)
+	if extra, ok := body["extra"].(map[string]any); ok {
+		if rc, ok := extra["reason_code"].(string); ok {
+			return rc
+		}
+	}
+	return ""
+}
+
 // ── tests: search ────────────────────────────────────────────────────────────
 
 func TestSearch_HappyPath(t *testing.T) {
@@ -452,7 +472,7 @@ func TestSearch_TenantInBodyIsRejectedNotSilentlyIgnored(t *testing.T) {
 	}))
 
 	assert.Equal(t, http.StatusBadRequest, w.Code)
-	assert.Equal(t, "invalid_request", bodyOf(t, w)["error"])
+	assert.Equal(t, "invalid_request", errorCode(t, w))
 }
 
 // The compiled plan's tenant filter is the HEADER's tenant, whatever else was
@@ -635,7 +655,7 @@ func TestExport_RequiresItsOwnReason(t *testing.T) {
 	h := newHarness(t, nil)
 	w := do(h, req(t, http.MethodPost, "/v1/search-exports", map[string]any{"scope": "obligation"}))
 	assert.Equal(t, http.StatusBadRequest, w.Code)
-	assert.Equal(t, "reason_required", bodyOf(t, w)["error"])
+	assert.Equal(t, "reason_required", errorCode(t, w))
 }
 
 func TestExport_AuthorizedRecordsEvidenceAndTransfersNothing(t *testing.T) {
@@ -661,7 +681,7 @@ func TestRestriction_RequiresAuthorizationAndSourceEvent(t *testing.T) {
 		"source_id": "ob-1", "reason": "PRV_ERASURE",
 	}))
 	assert.Equal(t, http.StatusBadRequest, w.Code)
-	assert.Equal(t, "source_event_id_required", bodyOf(t, w)["error"])
+	assert.Equal(t, "source_event_id_required", errorCode(t, w))
 
 	denied := newHarness(t, &stubAuthz{err: authz.ErrDenied})
 	w = do(denied, req(t, http.MethodPost, "/v1/restrictions", map[string]any{
@@ -775,7 +795,7 @@ func TestCreateSource_RefusesProhibitedCeiling(t *testing.T) {
 	}))
 
 	assert.Equal(t, http.StatusBadRequest, w.Code)
-	assert.Equal(t, "prohibited_ceiling", bodyOf(t, w)["error"])
+	assert.Equal(t, "prohibited_ceiling", errorCode(t, w))
 }
 
 // A source with no event types would subscribe a topic that can never
@@ -788,7 +808,7 @@ func TestCreateSource_RefusesSourceWithNoEventTypes(t *testing.T) {
 	}))
 
 	assert.Equal(t, http.StatusBadRequest, w.Code)
-	assert.Equal(t, "event_types_required", bodyOf(t, w)["error"])
+	assert.Equal(t, "event_types_required", errorCode(t, w))
 }
 
 // §4.2. A contract is always created DRAFT; publication is a separate,
@@ -908,7 +928,7 @@ func TestCreateContract_RequiresAnAuthzAction(t *testing.T) {
 	}))
 
 	require.Equal(t, http.StatusBadRequest, w.Code)
-	assert.Equal(t, "authz_action_required", bodyOf(t, w)["error"])
+	assert.Equal(t, "authz_action_required", errorCode(t, w))
 }
 
 // §8.1. ACTIVE is reachable only from READY. A BUILDING generation cannot be
@@ -922,7 +942,7 @@ func TestTransitionGeneration_CannotActivateFromBuilding(t *testing.T) {
 	}))
 
 	require.Equal(t, http.StatusConflict, w.Code)
-	assert.Equal(t, "invalid_transition", bodyOf(t, w)["error"])
+	assert.Equal(t, "invalid_transition", errorCode(t, w))
 }
 
 // §8.1's exit from ACTIVE is "RETIRED after replacement". Retiring the
@@ -936,7 +956,7 @@ func TestTransitionGeneration_CannotRetireTheServingGeneration(t *testing.T) {
 	}))
 
 	require.Equal(t, http.StatusConflict, w.Code)
-	assert.Equal(t, "active_generation", bodyOf(t, w)["error"])
+	assert.Equal(t, "active_generation", errorCode(t, w))
 }
 
 // §2.2: only PUBLISHED contracts build production generations.
@@ -946,7 +966,7 @@ func TestCreateGeneration_RequiresAPublishedContract(t *testing.T) {
 
 	w := do(h, req(t, http.MethodPost, "/v1/index-generations", map[string]any{"scope": "obligation"}))
 	require.Equal(t, http.StatusConflict, w.Code)
-	assert.Equal(t, "no_published_contract", bodyOf(t, w)["error"])
+	assert.Equal(t, "no_published_contract", errorCode(t, w))
 }
 
 // ── tests: scope catalogue ───────────────────────────────────────────────────
@@ -1003,7 +1023,7 @@ func TestPathParams_MalformedUUIDIs404NotServerError(t *testing.T) {
 			}
 			w := do(h, req(t, method, path, body))
 			assert.Equal(t, http.StatusNotFound, w.Code, w.Body.String())
-			assert.Equal(t, "not_found", bodyOf(t, w)["error"])
+			assert.Equal(t, "not_found", errorCode(t, w))
 		})
 	}
 }

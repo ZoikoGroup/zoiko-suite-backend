@@ -34,6 +34,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
+	apicontract "zoiko.io/identity-envelope/apicontract"
 
 	"zoiko.io/search-client/searchclient"
 	"zoiko.io/search-indexer-svc/internal/authz"
@@ -297,7 +298,7 @@ func (h *Handler) Retrieve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(req.Refs) == 0 {
-		writeError(w, http.StatusBadRequest, "refs_required", "at least one source ref is required")
+		writeError(w, r, http.StatusBadRequest, "refs_required", "at least one source ref is required")
 		return
 	}
 	if len(req.Refs) > maxRetrieveRefs {
@@ -406,7 +407,7 @@ func (h *Handler) RequestExport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if strings.TrimSpace(req.Reason) == "" {
-		writeError(w, http.StatusBadRequest, "reason_required",
+		writeError(w, r, http.StatusBadRequest, "reason_required",
 			"an export must state its reason; search purpose does not carry over")
 		return
 	}
@@ -506,7 +507,7 @@ func (h *Handler) ApplyRestriction(w http.ResponseWriter, r *http.Request) {
 		// scope is required: it is half of the ledger key the restriction
 		// is recorded under, and a restriction recorded under no scope
 		// protects nothing.
-		writeError(w, http.StatusBadRequest, "invalid_request",
+		writeError(w, r, http.StatusBadRequest, "invalid_request",
 			"scope, source_type, source_id and reason are required")
 		return
 	}
@@ -516,7 +517,7 @@ func (h *Handler) ApplyRestriction(w http.ResponseWriter, r *http.Request) {
 		// erasure would write a second tombstone at a new epoch — harmless
 		// here, but it would also make NP-47's duplicate-replay guarantee
 		// untestable. Required rather than generated.
-		writeError(w, http.StatusBadRequest, "source_event_id_required",
+		writeError(w, r, http.StatusBadRequest, "source_event_id_required",
 			"a restriction must name the authoritative source event it derives from")
 		return
 	}
@@ -527,7 +528,7 @@ func (h *Handler) ApplyRestriction(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := h.authz.CheckAllowed(r.Context(), tc.ActorID, entity, ActionRestrictionApply); err != nil {
 		h.metrics.AuthzDecision(ActionRestrictionApply, outcomeOf(err))
-		h.writeAuthzError(w, err)
+		h.writeAuthzError(w, r, err)
 		return
 	}
 	h.metrics.AuthzDecision(ActionRestrictionApply, "allowed")
@@ -552,7 +553,7 @@ func (h *Handler) ApplyRestriction(w http.ResponseWriter, r *http.Request) {
 			// refused, and 409 rather than 200: the caller asked for
 			// something that did not happen, and telling it otherwise would
 			// let a privacy workflow record an erasure that was declined.
-			writeErrorCode(w, http.StatusConflict, "stale_restriction_epoch",
+			writeErrorCode(w, r, http.StatusConflict, "stale_restriction_epoch",
 				err.Error(), domain.ReasonRestrictionEpochMismtch)
 			return
 		}
@@ -585,7 +586,7 @@ func (h *Handler) ApplyRestriction(w http.ResponseWriter, r *http.Request) {
 			zap.String("scope", req.Scope), zap.String("source_id", req.SourceID), zap.Error(err))
 		_ = h.store.MarkTombstoneState(r.Context(), tomb.TenantID, tomb.SourceType, tomb.SourceID,
 			tomb.SourceEventID, domain.PropagationFailed, "ledger not updated: "+err.Error())
-		writeErrorCode(w, http.StatusServiceUnavailable, "restriction_not_recorded",
+		writeErrorCode(w, r, http.StatusServiceUnavailable, "restriction_not_recorded",
 			"the restriction could not be made durable against later updates; retry", domain.ReasonRestrictionPropFailed)
 		return
 	}
@@ -745,7 +746,7 @@ func (h *Handler) tombstoneIn(ctx context.Context, gen domain.IndexGeneration, t
 func (h *Handler) ListRestrictions(w http.ResponseWriter, r *http.Request) {
 	env := envelope.MustFromContext(r.Context())
 	if env.TenantID == "" {
-		writeErrorCode(w, http.StatusUnauthorized, "tenant_context_missing",
+		writeErrorCode(w, r, http.StatusUnauthorized, "tenant_context_missing",
 			"no verified tenant on the request", domain.ReasonTenantContextMissing)
 		return
 	}
@@ -762,7 +763,7 @@ func (h *Handler) ListRestrictions(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) ListEvidence(w http.ResponseWriter, r *http.Request) {
 	env := envelope.MustFromContext(r.Context())
 	if env.TenantID == "" {
-		writeErrorCode(w, http.StatusUnauthorized, "tenant_context_missing",
+		writeErrorCode(w, r, http.StatusUnauthorized, "tenant_context_missing",
 			"no verified tenant on the request", domain.ReasonTenantContextMissing)
 		return
 	}
@@ -946,7 +947,7 @@ func (h *Handler) refuse(w http.ResponseWriter, r *http.Request, status int, cod
 			string(code), h.actorHash(tc), env.CorrelationID)
 	}
 
-	writeErrorCode(w, status, "search_refused", detail, code)
+	writeErrorCode(w, r, status, "search_refused", detail, code)
 }
 
 // actorHash is a keyed, stable hash of the acting identity.
@@ -1036,13 +1037,13 @@ func outcomeOf(err error) string {
 	}
 }
 
-func (h *Handler) writeAuthzError(w http.ResponseWriter, err error) {
+func (h *Handler) writeAuthzError(w http.ResponseWriter, r *http.Request, err error) {
 	if errors.Is(err, authz.ErrDenied) {
-		writeError(w, http.StatusForbidden, "authorization_denied",
+		writeError(w, r, http.StatusForbidden, "authorization_denied",
 			"this principal is not authorized for that action")
 		return
 	}
-	writeErrorCode(w, http.StatusServiceUnavailable, "authorization_unavailable",
+	writeErrorCode(w, r, http.StatusServiceUnavailable, "authorization_unavailable",
 		"no authorization decision could be obtained; failing closed",
 		domain.ReasonAuthorizationIndet)
 }
@@ -1050,7 +1051,7 @@ func (h *Handler) writeAuthzError(w http.ResponseWriter, err error) {
 func (h *Handler) internal(w http.ResponseWriter, r *http.Request, what string, err error) {
 	h.log.Error("request failed", zap.String("operation", what),
 		zap.String("path", r.URL.Path), zap.Error(err))
-	writeError(w, http.StatusInternalServerError, "internal_error", "the request could not be completed")
+	writeError(w, r, http.StatusInternalServerError, "internal_error", "the request could not be completed")
 }
 
 func str(m map[string]any, key string) string {
@@ -1070,7 +1071,7 @@ func decode(w http.ResponseWriter, r *http.Request, target any) bool {
 	// rather than that their request was refused (NP-01).
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(target); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		writeError(w, r, http.StatusBadRequest, "invalid_request", err.Error())
 		return false
 	}
 	return true
@@ -1082,8 +1083,8 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 	_ = json.NewEncoder(w).Encode(body)
 }
 
-func writeError(w http.ResponseWriter, status int, code, detail string) {
-	writeJSON(w, status, map[string]any{"error": code, "detail": detail})
+func writeError(w http.ResponseWriter, r *http.Request, status int, code, detail string) {
+	apicontract.WriteError(w, r, status, code, detail)
 }
 
 // writeErrorCode writes a refusal carrying its §11.3 reason code.
@@ -1092,12 +1093,13 @@ func writeError(w http.ResponseWriter, status int, code, detail string) {
 // "ESR-007" does not need the meaning; a human reading a response body in a
 // terminal does, and shipping only the code turns every refusal into a lookup
 // in a document they may not have.
-func writeErrorCode(w http.ResponseWriter, status int, code, detail string, reason domain.ReasonCode) {
-	writeJSON(w, status, map[string]any{
-		"error":       code,
-		"detail":      detail,
-		"reason_code": string(reason),
-		"reason":      domain.ReasonMeaning(reason),
+func writeErrorCode(w http.ResponseWriter, r *http.Request, status int, code, detail string, reason domain.ReasonCode) {
+	apicontract.WriteProblem(w, r, apicontract.Problem{
+		Status:     status,
+		Code:       code,
+		Detail:     detail,
+		Retryable:  status >= 500,
+		Extra:      map[string]any{"reason_code": string(reason), "reason": domain.ReasonMeaning(reason)},
 	})
 }
 
@@ -1120,7 +1122,7 @@ func chiParam(r *http.Request, name string) string { return chi.URLParam(r, name
 func uuidParam(w http.ResponseWriter, r *http.Request, name string) (string, bool) {
 	raw := chi.URLParam(r, name)
 	if _, err := uuid.Parse(raw); err != nil {
-		writeError(w, http.StatusNotFound, "not_found", "no such resource")
+		writeError(w, r, http.StatusNotFound, "not_found", "no such resource")
 		return "", false
 	}
 	return raw, true

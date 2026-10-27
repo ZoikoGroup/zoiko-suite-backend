@@ -143,23 +143,23 @@ paths:
         "400":
           description: ESR-003/004/005/006/015 — the request was refused
           content:
-            application/json:
-              schema: { $ref: "#/components/schemas/ReasonedError" }
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
         "401":
           description: ESR-001 TENANT_CONTEXT_MISSING
           content:
-            application/json:
-              schema: { $ref: "#/components/schemas/ReasonedError" }
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
         "403":
           description: ESR-007 PARTITION_NOT_AUTHORIZED / ESR-009 PRIVACY_PURPOSE_BLOCKED
           content:
-            application/json:
-              schema: { $ref: "#/components/schemas/ReasonedError" }
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
         "404":
           description: ESR-002 SCOPE_NOT_REGISTERED / ESR-011 INDEX_GENERATION_NOT_ACTIVE
           content:
-            application/json:
-              schema: { $ref: "#/components/schemas/ReasonedError" }
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
         "503":
           description: |
             The server's state, not the request's — the same request succeeds
@@ -174,8 +174,8 @@ paths:
               tenant's restrictions in the scope have failed to propagate, or
               the restriction queue could not be read (NP-59).
           content:
-            application/json:
-              schema: { $ref: "#/components/schemas/ReasonedError" }
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
 
   /v1/search/semantic:
     post:
@@ -217,20 +217,20 @@ paths:
         "400":
           description: ESR-003/004/005/006/015 — the request was refused
           content:
-            application/json:
-              schema: { $ref: "#/components/schemas/ReasonedError" }
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
         "404":
           description: |
             ESR-002 — the scope is not registered for semantic retrieval (its
             contract pins no embedding model); ESR-011 — no active generation
           content:
-            application/json:
-              schema: { $ref: "#/components/schemas/ReasonedError" }
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
         "409":
           description: ESR-019 — the request's `model` is not the scope's pinned model
           content:
-            application/json:
-              schema: { $ref: "#/components/schemas/ReasonedError" }
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
         "503":
           description: |
             ESR-008 / ESR-012 / ESR-018 as for `/v1/search`, or ESR-019 — no
@@ -238,8 +238,8 @@ paths:
             unreachable, or it answered with a model, version or width other
             than the pin (NP-35). Never a lexical fallback.
           content:
-            application/json:
-              schema: { $ref: "#/components/schemas/ReasonedError" }
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
 
   /v1/retrieve:
     post:
@@ -275,13 +275,13 @@ paths:
         "400":
           description: ESR-016 — too many refs; use an authorized export
           content:
-            application/json:
-              schema: { $ref: "#/components/schemas/ReasonedError" }
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
         "503":
           description: ESR-012 / ESR-018 — the same scope-health gate as `/v1/search`
           content:
-            application/json:
-              schema: { $ref: "#/components/schemas/ReasonedError" }
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
 
   /v1/scopes:
     get:
@@ -347,8 +347,8 @@ paths:
             one already applied (NP-11/NP-48). A 409 rather than a 200 because
             a privacy workflow must not record an erasure that was declined.
           content:
-            application/json:
-              schema: { $ref: "#/components/schemas/ReasonedError" }
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
         "503":
           description: Recorded, but the index write failed; the verifier will retry
     get:
@@ -402,11 +402,14 @@ paths:
           description: Export authorized and recorded as evidence
         "400":
           description: No reason given
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
         "403":
           description: ESR-016 EXPORT_AUTHORIZATION_REQUIRED
           content:
-            application/json:
-              schema: { $ref: "#/components/schemas/ReasonedError" }
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
 
   /v1/search-evidence:
     get:
@@ -460,10 +463,26 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Source" }
-        "400": { description: "Missing event types, or a prohibited ceiling" }
-        "403": { description: Principal lacks SEARCH_SOURCE_REGISTER }
-        "409": { description: That source_type is already registered }
-        "503": { description: Authorization unavailable — failing closed }
+        "400":
+          description: Missing event types, or a prohibited ceiling
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
+        "403":
+          description: Principal lacks SEARCH_SOURCE_REGISTER
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
+        "409":
+          description: That source_type is already registered
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
+        "503":
+          description: Authorization unavailable — failing closed
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
     get:
       tags: [Registry]
       summary: List registered sources
@@ -508,9 +527,21 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Contract" }
-        "400": { description: The field contract is invalid — `detail` says which rule }
-        "403": { description: Principal lacks SEARCH_CONTRACT_CREATE }
-        "404": { description: source_type is not registered }
+        "400":
+          description: The field contract is invalid — `detail` says which rule
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
+        "403":
+          description: Principal lacks SEARCH_CONTRACT_CREATE
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
+        "404":
+          description: source_type is not registered
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
     get:
       tags: [Registry]
       summary: List contracts
@@ -542,7 +573,11 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Contract" }
-        "404": { description: No such contract }
+        "404":
+          description: No such contract
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
 
   /v1/index-contracts/{contractID}/state:
     post:
@@ -572,7 +607,12 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Contract" }
-        "409": { description: "Illegal transition, or another version is already PUBLISHED" }
+        "409":
+          description: |
+            Illegal transition, or another version is already PUBLISHED
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
 
   /v1/index-generations:
     post:
@@ -599,7 +639,11 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Generation" }
-        "409": { description: The scope has no PUBLISHED contract to build from }
+        "409":
+          description: The scope has no PUBLISHED contract to build from
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
     get:
       tags: [Lifecycle]
       summary: List generations
@@ -685,8 +729,8 @@ paths:
             another generation is already ACTIVE; or an attempt to retire the
             serving generation before its replacement is active.
           content:
-            application/json:
-              schema: { $ref: "#/components/schemas/ReasonedError" }
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
 
   /v1/index-generations/{generationID}/retrieval-evaluations:
     post:
@@ -726,23 +770,23 @@ paths:
         "400":
           description: Invalid gold set, k or min_recall
           content:
-            application/json:
-              schema: { $ref: "#/components/schemas/ReasonedError" }
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
         "403":
           description: Requires `SEARCH_GENERATION_CREATE` at platform scope
           content:
-            application/json:
-              schema: { $ref: "#/components/schemas/ReasonedError" }
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
         "409":
           description: The generation is FAILED/RETIRED, or its contract is not semantic
           content:
-            application/json:
-              schema: { $ref: "#/components/schemas/ReasonedError" }
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
         "503":
           description: ESR-019 — the pinned model could not embed the evaluation queries
           content:
-            application/json:
-              schema: { $ref: "#/components/schemas/ReasonedError" }
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
     get:
       tags: [Lifecycle]
       summary: The generation's latest retrieval evaluation
@@ -758,8 +802,8 @@ paths:
         "404":
           description: Never evaluated
           content:
-            application/json:
-              schema: { $ref: "#/components/schemas/ReasonedError" }
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
 
   /v1/checkpoints:
     get:
@@ -819,6 +863,31 @@ components:
         verified identity envelope and strips any inbound copies.
 
   schemas:
+    Problem:
+      type: object
+      required: [type, title, status, code]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        code: { type: string }
+        request_id: { type: string }
+        correlation_id: { type: string }
+        retryable: { type: boolean }
+        retry_after: { type: integer }
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              pointer: { type: string }
+              code: { type: string }
+              detail: { type: string }
+        current_version: { type: integer, format: int64 }
+        decision_id: { type: string }
+
     ReasonedError:
       type: object
       description: Every refusal carries its §11.3 reason code and canonical meaning.
