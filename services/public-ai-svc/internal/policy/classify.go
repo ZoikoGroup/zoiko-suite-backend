@@ -75,7 +75,7 @@ var exceptionRules = map[string][]*regexp.Regexp{
 // phrases. tieOrder resolves equal scores (more specific / higher risk first).
 var intentRules = map[string]*regexp.Regexp{
 	"I01": pattern("what is zoikosuite", "what does zoikosuite do", "tell me about zoikosuite", "about zoikosuite", "overview", "hello", "hi", "hey", "good morning", "who are you"),
-	"I02": pattern("feature*", "capabilit*", "module*", "can zoikosuite", "does zoikosuite", "accounts payable", "accounts receivable", "general ledger", "treasury", "procurement", "cash management", "what can you do"),
+	"I02": pattern("feature*", "capabilit*", "module*", "accounts payable", "accounts receivable", "general ledger", "treasury", "procurement", "cash management", "what can you do"),
 	"I03": pattern("multi-entity", "multi entity", "multiple entities", "entities", "subsidiar*", "consolidat*", "intercompany", "group companies"),
 	"I04": pattern("which countries", "what countries", "available in", "jurisdiction*", "countries", "country", "markets do you", "do you support the uk", "do you operate in"),
 	"I05": pattern("price*", "pricing", "cost*", "how much", "per user", "per month", "per year", "plans", "plan cost", "fees", "quote", "expensive", "cheap*"),

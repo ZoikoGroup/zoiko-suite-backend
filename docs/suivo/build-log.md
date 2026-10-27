@@ -141,3 +141,19 @@ Each entry records what a build step changed and the verified result of
 - Live smoke test: server in dev mode answered 4 sample questions correctly over HTTP; server log
   contained 0 occurrences of visitor text or grants.
 - Result: build ok, vet ok, all tests pass (incl. Postgres), gofmt clean.
+
+## STEP 12 — Evaluation harness
+
+- Files: `internal/eval` (dataset loader, deterministic grader, report), `cmd/evalrun`,
+  `testdata/golden/golden-v1.json` (25 TEST-ONLY cases, partitions A canonical, B clarification,
+  C abstention/refusal, D adversarial; each with priority and requirement refs),
+  `docs/suivo/test-traceability.md`, service `README.md`.
+- Grader checks outcome, intent, required/forbidden text, required/forbidden claim citations,
+  official-route-only actions, citation counts, and the universal ANSWERED-needs-provenance rule.
+  Any P0 failure → BLOCK_RELEASE and exit code 1. A test proves the grader catches a fabricated
+  certification. `eval.TestGoldenSet` runs the set in CI.
+- Found by the eval: generic phrases ("can zoikosuite") outweighed the integration intent so a
+  verified integration claim was not cited; removed them from intent scoring.
+- Result: golden-dev-v1 25/25 passed, 0 P0 failures. build ok, vet ok, all tests pass, gofmt clean.
+- Not covered (needs people, the widget or staging): holdout partition E, drift sentinel F, semantic
+  and human grading lanes, WCAG, load/latency.
