@@ -106,6 +106,16 @@ type UnpostedEventsQuery struct {
 	AfterRecordID string
 }
 
+// ClearingBalanceAgingQuery scopes one page of the clearing-balance-aging
+// population: the portion of each clearing account's open balance that is older
+// than AgedBefore (a YYYY-MM-DD date; postings dated on or after it are recent).
+type ClearingBalanceAgingQuery struct {
+	LegalEntityID string
+	AgedBefore    string
+	Limit         int
+	AfterRecordID string
+}
+
 // EventJournalBreaksQuery scopes one page of the event-journal-breaks
 // population: accounting-event/journal linkage breaks strictly before
 // CreatedBefore.

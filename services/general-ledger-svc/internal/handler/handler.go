@@ -104,6 +104,7 @@ type Store interface {
 	QueryUnpostedEvents(ctx context.Context, tenantID string, q domain.UnpostedEventsQuery) (*domain.ControlPopulationPage, error)
 	QueryManualJournals(ctx context.Context, tenantID string, q domain.FiscalPeriodPopulationQuery) (*domain.ControlPopulationPage, error)
 	QueryEventJournalBreaks(ctx context.Context, tenantID string, q domain.EventJournalBreaksQuery) (*domain.ControlPopulationPage, error)
+	QueryClearingBalanceAging(ctx context.Context, tenantID string, q domain.ClearingBalanceAgingQuery) (*domain.ControlPopulationPage, error)
 }
 
 // Publisher is the event-publishing contract the handler depends on.

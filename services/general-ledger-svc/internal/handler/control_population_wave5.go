@@ -113,6 +113,40 @@ func (h *Handler) getUnpostedEvents(w http.ResponseWriter, r *http.Request, prin
 	h.writeControlPopulationPage(w, page, err)
 }
 
+const populationClearingBalanceAging = "clearing-balance-aging"
+
+var clearingBalanceAgingParams = map[string]bool{
+	"legal_entity_id": true,
+	"aged_before":     true,
+	"limit":           true,
+	"cursor":          true,
+}
+
+func (h *Handler) getClearingBalanceAging(w http.ResponseWriter, r *http.Request, principalID, tenantID string) {
+	q := r.URL.Query()
+	entity, limit, after, ok := parseCommonPopulationParams(w, q, clearingBalanceAgingParams)
+	if !ok {
+		return
+	}
+	// A date only: the cut-off is a business date compared with transaction_date, not an instant.
+	raw := q.Get("aged_before")
+	if _, err := time.Parse("2006-01-02", raw); err != nil || len(raw) != len("2006-01-02") {
+		writeError(w, http.StatusBadRequest, "invalid_field", "aged_before is required (YYYY-MM-DD)")
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, entity, actionControlPopulationRead); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	page, err := h.store.QueryClearingBalanceAging(r.Context(), tenantID, domain.ClearingBalanceAgingQuery{
+		LegalEntityID: entity,
+		AgedBefore:    raw,
+		Limit:         limit,
+		AfterRecordID: after,
+	})
+	h.writeControlPopulationPage(w, page, err)
+}
+
 const populationEventJournalBreaks = "event-journal-breaks"
 
 func (h *Handler) getEventJournalBreaks(w http.ResponseWriter, r *http.Request, principalID, tenantID string) {

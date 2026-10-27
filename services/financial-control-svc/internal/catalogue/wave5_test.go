@@ -13,9 +13,9 @@ import (
 func TestWave5_SingleSidedLedgerControls(t *testing.T) {
 	defs, err := Wave5("2026-09-01")
 	require.NoError(t, err)
-	require.Len(t, defs, 5)
+	require.Len(t, defs, 6)
 	want := map[string]string{"FIN-CTRL-019": domain.KindExceptionScan, "FIN-CTRL-020": domain.KindArithmetic, "FIN-CTRL-021": domain.KindExceptionScan,
-		"FIN-CTRL-022": domain.KindExceptionScan, "FIN-CTRL-023": domain.KindExceptionScan}
+		"FIN-CTRL-022": domain.KindExceptionScan, "FIN-CTRL-023": domain.KindExceptionScan, "FIN-CTRL-031": domain.KindExceptionScan}
 	for _, d := range defs {
 		l, err := domain.ParseRuleLogic(d.InitialLogic)
 		require.NoError(t, err, d.ControlCode)
@@ -36,6 +36,8 @@ func TestWave5_ScopeBoundParams(t *testing.T) {
 		switch d.ControlCode {
 		case "FIN-CTRL-019", "FIN-CTRL-022":
 			assert.Equal(t, "${scope.created_before}", s.Params["created_before"])
+		case "FIN-CTRL-031":
+			assert.Equal(t, "${scope.aged_before}", s.Params["aged_before"])
 		default:
 			assert.Equal(t, "${scope.fiscal_period}", s.Params["fiscal_period"], d.ControlCode)
 		}

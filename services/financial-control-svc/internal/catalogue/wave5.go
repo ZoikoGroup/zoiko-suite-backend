@@ -16,9 +16,10 @@ import (
 //
 //	020/021/023  scope {"fiscal_period": "<ledger fiscal period text>"}
 //	022          scope {"created_before": "<RFC3339 or YYYY-MM-DD cut-off>"}
+//	031          scope {"aged_before": "<YYYY-MM-DD cut-off>"}
 //
-// 019 (event to journal), 024 (closed-period block) and 031 (suspense aging) stay
-// BLOCKED — see Status(). 041/042 are computed by the control service itself.
+// 024 (closed-period block) stays BLOCKED — see Status(). 041/042 are computed by
+// the control service itself.
 func Wave5(effectiveFrom string) ([]domain.CreateControlDefinitionRequest, error) {
 	if effectiveFrom == "" {
 		return nil, fmt.Errorf("%w: catalogue needs effective_from", domain.ErrInvalidArgument)
@@ -64,6 +65,15 @@ func Wave5(effectiveFrom string) ([]domain.CreateControlDefinitionRequest, error
 			SourceSpec: glPop("unposted-events", map[string]string{"created_before": "${scope.created_before}"}),
 			InitialLogic: j(map[string]any{"kind": "EXCEPTION_SCAN", "finding_category": "LATE_DATA",
 				"finding_reason": "UNPOSTED_ACCOUNTING_EVENT", "finding_assertion": "COMPLETENESS"}),
+		},
+		{
+			// The aging limit is a controlled decision (§34); the run scope carries the cut-off.
+			ControlCode: "FIN-CTRL-031", Name: "Suspense account aging", Domain: "Accounting",
+			ControlType: "MONITORING", Assertions: []string{"ACCURACY", "CLASSIFICATION"}, RiskTier: "STANDARD",
+			Frequency: "DAILY", OwnerRole: "GL_OWNER", ReviewerRole: "SENIOR_ACCOUNTANT",
+			SourceSpec: glPop("clearing-balance-aging", map[string]string{"aged_before": "${scope.aged_before}"}),
+			InitialLogic: j(map[string]any{"kind": "EXCEPTION_SCAN", "finding_category": "CLASSIFICATION",
+				"finding_reason": "CLEARING_BALANCE_AGED", "finding_assertion": "CLASSIFICATION"}),
 		},
 		{
 			ControlCode: "FIN-CTRL-023", Name: "Manual journal independent review", Domain: "Accounting / Close",

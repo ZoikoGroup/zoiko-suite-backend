@@ -327,8 +327,8 @@ func TestCatalogueStatus(t *testing.T) {
 	}
 	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &got))
 	assert.Equal(t, 49, len(got.Controls))
-	assert.Equal(t, 21, got.Summary["BLOCKED"])
-	assert.Equal(t, 13, got.Summary["PARTIAL"])
+	assert.Equal(t, 20, got.Summary["BLOCKED"])
+	assert.Equal(t, 14, got.Summary["PARTIAL"])
 	for _, c := range got.Controls {
 		if c.Code == "FIN-CTRL-007" {
 			assert.Equal(t, "BLOCKED", c.State)

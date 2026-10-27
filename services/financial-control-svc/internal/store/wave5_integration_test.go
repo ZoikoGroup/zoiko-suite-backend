@@ -113,6 +113,28 @@ func TestWave5_UnpostedEvents_ScopeBindsTheCutoff(t *testing.T) {
 	assert.Equal(t, domain.ResultIndeterminate, final.ResultState)
 }
 
+func TestWave5_ClearingBalanceAging_EveryAgedBalanceIsAFindingAndTheCutOffIsPerRun(t *testing.T) {
+	w := newWave5(t)
+	sc := func(r *domain.CreateRunRequest) { r.Scope = json.RawMessage(`{"aged_before":"2026-09-01"}`) }
+
+	w.src.set(catalogue.SysGL, "clearing-balance-aging", "wm")
+	_, final := w.run("FIN-CTRL-031", sc)
+	assert.Equal(t, domain.ResultPass, final.ResultState, "no aged clearing balance: pass")
+
+	w.src.set(catalogue.SysGL, "clearing-balance-aging", "wm2", r("CLR-1:USD:", "CLR-1", "70.00"))
+	run, final := w.run("FIN-CTRL-031", sc)
+	assert.Equal(t, domain.ResultFail, final.ResultState)
+	ex, err := testStore.ListExceptions(ctx, w.tenant, run.RunID, store.ListExceptionsFilter{})
+	require.NoError(t, err)
+	require.Len(t, ex, 1)
+	assert.Equal(t, "CLASSIFICATION", ex[0].Category)
+	assert.Equal(t, "CLEARING_BALANCE_AGED", ex[0].ReasonCode)
+	assert.Equal(t, "2026-09-01", w.src.lastQuery(catalogue.SysGL).Get("aged_before"))
+
+	_, final = w.run("FIN-CTRL-031", nil)
+	assert.Equal(t, domain.ResultIndeterminate, final.ResultState, "no cut-off: fails closed, never passes")
+}
+
 // ── certification (maker-checker) ────────────────────────────────────────────
 
 func TestWave5_Certify_MakerCannotCertifyCheckerCan(t *testing.T) {
