@@ -79,3 +79,30 @@ Each entry records what a build step changed and the verified result of
   exception precedence (incl. injection + private data, sensitive + injection), negative cases for
   ordinary product questions, 13 intent samples, slot extraction, template rendering.
 - Result: build ok, vet ok, all tests pass, gofmt clean.
+
+## STEPs 6–7 — Knowledge pipeline, kbctl and claim resolver
+
+- Files: `internal/signing` (Ed25519, release files), `internal/knowledge` (registry/chunk types, ingestion
+  state machine, BM25 index with mandatory filters), `internal/claims` (P1 resolver), `internal/release`
+  (verified runtime with pinned snapshots, revocation ledger, publish/promote/revoke, public config),
+  `internal/events` (the six CloudEvents), `internal/flags` (flags + kill switch, fail closed),
+  `cmd/kbctl`, `testdata/fixtures` (TEST-ONLY: currency XTS, plans TEST_STARTER/TEST_GROWTH,
+  URLs https://example.invalid/…).
+- Ingestion (Doc 03 §09): REGISTER (every field mandatory) → ACQUIRE (https + allowlisted host) →
+  classification/audience/PII → sensitive scan → taxonomy map → review (approved, no self-approval,
+  P1 needs two approvers) → hidden-content/injection scan → dedup + content hash → chunk → STAGED.
+  Fixture outcomes verified: poisoned → QUARANTINE_INDEX, internal → QUARANTINE_PRIVATE,
+  draft → HOLD_APPROVAL, off-allowlist → QUARANTINE_FETCH; `javascript:` route rejected.
+- Retrieval filter order: release → classification → audience → revoked → effective window → market →
+  locale → BM25 → answerability (ANSWERABLE / NOT_FOUND / STALE / REVOKED).
+- Claims (Doc 05 §17): VERIFIED only for ACTIVE, publishable, enabled, in-window, unrevoked claims with
+  approved wording and provenance; CONTRADICTED on disagreeing active values (no majority vote);
+  EXPIRED/REVOKED blocked; market-scoped subjects without a market → MARKET_REQUIRED (clarify);
+  SOC 2 readiness (HOLD) is never stated as certification; ACTIVE claims need two approvals.
+- Runtime: releases verified on load (invalid signature → not ready, no snapshot); revocations are
+  copy-on-write and apply across rollback; commit-time check reads the ledger directly.
+- Routes: `signup_or_trial` offered only where a TRIAL claim is VERIFIED for the market.
+- kbctl exercised against Postgres: build/sign/publish/promote/revoke/flag; outbox received
+  kb.release.promoted.v1 ×2, kb.source.revoked.v1, publicai.kill_switch.changed.v1;
+  `stream_enabled=true` refused.
+- Result: build ok, vet ok, all tests pass, gofmt clean.

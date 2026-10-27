@@ -108,7 +108,15 @@ components:
         capabilities: {$ref: "#/components/schemas/Capabilities"}
         supported_locales: {type: array, items: {type: string}}
         market_choices: {type: array, items: {type: string}}
-        public_routes: {type: array, items: {type: string}}
+        public_routes:
+          type: array
+          description: Official destinations from the signed route registry. Actions reference route_key only.
+          items:
+            type: object
+            required: [route_key, url]
+            properties:
+              route_key: {type: string}
+              url: {type: string, format: uri}
         privacy_notice_key: {type: string}
     Problem:
       type: object

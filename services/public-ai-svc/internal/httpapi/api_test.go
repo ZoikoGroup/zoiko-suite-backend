@@ -22,7 +22,7 @@ type staticConfig struct{}
 func (staticConfig) PublicConfig() contract.ConfigResponse {
 	return contract.ConfigResponse{
 		AssistantDisplayName: "ZoikoSuite assistant", Capabilities: capabilities(),
-		SupportedLocales: []string{"en-US"}, MarketChoices: []string{}, PublicRoutes: []string{"pricing"},
+		SupportedLocales: []string{"en-US"}, MarketChoices: []string{}, PublicRoutes: []contract.PublicRoute{{RouteKey: "pricing", URL: "https://example.invalid/pricing"}},
 		PrivacyNoticeKey: "privacy",
 	}
 }

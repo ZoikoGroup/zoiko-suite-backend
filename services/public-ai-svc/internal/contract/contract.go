@@ -116,13 +116,13 @@ type Envelope struct {
 
 // ConfigResponse is the body of GET /config (Doc 05 §15).
 type ConfigResponse struct {
-	ConfigRevision       string       `json:"config_revision"`
-	AssistantDisplayName string       `json:"assistant_display_name"`
-	Capabilities         Capabilities `json:"capabilities"`
-	SupportedLocales     []string     `json:"supported_locales"`
-	MarketChoices        []string     `json:"market_choices"`
-	PublicRoutes         []string     `json:"public_routes"`
-	PrivacyNoticeKey     string       `json:"privacy_notice_key"`
+	ConfigRevision       string        `json:"config_revision"`
+	AssistantDisplayName string        `json:"assistant_display_name"`
+	Capabilities         Capabilities  `json:"capabilities"`
+	SupportedLocales     []string      `json:"supported_locales"`
+	MarketChoices        []string      `json:"market_choices"`
+	PublicRoutes         []PublicRoute `json:"public_routes"`
+	PrivacyNoticeKey     string        `json:"privacy_notice_key"`
 }
 
 // FieldError is a 422 validation failure (safe to show publicly).
@@ -229,4 +229,11 @@ func (e *Envelope) Validate() error {
 		return errors.New("ANSWERED requires provenance")
 	}
 	return nil
+}
+
+// PublicRoute is an official destination the widget may open. URLs come only
+// from the signed route registry, never from model output (Doc 05 §15).
+type PublicRoute struct {
+	RouteKey string `json:"route_key"`
+	URL      string `json:"url"`
 }

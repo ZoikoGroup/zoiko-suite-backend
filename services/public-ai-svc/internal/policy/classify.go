@@ -125,6 +125,17 @@ type Decision struct {
 	Redaction Redaction
 }
 
+// LooksLikeInjection reports whether text contains instruction-injection
+// patterns. Ingestion uses it to quarantine poisoned knowledge (Doc 03 §09).
+func LooksLikeInjection(text string) bool {
+	for _, re := range exceptionRules[X06PromptInjection] {
+		if re.MatchString(text) {
+			return true
+		}
+	}
+	return false
+}
+
 // Classify applies sensitive-input interception, exception rules and intent
 // rules. It is pure and deterministic.
 func Classify(msg string) Decision {
