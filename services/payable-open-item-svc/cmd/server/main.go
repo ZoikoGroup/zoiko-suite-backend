@@ -21,6 +21,7 @@ import (
 	"zoiko.io/payable-open-item-svc/internal/handler"
 	"zoiko.io/payable-open-item-svc/internal/health"
 	"zoiko.io/payable-open-item-svc/internal/middleware"
+	"zoiko.io/payable-open-item-svc/internal/paymentstatus"
 	"zoiko.io/payable-open-item-svc/internal/store"
 )
 
@@ -61,7 +62,9 @@ func main() {
 	publisher := events.NewKafkaPublisher(brokers, cfg.KafkaEventsTopic, logger)
 	authzClient := authz.NewClient(cfg.AuthzServiceURL)
 
-	h := handler.New(pgStore, publisher, authzClient, logger)
+	bankStatus := paymentstatus.NewHTTPClient(cfg.PaymentStatusServiceURL, logger)
+
+	h := handler.New(pgStore, publisher, authzClient, bankStatus, logger)
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)

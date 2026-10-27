@@ -14,6 +14,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
@@ -30,9 +31,12 @@ import (
 	"github.com/riandyrn/otelchi"
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
+	idenv "zoiko.io/identity-envelope"
 
+	"zoiko.io/jurisdiction-rules-svc/internal/approval"
 	"zoiko.io/jurisdiction-rules-svc/internal/authz"
 	"zoiko.io/jurisdiction-rules-svc/internal/config"
+	"zoiko.io/jurisdiction-rules-svc/internal/consumer"
 	"zoiko.io/jurisdiction-rules-svc/internal/domain"
 	svcenvelope "zoiko.io/jurisdiction-rules-svc/internal/envelope"
 	"zoiko.io/jurisdiction-rules-svc/internal/events"
@@ -125,22 +129,44 @@ func main() {
 		log.Info("mTLS enabled for authorization-svc calls", zap.String("authz_mtls_url", cfg.AuthzMTLSURL))
 		authzClient = authz.NewHTTPAuthZClientWithHTTPClient(cfg.AuthzMTLSURL, mtlsHTTPClient, log)
 	} else {
-		authzClient, err = authz.NewClient(cfg.Env, cfg.AuthZServiceURL, log)
+		authzClient, err = authz.NewClient(cfg.Env, cfg.AuthZServiceURL, cfg.AuthZAllowStub, log)
 		if err != nil {
 			log.Fatal("authz client construction failed", zap.Error(err))
 		}
 	}
 
-	publisher, closeProducer := newPublisher(cfg, log)
+	publisher, writer, closeProducer := newPublisher(cfg, log, pgStore)
 	defer closeProducer()
+
+	// Start outbox worker for reliable event publishing
+	var outboxWorker *events.OutboxWorker
+	if writer != nil {
+		outboxWorker = events.NewOutboxWorker(log, pgStore, writer, cfg.Kafka.Topic, metrics)
+		outboxWorker.Start()
+		defer outboxWorker.Stop()
+	}
+
+	// Identity gate (Governance audit J-01, X5). X-Principal-Id was trusted as
+	// sent and port 8082 is published, so anyone who could reach it could act
+	// as any principal. The gate verifies identity-context-svc's signed
+	// envelope (JWKS) and that its session is still live (AU-01), and makes the
+	// verified claims the only source of the identity headers.
+	// IDENTITY_VERIFY: require (default outside local) | warn.
+	gate, gateSettings, err := idenv.NewGateFromEnv("jurisdiction-rules-svc", log, idenv.EnvOptions{})
+	if err != nil {
+		log.Fatal("identity gate configuration refused", zap.Error(err))
+	}
+	log.Info("identity gate", gateSettings.Fields()...)
 
 	// ── 6. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()
+	r.Use(idenv.RequestID)
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
 	r.Use(middleware.Recoverer)
 	r.Use(otelchi.Middleware("jurisdiction-rules-svc", otelchi.WithChiRoutes(r)))
 	r.Use(metrics.HTTPMiddleware)
+	r.Use(gate.Middleware)
 	r.Use(correlationIDMiddleware)
 	r.Use(middleware.Logger)
 
@@ -150,6 +176,10 @@ func main() {
 	// actor, correlation and — on material writes — an idempotency key.
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
+
+	// Idempotency-Key replay on admin writes (runs after the envelope, which
+	// guarantees the key is present).
+	r.Use(handler.IdempotencyMiddleware(pgStore, log))
 
 	h := handler.New(pgStore, authzClient, publisher, cfg.AuthZPlatformScopeID, log)
 	var registryPub events.RegistryPublisher
@@ -199,7 +229,50 @@ func main() {
 	} else {
 		log.Warn("pack signing disabled: PACK_SIGNING_KEY_REF/PACK_SIGNING_KEY_FILE are not set; the sign command will answer 503")
 	}
+	h.WithEntityApplicability(pgStore)
+
+	// J-02: activation confirms its X-Approval-Reference with workflow-svc.
+	switch {
+	case cfg.WorkflowServiceURL != "":
+		h.WithApprovalVerifier(approval.New(cfg.WorkflowServiceURL))
+	case cfg.Env != "local" && cfg.Env != "dev":
+		log.Fatal("WORKFLOW_SERVICE_URL is required outside local/dev: a rule activation must cite an approval workflow-svc confirms")
+	default:
+		log.Warn("WORKFLOW_SERVICE_URL unset — activation approval references are recorded, not confirmed (local/dev only)")
+	}
 	handler.RegisterRoutes(r, h)
+
+	// Entity consumer (Doc 03 §8.2 consumed events): projects entity.created and
+	// entity.jurisdiction.changed from tenant-entity-registry-svc.
+	consumerCtx, stopConsumers := context.WithCancel(context.Background())
+	defer stopConsumers()
+	if len(cfg.Kafka.Brokers) == 0 || cfg.Kafka.EntityTopic == "" {
+		log.Warn("entity consumer disabled (no KAFKA_BROKERS or KAFKA_ENTITY_TOPIC): entity jurisdiction mappings will not be projected")
+	} else {
+		entityReader := kafka.NewReader(kafka.ReaderConfig{
+			Brokers:  cfg.Kafka.Brokers,
+			GroupID:  cfg.Kafka.GroupID,
+			Topic:    cfg.Kafka.EntityTopic,
+			MinBytes: 1,
+			MaxBytes: 10e6,
+			MaxWait:  500 * time.Millisecond,
+			// A new group starts at the earliest retained offset, so entities
+			// created before this consumer existed are projected — as far back
+			// as the topic's retention.
+			StartOffset: kafka.FirstOffset,
+			// kafka-go discards group errors without an ErrorLogger, and a
+			// member assigned zero partitions on a bad first join never
+			// re-checks without the partition watch: a dead consumer that
+			// looks idle (authorization-svc measured both).
+			ErrorLogger: kafka.LoggerFunc(func(msg string, args ...any) {
+				log.Error("kafka consumer error", zap.String("topic", cfg.Kafka.EntityTopic), zap.String("detail", fmt.Sprintf(msg, args...)))
+			}),
+			WatchPartitionChanges:  true,
+			PartitionWatchInterval: 30 * time.Second,
+		})
+		go consumer.NewEntityConsumer(log, pgStore).WithMetrics(metrics).Run(consumerCtx, entityReader)
+		log.Info("entity consumer wired", zap.String("topic", cfg.Kafka.EntityTopic), zap.String("group_id", cfg.Kafka.GroupID))
+	}
 
 	// ── 7. Health probes + metrics ────────────────────────────────────────────
 	healthH := health.New(pool, log)
@@ -259,13 +332,13 @@ func main() {
 // refused outside local development, because a production deployment
 // silently publishing nothing is exactly the failure the events exist to
 // prevent.
-func newPublisher(cfg *config.Config, log *zap.Logger) (events.Publisher, func()) {
+func newPublisher(cfg *config.Config, log *zap.Logger, pgStore *store.PgStore) (events.Publisher, *kafka.Writer, func()) {
 	if len(cfg.Kafka.Brokers) == 0 {
 		if strings.EqualFold(cfg.Env, "production") || strings.EqualFold(cfg.Env, "staging") {
 			log.Fatal("KAFKA_BROKERS must be set in " + cfg.Env + " environment")
 		}
 		log.Warn("no Kafka brokers configured — domain events will be dropped")
-		return events.NewNoopPublisher(log), func() {}
+		return events.NewNoopPublisher(log), nil, func() {}
 	}
 
 	writer := &kafka.Writer{
@@ -293,16 +366,17 @@ func newPublisher(cfg *config.Config, log *zap.Logger) (events.Publisher, func()
 		// only the artificial wait goes away.
 		BatchTimeout: 10 * time.Millisecond,
 	}
-	return events.NewPublisher(log, cfg.Kafka.Topic, writer), func() { _ = writer.Close() }
+	return events.NewOutboxPublisher(log, pgStore, cfg.Kafka.Topic), writer, func() { _ = writer.Close() }
 }
 
 // correlationIDMiddleware propagates X-Correlation-ID through every request.
 func correlationIDMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("X-Correlation-ID") == "" {
-			r.Header.Set("X-Correlation-ID", middleware.GetReqID(r.Context()))
+		// Echoed, never invented: a correlation id made up here, before the
+		// input contract can refuse a request without one, traces nothing.
+		if id := r.Header.Get("X-Correlation-ID"); id != "" {
+			w.Header().Set("X-Correlation-ID", id)
 		}
-		w.Header().Set("X-Correlation-ID", r.Header.Get("X-Correlation-ID"))
 		next.ServeHTTP(w, r)
 	})
 }

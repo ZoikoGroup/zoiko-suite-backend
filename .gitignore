@@ -21,6 +21,10 @@ services/*/secret_store.local
 # binaries left in a service's own root directory)
 services/*/server
 services/*/healthcheck
+# ...and their Windows names. Six of these (23–38 MB each) were committed on
+# 15 Oct 2026 and removed from the index on 19 Oct (Group 1 re-audit F-8):
+# a binary in the tree is one nobody can trace to a source revision.
+services/*/*.exe
 
 # same, for the Supabase bootstrap tool. `go build ./...` inside its directory
 # drops a ~13 MB binary named after the module, which is a build artifact and
@@ -39,6 +43,7 @@ deployments/supabase/supabase-bootstrap.exe
 # -o into .servicectl/ above.
 tools/servicectl/servicectl
 tools/servicectl/servicectl.exe
+tools/period-backfill/period-backfill.exe
 # New company-provided spec docs, landed 2026-08-27 as .docx alongside the
 # original zoiko_suite_doc1-7 (kept tracked, above). Left untracked for now
 # by explicit request — large (tens of MB total), not yet reviewed for
@@ -50,3 +55,8 @@ docs/original_doc/*.docx
 # Control intermittently blocks a freshly linked test binary there — a scan
 # race, not a test failure.
 .gotmp/
+scratch/
+
+# Suivo public-ai stack: local secrets and signed release files
+deployments/.env.public-ai
+deployments/public-ai-releases/

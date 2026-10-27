@@ -40,7 +40,7 @@ func openAdminPool(t *testing.T) *pgxpool.Pool {
 	}
 	t.Cleanup(pool.Close)
 
-	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS ingestion_logs, api_bridges CASCADE;`)
+	resetGovernanceObjects(ctx, pool)
 
 	// Every migration in filename order, never one hardcoded name — a
 	// suite that names migrations individually silently skips new ones,
@@ -125,7 +125,15 @@ func TestRLS_EnabledAndForced(t *testing.T) {
 	ctx := context.Background()
 	admin := openAdminPool(t)
 
-	for _, table := range []string{"api_bridges", "ingestion_logs"} {
+	for _, table := range []string{"api_bridges", "ingestion_logs", "connector_changes", "connector_approvals", "connector_health",
+		"connector_health_transitions", "sync_checkpoints", "checkpoint_reset_requests", "external_profiles", "eventing_outbox", "eventing_repair_log",
+		"xic_connectors", "xic_contract_versions", "xic_mapping_versions", "xic_contract_gates", "xic_validation_runs", "xic_contract_transitions", "xic_idempotency",
+		"xic_connections", "xic_credential_bindings", "xic_connection_events", "xic_connection_checks", "xic_certifications", "xic_authorization_sessions", "xic_connection_requests", "xic_conn_idempotency",
+		"xic_handoff_targets", "xic_inbound_exchanges", "xic_inbound_events", "xic_quarantine_requests",
+		"xic_outbound_attempts", "xic_outbound_events", "xic_callback_receipts",
+		"xic_batches", "xic_batch_files", "xic_batch_rows", "xic_batch_events", "xic_replay_jobs", "xic_replay_items",
+		"xic_reconciliation_runs", "xic_reconciliation_variances", "xic_reconciliation_events",
+		"xic_rollout_requests", "xic_rollouts", "xic_rollout_usage", "xic_rollout_events", "xic_legacy_connectors", "xic_legacy_exchanges", "xic_legacy_parity_runs"} {
 		var enabled, forced bool
 		if err := admin.QueryRow(ctx,
 			`SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname = $1`, table,
@@ -133,10 +141,10 @@ func TestRLS_EnabledAndForced(t *testing.T) {
 			t.Fatalf("read pg_class for %s: %v", table, err)
 		}
 		if !enabled {
-			t.Errorf("%s: migration 002 must ENABLE row level security", table)
+			t.Errorf("%s: row level security must be ENABLED", table)
 		}
 		if !forced {
-			t.Errorf("%s: migration 002 must FORCE row level security", table)
+			t.Errorf("%s: row level security must be FORCED", table)
 		}
 	}
 }
@@ -155,6 +163,7 @@ func TestRLS_PgStore_TenantIsolation(t *testing.T) {
 	bridge := &domain.ApiBridge{
 		LegalEntityID: "le-a", BridgeName: "Test Bridge", Protocol: "REST",
 		EndpointURL: "https://erp.example.internal/api", AuthType: "OAUTH2", Status: "ACTIVE",
+		LegacyUnapproved: true, // a pre-governance row: the only way to hold ACTIVE without an approval
 	}
 	if err := s.CreateBridge(ctxA, bridge); err != nil {
 		t.Fatalf("create tenant A's bridge: %v", err)
@@ -207,8 +216,27 @@ func TestRLS_WithCheckRefusesForeignTenantWrite(t *testing.T) {
 	_, err = conn.Exec(ctx, `
 		INSERT INTO api_bridges
 			(bridge_id, tenant_id, legal_entity_id, bridge_name, protocol, endpoint_url, auth_type, status)
-		VALUES ('forged-1', 'tenant-a', 'le-a', 'Forged', 'REST', 'https://attacker.example/api', 'NONE', 'ACTIVE')`)
+		VALUES ('forged-1', 'tenant-a', 'le-a', 'Forged', 'REST', 'https://attacker.example/api', 'NONE', 'DRAFT')`)
 	if err == nil {
 		t.Fatal("WITH CHECK must refuse an insert attributed to another tenant")
 	}
+}
+
+// resetGovernanceObjects drops everything the migrations create, so the suite
+// can re-apply them from scratch against the same database. Order does not
+// matter: CASCADE removes the dependent foreign keys and triggers.
+func resetGovernanceObjects(ctx context.Context, pool *pgxpool.Pool) {
+	_, _ = pool.Exec(ctx, `
+		DROP TABLE IF EXISTS xic_legacy_parity_runs, xic_legacy_exchanges, xic_legacy_connectors, xic_rollout_events, xic_rollout_usage, xic_rollouts, xic_rollout_requests, xic_reconciliation_events, xic_reconciliation_variances, xic_reconciliation_runs, xic_replay_items, xic_replay_jobs, xic_batch_events, xic_batch_rows, xic_batch_files, xic_batches, checkpoint_reset_requests, sync_checkpoints, connector_health_transitions, connector_health,
+			connector_approvals, connector_changes, external_profiles, eventing_outbox, eventing_repair_log,
+			ingestion_logs, api_bridges, xic_idempotency, xic_contract_transitions, xic_validation_runs, xic_contract_gates,
+			xic_mapping_versions, xic_contract_versions, xic_connectors,
+			xic_conn_idempotency, xic_connection_requests, xic_authorization_sessions, xic_certifications,
+			xic_callback_receipts, xic_outbound_events, xic_outbound_attempts,
+			xic_quarantine_requests, xic_inbound_events, xic_inbound_exchanges, xic_handoff_targets,
+			xic_connection_checks, xic_connection_events, xic_credential_bindings, xic_connections CASCADE;
+		DROP FUNCTION IF EXISTS connector_append_only(), sync_checkpoints_guard(), external_profiles_guard(),
+			eventing_outbox_payload_immutable(), eventing_repair_log_immutable(), xic_is_platform(), xic_append_only(),
+			xic_connectors_guard(), xic_cv_guard(), xic_mv_guard(), xic_gate_guard(), xic_conn_guard(), xic_conn_insert_guard(),
+			xic_bind_guard(), xic_session_guard(), xic_req_guard(), xic_target_guard(), xic_ix_guard(), xic_qr_guard(), xic_oa_guard(), xic_batch_guard(), xic_bf_guard(), xic_br_guard(), xic_rj_guard(), xic_ri_guard(), xic_rr_guard(), xic_rv_guard() CASCADE;`)
 }

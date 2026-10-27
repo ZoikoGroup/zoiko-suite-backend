@@ -1,0 +1,5 @@
+DROP TABLE IF EXISTS ar10_history;
+DROP TABLE IF EXISTS ar10_writeoffs;
+DROP FUNCTION IF EXISTS ar10_guard_writeoff();
+DROP TABLE IF EXISTS ar10_refunds;
+DROP FUNCTION IF EXISTS ar10_guard_refund();

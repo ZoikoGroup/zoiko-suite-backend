@@ -63,7 +63,7 @@ func newStubStore() *stubStore {
 	return &stubStore{invoices: map[string]*domain.VendorInvoice{}, byCorrelation: map[string]string{}}
 }
 
-func (s *stubStore) CreateInvoice(_ context.Context, inv *domain.VendorInvoice) (bool, error) {
+func (s *stubStore) CreateInvoice(_ context.Context, inv *domain.VendorInvoice, _ *domain.Mutation) (bool, error) {
 	if s.createErr != nil {
 		return false, s.createErr
 	}
@@ -110,6 +110,16 @@ func (s *stubStore) TransitionInvoice(_ context.Context, _, invoiceID string, fr
 		return domain.ErrInvalidTransition
 	}
 	inv.Status = to
+	return nil
+}
+
+// SetApprovalJournalID stores the GL journal ID on the invoice (test stub).
+func (s *stubStore) SetApprovalJournalID(_ context.Context, _, invoiceID, journalID string) error {
+	inv, ok := s.invoices[invoiceID]
+	if !ok {
+		return nil
+	}
+	inv.ApprovalJournalID = &journalID
 	return nil
 }
 

@@ -16,15 +16,6 @@ const (
 	actionAuditPlanRead    = "AUDIT_PLAN_READ"
 )
 
-func (h *Handler) requireCorrelationID(w http.ResponseWriter, r *http.Request) (string, bool) {
-	correlationID := r.Header.Get("X-Correlation-ID")
-	if correlationID == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_correlation_id"})
-		return "", false
-	}
-	return correlationID, true
-}
-
 // CreateAuditPlan creates AUD-02's own AuditPlan container for an
 // engagement that must already exist.
 func (h *Handler) CreateAuditPlan(w http.ResponseWriter, r *http.Request) {
@@ -45,7 +36,7 @@ func (h *Handler) CreateAuditPlan(w http.ResponseWriter, r *http.Request) {
 		h.writeAuditEngagementErr(w, err)
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionAuditPlanManage); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionAuditPlanManage, ""); err != nil {
 		h.writeAuditEngagementAuthzErr(w, err)
 		return
 	}
@@ -82,7 +73,7 @@ func (h *Handler) GetAuditPlan(w http.ResponseWriter, r *http.Request) {
 		h.writeAuditEngagementErr(w, err)
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionAuditPlanRead); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionAuditPlanRead, ""); err != nil {
 		h.writeAuditEngagementAuthzErr(w, err)
 		return
 	}
@@ -119,7 +110,7 @@ func (h *Handler) RecordMateriality(w http.ResponseWriter, r *http.Request) {
 		h.writeAuditEngagementErr(w, err)
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionAuditPlanManage); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionAuditPlanManage, ""); err != nil {
 		h.writeAuditEngagementAuthzErr(w, err)
 		return
 	}
@@ -173,7 +164,7 @@ func (h *Handler) IdentifyRisk(w http.ResponseWriter, r *http.Request) {
 		h.writeAuditEngagementErr(w, err)
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionAuditPlanManage); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionAuditPlanManage, ""); err != nil {
 		h.writeAuditEngagementAuthzErr(w, err)
 		return
 	}
@@ -227,7 +218,7 @@ func (h *Handler) ListRisks(w http.ResponseWriter, r *http.Request) {
 		h.writeAuditEngagementErr(w, err)
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionAuditPlanRead); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionAuditPlanRead, ""); err != nil {
 		h.writeAuditEngagementAuthzErr(w, err)
 		return
 	}
@@ -258,7 +249,7 @@ func (h *Handler) getRiskForManage(w http.ResponseWriter, r *http.Request, riskI
 		h.writeAuditEngagementErr(w, err)
 		return nil, false
 	}
-	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionAuditPlanManage); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionAuditPlanManage, ""); err != nil {
 		h.writeAuditEngagementAuthzErr(w, err)
 		return nil, false
 	}
@@ -393,7 +384,7 @@ func (h *Handler) ApprovePlan(w http.ResponseWriter, r *http.Request) {
 		h.writeAuditEngagementErr(w, err)
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionAuditPlanApprove); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionAuditPlanApprove, ""); err != nil {
 		h.writeAuditEngagementAuthzErr(w, err)
 		return
 	}

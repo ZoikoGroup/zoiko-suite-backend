@@ -27,7 +27,7 @@ func sentDirect(t *testing.T, s *store.PgStore, tenant, corr, msgID string) *dom
 }
 
 func TestEvidence_ADirectSendsCallbacksBecomeNormalizedFacts(t *testing.T) {
-	s := store.New(openTestPool(t))
+	s := store.New(openAdminTestPool(t))
 	n := sentDirect(t, s, "tenant-ev", "corr-ev-1", "<ev-1@example.com>")
 	proc := webhook.NewProcessor(s, zap.NewNop())
 
@@ -62,7 +62,7 @@ func TestEvidence_ADirectSendsCallbacksBecomeNormalizedFacts(t *testing.T) {
 }
 
 func TestEvidence_IsTenantIsolatedAndAppendOnly(t *testing.T) {
-	pool := openTestPool(t)
+	pool := openAdminTestPool(t)
 	s := store.New(pool)
 	n := sentDirect(t, s, "tenant-ev-a", "corr-ev-2", "<ev-2@example.com>")
 	proc := webhook.NewProcessor(s, zap.NewNop())
@@ -89,7 +89,7 @@ func TestEvidence_IsTenantIsolatedAndAppendOnly(t *testing.T) {
 }
 
 func TestEvidence_RefusesWhatItCannotAttach(t *testing.T) {
-	s := store.New(openTestPool(t))
+	s := store.New(openAdminTestPool(t))
 	base := domain.DeliveryEvidence{TenantID: "tenant-ev-c", AttemptID: uuid.NewString(), SourceEventID: "e", Provider: "generic",
 		Fact: domain.EvidenceBounced, Strength: domain.StrengthMailboxLevel, OccurredAt: time.Now().UTC()}
 
@@ -122,7 +122,7 @@ func TestEvidence_RefusesWhatItCannotAttach(t *testing.T) {
 }
 
 func TestMigration000024_DownThenUp(t *testing.T) {
-	pool := openTestPool(t)
+	pool := openAdminTestPool(t)
 	for _, f := range []string{"000024_delivery_evidence.down.sql", "000024_delivery_evidence.up.sql"} {
 		b, err := os.ReadFile("../../deployments/migrations/" + f)
 		require.NoError(t, err)

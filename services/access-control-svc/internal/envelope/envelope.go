@@ -244,3 +244,91 @@ func MustFromContext(ctx context.Context) Envelope {
 	e, _ := FromContext(ctx)
 	return e
 }
+
+// ApplyTo copies the envelope onto an outbound request's headers.
+func (e Envelope) ApplyTo(r *http.Request) {
+	if e.TenantID != "" {
+		r.Header.Set(HeaderTenantID, e.TenantID)
+	}
+	if e.ActorSubjectID != "" {
+		r.Header.Set(HeaderActorSubjectID, e.ActorSubjectID)
+	}
+	if e.WorkloadID != "" {
+		r.Header.Set(HeaderWorkloadID, e.WorkloadID)
+	}
+	if e.LegalEntityID != "" {
+		r.Header.Set(HeaderLegalEntityID, e.LegalEntityID)
+	}
+	if e.BookID != "" {
+		r.Header.Set(HeaderBookID, e.BookID)
+	}
+	if e.ReportingBasis != "" {
+		r.Header.Set(HeaderReportingBasis, e.ReportingBasis)
+	}
+	if e.Operation != "" {
+		r.Header.Set(HeaderOperation, e.Operation)
+	}
+	if e.RequestID != "" {
+		r.Header.Set(HeaderRequestID, e.RequestID)
+	}
+	if e.CorrelationID != "" {
+		r.Header.Set(HeaderCorrelationID, e.CorrelationID)
+	}
+	if e.CausationID != "" {
+		r.Header.Set(HeaderCausationID, e.CausationID)
+	}
+	if e.IdempotencyKey != "" {
+		r.Header.Set(HeaderIdempotencyKey, e.IdempotencyKey)
+	}
+	if e.SourceChannel != "" {
+		r.Header.Set(HeaderSourceChannel, string(e.SourceChannel))
+	}
+	if e.SourceSystem != "" {
+		r.Header.Set(HeaderSourceSystem, e.SourceSystem)
+	}
+	if e.ExternalReference != "" {
+		r.Header.Set(HeaderExternalReference, e.ExternalReference)
+	}
+	if e.OccurredAt != nil {
+		r.Header.Set(HeaderOccurredAt, e.OccurredAt.Format(time.RFC3339))
+	}
+	if e.EffectiveAt != nil {
+		r.Header.Set(HeaderEffectiveAt, e.EffectiveAt.Format(time.RFC3339))
+	}
+	if e.Timezone != "" {
+		r.Header.Set(HeaderTimezone, e.Timezone)
+	}
+	if e.JurisdictionContext != "" {
+		r.Header.Set(HeaderJurisdictionContext, e.JurisdictionContext)
+	}
+	if e.PurposeContext != "" {
+		r.Header.Set(HeaderPurposeContext, e.PurposeContext)
+	}
+	if e.ExpectedVersion != "" {
+		r.Header.Set(HeaderExpectedVersion, e.ExpectedVersion)
+	}
+	if e.WorkflowInstanceID != "" {
+		r.Header.Set(HeaderWorkflowInstanceID, e.WorkflowInstanceID)
+	}
+	if e.ApprovalReference != "" {
+		r.Header.Set(HeaderApprovalReference, e.ApprovalReference)
+	}
+	if len(e.EvidenceRefs) > 0 {
+		r.Header.Set(HeaderEvidenceRefs, strings.Join(e.EvidenceRefs, ","))
+	}
+}
+
+// ForwardTo copies the envelope from ctx onto an outbound request. The
+// convenience form of ApplyTo for the common case, where a client has a ctx and
+// a request and nothing else.
+//
+// A missing envelope is not an error here: it means the middleware did not run,
+// which happens on an internal call made outside a request (a startup probe, a
+// background reconciler). Those get a bare request, and the peer refuses them if
+// its own contract says it must -- which is the correct outcome, decided at the
+// peer rather than papered over here.
+func ForwardTo(ctx context.Context, r *http.Request) {
+	if e, ok := FromContext(ctx); ok {
+		e.ApplyTo(r)
+	}
+}

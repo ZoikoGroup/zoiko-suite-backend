@@ -1,0 +1,22 @@
+# Doc 11 register entry
+- Filename: ZoikoSuite_Suivo_Chatbot_Document_11_Engineering_Implementation_Roadmap_WBS_and_Final_Handover.md
+- FilenameId: 11
+- Document ID (exact): ZS-SUIVO-ENG-011
+- Title (exact, from the title line, not the ID line): Engineering Implementation Roadmap, Work Breakdown Structure & Final Handover
+- Version (exact): VERSION 1.0
+- Date (exact): 24 OCTOBER 2026
+- Status / approval wording (quote the full sentence): DOCUMENT STATUS — FOR APPROVAL, NOT PROOF OF IMPLEMENTATION PROPOSED ENGINEERING DELIVERY BASELINE. This document neither asserts that the architecture is deployed nor claims that the predecessor documents are legally, commercially or technically signed off. Scope, effort, schedules, suppliers, operational SLOs and residency remain conditional on repository discovery and named leadership approvals.
+- Approver roles (exactly as written in the status or approval text): No specific roles named in the status cell (line 13); it refers to 'named leadership approvals'. Audience (line 19, readers not approvers): Founder, Global CTO, product, engineering, AI/ML, security, DPO/legal, SRE, QA, design, knowledge operations, commercial/CRM and customer support.
+- Classification (if stated): not stated in lines 1–80
+- Other document IDs mentioned in lines 1–80 (list each ID + the line number):
+  - ZS-SUIVO-ENG-011 (line 18)
+  - Documents 01–10 (line 18)
+- Line numbers where each value above was found:
+  - Document ID (exact): line 18
+  - Title (exact): line 7
+  - Version (exact): line 9
+  - Date (exact): line 9
+  - Status / approval wording: line 13
+  - Approver roles: line 13 and 19
+  - Classification: not found in lines 1–80
+  - Other document IDs: line 18, line 18

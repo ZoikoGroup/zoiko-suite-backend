@@ -46,15 +46,18 @@ func (s *PgStore) CreateRendition(ctx context.Context, p domain.CreateRenditionP
 
 	var out domain.Rendition
 	err := s.withTenant(ctx, func(tx pgx.Tx, tenantID string) error {
-		var sourceExists bool
-		if err := tx.QueryRow(ctx, `SELECT EXISTS(
-			SELECT 1 FROM document_versions dv JOIN documents d ON d.document_id = dv.document_id
-			WHERE dv.document_version_id = $1 AND d.tenant_id::text = $2)`,
-			p.SourceDocumentVersionID, tenantID).Scan(&sourceExists); err != nil {
+		var legalEntityID string
+		if err := tx.QueryRow(ctx, `
+			SELECT d.legal_entity_id::text FROM document_versions dv JOIN documents d ON d.document_id = dv.document_id
+			WHERE dv.document_version_id = $1 AND d.tenant_id::text = $2`,
+			p.SourceDocumentVersionID, tenantID).Scan(&legalEntityID); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return domain.ErrSourceDocumentVersionNotFound
+			}
+			if mapped := mapPgError(err); errors.Is(mapped, domain.ErrDocumentNotFound) {
+				return domain.ErrSourceDocumentVersionNotFound
+			}
 			return fmt.Errorf("document store unavailable: %w", err)
-		}
-		if !sourceExists {
-			return domain.ErrSourceDocumentVersionNotFound
 		}
 
 		if p.ParentRenditionID != nil {
@@ -83,7 +86,14 @@ func (s *PgStore) CreateRendition(ctx context.Context, p domain.CreateRenditionP
 		if _, err := insertFixityManifest(ctx, tx, tenantID, nil, &out.RenditionID, p.ChecksumSHA256, p.CreatedByPrincipalID); err != nil {
 			return err
 		}
-		return nil
+		return enqueueDRCEvent(ctx, tx, "RENDITION", out.RenditionID, evtRenditionCreated, tenantID, legalEntityID,
+			p.CreatedByPrincipalID, "", map[string]any{
+				"rendition_id":      out.RenditionID,
+				"source_version_id": p.SourceDocumentVersionID,
+				"profile_id":        p.TransformationProfile,
+				"rendition_class":   p.RenditionClass,
+				"output_hash":       p.ChecksumSHA256,
+			})
 	})
 	if err != nil {
 		return nil, err
@@ -271,7 +281,29 @@ func (s *PgStore) RecordVerification(ctx context.Context, p domain.RecordVerific
 			WHERE manifest_id = $1 RETURNING `+fixityManifestColumns,
 			p.ManifestID, string(resolved), observedHash, repairSucceeded, p.VerifiedByPrincipalID,
 		)
-		return scanFixityManifest(row, &out)
+		if err := scanFixityManifest(row, &out); err != nil {
+			return err
+		}
+		// A recorded MISMATCH / MISSING / UNREADABLE is an integrity incident
+		// (DRC-011, §6.6). incident_ref is not modelled (no incident system is
+		// integrated), so it is not invented; the manifest id is the handle.
+		if resolved != domain.FixityVerified {
+			objectID := ""
+			if out.RenditionID != nil {
+				objectID = *out.RenditionID
+			} else if out.DocumentVersionID != nil {
+				objectID = *out.DocumentVersionID
+			}
+			return enqueueDRCEvent(ctx, tx, "FIXITY_MANIFEST", out.ManifestID, evtIntegrityCheckFailed, tenantID, "",
+				p.VerifiedByPrincipalID, "", map[string]any{
+					"manifest_id":   out.ManifestID,
+					"object_id":     objectID,
+					"integrity":     string(resolved),
+					"expected_hash": m.SourceHash,
+					"observed_hash": observedHash,
+				})
+		}
+		return nil
 	})
 	if err != nil {
 		return nil, err
@@ -388,10 +420,21 @@ func (s *PgStore) GetRedactionProfile(ctx context.Context, redactionID string) (
 
 // ── Export Packages ──────────────────────────────────────────────────────────
 
-const exportPackageColumns = `package_id, tenant_id, requested_by_principal_id, package_hash, created_at`
+const exportPackageColumns = `package_id, tenant_id, requested_by_principal_id, package_hash, created_at, recipient_scope, purpose`
 
 func scanExportPackage(row pgx.Row, p *domain.ExportPackage) error {
-	return row.Scan(&p.PackageID, &p.TenantID, &p.RequestedByPrincipalID, &p.PackageHash, &p.CreatedAt)
+	var recipient, purpose *string
+	if err := row.Scan(&p.PackageID, &p.TenantID, &p.RequestedByPrincipalID, &p.PackageHash, &p.CreatedAt, &recipient, &purpose); err != nil {
+		return err
+	}
+	p.RecipientScope, p.Purpose = "", ""
+	if recipient != nil {
+		p.RecipientScope = *recipient
+	}
+	if purpose != nil {
+		p.Purpose = *purpose
+	}
+	return nil
 }
 
 const exportPackageItemColumns = `
@@ -512,10 +555,10 @@ func (s *PgStore) CreateExportPackage(ctx context.Context, p domain.CreateExport
 		packageHash := hex.EncodeToString(sum[:])
 
 		row := tx.QueryRow(ctx, `
-			INSERT INTO export_packages (tenant_id, requested_by_principal_id, package_hash)
-			VALUES ($1, $2, $3)
+			INSERT INTO export_packages (tenant_id, requested_by_principal_id, package_hash, recipient_scope, purpose)
+			VALUES ($1, $2, $3, $4, $5)
 			RETURNING `+exportPackageColumns,
-			tenantID, p.RequestedByPrincipalID, packageHash,
+			tenantID, p.RequestedByPrincipalID, packageHash, nullableString(p.RecipientScope), nullableString(p.Purpose),
 		)
 		if err := scanExportPackage(row, &out); err != nil {
 			return fmt.Errorf("document store unavailable: %w", mapPgError(err))
@@ -539,7 +582,21 @@ func (s *PgStore) CreateExportPackage(ctx context.Context, p domain.CreateExport
 
 		out.PackageHash = packageHash
 		out.Items = items
-		return nil
+		// recipient_scope is the §9.3 export_package_created anchor; it (and the
+		// purpose, §6.5) is present when the caller supplied it.
+		payload := map[string]any{
+			"package_id":   out.PackageID,
+			"item_count":   len(items),
+			"package_hash": packageHash,
+		}
+		if p.RecipientScope != "" {
+			payload["recipient_scope"] = p.RecipientScope
+		}
+		if p.Purpose != "" {
+			payload["purpose"] = p.Purpose
+		}
+		return enqueueDRCEvent(ctx, tx, "EXPORT_PACKAGE", out.PackageID, evtExportPackageCreated, tenantID, "",
+			p.RequestedByPrincipalID, "", payload)
 	})
 	if err != nil {
 		return nil, err

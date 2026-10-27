@@ -18,6 +18,13 @@ EOSQL
 }
 
 create_db_and_migrate "zoiko_connectivity_api_bridge" "/migrations/connectivity-api-bridge/001_init.sql"
+# 001 alone leaves no row-level security (002) and none of the connector
+# governance schema or the transactional outbox (003), nor the XIC contract registry (004) , connection layer (005) and inbound gateway (006) outbound engine (007) and provider callbacks (008); apply every migration the
+# service ships, in order.
+for f in /migrations/connectivity-api-bridge/002_add_rls.sql /migrations/connectivity-api-bridge/003_connector_management.sql /migrations/connectivity-api-bridge/004_xic_registry.sql /migrations/connectivity-api-bridge/005_xic_connections.sql /migrations/connectivity-api-bridge/006_xic_inbound.sql /migrations/connectivity-api-bridge/007_xic_outbound.sql /migrations/connectivity-api-bridge/008_xic_callbacks.sql /migrations/connectivity-api-bridge/009_xic_batch.sql /migrations/connectivity-api-bridge/010_xic_reconciliation.sql /migrations/connectivity-api-bridge/011_xic_rollout.sql; do
+  echo "Applying $f to zoiko_connectivity_api_bridge..."
+  psql -v ON_ERROR_STOP=1 --username "$PGUSER" --dbname zoiko_connectivity_api_bridge -f "$f"
+done
 create_db_and_migrate "zoiko_banking_connector" "/migrations/banking-connector/001_init.sql"
 create_db_and_migrate "zoiko_hris_connector" "/migrations/hris-connector/001_init.sql"
 create_db_and_migrate "zoiko_tax_authority_interface" "/migrations/tax-authority-interface/001_init.sql"

@@ -2,12 +2,15 @@
 package handler
 
 import (
+	"archive/zip"
+	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -20,11 +23,19 @@ import (
 )
 
 type Store interface {
-	CreateManifest(ctx context.Context, m *domain.EvidenceManifest) error
-	AddRecord(ctx context.Context, r *domain.ManifestRecord) error
-	FinalizeGenerated(ctx context.Context, manifestID, checksumSHA256 string) (*domain.EvidenceManifest, error)
-	FinalizeFailed(ctx context.Context, manifestID, reason string) (*domain.EvidenceManifest, error)
+	// CompleteManifest persists a GENERATED manifest, all its records and its
+	// outbox event in one transaction (all-or-nothing). RecordFailedManifest
+	// persists a FAILED manifest with its reason in one statement. Neither
+	// leaves a PENDING manifest behind.
+	CompleteManifest(ctx context.Context, m *domain.EvidenceManifest, records []domain.ManifestRecord, correlationID string) (*domain.EvidenceManifest, error)
+	RecordFailedManifest(ctx context.Context, m *domain.EvidenceManifest, reason string) (*domain.EvidenceManifest, error)
 	FindManifestByID(ctx context.Context, manifestID string) (*domain.EvidenceManifest, error)
+	ListManifests(ctx context.Context, legalEntityID string, limit, offset int) ([]domain.EvidenceManifest, error)
+	// ListManifestLegalEntities / ListManifestsForEntities back the list route
+	// when the caller names no legal entity: each entity is authorized on its
+	// own and only the readable ones are listed.
+	ListManifestLegalEntities(ctx context.Context) ([]string, error)
+	ListManifestsForEntities(ctx context.Context, legalEntityIDs []string, limit, offset int) ([]domain.EvidenceManifest, error)
 	ListRecords(ctx context.Context, manifestID string) ([]domain.ManifestRecord, error)
 
 	// AUD-03 Audit Population — see internal/store/population_store.go's
@@ -156,8 +167,12 @@ func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID,
 func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Route("/v1/evidence-manifests", func(r chi.Router) {
 		r.Post("/", h.GenerateManifest)
+		r.Get("/", h.ListManifests)
+		r.Post("/verify", h.VerifyManifest)
 		r.Get("/{manifestID}", h.GetManifest)
 		r.Get("/{manifestID}/records", h.ListRecords)
+		r.Post("/{manifestID}/verify", h.VerifyManifest)
+		r.Get("/{manifestID}/download", h.DownloadManifestZip)
 	})
 	r.Route("/v1/audit-populations", func(r chi.Router) {
 		r.Post("/", h.DefinePopulation)
@@ -194,22 +209,49 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 // ── POST /v1/evidence-manifests ──────────────────────────────────────────────
 
 func (h *Handler) GenerateManifest(w http.ResponseWriter, r *http.Request) {
-	var req domain.GenerateManifestRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	// Order: tenant (TenantContext middleware) → principal → authorization →
+	// decode/validate → business validation. A caller who is not allowed to
+	// generate evidence learns nothing about what a valid request looks like.
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
 		return
 	}
+	// Authorization is scoped to a legal entity and the only source of one is
+	// the body, so exactly that one field is read before the check. If it
+	// cannot be read there is nothing to authorize against; the 400 that
+	// results reveals only that the body is unusable.
+	var scope struct {
+		LegalEntityID string `json:"legal_entity_id"`
+	}
+	if err := json.Unmarshal(body, &scope); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+		return
+	}
+	if scope.LegalEntityID == "" {
+		writeError(w, http.StatusBadRequest, "missing_field", "legal_entity_id")
+		return
+	}
+	if !h.authorize(w, r, principalID, scope.LegalEntityID, EvidenceManifestGenerate) {
+		return
+	}
 
+	var req domain.GenerateManifestRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+		return
+	}
 	if missing := requiredFieldMissing(req); missing != "" {
 		writeError(w, http.StatusBadRequest, "missing_field", missing)
 		return
 	}
 	// tenant_id stays in the request contract but is no longer the source of
-	// truth: it was previously the ONLY source, validated as non-empty and
-	// otherwise trusted, which made the tenant caller-declared. It may now
-	// only AGREE with the verified header. Disagreement is refused rather
-	// than silently resolved, so a caller meaning to act on another tenant
-	// gets an error instead of a quietly reinterpreted request.
+	// truth: it may only AGREE with the verified header. Disagreement is
+	// refused rather than silently resolved.
 	verifiedTenant := svcmiddleware.TenantFromContext(r.Context())
 	if req.TenantID != verifiedTenant {
 		writeError(w, http.StatusForbidden, "tenant_mismatch",
@@ -234,46 +276,35 @@ func (h *Handler) GenerateManifest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
+	// requested_by is the attribution on an evidence bundle, so it is the
+	// verified principal and nothing else. A body value is accepted only when
+	// it agrees; it can never name someone other than the caller.
+	if req.RequestedBy != "" && req.RequestedBy != principalID {
+		writeError(w, http.StatusForbidden, "requested_by_mismatch",
+			"requested_by in the request does not match the verified principal")
 		return
 	}
-	if !h.authorize(w, r, principalID, req.LegalEntityID, EvidenceManifestGenerate) {
-		return
-	}
-
-	// req.RequestedBy is still honoured — a service assembling evidence on
-	// behalf of a named human legitimately records that human — but it can no
-	// longer stand in for a missing verified principal, because there is no
-	// longer such a thing as a request without one.
-	requestedBy := req.RequestedBy
-	if requestedBy == "" {
-		requestedBy = principalID
-	}
+	requestedBy := principalID
 
 	manifest := &domain.EvidenceManifest{
 		TenantID: req.TenantID, LegalEntityID: req.LegalEntityID,
 		ScenarioType: req.ScenarioType, RequestedBy: requestedBy,
 	}
-	if err := h.store.CreateManifest(r.Context(), manifest); err != nil {
-		h.log.Error("GenerateManifest: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
-		return
-	}
 
-	// Principal is carried via context, same as tenant, so every aggregator
-	// client can forward it to source services that require it (see
+	// Source records are collected BEFORE anything is persisted. Principal is
+	// carried via context, same as tenant, so every aggregator client can
+	// forward it to source services that require it (see
 	// aggregator.forwardIdentity) without threading it through every call
 	// signature individually.
 	ctx := svcmiddleware.WithPrincipal(r.Context(), principalID)
-	records, err := h.collectRecords(ctx, req)
+	collected, err := h.collectRecords(ctx, req)
 	if err != nil {
 		// Fail closed: a manifest that can't fully assemble is FAILED, not
 		// silently partial — a partial manifest that LOOKS complete is worse
 		// than no manifest at all for audit/legal-discovery use.
 		reason := err.Error()
-		if _, ferr := h.store.FinalizeFailed(r.Context(), manifest.ManifestID, reason); ferr != nil {
-			h.log.Error("GenerateManifest: failed to record FAILED status", zap.Error(ferr))
+		if _, ferr := h.store.RecordFailedManifest(r.Context(), manifest, reason); ferr != nil {
+			h.log.Error("GenerateManifest: failed to record FAILED manifest", zap.Error(ferr))
 		}
 		h.log.Error("GenerateManifest: source aggregation failed — manifest marked FAILED",
 			zap.String("manifest_id", manifest.ManifestID), zap.Error(err))
@@ -281,35 +312,22 @@ func (h *Handler) GenerateManifest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	hasher := sha256.New()
-	for _, rec := range records {
-		mr := &domain.ManifestRecord{
-			ManifestID: manifest.ManifestID, SourceType: rec.SourceType,
-			SourceRecordID: rec.SourceRecordID, RecordSnapshot: rec.RawJSON,
-		}
-		if err := h.store.AddRecord(r.Context(), mr); err != nil {
-			h.log.Error("GenerateManifest: failed to persist record", zap.Error(err))
-			writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
-			return
-		}
-		hasher.Write([]byte(rec.SourceType))
-		hasher.Write([]byte(rec.SourceRecordID))
-		hasher.Write(rec.RawJSON)
+	records := make([]domain.ManifestRecord, 0, len(collected))
+	for _, rec := range collected {
+		records = append(records, domain.ManifestRecord{
+			SourceType: rec.SourceType, SourceRecordID: rec.SourceRecordID, RecordSnapshot: rec.RawJSON,
+		})
 	}
-	checksum := hex.EncodeToString(hasher.Sum(nil))
 
-	finalManifest, err := h.store.FinalizeGenerated(r.Context(), manifest.ManifestID, checksum)
+	// One transaction: manifest, records, checksum, GENERATED status and the
+	// outbox row (ZS-STATE-001 Invariant I-13). A failure anywhere leaves
+	// nothing behind — there is no PENDING manifest and no partial record set.
+	finalManifest, err := h.store.CompleteManifest(r.Context(), manifest, records, r.Header.Get("X-Correlation-ID"))
 	if err != nil {
-		h.log.Error("GenerateManifest: failed to finalize", zap.Error(err))
+		h.log.Error("GenerateManifest: failed to persist manifest", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
 		return
 	}
-
-	if pubErr := h.publisher.PublishManifestGenerated(r.Context(), finalManifest, r.Header.Get("X-Correlation-ID")); pubErr != nil {
-		h.log.Error("GenerateManifest: failed to publish evidence.manifest.generated",
-			zap.String("manifest_id", finalManifest.ManifestID), zap.Error(pubErr))
-	}
-
 	writeJSON(w, http.StatusCreated, finalManifest)
 }
 
@@ -364,6 +382,89 @@ func (h *Handler) collectRecords(ctx context.Context, req domain.GenerateManifes
 		out = append(out, recs...)
 	}
 	return out, nil
+}
+
+// ── GET /v1/evidence-manifests ───────────────────────────────────────────────
+
+// ListManifests returns the manifests for the caller's tenant, ordered newest first.
+//
+// EVIDENCE_MANIFEST_READ is granted per legal entity, so every path authorizes:
+//   - legal_entity_id given: that entity is authorized, then listed.
+//   - legal_entity_id omitted: each distinct legal entity that has a manifest is
+//     authorized on its own and only the readable ones are listed. If manifests
+//     exist but none is readable the answer is 403, as it is for a single
+//     manifest; an authorization-svc failure on any entity fails the whole
+//     request closed (503). A tenant with no manifests discloses nothing and has
+//     no entity to authorize against, so it returns an empty list.
+func (h *Handler) ListManifests(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	legalEntityID := r.URL.Query().Get("legal_entity_id")
+	var readable []string
+	if legalEntityID != "" {
+		if !h.authorize(w, r, principalID, legalEntityID, EvidenceManifestRead) {
+			return
+		}
+	} else {
+		entities, err := h.store.ListManifestLegalEntities(r.Context())
+		if err != nil {
+			h.handleStoreError(w, err)
+			return
+		}
+		for _, e := range entities {
+			err := h.authz.CheckAllowed(r.Context(), principalID, e, EvidenceManifestRead)
+			switch {
+			case err == nil:
+				readable = append(readable, e)
+			case errors.Is(err, authzpkg.ErrAuthorizationDenied):
+			default:
+				h.log.Error("authorization check failed", zap.Error(err))
+				writeError(w, http.StatusServiceUnavailable, "authorization_unavailable", "")
+				return
+			}
+		}
+		if len(entities) > 0 && len(readable) == 0 {
+			writeError(w, http.StatusForbidden, "not_authorized", "")
+			return
+		}
+	}
+
+	limit := 50
+	offset := 0
+	if l := r.URL.Query().Get("limit"); l != "" {
+		v, err := strconv.Atoi(l)
+		if err != nil || v < 1 || v > 200 {
+			writeError(w, http.StatusBadRequest, "invalid_limit", "limit must be between 1 and 200")
+			return
+		}
+		limit = v
+	}
+	if o := r.URL.Query().Get("offset"); o != "" {
+		v, err := strconv.Atoi(o)
+		if err != nil || v < 0 {
+			writeError(w, http.StatusBadRequest, "invalid_offset", "offset must be non-negative")
+			return
+		}
+		offset = v
+	}
+
+	var manifests []domain.EvidenceManifest
+	var err error
+	if legalEntityID != "" {
+		manifests, err = h.store.ListManifests(r.Context(), legalEntityID, limit, offset)
+	} else {
+		manifests, err = h.store.ListManifestsForEntities(r.Context(), readable, limit, offset)
+	}
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	if manifests == nil {
+		manifests = []domain.EvidenceManifest{}
+	}
+	writeJSON(w, http.StatusOK, manifests)
 }
 
 // ── GET /v1/evidence-manifests/{manifestID} ──────────────────────────────────
@@ -423,6 +524,190 @@ func (h *Handler) ListRecords(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, records)
 }
 
+// ── POST /v1/evidence-manifests/verify & /{manifestID}/verify ────────────────
+
+type verifyManifestRequest struct {
+	ManifestID     string `json:"manifest_id"`
+	ChecksumSHA256 string `json:"checksum_sha256,omitempty"`
+}
+
+type verifyManifestResponse struct {
+	ManifestID       string    `json:"manifest_id"`
+	Status           string    `json:"status"`
+	ChecksumSHA256   string    `json:"checksum_sha256"`
+	ComputedChecksum string    `json:"computed_checksum"`
+	Valid            bool      `json:"valid"`
+	RecordCount      int       `json:"record_count"`
+	VerifiedAt       time.Time `json:"verified_at"`
+}
+
+// VerifyManifest recalculates the SHA-256 cryptographic checksum across all
+// records stored for this manifest and asserts identity against the recorded
+// checksum_sha256, validating tamper-evidence.
+func (h *Handler) VerifyManifest(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+
+	manifestID := chi.URLParam(r, "manifestID")
+	var expectedChecksum string
+	if manifestID == "" {
+		var req verifyManifestRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+			return
+		}
+		manifestID = req.ManifestID
+		expectedChecksum = req.ChecksumSHA256
+	}
+	if manifestID == "" {
+		writeError(w, http.StatusBadRequest, "missing_manifest_id", "manifest_id is required")
+		return
+	}
+
+	m, err := h.store.FindManifestByID(r.Context(), manifestID)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	if !h.authorize(w, r, principalID, m.LegalEntityID, EvidenceManifestRead) {
+		return
+	}
+
+	if m.Status != domain.StatusGenerated {
+		writeError(w, http.StatusBadRequest, "invalid_manifest_state",
+			fmt.Sprintf("cannot verify manifest in status %s — only GENERATED manifests have a fixed cryptographic checksum", m.Status))
+		return
+	}
+
+	records, err := h.store.ListRecords(r.Context(), manifestID)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+
+	computed := domain.ManifestChecksum(records)
+
+	storedChecksum := ""
+	if m.ChecksumSHA256 != nil {
+		storedChecksum = *m.ChecksumSHA256
+	}
+
+	valid := (computed == storedChecksum)
+	if expectedChecksum != "" && computed != expectedChecksum {
+		valid = false
+	}
+
+	writeJSON(w, http.StatusOK, verifyManifestResponse{
+		ManifestID:       manifestID,
+		Status:           string(m.Status),
+		ChecksumSHA256:   storedChecksum,
+		ComputedChecksum: computed,
+		Valid:            valid,
+		RecordCount:      len(records),
+		VerifiedAt:       time.Now().UTC(),
+	})
+}
+
+// ── GET /v1/evidence-manifests/{manifestID}/download ─────────────────────────
+
+// DownloadManifestZip bundles the manifest metadata and all individual record
+// snapshots into an exportable zip archive for regulatory/audit discovery.
+func (h *Handler) DownloadManifestZip(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	manifestID := chi.URLParam(r, "manifestID")
+	if manifestID == "" {
+		writeError(w, http.StatusBadRequest, "missing_manifest_id", "manifest_id is required")
+		return
+	}
+
+	m, err := h.store.FindManifestByID(r.Context(), manifestID)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	if !h.authorize(w, r, principalID, m.LegalEntityID, EvidenceManifestRead) {
+		return
+	}
+
+	records, err := h.store.ListRecords(r.Context(), manifestID)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+
+	// The archive is assembled completely, and every write is checked, BEFORE
+	// any response header is sent: a packaging failure is an error response,
+	// never a 200 carrying a truncated archive.
+	buf := new(bytes.Buffer)
+	if err := writeManifestZip(buf, m, records); err != nil {
+		h.log.Error("DownloadManifestZip: packaging failed", zap.String("manifest_id", manifestID), zap.Error(err))
+		writeError(w, http.StatusInternalServerError, "packaging_failed", "")
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"evidence-manifest-%s.zip\"", manifestID))
+	w.Header().Set("Content-Length", strconv.Itoa(buf.Len()))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(buf.Bytes())
+}
+
+// writeManifestZip writes the manifest package — manifest.json, checksum.sha256,
+// records/records.json and one entry per record snapshot — to out, and returns
+// the first error from ANY create, write or close. Nothing is ignored.
+func writeManifestZip(out io.Writer, m *domain.EvidenceManifest, records []domain.ManifestRecord) error {
+	zw := zip.NewWriter(out)
+	add := func(name string, content []byte) error {
+		fw, err := zw.Create(name)
+		if err != nil {
+			return fmt.Errorf("create %s: %w", name, err)
+		}
+		if _, err := fw.Write(content); err != nil {
+			return fmt.Errorf("write %s: %w", name, err)
+		}
+		return nil
+	}
+
+	manifestJSON, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode manifest.json: %w", err)
+	}
+	if err := add("manifest.json", manifestJSON); err != nil {
+		return err
+	}
+
+	storedChecksum := ""
+	if m.ChecksumSHA256 != nil {
+		storedChecksum = *m.ChecksumSHA256
+	}
+	if err := add("checksum.sha256", []byte(storedChecksum+"\n")); err != nil {
+		return err
+	}
+
+	recordsJSON, err := json.MarshalIndent(records, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode records.json: %w", err)
+	}
+	if err := add("records/records.json", recordsJSON); err != nil {
+		return err
+	}
+	for i, rec := range records {
+		name := fmt.Sprintf("records/%03d_%s_%s.json", i+1, rec.SourceType, rec.SourceRecordID)
+		if err := add(name, rec.RecordSnapshot); err != nil {
+			return err
+		}
+	}
+	if err := zw.Close(); err != nil {
+		return fmt.Errorf("close archive: %w", err)
+	}
+	return nil
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 func (h *Handler) handleStoreError(w http.ResponseWriter, err error) {
@@ -466,13 +751,13 @@ func requiredFieldMissing(req domain.GenerateManifestRequest) string {
 // principal handed to authorization-svc, so a fabricated actor would mean
 // asking "is 'unknown' allowed to do this".
 //
-// Both header spellings are still accepted. X-Actor-Principal-ID takes
-// precedence over X-Principal-Id where a caller sends both, preserving the
-// existing contract; only the fabricated fallback is gone.
+// Only X-Principal-Id — the canonical envelope's actor header — is read.
+// A previous version let a caller-controlled X-Actor-Principal-ID override
+// it, which made the authorization subject, requested_by and every
+// separation-of-duties comparison spoofable by whoever could set a header.
+// The platform input contract defines no delegated-actor header, so none is
+// honoured: the principal is the verified envelope identity, full stop.
 func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
-	if a := r.Header.Get("X-Actor-Principal-ID"); a != "" {
-		return a, true
-	}
 	if a := r.Header.Get("X-Principal-Id"); a != "" {
 		return a, true
 	}

@@ -1,0 +1,16 @@
+# Used by BuildKit for builds with -f services/identity-context-svc/Dockerfile.
+# The context is the repository root (see the Dockerfile), so everything is
+# excluded except the modules the image is built from.
+*
+!services/identity-context-svc/
+!services/identity-envelope/
+!services/eventing/
+
+# Not needed inside the image.
+services/identity-context-svc/.gotmp/
+services/identity-context-svc/**/*.exe
+services/identity-context-svc/**/*_test.go
+services/identity-context-svc/**/testdata/
+services/identity-context-svc/deployments/
+services/identity-envelope/**/*_test.go
+services/eventing/**/*_test.go

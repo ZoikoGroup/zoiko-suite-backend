@@ -30,6 +30,7 @@ import (
 
 	"github.com/go-chi/chi/v5/middleware"
 	"go.uber.org/zap"
+	idenv "zoiko.io/identity-envelope"
 
 	svcenvelope "zoiko.io/search-indexer-svc/internal/envelope"
 )
@@ -219,6 +220,12 @@ func (c *HTTPClient) checkAllowedLive(ctx context.Context, principalID, legalEnt
 	// key would record ONE decision for a page of twenty results — losing
 	// exactly the per-resource audit trail TC-05 asks for.
 	req.Header.Set("Idempotency-Key", authzRequestID+":"+actionType+":"+legalEntityID)
+
+	// Forward the caller's canonical envelope for downstream traceability
+	svcenvelope.ForwardTo(ctx, req)
+	// The verified identity envelope too, so the next hop can check who
+	// is asking instead of trusting X-Principal-Id (X-R3).
+	idenv.Forward(ctx, req)
 
 	resp, err := c.http.Do(req)
 	if err != nil {

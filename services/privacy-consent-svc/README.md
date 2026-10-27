@@ -1,0 +1,357 @@
+# privacy-consent-svc (PRV-02)
+
+Notice, Consent & Preference Evidence Service — `ZS-SVC-W-001` §10-11, §18, §19.
+Port `8152`.
+
+This README reflects the actual implementation, not an aspirational one.
+Where a documented requirement is only partially met, or depends on another
+service, that is stated plainly below rather than in a separate drift
+document discovered later.
+
+> **Status: not production ready as an integrated system.** The service's own
+> behaviour is covered by tests (see [Verification](#verification)), but three
+> things outside it block a safe rollout — see
+> [External dependencies](#external-dependencies). The audit write-up is the
+> PRV-02 section of `docs/audit_files/PRIVACY.md`.
+
+## Scope
+
+Depends on `privacy-purpose-registry-svc` (PRV-01) for purpose validity:
+every `ConsentReceipt.purpose_id` is checked against a real HTTP call, never
+trusted as an opaque string. Does not itself enforce runtime data-use
+decisions (PRV-03's job) — it is the evidence store PRV-03 queries.
+
+## Endpoints
+
+### Notices
+
+| Method | Path | Notes |
+|---|---|---|
+| POST | `/privacy/notices` | Create draft identity + version 1 |
+| GET | `/privacy/notices/{id}?as_of=` | Resolve the version effective at a time. Tenant-scoped (`X-Tenant-Id` required), no principal required — a published notice is meant to be shown to a subject before any session exists |
+| POST | `/privacy/notices/{id}/versions` | Successor draft |
+| POST | `/privacy/notices/{id}/approve`, `/publish`, `/withdraw` (canonical, latest version) | The latest version is resolved **after** authorization — see [Request ordering](#request-ordering) |
+| POST | `/privacy/notices/{id}/versions/{vid}/approve`, `/publish`, `/withdraw` (explicit version) | |
+| POST | `/privacy/notices/{id}/presentation-receipts` (canonical) / `.../versions/{vid}/presentation-receipts` | Evidence a notice version was shown to a subject |
+
+### Consent
+
+| Method | Path | Notes |
+|---|---|---|
+| POST | `/privacy/consents` | Record a grant/deny receipt |
+| GET | `/privacy/consents?subject_ref=&purpose_id=` | Resolve current status. **Authenticated and authorized** (`PRIVACY_CONSENT_READ`) |
+| POST | `/privacy/consents/{id}/withdraw` | Subject-initiated terminal act |
+| POST | `/privacy/consents/{id}/invalidate` | **Platform**-initiated terminal act (`PRIVACY_CONSENT_INVALIDATE`) — a compromised capture channel or confirmed fraud, never a subject-initiated act. Distinct from withdrawal per §6's state list |
+
+### Preferences
+
+| Method | Path | Notes |
+|---|---|---|
+| POST | `/privacy/preferences` | |
+| GET | `/privacy/preferences?subject_ref=&channel_or_purpose=` | **Authenticated and authorized** (`PRIVACY_PREFERENCE_READ`) |
+
+## Response contract (§18)
+
+§18's critical fields are returned **alongside** the names this service has
+always used, with identical values, so existing consumers keep working.
+
+| Route | §18 field | Existing field |
+|---|---|---|
+| `POST /privacy/consents` | `receipt_id` | `consent_receipt_id` |
+| | `purpose_id`, `scope` (when a `consent_request` was supplied) | `purpose_id`, `consent_request.scope` |
+| | `notice_version` | `notice_version_id` |
+| | `status` (`GRANTED` or `DENIED` — the receipt's own captured outcome) | `action` |
+| | `evidence_hash` | `receipt_integrity_hash` |
+| `POST /privacy/notices/{id}/presentation-receipts` | `receipt_id` | `presentation_receipt_id` |
+| | subject / session / version / timestamp / channel-template | `subject_ref` / `session_ref` / `notice_version_id` / `created_at` / `channel`, `template_version` |
+| `POST /privacy/consents/{id}/withdraw` | `withdrawal_id` | `withdrawal_receipt_id` |
+| | `effective_at` (the instant the withdrawal was recorded) | `created_at` |
+| | `propagation_correlation` | `propagation_correlation_id` |
+
+`status` on a receipt is **not** the subject's current consent status, which
+can later become `WITHDRAWN`, `EXPIRED` or `INVALIDATED`; that is the derived
+read `GET /privacy/consents`, whose embedded `latest_receipt` has the same
+shape.
+
+## Request ordering
+
+Every **mutating** route runs, in this order, and nothing after a step runs
+until the step has passed:
+
+1. `X-Principal-Id` → `401 AUTHENTICATION_FAILED`
+2. verified `X-Tenant-Id` → `401 TENANT_SCOPE_REQUIRED` (never defaulted to the platform plane)
+3. `X-Correlation-ID` → `400 CORRELATION_ID_REQUIRED`
+4. `authorization-svc` grant on the caller's verified tenant → `403` / `503` (fail closed)
+5. `Idempotency-Key` → `400 IDEMPOTENCY_KEY_REQUIRED`, then the replay lookup (lookup failure → `503`, never "proceed")
+6. body parsing and validation → `400` / `422`
+7. resource lookup → `404`
+
+**Body validation never precedes authentication or authorization**: an
+unauthenticated caller gets `401`, and an unauthorized one `403`, whatever the
+body says. Authorization precedes every lookup, so a caller who is not
+authorized learns nothing about whether a notice or receipt exists: for the
+canonical latest-version routes and for withdraw/invalidate an existing and a
+nonexistent id answer identically (`403`). A receipt the caller's tenant does
+not own — including one with no tenant — answers `404`, never `403`.
+
+**Reads** (`GET /privacy/consents`, `GET /privacy/preferences`) run principal →
+tenant → grant → query-parameter validation → lookup. `GetNotice` requires a
+verified tenant and nothing else (see Auth).
+
+## Auth
+
+Every mutating route requires `X-Principal-Id`, a verified `X-Tenant-Id`,
+`X-Correlation-ID` and `Idempotency-Key` (§18.1 — all four mandatory), plus a
+fail-closed `authorization-svc` grant for its own action.
+`GetConsentStatus` and `GetPreference` require the same principal + tenant +
+grant, because they answer "what did this subject assert". `GetNotice`
+requires a verified tenant but no principal, matching the documented ordering
+(a notice precedes any consent decision, so it must be readable before a
+session exists) — it is tenant-scoped so a notice id cannot be read across
+tenants.
+
+A caller sending no `X-Tenant-Id` is refused (401) rather than defaulted to
+a platform-wide write.
+
+## Idempotency & correlation (§18.1)
+
+`Idempotency-Key` and `X-Correlation-ID` are mandatory on every mutating
+route (400 if missing), backed by `consent_idempotency_keys` (RLS-protected).
+
+Authentication, tenant, correlation and the `authorization-svc` grant (steps 1–4 of [Request ordering](#request-ordering)) all run **before** the replay lookup, so a replay can never bypass them.
+
+- **Scope:** (tenant, principal, key) — a key never replays another principal's response.
+- **Binding:** the stored hash covers method + path + body. The same key on a different operation or payload is `409 IDEMPOTENCY_MISMATCH`.
+- **Atomic:** the key claim, the evidence row(s), the `privacy.consent.changed` / `privacy.notice.published` outbox event and the stored replay response are written in **one transaction** (`store.RunIdempotent`; every store call made by the operation joins it). If any step fails — including saving the idempotency record — **nothing persists**, so a retry re-executes cleanly. Concurrent identical requests execute exactly once; the others replay the winner's response.
+- **Fail closed:** a lookup failure → `503 STORE_UNAVAILABLE` and the request is **not executed**.
+- A refused or failed operation (404, 409, 422, a store error, a failed commit) stores nothing — not the evidence, not the event, not the key — so the same key can simply be retried and re-executes. Only a successful commit makes a key replayable.
+- A replay returns the original response with `Idempotency-Replay: true`. (The former `500 IDEMPOTENCY_RECORD_NOT_SAVED` / `committed: true` outcome no longer exists: there is no longer a window in which the operation has committed but its record has not.)
+
+## Preference effective time
+
+§10.1: *PreferenceAssertion — "Channel/purpose preference with source and effective time; not promoted to consent …"*. The specification names the concept but no field name, default or resolution rule, so the smallest reading was implemented and is recorded here:
+
+- **Field:** `effective_at` (the name §18 already uses for an effective instant in this service), column `preference_assertions.effective_at`. It is **separate from `created_at`**, which stays the recording instant.
+- **Request:** optional RFC 3339 instant on `POST /privacy/preferences`. An unparseable value, a date-only value, a value without an offset, or the zero time is `400`. The instant is normalised to **UTC at microsecond precision** (what `timestamptz` stores), so the stored and returned value is the same on every host.
+- **Default:** omitted → the recording instant (trusted service time, PRV-N19).
+- **Response:** `effective_at` is on the assertion returned by `POST` and by `GET /privacy/preferences`.
+- **Resolution (`GET`):** the assertion **in force now** — among assertions whose effective time has been reached, the one with the latest `effective_at` (ties: the one recorded last). An assertion dated in the future does not govern yet; a later-recorded assertion with an *earlier* effective time does not override one that took effect after it; with none in force the answer is `NOT_APPLICABLE` as before. No `as_of` read parameter exists for preferences in the specification, so none was added.
+- **Idempotency:** `effective_at` is part of the request body, so it is covered by the request hash (the same key with a different `effective_at` is `409`).
+- **Evidence:** the table stays append-only (migration `000008` adds a nullable column; existing rows are **not** rewritten — a NULL reads as `created_at`). A preference never becomes consent (PRV-I12 / PRV-N17), unchanged.
+
+## Lifecycle states
+
+Notice: `DRAFT → APPROVED → PUBLISHED → WITHDRAWN`, with `SUPERSEDED` as the
+side effect of publishing a successor (never a direct action). A superseded
+version's `effective_to` is set to its successor's `effective_from` in the
+same transaction, closing the §10.1 "effective window."
+
+Consent: derived read, never stored — `NOT_REQUESTED | GRANTED | DENIED |
+WITHDRAWN | EXPIRED | INVALIDATED`. It is computed from the **latest**
+receipt for (subject, purpose). Precedence when more than one applies:
+`INVALIDATED > WITHDRAWN > EXPIRED >` the receipt's own action. `EXPIRED` is
+derived from an optional `expires_at`; `INVALIDATED` comes from a
+`ConsentInvalidation` record, never the same table or actor as a
+`WithdrawalReceipt`.
+
+### Replay versus re-consent (PRV-N04)
+
+A `POST /privacy/consents` returns the **original** receipt (no new evidence,
+no event) only while that receipt is still the live outcome of the same
+request: it is the latest receipt for the pair, has the same action and
+notice version, and still derives to `GRANTED`/`DENIED`. After an
+invalidation, an expiry, a withdrawal, or a later opposite decision, the same
+request writes a **new** receipt that can become `GRANTED`. Earlier receipts
+are never touched.
+
+## Evidence
+
+- `ConsentRequest` (§10.1) is a real row in `consent_requests`, one per
+  receipt — scope, data/recipient/technology context, vendor, storage
+  lifetime, jurisdiction rule reference, required status, notice version,
+  policy package.
+- **Receipt integrity (§10.1).** `receipt_integrity_hash` is a SHA-256, scheme
+  `v2` (values are prefixed `v2:`), computed once at insert over a canonical,
+  length-prefixed encoding of: subject, purpose, notice version, action,
+  capture channel, actor, capture time; proxy (flag, representative subject,
+  authority, evidence); affirmative-action type and evidence; age band;
+  offline-import provenance (flag, source, capture method, evidence reference,
+  `imported_at`); `expires_at`; and the whole `ConsentRequest`. Timestamps are
+  normalised to UTC microseconds so the digest recomputed from the stored row
+  equals the stored digest. Receipt id, tenant, correlation id and the hash
+  itself are deliberately outside it. Receipts written before this version
+  carry a bare 64-hex digest over a narrower field set (`v1-legacy`); they are
+  not rewritten. **No new algorithm, key or HMAC was introduced:** ZS-SVC-W-001
+  §33 OD-06 ("consent receipt cryptographic integrity scheme and long-term
+  evidence verification policy") is still an *open* decision.
+- Age-band evidence (`age_band`) and **offline/imported consent** (§11.1).
+  When `is_offline_import` is true the request must carry all four of
+  `import_source`, `import_capture_method`, `import_evidence_ref` and
+  `imported_at` (the consent's own original time, never in the future) —
+  otherwise `400 IMPORT_PROVENANCE_REQUIRED`. Online consent is unaffected.
+- `WithdrawalReceipt.propagation_correlation_id` is minted once, at the first
+  (non-replay) withdrawal (§10.1).
+- `NoticeVersion.published_by_principal_id` / `published_at` record who
+  actually published a version — distinct from maker and checker.
+
+## Error contract
+
+Every error a handler writes is `{"error": "...", "error_code": "..."}`.
+
+| Status | `error_code` | Meaning |
+|---|---|---|
+| 400 | `CORRELATION_ID_REQUIRED`, `IDEMPOTENCY_KEY_REQUIRED`, `VALIDATION_FAILED`, `IMPORT_PROVENANCE_REQUIRED` | missing header / invalid body or parameter / incomplete offline-import provenance |
+| 401 | `AUTHENTICATION_FAILED`, `TENANT_SCOPE_REQUIRED` | no principal / no tenant |
+| 403 | `AUTHORIZATION_DENIED`, `SOD_DENIED`, `TENANT_SCOPE_MISMATCH` | no grant / maker-checker violation / body tenant differs from the verified one |
+| 404 | `NOT_FOUND` | unknown (or foreign-tenant) resource |
+| 409 | `INVALID_TRANSITION` | a refused **notice lifecycle transition**: approve needs `DRAFT`, publish needs `APPROVED`, withdraw needs `PUBLISHED` |
+| 409 | `IDEMPOTENCY_MISMATCH` | the `Idempotency-Key` was already used with a different method, path or body |
+| 422 | `PRV-001`, `PRV-008` | purpose not registered/published; notice version not a currently PUBLISHED one (§32) |
+| 503 | `STORE_UNAVAILABLE`, `AUTHORIZATION_SERVICE_UNAVAILABLE`, `UPSTREAM_UNAVAILABLE` | store, authorization-svc or purpose registry unavailable (fail closed) |
+| 500 | `INTERNAL_ERROR` | response could not be serialised |
+
+The two `409`s share a status and are told apart **only** by `error_code`: a lifecycle refusal is never reported as an idempotency conflict, and an idempotency conflict is never derived from the status (it is written with its own code). `ALREADY_WITHDRAWN` and `ALREADY_INVALIDATED` are defined but not produced: a repeated withdrawal or invalidation returns the original record (PRV-N05).
+
+**Not in this envelope** — framework-level responses outside the handlers: the router's plain-text `404`/`405` for an unknown route or method, the empty `500` of the panic recoverer, the `/readyz` `503` body, and requests that Go's `net/http` rejects before routing.
+
+## Events & delivery
+
+`privacy.notice.published` and `privacy.consent.changed` are enqueued by the
+**store**, inside the same transaction as the evidence row they report
+(`internal/outbox`, `event_outbox`) — never after commit. A background relay
+drains the outbox with capped exponential backoff until the broker
+acknowledges (`RequiredAcks: RequireAll`).
+
+### `privacy.consent.changed` payload (§19)
+
+Emitted for grant, deny, withdraw and invalidate (never for a replay):
+
+| Field | Meaning |
+|---|---|
+| `subject_ref`, `purpose_id`, `scope` | the subject and purpose; `scope` from the receipt's `ConsentRequest` when present |
+| `change_type` | `GRANTED` \| `DENIED` \| `WITHDRAWN` \| `INVALIDATED` |
+| `old_state`, `new_state` | the **derived** consent status of the (subject, purpose) pair immediately before and after, both read inside the recording transaction. They can be equal — withdrawing an older receipt does not change what a newer one governs |
+| `receipt_id`; `withdrawal_id` + `propagation_correlation` (withdraw); `invalidation_id` (invalidate) | the evidence reference |
+| `effective_time` | capture time of a grant/deny — for an offline import its original `imported_at`, never a fabricated current time; the recording time of a withdrawal/invalidation |
+| `receipt` / `withdrawal` / `invalidation` | the raw evidence row |
+
+## Tenant isolation
+
+Every evidence table is `FORCE ROW LEVEL SECURITY`, scoped by `app.tenant_id`
+set from the gateway-verified `X-Tenant-Id` on every transaction. The runtime
+role is `zoiko_app` (not a superuser). **Migration `000006` removed the
+`tenant_id IS NULL OR …` exception** that `000003`/`000005` had written into
+every policy: a tenant-owned row is now visible to, and writable by, its own
+tenant and no one else, including a session with no tenant, and **no
+platform-scope exception was added** (§24's "separate governed plane" does not
+exist in this service). Every table also gets a `tenant_id IS NOT NULL` CHECK
+(`NOT VALID`, so new rows cannot bypass tenant assignment) and `event_outbox`
+no longer matches an empty tenant against an empty session.
+
+**Legacy rows:** a row whose `tenant_id` is NULL becomes invisible to the
+application role (it is not deleted — evidence is append-only). The migration
+raises a `WARNING` with the count per table; giving those rows an owner is a
+data decision it does not make.
+
+## Authorization scope
+
+`authz/client.go` forwards the caller's own verified tenant (from request
+context) as `X-Tenant-Id` to `authorization-svc` — never a hard-coded value.
+
+## External dependencies
+
+These are **not** implemented by this service, and none is claimed as working.
+
+1. **`privacy-purpose-registry-svc` — end-to-end consent recording is unverified.**
+   `RecordConsent` calls the registry's `GET /privacy/purposes/{id}` and now
+   forwards the caller's verified `X-Principal-Id` and `X-Tenant-Id` (it used to
+   send the tenant only, which the remediated registry refuses with `401`).
+   What remains outside this service is the registry-side **grant** for that
+   principal (`PRIVACY_PURPOSE_READ`, provisioned in `authorization-svc`); until
+   it is granted the call is `401` → "unavailable" → `503 UPSTREAM_UNAVAILABLE`
+   (fail closed). Pinned against a stub registry by
+   `internal/purposeregistry/client_test.go`; not verified against a live
+   registry or `authorization-svc`.
+2. **`privacy-decision-svc` — consent lookups depend on its own client.** This
+   service requires a principal and `PRIVACY_CONSENT_READ` on
+   `GET /privacy/consents`; the requirement is deliberately **not** relaxed
+   (pinned by `TestGap11_…`). What the decision service presents is that
+   service's concern.
+
+   A **service-to-service identity** for callers that have no end-user
+   principal is named by the architecture as a goal
+   (`docs/architecture/05-security.md` §12.4: "authenticated workload
+   identity", "traceable service-principal identity") but no mechanism is
+   defined — no header scheme, no service-principal provisioning — so none was
+   invented here. It is a platform decision.
+3. **Permission grants are not provisioned by this repository.** The actions
+   this service checks — `PRIVACY_NOTICE_CREATE`, `_APPROVE`, `_PUBLISH`,
+   `_WITHDRAW`, `PRIVACY_NOTICE_PRESENTATION_RECORD`, `PRIVACY_CONSENT_RECORD`,
+   `_WITHDRAW`, `_INVALIDATE`, `PRIVACY_CONSENT_READ`, `PRIVACY_PREFERENCE_SET`,
+   `PRIVACY_PREFERENCE_READ` — are evaluated by `authorization-svc`, whose
+   grants are runtime data created through its admin API. No migration, seed or
+   script in the repository grants any of them (the only RBAC seed script,
+   `scratch/seed_transfer_rbac.ps1`, covers privacy-transfer-svc actions for a
+   fixed test principal). Earlier documentation said `PRIVACY_FULL` contained
+   them; that was not verifiable and has been removed. Until an operator
+   grants them, the routes fail closed with `403`.
+4. **Workforce consent (§11.1) is not implemented here, by design.** The spec
+   says "flag contexts **where policy says** consent may be inappropriate or
+   invalid due to imbalance; require alternate approved basis or review"; the
+   decision-time rule (PRV-N10: "employee consent used where **PDC** flags
+   imbalance concern → REVIEW/BLOCK") belongs to privacy-decision-svc with the
+   PDC policy. Nothing in this service can know a PDC flag, and inventing a
+   flag or an "alternate basis" here would fabricate a control. This service
+   makes no claim to implement it.
+5. **§2.1 WFC boundary.** Notice approve/publish/withdraw are handled entirely
+   within this service (maker-checker enforced locally), while §2.1 lists
+   "workflow timers, maker-checker, approvals and escalation" as WFC's
+   authority. No WFC integration exists in this codebase.
+6. **Representative authority verification (§11.1)** — `is_proxy` requires the
+   representative subject and authority references to be *present*; nothing
+   verifies the authority reference. No verification service exists to call.
+7. **Dark-pattern UI rules (§10.2)** are UI-layer concerns this backend cannot
+   enforce; it only guarantees the API does not pre-select or mislabel.
+
+## Remaining limitations
+
+- *(fixed)* `PreferenceAssertion` now carries the §10.1 effective time — see [Preference effective time](#preference-effective-time).
+- `scope` appears on a consent response only when the caller supplied a
+  `consent_request`.
+- Receipts and legacy rows written before migration `000006` / the `v2`
+  digest are described above; they are not migrated.
+- **At most one `PUBLISHED` version per notice is not enforced — NEEDS CLARIFICATION / DESIGN DECISION.** Publishing supersedes the currently `PUBLISHED` version and then publishes the target, with no lock and no unique index. ZS-SVC-W-001 does not state this invariant (§10.1 asks for an effective window and supersession chain; §6 only that a receipt bind an exact published version), so none was added. Investigated on 2026-10-21 against real PostgreSQL: two concurrent publishes of two `APPROVED` versions of one notice ended with two `PUBLISHED` versions in 24 of 25 rounds. Effects today: `GET /privacy/notices/{id}` and the canonical presentation route pick the `PUBLISHED` version with the latest `effective_from`; receipts still bind an exact `PUBLISHED` version.
+- `GetNotice` treats an unparseable `as_of` as "now" (the registry rejects it
+  with `400`); the consent documentation does not specify which is wanted —
+  needs clarification.
+- Idempotency rows written before migration `000007` keep `principal_id = ''`
+  and can never match a real principal (inert, never replayed across
+  principals).
+
+## Verification
+
+```bash
+# Unit + integration tests. The integration tests need PostgreSQL and a
+# SUPERUSER url (TEST_DATABASE_URL); each test creates and drops its own
+# database and connects as a NOSUPERUSER NOBYPASSRLS role.
+# REQUIRE_DB_TESTS=1 turns a missing database into a FAILURE rather than a skip.
+REQUIRE_DB_TESTS=1 TEST_DATABASE_URL='postgres://postgres:...@localhost:55432/postgres?sslmode=disable' go test ./...
+go vet ./...
+go build ./...
+```
+
+With the database: **147 top-level tests pass, none skipped** (+ subtests; domain 7, handler 94, outbox 10, purposeregistry 3, store 33 — counted across all packages).
+**Without** `TEST_DATABASE_URL`: 109 pass and **38 skip** — the row-level
+security, outbox, notice-binding and store-level evidence tests are among the
+skipped, so a run without the database does **not** prove tenant isolation.
+
+## Migrations
+
+- `000001_initial_schema` — notices, consent/withdrawal/presentation receipts, preferences.
+- `000002_immutability` — append-only triggers on every evidence table.
+- `000003_add_rls` — tenant isolation (superseded in part by `000006`).
+- `000004_idempotency_and_evidence_extensions` — proxy/affirmative-action fields, `consent_idempotency_keys`.
+- `000005_security_and_evidence_gaps` — notice publisher evidence + effective-window end; `consent_requests`; `consent_invalidations`; integrity, age-band, offline-import and expiry columns; `withdrawal_receipts.propagation_correlation_id`; `event_outbox`.
+- `000006_strict_tenant_isolation` — removes the `tenant_id IS NULL OR` exception from every policy, adds `tenant_id IS NOT NULL` CHECKs (`NOT VALID`), tightens the `event_outbox` policy, warns about legacy NULL-tenant rows.
+- `000007_idempotency_principal_scope` — `consent_idempotency_keys.principal_id`; the key becomes `(tenant_id, principal_id, idempotency_key)`. Existing rows keep `principal_id = ''` (inert).
+- `000008_preference_effective_time` — `preference_assertions.effective_at` (nullable; NULL reads as `created_at`; append-only rows are not rewritten) and an index on the effective time.

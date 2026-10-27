@@ -69,10 +69,23 @@ type ExecutionPlan struct {
 	// Offset paging is not offered at all: NP-21 forbids unbounded windows and
 	// a from/size API invites exactly that.
 	SearchAfter []any
-	// Sort is the tie-broken sort order. The final key is always _id so a
-	// cursor is stable across equal scores; without it search_after skips or
-	// repeats documents at a score boundary.
+	// Sort is the caller's sort order. compile() appends _score and then
+	// source_id as the final key, so a cursor is stable across equal scores.
+	// source_id is unique only within one tenant and source_type: two source
+	// types in the same scope that share an id can still tie. The ESR contract
+	// does not prescribe the final tie-break key, so this is recorded as an
+	// open clarification rather than changed here.
 	Sort []SortKey
+
+	// Vector, when set, makes this a semantic plan: approximate nearest
+	// neighbours to Vector over EmbeddingVectorField, K of them. The query
+	// vector is server-computed from the pinned model (§10.1); like every
+	// other field here, a caller has no way to supply one.
+	Vector []float32
+	K      int
+	// Hybrid combines the vector match with the lexical multi_match over
+	// TextFields. False means pure semantic: Text is ignored for matching.
+	Hybrid bool
 
 	Timeout time.Duration
 }
@@ -130,6 +143,15 @@ type FacetBucket struct {
 // ExecutePlan runs a compiled plan against a target, which is always an ALIAS
 // and never a concrete index chosen by a caller.
 func (c *client) ExecutePlan(ctx context.Context, target string, plan ExecutionPlan) (Result, error) {
+	// Both checks are local and run before any network call: a plan that is
+	// unscoped, or a target that expands, never reaches the engine (INV-02,
+	// INV-03, INV-04, INV-07).
+	if err := validateTarget(target); err != nil {
+		return Result{}, err
+	}
+	if err := plan.validate(); err != nil {
+		return Result{}, err
+	}
 	body, err := json.Marshal(plan.compile())
 	if err != nil {
 		return Result{}, fmt.Errorf("searchclient: ExecutePlan marshal: %w", err)
@@ -229,9 +251,14 @@ var ErrNoActiveGeneration = fmt.Errorf("searchclient: scope has no active index 
 func (p ExecutionPlan) compile() map[string]any {
 	filter := make([]map[string]any, 0, len(p.MandatoryFilters)+len(p.UserFilters))
 	for _, f := range p.MandatoryFilters {
-		if c := f.clause(); c != nil {
-			filter = append(filter, c)
+		c := f.clause()
+		if c == nil {
+			// Never drop a mandatory filter. ExecutePlan refuses such a plan
+			// before it gets here; if compile is ever reached with one, the
+			// filter becomes match_none, not an absent constraint (INV-04).
+			c = map[string]any{"match_none": map[string]any{}}
 		}
+		filter = append(filter, c)
 	}
 	for _, f := range p.UserFilters {
 		if c := f.clause(); c != nil {
@@ -244,6 +271,10 @@ func (p ExecutionPlan) compile() map[string]any {
 		if c := f.clause(); c != nil {
 			mustNot = append(mustNot, c)
 		}
+	}
+
+	if len(p.Vector) > 0 {
+		return p.compileSemantic(filter, mustNot)
 	}
 
 	var must []map[string]any
@@ -313,9 +344,10 @@ func (p ExecutionPlan) compile() map[string]any {
 		sorts = append(sorts, map[string]any{s.Field: map[string]any{"order": dir}})
 	}
 	sorts = append(sorts, map[string]any{"_score": map[string]any{"order": "desc"}})
-	// Always last. Without a unique tie-break, search_after can skip or repeat
-	// documents whose sort values are equal — a cursor that silently loses
-	// rows is worse than no cursor.
+	// Always last, as the tie-break. Within one tenant and source_type it is
+	// unique, which keeps search_after from skipping or repeating documents
+	// whose sort values are equal. It is not unique across source types — see
+	// ExecutionPlan.Sort.
 	sorts = append(sorts, map[string]any{"source_id": map[string]any{"order": "asc"}})
 	body["sort"] = sorts
 
@@ -367,6 +399,94 @@ func (p ExecutionPlan) compile() map[string]any {
 		body["aggs"] = aggs
 	}
 
+	if p.Timeout > 0 {
+		body["timeout"] = fmt.Sprintf("%dms", p.Timeout.Milliseconds())
+	}
+	return body
+}
+
+// compileSemantic lowers a vector plan.
+//
+// The eligibility filters are applied TWICE, and both are load-bearing:
+//
+//   - inside the knn clause's own `filter`, so the Lucene graph walk only ever
+//     visits eligible documents. This is §10.1's "ANN execution occurs only
+//     within server-selected eligible partitions/filter sets" and NP-33's
+//     "ANN partition/filter prevents cross-tenant candidates". Without it the
+//     K nearest neighbours are chosen from every tenant first.
+//   - in the outer bool, so a hybrid plan's lexical clause is bounded by the
+//     same set, and so a future engine that ignored the inner filter would
+//     still return nothing ineligible. Similarity is not authorization.
+//
+// No highlight, facets or cursor: a nearest-neighbour page is one bounded
+// page (the planner refuses a cursor), and facet counts over "the K most
+// similar" would describe an arbitrary cut rather than a population.
+func (p ExecutionPlan) compileSemantic(filter, mustNot []map[string]any) map[string]any {
+	k := p.K
+	if k <= 0 {
+		k = p.Size
+	}
+	if k <= 0 {
+		k = 20
+	}
+	size := p.Size
+	if size <= 0 || size > k {
+		size = k
+	}
+
+	eligible := map[string]any{
+		"bool": map[string]any{
+			"filter":   filter,
+			"must_not": mustNot,
+		},
+	}
+	knn := map[string]any{
+		"knn": map[string]any{
+			EmbeddingVectorField: map[string]any{
+				"vector": p.Vector,
+				"k":      k,
+				"filter": eligible,
+			},
+		},
+	}
+
+	boolQuery := map[string]any{
+		"filter":   filter,
+		"must_not": mustNot,
+	}
+	if p.Hybrid && p.Text != "" && len(p.TextFields) > 0 {
+		boolQuery["should"] = []map[string]any{
+			knn,
+			{"multi_match": map[string]any{
+				"query":    p.Text,
+				"type":     "best_fields",
+				"fields":   p.TextFields,
+				"operator": "and",
+			}},
+		}
+		boolQuery["minimum_should_match"] = 1
+	} else {
+		boolQuery["must"] = []map[string]any{knn}
+	}
+
+	body := map[string]any{
+		"size":             size,
+		"query":            map[string]any{"bool": boolQuery},
+		"track_total_hits": true,
+		"sort": []any{
+			map[string]any{"_score": map[string]any{"order": "desc"}},
+			map[string]any{"source_id": map[string]any{"order": "asc"}},
+		},
+	}
+	if len(p.SourceIncludes) > 0 {
+		body["_source"] = map[string]any{"includes": p.SourceIncludes}
+	} else {
+		body["_source"] = map[string]any{"includes": []string{
+			"tenant_id", "legal_entity_id", "source_type", "source_id",
+			"source_version", "restriction_epoch", "retrieval_class",
+			"sensitivity_class", "acl_refs", "index_generation", "indexed_at",
+		}}
+	}
 	if p.Timeout > 0 {
 		body["timeout"] = fmt.Sprintf("%dms", p.Timeout.Milliseconds())
 	}
@@ -439,7 +559,9 @@ func maxInt(a, b int) int {
 }
 
 // StripHighlightMarkers removes the private-use sentinels compile() asked the
-// engine to wrap matches in, returning the plain text and the matched spans.
+// engine to wrap matches in, and returns the plain text only. It does not
+// return the matched spans: the retrieval layer finds them itself, from the
+// exported HighlightOpen and HighlightClose, before calling this.
 //
 // The retrieval layer escapes the plain text first and re-inserts real markup
 // around the spans afterwards, so stored HTML in an indexed body cannot reach a

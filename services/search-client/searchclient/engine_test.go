@@ -36,9 +36,13 @@ func TestGovernanceProperties_TenantIsExactMatch(t *testing.T) {
 }
 
 func TestReservedFields_CoversEveryGovernanceProperty(t *testing.T) {
-	assert.Len(t, ReservedFields(), len(GovernanceProperties()))
+	// Every governance property, plus the vector field — which only semantic
+	// generations map, but which no contract may ever register.
+	assert.Len(t, ReservedFields(), len(GovernanceProperties())+1)
 	assert.Contains(t, ReservedFields(), "tenant_id")
 	assert.Contains(t, ReservedFields(), "restriction_epoch")
+	assert.Contains(t, ReservedFields(), EmbeddingVectorField)
+	assert.Contains(t, ReservedFields(), "embedding_model")
 }
 
 // INV-08's mapping half: a registered-but-unsearchable text field is stored

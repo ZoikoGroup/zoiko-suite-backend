@@ -289,23 +289,7 @@ func (s *PgStore) RecordExecution(ctx context.Context, tenantID, runID, actor, c
 			return err
 		}
 		for _, e := range rec.Exceptions {
-			if _, err := tx.Exec(ctx, `
-				INSERT INTO control_exceptions (exception_id, tenant_id, run_id, legal_entity_id, category, reason_code,
-					assertion, severity, side, record_ids, exposure, currency, detail, owner_role, due_at, state, expected_clearing)
-				VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::numeric,$12,$13,$14,$15,'OPEN',$16::date)`,
-				e.ExceptionID, tenantID, runID, cur.LegalEntityID, e.Category, e.ReasonCode, e.Assertion,
-				string(e.Severity), string(e.Side), e.RecordIDs, e.Exposure, e.Currency, e.Detail, e.OwnerRole, e.DueAt, e.ExpectedClearing); err != nil {
-				return err
-			}
-			if err := insertExceptionTransition(ctx, tx, tenantID, e.ExceptionID, "", string(domain.ExOpen),
-				"opened by control execution", actor, correlationID); err != nil {
-				return err
-			}
-			if err := emitException(ctx, tx, cur, e.ExceptionID, events.ExceptionOpened, actor, correlationID, map[string]any{
-				"exception_id": e.ExceptionID, "run_id": runID, "category": e.Category, "reason_code": e.ReasonCode,
-				"assertion": e.Assertion, "severity": e.Severity, "exposure": e.Exposure, "currency": e.Currency,
-				"owner_role": e.OwnerRole, "due_at": e.DueAt.UTC().Format(time.RFC3339),
-			}); err != nil {
+			if err := openException(ctx, tx, cur, e, "opened by control execution", actor, correlationID, nil); err != nil {
 				return err
 			}
 		}
@@ -543,6 +527,33 @@ func (s *PgStore) AssignException(ctx context.Context, tenantID, exceptionID, ac
 		return nil, err
 	}
 	return &out, nil
+}
+
+// openException inserts e on run as OPEN, with its opening transition and its
+// control.exception.opened event, inside tx. extra is added to the event payload.
+func openException(ctx context.Context, tx pgx.Tx, run domain.ControlRun, e domain.ControlException,
+	reason, actor, correlationID string, extra map[string]any) error {
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO control_exceptions (exception_id, tenant_id, run_id, legal_entity_id, category, reason_code,
+			assertion, severity, side, record_ids, exposure, currency, detail, owner_role, due_at, state, expected_clearing)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::numeric,$12,$13,$14,$15,'OPEN',$16::date)`,
+		e.ExceptionID, run.TenantID, run.RunID, run.LegalEntityID, e.Category, e.ReasonCode, e.Assertion,
+		string(e.Severity), string(e.Side), e.RecordIDs, e.Exposure, e.Currency, e.Detail, e.OwnerRole, e.DueAt, e.ExpectedClearing); err != nil {
+		return err
+	}
+	if err := insertExceptionTransition(ctx, tx, run.TenantID, e.ExceptionID, "", string(domain.ExOpen),
+		reason, actor, correlationID); err != nil {
+		return err
+	}
+	payload := map[string]any{
+		"exception_id": e.ExceptionID, "run_id": run.RunID, "category": e.Category, "reason_code": e.ReasonCode,
+		"assertion": e.Assertion, "severity": e.Severity, "exposure": e.Exposure, "currency": e.Currency,
+		"owner_role": e.OwnerRole, "due_at": e.DueAt.UTC().Format(time.RFC3339),
+	}
+	for k, v := range extra {
+		payload[k] = v
+	}
+	return emitException(ctx, tx, run, e.ExceptionID, events.ExceptionOpened, actor, correlationID, payload)
 }
 
 func insertExceptionTransition(ctx context.Context, tx pgx.Tx, tenantID, exceptionID, from, to, reason, actor, correlationID string) error {

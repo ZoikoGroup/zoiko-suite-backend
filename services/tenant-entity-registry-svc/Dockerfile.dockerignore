@@ -1,0 +1,13 @@
+# Used by BuildKit for builds with -f services/tenant-entity-registry-svc/Dockerfile.
+# The context is the repository root (see the Dockerfile), so everything is
+# excluded except the modules the image is built from.
+*
+!services/tenant-entity-registry-svc/
+!services/identity-envelope/
+
+# Not needed inside the image.
+services/tenant-entity-registry-svc/.gotmp/
+services/tenant-entity-registry-svc/**/*.exe
+services/tenant-entity-registry-svc/**/*_test.go
+services/tenant-entity-registry-svc/deployments/
+services/identity-envelope/**/*_test.go

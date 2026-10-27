@@ -116,14 +116,40 @@ func (s *stubRegistry) ResolveSellerRegistration(_ context.Context, _, _, _, _ s
 	return s.reg, s.err
 }
 
+type stubRulesClient struct {
+	rule *rules.TaxRuleDTO
+	err  error
+}
+
+func (s *stubRulesClient) FetchActiveRule(_ context.Context, _, _, category string) (*rules.TaxRuleDTO, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	if s.rule != nil {
+		return s.rule, nil
+	}
+	return &rules.TaxRuleDTO{
+		RuleID:            "trule-test-01",
+		RuleCode:          "TEST-VAT-20",
+		Name:              "Test VAT 20%",
+		Category:          category,
+		TaxRatePercentage: 20.0,
+		Status:            "ACTIVE",
+	}, nil
+}
+
 func newTestHandler() *Handler {
 	return newTestHandlerWith(&stubJurisdiction{}, &stubRegistry{})
 }
 
 func newTestHandlerWith(jv JurisdictionValidator, rr RegistrationResolver) *Handler {
 	logger, _ := zap.NewDevelopment()
-	rulesClient := rules.NewClient("http://localhost:8125")
-	return New(newStubStore(), &stubPublisher{}, &stubAuthz{}, rulesClient, jv, rr, logger)
+	return New(newStubStore(), &stubPublisher{}, &stubAuthz{}, &stubRulesClient{}, jv, rr, logger)
+}
+
+func newTestHandlerWithRules(rc RulesClient, jv JurisdictionValidator, rr RegistrationResolver) *Handler {
+	logger, _ := zap.NewDevelopment()
+	return New(newStubStore(), &stubPublisher{}, &stubAuthz{}, rc, jv, rr, logger)
 }
 
 // withTAX03 fills the TAX-03 required business/source inputs on a request that
@@ -156,7 +182,8 @@ func withTAX03(req domain.DetermineTaxRequest) domain.DetermineTaxRequest {
 		req.SupplyType = domain.SupplyTypeB2C
 	}
 	if req.Currency == "" {
-		req.Currency = "GBP"
+		testCurr := "GBP"
+		req.Currency = testCurr
 	}
 	return req
 }
@@ -204,28 +231,35 @@ func TestDetermineTax(t *testing.T) {
 	}
 }
 
-// TestDetermineTax_FallbackRuleHasNoSnapshot proves the zero-tax fallback
-// (tax-rules-svc unreachable, exercised here since newTestHandler points at
-// a non-listening address) is never given a fabricated snapshot reference —
-// there is no real rule content behind it to snapshot.
-func TestDetermineTax_FallbackRuleHasNoSnapshot(t *testing.T) {
-	h := newTestHandler()
+// TestDetermineTax_MissingRule_FailsClosed proves that a missing tax rule
+// blocks determination and returns 422 Unprocessable Entity (TAX-03 Invariant 3 / D1).
+func TestDetermineTax_MissingRule_FailsClosed(t *testing.T) {
+	h := newTestHandlerWithRules(&stubRulesClient{err: domain.ErrTaxRuleNotFound}, &stubJurisdiction{}, &stubRegistry{})
 	body := domain.DetermineTaxRequest{
 		TransactionID: "tx-inv-1002", SourceModule: "INVOICE", LegalEntityID: "le-001",
+		JurisdictionID: "unknown-jurisdiction", TaxCategory: "VAT", GrossAmount: 1000.0,
+		Currency: "GBP", EffectiveFrom: "2026-01-01", EvaluatedBy: "billing-engine",
+	}
+	w := httptest.NewRecorder()
+	h.DetermineTax(w, buildRequest(http.MethodPost, "/v1/tax-determinations", withTAX03(body)))
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 Unprocessable Entity when tax rule is missing, got %d — %s", w.Code, w.Body.String())
+	}
+}
+
+// TestDetermineTax_ServiceUnavailable_FailsClosed proves that if tax-rules-svc is unreachable,
+// determination fails closed with 503 Service Unavailable rather than 0% fallback.
+func TestDetermineTax_ServiceUnavailable_FailsClosed(t *testing.T) {
+	h := newTestHandlerWithRules(&stubRulesClient{err: rules.ErrTaxRulesUnavailable}, &stubJurisdiction{}, &stubRegistry{})
+	body := domain.DetermineTaxRequest{
+		TransactionID: "tx-inv-1003", SourceModule: "INVOICE", LegalEntityID: "le-001",
 		JurisdictionID: "uk-england", TaxCategory: "VAT", GrossAmount: 1000.0,
 		Currency: "GBP", EffectiveFrom: "2026-01-01", EvaluatedBy: "billing-engine",
 	}
 	w := httptest.NewRecorder()
 	h.DetermineTax(w, buildRequest(http.MethodPost, "/v1/tax-determinations", withTAX03(body)))
-	if w.Code != http.StatusCreated {
-		t.Fatalf("expected 201, got %d — %s", w.Code, w.Body.String())
-	}
-	var resp domain.TaxDetermination
-	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
-		t.Fatalf("failed to decode response: %v", err)
-	}
-	if resp.TaxLogicSnapshotID != nil {
-		t.Errorf("expected nil tax_logic_snapshot_id for the fallback rule, got %v", *resp.TaxLogicSnapshotID)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 Service Unavailable when rules service is down, got %d — %s", w.Code, w.Body.String())
 	}
 }
 

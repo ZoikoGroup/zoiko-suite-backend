@@ -28,6 +28,7 @@ import (
 	"github.com/riandyrn/otelchi"
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
+	idenv "zoiko.io/identity-envelope"
 
 	"zoiko.io/tenant-entity-registry-svc/internal/authz"
 	"zoiko.io/tenant-entity-registry-svc/internal/config"
@@ -38,6 +39,7 @@ import (
 	"zoiko.io/tenant-entity-registry-svc/internal/idempotency"
 	"zoiko.io/tenant-entity-registry-svc/internal/jurisdiction"
 	svcmiddleware "zoiko.io/tenant-entity-registry-svc/internal/middleware"
+	"zoiko.io/tenant-entity-registry-svc/internal/mtlslistener"
 	"zoiko.io/tenant-entity-registry-svc/internal/outbox"
 	"zoiko.io/tenant-entity-registry-svc/internal/registry"
 	"zoiko.io/tenant-entity-registry-svc/internal/store"
@@ -197,13 +199,26 @@ func main() {
 	svc.ConfigureConcurrency(cfg.ExpectedVersionOptional)
 
 	// ── 6. HTTP router ───────────────────────────────────────────────────────
+	// Identity gate (X5 / X-R3, decision 21 Oct 2026): identity-context-svc's
+	// signed envelope is verified (JWKS) with its session status (AU-01), and
+	// its claims become the only source of X-Principal-Id / X-Tenant-Id; a peer
+	// over verified mTLS may vouch for them instead. Until now this service took
+	// those headers as sent. IDENTITY_VERIFY: require (default outside local) | warn.
+	gate, gateSettings, err := idenv.NewGateFromEnv("tenant-entity-registry-svc", log, idenv.EnvOptions{DefaultPeers: cfg.MTLSAllowedClients})
+	if err != nil {
+		log.Fatal("identity gate configuration refused", zap.Error(err))
+	}
+	log.Info("identity gate", gateSettings.Fields()...)
+
 	r := chi.NewRouter()
+	r.Use(idenv.RequestID)
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
 	r.Use(middleware.Recoverer)
 	r.Use(otelchi.Middleware("tenant-entity-registry-svc", otelchi.WithChiRoutes(r)))
 	r.Use(metrics.HTTPMiddleware)
 	r.Use(correlationIDMiddleware)
+	r.Use(gate.Middleware)
 	// Extract the caller's gateway-verified identity into the request context:
 	// tenant_id so every DB call can set app.tenant_id on the Postgres session
 	// and RLS is actually enforced, and principal_id so mutations are
@@ -254,6 +269,22 @@ func main() {
 		}
 	}()
 
+	// Mutual-TLS listener for gateway-auth-svc and other platform callers
+	// (SEC-INV-05, S5-B1). Same router; provisioned in the background, so an
+	// unavailable mtls-management-svc never stops the plaintext listener.
+	mtlsCtx, stopMTLS := context.WithCancel(context.Background())
+	defer stopMTLS()
+	var mtlsListener *mtlslistener.Listener
+	if cfg.MTLSEnabled {
+		mtlsListener = mtlslistener.Start(mtlsCtx, mtlslistener.Options{
+			ServiceName:        "tenant-entity-registry-svc",
+			Port:               cfg.MTLSPort,
+			ManagementURL:      cfg.MTLSManagementURL,
+			BootstrapTokenPath: cfg.MTLSBootstrapTokenPath,
+			AllowedClients:     cfg.MTLSAllowedClients,
+		}, r, log)
+	}
+
 	// Wait for SIGINT or SIGTERM.
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
@@ -268,6 +299,12 @@ func main() {
 	defer shutdownCancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Error("graceful shutdown failed", zap.Error(err))
+	}
+	if mtlsListener != nil {
+		stopMTLS()
+		if err := mtlsListener.Shutdown(shutdownCtx); err != nil {
+			log.Error("mtls listener shutdown failed", zap.Error(err))
+		}
 	}
 	// Stop the relay after the HTTP server, not before: a request in flight
 	// during shutdown can still enqueue an event, and draining first would
@@ -295,10 +332,11 @@ func (a kafkaWriterAdapter) WriteMessages(ctx context.Context, msgs ...outbox.Ka
 // If the header is absent a new ID is injected via chi's RequestID middleware.
 func correlationIDMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("X-Correlation-ID") == "" {
-			r.Header.Set("X-Correlation-ID", middleware.GetReqID(r.Context()))
+		// Echoed, never invented: a correlation id made up here, before the
+		// input contract can refuse a request without one, traces nothing.
+		if id := r.Header.Get("X-Correlation-ID"); id != "" {
+			w.Header().Set("X-Correlation-ID", id)
 		}
-		w.Header().Set("X-Correlation-ID", r.Header.Get("X-Correlation-ID"))
 		next.ServeHTTP(w, r)
 	})
 }

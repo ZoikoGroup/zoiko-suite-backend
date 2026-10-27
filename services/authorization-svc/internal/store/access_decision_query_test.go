@@ -599,17 +599,19 @@ func TestFindPrincipalStatus_EmptyPrincipalIsActive(t *testing.T) {
 	}
 }
 
-// The claim 000013's down migration rests on: with the table ABSENT, layer 0
-// answers ACTIVE rather than failing the evaluation.
+// With the table ABSENT, layer 0 fails CLOSED: the read is an outage
+// (ErrStoreUnavailable), never an ACTIVE answer.
 //
-// Without this, reverting 000013 on a live service would 503 every
-// authorization call on the platform — a rollback that takes the authorization
-// plane down is not a rollback. Matched on SQLSTATE 42P01 rather than on the
-// error message, which is localised.
+// This test used to assert the opposite — that a missing projection answered
+// ACTIVE so 000013 could be reverted on a live service. That made a dropped
+// or renamed table silently admit every suspended and terminated principal;
+// the 7 Oct governance pass made every evaluation-layer lookup fail closed
+// (ZS-IAM-001), so 000013 is no longer revertible on a running service, and
+// its down migration says so.
 //
 // This test drops the table AFTER setup deliberately: it is the only way to
 // reach the branch, and it is why the drop is the last thing it does.
-func TestFindPrincipalStatus_MissingTableIsInertNotAnOutage(t *testing.T) {
+func TestFindPrincipalStatus_MissingTableFailsClosed(t *testing.T) {
 	pool := getTestPool(t)
 	setupTestDB(t, pool)
 	s := store.New(pool, zap.NewNop())
@@ -621,19 +623,10 @@ func TestFindPrincipalStatus_MissingTableIsInertNotAnOutage(t *testing.T) {
 
 	// Both branches — the tenant-scoped read and the tenantless one, which
 	// take different code paths (withRLS vs withPlatformScope).
-	scoped, err := s.FindPrincipalStatus(ctx, "p-1", qTenantA)
-	if err != nil {
-		t.Fatalf("tenant-scoped read with the table absent returned %v — reverting 000013 would 503 every authorization call on the platform", err)
+	if status, err := s.FindPrincipalStatus(ctx, "p-1", qTenantA); !errors.Is(err, domain.ErrStoreUnavailable) {
+		t.Errorf("tenant-scoped read with the table absent = %q, %v; want ErrStoreUnavailable", status, err)
 	}
-	if scoped != domain.PrincipalStatusActive {
-		t.Errorf("tenant-scoped read = %q, want ACTIVE", scoped)
-	}
-
-	tenantless, err := s.FindPrincipalStatus(ctx, "p-1", "")
-	if err != nil {
-		t.Fatalf("tenantless read with the table absent returned %v", err)
-	}
-	if tenantless != domain.PrincipalStatusActive {
-		t.Errorf("tenantless read = %q, want ACTIVE", tenantless)
+	if status, err := s.FindPrincipalStatus(ctx, "p-1", ""); !errors.Is(err, domain.ErrStoreUnavailable) {
+		t.Errorf("tenantless read with the table absent = %q, %v; want ErrStoreUnavailable", status, err)
 	}
 }

@@ -185,11 +185,11 @@ type Domain struct {
 	OutboxPublished *prometheus.CounterVec
 	// OutboxFailures counts relay drain attempts that failed.
 	OutboxFailures prometheus.Counter
-// OutboxOldestAgeSeconds is the age of the oldest unpublished event. Depth
-// alone cannot distinguish a busy moment from a stalled relay: a backlog of
-// ten that is three seconds old is healthy, and a backlog of ten that is an
-// hour old means authority.revoked has not reached the consumer that ends
-// the delegate's session.
+	// OutboxOldestAgeSeconds is the age of the oldest unpublished event. Depth
+	// alone cannot distinguish a busy moment from a stalled relay: a backlog of
+	// ten that is three seconds old is healthy, and a backlog of ten that is an
+	// hour old means authority.revoked has not reached the consumer that ends
+	// the delegate's session.
 	OutboxOldestAgeSeconds prometheus.Gauge
 	// RefusedEscalations counts refused escalation attempts by reason.
 	// ORG-06 §4.2: "Every refused escalation attempt leaves durable evidence."
@@ -219,13 +219,13 @@ const (
 
 // Refused escalation reasons (for telemetry).
 const (
-	RefusedSelfDealing          = "self_dealing"
-	RefusedDelegatorMismatch    = "delegator_mismatch"
-	RefusedDelegatorLacksAuth   = "delegator_lacks_authority"
-	RefusedSODConflict          = "sod_conflict"
-	RefusedOverlapConflict      = "overlap_conflict"
-	RefusedInvalidWindow        = "invalid_window"
-	RefusedNoCreateGrant        = "no_create_grant"
+	RefusedSelfDealing        = "self_dealing"
+	RefusedDelegatorMismatch  = "delegator_mismatch"
+	RefusedDelegatorLacksAuth = "delegator_lacks_authority"
+	RefusedSODConflict        = "sod_conflict"
+	RefusedOverlapConflict    = "overlap_conflict"
+	RefusedInvalidWindow      = "invalid_window"
+	RefusedNoCreateGrant      = "no_create_grant"
 )
 
 // Revocation outcomes.

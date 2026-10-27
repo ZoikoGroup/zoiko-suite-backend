@@ -159,6 +159,54 @@ func (d Dimensions) Value() (driver.Value, error) {
 	return json.Marshal(map[string]string(d))
 }
 
+// EffectiveDate is a wire date for ACC-01's effective-dated account state.
+//
+// The spec calls the input an "effective date" but does not prescribe whether
+// callers send a calendar date or an instant. Both are accepted here: a
+// date-only value means end of that UTC day (the inclusive convention people
+// normally mean by "effective from 1 July"), while an RFC3339 timestamp is
+// honoured exactly. Keeping this separate from Date leaves journal dates
+// strict — a timestamp is still refused where the ledger expects a day.
+type EffectiveDate struct {
+	time.Time
+}
+
+// IsZero reports whether no effective date was supplied.
+func (d EffectiveDate) IsZero() bool { return d.Time.IsZero() }
+
+// MarshalJSON emits RFC3339, or null when unset.
+func (d EffectiveDate) MarshalJSON() ([]byte, error) {
+	if d.IsZero() {
+		return []byte("null"), nil
+	}
+	return []byte(`"` + d.UTC().Format(time.RFC3339Nano) + `"`), nil
+}
+
+// UnmarshalJSON accepts "2006-01-02", an RFC3339 timestamp, or null.
+func (d *EffectiveDate) UnmarshalJSON(b []byte) error {
+	s := strings.TrimSpace(string(b))
+	if s == "null" || s == `""` {
+		*d = EffectiveDate{}
+		return nil
+	}
+	if len(s) < 2 || s[0] != '"' || s[len(s)-1] != '"' {
+		return fmt.Errorf("effective date must be a JSON string in %s or RFC3339 form", DateLayout)
+	}
+	raw := s[1 : len(s)-1]
+	if parsed, err := time.Parse(DateLayout, raw); err == nil {
+		// End of the named day, so "effective 2026-10-19" is inclusive for an
+		// as-of read performed later that same day.
+		*d = EffectiveDate{parsed.Add(24*time.Hour - time.Nanosecond)}
+		return nil
+	}
+	parsed, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return fmt.Errorf("effective date %q is neither %s nor RFC3339", raw, DateLayout)
+	}
+	*d = EffectiveDate{parsed.UTC()}
+	return nil
+}
+
 // Value implements driver.Valuer for the DATE columns.
 func (d Date) Value() (driver.Value, error) {
 	if d.IsZero() {

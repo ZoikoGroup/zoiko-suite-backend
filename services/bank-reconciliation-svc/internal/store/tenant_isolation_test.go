@@ -53,37 +53,44 @@ var (
 )
 
 func TestMain(m *testing.M) {
-	dbPort := uint32(15901 + uint32(os.Getpid()%499))
-	pg := embeddedpostgres.NewDatabase(
-		embeddedpostgres.DefaultConfig().
-			// Version pinned explicitly — see the doc comment on
-			// embeddedpostgres.DefaultConfig() in audit-event-store-svc's
-			// main_integration_test.go for why: the unpinned default floats
-			// to whatever major the library calls "latest," and that patch
-			// build can stop resolving from the remote binary repo with no
-			// code change on our side (this is what broke PR #105's CI).
-			Version(embeddedpostgres.V16).
-			Port(dbPort).
-			Database("bankrec_isolation_test").
-			Username("postgres").
-			Password("postgres"),
-	)
-	if err := pg.Start(); err != nil {
-		fmt.Printf("failed to start embedded postgres: %v\n", err)
-		os.Exit(1)
+	ctx := context.Background()
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	var pg *embeddedpostgres.EmbeddedPostgres
+
+	if dsn == "" {
+		dbPort := uint32(15901 + uint32(os.Getpid()%499))
+		pg = embeddedpostgres.NewDatabase(
+			embeddedpostgres.DefaultConfig().
+				// Version pinned explicitly — see the doc comment on
+				// embeddedpostgres.DefaultConfig() in audit-event-store-svc's
+				// main_integration_test.go for why: the unpinned default floats
+				// to whatever major the library calls "latest," and that patch
+				// build can stop resolving from the remote binary repo with no
+				// code change on our side (this is what broke PR #105's CI).
+				Version(embeddedpostgres.PostgresVersion("16.15.0")).
+				Port(dbPort).
+				Database("bankrec_isolation_test").
+				Username("postgres").
+				Password("postgres"),
+		)
+		if err := pg.Start(); err != nil {
+			fmt.Printf("failed to start embedded postgres: %v\n", err)
+			os.Exit(1)
+		}
+
+		dsn = fmt.Sprintf(
+			"host=localhost port=%d dbname=bankrec_isolation_test user=postgres password=postgres sslmode=disable",
+			dbPort,
+		)
 	}
 
-	dsn := fmt.Sprintf(
-		"host=localhost port=%d dbname=bankrec_isolation_test user=postgres password=postgres sslmode=disable",
-		dbPort,
-	)
-
-	ctx := context.Background()
 	var err error
 	testPool, err = pgxpool.New(ctx, dsn)
 	if err != nil {
 		fmt.Printf("failed to connect to postgres: %v\n", err)
-		_ = pg.Stop()
+		if pg != nil {
+			_ = pg.Stop()
+		}
 		os.Exit(1)
 	}
 
@@ -96,9 +103,21 @@ func TestMain(m *testing.M) {
 	if err != nil {
 		fmt.Printf("postgres did not become ready: %v\n", err)
 		testPool.Close()
-		_ = pg.Stop()
+		if pg != nil {
+			_ = pg.Stop()
+		}
 		os.Exit(1)
 	}
+
+	_, _ = testPool.Exec(ctx, `
+			DROP TABLE IF EXISTS reconciliation_evidence_conflicts CASCADE;
+			DROP TABLE IF EXISTS reconciliation_population_lines CASCADE;
+			DROP TABLE IF EXISTS reconciliation_populations CASCADE;
+			DROP TABLE IF EXISTS reconciliation_policies CASCADE;
+			DROP TABLE IF EXISTS reconciliation_runs CASCADE;
+			DROP TABLE IF EXISTS reconciliation_certificates CASCADE;
+			DROP TABLE IF EXISTS statement_lines CASCADE;
+		`)
 
 	// EVERY *.up.sql, BY GLOB, NOT A NAMED LIST.
 	//
@@ -134,23 +153,29 @@ func TestMain(m *testing.M) {
 		if err != nil {
 			fmt.Printf("failed to read migration %s: %v\n", migration, err)
 			testPool.Close()
-			_ = pg.Stop()
+			if pg != nil {
+				_ = pg.Stop()
+			}
 			os.Exit(1)
 		}
 		if _, err = testPool.Exec(ctx, string(sql)); err != nil {
 			fmt.Printf("failed to apply migration %s: %v\n", filepath.Base(migration), err)
 			testPool.Close()
-			_ = pg.Stop()
+			if pg != nil {
+				_ = pg.Stop()
+			}
 			os.Exit(1)
 		}
 	}
 
-	testStore = store.New(testPool, zap.NewNop())
+	testStore = store.New(testPool, zap.NewNop(), store.WithEventRegion("uk"))
 
 	code := m.Run()
 
 	testPool.Close()
-	_ = pg.Stop()
+	if pg != nil {
+		_ = pg.Stop()
+	}
 	os.Exit(code)
 }
 
@@ -185,7 +210,7 @@ func setupIsolationFixture(t *testing.T, tenantLabel string) lineFixture {
 		BankReference:   "ACH-" + tenantLabel,
 		Status:          domain.StatementLineStatusUnmatched,
 		CorrelationID:   "corr-" + tenantLabel + "-" + f.statementLineID,
-	})
+	}, "ingest-fixture")
 	require.NoError(t, err)
 
 	return f
@@ -211,7 +236,7 @@ func TestPgStore_CreateStatementLine_RetriedCorrelationID_IsIdempotent(t *testin
 		Status:          domain.StatementLineStatusUnmatched,
 		CorrelationID:   "corr-retry-1",
 	}
-	created1, err := testStore.CreateStatementLine(ctx, line1)
+	created1, err := testStore.CreateStatementLine(ctx, line1, "ingest-actor")
 	require.NoError(t, err)
 	assert.True(t, created1, "expected created=true on the first call")
 
@@ -227,7 +252,7 @@ func TestPgStore_CreateStatementLine_RetriedCorrelationID_IsIdempotent(t *testin
 		Status:          domain.StatementLineStatusUnmatched,
 		CorrelationID:   "corr-retry-1",
 	}
-	created2, err := testStore.CreateStatementLine(ctx, line2)
+	created2, err := testStore.CreateStatementLine(ctx, line2, "ingest-actor")
 	require.NoError(t, err)
 	assert.False(t, created2, "expected created=false on the retried call — this is a duplicate-line bug if it's true")
 	assert.Equal(t, line1.StatementLineID, line2.StatementLineID, "retried call must resolve to the original statement_line_id")
@@ -236,6 +261,15 @@ func TestPgStore_CreateStatementLine_RetriedCorrelationID_IsIdempotent(t *testin
 	require.NoError(t, testPool.QueryRow(ctx, `SELECT COUNT(*) FROM statement_lines WHERE tenant_id = $1 AND correlation_id = $2`,
 		tenantID, "corr-retry-1").Scan(&count))
 	assert.Equal(t, 1, count, "DUPLICATE LINE: expected exactly 1 statement_lines row for this correlation_id")
+
+	// TestPgStore_CreateStatementLine_RetriedCorrelationID_DoesNotReenqueue:
+	// the replay branch must not call enqueueReconciliationEvent a second
+	// time — a retried ingest must never re-announce the fact to the outbox.
+	var outboxCount int
+	require.NoError(t, testPool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM eventing_outbox WHERE tenant_id = $1 AND aggregate_id = $2 AND event_type LIKE '%reconciliation.ingested'`,
+		tenantID, line1.StatementLineID).Scan(&outboxCount))
+	assert.Equal(t, 1, outboxCount, "expected exactly 1 outbox row for this ingestion — a retry must not re-enqueue the event")
 }
 
 // TestPgStore_CreateStatementLine_WritesContextTenantNotStructTenant proves
@@ -264,7 +298,7 @@ func TestPgStore_CreateStatementLine_WritesContextTenantNotStructTenant(t *testi
 		BankReference:   "ACH-crosstenant",
 		Status:          domain.StatementLineStatusUnmatched,
 		CorrelationID:   "corr-crosstenant-" + lineID,
-	})
+	}, "ingest-actor")
 	require.NoError(t, err)
 
 	var stored string
@@ -337,7 +371,7 @@ func TestPgStore_ListStatementLines_IsBounded(t *testing.T) {
 			BankReference:   "ACH-bounded",
 			Status:          domain.StatementLineStatusUnmatched,
 			CorrelationID:   "corr-bounded-" + id,
-		})
+		}, "ingest-actor")
 		require.NoError(t, err)
 	}
 

@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -80,6 +81,104 @@ func TestPgStore_MarkSatisfied_RequiresCleanScan(t *testing.T) {
 
 	if _, err := s.MarkSatisfied(ctx, domain.MarkSatisfiedParams{RequestID: req.RequestID, TenantID: tenantID, ActorPrincipalID: "auditor-1"}); err != domain.ErrArtifactNotScanned {
 		t.Fatalf("expected ErrArtifactNotScanned before the scan completes, got %v", err)
+	}
+}
+
+// A retry carries the same JSON the caller sent the first time, including a
+// nanosecond-precision due_at. Postgres stores microseconds, so a replay that
+// compared instants at full precision would report a false idempotency
+// mismatch. Same request must resolve to the original row.
+func TestPgStore_CreateEvidenceRequest_ReplayToleratesDatePrecision(t *testing.T) {
+	pool := openTestPool(t)
+	defer pool.Close()
+	tenantID := uuid.New().String()
+	s := store.New(pool, zap.NewNop())
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+
+	params := domain.CreateEvidenceRequestParams{
+		TenantID: tenantID, LegalEntityID: uuid.New().String(), Title: "Q2 confirmations",
+		Description: "same body on retry", AssignedToPrincipalID: "client-contact-1",
+		DueAt: time.Now().Add(48 * time.Hour).UTC(), CreatedByPrincipalID: "auditor-1",
+		CorrelationID: "precision-create",
+	}
+	first, created, err := s.CreateEvidenceRequest(ctx, uuid.NewString(), params)
+	if err != nil || !created {
+		t.Fatalf("first create: created=%v err=%v", created, err)
+	}
+
+	second, created, err := s.CreateEvidenceRequest(ctx, uuid.NewString(), params)
+	if err != nil {
+		t.Fatalf("replay create: %v", err)
+	}
+	if created {
+		t.Fatal("expected the retry to resolve to the existing row")
+	}
+	if second.RequestID != first.RequestID {
+		t.Fatalf("replay returned %s, want %s", second.RequestID, first.RequestID)
+	}
+}
+
+// Same correlation id must not answer a different create request.
+func TestPgStore_CreateEvidenceRequest_ReplayWithDifferentBodyConflicts(t *testing.T) {
+	pool := openTestPool(t)
+	defer pool.Close()
+	tenantID := uuid.New().String()
+	s := store.New(pool, zap.NewNop())
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+
+	params := domain.CreateEvidenceRequestParams{
+		TenantID: tenantID, LegalEntityID: uuid.New().String(), Title: "original",
+		AssignedToPrincipalID: "client-contact-1", DueAt: time.Now().Add(time.Hour).UTC(),
+		CreatedByPrincipalID: "auditor-1", CorrelationID: "conflict-create",
+	}
+	if _, created, err := s.CreateEvidenceRequest(ctx, uuid.NewString(), params); err != nil || !created {
+		t.Fatalf("first create: created=%v err=%v", created, err)
+	}
+
+	params.Title = "different"
+	if _, _, err := s.CreateEvidenceRequest(ctx, uuid.NewString(), params); !errors.Is(err, domain.ErrIdempotencyMismatch) {
+		t.Fatalf("err = %v, want ErrIdempotencyMismatch", err)
+	}
+}
+
+// Same response correlation submitted by a different principal is a
+// conflict, not a replay.
+func TestPgStore_SubmitResponse_ReplayByDifferentPrincipalConflicts(t *testing.T) {
+	pool := openTestPool(t)
+	defer pool.Close()
+	tenantID := uuid.New().String()
+	s := store.New(pool, zap.NewNop())
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+
+	req := createSentRequest(t, s, ctx, tenantID, "resp-conflict")
+	if _, _, err := s.SubmitResponse(ctx, domain.SubmitResponseParams{
+		RequestID: req.RequestID, TenantID: tenantID, SubmittedByPrincipalID: "client-contact-1", CorrelationID: "resp-conflict-1",
+	}); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	_, _, err := s.SubmitResponse(ctx, domain.SubmitResponseParams{
+		RequestID: req.RequestID, TenantID: tenantID, SubmittedByPrincipalID: "someone-else", CorrelationID: "resp-conflict-1",
+	})
+	if !errors.Is(err, domain.ErrIdempotencyMismatch) {
+		t.Fatalf("err = %v, want ErrIdempotencyMismatch", err)
+	}
+}
+
+// An omitted legal-entity filter is "all entities", not a malformed uuid.
+func TestPgStore_ListOpenEvidenceRequests_EmptyEntityFilter(t *testing.T) {
+	pool := openTestPool(t)
+	defer pool.Close()
+	tenantID := uuid.New().String()
+	s := store.New(pool, zap.NewNop())
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+
+	req := createSentRequest(t, s, ctx, tenantID, "empty-filter")
+	open, err := s.ListOpenEvidenceRequests(ctx, tenantID, "")
+	if err != nil {
+		t.Fatalf("ListOpenEvidenceRequests: %v", err)
+	}
+	if len(open) != 1 || open[0].RequestID != req.RequestID {
+		t.Fatalf("got %d open requests, want the seeded one", len(open))
 	}
 }
 

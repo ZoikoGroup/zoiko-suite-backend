@@ -1,75 +1,84 @@
 # obligations-svc — Progress
 
-## Status: v1 built and verified end-to-end (2026-07-08)
+**Status (21 Oct 2026):** Doc 03 §8.5 scope complete. Group 2 completion pass;
+the contract is `openapi.yaml` (validated with kin-openapi, route parity tested),
+the collection is `postman/postman/ZoikoSuite_Obligations.postman_collection.json`.
 
-Built from scratch per `docs/architecture/03-microservices.md` §8.5 and
-`docs/architecture/04-data-model.md` §13.1.
+## Owns (Doc 03 §8.5)
 
-## What's implemented
+| Concern | Where |
+|---|---|
+| Obligation definitions | `obligation_definitions` + immutable `obligation_definition_versions` (000012); `/v1/obligation-definitions` |
+| Obligation state and due dates | `obligations` (OPEN → IN_PROGRESS / OVERDUE / CLOSED; CLOSED terminal); `PATCH /v1/obligations/{id}` for due date, severity, responsible function |
+| Obligation-to-entity mappings | `obligation_entity_mappings` (interval, one open mapping per definition and entity); an obligation raised from a definition must name a mapped entity and is pinned to the definition version |
+| Obligation-to-workflow mappings | `workflow_id` (000007); `POST/DELETE /v1/obligations/{id}/workflow` |
+| Source-origin references | `obligation_source_type/id`, `source_reference` (required, Atomic Linking) |
+| Filing requirements | create, list, get; lifecycle PENDING → IN_PREPARATION → SUBMITTED → ACCEPTED / REJECTED, WITHDRAWN exit, append-only history |
+| Applicability decisions | versioned, append-only (doc7 §E2); UNASSESSED is never stored |
 
-- `Obligation` CRUD: create (idempotent on `obligation_code`), get, list
-  (filterable by `legal_entity_id`, `jurisdiction_id`, `obligation_type`,
-  `status`, `due_before`/`due_after`)
-- `FilingRequirement` CRUD scoped under a parent obligation: create, list
-- Obligation status state machine: `OPEN` → `IN_PROGRESS`/`OVERDUE`/`CLOSED`,
-  `IN_PROGRESS` → `OVERDUE`/`CLOSED`, `OVERDUE` → `CLOSED`. `CLOSED` is
-  terminal. Idempotent on repeat requests for the current status.
-- Critical constraint enforced: every obligation is entity-bound
-  (`legal_entity_id`) and jurisdiction-bound (`jurisdiction_id`) — the
-  latter is validated synchronously against the real jurisdiction-rules-svc
-  on creation, fail-closed (an unreachable jurisdiction-rules-svc rejects
-  the write with 503, never silently accepts an unvalidated ID).
-- Critical enhancement "Atomic Linking" enforced: `source_reference` is a
-  required field, both at the API validation layer and the DB `NOT NULL`
-  constraint.
-- Real Kafka producer: `obligation.created`, `obligation.updated`,
-  `obligation.overdue`, `obligation.closed` — same pattern as
-  identity-context-svc/tenant-entity-registry-svc/policy-svc.
+## Controls
 
-## Deliberate v1 scope decisions (not oversights)
+- **Entity- and jurisdiction-bound, fail-closed.** The legal entity is confirmed
+  against tenant-entity-registry-svc (`GET /v1/entities/{id}/status`, in the
+  caller's tenant; 422 otherwise, 503 if unreachable). The jurisdiction is
+  confirmed against jurisdiction-rules-svc.
+- **Identity.** `zoiko.io/identity-envelope` gate: the signed envelope is verified
+  (JWKS) and its session must be live (introspection, AU-01); X-Principal-Id /
+  X-Tenant-Id are then set from the verified claims. `IDENTITY_VERIFY` defaults
+  to `require` outside local/dev; compose runs `warn` until every caller forwards
+  the envelope. Outbound calls (authorization, jurisdiction, registry) forward it.
+- **Authorization** per action, at the entity acted on, fail-closed:
+  OBLIGATION_CREATE / _READ / _UPDATE / _STATUS_UPDATE, FILING_REQUIREMENT_CREATE /
+  _READ / _STATUS_UPDATE, APPLICABILITY_DECISION_RECORD / _READ,
+  OBLIGATION_ENTITY_MAPPING_MANAGE; the tenant-wide catalogue at PLATFORM scope
+  (OBLIGATION_DEFINITION_MANAGE / _READ).
+- **Tenant isolation.** FORCE RLS with NULLIF on every table; the runtime role
+  is NOBYPASSRLS and not the owner. The store suite runs as such a role.
+- **Idempotency.** Obligation create on `(tenant, obligation_code)` and on
+  `Idempotency-Key` + body hash; applicability decisions on `Idempotency-Key`
+  (same body replays 200, a changed body 409 IDEMPOTENCY_MISMATCH); filing
+  requirements on their natural key; status and filing moves are no-ops when
+  repeated.
+- **Concurrency.** Row locks on every transition; If-Match / ETag on status,
+  attributes (mandatory, 428 without), filing status and definition versions.
+- **Errors.** RFC 9457 problem+json, legacy `error` kept, §16 `error_class`.
+- **Pagination.** Default 50, max 200; keyset cursor (`X-Next-Cursor`, `Link`).
 
-- **`ComplianceStatus`, `ExceptionCase`, `EscalationRecord` not built.**
-  These are mentioned in 04-data-model.md §13.1 and the ERD ties them to
-  `LegalEntity` as siblings of `Obligation`, not children of it — they read
-  as a different service's entities (likely Exception & Escalation
-  Service / Compliance Status, per the §5.2 catalogue), not core to
-  obligations-svc. Revisit if a future spec section assigns them here
-  explicitly.
-- **No built-in scheduler for the `OPEN`/`IN_PROGRESS` → `OVERDUE`
-  transition.** `obligation.overdue` is only emitted when something calls
-  `POST /v1/obligations/{id}/status` with `"OVERDUE"`. Detecting *which*
-  obligations have passed their `due_date` is left to an external caller
-  (cron job, orchestrator) via `GET /v1/obligations?status=OPEN&due_before=<now>`.
-  Building a scheduler is out of scope for this service.
-- **No Authorization Service wiring on admin writes** — it doesn't exist
-  yet. Same posture policy-svc and governance-decision-log-svc shipped
-  with; revisit when Authorization Service exists.
-- **No consumed events in v1.** This is a producer-only service for now —
-  simpler to reason about, matching the pattern of some other single-purpose
-  spine services early in their lifecycle.
+## Events
 
-## Verified (real infra, not mocks)
+Transactional outbox (`event_outbox`), relayed by `internal/outbox`:
+claimed `FOR UPDATE SKIP LOCKED`, exponential backoff (2^n s, cap 300 s),
+parked only after 200 consecutive failures (~16 h); gauges
+`outbox_pending_events`, `outbox_failed_events` (alert on > 0),
+`outbox_oldest_pending_seconds`. Kafka key `<tenant>/<aggregate>`.
+Topic `zoiko.obligations.events`: `obligation.created`, `obligation.updated`
+(status, attribute, workflow link and filing changes, with `changed_fields`),
+`obligation.overdue`, `obligation.closed`, `obligation.definition.changed`,
+`obligation.entity_mapping.changed`. Parked events are requeued with
+`PgStore.RequeueFailedOutbox` (or `UPDATE event_outbox SET status='PENDING',
+attempts=0, failed_at=NULL, next_attempt_at=NOW() WHERE status='FAILED'`).
 
-- `go build`/`go vet`/`go test` clean
-- 7 store-layer integration tests against a real PostgreSQL instance
-  (idempotency + 409 conflict, not-found, filtered listing, legal state
-  transitions including the terminal-CLOSED and illegal-skip cases,
-  filing requirement CRUD)
-- Booted the real Docker image against the live platform compose stack
-  (real Postgres, real Kafka, real jurisdiction-rules-svc):
-  - Fail-closed jurisdiction validation confirmed against both a
-    nonexistent jurisdiction (404) and a real one (201 success)
-  - `obligation.created` event independently consumed off the real
-    `zoiko.obligations.events` Kafka topic — not just a successful
-    `WriteMessages` call
-  - Legal and illegal status transitions confirmed via live HTTP calls
-    (200 and 409 respectively)
-  - Filing requirement creation and listing confirmed via live HTTP calls
+## Overdue
 
-## Not yet done
+An in-process sweep (every minute) lists tenants with due OPEN / IN_PROGRESS
+obligations under the SELECT-only `overdue_sweep_select` policy and transitions
+each per tenant (events through the outbox). Before 000012 it found no tenants
+under the runtime role and never ran.
 
-- Not wired into `deployments/docker-compose.yml` — that file currently
-  has an unmerged, in-flight set of changes on another branch
-  (`fix/docker-platform-gaps`) that this would conflict with if added
-  here. Wiring obligations-svc into the compose stack should happen as a
-  small follow-up once that branch merges.
+## Not in scope here
+
+- R-001 WFC-05 (clock classes, computed deadlines, DUE_SOON / FULFILLED /
+  WAIVED): roadmap by decision of 21 Oct 2026; the 16 rows stay unscored.
+- ComplianceStatus / ExceptionCase / EscalationRecord (Doc 04 §13.1): no spec
+  section assigns them to this service.
+- Single owner of "obligations" (C8): obligation-tracking-svc and
+  filing-tracker-svc, outside this domain, still keep their own tables and
+  obligation-tracking-svc emits the same event names.
+
+## Deploy
+
+1. Apply migration **000012** before the new binary (`deployments/migrate.py up`).
+2. Set `TENANT_REGISTRY_URL` (required outside local/dev) and the `IDENTITY_*`
+   variables (see `idenv.NewGateFromEnv`).
+3. Register the new actions in access-control-svc (000021) and grant them.
+4. Build from the repository root: `docker build -f services/obligations-svc/Dockerfile .`

@@ -60,46 +60,75 @@ var (
 )
 
 func TestMain(m *testing.M) {
-	dbPort := uint32(15801 + uint32(os.Getpid()%499))
-	pg := embeddedpostgres.NewDatabase(
-		embeddedpostgres.DefaultConfig().
-			// Version pinned explicitly to a literal patch string, NOT the
-			// library's own embeddedpostgres.V16 alias — see the doc comment
-			// on embeddedpostgres.DefaultConfig() in audit-event-store-svc's
-			// main_integration_test.go for why floating is dangerous (this
-			// is what broke PR #105's CI). V16 itself turned out to be the
-			// same hazard one layer down: it is a constant baked into
-			// embedded-postgres v1.34.0 (the latest release) that resolves
-			// to "16.9.0", a specific patch chosen by that library's authors
-			// — not by us — and we cannot bump our way to a newer pin
-			// without the library releasing one. CI failed on exactly this
-			// ("no version found matching 16.9.0") even though 16.9.0 is
-			// still a real, resolvable artifact; pinning our own literal
-			// string here means a future resolution hiccup is something we
-			// control by editing this line, not something that requires
-			// waiting on an upstream library release.
-			Version(embeddedpostgres.PostgresVersion("16.15.0")).
-			Port(dbPort).
-			Database("pr_isolation_test").
-			Username("postgres").
-			Password("postgres"),
-	)
-	if err := pg.Start(); err != nil {
-		fmt.Printf("failed to start embedded postgres: %v\n", err)
-		os.Exit(1)
+	ctx := context.Background()
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	var pg *embeddedpostgres.EmbeddedPostgres
+
+	if dsn == "" {
+		dbPort := uint32(15801 + uint32(os.Getpid()%499))
+		pg = embeddedpostgres.NewDatabase(
+			embeddedpostgres.DefaultConfig().
+				// Version pinned explicitly to a literal patch string, NOT the
+				// library's own embeddedpostgres.V16 alias — see the doc comment
+				// on embeddedpostgres.DefaultConfig() in audit-event-store-svc's
+				// main_integration_test.go for why floating is dangerous (this
+				// is what broke PR #105's CI). V16 itself turned out to be the
+				// same hazard one layer down: it is a constant baked into
+				// embedded-postgres v1.34.0 (the latest release) that resolves
+				// to "16.9.0", a specific patch chosen by that library's authors
+				// — not by us — and we cannot bump our way to a newer pin
+				// without the library releasing one. CI failed on exactly this
+				// ("no version found matching 16.9.0") even though 16.9.0 is
+				// still a real, resolvable artifact; pinning our own literal
+				// string here means a future resolution hiccup is something we
+				// control by editing this line, not something that requires
+				// waiting on an upstream library release.
+				Version(embeddedpostgres.PostgresVersion("16.15.0")).
+				Port(dbPort).
+				Database("pr_isolation_test").
+				Username("postgres").
+				Password("postgres").
+				RuntimePath(filepath.Join(os.TempDir(), fmt.Sprintf("epg-pr-%d", dbPort))),
+		)
+
+		var err error
+		for attempt := 1; attempt <= 3; attempt++ {
+			if err = pg.Start(); err == nil {
+				break
+			}
+			time.Sleep(time.Duration(attempt) * time.Second)
+		}
+
+		if err != nil {
+			// If embedded postgres fails to start, fall back to the CI-provided Postgres container if reachable.
+			ciDSN := "postgres://postgres:secretpassword@localhost:5432/testdb?sslmode=disable"
+			fallbackPool, pingErr := pgxpool.New(ctx, ciDSN)
+			if pingErr == nil && fallbackPool.Ping(ctx) == nil {
+				fallbackPool.Close()
+				dsn = ciDSN
+				pg = nil
+			} else {
+				if fallbackPool != nil {
+					fallbackPool.Close()
+				}
+				fmt.Printf("failed to start embedded postgres: %v\n", err)
+				os.Exit(1)
+			}
+		} else {
+			dsn = fmt.Sprintf(
+				"host=localhost port=%d dbname=pr_isolation_test user=postgres password=postgres sslmode=disable",
+				dbPort,
+			)
+		}
 	}
 
-	dsn := fmt.Sprintf(
-		"host=localhost port=%d dbname=pr_isolation_test user=postgres password=postgres sslmode=disable",
-		dbPort,
-	)
-
-	ctx := context.Background()
 	var err error
 	testPool, err = pgxpool.New(ctx, dsn)
 	if err != nil {
 		fmt.Printf("failed to connect to postgres: %v\n", err)
-		_ = pg.Stop()
+		if pg != nil {
+			_ = pg.Stop()
+		}
 		os.Exit(1)
 	}
 
@@ -112,9 +141,22 @@ func TestMain(m *testing.M) {
 	if err != nil {
 		fmt.Printf("postgres did not become ready: %v\n", err)
 		testPool.Close()
-		_ = pg.Stop()
+		if pg != nil {
+			_ = pg.Stop()
+		}
 		os.Exit(1)
 	}
+
+	// Reset tables if running against a shared or reused database container (such as CI testdb).
+	_, _ = testPool.Exec(ctx, `
+		DO $$
+		DECLARE t record;
+		BEGIN
+			FOR t IN SELECT tablename FROM pg_tables WHERE schemaname = 'public' LOOP
+				EXECUTE format('DROP TABLE IF EXISTS public.%I CASCADE', t.tablename);
+			END LOOP;
+		END $$;
+	`)
 
 	// EVERY *.up.sql, BY GLOB, NOT A NAMED LIST.
 	//
@@ -129,7 +171,9 @@ func TestMain(m *testing.M) {
 		// assertion below would then fail for an unrelated reason.
 		fmt.Printf("no *.up.sql under deployments/migrations: %v\n", globErr)
 		testPool.Close()
-		_ = pg.Stop()
+		if pg != nil {
+			_ = pg.Stop()
+		}
 		os.Exit(1)
 	}
 	sort.Strings(migrations)
@@ -139,13 +183,17 @@ func TestMain(m *testing.M) {
 		if err != nil {
 			fmt.Printf("failed to read migration %s: %v\n", migration, err)
 			testPool.Close()
-			_ = pg.Stop()
+			if pg != nil {
+				_ = pg.Stop()
+			}
 			os.Exit(1)
 		}
 		if _, err = testPool.Exec(ctx, string(sql)); err != nil {
 			fmt.Printf("failed to apply migration %s: %v\n", migration, err)
 			testPool.Close()
-			_ = pg.Stop()
+			if pg != nil {
+				_ = pg.Stop()
+			}
 			os.Exit(1)
 		}
 	}
@@ -155,7 +203,9 @@ func TestMain(m *testing.M) {
 	code := m.Run()
 
 	testPool.Close()
-	_ = pg.Stop()
+	if pg != nil {
+		_ = pg.Stop()
+	}
 	os.Exit(code)
 }
 
@@ -164,6 +214,21 @@ type requestFixture struct {
 	tenantID  string
 	entityID  string
 	requestID string
+}
+
+// transition drives the store's single transition primitive (Apply) as the given tenant.
+func transition(tenantID, requestID string, to domain.RequestStatus, actor, reason string) error {
+	return transitionFrom(tenantID, requestID, domain.RequestStatusPending, to, actor, reason)
+}
+
+func transitionFrom(tenantID, requestID string, from, to domain.RequestStatus, actor, reason string) error {
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+	_, err := testStore.Apply(ctx, store.Transition{
+		TenantID: tenantID, RequestID: requestID,
+		From: []domain.RequestStatus{from}, To: to, Action: string(to),
+		Meta: store.Meta{Actor: actor, CorrelationID: "isolation-" + requestID, Reason: reason},
+	})
+	return err
 }
 
 func setupIsolationFixture(t *testing.T, tenantLabel string) requestFixture {
@@ -189,6 +254,9 @@ func setupIsolationFixture(t *testing.T, tenantLabel string) requestFixture {
 		CorrelationID:          "corr-" + tenantLabel + "-" + f.requestID,
 	})
 	require.NoError(t, err)
+	// CreateRequest always records a DRAFT; submit it so the isolation tests attack a
+	// request that is actually awaiting approval.
+	require.NoError(t, transitionFrom(f.tenantID, f.requestID, domain.RequestStatusDraft, domain.RequestStatusPending, "test-"+tenantLabel, ""))
 
 	return f
 }
@@ -273,8 +341,9 @@ func TestPgStore_TenantIsolation_TransitionRequest_Approve(t *testing.T) {
 	// tenantID as the scope argument — exactly what a handler bug would look
 	// like if TenantID were taken from the request body instead of the
 	// caller's real context.
-	err := testStore.TransitionRequest(context.Background(), b.tenantID, a.requestID, domain.RequestStatusApproved, "attacker", time.Now().UTC(), nil)
-	assert.ErrorIs(t, err, domain.ErrInvalidTransition,
+	err := transition(b.tenantID, a.requestID, domain.RequestStatusApproved, "attacker", "")
+	// Another tenant's row is invisible to this tenant: not found, never a transition.
+	assert.ErrorIs(t, err, domain.ErrRequestNotFound,
 		"ISOLATION FAILURE: tenant B was able to approve tenant A's request")
 
 	// Verify tenant A's request is still PENDING.
@@ -286,7 +355,7 @@ func TestPgStore_TenantIsolation_TransitionRequest_Approve(t *testing.T) {
 		"ISOLATION FAILURE: tenant A's request status was mutated by tenant B")
 
 	// Sanity: tenant B can still approve its OWN request.
-	err = testStore.TransitionRequest(context.Background(), b.tenantID, b.requestID, domain.RequestStatusApproved, "b-admin", time.Now().UTC(), nil)
+	err = transition(b.tenantID, b.requestID, domain.RequestStatusApproved, "b-admin", "")
 	require.NoError(t, err)
 	ctxB := svcmiddleware.WithTenant(context.Background(), b.tenantID)
 	gotB, err := testStore.GetRequest(ctxB, b.requestID)
@@ -299,8 +368,8 @@ func TestPgStore_TenantIsolation_TransitionRequest_Reject(t *testing.T) {
 	b := setupIsolationFixture(t, "B-Reject")
 
 	reason := "attacker-supplied reason"
-	err := testStore.TransitionRequest(context.Background(), b.tenantID, a.requestID, domain.RequestStatusRejected, "attacker", time.Now().UTC(), &reason)
-	assert.ErrorIs(t, err, domain.ErrInvalidTransition,
+	err := transition(b.tenantID, a.requestID, domain.RequestStatusRejected, "attacker", reason)
+	assert.ErrorIs(t, err, domain.ErrRequestNotFound,
 		"ISOLATION FAILURE: tenant B was able to reject tenant A's request")
 
 	ctxA := svcmiddleware.WithTenant(context.Background(), a.tenantID)

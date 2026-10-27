@@ -110,27 +110,42 @@ func enforced(mode Mode, isWrite bool) bool {
 	}
 }
 
-// writeViolation renders the refusal in the shape the platform's error bodies
-// already use — {"error", "detail"} — with the per-field violations alongside.
-//
-// The array is deliberately not folded into detail. The Next.js console's
-// readErrorDetail concatenates error/field/message/detail into one string, and
-// schema-registry-svc already showed what that costs when the structure is the
-// point: a caller cannot tell which of five headers it is missing from a folded
-// sentence. Keeping violations structured lets the console list them.
+// writeViolation renders the refusal as an RFC 9457 problem+json with the
+// per-field violations. The structure matches the platform's standard problem
+// detail format (API standard §12) so that clients can programmatically
+// inspect the violations.
 func writeViolation(w http.ResponseWriter, err *ValidationError) {
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.Header().Set("X-Envelope-Contract", "violated")
 	w.WriteHeader(StatusFor(err))
-	_ = json.NewEncoder(w).Encode(struct {
-		Error      string      `json:"error"`
+
+	// Build RFC 9457 problem detail with per-field violations
+	type problemDetail struct {
+		Type       string      `json:"type"`
+		Title      string      `json:"title"`
+		Status     int         `json:"status"`
 		Detail     string      `json:"detail"`
-		Service    string      `json:"service,omitempty"`
-		Violations []Violation `json:"violations"`
+		Code       string      `json:"code"`
+		Error      string      `json:"error"`
+		Violations []Violation `json:"errors"`
+	}
+
+	pd := struct {
+		Type       string      `json:"type"`
+		Title      string      `json:"title"`
+		Status     int         `json:"status"`
+		Detail     string      `json:"detail"`
+		Code       string      `json:"code"`
+		Error      string      `json:"error"`
+		Violations []Violation `json:"errors"`
 	}{
-		Error:      "envelope_incomplete",
+		Type:       "https://api.zoikosuite.com/problems/authorization-denied",
+		Title:      "Authorization Denied",
+		Status:     StatusFor(err),
 		Detail:     err.Error(),
-		Service:    err.Service,
+		Code:       "envelope_incomplete",
+		Error:      "envelope_incomplete",
 		Violations: err.Violations,
-	})
+	}
+	_ = json.NewEncoder(w).Encode(pd)
 }

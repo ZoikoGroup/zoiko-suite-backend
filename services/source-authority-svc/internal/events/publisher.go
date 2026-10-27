@@ -108,3 +108,23 @@ func (p *KafkaPublisher) Publish(ctx context.Context, params PublishParams) erro
 	}
 	return nil
 }
+
+// PublishOutbox delivers one already-persisted outbox row to Kafka, for the
+// outbox.Relay. Deliberately does not set Topic on the outgoing
+// kafka.Message — the Writer already pins it (NewKafkaPublisher), and
+// setting it on both panics with "Topic must not be specified for both
+// Writer and Message" (the same defect class found in document-vault-svc
+// and evidence-manifest-svc earlier in this engagement).
+func (p *KafkaPublisher) PublishOutbox(ctx context.Context, outboxEventID, aggregateID string, payload []byte) error {
+	headers := []kafka.Header{{Key: "X-Event-ID", Value: []byte(outboxEventID)}}
+	err := p.writer.WriteMessages(ctx, kafka.Message{
+		Key:     []byte(aggregateID),
+		Value:   payload,
+		Headers: headers,
+	})
+	if err != nil {
+		p.logger.Warn("outbox relay publish failed", zap.String("outbox_id", outboxEventID), zap.Error(err))
+		return err
+	}
+	return nil
+}

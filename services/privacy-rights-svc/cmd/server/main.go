@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
@@ -17,7 +16,6 @@ import (
 
 	"zoiko.io/privacy-rights-svc/internal/authz"
 	"zoiko.io/privacy-rights-svc/internal/config"
-	"zoiko.io/privacy-rights-svc/internal/events"
 	"zoiko.io/privacy-rights-svc/internal/handler"
 	"zoiko.io/privacy-rights-svc/internal/health"
 	"zoiko.io/privacy-rights-svc/internal/middleware"
@@ -57,11 +55,9 @@ func main() {
 	}
 
 	pgStore := store.NewPgStore(pool, logger)
-	brokers := strings.Split(cfg.KafkaBrokers, ",")
-	publisher := events.NewKafkaPublisher(brokers, cfg.KafkaEventsTopic, logger)
 	authzClient := authz.NewClient(cfg.AuthzServiceURL)
 
-	h := handler.New(pgStore, publisher, authzClient, logger)
+	h := handler.New(pgStore, authzClient, logger)
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)

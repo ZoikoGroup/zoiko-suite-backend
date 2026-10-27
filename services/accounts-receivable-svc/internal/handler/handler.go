@@ -37,6 +37,9 @@ type Store interface {
 	// ControlPopulation serves the control-population contract (open-invoices).
 	ControlPopulation(ctx context.Context, q domain.ControlPopulationQuery) (*domain.ControlPopulationPage, error)
 	TransitionInvoice(ctx context.Context, tenantID, invoiceID string, fromStatus, toStatus domain.InvoiceStatus, actorPrincipalID string, paymentDate *domain.CalendarDate, paymentReference *string) (*domain.CustomerInvoice, error)
+	// SetIssuanceJournalID records the GL journal ID returned when the invoice
+	// issuance accounting event was posted (ACC-14).
+	SetIssuanceJournalID(ctx context.Context, tenantID, invoiceID, journalID string) error
 }
 
 // Publisher is the event publisher contract.
@@ -53,9 +56,11 @@ type AuthZClient interface {
 }
 
 // LedgerClient verifies that the books account for an invoice before payment is
-// recorded against it. See internal/ledger.
+// recorded against it, AND posts issuance accounting events to GL (ACC-14).
+// See internal/ledger.
 type LedgerClient interface {
 	Verify(ctx context.Context, tenantID, legalEntityID, invoiceID string, amount float64) error
+	PostInvoiceIssuedAccountingEvent(ctx context.Context, tenantID, principalID string, inv *domain.CustomerInvoice) (journalID string, err error)
 }
 
 // EntityClient reconciles a caller-supplied legal entity with the caller's
@@ -74,6 +79,12 @@ const (
 	actionControlPopulationRead = "AR_CONTROL_POPULATION_READ"
 )
 
+// NewPathGuard tells the legacy handlers whether an invoice id / number lives in the AR-04 tables
+// (the new customer-invoice lifecycle). Implemented by ar04.Module.NewPathInvoiceExists.
+type NewPathGuard interface {
+	NewPathInvoiceExists(ctx context.Context, tenantID, legalEntityID, invoiceID, invoiceNumber string) (bool, error)
+}
+
 type Handler struct {
 	store     Store
 	publisher Publisher
@@ -83,6 +94,29 @@ type Handler struct {
 	log       *zap.Logger
 	// clock is nil in production and set by tests; see (*Handler).now.
 	clock func() time.Time
+
+	// legacyAPIOff is set by WithLegacyInvoiceAPI(false); the zero value keeps the legacy
+	// create / pay API enabled (default of AR_LEGACY_INVOICE_API).
+	legacyAPIOff bool
+	// newPath, when set, lets the legacy pay endpoint refuse invoices that live in AR-04.
+	newPath NewPathGuard
+}
+
+// WithLegacyInvoiceAPI enables (default) or disables the legacy POST /v1/invoices and
+// POST /v1/invoices/{id}/pay endpoints. main.go sets it from the AR_LEGACY_INVOICE_API environment variable.
+//
+// DEPRECATED legacy surface: new invoices are created and issued through AR-04
+// (/internal/v1/ar04/commands/...) and settled through AR-08 cash application. The legacy
+// ISSUED -> SENT -> PAID machine remains only for invoices that already exist in customer_invoices.
+func (h *Handler) WithLegacyInvoiceAPI(enabled bool) *Handler {
+	h.legacyAPIOff = !enabled
+	return h
+}
+
+// WithNewPathGuard installs the AR-04 lookup used by the legacy pay endpoint.
+func (h *Handler) WithNewPathGuard(g NewPathGuard) *Handler {
+	h.newPath = g
+	return h
 }
 
 // WithClock overrides the clock the overdue check reads. Test-only.
@@ -162,7 +196,14 @@ func linesFromRequest(in []domain.CreateCustomerInvoiceLineInput) []domain.Custo
 }
 
 // ── POST /v1/invoices ────────────────────────────────────────────────────────
+//
+// DEPRECATED: superseded by AR-04 CreateInvoiceDraft -> SubmitInvoiceForApproval -> ApproveInvoice ->
+// IssueInvoice. Gated by WithLegacyInvoiceAPI (env AR_LEGACY_INVOICE_API).
 func (h *Handler) CreateInvoice(w http.ResponseWriter, r *http.Request) {
+	if h.legacyAPIOff {
+		writeLegacyDisabled(w)
+		return
+	}
 	var req domain.CreateCustomerInvoiceRequest
 	if !decodeJSON(w, r, &req) {
 		return
@@ -268,6 +309,30 @@ func (h *Handler) CreateInvoice(w http.ResponseWriter, r *http.Request) {
 		// the original invoice, do not re-publish the issued event.
 		writeJSON(w, http.StatusOK, inv)
 		return
+	}
+
+	// Post the issuance accounting event to general-ledger-svc.
+	// This MUST succeed — an invoice that cannot be booked is unpayable
+	// (ReceivePayment hard-requires a FINALIZED journal for the amount).
+	// SourceEventID = inv.InvoiceID makes retry safe against GL's
+	// UNIQUE(tenant_id, source_event_id) constraint.
+	journalID, err := h.ledger.PostInvoiceIssuedAccountingEvent(r.Context(), tenantID, principalID, inv)
+	if err != nil {
+		h.log.Error("CreateInvoice: failed to post accounting event — invoice exists but is not yet booked",
+			zap.String("invoice_id", inv.InvoiceID), zap.Error(err))
+		// Fail the request so the caller knows to retry. Do not leave an
+		// unpayable invoice in the system.
+		writeError(w, http.StatusServiceUnavailable, "ledger_posting_failed",
+			"invoice created but accounting event could not be posted; retry the request")
+		return
+	}
+
+	// Store the journal ID on the invoice for audit traceability.
+	inv.IssuanceJournalID = &journalID
+	if err := h.store.SetIssuanceJournalID(r.Context(), tenantID, inv.InvoiceID, journalID); err != nil {
+		h.log.Error("CreateInvoice: invoice posted but failed to store journal ID",
+			zap.String("invoice_id", inv.InvoiceID), zap.String("journal_id", journalID), zap.Error(err))
+		// The journal exists in GL; this is an audit-only failure. Log and continue.
 	}
 
 	writeJSON(w, http.StatusCreated, inv)
@@ -473,12 +538,22 @@ func (h *Handler) MarkOverdue(w http.ResponseWriter, r *http.Request) {
 }
 
 // ── POST /v1/invoices/{invoice_id}/pay ───────────────────────────────────────
+//
+// DEPRECATED: superseded by AR-08 cash application. An invoice that exists in the AR-04 tables is
+// refused here with 409 CASH_APPLICATION_REQUIRED; gated by WithLegacyInvoiceAPI (AR_LEGACY_INVOICE_API).
 func (h *Handler) ReceivePayment(w http.ResponseWriter, r *http.Request) {
+	if h.legacyAPIOff {
+		writeLegacyDisabled(w)
+		return
+	}
 	tenantID, ok := h.requireTenant(w, r)
 	if !ok {
 		return
 	}
 	invoiceID := chi.URLParam(r, "invoice_id")
+	if !h.refuseNewPathInvoice(w, r, tenantID, "", invoiceID, "") {
+		return
+	}
 	inv, err := h.store.GetInvoice(r.Context(), tenantID, invoiceID)
 	if err != nil {
 		h.log.Error("ReceivePayment: store unavailable", zap.Error(err))
@@ -487,6 +562,10 @@ func (h *Handler) ReceivePayment(w http.ResponseWriter, r *http.Request) {
 	}
 	if inv == nil {
 		writeError(w, http.StatusNotFound, "invoice_not_found", "")
+		return
+	}
+	// A legacy row whose number was also issued through AR-04 is the same legal document.
+	if !h.refuseNewPathInvoice(w, r, tenantID, inv.LegalEntityID, "", inv.InvoiceNumber) {
 		return
 	}
 
@@ -775,6 +854,34 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 type errorResponse struct {
 	Error  string `json:"error"`
 	Detail string `json:"detail,omitempty"`
+	// Code is the stable spec class where one exists (e.g. CASH_APPLICATION_REQUIRED).
+	Code string `json:"code,omitempty"`
+}
+
+// writeLegacyDisabled answers a legacy create / pay call when AR_LEGACY_INVOICE_API is off.
+func writeLegacyDisabled(w http.ResponseWriter) {
+	writeJSON(w, http.StatusGone, errorResponse{Error: "legacy_invoice_api_disabled", Code: "LEGACY_INVOICE_API_DISABLED",
+		Detail: "this legacy endpoint is disabled: use AR-04 /internal/v1/ar04/commands/* to issue invoices and AR-08 cash application to settle them"})
+}
+
+// refuseNewPathInvoice writes 409 CASH_APPLICATION_REQUIRED and returns false when the invoice lives in
+// the AR-04 tables (it settles only through AR-08 cash application); an unanswerable lookup fails closed.
+func (h *Handler) refuseNewPathInvoice(w http.ResponseWriter, r *http.Request, tenantID, legalEntityID, invoiceID, invoiceNumber string) bool {
+	if h.newPath == nil {
+		return true
+	}
+	exists, err := h.newPath.NewPathInvoiceExists(r.Context(), tenantID, legalEntityID, invoiceID, invoiceNumber)
+	if err != nil {
+		h.log.Error("legacy pay: AR-04 lookup unavailable - failing closed", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return false
+	}
+	if exists {
+		writeJSON(w, http.StatusConflict, errorResponse{Error: "cash_application_required", Code: "CASH_APPLICATION_REQUIRED",
+			Detail: "this invoice was issued through AR-04: it is settled only by AR-08 cash application"})
+		return false
+	}
+	return true
 }
 
 func writeError(w http.ResponseWriter, status int, code, detail string) {

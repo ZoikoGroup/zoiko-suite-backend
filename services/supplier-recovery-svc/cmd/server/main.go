@@ -22,6 +22,7 @@ import (
 	"zoiko.io/supplier-recovery-svc/internal/handler"
 	"zoiko.io/supplier-recovery-svc/internal/health"
 	"zoiko.io/supplier-recovery-svc/internal/middleware"
+	"zoiko.io/supplier-recovery-svc/internal/outbox"
 	"zoiko.io/supplier-recovery-svc/internal/payableopenitem"
 	"zoiko.io/supplier-recovery-svc/internal/store"
 )
@@ -65,7 +66,15 @@ func main() {
 	payablesClient := payableopenitem.NewHTTPClient(cfg.PayableOpenItemServiceURL, logger)
 	bankrecClient := bankreconciliation.NewHTTPClient(cfg.BankReconciliationURL, logger)
 
-	h := handler.New(pgStore, publisher, authzClient, payablesClient, bankrecClient, logger)
+	// Domain events are written to outbox_events in each command's own transaction;
+	// this relay is the only thing that publishes them to Kafka.
+	relayCtx, stopRelay := context.WithCancel(context.Background())
+	defer stopRelay()
+	if pool != nil {
+		go outbox.NewRelay(pool, publisher, 0, 0, logger).Start(relayCtx)
+	}
+
+	h := handler.New(pgStore, authzClient, payablesClient, bankrecClient, logger)
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)
@@ -77,6 +86,7 @@ func main() {
 
 	r.Group(func(r chi.Router) {
 		r.Use(middleware.TenantContext())
+		r.Use(middleware.RequireTenant)
 		handler.RegisterRoutes(r, h)
 	})
 
@@ -100,6 +110,7 @@ func main() {
 	<-stop
 
 	logger.Info("shutting down supplier-recovery-svc gracefully...")
+	stopRelay()
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 

@@ -14,6 +14,14 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
+	"zoiko.io/eventing/adapter"
+	"zoiko.io/eventing/adapter/ext"
+	"zoiko.io/eventing/egress"
+	"zoiko.io/eventing/kafkaout"
+	"zoiko.io/eventing/integration"
+	"zoiko.io/eventing/outbox"
+	"zoiko.io/eventing/signature"
+	"zoiko.io/tax-authority-interface-svc/internal/authority"
 	"zoiko.io/tax-authority-interface-svc/internal/authz"
 	"zoiko.io/tax-authority-interface-svc/internal/config"
 	svcenvelope "zoiko.io/tax-authority-interface-svc/internal/envelope"
@@ -43,6 +51,11 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	// Background work (the outbox relay, the sweeper and poller) lives for the life of the process, not for the
+	// startup timeout above.
+	bg, stopBackground := context.WithCancel(context.Background())
+	defer stopBackground()
+
 	poolCfg, err := pgxpool.ParseConfig(cfg.DatabaseURL)
 	if err != nil {
 		logger.Fatal("failed to parse db pool config", zap.Error(err))
@@ -65,10 +78,32 @@ func main() {
 		logger.Info("connected to postgres database")
 	}
 
-	st := store.NewPgStore(dbpool)
+	if err := outbox.VerifySchema(ctx, dbpool); err != nil {
+		logger.Fatal("eventing outbox schema verification failed", zap.Error(err))
+	}
+
+	st := store.NewPgStore(dbpool).WithEventRegion(cfg.EventResidencyRegion)
 
 	brokers := strings.Split(cfg.KafkaBrokers, ",")
 	publisher := events.NewKafkaPublisher(brokers, cfg.KafkaEventsTopic, logger)
+
+	writer, err := kafkaout.New(kafkaout.Config{Brokers: brokers, Topic: cfg.KafkaEventsTopic})
+	if err != nil {
+		logger.Fatal("failed to create kafka writer", zap.Error(err))
+	}
+	relay, err := outbox.NewRelay(dbpool, writer, outbox.DefaultConfig(), logger)
+	if err != nil {
+		logger.Fatal("failed to create outbox relay", zap.Error(err))
+	}
+	// INT-CTRL-005 / INT-NP-006: with SCHEMA_REGISTRY_URL set, an event that breaks its registered contract is
+	// quarantined before publish, and a registry that cannot answer holds events instead of publishing them unchecked.
+	if gate, gerr := integration.GateFromEnv("tax-authority-interface-svc"); gerr != nil {
+		logger.Fatal("schema gate", zap.Error(gerr))
+	} else if gate != nil {
+		relay.SetGate(gate)
+		logger.Info("producer schema gate enabled")
+	}
+	go relay.Run(bg)
 
 	var authzClient *authz.Client
 	if cfg.AuthzMTLSEnabled {
@@ -84,28 +119,53 @@ func main() {
 
 	h := handler.New(st, publisher, authzClient, logger)
 
+	if cfg.Authority.Enabled {
+		engine, err := buildEngine(cfg.Authority, st)
+		if err != nil {
+			logger.Fatal("authority adapter misconfigured", zap.Error(err))
+		}
+		cbCfg, err := authority.ParseCallbackConfig(cfg.CallbacksJSON)
+		if err != nil {
+			logger.Fatal("AUTHORITY_CALLBACKS_JSON is invalid", zap.Error(err))
+		}
+		var proc *authority.CallbackProcessor
+		if len(cbCfg) > 0 {
+			proc = &authority.CallbackProcessor{
+				Config: cbCfg, Secrets: ext.NewVaultSecrets(cfg.Authority.VaultURL, cfg.Authority.WorkloadID), Store: st,
+				Guard: signature.NewMemoryGuard(100_000, nil), Log: logger, TenantCtx: middleware.WithTenant,
+			}
+		}
+		h = h.WithAuthority(engine, proc, st)
+		go runWorker(bg, engine, cfg.Authority, logger)
+		logger.Info("authority adapter enabled", zap.Int("callback_providers", len(cbCfg)))
+	}
+
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)
 	r.Use(chimiddleware.RealIP)
 	r.Use(chimiddleware.Logger)
 	r.Use(chimiddleware.Recoverer)
-	r.Use(middleware.TenantContext)
-
-	// Canonical Service Input Contract (ZS-ARCH-SVC-001 v2.0 §4). Runs after
-	// Recoverer and telemetry so a refusal is still traced, and ahead of every
-	// handler so no request reaches business logic without a resolved tenant,
-	// actor, correlation and — on material writes — an idempotency key.
-	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
-	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
 	r.Get("/healthz", health.Handler())
-	handler.RegisterRoutes(r, h)
+	// The authority callback receiver is machine-authenticated by signature, not by a tenant header, so it sits
+	// outside the tenant-context group.
+	handler.RegisterCallbackRoute(r, h)
+
+	r.Group(func(r chi.Router) {
+		r.Use(middleware.TenantContext)
+		// Canonical Service Input Contract (ZS-ARCH-SVC-001 v2.0 §4). Runs after Recoverer and telemetry so a
+		// refusal is still traced, and ahead of every handler so no request reaches business logic without a
+		// resolved tenant, actor, correlation and — on material writes — an idempotency key.
+		// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
+		r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
+		handler.RegisterRoutes(r, h)
+	})
 
 	srv := &http.Server{
 		Addr:         ":" + cfg.Port,
 		Handler:      r,
 		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
+		WriteTimeout: 60 * time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
 
@@ -129,4 +189,49 @@ func main() {
 		logger.Error("server forced to shutdown", zap.Error(err))
 	}
 	logger.Info("tax-authority-interface-svc stopped cleanly")
+}
+
+// buildEngine wires the live adapter: an egress-policy HTTP client (an authority is only ever reached through the
+// SSRF guard, whatever a connector says), the connector service, and the vault.
+func buildEngine(ac config.AuthorityConfig, st *store.PgStore) (*authority.Engine, error) {
+	nets, err := egress.ParseCIDRs(ac.PrivateCIDRs)
+	if err != nil {
+		return nil, err
+	}
+	policy := egress.Policy{AllowHTTP: ac.AllowHTTP, AllowedPorts: ac.AllowedPorts, PrivateNets: nets}
+	return &authority.Engine{
+		Store:      st,
+		Connectors: ext.NewConnectorHTTP(ac.ConnectivityURL),
+		Creds:      ext.NewVaultHTTP(ac.VaultURL, ac.WorkloadID),
+		Transport:  &adapter.Transport{Client: policy.NewHTTPClient(60 * time.Second), MaxBytes: ac.MaxResponse},
+		Cfg: authority.Config{
+			StaleAfter: ac.StaleAfter, BreakerWindow: ac.BreakerWindow, BreakerFailures: ac.BreakerFailures,
+			PollInterval: ac.PollInterval, UrgentPollInterval: ac.UrgentPollInterval,
+		},
+	}, nil
+}
+
+// runWorker releases filings stuck in SUBMITTING (the process died mid-call; never resent) and asks the authority
+// about every filing whose poll time has come, more often once its deadline is at risk.
+func runWorker(ctx context.Context, e *authority.Engine, ac config.AuthorityConfig, log *zap.Logger) {
+	sweep := time.NewTicker(ac.SweepInterval)
+	poll := time.NewTicker(ac.PollTick)
+	defer sweep.Stop()
+	defer poll.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-sweep.C:
+			if n, err := e.Sweep(ctx); err != nil {
+				log.Error("in-flight sweep failed", zap.Error(err))
+			} else if n > 0 {
+				log.Warn("released stale in-flight filings to PENDING_UNKNOWN", zap.Int("count", n))
+			}
+		case <-poll.C:
+			if _, err := e.PollDue(ctx, middleware.WithTenant, "tax-authority-poller"); err != nil {
+				log.Error("status poll failed", zap.Error(err))
+			}
+		}
+	}
 }

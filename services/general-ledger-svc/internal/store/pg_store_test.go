@@ -44,12 +44,13 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	base := filepath.Dir(filename)
 
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS
+		dimension_values, dimension_definitions, posting_rule_set_events, posting_rule_sets, accounting_events, accounting_books,
 		journal_lines, journal_headers,
 		trial_balance_lines, trial_balance_snapshots,
-		account_mappings, chart_of_accounts,
+		account_versions, account_mappings, chart_of_accounts,
 		posting_executions,
 		ledger_entries, ledger_balances,
-		outbox_events, eventing_outbox
+		outbox_events, eventing_outbox, command_idempotency
 		CASCADE;`)
 
 	// Every *.up.sql, sorted, rather than a list written out here.

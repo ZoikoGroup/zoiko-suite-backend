@@ -29,8 +29,10 @@ import (
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 
+	"zoiko.io/accounts-payable-svc/internal/accountingdispatch"
 	"zoiko.io/accounts-payable-svc/internal/authz"
 	"zoiko.io/accounts-payable-svc/internal/config"
+	"zoiko.io/accounts-payable-svc/internal/domain"
 	svcenvelope "zoiko.io/accounts-payable-svc/internal/envelope"
 	"zoiko.io/accounts-payable-svc/internal/events"
 	"zoiko.io/accounts-payable-svc/internal/handler"
@@ -40,6 +42,7 @@ import (
 	"zoiko.io/accounts-payable-svc/internal/outbox"
 	"zoiko.io/accounts-payable-svc/internal/payableopenitem"
 	"zoiko.io/accounts-payable-svc/internal/purchaseorder"
+	"zoiko.io/accounts-payable-svc/internal/receipts"
 	"zoiko.io/accounts-payable-svc/internal/store"
 	"zoiko.io/accounts-payable-svc/internal/telemetry"
 )
@@ -115,6 +118,9 @@ func main() {
 
 	// ── 4. Store, Kafka producer, jurisdiction validator ─────────────────────
 	pgStore := store.New(pool, log)
+	pgStore.WithPostingMappingKeys(domain.PostingMappingKeys{
+		Expense: cfg.PostingKeyExpense, TaxInput: cfg.PostingKeyTaxInput, PayableControl: cfg.PostingKeyPayableControl,
+	})
 
 	// Kafka producer — connects lazily on first write, same posture as
 	// identity-context-svc/tenant-entity-registry-svc/policy-svc: not a
@@ -169,6 +175,10 @@ func main() {
 	defer cancelRelay()
 	relay := outbox.NewRelay(pool, outboxPub, 500*time.Millisecond, 50, log)
 	go relay.Start(relayCtx)
+
+	// ACC-04 posting dispatcher: delivers the approval postings that were committed with
+	// each approval. Retries with backoff, quarantines ambiguous mappings, never posts twice.
+	go accountingdispatch.New(pgStore, accountingdispatch.NewHTTPClient(cfg.LedgerServiceURL), cfg.AccountingPrincipalID, log).Start(relayCtx)
 	var authzClient *authz.HTTPClient
 	if cfg.AuthzMTLSEnabled {
 		mtlsHTTPClient, err := mtls.NewClientHTTPClient(context.Background(), cfg.MTLSManagementServiceURL, "accounts-payable-svc", platformScopeID)
@@ -211,6 +221,9 @@ func main() {
 	payablesClient := payableopenitem.NewHTTPClient(cfg.PayableOpenItemServiceURL, log)
 
 	h := handler.New(pgStore, publisher, authzClient, poClient, payablesClient, log)
+	// AP-06 Invoice Matching runs inside this service: PO (AP-03) and receipt (AP-04)
+	// evidence in, an immutable match run and the invoice's match dimension out.
+	h.WithMatching(handler.MatchDeps{Store: pgStore, PO: poClient, Receipts: receipts.NewHTTPClient(cfg.GoodsReceiptServiceURL)})
 	handler.RegisterRoutes(r, h)
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────

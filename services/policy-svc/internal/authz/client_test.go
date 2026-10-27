@@ -124,3 +124,28 @@ func TestCheckAllowed_ExpiresAfterTTL(t *testing.T) {
 		t.Fatalf("expected the second call after expiry to re-hit authorization-svc, got %d live calls", got)
 	}
 }
+
+// The maker travels with a checker's authorization, so an own-object SoD rule
+// in authorization-svc can apply; and two makers never share a cached answer.
+func TestCheckAllowed_SendsResourceOwner(t *testing.T) {
+	var owners []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		owner, _ := body["resource_owner_principal_id"].(string)
+		owners = append(owners, owner)
+		_, _ = w.Write([]byte(`{"decision_outcome":"GRANTED"}`))
+	}))
+	defer srv.Close()
+	c := NewHTTPClient(srv.URL, zap.NewNop())
+	ctx := WithResourceOwner(context.Background(), "author-1")
+	if err := c.CheckAllowed(ctx, "approver", "le", ActionPolicyVersionApprove, "t"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.CheckAllowed(WithResourceOwner(context.Background(), "author-2"), "approver", "le", ActionPolicyVersionApprove, "t"); err != nil {
+		t.Fatal(err)
+	}
+	if len(owners) != 2 || owners[0] != "author-1" || owners[1] != "author-2" {
+		t.Fatalf("each maker must be sent and not served from another's cache entry, got %v", owners)
+	}
+}

@@ -14,6 +14,10 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	idenv "zoiko.io/identity-envelope"
+
+	svcenvelope "zoiko.io/governance-decision-log-svc/internal/envelope"
 )
 
 // ErrPolicyVersionNotFound is returned when policy-svc has no version
@@ -64,6 +68,15 @@ func (c *HTTPClient) GetPolicyVersion(ctx context.Context, tenantID, policyVersi
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrPolicyServiceUnavailable, err)
 	}
+	// The caller's canonical envelope travels with the lookup (GCP §16:
+	// correlation and request ids propagate end to end, and the principal who
+	// asked for the replay is who policy-svc sees). The tenant is then pinned to
+	// the decision's own, whatever the envelope says.
+	svcenvelope.ForwardTo(ctx, req)
+	// The verified identity envelope too (P-12): policy-svc verifies the signed
+	// envelope, and a replay carrying only the asserted headers kept
+	// policy-svc's identity gate at warn for every caller.
+	idenv.Forward(ctx, req)
 	req.Header.Set("X-Tenant-Id", tenantID)
 	resp, err := c.http.Do(req)
 	if err != nil {

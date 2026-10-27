@@ -98,6 +98,19 @@ spec:
         # exists yet.
         - name: DOCUMENT_VAULT_SERVICE_URL
           value: "http://document-vault-svc.zoiko-evidence.svc.cluster.local:8094"
+        # Cross-domain: legal entities are confirmed against tenant-svc and
+        # the identity gate verifies envelopes against identity-svc. Config
+        # refuses to start outside local without the registry URL.
+        - name: TENANT_REGISTRY_URL
+          value: "http://tenant-svc.zoiko-identity.svc.cluster.local:8081"
+        - name: IDENTITY_VERIFY
+          value: "warn"
+        - name: IDENTITY_JWKS_URL
+          value: "http://identity-svc.zoiko-identity.svc.cluster.local:8080/.well-known/jwks.json"
+        - name: IDENTITY_INTROSPECT_URL
+          value: "http://identity-svc.zoiko-identity.svc.cluster.local:8080/v1/context/session/introspect"
+        - name: IDENTITY_ISSUER
+          value: "identity-context-svc"
         - name: OTEL_EXPORTER_OTLP_ENDPOINT
           value: "http://otel-collector.zoiko-infra.svc.cluster.local:4318"
         livenessProbe:

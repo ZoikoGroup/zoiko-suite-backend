@@ -73,6 +73,19 @@ spec:
           value: "zoiko.authorization.events"
         - name: JURISDICTION_RULES_URL
           value: "http://jurisdiction-svc.zoiko-governance.svc.cluster.local:8082"
+        # Identity assertion (X5): warn until every G1/G2 caller forwards the
+        # signed envelope; the JWKS URL must be the in-cluster identity-svc.
+        - name: AUTHZ_IDENTITY_ASSERTION
+          value: "warn"
+        - name: AUTHZ_IDENTITY_JWKS_URL
+          value: "http://identity-svc.zoiko-identity.svc.cluster.local:8080/.well-known/jwks.json"
+        # AU-01: each verified envelope's session is checked at identity-svc.
+        - name: AUTHZ_IDENTITY_INTROSPECT_URL
+          value: "http://identity-svc.zoiko-identity.svc.cluster.local:8080/v1/context/session/introspect"
+        - name: AUTHZ_IDENTITY_ISSUER
+          value: "identity-context-svc"
+        - name: AUTHZ_IDENTITY_AUDIENCE
+          value: "zoiko-internal"
         livenessProbe:
           httpGet:
             path: /healthz

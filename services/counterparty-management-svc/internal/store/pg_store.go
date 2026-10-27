@@ -94,12 +94,13 @@ func (s *PgStore) GetCounterparty(ctx context.Context, id string) (*domain.Count
 
 	var c domain.Counterparty
 	var ctype, risk, status string
+	tenantID := middleware.GetTenantID(ctx)
 	err = tx.QueryRow(ctx, `
 		SELECT counterparty_id, tenant_id, legal_entity_id, name, counterparty_type, COALESCE(registration_number,''),
 		       COALESCE(tax_id,''), jurisdiction_id, risk_category, status, COALESCE(contact_email,''),
 		       COALESCE(phone,''), COALESCE(address,''), compliance_status, effective_from::text, effective_to::text,
 		       created_by, created_at, updated_at
-		FROM counterparties WHERE counterparty_id = $1`, id,
+		FROM counterparties WHERE counterparty_id = $1 AND tenant_id = $2`, id, tenantID,
 	).Scan(
 		&c.CounterpartyID, &c.TenantID, &c.LegalEntityID, &c.Name, &ctype, &c.RegistrationNumber,
 		&c.TaxID, &c.JurisdictionID, &risk, &status, &c.ContactEmail,
@@ -129,16 +130,18 @@ func (s *PgStore) ListCounterparties(ctx context.Context, legalEntityID, counter
 		return nil, err
 	}
 
+	tenantID := middleware.GetTenantID(ctx)
 	rows, err := tx.Query(ctx, `
 		SELECT counterparty_id, tenant_id, legal_entity_id, name, counterparty_type, COALESCE(registration_number,''),
 		       COALESCE(tax_id,''), jurisdiction_id, risk_category, status, COALESCE(contact_email,''),
 		       COALESCE(phone,''), COALESCE(address,''), compliance_status, effective_from::text, effective_to::text,
 		       created_by, created_at, updated_at
 		FROM counterparties
-		WHERE ($1 = '' OR legal_entity_id = $1)
+		WHERE tenant_id = $4
+		  AND ($1 = '' OR legal_entity_id = $1)
 		  AND ($2 = '' OR counterparty_type = $2)
 		  AND ($3 = '' OR status = $3)
-		ORDER BY created_at DESC`, legalEntityID, counterpartyType, status,
+		ORDER BY created_at DESC`, legalEntityID, counterpartyType, status, tenantID,
 	)
 	if err != nil {
 		return nil, err
@@ -177,14 +180,15 @@ func (s *PgStore) UpdateCounterparty(ctx context.Context, c *domain.Counterparty
 	}
 
 	c.UpdatedAt = time.Now().UTC()
+	tenantID := middleware.GetTenantID(ctx)
 
 	_, err = tx.Exec(ctx, `
 		UPDATE counterparties
 		SET name=$1, counterparty_type=$2, registration_number=$3, tax_id=$4, jurisdiction_id=$5,
 		    risk_category=$6, status=$7, contact_email=$8, phone=$9, address=$10, effective_to=$11, updated_at=$12
-		WHERE counterparty_id=$13`,
+		WHERE counterparty_id=$13 AND tenant_id=$14`,
 		c.Name, string(c.CounterpartyType), c.RegistrationNumber, c.TaxID, c.JurisdictionID,
-		string(c.RiskCategory), string(c.Status), c.ContactEmail, c.Phone, c.Address, c.EffectiveTo, c.UpdatedAt, c.CounterpartyID,
+		string(c.RiskCategory), string(c.Status), c.ContactEmail, c.Phone, c.Address, c.EffectiveTo, c.UpdatedAt, c.CounterpartyID, tenantID,
 	)
 	if err != nil {
 		return fmt.Errorf("update counterparty: %w", err)
@@ -210,12 +214,13 @@ func (s *PgStore) UpdateComplianceStatus(ctx context.Context, id, complianceStat
 
 	c.ComplianceStatus = complianceStatus
 	c.UpdatedAt = time.Now().UTC()
+	tenantID := middleware.GetTenantID(ctx)
 
 	_, err = tx.Exec(ctx, `
 		UPDATE counterparties
 		SET compliance_status=$1, updated_at=$2
-		WHERE counterparty_id=$3`,
-		c.ComplianceStatus, c.UpdatedAt, id,
+		WHERE counterparty_id=$3 AND tenant_id=$4`,
+		c.ComplianceStatus, c.UpdatedAt, id, tenantID,
 	)
 	if err != nil {
 		return nil, err

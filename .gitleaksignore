@@ -1,0 +1,42 @@
+# Gitleaks ignore list — findings tracked and cleaned up separately,
+# per .github/workflows/secret-scan.yml.
+#
+# Both entries are throwaway fixtures introduced by a1293aac (5 Oct audit-fix
+# commit) and are already handled in current HEAD:
+#   - suppression_handler_test.go line 272 is a deliberately-rejected legacy
+#     action-token shape (base64 of tenant-abc.UNSUB...), now marked with a
+#     `// gitleaks:allow` comment.
+#   - README-live-check.md line 44 is a local dev placeholder secret, now
+#     de-fanged to a low-entropy value.
+# The fingerprints below cover the historical patch in the scanned commit
+# range; gitleaks git scans additions, so the fix commits alone cannot
+# clear them.
+a1293aaceb57d44dd7a69bfd2134ac94bcd4d1f2:services/notification-svc/internal/handler/suppression_handler_test.go:generic-api-key:272
+a1293aaceb57d44dd7a69bfd2134ac94bcd4d1f2:services/notification-svc/scripts/README-live-check.md:generic-api-key:44
+
+# ZS-SVC-M-001 Waves 1-4 (PR feat/integration): deliberately fake secrets in
+# negative-path tests. Each proves a credential-shaped value is refused,
+# scrubbed or never echoed, so each has to contain one. All four are also marked
+# `// gitleaks:allow` on the line, which is what keeps them clean if the PR is
+# squash-merged; these fingerprints cover the commits already pushed.
+69c89a8ea0da7964337d541cf1d501ccb803dddb:services/connectivity-api-bridge-svc/internal/connector/service_test.go:stripe-access-token:218
+69c89a8ea0da7964337d541cf1d501ccb803dddb:services/connectivity-api-bridge-svc/internal/domain/lifecycle_test.go:stripe-access-token:140
+2fa30a2739ade5ee10d995d63ea196a803f7e077:services/gateway-auth-svc/internal/admin/admin_test.go:generic-api-key:15
+b4634f13b0fe152baeb1971abbf6c1c68a7c8852:services/eventing/integration/integration_test.go:private-key:455
+
+# ZS-SVC-T-001 wave 1 (PR #229): deliberately fake `sk_live_...` values in two
+# negative-path registry tests, which prove a credential-shaped credential_class
+# is refused and never echoed. The lines are marked `// gitleaks:allow` in the
+# current code; these fingerprints cover the commit already pushed.
+6b72bd5d221ffcf0db45fdac10cb22ffd4cc2ecf:services/connectivity-api-bridge-svc/internal/handler/registry_test.go:stripe-access-token:493
+6b72bd5d221ffcf0db45fdac10cb22ffd4cc2ecf:services/connectivity-api-bridge-svc/internal/handler/registry_test.go:stripe-access-token:498
+6b72bd5d221ffcf0db45fdac10cb22ffd4cc2ecf:services/connectivity-api-bridge-svc/internal/registry/validate_test.go:stripe-access-token:257
+6b72bd5d221ffcf0db45fdac10cb22ffd4cc2ecf:services/connectivity-api-bridge-svc/internal/registry/validate_test.go:stripe-access-token:259
+# PR #226 (shashi-changes, TOTP second factor in 75ca7b90): neither is a secret.
+#   - docker-compose.yml: the local stack's MFA_SECRET_KEY (base64 of
+#     "local-dev-mfa-key-32-bytes-long!"); identity-context-svc refuses it in
+#     staging and production (config.localMFAKey).
+#   - config_mfa_test.go: bytes 0x00..0x1f, a test vector.
+# Both lines now carry `gitleaks:allow`; these cover the commit already pushed.
+75ca7b900d4ba4afc2bbeff36c78409750fc6b90:deployments/docker-compose.yml:generic-api-key:674
+75ca7b900d4ba4afc2bbeff36c78409750fc6b90:services/identity-context-svc/internal/config/config_mfa_test.go:generic-api-key:8

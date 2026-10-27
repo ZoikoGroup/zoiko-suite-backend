@@ -38,9 +38,9 @@ func TestScenarioA06_PaymentReleaserChangedSupplierBank_CoolingWindowConflict_De
 		ResourceID:    "pmt-9988",
 		Action:        "payment.release",
 		ResourceAttributes: map[string]string{
-			"amount":                               "150000.00",
-			"currency":                             "USD",
-			"supplier_bank_changed_by":             releaserID, // Releaser changed the supplier bank details
+			"amount":                              "150000.00",
+			"currency":                            "USD",
+			"supplier_bank_changed_by":            releaserID, // Releaser changed the supplier bank details
 			"supplier_bank_cooling_window_active": "true",     // within cooling window
 		},
 		Environment: domain.EnvironmentContext{
@@ -167,9 +167,9 @@ func TestScenarioA06_IndependentReleaser_NotBlocked(t *testing.T) {
 		ResourceID:    "pmt-9988",
 		Action:        "payment.release",
 		ResourceAttributes: map[string]string{
-			"amount":                               "150000.00",
-			"currency":                             "USD",
-			"supplier_bank_changed_by":             bankChangerID, // Changed by someone else!
+			"amount":                              "150000.00",
+			"currency":                            "USD",
+			"supplier_bank_changed_by":            bankChangerID, // Changed by someone else!
 			"supplier_bank_cooling_window_active": "true",
 		},
 		Environment: domain.EnvironmentContext{
@@ -195,8 +195,8 @@ func TestScenarioA06_IndependentReleaser_NotBlocked(t *testing.T) {
 	var resp domain.CanonicalDecisionResponse
 	_ = json.Unmarshal(w.Body.Bytes(), &resp)
 
-	if resp.Decision != domain.CanonicalDecisionAllow {
-		t.Errorf("expected decision ALLOW for independent releaser, got %s", resp.Decision)
+	if resp.Decision != domain.CanonicalDecisionPermit {
+		t.Errorf("expected decision PERMIT for independent releaser, got %s", resp.Decision)
 	}
 	if len(resp.NegativeControls) != 0 {
 		t.Errorf("expected no negative controls for independent releaser, got %v", resp.NegativeControls)
@@ -357,8 +357,8 @@ func TestScenarioA26_RecentAuthentication_Allowed(t *testing.T) {
 	var resp domain.CanonicalDecisionResponse
 	_ = json.Unmarshal(w.Body.Bytes(), &resp)
 
-	if resp.Decision != domain.CanonicalDecisionAllow {
-		t.Errorf("expected decision ALLOW with fresh authentication, got %s", resp.Decision)
+	if resp.Decision != domain.CanonicalDecisionPermit {
+		t.Errorf("expected decision PERMIT with fresh authentication, got %s", resp.Decision)
 	}
 	if resp.StepUp != nil {
 		t.Errorf("expected no step_up requirement with fresh authentication, got %+v", resp.StepUp)
@@ -417,14 +417,15 @@ func TestCanonicalDecisionContract_Permit(t *testing.T) {
 		t.Fatalf("unmarshal error: %v", err)
 	}
 
-	if resp.Decision != domain.CanonicalDecisionAllow {
-		t.Errorf("expected decision ALLOW, got %s", resp.Decision)
+	if resp.Decision != domain.CanonicalDecisionPermit {
+		t.Errorf("expected decision PERMIT, got %s", resp.Decision)
 	}
 	if resp.DecisionID == "" {
 		t.Errorf("expected non-empty decision_id")
 	}
-	if resp.PolicySetVersion != domain.DefaultPolicySetVersion && resp.PolicySetVersion != "2026.08.24.4" {
-		t.Errorf("expected policy_set_version 2026.08.24.4, got %s", resp.PolicySetVersion)
+	// The version recorded with the decision, not a constant (§20, A28).
+	if resp.PolicySetVersion != "cfg.42" {
+		t.Errorf("expected the recorded policy_set_version cfg.42, got %q", resp.PolicySetVersion)
 	}
 	if len(resp.MatchedGrants) == 0 {
 		t.Errorf("expected non-empty matched_grants")
@@ -1008,13 +1009,15 @@ func TestAvailableActions_ResourceLifecycleState_TerminalStatus_Denied(t *testin
 	pub := &stubPublisher{}
 	r := newTestRouterFull(store, pub, &stubValidator{})
 
+	// Identity from the verified headers; the query-string principal/tenant
+	// fallback was an impersonation path and is gone.
 	url := "/v1/payment_instruction/pmt-terminal-1/available-actions?" +
-		"principal_id=" + userID +
-		"&tenant_id=" + tenantID +
-		"&legal_entity_id=" + legalEntity +
+		"legal_entity_id=" + legalEntity +
 		"&status=CANCELLED"
 
 	req := httptest.NewRequest(http.MethodGet, url, nil)
+	req.Header.Set("X-Principal-Id", userID)
+	req.Header.Set("X-Tenant-Id", tenantID)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -1088,8 +1091,8 @@ func TestCapabilities_ActivePrincipal_ReturnsModulesAndFeatures(t *testing.T) {
 
 func TestCapabilities_SuspendedPrincipal_Returns403(t *testing.T) {
 	const (
-		tenantID    = "11111111-1111-4111-8111-111111111111"
-		userID      = "usr-suspended-1"
+		tenantID = "11111111-1111-4111-8111-111111111111"
+		userID   = "usr-suspended-1"
 	)
 
 	store := &stubStore{
@@ -1113,9 +1116,9 @@ func TestCapabilities_SuspendedPrincipal_Returns403(t *testing.T) {
 // ── ValidateSoD Candidate Reporting with DynamicRestricted ───────────────────
 func TestValidateSoD_ReportsDynamicRestrictedActions(t *testing.T) {
 	const (
-		tenantID    = "11111111-1111-4111-8111-111111111111"
-		callerID    = "usr-admin-1"
-		subjectID   = "usr-user-1"
+		tenantID  = "11111111-1111-4111-8111-111111111111"
+		callerID  = "usr-admin-1"
+		subjectID = "usr-user-1"
 	)
 
 	store := &stubStore{
@@ -1144,8 +1147,8 @@ func TestValidateSoD_ReportsDynamicRestrictedActions(t *testing.T) {
 	}
 
 	var resp struct {
-		ConflictFree      bool          `json:"conflict_free"`
-		DynamicRestricted []string      `json:"dynamic_restricted"`
+		ConflictFree      bool     `json:"conflict_free"`
+		DynamicRestricted []string `json:"dynamic_restricted"`
 	}
 	_ = json.Unmarshal(w.Body.Bytes(), &resp)
 
@@ -1168,4 +1171,3 @@ func TestValidateSoD_ReportsDynamicRestrictedActions(t *testing.T) {
 		t.Errorf("expected dynamic_restricted to contain payment.release and invoice.approve, got %v", resp.DynamicRestricted)
 	}
 }
-

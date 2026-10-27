@@ -42,8 +42,6 @@ func (h *Handler) RaiseConflict(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.publisher.PublishEvidenceConflictRaised(r.Context(), *conflict)
-
 	status := http.StatusCreated
 	if !created {
 		status = http.StatusOK
@@ -137,6 +135,5 @@ func (h *Handler) ResolveConflict(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.publisher.PublishEvidenceConflictResolved(r.Context(), *conflict)
 	writeJSON(w, http.StatusOK, conflict)
 }

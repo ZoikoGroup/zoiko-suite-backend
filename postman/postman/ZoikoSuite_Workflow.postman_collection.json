@@ -1,0 +1,1348 @@
+{
+  "info": {
+    "_postman_id": "zoiko-workflow",
+    "name": "ZoikoSuite - Workflow & Approvals",
+    "description": "workflow-svc (port 8090, Doc 03 §8.4). Send identity-context-svc's envelope as the bearer token ({{identityEnvelope}}); in warn mode X-Principal-Id alone is still admitted. The collection pre-request script adds X-Tenant-Id, X-Principal-Id (unless the request sets its own), X-Correlation-ID, X-Request-Id, X-Source-Channel and, on writes, a fresh Idempotency-Key. Approvals need WORKFLOW_APPROVE (WORKFLOW_APPROVER template, access-control 000021); a delegate needs a live delegation from the stage's approver. Each decision returns decision_id, the governance-ledger record it is written under. Errors are RFC 9457 application/problem+json with error_class. Run the folders in order.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{identityEnvelope}}",
+        "type": "string"
+      }
+    ]
+  },
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "const v = (k) => pm.variables.get(k);",
+          "pm.request.headers.upsert({key: 'X-Tenant-Id', value: v('tenantId')});",
+          "if (!pm.request.headers.has('X-Principal-Id')) { pm.request.headers.upsert({key: 'X-Principal-Id', value: v('requesterId')}); }",
+          "pm.request.headers.upsert({key: 'X-Correlation-ID', value: v('correlationId')});",
+          "pm.request.headers.upsert({key: 'X-Request-Id', value: 'req_' + Date.now() + Math.floor(Math.random()*1e6)});",
+          "pm.request.headers.upsert({key: 'X-Source-Channel', value: 'api'});",
+          "if (pm.request.method !== 'GET') {",
+          "  if (!pm.request.headers.has('Idempotency-Key')) { pm.request.headers.upsert({key: 'Idempotency-Key', value: pm.variables.replaceIn('{{$guid}}')}); }",
+          "  pm.request.headers.upsert({key: 'Content-Type', value: 'application/json'});",
+          "}"
+        ]
+      }
+    }
+  ],
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:8090"
+    },
+    {
+      "key": "identityEnvelope",
+      "value": ""
+    },
+    {
+      "key": "tenantId",
+      "value": "11111111-1111-1111-1111-111111111111"
+    },
+    {
+      "key": "legalEntityId",
+      "value": "22222222-2222-2222-2222-222222222222"
+    },
+    {
+      "key": "requesterId",
+      "value": "demo-requester-01"
+    },
+    {
+      "key": "approver1Id",
+      "value": "demo-approver-01"
+    },
+    {
+      "key": "approver2Id",
+      "value": "demo-approver-02"
+    },
+    {
+      "key": "delegateId",
+      "value": "demo-delegate-01"
+    },
+    {
+      "key": "adminId",
+      "value": "demo-workflow-admin-01"
+    },
+    {
+      "key": "escalationTargetId",
+      "value": "demo-head-of-finance"
+    },
+    {
+      "key": "subjectOwnerId",
+      "value": "demo-invoice-service"
+    },
+    {
+      "key": "correlationId",
+      "value": "workflow-demo-01"
+    },
+    {
+      "key": "workflowId",
+      "value": ""
+    },
+    {
+      "key": "workflowVersion",
+      "value": "1"
+    },
+    {
+      "key": "definitionId",
+      "value": ""
+    },
+    {
+      "key": "definitionV2Id",
+      "value": ""
+    },
+    {
+      "key": "fixedIdemKey",
+      "value": ""
+    }
+  ],
+  "item": [
+    {
+      "name": "01 - Probes",
+      "item": [
+        {
+          "name": "Liveness /healthz",
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "GET",
+            "url": "{{baseUrl}}/healthz"
+          }
+        },
+        {
+          "name": "Readiness /readyz",
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "GET",
+            "url": "{{baseUrl}}/readyz"
+          }
+        }
+      ]
+    },
+    {
+      "name": "02 - Definitions",
+      "item": [
+        {
+          "name": "Create definition (ROLE stage, 24h stage deadline)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-Principal-Id",
+                "value": "{{adminId}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/workflow-definitions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "workflow-definitions"
+              ]
+            },
+            "description": "WORKFLOW_DEFINE at PLATFORM scope. stages_json is a base64 JSON array: [{\"order\":1,\"stage_type\":\"SINGLE\",\"approver_principal_id\":\"demo-approver-01\",\"due_at_hours\":24},{\"order\":2,\"stage_type\":\"ROLE\",\"approver_role\":\"FINANCE_CONTROLLER\"}].",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"tenant_id\": \"{{tenantId}}\",\n  \"workflow_type\": \"PURCHASE_APPROVAL\",\n  \"version\": 1,\n  \"name\": \"Purchase approval\",\n  \"stages_json\": \"W3sib3JkZXIiOjEsInN0YWdlX3R5cGUiOiJTSU5HTEUiLCJhcHByb3Zlcl9wcmluY2lwYWxfaWQiOiJkZW1vLWFwcHJvdmVyLTAxIiwiZHVlX2F0X2hvdXJzIjoyNH0seyJvcmRlciI6Miwic3RhZ2VfdHlwZSI6IlJPTEUiLCJhcHByb3Zlcl9yb2xlIjoiRklOQU5DRV9DT05UUk9MTEVSIn1d\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 201', () => pm.expect(pm.response.code).to.be.oneOf([201]));",
+                  "if (pm.response.code < 300) { pm.collectionVariables.set('definitionId', pm.response.json().workflow_definition_id); }"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Activate definition",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-Principal-Id",
+                "value": "{{adminId}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/workflow-definitions/{{definitionId}}/activate",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "workflow-definitions",
+                "{{definitionId}}",
+                "activate"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.expect(pm.response.code).to.be.oneOf([200]));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "List definitions (WORKFLOW_READ at PLATFORM)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Principal-Id",
+                "value": "{{adminId}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/workflow-definitions?workflow_type=PURCHASE_APPROVAL",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "workflow-definitions"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.expect(pm.response.code).to.be.oneOf([200]));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get definition",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Principal-Id",
+                "value": "{{adminId}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/workflow-definitions/{{definitionId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "workflow-definitions",
+                "{{definitionId}}"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.expect(pm.response.code).to.be.oneOf([200]));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "03 - Start and read",
+      "item": [
+        {
+          "name": "Create workflow (named stages)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-Legal-Entity-Id",
+                "value": "{{legalEntityId}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/workflows",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "workflows"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"tenant_id\": \"{{tenantId}}\",\n  \"legal_entity_id\": \"{{legalEntityId}}\",\n  \"workflow_type\": \"PURCHASE_APPROVAL\",\n  \"subject_type\": \"purchase_order\",\n  \"subject_id\": \"PO-1001\",\n  \"subject_version\": 1,\n  \"subject_fingerprint\": \"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\n  \"escalation_target\": \"{{escalationTargetId}}\",\n  \"stages\": [\n    {\n      \"approver_principal_id\": \"{{approver1Id}}\",\n      \"due_at_hours\": 24\n    },\n    {\n      \"approver_principal_id\": \"{{approver2Id}}\"\n    }\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 201', () => pm.expect(pm.response.code).to.be.oneOf([201]));",
+                  "if (pm.response.code < 300) { pm.collectionVariables.set('workflowId', pm.response.json().workflow_instance_id); }"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Create workflow from the definition (route from the definition)",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/v1/workflows",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "workflows"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"tenant_id\": \"{{tenantId}}\",\n  \"legal_entity_id\": \"{{legalEntityId}}\",\n  \"workflow_type\": \"PURCHASE_APPROVAL\",\n  \"workflow_definition_id\": \"{{definitionId}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 201', () => pm.expect(pm.response.code).to.be.oneOf([201]));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Refused: body entity differs from X-Legal-Entity-Id (400)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-Legal-Entity-Id",
+                "value": "99999999-9999-4999-8999-999999999999"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/workflows",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "workflows"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"tenant_id\": \"{{tenantId}}\",\n  \"legal_entity_id\": \"{{legalEntityId}}\",\n  \"workflow_type\": \"PURCHASE_APPROVAL\",\n  \"stages\": [\n    {\n      \"approver_principal_id\": \"{{approver1Id}}\"\n    }\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 400', () => pm.expect(pm.response.code).to.be.oneOf([400]));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get workflow (initiator reads without WORKFLOW_READ)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/v1/workflows/{{workflowId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "workflows",
+                "{{workflowId}}"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.expect(pm.response.code).to.be.oneOf([200]));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Next approver",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/v1/workflows/{{workflowId}}/next-approver",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "workflows",
+                "{{workflowId}}",
+                "next-approver"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.expect(pm.response.code).to.be.oneOf([200]));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Pending approvals (WORKFLOW_READ at PLATFORM)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Principal-Id",
+                "value": "{{adminId}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/workflows/pending?limit=50",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "workflows",
+                "pending"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.expect(pm.response.code).to.be.oneOf([200]));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "04 - Decide",
+      "item": [
+        {
+          "name": "Refused: REJECT without a rationale (400)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-Principal-Id",
+                "value": "{{approver1Id}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/workflows/{{workflowId}}/actions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "workflows",
+                "{{workflowId}}",
+                "actions"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"action\": \"REJECT\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 400', () => pm.expect(pm.response.code).to.be.oneOf([400]));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Refused: a service principal cannot approve (403)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-Principal-Id",
+                "value": "svc-payments"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/workflows/{{workflowId}}/actions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "workflows",
+                "{{workflowId}}",
+                "actions"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"action\": \"APPROVE\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 403', () => pm.expect(pm.response.code).to.be.oneOf([403]));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Refused: the initiator cannot approve (403)",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/v1/workflows/{{workflowId}}/actions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "workflows",
+                "{{workflowId}}",
+                "actions"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"action\": \"APPROVE\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 403', () => pm.expect(pm.response.code).to.be.oneOf([403]));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Stage 1 APPROVE (fixed Idempotency-Key)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Idempotency-Key",
+                "value": "wf-demo-approve-1"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{approver1Id}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/workflows/{{workflowId}}/actions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "workflows",
+                "{{workflowId}}",
+                "actions"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"action\": \"APPROVE\",\n  \"rationale\": \"Within budget\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.expect(pm.response.code).to.be.oneOf([200]));",
+                  "pm.test('decision_id returned', () => pm.expect(pm.response.json().decision_id).to.be.a('string'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Replay: same key and body (200, no decision_id)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Idempotency-Key",
+                "value": "wf-demo-approve-1"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{approver1Id}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/workflows/{{workflowId}}/actions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "workflows",
+                "{{workflowId}}",
+                "actions"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"action\": \"APPROVE\",\n  \"rationale\": \"Within budget\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.expect(pm.response.code).to.be.oneOf([200]));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Refused: same key, different body (409)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Idempotency-Key",
+                "value": "wf-demo-approve-1"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{approver1Id}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/workflows/{{workflowId}}/actions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "workflows",
+                "{{workflowId}}",
+                "actions"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"action\": \"REJECT\",\n  \"rationale\": \"Changed my mind\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 409', () => pm.expect(pm.response.code).to.be.oneOf([409]));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Stage 2 APPROVE by a delegate of approver 2",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-Principal-Id",
+                "value": "{{delegateId}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/workflows/{{workflowId}}/actions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "workflows",
+                "{{workflowId}}",
+                "actions"
+              ]
+            },
+            "description": "Needs a live delegation of WORKFLOW_APPROVE from {{approver2Id}} to {{delegateId}} (delegated-authority-svc). Without one: 403 wrong_approver.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"action\": \"APPROVE\",\n  \"rationale\": \"Covering for approver 2\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200 or 403', () => pm.expect(pm.response.code).to.be.oneOf([200, 403]));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Approval evidence (transitions with lineage)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/v1/workflows/{{workflowId}}/evidence",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "workflows",
+                "{{workflowId}}",
+                "evidence"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.expect(pm.response.code).to.be.oneOf([200]));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Verify release",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-Principal-Id",
+                "value": "{{subjectOwnerId}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/workflows/{{workflowId}}/verify-release",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "workflows",
+                "{{workflowId}}",
+                "verify-release"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"expected_subject_version\": 1,\n  \"current_subject_fingerprint\": \"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200 or 409', () => pm.expect(pm.response.code).to.be.oneOf([200, 409]));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "05 - Lifecycle",
+      "item": [
+        {
+          "name": "Create a second workflow",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/v1/workflows",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "workflows"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"tenant_id\": \"{{tenantId}}\",\n  \"legal_entity_id\": \"{{legalEntityId}}\",\n  \"workflow_type\": \"PURCHASE_APPROVAL\",\n  \"stages\": [\n    {\n      \"approver_principal_id\": \"{{approver1Id}}\"\n    },\n    {\n      \"approver_principal_id\": \"{{approver2Id}}\"\n    }\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 201', () => pm.expect(pm.response.code).to.be.oneOf([201]));",
+                  "if (pm.response.code < 300) { pm.collectionVariables.set('workflowId', pm.response.json().workflow_instance_id); }"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Escalate to a named owner",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-Principal-Id",
+                "value": "{{adminId}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/workflows/{{workflowId}}/escalate-to",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "workflows",
+                "{{workflowId}}",
+                "escalate-to"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"escalation_target\": \"{{escalationTargetId}}\",\n  \"reason_code\": \"SLA_BREACH\",\n  \"narrative\": \"Approver on leave\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.expect(pm.response.code).to.be.oneOf([200]));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Escalation target decides the stage",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-Principal-Id",
+                "value": "{{escalationTargetId}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/workflows/{{workflowId}}/actions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "workflows",
+                "{{workflowId}}",
+                "actions"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"action\": \"REJECT\",\n  \"rationale\": \"Supplier not onboarded\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.expect(pm.response.code).to.be.oneOf([200]));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Request changes (reopens for a new review cycle)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-Principal-Id",
+                "value": "{{adminId}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/workflows/{{workflowId}}/request-changes",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "workflows",
+                "{{workflowId}}",
+                "request-changes"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"rationale\": \"Attach the supplier onboarding pack\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.expect(pm.response.code).to.be.oneOf([200]));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Escalate (initiator chasing)",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/v1/workflows/{{workflowId}}/escalate",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "workflows",
+                "{{workflowId}}",
+                "escalate"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.expect(pm.response.code).to.be.oneOf([200]));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Invalidate (subject changed)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-Expected-Version",
+                "value": "{{workflowVersion}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{subjectOwnerId}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/workflows/{{workflowId}}/invalidate",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "workflows",
+                "{{workflowId}}",
+                "invalidate"
+              ]
+            },
+            "description": "Called by the service that owns the subject (WORKFLOW_INVALIDATE). X-Expected-Version is the instance row_version.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"reason_code\": \"CONTROL_FAILURE\",\n  \"narrative\": \"PO amount changed\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200 or 409', () => pm.expect(pm.response.code).to.be.oneOf([200, 409]));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Cancel (initiator withdraws)",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/v1/workflows/{{workflowId}}/cancel",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "workflows",
+                "{{workflowId}}",
+                "cancel"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200 or 409', () => pm.expect(pm.response.code).to.be.oneOf([200, 409]));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "06 - Definition lifecycle",
+      "item": [
+        {
+          "name": "Suspend definition",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-Principal-Id",
+                "value": "{{adminId}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/workflow-definitions/{{definitionId}}/suspend",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "workflow-definitions",
+                "{{definitionId}}",
+                "suspend"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.expect(pm.response.code).to.be.oneOf([200]));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Create definition v2",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-Principal-Id",
+                "value": "{{adminId}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/workflow-definitions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "workflow-definitions"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"tenant_id\": \"{{tenantId}}\",\n  \"workflow_type\": \"PURCHASE_APPROVAL\",\n  \"version\": 2,\n  \"stages_json\": \"W3sib3JkZXIiOjEsInN0YWdlX3R5cGUiOiJST0xFIiwiYXBwcm92ZXJfcm9sZSI6IkZJTkFOQ0VfQ09OVFJPTExFUiIsImR1ZV9hdF9ob3VycyI6NDh9XQ==\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 201', () => pm.expect(pm.response.code).to.be.oneOf([201]));",
+                  "if (pm.response.code < 300) { pm.collectionVariables.set('definitionV2Id', pm.response.json().workflow_definition_id); }"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Supersede v1 with v2",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-Principal-Id",
+                "value": "{{adminId}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/workflow-definitions/{{definitionId}}/supersede",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "workflow-definitions",
+                "{{definitionId}}",
+                "supersede"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"new_definition_id\": \"{{definitionV2Id}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.expect(pm.response.code).to.be.oneOf([200]));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Retire v1",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-Principal-Id",
+                "value": "{{adminId}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/workflow-definitions/{{definitionId}}/retire",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "workflow-definitions",
+                "{{definitionId}}",
+                "retire"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.expect(pm.response.code).to.be.oneOf([200]));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

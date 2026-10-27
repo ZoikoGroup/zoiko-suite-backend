@@ -51,46 +51,53 @@ var (
 )
 
 func TestMain(m *testing.M) {
-	dbPort := uint32(15901 + uint32(os.Getpid()%499))
-	pg := embeddedpostgres.NewDatabase(
-		embeddedpostgres.DefaultConfig().
-			// Version pinned explicitly to a literal patch string, NOT the
-			// library's own embeddedpostgres.V16 alias — see the doc comment
-			// on embeddedpostgres.DefaultConfig() in audit-event-store-svc's
-			// main_integration_test.go for why floating is dangerous (this
-			// is what broke PR #105's CI). V16 itself turned out to be the
-			// same hazard one layer down: it is a constant baked into
-			// embedded-postgres v1.34.0 (the latest release) that resolves
-			// to "16.9.0", a specific patch chosen by that library's authors
-			// — not by us — and we cannot bump our way to a newer pin
-			// without the library releasing one. CI failed on exactly this
-			// ("no version found matching 16.9.0") even though 16.9.0 is
-			// still a real, resolvable artifact; pinning our own literal
-			// string here means a future resolution hiccup is something we
-			// control by editing this line, not something that requires
-			// waiting on an upstream library release.
-			Version(embeddedpostgres.PostgresVersion("16.15.0")).
-			Port(dbPort).
-			Database("evreq_isolation_test").
-			Username("postgres").
-			Password("postgres"),
-	)
-	if err := pg.Start(); err != nil {
-		fmt.Printf("failed to start embedded postgres: %v\n", err)
-		os.Exit(1)
+	ctx := context.Background()
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	var pg *embeddedpostgres.EmbeddedPostgres
+
+	if dsn == "" {
+		dbPort := uint32(15901 + uint32(os.Getpid()%499))
+		pg = embeddedpostgres.NewDatabase(
+			embeddedpostgres.DefaultConfig().
+				// Version pinned explicitly to a literal patch string, NOT the
+				// library's own embeddedpostgres.V16 alias — see the doc comment
+				// on embeddedpostgres.DefaultConfig() in audit-event-store-svc's
+				// main_integration_test.go for why floating is dangerous (this
+				// is what broke PR #105's CI). V16 itself turned out to be the
+				// same hazard one layer down: it is a constant baked into
+				// embedded-postgres v1.34.0 (the latest release) that resolves
+				// to "16.9.0", a specific patch chosen by that library's authors
+				// — not by us — and we cannot bump our way to a newer pin
+				// without the library releasing one. CI failed on exactly this
+				// ("no version found matching 16.9.0") even though 16.9.0 is
+				// still a real, resolvable artifact; pinning our own literal
+				// string here means a future resolution hiccup is something we
+				// control by editing this line, not something that requires
+				// waiting on an upstream library release.
+				Version(embeddedpostgres.PostgresVersion("16.15.0")).
+				Port(dbPort).
+				Database("evreq_isolation_test").
+				Username("postgres").
+				Password("postgres"),
+		)
+		if err := pg.Start(); err != nil {
+			fmt.Printf("failed to start embedded postgres: %v\n", err)
+			os.Exit(1)
+		}
+
+		dsn = fmt.Sprintf(
+			"host=localhost port=%d dbname=evreq_isolation_test user=postgres password=postgres sslmode=disable",
+			dbPort,
+		)
 	}
 
-	dsn := fmt.Sprintf(
-		"host=localhost port=%d dbname=evreq_isolation_test user=postgres password=postgres sslmode=disable",
-		dbPort,
-	)
-
-	ctx := context.Background()
 	var err error
 	testPool, err = pgxpool.New(ctx, dsn)
 	if err != nil {
 		fmt.Printf("failed to connect to postgres: %v\n", err)
-		_ = pg.Stop()
+		if pg != nil {
+			_ = pg.Stop()
+		}
 		os.Exit(1)
 	}
 
@@ -103,9 +110,21 @@ func TestMain(m *testing.M) {
 	if err != nil {
 		fmt.Printf("postgres did not become ready: %v\n", err)
 		testPool.Close()
-		_ = pg.Stop()
+		if pg != nil {
+			_ = pg.Stop()
+		}
 		os.Exit(1)
 	}
+
+	_, _ = testPool.Exec(ctx, `
+		DROP TABLE IF EXISTS outbox CASCADE;
+		DROP TABLE IF EXISTS evidence_request_receipts CASCADE;
+		DROP TABLE IF EXISTS evidence_request_notes CASCADE;
+		DROP TABLE IF EXISTS evidence_request_responses CASCADE;
+		DROP TABLE IF EXISTS evidence_requests CASCADE;
+		DROP TABLE IF EXISTS evidence_evaluations CASCADE;
+		DROP TABLE IF EXISTS evidence_requirements CASCADE;
+	`)
 
 	// EVERY *.up.sql, BY GLOB, NOT ONE NAMED FILE.
 	//
@@ -130,13 +149,17 @@ func TestMain(m *testing.M) {
 		if readErr != nil {
 			fmt.Printf("failed to read migration %s: %v\n", filepath.Base(migration), readErr)
 			testPool.Close()
-			_ = pg.Stop()
+			if pg != nil {
+				_ = pg.Stop()
+			}
 			os.Exit(1)
 		}
 		if _, err = testPool.Exec(ctx, string(sql)); err != nil {
 			fmt.Printf("failed to apply migration %s: %v\n", filepath.Base(migration), err)
 			testPool.Close()
-			_ = pg.Stop()
+			if pg != nil {
+				_ = pg.Stop()
+			}
 			os.Exit(1)
 		}
 	}
@@ -146,7 +169,9 @@ func TestMain(m *testing.M) {
 	code := m.Run()
 
 	testPool.Close()
-	_ = pg.Stop()
+	if pg != nil {
+		_ = pg.Stop()
+	}
 	os.Exit(code)
 }
 
@@ -373,7 +398,7 @@ func TestPgStore_EffectiveRequirements_ExcludesRetired(t *testing.T) {
 }
 
 // Idempotency is enforced by the database, not by convention.
-func TestPgStore_CreateRequirement_IdempotentOnCorrelationID(t *testing.T) {
+func TestPgStore_CreateRequirement_IsIdempotentByKey(t *testing.T) {
 	ctx := context.Background()
 	tenantID := uuid.New().String()
 	entityID := uuid.New().String()
@@ -391,6 +416,7 @@ func TestPgStore_CreateRequirement_IdempotentOnCorrelationID(t *testing.T) {
 			EffectiveFrom:         time.Now().UTC(),
 			CreatedByPrincipalID:  "admin",
 			CorrelationID:         "corr-idem-1",
+			IdempotencyKey:        "idem-req-replay",
 		}
 	}
 
@@ -400,7 +426,7 @@ func TestPgStore_CreateRequirement_IdempotentOnCorrelationID(t *testing.T) {
 	require.True(t, created)
 
 	// Replay with a DIFFERENT generated primary key but the same
-	// correlation_id: must return the original row, not mint a second.
+	// idempotency key: must return the original row, not mint a second.
 	second := mk()
 	created, err = testStore.CreateRequirement(tctx, second)
 	require.NoError(t, err)
@@ -426,7 +452,7 @@ func TestPgStore_TenantIsolation_GetEvaluation(t *testing.T) {
 			EvaluatedForPrincipalID: "p-" + label,
 			CorrelationID:           "corr-eval-" + label,
 		}
-		created, err := testStore.RecordEvaluation(svcmiddleware.WithTenant(ctx, tenantID), e)
+		created, err := testStore.RecordEvaluation(svcmiddleware.WithTenant(ctx, tenantID), e, nil)
 		require.NoError(t, err)
 		require.True(t, created)
 		return tenantID, evalID
@@ -448,7 +474,7 @@ func TestPgStore_TenantIsolation_GetEvaluation(t *testing.T) {
 
 // A replayed evaluation must return the ORIGINAL determination — the handler
 // relies on created=false to decide not to republish its Kafka event.
-func TestPgStore_RecordEvaluation_IdempotentOnCorrelationID(t *testing.T) {
+func TestPgStore_RecordEvaluation_IsIdempotentByKey(t *testing.T) {
 	ctx := context.Background()
 	tenantID := uuid.New().String()
 	entityID := uuid.New().String()
@@ -466,18 +492,19 @@ func TestPgStore_RecordEvaluation_IdempotentOnCorrelationID(t *testing.T) {
 			PresentArtifactsPayload: json.RawMessage(`[]`),
 			EvaluatedForPrincipalID: "admin",
 			CorrelationID:           "corr-eval-idem",
+			IdempotencyKey:          "idem-eval-replay",
 		}
 	}
 
 	first := mk(domain.OutcomeMissing)
-	created, err := testStore.RecordEvaluation(tctx, first)
+	created, err := testStore.RecordEvaluation(tctx, first, nil)
 	require.NoError(t, err)
 	require.True(t, created)
 
 	// Replay, deliberately with a different outcome: the stored determination
 	// must win. An append-only ledger never gets rewritten.
 	second := mk(domain.OutcomeSatisfied)
-	created, err = testStore.RecordEvaluation(tctx, second)
+	created, err = testStore.RecordEvaluation(tctx, second, nil)
 	require.NoError(t, err)
 	assert.False(t, created)
 	assert.Equal(t, first.EvaluationID, second.EvaluationID)

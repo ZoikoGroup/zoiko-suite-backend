@@ -11,7 +11,6 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/banking-connector-svc/internal/domain"
-	"zoiko.io/banking-connector-svc/internal/events"
 	"zoiko.io/banking-connector-svc/internal/middleware"
 	"zoiko.io/banking-connector-svc/internal/store"
 )
@@ -133,7 +132,7 @@ func (h *BNK0304Handler) IngestStatement(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	tenantID := middleware.GetTenantID(r.Context())
-	result, err := h.bnk0304Store.IngestStatement(r.Context(), tenantID, req, principalID)
+	result, err := h.bnk0304Store.IngestStatement(r.Context(), tenantID, req, principalID, r.Header.Get("X-Correlation-ID"))
 	if err != nil {
 		h.logger.Error("IngestStatement failed", zap.Error(err))
 		writeError(w, http.StatusInternalServerError, "failed to ingest bank statement")
@@ -142,10 +141,6 @@ func (h *BNK0304Handler) IngestStatement(w http.ResponseWriter, r *http.Request)
 	status := http.StatusOK
 	if result.Created {
 		status = http.StatusCreated
-		_ = h.publisher.Publish(r.Context(), events.PublishParams{
-			EventType: "banking.statement.ingested", AggregateID: result.Statement.StatementID, TenantID: tenantID,
-			ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: result,
-		})
 	}
 	writeJSON(w, status, result)
 }
@@ -224,23 +219,16 @@ func (h *BNK0304Handler) NormalizeTransaction(w http.ResponseWriter, r *http.Req
 	}
 	req.TenantID = middleware.GetTenantID(r.Context())
 	req.ActorPrincipalID = principalID
+	req.CorrelationID = r.Header.Get("X-Correlation-ID")
 	result, err := h.bnk0304Store.NormalizeTransaction(r.Context(), req)
 	if err != nil {
 		h.writeTransactionErr(w, err)
 		return
 	}
 	if result.Transaction != nil {
-		_ = h.publisher.Publish(r.Context(), events.PublishParams{
-			EventType: "banking.transaction.normalized", AggregateID: result.Transaction.TransactionID, TenantID: req.TenantID,
-			ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: result.Transaction,
-		})
 		writeJSON(w, http.StatusCreated, result)
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "banking.mapping_exception.raised", AggregateID: result.QuarantinedException.ExceptionID, TenantID: req.TenantID,
-		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: result.QuarantinedException,
-	})
 	writeJSON(w, http.StatusOK, result)
 }
 
@@ -257,15 +245,12 @@ func (h *BNK0304Handler) ReNormalizeTransaction(w http.ResponseWriter, r *http.R
 	req.PriorTransactionID = chi.URLParam(r, "id")
 	req.TenantID = middleware.GetTenantID(r.Context())
 	req.ActorPrincipalID = principalID
+	req.CorrelationID = r.Header.Get("X-Correlation-ID")
 	txn, err := h.bnk0304Store.ReNormalizeTransaction(r.Context(), req)
 	if err != nil {
 		h.writeTransactionErr(w, err)
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "banking.transaction.renormalized", AggregateID: txn.TransactionID, TenantID: req.TenantID,
-		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: txn,
-	})
 	writeJSON(w, http.StatusOK, txn)
 }
 
@@ -285,15 +270,12 @@ func (h *BNK0304Handler) QuarantineTransaction(w http.ResponseWriter, r *http.Re
 	}
 	req.TenantID = middleware.GetTenantID(r.Context())
 	req.ActorPrincipalID = principalID
+	req.CorrelationID = r.Header.Get("X-Correlation-ID")
 	exc, err := h.bnk0304Store.QuarantineTransaction(r.Context(), req)
 	if err != nil {
 		h.writeTransactionErr(w, err)
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "banking.mapping_exception.raised", AggregateID: exc.ExceptionID, TenantID: req.TenantID,
-		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: exc,
-	})
 	writeJSON(w, http.StatusCreated, exc)
 }
 
@@ -318,6 +300,7 @@ func (h *BNK0304Handler) ApproveMappingException(w http.ResponseWriter, r *http.
 	req.ExceptionID = chi.URLParam(r, "id")
 	req.TenantID = middleware.GetTenantID(r.Context())
 	req.ApproverPrincipalID = principalID
+	req.CorrelationID = r.Header.Get("X-Correlation-ID")
 	if err := h.authz.CheckAllowed(r.Context(), principalID, "", BANKING_MAPPING_EXCEPTION_APPROVE); err != nil {
 		h.writeAuthzErr(w, err)
 		return
@@ -327,10 +310,6 @@ func (h *BNK0304Handler) ApproveMappingException(w http.ResponseWriter, r *http.
 		h.writeTransactionErr(w, err)
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "banking.mapping_exception.approved", AggregateID: req.ExceptionID, TenantID: req.TenantID,
-		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: txn,
-	})
 	writeJSON(w, http.StatusOK, txn)
 }
 

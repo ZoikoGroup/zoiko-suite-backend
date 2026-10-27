@@ -256,15 +256,18 @@ func TestValidationRoutesDoNotConsultPrincipalStatus(t *testing.T) {
 		{handler.DelegatedAccessEvaluatePath, `{"principal_id":"p-1","legal_entity_id":"11111111-1111-4111-8111-aaaaaaaaaaa1"}`},
 	}
 	for _, c := range cases {
-		store := &stubStore{principalStatus: "SUSPENDED", rbacActions: []string{"PAYMENT_APPROVE"}}
+		// The SUBJECT is suspended; the admin asking is not (since N-01 the
+		// admin gate itself checks the caller's standing).
+		store := &stubStore{principalStatusByID: map[string]string{"p-1": "SUSPENDED"}, rbacActions: []string{"PAYMENT_APPROVE", "iam.assignment.read"}}
 		r := newTestRouter(store)
 		w := postJSON(t, r, c.path, c.body, adminHeaders())
 		if w.Code != http.StatusOK {
 			t.Errorf("%s: expected 200, got %d: %s", c.path, w.Code, w.Body.String())
 		}
-		if store.principalStatusCallCount != 0 {
-			t.Errorf("%s: consulted principal status %d times — these routes report what the grant graph holds, not what may be exercised right now",
-				c.path, store.principalStatusCallCount)
+		for _, p := range store.principalStatusQueried {
+			if p == "p-1" {
+				t.Errorf("%s: consulted the subject's principal status — these routes report what the grant graph holds, not what may be exercised right now", c.path)
+			}
 		}
 	}
 }

@@ -39,7 +39,7 @@ func countRows(t *testing.T, s *store.PgStore, tenant string) int {
 }
 
 func TestQuota_APerRecipientBudgetRefusesAndLeavesNothingBehind(t *testing.T) {
-	s := store.New(openTestPool(t)).WithQuota(quota.Limits{RecipientPerHour: 3})
+	s := store.New(openAdminTestPool(t)).WithQuota(quota.Limits{RecipientPerHour: 3})
 	tenant := "tenant-quota-r"
 
 	for i := 0; i < 3; i++ {
@@ -64,7 +64,7 @@ func TestQuota_APerRecipientBudgetRefusesAndLeavesNothingBehind(t *testing.T) {
 }
 
 func TestQuota_SecurityMessagesHaveProtectedCapacityThatIsStillBounded(t *testing.T) {
-	s := store.New(openTestPool(t)).WithQuota(quota.Limits{TenantPerMinute: 2, TenantS0PerMinute: 3})
+	s := store.New(openAdminTestPool(t)).WithQuota(quota.Limits{TenantPerMinute: 2, TenantS0PerMinute: 3})
 	tenant := "tenant-quota-s0"
 
 	require.NoError(t, send(s, tenant, "g1", "p1", "A1"))
@@ -83,7 +83,7 @@ func TestQuota_SecurityMessagesHaveProtectedCapacityThatIsStillBounded(t *testin
 }
 
 func TestQuota_APerIntentBudgetIsSeparateFromOtherIntents(t *testing.T) {
-	s := store.New(openTestPool(t)).WithQuota(quota.Limits{IntentPerMinute: 2})
+	s := store.New(openAdminTestPool(t)).WithQuota(quota.Limits{IntentPerMinute: 2})
 	tenant := "tenant-quota-i"
 	a := regulatedIntentVersion(t, s, tenant, "legal.quota.a")
 	b := regulatedIntentVersion(t, s, tenant, "legal.quota.b")
@@ -102,7 +102,7 @@ func TestQuota_APerIntentBudgetIsSeparateFromOtherIntents(t *testing.T) {
 }
 
 func TestQuota_AReplayIsNotCountedTwice(t *testing.T) {
-	s := store.New(openTestPool(t)).WithQuota(quota.Limits{RecipientPerHour: 1})
+	s := store.New(openAdminTestPool(t)).WithQuota(quota.Limits{RecipientPerHour: 1})
 	tenant := "tenant-quota-replay"
 	require.NoError(t, send(s, tenant, "same-event", "alice", "T0"))
 	// The same source event again is a replay of the original, not a new send: it is not counted
@@ -112,7 +112,7 @@ func TestQuota_AReplayIsNotCountedTwice(t *testing.T) {
 }
 
 func TestQuota_OnlyCountedCreationsDrawOnTheBudget(t *testing.T) {
-	s := store.New(openTestPool(t)).WithQuota(quota.Limits{RecipientPerHour: 1})
+	s := store.New(openAdminTestPool(t)).WithQuota(quota.Limits{RecipientPerHour: 1})
 	tenant := "tenant-quota-optin"
 	// Creations that do not ask to be counted (notice dispatch, ledger register rows) are not.
 	for i := 0; i < 3; i++ {
@@ -125,14 +125,14 @@ func TestQuota_OnlyCountedCreationsDrawOnTheBudget(t *testing.T) {
 }
 
 func TestQuota_OffUnlessEnabled(t *testing.T) {
-	s := store.New(openTestPool(t)) // no WithQuota
+	s := store.New(openAdminTestPool(t)) // no WithQuota
 	for i := 0; i < 30; i++ {
 		require.NoError(t, send(s, "tenant-quota-off", "o"+strconv.Itoa(i), "alice", "T0"))
 	}
 }
 
 func TestQuota_WindowsRollOverAndOldCountersAreRemoved(t *testing.T) {
-	pool := openTestPool(t)
+	pool := openAdminTestPool(t)
 	now := time.Date(2026, 10, 6, 9, 30, 10, 0, time.UTC)
 	s := store.New(pool).WithQuota(quota.Limits{TenantPerMinute: 2}).WithQuotaClock(func() time.Time { return now })
 	tenant := "tenant-quota-win"
@@ -156,7 +156,7 @@ func TestQuota_WindowsRollOverAndOldCountersAreRemoved(t *testing.T) {
 // Backpressure preserves priority (6.5): when more is due than one batch carries, security goes
 // first, then transactional, then operational, whatever order they became due in.
 func TestPriority_DueSecurityMessagesAreFoundBeforeRoutineOnes(t *testing.T) {
-	s := store.New(openTestPool(t))
+	s := store.New(openAdminTestPool(t))
 	tenant := "tenant-priority"
 	mk := func(corr, class string, ago time.Duration) *domain.Notification {
 		n := newNotification(tenant, "entity-1", "p-"+corr, corr)
@@ -189,7 +189,7 @@ func TestPriority_DueSecurityMessagesAreFoundBeforeRoutineOnes(t *testing.T) {
 }
 
 func TestMigration000029_DownThenUp(t *testing.T) {
-	pool := openTestPool(t)
+	pool := openAdminTestPool(t)
 	for _, f := range []string{"000029_send_quota_counters.down.sql", "000029_send_quota_counters.up.sql"} {
 		b, err := os.ReadFile("../../deployments/migrations/" + f)
 		require.NoError(t, err)

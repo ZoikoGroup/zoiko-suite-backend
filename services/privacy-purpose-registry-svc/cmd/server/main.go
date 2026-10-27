@@ -10,8 +10,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/go-chi/chi/v5"
-	chimiddleware "github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
@@ -19,8 +17,6 @@ import (
 	"zoiko.io/privacy-purpose-registry-svc/internal/config"
 	"zoiko.io/privacy-purpose-registry-svc/internal/events"
 	"zoiko.io/privacy-purpose-registry-svc/internal/handler"
-	"zoiko.io/privacy-purpose-registry-svc/internal/health"
-	"zoiko.io/privacy-purpose-registry-svc/internal/middleware"
 	"zoiko.io/privacy-purpose-registry-svc/internal/store"
 )
 
@@ -49,35 +45,41 @@ func main() {
 	poolCfg.MaxConnLifetime = 30 * time.Minute
 	poolCfg.MaxConnIdleTime = 5 * time.Minute
 	poolCfg.HealthCheckPeriod = 1 * time.Minute
+	// pgxpool's constructor is lazy: it returns a usable-looking pool without
+	// opening a connection, and the old warn-and-continue left a nil pool that
+	// every store call and the outbox relay would dereference. Every route
+	// needs the database, so a pool-less process serves nothing useful: prove
+	// the database answers, or abort and let the orchestrator restart us.
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
-		logger.Warn("unable to connect to database on startup", zap.Error(err))
-	} else {
-		logger.Info("connected to postgres database")
+		logger.Fatal("unable to create database pool — aborting", zap.Error(err))
 	}
+	if err := pool.Ping(ctx); err != nil {
+		logger.Fatal("database unreachable on startup — aborting", zap.Error(err))
+	}
+	logger.Info("connected to postgres database")
 
 	pgStore := store.NewPgStore(pool, logger)
 	brokers := strings.Split(cfg.KafkaBrokers, ",")
-	publisher := events.NewKafkaPublisher(brokers, cfg.KafkaEventsTopic, logger)
 	authzClient := authz.NewClient(cfg.AuthzServiceURL)
 
-	h := handler.New(pgStore, publisher, authzClient, logger)
+	// The transactional outbox is the ONLY event path: the store enqueues
+	// inside the transaction that changes state; this relay is the only thing
+	// that talks to Kafka, retrying with backoff until a broker acknowledges.
+	kafkaWriter := events.NewKafkaWriter(brokers, cfg.KafkaEventsTopic)
+	defer func() { _ = kafkaWriter.Close() }()
+	relay := events.NewOutboxRelay(pool, kafkaWriter, cfg.KafkaEventsTopic, logger)
+	relayCtx, cancelRelay := context.WithCancel(context.Background())
+	defer cancelRelay()
+	go relay.Start(relayCtx, 3*time.Second)
 
-	r := chi.NewRouter()
-	r.Use(chimiddleware.RequestID)
-	r.Use(chimiddleware.RealIP)
-	r.Use(chimiddleware.Recoverer)
+	h := handler.New(pgStore, authzClient, logger)
 
-	// /healthz and /readyz stay OUTSIDE the tenant gate — liveness/readiness
-	// probes carry no tenant, same doctrine as every other service in this
-	// platform.
-	r.Get("/healthz", health.HealthzHandler)
-	r.Get("/readyz", health.ReadyzHandler(pool))
-
-	r.Group(func(r chi.Router) {
-		r.Use(middleware.TenantContext())
-		handler.RegisterRoutes(r, h)
-	})
+	// handler.NewRouter keeps /healthz and /readyz outside the tenant gate,
+	// puts every registry route behind it, and gives transport-level errors
+	// (404, 405, recovered panic, failed readiness) the same error envelope as
+	// handler errors.
+	r := handler.NewRouter(h, logger, pool)
 
 	srv := &http.Server{
 		Addr:         ":" + cfg.Port,

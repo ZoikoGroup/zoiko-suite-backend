@@ -824,9 +824,26 @@ func (s *PgStore) PublishDefinition(ctx context.Context, params domain.PublishDe
 	default:
 		return nil, domain.ErrValueConstraintFailed
 	}
+	// The enqueue below writes an outbox row and the policy admits a
+	// request-path row only for the session tenant — or for a named
+	// background escape, and publish is neither the relay nor the sweep.
+	// Without the caller's tenant the INSERT was refused (42501), and because
+	// the enqueue shares the publish's transaction the whole publish failed
+	// with a 503 that named nothing. Refused explicitly, same doctrine as
+	// every other write: a row owned by nobody is refused rather than
+	// defaulted.
+	if strings.TrimSpace(params.CallerTenantID) == "" {
+		return nil, domain.ErrCallerTenantMissing
+	}
 
 	var out *domain.ConfigDefinitionVersion
 	err := s.withDefinitionAdmin(ctx, func(tx pgx.Tx) error {
+		// Name the caller's tenant for the transaction: the definition
+		// tables' policies key on definition_admin, so this only widens what
+		// the outbox INSERT is allowed to do.
+		if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", params.CallerTenantID); err != nil {
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
 		working, err := scanDefinition(tx.QueryRow(ctx, `
 			SELECT `+definitionColumns+`
 			FROM config_definitions
@@ -894,9 +911,10 @@ func (s *PgStore) PublishDefinition(ctx context.Context, params domain.PublishDe
 
 		// config.version.published is enqueued in the same transaction that
 		// produced the version: a resolver that misses it would keep reading
-		// the previous invention forever.
+		// the previous invention forever. Owned by the CALLER's tenant, the
+		// same as every request-path event.
 		outEv, evErr := events.VersionPublished(*v, working.Key, params.ActorPrincipalID, params.CorrelationID)
-		if err := enqueueEvent(ctx, tx, "", outEv, evErr); err != nil {
+		if err := enqueueEvent(ctx, tx, params.CallerTenantID, outEv, evErr); err != nil {
 			return err
 		}
 		out = v
@@ -2009,6 +2027,25 @@ func (s *PgStore) ApproveChange(ctx context.Context, changeID string, approval d
 			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 		}
 
+		// A tenant-owned change is decided only from its own tenant. Answered
+		// as not-found, the same as an id that does not exist.
+		if change.TenantID != nil && *change.TenantID != callerTenantID {
+			return domain.ErrChangeNotFound
+		}
+		// S3-2 / R-5: only a change awaiting a decision can take one. With no
+		// guard here a rejection sent a VERIFIED change back to PROPOSED and a
+		// re-approval to APPROVED, which made it activatable again.
+		if change.Status != domain.ChangeStatusProposed && change.Status != domain.ChangeStatusValidated {
+			return domain.ErrChangeNotApprovable
+		}
+		// S3-1 / R-4: C2 / C3 need an approval by somebody other than the
+		// proposer (AA-001 §8.1). Rejecting one's own change is allowed: it
+		// only withholds.
+		if approval.Approved && approval.ByPrincipalID == change.CreatedByPrincipalID &&
+			(change.ChangeClass == domain.ChangeClassC2 || change.ChangeClass == domain.ChangeClassC3) {
+			return domain.ErrChangeSelfApproval
+		}
+
 		// The approval record lives in config_changes.approval as {approved,
 		// by_principal_id, approved_at, wfc_reference?} (000006) — not in a
 		// separate approval table. A rejected approval keeps the change's
@@ -2026,11 +2063,15 @@ func (s *PgStore) ApproveChange(ctx context.Context, changeID string, approval d
 		if approval.Approved {
 			status = domain.ChangeStatusApproved
 		}
-		if _, err := tx.Exec(ctx, `
+		tag, err := tx.Exec(ctx, `
 			UPDATE config_changes
 			SET status = $2, approval = $3, updated_at = NOW()
-			WHERE change_id = $1`, changeID, status, approvalJSON); err != nil {
+			WHERE change_id = $1 AND status IN ('PROPOSED', 'VALIDATED')`, changeID, status, approvalJSON)
+		if err != nil {
 			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+		if tag.RowsAffected() != 1 {
+			return domain.ErrChangeNotApprovable
 		}
 
 		change.Status = status

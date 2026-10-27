@@ -41,7 +41,7 @@ func createDef(t *testing.T, s *store.PgStore, p domain.CreateDefinitionParams) 
 	}
 	if _, err := s.PublishDefinition(ctx, domain.PublishDefinitionParams{
 		DefinitionID: def.DefinitionID, Lifecycle: domain.LifecyclePublished,
-		ActorPrincipalID: "admin-1", ApprovalReference: "CAB-1",
+		ActorPrincipalID: "admin-1", ApprovalReference: "CAB-1", CallerTenantID: testCallerTenant,
 	}); err != nil {
 		t.Fatalf("publish %s: %v", p.Key, err)
 	}
@@ -139,12 +139,13 @@ func TestRemaining_MaterialPublishNeedsApproval(t *testing.T) {
 	}
 	if _, err := s.PublishDefinition(ctx, domain.PublishDefinitionParams{
 		DefinitionID: def.DefinitionID, Lifecycle: domain.LifecyclePublished, ActorPrincipalID: "admin-1",
+		CallerTenantID: testCallerTenant,
 	}); !errors.Is(err, domain.ErrApprovalReferenceRequired) {
 		t.Fatalf("S3 publish without approval: expected approval_reference_required, got %v", err)
 	}
 	v, err := s.PublishDefinition(ctx, domain.PublishDefinitionParams{
 		DefinitionID: def.DefinitionID, Lifecycle: domain.LifecyclePublished, ActorPrincipalID: "admin-1",
-		ApprovalReference: "CAB-2026-900",
+		ApprovalReference: "CAB-2026-900", CallerTenantID: testCallerTenant,
 	})
 	if err != nil || v.ApprovalReference == nil || *v.ApprovalReference != "CAB-2026-900" {
 		t.Fatalf("the published version must carry its approval: %+v %v", v, err)

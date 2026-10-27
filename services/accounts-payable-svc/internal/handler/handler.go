@@ -22,7 +22,8 @@ import (
 
 // Store is the persistence contract the handler depends on.
 type Store interface {
-	CreateInvoice(ctx context.Context, inv *domain.VendorInvoice) (created bool, err error)
+	// mut may be nil: the store then records the plain "received" capture.
+	CreateInvoice(ctx context.Context, inv *domain.VendorInvoice, mut *domain.Mutation) (created bool, err error)
 	GetInvoice(ctx context.Context, invoiceID string) (*domain.VendorInvoice, error)
 	ListInvoices(ctx context.Context, filter domain.ListInvoicesFilter) ([]domain.VendorInvoice, error)
 	TransitionInvoice(ctx context.Context, tenantID, invoiceID string, fromStatus, toStatus domain.InvoiceStatus, actorPrincipalID string) error
@@ -81,6 +82,7 @@ type Handler struct {
 	authz          AuthZClient
 	purchaseOrders PurchaseOrderVerifier
 	payables       payableopenitem.Client
+	match          *MatchDeps // AP-06; nil until WithMatching
 	log            *zap.Logger
 }
 
@@ -130,7 +132,9 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{invoice_id}/validate", h.ValidateInvoice)
 		r.Post("/{invoice_id}/approve", h.ApproveInvoice)
 		r.Post("/{invoice_id}/request-payment", h.RequestPayment)
+		h.registerInvoiceMatchRoutes(r)
 	})
+	h.registerMatchRoutes(r)
 }
 
 // ── POST /v1/invoices ────────────────────────────────────────────────────────
@@ -241,7 +245,7 @@ func (h *Handler) CreateInvoice(w http.ResponseWriter, r *http.Request) {
 		Lines:             linesFromRequest(req.Lines),
 	}
 
-	created, err := h.store.CreateInvoice(r.Context(), inv)
+	created, err := h.store.CreateInvoice(r.Context(), inv, nil)
 	if err != nil {
 		// A re-keyed invoice number is the caller's mistake, with a remedy they
 		// can act on. It used to arrive here indistinguishable from a dead
@@ -496,6 +500,7 @@ func (h *Handler) ApproveInvoice(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
 		return
 	}
+
 	// vendor.invoice.approved is written to the outbox inside TransitionInvoice
 	// (ZS-STATE-001), so it is not published here as well.
 	//
@@ -759,19 +764,4 @@ func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (stri
 		return "", false
 	}
 	return principalID, true
-}
-
-func writeJSON(w http.ResponseWriter, status int, body any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(body)
-}
-
-type errorResponse struct {
-	Error  string `json:"error"`
-	Detail string `json:"detail,omitempty"`
-}
-
-func writeError(w http.ResponseWriter, status int, code, detail string) {
-	writeJSON(w, status, errorResponse{Error: code, Detail: detail})
 }

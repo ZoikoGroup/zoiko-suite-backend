@@ -1,0 +1,12 @@
+DROP TABLE IF EXISTS ncd_bulk_sends;
+DROP TABLE IF EXISTS ncd_exceptions;
+DROP TABLE IF EXISTS ncd_approvals;
+DROP TABLE IF EXISTS ncd_stream_controls;
+DROP TABLE IF EXISTS ncd_attempts;
+DROP FUNCTION IF EXISTS ncd_attempt_transition();
+DROP FUNCTION IF EXISTS ncd_attempt_no_send_while_unknown();
+DROP TABLE IF EXISTS ncd_delivery_jobs;
+DROP TABLE IF EXISTS ncd_binding_health;
+DROP TABLE IF EXISTS ncd_provider_bindings;
+DROP TABLE IF EXISTS ncd_rendered_content;
+DROP TABLE IF EXISTS ncd_communications;

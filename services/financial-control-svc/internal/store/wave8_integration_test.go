@@ -73,6 +73,11 @@ func TestWave8_RootCause_RequiredForHighSeverityAndRecurrence(t *testing.T) {
 
 func TestWave8_Monitoring_ComputesTheSectionTwentyEightSignals(t *testing.T) {
 	w := newWave5(t)
+	// One clock for the whole test. Exception created_at comes from the database's
+	// real clock and monitoring is evaluated against the real clock below, so due_at
+	// must come from it too: with the shared pinned clock (2026-09-30) the 2- and
+	// 10-day SLAs looked breached on any real date after 2026-10-10.
+	w.exec.WithClock(func() time.Time { return time.Now().UTC() })
 	empty, err := testStore.Monitoring(ctx, w.tenant, w.entity, "2026-09", time.Now().UTC())
 	require.NoError(t, err)
 	assert.NotNil(t, empty.Rates.ControlCompletion, "definitions exist, so the completion rate is defined")
@@ -85,7 +90,7 @@ func TestWave8_Monitoring_ComputesTheSectionTwentyEightSignals(t *testing.T) {
 	require.Len(t, exc, 2)
 	w.src.set(catalogue.SysGL, "journal-balances", "wm", journalBal("j1", "5", "5"))
 	_, final := w.run("FIN-CTRL-020", fiscal)
-	_, err = testStore.CertifyRun(ctx, w.tenant, final.RunID, "checker", "c", final.Version, domain.CertifyRequest{Decision: "CERTIFY"})
+	_, err = certifyRun(ctx, w.tenant, final.RunID, "checker", "c", final.Version, domain.CertifyRequest{Decision: "CERTIFY"}, testAuthority("checker", w.tenant))
 	require.NoError(t, err)
 
 	m, err := testStore.Monitoring(ctx, w.tenant, w.entity, "2026-09", time.Now().UTC())

@@ -13,7 +13,7 @@
     act on the demo legal entity"; it does not answer "does that legal entity
     exist". Nothing had ever registered the demo tenant or entity in
     tenant-entity-registry-svc, and no service noticed until
-    accounts-receivable-svc started reconciling the legal entity on a write — at
+    accounts-receivable-svc started reconciling the legal entity on a write -- at
     which point every invoice is refused with legal_entity_not_in_tenant no matter
     what this script grants. The two are separate scripts because they seed
     different services, and a fresh stack needs both.
@@ -65,7 +65,10 @@ param(
     [string] $AuthzUrl = "http://localhost:8089",
 
     [Parameter(ParameterSetName = "Gateway", Mandatory)]
-    [string] $GatewayUrl
+    [string] $GatewayUrl,
+
+    # The Postgres container the IAM bootstrap writes through (development only).
+    [string] $PgContainer = "zoiko-postgres"
 )
 
 $ErrorActionPreference = "Stop"
@@ -76,6 +79,29 @@ $LEGAL_ENTITY = "22222222-2222-2222-2222-222222222222"
 $PRINCIPAL_ID = "33333333-3333-3333-3333-333333333333"
 $APPROVER_ID  = "66666666-6666-6666-6666-666666666666"
 $ROLE_ID      = "44444444-4444-4444-4444-444444444444"
+
+# The seed's own IAM administrator. It holds IAM_ADMIN_FULL through a role of
+# its own and never holds $ROLE_ID, because authorization-svc refuses a
+# principal changing the permissions of a role they hold (self_grant_not_allowed)
+# -- and both demo principals hold $ROLE_ID, so neither may write its bundles.
+$SEED_ADMIN_ID      = "5eed0000-0000-4000-8000-00000000a001"
+$SEED_ADMIN_ROLE_ID = "5eed0000-0000-4000-8000-00000000a002"
+
+# access-control-svc's own identity (ACS_SERVICE_PRINCIPAL_ID). It EXECUTES the
+# REVOKE an access reviewer decides (Group 1 audit gap S9-B), and opens the
+# EVENT_TRIGGERED reviews HR events trigger (S9-C2), so it holds
+# iam.assignment.revoke and iam.assignment.read and nothing else: it can read
+# and remove access, never grant it.
+$ACS_SERVICE_ID      = "svc-access-control"
+$ACS_SERVICE_ROLE_ID = "5eed0000-0000-4000-8000-00000000a003"
+
+# policy-svc's own identity (POLICY_LEDGER_PRINCIPAL_ID). Its evidence relay
+# writes every policy evaluation to governance-decision-log-svc as this
+# principal (decision D-02), so it holds GOVERNANCE_DECISION_RECORD and nothing
+# else: on the platform scope (evaluations no entity scopes) and on the legal
+# entity (evaluations scoped to it).
+$POLICY_SERVICE_ID      = "svc-policy"
+$POLICY_SERVICE_ROLE_ID = "5eed0000-0000-4000-8000-00000000a004"
 
 $ROLE_CODE = "CONSOLE_DEMO_OPERATOR"
 
@@ -95,7 +121,28 @@ $BUNDLES = @(
     @{
         Code    = "PO_FULL"
         Service = "purchase-order-svc"
-        Actions = @("PO_ISSUE", "PO_AMEND", "PO_CLOSE")
+        # PO_ISSUE/PO_AMEND/PO_CLOSE are the original three; the rest gate the
+        # governed lifecycle (AP-03 section 6): create, submit, approve (plus the
+        # high-value tier), hold/release, cancel, the supplier-hold exception, and
+        # the receipt/invoice progress push. Copied from the action* constants in
+        # purchase-order-svc/internal/handler. Maker-checker is NOT decided here:
+        # authorization-svc's own-object SoD refuses a preparer approving their own
+        # order even when they hold PO_APPROVE.
+        Actions = @("PO_ISSUE", "PO_AMEND", "PO_CLOSE",
+                    "PO_CREATE", "PO_SUBMIT", "PO_APPROVE", "PO_APPROVE_HIGHVALUE",
+                    "PO_HOLD", "PO_CANCEL", "PO_SUPPLIER_EXCEPTION", "PO_PROGRESS_RECORD")
+    },
+    @{
+        # goods-service-receipt-svc (AP-04): the spec's receipt.read/create/confirm/
+        # reverse and service.accept, plus the "approved exception" a confirmer
+        # needs to pass PO tolerance. Copied from the constants in
+        # goods-service-receipt-svc/internal/handler. As with the PO bundle,
+        # authorization-svc's own-object SoD still stops a receiver certifying
+        # their own receipt where independent acceptance is required.
+        Code    = "GOODS_RECEIPT_FULL"
+        Service = "goods-service-receipt-svc"
+        Actions = @("GOODS_SERVICE_RECEIPT_READ", "GOODS_SERVICE_RECEIPT_CREATE", "GOODS_SERVICE_RECEIPT_CONFIRM",
+                    "GOODS_SERVICE_RECEIPT_REVERSE", "SERVICE_ACCEPT", "GOODS_SERVICE_RECEIPT_TOLERANCE_OVERRIDE")
     },
     @{
         Code    = "PR_FULL"
@@ -147,6 +194,160 @@ $BUNDLES = @(
         Actions = @("AR_INVOICE_ISSUE", "AR_INVOICE_SEND", "AR_MARK_OVERDUE", "AR_PAYMENT_RECEIVE")
     },
     @{
+        # AR-01 Customer Financial Profile (ZS-SVC-C-001). Maintaining a profile
+        # and approving an out-of-policy credit-limit increase are separate roles
+        # on purpose: the service refuses self-approval (SEGREGATION_OF_DUTIES), and
+        # a role holding both would let one person staff both sides in a demo.
+        Code    = "AR01_PROFILE_MANAGER"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR01_PROFILE_MANAGE", "AR01_CREDIT_LIMIT_MANAGE", "AR01_CREDIT_HOLD_MANAGE")
+    },
+    @{
+        Code    = "AR01_CREDIT_APPROVER"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR01_CREDIT_LIMIT_APPROVE")
+    },
+    @{
+        # AR-02 Quote / Estimate. Preparing, approving and converting are separate
+        # roles; the service refuses a discount above 10% approved by its preparer.
+        Code    = "AR02_QUOTE_PREPARER"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR02_QUOTE_MANAGE", "AR02_QUOTE_CONVERT")
+    },
+    @{
+        Code    = "AR02_QUOTE_APPROVER"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR02_QUOTE_APPROVE", "AR02_QUOTE_DISCOUNT_APPROVE")
+    },
+    @{
+        # AR-03 Sales Order. Managing, approving and the credit-exception authority
+        # are separate roles; the service refuses self-approval above thresholds and
+        # release of a CREDIT hold by the principal who needs it released.
+        Code    = "AR03_ORDER_MANAGER"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR03_ORDER_MANAGE", "AR03_ORDER_CONFIRM", "AR03_ORDER_HOLD", "AR03_ORDER_CANCEL")
+    },
+    @{
+        Code    = "AR03_ORDER_APPROVER"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR03_ORDER_APPROVE", "AR03_ORDER_CREDIT_EXCEPTION_APPROVE")
+    },
+    @{
+        # AR-04 Customer Invoice. Drafting/issuing, approval and legal-cancellation
+        # decisions are separate roles: the service refuses an approver who is the
+        # creator or submitter, and the issuer approving a material invoice.
+        Code    = "AR04_INVOICE_BILLER"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR04_INVOICE_MANAGE", "AR04_INVOICE_ISSUE", "AR04_INVOICE_CANCEL_REQUEST",
+                    "AR04_INVOICE_CORRECTION_LINK", "AR04_INVOICE_DELIVERY_RECORD")
+    },
+    @{
+        Code    = "AR04_INVOICE_APPROVER"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR04_INVOICE_APPROVE", "AR04_INVOICE_CANCEL_APPROVE")
+    },
+    @{
+        # AR-05 Electronic Invoice. Submitting, reconciling against the provider and
+        # the manual-evidence admin path are separate: the issuer needs no provider
+        # permission, and the principal who started an attempt cannot resolve it by
+        # manual evidence.
+        Code    = "AR05_EINVOICE_OPERATOR"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR05_EINVOICE_SUBMIT", "AR05_EINVOICE_RECONCILE")
+    },
+    @{
+        Code    = "AR05_ADAPTER_ADMIN"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR05_ADAPTER_ADMIN", "AR05_EINVOICE_RECONCILE")
+    },
+    @{
+        # AR-07 Receivables. Disputes/holds are operational; a privileged balance
+        # correction is a separate authority. No role can set a balance directly.
+        Code    = "AR07_RECEIVABLES_OPERATOR"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR07_DISPUTE_MANAGE", "AR07_HOLD_MANAGE", "AR07_RECEIVABLE_MANAGE")
+    },
+    @{
+        Code    = "AR07_RECEIVABLES_CORRECTOR"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR07_RECEIVABLE_ADJUST")
+    },
+    @{
+        # AR-06 Credit / Debit Note. Preparing, approving and issuing are separate
+        # roles; the service refuses an approver who is the creator or submitter.
+        Code    = "AR06_CORRECTION_PREPARER"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR06_CORRECTION_MANAGE", "AR06_CORRECTION_ISSUE", "AR06_CORRECTION_LINK")
+    },
+    @{
+        Code    = "AR06_CORRECTION_APPROVER"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR06_CORRECTION_APPROVE")
+    },
+    @{
+        # AR-08 Cash Application. Registering/applying cash, approving a manual
+        # match and unapplying are separate authorities; the service refuses the
+        # proposer or registrant as approver and the applier as unapplier.
+        Code    = "AR08_CASH_APPLIER"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR08_RECEIPT_REGISTER", "AR08_APPLICATION_MANAGE")
+    },
+    @{
+        Code    = "AR08_CASH_APPROVER"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR08_MANUALMATCH_APPROVE", "AR08_UNAPPLY", "AR08_REAPPLY")
+    },
+    @{
+        # AR-10 Refund / Write-Off. Requesting, approving, submitting for payment,
+        # tax review and committing are separate authorities; write-off approval is
+        # tiered (T1 <= 500, T2 <= 5,000, T3 <= 50,000, T4 unlimited) and the service
+        # refuses the requester, dispute resolver or collector as approver.
+        Code    = "AR10_REFUND_REQUESTER"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR10_REFUND_CREATE", "AR10_REFUND_SUBMIT", "AR10_REFUND_RECONCILE", "AR10_WRITEOFF_CREATE")
+    },
+    @{
+        # AR-09 Collections & Dunning. No role here carries any write-off, refund,
+        # credit or approval authority: collections never changes a balance.
+        Code    = "AR09_COLLECTOR"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR09_COLLECTIONS_MANAGE", "AR09_DUNNING_SEND", "AR09_HOLD_MANAGE")
+    },
+    @{
+        # AR-to-GL controls. Running a reconciliation and acknowledging its findings
+        # are separate: the principal who ran it cannot acknowledge its findings, and
+        # an acknowledgement only annotates (it never clears) a finding.
+        Code    = "AR_CTL_RECONCILER"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR_CTL_RUN_RECONCILIATION")
+    },
+    @{
+        Code    = "AR_CTL_REVIEWER"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR_CTL_ACKNOWLEDGE_FINDING")
+    },
+    @{
+        Code    = "AR09_COLLECTIONS_LEAD"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR09_COLLECTIONS_ESCALATE", "AR09_POLICY_MANAGE")
+    },
+    @{
+        Code    = "AR10_REFUND_APPROVER"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR10_REFUND_APPROVE")
+    },
+    @{
+        Code    = "AR10_WRITEOFF_APPROVER_T1"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR10_WRITEOFF_APPROVE_T1", "AR10_WRITEOFF_COMMIT")
+    },
+    @{
+        Code    = "AR10_WRITEOFF_APPROVER_T4"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR10_WRITEOFF_APPROVE_T1", "AR10_WRITEOFF_APPROVE_T2", "AR10_WRITEOFF_APPROVE_T3",
+                    "AR10_WRITEOFF_APPROVE_T4", "AR10_WRITEOFF_TAX_REVIEW", "AR10_WRITEOFF_COMMIT")
+    },
+    @{
         # bank-reconciliation-svc gates ingest, match, exception and statement
         # completion separately. Its two READ routes are not authorized at all
         # -- they are scoped by the verified X-Tenant-Id instead, the same
@@ -167,15 +368,16 @@ $BUNDLES = @(
     },
     @{
         # financial-control-svc (ZS-CONTROL-001). DEFINE / APPROVE_RULE / EXECUTE / CERTIFY /
-        # EXCEPTION_WAIVE / REPERFORM are deliberately separate actions: a real tenant should grant
-        # them through separate roles. The service itself also refuses a certifier who created or
-        # took part in a run, and a waiver from the exception's own owner, whatever is granted here.
+        # EXCEPTION_WAIVE / REPERFORM / REVOKE are deliberately separate actions: a real tenant
+        # should grant them through separate roles. The service itself also refuses a certifier
+        # who created or took part in a run, a waiver from the exception's own owner, and a
+        # revoker who certified the run being revoked, whatever is granted here.
         Code    = "FINCTRL_FULL"
         Service = "financial-control-svc"
         Actions = @("FINCTRL_DEFINE", "FINCTRL_APPROVE_RULE", "FINCTRL_POLICY_MANAGE", "FINCTRL_RUN_CREATE",
                     "FINCTRL_READ", "FINCTRL_EXECUTE", "FINCTRL_EXCEPTION_ASSIGN", "FINCTRL_CERTIFY",
                     "FINCTRL_EXCEPTION_RESOLVE", "FINCTRL_EXCEPTION_WAIVE", "FINCTRL_REPERFORM",
-                    "FINCTRL_EVIDENCE_EXPORT")
+                    "FINCTRL_EVIDENCE_EXPORT", "FINCTRL_REVOKE")
     },
     @{
         # The source services authorize the HUMAN caller of a control population (the control service
@@ -188,6 +390,20 @@ $BUNDLES = @(
                     "INVENTORY_CONTROL_POPULATION_READ", "INTERCOMPANY_CONTROL_POPULATION_READ",
                     "CONSOLIDATION_CONTROL_POPULATION_READ", "FINANCIAL_CLOSE_CONTROL_POPULATION_READ",
                     "PAYEE_BANKING_CONTROL_POPULATION_READ", "TAX_AUTHORITY_CONTROL_POPULATION_READ")
+    },
+    @{
+        # reconciliation-engine-svc (DATA-07, ZS-SVC-Z-001 DQC-03). DEFINE/RUN/MATCH stay under
+        # MANAGE as preparation steps; CERTIFY, ACCEPT_RISK, APPROVE_RULES and REVOKE are
+        # deliberately separate actions, the same posture as FINCTRL_FULL above — a real tenant
+        # should grant them through separate roles. The service itself also refuses a certifier
+        # who prepared the run, a revoker who certified it, and a self-accepted risk, whatever is
+        # granted here. None of these five actions had a permission_definitions row before
+        # migration 000008 (MANAGE/READ) and 000018 (the other four) — without that row no role
+        # can hold the action at all.
+        Code    = "RECONCILIATION_FULL"
+        Service = "reconciliation-engine-svc"
+        Actions = @("RECONCILIATION_MANAGE", "RECONCILIATION_READ", "RECONCILIATION_CERTIFY",
+                    "RECONCILIATION_ACCEPT_RISK", "RECONCILIATION_APPROVE_RULES", "RECONCILIATION_REVOKE")
     },
     @{
         # spend-controls-svc separates setting a limit from spending against it,
@@ -219,14 +435,32 @@ $BUNDLES = @(
         Actions = @("GOVERNANCE_DECISION_RECORD")
     },
     @{
-        # policy-svc checks POLICY_CREATE / POLICY_VERSION_CREATE /
-        # POLICY_VERSION_ACTIVATE against the legal entity when the policy is
-        # entity-scoped and against authzPlatformScopeID when it is not. The
-        # console always creates entity-scoped policies, but the platform-scope
-        # assignment below also carries these so both paths are granted.
+        # policy-svc checks its actions against the legal entity when the
+        # policy is entity-scoped and against authzPlatformScopeID when it is
+        # not, so the platform-scope assignment below carries them too. The
+        # GOV-05 lifecycle (14 Oct 2026) added review, approval, suspension,
+        # retirement, the _GLOBAL variants, reads and evaluation. Both demo
+        # principals hold this role; policy-svc itself refuses the author
+        # approving or activating, and the suspender reviewing, so the
+        # maker-checker paths stay testable with $PRINCIPAL_ID and $APPROVER_ID.
         Code    = "POLICY_FULL"
         Service = "policy-svc"
-        Actions = @("POLICY_CREATE", "POLICY_VERSION_CREATE", "POLICY_VERSION_ACTIVATE")
+        Actions = @("POLICY_CREATE", "POLICY_CREATE_GLOBAL", "POLICY_READ", "POLICY_EVALUATE",
+                    "POLICY_VERSION_CREATE", "POLICY_VERSION_CREATE_GLOBAL",
+                    "POLICY_VERSION_APPROVE", "POLICY_VERSION_APPROVE_GLOBAL",
+                    "POLICY_VERSION_ACTIVATE", "POLICY_VERSION_ACTIVATE_GLOBAL",
+                    "POLICY_VERSION_SUSPEND", "POLICY_VERSION_SUSPEND_GLOBAL",
+                    "POLICY_VERSION_RETIRE", "POLICY_VERSION_RETIRE_GLOBAL")
+    },
+    @{
+        # policy-svc's control tests and attestations (doc7 E3/E6) authorize
+        # against the platform scope.
+        Code    = "CONTROL_TESTS_FULL"
+        Service = "policy-svc"
+        Actions = @("CONTROL_TEST_DEFINITION_CREATE", "CONTROL_TEST_DEFINITION_READ",
+                    "CONTROL_TEST_EXECUTION_RECORD", "CONTROL_TEST_EXECUTION_READ",
+                    "CONTROL_EFFECTIVENESS_READ", "ATTESTATION_CREATE", "ATTESTATION_READ",
+                    "ATTESTATION_REVOKE")
     },
     @{
         # configuration-feature-flag-svc authorizes config and flag writes
@@ -258,9 +492,21 @@ $BUNDLES = @(
         # notification-svc authorizes sends against the target legal entity
         # and views against the legal entity being queried, so the console
         # grants these on the legal entity scope.
+        #
+        # The ZS-SVC-Y-001 control plane (30 Sep 2026) also authorizes intent
+        # and template authorship (TEMPLATE_MANAGE), their activation and
+        # publication (TEMPLATE_APPROVE), suppression and circuit/stream
+        # controls (NOTIFICATION_SUPPRESS) and UNKNOWN reconciliation /
+        # operator evidence (NOTIFICATION_RESOLVE_OUTCOME). Without them every
+        # NCD authoring or approval call is a 403 on this stack. Maker-checker
+        # is enforced by the service (author != approver), not by withholding
+        # a grant, so one development bundle can hold both halves.
         Code    = "NOTIFICATION_FULL"
         Service = "notification-svc"
-        Actions = @("NOTIFICATION_SEND", "NOTIFICATION_VIEW")
+        Actions = @(
+            "NOTIFICATION_SEND", "NOTIFICATION_VIEW", "TEMPLATE_MANAGE", "TEMPLATE_APPROVE",
+            "NOTIFICATION_SUPPRESS", "NOTIFICATION_RESOLVE_OUTCOME"
+        )
     },
     @{
         # board-resolutions-svc authorizes meeting creation against the
@@ -304,7 +550,7 @@ $BUNDLES = @(
         # (SRB on role SR_1255) had been left in the dev database by some
         # earlier ad-hoc seeding. On a fresh volume, in CI, or on anyone else's
         # machine, nothing granted SCHEMA_PUBLISH and every registration was a
-        # 403 — the whole write path dead, with the page still rendering
+        # 403 -- the whole write path dead, with the page still rendering
         # normally. A grant that exists only in one developer's database is
         # indistinguishable from a working feature right up until someone else
         # tries it.
@@ -501,6 +747,50 @@ $BUNDLES = @(
         Actions = @("ROLE_MANAGE")
     },
     @{
+        # authorization-svc admin API. These actions gate the 22 /v1/admin/* routes
+        # that create/manage roles, bundles, assignments, SoD rules, ABAC rules,
+        # delegations, PAM, break-glass and support sessions. They are
+        # PLATFORM-SCOPED: authorization-svc is the platform's authorization
+        # engine, so managing its configuration is a platform-wide act.
+        #
+        # The demo principal gets this on the platform scope assignment below.
+        Code    = "IAM_ADMIN_FULL"
+        Service = "authorization-svc"
+        Actions = @(
+            "iam.role.manage",
+            "iam.permission_bundle.manage",
+            "iam.assignment.grant",
+            "iam.assignment.revoke",
+            # Reading another principal's grants (entity-scope/validate for
+            # someone else) -- the access-control console's audit page.
+            "iam.assignment.read",
+            # Security approval of a CRITICAL-risk assignment request in
+            # access-control-svc (its migration 000013). The demo approver
+            # approves the audit's CRITICAL requests, so it holds this.
+            "iam.assignment.approve_privileged",
+            "iam.sod_rule.manage",
+            # Authorization Standard Appendix A, as authorization-svc now gates:
+            # the full decision log and its rationale (iam.policy.read), the
+            # GOV-03 cache invalidation command (iam.policy.publish), the SoD
+            # exception register (iam.sod_rule.read) and approving a GOV-04
+            # compensating control (iam.sod_rule.publish).
+            "iam.policy.read",
+            "iam.policy.publish",
+            "iam.sod_rule.read",
+            "iam.sod_rule.publish",
+            # The admin registers' read permissions (§21 "no broad IAM
+            # discovery"): roles and bundles, delegations.
+            "iam.role.read",
+            "iam.delegation.read",
+            "iam.abac_rule.manage",
+            "iam.delegation.grant",
+            "iam.delegation.revoke",
+            "iam.pam.manage",
+            "iam.break_glass.manage",
+            "iam.support.manage"
+        )
+    },
+    @{
         # retention-registry-svc. LEGAL_HOLD_RELEASE is deliberately in the same
         # bundle as LEGAL_HOLD_CREATE for the demo principal only because this
         # seeds a DEVELOPMENT stack -- in a real deployment engaging a freeze and
@@ -552,6 +842,28 @@ $BUNDLES = @(
             "SEARCH_GENERATION_CREATE", "SEARCH_GENERATION_ACTIVATE",
             "SEARCH_RESTRICTION_APPLY", "SEARCH_EXPORT"
         )
+    },
+    @{
+        # commercial-account-svc's COM-01 price book checks every write
+        # against AUTHZ_PLATFORM_SCOPE_ID, not a legal entity -- same
+        # posture as governance-decision-log-svc etc. above. Propose,
+        # approve and publish are separate actions (COM-CTRL-004 maker-
+        # checker: the handler itself refuses an approve/publish from the
+        # same principal who proposed, regardless of what this bundle
+        # grants -- RBAC only answers "is this principal allowed to call
+        # this action at all", never "are these two principals distinct").
+        Code    = "COMMERCIAL_PRICE_BOOK_FULL"
+        Service = "commercial-account-svc"
+        Actions = @(
+            "COMMERCIAL_PRICE_BOOK_PROPOSE", "COMMERCIAL_PRICE_BOOK_APPROVE",
+            "COMMERCIAL_PRICE_BOOK_PUBLISH", "COMMERCIAL_PRICE_BOOK_RETIRE",
+            "COMMERCIAL_PRICE_BOOK_READ",
+            # Currency registration is a prerequisite seller-authority action
+            # for creating any price version at all (pricebook_handler.go's
+            # PutCurrency route) -- same platform scope as the price-book
+            # actions above.
+            "COMMERCIAL_CURRENCY_MANAGE"
+        )
     }
 )
 
@@ -570,7 +882,7 @@ $ALL_ACTIONS = $BUNDLES | ForEach-Object { $_.Actions } | Sort-Object -Unique
 # missing, and the run would skip the bundles entirely -- never granting the
 # platform scope. It then reported success and had granted nothing.
 $PLATFORM_SCOPED_ACTION_CODES = @(
-    "GOVERNANCE_FULL", "CONFIG_FULL", "VAULT_FULL", "POLICY_FULL",
+    "GOVERNANCE_FULL", "CONFIG_FULL", "VAULT_FULL", "POLICY_FULL", "CONTROL_TESTS_FULL",
     "SCHEMA_FULL", "JURISDICTION_FULL", "JURISDICTION_PACK_REGISTRY_FULL", "JURISDICTION_RESOLVER_CALLER",
     # retention-registry-svc falls back to the platform scope when a hold or
     # policy names no tenant -- the console offers that as a "platform-wide"
@@ -580,7 +892,14 @@ $PLATFORM_SCOPED_ACTION_CODES = @(
     # scope. A grant made only on the legal entity would be invisible to every
     # one of its checks -- silently, and fail-closed, so it would read as
     # "no_grant" rather than as a scope mismatch.
-    "SEARCH_FULL")
+    "SEARCH_FULL",
+    # authorization-svc admin API manages the platform's authorization engine
+    "IAM_ADMIN_FULL",
+    # commercial-account-svc's COM-01 price book (propose/approve/publish/
+    # retire/read) checks every write against platformScopeID -- see
+    # handler.go's platformScopeID constant and pricebook_handler.go's
+    # h.authz.CheckAllowed(ctx, principal, platformScopeID, action) call.
+    "COMMERCIAL_PRICE_BOOK_FULL")
 $PLATFORM_SCOPED_ACTIONS = $BUNDLES |
     Where-Object { $PLATFORM_SCOPED_ACTION_CODES -contains $_.Code } |
     ForEach-Object { $_.Actions }
@@ -591,7 +910,7 @@ if ($PSCmdlet.ParameterSetName -eq "Gateway") {
     $AUTHZ = $AuthzUrl.TrimEnd('/')
 }
 
-# §4 canonical envelope (ZS-ARCH-SVC-001 §4). Every request to the service has
+# section 4 canonical envelope (ZS-ARCH-SVC-001 section 4). Every request to the service has
 # carried these headers since envelope enforcement made admin writes fail
 # closed with 401 `envelope_incomplete`; this script predates that and was
 # seeding a volume that its own writes could never populate. The header set
@@ -602,11 +921,12 @@ if ($PSCmdlet.ParameterSetName -eq "Gateway") {
 # representative of a real read-path call.
 function New-AuthzEnvelope {
     param(
-        [Parameter(Mandatory)] [string] $Path
+        [Parameter(Mandatory)] [string] $Path,
+        [string] $Actor = $PRINCIPAL_ID
     )
     $headers = @{
         "X-Tenant-Id"       = $TENANT_ID
-        "X-Principal-Id"    = $PRINCIPAL_ID
+        "X-Principal-Id"    = $Actor
         "X-Legal-Entity-Id" = $LEGAL_ENTITY
         "X-Correlation-ID"  = [guid]::NewGuid().ToString()
         "X-Request-Id"      = [guid]::NewGuid().ToString()
@@ -624,12 +944,22 @@ function New-AuthzEnvelope {
 function Invoke-Authz {
     param(
         [Parameter(Mandatory)] [string] $Path,
-        [Parameter(Mandatory)] $Body
+        [Parameter(Mandatory)] $Body,
+        # Who makes the call. Role assignments to the demo principal are made by
+        # the approver: authorization-svc refuses a principal assigning a role to
+        # themselves (self_grant_not_allowed, section 10.1 "no self-grant of protected
+        # privilege").
+        [string] $Actor = $PRINCIPAL_ID
     )
     $json = $Body | ConvertTo-Json -Compress -Depth 5
+    $headers = New-AuthzEnvelope -Path $Path -Actor $Actor
+    # The legal entity mirrors the body's own scope when the call carries one
+    # (Get-Decision probes different scopes per call), falling back to the demo
+    # legal entity for admin calls that scope themselves some other way.
+    if ($Body.legal_entity_id) { $headers["X-Legal-Entity-Id"] = $Body.legal_entity_id }
     try {
         $response = Invoke-WebRequest -Uri "$AUTHZ$Path" -Method POST -Body $json `
-            -ContentType "application/json" -Headers (New-AuthzEnvelope -Path $Path) `
+            -ContentType "application/json" -Headers $headers `
             -UseBasicParsing -TimeoutSec 10
         return @{ status = [int] $response.StatusCode; body = $response.Content | ConvertFrom-Json }
     } catch {
@@ -645,10 +975,11 @@ function Invoke-Authz {
 function Get-Decision {
     param(
         [Parameter(Mandatory)] [string] $Action,
-        [Parameter(Mandatory)] [string] $Scope
+        [Parameter(Mandatory)] [string] $Scope,
+        [string] $Principal = $PRINCIPAL_ID
     )
     $result = Invoke-Authz -Path "/v1/authorize" -Body @{
-        principal_id    = $PRINCIPAL_ID
+        principal_id    = $Principal
         legal_entity_id = $Scope
         action_type     = $Action
     }
@@ -693,6 +1024,78 @@ if ($missing.Count -eq 0) {
 } else {
     Write-Host "$($missing.Count) of $($ALL_ACTIONS.Count) actions missing: $($missing -join ', ')" -ForegroundColor Yellow
 
+    # -- Bootstrap: the admin API is gated by the grants this script creates --
+    #
+    # Since 30 Sep every /v1/admin/* route requires an iam.* action (iam.role.
+    # manage, iam.permission_bundle.manage, ...) held through a TENANT-scope
+    # assignment. On a database where nobody holds them yet -- any fresh or
+    # rebuilt volume -- the first call below is refused 403 and nothing can ever
+    # be granted through the API: the grant that opens the gate can only be
+    # made through the gate. This writes the minimum directly into
+    # authorization_svc (role, the IAM_ADMIN_FULL bundle, the tenant-scope
+    # assignment), idempotently, and the API does the rest. DEVELOPMENT ONLY:
+    # a real deployment's first IAM administrator is a governed act, not this.
+    # The approver is bootstrapped as well: it makes the demo principal's own
+    # role assignments below, which the demo principal may not make itself.
+    if ((Get-Decision -Action "iam.role.manage" -Scope $TENANT_ID).decision_outcome -ne "GRANTED" -or
+        (Get-Decision -Action "iam.assignment.grant" -Scope $TENANT_ID -Principal $APPROVER_ID).decision_outcome -ne "GRANTED" -or
+        (Get-Decision -Action "iam.permission_bundle.manage" -Scope $TENANT_ID -Principal $SEED_ADMIN_ID).decision_outcome -ne "GRANTED" -or
+        (Get-Decision -Action "iam.assignment.grant" -Scope $PLATFORM_SCOPE -Principal $SEED_ADMIN_ID).decision_outcome -ne "GRANTED" -or
+        (Get-Decision -Action "iam.assignment.revoke" -Scope $TENANT_ID -Principal $ACS_SERVICE_ID).decision_outcome -ne "GRANTED" -or
+        (Get-Decision -Action "iam.assignment.read" -Scope $TENANT_ID -Principal $ACS_SERVICE_ID).decision_outcome -ne "GRANTED") {
+        Write-Host "0  bootstrap the IAM admin grant directly (the admin API refuses everyone until one exists)" -NoNewline
+        $iamActions = ($BUNDLES | Where-Object { $_.Code -eq "IAM_ADMIN_FULL" }).Actions | ConvertTo-Json -Compress
+        $sql = @"
+INSERT INTO roles (role_id, tenant_id, role_code, role_name, role_scope_type, active_flag, created_by_principal_id)
+VALUES ('$ROLE_ID', '$TENANT_ID', '$ROLE_CODE', 'Console Demo Operator', 'LEGAL_ENTITY', true, 'seed-bootstrap')
+ON CONFLICT DO NOTHING;
+INSERT INTO permission_bundles (role_id, bundle_code, permitted_actions, active_flag)
+VALUES ('$ROLE_ID', 'IAM_ADMIN_FULL', '$iamActions'::jsonb, true)
+ON CONFLICT (role_id, bundle_code) DO UPDATE SET permitted_actions = EXCLUDED.permitted_actions, active_flag = true;
+INSERT INTO principal_role_assignments (principal_id, role_id, legal_entity_id, effective_from, assigned_by)
+SELECT '$PRINCIPAL_ID', '$ROLE_ID', '$TENANT_ID', now() - interval '1 minute', 'seed-bootstrap'
+WHERE NOT EXISTS (SELECT 1 FROM principal_role_assignments
+                  WHERE principal_id = '$PRINCIPAL_ID' AND role_id = '$ROLE_ID' AND legal_entity_id = '$TENANT_ID');
+INSERT INTO principal_role_assignments (principal_id, role_id, legal_entity_id, effective_from, assigned_by)
+SELECT '$APPROVER_ID', '$ROLE_ID', '$TENANT_ID', now() - interval '1 minute', 'seed-bootstrap'
+WHERE NOT EXISTS (SELECT 1 FROM principal_role_assignments
+                  WHERE principal_id = '$APPROVER_ID' AND role_id = '$ROLE_ID' AND legal_entity_id = '$TENANT_ID');
+INSERT INTO roles (role_id, tenant_id, role_code, role_name, role_scope_type, active_flag, created_by_principal_id)
+VALUES ('$SEED_ADMIN_ROLE_ID', '$TENANT_ID', 'SEED_IAM_ADMIN', 'Seed IAM Administrator', 'LEGAL_ENTITY', true, 'seed-bootstrap')
+ON CONFLICT DO NOTHING;
+INSERT INTO permission_bundles (role_id, bundle_code, permitted_actions, active_flag)
+VALUES ('$SEED_ADMIN_ROLE_ID', 'IAM_ADMIN_FULL', '$iamActions'::jsonb, true)
+ON CONFLICT (role_id, bundle_code) DO UPDATE SET permitted_actions = EXCLUDED.permitted_actions, active_flag = true;
+INSERT INTO principal_role_assignments (principal_id, role_id, legal_entity_id, effective_from, assigned_by)
+SELECT '$SEED_ADMIN_ID', '$SEED_ADMIN_ROLE_ID', '$TENANT_ID', now() - interval '1 minute', 'seed-bootstrap'
+WHERE NOT EXISTS (SELECT 1 FROM principal_role_assignments
+                  WHERE principal_id = '$SEED_ADMIN_ID' AND role_id = '$SEED_ADMIN_ROLE_ID' AND legal_entity_id = '$TENANT_ID');
+-- Platform scope too: an assignment on the platform-scope entity can only be
+-- made by a holder of iam.assignment.grant AT platform scope.
+INSERT INTO principal_role_assignments (principal_id, role_id, legal_entity_id, effective_from, assigned_by)
+SELECT '$SEED_ADMIN_ID', '$SEED_ADMIN_ROLE_ID', '$PLATFORM_SCOPE', now() - interval '1 minute', 'seed-bootstrap'
+WHERE NOT EXISTS (SELECT 1 FROM principal_role_assignments
+                  WHERE principal_id = '$SEED_ADMIN_ID' AND role_id = '$SEED_ADMIN_ROLE_ID' AND legal_entity_id = '$PLATFORM_SCOPE');
+INSERT INTO roles (role_id, tenant_id, role_code, role_name, role_scope_type, active_flag, created_by_principal_id)
+VALUES ('$ACS_SERVICE_ROLE_ID', '$TENANT_ID', 'SVC_ACCESS_CONTROL', 'access-control-svc review executor', 'LEGAL_ENTITY', true, 'seed-bootstrap')
+ON CONFLICT DO NOTHING;
+INSERT INTO permission_bundles (role_id, bundle_code, permitted_actions, active_flag)
+VALUES ('$ACS_SERVICE_ROLE_ID', 'REVIEW_REVOKE', '["iam.assignment.revoke", "iam.assignment.read"]'::jsonb, true)
+ON CONFLICT (role_id, bundle_code) DO UPDATE SET permitted_actions = EXCLUDED.permitted_actions, active_flag = true;
+INSERT INTO principal_role_assignments (principal_id, role_id, legal_entity_id, effective_from, assigned_by)
+SELECT '$ACS_SERVICE_ID', '$ACS_SERVICE_ROLE_ID', '$TENANT_ID', now() - interval '1 minute', 'seed-bootstrap'
+WHERE NOT EXISTS (SELECT 1 FROM principal_role_assignments
+                  WHERE principal_id = '$ACS_SERVICE_ID' AND role_id = '$ACS_SERVICE_ROLE_ID' AND legal_entity_id = '$TENANT_ID');
+"@
+        $sql | docker exec -i $PgContainer psql -U postgres -d authorization_svc -v ON_ERROR_STOP=1 -q | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "IAM bootstrap into authorization_svc failed (container $PgContainer)" }
+        # A write made behind the service's back is not seen by its grant cache
+        # until the entry expires (AUTHZ_CACHE_TTL_SECONDS, default 5), and the
+        # probe above has just cached "nothing granted".
+        Start-Sleep -Seconds 6
+        Write-Host "  -> done" -ForegroundColor Green
+    }
+
     # Re-creating an existing role is NOT idempotent, despite what this script
     # used to claim: authorization-svc answers 503 `store_unavailable` (its own
     # instance of the platform-wide habit of reporting a constraint violation as
@@ -718,7 +1121,7 @@ if ($missing.Count -eq 0) {
     $step = 2
     foreach ($bundle in $BUNDLES) {
         Write-Host "$step  bundle $($bundle.Code) for $($bundle.Service)" -NoNewline
-        $result = Invoke-Authz -Path "/v1/admin/roles/$ROLE_ID/permission-bundles" -Body @{
+        $result = Invoke-Authz -Actor $SEED_ADMIN_ID -Path "/v1/admin/roles/$ROLE_ID/permission-bundles" -Body @{
             bundle_code       = $bundle.Code
             permitted_actions = $bundle.Actions
         }
@@ -732,12 +1135,12 @@ if ($missing.Count -eq 0) {
     foreach ($scope in @(@{ Id = $LEGAL_ENTITY; Label = "legal entity" }, @{ Id = $TENANT_ID; Label = "tenant" })) {
         Write-Host "$step  assign role to $PRINCIPAL_ID on the $($scope.Label)" -NoNewline
         try {
-            $assignment = Invoke-Authz -Path "/v1/admin/role-assignments" -Body @{
+            $assignment = Invoke-Authz -Actor $APPROVER_ID -Path "/v1/admin/role-assignments" -Body @{
                 principal_id    = $PRINCIPAL_ID
                 role_id         = $ROLE_ID
                 legal_entity_id = $scope.Id
                 effective_from  = "2020-01-01T00:00:00Z"
-                assigned_by     = $PRINCIPAL_ID
+                assigned_by     = $APPROVER_ID
             }
             Write-Host "  -> $($assignment.status) $($assignment.body.principal_role_assignment_id)"
         } catch {
@@ -764,12 +1167,14 @@ if ($missing.Count -eq 0) {
     # is in place.
     Write-Host "$step  assign role to $PRINCIPAL_ID on the platform scope" -NoNewline
     try {
-        $assignment = Invoke-Authz -Path "/v1/admin/role-assignments" -Body @{
+        # The seed admin, not the approver: an assignment on the platform scope
+        # needs iam.assignment.grant held AT platform scope.
+        $assignment = Invoke-Authz -Actor $SEED_ADMIN_ID -Path "/v1/admin/role-assignments" -Body @{
             principal_id    = $PRINCIPAL_ID
             role_id         = $ROLE_ID
             legal_entity_id = $PLATFORM_SCOPE
             effective_from  = "2020-01-01T00:00:00Z"
-            assigned_by     = $PRINCIPAL_ID
+            assigned_by     = $APPROVER_ID
         }
         Write-Host "  -> $($assignment.status) $($assignment.body.principal_role_assignment_id)"
     } catch {
@@ -792,6 +1197,182 @@ try {
         principal_id    = $APPROVER_ID
         role_id         = $ROLE_ID
         legal_entity_id = $LEGAL_ENTITY
+        effective_from  = "2020-01-01T00:00:00Z"
+        assigned_by     = $PRINCIPAL_ID
+    }
+    Write-Host "  -> $($assignment.status) $($assignment.body.principal_role_assignment_id)"
+} catch {
+    if ("$_" -match "409|23505|duplicate|already") {
+        Write-Host "  -> already assigned" -ForegroundColor DarkGray
+    } else {
+        throw
+    }
+}
+
+# -- policy-svc's ledger writer -----------------------------------------------------
+#
+# Runs on every invocation, like the SoD approver above: it is one role with one
+# bundle and two assignments, written idempotently. Direct SQL, as for the other
+# service identities in the bootstrap block -- DEVELOPMENT ONLY.
+if ((Get-Decision -Action "GOVERNANCE_DECISION_RECORD" -Scope $PLATFORM_SCOPE -Principal $POLICY_SERVICE_ID).decision_outcome -ne "GRANTED" -or
+    (Get-Decision -Action "GOVERNANCE_DECISION_RECORD" -Scope $LEGAL_ENTITY -Principal $POLICY_SERVICE_ID).decision_outcome -ne "GRANTED") {
+    Write-Host "grant $POLICY_SERVICE_ID GOVERNANCE_DECISION_RECORD (policy evidence relay)" -NoNewline
+    $sql = @"
+INSERT INTO roles (role_id, tenant_id, role_code, role_name, role_scope_type, active_flag, created_by_principal_id)
+VALUES ('$POLICY_SERVICE_ROLE_ID', '$TENANT_ID', 'SVC_POLICY_LEDGER', 'policy-svc evidence relay', 'LEGAL_ENTITY', true, 'seed-bootstrap')
+ON CONFLICT DO NOTHING;
+INSERT INTO permission_bundles (role_id, bundle_code, permitted_actions, active_flag)
+VALUES ('$POLICY_SERVICE_ROLE_ID', 'LEDGER_WRITE', '["GOVERNANCE_DECISION_RECORD"]'::jsonb, true)
+ON CONFLICT (role_id, bundle_code) DO UPDATE SET permitted_actions = EXCLUDED.permitted_actions, active_flag = true;
+INSERT INTO principal_role_assignments (principal_id, role_id, legal_entity_id, effective_from, assigned_by)
+SELECT '$POLICY_SERVICE_ID', '$POLICY_SERVICE_ROLE_ID', scope, now() - interval '1 minute', 'seed-bootstrap'
+FROM (VALUES ('$PLATFORM_SCOPE'::uuid), ('$LEGAL_ENTITY'::uuid)) AS s(scope)
+WHERE NOT EXISTS (SELECT 1 FROM principal_role_assignments
+                  WHERE principal_id = '$POLICY_SERVICE_ID' AND role_id = '$POLICY_SERVICE_ROLE_ID' AND legal_entity_id = s.scope);
+"@
+    $sql | docker exec -i $PgContainer psql -U postgres -d authorization_svc -v ON_ERROR_STOP=1 -q | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "policy-svc ledger grant into authorization_svc failed (container $PgContainer)" }
+    Start-Sleep -Seconds 6
+    Write-Host "  -> done" -ForegroundColor Green
+}
+
+# -- REF-04 / REF-05 maker-checker roles -------------------------------------------
+#
+# Which action belongs to which service (copied from the `Action*` constants in
+# each service's internal/handler/handler.go -- re-grep them before editing):
+#
+#   currency-registry-svc    CURRENCY_IMPORT, CURRENCY_ACTIVATE, CURRENCY_RESTRICT,
+#                            CURRENCY_RETIRE, CURRENCY_TENANT_ENABLE, CURRENCY_TENANT_DISABLE
+#   fiscal-calendar-svc      FISCAL_CALENDAR_PROPOSE, FISCAL_CALENDAR_APPROVE,
+#                            FISCAL_CALENDAR_ACTIVATE
+#                            (transition-plan creation uses PROPOSE and plan
+#                            approve/reject uses APPROVE -- there is no separate plan action)
+#   accounting-period-svc    PERIOD_STATE_COMMAND, PERIOD_MATERIALIZE
+#
+# These are deliberately NOT appended to $BUNDLES. $BUNDLES all land on
+# CONSOLE_DEMO_OPERATOR, which is assigned to BOTH the demo principal and the
+# SoD approver, so adding them there would hand each of them both sides of
+# every pair below. Instead there are two roles, one per side:
+#
+#   REF05_PERIOD_MAKER    -> $PRINCIPAL_ID  proposes, imports, materialises
+#   REF05_PERIOD_CHECKER  -> $APPROVER_ID   approves, activates, restricts, retires
+#
+# SoD pairs the services enforce on a DIFFERENT PRINCIPAL (so they are only
+# testable if no one principal holds both actions):
+#   FISCAL_CALENDAR_PROPOSE  vs FISCAL_CALENDAR_APPROVE   (proposer may not approve)
+#   CURRENCY_IMPORT          vs CURRENCY_ACTIVATE         (importer may not activate)
+# PERIOD_STATE_COMMAND is ONE action covering soft close and hard close, and
+# accounting-period-svc refuses a hard close by whoever requested the soft
+# close. The action cannot be split, so both roles carry it and the service's own
+# actor check is the control; the demo principals are still distinct.
+#
+# Currency actions authorize against the PLATFORM scope when a request names no
+# legal entity (currency-registry-svc falls back to it), so both roles are also
+# assigned there.
+$REF05_ROLES = @(
+    @{
+        RoleId     = "88888888-8888-8888-8888-888888888881"
+        Code       = "REF05_PERIOD_MAKER"
+        Name       = "REF-04/05 Period Maker"
+        Principal  = $PRINCIPAL_ID
+        BundleCode = "REF05_MAKER"
+        Actions    = @(
+            "CURRENCY_IMPORT", "CURRENCY_TENANT_ENABLE", "CURRENCY_TENANT_DISABLE",
+            "FISCAL_CALENDAR_PROPOSE",
+            "PERIOD_MATERIALIZE", "PERIOD_STATE_COMMAND"
+        )
+    },
+    @{
+        RoleId     = "88888888-8888-8888-8888-888888888882"
+        Code       = "REF05_PERIOD_CHECKER"
+        Name       = "REF-04/05 Period Checker"
+        Principal  = $APPROVER_ID
+        BundleCode = "REF05_CHECKER"
+        Actions    = @(
+            "CURRENCY_ACTIVATE", "CURRENCY_RESTRICT", "CURRENCY_RETIRE",
+            "FISCAL_CALENDAR_APPROVE", "FISCAL_CALENDAR_ACTIVATE",
+            "PERIOD_STATE_COMMAND"
+        )
+    }
+)
+$REF05_SOD_PAIRS = @(
+    @("FISCAL_CALENDAR_PROPOSE", "FISCAL_CALENDAR_APPROVE"),
+    @("CURRENCY_IMPORT", "CURRENCY_ACTIVATE")
+)
+
+function Add-Ref05Assignment {
+    param([string] $PrincipalId, [string] $RoleId, [string] $Scope, [string] $Label)
+    Write-Host "assign $RoleId to $PrincipalId on the $Label" -NoNewline
+    try {
+        $assignment = Invoke-Authz -Path "/v1/admin/role-assignments" -Body @{
+            principal_id    = $PrincipalId
+            role_id         = $RoleId
+            legal_entity_id = $Scope
+            effective_from  = "2020-01-01T00:00:00Z"
+            assigned_by     = $PRINCIPAL_ID
+        }
+        Write-Host "  -> $($assignment.status) $($assignment.body.principal_role_assignment_id)"
+    } catch {
+        if ("$_" -match "409|23505|duplicate|already") {
+            Write-Host "  -> already assigned" -ForegroundColor DarkGray
+        } else {
+            throw
+        }
+    }
+}
+
+foreach ($r in $REF05_ROLES) {
+    # Probe as the principal the role is FOR, on both scopes, so a re-run on a
+    # volume that already holds the grant does nothing (bundle posts have no upsert).
+    $roleMissing = @()
+    foreach ($action in $r.Actions) {
+        foreach ($scope in @($LEGAL_ENTITY, $PLATFORM_SCOPE)) {
+            $probe = Invoke-Authz -Path "/v1/authorize" -Body @{
+                principal_id = $r.Principal; legal_entity_id = $scope; action_type = $action
+            }
+            if ($probe.body.decision_outcome -ne "GRANTED") { $roleMissing += "$action@$scope" }
+        }
+    }
+    if ($roleMissing.Count -eq 0) {
+        Write-Host "$($r.Code): already granted to $($r.Principal)" -ForegroundColor Green
+        continue
+    }
+    Write-Host "$($r.Code): $($roleMissing.Count) grants missing" -ForegroundColor Yellow
+
+    Write-Host "role $($r.Code)" -NoNewline
+    try {
+        $role = Invoke-Authz -Path "/v1/admin/roles" -Body @{
+            role_id                 = $r.RoleId
+            tenant_id               = $TENANT_ID
+            role_code               = $r.Code
+            role_name               = $r.Name
+            role_scope_type         = "LEGAL_ENTITY"
+            created_by_principal_id = $PRINCIPAL_ID
+        }
+        Write-Host "  -> $($role.status)"
+    } catch {
+        Write-Host "  -> already exists, or could not be created; continuing to the bundle" -ForegroundColor DarkGray
+    }
+    $bundle = Invoke-Authz -Path "/v1/admin/roles/$($r.RoleId)/permission-bundles" -Body @{
+        bundle_code       = $r.BundleCode
+        permitted_actions = $r.Actions
+    }
+    Write-Host "bundle $($r.BundleCode)  -> $($bundle.status) [$($bundle.body.permitted_actions -join ', ')]"
+    Add-Ref05Assignment -PrincipalId $r.Principal -RoleId $r.RoleId -Scope $LEGAL_ENTITY -Label "legal entity"
+    Add-Ref05Assignment -PrincipalId $r.Principal -RoleId $r.RoleId -Scope $PLATFORM_SCOPE -Label "platform scope"
+}
+
+# $APPROVER_ID also needs the platform scope: commercial-account-svc's COM-01
+# price book (and every other PLATFORM_SCOPED_ACTION_CODES bundle) checks
+# against platformScopeID, not the legal entity. Without this, a genuine SoD
+# approve/publish test (a second principal distinct from the proposer) has no
+# principal to use for any platform-scoped action.
+Write-Host "assign role to $APPROVER_ID on the platform scope (SoD approver)" -NoNewline
+try {
+    $assignment = Invoke-Authz -Path "/v1/admin/role-assignments" -Body @{
+        principal_id    = $APPROVER_ID
+        role_id         = $ROLE_ID
+        legal_entity_id = $PLATFORM_SCOPE
         effective_from  = "2020-01-01T00:00:00Z"
         assigned_by     = $PRINCIPAL_ID
     }
@@ -855,6 +1436,152 @@ foreach ($action in $PLATFORM_SCOPED_ACTIONS) {
     $outcome  = $decision.decision_outcome
     if ($outcome -eq "GRANTED") { $colour = "Green" } else { $colour = "Red"; $failed += "$action (platform scope)" }
     Write-Host ("     {0,-28} {1,-30} -> {2}" -f "platform", $action, $outcome) -ForegroundColor $colour
+}
+
+# REF-04/05: verify each maker/checker role grants what it should, and that no
+# principal holds both sides of an SoD pair (otherwise SoD is untestable and a
+# hand-made grant has crept in).
+Write-Host "Verifying REF-04/05 maker-checker roles:" -ForegroundColor Cyan
+foreach ($r in $REF05_ROLES) {
+    foreach ($action in $r.Actions) {
+        foreach ($scope in @($LEGAL_ENTITY, $PLATFORM_SCOPE)) {
+            $probe = Invoke-Authz -Path "/v1/authorize" -Body @{
+                principal_id = $r.Principal; legal_entity_id = $scope; action_type = $action
+            }
+            if ($probe.body.decision_outcome -ne "GRANTED") { $failed += "$action ($($r.Code) on $scope)" }
+        }
+    }
+}
+foreach ($principal in @($PRINCIPAL_ID, $APPROVER_ID)) {
+    foreach ($pair in $REF05_SOD_PAIRS) {
+        $held = @()
+        foreach ($action in $pair) {
+            $probe = Invoke-Authz -Path "/v1/authorize" -Body @{
+                principal_id = $principal; legal_entity_id = $LEGAL_ENTITY; action_type = $action
+            }
+            if ($probe.body.decision_outcome -eq "GRANTED") { $held += $action }
+        }
+        if ($held.Count -eq $pair.Count) {
+            $failed += "$principal holds BOTH sides of an SoD pair ($($pair -join ' / '))"
+            Write-Host "     $principal holds both $($pair -join ' / ')" -ForegroundColor Red
+        } else {
+            Write-Host ("     {0} holds {1} of [{2}]" -f $principal, $held.Count, ($pair -join ' / ')) -ForegroundColor Green
+        }
+    }
+}
+
+# -- REP-01 financial-statements-svc maker-checker roles --------------------------
+#
+# Actions (copied from the Action* constants in
+# services/financial-statements-svc/internal/service/service.go -- re-grep
+# them before editing): FINANCIAL_STATEMENT_SET_CREATE, _VIEW, _REFRESH,
+# _VALIDATE, _REVIEW, _APPROVE, _CERTIFY, _PUBLISH.
+#
+# _REVIEW covers both SubmitForReview (maker side) and RequestChanges
+# (checker side) -- one action, like accounting-period-svc's
+# PERIOD_STATE_COMMAND above, because the service's own in-code Preparer()
+# check is the real control, not an RBAC split. The genuine SoD boundary the
+# service enforces is "the preparer may not also Approve or Certify their own
+# work" (ZS-SVC-H-001 4.1) -- that is a per-row identity comparison against
+# whoever created or last refreshed the set, never just "does this principal
+# hold the APPROVE/CERTIFY grant". The two roles below exist so a demo run
+# has two DISTINCT principals to prove that with, same purpose as REF05's
+# maker/checker pair.
+$REF01_ROLES = @(
+    @{
+        RoleId     = "88888888-8888-8888-8888-888888888883"
+        Code       = "REF01_STATEMENT_MAKER"
+        Name       = "REP-01 Statement Maker"
+        Principal  = $PRINCIPAL_ID
+        BundleCode = "REF01_MAKER"
+        Actions    = @(
+            "FINANCIAL_STATEMENT_SET_CREATE", "FINANCIAL_STATEMENT_SET_VIEW",
+            "FINANCIAL_STATEMENT_SET_REFRESH", "FINANCIAL_STATEMENT_SET_VALIDATE",
+            "FINANCIAL_STATEMENT_SET_REVIEW"
+        )
+    },
+    @{
+        RoleId     = "88888888-8888-8888-8888-888888888884"
+        Code       = "REF01_STATEMENT_CHECKER"
+        Name       = "REP-01 Statement Checker"
+        Principal  = $APPROVER_ID
+        BundleCode = "REF01_CHECKER"
+        Actions    = @(
+            "FINANCIAL_STATEMENT_SET_VIEW", "FINANCIAL_STATEMENT_SET_REVIEW",
+            "FINANCIAL_STATEMENT_SET_APPROVE", "FINANCIAL_STATEMENT_SET_CERTIFY",
+            "FINANCIAL_STATEMENT_SET_PUBLISH"
+        )
+    }
+)
+# Not RBAC-exclusive pairs (both are checked below only to confirm the two
+# demo principals are genuinely distinct grants, not to assert the platform
+# would refuse one principal holding both -- it would not; the service's own
+# Preparer() check is what actually refuses that, and is NOT exercised by
+# this seed script).
+$REF01_SOD_PAIRS = @(
+    @("FINANCIAL_STATEMENT_SET_CREATE", "FINANCIAL_STATEMENT_SET_APPROVE"),
+    @("FINANCIAL_STATEMENT_SET_CREATE", "FINANCIAL_STATEMENT_SET_CERTIFY")
+)
+
+foreach ($r in $REF01_ROLES) {
+    $roleMissing = @()
+    foreach ($action in $r.Actions) {
+        foreach ($scope in @($LEGAL_ENTITY, $PLATFORM_SCOPE)) {
+            $probe = Invoke-Authz -Path "/v1/authorize" -Body @{
+                principal_id = $r.Principal; legal_entity_id = $scope; action_type = $action
+            }
+            if ($probe.body.decision_outcome -ne "GRANTED") { $roleMissing += "$action@$scope" }
+        }
+    }
+    if ($roleMissing.Count -eq 0) {
+        Write-Host "$($r.Code): already granted to $($r.Principal)" -ForegroundColor Green
+        continue
+    }
+    Write-Host "$($r.Code): $($roleMissing.Count) grants missing" -ForegroundColor Yellow
+    Write-Host "role $($r.Code)" -NoNewline
+    try {
+        $role = Invoke-Authz -Path "/v1/admin/roles" -Body @{
+            role_id                 = $r.RoleId
+            tenant_id               = $TENANT_ID
+            role_code               = $r.Code
+            role_name               = $r.Name
+            role_scope_type         = "LEGAL_ENTITY"
+            created_by_principal_id = $PRINCIPAL_ID
+        }
+        Write-Host "  -> $($role.status)"
+    } catch {
+        Write-Host "  -> already exists, or could not be created; continuing to the bundle" -ForegroundColor DarkGray
+    }
+    $bundle = Invoke-Authz -Path "/v1/admin/roles/$($r.RoleId)/permission-bundles" -Body @{
+        bundle_code       = $r.BundleCode
+        permitted_actions = $r.Actions
+    }
+    Write-Host "bundle $($r.BundleCode)  -> $($bundle.status) [$($bundle.body.permitted_actions -join ', ')]"
+    Add-Ref05Assignment -PrincipalId $r.Principal -RoleId $r.RoleId -Scope $LEGAL_ENTITY -Label "legal entity"
+    Add-Ref05Assignment -PrincipalId $r.Principal -RoleId $r.RoleId -Scope $PLATFORM_SCOPE -Label "platform scope"
+}
+
+Write-Host "Verifying REP-01 maker-checker roles:" -ForegroundColor Cyan
+foreach ($r in $REF01_ROLES) {
+    foreach ($action in $r.Actions) {
+        foreach ($scope in @($LEGAL_ENTITY, $PLATFORM_SCOPE)) {
+            $probe = Invoke-Authz -Path "/v1/authorize" -Body @{
+                principal_id = $r.Principal; legal_entity_id = $scope; action_type = $action
+            }
+            if ($probe.body.decision_outcome -ne "GRANTED") { $failed += "$action ($($r.Code) on $scope)" }
+        }
+    }
+}
+foreach ($pair in $REF01_SOD_PAIRS) {
+    $makerHas = (Invoke-Authz -Path "/v1/authorize" -Body @{
+        principal_id = $PRINCIPAL_ID; legal_entity_id = $LEGAL_ENTITY; action_type = $pair[1]
+    }).body.decision_outcome -eq "GRANTED"
+    if ($makerHas) {
+        $failed += "$PRINCIPAL_ID (the REP-01 maker) unexpectedly holds the checker-only action $($pair[1])"
+        Write-Host "     maker unexpectedly holds $($pair[1])" -ForegroundColor Red
+    } else {
+        Write-Host ("     maker/checker split holds for {0}" -f $pair[1]) -ForegroundColor Green
+    }
 }
 
 if ($failed.Count -gt 0) {

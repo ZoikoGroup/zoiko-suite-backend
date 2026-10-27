@@ -30,7 +30,7 @@ func scanStatement(row pgx.Row, s *domain.BankStatement, contentHash, sourceID, 
 // plus its immutable evidence lines, written in one transaction.
 // Idempotent on (connection_id, content_hash) — a re-uploaded statement
 // returns the original import rather than double-ingesting it.
-func (p *PgStore) IngestStatement(ctx context.Context, tenantID string, req domain.IngestStatementLinesRequest, actorPrincipalID string) (*domain.IngestStatementResult, error) {
+func (p *PgStore) IngestStatement(ctx context.Context, tenantID string, req domain.IngestStatementLinesRequest, actorPrincipalID, correlationID string) (*domain.IngestStatementResult, error) {
 	result := &domain.IngestStatementResult{}
 	err := p.withTenant(ctx, func(tx pgx.Tx) error {
 		statementID := uuid.New().String()
@@ -61,7 +61,8 @@ func (p *PgStore) IngestStatement(ctx context.Context, tenantID string, req doma
 				result.Lines = append(result.Lines, l)
 			}
 			result.Statement = s
-			return nil
+			return p.enqueueEvent(ctx, tx, "com.zoikosuite.banking.bank-statement.ingested", "banking.statement.ingested",
+				"bank-statement", s.StatementID, tenantID, "", actorPrincipalID, correlationID, result)
 		}
 		if !errors.Is(err, pgx.ErrNoRows) {
 			return err
@@ -266,6 +267,9 @@ func (p *PgStore) NormalizeTransaction(ctx context.Context, params domain.Normal
 				FROM mapping_exceptions WHERE statement_line_id=$1 AND status='OPEN'`, params.StatementLineID)
 			err = existingRow.Scan(&e.ExceptionID, &e.TenantID, &e.StatementLineID, &e.Reason, &e.Status, &e.RaisedByPrincipalID, &resolvedTxnID, &resolvedBy, &resolvedAt, &e.CreatedAt)
 			if err == nil {
+				// A second normalize attempt on an already-quarantined line
+				// reuses the existing exception rather than raising a
+				// duplicate -- no new fact, so no new event either.
 				result.QuarantinedException = &e
 				return nil
 			}
@@ -282,7 +286,8 @@ func (p *PgStore) NormalizeTransaction(ctx context.Context, params domain.Normal
 				return err
 			}
 			result.QuarantinedException = &e
-			return nil
+			return p.enqueueEvent(ctx, tx, "com.zoikosuite.banking.mapping-exception.raised", "banking.mapping_exception.raised",
+				"mapping-exception", e.ExceptionID, params.TenantID, "", params.ActorPrincipalID, params.CorrelationID, e)
 		}
 
 		var t domain.CanonicalTransaction
@@ -295,7 +300,8 @@ func (p *PgStore) NormalizeTransaction(ctx context.Context, params domain.Normal
 			return err
 		}
 		result.Transaction = &t
-		return nil
+		return p.enqueueEvent(ctx, tx, "com.zoikosuite.banking.canonical-transaction.normalized", "banking.transaction.normalized",
+			"canonical-transaction", t.TransactionID, params.TenantID, "", params.ActorPrincipalID, params.CorrelationID, t)
 	})
 	if err != nil {
 		return nil, err
@@ -357,7 +363,11 @@ func (p *PgStore) ReNormalizeTransaction(ctx context.Context, params domain.ReNo
 			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
 			RETURNING `+canonicalTxnColumns,
 			newID, params.TenantID, prior.StatementLineID, prior.MappingVersion+1, params.TransactionDate, params.Amount, params.Currency, params.Category, params.Counterparty, params.ActorPrincipalID)
-		return scanCanonicalTxn(row, &newTxn)
+		if err := scanCanonicalTxn(row, &newTxn); err != nil {
+			return err
+		}
+		return p.enqueueEvent(ctx, tx, "com.zoikosuite.banking.canonical-transaction.renormalized", "banking.transaction.renormalized",
+			"canonical-transaction", newTxn.TransactionID, params.TenantID, "", params.ActorPrincipalID, params.CorrelationID, newTxn)
 	})
 	if err != nil {
 		return nil, err
@@ -375,7 +385,11 @@ func (p *PgStore) QuarantineTransaction(ctx context.Context, params domain.Quara
 			uuid.New().String(), params.TenantID, params.StatementLineID, params.Reason, params.ActorPrincipalID)
 		var resolvedTxnID, resolvedBy *string
 		var resolvedAt *time.Time
-		return row.Scan(&e.ExceptionID, &e.TenantID, &e.StatementLineID, &e.Reason, &e.Status, &e.RaisedByPrincipalID, &resolvedTxnID, &resolvedBy, &resolvedAt, &e.CreatedAt)
+		if err := row.Scan(&e.ExceptionID, &e.TenantID, &e.StatementLineID, &e.Reason, &e.Status, &e.RaisedByPrincipalID, &resolvedTxnID, &resolvedBy, &resolvedAt, &e.CreatedAt); err != nil {
+			return err
+		}
+		return p.enqueueEvent(ctx, tx, "com.zoikosuite.banking.mapping-exception.raised", "banking.mapping_exception.raised",
+			"mapping-exception", e.ExceptionID, params.TenantID, "", params.ActorPrincipalID, params.CorrelationID, e)
 	})
 	if err != nil {
 		return nil, err
@@ -418,9 +432,12 @@ func (p *PgStore) ApproveMappingException(ctx context.Context, params domain.App
 		if err := scanCanonicalTxn(txnRow, &t); err != nil {
 			return err
 		}
-		_, err = tx.Exec(ctx, `UPDATE mapping_exceptions SET status='APPROVED', resolved_transaction_id=$2, resolved_by_principal_id=$3, resolved_at=now() WHERE exception_id=$1`,
-			e.ExceptionID, t.TransactionID, params.ApproverPrincipalID)
-		return err
+		if _, err := tx.Exec(ctx, `UPDATE mapping_exceptions SET status='APPROVED', resolved_transaction_id=$2, resolved_by_principal_id=$3, resolved_at=now() WHERE exception_id=$1`,
+			e.ExceptionID, t.TransactionID, params.ApproverPrincipalID); err != nil {
+			return err
+		}
+		return p.enqueueEvent(ctx, tx, "com.zoikosuite.banking.mapping-exception.approved", "banking.mapping_exception.approved",
+			"mapping-exception", e.ExceptionID, params.TenantID, "", params.ApproverPrincipalID, params.CorrelationID, t)
 	})
 	if err != nil {
 		return nil, err

@@ -31,6 +31,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/riandyrn/otelchi"
 	"go.uber.org/zap"
+	idenv "zoiko.io/identity-envelope"
 
 	"github.com/segmentio/kafka-go"
 
@@ -141,13 +142,26 @@ func main() {
 	}
 
 	// ── 6. Router + handler ───────────────────────────────────────────────────
+	// Identity gate (X5 / X-R3, decision 21 Oct 2026): identity-context-svc's
+	// signed envelope is verified (JWKS) with its session status (AU-01), and
+	// its claims become the only source of X-Principal-Id / X-Tenant-Id; a peer
+	// over verified mTLS may vouch for them instead. Until now this service took
+	// those headers as sent. IDENTITY_VERIFY: require (default outside local) | warn.
+	gate, gateSettings, err := idenv.NewGateFromEnv("configuration-feature-flag-svc", log, idenv.EnvOptions{DefaultPeers: nil})
+	if err != nil {
+		log.Fatal("identity gate configuration refused", zap.Error(err))
+	}
+	log.Info("identity gate", gateSettings.Fields()...)
+
 	r := chi.NewRouter()
+	r.Use(idenv.RequestID)
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
 	r.Use(middleware.Recoverer)
 	r.Use(otelchi.Middleware("configuration-feature-flag-svc", otelchi.WithChiRoutes(r)))
 	r.Use(metrics.HTTPMiddleware)
 	r.Use(correlationIDMiddleware)
+	r.Use(gate.Middleware)
 	// The caller's tenant scope, from the header the gateway sets. This service
 	// used to read no such header: which tenant's configuration was read or
 	// written came from a query parameter or a request body.
@@ -317,10 +331,11 @@ func authzReachable(baseURL string) func(context.Context) error {
 // correlationIDMiddleware propagates X-Correlation-ID through every request.
 func correlationIDMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("X-Correlation-ID") == "" {
-			r.Header.Set("X-Correlation-ID", middleware.GetReqID(r.Context()))
+		// Echoed, never invented: a correlation id made up here, before the
+		// input contract can refuse a request without one, traces nothing.
+		if id := r.Header.Get("X-Correlation-ID"); id != "" {
+			w.Header().Set("X-Correlation-ID", id)
 		}
-		w.Header().Set("X-Correlation-ID", r.Header.Get("X-Correlation-ID"))
 		next.ServeHTTP(w, r)
 	})
 }

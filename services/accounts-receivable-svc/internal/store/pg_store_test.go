@@ -710,3 +710,76 @@ func TestPgStore_ListInvoices_PagesStably(t *testing.T) {
 		t.Fatalf("expected 1 row for limit=1, got %d", len(one))
 	}
 }
+
+// TestPgStore_SetIssuanceJournalID_RoundTripsThroughGetInvoice proves the
+// ACC-04 audit link actually persists against a real column, not a stub map.
+// Before this test, SetIssuanceJournalID had zero coverage anywhere in this
+// service — the handler's CreateInvoice calls it right after posting the
+// invoice's accounting event to general-ledger-svc.
+func TestPgStore_SetIssuanceJournalID_RoundTripsThroughGetInvoice(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop())
+
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+
+	inv := newTestInvoice(tenantID)
+	if _, err := s.CreateInvoice(ctx, inv); err != nil {
+		t.Fatalf("CreateInvoice failed: %v", err)
+	}
+
+	got, err := s.GetInvoice(ctx, tenantID, inv.InvoiceID)
+	if err != nil {
+		t.Fatalf("GetInvoice failed: %v", err)
+	}
+	if got.IssuanceJournalID != nil {
+		t.Fatalf("expected a freshly created invoice to have no issuance_journal_id yet, got %q", *got.IssuanceJournalID)
+	}
+
+	const journalID = "j-integration-1"
+	if err := s.SetIssuanceJournalID(ctx, tenantID, inv.InvoiceID, journalID); err != nil {
+		t.Fatalf("SetIssuanceJournalID failed: %v", err)
+	}
+
+	got, err = s.GetInvoice(ctx, tenantID, inv.InvoiceID)
+	if err != nil {
+		t.Fatalf("GetInvoice after SetIssuanceJournalID failed: %v", err)
+	}
+	if got.IssuanceJournalID == nil {
+		t.Fatal("issuance_journal_id did not survive a reload from Postgres — it is nil")
+	}
+	if *got.IssuanceJournalID != journalID {
+		t.Fatalf("issuance_journal_id = %q, want %q", *got.IssuanceJournalID, journalID)
+	}
+}
+
+// TestPgStore_SetIssuanceJournalID_WrongTenant_IsNoop proves the tenant
+// predicate in SetIssuanceJournalID's UPDATE actually scopes the write — a
+// caller holding another tenant's invoice_id must not be able to stamp a
+// journal link onto a row it doesn't own.
+func TestPgStore_SetIssuanceJournalID_WrongTenant_IsNoop(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop())
+
+	ownerTenant := uuid.New().String()
+	otherTenant := uuid.New().String()
+	ctxOwner := svcmiddleware.WithTenant(context.Background(), ownerTenant)
+
+	inv := newTestInvoice(ownerTenant)
+	if _, err := s.CreateInvoice(ctxOwner, inv); err != nil {
+		t.Fatalf("CreateInvoice failed: %v", err)
+	}
+
+	if err := s.SetIssuanceJournalID(context.Background(), otherTenant, inv.InvoiceID, "j-intruder"); err != nil {
+		t.Fatalf("SetIssuanceJournalID under the wrong tenant returned an error instead of a silent no-op: %v", err)
+	}
+
+	got, err := s.GetInvoice(ctxOwner, ownerTenant, inv.InvoiceID)
+	if err != nil {
+		t.Fatalf("GetInvoice failed: %v", err)
+	}
+	if got.IssuanceJournalID != nil {
+		t.Fatalf("ISOLATION FAILURE: SetIssuanceJournalID under tenant %q stamped a journal onto tenant %q's invoice: %q",
+			otherTenant, ownerTenant, *got.IssuanceJournalID)
+	}
+}

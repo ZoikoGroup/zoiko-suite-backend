@@ -1,0 +1,13 @@
+# Used by BuildKit for builds with -f services/evidence-requirements-svc/Dockerfile.
+# The context is the repository root (see the Dockerfile), so everything is
+# excluded except the modules the image is built from.
+*
+!services/evidence-requirements-svc/
+!services/identity-envelope/
+
+# Not needed inside the image.
+services/evidence-requirements-svc/.gotmp/
+services/evidence-requirements-svc/**/*.exe
+services/evidence-requirements-svc/**/*_test.go
+services/evidence-requirements-svc/deployments/
+services/identity-envelope/**/*_test.go

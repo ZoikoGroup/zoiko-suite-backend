@@ -11,7 +11,10 @@
 // itself.
 package domain
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 // AIRunType is doc7 §G1's own enumerated list of what AI may do by default —
 // quoted verbatim, not a locally invented taxonomy: "Classify, summarize,
@@ -594,6 +597,49 @@ func (r ApproveReleaseRequest) AllGatesCleared() bool {
 		r.EvaluationCleared && r.ExplainabilityCleared && r.ContinuityCleared && r.LegalCleared
 }
 
+type CreateExecutionRequest struct {
+	UseCaseID      string          `json:"use_case_id"`
+	ModelReleaseID string          `json:"model_release_id"`
+	PackageID      string          `json:"package_id"`
+	PackageVersion string          `json:"package_version"`
+	Input          json.RawMessage `json:"input"`
+}
+
+type AIExecution struct {
+	ExecutionID          string    `json:"execution_id"`
+	TenantID             string    `json:"tenant_id"`
+	UseCaseID            string    `json:"use_case_id"`
+	ModelReleaseID       string    `json:"model_release_id"`
+	PackageID            string    `json:"package_id"`
+	PackageVersion       string    `json:"package_version"`
+	RequestSHA256        string    `json:"-"`
+	Status               string    `json:"status"`
+	BlockReason          string    `json:"block_reason"`
+	BlockedBy            []string  `json:"blocked_by"`
+	CreatedAt            time.Time `json:"created_at"`
+	CreatedByPrincipalID string    `json:"created_by_principal_id"`
+}
+
+type CreateAIIncidentRequest struct {
+	Severity           string   `json:"severity"`
+	ModelReleaseID     string   `json:"model_release_id"`
+	Description        string   `json:"description"`
+	EvidenceReferences []string `json:"evidence_references,omitempty"`
+}
+
+type AIIncident struct {
+	IncidentID           string    `json:"incident_id"`
+	TenantID             string    `json:"tenant_id"`
+	Severity             string    `json:"severity"`
+	ModelReleaseID       string    `json:"model_release_id"`
+	Description          string    `json:"description"`
+	EvidenceReferences   []string  `json:"evidence_references"`
+	Status               string    `json:"status"`
+	RequestSHA256        string    `json:"-"`
+	CreatedAt            time.Time `json:"created_at"`
+	CreatedByPrincipalID string    `json:"created_by_principal_id"`
+}
+
 // ── errors ───────────────────────────────────────────────────────────────────
 
 type errorString string
@@ -641,4 +687,79 @@ var (
 	ErrModelReleaseQuarantined  = errorString("ai model release is QUARANTINED")  // AIG-006 MODEL_RELEASE_QUARANTINED
 	ErrReleaseGatesNotCleared   = errorString("release cannot be approved: not every procurement/enablement gate is cleared")
 	ErrInvalidReleaseTransition = errorString("invalid model release state transition")
+	ErrIdempotencyConflict      = errorString("idempotency key was already used with a different request")
+	ErrExecutionNotFound        = errorString("ai execution not found")
+	ErrAIIncidentNotFound       = errorString("ai incident not found")
+
+	// AIG-04 — ZS-SVC-X-001 §7. AIG-04 determines the oversight requirement
+	// and records the disposition decision; WFC (reviewer assignment,
+	// delegation, deadlines, escalation) is explicitly out of scope here —
+	// no approved integration contract with it exists in this repository.
+	ErrAIRunAlreadyHasDisposition = errorString("this ai run already has an output disposition")
+	ErrOversightClassProhibited   = errorString("oversight class O4 is AI-prohibited: human/deterministic process only, no disposition may be created")
+	ErrDispositionNotFound        = errorString("ai output disposition not found")
+	ErrDispositionNotReviewable   = errorString("ai output disposition is not in REVIEW_REQUIRED state")
 )
+
+// OversightClass is ZS-SVC-X-001 §7.1's oversight taxonomy.
+type OversightClass string
+
+const (
+	OversightNone      OversightClass = "O0" // no material consequence; automated monitoring only
+	OversightUserReview OversightClass = "O1" // identified user sees AI status, can reject/edit
+	OversightQualified  OversightClass = "O2" // qualified reviewer, explicit accept/reject
+	OversightDual       OversightClass = "O3" // maker-checker dual/control review
+	OversightProhibited OversightClass = "O4" // AI prohibited; technical block
+)
+
+func (c OversightClass) Valid() bool {
+	switch c {
+	case OversightNone, OversightUserReview, OversightQualified, OversightDual, OversightProhibited:
+		return true
+	default:
+		return false
+	}
+}
+
+// DispositionStatus is ZS-SVC-X-001 §7.3's output state machine. This
+// service creates a disposition only in DRAFT_ASSISTIVE or REVIEW_REQUIRED
+// (BLOCKED belongs to AIG-03's upstream validation step, before a
+// disposition would ever be created here; SUPERSEDED requires a
+// replacement-output linking workflow not implemented in this pass).
+type DispositionStatus string
+
+const (
+	DispositionDraftAssistive DispositionStatus = "DRAFT_ASSISTIVE"
+	DispositionReviewRequired DispositionStatus = "REVIEW_REQUIRED"
+	DispositionAccepted       DispositionStatus = "ACCEPTED"
+	DispositionRejected       DispositionStatus = "REJECTED"
+)
+
+type CreateOutputDispositionRequest struct {
+	AIRunID        string `json:"ai_run_id"`
+	OversightClass string `json:"oversight_class"`
+}
+
+// AIOutputDisposition is ZS-SVC-X-001 §7's disposition record: every
+// AI-generated output that is not purely O0 passes through here before any
+// downstream authority may rely on it. ACCEPTED does not itself execute a
+// business action — it only records that a competent reviewer, distinct
+// from whoever produced the output, examined and accepted it.
+type AIOutputDisposition struct {
+	DispositionID        string     `json:"disposition_id"`
+	TenantID              string     `json:"tenant_id"`
+	AIRunID               string     `json:"ai_run_id"`
+	OversightClass         string     `json:"oversight_class"`
+	Status                 string     `json:"status"`
+	Reason                 *string    `json:"reason,omitempty"`
+	RequestSHA256          string     `json:"-"`
+	CreatedAt              time.Time  `json:"created_at"`
+	CreatedByPrincipalID   string     `json:"created_by_principal_id"`
+	DecidedAt              *time.Time `json:"decided_at,omitempty"`
+	DecidedByPrincipalID   *string    `json:"decided_by_principal_id,omitempty"`
+}
+
+type DecideOutputDispositionRequest struct {
+	Decision string `json:"decision"` // ACCEPTED or REJECTED
+	Reason   string `json:"reason,omitempty"`
+}

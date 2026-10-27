@@ -1,0 +1,339 @@
+openapi: 3.1.0
+info:
+  title: evidence-requirements-svc
+  version: 1.3.0
+  description: |
+    Evidence Requirements Service (Doc 03 §8.6, Doc 04 §7.1): decides what evidence must exist
+    before an action may complete, and records each determination in an append-only ledger.
+
+    Outcomes: SATISFIED, MISSING, NO_REQUIREMENTS_DEFINED. NO_REQUIREMENTS_DEFINED is a distinct
+    outcome (decided 21 Oct 2026): it is never reported as SATISFIED, and the calling service
+    decides whether its action may proceed without configured requirements.
+
+    Identity: identity-context-svc's signed envelope (Authorization: Bearer), verified against
+    its JWKS and session status; a service may instead call over verified mTLS as a registered
+    peer workload. Authorization at the legal entity: EVIDENCE_EVALUATE, EVIDENCE_REQUIREMENT_READ,
+    EVIDENCE_EVALUATION_READ, EVIDENCE_REQUIREMENT_CREATE, EVIDENCE_REQUIREMENT_RETIRE (tenant-wide
+    requirements at PLATFORM scope); the legal entity must exist in the caller's tenant
+    (tenant-entity-registry-svc). Errors: RFC 9457 problem+json with the §16 error_class.
+
+    Events (transactional outbox, topic zoiko.evidence-requirements.events, key
+    `<tenant>/<evaluation>`): evidence.requirement.satisfied, evidence.requirement.missing; the
+    envelope carries causation_id, jurisdiction_context and governing_refs.requirement_ids.
+servers:
+  - url: http://localhost:8130
+security:
+  - identityEnvelope: []
+tags:
+  - name: evaluation
+  - name: catalogue
+  - name: pbc
+  - name: probes
+paths:
+  /v1/evidence/evaluate:
+    post:
+      tags: [evaluation]
+      operationId: evaluate
+      parameters:
+        - {$ref: '#/components/parameters/IdempotencyKey'}
+        - {name: X-Legal-Entity-Id, in: header, required: true, description: Must equal the body's legal_entity_id, schema: {type: string}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [legal_entity_id, domain_code, action_type, correlation_id]
+              properties:
+                legal_entity_id: {type: string, format: uuid}
+                domain_code: {type: string}
+                action_type: {type: string}
+                correlation_id: {type: string}
+                present_artifacts:
+                  type: array
+                  description: The same artifact offered twice (by canonical reference) counts once.
+                  items:
+                    type: object
+                    required: [evidence_type, reference_id]
+                    properties:
+                      evidence_type: {type: string, description: SUPPORTING_DOCUMENT references are verified against document-vault-svc}
+                      reference_id: {type: string}
+                      artifact_subtype: {type: string}
+      responses:
+        '200':
+          description: The determination (a replay of the same Idempotency-Key and body returns the original)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/EvaluateResponse'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '413': {$ref: '#/components/responses/Problem'}
+        '422': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /v1/evidence/evaluations/{evaluation_id}:
+    parameters:
+      - {name: evaluation_id, in: path, required: true, schema: {type: string}}
+    get:
+      tags: [evaluation]
+      operationId: getEvaluation
+      responses:
+        '200': {description: The recorded determination, content: {application/json: {schema: {$ref: '#/components/schemas/Evaluation'}}}}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+  /v1/evidence-requirements:
+    get:
+      tags: [catalogue]
+      operationId: listRequirements
+      parameters:
+        - {name: legal_entity_id, in: query, schema: {type: string, format: uuid}}
+        - {name: domain_code, in: query, schema: {type: string}}
+        - {name: action_type, in: query, schema: {type: string}}
+        - {name: as_of, in: query, description: "RFC 3339 or 'now'; omitted returns the full history", schema: {type: string}}
+        - {name: tenant_id, in: query, description: May only repeat the caller's tenant, schema: {type: string}}
+      responses:
+        '200': {description: The caller's tenant catalogue, content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/Requirement'}}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+  /v1/evidence-requirements/{evidence_requirement_id}:
+    parameters:
+      - {name: evidence_requirement_id, in: path, required: true, schema: {type: string}}
+    get:
+      tags: [catalogue]
+      operationId: getRequirement
+      responses:
+        '200': {description: The requirement, content: {application/json: {schema: {$ref: '#/components/schemas/Requirement'}}}}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+  /v1/admin/evidence-requirements:
+    post:
+      tags: [catalogue]
+      operationId: createRequirement
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tenant_id, domain_code, action_type, evidence_type, correlation_id]
+              properties:
+                tenant_id: {type: string, description: Must equal the caller's tenant}
+                legal_entity_id: {type: string, format: uuid, description: Omitted for a tenant-wide requirement}
+                domain_code: {type: string}
+                action_type: {type: string}
+                evidence_type: {type: string}
+                requirement_payload: {$ref: '#/components/schemas/RequirementSpec'}
+                effective_from: {type: string, format: date-time, description: Not before now}
+                correlation_id: {type: string}
+      responses:
+        '201':
+          description: Created
+          headers:
+            Location: {description: The new requirement, schema: {type: string}}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Requirement'}
+        '200': {description: Replay of the same Idempotency-Key and body, content: {application/json: {schema: {$ref: '#/components/schemas/Requirement'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '422': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /v1/admin/evidence-requirements/{evidence_requirement_id}/end-date:
+    parameters:
+      - {name: evidence_requirement_id, in: path, required: true, schema: {type: string}}
+    post:
+      tags: [catalogue]
+      operationId: endDateRequirement
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                effective_to: {type: string, format: date-time, description: After effective_from and not before now}
+                reason: {type: string}
+      responses:
+        '200': {description: Retired by end-dating (never deleted), content: {application/json: {schema: {$ref: '#/components/schemas/Requirement'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '422': {$ref: '#/components/responses/Problem'}
+  /v1/pbc/requests:
+    post:
+      tags: [pbc]
+      operationId: createEvidenceRequest
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
+      requestBody: {$ref: '#/components/requestBodies/PBCCommand'}
+      responses:
+        '201': {$ref: '#/components/responses/EvidenceRequest'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+    get:
+      tags: [pbc]
+      operationId: listOpenEvidenceRequests
+      responses:
+        '200': {description: Open requests, content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/EvidenceRequest'}}}}}
+  /v1/pbc/requests/{request_id}:
+    parameters: [{$ref: '#/components/parameters/RequestID'}]
+    get:
+      tags: [pbc]
+      operationId: getEvidenceRequest
+      responses:
+        '200': {$ref: '#/components/responses/EvidenceRequest'}
+        '404': {$ref: '#/components/responses/Problem'}
+  /v1/pbc/requests/{request_id}/send:
+    parameters: [{$ref: '#/components/parameters/RequestID'}]
+    post: {tags: [pbc], operationId: sendEvidenceRequest, requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'200': {$ref: '#/components/responses/EvidenceRequest'}, '409': {$ref: '#/components/responses/Problem'}}}
+  /v1/pbc/requests/{request_id}/reassign:
+    parameters: [{$ref: '#/components/parameters/RequestID'}]
+    post: {tags: [pbc], operationId: reassignEvidenceRequest, requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'200': {$ref: '#/components/responses/EvidenceRequest'}, '409': {$ref: '#/components/responses/Problem'}}}
+  /v1/pbc/requests/{request_id}/extend-due-date:
+    parameters: [{$ref: '#/components/parameters/RequestID'}]
+    post: {tags: [pbc], operationId: extendEvidenceRequestDueDate, requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'200': {$ref: '#/components/responses/EvidenceRequest'}, '409': {$ref: '#/components/responses/Problem'}}}
+  /v1/pbc/requests/{request_id}/view:
+    parameters: [{$ref: '#/components/parameters/RequestID'}]
+    post: {tags: [pbc], operationId: viewEvidenceRequest, responses: {'200': {$ref: '#/components/responses/EvidenceRequest'}}}
+  /v1/pbc/requests/{request_id}/responses:
+    parameters: [{$ref: '#/components/parameters/RequestID'}]
+    post: {tags: [pbc], operationId: submitEvidenceResponse, requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'201': {description: Response recorded}, '409': {$ref: '#/components/responses/Problem'}}}
+  /v1/pbc/requests/{request_id}/notes:
+    parameters: [{$ref: '#/components/parameters/RequestID'}]
+    post: {tags: [pbc], operationId: addEvidenceRequestNote, requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'201': {description: Note added}}}
+  /v1/pbc/requests/{request_id}/clarify:
+    parameters: [{$ref: '#/components/parameters/RequestID'}]
+    post: {tags: [pbc], operationId: requestEvidenceClarification, requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'200': {$ref: '#/components/responses/EvidenceRequest'}, '409': {$ref: '#/components/responses/Problem'}}}
+  /v1/pbc/requests/{request_id}/mark-satisfied:
+    parameters: [{$ref: '#/components/parameters/RequestID'}]
+    post: {tags: [pbc], operationId: markEvidenceRequestSatisfied, requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'200': {$ref: '#/components/responses/EvidenceRequest'}, '403': {$ref: '#/components/responses/Problem'}, '409': {$ref: '#/components/responses/Problem'}}}
+  /v1/pbc/requests/{request_id}/close:
+    parameters: [{$ref: '#/components/parameters/RequestID'}]
+    post: {tags: [pbc], operationId: closeEvidenceRequest, requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'200': {$ref: '#/components/responses/EvidenceRequest'}, '409': {$ref: '#/components/responses/Problem'}}}
+  /v1/pbc/responses/{response_id}/scan-result:
+    parameters: [{$ref: '#/components/parameters/ResponseID'}]
+    post: {tags: [pbc], operationId: recordScanResult, requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'200': {description: Scan result recorded}, '404': {$ref: '#/components/responses/Problem'}}}
+  /v1/pbc/responses/{response_id}/acknowledge:
+    parameters: [{$ref: '#/components/parameters/ResponseID'}]
+    post: {tags: [pbc], operationId: acknowledgeEvidenceResponse, responses: {'201': {description: Receipt recorded}, '404': {$ref: '#/components/responses/Problem'}}}
+  /healthz:
+    get: {tags: [probes], operationId: liveness, security: [], responses: {'200': {description: Process up}}}
+  /readyz:
+    get: {tags: [probes], operationId: readiness, security: [], responses: {'200': {description: Ready}, '503': {description: Not ready}}}
+components:
+  securitySchemes:
+    identityEnvelope: {type: http, scheme: bearer, bearerFormat: JWT}
+  parameters:
+    IdempotencyKey: {name: Idempotency-Key, in: header, required: true, schema: {type: string}}
+    RequestID: {name: request_id, in: path, required: true, schema: {type: string}}
+    ResponseID: {name: response_id, in: path, required: true, schema: {type: string}}
+  requestBodies:
+    PBCCommand:
+      required: true
+      content:
+        application/json:
+          schema: {type: object, additionalProperties: true}
+  responses:
+    Problem:
+      description: RFC 9457 problem document
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    EvidenceRequest:
+      description: The evidence request
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/EvidenceRequest'}
+  schemas:
+    Problem:
+      type: object
+      required: [type, title, status, code]
+      properties:
+        type: {type: string}
+        title: {type: string}
+        status: {type: integer}
+        detail: {type: string}
+        code: {type: string}
+        error: {type: string}
+        error_class: {type: string}
+        retryable: {type: boolean}
+      additionalProperties: true
+    RequirementSpec:
+      type: object
+      additionalProperties: false
+      properties:
+        minimum_count: {type: integer, minimum: 0, description: Defaults to 1}
+        artifact_subtype: {type: string}
+        description: {type: string}
+    Requirement:
+      type: object
+      properties:
+        evidence_requirement_id: {type: string}
+        tenant_id: {type: string}
+        legal_entity_id: {type: [string, 'null']}
+        domain_code: {type: string}
+        action_type: {type: string}
+        evidence_type: {type: string}
+        requirement_payload: {$ref: '#/components/schemas/RequirementSpec'}
+        effective_from: {type: string, format: date-time}
+        effective_to: {type: [string, 'null'], format: date-time}
+        created_by_principal_id: {type: string}
+        correlation_id: {type: string}
+      additionalProperties: true
+    Unmet:
+      type: object
+      properties:
+        evidence_requirement_id: {type: string}
+        evidence_type: {type: string}
+        reason: {type: string}
+    EvaluateResponse:
+      type: object
+      properties:
+        evaluation_id: {type: string}
+        outcome: {type: string, enum: [SATISFIED, MISSING, NO_REQUIREMENTS_DEFINED]}
+        unmet: {type: array, items: {$ref: '#/components/schemas/Unmet'}}
+        evaluated_at: {type: string, format: date-time}
+        correlation_id: {type: string}
+        domain_code: {type: string}
+        action_type: {type: string}
+    Evaluation:
+      type: object
+      properties:
+        evaluation_id: {type: string}
+        tenant_id: {type: string}
+        legal_entity_id: {type: string}
+        domain_code: {type: string}
+        action_type: {type: string}
+        outcome: {type: string}
+        unmet_payload: {}
+        present_artifacts_payload: {}
+        requirement_ids: {type: array, items: {type: string}}
+        evaluated_at: {type: string, format: date-time}
+        evaluated_for_principal_id: {type: string}
+        correlation_id: {type: string}
+      additionalProperties: true
+    EvidenceRequest:
+      type: object
+      properties:
+        request_id: {type: string}
+        tenant_id: {type: string}
+        legal_entity_id: {type: string}
+        requirement_id: {type: [string, 'null']}
+        title: {type: string}
+        description: {type: string}
+        assigned_to_principal_id: {type: string}
+        due_at: {type: string, format: date-time}
+        status: {type: string}
+        created_by_principal_id: {type: string}
+        correlation_id: {type: string}
+        created_at: {type: string, format: date-time}
+        is_overdue: {type: boolean}
+      additionalProperties: true

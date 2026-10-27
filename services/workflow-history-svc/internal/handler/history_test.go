@@ -58,6 +58,7 @@ func (f *fakeReadStore) ListByInstance(_ context.Context, tenantID, instanceID s
 			out = append(out, e)
 		}
 	}
+	store.SortEvents(out)
 	return out, nil
 }
 
@@ -70,7 +71,33 @@ func (f *fakeReadStore) ListByFilter(_ context.Context, filter store.QueryFilter
 			out = append(out, e)
 		}
 	}
+	store.SortEvents(out)
 	return out, nil
+}
+
+func (f *fakeReadStore) ListByInstancePage(ctx context.Context, tenantID, instanceID string, after *store.PageCursor, limit int) ([]store.WorkflowHistoryEvent, error) {
+	all, _ := f.ListByInstance(ctx, tenantID, instanceID)
+	return pageAfter(all, after, limit), nil
+}
+
+func (f *fakeReadStore) ListByFilterPage(ctx context.Context, filter store.QueryFilter, after *store.PageCursor, limit int) ([]store.WorkflowHistoryEvent, error) {
+	all, _ := f.ListByFilter(ctx, filter)
+	return pageAfter(all, after, limit), nil
+}
+
+// pageAfter sorts like the real store and returns up to limit rows after the cursor.
+func pageAfter(all []store.WorkflowHistoryEvent, after *store.PageCursor, limit int) []store.WorkflowHistoryEvent {
+	store.SortEvents(all)
+	var out []store.WorkflowHistoryEvent
+	for _, e := range all {
+		if store.AfterCursor(e, after) {
+			out = append(out, e)
+			if len(out) == limit {
+				break
+			}
+		}
+	}
+	return out
 }
 
 func (f *fakeReadStore) GetTenantContext(_ context.Context, _ string) (store.TenantContext, bool, error) {

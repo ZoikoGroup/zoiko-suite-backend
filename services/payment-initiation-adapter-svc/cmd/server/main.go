@@ -15,10 +15,12 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
+	"zoiko.io/eventing/kafkaout"
+	"zoiko.io/eventing/integration"
+	"zoiko.io/eventing/outbox"
 	"zoiko.io/payment-initiation-adapter-svc/internal/authz"
 	"zoiko.io/payment-initiation-adapter-svc/internal/clients"
 	"zoiko.io/payment-initiation-adapter-svc/internal/config"
-	"zoiko.io/payment-initiation-adapter-svc/internal/events"
 	"zoiko.io/payment-initiation-adapter-svc/internal/handler"
 	"zoiko.io/payment-initiation-adapter-svc/internal/health"
 	"zoiko.io/payment-initiation-adapter-svc/internal/middleware"
@@ -58,9 +60,11 @@ func main() {
 		logger.Info("connected to postgres database")
 	}
 
-	pgStore := store.NewPgStore(pool, logger)
-	brokers := strings.Split(cfg.KafkaBrokers, ",")
-	publisher := events.NewKafkaPublisher(brokers, cfg.KafkaEventsTopic, logger)
+	if err := outbox.VerifySchema(ctx, pool); err != nil {
+		logger.Fatal("eventing outbox schema verification failed", zap.Error(err))
+	}
+
+	pgStore := store.NewPgStore(pool, logger, store.WithEventRegion(cfg.EventResidencyRegion))
 	authzClient := authz.NewClient(cfg.AuthzServiceURL)
 	// StubProviderAdapter — NOT a real bank connection. See
 	// internal/provideradapter's package doc.
@@ -68,7 +72,41 @@ func main() {
 	treasuryClient := clients.NewTreasuryHTTPClient(cfg.TreasuryServiceURL)
 	authorizationClient := clients.NewAuthorizationHTTPClient(cfg.AuthorizationServiceURL)
 
-	h := handler.New(pgStore, publisher, authzClient, provider, treasuryClient, authorizationClient, logger)
+	h := handler.New(pgStore, authzClient, provider, treasuryClient, authorizationClient, logger).WithPayroll(clients.NewPayrollHTTPClient(cfg.PayrollRunServiceURL))
+
+	// Background work (the outbox relay, the in-flight sweeper) lives for the life of the process, not for
+	// the startup timeout above.
+	bg, stopBackground := context.WithCancel(context.Background())
+	defer stopBackground()
+
+	if cfg.Providers.Enabled {
+		engine, err := buildProviderEngine(cfg.Providers, pgStore)
+		if err != nil {
+			logger.Fatal("provider adapters misconfigured", zap.Error(err))
+		}
+		h = h.WithProviders(engine)
+		go runSweeper(bg, engine, cfg.Providers.SweepInterval, logger)
+		logger.Info("provider adapters enabled")
+	}
+
+	brokers := strings.Split(cfg.KafkaBrokers, ",")
+	writer, err := kafkaout.New(kafkaout.Config{Brokers: brokers, Topic: cfg.KafkaEventsTopic})
+	if err != nil {
+		logger.Fatal("failed to create kafka writer", zap.Error(err))
+	}
+	relay, err := outbox.NewRelay(pool, writer, outbox.DefaultConfig(), logger)
+	if err != nil {
+		logger.Fatal("failed to create outbox relay", zap.Error(err))
+	}
+	// INT-CTRL-005 / INT-NP-006: with SCHEMA_REGISTRY_URL set, an event that breaks its registered contract is
+	// quarantined before publish, and a registry that cannot answer holds events instead of publishing them unchecked.
+	if gate, gerr := integration.GateFromEnv("payment-initiation-adapter-svc"); gerr != nil {
+		logger.Fatal("schema gate", zap.Error(gerr))
+	} else if gate != nil {
+		relay.SetGate(gate)
+		logger.Info("producer schema gate enabled")
+	}
+	go relay.Run(bg)
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)

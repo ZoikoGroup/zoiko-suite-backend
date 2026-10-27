@@ -80,6 +80,7 @@ func TestMissingPrincipal_Refused(t *testing.T) {
 		body               []byte
 	}{
 		{"generate manifest", http.MethodPost, "/v1/evidence-manifests", generateBody(t, "t1")},
+		{"list manifests", http.MethodGet, "/v1/evidence-manifests", nil},
 		{"get manifest", http.MethodGet, "/v1/evidence-manifests/some-id", nil},
 		{"list records", http.MethodGet, "/v1/evidence-manifests/some-id/records", nil},
 	} {

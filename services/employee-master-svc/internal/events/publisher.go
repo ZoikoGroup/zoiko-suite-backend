@@ -65,15 +65,20 @@ func NewPublisherWithWriter(log *zap.Logger, topic string, producer MessageWrite
 
 func (p *Publisher) PublishEmployeeCreated(ctx context.Context, correlationID, actorID string, emp domain.Employee) {
 	p.emit(ctx, "employee.created", correlationID, emp.TenantID, emp.LegalEntityID, actorID, emp.EmployeeID, map[string]any{
-		"employee_id":     emp.EmployeeID,
-		"tenant_id":       emp.TenantID,
-		"legal_entity_id": emp.LegalEntityID,
-		"first_name":      emp.FirstName,
-		"last_name":       emp.LastName,
-		"email":           emp.Email,
-		"worker_type":     emp.WorkerType,
-		"status":          emp.Status,
-		"created_at":      emp.CreatedAt,
+		"employee_id":      emp.EmployeeID,
+		"tenant_id":        emp.TenantID,
+		"legal_entity_id":  emp.LegalEntityID,
+		"employee_number":  emp.EmployeeNumber,
+		"first_name":       emp.FirstName,
+		"last_name":        emp.LastName,
+		"email":            emp.Email,
+		"worker_type":      emp.WorkerType,
+		"status":           emp.Status,
+		"department_id":    emp.DepartmentID,
+		"job_title":        emp.JobTitle,
+		"basic_salary":     emp.BasicSalary,
+		"ctc":              emp.CTC,
+		"created_at":       emp.CreatedAt,
 	})
 }
 
@@ -101,6 +106,9 @@ func (p *Publisher) PublishEmployeeUpdated(ctx context.Context, correlationID, a
 		"department_id":       emp.DepartmentID,
 		"manager_employee_id": emp.ManagerEmployeeID,
 		"worker_type":         emp.WorkerType,
+		"status":              emp.Status,
+		"basic_salary":        emp.BasicSalary,
+		"ctc":                 emp.CTC,
 		"updated_at":          emp.UpdatedAt,
 	})
 }
@@ -110,8 +118,10 @@ func (p *Publisher) PublishStatusChanged(ctx context.Context, correlationID, act
 		"employee_id":     emp.EmployeeID,
 		"tenant_id":       emp.TenantID,
 		"legal_entity_id": emp.LegalEntityID,
+		"employee_number": emp.EmployeeNumber,
 		"old_status":      oldStatus,
 		"new_status":      emp.Status,
+		"worker_type":     emp.WorkerType,
 		"updated_at":      time.Now().UTC(),
 	})
 }
@@ -121,6 +131,7 @@ func (p *Publisher) PublishEmployeeTerminated(ctx context.Context, correlationID
 		"employee_id":      emp.EmployeeID,
 		"tenant_id":        emp.TenantID,
 		"legal_entity_id":  emp.LegalEntityID,
+		"employee_number":  emp.EmployeeNumber,
 		"termination_date": emp.TerminationDate,
 		"effective_to":     emp.EffectiveTo,
 		"terminated_at":    time.Now().UTC(),

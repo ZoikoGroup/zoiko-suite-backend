@@ -1,0 +1,13 @@
+# Used by BuildKit for builds with -f services/configuration-feature-flag-svc/Dockerfile.
+# The context is the repository root (see the Dockerfile), so everything is
+# excluded except the modules the image is built from.
+*
+!services/configuration-feature-flag-svc/
+!services/identity-envelope/
+
+# Not needed inside the image.
+services/configuration-feature-flag-svc/.gotmp/
+services/configuration-feature-flag-svc/**/*.exe
+services/configuration-feature-flag-svc/**/*_test.go
+services/configuration-feature-flag-svc/deployments/
+services/identity-envelope/**/*_test.go

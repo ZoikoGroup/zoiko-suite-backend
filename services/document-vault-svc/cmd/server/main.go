@@ -73,11 +73,18 @@ func main() {
 	pgStore := store.New(pool, log)
 	residencyValidator := residency.NewHTTPValidator(cfg.TenantRegistryURL, log)
 	authzClient := authz.NewHTTPClient(cfg.AuthZServiceURL, log)
-	// scan.NoOpScanner: no real malware/type scanning engine is
-	// integrated anywhere in this repo — see internal/scan's own package
-	// doc. The gate itself is real and wired; swapping in a real scanner
-	// is a one-line change here.
-	scanner := scan.NoOpScanner{}
+	var scanner scan.Scanner
+	if cfg.ClamAVURL != "" {
+		log.Info("configuring ClamAV malware scanner", zap.String("clamav_url", cfg.ClamAVURL))
+		scanner = scan.NewClamAVScanner(cfg.ClamAVURL, 5*time.Second)
+	} else {
+		// Fail closed. An absent scanner is NOT a clean verdict: every upload and
+		// every new version will be refused with 503 scan_unavailable until
+		// CLAMAV_URL is set. Everything that does not accept new bytes (reads,
+		// records, retention, holds, preservation) keeps working.
+		log.Error("no ClamAV URL configured (CLAMAV_URL) — document and version uploads will be REFUSED (fail-closed) until a malware scanner is configured")
+		scanner = scan.UnconfiguredScanner{}
+	}
 	h := handler.New(pgStore, storageBackend, residencyValidator, authzClient, scanner, log)
 	healthH := health.New(pool)
 
@@ -125,6 +132,8 @@ func main() {
 	handler.RegisterRoutes(r, h)
 	handler.RegisterEvidenceRoutes(r, h, pgStore)
 	handler.RegisterRecordsRoutes(r, h, pgStore)
+	handler.RegisterVersionRoutes(r, h, pgStore)
+	handler.RegisterUploadReservationRoutes(r, h, pgStore)
 	handler.RegisterRetentionRoutes(r, h, pgStore)
 	handler.RegisterPreservationRoutes(r, h, pgStore)
 

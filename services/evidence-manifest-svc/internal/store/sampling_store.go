@@ -124,7 +124,7 @@ func (s *PgStore) ApproveSampleDesign(ctx context.Context, p domain.ApproveSampl
 			return domain.ErrSampleDesignInvalidState
 		}
 		if current.CreatedByPrincipalID == p.ActorPrincipalID {
-			return domain.ErrSampleDesignInvalidState
+			return domain.ErrSelfApprovalForbidden
 		}
 		out, err = scanSampleDesign(tx.QueryRow(ctx, `UPDATE sample_designs SET status=$1, approved_by_principal_id=$2 WHERE design_id=$3 RETURNING `+sampleDesignColumns,
 			domain.SampleDesignApproved, p.ActorPrincipalID, p.DesignID))
@@ -132,9 +132,16 @@ func (s *PgStore) ApproveSampleDesign(ctx context.Context, p domain.ApproveSampl
 			return err
 		}
 		changed = true
-		return nil
+		le, err := populationLegalEntity(ctx, tx, out.PopulationID)
+		if err != nil {
+			return err
+		}
+		return emitEvent(ctx, tx, EventSampleDesignApproved, aggregateSample, out.DesignID, le,
+			p.ActorPrincipalID, p.CorrelationID, map[string]any{
+				"design_id": out.DesignID, "population_id": out.PopulationID,
+			})
 	})
-	if errors.Is(err, domain.ErrSampleDesignNotFound) || errors.Is(err, domain.ErrSampleDesignInvalidState) {
+	if errors.Is(err, domain.ErrSampleDesignNotFound) || errors.Is(err, domain.ErrSampleDesignInvalidState) || errors.Is(err, domain.ErrSelfApprovalForbidden) {
 		return nil, false, err
 	}
 	if err != nil {
@@ -313,7 +320,14 @@ func (s *PgStore) SelectSample(ctx context.Context, p domain.SelectSampleParams)
 		outSel = sel
 		outItems = items
 		created = true
-		return nil
+		le, err := populationLegalEntity(ctx, tx, design.PopulationID)
+		if err != nil {
+			return err
+		}
+		return emitEvent(ctx, tx, EventSampleSelected, aggregateSample, design.DesignID, le,
+			p.ActorPrincipalID, p.CorrelationID, map[string]any{
+				"design_id": design.DesignID, "selection_id": sel.SelectionID, "item_count": len(items),
+			})
 	})
 	if errors.Is(err, domain.ErrSampleDesignNotFound) || errors.Is(err, domain.ErrSampleDesignInvalidState) || errors.Is(err, domain.ErrPopulationNotFrozen) {
 		return nil, nil, false, err
@@ -498,10 +512,10 @@ func (s *PgStore) RecordItemResult(ctx context.Context, p domain.RecordItemResul
 	var out *domain.SampleItem
 	matched := false
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
-		var status, designObjective string
-		if err := tx.QueryRow(ctx, `SELECT si.status, sd.objective FROM sample_items si
+		var status, designObjective, designID, designPopulationID string
+		if err := tx.QueryRow(ctx, `SELECT si.status, sd.objective, sd.design_id, sd.population_id FROM sample_items si
 			JOIN sample_selections ss ON ss.selection_id=si.selection_id JOIN sample_designs sd ON sd.design_id=ss.design_id
-			WHERE si.item_id=$1`, p.ItemID).Scan(&status, &designObjective); err != nil {
+			WHERE si.item_id=$1`, p.ItemID).Scan(&status, &designObjective, &designID, &designPopulationID); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return domain.ErrSampleItemNotFound
 			}
@@ -514,6 +528,23 @@ func (s *PgStore) RecordItemResult(ctx context.Context, p domain.RecordItemResul
 		if _, err := tx.Exec(ctx, `INSERT INTO sample_executions (item_id, tenant_id, action, objective_tested, result, exception_amount, actor_principal_id, correlation_id)
 			VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`, p.ItemID, svcmiddleware.TenantFromContext(ctx), domain.SampleExecutionResult, p.ObjectiveTested, p.Result, p.ExceptionAmount, p.ActorPrincipalID, p.CorrelationID); err != nil {
 			return err
+		}
+		// The execution row is committed whether or not the objective matches,
+		// so an exception recorded on it is reported either way. An exception
+		// is a result carrying an exception_amount — the only exception field
+		// the schema has; the contract gives no further definition.
+		if p.ExceptionAmount != nil {
+			le, err := populationLegalEntity(ctx, tx, designPopulationID)
+			if err != nil {
+				return err
+			}
+			if err := emitEvent(ctx, tx, EventSampleItemExceptionRecord, aggregateSample, designID, le,
+				p.ActorPrincipalID, p.CorrelationID, map[string]any{
+					"design_id": designID, "item_id": p.ItemID, "exception_amount": *p.ExceptionAmount,
+					"objective_tested": p.ObjectiveTested, "objective_matched": p.ObjectiveTested == designObjective,
+				}); err != nil {
+				return err
+			}
 		}
 
 		if p.ObjectiveTested != designObjective {
@@ -683,6 +714,17 @@ func (s *PgStore) EvaluateSample(ctx context.Context, p domain.EvaluateSamplePar
 			if _, err := tx.Exec(ctx, `UPDATE sample_designs SET status=$1 WHERE design_id=$2`, domain.SampleDesignEvaluated, p.DesignID); err != nil {
 				return err
 			}
+			le, err := populationLegalEntity(ctx, tx, design.PopulationID)
+			if err != nil {
+				return err
+			}
+			if err := emitEvent(ctx, tx, EventSampleEvaluated, aggregateSample, design.DesignID, le,
+				p.ActorPrincipalID, p.CorrelationID, map[string]any{
+					"design_id": design.DesignID, "evaluation_id": eval.EvaluationID,
+					"known_exception_count": eval.KnownExceptionCount,
+				}); err != nil {
+				return err
+			}
 		}
 		out = eval
 		changed = true
@@ -738,7 +780,14 @@ func (s *PgStore) SupersedeSample(ctx context.Context, p domain.SupersedeSampleP
 		}
 		out = newDesign
 		created = true
-		return nil
+		le, err := populationLegalEntity(ctx, tx, old.PopulationID)
+		if err != nil {
+			return err
+		}
+		return emitEvent(ctx, tx, EventSampleSuperseded, aggregateSample, old.DesignID, le,
+			p.ActorPrincipalID, p.CorrelationID, map[string]any{
+				"design_id": old.DesignID, "new_design_id": newDesign.DesignID, "reason": p.Reason,
+			})
 	})
 	if errors.Is(err, domain.ErrSampleDesignNotFound) || errors.Is(err, domain.ErrSampleDesignInvalidState) {
 		return nil, false, err

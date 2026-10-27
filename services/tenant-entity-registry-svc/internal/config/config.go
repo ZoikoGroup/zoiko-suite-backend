@@ -12,6 +12,16 @@ type Config struct {
 	Env  string
 	Port int
 
+	// MTLS* enable the mutual-TLS listener gateway-auth-svc's mTLS client
+	// calls (SEC-INV-05; Group 1 register S5-B1). Off unless MTLS_ENABLED.
+	MTLSEnabled            bool
+	MTLSPort               int
+	MTLSManagementURL      string
+	MTLSBootstrapTokenPath string
+	// MTLSAllowedClients lists the client certificate CNs admitted on the
+	// mTLS listener; empty admits any certificate the platform CA issued.
+	MTLSAllowedClients []string
+
 	DB DBConfig
 
 	Kafka KafkaConfig
@@ -26,12 +36,15 @@ type Config struct {
 	AuthZServiceURL string
 
 	// AuthZPlatformScopeID is the legal_entity_id presented to
-	// authorization-svc for operations that have no tenant yet — in practice
-	// only ProvisionTenant, which is what creates the tenant. Every other
-	// mutation is scoped to the caller's own tenant. authorization-svc
-	// rejects an empty legal_entity_id with 400, so a synthetic
-	// platform-scope entity is required; role assignments granting
-	// TENANT_PROVISION must be made against this same ID.
+	// authorization-svc for decisions that belong to the platform rather
+	// than to one legal entity: ProvisionTenant (which is what creates the
+	// tenant), the tenant-creation and home-region approvals, and any
+	// mutation whose caller envelope names no entity (X-Legal-Entity-Id).
+	// Every other mutation is evaluated at the caller's envelope entity,
+	// whose owning tenant authorization-svc resolves and checks.
+	// authorization-svc rejects an empty legal_entity_id with 400, so a
+	// synthetic platform-scope entity is required; role assignments granting
+	// platform-scope actions must be made against this same ID.
 	AuthZPlatformScopeID string
 
 	// OTELExporterEndpoint is where internal/telemetry sends OTLP/HTTP
@@ -223,6 +236,15 @@ func Load() (*Config, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
+	cfg.MTLSEnabled = env("MTLS_ENABLED", "false") == "true"
+	cfg.MTLSPort = envInt("MTLS_PORT", 8449)
+	cfg.MTLSManagementURL = env("MTLS_MANAGEMENT_SERVICE_URL", "")
+	cfg.MTLSBootstrapTokenPath = env("MTLS_BOOTSTRAP_TOKEN_PATH", "")
+	cfg.MTLSAllowedClients = envList("MTLS_ALLOWED_CLIENTS", nil)
+	if cfg.MTLSEnabled && cfg.MTLSManagementURL == "" {
+		return nil, fmt.Errorf("MTLS_ENABLED=true needs MTLS_MANAGEMENT_SERVICE_URL: the listener's certificate comes from mtls-management-svc")
+	}
+
 	return cfg, nil
 }
 

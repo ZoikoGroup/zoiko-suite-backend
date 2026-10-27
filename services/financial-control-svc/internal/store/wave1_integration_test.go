@@ -77,7 +77,18 @@ func (f *fakeSources) server(system string) *httptest.Server {
 		off, _ := strconv.Atoi(r.URL.Query().Get("cursor"))
 		limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 		end := off + limit
-		resp := map[string]any{"watermark": f.wm[key]}
+		// Like a conforming source: declared_totals cover the WHOLE population and are
+		// identical on every page (control-population-contract.md). Records a test made
+		// invalid get totals of nothing; the client refuses the record before comparing.
+		declared := map[string]any{"row_count": len(recs), "totals": map[string]string{}}
+		if totals, err := domain.ComputeTotals(recs); err == nil {
+			byCcy := map[string]string{}
+			for _, t := range totals {
+				byCcy[t.Currency] = t.Total
+			}
+			declared["totals"] = byCcy
+		}
+		resp := map[string]any{"watermark": f.wm[key], "declared_totals": declared}
 		if end < len(recs) {
 			resp["next_cursor"] = strconv.Itoa(end)
 		} else {
@@ -375,6 +386,7 @@ func TestE2E_FrozenPopulationIsImmutable_LateDataMakesANewRun(t *testing.T) {
 	run1, _ := x.start("k1")
 	snaps1, err := testStore.ListPopulationSnapshots(ctx, x.tenant, run1.RunID)
 	require.NoError(t, err)
+	require.NotEmpty(t, snaps1, "run 1 froze no population (did it fail before freezing?)")
 
 	for name, q := range map[string]string{
 		"update record":   `UPDATE population_records SET amount = 999 WHERE population_id = $1`,
@@ -394,10 +406,12 @@ func TestE2E_FrozenPopulationIsImmutable_LateDataMakesANewRun(t *testing.T) {
 	assert.Equal(t, domain.ResultFail, final2.ResultState)
 	snaps2, err := testStore.ListPopulationSnapshots(ctx, x.tenant, run2.RunID)
 	require.NoError(t, err)
+	require.NotEmpty(t, snaps2, "run 2 froze no population")
 	assert.NotEqual(t, snaps1[0].PopulationHash, snaps2[0].PopulationHash)
 	assert.Equal(t, "wm-2", snaps2[0].Watermark)
 	reread, err := testStore.ListPopulationSnapshots(ctx, x.tenant, run1.RunID)
 	require.NoError(t, err)
+	require.NotEmpty(t, reread)
 	assert.Equal(t, snaps1[0].PopulationHash, reread[0].PopulationHash, "run 1's frozen population never changed")
 	assert.Equal(t, "wm-1", reread[0].Watermark)
 }

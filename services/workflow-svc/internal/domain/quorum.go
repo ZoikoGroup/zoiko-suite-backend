@@ -43,6 +43,9 @@ type SubmitQuorumVoteParams struct {
 	Action      string
 	Rationale   *string
 	CausationID *string
+
+	Authority ActionAuthority
+	Meta      CommandMeta
 }
 
 // QuorumStageStatus evaluates a QUORUM stage's current vote tally

@@ -13,6 +13,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 
 	svcenvelope "zoiko.io/kill-switch-registry-svc/internal/envelope"
+	svcmiddleware "zoiko.io/kill-switch-registry-svc/internal/middleware"
 )
 
 var ErrAuthzServiceUnavailable = errors.New("authorization-svc unavailable")
@@ -155,6 +156,8 @@ func (c *Client) checkAllowedLive(ctx context.Context, principalID, legalEntityI
 	if env, ok := svcenvelope.FromContext(ctx); ok {
 		if env.TenantID != "" {
 			req.Header.Set("X-Tenant-Id", env.TenantID)
+		} else if tenantID := svcmiddleware.TenantFromContext(ctx); tenantID != "" {
+			req.Header.Set("X-Tenant-Id", tenantID)
 		}
 		if env.RequestID != "" {
 			authzRequestID = env.RequestID
@@ -168,6 +171,8 @@ func (c *Client) checkAllowedLive(ctx context.Context, principalID, legalEntityI
 		if env.CausationID != "" {
 			req.Header.Set("X-Causation-Id", env.CausationID)
 		}
+	} else if tenantID := svcmiddleware.TenantFromContext(ctx); tenantID != "" {
+		req.Header.Set("X-Tenant-Id", tenantID)
 	}
 	req.Header.Set("X-Request-Id", authzRequestID)
 	req.Header.Set("X-Source-Channel", authzSourceChannel)

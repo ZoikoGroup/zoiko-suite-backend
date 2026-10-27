@@ -39,7 +39,7 @@ func (s *PgStore) setRLS(ctx context.Context, tx pgx.Tx) error {
 	if tenantID == "" {
 		return domain.ErrTenantMissing
 	}
-	_, err := tx.Exec(ctx, "SET LOCAL app.tenant_id = $1", tenantID)
+	_, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID)
 	return err
 }
 
@@ -230,11 +230,14 @@ func (s *PgStore) Finalize(ctx context.Context, id string, req *domain.FinalizeD
 	if err != nil {
 		return nil, err
 	}
-	if d.ValidationStatus == domain.StatusBlocked {
-		return nil, domain.ErrValidationBlocked
-	}
-	if d.ValidationStatus == domain.StatusReadyForSubmission {
-		return nil, domain.ErrDraftAlreadyFinal
+	if d.ValidationStatus != domain.StatusPrepared {
+		if d.ValidationStatus == domain.StatusBlocked {
+			return nil, domain.ErrValidationBlocked
+		}
+		if d.ValidationStatus == domain.StatusReadyForSubmission {
+			return nil, domain.ErrDraftAlreadyFinal
+		}
+		return nil, domain.ErrValidationRequired
 	}
 
 	d.ValidationStatus = domain.StatusReadyForSubmission

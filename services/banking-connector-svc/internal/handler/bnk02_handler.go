@@ -13,7 +13,6 @@ import (
 
 	"zoiko.io/banking-connector-svc/internal/clients"
 	"zoiko.io/banking-connector-svc/internal/domain"
-	"zoiko.io/banking-connector-svc/internal/events"
 	"zoiko.io/banking-connector-svc/internal/middleware"
 	"zoiko.io/banking-connector-svc/internal/store"
 )
@@ -199,6 +198,7 @@ func (h *BNK02Handler) InitiateConnection(w http.ResponseWriter, r *http.Request
 		TenantID: tenantID, LegalEntityID: req.LegalEntityID, BankAccountID: req.BankAccountID,
 		ProviderRef: req.ProviderRef, BankName: req.BankName, Region: req.Region,
 		RequestedScope: req.RequestedScope, CreatedByPrincipalID: principalID, CorrelationID: req.CorrelationID,
+		RequestCorrelationID: r.Header.Get("X-Correlation-ID"),
 	})
 	if err != nil {
 		h.writeConnectionErr(w, err)
@@ -207,11 +207,6 @@ func (h *BNK02Handler) InitiateConnection(w http.ResponseWriter, r *http.Request
 	status := http.StatusOK
 	if created {
 		status = http.StatusCreated
-		_ = h.publisher.Publish(r.Context(), events.PublishParams{
-			EventType: "banking.connection.requested", AggregateID: conn.ConnectionID, TenantID: tenantID,
-			LegalEntityID: req.LegalEntityID, ActorID: principalID,
-			CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: conn,
-		})
 	}
 	writeJSON(w, status, conn)
 }

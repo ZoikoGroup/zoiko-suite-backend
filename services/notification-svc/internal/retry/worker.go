@@ -8,7 +8,7 @@ import (
 
 	"zoiko.io/notification-svc/internal/domain"
 	svcmiddleware "zoiko.io/notification-svc/internal/middleware"
-	"zoiko.io/notification-svc/internal/ncd"
+	"zoiko.io/notification-svc/internal/ncdcode"
 	"zoiko.io/notification-svc/internal/telemetry"
 )
 
@@ -425,7 +425,7 @@ func (w *Worker) reresolve(ctx context.Context, n *domain.Notification) bool {
 	addr, err := w.recipient.ResolveEmail(ctx, n.TenantID, n.CreatedByPrincipalID, n.RecipientPrincipalID)
 	if err != nil {
 		w.conclude(ctx, n, domain.DeliveryOutcome{
-			Reason:    ncd.Format(ncd.RecipientUnresolved) + ": recipient resolution failed: " + err.Error(),
+			Reason:    ncdcode.Format(ncdcode.RecipientUnresolved) + ": recipient resolution failed: " + err.Error(),
 			Retryable: w.settled != nil && !w.settled(err),
 		})
 		return false

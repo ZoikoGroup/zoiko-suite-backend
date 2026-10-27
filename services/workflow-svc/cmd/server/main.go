@@ -24,22 +24,29 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/riandyrn/otelchi"
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
+	idenv "zoiko.io/identity-envelope"
 
 	"zoiko.io/workflow-svc/internal/authz"
 	"zoiko.io/workflow-svc/internal/config"
+	"zoiko.io/workflow-svc/internal/consumer"
+	"zoiko.io/workflow-svc/internal/decisionlog"
 	"zoiko.io/workflow-svc/internal/documentvault"
 	svcenvelope "zoiko.io/workflow-svc/internal/envelope"
 	"zoiko.io/workflow-svc/internal/events"
+	"zoiko.io/workflow-svc/internal/evidence"
 	"zoiko.io/workflow-svc/internal/handler"
 	"zoiko.io/workflow-svc/internal/health"
 	svcmiddleware "zoiko.io/workflow-svc/internal/middleware"
 	"zoiko.io/workflow-svc/internal/outbox"
+	"zoiko.io/workflow-svc/internal/registry"
 	"zoiko.io/workflow-svc/internal/store"
 	"zoiko.io/workflow-svc/internal/telemetry"
+	"zoiko.io/workflow-svc/internal/timers"
 )
 
 func main() {
@@ -55,6 +62,13 @@ func main() {
 		os.Exit(1)
 	}
 	defer func() { _ = log.Sync() }()
+
+	// The governance ledger relay cannot authenticate without its service
+	// principal; retrying an unauthenticated delivery forever hides a
+	// configuration error. Local runs may omit it when no ledger is wired.
+	if cfg.Env != "local" && cfg.LedgerPrincipalID == "" {
+		log.Fatal("WORKFLOW_LEDGER_PRINCIPAL_ID is required outside local: decision ledger records need a service principal")
+	}
 
 	log.Info("workflow-svc starting",
 		zap.Int("port", cfg.Port),
@@ -121,6 +135,18 @@ func main() {
 	authzClient := authz.NewHTTPClient(cfg.AuthorizationServiceURL, log)
 	documentVaultClient := documentvault.NewHTTPClient(cfg.DocumentVaultServiceURL, log)
 
+	// Identity gate (X5 / X-R3): a signed envelope, when the caller sends one,
+	// is verified against identity-context-svc's JWKS and its session status,
+	// and its claims override X-Principal-Id / X-Tenant-Id. Without this the
+	// gateway's raw headers were the only identity, and this service could not
+	// pass a verified envelope on to authorization-svc under
+	// AUTHZ_IDENTITY_ASSERTION=require (the cross-domain auth plane).
+	gate, gateSettings, err := idenv.NewGateFromEnv("workflow-svc", log, idenv.EnvOptions{})
+	if err != nil {
+		log.Fatal("identity gate configuration refused", zap.Error(err))
+	}
+	log.Info("identity gate", gateSettings.Fields()...)
+
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
@@ -129,6 +155,7 @@ func main() {
 	r.Use(metrics.HTTPMiddleware)
 	r.Use(correlationIDMiddleware)
 	r.Use(middleware.Logger)
+	r.Use(gate.Middleware)
 	r.Use(svcmiddleware.TenantContext())
 
 	// Canonical Service Input Contract (ZS-ARCH-SVC-001 v2.0 §4). Runs after
@@ -139,15 +166,37 @@ func main() {
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
 	h := handler.New(pgStore, publisher, authzClient, documentVaultClient, log)
+	h = h.WithRegistryChecker(registry.New(cfg.RegistryServiceURL, log))
+	h = h.WithReadAuthz(cfg.ReadAuthzMode)
+	// AUD-07's contradiction check reads document-vault-svc's own AUD-06
+	// evidence state; without this wiring the check was skipped silently and
+	// a contradictory workpaper could be marked prepared.
+	h = h.WithEvidenceClient(evidence.NewHTTPClient(cfg.DocumentVaultServiceURL, log))
 	handler.RegisterRoutes(r, h)
 
-	// Outbox relay (ZS-STATE-001 Invariant I-13 / doc7 item 32):
-	// Asynchronously polls outbox_events and publishes to Kafka with FOR UPDATE SKIP LOCKED,
-	// guaranteeing multi-replica safety and durable at-least-once delivery.
+	// Outbox relays (ZS-STATE-001 Invariant I-13 / doc7 item 32):
+	// one Relay per destination — Kafka for domain events, decision_log for
+	// the governance ledger record written in the decision's own transaction.
+	// Each polls with FOR UPDATE SKIP LOCKED, so replicas never double-send.
 	relayCtx, relayCancel := context.WithCancel(context.Background())
 	defer relayCancel()
-	relay := outbox.NewRelay(pool, publisher, 1500*time.Millisecond, 50, log)
-	go relay.Start(relayCtx)
+	kafkaRelay := outbox.NewRelay(pool, publisher.Deliverer(), outbox.DestinationKafka, 1500*time.Millisecond, 50, log)
+	go kafkaRelay.Start(relayCtx)
+	ledgerRelay := outbox.NewRelay(pool,
+		decisionlog.NewLedgerDeliverer(cfg.GovernanceDecisionLogServiceURL, cfg.LedgerPrincipalID),
+		outbox.DestinationDecisionLog, 1500*time.Millisecond, 50, log)
+	go ledgerRelay.Start(relayCtx)
+
+	// Deadline expiry, escalation and authority re-check (000020).
+	sweeper := timers.New(pgStore, authzClient, cfg.TimerSweepInterval, cfg.TimerSweepBatch, log, prometheus.DefaultRegisterer)
+	go sweeper.Start(relayCtx)
+
+	// Authority-change consumer: a policy or delegation/authority change, or
+	// an authorization denial, flags the affected pending approvals so the
+	// sweeper re-authorizes their approvers.
+	recheckConsumer := consumer.New(cfg.Kafka.Brokers, cfg.ConsumerGroupID, cfg.ConsumerTopics, pgStore, log)
+	recheckConsumer.Start(relayCtx)
+	defer recheckConsumer.Close()
 
 	healthH := health.New(pool, log)
 	r.Get("/healthz", healthH.Liveness)
@@ -189,12 +238,15 @@ func main() {
 	log.Info("server stopped")
 }
 
+// correlationIDMiddleware echoes the caller's X-Correlation-ID. It used to
+// invent one from the request id when the caller sent none, before the input
+// contract below could refuse the request: correlation_id is mandatory
+// end-to-end (§4), and a made-up one traces nothing (Governance audit row 34).
 func correlationIDMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("X-Correlation-ID") == "" {
-			r.Header.Set("X-Correlation-ID", middleware.GetReqID(r.Context()))
+		if id := r.Header.Get("X-Correlation-ID"); id != "" {
+			w.Header().Set("X-Correlation-ID", id)
 		}
-		w.Header().Set("X-Correlation-ID", r.Header.Get("X-Correlation-ID"))
 		next.ServeHTTP(w, r)
 	})
 }

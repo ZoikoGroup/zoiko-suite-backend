@@ -9,6 +9,7 @@ package domain
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"strings"
 	"time"
 )
@@ -32,6 +33,10 @@ type Role struct {
 
 	CreatedAt            time.Time `json:"created_at"`
 	CreatedByPrincipalID string    `json:"created_by_principal_id"`
+	// Version is bumped by the database on every change (migration 000022),
+	// and an optional expected_version on a protected update is checked
+	// against it. Each version's full state is kept in authz_config_history.
+	Version int64 `json:"version"`
 }
 
 // PermissionBundle is the set of actions a Role grants. One role may own
@@ -44,6 +49,7 @@ type PermissionBundle struct {
 	PermittedActions   []string  `json:"permitted_actions"`
 	ActiveFlag         bool      `json:"active_flag"`
 	CreatedAt          time.Time `json:"created_at"`
+	Version            int64     `json:"version"`
 }
 
 // PrincipalRoleAssignment grants a Role to a principal, effective-dated,
@@ -65,6 +71,35 @@ type PrincipalRoleAssignment struct {
 
 	AssignedBy string    `json:"assigned_by"`
 	CreatedAt  time.Time `json:"created_at"`
+
+	// Maker-checker (000025). APPROVED grants; PENDING_APPROVAL, REJECTED
+	// and EXPIRED grant nothing.
+	ApprovalStatus    string     `json:"approval_status"`
+	ApprovedBy        *string    `json:"approved_by,omitempty"`
+	ApprovalReference *string    `json:"approval_reference,omitempty"`
+	ApprovalDecidedAt *time.Time `json:"approval_decided_at,omitempty"`
+	ApprovalExpiresAt *time.Time `json:"approval_expires_at,omitempty"`
+
+	// Filled only when a list asks for usage (include_usage=true), for access
+	// reviews (Authorization Standard §24 "Dormancy", "Orphan detection").
+	// LastGrantedAt is the latest GRANTED decision whose basis names this
+	// assignment's role for this principal; nil means none is on record.
+	// PrincipalStatus is the subject's projected status (ACTIVE when no
+	// status has ever been projected for them).
+	LastGrantedAt   *time.Time `json:"last_granted_at,omitempty"`
+	PrincipalStatus string     `json:"principal_status,omitempty"`
+}
+
+// AssignmentQuery is a paged assignment read. Limit is capped by the store;
+// Offset pages past it, so a caller that needs every row can have them.
+type AssignmentQuery struct {
+	TenantID     string
+	PrincipalID  string
+	RoleID       string
+	ActiveOnly   bool
+	IncludeUsage bool
+	Limit        int
+	Offset       int
 }
 
 // DelegatedAuthority grants a delegate principal the ability to act within
@@ -176,6 +211,7 @@ type ABACRule struct {
 	ActiveFlag           bool      `json:"active_flag"`
 	CreatedAt            time.Time `json:"created_at"`
 	CreatedByPrincipalID string    `json:"created_by_principal_id"`
+	Version              int64     `json:"version"`
 }
 
 // The two ABAC effects.
@@ -252,6 +288,7 @@ type SoDRule struct {
 
 	ActiveFlag bool      `json:"active_flag"`
 	CreatedAt  time.Time `json:"created_at"`
+	Version    int64     `json:"version"`
 }
 
 // ConflictTypeOwnObjectForbidden is the conflict_type convention for a
@@ -296,6 +333,27 @@ type AccessDecisionLog struct {
 
 	CorrelationID string    `json:"correlation_id"`
 	DecidedAt     time.Time `json:"decided_at"`
+
+	// ── Decision evidence (000023; GOV-03 Evidence, ZS-IAM-001 §8.2, §20) ──
+
+	// Decision is the §7 stage 9 value: PERMIT | DENY | STEP_UP |
+	// REQUIRE_APPROVAL. DecisionOutcome keeps the /v1/authorize vocabulary.
+	Decision string `json:"decision,omitempty"`
+	// PolicySetVersion is the configuration watermark the decision was made
+	// under ("cfg.<authz_config_history id>"), so it can be replayed exactly.
+	PolicySetVersion string   `json:"policy_set_version,omitempty"`
+	Obligations      []string `json:"obligations"`
+	ReasonCodes      []string `json:"reason_codes"`
+	// MatchedGrants are the assignment/role references that supplied the grant.
+	MatchedGrants    []string   `json:"matched_grants"`
+	ResourceType     string     `json:"resource_type,omitempty"`
+	ResourceID       string     `json:"resource_id,omitempty"`
+	ResourceVersion  string     `json:"resource_version,omitempty"`
+	AttributesDigest string     `json:"attributes_digest,omitempty"`
+	SessionAssurance string     `json:"session_assurance,omitempty"`
+	OnBehalfOf       string     `json:"on_behalf_of,omitempty"`
+	DelegationID     string     `json:"delegation_id,omitempty"`
+	ExpiresAt        *time.Time `json:"expires_at,omitempty"`
 }
 
 // ── principal status ─────────────────────────────────────────────────────────
@@ -338,6 +396,24 @@ type PrincipalStatusProjection struct {
 // admit it.
 const PrincipalStatusActive = "ACTIVE"
 
+// Legal entity statuses as tenant-entity-registry-svc publishes them on
+// entity.status.changed. SUSPENDED and DISSOLVED are negative controls;
+// DORMANT permits with an obligation.
+const (
+	EntityStatusDormant   = "DORMANT"
+	EntityStatusSuspended = "SUSPENDED"
+	EntityStatusDissolved = "DISSOLVED"
+)
+
+// ProjectEntityStatusParams is the lifecycle consumer's write for
+// entity.status.changed: latest event wins, older ones are ignored.
+type ProjectEntityStatusParams struct {
+	LegalEntityID   string
+	TenantID        string
+	Status          string
+	StatusChangedAt time.Time
+}
+
 // ProjectPrincipalStatusParams is the write shape used by the principal
 // lifecycle consumer. An UPSERT on (tenant_id, principal_id) — the broker
 // redelivers, and a status is a current value rather than an append-only
@@ -374,16 +450,41 @@ type PrivilegedSession struct {
 	CreatedAt        time.Time  `json:"created_at"`
 	RevokedAt        *time.Time `json:"revoked_at,omitempty"`
 	RevokedBy        *string    `json:"revoked_by,omitempty"`
+	// 000030: §13 request fields, approval and post-session review.
+	RequestedBy       *string    `json:"requested_by,omitempty"`
+	ResourceScope     *string    `json:"resource_scope,omitempty"`
+	TargetEnvironment *string    `json:"target_environment,omitempty"`
+	HighImpact        bool       `json:"high_impact"`
+	ApprovedBy        *string    `json:"approved_by,omitempty"`
+	ApprovedAt        *time.Time `json:"approved_at,omitempty"`
+	ReviewStatus      string     `json:"review_status"`
+	ReviewedBy        *string    `json:"reviewed_by,omitempty"`
+	ReviewedAt        *time.Time `json:"reviewed_at,omitempty"`
+	ReviewNotes       *string    `json:"review_notes,omitempty"`
+	// 000033: the step-up the requester and the approver each proved (A-03).
+	RequesterStepUp *StepUpEvidence `json:"requester_step_up,omitempty"`
+	ApproverStepUp  *StepUpEvidence `json:"approver_step_up,omitempty"`
 }
 
 // CreatePrivilegedSessionParams holds the parameters to issue a new JIT privileged session.
 type CreatePrivilegedSessionParams struct {
-	TenantID         string
-	PrincipalID      string
-	RequestedActions []string
-	TicketRef        string
-	Reason           string
-	DurationSeconds  int
+	TenantID          string
+	PrincipalID       string
+	RequestedActions  []string
+	TicketRef         string
+	Reason            string
+	DurationSeconds   int
+	RequestedBy       string
+	ResourceScope     string
+	TargetEnvironment string
+	// HighImpact sessions start PENDING_APPROVAL and grant nothing until an
+	// independent approver approves (§13).
+	HighImpact bool
+	// MaxDurationSeconds is the configured maximum (B-01); a longer request is
+	// ErrSessionDurationExceeded. Zero applies the built-in 24 h ceiling.
+	MaxDurationSeconds int
+	// StepUp is the requester's proven authentication (A-03), recorded.
+	StepUp *StepUpEvidence
 }
 
 // BreakGlassSessionStatus represents the lifecycle state of an emergency break-glass session (ZS-IAM-001 §14 & §21).
@@ -407,6 +508,14 @@ type BreakGlassSession struct {
 	CreatedAt        time.Time  `json:"created_at"`
 	RevokedAt        *time.Time `json:"revoked_at,omitempty"`
 	RevokedBy        *string    `json:"revoked_by,omitempty"`
+	// 000030: requester and the mandatory post-event review (§14).
+	RequestedBy  *string    `json:"requested_by,omitempty"`
+	ReviewStatus string     `json:"review_status"`
+	ReviewedBy   *string    `json:"reviewed_by,omitempty"`
+	ReviewedAt   *time.Time `json:"reviewed_at,omitempty"`
+	ReviewNotes  *string    `json:"review_notes,omitempty"`
+	// 000033: the step-up the requester proved (A-03, §14).
+	RequesterStepUp *StepUpEvidence `json:"requester_step_up,omitempty"`
 }
 
 type CreateBreakGlassSessionParams struct {
@@ -416,6 +525,10 @@ type CreateBreakGlassSessionParams struct {
 	Reason           string
 	RequestedActions []string
 	DurationSeconds  int
+	RequestedBy      string
+	// MaxDurationSeconds: see CreatePrivilegedSessionParams. Zero applies 2 h.
+	MaxDurationSeconds int
+	StepUp             *StepUpEvidence
 }
 
 // SupportSessionStatus represents the lifecycle state of a tenant support session (ZS-IAM-001 §15 & §21).
@@ -427,21 +540,22 @@ const (
 
 // SupportSession records a purpose-bound tenant support / diagnostic access session (ZS-IAM-001 §15 & §21).
 type SupportSession struct {
-	SessionID              string     `json:"session_id"`
-	TenantID               string     `json:"tenant_id"`
-	SupportOperatorID      string     `json:"support_operator_id"`
-	TicketRef              string     `json:"ticket_ref"`
-	Purpose                string     `json:"purpose"`
-	ReadOnly               bool       `json:"read_only"`
-	AllowBulkExport        bool       `json:"allow_bulk_export"`
-	AllowedActions         []string   `json:"allowed_actions"`
-	Status                 string     `json:"status"`
-	DurationSeconds        int        `json:"duration_seconds"`
-	ExpiresAt              time.Time  `json:"expires_at"`
-	TenantConsentObtained  bool       `json:"tenant_consent_obtained"`
-	CreatedAt              time.Time  `json:"created_at"`
-	RevokedAt              *time.Time `json:"revoked_at,omitempty"`
-	RevokedBy              *string    `json:"revoked_by,omitempty"`
+	SessionID             string     `json:"session_id"`
+	TenantID              string     `json:"tenant_id"`
+	SupportOperatorID     string     `json:"support_operator_id"`
+	TicketRef             string     `json:"ticket_ref"`
+	Purpose               string     `json:"purpose"`
+	ReadOnly              bool       `json:"read_only"`
+	AllowBulkExport       bool       `json:"allow_bulk_export"`
+	AllowedActions        []string   `json:"allowed_actions"`
+	Status                string     `json:"status"`
+	DurationSeconds       int        `json:"duration_seconds"`
+	ExpiresAt             time.Time  `json:"expires_at"`
+	TenantConsentObtained bool       `json:"tenant_consent_obtained"`
+	CreatedAt             time.Time  `json:"created_at"`
+	RevokedAt             *time.Time `json:"revoked_at,omitempty"`
+	RevokedBy             *string    `json:"revoked_by,omitempty"`
+	RequestedBy           *string    `json:"requested_by,omitempty"`
 }
 
 type CreateSupportSessionParams struct {
@@ -454,6 +568,9 @@ type CreateSupportSessionParams struct {
 	AllowedActions        []string
 	DurationSeconds       int
 	TenantConsentObtained bool
+	RequestedBy           string
+	// MaxDurationSeconds: see CreatePrivilegedSessionParams. Zero applies 24 h.
+	MaxDurationSeconds int
 }
 
 // ── params ───────────────────────────────────────────────────────────────────
@@ -472,6 +589,9 @@ type CreatePermissionBundleParams struct {
 	RoleID             string
 	BundleCode         string
 	PermittedActions   []string
+	// ExpectedVersion, when non-zero, makes a replace conditional on the
+	// existing bundle still being at that version (ErrVersionConflict if not).
+	ExpectedVersion int64
 }
 
 type CreateRoleAssignmentParams struct {
@@ -485,7 +605,19 @@ type CreateRoleAssignmentParams struct {
 	BookID        *string
 	OrgUnitID     *string
 	EffectiveFrom time.Time
-	AssignedBy    string
+	// EffectiveTo is optional: nil is open-ended. When set it must be after
+	// EffectiveFrom (Authorization Standard §9: an assignment carries
+	// "effective dates", and §22 the same of access_assignment).
+	EffectiveTo *time.Time
+
+	// ApprovalStatus is APPROVED or PENDING_APPROVAL ("" = APPROVED).
+	// ApprovedBy is the independent approver of an APPROVED privileged
+	// grant; ApprovalExpiresAt bounds a PENDING one.
+	ApprovalStatus    string
+	ApprovedBy        *string
+	ApprovalReference *string
+	ApprovalExpiresAt *time.Time
+	AssignedBy        string
 }
 
 type CreateDelegatedAuthorityParams struct {
@@ -508,6 +640,10 @@ type CreateDelegatedAuthorityParams struct {
 	DelegatedActions []string
 	EffectiveFrom    time.Time
 	EffectiveTo      *time.Time
+
+	// Reason and ApprovalReference (ZS-IAM-001 §11; 000025).
+	Reason            *string
+	ApprovalReference *string
 
 	// SourceService / SourceDelegationID identify the upstream record when
 	// this row is projected from delegated-authority-svc's events rather
@@ -538,6 +674,26 @@ type ProjectDelegationParams struct {
 	DelegatedActions []string
 	EffectiveFrom    time.Time
 	EffectiveTo      *time.Time
+	// SourceVersion is the upstream grant's version; one older than the
+	// projection holds is ignored (a replayed event must not undo a later one).
+	SourceVersion int64
+	// The delegation's own ceiling, in minor units, as the upstream grant set
+	// it. Nil means the delegation sets no ceiling of that kind.
+	LimitMinor    *int64
+	LimitCurrency *string
+	LimitQuantity *int64
+}
+
+// DelegationCeiling is the ceiling one active delegation places on the
+// authority it confers (delegated-authority-svc authority_limit_*).
+type DelegationCeiling struct {
+	SourceDelegationID string
+	// DelegatorPrincipalID is whose authority the delegation transmits. The
+	// delegation can confer no more than that principal's own limits allow.
+	DelegatorPrincipalID string
+	LimitMinor           *int64
+	LimitCurrency        *string
+	LimitQuantity        *int64
 }
 
 type CreateSoDRuleParams struct {
@@ -573,8 +729,24 @@ type RecordAccessDecisionParams struct {
 	LegalEntityID string
 	ActionType    string
 	Outcome       string
-	Basis         string
-	CorrelationID string
+
+	// Evidence (000023). All optional: the admin-gate checks record only the
+	// core fields. PolicySetVersion is not here — the store reads it in the
+	// insert's own transaction, so it is the version actually in force.
+	Decision         string
+	Obligations      []string
+	ReasonCodes      []string
+	MatchedGrants    []string
+	ResourceType     string
+	ResourceID       string
+	ResourceVersion  string
+	AttributesDigest string
+	SessionAssurance string
+	OnBehalfOf       string
+	DelegationID     string
+	ExpiresAt        *time.Time
+	Basis            string
+	CorrelationID    string
 
 	// TenantID is the caller's verified tenant scope, empty when the caller
 	// supplied none. Stored as SQL NULL when empty: /v1/authorize is called
@@ -583,6 +755,30 @@ type RecordAccessDecisionParams struct {
 	// unattributed decision. A NULL-tenant row is deliberately NOT readable
 	// through GET /v1/access-decisions/{id}, which is tenant-scoped.
 	TenantID string
+
+	// Events, when set, builds the events this decision publishes from the
+	// recorded row. The store writes them to outbox_events in the SAME
+	// transaction as the decision, so a recorded decision always has its
+	// events — a Kafka outage delays them instead of losing them. Nil writes
+	// none (internal admin-gate checks publish nothing).
+	Events func(AccessDecisionLog) ([]OutboxMessage, error)
+}
+
+// GrantingAssignment is one assignment that confers an action: the §20
+// "assignment references" a decision records.
+type GrantingAssignment struct {
+	AssignmentID string
+	RoleID       string
+	RoleCode     string
+}
+
+// OutboxMessage is one event waiting in outbox_events: the Kafka key and the
+// fully built envelope, so the relay publishes exactly what was committed.
+type OutboxMessage struct {
+	EventType string
+	Key       string
+	Value     []byte
+	TenantID  string
 }
 
 // ListAccessDecisionsParams filters the decision log for
@@ -745,9 +941,17 @@ var ErrPrincipalStatusIncomplete = errorString("principal status projection requ
 var ErrPrincipalStatusStale = errorString("a newer principal status is already projected")
 
 var ErrRoleNotFound = errorString("role not found")
+
+// ErrVersionConflict: an update carried an expected_version the object is no
+// longer at — somebody else changed it since the caller read it.
+var ErrVersionConflict = errorString("the object has changed since the expected version")
 var ErrRoleAssignmentNotFound = errorString("role assignment not found")
 var ErrLegalEntityRequiredForRoleScope = errorString("legal_entity_id is required: this role's scope_type is not TENANT")
 var ErrDelegatedAuthorityNotFound = errorString("delegated authority not found")
+
+// ErrStaleProjection: a delegation event older than the projection it would
+// change. Ignored, never applied.
+var ErrStaleProjection = errorString("delegation event is older than the projection")
 
 // ErrTenantScopeRequired means a delegation operation was attempted without a
 // verified tenant. Since 000006 delegated_authorities.tenant_id is NOT NULL and
@@ -817,8 +1021,6 @@ var ErrJurisdictionServiceUnavailable = errorString("jurisdiction-rules-svc unav
 var ErrAuthorityLimitNotFound = errorString("authority limit not found")
 var ErrAuthorityLimitTargetRequired = errorString("authority limit requires at least one of principal_id or role_id")
 var ErrWorkloadBindingNotFound = errorString("workload binding not found")
-var ErrAccessReviewNotFound = errorString("access review not found")
-var ErrAccessReviewAlreadyCompleted = errorString("access review is already completed")
 
 // AuthorityLimit defines the foundational approval and signing limit for a principal
 // or role within an optional legal entity, book, or org-unit scope (ZS-IAM-001 §12, §21, §22).
@@ -862,10 +1064,13 @@ const (
 	OutcomeDenied  = "DENIED"
 	OutcomeStepUp  = "STEP_UP"
 
-	CanonicalDecisionAllow  = "ALLOW"
-	CanonicalDecisionPermit = "PERMIT"
-	CanonicalDecisionDeny   = "DENY"
-	CanonicalDecisionStepUp = "STEP_UP"
+	// CanonicalDecisionAllow is kept only so older code compiles; the §8.2
+	// decision vocabulary is PERMIT and nothing emits ALLOW any more.
+	CanonicalDecisionAllow           = "ALLOW"
+	CanonicalDecisionPermit          = "PERMIT"
+	CanonicalDecisionDeny            = "DENY"
+	CanonicalDecisionStepUp          = "STEP_UP"
+	CanonicalDecisionRequireApproval = "REQUIRE_APPROVAL"
 
 	DefaultPolicySetVersion = "2026.08.24.4"
 )
@@ -873,10 +1078,30 @@ const (
 // EnvironmentContext captures contextual environment attributes including authentication age,
 // assurance level, operational risk, and audience (ZS-IAM-001 §8.1, §16).
 type EnvironmentContext struct {
-	AuthnAgeSeconds int    `json:"authn_age_seconds,omitempty"`
-	Assurance       string `json:"assurance,omitempty"`
-	Risk            string `json:"risk,omitempty"`
-	Audience        string `json:"audience,omitempty"`
+	AuthnAgeSeconds int `json:"authn_age_seconds,omitempty"`
+	// AuthnAgeKnown says whether the caller stated an authentication age at
+	// all. AuthnAgeSeconds 0 with AuthnAgeKnown false is "not said", which a
+	// step-up action treats as not recent (Governance audit N-07) — it used to
+	// read as a login zero seconds old.
+	AuthnAgeKnown bool   `json:"-"`
+	Assurance     string `json:"assurance,omitempty"`
+	Risk          string `json:"risk,omitempty"`
+	Audience      string `json:"audience,omitempty"`
+}
+
+// UnmarshalJSON records whether authn_age_seconds was present.
+func (e *EnvironmentContext) UnmarshalJSON(b []byte) error {
+	type plain EnvironmentContext
+	var p plain
+	if err := json.Unmarshal(b, &p); err != nil {
+		return err
+	}
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal(b, &keys); err == nil {
+		_, p.AuthnAgeKnown = keys["authn_age_seconds"]
+	}
+	*e = EnvironmentContext(p)
+	return nil
 }
 
 // StepUpRequirement details the required assurance and authentication freshness needed
@@ -905,6 +1130,10 @@ type CanonicalDecisionRequest struct {
 	DelegationID        *string            `json:"delegation_id,omitempty"`
 	CorrelationID       string             `json:"correlation_id,omitempty"`
 	InitiatingSubjectID string             `json:"initiating_subject_id,omitempty"`
+	// The emergency and support session layers, as on /v1/authorize. The
+	// canonical API accepted only a JIT session_id (Governance audit N-16).
+	BreakGlassSessionID string `json:"break_glass_session_id,omitempty"`
+	SupportSessionID    string `json:"support_session_id,omitempty"`
 }
 
 // CanonicalDecisionResponse matches ZS-IAM-001 §8.2 for POST /internal/authorization/decisions.
@@ -959,51 +1188,6 @@ type CapabilitiesResponse struct {
 	Permissions   []string        `json:"permissions"`
 	Modules       []string        `json:"modules"`
 	Features      map[string]bool `json:"features"`
-}
-
-// Phase 5: Access Reviews & Continuous Governance (ZS-IAM-001 §21, §24)
-const (
-	ReviewTypePeriodic       = "PERIODIC"
-	ReviewTypeEventTriggered = "EVENT_TRIGGERED"
-	ReviewTypePrivileged     = "PRIVILEGED"
-
-	ReviewStatusOpen      = "OPEN"
-	ReviewStatusCompleted = "COMPLETED"
-	ReviewStatusEscalated = "ESCALATED"
-	ReviewStatusExpired   = "EXPIRED"
-
-	ReviewDecisionKeep     = "KEEP"
-	ReviewDecisionRevoke   = "REVOKE"
-	ReviewDecisionModify   = "MODIFY"
-	ReviewDecisionEscalate = "ESCALATE"
-)
-
-// AccessReview matches ZS-IAM-001 §21, §22, §24 access_reviews table and API.
-type AccessReview struct {
-	ReviewID            string     `json:"review_id"`
-	TenantID            string     `json:"tenant_id"`
-	CampaignID          string     `json:"campaign_id"`
-	CampaignName        string     `json:"campaign_name"`
-	ReviewerPrincipalID string     `json:"reviewer_principal_id"`
-	TargetPrincipalID   string     `json:"target_principal_id"`
-	RoleID              string     `json:"role_id"`
-	LegalEntityID       string     `json:"legal_entity_id"`
-	BookID              *string    `json:"book_id,omitempty"`
-	OrgUnitID           *string    `json:"org_unit_id,omitempty"`
-	ReviewType          string     `json:"review_type"`
-	Status              string     `json:"status"`
-	Decision            *string    `json:"decision,omitempty"`
-	DecisionReason      *string    `json:"decision_reason,omitempty"`
-	DecidedAt           *time.Time `json:"decided_at,omitempty"`
-	DecidedBy           *string    `json:"decided_by,omitempty"`
-	DueAt               time.Time  `json:"due_at"`
-	CreatedAt           time.Time  `json:"created_at"`
-}
-
-// AccessReviewDecideRequest matches POST /v1/iam/access-reviews/{id}:decide body.
-type AccessReviewDecideRequest struct {
-	Decision string `json:"decision"`
-	Reason   string `json:"reason"`
 }
 
 // WorkloadBinding matches ZS-IAM-001 §16 workload_bindings table.

@@ -26,7 +26,7 @@ func seedAdjustment(s *stubStore, id, status, createdBy string) *domain.Consolid
 	return a
 }
 
-func stubClientsWithMatched(amount float64) *stubClients {
+func stubClientsWithMatched(amount domain.Decimal) *stubClients {
 	return &stubClients{
 		intercompanyEntries: []clients.IntercompanyEntry{
 			{IntercompanyEntryID: "ic-1", Amount: amount, MatchStatus: "MATCHED"},
@@ -51,7 +51,7 @@ func validAdjustmentReq(adjType string) map[string]any {
 
 func TestCreateEliminationProposal_TargetsStatutoryBook_Refused(t *testing.T) {
 	s := newStubStore() // group-1 never appeared in any ConsolidationRun
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubClients{})
+	r := newRouter(s, &stubAuthZ{}, &stubClients{})
 
 	resp := doReq(r, http.MethodPost, "/v1/consolidation/adjustments", validAdjustmentReq(domain.AdjustmentTypeManual), "preparer-1")
 	if resp.Code != http.StatusUnprocessableEntity {
@@ -62,7 +62,7 @@ func TestCreateEliminationProposal_TargetsStatutoryBook_Refused(t *testing.T) {
 func TestCreateEliminationProposal_ManualAdjustment_HappyPath(t *testing.T) {
 	s := newStubStore()
 	s.groupHasRun["group-1"] = true
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubClients{})
+	r := newRouter(s, &stubAuthZ{}, &stubClients{})
 
 	resp := doReq(r, http.MethodPost, "/v1/consolidation/adjustments", validAdjustmentReq(domain.AdjustmentTypeManual), "preparer-1")
 	if resp.Code != http.StatusCreated {
@@ -81,7 +81,7 @@ func TestCreateEliminationProposal_EliminationExceedsMatchedBalance_Refused(t *t
 	s := newStubStore()
 	s.groupHasRun["group-1"] = true
 	// Only 50 of matched intercompany balance exists; the proposal below asks for 100.
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, stubClientsWithMatched(50))
+	r := newRouter(s, &stubAuthZ{}, stubClientsWithMatched("50"))
 
 	resp := doReq(r, http.MethodPost, "/v1/consolidation/adjustments", validAdjustmentReq(domain.AdjustmentTypeElimination), "preparer-1")
 	if resp.Code != http.StatusUnprocessableEntity {
@@ -92,7 +92,7 @@ func TestCreateEliminationProposal_EliminationExceedsMatchedBalance_Refused(t *t
 func TestCreateEliminationProposal_EliminationWithinMatchedBalance_Allowed(t *testing.T) {
 	s := newStubStore()
 	s.groupHasRun["group-1"] = true
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, stubClientsWithMatched(500))
+	r := newRouter(s, &stubAuthZ{}, stubClientsWithMatched("500"))
 
 	resp := doReq(r, http.MethodPost, "/v1/consolidation/adjustments", validAdjustmentReq(domain.AdjustmentTypeElimination), "preparer-1")
 	if resp.Code != http.StatusCreated {
@@ -105,7 +105,7 @@ func TestCreateEliminationProposal_EliminationWithinMatchedBalance_Allowed(t *te
 func TestApproveConsolidationAdjustment_SelfApproval_Refused(t *testing.T) {
 	s := newStubStore()
 	seedAdjustment(s, "adj-1", domain.AdjustmentStatusPendingApproval, "preparer-1")
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubClients{})
+	r := newRouter(s, &stubAuthZ{}, &stubClients{})
 
 	resp := doReq(r, http.MethodPost, "/v1/consolidation/adjustments/adj-1/approve", nil, "preparer-1")
 	if resp.Code != http.StatusForbidden {
@@ -116,7 +116,7 @@ func TestApproveConsolidationAdjustment_SelfApproval_Refused(t *testing.T) {
 func TestApproveConsolidationAdjustment_DifferentApprover_Allowed(t *testing.T) {
 	s := newStubStore()
 	seedAdjustment(s, "adj-1", domain.AdjustmentStatusPendingApproval, "preparer-1")
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubClients{})
+	r := newRouter(s, &stubAuthZ{}, &stubClients{})
 
 	resp := doReq(r, http.MethodPost, "/v1/consolidation/adjustments/adj-1/approve", nil, "approver-1")
 	if resp.Code != http.StatusOK {
@@ -132,7 +132,7 @@ func TestApproveConsolidationAdjustment_DifferentApprover_Allowed(t *testing.T) 
 func TestPostConsolidationAdjustment_NotApproved_Refused(t *testing.T) {
 	s := newStubStore()
 	seedAdjustment(s, "adj-1", domain.AdjustmentStatusPendingApproval, "preparer-1")
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubClients{})
+	r := newRouter(s, &stubAuthZ{}, &stubClients{})
 
 	resp := doReq(r, http.MethodPost, "/v1/consolidation/adjustments/adj-1/post", nil, "poster-1")
 	if resp.Code != http.StatusUnprocessableEntity {
@@ -144,7 +144,7 @@ func TestPostConsolidationAdjustment_Approved_PostsRealJournal(t *testing.T) {
 	s := newStubStore()
 	seedAdjustment(s, "adj-1", domain.AdjustmentStatusApproved, "preparer-1")
 	cl := &stubClients{postJournalID: "real-journal-1"}
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, cl)
+	r := newRouter(s, &stubAuthZ{}, cl)
 
 	resp := doReq(r, http.MethodPost, "/v1/consolidation/adjustments/adj-1/post", nil, "poster-1")
 	if resp.Code != http.StatusOK {
@@ -163,7 +163,7 @@ func TestPostConsolidationAdjustment_Approved_PostsRealJournal(t *testing.T) {
 func TestReverseConsolidationAdjustment_MissingReason_Returns400(t *testing.T) {
 	s := newStubStore()
 	seedAdjustment(s, "adj-1", domain.AdjustmentStatusPosted, "preparer-1")
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubClients{})
+	r := newRouter(s, &stubAuthZ{}, &stubClients{})
 
 	resp := doReq(r, http.MethodPost, "/v1/consolidation/adjustments/adj-1/reverse", map[string]string{}, "reverser-1")
 	if resp.Code != http.StatusBadRequest {
@@ -175,7 +175,7 @@ func TestReverseConsolidationAdjustment_AfterSnapshot_RequiresSupersession(t *te
 	s := newStubStore()
 	seedAdjustment(s, "adj-1", domain.AdjustmentStatusPosted, "preparer-1")
 	s.hasSnapshot["group-1|2026-07"] = true
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubClients{})
+	r := newRouter(s, &stubAuthZ{}, &stubClients{})
 
 	resp := doReq(r, http.MethodPost, "/v1/consolidation/adjustments/adj-1/reverse", map[string]string{"reason": "correcting an error"}, "reverser-1")
 	if resp.Code != http.StatusUnprocessableEntity {
@@ -189,7 +189,7 @@ func TestReverseConsolidationAdjustment_AfterSnapshot_WithSupersession_Allowed(t
 	seedAdjustment(s, "adj-2", domain.AdjustmentStatusPendingApproval, "preparer-1")
 	s.hasSnapshot["group-1|2026-07"] = true
 	supersededBy := "adj-2"
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubClients{})
+	r := newRouter(s, &stubAuthZ{}, &stubClients{})
 
 	resp := doReq(r, http.MethodPost, "/v1/consolidation/adjustments/adj-1/reverse", map[string]any{
 		"reason": "correcting an error", "superseded_by_adjustment_id": supersededBy,
@@ -206,10 +206,53 @@ func TestReverseConsolidationAdjustment_NoSnapshotYet_PlainReversalAllowed(t *te
 	s := newStubStore()
 	seedAdjustment(s, "adj-1", domain.AdjustmentStatusPosted, "preparer-1")
 	// No snapshot recorded for group-1|2026-07.
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubClients{})
+	r := newRouter(s, &stubAuthZ{}, &stubClients{})
 
 	resp := doReq(r, http.MethodPost, "/v1/consolidation/adjustments/adj-1/reverse", map[string]string{"reason": "never posted correctly"}, "reverser-1")
 	if resp.Code != http.StatusOK {
 		t.Fatalf("expected 200 (no snapshot exists yet), got %d: %s", resp.Code, resp.Body.String())
+	}
+}
+
+// TestReverseConsolidationAdjustment_AfterSnapshot_InvalidSupersession_Refused
+// proves the supersession rule cannot be met by naming an adjustment that
+// replaces nothing: the adjustment itself, one for another group or period,
+// or one that was itself reversed.
+func TestReverseConsolidationAdjustment_AfterSnapshot_InvalidSupersession_Refused(t *testing.T) {
+	cases := []struct {
+		name  string
+		seed  func(s *stubStore)
+		named string
+	}{
+		{"itself", func(s *stubStore) {}, "adj-1"},
+		{"other period", func(s *stubStore) {
+			seedAdjustment(s, "adj-2", domain.AdjustmentStatusPendingApproval, "preparer-1").FiscalPeriod = "2026-08"
+		}, "adj-2"},
+		{"other group", func(s *stubStore) {
+			seedAdjustment(s, "adj-2", domain.AdjustmentStatusPendingApproval, "preparer-1").GroupLegalEntityID = "group-2"
+		}, "adj-2"},
+		{"reversed", func(s *stubStore) {
+			seedAdjustment(s, "adj-2", domain.AdjustmentStatusReversed, "preparer-1")
+		}, "adj-2"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newStubStore()
+			seedAdjustment(s, "adj-1", domain.AdjustmentStatusPosted, "preparer-1")
+			tc.seed(s)
+			s.hasSnapshot["group-1|2026-07"] = true
+			cl := &stubClients{}
+			r := newRouter(s, &stubAuthZ{}, cl)
+
+			resp := doReq(r, http.MethodPost, "/v1/consolidation/adjustments/adj-1/reverse", map[string]any{
+				"reason": "correcting an error", "superseded_by_adjustment_id": tc.named,
+			}, "reverser-1")
+			if resp.Code != http.StatusUnprocessableEntity {
+				t.Fatalf("expected 422, got %d: %s", resp.Code, resp.Body.String())
+			}
+			if s.adjustments["adj-1"].Status != domain.AdjustmentStatusPosted {
+				t.Fatalf("expected adj-1 to stay POSTED, got %q", s.adjustments["adj-1"].Status)
+			}
+		})
 	}
 }

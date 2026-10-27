@@ -28,15 +28,21 @@ import (
 	"github.com/riandyrn/otelchi"
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
+	idenv "zoiko.io/identity-envelope"
 
 	"zoiko.io/policy-svc/internal/authz"
+	"zoiko.io/policy-svc/internal/cache"
 	"zoiko.io/policy-svc/internal/config"
+	"zoiko.io/policy-svc/internal/consumer"
 	"zoiko.io/policy-svc/internal/decisionlog"
 	svcenvelope "zoiko.io/policy-svc/internal/envelope"
-	"zoiko.io/policy-svc/internal/events"
+	"zoiko.io/policy-svc/internal/evidence"
 	"zoiko.io/policy-svc/internal/handler"
 	"zoiko.io/policy-svc/internal/health"
 	svcmiddleware "zoiko.io/policy-svc/internal/middleware"
+	"zoiko.io/policy-svc/internal/mtlslistener"
+	"zoiko.io/policy-svc/internal/outbox"
+	"zoiko.io/policy-svc/internal/scheduler"
 	"zoiko.io/policy-svc/internal/store"
 	"zoiko.io/policy-svc/internal/telemetry"
 )
@@ -106,37 +112,55 @@ func main() {
 	}
 	log.Info("db pool connected")
 
-	// ── 4. Store ──────────────────────────────────────────────────────────────
-	pgStore := store.New(pool, log)
-
-	// Kafka producer — connects lazily on first write, same posture as
-	// identity-context-svc/tenant-entity-registry-svc: not a fail-fast
-	// startup dependency like Postgres.
-	// AllowAutoTopicCreation is required even though the broker itself has
-	// auto.create.topics.enable=true: segmentio/kafka-go's Writer defaults
-	// this to false and never asks the broker to auto-create in its
-	// metadata request, so every write to a not-yet-existing topic fails
-	// with "Unknown Topic Or Partition" regardless of the broker-side
-	// setting.
+	// ── 3b. Kafka producer & outbox worker ────────────────────────────────────
 	kafkaWriter := &kafka.Writer{
-		Addr:                   kafka.TCP(cfg.Kafka.Brokers...),
-		Topic:                  cfg.Kafka.Topic,
-		Balancer:               &kafka.LeastBytes{},
-		AllowAutoTopicCreation: true,
-		// Without this, every write to this service costs an extra second.
-		// kafka-go batches, and BatchTimeout defaults to 1s: a synchronous
-		// WriteMessages of a single message waits for the batch to fill (100
-		// messages) or for that timer, whichever comes first. These events are
-		// emitted one per state transition, so the batch never fills and the
-		// timer always wins — and publishing is on the request path, so the
-		// caller pays for it. Ordering and synchronous delivery are unchanged;
-		// only the artificial wait goes away.
+		Addr:         kafka.TCP(cfg.Kafka.Brokers...),
+		Topic:        cfg.Kafka.Topic,
+		Balancer:     &kafka.LeastBytes{},
+		BatchSize:    100,
 		BatchTimeout: 10 * time.Millisecond,
+		RequiredAcks: kafka.RequireAll,
+		Async:        false,
 	}
-	defer func() { _ = kafkaWriter.Close() }()
+	defer func() {
+		if err := kafkaWriter.Close(); err != nil {
+			log.Error("kafka writer close failed", zap.Error(err))
+		}
+	}()
 
-	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
-	decisionLogClient := decisionlog.NewHTTPClient(cfg.GovernanceDecisionLogServiceURL)
+	// Every state change writes its events to the outbox in its own
+	// transaction; this relay publishes them after commit.
+	outboxWorker := outbox.NewWorker(pool, kafkaWriter, log).WithResidency(cfg.EventResidencyRegion)
+	outboxWorker.Start()
+	defer outboxWorker.Stop()
+
+	// ── 4. Store, resolution cache, background workers ────────────────────────
+	pgStore := store.New(pool, log)
+	resolutionCache := cache.New(pgStore)
+
+	// Evaluation evidence is stored before Evaluate answers; this relay
+	// delivers it to the governance ledger as policy-svc's own principal.
+	if cfg.LedgerPrincipalID == "" {
+		log.Error("POLICY_LEDGER_PRINCIPAL_ID is not set: evaluations will be stored but stay PENDING for the governance ledger")
+	}
+	evidenceRelay := evidence.NewRelay(pgStore, decisionlog.NewHTTPClient(cfg.GovernanceDecisionLogServiceURL),
+		cfg.LedgerPrincipalID, cfg.EvidenceRelayInterval, log)
+	evidenceRelay.Start()
+	defer evidenceRelay.Stop()
+
+	activationScheduler := scheduler.New(pgStore, cfg.SchedulerInterval, log)
+	activationScheduler.Start()
+	defer activationScheduler.Stop()
+
+	stopBacklog := watchBacklogs(pgStore, metrics, log)
+	defer stopBacklog()
+
+	// ── 4b. Kafka consumer for external events ────────────────────────────────
+	consumerCfg := consumer.DefaultConsumerConfig(cfg.Kafka.Brokers, cfg.Kafka.GroupID)
+	consumerHandler := consumer.NewHandler(resolutionCache, log)
+	eventConsumer := consumer.NewConsumer(consumerCfg, consumerHandler, log)
+	eventConsumer.Start(context.Background())
+	defer eventConsumer.Stop()
 
 	// AuthZ client. Refuses to start in production/staging against a
 	// placeholder URL — no service may silently fall back to permit-all.
@@ -154,6 +178,19 @@ func main() {
 	r.Use(metrics.HTTPMiddleware)
 	r.Use(correlationIDMiddleware)
 	r.Use(middleware.Logger)
+
+	// Identity before anything reads X-Tenant-Id / X-Principal-Id (X5), through
+	// the platform's shared gate (decision 21 Oct 2026). policy-svc's own
+	// verifier checked the envelope's signature and nothing else, so a session
+	// ended at identity-context-svc (logout, suspension) kept working here until
+	// the envelope expired (AU-01). The gate also checks the session status, and
+	// makes the verified claims the only source of the identity headers.
+	gate, gateSettings, err := idenv.NewGateFromEnv("policy-svc", log, gateOptions(cfg))
+	if err != nil {
+		log.Fatal("identity gate configuration refused", zap.Error(err))
+	}
+	log.Info("identity gate", gateSettings.Fields()...)
+	r.Use(gate.Middleware)
 	r.Use(svcmiddleware.TenantContext())
 
 	// Canonical Service Input Contract (ZS-ARCH-SVC-001 v2.0 §4). Runs after
@@ -161,9 +198,38 @@ func main() {
 	// handler so no request reaches business logic without a resolved tenant,
 	// actor, correlation and — on material writes — an idempotency key.
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
-	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
+	//
+	// Evaluate is exempt from MaterialWrite, as authorization-svc's
+	// /v1/authorize is (audit C5): its replay protection is the caller's
+	// decision_id, which reconciles a retry to the stored result, so an
+	// Idempotency-Key would be a second key for the same thing.
+	envelopePolicy := svcenvelope.ServicePolicy()
+	envelopePolicy.MaterialWrite = func(req *http.Request) bool {
+		if req.URL.Path == "/v1/policies/evaluate" && req.Method == http.MethodPost {
+			return false
+		}
+		switch req.Method {
+		case http.MethodGet, http.MethodHead, http.MethodOptions:
+			return false
+		default:
+			return true
+		}
+	}
+	// LegalEntityID is not universally required: a policy family and a global
+	// or tenant-wide version have no legal entity. Where a body names one, the
+	// handlers reconcile it with X-Legal-Entity-Id (a mismatch is 400).
+	envelopePolicy.LegalEntityID = svcenvelope.NotRequired
+	r.Use(svcenvelope.Middleware(envelopePolicy, svcenvelope.DefaultReporter()))
 
-	h := handler.New(pgStore, publisher, decisionLogClient, authzClient, cfg.AuthZPlatformScopeID, log)
+	h := handler.New(pgStore, resolutionCache, authzClient, handler.Options{
+		PlatformScopeID: cfg.AuthZPlatformScopeID,
+		EvaluateAuthz:   handler.ParseMode(cfg.EvaluateAuthz),
+		ReadAuthz:       handler.ParseMode(cfg.ReadAuthz),
+	}, log)
+	if handler.ParseMode(cfg.EvaluateAuthz) == handler.ModeWarn || handler.ParseMode(cfg.ReadAuthz) == handler.ModeWarn {
+		log.Warn("policy-svc authorization gates in WARN mode: refusals are logged, not enforced",
+			zap.String("evaluate", cfg.EvaluateAuthz), zap.String("read", cfg.ReadAuthz))
+	}
 	handler.RegisterRoutes(r, h)
 	handler.RegisterControlTestRoutes(r, h)
 
@@ -190,6 +256,22 @@ func main() {
 		IdleTimeout:       60 * time.Second,
 	}
 
+	// Mutual-TLS listener for peer services (SEC-INV-05): same router,
+	// provisioned in the background so an unavailable mtls-management-svc
+	// never stops the plaintext listener.
+	mtlsCtx, stopMTLS := context.WithCancel(context.Background())
+	defer stopMTLS()
+	var mtlsListener *mtlslistener.Listener
+	if cfg.MTLSEnabled {
+		mtlsListener = mtlslistener.Start(mtlsCtx, mtlslistener.Options{
+			ServiceName:        "policy-svc",
+			Port:               cfg.MTLSPort,
+			ManagementURL:      cfg.MTLSManagementURL,
+			BootstrapTokenPath: cfg.MTLSBootstrapTokenPath,
+			AllowedClients:     cfg.MTLSAllowedClients,
+		}, r, log)
+	}
+
 	serverErr := make(chan error, 1)
 	go func() {
 		log.Info("HTTP server listening", zap.String("addr", addr))
@@ -212,7 +294,47 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Error("graceful shutdown failed", zap.Error(err))
 	}
+	if mtlsListener != nil {
+		stopMTLS()
+		if err := mtlsListener.Shutdown(shutdownCtx); err != nil {
+			log.Error("mtls listener shutdown failed", zap.Error(err))
+		}
+	}
 	log.Info("server stopped")
+}
+
+// watchBacklogs exports both outboxes' backlogs every 30 seconds. Returns a
+// stop function.
+func watchBacklogs(st *store.PgStore, m *telemetry.Metrics, log *zap.Logger) func() {
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		t := time.NewTicker(30 * time.Second)
+		defer t.Stop()
+		for {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			if pending, failed, err := st.EvidenceBacklog(ctx); err == nil {
+				m.EvidencePending.Set(float64(pending))
+				m.EvidenceFailed.Set(float64(failed))
+			} else {
+				log.Warn("evidence backlog unreadable", zap.Error(err))
+			}
+			if pending, oldest, err := st.OutboxBacklog(ctx); err == nil {
+				m.OutboxPending.Set(float64(pending))
+				m.OutboxOldestSeconds.Set(oldest)
+			} else {
+				log.Warn("outbox backlog unreadable", zap.Error(err))
+			}
+			cancel()
+			select {
+			case <-stop:
+				return
+			case <-t.C:
+			}
+		}
+	}()
+	return func() { close(stop); <-done }
 }
 
 // correlationIDMiddleware propagates X-Correlation-ID through every request.

@@ -1,9 +1,12 @@
 // Package main is the entry point for audit-event-store-svc.
 //
 // This service is an append-only evidence store for domain events
-// (see docs/architecture/03-microservices.md §14.1).  It has no
-// outward-facing business HTTP API; the HTTP server exists solely to serve
-// health probes.  The real work is done by the Kafka consumer runners.
+// (see docs/architecture/03-microservices.md §14.1).  Ingestion is Kafka only:
+// one consumer runner per topic appends events to the hash chain.  The HTTP
+// server serves the health/metrics probes and six authenticated business
+// routes — GET /v1/events and POST /v1/events/verify (AUDIT_EVENT_READ) and the
+// four /v1/archives routes (AUDIT_ARCHIVE_MANAGE).  There is no HTTP ingestion
+// endpoint.
 //
 // Wiring order:
 //
@@ -23,6 +26,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -33,6 +37,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 
+	"zoiko.io/audit-event-store-svc/internal/authz"
 	"zoiko.io/audit-event-store-svc/internal/config"
 	"zoiko.io/audit-event-store-svc/internal/consumer"
 	svcenvelope "zoiko.io/audit-event-store-svc/internal/envelope"
@@ -141,7 +146,14 @@ func main() {
 	// handler so no request reaches business logic without a resolved tenant,
 	// actor, correlation and — on material writes — an idempotency key.
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
-	router.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
+	policy := svcenvelope.ServicePolicy()
+	policy.MaterialWrite = func(r *http.Request) bool {
+		if r.Method == http.MethodPost && (r.URL.Path == "/v1/events/verify" || strings.HasSuffix(r.URL.Path, "/verify")) {
+			return false
+		}
+		return r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions
+	}
+	router.Use(svcenvelope.Middleware(policy, svcenvelope.DefaultReporter()))
 
 	// Health probes — no auth, no tenant context required.
 	healthH := health.New(pool, log)
@@ -151,7 +163,8 @@ func main() {
 
 	// AUD-10 archive/verify API — this service's first business HTTP
 	// endpoint set (see internal/handler's own package doc).
-	archiveHandler := handler.New(pgStore, log)
+	authzClient := authz.NewClient(cfg.AuthzServiceURL)
+	archiveHandler := handler.New(pgStore, authzClient, log)
 	handler.RegisterRoutes(router, archiveHandler)
 
 	// ── 7. HTTP server with graceful shutdown ─────────────────────────────────

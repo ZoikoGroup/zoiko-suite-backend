@@ -71,8 +71,8 @@ func TestAuthorityLimit_AmountWithinLimit_Allowed(t *testing.T) {
 	var resp domain.CanonicalDecisionResponse
 	_ = json.Unmarshal(w.Body.Bytes(), &resp)
 
-	if resp.Decision != domain.CanonicalDecisionAllow {
-		t.Errorf("expected decision ALLOW for amount within limit, got %s", resp.Decision)
+	if resp.Decision != domain.CanonicalDecisionPermit {
+		t.Errorf("expected decision PERMIT for amount within limit, got %s", resp.Decision)
 	}
 }
 
@@ -183,8 +183,8 @@ func TestAuthorityLimit_BoundaryCondition_ExactlyAtLimit(t *testing.T) {
 
 	var resp1 domain.CanonicalDecisionResponse
 	_ = json.Unmarshal(w1.Body.Bytes(), &resp1)
-	if resp1.Decision != domain.CanonicalDecisionAllow {
-		t.Errorf("expected ALLOW when amount exactly equals upper limit, got %s", resp1.Decision)
+	if resp1.Decision != domain.CanonicalDecisionPermit {
+		t.Errorf("expected PERMIT when amount exactly equals upper limit, got %s", resp1.Decision)
 	}
 
 	// 2. Exactly at lower limit: 500.00 GBP -> ALLOWED (inclusive lower bound)
@@ -203,8 +203,8 @@ func TestAuthorityLimit_BoundaryCondition_ExactlyAtLimit(t *testing.T) {
 
 	var resp2 domain.CanonicalDecisionResponse
 	_ = json.Unmarshal(w2.Body.Bytes(), &resp2)
-	if resp2.Decision != domain.CanonicalDecisionAllow {
-		t.Errorf("expected ALLOW when amount exactly equals lower limit, got %s", resp2.Decision)
+	if resp2.Decision != domain.CanonicalDecisionPermit {
+		t.Errorf("expected PERMIT when amount exactly equals lower limit, got %s", resp2.Decision)
 	}
 }
 
@@ -467,8 +467,8 @@ func TestQuorum_DualApproval_Satisfied_Allowed(t *testing.T) {
 	var resp domain.CanonicalDecisionResponse
 	_ = json.Unmarshal(w.Body.Bytes(), &resp)
 
-	if resp.Decision != domain.CanonicalDecisionAllow {
-		t.Errorf("expected ALLOW when quorum is satisfied, got %s (basis=%s)", resp.Decision, resp.Basis)
+	if resp.Decision != domain.CanonicalDecisionPermit {
+		t.Errorf("expected PERMIT when quorum is satisfied, got %s (basis=%s)", resp.Decision, resp.Basis)
 	}
 }
 
@@ -746,7 +746,47 @@ func TestScenarioA10_ApprovalFactsUnchanged_Allowed(t *testing.T) {
 	var resp domain.CanonicalDecisionResponse
 	_ = json.Unmarshal(w.Body.Bytes(), &resp)
 
-	if resp.Decision != domain.CanonicalDecisionAllow {
-		t.Errorf("expected ALLOW when approval facts are unchanged, got %s (basis=%s)", resp.Decision, resp.Basis)
+	if resp.Decision != domain.CanonicalDecisionPermit {
+		t.Errorf("expected PERMIT when approval facts are unchanged, got %s (basis=%s)", resp.Decision, resp.Basis)
+	}
+}
+
+// A rate supplied by the caller whose amount is checked is ignored (decision
+// 5 Oct 2026). With it honoured, fx_rate=0.0001 brought 100,000 USD under a
+// 50,000 GBP limit; at the reference rate it is ~78,000 GBP and over.
+func TestCallerSuppliedFXRateCannotMoveTheLimit(t *testing.T) {
+	const (
+		tenantID    = "11111111-1111-4111-8111-111111111111"
+		legalEntity = "22222222-2222-4222-8222-222222222222"
+		principalID = "usr-approver-001"
+	)
+	store := &stubStore{
+		rbacActions: []string{"payment.release"},
+		rbacBasis:   "rbac:role=PAYMENT_RELEASER",
+		authorityLimits: []domain.AuthorityLimit{{
+			AuthorityLimitID: "lim-001", TenantID: tenantID, PrincipalID: strptr(principalID),
+			AuthorityType: "payment_release", LegalEntityID: strptr(legalEntity), Currency: "GBP",
+			UpperLimit: "50000.00", EffectiveFrom: time.Now().Add(-1 * time.Hour),
+		}},
+	}
+	r := newTestRouterFull(store, &stubPublisher{}, &stubValidator{})
+	for _, attr := range []string{"fx_rate", "exchange_rate"} {
+		body := `{
+			"subject_id": "` + principalID + `",
+			"tenant_id": "` + tenantID + `",
+			"legal_entity_id": "` + legalEntity + `",
+			"action": "payment.release",
+			"resource_attributes": {"amount": "100000.00", "currency": "USD", "` + attr + `": "0.0001"}
+		}`
+		req := httptest.NewRequest(http.MethodPost, "/internal/authorization/decisions", bytes.NewBufferString(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Tenant-Id", tenantID)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		var resp domain.CanonicalDecisionResponse
+		_ = json.Unmarshal(w.Body.Bytes(), &resp)
+		if resp.Decision != domain.CanonicalDecisionDeny {
+			t.Errorf("%s=0.0001 must not bring 100,000 USD under a 50,000 GBP limit; got %s (%s)", attr, resp.Decision, resp.Basis)
+		}
 	}
 }

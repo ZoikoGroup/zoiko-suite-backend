@@ -29,7 +29,9 @@ const platformScopeID = "00000000-0000-0000-0000-00000000f001"
 // Action constants passed to authorization-svc as action_type.
 const (
 	CommercialAccountCreate = "COMMERCIAL_ACCOUNT_CREATE"
+	CommercialAccountRead   = "COMMERCIAL_ACCOUNT_READ"
 	MembershipCreate        = "MEMBERSHIP_CREATE"
+	MembershipRead          = "MEMBERSHIP_READ"
 	MembershipDeactivate    = "MEMBERSHIP_DEACTIVATE"
 )
 
@@ -163,20 +165,21 @@ func (h *Handler) CreateCommercialAccount(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "commercial_account.created", EntityID: acct.CommercialAccountID, TenantID: acct.OrganizationID,
-		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: acct,
-	})
 	writeJSON(w, http.StatusCreated, acct)
 }
 
 // GetCommercialAccount reads one account, scoped to the verified tenant.
 //
-// requireTenant is new here. This route has no authz check of its own, and
-// the store's tenant predicate used to disable itself when the tenant was
-// absent, so a header-less request could read any account by id — legal
-// customer name, contact email, contract reference, processor customer ref.
+// Authz is now gated on COMMERCIAL_ACCOUNT_READ. The account is fetched
+// first (store is tenant-scoped so a foreign tenant's account is already
+// indistinguishable from 404), then the check is made against the account's
+// OWN organization_id — never against a caller-supplied scope — to avoid
+// the namespace-mismatch risk documented in tracker row 84a.
 func (h *Handler) GetCommercialAccount(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
 	if _, ok := h.requireTenant(w, r, ""); !ok {
 		return
 	}
@@ -188,6 +191,9 @@ func (h *Handler) GetCommercialAccount(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "failed to get commercial account")
+		return
+	}
+	if !h.authorize(w, r, principalID, acct.OrganizationID, CommercialAccountRead) {
 		return
 	}
 	writeJSON(w, http.StatusOK, acct)
@@ -234,17 +240,19 @@ func (h *Handler) CreateMembership(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "membership.created", EntityID: m.MembershipID, TenantID: m.OrganizationID,
-		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: m,
-	})
 	writeJSON(w, http.StatusCreated, m)
 }
 
-// GetMembership reads one membership, scoped to the verified tenant. Same
-// two gaps as GetCommercialAccount: no authz check on the route, and a
-// store predicate that disabled itself when the tenant was absent.
+// GetMembership reads one membership, scoped to the verified tenant.
+//
+// Authz is now gated on MEMBERSHIP_READ. The membership is fetched first
+// (store is tenant-scoped so a foreign tenant's membership is 404), then
+// the check is made against the membership's OWN organization_id.
 func (h *Handler) GetMembership(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
 	if _, ok := h.requireTenant(w, r, ""); !ok {
 		return
 	}
@@ -258,19 +266,31 @@ func (h *Handler) GetMembership(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to get membership")
 		return
 	}
+	if !h.authorize(w, r, principalID, m.OrganizationID, MembershipRead) {
+		return
+	}
 	writeJSON(w, http.StatusOK, m)
 }
 
-// ListMemberships lists the verified tenant's own memberships.
+// ListMemberships lists the verified tenant's own memberships, authorized by
+// MEMBERSHIP_READ (tracker row 84b).
 //
-// The {organizationID} path segment is kept in the route for URL
-// compatibility but is no longer what the query filters on: it must now
-// AGREE with the verified X-Tenant-Id, and the roster is read from the
-// context tenant either way. Previously the path value went straight to
-// the store with no authz check and no tenant comparison, so any caller
-// could enumerate any organization's membership roster.
+// The {organizationID} path segment is kept for URL compatibility but is
+// no longer what drives the query: it must AGREE with the verified
+// X-Tenant-Id, and the store always filters by the context tenant.
+// MEMBERSHIP_READ authorization is checked against the verified tenant ID
+// (the organization scope), not the path parameter — eliminates the
+// any-caller-can-enumerate-any-org gap.
 func (h *Handler) ListMemberships(w http.ResponseWriter, r *http.Request) {
-	if _, ok := h.requireTenant(w, r, chi.URLParam(r, "organizationID")); !ok {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r, chi.URLParam(r, "organizationID"))
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, tenantID, MembershipRead) {
 		return
 	}
 	memberships, err := h.store.ListMemberships(r.Context())
@@ -325,10 +345,6 @@ func (h *Handler) DeactivateMembership(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "membership.deactivated", EntityID: id, TenantID: existing.OrganizationID,
-		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: nil,
-	})
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deactivated"})
 }
 

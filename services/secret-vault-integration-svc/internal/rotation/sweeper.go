@@ -38,12 +38,12 @@ const claimHold = 10 * time.Minute
 
 // Sweeper rotates every due secret on a fixed interval.
 type Sweeper struct {
-	store      SweepStore
-	rotate     RotationCore
-	log        *zap.Logger
-	interval   time.Duration
-	actorID    string
-	pageSize   int
+	store    SweepStore
+	rotate   RotationCore
+	log      *zap.Logger
+	interval time.Duration
+	actorID  string
+	pageSize int
 }
 
 // New constructs a sweeper. actorID is the principal recorded as the actor

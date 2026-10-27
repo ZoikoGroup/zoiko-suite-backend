@@ -50,8 +50,6 @@ func (h *Handler) StartRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.publisher.PublishReconciliationStarted(r.Context(), *run)
-
 	status := http.StatusCreated
 	if !created {
 		status = http.StatusOK
@@ -214,8 +212,6 @@ func (h *Handler) CertifyRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.publisher.PublishReconciliationCertified(r.Context(), *run, *cert)
-
 	status := http.StatusCreated
 	if !created {
 		status = http.StatusOK
@@ -287,8 +283,6 @@ func (h *Handler) ReperformRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.publisher.PublishReconciliationSuperseded(r.Context(), *run, newRun.RunID)
-	h.publisher.PublishReconciliationReperformed(r.Context(), *newRun, runID)
 	writeJSON(w, http.StatusCreated, newRun)
 }
 
@@ -377,7 +371,6 @@ func (h *Handler) RunAutomaticMatching(w http.ResponseWriter, r *http.Request) {
 			l.Status = domain.StatementLineStatusMatched
 			l.MatchedTransactionID = &c.TransactionID
 			l.MatchedByPrincipalID = &principalID
-			h.publisher.PublishReconciliationMatched(r.Context(), l)
 			result.Matched = true
 		default:
 			if err := h.verifyJournalMatches(r.Context(), l, c.JournalID); err != nil {
@@ -391,7 +384,6 @@ func (h *Handler) RunAutomaticMatching(w http.ResponseWriter, r *http.Request) {
 			l.Status = domain.StatementLineStatusMatched
 			l.MatchedJournalID = &c.JournalID
 			l.MatchedByPrincipalID = &principalID
-			h.publisher.PublishReconciliationMatched(r.Context(), l)
 			result.Matched = true
 		}
 

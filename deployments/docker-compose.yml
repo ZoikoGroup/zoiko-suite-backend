@@ -72,6 +72,10 @@ services:
       - ../services/procurement-workflow-svc/deployments/migrations:/migrations/procurement-workflow:ro
       - ../services/performance-review-svc/deployments/migrations:/migrations/performance-review:ro
       - ../services/delegated-authority-svc/deployments/migrations:/migrations/delegated-authority:ro
+      - ../services/currency-registry-svc/deployments/migrations:/migrations/currency-registry:ro
+      - ../services/fiscal-calendar-svc/deployments/migrations:/migrations/fiscal-calendar:ro
+      - ../services/accounting-period-svc/deployments/migrations:/migrations/accounting-period:ro
+      - ../services/financial-statements-svc/deployments/migrations:/migrations/financial-statements:ro
       - ../services/access-control-svc/deployments/migrations:/migrations/access-control:ro
       - ../services/decision-support-svc/deployments/migrations:/migrations/decision-support:ro
       - ../services/treasury-svc/deployments/migrations:/migrations/treasury:ro
@@ -294,15 +298,21 @@ services:
         chmod 644 /keys/envelope_signing_key.pem
     restart: "no"
 
-  # ── One-shot: generate the shared mTLS self-provisioning bootstrap token ──
+  # ── One-shot: generate the per-service mTLS self-provisioning tokens ──────
   # mtls-management-svc requires a verified principal + authorize() decision
   # for every certificate request EXCEPT this one bootstrap path: a service
   # requesting its own first certificate has no principal or session yet to
   # present (the standard PKI bootstrap problem — see
-  # docs/architecture/master-register-findings-2026-08-27.md §3.28). This
-  # generates one random token into a shared volume, exactly like
-  # identity-svc-keygen above; never used in staging/production, where a
-  # real value is injected via the secrets manager.
+  # docs/architecture/master-register-findings-2026-08-27.md §3.28).
+  #
+  # ONE TOKEN PER SERVICE (Governance register M-01, 13 Oct 2026). There used
+  # to be a single shared token, and any holder could mint a certificate for
+  # any service name — including a registered PEP's. Each service now gets
+  # <service_name>/token; it mounts only that sub-directory (volume subpath),
+  # and mtls-management-svc issues a token's certificate only for the service
+  # it is named after. To add a consumer: add its service_name below and
+  # mount `subpath: <service_name>` at /bootstrap. Never used in
+  # staging/production, where the secrets manager injects each token.
   mtls-bootstrap-keygen:
     image: alpine:3.19
     container_name: mtls-bootstrap-keygen
@@ -314,13 +324,17 @@ services:
     command:
       - |
         set -e
-        if [ ! -f /bootstrap/token ]; then
-          head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > /bootstrap/token
-          echo "Generated throwaway dev mTLS bootstrap token"
-        else
-          echo "Dev mTLS bootstrap token already present, skipping"
-        fi
-        chmod 644 /bootstrap/token
+        for svc in identity-context-svc gateway-auth-svc tenant-entity-registry-svc authorization-svc ai-governance-svc; do
+          mkdir -p "/bootstrap/$$svc"
+          if [ ! -f "/bootstrap/$$svc/token" ]; then
+            head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "/bootstrap/$$svc/token"
+            echo "Generated dev mTLS bootstrap token for $$svc"
+          fi
+          chmod 644 "/bootstrap/$$svc/token"
+        done
+        # The pre-M-01 shared token, if this volume still has one: nothing
+        # accepts it any more, so it must not linger as if it did.
+        rm -f /bootstrap/token
     restart: "no"
 
   # ── Docker socket proxy ──────────────────────────────────────────────────────
@@ -507,8 +521,11 @@ services:
   # ── 1. identity-context-svc (Port: 8080) ─────────────────────────────────────
   identity-svc:
     build:
-      context: ../services/identity-context-svc
-      dockerfile: Dockerfile
+      # Root context is required: go.mod replaces zoiko.io/identity-envelope
+      # with the sibling ../identity-envelope module, so the build must see
+      # both (Group 1 re-audit F-4). Dockerfile.dockerignore keeps it small.
+      context: ..
+      dockerfile: services/identity-context-svc/Dockerfile
     container_name: identity-context-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -608,7 +625,10 @@ services:
       # authz stub on purpose, because a deployment with a real GOV-03 and a
       # stubbed GOV-04 would satisfy "authorization enforced" while having no
       # segregation control at all.
-      SOD_SERVICE_URL: "${SOD_SERVICE_URL:-}"
+      # GOV-04 maker-checker answers come from authorization-svc's
+      # /v1/sod/evaluate (it owns the SoD rules). Empty used to mean a
+      # permit-everything stub in development.
+      SOD_SERVICE_URL: "${SOD_SERVICE_URL:-http://authorization-svc:8089}"
 
       # Break-glass bounds. The maximum is the ceiling on how long a support
       # engineer can hold standing inside a customer tenant; raising it is a
@@ -630,10 +650,86 @@ services:
       OUTBOX_RELAY_BATCH_SIZE: "100"
       OUTBOX_RELAY_POLL_MILLIS: "1000"
       OUTBOX_RETENTION_DAYS: "7"
+      # Mutual-TLS listener on :8449 for gateway-auth-svc (SEC-INV-05, S5-B1).
+      # Same router as :8080; the certificate comes from mtls-management-svc
+      # through the bootstrap path and is renewed at two thirds of its life.
+      # Provisioning retries in the background: mtls-management-svc being down
+      # never stops the plaintext listener. Only the listed client CNs are
+      # admitted, and X-Workload-Id is set to the verified one.
+      MTLS_ENABLED: "true"
+      MTLS_PORT: "8449"
+      MTLS_MANAGEMENT_SERVICE_URL: "http://mtls-management-svc:8140"
+      MTLS_BOOTSTRAP_TOKEN_PATH: "/bootstrap/token"
+      MTLS_ALLOWED_CLIENTS: "gateway-auth-svc,authorization-svc"
+      # ── Auth plane closure (14 Oct 2026) ───────────────────────────────────
+      # Login clients (Group 1 register R-1). The console's SERVER tier logs
+      # in as client "zoiko-console" with its secret (local value:
+      # local-dev-console-client-secret; the file holds only its SHA-256), so
+      # the token carries a verified azp and a human session gets a VERIFIED
+      # source channel. "optional" until the console sends the client; then
+      # "required".
+      IDP_CLIENT_SECRETS_FILE: "/idp-clients/clients.json"
+      IDP_CLIENT_CHANNELS: "zoiko-console=web"
+      IDP_CLIENT_AUTH: "optional"
+      # The TOTP second factor (migration 000012): secrets are AES-256-GCM
+      # encrypted under this key. LOCAL VALUE ONLY — staging and production
+      # refuse to start without their own (from the secret store), and a
+      # factor enrolled under one key cannot be used under another.
+      MFA_SECRET_KEY: "bG9jYWwtZGV2LW1mYS1rZXktMzItYnl0ZXMtbG9uZyE=" # gitleaks:allow -- local-only key; identity-context-svc refuses it in staging/production
+      MFA_SECRET_KEY_ID: "local-1"
+      MFA_RECENT_AUTH_SECONDS: "900"
+      # ── OIDC provider and login throttling (wired 19 Oct 2026, F-5) ─────────
+      # The provider is mounted at /.well-known/openid-configuration and
+      # /oauth2/*. The local registry holds one public loopback client for
+      # trying the code flow by hand; the console is registered here when it
+      # moves from /v1/authenticate to /oauth2/authorize.
+      OIDC_ISSUER: "http://localhost:8080"
+      OIDC_CLIENTS_FILE: "/idp-clients/oidc-clients.json"
+      # The console still logs in through POST /v1/authenticate, so it stays
+      # open locally. The default is "internal" (mTLS platform tooling only),
+      # and config.Load refuses "open" in staging and production (IAM §18).
+      AUTHENTICATE_ENDPOINT: "open"
+      # Source-level login throttling (AU-04): per-IP attempt rate and failure
+      # budgets, per-tenant failure budget, in Redis.
+      AUTH_RATE_IP_PER_MINUTE: "30"
+      AUTH_FAIL_IP_LIMIT: "10"
+      AUTH_FAIL_TENANT_LIMIT: "100"
+
+      # ── INT-10 identity federation (OFF unless enabled) ───────────────────────
+      #
+      # A tenant's own identity provider can authenticate its people only on a platform whose operator
+      # has turned this on. The IdP's key location is a tenant-supplied destination, so it passes the same
+      # SSRF guard as every other (https, public addresses, pinned dial, no redirects); the *_ALLOW_HTTP and
+      # *_PRIVATE_CIDRS settings below exist for local development and private-link IdPs only.
+      FEDERATION_ENABLED: "${FEDERATION_ENABLED:-false}"
+      FEDERATION_EGRESS_ALLOW_HTTP: "${FEDERATION_EGRESS_ALLOW_HTTP:-false}"
+      FEDERATION_EGRESS_PRIVATE_CIDRS: "${FEDERATION_EGRESS_PRIVATE_CIDRS:-}"
+      FEDERATION_JWKS_REFRESH_SECONDS: "900"
+      FEDERATION_JWKS_MIN_REFRESH_SECONDS: "30"
+      # SCIM provisioning, role requests to access-control-svc, and the deprovisioning worker. Requires
+      # FEDERATION_ENABLED. IDENTITY_SERVICE_PRINCIPAL_ID needs ROLE_MANAGE on the entities its mappings name:
+      # an operator grant, never something federation gives itself.
+      FEDERATION_PROVISIONING_ENABLED: "${FEDERATION_PROVISIONING_ENABLED:-false}"
+      FEDERATION_WORKER_INTERVAL_SECONDS: "15"
+      FEDERATION_RETRY_BASE_SECONDS: "10"
+      FEDERATION_REVOKE_RETRY_MAX_SECONDS: "60"
     volumes:
       - identity_jwt_keys:/keys:ro
+      - ./identity/idp-clients.local.json:/idp-clients/clients.json:ro
+      - ./identity/oidc-clients.local.json:/idp-clients/oidc-clients.json:ro
+      # Only this service's own bootstrap token (register M-01): the
+      # sub-directory identity-context-svc/ of the keygen volume, so /bootstrap/token
+      # here is a token mtls-management-svc binds to identity-context-svc alone.
+      - type: volume
+        source: mtls_bootstrap_token
+        target: /bootstrap
+        read_only: true
+        volume:
+          subpath: identity-context-svc
     depends_on:
       identity-svc-keygen:
+        condition: service_completed_successfully
+      mtls-bootstrap-keygen:
         condition: service_completed_successfully
       postgres:
         condition: service_healthy
@@ -656,8 +752,10 @@ services:
   # wired into a route.
   gateway-auth-svc:
     build:
-      context: ../services/gateway-auth-svc
-      dockerfile: Dockerfile
+      # Root context: go.mod replaces zoiko.io/identity-envelope with the
+      # sibling module, so the build must see both (see the Dockerfile).
+      context: ..
+      dockerfile: services/gateway-auth-svc/Dockerfile
     container_name: gateway-auth-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -695,10 +793,37 @@ services:
       # unreachable. Writes are never served from a stale context.
       TENANT_CONTEXT_STALE_GRACE_SECONDS: "120"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
+      # SEC-INV-05 mTLS to identity-context-svc (JWKS) and the tenant registry:
+      # each peer is called at its https:// *_MTLS_URL with a 1-day
+      # certificate from mtls-management-svc, renewed at half-life. Both peers
+      # serve :8449 with RequireAndVerifyClientCert since 13 Oct
+      # (internal/mtlslistener). The host names are the container names,
+      # which are the DNS names on the peers' certificates — "identity-svc"
+      # (the compose key) would fail hostname verification. The gateway
+      # provisions its client identity at boot and refuses to start without
+      # it, hence the dependency on mtls-management-svc below.
+      IDENTITY_JWKS_MTLS_ENABLED: "true"
+      IDENTITY_JWKS_MTLS_URL: "https://identity-context-svc:8449/.well-known/jwks.json"
+      TENANT_REGISTRY_MTLS_ENABLED: "true"
+      TENANT_REGISTRY_MTLS_URL: "https://tenant-entity-registry-svc:8449"
+      MTLS_MANAGEMENT_SERVICE_URL: "http://mtls-management-svc:8140"
+      MTLS_BOOTSTRAP_TOKEN_PATH: "/bootstrap/token"
+    volumes:
+      # Only this service's own bootstrap token (register M-01): the
+      # sub-directory gateway-auth-svc/ of the keygen volume, so /bootstrap/token
+      # here is a token mtls-management-svc binds to gateway-auth-svc alone.
+      - type: volume
+        source: mtls_bootstrap_token
+        target: /bootstrap
+        read_only: true
+        volume:
+          subpath: gateway-auth-svc
     depends_on:
       identity-svc:
         condition: service_healthy
       tenant-svc:
+        condition: service_healthy
+      mtls-management-svc:
         condition: service_healthy
     healthcheck:
       # readyz, not healthz. Liveness here answers 200 whenever the process is
@@ -715,14 +840,25 @@ services:
   # ── 2. tenant-entity-registry-svc (Port: 8081) ────────────────────────────────
   tenant-svc:
     build:
-      context: ../services/tenant-entity-registry-svc
-      dockerfile: Dockerfile
+      # Root context: go.mod replaces zoiko.io/identity-envelope with the
+      # sibling module, so the build must see both (see the Dockerfile).
+      context: ..
+      dockerfile: services/tenant-entity-registry-svc/Dockerfile
     container_name: tenant-entity-registry-svc
     mem_limit: 256m
     cpus: "0.5"
     ports:
       - "8081:8081"
     environment:
+      # Identity gate (X-R3): a presented signed envelope is verified and its
+      # session checked; its claims replace X-Principal-Id / X-Tenant-Id.
+      # warn here: the services outside Groups 1-2 that read entities forward
+      # the principal but not the envelope. The gateway's tenant-context calls
+      # come over mTLS as a peer. The code default outside local is require.
+      IDENTITY_VERIFY: "${TENANT_REGISTRY_IDENTITY_VERIFY:-warn}"
+      IDENTITY_JWKS_URL: "http://identity-context-svc:8080/.well-known/jwks.json"
+      IDENTITY_INTROSPECT_URL: "http://identity-context-svc:8080/v1/context/session/introspect"
+      IDENTITY_ISSUER: "identity-context-svc"
       PORT: "8081"
       DB_HOST: postgres
       DB_PORT: "5432"
@@ -746,7 +882,30 @@ services:
       # granting TENANT_PROVISION must target this same ID.
       AUTHZ_PLATFORM_SCOPE_ID: "00000000-0000-0000-0000-00000000f001"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
+      # Mutual-TLS listener on :8449 for gateway-auth-svc (SEC-INV-05, S5-B1).
+      # Same router as :8081; the certificate comes from mtls-management-svc
+      # through the bootstrap path and is renewed at two thirds of its life.
+      # Provisioning retries in the background: mtls-management-svc being down
+      # never stops the plaintext listener. Only the listed client CNs are
+      # admitted, and X-Workload-Id is set to the verified one.
+      MTLS_ENABLED: "true"
+      MTLS_PORT: "8449"
+      MTLS_MANAGEMENT_SERVICE_URL: "http://mtls-management-svc:8140"
+      MTLS_BOOTSTRAP_TOKEN_PATH: "/bootstrap/token"
+      MTLS_ALLOWED_CLIENTS: "gateway-auth-svc,authorization-svc"
+    volumes:
+      # Only this service's own bootstrap token (register M-01): the
+      # sub-directory tenant-entity-registry-svc/ of the keygen volume, so /bootstrap/token
+      # here is a token mtls-management-svc binds to tenant-entity-registry-svc alone.
+      - type: volume
+        source: mtls_bootstrap_token
+        target: /bootstrap
+        read_only: true
+        volume:
+          subpath: tenant-entity-registry-svc
     depends_on:
+      mtls-bootstrap-keygen:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       kafka:
@@ -764,8 +923,10 @@ services:
   # ── 3. jurisdiction-rules-svc (Port: 8082) ──────────────────────────────────
   jurisdiction-svc:
     build:
-      context: ../services/jurisdiction-rules-svc
-      dockerfile: Dockerfile
+      # Root context: go.mod replaces zoiko.io/identity-envelope with the
+      # sibling module, so the build must see both (see the Dockerfile).
+      context: ..
+      dockerfile: services/jurisdiction-rules-svc/Dockerfile
     container_name: jurisdiction-rules-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -791,6 +952,22 @@ services:
       # platform-scope entity. Role assignments granting JURISDICTION_* /
       # JURISDICTION_RULE_* actions must use this same id.
       AUTHZ_PLATFORM_SCOPE_ID: "00000000-0000-0000-0000-00000000f001"
+      # Rule activation confirms its X-Approval-Reference with workflow-svc
+      # (an APPROVED workflow bound to the rule, decided by someone other than
+      # its author; J-02).
+      WORKFLOW_SERVICE_URL: "http://workflow-svc:8090"
+      # Identity gate (J-01): a presented signed envelope is verified and its
+      # session checked. warn: the tax and payroll services that read rule packs
+      # (out of this domain) do not forward the envelope yet. The code default
+      # outside local is require.
+      IDENTITY_VERIFY: "${JURISDICTION_IDENTITY_VERIFY:-warn}"
+      IDENTITY_JWKS_URL: "http://identity-context-svc:8080/.well-known/jwks.json"
+      IDENTITY_INTROSPECT_URL: "http://identity-context-svc:8080/v1/context/session/introspect"
+      IDENTITY_ISSUER: "identity-context-svc"
+      # ZS-JUR rule resolver on (decision J-07, 21 Oct 2026): governed actions'
+      # rule basis is recorded as rule_decision_evidence. Locally it serves every
+      # RELEASED pack; production and staging must name RESOLVER_RING / _REGION.
+      RESOLVER_ENABLED: "${RESOLVER_ENABLED:-true}"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_GROUP_ID: "jurisdiction-rules-svc"
       KAFKA_EVENTS_TOPIC: "zoiko.jurisdiction.events"
@@ -839,14 +1016,23 @@ services:
       # provenance class S ("client may request context but cannot override
       # result"). A header the gateway sets and this list omits is dropped
       # silently, so any addition in handler.Verify belongs here too.
-      - "traefik.http.middlewares.gateway-auth.forwardauth.authResponseHeaders=X-Principal-Id,X-Tenant-Id,X-Legal-Entity-Id,X-Correlation-Id,X-Jurisdiction-Context,X-Timezone,X-Residency-Policy-Id,X-Tenant-Context-Stale"
+      # X-Workload-Id, X-Authn-Age-Seconds, X-Audience, X-Token-Audience,
+      # X-Initiating-Subject-Id and X-On-Behalf-Of are listed but never set by
+      # the gateway: listing them is how they are stripped, since no client can
+      # assert a workload identity, a login age, a token audience or an
+      # initiating subject. X-Support-Context-Id, X-Assurance-Level and
+      # X-Source-Channel(-Basis) are set from the signed envelope (13 Oct, S1-B1).
+      # Must match gatewayAuthResponseHeaders in gtrm/compiler/emit.go.
+      - "traefik.http.middlewares.gateway-auth.forwardauth.authResponseHeaders=X-Principal-Id,X-Tenant-Id,X-Legal-Entity-Id,X-Correlation-Id,X-Jurisdiction-Context,X-Timezone,X-Residency-Policy-Id,X-Tenant-Context-Stale,X-Workload-Id,X-Support-Context-Id,X-Source-Channel,X-Source-Channel-Basis,X-Assurance-Level,X-Authn-Age-Seconds,X-Audience,X-Token-Audience,X-Initiating-Subject-Id,X-On-Behalf-Of"
       - "traefik.http.routers.jurisdiction.middlewares=gateway-auth,jurisdiction-strip"
 
   # ── 4. governance-decision-log-svc (Port: 8083) ──────────────────────────────
   governance-svc:
     build:
-      context: ../services/governance-decision-log-svc
-      dockerfile: Dockerfile
+      # Root context: go.mod replaces zoiko.io/identity-envelope with the
+      # sibling module, so the build must see both (see the Dockerfile).
+      context: ..
+      dockerfile: services/governance-decision-log-svc/Dockerfile
     container_name: governance-decision-log-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -871,6 +1057,21 @@ services:
       # policy version a past decision used (doc7 backlog item 34) — never
       # for authorization.
       POLICY_SERVICE_URL: "http://policy-svc:8085"
+      # Reads are authorized on GOVERNANCE_DECISION_READ. warn logs a refusal
+      # instead of making it, because contract-lifecycle-svc (contract
+      # activation) and decision-support-svc still read with no X-Principal-Id.
+      # Set to enforce (the code default) once both forward the caller.
+      DECISION_LOG_READ_AUTHZ: "warn"
+      # Identity gate (A1 / D-05): a presented signed envelope is verified and
+      # its session checked; its claims replace X-Principal-Id / X-Tenant-Id.
+      # warn here because the out-of-domain readers above, and every ledger
+      # writer's async relay (no person behind it; a peer over mTLS in
+      # production), present no envelope yet. The code default outside local is
+      # require.
+      IDENTITY_VERIFY: "${DECISION_LOG_IDENTITY_VERIFY:-warn}"
+      IDENTITY_JWKS_URL: "http://identity-context-svc:8080/.well-known/jwks.json"
+      IDENTITY_INTROSPECT_URL: "http://identity-context-svc:8080/v1/context/session/introspect"
+      IDENTITY_ISSUER: "identity-context-svc"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_GROUP_ID: "governance-decision-log-svc"
       KAFKA_EVENTS_TOPIC: "zoiko.governance.events"
@@ -909,7 +1110,13 @@ services:
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_GROUP_ID: "audit-event-store-svc"
-      KAFKA_TOPICS: "zoiko.identity.events,zoiko.entity.events,zoiko.workflow.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      # AUD-01 requires this service to ingest every platform domain event, not
+      # just identity/entity/workflow — handleGenericDomainEvent (consumer.go)
+      # already stores any canonical-envelope event generically; this list was
+      # the missing half: without a Reader subscribed to a topic, no event on
+      # it is ever received regardless of how generic the handler is.
+      KAFKA_TOPICS: "zoiko.access-control.events,zoiko.accounts-payable.events,zoiko.accounts-receivable.events,zoiko.ai-governance.events,zoiko.asset.events,zoiko.authorization.events,zoiko.bank-reconciliation.events,zoiko.benefits.events,zoiko.board-resolutions.events,zoiko.capability-registry.events,zoiko.clause.events,zoiko.close.events,zoiko.comments-collaboration.events,zoiko.commercial-account.events,zoiko.compensation.events,zoiko.compliance.events,zoiko.configuration.events,zoiko.consolidation.events,zoiko.contract.events,zoiko.corporate-actions.events,zoiko.corporate-tax.events,zoiko.counterparty.events,zoiko.decision-support.events,zoiko.delegated-authority.events,zoiko.employee.events,zoiko.entity.events,zoiko.evidence-requirements.events,zoiko.evidence.events,zoiko.expense-claim.events,zoiko.financial-control.events,zoiko.general-ledger.events,zoiko.goods-service-receipt.events,zoiko.governance.events,zoiko.identity.events,zoiko.intercompany.events,zoiko.inventory.events,zoiko.invoice-approval.events,zoiko.jurisdiction.events,zoiko.kill-switch-registry.events,zoiko.leaveabsence.events,zoiko.metric-registry.events,zoiko.notification.events,zoiko.obligation-tracking.events,zoiko.obligations.events,zoiko.offboarding.events,zoiko.orgstructure.events,zoiko.payable-open-item.events,zoiko.payee-banking-identity.events,zoiko.payment-authorization.events,zoiko.payment-initiation.events,zoiko.payment-proposal.events,zoiko.payment-run.events,zoiko.payment-status.events,zoiko.payroll.events,zoiko.payrollexceptions.events,zoiko.payrolltax.events,zoiko.performance-review.events,zoiko.policy.events,zoiko.privacy-consent.events,zoiko.privacy-decision.events,zoiko.privacy-purpose-registry.events,zoiko.privacy-rights.events,zoiko.privacy-transfer.events,zoiko.procurement-workflow.events,zoiko.project.events,zoiko.purchase-order.events,zoiko.purchase-request.events,zoiko.retention-registry.events,zoiko.secretvault.events,zoiko.source-authority.events,zoiko.spend-controls.events,zoiko.supplier-financial-profile.events,zoiko.supplier-recovery.events,zoiko.tax-determination.events,zoiko.tax-rules.events,zoiko.treasury.events,zoiko.vat-gst.events,zoiko.vendor-due-diligence.events,zoiko.workflow.events"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
     depends_on:
       postgres:
@@ -927,8 +1134,10 @@ services:
   # ── 6. policy-svc (Port: 8085) ────────────────────────────────────────────────
   policy-svc:
     build:
-      context: ../services/policy-svc
-      dockerfile: Dockerfile
+      # Root context: go.mod replaces zoiko.io/identity-envelope with the
+      # sibling module, so the build must see both (see the Dockerfile).
+      context: ..
+      dockerfile: services/policy-svc/Dockerfile
     container_name: policy-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -943,6 +1152,11 @@ services:
       DB_PASSWORD: "${DB_PASSWORD:-postgres}"
       DB_SSLMODE: disable
       GOVERNANCE_DECISION_LOG_SERVICE_URL: "http://governance-svc:8083"
+      # The principal policy-svc writes evaluation evidence to the governance
+      # ledger as (decision D-02). It needs GOVERNANCE_DECISION_RECORD; until
+      # it has it, evaluations still succeed and their evidence waits, durable,
+      # in policy_evidence_outbox.
+      POLICY_LEDGER_PRINCIPAL_ID: "${POLICY_LEDGER_PRINCIPAL_ID:-svc-policy}"
       # Authorization gate. policy-svc had none: anyone able to reach the
       # port could define a policy, publish a version and activate it.
       # Role assignments granting POLICY_CREATE / POLICY_VERSION_CREATE /
@@ -950,6 +1164,27 @@ services:
       # legal_entity_id for policies that are not entity-scoped.
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       AUTHZ_PLATFORM_SCOPE_ID: "00000000-0000-0000-0000-00000000f001"
+      # POLICY_EVALUATE and POLICY_READ gates. Enforced: access-control-svc
+      # registers both actions (its 000019), seed-demo-rbac.ps1 grants them,
+      # and every caller forwards X-Principal-Id (expense-claim-svc and
+      # payment-authorization-svc since 14 Oct; governance-decision-log-svc's
+      # replay through its envelope).
+      POLICY_EVALUATE_AUTHZ: "${POLICY_EVALUATE_AUTHZ:-enforce}"
+      POLICY_READ_AUTHZ: "${POLICY_READ_AUTHZ:-enforce}"
+      # Identity headers (X5), through the shared identity-envelope gate:
+      # identity-context-svc's signed envelope (verified against its JWKS, its
+      # session checked at introspection, AU-01) replaces X-Tenant-Id /
+      # X-Principal-Id, or a peer certificate on the :8449 mTLS listener vouches
+      # for them. governance-decision-log-svc's replay forwards the envelope
+      # since 21 Oct; warn remains for the out-of-domain evaluate callers
+      # (expense-claim-svc, payment-authorization-svc), which forward the
+      # principal but not the envelope. The code default is enforce.
+      POLICY_IDENTITY_VERIFY: "${POLICY_IDENTITY_VERIFY:-warn}"
+      IDENTITY_JWKS_URL: "http://identity-svc:8080/.well-known/jwks.json"
+      IDENTITY_INTROSPECT_URL: "http://identity-svc:8080/v1/context/session/introspect"
+      EXPECTED_ISSUER: "identity-context-svc"
+      EXPECTED_AUDIENCE: "zoiko-internal"
+      EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_GROUP_ID: "policy-svc"
@@ -975,14 +1210,23 @@ services:
   # docs/architecture/observability-baseline-plan.md).
   configuration-feature-flag-svc:
     build:
-      context: ../services/configuration-feature-flag-svc
-      dockerfile: Dockerfile
+      # Root context: go.mod replaces zoiko.io/identity-envelope with the
+      # sibling module, so the build must see both (see the Dockerfile).
+      context: ..
+      dockerfile: services/configuration-feature-flag-svc/Dockerfile
     container_name: configuration-feature-flag-svc
     mem_limit: 256m
     cpus: "0.5"
     ports:
       - "8086:8086"
     environment:
+      # Identity gate (X-R3): a presented signed envelope is verified and its
+      # session checked; its claims replace X-Principal-Id / X-Tenant-Id.
+      # warn here: callers outside Groups 1-2 read flags without the envelope. The code default outside local is require.
+      IDENTITY_VERIFY: "${CONFIG_IDENTITY_VERIFY:-warn}"
+      IDENTITY_JWKS_URL: "http://identity-context-svc:8080/.well-known/jwks.json"
+      IDENTITY_INTROSPECT_URL: "http://identity-context-svc:8080/v1/context/session/introspect"
+      IDENTITY_ISSUER: "identity-context-svc"
       PORT: "8086"
       DB_HOST: postgres
       DB_PORT: "5432"
@@ -1024,14 +1268,23 @@ services:
   # identity-svc's envelope signing key — never used in staging/production.
   secret-vault-integration-svc:
     build:
-      context: ../services/secret-vault-integration-svc
-      dockerfile: Dockerfile
+      # Root context: go.mod replaces zoiko.io/identity-envelope with the
+      # sibling module, so the build must see both (see the Dockerfile).
+      context: ..
+      dockerfile: services/secret-vault-integration-svc/Dockerfile
     container_name: secret-vault-integration-svc
     mem_limit: 256m
     cpus: "0.5"
     ports:
       - "8087:8087"
     environment:
+      # Identity gate (X-R3): a presented signed envelope is verified and its
+      # session checked; its claims replace X-Principal-Id / X-Tenant-Id.
+      # warn here: service callers present client certificates (peers), the console no envelope yet. The code default outside local is require.
+      IDENTITY_VERIFY: "${SECRET_VAULT_IDENTITY_VERIFY:-warn}"
+      IDENTITY_JWKS_URL: "http://identity-context-svc:8080/.well-known/jwks.json"
+      IDENTITY_INTROSPECT_URL: "http://identity-context-svc:8080/v1/context/session/introspect"
+      IDENTITY_ISSUER: "identity-context-svc"
       PORT: "8087"
       DB_HOST: postgres
       DB_PORT: "5432"
@@ -1071,13 +1324,18 @@ services:
   # same pre-existing gap as the two services above.
   obligations-svc:
     build:
-      context: ../services/obligations-svc
-      dockerfile: Dockerfile
+      # Root context: go.mod replaces zoiko.io/identity-envelope with the
+      # sibling module, and the image is built from source (it used to copy
+      # prebuilt binaries that a clean checkout does not have).
+      context: ..
+      dockerfile: services/obligations-svc/Dockerfile
     container_name: obligations-svc
     mem_limit: 256m
     cpus: "0.5"
     ports:
-      - "8088:8088"
+      # Loopback only: in warn mode a request without an identity envelope is
+      # still admitted on its headers, so the port must not answer the LAN.
+      - "127.0.0.1:8088:8088"
     environment:
       PORT: "8088"
       DB_HOST: postgres
@@ -1095,12 +1353,27 @@ services:
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_GROUP_ID: "obligations-svc"
       KAFKA_EVENTS_TOPIC: "zoiko.obligations.events"
+      # Every legal entity a write names must exist in the caller's tenant.
+      TENANT_REGISTRY_URL: "http://tenant-entity-registry-svc:8081"
+      # Identity gate (X5 / X-R3): the signed envelope is verified when sent
+      # and a refused envelope is 401 in every mode; warn admits a request
+      # that carries none until every caller forwards it. Code default
+      # outside local: require.
+      IDENTITY_VERIFY: "${OBLIGATIONS_IDENTITY_VERIFY:-warn}"
+      IDENTITY_JWKS_URL: "http://identity-context-svc:8080/.well-known/jwks.json"
+      IDENTITY_INTROSPECT_URL: "http://identity-context-svc:8080/v1/context/session/introspect"
+      IDENTITY_ISSUER: "identity-context-svc"
     depends_on:
       postgres:
         condition: service_healthy
       kafka:
         condition: service_healthy
       authorization-svc:
+        condition: service_healthy
+      # Creates fail closed (503) until both answer.
+      jurisdiction-svc:
+        condition: service_healthy
+      tenant-svc:
         condition: service_healthy
     healthcheck:
       # readyz, not healthz: liveness answers 200 whenever the process is up, so a
@@ -1115,14 +1388,19 @@ services:
   # ── 10. authorization-svc (Port: 8089) ──────────────────────────────────────
   authorization-svc:
     build:
-      context: ../services/authorization-svc
-      dockerfile: Dockerfile
+      # Root context: go.mod replaces zoiko.io/identity-envelope with the
+      # sibling module, so the build must see both (see the Dockerfile).
+      context: ..
+      dockerfile: services/authorization-svc/Dockerfile
     container_name: authorization-svc
     mem_limit: 256m
     cpus: "0.5"
     ports:
-      - "8089:8089"
-      - "8449:8449" # mTLS pilot listener — see MTLS_ENABLED below
+      # Loopback only: the plaintext port trusts X-Principal-Id / X-Tenant-Id
+      # as sent (audit register A-01), so it must not answer the LAN.
+      # Containers still reach it as authorization-svc:8089.
+      - "127.0.0.1:8089:8089"
+      - "8449:8449" # mTLS listener — see MTLS_ENABLED below
     environment:
       PORT: "8089"
       DB_HOST: postgres
@@ -1208,6 +1486,19 @@ services:
       # through ANOTHER replica can still authorize. 0 disables caching
       # entirely. See internal/cache's package comment before raising it.
       AUTHZ_CACHE_TTL_SECONDS: "5"
+      # Governance Control Plane §16 / ZS-IAM-001 §11 on admin commands:
+      # purpose / reason_code on privileged and destructive commands, a finite
+      # end date on a delegation. "warn" admits a command without them, marks
+      # it X-Command-Contract: violated and bounds an open delegation to 90
+      # days; "enforce" refuses. Enforced since 12 Oct 2026: access-control-svc
+      # sends reason_code on every command, and the admin console asks for a
+      # reason, one sentence and (delegations) an end date before it calls.
+      AUTHZ_COMMAND_CONTRACT: "enforce"
+      # Tenant of an entity /v1/authorize has no projection for (created before
+      # entity.created was consumed): checked with the registry, never taken
+      # on the caller's word or evaluated across tenants. No depends_on on
+      # purpose — the registry being down refuses only those entities (503).
+      AUTHZ_ENTITY_REGISTRY_URL: "http://tenant-entity-registry-svc:8081"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
       # siem-integration-svc lives in docker-compose.phase6.yml — reachable
       # only when that file is up alongside this one. Streaming degrades to
@@ -1223,8 +1514,59 @@ services:
       MTLS_PORT: "8449"
       MTLS_MANAGEMENT_SERVICE_URL: "http://mtls-management-svc:8140"
       MTLS_BOOTSTRAP_TOKEN_PATH: "/bootstrap/token"
+      # Evaluation routes (/v1/authorize, /internal/*, the SoD / entity-scope /
+      # delegated-access evaluators) are gated by client certificate — see
+      # internal/workload. "permit" is the local default: callers not yet on
+      # mTLS keep the plaintext port, and a caller that DOES present a cert is
+      # still checked against AUTHZ_PEP_ALLOWLIST when one is set. Outside
+      # ENV=local the default is "require", which also needs the allow-list.
+      AUTHZ_EVALUATION_MTLS: "permit"
+      AUTHZ_PEP_ALLOWLIST: ""
+      # Step-up on reopen-class actions (Governance audit N-07). The code
+      # default "step_up" treats a decision request with no stated
+      # authentication age as NOT recent. No PEP forwards X-Authn-Age-Seconds
+      # yet (gateway-auth-svc asserts no age, register A-03), so "step_up"
+      # would answer STEP_UP to financial-close-svc's PERIOD_REOPEN_APPROVE.
+      # "permit" keeps the old reading here until PEPs forward the age.
+      AUTHZ_STEP_UP_UNKNOWN_AGE: "permit"
+      # Who is calling the admin, session and console routes (register A-01):
+      # the identity envelope in Authorization, verified against
+      # identity-context-svc's JWKS, or a registered delegate's client
+      # certificate. "warn" locally (admitted on X-Principal-Id, logged and
+      # marked X-Identity-Assertion: missing) so a console that does not yet
+      # forward the envelope keeps working; outside ENV=local the default is
+      # "require". A PRESENTED envelope that fails is refused in every mode.
+      # Plaintext JWKS here because docker-compose.override.yml turns this
+      # service's mTLS off; production points at
+      # https://identity-context-svc:8449/.well-known/jwks.json, which
+      # allow-lists authorization-svc and is fetched with its own certificate.
+      AUTHZ_IDENTITY_ASSERTION: "warn"
+      AUTHZ_IDENTITY_JWKS_URL: "http://identity-svc:8080/.well-known/jwks.json"
+      # AU-01: every verified envelope's session is checked here (live answers
+      # reused for 5 s), so a logout stops the admin routes at once instead of
+      # when the envelope expires. Fails closed when identity-context cannot
+      # answer.
+      AUTHZ_IDENTITY_INTROSPECT_URL: "http://identity-svc:8080/v1/context/session/introspect"
+      AUTHZ_ADMIN_DELEGATES: "access-control-svc"
+      # Issuing or approving a JIT or break-glass session needs a TOTP step-up
+      # no older than this (register A-03, ZS-IAM-001 §13/§14). Enforced here
+      # too: there is deliberately no local opt-out in this file.
+      AUTHZ_SESSION_STEP_UP_MAX_AGE_SECONDS: "900"
+      # Session maximums (register B-01), refused rather than shortened.
+      # Chosen 14 Oct 2026; "numeric limits require Security approval".
+      AUTHZ_MAX_JIT_SECONDS: "28800"
+      AUTHZ_MAX_BREAK_GLASS_SECONDS: "7200"
+      AUTHZ_MAX_SUPPORT_SECONDS: "14400"
     volumes:
-      - mtls_bootstrap_token:/bootstrap:ro
+      # Only this service's own bootstrap token (register M-01): the
+      # sub-directory authorization-svc/ of the keygen volume, so /bootstrap/token
+      # here is a token mtls-management-svc binds to authorization-svc alone.
+      - type: volume
+        source: mtls_bootstrap_token
+        target: /bootstrap
+        read_only: true
+        volume:
+          subpath: authorization-svc
     depends_on:
       postgres:
         condition: service_healthy
@@ -1245,8 +1587,10 @@ services:
   # ── 11. workflow-svc (Port: 8090) ───────────────────────────────────────────
   workflow-svc:
     build:
-      context: ../services/workflow-svc
-      dockerfile: Dockerfile
+      # Root context: go.mod replaces zoiko.io/identity-envelope with the
+      # sibling module, so the build must see both (see the Dockerfile).
+      context: ..
+      dockerfile: services/workflow-svc/Dockerfile
     container_name: workflow-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -1264,6 +1608,30 @@ services:
       KAFKA_GROUP_ID: "workflow-svc"
       KAFKA_EVENTS_TOPIC: "zoiko.workflow.events"
       AUTHORIZATION_SERVICE_URL: "http://authorization-svc:8089"
+      DOCUMENT_VAULT_SERVICE_URL: "http://document-vault-svc:8094"
+      GOVERNANCE_DECISION_LOG_SERVICE_URL: "http://governance-decision-log-svc:8083"
+      # The writer to the governance ledger (workflow decision evidence): a
+      # service principal holding GOVERNANCE_DECISION_RECORD and nothing else
+      # (GOVERNANCE_LEDGER_WRITER in deployments/supabase/seed-rbac.sql).
+      # Without the grant every decision still commits, and its ledger record
+      # waits durably in the outbox.
+      WORKFLOW_LEDGER_PRINCIPAL_ID: "${WORKFLOW_LEDGER_PRINCIPAL_ID:-svc-workflow}"
+      # Reads need WORKFLOW_READ unless the caller is a participant (the
+      # WORKFLOW_APPROVER / WORKFLOW_ADMINISTRATOR templates, access-control 000021).
+      WORKFLOW_READ_AUTHZ: "${WORKFLOW_READ_AUTHZ:-enforce}"
+      # Approver re-check on authority changes (policy, delegation, denials).
+      KAFKA_CONSUMER_GROUP_ID: "workflow-svc-recheck"
+      # CreateWorkflow validates the legal entity against the registry
+      # (cross-domain fact) rather than trusting a caller-supplied UUID.
+      TENANT_ENTITY_REGISTRY_SERVICE_URL: "http://tenant-entity-registry-svc:8081"
+      # Identity gate (X5 / X-R3): verify a presented signed envelope against
+      # identity-context-svc and derive the trusted principal/tenant from it.
+      # Warn locally while the console does not forward the envelope on every
+      # workflow call; require in production.
+      IDENTITY_VERIFY: "${WORKFLOW_IDENTITY_VERIFY:-warn}"
+      IDENTITY_JWKS_URL: "http://identity-context-svc:8080/.well-known/jwks.json"
+      IDENTITY_INTROSPECT_URL: "http://identity-context-svc:8080/v1/context/session/introspect"
+      IDENTITY_ISSUER: "identity-context-svc"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
     depends_on:
       postgres:
@@ -1271,6 +1639,15 @@ services:
       kafka:
         condition: service_healthy
       authorization-svc:
+        condition: service_healthy
+      document-vault-svc:
+        condition: service_healthy
+      tenant-svc:
+        condition: service_healthy
+      # The compose service key is governance-svc (container
+      # governance-decision-log-svc); naming the container here made every
+      # docker compose command fail with "undefined service".
+      governance-svc:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/healthcheck", "http://localhost:8090/healthz"]
@@ -1370,6 +1747,14 @@ services:
       # This service had no authorization at all — every route was open,
       # including the one that returns the bytes of a RESTRICTED document.
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      # Without this, config.go's own default ("localhost:9092") resolves
+      # inside this container to its own loopback, where nothing listens —
+      # Kafka is a separate container reachable only as "kafka:9094". Every
+      # outbox publish attempt failed with "connection refused" until this
+      # was added; combined with a since-fixed code bug (the Writer and the
+      # Message both carrying a Topic), the transactional outbox had never
+      # actually delivered a single event to Kafka.
+      KAFKA_BROKERS: "kafka:9094"
     volumes:
       - document_vault_storage:/data/documents
     depends_on:
@@ -1400,12 +1785,14 @@ services:
   # error fails manifest generation entirely, never a silent partial manifest.
   # UPDATE: every requested WorkflowInstanceID now also pulls that instance's
   # real transition history from workflow-history-svc — closing the gap
-  # workflow-history-svc's own package doc named directly ("evidence-
+  # workflow-history-svc's earlier package doc named directly ("evidence-
   # manifest-svc currently... is NOT wired to this... endpoint"). Not a new
   # opt-in field: an instance's history is intrinsically part of its
-  # evidence. The cross-workflow query endpoint remains unwired — a
-  # separate, broader discovery surface this service has no request shape
-  # for yet.
+  # evidence. The cross-workflow query endpoint (GET /v1/workflows/history) is
+  # also wired: a request may supply workflow_history_from and
+  # workflow_history_to, and the aggregator then pulls every transition for
+  # the request's legal entity in that window
+  # (WorkflowHistoryClient.ListByEntityAndDateRange).
   evidence-manifest-svc:
     build:
       context: ../services/evidence-manifest-svc
@@ -1465,6 +1852,8 @@ services:
   # POST to /v1/search-sources, not a redeploy.
   search-indexer-svc:
     build:
+      # Root context is required: go.mod replaces zoiko.io/search-client with
+      # the sibling ../search-client module, so the build must see both.
       context: ..
       dockerfile: services/search-indexer-svc/Dockerfile
     container_name: search-indexer-svc
@@ -1474,6 +1863,14 @@ services:
       - "8096:8096"
     environment:
       ENV: "local"
+      # Identity gate (X-R3): a presented signed envelope is verified and its
+      # session checked; its claims replace X-Principal-Id / X-Tenant-Id.
+      # warn here: the console's search calls do not forward the envelope yet.
+      # The code default outside local is require.
+      IDENTITY_VERIFY: "${SEARCH_INDEXER_IDENTITY_VERIFY:-warn}"
+      IDENTITY_JWKS_URL: "http://identity-context-svc:8080/.well-known/jwks.json"
+      IDENTITY_INTROSPECT_URL: "http://identity-context-svc:8080/v1/context/session/introspect"
+      IDENTITY_ISSUER: "identity-context-svc"
       PORT: "8096"
       DB_HOST: "postgres"
       DB_PORT: "5432"
@@ -1507,6 +1904,16 @@ services:
       CHECKPOINT_INTERVAL: "60s"
       MAX_RESULT_WINDOW: "100"
       FACET_MIN_COUNT: "2"
+      # R2/R3 hydration (§7.1): one record COLLECTION per source type; the id
+      # is appended. Hydration forwards the caller's envelope and asks as the
+      # caller, so obligations-svc authorizes the person actually looking. Not
+      # a depends_on: an unreachable source suppresses R2 results with ESR-014,
+      # it does not stop search from starting.
+      SOURCE_SERVICE_URL_OBLIGATION: "http://obligations-svc:8088/v1/obligations"
+      # Semantic scopes (§10.1). Deliberately unset: the provider and model are
+      # OD-10, not yet decided. Until set, semantic contracts cannot build and
+      # POST /v1/search/semantic answers ESR-019.
+      # EMBEDDING_PROVIDER_URL: ""
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
     depends_on:
       postgres:
@@ -1559,6 +1966,8 @@ services:
         condition: service_healthy
       workflow-svc:
         condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "/healthcheck", "http://localhost:8097/healthz"]
       interval: 10s
@@ -1585,6 +1994,13 @@ services:
       - "8098:8098"
     environment:
       PORT: "8098"
+      # REF-05 cutover phase 2. off = today's behavior exactly. shadow = also ask
+      # accounting-period-svc by posting date and COMPARE (never changes the
+      # outcome). "enforce" is rejected at startup: that is phase 4 and needs
+      # separate sign-off. Leave off until periods are backfilled, or every
+      # comparison reports not_found.
+      PERIOD_GATE_MODE: "off"
+      ACCOUNTING_PERIOD_URL: "http://accounting-period-svc:8174"
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: general_ledger
@@ -1596,12 +2012,15 @@ services:
       # Required, no default (ZS-EVENT-001 §4 residencyregion).
       EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      EVIDENCE_REQUIREMENTS_URL: "http://evidence-requirements-svc:8130"
     depends_on:
       postgres:
         condition: service_healthy
       kafka:
         condition: service_healthy
       authorization-svc:
+        condition: service_healthy
+      evidence-requirements-svc:
         condition: service_healthy
     healthcheck:
       # readyz, not healthz: liveness answers 200 whenever the process is up, so a
@@ -1732,6 +2151,10 @@ services:
       KAFKA_EVENTS_TOPIC: "zoiko.purchase-order.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       PURCHASE_REQUEST_SERVICE_URL: "http://purchase-request-svc:8100"
+      SUPPLIER_PROFILE_SERVICE_URL: "http://supplier-financial-profile-svc:8156"
+      PROCUREMENT_WORKFLOW_SERVICE_URL: "http://procurement-workflow-svc:8134"
+      PO_HIGH_VALUE_THRESHOLD: "${PO_HIGH_VALUE_THRESHOLD:-0}"
+      PO_OVER_TOLERANCE_PERCENT: "${PO_OVER_TOLERANCE_PERCENT:-0}"
     depends_on:
       postgres:
         condition: service_healthy
@@ -1891,14 +2314,23 @@ services:
 
   notification-svc:
     build:
-      context: ../services/notification-svc
-      dockerfile: Dockerfile
+      # Root context: go.mod replaces zoiko.io/identity-envelope with the
+      # sibling module, so the build must see both (see the Dockerfile).
+      context: ..
+      dockerfile: services/notification-svc/Dockerfile
     container_name: notification-svc
     mem_limit: 256m
     cpus: "0.5"
     ports:
       - "8133:8133"
     environment:
+      # Identity gate (X-R3): a presented signed envelope is verified and its
+      # session checked; its claims replace X-Principal-Id / X-Tenant-Id.
+      # warn here: domain services outside Groups 1-2 send without the envelope. The code default outside local is require.
+      IDENTITY_VERIFY: "${NOTIFICATION_IDENTITY_VERIFY:-warn}"
+      IDENTITY_JWKS_URL: "http://identity-context-svc:8080/.well-known/jwks.json"
+      IDENTITY_INTROSPECT_URL: "http://identity-context-svc:8080/v1/context/session/introspect"
+      IDENTITY_ISSUER: "identity-context-svc"
       PORT: "8133"
       DB_HOST: postgres
       DB_PORT: "5432"
@@ -1969,6 +2401,32 @@ services:
       # replica is still working on and the recipient gets it twice. 0 is a
       # true off switch, not "sweep everything now".
       NOTIFICATION_STRANDED_AFTER: "${NOTIFICATION_STRANDED_AFTER:-15m}"
+
+      # Provider callbacks are authenticated (ZS-SVC-Y-001 INV-27). With no
+      # secret configured both routes refuse every request — fail closed —
+      # so the development stack sets its own; a real deployment sets these
+      # from the secret store, never from these defaults.
+      #   NCD plane:     POST /v1/provider-events/smtp-primary
+      #   legacy route:  POST /v1/notifications/webhooks/{provider}
+      NCD_CALLBACK_SECRET_SMTP_PRIMARY: "${NCD_CALLBACK_SECRET_SMTP_PRIMARY:-dev-ncd-callback-secret}"
+      # JSON: provider -> list of secrets (several, so one can be rotated);
+      # each at least 16 bytes. Signed as X-Zoiko-Signature: t=<unix>,v1=<hmac>.
+      NOTIFICATION_WEBHOOK_SECRETS: '${NOTIFICATION_WEBHOOK_SECRETS:-{"smtp":["dev-webhook-secret-0123456789"]}}'
+
+      # One-click unsubscribe (RFC 8058). The link's sealed token is the
+      # receiver's only credential; without a secret the service refuses to
+      # send marketing mail at all rather than send it without a working
+      # link. The base URL is where mail clients POST the unsubscribe — the
+      # gateway route in development. A real deployment sets both from the
+      # secret store and its public hostname.
+      NOTIFICATION_UNSUBSCRIBE_SECRET: "${NOTIFICATION_UNSUBSCRIBE_SECRET:-dev-unsubscribe-secret-0123456789abcdef}"
+      NOTIFICATION_PUBLIC_BASE_URL: "${NOTIFICATION_PUBLIC_BASE_URL:-http://localhost:8133}"
+
+      # DKIM signing and the NP-55 sender-authentication monitor. Unset here:
+      # mailpit needs no signature, and a monitor pointed at a domain with no
+      # published records would (correctly) hold all mail. Set
+      # NOTIFICATION_DKIM_DOMAIN, _SELECTOR and _PRIVATE_KEY together when this
+      # service, not the provider, signs.
     depends_on:
       postgres:
         condition: service_healthy
@@ -2096,14 +2554,23 @@ services:
   # delegated, at creation time.
   delegated-authority-svc:
     build:
-      context: ../services/delegated-authority-svc
-      dockerfile: Dockerfile
+      # Root context: go.mod replaces zoiko.io/identity-envelope with the
+      # sibling module, so the build must see both (see the Dockerfile).
+      context: ..
+      dockerfile: services/delegated-authority-svc/Dockerfile
     container_name: delegated-authority-svc
     mem_limit: 256m
     cpus: "0.5"
     ports:
       - "8136:8136"
     environment:
+      # Identity gate (X-R3): a presented signed envelope is verified and its
+      # session checked; its claims replace X-Principal-Id / X-Tenant-Id.
+      # warn here: the console does not forward the envelope on every call yet. The code default outside local is require.
+      IDENTITY_VERIFY: "${DELEGATED_AUTHORITY_IDENTITY_VERIFY:-warn}"
+      IDENTITY_JWKS_URL: "http://identity-context-svc:8080/.well-known/jwks.json"
+      IDENTITY_INTROSPECT_URL: "http://identity-context-svc:8080/v1/context/session/introspect"
+      IDENTITY_ISSUER: "identity-context-svc"
       PORT: "8136"
       DB_HOST: postgres
       DB_PORT: "5432"
@@ -2131,6 +2598,170 @@ services:
       start_period: 10s
     restart: on-failure
 
+  # Currency Registry Service (REF-02). Global reference data: ISO 4217
+  # currencies, versioned minor-unit metadata and the platform support
+  # lifecycle. Owns NO FX rates, functional-currency assignment or amounts.
+  # Reads (validate/get/list) do not call authorization-svc; commands do and
+  # fail closed. Port 8172 was the next unused service port at the time of
+  # writing (8171 was the highest registered).
+  currency-registry-svc:
+    build:
+      context: ../services/currency-registry-svc
+      dockerfile: Dockerfile
+    container_name: currency-registry-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8172:8172"
+    environment:
+      PORT: "8172"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: currency_registry
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
+      DB_SSLMODE: disable
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.currency-registry.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8172/readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # Fiscal Calendar Service (REF-04). Calendar definitions and versions as data;
+  # deterministic period preview. Owns NO period state (REF-05) and NO postings.
+  # Activating a non-first calendar version asks accounting-period-svc whether
+  # periods are already closed, and fails closed if it cannot be reached.
+  # Needs authz actions FISCAL_CALENDAR_PROPOSE / _APPROVE / _ACTIVATE seeded.
+  fiscal-calendar-svc:
+    build:
+      context: ../services/fiscal-calendar-svc
+      dockerfile: Dockerfile
+    container_name: fiscal-calendar-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8173:8173"
+    environment:
+      PORT: "8173"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: fiscal_calendar
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
+      DB_SSLMODE: disable
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.fiscal-calendar.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      ACCOUNTING_PERIOD_URL: "http://accounting-period-svc:8174"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8173/readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # Accounting Period Service (REF-05). Authoritative period state and the
+  # posting gate. A missing period is "not allowed", never OPEN. Close and
+  # reopen commands are refused until financial-close-svc serves
+  # /v1/close/workflow-refs/{ref} (not built yet) — fail closed by design.
+  # Needs authz actions PERIOD_STATE_COMMAND / PERIOD_MATERIALIZE seeded.
+  accounting-period-svc:
+    build:
+      context: ../services/accounting-period-svc
+      dockerfile: Dockerfile
+    container_name: accounting-period-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8174:8174"
+    environment:
+      PORT: "8174"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: accounting_period
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
+      DB_SSLMODE: disable
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.accounting-period.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      FISCAL_CALENDAR_URL: "http://fiscal-calendar-svc:8173"
+      FINANCIAL_CLOSE_URL: "http://financial-close-svc:8104"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8174/readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  financial-statements-svc:
+    build:
+      # services/, so the build can reach ../eventing — see the Dockerfile.
+      context: ../services
+      dockerfile: financial-statements-svc/Dockerfile
+    container_name: financial-statements-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8175:8175"
+    environment:
+      PORT: "8175"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: financial_statements
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
+      DB_SSLMODE: disable
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.financial-statements.events"
+      EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      FINANCIAL_CLOSE_URL: "http://financial-close-svc:8104"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+      financial-close-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8175/readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
   # Access Control Service — 03-microservices.md §9.4. Owns role/permission-
   # bundle DEFINITIONS (the catalogue); previously unbuilt. Scope decision:
   # authorization-svc keeps owning live RBAC role/assignment data — this
@@ -2140,14 +2771,23 @@ services:
   # internal/domain/types.go for the full rationale.
   access-control-svc:
     build:
-      context: ../services/access-control-svc
-      dockerfile: Dockerfile
+      # Root context: go.mod replaces zoiko.io/identity-envelope with the
+      # sibling module, so the build must see both (see the Dockerfile).
+      context: ..
+      dockerfile: services/access-control-svc/Dockerfile
     container_name: access-control-svc
     mem_limit: 256m
     cpus: "0.5"
     ports:
       - "8137:8137"
     environment:
+      # Identity gate (X-R3): a presented signed envelope is verified and its
+      # session checked; its claims replace X-Principal-Id / X-Tenant-Id.
+      # warn here: HR and other out-of-domain event sources call without the envelope. The code default outside local is require.
+      IDENTITY_VERIFY: "${ACCESS_CONTROL_IDENTITY_VERIFY:-warn}"
+      IDENTITY_JWKS_URL: "http://identity-context-svc:8080/.well-known/jwks.json"
+      IDENTITY_INTROSPECT_URL: "http://identity-context-svc:8080/v1/context/session/introspect"
+      IDENTITY_ISSUER: "identity-context-svc"
       PORT: "8137"
       DB_HOST: postgres
       DB_PORT: "5432"
@@ -2158,6 +2798,14 @@ services:
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.access-control.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      # This service's identity in authorization-svc: it executes the REVOKE an
+      # access reviewer decides, holding only iam.assignment.revoke (seeded by
+      # seed-demo-rbac.ps1). The reviewer is recorded as the decider.
+      ACS_SERVICE_PRINCIPAL_ID: "svc-access-control"
+      # S9-C2: HR lifecycle events (employee-master, offboarding) open an
+      # EVENT_TRIGGERED review of the linked subject, reviewed by their manager
+      # when linked, else by this principal. Unset turns the consumer off.
+      ACS_EVENT_REVIEW_DEFAULT_REVIEWER: "5eed0000-0000-4000-8000-00000000a001"
     depends_on:
       postgres:
         condition: service_healthy
@@ -2241,15 +2889,21 @@ services:
       PORT: "8140"
       CA_DATA_DIR: "/data/ca"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      # Authorization decisions over mTLS, presenting a client certificate
+      # this service issues itself (it is the CA, so it needs no bootstrap
+      # token). authorization-svc's evaluation gate requires a verified
+      # workload certificate outside ENV=local; AUTHZ_SERVICE_URL is the
+      # plaintext fallback used only when this is unset.
+      AUTHZ_MTLS_URL: "https://authorization-svc:8449"
       # Enables the self-provisioning bootstrap path on ProvisionCert — see
-      # master-register-findings-2026-08-27.md §3.28. Empty/unset leaves
-      # that path disabled, requiring every caller to present a real
-      # principal (which mtls-bootstrap-keygen's own consumers cannot, at
-      # their own startup — this is what makes the pilot actually usable).
-      MTLS_BOOTSTRAP_TOKEN_PATH: "/bootstrap/token"
+      # master-register-findings-2026-08-27.md §3.28. One sub-directory per
+      # service, each holding that service's own token (register M-01); the
+      # old shared MTLS_BOOTSTRAP_TOKEN_PATH is refused at startup.
+      MTLS_BOOTSTRAP_TOKENS_DIR: "/bootstrap-tokens"
     volumes:
+      # Also holds revocations.json — the CRL's ledger lives with the CA key.
       - mtls_ca_data:/data/ca
-      - mtls_bootstrap_token:/bootstrap:ro
+      - mtls_bootstrap_token:/bootstrap-tokens:ro
     depends_on:
       mtls-bootstrap-keygen:
         condition: service_completed_successfully
@@ -2271,13 +2925,16 @@ services:
   # `jurisdiction-svc` (the service key) was required.
   evidence-requirements-svc:
     build:
-      context: ../services/evidence-requirements-svc
-      dockerfile: Dockerfile
+      # Root context: go.mod replaces zoiko.io/identity-envelope with the
+      # sibling module, so the build must see both.
+      context: ..
+      dockerfile: services/evidence-requirements-svc/Dockerfile
     container_name: evidence-requirements-svc
     mem_limit: 256m
     cpus: "0.5"
     ports:
-      - "8130:8130"
+      # Loopback only while the identity gate runs in warn mode.
+      - "127.0.0.1:8130:8130"
     environment:
       PORT: "8130"
       DB_HOST: postgres
@@ -2290,6 +2947,19 @@ services:
       KAFKA_EVENTS_TOPIC: "zoiko.evidence-requirements.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       DOCUMENT_VAULT_SERVICE_URL: "http://document-vault-svc:8094"
+      # The legal entity of every evaluation and requirement is confirmed here.
+      TENANT_REGISTRY_URL: "http://tenant-entity-registry-svc:8081"
+      # Evaluate is gated on EVIDENCE_EVALUATE (decided 21 Oct 2026). warn on the
+      # local stack until the callers outside the governance domains
+      # (board-resolutions, corporate-actions, filing-preparation) have their
+      # principals granted; the code default is enforce. Reads enforce.
+      EVIDENCE_EVALUATE_AUTHZ: "${EVIDENCE_EVALUATE_AUTHZ:-warn}"
+      EVIDENCE_READ_AUTHZ: "${EVIDENCE_READ_AUTHZ:-enforce}"
+      # Identity gate (X5 / X-R3); see obligations-svc for the semantics.
+      IDENTITY_VERIFY: "${EVIDENCE_IDENTITY_VERIFY:-warn}"
+      IDENTITY_JWKS_URL: "http://identity-context-svc:8080/.well-known/jwks.json"
+      IDENTITY_INTROSPECT_URL: "http://identity-context-svc:8080/v1/context/session/introspect"
+      IDENTITY_ISSUER: "identity-context-svc"
     depends_on:
       postgres:
         condition: service_healthy
@@ -2298,6 +2968,8 @@ services:
       authorization-svc:
         condition: service_healthy
       document-vault-svc:
+        condition: service_healthy
+      tenant-svc:
         condition: service_healthy
     healthcheck:
       # readyz, not healthz: liveness answers 200 whenever the process is up, so a
@@ -2415,8 +3087,9 @@ services:
 
   financial-close-svc:
     build:
-      context: ../services/financial-close-svc
-      dockerfile: Dockerfile
+      # services/, so the build can reach ../eventing — see the Dockerfile.
+      context: ../services
+      dockerfile: financial-close-svc/Dockerfile
     container_name: financial-close-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -2424,6 +3097,14 @@ services:
       - "8104:8104"
     environment:
       PORT: "8104"
+      # REF-05 cutover phase 1. The mirror is best-effort dual-write of lock and
+      # reopen into accounting-period-svc; financial-close-svc stays
+      # authoritative. off = no outbound calls, no workflow refs written. The
+      # provenance endpoint /v1/close/workflow-refs/{ref} is served either way.
+      PERIOD_SERVICE_MIRROR: "off"
+      ACCOUNTING_PERIOD_URL: "http://accounting-period-svc:8174"
+      WORKFLOW_REF_CALLERS: "accounting-period-svc"
+      PERIOD_MIRROR_REOPEN_WINDOW: "24h"
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: financial_close
@@ -2432,6 +3113,11 @@ services:
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.close.events"
+      # Required, no default (ZS-EVENT-001 §4 residencyregion) — was missing
+      # entirely, so every outbox event this service tried to enqueue failed
+      # envelope validation with 'residency region "" must be a controlled
+      # lower-case code'. Found via VerifySnapshotIntegrity's manual test.
+      EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       LEDGER_SERVICE_URL: "http://general-ledger-svc:8098"
       AP_SERVICE_URL: "http://accounts-payable-svc:8099"
@@ -2442,6 +3128,7 @@ services:
       # upload with "failed to record close evidence in vault", which reads as
       # the vault being broken rather than as never having been contacted.
       VAULT_SERVICE_URL: "http://document-vault-svc:8094"
+      EVIDENCE_REQUIREMENTS_URL: "http://evidence-requirements-svc:8130"
       # ACC-06's third subledger source (ASSETS), added to satisfy the
       # AST/INV/PRJ domain spec's own §9 "Assets → GL" reconciliation
       # assertion — no new reconciliation engine, just a new caller onto
@@ -2616,8 +3303,9 @@ services:
 
   intercompany-accounting-svc:
     build:
-      context: ../services/intercompany-accounting-svc
-      dockerfile: Dockerfile
+      # services/, so the build can reach ../eventing — see the Dockerfile.
+      context: ../services
+      dockerfile: intercompany-accounting-svc/Dockerfile
     container_name: intercompany-accounting-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -2633,6 +3321,7 @@ services:
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.intercompany.events"
+      EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       LEDGER_SERVICE_URL: "http://general-ledger-svc:8098"
       TENANT_REGISTRY_URL: "http://tenant-entity-registry-svc:8081"
@@ -2659,8 +3348,9 @@ services:
 
   consolidation-svc:
     build:
-      context: ../services/consolidation-svc
-      dockerfile: Dockerfile
+      # services/, so the build can reach ../eventing — see the Dockerfile.
+      context: ../services
+      dockerfile: consolidation-svc/Dockerfile
     container_name: consolidation-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -2676,6 +3366,8 @@ services:
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.consolidation.events"
+      # Required, no default (ZS-EVENT-001 §4 residencyregion).
+      EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       LEDGER_SERVICE_URL: "http://general-ledger-svc:8098"
       INTERCOMPANY_SERVICE_URL: "http://intercompany-accounting-svc:8105"
@@ -3643,12 +4335,15 @@ services:
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       TAX_RULES_SERVICE_URL: "http://tax-rules-svc:8125"
       JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8082"
+      EVIDENCE_REQUIREMENTS_URL: "http://evidence-requirements-svc:8130"
     depends_on:
       postgres:
         condition: service_healthy
       kafka:
         condition: service_healthy
       authorization-svc:
+        condition: service_healthy
+      evidence-requirements-svc:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/app/healthcheck"]
@@ -3676,12 +4371,15 @@ services:
       TAX_RULES_SERVICE_URL: "http://tax-rules-svc:8125"
       JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8082"
       GENERAL_LEDGER_URL: "http://general-ledger-svc:8091"
+      EVIDENCE_REQUIREMENTS_URL: "http://evidence-requirements-svc:8130"
     depends_on:
       postgres:
         condition: service_healthy
       kafka:
         condition: service_healthy
       authorization-svc:
+        condition: service_healthy
+      evidence-requirements-svc:
         condition: service_healthy
       tax-rules-svc:
         condition: service_healthy
@@ -3708,7 +4406,16 @@ services:
       - "8144:8144"
     environment:
       PORT: "8144"
-      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/commercial_account?sslmode=disable"
+      # zoiko_app, not the postgres superuser: commercial_account has no
+      # dedicated app_ role of its own (absent from create-app-roles.sh's
+      # SERVICES list), so it uses the shared least-privilege runtime role
+      # init-db.sh provisions for every database that doesn't claim one.
+      # zoiko_app is NOSUPERUSER NOBYPASSRLS, which is what makes this
+      # database's tenant RLS policies (migration 000005_add_rls.up.sql)
+      # actually apply instead of being silently inert to a superuser
+      # connection — same fix already applied to the 5 privacy-domain
+      # services.
+      DATABASE_URL: "postgres://${DB_USER:-zoiko_app}:${DB_PASSWORD:-zoiko_app_password}@postgres:5432/commercial_account?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.commercial-account.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -3743,7 +4450,19 @@ services:
       - "8145:8145"
     environment:
       PORT: "8145"
-      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/capability_registry?sslmode=disable"
+      # zoiko_app, not the postgres superuser. This database has no RLS
+      # policies (capabilities/market_releases/releases/etc. are a
+      # deliberate platform-wide registry with no tenant_id column — see
+      # the audit's own note on this), so there is no bypassed-RLS
+      # vulnerability here the way there was for the 5 privacy services
+      # and commercial-account-svc. This flip is purely the same
+      # least-privilege hardening those fixes used: capability_registry
+      # has no dedicated app_ role of its own, zoiko_app already has
+      # complete grants on all 7 tables here, and running as an ordinary,
+      # non-superuser role is still strictly safer defense-in-depth
+      # (limits blast radius of a SQL-injection or migration mistake)
+      # even with no RLS to activate.
+      DATABASE_URL: "postgres://${DB_USER:-zoiko_app}:${DB_PASSWORD:-zoiko_app_password}@postgres:5432/capability_registry?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.capability-registry.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -3767,7 +4486,8 @@ services:
   # keeping and gate-checking for AI runs, action-risk classification,
   # automation allowlists, provider/model registry, and maker-checker
   # self-approval blocking — never runs models or executes automations
-  # itself.
+  # itself. Keep the service private to the compose network; authenticated
+  # browser requests must pass through gateway-auth-svc.
   ai-governance-svc:
     build:
       context: ../services/ai-governance-svc
@@ -3779,7 +4499,16 @@ services:
       - "8146:8146"
     environment:
       PORT: "8146"
-      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/ai_governance?sslmode=disable"
+      # zoiko_app, not the postgres superuser: ai_governance has no
+      # dedicated app_ role of its own, and this database genuinely has
+      # active RLS policies (ai_runs, ai_use_cases, ai_executions,
+      # ai_incidents, ai_output_dispositions, automation_policies,
+      # automation_actions, ai_impact_assessments — confirmed live via
+      # pg_class) that a superuser connection silently bypasses — the
+      # same platform-wide issue already fixed for the 5 privacy services
+      # and commercial-account-svc. zoiko_app already has complete grants
+      # on all 13 tables here.
+      DATABASE_URL: "postgres://${DB_USER:-zoiko_app}:${DB_PASSWORD:-zoiko_app_password}@postgres:5432/ai_governance?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.ai-governance.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -3793,7 +4522,15 @@ services:
       MTLS_MANAGEMENT_SERVICE_URL: "http://mtls-management-svc:8140"
       MTLS_BOOTSTRAP_TOKEN_PATH: "/bootstrap/token"
     volumes:
-      - mtls_bootstrap_token:/bootstrap:ro
+      # Only this service's own bootstrap token (register M-01): the
+      # sub-directory ai-governance-svc/ of the keygen volume, so /bootstrap/token
+      # here is a token mtls-management-svc binds to ai-governance-svc alone.
+      - type: volume
+        source: mtls_bootstrap_token
+        target: /bootstrap
+        read_only: true
+        volume:
+          subpath: ai-governance-svc
     depends_on:
       postgres:
         condition: service_healthy
@@ -3833,7 +4570,18 @@ services:
       - "8147:8147"
     environment:
       PORT: "8147"
-      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/kill_switch_registry?sslmode=disable"
+      # Migration 000002_add_rls.up.sql FORCEs row-level security specifically
+      # because this is "the one service in the tier where a naive tenant
+      # policy is not an outage or a leak but a SILENT SAFETY BYPASS" (its own
+      # words). FORCE ROW LEVEL SECURITY does not apply to a true superuser —
+      # this was connecting as ${DB_USER:-postgres}, which defaulted to the
+      # postgres superuser (rolsuper=true, rolbypassrls=true) with nothing in
+      # this repo ever overriding it, so every carefully-designed RLS policy
+      # here was unconditionally bypassed. zoiko_app (NOSUPERUSER, NOBYPASSRLS)
+      # already holds the needed grants on kill_switch_events/outbox_events —
+      # same least-privilege role every other RLS-dependent service in this
+      # file uses.
+      DATABASE_URL: "postgres://zoiko_app:zoiko_app_password@postgres:5432/kill_switch_registry?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.kill-switch-registry.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -3868,7 +4616,18 @@ services:
       - "8148:8148"
     environment:
       PORT: "8148"
-      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/retention_registry?sslmode=disable"
+      # Migration 000002_add_rls.up.sql FORCEs row-level security specifically
+      # because, in its own words, this is a case where the naive policy
+      # failure "is IRREVERSIBLE" (a hidden legal hold or retention policy
+      # leads straight to spoliation, not just a leak). FORCE ROW LEVEL
+      # SECURITY does not bind a true superuser — this was connecting as
+      # ${DB_USER:-postgres}, which defaulted to the postgres superuser
+      # (rolsuper=true, rolbypassrls=true) with nothing in this repo ever
+      # overriding it, exactly the defect found and fixed for
+      # kill-switch-registry-svc in this same pass. zoiko_app (NOSUPERUSER,
+      # NOBYPASSRLS) already holds the needed grants on retention_policies,
+      # legal_holds, and outbox_events.
+      DATABASE_URL: "postgres://zoiko_app:zoiko_app_password@postgres:5432/retention_registry?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.retention-registry.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -3944,7 +4703,15 @@ services:
       - "8151:8151"
     environment:
       PORT: "8151"
-      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/privacy_purpose_registry?sslmode=disable"
+      # zoiko_app, not the postgres superuser: privacy_purpose_registry has no
+      # dedicated app_ role of its own (absent from create-app-roles.sh's
+      # SERVICES list), so it uses the shared least-privilege runtime role
+      # init-db.sh provisions for every database that doesn't claim one — see
+      # that script's "Runtime role: zoiko_app" section. zoiko_app is
+      # NOSUPERUSER NOBYPASSRLS, which is what makes this database's
+      # tenant_isolation_policy actually apply instead of being silently
+      # inert to a superuser connection.
+      DATABASE_URL: "postgres://${DB_USER:-zoiko_app}:${DB_PASSWORD:-zoiko_app_password}@postgres:5432/privacy_purpose_registry?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.privacy-purpose-registry.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -3982,7 +4749,9 @@ services:
       - "8152:8152"
     environment:
       PORT: "8152"
-      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/privacy_consent?sslmode=disable"
+      # zoiko_app, not the postgres superuser — see the same note on
+      # privacy-purpose-registry-svc above.
+      DATABASE_URL: "postgres://${DB_USER:-zoiko_app}:${DB_PASSWORD:-zoiko_app_password}@postgres:5432/privacy_consent?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.privacy-consent.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -4029,7 +4798,9 @@ services:
       - "8153:8153"
     environment:
       PORT: "8153"
-      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/privacy_decision?sslmode=disable"
+      # zoiko_app, not the postgres superuser — see the same note on
+      # privacy-purpose-registry-svc above.
+      DATABASE_URL: "postgres://${DB_USER:-zoiko_app}:${DB_PASSWORD:-zoiko_app_password}@postgres:5432/privacy_decision?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.privacy-decision.events"
       PURPOSE_REGISTRY_URL: "http://privacy-purpose-registry-svc:8151"
@@ -4083,7 +4854,9 @@ services:
       - "8154:8154"
     environment:
       PORT: "8154"
-      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/privacy_rights?sslmode=disable"
+      # zoiko_app, not the postgres superuser — see the same note on
+      # privacy-purpose-registry-svc above.
+      DATABASE_URL: "postgres://${DB_USER:-zoiko_app}:${DB_PASSWORD:-zoiko_app_password}@postgres:5432/privacy_rights?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.privacy-rights.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -4127,7 +4900,9 @@ services:
       - "8155:8155"
     environment:
       PORT: "8155"
-      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/privacy_transfer?sslmode=disable"
+      # zoiko_app, not the postgres superuser — see the same note on
+      # privacy-purpose-registry-svc above.
+      DATABASE_URL: "postgres://${DB_USER:-zoiko_app}:${DB_PASSWORD:-zoiko_app_password}@postgres:5432/privacy_transfer?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.privacy-transfer.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -4227,6 +5002,15 @@ services:
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       PURCHASE_ORDER_SERVICE_URL: "http://purchase-order-svc:8129"
       GENERAL_LEDGER_SERVICE_URL: "http://general-ledger-svc:8098"
+      # Service identities for the two background workers. Deliberately no
+      # default: while one is empty its worker stays off and the work waits
+      # PENDING (visible, nothing lost) rather than acting under an invented id.
+      #   ACCOUNTING_PRINCIPAL_ID  must hold GL_POSTING_EXECUTE (GRNI postings).
+      #   PO_PROGRESS_PRINCIPAL_ID must hold PO_PROGRESS_RECORD (received-quantity
+      #                            deltas to purchase-order-svc).
+      ACCOUNTING_PRINCIPAL_ID: "${GOODS_RECEIPT_ACCOUNTING_PRINCIPAL_ID:-}"
+      PO_PROGRESS_PRINCIPAL_ID: "${GOODS_RECEIPT_PO_PROGRESS_PRINCIPAL_ID:-}"
+      OVER_RECEIPT_TOLERANCE_PCT: "${OVER_RECEIPT_TOLERANCE_PCT:-0}"
     depends_on:
       postgres:
         condition: service_healthy
@@ -4281,6 +5065,9 @@ services:
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.payable-open-item.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      # BNK-07: a payment is applied to a payable only once Banking reports
+      # it SETTLED. Not a depends_on (AP-08 fails closed per call instead).
+      PAYMENT_STATUS_SERVICE_URL: "http://payment-status-svc:8163"
     depends_on:
       postgres:
         condition: service_healthy
@@ -4527,6 +5314,12 @@ services:
       SUPPLIER_PROFILE_SERVICE_URL: "http://supplier-financial-profile-svc:8156"
       PAYEE_IDENTITY_SERVICE_URL: "http://payee-banking-identity-svc:8166"
       POLICY_SERVICE_URL: "http://policy-svc:8085"
+      # AP-10 controls: how long an unused authorization stays valid, how often
+      # overdue ones are expired, and how many distinct signers a high-value
+      # payment needs.
+      AUTHORIZATION_TTL: "24h"
+      EXPIRY_SWEEP_INTERVAL: "1m"
+      HIGH_VALUE_REQUIRED_SIGNATURES: "2"
     depends_on:
       postgres:
         condition: service_healthy
@@ -4593,6 +5386,14 @@ services:
       PAYMENT_AUTHORIZATION_SERVICE_URL: "http://payment-authorization-svc:8160"
       PAYMENT_INITIATION_ADAPTER_URL: "http://payment-initiation-adapter-svc:8162"
       PAYMENT_STATUS_SERVICE_URL: "http://payment-status-svc:8163"
+      PAYMENT_PROPOSAL_SERVICE_URL: "http://payment-proposal-svc:8159"
+      PAYABLE_OPEN_ITEM_SERVICE_URL: "http://payable-open-item-svc:8164"
+      # ACC-04 settlement postings. The principal must hold GL_POSTING_EXECUTE in
+      # authorization-svc (an internal service identity, never a human role).
+      # Deliberately no default: while it is empty the dispatcher stays off and
+      # posting requests wait PENDING rather than posting under an invented id.
+      LEDGER_SERVICE_URL: "http://general-ledger-svc:8098"
+      ACCOUNTING_PRINCIPAL_ID: "${PAYMENT_RUN_ACCOUNTING_PRINCIPAL_ID:-}"
     depends_on:
       postgres:
         condition: service_healthy
@@ -4605,6 +5406,10 @@ services:
       payment-initiation-adapter-svc:
         condition: service_healthy
       payment-status-svc:
+        condition: service_healthy
+      payment-proposal-svc:
+        condition: service_healthy
+      payable-open-item-svc:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/app/healthcheck"]
@@ -4628,8 +5433,8 @@ services:
   # fields once prepared.
   payment-initiation-adapter-svc:
     build:
-      context: ../services/payment-initiation-adapter-svc
-      dockerfile: Dockerfile
+      context: ../services
+      dockerfile: payment-initiation-adapter-svc/Dockerfile
     container_name: payment-initiation-adapter-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -4672,8 +5477,8 @@ services:
   # replaced before any real provider is ever connected.
   payment-status-svc:
     build:
-      context: ../services/payment-status-svc
-      dockerfile: Dockerfile
+      context: ../services
+      dockerfile: payment-status-svc/Dockerfile
     container_name: payment-status-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -4716,7 +5521,16 @@ services:
       - "8149:8149"
     environment:
       PORT: "8149"
-      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/metric_registry?sslmode=disable"
+      # Least-privilege hardening, NOT an RLS-bypass fix: report_metric_definitions
+      # has no tenant_id and no RLS policy at all (this registry is platform-wide
+      # reference data, same posture as schema-registry-svc/capability-registry-svc),
+      # so there is no tenant-isolation policy for a superuser connection to defeat.
+      # Still changed from the postgres superuser default to the least-privilege
+      # zoiko_app role (already granted arwd on this service's own tables) —
+      # a compromised or buggy connection from this service has no business
+      # holding CREATEROLE/DROP-anything rights on a Postgres instance shared
+      # with every other service's data.
+      DATABASE_URL: "postgres://zoiko_app:zoiko_app_password@postgres:5432/metric_registry?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.metric-registry.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -4751,7 +5565,15 @@ services:
       - "8150:8150"
     environment:
       PORT: "8150"
-      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/source_authority?sslmode=disable"
+      # Genuine RLS-bypass fix, not least-privilege hardening alone:
+      # normalized_facts carries FORCE ROW LEVEL SECURITY (migration 000002),
+      # but the postgres superuser default unconditionally bypasses RLS
+      # regardless of FORCE (rolsuper/rolbypassrls), silently defeating the
+      # tenant_isolation_policy that migration correctly set up. Switched to
+      # the pre-provisioned, NOSUPERUSER/NOBYPASSRLS zoiko_app role, already
+      # holding the needed arwd grants on both source_authority_maps and
+      # normalized_facts.
+      DATABASE_URL: "postgres://zoiko_app:zoiko_app_password@postgres:5432/source_authority?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.source-authority.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"

@@ -13,8 +13,10 @@ import (
 
 	authzpkg "zoiko.io/kill-switch-registry-svc/internal/authz"
 	"zoiko.io/kill-switch-registry-svc/internal/domain"
+	svcenvelope "zoiko.io/kill-switch-registry-svc/internal/envelope"
 	"zoiko.io/kill-switch-registry-svc/internal/events"
 	svcmiddleware "zoiko.io/kill-switch-registry-svc/internal/middleware"
+	"zoiko.io/kill-switch-registry-svc/internal/outbox"
 	"zoiko.io/kill-switch-registry-svc/internal/store"
 )
 
@@ -75,6 +77,18 @@ func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (stri
 // of a silently reinterpreted answer about itself.
 func (h *Handler) resolveTenantScope(w http.ResponseWriter, r *http.Request, declared string) (*string, bool) {
 	verified := svcmiddleware.TenantFromContext(r.Context())
+	if declared != "" {
+		if _, err := uuid.Parse(declared); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid tenant_id: must be a valid UUID")
+			return nil, false
+		}
+	}
+	if verified != "" {
+		if _, err := uuid.Parse(verified); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid tenant_id: must be a valid UUID")
+			return nil, false
+		}
+	}
 	if declared != "" && declared != verified {
 		writeError(w, http.StatusForbidden,
 			"tenant_id does not match the verified X-Tenant-Id")
@@ -88,16 +102,59 @@ func (h *Handler) resolveTenantScope(w http.ResponseWriter, r *http.Request, dec
 // a role granted for that tenant specifically, same doctrine as every other
 // service's per-scope authorize helper (e.g. commercial-account-svc).
 func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID, tenantID, actionType string) bool {
+	return h.authorizePrincipal(w, r, principalID, tenantID, actionType, "not authorized to perform this action")
+}
+
+// authorizePrincipal checks actionType for a given principalID against tenantID's scope
+// (or platform scope if tenantID is empty) and emits a customized forbidden message if denied.
+func (h *Handler) authorizePrincipal(w http.ResponseWriter, r *http.Request, principalID, tenantID, actionType, deniedMsg string) bool {
 	scope := platformScopeID
 	if tenantID != "" {
 		scope = tenantID
 	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, scope, actionType); err != nil {
 		if errors.Is(err, authzpkg.ErrAuthorizationDenied) {
-			writeError(w, http.StatusForbidden, "not authorized to perform this action")
+			msg := "not authorized to perform this action"
+			if deniedMsg != "" {
+				msg = deniedMsg
+			}
+			writeError(w, http.StatusForbidden, msg)
 		} else {
 			writeError(w, http.StatusServiceUnavailable, "authorization service unavailable")
 		}
+		return false
+	}
+	return true
+}
+
+// checkBodyTenant validates a tenant_id supplied in an engage/disengage body
+// against the verified X-Tenant-Id, and writes the refusal itself.
+//
+// A body tenant_id is never a source of tenant identity — it may only AGREE
+// with the verified header. So it is refused when it is malformed (400), when
+// it disagrees with the verified tenant (403), and also when there is NO
+// verified tenant at all (403): there is nothing for it to agree with. The last
+// case used to slip through to authorization and then fail at the database's
+// row-level-security WITH CHECK as an opaque 500. RLS is unchanged and still
+// the backstop; this just makes the client error deterministic and ahead of it.
+//
+// An empty body tenant_id (a platform-wide switch) is always acceptable here;
+// whether the caller may act at platform scope is the authorization check's job.
+func (h *Handler) checkBodyTenant(w http.ResponseWriter, r *http.Request, bodyTenant string) bool {
+	if bodyTenant == "" {
+		return true
+	}
+	if _, err := uuid.Parse(bodyTenant); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid tenant_id: must be a valid UUID")
+		return false
+	}
+	verified := svcmiddleware.TenantFromContext(r.Context())
+	if verified == "" {
+		writeError(w, http.StatusForbidden, "tenant_id requires a matching verified X-Tenant-Id")
+		return false
+	}
+	if bodyTenant != verified {
+		writeError(w, http.StatusForbidden, "tenant_id does not match the verified X-Tenant-Id")
 		return false
 	}
 	return true
@@ -108,6 +165,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/engage", h.EngageKillSwitch)
 		r.Post("/disengage", h.DisengageKillSwitch)
 		r.Get("/resolve", h.ResolveKillSwitch)
+		r.Get("/check", h.ResolveKillSwitch)
 		r.Get("/", h.ListCurrentStates)
 		r.Get("/history", h.ListHistoryForScope)
 	})
@@ -144,8 +202,31 @@ func (h *Handler) EngageKillSwitch(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+
+	// Segregation of Duties (SoD) — Two-man rule: creator cannot self-approve.
+	if principalID == req.ApprovedByPrincipalID {
+		writeError(w, http.StatusForbidden, "self-approval forbidden: maker cannot be checker under segregation of duties")
+		return
+	}
+
+	if !h.checkBodyTenant(w, r, req.TenantID) {
+		return
+	}
+
 	if !h.authorize(w, r, principalID, req.TenantID, KillSwitchEngage) {
 		return
+	}
+	if !h.authorizePrincipal(w, r, req.ApprovedByPrincipalID, req.TenantID, KillSwitchEngage, "approver not authorized to approve kill switch engagement") {
+		return
+	}
+
+	correlationID := req.CorrelationID
+	if correlationID == "" {
+		if env, ok := svcenvelope.FromContext(r.Context()); ok && env.CorrelationID != "" {
+			correlationID = env.CorrelationID
+		} else if hdr := r.Header.Get("X-Correlation-ID"); hdr != "" {
+			correlationID = hdr
+		}
 	}
 
 	e := &domain.KillSwitchEvent{
@@ -161,22 +242,42 @@ func (h *Handler) EngageKillSwitch(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:                  time.Now().UTC(),
 		CreatedByPrincipalID:       principalID,
 	}
-	if err := h.store.AppendEvent(r.Context(), e); err != nil {
+
+	outboxEvt := outbox.Event{
+		AggregateType: "kill_switch",
+		AggregateID:   e.KillSwitchEventID,
+		EventType:     "kill_switch.engaged",
+		Payload: events.Event{
+			EventID:       "evt-" + uuid.New().String(),
+			EventType:     "kill_switch.engaged",
+			EventVersion:  "1.0",
+			SchemaVersion: "1.0",
+			SourceService: "kill-switch-registry-svc",
+			EntityID:      e.KillSwitchEventID,
+			TenantID:      req.TenantID,
+			ActorID:       principalID,
+			CorrelationID: correlationID,
+			OccurredAt:    e.CreatedAt,
+			Payload:       e,
+		},
+		CorrelationID: correlationID,
+		TenantID:      strPtrOrNil(req.TenantID),
+	}
+
+	if err := h.store.AppendEvent(r.Context(), e, outboxEvt); err != nil {
 		h.logger.Error("engage kill switch failed", zap.Error(err))
 		writeError(w, http.StatusInternalServerError, "failed to engage kill switch")
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "kill_switch.engaged", EntityID: e.KillSwitchEventID, TenantID: req.TenantID,
-		ActorID: principalID, CorrelationID: req.CorrelationID, Payload: e,
-	})
 	writeJSON(w, http.StatusCreated, e)
 }
 
 // DisengageKillSwitch handles POST /v1/kill-switches/disengage. Requires the
 // exact scope tuple currently be ENGAGED — disengaging an already-
-// disengaged (or never-engaged) tuple is rejected, not silently accepted.
+// disengaged (or never-engaged) tuple is rejected with 409, not silently
+// accepted. The check is made atomically with the insert (see
+// store.DisengageIfEngaged).
 func (h *Handler) DisengageKillSwitch(w http.ResponseWriter, r *http.Request) {
 	var req domain.DisengageKillSwitchRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -196,20 +297,33 @@ func (h *Handler) DisengageKillSwitch(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+
+	// Segregation of Duties (SoD) — Two-man rule: creator cannot self-approve.
+	if principalID == req.ApprovedByPrincipalID {
+		writeError(w, http.StatusForbidden, "self-approval forbidden: maker cannot be checker under segregation of duties")
+		return
+	}
+
+	if !h.checkBodyTenant(w, r, req.TenantID) {
+		return
+	}
+
 	if !h.authorize(w, r, principalID, req.TenantID, KillSwitchDisengage) {
+		return
+	}
+	if !h.authorizePrincipal(w, r, req.ApprovedByPrincipalID, req.TenantID, KillSwitchDisengage, "approver not authorized to approve kill switch disengagement") {
 		return
 	}
 
 	plane, domainName, providerCode, tenantID := strPtrOrNil(req.Plane), strPtrOrNil(req.Domain), strPtrOrNil(req.ProviderCode), strPtrOrNil(req.TenantID)
-	current, err := h.store.LatestEventForScope(r.Context(), plane, domainName, providerCode, tenantID)
-	if err != nil {
-		h.logger.Error("disengage kill switch: lookup failed", zap.Error(err))
-		writeError(w, http.StatusInternalServerError, "failed to look up current kill switch state")
-		return
-	}
-	if current == nil || current.Action != domain.KillSwitchActionEngage {
-		writeError(w, http.StatusConflict, domain.ErrNotCurrentlyEngaged.Error())
-		return
+
+	correlationID := req.CorrelationID
+	if correlationID == "" {
+		if env, ok := svcenvelope.FromContext(r.Context()); ok && env.CorrelationID != "" {
+			correlationID = env.CorrelationID
+		} else if hdr := r.Header.Get("X-Correlation-ID"); hdr != "" {
+			correlationID = hdr
+		}
 	}
 
 	e := &domain.KillSwitchEvent{
@@ -224,16 +338,41 @@ func (h *Handler) DisengageKillSwitch(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:             time.Now().UTC(),
 		CreatedByPrincipalID:  principalID,
 	}
-	if err := h.store.AppendEvent(r.Context(), e); err != nil {
+
+	outboxEvt := outbox.Event{
+		AggregateType: "kill_switch",
+		AggregateID:   e.KillSwitchEventID,
+		EventType:     "kill_switch.disengaged",
+		Payload: events.Event{
+			EventID:       "evt-" + uuid.New().String(),
+			EventType:     "kill_switch.disengaged",
+			EventVersion:  "1.0",
+			SchemaVersion: "1.0",
+			SourceService: "kill-switch-registry-svc",
+			EntityID:      e.KillSwitchEventID,
+			TenantID:      req.TenantID,
+			ActorID:       principalID,
+			CorrelationID: correlationID,
+			OccurredAt:    e.CreatedAt,
+			Payload:       e,
+		},
+		CorrelationID: correlationID,
+		TenantID:      strPtrOrNil(req.TenantID),
+	}
+
+	// The "currently ENGAGED" precondition and the DISENGAGE insert happen in one
+	// serialized transaction inside the store, so two concurrent disengages of
+	// the same scope cannot both succeed; the loser gets the 409 below.
+	if err := h.store.DisengageIfEngaged(r.Context(), e, outboxEvt); err != nil {
+		if errors.Is(err, domain.ErrNotCurrentlyEngaged) {
+			writeError(w, http.StatusConflict, domain.ErrNotCurrentlyEngaged.Error())
+			return
+		}
 		h.logger.Error("disengage kill switch failed", zap.Error(err))
 		writeError(w, http.StatusInternalServerError, "failed to disengage kill switch")
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "kill_switch.disengaged", EntityID: e.KillSwitchEventID, TenantID: req.TenantID,
-		ActorID: principalID, CorrelationID: req.CorrelationID, Payload: e,
-	})
 	writeJSON(w, http.StatusOK, e)
 }
 

@@ -44,7 +44,7 @@ func cpRouter(s *stubStoreReal, authz *stubAuthZ, tenant string) chi.Router {
 			next.ServeHTTP(w, req)
 		})
 	})
-	handler.RegisterRoutes(r, handler.New(s, &stubPublisher{}, authz, &stubLedger{}, zap.NewNop()))
+	handler.RegisterRoutes(r, handler.New(s, authz, &stubLedger{}, zap.NewNop()))
 	return r
 }
 

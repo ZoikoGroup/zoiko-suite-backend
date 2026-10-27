@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -39,11 +40,12 @@ func TestMain(m *testing.M) {
 				// to whatever major the library calls "latest," and that patch
 				// build can stop resolving from the remote binary repo with no
 				// code change on our side (this is what broke PR #105's CI).
-				Version(embeddedpostgres.V16).
+				Version(embeddedpostgres.PostgresVersion("16.15.0")).
 				Port(dbPort).
 				Database("treasury_isolation_test").
 				Username("postgres").
-				Password("postgres"),
+				Password("postgres").
+				RuntimePath(filepath.Join(os.TempDir(), fmt.Sprintf("epg-treasury-%d", dbPort))),
 		)
 		if err := pg.Start(); err != nil {
 			fmt.Printf("failed to start embedded postgres: %v\n", err)
@@ -85,7 +87,8 @@ func TestMain(m *testing.M) {
 		cash_balances, cash_position_snapshots,
 		fx_exposure_snapshots, fx_rates,
 		bank_account_ownership_evidence, bank_account_history, bank_accounts,
-		liquidity_thresholds
+		liquidity_thresholds,
+		eventing_outbox
 		CASCADE;`)
 
 	for _, migration := range []string{
@@ -99,6 +102,8 @@ func TestMain(m *testing.M) {
 		"000008_add_bnk08_cash_position_snapshot.up.sql",
 		"000009_add_bnk10_fx_exposure_snapshot.up.sql",
 		"000010_add_bnk09_authorization_and_events.up.sql",
+		"000011_add_eventing_outbox.up.sql",
+		"000012_eventing_outbox_rls.up.sql",
 	} {
 		sql, err := os.ReadFile("../../deployments/migrations/" + migration)
 		if err != nil {
@@ -119,7 +124,7 @@ func TestMain(m *testing.M) {
 		}
 	}
 
-	testStore = store.New(testPool, zap.NewNop())
+	testStore = store.New(testPool, zap.NewNop(), store.WithEventRegion("uk"))
 
 	code := m.Run()
 

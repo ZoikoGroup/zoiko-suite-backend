@@ -37,6 +37,58 @@ func (r CertifyRequest) Validate() error {
 // ErrSegregation: the actor took part in producing the run they are asked to certify.
 const ErrSegregation = errorString("the certifier must be independent of the run's creation and execution")
 
+// RevokeCertificationRequest withdraws a run's certification (ZS-CONTROL-001
+// §27; ZS-SVC-Z-001 RB-05). Both fields are mandatory: §25 requires a reason,
+// and NP-47 says a revocation with no reason or evidence must fail safe.
+type RevokeCertificationRequest struct {
+	Reason       string   `json:"reason"`
+	EvidenceRefs []string `json:"evidence_refs"`
+}
+
+const (
+	maxRevocationEvidenceRefs   = 20
+	maxRevocationEvidenceRefLen = 512
+)
+
+func (r RevokeCertificationRequest) Validate() error {
+	if strings.TrimSpace(r.Reason) == "" {
+		return fmt.Errorf("%w: a revocation needs a reason", ErrInvalidArgument)
+	}
+	if len(r.Reason) > 1000 {
+		return fmt.Errorf("%w: reason is too long", ErrInvalidArgument)
+	}
+	if len(r.EvidenceRefs) == 0 {
+		return fmt.Errorf("%w: a revocation needs at least one evidence reference", ErrInvalidArgument)
+	}
+	if len(r.EvidenceRefs) > maxRevocationEvidenceRefs {
+		return fmt.Errorf("%w: at most %d evidence references", ErrInvalidArgument, maxRevocationEvidenceRefs)
+	}
+	for _, e := range r.EvidenceRefs {
+		if strings.TrimSpace(e) == "" || len(e) > maxRevocationEvidenceRefLen {
+			return fmt.Errorf("%w: each evidence reference must be 1-%d characters", ErrInvalidArgument, maxRevocationEvidenceRefLen)
+		}
+	}
+	return nil
+}
+
+// ErrRevokerIsCertifier: the actor certified the run whose certification they
+// are asked to revoke.
+const ErrRevokerIsCertifier = errorString("a certification cannot be revoked by the principal who certified it")
+
+// CheckRevokerIndependence: the principal who certified a run cannot revoke
+// that certification, the same independence a certifier has from the run's
+// preparers (Invariant 12; reconciliation-engine-svc's
+// CheckCertifierIndependence). certifiers is everyone recorded as moving the
+// run's certification to CERTIFIED.
+func CheckRevokerIndependence(actor string, certifiers []string) error {
+	for _, c := range certifiers {
+		if actor == c {
+			return ErrRevokerIsCertifier
+		}
+	}
+	return nil
+}
+
 // Close-gate statuses.
 const (
 	GatePassed   = "PASSED"
@@ -53,7 +105,29 @@ type CloseGateItem struct {
 	Lifecycle    string `json:"lifecycle_state,omitempty"`
 	Result       string `json:"result_state,omitempty"`
 	Certificatio string `json:"certification_state,omitempty"`
+
+	// Set when the latest run's certification was revoked: when, and why.
+	// The revocation is prospective (RB-05): it tells whoever reads the gate
+	// that the certification is withdrawn from that instant.
+	CertificationRevokedAt string `json:"certification_revoked_at,omitempty"`
+	RevocationReason       string `json:"revocation_reason,omitempty"`
+
+	// Set when the latest run is certified and an unresolved late-data
+	// exception says its source changed since (Invariant 14). The
+	// certification itself is untouched; the gate reads the exception.
+	LateDataExceptionID string `json:"late_data_exception_id,omitempty"`
+	LateDataDetectedAt  string `json:"late_data_detected_at,omitempty"`
 }
+
+// GateReasonCertificationRevoked: the latest run was certified, and that
+// certification has since been revoked.
+const GateReasonCertificationRevoked = "CERTIFICATION_REVOKED"
+
+// GateReasonLateDataAfterCertification: the latest run is certified, but its
+// source has changed since and the late-data exception that records it is
+// unresolved. A new run naming it as prior, or resolving the exception under
+// authority (waiver, carry-forward, closure), clears it.
+const GateReasonLateDataAfterCertification = "LATE_DATA_AFTER_CERTIFICATION"
 
 // CloseGate is the entity-level decision (FIN-CTRL-041). Open means every
 // mandatory control's LATEST run for the period is CERTIFIED. It is fail-closed:
@@ -78,6 +152,14 @@ func EvaluateGate(entityID, periodID string, controls []GateInput) CloseGate {
 		switch {
 		case c.RunID == "":
 			it.Status, it.Reason = GateBlocking, "NO_RUN_FOR_PERIOD"
+		case c.Lifecycle == string(LifecycleCertified) && c.Certification == string(CertRevoked):
+			it.Status, it.Reason = GateBlocking, GateReasonCertificationRevoked
+			it.RunID, it.Lifecycle, it.Result, it.Certificatio = c.RunID, c.Lifecycle, c.Result, c.Certification
+			it.CertificationRevokedAt, it.RevocationReason = c.RevokedAt, c.RevocationReason
+		case c.Lifecycle == string(LifecycleCertified) && c.Certification == string(CertCertified) && c.LateDataExceptionID != "":
+			it.Status, it.Reason = GateBlocking, GateReasonLateDataAfterCertification
+			it.RunID, it.Lifecycle, it.Result, it.Certificatio = c.RunID, c.Lifecycle, c.Result, c.Certification
+			it.LateDataExceptionID, it.LateDataDetectedAt = c.LateDataExceptionID, c.LateDataDetectedAt
 		case c.Lifecycle == string(LifecycleCertified) && c.Certification == string(CertCertified):
 			it.Status = GatePassed
 			it.RunID, it.Lifecycle, it.Result, it.Certificatio = c.RunID, c.Lifecycle, c.Result, c.Certification
@@ -99,6 +181,12 @@ func EvaluateGate(entityID, periodID string, controls []GateInput) CloseGate {
 type GateInput struct {
 	ControlCode, ControlName                string
 	RunID, Lifecycle, Result, Certification string
+	// RevokedAt (RFC 3339) and RevocationReason are set when the latest run's
+	// certification was revoked.
+	RevokedAt, RevocationReason string
+	// LateDataExceptionID and LateDataDetectedAt (RFC 3339) are set when the
+	// latest run has an unresolved late-data exception.
+	LateDataExceptionID, LateDataDetectedAt string
 }
 
 // ExposureRow is the unresolved exception exposure of one currency and severity.

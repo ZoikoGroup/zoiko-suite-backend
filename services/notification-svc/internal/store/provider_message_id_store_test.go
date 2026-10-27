@@ -26,7 +26,7 @@ func complete(t *testing.T, s *store.PgStore, tenant, id, status, failure, recei
 // F-12 (migration 000015): a callback quoting a direct send's Message-ID, with or
 // without angle brackets, or its attempt id, finds that attempt.
 func TestDirectAttempt_IsFoundByItsProviderMessageID(t *testing.T) {
-	pool := openTestPool(t)
+	pool := openAdminTestPool(t)
 	s := store.New(pool)
 	n := seedNotification(t, s, "tenant-pmid", "corr-pmid-1")
 	if err := complete(t, s, "tenant-pmid", n.NotificationID, "SENT", "", receiptFor("<abc-123@example.com>")); err != nil {
@@ -62,7 +62,7 @@ func TestDirectAttempt_IsFoundByItsProviderMessageID(t *testing.T) {
 // A failed attempt has no message to point at; recording an id would let a stray
 // callback attach itself to it.
 func TestDirectAttempt_FailedAttemptRecordsNoProviderMessageID(t *testing.T) {
-	pool := openTestPool(t)
+	pool := openAdminTestPool(t)
 	s := store.New(pool)
 	n := seedNotification(t, s, "tenant-pmid", "corr-pmid-2")
 	if err := complete(t, s, "tenant-pmid", n.NotificationID, "FAILED", "550 no such user", receiptFor("<should-not-be-stored@example.com>")); err != nil {
@@ -76,7 +76,7 @@ func TestDirectAttempt_FailedAttemptRecordsNoProviderMessageID(t *testing.T) {
 // NP-27: one provider message id maps to exactly one attempt; a second claim is
 // refused, not merged.
 func TestDirectAttempt_ProviderMessageIDIsUnique(t *testing.T) {
-	pool := openTestPool(t)
+	pool := openAdminTestPool(t)
 	s := store.New(pool)
 	a := seedNotification(t, s, "tenant-pmid", "corr-pmid-3a")
 	b := seedNotification(t, s, "tenant-pmid", "corr-pmid-3b")
@@ -95,7 +95,7 @@ func TestDirectAttempt_ProviderMessageIDIsUnique(t *testing.T) {
 // The point of F-12, end to end: a hard bounce for a DIRECT send now becomes a
 // suppression, which the direct-send guard then enforces.
 func TestDirectAttempt_HardBounceCallbackBecomesASuppression(t *testing.T) {
-	pool := openTestPool(t)
+	pool := openAdminTestPool(t)
 	s := store.New(pool)
 	n := newNotification("tenant-bounce", "entity-1", "recipient-1", "corr-pmid-4")
 	n.RecipientAddress, n.RecipientAddressSource = "gone@example.com", domain.AddressSourceRequest
@@ -121,7 +121,7 @@ func TestDirectAttempt_HardBounceCallbackBecomesASuppression(t *testing.T) {
 // The migration reverses cleanly and can be re-applied, and the column is nullable
 // so existing rows are untouched.
 func TestMigration000015_DownThenUp(t *testing.T) {
-	pool := openTestPool(t)
+	pool := openAdminTestPool(t)
 	ctx := context.Background()
 	for _, f := range []string{"000015_direct_attempt_provider_message_id.down.sql", "000015_direct_attempt_provider_message_id.up.sql"} {
 		b, err := os.ReadFile("../../deployments/migrations/" + f)

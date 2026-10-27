@@ -3,6 +3,8 @@ package events
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"time"
@@ -12,6 +14,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/workflow-svc/internal/domain"
+	"zoiko.io/workflow-svc/internal/outbox"
 )
 
 // envelope is this platform's event contract (Doc 03 §19): every published
@@ -268,39 +271,81 @@ func (p *Publisher) emit(ctx context.Context, eventType, correlationID, tenantID
 
 // PublishOutbox publishes an event from the transactional outbox relay, preserving
 // the stable outboxEventID as the X-Event-ID Kafka header across all retries.
-func (p *Publisher) PublishOutbox(ctx context.Context, outboxEventID, eventType, correlationID, tenantID, legalEntityID, actorID string, payload []byte) error {
-	env := envelope{
-		EventType:     eventType,
-		EventVersion:  "1.0",
-		EmittedAt:     time.Now().UTC(),
-		SchemaVersion: "1.0",
-		SourceService: "workflow-svc",
-		CorrelationID: correlationID,
-		TenantID:      tenantID,
-		LegalEntityID: legalEntityID,
-		ActorID:       actorID,
-		Payload:       json.RawMessage(payload),
+func (p *Publisher) PublishOutbox(ctx context.Context, e outbox.StoredEvent) error {
+	sum := sha256.Sum256(e.Payload)
+	env := outboxEnvelope{
+		envelope: envelope{
+			EventType:     e.EventType,
+			EventVersion:  "1.0",
+			EmittedAt:     e.CreatedAt.UTC(),
+			SchemaVersion: "1.0",
+			SourceService: "workflow-svc",
+			CorrelationID: e.Correlation(),
+			TenantID:      e.TenantID,
+			LegalEntityID: e.LegalEntityID,
+			ActorID:       e.Actor(),
+			Jurisdiction:  e.Headers["jurisdiction_context"],
+			Payload:       json.RawMessage(e.Payload),
+		},
+		// GCP §16 / R-001 §10.3 envelope minimum (Governance audit row 46).
+		EventID:          e.OutboxEventID,
+		CausationID:      e.Headers["causation_id"],
+		AggregateType:    e.AggregateType,
+		AggregateID:      e.AggregateID,
+		ProcessVersion:   e.Headers["workflow_definition_version"],
+		Plane:            "governance",
+		PayloadHash:      "sha256:" + hex.EncodeToString(sum[:]),
+		EvidenceRefs:     e.Headers["decision_id"],
+		IdempotencyKey:   e.Headers["idempotency_key"],
+		ReviewCycle:      e.Headers["review_cycle"],
+		AccessDecisionID: e.Headers["access_decision_id"],
 	}
 	data, err := json.Marshal(env)
 	if err != nil {
-		return fmt.Errorf("event %q: marshal envelope: %w", eventType, err)
+		return fmt.Errorf("event %q: marshal envelope: %w", e.EventType, err)
 	}
 
+	// Partition key hash(tenant, aggregate) (Event Catalogue §5.3): every
+	// event about one workflow instance keeps its order (row 47; the writer's
+	// LeastBytes balancer used to scatter them).
 	msg := kafka.Message{
+		Key:   []byte(e.TenantID + "/" + e.AggregateID),
 		Value: data,
 		Headers: []kafka.Header{
-			{Key: "X-Event-ID", Value: []byte(outboxEventID)},
+			{Key: "X-Event-ID", Value: []byte(e.OutboxEventID)},
 		},
 	}
 	if err := p.producer.WriteMessages(ctx, msg); err != nil {
-		return fmt.Errorf("event %q: kafka write: %w", eventType, err)
+		return fmt.Errorf("event %q: kafka write: %w", e.EventType, err)
 	}
 
 	p.log.Info("outbox event published",
-		zap.String("event_id", outboxEventID),
-		zap.String("event_type", eventType),
+		zap.String("event_id", e.OutboxEventID),
+		zap.String("event_type", e.EventType),
 		zap.String("topic", p.topic),
-		zap.String("correlation_id", correlationID),
+		zap.String("correlation_id", e.Correlation()),
 	)
 	return nil
+}
+
+// Deliverer adapts the publisher to the outbox relay's Kafka destination.
+func (p *Publisher) Deliverer() outbox.Deliverer {
+	return outbox.DelivererFunc(p.PublishOutbox)
+}
+
+// outboxEnvelope is the envelope of an event relayed from the outbox: the
+// common fields plus the governance-plane minimum.
+type outboxEnvelope struct {
+	envelope
+	EventID          string `json:"event_id"`
+	CausationID      string `json:"causation_id,omitempty"`
+	AggregateType    string `json:"aggregate_type"`
+	AggregateID      string `json:"aggregate_id"`
+	ProcessVersion   string `json:"process_version,omitempty"`
+	Plane            string `json:"plane"`
+	PayloadHash      string `json:"payload_hash"`
+	EvidenceRefs     string `json:"evidence_ref,omitempty"`
+	IdempotencyKey   string `json:"idempotency_ref,omitempty"`
+	ReviewCycle      string `json:"review_cycle,omitempty"`
+	AccessDecisionID string `json:"access_decision_id,omitempty"`
 }

@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -33,11 +34,22 @@ func NewClient(baseURL string) *Client {
 
 // ResolveActivity mirrors privacy-decision-svc's client — GET
 // /privacy/processing-activities/{id} only ever resolves ACTIVE/
-// SUSPENDED/RETIRED.
-func (c *Client) ResolveActivity(ctx context.Context, activityID string) (*ActivityVersion, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/privacy/processing-activities/"+activityID, nil)
+// SUSPENDED/RETIRED. tenantID is forwarded via X-Tenant-Id — PRV-01's own
+// RLS scopes this read by tenant (see retentionregistry-style clients
+// elsewhere in this domain for the same convention).
+func (c *Client) ResolveActivity(ctx context.Context, tenantID, principalID, activityID string) (*ActivityVersion, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/privacy/processing-activities/"+url.PathEscape(activityID), nil)
 	if err != nil {
 		return nil, err
+	}
+	if tenantID != "" {
+		req.Header.Set("X-Tenant-Id", tenantID)
+	}
+	// PRV-01 requires an authenticated principal with a read grant on every
+	// route; the caller's verified principal is forwarded. (Provisioning the
+	// grant is authorization-svc's / the operator's job, not this service's.)
+	if principalID != "" {
+		req.Header.Set("X-Principal-Id", principalID)
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {

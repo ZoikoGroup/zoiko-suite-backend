@@ -148,6 +148,9 @@ type ApproveSampleDesignParams struct {
 
 type SelectSampleParams struct {
 	DesignID, TenantID, CorrelationID string
+	// ActorPrincipalID is the verified principal; it is recorded on the
+	// SampleSelected event.
+	ActorPrincipalID string
 }
 
 type RecordItemResultParams struct {
@@ -165,6 +168,9 @@ type AddAlternativeProcedureParams struct {
 
 type EvaluateSampleParams struct {
 	DesignID, TenantID, CorrelationID string
+	// ActorPrincipalID is the verified principal; it is recorded on the
+	// SampleEvaluated event.
+	ActorPrincipalID string
 }
 
 // SupersedeSampleParams is AUD-04's own AUD-NEG-011 mechanism: since
@@ -181,6 +187,7 @@ type SupersedeSampleParams struct {
 var (
 	ErrSampleDesignNotFound       = errors.New("sample design not found")
 	ErrSampleDesignInvalidState   = errors.New("sample design is not in a state that permits this action")
+	ErrSelfApprovalForbidden      = errors.New("self-approval is forbidden: creator cannot approve their own sample design")
 	ErrSampleItemNotFound         = errors.New("sample item not found")
 	ErrSampleItemInvalidState     = errors.New("sample item is not in a state that permits this action")
 	ErrSampleSelectionInvalidated = errors.New("sample selection is invalidated — its parameter set has changed since selection; supersede the design")

@@ -28,16 +28,19 @@ func TestPrivilegedSession_Create_Success(t *testing.T) {
 
 	body := `{
 		"principal_id": "` + testPAMElevatedUser + `",
-		"requested_actions": ["emergency.override", "tax.reconcile"],
+		"requested_actions": ["tax.ledger.view", "tax.return.read"],
 		"ticket_ref": "INC-88992",
-		"reason": "Emergency tax reconciliation for month end",
-		"duration_seconds": 1800
+		"reason": "Investigate month-end tax reconciliation",
+		"duration_seconds": 1800,
+		"resource_scope": "tax-ledger/2026-09",
+		"target_environment": "production"
 	}`
 
 	req := httptest.NewRequest(http.MethodPost, "/admin/v1/privileged-sessions", bytes.NewBufferString(body))
 	req.Header.Set("X-Tenant-Id", testPAMTenantID)
 	req.Header.Set("X-Principal-Id", testPAMCaller)
 	req.Header.Set("X-Correlation-ID", "corr-pam-1")
+	req = withStepUp(req, testPAMCaller)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 

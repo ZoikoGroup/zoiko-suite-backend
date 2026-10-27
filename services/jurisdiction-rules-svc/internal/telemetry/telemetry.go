@@ -77,6 +77,20 @@ type Metrics struct {
 	// ReadinessUp is the source for the ReadinessProbeFailing alert rule.
 	// 1 if the last /readyz check returned 200, 0 otherwise.
 	ReadinessUp prometheus.Gauge
+	// OutboxPublishFailuresTotal counts outbox events whose producer write
+	// failed (audit X3: "no metric exists to alert on it"). A rising value
+	// means events committed to the local DB are being lost to the broker.
+	OutboxPublishFailuresTotal *prometheus.CounterVec
+	// OutboxPendingEvents is the most recent outbox depth — the lag between
+	// what is committed and what has reached the broker. Source for an
+	// alert on a stalled OutboxWorker.
+	OutboxPendingEvents prometheus.Gauge
+	// OutboxParkedTotal counts events the worker gave up on after
+	// store.MaxOutboxAttempts failed publishes. Any increase needs a person.
+	OutboxParkedTotal *prometheus.CounterVec
+	// EntityEventsTotal counts consumed tenant-entity-registry events by
+	// result: applied, duplicate, skipped (unappliable) or retry (store down).
+	EntityEventsTotal *prometheus.CounterVec
 }
 
 // NewMetrics constructs and registers this service's Prometheus
@@ -100,8 +114,28 @@ func NewMetrics(serviceName string) *Metrics {
 			Help:        "1 if the last /readyz check succeeded, 0 otherwise.",
 			ConstLabels: prometheus.Labels{"service": serviceName},
 		}),
+		OutboxPublishFailuresTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name:        "outbox_publish_failures_total",
+			Help:        "Total outbox publishes that failed to reach the broker.",
+			ConstLabels: prometheus.Labels{"service": serviceName},
+		}, []string{"event_type"}),
+		OutboxPendingEvents: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name:        "outbox_pending_events",
+			Help:        "Depth of the outbox: events committed but not yet published.",
+			ConstLabels: prometheus.Labels{"service": serviceName},
+		}),
 	}
-	prometheus.MustRegister(m.HTTPRequestsTotal, m.HTTPRequestDuration, m.ReadinessUp)
+	m.OutboxParkedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name:        "outbox_parked_events_total",
+		Help:        "Outbox events parked after repeated publish failures.",
+		ConstLabels: prometheus.Labels{"service": serviceName},
+	}, []string{"event_type"})
+	m.EntityEventsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name:        "entity_events_consumed_total",
+		Help:        "Consumed entity events by result.",
+		ConstLabels: prometheus.Labels{"service": serviceName},
+	}, []string{"event_type", "result"})
+	prometheus.MustRegister(m.HTTPRequestsTotal, m.HTTPRequestDuration, m.ReadinessUp, m.OutboxPublishFailuresTotal, m.OutboxPendingEvents, m.OutboxParkedTotal, m.EntityEventsTotal)
 	return m
 }
 

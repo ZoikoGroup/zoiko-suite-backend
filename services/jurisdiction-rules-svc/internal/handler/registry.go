@@ -225,6 +225,8 @@ func (h *Handler) writeRegistryError(w http.ResponseWriter, err error, corr stri
 		writeError(w, http.StatusConflict, "interpretation_not_approved", err.Error())
 	case errors.Is(err, domain.ErrSourceNotReady):
 		writeError(w, http.StatusConflict, "source_not_ready", err.Error())
+	case errors.Is(err, domain.ErrSupersedesTaken):
+		writeError(w, http.StatusConflict, "supersedes_taken", err.Error())
 	case errors.Is(err, domain.ErrInvalidReference):
 		writeError(w, http.StatusBadRequest, "invalid_reference", err.Error())
 	case errors.Is(err, domain.ErrManifestInvalid):

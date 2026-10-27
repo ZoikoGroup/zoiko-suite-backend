@@ -1,0 +1,15 @@
+# Used by BuildKit for builds with -f services/workflow-svc/Dockerfile.
+# The context is the repository root (see the Dockerfile), so everything is
+# excluded except the two modules the image is built from.
+*
+!services/workflow-svc/
+!services/identity-envelope/
+
+# Not needed inside the image.
+services/workflow-svc/.gotmp/
+services/workflow-svc/**/*.exe
+services/workflow-svc/**/*_test.go
+services/workflow-svc/**/testdata/
+services/workflow-svc/deployments/
+services/workflow-svc/.dockerignore
+services/identity-envelope/**/*_test.go

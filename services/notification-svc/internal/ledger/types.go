@@ -83,7 +83,6 @@ func ResolveSenderIdentity(stream SenderStream, templateKey string) StreamSender
 	}
 }
 
-
 // IntentStatus defines the lifecycle status of a governed message intent.
 type IntentStatus string
 
@@ -199,10 +198,10 @@ type EventIngestRequest struct {
 type SuppressionReason string
 
 const (
-	SuppressionReasonHardBounce   SuppressionReason = "HARD_BOUNCE"
-	SuppressionReasonComplaint    SuppressionReason = "COMPLAINT"
-	SuppressionReasonUnsubscribe  SuppressionReason = "UNSUBSCRIBE"
-	SuppressionReasonAdmin        SuppressionReason = "ADMIN_SUPPRESSED"
+	SuppressionReasonHardBounce  SuppressionReason = "HARD_BOUNCE"
+	SuppressionReasonComplaint   SuppressionReason = "COMPLAINT"
+	SuppressionReasonUnsubscribe SuppressionReason = "UNSUBSCRIBE"
+	SuppressionReasonAdmin       SuppressionReason = "ADMIN_SUPPRESSED"
 )
 
 // EmailSuppression records an active deliverability or preference suppression entry in email_suppressions.

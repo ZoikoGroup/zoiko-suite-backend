@@ -33,7 +33,7 @@ corporate-actions-svc corporate-tax-svc counterparty-management-svc decision-sup
 delegated-authority-svc document-vault-svc employee-master-svc employment-contracts-svc \
 esignature-integration-svc evidence-manifest-svc evidence-requirements-svc \
 exception-escalation-svc external-data-feed-svc filing-preparation-svc filing-tracker-svc \
-financial-close-svc financial-control-svc forecasting-svc general-ledger-svc governance-decision-log-svc \
+financial-close-svc financial-control-svc financial-statements-svc forecasting-svc general-ledger-svc governance-decision-log-svc \
 hris-connector-svc identity-context-svc inventory-management-svc invoice-approval-svc key-management-svc \
 leave-absence-svc migration-integrity-svc mtls-management-svc notification-svc \
 obligation-tracking-svc obligations-svc offboarding-severance-svc org-structure-svc \
@@ -71,6 +71,11 @@ treasury-svc corporate-tax-svc vat-gst-svc withholding-tax-svc tax-determination
 tax-authority-interface-svc evidence-manifest-svc governance-decision-log-svc \
 audit-event-store-svc hris-connector-svc search-indexer-svc"
 
+# Sensitive services whose purpose of access is a read concern only: appends to
+# them are evidence, not access (governance-decision-log-svc, decision D-06,
+# 21 Oct 2026).
+PURPOSE_ON_READ="governance-decision-log-svc"
+
 # Services that post to, or report from, an accounting book (INV-03).
 #
 # Their generated policy sets BookID to NotRequired with a pointer to the gap,
@@ -82,7 +87,7 @@ audit-event-store-svc hris-connector-svc search-indexer-svc"
 # carries book_id today so callers can begin sending it; flipping these to
 # Required is a one-line change per service once REF-06 ships.
 ACCOUNTING="general-ledger-svc accounts-payable-svc accounts-receivable-svc \
-asset-management-svc consolidation-svc intercompany-accounting-svc financial-close-svc financial-control-svc migration-integrity-svc \
+asset-management-svc consolidation-svc intercompany-accounting-svc financial-close-svc financial-control-svc financial-statements-svc migration-integrity-svc \
 inventory-management-svc project-accounting-svc \
 reporting-orchestration-svc metric-registry-svc corporate-tax-svc vat-gst-svc \
 withholding-tax-svc tax-determination-svc payroll-tax-svc treasury-svc \
@@ -98,7 +103,8 @@ bank-reconciliation-svc reconciliation-intelligence-svc"
 # authenticator itself while its JWT verification never runs.
 #
 # identity-context-svc:/v1/authenticate is the same circularity one step
-# earlier. It is where a human exchanges a password for the bearer token that
+# earlier. It is where a human exchanges a password (or, at /v1/authenticate/federated, a tenant IdP's
+# signed ID token) for the bearer token that
 # /v1/context/resolve turns into a signed envelope, so it necessarily runs
 # before any identity exists to put in the headers the contract demands. Left
 # unexempted, the endpoint that produces every identity on the platform refuses
@@ -109,7 +115,7 @@ bank-reconciliation-svc reconciliation-intelligence-svc"
 # and actor honestly.
 #
 # Format: "<svc>:<path>[,<path>...]" — one entry per service.
-EXEMPT_PATHS="gateway-auth-svc:/verify identity-context-svc:/v1/authenticate"
+EXEMPT_PATHS="gateway-auth-svc:/verify identity-context-svc:/v1/authenticate,/v1/authenticate/federated"
 
 # Services whose POST routes resolve or evaluate but change nothing (a body-
 # carrying read). They still get the full envelope; only the idempotency_key
@@ -172,6 +178,8 @@ for svc in "${targets[@]}"; do
 
 	purpose="NotRequired"
 	in_list "$svc" "$SENSITIVE" && purpose="RequiredOnWrite"
+	# The ledger demands purpose on reads, not on evidence appends (D-06).
+	in_list "$svc" "$PURPOSE_ON_READ" && purpose="RequiredOnRead"
 
 	exempt_block=""
 	if exempt_literal="$(exempt_for "$svc")"; then

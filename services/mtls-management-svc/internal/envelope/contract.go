@@ -21,5 +21,10 @@ func ServicePolicy() Policy {
 
 		// This service does not post to an accounting book.
 		BookID: NotRequired,
+
+		// Endpoints that produce or bootstrap identity rather than consume it,
+		// where requiring those fields as input is circular.
+		// See EXEMPT_PATHS pattern in rollout.sh.
+		ExemptPaths: []string{"/v1/mtls/certificates"},
 	}
 }

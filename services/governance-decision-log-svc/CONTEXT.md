@@ -102,10 +102,12 @@ MVP on it now.
 Authorization / Workflow call it directly (sync or via event), it does
 not subscribe back to them.
 
-**Governance dependencies**: none upstream. This service sits beneath
-Policy/Authorization/Workflow, not behind them — it must never itself
-require a governance check to accept a write (that would be circular
-and could deadlock the evidence path).
+**Governance dependencies**: none upstream for governance logic, but writes
+are authorized via authorization-svc (action `GOVERNANCE_DECISION_RECORD`).
+Reads are also authorized (`GOVERNANCE_DECISION_READ`). Replay requires
+`GOVERNANCE_DECISION_REPLAY`. This service sits beneath
+Policy/Authorization/Workflow for governance decisions, but requires
+authorization-svc to confirm the caller may append to the ledger.
 
 ## Evidence obligations
 
@@ -115,40 +117,58 @@ defined) for audit, regulator, and legal-discovery scenarios.
 
 ## Idempotency
 
-FINALIZED: dedup key is `decision_id` (caller-supplied). Mirror
-`services/audit-event-store-svc/internal/store/store.go`'s `Store` method
-exactly: `INSERT ... ON CONFLICT (decision_id) DO NOTHING`, never
-SELECT-then-INSERT (TOCTOU race under concurrent delivery — see that
-file's doc comment for why).
+Two keys, both truthful (12 Oct 2026):
+- **`Idempotency-Key`** (required on every POST): same key + same body →
+  200 with the stored row; same key + different body → 409
+  `IDEMPOTENCY_MISMATCH`. Keys live in `idempotency_keys` (000008), scoped
+  per tenant. The key check runs **after** authorization, because a replay
+  returns a stored decision.
+- **`decision_id`** (caller-supplied, unique per tenant since 000013 — the
+  primary key is `(tenant_id, decision_id)`): `INSERT ... ON CONFLICT
+  (tenant_id, decision_id) DO NOTHING`, never SELECT-then-INSERT. A repeat
+  answers 200 with the **stored** row when the content matches and 409
+  `DECISION_ID_CONFLICT` when it does not. It never echoes an unstored body.
+- Replays (`POST /v1/decisions/{id}/replay`) are idempotent on
+  `(tenant, decision, Idempotency-Key)` (000014): a retry returns the first
+  manifest without re-evaluating.
 
-## Event publishing — FINALIZED
+## Event publishing — transactional outbox
 
-After a successful `POST /v1/decisions` write, publish
-`governance.decision.recorded`.
+`store.RecordDecision` writes the decision, its idempotency key and the
+complete `governance.decision.recorded` envelope (`events.DecisionRecorded`)
+to `outbox` in **one transaction**. `internal/outbox` relays it: it claims
+rows with `FOR UPDATE SKIP LOCKED` under the `app.outbox_relay` marker the
+outbox RLS policy admits (000012), publishes the envelope byte for byte
+(`payload` is BYTEA, so `payload_hash` stays verifiable), keys the message by
+`decision_id`, and records failures in `attempts` / `last_error` for retry.
+A broker outage delays events; it cannot lose them.
 
-Mirror the existing publisher convention exactly — see
-`services/identity-context-svc/internal/events/publisher.go` and
-`services/tenant-entity-registry-svc/internal/events/publisher.go`. Both:
-- wrap payloads in the same `envelope` struct shape (`EventType`,
-  `EmittedAt`, `SchemaVersion`, `SourceService`, `CorrelationID`, `Payload`)
-- have a `// producer *kafka.Writer — TODO: inject kafka.Writer before
-  Phase 1 exit criteria` comment on the `Publisher` struct
-- log the fully-marshaled envelope at `Info` level instead of writing to
-  Kafka (`p.log.Info("event emitted (stub — wire Kafka writer)", ...)`)
+Envelope: `event_id`, `event_type`, `event_version`, `emitted_at`,
+`schema_version` (1.1), `source_service`, `tenant_id`, `legal_entity_id`,
+`actor_id`, `correlation_id`, `causation_id`, `workflow_instance_id`,
+`aggregate_type`, `aggregate_id`, `payload_hash`, `payload`. The payload no
+longer carries a `jurisdiction_context` filled with `rule_basis`; this service
+holds no jurisdiction of its own.
 
-**Important nuance**: neither existing envelope struct hoists
-`tenant_id`/`legal_entity_id`/jurisdiction context to the top level —
-those live inside the `payload` map, and neither existing publisher
-emits jurisdiction context at all today. Don't invent new top-level
-envelope fields to satisfy `03-microservices.md` §19 (event name,
-version, timestamp, tenant ID, legal entity ID, jurisdiction context,
-actor ID, correlation ID, source service, payload schema version) —
-instead make sure the `payload` map for `governance.decision.recorded`
-includes `tenant_id`, `legal_entity_id`, `actor_id` (from `actor_id`
-column), and jurisdiction context (populate from `rule_basis` — it's
-the closest thing this schema has to a jurisdiction reference). Schema
-version goes in the envelope's existing `SchemaVersion` field, same as
-today's services.
+Relay health is on `/metrics`: alert on `outbox_oldest_pending_seconds`
+(also `outbox_pending_events`, `outbox_pruned_events_total`). Published rows
+older than `OUTBOX_RETENTION` (default `168h`; `0` keeps them) are pruned;
+unpublished rows never are. `Stop()` cancels a relay pass blocked on a dead
+broker, and what it did not mark published is relayed again.
+
+`ENV=production|staging` with no `KAFKA_BROKERS` refuses to start. Locally,
+`KAFKA_BROKERS=` runs without a relay and events wait in the outbox.
+
+## Read authorization
+
+Every GET is authorized on `GOVERNANCE_DECISION_READ` on the legal entity the
+data belongs to (the decision's, or the list's `entity` filter), with the
+platform scope (`AUTHZ_PLATFORM_SCOPE_ID`) as the tenant-wide reader tried
+second. An unfiltered list needs the platform grant. An authz outage is a 503,
+never a reason to fall back.
+`DECISION_LOG_READ_AUTHZ=warn` logs instead of refusing, as a migration path:
+compose sets it because contract-lifecycle-svc and decision-support-svc still
+read with no `X-Principal-Id`. The code default is `enforce`.
 
 ## Doctrine constraints that apply here
 
@@ -292,9 +312,13 @@ live status.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `POST` | `/v1/decisions` | Record a governance decision (idempotent on `decision_id`) — called by Policy/Authorization/Workflow services after each evaluation |
+| `POST` | `/v1/decisions` | Record a governance decision (idempotent on `Idempotency-Key` and `decision_id`) — called by Policy/Workflow services after each evaluation |
 | `GET` | `/v1/decisions/{decision_id}` | Retrieve one decision by ID |
 | `GET` | `/v1/decisions?actor=&entity=&action=&rule_basis=&from=&to=&limit=&offset=` | List/query decisions — all filters optional, compose with AND semantics |
+| `POST` | `/v1/decisions/{decision_id}/replay` | Re-evaluate against the exact policy version (APPROVAL_THRESHOLD only) |
+| `GET` | `/v1/decisions/{decision_id}/replay-manifests` | Replay history of one decision |
+
+The full contract, status codes and required headers are in `openapi.yaml`.
 | `GET` | `/healthz` | Liveness probe |
 | `GET` | `/readyz` | Readiness probe (DB connectivity) |
 
@@ -314,9 +338,9 @@ go run ./cmd/server
 docker network create gdl-net
 docker run -d --name gov-decision-log-pg --network gdl-net -e POSTGRES_PASSWORD=secretpassword -e POSTGRES_DB=governance_decision_log -p 55434:5432 postgres:16-alpine
 ```
-2. Apply the migration:
+2. Apply every migration, in order:
 ```powershell
-Get-Content deployments\migrations\000001_initial_schema.up.sql | docker exec -i gov-decision-log-pg psql -U postgres -d governance_decision_log
+Get-ChildItem deployments\migrations\*.up.sql | Sort-Object Name | ForEach-Object { Get-Content $_ -Raw | docker exec -i gov-decision-log-pg psql -v ON_ERROR_STOP=1 -U postgres -d governance_decision_log }
 ```
 3. Build and run (from the `services/governance-decision-log-svc` directory):
 ```powershell

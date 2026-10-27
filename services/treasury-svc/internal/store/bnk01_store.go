@@ -30,14 +30,18 @@ import (
 // of "ownership verification state is orthogonal and versioned."
 func (s *PgStore) VerifyBankAccountOwnership(ctx context.Context, p domain.VerifyOwnershipParams) (*domain.OwnershipEvidence, error) {
 	var evidence *domain.OwnershipEvidence
+	acct := &domain.BankAccount{}
 	err := s.withRLS(ctx, p.TenantID, func(tx pgx.Tx) error {
-		var exists bool
-		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM bank_accounts WHERE bank_account_id = $1 AND tenant_id = $2)`,
-			p.BankAccountID, p.TenantID).Scan(&exists); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT `+bankAccountColumns+` FROM bank_accounts WHERE bank_account_id = $1 AND tenant_id = $2`,
+			p.BankAccountID, p.TenantID).Scan(
+			&acct.BankAccountID, &acct.TenantID, &acct.LegalEntityID, &acct.AccountName,
+			&acct.MaskedAccountNumber, &acct.BankIdentifier, &acct.CurrencyCode, &acct.AccountStatus,
+			&acct.BranchRef, &acct.Country, &acct.AccountType, &acct.RequestedOperationalUse, &acct.TokenVersion,
+			&acct.CreatedByPrincipalID, &acct.CreatedAt, &acct.UpdatedAt); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return domain.ErrBankAccountNotFound
+			}
 			return err
-		}
-		if !exists {
-			return domain.ErrBankAccountNotFound
 		}
 
 		row := tx.QueryRow(ctx, `
@@ -55,7 +59,18 @@ func (s *PgStore) VerifyBankAccountOwnership(ctx context.Context, p domain.Verif
 			UPDATE bank_account_ownership_evidence SET superseded_by = $1
 			WHERE bank_account_id = $2 AND evidence_id <> $1 AND superseded_by IS NULL`,
 			e.EvidenceID, p.BankAccountID)
-		return err
+		if err != nil {
+			return err
+		}
+		// Enqueue bank_account.ownership_verified event
+		return s.enqueueBankAccountEvent(ctx, tx, "ownership-verified", "bank_account.ownership_verified", p.TenantID, acct.LegalEntityID, p.BankAccountID, p.VerifiedByPrincipalID, "", map[string]any{
+			"bank_account_id":      acct.BankAccountID,
+			"tenant_id":            acct.TenantID,
+			"legal_entity_id":      acct.LegalEntityID,
+			"account_status":       acct.AccountStatus,
+			"evidence_id":          e.EvidenceID,
+			"verification_method":  e.VerificationMethod,
+		})
 	})
 	if errors.Is(err, domain.ErrBankAccountNotFound) {
 		return nil, domain.ErrBankAccountNotFound
@@ -155,7 +170,16 @@ func (s *PgStore) AmendBankAccountMetadata(ctx context.Context, p domain.AmendBa
 		if err := scanBankAccount(row, &acct); err != nil {
 			return err
 		}
-		return s.recordAccountHistory(ctx, tx, &acct, p.ActorPrincipalID)
+		if err := s.recordAccountHistory(ctx, tx, &acct, p.ActorPrincipalID); err != nil {
+			return err
+		}
+		// Enqueue bank_account.metadata_amended event
+		return s.enqueueBankAccountEvent(ctx, tx, "metadata-amended", "bank_account.metadata_amended", p.TenantID, acct.LegalEntityID, p.BankAccountID, p.ActorPrincipalID, "", map[string]any{
+			"bank_account_id": acct.BankAccountID,
+			"tenant_id":       acct.TenantID,
+			"legal_entity_id": acct.LegalEntityID,
+			"account_status":  acct.AccountStatus,
+		})
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, s.notFoundOrInvalidErr(ctx, p.BankAccountID)
@@ -178,7 +202,17 @@ func (s *PgStore) ChangeOperationalUse(ctx context.Context, p domain.ChangeOpera
 		if err := scanBankAccount(row, &acct); err != nil {
 			return err
 		}
-		return s.recordAccountHistory(ctx, tx, &acct, p.ActorPrincipalID)
+		if err := s.recordAccountHistory(ctx, tx, &acct, p.ActorPrincipalID); err != nil {
+			return err
+		}
+		// Enqueue bank_account.operational_use_changed event
+		return s.enqueueBankAccountEvent(ctx, tx, "operational-use-changed", "bank_account.operational_use_changed", p.TenantID, acct.LegalEntityID, p.BankAccountID, p.ActorPrincipalID, "", map[string]any{
+			"bank_account_id":          acct.BankAccountID,
+			"tenant_id":                acct.TenantID,
+			"legal_entity_id":          acct.LegalEntityID,
+			"account_status":           acct.AccountStatus,
+			"requested_operational_use": acct.RequestedOperationalUse,
+		})
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, s.notFoundOrInvalidErr(ctx, p.BankAccountID)
@@ -201,7 +235,16 @@ func (s *PgStore) SuspendBankAccount(ctx context.Context, p domain.SuspendAccoun
 		if err := scanBankAccount(row, &acct); err != nil {
 			return err
 		}
-		return s.recordAccountHistory(ctx, tx, &acct, p.ActorPrincipalID)
+		if err := s.recordAccountHistory(ctx, tx, &acct, p.ActorPrincipalID); err != nil {
+			return err
+		}
+		// Enqueue bank_account.suspended event
+		return s.enqueueBankAccountEvent(ctx, tx, "suspended", "bank_account.suspended", p.TenantID, acct.LegalEntityID, p.BankAccountID, p.ActorPrincipalID, "", map[string]any{
+			"bank_account_id": acct.BankAccountID,
+			"tenant_id":       acct.TenantID,
+			"legal_entity_id": acct.LegalEntityID,
+			"account_status":  acct.AccountStatus,
+		})
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, s.notFoundOrInvalidErr(ctx, p.BankAccountID)
@@ -224,7 +267,16 @@ func (s *PgStore) ReactivateBankAccount(ctx context.Context, p domain.Reactivate
 		if err := scanBankAccount(row, &acct); err != nil {
 			return err
 		}
-		return s.recordAccountHistory(ctx, tx, &acct, p.ActorPrincipalID)
+		if err := s.recordAccountHistory(ctx, tx, &acct, p.ActorPrincipalID); err != nil {
+			return err
+		}
+		// Enqueue bank_account.reactivated event
+		return s.enqueueBankAccountEvent(ctx, tx, "reactivated", "bank_account.reactivated", p.TenantID, acct.LegalEntityID, p.BankAccountID, p.ActorPrincipalID, "", map[string]any{
+			"bank_account_id": acct.BankAccountID,
+			"tenant_id":       acct.TenantID,
+			"legal_entity_id": acct.LegalEntityID,
+			"account_status":  acct.AccountStatus,
+		})
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, s.notFoundOrInvalidErr(ctx, p.BankAccountID)
@@ -247,7 +299,16 @@ func (s *PgStore) CloseBankAccount(ctx context.Context, p domain.CloseAccountPar
 		if err := scanBankAccount(row, &acct); err != nil {
 			return err
 		}
-		return s.recordAccountHistory(ctx, tx, &acct, p.ActorPrincipalID)
+		if err := s.recordAccountHistory(ctx, tx, &acct, p.ActorPrincipalID); err != nil {
+			return err
+		}
+		// Enqueue bank_account.closed event
+		return s.enqueueBankAccountEvent(ctx, tx, "closed", "bank_account.closed", p.TenantID, acct.LegalEntityID, p.BankAccountID, p.ActorPrincipalID, "", map[string]any{
+			"bank_account_id": acct.BankAccountID,
+			"tenant_id":       acct.TenantID,
+			"legal_entity_id": acct.LegalEntityID,
+			"account_status":  acct.AccountStatus,
+		})
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, s.notFoundOrInvalidErr(ctx, p.BankAccountID)
@@ -276,7 +337,17 @@ func (s *PgStore) RotateAccountIdentifierToken(ctx context.Context, p domain.Rot
 		if err := scanBankAccount(row, &acct); err != nil {
 			return err
 		}
-		return s.recordAccountHistory(ctx, tx, &acct, p.ActorPrincipalID)
+		if err := s.recordAccountHistory(ctx, tx, &acct, p.ActorPrincipalID); err != nil {
+			return err
+		}
+		// Enqueue bank_account.token_rotated event
+		return s.enqueueBankAccountEvent(ctx, tx, "token-rotated", "bank_account.token_rotated", p.TenantID, acct.LegalEntityID, p.BankAccountID, p.ActorPrincipalID, "", map[string]any{
+			"bank_account_id": acct.BankAccountID,
+			"tenant_id":       acct.TenantID,
+			"legal_entity_id": acct.LegalEntityID,
+			"account_status":  acct.AccountStatus,
+			"token_version":   acct.TokenVersion,
+		})
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, s.notFoundOrInvalidErr(ctx, p.BankAccountID)

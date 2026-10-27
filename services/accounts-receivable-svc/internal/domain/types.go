@@ -85,6 +85,12 @@ type CustomerInvoice struct {
 	SentAt                       *time.Time `json:"sent_at,omitempty"`
 	MarkedOverdueAt              *time.Time `json:"marked_overdue_at,omitempty"`
 	PaymentReceivedAt            *time.Time `json:"payment_received_at,omitempty"`
+
+	// IssuanceJournalID is the journal ID returned by general-ledger-svc when
+	// the invoice issuance accounting event was posted (via ACC-14 / GL posting).
+	// Nullable: pre-existing invoices and invoices created before this migration
+	// will not have this populated.
+	IssuanceJournalID *string `json:"issuance_journal_id,omitempty"`
 }
 
 // CustomerInvoiceLine is one line of a customer invoice — AR-05's "lines" and

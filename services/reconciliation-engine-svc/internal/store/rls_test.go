@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -44,6 +45,10 @@ func openAdminPool(t *testing.T) *pgxpool.Pool {
 	t.Cleanup(pool.Close)
 
 	_, _ = pool.Exec(ctx, `
+		DROP TABLE IF EXISTS reconciliation_certification_revocations CASCADE;
+		DROP TABLE IF EXISTS reconciliation_rule_versions CASCADE;
+		DROP TABLE IF EXISTS reconciliation_exception_transitions CASCADE;
+		DROP TABLE IF EXISTS reconciliation_run_transitions CASCADE;
 		DROP TABLE IF EXISTS outbox_events CASCADE;
 		DROP TABLE IF EXISTS idempotency_keys CASCADE;
 		DROP TABLE IF EXISTS certifications CASCADE;
@@ -56,7 +61,12 @@ func openAdminPool(t *testing.T) *pgxpool.Pool {
 		DROP FUNCTION IF EXISTS enforce_exception_resolution() CASCADE;
 		DROP FUNCTION IF EXISTS reject_immutable_row() CASCADE;
 		DROP FUNCTION IF EXISTS enforce_run_lifecycle() CASCADE;
-		DROP FUNCTION IF EXISTS enforce_definition_versioning() CASCADE;`)
+		DROP FUNCTION IF EXISTS enforce_run_creation() CASCADE;
+		DROP FUNCTION IF EXISTS enforce_run_governance_pinned() CASCADE;
+		DROP FUNCTION IF EXISTS guard_rule_version() CASCADE;
+		DROP FUNCTION IF EXISTS enforce_definition_versioning() CASCADE;
+		DROP FUNCTION IF EXISTS enforce_revocation_revokes() CASCADE;
+		DROP FUNCTION IF EXISTS reconciliation_refs_nonblank(TEXT[]) CASCADE;`)
 
 	_, thisFile, _, _ := runtime.Caller(0)
 	migDir := filepath.Join(filepath.Dir(thisFile), "../../deployments/migrations")
@@ -152,28 +162,144 @@ func (f *fixture) claim(op, resource string) domain.IdempotencyClaim {
 	}
 }
 
+// grant is the traceable authorization-svc decision a certifier brings to
+// Certify (A12): what the handler's live Decide returns on GRANTED.
+func grant(principal string) *domain.AuthoritySnapshot {
+	return &domain.AuthoritySnapshot{Source: "authorization-svc", PrincipalID: principal, LegalEntityID: entityA,
+		ActionType: "RECONCILIATION_CERTIFY", AccessDecisionID: "adl-" + principal, DecisionOutcome: "GRANTED",
+		Decision: "ALLOW", DecisionBasis: "rbac:role=recon-certifier", PolicySetVersion: "psv-1",
+		DecidedAt: time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)}
+}
+
+const (
+	entityA = "aaaaaaaa-0000-0000-0000-00000000000a"
+	entityB = "bbbbbbbb-0000-0000-0000-00000000000b"
+)
+
+// testSpecs are the two population sources every fixture definition names.
+func testSpecs() []domain.PopulationSpec {
+	return []domain.PopulationSpec{
+		{Side: "Bank", System: "BANK", Population: "bank-transactions"},
+		{Side: "Ledger", System: "GL", Population: "account-postings", Params: map[string]string{"account_codes": "1100"}},
+	}
+}
+
+func defineRequest(name string, toleranceMinor int64) domain.DefineReconciliationRequest {
+	scale := 2
+	return domain.DefineReconciliationRequest{LegalEntityID: entityA, Name: name, RulesInput: domain.RulesInput{
+		Populations: testSpecs(), MatchKeyFields: []string{"ref_id"},
+		AmountScale: &scale, Materiality: domain.MaterialityPolicy{Currencies: map[string]int64{"USD": 100000}},
+		ExceptionPolicy: &domain.ExceptionPolicy{OwnerRole: "recon-owner",
+			SLADays: map[domain.Severity]int{domain.SeverityBlocker: 1, domain.SeverityError: 3, domain.SeverityWarning: 10}},
+		Tolerance: domain.TolerancePolicy{Currencies: map[string]domain.CurrencyTolerance{"USD": {AbsoluteMinorUnits: &toleranceMinor}}},
+	}}
+}
+
 func (f *fixture) defineReconciliation(org, name string, toleranceMinor int64) *domain.ReconciliationDefinition {
 	f.t.Helper()
-	d, err := f.s.DefineReconciliation(f.ctx, org, domain.DefineReconciliationRequest{
-		Name: name, MatchKeyFields: []string{"ref_id"},
-		ToleranceAmountMinorUnits: toleranceMinor, MaterialityAmountMinorUnits: 100000,
-	}, "test-operator")
+	return f.defineApproved(org, defineRequest(name, toleranceMinor))
+}
+
+// defineApproved defines a reconciliation and has a second principal approve
+// its first rule version, so it can run.
+func (f *fixture) defineApproved(org string, req domain.DefineReconciliationRequest) *domain.ReconciliationDefinition {
+	f.t.Helper()
+	d, err := f.s.DefineReconciliation(f.ctx, org, req, "test-operator", f.claim("DefineReconciliation", req.Name))
 	if err != nil {
-		f.t.Fatalf("define reconciliation %s: %v", name, err)
+		f.t.Fatalf("define reconciliation %s: %v", req.Name, err)
+	}
+	return f.approve(org, d.DefinitionID, 1)
+}
+
+func (f *fixture) approve(org, definitionID string, version int64) *domain.ReconciliationDefinition {
+	f.t.Helper()
+	if _, err := f.s.ApproveRuleVersion(f.ctx, org, definitionID, version, "rule-approver",
+		f.claim("ApproveRuleVersion", definitionID)); err != nil {
+		f.t.Fatalf("approve rule version %d: %v", version, err)
+	}
+	d, err := f.s.GetDefinition(f.ctx, org, definitionID)
+	if err != nil {
+		f.t.Fatal(err)
 	}
 	return d
 }
 
-func (f *fixture) startRun(org, definitionID string, populations []domain.PopulationInput) *domain.ReconciliationRun {
+// publish creates the next rule version from the definition's current rules
+// changed by mutate, and has it approved; it returns the definition after.
+func (f *fixture) publish(def *domain.ReconciliationDefinition, mutate func(*domain.RulesInput)) *domain.ReconciliationDefinition {
 	f.t.Helper()
-	r, err := f.s.StartRun(f.ctx, org, domain.StartRunRequest{DefinitionID: definitionID, Populations: populations},
-		"test-operator", f.claim("StartRun", definitionID))
+	v, err := f.s.CreateRuleVersion(f.ctx, orgA, def.DefinitionID, f.nextVersion(def, mutate), "test-operator",
+		f.claim("CreateRuleVersion", def.DefinitionID))
+	if err != nil {
+		f.t.Fatalf("create rule version: %v", err)
+	}
+	return f.approve(orgA, def.DefinitionID, v.RuleVersion)
+}
+
+func (f *fixture) nextVersion(def *domain.ReconciliationDefinition, mutate func(*domain.RulesInput)) domain.CreateRuleVersionRequest {
+	rs := def.RuleSet()
+	scale, pol := rs.AmountScale, rs.ExceptionPolicy
+	in := domain.RulesInput{Populations: rs.Populations, MatchKeyFields: rs.MatchKeyFields, BalanceDimensions: rs.BalanceDimensions,
+		AmountScale: &scale, Tolerance: rs.Tolerance, Materiality: rs.Materiality, ExceptionPolicy: &pol,
+		CertificationProfile: rs.CertificationProfile}
+	if mutate != nil {
+		mutate(&in)
+	}
+	based := def.LatestRuleVersion
+	return domain.CreateRuleVersionRequest{BasedOnVersion: &based, RulesInput: in, Reason: "test change"}
+}
+
+// testPop is one side's items as a test writes them; frozen() turns it into
+// what the population client hands StartRun after reading a source.
+type testPop struct {
+	Side         string
+	SourceSystem string
+	Items        []domain.PopulationItemInput
+}
+
+func frozen(p testPop) domain.FrozenPopulation {
+	declared := map[string]string{}
+	sums := map[string]int64{}
+	for _, it := range p.Items {
+		sums[it.Currency] += it.AmountMinorUnits
+	}
+	for c, v := range sums {
+		declared[c] = fmt.Sprintf("%d.%02d", v/100, v%100)
+	}
+	ref := "BANK/bank-transactions"
+	if p.Side == "Ledger" {
+		ref = "GL/account-postings?account_codes=1100"
+	}
+	return domain.FrozenPopulation{Side: p.Side, SourceSystem: p.SourceSystem, SpecRef: ref, Watermark: "wm-" + p.Side,
+		DeclaredRowCount: int64(len(p.Items)), DeclaredTotals: declared, Items: p.Items}
+}
+
+func frozenAll(pops []testPop) []domain.FrozenPopulation {
+	out := make([]domain.FrozenPopulation, len(pops))
+	for i, p := range pops {
+		out[i] = frozen(p)
+	}
+	return out
+}
+
+func (f *fixture) startRunE(org string, def *domain.ReconciliationDefinition, populations []testPop) (*domain.ReconciliationRun, error) {
+	return f.s.StartRun(f.ctx, org, domain.StartRunRequest{DefinitionID: def.DefinitionID, PeriodID: "2026-09"}, def.Version,
+		frozenAll(populations), "test-operator", f.claim("StartRun", def.DefinitionID))
+}
+
+func (f *fixture) startRun(org string, def *domain.ReconciliationDefinition, populations []testPop) *domain.ReconciliationRun {
+	f.t.Helper()
+	r, err := f.startRunE(org, def, populations)
 	if err != nil {
 		f.t.Fatalf("start run: %v", err)
 	}
 	return r
 }
 
+var itemSeq int64
+
 func item(refID string, amountMinor int64) domain.PopulationItemInput {
-	return domain.PopulationItemInput{RefID: refID, AmountMinorUnits: amountMinor, OccurredAt: time.Now().UTC()}
+	n := atomic.AddInt64(&itemSeq, 1)
+	return domain.PopulationItemInput{SourceRecordID: fmt.Sprintf("rec-%06d", n), RefID: refID, AmountMinorUnits: amountMinor,
+		Currency: "USD", OccurredAt: time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)}
 }

@@ -16,6 +16,7 @@ const (
 	WorkflowStatusEscalated   = "ESCALATED"
 	WorkflowStatusCancelled   = "CANCELLED"
 	WorkflowStatusInvalidated = "INVALIDATED"
+	WorkflowStatusExpired     = "EXPIRED"
 )
 
 // WorkflowInstance is one approval request moving through an ordered chain
@@ -37,8 +38,8 @@ type WorkflowInstance struct {
 	SubjectVersion     *int    `json:"subject_version,omitempty"`
 	SubjectFingerprint *string `json:"subject_fingerprint,omitempty"`
 
-	// WorkflowStatus: PENDING | APPROVED | REJECTED | ESCALATED | CANCELLED | INVALIDATED.
-	// APPROVED/REJECTED/CANCELLED/INVALIDATED are terminal.
+	// WorkflowStatus: PENDING | APPROVED | REJECTED | ESCALATED | CANCELLED | INVALIDATED | EXPIRED.
+	// APPROVED/REJECTED/CANCELLED/INVALIDATED/EXPIRED are terminal.
 	WorkflowStatus string `json:"workflow_status"`
 
 	// CurrentStage is the 1-based stage_order currently awaiting action.
@@ -55,6 +56,33 @@ type WorkflowInstance struct {
 	InvalidationReasonCode   *string    `json:"invalidation_reason_code,omitempty"`
 	InvalidationNarrative    *string    `json:"invalidation_narrative,omitempty"`
 	InvalidationEvidenceRefs []string   `json:"invalidation_evidence_refs,omitempty"`
+
+	// Deadline tracking for SLA/escalation per GOV-06 NFR / R-001 §4.4
+	DueAt        *time.Time `json:"due_at,omitempty"`
+	NextActionAt *time.Time `json:"next_action_at,omitempty"`
+
+	// Escalation target per R-001 §4.2
+	EscalationTarget *string `json:"escalation_target,omitempty"`
+
+	// R-001 §9.1 common columns for optimistic concurrency and audit
+	RowVersion      int       `json:"row_version"`
+	UpdatedAt       time.Time `json:"updated_at"`
+	CreatedBy       string    `json:"created_by"`
+	Plane           string    `json:"plane"`
+	DataClass       string    `json:"data_class"`
+	ResidencyRegion string    `json:"residency_region"`
+
+	// Idempotency key for INV-08 compliance
+	IdempotencyKey string `json:"idempotency_key,omitempty"`
+
+	// Versioned workflow definition reference per R-001 WFC-02
+	WorkflowDefinitionID      string `json:"workflow_definition_id,omitempty"`
+	WorkflowDefinitionVersion int    `json:"workflow_definition_version,omitempty"`
+
+	// ReviewCycle increments when changes are requested and the chain is
+	// decided again (000020); EscalatedAt is when it was last escalated.
+	ReviewCycle int        `json:"review_cycle"`
+	EscalatedAt *time.Time `json:"escalated_at,omitempty"`
 }
 
 // WorkflowStage is one approval gate in a workflow's ordered chain,
@@ -89,6 +117,21 @@ type WorkflowStage struct {
 
 	ActedAt   *time.Time `json:"acted_at"`
 	Rationale *string    `json:"rationale"`
+
+	// R-001 §9.1 common columns for optimistic concurrency and audit
+	RowVersion      int       `json:"row_version"`
+	UpdatedAt       time.Time `json:"updated_at"`
+	CreatedBy       string    `json:"created_by"`
+	Plane           string    `json:"plane"`
+	DataClass       string    `json:"data_class"`
+	ResidencyRegion string    `json:"residency_region"`
+
+	// ApproverRole is set only for a ROLE stage (routed by a definition);
+	// DueAt is the stage deadline; ActedBy is who decided it (a delegate or
+	// an escalation target acts for the stage, and the record says so).
+	ApproverRole *string    `json:"approver_role,omitempty"`
+	DueAt        *time.Time `json:"due_at,omitempty"`
+	ActedBy      *string    `json:"acted_by,omitempty"`
 }
 
 // WorkflowTransition is the append-only audit trail — one row per state
@@ -110,6 +153,17 @@ type WorkflowTransition struct {
 	CausationID   *string `json:"causation_id,omitempty"`
 
 	ActedAt time.Time `json:"acted_at"`
+
+	// Lineage (000020): the stage and review cycle decided, the authority
+	// snapshot (access decision, basis, delegation), the route version, and
+	// the governance-ledger decision id.
+	StageOrder                *int    `json:"stage_order,omitempty"`
+	ReviewCycle               *int    `json:"review_cycle,omitempty"`
+	AccessDecisionID          *string `json:"access_decision_id,omitempty"`
+	AuthorityBasis            *string `json:"authority_basis,omitempty"`
+	DelegationID              *string `json:"delegation_id,omitempty"`
+	WorkflowDefinitionVersion *int    `json:"workflow_definition_version,omitempty"`
+	DecisionID                *string `json:"decision_id,omitempty"`
 }
 
 // ── params ───────────────────────────────────────────────────────────────────
@@ -123,6 +177,11 @@ type CreateWorkflowStageInput struct {
 	ApproverPrincipalID string   `json:"approver_principal_id,omitempty"`
 	RequiredApprovals   int      `json:"required_approvals,omitempty"`
 	QuorumApprovers     []string `json:"quorum_approvers,omitempty"`
+	// ApproverRole routes a ROLE stage (definition-driven).
+	ApproverRole string `json:"approver_role,omitempty"`
+	// DueAtHours is the stage deadline, counted from when the stage becomes
+	// current; when it passes the instance is escalated.
+	DueAtHours int `json:"due_at_hours,omitempty"`
 }
 
 type CreateWorkflowParams struct {
@@ -136,19 +195,38 @@ type CreateWorkflowParams struct {
 	SubjectFingerprint *string
 	InitiatedBy        string
 	CorrelationID      string
-	Stages             []CreateWorkflowStageInput
+	IdempotencyKey     string
+	EscalationTarget   *string
+	// WorkflowDefinitionID/Version pin the instance to the definition that
+	// was in force when it started. Later definition changes must not
+	// retroactively alter an in-flight approval chain.
+	WorkflowDefinitionID      string
+	WorkflowDefinitionVersion int
+	Stages                    []CreateWorkflowStageInput
+	// DueAt is when the whole approval expires (R-001 Expire): past it, a
+	// PENDING or ESCALATED instance becomes EXPIRED. nil = no expiry.
+	DueAt *time.Time
 }
 
 // SubmitActionParams holds input for approving or rejecting the current stage.
 type SubmitActionParams struct {
 	WorkflowInstanceID string
 	ActorPrincipalID   string
+	AssignedApproverID string // optional: the assigned approver for this stage (for delegation)
 	// Action: APPROVE | REJECT.
 	Action    string
 	Rationale *string
 	// CausationID is optional: the event/decision that caused this specific
 	// action, when the caller knows it.
 	CausationID *string
+
+	// ActingAs is the stage the actor decides when they are not its named
+	// approver: "escalation" (the instance's escalation target on an
+	// ESCALATED stage) or "role" (a ROLE stage). Empty for a named approver
+	// or a delegate (AssignedApproverID).
+	ActingAs  string
+	Authority ActionAuthority
+	Meta      CommandMeta
 }
 
 // InvalidateWorkflowParams holds input for invalidating a workflow on material change.
@@ -161,6 +239,26 @@ type InvalidateWorkflowParams struct {
 	EvidenceRefs       []string
 	CorrelationID      string
 	CausationID        *string
+	// ExpectedVersion is the caller's X-Expected-Version precondition. When
+	// present, the update fails with ErrConcurrencyConflict unless it matches
+	// the instance's current row_version.
+	ExpectedVersion *int
+
+	Authority ActionAuthority
+	Meta      CommandMeta
+}
+
+// EscalateToWorkflowParams holds input for escalating a workflow to a different target.
+type EscalateToWorkflowParams struct {
+	WorkflowInstanceID string
+	ActorPrincipalID   string
+	EscalationTarget   string
+	ReasonCode         string
+	Narrative          *string
+	CorrelationID      string
+
+	Authority ActionAuthority
+	Meta      CommandMeta
 }
 
 // VerifyReleaseParams holds input for verifying an approval before release.
@@ -181,6 +279,65 @@ type ReleaseVerificationResult struct {
 	SubjectFingerprint *string `json:"subject_fingerprint,omitempty"`
 }
 
+// WorkflowDefinition is a versioned, immutable definition of an approval workflow.
+// Per R-001 WFC-02 and GOV-06, definitions are separate from instances.
+type WorkflowDefinition struct {
+	WorkflowDefinitionID string    `json:"workflow_definition_id"`
+	TenantID             string    `json:"tenant_id"`
+	WorkflowType         string    `json:"workflow_type"`
+	Version              int       `json:"version"`
+	StagesJSON           []byte    `json:"stages_json"`
+	Name                 *string   `json:"name,omitempty"`
+	Description          *string   `json:"description,omitempty"`
+	CreatedBy            string    `json:"created_by"`
+	CreatedAt            time.Time `json:"created_at"`
+	SupersededBy         *string   `json:"superseded_by,omitempty"`
+	IsActive             bool      `json:"is_active"`
+
+	// R-001 §9.1 common columns
+	RowVersion      int       `json:"row_version"`
+	UpdatedAt       time.Time `json:"updated_at"`
+	Plane           string    `json:"plane"`
+	DataClass       string    `json:"data_class"`
+	ResidencyRegion string    `json:"residency_region"`
+
+	// ExpiryHours: an instance started from this definition expires this
+	// long after it starts (000020). EscalationTarget: who an instance is
+	// escalated to when a stage deadline passes.
+	ExpiryHours      *int    `json:"expiry_hours,omitempty"`
+	EscalationTarget *string `json:"escalation_target,omitempty"`
+}
+
+// CreateWorkflowDefinitionParams holds input for creating a workflow definition.
+type CreateWorkflowDefinitionParams struct {
+	TenantID         string
+	WorkflowType     string
+	Version          int
+	StagesJSON       []byte
+	Name             *string
+	Description      *string
+	CreatedBy        string
+	ExpiryHours      *int
+	EscalationTarget *string
+}
+
+// GetWorkflowDefinitionParams holds input for retrieving a workflow definition.
+type GetWorkflowDefinitionParams struct {
+	TenantID             string
+	WorkflowType         string
+	Version              *int // nil = latest active
+	WorkflowDefinitionID *string
+}
+
+// ListWorkflowDefinitionsParams holds input for listing workflow definitions.
+type ListWorkflowDefinitionsParams struct {
+	TenantID     string
+	WorkflowType *string
+	IsActive     *bool
+	Limit        int
+	Offset       int
+}
+
 // ── errors ───────────────────────────────────────────────────────────────────
 
 var ErrWorkflowNotFound = errorString("workflow not found")
@@ -190,6 +347,14 @@ var ErrWrongApprover = errorString("actor is not the approver for the current st
 var ErrStoreUnavailable = errorString("workflow store unavailable")
 var ErrAuthorizationDenied = errorString("authorization denied for this approval action")
 var ErrAuthorizationServiceUnavailable = errorString("authorization-svc unavailable")
+
+// ErrConcurrencyConflict is returned when an optimistic concurrency check fails:
+// the workflow or stage was modified by another transaction concurrently.
+var ErrConcurrencyConflict = errorString("concurrency conflict: workflow was modified by another request")
+
+// ErrIdempotencyMismatch is returned when the same idempotency key is used
+// with a different request body — INV-08 / GCP §16 IDEMPOTENCY_MISMATCH.
+var ErrIdempotencyMismatch = errorString("idempotency key mismatch: same key used with different request body")
 
 // ErrInitiatorCannotBeApprover is a creation-time validation error:
 // Segregation of Duties (docs/original_doc/zoiko_suite_doc1.txt §12.3)

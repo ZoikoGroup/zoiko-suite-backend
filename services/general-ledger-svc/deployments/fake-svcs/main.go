@@ -58,11 +58,21 @@
  		})
  	})
  
- 	mux.HandleFunc("GET /v1/close/periods/status", func(w http.ResponseWriter, r *http.Request) {
+ 	// the currency registry's precision lookup, which the accounting kernel reads (JPY has no minor unit)
+	mux.HandleFunc("GET /v1/currencies/{code}", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		unit := 2
+		if r.PathValue("code") == "JPY" {
+			unit = 0
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"code": r.PathValue("code"), "minor_unit": map[string]any{"minor_unit": unit}})
+	})
+
+	mux.HandleFunc("GET /v1/close/periods/status", func(w http.ResponseWriter, r *http.Request) {
  		w.Header().Set("Content-Type", "application/json")
  		// Allow testing different period states via query params
  		periodState := r.URL.Query().Get("period_state")
- 		postingPolicy := r.URL.Query().Get("posting_policy")
+ 		_ = r.URL.Query().Get("posting_policy") // accepted for compatibility; the response derives the policy from period_state
  		reopenExpiresAt := r.URL.Query().Get("reopen_expires_at")
  
  		resp := periodStatusResponse{

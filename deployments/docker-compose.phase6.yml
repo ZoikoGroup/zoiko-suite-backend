@@ -244,6 +244,8 @@ services:
       DATABASE_URL: postgres://zoiko_app:zoiko_app_password@postgres:5432/migration_integrity?sslmode=disable
       KAFKA_BROKERS: kafka:9092
       KAFKA_TOPIC: zoiko.migration-integrity.events
+      # Required, no default (ZS-EVENT-001 §4 residencyregion).
+      EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"
       AUTHZ_SERVICE_URL: http://authorization-svc:8089
     depends_on:
       postgres:
@@ -272,9 +274,11 @@ services:
       PORT: "8140"
       AUTHZ_SERVICE_URL: http://authorization-svc:8089
       SIEM_SERVICE_URL: http://siem-integration-svc:8141
-    depends_on:
-      authorization-svc:
-        condition: service_healthy
+    # No depends_on authorization-svc: this service only calls it per request,
+    # while docker-compose.yml makes authorization-svc wait for this one (it
+    # provisions its server certificate here at startup). With both edges,
+    # running this file alongside docker-compose.yml failed with
+    # "dependency cycle detected".
     restart: on-failure
     healthcheck:
       test: ["CMD", "/app/healthcheck"]

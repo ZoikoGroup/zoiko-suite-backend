@@ -48,9 +48,17 @@ apply_migrations() {
         exit 1
     fi
 
+    # schema_migrations records what ran, so deployments/migrate.py can bring an
+    # EXISTING volume up to date later (this script only runs on a fresh one).
+    # Same table and checksum (sha256 of the file with CRLF normalised) as
+    # migrate.py, so a fresh volume is "tracked" from its first boot.
+    psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$db" -q -c         "CREATE TABLE IF NOT EXISTS schema_migrations (filename TEXT PRIMARY KEY, checksum TEXT NOT NULL, applied_at TIMESTAMPTZ NOT NULL DEFAULT now(), method TEXT NOT NULL);"
+
     for f in $(LC_ALL=C ls "$path"/*.up.sql 2>/dev/null | LC_ALL=C sort); do
         echo "    $db <- $(basename "$f")"
         psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$db" -f "$f"
+        sum=$(tr -d '\r' < "$f" | sha256sum | cut -d' ' -f1)
+        psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$db" -q -c             "INSERT INTO schema_migrations (filename, checksum, method) VALUES ('$(basename "$f")', '$sum', 'init-db.sh') ON CONFLICT DO NOTHING;"
         applied=$((applied + 1))
     done
 
@@ -116,6 +124,10 @@ notification:notification
 procurement_workflow:procurement-workflow
 performance_review:performance-review
 delegated_authority:delegated-authority
+currency_registry:currency-registry
+fiscal_calendar:fiscal-calendar
+accounting_period:accounting-period
+financial_statements:financial-statements
 access_control:access-control
 decision_support:decision-support
 treasury:treasury
@@ -231,6 +243,7 @@ zoiko_app_granted=0
 zoiko_app_skipped=0
 for db in \
     access_control accounts_payable accounts_receivable ai_governance asset_management audit_event_store \
+    currency_registry fiscal_calendar accounting_period financial_statements \
     inventory_management project_accounting \
     authorization_svc bank_reconciliation benefits board_resolutions capability_registry \
     clause_template commercial_account compensation configuration_feature_flag consolidation_svc \

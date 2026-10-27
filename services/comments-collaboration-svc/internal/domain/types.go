@@ -13,6 +13,28 @@ import (
 	"time"
 )
 
+// Classification is the platform's data-classification baseline
+// (04-data-model.md §20.1), the same four tiers document-vault-svc enforces.
+// BIZ-09 requires classification as an input and as inherited lineage but
+// defines no vocabulary of its own, so none is invented here.
+type Classification string
+
+const (
+	ClassificationPublic       Classification = "PUBLIC"
+	ClassificationInternal     Classification = "INTERNAL"
+	ClassificationConfidential Classification = "CONFIDENTIAL"
+	ClassificationRestricted   Classification = "RESTRICTED"
+)
+
+// ValidClassification reports whether s is one of the four baseline tiers.
+func ValidClassification(s string) bool {
+	switch Classification(s) {
+	case ClassificationPublic, ClassificationInternal, ClassificationConfidential, ClassificationRestricted:
+		return true
+	}
+	return false
+}
+
 type ThreadStatus string
 
 const (
@@ -34,18 +56,22 @@ const (
 // caller-supplied type+id pair — never a foreign key, same posture as
 // every other cross-service reference in this platform.
 type CommentThread struct {
-	ThreadID         string       `json:"thread_id"`
-	TenantID         string       `json:"tenant_id"`
-	LegalEntityID    string       `json:"legal_entity_id"`
-	LinkedObjectType string       `json:"linked_object_type"`
-	LinkedObjectID   string       `json:"linked_object_id"`
-	Restricted       bool         `json:"restricted"`
-	Status           ThreadStatus `json:"status"`
-	CreatedBy        string       `json:"created_by"`
-	CreatedAt        time.Time    `json:"created_at"`
-	ResolvedBy       string       `json:"resolved_by,omitempty"`
-	ResolvedAt       *time.Time   `json:"resolved_at,omitempty"`
-	ResolutionNote   string       `json:"resolution_note,omitempty"`
+	ThreadID         string `json:"thread_id"`
+	TenantID         string `json:"tenant_id"`
+	LegalEntityID    string `json:"legal_entity_id"`
+	LinkedObjectType string `json:"linked_object_type"`
+	LinkedObjectID   string `json:"linked_object_id"`
+	Restricted       bool   `json:"restricted"`
+	// Classification is the linked object's classification as asserted when
+	// the thread was created. Empty only for threads written before it was
+	// recorded — none is fabricated for them.
+	Classification string       `json:"classification,omitempty"`
+	Status         ThreadStatus `json:"status"`
+	CreatedBy      string       `json:"created_by"`
+	CreatedAt      time.Time    `json:"created_at"`
+	ResolvedBy     string       `json:"resolved_by,omitempty"`
+	ResolvedAt     *time.Time   `json:"resolved_at,omitempty"`
+	ResolutionNote string       `json:"resolution_note,omitempty"`
 }
 
 // Comment is one message in a thread, optionally a reply to another
@@ -53,11 +79,14 @@ type CommentThread struct {
 // CurrentVersionID always points at the latest CommentVersion; Body is
 // never a column on this table.
 type Comment struct {
-	CommentID              string        `json:"comment_id"`
-	ThreadID               string        `json:"thread_id"`
-	TenantID               string        `json:"tenant_id"`
-	ParentCommentID        string        `json:"parent_comment_id,omitempty"`
-	CurrentVersionID       string        `json:"current_version_id"`
+	CommentID        string `json:"comment_id"`
+	ThreadID         string `json:"thread_id"`
+	TenantID         string `json:"tenant_id"`
+	ParentCommentID  string `json:"parent_comment_id,omitempty"`
+	CurrentVersionID string `json:"current_version_id"`
+	// Classification is inherited from the thread when the comment is written
+	// and kept as the comment's own lineage snapshot.
+	Classification         string        `json:"classification,omitempty"`
 	Status                 CommentStatus `json:"status"`
 	CreatedBy              string        `json:"created_by"`
 	CreatedAt              time.Time     `json:"created_at"`
@@ -135,19 +164,31 @@ type ModerationEntry struct {
 // the thread for LinkedObjectType/LinkedObjectID; a RESOLVED thread found
 // this way is reopened to ACTIVE as part of adding the new comment — see
 // migration 000001's own doc comment on why.
+//
+// Restricted is a THREAD-level property (BIZ-09: "restricted threads require
+// purpose and membership controls"), fixed when the thread is created.
+// Adding to an existing thread must therefore state the thread's own
+// restricted value: a mismatch is refused with ErrThreadRestrictionMismatch
+// rather than silently accepted and discarded.
 type AddCommentParams struct {
 	TenantID, LegalEntityID          string
 	LinkedObjectType, LinkedObjectID string
 	Restricted                       bool
-	ParentCommentID                  string
-	Body                             string
-	CreatedByPrincipalID             string
+	// Classification is required when the call creates the thread. On an
+	// existing thread it may be omitted (the comment inherits the thread's) or
+	// must equal the thread's; a different value is ErrClassificationMismatch.
+	Classification       string
+	ParentCommentID      string
+	Body                 string
+	CreatedByPrincipalID string
+	Idem                 *Idempotency
 }
 
 // EditCommentParams — BIZ-09's own EditComment command. Never mutates an
 // existing CommentVersion; always inserts a new one.
 type EditCommentParams struct {
 	CommentID, TenantID, ActorPrincipalID, Body string
+	Idem                                        *Idempotency
 }
 
 // DeleteCommentParams — BIZ-09's own DeleteComment command. Never a hard
@@ -157,6 +198,7 @@ type EditCommentParams struct {
 // publishes nothing; that is the doc's own choice, not an oversight here.
 type DeleteCommentParams struct {
 	CommentID, TenantID, ActorPrincipalID, Reason string
+	Idem                                          *Idempotency
 }
 
 // MentionParams — BIZ-09's own Mention command. VisibilityGranted is
@@ -166,10 +208,12 @@ type DeleteCommentParams struct {
 type MentionParams struct {
 	CommentID, TenantID, MentionedPrincipalID string
 	VisibilityGranted                         bool
+	Idem                                      *Idempotency
 }
 
 type ReactParams struct {
 	CommentID, TenantID, PrincipalID, ReactionType string
+	Idem                                           *Idempotency
 }
 
 // ModerateParams — BIZ-09's own Moderate command. Reason is mandatory —
@@ -177,11 +221,13 @@ type ReactParams struct {
 // -> Fail; moderation history/reason required."
 type ModerateParams struct {
 	CommentID, TenantID, ModeratorPrincipalID, Action, Reason string
+	Idem                                                      *Idempotency
 }
 
 // ResolveThreadParams — BIZ-09's own ResolveThread command.
 type ResolveThreadParams struct {
 	ThreadID, TenantID, ActorPrincipalID, ResolutionNote string
+	Idem                                                 *Idempotency
 }
 
 // AttachReferenceParams — BIZ-09's own AttachReference command. Never
@@ -192,7 +238,26 @@ type AttachReferenceParams struct {
 	CommentID, TenantID              string
 	LinkedObjectType, LinkedObjectID string
 	AttachedByPrincipalID            string
+	Idem                             *Idempotency
 }
+
+// Idempotency carries a material write's Idempotency-Key (platform contract,
+// ZS-ARCH-SVC-001 §4 / INV-08) into the store. The store claims the key in
+// the SAME transaction as the mutation, so a retry — sequential or
+// concurrent — gets the original result instead of a duplicate row.
+// Scope: tenant + principal + operation + key. RequestHash fingerprints the
+// operation, its target and its body: reusing a key with a different
+// request is ErrIdempotencyConflict. Replayed is set by the store.
+type Idempotency struct {
+	Key         string
+	PrincipalID string
+	Operation   string
+	RequestHash string
+	Replayed    bool
+}
+
+// IsReplay is nil-safe: no Idempotency-Key means never a replay.
+func (i *Idempotency) IsReplay() bool { return i != nil && i.Replayed }
 
 // ── errors ───────────────────────────────────────────────────────────────────
 
@@ -211,6 +276,30 @@ var (
 	ErrParentCommentNotInThread = errors.New("parent_comment_id does not belong to this thread")
 
 	ErrReasonRequired = errors.New("reason is required")
+
+	// ErrActionRequired — a moderation trail entry must say what the
+	// moderator did. BIZ-09 defines no action vocabulary, so only presence is
+	// enforced here, never membership of an invented set.
+	// ErrClassificationRequired — creating a thread needs the linked object's
+	// classification (BIZ-09 required input).
+	ErrClassificationRequired = errors.New("classification is required when creating a thread")
+
+	// ErrClassificationInvalid — not one of PUBLIC, INTERNAL, CONFIDENTIAL,
+	// RESTRICTED.
+	ErrClassificationInvalid = errors.New("classification must be one of PUBLIC, INTERNAL, CONFIDENTIAL, RESTRICTED")
+
+	// ErrClassificationMismatch — a comment cannot carry a classification other
+	// than the one its thread already has; it inherits it.
+	ErrClassificationMismatch = errors.New("classification does not match the existing thread's classification")
+
+	ErrActionRequired = errors.New("action is required")
+
+	// ErrThreadRestrictionMismatch — see AddCommentParams.
+	ErrThreadRestrictionMismatch = errors.New("restricted does not match the existing thread's restricted setting")
+
+	// ErrIdempotencyConflict — the same Idempotency-Key was reused for a
+	// different request.
+	ErrIdempotencyConflict = errors.New("Idempotency-Key was already used for a different request")
 
 	// ErrNoVisibilityCheckRegistered is Mention's own fail-closed default
 	// — see internal/handler's own doc comment on ObjectVisibilityChecker

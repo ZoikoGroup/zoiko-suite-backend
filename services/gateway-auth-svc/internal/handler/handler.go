@@ -6,15 +6,19 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 	"go.uber.org/zap"
+	idenv "zoiko.io/identity-envelope"
 
+	"zoiko.io/gateway-auth-svc/internal/admission"
 	"zoiko.io/gateway-auth-svc/internal/carta"
 	"zoiko.io/gateway-auth-svc/internal/config"
 	"zoiko.io/gateway-auth-svc/internal/jwks"
+	"zoiko.io/gateway-auth-svc/internal/problem"
 	"zoiko.io/gateway-auth-svc/internal/siem"
 	"zoiko.io/gateway-auth-svc/internal/tenantctx"
 )
@@ -27,8 +31,18 @@ type Handler struct {
 	tenant *tenantctx.Resolver
 	log    *zap.Logger
 
+	// adm and rec are the INT-01 admission controls and the bounded record of
+	// refusals. rec is never nil; adm is the zero value (admit everything)
+	// until UseAdmission.
+	adm Admission
+	rec *admission.Recorder
+
 	// metrics is never nil — New installs nopMetrics.
 	metrics DomainMetrics
+
+	// revocation checks each verified envelope's session at
+	// identity-context-svc (AU-01). Nil skips the check (ENV=local only).
+	revocation *idenv.Revocation
 }
 
 // DomainMetrics records the outcomes this service's HTTP metrics cannot
@@ -86,6 +100,7 @@ func New(
 		tenant:  tenantResolver,
 		log:     log,
 		metrics: nopMetrics{},
+		rec:     admission.NewRecorder(1024, 0, nil),
 	}
 }
 
@@ -96,6 +111,14 @@ func (h *Handler) UseMetrics(m DomainMetrics) *Handler {
 	if m != nil {
 		h.metrics = m
 	}
+	return h
+}
+
+// UseRevocation makes /verify refuse an envelope whose session has ended. A
+// logout used to leave the envelope passing the edge until it expired (Auth
+// audit AU-01: revocation "must not wait for cache/token expiry").
+func (h *Handler) UseRevocation(r *idenv.Revocation) *Handler {
+	h.revocation = r
 	return h
 }
 
@@ -110,8 +133,57 @@ type envelopeClaims struct {
 	TenantID      string `json:"tenant_id"`
 	LegalEntityID string `json:"legal_entity_id"`
 	CorrelationID string `json:"correlation_id"`
+
+	// SourceChannel is GOV-01 §4's server-resolved channel, set by
+	// identity-context-svc when it could establish it (a verified client
+	// mapping or the principal's own type) and empty when only an assertion
+	// was available. Stamped as X-Source-Channel (S1-B1).
+	SourceChannel string `json:"source_channel"`
+
+	// SupportContextID is present only on a session identity-context-svc
+	// issued under a VERIFIED support elevation.
+	SupportContextID string `json:"support_context_id"`
+
+	// SessionTrustPosture.MFAVerified is the authentication assurance the
+	// session was issued with. A pointer so an envelope without the claim
+	// asserts nothing, rather than "single factor".
+	SessionTrustPosture struct {
+		MFAVerified      *bool  `json:"mfa_verified"`
+		SessionContextID string `json:"session_context_id"`
+	} `json:"session_trust_posture"`
+
+	// AuthTime is when the person last authenticated (OIDC auth_time, Unix
+	// seconds): the password login or a later TOTP step-up. NOT iat, which is
+	// when the envelope was minted and moves on every re-resolve. Zero when the
+	// envelope predates the claim, in which case no age is asserted.
+	AuthTime int64 `json:"auth_time"`
+
+	// SID is the login session the envelope descends from (OIDC sid).
+	SID string `json:"sid"`
+
 	jwt.RegisteredClaims
 }
+
+// maxAuthTimeSkew is how far in the future an auth_time may be before it is
+// treated as unknown rather than as a fresh login. The signature proves
+// identity-context-svc minted it; a clock ahead of ours must still never make a
+// login look more recent than "now".
+const maxAuthTimeSkew = time.Minute
+
+// Source-channel provenance, on X-Source-Channel-Basis.
+const (
+	// channelVerified: X-Source-Channel came from the signed envelope.
+	channelVerified = "verified"
+	// channelAsserted: the envelope named no channel, so the caller's own
+	// X-Source-Channel is passed on, labelled as the assertion it is.
+	channelAsserted = "asserted"
+)
+
+// Assurance levels, on X-Assurance-Level.
+const (
+	assuranceMFA          = "MFA"
+	assuranceSingleFactor = "SINGLE_FACTOR"
+)
 
 // Verify is called by Traefik's ForwardAuth middleware on every gated
 // request. A 2xx response grants access and its headers are copied into the
@@ -119,9 +191,16 @@ type envelopeClaims struct {
 // other status is returned to the client verbatim — fail-closed, the
 // protected backend never sees an unverified request.
 func (h *Handler) Verify(w http.ResponseWriter, r *http.Request) {
+	rc := h.requestContext(r)
+	release, admitted := h.admit(w, r, rc)
+	if !admitted {
+		return
+	}
+	defer release()
+
 	rawToken, ok := bearerToken(r.Header.Get("Authorization"))
 	if !ok {
-		h.deny(w, "missing bearer token", outcomeNoToken)
+		h.refuseAuth(w, r, rc, outcomeNoToken, "a bearer credential is required")
 		return
 	}
 
@@ -158,7 +237,7 @@ func (h *Handler) Verify(w http.ResponseWriter, r *http.Request) {
 			zap.Error(err),
 			zap.String("forwarded_uri", r.Header.Get("X-Forwarded-Uri")),
 		)
-		h.deny(w, "invalid token", outcomeInvalidToken)
+		h.refuseAuth(w, r, rc, outcomeInvalidToken, "the credential could not be verified")
 		return
 	}
 
@@ -172,7 +251,23 @@ func (h *Handler) Verify(w http.ResponseWriter, r *http.Request) {
 			zap.String("tenant_id", claims.TenantID),
 			zap.String("forwarded_uri", r.Header.Get("X-Forwarded-Uri")),
 		)
-		h.deny(w, "invalid token", outcomeIncompleteClaims)
+		h.refuseAuth(w, r, rc, outcomeIncompleteClaims, "the credential could not be verified")
+		return
+	}
+
+	// The token has named a tenant and a principal: from here refusals are
+	// evidenced against them, and the tenant quota applies. It runs before the
+	// CARTA and registry calls so a tenant over its quota cannot spend those
+	// services' capacity.
+	rc.tenantID, rc.principalID = claims.TenantID, claims.Principal.PrincipalID
+	if !h.admitTenant(w, r, rc) {
+		return
+	}
+
+	// AU-01: the envelope verified, but its session may have ended since it
+	// was minted. Asked of identity-context-svc (cached for the revocation
+	// TTL), before anything is forwarded.
+	if !h.sessionLive(ctx, w, r, rc, rawToken, claims) {
 		return
 	}
 
@@ -214,7 +309,10 @@ func (h *Handler) Verify(w http.ResponseWriter, r *http.Request) {
 		h.siem.Stream(ctx, claims.TenantID, "auth.tenant_hostname_mismatch", siem.SeverityCritical,
 			"token for tenant "+claims.TenantID+" presented against hostname-resolved tenant "+resolvedTenantID+
 				" by principal "+claims.Principal.PrincipalID)
-		h.denyMismatch(w, "token tenant does not match the hostname-resolved tenant")
+		h.refuse(w, r, rc, refusal{
+			outcome: outcomeTenantHostnameMismatch, code: problem.CodeContextInvalid, status: http.StatusForbidden,
+			detail: "token tenant does not match the hostname-resolved tenant", severity: siem.SeverityCritical, dedicated: true,
+		})
 		return
 	}
 
@@ -234,6 +332,17 @@ func (h *Handler) Verify(w http.ResponseWriter, r *http.Request) {
 		"MEDIUM",
 	)
 
+	// AU-23 (decision 21 Oct 2026): carta-svc configured but silent fails
+	// closed on a material write and open on a read. It used to fail open for
+	// everything, so an outage of the risk engine removed the control.
+	if assessment == nil && h.carta.Enabled() && materialWrite(originalMethod(r)) {
+		h.refuse(w, r, rc, refusal{
+			outcome: outcomeCartaUnavailable, code: problem.CodeAuthDenied, status: http.StatusServiceUnavailable,
+			detail: "continuous risk assessment unavailable", retryable: true,
+		})
+		return
+	}
+
 	if assessment != nil {
 		// Counted before the branch, so ALLOW and STEP_UP_MFA are visible too.
 		h.metrics.CartaDecision(string(assessment.Decision))
@@ -251,17 +360,37 @@ func (h *Handler) Verify(w http.ResponseWriter, r *http.Request) {
 			severityFor(assessment.Decision),
 			"CARTA flagged principal "+claims.Principal.PrincipalID+": "+string(assessment.Decision))
 
-		// ISOLATE/DENY/STEP_UP_MFA are hard-blocked: they represent risk high
-		// enough that this platform has no automated remediation for them.
-		// STEP_UP_MFA was previously allowed through because there was no
-		// step-up challenge flow downstream, but letting it pass silently
-		// defeats the risk engine's intent — a request that needs step-up
-		// must not proceed as if it were ALLOW.
-		if assessment.Decision == carta.DecisionIsolate || assessment.Decision == carta.DecisionDeny || assessment.Decision == carta.DecisionStepUpMFA {
-			h.metrics.VerifyDecision(outcomeCartaBlocked)
-			h.denyCarta(w, "access denied by continuous risk assessment", string(assessment.Decision))
+		// Every answer except ALLOW blocks. STEP_UP_MFA blocks because no
+		// step-up factor exists anywhere in the estate to satisfy it, and
+		// letting it pass answers the risk engine's "not like this" with yes.
+		// The test is "not ALLOW" rather than a list of the blocking values
+		// on purpose: a list lets through any decision it does not name — a
+		// value carta-svc adds later, or an empty one from a reply that
+		// parsed but carried no decision — and CARTA having answered is not
+		// the unreachable case that Evaluate deliberately fails open on.
+		// STEP_UP_MFA: a TOTP step-up now exists (identity-context-svc), so the
+		// answer is 401 step_up_required, which the console turns into a
+		// step-up and a retry, not a hard 403 (AU-23).
+		// X-Carta-Decision is set on these two refusals and nowhere else, so it
+		// is never attributed to a refusal the risk engine did not make.
+		if assessment.Decision == carta.DecisionStepUpMFA {
+			h.refuse(w, r, rc, refusal{
+				outcome: outcomeStepUpRequired, code: problem.CodeAuthDenied, status: http.StatusUnauthorized,
+				detail: "step-up authentication required", severity: severityFor(assessment.Decision), dedicated: true,
+				headers: [][2]string{
+					{"X-Carta-Decision", string(carta.DecisionStepUpMFA)},
+					// RFC 9470: authenticate again with a second factor and retry.
+					{"WWW-Authenticate", `Bearer error="insufficient_user_authentication", error_description="step-up authentication required"`},
+				},
+			})
 			return
 		}
+		h.refuse(w, r, rc, refusal{
+			outcome: outcomeCartaBlocked, code: problem.CodeAuthDenied, status: http.StatusForbidden,
+			detail: "access denied by continuous risk assessment", severity: severityFor(assessment.Decision), dedicated: true,
+			headers: [][2]string{{"X-Carta-Decision", string(assessment.Decision)}},
+		})
+		return
 	}
 
 	// GOV-01 (ZS-SVC-A-001 §4): resolve the authoritative tenant and operating
@@ -273,7 +402,7 @@ func (h *Handler) Verify(w http.ResponseWriter, r *http.Request) {
 	resolved, err := h.tenant.Resolve(ctx,
 		claims.TenantID, claims.LegalEntityID, materialWrite(originalMethod(r)))
 	if err != nil {
-		h.denyResolution(w, r, claims, err)
+		h.denyResolution(w, r, rc, claims, err)
 		return
 	}
 
@@ -283,6 +412,7 @@ func (h *Handler) Verify(w http.ResponseWriter, r *http.Request) {
 	if claims.CorrelationID != "" {
 		w.Header().Set("X-Correlation-Id", claims.CorrelationID)
 	}
+	setSessionContext(w, r, claims)
 
 	// Server-resolved context, forwarded so backends read authoritative values
 	// instead of the caller's assertions (§5 provenance class S: "client may
@@ -316,7 +446,56 @@ func (h *Handler) Verify(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.metrics.VerifyDecision(outcomeAllowed)
+	h.rec.Allowed(claims.TenantID)
 	w.WriteHeader(http.StatusOK)
+}
+
+// setSessionContext forwards the session facts the signed envelope carries, in
+// place of anything the caller wrote under the same names. Every header here
+// is in authResponseHeaders, so Traefik deletes the client's copy and keeps
+// only what this sets.
+//
+//   - X-Source-Channel (S1-B1, GOV-01 §4 "server-resolved source channel"):
+//     identity-context-svc puts the verified channel on the envelope, and it
+//     used to stop there — the edge passed the client's header through, so any
+//     caller could claim "system" or "scheduled_job". The verified value now
+//     wins. When the envelope names none, the caller's value is passed on, and
+//     X-Source-Channel-Basis says which of the two a backend is reading.
+//
+//   - X-Assurance-Level: MFA or SINGLE_FACTOR, from the session's
+//     mfa_verified. authorization-svc's step-up reads this header; through the
+//     edge it was whatever the client sent.
+//
+//   - X-Support-Context-Id: only a support elevation identity-context-svc
+//     verified at resolve time. Before, the edge stripped it outright, so no
+//     backend could see that a request ran under one.
+//
+//   - X-Authn-Age-Seconds (Group 1 register R-2, ZS-IAM-001 §3
+//     "Reauthentication age"): seconds since the envelope's auth_time, the
+//     moment the person last authenticated. Never derived from iat, which is
+//     when the envelope was minted and would overstate freshness on every
+//     re-resolve. With no auth_time (an envelope minted before the claim), or
+//     one more than maxAuthTimeSkew in the future, the header is not set: a
+//     backend reads an absent age as unknown, which authorization-svc's
+//     step-up treats as not recent. A client copy is always stripped (edge
+//     lists), so the only age a backend ever sees is this one.
+func setSessionContext(w http.ResponseWriter, r *http.Request, claims *envelopeClaims) {
+	setAuthnAge(w, claims.AuthTime, time.Now())
+	if ch := strings.TrimSpace(claims.SourceChannel); ch != "" {
+		w.Header().Set("X-Source-Channel", ch)
+		w.Header().Set("X-Source-Channel-Basis", channelVerified)
+	} else if asserted := strings.TrimSpace(r.Header.Get("X-Source-Channel")); asserted != "" {
+		w.Header().Set("X-Source-Channel", asserted)
+		w.Header().Set("X-Source-Channel-Basis", channelAsserted)
+	}
+	if mfa := claims.SessionTrustPosture.MFAVerified; mfa != nil {
+		if *mfa {
+			w.Header().Set("X-Assurance-Level", assuranceMFA)
+		} else {
+			w.Header().Set("X-Assurance-Level", assuranceSingleFactor)
+		}
+	}
+	setIfPresent(w, "X-Support-Context-Id", strings.TrimSpace(claims.SupportContextID))
 }
 
 func setIfPresent(w http.ResponseWriter, header, value string) {
@@ -356,7 +535,7 @@ func materialWrite(method string) bool {
 // its own — and re-authenticating will not change it, so 403. ErrUnavailable is
 // the absence of a decision; answering 403 would tell the caller it had been
 // refused when in fact nothing could be determined, so 503 with Retry-After.
-func (h *Handler) denyResolution(w http.ResponseWriter, r *http.Request, claims *envelopeClaims, err error) {
+func (h *Handler) denyResolution(w http.ResponseWriter, r *http.Request, rc *reqCtx, claims *envelopeClaims, err error) {
 	h.log.Warn("tenant context resolution failed",
 		zap.Error(err),
 		zap.String("principal_id", claims.Principal.PrincipalID),
@@ -373,25 +552,25 @@ func (h *Handler) denyResolution(w http.ResponseWriter, r *http.Request, claims 
 	// and have different fixes.
 	if errors.Is(err, tenantctx.ErrUnavailable) {
 		h.metrics.TenantContext("unavailable")
-		h.metrics.VerifyDecision(outcomeTenantContextUnresolved)
 		// Fail closed, and say why: no fallback to a global or default tenant,
 		// and no proceeding on a context nobody could confirm.
-		w.Header().Set("X-Tenant-Context", "unresolved")
-		w.Header().Set(denialReasonHeader, outcomeTenantContextUnresolved)
-		w.Header().Set("Retry-After", "5")
-		w.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = w.Write([]byte("tenant context could not be resolved"))
+		h.refuse(w, r, rc, refusal{
+			outcome: outcomeTenantContextUnresolved, code: problem.CodeContextInvalid,
+			status: http.StatusServiceUnavailable, detail: "tenant context could not be resolved",
+			retryable: true, retryAfter: 5, severity: siem.SeverityHigh,
+			headers: [][2]string{{"X-Tenant-Context", "unresolved"}},
+		})
 		return
 	}
 
 	h.metrics.TenantContext("denied")
-	h.metrics.VerifyDecision(outcomeTenantContextDenied)
 	h.siem.Stream(r.Context(), claims.TenantID, "tenant_context.denied", siem.SeverityHigh,
 		"tenant context denied for principal "+claims.Principal.PrincipalID)
-	w.Header().Set("X-Tenant-Context", "denied")
-	w.Header().Set(denialReasonHeader, outcomeTenantContextDenied)
-	w.WriteHeader(http.StatusForbidden)
-	_, _ = w.Write([]byte("tenant context denied"))
+	h.refuse(w, r, rc, refusal{
+		outcome: outcomeTenantContextDenied, code: problem.CodeContextInvalid, status: http.StatusForbidden,
+		detail: "tenant context denied", severity: siem.SeverityHigh, dedicated: true,
+		headers: [][2]string{{"X-Tenant-Context", "denied"}},
+	})
 }
 
 func severityFor(d carta.Decision) siem.Severity {
@@ -409,9 +588,18 @@ func severityFor(d carta.Decision) siem.Severity {
 
 // clientIP prefers the value Traefik sets over the raw socket address, which
 // would otherwise always be the gateway container's own address.
+// clientIP is the address CARTA scores. It is the RIGHTMOST X-Forwarded-For
+// entry: the one appended by the proxy directly in front of this service,
+// which no client can write. The leftmost entry is whatever the client sent,
+// so taking it let any caller choose the IP its risk was assessed on. With
+// ForwardAuth's trustForwardHeader off, Traefik sends a single entry (its
+// peer), so rightmost and only are the same.
 func clientIP(r *http.Request) string {
-	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
-		return strings.TrimSpace(strings.Split(fwd, ",")[0])
+	hops := strings.Split(strings.Join(r.Header.Values("X-Forwarded-For"), ","), ",")
+	for i := len(hops) - 1; i >= 0; i-- {
+		if hop := strings.TrimSpace(hops[i]); hop != "" {
+			return hop
+		}
 	}
 	return r.RemoteAddr
 }
@@ -441,14 +629,20 @@ func bearerToken(header string) (string, bool) {
 // depend on internal/telemetry — see DomainMetrics. The audit script compares
 // the two lists so they cannot drift apart unnoticed.
 const (
-	outcomeAllowed                 = "allowed"
-	outcomeNoToken                 = "no_token"
-	outcomeInvalidToken            = "invalid_token"
-	outcomeIncompleteClaims        = "incomplete_claims"
-	outcomeTenantHostnameMismatch  = "tenant_hostname_mismatch"
-	outcomeCartaBlocked            = "carta_blocked"
-	outcomeTenantContextDenied     = "tenant_context_denied"
-	outcomeTenantContextUnresolved = "tenant_context_unresolved"
+	outcomeAllowed                  = "allowed"
+	outcomeNoToken                  = "no_token"
+	outcomeInvalidToken             = "invalid_token"
+	outcomeIncompleteClaims         = "incomplete_claims"
+	outcomeTenantHostnameMismatch   = "tenant_hostname_mismatch"
+	outcomeCartaBlocked             = "carta_blocked"
+	outcomeTenantContextDenied      = "tenant_context_denied"
+	outcomeTenantContextUnresolved  = "tenant_context_unresolved"
+	outcomeSessionRevoked           = "session_revoked"
+	outcomeSessionStatusUnavailable = "session_status_unavailable"
+	outcomeStepUpRequired           = "step_up_required"
+	outcomeCartaUnavailable         = "carta_unavailable"
+	outcomeRateLimited              = "rate_limited"
+	outcomeOverloaded               = "overloaded"
 )
 
 // denialReasonHeader names why a request was refused, on every refusal.
@@ -458,34 +652,46 @@ const (
 // console tell the gateway's own refusals apart from the backend's.
 const denialReasonHeader = "X-Auth-Denial-Reason"
 
-// deny refuses with 401 and names the reason.
-func (h *Handler) deny(w http.ResponseWriter, msg, outcome string) {
-	h.metrics.VerifyDecision(outcome)
-	w.Header().Set(denialReasonHeader, outcome)
-	w.WriteHeader(http.StatusUnauthorized)
-	_, _ = w.Write([]byte(msg))
+// sessionLive runs the AU-01 revocation check and writes the refusal: 401
+// session_revoked for an ended session, 503 when identity-context-svc cannot
+// answer and the check fails closed.
+func (h *Handler) sessionLive(ctx context.Context, w http.ResponseWriter, r *http.Request, rc *reqCtx, token string, claims *envelopeClaims) bool {
+	if h.revocation == nil {
+		return true
+	}
+	c := &idenv.Claims{TenantID: claims.TenantID, SID: claims.SID}
+	c.Principal.PrincipalID = claims.Principal.PrincipalID
+	c.SessionTrustPosture.SessionContextID = claims.SessionTrustPosture.SessionContextID
+	err := h.revocation.Check(ctx, token, c)
+	switch {
+	case err == nil:
+		return true
+	case errors.Is(err, idenv.ErrRevoked):
+		h.log.Info("gateway refused a revoked session", zap.String("principal_id", claims.Principal.PrincipalID),
+			zap.String("session_context_id", c.SessionContextID()), zap.Error(err))
+		h.refuseAuth(w, r, rc, outcomeSessionRevoked, "session revoked")
+	default:
+		h.log.Error("identity session status unavailable — failing closed", zap.Error(err))
+		h.refuse(w, r, rc, refusal{
+			outcome: outcomeSessionStatusUnavailable, code: problem.CodeAuthDenied, status: http.StatusServiceUnavailable,
+			detail: "session status unavailable", retryable: true,
+		})
+	}
+	return false
 }
 
-// denyCarta refuses with 403 because continuous risk assessment said so.
-//
-// X-Carta-Decision is set here and ONLY here. It used to be set by a shared
-// helper that the tenant/hostname mismatch also called, so a token-spoofing
-// rejection was reported to the caller as a decision the risk engine had made
-// — attributing a refusal to a component that had not been consulted, and
-// sending anyone reading the header to carta-svc's logs to look for a decision
-// that was never there.
-func (h *Handler) denyCarta(w http.ResponseWriter, msg, decision string) {
-	w.Header().Set("X-Carta-Decision", decision)
-	w.Header().Set(denialReasonHeader, outcomeCartaBlocked)
-	w.WriteHeader(http.StatusForbidden)
-	_, _ = w.Write([]byte(msg))
-}
-
-// denyMismatch refuses with 403 because the token's tenant is not the tenant
-// the caller's hostname resolved to.
-func (h *Handler) denyMismatch(w http.ResponseWriter, msg string) {
-	h.metrics.VerifyDecision(outcomeTenantHostnameMismatch)
-	w.Header().Set(denialReasonHeader, outcomeTenantHostnameMismatch)
-	w.WriteHeader(http.StatusForbidden)
-	_, _ = w.Write([]byte(msg))
+// setAuthnAge stamps X-Authn-Age-Seconds from authTime (Unix seconds), or
+// leaves it unset when the age cannot be stated honestly.
+func setAuthnAge(w http.ResponseWriter, authTime int64, now time.Time) {
+	if authTime <= 0 {
+		return
+	}
+	age := now.Unix() - authTime
+	if age < -int64(maxAuthTimeSkew/time.Second) {
+		return
+	}
+	if age < 0 {
+		age = 0
+	}
+	w.Header().Set("X-Authn-Age-Seconds", strconv.FormatInt(age, 10))
 }

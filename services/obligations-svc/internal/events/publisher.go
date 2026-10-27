@@ -13,6 +13,7 @@ import (
 
 	"zoiko.io/obligations-svc/internal/domain"
 	"zoiko.io/obligations-svc/internal/middleware"
+	"zoiko.io/obligations-svc/internal/telemetry"
 )
 
 // envelope is this platform's event contract (Doc 03 §19): every published
@@ -66,17 +67,18 @@ type Publisher struct {
 	log      *zap.Logger
 	topic    string
 	producer MessageWriter
+	metrics  *telemetry.Metrics
 }
 
 // NewPublisher constructs a Publisher bound to the given topic and Kafka writer.
-func NewPublisher(log *zap.Logger, topic string, producer *kafka.Writer) *Publisher {
-	return &Publisher{log: log, topic: topic, producer: producer}
+func NewPublisher(log *zap.Logger, topic string, producer *kafka.Writer, metrics *telemetry.Metrics) *Publisher {
+	return &Publisher{log: log, topic: topic, producer: producer, metrics: metrics}
 }
 
 // NewPublisherWithWriter is NewPublisher but with a caller-supplied
 // MessageWriter — used by tests to substitute a fake.
-func NewPublisherWithWriter(log *zap.Logger, topic string, producer MessageWriter) *Publisher {
-	return &Publisher{log: log, topic: topic, producer: producer}
+func NewPublisherWithWriter(log *zap.Logger, topic string, producer MessageWriter, metrics *telemetry.Metrics) *Publisher {
+	return &Publisher{log: log, topic: topic, producer: producer, metrics: metrics}
 }
 
 // PublishObligationCreated publishes obligation.created for a newly-created
@@ -126,6 +128,25 @@ func (p *Publisher) PublishObligationClosed(ctx context.Context, o domain.Obliga
 	})
 }
 
+// PublishEnvelope writes an envelope that was already built and stored by the
+// transactional outbox. The bytes are not re-serialised, so the event_id and
+// emitted_at recorded with the business transaction are the ones delivered.
+func (p *Publisher) PublishEnvelope(ctx context.Context, key string, envelope []byte) error {
+	msg := kafka.Message{Key: []byte(key), Value: envelope}
+	if err := p.producer.WriteMessages(ctx, msg); err != nil {
+		if p.metrics != nil {
+			p.metrics.EventPublishFailures.WithLabelValues("outbox").Inc()
+		}
+		return fmt.Errorf("outbox publish: kafka write: %w", err)
+	}
+
+	p.log.Info("event published",
+		zap.String("topic", p.topic),
+		zap.String("key", key),
+	)
+	return nil
+}
+
 // emit serialises the payload into the canonical envelope and writes it to
 // the Kafka topic set on the Writer (main.go) — not set here, since kafka-go
 // rejects a Message that also specifies Topic when the Writer already has one.
@@ -162,6 +183,9 @@ func (p *Publisher) emit(ctx context.Context, eventType, correlationID, legalEnt
 
 	msg := kafka.Message{Key: []byte(key), Value: data}
 	if err := p.producer.WriteMessages(ctx, msg); err != nil {
+		if p.metrics != nil {
+			p.metrics.EventPublishFailures.WithLabelValues(eventType).Inc()
+		}
 		return fmt.Errorf("event %q: kafka write: %w", eventType, err)
 	}
 

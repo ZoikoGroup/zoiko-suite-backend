@@ -272,6 +272,8 @@ func (rs *Resolver) get(ctx context.Context, e Envelope, path string, into any) 
 	req.Header.Set(HeaderSourceChannel, string(ChannelSystem))
 	req.Header.Set("Accept", "application/json")
 
+	ForwardTo(ctx, req)
+
 	resp, err := rs.http.Do(req)
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrResolverUnavailable, err)

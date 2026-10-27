@@ -873,6 +873,13 @@ This is the runtime rules foundation of ZoikoSuite.
 
 - activated_at
 
+*Physical names (recorded 14 Oct 2026; policy-svc column and wire names):*
+Policy `policy_domain` → `policy_type`; a NULL `tenant_id` is a platform-wide family ·
+PolicyVersion `policy_payload` → `rule_payload` (with a server-derived `artifact_digest`) ·
+`activation_status` → `version_status`, whose values are the GOV-05 state model
+(DRAFT, REVIEW, APPROVED, SCHEDULED, ACTIVE, SUSPENDED, SUPERSEDED, RETIRED) ·
+`activated_by` → `activated_by_principal_id` · `version_number` is sequential per policy and owning tenant.
+
 ### **Jurisdiction**
 
 - jurisdiction_id
@@ -942,6 +949,13 @@ This is the runtime rules foundation of ZoikoSuite.
 - correlation_id
 
 - decision_timestamp
+
+*Physical names (recorded 12 Oct 2026; governance-decision-log-svc wire and column names, which every caller already uses):*
+`governance_decision_id` → `decision_id` (unique per tenant: key `(tenant_id, decision_id)`) ·
+`principal_id` → `actor_id` (always the authenticated caller) ·
+`jurisdiction_rule_basis` → `rule_basis` + `jurisdiction_context` ·
+`authorization_outcome` → `outcome` ·
+`decision_timestamp` → `decided_at` (upstream decision time) plus server-assigned `recorded_at`.
 
 ### **EvidenceRequirement**
 

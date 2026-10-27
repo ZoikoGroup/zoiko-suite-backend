@@ -62,6 +62,13 @@ type Metrics struct {
 	HTTPRequestsTotal   *prometheus.CounterVec
 	HTTPRequestDuration *prometheus.HistogramVec
 	ReadinessUp         prometheus.Gauge
+
+	// Backlogs of the two outboxes, so a stalled relay is alertable rather
+	// than silent (GCP domain negative path #28).
+	EvidencePending     prometheus.Gauge
+	EvidenceFailed      prometheus.Gauge
+	OutboxPending       prometheus.Gauge
+	OutboxOldestSeconds prometheus.Gauge
 }
 
 func NewMetrics(serviceName string) *Metrics {
@@ -82,8 +89,29 @@ func NewMetrics(serviceName string) *Metrics {
 			Help:        "1 if the last /readyz check succeeded, 0 otherwise.",
 			ConstLabels: prometheus.Labels{"service": serviceName},
 		}),
+		EvidencePending: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name:        "policy_evidence_pending",
+			Help:        "Evaluations stored but not yet in the governance ledger.",
+			ConstLabels: prometheus.Labels{"service": serviceName},
+		}),
+		EvidenceFailed: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name:        "policy_evidence_failed",
+			Help:        "Evaluations the governance ledger refused for good (parked for review).",
+			ConstLabels: prometheus.Labels{"service": serviceName},
+		}),
+		OutboxPending: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name:        "outbox_pending",
+			Help:        "Events committed but not yet published.",
+			ConstLabels: prometheus.Labels{"service": serviceName},
+		}),
+		OutboxOldestSeconds: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name:        "outbox_oldest_pending_seconds",
+			Help:        "Age of the oldest unpublished event, 0 when none.",
+			ConstLabels: prometheus.Labels{"service": serviceName},
+		}),
 	}
-	prometheus.MustRegister(m.HTTPRequestsTotal, m.HTTPRequestDuration, m.ReadinessUp)
+	prometheus.MustRegister(m.HTTPRequestsTotal, m.HTTPRequestDuration, m.ReadinessUp,
+		m.EvidencePending, m.EvidenceFailed, m.OutboxPending, m.OutboxOldestSeconds)
 	return m
 }
 

@@ -30,6 +30,13 @@ func (h *Handler) Readiness(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 	defer cancel()
 
+	if h.pool == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "unavailable", "reason": "db_pool_not_configured"})
+		return
+	}
+
 	if err := h.pool.Ping(ctx); err != nil {
 		h.log.Error("readiness probe: db ping failed", zap.Error(err))
 		w.Header().Set("Content-Type", "application/json")

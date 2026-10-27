@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.uber.org/zap"
 
 	"zoiko.io/financial-close-svc/internal/domain"
 	svcmiddleware "zoiko.io/financial-close-svc/internal/middleware"
@@ -24,7 +25,7 @@ func newRequirement(tenantID, entity, kind, subledger, book, bank, reason string
 
 func TestCloseRequirements_AddListReplayRemove(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
 	tenantID := uuid.NewString()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
@@ -81,7 +82,7 @@ func TestCloseRequirements_AddListReplayRemove(t *testing.T) {
 // the handler does.
 func TestCloseRequirements_DatabaseRefusesInvalidShapes(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
 	tenantID := uuid.NewString()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
@@ -104,7 +105,7 @@ func TestCloseRequirements_DatabaseRefusesInvalidShapes(t *testing.T) {
 // A requirement is evidence: only its removal stamp may ever change, once.
 func TestCloseRequirements_RowsAreImmutableAndNeverDeleted(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
 	tenantID := uuid.NewString()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 	cr := newRequirement(tenantID, "le-1", domain.CloseRequirementBankAccountExclusion, "", "", "acct-1", "dormant, zero balance")
@@ -136,7 +137,7 @@ func TestCloseRequirements_RowsAreImmutableAndNeverDeleted(t *testing.T) {
 
 func TestCloseRequirements_TenantIsolation(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
 	a, b := uuid.NewString(), uuid.NewString()
 	ctxA := svcmiddleware.WithTenant(context.Background(), a)
 	ctxB := svcmiddleware.WithTenant(context.Background(), b)

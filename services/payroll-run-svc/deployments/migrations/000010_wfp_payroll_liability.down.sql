@@ -1,0 +1,9 @@
+DROP TABLE IF EXISTS wfp_liability_exceptions;
+DROP TABLE IF EXISTS wfp_liability_adjustments;
+DROP TABLE IF EXISTS wfp_liability_settlements;
+DROP TABLE IF EXISTS wfp_payroll_liabilities;
+DROP TABLE IF EXISTS wfp_liability_classes;
+DROP FUNCTION IF EXISTS wfp_exc_guard();
+DROP FUNCTION IF EXISTS wfp_liab_update_guard();
+DROP FUNCTION IF EXISTS wfp_liab_insert_guard();
+DROP FUNCTION IF EXISTS wfp_liab_append_only();

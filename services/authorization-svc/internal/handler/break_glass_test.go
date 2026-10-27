@@ -30,7 +30,7 @@ func TestBreakGlass_Create_Success(t *testing.T) {
 		"principal_id": "` + testBGElevatedUser + `",
 		"incident_id": "INC-CRIT-991",
 		"reason": "Payment gateway failover outage remediation",
-		"requested_actions": ["payment.override", "period.reopen"],
+		"requested_actions": ["gateway.failover", "period.reopen"],
 		"duration_seconds": 1800
 	}`
 
@@ -38,6 +38,7 @@ func TestBreakGlass_Create_Success(t *testing.T) {
 	req.Header.Set("X-Tenant-Id", testBGTenantID)
 	req.Header.Set("X-Principal-Id", testBGCaller)
 	req.Header.Set("X-Correlation-ID", "corr-bg-1")
+	req = withStepUp(req, testBGCaller)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 

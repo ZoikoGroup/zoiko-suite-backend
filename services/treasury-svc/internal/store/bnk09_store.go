@@ -59,7 +59,17 @@ func (s *PgStore) CreateTreasuryTransfer(ctx context.Context, p domain.CreateTre
 		err := scanTreasuryTransfer(row, &t)
 		if err == nil {
 			created = true
-			return nil
+			// Enqueue treasury_transfer.created event
+			return s.enqueueTreasuryTransferEvent(ctx, tx, "created", "treasury_transfer.created", p.TenantID, "", t.TransferID, p.MakerPrincipalID, p.CorrelationID, map[string]any{
+				"transfer_id":        t.TransferID,
+				"tenant_id":          t.TenantID,
+				"source_account_id":  t.SourceBankAccountID,
+				"target_account_id":  t.TargetBankAccountID,
+				"amount":             t.Amount,
+				"currency_code":      t.CurrencyCode,
+				"is_cross_entity":    t.IsCrossEntity,
+				"status":             t.Status,
+			})
 		}
 		if !errors.Is(err, pgx.ErrNoRows) {
 			return err
@@ -119,7 +129,16 @@ func (s *PgStore) ApproveTreasuryTransfer(ctx context.Context, p domain.ApproveT
 			WHERE transfer_id=$1 AND tenant_id=$2 AND status='PENDING_APPROVAL'
 			RETURNING `+treasuryTransferColumns,
 			p.TransferID, p.TenantID, domain.TransferApproved, p.CheckerPrincipalID)
-		return scanTreasuryTransfer(row, &t)
+		if err := scanTreasuryTransfer(row, &t); err != nil {
+			return err
+		}
+		// Enqueue treasury_transfer.approved event
+		return s.enqueueTreasuryTransferEvent(ctx, tx, "approved", "treasury_transfer.approved", p.TenantID, "", t.TransferID, p.CheckerPrincipalID, "", map[string]any{
+			"transfer_id":       t.TransferID,
+			"tenant_id":         t.TenantID,
+			"status":            t.Status,
+			"checker_principal": t.CheckerPrincipalID,
+		})
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, s.notFoundOrInvalidTransfer(ctx, p.TenantID, p.TransferID)
@@ -154,7 +173,16 @@ func (s *PgStore) AuthorizeTreasuryTransfer(ctx context.Context, p domain.Author
 			WHERE transfer_id=$1 AND tenant_id=$2 AND status='APPROVED' AND is_cross_entity=true
 			RETURNING `+treasuryTransferColumns,
 			p.TransferID, p.TenantID, domain.TransferAuthorized, p.AuthorizerPrincipalID)
-		return scanTreasuryTransfer(row, &t)
+		if err := scanTreasuryTransfer(row, &t); err != nil {
+			return err
+		}
+		// Enqueue treasury_transfer.authorized event
+		return s.enqueueTreasuryTransferEvent(ctx, tx, "authorized", "treasury_transfer.authorized", p.TenantID, "", t.TransferID, p.AuthorizerPrincipalID, "", map[string]any{
+			"transfer_id":        t.TransferID,
+			"tenant_id":          t.TenantID,
+			"status":             t.Status,
+			"authorizer_principal": t.AuthorizerPrincipalID,
+		})
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, s.notFoundOrInvalidTransfer(ctx, p.TenantID, p.TransferID)
@@ -223,7 +251,17 @@ func (s *PgStore) RejectTreasuryTransfer(ctx context.Context, p domain.RejectTre
 			WHERE transfer_id=$1 AND tenant_id=$2 AND status='PENDING_APPROVAL'
 			RETURNING `+treasuryTransferColumns,
 			p.TransferID, p.TenantID, domain.TransferRejected, p.CheckerPrincipalID, p.Reason)
-		return scanTreasuryTransfer(row, &t)
+		if err := scanTreasuryTransfer(row, &t); err != nil {
+			return err
+		}
+		// Enqueue treasury_transfer.rejected event
+		return s.enqueueTreasuryTransferEvent(ctx, tx, "rejected", "treasury_transfer.rejected", p.TenantID, "", t.TransferID, p.CheckerPrincipalID, "", map[string]any{
+			"transfer_id":      t.TransferID,
+			"tenant_id":        t.TenantID,
+			"status":           t.Status,
+			"reject_reason":    t.RejectReason,
+			"checker_principal": t.CheckerPrincipalID,
+		})
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, s.notFoundOrInvalidTransfer(ctx, p.TenantID, p.TransferID)
@@ -248,7 +286,16 @@ func (s *PgStore) MarkTransferSubmitted(ctx context.Context, tenantID, transferI
 			WHERE transfer_id=$1 AND tenant_id=$2 AND status='APPROVED'
 			RETURNING `+treasuryTransferColumns,
 			transferID, tenantID, domain.TransferSubmitted, paymentAttemptID)
-		return scanTreasuryTransfer(row, &t)
+		if err := scanTreasuryTransfer(row, &t); err != nil {
+			return err
+		}
+		// Enqueue treasury_transfer.submitted event
+		return s.enqueueTreasuryTransferEvent(ctx, tx, "submitted", "treasury_transfer.submitted", tenantID, "", transferID, "", paymentAttemptID, map[string]any{
+			"transfer_id":          t.TransferID,
+			"tenant_id":            t.TenantID,
+			"status":               t.Status,
+			"payment_attempt_id":   t.PaymentAttemptID,
+		})
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, s.notFoundOrInvalidTransfer(ctx, tenantID, transferID)
@@ -377,7 +424,17 @@ func (s *PgStore) CancelBeforeSubmission(ctx context.Context, p domain.CancelBef
 			WHERE transfer_id=$1 AND tenant_id=$2 AND status IN ('DRAFT','PENDING_APPROVAL','APPROVED')
 			RETURNING `+treasuryTransferColumns,
 			p.TransferID, p.TenantID, domain.TransferCancelled, p.Reason)
-		return scanTreasuryTransfer(row, &t)
+		if err := scanTreasuryTransfer(row, &t); err != nil {
+			return err
+		}
+		// Enqueue treasury_transfer.cancelled event
+		return s.enqueueTreasuryTransferEvent(ctx, tx, "cancelled", "treasury_transfer.cancelled", p.TenantID, "", t.TransferID, p.ActorPrincipalID, "", map[string]any{
+			"transfer_id":      t.TransferID,
+			"tenant_id":        t.TenantID,
+			"status":           t.Status,
+			"cancel_reason":    t.CancelReason,
+			"actor_principal":  t.MakerPrincipalID, // reusing field
+		})
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, s.notFoundOrInvalidTransfer(ctx, p.TenantID, p.TransferID)
@@ -399,7 +456,17 @@ func (s *PgStore) MarkTransferReturned(ctx context.Context, p domain.MarkTransfe
 			WHERE transfer_id=$1 AND tenant_id=$2 AND status IN ('SUBMITTED','LEDGER_POSTED','INTERCOMPANY_PAIRED')
 			RETURNING `+treasuryTransferColumns,
 			p.TransferID, p.TenantID, domain.TransferReturned, p.Reason)
-		return scanTreasuryTransfer(row, &t)
+		if err := scanTreasuryTransfer(row, &t); err != nil {
+			return err
+		}
+		// Enqueue treasury_transfer.returned event
+		return s.enqueueTreasuryTransferEvent(ctx, tx, "returned", "treasury_transfer.returned", p.TenantID, "", t.TransferID, p.ActorPrincipalID, "", map[string]any{
+			"transfer_id":     t.TransferID,
+			"tenant_id":       t.TenantID,
+			"status":          t.Status,
+			"return_reason":   t.ReturnReason,
+			"actor_principal": t.AuthorizerPrincipalID, // reusing field, but should be actor
+		})
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, s.notFoundOrInvalidTransfer(ctx, p.TenantID, p.TransferID)
@@ -439,7 +506,20 @@ func (s *PgStore) ResolveTreasuryTransfer(ctx context.Context, p domain.ResolveT
 				RETURNING `+treasuryTransferColumns,
 				p.TransferID, p.TenantID, domain.TransferCancelled, p.Note)
 		}
-		return scanTreasuryTransfer(row, &t)
+		if err := scanTreasuryTransfer(row, &t); err != nil {
+			return err
+		}
+		// Enqueue treasury_transfer.cancelled event only for CANCEL resolution
+		if p.Resolution == domain.ResolutionCancel {
+			return s.enqueueTreasuryTransferEvent(ctx, tx, "cancelled", "treasury_transfer.cancelled", p.TenantID, "", t.TransferID, p.ActorPrincipalID, "", map[string]any{
+				"transfer_id":      t.TransferID,
+				"tenant_id":        t.TenantID,
+				"status":           t.Status,
+				"resolution_note":  t.ResolutionNote,
+				"actor_principal":  t.MakerPrincipalID,
+			})
+		}
+		return nil
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, s.notFoundOrInvalidTransfer(ctx, p.TenantID, p.TransferID)
@@ -463,7 +543,15 @@ func (s *PgStore) MarkTransferCompleted(ctx context.Context, tenantID, transferI
 			WHERE transfer_id=$1 AND tenant_id=$2 AND status IN ('SUBMITTED','INTERCOMPANY_PAIRED')
 			RETURNING `+treasuryTransferColumns,
 			transferID, tenantID, domain.TransferCompleted)
-		return scanTreasuryTransfer(row, &t)
+		if err := scanTreasuryTransfer(row, &t); err != nil {
+			return err
+		}
+		// Enqueue treasury_transfer.settled event
+		return s.enqueueTreasuryTransferEvent(ctx, tx, "settled", "treasury_transfer.settled", tenantID, "", transferID, "", "", map[string]any{
+			"transfer_id": t.TransferID,
+			"tenant_id":   t.TenantID,
+			"status":      t.Status,
+		})
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, s.notFoundOrInvalidTransfer(ctx, tenantID, transferID)

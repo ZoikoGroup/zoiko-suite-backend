@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"zoiko.io/notification-svc/internal/ncd"
+	"zoiko.io/notification-svc/internal/ncdcode"
 )
 
 // ZS-SVC-Y-001 NCD-05 (sections 8.1 to 8.5): the regulated notice package.
@@ -58,7 +58,7 @@ var (
 	ErrNoticeInvalid  = errors.New("notice is invalid")
 	ErrNoticeState    = errors.New("notice is not in a state that allows this")
 	// ErrNoticeEvidenceInsufficient (NCD-016): a response arrived before delivery was evidenced.
-	ErrNoticeEvidenceInsufficient = fmt.Errorf("%w: %s: delivery has not been evidenced yet", ErrNoticeState, ncd.Format(ncd.EvidenceInsufficient))
+	ErrNoticeEvidenceInsufficient = fmt.Errorf("%w: %s: delivery has not been evidenced yet", ErrNoticeState, ncdcode.Format(ncdcode.EvidenceInsufficient))
 	ErrNotNoticeRecipient         = errors.New("only the notice's recipient may respond to it")
 	ErrNoticeAlreadyAnswered      = errors.New("this notice has already been answered")
 	ErrAckNotRequired             = errors.New("this notice does not call for an acknowledgement")
@@ -258,7 +258,7 @@ func DecideNoticeProgress(n *Notice, notificationStatus, notificationFailure str
 		case notificationStatus == StatusSent && accepted:
 			return NoticeProgress{NoticeDeliveryEvidenced, "the receiving mail server accepted the message (MAILBOX_ACCEPTED); this does not prove the recipient saw it"}, true
 		case n.DeadlineAt != nil && !now.Before(*n.DeadlineAt):
-			return NoticeProgress{NoticeException, ncd.Format(ncd.DeliveryExpired) + ": the deadline passed before delivery could be evidenced"}, true
+			return NoticeProgress{NoticeException, ncdcode.Format(ncdcode.DeliveryExpired) + ": the deadline passed before delivery could be evidenced"}, true
 		}
 	case NoticeDeliveryEvidenced:
 		if n.AckRequirement == AckNone {

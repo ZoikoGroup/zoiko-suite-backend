@@ -535,5 +535,11 @@ func FieldMappings(c domain.IndexContract) []searchclient.FieldMapping {
 			Analyzer:   analyzer,
 		})
 	}
+	if c.Embedding != nil {
+		// The pinned width and space come from the contract, so a generation's
+		// mapping is fixed at build and a provider that changed its output
+		// cannot widen it (§10.1, NP-35).
+		out = append(out, searchclient.VectorMapping(c.Embedding.Dimensions, c.Embedding.Similarity))
+	}
 	return out
 }

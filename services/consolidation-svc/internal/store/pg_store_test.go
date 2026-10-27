@@ -17,6 +17,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.uber.org/zap"
 
 	"zoiko.io/consolidation-svc/internal/domain"
 	svcmiddleware "zoiko.io/consolidation-svc/internal/middleware"
@@ -41,13 +42,18 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	base := filepath.Dir(filename)
 
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS
-		consolidation_adjustments, balance_contributions, balance_snapshots, consolidation_runs
+		command_idempotency, eventing_outbox, consolidation_eliminations, consolidation_adjustment_transitions, consolidation_adjustments, balance_contributions, balance_snapshots, consolidation_runs
 		CASCADE;`)
 
 	for _, migration := range []string{
 		"000001_initial_schema.up.sql",
 		"000002_add_balance_contributions.up.sql",
 		"000003_add_consolidation_adjustments.up.sql",
+		"000004_add_eventing_outbox.up.sql",
+		"000005_eventing_outbox_relay_policy.up.sql",
+		"000006_add_consolidation_adjustment_transitions.up.sql",
+		"000007_add_consolidation_eliminations.up.sql",
+		"000008_add_command_idempotency.up.sql",
 	} {
 		sql, err := os.ReadFile(filepath.Join(base, "../../deployments/migrations", migration))
 		if err != nil {
@@ -59,6 +65,10 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	}
 
 	return pool
+}
+
+func newTestStore(pool *pgxpool.Pool) *store.PgStore {
+	return store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
 }
 
 func newTestRun(tenantID, groupLegalEntityID string) *domain.ConsolidationRun {
@@ -83,9 +93,39 @@ func newTestAdjustment(tenantID, groupLegalEntityID, createdBy string) *domain.C
 	}
 }
 
+// Every mutating command now requires the Idempotency-Key that makes a retry a
+// replay (migration 000008). These adapters give each call in the store's own
+// tests a fresh key: each call is a distinct command, and the key's replay and
+// conflict rules are covered directly by idempotency_integration_test.go and
+// the handler tests.
+func createRun(s *store.PgStore, ctx context.Context, run *domain.ConsolidationRun, actorID, correlationID string) error {
+	_, _, err := s.CreateRun(ctx, run, uuid.NewString(), actorID, correlationID)
+	return err
+}
+
+func createAdjustment(s *store.PgStore, ctx context.Context, a *domain.ConsolidationAdjustment, correlationID string) error {
+	_, _, err := s.CreateAdjustment(ctx, a, uuid.NewString(), correlationID)
+	return err
+}
+
+func approveAdjustment(s *store.PgStore, ctx context.Context, id, principalID, correlationID string) error {
+	_, _, err := s.ApproveAdjustment(ctx, id, principalID, uuid.NewString(), correlationID)
+	return err
+}
+
+func postAdjustment(s *store.PgStore, ctx context.Context, id, principalID, journalID, correlationID string) error {
+	_, _, err := s.MarkAdjustmentPosted(ctx, id, principalID, journalID, uuid.NewString(), correlationID)
+	return err
+}
+
+func reverseAdjustment(s *store.PgStore, ctx context.Context, id, principalID, reason string, supersededBy *string, correlationID string) error {
+	_, _, err := s.ReverseAdjustment(ctx, id, principalID, reason, supersededBy, uuid.NewString(), correlationID)
+	return err
+}
+
 func TestPgStore_ACC12_GroupEntityHasRun_RealDB(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := newTestStore(pool)
 
 	tenantID := uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
@@ -98,7 +138,7 @@ func TestPgStore_ACC12_GroupEntityHasRun_RealDB(t *testing.T) {
 		t.Fatal("expected no run recorded yet")
 	}
 
-	if err := s.CreateRun(ctx, newTestRun(tenantID, "group-1")); err != nil {
+	if err := createRun(s, ctx, newTestRun(tenantID, "group-1"), "principal-1", "corr-1"); err != nil {
 		t.Fatalf("CreateRun: %v", err)
 	}
 	hasRun, err = s.GroupEntityHasRun(ctx, "group-1")
@@ -112,13 +152,13 @@ func TestPgStore_ACC12_GroupEntityHasRun_RealDB(t *testing.T) {
 
 func TestPgStore_ACC12_FullLifecycle_ApprovePostReverse_RealDB(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := newTestStore(pool)
 
 	tenantID := uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
 	adj := newTestAdjustment(tenantID, "group-1", "preparer-1")
-	if err := s.CreateAdjustment(ctx, adj); err != nil {
+	if err := createAdjustment(s, ctx, adj, "corr-1"); err != nil {
 		t.Fatalf("CreateAdjustment: %v", err)
 	}
 
@@ -130,11 +170,11 @@ func TestPgStore_ACC12_FullLifecycle_ApprovePostReverse_RealDB(t *testing.T) {
 		t.Fatalf("expected lines round-tripped through JSONB, got %+v", got.Lines)
 	}
 
-	if err := s.ApproveAdjustment(ctx, adj.ConsolidationAdjustmentID, "approver-1"); err != nil {
+	if err := approveAdjustment(s, ctx, adj.ConsolidationAdjustmentID, "approver-1", "corr-1"); err != nil {
 		t.Fatalf("ApproveAdjustment: %v", err)
 	}
 	journalID := uuid.New().String()
-	if err := s.MarkAdjustmentPosted(ctx, adj.ConsolidationAdjustmentID, "poster-1", journalID); err != nil {
+	if err := postAdjustment(s, ctx, adj.ConsolidationAdjustmentID, "poster-1", journalID, "corr-1"); err != nil {
 		t.Fatalf("MarkAdjustmentPosted: %v", err)
 	}
 	got, err = s.GetAdjustment(ctx, adj.ConsolidationAdjustmentID)
@@ -149,11 +189,11 @@ func TestPgStore_ACC12_FullLifecycle_ApprovePostReverse_RealDB(t *testing.T) {
 	// a real row — the same "no phantom supersession" guarantee that FK
 	// gives for free.
 	replacement := newTestAdjustment(tenantID, "group-1", "preparer-1")
-	if err := s.CreateAdjustment(ctx, replacement); err != nil {
+	if err := createAdjustment(s, ctx, replacement, "corr-1"); err != nil {
 		t.Fatalf("CreateAdjustment (replacement): %v", err)
 	}
 
-	if err := s.ReverseAdjustment(ctx, adj.ConsolidationAdjustmentID, "reverser-1", "correction", &replacement.ConsolidationAdjustmentID); err != nil {
+	if err := reverseAdjustment(s, ctx, adj.ConsolidationAdjustmentID, "reverser-1", "correction", &replacement.ConsolidationAdjustmentID, "corr-1"); err != nil {
 		t.Fatalf("ReverseAdjustment: %v", err)
 	}
 	got, err = s.GetAdjustment(ctx, adj.ConsolidationAdjustmentID)
@@ -169,21 +209,21 @@ func TestPgStore_ACC12_FullLifecycle_ApprovePostReverse_RealDB(t *testing.T) {
 // UPDATE's WHERE clause against the real database.
 func TestPgStore_ACC12_ApproveFromWrongStatus_Refused(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := newTestStore(pool)
 
 	tenantID := uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
 	adj := newTestAdjustment(tenantID, "group-1", "preparer-1")
-	if err := s.CreateAdjustment(ctx, adj); err != nil {
+	if err := createAdjustment(s, ctx, adj, "corr-1"); err != nil {
 		t.Fatalf("CreateAdjustment: %v", err)
 	}
-	if err := s.ApproveAdjustment(ctx, adj.ConsolidationAdjustmentID, "approver-1"); err != nil {
+	if err := approveAdjustment(s, ctx, adj.ConsolidationAdjustmentID, "approver-1", "corr-1"); err != nil {
 		t.Fatalf("first ApproveAdjustment: %v", err)
 	}
 	// A second approval attempt must fail — the adjustment is now APPROVED,
 	// not PENDING_APPROVAL.
-	if err := s.ApproveAdjustment(ctx, adj.ConsolidationAdjustmentID, "approver-2"); err == nil {
+	if err := approveAdjustment(s, ctx, adj.ConsolidationAdjustmentID, "approver-2", "corr-1"); err == nil {
 		t.Fatal("expected a second ApproveAdjustment to be refused")
 	}
 }
@@ -192,14 +232,14 @@ func TestPgStore_ACC12_ApproveFromWrongStatus_Refused(t *testing.T) {
 // migration 000003's CHECK constraints are real, not just documentation.
 func TestPgStore_ACC12_InvalidAdjustmentType_RejectedByCheckConstraint(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := newTestStore(pool)
 
 	tenantID := uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
 	adj := newTestAdjustment(tenantID, "group-1", "preparer-1")
 	adj.AdjustmentType = "NOT_A_REAL_TYPE"
-	if err := s.CreateAdjustment(ctx, adj); err == nil {
+	if err := createAdjustment(s, ctx, adj, "corr-1"); err == nil {
 		t.Fatal("expected the CHECK constraint to reject an unrecognized adjustment_type value")
 	}
 }

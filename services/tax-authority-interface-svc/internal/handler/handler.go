@@ -8,6 +8,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
+	"zoiko.io/tax-authority-interface-svc/internal/authority"
 	"zoiko.io/tax-authority-interface-svc/internal/authz"
 	"zoiko.io/tax-authority-interface-svc/internal/domain"
 	"zoiko.io/tax-authority-interface-svc/internal/events"
@@ -27,6 +28,11 @@ type Handler struct {
 	publisher events.Publisher
 	authz     *authz.Client
 	logger    *zap.Logger
+
+	// engine, callbacks and cbStore serve the live authority adapter (INT-08); nil means it is off.
+	engine    *authority.Engine
+	callbacks *authority.CallbackProcessor
+	cbStore   authority.CallbackStore
 }
 
 func New(st store.Store, pub events.Publisher, az *authz.Client, logger *zap.Logger) *Handler {
@@ -41,6 +47,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/interfaces/{id}", h.GetInterfaceByID)
 		r.Post("/filings", h.SubmitTaxFiling)
 		r.Get("/filings", h.ListSubmissions)
+		h.registerAuthorityRoutes(r)
 	})
 }
 
@@ -72,6 +79,11 @@ func (h *Handler) CreateInterface(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if msg := validateAuthorityBinding(req); msg != "" {
+		writeError(w, http.StatusBadRequest, msg)
+		return
+	}
+
 	tf := &domain.TaxInterface{
 		TenantID:      tenantID,
 		LegalEntityID: req.LegalEntityID,
@@ -79,6 +91,14 @@ func (h *Handler) CreateInterface(w http.ResponseWriter, r *http.Request) {
 		AuthorityName: req.AuthorityName,
 		Protocol:      req.Protocol,
 		Status:        "ACTIVE",
+
+		// authority binding (INT-08); all empty keeps the legacy behaviour
+		ProviderKey:         req.ProviderKey,
+		AdapterKind:         req.AdapterKind,
+		ConnectorID:         req.ConnectorID,
+		CertificateRef:      req.CertificateRef,
+		CertificateNotAfter: req.CertificateNotAfter,
+		EscalateBeforeHours: req.EscalateBeforeHours,
 	}
 
 	if err := h.store.CreateInterface(r.Context(), tf); err != nil {
@@ -157,6 +177,10 @@ func (h *Handler) SubmitTaxFiling(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeError(w, http.StatusServiceUnavailable, "authorization check failed")
+		return
+	}
+
+	if h.submitViaAuthority(w, r, iface, req, principalID) {
 		return
 	}
 

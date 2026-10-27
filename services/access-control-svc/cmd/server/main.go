@@ -24,14 +24,18 @@ import (
 	"github.com/riandyrn/otelchi"
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
+	idenv "zoiko.io/identity-envelope"
 
 	"zoiko.io/access-control-svc/internal/clients"
 	"zoiko.io/access-control-svc/internal/config"
 	"zoiko.io/access-control-svc/internal/domain"
 	svcenvelope "zoiko.io/access-control-svc/internal/envelope"
 	"zoiko.io/access-control-svc/internal/events"
+	"zoiko.io/access-control-svc/internal/expiry"
 	"zoiko.io/access-control-svc/internal/handler"
 	"zoiko.io/access-control-svc/internal/health"
+	"zoiko.io/access-control-svc/internal/hrevents"
+	"zoiko.io/access-control-svc/internal/idempotency"
 	svcmiddleware "zoiko.io/access-control-svc/internal/middleware"
 	"zoiko.io/access-control-svc/internal/mtls"
 	"zoiko.io/access-control-svc/internal/outbox"
@@ -350,20 +354,44 @@ func main() {
 		authzBaseURL = cfg.AuthzMTLSURL
 	}
 	authzClient := &httpAuthzClient{baseURL: authzBaseURL, client: httpClientForAuthz, log: log, cache: make(map[string]cachedDecision)}
-	authzAdminClient := clients.NewAuthzAdminClient(cfg.AuthZServiceURL)
+	// Over the same client and URL as the decision calls: with mTLS on, the
+	// admin calls used to go out plaintext to AUTHZ_SERVICE_URL, so
+	// authorization-svc could never see this service's certificate and admit it
+	// as a registered delegate (its register A-01).
+	authzAdminClient := clients.NewAuthzAdminClientWithHTTP(authzBaseURL, httpClientForAuthz)
 	sodClient := clients.NewSoDClient(authzBaseURL)
-	protectedActionsClient := clients.NewProtectedActionsClient(authzBaseURL)
+	// The protected-action catalogue is this service's own table, not a call:
+	// the route the old client called (GET /v1/protected-permissions) exists
+	// nowhere in the estate.
+	protectedCatalogue := store.NewProtectedCatalogue(pgStore)
+	permissionTaxonomy := store.NewPermissionCatalogue(pgStore)
 
 	// ── 5. Router + handler ───────────────────────────────────────────────────
+	// Identity gate (X5 / X-R3, decision 21 Oct 2026): identity-context-svc's
+	// signed envelope is verified (JWKS) with its session status (AU-01), and
+	// its claims become the only source of X-Principal-Id / X-Tenant-Id; a peer
+	// over verified mTLS may vouch for them instead. Until now this service took
+	// those headers as sent. IDENTITY_VERIFY: require (default outside local) | warn.
+	gate, gateSettings, err := idenv.NewGateFromEnv("access-control-svc", log, idenv.EnvOptions{DefaultPeers: nil})
+	if err != nil {
+		log.Fatal("identity gate configuration refused", zap.Error(err))
+	}
+	log.Info("identity gate", gateSettings.Fields()...)
+
 	r := chi.NewRouter()
+	r.Use(idenv.RequestID)
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
 	r.Use(middleware.Recoverer)
 	r.Use(otelchi.Middleware("access-control-svc", otelchi.WithChiRoutes(r)))
 	r.Use(metrics.HTTPMiddleware)
 	r.Use(correlationIDMiddleware)
+	r.Use(gate.Middleware)
 	r.Use(svcmiddleware.TenantContext())
 	r.Use(middleware.Logger)
+	// Records the caller's identity envelope so the authorization-svc admin
+	// client can forward it (authorization-svc register A-01; clients/forward.go).
+	r.Use(clients.ForwardBearer)
 
 	// Canonical Service Input Contract (ZS-ARCH-SVC-001 v2.0 §4). Runs after
 	// Recoverer and telemetry so a refusal is still traced, and ahead of every
@@ -372,8 +400,19 @@ func main() {
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
-	h := handler.New(pgStore, authzClient, authzAdminClient, sodClient, protectedActionsClient, domainMetrics, log)
+	// After the envelope check (a write without a key is already refused
+	// there), so this only ever sees writes that carry one. See
+	// internal/idempotency for why the header is now honoured, not just
+	// required.
+	r.Use(idempotency.Middleware(pgStore, log))
+
+	h := handler.New(pgStore, authzClient, authzAdminClient, sodClient, protectedCatalogue, permissionTaxonomy, domainMetrics, log)
 	handler.RegisterRoutes(r, h)
+	gov := handler.NewGov(h, pgStore, authzAdminClient)
+	gov.SetServicePrincipal(cfg.ServicePrincipalID)
+	gov.SetGroupStore(pgStore)
+	gov.SetSubjectLinks(pgStore, cfg.EventReviewReviewer, time.Duration(cfg.EventReviewDueDays)*24*time.Hour)
+	handler.RegisterGovernanceRoutes(r, gov)
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────
 	//
@@ -400,6 +439,40 @@ func main() {
 	defer stopRelay()
 	relay := outbox.NewRelay(pgStore, publisher, domainMetrics, log)
 	go relay.Run(relayCtx)
+
+	// ── 6c. Assignment expiry sweep ───────────────────────────────────────────
+	//
+	// Closes governed assignments whose effective_to has passed and enqueues
+	// iam.assignment.revoked, so the sessions holding them end. Stopped with
+	// the relay; see internal/expiry.
+	go expiry.New(pgStore, domainMetrics, log).Run(relayCtx)
+
+	// ── 6d. Event-triggered reviews (S9-C2) ───────────────────────────────────
+	//
+	// HR lifecycle events open an EVENT_TRIGGERED review of the linked
+	// subject; see internal/hrevents. Off until a default reviewer is set: a
+	// review nobody is assigned to is not a control.
+	if cfg.EventReviewReviewer != "" {
+		hrReader := kafka.NewReader(kafka.ReaderConfig{
+			Brokers:     cfg.Kafka.Brokers,
+			GroupID:     cfg.HREventGroupID,
+			GroupTopics: cfg.HREventTopics,
+			StartOffset: kafka.FirstOffset,
+			// A nil ErrorLogger hides a consumer that cannot join its group
+			// behind one that looks idle.
+			ErrorLogger: kafka.LoggerFunc(func(msg string, args ...interface{}) {
+				log.Warn(fmt.Sprintf("hr-events reader: "+msg, args...))
+			}),
+		})
+		defer hrReader.Close()
+		hr := hrevents.NewHandler(pgStore, gov, handler.IsTransient, log)
+		go hrevents.Run(relayCtx, hrReader, hr, log, func(outcome string) {
+			domainMetrics.HREvents.WithLabelValues(outcome).Inc()
+		})
+		log.Info("event-triggered reviews on", zap.Strings("topics", cfg.HREventTopics), zap.String("default_reviewer", cfg.EventReviewReviewer))
+	} else {
+		log.Warn("event-triggered reviews off: ACS_EVENT_REVIEW_DEFAULT_REVIEWER is not set")
+	}
 
 	// ── 7. HTTP server with graceful shutdown ─────────────────────────────────
 	addr := ":" + strconv.Itoa(cfg.Port)
@@ -477,10 +550,11 @@ func authzReachable(baseURL string) func(context.Context) error {
 
 func correlationIDMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("X-Correlation-ID") == "" {
-			r.Header.Set("X-Correlation-ID", middleware.GetReqID(r.Context()))
+		// Echoed, never invented: a correlation id made up here, before the
+		// input contract can refuse a request without one, traces nothing.
+		if id := r.Header.Get("X-Correlation-ID"); id != "" {
+			w.Header().Set("X-Correlation-ID", id)
 		}
-		w.Header().Set("X-Correlation-ID", r.Header.Get("X-Correlation-ID"))
 		next.ServeHTTP(w, r)
 	})
 }

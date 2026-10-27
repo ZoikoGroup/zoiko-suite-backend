@@ -71,6 +71,7 @@ type EvidenceRequirement struct {
 	CreatedAt            time.Time `json:"created_at"`
 	CreatedByPrincipalID string    `json:"created_by_principal_id"`
 	CorrelationID        string    `json:"correlation_id"`
+	IdempotencyKey       string    `json:"idempotency_key"`
 }
 
 // RequirementSpec is the decoded shape of EvidenceRequirement.
@@ -109,10 +110,15 @@ type EvidenceEvaluation struct {
 	// the record stays truthful even after the catalog changes underneath it.
 	UnmetPayload            json.RawMessage `json:"unmet_payload"`
 	PresentArtifactsPayload json.RawMessage `json:"present_artifacts_payload"`
+	// RequirementIDs stores the IDs of all requirements that were evaluated
+	// (both satisfied and unmet), so a SATISFIED record can prove which
+	// rules it was tested against.
+	RequirementIDs []string `json:"requirement_ids"`
 
 	EvaluatedAt             time.Time `json:"evaluated_at"`
 	EvaluatedForPrincipalID string    `json:"evaluated_for_principal_id"`
 	CorrelationID           string    `json:"correlation_id"`
+	IdempotencyKey          string    `json:"idempotency_key"`
 }
 
 // ── wire types ───────────────────────────────────────────────────────────────
@@ -162,6 +168,8 @@ type EvaluateResponse struct {
 	Unmet         []UnmetRequirement `json:"unmet"`
 	EvaluatedAt   time.Time          `json:"evaluated_at"`
 	CorrelationID string             `json:"correlation_id"`
+	DomainCode    string             `json:"domain_code"`
+	ActionType    string             `json:"action_type"`
 }
 
 // CreateRequirementRequest is the body of POST /v1/admin/evidence-requirements.
@@ -198,6 +206,14 @@ type ListRequirementsFilter struct {
 	AsOf time.Time
 }
 
+// OutboxEvent represents an event to be written to the outbox table.
+type OutboxEvent struct {
+	AggregateType string
+	AggregateID   string
+	EventType     string
+	Payload       []byte
+}
+
 // ── errors ───────────────────────────────────────────────────────────────────
 
 type errorString string
@@ -216,6 +232,12 @@ var (
 	// clothes. A malformed id cannot name an existing row, so callers treat
 	// this as absent rather than as the database being down.
 	ErrInvalidIdentifier = errorString("identifier is not a valid UUID")
+
+	// ErrIdempotencyMismatch is returned when an Idempotency-Key or PBC
+	// correlation_id is replayed with a different request payload. The
+	// stored original is authoritative, so silently answering it would
+	// report success for a write that never happened.
+	ErrIdempotencyMismatch = errorString("idempotency key reused with a different request payload")
 
 	// ErrAlreadyRetired is returned when end-dating a requirement that
 	// already carries an effective_to. Surfaced as 422, never a silent
@@ -250,4 +272,9 @@ var (
 	ErrDocumentNotFound           = errorString("referenced document not found")
 	ErrDocumentMismatch           = errorString("referenced document belongs to a different tenant or legal entity")
 	ErrDocumentServiceUnavailable = errorString("document-vault-svc unavailable")
+
+	// The legal entity is not held by tenant-entity-registry-svc in the
+	// caller's tenant, or the registry could not answer (fail-closed).
+	ErrLegalEntityNotFound = errorString("legal entity does not exist in this tenant")
+	ErrRegistryUnavailable = errorString("tenant-entity-registry-svc unavailable")
 )

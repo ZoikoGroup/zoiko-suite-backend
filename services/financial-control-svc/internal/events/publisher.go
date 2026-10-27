@@ -32,16 +32,20 @@ const (
 	RunReadyForCert        = "control.run.ready_for_certification"
 	RunCertified           = "control.run.certified"
 	RunCertificationReject = "control.run.certification_rejected"
-	RunFailed              = "control.run.failed"
-	CloseGateBlocked       = "control.close_gate.blocked"
-	CloseGateSatisfied     = "control.close_gate.satisfied"
-	ExceptionSLABreached   = "control.exception.sla_breached"
-	ExceptionWaived        = "control.exception.waived"
-	ExceptionCarried       = "control.exception.carried_forward"
-	ExceptionReperformed   = "control.exception.reperformed"
-	ExceptionClosed        = "control.exception.closed"
-	RunSuperseded          = "control.run.superseded"
-	RunExpired             = "control.run.expired"
+	// RunCertificationRevoked: a certified run's certification was revoked
+	// (prospectively; ZS-SVC-Z-001 RB-05). Carries the prior certification,
+	// reason, evidence and effective time.
+	RunCertificationRevoked = "control.run.certification_revoked"
+	RunFailed               = "control.run.failed"
+	CloseGateBlocked        = "control.close_gate.blocked"
+	CloseGateSatisfied      = "control.close_gate.satisfied"
+	ExceptionSLABreached    = "control.exception.sla_breached"
+	ExceptionWaived         = "control.exception.waived"
+	ExceptionCarried        = "control.exception.carried_forward"
+	ExceptionReperformed    = "control.exception.reperformed"
+	ExceptionClosed         = "control.exception.closed"
+	RunSuperseded           = "control.run.superseded"
+	RunExpired              = "control.run.expired"
 )
 
 // envelope is the platform's canonical event wrapper, byte-compatible with every other

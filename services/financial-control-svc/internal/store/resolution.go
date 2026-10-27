@@ -18,9 +18,14 @@ import (
 // authority/evidence behind it, an outbox event, and, when the last exception of a
 // failed run becomes terminal, the run's own roll-up to READY_TO_CERTIFY, all in ONE
 // transaction.
-func (s *PgStore) ResolveException(ctx context.Context, tenantID, exceptionID, actor, correlationID string, expectedVersion int, req domain.ResolveExceptionRequest) (*domain.ControlException, error) {
+//
+// Idempotent on (tenant, Idempotency-Key) through command_idempotency, keyed to this
+// exception and target state (migration 000008): a repeat of the key returns
+// replay=true and the exception as it now stands. This covers reperformance
+// (REPERFORMED), for which ZS-CONTROL-001 makes idempotency mandatory.
+func (s *PgStore) ResolveException(ctx context.Context, tenantID, exceptionID, actor, correlationID, idempotencyKey string, expectedVersion int, req domain.ResolveExceptionRequest) (*domain.ControlException, bool, error) {
 	var out domain.ControlException
-	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+	apply := func(tx pgx.Tx) error {
 		var cur domain.ControlException
 		if err := scanException(tx.QueryRow(ctx, `SELECT `+exColumns+` FROM control_exceptions
 			WHERE tenant_id = $1 AND exception_id = $2 FOR UPDATE`, tenantID, exceptionID), &cur); err != nil {
@@ -88,11 +93,32 @@ func (s *PgStore) ResolveException(ctx context.Context, tenantID, exceptionID, a
 			return err
 		}
 		return nil
+	}
+	replay := false
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		var cur domain.ControlException
+		if err := scanException(tx.QueryRow(ctx, `SELECT `+exColumns+` FROM control_exceptions
+			WHERE tenant_id = $1 AND exception_id = $2 FOR UPDATE`, tenantID, exceptionID), &cur); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return domain.ErrNotFound
+			}
+			return err
+		}
+		k := commandKey{key: idempotencyKey, command: exceptionCommand(req.ToState), runID: cur.RunID, exceptionID: &exceptionID}
+		var err error
+		if replay, err = lookupCommandKey(ctx, tx, tenantID, k); err != nil || replay {
+			out = cur
+			return err
+		}
+		if err := apply(tx); err != nil {
+			return err
+		}
+		return recordCommandKey(ctx, tx, tenantID, k)
 	})
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return &out, nil
+	return &out, replay, nil
 }
 
 func isTerminalException(s domain.ExceptionState) bool {
@@ -167,9 +193,12 @@ func rollupTx(ctx context.Context, tx pgx.Tx, tenantID, runID, actor, correlatio
 // SubmitForCertification is the operator's resubmission of a run that is in
 // EXCEPTION_REVIEW with every exception resolved, the way back after a rejected
 // certification. Nothing is decided here; the certifier still decides.
-func (s *PgStore) SubmitForCertification(ctx context.Context, tenantID, runID, actor, correlationID string, expectedVersion int, reason string) (*domain.ControlRun, error) {
+//
+// Idempotent on (tenant, Idempotency-Key) through command_idempotency, like
+// BeginExecution: a repeat of the key returns replay=true and the run as it now stands.
+func (s *PgStore) SubmitForCertification(ctx context.Context, tenantID, runID, actor, correlationID, idempotencyKey string, expectedVersion int, reason string) (*domain.ControlRun, bool, error) {
 	var out *domain.ControlRun
-	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+	apply := func(tx pgx.Tx) error {
 		var v int
 		if err := tx.QueryRow(ctx, `SELECT version FROM control_runs WHERE tenant_id = $1 AND run_id = $2 FOR UPDATE`,
 			tenantID, runID).Scan(&v); err != nil {
@@ -184,11 +213,27 @@ func (s *PgStore) SubmitForCertification(ctx context.Context, tenantID, runID, a
 		var err error
 		out, err = rollupTx(ctx, tx, tenantID, runID, actor, correlationID, reason, true)
 		return err
+	}
+	replay := false
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		k := commandKey{key: idempotencyKey, command: submitCommand, runID: runID}
+		cur, err := lockRun(ctx, tx, tenantID, runID)
+		if err != nil {
+			return err
+		}
+		if replay, err = lookupCommandKey(ctx, tx, tenantID, k); err != nil || replay {
+			out = cur
+			return err
+		}
+		if err := apply(tx); err != nil {
+			return err
+		}
+		return recordCommandKey(ctx, tx, tenantID, k)
 	})
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return out, nil
+	return out, replay, nil
 }
 
 // ListExceptionTransitions returns an exception's append-only history.

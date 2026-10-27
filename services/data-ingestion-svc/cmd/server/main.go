@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
@@ -28,7 +29,10 @@ import (
 const platformScopeID = "00000000-0000-0000-0000-00000000f001"
 
 func main() {
-	cfg := config.Load()
+	cfg, err := config.Load()
+	if err != nil {
+		panic(err)
+	}
 
 	logger, err := telemetry.NewLogger(cfg.LogLevel)
 	if err != nil {
@@ -87,7 +91,11 @@ func main() {
 	}
 
 	h := handler.NewHandler(dataStore, authzClient, logger)
-	router := handler.NewRouter(h)
+	var extra []func(chi.Router)
+	if reg := wireImports(relayCtx, cfg, logger, dataStore, authzClient); reg != nil {
+		extra = append(extra, reg)
+	}
+	router := handler.NewRouter(h, extra...)
 
 	srv := &http.Server{
 		Addr:         ":" + cfg.Port,

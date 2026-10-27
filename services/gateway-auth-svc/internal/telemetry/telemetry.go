@@ -171,6 +171,9 @@ func NewMetrics(serviceName string) *Metrics {
 		OutcomeAllowed, OutcomeNoToken, OutcomeInvalidToken, OutcomeIncompleteClaims,
 		OutcomeTenantHostnameMismatch, OutcomeCartaBlocked,
 		OutcomeTenantContextDenied, OutcomeTenantContextUnresolved,
+		OutcomeSessionRevoked, OutcomeSessionStatusUnavailable, OutcomeStepUpRequired, OutcomeCartaUnavailable,
+		OutcomeRateLimited, OutcomeOverloaded, OutcomeRequestTooLarge, OutcomeRequestEncodingRefused,
+		OutcomeMalformedRequest, OutcomeVersionUnsupported,
 	} {
 		m.VerifyDecisionsTotal.WithLabelValues(outcome)
 	}
@@ -204,7 +207,7 @@ const (
 	OutcomeIncompleteClaims = "incomplete_claims"
 	// OutcomeTenantHostnameMismatch — a validly-signed token presented against
 	// a different tenant's hostname. The one outcome here that is evidence of
-	// an attack rather than of a misconfiguration.
+	// an attack rather than a misconfiguration.
 	OutcomeTenantHostnameMismatch = "tenant_hostname_mismatch"
 	// OutcomeCartaBlocked — continuous risk assessment returned ISOLATE or DENY.
 	OutcomeCartaBlocked = "carta_blocked"
@@ -214,6 +217,33 @@ const (
 	// OutcomeTenantContextUnresolved — the registry could not be reached, so no
 	// decision exists. Fail-closed, and an outage rather than a refusal.
 	OutcomeTenantContextUnresolved = "tenant_context_unresolved"
+	// OutcomeSessionRevoked — the envelope verified but its session has ended
+	// at identity-context-svc (logout, invalidation, suspension). AU-01.
+	OutcomeSessionRevoked = "session_revoked"
+	// OutcomeSessionStatusUnavailable — identity-context-svc could not say
+	// whether the session stands; fail-closed.
+	OutcomeSessionStatusUnavailable = "session_status_unavailable"
+	// OutcomeStepUpRequired — continuous risk assessment asked for a fresh
+	// second factor (STEP_UP_MFA); the caller steps up and retries. AU-23.
+	OutcomeStepUpRequired = "step_up_required"
+	// OutcomeCartaUnavailable — carta-svc is configured but gave no assessment
+	// for a material write, which fails closed (reads proceed unscored). AU-23.
+	OutcomeCartaUnavailable = "carta_unavailable"
+	// OutcomeRateLimited — a client or tenant quota was exhausted (INT-RATE-007).
+	OutcomeRateLimited = "rate_limited"
+	// OutcomeOverloaded — the gateway shed the request above its concurrency
+	// ceiling (INT-BP-016). Distinct from a refusal: nothing about the caller
+	// was judged.
+	OutcomeOverloaded = "overloaded"
+	// OutcomeRequestTooLarge — a declared body length above the admission cap.
+	OutcomeRequestTooLarge = "request_too_large"
+	// OutcomeRequestEncodingRefused — a compressed request body that is not
+	// accepted (decompression-bomb protection).
+	OutcomeRequestEncodingRefused = "request_encoding_refused"
+	// OutcomeMalformedRequest — an unreadable length or request URI.
+	OutcomeMalformedRequest = "malformed_request"
+	// OutcomeVersionUnsupported — an API version that is not routed (INT-VERS-012).
+	OutcomeVersionUnsupported = "version_unsupported"
 )
 
 // ── handler.DomainMetrics implementation ─────────────────────────────────────
@@ -309,3 +339,17 @@ func newDiscardResponseWriter() *discardResponseWriter {
 func (d *discardResponseWriter) Header() http.Header         { return d.header }
 func (d *discardResponseWriter) Write(b []byte) (int, error) { return len(b), nil }
 func (d *discardResponseWriter) WriteHeader(int)             {}
+
+// RegisterSIEMDrops exposes the count of security events the SIEM queue discarded because it was full. The queue drops
+// rather than blocks (an unbounded one would turn a SIEM outage into this service's memory problem), so the loss is only
+// acceptable if it is measurable and alertable: gateway_auth_siem_events_dropped_total should stay at zero (INT-NP-044).
+// It returns the collector so a test can read it.
+func (m *Metrics) RegisterSIEMDrops(dropped func() uint64, serviceName string) prometheus.CounterFunc {
+	c := prometheus.NewCounterFunc(prometheus.CounterOpts{
+		Name:        "gateway_auth_siem_events_dropped_total",
+		Help:        "Security events discarded because the SIEM queue was full.",
+		ConstLabels: prometheus.Labels{"service": serviceName},
+	}, func() float64 { return float64(dropped()) })
+	prometheus.MustRegister(c)
+	return c
+}

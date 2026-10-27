@@ -49,12 +49,20 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	_, filename, _, _ := runtime.Caller(0)
 	base := filepath.Dir(filename)
 
+	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS outbox CASCADE;`)
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS evidence_request_receipts CASCADE;`)
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS evidence_request_notes CASCADE;`)
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS evidence_request_responses CASCADE;`)
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS evidence_requests CASCADE;`)
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS evidence_evaluations CASCADE;`)
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS evidence_requirements CASCADE;`)
+	// Migration 000008 is not covered by the table list above and is not
+	// idempotent, so without these drops only the first test in the package
+	// could apply the schema.
+	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS outbox CASCADE;`)
+	_, _ = pool.Exec(ctx, `DROP FUNCTION IF EXISTS claim_outbox_events(INT);`)
+	_, _ = pool.Exec(ctx, `DROP FUNCTION IF EXISTS mark_outbox_published(UUID[]);`)
+	_, _ = pool.Exec(ctx, `DROP FUNCTION IF EXISTS mark_outbox_failed(UUID[], TEXT);`)
 
 	// Every *.up.sql, sorted, rather than a list written out here.
 	//
@@ -203,6 +211,7 @@ func TestPgStore_CreateRequirement_RetriedCorrelationID_IsIdempotent(t *testing.
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
 	first := newTestRequirement(tenantID, nil)
+	first.IdempotencyKey = "idem-" + uuid.New().String()
 	created, err := s.CreateRequirement(ctx, first)
 	if err != nil || !created {
 		t.Fatalf("first CreateRequirement: created=%v err=%v", created, err)
@@ -210,6 +219,7 @@ func TestPgStore_CreateRequirement_RetriedCorrelationID_IsIdempotent(t *testing.
 
 	replay := newTestRequirement(tenantID, nil)
 	replay.CorrelationID = first.CorrelationID
+	replay.IdempotencyKey = first.IdempotencyKey
 	replay.EvidenceType = "ATTESTATION"
 
 	created, err = s.CreateRequirement(ctx, replay)
@@ -504,9 +514,10 @@ func TestPgStore_RecordEvaluation_RoundTripAndIdempotency(t *testing.T) {
 		PresentArtifactsPayload: json.RawMessage(`[{"evidence_type":"SUPPORTING_DOCUMENT"}]`),
 		EvaluatedForPrincipalID: "buyer-1",
 		CorrelationID:           "corr-" + uuid.New().String(),
+		IdempotencyKey:          "idem-" + uuid.New().String(),
 	}
 
-	created, err := s.RecordEvaluation(ctx, e)
+	created, err := s.RecordEvaluation(ctx, e, nil)
 	if err != nil {
 		t.Fatalf("RecordEvaluation: %v", err)
 	}
@@ -536,7 +547,7 @@ func TestPgStore_RecordEvaluation_RoundTripAndIdempotency(t *testing.T) {
 	replay := *e
 	replay.EvaluationID = uuid.New().String()
 	replay.Outcome = domain.OutcomeMissing
-	created, err = s.RecordEvaluation(ctx, &replay)
+	created, err = s.RecordEvaluation(ctx, &replay, nil)
 	if err != nil {
 		t.Fatalf("replayed RecordEvaluation: %v", err)
 	}
@@ -569,7 +580,7 @@ func TestPgStore_GetEvaluation_OtherTenant_ReadsAsAbsent(t *testing.T) {
 		EvaluatedForPrincipalID: "buyer-1",
 		CorrelationID:           "corr-" + uuid.New().String(),
 	}
-	if _, err := s.RecordEvaluation(svcmiddleware.WithTenant(context.Background(), owner), e); err != nil {
+	if _, err := s.RecordEvaluation(svcmiddleware.WithTenant(context.Background(), owner), e, nil); err != nil {
 		t.Fatalf("RecordEvaluation: %v", err)
 	}
 

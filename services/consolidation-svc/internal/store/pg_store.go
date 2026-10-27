@@ -7,18 +7,124 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.uber.org/zap"
 	"zoiko.io/consolidation-svc/internal/domain"
 	svcmiddleware "zoiko.io/consolidation-svc/internal/middleware"
+	"zoiko.io/eventing/envelope"
+	"zoiko.io/eventing/outbox"
 )
 
 type PgStore struct {
-	pool *pgxpool.Pool
+	pool        *pgxpool.Pool
+	log         *zap.Logger
+	eventRegion string
 }
 
-func New(pool *pgxpool.Pool) *PgStore {
-	return &PgStore{pool: pool}
+// Option configures a PgStore.
+type Option func(*PgStore)
+
+// WithEventRegion sets the residency region carried by emitted events
+// (config EVENT_RESIDENCY_REGION).
+func WithEventRegion(region string) Option {
+	return func(s *PgStore) { s.eventRegion = region }
+}
+
+func New(pool *pgxpool.Pool, log *zap.Logger, opts ...Option) *PgStore {
+	s := &PgStore{pool: pool, log: log}
+	for _, o := range opts {
+		o(s)
+	}
+	return s
+}
+
+// enqueueRunEvent writes one consolidation-run lifecycle event to the
+// transactional outbox inside tx, the transaction that made the change it
+// reports. fact is kebab-case (envelope.New rejects underscores); legacyType
+// is the exact pre-standard event_type existing consumers still filter on.
+// The aggregate is always the run itself — never a general-ledger or
+// intercompany id the run happened to read from.
+func (s *PgStore) enqueueRunEvent(ctx context.Context, tx pgx.Tx, fact, legacyType, tenantID, groupLegalEntityID, runID, actorID, correlationID string, data map[string]any) error {
+	env, err := envelope.New(envelope.Spec{
+		Type:            "com.zoikosuite.accounting.consolidation-run." + fact,
+		LegacyType:      legacyType,
+		Service:         "consolidation-svc",
+		SchemaVersion:   "1.0.0",
+		OccurredAt:      time.Now().UTC(),
+		TenantID:        tenantID,
+		LegalEntityID:   groupLegalEntityID,
+		AggregateType:   "consolidation-run",
+		AggregateID:     runID,
+		CorrelationID:   correlationID,
+		ActorID:         actorID,
+		ResidencyRegion: s.eventRegion,
+		Classification:  envelope.Confidential,
+		Data:            data,
+	})
+	if err != nil {
+		return fmt.Errorf("build consolidation-run.%s event: %w", fact, err)
+	}
+	if err := outbox.Enqueue(ctx, tx, env); err != nil {
+		return fmt.Errorf("enqueue consolidation-run.%s event: %w", fact, err)
+	}
+	return nil
+}
+
+// enqueueAdjustmentEvent writes one ACC-12 consolidation-adjustment
+// lifecycle event to the transactional outbox inside tx, the transaction
+// that made the change it reports. fact is kebab-case (envelope.New rejects
+// underscores); legacyType is the exact pre-standard event name existing
+// consumers filter on (ConsolidationAdjustmentCreated and the like). The
+// aggregate is always the adjustment itself — never the run or the
+// consolidation-book journal it may reference.
+func (s *PgStore) enqueueAdjustmentEvent(ctx context.Context, tx pgx.Tx, fact, legacyType, tenantID, groupLegalEntityID, adjustmentID, actorID, correlationID string, data map[string]any) error {
+	env, err := envelope.New(envelope.Spec{
+		Type:            "com.zoikosuite.accounting.consolidation-adjustment." + fact,
+		LegacyType:      legacyType,
+		Service:         "consolidation-svc",
+		SchemaVersion:   "1.0.0",
+		OccurredAt:      time.Now().UTC(),
+		TenantID:        tenantID,
+		LegalEntityID:   groupLegalEntityID,
+		AggregateType:   "consolidation-adjustment",
+		AggregateID:     adjustmentID,
+		CorrelationID:   correlationID,
+		ActorID:         actorID,
+		ResidencyRegion: s.eventRegion,
+		Classification:  envelope.Confidential,
+		Data:            data,
+	})
+	if err != nil {
+		return fmt.Errorf("build consolidation-adjustment.%s event: %w", fact, err)
+	}
+	if err := outbox.Enqueue(ctx, tx, env); err != nil {
+		return fmt.Errorf("enqueue consolidation-adjustment.%s event: %w", fact, err)
+	}
+	return nil
+}
+
+// appendAdjustmentTransition writes one row of the append-only lifecycle log
+// inside the same transaction as the status change it records. fromStatus is
+// nil for the creation step; details carries step-specific evidence. The
+// table is insert-and-read only: nothing in this store updates or deletes it.
+func (s *PgStore) appendAdjustmentTransition(ctx context.Context, tx pgx.Tx, tenantID, adjustmentID string, fromStatus *string, toStatus, actorID, correlationID string, occurredAt time.Time, reason *string, details map[string]any) error {
+	detailsJSON, err := json.Marshal(details)
+	if err != nil {
+		return fmt.Errorf("marshal adjustment transition details: %w", err)
+	}
+	_, err = tx.Exec(ctx, `
+		INSERT INTO consolidation_adjustment_transitions (
+			transition_id, tenant_id, consolidation_adjustment_id, from_status, to_status,
+			actor_principal_id, occurred_at, correlation_id, reason, details
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+	`, uuid.NewString(), tenantID, adjustmentID, fromStatus, toStatus,
+		actorID, occurredAt, correlationID, reason, detailsJSON)
+	if err != nil {
+		return fmt.Errorf("record adjustment transition to %s: %w", toStatus, err)
+	}
+	return nil
 }
 
 func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(tx pgx.Tx) error) error {
@@ -44,21 +150,115 @@ func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(tx pgx.T
 	return nil
 }
 
-func (s *PgStore) CreateRun(ctx context.Context, run *domain.ConsolidationRun) error {
+const consolidationRunColumns = `consolidation_run_id, tenant_id, group_legal_entity_id, fiscal_period,
+	target_currency, status, exception_count, started_at, completed_at`
+
+func scanConsolidationRun(row pgx.Row, run *domain.ConsolidationRun) error {
+	return row.Scan(
+		&run.ConsolidationRunID, &run.TenantID, &run.GroupLegalEntityID, &run.FiscalPeriod,
+		&run.TargetCurrency, &run.Status, &run.ExceptionCount, &run.StartedAt, &run.CompletedAt,
+	)
+}
+
+// CreateRun claims idempotencyKey and creates the run in one transaction, so a
+// retried POST /v1/consolidation/runs cannot create a second run. The claim is
+// written before any of the run's work (the GL trial balances, the elimination
+// plan, the snapshots), not after it: if the first attempt dies halfway, the
+// run it left behind is the run a retry sees, rather than a duplicate that
+// would double the group's balances.
+//
+// A repeat for the same request returns the run as it now stands with
+// replay=true — COMPLETED when the first attempt finished, RUNNING when it is
+// still in flight or its completion write failed. The same key for a different
+// command, or for a request naming a different group/period/currency, is
+// ErrIdempotencyKeyConflict.
+func (s *PgStore) CreateRun(ctx context.Context, run *domain.ConsolidationRun, idempotencyKey, actorID, correlationID string) (*domain.ConsolidationRun, bool, error) {
+	if idempotencyKey == "" {
+		return nil, false, domain.ErrIdempotencyKeyRequired
+	}
+	out, replay, err := s.createRun(ctx, run, idempotencyKey, actorID, correlationID)
+	if isUniqueViolation(err) {
+		// A concurrent first attempt with the same key won the insert. Its
+		// transaction has committed by the time the violation is reported,
+		// so a fresh transaction reads its claim and replays it.
+		return s.createRun(ctx, run, idempotencyKey, actorID, correlationID)
+	}
+	return out, replay, err
+}
+
+func (s *PgStore) createRun(ctx context.Context, run *domain.ConsolidationRun, idempotencyKey, actorID, correlationID string) (*domain.ConsolidationRun, bool, error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
-		return domain.ErrIdentityMissing
+		return nil, false, domain.ErrIdentityMissing
 	}
 
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `
-			INSERT INTO consolidation_runs (
-				consolidation_run_id, tenant_id, group_legal_entity_id, fiscal_period,
-				target_currency, status, exception_count, started_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-		`, run.ConsolidationRunID, tenantID, run.GroupLegalEntityID, run.FiscalPeriod,
-			run.TargetCurrency, run.Status, run.ExceptionCount, run.StartedAt)
+	var out *domain.ConsolidationRun
+	replay := false
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		claim, err := lookupCommandClaim(ctx, tx, tenantID, idempotencyKey)
+		if err != nil {
+			return err
+		}
+		if claim != nil {
+			if claim.Command != domain.CommandStartRun || claim.RunID == nil {
+				return commandConflict(idempotencyKey, claim)
+			}
+			var r domain.ConsolidationRun
+			if err := scanConsolidationRun(tx.QueryRow(ctx, `
+				SELECT `+consolidationRunColumns+`
+				FROM consolidation_runs
+				WHERE consolidation_run_id = $1 AND tenant_id = $2
+			`, *claim.RunID, tenantID), &r); err != nil {
+				return err
+			}
+			// StartRun's target is the run its key created, not an id the
+			// caller supplies, so a replay is recognised by the request it
+			// repeats: the same group, period and target currency. Anything
+			// else is the key reused for a different run.
+			if r.GroupLegalEntityID != run.GroupLegalEntityID ||
+				r.FiscalPeriod != run.FiscalPeriod ||
+				r.TargetCurrency != run.TargetCurrency {
+				return fmt.Errorf("%w: key %q already created a run for %s/%s/%s",
+					domain.ErrIdempotencyKeyConflict, idempotencyKey,
+					r.GroupLegalEntityID, r.FiscalPeriod, r.TargetCurrency)
+			}
+			out, replay = &r, true
+			return nil
+		}
+
+		if err := s.insertRun(ctx, tx, tenantID, run, actorID, correlationID); err != nil {
+			return err
+		}
+		if err := recordCommandClaim(ctx, tx, tenantID, idempotencyKey, domain.CommandStartRun, &run.ConsolidationRunID, nil); err != nil {
+			return err
+		}
+		out = run
+		return nil
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	return out, replay, nil
+}
+
+// insertRun writes the run row and its started event inside tx.
+func (s *PgStore) insertRun(ctx context.Context, tx pgx.Tx, tenantID string, run *domain.ConsolidationRun, actorID, correlationID string) error {
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO consolidation_runs (
+			consolidation_run_id, tenant_id, group_legal_entity_id, fiscal_period,
+			target_currency, status, exception_count, started_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+	`, run.ConsolidationRunID, tenantID, run.GroupLegalEntityID, run.FiscalPeriod,
+		run.TargetCurrency, run.Status, run.ExceptionCount, run.StartedAt); err != nil {
 		return err
+	}
+	return s.enqueueRunEvent(ctx, tx, "started", "consolidation.run.started", tenantID, run.GroupLegalEntityID, run.ConsolidationRunID, actorID, correlationID, map[string]any{
+		"consolidation_run_id":  run.ConsolidationRunID,
+		"tenant_id":             tenantID,
+		"group_legal_entity_id": run.GroupLegalEntityID,
+		"fiscal_period":         run.FiscalPeriod,
+		"target_currency":       run.TargetCurrency,
+		"started_at":            run.StartedAt,
 	})
 }
 
@@ -70,15 +270,11 @@ func (s *PgStore) GetRun(ctx context.Context, id string) (*domain.ConsolidationR
 
 	var run domain.ConsolidationRun
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		return tx.QueryRow(ctx, `
-			SELECT consolidation_run_id, tenant_id, group_legal_entity_id, fiscal_period,
-			       target_currency, status, exception_count, started_at, completed_at
+		return scanConsolidationRun(tx.QueryRow(ctx, `
+			SELECT `+consolidationRunColumns+`
 			FROM consolidation_runs
 			WHERE consolidation_run_id = $1 AND tenant_id = $2
-		`, id, tenantID).Scan(
-			&run.ConsolidationRunID, &run.TenantID, &run.GroupLegalEntityID, &run.FiscalPeriod,
-			&run.TargetCurrency, &run.Status, &run.ExceptionCount, &run.StartedAt, &run.CompletedAt,
-		)
+		`, id, tenantID), &run)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, domain.ErrRunNotFound
@@ -97,12 +293,7 @@ func (s *PgStore) ListRuns(ctx context.Context, groupLegalEntityID string) ([]do
 
 	var out []domain.ConsolidationRun
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		query := `
-			SELECT consolidation_run_id, tenant_id, group_legal_entity_id, fiscal_period,
-			       target_currency, status, exception_count, started_at, completed_at
-			FROM consolidation_runs
-			WHERE tenant_id = $1
-		`
+		query := `SELECT ` + consolidationRunColumns + ` FROM consolidation_runs WHERE tenant_id = $1`
 		args := []any{tenantID}
 
 		if groupLegalEntityID != "" {
@@ -119,10 +310,7 @@ func (s *PgStore) ListRuns(ctx context.Context, groupLegalEntityID string) ([]do
 
 		for rows.Next() {
 			var run domain.ConsolidationRun
-			if err := rows.Scan(
-				&run.ConsolidationRunID, &run.TenantID, &run.GroupLegalEntityID, &run.FiscalPeriod,
-				&run.TargetCurrency, &run.Status, &run.ExceptionCount, &run.StartedAt, &run.CompletedAt,
-			); err != nil {
+			if err := scanConsolidationRun(rows, &run); err != nil {
 				return err
 			}
 			out = append(out, run)
@@ -135,25 +323,56 @@ func (s *PgStore) ListRuns(ctx context.Context, groupLegalEntityID string) ([]do
 	return out, nil
 }
 
-func (s *PgStore) CompleteRun(ctx context.Context, id, status string, exceptionCount int, completedAt time.Time) error {
+// CompleteRun records a run's terminal status. Only a COMPLETED run emits
+// events — exception.detected (when exceptions is non-empty) then completed,
+// the same order and the same condition the handler used to publish them in.
+// A FAILED run has never emitted an event; that is unchanged here.
+func (s *PgStore) CompleteRun(ctx context.Context, id, status string, exceptionCount int, completedAt time.Time, actorID, correlationID string, snapshotCount int, exceptions []string) error {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
 		return domain.ErrIdentityMissing
 	}
 
 	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		res, err := tx.Exec(ctx, `
+		var groupLegalEntityID, fiscalPeriod string
+		err := tx.QueryRow(ctx, `
 			UPDATE consolidation_runs
 			SET status = $1, exception_count = $2, completed_at = $3
 			WHERE consolidation_run_id = $4 AND tenant_id = $5
-		`, status, exceptionCount, completedAt, id, tenantID)
+			RETURNING group_legal_entity_id, fiscal_period
+		`, status, exceptionCount, completedAt, id, tenantID).Scan(&groupLegalEntityID, &fiscalPeriod)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrRunNotFound
+		}
 		if err != nil {
 			return err
 		}
-		if res.RowsAffected() == 0 {
-			return domain.ErrRunNotFound
+		if status != "COMPLETED" {
+			return nil
 		}
-		return nil
+
+		if len(exceptions) > 0 {
+			if err := s.enqueueRunEvent(ctx, tx, "exception-detected", "consolidation.exception.detected", tenantID, groupLegalEntityID, id, actorID, correlationID, map[string]any{
+				"consolidation_run_id":  id,
+				"tenant_id":             tenantID,
+				"group_legal_entity_id": groupLegalEntityID,
+				"fiscal_period":         fiscalPeriod,
+				"exceptions":            exceptions,
+				"timestamp":             time.Now().UTC(),
+			}); err != nil {
+				return err
+			}
+		}
+		return s.enqueueRunEvent(ctx, tx, "completed", "consolidation.completed", tenantID, groupLegalEntityID, id, actorID, correlationID, map[string]any{
+			"consolidation_run_id":  id,
+			"tenant_id":             tenantID,
+			"group_legal_entity_id": groupLegalEntityID,
+			"fiscal_period":         fiscalPeriod,
+			"status":                status,
+			"exception_count":       exceptionCount,
+			"snapshot_count":        snapshotCount,
+			"completed_at":          completedAt,
+		})
 	})
 }
 
@@ -356,20 +575,70 @@ func (s *PgStore) HasSnapshotForPeriod(ctx context.Context, groupLegalEntityID, 
 	return exists, err
 }
 
-// CreateAdjustment inserts a new ConsolidationAdjustment. Callers land it
-// directly in PENDING_APPROVAL — see migration 000003's doc comment on why
-// no DRAFT resting state is reachable via this v1's API.
-func (s *PgStore) CreateAdjustment(ctx context.Context, a *domain.ConsolidationAdjustment) error {
+// CreateAdjustment claims idempotencyKey and inserts the new
+// ConsolidationAdjustment in one transaction. Callers land it directly in
+// PENDING_APPROVAL — see migration 000003's doc comment on why no DRAFT
+// resting state is reachable via this v1's API. ConsolidationAdjustmentCreated
+// is enqueued in the same transaction as the insert.
+//
+// A repeat for the same group/period/type returns the adjustment the key
+// created, as it now stands, with replay=true; the same key for another
+// command or another adjustment is ErrIdempotencyKeyConflict.
+func (s *PgStore) CreateAdjustment(ctx context.Context, a *domain.ConsolidationAdjustment, idempotencyKey, correlationID string) (*domain.ConsolidationAdjustment, bool, error) {
+	if idempotencyKey == "" {
+		return nil, false, domain.ErrIdempotencyKeyRequired
+	}
+	out, replay, err := s.createAdjustment(ctx, a, idempotencyKey, correlationID)
+	if isUniqueViolation(err) {
+		// A concurrent first attempt with the same key won; its claim is
+		// committed and a fresh transaction replays it.
+		return s.createAdjustment(ctx, a, idempotencyKey, correlationID)
+	}
+	return out, replay, err
+}
+
+func (s *PgStore) createAdjustment(ctx context.Context, a *domain.ConsolidationAdjustment, idempotencyKey, correlationID string) (*domain.ConsolidationAdjustment, bool, error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
-		return domain.ErrIdentityMissing
+		return nil, false, domain.ErrIdentityMissing
 	}
 	linesJSON, err := json.Marshal(a.Lines)
 	if err != nil {
-		return err
+		return nil, false, err
 	}
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `
+
+	var out *domain.ConsolidationAdjustment
+	replay := false
+	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		claim, err := lookupCommandClaim(ctx, tx, tenantID, idempotencyKey)
+		if err != nil {
+			return err
+		}
+		if claim != nil {
+			if claim.Command != domain.CommandCreateAdjustment || claim.AdjustmentID == nil {
+				return commandConflict(idempotencyKey, claim)
+			}
+			var existing domain.ConsolidationAdjustment
+			if err := scanConsolidationAdjustment(tx.QueryRow(ctx, `
+				SELECT `+consolidationAdjustmentColumns+`
+				FROM consolidation_adjustments
+				WHERE consolidation_adjustment_id = $1 AND tenant_id = $2
+			`, *claim.AdjustmentID, tenantID), &existing); err != nil {
+				return err
+			}
+			// The adjustment id is server-generated, so a replay is
+			// recognised by the resource the caller named: same group,
+			// period and adjustment type.
+			if existing.GroupLegalEntityID != a.GroupLegalEntityID ||
+				existing.FiscalPeriod != a.FiscalPeriod ||
+				existing.AdjustmentType != a.AdjustmentType {
+				return commandConflict(idempotencyKey, claim)
+			}
+			out, replay = &existing, true
+			return nil
+		}
+
+		if _, err := tx.Exec(ctx, `
 			INSERT INTO consolidation_adjustments (
 				consolidation_adjustment_id, tenant_id, group_legal_entity_id, fiscal_period,
 				adjustment_type, description, status, lines,
@@ -377,9 +646,38 @@ func (s *PgStore) CreateAdjustment(ctx context.Context, a *domain.ConsolidationA
 			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		`, a.ConsolidationAdjustmentID, tenantID, a.GroupLegalEntityID, a.FiscalPeriod,
 			a.AdjustmentType, a.Description, a.Status, linesJSON,
-			a.CreatedAt, a.CreatedByPrincipalID)
-		return err
+			a.CreatedAt, a.CreatedByPrincipalID); err != nil {
+			return err
+		}
+		if err := s.appendAdjustmentTransition(ctx, tx, tenantID, a.ConsolidationAdjustmentID,
+			nil, a.Status, a.CreatedByPrincipalID, correlationID, a.CreatedAt, nil,
+			map[string]any{"adjustment_type": a.AdjustmentType}); err != nil {
+			return err
+		}
+		if err := s.enqueueAdjustmentEvent(ctx, tx, "created", "ConsolidationAdjustmentCreated",
+			tenantID, a.GroupLegalEntityID, a.ConsolidationAdjustmentID,
+			a.CreatedByPrincipalID, correlationID, map[string]any{
+				"consolidation_adjustment_id": a.ConsolidationAdjustmentID,
+				"tenant_id":                   tenantID,
+				"group_legal_entity_id":       a.GroupLegalEntityID,
+				"fiscal_period":               a.FiscalPeriod,
+				"adjustment_type":             a.AdjustmentType,
+				"status":                      a.Status,
+				"created_at":                  a.CreatedAt,
+				"created_by_principal_id":     a.CreatedByPrincipalID,
+			}); err != nil {
+			return err
+		}
+		if err := recordCommandClaim(ctx, tx, tenantID, idempotencyKey, domain.CommandCreateAdjustment, nil, &a.ConsolidationAdjustmentID); err != nil {
+			return err
+		}
+		out = a
+		return nil
 	})
+	if err != nil {
+		return nil, false, err
+	}
+	return out, replay, nil
 }
 
 func (s *PgStore) GetAdjustment(ctx context.Context, id string) (*domain.ConsolidationAdjustment, error) {
@@ -442,77 +740,454 @@ func (s *PgStore) ListAdjustments(ctx context.Context, groupLegalEntityID, fisca
 	return out, nil
 }
 
-// ApproveAdjustment moves PENDING_APPROVAL -> APPROVED. Guarded to only
-// ever succeed from PENDING_APPROVAL — the self-approval check (the spec's
-// own "Top-side journal self-approved" negative path) is the handler's
-// job, since it needs to compare against the CALLER's principal, which
-// this store method deliberately doesn't decide.
-func (s *PgStore) ApproveAdjustment(ctx context.Context, id, principalID string) error {
+// ApproveAdjustment moves PENDING_APPROVAL -> APPROVED and claims
+// idempotencyKey in the same transaction. Guarded to only ever succeed from
+// PENDING_APPROVAL — the self-approval check (the spec's own "Top-side journal
+// self-approved" negative path) is the handler's job, since it needs to
+// compare against the CALLER's principal, which this store method deliberately
+// doesn't decide.
+//
+// A repeat of the key for the same adjustment returns it as it now stands
+// with replay=true, before the status guard runs: that is what lets a client
+// whose response was lost get its result instead of a 422 on the moved-on
+// adjustment. The same key for another command or adjustment is
+// ErrIdempotencyKeyConflict.
+func (s *PgStore) ApproveAdjustment(ctx context.Context, id, principalID, idempotencyKey, correlationID string) (*domain.ConsolidationAdjustment, bool, error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
-		return domain.ErrIdentityMissing
+		return nil, false, domain.ErrIdentityMissing
 	}
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+	if idempotencyKey == "" {
+		return nil, false, domain.ErrIdempotencyKeyRequired
+	}
+
+	var out *domain.ConsolidationAdjustment
+	replay := false
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		var cur domain.ConsolidationAdjustment
+		if err := scanConsolidationAdjustment(tx.QueryRow(ctx, `
+			SELECT `+consolidationAdjustmentColumns+`
+			FROM consolidation_adjustments
+			WHERE consolidation_adjustment_id = $1 AND tenant_id = $2
+			FOR UPDATE
+		`, id, tenantID), &cur); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return domain.ErrAdjustmentNotFound
+			}
+			return err
+		}
+		claim, err := lookupCommandClaim(ctx, tx, tenantID, idempotencyKey)
+		if err != nil {
+			return err
+		}
+		if claim != nil {
+			if claim.Command != domain.CommandApproveAdjustment || claim.AdjustmentID == nil || *claim.AdjustmentID != id {
+				return commandConflict(idempotencyKey, claim)
+			}
+			out, replay = &cur, true
+			return nil
+		}
+
 		now := time.Now().UTC()
-		res, err := tx.Exec(ctx, `
+		var groupLegalEntityID, fiscalPeriod string
+		err = tx.QueryRow(ctx, `
 			UPDATE consolidation_adjustments
 			SET status = $1, approved_at = $2, approved_by_principal_id = $3
 			WHERE consolidation_adjustment_id = $4 AND tenant_id = $5 AND status = $6
-		`, domain.AdjustmentStatusApproved, now, principalID, id, tenantID, domain.AdjustmentStatusPendingApproval)
+			RETURNING group_legal_entity_id, fiscal_period
+		`, domain.AdjustmentStatusApproved, now, principalID, id, tenantID, domain.AdjustmentStatusPendingApproval).
+			Scan(&groupLegalEntityID, &fiscalPeriod)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrInvalidAdjustmentTransition
+		}
 		if err != nil {
 			return err
 		}
-		if res.RowsAffected() == 0 {
-			return domain.ErrInvalidAdjustmentTransition
+		from := domain.AdjustmentStatusPendingApproval
+		if err := s.appendAdjustmentTransition(ctx, tx, tenantID, id, &from,
+			domain.AdjustmentStatusApproved, principalID, correlationID, now, nil, nil); err != nil {
+			return err
 		}
+		if err := s.enqueueAdjustmentEvent(ctx, tx, "approved", "ConsolidationAdjustmentApproved",
+			tenantID, groupLegalEntityID, id, principalID, correlationID, map[string]any{
+				"consolidation_adjustment_id": id,
+				"tenant_id":                   tenantID,
+				"group_legal_entity_id":       groupLegalEntityID,
+				"fiscal_period":               fiscalPeriod,
+				"status":                      domain.AdjustmentStatusApproved,
+				"approved_at":                 now,
+				"approved_by_principal_id":    principalID,
+			}); err != nil {
+			return err
+		}
+		if err := recordCommandClaim(ctx, tx, tenantID, idempotencyKey, domain.CommandApproveAdjustment, nil, &id); err != nil {
+			return err
+		}
+		cur.Status, cur.ApprovedAt, cur.ApprovedByPrincipalID = domain.AdjustmentStatusApproved, &now, &principalID
+		out = &cur
 		return nil
 	})
+	if err != nil {
+		return nil, false, err
+	}
+	return out, replay, nil
 }
 
 // MarkAdjustmentPosted moves APPROVED -> POSTED, recording the real
-// consolidation-book journal general-ledger-svc actually created.
-func (s *PgStore) MarkAdjustmentPosted(ctx context.Context, id, principalID, journalID string) error {
+// consolidation-book journal general-ledger-svc actually created, and claims
+// idempotencyKey in the same transaction.
+//
+// A repeat of the key for the same adjustment returns it as it now stands with
+// replay=true and never re-posts; the handler consults
+// ReplayedAdjustmentCommand before calling the ledger, so a retry does not even
+// make that call (general-ledger-svc would answer it idempotently, but there is
+// no reason to ask twice). The same key for another command or adjustment is
+// ErrIdempotencyKeyConflict.
+func (s *PgStore) MarkAdjustmentPosted(ctx context.Context, id, principalID, journalID, idempotencyKey, correlationID string) (*domain.ConsolidationAdjustment, bool, error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
-		return domain.ErrIdentityMissing
+		return nil, false, domain.ErrIdentityMissing
 	}
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+	if idempotencyKey == "" {
+		return nil, false, domain.ErrIdempotencyKeyRequired
+	}
+
+	var out *domain.ConsolidationAdjustment
+	replay := false
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		var cur domain.ConsolidationAdjustment
+		if err := scanConsolidationAdjustment(tx.QueryRow(ctx, `
+			SELECT `+consolidationAdjustmentColumns+`
+			FROM consolidation_adjustments
+			WHERE consolidation_adjustment_id = $1 AND tenant_id = $2
+			FOR UPDATE
+		`, id, tenantID), &cur); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return domain.ErrAdjustmentNotFound
+			}
+			return err
+		}
+		claim, err := lookupCommandClaim(ctx, tx, tenantID, idempotencyKey)
+		if err != nil {
+			return err
+		}
+		if claim != nil {
+			if claim.Command != domain.CommandPostAdjustment || claim.AdjustmentID == nil || *claim.AdjustmentID != id {
+				return commandConflict(idempotencyKey, claim)
+			}
+			out, replay = &cur, true
+			return nil
+		}
+
 		now := time.Now().UTC()
-		res, err := tx.Exec(ctx, `
+		var groupLegalEntityID, fiscalPeriod string
+		err = tx.QueryRow(ctx, `
 			UPDATE consolidation_adjustments
 			SET status = $1, posted_at = $2, posted_by_principal_id = $3, consolidation_book_journal_id = $4
 			WHERE consolidation_adjustment_id = $5 AND tenant_id = $6 AND status = $7
-		`, domain.AdjustmentStatusPosted, now, principalID, journalID, id, tenantID, domain.AdjustmentStatusApproved)
+			RETURNING group_legal_entity_id, fiscal_period
+		`, domain.AdjustmentStatusPosted, now, principalID, journalID, id, tenantID, domain.AdjustmentStatusApproved).
+			Scan(&groupLegalEntityID, &fiscalPeriod)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrInvalidAdjustmentTransition
+		}
 		if err != nil {
 			return err
 		}
-		if res.RowsAffected() == 0 {
-			return domain.ErrInvalidAdjustmentTransition
+		from := domain.AdjustmentStatusApproved
+		if err := s.appendAdjustmentTransition(ctx, tx, tenantID, id, &from,
+			domain.AdjustmentStatusPosted, principalID, correlationID, now, nil,
+			map[string]any{"consolidation_book_journal_id": journalID}); err != nil {
+			return err
 		}
+		if err := s.enqueueAdjustmentEvent(ctx, tx, "posted", "ConsolidationAdjustmentPosted",
+			tenantID, groupLegalEntityID, id, principalID, correlationID, map[string]any{
+				"consolidation_adjustment_id":   id,
+				"tenant_id":                     tenantID,
+				"group_legal_entity_id":         groupLegalEntityID,
+				"fiscal_period":                 fiscalPeriod,
+				"status":                        domain.AdjustmentStatusPosted,
+				"posted_at":                     now,
+				"posted_by_principal_id":        principalID,
+				"consolidation_book_journal_id": journalID,
+			}); err != nil {
+			return err
+		}
+		if err := recordCommandClaim(ctx, tx, tenantID, idempotencyKey, domain.CommandPostAdjustment, nil, &id); err != nil {
+			return err
+		}
+		cur.Status, cur.PostedAt, cur.PostedByPrincipalID, cur.ConsolidationBookJournalID =
+			domain.AdjustmentStatusPosted, &now, &principalID, &journalID
+		out = &cur
 		return nil
 	})
+	if err != nil {
+		return nil, false, err
+	}
+	return out, replay, nil
 }
 
 // ReverseAdjustment moves POSTED -> REVERSED, optionally recording the
-// replacement adjustment that supersedes it.
-func (s *PgStore) ReverseAdjustment(ctx context.Context, id, principalID, reason string, supersededBy *string) error {
+// replacement adjustment that supersedes it, and claims idempotencyKey in the
+// same transaction.
+//
+// A repeat of the key for the same adjustment returns it as it now stands with
+// replay=true and never re-reverses; the handler consults
+// ReplayedAdjustmentCommand before calling general-ledger-svc's reversal
+// endpoint, which — unlike its posting endpoint — has no source-event key of
+// its own. The same key for another command or adjustment is
+// ErrIdempotencyKeyConflict.
+func (s *PgStore) ReverseAdjustment(ctx context.Context, id, principalID, reason string, supersededBy *string, idempotencyKey, correlationID string) (*domain.ConsolidationAdjustment, bool, error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
-		return domain.ErrIdentityMissing
+		return nil, false, domain.ErrIdentityMissing
 	}
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		now := time.Now().UTC()
-		res, err := tx.Exec(ctx, `
-			UPDATE consolidation_adjustments
-			SET status = $1, reversed_at = $2, reversed_by_principal_id = $3, reversal_reason = $4, superseded_by_adjustment_id = $5
-			WHERE consolidation_adjustment_id = $6 AND tenant_id = $7 AND status = $8
-		`, domain.AdjustmentStatusReversed, now, principalID, reason, supersededBy, id, tenantID, domain.AdjustmentStatusPosted)
+	if idempotencyKey == "" {
+		return nil, false, domain.ErrIdempotencyKeyRequired
+	}
+
+	var out *domain.ConsolidationAdjustment
+	replay := false
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		var cur domain.ConsolidationAdjustment
+		if err := scanConsolidationAdjustment(tx.QueryRow(ctx, `
+			SELECT `+consolidationAdjustmentColumns+`
+			FROM consolidation_adjustments
+			WHERE consolidation_adjustment_id = $1 AND tenant_id = $2
+			FOR UPDATE
+		`, id, tenantID), &cur); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return domain.ErrAdjustmentNotFound
+			}
+			return err
+		}
+		claim, err := lookupCommandClaim(ctx, tx, tenantID, idempotencyKey)
 		if err != nil {
 			return err
 		}
-		if res.RowsAffected() == 0 {
+		if claim != nil {
+			if claim.Command != domain.CommandReverseAdjustment || claim.AdjustmentID == nil || *claim.AdjustmentID != id {
+				return commandConflict(idempotencyKey, claim)
+			}
+			out, replay = &cur, true
+			return nil
+		}
+
+		now := time.Now().UTC()
+		var groupLegalEntityID, fiscalPeriod string
+		err = tx.QueryRow(ctx, `
+			UPDATE consolidation_adjustments
+			SET status = $1, reversed_at = $2, reversed_by_principal_id = $3, reversal_reason = $4, superseded_by_adjustment_id = $5
+			WHERE consolidation_adjustment_id = $6 AND tenant_id = $7 AND status = $8
+			RETURNING group_legal_entity_id, fiscal_period
+		`, domain.AdjustmentStatusReversed, now, principalID, reason, supersededBy, id, tenantID, domain.AdjustmentStatusPosted).
+			Scan(&groupLegalEntityID, &fiscalPeriod)
+		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.ErrInvalidAdjustmentTransition
+		}
+		if err != nil {
+			return err
+		}
+		from := domain.AdjustmentStatusPosted
+		if err := s.appendAdjustmentTransition(ctx, tx, tenantID, id, &from,
+			domain.AdjustmentStatusReversed, principalID, correlationID, now, &reason,
+			map[string]any{"superseded_by_adjustment_id": supersededBy}); err != nil {
+			return err
+		}
+		if err := s.enqueueAdjustmentEvent(ctx, tx, "reversed", "ConsolidationAdjustmentReversed",
+			tenantID, groupLegalEntityID, id, principalID, correlationID, map[string]any{
+				"consolidation_adjustment_id": id,
+				"tenant_id":                   tenantID,
+				"group_legal_entity_id":       groupLegalEntityID,
+				"fiscal_period":               fiscalPeriod,
+				"status":                      domain.AdjustmentStatusReversed,
+				"reversed_at":                 now,
+				"reversed_by_principal_id":    principalID,
+				"reversal_reason":             reason,
+				"superseded_by_adjustment_id": supersededBy,
+			}); err != nil {
+			return err
+		}
+		if err := recordCommandClaim(ctx, tx, tenantID, idempotencyKey, domain.CommandReverseAdjustment, nil, &id); err != nil {
+			return err
+		}
+		cur.Status, cur.ReversedAt, cur.ReversedByPrincipalID, cur.ReversalReason, cur.SupersededByAdjustmentID =
+			domain.AdjustmentStatusReversed, &now, &principalID, &reason, supersededBy
+		out = &cur
+		return nil
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	return out, replay, nil
+}
+
+// ReplayedAdjustmentCommand reports whether idempotencyKey was already used for
+// command on this adjustment. It is the pre-flight check the handler makes
+// before an external ledger call (post, reverse) and before a status guard that
+// the original command has since moved past; the authoritative claim is still
+// recorded by MarkAdjustmentPosted/ReverseAdjustment in the transaction that
+// makes the change. A key claimed for another command or adjustment is
+// ErrIdempotencyKeyConflict, not "not a replay": reusing it is an error either
+// way.
+func (s *PgStore) ReplayedAdjustmentCommand(ctx context.Context, id, command, idempotencyKey string) (bool, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return false, domain.ErrIdentityMissing
+	}
+	if idempotencyKey == "" {
+		return false, domain.ErrIdempotencyKeyRequired
+	}
+	var replay bool
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		claim, err := lookupCommandClaim(ctx, tx, tenantID, idempotencyKey)
+		if err != nil {
+			return err
+		}
+		if claim == nil {
+			return nil
+		}
+		if claim.Command != command || claim.AdjustmentID == nil || *claim.AdjustmentID != id {
+			return commandConflict(idempotencyKey, claim)
+		}
+		replay = true
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	return replay, nil
+}
+
+// GetAdjustmentHistory returns the adjustment's append-only lifecycle. The
+// transition table is the record; rows that predate migration 000006 (or were
+// written by an old instance during a rolling deploy after the backfill) are
+// synthesized from the lifecycle columns on the adjustment itself, so the
+// answer is always the full chain rather than an empty one.
+func (s *PgStore) GetAdjustmentHistory(ctx context.Context, id string) (*domain.AdjustmentHistory, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+
+	var a domain.ConsolidationAdjustment
+	out := &domain.AdjustmentHistory{Transitions: []domain.AdjustmentTransition{}}
+
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		if err := scanConsolidationAdjustment(tx.QueryRow(ctx, `
+			SELECT `+consolidationAdjustmentColumns+`
+			FROM consolidation_adjustments
+			WHERE consolidation_adjustment_id = $1 AND tenant_id = $2
+		`, id, tenantID), &a); err != nil {
+			return err
+		}
+
+		out.ConsolidationAdjustmentID = a.ConsolidationAdjustmentID
+		out.GroupLegalEntityID = a.GroupLegalEntityID
+		out.FiscalPeriod = a.FiscalPeriod
+		out.AdjustmentType = a.AdjustmentType
+		out.Status = a.Status
+
+		rows, err := tx.Query(ctx, `
+			SELECT transition_id, consolidation_adjustment_id, sequence, from_status, to_status,
+			       actor_principal_id, occurred_at, COALESCE(correlation_id, ''), reason, details
+			FROM consolidation_adjustment_transitions
+			WHERE consolidation_adjustment_id = $1 AND tenant_id = $2
+			ORDER BY sequence ASC
+		`, id, tenantID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var t domain.AdjustmentTransition
+			var details []byte
+			if err := rows.Scan(&t.TransitionID, &t.ConsolidationAdjustmentID, &t.Sequence,
+				&t.FromStatus, &t.ToStatus, &t.ActorPrincipalID, &t.OccurredAt,
+				&t.CorrelationID, &t.Reason, &details); err != nil {
+				return err
+			}
+			if len(details) > 0 {
+				if err := json.Unmarshal(details, &t.Details); err != nil {
+					return fmt.Errorf("read adjustment transition %s details: %w", t.TransitionID, err)
+				}
+			}
+			out.Transitions = append(out.Transitions, t)
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		if len(out.Transitions) == 0 {
+			out.Transitions = synthesizeAdjustmentTransitions(&a)
 		}
 		return nil
 	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrAdjustmentNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// synthesizeAdjustmentTransitions rebuilds the lifecycle chain from the
+// adjustment row for an adjustment whose transitions were never written
+// (created before migration 000006). It mirrors exactly what the commands
+// would have recorded, from the same columns.
+func synthesizeAdjustmentTransitions(a *domain.ConsolidationAdjustment) []domain.AdjustmentTransition {
+	out := make([]domain.AdjustmentTransition, 0, 4)
+	var seq int64
+	add := func(from *string, to, actor string, at time.Time, reason *string, details map[string]any) {
+		seq++
+		out = append(out, domain.AdjustmentTransition{
+			TransitionID:              uuid.NewString(),
+			ConsolidationAdjustmentID: a.ConsolidationAdjustmentID,
+			Sequence:                  seq,
+			FromStatus:                from,
+			ToStatus:                  to,
+			ActorPrincipalID:          actor,
+			OccurredAt:                at,
+			Reason:                    reason,
+			Details:                   details,
+		})
+	}
+
+	add(nil, domain.AdjustmentStatusPendingApproval, a.CreatedByPrincipalID, a.CreatedAt, nil,
+		map[string]any{"adjustment_type": a.AdjustmentType})
+
+	if a.ApprovedAt != nil {
+		from := domain.AdjustmentStatusPendingApproval
+		actor := ""
+		if a.ApprovedByPrincipalID != nil {
+			actor = *a.ApprovedByPrincipalID
+		}
+		add(&from, domain.AdjustmentStatusApproved, actor, *a.ApprovedAt, nil, nil)
+	}
+	if a.PostedAt != nil {
+		from := domain.AdjustmentStatusApproved
+		actor := ""
+		if a.PostedByPrincipalID != nil {
+			actor = *a.PostedByPrincipalID
+		}
+		details := map[string]any{}
+		if a.ConsolidationBookJournalID != nil {
+			details["consolidation_book_journal_id"] = *a.ConsolidationBookJournalID
+		}
+		add(&from, domain.AdjustmentStatusPosted, actor, *a.PostedAt, nil, details)
+	}
+	if a.ReversedAt != nil {
+		from := domain.AdjustmentStatusPosted
+		actor := ""
+		if a.ReversedByPrincipalID != nil {
+			actor = *a.ReversedByPrincipalID
+		}
+		details := map[string]any{}
+		if a.SupersededByAdjustmentID != nil {
+			details["superseded_by_adjustment_id"] = *a.SupersededByAdjustmentID
+		}
+		add(&from, domain.AdjustmentStatusReversed, actor, *a.ReversedAt, a.ReversalReason, details)
+	}
+	return out
 }

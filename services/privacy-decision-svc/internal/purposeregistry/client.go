@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -24,12 +25,18 @@ type ActivityVersion struct {
 	DpiaTiaStatus           string   `json:"dpia_tia_status,omitempty"`
 	SubjectClasses          []string `json:"subject_classes,omitempty"`
 	DataCategories          []string `json:"data_categories,omitempty"`
+	Jurisdictions           []string `json:"jurisdictions,omitempty"`
+	RetentionRuleRefs       []string `json:"retention_rule_refs,omitempty"`
+	TransferRefs            []string `json:"transfer_refs,omitempty"`
 }
 
 type PurposeVersion struct {
-	PurposeVersionID string `json:"purpose_version_id"`
-	PurposeID        string `json:"purpose_id"`
-	VersionStatus    string `json:"version_status"`
+	PurposeVersionID     string   `json:"purpose_version_id"`
+	PurposeID            string   `json:"purpose_id"`
+	VersionStatus        string   `json:"version_status"`
+	LawfulBasisRefs      []string `json:"lawful_basis_refs,omitempty"`
+	SpecialConditionRefs []string `json:"special_condition_refs,omitempty"`
+	CompatibilityClass   string   `json:"compatibility_class,omitempty"`
 }
 
 type Client struct {
@@ -41,14 +48,30 @@ func NewClient(baseURL string) *Client {
 	return &Client{baseURL: strings.TrimRight(baseURL, "/"), httpClient: &http.Client{Timeout: 5 * time.Second}}
 }
 
-// ResolveActivity returns the currently-resolvable version of
-// activityID, or nil if it doesn't resolve to one at all (not found, or
-// exists but never activated) — GET /privacy/processing-activities/{id}
-// in PRV-01 already only ever resolves ACTIVE/SUSPENDED/RETIRED.
-func (c *Client) ResolveActivity(ctx context.Context, activityID string) (*ActivityVersion, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/privacy/processing-activities/"+activityID, nil)
+// ResolveActivity returns the currently-resolvable version of activityID.
+// Forwards verified tenant and principal identity to authenticate against PRV-01.
+func (c *Client) ResolveActivity(ctx context.Context, tenantID, principalID, activityID string) (*ActivityVersion, error) {
+	return c.getActivity(ctx, tenantID, principalID, "/privacy/processing-activities/"+url.PathEscape(activityID))
+}
+
+// ResolveActivityVersion returns exactly the requested historical or current
+// version (GET /privacy/processing-activities/{id}/versions/{versionID}); it
+// never substitutes the current version for a different requested one (§13, I29).
+func (c *Client) ResolveActivityVersion(ctx context.Context, tenantID, principalID, activityID, versionID string) (*ActivityVersion, error) {
+	return c.getActivity(ctx, tenantID, principalID,
+		"/privacy/processing-activities/"+url.PathEscape(activityID)+"/versions/"+url.PathEscape(versionID))
+}
+
+func (c *Client) getActivity(ctx context.Context, tenantID, principalID, path string) (*ActivityVersion, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
 	if err != nil {
 		return nil, err
+	}
+	if tenantID != "" {
+		req.Header.Set("X-Tenant-Id", tenantID)
+	}
+	if principalID != "" {
+		req.Header.Set("X-Principal-Id", principalID)
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -72,10 +95,16 @@ func (c *Client) ResolveActivity(ctx context.Context, activityID string) (*Activ
 
 // ResolvePurpose mirrors ResolveActivity for GET /privacy/purposes/{id},
 // which only ever resolves a PUBLISHED version.
-func (c *Client) ResolvePurpose(ctx context.Context, purposeID string) (*PurposeVersion, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/privacy/purposes/"+purposeID, nil)
+func (c *Client) ResolvePurpose(ctx context.Context, tenantID, principalID, purposeID string) (*PurposeVersion, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/privacy/purposes/"+url.PathEscape(purposeID), nil)
 	if err != nil {
 		return nil, err
+	}
+	if tenantID != "" {
+		req.Header.Set("X-Tenant-Id", tenantID)
+	}
+	if principalID != "" {
+		req.Header.Set("X-Principal-Id", principalID)
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {

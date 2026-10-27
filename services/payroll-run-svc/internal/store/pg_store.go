@@ -94,13 +94,18 @@ func (s *PgStore) CreatePayrollRun(ctx context.Context, r *domain.PayrollRun) (c
 				run_id, tenant_id, legal_entity_id, run_number, pay_period_start,
 				pay_period_end, pay_date, status, is_shadow_run, total_gross_pay,
 				total_net_pay, total_tax_deductions, total_other_deductions, employee_count,
-				correlation_id, created_at, updated_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+				correlation_id, created_at, updated_at,
+				total_employer_contributions, total_employee_contributions, total_tds,
+				total_pf, total_esi, total_pt, batch_id, processed_by
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
+				$18, $19, $20, $21, $22, $23, $24, $25)
 			ON CONFLICT (tenant_id, correlation_id) WHERE correlation_id != '' DO NOTHING
 		`, r.RunID, tenantID, r.LegalEntityID, r.RunNumber, r.PayPeriodStart,
 			r.PayPeriodEnd, r.PayDate, r.Status, r.IsShadowRun, r.TotalGrossPay,
 			r.TotalNetPay, r.TotalTaxDeductions, r.TotalOtherDeductions, r.EmployeeCount,
-			r.CorrelationID, r.CreatedAt, r.UpdatedAt)
+			r.CorrelationID, r.CreatedAt, r.UpdatedAt,
+			r.TotalEmployerContributions, r.TotalEmployeeContributions, r.TotalTDS,
+			r.TotalPF, r.TotalESI, r.TotalPT, r.BatchID, r.ProcessedBy)
 		if err != nil {
 			return err
 		}
@@ -109,7 +114,10 @@ func (s *PgStore) CreatePayrollRun(ctx context.Context, r *domain.PayrollRun) (c
 				SELECT run_id, run_number, pay_period_start::text, pay_period_end::text, pay_date::text,
 				       status, is_shadow_run, total_gross_pay, total_net_pay, total_tax_deductions,
 				       total_other_deductions, employee_count, created_at, updated_at, finalized_at,
-				       governance_decision_id, snapshot_hash
+				       governance_decision_id, snapshot_hash,
+				       total_employer_contributions, total_employee_contributions, total_tds,
+				       total_pf, total_esi, total_pt, batch_id, processed_by,
+				       approved_by, approved_at
 				FROM payroll_runs WHERE tenant_id = $1 AND correlation_id = $2
 			`, tenantID, r.CorrelationID)
 			if err := row.Scan(
@@ -117,6 +125,9 @@ func (s *PgStore) CreatePayrollRun(ctx context.Context, r *domain.PayrollRun) (c
 				&r.Status, &r.IsShadowRun, &r.TotalGrossPay, &r.TotalNetPay, &r.TotalTaxDeductions,
 				&r.TotalOtherDeductions, &r.EmployeeCount, &r.CreatedAt, &r.UpdatedAt, &r.FinalizedAt,
 				&r.GovernanceDecisionID, &r.SnapshotHash,
+				&r.TotalEmployerContributions, &r.TotalEmployeeContributions, &r.TotalTDS,
+				&r.TotalPF, &r.TotalESI, &r.TotalPT, &r.BatchID, &r.ProcessedBy,
+				&r.ApprovedBy, &r.ApprovedAt,
 			); err != nil {
 				return err
 			}
@@ -124,7 +135,7 @@ func (s *PgStore) CreatePayrollRun(ctx context.Context, r *domain.PayrollRun) (c
 			return nil
 		}
 		created = true
-		return nil
+		return enqueueRunEvent(ctx, tx, tenantID, r.RunID)
 	})
 	return created, err
 }
@@ -141,7 +152,10 @@ func (s *PgStore) GetPayrollRun(ctx context.Context, id string) (*domain.Payroll
 			SELECT run_id, tenant_id, legal_entity_id, run_number, pay_period_start::text,
 			       pay_period_end::text, pay_date::text, status, is_shadow_run, total_gross_pay,
 			       total_net_pay, total_tax_deductions, total_other_deductions, employee_count,
-			       created_at, updated_at, finalized_at, governance_decision_id, snapshot_hash
+			       created_at, updated_at, finalized_at, governance_decision_id, snapshot_hash,
+			       total_employer_contributions, total_employee_contributions, total_tds,
+			       total_pf, total_esi, total_pt, batch_id, processed_by,
+			       approved_by, approved_at
 			FROM payroll_runs
 			WHERE run_id = $1 AND tenant_id = $2
 		`, id, tenantID).Scan(
@@ -149,6 +163,9 @@ func (s *PgStore) GetPayrollRun(ctx context.Context, id string) (*domain.Payroll
 			&r.PayPeriodEnd, &r.PayDate, &r.Status, &r.IsShadowRun, &r.TotalGrossPay,
 			&r.TotalNetPay, &r.TotalTaxDeductions, &r.TotalOtherDeductions, &r.EmployeeCount,
 			&r.CreatedAt, &r.UpdatedAt, &r.FinalizedAt, &r.GovernanceDecisionID, &r.SnapshotHash,
+			&r.TotalEmployerContributions, &r.TotalEmployeeContributions, &r.TotalTDS,
+			&r.TotalPF, &r.TotalESI, &r.TotalPT, &r.BatchID, &r.ProcessedBy,
+			&r.ApprovedBy, &r.ApprovedAt,
 		)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -172,7 +189,10 @@ func (s *PgStore) ListPayrollRuns(ctx context.Context, legalEntityID, status str
 			SELECT run_id, tenant_id, legal_entity_id, run_number, pay_period_start::text,
 			       pay_period_end::text, pay_date::text, status, is_shadow_run, total_gross_pay,
 			       total_net_pay, total_tax_deductions, total_other_deductions, employee_count,
-			       created_at, updated_at, finalized_at, governance_decision_id, snapshot_hash
+			       created_at, updated_at, finalized_at, governance_decision_id, snapshot_hash,
+			       total_employer_contributions, total_employee_contributions, total_tds,
+			       total_pf, total_esi, total_pt, batch_id, processed_by,
+			       approved_by, approved_at
 			FROM payroll_runs
 			WHERE tenant_id = $1
 		`
@@ -205,6 +225,9 @@ func (s *PgStore) ListPayrollRuns(ctx context.Context, legalEntityID, status str
 				&r.PayPeriodEnd, &r.PayDate, &r.Status, &r.IsShadowRun, &r.TotalGrossPay,
 				&r.TotalNetPay, &r.TotalTaxDeductions, &r.TotalOtherDeductions, &r.EmployeeCount,
 				&r.CreatedAt, &r.UpdatedAt, &r.FinalizedAt, &r.GovernanceDecisionID, &r.SnapshotHash,
+				&r.TotalEmployerContributions, &r.TotalEmployeeContributions, &r.TotalTDS,
+				&r.TotalPF, &r.TotalESI, &r.TotalPT, &r.BatchID, &r.ProcessedBy,
+				&r.ApprovedBy, &r.ApprovedAt,
 			); err != nil {
 				return err
 			}
@@ -255,12 +278,22 @@ func (s *PgStore) SaveCalculatedResults(ctx context.Context, runID string, total
 				INSERT INTO pay_slips (
 					slip_id, tenant_id, run_id, employee_id, employee_number,
 					employee_name, gross_pay, tax_withheld, benefits_deductions,
-					net_pay, currency, effective_date, taxable_amount, structure_id, created_at
-				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+					net_pay, currency, effective_date, taxable_amount, structure_id, created_at,
+					basic_salary, hra, special_allowance, conveyance, medical_allowance, lta,
+					pf_employee, pf_employer, esi_employee, esi_employer, pt, tds,
+					other_deductions, arrears, bonus, overtime_pay, leave_encashment,
+					reimbursements, advance_deduction, loan_deduction
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
+					$16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29,
+					$30, $31, $32, $33, $34, $35)
 			`, slip.SlipID, tenantID, runID, slip.EmployeeID, slip.EmployeeNumber,
 				slip.EmployeeName, slip.GrossPay, slip.TaxWithheld, slip.BenefitsDeductions,
 				slip.NetPay, slip.Currency, slip.EffectiveDate, slip.TaxableAmount,
-				slip.StructureID, slip.CreatedAt)
+				slip.StructureID, slip.CreatedAt,
+				slip.BasicSalary, slip.HRA, slip.SpecialAllowance, slip.Conveyance, slip.MedicalAllowance, slip.LTA,
+				slip.PFEmployee, slip.PFEmployer, slip.ESIEmployee, slip.ESIEmployer, slip.PT, slip.TDS,
+				slip.OtherDeductions, slip.Arrears, slip.Bonus, slip.OvertimePay, slip.LeaveEncashment,
+				slip.Reimbursements, slip.AdvanceDeduction, slip.LoanDeduction)
 			if err != nil {
 				return err
 			}
@@ -277,6 +310,9 @@ func (s *PgStore) SaveCalculatedResults(ctx context.Context, runID string, total
 					item.CalculationValue, item.Amount, item.Sequence, item.CreatedAt); err != nil {
 					return err
 				}
+			}
+			if err := insertTaxLinesTx(ctx, tx, tenantID, slip); err != nil {
+				return err
 			}
 		}
 
@@ -310,7 +346,10 @@ func (s *PgStore) SaveCalculatedResults(ctx context.Context, runID string, total
 			    updated_at = $6
 			WHERE run_id = $7 AND tenant_id = $8
 		`, totalGross, totalNet, totalTax, totalDeductions, len(slips), time.Now().UTC(), runID, tenantID)
-		return err
+		if err != nil {
+			return err
+		}
+		return enqueueRunEvent(ctx, tx, tenantID, runID)
 	})
 }
 
@@ -326,7 +365,11 @@ func (s *PgStore) GetPaySlipsByRun(ctx context.Context, runID string) ([]domain.
 			SELECT slip_id, tenant_id, run_id, employee_id, employee_number,
 			       employee_name, gross_pay, tax_withheld, benefits_deductions,
 			       net_pay, currency, effective_date::text, taxable_amount,
-			       structure_id::text, created_at
+			       structure_id::text, created_at,
+			       basic_salary, hra, special_allowance, conveyance, medical_allowance, lta,
+			       pf_employee, pf_employer, esi_employee, esi_employer, pt, tds,
+			       other_deductions, arrears, bonus, overtime_pay, leave_encashment,
+			       reimbursements, advance_deduction, loan_deduction
 			FROM pay_slips
 			WHERE run_id = $1 AND tenant_id = $2
 			ORDER BY employee_name ASC
@@ -343,6 +386,10 @@ func (s *PgStore) GetPaySlipsByRun(ctx context.Context, runID string) ([]domain.
 				&slip.EmployeeName, &slip.GrossPay, &slip.TaxWithheld, &slip.BenefitsDeductions,
 				&slip.NetPay, &slip.Currency, &slip.EffectiveDate, &slip.TaxableAmount,
 				&slip.StructureID, &slip.CreatedAt,
+				&slip.BasicSalary, &slip.HRA, &slip.SpecialAllowance, &slip.Conveyance, &slip.MedicalAllowance, &slip.LTA,
+				&slip.PFEmployee, &slip.PFEmployer, &slip.ESIEmployee, &slip.ESIEmployer, &slip.PT, &slip.TDS,
+				&slip.OtherDeductions, &slip.Arrears, &slip.Bonus, &slip.OvertimePay, &slip.LeaveEncashment,
+				&slip.Reimbursements, &slip.AdvanceDeduction, &slip.LoanDeduction,
 			); err != nil {
 				return err
 			}
@@ -387,6 +434,9 @@ func (s *PgStore) GetPaySlipsByRun(ctx context.Context, runID string) ([]domain.
 
 		for i := range out {
 			out[i].Items = bySlip[out[i].SlipID]
+		}
+		if err := attachTaxLinesTx(ctx, tx, tenantID, runID, out); err != nil {
+			return err
 		}
 		return nil
 	})
@@ -485,6 +535,9 @@ func (s *PgStore) FinalizePayrollRun(ctx context.Context, runID string, governan
 			    snapshot_hash = $4
 			WHERE run_id = $5 AND tenant_id = $6
 		`, now, now, governanceDecisionID, snapshotHash, runID, tenantID)
-		return err
+		if err != nil {
+			return err
+		}
+		return enqueueRunEvent(ctx, tx, tenantID, runID)
 	})
 }

@@ -14,21 +14,9 @@ import (
 	authzpkg "zoiko.io/payee-banking-identity-svc/internal/authz"
 	"zoiko.io/payee-banking-identity-svc/internal/counterparty"
 	"zoiko.io/payee-banking-identity-svc/internal/domain"
-	"zoiko.io/payee-banking-identity-svc/internal/events"
 	"zoiko.io/payee-banking-identity-svc/internal/handler"
 	"zoiko.io/payee-banking-identity-svc/internal/middleware"
 )
-
-// ── stub publisher ───────────────────────────────────────────────────────────
-
-type stubPublisher struct{ calls int }
-
-func (p *stubPublisher) Publish(_ context.Context, _ events.PublishParams) error {
-	p.calls++
-	return nil
-}
-
-var _ events.Publisher = (*stubPublisher)(nil)
 
 // ── stub authz — including the own-object SoD layer and privileged-read gate ─
 
@@ -85,9 +73,9 @@ var _ counterparty.Client = (*stubParty)(nil)
 const testTenant = "tenant-org10-1"
 const testLegalEntity = "le-org10-1"
 
-func newTestRouter(st *stubStore, pub *stubPublisher, az *stubAuthz, party *stubParty) chi.Router {
+func newTestRouter(st *stubStore, az *stubAuthz, party *stubParty) chi.Router {
 	logger := zap.NewNop()
-	h := handler.New(st, pub, az, party, logger)
+	h := handler.New(st, az, party, logger)
 	r := chi.NewRouter()
 	r.Use(middleware.TenantContext())
 	handler.RegisterRoutes(r, h)
@@ -145,7 +133,7 @@ func approveDestination(t *testing.T, r http.Handler, destinationID string) *htt
 func TestProposePayeeDestination(t *testing.T) {
 	party := newStubParty()
 	party.add("party-1", testLegalEntity)
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, party)
+	r := newTestRouter(newStubStore(), &stubAuthz{}, party)
 
 	d := proposeDestination(t, r, "party-1", domain.SourceSupplierPortal)
 	if d.Status != domain.StatusCandidate {
@@ -157,7 +145,7 @@ func TestProposePayeeDestination(t *testing.T) {
 }
 
 func TestProposePayeeDestination_UnknownParty_Rejected(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, newStubParty())
+	r := newTestRouter(newStubStore(), &stubAuthz{}, newStubParty())
 	w := doRequest(r, http.MethodPost, "/org10/destinations/", domain.ProposeDestinationRequest{
 		LegalEntityID: testLegalEntity, PartyRef: "does-not-exist", FinancialInstitution: "Bank", AccountIdentifier: "12345",
 		CountryCode: "US", Currency: "USD", PayeeName: "Acme", SourceType: domain.SourceSupplierPortal,
@@ -173,7 +161,7 @@ func TestProposePayeeDestination_UnknownParty_Rejected(t *testing.T) {
 func TestVerifyPayeeDestination_InvoiceSourced_RequiresIndependentMethod(t *testing.T) {
 	party := newStubParty()
 	party.add("party-2", testLegalEntity)
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, party)
+	r := newTestRouter(newStubStore(), &stubAuthz{}, party)
 	d := proposeDestination(t, r, "party-2", domain.SourceInvoiceOCR)
 
 	w := verifyDestination(t, r, d.DestinationID, "INVOICE_OCR")
@@ -190,7 +178,7 @@ func TestVerifyPayeeDestination_InvoiceSourced_RequiresIndependentMethod(t *test
 func TestApprovePayeeDestination_SelfApproval_Denied(t *testing.T) {
 	party := newStubParty()
 	party.add("party-3", testLegalEntity)
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{sodRules: true}, party)
+	r := newTestRouter(newStubStore(), &stubAuthz{sodRules: true}, party)
 	d := proposeDestination(t, r, "party-3", domain.SourceSupplierPortal) // proposed by "principal-proposer"
 	verifyDestination(t, r, d.DestinationID, "OUTBOUND_CALL_TO_SUPPLIER")
 
@@ -203,7 +191,7 @@ func TestApprovePayeeDestination_SelfApproval_Denied(t *testing.T) {
 func TestApprovePayeeDestination_IndependentApprover_Succeeds(t *testing.T) {
 	party := newStubParty()
 	party.add("party-4", testLegalEntity)
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{sodRules: true}, party)
+	r := newTestRouter(newStubStore(), &stubAuthz{sodRules: true}, party)
 	d := proposeDestination(t, r, "party-4", domain.SourceSupplierPortal)
 	verifyDestination(t, r, d.DestinationID, "OUTBOUND_CALL_TO_SUPPLIER")
 
@@ -223,7 +211,7 @@ func TestApprovePayeeDestination_IndependentApprover_Succeeds(t *testing.T) {
 func TestActivateDestination_SupersedesPriorActive(t *testing.T) {
 	party := newStubParty()
 	party.add("party-5", testLegalEntity)
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{sodRules: true}, party)
+	r := newTestRouter(newStubStore(), &stubAuthz{sodRules: true}, party)
 
 	first := proposeDestination(t, r, "party-5", domain.SourceSupplierPortal)
 	verifyDestination(t, r, first.DestinationID, "OUTBOUND_CALL_TO_SUPPLIER")
@@ -268,7 +256,7 @@ func TestActivateDestination_SupersedesPriorActive(t *testing.T) {
 func TestProposePayeeDestination_DuplicateFingerprint_Rejected(t *testing.T) {
 	party := newStubParty()
 	party.add("party-6", testLegalEntity)
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, party)
+	r := newTestRouter(newStubStore(), &stubAuthz{}, party)
 	proposeDestination(t, r, "party-6", domain.SourceSupplierPortal)
 
 	req := domain.ProposeDestinationRequest{
@@ -286,7 +274,7 @@ func TestProposePayeeDestination_DuplicateFingerprint_Rejected(t *testing.T) {
 func TestGetPayeeDestination_PrivilegedRead_ReturnsFullAccount(t *testing.T) {
 	party := newStubParty()
 	party.add("party-7", testLegalEntity)
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, party)
+	r := newTestRouter(newStubStore(), &stubAuthz{}, party)
 	d := proposeDestination(t, r, "party-7", domain.SourceSupplierPortal)
 
 	w := doRequest(r, http.MethodGet, "/org10/destinations/"+d.DestinationID, nil, testTenant)
@@ -300,7 +288,7 @@ func TestGetPayeeDestination_PrivilegedRead_ReturnsFullAccount(t *testing.T) {
 func TestGetPayeeDestination_UnprivilegedRead_Masked(t *testing.T) {
 	party := newStubParty()
 	party.add("party-8", testLegalEntity)
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{denyPrivileged: true}, party)
+	r := newTestRouter(newStubStore(), &stubAuthz{denyPrivileged: true}, party)
 	d := proposeDestination(t, r, "party-8", domain.SourceSupplierPortal)
 
 	w := doRequest(r, http.MethodGet, "/org10/destinations/"+d.DestinationID, nil, testTenant)
@@ -315,7 +303,7 @@ func TestGetPayeeDestination_UnprivilegedRead_Masked(t *testing.T) {
 }
 
 func TestGetPayeeDestination_NotFound(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, newStubParty())
+	r := newTestRouter(newStubStore(), &stubAuthz{}, newStubParty())
 	w := doRequest(r, http.MethodGet, "/org10/destinations/does-not-exist", nil, testTenant)
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("expected 404, got %d: %s", w.Code, w.Body.String())

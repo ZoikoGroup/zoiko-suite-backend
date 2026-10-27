@@ -43,6 +43,10 @@ type Backend interface {
 	// ErrIntegrityFailure if they don't match — this is the read-time half
 	// of tamper detection, not just a write-time formality.
 	Get(ctx context.Context, key string, wantChecksumSHA256 string) ([]byte, error)
+
+	// Delete removes the blob at key from storage. If the object does not exist,
+	// Delete returns nil (idempotent compensation).
+	Delete(ctx context.Context, key string) error
 }
 
 // LocalFileBackend implements Backend against a directory of encrypted
@@ -130,6 +134,17 @@ func (b *LocalFileBackend) Get(_ context.Context, key string, wantChecksumSHA256
 		return nil, ErrIntegrityFailure
 	}
 	return plaintext, nil
+}
+
+// Delete removes the encrypted blob at key from disk. If the file does not exist,
+// Delete returns nil (idempotent deletion).
+func (b *LocalFileBackend) Delete(_ context.Context, key string) error {
+	filePath := b.path(key)
+	err := os.Remove(filePath)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("storage: failed to delete object %q: %w", key, err)
+	}
+	return nil
 }
 
 var _ Backend = (*LocalFileBackend)(nil)

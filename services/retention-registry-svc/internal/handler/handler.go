@@ -14,8 +14,10 @@ import (
 
 	authzpkg "zoiko.io/retention-registry-svc/internal/authz"
 	"zoiko.io/retention-registry-svc/internal/domain"
+	svcenvelope "zoiko.io/retention-registry-svc/internal/envelope"
 	"zoiko.io/retention-registry-svc/internal/events"
 	svcmiddleware "zoiko.io/retention-registry-svc/internal/middleware"
+	"zoiko.io/retention-registry-svc/internal/outbox"
 	"zoiko.io/retention-registry-svc/internal/store"
 )
 
@@ -74,6 +76,18 @@ func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (stri
 // than ignored.
 func (h *Handler) resolveTenantScope(w http.ResponseWriter, r *http.Request, declared string) (*string, bool) {
 	verified := svcmiddleware.TenantFromContext(r.Context())
+	if declared != "" {
+		if _, err := uuid.Parse(declared); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid tenant_id: must be a valid UUID")
+			return nil, false
+		}
+	}
+	if verified != "" {
+		if _, err := uuid.Parse(verified); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid tenant_id: must be a valid UUID")
+			return nil, false
+		}
+	}
 	if declared != "" && declared != verified {
 		writeError(w, http.StatusForbidden,
 			"tenant_id does not match the verified X-Tenant-Id")
@@ -82,14 +96,58 @@ func (h *Handler) resolveTenantScope(w http.ResponseWriter, r *http.Request, dec
 	return strPtrOrNil(verified), true
 }
 
+// checkBodyTenant validates a tenant_id supplied in a create-policy/create-hold
+// body against the verified X-Tenant-Id, and writes the refusal itself.
+//
+// A body tenant_id is never a source of tenant identity: it may only AGREE with
+// the verified header. It is refused when malformed (400), when it disagrees
+// with the verified tenant (403), and also when there is NO verified tenant at
+// all (403) — there is nothing for it to agree with. That last case used to pass
+// this check, reach authorization, and then fail at the database's row-level
+// security WITH CHECK as an opaque 500. RLS is unchanged and remains the
+// backstop; this only makes the client error deterministic and ahead of it.
+//
+// An empty body tenant_id (a platform-wide policy or hold) is always acceptable
+// here; whether the caller may act at platform scope is the authorization
+// check's job, and middleware.TenantContext stays permissive on purpose.
+func (h *Handler) checkBodyTenant(w http.ResponseWriter, r *http.Request, bodyTenant string) bool {
+	if bodyTenant == "" {
+		return true
+	}
+	if _, err := uuid.Parse(bodyTenant); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid tenant_id: must be a valid UUID")
+		return false
+	}
+	verified := svcmiddleware.TenantFromContext(r.Context())
+	if verified == "" {
+		writeError(w, http.StatusForbidden, "tenant_id requires a matching verified X-Tenant-Id")
+		return false
+	}
+	if bodyTenant != verified {
+		writeError(w, http.StatusForbidden, "tenant_id does not match the verified X-Tenant-Id")
+		return false
+	}
+	return true
+}
+
 func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID, tenantID, actionType string) bool {
+	return h.authorizePrincipal(w, r, principalID, tenantID, actionType, "not authorized to perform this action")
+}
+
+// authorizePrincipal checks actionType for a given principalID against tenantID's scope
+// (or platform scope if tenantID is empty) and emits a customized forbidden message if denied.
+func (h *Handler) authorizePrincipal(w http.ResponseWriter, r *http.Request, principalID, tenantID, actionType, deniedMsg string) bool {
 	scope := platformScopeID
 	if tenantID != "" {
 		scope = tenantID
 	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, scope, actionType); err != nil {
 		if errors.Is(err, authzpkg.ErrAuthorizationDenied) {
-			writeError(w, http.StatusForbidden, "not authorized to perform this action")
+			msg := "not authorized to perform this action"
+			if deniedMsg != "" {
+				msg = deniedMsg
+			}
+			writeError(w, http.StatusForbidden, msg)
 		} else {
 			writeError(w, http.StatusServiceUnavailable, "authorization service unavailable")
 		}
@@ -140,12 +198,21 @@ func (h *Handler) CreateRetentionPolicy(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	if !h.checkBodyTenant(w, r, req.TenantID) {
+		return
+	}
+
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
 	}
 	if !h.authorize(w, r, principalID, req.TenantID, RetentionPolicyCreate) {
 		return
+	}
+
+	correlationID := r.Header.Get("X-Correlation-ID")
+	if env, ok := svcenvelope.FromContext(r.Context()); ok && env.CorrelationID != "" {
+		correlationID = env.CorrelationID
 	}
 
 	p := &domain.RetentionPolicy{
@@ -163,16 +230,43 @@ func (h *Handler) CreateRetentionPolicy(w http.ResponseWriter, r *http.Request) 
 		CreatedAt:            time.Now().UTC(),
 		CreatedByPrincipalID: principalID,
 	}
-	if err := h.store.CreateRetentionPolicy(r.Context(), p); err != nil {
+
+	outboxEvt := outbox.Event{
+		AggregateType: "RetentionPolicy",
+		AggregateID:   p.RetentionPolicyID,
+		EventType:     "retention_policy.created",
+		Payload: events.Event{
+			EventID:       "evt-" + uuid.New().String(),
+			EventType:     "retention_policy.created",
+			EventVersion:  "1.0",
+			SchemaVersion: "1.0",
+			SourceService: "retention-registry-svc",
+			EntityID:      p.RetentionPolicyID,
+			TenantID:      req.TenantID,
+			Jurisdiction:  req.JurisdictionCode,
+			ActorID:       principalID,
+			CorrelationID: correlationID,
+			OccurredAt:    p.CreatedAt,
+			Payload:       p,
+		},
+		CorrelationID: correlationID,
+		TenantID:      strPtrOrNil(req.TenantID),
+	}
+
+	if err := h.store.CreateRetentionPolicy(r.Context(), p, outboxEvt); err != nil {
 		h.logger.Error("create retention policy failed", zap.Error(err))
 		writeError(w, http.StatusInternalServerError, "failed to create retention policy")
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "retention_policy.created", EntityID: p.RetentionPolicyID, TenantID: req.TenantID,
-		Jurisdiction: req.JurisdictionCode, ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: p,
-	})
+	// outboxEvt above already carries this exact event, inserted atomically
+	// with the domain row and delivered reliably by the outbox relay. A
+	// direct h.publisher.Publish call used to run here too — not as a
+	// fallback (its own error was discarded, so nothing depended on whether
+	// it succeeded), but unconditionally alongside the outbox, so a
+	// consumer received retention_policy.created twice on the common case
+	// where both sends succeeded. Removed; the outbox is the only delivery
+	// path now, same as ReleaseLegalHold's.
 	writeJSON(w, http.StatusCreated, p)
 }
 
@@ -188,12 +282,21 @@ func (h *Handler) CreateLegalHold(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !h.checkBodyTenant(w, r, req.TenantID) {
+		return
+	}
+
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
 	}
 	if !h.authorize(w, r, principalID, req.TenantID, LegalHoldCreate) {
 		return
+	}
+
+	correlationID := r.Header.Get("X-Correlation-ID")
+	if env, ok := svcenvelope.FromContext(r.Context()); ok && env.CorrelationID != "" {
+		correlationID = env.CorrelationID
 	}
 
 	now := time.Now().UTC()
@@ -210,43 +313,66 @@ func (h *Handler) CreateLegalHold(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:            now,
 		CreatedByPrincipalID: principalID,
 	}
-	if err := h.store.CreateLegalHold(r.Context(), hld); err != nil {
+
+	outboxEvt := outbox.Event{
+		AggregateType: "LegalHold",
+		AggregateID:   hld.LegalHoldID,
+		EventType:     "legal_hold.engaged",
+		Payload: events.Event{
+			EventID:       "evt-" + uuid.New().String(),
+			EventType:     "legal_hold.engaged",
+			EventVersion:  "1.0",
+			SchemaVersion: "1.0",
+			SourceService: "retention-registry-svc",
+			EntityID:      hld.LegalHoldID,
+			TenantID:      req.TenantID,
+			ActorID:       principalID,
+			CorrelationID: correlationID,
+			OccurredAt:    hld.CreatedAt,
+			Payload:       hld,
+		},
+		CorrelationID: correlationID,
+		TenantID:      strPtrOrNil(req.TenantID),
+	}
+
+	if err := h.store.CreateLegalHold(r.Context(), hld, outboxEvt); err != nil {
 		h.logger.Error("create legal hold failed", zap.Error(err))
 		writeError(w, http.StatusInternalServerError, "failed to create legal hold")
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "legal_hold.engaged", EntityID: hld.LegalHoldID, TenantID: req.TenantID,
-		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: hld,
-	})
+	// See CreateRetentionPolicy's comment: outboxEvt already delivers this
+	// event reliably; the direct publish that used to run here duplicated it.
 	writeJSON(w, http.StatusCreated, hld)
 }
 
 // GetLegalHold handles GET /v1/legal-holds/{id}.
 //
-// THIS ROUTE HAD NO IDENTITY CHECK OF ANY KIND. It called
-// FindLegalHoldByID(id) with no principal, no tenant, and no authorization —
-// so anything that could reach the port could read any hold in any tenant by
-// id, and a hold names the court or regulator that ordered the freeze, the
-// matter, and the custodians holding the evidence. Reading it now requires a
-// verified principal and is scoped to the caller's tenant.
+// This route used to have no identity check of any kind: it called
+// FindLegalHoldByID(id) with no principal, tenant or authorization, so anything
+// that could reach the port could read any hold in any tenant by id. A hold
+// names the court or regulator that ordered the freeze, the matter, and the
+// custodians holding the evidence.
 //
-// No authz action is checked beyond the tenant scope, matching the create/list
-// posture: a hold in your own tenant is visible to your own principals, and it
-// is the RELEASE that is privileged. Widening that to a per-read grant is a
-// defensible position, but it is a policy change rather than a defect fix and
-// would need the grant seeding to change with it.
+// It now applies two gates, in this order:
 //
-// BOTH GATES ARE NOW PRESENT. The read is scoped to the caller's verified
-// tenant in the store, and it is additionally authorized against LEGAL_HOLD_READ
-// for the hold's own tenant. The tenant scope answers "whose hold is this"; the
-// action grant answers "may this principal read holds at all". Fetch-then-
-// authorize, in that order and matching ReleaseLegalHold: the store already
-// refuses another tenant's hold with the same ErrLegalHoldNotFound a genuinely
-// absent id produces, so authorizing against a caller-supplied scope first would
-// let a caller nominate an entity they hold a grant for and probe for holds
-// outside it.
+//  1. Identity and tenant scope. A verified principal (401 if absent) and a
+//     verified tenant (401 if absent) are required, and the store read is scoped
+//     to that tenant. A hold in another tenant, or an id that does not exist,
+//     both answer 404 — indistinguishable, so a probe cannot confirm that an id
+//     exists. Platform-wide holds (tenant_id NULL) are readable by every tenant.
+//  2. Action grant. The caller must hold LEGAL_HOLD_READ at the hold's own scope
+//     (its tenant, or the platform scope for a platform-wide hold): 403 if
+//     denied, 503 if authorization-svc cannot be reached (fail closed).
+//
+// The fetch comes first and the authorization second, matching ReleaseLegalHold:
+// authorizing against a caller-supplied scope before the tenant-scoped fetch
+// would let a caller nominate an entity they hold a grant for and probe for
+// holds outside it.
+//
+// The LEGAL_HOLD_READ gate is implemented behavior, but the audit file does not
+// list it as a requirement of this route, so it is tracked as a documentation
+// alignment question rather than as settled contract.
 func (h *Handler) GetLegalHold(w http.ResponseWriter, r *http.Request) {
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
@@ -257,7 +383,8 @@ func (h *Handler) GetLegalHold(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	hld, err := h.store.FindLegalHoldByID(r.Context(), chi.URLParam(r, "id"), tenantID)
+	id := chi.URLParam(r, "id")
+	hld, err := h.store.FindLegalHoldByID(r.Context(), id, tenantID)
 	if err != nil {
 		if errors.Is(err, domain.ErrLegalHoldNotFound) {
 			writeError(w, http.StatusNotFound, "legal hold not found")
@@ -443,6 +570,7 @@ func pageParams(w http.ResponseWriter, r *http.Request) (int, int, bool) {
 // "release approval". Legal only from ACTIVE.
 func (h *Handler) ReleaseLegalHold(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+
 	var req domain.ReleaseLegalHoldRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
@@ -476,6 +604,10 @@ func (h *Handler) ReleaseLegalHold(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if principalID == req.ReleaseApprovedByPrincipalID {
+		writeError(w, http.StatusForbidden, "maker-checker violation: principal cannot approve their own legal hold release")
+		return
+	}
 	scope := ""
 	if existing.TenantID != nil {
 		scope = *existing.TenantID
@@ -483,8 +615,48 @@ func (h *Handler) ReleaseLegalHold(w http.ResponseWriter, r *http.Request) {
 	if !h.authorize(w, r, principalID, scope, LegalHoldRelease) {
 		return
 	}
+	if !h.authorizePrincipal(w, r, req.ReleaseApprovedByPrincipalID, scope, LegalHoldRelease, "approver is not authorized to release legal hold") {
+		return
+	}
 
-	released, err := h.store.ReleaseLegalHold(r.Context(), id, tenantID, principalID, req.ReleaseApprovedByPrincipalID)
+	correlationID := r.Header.Get("X-Correlation-ID")
+	if env, ok := svcenvelope.FromContext(r.Context()); ok && env.CorrelationID != "" {
+		correlationID = env.CorrelationID
+	}
+
+	tenantForEvent := ""
+	if existing.TenantID != nil {
+		tenantForEvent = *existing.TenantID
+	}
+
+	outboxEvt := outbox.Event{
+		AggregateType: "LegalHold",
+		AggregateID:   id,
+		EventType:     "legal_hold.released",
+		Payload: events.Event{
+			EventID:       "evt-" + uuid.New().String(),
+			EventType:     "legal_hold.released",
+			EventVersion:  "1.0",
+			SchemaVersion: "1.0",
+			SourceService: "retention-registry-svc",
+			EntityID:      id,
+			TenantID:      tenantForEvent,
+			ActorID:       principalID,
+			CorrelationID: correlationID,
+			OccurredAt:    time.Now().UTC(),
+			Payload: map[string]interface{}{
+				"legal_hold_id":                   id,
+				"tenant_id":                       tenantForEvent,
+				"released_by_principal_id":        principalID,
+				"release_approved_by_principal_id": req.ReleaseApprovedByPrincipalID,
+				"status":                          "RELEASED",
+			},
+		},
+		CorrelationID: correlationID,
+		TenantID:      existing.TenantID,
+	}
+
+	released, err := h.store.ReleaseLegalHold(r.Context(), id, tenantID, principalID, req.ReleaseApprovedByPrincipalID, outboxEvt)
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrLegalHoldNotFound):
@@ -498,14 +670,8 @@ func (h *Handler) ReleaseLegalHold(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tenantForEvent := ""
-	if released.TenantID != nil {
-		tenantForEvent = *released.TenantID
-	}
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "legal_hold.released", EntityID: released.LegalHoldID, TenantID: tenantForEvent,
-		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: released,
-	})
+	// See CreateRetentionPolicy's comment: outboxEvt already delivers this
+	// event reliably; the direct publish that used to run here duplicated it.
 	writeJSON(w, http.StatusOK, released)
 }
 

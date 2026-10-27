@@ -142,6 +142,13 @@ func (s *stubStore) FreezeProposal(_ context.Context, proposalID string, princip
 		return nil, domain.ErrInvalidTransition
 	}
 	now := time.Now().UTC()
+	var active []domain.ProposalItem
+	for _, i := range s.items {
+		if i.ProposalID == proposalID && i.IsActive {
+			active = append(active, *i)
+		}
+	}
+	p.FrozenFingerprint = domain.ComputeFingerprint(p, active, domain.StatusFrozen)
 	p.Status = domain.StatusFrozen
 	p.FrozenByPrincipalID = &principalID
 	p.FrozenAt = &now

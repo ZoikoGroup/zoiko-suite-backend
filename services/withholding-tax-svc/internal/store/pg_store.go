@@ -35,7 +35,7 @@ func (s *PgStore) setRLS(ctx context.Context, tx pgx.Tx) error {
 	if tenantID == "" {
 		return domain.ErrTenantMissing
 	}
-	_, err := tx.Exec(ctx, "SET LOCAL app.tenant_id = $1", tenantID)
+	_, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID)
 	return err
 }
 
@@ -58,9 +58,6 @@ func (s *PgStore) Create(ctx context.Context, o *domain.WithholdingTaxObligation
 	o.UpdatedAt = now
 	if o.Status == "" {
 		o.Status = domain.StatusPendingRemittance
-	}
-	if o.Currency == "" {
-		o.Currency = "USD"
 	}
 	if o.PaymentType == "" {
 		o.PaymentType = "SERVICES"
@@ -193,18 +190,21 @@ func (s *PgStore) Update(ctx context.Context, o *domain.WithholdingTaxObligation
 	o.UpdatedAt = time.Now().UTC()
 	tenantID := middleware.GetTenantID(ctx)
 
-	_, err = tx.Exec(ctx, `
+	cmdTag, err := tx.Exec(ctx, `
 		UPDATE withholding_tax_obligations
 		SET gross_payment_amount=$1, taxable_base_amount=$2, withholding_rate_percent=$3,
 		    withheld_amount=$4, tax_treaty_exemption=$5, exemption_certificate_ref=$6,
 		    notes=$7, effective_to=$8, updated_at=$9
-		WHERE obligation_id=$10 AND tenant_id=$11`,
+		WHERE obligation_id=$10 AND tenant_id=$11 AND status != 'REMITTED'`,
 		o.GrossPaymentAmount, o.TaxableBaseAmount, o.WithholdingRatePercent,
 		o.WithheldAmount, o.TaxTreatyExemption, o.ExemptionCertificateRef,
 		o.Notes, o.EffectiveTo, o.UpdatedAt, o.ObligationID, tenantID,
 	)
 	if err != nil {
 		return fmt.Errorf("update withholding tax obligation: %w", err)
+	}
+	if cmdTag.RowsAffected() == 0 {
+		return fmt.Errorf("withholding tax obligation not found or already remitted")
 	}
 	return tx.Commit(ctx)
 }

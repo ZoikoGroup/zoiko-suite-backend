@@ -12,20 +12,28 @@
 //
 // Fail-closed, like every other client on this platform: an unreachable
 // authorization-svc REFUSES the mutation, it never silently permits it.
+//
+// Circuit breaker added per 03-microservices.md §17.7: "All inter-service
+// calls must use circuit breakers, timeouts, retries, and dead-letter routing
+// where applicable. A Tier 2 failure must not collapse a Tier 0 process."
 package authz
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"github.com/go-chi/chi/v5/middleware"
 	"net/http"
 	"strings"
 	"time"
 
-	"github.com/go-chi/chi/v5/middleware"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
+	idenv "zoiko.io/identity-envelope"
 
+	"zoiko.io/obligations-svc/internal/circuitbreaker"
 	"zoiko.io/obligations-svc/internal/domain"
 	svcenvelope "zoiko.io/obligations-svc/internal/envelope"
 )
@@ -34,7 +42,7 @@ import (
 type Client interface {
 	// CheckAllowed returns nil only when authorization-svc explicitly GRANTS
 	// actionType for principalID within legalEntityID.
-	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType, correlationID string) error
+	CheckAllowed(ctx context.Context, principalID, legalEntityID, tenantID, actionType, correlationID string) error
 }
 
 // The four mutating actions this service exposes. One action per route rather
@@ -45,19 +53,37 @@ type Client interface {
 // ActionApplicabilityDecide is separate for the same reason and is the strongest
 // of the four in practice: an applicability decision is the record of WHETHER a
 // statutory obligation binds an entity at all, and everything downstream —
-// filings, evidence, aging — is derived from it. "May raise an obligation" and
-// "may decide it does not apply" are emphatically not the same authority.
+// filings, evidence, aging — is all derived from it. "May raise an obligation"
+// and "may decide it does not apply" are emphatically not the same authority.
+//
+// Read actions for object-level authorization on GET endpoints.
 const (
 	ActionObligationCreate       = "OBLIGATION_CREATE"
 	ActionObligationStatusUpdate = "OBLIGATION_STATUS_UPDATE"
 	ActionFilingRequirementAdd   = "FILING_REQUIREMENT_CREATE"
 	ActionApplicabilityDecide    = "APPLICABILITY_DECISION_RECORD"
+	ActionObligationRead         = "OBLIGATION_READ"
+	ActionFilingRequirementRead  = "FILING_REQUIREMENT_READ"
+	ActionApplicabilityRead      = "APPLICABILITY_DECISION_READ"
+
+	// 21 Oct 2026 completion pass (registered in access-control-svc 000021).
+	ActionObligationUpdate           = "OBLIGATION_UPDATE"
+	ActionFilingStatusUpdate         = "FILING_REQUIREMENT_STATUS_UPDATE"
+	ActionObligationDefinitionManage = "OBLIGATION_DEFINITION_MANAGE"
+	ActionObligationDefinitionRead   = "OBLIGATION_DEFINITION_READ"
+	ActionObligationMappingManage    = "OBLIGATION_ENTITY_MAPPING_MANAGE"
+
+	// PlatformScope is the legal-entity scope for tenant-wide actions (the
+	// definition catalogue has no entity); authorization-svc resolves it to
+	// the configured platform entity, within the caller's tenant.
+	PlatformScope = "PLATFORM"
 )
 
 type HTTPClient struct {
 	baseURL string
 	http    *http.Client
 	log     *zap.Logger
+	breaker *circuitbreaker.CircuitBreaker
 }
 
 func NewHTTPClient(baseURL string, log *zap.Logger) *HTTPClient {
@@ -65,6 +91,7 @@ func NewHTTPClient(baseURL string, log *zap.Logger) *HTTPClient {
 		baseURL: strings.TrimRight(baseURL, "/"),
 		http:    &http.Client{Timeout: 5 * time.Second},
 		log:     log,
+		breaker: circuitbreaker.NewCircuitBreaker("authorization-svc", circuitbreaker.DefaultConfig()),
 	}
 }
 
@@ -72,6 +99,11 @@ type authorizeRequest struct {
 	PrincipalID   string `json:"principal_id"`
 	LegalEntityID string `json:"legal_entity_id"`
 	ActionType    string `json:"action_type"`
+	// TenantID is the pre-header fallback authorization-svc's resolveTenantScope
+	// still accepts. The X-Tenant-Id header set below is what its mandatory §4
+	// envelope check actually looks for; this is sent alongside it so the two
+	// calling conventions can never disagree about which tenant is asking.
+	TenantID string `json:"tenant_id,omitempty"`
 }
 
 // authorizeResponse is the shape authorization-svc actually sends: it always
@@ -83,11 +115,12 @@ type authorizeResponse struct {
 	DecisionOutcome string `json:"decision_outcome"`
 }
 
-func (c *HTTPClient) CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType, correlationID string) error {
+func (c *HTTPClient) CheckAllowed(ctx context.Context, principalID, legalEntityID, tenantID, actionType, correlationID string) error {
 	body, err := json.Marshal(authorizeRequest{
 		PrincipalID:   principalID,
 		LegalEntityID: legalEntityID,
 		ActionType:    actionType,
+		TenantID:      tenantID,
 	})
 	if err != nil {
 		return err
@@ -98,9 +131,39 @@ func (c *HTTPClient) CheckAllowed(ctx context.Context, principalID, legalEntityI
 		return domain.ErrAuthorizationUnavailable
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if correlationID != "" {
-		req.Header.Set("X-Correlation-ID", correlationID)
+	if correlationID == "" {
+		correlationID = uuid.NewString()
 	}
+	req.Header.Set("X-Correlation-ID", correlationID)
+	// authorization-svc enforces its own §4 canonical input contract on every
+	// route, including /v1/authorize, and this client used to send none of it:
+	// only Content-Type and an optional X-Correlation-ID. tenant_id and
+	// actor_subject_id (X-Tenant-Id / X-Principal-Id) missing answers 401 before
+	// the request reaches RBAC evaluation at all; request_id, source_channel,
+	// idempotency_key and (since this is a POST, so RequiredOnWrite promotes it)
+	// legal_entity_id missing answers 400. Either way this client folded the
+	// refusal into ErrAuthorizationUnavailable and obligations-svc failed
+	// closed on it — every write was refused, on a caller who was in fact
+	// authorized, because the internal call never identified itself.
+	// tenant_id/legal_entity_id are also sent in the body for the pre-header
+	// calling convention authorization-svc still accepts, but the headers are
+	// what its envelope check actually looks for.
+	if tenantID != "" {
+		req.Header.Set("X-Tenant-Id", tenantID)
+	}
+	if principalID != "" {
+		req.Header.Set("X-Principal-Id", principalID)
+	}
+	if legalEntityID != "" {
+		req.Header.Set("X-Legal-Entity-Id", legalEntityID)
+	}
+	req.Header.Set("X-Request-Id", uuid.NewString())
+	req.Header.Set("X-Source-Channel", "system")
+	// Each authorization check is its own evaluation, not a resubmission of a
+	// prior one, so it gets its own key rather than reusing the caller's —
+	// reusing it would make an unrelated authorize call collide with the
+	// material write's own idempotency record.
+	req.Header.Set("Idempotency-Key", uuid.NewString())
 
 	// authorization-svc's resolveTenantScope prefers the verified X-Tenant-Id
 	// header over the request body, and — per its own doc comment — silently
@@ -135,36 +198,56 @@ func (c *HTTPClient) CheckAllowed(ctx context.Context, principalID, legalEntityI
 	req.Header.Set("X-Source-Channel", authzSourceChannel)
 	req.Header.Set("Idempotency-Key", authzRequestID+":"+actionType)
 
-	resp, err := c.http.Do(req)
-	if err != nil {
-		c.log.Error("authorization-svc unreachable — failing closed",
+	// Forward the caller's canonical envelope for downstream traceability,
+	// and the verified identity envelope so authorization-svc attributes the
+	// decision to the person (X-82i) and sees the authentication age.
+	svcenvelope.ForwardTo(ctx, req)
+	idenv.Forward(ctx, req)
+
+	// Execute with circuit breaker
+	err = c.breaker.Execute(ctx, func() error {
+		resp, err := c.http.Do(req)
+		if err != nil {
+			c.log.Error("authorization-svc unreachable — failing closed",
+				zap.String("principal_id", principalID),
+				zap.String("action_type", actionType),
+				zap.Error(err))
+			return domain.ErrAuthorizationUnavailable
+		}
+		defer func() { _ = resp.Body.Close() }()
+
+		if resp.StatusCode != http.StatusOK {
+			return domain.ErrAuthorizationUnavailable
+		}
+
+		var out authorizeResponse
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			return domain.ErrAuthorizationUnavailable
+		}
+
+		switch out.DecisionOutcome {
+		case "GRANTED":
+			return nil
+		case "DENIED":
+			return domain.ErrAuthorizationDenied
+		default:
+			// Includes the empty string — the zero value, which is what a renamed
+			// field or a changed envelope produces. Refused as an unusable answer
+			// rather than reported as a denial, because it is not a decision this
+			// service was given.
+			return fmt.Errorf("%w: unrecognised decision_outcome %q",
+				domain.ErrAuthorizationUnavailable, out.DecisionOutcome)
+		}
+	})
+
+	if errors.Is(err, circuitbreaker.ErrCircuitOpen) {
+		c.log.Error("circuit breaker open for authorization-svc — failing closed",
 			zap.String("principal_id", principalID),
 			zap.String("action_type", actionType),
-			zap.Error(err))
-		return domain.ErrAuthorizationUnavailable
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
+			zap.String("breaker_state", c.breaker.GetState().String()),
+		)
 		return domain.ErrAuthorizationUnavailable
 	}
 
-	var out authorizeResponse
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return domain.ErrAuthorizationUnavailable
-	}
-
-	switch out.DecisionOutcome {
-	case "GRANTED":
-		return nil
-	case "DENIED":
-		return domain.ErrAuthorizationDenied
-	default:
-		// Includes the empty string — the zero value, which is what a renamed
-		// field or a changed envelope produces. Refused as an unusable answer
-		// rather than reported as a denial, because it is not a decision this
-		// service was given.
-		return fmt.Errorf("%w: unrecognised decision_outcome %q",
-			domain.ErrAuthorizationUnavailable, out.DecisionOutcome)
-	}
+	return err
 }

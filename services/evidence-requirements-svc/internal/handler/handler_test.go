@@ -33,6 +33,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/evidence-requirements-svc/internal/domain"
+	svcenvelope "zoiko.io/evidence-requirements-svc/internal/envelope"
 	"zoiko.io/evidence-requirements-svc/internal/handler"
 	svcmiddleware "zoiko.io/evidence-requirements-svc/internal/middleware"
 )
@@ -97,7 +98,7 @@ func (s *stubStore) EndDateRequirement(_ context.Context, _, _ string, _ time.Ti
 	return s.endDated, nil
 }
 
-func (s *stubStore) RecordEvaluation(_ context.Context, e *domain.EvidenceEvaluation) (bool, error) {
+func (s *stubStore) RecordEvaluation(_ context.Context, e *domain.EvidenceEvaluation, _ *domain.OutboxEvent) (bool, error) {
 	if s.recordEvalErr != nil {
 		return false, s.recordEvalErr
 	}
@@ -112,10 +113,24 @@ func (s *stubStore) GetEvaluation(_ context.Context, _ string) (*domain.Evidence
 	return s.evaluation, nil
 }
 
+// stubPublisher collects the evaluations whose event reached the outbox.
 type stubPublisher struct{ published []domain.EvidenceEvaluation }
 
-func (p *stubPublisher) PublishEvaluation(_ context.Context, e domain.EvidenceEvaluation) {
-	p.published = append(p.published, e)
+// outboxCapture wraps a Store and records an event into pub whenever the
+// handler hands RecordEvaluation an outbox event and the row was really
+// created — the store writes the event in the same transaction, so a replay
+// (created=false) writes none.
+type outboxCapture struct {
+	handler.Store
+	pub *stubPublisher
+}
+
+func (c outboxCapture) RecordEvaluation(ctx context.Context, e *domain.EvidenceEvaluation, ev *domain.OutboxEvent) (bool, error) {
+	created, err := c.Store.RecordEvaluation(ctx, e, ev)
+	if err == nil && created && ev != nil {
+		c.pub.published = append(c.pub.published, *e)
+	}
+	return created, err
 }
 
 type stubAuthz struct {
@@ -135,17 +150,19 @@ type stubDocs struct {
 	calls int
 }
 
-func (d *stubDocs) VerifyDocument(_ context.Context, _, _, _ string) error {
+func (d *stubDocs) VerifyDocument(_ context.Context, _, _, _, _ string) error {
 	d.calls++
 	return d.err
 }
 
 // ── harness ──────────────────────────────────────────────────────────────────
 
-func newRouter(store handler.Store, pub handler.Publisher, az handler.AuthZClient, docs handler.DocumentVaultClient) http.Handler {
+func newRouter(store handler.Store, pub *stubPublisher, az handler.AuthZClient, docs handler.DocumentVaultClient) http.Handler {
 	r := chi.NewRouter()
 	r.Use(svcmiddleware.TenantContext())
-	handler.RegisterRoutes(r, handler.New(store, pub, az, docs, zap.NewNop()))
+	// Envelope middleware in observe mode so tests can pass with partial headers
+	r.Use(svcenvelope.MiddlewareWithMode(svcenvelope.ServicePolicy(), svcenvelope.ModeObserve, nil))
+	handler.RegisterRoutes(r, handler.New(outboxCapture{Store: store, pub: pub}, az, docs, zap.NewNop()))
 	return r
 }
 
@@ -160,6 +177,7 @@ func do(t *testing.T, h http.Handler, method, path string, body any, tenant, pri
 	}
 	req := httptest.NewRequest(method, path, &buf)
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Idempotency-Key", "idem-test-"+t.Name()) // unique per test
 	if tenant != "" {
 		req.Header.Set("X-Tenant-Id", tenant)
 	}
@@ -218,12 +236,9 @@ func TestEvaluate_NoRequirementsDefined(t *testing.T) {
 		"an unconfigured gate must never be indistinguishable from a verified one")
 	assert.Empty(t, got.Unmet)
 
-	// The publisher IS consulted; it is the publisher that decides neither
-	// §8.6 event is true of this outcome and emits nothing to Kafka. That
-	// guarantee is asserted in internal/events/publisher_test.go, which can
-	// see the broker; this stub only sees the call.
-	require.Len(t, pub.published, 1)
-	assert.Equal(t, domain.OutcomeNoRequirementsDefined, pub.published[0].Outcome)
+	// Neither §8.6 event (satisfied / missing) is true of this outcome, so the
+	// handler writes no outbox event: nothing reaches Kafka.
+	assert.Empty(t, pub.published)
 }
 
 func TestEvaluate_Missing_NamesEachUnmetRequirement(t *testing.T) {
@@ -373,14 +388,16 @@ func TestEvaluate_DocumentServiceUnavailable_Returns503(t *testing.T) {
 // nothing further.
 func TestEvaluate_Replay_DoesNotRepublish(t *testing.T) {
 	original := &domain.EvidenceEvaluation{
-		EvaluationID:  "eval-original",
-		TenantID:      testTenant,
-		LegalEntityID: testEntity,
-		DomainCode:    "FINANCE",
-		ActionType:    "JOURNAL_POST",
-		Outcome:       domain.OutcomeMissing,
-		UnmetPayload:  json.RawMessage(`[{"evidence_requirement_id":"req-SIGNATURE","evidence_type":"SIGNATURE","reason":"stored reason"}]`),
-		CorrelationID: "corr-1",
+		EvaluationID:            "eval-original",
+		TenantID:                testTenant,
+		LegalEntityID:           testEntity,
+		DomainCode:              "FINANCE",
+		ActionType:              "JOURNAL_POST",
+		Outcome:                 domain.OutcomeMissing,
+		UnmetPayload:            json.RawMessage(`[{"evidence_requirement_id":"req-SIGNATURE","evidence_type":"SIGNATURE","reason":"stored reason"}]`),
+		PresentArtifactsPayload: json.RawMessage(`null`),
+		EvaluatedForPrincipalID: testPrincipal,
+		CorrelationID:           "corr-1",
 	}
 	st := &stubStore{
 		effective:   []domain.EvidenceRequirement{requirement("SIGNATURE", domain.RequirementSpec{})},
@@ -401,10 +418,33 @@ func TestEvaluate_Replay_DoesNotRepublish(t *testing.T) {
 	assert.Empty(t, pub.published, "a replay must not republish the event")
 }
 
-func TestEvaluate_MissingTenant_Returns400(t *testing.T) {
+// Reusing an Idempotency-Key for a different determination is a conflict,
+// not a replay: answering the original would report a decision that was
+// never made for this action.
+func TestEvaluate_IdempotencyMismatch_Returns409(t *testing.T) {
+	original := &domain.EvidenceEvaluation{
+		EvaluationID:            "eval-original",
+		TenantID:                testTenant,
+		LegalEntityID:           testEntity,
+		DomainCode:              "FINANCE",
+		ActionType:              "PAYMENT_RELEASE",
+		Outcome:                 domain.OutcomeMissing,
+		UnmetPayload:            json.RawMessage(`[]`),
+		PresentArtifactsPayload: json.RawMessage(`null`),
+		EvaluatedForPrincipalID: testPrincipal,
+	}
+	st := &stubStore{evaluation: original, evalCreated: false}
+	h := newRouter(st, &stubPublisher{}, &stubAuthz{}, &stubDocs{})
+
+	rec := do(t, h, http.MethodPost, "/v1/evidence/evaluate", evaluateBody(), testTenant, testPrincipal)
+	assert.Equal(t, http.StatusConflict, rec.Code)
+	assert.Contains(t, rec.Body.String(), "idempotency_mismatch")
+}
+
+func TestEvaluate_MissingTenant_Returns401(t *testing.T) {
 	h := newRouter(&stubStore{}, &stubPublisher{}, &stubAuthz{}, &stubDocs{})
 	rec := do(t, h, http.MethodPost, "/v1/evidence/evaluate", evaluateBody(), "", testPrincipal)
-	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Equal(t, http.StatusUnauthorized, rec.Code, "the same fault answered 400 here and 401 at the envelope")
 	assert.Contains(t, rec.Body.String(), "missing_tenant",
 		"absent tenant scope must be rejected, never defaulted to a placeholder tenant")
 }
@@ -493,6 +533,7 @@ func TestCreateRequirement_Idempotent_ReplayReturns200(t *testing.T) {
 		DomainCode:            "FINANCE",
 		ActionType:            "JOURNAL_POST",
 		EvidenceType:          "SUPPORTING_DOCUMENT",
+		CreatedByPrincipalID:  testPrincipal,
 		CorrelationID:         "corr-create-1",
 	}
 	st := &stubStore{created: false, requirement: existing}
@@ -504,6 +545,25 @@ func TestCreateRequirement_Idempotent_ReplayReturns200(t *testing.T) {
 	var got domain.EvidenceRequirement
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
 	assert.Equal(t, "req-existing", got.EvidenceRequirementID)
+}
+
+// Same key, different catalog row: must conflict rather than answer 200
+// with a requirement the caller did not just describe.
+func TestCreateRequirement_IdempotencyMismatch_Returns409(t *testing.T) {
+	existing := &domain.EvidenceRequirement{
+		EvidenceRequirementID: "req-existing",
+		TenantID:              testTenant,
+		DomainCode:            "FINANCE",
+		ActionType:            "JOURNAL_POST",
+		EvidenceType:          "SIGNATURE",
+		CreatedByPrincipalID:  testPrincipal,
+	}
+	st := &stubStore{created: false, requirement: existing}
+	h := newRouter(st, &stubPublisher{}, &stubAuthz{}, &stubDocs{})
+
+	rec := do(t, h, http.MethodPost, "/v1/admin/evidence-requirements", createBody(), testTenant, testPrincipal)
+	assert.Equal(t, http.StatusConflict, rec.Code)
+	assert.Contains(t, rec.Body.String(), "idempotency_mismatch")
 }
 
 func TestCreateRequirement_MissingFields_Returns400(t *testing.T) {
@@ -582,7 +642,7 @@ func TestEndDate_CallsAuthorization(t *testing.T) {
 func TestListRequirements_NoTenantScope_Refused(t *testing.T) {
 	h := newRouter(&stubStore{}, &stubPublisher{}, &stubAuthz{}, &stubDocs{})
 	rec := do(t, h, http.MethodGet, "/v1/evidence-requirements", nil, "", testPrincipal)
-	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
 }
 
 func TestListRequirements_NoQueryParam_UsesVerifiedScope(t *testing.T) {

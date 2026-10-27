@@ -44,7 +44,7 @@ func TestPgStore_CreateVersion_RejectsRetiredTemplate(t *testing.T) {
 // negative-controlled proof of the maker-checker requirement — every
 // version, not only ones flagged externally binding (Wave 1 decision).
 func TestPgStore_ApproveTemplate_RejectsSelfApproval(t *testing.T) {
-	pool := openTestPool(t)
+	pool, admin := openTestPools(t)
 	s := store.New(pool)
 	ctx := tenantCtx("tenant-a")
 	tmpl := newTestTemplate(t, s, ctx, "owner-1")
@@ -66,7 +66,7 @@ func TestPgStore_ApproveTemplate_RejectsSelfApproval(t *testing.T) {
 
 	// Negative control at the DB layer — the CHECK constraint refuses the
 	// same self-approval even bypassing the store entirely.
-	_, err = pool.Exec(context.Background(),
+	_, err = admin.Exec(context.Background(),
 		`UPDATE template_versions SET status='APPROVED', approved_by_principal_id=$1, approved_at=now() WHERE version_id=$2`,
 		"owner-1", v.VersionID)
 	if err == nil {
@@ -78,7 +78,7 @@ func TestPgStore_ApproveTemplate_RejectsSelfApproval(t *testing.T) {
 // the forward-link supersession mechanism, plus the negative control
 // that a superseded/terminal row can never be changed again.
 func TestPgStore_PublishTemplate_SupersedesPriorPublished_SameLocale(t *testing.T) {
-	pool := openTestPool(t)
+	pool, admin := openTestPools(t)
 	s := store.New(pool)
 	ctx := tenantCtx("tenant-a")
 	tmpl := newTestTemplate(t, s, ctx, "owner-1")
@@ -137,7 +137,7 @@ func TestPgStore_PublishTemplate_SupersedesPriorPublished_SameLocale(t *testing.
 
 	// Negative control: the trigger refuses any further change to a
 	// terminal (SUPERSEDED) row, including re-pointing the forward link.
-	_, err = pool.Exec(context.Background(),
+	_, err = admin.Exec(context.Background(),
 		`UPDATE template_versions SET superseded_by_version_id = $1 WHERE version_id = $2`,
 		v1.VersionID, published1.VersionID)
 	if err == nil {

@@ -55,7 +55,11 @@ func (p *PgStore) InitiateConnection(ctx context.Context, params domain.Initiate
 			params.BankAccountID, params.ProviderRef, requestedScope, params.Region, params.CorrelationID, params.CreatedByPrincipalID)
 		if err := scanConnection(row, &c); err == nil {
 			created = true
-			return p.recordConnectionEvent(ctx, tx, tenantID, c.ConnectionID, domain.EventConnectionRequested, "", params.CreatedByPrincipalID)
+			if err := p.recordConnectionEvent(ctx, tx, tenantID, c.ConnectionID, domain.EventConnectionRequested, "", params.CreatedByPrincipalID); err != nil {
+				return err
+			}
+			return p.enqueueEvent(ctx, tx, "com.zoikosuite.banking.bank-connection.requested", "banking.connection.requested",
+				"bank-connection", c.ConnectionID, tenantID, params.LegalEntityID, params.CreatedByPrincipalID, params.RequestCorrelationID, c)
 		} else if !errors.Is(err, pgx.ErrNoRows) {
 			return err
 		}

@@ -11,11 +11,11 @@ import (
 )
 
 func auditEngagement() *domain.AuditEngagement {
-	return &domain.AuditEngagement{EngagementID: "eng-1", LegalEntityID: "le-1", Status: domain.AuditEngagementProposed}
+	return &domain.AuditEngagement{EngagementID: "eng-1", LegalEntityID: "22222222-2222-4222-8222-222222222222", Status: domain.AuditEngagementProposed}
 }
 
 func validAuditEngagementBody() string {
-	return `{"tenant_id":"t-1","legal_entity_id":"le-1","engagement_code":"FY26-STAT","engagement_type":"STATUTORY_AUDIT","reporting_period_start":"2025-04-01T00:00:00Z","reporting_period_end":"2026-03-31T00:00:00Z","framework_profile_id":"isa","framework_profile_version":"2025.1","methodology_id":"firm-method","methodology_version":"2026.1","responsible_partner_id":"partner-1","scope_summary":"Annual statutory audit"}`
+	return `{"tenant_id":"11111111-1111-4111-8111-111111111111","legal_entity_id":"22222222-2222-4222-8222-222222222222","engagement_code":"FY26-STAT","engagement_type":"STATUTORY_AUDIT","reporting_period_start":"2025-04-01T00:00:00Z","reporting_period_end":"2026-03-31T00:00:00Z","framework_profile_id":"isa","framework_profile_version":"2025.1","methodology_id":"firm-method","methodology_version":"2026.1","responsible_partner_id":"partner-1","scope_summary":"Annual statutory audit"}`
 }
 
 func TestCreateAuditEngagement_Created(t *testing.T) {
@@ -42,7 +42,7 @@ func TestCreateAuditEngagement_RequiresCorrelation(t *testing.T) {
 
 func TestCreateAuditEngagement_RejectsForeignTenant(t *testing.T) {
 	r := newTestRouter(&stubStore{})
-	body := strings.Replace(validAuditEngagementBody(), `"tenant_id":"t-1"`, `"tenant_id":"other"`, 1)
+	body := strings.Replace(validAuditEngagementBody(), `"tenant_id":"11111111-1111-4111-8111-111111111111"`, `"tenant_id":"other"`, 1)
 	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/audit/engagements/", bytes.NewBufferString(body)), "manager-1")
 	req.Header.Set("X-Correlation-ID", "audit-create-foreign")
 	w := httptest.NewRecorder()

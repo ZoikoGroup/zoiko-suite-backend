@@ -236,7 +236,7 @@ func TestCreateApplicabilityDecision_RefusesForeignAttribution(t *testing.T) {
 			if w.Code != http.StatusBadRequest {
 				t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
 			}
-			var body map[string]string
+			var body map[string]any
 			if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
 				t.Fatalf("unmarshal: %v", err)
 			}

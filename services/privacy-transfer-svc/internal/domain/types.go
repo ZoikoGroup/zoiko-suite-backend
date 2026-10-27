@@ -147,18 +147,18 @@ func (o AssessmentOutcome) Valid() bool {
 // for a relationship is the latest by created_at, same derived-read
 // pattern as PRV-02's ResolveConsentStatus.
 type TransferAssessment struct {
-	AssessmentID            string            `json:"assessment_id"`
-	TenantID                *string           `json:"tenant_id,omitempty"`
-	RelationshipID          string            `json:"relationship_id"`
-	Outcome                 AssessmentOutcome `json:"outcome"`
-	ReviewerPrincipalID     string            `json:"reviewer_principal_id"`
-	ResidualRisk            string            `json:"residual_risk,omitempty"`
-	EvidenceRef             string            `json:"evidence_ref,omitempty"`
-	GovernmentAccessRisk    string            `json:"government_access_risk,omitempty"`
-	TechnicalMeasures       string            `json:"technical_measures,omitempty"`
-	OrganizationalMeasures  string            `json:"organizational_measures,omitempty"`
-	ReviewTriggerAt         *time.Time        `json:"review_trigger_at,omitempty"` // §17.1: expiry/review date
-	CreatedAt               time.Time         `json:"created_at"`
+	AssessmentID           string            `json:"assessment_id"`
+	TenantID               *string           `json:"tenant_id,omitempty"`
+	RelationshipID         string            `json:"relationship_id"`
+	Outcome                AssessmentOutcome `json:"outcome"`
+	ReviewerPrincipalID    string            `json:"reviewer_principal_id"`
+	ResidualRisk           string            `json:"residual_risk,omitempty"`
+	EvidenceRef            string            `json:"evidence_ref,omitempty"`
+	GovernmentAccessRisk   string            `json:"government_access_risk,omitempty"`
+	TechnicalMeasures      string            `json:"technical_measures,omitempty"`
+	OrganizationalMeasures string            `json:"organizational_measures,omitempty"`
+	ReviewTriggerAt        *time.Time        `json:"review_trigger_at,omitempty"` // §17.1: expiry/review date
+	CreatedAt              time.Time         `json:"created_at"`
 }
 
 func (a *TransferAssessment) ExpiredAsOf(t time.Time) bool {
@@ -206,6 +206,44 @@ const (
 	TriggerExpiryReviewDateReached       = "EXPIRY_OR_REVIEW_DATE_REACHED"
 )
 
+// ValidTrigger reports whether v is one of the eight §17.1 mandatory
+// reassessment triggers. A caller-declared trigger outside this set is
+// refused rather than echoed into a reason code.
+func ValidTrigger(v string) bool {
+	switch v {
+	case TriggerNewPurposeOrSensitiveCategory, TriggerAutomatedDecisioning, TriggerNewProcessorOrJurisdiction,
+		TriggerChangedTransferMechanism, TriggerMaterialArchitectureChange, TriggerNewMinorsContext,
+		TriggerSecurityPrivacyIncident, TriggerExpiryReviewDateReached:
+		return true
+	}
+	return false
+}
+
+// TransferContext — §16.1's own required field list for the context of a
+// proposed transfer: "exporter/importer roles, origin/destination
+// jurisdictions, data categories, subject classes, purpose, route/provider,
+// frequency/volume class".
+//
+// Data categories, subject classes and destination jurisdiction already
+// travelled on EvaluateTransferRequest; purpose is carried by the parent
+// relationship's purpose_activity_refs. The remaining §16.1 members —
+// exporter/importer roles, origin jurisdiction, route/provider and
+// frequency/volume class — are declared by the caller and recorded
+// verbatim on the append-only authorization evidence.
+//
+// They are DATA ONLY: the spec names no taxonomy or enum for them, so the
+// service accepts whatever a real caller declares and never manufactures a
+// vocabulary for them — the same doctrine as MechanismType. They are
+// optional on the wire because making them mandatory would break the
+// existing workbench client, which predates this field list.
+type TransferContext struct {
+	ExporterRole         string `json:"exporter_role,omitempty"`
+	ImporterRole         string `json:"importer_role,omitempty"`
+	OriginJurisdiction   string `json:"origin_jurisdiction,omitempty"`
+	RouteProvider        string `json:"route_provider,omitempty"`
+	FrequencyVolumeClass string `json:"frequency_volume_class,omitempty"`
+}
+
 // TransferDecision is the append-only evidence record for one evaluation
 // — satisfies §18 critical response fields: authorization_id, result, conditions, mechanism/assessment refs, expiry.
 type TransferDecision struct {
@@ -215,6 +253,11 @@ type TransferDecision struct {
 	RelationshipID          string              `json:"relationship_id"`
 	TransferMechanismID     string              `json:"transfer_mechanism_id"`
 	DestinationJurisdiction string              `json:"destination_jurisdiction,omitempty"`
+	ExporterRole            string              `json:"exporter_role,omitempty"`
+	ImporterRole            string              `json:"importer_role,omitempty"`
+	OriginJurisdiction      string              `json:"origin_jurisdiction,omitempty"`
+	RouteProvider           string              `json:"route_provider,omitempty"`
+	FrequencyVolumeClass    string              `json:"frequency_volume_class,omitempty"`
 	AssessmentID            *string             `json:"assessment_id,omitempty"`
 	Result                  AuthorizationResult `json:"result"`
 	Conditions              string              `json:"conditions,omitempty"` // §16.1 & §18 conditions
@@ -290,6 +333,14 @@ type EvaluateTransferRequest struct {
 	ReassessmentTrigger     string   `json:"reassessment_trigger,omitempty"`
 	DataCategories          []string `json:"data_categories,omitempty"`
 	SubjectClasses          []string `json:"subject_classes,omitempty"`
+
+	// §16.1 TransferContext — caller-declared, data-only context recorded
+	// on the decision. See the TransferContext doc comment.
+	ExporterRole         string `json:"exporter_role,omitempty"`
+	ImporterRole         string `json:"importer_role,omitempty"`
+	OriginJurisdiction   string `json:"origin_jurisdiction,omitempty"`
+	RouteProvider        string `json:"route_provider,omitempty"`
+	FrequencyVolumeClass string `json:"frequency_volume_class,omitempty"`
 }
 
 type TriggerEvaluation struct {
@@ -320,6 +371,7 @@ type EvaluateTriggersResponse struct {
 type IdempotencyRecord struct {
 	IdempotencyKey string    `json:"idempotency_key"`
 	TenantID       string    `json:"tenant_id"`
+	PrincipalID    string    `json:"principal_id"`
 	Endpoint       string    `json:"endpoint"`
 	RequestHash    string    `json:"request_hash"`
 	ResponseCode   int       `json:"response_code"`
@@ -339,6 +391,6 @@ var (
 	ErrDecisionNotFound     = errorString("PRV-015: transfer decision not found")
 	ErrPurposeNotActive     = errorString("PRV-002: referenced processing activity is not active")
 	ErrStoreUnavailable     = errorString("PRV-019: privacy-transfer store unavailable")
+	ErrInvalidTrigger       = errorString("reassessment_trigger / declared_trigger must be one of the eight §17.1 triggers")
 	ErrIdempotencyConflict  = errorString("PRV-020: IMMUTABLE_EVIDENCE_CONFLICT: idempotency key replayed with conflicting payload")
 )
-

@@ -58,7 +58,7 @@ func openAdminPool(t *testing.T) *pgxpool.Pool {
 	}
 	t.Cleanup(pool.Close)
 
-	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS kill_switch_events CASCADE;`)
+	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS kill_switch_events, outbox_events CASCADE;`)
 
 	// Every migration in filename order, never one hardcoded name.
 	_, thisFile, _, _ := runtime.Caller(0)

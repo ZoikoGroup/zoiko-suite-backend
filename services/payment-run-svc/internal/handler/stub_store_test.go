@@ -7,6 +7,7 @@ import (
 	"github.com/google/uuid"
 
 	"zoiko.io/payment-run-svc/internal/domain"
+	"zoiko.io/payment-run-svc/internal/store"
 )
 
 // stubStore is a real, working in-memory implementation of store.Store —
@@ -18,6 +19,7 @@ type stubStore struct {
 	consumedAuth      map[string]string          // authorization_id -> instruction_id, once ever consumed
 	reconciledEvents  map[string]map[string]bool // instruction_id -> provider_event_ref -> applied
 	events            map[string][]domain.RunEvent
+	accounting        map[string][]*store.AccountingRequest // run_id -> posting requests
 }
 
 func newStubStore() *stubStore {
@@ -28,6 +30,7 @@ func newStubStore() *stubStore {
 		consumedAuth:      map[string]string{},
 		reconciledEvents:  map[string]map[string]bool{},
 		events:            map[string][]domain.RunEvent{},
+		accounting:        map[string][]*store.AccountingRequest{},
 	}
 }
 
@@ -47,7 +50,7 @@ func (s *stubStore) recordEvent(runID string, tenantID *string, eventType, detai
 
 func (s *stubStore) CreateRun(_ context.Context, tenantID string, req domain.CreateRunRequest, instructions []domain.RunInstruction, principalID string) (*domain.PaymentRun, []domain.RunInstruction, error) {
 	for _, ins := range instructions {
-		if _, taken := s.consumedAuth[ins.AuthorizationID]; taken {
+		if _, taken := s.consumedAuth[ins.AuthorizationID+"|"+ins.PayeeRef]; taken {
 			return nil, nil, domain.ErrAuthorizationNotEligible
 		}
 	}
@@ -67,9 +70,13 @@ func (s *stubStore) CreateRun(_ context.Context, tenantID string, req domain.Cre
 			PayeeRef: ins.PayeeRef, NetAmount: ins.NetAmount,
 			Currency: ins.Currency, Status: domain.InstructionPending, CreatedAt: now,
 		}
+		for _, p := range ins.Payables {
+			p.InstructionID = created.InstructionID
+			created.Payables = append(created.Payables, p)
+		}
 		s.instructions[created.InstructionID] = &created
 		s.instructionsByRun[run.RunID] = append(s.instructionsByRun[run.RunID], created.InstructionID)
-		s.consumedAuth[ins.AuthorizationID] = created.InstructionID
+		s.consumedAuth[ins.AuthorizationID+"|"+ins.PayeeRef] = created.InstructionID
 		out = append(out, created)
 	}
 	s.recordEvent(run.RunID, run.TenantID, domain.EventRunCreated, "", principalID)
@@ -123,16 +130,79 @@ func (s *stubStore) MarkInstructionConsumed(_ context.Context, instructionID str
 	return nil
 }
 
-func (s *stubStore) SetInstructionProviderRefs(_ context.Context, instructionID, providerAttemptID, bnk07PaymentID string) error {
+// setOnce mirrors the real write-once guard: same value is a no-op, a
+// different value is refused.
+func setOnce(field *string, value string) error {
+	if *field == value {
+		return nil
+	}
+	if *field != "" {
+		return domain.ErrStoreUnavailable
+	}
+	*field = value
+	return nil
+}
+
+func (s *stubStore) SetInstructionAttemptID(_ context.Context, instructionID, providerAttemptID string) error {
 	i, ok := s.instructions[instructionID]
 	if !ok {
 		return domain.ErrInstructionNotFound
 	}
-	if i.ProviderAttemptID != "" {
-		return domain.ErrInstructionNotFound // already set once — mirrors the real trigger's guard
+	return setOnce(&i.ProviderAttemptID, providerAttemptID)
+}
+
+func (s *stubStore) SetInstructionBnk07PaymentID(_ context.Context, instructionID, bnk07PaymentID string) error {
+	i, ok := s.instructions[instructionID]
+	if !ok {
+		return domain.ErrInstructionNotFound
 	}
-	i.ProviderAttemptID = providerAttemptID
-	i.Bnk07PaymentID = bnk07PaymentID
+	return setOnce(&i.Bnk07PaymentID, bnk07PaymentID)
+}
+
+func (s *stubStore) BindSubmitKey(_ context.Context, runID, idempotencyKey string) (*domain.PaymentRun, error) {
+	r, ok := s.runs[runID]
+	if !ok {
+		return nil, domain.ErrRunNotFound
+	}
+	if r.IdempotencyKey != "" {
+		if r.IdempotencyKey != idempotencyKey {
+			return nil, domain.ErrIdempotencyKeyMismatch
+		}
+		return r, nil
+	}
+	if r.Status != domain.StatusLocked {
+		return nil, domain.ErrInvalidTransition
+	}
+	r.IdempotencyKey = idempotencyKey
+	return r, nil
+}
+
+func (s *stubStore) ListUnappliedPayables(_ context.Context, instructionID string) ([]domain.InstructionPayable, error) {
+	i, ok := s.instructions[instructionID]
+	if !ok {
+		return nil, nil
+	}
+	var out []domain.InstructionPayable
+	for _, p := range i.Payables {
+		if p.PayableAppliedAt == nil {
+			out = append(out, p)
+		}
+	}
+	return out, nil
+}
+
+func (s *stubStore) MarkPayableApplied(_ context.Context, instructionID, payableSource, sourceReference string) error {
+	i, ok := s.instructions[instructionID]
+	if !ok {
+		return domain.ErrInstructionNotFound
+	}
+	now := time.Now().UTC()
+	for idx := range i.Payables {
+		p := &i.Payables[idx]
+		if p.PayableSource == payableSource && p.SourceReference == sourceReference && p.PayableAppliedAt == nil {
+			p.PayableAppliedAt = &now
+		}
+	}
 	return nil
 }
 
@@ -214,13 +284,53 @@ func (s *stubStore) ReconcileInstruction(_ context.Context, req domain.Reconcile
 	}
 	s.reconciledEvents[req.InstructionID][req.ProviderEventRef] = true
 	i.Status = req.ExternalStatus
+	i.StatusReason = req.Reason
 	i.ProviderEventRef = req.ProviderEventRef
+	// A bank-confirmed settlement records one posting request, keyed by the
+	// instruction, in the same step (as PgStore does in the same transaction).
+	if req.ExternalStatus == domain.InstructionSettled {
+		src := "ap11:settle:" + i.InstructionID
+		seen := false
+		for _, q := range s.accounting[i.RunID] {
+			seen = seen || q.SourceEventID == src
+		}
+		if !seen {
+			s.accounting[i.RunID] = append(s.accounting[i.RunID], &store.AccountingRequest{
+				RequestID: uuid.New().String(), InstructionID: i.InstructionID, SourceEventID: src, Status: "PENDING",
+			})
+		}
+	}
 	return i, true, nil
+}
+
+func (s *stubStore) ListAccountingRequests(_ context.Context, runID string) ([]store.AccountingRequest, error) {
+	var out []store.AccountingRequest
+	for _, q := range s.accounting[runID] {
+		out = append(out, *q)
+	}
+	return out, nil
+}
+
+func (s *stubStore) RequeueAccountingRequests(_ context.Context, runID string) (int64, error) {
+	if _, ok := s.runs[runID]; !ok {
+		return 0, domain.ErrRunNotFound
+	}
+	var n int64
+	for _, q := range s.accounting[runID] {
+		if q.Status == "FAILED" || q.Status == "QUARANTINED" {
+			q.Status, q.Attempts = "PENDING", 0
+			n++
+		}
+	}
+	return n, nil
 }
 
 func (s *stubStore) UpdateRunAggregateStatus(_ context.Context, runID string, newStatus domain.RunStatus, principalID string) (*domain.PaymentRun, error) {
 	r, ok := s.runs[runID]
-	allowed := map[domain.RunStatus]bool{domain.StatusSubmitted: true, domain.StatusAccepted: true, domain.StatusRejected: true, domain.StatusPartiallyAccepted: true}
+	allowed := map[domain.RunStatus]bool{
+		domain.StatusSubmitted: true, domain.StatusPendingUnknown: true, domain.StatusAccepted: true,
+		domain.StatusRejected: true, domain.StatusPartiallyAccepted: true, domain.StatusException: true,
+	}
 	if !ok || !allowed[r.Status] {
 		return nil, domain.ErrInvalidTransition
 	}

@@ -28,13 +28,18 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
 	"zoiko.io/evidence-manifest-svc/internal/domain"
+	"zoiko.io/evidence-manifest-svc/internal/events"
 	svcmiddleware "zoiko.io/evidence-manifest-svc/internal/middleware"
+	"zoiko.io/evidence-manifest-svc/internal/outbox"
 )
 
 type PgStore struct {
@@ -129,20 +134,166 @@ func (s *PgStore) AddRecord(ctx context.Context, r *domain.ManifestRecord) error
 // LAST mutation ever applied to a manifest row — after this, it and its
 // records are immutable evidence.
 //
-// The tenant predicate is new, and this was an unscoped WRITE on an evidence
-// record. Any caller holding another tenant's manifest_id could set that
-// manifest's status and checksum_sha256 — writing a wrong checksum onto an
-// evidence bundle destined for a regulator, and doing it irreversibly, since
-// GENERATED is terminal and a retry produces a new manifest rather than
-// repairing this one.
-func (s *PgStore) FinalizeGenerated(ctx context.Context, manifestID, checksumSHA256 string) (*domain.EvidenceManifest, error) {
-	m, err := s.finalize(ctx, manifestID, `
-		UPDATE evidence_manifests SET status = 'GENERATED', checksum_sha256 = $2, generated_at = now()
-		WHERE manifest_id = $1 AND tenant_id::text = $3
-		RETURNING manifest_id, tenant_id, legal_entity_id, scenario_type, requested_by, status,
-			checksum_sha256, failure_reason, requested_at, generated_at
-	`, checksumSHA256)
-	return m, err
+// Per ZS-STATE-001 Invariant I-13, an outbox event for evidence.manifest.generated
+// is written within the SAME database transaction, ensuring state mutation
+// and event publication are atomic.
+func (s *PgStore) FinalizeGenerated(ctx context.Context, manifestID, checksumSHA256 string, correlationID ...string) (*domain.EvidenceManifest, error) {
+	var m domain.EvidenceManifest
+	corrID := ""
+	if len(correlationID) > 0 && correlationID[0] != "" {
+		corrID = correlationID[0]
+	}
+	if corrID == "" {
+		corrID = manifestID
+	}
+
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		err := tx.QueryRow(ctx, `
+			UPDATE evidence_manifests SET status = 'GENERATED', checksum_sha256 = $2, generated_at = now()
+			WHERE manifest_id = $1 AND tenant_id::text = $3
+			RETURNING manifest_id, tenant_id, legal_entity_id, scenario_type, requested_by, status,
+				checksum_sha256, failure_reason, requested_at, generated_at
+		`, manifestID, checksumSHA256, svcmiddleware.TenantFromContext(ctx)).Scan(
+			&m.ManifestID, &m.TenantID, &m.LegalEntityID, &m.ScenarioType, &m.RequestedBy, &m.Status,
+			&m.ChecksumSHA256, &m.FailureReason, &m.RequestedAt, &m.GeneratedAt)
+		if err != nil {
+			return err
+		}
+
+		return insertManifestGeneratedEvent(ctx, tx, &m, corrID)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrManifestNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("evidence manifest store unavailable: %w", err)
+	}
+	return &m, nil
+}
+
+// insertManifestGeneratedEvent writes the evidence.manifest.generated outbox
+// row inside the caller's transaction.
+func insertManifestGeneratedEvent(ctx context.Context, tx pgx.Tx, m *domain.EvidenceManifest, corrID string) error {
+	checksum := ""
+	if m.ChecksumSHA256 != nil {
+		checksum = *m.ChecksumSHA256
+	}
+	generatedAt := time.Now().UTC()
+	if m.GeneratedAt != nil {
+		generatedAt = *m.GeneratedAt
+	}
+
+	evt := events.ManifestGeneratedEvent{
+		EventID:        "evt-" + uuid.New().String(),
+		EventType:      "evidence.manifest.generated",
+		EventVersion:   "1.0",
+		SourceService:  "evidence-manifest-svc",
+		ManifestID:     m.ManifestID,
+		TenantID:       m.TenantID,
+		LegalEntityID:  m.LegalEntityID,
+		ActorID:        m.RequestedBy,
+		CorrelationID:  corrID,
+		ScenarioType:   string(m.ScenarioType),
+		ChecksumSHA256: checksum,
+		GeneratedAt:    generatedAt,
+	}
+
+	actor := m.RequestedBy
+	return outbox.Insert(ctx, tx, outbox.Event{
+		AggregateType: "MANIFEST",
+		AggregateID:   m.ManifestID,
+		EventType:     "evidence.manifest.generated",
+		TenantID:      m.TenantID,
+		LegalEntityID: m.LegalEntityID,
+		ActorID:       &actor,
+		CorrelationID: corrID,
+		Payload:       evt,
+	})
+}
+
+// CompleteManifest creates a manifest, appends every record, computes the
+// checksum from the records as stored, marks the manifest GENERATED and writes
+// the evidence.manifest.generated outbox row — all in ONE transaction. Either
+// the whole GENERATED manifest exists afterwards or nothing does: a failure at
+// any record, at finalisation or at the outbox insert rolls everything back,
+// so there is no PENDING manifest, no partial record set, and no GENERATED
+// manifest whose checksum covers fewer records than were requested.
+//
+// The checksum is taken from a read-back of the stored records (canonical
+// order, JSONB-normalised snapshots) inside the same transaction, which is
+// exactly what VerifyManifest later recomputes.
+//
+// m supplies tenant (ignored — taken from context), legal entity, scenario and
+// requested_by; ManifestID, Status and RequestedAt are filled in on success.
+func (s *PgStore) CompleteManifest(ctx context.Context, m *domain.EvidenceManifest, records []domain.ManifestRecord, correlationID string) (*domain.EvidenceManifest, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	var final domain.EvidenceManifest
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		var manifestID string
+		if err := tx.QueryRow(ctx, `
+			INSERT INTO evidence_manifests (tenant_id, legal_entity_id, scenario_type, requested_by, status)
+			VALUES ($1, $2, $3, $4, 'PENDING')
+			RETURNING manifest_id
+		`, tenantID, m.LegalEntityID, string(m.ScenarioType), m.RequestedBy).Scan(&manifestID); err != nil {
+			return err
+		}
+		for _, r := range records {
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO manifest_records (manifest_id, source_type, source_record_id, record_snapshot)
+				VALUES ($1, $2, $3, $4)
+			`, manifestID, string(r.SourceType), r.SourceRecordID, r.RecordSnapshot); err != nil {
+				return fmt.Errorf("record %s/%s: %w", r.SourceType, r.SourceRecordID, err)
+			}
+		}
+		stored, err := listRecordsTx(ctx, tx, manifestID, tenantID)
+		if err != nil {
+			return err
+		}
+		checksum := domain.ManifestChecksum(stored)
+		if err := tx.QueryRow(ctx, `
+			UPDATE evidence_manifests SET status = 'GENERATED', checksum_sha256 = $2, generated_at = now()
+			WHERE manifest_id = $1 AND tenant_id::text = $3 AND status = 'PENDING'
+			RETURNING manifest_id, tenant_id, legal_entity_id, scenario_type, requested_by, status,
+				checksum_sha256, failure_reason, requested_at, generated_at
+		`, manifestID, checksum, tenantID).Scan(
+			&final.ManifestID, &final.TenantID, &final.LegalEntityID, &final.ScenarioType, &final.RequestedBy, &final.Status,
+			&final.ChecksumSHA256, &final.FailureReason, &final.RequestedAt, &final.GeneratedAt); err != nil {
+			return err
+		}
+		corrID := correlationID
+		if corrID == "" {
+			corrID = manifestID
+		}
+		return insertManifestGeneratedEvent(ctx, tx, &final, corrID)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("evidence manifest store unavailable: %w", err)
+	}
+	m.ManifestID, m.Status, m.RequestedAt = final.ManifestID, final.Status, final.RequestedAt
+	return &final, nil
+}
+
+// RecordFailedManifest persists a manifest that could not be assembled (a
+// source service was unavailable) as a single FAILED row with its reason and
+// no records. It is one statement, so a FAILED manifest is never preceded by
+// a PENDING one that a crash could leave behind.
+func (s *PgStore) RecordFailedManifest(ctx context.Context, m *domain.EvidenceManifest, reason string) (*domain.EvidenceManifest, error) {
+	var out domain.EvidenceManifest
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			INSERT INTO evidence_manifests (tenant_id, legal_entity_id, scenario_type, requested_by, status, failure_reason)
+			VALUES ($1, $2, $3, $4, 'FAILED', $5)
+			RETURNING manifest_id, tenant_id, legal_entity_id, scenario_type, requested_by, status,
+				checksum_sha256, failure_reason, requested_at, generated_at
+		`, svcmiddleware.TenantFromContext(ctx), m.LegalEntityID, string(m.ScenarioType), m.RequestedBy, reason).Scan(
+			&out.ManifestID, &out.TenantID, &out.LegalEntityID, &out.ScenarioType, &out.RequestedBy, &out.Status,
+			&out.ChecksumSHA256, &out.FailureReason, &out.RequestedAt, &out.GeneratedAt)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("evidence manifest store unavailable: %w", err)
+	}
+	m.ManifestID, m.Status, m.RequestedAt = out.ManifestID, out.Status, out.RequestedAt
+	return &out, nil
 }
 
 // FinalizeFailed marks a manifest FAILED with a reason — still a terminal,
@@ -172,13 +323,24 @@ func (s *PgStore) finalize(ctx context.Context, manifestID, query, arg2 string) 
 			&m.ManifestID, &m.TenantID, &m.LegalEntityID, &m.ScenarioType, &m.RequestedBy, &m.Status,
 			&m.ChecksumSHA256, &m.FailureReason, &m.RequestedAt, &m.GeneratedAt)
 	})
-	if errors.Is(err, pgx.ErrNoRows) {
+	if isNotFound(err) {
 		return nil, domain.ErrManifestNotFound
 	}
 	if err != nil {
 		return nil, fmt.Errorf("evidence manifest store unavailable: %w", err)
 	}
 	return &m, nil
+}
+
+func isNotFound(err error) bool {
+	if errors.Is(err, pgx.ErrNoRows) {
+		return true
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "22P02" {
+		return true
+	}
+	return false
 }
 
 // FindManifestByID reads one manifest, scoped to the caller's tenant.
@@ -197,13 +359,122 @@ func (s *PgStore) FindManifestByID(ctx context.Context, manifestID string) (*dom
 			&m.ManifestID, &m.TenantID, &m.LegalEntityID, &m.ScenarioType, &m.RequestedBy, &m.Status,
 			&m.ChecksumSHA256, &m.FailureReason, &m.RequestedAt, &m.GeneratedAt)
 	})
-	if errors.Is(err, pgx.ErrNoRows) {
+	if isNotFound(err) {
 		return nil, domain.ErrManifestNotFound
 	}
 	if err != nil {
 		return nil, fmt.Errorf("evidence manifest store unavailable: %w", err)
 	}
 	return &m, nil
+}
+
+// ListManifests returns the manifests for the caller's tenant, ordered newest first.
+func (s *PgStore) ListManifests(ctx context.Context, legalEntityID string, limit, offset int) ([]domain.EvidenceManifest, error) {
+	var out []domain.EvidenceManifest
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		query := `
+			SELECT manifest_id, tenant_id, legal_entity_id, scenario_type, requested_by, status,
+				checksum_sha256, failure_reason, requested_at, generated_at
+			FROM evidence_manifests
+			WHERE tenant_id::text = $1`
+		args := []any{svcmiddleware.TenantFromContext(ctx)}
+		argIdx := 2
+		if legalEntityID != "" {
+			query += fmt.Sprintf(" AND legal_entity_id = $%d", argIdx)
+			args = append(args, legalEntityID)
+			argIdx++
+		}
+		query += fmt.Sprintf(" ORDER BY requested_at DESC LIMIT $%d OFFSET $%d", argIdx, argIdx+1)
+		args = append(args, limit, offset)
+
+		rows, err := tx.Query(ctx, query, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var m domain.EvidenceManifest
+			if err := rows.Scan(
+				&m.ManifestID, &m.TenantID, &m.LegalEntityID, &m.ScenarioType, &m.RequestedBy, &m.Status,
+				&m.ChecksumSHA256, &m.FailureReason, &m.RequestedAt, &m.GeneratedAt,
+			); err != nil {
+				return err
+			}
+			out = append(out, m)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, fmt.Errorf("evidence manifest store unavailable: %w", err)
+	}
+	if out == nil {
+		out = []domain.EvidenceManifest{}
+	}
+	return out, nil
+}
+
+// ListManifestLegalEntities returns the distinct legal entities that have a
+// manifest in the caller's tenant. The list route authorizes each one, so a
+// caller who names no legal entity is still only shown what they may read.
+func (s *PgStore) ListManifestLegalEntities(ctx context.Context) ([]string, error) {
+	var out []string
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `SELECT DISTINCT legal_entity_id::text FROM evidence_manifests WHERE tenant_id::text = $1 ORDER BY 1`,
+			svcmiddleware.TenantFromContext(ctx))
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var e string
+			if err := rows.Scan(&e); err != nil {
+				return err
+			}
+			out = append(out, e)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, fmt.Errorf("evidence manifest store unavailable: %w", err)
+	}
+	return out, nil
+}
+
+// ListManifestsForEntities is ListManifests restricted to a set of legal
+// entities, applied before pagination so a page is never short because rows
+// the caller may not read were dropped afterwards.
+func (s *PgStore) ListManifestsForEntities(ctx context.Context, legalEntityIDs []string, limit, offset int) ([]domain.EvidenceManifest, error) {
+	out := []domain.EvidenceManifest{}
+	if len(legalEntityIDs) == 0 {
+		return out, nil
+	}
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT manifest_id, tenant_id, legal_entity_id, scenario_type, requested_by, status,
+				checksum_sha256, failure_reason, requested_at, generated_at
+			FROM evidence_manifests
+			WHERE tenant_id::text = $1 AND legal_entity_id::text = ANY($2)
+			ORDER BY requested_at DESC LIMIT $3 OFFSET $4`,
+			svcmiddleware.TenantFromContext(ctx), legalEntityIDs, limit, offset)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var m domain.EvidenceManifest
+			if err := rows.Scan(&m.ManifestID, &m.TenantID, &m.LegalEntityID, &m.ScenarioType, &m.RequestedBy, &m.Status,
+				&m.ChecksumSHA256, &m.FailureReason, &m.RequestedAt, &m.GeneratedAt); err != nil {
+				return err
+			}
+			out = append(out, m)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, fmt.Errorf("evidence manifest store unavailable: %w", err)
+	}
+	return out, nil
 }
 
 // ListRecords reads a manifest's records, scoped to the caller's tenant.
@@ -220,31 +491,46 @@ func (s *PgStore) FindManifestByID(ctx context.Context, manifestID string) (*dom
 func (s *PgStore) ListRecords(ctx context.Context, manifestID string) ([]domain.ManifestRecord, error) {
 	var out []domain.ManifestRecord
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
-		rows, err := tx.Query(ctx, `
-			SELECT r.manifest_record_id, r.manifest_id, r.source_type, r.source_record_id,
-				r.record_snapshot, r.fetched_at
-			FROM manifest_records r
-			JOIN evidence_manifests m ON m.manifest_id = r.manifest_id
-			WHERE r.manifest_id = $1 AND m.tenant_id::text = $2
-			ORDER BY r.fetched_at ASC
-		`, manifestID, svcmiddleware.TenantFromContext(ctx))
-		if err != nil {
-			return err
-		}
-		defer rows.Close()
-
-		for rows.Next() {
-			var r domain.ManifestRecord
-			if err := rows.Scan(&r.ManifestRecordID, &r.ManifestID, &r.SourceType, &r.SourceRecordID,
-				&r.RecordSnapshot, &r.FetchedAt); err != nil {
-				return err
-			}
-			out = append(out, r)
-		}
-		return rows.Err()
+		var err error
+		out, err = listRecordsTx(ctx, tx, manifestID, svcmiddleware.TenantFromContext(ctx))
+		return err
 	})
+	if isNotFound(err) {
+		return []domain.ManifestRecord{}, nil
+	}
 	if err != nil {
 		return nil, fmt.Errorf("evidence manifest store unavailable: %w", err)
 	}
 	return out, nil
+}
+
+// listRecordsTx is the one place manifest records are read in canonical order:
+// fetched_at, then manifest_record_id. fetched_at alone is not a total order —
+// every record written in one transaction shares now() — so without the
+// secondary key the order, and with it the checksum, would be left to the
+// planner. manifest_record_id is the existing primary key.
+func listRecordsTx(ctx context.Context, tx pgx.Tx, manifestID, tenantID string) ([]domain.ManifestRecord, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT r.manifest_record_id, r.manifest_id, r.source_type, r.source_record_id,
+			r.record_snapshot, r.fetched_at
+		FROM manifest_records r
+		JOIN evidence_manifests m ON m.manifest_id = r.manifest_id
+		WHERE r.manifest_id = $1 AND m.tenant_id::text = $2
+		ORDER BY r.fetched_at ASC, r.manifest_record_id ASC
+	`, manifestID, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []domain.ManifestRecord
+	for rows.Next() {
+		var r domain.ManifestRecord
+		if err := rows.Scan(&r.ManifestRecordID, &r.ManifestID, &r.SourceType, &r.SourceRecordID,
+			&r.RecordSnapshot, &r.FetchedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }

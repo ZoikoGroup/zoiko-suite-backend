@@ -4,13 +4,13 @@
 // 03-microservices.md §19): this registry stores the PAYLOAD shape of each
 // event type only — the shared envelope fields (event_type, emitted_at,
 // schema_version, source_service) are common across every publisher already
-// and are not schema-registry-managed. Compatibility analysis is top-level
-// only (properties + required); nested object/array evolution is not
-// analyzed — a documented v1 limit, not an oversight.
+// and are not schema-registry-managed. Compatibility analysis recurses into
+// nested object properties and array item schemas (see internal/compat); it
+// is not limited to the top-level properties/required pair.
 //
 // Mutation-rights gating (05-security.md §14.6 "event-contract mutation
-// rights") is deferred to chunk 2, which wires this service to
-// authorization-svc the same way tenant-entity-registry-svc already does.
+// rights") is wired to authorization-svc (internal/authz), the same way
+// tenant-entity-registry-svc does.
 package domain
 
 import (
@@ -39,6 +39,14 @@ type EventSchema struct {
 
 	RegisteredBy string    `json:"registered_by,omitempty"`
 	RegisteredAt time.Time `json:"registered_at"`
+
+	// IdempotencyKey is the caller-supplied Idempotency-Key (INV-08) this
+	// version was registered under, scoped per event_name. A replayed
+	// registration with the same key against the same event returns this
+	// row again instead of claiming a new version. Omitted from the wire
+	// response (json:"-"): it is the registry's own replay-detection state,
+	// not part of the event contract being described.
+	IdempotencyKey string `json:"-"`
 }
 
 // Compatibility modes. VARCHAR in the database and extensible by data
@@ -134,13 +142,20 @@ func ValidateJSONSchema(raw json.RawMessage) error {
 	return nil
 }
 
-// Shape is the part of a JSON Schema this registry understands: the top-level
-// property types and the required list.
+// PropertyDef describes a property's declared type and any nested structure.
+type PropertyDef struct {
+	Type       string                 `json:"type"`
+	Properties map[string]PropertyDef `json:"properties,omitempty"`
+	Required   []string               `json:"required,omitempty"`
+	Items      *PropertyDef           `json:"items,omitempty"`
+}
+
+// Shape is the part of a JSON Schema this registry understands: the
+// property types, nested structure, and required list.
 type Shape struct {
-	Properties map[string]struct {
-		Type string `json:"type"`
-	} `json:"properties"`
-	Required []string `json:"required"`
+	Type       string                 `json:"type"`
+	Properties map[string]PropertyDef `json:"properties"`
+	Required   []string               `json:"required"`
 }
 
 // ShapeOf parses the analysable part of a schema. It lives in domain rather

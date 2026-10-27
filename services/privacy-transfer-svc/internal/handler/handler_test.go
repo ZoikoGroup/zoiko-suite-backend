@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 
 	authzpkg "zoiko.io/privacy-transfer-svc/internal/authz"
@@ -23,14 +24,27 @@ import (
 
 // ── stub publisher ───────────────────────────────────────────────────────────
 
-type stubPublisher struct{ calls int }
+type stubPublisher struct {
+	calls      int
+	eventTypes []string
+	last       events.PublishParams
+}
 
-func (p *stubPublisher) Publish(_ context.Context, _ events.PublishParams) error {
+func (p *stubPublisher) Publish(_ context.Context, params events.PublishParams) error {
 	p.calls++
+	p.eventTypes = append(p.eventTypes, params.EventType)
+	p.last = params
 	return nil
 }
 
-var _ events.Publisher = (*stubPublisher)(nil)
+func (p *stubPublisher) published(eventType string) bool {
+	for _, e := range p.eventTypes {
+		if e == eventType {
+			return true
+		}
+	}
+	return false
+}
 
 // ── stub authz ───────────────────────────────────────────────────────────────
 
@@ -54,7 +68,7 @@ func newStubPurposeRegistry() *stubPurposeRegistry {
 	return &stubPurposeRegistry{activities: map[string]*purposeregistry.ActivityVersion{}}
 }
 
-func (p *stubPurposeRegistry) ResolveActivity(_ context.Context, activityID string) (*purposeregistry.ActivityVersion, error) {
+func (p *stubPurposeRegistry) ResolveActivity(_ context.Context, _, _, activityID string) (*purposeregistry.ActivityVersion, error) {
 	if p.err != nil {
 		return nil, p.err
 	}
@@ -65,9 +79,12 @@ func (p *stubPurposeRegistry) ResolveActivity(_ context.Context, activityID stri
 
 const testTenant = "tenant-transfer-1"
 
-func newTestRouter(st *stubStore, pub *stubPublisher, az *stubAuthz, purposes *stubPurposeRegistry) chi.Router {
+func tctx() context.Context { return middleware.WithTenant(context.Background(), testTenant) }
+
+func newTestRouter(st *stubStore, pub *stubPublisher, az handler.AuthzChecker, purposes *stubPurposeRegistry) chi.Router {
 	logger := zap.NewNop()
-	h := handler.New(st, pub, az, purposes, logger)
+	st.pub = pub // the store "enqueues" events; the stub records the committed ones here
+	h := handler.New(st, az, purposes, logger)
 	r := chi.NewRouter()
 	r.Use(middleware.TenantContext())
 	handler.RegisterRoutes(r, h)
@@ -82,6 +99,11 @@ func doRequest(r http.Handler, method, path string, body interface{}, tenantID s
 	req := httptest.NewRequest(method, path, &buf)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Principal-Id", "principal-01")
+	// §18.1 requires a correlation ID and idempotency key on every mutating
+	// API; the generic helper supplies unique defaults so tests that are not
+	// specifically exercising those headers stay focused on their behavior.
+	req.Header.Set("X-Correlation-ID", "corr-"+uuid.NewString())
+	req.Header.Set("Idempotency-Key", "idem-"+uuid.NewString())
 	if tenantID != "" {
 		req.Header.Set("X-Tenant-Id", tenantID)
 	}
@@ -94,6 +116,7 @@ func createRelationship(t *testing.T, r http.Handler) *domain.ProcessorRelations
 	t.Helper()
 	w := doRequest(r, http.MethodPost, "/privacy/processor-relationships", domain.CreateProcessorRelationshipRequest{
 		ControllerRef: "controller-1", ProcessorRef: "processor-1", Service: "payroll-processing",
+		ProcessingInstructions: "process payroll data only as instructed by the controller",
 	}, testTenant)
 	if w.Code != http.StatusCreated {
 		t.Fatalf("createRelationship: expected 201, got %d: %s", w.Code, w.Body.String())
@@ -166,7 +189,7 @@ func TestUpdateRelationshipStatus_ToInactive(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
-	updated, _ := st.FindRelationship(context.Background(), rel.RelationshipID)
+	updated, _ := st.FindRelationship(tctx(), rel.RelationshipID)
 	if updated.Status != domain.RelationshipInactive {
 		t.Fatalf("expected INACTIVE, got %s", updated.Status)
 	}
@@ -209,6 +232,94 @@ func TestEvaluateTransfer_Authorized_NoAssessmentRequired(t *testing.T) {
 	_ = json.Unmarshal(w.Body.Bytes(), &d)
 	if d.Result != domain.ResultAuthorized {
 		t.Fatalf("expected AUTHORIZED, got %s (reasons=%v)", d.Result, d.ReasonCodes)
+	}
+}
+
+// TestEvaluateTransfer_AuthorizationDenied proves EvaluateTransfer is now
+// gated the same way every other mutating handler in this service already
+// is: a principal lacking PRIVACY_TRANSFER_DECISION_EVALUATE is rejected
+// with 403 before any decision is recorded or published, closing the gap
+// where any non-empty X-Principal-Id could previously evaluate transfers.
+func TestEvaluateTransfer_AuthorizationDenied(t *testing.T) {
+	st := newStubStore()
+	setupRouter := newTestRouter(st, &stubPublisher{}, &stubAuthz{}, newStubPurposeRegistry())
+	rel := createRelationship(t, setupRouter)
+	mech := createValidMechanism(t, setupRouter)
+
+	pub := &stubPublisher{}
+	deniedRouter := newTestRouter(st, pub, &stubAuthz{deny: true}, newStubPurposeRegistry())
+	w := doRequest(deniedRouter, http.MethodPost, "/privacy/transfer-decisions", domain.EvaluateTransferRequest{
+		RelationshipID: rel.RelationshipID, TransferMechanismID: mech.MechanismID,
+	}, testTenant)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d: %s", w.Code, w.Body.String())
+	}
+	if len(st.decisions) != 0 {
+		t.Fatalf("expected no decision recorded on denial, found %d", len(st.decisions))
+	}
+	if pub.calls != 0 {
+		t.Fatalf("expected no event published on denial, got %d publish calls", pub.calls)
+	}
+}
+
+// TestEvaluateTransfer_AuthorizationDenied_NoIdempotencyRecordCreated proves
+// a denied request cannot back-door a decision into existence via the
+// idempotency store either: the same Idempotency-Key, retried by an
+// authorized principal, must still evaluate for real rather than replaying
+// a cached response the denied call never got to create.
+func TestEvaluateTransfer_AuthorizationDenied_NoIdempotencyRecordCreated(t *testing.T) {
+	st := newStubStore()
+	setupRouter := newTestRouter(st, &stubPublisher{}, &stubAuthz{}, newStubPurposeRegistry())
+	rel := createRelationship(t, setupRouter)
+	mech := createValidMechanism(t, setupRouter)
+
+	const key = "evaluate-denied-then-retry"
+	deniedRouter := newTestRouter(st, &stubPublisher{}, &stubAuthz{deny: true}, newStubPurposeRegistry())
+	denied := doRequestWithHeaders(deniedRouter, http.MethodPost, "/privacy/transfer-decisions",
+		domain.EvaluateTransferRequest{RelationshipID: rel.RelationshipID, TransferMechanismID: mech.MechanismID},
+		map[string]string{"X-Tenant-Id": testTenant, "Idempotency-Key": key})
+	if denied.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d: %s", denied.Code, denied.Body.String())
+	}
+
+	allowedRouter := newTestRouter(st, &stubPublisher{}, &stubAuthz{}, newStubPurposeRegistry())
+	allowed := doRequestWithHeaders(allowedRouter, http.MethodPost, "/privacy/transfer-decisions",
+		domain.EvaluateTransferRequest{RelationshipID: rel.RelationshipID, TransferMechanismID: mech.MechanismID},
+		map[string]string{"X-Tenant-Id": testTenant, "Idempotency-Key": key})
+	if allowed.Code != http.StatusOK {
+		t.Fatalf("expected the same key to succeed once actually authorized, got %d: %s", allowed.Code, allowed.Body.String())
+	}
+	var d domain.TransferDecision
+	_ = json.Unmarshal(allowed.Body.Bytes(), &d)
+	if d.Result != domain.ResultAuthorized {
+		t.Fatalf("expected AUTHORIZED, got %s", d.Result)
+	}
+}
+
+// An unknown relationship or mechanism id is a 404 (the service's convention for
+// an id that does not resolve), never 503 "store unavailable", and nothing is
+// recorded or published for it.
+func TestEvaluateTransfer_UnknownRelationshipOrMechanism_Is404(t *testing.T) {
+	st := newStubStore()
+	pub := &stubPublisher{}
+	r := newTestRouter(st, pub, &stubAuthz{}, newStubPurposeRegistry())
+	rel := createRelationship(t, r)
+	mech := createValidMechanism(t, r)
+
+	w := doRequest(r, http.MethodPost, "/privacy/transfer-decisions", domain.EvaluateTransferRequest{
+		RelationshipID: rel.RelationshipID, TransferMechanismID: "00000000-0000-0000-0000-0000000000e2",
+	}, testTenant)
+	if w.Code != http.StatusNotFound || !strings.Contains(w.Body.String(), "transfer mechanism not found") {
+		t.Fatalf("unknown mechanism must be 404, got %d: %s", w.Code, w.Body.String())
+	}
+	w = doRequest(r, http.MethodPost, "/privacy/transfer-decisions", domain.EvaluateTransferRequest{
+		RelationshipID: "00000000-0000-0000-0000-0000000000e3", TransferMechanismID: mech.MechanismID,
+	}, testTenant)
+	if w.Code != http.StatusNotFound || !strings.Contains(w.Body.String(), "processor relationship not found") {
+		t.Fatalf("unknown relationship must be 404, got %d: %s", w.Code, w.Body.String())
+	}
+	if pub.published("privacy.transfer.authorization_changed") {
+		t.Fatal("no authorization event may be published for an unknown id")
 	}
 }
 
@@ -384,6 +495,31 @@ func TestCreateRelationship_AuthorizationDenied(t *testing.T) {
 }
 
 func doRequestWithHeaders(r http.Handler, method, path string, body interface{}, headers map[string]string) *httptest.ResponseRecorder {
+	var buf bytes.Buffer
+	if body != nil {
+		_ = json.NewEncoder(&buf).Encode(body)
+	}
+	req := httptest.NewRequest(method, path, &buf)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Principal-Id", "principal-01")
+	if _, ok := headers["X-Correlation-ID"]; !ok {
+		req.Header.Set("X-Correlation-ID", "corr-"+uuid.NewString())
+	}
+	if _, ok := headers["Idempotency-Key"]; !ok {
+		req.Header.Set("Idempotency-Key", "idem-"+uuid.NewString())
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	return w
+}
+
+// doRawRequest sends exactly the headers it is given (plus content type and
+// principal) with no defaults, so negative tests can omit X-Tenant-Id,
+// Idempotency-Key or X-Correlation-ID on purpose.
+func doRawRequest(r http.Handler, method, path string, body interface{}, headers map[string]string) *httptest.ResponseRecorder {
 	var buf bytes.Buffer
 	if body != nil {
 		_ = json.NewEncoder(&buf).Encode(body)
@@ -577,7 +713,8 @@ func TestEvaluateTransfer_MandatoryReassessmentTriggers(t *testing.T) {
 	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, newStubPurposeRegistry())
 	wRel := doRequest(r, http.MethodPost, "/privacy/processor-relationships", domain.CreateProcessorRelationshipRequest{
 		ControllerRef: "controller-1", ProcessorRef: "processor-1", Service: "cloud-hosting",
-		Jurisdictions: []string{"EU-GDPR", "UK-GDPR"},
+		Jurisdictions:          []string{"EU-GDPR", "UK-GDPR"},
+		ProcessingInstructions: "host data only within the declared jurisdictions",
 	}, testTenant)
 	var rel domain.ProcessorRelationship
 	_ = json.Unmarshal(wRel.Body.Bytes(), &rel)
@@ -679,4 +816,245 @@ func TestEvaluateTriggersEndpoint(t *testing.T) {
 	}
 }
 
+// ── §18.1 mandatory transport headers ────────────────────────────────────────
 
+// TestTenantHeader_Rejected proves the tenant scope carrier is enforced at the
+// transport boundary, before any business logic runs: a missing, empty or
+// whitespace-only X-Tenant-Id must be refused rather than silently scoping the
+// request to the empty/platform tenant.
+func TestTenantHeader_Rejected(t *testing.T) {
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, newStubPurposeRegistry())
+	body := domain.CreateProcessorRelationshipRequest{
+		ControllerRef: "controller-1", ProcessorRef: "processor-1", Service: "payroll-processing",
+	}
+
+	cases := map[string]map[string]string{
+		"missing":              {"Idempotency-Key": "k1", "X-Correlation-ID": "c1"},
+		"empty":                {"X-Tenant-Id": "", "Idempotency-Key": "k2", "X-Correlation-ID": "c2"},
+		"whitespace-only":      {"X-Tenant-Id": "   ", "Idempotency-Key": "k3", "X-Correlation-ID": "c3"},
+		"whitespace-around-id": {"X-Tenant-Id": "  " + testTenant + "  ", "Idempotency-Key": "k4", "X-Correlation-ID": "c4"},
+	}
+
+	for name, headers := range cases {
+		t.Run(name, func(t *testing.T) {
+			w := doRawRequest(r, http.MethodPost, "/privacy/processor-relationships", body, headers)
+			if name == "whitespace-around-id" {
+				if w.Code != http.StatusCreated {
+					t.Fatalf("expected 201 when tenant id is padded with whitespace, got %d: %s", w.Code, w.Body.String())
+				}
+				return
+			}
+			if w.Code != http.StatusUnauthorized {
+				t.Fatalf("expected 401 for %s X-Tenant-Id, got %d: %s", name, w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
+// TestMutations_RequireIdempotencyKeyAndCorrelationID walks every mutating route
+// and proves both §18.1 headers are mandatory: omitting either yields 400
+// before any idempotency record, store mutation or event is produced.
+func TestMutations_RequireIdempotencyKeyAndCorrelationID(t *testing.T) {
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, newStubPurposeRegistry())
+	rel := createRelationship(t, r)
+	mech := createValidMechanism(t, r)
+
+	cases := []struct {
+		name string
+		path string
+		body interface{}
+	}{
+		{"create-relationship", "/privacy/processor-relationships", domain.CreateProcessorRelationshipRequest{ControllerRef: "c", ProcessorRef: "p", Service: "s"}},
+		{"update-status", "/privacy/processor-relationships/" + rel.RelationshipID + "/status", domain.UpdateRelationshipStatusRequest{Status: domain.RelationshipInactive}},
+		{"attach-subprocessor", "/privacy/processor-relationships/" + rel.RelationshipID + "/subprocessors", domain.AttachSubprocessorRequest{ProviderIdentity: "sub-1", Service: "svc"}},
+		{"create-mechanism", "/privacy/transfer-mechanisms", domain.CreateTransferMechanismRequest{MechanismType: "SCC", EvidenceRef: "e-1"}},
+		{"record-assessment", "/privacy/transfer-assessments", domain.RecordTransferAssessmentRequest{RelationshipID: rel.RelationshipID, Outcome: domain.AssessmentApprove}},
+		{"evaluate-transfer", "/privacy/transfer-decisions", domain.EvaluateTransferRequest{RelationshipID: rel.RelationshipID, TransferMechanismID: mech.MechanismID}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name+"/missing-idempotency-key", func(t *testing.T) {
+			w := doRawRequest(r, http.MethodPost, tc.path, tc.body, map[string]string{
+				"X-Tenant-Id":      testTenant,
+				"X-Correlation-ID": "corr-test",
+			})
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400 when Idempotency-Key is missing, got %d: %s", w.Code, w.Body.String())
+			}
+		})
+		t.Run(tc.name+"/blank-idempotency-key", func(t *testing.T) {
+			w := doRawRequest(r, http.MethodPost, tc.path, tc.body, map[string]string{
+				"X-Tenant-Id":      testTenant,
+				"X-Correlation-ID": "corr-test",
+				"Idempotency-Key":  "   ",
+			})
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400 when Idempotency-Key is blank, got %d: %s", w.Code, w.Body.String())
+			}
+		})
+		t.Run(tc.name+"/missing-correlation-id", func(t *testing.T) {
+			w := doRawRequest(r, http.MethodPost, tc.path, tc.body, map[string]string{
+				"X-Tenant-Id":     testTenant,
+				"Idempotency-Key": "idem-test-" + tc.name,
+			})
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400 when X-Correlation-ID is missing, got %d: %s", w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
+// TestEvaluateTransfer_Blocked_ProcessorInstructionMissing proves PRV-017 is
+// enforced fail-closed: an ACTIVE relationship with no controller processing
+// instructions cannot be authorized, and is reported with the §32 reason code.
+func TestEvaluateTransfer_Blocked_ProcessorInstructionMissing(t *testing.T) {
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, newStubPurposeRegistry())
+
+	// Deliberately created WITHOUT processing_instructions.
+	wRel := doRequest(r, http.MethodPost, "/privacy/processor-relationships", domain.CreateProcessorRelationshipRequest{
+		ControllerRef: "controller-1", ProcessorRef: "processor-1", Service: "payroll-processing",
+	}, testTenant)
+	var rel domain.ProcessorRelationship
+	_ = json.Unmarshal(wRel.Body.Bytes(), &rel)
+	mech := createValidMechanism(t, r)
+
+	w := doRequest(r, http.MethodPost, "/privacy/transfer-decisions", domain.EvaluateTransferRequest{
+		RelationshipID: rel.RelationshipID, TransferMechanismID: mech.MechanismID,
+	}, testTenant)
+	var d domain.TransferDecision
+	_ = json.Unmarshal(w.Body.Bytes(), &d)
+	if d.Result != domain.ResultBlocked || d.ReasonCodes[0] != domain.ReasonInstructionMissing {
+		t.Fatalf("expected BLOCKED/PRV-017 PROCESSOR_INSTRUCTION_MISSING, got %s %v", d.Result, d.ReasonCodes)
+	}
+}
+
+// ── PRV-018 subprocessor approval gate (§17.2 / §32) ─────────────────────────
+
+// TestEvaluateTransfer_Blocked_SubprocessorNotApproved proves §17.2's
+// fail-closed gate: an attached subprocessor with no §16.1 notification/
+// approval model on file is an unapproved subprocessor, so the transfer is
+// BLOCKED with the stable §32 code PRV-018 rather than silently
+// authorized. A second, properly governed subprocessor must not clear it.
+func TestEvaluateTransfer_Blocked_SubprocessorNotApproved(t *testing.T) {
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, newStubPurposeRegistry())
+	rel := createRelationship(t, r)
+	mech := createValidMechanism(t, r)
+
+	doRequest(r, http.MethodPost, "/privacy/processor-relationships/"+rel.RelationshipID+"/subprocessors",
+		domain.AttachSubprocessorRequest{ProviderIdentity: "sub-unapproved", Service: "analytics"}, testTenant)
+	doRequest(r, http.MethodPost, "/privacy/processor-relationships/"+rel.RelationshipID+"/subprocessors",
+		domain.AttachSubprocessorRequest{ProviderIdentity: "sub-approved", Service: "storage", NotificationApprovalModel: "PRIOR_WRITTEN_NOTICE_30_DAYS"}, testTenant)
+
+	w := doRequest(r, http.MethodPost, "/privacy/transfer-decisions", domain.EvaluateTransferRequest{
+		RelationshipID: rel.RelationshipID, TransferMechanismID: mech.MechanismID,
+	}, testTenant)
+	var d domain.TransferDecision
+	_ = json.Unmarshal(w.Body.Bytes(), &d)
+	if d.Result != domain.ResultBlocked || d.ReasonCodes[0] != domain.ReasonSubprocessorNotApproved {
+		t.Fatalf("expected BLOCKED/PRV-018 SUBPROCESSOR_NOT_APPROVED, got %s %v", d.Result, d.ReasonCodes)
+	}
+}
+
+// TestEvaluateTransfer_Authorized_WithApprovedSubprocessor proves the
+// inverse: a subprocessor that does carry an approval model does not block
+// an otherwise compliant transfer.
+func TestEvaluateTransfer_Authorized_WithApprovedSubprocessor(t *testing.T) {
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, newStubPurposeRegistry())
+	rel := createRelationship(t, r)
+	mech := createValidMechanism(t, r)
+
+	doRequest(r, http.MethodPost, "/privacy/processor-relationships/"+rel.RelationshipID+"/subprocessors",
+		domain.AttachSubprocessorRequest{ProviderIdentity: "sub-approved", Service: "storage", NotificationApprovalModel: "PRIOR_WRITTEN_NOTICE_30_DAYS"}, testTenant)
+
+	w := doRequest(r, http.MethodPost, "/privacy/transfer-decisions", domain.EvaluateTransferRequest{
+		RelationshipID: rel.RelationshipID, TransferMechanismID: mech.MechanismID,
+	}, testTenant)
+	var d domain.TransferDecision
+	_ = json.Unmarshal(w.Body.Bytes(), &d)
+	if d.Result != domain.ResultAuthorized {
+		t.Fatalf("expected AUTHORIZED with an approved subprocessor, got %s %v", d.Result, d.ReasonCodes)
+	}
+}
+
+// ── §16.1 TransferContext ────────────────────────────────────────────────────
+
+// TestEvaluateTransfer_TransferContextRecorded proves §16.1's exporter/
+// importer roles, origin jurisdiction, route/provider and frequency/volume
+// class travel with the authorization evidence: echoed on the decision
+// response and durable on the GET-by-id read.
+func TestEvaluateTransfer_TransferContextRecorded(t *testing.T) {
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, newStubPurposeRegistry())
+	rel := createRelationship(t, r)
+	mech := createValidMechanism(t, r)
+
+	w := doRequest(r, http.MethodPost, "/privacy/transfer-decisions", domain.EvaluateTransferRequest{
+		RelationshipID:          rel.RelationshipID,
+		TransferMechanismID:     mech.MechanismID,
+		DestinationJurisdiction: "US",
+		ExporterRole:            "CONTROLLER",
+		ImporterRole:            "PROCESSOR",
+		OriginJurisdiction:      "EU-GDPR",
+		RouteProvider:           "AWS-DIRECT-CONNECT",
+		FrequencyVolumeClass:    "BATCH_HOURLY_HIGH_VOLUME",
+	}, testTenant)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var d domain.TransferDecision
+	_ = json.Unmarshal(w.Body.Bytes(), &d)
+
+	if d.AuthorizationID == "" {
+		t.Fatalf("expected §18 authorization_id to be populated on the response")
+	}
+	if d.ExporterRole != "CONTROLLER" || d.ImporterRole != "PROCESSOR" || d.OriginJurisdiction != "EU-GDPR" ||
+		d.RouteProvider != "AWS-DIRECT-CONNECT" || d.FrequencyVolumeClass != "BATCH_HOURLY_HIGH_VOLUME" {
+		t.Fatalf("transfer context not echoed on decision: %+v", d)
+	}
+
+	wGet := doRequest(r, http.MethodGet, "/privacy/transfer-decisions/"+d.DecisionID, nil, testTenant)
+	var got domain.TransferDecision
+	_ = json.Unmarshal(wGet.Body.Bytes(), &got)
+	if got.OriginJurisdiction != "EU-GDPR" || got.RouteProvider != "AWS-DIRECT-CONNECT" {
+		t.Fatalf("transfer context not durable on GET: %+v", got)
+	}
+}
+
+// ── §19 event contracts ──────────────────────────────────────────────────────
+
+// TestEvents_EmitSpecContract proves PRV-05 emits the §19 event types it
+// owns — privacy.processor.changed on relationship create/status change/
+// subprocessor attach, privacy.assessment.expiring when a review/expiry
+// trigger is declared, and privacy.transfer.authorization_changed on
+// evaluation — and does not publish the superseded non-spec names.
+func TestEvents_EmitSpecContract(t *testing.T) {
+	pub := &stubPublisher{}
+	r := newTestRouter(newStubStore(), pub, &stubAuthz{}, newStubPurposeRegistry())
+	rel := createRelationship(t, r)
+	mech := createValidMechanism(t, r)
+
+	doRequest(r, http.MethodPost, "/privacy/processor-relationships/"+rel.RelationshipID+"/status",
+		domain.UpdateRelationshipStatusRequest{Status: domain.RelationshipInactive}, testTenant)
+	doRequest(r, http.MethodPost, "/privacy/processor-relationships/"+rel.RelationshipID+"/status",
+		domain.UpdateRelationshipStatusRequest{Status: domain.RelationshipActive}, testTenant)
+	doRequest(r, http.MethodPost, "/privacy/processor-relationships/"+rel.RelationshipID+"/subprocessors",
+		domain.AttachSubprocessorRequest{ProviderIdentity: "sub-1", Service: "svc", NotificationApprovalModel: "PRIOR_WRITTEN_NOTICE_30_DAYS"}, testTenant)
+
+	future := time.Now().UTC().Add(365 * 24 * time.Hour)
+	doRequest(r, http.MethodPost, "/privacy/transfer-assessments", domain.RecordTransferAssessmentRequest{
+		RelationshipID: rel.RelationshipID, Outcome: domain.AssessmentApprove, ReviewTriggerAt: &future,
+	}, testTenant)
+	doRequest(r, http.MethodPost, "/privacy/transfer-decisions", domain.EvaluateTransferRequest{
+		RelationshipID: rel.RelationshipID, TransferMechanismID: mech.MechanismID,
+	}, testTenant)
+
+	for _, want := range []string{handler.EventProcessorChanged, handler.EventAssessmentExpiring, handler.EventTransferAuthorizationChanged} {
+		if !pub.published(want) {
+			t.Fatalf("expected §19 event %q to be published; got %v", want, pub.eventTypes)
+		}
+	}
+	for _, superseded := range []string{"privacy.processor_relationship.created", "privacy.transfer_decision.evaluated"} {
+		if pub.published(superseded) {
+			t.Fatalf("superseded non-spec event %q must not be published; got %v", superseded, pub.eventTypes)
+		}
+	}
+}

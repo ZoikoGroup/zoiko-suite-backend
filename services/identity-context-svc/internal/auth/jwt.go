@@ -1,63 +1,94 @@
-// Package auth provides JWT verification and envelope signing.
+// Package auth mints and verifies the tokens identity-context-svc issues.
+//
+// Every token is signed by the keyring (internal/keys, AU-05) and verifiable
+// from the published JWKS:
+//
+//   - the identity ENVELOPE (typ JWT), consumed by every relying party;
+//   - the OAuth ACCESS TOKEN (typ at+jwt, RFC 9068), consumed only by
+//     POST /v1/context/resolve, which turns it into an envelope;
+//   - the OIDC ID TOKEN, consumed by the client that logged the person in.
+//
+// The access token used to be HS256 under JWT_SIGNING_SECRET, a symmetric
+// secret from the environment that could mint as well as verify. It is now
+// signed like everything else, so no shared secret exists to leak.
 package auth
 
 import (
 	"context"
-	"crypto/rsa"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
+	"strings"
+	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 
 	"zoiko.io/identity-context-svc/internal/config"
 	"zoiko.io/identity-context-svc/internal/domain"
+	"zoiko.io/identity-context-svc/internal/keys"
+	idenv "zoiko.io/identity-envelope"
 )
 
-// JWTVerifier verifies inbound OIDC bearer tokens from the IdP.
-//
-// Production: validate against the IdP's JWKS endpoint using RS256.
-// TODO: replace HMAC verification with JWKS-backed RSA public key validation
-//
-//	and integrate with Secret Vault Integration Service for key material.
+// TypeAccessToken is the JOSE typ of access tokens (RFC 9068 §2.1).
+const TypeAccessToken = "at+jwt"
+
+// JWTVerifier verifies the access tokens this service mints.
 type JWTVerifier struct {
-	cfg *config.Config
+	ring   *keys.Keyring
+	issuer string
+	now    func() time.Time
 }
 
-func NewJWTVerifier(cfg *config.Config) *JWTVerifier {
-	return &JWTVerifier{cfg: cfg}
+// NewJWTVerifier builds a verifier over ring's published keys.
+func NewJWTVerifier(cfg *config.Config, ring *keys.Keyring) *JWTVerifier {
+	return &JWTVerifier{ring: ring, issuer: cfg.JWTIssuer, now: time.Now}
 }
 
-type idpClaims struct {
+type accessClaims struct {
 	TenantID string `json:"tenant_id"`
 	MFADone  bool   `json:"mfa_done"`
+	// AuthorizedParty is the OIDC azp: the client the token was issued to.
+	AuthorizedParty string `json:"azp"`
+	ClientID        string `json:"client_id,omitempty"`
+	// AuthTime is the OIDC auth_time: when the person authenticated.
+	AuthTime *jwt.NumericDate `json:"auth_time,omitempty"`
+	// AMR is the authentication methods (RFC 8176).
+	AMR            []string             `json:"amr,omitempty"`
+	SID            string               `json:"sid,omitempty"`
+	Scope          string               `json:"scope,omitempty"`
+	AssuranceLevel string               `json:"assurance_level,omitempty"`
+	Cnf            *domain.Confirmation `json:"cnf,omitempty"`
 	jwt.RegisteredClaims
 }
 
-// VerifyBearer parses and validates a bearer JWT.
-// Returns VerifiedClaims on success; non-nil error on any failure.
-// Fails closed — any unverifiable token returns an error, never partial claims.
-func (v *JWTVerifier) VerifyBearer(_ context.Context, token string) (*domain.VerifiedClaims, error) {
-	parsed, err := jwt.ParseWithClaims(token, &idpClaims{}, func(t *jwt.Token) (any, error) {
-		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+// VerifyBearer parses and validates an access token. Fails closed: any
+// unverifiable token returns an error, never partial claims.
+func (v *JWTVerifier) VerifyBearer(ctx context.Context, token string) (*domain.VerifiedClaims, error) {
+	keySource := v.ring.KeySource()
+	parsed, err := jwt.ParseWithClaims(token, &accessClaims{}, func(t *jwt.Token) (any, error) {
+		switch t.Method.Alg() {
+		case jwt.SigningMethodRS256.Alg(), jwt.SigningMethodES256.Alg():
+		default:
 			return nil, errors.New("unexpected signing method")
 		}
-		return []byte(v.cfg.JWTSigningSecret), nil
+		if typ, _ := t.Header["typ"].(string); !strings.EqualFold(typ, TypeAccessToken) {
+			return nil, fmt.Errorf("token typ %q is not an access token", typ)
+		}
+		kid, _ := t.Header["kid"].(string)
+		return keySource.PublicKey(ctx, kid)
 	},
 		jwt.WithExpirationRequired(),
 		jwt.WithIssuedAt(),
-		// Audience and issuer are both checked. Neither was before, so any
-		// token this secret could verify was accepted here — including one
-		// minted for a different purpose entirely. A signature says the token
-		// was not forged; it does not say the token was meant for this door.
+		// A signature says the token was not forged; the audience says it was
+		// meant for this door.
 		jwt.WithAudience(IdPTokenAudience),
-		jwt.WithIssuer(v.cfg.JWTIssuer),
+		jwt.WithIssuer(v.issuer),
+		jwt.WithTimeFunc(v.now),
 	)
 	if err != nil {
 		return nil, err
 	}
-	claims, ok := parsed.Claims.(*idpClaims)
+	claims, ok := parsed.Claims.(*accessClaims)
 	if !ok || !parsed.Valid {
 		return nil, errors.New("invalid token claims")
 	}
@@ -67,53 +98,135 @@ func (v *JWTVerifier) VerifyBearer(_ context.Context, token string) (*domain.Ver
 	if claims.TenantID == "" {
 		return nil, errors.New("token missing tenant_id claim")
 	}
-	return &domain.VerifiedClaims{
-		Subject:  claims.Subject,
-		TenantID: claims.TenantID,
-		MFADone:  claims.MFADone,
-	}, nil
+	authTime := claims.IssuedAt
+	if claims.AuthTime != nil {
+		authTime = claims.AuthTime
+	}
+	if authTime == nil {
+		return nil, errors.New("token carries neither auth_time nor iat")
+	}
+	if authTime.After(v.now().Add(time.Minute)) {
+		return nil, errors.New("token auth_time is in the future")
+	}
+	vc := &domain.VerifiedClaims{
+		Subject:        claims.Subject,
+		TenantID:       claims.TenantID,
+		MFADone:        claims.MFADone,
+		AuthTime:       authTime.Time.UTC(),
+		AMR:            claims.AMR,
+		ClientID:       claims.AuthorizedParty,
+		SID:            claims.SID,
+		AssuranceLevel: claims.AssuranceLevel,
+		JTI:            claims.ID,
+		Scope:          claims.Scope,
+	}
+	if claims.ExpiresAt != nil {
+		vc.ExpiresAt = claims.ExpiresAt.Time
+	}
+	if claims.Cnf != nil {
+		vc.CnfJKT = claims.Cnf.JKT
+	}
+	if vc.AssuranceLevel == "" {
+		vc.AssuranceLevel = domain.AssuranceFor(vc.AMR)
+	}
+	return vc, nil
 }
 
-// JWTSigner signs IdentityContextEnvelopes as short-lived JWTs (Q2 resolution).
+// EnvelopeVerifier verifies an identity envelope this service signed.
 //
-// Current implementation: HS256 with a shared secret for development.
-// TODO: migrate to RS256 with a KMS-backed private key via Secret Vault
-//
-//	Integration Service before Phase 1 production cutover.
-//	The public key must be published to a JWKS endpoint so downstream
-//	services can verify envelopes independently.
+// The MFA routes, the step-up route, introspection and token exchange
+// authenticate their caller by the envelope itself, never by X-Principal-Id.
+// It is the exact check every relying party makes (idenv), run against this
+// process's own keyring, and it accepts any audience this service minted
+// (the session audience and every exchanged one) — the caller is this
+// service's own token, wherever it was headed.
+type EnvelopeVerifier struct {
+	v *idenv.Verifier
+}
+
+// NewEnvelopeVerifier builds a verifier for envelopes signed by ring.
+// audiences are accepted; empty means any audience.
+func NewEnvelopeVerifier(ring *keys.Keyring, issuer string, audiences ...string) *EnvelopeVerifier {
+	opts := idenv.VerifierOptions{Keys: ring.KeySource(), Issuer: issuer, AcceptLegacyAudience: true}
+	if len(audiences) > 0 {
+		opts.Audience = audiences[0]
+		opts.ExtraAudiences = audiences[1:]
+	}
+	v, err := idenv.NewVerifier(opts)
+	if err != nil {
+		return &EnvelopeVerifier{}
+	}
+	return &EnvelopeVerifier{v: v}
+}
+
+// Verify parses and checks token, returning the envelope it carries.
+func (v *EnvelopeVerifier) Verify(token string) (*domain.IdentityContextEnvelope, error) {
+	if v == nil || v.v == nil {
+		return nil, errors.New("envelope verifier not configured")
+	}
+	if _, err := v.v.Verify(context.Background(), token); err != nil {
+		return nil, err
+	}
+	return decodeEnvelope(token)
+}
+
+// VerifyAnyAudience checks token's signature, issuer and lifetime against
+// ring without pinning an audience.
+func VerifyAnyAudience(ring *keys.Keyring, issuer, token string) (*domain.IdentityContextEnvelope, error) {
+	claims := jwt.MapClaims{}
+	keySource := ring.KeySource()
+	_, err := jwt.ParseWithClaims(token, claims, func(t *jwt.Token) (any, error) {
+		switch t.Method.Alg() {
+		case jwt.SigningMethodRS256.Alg(), jwt.SigningMethodES256.Alg():
+		default:
+			return nil, errors.New("unexpected signing method")
+		}
+		if typ, _ := t.Header["typ"].(string); strings.EqualFold(typ, TypeAccessToken) {
+			return nil, errors.New("an access token is not an identity envelope")
+		}
+		kid, _ := t.Header["kid"].(string)
+		return keySource.PublicKey(context.Background(), kid)
+	}, jwt.WithExpirationRequired(), jwt.WithIssuer(issuer), jwt.WithLeeway(30*time.Second))
+	if err != nil {
+		return nil, err
+	}
+	return decodeEnvelope(token)
+}
+
+func decodeEnvelope(token string) (*domain.IdentityContextEnvelope, error) {
+	claims := jwt.MapClaims{}
+	if _, _, err := jwt.NewParser().ParseUnverified(token, claims); err != nil {
+		return nil, err
+	}
+	raw, err := json.Marshal(claims)
+	if err != nil {
+		return nil, fmt.Errorf("re-encode envelope: %w", err)
+	}
+	var env domain.IdentityContextEnvelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return nil, fmt.Errorf("decode envelope: %w", err)
+	}
+	if env.Principal.PrincipalID == "" || env.TenantID == "" {
+		return nil, errors.New("envelope missing principal or tenant")
+	}
+	if env.Principal.TenantID != "" && env.Principal.TenantID != env.TenantID {
+		return nil, errors.New("envelope principal and tenant disagree")
+	}
+	return &env, nil
+}
+
+// JWTSigner signs IdentityContextEnvelopes with the keyring's active key.
 type JWTSigner struct {
-	cfg        *config.Config
-	privateKey *rsa.PrivateKey
+	ring *keys.Keyring
 }
 
-func NewJWTSigner(cfg *config.Config) (*JWTSigner, error) {
-	keyBytes, err := os.ReadFile(cfg.JWTSigningPrivateKeyPath)
-	if err != nil {
-		return nil, fmt.Errorf("read private key: %w", err)
-	}
-	privateKey, err := jwt.ParseRSAPrivateKeyFromPEM(keyBytes)
-	if err != nil {
-		return nil, fmt.Errorf("parse private key: %w", err)
-	}
-	return &JWTSigner{cfg: cfg, privateKey: privateKey}, nil
-}
+// NewJWTSigner builds a signer over ring.
+func NewJWTSigner(ring *keys.Keyring) *JWTSigner { return &JWTSigner{ring: ring} }
+
+// Ring is the keyring (JWKS handler, verifiers).
+func (s *JWTSigner) Ring() *keys.Keyring { return s.ring }
 
 // Sign produces a signed JWT for the given envelope.
-// We marshal the envelope to jwt.MapClaims so that:
-//   - All envelope fields are included in the token exactly as serialised.
-//   - We avoid the jwt/v5 Claims interface complexity (GetAudience etc.).
-//   - No struct-embedding required, eliminating the duplicate-JSON-tag problem.
 func (s *JWTSigner) Sign(envelope *domain.IdentityContextEnvelope) (string, error) {
-	raw, err := json.Marshal(envelope)
-	if err != nil {
-		return "", fmt.Errorf("marshal envelope: %w", err)
-	}
-	var claims jwt.MapClaims
-	if err := json.Unmarshal(raw, &claims); err != nil {
-		return "", fmt.Errorf("unmarshal to MapClaims: %w", err)
-	}
-	token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
-	token.Header["kid"] = s.cfg.JWTKeyID
-	return token.SignedString(s.privateKey)
+	return s.ring.Sign(envelope, "JWT")
 }

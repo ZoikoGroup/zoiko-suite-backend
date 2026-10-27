@@ -58,6 +58,9 @@ spec:
         # must be the full cluster DNS name here.
         - name: IDENTITY_JWKS_URL
           value: "http://identity-svc.zoiko-identity.svc.cluster.local:8080/.well-known/jwks.json"
+        # AU-01: /verify checks each envelope's session at identity-svc.
+        - name: IDENTITY_INTROSPECT_URL
+          value: "http://identity-svc.zoiko-identity.svc.cluster.local:8080/v1/context/session/introspect"
         - name: EXPECTED_ISSUER
           value: "identity-context-svc"
         - name: EXPECTED_AUDIENCE

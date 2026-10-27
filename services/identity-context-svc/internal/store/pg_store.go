@@ -172,7 +172,12 @@ func (s *PgStore) FindActiveRoleAssignments(
 	)
 
 	const query = `
-		SELECT assignment_id, principal_id, role_id, legal_entity_id, effective_from, effective_to, assigned_by
+		SELECT assignment_id, principal_id, role_id, legal_entity_id, effective_from,
+		       -- An open-ended governed assignment is stored as 'infinity'
+		       -- (UpsertRoleAssignment), which pgx cannot scan into a
+		       -- time.Time: every principal holding one failed to resolve.
+		       -- Read it as NULL, i.e. the zero time, "no end".
+		       NULLIF(effective_to, 'infinity'::timestamptz), assigned_by
 		FROM principal_role_assignments
 		WHERE principal_id = $1
 		  AND tenant_id = $2
@@ -190,10 +195,14 @@ func (s *PgStore) FindActiveRoleAssignments(
 
 		for rows.Next() {
 			var a domain.PrincipalRoleAssignment
+			var effectiveTo *time.Time
 			if err := rows.Scan(
-				&a.AssignmentID, &a.PrincipalID, &a.RoleID, &a.LegalEntityID, &a.EffectiveFrom, &a.EffectiveTo, &a.AssignedBy,
+				&a.AssignmentID, &a.PrincipalID, &a.RoleID, &a.LegalEntityID, &a.EffectiveFrom, &effectiveTo, &a.AssignedBy,
 			); err != nil {
 				return err
+			}
+			if effectiveTo != nil {
+				a.EffectiveTo = *effectiveTo
 			}
 			assignments = append(assignments, a)
 		}

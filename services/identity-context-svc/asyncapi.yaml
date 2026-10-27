@@ -68,11 +68,24 @@ channels:
         oneOf:
           - $ref: "#/components/messages/ContextResolved"
           - $ref: "#/components/messages/ResolutionFailed"
-          - $ref: "#/components/messages/SessionInvalidated"
+          - $ref: "#/components/messages/SessionRevoked"
           - $ref: "#/components/messages/RiskSignalUnavailable"
           - $ref: "#/components/messages/PrincipalStatusChanged"
+          - $ref: "#/components/messages/SubjectDisabled"
+          - $ref: "#/components/messages/SubjectEnabled"
+          - $ref: "#/components/messages/LoginSessionStarted"
+          - $ref: "#/components/messages/LoginSessionEnded"
+          - $ref: "#/components/messages/RefreshTokenReuseDetected"
+          - $ref: "#/components/messages/AuthorizationCodeReplayed"
+          - $ref: "#/components/messages/AuthenticationThrottled"
+          - $ref: "#/components/messages/TokenExchanged"
           - $ref: "#/components/messages/AuthenticationSucceeded"
           - $ref: "#/components/messages/AuthenticationFailed"
+          - $ref: "#/components/messages/MFAFactorEnrolled"
+          - $ref: "#/components/messages/MFAFactorRevoked"
+          - $ref: "#/components/messages/MFAFactorReset"
+          - $ref: "#/components/messages/StepUpSucceeded"
+          - $ref: "#/components/messages/StepUpFailed"
           - $ref: "#/components/messages/TenantContextCacheInvalidated"
           - $ref: "#/components/messages/TenantContextInvalidated"
           - $ref: "#/components/messages/SupportContextAttached"
@@ -80,6 +93,27 @@ channels:
           - $ref: "#/components/messages/SupportContextReviewed"
           - $ref: "#/components/messages/DispositionExecuted"
           - $ref: "#/components/messages/DispositionBlocked"
+          - $ref: "#/components/messages/FederationVersionProposed"
+          - $ref: "#/components/messages/FederationVersionApproved"
+          - $ref: "#/components/messages/FederationVersionRejected"
+          - $ref: "#/components/messages/FederationActivated"
+          - $ref: "#/components/messages/FederationSuspended"
+          - $ref: "#/components/messages/FederationResumed"
+          - $ref: "#/components/messages/FederationRevoked"
+          - $ref: "#/components/messages/FederationDegraded"
+          - $ref: "#/components/messages/FederationRecovered"
+          - $ref: "#/components/messages/FederationLoginSucceeded"
+          - $ref: "#/components/messages/FederationLoginDenied"
+          - $ref: "#/components/messages/FederationSCIMTokenIssued"
+          - $ref: "#/components/messages/FederationSCIMTokenRevoked"
+          - $ref: "#/components/messages/FederationMappingProposed"
+          - $ref: "#/components/messages/FederationMappingApproved"
+          - $ref: "#/components/messages/FederationMappingRejected"
+          - $ref: "#/components/messages/IdentityLinkCreated"
+          - $ref: "#/components/messages/ProvisioningApplied"
+          - $ref: "#/components/messages/ProvisioningRejected"
+          - $ref: "#/components/messages/DeprovisionApplied"
+          - $ref: "#/components/messages/DeprovisionEscalated"
     subscribe:
       summary: Events identity-context-svc consumes
       message:
@@ -103,6 +137,8 @@ channels:
       message:
         oneOf:
           - $ref: "#/components/messages/RoleUpdated"
+          - $ref: "#/components/messages/AssignmentRevoked"
+          - $ref: "#/components/messages/AssignmentGranted"
 
   zoiko.entity.events:
     description: Owned by tenant-entity-registry-svc. Consumed only.
@@ -114,6 +150,19 @@ channels:
 
 components:
   schemas:
+    PrincipalStatusPayload:
+      type: object
+      properties:
+        payload:
+          type: object
+          properties:
+            principal_id: { type: string }
+            tenant_id: { type: string }
+            new_status: { type: string, enum: [ACTIVE, SUSPENDED, DISABLED] }
+            actor: { type: string }
+            reason: { type: string }
+            correlation_id: { type: string }
+
     Envelope:
       type: object
       description: |
@@ -202,9 +251,12 @@ components:
                       - residency_denied
                       - trust_posture_blocked
 
-    SessionInvalidated:
-      name: session.invalidated
+    SessionRevoked:
+      name: identity.session.revoked
       title: One session was revoked
+      summary: |
+        ZS-IAM-001 §23's name. Emitted as `session.invalidated` until 16 Oct
+        2026; no service consumed the old name, so it was retired outright.
       payload:
         allOf:
           - $ref: "#/components/schemas/Envelope"
@@ -249,11 +301,97 @@ components:
 
     PrincipalStatusChanged:
       name: principal.status.changed
-      title: A principal was suspended or reactivated
+      title: A principal was enabled, suspended or disabled
+      summary: |
+        Written in the same transaction as the status change (PUT
+        /v1/principals/{id}/status), together with identity.subject.disabled
+        or identity.subject.enabled. authorization-svc's principal-status
+        projection and cache invalidator consume this name; ZS-IAM-001 names
+        the identity.subject.* pair, so both are emitted. Until 19 Oct 2026
+        the status route emitted neither (Group 1 re-audit F-3).
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - $ref: "#/components/schemas/PrincipalStatusPayload"
+
+    SubjectDisabled:
+      name: identity.subject.disabled
+      title: A principal was suspended or disabled (ZS-IAM-001 §23)
+      summary: Emitted with principal.status.changed; every session the principal held is then ended.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - $ref: "#/components/schemas/PrincipalStatusPayload"
+
+    SubjectEnabled:
+      name: identity.subject.enabled
+      title: A principal was (re)activated (ZS-IAM-001 §23)
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - $ref: "#/components/schemas/PrincipalStatusPayload"
+
+    LoginSessionStarted:
+      name: identity.login_session.started
+      title: A hosted login completed and a login session (sid) began
       payload:
         allOf:
           - $ref: "#/components/schemas/Envelope"
           - type: object
+            properties:
+              payload:
+                type: object
+                properties:
+                  sid: { type: string }
+                  principal_id: { type: string }
+                  tenant_id: { type: string }
+                  client_id: { type: string }
+                  amr: { type: array, items: { type: string } }
+                  assurance_level: { type: string }
+
+    LoginSessionEnded:
+      name: identity.login_session.ended
+      title: A login session ended (logout, refresh or code reuse, disable, admin revoke)
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+            properties:
+              payload:
+                type: object
+                properties:
+                  sid: { type: string }
+                  tenant_id: { type: string }
+                  reason: { type: string }
+                  session_contexts_ended: { type: integer }
+
+    RefreshTokenReuseDetected:
+      name: identity.refresh_token.reuse_detected
+      title: A rotated refresh token was presented again; its family was revoked and the login session ended
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+
+    AuthorizationCodeReplayed:
+      name: identity.authorization_code.replayed
+      title: An authorization code was redeemed twice; the login session it came from was ended
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+
+    AuthenticationThrottled:
+      name: identity.authentication.throttled
+      title: A hosted login was refused 429 by the source throttle (AU-04)
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+
+    TokenExchanged:
+      name: identity.token.exchanged
+      title: A workload exchanged an envelope for a narrower audience (RFC 8693)
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
 
     AuthenticationSucceeded:
       name: identity.authentication.succeeded
@@ -277,6 +415,66 @@ components:
         failures against addresses that do not exist is the signature of an
         enumeration sweep, and dropping those would hide exactly the attack the
         constant-time verification path defends against.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+
+    MFAFactorEnrolled:
+      name: identity.mfa_factor.enrolled
+      title: A TOTP factor was proven and is now active
+      summary: |
+        Written through the outbox in the transaction that activates the
+        factor (and retires any previous one). Payload: principal_id,
+        tenant_id, factor_id, factor_type, correlation_id. Never any secret.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+
+    MFAFactorRevoked:
+      name: identity.mfa_factor.revoked
+      title: A principal revoked its own TOTP factor
+      summary: |
+        Requires a recent step-up. Payload: principal_id, tenant_id, factor_id,
+        reason, actor, correlation_id.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+
+    MFAFactorReset:
+      name: identity.mfa_factor.reset
+      title: An administrator reset another principal's second factor
+      summary: |
+        Credential recovery (ZS-IAM-001 §3). Payload: principal_id (the
+        subject), tenant_id, reason_code, purpose, actor (the administrator),
+        correlation_id. Also streamed to SIEM at high severity.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+
+    StepUpSucceeded:
+      name: identity.step_up.succeeded
+      title: A session was stepped up with a second factor
+      summary: |
+        Written with the accepted code. Payload: principal_id, tenant_id,
+        factor_id, session_context_id, amr, correlation_id. Doc 05 §13.2 names
+        MFA/step-up events a required SIEM signal.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+
+    StepUpFailed:
+      name: identity.step_up.failed
+      title: A second-factor code was refused
+      summary: |
+        A wrong, replayed or locked code, on step-up or activation. Payload:
+        principal_id, tenant_id, credential_type, action, failure_reason,
+        correlation_id. The reason is here and in access_decision_log, never on
+        the wire.
       payload:
         allOf:
           - $ref: "#/components/schemas/Envelope"
@@ -430,6 +628,238 @@ components:
                   held_back: { type: integer }
                   reason: { type: string, enum: [LEGAL_HOLD_ACTIVE] }
 
+    # -- INT-10 identity federation (published) ----------------------------------
+    #
+    # Written in the same transaction as the fact they attest. They carry identifiers and decisions only: never an
+    # ID token, a SCIM token, a key, or an email address.
+
+    FederationVersionProposed:
+      name: identity.federation.version_proposed
+      title: A federation trust configuration was proposed
+      summary: A new connection, or a new version of one, awaits an independent approver. The fingerprint is what the approver approves.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+            properties:
+              payload:
+                type: object
+                required: [connection_id, version, fingerprint]
+                properties:
+                  connection_id: { type: string }
+                  version: { type: integer }
+                  fingerprint: { type: string }
+                  issuer: { type: string }
+
+    FederationVersionApproved:
+      name: identity.federation.version_approved
+      title: A later version of an active connection was approved
+      summary: It replaces the version login uses; the earlier one is superseded.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+
+    FederationVersionRejected:
+      name: identity.federation.version_rejected
+      title: A proposed federation configuration was rejected
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+
+    FederationActivated:
+      name: identity.federation.activated
+      title: A tenant's IdP connection became active
+      summary: The first approved version. From here the tenant's people may sign in through their identity provider.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+
+    FederationSuspended:
+      name: identity.federation.suspended
+      title: A connection was suspended
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+
+    FederationResumed:
+      name: identity.federation.resumed
+      title: A suspended connection returned to service
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+
+    FederationRevoked:
+      name: identity.federation.revoked
+      title: A connection was revoked (final)
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+
+    FederationDegraded:
+      name: identity.federation.degraded
+      title: A connection's signing keys could not be refreshed
+      summary: Emitted on the transition. Under FAIL_CLOSED logins are refused until the keys return; under CACHED_KEYS they run on the last good set until its grace ends.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+
+    FederationRecovered:
+      name: identity.federation.recovered
+      title: A degraded connection's signing keys were obtained again
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+
+    FederationLoginSucceeded:
+      name: identity.federation.login_succeeded
+      title: A person signed in through their identity provider
+      summary: Distinct from identity.authentication.succeeded, which attests a password. Carries whether a tenant-approved second factor was asserted and whether the keys were the cached set.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+            properties:
+              payload:
+                type: object
+                properties:
+                  connection_id: { type: string }
+                  config_version: { type: integer }
+                  principal_id: { type: string }
+                  mfa_asserted: { type: boolean }
+                  degraded_keys: { type: boolean }
+
+    FederationLoginDenied:
+      name: identity.federation.login_denied
+      title: An authentic assertion was refused
+      summary: Emitted only for a token whose signature verified. A forged or malformed token is counted and streamed, never stored, so an anonymous sender cannot grow this stream.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+
+    FederationSCIMTokenIssued:
+      name: identity.federation.scim_token_issued
+      title: A SCIM bearer token was issued for a connection
+      summary: The token itself is never in the event; only its issue.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+
+    FederationSCIMTokenRevoked:
+      name: identity.federation.scim_token_revoked
+      title: A SCIM bearer token was revoked
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+
+    FederationMappingProposed:
+      name: identity.federation.mapping_proposed
+      title: A provisioning mapping was proposed
+      summary: Only baseline roles may be named; access-control-svc is asked about each before the proposal exists.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+
+    FederationMappingApproved:
+      name: identity.federation.mapping_approved
+      title: A provisioning mapping was approved
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+
+    FederationMappingRejected:
+      name: identity.federation.mapping_rejected
+      title: A provisioning mapping was rejected
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+
+    IdentityLinkCreated:
+      name: identity.link.created
+      title: An external subject was linked to a principal
+      summary: Keyed by tenant, issuer and stable subject. Never by email address.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+            properties:
+              payload:
+                type: object
+                properties:
+                  link_id: { type: string }
+                  connection_id: { type: string }
+                  principal_id: { type: string }
+                  issuer: { type: string }
+                  link_source: { type: string, enum: [SCIM, JIT, ADMIN] }
+
+    ProvisioningApplied:
+      name: identity.provisioning.applied
+      title: A directory provisioning event was applied
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+            properties:
+              payload:
+                type: object
+                properties:
+                  connection_id: { type: string }
+                  event_id: { type: string }
+                  link_id: { type: string }
+                  principal_id: { type: string }
+                  operation: { type: string }
+                  planned: { type: integer }
+                  revoking: { type: integer }
+
+    ProvisioningRejected:
+      name: identity.provisioning.rejected
+      title: A directory provisioning event was rejected or quarantined
+      summary: An email collision, an ambiguous mapping, or an event the pipeline refused. Listed for a human as a sync exception.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+
+    DeprovisionApplied:
+      name: identity.federation.deprovision_applied
+      title: A person was deprovisioned
+      summary: Emitted in the transaction that disables the principal. Session eviction and assignment revocation follow and are retried until done.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+            properties:
+              payload:
+                type: object
+                properties:
+                  connection_id: { type: string }
+                  link_id: { type: string }
+                  principal_id: { type: string }
+                  requested_at: { type: string, format: date-time }
+                  revoking: { type: integer }
+
+    DeprovisionEscalated:
+      name: identity.federation.deprovision_escalated
+      title: A deprovisioning missed its objective
+      summary: Raised once. The person already cannot sign in; some session or assignment still stands past the SLO.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+
     # -- Consumed ---------------------------------------------------------------
 
     AuthorityEnded:
@@ -453,6 +883,32 @@ components:
         Envelopes already issued carry the permission bundles the role granted
         BEFORE the change, so every holder's sessions are revoked and the next
         resolve re-derives them.
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    AssignmentGranted:
+      name: iam.assignment.granted
+      title: An access assignment became effective
+      summary: |
+        Emitted by access-control-svc once a governed assignment is
+        provisioned in authorization-svc. Projected into
+        principal_role_assignments, the table the resolver frames session
+        roles from and handleRoleUpdated finds a role's holders in; it had no
+        other feed. A principal unknown here is skipped. Revokes nothing.
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    AssignmentRevoked:
+      name: iam.assignment.revoked
+      title: An access assignment was revoked
+      summary: |
+        Emitted by access-control-svc when a governed assignment is revoked
+        (POST /v1/iam/access-assignments/{id}:revoke, or a REVOKE decision in
+        an access review). role.updated cannot cover this: it re-resolves the
+        role's CURRENT holders, and the revoked principal is no longer one.
+        The subject is read from `payload.principal_id`, never from
+        `actor_id` (the revoker). Every session of the subject is revoked;
+        events older than the envelope TTL plus one minute are skipped.
       payload:
         $ref: "#/components/schemas/Envelope"
 

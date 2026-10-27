@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"sort"
 	"testing"
 	"time"
 
@@ -23,6 +25,7 @@ import (
 var (
 	testPool  *pgxpool.Pool
 	testStore *store.PgStore
+	testDSN   string
 )
 
 // TestMain provisions a real, throwaway embedded Postgres instance and
@@ -31,27 +34,33 @@ var (
 // exercised by internal/handler/handler_test.go, which cannot prove a
 // database-level trigger actually fires.
 func TestMain(m *testing.M) {
-	dbPort := uint32(15901 + uint32(os.Getpid()%499))
-	pg := embeddedpostgres.NewDatabase(
-		embeddedpostgres.DefaultConfig().
-			Version(embeddedpostgres.V16).
-			Port(dbPort).
-			Database("payment_adapter_test").
-			Username("postgres").
-			Password("postgres"),
-	)
-	if err := pg.Start(); err != nil {
-		fmt.Printf("failed to start embedded postgres: %v\n", err)
-		os.Exit(1)
-	}
-
-	dsn := fmt.Sprintf("host=localhost port=%d dbname=payment_adapter_test user=postgres password=postgres sslmode=disable", dbPort)
 	ctx := context.Background()
+	stop := func() {}
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		dbPort := uint32(15901 + uint32(os.Getpid()%499))
+		pg := embeddedpostgres.NewDatabase(
+			embeddedpostgres.DefaultConfig().
+				RuntimePath(os.TempDir() + "/payment-pg-" + fmt.Sprint(os.Getpid())).
+				Version(embeddedpostgres.V16).
+				Port(dbPort).
+				Database("payment_adapter_test").
+				Username("postgres").
+				Password("postgres"),
+		)
+		if err := pg.Start(); err != nil {
+			fmt.Printf("failed to start embedded postgres: %v\n", err)
+			os.Exit(1)
+		}
+		stop = func() { _ = pg.Stop() }
+		dsn = fmt.Sprintf("host=localhost port=%d dbname=payment_adapter_test user=postgres password=postgres sslmode=disable", dbPort)
+	}
+	testDSN = dsn
 	var err error
 	testPool, err = pgxpool.New(ctx, dsn)
 	if err != nil {
 		fmt.Printf("failed to connect: %v\n", err)
-		_ = pg.Stop()
+		stop()
 		os.Exit(1)
 	}
 	for i := 0; i < 75; i++ {
@@ -63,36 +72,48 @@ func TestMain(m *testing.M) {
 	if err != nil {
 		fmt.Printf("postgres did not become ready: %v\n", err)
 		testPool.Close()
-		_ = pg.Stop()
+		stop()
 		os.Exit(1)
 	}
+	if os.Getenv("TEST_DATABASE_URL") != "" {
+		// a shared server: start from an empty schema so the migrations are exercised from nothing
+		if _, err := testPool.Exec(ctx, "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"); err != nil {
+			fmt.Printf("reset schema: %v\n", err)
+			os.Exit(1)
+		}
+	}
 
-	for _, migration := range []string{
-		"000001_initial_schema.up.sql",
-		"000002_immutability.up.sql",
-		"000003_add_rls.up.sql",
-		"000004_add_authorization_verification.up.sql",
-	} {
-		sql, err := os.ReadFile("../../deployments/migrations/" + migration)
+	// Every migration in filename order, never a hardcoded list: a list that must be remembered to be
+	// updated silently skips new migrations.
+	migrations, err := filepath.Glob("../../deployments/migrations/*.up.sql")
+	if err != nil || len(migrations) == 0 {
+		fmt.Printf("no migrations found: %v\n", err)
+		testPool.Close()
+		stop()
+		os.Exit(1)
+	}
+	sort.Strings(migrations)
+	for _, migration := range migrations {
+		sql, err := os.ReadFile(migration)
 		if err != nil {
 			fmt.Printf("read migration %s: %v\n", migration, err)
 			testPool.Close()
-			_ = pg.Stop()
+			stop()
 			os.Exit(1)
 		}
 		if _, err := testPool.Exec(ctx, string(sql)); err != nil {
-			fmt.Printf("apply migration %s: %v\n", migration, err)
+			fmt.Printf("apply migration %s: %v\n", filepath.Base(migration), err)
 			testPool.Close()
-			_ = pg.Stop()
+			stop()
 			os.Exit(1)
 		}
 	}
 
-	testStore = store.NewPgStore(testPool, zap.NewNop())
+	testStore = store.NewPgStore(testPool, zap.NewNop(), store.WithEventRegion("uk"))
 
 	code := m.Run()
 	testPool.Close()
-	_ = pg.Stop()
+	stop()
 	os.Exit(code)
 }
 
@@ -109,7 +130,7 @@ func TestPgStore_PreparedAttempt_AuthorizedFieldsAreImmutable(t *testing.T) {
 		LegalEntityID: uuid.New().String(), PayerAccountRef: "acct-src", PayeeRef: "acct-dst",
 		Amount: 100.00, Currency: "USD", ExecutionDate: time.Now(), PayerAccountVerified: true,
 		IdempotencyKey: "corr-immutable-1",
-	}, "maker-1")
+	}, "maker-1", "corr-immutable-1")
 	if err != nil {
 		t.Fatalf("PrepareAttempt: %v", err)
 	}
@@ -160,7 +181,7 @@ func TestPgStore_PreparedAttempt_AuthorizationFieldsPersistAndAreImmutable(t *te
 		IdempotencyKey: "corr-auth-fields-1",
 		AuthorizationFingerprint: "sha256:real-fingerprint", AuthorizationID: "auth-real-1",
 		AuthorizationSource: domain.AuthorizationSourcePaymentAuthorization,
-	}, "maker-1")
+	}, "maker-1", "corr-auth-fields-1")
 	if err != nil {
 		t.Fatalf("PrepareAttempt: %v", err)
 	}
@@ -201,7 +222,7 @@ func TestPgStore_SubmittedAttempt_IsFullyTerminal(t *testing.T) {
 		LegalEntityID: uuid.New().String(), PayerAccountRef: "acct-src", PayeeRef: "acct-dst",
 		Amount: 50.00, Currency: "USD", ExecutionDate: time.Now(), PayerAccountVerified: true,
 		IdempotencyKey: "corr-immutable-2",
-	}, "maker-1")
+	}, "maker-1", "corr-immutable-2")
 	if err != nil {
 		t.Fatalf("PrepareAttempt: %v", err)
 	}
@@ -232,7 +253,7 @@ func TestPgStore_PrepareAttempt_RejectsSecondUnresolvedAttempt(t *testing.T) {
 		PayerAccountRef: "acct-src", PayeeRef: "acct-dst",
 		Amount: 75.00, Currency: "USD", ExecutionDate: time.Now(), PayerAccountVerified: true,
 		IdempotencyKey: "corr-unresolved-1",
-	}, "maker-1")
+	}, "maker-1", "corr-unresolved-1")
 	if err != nil {
 		t.Fatalf("first PrepareAttempt: %v", err)
 	}
@@ -244,7 +265,7 @@ func TestPgStore_PrepareAttempt_RejectsSecondUnresolvedAttempt(t *testing.T) {
 		PayerAccountRef: "acct-src", PayeeRef: "acct-dst",
 		Amount: 75.00, Currency: "USD", ExecutionDate: time.Now(), PayerAccountVerified: true,
 		IdempotencyKey: "corr-unresolved-2",
-	}, "maker-1")
+	}, "maker-1", "corr-unresolved-2")
 	if !errors.Is(err, domain.ErrUnresolvedAttemptExists) {
 		t.Fatalf("expected ErrUnresolvedAttemptExists, got err=%v", err)
 	}
@@ -275,7 +296,7 @@ func TestPgStore_PrepareAttempt_RejectsSecondUnresolvedAttempt(t *testing.T) {
 		PayerAccountRef: "acct-src", PayeeRef: "acct-dst",
 		Amount: 75.00, Currency: "USD", ExecutionDate: time.Now(), PayerAccountVerified: true,
 		IdempotencyKey: "corr-unresolved-3",
-	}, "maker-1")
+	}, "maker-1", "corr-unresolved-3")
 	if !errors.Is(err, domain.ErrUnresolvedAttemptExists) {
 		t.Fatalf("expected ErrUnresolvedAttemptExists once the prior attempt is SUBMITTED, got %v", err)
 	}
@@ -290,7 +311,7 @@ func TestPgStore_PrepareAttempt_RejectsSecondUnresolvedAttempt(t *testing.T) {
 		PayerAccountRef: "acct-src", PayeeRef: "acct-dst",
 		Amount: 75.00, Currency: "USD", ExecutionDate: time.Now(), PayerAccountVerified: true,
 		IdempotencyKey: "corr-unresolved-4",
-	}, "maker-1")
+	}, "maker-1", "corr-unresolved-4")
 	if err != nil {
 		t.Fatalf("expected a genuinely new source_reference to be unaffected, got %v", err)
 	}
@@ -311,7 +332,7 @@ func TestPgStore_PrepareAttempt_EmptySourceReference_NeverDeduped(t *testing.T) 
 		LegalEntityID: uuid.New().String(), PayerAccountRef: "acct-src", PayeeRef: "acct-dst",
 		Amount: 10.00, Currency: "USD", ExecutionDate: time.Now(), PayerAccountVerified: true,
 		IdempotencyKey: "corr-empty-ref-1",
-	}, "maker-1")
+	}, "maker-1", "corr-empty-ref-1")
 	if err != nil {
 		t.Fatalf("first PrepareAttempt: %v", err)
 	}
@@ -319,7 +340,7 @@ func TestPgStore_PrepareAttempt_EmptySourceReference_NeverDeduped(t *testing.T) 
 		LegalEntityID: uuid.New().String(), PayerAccountRef: "acct-src", PayeeRef: "acct-dst",
 		Amount: 20.00, Currency: "USD", ExecutionDate: time.Now(), PayerAccountVerified: true,
 		IdempotencyKey: "corr-empty-ref-2",
-	}, "maker-1")
+	}, "maker-1", "corr-empty-ref-2")
 	if err != nil {
 		t.Fatalf("expected two unrelated attempts with no source_reference to both succeed, got %v", err)
 	}

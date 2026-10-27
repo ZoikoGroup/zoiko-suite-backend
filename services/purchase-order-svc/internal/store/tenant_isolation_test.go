@@ -53,37 +53,75 @@ var (
 )
 
 func TestMain(m *testing.M) {
-	dbPort := uint32(15901 + uint32(os.Getpid()%499))
-	pg := embeddedpostgres.NewDatabase(
-		embeddedpostgres.DefaultConfig().
-			// Version pinned explicitly — see the doc comment on
-			// embeddedpostgres.DefaultConfig() in audit-event-store-svc's
-			// main_integration_test.go for why: the unpinned default floats
-			// to whatever major the library calls "latest," and that patch
-			// build can stop resolving from the remote binary repo with no
-			// code change on our side (this is what broke PR #105's CI).
-			Version(embeddedpostgres.V16).
-			Port(dbPort).
-			Database("po_isolation_test").
-			Username("postgres").
-			Password("postgres"),
-	)
-	if err := pg.Start(); err != nil {
-		fmt.Printf("failed to start embedded postgres: %v\n", err)
-		os.Exit(1)
+	ctx := context.Background()
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	var pg *embeddedpostgres.EmbeddedPostgres
+
+	if dsn == "" {
+		dbPort := uint32(15901 + uint32(os.Getpid()%499))
+		pg = embeddedpostgres.NewDatabase(
+			embeddedpostgres.DefaultConfig().
+				// Version pinned explicitly to a literal patch string, NOT the
+				// library's own embeddedpostgres.V16 alias — see the doc comment
+				// on embeddedpostgres.DefaultConfig() in audit-event-store-svc's
+				// main_integration_test.go for why floating is dangerous (this
+				// is what broke PR #105's CI). V16 itself turned out to be the
+				// same hazard one layer down: it is a constant baked into
+				// embedded-postgres v1.34.0 (the latest release) that resolves
+				// to "16.9.0", a specific patch chosen by that library's authors
+				// — not by us — and we cannot bump our way to a newer pin
+				// without the library releasing one. CI failed on exactly this
+				// ("no version found matching 16.9.0") even though 16.9.0 is
+				// still a real, resolvable artifact; pinning our own literal
+				// string here means a future resolution hiccup is something we
+				// control by editing this line, not something that requires
+				// waiting on an upstream library release.
+				Version(embeddedpostgres.PostgresVersion("16.15.0")).
+				Port(dbPort).
+				Database("po_isolation_test").
+				Username("postgres").
+				Password("postgres").
+				RuntimePath(filepath.Join(os.TempDir(), fmt.Sprintf("epg-po-%d", dbPort))),
+		)
+
+		var err error
+		for attempt := 1; attempt <= 3; attempt++ {
+			if err = pg.Start(); err == nil {
+				break
+			}
+			time.Sleep(time.Duration(attempt) * time.Second)
+		}
+
+		if err != nil {
+			// If embedded postgres fails to start, fall back to the CI-provided Postgres container if reachable.
+			ciDSN := "postgres://postgres:secretpassword@localhost:5432/testdb?sslmode=disable"
+			fallbackPool, pingErr := pgxpool.New(ctx, ciDSN)
+			if pingErr == nil && fallbackPool.Ping(ctx) == nil {
+				fallbackPool.Close()
+				dsn = ciDSN
+				pg = nil
+			} else {
+				if fallbackPool != nil {
+					fallbackPool.Close()
+				}
+				fmt.Printf("failed to start embedded postgres: %v\n", err)
+				os.Exit(1)
+			}
+		} else {
+			dsn = fmt.Sprintf(
+				"host=localhost port=%d dbname=po_isolation_test user=postgres password=postgres sslmode=disable",
+				dbPort,
+			)
+		}
 	}
 
-	dsn := fmt.Sprintf(
-		"host=localhost port=%d dbname=po_isolation_test user=postgres password=postgres sslmode=disable",
-		dbPort,
-	)
-
-	ctx := context.Background()
 	var err error
 	testPool, err = pgxpool.New(ctx, dsn)
 	if err != nil {
 		fmt.Printf("failed to connect to postgres: %v\n", err)
-		_ = pg.Stop()
+		if pg != nil {
+			_ = pg.Stop()
+		}
 		os.Exit(1)
 	}
 
@@ -96,9 +134,23 @@ func TestMain(m *testing.M) {
 	if err != nil {
 		fmt.Printf("postgres did not become ready: %v\n", err)
 		testPool.Close()
-		_ = pg.Stop()
+		if pg != nil {
+			_ = pg.Stop()
+		}
 		os.Exit(1)
 	}
+
+	// Reset tables if running against a shared or reused database container (such as CI testdb).
+	_, _ = testPool.Exec(ctx, `
+		DO $$
+		DECLARE t record;
+		BEGIN
+			FOR t IN SELECT tablename FROM pg_tables WHERE schemaname = 'public' LOOP
+				EXECUTE format('DROP TABLE IF EXISTS public.%I CASCADE', t.tablename);
+			END LOOP;
+		END $$;
+		DROP SEQUENCE IF EXISTS purchase_order_number_seq CASCADE;
+	`)
 
 	// EVERY *.up.sql, BY GLOB, NOT ONE NAMED FILE.
 	//
@@ -113,7 +165,9 @@ func TestMain(m *testing.M) {
 		// assertion below would then fail for an unrelated reason.
 		fmt.Printf("no *.up.sql under deployments/migrations: %v\n", err)
 		testPool.Close()
-		_ = pg.Stop()
+		if pg != nil {
+			_ = pg.Stop()
+		}
 		os.Exit(1)
 	}
 	sort.Strings(migrations)
@@ -123,13 +177,17 @@ func TestMain(m *testing.M) {
 		if readErr != nil {
 			fmt.Printf("failed to read migration %s: %v\n", filepath.Base(migration), readErr)
 			testPool.Close()
-			_ = pg.Stop()
+			if pg != nil {
+				_ = pg.Stop()
+			}
 			os.Exit(1)
 		}
 		if _, err = testPool.Exec(ctx, string(sql)); err != nil {
 			fmt.Printf("failed to apply migration %s: %v\n", filepath.Base(migration), err)
 			testPool.Close()
-			_ = pg.Stop()
+			if pg != nil {
+				_ = pg.Stop()
+			}
 			os.Exit(1)
 		}
 	}
@@ -139,7 +197,9 @@ func TestMain(m *testing.M) {
 	code := m.Run()
 
 	testPool.Close()
-	_ = pg.Stop()
+	if pg != nil {
+		_ = pg.Stop()
+	}
 	os.Exit(code)
 }
 
@@ -148,32 +208,31 @@ type orderFixture struct {
 	tenantID string
 	entityID string
 	orderID  string
+	lineID   string
 }
 
+// setupIsolationFixture seeds one tenant with an ISSUED order that has a line, so
+// the isolation probes below reach the order, line, progress, revision and event
+// tables and not just the header.
 func setupIsolationFixture(t *testing.T, tenantLabel string) orderFixture {
 	t.Helper()
 	ctx := context.Background()
 
-	f := orderFixture{
-		tenantID: uuid.New().String(),
-		entityID: uuid.New().String(),
-		orderID:  uuid.New().String(),
-	}
+	f := orderFixture{tenantID: uuid.New().String(), entityID: uuid.New().String()}
 	tctx := svcmiddleware.WithTenant(ctx, f.tenantID)
 
-	o := &domain.PurchaseOrder{
-		PurchaseOrderID:     f.orderID,
-		TenantID:            f.tenantID,
-		LegalEntityID:       f.entityID,
-		IssuedByPrincipalID: "test-" + tenantLabel,
-		TotalAmount:         1000,
-		CurrencyCode:        "USD",
-		CorrelationID:       "corr-" + tenantLabel,
-	}
-	created, err := testStore.CreateOrder(tctx, o)
+	d, created, err := testStore.CreateIssued(tctx, store.IssuedInput{
+		CreateDraftInput: store.CreateDraftInput{
+			TenantID: f.tenantID, LegalEntityID: f.entityID, CurrencyCode: "USD",
+			CorrelationID: "corr-" + tenantLabel, PreparedBy: "test-" + tenantLabel,
+			Lines: []domain.LineInput{{ItemRef: "SKU-1", Quantity: 10, UnitPrice: 100, UOM: "EA"}},
+		},
+		ApprovalBasis: domain.ApprovalBasisProcurementCase, ApprovalRef: "case-" + tenantLabel, ApprovedBy: "case-approver",
+	})
 	require.NoError(t, err)
 	require.True(t, created)
-
+	f.orderID = d.PurchaseOrderID
+	f.lineID = d.Lines[0].LineID
 	return f
 }
 
@@ -187,6 +246,10 @@ func TestPgStore_TenantIsolation_GetOrder(t *testing.T) {
 	require.NoError(t, err)
 	assert.Nil(t, got, "ISOLATION FAILURE: GetOrder returned Tenant A's row under Tenant B's context")
 
+	detail, err := testStore.GetOrderDetail(ctxB, a.orderID)
+	require.NoError(t, err)
+	assert.Nil(t, detail, "ISOLATION FAILURE: GetOrderDetail returned Tenant A's order and lines under Tenant B's context")
+
 	// Sanity: tenant B can still read its own order.
 	gotOwn, err := testStore.GetOrder(ctxB, b.orderID)
 	require.NoError(t, err)
@@ -194,6 +257,9 @@ func TestPgStore_TenantIsolation_GetOrder(t *testing.T) {
 	assert.Equal(t, b.orderID, gotOwn.PurchaseOrderID)
 }
 
+// An amendment aimed at another tenant's order finds no order at all — and an
+// order that does not exist in the caller's tenant is "not found", not "found in
+// the wrong state".
 func TestPgStore_TenantIsolation_AmendOrder(t *testing.T) {
 	a := setupIsolationFixture(t, "A-Amend")
 	b := setupIsolationFixture(t, "B-Amend")
@@ -202,8 +268,9 @@ func TestPgStore_TenantIsolation_AmendOrder(t *testing.T) {
 	// tenantID as the scope argument — exactly what a handler bug would
 	// look like if TenantID were taken from the request body instead of
 	// the caller's real context.
-	_, err := testStore.AmendOrder(context.Background(), b.tenantID, a.orderID, 9999, "attacker amend", "attacker")
-	assert.ErrorIs(t, err, domain.ErrInvalidTransition,
+	_, err := testStore.AmendOrder(context.Background(), b.tenantID, a.orderID, "attacker",
+		domain.AmendOrderRequest{NewTotalAmount: 9999, Reason: "attacker amend"})
+	assert.ErrorIs(t, err, domain.ErrOrderNotFound,
 		"ISOLATION FAILURE: tenant B was able to amend tenant A's order")
 
 	// Verify tenant A's order is unchanged.
@@ -214,33 +281,73 @@ func TestPgStore_TenantIsolation_AmendOrder(t *testing.T) {
 	assert.Equal(t, float64(1000), got.TotalAmount,
 		"ISOLATION FAILURE: tenant A's order total_amount was mutated by tenant B")
 	assert.Equal(t, 1, got.Version)
-
-	// Sanity: tenant B can still amend its OWN order.
-	updated, err := testStore.AmendOrder(context.Background(), b.tenantID, b.orderID, 2000, "legit amend", "b-admin")
-	require.NoError(t, err)
-	assert.Equal(t, float64(2000), updated.TotalAmount)
-	assert.Equal(t, 2, updated.Version)
+	assert.Equal(t, domain.OrderStatusIssued, got.Status)
 }
 
-func TestPgStore_TenantIsolation_CloseOrder(t *testing.T) {
+func TestPgStore_TenantIsolation_Transitions(t *testing.T) {
 	a := setupIsolationFixture(t, "A-Close")
 	b := setupIsolationFixture(t, "B-Close")
 
-	_, err := testStore.CloseOrder(context.Background(), b.tenantID, a.orderID, "attacker")
-	assert.ErrorIs(t, err, domain.ErrInvalidTransition,
-		"ISOLATION FAILURE: tenant B was able to close tenant A's order")
+	for _, cmd := range []store.Command{store.CmdClose, store.CmdHold, store.CmdCancel} {
+		_, err := testStore.Transition(context.Background(), store.TransitionInput{
+			TenantID: b.tenantID, OrderID: a.orderID, Actor: "attacker", Command: cmd, Reason: "attack",
+		})
+		assert.ErrorIs(t, err, domain.ErrOrderNotFound,
+			"ISOLATION FAILURE: tenant B was able to run %s on tenant A's order", cmd)
+	}
 
 	ctxA := svcmiddleware.WithTenant(context.Background(), a.tenantID)
 	got, err := testStore.GetOrder(ctxA, a.orderID)
 	require.NoError(t, err)
 	require.NotNil(t, got)
 	assert.Equal(t, domain.OrderStatusIssued, got.Status,
-		"ISOLATION FAILURE: tenant A's order status was mutated by tenant B's close attempt")
+		"ISOLATION FAILURE: tenant A's order status was mutated by tenant B")
 
 	// Sanity: tenant B can still close its OWN order.
-	updated, err := testStore.CloseOrder(context.Background(), b.tenantID, b.orderID, "b-admin")
+	updated, err := testStore.Transition(context.Background(), store.TransitionInput{
+		TenantID: b.tenantID, OrderID: b.orderID, Actor: "b-admin", Command: store.CmdClose,
+	})
 	require.NoError(t, err)
 	assert.Equal(t, domain.OrderStatusClosed, updated.Status)
+}
+
+// Progress, lines, revisions, history and open quantity are all reached through
+// the order, and each must be tenant-scoped on its own.
+func TestPgStore_TenantIsolation_ProgressAndReads(t *testing.T) {
+	a := setupIsolationFixture(t, "A-Progress")
+	b := setupIsolationFixture(t, "B-Progress")
+	ctxB := svcmiddleware.WithTenant(context.Background(), b.tenantID)
+
+	// Tenant B pushing progress against tenant A's order/line.
+	_, err := testStore.RecordProgress(context.Background(), b.tenantID, a.orderID, a.lineID, "attacker",
+		domain.ProgressRequest{Kind: domain.ProgressReceived, Quantity: 1, SourceRef: "attack-1", DeltaSign: 1}, "")
+	assert.ErrorIs(t, err, domain.ErrOrderNotFound, "ISOLATION FAILURE: tenant B pushed progress onto tenant A's order")
+
+	// ... and onto tenant A's line through its OWN order id.
+	_, err = testStore.RecordProgress(context.Background(), b.tenantID, b.orderID, a.lineID, "attacker",
+		domain.ProgressRequest{Kind: domain.ProgressReceived, Quantity: 1, SourceRef: "attack-2", DeltaSign: 1}, "")
+	assert.ErrorIs(t, err, domain.ErrLineNotFound, "ISOLATION FAILURE: tenant B reached tenant A's line through its own order")
+
+	lines, ok, err := testStore.OpenQuantity(ctxB, a.orderID)
+	require.NoError(t, err)
+	assert.False(t, ok, "ISOLATION FAILURE: OpenQuantity answered for another tenant's order")
+	assert.Empty(t, lines)
+
+	events, err := testStore.ListEvents(ctxB, a.orderID)
+	require.NoError(t, err)
+	assert.Empty(t, events, "ISOLATION FAILURE: another tenant's order history was readable")
+
+	revs, err := testStore.ListRevisions(ctxB, a.orderID)
+	require.NoError(t, err)
+	assert.Empty(t, revs, "ISOLATION FAILURE: another tenant's revisions were readable")
+
+	// Tenant A's own order was never touched.
+	ctxA := svcmiddleware.WithTenant(context.Background(), a.tenantID)
+	qty, ok, err := testStore.OpenQuantity(ctxA, a.orderID)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Len(t, qty, 1)
+	assert.Equal(t, float64(0), qty[0].ReceivedQuantity)
 }
 
 func TestPgStore_TenantIsolation_ListOrders(t *testing.T) {

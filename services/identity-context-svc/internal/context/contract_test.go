@@ -16,6 +16,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	identityctx "zoiko.io/identity-context-svc/internal/context"
+	"zoiko.io/identity-context-svc/internal/federation"
 )
 
 // DoD gate 1: "Machine contract published and compatibility certified."
@@ -65,6 +66,10 @@ func routerPaths(t *testing.T) map[string]bool {
 
 	r := chi.NewRouter()
 	identityctx.RegisterRoutes(r, h)
+	// INT-10: the federation and SCIM routes are part of the same published contract.
+	fh := federation.NewHandler(nil, nil, nil, nil).WithProvisioning(&federation.Provisioning{})
+	fh.Register(r)
+	fh.RegisterSCIM(r)
 
 	out := map[string]bool{}
 	err := chi.Walk(r, func(method, route string, _ http.Handler, _ ...func(http.Handler) http.Handler) error {
@@ -135,6 +140,27 @@ func TestEveryContractPathIsServed(t *testing.T) {
 	mountedElsewhere := map[string]bool{
 		"GET /health":                true,
 		"GET /.well-known/jwks.json": true,
+		// The OIDC provider's routes (internal/oidc, mounted in cmd/server).
+		// internal/oidc's TestEveryProviderRouteIsPublished checks them against
+		// this same document in both directions.
+		"GET /.well-known/openid-configuration":       true,
+		"GET /.well-known/oauth-authorization-server": true,
+		"GET /oauth2/authorize":                       true,
+		"POST /oauth2/authorize":                      true,
+		"POST /oauth2/login":                          true,
+		"POST /oauth2/login/mfa":                      true,
+		"POST /oauth2/login/passkey/begin":            true,
+		"POST /oauth2/login/passkey/finish":           true,
+		"GET /oauth2/login/federate/{idpid}":          true,
+		"POST /oauth2/token":                          true,
+		"GET /oauth2/userinfo":                        true,
+		"POST /oauth2/userinfo":                       true,
+		"POST /oauth2/revoke":                         true,
+		"POST /oauth2/introspect":                     true,
+		"GET /oauth2/logout":                          true,
+		"POST /oauth2/logout":                         true,
+		"POST /v1/logout":                             true,
+		"POST /v1/context/session/introspect":         true,
 	}
 
 	var unserved []string

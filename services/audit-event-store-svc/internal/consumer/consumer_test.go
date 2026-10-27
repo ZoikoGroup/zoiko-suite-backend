@@ -149,7 +149,7 @@ func TestMalformedEventRejected(t *testing.T) {
 			"tenant_id": "", // deliberately omit to trigger validation failure
 		})
 		err := c.Handle(ctx, "evt-malformed-001", msg)
-		require.NoError(t, err, "malformed event must not return an error to the caller")
+		require.ErrorIs(t, err, consumer.ErrMalformedEvent, "a malformed event must be reported (so the runner dead-letters it), not silently dropped")
 		assert.Equal(t, 0, s.Count(), "malformed event must not be stored")
 	})
 
@@ -162,7 +162,7 @@ func TestMalformedEventRejected(t *testing.T) {
 			"legal_entity_id": "",
 		})
 		err := c.Handle(ctx, "evt-malformed-002", msg)
-		require.NoError(t, err)
+		require.ErrorIs(t, err, consumer.ErrMalformedEvent, "a malformed event must be reported (so the runner dead-letters it), not silently dropped")
 		assert.Equal(t, 0, s.Count())
 	})
 
@@ -175,7 +175,7 @@ func TestMalformedEventRejected(t *testing.T) {
 			"principal_id": "",
 		})
 		err := c.Handle(ctx, "evt-malformed-003", msg)
-		require.NoError(t, err)
+		require.ErrorIs(t, err, consumer.ErrMalformedEvent, "a malformed event must be reported (so the runner dead-letters it), not silently dropped")
 		assert.Equal(t, 0, s.Count())
 	})
 
@@ -188,7 +188,7 @@ func TestMalformedEventRejected(t *testing.T) {
 			"session_context_id": "",
 		})
 		err := c.Handle(ctx, "evt-malformed-004", msg)
-		require.NoError(t, err)
+		require.ErrorIs(t, err, consumer.ErrMalformedEvent, "a malformed event must be reported (so the runner dead-letters it), not silently dropped")
 		assert.Equal(t, 0, s.Count())
 	})
 
@@ -201,7 +201,7 @@ func TestMalformedEventRejected(t *testing.T) {
 			"correlation_id": "",
 		})
 		err := c.Handle(ctx, "evt-malformed-005", msg)
-		require.NoError(t, err)
+		require.ErrorIs(t, err, consumer.ErrMalformedEvent, "a malformed event must be reported (so the runner dead-letters it), not silently dropped")
 		assert.Equal(t, 0, s.Count())
 	})
 
@@ -211,7 +211,7 @@ func TestMalformedEventRejected(t *testing.T) {
 		ctx := context.Background()
 
 		err := c.Handle(ctx, "evt-malformed-bad-json", []byte(`{not valid json`))
-		require.NoError(t, err, "unparseable JSON must not return error to caller")
+		require.ErrorIs(t, err, consumer.ErrMalformedEvent, "a malformed event must be reported (so the runner dead-letters it), not silently dropped")
 		assert.Equal(t, 0, s.Count())
 	})
 
@@ -222,7 +222,7 @@ func TestMalformedEventRejected(t *testing.T) {
 
 		msg := buildContextResolvedMsg(t, "", nil)
 		err := c.Handle(ctx, "", msg) // empty event_id
-		require.NoError(t, err)
+		require.ErrorIs(t, err, consumer.ErrMalformedEvent, "a malformed event must be reported (so the runner dead-letters it), not silently dropped")
 		assert.Equal(t, 0, s.Count())
 	})
 }
@@ -307,7 +307,7 @@ func TestAuditEngagementEventRejectsScopeMismatch(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	require.NoError(t, c.Handle(context.Background(), "evt-audit-mismatch", msg))
+	require.ErrorIs(t, c.Handle(context.Background(), "evt-audit-mismatch", msg), consumer.ErrMalformedEvent)
 	assert.Equal(t, 0, s.Count())
 }
 
@@ -407,3 +407,126 @@ func TestCorrelationID_FallsBackToPayload(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, "payload-corr-only", stored.CorrelationID)
 }
+
+// ─── Test 7: generic domain event ingestion (AUD-01) ─────────────────────────
+
+// TestGenericDomainEvent_StoredWithEnvelopeContext verifies that arbitrary
+// platform events with standard envelope metadata are ingested and stored.
+func TestGenericDomainEvent_StoredWithEnvelopeContext(t *testing.T) {
+	s := store.NewFakeStore()
+	c := newConsumer(t, s)
+	ctx := context.Background()
+
+	payload := map[string]interface{}{
+		"subscription_id": "sub-100",
+		"plan_id":         "plan-enterprise",
+	}
+	rawPayload, err := json.Marshal(payload)
+	require.NoError(t, err)
+
+	env := map[string]interface{}{
+		"event_type":      "commercial_subscription.created",
+		"emitted_at":      "2026-09-30T12:00:00Z",
+		"schema_version":  "1.0",
+		"source_service":  "commercial-account-svc",
+		"tenant_id":       "tenant-corp",
+		"legal_entity_id": "entity-corp",
+		"actor_id":        "user-cgo",
+		"correlation_id":  "corr-sub-1",
+		"causation_id":    "cause-sub-1",
+		"payload":         json.RawMessage(rawPayload),
+	}
+	msg, err := json.Marshal(env)
+	require.NoError(t, err)
+
+	const eventID = "evt-comm-sub-001"
+	require.NoError(t, c.Handle(ctx, eventID, msg))
+
+	assert.Equal(t, 1, s.Count())
+	stored, ok := s.Get(eventID)
+	require.True(t, ok)
+	assert.Equal(t, "commercial_subscription.created", stored.EventType)
+	assert.Equal(t, "tenant-corp", stored.TenantID)
+	assert.Equal(t, "entity-corp", stored.LegalEntityID)
+	assert.Equal(t, "user-cgo", stored.PrincipalID)
+	assert.Equal(t, "commercial-account-svc", stored.SourceService)
+	assert.Equal(t, "corr-sub-1", stored.CorrelationID)
+	assert.Equal(t, "cause-sub-1", stored.CausationID)
+	assert.NotEmpty(t, stored.PayloadHash)
+	assert.Equal(t, int64(1), stored.SequenceNumber)
+}
+
+// TestGenericDomainEvent_StoredWithPayloadFallbackContext verifies that events
+// carrying scope in payload JSON are extracted if envelope fields are empty.
+func TestGenericDomainEvent_StoredWithPayloadFallbackContext(t *testing.T) {
+	s := store.NewFakeStore()
+	c := newConsumer(t, s)
+	ctx := context.Background()
+
+	payload := map[string]interface{}{
+		"tenant_id":       "tenant-workflow",
+		"legal_entity_id": "entity-workflow",
+		"principal_id":   "actor-wf-1",
+		"correlation_id":  "corr-wf-99",
+		"instance_id":     "wf-inst-123",
+	}
+	rawPayload, err := json.Marshal(payload)
+	require.NoError(t, err)
+
+	env := map[string]interface{}{
+		"event_type":     "workflow.instance.transitioned",
+		"emitted_at":     "2026-09-30T12:05:00Z",
+		"schema_version": "1.0",
+		"source_service": "workflow-svc",
+		"payload":        json.RawMessage(rawPayload),
+	}
+	msg, err := json.Marshal(env)
+	require.NoError(t, err)
+
+	const eventID = "evt-wf-trans-001"
+	require.NoError(t, c.Handle(ctx, eventID, msg))
+
+	stored, ok := s.Get(eventID)
+	require.True(t, ok)
+	assert.Equal(t, "workflow.instance.transitioned", stored.EventType)
+	assert.Equal(t, "tenant-workflow", stored.TenantID)
+	assert.Equal(t, "entity-workflow", stored.LegalEntityID)
+	assert.Equal(t, "actor-wf-1", stored.PrincipalID)
+	assert.Equal(t, "corr-wf-99", stored.CorrelationID)
+}
+
+// TestGenericDomainEvent_PlatformScopeFallback verifies that platform-level events
+// with no tenant default safely to "platform" scope.
+func TestGenericDomainEvent_PlatformScopeFallback(t *testing.T) {
+	s := store.NewFakeStore()
+	c := newConsumer(t, s)
+	ctx := context.Background()
+
+	payload := map[string]interface{}{
+		"feature_code": "payment_gateway",
+	}
+	rawPayload, err := json.Marshal(payload)
+	require.NoError(t, err)
+
+	env := map[string]interface{}{
+		"event_type":     "kill_switch.engaged",
+		"emitted_at":     "2026-09-30T12:10:00Z",
+		"schema_version": "1.0",
+		"source_service": "kill-switch-registry-svc",
+		"actor_id":       "sre-lead",
+		"payload":        json.RawMessage(rawPayload),
+	}
+	msg, err := json.Marshal(env)
+	require.NoError(t, err)
+
+	const eventID = "evt-ks-001"
+	require.NoError(t, c.Handle(ctx, eventID, msg))
+
+	stored, ok := s.Get(eventID)
+	require.True(t, ok)
+	assert.Equal(t, "kill_switch.engaged", stored.EventType)
+	assert.Equal(t, "platform", stored.TenantID)
+	assert.Equal(t, "platform", stored.LegalEntityID)
+	assert.Equal(t, "sre-lead", stored.PrincipalID)
+}
+

@@ -91,9 +91,25 @@ type CredentialStore interface {
 
 // TokenIssuer mints the bearer token /v1/context/resolve accepts.
 type TokenIssuer interface {
-	Issue(subject, tenantID string, mfaDone bool) (string, error)
+	IssueGrant(g domain.TokenGrant) (string, error)
 	TTLSeconds() int
 }
+
+// ClientAuthenticator verifies the OAuth client a login arrives through and
+// returns its id ("" when none was presented and none is required).
+type ClientAuthenticator interface {
+	Authenticate(clientID, secret string) (string, error)
+}
+
+// MFAStatusReader reports whether a principal holds an ACTIVE second factor.
+type MFAStatusReader interface {
+	HasActiveTOTP(ctx context.Context, principalID, tenantID string) (bool, error)
+}
+
+// ErrInvalidClient is a login whose client did not authenticate. 401, but a
+// distinct answer from ErrInvalidCredentials: it says nothing about the
+// account, and an operator fixing a misconfigured console needs to see it.
+var ErrInvalidClient = errors.New("invalid client")
 
 // AuthEventPublisher is the authenticator's slice of the event backbone.
 // Separate from EventPublisher so adding authentication events did not force
@@ -139,9 +155,53 @@ type Authenticator struct {
 	siem        *siem.Client
 	lockout     LockoutPolicy
 
+	// clients verifies the login client (R-1). Nil accepts only logins that
+	// present no client, which is the behaviour before clients existed.
+	clients ClientAuthenticator
+	// startSession records the login session (sid) a token belongs to.
+	startSession func(ctx context.Context, p *domain.Principal, clientID string, amr []string, authTime time.Time) (string, error)
+	// mfa answers mfa_enrolled. Nil reports false.
+	mfa MFAStatusReader
+
 	// wg tracks fire-and-forget event goroutines so Drain can wait on them,
 	// matching Resolver's shutdown contract.
 	wg sync.WaitGroup
+}
+
+// WithClients enables confidential-client authentication at login.
+func (a *Authenticator) WithClients(c ClientAuthenticator) *Authenticator {
+	a.clients = c
+	return a
+}
+
+// WithMFAStatus lets the login response say whether a factor is enrolled.
+// WithLoginSessions makes every login record an auth session (AU-01).
+func (a *Authenticator) WithLoginSessions(start func(ctx context.Context, p *domain.Principal, clientID string, amr []string, authTime time.Time) (string, error)) *Authenticator {
+	a.startSession = start
+	return a
+}
+
+func (a *Authenticator) WithMFAStatus(m MFAStatusReader) *Authenticator {
+	a.mfa = m
+	return a
+}
+
+// authenticateClient returns the verified client id for req.
+func (a *Authenticator) authenticateClient(req domain.AuthenticateRequest) (string, error) {
+	if a.clients == nil {
+		if strings.TrimSpace(req.ClientID) != "" || req.ClientSecret != "" {
+			// A client was presented and nothing can verify it. Refused rather
+			// than ignored, so a console configured for client auth fails
+			// loudly against a service that is not.
+			return "", ErrInvalidClient
+		}
+		return "", nil
+	}
+	id, err := a.clients.Authenticate(req.ClientID, req.ClientSecret)
+	if err != nil {
+		return "", ErrInvalidClient
+	}
+	return id, nil
 }
 
 // NewAuthenticator wires the authentication path.
@@ -181,6 +241,89 @@ func (a *Authenticator) Authenticate(ctx context.Context, req domain.Authenticat
 	if req.TenantID == "" || email == "" || req.Password == "" {
 		return nil, ErrAuthRequestInvalid
 	}
+
+	// The client is checked before the account is touched: a request from an
+	// unauthenticated client is refused without costing the person a lockout
+	// attempt, and without saying anything about the account.
+	clientID, err := a.authenticateClient(req)
+	if err != nil {
+		a.reject(ctx, email, "", req.TenantID, req.CorrelationID, "invalid_client", siem.SeverityMedium)
+		return nil, err
+	}
+
+	principal, err := a.VerifyPassword(ctx, req.TenantID, email, req.Password, req.CorrelationID)
+	if err != nil {
+		return nil, err
+	}
+
+	// The token asserts the IdP subject, not the principal ID: VerifyBearer
+	// hands its sub claim to FindByIDPSubject. MFADone is false: a password
+	// is one factor; the second is proven by POST /v1/authenticate/step-up.
+	authTime := time.Now().UTC()
+	amr := []string{domain.AMRPassword}
+	grant := domain.TokenGrant{
+		Subject:  principal.IdentityProviderSubject,
+		TenantID: principal.TenantID,
+		MFADone:  false,
+		AuthTime: authTime,
+		AMR:      amr,
+		ClientID: clientID,
+	}
+	// Every login is a session that logout can end (AU-01): the internal
+	// route records one too, so its envelopes carry a sid like the OAuth
+	// flow's do.
+	if a.startSession != nil {
+		sid, err := a.startSession(ctx, principal, clientID, amr, authTime)
+		if err != nil {
+			return nil, fmt.Errorf("%w: login session: %v", ErrAuthUnavailable, err)
+		}
+		grant.SID = sid
+	}
+	token, err := a.issuer.IssueGrant(grant)
+	if err != nil {
+		a.log.Error("failed to mint bearer token after successful verification",
+			zap.String("principal_id", principal.PrincipalID),
+			zap.Error(err),
+		)
+		return nil, fmt.Errorf("%w: token issuance: %v", ErrAuthUnavailable, err)
+	}
+
+	// MFARequired stays false: login is password-baseline, and the second
+	// factor is demanded at step-up, before a privileged session. MFAEnrolled
+	// tells the client which of step-up or enrolment to offer. A failed lookup
+	// reports false rather than failing a login that already succeeded.
+	enrolled := false
+	if a.mfa != nil {
+		has, mfaErr := a.mfa.HasActiveTOTP(ctx, principal.PrincipalID, principal.TenantID)
+		if mfaErr != nil {
+			a.log.Warn("could not read mfa enrolment for login response",
+				zap.String("principal_id", principal.PrincipalID), zap.Error(mfaErr))
+		}
+		enrolled = has
+	}
+	return &domain.AuthenticateResponse{
+		AccessToken: token,
+		TokenType:   "Bearer",
+		ExpiresIn:   a.issuer.TTLSeconds(),
+		PrincipalID: principal.PrincipalID,
+		TenantID:    principal.TenantID,
+		MFARequired: false,
+		MFAEnrolled: enrolled,
+		AuthTime:    authTime.Unix(),
+		AMR:         amr,
+	}, nil
+}
+
+// VerifyPassword checks a password for (tenant, email) with the lockout,
+// evidence, events and timing equalisation Authenticate always had, and
+// returns the principal. It mints nothing: the hosted login (internal/oidc)
+// and Authenticate each decide what a verified password leads to.
+func (a *Authenticator) VerifyPassword(ctx context.Context, tenantID, email, password, correlationID string) (*domain.Principal, error) {
+	email = strings.ToLower(strings.TrimSpace(email))
+	if tenantID == "" || email == "" || password == "" {
+		return nil, ErrAuthRequestInvalid
+	}
+	req := domain.AuthenticateRequest{TenantID: tenantID, Email: email, Password: password, CorrelationID: correlationID}
 
 	principal, cred, err := a.credentials.FindActiveCredentialByEmail(ctx, email, req.TenantID)
 	switch {
@@ -308,24 +451,6 @@ func (a *Authenticator) Authenticate(ctx context.Context, req domain.Authenticat
 		return nil, fmt.Errorf("%w: evidence write: %v", ErrAuthUnavailable, err)
 	}
 
-	// The token asserts the IdP subject, not the principal ID: VerifyBearer
-	// hands its sub claim to FindByIDPSubject, which looks up
-	// identity_provider_subject. Sending principal_id here would resolve to
-	// nothing and every login would 401 one step later.
-	//
-	// mfaDone is false unconditionally. A password is one factor, and no
-	// step-up challenge exists anywhere in the estate to have supplied a
-	// second. Passing true would lift the resolved trust posture to
-	// MFA_VERIFIED on the strength of a password alone.
-	token, err := a.issuer.Issue(principal.IdentityProviderSubject, principal.TenantID, false)
-	if err != nil {
-		a.log.Error("failed to mint bearer token after successful verification",
-			zap.String("principal_id", principal.PrincipalID),
-			zap.Error(err),
-		)
-		return nil, fmt.Errorf("%w: token issuance: %v", ErrAuthUnavailable, err)
-	}
-
 	a.wg.Add(1)
 	go func() {
 		defer a.wg.Done()
@@ -347,24 +472,7 @@ func (a *Authenticator) Authenticate(ctx context.Context, req domain.Authenticat
 		zap.String("correlation_id", req.CorrelationID),
 	)
 
-	// MFARequired is false because it is currently true of nothing. No step-up
-	// factor exists anywhere in the estate — mfaDone is passed false above for
-	// that same reason — so a client honouring `true` would prompt for a second
-	// factor it cannot obtain and could never complete a login.
-	//
-	// The field stays in the response rather than being removed: it is the slot
-	// a real factor reports through, and clients already read it. When TOTP or
-	// WebAuthn lands, this becomes a per-principal answer sourced from that
-	// factor's enrolment state, and MFA_VERIFIED trust posture becomes
-	// reachable for the first time.
-	return &domain.AuthenticateResponse{
-		AccessToken: token,
-		TokenType:   "Bearer",
-		ExpiresIn:   a.issuer.TTLSeconds(),
-		PrincipalID: principal.PrincipalID,
-		TenantID:    principal.TenantID,
-		MFARequired: false,
-	}, nil
+	return principal, nil
 }
 
 // SetPassword hashes and stores a password for a principal.
