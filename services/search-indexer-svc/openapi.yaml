@@ -350,6 +350,10 @@ paths:
             application/problem+json:
               schema: { $ref: "#/components/schemas/Problem" }
         "503":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: Recorded, but the index write failed; the verifier will retry
     get:
       tags: [Restrictions]

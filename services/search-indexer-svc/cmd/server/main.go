@@ -339,6 +339,9 @@ func run(log *zap.Logger) error {
 	r.Handle("/metrics", metrics.MetricsHandler(healthH.Readiness, promhttp.Handler()))
 
 	r.Group(func(r chi.Router) {
+		// The vendored envelope middleware answers refusals as legacy JSON; render
+		// them as RFC 9457 problem+json like every other error (ZS-API-001 §12).
+		r.Use(apicontract.EnvelopeRefusals)
 		r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(),
 			func(req *http.Request, e svcenvelope.Envelope, verr *svcenvelope.ValidationError) {
 				log.Warn("canonical input contract violated",

@@ -16,6 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
+	"zoiko.io/identity-envelope/apicontract"
 	"zoiko.io/search-client/searchclient"
 	"zoiko.io/search-indexer-svc/internal/authz"
 	"zoiko.io/search-indexer-svc/internal/domain"
@@ -341,6 +342,7 @@ type harness struct {
 	store   *fakeStore
 	engine  *fakeEngine
 	authz   *stubAuthz
+	t       *testing.T
 }
 
 type stubAuthz struct {
@@ -376,10 +378,12 @@ func newHarness(t *testing.T, az *stubAuthz) *harness {
 	// Strict enforcement, matching the deployed configuration. A test that
 	// ran in write-strict would not exercise the refusals the service
 	// actually performs.
+	// As in main.go: envelope refusals are rendered as problem details.
+	r.Use(apicontract.EnvelopeRefusals)
 	r.Use(envelope.MiddlewareWithMode(envelope.ServicePolicy(), envelope.ModeStrict, nil))
 	h.Routes(r)
 
-	return &harness{router: r, handler: h, store: st, engine: eng, authz: az}
+	return &harness{router: r, handler: h, store: st, engine: eng, authz: az, t: t}
 }
 
 // req builds a fully-enveloped request. Every §4 mandatory field is present,
@@ -409,6 +413,16 @@ func req(t *testing.T, method, path string, body any) *http.Request {
 func do(h *harness, r *http.Request) *httptest.ResponseRecorder {
 	w := httptest.NewRecorder()
 	h.router.ServeHTTP(w, r)
+	// API-2 (ZS-API-001 §12): every refusal any test provokes must be a problem
+	// document with a code, so each negative test also checks the contract.
+	if w.Code >= 400 {
+		h.t.Helper()
+		if ct := w.Header().Get("Content-Type"); ct != apicontract.ContentTypeProblem {
+			h.t.Errorf("%s %s: %d answered as %q, want %s: %s", r.Method, r.URL.Path, w.Code, ct, apicontract.ContentTypeProblem, w.Body.String())
+		} else if !strings.Contains(w.Body.String(), `"code":`) {
+			h.t.Errorf("%s %s: problem has no code: %s", r.Method, r.URL.Path, w.Body.String())
+		}
+	}
 	return w
 }
 
