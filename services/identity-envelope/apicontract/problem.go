@@ -3,6 +3,7 @@ package apicontract
 import (
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"strings"
 )
 
@@ -32,8 +33,10 @@ type Problem struct {
 	RequestID      string         `json:"request_id,omitempty"`
 	CorrelationID  string         `json:"correlation_id,omitempty"`
 	Retryable      bool           `json:"retryable"`
+	RetryAfter     int            `json:"-"`
 	Errors         []FieldError   `json:"errors,omitempty"`
 	CurrentVersion *int64         `json:"current_version,omitempty"`
+	DecisionID     string         `json:"decision_id,omitempty"`
 	Extra          map[string]any `json:"-"`
 }
 
@@ -91,6 +94,12 @@ func WriteProblem(w http.ResponseWriter, r *http.Request, p Problem) {
 	if p.RequestID != "" {
 		h.Set(HeaderRequestID, p.RequestID)
 		h.Set(HeaderLegacyRequestID, p.RequestID)
+	}
+	if p.Retryable && p.RetryAfter > 0 {
+		h.Set("Retry-After", strconv.Itoa(p.RetryAfter))
+	}
+	if p.DecisionID != "" {
+		h.Set("X-Gateway-Decision-Id", p.DecisionID)
 	}
 	w.WriteHeader(p.Status)
 	_ = json.NewEncoder(w).Encode(body)

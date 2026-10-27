@@ -161,11 +161,8 @@ paths:
             X-Auth-Denial-Reason:
               $ref: "#/components/headers/DenialReason"
           content:
-            text/plain:
-              schema: { type: string }
-              examples:
-                noToken: { value: "missing bearer token" }
-                invalid: { value: "invalid token" }
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
         "403":
           description: |
             Verified, and refused anyway. One of `tenant_hostname_mismatch`,
@@ -180,15 +177,8 @@ paths:
             X-Tenant-Context:
               $ref: "#/components/headers/TenantContext"
           content:
-            text/plain:
-              schema: { type: string }
-              examples:
-                spoofing:
-                  value: "token tenant does not match the hostname-resolved tenant"
-                risk:
-                  value: "access denied by continuous risk assessment"
-                tenant:
-                  value: "tenant context denied"
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
         "503":
           description: |
             `tenant_context_unresolved` — the tenant registry could not be
@@ -204,7 +194,8 @@ paths:
             Retry-After:
               schema: { type: string, example: "5" }
           content:
-            text/plain:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
               schema: { type: string }
               example: "tenant context could not be resolved"
 
@@ -273,6 +264,32 @@ components:
         The signed identity envelope minted by identity-context-svc. RS256,
         verified against its JWKS. This service reads tokens; it never mints
         one.
+
+  schemas:
+    Problem:
+      type: object
+      required: [type, title, status, code]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        code: { type: string }
+        request_id: { type: string }
+        correlation_id: { type: string }
+        retryable: { type: boolean }
+        retry_after: { type: integer }
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              pointer: { type: string }
+              code: { type: string }
+              detail: { type: string }
+        current_version: { type: integer, format: int64 }
+        decision_id: { type: string }
 
   parameters:
     Authorization:
