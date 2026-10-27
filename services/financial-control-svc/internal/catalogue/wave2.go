@@ -24,7 +24,7 @@ const (
 	SysBanking = "banking-connector"
 	// SysPaymentRun is payment-run-svc (AP-11), the owner of supplier payment instructions (FIN-CTRL-030).
 	SysPaymentRun = "payment-run"
-	// SysTreasury is treasury-svc: FX rate observations (FIN-CTRL-026) and the bank account master (FIN-CTRL-044).
+	// SysTreasury is treasury-svc: the bank account master (FIN-CTRL-044).
 	SysTreasury = "treasury"
 )
 
@@ -39,6 +39,9 @@ type Wave2Options struct {
 	// FXPairsExpected are currency pairs ("EUR/USD") that MUST have a rate on every business day (FIN-CTRL-026).
 	// Left empty, only pairs that delivered at least one rate in the period are tested, so a dead feed would pass.
 	FXPairsExpected []string `json:"fx_pairs_expected"`
+	// FXRateType is the ledger rate type tested for daily completeness (FIN-CTRL-026); empty means SPOT. Which type
+	// must exist every business day is the entity's decision (a CLOSING rate, for instance, is only needed at period end).
+	FXRateType string `json:"fx_rate_type"`
 	// EffectiveFrom is the date the first rule version takes effect (YYYY-MM-DD).
 	EffectiveFrom string `json:"effective_from"`
 }
@@ -64,6 +67,10 @@ func Wave2(o Wave2Options) ([]domain.CreateControlDefinitionRequest, error) {
 	}
 
 	evidence := j(map[string]any{"retention_class": "FINANCIAL_CONTROL", "retention_years": 7})
+	fxRateType := strings.ToUpper(strings.TrimSpace(o.FXRateType))
+	if fxRateType == "" {
+		fxRateType = "SPOT"
+	}
 	gl := func(codes, normal string) json.RawMessage {
 		return j(map[string]any{"system": SysGL, "population": "account-postings",
 			"params": map[string]string{"account_codes": codes, "normal_balance": normal}})
@@ -137,14 +144,15 @@ func Wave2(o Wave2Options) ([]domain.CreateControlDefinitionRequest, error) {
 				"finding_reason": "UNAPPLIED_CASH_AGED", "finding_assertion": "CLASSIFICATION"}),
 		},
 		{
-			// Run period_id (YYYY-MM) selects the month of rate observations; each expected pair needs a rate on every
-			// business day up to today. Rates are tenant-level and carry no source column, so this tests completeness
-			// of the feed, not its authority.
+			// Reads the LEDGER's own sourced FX rates (the ones revaluation and translation use), not treasury's analytics
+			// rates. Run period_id (YYYY-MM) selects the month; each expected pair needs a rate of the chosen type on every
+			// business day up to today. The rate's source is carried on each record, so a gap can be attributed to a feed.
 			ControlCode: "FIN-CTRL-026", Name: "FX rate source completeness", Domain: "Reference / Accounting",
 			ControlType: "INTERFACE", Assertions: []string{"ACCURACY", "VALUATION"}, RiskTier: "STANDARD",
-			Frequency: "DAILY", OwnerRole: "TREASURY_OWNER", ReviewerRole: "TREASURY_ANALYST",
-			SourceSpec: pop(SysTreasury, "fx-rate-observations"),
-			InitialLogic: j(map[string]any{"kind": "DATE_COVERAGE", "group_attr": "currency_pair",
+			Frequency: "DAILY", OwnerRole: "GL_OWNER", ReviewerRole: "TREASURY_ANALYST",
+			SourceSpec: j(map[string]any{"system": SysGL, "population": "fx-rate-observations",
+				"params": map[string]string{"rate_type": fxRateType}}),
+			InitialLogic: j(map[string]any{"kind": "DATE_COVERAGE", "group_attr": "pair",
 				"skip_weekends": true, "expected_groups": nonNil(o.FXPairsExpected)}),
 		},
 		{

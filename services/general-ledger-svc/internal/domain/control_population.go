@@ -116,6 +116,16 @@ type ClearingBalanceAgingQuery struct {
 	AfterRecordID string
 }
 
+// FXRateObservationsQuery scopes one page of the fx-rate-observations population: the
+// tenant's ledger FX rates of one RateType whose rate_date lies in the calendar month
+// PeriodID (YYYY-MM). Ledger FX rates are tenant-level, not scoped to an entity.
+type FXRateObservationsQuery struct {
+	PeriodID      string
+	RateType      string
+	Limit         int
+	AfterRecordID string
+}
+
 // PostSealEntriesQuery scopes one page of the post-seal-entries population: ledger
 // entries of the entity written after the close watermark of a period that is
 // currently SEALED.

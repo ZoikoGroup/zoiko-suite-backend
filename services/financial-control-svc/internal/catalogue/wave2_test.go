@@ -47,6 +47,31 @@ func TestWave2_NineControlsAllValidAndExecutable(t *testing.T) {
 	}
 }
 
+func TestWave2_FXRateCompletenessReadsTheLedgerRatesOfTheConfiguredType(t *testing.T) {
+	spec := func(o Wave2Options) source.Spec {
+		defs, err := Wave2(o)
+		require.NoError(t, err)
+		for _, d := range defs {
+			if d.ControlCode == "FIN-CTRL-026" {
+				s, err := source.ParseSpec(d.SourceSpec)
+				require.NoError(t, err)
+				return s
+			}
+		}
+		t.Fatal("FIN-CTRL-026 missing")
+		return source.Spec{}
+	}
+	s := spec(opts)
+	assert.Equal(t, SysGL, s.System)
+	assert.Equal(t, "fx-rate-observations", s.Population)
+	assert.Equal(t, "SPOT", s.Params["rate_type"], "the default rate type")
+	assert.False(t, s.NoPeriod, "the month under test is the run's period")
+
+	o := opts
+	o.FXRateType = " closing "
+	assert.Equal(t, "CLOSING", spec(o).Params["rate_type"], "normalized to the ledger's upper-case type")
+}
+
 func TestWave2_KeyControlsAreCloseGatingWithSeparateCertifier(t *testing.T) {
 	m := byCode(t)
 	for _, code := range []string{"FIN-CTRL-001", "FIN-CTRL-002", "FIN-CTRL-003"} {

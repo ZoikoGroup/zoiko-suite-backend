@@ -255,16 +255,18 @@ func TestWave2_FXRateCompleteness_MissingBusinessDayAndDeadPair(t *testing.T) {
 			continue
 		}
 		ds := day.Format("2006-01-02")
-		recs = append(recs, attrs(recAt(fmt.Sprintf("f%d", d), "EUR/USD", "1.08000000", ds), "currency_pair", "EUR/USD"))
+		recs = append(recs, attrs(recAt(fmt.Sprintf("f%d", d), "EUR/USD", "1.08000000", ds), "pair", "EUR/USD", "rate_type", "SPOT", "source", "ECB"))
 	}
-	w.src.set(catalogue.SysTreasury, "fx-rate-observations", "wm", recs...)
+	w.src.set(catalogue.SysGL, "fx-rate-observations", "wm", recs...)
 	run, final := w.run("FIN-CTRL-026", nil)
 	assert.Equal(t, domain.ResultFail, final.ResultState)
 	list, err := testStore.ListExceptions(ctx, w.tenant, run.RunID, store.ListExceptionsFilter{})
 	require.NoError(t, err)
 	require.Len(t, list, 1)
 	assert.Equal(t, []string{"gap:EUR/USD:2026-09-16..2026-09-16"}, list[0].RecordIDs)
-	assert.Equal(t, "2026-09", w.src.lastQuery(catalogue.SysTreasury).Get("period_id"), "the month under test is sent to the source")
+	q := w.src.lastQuery(catalogue.SysGL)
+	assert.Equal(t, "2026-09", q.Get("period_id"), "the month under test is sent to the source")
+	assert.Equal(t, "SPOT", q.Get("rate_type"), "the rate type defaults to SPOT")
 
 	// A pair listed in fx_pairs_expected that delivered nothing cannot pass: the catalogue definition built with a
 	// pair list names it, so it is covered even when the whole feed is dead.
@@ -278,7 +280,7 @@ func TestWave2_FXRateCompleteness_MissingBusinessDayAndDeadPair(t *testing.T) {
 		l, err := domain.ParseRuleLogic(d.InitialLogic)
 		require.NoError(t, err)
 		assert.Equal(t, []string{"EUR/USD", "GBP/USD"}, l.ExpectedGroups)
-		assert.Equal(t, "currency_pair", l.GroupAttr)
+		assert.Equal(t, "pair", l.GroupAttr)
 	}
 }
 
