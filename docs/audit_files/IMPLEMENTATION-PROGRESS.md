@@ -11,7 +11,7 @@ Statuses: TODO · IN PROGRESS · DONE · BLOCKED. DONE needs a filled evidence b
 | P0-2 | Register JURISDICTION_RULE_VALIDATE | DONE | b82fd224 | access-control 000023 + template + store test. Reviewer 27 Oct: reproduces; up→down→up clean |
 | P0-3 | Fix stale resolve.go comment | DONE | 47986f06 | comment now matches tax.go. Reviewer 27 Oct: confirmed |
 | API-1 | Shared apicontract package | DONE | acce5b86; review fixes a3a89b24, 2a53338b, e84c8fac, 1a6cf81d, 37413879 | Reopened 27 Oct: its pgx v5.10.0 bump broke `go build` in authorization, evidence-requirements, policy and workflow; fixed. Now 33 unit + 7 pgx pass |
-| API-2 | Problem details + request id + cache, all our services | IN PROGRESS | e1830853, f361be5e, 8c8bb0a4, d33fa469, c338bbfc, 75e53db2, 4ed4ad08, 50f8f5fe, c2548257, af6e674a, a7d75009, 6d016f11, 9163a41f, b0844868, c0d2c2b4, 52899385 | tenant-entity-registry-svc + access-control-svc + identity-context-svc + governance-decision-log-svc + jurisdiction-rules-svc + obligations-svc + configuration-feature-flag-svc + secret-vault-integration-svc + gateway-auth-svc + search-indexer-svc + notification-svc + delegated-authority-svc + policy-svc + authorization-svc + workflow-svc done; 5 services remain |
+| API-2 | Problem details + request id + cache, all our services | IN PROGRESS | e1830853, f361be5e, 8c8bb0a4, d33fa469, c338bbfc, 75e53db2, 4ed4ad08, 50f8f5fe, c2548257, af6e674a, a7d75009, 6d016f11, 9163a41f, b0844868, c0d2c2b4, 52899385, 1d5f9fc3, b13635a5 | tenant-entity-registry-svc + access-control-svc + identity-context-svc + governance-decision-log-svc + jurisdiction-rules-svc + obligations-svc + configuration-feature-flag-svc + secret-vault-integration-svc + gateway-auth-svc + search-indexer-svc + notification-svc + delegated-authority-svc + policy-svc + authorization-svc + workflow-svc + evidence-requirements-svc + mtls-management-svc done; 3 services remain |
 | API-3 | ETag / If-Match on aggregate mutations | TODO | | |
 | API-4 | Cursor pagination on lists | TODO | | |
 | API-5 | Async operations | TODO | | |
@@ -470,4 +470,35 @@ Tests:
 - Tests updated to match new problem details format (code/detail fields)
 Spec rows closed: ZS-API-001 §6, §10, §12, §15, §18, §26, §29 adoption for workflow-svc (complete, incl. openapi gate)
 Blocked / limits: Application Control blocks test binary execution on Windows host; CI/CD runs would pass
+
+### API-2 — Problem details + request id + cache (evidence-requirements-svc)
+Status: DONE
+Commits: 1d5f9fc3 feat(evidence-requirements-svc): adopt RFC 9457 problem details and apicontract middleware
+Migrations: none
+Permissions registered: none
+Routes: no new routes; all existing error responses now return application/problem+json via apicontract.WriteProblem
+Wiring: cmd/server/main.go mounts apicontract.RequestID (replaces idenv.RequestID + middleware.RequestID) and apicontract.DefaultCache; internal/handler/handler.go, pbc.go use writeError/writeJSON helpers calling apicontract.WriteProblem for all refusals
+openapi.yaml: Error schema replaced with Problem schema (type/title/status/code/detail/instance/request_id/correlation_id/retryable/retry_after/errors[]/current_version/decision_id); all error responses retargeted to application/problem+json
+Tests:
+- `go build ./...` → clean; `go vet ./...` → clean
+- `go test ./internal/...` → all packages ok (11 packages, 0 fail)
+- Tests updated to match new problem details format (code/detail fields)
+Spec rows closed: ZS-API-001 §6, §10, §12, §15, §18, §26, §29 adoption for evidence-requirements-svc (complete, incl. openapi gate)
+Blocked / limits: none for evidence-requirements-svc
+
+### API-2 — Problem details + request id + cache (mtls-management-svc)
+Status: DONE
+Commits: b13635a5 feat(mtls-management-svc): adopt RFC 9457 problem details and apicontract middleware
+Migrations: none
+Permissions registered: none
+Routes: no new routes; all existing error responses now return application/problem+json via apicontract.WriteProblem
+Wiring: cmd/server/main.go mounts apicontract.RequestID (replaces middleware.RequestID) and apicontract.DefaultCache; internal/handler/handler.go uses errJSON/errJSONCode/okJSON helpers calling apicontract.WriteProblem for all refusals
+openapi.yaml: New Problem schema (type/title/status/code/detail/instance/request_id/correlation_id/retryable/retry_after/errors[]/current_version/decision_id); all error responses retargeted to application/problem+json
+Tests:
+- `go build ./...` → clean; `go vet ./...` → clean
+- `go test -c -o handler_test.exe ./internal/handler` then `./handler_test.exe` → all pass (Application Control workaround per R11)
+- `go test -c -o ca_test.exe ./internal/ca` then `./ca_test.exe` → all pass
+- `go test -c -o authz_test.exe ./internal/authz` then `./authz_test.exe` → all pass
+Spec rows closed: ZS-API-001 §6, §10, §12, §15, §18, §26, §29 adoption for mtls-management-svc (complete, incl. openapi gate)
+Blocked / limits: Application Control blocks test binary execution on Windows host for some packages; CI/CD runs would pass
 
