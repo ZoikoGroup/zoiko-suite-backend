@@ -19,3 +19,5 @@
   - Status enum: Doc 05 status enum is master; Doc 01/02/03 answer classes and abstention codes map onto it.
 - Consequences: Deterministic behavior now; must be revisited on approval.
 - Dev defaults: As listed above.
+
+- Config extension (STEP 13 prep): `GET /config` adds `citation_links` [{url_key, url, title}] so the widget can link citations. URLs come only from the signed release's source registry (allowlisted HTTPS origins), never from model output; Doc 05 §15 does not list this field. Approver: Backend Lead.

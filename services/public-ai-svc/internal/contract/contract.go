@@ -122,7 +122,11 @@ type ConfigResponse struct {
 	SupportedLocales     []string      `json:"supported_locales"`
 	MarketChoices        []string      `json:"market_choices"`
 	PublicRoutes         []PublicRoute `json:"public_routes"`
-	PrivacyNoticeKey     string        `json:"privacy_notice_key"`
+	// CitationLinks resolves a citation url_key to the approved public page
+	// it came from (server-side resolution, Doc 06 §10). Extension of Doc 05
+	// §15 recorded in ADR-005.
+	CitationLinks    []CitationLink `json:"citation_links"`
+	PrivacyNoticeKey string         `json:"privacy_notice_key"`
 }
 
 // FieldError is a 422 validation failure (safe to show publicly).
@@ -236,4 +240,11 @@ func (e *Envelope) Validate() error {
 type PublicRoute struct {
 	RouteKey string `json:"route_key"`
 	URL      string `json:"url"`
+}
+
+// CitationLink maps a citation url_key to an approved, allowlisted HTTPS page.
+type CitationLink struct {
+	URLKey string `json:"url_key"`
+	URL    string `json:"url"`
+	Title  string `json:"title"`
 }

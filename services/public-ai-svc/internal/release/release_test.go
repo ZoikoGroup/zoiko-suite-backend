@@ -267,6 +267,17 @@ func TestTrialRouteGatedByClaim(t *testing.T) {
 		t.Fatal("javascript: route must never exist")
 	}
 	cfg := e.rt.PublicConfig()
+	for _, l := range cfg.CitationLinks {
+		if !strings.HasPrefix(l.URL, "https://example.invalid/") || l.URLKey == "" {
+			t.Fatalf("citation link not from an approved source: %+v", l)
+		}
+		if l.URLKey == "internal-payroll" || l.URLKey == "release-notes" {
+			t.Fatalf("quarantined source exposed as a citation link: %+v", l)
+		}
+	}
+	if len(cfg.CitationLinks) == 0 {
+		t.Fatal("citation links missing")
+	}
 	if cfg.ConfigRevision == "" || len(cfg.MarketChoices) != 2 {
 		t.Fatalf("config: %+v", cfg)
 	}

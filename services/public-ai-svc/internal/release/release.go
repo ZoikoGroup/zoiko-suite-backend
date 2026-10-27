@@ -264,6 +264,7 @@ func (r *Runtime) PublicConfig() contract.ConfigResponse {
 		SupportedLocales:     []string{"en-US"},
 		MarketChoices:        []string{},
 		PublicRoutes:         []contract.PublicRoute{},
+		CitationLinks:        []contract.CitationLink{},
 		PrivacyNoticeKey:     "privacy-notice-pending-dpo",
 	}
 	f := false
@@ -287,6 +288,7 @@ func (r *Runtime) PublicConfig() contract.ConfigResponse {
 		cfg.PublicRoutes = append(cfg.PublicRoutes, contract.PublicRoute{RouteKey: rt.RouteKey, URL: rt.URL})
 	}
 	sort.Slice(cfg.PublicRoutes, func(i, j int) bool { return cfg.PublicRoutes[i].RouteKey < cfg.PublicRoutes[j].RouteKey })
+	cfg.CitationLinks = snap.KB.CitationLinks()
 	return cfg
 }
 

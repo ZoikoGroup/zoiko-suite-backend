@@ -101,7 +101,7 @@ components:
             requires_human: {type: boolean}
     ConfigResponse:
       type: object
-      required: [config_revision, assistant_display_name, capabilities, supported_locales, market_choices, public_routes, privacy_notice_key]
+      required: [config_revision, assistant_display_name, capabilities, supported_locales, market_choices, public_routes, citation_links, privacy_notice_key]
       properties:
         config_revision: {type: string}
         assistant_display_name: {type: string}
@@ -117,6 +117,16 @@ components:
             properties:
               route_key: {type: string}
               url: {type: string, format: uri}
+        citation_links:
+          type: array
+          description: Resolves a citation url_key to the approved public page (server-side).
+          items:
+            type: object
+            required: [url_key, url, title]
+            properties:
+              url_key: {type: string}
+              url: {type: string, format: uri}
+              title: {type: string}
         privacy_notice_key: {type: string}
     Problem:
       type: object

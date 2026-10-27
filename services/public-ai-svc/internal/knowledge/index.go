@@ -6,6 +6,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"zoiko.io/public-ai-svc/internal/contract"
 )
 
 // Answerability (Doc 05 §18). The model can never override BLOCKED.
@@ -121,6 +123,23 @@ func (x *Index) ReleaseID() string { return x.releaseID }
 func (x *Index) Source(sourceVersionID string) (Source, bool) {
 	s, ok := x.sources[sourceVersionID]
 	return s, ok
+}
+
+// CitationLinks returns one approved page per url_key, from the release's
+// source registry (origin_uri was checked against allowed_hosts at ingest).
+func (x *Index) CitationLinks() []contract.CitationLink {
+	seen := map[string]bool{}
+	out := []contract.CitationLink{}
+	for _, c := range x.chunks {
+		s, ok := x.sources[c.SourceVersionID]
+		if !ok || seen[s.URLKey] {
+			continue
+		}
+		seen[s.URLKey] = true
+		out = append(out, contract.CitationLink{URLKey: s.URLKey, URL: s.OriginURI, Title: s.Title})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].URLKey < out[j].URLKey })
+	return out
 }
 
 // Revocations is the set of revoked source ids / source version ids.
