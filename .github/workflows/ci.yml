@@ -1,19 +1,19 @@
-﻿name: CI
+name: CI
 
 # push on "main" catches direct pushes (rare, but not every change goes
-# through a PR â€” e.g. an emergency hotfix). Feature branches are covered by
+# through a PR — e.g. an emergency hotfix). Feature branches are covered by
 # pull_request instead of push: once a PR exists, push+pull_request on the
 # same branch would run this entire ~25-service matrix twice for the
 # identical commit, doubling compute cost and doubling exposure to any
 # transient flake (this already caused a false-negative on PR #58's
 # embedded-postgres download step). The concurrency group below is a second
-# layer of protection â€” if anything still fires twice for the same ref, the
+# layer of protection — if anything still fires twice for the same ref, the
 # older run is cancelled rather than both racing to completion.
 on:
   push:
-    branches: [public-ai-svc, "main"]
+    branches: ["main"]
   pull_request:
-    branches: [public-ai-svc, "main"]
+    branches: ["main"]
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -24,9 +24,9 @@ defaults:
     shell: bash
 
 jobs:
-  # â”€â”€â”€ Go services â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  # ─── Go services ─────────────────────────────────────────────────────────────
   go-services:
-    name: "${{ matrix.service }} â€” build Â· vet Â· test"
+    name: "${{ matrix.service }} — build · vet · test"
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -68,7 +68,7 @@ jobs:
           - retention-registry-svc
           # These four were in compose and in Traefik but absent from this
           # matrix, so nothing had ever built, vetted or tested them on any PR
-          # â€” despite all four being wired to live console pages.
+          # — despite all four being wired to live console pages.
           - spend-controls-svc
           - vendor-due-diligence-svc
           - delegated-authority-svc
@@ -116,7 +116,7 @@ jobs:
           - org-structure-svc
           - offboarding-severance-svc
           - workforce-compliance-svc
-          # â”€â”€ Phase 5 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+          # ── Phase 5 ────────────────────────────────────
           - contract-lifecycle-svc
           - clause-template-svc
           - obligation-tracking-svc
@@ -128,6 +128,8 @@ jobs:
           - vat-gst-svc
           - corporate-tax-svc
           - evidence-requirements-svc
+          # Suivo public chatbot (R0). Store tests use the database service below.
+          - public-ai-svc
 
     steps:
       - name: Checkout
@@ -142,7 +144,7 @@ jobs:
           cache-dependency-path: services/${{ matrix.service }}/go.sum
 
       # go.sum MUST exist in the repo and be current.
-      # If it is missing or stale this step will fail â€” which is the
+      # If it is missing or stale this step will fail — which is the
       # correct behavior: a missing go.sum means CI was not verifying
       # the module graph integrity.
       - name: Verify module graph (go mod verify)
@@ -160,25 +162,25 @@ jobs:
       - name: Test (with race detector)
         working-directory: services/${{ matrix.service }}
         env:
-          TEST_DATABASE_URL: ${{ (matrix.service == 'eventing' || matrix.service == 'jurisdiction-rules-svc' || matrix.service == 'identity-context-svc' || matrix.service == 'governance-decision-log-svc' || matrix.service == 'tenant-entity-registry-svc' || matrix.service == 'policy-svc' || matrix.service == 'configuration-feature-flag-svc' || matrix.service == 'obligations-svc' || matrix.service == 'secret-vault-integration-svc' || matrix.service == 'authorization-svc' || matrix.service == 'workflow-svc' || matrix.service == 'schema-registry-svc' || matrix.service == 'document-vault-svc' || matrix.service == 'evidence-manifest-svc' || matrix.service == 'spend-controls-svc' || matrix.service == 'vendor-due-diligence-svc' || matrix.service == 'notification-svc' || matrix.service == 'general-ledger-svc' || matrix.service == 'accounts-payable-svc' || matrix.service == 'accounts-receivable-svc' || matrix.service == 'purchase-request-svc' || matrix.service == 'purchase-order-svc' || matrix.service == 'treasury-svc' || matrix.service == 'financial-close-svc' || matrix.service == 'bank-reconciliation-svc' || matrix.service == 'intercompany-accounting-svc' || matrix.service == 'consolidation-svc' || matrix.service == 'invoice-approval-svc' || matrix.service == 'employee-master-svc' || matrix.service == 'employment-contracts-svc' || matrix.service == 'payroll-run-svc' || matrix.service == 'compensation-svc' || matrix.service == 'benefits-svc' || matrix.service == 'payroll-tax-svc' || matrix.service == 'payroll-exceptions-svc' || matrix.service == 'leave-absence-svc' || matrix.service == 'org-structure-svc' || matrix.service == 'offboarding-severance-svc' || matrix.service == 'workforce-compliance-svc' || matrix.service == 'contract-lifecycle-svc' || matrix.service == 'clause-template-svc' || matrix.service == 'obligation-tracking-svc' || matrix.service == 'board-resolutions-svc' || matrix.service == 'corporate-actions-svc' || matrix.service == 'counterparty-management-svc' || matrix.service == 'tax-rules-svc' || matrix.service == 'tax-determination-svc' || matrix.service == 'vat-gst-svc' || matrix.service == 'corporate-tax-svc' || matrix.service == 'delegated-authority-svc' || matrix.service == 'connectivity-api-bridge-svc' || matrix.service == 'data-ingestion-svc') &&'postgres://postgres:secretpassword@localhost:5432/testdb?sslmode=disable' || '' }}
+          TEST_DATABASE_URL: ${{ (matrix.service == 'eventing' || matrix.service == 'jurisdiction-rules-svc' || matrix.service == 'identity-context-svc' || matrix.service == 'governance-decision-log-svc' || matrix.service == 'tenant-entity-registry-svc' || matrix.service == 'policy-svc' || matrix.service == 'configuration-feature-flag-svc' || matrix.service == 'obligations-svc' || matrix.service == 'secret-vault-integration-svc' || matrix.service == 'authorization-svc' || matrix.service == 'workflow-svc' || matrix.service == 'schema-registry-svc' || matrix.service == 'document-vault-svc' || matrix.service == 'evidence-manifest-svc' || matrix.service == 'spend-controls-svc' || matrix.service == 'vendor-due-diligence-svc' || matrix.service == 'notification-svc' || matrix.service == 'general-ledger-svc' || matrix.service == 'accounts-payable-svc' || matrix.service == 'accounts-receivable-svc' || matrix.service == 'purchase-request-svc' || matrix.service == 'purchase-order-svc' || matrix.service == 'treasury-svc' || matrix.service == 'financial-close-svc' || matrix.service == 'bank-reconciliation-svc' || matrix.service == 'intercompany-accounting-svc' || matrix.service == 'consolidation-svc' || matrix.service == 'invoice-approval-svc' || matrix.service == 'employee-master-svc' || matrix.service == 'employment-contracts-svc' || matrix.service == 'payroll-run-svc' || matrix.service == 'compensation-svc' || matrix.service == 'benefits-svc' || matrix.service == 'payroll-tax-svc' || matrix.service == 'payroll-exceptions-svc' || matrix.service == 'leave-absence-svc' || matrix.service == 'org-structure-svc' || matrix.service == 'offboarding-severance-svc' || matrix.service == 'workforce-compliance-svc' || matrix.service == 'contract-lifecycle-svc' || matrix.service == 'clause-template-svc' || matrix.service == 'obligation-tracking-svc' || matrix.service == 'board-resolutions-svc' || matrix.service == 'corporate-actions-svc' || matrix.service == 'counterparty-management-svc' || matrix.service == 'tax-rules-svc' || matrix.service == 'tax-determination-svc' || matrix.service == 'vat-gst-svc' || matrix.service == 'corporate-tax-svc' || matrix.service == 'delegated-authority-svc' || matrix.service == 'connectivity-api-bridge-svc' || matrix.service == 'data-ingestion-svc' || matrix.service == 'public-ai-svc') &&'postgres://postgres:secretpassword@localhost:5432/testdb?sslmode=disable' || '' }}
 
         # go list ./... pre-enumerates packages, excluding the bare module
         # root which has no .go files (verified: this causes "no Go files
         # in root directory" only with `go test -list=...`, not with plain
         # ./... or with -race). Whether ./... alone has any failure mode on
         # the GitHub Actions Ubuntu runner under -race has not been directly
-        # observed â€” this enumeration approach is used regardless because it
+        # observed — this enumeration approach is used regardless because it
         # removes that ambiguity entirely rather than relying on ./...'s
         # implicit skip behavior.
         run: |
           pkgs=$(go list ./... 2>/dev/null | tr '\n' ' ')
-          if [public-ai-svc,  -n "$pkgs" ]; then
+          if [ -n "$pkgs" ]; then
             go test -race -v -count=1 -timeout=600s $pkgs
           else
             echo "No packages to test"
           fi
 
-      - name: Integration test â€” health probes with embedded Postgres
+      - name: Integration test — health probes with embedded Postgres
         if: matrix.service == 'audit-event-store-svc' || matrix.service == 'workflow-history-svc'
         working-directory: services/${{ matrix.service }}
         # Uses embedded-postgres (downloads real Postgres binaries automatically).
@@ -186,7 +188,7 @@ jobs:
         # Proves /healthz and /readyz return 200 against a real DB.
         run: go test -v -tags=integration -count=1 -timeout=600s ./cmd/server/
 
-      - name: Integration test â€” store isolation/pipeline (PgStore â†’ DB)
+      - name: Integration test — store isolation/pipeline (PgStore → DB)
         if: matrix.service == 'access-control-svc' || matrix.service == 'workflow-history-svc' || matrix.service == 'tenant-entity-registry-svc' || matrix.service == 'accounts-receivable-svc' || matrix.service == 'purchase-request-svc' || matrix.service == 'purchase-order-svc' || matrix.service == 'treasury-svc' || matrix.service == 'financial-close-svc' || matrix.service == 'bank-reconciliation-svc' || matrix.service == 'intercompany-accounting-svc' || matrix.service == 'consolidation-svc' || matrix.service == 'invoice-approval-svc' || matrix.service == 'employee-master-svc' || matrix.service == 'employment-contracts-svc' || matrix.service == 'payroll-run-svc' || matrix.service == 'compensation-svc' || matrix.service == 'benefits-svc' || matrix.service == 'payroll-tax-svc' || matrix.service == 'payroll-exceptions-svc' || matrix.service == 'leave-absence-svc' || matrix.service == 'org-structure-svc' || matrix.service == 'offboarding-severance-svc' || matrix.service == 'workforce-compliance-svc' || matrix.service == 'evidence-requirements-svc' || matrix.service == 'payment-initiation-adapter-svc' || matrix.service == 'payment-status-svc' || matrix.service == 'tax-authority-interface-svc'
         working-directory: services/${{ matrix.service }}
         env:
@@ -196,7 +198,7 @@ jobs:
           timeout=60
           while ! pg_isready -U postgres -d testdb -h localhost -p 5432 >/dev/null 2>&1; do
             timeout=$((timeout-1))
-            if [public-ai-svc,  $timeout -le 0 ]; then
+            if [ $timeout -le 0 ]; then
               echo "Postgres did not become ready in time"
               exit 1
             fi
@@ -206,12 +208,12 @@ jobs:
           go test -v -tags=integration -count=1 -timeout=600s ./internal/store/
 
 
-  # â”€â”€â”€ INT certification (ZS-SVC-M-001) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  # ─── INT certification (ZS-SVC-M-001) ────────────────────────────────────────
   # The ledger is checked against the tree on every change (a cited test that is renamed or deleted fails here), and
   # intcert then executes every cited test and publishes the certificate. It reports only while items remain open
   # (PARTIAL, or a deviation nobody accepted); remove --report-only once the ledger has nothing open.
   int-certification:
-    name: "INT certification â€” ledger Â· cited tests Â· certificate"
+    name: "INT certification — ledger · cited tests · certificate"
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -254,5 +256,3 @@ jobs:
           name: int-certificate
           path: services/_certification/certificate.json
           if-no-files-found: ignore
-
-

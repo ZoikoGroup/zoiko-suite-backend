@@ -1,0 +1,11 @@
+openapi: 3.1.0
+info:
+  title: ZoikoSuite public AI assistant API (zoikosuite-public-ai)
+  version: "1.0"
+  description: Public anonymous API for Release R0. Filled in by STEP 3/4.
+paths:
+  /public-ai/v1/health/public:
+    get:
+      responses:
+        "200": {description: Service available}
+        "503": {description: Service unavailable}
