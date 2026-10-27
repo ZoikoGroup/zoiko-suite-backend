@@ -52,6 +52,9 @@ func New(h *handler.Handler, jwksClient *jwks.Client, metrics *telemetry.Metrics
 	// /verify is exempt, declared in the generated ServicePolicy. It is the
 	// endpoint that establishes tenant and actor from the signed token, so it
 	// cannot also demand them as input — see EXEMPT_PATHS in rollout.sh.
+	// The vendored middleware answers refusals as legacy JSON; render them as
+	// RFC 9457 problem+json like every other refusal here.
+	r.Use(apicontract.EnvelopeRefusals)
 	r.Use(envelope.Middleware(envelope.ServicePolicy(), envelope.DefaultReporter()))
 
 	r.Get("/healthz", health.Liveness)

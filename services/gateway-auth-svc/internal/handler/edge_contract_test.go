@@ -100,7 +100,6 @@ func compiledAuthResponseHeaders(t *testing.T) map[string]bool {
 // and the check compared nothing on every tenant host. And with
 // trustForwardHeader on, a client's X-Forwarded-Method reaches Verify.
 func TestEdgeContract_ResolvedTenantReachesVerify(t *testing.T) {
-	t.Skip("requires deployments directory accessible from test working directory")
 	raw, err := os.ReadFile(compiledGTRMPath)
 	require.NoError(t, err)
 	lines := strings.Split(strings.ReplaceAll(string(raw), "\r\n", "\n"), "\n")
@@ -151,7 +150,6 @@ func canonicalSet(names []string) map[string]bool {
 }
 
 func TestEdgeContract_ForwardAuthListsMatchVerify(t *testing.T) {
-	t.Skip("requires deployments directory accessible from test working directory")
 	lists := map[string]map[string]bool{
 		"docker-compose.yml":   composeAuthResponseHeaders(t),
 		"compiled-traefik.yml": compiledAuthResponseHeaders(t),

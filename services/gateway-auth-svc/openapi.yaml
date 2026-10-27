@@ -196,8 +196,6 @@ paths:
           content:
             application/problem+json:
               schema: { $ref: "#/components/schemas/Problem" }
-              schema: { type: string }
-              example: "tenant context could not be resolved"
 
   /healthz:
     get:
@@ -279,7 +277,6 @@ components:
         request_id: { type: string }
         correlation_id: { type: string }
         retryable: { type: boolean }
-        retry_after: { type: integer }
         errors:
           type: array
           items:
