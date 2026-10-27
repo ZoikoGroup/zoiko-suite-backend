@@ -190,11 +190,10 @@ func (h *Handler) InvalidateTenantContext(w http.ResponseWriter, r *http.Request
 		// caller who assumed otherwise would re-run a command that logs
 		// everybody out twice.
 		if resp != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error":            "tenant invalidation incomplete",
-				"error_code":       domain.ErrCodeUpstreamUnavailable,
-				"sessions_revoked": resp.SessionsRevoked,
-			})
+			p := apicontract.ProblemFor(http.StatusInternalServerError, domain.ErrCodeUpstreamUnavailable,
+				"tenant invalidation incomplete")
+			p.Extra = map[string]any{"sessions_revoked": resp.SessionsRevoked}
+			apicontract.WriteProblem(w, r, p)
 			return
 		}
 		writeCoded(w, r, http.StatusInternalServerError, domain.ErrCodeUpstreamUnavailable,

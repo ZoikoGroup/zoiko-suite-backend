@@ -521,6 +521,9 @@ func main() {
 	// The OAuth/OIDC protocol endpoints are called by browsers and OAuth
 	// clients speaking RFC 6749; they carry no §4 envelope by design.
 	envelopePolicy.Exempt = protocolExempt(envelopePolicy.ExemptPaths)
+	// The vendored envelope middleware answers refusals as legacy JSON; render
+	// them as RFC 9457 problem+json like every other error (ZS-API-001 §12).
+	r.Use(apicontract.EnvelopeRefusals)
 	r.Use(svcenvelope.Middleware(envelopePolicy, svcenvelope.DefaultReporter()))
 
 	// Replay protection, AFTER the envelope contract.
