@@ -24,6 +24,8 @@ const (
 	SysBanking = "banking-connector"
 	// SysPaymentRun is payment-run-svc (AP-11), the owner of supplier payment instructions (FIN-CTRL-030).
 	SysPaymentRun = "payment-run"
+	// SysTreasury is treasury-svc: FX rate observations (FIN-CTRL-026) and the bank account master (FIN-CTRL-044).
+	SysTreasury = "treasury"
 )
 
 // Wave2Options carries the entity-specific inputs a definition cannot guess.
@@ -34,6 +36,9 @@ type Wave2Options struct {
 	CashAccounts      string `json:"cash_accounts"`
 	// BankAccountsExpected are accounts that MUST deliver a statement every day (FIN-CTRL-032).
 	BankAccountsExpected []string `json:"bank_accounts_expected"`
+	// FXPairsExpected are currency pairs ("EUR/USD") that MUST have a rate on every business day (FIN-CTRL-026).
+	// Left empty, only pairs that delivered at least one rate in the period are tested, so a dead feed would pass.
+	FXPairsExpected []string `json:"fx_pairs_expected"`
 	// EffectiveFrom is the date the first rule version takes effect (YYYY-MM-DD).
 	EffectiveFrom string `json:"effective_from"`
 }
@@ -130,6 +135,17 @@ func Wave2(o Wave2Options) ([]domain.CreateControlDefinitionRequest, error) {
 				"params": map[string]string{"unapplied_before": "${scope.unapplied_before}"}}),
 			InitialLogic: j(map[string]any{"kind": "EXCEPTION_SCAN", "finding_category": "CLASSIFICATION",
 				"finding_reason": "UNAPPLIED_CASH_AGED", "finding_assertion": "CLASSIFICATION"}),
+		},
+		{
+			// Run period_id (YYYY-MM) selects the month of rate observations; each expected pair needs a rate on every
+			// business day up to today. Rates are tenant-level and carry no source column, so this tests completeness
+			// of the feed, not its authority.
+			ControlCode: "FIN-CTRL-026", Name: "FX rate source completeness", Domain: "Reference / Accounting",
+			ControlType: "INTERFACE", Assertions: []string{"ACCURACY", "VALUATION"}, RiskTier: "STANDARD",
+			Frequency: "DAILY", OwnerRole: "TREASURY_OWNER", ReviewerRole: "TREASURY_ANALYST",
+			SourceSpec: pop(SysTreasury, "fx-rate-observations"),
+			InitialLogic: j(map[string]any{"kind": "DATE_COVERAGE", "group_attr": "currency_pair",
+				"skip_weekends": true, "expected_groups": nonNil(o.FXPairsExpected)}),
 		},
 		{
 			// Same per-run cut-off as FIN-CTRL-029: {"unapplied_before": "YYYY-MM-DD"}.

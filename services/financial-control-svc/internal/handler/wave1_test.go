@@ -273,7 +273,7 @@ func TestSeedCatalogue(t *testing.T) {
 		Controls []struct{ ControlCode, Status string } `json:"controls"`
 	}
 	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &got))
-	require.Len(t, got.Controls, 8)
+	require.Len(t, got.Controls, 9)
 	assert.Equal(t, "created", got.Controls[0].Status)
 	assert.Equal(t, []string{"FINCTRL_DEFINE"}, a.actions, "seeding needs the same authority as defining a control")
 
@@ -327,8 +327,8 @@ func TestCatalogueStatus(t *testing.T) {
 	}
 	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &got))
 	assert.Equal(t, 49, len(got.Controls))
-	assert.Equal(t, 20, got.Summary["BLOCKED"])
-	assert.Equal(t, 14, got.Summary["PARTIAL"])
+	assert.Equal(t, 18, got.Summary["BLOCKED"])
+	assert.Equal(t, 16, got.Summary["PARTIAL"])
 	for _, c := range got.Controls {
 		if c.Code == "FIN-CTRL-007" {
 			assert.Equal(t, "BLOCKED", c.State)

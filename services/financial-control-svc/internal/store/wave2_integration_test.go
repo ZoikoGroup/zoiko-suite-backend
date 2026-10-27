@@ -38,7 +38,7 @@ func newWave2(t *testing.T) *wave2 {
 	t.Helper()
 	w := &wave2{t: t, tenant: uuid.NewString(), entity: uuid.NewString(), src: newFakeSources(), defs: map[string]string{}}
 	endpoints := map[string]string{}
-	for _, sys := range []string{catalogue.SysAR, catalogue.SysAP, catalogue.SysGL, catalogue.SysBanking, catalogue.SysPaymentRun} {
+	for _, sys := range []string{catalogue.SysAR, catalogue.SysAP, catalogue.SysGL, catalogue.SysBanking, catalogue.SysPaymentRun, catalogue.SysTreasury} {
 		s := w.src.server(sys)
 		t.Cleanup(s.Close)
 		endpoints[sys] = s.URL
@@ -244,6 +244,44 @@ func TestWave2_UnappliedCashAging_EveryAgedReceiptIsAFindingAndTheCutOffIsPerRun
 	assert.Equal(t, domain.ResultIndeterminate, final.ResultState)
 }
 
+// ── FIN-CTRL-026: FX rate source completeness ────────────────────────────────
+
+func TestWave2_FXRateCompleteness_MissingBusinessDayAndDeadPair(t *testing.T) {
+	w := newWave2(t) // the run period is 2026-09 and "today" is 2026-09-30
+	var recs []domain.PopulationRecord
+	for d := 1; d <= 30; d++ {
+		day := time.Date(2026, 9, d, 0, 0, 0, 0, time.UTC)
+		if day.Weekday() == time.Saturday || day.Weekday() == time.Sunday || d == 16 { // Wed 16 Sep has no rate
+			continue
+		}
+		ds := day.Format("2006-01-02")
+		recs = append(recs, attrs(recAt(fmt.Sprintf("f%d", d), "EUR/USD", "1.08000000", ds), "currency_pair", "EUR/USD"))
+	}
+	w.src.set(catalogue.SysTreasury, "fx-rate-observations", "wm", recs...)
+	run, final := w.run("FIN-CTRL-026", nil)
+	assert.Equal(t, domain.ResultFail, final.ResultState)
+	list, err := testStore.ListExceptions(ctx, w.tenant, run.RunID, store.ListExceptionsFilter{})
+	require.NoError(t, err)
+	require.Len(t, list, 1)
+	assert.Equal(t, []string{"gap:EUR/USD:2026-09-16..2026-09-16"}, list[0].RecordIDs)
+	assert.Equal(t, "2026-09", w.src.lastQuery(catalogue.SysTreasury).Get("period_id"), "the month under test is sent to the source")
+
+	// A pair listed in fx_pairs_expected that delivered nothing cannot pass: the catalogue definition built with a
+	// pair list names it, so it is covered even when the whole feed is dead.
+	defs, err := catalogue.Wave2(catalogue.Wave2Options{ARControlAccounts: "1200", APControlAccounts: "2000", CashAccounts: "1000",
+		FXPairsExpected: []string{"EUR/USD", "GBP/USD"}, EffectiveFrom: "2026-01-01"})
+	require.NoError(t, err)
+	for _, d := range defs {
+		if d.ControlCode != "FIN-CTRL-026" {
+			continue
+		}
+		l, err := domain.ParseRuleLogic(d.InitialLogic)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"EUR/USD", "GBP/USD"}, l.ExpectedGroups)
+		assert.Equal(t, "currency_pair", l.GroupAttr)
+	}
+}
+
 // ── FIN-CTRL-030: supplier unapplied payment aging ───────────────────────────
 
 func TestWave2_SupplierUnappliedPaymentAging_EverySettledUnappliedPayableIsAFinding(t *testing.T) {
@@ -356,7 +394,7 @@ func TestWave2_TenantIsolationAcrossSeededCatalogue(t *testing.T) {
 	assert.ErrorIs(t, err, domain.ErrNotFound, "another tenant cannot run this tenant's control")
 	defs, err := testStore.ListDefinitions(ctx, w.tenant, 50)
 	require.NoError(t, err)
-	assert.Len(t, defs, 8)
+	assert.Len(t, defs, 9)
 }
 
 // A rule version's logic cannot change under an approved/pinned run: a newer, looser

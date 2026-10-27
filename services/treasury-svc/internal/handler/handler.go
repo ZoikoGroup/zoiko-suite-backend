@@ -77,6 +77,10 @@ type Store interface {
 	CloseBankAccount(ctx context.Context, p domain.CloseAccountParams) (*domain.BankAccount, error)
 	RotateAccountIdentifierToken(ctx context.Context, p domain.RotateAccountTokenParams) (*domain.BankAccount, error)
 	GetBankAccountAsOf(ctx context.Context, tenantID, bankAccountID string, asOf time.Time) (*domain.AccountHistoryEntry, error)
+
+	// ZS-CONTROL-001 control populations — see internal/store/control_population.go.
+	QueryFXRateObservations(ctx context.Context, tenantID string, q domain.FXRateObservationsQuery) (*domain.ControlPopulationPage, error)
+	QueryBankAccountOwnership(ctx context.Context, tenantID string, q domain.BankAccountOwnershipQuery) (*domain.ControlPopulationPage, error)
 }
 
 // AuthZClient defines authorization plane contract.
@@ -161,6 +165,7 @@ func New(store Store, authz AuthZClient, clients Clients, transferClients Transf
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
+	r.Get("/v1/control-populations/{population}", h.GetControlPopulation)
 	r.Route("/v1/treasury", func(r chi.Router) {
 		r.Post("/accounts", h.RegisterBankAccount)
 		r.Get("/accounts", h.ListBankAccounts)

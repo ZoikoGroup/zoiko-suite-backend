@@ -86,9 +86,7 @@ func Status() []ControlStatus {
 			"financial-close-svc posts revaluation via POST /v1/journals with correlation_id only (source_event_id is null), so the GL reference cannot be paired to the run",
 			"by code inspection (not run) the GL rejects that call: financial-close-svc omits journal_type, transaction_date, posting_date and currency_code, which general-ledger-svc requires",
 			"financial-close-svc has no control-populations endpoint"),
-		blk("FIN-CTRL-026", "FX rate source completeness", 3,
-			"treasury fx_rates has no list/read endpoint, no source column and no entity or cadence scope",
-			"financial-close-svc revaluation takes caller-supplied closing rates and does not read treasury rates"),
+		part("FIN-CTRL-026", "FX rate source completeness", 3, "treasury-svc fx_rates observations of the run's period_id month, tested per currency pair for a rate on every business day up to today (pairs listed in the catalogue's fx_pairs_expected must be covered even if the feed delivered nothing; with none listed a dead feed passes); rates are tenant-level and carry no source column, so completeness of the feed is tested, not its authority or the entity's reliance on it; financial-close-svc revaluation still takes caller-supplied closing rates and does not read treasury rates"),
 		impl("FIN-CTRL-027", "Customer invoice sequence / issue completeness", 2, ""),
 		impl("FIN-CTRL-028", "Supplier invoice duplicate control", 2, ""),
 		impl("FIN-CTRL-029", "Unapplied cash aging", 2, "AR-08 receipts with unapplied_amount > 0 and a value date before the run's unapplied_before cut-off (the aging limit is a §34 decision, supplied per run); AR-side only, the unapplied balance is not tied to the GL unapplied-cash account"),
@@ -114,8 +112,7 @@ func Status() []ControlStatus {
 		impl("FIN-CTRL-042", "Material exception aggregation", 5, "computed by this service (GET /controls/v1/exception-summary): unresolved exceptions of each control's latest run, per currency, against the entity's aggregate threshold; exposure across controls can overlap, so it is an upper bound; other currencies are reported unassessed, not converted"),
 		blk("FIN-CTRL-043", "Related-party/intercompany classification", 4,
 			"no intercompany or related-party flag on chart-of-accounts, journal lines or counterparties; journal lines carry no counterparty-entity dimension"),
-		blk("FIN-CTRL-044", "Cash account ownership/entity validation", 6,
-			"no bank account master maps a bank account to its owning entity and ledger cash account; statement_lines.gl_cash_account_code is nullable and unowned"),
+		part("FIN-CTRL-044", "Cash account ownership/entity validation", 6, "treasury-svc bank accounts of the run's entity in use (ACTIVE or SUSPENDED) with no current ownership evidence, or whose evidence was recorded by the account's own creator; the account-to-ledger-cash-account link is NOT covered, because nothing maps a bank account to its GL cash account (statement_lines.gl_cash_account_code is nullable and unowned), so the entity match of the GL side is untested"),
 		part("FIN-CTRL-045", "Supplier bank detail change vs payment release SoD", 6, "checks proposer/verifier/approver independence on the bank-detail change itself; it does not link the change to the payment released afterwards, which spans payment-authorization-svc"),
 
 		// Extensions implemented from §15's payroll tests, on payroll's own data.

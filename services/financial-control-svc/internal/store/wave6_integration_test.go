@@ -23,6 +23,7 @@ var wave6Pops = map[string]string{
 	catalogue.SysFinancialClose: "migration-batch-tieout",
 	catalogue.SysTaxAuthority:   "unacknowledged-filings",
 	catalogue.SysPayeeBanking:   "destination-changes",
+	catalogue.SysTreasury:       "bank-account-ownership",
 }
 
 func newWave6(t *testing.T) *wave2 {
@@ -110,6 +111,27 @@ func TestWave6_TaxFilingAcknowledgement_EveryReturnedFilingIsAFinding(t *testing
 	assert.Equal(t, "EXTERNAL_STATUS", ex[0].Category)
 	assert.Equal(t, "FILING_NOT_ACKNOWLEDGED", ex[0].ReasonCode)
 	assert.Equal(t, "2026-09-01", w.src.lastQuery(catalogue.SysTaxAuthority).Get("submitted_before"))
+}
+
+func TestWave6_CashAccountOwnership_OnlyGapsAreFindings(t *testing.T) {
+	w := newWave6(t)
+	mk := func(id, gap string) domain.PopulationRecord {
+		x := r(id, id, "0")
+		x.Currency = "XXX"
+		return attrs(x, "account_status", "ACTIVE", "ownership_gap", gap)
+	}
+	w.src.set(catalogue.SysTreasury, "bank-account-ownership", "wm", mk("a1", ""), mk("a2", "OWNERSHIP_UNVERIFIED"), mk("a3", "SELF_VERIFIED"))
+	run, final := w.run("FIN-CTRL-044", nil)
+	assert.Equal(t, domain.ResultFail, final.ResultState)
+	ex, err := testStore.ListExceptions(ctx, w.tenant, run.RunID, store.ListExceptionsFilter{})
+	require.NoError(t, err)
+	require.Len(t, ex, 2, "only the two accounts with a gap are findings")
+	assert.Equal(t, "AUTHORIZATION", ex[0].Category)
+	assert.Equal(t, "BANK_ACCOUNT_OWNERSHIP_GAP", ex[0].ReasonCode)
+
+	w.src.set(catalogue.SysTreasury, "bank-account-ownership", "wm", mk("a1", ""))
+	_, final = w.run("FIN-CTRL-044", nil)
+	assert.Equal(t, domain.ResultPass, final.ResultState)
 }
 
 func TestWave6_BankDetailChangeSoD_OnlyGapsAreFindings(t *testing.T) {

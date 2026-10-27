@@ -10,13 +10,14 @@ import (
 	"zoiko.io/financial-control-svc/internal/source"
 )
 
-func TestWave6_ThreeSingleSidedNoPeriodControls(t *testing.T) {
+func TestWave6_FourSingleSidedNoPeriodControls(t *testing.T) {
 	defs, err := Wave6("2026-09-01")
 	require.NoError(t, err)
-	require.Len(t, defs, 3)
+	require.Len(t, defs, 4)
 	want := map[string][2]string{
 		"FIN-CTRL-037": {SysTaxAuthority, domain.KindExceptionScan},
 		"FIN-CTRL-038": {SysFinancialClose, domain.KindArithmetic},
+		"FIN-CTRL-044": {SysTreasury, domain.KindExceptionScan},
 		"FIN-CTRL-045": {SysPayeeBanking, domain.KindExceptionScan},
 	}
 	for _, d := range defs {

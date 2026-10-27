@@ -26,10 +26,10 @@ func byCode(t *testing.T) map[string]domain.CreateControlDefinitionRequest {
 	return m
 }
 
-func TestWave2_EightControlsAllValidAndExecutable(t *testing.T) {
+func TestWave2_NineControlsAllValidAndExecutable(t *testing.T) {
 	m := byCode(t)
-	require.Len(t, m, 8)
-	for _, code := range []string{"FIN-CTRL-001", "FIN-CTRL-002", "FIN-CTRL-003", "FIN-CTRL-027", "FIN-CTRL-028", "FIN-CTRL-029", "FIN-CTRL-030", "FIN-CTRL-032"} {
+	require.Len(t, m, 9)
+	for _, code := range []string{"FIN-CTRL-001", "FIN-CTRL-002", "FIN-CTRL-003", "FIN-CTRL-026", "FIN-CTRL-027", "FIN-CTRL-028", "FIN-CTRL-029", "FIN-CTRL-030", "FIN-CTRL-032"} {
 		d, ok := m[code]
 		require.True(t, ok, code)
 		require.NoError(t, d.Validate(), code)
@@ -57,7 +57,7 @@ func TestWave2_KeyControlsAreCloseGatingWithSeparateCertifier(t *testing.T) {
 		assert.NotEmpty(t, d.CertifierRole, code)
 		assert.NotEqual(t, d.OwnerRole, d.CertifierRole, "%s: the preparer role is not the certifier role", code)
 	}
-	for _, code := range []string{"FIN-CTRL-027", "FIN-CTRL-028", "FIN-CTRL-029", "FIN-CTRL-030", "FIN-CTRL-032"} {
+	for _, code := range []string{"FIN-CTRL-026", "FIN-CTRL-027", "FIN-CTRL-028", "FIN-CTRL-029", "FIN-CTRL-030", "FIN-CTRL-032"} {
 		assert.False(t, m[code].CloseGating, code)
 	}
 }

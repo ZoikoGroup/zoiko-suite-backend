@@ -14,6 +14,8 @@ const (
 	SysPayeeBanking   = "payee-banking-identity"
 )
 
+// FIN-CTRL-044 reads treasury-svc (SysTreasury, defined with the Wave 2 systems).
+
 // Wave6 returns the migration, filing-acknowledgement and bank-detail controls that
 // can run on data the platform holds today. Five controls of the wave (033-036, 044)
 // and 039 remain BLOCKED — see Status() for the missing capability of each.
@@ -55,6 +57,16 @@ func Wave6(effectiveFrom string) ([]domain.CreateControlDefinitionRequest, error
 					{"name": "opening_balance_balanced", "plus": []string{"attr:crosswalk_debits"}, "equals": "attr:crosswalk_credits"},
 				},
 			}),
+		},
+		{
+			ControlCode: "FIN-CTRL-044", Name: "Cash account ownership/entity validation", Domain: "Treasury / Master Data",
+			ControlType: "PREVENTIVE", Assertions: []string{"RIGHTS_OBLIGATIONS"}, RiskTier: "KEY",
+			Frequency: "ON_DEMAND", OwnerRole: "TREASURY_OWNER", ReviewerRole: "SENIOR_ACCOUNTANT", CertifierRole: "CONTROLLER",
+			SourceSpec: pop(SysTreasury, "bank-account-ownership", map[string]string{}),
+			InitialLogic: j(map[string]any{"kind": "EXCEPTION_SCAN", "finding_category": "AUTHORIZATION",
+				"finding_reason": "BANK_ACCOUNT_OWNERSHIP_GAP", "finding_assertion": "RIGHTS_OBLIGATIONS",
+				"conditions": []map[string]any{{"attr": "ownership_gap", "op": "nonempty",
+					"detail": "account in use without independently verified ownership evidence"}}}),
 		},
 		{
 			ControlCode: "FIN-CTRL-045", Name: "Supplier bank detail change segregation of duties", Domain: "Payments",
