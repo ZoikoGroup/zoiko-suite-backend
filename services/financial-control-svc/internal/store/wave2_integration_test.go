@@ -38,7 +38,7 @@ func newWave2(t *testing.T) *wave2 {
 	t.Helper()
 	w := &wave2{t: t, tenant: uuid.NewString(), entity: uuid.NewString(), src: newFakeSources(), defs: map[string]string{}}
 	endpoints := map[string]string{}
-	for _, sys := range []string{catalogue.SysAR, catalogue.SysAP, catalogue.SysGL, catalogue.SysBanking, catalogue.SysPaymentRun, catalogue.SysTreasury} {
+	for _, sys := range []string{catalogue.SysAR, catalogue.SysAP, catalogue.SysGL, catalogue.SysBanking, catalogue.SysPaymentRun, catalogue.SysTreasury, catalogue.SysPaymentInitiation} {
 		s := w.src.server(sys)
 		t.Cleanup(s.Close)
 		endpoints[sys] = s.URL
@@ -205,6 +205,81 @@ func TestWave2_BankToCash_ExclusionsAreEvidenced_AndOutstandingItemsAreAged(t *t
 	assert.Empty(t, snaps[1].Exclusions)
 }
 
+// ── FIN-CTRL-004: payment provider settlement ────────────────────────────────
+
+func TestWave2_ProviderSettlement_PaymentsPairWithBankDebitsAndEveryOtherItemIsDisclosed(t *testing.T) {
+	w := newWave2(t)
+	pay := func(id, ref, amt, date, status string) domain.PopulationRecord {
+		return attrs(recAt(id, ref, amt, date), "status", status)
+	}
+	bank := func(id, ref, amt, date, direction string) domain.PopulationRecord {
+		return attrs(recAt(id, ref, amt, date), "status", "NORMALIZED", "direction", direction)
+	}
+	tied := func() {
+		w.src.set(catalogue.SysPaymentInitiation, "payment-attempts", "pa-wm",
+			pay("a1", "PAY-1", "-100.00", "2026-09-01", "SUBMITTED"),
+			pay("a2", "PAY-2", "-40.00", "2026-09-02", "SUBMITTED"),
+			pay("a3", "PAY-3", "-9.00", "2026-09-03", "CANCELLED"))
+		// the bank books each debit one day after the execution date, as banks do
+		w.src.set(catalogue.SysBanking, "bank-transactions", "bk-wm",
+			bank("b1", "PAY-1", "-100.00", "2026-09-02", "DEBIT"),
+			bank("b2", "PAY-2", "-40.00", "2026-09-03", "DEBIT"),
+			bank("b3", "CUST-RCPT", "500.00", "2026-09-04", "CREDIT"),
+			attrs(recAt("b1old", "PAY-1", "-100.00", "2026-09-02"), "status", "SUPERSEDED", "direction", "DEBIT"))
+	}
+
+	// Without an approved date tolerance the settlement lag is a mismatch: the date tolerance is a controlled
+	// decision (§34) made per entity, never baked into the definition.
+	tied()
+	run, final := w.run("FIN-CTRL-004", nil)
+	assert.Equal(t, domain.ResultFail, final.ResultState)
+	list, err := testStore.ListExceptions(ctx, w.tenant, run.RunID, store.ListExceptionsFilter{})
+	require.NoError(t, err)
+	require.Len(t, list, 2)
+	for _, x := range list {
+		assert.Equal(t, domain.ReasonDateOutOfTol, x.ReasonCode, "tolerance is 0 days until a policy is approved")
+	}
+
+	// The entity approves a 3-day settlement lag for this control; later runs pin it.
+	_, err = testStore.CreateTolerancePolicy(ctx, w.tenant, "maker", domain.CreateTolerancePolicyRequest{
+		LegalEntityID: w.entity, Metric: "FIN-CTRL-004", AbsoluteTolerance: "0", Currency: "USD", DateToleranceDays: 3,
+		Rationale: "bank booking lag", EffectiveFrom: "2026-01-01", ApprovedBy: "treasurer"})
+	require.NoError(t, err)
+
+	tied()
+	run, final = w.run("FIN-CTRL-004", nil)
+	assert.Equal(t, domain.ResultPass, final.ResultState, "every instructed payment is settled at the bank")
+	snaps, err := testStore.ListPopulationSnapshots(ctx, w.tenant, run.RunID)
+	require.NoError(t, err)
+	require.Len(t, snaps[0].Exclusions, 1)
+	assert.Equal(t, "TREASURER", snaps[0].Exclusions[0].Authority)
+	assert.Equal(t, 1, snaps[0].Exclusions[0].Count, "the cancelled attempt")
+	assert.Len(t, snaps[1].Exclusions, 2, "the receipt and the superseded row")
+
+	// A payment the bank never debited (old enough not to be in transit), a wrong amount, and a bank debit nobody
+	// instructed are each their own exception: nothing is netted away.
+	w.src.set(catalogue.SysPaymentInitiation, "payment-attempts", "pa-wm2",
+		pay("a1", "PAY-1", "-100.00", "2026-09-01", "SUBMITTED"),
+		pay("a2", "PAY-2", "-40.00", "2026-09-02", "SUBMITTED"),
+		pay("a4", "PAY-4", "-75.00", "2026-09-03", "SUBMITTED"))
+	w.src.set(catalogue.SysBanking, "bank-transactions", "bk-wm2",
+		bank("b1", "PAY-1", "-100.00", "2026-09-02", "DEBIT"),
+		bank("b2", "PAY-2", "-39.00", "2026-09-03", "DEBIT"),
+		bank("b9", "BANK-FEE", "-3.00", "2026-09-04", "DEBIT"))
+	run, final = w.run("FIN-CTRL-004", nil)
+	assert.Equal(t, domain.ResultFail, final.ResultState)
+	list, err = testStore.ListExceptions(ctx, w.tenant, run.RunID, store.ListExceptionsFilter{})
+	require.NoError(t, err)
+	reasons := map[string][]string{}
+	for _, x := range list {
+		reasons[x.ReasonCode] = append(reasons[x.ReasonCode], x.RecordIDs...)
+		assert.Equal(t, "TREASURY_OWNER", x.OwnerRole)
+	}
+	assert.Len(t, list, 3, "PAY-2 amount difference, PAY-4 unsettled, BANK-FEE unexplained: %v", reasons)
+	assert.Contains(t, reasons[domain.ReasonAmountMismatch], "a2", "-40.00 instructed against -39.00 at the bank")
+	assert.Equal(t, []string{"a4"}, reasons[domain.ReasonMissingDownstream], "instructed 27 days before the period end, never debited")
+	assert.Equal(t, []string{"b9"}, reasons[domain.ReasonMissingSource], "a bank debit nobody instructed")
+}
 func recAt(id, ref, amt, date string) domain.PopulationRecord {
 	x := r(id, ref, amt)
 	x.Date = date
@@ -396,7 +471,7 @@ func TestWave2_TenantIsolationAcrossSeededCatalogue(t *testing.T) {
 	assert.ErrorIs(t, err, domain.ErrNotFound, "another tenant cannot run this tenant's control")
 	defs, err := testStore.ListDefinitions(ctx, w.tenant, 50)
 	require.NoError(t, err)
-	assert.Len(t, defs, 9)
+	assert.Len(t, defs, 10)
 }
 
 // A rule version's logic cannot change under an approved/pinned run: a newer, looser

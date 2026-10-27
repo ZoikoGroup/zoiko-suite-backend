@@ -26,6 +26,8 @@ const (
 	SysPaymentRun = "payment-run"
 	// SysTreasury is treasury-svc: the bank account master (FIN-CTRL-044).
 	SysTreasury = "treasury"
+	// SysPaymentInitiation is payment-initiation-adapter-svc: the payments instructed to the provider (FIN-CTRL-004).
+	SysPaymentInitiation = "payment-initiation-adapter"
 )
 
 // Wave2Options carries the entity-specific inputs a definition cannot guess.
@@ -115,6 +117,33 @@ func Wave2(o Wave2Options) ([]domain.CreateControlDefinitionRequest, error) {
 					"reason":    "canonical bank transaction superseded by a re-normalisation; its replacement is in the population",
 					"authority": "TREASURER",
 				}},
+			}),
+		},
+		{
+			// Payments instructed to the provider (side A, signed negative: money OUT) against the bank's debits
+			// (side B). The two are paired on the payment_reference sent to the provider, which the bank/provider is
+			// expected to echo on the statement line; where it is not echoed, a payment surfaces as unmatched, never
+			// as a pass. Receipts and attempts that never reached the provider are excluded by explicit, owned rules
+			// whose count and value are recorded in the evidence. Unmatched items dated within 5 days of the period
+			// end are reconciling items (in transit), not permanent mismatches.
+			ControlCode: "FIN-CTRL-004", Name: "Payment provider settlement", Domain: "Treasury",
+			ControlType: "TRANSACTION", Assertions: []string{"COMPLETENESS", "ACCURACY"}, RiskTier: "STANDARD",
+			Frequency: "DAILY",
+			OwnerRole: "TREASURY_OWNER", ReviewerRole: "TREASURY_ANALYST", CertifierRole: "TREASURER",
+			SourceSpec: pop(SysPaymentInitiation, "payment-attempts"), TargetSpec: pop(SysBanking, "bank-transactions"),
+			InitialLogic: j(map[string]any{
+				"kind": "MATCH", "skip_content_duplicates": true, "outstanding_days": 5,
+				"exclusions": []map[string]any{
+					{"side": "A", "attr": "status", "values": []string{"PREPARED", "REJECTED_BEFORE_SUBMISSION", "CANCELLED"},
+						"reason":    "payment attempt that never reached the provider moved no money",
+						"authority": "TREASURER"},
+					{"side": "B", "attr": "direction", "values": []string{"CREDIT", "ZERO"},
+						"reason":    "bank credits and zero lines are receipts, not payments",
+						"authority": "TREASURER"},
+					{"side": "B", "attr": "status", "values": []string{"SUPERSEDED"},
+						"reason":    "canonical bank transaction superseded by a re-normalisation; its replacement is in the population",
+						"authority": "TREASURER"},
+				},
 			}),
 		},
 		{

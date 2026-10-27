@@ -55,6 +55,9 @@ type Store interface {
 	ResolveAmbiguous(ctx context.Context, attemptID string, req domain.ResolveAmbiguousRequest, principalID string) (*domain.PaymentInitiationAttempt, error)
 
 	ListEvents(ctx context.Context, attemptID string) ([]domain.AttemptEvent, error)
+
+	// QueryPaymentAttempts serves the FIN-CTRL-004 control population (see control_population.go).
+	QueryPaymentAttempts(ctx context.Context, tenantID string, q domain.PaymentAttemptsQuery) (*domain.ControlPopulationPage, error)
 }
 
 type PgStore struct {

@@ -26,10 +26,10 @@ func byCode(t *testing.T) map[string]domain.CreateControlDefinitionRequest {
 	return m
 }
 
-func TestWave2_NineControlsAllValidAndExecutable(t *testing.T) {
+func TestWave2_TenControlsAllValidAndExecutable(t *testing.T) {
 	m := byCode(t)
-	require.Len(t, m, 9)
-	for _, code := range []string{"FIN-CTRL-001", "FIN-CTRL-002", "FIN-CTRL-003", "FIN-CTRL-026", "FIN-CTRL-027", "FIN-CTRL-028", "FIN-CTRL-029", "FIN-CTRL-030", "FIN-CTRL-032"} {
+	require.Len(t, m, 10)
+	for _, code := range []string{"FIN-CTRL-001", "FIN-CTRL-002", "FIN-CTRL-003", "FIN-CTRL-004", "FIN-CTRL-026", "FIN-CTRL-027", "FIN-CTRL-028", "FIN-CTRL-029", "FIN-CTRL-030", "FIN-CTRL-032"} {
 		d, ok := m[code]
 		require.True(t, ok, code)
 		require.NoError(t, d.Validate(), code)
@@ -45,6 +45,37 @@ func TestWave2_NineControlsAllValidAndExecutable(t *testing.T) {
 		assert.NotEmpty(t, d.OwnerRole, code)
 		assert.NotEmpty(t, d.Assertions, code)
 	}
+}
+
+// FIN-CTRL-004 pairs the payments instructed to the provider (money out, signed negative) with the bank's debits; the
+// receipts, the never-sent attempts and the superseded bank rows leave their side only by an owned, evidenced rule.
+func TestWave2_ProviderSettlementIsATwoSidedMatchWithOwnedExclusions(t *testing.T) {
+	d := byCode(t)["FIN-CTRL-004"]
+	a, err := source.ParseSpec(d.SourceSpec)
+	require.NoError(t, err)
+	b, err := source.ParseSpec(d.TargetSpec)
+	require.NoError(t, err)
+	assert.Equal(t, SysPaymentInitiation, a.System)
+	assert.Equal(t, "payment-attempts", a.Population)
+	assert.Equal(t, SysBanking, b.System)
+	assert.Equal(t, "bank-transactions", b.Population)
+
+	l, err := domain.ParseRuleLogic(d.InitialLogic)
+	require.NoError(t, err)
+	assert.True(t, l.TwoSided())
+	assert.Equal(t, 5, l.OutstandingDays)
+	assert.False(t, d.CloseGating)
+	byAttr := map[string]domain.ExclusionRule{}
+	for _, x := range l.Exclusions {
+		assert.Equal(t, "TREASURER", x.Authority, "%s/%s needs an owner", x.Side, x.Attr)
+		assert.NotEmpty(t, x.Reason)
+		byAttr[x.Side+"/"+x.Attr] = x
+	}
+	assert.ElementsMatch(t, []string{"PREPARED", "REJECTED_BEFORE_SUBMISSION", "CANCELLED"}, byAttr["A/status"].Values)
+	assert.NotContains(t, byAttr["A/status"].Values, "PENDING_UNKNOWN", "an attempt whose outcome is unknown may have moved money")
+	assert.NotContains(t, byAttr["A/status"].Values, "QUARANTINED", "a quarantined attempt may have been sent first")
+	assert.ElementsMatch(t, []string{"CREDIT", "ZERO"}, byAttr["B/direction"].Values)
+	assert.Equal(t, []string{"SUPERSEDED"}, byAttr["B/status"].Values)
 }
 
 func TestWave2_FXRateCompletenessReadsTheLedgerRatesOfTheConfiguredType(t *testing.T) {
@@ -82,7 +113,7 @@ func TestWave2_KeyControlsAreCloseGatingWithSeparateCertifier(t *testing.T) {
 		assert.NotEmpty(t, d.CertifierRole, code)
 		assert.NotEqual(t, d.OwnerRole, d.CertifierRole, "%s: the preparer role is not the certifier role", code)
 	}
-	for _, code := range []string{"FIN-CTRL-026", "FIN-CTRL-027", "FIN-CTRL-028", "FIN-CTRL-029", "FIN-CTRL-030", "FIN-CTRL-032"} {
+	for _, code := range []string{"FIN-CTRL-004", "FIN-CTRL-026", "FIN-CTRL-027", "FIN-CTRL-028", "FIN-CTRL-029", "FIN-CTRL-030", "FIN-CTRL-032"} {
 		assert.False(t, m[code].CloseGating, code)
 	}
 }
