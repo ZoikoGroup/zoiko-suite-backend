@@ -29,6 +29,6 @@ apply to the approved holdout set, real content and the approved model, none of 
 | Events (six only, redacted, outbox, DLQ) | `events.*`, `e2e` | Covered |
 | Golden set partitions A–D | `eval.TestGoldenSet` (37 cases, dev set v2) | Covered; partition E holdout and F drift sentinel **not covered** (need independent authors / production) |
 | Semantic rubric + human grading lanes (Doc 07 §08) | — | Not covered (harness is deterministic lane only) |
-| WCAG 2.2 AA (QA-T050–056) | — | Not covered: widget not built (STEP 13) |
+| WCAG 2.2 AA (QA-T050–056) | Manual browser checks in the console widget: keyboard, Escape focus return, live region, 44 px buttons, 375 px layout | Partial: no screen-reader or zoom pass, no automated a11y tests |
 | Load / p95 latency (QA-T057–063) | — | Not covered: needs staging + agreed reference load |
 | Doc 09 admin console, Doc 10 CRM/leads | — | Out of R0 scope |
