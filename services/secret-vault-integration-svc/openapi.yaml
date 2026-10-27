@@ -642,9 +642,9 @@ paths:
       responses:
         "200": {description: "{secret_path, algorithm, signature_hex, secret_policy_version_id}"}
         "400": { $ref: "#/components/responses/BadRequest" }
-        "403": {description: "Identity mismatch, not an allowed workload, or not a signing secret"}
-        "404": {description: No applicable secret policy}
-        "503": {description: Vault backend or audit store unavailable (fails closed)}
+        "403": {description: "Identity mismatch, not an allowed workload, or not a signing secret", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "404": {description: No applicable secret policy, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "503": {description: Vault backend or audit store unavailable (fails closed), content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
 
   /v1/secrets/use:
     post:
@@ -674,10 +674,10 @@ paths:
                 request_id: {type: string}
       responses:
         "200": {description: "{secret_path, secret_class, credential_base64, secret_policy_version_id}"}
-        "400": {description: "Invalid request, or the canonical input contract is incomplete"}
-        "403": {description: "Identity mismatch, not an allowed workload, or a class that may not be used"}
-        "404": {description: No applicable secret policy}
-        "503": {description: Vault backend or audit store unavailable (fails closed)}
+        "400": {description: "Invalid request, or the canonical input contract is incomplete", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "403": {description: "Identity mismatch, not an allowed workload, or a class that may not be used", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "404": {description: No applicable secret policy, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "503": {description: Vault backend or audit store unavailable (fails closed), content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
 
   /v1/secrets/broker:
     post:
