@@ -22,6 +22,8 @@ const (
 	SysAP      = "accounts-payable"
 	SysGL      = "general-ledger"
 	SysBanking = "banking-connector"
+	// SysPaymentRun is payment-run-svc (AP-11), the owner of supplier payment instructions (FIN-CTRL-030).
+	SysPaymentRun = "payment-run"
 )
 
 // Wave2Options carries the entity-specific inputs a definition cannot guess.
@@ -128,6 +130,16 @@ func Wave2(o Wave2Options) ([]domain.CreateControlDefinitionRequest, error) {
 				"params": map[string]string{"unapplied_before": "${scope.unapplied_before}"}}),
 			InitialLogic: j(map[string]any{"kind": "EXCEPTION_SCAN", "finding_category": "CLASSIFICATION",
 				"finding_reason": "UNAPPLIED_CASH_AGED", "finding_assertion": "CLASSIFICATION"}),
+		},
+		{
+			// Same per-run cut-off as FIN-CTRL-029: {"unapplied_before": "YYYY-MM-DD"}.
+			ControlCode: "FIN-CTRL-030", Name: "Supplier unapplied payment aging", Domain: "AP / Treasury",
+			ControlType: "MONITORING", Assertions: []string{"CLASSIFICATION", "ACCURACY"}, RiskTier: "STANDARD",
+			Frequency: "DAILY", OwnerRole: "AP_ACCOUNTING_OWNER", ReviewerRole: "SENIOR_ACCOUNTANT",
+			SourceSpec: j(map[string]any{"system": SysPaymentRun, "population": "unapplied-supplier-payments", "no_period": true,
+				"params": map[string]string{"unapplied_before": "${scope.unapplied_before}"}}),
+			InitialLogic: j(map[string]any{"kind": "EXCEPTION_SCAN", "finding_category": "CLASSIFICATION",
+				"finding_reason": "SUPPLIER_PAYMENT_UNAPPLIED", "finding_assertion": "CLASSIFICATION"}),
 		},
 		{
 			ControlCode: "FIN-CTRL-032", Name: "Bank feed completeness", Domain: "Treasury / Integration",

@@ -38,7 +38,7 @@ func newWave2(t *testing.T) *wave2 {
 	t.Helper()
 	w := &wave2{t: t, tenant: uuid.NewString(), entity: uuid.NewString(), src: newFakeSources(), defs: map[string]string{}}
 	endpoints := map[string]string{}
-	for _, sys := range []string{catalogue.SysAR, catalogue.SysAP, catalogue.SysGL, catalogue.SysBanking} {
+	for _, sys := range []string{catalogue.SysAR, catalogue.SysAP, catalogue.SysGL, catalogue.SysBanking, catalogue.SysPaymentRun} {
 		s := w.src.server(sys)
 		t.Cleanup(s.Close)
 		endpoints[sys] = s.URL
@@ -244,6 +244,32 @@ func TestWave2_UnappliedCashAging_EveryAgedReceiptIsAFindingAndTheCutOffIsPerRun
 	assert.Equal(t, domain.ResultIndeterminate, final.ResultState)
 }
 
+// ── FIN-CTRL-030: supplier unapplied payment aging ───────────────────────────
+
+func TestWave2_SupplierUnappliedPaymentAging_EverySettledUnappliedPayableIsAFinding(t *testing.T) {
+	w := newWave2(t)
+	w.src.noPeriod[catalogue.SysPaymentRun+"/unapplied-supplier-payments"] = true // the real endpoint rejects period_id
+	sc := func(r *domain.CreateRunRequest) { r.Scope = json.RawMessage(`{"unapplied_before":"2026-09-01"}`) }
+
+	w.src.set(catalogue.SysPaymentRun, "unapplied-supplier-payments", "wm")
+	_, final := w.run("FIN-CTRL-030", sc)
+	assert.Equal(t, domain.ResultPass, final.ResultState, "no settled-but-unapplied supplier payments: pass")
+
+	w.src.set(catalogue.SysPaymentRun, "unapplied-supplier-payments", "wm2", r("i1:AP_INVOICE:INV-1", "INV-1", "90.00"))
+	run, final := w.run("FIN-CTRL-030", sc)
+	assert.Equal(t, domain.ResultFail, final.ResultState)
+	ex, err := testStore.ListExceptions(ctx, w.tenant, run.RunID, store.ListExceptionsFilter{})
+	require.NoError(t, err)
+	require.Len(t, ex, 1)
+	assert.Equal(t, "CLASSIFICATION", ex[0].Category)
+	assert.Equal(t, "SUPPLIER_PAYMENT_UNAPPLIED", ex[0].ReasonCode)
+	assert.Equal(t, "2026-09-01", w.src.lastQuery(catalogue.SysPaymentRun).Get("unapplied_before"))
+	assert.Empty(t, w.src.lastQuery(catalogue.SysPaymentRun).Get("period_id"))
+
+	_, final = w.run("FIN-CTRL-030", nil)
+	assert.Equal(t, domain.ResultIndeterminate, final.ResultState, "no cut-off: fails closed, never passes")
+}
+
 // ── FIN-CTRL-027 / 028 / 032 ─────────────────────────────────────────────────
 
 func TestWave2_InvoiceSequenceGaps(t *testing.T) {
@@ -330,7 +356,7 @@ func TestWave2_TenantIsolationAcrossSeededCatalogue(t *testing.T) {
 	assert.ErrorIs(t, err, domain.ErrNotFound, "another tenant cannot run this tenant's control")
 	defs, err := testStore.ListDefinitions(ctx, w.tenant, 50)
 	require.NoError(t, err)
-	assert.Len(t, defs, 7)
+	assert.Len(t, defs, 8)
 }
 
 // A rule version's logic cannot change under an approved/pinned run: a newer, looser
