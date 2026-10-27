@@ -64,7 +64,7 @@ paths:
       requestBody:
         required: true
         content:
-          application/json:
+          application/problem+json:
             schema: {$ref: '#/components/schemas/CreateWorkflow'}
       responses:
         '201': {$ref: '#/components/responses/WorkflowWithStages'}
@@ -87,7 +87,7 @@ paths:
         '200':
           description: Pending instances
           content:
-            application/json:
+            application/problem+json:
               schema: {type: array, items: {$ref: '#/components/schemas/WorkflowInstance'}}
         '401': {$ref: '#/components/responses/Problem'}
         '403': {$ref: '#/components/responses/Problem'}
@@ -114,7 +114,7 @@ paths:
         '200':
           description: The current stage
           content:
-            application/json:
+            application/problem+json:
               schema: {$ref: '#/components/schemas/WorkflowStage'}
         '400': {$ref: '#/components/responses/Problem'}
         '401': {$ref: '#/components/responses/Problem'}
@@ -131,7 +131,7 @@ paths:
         '200':
           description: Transitions, oldest first
           content:
-            application/json:
+            application/problem+json:
               schema: {type: array, items: {$ref: '#/components/schemas/WorkflowTransition'}}
         '400': {$ref: '#/components/responses/Problem'}
         '401': {$ref: '#/components/responses/Problem'}
@@ -202,7 +202,7 @@ paths:
       requestBody:
         required: true
         content:
-          application/json:
+          application/problem+json:
             schema:
               type: object
               required: [escalation_target, reason_code]
@@ -244,7 +244,7 @@ paths:
       requestBody:
         required: true
         content:
-          application/json:
+          application/problem+json:
             schema:
               type: object
               properties:
@@ -254,7 +254,7 @@ paths:
         '200':
           description: Changes requested
           content:
-            application/json:
+            application/problem+json:
               schema: {type: object, properties: {status: {type: string, const: changes_requested}}}
         '400': {$ref: '#/components/responses/Problem'}
         '401': {$ref: '#/components/responses/Problem'}
@@ -276,7 +276,7 @@ paths:
       requestBody:
         required: true
         content:
-          application/json:
+          application/problem+json:
             schema:
               type: object
               required: [reason_code]
@@ -302,7 +302,7 @@ paths:
       requestBody:
         required: true
         content:
-          application/json:
+          application/problem+json:
             schema:
               type: object
               required: [current_subject_fingerprint]
@@ -330,7 +330,7 @@ paths:
         '200':
           description: Definitions
           content:
-            application/json:
+            application/problem+json:
               schema: {type: array, items: {$ref: '#/components/schemas/WorkflowDefinition'}}
         '401': {$ref: '#/components/responses/Problem'}
         '403': {$ref: '#/components/responses/Problem'}
@@ -341,7 +341,7 @@ paths:
       requestBody:
         required: true
         content:
-          application/json:
+          application/problem+json:
             schema:
               type: object
               required: [tenant_id, workflow_type, version, stages_json]
@@ -356,7 +356,7 @@ paths:
         '201':
           description: Created
           content:
-            application/json:
+            application/problem+json:
               schema: {$ref: '#/components/schemas/WorkflowDefinition'}
         '400': {$ref: '#/components/responses/Problem'}
         '401': {$ref: '#/components/responses/Problem'}
@@ -371,7 +371,7 @@ paths:
         '200':
           description: The definition
           content:
-            application/json:
+            application/problem+json:
               schema: {$ref: '#/components/schemas/WorkflowDefinition'}
         '400': {$ref: '#/components/responses/Problem'}
         '401': {$ref: '#/components/responses/Problem'}
@@ -386,7 +386,7 @@ paths:
       requestBody:
         required: true
         content:
-          application/json:
+          application/problem+json:
             schema:
               type: object
               required: [new_definition_id]
@@ -447,7 +447,7 @@ components:
     Decision:
       required: true
       content:
-        application/json:
+        application/problem+json:
           schema:
             type: object
             required: [action]
@@ -464,22 +464,22 @@ components:
     Workflow:
       description: The workflow instance
       content:
-        application/json:
+        application/problem+json:
           schema: {$ref: '#/components/schemas/WorkflowInstance'}
     WorkflowWithStages:
       description: The workflow instance and its stages
       content:
-        application/json:
+        application/problem+json:
           schema: {$ref: '#/components/schemas/WorkflowWithStages'}
     Decision:
       description: The instance after the decision, the decided stage, and the ledger decision id (absent on an idempotent replay)
       content:
-        application/json:
+        application/problem+json:
           schema: {$ref: '#/components/schemas/WorkflowWithStages'}
     ReleaseVerification:
       description: Release verification result
       content:
-        application/json:
+        application/problem+json:
           schema:
             type: object
             properties:
@@ -492,22 +492,33 @@ components:
     DefinitionStatus:
       description: The definition's new status
       content:
-        application/json:
+        application/problem+json:
           schema: {type: object, properties: {status: {type: string}}}
-  schemas:
+schemas:
     Problem:
       type: object
-      required: [type, title, status]
+      required: [type, title, status, code]
       properties:
-        type: {type: string}
-        title: {type: string}
-        status: {type: integer}
-        detail: {type: string}
-        code: {type: string}
-        error: {type: string}
-        error_class: {type: string}
-        retryable: {type: boolean}
-      additionalProperties: true
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        code: { type: string }
+        request_id: { type: string }
+        correlation_id: { type: string }
+        retryable: { type: boolean }
+        retry_after: { type: integer }
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              pointer: { type: string }
+              code: { type: string }
+              detail: { type: string }
+        current_version: { type: integer, format: int64 }
+        decision_id: { type: string }
     StageInput:
       type: object
       properties:

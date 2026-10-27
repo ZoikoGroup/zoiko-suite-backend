@@ -16,6 +16,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
+	apicontract "zoiko.io/identity-envelope/apicontract"
 	idenv "zoiko.io/identity-envelope"
 
 	"zoiko.io/workflow-svc/internal/authz"
@@ -318,7 +319,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 func (h *Handler) requireTenant(w http.ResponseWriter, r *http.Request) (string, bool) {
 	tenantID := svcmiddleware.TenantFromContext(r.Context())
 	if tenantID == "" {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{
+		writeJSON(w, r, http.StatusUnauthorized, map[string]string{
 			"error":   "missing_tenant_scope",
 			"message": "X-Tenant-Id is required — the gateway sets it from a verified identity envelope",
 		})
@@ -327,7 +328,7 @@ func (h *Handler) requireTenant(w http.ResponseWriter, r *http.Request) (string,
 	// A non-UUID tenant used to reach the ::uuid cast and come back as a 503
 	// store outage (row 54); it is the caller's error.
 	if !isValidUUID(strings.ToLower(tenantID)) {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{
 			"error":   "invalid_tenant",
 			"message": "X-Tenant-Id must be a UUID",
 		})
@@ -348,7 +349,7 @@ func (h *Handler) requireTenant(w http.ResponseWriter, r *http.Request) (string,
 func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
 	principalID := r.Header.Get("X-Principal-Id")
 	if principalID == "" {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{
+		writeJSON(w, r, http.StatusUnauthorized, map[string]string{
 			"error":   "missing_principal",
 			"message": "X-Principal-Id is required — the gateway sets it from a verified identity envelope",
 		})
@@ -384,7 +385,7 @@ func (h *Handler) refuseNonHumanApprover(w http.ResponseWriter, r *http.Request,
 	if reason == "" {
 		return false
 	}
-	writeJSON(w, http.StatusForbidden, map[string]string{
+	writeJSON(w, r, http.StatusForbidden, map[string]string{
 		"error":   "approver_not_human",
 		"message": domain.ErrApproverNotHuman.Error() + " (" + reason + ")",
 	})
@@ -394,11 +395,11 @@ func (h *Handler) refuseNonHumanApprover(w http.ResponseWriter, r *http.Request,
 // refuseRejectWithoutRationale writes 400 rationale_required and returns true
 // for a REJECT with no rationale: a rejection is the decision an initiator and
 // an auditor most need the reason for (row 38).
-func refuseRejectWithoutRationale(w http.ResponseWriter, action string, rationale *string) bool {
+func refuseRejectWithoutRationale(w http.ResponseWriter, r *http.Request, action string, rationale *string) bool {
 	if action != "REJECT" || strings.TrimSpace(derefString(rationale)) != "" {
 		return false
 	}
-	writeJSON(w, http.StatusBadRequest, map[string]string{
+	writeJSON(w, r, http.StatusBadRequest, map[string]string{
 		"error":   "rationale_required",
 		"field":   "rationale",
 		"message": domain.ErrRationaleRequired.Error(),
@@ -408,9 +409,9 @@ func refuseRejectWithoutRationale(w http.ResponseWriter, action string, rational
 
 // refuseForeignTenant reports whether claimed names a tenant other than
 // verifiedTenant, writing a 403 if so.
-func (h *Handler) refuseForeignTenant(w http.ResponseWriter, claimed, verifiedTenant string) bool {
+func (h *Handler) refuseForeignTenant(w http.ResponseWriter, r *http.Request, claimed, verifiedTenant string) bool {
 	if claimed != "" && claimed != verifiedTenant {
-		writeJSON(w, http.StatusForbidden, map[string]string{
+		writeJSON(w, r, http.StatusForbidden, map[string]string{
 			"error":   "tenant_scope_mismatch",
 			"message": "request tenant_id does not match the caller's verified tenant scope",
 		})
@@ -425,7 +426,7 @@ func (h *Handler) refuseForeignTenant(w http.ResponseWriter, claimed, verifiedTe
 func (h *Handler) requireCorrelationID(w http.ResponseWriter, r *http.Request) (string, bool) {
 	correlationID := r.Header.Get("X-Correlation-ID")
 	if correlationID == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_correlation_id"})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "missing_correlation_id"})
 		return "", false
 	}
 	return correlationID, true
@@ -532,25 +533,25 @@ func (h *Handler) CreateWorkflow(w http.ResponseWriter, r *http.Request) {
 
 	var req createWorkflowRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
 		return
 	}
 	if missing := req.missingField(); missing != "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": missing})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": missing})
 		return
 	}
-	if h.refuseForeignTenant(w, req.TenantID, tenantScope) {
+	if h.refuseForeignTenant(w, r, req.TenantID, tenantScope) {
 		return
 	}
 	// The envelope's X-Legal-Entity-Id and the body name the same entity; the
 	// body's is what is authorized and stored, so they may not disagree
 	// (row 53). A non-UUID entity used to reach the cast as a 503 (row 54).
 	if !isValidUUID(strings.ToLower(req.LegalEntityID)) {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_uuid", "field": "legal_entity_id"})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_uuid", "field": "legal_entity_id"})
 		return
 	}
 	if hdr := strings.TrimSpace(r.Header.Get("X-Legal-Entity-Id")); hdr != "" && !strings.EqualFold(hdr, req.LegalEntityID) {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{
 			"error":   "legal_entity_mismatch",
 			"message": "body legal_entity_id does not match the X-Legal-Entity-Id header",
 		})
@@ -565,7 +566,7 @@ func (h *Handler) CreateWorkflow(w http.ResponseWriter, r *http.Request) {
 	var instanceDueAt *time.Time
 	if req.WorkflowDefinitionID != "" {
 		if !isValidUUID(req.WorkflowDefinitionID) {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_uuid", "field": "workflow_definition_id"})
+			writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_uuid", "field": "workflow_definition_id"})
 			return
 		}
 		defID := req.WorkflowDefinitionID
@@ -575,25 +576,25 @@ func (h *Handler) CreateWorkflow(w http.ResponseWriter, r *http.Request) {
 		})
 		if defErr != nil {
 			if errors.Is(defErr, domain.ErrWorkflowNotFound) {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "workflow_definition_not_found"})
+				writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "workflow_definition_not_found"})
 				return
 			}
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			writeJSON(w, r, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
 			return
 		}
 		if def.WorkflowType != req.WorkflowType {
-			writeJSON(w, http.StatusBadRequest, map[string]string{
+			writeJSON(w, r, http.StatusBadRequest, map[string]string{
 				"error":   "workflow_definition_type_mismatch",
 				"message": "workflow_definition_id does not match workflow_type",
 			})
 			return
 		}
 		if !def.IsActive {
-			writeJSON(w, http.StatusConflict, map[string]string{"error": "workflow_definition_not_active"})
+			writeJSON(w, r, http.StatusConflict, map[string]string{"error": "workflow_definition_not_active"})
 			return
 		}
 		if req.WorkflowDefinitionVersion != 0 && req.WorkflowDefinitionVersion != def.Version {
-			writeJSON(w, http.StatusConflict, map[string]string{"error": "workflow_definition_version_mismatch"})
+			writeJSON(w, r, http.StatusConflict, map[string]string{"error": "workflow_definition_version_mismatch"})
 			return
 		}
 		// Always pin the resolved version, even when the caller omitted it.
@@ -602,7 +603,7 @@ func (h *Handler) CreateWorkflow(w http.ResponseWriter, r *http.Request) {
 		if len(req.Stages) == 0 {
 			defStages, stageErr := store.DefinitionStages(def)
 			if stageErr != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{
+				writeJSON(w, r, http.StatusBadRequest, map[string]string{
 					"error": "invalid_definition_stages", "message": stageErr.Error(),
 				})
 				return
@@ -618,7 +619,7 @@ func (h *Handler) CreateWorkflow(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if len(req.Stages) == 0 {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "no_stages"})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "no_stages"})
 		return
 	}
 
@@ -636,47 +637,47 @@ func (h *Handler) CreateWorkflow(w http.ResponseWriter, r *http.Request) {
 		switch stageType {
 		case domain.StageTypeSingle:
 			if st.ApproverPrincipalID == "" {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "stages[].approver_principal_id"})
+				writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "stages[].approver_principal_id"})
 				return
 			}
 			if st.ApproverPrincipalID == principalID {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "initiator_cannot_be_approver", "field": "stages[].approver_principal_id"})
+				writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "initiator_cannot_be_approver", "field": "stages[].approver_principal_id"})
 				return
 			}
 		case domain.StageTypeQuorum:
 			if len(st.QuorumApprovers) == 0 {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "stages[].quorum_approvers"})
+				writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "stages[].quorum_approvers"})
 				return
 			}
 			if st.RequiredApprovals <= 0 || st.RequiredApprovals > len(st.QuorumApprovers) {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_required_approvals", "field": "stages[].required_approvals"})
+				writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_required_approvals", "field": "stages[].required_approvals"})
 				return
 			}
 			seen := make(map[string]bool, len(st.QuorumApprovers))
 			for _, approver := range st.QuorumApprovers {
 				if seen[approver] {
-					writeJSON(w, http.StatusBadRequest, map[string]string{"error": "duplicate_quorum_approver", "field": "stages[].quorum_approvers"})
+					writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "duplicate_quorum_approver", "field": "stages[].quorum_approvers"})
 					return
 				}
 				seen[approver] = true
 				if approver == principalID {
-					writeJSON(w, http.StatusBadRequest, map[string]string{"error": "initiator_cannot_be_approver", "field": "stages[].quorum_approvers"})
+					writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "initiator_cannot_be_approver", "field": "stages[].quorum_approvers"})
 					return
 				}
 			}
 		case domain.StageTypeRole:
 			if strings.TrimSpace(st.ApproverRole) == "" {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "stages[].approver_role"})
+				writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "stages[].approver_role"})
 				return
 			}
 			// A ROLE stage names a role, not a principal: naming both would
 			// leave it ambiguous who the stage is for.
 			if st.ApproverPrincipalID != "" || len(st.QuorumApprovers) > 0 {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "role_stage_takes_no_approver", "field": fmt.Sprintf("stages[%d]", i)})
+				writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "role_stage_takes_no_approver", "field": fmt.Sprintf("stages[%d]", i)})
 				return
 			}
 		default:
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_stage_type", "field": fmt.Sprintf("stages[%d].stage_type", i)})
+			writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_stage_type", "field": fmt.Sprintf("stages[%d].stage_type", i)})
 			return
 		}
 	}
@@ -687,11 +688,11 @@ func (h *Handler) CreateWorkflow(w http.ResponseWriter, r *http.Request) {
 		if err := h.registry.CheckEntity(r.Context(), req.TenantID, req.LegalEntityID); err != nil {
 			switch {
 			case errors.Is(err, domain.ErrLegalEntityNotFound):
-				writeJSON(w, http.StatusNotFound, map[string]string{"error": "legal_entity_not_found"})
+				writeJSON(w, r, http.StatusNotFound, map[string]string{"error": "legal_entity_not_found"})
 			default:
 				h.log.Error("CreateWorkflow: tenant-entity-registry-svc unavailable — failing closed",
 					zap.String("correlation_id", correlationID), zap.Error(err))
-				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "registry_unavailable"})
+				writeJSON(w, r, http.StatusServiceUnavailable, map[string]string{"error": "registry_unavailable"})
 			}
 			return
 		}
@@ -713,7 +714,7 @@ func (h *Handler) CreateWorkflow(w http.ResponseWriter, r *http.Request) {
 			if _, err := h.authz.CheckApprovalAllowed(r.Context(), approver, req.LegalEntityID, principalID, attrs); err != nil {
 				switch {
 				case errors.Is(err, domain.ErrAuthorizationDenied):
-					writeJSON(w, http.StatusForbidden, map[string]string{
+					writeJSON(w, r, http.StatusForbidden, map[string]string{
 						"error":                 "approver_not_authorized",
 						"approver_principal_id": approver,
 						"message":               "approver is not authorized to approve for this legal entity",
@@ -721,7 +722,7 @@ func (h *Handler) CreateWorkflow(w http.ResponseWriter, r *http.Request) {
 				default:
 					h.log.Error("CreateWorkflow: authorization-svc unavailable for approver check — failing closed",
 						zap.String("correlation_id", correlationID), zap.Error(err))
-					writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "authorization_service_unavailable"})
+					writeJSON(w, r, http.StatusServiceUnavailable, map[string]string{"error": "authorization_service_unavailable"})
 				}
 				return
 			}
@@ -736,7 +737,7 @@ func (h *Handler) CreateWorkflow(w http.ResponseWriter, r *http.Request) {
 	for i, st := range req.Stages {
 		for _, approver := range stageApprovers(st) {
 			if existingStage, ok := seenApprovers[approver]; ok {
-				writeJSON(w, http.StatusBadRequest, map[string]string{
+				writeJSON(w, r, http.StatusBadRequest, map[string]string{
 					"error":                 "duplicate_approver",
 					"approver_principal_id": approver,
 					"first_stage":           strconv.Itoa(existingStage),
@@ -755,7 +756,7 @@ func (h *Handler) CreateWorkflow(w http.ResponseWriter, r *http.Request) {
 	if req.SubjectFingerprint != nil && strings.TrimSpace(*req.SubjectFingerprint) != "" {
 		trimmedFp := strings.TrimSpace(*req.SubjectFingerprint)
 		if !svcenvelope.IsValidFingerprint(trimmedFp) {
-			writeJSON(w, http.StatusBadRequest, map[string]string{
+			writeJSON(w, r, http.StatusBadRequest, map[string]string{
 				"error":   "invalid_subject_fingerprint",
 				"message": "subject_fingerprint must match sha256:<64 lowercase hex characters>",
 			})
@@ -764,7 +765,7 @@ func (h *Handler) CreateWorkflow(w http.ResponseWriter, r *http.Request) {
 		req.SubjectFingerprint = &trimmedFp
 	}
 	if req.SubjectVersion != nil && *req.SubjectVersion < 0 {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{
 			"error":   "invalid_subject_version",
 			"message": "subject_version must be non-negative",
 		})
@@ -773,7 +774,7 @@ func (h *Handler) CreateWorkflow(w http.ResponseWriter, r *http.Request) {
 	hasType := req.SubjectType != nil && strings.TrimSpace(*req.SubjectType) != ""
 	hasID := req.SubjectID != nil && strings.TrimSpace(*req.SubjectID) != ""
 	if hasType != hasID {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{
 			"error":   "missing_subject_field",
 			"message": "subject_type and subject_id must both be provided if either is present",
 		})
@@ -781,7 +782,7 @@ func (h *Handler) CreateWorkflow(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.WorkflowDefinitionID == "" && req.WorkflowDefinitionVersion != 0 {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{
 			"error":   "missing_field",
 			"field":   "workflow_definition_id",
 			"message": "workflow_definition_version requires workflow_definition_id",
@@ -803,15 +804,15 @@ func (h *Handler) CreateWorkflow(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		if errors.Is(err, domain.ErrNoStages) {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "no_stages"})
+			writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "no_stages"})
 			return
 		}
 		if errors.Is(err, domain.ErrIdempotencyMismatch) {
-			writeJSON(w, http.StatusConflict, map[string]string{"error": "idempotency_mismatch", "message": "same idempotency key used with different request body"})
+			writeJSON(w, r, http.StatusConflict, map[string]string{"error": "idempotency_mismatch", "message": "same idempotency key used with different request body"})
 			return
 		}
 		h.log.Error("CreateWorkflow: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		writeJSON(w, r, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
 		return
 	}
 
@@ -831,7 +832,7 @@ func (h *Handler) CreateWorkflow(w http.ResponseWriter, r *http.Request) {
 			zap.String("correlation_id", correlationID),
 		)
 	}
-	writeJSON(w, status, workflowResponse{WorkflowInstance: instance, Stages: stages})
+	writeJSON(w, r, status, workflowResponse{WorkflowInstance: instance, Stages: stages})
 }
 
 // ── GET /v1/workflows/{id} ───────────────────────────────────────────────────
@@ -844,7 +845,7 @@ func (h *Handler) GetWorkflow(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
 
 	if !isValidUUID(workflowInstanceID) {
-		writeError(w, http.StatusBadRequest, "invalid_uuid", "workflow_instance_id must be a valid UUID", correlationID, nil)
+		writeError(w, r, http.StatusBadRequest, "invalid_uuid", "workflow_instance_id must be a valid UUID", correlationID, nil)
 		return
 	}
 
@@ -858,7 +859,7 @@ func (h *Handler) GetWorkflow(w http.ResponseWriter, r *http.Request) {
 
 	instance, err := h.store.FindWorkflowByID(r.Context(), workflowInstanceID)
 	if err != nil {
-		writeStoreErr(w, h.log, err, correlationID, "GetWorkflow")
+		writeStoreErr(w, r, h.log, err, correlationID, "GetWorkflow")
 		return
 	}
 	if !h.authorizeRead(w, r, instance, principalID, correlationID, "GetWorkflow") {
@@ -866,10 +867,10 @@ func (h *Handler) GetWorkflow(w http.ResponseWriter, r *http.Request) {
 	}
 	stages, err := h.store.FindStagesByWorkflowID(r.Context(), workflowInstanceID)
 	if err != nil {
-		writeStoreErr(w, h.log, err, correlationID, "GetWorkflow")
+		writeStoreErr(w, r, h.log, err, correlationID, "GetWorkflow")
 		return
 	}
-	writeJSON(w, http.StatusOK, workflowResponse{WorkflowInstance: instance, Stages: stages})
+	writeJSON(w, r, http.StatusOK, workflowResponse{WorkflowInstance: instance, Stages: stages})
 }
 
 // ── GET /v1/workflows/{id}/next-approver ─────────────────────────────────────
@@ -883,7 +884,7 @@ func (h *Handler) GetNextApprover(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
 
 	if !isValidUUID(workflowInstanceID) {
-		writeError(w, http.StatusBadRequest, "invalid_uuid", "workflow_instance_id must be a valid UUID", correlationID, nil)
+		writeError(w, r, http.StatusBadRequest, "invalid_uuid", "workflow_instance_id must be a valid UUID", correlationID, nil)
 		return
 	}
 
@@ -897,7 +898,7 @@ func (h *Handler) GetNextApprover(w http.ResponseWriter, r *http.Request) {
 
 	instance, err := h.store.FindWorkflowByID(r.Context(), workflowInstanceID)
 	if err != nil {
-		writeStoreErr(w, h.log, err, correlationID, "GetNextApprover")
+		writeStoreErr(w, r, h.log, err, correlationID, "GetNextApprover")
 		return
 	}
 	if !h.authorizeRead(w, r, instance, principalID, correlationID, "GetNextApprover") {
@@ -906,10 +907,10 @@ func (h *Handler) GetNextApprover(w http.ResponseWriter, r *http.Request) {
 
 	stage, err := h.store.FindCurrentStage(r.Context(), workflowInstanceID)
 	if err != nil {
-		writeStoreErr(w, h.log, err, correlationID, "GetNextApprover")
+		writeStoreErr(w, r, h.log, err, correlationID, "GetNextApprover")
 		return
 	}
-	writeJSON(w, http.StatusOK, stage)
+	writeJSON(w, r, http.StatusOK, stage)
 }
 
 // ── POST /v1/workflows/{id}/actions ──────────────────────────────────────────
@@ -952,7 +953,7 @@ func (h *Handler) SubmitAction(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
 
 	if !isValidUUID(workflowInstanceID) {
-		writeError(w, http.StatusBadRequest, "invalid_uuid", "workflow_instance_id must be a valid UUID", correlationID, nil)
+		writeError(w, r, http.StatusBadRequest, "invalid_uuid", "workflow_instance_id must be a valid UUID", correlationID, nil)
 		return
 	}
 
@@ -971,20 +972,20 @@ func (h *Handler) SubmitAction(w http.ResponseWriter, r *http.Request) {
 
 	var req submitActionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
 		return
 	}
 	if req.Action != "APPROVE" && req.Action != "REJECT" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_field", "field": "action", "message": "must be APPROVE or REJECT"})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_field", "field": "action", "message": "must be APPROVE or REJECT"})
 		return
 	}
-	if refuseRejectWithoutRationale(w, req.Action, req.Rationale) || h.refuseNonHumanApprover(w, r, principalID) {
+	if refuseRejectWithoutRationale(w, r, req.Action, req.Rationale) || h.refuseNonHumanApprover(w, r, principalID) {
 		return
 	}
 
 	instanceForAuthzCheck, err := h.store.FindWorkflowByID(r.Context(), workflowInstanceID)
 	if err != nil {
-		writeStoreErr(w, h.log, err, correlationID, "SubmitAction")
+		writeStoreErr(w, r, h.log, err, correlationID, "SubmitAction")
 		return
 	}
 
@@ -995,7 +996,7 @@ func (h *Handler) SubmitAction(w http.ResponseWriter, r *http.Request) {
 	// This covers instances created before CreateWorkflow's validation
 	// existed, or via any path that bypasses it.
 	if principalID == instanceForAuthzCheck.InitiatedBy {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "self_approval_not_allowed", "message": domain.ErrSelfApprovalNotAllowed.Error()})
+		writeJSON(w, r, http.StatusForbidden, map[string]string{"error": "self_approval_not_allowed", "message": domain.ErrSelfApprovalNotAllowed.Error()})
 		return
 	}
 
@@ -1007,7 +1008,7 @@ func (h *Handler) SubmitAction(w http.ResponseWriter, r *http.Request) {
 	if edgeErr := svcenvelope.ValidateTransitionEdge("workflow_instance", instanceForAuthzCheck.WorkflowStatus, targetState); edgeErr != nil {
 		var illegalErr *svcenvelope.IllegalEdgeError
 		if errors.As(edgeErr, &illegalErr) {
-			writeJSON(w, http.StatusConflict, map[string]any{
+			writeJSON(w, r, http.StatusConflict, map[string]any{
 				"error":           "invalid_transition",
 				"message":         illegalErr.Error(),
 				"from_state":      illegalErr.FromState,
@@ -1024,7 +1025,7 @@ func (h *Handler) SubmitAction(w http.ResponseWriter, r *http.Request) {
 	// authorization question is about.
 	currentStage, err := h.store.FindCurrentStage(r.Context(), workflowInstanceID)
 	if err != nil {
-		writeStoreErr(w, h.log, err, correlationID, "SubmitAction")
+		writeStoreErr(w, r, h.log, err, correlationID, "SubmitAction")
 		return
 	}
 
@@ -1039,11 +1040,11 @@ func (h *Handler) SubmitAction(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrAuthorizationDenied):
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": "authorization_denied"})
+			writeJSON(w, r, http.StatusForbidden, map[string]string{"error": "authorization_denied"})
 		default:
 			h.log.Error("SubmitAction: authorization-svc unavailable — failing closed",
 				zap.String("correlation_id", correlationID), zap.Error(err))
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "authorization_service_unavailable"})
+			writeJSON(w, r, http.StatusServiceUnavailable, map[string]string{"error": "authorization_service_unavailable"})
 		}
 		return
 	}
@@ -1061,11 +1062,11 @@ func (h *Handler) SubmitAction(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			switch {
 			case errors.Is(err, domain.ErrAuthorizationDenied):
-				writeJSON(w, http.StatusForbidden, map[string]string{"error": "wrong_approver"})
+				writeJSON(w, r, http.StatusForbidden, map[string]string{"error": "wrong_approver"})
 			default:
 				h.log.Error("SubmitAction: authorization-svc unavailable for delegation check — failing closed",
 					zap.String("correlation_id", correlationID), zap.Error(err))
-				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "authorization_service_unavailable"})
+				writeJSON(w, r, http.StatusServiceUnavailable, map[string]string{"error": "authorization_service_unavailable"})
 			}
 			return
 		}
@@ -1086,11 +1087,11 @@ func (h *Handler) SubmitAction(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrWorkflowNotFound):
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "workflow_not_found"})
+			writeJSON(w, r, http.StatusNotFound, map[string]string{"error": "workflow_not_found"})
 		case errors.Is(err, domain.ErrWrongApprover):
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": "wrong_approver"})
+			writeJSON(w, r, http.StatusForbidden, map[string]string{"error": "wrong_approver"})
 		case errors.Is(err, domain.ErrInvalidTransition):
-			writeJSON(w, http.StatusConflict, map[string]any{
+			writeJSON(w, r, http.StatusConflict, map[string]any{
 				"error":           "invalid_transition",
 				"reason_family":   string(svcenvelope.ReasonFamilyReject),
 				"reason_code":     string(svcenvelope.ReasonRejectPolicyNotMet),
@@ -1098,7 +1099,7 @@ func (h *Handler) SubmitAction(w http.ResponseWriter, r *http.Request) {
 			})
 		default:
 			h.log.Error("SubmitAction: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			writeJSON(w, r, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
 		}
 		return
 	}
@@ -1110,7 +1111,7 @@ func (h *Handler) SubmitAction(w http.ResponseWriter, r *http.Request) {
 		zap.String("workflow_status", instance.WorkflowStatus),
 		zap.String("correlation_id", correlationID),
 	)
-	writeJSON(w, http.StatusOK, workflowResponse{WorkflowInstance: instance, Stages: []*domain.WorkflowStage{stage}, DecisionID: decisionIDFor(meta, transitioned)})
+	writeJSON(w, r, http.StatusOK, workflowResponse{WorkflowInstance: instance, Stages: []*domain.WorkflowStage{stage}, DecisionID: decisionIDFor(meta, transitioned)})
 }
 
 // ── POST /v1/workflows/{id}/quorum-votes ─────────────────────────────────────
@@ -1126,7 +1127,7 @@ func (h *Handler) SubmitQuorumVote(w http.ResponseWriter, r *http.Request) {
 
 	// The one action route that never checked its path id (row 54).
 	if !isValidUUID(workflowInstanceID) {
-		writeError(w, http.StatusBadRequest, "invalid_uuid", "workflow_instance_id must be a valid UUID", correlationID, nil)
+		writeError(w, r, http.StatusBadRequest, "invalid_uuid", "workflow_instance_id must be a valid UUID", correlationID, nil)
 		return
 	}
 
@@ -1140,20 +1141,20 @@ func (h *Handler) SubmitQuorumVote(w http.ResponseWriter, r *http.Request) {
 
 	var req submitQuorumVoteRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
 		return
 	}
 	if req.Action != "APPROVE" && req.Action != "REJECT" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_field", "field": "action", "message": "must be APPROVE or REJECT"})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_field", "field": "action", "message": "must be APPROVE or REJECT"})
 		return
 	}
-	if refuseRejectWithoutRationale(w, req.Action, req.Rationale) || h.refuseNonHumanApprover(w, r, principalID) {
+	if refuseRejectWithoutRationale(w, r, req.Action, req.Rationale) || h.refuseNonHumanApprover(w, r, principalID) {
 		return
 	}
 
 	instanceForAuthzCheck, err := h.store.FindWorkflowByID(r.Context(), workflowInstanceID)
 	if err != nil {
-		writeStoreErr(w, h.log, err, correlationID, "SubmitQuorumVote")
+		writeStoreErr(w, r, h.log, err, correlationID, "SubmitQuorumVote")
 		return
 	}
 
@@ -1162,13 +1163,13 @@ func (h *Handler) SubmitQuorumVote(w http.ResponseWriter, r *http.Request) {
 	// regardless of whether CreateWorkflow's own pool validation was
 	// somehow bypassed.
 	if principalID == instanceForAuthzCheck.InitiatedBy {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "self_approval_not_allowed", "message": domain.ErrSelfApprovalNotAllowed.Error()})
+		writeJSON(w, r, http.StatusForbidden, map[string]string{"error": "self_approval_not_allowed", "message": domain.ErrSelfApprovalNotAllowed.Error()})
 		return
 	}
 
 	currentStage, err := h.store.FindCurrentStage(r.Context(), workflowInstanceID)
 	if err != nil {
-		writeStoreErr(w, h.log, err, correlationID, "SubmitQuorumVote")
+		writeStoreErr(w, r, h.log, err, correlationID, "SubmitQuorumVote")
 		return
 	}
 	authority, err := h.authz.CheckApprovalAllowed(r.Context(), principalID, instanceForAuthzCheck.LegalEntityID, instanceForAuthzCheck.InitiatedBy,
@@ -1179,11 +1180,11 @@ func (h *Handler) SubmitQuorumVote(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrAuthorizationDenied):
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": "authorization_denied"})
+			writeJSON(w, r, http.StatusForbidden, map[string]string{"error": "authorization_denied"})
 		default:
 			h.log.Error("SubmitQuorumVote: authorization-svc unavailable — failing closed",
 				zap.String("correlation_id", correlationID), zap.Error(err))
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "authorization_service_unavailable"})
+			writeJSON(w, r, http.StatusServiceUnavailable, map[string]string{"error": "authorization_service_unavailable"})
 		}
 		return
 	}
@@ -1196,13 +1197,13 @@ func (h *Handler) SubmitQuorumVote(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrWorkflowNotFound):
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "workflow_not_found"})
+			writeJSON(w, r, http.StatusNotFound, map[string]string{"error": "workflow_not_found"})
 		case errors.Is(err, domain.ErrNotQuorumStage):
-			writeJSON(w, http.StatusConflict, map[string]string{"error": "not_quorum_stage"})
+			writeJSON(w, r, http.StatusConflict, map[string]string{"error": "not_quorum_stage"})
 		case errors.Is(err, domain.ErrNotEligibleQuorumApprover):
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": "not_eligible_quorum_approver"})
+			writeJSON(w, r, http.StatusForbidden, map[string]string{"error": "not_eligible_quorum_approver"})
 		case errors.Is(err, domain.ErrInvalidTransition):
-			writeJSON(w, http.StatusConflict, map[string]any{
+			writeJSON(w, r, http.StatusConflict, map[string]any{
 				"error":           "invalid_transition",
 				"reason_family":   string(svcenvelope.ReasonFamilyReject),
 				"reason_code":     string(svcenvelope.ReasonRejectPolicyNotMet),
@@ -1210,7 +1211,7 @@ func (h *Handler) SubmitQuorumVote(w http.ResponseWriter, r *http.Request) {
 			})
 		default:
 			h.log.Error("SubmitQuorumVote: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			writeJSON(w, r, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
 		}
 		return
 	}
@@ -1222,7 +1223,7 @@ func (h *Handler) SubmitQuorumVote(w http.ResponseWriter, r *http.Request) {
 		zap.String("workflow_status", instance.WorkflowStatus),
 		zap.String("correlation_id", correlationID),
 	)
-	writeJSON(w, http.StatusOK, workflowResponse{WorkflowInstance: instance, Stages: []*domain.WorkflowStage{stage}, DecisionID: decisionIDFor(meta, transitioned)})
+	writeJSON(w, r, http.StatusOK, workflowResponse{WorkflowInstance: instance, Stages: []*domain.WorkflowStage{stage}, DecisionID: decisionIDFor(meta, transitioned)})
 }
 
 // ── Lifecycle authorization (cancel / escalate / invalidate) ─────────────────
@@ -1302,12 +1303,12 @@ func (h *Handler) authorizeRead(w http.ResponseWriter, r *http.Request, instance
 		return true
 	}
 	if errors.Is(err, domain.ErrAuthorizationDenied) {
-		writeError(w, http.StatusForbidden, "authorization_denied", "principal is not authorized to read this workflow", correlationID,
+		writeError(w, r, http.StatusForbidden, "authorization_denied", "principal is not authorized to read this workflow", correlationID,
 			map[string]any{"action_type": actionWorkflowRead})
 		return false
 	}
 	h.log.Error(op+": authorization-svc unavailable — failing closed", zap.String("correlation_id", correlationID), zap.Error(err))
-	writeError(w, http.StatusServiceUnavailable, "authorization_service_unavailable", "authorization service unavailable", correlationID,
+	writeError(w, r, http.StatusServiceUnavailable, "authorization_service_unavailable", "authorization service unavailable", correlationID,
 		map[string]any{"retryable": true})
 	return false
 }
@@ -1345,14 +1346,14 @@ func (h *Handler) authorizeLifecycleCommand(w http.ResponseWriter, r *http.Reque
 		return authority, true
 	}
 	if errors.Is(err, domain.ErrAuthorizationDenied) {
-		writeError(w, http.StatusForbidden, "authorization_denied", "principal is not authorized for "+action+" on this workflow", correlationID, map[string]any{
+		writeError(w, r, http.StatusForbidden, "authorization_denied", "principal is not authorized for "+action+" on this workflow", correlationID, map[string]any{
 			"action_type": action,
 		})
 		return domain.ActionAuthority{}, false
 	}
 	h.log.Error(op+": authorization-svc unavailable — failing closed",
 		zap.String("correlation_id", correlationID), zap.String("action_type", action), zap.Error(err))
-	writeError(w, http.StatusServiceUnavailable, "authorization_service_unavailable", "authorization service unavailable", correlationID, map[string]any{
+	writeError(w, r, http.StatusServiceUnavailable, "authorization_service_unavailable", "authorization service unavailable", correlationID, map[string]any{
 		"retryable": true,
 	})
 	return domain.ActionAuthority{}, false
@@ -1368,7 +1369,7 @@ func (h *Handler) EscalateWorkflow(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
 
 	if !isValidUUID(workflowInstanceID) {
-		writeError(w, http.StatusBadRequest, "invalid_uuid", "workflow_instance_id must be a valid UUID", correlationID, nil)
+		writeError(w, r, http.StatusBadRequest, "invalid_uuid", "workflow_instance_id must be a valid UUID", correlationID, nil)
 		return
 	}
 
@@ -1382,7 +1383,7 @@ func (h *Handler) EscalateWorkflow(w http.ResponseWriter, r *http.Request) {
 
 	instanceForAuthzCheck, err := h.store.FindWorkflowByID(r.Context(), workflowInstanceID)
 	if err != nil {
-		writeStoreErr(w, h.log, err, correlationID, "EscalateWorkflow")
+		writeStoreErr(w, r, h.log, err, correlationID, "EscalateWorkflow")
 		return
 	}
 	// The initiator chasing their request, or an approver sitting on the
@@ -1394,7 +1395,7 @@ func (h *Handler) EscalateWorkflow(w http.ResponseWriter, r *http.Request) {
 	} else {
 		onStage, err := h.store.IsCurrentStageApprover(r.Context(), workflowInstanceID, principalID)
 		if err != nil {
-			writeStoreErr(w, h.log, err, correlationID, "EscalateWorkflow")
+			writeStoreErr(w, r, h.log, err, correlationID, "EscalateWorkflow")
 			return
 		}
 		if onStage {
@@ -1409,10 +1410,10 @@ func (h *Handler) EscalateWorkflow(w http.ResponseWriter, r *http.Request) {
 	instance, _, err := h.store.EscalateWorkflow(r.Context(), workflowInstanceID, principalID,
 		domain.LifecycleCommand{Authority: authority, Meta: commandMeta(r, correlationID, "ESCALATE", workflowInstanceID)})
 	if err != nil {
-		writeStoreErr(w, h.log, err, correlationID, "EscalateWorkflow")
+		writeStoreErr(w, r, h.log, err, correlationID, "EscalateWorkflow")
 		return
 	}
-	writeJSON(w, http.StatusOK, instance)
+	writeJSON(w, r, http.StatusOK, instance)
 }
 
 // ── POST /v1/workflows/{id}/cancel ───────────────────────────────────────────
@@ -1425,7 +1426,7 @@ func (h *Handler) CancelWorkflow(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
 
 	if !isValidUUID(workflowInstanceID) {
-		writeError(w, http.StatusBadRequest, "invalid_uuid", "workflow_instance_id must be a valid UUID", correlationID, nil)
+		writeError(w, r, http.StatusBadRequest, "invalid_uuid", "workflow_instance_id must be a valid UUID", correlationID, nil)
 		return
 	}
 
@@ -1439,7 +1440,7 @@ func (h *Handler) CancelWorkflow(w http.ResponseWriter, r *http.Request) {
 
 	instanceForAuthzCheck, err := h.store.FindWorkflowByID(r.Context(), workflowInstanceID)
 	if err != nil {
-		writeStoreErr(w, h.log, err, correlationID, "CancelWorkflow")
+		writeStoreErr(w, r, h.log, err, correlationID, "CancelWorkflow")
 		return
 	}
 	// The initiator withdrawing their own request cancels under
@@ -1457,10 +1458,10 @@ func (h *Handler) CancelWorkflow(w http.ResponseWriter, r *http.Request) {
 	instance, _, err := h.store.CancelWorkflow(r.Context(), workflowInstanceID, principalID,
 		domain.LifecycleCommand{Authority: authority, Meta: commandMeta(r, correlationID, "CANCEL", workflowInstanceID)})
 	if err != nil {
-		writeStoreErr(w, h.log, err, correlationID, "CancelWorkflow")
+		writeStoreErr(w, r, h.log, err, correlationID, "CancelWorkflow")
 		return
 	}
-	writeJSON(w, http.StatusOK, instance)
+	writeJSON(w, r, http.StatusOK, instance)
 }
 
 // ── POST /v1/workflows/{id}/invalidate ───────────────────────────────────────
@@ -1483,7 +1484,7 @@ func (h *Handler) InvalidateWorkflow(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
 
 	if !isValidUUID(workflowInstanceID) {
-		writeError(w, http.StatusBadRequest, "invalid_uuid", "workflow_instance_id must be a valid UUID", correlationID, nil)
+		writeError(w, r, http.StatusBadRequest, "invalid_uuid", "workflow_instance_id must be a valid UUID", correlationID, nil)
 		return
 	}
 
@@ -1498,20 +1499,20 @@ func (h *Handler) InvalidateWorkflow(w http.ResponseWriter, r *http.Request) {
 
 	var req invalidateWorkflowRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
 		return
 	}
 
 	reasonCode := strings.TrimSpace(req.ReasonCode)
 	if reasonCode == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "reason_code"})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "reason_code"})
 		return
 	}
 
 	// Validate governed reason code per ZS-STATE-001 §16 and Appendix B
 	_, validatedCode, parseErr := svcenvelope.ParseReason(reasonCode)
 	if parseErr != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{
 			"error":   "invalid_reason_code",
 			"message": fmt.Sprintf("reason code %q is not registered in ZS-STATE-001 Appendix B: %v", reasonCode, parseErr),
 		})
@@ -1544,7 +1545,7 @@ func (h *Handler) InvalidateWorkflow(w http.ResponseWriter, r *http.Request) {
 	// turn a caller's stale write into an unguarded update.
 	env.ExpectedVersion = r.Header.Get("X-Expected-Version")
 	if env.ExpectedVersion == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{
 			"error":   "missing_expected_version",
 			"message": "X-Expected-Version header is required for governed transitions",
 		})
@@ -1566,13 +1567,13 @@ func (h *Handler) InvalidateWorkflow(w http.ResponseWriter, r *http.Request) {
 		payload,
 	)
 	if cmdErr != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_transition_command", "message": cmdErr.Error()})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_transition_command", "message": cmdErr.Error()})
 		return
 	}
 
 	existing, findErr := h.store.FindWorkflowByID(r.Context(), workflowInstanceID)
 	if findErr != nil {
-		writeStoreErr(w, h.log, findErr, correlationID, "InvalidateWorkflow")
+		writeStoreErr(w, r, h.log, findErr, correlationID, "InvalidateWorkflow")
 		return
 	}
 	// Invalidation is a system transition: the service that owns the bound
@@ -1588,13 +1589,13 @@ func (h *Handler) InvalidateWorkflow(w http.ResponseWriter, r *http.Request) {
 	// no edge, so a plain retry answered 409 and never reached the store's
 	// idempotent no-op (N-1).
 	if existing.WorkflowStatus == domain.WorkflowStatusInvalidated {
-		writeJSON(w, http.StatusOK, existing)
+		writeJSON(w, r, http.StatusOK, existing)
 		return
 	}
 	if edgeErr := svcenvelope.ValidateTransitionEdge("workflow_instance", existing.WorkflowStatus, "INVALIDATED"); edgeErr != nil {
 		var illegalErr *svcenvelope.IllegalEdgeError
 		if errors.As(edgeErr, &illegalErr) {
-			writeJSON(w, http.StatusConflict, map[string]any{
+			writeJSON(w, r, http.StatusConflict, map[string]any{
 				"error":           "invalid_transition",
 				"message":         illegalErr.Error(),
 				"from_state":      illegalErr.FromState,
@@ -1624,14 +1625,14 @@ func (h *Handler) InvalidateWorkflow(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrConcurrencyConflict):
-			writeJSON(w, http.StatusConflict, map[string]string{
+			writeJSON(w, r, http.StatusConflict, map[string]string{
 				"error":   "concurrency_conflict",
 				"message": "X-Expected-Version does not match the current workflow version",
 			})
 		case errors.Is(err, domain.ErrWorkflowNotFound):
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "workflow_not_found"})
+			writeJSON(w, r, http.StatusNotFound, map[string]string{"error": "workflow_not_found"})
 		case errors.Is(err, domain.ErrInvalidTransition):
-			writeJSON(w, http.StatusConflict, map[string]any{
+			writeJSON(w, r, http.StatusConflict, map[string]any{
 				"error":           "invalid_transition",
 				"message":         "cannot invalidate a workflow in terminal rejected or cancelled state",
 				"reason_family":   string(svcenvelope.ReasonFamilyReject),
@@ -1640,7 +1641,7 @@ func (h *Handler) InvalidateWorkflow(w http.ResponseWriter, r *http.Request) {
 			})
 		default:
 			h.log.Error("InvalidateWorkflow: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			writeJSON(w, r, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
 		}
 		return
 	}
@@ -1657,7 +1658,7 @@ func (h *Handler) InvalidateWorkflow(w http.ResponseWriter, r *http.Request) {
 
 		// Record governance decision per GOV §1 "No evidence afterthought"
 	}
-	writeJSON(w, http.StatusOK, instance)
+	writeJSON(w, r, http.StatusOK, instance)
 }
 
 // ── POST /v1/workflows/{id}/verify-release ───────────────────────────────────
@@ -1685,7 +1686,7 @@ func (h *Handler) VerifyRelease(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
 
 	if !isValidUUID(workflowInstanceID) {
-		writeError(w, http.StatusBadRequest, "invalid_uuid", "workflow_instance_id must be a valid UUID", correlationID, nil)
+		writeError(w, r, http.StatusBadRequest, "invalid_uuid", "workflow_instance_id must be a valid UUID", correlationID, nil)
 		return
 	}
 
@@ -1702,40 +1703,40 @@ func (h *Handler) VerifyRelease(w http.ResponseWriter, r *http.Request) {
 	// against its legal entity and initiator.
 	instanceForAuthz, err := h.store.FindWorkflowByID(r.Context(), workflowInstanceID)
 	if err != nil {
-		writeStoreErr(w, h.log, err, correlationID, "VerifyRelease")
+		writeStoreErr(w, r, h.log, err, correlationID, "VerifyRelease")
 		return
 	}
 	if _, err := h.authz.CheckApprovalAllowed(r.Context(), principalID, instanceForAuthz.LegalEntityID, instanceForAuthz.InitiatedBy,
 		map[string]string{authz.AttrWorkflowType: instanceForAuthz.WorkflowType}); err != nil {
 		switch {
 		case errors.Is(err, domain.ErrAuthorizationDenied):
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": "authorization_denied"})
+			writeJSON(w, r, http.StatusForbidden, map[string]string{"error": "authorization_denied"})
 		default:
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "authorization_service_unavailable"})
+			writeJSON(w, r, http.StatusServiceUnavailable, map[string]string{"error": "authorization_service_unavailable"})
 		}
 		return
 	}
 
 	var req verifyReleaseRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
 		return
 	}
 
 	fp := strings.TrimSpace(req.CurrentSubjectFingerprint)
 	if fp == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "current_subject_fingerprint"})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "current_subject_fingerprint"})
 		return
 	}
 	if !svcenvelope.IsValidFingerprint(fp) {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{
 			"error":   "invalid_subject_fingerprint",
 			"message": "current_subject_fingerprint must match sha256:<64 lowercase hex characters>",
 		})
 		return
 	}
 	if req.ExpectedSubjectVersion != nil && *req.ExpectedSubjectVersion < 0 {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{
 			"error":   "invalid_subject_version",
 			"message": "expected_subject_version must be non-negative",
 		})
@@ -1749,15 +1750,15 @@ func (h *Handler) VerifyRelease(w http.ResponseWriter, r *http.Request) {
 		CurrentSubjectFingerprint: fp,
 	})
 	if err != nil {
-		writeStoreErr(w, h.log, err, correlationID, "VerifyRelease")
+		writeStoreErr(w, r, h.log, err, correlationID, "VerifyRelease")
 		return
 	}
 
 	if !res.CanRelease {
-		writeJSON(w, http.StatusConflict, res)
+		writeJSON(w, r, http.StatusConflict, res)
 		return
 	}
-	writeJSON(w, http.StatusOK, res)
+	writeJSON(w, r, http.StatusOK, res)
 }
 
 // ── Workflow Definition Handlers (WFC-02) ───────────────────────────────────
@@ -1805,14 +1806,14 @@ func (h *Handler) CreateWorkflowDefinition(w http.ResponseWriter, r *http.Reques
 
 	var req createWorkflowDefinitionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
 		return
 	}
 	if missing := req.missingField(); missing != "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": missing})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": missing})
 		return
 	}
-	if h.refuseForeignTenant(w, req.TenantID, tenantScope) {
+	if h.refuseForeignTenant(w, r, req.TenantID, tenantScope) {
 		return
 	}
 
@@ -1827,10 +1828,10 @@ func (h *Handler) CreateWorkflowDefinition(w http.ResponseWriter, r *http.Reques
 	})
 	if err != nil {
 		h.log.Error("CreateWorkflowDefinition: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		writeJSON(w, r, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
 		return
 	}
-	writeJSON(w, http.StatusCreated, definition)
+	writeJSON(w, r, http.StatusCreated, definition)
 }
 
 // ListWorkflowDefinitions handles GET /v1/workflow-definitions.
@@ -1856,13 +1857,13 @@ func (h *Handler) ListWorkflowDefinitions(w http.ResponseWriter, r *http.Request
 	})
 	if err != nil {
 		h.log.Error("ListWorkflowDefinitions: store unavailable", zap.Error(err))
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		writeJSON(w, r, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
 		return
 	}
 	if definitions == nil {
 		definitions = []*domain.WorkflowDefinition{}
 	}
-	writeJSON(w, http.StatusOK, definitions)
+	writeJSON(w, r, http.StatusOK, definitions)
 }
 
 // GetWorkflowDefinition handles GET /v1/workflow-definitions/{workflow_definition_id}.
@@ -1881,7 +1882,7 @@ func (h *Handler) GetWorkflowDefinition(w http.ResponseWriter, r *http.Request) 
 
 	workflowDefinitionID := chi.URLParam(r, "workflow_definition_id")
 	if !isValidUUID(workflowDefinitionID) {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_uuid", "field": "workflow_definition_id"})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_uuid", "field": "workflow_definition_id"})
 		return
 	}
 
@@ -1891,14 +1892,14 @@ func (h *Handler) GetWorkflowDefinition(w http.ResponseWriter, r *http.Request) 
 	})
 	if err != nil {
 		if errors.Is(err, domain.ErrWorkflowNotFound) {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "workflow_definition_not_found"})
+			writeJSON(w, r, http.StatusNotFound, map[string]string{"error": "workflow_definition_not_found"})
 			return
 		}
 		h.log.Error("GetWorkflowDefinition: store unavailable", zap.Error(err))
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		writeJSON(w, r, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
 		return
 	}
-	writeJSON(w, http.StatusOK, definition)
+	writeJSON(w, r, http.StatusOK, definition)
 }
 
 // refuseUnknownDefinition fetches a workflow definition under tenant scope,
@@ -1915,10 +1916,10 @@ func (h *Handler) refuseUnknownDefinition(w http.ResponseWriter, r *http.Request
 		return false
 	}
 	if errors.Is(err, domain.ErrWorkflowNotFound) {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "workflow_definition_not_found"})
+		writeJSON(w, r, http.StatusNotFound, map[string]string{"error": "workflow_definition_not_found"})
 		return true
 	}
-	writeStoreErr(w, h.log, err, correlationID, op)
+	writeStoreErr(w, r, h.log, err, correlationID, op)
 	return true
 }
 
@@ -1940,7 +1941,7 @@ func (h *Handler) SupersedeWorkflowDefinition(w http.ResponseWriter, r *http.Req
 
 	oldDefID := chi.URLParam(r, "workflow_definition_id")
 	if !isValidUUID(oldDefID) {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_uuid", "field": "workflow_definition_id"})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_uuid", "field": "workflow_definition_id"})
 		return
 	}
 	if h.refuseUnknownDefinition(w, r, tenantScope, oldDefID, correlationID, "SupersedeWorkflowDefinition") {
@@ -1951,19 +1952,19 @@ func (h *Handler) SupersedeWorkflowDefinition(w http.ResponseWriter, r *http.Req
 		NewDefinitionID string `json:"new_definition_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
 		return
 	}
 	if req.NewDefinitionID == "" || !isValidUUID(req.NewDefinitionID) {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "new_definition_id"})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "new_definition_id"})
 		return
 	}
 
 	if err := h.store.SupersedeWorkflowDefinition(r.Context(), oldDefID, req.NewDefinitionID); err != nil {
-		writeStoreErr(w, h.log, err, correlationID, "SupersedeWorkflowDefinition")
+		writeStoreErr(w, r, h.log, err, correlationID, "SupersedeWorkflowDefinition")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "superseded"})
+	writeJSON(w, r, http.StatusOK, map[string]string{"status": "superseded"})
 }
 
 // ActivateWorkflowDefinition handles POST /v1/workflow-definitions/{workflow_definition_id}/activate.
@@ -1984,7 +1985,7 @@ func (h *Handler) ActivateWorkflowDefinition(w http.ResponseWriter, r *http.Requ
 
 	workflowDefinitionID := chi.URLParam(r, "workflow_definition_id")
 	if !isValidUUID(workflowDefinitionID) {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_uuid", "field": "workflow_definition_id"})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_uuid", "field": "workflow_definition_id"})
 		return
 	}
 	if h.refuseUnknownDefinition(w, r, tenantScope, workflowDefinitionID, correlationID, "ActivateWorkflowDefinition") {
@@ -1992,10 +1993,10 @@ func (h *Handler) ActivateWorkflowDefinition(w http.ResponseWriter, r *http.Requ
 	}
 
 	if err := h.store.ActivateWorkflowDefinition(r.Context(), workflowDefinitionID); err != nil {
-		writeStoreErr(w, h.log, err, correlationID, "ActivateWorkflowDefinition")
+		writeStoreErr(w, r, h.log, err, correlationID, "ActivateWorkflowDefinition")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "activated"})
+	writeJSON(w, r, http.StatusOK, map[string]string{"status": "activated"})
 }
 
 // SuspendWorkflowDefinition handles POST /v1/workflow-definitions/{workflow_definition_id}/suspend.
@@ -2016,7 +2017,7 @@ func (h *Handler) SuspendWorkflowDefinition(w http.ResponseWriter, r *http.Reque
 
 	workflowDefinitionID := chi.URLParam(r, "workflow_definition_id")
 	if !isValidUUID(workflowDefinitionID) {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_uuid", "field": "workflow_definition_id"})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_uuid", "field": "workflow_definition_id"})
 		return
 	}
 	if h.refuseUnknownDefinition(w, r, tenantScope, workflowDefinitionID, correlationID, "SuspendWorkflowDefinition") {
@@ -2024,10 +2025,10 @@ func (h *Handler) SuspendWorkflowDefinition(w http.ResponseWriter, r *http.Reque
 	}
 
 	if err := h.store.SuspendWorkflowDefinition(r.Context(), workflowDefinitionID); err != nil {
-		writeStoreErr(w, h.log, err, correlationID, "SuspendWorkflowDefinition")
+		writeStoreErr(w, r, h.log, err, correlationID, "SuspendWorkflowDefinition")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "suspended"})
+	writeJSON(w, r, http.StatusOK, map[string]string{"status": "suspended"})
 }
 
 // RetireWorkflowDefinition handles POST /v1/workflow-definitions/{workflow_definition_id}/retire.
@@ -2048,7 +2049,7 @@ func (h *Handler) RetireWorkflowDefinition(w http.ResponseWriter, r *http.Reques
 
 	workflowDefinitionID := chi.URLParam(r, "workflow_definition_id")
 	if !isValidUUID(workflowDefinitionID) {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_uuid", "field": "workflow_definition_id"})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_uuid", "field": "workflow_definition_id"})
 		return
 	}
 	if h.refuseUnknownDefinition(w, r, tenantScope, workflowDefinitionID, correlationID, "RetireWorkflowDefinition") {
@@ -2056,10 +2057,10 @@ func (h *Handler) RetireWorkflowDefinition(w http.ResponseWriter, r *http.Reques
 	}
 
 	if err := h.store.RetireWorkflowDefinition(r.Context(), workflowDefinitionID); err != nil {
-		writeStoreErr(w, h.log, err, correlationID, "RetireWorkflowDefinition")
+		writeStoreErr(w, r, h.log, err, correlationID, "RetireWorkflowDefinition")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "retired"})
+	writeJSON(w, r, http.StatusOK, map[string]string{"status": "retired"})
 }
 
 // EscalateToWorkflow handles POST /v1/workflows/{workflow_instance_id}/escalate-to.
@@ -2077,17 +2078,17 @@ func (h *Handler) EscalateToWorkflow(w http.ResponseWriter, r *http.Request) {
 
 	workflowInstanceID := chi.URLParam(r, "workflow_instance_id")
 	if !isValidUUID(workflowInstanceID) {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_uuid", "field": "workflow_instance_id"})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_uuid", "field": "workflow_instance_id"})
 		return
 	}
 
 	instanceForAuthzCheck, err := h.store.FindWorkflowByID(r.Context(), workflowInstanceID)
 	if err != nil {
-		writeStoreErr(w, h.log, err, correlationID, "EscalateToWorkflow")
+		writeStoreErr(w, r, h.log, err, correlationID, "EscalateToWorkflow")
 		return
 	}
 	if instanceForAuthzCheck.TenantID != tenantScope {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "workflow_not_found"})
+		writeJSON(w, r, http.StatusNotFound, map[string]string{"error": "workflow_not_found"})
 		return
 	}
 
@@ -2097,15 +2098,15 @@ func (h *Handler) EscalateToWorkflow(w http.ResponseWriter, r *http.Request) {
 		Narrative        *string `json:"narrative,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
 		return
 	}
 	if req.EscalationTarget == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "escalation_target"})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "escalation_target"})
 		return
 	}
 	if req.ReasonCode == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "reason_code"})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "reason_code"})
 		return
 	}
 
@@ -2127,7 +2128,7 @@ func (h *Handler) EscalateToWorkflow(w http.ResponseWriter, r *http.Request) {
 			derefString(req.Narrative), workflowInstanceID),
 	})
 	if err != nil {
-		writeStoreErr(w, h.log, err, correlationID, "EscalateToWorkflow")
+		writeStoreErr(w, r, h.log, err, correlationID, "EscalateToWorkflow")
 		return
 	}
 
@@ -2137,7 +2138,7 @@ func (h *Handler) EscalateToWorkflow(w http.ResponseWriter, r *http.Request) {
 		zap.String("actor_id", principalID),
 		zap.String("correlation_id", correlationID),
 	)
-	writeJSON(w, http.StatusOK, instance)
+	writeJSON(w, r, http.StatusOK, instance)
 }
 
 // ListPendingApprovals handles GET /v1/workflows/pending.
@@ -2158,13 +2159,13 @@ func (h *Handler) ListPendingApprovals(w http.ResponseWriter, r *http.Request) {
 
 	instances, err := h.store.ListPendingApprovals(r.Context(), tenantScope, getIntQuery(r, "limit", 50), getIntQuery(r, "offset", 0))
 	if err != nil {
-		writeStoreErr(w, h.log, err, correlationID, "ListPendingApprovals")
+		writeStoreErr(w, r, h.log, err, correlationID, "ListPendingApprovals")
 		return
 	}
 	if instances == nil {
 		instances = []*domain.WorkflowInstance{}
 	}
-	writeJSON(w, http.StatusOK, instances)
+	writeJSON(w, r, http.StatusOK, instances)
 }
 
 // GetApprovalEvidence handles GET /v1/workflows/{workflow_instance_id}/evidence.
@@ -2182,17 +2183,17 @@ func (h *Handler) GetApprovalEvidence(w http.ResponseWriter, r *http.Request) {
 
 	workflowInstanceID := chi.URLParam(r, "workflow_instance_id")
 	if !isValidUUID(workflowInstanceID) {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_uuid", "field": "workflow_instance_id"})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_uuid", "field": "workflow_instance_id"})
 		return
 	}
 
 	instance, err := h.store.FindWorkflowByID(r.Context(), workflowInstanceID)
 	if err != nil {
-		writeStoreErr(w, h.log, err, correlationID, "GetApprovalEvidence")
+		writeStoreErr(w, r, h.log, err, correlationID, "GetApprovalEvidence")
 		return
 	}
 	if instance.TenantID != tenantScope {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "workflow_not_found"})
+		writeJSON(w, r, http.StatusNotFound, map[string]string{"error": "workflow_not_found"})
 		return
 	}
 	if !h.authorizeRead(w, r, instance, principalID, correlationID, "GetApprovalEvidence") {
@@ -2201,13 +2202,13 @@ func (h *Handler) GetApprovalEvidence(w http.ResponseWriter, r *http.Request) {
 
 	transitions, err := h.store.GetApprovalEvidence(r.Context(), workflowInstanceID)
 	if err != nil {
-		writeStoreErr(w, h.log, err, correlationID, "GetApprovalEvidence")
+		writeStoreErr(w, r, h.log, err, correlationID, "GetApprovalEvidence")
 		return
 	}
 	if transitions == nil {
 		transitions = []*domain.WorkflowTransition{}
 	}
-	writeJSON(w, http.StatusOK, transitions)
+	writeJSON(w, r, http.StatusOK, transitions)
 }
 
 // RequestChanges handles POST /v1/workflows/{workflow_instance_id}/request-changes.
@@ -2225,17 +2226,17 @@ func (h *Handler) RequestChanges(w http.ResponseWriter, r *http.Request) {
 
 	workflowInstanceID := chi.URLParam(r, "workflow_instance_id")
 	if !isValidUUID(workflowInstanceID) {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_uuid", "field": "workflow_instance_id"})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_uuid", "field": "workflow_instance_id"})
 		return
 	}
 
 	instance, err := h.store.FindWorkflowByID(r.Context(), workflowInstanceID)
 	if err != nil {
-		writeStoreErr(w, h.log, err, correlationID, "RequestChanges")
+		writeStoreErr(w, r, h.log, err, correlationID, "RequestChanges")
 		return
 	}
 	if instance.TenantID != tenantScope {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "workflow_not_found"})
+		writeJSON(w, r, http.StatusNotFound, map[string]string{"error": "workflow_not_found"})
 		return
 	}
 
@@ -2249,7 +2250,7 @@ func (h *Handler) RequestChanges(w http.ResponseWriter, r *http.Request) {
 		CausationID *string `json:"causation_id,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
 		return
 	}
 
@@ -2260,10 +2261,10 @@ func (h *Handler) RequestChanges(w http.ResponseWriter, r *http.Request) {
 
 	if err := h.store.RequestChanges(r.Context(), workflowInstanceID, principalID, rationale, req.CausationID,
 		domain.LifecycleCommand{Authority: authority, Meta: commandMeta(r, correlationID, "REQUEST_CHANGES", rationale, workflowInstanceID)}); err != nil {
-		writeStoreErr(w, h.log, err, correlationID, "RequestChanges")
+		writeStoreErr(w, r, h.log, err, correlationID, "RequestChanges")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "changes_requested"})
+	writeJSON(w, r, http.StatusOK, map[string]string{"status": "changes_requested"})
 }
 
 // ── helpers for query params ───────────────────────────────────────────────────
@@ -2309,68 +2310,86 @@ func isValidUUID(s string) bool {
 	return uuidRegex.MatchString(s)
 }
 
-// writeError writes a standardized error response per ZS-ARCH-SVC-001 §7.
-func writeError(w http.ResponseWriter, status int, errorCode, message, correlationID string, details map[string]any) {
-	resp := map[string]any{
-		"error":          errorCode,
-		"message":        message,
-		"correlation_id": correlationID,
-		"timestamp":      time.Now().UTC().Format(time.RFC3339),
-	}
+// writeError writes a RFC 9457 problem details response using the shared apicontract package.
+func writeError(w http.ResponseWriter, r *http.Request, status int, errorCode, message, correlationID string, details map[string]any) {
+	extra := map[string]any{}
 	for k, v := range details {
-		resp[k] = v
+		extra[k] = v
 	}
-	writeJSON(w, status, resp)
+	apicontract.WriteProblem(w, r, apicontract.Problem{
+		Status:    status,
+		Code:      errorCode,
+		Detail:    message,
+		Retryable: status >= 500,
+		Extra:     extra,
+	})
 }
 
 // writeStoreErr converts store-layer errors to standardized HTTP responses.
-func writeStoreErr(w http.ResponseWriter, log *zap.Logger, err error, correlationID, op string) {
+func writeStoreErr(w http.ResponseWriter, r *http.Request, log *zap.Logger, err error, correlationID, op string) {
 	switch {
 	case errors.Is(err, domain.ErrWorkflowNotFound):
-		writeError(w, http.StatusNotFound, "workflow_not_found", "workflow instance not found", correlationID, nil)
+		writeError(w, r, http.StatusNotFound, "workflow_not_found", "workflow instance not found", correlationID, nil)
 	case errors.Is(err, domain.ErrInvalidTransition):
-		writeError(w, http.StatusConflict, "invalid_transition", "invalid workflow status transition", correlationID, map[string]any{
+		writeError(w, r, http.StatusConflict, "invalid_transition", "invalid workflow status transition", correlationID, map[string]any{
 			"reason_family":   string(svcenvelope.ReasonFamilyReject),
 			"reason_code":     string(svcenvelope.ReasonRejectPolicyNotMet),
 			"exception_class": string(svcenvelope.ExceptionClassBusinessRule),
 		})
 	case errors.Is(err, domain.ErrConcurrencyConflict):
-		writeError(w, http.StatusConflict, "concurrency_conflict", "workflow was modified by another request", correlationID, nil)
+		writeError(w, r, http.StatusConflict, "concurrency_conflict", "workflow was modified by another request", correlationID, nil)
 	case errors.Is(err, domain.ErrIdempotencyMismatch):
-		writeError(w, http.StatusConflict, "idempotency_mismatch", "same idempotency key used with different request body", correlationID, nil)
+		writeError(w, r, http.StatusConflict, "idempotency_mismatch", "same idempotency key used with different request body", correlationID, nil)
 	case errors.Is(err, domain.ErrWrongApprover):
-		writeError(w, http.StatusForbidden, "wrong_approver", "actor is not the approver for the current stage", correlationID, nil)
+		writeError(w, r, http.StatusForbidden, "wrong_approver", "actor is not the approver for the current stage", correlationID, nil)
 	case errors.Is(err, domain.ErrNoCurrentStage):
-		writeError(w, http.StatusNotFound, "no_current_stage", "workflow has no stage awaiting a decision", correlationID, nil)
+		writeError(w, r, http.StatusNotFound, "no_current_stage", "workflow has no stage awaiting a decision", correlationID, nil)
 	case errors.Is(err, domain.ErrNotEscalationOwner):
-		writeError(w, http.StatusForbidden, "not_escalation_owner", "only the escalation target may decide this stage", correlationID, nil)
+		writeError(w, r, http.StatusForbidden, "not_escalation_owner", "only the escalation target may decide this stage", correlationID, nil)
 	case errors.Is(err, domain.ErrAlreadyDecided):
-		writeError(w, http.StatusConflict, "already_decided", "principal already decided another stage of this workflow", correlationID, nil)
+		writeError(w, r, http.StatusConflict, "already_decided", "principal already decided another stage of this workflow", correlationID, nil)
 	case errors.Is(err, domain.ErrSelfApprovalNotAllowed):
-		writeError(w, http.StatusForbidden, "self_approval_not_allowed", "principal may not decide their own submission", correlationID, nil)
+		writeError(w, r, http.StatusForbidden, "self_approval_not_allowed", "principal may not decide their own submission", correlationID, nil)
 	case errors.Is(err, domain.ErrNotQuorumStage):
-		writeError(w, http.StatusConflict, "not_quorum_stage", "the current stage is not a QUORUM stage", correlationID, nil)
+		writeError(w, r, http.StatusConflict, "not_quorum_stage", "the current stage is not a QUORUM stage", correlationID, nil)
 	case errors.Is(err, domain.ErrNotEligibleQuorumApprover):
-		writeError(w, http.StatusForbidden, "not_eligible_quorum_approver", "actor is not eligible to vote on this stage", correlationID, nil)
+		writeError(w, r, http.StatusForbidden, "not_eligible_quorum_approver", "actor is not eligible to vote on this stage", correlationID, nil)
 	case errors.Is(err, domain.ErrLegalEntityNotFound):
-		writeError(w, http.StatusNotFound, "legal_entity_not_found", "legal entity not found in the caller's tenant", correlationID, nil)
+		writeError(w, r, http.StatusNotFound, "legal_entity_not_found", "legal entity not found in the caller's tenant", correlationID, nil)
 	case errors.Is(err, domain.ErrRegistryUnavailable):
-		writeError(w, http.StatusServiceUnavailable, "registry_unavailable", "tenant-entity-registry-svc unavailable", correlationID, map[string]any{"retryable": true})
+		writeError(w, r, http.StatusServiceUnavailable, "registry_unavailable", "tenant-entity-registry-svc unavailable", correlationID, map[string]any{"retryable": true})
 	default:
 		log.Error(op+": store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "workflow store temporarily unavailable", correlationID, map[string]any{
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "workflow store temporarily unavailable", correlationID, map[string]any{
 			"retryable": true,
 		})
 	}
 }
 
 // writeJSON serialises v. An error body ({"error": code, ...}) is rendered as
-// RFC 9457 application/problem+json with the §16 error_class; the legacy
-// members stay, so callers that read "error" are unaffected (Governance audit
-// X9, workflow row 55).
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	if idenv.WriteLegacyError(w, nil, status, v) {
-		return
+// RFC 9457 application/problem+json with the §16 error_class via apicontract.
+func writeJSON(w http.ResponseWriter, r *http.Request, status int, v any) {
+	if errResp, ok := v.(map[string]any); ok {
+		if errCode, ok := errResp["error"].(string); ok {
+			message := ""
+			if msg, ok := errResp["message"].(string); ok {
+				message = msg
+			}
+			extra := map[string]any{}
+			for k, v := range errResp {
+				if k != "error" && k != "message" && k != "correlation_id" {
+					extra[k] = v
+				}
+			}
+			apicontract.WriteProblem(w, r, apicontract.Problem{
+				Status:    status,
+				Code:      errCode,
+				Detail:    message,
+				Retryable: status >= 500,
+				Extra:     extra,
+			})
+			return
+		}
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
