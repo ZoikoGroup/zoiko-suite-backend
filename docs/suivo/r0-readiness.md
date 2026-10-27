@@ -29,7 +29,7 @@ TEST-ONLY fixtures with the fake model; it proves mechanisms, not production beh
 | Missing Security, SRE or QA sign-off | All PENDING |
 | Rollback or kill switch cannot be executed | Drills pass in dev; not yet executed on staging |
 | Handoff/CRM false-success state | Route-only; prohibited phrases blocked; no CRM/case code in R0 |
-| P0 accessibility obstruction | Widget built (public site + console). Keyboard, focus return, live region, 44 px buttons, 375 px layout checked in a browser; no screen-reader (NVDA/VoiceOver) or 200%/400% zoom pass yet |
+| P0 accessibility obstruction | Widget built in the admin console only (`zoiko-suite-frontend-platform`; product-owner decision — Docs 01/11 intend the public website). Keyboard, focus return, live region, 44 px buttons, 375 px layout checked in a browser; no screen-reader (NVDA/VoiceOver) or 200%/400% zoom pass yet |
 
 ## Operational artefacts
 
