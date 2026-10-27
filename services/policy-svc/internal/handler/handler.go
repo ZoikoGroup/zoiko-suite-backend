@@ -13,6 +13,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
+	apicontract "zoiko.io/identity-envelope/apicontract"
 
 	"zoiko.io/policy-svc/internal/authz"
 	"zoiko.io/policy-svc/internal/domain"
@@ -131,17 +132,18 @@ const (
 	codeNotImplemented      = "NOT_IMPLEMENTED"
 )
 
-// writeError writes the error body. `error` keeps the snake_case value
-// callers already switch on; `code` is the stable GCP §16 class.
-func writeError(w http.ResponseWriter, status int, code, legacy, message string, extra map[string]any) {
-	body := map[string]any{"error": legacy, "code": code}
-	if message != "" {
-		body["message"] = message
+func writeError(w http.ResponseWriter, r *http.Request, status int, code, legacy, message string, extra map[string]any) {
+	detail := message
+	if detail == "" {
+		detail = legacy
 	}
-	for k, v := range extra {
-		body[k] = v
-	}
-	writeJSON(w, status, body)
+	apicontract.WriteProblem(w, r, apicontract.Problem{
+		Status:    status,
+		Code:      code,
+		Detail:    detail,
+		Retryable: status >= 500,
+		Extra:     extra,
+	})
 }
 
 func (h *Handler) storeUnavailable(w http.ResponseWriter, r *http.Request, op string, err error) {
@@ -149,7 +151,7 @@ func (h *Handler) storeUnavailable(w http.ResponseWriter, r *http.Request, op st
 		zap.String("correlation_id", r.Header.Get("X-Correlation-ID")),
 		zap.Error(err),
 	)
-	writeError(w, http.StatusServiceUnavailable, codeUnavailable, "store_unavailable", "", nil)
+	writeError(w, r, http.StatusServiceUnavailable, codeUnavailable, "store_unavailable", "", nil)
 }
 
 // ── request context ──────────────────────────────────────────────────────────
@@ -161,7 +163,7 @@ func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (stri
 	if id := strings.TrimSpace(r.Header.Get("X-Principal-Id")); id != "" {
 		return id, true
 	}
-	writeError(w, http.StatusUnauthorized, codeContextUnresolved, "missing_principal",
+	writeError(w, r, http.StatusUnauthorized, codeContextUnresolved, "missing_principal",
 		"X-Principal-Id is required — the gateway sets it from a verified identity envelope", nil)
 	return "", false
 }
@@ -172,11 +174,11 @@ func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (stri
 func (h *Handler) requireTenant(w http.ResponseWriter, r *http.Request) (string, bool) {
 	tenantID := svcmiddleware.TenantFromContext(r.Context())
 	if tenantID == "" {
-		writeError(w, http.StatusUnauthorized, codeContextUnresolved, "tenant_scope_missing", "caller tenant scope missing", nil)
+		writeError(w, r, http.StatusUnauthorized, codeContextUnresolved, "tenant_scope_missing", "caller tenant scope missing", nil)
 		return "", false
 	}
 	if _, err := uuid.Parse(tenantID); err != nil {
-		writeError(w, http.StatusBadRequest, codeContextUnresolved, "invalid_tenant_id", "X-Tenant-Id must be a UUID", nil)
+		writeError(w, r, http.StatusBadRequest, codeContextUnresolved, "invalid_tenant_id", "X-Tenant-Id must be a UUID", nil)
 		return "", false
 	}
 	return tenantID, true
@@ -184,11 +186,11 @@ func (h *Handler) requireTenant(w http.ResponseWriter, r *http.Request) (string,
 
 // refuseForeignTenant answers 403 if claimed names a tenant other than the
 // caller's verified scope. nil means GLOBAL scope, a deliberate request.
-func (h *Handler) refuseForeignTenant(w http.ResponseWriter, claimed *string, tenantID string) bool {
+func (h *Handler) refuseForeignTenant(w http.ResponseWriter, r *http.Request, claimed *string, tenantID string) bool {
 	if claimed == nil || *claimed == "" || *claimed == tenantID {
 		return false
 	}
-	writeError(w, http.StatusForbidden, codeContextUnresolved, "tenant_scope_mismatch",
+	writeError(w, r, http.StatusForbidden, codeContextUnresolved, "tenant_scope_mismatch",
 		"request tenant_id does not match the caller's verified tenant scope", nil)
 	return true
 }
@@ -210,11 +212,11 @@ func legalEntityFromRequest(w http.ResponseWriter, r *http.Request, body *string
 	}
 	if le != nil {
 		if _, err := uuid.Parse(*le); err != nil {
-			writeError(w, http.StatusBadRequest, codeInvalidRequest, "invalid_legal_entity_id", "legal_entity_id must be a UUID", nil)
+			writeError(w, r, http.StatusBadRequest, codeInvalidRequest, "invalid_legal_entity_id", "legal_entity_id must be a UUID", nil)
 			return nil, false
 		}
 		if header != "" && header != "PLATFORM" && header != *le {
-			writeError(w, http.StatusBadRequest, codeInvalidRequest, "legal_entity_mismatch",
+			writeError(w, r, http.StatusBadRequest, codeInvalidRequest, "legal_entity_mismatch",
 				"X-Legal-Entity-Id header does not match body legal_entity_id", nil)
 			return nil, false
 		}
@@ -229,34 +231,34 @@ func validUUID(s string) bool {
 
 // requireUUID answers 400 unless value is a UUID — a malformed id is the
 // caller's mistake, not an outage (audit X10).
-func requireUUID(w http.ResponseWriter, field, value string) bool {
+func requireUUID(w http.ResponseWriter, r *http.Request, field, value string) bool {
 	if validUUID(value) {
 		return true
 	}
-	writeError(w, http.StatusBadRequest, codeInvalidRequest, "invalid_"+field, field+" must be a valid UUID", nil)
+	writeError(w, r, http.StatusBadRequest, codeInvalidRequest, "invalid_"+field, field+" must be a valid UUID", nil)
 	return false
 }
 
-func optionalUUID(w http.ResponseWriter, field string, value *string) bool {
+func optionalUUID(w http.ResponseWriter, r *http.Request, field string, value *string) bool {
 	if value == nil || *value == "" {
 		return true
 	}
-	return requireUUID(w, field, *value)
+	return requireUUID(w, r, field, *value)
 }
 
 // tooLong answers 400 when value exceeds its column width, before it can
 // reach Postgres and come back as a 503.
-func tooLong(w http.ResponseWriter, field, value string, max int) bool {
+func tooLong(w http.ResponseWriter, r *http.Request, field, value string, max int) bool {
 	if len(value) <= max {
 		return false
 	}
-	writeError(w, http.StatusBadRequest, codeInvalidRequest, "field_too_long", field+" exceeds "+strconv.Itoa(max)+" characters",
+	writeError(w, r, http.StatusBadRequest, codeInvalidRequest, "field_too_long", field+" exceeds "+strconv.Itoa(max)+" characters",
 		map[string]any{"field": field, "max_length": max})
 	return true
 }
 
-func missingField(w http.ResponseWriter, field string) {
-	writeError(w, http.StatusBadRequest, codeInvalidRequest, "missing_field", "", map[string]any{"field": field})
+func missingField(w http.ResponseWriter, r *http.Request, field string) {
+	writeError(w, r, http.StatusBadRequest, codeInvalidRequest, "missing_field", "", map[string]any{"field": field})
 }
 
 func eventMeta(r *http.Request, actor string) domain.EventMeta {
@@ -290,14 +292,14 @@ func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID,
 	case err == nil:
 		return true
 	case errors.Is(err, domain.ErrAuthorizationDenied):
-		writeError(w, http.StatusForbidden, codeAuthorizationDenied, "authorization_denied", "", map[string]any{"action_type": actionType})
+		writeError(w, r, http.StatusForbidden, codeAuthorizationDenied, "authorization_denied", "", map[string]any{"action_type": actionType})
 	default:
 		h.log.Error("authorization check failed — refusing the request",
 			zap.String("principal_id", principalID),
 			zap.String("action_type", actionType),
 			zap.Error(err),
 		)
-		writeError(w, http.StatusServiceUnavailable, codeUnavailable, "authz_unavailable", "", nil)
+		writeError(w, r, http.StatusServiceUnavailable, codeUnavailable, "authz_unavailable", "", nil)
 	}
 	return false
 }
@@ -410,20 +412,20 @@ func (h *Handler) CreatePolicy(w http.ResponseWriter, r *http.Request) {
 	}
 	switch {
 	case req.PolicyCode == "":
-		missingField(w, "policy_code")
+		missingField(w, r, "policy_code")
 		return
 	case req.PolicyName == "":
-		missingField(w, "policy_name")
+		missingField(w, r, "policy_name")
 		return
 	case req.PolicyType == "":
-		missingField(w, "policy_type")
+		missingField(w, r, "policy_type")
 		return
 	}
-	if tooLong(w, "policy_code", req.PolicyCode, 128) || tooLong(w, "policy_type", req.PolicyType, 64) ||
-		tooLong(w, "policy_name", req.PolicyName, 512) {
+	if tooLong(w, r, "policy_code", req.PolicyCode, 128) || tooLong(w, r, "policy_type", req.PolicyType, 64) ||
+		tooLong(w, r, "policy_name", req.PolicyName, 512) {
 		return
 	}
-	if req.PolicyID != "" && !requireUUID(w, "policy_id", req.PolicyID) {
+	if req.PolicyID != "" && !requireUUID(w, r, "policy_id", req.PolicyID) {
 		return
 	}
 
@@ -434,7 +436,7 @@ func (h *Handler) CreatePolicy(w http.ResponseWriter, r *http.Request) {
 	case domain.ScopeTypeGlobal:
 		owner, action = nil, authz.ActionPolicyCreateGlobal
 	default:
-		writeError(w, http.StatusBadRequest, codeInvalidRequest, "invalid_scope", "scope must be TENANT or GLOBAL", nil)
+		writeError(w, r, http.StatusBadRequest, codeInvalidRequest, "invalid_scope", "scope must be TENANT or GLOBAL", nil)
 		return
 	}
 	// A family is not scoped to a legal entity — scoping lives on its
@@ -454,7 +456,7 @@ func (h *Handler) CreatePolicy(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		if errors.Is(err, domain.ErrConflict) {
-			writeError(w, http.StatusConflict, codeIdempotencyMismatch, "policy_conflict", "", map[string]any{"policy_code": req.PolicyCode})
+			writeError(w, r, http.StatusConflict, codeIdempotencyMismatch, "policy_conflict", "", map[string]any{"policy_code": req.PolicyCode})
 			return
 		}
 		h.storeUnavailable(w, r, "CreatePolicy", err)
@@ -471,7 +473,7 @@ func (h *Handler) CreatePolicy(w http.ResponseWriter, r *http.Request) {
 // caller (a platform family, or one the caller's tenant owns).
 func (h *Handler) GetPolicy(w http.ResponseWriter, r *http.Request) {
 	policyID := chi.URLParam(r, "policy_id")
-	if !requireUUID(w, "policy_id", policyID) {
+	if !requireUUID(w, r, "policy_id", policyID) {
 		return
 	}
 	if _, ok := h.requireTenant(w, r); !ok {
@@ -483,7 +485,7 @@ func (h *Handler) GetPolicy(w http.ResponseWriter, r *http.Request) {
 	p, err := h.store.FindPolicyByID(r.Context(), policyID)
 	if err != nil {
 		if errors.Is(err, domain.ErrPolicyNotFound) {
-			writeError(w, http.StatusNotFound, codeNotFound, "policy_not_found", "", map[string]any{"policy_id": policyID})
+			writeError(w, r, http.StatusNotFound, codeNotFound, "policy_not_found", "", map[string]any{"policy_id": policyID})
 			return
 		}
 		h.storeUnavailable(w, r, "GetPolicy", err)
@@ -511,27 +513,27 @@ type createPolicyVersionRequest struct {
 // validateRulePayload checks a payload against what its policy type's
 // evaluator will need (V-001 §10.1 step 2), so a version that could never be
 // evaluated is refused at authoring time, not at the first evaluation.
-func validateRulePayload(w http.ResponseWriter, policyType string, payload json.RawMessage) bool {
+func validateRulePayload(w http.ResponseWriter, r *http.Request, policyType string, payload json.RawMessage) bool {
 	if len(payload) == 0 {
 		if policyType == policyTypeApprovalThreshold {
-			missingField(w, "rule_payload.threshold_amount")
+			missingField(w, r, "rule_payload.threshold_amount")
 			return false
 		}
 		return true
 	}
 	var obj map[string]json.RawMessage
 	if err := json.Unmarshal(payload, &obj); err != nil {
-		writeError(w, http.StatusBadRequest, codeInvalidRequest, "invalid_rule_payload", "rule_payload must be a JSON object", nil)
+		writeError(w, r, http.StatusBadRequest, codeInvalidRequest, "invalid_rule_payload", "rule_payload must be a JSON object", nil)
 		return false
 	}
 	if policyType == policyTypeApprovalThreshold {
 		amount, present, err := decodeExactAmount(payload, "threshold_amount")
 		if err != nil || !present {
-			missingField(w, "rule_payload.threshold_amount")
+			missingField(w, r, "rule_payload.threshold_amount")
 			return false
 		}
 		if amount.Sign() < 0 {
-			writeError(w, http.StatusBadRequest, codeInvalidRequest, "invalid_rule_payload", "threshold_amount must not be negative", nil)
+			writeError(w, r, http.StatusBadRequest, codeInvalidRequest, "invalid_rule_payload", "threshold_amount must not be negative", nil)
 			return false
 		}
 	}
@@ -550,7 +552,7 @@ func (h *Handler) CreatePolicyVersion(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if !requireUUID(w, "policy_id", policyID) {
+	if !requireUUID(w, r, "policy_id", policyID) {
 		return
 	}
 	tenantID, ok := h.requireTenant(w, r)
@@ -563,34 +565,34 @@ func (h *Handler) CreatePolicyVersion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.EffectiveFrom.IsZero() {
-		missingField(w, "effective_from")
+		missingField(w, r, "effective_from")
 		return
 	}
 	if req.EffectiveTo != nil && !req.EffectiveTo.After(req.EffectiveFrom) {
-		writeError(w, http.StatusBadRequest, codeInvalidRequest, "invalid_temporal_range", "effective_to must be after effective_from", nil)
+		writeError(w, r, http.StatusBadRequest, codeInvalidRequest, "invalid_temporal_range", "effective_to must be after effective_from", nil)
 		return
 	}
-	if (req.PolicyVersionID != "" && !requireUUID(w, "policy_version_id", req.PolicyVersionID)) ||
-		!optionalUUID(w, "tenant_id", req.TenantID) {
+	if (req.PolicyVersionID != "" && !requireUUID(w, r, "policy_version_id", req.PolicyVersionID)) ||
+		!optionalUUID(w, r, "tenant_id", req.TenantID) {
 		return
 	}
-	if tooLong(w, "source", req.Source, 64) || tooLong(w, "rationale", req.Rationale, 4000) {
+	if tooLong(w, r, "source", req.Source, 64) || tooLong(w, r, "rationale", req.Rationale, 4000) {
 		return
 	}
 	if req.LegalEntityID != nil && *req.LegalEntityID == "" {
 		req.LegalEntityID = nil
 	}
 	if req.LegalEntityID != nil {
-		if !requireUUID(w, "legal_entity_id", *req.LegalEntityID) {
+		if !requireUUID(w, r, "legal_entity_id", *req.LegalEntityID) {
 			return
 		}
 		if env, ok := envelope.FromContext(r.Context()); ok && env.LegalEntityID != "" && env.LegalEntityID != *req.LegalEntityID {
-			writeError(w, http.StatusBadRequest, codeInvalidRequest, "legal_entity_mismatch",
+			writeError(w, r, http.StatusBadRequest, codeInvalidRequest, "legal_entity_mismatch",
 				"X-Legal-Entity-Id header does not match body legal_entity_id", nil)
 			return
 		}
 	}
-	if h.refuseForeignTenant(w, req.TenantID, tenantID) {
+	if h.refuseForeignTenant(w, r, req.TenantID, tenantID) {
 		return
 	}
 	if req.TenantID != nil && *req.TenantID == "" {
@@ -600,7 +602,7 @@ func (h *Handler) CreatePolicyVersion(w http.ResponseWriter, r *http.Request) {
 	family, err := h.store.FindPolicyByID(r.Context(), policyID)
 	if err != nil {
 		if errors.Is(err, domain.ErrPolicyNotFound) {
-			writeError(w, http.StatusNotFound, codeNotFound, "policy_not_found", "", map[string]any{"policy_id": policyID})
+			writeError(w, r, http.StatusNotFound, codeNotFound, "policy_not_found", "", map[string]any{"policy_id": policyID})
 			return
 		}
 		h.storeUnavailable(w, r, "CreatePolicyVersion", err)
@@ -613,10 +615,10 @@ func (h *Handler) CreatePolicyVersion(w http.ResponseWriter, r *http.Request) {
 	}
 	// A global version naming one legal entity is an incoherent scope.
 	if req.TenantID == nil && req.LegalEntityID != nil {
-		writeError(w, http.StatusBadRequest, codeInvalidRequest, "invalid_scope", "a global version (no tenant_id) cannot name a legal_entity_id", nil)
+		writeError(w, r, http.StatusBadRequest, codeInvalidRequest, "invalid_scope", "a global version (no tenant_id) cannot name a legal_entity_id", nil)
 		return
 	}
-	if !validateRulePayload(w, family.PolicyType, req.RulePayload) {
+	if !validateRulePayload(w, r, family.PolicyType, req.RulePayload) {
 		return
 	}
 
@@ -648,11 +650,11 @@ func (h *Handler) CreatePolicyVersion(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrPolicyNotFound):
-			writeError(w, http.StatusNotFound, codeNotFound, "policy_not_found", "", map[string]any{"policy_id": policyID})
+			writeError(w, r, http.StatusNotFound, codeNotFound, "policy_not_found", "", map[string]any{"policy_id": policyID})
 		case errors.Is(err, domain.ErrInvalidScope):
-			writeError(w, http.StatusBadRequest, codeInvalidRequest, "invalid_scope", "a version of a tenant-owned policy must be in its owner's scope", nil)
+			writeError(w, r, http.StatusBadRequest, codeInvalidRequest, "invalid_scope", "a version of a tenant-owned policy must be in its owner's scope", nil)
 		case errors.Is(err, domain.ErrIdempotencyMismatch), errors.Is(err, domain.ErrConflict):
-			writeError(w, http.StatusConflict, codeIdempotencyMismatch, "policy_version_conflict",
+			writeError(w, r, http.StatusConflict, codeIdempotencyMismatch, "policy_version_conflict",
 				"this Idempotency-Key or policy_version_id was already used with different content", map[string]any{"policy_id": policyID})
 		default:
 			h.storeUnavailable(w, r, "CreatePolicyVersion", err)
@@ -749,7 +751,7 @@ func (h *Handler) lifecycle(command string) http.HandlerFunc {
 		if !ok {
 			return
 		}
-		if !requireUUID(w, "policy_id", policyID) || !requireUUID(w, "version_id", versionID) {
+		if !requireUUID(w, r, "policy_id", policyID) || !requireUUID(w, r, "version_id", versionID) {
 			return
 		}
 		if _, ok := h.requireTenant(w, r); !ok {
@@ -762,12 +764,12 @@ func (h *Handler) lifecycle(command string) http.HandlerFunc {
 		}
 		expected, ok := ifMatch(r)
 		if !ok {
-			writeError(w, http.StatusBadRequest, codeInvalidRequest, "invalid_if_match", "If-Match must be a row_version", nil)
+			writeError(w, r, http.StatusBadRequest, codeInvalidRequest, "invalid_if_match", "If-Match must be a row_version", nil)
 			return
 		}
 		if req.ExpectedVersion != nil {
 			if expected != nil && *expected != *req.ExpectedVersion {
-				writeError(w, http.StatusBadRequest, codeInvalidRequest, "expected_version_mismatch", "If-Match and expected_version disagree", nil)
+				writeError(w, r, http.StatusBadRequest, codeInvalidRequest, "expected_version_mismatch", "If-Match and expected_version disagree", nil)
 				return
 			}
 			expected = req.ExpectedVersion
@@ -776,18 +778,18 @@ func (h *Handler) lifecycle(command string) http.HandlerFunc {
 		// lifecycle command is stateful, so the version the caller decided on
 		// must be named. 428 is HTTP's own answer to a missing precondition.
 		if expected == nil {
-			writeError(w, http.StatusPreconditionRequired, codeInvalidRequest, "expected_version_required",
+			writeError(w, r, http.StatusPreconditionRequired, codeInvalidRequest, "expected_version_required",
 				"send the version's row_version as If-Match or expected_version (GET the version for its ETag)", nil)
 			return
 		}
 		reason := strings.TrimSpace(req.ReasonCode)
 		if (command == domain.CommandSuspend || command == domain.CommandRetire || command == domain.CommandReviewSuspension) && reason == "" {
-			missingField(w, "reason_code")
+			missingField(w, r, "reason_code")
 			return
 		}
 		outcome := strings.ToUpper(strings.TrimSpace(req.Outcome))
 		if command == domain.CommandReviewSuspension && outcome != domain.SuspensionUpheld && outcome != domain.SuspensionOverturned {
-			writeError(w, http.StatusBadRequest, codeInvalidRequest, "invalid_outcome", "outcome must be UPHELD or OVERTURNED", nil)
+			writeError(w, r, http.StatusBadRequest, codeInvalidRequest, "invalid_outcome", "outcome must be UPHELD or OVERTURNED", nil)
 			return
 		}
 		if free := strings.TrimSpace(req.Reason); free != "" {
@@ -796,14 +798,14 @@ func (h *Handler) lifecycle(command string) http.HandlerFunc {
 			}
 			reason += free
 		}
-		if tooLong(w, "reason", reason, 2000) || tooLong(w, "approval_reference", req.ApprovalReference, 256) {
+		if tooLong(w, r, "reason", reason, 2000) || tooLong(w, r, "approval_reference", req.ApprovalReference, 256) {
 			return
 		}
 
 		existing, err := h.store.FindPolicyVersionByID(r.Context(), versionID)
 		if err != nil {
 			if errors.Is(err, domain.ErrPolicyVersionNotFound) {
-				writeError(w, http.StatusNotFound, codeNotFound, "policy_version_not_found", "", map[string]any{"policy_version_id": versionID})
+				writeError(w, r, http.StatusNotFound, codeNotFound, "policy_version_not_found", "", map[string]any{"policy_version_id": versionID})
 				return
 			}
 			h.storeUnavailable(w, r, "lifecycle", err)
@@ -812,7 +814,7 @@ func (h *Handler) lifecycle(command string) http.HandlerFunc {
 		// A command must never succeed against the wrong policy_id/version_id
 		// pairing just because version_id alone resolves.
 		if existing.PolicyID != policyID {
-			writeError(w, http.StatusNotFound, codeNotFound, "policy_version_not_found", "",
+			writeError(w, r, http.StatusNotFound, codeNotFound, "policy_version_not_found", "",
 				map[string]any{"policy_id": policyID, "policy_version_id": versionID})
 			return
 		}
@@ -868,19 +870,19 @@ func (h *Handler) writeTransitionError(w http.ResponseWriter, r *http.Request, v
 	extra := map[string]any{"policy_version_id": versionID}
 	switch {
 	case errors.Is(err, domain.ErrPolicyVersionNotFound):
-		writeError(w, http.StatusNotFound, codeNotFound, "policy_version_not_found", "", extra)
+		writeError(w, r, http.StatusNotFound, codeNotFound, "policy_version_not_found", "", extra)
 	case errors.Is(err, domain.ErrApprovalRequired):
-		writeError(w, http.StatusConflict, codeApprovalRequired, "approval_required",
+		writeError(w, r, http.StatusConflict, codeApprovalRequired, "approval_required",
 			"submit the version for review and have an independent approver approve it before activation", extra)
 	case errors.Is(err, domain.ErrSoDConflict):
-		writeError(w, http.StatusForbidden, codeSoDConflict, "maker_checker_violation",
+		writeError(w, r, http.StatusForbidden, codeSoDConflict, "maker_checker_violation",
 			"the maker cannot be the checker: the author cannot approve or activate, and the suspender cannot review the suspension", extra)
 	case errors.Is(err, domain.ErrPolicyConflicted):
-		writeError(w, http.StatusConflict, codePolicyConflicted, "policy_overlap", err.Error(), extra)
+		writeError(w, r, http.StatusConflict, codePolicyConflicted, "policy_overlap", err.Error(), extra)
 	case errors.Is(err, domain.ErrConcurrencyConflict):
-		writeError(w, http.StatusConflict, codeConcurrency, "concurrency_conflict", err.Error(), extra)
+		writeError(w, r, http.StatusConflict, codeConcurrency, "concurrency_conflict", err.Error(), extra)
 	case errors.Is(err, domain.ErrInvalidTransition):
-		writeError(w, http.StatusConflict, codeConcurrency, "invalid_transition",
+		writeError(w, r, http.StatusConflict, codeConcurrency, "invalid_transition",
 			"the version's current status does not allow this command", extra)
 	default:
 		h.storeUnavailable(w, r, "Transition", err)
@@ -896,7 +898,7 @@ func (h *Handler) ListVersionHistory(w http.ResponseWriter, r *http.Request) {
 	if _, ok := h.requireTenant(w, r); !ok {
 		return
 	}
-	if !requireUUID(w, "policy_id", policyID) {
+	if !requireUUID(w, r, "policy_id", policyID) {
 		return
 	}
 	if _, ok := h.gate(w, r, h.opts.ReadAuthz, authz.ActionPolicyRead, nil); !ok {
@@ -905,7 +907,7 @@ func (h *Handler) ListVersionHistory(w http.ResponseWriter, r *http.Request) {
 	results, err := h.store.ListVersionHistory(r.Context(), policyID)
 	if err != nil {
 		if errors.Is(err, domain.ErrPolicyNotFound) {
-			writeError(w, http.StatusNotFound, codeNotFound, "policy_not_found", "", map[string]any{"policy_id": policyID})
+			writeError(w, r, http.StatusNotFound, codeNotFound, "policy_not_found", "", map[string]any{"policy_id": policyID})
 			return
 		}
 		h.storeUnavailable(w, r, "ListVersionHistory", err)
@@ -922,7 +924,7 @@ func (h *Handler) ListVersionHistory(w http.ResponseWriter, r *http.Request) {
 // GetPolicyVersion; historical reads never resolve through "latest").
 func (h *Handler) GetPolicyVersionByID(w http.ResponseWriter, r *http.Request) {
 	versionID := chi.URLParam(r, "version_id")
-	if !requireUUID(w, "version_id", versionID) {
+	if !requireUUID(w, r, "version_id", versionID) {
 		return
 	}
 	if _, ok := h.requireTenant(w, r); !ok {
@@ -931,7 +933,7 @@ func (h *Handler) GetPolicyVersionByID(w http.ResponseWriter, r *http.Request) {
 	v, err := h.store.FindPolicyVersionByID(r.Context(), versionID)
 	if err != nil {
 		if errors.Is(err, domain.ErrPolicyVersionNotFound) {
-			writeError(w, http.StatusNotFound, codeNotFound, "policy_version_not_found", "", map[string]any{"policy_version_id": versionID})
+			writeError(w, r, http.StatusNotFound, codeNotFound, "policy_version_not_found", "", map[string]any{"policy_version_id": versionID})
 			return
 		}
 		h.storeUnavailable(w, r, "GetPolicyVersionByID", err)
@@ -948,7 +950,7 @@ func (h *Handler) GetPolicyVersionByID(w http.ResponseWriter, r *http.Request) {
 // approvals, activation actor/time; negative path #3, suspension evidenced).
 func (h *Handler) ListTransitions(w http.ResponseWriter, r *http.Request) {
 	versionID := chi.URLParam(r, "version_id")
-	if !requireUUID(w, "version_id", versionID) {
+	if !requireUUID(w, r, "version_id", versionID) {
 		return
 	}
 	if _, ok := h.requireTenant(w, r); !ok {
@@ -960,7 +962,7 @@ func (h *Handler) ListTransitions(w http.ResponseWriter, r *http.Request) {
 	ts, err := h.store.ListTransitions(r.Context(), versionID)
 	if err != nil {
 		if errors.Is(err, domain.ErrPolicyVersionNotFound) {
-			writeError(w, http.StatusNotFound, codeNotFound, "policy_version_not_found", "", map[string]any{"policy_version_id": versionID})
+			writeError(w, r, http.StatusNotFound, codeNotFound, "policy_version_not_found", "", map[string]any{"policy_version_id": versionID})
 			return
 		}
 		h.storeUnavailable(w, r, "ListTransitions", err)
@@ -991,10 +993,10 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
-			writeError(w, http.StatusRequestEntityTooLarge, codeInvalidRequest, "request_too_large", "", nil)
+			writeError(w, r, http.StatusRequestEntityTooLarge, codeInvalidRequest, "request_too_large", "", nil)
 			return false
 		}
-		writeError(w, http.StatusBadRequest, codeInvalidRequest, "invalid_json", err.Error(), nil)
+		writeError(w, r, http.StatusBadRequest, codeInvalidRequest, "invalid_json", err.Error(), nil)
 		return false
 	}
 	return true
@@ -1012,10 +1014,10 @@ func decodeOptionalJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 	default:
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
-			writeError(w, http.StatusRequestEntityTooLarge, codeInvalidRequest, "request_too_large", "", nil)
+			writeError(w, r, http.StatusRequestEntityTooLarge, codeInvalidRequest, "request_too_large", "", nil)
 			return false
 		}
-		writeError(w, http.StatusBadRequest, codeInvalidRequest, "invalid_json", err.Error(), nil)
+		writeError(w, r, http.StatusBadRequest, codeInvalidRequest, "invalid_json", err.Error(), nil)
 		return false
 	}
 }

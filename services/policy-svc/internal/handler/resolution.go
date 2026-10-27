@@ -35,10 +35,10 @@ func (h *Handler) parseResolutionQuery(w http.ResponseWriter, r *http.Request) (
 	var out resolutionQuery
 	out.policyType = q.Get("policy_type")
 	if out.policyType == "" {
-		missingField(w, "policy_type")
+		missingField(w, r, "policy_type")
 		return out, false
 	}
-	if tooLong(w, "policy_type", out.policyType, 64) {
+	if tooLong(w, r, "policy_type", out.policyType, 64) {
 		return out, false
 	}
 	parseTime := func(name string) (*time.Time, bool) {
@@ -48,7 +48,7 @@ func (h *Handler) parseResolutionQuery(w http.ResponseWriter, r *http.Request) (
 		}
 		t, err := time.Parse(time.RFC3339, v)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, codeInvalidRequest, "invalid_"+name, name+" must be a valid RFC3339 timestamp", nil)
+			writeError(w, r, http.StatusBadRequest, codeInvalidRequest, "invalid_"+name, name+" must be a valid RFC3339 timestamp", nil)
 			return nil, false
 		}
 		return &t, true
@@ -69,7 +69,7 @@ func (h *Handler) parseResolutionQuery(w http.ResponseWriter, r *http.Request) (
 	if v := q.Get("tenant_id"); v != "" {
 		out.tenantID = &v
 	}
-	if !optionalUUID(w, "tenant_id", out.tenantID) || h.refuseForeignTenant(w, out.tenantID, verifiedTenant) {
+	if !optionalUUID(w, r, "tenant_id", out.tenantID) || h.refuseForeignTenant(w, r, out.tenantID, verifiedTenant) {
 		return out, false
 	}
 	var le *string
@@ -82,7 +82,7 @@ func (h *Handler) parseResolutionQuery(w http.ResponseWriter, r *http.Request) (
 
 	a, k, ok := resolve.Times(asOf, knownAt, h.opts.Now().UTC())
 	if !ok {
-		writeError(w, http.StatusBadRequest, codeInvalidRequest, "invalid_known_at", "known_at cannot be in the future", nil)
+		writeError(w, r, http.StatusBadRequest, codeInvalidRequest, "invalid_known_at", "known_at cannot be in the future", nil)
 		return out, false
 	}
 	out.asOf, out.knownAt = a, k
@@ -224,14 +224,14 @@ func diffJSON(path string, a, b any, out *[]payloadChange) {
 func (h *Handler) ComparePolicyVersions(w http.ResponseWriter, r *http.Request) {
 	baseID, targetID := r.URL.Query().Get("base"), r.URL.Query().Get("target")
 	if baseID == "" {
-		missingField(w, "base")
+		missingField(w, r, "base")
 		return
 	}
 	if targetID == "" {
-		missingField(w, "target")
+		missingField(w, r, "target")
 		return
 	}
-	if !requireUUID(w, "base", baseID) || !requireUUID(w, "target", targetID) {
+	if !requireUUID(w, r, "base", baseID) || !requireUUID(w, r, "target", targetID) {
 		return
 	}
 	if _, ok := h.requireTenant(w, r); !ok {
@@ -245,7 +245,7 @@ func (h *Handler) ComparePolicyVersions(w http.ResponseWriter, r *http.Request) 
 		v, err := h.store.FindPolicyVersionByID(r.Context(), id)
 		if err != nil {
 			if errors.Is(err, domain.ErrPolicyVersionNotFound) {
-				writeError(w, http.StatusNotFound, codeNotFound, "policy_version_not_found", "", map[string]any{"policy_version_id": id})
+				writeError(w, r, http.StatusNotFound, codeNotFound, "policy_version_not_found", "", map[string]any{"policy_version_id": id})
 				return
 			}
 			h.storeUnavailable(w, r, "ComparePolicyVersions", err)
@@ -293,7 +293,7 @@ func (h *Handler) ComparePolicyVersions(w http.ResponseWriter, r *http.Request) 
 // never cross-tenant).
 func (h *Handler) GetEvaluation(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "evidence_id")
-	if !requireUUID(w, "evidence_id", id) {
+	if !requireUUID(w, r, "evidence_id", id) {
 		return
 	}
 	tenantID, ok := h.requireTenant(w, r)
@@ -306,7 +306,7 @@ func (h *Handler) GetEvaluation(w http.ResponseWriter, r *http.Request) {
 	ev, err := h.store.FindEvaluationByID(r.Context(), tenantID, id)
 	if err != nil {
 		if errors.Is(err, domain.ErrEvaluationNotFound) {
-			writeError(w, http.StatusNotFound, codeNotFound, "evaluation_not_found", "", map[string]any{"evidence_id": id})
+			writeError(w, r, http.StatusNotFound, codeNotFound, "evaluation_not_found", "", map[string]any{"evidence_id": id})
 			return
 		}
 		h.storeUnavailable(w, r, "GetEvaluation", err)
