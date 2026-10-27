@@ -99,10 +99,10 @@ listed gap remains; **Missing** = no route or no callable path.
 | QuarantineTransaction | `POST /v1/banking/transactions/quarantine` | Partial; creates an OPEN mapping exception. It can be called after a canonical row exists and does not create a canonical `QUARANTINED` version (A22/A23). |
 | SupersedeNormalization | Missing as a named command | —; `re-normalize` performs a supersession, but there is no mapping-correction/re-performance command (A22). |
 | ApproveMappingException | `POST /v1/banking/mapping-exceptions/{id}/approve` | Partial; maker-checker is real. Category/counterparty are arbitrary caller input and the new row gets `mapping_version = 1`, not a mapping-registry version (A19/A21). |
-| GetBankTransaction | `GET /v1/banking/canonical-transactions/{id}` | Done, but requires `X-Principal-Id`; BNK-05's client sends only tenant (section C). No read authz beyond the principal check (A21). |
+| GetBankTransaction | `GET /v1/banking/canonical-transactions/{id}` | Done, but no read authz beyond the principal check (A21), and the amount is a JSON float. BNK-05's client now sends the principal (C2, closed). |
 | GetRawLineage | Missing | — (A20). |
 | GetNormalizationVersion | Missing | — (A20). |
-| ListTransactions | Missing | — (A20). |
+| ListTransactions | `GET /v1/banking/canonical-transactions` | Done (2026-10-27): NORMALIZED rows of one legal entity, with bank-account, currency and date filters, an exact decimal amount, keyset pagination and `bank.transaction.read` authz (A20). |
 | ListNormalizationExceptions | Missing | — (A20). |
 
 ## State, events and permissions
@@ -344,7 +344,8 @@ listed gap remains; **Missing** = no route or no callable path.
   caller-supplied category. A later reader cannot reproduce which mapping
   produced a canonical row. This fails invariant 7 and the negative path
   “Mapping version not retained”.
-- **A20. Raw-lineage, normalization-version and list queries are missing.**
+- **A20. Raw-lineage, normalization-version and list queries are missing**
+  (narrowed 2026-10-27: `ListTransactions` is done, see below).
   `GetRawLineage`, `GetNormalizationVersion`, `ListTransactions` and
   `ListNormalizationExceptions` have no route (table 23). Only
   `GetBankTransaction` exists. The canonical response has
@@ -352,6 +353,97 @@ listed gap remains; **Missing** = no route or no callable path.
   registry version, no exception list and no way to enumerate a tenant's
   transactions. BNK-05 cannot call a lineage/version query because there is
   none.
+
+  *ListTransactions (2026-10-27).* Route:
+
+      GET /v1/banking/canonical-transactions?legal_entity_id=…
+          [&bank_account_id=…][&currency=…]
+          [&transaction_date_from=YYYY-MM-DD][&transaction_date_to=YYYY-MM-DD]
+          [&limit=…][&cursor=…]
+
+  It is mounted next to `GetBankTransaction` in
+  `internal/handler/bnk0304_handler.go` (`ListCanonicalTransactions`), and
+  the store is `PgStore.ListCanonicalTransactions` in
+  `internal/store/bnk0304_store.go`. It exists for
+  reconciliation-intelligence-svc's A2b: proposing a bank-side counterpart
+  as well as a ledger one.
+  - *bank_account_id join.* It exists only on `bank_connections`, so a
+    transaction reaches it through its line and statement:
+
+        FROM bank_transactions_canonical t
+        JOIN bank_statement_lines l ON l.line_id = t.statement_line_id
+        JOIN bank_statements s      ON s.statement_id = l.statement_id
+        JOIN bank_connections c     ON c.connection_id = s.connection_id
+        WHERE t.status = 'NORMALIZED' AND c.legal_entity_id = $1
+          AND ($2 = '' OR c.bank_account_id = $2) AND ($3 = '' OR t.currency = $3)
+          AND (from/to bounds on t.transaction_date, half-open in UTC)
+          AND ($6 = '' OR t.transaction_id COLLATE "C" > $6)
+        ORDER BY t.transaction_id COLLATE "C" LIMIT limit + 1
+
+    Every row carries `bank_account_id` and `connection_id`.
+    `bank_account_id` is null for a pre-BNK-02 connection (stored as `''`),
+    and such a row never matches a `bank_account_id` filter.
+  - *Tenant isolation.* There is no tenant predicate in the query. All four
+    tables are FORCE ROW LEVEL SECURITY on `app.tenant_id`, which
+    `withTenant` sets from the verified request, so the read cannot diverge
+    from the policy. The control-population read differs: it adds explicit
+    tenant predicates as well.
+  - *Status.* NORMALIZED only. QUARANTINED and SUPERSEDED rows are never
+    returned, and there is no parameter to ask for them; stale versions
+    belong to `GetNormalizationVersion`/`GetRawLineage`.
+  - *Amount.* An exact decimal string, never a float64: `t.amount::text` is
+    scanned into a string. NUMERIC(18,4) renders with exactly four places,
+    so `125.5` is `"125.5000"`.
+  - *Response type.* `domain.CanonicalTransactionListItem` is a dedicated
+    type, so `GetBankTransaction`'s float `amount` is not inherited.
+    `GetBankTransaction` itself is unchanged and still serializes a float.
+  - *Pagination.* It follows the control-population route: `limit` defaults
+    to 1000 and is clamped at 5000, with an opaque base64 `cursor` and a
+    limit+1 fetch. `next_cursor` is present exactly when more rows exist, so
+    a full page is never indistinguishable from the last one. Unknown or
+    repeated query parameters are 400.
+  - *Authorization.* A real authorization-svc decision on the legal entity
+    for `bank.transaction.read`, the spec's own table-24 name. The route
+    does not repeat A21's principal-only check.
+    - The action is registered (TAXONOMY naming) by access-control-svc
+      migration 000022.
+    - Its down migration refuses while any bundle grants the action, and
+      sets `row_security = off` first because `permission_bundle_defs` is
+      FORCE RLS.
+    - *Observed, partially fixed:* `000020_register_payment_status_actions`'s
+      down (this domain's own migration) was missing the same line; fixed
+      here and reverified by hand under a NOBYPASSRLS owner (refuses while a
+      different tenant's bundle still grants one of its actions; succeeds
+      once cleared). `000020_register_auth_plane_actions` and `000021`
+      (Identity/Governance) have the identical gap and were left untouched —
+      flagged to that domain's owner rather than edited here. Two migrations
+      also share the number 000020; the glob-and-sort migration runner
+      applies both deterministically (alphabetical by full filename), so
+      this is a numbering-hygiene problem, not a runtime ambiguity.
+  - *Index.* Migration 009 adds `idx_bank_txn_canonical_tenant_status_date`
+    `(tenant_id, status, transaction_date)`. It is index only, so its down
+    has no guard.
+  - *Tests:* `internal/store/list_transactions_contract_test.go`, run
+    through the real router and Postgres as a NOBYPASSRLS role:
+    - the date window is inclusive at both UTC day ends;
+    - currency and bank-account filters across several connections, with a
+      null account;
+    - QUARANTINED and SUPERSEDED excluded, and the superseding correction
+      included;
+    - cross-tenant isolation, even with identical entity and account ids;
+    - the exact amount `98765432109876.5432` comes back as that string.
+      Through float8 it would be `98765432109876.55`, and a negative control
+      routing the amount through float8 fails the test;
+    - 1001 rows at the default page size give 1000 rows and a cursor, the
+      cursor yields the last row with none, and every row is seen once;
+    - the authz decision asked for, a denial (403), and a missing principal
+      (401).
+
+    access-control-svc's
+    `internal/store/bank_transaction_read_permission_test.go` covers the
+    registration and both down paths.
+  - *Still open:* `GetRawLineage`, `GetNormalizationVersion` and
+    `ListNormalizationExceptions`.
 - **A21. Normalization has no legal-entity authorization or independent
   mapping control.** Normalize, re-normalize and quarantine only require a
   principal; `BANKING_TRANSACTION_NORMALIZE` is defined but never checked.
@@ -700,6 +792,12 @@ database was used.
    canonical `QUARANTINED` state if the product wants the spec state exactly.
 
 ## F. Files changed in this pass
+
+A20 ListTransactions (2026-10-27): `internal/handler/bnk0304_handler.go`,
+`internal/store/bnk0304_store.go`, `internal/store/store.go`,
+`internal/domain/bnk0304.go`, migration 009, and
+`internal/store/list_transactions_contract_test.go` (new); access-control-svc
+migration 000022 and its test.
 
 C2 fix (2026-10-24): `internal/store/canonical_read_contract_test.go`
 (new) and this register. No production code in this service changed.

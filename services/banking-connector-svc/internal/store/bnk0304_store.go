@@ -551,3 +551,85 @@ func (p *PgStore) GetCanonicalTransaction(ctx context.Context, tenantID, transac
 	}
 	return &t, nil
 }
+
+// listCanonicalTransactionsSQL is BNK-04 ListTransactions. bank_account_id
+// lives only on bank_connections, so a transaction reaches it through its
+// statement line and statement:
+//
+//	bank_transactions_canonical.statement_line_id -> bank_statement_lines.line_id
+//	bank_statement_lines.statement_id             -> bank_statements.statement_id
+//	bank_statements.connection_id                 -> bank_connections.connection_id
+//
+// There is no tenant predicate: all four tables are FORCE ROW LEVEL SECURITY
+// on tenant_id = app.tenant_id, which withTenant sets from the verified
+// request, so the read sees one tenant's rows by construction and cannot
+// disagree with the policy. An empty tenant matches nothing.
+//
+// Only NORMALIZED rows: a SUPERSEDED version was replaced by a correction and
+// a QUARANTINED one is not current truth. amount is cast to text in SQL — a
+// NUMERIC(18,4) renders with exactly four places — and scanned into a string,
+// so it never passes through float64. Dates bound transaction_date half-open
+// in UTC ($4 inclusive, $5 exclusive), which keeps the predicate sargable.
+// Keyset by transaction_id in byte order; $7 = limit + 1 tells the caller
+// whether another page exists.
+const listCanonicalTransactionsSQL = `
+	SELECT t.transaction_id, t.tenant_id, c.legal_entity_id, c.connection_id, c.bank_account_id,
+	       t.statement_line_id, t.mapping_version, t.transaction_date, t.amount::text,
+	       t.currency, t.category, t.counterparty, t.status
+	FROM bank_transactions_canonical t
+	JOIN bank_statement_lines l ON l.line_id = t.statement_line_id
+	JOIN bank_statements s ON s.statement_id = l.statement_id
+	JOIN bank_connections c ON c.connection_id = s.connection_id
+	WHERE t.status = 'NORMALIZED'
+	  AND c.legal_entity_id = $1
+	  AND ($2::text = '' OR c.bank_account_id = $2::text)
+	  AND ($3::text = '' OR t.currency = $3::text)
+	  AND ($4::timestamptz IS NULL OR t.transaction_date >= $4::timestamptz)
+	  AND ($5::timestamptz IS NULL OR t.transaction_date < $5::timestamptz)
+	  AND ($6::text = '' OR t.transaction_id COLLATE "C" > $6::text COLLATE "C")
+	ORDER BY t.transaction_id COLLATE "C"
+	LIMIT $7`
+
+// ListCanonicalTransactions returns one keyset page of q's NORMALIZED canonical
+// transactions. When more rows exist, NextCursor is the last returned
+// transaction_id (the handler makes it opaque); it is empty only when this
+// page ends the result.
+func (p *PgStore) ListCanonicalTransactions(ctx context.Context, q domain.ListTransactionsQuery) (*domain.CanonicalTransactionPage, error) {
+	if q.LegalEntityID == "" {
+		return nil, fmt.Errorf("legal_entity_id is required")
+	}
+	if q.Limit < 1 {
+		return nil, fmt.Errorf("limit must be positive")
+	}
+	page := &domain.CanonicalTransactionPage{Transactions: []domain.CanonicalTransactionListItem{}}
+	err := p.withTenant(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, listCanonicalTransactionsSQL,
+			q.LegalEntityID, q.BankAccountID, q.Currency, q.From, q.ToExclusive, q.AfterTransactionID, q.Limit+1)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var it domain.CanonicalTransactionListItem
+			var bankAccountID string
+			if err := rows.Scan(&it.TransactionID, &it.TenantID, &it.LegalEntityID, &it.ConnectionID, &bankAccountID,
+				&it.StatementLineID, &it.MappingVersion, &it.TransactionDate, &it.Amount,
+				&it.Currency, &it.Category, &it.Counterparty, &it.Status); err != nil {
+				return err
+			}
+			if bankAccountID != "" {
+				it.BankAccountID = &bankAccountID
+			}
+			page.Transactions = append(page.Transactions, it)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(page.Transactions) > q.Limit {
+		page.Transactions = page.Transactions[:q.Limit]
+		page.NextCursor = page.Transactions[q.Limit-1].TransactionID
+	}
+	return page, nil
+}

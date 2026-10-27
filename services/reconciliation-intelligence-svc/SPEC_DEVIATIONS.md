@@ -218,11 +218,15 @@ closed A8 and A9; a fifth closed A5; the latest closes A2a.
 - **A2b. No candidate match against a banking-connector-svc canonical
   transaction, and the ledger search has known limits** (open, narrower than
   A2a).
-  1. *The canonical side.* banking-connector-svc still exposes canonical
-     transactions only by id (`GET /v1/banking/canonical-transactions/{id}`).
-     Proposing one needs a scoped list route there: by tenant, bank account
-     or connection, currency and a date window, NORMALIZED only. Its
-     ZS-SVC-E-001 BNK-04 read contract has no such query yet.
+  1. *The canonical side.* Unblocked 2026-10-27, not yet built.
+     banking-connector-svc now serves BNK-04 `ListTransactions`
+     (`GET /v1/banking/canonical-transactions`, its A20). It returns
+     NORMALIZED rows only, filtered by legal entity, bank account, currency
+     and a UTC date window, with an exact decimal-string amount and
+     `next_cursor` pagination. It is authorized as `bank.transaction.read`,
+     so this service's principal needs a bundle granting it. This service
+     has no client for it yet, and no rule for when a canonical transaction
+     rather than a journal is a line's counterpart.
   2. *Multiple journals.* A journal is a candidate only if its own net
      movement equals the line. One payment booked as two journals is not
      found.
