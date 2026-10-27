@@ -101,6 +101,21 @@ func (p *Pipeline) Answer(ctx context.Context, in Input) Result {
 		return res
 	}
 	intent := dec.Primary
+	clarifications := 0
+	if pd := in.Pending; pd != nil && (intent == pd.Intent || intent == "I29" || intent == "I04") {
+		// A reply to our clarifying question: keep the original question's
+		// intent and slots, add what the visitor just supplied.
+		intent, clarifications = pd.Intent, pd.Clarifications
+		if dec.Slots.PlanName == "" {
+			dec.Slots.PlanName = pd.PlanName
+		}
+		if dec.Slots.BillingCadence == "" {
+			dec.Slots.BillingCadence = pd.BillingCadence
+		}
+		if dec.Slots.Integration == "" {
+			dec.Slots.Integration = pd.Integration
+		}
+	}
 	if fv.DisabledIntents[intent] {
 		return p.fromTemplate(withRoute(policy.TplUnavailable, policy.DefaultRoute[intent]), intent, snap, market, now, releaseID)
 	}
@@ -116,7 +131,14 @@ func (p *Pipeline) Answer(ctx context.Context, in Input) Result {
 		d := snap.Claims.Resolve(req, snap)
 		switch d.Decision {
 		case claims.MarketRequired:
-			return p.fromTemplate(policy.TplClarifyMarket, intent, snap, market, now, releaseID)
+			if clarifications >= 2 {
+				// Two failed clarifications: one verified route, no third question (Doc 02 §10).
+				return p.fromTemplate(withRoute(policy.TplClarifyGiveUp, policy.DefaultRoute[intent]), intent, snap, market, now, releaseID)
+			}
+			res := p.fromTemplate(policy.TplClarifyMarket, intent, snap, market, now, releaseID)
+			res.Pending = &Pending{Intent: intent, PlanName: dec.Slots.PlanName, BillingCadence: dec.Slots.BillingCadence,
+				Integration: dec.Slots.Integration, Clarifications: clarifications + 1}
+			return res
 		case claims.Contradicted:
 			p.recordConflict(ctx, req, d, now)
 			return p.fromTemplate(withRoute(policy.TplAbstainConflict, policy.DefaultRoute[intent]), intent, snap, market, now, releaseID)

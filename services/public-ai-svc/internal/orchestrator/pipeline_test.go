@@ -76,6 +76,34 @@ func TestSlicePriceFromVerifiedClaim(t *testing.T) {
 	}
 }
 
+// Multi-turn: the plan from the first question survives the clarification.
+func TestClarificationCarriesPlan(t *testing.T) {
+	e := newEnv(t)
+	r1 := ask(e, "How much does the Growth plan cost?", "")
+	if r1.Status != contract.Clarify || r1.Pending == nil || r1.Pending.PlanName != "growth" {
+		t.Fatalf("turn 1: %+v", r1)
+	}
+	r2 := e.Pipeline.Answer(ctx, orchestrator.Input{Message: "In the United States, per month", Pending: r1.Pending, Locale: "en-US"})
+	if r2.Status != contract.Answered || !strings.Contains(r2.Text, "XTS 49.00") || strings.Contains(r2.Text, "XTS 19.00") || r2.Pending != nil {
+		t.Fatalf("turn 2: %+v", r2)
+	}
+	// A new topic drops the carry-over.
+	r3 := e.Pipeline.Answer(ctx, orchestrator.Input{Message: "Can I book a demo?", Pending: r1.Pending})
+	if r3.Status != contract.Handoff {
+		t.Fatalf("new topic: %+v", r3)
+	}
+}
+
+// After two clarifications that still give no market, offer one route instead of asking again.
+func TestClarificationGivesUpAfterTwo(t *testing.T) {
+	e := newEnv(t)
+	pd := &orchestrator.Pending{Intent: "I05", PlanName: "growth", Clarifications: 2}
+	r := e.Pipeline.Answer(ctx, orchestrator.Input{Message: "not sure", Pending: pd})
+	if r.Status != contract.Abstain || r.Pending != nil || action(r) != "support" {
+		t.Fatalf("got %+v", r)
+	}
+}
+
 func TestPriceWithoutMarketClarifies(t *testing.T) {
 	e := newEnv(t)
 	if r := ask(e, "How much does the Growth plan cost?", ""); r.Status != contract.Clarify || !strings.Contains(r.Text, "Which country") {

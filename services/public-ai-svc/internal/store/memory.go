@@ -115,11 +115,26 @@ func (m *Memory) DeleteSession(_ context.Context, sessionID string, at time.Time
 	if s.DeletedAt == nil {
 		s.DeletedAt = &at
 	}
-	s.Locale, s.MarketCode, s.PageContext, s.activeTurnID = "", "", "", ""
+	s.Locale, s.MarketCode, s.PageContext, s.activeTurnID, s.PendingContext = "", "", "", "", nil
 	for k, t := range m.turns {
 		if t.SessionID == sessionID {
 			delete(m.turns, k)
 		}
+	}
+	return nil
+}
+
+func (m *Memory) SetPendingContext(_ context.Context, sessionID string, data []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.sessions[sessionID]
+	if !ok || s.DeletedAt != nil {
+		return ErrNotFound
+	}
+	if data == nil {
+		s.PendingContext = nil
+	} else {
+		s.PendingContext = append([]byte(nil), data...)
 	}
 	return nil
 }

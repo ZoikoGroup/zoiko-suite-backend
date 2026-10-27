@@ -176,3 +176,30 @@ Each entry records what a build step changed and the verified result of
   and 5/5 on Postgres.
 - Readiness record lists every Doc 11 gate G0–G5 as PENDING with evidence and remaining needs.
 - Result: build ok, vet ok, all tests pass (incl. Postgres), gofmt clean.
+
+## STEP 13 — Assistant widget (frontend) + multi-turn carry-over (backend)
+
+- Location chosen by the product owner: `zoiko-suite-frontend-platform` (staff admin console), branch
+  `suivo/assistant-widget`. Note: Docs 01/11 place the visitor widget on the public website; in the
+  console only signed-in staff see it. The widget talks only to the public API, so moving it to the
+  public site is a contained change.
+- Frontend: `lib/api/public-ai.ts` (server-only client; deliberately NOT the console client, so no
+  X-Principal/X-Tenant identity headers ever reach the public assistant), `app/admin/assistant/actions.ts`
+  (Server Actions; verify the console session; validate input), `components/admin/assistant/AssistantWidget.tsx`
+  (launcher + non-modal panel, welcome + 4 starters, citations, single official CTA, clarify/refusal/
+  error/retry/429/409 states, re-session on 401, end-chat deletes the session, grant kept in memory only),
+  mounted in `app/admin/layout.tsx`; `.env.example` documents `ZOIKO_PUBLIC_AI_URL` / `_ORIGIN`.
+- Backend: `/config` now returns `citation_links` (server-resolved, ADR-005 note); new migration
+  000002 adds `sessions.pending_context` so a reply to a clarifying question keeps the original intent and
+  slots (intent/slot values only, never text; wiped on delete); after two failed clarifications the
+  assistant offers one route instead of a third question (Doc 02 §10).
+- Found in the browser: the follow-up "In the United States, per month" lost the plan from "How much does
+  the Growth plan cost?" and listed every plan — fixed by the carry-over above, re-verified in the browser.
+- Verified in a real browser (console on :3000, backend dev mode on :18080): starter question answered with
+  a source link and CTA; clarify → price from the verified claim only; private-invoice request refused with
+  a support link; Escape closes and returns focus to the launcher; mobile 375 px full-screen sheet with no
+  horizontal scroll; replies in a polite live region. Inline source links are 24 px tall (meets WCAG 2.2 AA
+  2.5.8; the docs' 44 px target applies to buttons, which meet it).
+- Checks: frontend `tsc --noEmit` and eslint clean; backend build, vet, all tests (incl. Postgres) pass.
+- Not done: automated browser/a11y tests (the console repo has no test runner), screen-reader pass with
+  NVDA/VoiceOver, 200%/400% zoom check, answer quality (the fake model is extractive; real model is DEC-05).

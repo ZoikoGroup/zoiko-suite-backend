@@ -109,11 +109,11 @@ func (p *Postgres) CreateSession(ctx context.Context, s Session, key string, has
 	})
 }
 
-const sessionCols = `s.session_id, s.grant_hash, s.created_at, s.expires_at, s.locale, s.market_code, s.page_context, s.deleted_at`
+const sessionCols = `s.session_id, s.grant_hash, s.created_at, s.expires_at, s.locale, s.market_code, s.page_context, s.deleted_at, s.pending_context`
 
 func scanSession(row pgx.Row) (Session, error) {
 	var s Session
-	err := row.Scan(&s.SessionID, &s.GrantHash, &s.CreatedAt, &s.ExpiresAt, &s.Locale, &s.MarketCode, &s.PageContext, &s.DeletedAt)
+	err := row.Scan(&s.SessionID, &s.GrantHash, &s.CreatedAt, &s.ExpiresAt, &s.Locale, &s.MarketCode, &s.PageContext, &s.DeletedAt, &s.PendingContext)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Session{}, ErrNotFound
 	}
@@ -126,7 +126,7 @@ func (p *Postgres) SessionByIdempotencyKey(ctx context.Context, key string) (Ses
 	err := p.pool.QueryRow(ctx, `SELECT `+sessionCols+`, i.request_hash
 		FROM public_ai.session_idempotency i JOIN public_ai.sessions s USING (session_id)
 		WHERE i.idempotency_key = $1`, key).
-		Scan(&s.SessionID, &s.GrantHash, &s.CreatedAt, &s.ExpiresAt, &s.Locale, &s.MarketCode, &s.PageContext, &s.DeletedAt, &hash)
+		Scan(&s.SessionID, &s.GrantHash, &s.CreatedAt, &s.ExpiresAt, &s.Locale, &s.MarketCode, &s.PageContext, &s.DeletedAt, &s.PendingContext, &hash)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Session{}, nil, ErrNotFound
 	}
@@ -155,7 +155,7 @@ func (p *Postgres) DeleteSession(ctx context.Context, sessionID string, at time.
 		// 204; deleted_at makes the grant useless for anything else.
 		tag, err := tx.Exec(ctx, `UPDATE public_ai.sessions
 			SET deleted_at = COALESCE(deleted_at, $2),
-			    active_turn_id = NULL, locale = '', market_code = '', page_context = ''
+			    active_turn_id = NULL, locale = '', market_code = '', page_context = '', pending_context = NULL
 			WHERE session_id = $1`, sessionID, at)
 		if err != nil {
 			return err
@@ -166,6 +166,17 @@ func (p *Postgres) DeleteSession(ctx context.Context, sessionID string, at time.
 		_, err = tx.Exec(ctx, `DELETE FROM public_ai.turns WHERE session_id = $1`, sessionID)
 		return err
 	})
+}
+
+func (p *Postgres) SetPendingContext(ctx context.Context, sessionID string, data []byte) error {
+	tag, err := p.pool.Exec(ctx, `UPDATE public_ai.sessions SET pending_context = $2 WHERE session_id = $1 AND deleted_at IS NULL`, sessionID, data)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 func (p *Postgres) BeginTurn(ctx context.Context, t Turn, lockUntil time.Time) (BeginResult, error) {

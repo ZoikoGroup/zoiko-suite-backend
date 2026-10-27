@@ -28,6 +28,9 @@ type Session struct {
 	MarketCode  string
 	PageContext string
 	DeletedAt   *time.Time
+	// PendingContext is the JSON carry-over after a clarifying question:
+	// intent and slots only, never visitor text.
+	PendingContext []byte
 }
 
 // Turn is one request/response exchange. Response holds the validated public
@@ -114,6 +117,8 @@ type Store interface {
 	SessionByGrant(ctx context.Context, grantHash []byte) (Session, error)
 	RotateGrant(ctx context.Context, sessionID string, newGrantHash []byte) error
 	DeleteSession(ctx context.Context, sessionID string, at time.Time) error
+	// SetPendingContext replaces (nil clears) the session's carry-over.
+	SetPendingContext(ctx context.Context, sessionID string, data []byte) error
 
 	// BeginTurn atomically either replays a completed turn with the same
 	// (session, client_turn_id) and request hash, rejects a mismatched

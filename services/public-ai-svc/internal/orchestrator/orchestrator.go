@@ -18,6 +18,18 @@ type Input struct {
 	Locale      string
 	MarketCode  string
 	PageContext string
+	// Pending is the carry-over from a previous clarifying question.
+	Pending *Pending
+}
+
+// Pending is what a clarifying question needs remembered: intent and slot
+// values only, never the visitor's words (Doc 02 §10).
+type Pending struct {
+	Intent         string `json:"intent"`
+	PlanName       string `json:"plan,omitempty"`
+	BillingCadence string `json:"billing,omitempty"`
+	Integration    string `json:"integration,omitempty"`
+	Clarifications int    `json:"clarifications"`
 }
 
 // Result is the orchestrator outcome. The HTTP layer adds turn identifiers.
@@ -32,6 +44,8 @@ type Result struct {
 	Tokens             int64
 	// LatencyBucket and SecuritySignal feed redacted events.
 	SecuritySignal string
+	// Pending, when set, must be stored for the next turn; nil clears it.
+	Pending *Pending
 }
 
 // Answerer produces a turn result. Implementations must never return an

@@ -210,8 +210,15 @@ func (s *Server) postTurn(w http.ResponseWriter, r *http.Request) {
 	// disconnect cannot leave the slot locked; it is bounded by its own deadline.
 	runCtx, cancel := context.WithDeadline(context.WithoutCancel(ctx), lockUntil)
 	defer cancel()
+	var pending *orchestrator.Pending
+	if len(sess.PendingContext) > 0 {
+		var pd orchestrator.Pending
+		if json.Unmarshal(sess.PendingContext, &pd) == nil {
+			pending = &pd
+		}
+	}
 	res := s.deps.Answerer.Answer(runCtx, orchestrator.Input{
-		RequestID: rid, SessionID: sess.SessionID, TurnID: turnID, Message: req.Message,
+		RequestID: rid, SessionID: sess.SessionID, TurnID: turnID, Message: req.Message, Pending: pending,
 		Locale: firstNonEmpty(req.Locale, sess.Locale), MarketCode: firstNonEmpty(req.MarketCode, sess.MarketCode),
 		PageContext: firstNonEmpty(req.PageContext, sess.PageContext),
 	})
@@ -241,6 +248,16 @@ func (s *Server) postTurn(w http.ResponseWriter, r *http.Request) {
 		_ = s.deps.Store.AbortTurn(context.WithoutCancel(ctx), sess.SessionID, turnID)
 		problem.Write(w, r, problem.ServiceUnavailable, "")
 		return
+	}
+	// Carry-over for the next turn (intent and slots only); cleared otherwise.
+	if res.Pending != nil || pending != nil {
+		var data []byte
+		if res.Pending != nil {
+			data, _ = json.Marshal(res.Pending)
+		}
+		if err := s.deps.Store.SetPendingContext(runCtx, sess.SessionID, data); err != nil {
+			s.log.Warn("pending context not saved", zap.String("request_id", rid), zap.Error(err))
+		}
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)

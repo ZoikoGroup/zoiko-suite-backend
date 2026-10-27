@@ -63,8 +63,17 @@ func testSessions(t *testing.T, s store.Store) {
 		t.Fatal("new grant must work")
 	}
 
+	if err := s.SetPendingContext(ctx, sess.SessionID, []byte(`{"intent":"I05"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.SessionByGrant(ctx, []byte("grant-2")); string(got.PendingContext) != `{"intent":"I05"}` {
+		t.Fatalf("pending context: %q", got.PendingContext)
+	}
 	if err := s.DeleteSession(ctx, sess.SessionID, time.Now()); err != nil {
 		t.Fatal(err)
+	}
+	if del, _ := s.SessionByGrant(ctx, []byte("grant-2")); del.PendingContext != nil {
+		t.Fatal("delete must wipe the pending context")
 	}
 	if del, err := s.SessionByGrant(ctx, []byte("grant-2")); err != nil || del.DeletedAt == nil || del.Locale != "" {
 		t.Fatalf("deleted session must be reported as deleted with context wiped: %v %+v", err, del)
