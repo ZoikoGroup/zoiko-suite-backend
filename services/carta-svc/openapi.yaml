@@ -1,0 +1,224 @@
+openapi: 3.1.0
+info:
+  title: carta-svc
+  version: 1.0.0
+  description: |
+    Continuous Adaptive Risk and Trust Assessment (CARTA) service.
+
+    ## Authentication & Authorization
+
+    Every mutating endpoint requires the standard ZS-ARCH-SVC-001 §4
+    identity envelope headers (`X-Tenant-Id`, `X-Principal-Id`,
+    `X-Correlation-Id`, `Idempotency-Key`). Missing or unverified headers
+    result in 401. Authorization is enforced via `authorization-svc` at
+    the legal entity scope (see per-route descriptions).
+
+    **One route is deliberately not principal-gated:**
+
+    * `POST /v1/carta/evaluate` — called by gateway-auth-svc during
+      authentication to score an access request. By definition there is
+      no authenticated principal when an authentication decision is being
+      made. The caller passes the subject as `context.subject_id` in the
+      request body.
+
+    This is the same shape as siem-integration-svc's `/stream` —
+    gateway-auth-svc streaming an authentication FAILURE has no
+    authenticated principal either.
+
+    ## Error responses (RFC 9457)
+
+    All error responses are `application/problem+json` with the stable
+    `code` field. The legacy `error` string is preserved in the body for
+    backward compatibility. Clients should branch on `code`, not on the
+    human-readable `detail`.
+
+servers:
+  - url: http://localhost:8142
+    description: Local development
+
+paths:
+  /healthz:
+    get:
+      summary: Liveness probe
+      operationId: Healthz
+      responses:
+        '200':
+          description: Service is running
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+                  service: { type: string, example: carta-svc }
+
+  /v1/carta/evaluate:
+    post:
+      summary: Evaluate an access request
+      description: |
+        Scores an access request and returns ALLOW / STEP_UP_MFA / ISOLATE / DENY.
+        Exempt from principal requirement — called during authentication.
+        Requires tenant header. The subject being evaluated is passed as
+        `context.subject_id` in the request body.
+      operationId: EvaluateAccess
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EvaluateRequest'
+      responses:
+        '201':
+          description: Assessment recorded
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CartaAssessment' }
+        '400':
+          description: Invalid request body or validation error
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401':
+          description: Missing tenant
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '500':
+          description: Failed to save assessment
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /v1/carta/assessments:
+    get:
+      summary: List access assessments
+      description: |
+        Returns assessments in the caller's tenant, filtered by required
+        `legal_entity_id` (the authorization scope) and optional `subject_id`.
+        Requires principal and authorization on `CARTA_ASSESSMENT_READ` at the
+        specified legal entity.
+      operationId: ListAssessments
+      parameters:
+        - name: legal_entity_id
+          in: query
+          required: true
+          schema: { type: string, format: uuid }
+        - name: subject_id
+          in: query
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: List of assessments
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AssessmentListResponse' }
+        '400':
+          description: Missing legal_entity_id
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401':
+          description: Missing tenant or principal
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '403':
+          description: Not authorized to read assessments for that entity
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /v1/carta/assessments/{id}:
+    get:
+      summary: Get an access assessment by ID
+      operationId: GetAssessment
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Assessment
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CartaAssessment' }
+        '401':
+          description: Missing tenant or principal
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '403':
+          description: Not authorized to read that assessment
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404':
+          description: Assessment not found in this tenant
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+components:
+  schemas:
+    Problem:
+      type: object
+      required: [type, title, status, code]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        code: { type: string }
+        request_id: { type: string }
+        correlation_id: { type: string }
+        retryable: { type: boolean }
+        retry_after: { type: integer }
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              pointer: { type: string }
+              code: { type: string }
+              detail: { type: string }
+        current_version: { type: integer, format: int64 }
+        decision_id: { type: string }
+
+    EvaluateRequest:
+      type: object
+      required: [context]
+      properties:
+        context:
+          type: object
+          required: [subject_id]
+          properties:
+            subject_id: { type: string, format: uuid }
+            ip: { type: string, format: ipv4 }
+            device_trust_level: { type: integer, minimum: 0, maximum: 100 }
+            user_agent: { type: string }
+            location: { type: string }
+            timestamp: { type: string, format: date-time }
+
+    CartaAssessment:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        legal_entity_id: { type: string, format: uuid }
+        subject_id: { type: string, format: uuid }
+        decision: { type: string, enum: [ALLOW, STEP_UP_MFA, ISOLATE, DENY] }
+        score: { type: integer, minimum: 0, maximum: 100 }
+        risk_factors:
+          type: array
+          items: { type: string }
+        created_at: { type: string, format: date-time }
+
+    AssessmentListResponse:
+      type: object
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/CartaAssessment' }
+        count: { type: integer }
