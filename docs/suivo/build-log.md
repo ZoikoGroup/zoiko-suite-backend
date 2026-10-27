@@ -157,3 +157,22 @@ Each entry records what a build step changed and the verified result of
 - Result: golden-dev-v1 25/25 passed, 0 P0 failures. build ok, vet ok, all tests pass, gofmt clean.
 - Not covered (needs people, the widget or staging): holdout partition E, drift sentinel F, semantic
   and human grading lanes, WCAG, load/latency.
+
+## STEP 14 — Ops readiness
+
+- Files: `services/public-ai-svc/Dockerfile` (+ `.dockerignore`), `deployments/docker-compose.public-ai.yml`,
+  `internal/release/manifest.go` + `kbctl manifest`, `internal/policy/bundle.go` (prompt/policy digest),
+  `cmd/drill`, `RUNBOOK.md`, `docs/suivo/r0-readiness.md`; `fixtureenv.NewWithStore`; server logs its git SHA.
+- Container: multi-stage, non-root (uid 10001), runs with a read-only root filesystem, all capabilities
+  dropped, healthcheck; image 14.7 MB; contains no fixtures, keys or secrets.
+- Compose: standalone stack with its own Postgres and network, port bound to 127.0.0.1, signed releases
+  mounted read-only. Verified: `/health/ready` 503 before releases → `kbctl publish -promote` inside the
+  container → 200 → price question answered from the verified claim; container healthy; 0 visitor text in logs.
+- Release manifest: signed record of the four artifacts (app commit + image digest, prompt/policy
+  digest, knowledge release + digest, claim release + digest), assurance runs (eval summary + report
+  hash) and approvals all PENDING with decision NO_GO_UNTIL_SIGNED. Generated successfully.
+- Drills (Doc 08 RB-01/02/04 + kill switch): DR-01 kill switch, DR-02 claim revocation, DR-03 rollback
+  without resurrection, DR-04 provider outage/timeout, DR-05 safe-static — 5/5 pass on the memory store
+  and 5/5 on Postgres.
+- Readiness record lists every Doc 11 gate G0–G5 as PENDING with evidence and remaining needs.
+- Result: build ok, vet ok, all tests pass (incl. Postgres), gofmt clean.

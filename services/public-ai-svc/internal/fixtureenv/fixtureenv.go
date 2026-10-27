@@ -21,7 +21,7 @@ import (
 
 // Env is a ready stack.
 type Env struct {
-	Store    *store.Memory
+	Store    store.Store
 	Releases *release.Runtime
 	Flags    *flags.Loader
 	Fake     *model.Fake
@@ -36,31 +36,42 @@ func FixturesDir() string {
 	return filepath.Join(filepath.Dir(file), "..", "..", "testdata", "fixtures")
 }
 
-// New builds the stack. now is the release creation time.
+// New builds the stack on an in-memory store.
 func New(ctx context.Context, modelTimeout time.Duration) (*Env, error) {
+	return NewWithStore(ctx, store.NewMemory(), "fixture-1", modelTimeout)
+}
+
+// NewWithStore builds the stack on st, publishing releases
+// "kb-<suffix>" and "claims-<suffix>" signed with a fresh key and moving the
+// release pointers to them. Use only on a dedicated test/drill database.
+func NewWithStore(ctx context.Context, st store.Store, suffix string, modelTimeout time.Duration) (*Env, error) {
 	pub, priv, err := signing.GenerateKey()
 	if err != nil {
 		return nil, err
 	}
-	st := store.NewMemory()
 	dir := FixturesDir()
 	now := time.Now().UTC()
-	kb, kbSig, _, err := release.BuildKB(filepath.Join(dir, "kb"), "kb-fixture-1", now, priv)
+	kbID, clID := "kb-"+suffix, "claims-"+suffix
+	kb, kbSig, _, err := release.BuildKB(filepath.Join(dir, "kb"), kbID, now, priv)
 	if err != nil {
 		return nil, fmt.Errorf("build kb: %w", err)
 	}
-	cl, clSig, err := release.BuildClaims(filepath.Join(dir, "claims.json"), "claims-fixture-1", now, priv)
+	cl, clSig, err := release.BuildClaims(filepath.Join(dir, "claims.json"), clID, now, priv)
 	if err != nil {
 		return nil, fmt.Errorf("build claims: %w", err)
 	}
-	if err := release.Publish(ctx, st, pub, "kb-fixture-1", "kb", kb, kbSig); err != nil {
+	if err := release.Publish(ctx, st, pub, kbID, "kb", kb, kbSig); err != nil {
 		return nil, err
 	}
-	if err := release.Publish(ctx, st, pub, "claims-fixture-1", "claims", cl, clSig); err != nil {
+	if err := release.Publish(ctx, st, pub, clID, "claims", cl, clSig); err != nil {
 		return nil, err
 	}
-	_ = release.Promote(ctx, st, "kb", "kb-fixture-1", nil)
-	_ = release.Promote(ctx, st, "claims", "claims-fixture-1", nil)
+	if err := release.Promote(ctx, st, "kb", kbID, nil); err != nil {
+		return nil, err
+	}
+	if err := release.Promote(ctx, st, "claims", clID, nil); err != nil {
+		return nil, err
+	}
 
 	rt := release.New(st, pub)
 	if err := rt.Refresh(ctx); err != nil {

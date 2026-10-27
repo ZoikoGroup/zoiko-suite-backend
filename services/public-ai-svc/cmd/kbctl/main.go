@@ -8,6 +8,7 @@
 //	kbctl promote      -kind kb -id kb-dev-1          (also used for rollback)
 //	kbctl revoke       -kind source -id src-x -reason CODE
 //	kbctl flag         -name public_ai_enabled -value false -actor sre-1 -approval CHG-1
+//	kbctl manifest     -id suivo-r0-20261027-01 -git <sha> -image <digest> -eval eval-report.json -out release-manifest.json
 //
 // Signing keys come from PUBLIC_AI_SIGNING_KEY / PUBLIC_AI_SIGNING_PUBLIC_KEY;
 // the database from PUBLIC_AI_DATABASE_URL.
@@ -15,6 +16,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -51,6 +53,8 @@ func main() {
 		err = revoke(ctx, os.Args[2:])
 	case "flag":
 		err = setFlag(ctx, os.Args[2:])
+	case "manifest":
+		err = manifest(ctx, os.Args[2:])
 	default:
 		usage()
 	}
@@ -61,7 +65,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: kbctl keygen|build-kb|build-claims|publish|promote|revoke|flag [flags]")
+	fmt.Fprintln(os.Stderr, "usage: kbctl keygen|build-kb|build-claims|publish|promote|revoke|flag|manifest [flags]")
 	os.Exit(2)
 }
 
@@ -247,4 +251,52 @@ func setFlag(ctx context.Context, args []string) error {
 	}
 	fmt.Println("flag set", *name, "=", *value)
 	return nil
+}
+
+func manifest(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("manifest", flag.ExitOnError)
+	id := fs.String("id", "", "release id, e.g. suivo-r0-20261027-01")
+	git := fs.String("git", "", "application git commit")
+	image := fs.String("image", "", "container image digest (sha256:...)")
+	stage := fs.String("stage", "staging", "rollout stage")
+	evalPath := fs.String("eval", "", "eval-report.json from cmd/evalrun")
+	out := fs.String("out", "release-manifest.json", "output file")
+	_ = fs.Parse(args)
+	key, err := privKey()
+	if err != nil {
+		return err
+	}
+	st, err := openStore(ctx)
+	if err != nil {
+		return err
+	}
+	rec, err := release.BuildManifest(ctx, st, release.ManifestInput{
+		ReleaseID: *id, GitCommit: *git, ImageDigest: *image, RolloutStage: *stage,
+		ModelProfile: envOr("PUBLIC_AI_MODEL_PROFILE", "fake-v0"), EvalReportPath: *evalPath,
+		PolicyVersion: envOr("PUBLIC_AI_POLICY_VERSION", "pub-policy-1.0"),
+	})
+	if err != nil {
+		return err
+	}
+	body, err := json.MarshalIndent(rec, "", "  ")
+	if err != nil {
+		return err
+	}
+	sig, err := signing.Sign(key, body)
+	if err != nil {
+		return err
+	}
+	if err := signing.WriteFile(*out, rec.ReleaseID, "release_manifest", body, sig); err != nil {
+		return err
+	}
+	fmt.Println(string(body))
+	fmt.Printf("wrote signed manifest %s (decision %s)\n", *out, rec.Decision)
+	return nil
+}
+
+func envOr(k, def string) string {
+	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	return def
 }

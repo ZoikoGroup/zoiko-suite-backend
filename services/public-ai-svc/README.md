@@ -59,6 +59,17 @@ PUBLIC_AI_ENABLED=true go run ./cmd/server
 Operations: `kbctl promote` (also rollback), `kbctl revoke -kind source|claim -id ... -reason ...`,
 `kbctl flag -name public_ai_enabled -value false -actor ... -approval ...` (kill switch).
 
+## Run it in containers
+
+```bash
+docker compose -f deployments/docker-compose.public-ai.yml --env-file deployments/.env.public-ai up -d --build
+docker exec public-ai-svc /app/kbctl publish -file /releases/kb.release.json -promote
+docker exec public-ai-svc /app/kbctl publish -file /releases/claims.release.json -promote
+```
+
+The stack has its own Postgres and network (never joined to the main stack). `/health/ready` stays 503
+until signed releases are published. Operations, rollback, kill switch and drills: [RUNBOOK.md](RUNBOOK.md).
+
 ## Tests and evaluation
 
 ```bash

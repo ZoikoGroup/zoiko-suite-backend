@@ -37,6 +37,10 @@ import (
 
 const refreshInterval = 5 * time.Second
 
+// gitSHA is the application artifact version, set at build time
+// (-ldflags "-X main.gitSHA=...") and recorded in the release manifest.
+var gitSHA = "unknown"
+
 func main() {
 	log, err := zap.NewProduction()
 	if err != nil {
@@ -156,7 +160,7 @@ func serve(ctx context.Context, log *zap.Logger, cfg config.Config, h http.Handl
 		IdleTimeout:       60 * time.Second,
 	}
 	go func() {
-		log.Info("public-ai-svc listening", zap.String("addr", cfg.HTTPAddr), zap.Bool("enabled", cfg.Enabled))
+		log.Info("public-ai-svc listening", zap.String("addr", cfg.HTTPAddr), zap.Bool("enabled", cfg.Enabled), zap.String("git_sha", gitSHA))
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatal("http server failed", zap.Error(err))
 		}
