@@ -18,7 +18,7 @@ import (
 
 	"github.com/exaring/otelpgx"
 	"github.com/go-chi/chi/v5"
-	"github.com/go-chi/chi/v5/middleware"
+	chimiddleware "github.com/go-chi/chi/v5/middleware"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -26,6 +26,7 @@ import (
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 	idenv "zoiko.io/identity-envelope"
+	apicontract "zoiko.io/identity-envelope/apicontract"
 
 	"zoiko.io/delegated-authority-svc/internal/config"
 	"zoiko.io/delegated-authority-svc/internal/domain"
@@ -341,7 +342,7 @@ func (s *httpSoDClient) CheckConflict(ctx context.Context, tenantID, legalEntity
 func forwardEnvelope(ctx context.Context, req *http.Request, principalID, legalEntityID, idemSuffix string) {
 	req.Header.Set("X-Principal-Id", principalID)
 	req.Header.Set("X-Legal-Entity-Id", legalEntityID)
-	requestID := middleware.GetReqID(ctx)
+	requestID := chimiddleware.GetReqID(ctx)
 	sourceChannel := "system"
 	if requestID == "" {
 		// A background path has no inbound request; an empty id is a 400 at
@@ -526,16 +527,16 @@ func main() {
 	log.Info("identity gate", gateSettings.Fields()...)
 
 	r := chi.NewRouter()
-	r.Use(idenv.RequestID)
-	r.Use(middleware.RequestID)
-	r.Use(middleware.RealIP)
-	r.Use(middleware.Recoverer)
+	r.Use(apicontract.RequestID)
+	r.Use(apicontract.DefaultCache)
+	r.Use(chimiddleware.RealIP)
+	r.Use(chimiddleware.Recoverer)
 	r.Use(otelchi.Middleware("delegated-authority-svc", otelchi.WithChiRoutes(r)))
 	r.Use(metrics.HTTPMiddleware)
 	r.Use(correlationIDMiddleware)
 	r.Use(gate.Middleware)
 	r.Use(svcmiddleware.TenantContext())
-	r.Use(middleware.Logger)
+	r.Use(chimiddleware.Logger)
 
 	// Canonical Service Input Contract (ZS-ARCH-SVC-001 v2.0 §4). Runs after
 	// Recoverer and telemetry so a refusal is still traced, and ahead of every
