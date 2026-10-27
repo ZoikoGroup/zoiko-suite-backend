@@ -769,6 +769,9 @@ func TestWriteErr_EveryRefusalCarriesItsTypedCode(t *testing.T) {
 			if rec.Code != tc.wantStatus || body.Code != tc.wantCode {
 				t.Fatalf("got %d %q, want %d %q (body %s)", rec.Code, body.Code, tc.wantStatus, tc.wantCode, rec.Body.String())
 			}
+			if ct := rec.Header().Get("Content-Type"); ct != "application/problem+json" {
+				t.Fatalf("Content-Type = %q, want application/problem+json (API-2)", ct)
+			}
 			if strings.Contains(body.Detail, "already exists") && tc.wantCode != "DUPLICATE_CANDIDATE" {
 				t.Fatalf("a %s must not read as a duplicate: %q", tc.wantCode, body.Detail)
 			}

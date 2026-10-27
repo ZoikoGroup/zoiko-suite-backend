@@ -17,12 +17,13 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 
 	"go.uber.org/zap"
+
+	"zoiko.io/identity-envelope/apicontract"
 
 	"zoiko.io/tenant-entity-registry-svc/internal/domain"
 	"zoiko.io/tenant-entity-registry-svc/internal/store"
@@ -175,19 +176,21 @@ func replay(w http.ResponseWriter, rec *store.IdempotencyRecord) {
 		w.WriteHeader(rec.ResponseStatus)
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
+	// A recorded refusal was written as a problem document; replay it as one.
+	ct := "application/json"
+	if rec.ResponseStatus >= 400 {
+		ct = apicontract.ContentTypeProblem
+	}
+	w.Header().Set("Content-Type", ct)
 	w.WriteHeader(rec.ResponseStatus)
 	_, _ = w.Write(rec.ResponseBody)
 }
 
-// writeErr uses this service's error body shape (error, error_code,
-// correlation_id), not identity-context-svc's.
+// writeErr answers as RFC 9457 problem+json, like every other error from
+// this service (ZS-API-001 §12). A 503 and an in-flight duplicate are worth
+// retrying; a mismatched key or an unreadable body is not.
 func writeErr(w http.ResponseWriter, r *http.Request, status int, code, msg string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]string{
-		"error":          msg,
-		"error_code":     code,
-		"correlation_id": r.Header.Get("X-Correlation-ID"),
-	})
+	p := apicontract.ProblemFor(status, code, msg)
+	p.Retryable = status == http.StatusServiceUnavailable || code == "IDEMPOTENCY_IN_FLIGHT"
+	apicontract.WriteProblem(w, r, p)
 }
