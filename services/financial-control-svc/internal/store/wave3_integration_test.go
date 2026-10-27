@@ -23,7 +23,7 @@ func newWave3(t *testing.T) *wave2 {
 	t.Helper()
 	w := &wave2{t: t, tenant: uuid.NewString(), entity: uuid.NewString(), src: newFakeSources(), defs: map[string]string{}}
 	endpoints := map[string]string{}
-	for _, sys := range []string{catalogue.SysInventory, catalogue.SysPayroll} {
+	for _, sys := range []string{catalogue.SysInventory, catalogue.SysPayroll, catalogue.SysAssetManagement, catalogue.SysGL} {
 		s := w.src.server(sys)
 		t.Cleanup(s.Close)
 		endpoints[sys] = s.URL
@@ -31,7 +31,7 @@ func newWave3(t *testing.T) *wave2 {
 	// The real inventory endpoint rejects period_id.
 	w.src.noPeriod[catalogue.SysInventory+"/stock-count-lines"] = true
 	w.exec = engine.New(testStore, source.NewHTTPFetcher(endpoints, nil), zap.NewNop()).WithClock(func() time.Time { return wave2Now })
-	defs, err := catalogue.Wave3("2026-01-01")
+	defs, err := catalogue.Wave3("2026-01-01", catalogue.Wave3Options{AccumulatedDepreciationAccounts: "1590"})
 	require.NoError(t, err)
 	for _, d := range defs {
 		def, err := testStore.CreateDefinition(ctx, w.tenant, "maker", "c", d)
@@ -225,7 +225,7 @@ func TestWave3_SeedIsIdempotentAndTenantScoped(t *testing.T) {
 	w := newWave3(t)
 	defs, err := testStore.ListDefinitions(ctx, w.tenant, 50)
 	require.NoError(t, err)
-	assert.Len(t, defs, 4)
+	assert.Len(t, defs, 5, "the four fixed Wave 3 controls plus FIN-CTRL-011, which this harness seeds with its accounts")
 	again, _ := catalogue.Wave3("2026-01-01")
 	for _, d := range again {
 		_, err := testStore.CreateDefinition(ctx, w.tenant, "maker", "c", d)
@@ -240,4 +240,46 @@ func TestWave3_SeedIsIdempotentAndTenantScoped(t *testing.T) {
 func withAmount(r domain.PopulationRecord, amount string) domain.PopulationRecord {
 	r.Amount = amount
 	return r
+}
+
+// ── FIN-CTRL-011: depreciation run to GL ─────────────────────────────────────
+
+func TestWave3_DepreciationRunToGL_PairsOnTheKernelReferenceAndNothingIsNettedAway(t *testing.T) {
+	w := newWave3(t)
+	reg := func(run, cat, amt, date string) domain.PopulationRecord {
+		return attrs(recAt(run+":"+cat, "ast-dep:"+run+":"+cat, amt, date), "asset_category", cat, "run_status", "ACCOUNTING_EVENT_EMITTED")
+	}
+	gl := func(id, ref, amt, date string) domain.PopulationRecord { return recAt(id, ref, amt, date) }
+
+	// Everything ties: one register record per (run, category), one ledger credit per posted category journal.
+	w.src.set(catalogue.SysAssetManagement, "depreciation-run-postings", "am-wm",
+		reg("R1", "IT", "1000.00", "2026-01-31"), reg("R1", "Vehicles", "250.50", "2026-01-31"))
+	w.src.set(catalogue.SysGL, "account-postings", "gl-wm",
+		gl("l1", "ast-dep:R1:IT", "1000.00", "2026-01-31"), gl("l2", "ast-dep:R1:Vehicles", "250.50", "2026-01-31"))
+	run, final := w.run("FIN-CTRL-011", nil)
+	assert.Equal(t, domain.ResultPass, final.ResultState, "the register ties to the accumulated depreciation postings")
+	snaps, err := testStore.ListPopulationSnapshots(ctx, w.tenant, run.RunID)
+	require.NoError(t, err)
+	assert.Equal(t, "general-ledger/account-postings?account_codes=1590&normal_balance=CREDIT", snaps[1].SpecRef,
+		"the ledger side is read on the accumulated depreciation accounts, credit-normal")
+
+	// An approved run that never posted, a wrong amount, and a posting nobody asked for are each an exception.
+	w.src.set(catalogue.SysAssetManagement, "depreciation-run-postings", "am-wm2",
+		reg("R1", "IT", "1000.00", "2026-01-31"), reg("R1", "Vehicles", "250.50", "2026-01-31"), reg("R2", "IT", "600.00", "2026-02-28"))
+	w.src.set(catalogue.SysGL, "account-postings", "gl-wm2",
+		gl("l1", "ast-dep:R1:IT", "1000.00", "2026-01-31"), gl("l2", "ast-dep:R1:Vehicles", "250.00", "2026-01-31"),
+		gl("l9", "ast-dep:R9:IT", "75.00", "2026-01-31"))
+	run, final = w.run("FIN-CTRL-011", nil)
+	assert.Equal(t, domain.ResultFail, final.ResultState)
+	list, err := testStore.ListExceptions(ctx, w.tenant, run.RunID, store.ListExceptionsFilter{})
+	require.NoError(t, err)
+	reasons := map[string][]string{}
+	for _, x := range list {
+		reasons[x.ReasonCode] = append(reasons[x.ReasonCode], x.RecordIDs...)
+		assert.Equal(t, "ASSET_ACCOUNTING_OWNER", x.OwnerRole)
+	}
+	assert.Len(t, list, 3, "%v", reasons)
+	assert.Equal(t, []string{"R2:IT"}, reasons[domain.ReasonMissingDownstream], "approved but never posted")
+	assert.Equal(t, []string{"l9"}, reasons[domain.ReasonMissingSource], "a posting no run asked for")
+	assert.NotEmpty(t, reasons[domain.ReasonAmountMismatch], "250.50 in the register against 250.00 in the ledger")
 }

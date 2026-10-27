@@ -3,6 +3,7 @@ package catalogue
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"zoiko.io/financial-control-svc/internal/domain"
 )
@@ -13,6 +14,17 @@ const (
 	SysPayroll   = "payroll-run"
 )
 
+// SysAssetManagement is asset-management-svc, the owner of the fixed-asset register and its depreciation runs.
+const SysAssetManagement = "asset-management"
+
+// Wave3Options carries the optional, entity-specific inputs of Wave 3. A control whose input is empty is not created.
+type Wave3Options struct {
+	// AccumulatedDepreciationAccounts are the ledger accounts (comma separated, credit-normal) the kernel posts
+	// accumulated depreciation to; naming them creates FIN-CTRL-011. They are the tenant's depreciation mappings in
+	// the ledger, which this service cannot discover.
+	AccumulatedDepreciationAccounts string `json:"accumulated_depreciation_accounts"`
+}
+
 // Wave3 returns the controls of implementation wave 3 that can run on data the
 // platform holds today: the physical-count control and the payroll integrity
 // controls. The rest of wave 3 is BLOCKED by missing capabilities in other
@@ -21,7 +33,11 @@ const (
 // PAY-CTRL-* are extensions that implement §15's "Gross-to-net" and "Run-to-…"
 // tests from payroll's own data. They do not replace FIN-CTRL-005/006, which
 // need a payroll-to-GL and a payroll-to-payment path that do not exist yet.
-func Wave3(effectiveFrom string) ([]domain.CreateControlDefinitionRequest, error) {
+func Wave3(effectiveFrom string, opts ...Wave3Options) ([]domain.CreateControlDefinitionRequest, error) {
+	var o Wave3Options
+	if len(opts) > 0 {
+		o = opts[0]
+	}
 	if effectiveFrom == "" {
 		return nil, fmt.Errorf("%w: catalogue needs effective_from", domain.ErrInvalidArgument)
 	}
@@ -96,6 +112,20 @@ func Wave3(effectiveFrom string) ([]domain.CreateControlDefinitionRequest, error
 		},
 	}
 
+	if strings.TrimSpace(o.AccumulatedDepreciationAccounts) != "" {
+		// One record per (live run, asset category) on the register side, paired on the kernel's own reference
+		// ('ast-dep:<run>:<category>', the source event id of the posting) with the credits on the accumulated
+		// depreciation accounts. Both sides carry the period end as their date, so no date tolerance is needed.
+		defs = append(defs, domain.CreateControlDefinitionRequest{
+			ControlCode: "FIN-CTRL-011", Name: "Depreciation run to GL", Domain: "Assets",
+			ControlType: "TRANSACTION", Assertions: []string{"ACCURACY", "VALUATION"}, RiskTier: "STANDARD",
+			Frequency: "PERIOD_END", OwnerRole: "ASSET_ACCOUNTING_OWNER", ReviewerRole: "SENIOR_ACCOUNTANT", CertifierRole: "CONTROLLER",
+			SourceSpec: pop(SysAssetManagement, "depreciation-run-postings", nil),
+			TargetSpec: j(map[string]any{"system": SysGL, "population": "account-postings",
+				"params": map[string]string{"account_codes": strings.TrimSpace(o.AccumulatedDepreciationAccounts), "normal_balance": "CREDIT"}}),
+			InitialLogic: j(map[string]any{"kind": "MATCH", "allow_groups": true, "skip_content_duplicates": true}),
+		})
+	}
 	for i := range defs {
 		d := &defs[i]
 		d.EvidencePolicy = evidence
