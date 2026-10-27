@@ -11,7 +11,7 @@ Statuses: TODO · IN PROGRESS · DONE · BLOCKED. DONE needs a filled evidence b
 | P0-2 | Register JURISDICTION_RULE_VALIDATE | DONE | b82fd224 | access-control 000023 + template + store test. Reviewer 27 Oct: reproduces; up→down→up clean |
 | P0-3 | Fix stale resolve.go comment | DONE | 47986f06 | comment now matches tax.go. Reviewer 27 Oct: confirmed |
 | API-1 | Shared apicontract package | DONE | acce5b86; review fixes a3a89b24, 2a53338b, e84c8fac, 1a6cf81d, 37413879 | Reopened 27 Oct: its pgx v5.10.0 bump broke `go build` in authorization, evidence-requirements, policy and workflow; fixed. Now 33 unit + 7 pgx pass |
-| API-2 | Problem details + request id + cache, all our services | IN PROGRESS | e1830853, f361be5e, 8c8bb0a4, d33fa469, c338bbfc, 75e53db2, 4ed4ad08, 50f8f5fe, c2548257, af6e674a, a7d75009, 6d016f11, 9163a41f, b0844868, c0d2c2b4, 52899385, 1d5f9fc3, b13635a5, 416bce59 | tenant-entity-registry-svc + access-control-svc + identity-context-svc + governance-decision-log-svc + jurisdiction-rules-svc + obligations-svc + configuration-feature-flag-svc + secret-vault-integration-svc + gateway-auth-svc + search-indexer-svc + notification-svc + delegated-authority-svc + policy-svc + authorization-svc + workflow-svc + evidence-requirements-svc + mtls-management-svc + siem-integration-svc done; 2 services remain |
+| API-2 | Problem details + request id + cache, all our services | IN PROGRESS | e1830853, f361be5e, 8c8bb0a4, d33fa469, c338bbfc, 75e53db2, 4ed4ad08, 50f8f5fe, c2548257, af6e674a, a7d75009, 6d016f11, 9163a41f, b0844868, c0d2c2b4, 52899385, 1d5f9fc3, b13635a5, 416bce59, 6a2fae97 | tenant-entity-registry-svc + access-control-svc + identity-context-svc + governance-decision-log-svc + jurisdiction-rules-svc + obligations-svc + configuration-feature-flag-svc + secret-vault-integration-svc + gateway-auth-svc + search-indexer-svc + notification-svc + delegated-authority-svc + policy-svc + authorization-svc + workflow-svc + evidence-requirements-svc + mtls-management-svc + siem-integration-svc + carta-svc done; 1 service remains |
 | API-3 | ETag / If-Match on aggregate mutations | TODO | | |
 | API-4 | Cursor pagination on lists | TODO | | |
 | API-5 | Async operations | TODO | | |
@@ -516,4 +516,19 @@ Tests:
 - All 16 handler tests pass
 Spec rows closed: ZS-API-001 §6, §10, §12, §15, §18, §26, §29 adoption for siem-integration-svc (complete, incl. openapi gate)
 Blocked / limits: none for siem-integration-svc
+
+### API-2 — Problem details + request id + cache (carta-svc)
+Status: DONE
+Commits: 6a2fae97 feat(carta-svc): adopt RFC 9457 problem details and apicontract middleware
+Migrations: none
+Permissions registered: none
+Routes: no new routes; all existing error responses now return application/problem+json via apicontract.WriteProblem
+Wiring: cmd/server/main.go mounts apicontract.RequestID (replaces middleware.RequestID) and apicontract.DefaultCache; internal/handler/handler.go uses errJSON/okJSON helpers calling apicontract.WriteProblem for all refusals; requireTenant uses apicontract.WriteProblem
+openapi.yaml: New Problem schema (type/title/status/code/detail/instance/request_id/correlation_id/retryable/retry_after/errors[]/current_version/decision_id); all error responses retargeted to application/problem+json
+Tests:
+- `go build ./...` → clean; `go vet ./...` → clean
+- `go test -count=1 ./internal/...` → all packages ok (5 packages, 0 fail)
+- All 4 handler tests pass
+Spec rows closed: ZS-API-001 §6, §10, §12, §15, §18, §26, §29 adoption for carta-svc (complete, incl. openapi gate)
+Blocked / limits: none for carta-svc
 
