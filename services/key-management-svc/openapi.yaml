@@ -149,6 +149,7 @@ paths:
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
+  /v1/keys/{id}/rotate:
     post:
       summary: Rotate a customer key
       description: |
@@ -188,7 +189,8 @@ paths:
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
-    delete:
+  /v1/keys/{id}/disable:
+    post:
       summary: Disable a customer key
       description: |
         Disables the key (the destructive operation for this metadata-only
