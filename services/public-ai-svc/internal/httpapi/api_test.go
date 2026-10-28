@@ -280,7 +280,7 @@ func TestIdempotencyHeaderMismatch(t *testing.T) {
 	h := newHarness(t, time.Hour)
 	s := h.newSession("key-00000009")
 	w := h.req(http.MethodPost, "/public-ai/v1/turns", turnBody(s.SessionID, turnUUID, "hi"),
-		map[string]string{sessionHeader: s.SessionGrant, "Idempotency-Key": "8f1c2a52-3c1e-4b5e-9a7f-0c1d2e3f4a5b"})
+		map[string]string{sessionHeader: s.SessionGrant, "Idempotency-Key": "idem-key-1"}) // gitleaks:allow (test idempotency key, not a secret)
 	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "idempotency_header_mismatch") {
 		t.Fatalf("got %d %s", w.Code, w.Body.String())
 	}
