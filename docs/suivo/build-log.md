@@ -255,3 +255,16 @@ Trigger: in the console, "What plans are available?" asked for a country, and th
   unknown route refused, event payload), traceparent, synonyms, store conformance for feedback/purge/
   append-events on memory and Postgres. All 14 packages pass; golden 37/37; drills 5/5.
 - Record: `docs/suivo/docs-01-05-compliance.md`.
+
+## Master implementation prompt gaps (2026-10-28)
+
+- Checked the Suivo master implementation prompt against what was built. Its reference stack (Node/Fastify/React web component) is REPLACEABLE, so the discovered Go service and Next.js console stay; the delta is in ADR-006.
+- Turn envelope: `answer_class` on every turn, plus optional `status_label` (governed registry vocabulary only), `market_code` and `clarification` {slot, question, options = markets + GENERAL_OVERVIEW}. Validated in `contract.Envelope.Validate` and documented in OpenAPI.
+- "Show general overview" answers the pending question from market-free narrative (fixed per-intent overview query); it no longer falls through to the product overview.
+- Prompts: L1-PROMPT-001, L2-RESPONSE-001 and the L3-EVIDENCE-001 wrapper are sent verbatim and pinned by hash (`model.PromptVersion`); L2-INTENT-001 is pinned for the provider classifier (R0 classifies deterministically).
+- Validator: banned absolutes and action claims added (24/7, round-the-clock, works with every/all, I've submitted/created/sent/scheduled).
+- Config: refuses to start outside dev/test without `PUBLIC_AI_RETENTION` from the signed policy. `GET /config` serves the `ui.*` microcopy registry and page-aware chips.
+- Tests: S01–S10 multi-turn scripts over the HTTP API (`internal/acceptance/scripts_test.go`), envelope and retention tests. Full suite green.
+- Docs: ADR-006, `conversation-assets.md` (T01–T30, S01–S10, banned absolutes, escalation matrix), `owasp-llm-map.md`.
+- Console widget: S00–S09 reducer (`state.ts`, 7 `node --test` cases), status badge (text + icon), market qualifier, clarification chips, pre-send sensitive-data warning (blocks Send), privacy notice, Clear chat, unavailable panel with static routes, copy and chips from `/config`.
+- Verified in the browser against the live dev backend: price question → country chips → United Kingdom → GB price with qualifier, source and one CTA; pasted password → warning, Send disabled; FixtureBooks → "Implemented" badge; Clear chat → S09 with retention notice.

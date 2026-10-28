@@ -56,7 +56,8 @@ func TestNormalizeMessage(t *testing.T) {
 }
 
 func TestEnvelopeValidate(t *testing.T) {
-	e := Envelope{SchemaVersion: "1.0", TurnSequence: 1, Status: Abstain, IntentID: "I05", KnowledgeReleaseID: "kb-1", PolicyVersion: "p", Citations: []Citation{}, Actions: []Action{}}
+	e := Envelope{SchemaVersion: "1.0", TurnSequence: 1, Status: Abstain, IntentID: "I05", KnowledgeReleaseID: "kb-1", PolicyVersion: "p",
+		Citations: []Citation{}, Actions: []Action{}, AnswerClass: HandoffUnknown}
 	if err := e.Validate(); err != nil {
 		t.Fatal(err)
 	}
@@ -79,5 +80,20 @@ func TestEnvelopeValidate(t *testing.T) {
 	bad.Text = strings.Repeat("x", 5001)
 	if bad.Validate() == nil {
 		t.Fatal("text over 5000 must fail")
+	}
+	bad = e
+	bad.AnswerClass = ""
+	if bad.Validate() == nil {
+		t.Fatal("missing answer_class must fail")
+	}
+	bad = e
+	bad.StatusLabel = "Certified" // not in the governed vocabulary
+	if bad.Validate() == nil {
+		t.Fatal("ungoverned status label must fail")
+	}
+	bad = e
+	bad.Clarification = &Clarification{Slot: "market_code", Question: "q", Options: []string{"US"}}
+	if bad.Validate() == nil {
+		t.Fatal("clarification outside CLARIFY must fail")
 	}
 }

@@ -136,6 +136,12 @@ var (
 // IsGreeting reports whether the whole message is a greeting or thanks.
 func IsGreeting(text string) bool { return greetingRe.MatchString(text) }
 
+var overviewRe = regexp.MustCompile(`(?i)^\s*(?:` + regexp.QuoteMeta("GENERAL_OVERVIEW") + `|show (?:me )?(?:a |the )?general overview|general overview)\s*[.!]?\s*$`)
+
+// IsGeneralOverview reports whether the visitor chose "Show general overview"
+// in answer to a clarifying question (Master prompt §4 step 6).
+func IsGeneralOverview(text string) bool { return overviewRe.MatchString(text) }
+
 // AsksPrice reports whether the message asks for a price (as opposed to,
 // say, which plans exist). Only price questions need a market (Doc 02 I05).
 func AsksPrice(text string) bool { return priceRe.MatchString(text) }

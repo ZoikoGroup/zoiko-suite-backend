@@ -36,6 +36,41 @@ const (
 
 var validStatus = map[Status]bool{Answered: true, Clarify: true, RefusedAction: true, Abstain: true, Handoff: true, Unavailable: true}
 
+// Answer classes (Master prompt §4.1, Doc 02 §12): how much of the answer is
+// a governed fact. Every status maps to exactly one class.
+const (
+	VerifiedFact       = "VERIFIED_FACT"
+	StatusQualified    = "STATUS_QUALIFIED"
+	ProcessExplanation = "PROCESS_EXPLANATION"
+	HandoffUnknown     = "HANDOFF_UNKNOWN"
+)
+
+var validClass = map[string]bool{VerifiedFact: true, StatusQualified: true, ProcessExplanation: true, HandoffUnknown: true}
+
+// StatusLabels is the governed status vocabulary. A label is shown only when
+// it comes from the signed claim registry; it is never inferred or upgraded.
+var StatusLabels = map[string]bool{
+	"Available": true, "Limited": true, "Partner-Supported": true, "Planned": true, "Not Available": true,
+	"Unverified": true, "Current Architecture": true, "Implemented": true, "In Validation": true, "Readiness": true,
+	"MARKET_DEPENDENT": true,
+}
+
+// OverviewOption is the clarification choice that skips the missing slot and
+// asks for the general, non-market answer instead.
+const OverviewOption = "GENERAL_OVERVIEW"
+
+// DefaultClass is the class for a status when the orchestrator set none.
+func DefaultClass(s Status) string {
+	switch s {
+	case Answered:
+		return ProcessExplanation
+	case Clarify:
+		return StatusQualified
+	default:
+		return HandoffUnknown
+	}
+}
+
 // PageContexts is the allowlisted page_context enum (Doc 05 §08).
 var PageContexts = map[string]bool{"home": true, "pricing": true, "core_modules": true, "demo": true, "support": true, "other": true}
 
@@ -98,6 +133,14 @@ type Flags struct {
 	RequiresHuman bool `json:"requires_human,omitempty"`
 }
 
+// Clarification is the one question a CLARIFY turn asks: the slot it fills
+// and the allowed choices (market codes plus OverviewOption).
+type Clarification struct {
+	Slot     string   `json:"slot"`
+	Question string   `json:"question"`
+	Options  []string `json:"options"`
+}
+
 // Envelope is the turn response (zs-public-answer-v1).
 type Envelope struct {
 	SchemaVersion      string     `json:"schema_version"`
@@ -112,6 +155,12 @@ type Envelope struct {
 	KnowledgeReleaseID string     `json:"knowledge_release_id"`
 	PolicyVersion      string     `json:"policy_version"`
 	Flags              *Flags     `json:"flags,omitempty"`
+	// AnswerClass, StatusLabel and MarketCode are the qualifier the UI shows
+	// next to the answer; Clarification is set only on CLARIFY.
+	AnswerClass   string         `json:"answer_class"`
+	StatusLabel   string         `json:"status_label,omitempty"`
+	MarketCode    string         `json:"market_code,omitempty"`
+	Clarification *Clarification `json:"clarification,omitempty"`
 }
 
 // ConfigResponse is the body of GET /config (Doc 05 §15).
@@ -127,6 +176,16 @@ type ConfigResponse struct {
 	// §15 recorded in ADR-005.
 	CitationLinks    []CitationLink `json:"citation_links"`
 	PrivacyNoticeKey string         `json:"privacy_notice_key"`
+	// Microcopy (ui.* keys) and Chips (starter questions by page_context)
+	// let the widget render pre-approved wording only (Master prompt §6.4).
+	Microcopy map[string]string `json:"microcopy"`
+	Chips     map[string][]Chip `json:"chips"`
+}
+
+// Chip is one welcome-card starter: a label and the fixed message it sends.
+type Chip struct {
+	Label   string `json:"label"`
+	Message string `json:"message"`
 }
 
 // FieldError is a 422 validation failure (safe to show publicly).
@@ -220,6 +279,16 @@ func (e *Envelope) Validate() error {
 		return errors.New("release/policy required")
 	case e.TurnSequence < 1:
 		return errors.New("turn_sequence")
+	case !validClass[e.AnswerClass]:
+		return errors.New("answer_class")
+	case e.StatusLabel != "" && !StatusLabels[e.StatusLabel]:
+		return errors.New("status_label")
+	case e.MarketCode != "" && !marketRe.MatchString(e.MarketCode):
+		return errors.New("market_code")
+	case e.Clarification != nil && e.Status != Clarify:
+		return errors.New("clarification only on CLARIFY")
+	case e.AnswerClass == HandoffUnknown && e.Status == Answered:
+		return errors.New("ANSWERED cannot be HANDOFF_UNKNOWN")
 	}
 	for _, a := range e.Actions {
 		if a.Type != ActionOpenRoute || a.RouteKey == "" {

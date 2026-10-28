@@ -37,3 +37,16 @@ func TestSingleActiveTurnEnforced(t *testing.T) {
 		t.Fatal("expected refusal of >1 active turn per session")
 	}
 }
+
+// Master prompt §10: retention is never a guessed default outside dev/test.
+func TestRetentionRequiredOutsideDev(t *testing.T) {
+	t.Setenv("PUBLIC_AI_ENVIRONMENT", "production")
+	t.Setenv("PUBLIC_AI_RETENTION", "")
+	if _, err := Load(); err == nil {
+		t.Fatal("production without PUBLIC_AI_RETENTION must refuse to start")
+	}
+	t.Setenv("PUBLIC_AI_RETENTION", "720h")
+	if _, err := Load(); err != nil {
+		t.Fatalf("explicit retention should load: %v", err)
+	}
+}

@@ -108,7 +108,7 @@ func (p *Pipeline) Answer(ctx context.Context, in Input) Result {
 	intent := dec.Primary
 	clarifications := 0
 	carried := false
-	if pd := in.Pending; pd != nil && (intent == pd.Intent || intent == "I29" || intent == "I04") {
+	if pd := in.Pending; pd != nil && (intent == pd.Intent || intent == "I29" || intent == "I04" || policy.IsGeneralOverview(in.Message)) {
 		// A reply to our clarifying question: keep the original question's
 		// intent and slots, add what the visitor just supplied.
 		intent, clarifications, carried = pd.Intent, pd.Clarifications, true
@@ -122,6 +122,9 @@ func (p *Pipeline) Answer(ctx context.Context, in Input) Result {
 			dec.Slots.Integration = pd.Integration
 		}
 	}
+	// "Show general overview": answer the pending question without the
+	// missing slot, from approved narrative only (no market-scoped claims).
+	overview := carried && policy.IsGeneralOverview(in.Message)
 	if fv.DisabledIntents[intent] {
 		return p.fromTemplate(withRoute(policy.TplUnavailable, policy.DefaultRoute[intent]), intent, snap, market, now, releaseID)
 	}
@@ -139,7 +142,7 @@ func (p *Pipeline) Answer(ctx context.Context, in Input) Result {
 				verified = append(verified, d.Verified...)
 			}
 		}
-	} else if req, ok := claimRequest(intent, dec, in.Message, snap.Claims, market, now, carried); ok {
+	} else if req, ok := claimRequest(intent, dec, in.Message, snap.Claims, market, now, carried); ok && !overview {
 		if (req.Subject == claims.Price || req.Subject == claims.Trial) && !fv.PricingClaimsEnabled {
 			return p.fromTemplate(withRoute(policy.TplAbstainNoEvidence, "pricing"), intent, snap, market, now, releaseID)
 		}
@@ -151,6 +154,9 @@ func (p *Pipeline) Answer(ctx context.Context, in Input) Result {
 				return p.fromTemplate(withRoute(policy.TplClarifyGiveUp, policy.DefaultRoute[intent]), intent, snap, market, now, releaseID)
 			}
 			res := p.fromTemplate(policy.TplClarifyMarket, intent, snap, market, now, releaseID)
+			res.StatusLabel = "MARKET_DEPENDENT"
+			res.Clarification = &contract.Clarification{Slot: "market_code", Question: policy.TplClarifyMarket.Text,
+				Options: append(snap.Claims.Markets(), contract.OverviewOption)}
 			res.Pending = &Pending{Intent: intent, PlanName: dec.Slots.PlanName, BillingCadence: dec.Slots.BillingCadence,
 				Integration: dec.Slots.Integration, Clarifications: clarifications + 1}
 			return res
@@ -173,7 +179,13 @@ func (p *Pipeline) Answer(ctx context.Context, in Input) Result {
 	// P2/P3 retrieval with mandatory filters (only when no claim answers it).
 	var hits []knowledge.Hit
 	if len(verified) == 0 {
-		kq := knowledge.Query{Text: dec.Redaction.Text, Market: market, Locale: in.Locale, Now: now, MaxChunks: 4, IntentID: intent}
+		qtext := dec.Redaction.Text
+		if overview {
+			// The overview reply carries no search terms of its own; search
+			// the fixed general question for the pending intent instead.
+			qtext = overviewQuery[intent]
+		}
+		kq := knowledge.Query{Text: qtext, Market: market, Locale: in.Locale, Now: now, MaxChunks: 4, IntentID: intent}
 		r := snap.KB.Search(kq, snap)
 		if r.Answerability == knowledge.NotFound && intent != "I29" {
 			r = snap.KB.ByIntent(kq, snap)
@@ -216,7 +228,7 @@ func (p *Pipeline) Answer(ctx context.Context, in Input) Result {
 	case staticOnly:
 		return p.fromTemplate(withRoute(policy.TplUnavailable, policy.DefaultRoute[intent]), intent, snap, market, now, releaseID)
 	default:
-		text, draft, err = p.generate(ctx, intent, dec.Redaction.Text, cards, evidence)
+		text, draft, err = p.generate(ctx, intent, modelQuestion(dec.Redaction.Text, overview, intent), cards, evidence)
 		if errors.Is(err, validate.ErrToolInstruction) {
 			// CT-033: no tool exists to invoke; the draft is discarded and a safety signal recorded.
 			res := p.fromTemplate(withRoute(policy.TplAbstainNoEvidence, policy.DefaultRoute[intent]), intent, snap, market, now, releaseID)
@@ -253,6 +265,7 @@ func (p *Pipeline) Answer(ctx context.Context, in Input) Result {
 		Actions: p.actions(snap, routeKey, market, now), KnowledgeReleaseID: releaseID,
 		Tokens: int64(draft.InputTokens + draft.OutputTokens),
 	}
+	res.AnswerClass, res.StatusLabel, res.MarketCode = qualify(verified, market)
 	if (intent == "I05" || intent == "I06") && len(verified) == 0 {
 		// Plans/trials explained without a market: a reply naming a country
 		// ("uk") should get that market's verified prices or trial next.
@@ -273,7 +286,8 @@ func (p *Pipeline) generate(ctx context.Context, intent, msg string, cards []mod
 		if verr == nil {
 			return text, d, nil
 		}
-		p.log().Warn("draft rejected by output validation", zap.String("reason", verr.Error()), zap.Int("attempt", attempt))
+		p.log().Warn("draft rejected by output validation", zap.String("reason", verr.Error()), zap.Int("attempt", attempt),
+			zap.String("prompt_version", model.PromptVersion))
 		lastErr = verr
 		req.RepairNote = "Previous draft was rejected: " + verr.Error()
 	}
@@ -343,6 +357,45 @@ func (p *Pipeline) actions(snap *release.Snapshot, routeKey, market string, now 
 		return []contract.Action{} // missing/unpublished route → hide the CTA
 	}
 	return []contract.Action{{Type: contract.ActionOpenRoute, RouteKey: routeKey}}
+}
+
+// qualify derives the answer class and governed status label from the claims
+// that backed an ANSWERED turn (Master prompt §4.1). Labels come only from the
+// registry's normalized value; an unknown value shows no label.
+func qualify(verified []claims.Claim, market string) (class, label, marketCode string) {
+	if len(verified) == 0 {
+		return contract.ProcessExplanation, "", ""
+	}
+	class = contract.VerifiedFact
+	for _, c := range verified {
+		if l := statusLabels[strings.ToLower(c.NormalizedValue)]; l != "" && label == "" &&
+			(c.ClaimType == claims.IntegrationStatus || c.ClaimType == claims.Certification) {
+			label = l
+		}
+		if c.Market != "" && c.Market != "ALL" {
+			marketCode = market
+		}
+	}
+	if label != "" || marketCode != "" {
+		class = contract.StatusQualified
+	}
+	return class, label, marketCode
+}
+
+// overviewQuery is the general, market-free question answered when a visitor
+// picks "Show general overview" instead of naming a market.
+var overviewQuery = map[string]string{
+	"I04": "Which countries and markets is ZoikoSuite available in?",
+	"I05": "What plans are available and how is pricing structured?",
+	"I06": "Is there a free trial and how does it work?",
+	"I14": "Where is data hosted and stored?",
+}
+
+var statusLabels = map[string]string{
+	"available": "Available", "limited": "Limited", "partner_supported": "Partner-Supported",
+	"partner-supported": "Partner-Supported", "planned": "Planned", "not_available": "Not Available",
+	"unverified": "Unverified", "current_architecture": "Current Architecture", "implemented": "Implemented",
+	"built": "Implemented", "in_validation": "In Validation", "readiness": "Readiness",
 }
 
 func (p *Pipeline) fromTemplate(t policy.Template, intent string, snap *release.Snapshot, market string, now time.Time, releaseID string) Result {
@@ -457,4 +510,13 @@ func claimRequest(intent string, dec policy.Decision, msg string, reg *claims.Re
 		q.SubjectID = "UNKNOWN_PLAN" // a plan the registry does not know is never matched
 	}
 	return q, true
+}
+
+// modelQuestion is the question the model answers: the visitor's own
+// (redacted) words, or the fixed general question after "Show general overview".
+func modelQuestion(redacted string, overview bool, intent string) string {
+	if q := overviewQuery[intent]; overview && q != "" {
+		return q
+	}
+	return redacted
 }

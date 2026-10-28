@@ -41,7 +41,13 @@ type Result struct {
 	Actions            []contract.Action
 	KnowledgeReleaseID string
 	Flags              *contract.Flags
-	Tokens             int64
+	// AnswerClass ("" = contract.DefaultClass), StatusLabel, MarketCode and
+	// Clarification are the qualifier fields of the envelope.
+	AnswerClass   string
+	StatusLabel   string
+	MarketCode    string
+	Clarification *contract.Clarification
+	Tokens        int64
 	// LatencyBucket and SecuritySignal feed redacted events.
 	SecuritySignal string
 	// Pending, when set, must be stored for the next turn; nil clears it.

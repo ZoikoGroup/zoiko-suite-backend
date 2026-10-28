@@ -33,6 +33,11 @@ type Config struct {
 	// Retention is how long expired/deleted sessions and their turns are
 	// kept before purge. Dev default pending DPO approval (DEC-06).
 	Retention                 time.Duration
+	// Environment is dev, test, staging or production. Outside dev/test the
+	// retention period must come from the signed policy config, never from a
+	// default (Master prompt §10): RetentionSet records whether it was given.
+	Environment  string
+	RetentionSet bool
 	MaxBodyBytes              int64
 	ModelTimeout              time.Duration
 	RateLimitPerIPPerMinute   int
@@ -69,6 +74,8 @@ func Load() (Config, error) {
 		SessionTTL:                envDuration("PUBLIC_AI_SESSION_TTL", 30*time.Minute),
 		IdempotencyTTL:            envDuration("PUBLIC_AI_IDEMPOTENCY_TTL", 24*time.Hour),
 		Retention:                 envDuration("PUBLIC_AI_RETENTION", 24*time.Hour),
+		Environment:               env("PUBLIC_AI_ENVIRONMENT", "dev"),
+		RetentionSet:              os.Getenv("PUBLIC_AI_RETENTION") != "",
 		MaxBodyBytes:              int64(envInt("PUBLIC_AI_MAX_BODY_BYTES", 16*1024)),
 		ModelTimeout:              envDuration("PUBLIC_AI_MODEL_TIMEOUT", 6*time.Second),
 		RateLimitPerIPPerMinute:   envInt("PUBLIC_AI_RATE_LIMIT_IP_PER_MIN", 60),
@@ -98,6 +105,9 @@ func (c Config) Validate() error {
 		if o == "*" {
 			return fmt.Errorf("wildcard origin is not permitted (Doc 06 §11)")
 		}
+	}
+	if c.Environment != "dev" && c.Environment != "test" && !c.RetentionSet {
+		return fmt.Errorf("PUBLIC_AI_RETENTION must be set from the signed retention policy outside dev/test (TODO(DPO): DEC-06)")
 	}
 	if c.SessionTTL <= 0 || c.IdempotencyTTL <= 0 || c.ModelTimeout <= 0 {
 		return fmt.Errorf("TTL and timeout values must be positive")

@@ -233,12 +233,17 @@ func (s *Server) postTurn(w http.ResponseWriter, r *http.Request) {
 		TurnSequence: begun.Turn.Sequence, Status: res.Status, IntentID: res.IntentID, Text: res.Text,
 		Citations: nonNilC(res.Citations), Actions: nonNilA(res.Actions),
 		KnowledgeReleaseID: res.KnowledgeReleaseID, PolicyVersion: s.cfg.PolicyVersion, Flags: res.Flags,
+		AnswerClass: res.AnswerClass, StatusLabel: res.StatusLabel, MarketCode: res.MarketCode, Clarification: res.Clarification,
+	}
+	if env.AnswerClass == "" {
+		env.AnswerClass = contract.DefaultClass(env.Status)
 	}
 	if err := env.Validate(); err != nil {
 		// The orchestrator produced something outside the schema: never send it.
 		s.log.Error("response failed schema validation", zap.String("request_id", rid), zap.String("reason", err.Error()))
 		env.Status, env.IntentID, env.Text = contract.Unavailable, "UNKNOWN", unavailableText
 		env.Citations, env.Actions, env.Flags = []contract.Citation{}, []contract.Action{}, nil
+		env.AnswerClass, env.StatusLabel, env.MarketCode, env.Clarification = contract.HandoffUnknown, "", "", nil
 		if env.KnowledgeReleaseID == "" {
 			env.KnowledgeReleaseID = "none"
 		}

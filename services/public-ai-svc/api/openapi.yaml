@@ -82,7 +82,7 @@ components:
       title: zs-public-answer-v1
       type: object
       additionalProperties: false
-      required: [schema_version, turn_id, request_id, turn_sequence, status, intent_id, text, citations, actions, knowledge_release_id, policy_version]
+      required: [schema_version, turn_id, request_id, turn_sequence, status, intent_id, text, citations, actions, knowledge_release_id, policy_version, answer_class]
       properties:
         schema_version: {const: "1.0"}
         turn_id: {type: string}
@@ -99,6 +99,27 @@ components:
           type: object
           properties:
             requires_human: {type: boolean}
+        answer_class:
+          type: string
+          enum: [VERIFIED_FACT, STATUS_QUALIFIED, PROCESS_EXPLANATION, HANDOFF_UNKNOWN]
+          description: ANSWERED is never HANDOFF_UNKNOWN; refusals, abstentions and outages always are.
+        status_label:
+          type: string
+          description: Governed status from the signed claim registry only; never inferred or upgraded.
+          enum: [Available, Limited, Partner-Supported, Planned, Not Available, Unverified, Current Architecture, Implemented, In Validation, Readiness, MARKET_DEPENDENT]
+        market_code:
+          type: string
+          pattern: "^[A-Z]{2}$"
+          description: The market a STATUS_QUALIFIED answer is scoped to.
+        clarification:
+          type: object
+          description: Present only on CLARIFY. Options are market codes plus GENERAL_OVERVIEW.
+          additionalProperties: false
+          required: [slot, question, options]
+          properties:
+            slot: {type: string}
+            question: {type: string}
+            options: {type: array, items: {type: string}}
     ConfigResponse:
       type: object
       required: [config_revision, assistant_display_name, capabilities, supported_locales, market_choices, public_routes, citation_links, privacy_notice_key]
@@ -128,6 +149,21 @@ components:
               url: {type: string, format: uri}
               title: {type: string}
         privacy_notice_key: {type: string}
+        microcopy:
+          type: object
+          description: Pre-approved UI wording keyed ui.* (plain text).
+          additionalProperties: {type: string}
+        chips:
+          type: object
+          description: Starter questions keyed by page_context.
+          additionalProperties:
+            type: array
+            items:
+              type: object
+              required: [label, message]
+              properties:
+                label: {type: string}
+                message: {type: string}
     Problem:
       type: object
       required: [type, title, status, instance, code, request_id, retryable]

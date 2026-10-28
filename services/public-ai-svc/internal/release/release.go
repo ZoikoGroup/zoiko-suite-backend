@@ -17,6 +17,7 @@ import (
 	"zoiko.io/public-ai-svc/internal/claims"
 	"zoiko.io/public-ai-svc/internal/contract"
 	"zoiko.io/public-ai-svc/internal/knowledge"
+	"zoiko.io/public-ai-svc/internal/policy"
 	"zoiko.io/public-ai-svc/internal/signing"
 	"zoiko.io/public-ai-svc/internal/store"
 )
@@ -288,6 +289,13 @@ func (r *Runtime) PublicConfig() contract.ConfigResponse {
 		PublicRoutes:         []contract.PublicRoute{},
 		CitationLinks:        []contract.CitationLink{},
 		PrivacyNoticeKey:     "privacy-notice-pending-dpo",
+		Microcopy:            policy.Microcopy,
+		Chips:                map[string][]contract.Chip{},
+	}
+	for page, chips := range policy.Chips {
+		for _, c := range chips {
+			cfg.Chips[page] = append(cfg.Chips[page], contract.Chip{Label: c.Label, Message: c.Message})
+		}
 	}
 	f := false
 	cfg.Capabilities.Authenticated = &f
