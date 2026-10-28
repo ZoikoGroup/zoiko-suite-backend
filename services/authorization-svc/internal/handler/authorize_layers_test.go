@@ -122,8 +122,8 @@ func TestAuthorize_PlatformScopeRefusedWhenUnconfigured(t *testing.T) {
 	if code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d", code)
 	}
-	if got["error"] != "platform_scope_not_configured" {
-		t.Fatalf("error = %q, want platform_scope_not_configured", got["error"])
+	if got["code"] != "platform_scope_not_configured" {
+		t.Fatalf("error = %q, want platform_scope_not_configured", got["code"])
 	}
 }
 
@@ -375,8 +375,8 @@ func TestCreateABACRule_RejectsUnsupportedOperatorAndEffect(t *testing.T) {
 			}
 			var got map[string]string
 			_ = json.Unmarshal(w.Body.Bytes(), &got)
-			if got["error"] != tc.wantError {
-				t.Fatalf("error = %q, want %q", got["error"], tc.wantError)
+			if got["code"] != tc.wantError {
+				t.Fatalf("error = %q, want %q", got["code"], tc.wantError)
 			}
 			if store.gotCreateABACRule.RuleCode != "" {
 				t.Errorf("an invalid rule reached the store: %+v", store.gotCreateABACRule)

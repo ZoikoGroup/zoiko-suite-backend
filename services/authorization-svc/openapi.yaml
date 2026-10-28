@@ -36,12 +36,13 @@ info:
     refused wherever they hold the permission, with basis
     `principal_status:<status>`.
 
-    **Errors.** `{"error": "<code>", "message": "...", "error_class":
-    "<class>"}`. `error` is the stable code callers match on; `error_class`
-    is the Governance Control Plane A16 class (`CONTEXT_UNRESOLVED`,
+    **Errors.** RFC 9457 `application/problem+json` (ZS-API-001 A12). `code`
+    is the stable code callers match on; `error_class` is the Governance
+    Control Plane A16 class (`CONTEXT_UNRESOLVED`, `AUTHENTICATION_FAILED`,
     `AUTHORIZATION_DENIED`, `SOD_CONFLICT`, `APPROVAL_INVALIDATED`,
-    `CONCURRENCY_CONFLICT`, `IDEMPOTENCY_MISMATCH`), present where one
-    applies.
+    `CONCURRENCY_CONFLICT`, `IDEMPOTENCY_MISMATCH`, `DEPENDENCY_UNAVAILABLE`),
+    present where one applies. Other members of a refusal (`field`, `reason`,
+    `approval_status`, ...) are extension members.
 
     **Idempotency.** Every material write honours `Idempotency-Key`: a retry
     returns the first response (`X-Idempotent-Replay: true`, `201` answered
@@ -147,14 +148,14 @@ paths:
       requestBody:
         required: true
         content:
-          application/problem+json:
+          application/json:
             schema:
               $ref: '#/components/schemas/AuthorizeRequest'
       responses:
         '200':
           description: A decision was reached.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/Decision'
         '400':
@@ -183,14 +184,14 @@ paths:
       requestBody:
         required: true
         content:
-          application/problem+json:
+          application/json:
             schema:
               $ref: '#/components/schemas/CanonicalDecisionRequest'
       responses:
         '200':
           description: A canonical decision.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/Decision'
         '400':
@@ -213,7 +214,7 @@ paths:
       requestBody:
         required: true
         content:
-          application/problem+json:
+          application/json:
             schema:
               type: object
               description: Principal, legal entity and the tenant to validate against.
@@ -222,7 +223,7 @@ paths:
         '200':
           description: The scope resolution result.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/EntityScopeValidation'
         '400':
@@ -241,7 +242,7 @@ paths:
       requestBody:
         required: true
         content:
-          application/problem+json:
+          application/json:
             schema:
               type: object
               additionalProperties: true
@@ -249,7 +250,7 @@ paths:
         '200':
           description: Conflicts found, if any.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/SoDValidation'
         '400':
@@ -268,7 +269,7 @@ paths:
       requestBody:
         required: true
         content:
-          application/problem+json:
+          application/json:
             schema:
               type: object
               additionalProperties: true
@@ -276,7 +277,7 @@ paths:
         '200':
           description: The SoD evaluation result.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/SoDValidation'
         '400':
@@ -302,7 +303,7 @@ paths:
       requestBody:
         required: true
         content:
-          application/problem+json:
+          application/json:
             schema:
               type: object
               properties:
@@ -316,7 +317,7 @@ paths:
         '200':
           description: The delegation evaluation result.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/DelegatedAccessEvaluation'
         '400':
@@ -353,7 +354,7 @@ paths:
         '200':
           description: Available actions for the caller.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/AvailableActions'
         '400':
@@ -372,7 +373,7 @@ paths:
         '200':
           description: The caller's capabilities.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/Capabilities'
         '401':
@@ -414,7 +415,7 @@ paths:
         '200':
           description: A page of decisions.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 type: object
                 properties:
@@ -445,7 +446,7 @@ paths:
         '200':
           description: The decision.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/AccessDecision'
         '401':
@@ -468,20 +469,20 @@ paths:
       requestBody:
         required: true
         content:
-          application/problem+json:
+          application/json:
             schema:
               $ref: '#/components/schemas/CreateRoleRequest'
       responses:
         '201':
           description: Role created.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/Role'
         '200':
           description: Idempotent replay of a role already created.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/Role'
         '400':
@@ -503,7 +504,7 @@ paths:
         '200':
           description: The tenant's roles.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 type: object
                 properties:
@@ -531,7 +532,7 @@ paths:
         '200':
           description: Role retired.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/Role'
         '400':
@@ -567,7 +568,7 @@ paths:
         '200':
           description: Role reactivated.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/Role'
         '400':
@@ -607,20 +608,20 @@ paths:
       requestBody:
         required: true
         content:
-          application/problem+json:
+          application/json:
             schema:
               $ref: '#/components/schemas/CreatePermissionBundleRequest'
       responses:
         '201':
           description: Bundle created.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/PermissionBundle'
         '200':
           description: Bundle replaced.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/PermissionBundle'
         '400':
@@ -644,7 +645,7 @@ paths:
         '200':
           description: The role's bundles.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 type: object
                 properties:
@@ -674,7 +675,7 @@ paths:
         '200':
           description: Bundle retired.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/PermissionBundle'
         '400':
@@ -704,7 +705,7 @@ paths:
         '200':
           description: Bundle reactivated.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/PermissionBundle'
         '400':
@@ -738,20 +739,20 @@ paths:
       requestBody:
         required: true
         content:
-          application/problem+json:
+          application/json:
             schema:
               $ref: '#/components/schemas/CreateRoleAssignmentRequest'
       responses:
         '201':
           description: Assignment approved and active.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/RoleAssignment'
         '202':
           description: PENDING_APPROVAL — recorded but granting nothing until an independent approver approves.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/RoleAssignment'
         '400':
@@ -782,7 +783,7 @@ paths:
         '200':
           description: The tenant's assignments.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 type: object
                 properties:
@@ -814,7 +815,7 @@ paths:
         '200':
           description: Assignment approved.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/RoleAssignment'
         '400':
@@ -850,7 +851,7 @@ paths:
         '200':
           description: Assignment rejected and grants nothing.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/RoleAssignment'
         '400':
@@ -877,7 +878,7 @@ paths:
       requestBody:
         required: true
         content:
-          application/problem+json:
+          application/json:
             schema:
               type: object
               properties:
@@ -892,7 +893,7 @@ paths:
         '200':
           description: Assignment revoked or scheduled to end.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/RoleAssignment'
         '400':
@@ -925,14 +926,14 @@ paths:
       requestBody:
         required: true
         content:
-          application/problem+json:
+          application/json:
             schema:
               $ref: '#/components/schemas/CreateDelegationRequest'
       responses:
         '201':
           description: Delegation granted.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/Delegation'
         '400':
@@ -954,7 +955,7 @@ paths:
         '200':
           description: The tenant's delegations.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 type: object
                 properties:
@@ -982,7 +983,7 @@ paths:
         '200':
           description: Delegation revoked.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/Delegation'
         '400':
@@ -1008,14 +1009,14 @@ paths:
       requestBody:
         required: true
         content:
-          application/problem+json:
+          application/json:
             schema:
               $ref: '#/components/schemas/CreateSoDRuleRequest'
       responses:
         '202':
           description: Proposed — inactive until published by someone else (AU-17).
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/SoDRule'
         '400':
@@ -1039,7 +1040,7 @@ paths:
         '200':
           description: The rules visible to the tenant.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 type: object
                 properties:
@@ -1067,7 +1068,7 @@ paths:
         '202':
           description: Change requested; the rule is unchanged until published by someone else (AU-17). 200 when already in that state.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/SoDRule'
         '400':
@@ -1100,7 +1101,7 @@ paths:
         '202':
           description: Change requested; the rule is unchanged until published by someone else (AU-17). 200 when already in that state.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/SoDRule'
         '400':
@@ -1128,7 +1129,7 @@ paths:
         '200':
           description: The conflicting actions, by rule.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 type: object
                 additionalProperties: true
@@ -1154,14 +1155,14 @@ paths:
       requestBody:
         required: true
         content:
-          application/problem+json:
+          application/json:
             schema:
               $ref: '#/components/schemas/CreateSoDExceptionRequest'
       responses:
         '201':
           description: Exception requested.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/SoDException'
         '400':
@@ -1187,7 +1188,7 @@ paths:
         '200':
           description: The exceptions matching the filter.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 type: object
                 properties:
@@ -1219,7 +1220,7 @@ paths:
         '200':
           description: Exception approved.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/SoDException'
         '400':
@@ -1252,7 +1253,7 @@ paths:
         '200':
           description: Exception rejected.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/SoDException'
         '400':
@@ -1282,7 +1283,7 @@ paths:
         '200':
           description: Exception revoked.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/SoDException'
         '400':
@@ -1308,7 +1309,7 @@ paths:
       requestBody:
         required: true
         content:
-          application/problem+json:
+          application/json:
             schema:
               type: object
               description: 'Rule code, action, effect and conditions. A REQUIRE rule whose attribute the caller does not send is a denial (`abac:require_failed`).'
@@ -1317,7 +1318,7 @@ paths:
         '202':
           description: Proposed — inactive until published by someone else (AU-17).
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/ABACRule'
         '400':
@@ -1338,7 +1339,7 @@ paths:
         '200':
           description: The rules visible to the tenant.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 type: object
                 properties:
@@ -1366,7 +1367,7 @@ paths:
         '202':
           description: Change requested; the rule is unchanged until published by someone else (AU-17). 200 when already in that state.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/ABACRule'
         '400':
@@ -1396,7 +1397,7 @@ paths:
         '202':
           description: Change requested; the rule is unchanged until published by someone else (AU-17). 200 when already in that state.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/ABACRule'
         '400':
@@ -1422,7 +1423,7 @@ paths:
       requestBody:
         required: true
         content:
-          application/problem+json:
+          application/json:
             schema:
               type: object
               required: [workload_id, allowed_audience, allowed_actions]
@@ -1437,13 +1438,13 @@ paths:
         '200':
           description: Binding saved.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/WorkloadBinding'
         '201':
           description: Binding created.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/WorkloadBinding'
         '400':
@@ -1462,7 +1463,7 @@ paths:
         '200':
           description: The tenant's bindings.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 type: object
                 properties:
@@ -1490,7 +1491,7 @@ paths:
         '200':
           description: Binding deactivated.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/WorkloadBinding'
         '400':
@@ -1518,7 +1519,7 @@ paths:
         '200':
           description: Binding reactivated.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/WorkloadBinding'
         '400':
@@ -1550,20 +1551,20 @@ paths:
       requestBody:
         required: true
         content:
-          application/problem+json:
+          application/json:
             schema:
               $ref: '#/components/schemas/CreatePrivilegedSessionRequest'
       responses:
         '201':
           description: Session ACTIVE (read-only request).
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/PrivilegedSession'
         '202':
           description: PENDING_APPROVAL — grants nothing until an independent approver approves.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/PrivilegedSession'
         '400':
@@ -1582,7 +1583,7 @@ paths:
         '200':
           description: The sessions visible to the caller.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 type: object
                 properties:
@@ -1606,20 +1607,20 @@ paths:
       requestBody:
         required: true
         content:
-          application/problem+json:
+          application/json:
             schema:
               $ref: '#/components/schemas/CreatePrivilegedSessionRequest'
       responses:
         '201':
           description: Session ACTIVE (read-only request).
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/PrivilegedSession'
         '202':
           description: PENDING_APPROVAL.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/PrivilegedSession'
         '400':
@@ -1638,7 +1639,7 @@ paths:
         '200':
           description: The sessions visible to the caller.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 type: object
                 properties:
@@ -1666,7 +1667,7 @@ paths:
         '200':
           description: Session ACTIVE.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/PrivilegedSession'
         '400':
@@ -1696,7 +1697,7 @@ paths:
         '200':
           description: Session ACTIVE.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/PrivilegedSession'
         '400':
@@ -1726,7 +1727,7 @@ paths:
         '200':
           description: Session rejected.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/PrivilegedSession'
         '400':
@@ -1756,7 +1757,7 @@ paths:
         '200':
           description: Session rejected.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/PrivilegedSession'
         '400':
@@ -1786,7 +1787,7 @@ paths:
         '200':
           description: Session revoked.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/PrivilegedSession'
         '400':
@@ -1816,7 +1817,7 @@ paths:
         '200':
           description: Session revoked.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/PrivilegedSession'
         '400':
@@ -1847,14 +1848,14 @@ paths:
       requestBody:
         required: true
         content:
-          application/problem+json:
+          application/json:
             schema:
               $ref: '#/components/schemas/SessionReviewRequest'
       responses:
         '200':
           description: Review recorded.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/PrivilegedSession'
         '400':
@@ -1881,14 +1882,14 @@ paths:
       requestBody:
         required: true
         content:
-          application/problem+json:
+          application/json:
             schema:
               $ref: '#/components/schemas/SessionReviewRequest'
       responses:
         '200':
           description: Review recorded.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/PrivilegedSession'
         '400':
@@ -1919,14 +1920,14 @@ paths:
       requestBody:
         required: true
         content:
-          application/problem+json:
+          application/json:
             schema:
               $ref: '#/components/schemas/CreateBreakGlassSessionRequest'
       responses:
         '202':
           description: Requested — PENDING_APPROVAL until independent approvers approve it (AU-02).
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/BreakGlassSession'
         '400':
@@ -1945,7 +1946,7 @@ paths:
         '200':
           description: The sessions visible to the caller.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 type: object
                 properties:
@@ -1969,14 +1970,14 @@ paths:
       requestBody:
         required: true
         content:
-          application/problem+json:
+          application/json:
             schema:
               $ref: '#/components/schemas/CreateBreakGlassSessionRequest'
       responses:
         '202':
           description: Requested — PENDING_APPROVAL until independent approvers approve it (AU-02).
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/BreakGlassSession'
         '400':
@@ -1995,7 +1996,7 @@ paths:
         '200':
           description: The sessions visible to the caller.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 type: object
                 properties:
@@ -2021,7 +2022,7 @@ paths:
         '200':
           description: The session.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/BreakGlassSession'
         '401':
@@ -2045,7 +2046,7 @@ paths:
         '200':
           description: The session.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/BreakGlassSession'
         '401':
@@ -2071,7 +2072,7 @@ paths:
         '200':
           description: Session revoked.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/BreakGlassSession'
         '400':
@@ -2101,7 +2102,7 @@ paths:
         '200':
           description: Session revoked.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/BreakGlassSession'
         '400':
@@ -2128,14 +2129,14 @@ paths:
       requestBody:
         required: true
         content:
-          application/problem+json:
+          application/json:
             schema:
               $ref: '#/components/schemas/SessionReviewRequest'
       responses:
         '200':
           description: Review recorded.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/BreakGlassSession'
         '400':
@@ -2162,14 +2163,14 @@ paths:
       requestBody:
         required: true
         content:
-          application/problem+json:
+          application/json:
             schema:
               $ref: '#/components/schemas/SessionReviewRequest'
       responses:
         '200':
           description: Review recorded.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/BreakGlassSession'
         '400':
@@ -2201,14 +2202,14 @@ paths:
       requestBody:
         required: true
         content:
-          application/problem+json:
+          application/json:
             schema:
               $ref: '#/components/schemas/CreateSupportSessionRequest'
       responses:
         '201':
           description: Session opened.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/SupportSession'
         '400':
@@ -2227,7 +2228,7 @@ paths:
         '200':
           description: The sessions visible to the caller.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 type: object
                 properties:
@@ -2253,7 +2254,7 @@ paths:
         '200':
           description: The session.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/SupportSession'
         '401':
@@ -2279,7 +2280,7 @@ paths:
         '200':
           description: Session revoked.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/SupportSession'
         '400':
@@ -2307,7 +2308,7 @@ paths:
         '200':
           description: Done.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/SessionActivity'
         '401':
@@ -2331,7 +2332,7 @@ paths:
         '200':
           description: Done.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/SessionActivity'
         '401':
@@ -2357,7 +2358,7 @@ paths:
         '200':
           description: Approval recorded; status ACTIVE once the quorum is met.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/BreakGlassSession'
         '400':
@@ -2387,7 +2388,7 @@ paths:
         '200':
           description: Rejected.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/BreakGlassSession'
         '400':
@@ -2415,7 +2416,7 @@ paths:
         '200':
           description: Done.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/SessionActivity'
         '401':
@@ -2441,7 +2442,7 @@ paths:
         '200':
           description: Approval recorded; status ACTIVE once the quorum is met.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/BreakGlassSession'
         '400':
@@ -2471,7 +2472,7 @@ paths:
         '200':
           description: Rejected.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/BreakGlassSession'
         '400':
@@ -2499,7 +2500,7 @@ paths:
         '200':
           description: Done.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/SessionActivity'
         '401':
@@ -2523,7 +2524,7 @@ paths:
         '200':
           description: Done.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/SessionActivity'
         '401':
@@ -2549,7 +2550,7 @@ paths:
         '200':
           description: Published.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/SoDRule'
         '400':
@@ -2579,7 +2580,7 @@ paths:
         '200':
           description: Rejected.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/SoDRule'
         '400':
@@ -2609,7 +2610,7 @@ paths:
         '200':
           description: Published.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/ABACRule'
         '400':
@@ -2639,7 +2640,7 @@ paths:
         '200':
           description: Rejected.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/ABACRule'
         '400':
@@ -2662,7 +2663,7 @@ paths:
         '200':
           description: Done.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/AuthorityLimitList'
         '401':
@@ -2676,14 +2677,14 @@ paths:
       requestBody:
         required: true
         content:
-          application/problem+json:
+          application/json:
             schema:
               $ref: '#/components/schemas/CreateAuthorityLimitRequest'
       responses:
         '202':
           description: Requested.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/AuthorityLimit'
         '400':
@@ -2706,14 +2707,14 @@ paths:
       requestBody:
         required: true
         content:
-          application/problem+json:
+          application/json:
             schema:
               $ref: '#/components/schemas/CreateAuthorityLimitRequest'
       responses:
         '202':
           description: Change requested.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/AuthorityLimit'
         '400':
@@ -2743,7 +2744,7 @@ paths:
         '202':
           description: Retirement requested.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/AuthorityLimit'
         '400':
@@ -2773,7 +2774,7 @@ paths:
         '200':
           description: Approved.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/AuthorityLimit'
         '400':
@@ -2803,7 +2804,7 @@ paths:
         '200':
           description: Rejected.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/AuthorityLimit'
         '400':
@@ -2833,7 +2834,7 @@ paths:
         '200':
           description: Cache invalidated.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/CommandResult'
         '400':
@@ -2855,7 +2856,7 @@ paths:
         '200':
           description: Cache invalidated.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/CommandResult'
         '400':
@@ -2880,7 +2881,7 @@ paths:
         '200':
           description: The recomputed effective access.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/EffectiveAccess'
         '400':
@@ -2899,7 +2900,7 @@ paths:
       requestBody:
         required: true
         content:
-          application/problem+json:
+          application/json:
             schema:
               type: object
               required: [principal_id]
@@ -2909,7 +2910,7 @@ paths:
         '200':
           description: The recomputed effective access.
           content:
-            application/problem+json:
+            application/json:
               schema:
                 $ref: '#/components/schemas/EffectiveAccess'
         '400':
@@ -2979,7 +2980,7 @@ components:
     CommandBody:
       required: true
       content:
-        application/problem+json:
+        application/json:
           schema:
             type: object
             properties:
@@ -3047,7 +3048,6 @@ components:
         request_id: { type: string }
         correlation_id: { type: string }
         retryable: { type: boolean }
-        retry_after: { type: integer }
         errors:
           type: array
           items:
@@ -3060,7 +3060,7 @@ components:
         decision_id: { type: string }
         error_class:
           type: string
-          enum: [CONTEXT_UNRESOLVED, AUTHORIZATION_DENIED, SOD_CONFLICT, APPROVAL_INVALIDATED, CONCURRENCY_CONFLICT, IDEMPOTENCY_MISMATCH]
+          enum: [CONTEXT_UNRESOLVED, AUTHENTICATION_FAILED, AUTHORIZATION_DENIED, SOD_CONFLICT, APPROVAL_INVALIDATED, CONCURRENCY_CONFLICT, IDEMPOTENCY_MISMATCH, DEPENDENCY_UNAVAILABLE]
 
     Error:
       type: object
@@ -3082,15 +3082,17 @@ components:
       additionalProperties: true
 
     StepUpRequired:
-      type: object
-      properties:
-        error: { type: string, const: step_up_required }
-        reason:
-          type: string
-          enum: [no_verified_identity, delegated_caller, single_factor, step_up_stale, authn_time_unknown, authn_time_in_future, assertion_principal_mismatch]
-        required_assurance: { type: string, const: MFA }
-        max_authn_age_seconds: { type: integer }
-      additionalProperties: true
+      description: A problem with code `step_up_required`, plus the step-up members.
+      allOf:
+        - $ref: '#/components/schemas/Problem'
+        - type: object
+          properties:
+            code: { type: string, const: step_up_required }
+            reason:
+              type: string
+              enum: [no_verified_identity, delegated_caller, single_factor, step_up_stale, authn_time_unknown, authn_time_in_future, assertion_principal_mismatch]
+            required_assurance: { type: string, const: MFA }
+            max_authn_age_seconds: { type: integer }
 
     AuthorizeRequest:
       type: object

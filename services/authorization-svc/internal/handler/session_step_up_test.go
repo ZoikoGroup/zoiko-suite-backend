@@ -93,7 +93,7 @@ func assertStepUpRequired(t *testing.T, what string, w *httptest.ResponseRecorde
 	}
 	var body map[string]any
 	_ = json.Unmarshal(w.Body.Bytes(), &body)
-	if body["error"] != "step_up_required" || body["required_assurance"] != "MFA" {
+	if body["code"] != "step_up_required" || body["required_assurance"] != "MFA" {
 		t.Fatalf("%s: body %s", what, w.Body.String())
 	}
 	if !strings.Contains(w.Header().Get("WWW-Authenticate"), "insufficient_user_authentication") {

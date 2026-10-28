@@ -3465,6 +3465,10 @@ func removeAll(list []string, target string) []string {
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
+	if p, ok := legacyErrorProblem(w, status, withErrorClass(status, v)); ok {
+		apicontract.WriteProblem(w, nil, p)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(withErrorClass(status, v)); err != nil {

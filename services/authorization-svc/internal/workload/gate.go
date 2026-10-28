@@ -17,12 +17,12 @@
 package workload
 
 import (
-	"encoding/json"
 	"net/http"
 	"sort"
 	"strings"
 
 	"go.uber.org/zap"
+	apicontract "zoiko.io/identity-envelope/apicontract"
 )
 
 // Mode says what happens to an evaluation request that arrives without a
@@ -107,7 +107,7 @@ func (g *Gate) Middleware(next http.Handler) http.Handler {
 				g.log.Warn("evaluation call refused: no verified client certificate",
 					zap.String("path", r.URL.Path), zap.String("remote_addr", r.RemoteAddr),
 					zap.String("claimed_workload", r.Header.Get(HeaderWorkloadID)))
-				refuse(w, http.StatusUnauthorized, "client_certificate_required", "CONTEXT_UNRESOLVED",
+				refuse(w, r, http.StatusUnauthorized, "client_certificate_required", "CONTEXT_UNRESOLVED",
 					"evaluation endpoints require a client certificate issued by mtls-management-svc; call the mTLS listener")
 				return
 			}
@@ -118,7 +118,7 @@ func (g *Gate) Middleware(next http.Handler) http.Handler {
 		if len(g.allow) > 0 && !g.allow[id] {
 			g.log.Warn("evaluation call refused: workload is not a registered PEP",
 				zap.String("workload", id), zap.String("path", r.URL.Path))
-			refuse(w, http.StatusForbidden, "workload_not_registered", "AUTHORIZATION_DENIED",
+			refuse(w, r, http.StatusForbidden, "workload_not_registered", "AUTHORIZATION_DENIED",
 				"the calling service is not a registered policy enforcement point")
 			return
 		}
@@ -126,7 +126,7 @@ func (g *Gate) Middleware(next http.Handler) http.Handler {
 		if claimed := strings.TrimSpace(r.Header.Get(HeaderWorkloadID)); claimed != "" && claimed != id {
 			g.log.Warn("evaluation call refused: X-Workload-Id does not match the client certificate",
 				zap.String("workload", id), zap.String("claimed", claimed), zap.String("path", r.URL.Path))
-			refuse(w, http.StatusForbidden, "workload_identity_mismatch", "AUTHORIZATION_DENIED",
+			refuse(w, r, http.StatusForbidden, "workload_identity_mismatch", "AUTHORIZATION_DENIED",
 				"X-Workload-Id does not name the service the client certificate was issued to")
 			return
 		}
@@ -148,12 +148,10 @@ func VerifiedIdentity(r *http.Request) string {
 	return strings.TrimSpace(r.TLS.VerifiedChains[0][0].Subject.CommonName)
 }
 
-func refuse(w http.ResponseWriter, status int, code, class, msg string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]string{
-		"error":       code,
-		"error_class": class,
-		"message":     msg,
-	})
+// refuse answers as RFC 9457 problem+json (ZS-API-001 §12), with the §16
+// class beside the code.
+func refuse(w http.ResponseWriter, r *http.Request, status int, code, class, msg string) {
+	p := apicontract.ProblemFor(status, code, msg)
+	p.Extra = map[string]any{"error_class": class}
+	apicontract.WriteProblem(w, r, p)
 }

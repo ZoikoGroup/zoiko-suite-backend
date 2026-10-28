@@ -257,6 +257,8 @@ func main() {
 	// handler.EnvelopePolicy, not svcenvelope.ServicePolicy: the generated
 	// policy classifies POST /v1/authorize as a material write, which refused
 	// almost every caller of the evaluation endpoint. See handler.MaterialWrite.
+	// Refusals rendered as RFC 9457 problem+json, like every other error here.
+	r.Use(apicontract.EnvelopeRefusals)
 	r.Use(svcenvelope.Middleware(handler.EnvelopePolicy(), svcenvelope.DefaultReporter()))
 	// Idempotency-Key honoured on material writes (migration 000021): a retry
 	// is answered from the first response instead of creating a second grant
