@@ -11,7 +11,7 @@ Statuses: TODO · IN PROGRESS · DONE · BLOCKED. DONE needs a filled evidence b
 | P0-2 | Register JURISDICTION_RULE_VALIDATE | DONE | b82fd224 | access-control 000023 + template + store test. Reviewer 27 Oct: reproduces; up→down→up clean |
 | P0-3 | Fix stale resolve.go comment | DONE | 47986f06 | comment now matches tax.go. Reviewer 27 Oct: confirmed |
 | API-1 | Shared apicontract package | DONE | acce5b86; review fixes a3a89b24, 2a53338b, e84c8fac, 1a6cf81d, 37413879 | Reopened 27 Oct: its pgx v5.10.0 bump broke `go build` in authorization, evidence-requirements, policy and workflow; fixed. Now 33 unit + 7 pgx pass |
-| API-2 | Problem details + request id + cache, all our services | DONE | e1830853, f361be5e, 8c8bb0a4, d33fa469, c338bbfc, 75e53db2, 4ed4ad08, 50f8f5fe, c2548257, af6e674a, a7d75009, 6d016f11, 9163a41f, b0844868, c0d2c2b4, 52899385, 1d5f9fc3, b13635a5, 416bce59, 6a2fae97, 00f41d6c | tenant-entity-registry-svc + access-control-svc + identity-context-svc + governance-decision-log-svc + jurisdiction-rules-svc + obligations-svc + configuration-feature-flag-svc + secret-vault-integration-svc + gateway-auth-svc + search-indexer-svc + notification-svc + delegated-authority-svc + policy-svc + authorization-svc + workflow-svc + evidence-requirements-svc + mtls-management-svc + siem-integration-svc + carta-svc + key-management-svc done; all services complete |
+| API-2 | Problem details + request id + cache, all our services | DONE | e1830853, f361be5e, 8c8bb0a4, d33fa469, c338bbfc, 75e53db2, 4ed4ad08, 50f8f5fe, c2548257, af6e674a, a7d75009, 6d016f11, 9163a41f, b0844868, c0d2c2b4, 52899385, 1d5f9fc3, b13635a5, 416bce59, 6a2fae97, 00f41d6c; 28 Oct review fixes (see "Review 28 Oct 2026") | All 20 services. 12 closed by the 27 Oct review fixes; 8 reopened 28 Oct (D-1..D-12) and fixed the same day |
 | API-3 | ETag / If-Match on aggregate mutations | TODO | | |
 | API-4 | Cursor pagination on lists | TODO | | |
 | API-5 | Async operations | TODO | | |
@@ -135,12 +135,108 @@ two search tests. All three changes were restored.
 - `migrate.py` was not exercised. Python is available as `py` (3.14) on this host, contrary to the P0-1 note,
   but `migrate.py` drives the docker compose stack, and Docker was not running.
 
+## Review 28 Oct 2026 (plan §8, API-2 in the eight services added after the 27 Oct review)
+
+Commits reviewed: b0844868 policy, c0d2c2b4 authorization, 52899385 workflow, 1d5f9fc3 evidence-requirements,
+b13635a5 mtls-management, 416bce59 siem-integration, 6a2fae97 carta, 00f41d6c key-management, 05f5e498 go.sum.
+`git diff 65dda6bd HEAD -- services/` touches only these eight services, so the 27 Oct review of the other
+twelve still stands. Every defect below was fixed the same day; see "Fixed 28 Oct" after the table.
+
+**Reproduced:**
+- R1 scope: only these eight services and `docs/` were touched. No binary is tracked.
+- `go build ./...` and `go vet ./...` are clean in all eight.
+- Suites ran on scratch PostgreSQL 16 (:55432), with a fresh database per service and `REQUIRE_DB_TESTS=1`.
+  Results (pass/fail/skip):
+  - policy: 120/0/0.
+  - authorization: 744/0/35. The 35 skips are the `IT_` tests gated on `AUTHZ_IT_DSN`.
+  - workflow: 294/0/0.
+  - evidence-requirements: 69/0/0. The store suite refuses any database not named `evidence_requirements_test`.
+    The `-tags=integration` store suite did not run, because Application Control blocked every attempt.
+  - mtls-management: 71/0/0. siem-integration: 25/0/0. carta: 23/0/0. key-management: 37/0/0.
+- kin-openapi: authorization, mtls-management, siem-integration, carta and key-management load and validate.
+  Every 4xx/5xx in the four Security & Trust documents is problem+json.
+
+**Reopened:**
+
+| # | Service | Defect | Evidence |
+|---|---|---|---|
+| D-1 | policy | There is no `openapi.yaml`, and git history shows there never was one. The evidence says "complete, incl. openapi gate". The Problem schema, kin-openapi validation and parity test (R6, API-2 done-when) cannot exist without it. Three legacy bodies remain. | `control_test_handler.go:235` and `:411` pass `map[string]string{"error":…}` to `writeJSON`, which always writes `application/json`. `internal/mtlslistener/mtlslistener.go:214` writes raw `{"error":…}`. |
+| D-2 | authorization | Most error paths still return legacy `application/json`. `writeJSON` (`handler.go:3467`) does no problem conversion, and 280 call sites pass a 4xx/5xx status to it. Only the paths moved to `writeError` changed. The idempotency middleware writes legacy JSON too. | Examples: `handler.go:437` (400), `:452` (403), `:478` (503); `internal/idempotency/middleware.go:158`. Eight `StepUpRequired` 401s declare problem+json, but their schema is the legacy `{error, reason}` shape. |
+| D-3 | workflow | `openapi.yaml` no longer loads ("map key \"schemas\" not found"). The commit moved `schemas:` out of `components`. The document validated at 52899385^. A blind content-type replace also relabelled request bodies and 2xx responses as problem+json, the same defect as R-19. `writeJSON` converts only `map[string]any`, so the 190 error calls that pass `map[string]string` stay legacy JSON. | Examples: `handler.go:331`, `audit_engagement.go:84`. `openapi_parity_test.go` scans text lines and never parses the document, so it still passes. |
+| D-4 | evidence-requirements | `openapi.yaml` no longer loads ("bad data in #/components/schemas/EvidenceRequest (expecting ref to response object)"). Eight success responses were re-pointed from `#/components/responses/EvidenceRequest` to `#/components/schemas/EvidenceRequest`. The document validated at 1d5f9fc3^. The `writeJSON` conversion drops every member except `error` and `detail`, the same defect as R-11. | `handler.go:1075`. |
+| D-5 | all eight | Envelope refusals are still legacy `application/json`. Each service mounts its vendored `svcenvelope.Middleware`, but none mounts `apicontract.EnvelopeRefusals`. This is the same defect as R-5. | `internal/envelope/middleware.go:122` in each service; `grep EnvelopeRefusals cmd/server/main.go` finds nothing. |
+| D-6 | mtls-management, siem-integration, carta, key-management | Their Docker images can no longer build. `go.mod` now has `go 1.25.0` and `replace zoiko.io/identity-envelope => ../identity-envelope`. Compose still builds them with `context: ../services/<svc>` (`docker-compose.phase6.yml`, plus `docker-compose.yml:2881` for mtls) and `FROM golang:1.22-alpine`. | A copy of carta-svc built outside the repo fails: "replacement directory ../identity-envelope does not exist". The Dockerfiles need a repo-root build, like the other sixteen services (plan §3). |
+| D-7 | all eight | No service has the done-when handler test: problem+json plus a pinned `code` for 400/401/403/404/409/412/428/503. The four Security & Trust commits added no tests at all. Their commit messages say kin-openapi was added "for openapi validation", but no `go.mod` requires it and no test loads the YAML. | Only existing tests touch problem+json: `workflow completion_test.go:219` and `evidence-requirements completion_test.go:59`, one status each. |
+| D-8 | evidence text | The blocks claim "complete, incl. openapi gate" for all eight. That cannot hold: policy has no document, workflow and evidence-requirements do not parse, and no test validates the other five. The workflow, mtls and key-management blocks say "Application Control blocks test binary execution; CI/CD runs would pass". These suites ran here with the per-package retry from R11. | — |
+| D-9 | authorization | The commit also relabelled 127 request bodies and 2xx responses as `application/problem+json` (the R-19 defect). The first pass missed it because it only checked error responses. The eight `StepUpRequired` 401s used a legacy `{error, reason}` schema. The Problem schema listed `retry_after`, a header. | `TestOpenAPI_ProblemJSONOnlyOnErrors` (new) listed them. |
+| D-10 | key-management, mtls-management | The new `openapi.yaml` documents routes that are not served: `POST` and `DELETE /v1/keys/{id}` (served: `POST /v1/keys/{id}/rotate` and `/disable`), and `POST /v1/mtls/certificates/{id}` (served: `/rotate`). | The new route-parity test listed them. |
+| D-11 | the S&T four | `errJSON` wrote `code: internal_error` for every status (400, 403, 404, 503 alike), so no refusal had a stable code. Before API-2 these bodies had no code at all. | `carta handler.go:251` and the same writer in the other three. |
+| D-12 | policy | `writeError` lost the specific refusal (`policy_not_found`, `missing_field`, ...) whenever it had a detail message. Before API-2 it was in `error`, beside the class in `code`. | `handler.go:135`. |
+| D-13 | authorization | The workload gate (`internal/workload/gate.go`) and the identity gate (`internal/identity/gate.go`) wrote legacy `{error, error_class, message}` JSON. | `refuse()` in both. |
+
+**Fixed 28 Oct** (uncommitted when written; one commit per service follows):
+- **authorization (D-2, D-9, D-13, D-5, D-7):**
+  - `writeJSON` now renders every 4xx/5xx `{"error": …}` body as a problem through `legacyErrorProblem`. `message`, `detail` or `field` becomes `detail`; other members, including `error_class`, stay as extension members. The request and correlation ids come from the response headers the middleware set.
+  - The idempotency `writeErr`, both gate `refuse()` writers and replayed 4xx answers are problems now.
+  - `EnvelopeRefusals` is mounted.
+  - In `openapi.yaml`: 127 non-error labels reverted, `StepUpRequired` is `allOf` Problem, `retry_after` dropped, the error-class enum completed and the description updated.
+  - Tests that read `error` now read `code`.
+  - New: `TestAPI2_ErrorResponsesAreProblemDetails` (400/401/403/404/409/503), `TestOpenAPI_ProblemJSONOnlyOnErrors`, `TestRefusalIsAProblem` (workload) and `TestRefusalsAndReplayedRefusalsAreProblems` (idempotency).
+- **workflow (D-3, D-5, D-7):**
+  - In `openapi.yaml`: `schemas` moved back under `components`, the 20 relabels reverted and `retry_after` dropped. It loads and validates.
+  - `writeJSON` converts `map[string]string` bodies too, and only for status ≥ 400. A body `correlation_id` is kept.
+  - `EnvelopeRefusals` is mounted.
+  - The verify-release 409 decision is exempt, recorded in the new `SPEC_DEVIATIONS.md`.
+  - New: `openapi_validation_test.go` (kin-openapi; problem only on errors) and `api2_problem_test.go` (400/401/403/404/409/503 plus the envelope refusal).
+- **evidence-requirements (D-4, D-5, D-7):**
+  - In `openapi.yaml`: eight response refs restored to `#/components/responses/EvidenceRequest`, 13 relabels reverted and `retry_after` dropped.
+  - `writeJSON` keeps extension members and converts only for status ≥ 400.
+  - `EnvelopeRefusals` is mounted.
+  - New: `openapi_validation_test.go` and `api2_problem_test.go`.
+- **policy (D-1, D-5, D-7, D-12):**
+  - New `openapi.yaml` covers all 28 routes and the probes, and validates.
+  - The two control-test `missing_field` bodies go through `missingField`. The mTLS listener refusal goes through `apicontract.WriteError`.
+  - `writeError` keeps the specific refusal as `reason_code`.
+  - `EnvelopeRefusals` is mounted.
+  - New: `api2_problem_test.go`, covering 400/401/403/404/409/428/503, the envelope refusal, kin-openapi validity, route parity both ways and problem only on errors.
+- **mtls-management, siem-integration, carta, key-management (D-5, D-6, D-7, D-10, D-11):**
+  - `EnvelopeRefusals` is mounted in `NewRouter`.
+  - `errJSON` takes its code from the new `apicontract.CodeForStatus`.
+  - Dockerfiles build from the repo root (`golang:1.25-alpine`, `Dockerfile.dockerignore`). Compose entries in `docker-compose.phase6.yml` and `docker-compose.yml` use `context: ..`.
+  - The openapi routes now match the router.
+  - New: `api2_problem_test.go`, covering 400/401/403/404/503, a strict-mode envelope refusal, kin-openapi validity, route parity and problem only on errors.
+- **identity-envelope:** `apicontract.CodeForStatus`, with `TestCodeForStatusIsStablePerStatus`. All 20 `replace ../identity-envelope` consumers build.
+
+**Re-verified after the fixes.** Scratch PostgreSQL 16 on :55432, a fresh database per service, `REQUIRE_DB_TESTS=1`, and every package run. Results (pass/fail/skip):
+- policy: 131/0/0.
+- authorization: 755/0/35. The 35 skips are the `IT_` tests gated on `AUTHZ_IT_DSN`.
+- workflow: 304/0/0.
+- evidence-requirements: 79/0/0 untagged, and 90/0/0 with `-tags=integration`. Application Control no longer blocked it.
+- mtls-management: 80/0/0. siem-integration: 34/0/0. carta: 32/0/0. key-management: 46/0/0.
+- identity-envelope: 55/0/0.
+
+All eight documents load and validate with kin-openapi. The root-context Docker builder stage was simulated for the S&T four by building a copy with only the service and `identity-envelope` in the repo layout; Docker itself was down.
+
+Mutation checks:
+- Disabling authorization's `writeJSON` conversion fails 8 subtests.
+- Dropping workflow's `map[string]string` case fails three matrix rows.
+- Putting back policy's legacy `missing_field` body fails the 400 row.
+- Restoring carta's blanket `internal_error` fails four rows. Removing its `EnvelopeRefusals` fails the envelope test.
+- evidence-requirements' `writeJSON` conversion is an equivalent mutant: no caller passes it an error map.
+
+All of these were restored.
+
+**Noted, not fixed (not API-2):** siem-integration's `GET /v1/siem/exporters` lists a tenant's exporters with no authorization check, while creating one is authorized at the entity.
+
 ## Decisions taken during implementation
 
 | Date | Task | Decision | Why |
 |---|---|---|---|
 | 2026-10-23 | P0-2 | Created `JURISDICTION_COMPLIANCE_OFFICER` (TENANT, v1) carrying `JURISDICTION_SUPPORT_VIEW` + `JURISDICTION_RULE_VALIDATE` instead of extending an existing template | The plan assumes a template already carries the other `JURISDICTION_*` read actions; none did (queried `role_template_versions` in a fresh DB: 0 rows matching `JURISDICTION%`). Adding the validation POST to `VIEWER_AUDITOR_READ_ONLY` would put a verb into the read-only archetype; a dedicated tenant-scope template is the closest safe fit. |
 | 2026-10-27 | API-2 | Envelope refusals are rewritten by the shared `apicontract.EnvelopeRefusals` rather than by editing each vendored `internal/envelope/middleware.go` | The vendored copy comes from `services/_contract`, and a rollout would overwrite local edits. Changing the generator would touch every teammate's service (R1). |
+| 2026-10-28 | API-2 | policy-svc keeps `code` = the §16 class and adds the specific refusal as `reason_code` | `code` was already the class before API-2 (`{"error": specific, "code": class}`), and callers and tests match on it. Swapping it to the specific code would break them, and dropping the specific code lost information. |
+| 2026-10-28 | API-2 | A writer that names no code uses `apicontract.CodeForStatus(status)` | The S&T four never had codes. A status-derived code is stable and spec-conformant. A blanket `internal_error` on a 403 was not. |
+| 2026-10-28 | API-2 | workflow `verify-release` 409 stays `application/json` | It is the release decision (`can_release: false`), like jurisdiction's validate-action 409. Recorded in workflow-svc `SPEC_DEVIATIONS.md`. |
 | 2026-10-27 | API-2 | Exempt from problem+json: `/healthz`, `/readyz`, `/health` probe bodies; identity-context `/oauth2/*`, `/scim/v2/*`, `/.well-known/*`; jurisdiction `POST /v1/validate-action` 409 | Protocol-mandated formats (RFC 6749/6750, RFC 7644) and a 409 that is a decision result, not an error report. Recorded in each service's `SPEC_DEVIATIONS.md` (R15). |
 
 ## Cross-team follow-ups (changes needed in services we do not own)
