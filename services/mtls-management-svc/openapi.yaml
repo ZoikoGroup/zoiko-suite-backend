@@ -170,6 +170,42 @@ paths:
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
+    delete:
+      summary: Revoke a certificate
+      description: |
+        Adds the certificate's serial to the CRL. Authorized on
+        `MTLS_CERT_REVOKE` at the certificate's own `legal_entity_id`.
+        This is the destructive operation — revocation breaks whatever
+        service-to-service authentication depends on this certificate.
+      operationId: RevokeCert
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Revoked
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RevokeResult' }
+        '401':
+          description: Missing tenant or principal
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '403':
+          description: Not authorized to revoke that certificate
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404':
+          description: Certificate not found
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /v1/mtls/certificates/{id}/rotate:
     post:
       summary: Rotate a certificate
       description: |
@@ -208,41 +244,6 @@ paths:
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
-    delete:
-      summary: Revoke a certificate
-      description: |
-        Adds the certificate's serial to the CRL. Authorized on
-        `MTLS_CERT_REVOKE` at the certificate's own `legal_entity_id`.
-        This is the destructive operation — revocation breaks whatever
-        service-to-service authentication depends on this certificate.
-      operationId: RevokeCert
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema: { type: string, format: uuid }
-      responses:
-        '200':
-          description: Revoked
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/RevokeResult' }
-        '401':
-          description: Missing tenant or principal
-          content:
-            application/problem+json:
-              schema: { $ref: '#/components/schemas/Problem' }
-        '403':
-          description: Not authorized to revoke that certificate
-          content:
-            application/problem+json:
-              schema: { $ref: '#/components/schemas/Problem' }
-        '404':
-          description: Certificate not found
-          content:
-            application/problem+json:
-              schema: { $ref: '#/components/schemas/Problem' }
-
   /v1/mtls/certificates/csr:
     post:
       summary: Sign a CSR

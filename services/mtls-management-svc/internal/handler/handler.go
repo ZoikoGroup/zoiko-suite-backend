@@ -192,6 +192,8 @@ func NewRouter(h *Handler) http.Handler {
 	// request reaches business logic without a resolved tenant, actor,
 	// correlation and — on material writes — an idempotency key.
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
+	// Refusals rendered as RFC 9457 problem+json, like every other error here.
+	r.Use(apicontract.EnvelopeRefusals)
 	r.Use(svcenvelope.Middleware(envelopePolicy(), svcenvelope.DefaultReporter()))
 	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -788,10 +790,13 @@ func (h *Handler) SignCSR(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// errJSON answers a refusal that names no code of its own. The code is the
+// status's class (apicontract.CodeForStatus), never a blanket internal_error,
+// so a caller has a stable value to match on (ZS-API-001 §12).
 func (h *Handler) errJSON(w http.ResponseWriter, r *http.Request, code int, msg string) {
 	apicontract.WriteProblem(w, r, apicontract.Problem{
 		Status:    code,
-		Code:      "internal_error",
+		Code:      apicontract.CodeForStatus(code),
 		Detail:    msg,
 		Retryable: code >= 500,
 	})
