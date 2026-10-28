@@ -29,8 +29,8 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
-	apicontract "zoiko.io/identity-envelope/apicontract"
 	idenv "zoiko.io/identity-envelope"
+	apicontract "zoiko.io/identity-envelope/apicontract"
 
 	"zoiko.io/evidence-requirements-svc/internal/domain"
 	svcenvelope "zoiko.io/evidence-requirements-svc/internal/envelope"
@@ -1073,17 +1073,26 @@ func writeError(w http.ResponseWriter, r *http.Request, status int, code, detail
 // writeJSON writes body as JSON. An error body is rendered as RFC 9457
 // application/problem+json with the §16 error_class via apicontract.
 func writeJSON(w http.ResponseWriter, r *http.Request, status int, body any) {
-	if errResp, ok := body.(map[string]any); ok {
+	if errResp, ok := body.(map[string]any); ok && status >= 400 {
 		if errCode, ok := errResp["error"].(string); ok {
 			message := ""
 			if msg, ok := errResp["detail"].(string); ok {
 				message = msg
+			}
+			// Every other member of the refusal stays on the problem as an
+			// extension member.
+			extra := map[string]any{}
+			for k, v := range errResp {
+				if k != "error" && k != "detail" {
+					extra[k] = v
+				}
 			}
 			apicontract.WriteProblem(w, r, apicontract.Problem{
 				Status:    status,
 				Code:      errCode,
 				Detail:    message,
 				Retryable: status >= 500,
+				Extra:     extra,
 			})
 			return
 		}

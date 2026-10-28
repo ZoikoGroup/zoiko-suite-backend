@@ -5,8 +5,8 @@ go 1.25.0
 require (
 	github.com/exaring/otelpgx v0.11.1
 	github.com/fergusstrange/embedded-postgres v1.34.0
-	github.com/go-chi/chi/v5 v5.1.0
 	github.com/getkin/kin-openapi v0.149.0
+	github.com/go-chi/chi/v5 v5.1.0
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/prometheus/client_golang v1.23.2
@@ -17,6 +17,14 @@ require (
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp v1.44.0
 	go.opentelemetry.io/otel/sdk v1.44.0
 	go.uber.org/zap v1.27.0
+)
+
+require (
+	github.com/go-openapi/jsonpointer v0.22.5 // indirect
+	github.com/go-openapi/swag/jsonname v0.25.5 // indirect
+	github.com/oasdiff/yaml v0.1.1 // indirect
+	github.com/oasdiff/yaml3 v0.0.14 // indirect
+	github.com/santhosh-tekuri/jsonschema/v6 v6.0.3 // indirect
 )
 
 require (

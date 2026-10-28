@@ -40,7 +40,7 @@ paths:
       requestBody:
         required: true
         content:
-          application/problem+json:
+          application/json:
             schema:
               type: object
               required: [legal_entity_id, domain_code, action_type, correlation_id]
@@ -63,7 +63,7 @@ paths:
         '200':
           description: The determination (a replay of the same Idempotency-Key and body returns the original)
           content:
-            application/problem+json:
+            application/json:
               schema: {$ref: '#/components/schemas/EvaluateResponse'}
         '400': {$ref: '#/components/responses/Problem'}
         '401': {$ref: '#/components/responses/Problem'}
@@ -79,7 +79,7 @@ paths:
       tags: [evaluation]
       operationId: getEvaluation
       responses:
-        '200': {description: The recorded determination, content: {application/problem+json: {schema: {$ref: '#/components/schemas/Evaluation'}}}}
+        '200': {description: The recorded determination, content: {application/json: {schema: {$ref: '#/components/schemas/Evaluation'}}}}
         '401': {$ref: '#/components/responses/Problem'}
         '403': {$ref: '#/components/responses/Problem'}
         '404': {$ref: '#/components/responses/Problem'}
@@ -94,7 +94,7 @@ paths:
         - {name: as_of, in: query, description: "RFC 3339 or 'now'; omitted returns the full history", schema: {type: string}}
         - {name: tenant_id, in: query, description: May only repeat the caller's tenant, schema: {type: string}}
       responses:
-        '200': {description: The caller's tenant catalogue, content: {application/problem+json: {schema: {type: array, items: {$ref: '#/components/schemas/Requirement'}}}}}
+        '200': {description: The caller's tenant catalogue, content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/Requirement'}}}}}
         '400': {$ref: '#/components/responses/Problem'}
         '401': {$ref: '#/components/responses/Problem'}
         '403': {$ref: '#/components/responses/Problem'}
@@ -105,7 +105,7 @@ paths:
       tags: [catalogue]
       operationId: getRequirement
       responses:
-        '200': {description: The requirement, content: {application/problem+json: {schema: {$ref: '#/components/schemas/Requirement'}}}}
+        '200': {description: The requirement, content: {application/json: {schema: {$ref: '#/components/schemas/Requirement'}}}}
         '401': {$ref: '#/components/responses/Problem'}
         '403': {$ref: '#/components/responses/Problem'}
         '404': {$ref: '#/components/responses/Problem'}
@@ -117,7 +117,7 @@ paths:
       requestBody:
         required: true
         content:
-          application/problem+json:
+          application/json:
             schema:
               type: object
               required: [tenant_id, domain_code, action_type, evidence_type, correlation_id]
@@ -136,9 +136,9 @@ paths:
           headers:
             Location: {description: The new requirement, schema: {type: string}}
           content:
-            application/problem+json:
+            application/json:
               schema: {$ref: '#/components/schemas/Requirement'}
-        '200': {description: Replay of the same Idempotency-Key and body, content: {application/problem+json: {schema: {$ref: '#/components/schemas/Requirement'}}}}
+        '200': {description: Replay of the same Idempotency-Key and body, content: {application/json: {schema: {$ref: '#/components/schemas/Requirement'}}}}
         '400': {$ref: '#/components/responses/Problem'}
         '401': {$ref: '#/components/responses/Problem'}
         '403': {$ref: '#/components/responses/Problem'}
@@ -155,7 +155,7 @@ paths:
       requestBody:
         required: true
         content:
-          application/problem+json:
+          application/json:
             schema:
               type: object
               required: [reason]
@@ -163,7 +163,7 @@ paths:
                 effective_to: {type: string, format: date-time, description: After effective_from and not before now}
                 reason: {type: string}
       responses:
-        '200': {description: Retired by end-dating (never deleted), content: {application/problem+json: {schema: {$ref: '#/components/schemas/Requirement'}}}}
+        '200': {description: Retired by end-dating (never deleted), content: {application/json: {schema: {$ref: '#/components/schemas/Requirement'}}}}
         '400': {$ref: '#/components/responses/Problem'}
         '403': {$ref: '#/components/responses/Problem'}
         '404': {$ref: '#/components/responses/Problem'}
@@ -175,34 +175,34 @@ paths:
       parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
       requestBody: {$ref: '#/components/requestBodies/PBCCommand'}
       responses:
-        '201': {$ref: '#/components/schemas/EvidenceRequest'}
+        '201': {$ref: '#/components/responses/EvidenceRequest'}
         '400': {$ref: '#/components/responses/Problem'}
         '403': {$ref: '#/components/responses/Problem'}
     get:
       tags: [pbc]
       operationId: listOpenEvidenceRequests
       responses:
-        '200': {description: Open requests, content: {application/problem+json: {schema: {type: array, items: {$ref: '#/components/schemas/EvidenceRequest'}}}}}
+        '200': {description: Open requests, content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/EvidenceRequest'}}}}}
   /v1/pbc/requests/{request_id}:
     parameters: [{$ref: '#/components/parameters/RequestID'}]
     get:
       tags: [pbc]
       operationId: getEvidenceRequest
       responses:
-        '200': {$ref: '#/components/schemas/EvidenceRequest'}
+        '200': {$ref: '#/components/responses/EvidenceRequest'}
         '404': {$ref: '#/components/responses/Problem'}
   /v1/pbc/requests/{request_id}/send:
     parameters: [{$ref: '#/components/parameters/RequestID'}]
-    post: {tags: [pbc], operationId: sendEvidenceRequest, requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'200': {$ref: '#/components/schemas/EvidenceRequest'}, '409': {$ref: '#/components/responses/Problem'}}}
+    post: {tags: [pbc], operationId: sendEvidenceRequest, requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'200': {$ref: '#/components/responses/EvidenceRequest'}, '409': {$ref: '#/components/responses/Problem'}}}
   /v1/pbc/requests/{request_id}/reassign:
     parameters: [{$ref: '#/components/parameters/RequestID'}]
-    post: {tags: [pbc], operationId: reassignEvidenceRequest, requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'200': {$ref: '#/components/schemas/EvidenceRequest'}, '409': {$ref: '#/components/responses/Problem'}}}
+    post: {tags: [pbc], operationId: reassignEvidenceRequest, requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'200': {$ref: '#/components/responses/EvidenceRequest'}, '409': {$ref: '#/components/responses/Problem'}}}
   /v1/pbc/requests/{request_id}/extend-due-date:
     parameters: [{$ref: '#/components/parameters/RequestID'}]
-    post: {tags: [pbc], operationId: extendEvidenceRequestDueDate, requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'200': {$ref: '#/components/schemas/EvidenceRequest'}, '409': {$ref: '#/components/responses/Problem'}}}
+    post: {tags: [pbc], operationId: extendEvidenceRequestDueDate, requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'200': {$ref: '#/components/responses/EvidenceRequest'}, '409': {$ref: '#/components/responses/Problem'}}}
   /v1/pbc/requests/{request_id}/view:
     parameters: [{$ref: '#/components/parameters/RequestID'}]
-    post: {tags: [pbc], operationId: viewEvidenceRequest, responses: {'200': {$ref: '#/components/schemas/EvidenceRequest'}}}
+    post: {tags: [pbc], operationId: viewEvidenceRequest, responses: {'200': {$ref: '#/components/responses/EvidenceRequest'}}}
   /v1/pbc/requests/{request_id}/responses:
     parameters: [{$ref: '#/components/parameters/RequestID'}]
     post: {tags: [pbc], operationId: submitEvidenceResponse, requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'201': {description: Response recorded}, '409': {$ref: '#/components/responses/Problem'}}}
@@ -211,13 +211,13 @@ paths:
     post: {tags: [pbc], operationId: addEvidenceRequestNote, requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'201': {description: Note added}}}
   /v1/pbc/requests/{request_id}/clarify:
     parameters: [{$ref: '#/components/parameters/RequestID'}]
-    post: {tags: [pbc], operationId: requestEvidenceClarification, requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'200': {$ref: '#/components/schemas/EvidenceRequest'}, '409': {$ref: '#/components/responses/Problem'}}}
+    post: {tags: [pbc], operationId: requestEvidenceClarification, requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'200': {$ref: '#/components/responses/EvidenceRequest'}, '409': {$ref: '#/components/responses/Problem'}}}
   /v1/pbc/requests/{request_id}/mark-satisfied:
     parameters: [{$ref: '#/components/parameters/RequestID'}]
-    post: {tags: [pbc], operationId: markEvidenceRequestSatisfied, requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'200': {$ref: '#/components/schemas/EvidenceRequest'}, '403': {$ref: '#/components/responses/Problem'}, '409': {$ref: '#/components/responses/Problem'}}}
+    post: {tags: [pbc], operationId: markEvidenceRequestSatisfied, requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'200': {$ref: '#/components/responses/EvidenceRequest'}, '403': {$ref: '#/components/responses/Problem'}, '409': {$ref: '#/components/responses/Problem'}}}
   /v1/pbc/requests/{request_id}/close:
     parameters: [{$ref: '#/components/parameters/RequestID'}]
-    post: {tags: [pbc], operationId: closeEvidenceRequest, requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'200': {$ref: '#/components/schemas/EvidenceRequest'}, '409': {$ref: '#/components/responses/Problem'}}}
+    post: {tags: [pbc], operationId: closeEvidenceRequest, requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'200': {$ref: '#/components/responses/EvidenceRequest'}, '409': {$ref: '#/components/responses/Problem'}}}
   /v1/pbc/responses/{response_id}/scan-result:
     parameters: [{$ref: '#/components/parameters/ResponseID'}]
     post: {tags: [pbc], operationId: recordScanResult, requestBody: {$ref: '#/components/requestBodies/PBCCommand'}, responses: {'200': {description: Scan result recorded}, '404': {$ref: '#/components/responses/Problem'}}}
@@ -239,7 +239,7 @@ components:
     PBCCommand:
       required: true
       content:
-        application/problem+json:
+        application/json:
           schema: {type: object, additionalProperties: true}
   responses:
     Problem:
@@ -250,7 +250,7 @@ components:
     EvidenceRequest:
       description: The evidence request
       content:
-        application/problem+json:
+        application/json:
           schema: {$ref: '#/components/schemas/EvidenceRequest'}
   schemas:
     Problem:
@@ -266,7 +266,6 @@ components:
         request_id: { type: string }
         correlation_id: { type: string }
         retryable: { type: boolean }
-        retry_after: { type: integer }
         errors:
           type: array
           items:
