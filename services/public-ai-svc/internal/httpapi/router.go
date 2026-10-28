@@ -77,6 +77,7 @@ func (s *Server) Router() http.Handler {
 	r.Get("/health/ready", func(w http.ResponseWriter, _ *http.Request) { writeStatus(w, s.deps.Ready()) })
 
 	r.Route("/public-ai/v1", func(api chi.Router) {
+		api.Use(middleware.Host(s.cfg.AllowedHosts))
 		api.Use(middleware.Origin(s.cfg.AllowedOrigins))
 		if s.deps.Limiter != nil {
 			api.Use(s.deps.Limiter)

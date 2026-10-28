@@ -25,6 +25,9 @@ func BuildKB(dir, releaseID string, now time.Time, privKey string) ([]byte, []by
 	if len(m.Sources) == 0 {
 		return nil, nil, reports, errors.New("no source passed ingestion; refusing to build an empty release")
 	}
+	if err := m.Validate(); err != nil {
+		return nil, nil, reports, err
+	}
 	body, err := json.Marshal(m)
 	if err != nil {
 		return nil, nil, nil, err

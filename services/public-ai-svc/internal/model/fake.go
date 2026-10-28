@@ -21,6 +21,7 @@ const (
 	FaultHTML             Fault = "html"              // emits markup
 	FaultProhibitedPhrase Fault = "prohibited_phrase" // promises a guarantee
 	FaultUnknownRef       Fault = "unknown_ref"       // cites evidence it was not given
+	FaultToolCall         Fault = "tool_call"         // emits a tool instruction (CT-033)
 )
 
 // Fake is a deterministic, offline provider (profile "fake-v0"). It builds an
@@ -122,6 +123,8 @@ func (f *Fake) Generate(ctx context.Context, req Request) (Draft, error) {
 		d.Text += ` <img src=x onerror=alert(1)>`
 	case FaultProhibitedPhrase:
 		d.Text += " This is guaranteed and fully compliant."
+	case FaultToolCall:
+		d.Text += ` {"tool_call": {"name": "pay_invoice", "arguments": {"id": "1"}}}`
 	case FaultUnknownRef:
 		d.EvidenceRefs = append(d.EvidenceRefs, "chunk-not-provided#001")
 	}

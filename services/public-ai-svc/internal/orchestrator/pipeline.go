@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"regexp"
 	"strings"
 	"time"
@@ -48,9 +49,10 @@ type Pipeline struct {
 
 // Security signal reason classes (no prompt content).
 const (
-	SignalInjection = "PROMPT_INJECTION"
-	SignalSensitive = "SENSITIVE_INPUT"
-	SignalSecurity  = "SECURITY_REPORT"
+	SignalInjection       = "PROMPT_INJECTION"
+	SignalSensitive       = "SENSITIVE_INPUT"
+	SignalSecurity        = "SECURITY_REPORT"
+	SignalToolInstruction = "TOOL_INSTRUCTION"
 )
 
 func (p *Pipeline) now() time.Time {
@@ -158,7 +160,11 @@ func (p *Pipeline) Answer(ctx context.Context, in Input) Result {
 		case claims.RevokedDecision, claims.ExpiredDecision:
 			return p.fromTemplate(withRoute(policy.TplAbstainStale, policy.DefaultRoute[intent]), intent, snap, market, now, releaseID)
 		case claims.InsufficientEvidence:
-			return p.fromTemplate(withRoute(policy.TplAbstainNoEvidence, policy.DefaultRoute[intent]), intent, snap, market, now, releaseID)
+			route := policy.DefaultRoute[intent]
+			if (req.Subject == claims.Price || req.Subject == claims.Trial) && market != "" {
+				route = "demo" // KB-025, A09: unsupported market or disabled trial → verified sales route
+			}
+			return p.fromTemplate(withRoute(policy.TplAbstainNoEvidence, route), intent, snap, market, now, releaseID)
 		case claims.Verified:
 			verified = d.Verified
 		}
@@ -175,6 +181,10 @@ func (p *Pipeline) Answer(ctx context.Context, in Input) Result {
 		switch r.Answerability {
 		case knowledge.Answerable:
 			hits = r.Hits
+			if regionalIntents[intent] && market != "" && !hasMarketEvidence(hits, market) {
+				// G12/G13: a named country needs country-specific evidence; never assume coverage.
+				return p.fromTemplate(policy.TplAbstainCoverage, intent, snap, market, now, releaseID)
+			}
 		case knowledge.Stale, knowledge.Revoked:
 			return p.fromTemplate(withRoute(policy.TplAbstainStale, policy.DefaultRoute[intent]), intent, snap, market, now, releaseID)
 		default:
@@ -207,6 +217,12 @@ func (p *Pipeline) Answer(ctx context.Context, in Input) Result {
 		return p.fromTemplate(withRoute(policy.TplUnavailable, policy.DefaultRoute[intent]), intent, snap, market, now, releaseID)
 	default:
 		text, draft, err = p.generate(ctx, intent, dec.Redaction.Text, cards, evidence)
+		if errors.Is(err, validate.ErrToolInstruction) {
+			// CT-033: no tool exists to invoke; the draft is discarded and a safety signal recorded.
+			res := p.fromTemplate(withRoute(policy.TplAbstainNoEvidence, policy.DefaultRoute[intent]), intent, snap, market, now, releaseID)
+			res.SecuritySignal = SignalToolInstruction
+			return res
+		}
 		if err != nil {
 			if ctx.Err() != nil || isProviderError(err) {
 				return p.fromTemplate(withRoute(policy.TplUnavailable, policy.DefaultRoute[intent]), intent, snap, market, now, releaseID)
@@ -218,6 +234,10 @@ func (p *Pipeline) Answer(ctx context.Context, in Input) Result {
 	citations, sourceIDs := p.citations(snap, verified, hits, draft)
 	if len(citations) == 0 {
 		return p.fromTemplate(withRoute(policy.TplAbstainNoEvidence, policy.DefaultRoute[intent]), intent, snap, market, now, releaseID)
+	}
+	// CT-048: a kill switch thrown while this turn ran withholds the answer.
+	if fv2 := p.Flags.Values(); !fv2.PublicAIEnabled || (!staticOnly && !fv2.ModelGenerationEnabled) {
+		return p.fromTemplate(policy.TplUnavailable, intent, snap, market, now, releaseID)
 	}
 	// Revocation check at commit (Doc 08 §06): fail closed on any doubt.
 	if revoked, err := p.Releases.RevokedSince(ctx, snap.Watermark, sourceIDs, refs(cards)); revoked || err != nil {
@@ -372,9 +392,25 @@ func joinStatements(cards []model.ClaimCard) string {
 	return strings.Join(parts, " ")
 }
 
+// regionalIntents depend on country coverage (tax, payroll, legal).
+var regionalIntents = map[string]bool{"I17": true, "I18": true, "I19": true}
+
+func hasMarketEvidence(hits []knowledge.Hit, market string) bool {
+	for _, h := range hits {
+		for _, m := range h.Chunk.MarketCodes {
+			if m == market {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 var (
-	soc2Re = regexp.MustCompile(`(?i)\bsoc\s*-?\s*2\b`)
-	isoRe  = regexp.MustCompile(`(?i)\biso\s*/?\s*(?:iec\s*)?27001\b`)
+	frameworkRe = regexp.MustCompile(`(?i)\b(fedramp|pci[ -]?dss|hipaa|hitrust|cyber essentials(?: plus)?|irap|c5|iso[ /-]?(?:iec )?(?:9001|27017|27018|27701|42001)|soc ?[13])\b`)
+	nonAlnum    = regexp.MustCompile(`[^A-Za-z0-9]`)
+	soc2Re      = regexp.MustCompile(`(?i)\bsoc\s*-?\s*2\b`)
+	isoRe       = regexp.MustCompile(`(?i)\biso\s*/?\s*(?:iec\s*)?27001\b`)
 )
 
 // claimRequest maps an intent to the P1 subject it must be answered from.
@@ -401,6 +437,9 @@ func claimRequest(intent string, dec policy.Decision, msg string, reg *claims.Re
 			q.Subject, q.SubjectID = claims.Certification, "SOC2"
 		case isoRe.MatchString(msg):
 			q.Subject, q.SubjectID = claims.Certification, "ISO27001"
+		case frameworkRe.MatchString(msg):
+			// A11: a named framework we hold no claim for must not borrow another one.
+			q.Subject, q.SubjectID = claims.Certification, strings.ToUpper(nonAlnum.ReplaceAllString(frameworkRe.FindString(msg), ""))
 		case strings.Contains(strings.ToLower(msg), "certif"):
 			q.Subject = claims.Certification
 		default:

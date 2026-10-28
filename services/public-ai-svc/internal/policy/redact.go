@@ -20,6 +20,7 @@ const (
 	KindPassword = "password"
 	KindOTP      = "one_time_code"
 	KindBank     = "bank_account"
+	KindPrivate  = "private_identifier" // invoice, customer, employee, payroll, tenant ids (G32, CT-036)
 )
 
 type detector struct {
@@ -43,6 +44,7 @@ var detectors = []detector{
 	{KindNationID, regexp.MustCompile(`\b\d{3}-\d{2}-\d{4}\b`), nil},                                               // US SSN
 	{KindNationID, regexp.MustCompile(`(?i)\b[A-CEGHJ-PR-TW-Z]{2} ?\d{2} ?\d{2} ?\d{2} ?[A-D]\b`), nil},            // UK NINO
 	{KindNationID, regexp.MustCompile(`(?i)\b(?:ein|fein|tin|utr|ssn|nino|pan)\b\D{0,10}\d[\d -]{6,12}\d\b`), nil}, // labelled tax IDs
+	{KindPrivate, regexp.MustCompile(`(?i)\b(?:invoice|inv|customer|client|account|employee|emp|payroll|tenant|order|ticket)\s*(?:id|no\.?|number|#|ref(?:erence)?)\s*(?:is\s*)?[:#]?\s*[A-Z0-9][A-Z0-9-]{3,}`), hasDigit},
 	{KindBank, regexp.MustCompile(`(?i)\b(?:account|acct|routing|sort code|aba)\b\s*(?:number|no\.?|#)?\s*[:#]?\s*\d[\d -]{5,20}\d\b`), nil},
 }
 
@@ -76,6 +78,8 @@ func Redact(msg string) Redaction {
 	sort.Strings(r.Kinds)
 	return r
 }
+
+func hasDigit(s string) bool { return strings.ContainsAny(s, "0123456789") }
 
 func digitsOnly(s string) string {
 	var b strings.Builder

@@ -107,7 +107,12 @@ func main() {
 
 	pipeline := &orchestrator.Pipeline{
 		Releases: rt, Flags: fl, Store: st, Log: log, MaxOutputTokens: cfg.TokenBudgetPerTurn / 4,
-		Model: model.Gateway{Provider: providerFor(log, cfg), Timeout: cfg.ModelTimeout},
+		Model: model.Gateway{Provider: providerFor(log, cfg), Timeout: cfg.ModelTimeout, Breaker: &model.Breaker{
+			Threshold: 5, Cooldown: 30 * time.Second,
+			OnOpen: func() {
+				log.Error("ALERT model circuit open: provider failing; serving UNAVAILABLE with official routes")
+			},
+		}},
 	}
 	guard := limits.New(cfg, st, fl)
 	api := httpapi.New(cfg, log, httpapi.Deps{

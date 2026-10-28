@@ -21,6 +21,7 @@ var (
 	ErrProhibitedPhrase = errors.New("prohibited commitment phrase")
 	ErrUnsupportedFact  = errors.New("number not present in verified claims or evidence")
 	ErrInstructionLeak  = errors.New("output discusses instructions")
+	ErrToolInstruction  = errors.New("output contains a tool or function instruction")
 )
 
 var (
@@ -29,6 +30,7 @@ var (
 	phoneRe  = regexp.MustCompile(`\+?\d[\d\s().-]{7,}\d`)
 	markupRe = regexp.MustCompile(`(?i)<\s*/?\s*[a-z][^>]*>|javascript:|on[a-z]+\s*=|\]\(|!\[`)
 	numberRe = regexp.MustCompile(`\d+(?:[.,]\d+)*%?`)
+	toolRe   = regexp.MustCompile(`(?i)tool_call|function_call|"tool"\s*:|<\s*tool|call_tool|execute_action|"arguments"\s*:`)
 	leakRe   = regexp.MustCompile(`(?i)system prompt|my instructions|approved_public_evidence|verified_claim|L1-PROMPT`)
 	spaceRe  = regexp.MustCompile(`\s{2,}`)
 )
@@ -68,6 +70,9 @@ func Check(d model.Draft, claims []model.ClaimCard, evidence []model.Evidence) (
 	}
 
 	text := d.Text
+	if toolRe.MatchString(text) {
+		return "", ErrToolInstruction
+	}
 	if markupRe.MatchString(text) {
 		return "", ErrMarkup
 	}

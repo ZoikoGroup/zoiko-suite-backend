@@ -9,6 +9,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -50,6 +51,10 @@ func writeValidationError(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
 	case errors.Is(err, contract.ErrUnsupportedSchema):
 		problem.Write(w, r, problem.UnsupportedSchema, "")
+	case errors.As(err, &fe) && fe.Field == "message" && strings.HasPrefix(fe.Reason, "too long"):
+		problem.Write(w, r, problem.PayloadTooLarge, fe.Error()) // CT-007: 413, never truncated
+	case errors.As(err, &fe) && fe.Field == "market_code":
+		problem.Write(w, r, problem.InvalidRequest, fe.Error()) // CT-008: malformed market is 400; never inferred
 	case errors.As(err, &fe):
 		problem.Write(w, r, problem.ValidationFailed, fe.Error())
 	default:

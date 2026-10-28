@@ -4,7 +4,10 @@
 // retrieval with mandatory filters (§14, Doc 05 §18).
 package knowledge
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 const (
 	ProductID      = "zoikosuite"
@@ -88,6 +91,32 @@ type Route struct {
 	// RequiresClaim gates the route on a VERIFIED claim (signup_or_trial
 	// requires trial eligibility, Doc 05 §15).
 	RequiresClaim string `json:"requires_claim,omitempty"`
+}
+
+// Validate checks a manifest's internal consistency before it is signed or
+// served (KB-008, A14): every chunk must belong to a listed, approved,
+// PUBLIC_APPROVED source and carry the same labels; no orphan chunks.
+func (m Manifest) Validate() error {
+	if m.Kind != KindKB || m.ReleaseID == "" {
+		return fmt.Errorf("manifest kind/release id invalid")
+	}
+	sources := map[string]Source{}
+	for _, s := range m.Sources {
+		if s.ApprovalState != "APPROVED" || s.Classification != Classification || s.Audience != Audience || s.ProductID != ProductID {
+			return fmt.Errorf("source %s is not an approved public source", s.SourceVersionID)
+		}
+		sources[s.SourceVersionID] = s
+	}
+	for _, c := range m.Chunks {
+		s, ok := sources[c.SourceVersionID]
+		if !ok {
+			return fmt.Errorf("chunk %s has no source in this release", c.ChunkID)
+		}
+		if c.Classification != s.Classification || c.Audience != s.Audience || c.ReleaseID != m.ReleaseID {
+			return fmt.Errorf("chunk %s lost its parent labels", c.ChunkID)
+		}
+	}
+	return nil
 }
 
 // HeadingPrefix marks the start of a section inside chunk text. Retrieval and

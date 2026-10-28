@@ -97,40 +97,5 @@
       "effective_until": "2099-12-31T00:00:00Z",
       "approval_ref": "TEST-ROUTE-APPROVAL"
     }
-  ],
-  "synonyms": {
-    "ar": [
-      "accounts receivable"
-    ],
-    "ap": [
-      "accounts payable"
-    ],
-    "gl": [
-      "general ledger"
-    ],
-    "payables": [
-      "accounts payable"
-    ],
-    "receivables": [
-      "accounts receivable"
-    ],
-    "ledger": [
-      "general ledger"
-    ],
-    "hr": [
-      "human resources"
-    ],
-    "sso": [
-      "single sign-on"
-    ],
-    "mfa": [
-      "multi-factor authentication"
-    ],
-    "gst": [
-      "indirect taxes"
-    ],
-    "erp": [
-      "business operations platform"
-    ]
-  }
+  ]
 }

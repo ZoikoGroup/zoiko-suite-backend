@@ -63,6 +63,8 @@ var ErrTransient = errors.New("transient provider error")
 type Gateway struct {
 	Provider Provider
 	Timeout  time.Duration
+	// Breaker, when set, stops calling a failing provider (A29).
+	Breaker *Breaker
 }
 
 // Generate calls the provider with a deadline and at most one retry.
@@ -70,18 +72,27 @@ func (g Gateway) Generate(ctx context.Context, req Request) (Draft, error) {
 	if req.MaxOutputTokens <= 0 || req.MaxOutputTokens > 2000 {
 		req.MaxOutputTokens = 400
 	}
+	if g.Breaker != nil && !g.Breaker.allow() {
+		return Draft{}, ErrCircuitOpen
+	}
 	var last error
 	for attempt := 0; attempt < 2; attempt++ {
 		cctx, cancel := context.WithTimeout(ctx, g.Timeout)
 		d, err := g.Provider.Generate(cctx, req)
 		cancel()
 		if err == nil {
+			if g.Breaker != nil {
+				g.Breaker.success()
+			}
 			return d, nil
 		}
 		last = err
 		if !errors.Is(err, ErrTransient) || ctx.Err() != nil {
 			break
 		}
+	}
+	if g.Breaker != nil {
+		g.Breaker.failure()
 	}
 	return Draft{}, last
 }

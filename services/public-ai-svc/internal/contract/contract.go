@@ -190,8 +190,10 @@ func (r *TurnRequest) Validate() error {
 	}
 	r.ClientTurnID = strings.ToLower(r.ClientTurnID)
 	r.Message = NormalizeMessage(r.Message)
-	if n := utf8.RuneCountInString(r.Message); n < 1 || n > MaxMessageRunes {
-		return &FieldError{"message", fmt.Sprintf("must be 1-%d characters", MaxMessageRunes)}
+	if n := utf8.RuneCountInString(r.Message); n < 1 {
+		return &FieldError{"message", "must not be empty"}
+	} else if n > MaxMessageRunes {
+		return &FieldError{"message", fmt.Sprintf("too long: at most %d characters", MaxMessageRunes)}
 	}
 	if r.RequestedResponseMode != "" && r.RequestedResponseMode != "json" {
 		return &FieldError{"requested_response_mode", "only json is supported"}

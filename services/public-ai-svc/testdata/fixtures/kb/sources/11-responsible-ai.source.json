@@ -37,5 +37,5 @@
     "url_key": "responsible-ai",
     "title": "Responsible AI"
   },
-  "body": "TEST-ONLY synthetic fixture. Not ZoikoSuite fact.\n\n# How ZoikoSuite uses AI\nAI features suggest classifications, highlight anomalies and draft summaries, and a person always reviews and approves before anything is posted or sent.\n# This assistant\nThis website assistant answers only from approved public ZoikoSuite information, cannot see customer accounts, and does not take actions."
+  "body": "TEST-ONLY synthetic fixture. Not ZoikoSuite fact.\n\n# How ZoikoSuite uses AI\nAI features suggest classifications, highlight anomalies and draft summaries. AI does not run approvals automatically: a person always reviews and approves before anything is posted or sent.\n# This assistant\nThis website assistant answers only from approved public ZoikoSuite information, cannot see customer accounts, and does not take actions."
 }

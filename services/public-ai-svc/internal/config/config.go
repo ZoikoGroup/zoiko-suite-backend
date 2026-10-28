@@ -20,9 +20,11 @@ type Config struct {
 	KafkaBrokers []string
 
 	AllowedOrigins []string
-	ModelProfile   string
-	PolicyVersion  string
-	Region         string
+	// AllowedHosts, when set, restricts the Host header (Doc 04 §08, A02).
+	AllowedHosts  []string
+	ModelProfile  string
+	PolicyVersion string
+	Region        string
 
 	TokenBudgetPerTurn       int
 	MaxActiveTurnsPerSession int
@@ -58,6 +60,7 @@ func Load() (Config, error) {
 		DatabaseURL:               os.Getenv("PUBLIC_AI_DATABASE_URL"),
 		KafkaBrokers:              splitList(os.Getenv("PUBLIC_AI_KAFKA_BROKERS")),
 		AllowedOrigins:            splitList(env("PUBLIC_AI_ALLOWED_ORIGINS", "http://localhost:3000")),
+		AllowedHosts:              splitList(os.Getenv("PUBLIC_AI_ALLOWED_HOSTS")),
 		ModelProfile:              env("PUBLIC_AI_MODEL_PROFILE", "fake-v0"),
 		PolicyVersion:             env("PUBLIC_AI_POLICY_VERSION", "pub-policy-1.0"),
 		Region:                    os.Getenv("PUBLIC_AI_REGION"),

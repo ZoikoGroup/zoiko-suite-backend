@@ -28,6 +28,9 @@ type Snapshot struct {
 	Routes    []knowledge.Route
 	Watermark int64
 	rev       *revocationSet
+
+	kbManifest    *knowledge.Manifest
+	claimsChanged bool
 }
 
 // SourceRevoked implements knowledge.Revocations.
@@ -121,7 +124,11 @@ func (r *Runtime) refresh(ctx context.Context) error {
 			r.invalidate()
 			return err
 		}
-		next.KB, next.Routes = knowledge.NewIndex(m), m.Routes
+		if err := m.Validate(); err != nil {
+			r.invalidate()
+			return fmt.Errorf("release %s: %w", newKB, err)
+		}
+		next.KB, next.Routes, next.kbManifest = knowledge.NewIndex(m), m.Routes, &m
 	}
 	newClaims, err := r.store.GetPointer(ctx, claims.KindClaims)
 	if err != nil {
@@ -134,6 +141,11 @@ func (r *Runtime) refresh(ctx context.Context) error {
 			return err
 		}
 		next.Claims = claims.NewResolver(m)
+		next.claimsChanged = true
+	}
+	if next.claimsChanged || newKB != kbID {
+		next.Claims = next.Claims.WithDisputes(PriceDisputes(next.kbManifest, next.Claims.Manifest()))
+		next.claimsChanged = false
 	}
 	revs, err := r.store.Revocations(ctx, cur.Watermark)
 	if err != nil {

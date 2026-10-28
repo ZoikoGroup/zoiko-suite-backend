@@ -113,11 +113,26 @@ var needsMarket = map[string]bool{Price: true, Trial: true, MarketAvailability: 
 // Resolver resolves requests against one verified manifest.
 type Resolver struct {
 	m Manifest
+	// disputed are plan codes whose public page states a different price
+	// than the signed claim (KB-003, A08): never quoted until resolved.
+	disputed map[string]bool
 }
 
 func NewResolver(m Manifest) *Resolver { return &Resolver{m: m} }
 
 func (r *Resolver) ReleaseID() string { return r.m.ReleaseID }
+
+// Manifest returns the verified manifest.
+func (r *Resolver) Manifest() Manifest { return r.m }
+
+// WithDisputes returns a resolver that treats prices for these plan codes
+// as contradicted.
+func (r *Resolver) WithDisputes(plans map[string]bool) *Resolver {
+	return &Resolver{m: r.m, disputed: plans}
+}
+
+// Disputed reports whether a plan's price is disputed by a public page.
+func (r *Resolver) Disputed(plan string) bool { return r.disputed[plan] }
 
 // PlanCode maps a visitor's plan word to a registry plan code.
 func (r *Resolver) PlanCode(word string) string {
@@ -176,7 +191,7 @@ func (r *Resolver) Resolve(q Request, rev RevocationSet) Decision {
 			// HOLD/TARGET/RETIRED/CONDITIONAL or unpublished: never stated as fact.
 		case q.AsOf.Before(c.ValidFrom) || !q.AsOf.Before(c.ValidUntil):
 			sawExpired = true
-		case len(c.ConflictIDs) > 0:
+		case len(c.ConflictIDs) > 0 || (c.ClaimType == Price && r.disputed[c.SubjectID]):
 			sawConflict = true
 			d.ConflictKeys = append(d.ConflictKeys, c.ClaimID)
 		case strings.TrimSpace(c.PublicStatement) == "" || len(c.EvidenceSourceVersionIDs) == 0 || c.CitationURLKey == "":
@@ -217,6 +232,16 @@ func (r *Resolver) Resolve(q Request, rev RevocationSet) Decision {
 	return d
 }
 
+func distinct(xs []string) int {
+	seen := map[string]bool{}
+	for _, x := range xs {
+		if x != "" {
+			seen[x] = true
+		}
+	}
+	return len(seen)
+}
+
 // Validate checks a manifest before it is signed.
 func (m Manifest) Validate() []string {
 	var problems []string
@@ -227,7 +252,7 @@ func (m Manifest) Validate() []string {
 			problems = append(problems, "claim missing id/type/status: "+c.ClaimID)
 		case seen[c.ClaimID]:
 			problems = append(problems, "duplicate claim_id: "+c.ClaimID)
-		case c.Status == StatusActive && (len(c.ApprovalRefs) < 2):
+		case c.Status == StatusActive && distinct(c.ApprovalRefs) < 2:
 			problems = append(problems, "ACTIVE claim needs two approvals (Doc 03 §10): "+c.ClaimID)
 		case c.Status == StatusActive && !c.ValidUntil.After(c.ValidFrom):
 			problems = append(problems, "invalid validity window: "+c.ClaimID)

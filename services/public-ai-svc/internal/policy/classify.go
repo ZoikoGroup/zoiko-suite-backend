@@ -61,7 +61,10 @@ var exceptionRules = map[string][]*regexp.Regexp{
 	X04RegulatedAdvice: {
 		pattern("tax advice", "legal advice", "accounting advice", "financial advice", "investment advice", "employment law advice",
 			"should i deduct", "can i deduct", "should i claim", "can i claim", "should i file", "how much tax should", "how much tax do i",
-			"how do i avoid tax", "reduce my tax", "is it legal", "am i compliant", "are we compliant", "should i invest", "can i fire"),
+			"how do i avoid tax", "reduce my tax", "is it legal", "am i compliant", "are we compliant", "should i invest", "can i fire",
+			"tax liability", "how much tax do i owe", "admissible", "legally admissible", "legal guarantee",
+			// Spanish (G33): regulated-advice requests are refused whatever the language.
+			"asesor*", "despedir", "despido", "consejo legal", "consejo fiscal", "impuestos debo"),
 	},
 	X08ClaimVerification: {
 		pattern("guarantee", "guaranteed", "promise me", "confirm in writing", "legally binding", "put it in writing", "are you sure it is free"),
@@ -82,7 +85,7 @@ var intentRules = map[string]*regexp.Regexp{
 	"I06": pattern("trial", "free trial", "try it", "try for free", "test drive", "sandbox account"),
 	"I07": pattern("upgrade*", "downgrade*", "switch plan", "change plan", "change my plan", "move to the growth", "add users", "remove users"),
 	"I08": pattern("demo", "book a demo", "schedule a demo", "see it in action", "walkthrough", "product tour"),
-	"I09": pattern("enterprise", "large organization", "large organisation", "sso", "scim", "solutions architect", "custom contract", "volume discount", "procurement team"),
+	"I09": pattern("enterprise quote", "custom quote", "enterprise pricing", "enterprise", "large organization", "large organisation", "sso", "scim", "solutions architect", "custom contract", "volume discount", "procurement team"),
 	"I10": pattern("integrat*", "connector*", "connect to", "connect with", "api", "apis", "webhook*", "quickbooks", "salesforce", "sync with", "bank feeds"),
 	"I11": pattern("migrat*", "switch from", "move from", "moving from", "import our data", "import data", "data import", "onboarding data"),
 	"I12": pattern("soc 2", "soc2", "iso 27001", "iso27001", "certif*", "secur*", "encrypt*", "penetration test", "pentest", "trust center", "compliance report", "mfa", "single sign-on"),
@@ -102,7 +105,7 @@ var intentRules = map[string]*regexp.Regexp{
 	"I26": pattern("compare", "comparison", "vs", "versus", "better than", "alternative to", "competitor*", "netsuite", "sage intacct"),
 	"I27": pattern("accessibility", "screen reader", "wcag", "accessible", "keyboard navigation"),
 	"I28": pattern("billing", "payment method", "receipt*", "charged", "invoice from zoikosuite", "update my card", "billing address"),
-	"I30": pattern("responsible ai", "how do you use ai", "use ai", "uses ai", "artificial intelligence", "ai features", "ai model", "which model", "training data", "train on my data", "trained on", "hallucinat*", "are you an ai", "are you a bot"),
+	"I30": pattern("responsible ai", "can ai", "does ai", "will ai", "ai approv*", "ai run*", "how do you use ai", "use ai", "uses ai", "artificial intelligence", "ai features", "ai model", "which model", "training data", "train on my data", "trained on", "hallucinat*", "are you an ai", "are you a bot"),
 }
 
 var tieOrder = []string{"I22", "I24", "I12", "I13", "I14", "I05", "I06", "I08", "I09", "I10", "I11", "I17", "I18", "I19", "I03", "I04", "I07", "I15", "I16", "I20", "I25", "I26", "I27", "I28", "I30", "I23", "I21", "I02", "I01"}

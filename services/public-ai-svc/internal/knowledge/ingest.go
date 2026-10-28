@@ -62,6 +62,15 @@ type Report struct {
 	Reason   string
 }
 
+// privateMarkers catch a private document mislabelled PUBLIC (KB-002).
+var privateMarkers = regexp.MustCompile(`(?i)\b(internal only|internal use only|confidential|staff only|not for distribution|do not share externally)\b`)
+
+// publicLicences may be published and indexed (KB-017).
+var publicLicences = map[string]bool{"OWNED_PUBLIC": true, "PUBLIC_REUSE": true, "LICENSED_PUBLIC": true}
+
+// highImpactSubjects need an in-date review (KB-028).
+var highImpactSubjects = map[string]bool{"PRICING": true, "TRUST": true}
+
 var hiddenContent = regexp.MustCompile(`(?i)<!--|<script|<style|<iframe|javascript:|[\x{200B}-\x{200F}\x{2060}\x{FEFF}]`)
 
 // IngestDir runs every *.source.json in dir/sources through the pipeline and
@@ -113,7 +122,7 @@ func Ingest(cfg IngestConfig, inputs []namedSource, releaseID string, now time.T
 	for _, in := range inputs {
 		src, body := in.sf.Source, in.sf.Body
 		rep := Report{File: in.name, SourceID: src.SourceID}
-		state, reason := check(cfg, caps, src, body)
+		state, reason := check(cfg, caps, src, body, now)
 		if state == StateStaged {
 			text := normalizeBody(body)
 			h := sha256Hex(text)
@@ -141,7 +150,7 @@ func Ingest(cfg IngestConfig, inputs []namedSource, releaseID string, now time.T
 
 // check runs REGISTER → ACQUIRE → SENSITIVE SCAN → TAXONOMY MAP → REVIEW →
 // injection scan, returning the first failure.
-func check(cfg IngestConfig, caps map[string]bool, s Source, body string) (string, string) {
+func check(cfg IngestConfig, caps map[string]bool, s Source, body string, now time.Time) (string, string) {
 	missing := []string{}
 	for name, v := range map[string]string{
 		"source_id": s.SourceID, "source_version_id": s.SourceVersionID, "source_type": s.SourceType,
@@ -171,6 +180,12 @@ func check(cfg IngestConfig, caps map[string]bool, s Source, body string) (strin
 	if policy.Redact(body).Found() {
 		return StateQuarantinePrivate, "sensitive data detected in body"
 	}
+	if privateMarkers.MatchString(body) {
+		return StateQuarantinePrivate, "body is marked internal/confidential"
+	}
+	if !publicLicences[s.License] {
+		return StateQuarantinePrivate, "license does not permit public use"
+	}
 	for _, c := range s.CapabilityIDs {
 		if !caps[c] {
 			return StateReviewUnmapped, "capability_id not in taxonomy: " + c
@@ -186,6 +201,9 @@ func check(cfg IngestConfig, caps map[string]bool, s Source, body string) (strin
 	}
 	if s.AuthorityTier == "P1" && len(s.ApproverIDs) < 2 {
 		return StateHoldApproval, "P1 sources need two approvers"
+	}
+	if (s.AuthorityTier == "P1" || highImpactSubjects[s.SubjectType]) && s.ReviewDueAt != nil && s.ReviewDueAt.Before(now) {
+		return StateHoldApproval, "high-impact review overdue"
 	}
 	if hiddenContent.MatchString(body) || policy.LooksLikeInjection(body) {
 		return StateQuarantineIndex, "hidden content or instruction injection"

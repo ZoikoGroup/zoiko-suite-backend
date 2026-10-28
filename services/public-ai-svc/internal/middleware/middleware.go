@@ -112,6 +112,24 @@ func Origin(allowed []string) func(http.Handler) http.Handler {
 	}
 }
 
+// Host rejects requests for an unexpected Host header when an allowlist is
+// configured (Doc 04 §08: validate Origin/Host before any work).
+func Host(allowed []string) func(http.Handler) http.Handler {
+	allow := map[string]bool{}
+	for _, h := range allowed {
+		allow[strings.ToLower(h)] = true
+	}
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if len(allow) > 0 && !allow[strings.ToLower(r.Host)] {
+				problem.Write(w, r, problem.OriginDenied, "")
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
 // RequireJSON enforces application/json on requests that carry a body.
 func RequireJSON(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

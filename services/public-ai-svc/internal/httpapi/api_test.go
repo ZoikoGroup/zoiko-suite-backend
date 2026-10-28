@@ -151,7 +151,7 @@ func TestSessionValidation(t *testing.T) {
 	}{
 		"unknown field":     {`{"schema_version":"1.0","tenant_id":"x"}`, 400},
 		"bad schema":        {`{"schema_version":"2.0"}`, 400},
-		"bad market":        {`{"schema_version":"1.0","market_code":"usa"}`, 422},
+		"bad market":        {`{"schema_version":"1.0","market_code":"usa"}`, 400},
 		"raw url as page":   {`{"schema_version":"1.0","page_context":"https://x/y"}`, 422},
 		"not json":          {`{nope`, 400},
 		"two objects":       {`{"schema_version":"1.0"}{}`, 400},
@@ -328,7 +328,7 @@ func TestTurnRejectsExtraFieldsAndBadValues(t *testing.T) {
 	}
 	long := turnBody(s.SessionID, turnUUID, strings.Repeat("a", 2001))
 	w = h.req(http.MethodPost, "/public-ai/v1/turns", long, map[string]string{sessionHeader: s.SessionGrant, "Idempotency-Key": turnUUID})
-	if w.Code != http.StatusUnprocessableEntity {
+	if w.Code != http.StatusRequestEntityTooLarge { // CT-007
 		t.Fatalf("long message: %d", w.Code)
 	}
 	if h.ans.calls.Load() != 0 {

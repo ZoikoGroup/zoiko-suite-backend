@@ -84,7 +84,7 @@ func NewWithStore(ctx context.Context, st store.Store, suffix string, modelTimeo
 	fake := &model.Fake{}
 	return &Env{
 		Store: st, Releases: rt, Flags: fl, Fake: fake, PubKey: pub, PrivKey: priv,
-		Pipeline: &orchestrator.Pipeline{Releases: rt, Flags: fl, Model: model.Gateway{Provider: fake, Timeout: modelTimeout}, Store: st, MaxOutputTokens: 400},
+		Pipeline: &orchestrator.Pipeline{Releases: rt, Flags: fl, Model: model.Gateway{Provider: fake, Timeout: modelTimeout, Breaker: &model.Breaker{Threshold: 5, Cooldown: 30 * time.Second}}, Store: st, MaxOutputTokens: 400},
 	}, nil
 }
 

@@ -53,8 +53,11 @@ var (
 	TplClarifyMarket     = Template{contract.Clarify, "Which country are you evaluating ZoikoSuite for?", "", false}
 	TplClarifyPlan       = Template{contract.Clarify, "Which plan are you asking about?", "pricing", false}
 	TplUnavailable       = Template{contract.Unavailable, "I can't answer right now. Please use the official ZoikoSuite pages for pricing, demos and support.", "support", false}
-	TplOutOfScope        = Template{contract.Abstain, "I can help with questions about ZoikoSuite's products, plans, integrations and security. Could you rephrase your question about ZoikoSuite?", "", false}
+	TplOutOfScope        = Template{contract.Abstain, "I can help with questions about ZoikoSuite's products, plans, integrations and security. Could you rephrase your question about ZoikoSuite?", "support", false}
 	TplClarifyGiveUp     = Template{contract.Abstain, "I'm not sure I can help with that here. The support team can point you in the right direction.", "support", false}
+	// TplAbstainCoverage: a regional capability in a named country without
+	// market-specific evidence (G12, G13): no assumed coverage.
+	TplAbstainCoverage = Template{contract.Abstain, "I can't confirm what's available in that country from approved ZoikoSuite sources. The team can confirm coverage for your country.", "demo", false}
 	// TplWelcome answers a bare greeting (Doc 02 T01).
 	TplWelcome = Template{contract.Clarify, "Hi! I'm the ZoikoSuite assistant. I can answer questions about ZoikoSuite's modules, plans, integrations and security. What would you like to know?", "core_modules", false}
 )
