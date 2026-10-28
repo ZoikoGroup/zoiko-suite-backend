@@ -128,3 +128,15 @@ func TestWriteProblemMarksTransientStatusesRetryable(t *testing.T) {
 		}
 	}
 }
+
+func TestCodeForStatusIsStablePerStatus(t *testing.T) {
+	for status, want := range map[int]string{
+		400: "invalid_request", 401: "unauthenticated", 403: "authorization_denied", 404: "not_found",
+		409: "conflict", 412: "stale_version", 428: "precondition_required", 503: "service_unavailable",
+		500: "internal_error", 418: "internal_error",
+	} {
+		if got := CodeForStatus(status); got != want {
+			t.Errorf("CodeForStatus(%d) = %q, want %q", status, got, want)
+		}
+	}
+}

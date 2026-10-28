@@ -115,6 +115,41 @@ func WriteError(w http.ResponseWriter, r *http.Request, status int, code, detail
 	WriteProblem(w, r, ProblemFor(status, code, detail))
 }
 
+// CodeForStatus is the stable code for a refusal whose writer names none
+// (ZS-API-001 §12 requires one on every problem): the status's own class, so
+// a caller still matches on something other than the detail text.
+func CodeForStatus(status int) string {
+	switch status {
+	case http.StatusBadRequest:
+		return "invalid_request"
+	case http.StatusUnauthorized:
+		return "unauthenticated"
+	case http.StatusForbidden:
+		return "authorization_denied"
+	case http.StatusNotFound:
+		return "not_found"
+	case http.StatusConflict:
+		return "conflict"
+	case http.StatusPreconditionFailed:
+		return "stale_version"
+	case http.StatusRequestEntityTooLarge:
+		return "request_too_large"
+	case http.StatusUnprocessableEntity:
+		return "unprocessable"
+	case http.StatusPreconditionRequired:
+		return "precondition_required"
+	case http.StatusTooManyRequests:
+		return "rate_limited"
+	case http.StatusBadGateway:
+		return "upstream_error"
+	case http.StatusServiceUnavailable:
+		return "service_unavailable"
+	case http.StatusGatewayTimeout:
+		return "upstream_timeout"
+	}
+	return "internal_error"
+}
+
 func firstNonEmpty(vals ...string) string {
 	for _, v := range vals {
 		if v = strings.TrimSpace(v); v != "" {
