@@ -1,0 +1,101 @@
+{
+  "allowed_hosts": [
+    "example.invalid"
+  ],
+  "capability_ids": [
+    "CAP-GL",
+    "CAP-AP",
+    "CAP-AR",
+    "CAP-TREASURY",
+    "CAP-PAYROLL",
+    "CAP-HR",
+    "CAP-TAX",
+    "CAP-LEGAL",
+    "CAP-COMPLIANCE"
+  ],
+  "approved_by": [
+    "approver-a",
+    "approver-b"
+  ],
+  "eval_run_id": "eval-dev-0",
+  "routes": [
+    {
+      "route_key": "pricing",
+      "url": "https://example.invalid/pricing",
+      "market_codes": [
+        "ALL"
+      ],
+      "locale": "en-US",
+      "effective_from": "2026-01-01T00:00:00Z",
+      "effective_until": "2099-12-31T00:00:00Z",
+      "approval_ref": "TEST-ROUTE-APPROVAL"
+    },
+    {
+      "route_key": "demo",
+      "url": "https://example.invalid/book-demo",
+      "market_codes": [
+        "ALL"
+      ],
+      "locale": "en-US",
+      "effective_from": "2026-01-01T00:00:00Z",
+      "effective_until": "2099-12-31T00:00:00Z",
+      "approval_ref": "TEST-ROUTE-APPROVAL"
+    },
+    {
+      "route_key": "support",
+      "url": "https://example.invalid/support",
+      "market_codes": [
+        "ALL"
+      ],
+      "locale": "en-US",
+      "effective_from": "2026-01-01T00:00:00Z",
+      "effective_until": "2099-12-31T00:00:00Z",
+      "approval_ref": "TEST-ROUTE-APPROVAL"
+    },
+    {
+      "route_key": "core_modules",
+      "url": "https://example.invalid/core-modules",
+      "market_codes": [
+        "ALL"
+      ],
+      "locale": "en-US",
+      "effective_from": "2026-01-01T00:00:00Z",
+      "effective_until": "2099-12-31T00:00:00Z",
+      "approval_ref": "TEST-ROUTE-APPROVAL"
+    },
+    {
+      "route_key": "trust",
+      "url": "https://example.invalid/trust-center",
+      "market_codes": [
+        "ALL"
+      ],
+      "locale": "en-US",
+      "effective_from": "2026-01-01T00:00:00Z",
+      "effective_until": "2099-12-31T00:00:00Z",
+      "approval_ref": "TEST-ROUTE-APPROVAL"
+    },
+    {
+      "route_key": "signup_or_trial",
+      "url": "https://example.invalid/signup",
+      "market_codes": [
+        "ALL"
+      ],
+      "locale": "en-US",
+      "effective_from": "2026-01-01T00:00:00Z",
+      "effective_until": "2099-12-31T00:00:00Z",
+      "approval_ref": "TEST-ROUTE-APPROVAL",
+      "requires_claim": "TRIAL"
+    },
+    {
+      "route_key": "evil",
+      "url": "javascript:alert(1)",
+      "market_codes": [
+        "ALL"
+      ],
+      "locale": "en-US",
+      "effective_from": "2026-01-01T00:00:00Z",
+      "effective_until": "2099-12-31T00:00:00Z",
+      "approval_ref": "TEST-ROUTE-APPROVAL"
+    }
+  ]
+}

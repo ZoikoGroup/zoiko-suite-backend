@@ -16,10 +16,12 @@ import (
 // SubmitRequest is everything a real provider integration would need to
 // actually transmit the payment.
 type SubmitRequest struct {
-	IdempotencyKey   string
-	PayerAccountRef  string
-	PayeeRef         string
-	Amount           float64
+	IdempotencyKey  string
+	PayerAccountRef string
+	PayeeRef        string
+	// Amount is the exact decimal text of the stored amount ("10.50"), never
+	// a float: what is sent is the amount that was authorized (A6).
+	Amount           string
 	Currency         string
 	PaymentReference string
 }

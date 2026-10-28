@@ -23,8 +23,9 @@ type Client interface {
 	RecordInitialStatus(ctx context.Context, tenantID, principalID string, req RecordInitialStatusRequest) (*PaymentState, error)
 	// GetStatus fetches BNK-07's real, current canonical status for a
 	// payment — this is what a poll asks instead of accepting a caller's
-	// unverified word for the external status.
-	GetStatus(ctx context.Context, tenantID, paymentID string) (*PaymentState, error)
+	// unverified word for the external status. Reads are authorized per
+	// principal in BNK-07, so the acting principal is forwarded.
+	GetStatus(ctx context.Context, tenantID, principalID, paymentID string) (*PaymentState, error)
 }
 
 type RecordInitialStatusRequest struct {
@@ -85,12 +86,13 @@ func (c *HTTPClient) RecordInitialStatus(ctx context.Context, tenantID, principa
 	return &out, nil
 }
 
-func (c *HTTPClient) GetStatus(ctx context.Context, tenantID, paymentID string) (*PaymentState, error) {
+func (c *HTTPClient) GetStatus(ctx context.Context, tenantID, principalID, paymentID string) (*PaymentState, error) {
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/bnk07/payments/"+paymentID, nil)
 	if err != nil {
 		return nil, domain.ErrPaymentStatusUnavailable
 	}
 	httpReq.Header.Set("X-Tenant-Id", tenantID)
+	httpReq.Header.Set("X-Principal-Id", principalID)
 
 	resp, err := c.http.Do(httpReq)
 	if err != nil {

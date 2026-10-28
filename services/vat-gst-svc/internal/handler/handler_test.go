@@ -251,3 +251,37 @@ func TestFileVATReturn_MissingPrincipalHeader(t *testing.T) {
 		t.Fatalf("expected 401, got %d — %s", wFile.Code, wFile.Body.String())
 	}
 }
+
+func TestUpdateVATReturn_Filed_Returns409(t *testing.T) {
+	h := newTestHandler()
+	r := chi.NewRouter()
+	RegisterRoutes(r, h)
+
+	body := domain.CreateVATReturnRequest{
+		LegalEntityID:  "le-001",
+		JurisdictionID: "uk-england",
+		TaxPeriod:      "2026-Q1",
+	}
+	wCreate := httptest.NewRecorder()
+	r.ServeHTTP(wCreate, buildRequest(http.MethodPost, "/v1/vat-returns", body))
+	var created domain.VATReturn
+	_ = json.NewDecoder(wCreate.Body).Decode(&created)
+
+	// File the return
+	fileReq := buildRequest(http.MethodPost, "/v1/vat-returns/"+created.ReturnID+"/file", domain.FileVATReturnRequest{FiledBy: "principal-test-01"})
+	wFile := httptest.NewRecorder()
+	r.ServeHTTP(wFile, fileReq)
+	if wFile.Code != http.StatusOK {
+		t.Fatalf("expected 200 on filing, got %d — %s", wFile.Code, wFile.Body.String())
+	}
+
+	// Now try to update the filed VAT return
+	updateReq := buildRequest(http.MethodPut, "/v1/vat-returns/"+created.ReturnID, domain.CreateVATReturnRequest{
+		OutputTaxAmount: 5000,
+	})
+	wUpdate := httptest.NewRecorder()
+	r.ServeHTTP(wUpdate, updateReq)
+	if wUpdate.Code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict when updating filed VAT return, got %d — %s", wUpdate.Code, wUpdate.Body.String())
+	}
+}

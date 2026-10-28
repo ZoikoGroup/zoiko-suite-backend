@@ -30,7 +30,8 @@ func TestPgStore_ACC17_CrosswalkEntryOpenItemFields_RoundTrip_RealDB(t *testing.
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
 	batch := &domain.MigrationBatch{
-		BatchID: uuid.New().String(), TenantID: tenantID, LegalEntityID: "le-1",
+		CurrencyCode: storeTestCurrency,
+		BatchID:      uuid.New().String(), TenantID: tenantID, LegalEntityID: "le-1",
 		FiscalPeriod: "2026-01", SourceSystemName: "LegacyERP", SourceExtractHash: "sha256:x",
 		ExpectedRowCount: 2, ExpectedTotalDebits: 500, ExpectedTotalCredits: 500,
 		Status: domain.MigrationBatchStatusLoaded, CreatedAt: time.Now().UTC(), CreatedByPrincipalID: "preparer-1",
@@ -98,7 +99,8 @@ func TestPgStore_ACC17_InvalidSourceReferenceType_RejectedByCheckConstraint(t *t
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
 	batch := &domain.MigrationBatch{
-		BatchID: uuid.New().String(), TenantID: tenantID, LegalEntityID: "le-1",
+		CurrencyCode: storeTestCurrency,
+		BatchID:      uuid.New().String(), TenantID: tenantID, LegalEntityID: "le-1",
 		FiscalPeriod: "2026-01", SourceSystemName: "LegacyERP", SourceExtractHash: "sha256:x",
 		ExpectedRowCount: 1, ExpectedTotalDebits: 500, ExpectedTotalCredits: 0,
 		Status: domain.MigrationBatchStatusLoaded, CreatedAt: time.Now().UTC(), CreatedByPrincipalID: "preparer-1",

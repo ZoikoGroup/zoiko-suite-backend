@@ -15,13 +15,13 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+	apicontract "zoiko.io/identity-envelope/apicontract"
 
 	"zoiko.io/gateway-auth-svc/internal/admission"
 	"zoiko.io/gateway-auth-svc/internal/carta"
 	"zoiko.io/gateway-auth-svc/internal/config"
 	"zoiko.io/gateway-auth-svc/internal/handler"
 	"zoiko.io/gateway-auth-svc/internal/jwks"
-	"zoiko.io/gateway-auth-svc/internal/problem"
 	"zoiko.io/gateway-auth-svc/internal/router"
 	"zoiko.io/gateway-auth-svc/internal/siem"
 	"zoiko.io/gateway-auth-svc/internal/tenantctx"
@@ -124,10 +124,10 @@ func (e *admEnv) verify(headers map[string]string) *httptest.ResponseRecorder {
 	return rec
 }
 
-func decodeProblem(t *testing.T, rec *httptest.ResponseRecorder) problem.Problem {
+func decodeProblem(t *testing.T, rec *httptest.ResponseRecorder) apicontract.Problem {
 	t.Helper()
-	require.Equal(t, problem.ContentType, rec.Header().Get("Content-Type"))
-	var p problem.Problem
+	require.Equal(t, apicontract.ContentTypeProblem, rec.Header().Get("Content-Type"))
+	var p apicontract.Problem
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &p))
 	return p
 }
@@ -153,8 +153,8 @@ func TestRefusalIsRFC9457WithStableCodeAndDecisionID(t *testing.T) {
 	require.Equal(t, http.StatusUnauthorized, rec.Code)
 	assert.Equal(t, "no_token", rec.Header().Get("X-Auth-Denial-Reason"), "the header consoles read must survive")
 	p := decodeProblem(t, rec)
-	assert.Equal(t, problem.CodeAuthDenied, p.Code)
-	assert.Equal(t, "urn:zoikosuite:problem:INT-AUTH-003", p.Type)
+	assert.Equal(t, "auth_denied", p.Code)
+	assert.Equal(t, "https://api.zoikosuite.com/problems/auth-denied", p.Type)
 	assert.Equal(t, 401, p.Status)
 	assert.False(t, p.Retryable)
 	assert.Equal(t, "corr-77", p.CorrelationID)
@@ -176,11 +176,11 @@ func TestEveryAuthRefusalCarriesAProblemBody(t *testing.T) {
 	for name, c := range map[string]struct {
 		hdr    map[string]string
 		status int
-		code   problem.Code
+		code   string
 		reason string
 	}{
-		"no token":      {map[string]string{}, 401, problem.CodeAuthDenied, "no_token"},
-		"garbage token": {map[string]string{"Authorization": "Bearer nonsense"}, 401, problem.CodeAuthDenied, "invalid_token"},
+		"no token":      {map[string]string{}, 401, "auth_denied", "no_token"},
+		"garbage token": {map[string]string{"Authorization": "Bearer nonsense"}, 401, "auth_denied", "invalid_token"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			rec := e.verify(c.hdr)
@@ -199,7 +199,7 @@ func TestForgedTenantContextRefusedAsProblem_INT_NP_001(t *testing.T) {
 		"Authorization": e.token(t, "tenant-abc"), "X-Zoiko-Resolved-Tenant-Id": "tenant-other",
 	})
 	require.Equal(t, http.StatusForbidden, rec.Code)
-	assert.Equal(t, problem.CodeContextInvalid, decodeProblem(t, rec).Code)
+	assert.Equal(t, "context_invalid", decodeProblem(t, rec).Code)
 	assert.Empty(t, rec.Header().Get("X-Principal-Id"), "a refused request must not carry identity headers forward")
 	assert.Empty(t, rec.Header().Get("X-Tenant-Id"))
 	assert.Empty(t, rec.Header().Get("X-Carta-Decision"), "a mismatch is not a risk-engine decision")
@@ -230,7 +230,7 @@ func TestUnsupportedAPIVersionRefusedWithoutFallback_INT_NP_003(t *testing.T) {
 	rec := e.verify(map[string]string{"Authorization": tok, "X-Forwarded-Uri": "/v2/payments"})
 	require.Equal(t, http.StatusBadRequest, rec.Code)
 	p := decodeProblem(t, rec)
-	assert.Equal(t, problem.CodeVersionUnsupported, p.Code)
+	assert.Equal(t, "version_unsupported", p.Code)
 	assert.Equal(t, "version_unsupported", rec.Header().Get("X-Auth-Denial-Reason"))
 	assert.Empty(t, rec.Header().Get("X-Tenant-Id"), "no identity may be forwarded for a refused version")
 	d, _ := e.h.Recorder().Get(p.DecisionID)
@@ -252,7 +252,7 @@ func TestOversizedAndCompressedBodiesRefusedBeforeAuthentication_INT_NP_004(t *t
 	// this would be a 401. 413 proves it is checked first.
 	rec := e.verify(map[string]string{"Content-Length": "5000"})
 	require.Equal(t, http.StatusRequestEntityTooLarge, rec.Code)
-	assert.Equal(t, problem.CodeSchemaMismatch, decodeProblem(t, rec).Code)
+	assert.Equal(t, "schema_mismatch", decodeProblem(t, rec).Code)
 	assert.Equal(t, "request_too_large", rec.Header().Get("X-Auth-Denial-Reason"))
 
 	rec = e.verify(map[string]string{"Content-Length": "100", "Content-Encoding": "gzip"})
@@ -307,7 +307,7 @@ func TestRateLimitedResponseIsProblemWithRetryAfter(t *testing.T) {
 	rec := e.verify(map[string]string{})
 	require.Equal(t, http.StatusTooManyRequests, rec.Code)
 	p := decodeProblem(t, rec)
-	assert.Equal(t, problem.CodeRateLimited, p.Code)
+	assert.Equal(t, "rate_limited", p.Code)
 	assert.True(t, p.Retryable)
 	assert.Equal(t, "rate_limited", rec.Header().Get("X-Auth-Denial-Reason"))
 	assert.Equal(t, "2", rec.Header().Get("Retry-After"), "1 token short at 0.5/s is 2 whole seconds")
@@ -329,7 +329,7 @@ func TestTenantQuotaAppliesAfterAuthenticationAndIsPerTenant(t *testing.T) {
 	}
 	rec := e.verify(map[string]string{"Authorization": tok})
 	require.Equal(t, http.StatusTooManyRequests, rec.Code)
-	assert.Equal(t, problem.CodeRateLimited, decodeProblem(t, rec).Code)
+	assert.Equal(t, "rate_limited", decodeProblem(t, rec).Code)
 	assert.Empty(t, rec.Header().Get("X-Principal-Id"))
 
 	assert.Equal(t, 200, e.verify(map[string]string{"Authorization": e.token(t, "tenant-xyz")}).Code,
@@ -350,7 +350,7 @@ func TestOverloadIsShedWithBackpressureNotQueued_INT_NP_044(t *testing.T) {
 	rec := e.verify(map[string]string{"Authorization": e.token(t, "tenant-abc")})
 	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
 	p := decodeProblem(t, rec)
-	assert.Equal(t, problem.CodeBackpressure, p.Code)
+	assert.Equal(t, "backpressure", p.Code)
 	assert.True(t, p.Retryable)
 	assert.Equal(t, "1", rec.Header().Get("Retry-After"))
 	assert.Equal(t, "overloaded", rec.Header().Get("X-Auth-Denial-Reason"))
@@ -446,7 +446,7 @@ func TestDecisionsAreRecordedForClaims(t *testing.T) {
 	e := newAdmEnv(t, handler.Admission{TenantLimiter: admission.NewLimiter(0.0001, 1, 0, nil)})
 	t1 := e.token(t, "tenant-abc")
 	e.verify(map[string]string{"Authorization": t1})
-	rec := e.verify(map[string]string{"Authorization": t1, "X-Forwarded-Uri": "/v1/ledger/journals?x=1"})
+	rec := e.verify(map[string]string{"Authorization": t1, "X-Forwarded-Uri": "/v1/ledger/journals?x=1", "X-Correlation-Id": "corr-test-123"})
 	require.Equal(t, 429, rec.Code)
 	d, ok := e.h.Recorder().Get(decodeProblem(t, rec).DecisionID)
 	require.True(t, ok)
@@ -454,7 +454,7 @@ func TestDecisionsAreRecordedForClaims(t *testing.T) {
 	assert.Equal(t, "principal-xyz", d.PrincipalID)
 	assert.Equal(t, "/v1/ledger/journals", d.Path)
 	assert.Equal(t, "POST", d.Method)
-	assert.NotEmpty(t, d.CorrelationID, "every decision is correlated")
+	assert.Equal(t, "corr-test-123", d.CorrelationID, "every decision is correlated")
 }
 
 // Regression, found by running the real image: with no X-Forwarded-For the

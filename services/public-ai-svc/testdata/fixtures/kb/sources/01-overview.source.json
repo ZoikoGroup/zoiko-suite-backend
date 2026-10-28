@@ -1,0 +1,48 @@
+{
+  "source": {
+    "source_type": "WEB_PAGE",
+    "product_id": "zoikosuite",
+    "audience": "PUBLIC_ANONYMOUS",
+    "classification": "PUBLIC_APPROVED",
+    "pii_state": "CLEAR",
+    "authority_tier": "P3",
+    "subject_type": "CAPABILITY",
+    "owner_id": "owner-web",
+    "approver_ids": [
+      "approver-a"
+    ],
+    "market_codes": [
+      "ALL"
+    ],
+    "locale": "en-US",
+    "plan_codes": [],
+    "capability_ids": [
+      "CAP-GL",
+      "CAP-AP",
+      "CAP-AR",
+      "CAP-TREASURY"
+    ],
+    "intent_ids": [
+      "I01",
+      "I02",
+      "I15"
+    ],
+    "approval_state": "APPROVED",
+    "approval_ts": "2026-01-02T00:00:00Z",
+    "effective_from": "2026-01-01T00:00:00Z",
+    "effective_until": null,
+    "review_due_at": "2027-01-01T00:00:00Z",
+    "expires_at": "2099-12-31T00:00:00Z",
+    "content_sha256": "",
+    "signing_ref": "kbctl-dev",
+    "license": "OWNED_PUBLIC",
+    "supersedes": "",
+    "revocation_reason": "",
+    "source_id": "src-overview",
+    "source_version_id": "src-overview-v1",
+    "origin_uri": "https://example.invalid/core-modules",
+    "url_key": "core-modules",
+    "title": "ZoikoSuite platform overview"
+  },
+  "body": "TEST-ONLY synthetic fixture. Not ZoikoSuite fact.\n\n# What ZoikoSuite is\nZoikoSuite is a governed business operations platform that brings finance, workforce, tax, legal, compliance and commercial operations into one system with built-in approvals and audit evidence.\n# Domains and modules\nCapabilities are grouped into four domains: Finance; Workforce; Tax, Legal and Compliance; and Commercial.\n# Finance modules\nThe Finance domain covers accounting and general ledger, accounts payable, accounts receivable, and treasury and cash position.\n# Governance\nApproval workflows, audit trails and segregation of duties are cross-cutting governance capabilities rather than separate modules."
+}

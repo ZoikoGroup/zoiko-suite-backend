@@ -12,10 +12,15 @@ import (
 
 // TestMain boots an embedded Postgres and points TEST_DATABASE_URL at it, so
 // the service's existing Postgres tests (rls_test.go et al., which skip when
-// the variable is unset) and the control-population tests run for real.
+// the variable is unset) and the control-population tests run for real. A
+// caller-supplied TEST_DATABASE_URL wins, letting CI point the same suite at a
+// disposable container without starting a second Postgres.
 //
 // Run: go test -tags=integration -count=1 -timeout=400s ./internal/store/
 func TestMain(m *testing.M) {
+	if os.Getenv("TEST_DATABASE_URL") != "" {
+		os.Exit(m.Run())
+	}
 	port := uint32(17301 + uint32(os.Getpid()%499))
 	// A private runtime dir: the default (~/.embedded-postgres-go/extracted) is
 	// shared by every service's harness and collides when two run at once.

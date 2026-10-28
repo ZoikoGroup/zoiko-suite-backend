@@ -81,6 +81,27 @@ func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (stri
 	return principalID, true
 }
 
+// requireIdempotencyKey is the ORG-10 command contract's retry identity:
+// every one of the six named commands is a material write and must carry it.
+func (h *Handler) requireIdempotencyKey(w http.ResponseWriter, r *http.Request) (string, bool) {
+	key := r.Header.Get("Idempotency-Key")
+	if key == "" {
+		writeError(w, http.StatusBadRequest, domain.ErrIdempotencyKeyRequired.Error())
+		return "", false
+	}
+	if len(key) > 255 {
+		writeError(w, http.StatusBadRequest, "Idempotency-Key must be at most 255 characters")
+		return "", false
+	}
+	return key, true
+}
+
+func markIdempotentReplay(w http.ResponseWriter, replay bool) {
+	if replay {
+		w.Header().Set("Idempotent-Replay", "true")
+	}
+}
+
 func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID, legalEntityID, actionType string) bool {
 	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionType); err != nil {
 		if errors.Is(err, authzpkg.ErrAuthorizationDenied) {
@@ -123,13 +144,38 @@ func (h *Handler) fetchDestinationForAuth(w http.ResponseWriter, r *http.Request
 	return d, true
 }
 
+// isPrivileged is one authorization-svc check for one legal entity. A list
+// response calls it once per distinct entity, not once per version.
+func (h *Handler) isPrivileged(r *http.Request, principalID, legalEntityID string) bool {
+	return h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, PayeeMasterPrivilegedRead) == nil
+}
+
 // maskIfNotPrivileged is the literal enforcement of "full account never
 // overexposed": AccountIdentifier is cleared for every reader except one
 // holding PayeeMasterPrivilegedRead. AccountLast4 always stays — it's the
 // masked value the spec's own control expects a normal reader to see.
 func (h *Handler) maskIfNotPrivileged(r *http.Request, principalID, legalEntityID string, d *domain.PayeeDestination) {
-	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, PayeeMasterPrivilegedRead); err != nil {
+	if !h.isPrivileged(r, principalID, legalEntityID) {
 		d.AccountIdentifier = ""
+	}
+}
+
+// maskVersions preserves maskIfNotPrivileged's per-entity decision while
+// avoiding an authorization round trip for every version in the list. A
+// party's versions normally share one legal entity, so this is one call in
+// the common case (previously N calls for N versions).
+func (h *Handler) maskVersions(r *http.Request, principalID string, list []domain.PayeeDestination) {
+	privileged := make(map[string]bool)
+	for i := range list {
+		entity := list[i].LegalEntityID
+		allowed, checked := privileged[entity]
+		if !checked {
+			allowed = h.isPrivileged(r, principalID, entity)
+			privileged[entity] = allowed
+		}
+		if !allowed {
+			list[i].AccountIdentifier = ""
+		}
 	}
 }
 
@@ -159,6 +205,10 @@ func (h *Handler) ProposePayeeDestination(w http.ResponseWriter, r *http.Request
 	if !ok {
 		return
 	}
+	idempotencyKey, ok := h.requireIdempotencyKey(w, r)
+	if !ok {
+		return
+	}
 	if !h.authorize(w, r, principalID, req.LegalEntityID, PayeeMasterAdmin) {
 		return
 	}
@@ -174,8 +224,12 @@ func (h *Handler) ProposePayeeDestination(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	created, err := h.store.ProposeDestination(r.Context(), verifiedTenant, req, principalID, r.Header.Get("X-Correlation-ID"))
+	created, replay, err := h.store.ProposeDestination(r.Context(), verifiedTenant, req, principalID, r.Header.Get("X-Correlation-ID"), idempotencyKey)
 	if err != nil {
+		if errors.Is(err, domain.ErrIdempotencyKeyConflict) {
+			writeError(w, http.StatusConflict, domain.ErrIdempotencyKeyConflict.Error())
+			return
+		}
 		if errors.Is(err, domain.ErrDuplicateDestination) {
 			writeError(w, http.StatusConflict, domain.ErrDuplicateDestination.Error())
 			return
@@ -189,16 +243,23 @@ func (h *Handler) ProposePayeeDestination(w http.ResponseWriter, r *http.Request
 	// ProposeDestination's own transaction (the transactional outbox), not
 	// published here after the fact — see pg_store.go.
 	h.maskIfNotPrivileged(r, principalID, req.LegalEntityID, created)
+	markIdempotentReplay(w, replay)
+	if replay {
+		// Match the platform's command pattern: the first response is 201,
+		// a replay returns 200 with the same candidate and the replay header.
+		writeJSON(w, http.StatusOK, created)
+		return
+	}
 	writeJSON(w, http.StatusCreated, created)
 }
 
 func (h *Handler) GetPayeeDestination(w http.ResponseWriter, r *http.Request) {
 	destinationID := chi.URLParam(r, "destinationID")
-	d, ok := h.fetchDestinationForAuth(w, r, destinationID)
+	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
 	}
-	principalID, ok := h.requirePrincipal(w, r)
+	d, ok := h.fetchDestinationForAuth(w, r, destinationID)
 	if !ok {
 		return
 	}
@@ -218,9 +279,7 @@ func (h *Handler) ListPayeeVersions(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "store unavailable")
 		return
 	}
-	for i := range list {
-		h.maskIfNotPrivileged(r, principalID, list[i].LegalEntityID, &list[i])
-	}
+	h.maskVersions(r, principalID, list)
 	if list == nil {
 		list = []domain.PayeeDestination{}
 	}
@@ -253,6 +312,9 @@ func (h *Handler) GetActivePayeeDestination(w http.ResponseWriter, r *http.Reque
 
 func (h *Handler) GetPayeeChangeHistory(w http.ResponseWriter, r *http.Request) {
 	destinationID := chi.URLParam(r, "destinationID")
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
 	if _, ok := h.fetchDestinationForAuth(w, r, destinationID); !ok {
 		return
 	}
@@ -285,6 +347,10 @@ func (h *Handler) VerifyPayeeDestination(w http.ResponseWriter, r *http.Request)
 	if !ok {
 		return
 	}
+	idempotencyKey, ok := h.requireIdempotencyKey(w, r)
+	if !ok {
+		return
+	}
 	d, ok := h.fetchDestinationForAuth(w, r, destinationID)
 	if !ok {
 		return
@@ -292,10 +358,10 @@ func (h *Handler) VerifyPayeeDestination(w http.ResponseWriter, r *http.Request)
 	if !h.authorize(w, r, principalID, d.LegalEntityID, PayeeMasterAdmin) {
 		return
 	}
-	if !domain.CanProposeVerification(d.Status) {
-		writeError(w, http.StatusConflict, "destination is not in a state that accepts verification")
-		return
-	}
+	// The state guard is deliberately in the store, after the idempotency
+	// lookup: a retried VerifyPayeeDestination must replay its original
+	// result even after the destination has moved on to APPROVAL_PENDING or
+	// ACTIVE. A handler-side pre-check would turn that retry into a 409.
 	if !domain.CanVerify(d.SourceType, req.VerificationMethod) {
 		writeError(w, http.StatusConflict, domain.ErrVerificationNotIndependent.Error())
 		return
@@ -305,8 +371,12 @@ func (h *Handler) VerifyPayeeDestination(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	updated, err := h.store.VerifyDestination(r.Context(), destinationID, req, principalID)
+	updated, replay, err := h.store.VerifyDestination(r.Context(), destinationID, req, principalID, idempotencyKey)
 	if err != nil {
+		if errors.Is(err, domain.ErrIdempotencyKeyConflict) {
+			writeError(w, http.StatusConflict, domain.ErrIdempotencyKeyConflict.Error())
+			return
+		}
 		if errors.Is(err, domain.ErrInvalidTransition) {
 			writeError(w, http.StatusConflict, "destination is not in a state that accepts verification")
 			return
@@ -316,6 +386,7 @@ func (h *Handler) VerifyPayeeDestination(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	h.maskIfNotPrivileged(r, principalID, updated.LegalEntityID, updated)
+	markIdempotentReplay(w, replay)
 	writeJSON(w, http.StatusOK, updated)
 }
 
@@ -327,6 +398,10 @@ func (h *Handler) ApprovePayeeDestination(w http.ResponseWriter, r *http.Request
 	if !ok {
 		return
 	}
+	idempotencyKey, ok := h.requireIdempotencyKey(w, r)
+	if !ok {
+		return
+	}
 	d, ok := h.fetchDestinationForAuth(w, r, destinationID)
 	if !ok {
 		return
@@ -335,8 +410,12 @@ func (h *Handler) ApprovePayeeDestination(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	updated, err := h.store.ApproveDestination(r.Context(), destinationID, principalID, r.Header.Get("X-Correlation-ID"))
+	updated, replay, err := h.store.ApproveDestination(r.Context(), destinationID, principalID, r.Header.Get("X-Correlation-ID"), idempotencyKey)
 	if err != nil {
+		if errors.Is(err, domain.ErrIdempotencyKeyConflict) {
+			writeError(w, http.StatusConflict, domain.ErrIdempotencyKeyConflict.Error())
+			return
+		}
 		if errors.Is(err, domain.ErrInvalidTransition) {
 			writeError(w, http.StatusConflict, "destination must be VERIFIED to approve")
 			return
@@ -348,17 +427,24 @@ func (h *Handler) ApprovePayeeDestination(w http.ResponseWriter, r *http.Request
 	// com.zoikosuite.banking.payee-destination.approved is enqueued inside
 	// ApproveDestination's own transaction — see pg_store.go.
 	h.maskIfNotPrivileged(r, principalID, updated.LegalEntityID, updated)
+	markIdempotentReplay(w, replay)
 	writeJSON(w, http.StatusOK, updated)
 }
 
 // ActivateDestination is where "only one active version per party/scope"
-// takes effect, and — the moment an active destination genuinely changes
-// — is exactly the point AP-10 would need to consult before authorizing
-// against a now-stale fingerprint. No real caller does that yet; see
-// internal/domain's package doc.
+// takes effect. AP-10 in payment-authorization-svc does re-fetch this
+// service's active destination before requesting, approving, consuming and
+// validating a payment, and invalidates on a changed/absent DestinationID
+// (verifyStillEligible) — so the comment that "no real caller does that yet"
+// was stale. AP-10 does NOT subscribe to the outbox event below; protection
+// is pull-based between those checkpoints. See SPEC_DEVIATIONS A9.
 func (h *Handler) ActivateDestination(w http.ResponseWriter, r *http.Request) {
 	destinationID := chi.URLParam(r, "destinationID")
 	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	idempotencyKey, ok := h.requireIdempotencyKey(w, r)
 	if !ok {
 		return
 	}
@@ -370,8 +456,12 @@ func (h *Handler) ActivateDestination(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	updated, err := h.store.ActivateDestination(r.Context(), destinationID, principalID, r.Header.Get("X-Correlation-ID"))
+	updated, replay, err := h.store.ActivateDestination(r.Context(), destinationID, principalID, r.Header.Get("X-Correlation-ID"), idempotencyKey)
 	if err != nil {
+		if errors.Is(err, domain.ErrIdempotencyKeyConflict) {
+			writeError(w, http.StatusConflict, domain.ErrIdempotencyKeyConflict.Error())
+			return
+		}
 		if errors.Is(err, domain.ErrInvalidTransition) {
 			writeError(w, http.StatusConflict, "destination must be APPROVAL_PENDING to activate")
 			return
@@ -380,9 +470,12 @@ func (h *Handler) ActivateDestination(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "store unavailable")
 		return
 	}
-	// com.zoikosuite.banking.payee-destination.activated is enqueued inside
-	// ActivateDestination's own transaction — see pg_store.go.
+	// com.zoikosuite.banking.payee-destination.activated and, when this
+	// activation replaces an existing ACTIVE row, that row's .superseded
+	// event are enqueued inside ActivateDestination's own transaction — see
+	// pg_store.go.
 	h.maskIfNotPrivileged(r, principalID, updated.LegalEntityID, updated)
+	markIdempotentReplay(w, replay)
 	writeJSON(w, http.StatusOK, updated)
 }
 
@@ -401,6 +494,10 @@ func (h *Handler) SuspendDestination(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	idempotencyKey, ok := h.requireIdempotencyKey(w, r)
+	if !ok {
+		return
+	}
 	d, ok := h.fetchDestinationForAuth(w, r, destinationID)
 	if !ok {
 		return
@@ -409,8 +506,12 @@ func (h *Handler) SuspendDestination(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	updated, err := h.store.SuspendDestination(r.Context(), destinationID, req, principalID, r.Header.Get("X-Correlation-ID"))
+	updated, replay, err := h.store.SuspendDestination(r.Context(), destinationID, req, principalID, r.Header.Get("X-Correlation-ID"), idempotencyKey)
 	if err != nil {
+		if errors.Is(err, domain.ErrIdempotencyKeyConflict) {
+			writeError(w, http.StatusConflict, domain.ErrIdempotencyKeyConflict.Error())
+			return
+		}
 		if errors.Is(err, domain.ErrInvalidTransition) {
 			writeError(w, http.StatusConflict, "destination must be ACTIVE to suspend")
 			return
@@ -422,6 +523,7 @@ func (h *Handler) SuspendDestination(w http.ResponseWriter, r *http.Request) {
 	// com.zoikosuite.banking.payee-destination.suspended is enqueued inside
 	// SuspendDestination's own transaction — see pg_store.go.
 	h.maskIfNotPrivileged(r, principalID, updated.LegalEntityID, updated)
+	markIdempotentReplay(w, replay)
 	writeJSON(w, http.StatusOK, updated)
 }
 
@@ -440,6 +542,10 @@ func (h *Handler) SupersedeDestination(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	idempotencyKey, ok := h.requireIdempotencyKey(w, r)
+	if !ok {
+		return
+	}
 	d, ok := h.fetchDestinationForAuth(w, r, destinationID)
 	if !ok {
 		return
@@ -448,8 +554,12 @@ func (h *Handler) SupersedeDestination(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	updated, err := h.store.SupersedeDestination(r.Context(), destinationID, req, principalID, r.Header.Get("X-Correlation-ID"))
+	updated, replay, err := h.store.SupersedeDestination(r.Context(), destinationID, req, principalID, r.Header.Get("X-Correlation-ID"), idempotencyKey)
 	if err != nil {
+		if errors.Is(err, domain.ErrIdempotencyKeyConflict) {
+			writeError(w, http.StatusConflict, domain.ErrIdempotencyKeyConflict.Error())
+			return
+		}
 		if errors.Is(err, domain.ErrInvalidTransition) {
 			writeError(w, http.StatusConflict, "destination is not in a state that can be superseded")
 			return
@@ -461,5 +571,6 @@ func (h *Handler) SupersedeDestination(w http.ResponseWriter, r *http.Request) {
 	// com.zoikosuite.banking.payee-destination.superseded is enqueued inside
 	// SupersedeDestination's own transaction — see pg_store.go.
 	h.maskIfNotPrivileged(r, principalID, updated.LegalEntityID, updated)
+	markIdempotentReplay(w, replay)
 	writeJSON(w, http.StatusOK, updated)
 }

@@ -17,6 +17,7 @@ func TestValidateOpeningBalances_AROpenItemAlreadyExistsInHistory_QuarantinesBat
 	}
 	r := newRouter(s, &stubAuthZ{}, cl)
 	req := domain.CreateMigrationBatchRequest{
+		CurrencyCode:  testCurrency,
 		LegalEntityID: "le-1", FiscalPeriod: "2026-01", SourceSystemName: "LegacyERP", SourceExtractHash: "sha256:x",
 		ExpectedRowCount: 2, ExpectedTotalDebits: 500, ExpectedTotalCredits: 500,
 		Entries: []domain.MigrationCrosswalkEntry{
@@ -47,6 +48,7 @@ func TestValidateOpeningBalances_APOpenItemAlreadyExistsInHistory_QuarantinesBat
 	}
 	r := newRouter(s, &stubAuthZ{}, cl)
 	req := domain.CreateMigrationBatchRequest{
+		CurrencyCode:  testCurrency,
 		LegalEntityID: "le-1", FiscalPeriod: "2026-01", SourceSystemName: "LegacyERP", SourceExtractHash: "sha256:x",
 		ExpectedRowCount: 2, ExpectedTotalDebits: 500, ExpectedTotalCredits: 500,
 		Entries: []domain.MigrationCrosswalkEntry{
@@ -73,6 +75,7 @@ func TestValidateOpeningBalances_AROpenItemNotInHistory_ValidationSucceeds(t *te
 	}
 	r := newRouter(s, &stubAuthZ{}, cl)
 	req := domain.CreateMigrationBatchRequest{
+		CurrencyCode:  testCurrency,
 		LegalEntityID: "le-1", FiscalPeriod: "2026-01", SourceSystemName: "LegacyERP", SourceExtractHash: "sha256:x",
 		ExpectedRowCount: 2, ExpectedTotalDebits: 500, ExpectedTotalCredits: 500,
 		Entries: []domain.MigrationCrosswalkEntry{
@@ -96,6 +99,7 @@ func TestValidateOpeningBalances_OpenItemMissingPartyID_QuarantinesBatch(t *test
 	cl := &stubClients{accountStatuses: map[string]string{"1000-Cash": "ACTIVE", "1200-AR": "ACTIVE"}}
 	r := newRouter(s, &stubAuthZ{}, cl)
 	req := domain.CreateMigrationBatchRequest{
+		CurrencyCode:  testCurrency,
 		LegalEntityID: "le-1", FiscalPeriod: "2026-01", SourceSystemName: "LegacyERP", SourceExtractHash: "sha256:x",
 		ExpectedRowCount: 2, ExpectedTotalDebits: 500, ExpectedTotalCredits: 500,
 		Entries: []domain.MigrationCrosswalkEntry{

@@ -285,6 +285,18 @@ func (s *PgStore) GetDunningCase(ctx context.Context, caseID string) (*domain.Du
 	return out, err
 }
 
+// GetDunningCaseAsSeller is the replay reader for seller commands whose
+// claim resource id is the dunning case id (StartDunning, Advance/Stop).
+func (s *PgStore) GetDunningCaseAsSeller(ctx context.Context, caseID string) (*domain.DunningCase, error) {
+	var out *domain.DunningCase
+	err := mapDunningErr(s.withSellerPlane(ctx, func(tx pgx.Tx) error {
+		c, err := loadDunningCase(ctx, tx, caseID, false)
+		out = c
+		return err
+	}))
+	return out, err
+}
+
 // GetDunningStateForInvoice returns the invoice's current OPEN case, or nil
 // (with no error) if none is open — the invoice being current, or its case
 // already closed, are both ordinary states, not failures.

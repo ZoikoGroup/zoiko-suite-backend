@@ -1,0 +1,257 @@
+# Suivo R0 build log
+
+Each entry records what a build step changed and the verified result of
+`go build ./...`, `go vet ./...`, `go test ./...` and `gofmt -l .` in
+`services/public-ai-svc`. Postgres-backed tests run when `TEST_DATABASE_URL` is set.
+
+## STEP 1 — Service skeleton
+
+- Files: `go.mod`, `cmd/server`, `cmd/healthcheck`, `internal/config`, `internal/problem`,
+  `internal/middleware`, `internal/httpapi`, `internal/isolation`, `api/openapi.yaml`, `.env.example`;
+  `.github/workflows/ci.yml` (adds `public-ai-svc` to the matrix and to the `TEST_DATABASE_URL` list).
+- Repaired from the earlier OpenCode attempt: that commit had corrupted `ci.yml` for every service
+  (rewrote `[` in shell tests, changed triggers, mojibake, BOM) and left the service code uncommitted;
+  its isolation test could never fail.
+- Controls: server-issued `X-Request-ID`; first-party Origin allowlist (missing Origin denied) with CORS
+  preflight; body cap → 413; non-JSON → 415; RFC 9457 problems from the Doc 05 §13 catalogue;
+  `no-store`; security headers; access log with allowlisted fields only; config refuses
+  `PUBLIC_AI_LOG_RAW_PROMPT=true`, PII capture, wildcard origins and >1 active turn per session.
+- Tests: CT-003 origin denied, CT-004 oversized body, CT-005 content type, preflight, request id,
+  readiness vs liveness, generic public health, SSE 404 in R0, SEC-T049 isolation (module-wide, plus a
+  test proving a cross-service import is rejected), config guards, problem format.
+- Result: build ok, vet ok, all tests pass, gofmt clean.
+
+## STEP 2 — Database migrations and store
+
+- Files: `deployments/migrations/000001_initial_schema.{up,down}.sql` + embed package,
+  `internal/store` (`Store` interface, `Memory`, `Postgres`, `Migrate`/`MigrateDown`),
+  `internal/store/storetest` (conformance suite run against both implementations).
+- Schema `public_ai`: sessions (grant stored only as SHA-256), session_idempotency, turns (exact
+  response bytes for byte-identical replay; never the raw message), releases (signed, immutable),
+  release_pointer (atomic swap), revocations (append-only, enforced by trigger), conflicts, flags,
+  usage_counters, outbox.
+- Design change recorded in ADR-002: knowledge lives in signed release bundles rather than editable
+  source/chunk tables (Doc 03 §11 forbids in-place edits).
+- Tests: memory + Postgres conformance (sessions, grant rotation, delete, turn begin/replay/mismatch/
+  conflict/abort/expired lock, sequence, releases immutability + pointer kind check, monotonic
+  revocations, flags, usage, outbox dedupe/publish), migrations up/down/up, revocation append-only.
+- Found by the real-Postgres run: JSONB re-formats stored responses; switched to BYTEA.
+- Result: build ok, vet ok, all tests pass (Postgres 16 via TEST_DATABASE_URL), gofmt clean.
+
+## STEPs 3–4 — Sessions, config and turns API
+
+- Files: `internal/contract` (wire types + validation, envelope schema check), `internal/session`
+  (grant issue/verify, SHA-256 at rest), `internal/orchestrator` (Answerer interface + AbstainAll
+  placeholder), `internal/httpapi/handlers.go`, `api/openapi.yaml` (full R0 contract), `cmd/server`
+  (Postgres or in-memory store, migrations on start).
+- Behaviour: POST /sessions requires Idempotency-Key; replay returns the same session_id/expiry with a
+  rotated grant (the grant is never stored, so it cannot be returned twice — ADR-005 dev default);
+  DELETE ends the session, repeat delete of own session is 204, a foreign grant gets 404 (no
+  existence leak); GET /config with ETag/304. POST /turns: grant → session, strict schema (unknown
+  fields 400), NFC + control-char stripping, session_id must equal grant subject (403), Idempotency-Key
+  must equal client_turn_id (400), atomic single active turn (409 + Retry-After), replay is
+  byte-identical with no second orchestrator call, same key + different payload 422, the orchestrator
+  runs on a context detached from client disconnect, and any orchestrator output that fails the
+  response schema is replaced by UNAVAILABLE before it is sent.
+- Store change: deleted sessions keep their grant hash marked deleted, so repeat DELETE is 204 while
+  the grant cannot start turns or be rotated.
+- Tests: CT-001, CT-002 (replay + grant rotation + mismatch), CT-009/010 replay without second call,
+  CT-011 turn conflict, idempotency mismatch, header mismatch, scope denied, extra fields, long message,
+  expired session, delete semantics, config ETag, contract validation, NFC normalization, envelope
+  schema (ANSWERED requires provenance, non-route actions rejected).
+- Result: build ok, vet ok, all tests pass (memory + Postgres), gofmt clean.
+
+## STEP 5 — Sanitize, redaction, intercepts, intent rules
+
+- Files: `internal/policy` (`redact.go`, `classify.go`, `templates.go`).
+- Sensitive-input interception before any model call: payment cards (Luhn-checked), IBAN (mod-97),
+  US SSN, UK NINO, labelled tax IDs, API keys/tokens/private keys, passwords, one-time codes, bank
+  account numbers → masked as `[REDACTED:<kind>]` and exception X03. Templates never echo the message.
+- Exception classes X01–X08 by deterministic rules, highest risk first:
+  X03 > X06 > X05 > X02 > X01 > X04 > X08 > X07 (X09 is set by the claim stage, X10 by the limiter).
+- Intent rules I01–I30 with scored phrase matching and a fixed tie order; unmatched → I29.
+- Slots from the visitor's own words only (market, plan word, billing cadence, entity band,
+  integration name); never inferred from IP.
+- Templates: neutral DEV DRAFT wording for exceptions, abstention, clarification, unavailability and
+  route-only intents (I08/I22/I23/I24/I28) that never claim a booking, ticket or callback; unresolved
+  placeholders fail rendering. Copy needs Legal/Product review (Doc 06 App. B).
+- Tests: detection for each kind, no false positives on plan sizes/years/IDs failing checksums,
+  exception precedence (incl. injection + private data, sensitive + injection), negative cases for
+  ordinary product questions, 13 intent samples, slot extraction, template rendering.
+- Result: build ok, vet ok, all tests pass, gofmt clean.
+
+## STEPs 6–7 — Knowledge pipeline, kbctl and claim resolver
+
+- Files: `internal/signing` (Ed25519, release files), `internal/knowledge` (registry/chunk types, ingestion
+  state machine, BM25 index with mandatory filters), `internal/claims` (P1 resolver), `internal/release`
+  (verified runtime with pinned snapshots, revocation ledger, publish/promote/revoke, public config),
+  `internal/events` (the six CloudEvents), `internal/flags` (flags + kill switch, fail closed),
+  `cmd/kbctl`, `testdata/fixtures` (TEST-ONLY: currency XTS, plans TEST_STARTER/TEST_GROWTH,
+  URLs https://example.invalid/…).
+- Ingestion (Doc 03 §09): REGISTER (every field mandatory) → ACQUIRE (https + allowlisted host) →
+  classification/audience/PII → sensitive scan → taxonomy map → review (approved, no self-approval,
+  P1 needs two approvers) → hidden-content/injection scan → dedup + content hash → chunk → STAGED.
+  Fixture outcomes verified: poisoned → QUARANTINE_INDEX, internal → QUARANTINE_PRIVATE,
+  draft → HOLD_APPROVAL, off-allowlist → QUARANTINE_FETCH; `javascript:` route rejected.
+- Retrieval filter order: release → classification → audience → revoked → effective window → market →
+  locale → BM25 → answerability (ANSWERABLE / NOT_FOUND / STALE / REVOKED).
+- Claims (Doc 05 §17): VERIFIED only for ACTIVE, publishable, enabled, in-window, unrevoked claims with
+  approved wording and provenance; CONTRADICTED on disagreeing active values (no majority vote);
+  EXPIRED/REVOKED blocked; market-scoped subjects without a market → MARKET_REQUIRED (clarify);
+  SOC 2 readiness (HOLD) is never stated as certification; ACTIVE claims need two approvals.
+- Runtime: releases verified on load (invalid signature → not ready, no snapshot); revocations are
+  copy-on-write and apply across rollback; commit-time check reads the ledger directly.
+- Routes: `signup_or_trial` offered only where a TRIAL claim is VERIFIED for the market.
+- kbctl exercised against Postgres: build/sign/publish/promote/revoke/flag; outbox received
+  kb.release.promoted.v1 ×2, kb.source.revoked.v1, publicai.kill_switch.changed.v1;
+  `stream_enabled=true` refused.
+- Result: build ok, vet ok, all tests pass, gofmt clean.
+
+## STEPs 8–11 — Model gateway, output validation, vertical slice, events, limits, kill switch
+
+- Files: `internal/model` (gateway: tools hard-coded off, deadline, one transient retry, layered prompt
+  with evidence escaped as non-instructional data; deterministic `Fake` provider with fault modes),
+  `internal/validate` (post-generation gate), `internal/orchestrator/pipeline.go` (full pipeline),
+  `internal/fixtureenv` (in-process stack on TEST-ONLY fixtures), `internal/events/relay.go`
+  (outbox → Kafka/log, at-least-once, DLQ after 10 attempts), `internal/limits`, `cmd/server`
+  (Postgres mode + local dev mode on fixtures), `internal/e2e`.
+- Pipeline order: kill switch → verified snapshot (none → UNAVAILABLE, never model memory) →
+  redaction + X-exceptions (templates, security signal) → per-intent disable → route-only intents →
+  P1 claims (MARKET_REQUIRED → CLARIFY; CONTRADICTED → ABSTAIN + conflict record; REVOKED/EXPIRED →
+  ABSTAIN; INSUFFICIENT → ABSTAIN) → retrieval (STALE/REVOKED → ABSTAIN; NOT_FOUND → ABSTAIN or
+  out-of-scope for I29) → generation (claims are used verbatim) → validation (one repair) → ≤3
+  citations from what was actually used → revocation re-check at commit → ≤1 official CTA.
+- Validation: unknown claim/evidence refs, markup/script, instruction leakage, prohibited commitment
+  phrases (unless a signed claim contains them), and ANY number not present in the supplied claims or
+  evidence are rejected; model URLs/emails/phones removed; ≤120 words at sentence boundaries.
+- Degraded modes: provider error/timeout → UNAVAILABLE + route; `approved_fallback_mode=static` and
+  `model_generation_enabled=false` serve signed claim statements only; `pricing_claims_enabled=false`
+  → no numbers; `public_ai_enabled=false` → UNAVAILABLE and readiness false.
+- Limits: per-IP (IPv6 /64) and per-session token buckets, global in-flight cap → 429 + Retry-After;
+  daily/monthly token ceilings stop the model path (fail closed if usage unreadable).
+- Events: chat.turn.completed.v1 and chat.security.signal.v1 written in the turn transaction;
+  chat.handoff.clicked.v1 is defined but not emitted in R0 (no click endpoint in the Doc 05 contract).
+- Tests: vertical slice (grounded answer, verified price, clarify, conflict + record, SOC 2 never
+  certified, ISO verified, private data/actions refused, injection + signal, sensitive input never
+  echoed, provider error/timeout/transient, 5 misbehaving-model faults, revocation mid-flight, revoked
+  source, kill switch, pricing off, static mode, per-intent disable, trial CTA gating, demo route-only,
+  expired evidence, no knowledge), validator unit tests, gateway deadline + prompt escaping, relay
+  delivery/no-resend/DLQ, six event types only, limiter tests, spend ceiling, HTTP e2e incl. SEC-T039
+  (no visitor text or secrets in any event).
+- Live smoke test: server in dev mode answered 4 sample questions correctly over HTTP; server log
+  contained 0 occurrences of visitor text or grants.
+- Result: build ok, vet ok, all tests pass (incl. Postgres), gofmt clean.
+
+## STEP 12 — Evaluation harness
+
+- Files: `internal/eval` (dataset loader, deterministic grader, report), `cmd/evalrun`,
+  `testdata/golden/golden-v1.json` (25 TEST-ONLY cases, partitions A canonical, B clarification,
+  C abstention/refusal, D adversarial; each with priority and requirement refs),
+  `docs/suivo/test-traceability.md`, service `README.md`.
+- Grader checks outcome, intent, required/forbidden text, required/forbidden claim citations,
+  official-route-only actions, citation counts, and the universal ANSWERED-needs-provenance rule.
+  Any P0 failure → BLOCK_RELEASE and exit code 1. A test proves the grader catches a fabricated
+  certification. `eval.TestGoldenSet` runs the set in CI.
+- Found by the eval: generic phrases ("can zoikosuite") outweighed the integration intent so a
+  verified integration claim was not cited; removed them from intent scoring.
+- Result: golden-dev-v1 25/25 passed, 0 P0 failures. build ok, vet ok, all tests pass, gofmt clean.
+- Not covered (needs people, the widget or staging): holdout partition E, drift sentinel F, semantic
+  and human grading lanes, WCAG, load/latency.
+
+## STEP 14 — Ops readiness
+
+- Files: `services/public-ai-svc/Dockerfile` (+ `.dockerignore`), `deployments/docker-compose.public-ai.yml`,
+  `internal/release/manifest.go` + `kbctl manifest`, `internal/policy/bundle.go` (prompt/policy digest),
+  `cmd/drill`, `RUNBOOK.md`, `docs/suivo/r0-readiness.md`; `fixtureenv.NewWithStore`; server logs its git SHA.
+- Container: multi-stage, non-root (uid 10001), runs with a read-only root filesystem, all capabilities
+  dropped, healthcheck; image 14.7 MB; contains no fixtures, keys or secrets.
+- Compose: standalone stack with its own Postgres and network, port bound to 127.0.0.1, signed releases
+  mounted read-only. Verified: `/health/ready` 503 before releases → `kbctl publish -promote` inside the
+  container → 200 → price question answered from the verified claim; container healthy; 0 visitor text in logs.
+- Release manifest: signed record of the four artifacts (app commit + image digest, prompt/policy
+  digest, knowledge release + digest, claim release + digest), assurance runs (eval summary + report
+  hash) and approvals all PENDING with decision NO_GO_UNTIL_SIGNED. Generated successfully.
+- Drills (Doc 08 RB-01/02/04 + kill switch): DR-01 kill switch, DR-02 claim revocation, DR-03 rollback
+  without resurrection, DR-04 provider outage/timeout, DR-05 safe-static — 5/5 pass on the memory store
+  and 5/5 on Postgres.
+- Readiness record lists every Doc 11 gate G0–G5 as PENDING with evidence and remaining needs.
+- Result: build ok, vet ok, all tests pass (incl. Postgres), gofmt clean.
+
+## STEP 13 — Assistant widget (frontend) + multi-turn carry-over (backend)
+
+- Location chosen by the product owner: `zoiko-suite-frontend-platform` (staff admin console), branch
+  `suivo/assistant-widget`. Note: Docs 01/11 place the visitor widget on the public website; in the
+  console only signed-in staff see it. The widget talks only to the public API, so moving it to the
+  public site is a contained change.
+- Frontend: `lib/api/public-ai.ts` (server-only client; deliberately NOT the console client, so no
+  X-Principal/X-Tenant identity headers ever reach the public assistant), `app/admin/assistant/actions.ts`
+  (Server Actions; verify the console session; validate input), `components/admin/assistant/AssistantWidget.tsx`
+  (launcher + non-modal panel, welcome + 4 starters, citations, single official CTA, clarify/refusal/
+  error/retry/429/409 states, re-session on 401, end-chat deletes the session, grant kept in memory only),
+  mounted in `app/admin/layout.tsx`; `.env.example` documents `ZOIKO_PUBLIC_AI_URL` / `_ORIGIN`.
+- Backend: `/config` now returns `citation_links` (server-resolved, ADR-005 note); new migration
+  000002 adds `sessions.pending_context` so a reply to a clarifying question keeps the original intent and
+  slots (intent/slot values only, never text; wiped on delete); after two failed clarifications the
+  assistant offers one route instead of a third question (Doc 02 §10).
+- Found in the browser: the follow-up "In the United States, per month" lost the plan from "How much does
+  the Growth plan cost?" and listed every plan — fixed by the carry-over above, re-verified in the browser.
+- Verified in a real browser (console on :3000, backend dev mode on :18080): starter question answered with
+  a source link and CTA; clarify → price from the verified claim only; private-invoice request refused with
+  a support link; Escape closes and returns focus to the launcher; mobile 375 px full-screen sheet with no
+  horizontal scroll; replies in a polite live region. Inline source links are 24 px tall (meets WCAG 2.2 AA
+  2.5.8; the docs' 44 px target applies to buttons, which meet it).
+- Checks: frontend `tsc --noEmit` and eslint clean; backend build, vet, all tests (incl. Postgres) pass.
+- Not done: automated browser/a11y tests (the console repo has no test runner), screen-reader pass with
+  NVDA/VoiceOver, 200%/400% zoom check, answer quality (the fake model is extractive; real model is DEC-05).
+
+## STEP 13b — Public-website widget: built, then withdrawn
+
+- A website version was built on `ZoikoSuite-NextJS` (branch `suivo/public-assistant`, never pushed) and
+  verified in a browser. At the product owner's direction the widget lives **only** in
+  `zoiko-suite-frontend-platform` (branch `suivo/assistant-widget`); `ZoikoSuite-NextJS` was returned to its
+  `main` branch unchanged.
+- Consequence to record for approvers: Docs 01/11 describe a public-website assistant for anonymous visitors.
+  In the console only signed-in staff can use it. The backend is unchanged by this choice and still serves
+  any allowlisted first-party origin, so a later move to the public site is a frontend-only change.
+
+## STEP 13c — Answer coverage fixes found by probing the console widget
+
+Trigger: in the console, "What plans are available?" asked for a country, and the follow-up "uk" got
+"information is being reviewed". A probe of 24 typical visitor questions found more gaps. All fixed in
+`zoiko-suite-backend` only; the console widget needed no change.
+
+| Gap | Fix (document basis) |
+|---|---|
+| "hi" / "What is ZoikoSuite?" → "couldn't verify" | Greeting → welcome template (Doc 02 T01); intent-tagged page fallback when a question's words are too generic to rank (I01) |
+| "What plans are available?" treated as a price question | Only price questions ("how much", "cost", "price"…) need a market and P1 claims; plan catalogue answered from the approved pricing page (Doc 02 I05) |
+| "uk" after the plans answer lost context | Plans/trial answers carry intent and slots (never text) so a market reply returns that market's verified prices |
+| Deliberate price conflict sat on GB | Conflict fixture moved to IE; GB gets consistent prices and a trial (fixtures are TEST-ONLY) |
+| Thin knowledge: payroll, VAT, integrations, GDPR, multi-entity, AI, deployment… | Fixtures v2: 15 approved sources tagged to Doc 02 intents (still synthetic; no compliance or certification claims outside signed claims) |
+| "How is data secured?" answered from the migration page | Intent-aware ranking boost; better stemming; small sections packed into coherent chunks with their headings |
+| "Which countries do you support?" asked for a country | Lists every market whose availability is VERIFIED, verbatim from claims (Doc 02 I04) |
+| Revoked page's question answered from an unrelated page | If the best match is revoked/expired, abstain instead of using a weaker page (Doc 03 §15) |
+| "How does it compare to NetSuite?" | Route template: ZoikoSuite facts only (Doc 02 I26) |
+
+- Probe after fixes: 24/24 questions get a grounded answer, a correct clarification, a route-only handoff
+  or a policy-correct refusal; screenshot flow re-verified in the console (dark mode).
+- Golden set v2: 37 cases (12 added from the probe), 37/37 pass. Drills 5/5. All 14 test packages pass.
+- Still true: answers come from the extractive fake model (DEC-05), so wording is plain.
+
+## Docs 01–05 gap closure
+
+- Backend: `POST /turns/{turn_id}/feedback` (Doc 01 FR-09; enums only; own completed turns only; migration
+  000003), `POST /handoffs` emitting `chat.handoff.clicked.v1` (Doc 05 §21; route-only), retention purge of
+  expired/deleted sessions (`PUBLIC_AI_RETENTION`, dev default 24 h, DEC-06), W3C `traceparent` validation
+  (Doc 05 §06), signed synonym lexicon in the KB release (Doc 03 §13), `api/asyncapi.yaml` (Doc 05 §20),
+  OpenAPI updated, ADR-005 notes for the two extension endpoints.
+- Console widget: per-answer "Was this helpful?" with reasons, Stop while thinking (S02), Get help link on
+  errors (S08), retention notice (S09), official-link clicks recorded, mobile back button closes the sheet
+  (W02), focus returns to the launcher after any close.
+- Verified in the browser: synonym question answered; not-helpful + reason → "Thanks for the feedback"
+  (backend 204); link click → backend 200 + `chat.handoff.clicked.v1` in the outbox log; backend down → error
+  with Try again + Get help, Try again recovers after restart; 375 px back button closes the sheet and keeps
+  the URL; Escape returns focus. Stop was not exercised live (the fake model answers instantly).
+- Tests: feedback (own turn, enums, free text rejected, other session refused), handoff (approved URL,
+  unknown route refused, event payload), traceparent, synonyms, store conformance for feedback/purge/
+  append-events on memory and Postgres. All 14 packages pass; golden 37/37; drills 5/5.
+- Record: `docs/suivo/docs-01-05-compliance.md`.

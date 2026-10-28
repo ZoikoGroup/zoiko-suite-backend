@@ -861,8 +861,8 @@ func TestSubmitAction_IllegalTransitionEdge_NegativeControl(t *testing.T) {
 		t.Fatalf("failed to decode response JSON: %v", err)
 	}
 
-	if resp["error"] != "invalid_transition" {
-		t.Errorf("expected error = 'invalid_transition', got %v", resp["error"])
+	if resp["code"] != "invalid_transition" {
+		t.Errorf("expected error = 'invalid_transition', got %v", resp["code"])
 	}
 	// Assert mapped to canonical governed reason code from envelope/reason.go
 	if resp["reason_code"] != string(svcenvelope.ReasonRejectPolicyNotMet) {

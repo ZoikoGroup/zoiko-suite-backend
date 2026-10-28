@@ -32,17 +32,14 @@ func (h *Handler) authorizeTarget(w http.ResponseWriter, r *http.Request, princi
 	tenantID, err := h.store.TargetScope(r.Context(), kind, id)
 	if err != nil {
 		if errors.Is(err, domain.ErrChangeNotFound) {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "change_not_found", "id": id})
+			writeError(w, r, http.StatusNotFound, "change_not_found", id)
 			return "", false
 		}
-		h.governedRefusal(w, "", "authorizeTarget", r.Header.Get("X-Correlation-ID"), err)
+		h.governedRefusal(w, r, "", "authorizeTarget", r.Header.Get("X-Correlation-ID"), err)
 		return "", false
 	}
 	if tenantID != nil && *tenantID != callerTenant {
-		writeJSON(w, http.StatusForbidden, map[string]string{
-			"error":   "tenant_scope_mismatch",
-			"message": "the target belongs to another tenant",
-		})
+		writeError(w, r, http.StatusForbidden, "tenant_scope_mismatch", "the target belongs to another tenant")
 		return "", false
 	}
 	action := governedAction("config", tenantID)
@@ -110,10 +107,10 @@ func (h *Handler) ActivateKillSwitch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if missing := req.missingField(); missing != "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": missing})
+		writeError(w, r, http.StatusBadRequest, "missing_field", missing)
 		return
 	}
-	if h.refuseForeignTenant(w, req.TenantID, tenantScope) {
+	if h.refuseForeignTenant(w, r, req.TenantID, tenantScope) {
 		return
 	}
 	action := governedAction("flag", req.TenantID)
@@ -135,7 +132,7 @@ func (h *Handler) ActivateKillSwitch(w http.ResponseWriter, r *http.Request) {
 		CorrelationID:    correlationID,
 	})
 	if err != nil {
-		h.governedRefusal(w, action, "ActivateKillSwitch", correlationID, err)
+		h.governedRefusal(w, r, action, "ActivateKillSwitch", correlationID, err)
 		return
 	}
 	h.metrics.GovernedWrites.WithLabelValues(action, telemetry.WriteCreated).Inc()
@@ -182,7 +179,7 @@ func (h *Handler) RollbackChange(w http.ResponseWriter, r *http.Request) {
 
 	proposed, err := h.store.RollbackChange(r.Context(), changeID, tenantScope, principalID, correlationID)
 	if err != nil {
-		h.governedRefusal(w, action, "RollbackChange", correlationID, err)
+		h.governedRefusal(w, r, action, "RollbackChange", correlationID, err)
 		return
 	}
 	h.metrics.GovernedWrites.WithLabelValues(action, telemetry.WriteCreated).Inc()
@@ -229,7 +226,7 @@ func (h *Handler) CloseEmergencyRetrospective(w http.ResponseWriter, r *http.Req
 		return
 	}
 	if strings.TrimSpace(req.Reference) == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "reference"})
+		writeError(w, r, http.StatusBadRequest, "missing_field", "reference")
 		return
 	}
 	action, ok := h.authorizeTarget(w, r, principalID, tenantScope, "emergency", id)
@@ -239,7 +236,7 @@ func (h *Handler) CloseEmergencyRetrospective(w http.ResponseWriter, r *http.Req
 
 	closed, err := h.store.CloseEmergencyRetrospective(r.Context(), id, req.Reference, tenantScope, principalID)
 	if err != nil {
-		h.governedRefusal(w, action, "CloseEmergencyRetrospective", correlationID, err)
+		h.governedRefusal(w, r, action, "CloseEmergencyRetrospective", correlationID, err)
 		return
 	}
 	h.metrics.GovernedWrites.WithLabelValues(action, telemetry.WriteCreated).Inc()

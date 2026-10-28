@@ -107,7 +107,7 @@ type TreasuryTransfer struct {
 	TenantID            string  `json:"tenant_id"`
 	SourceBankAccountID string  `json:"source_bank_account_id"`
 	TargetBankAccountID string  `json:"target_bank_account_id"`
-	Amount              float64 `json:"amount"`
+	Amount              Decimal `json:"amount"`
 	CurrencyCode        string  `json:"currency_code"`
 	CorrelationID       string  `json:"correlation_id,omitempty"`
 	IsCrossEntity       bool    `json:"is_cross_entity"`
@@ -134,7 +134,7 @@ type TreasuryTransfer struct {
 
 type CreateTreasuryTransferParams struct {
 	TenantID, SourceBankAccountID, TargetBankAccountID string
-	Amount                                             float64
+	Amount                                             Decimal
 	CurrencyCode                                       string
 	IsCrossEntity                                      bool
 	CorrelationID                                      string
@@ -165,12 +165,16 @@ type RejectTreasuryTransferParams struct {
 
 // AmendTreasuryTransferParams: only the maker may amend, and only while
 // still DRAFT. Every protected field is re-suppliable — the store
-// recomputes protected_field_hash from the amended values.
+// recomputes protected_field_hash from the amended values. IsCrossEntity
+// is re-derived by the handler from the amended accounts' legal entities,
+// exactly as CreateTreasuryTransfer derives it, so changing an account
+// can never leave a cross-entity movement classified as same-entity.
 type AmendTreasuryTransferParams struct {
 	TenantID, TransferID                     string
 	SourceBankAccountID, TargetBankAccountID string
-	Amount                                   float64
+	Amount                                   Decimal
 	CurrencyCode                             string
+	IsCrossEntity                            bool
 	ActorPrincipalID                         string
 }
 
@@ -259,11 +263,19 @@ var (
 // encoding mirrors payment-proposal-svc's GetFingerprint exactly:
 // sha256 over the pipe-joined fields, hex-encoded, "sha256:" prefixed.
 // Amount is formatted to 4 decimal places (not proposal-svc's 2) to match
-// this table's own NUMERIC(20,4) precision and protected_field_hash's
-// existing %.4f convention.
+// this table's own NUMERIC(20,4) precision. It is formatted from the exact
+// Decimal, not a float64.
+//
+// Compatibility: the fingerprint is live, never stored by treasury-svc.
+// payment-initiation-adapter-svc re-fetches this endpoint and compares the
+// string it was given, so both sides always use the current algorithm; it
+// does not hardcode the old %.4f rendering. An attempt already prepared
+// before this deploy keeps executing without re-verification. A repeated
+// PrepareAttempt carrying an old fingerprint fails closed rather than
+// silently accepting a different value, which is the safe direction.
 func TransferFingerprint(t *TreasuryTransfer) string {
 	h := sha256.New()
-	fmt.Fprintf(h, "%s|%s|%.4f|%s|%s|%s|%s",
-		t.TransferID, t.Status, t.Amount, t.CurrencyCode, t.SourceBankAccountID, t.TargetBankAccountID, t.CheckerPrincipalID)
+	fmt.Fprintf(h, "%s|%s|%s|%s|%s|%s|%s",
+		t.TransferID, t.Status, t.Amount.MoneyText(), t.CurrencyCode, t.SourceBankAccountID, t.TargetBankAccountID, t.CheckerPrincipalID)
 	return "sha256:" + hex.EncodeToString(h.Sum(nil))
 }

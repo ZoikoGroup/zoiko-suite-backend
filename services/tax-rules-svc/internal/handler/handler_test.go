@@ -157,4 +157,65 @@ func TestUpdateTaxRule(t *testing.T) {
 	if updated.Status != domain.StatusActive {
 		t.Errorf("expected ACTIVE, got %s", updated.Status)
 	}
+
+	// Attempting to update an ACTIVE rule in place must be rejected with 409 Conflict (D2)
+	wConflict := httptest.NewRecorder()
+	anotherRate := 8.00
+	conflictBody := domain.UpdateTaxRuleRequest{
+		TaxRatePercentage: &anotherRate,
+		UpdatedBy:         "tax-admin-01",
+	}
+	r.ServeHTTP(wConflict, buildRequest(http.MethodPut, "/v1/tax-rules/"+created.RuleID, conflictBody))
+	if wConflict.Code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict when updating ACTIVE rule, got %d — %s", wConflict.Code, wConflict.Body.String())
+	}
 }
+
+func TestGetAndListTaxRules_Authz(t *testing.T) {
+	h := newTestHandler()
+	r := chi.NewRouter()
+	RegisterRoutes(r, h)
+
+	// Create a rule
+	body := domain.CreateTaxRuleRequest{
+		JurisdictionID:    "uk-england",
+		RuleCode:          "UK-VAT-REDUCED-5",
+		Name:              "UK Reduced VAT",
+		Category:          domain.CategoryVAT,
+		TaxRatePercentage: 5.0,
+		EffectiveFrom:     "2026-01-01",
+	}
+	wCreate := httptest.NewRecorder()
+	r.ServeHTTP(wCreate, buildRequest(http.MethodPost, "/v1/tax-rules", body))
+	var created domain.TaxRule
+	_ = json.NewDecoder(wCreate.Body).Decode(&created)
+
+	// GET with principal -> 200 OK
+	wGet := httptest.NewRecorder()
+	r.ServeHTTP(wGet, buildRequest(http.MethodGet, "/v1/tax-rules/"+created.RuleID, nil))
+	if wGet.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", wGet.Code)
+	}
+
+	// GET without principal -> 401 Unauthorized
+	reqNoPrincipal := buildRequest(http.MethodGet, "/v1/tax-rules/"+created.RuleID, nil)
+	reqNoPrincipal.Header.Del("X-Principal-Id")
+	wGetNoAuth := httptest.NewRecorder()
+	r.ServeHTTP(wGetNoAuth, reqNoPrincipal)
+	if wGetNoAuth.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", wGetNoAuth.Code)
+	}
+
+	// LIST with principal -> 200 OK
+	wList := httptest.NewRecorder()
+	r.ServeHTTP(wList, buildRequest(http.MethodGet, "/v1/tax-rules", nil))
+	if wList.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", wList.Code)
+	}
+
+	// Attribution test: created_by should be principal-test-01
+	if created.CreatedBy != "principal-test-01" {
+		t.Errorf("expected CreatedBy to be pinned to authenticated principal, got %s", created.CreatedBy)
+	}
+}
+

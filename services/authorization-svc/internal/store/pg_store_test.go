@@ -131,6 +131,9 @@ func setupTestDB(t *testing.T, pool *pgxpool.Pool) {
 		"000031_purge_outbox_and_idempotency.up.sql",
 		"000032_regrant_definer_functions.up.sql",
 		"000033_session_step_up_evidence.up.sql",
+		"000034_break_glass_approval_and_session_evidence.up.sql",
+		"000035_authority_limit_governance.up.sql",
+		"000036_rule_publication_approval.up.sql",
 	}
 	// Three migrations have now been missed from this list. Refuse to run
 	// against a schema the list does not fully describe.
@@ -495,11 +498,9 @@ func TestPgStore_CheckSoDConflict(t *testing.T) {
 	s := store.New(pool, zap.NewNop())
 	ctx := context.Background()
 
-	if _, err := s.CreateSoDRule(ctx, domain.CreateSoDRuleParams{
+	publishSoD(t, s, "", domain.CreateSoDRuleParams{
 		DomainCode: "FINANCE", ActionA: "PAYMENT_INITIATE", ActionB: "PAYMENT_APPROVE", ConflictType: "MUTUALLY_EXCLUSIVE",
-	}); err != nil {
-		t.Fatalf("create sod rule: %v", err)
-	}
+	})
 
 	conflicting, hasConflict, err := s.CheckSoDConflict(ctx, []string{"PAYMENT_INITIATE"}, "PAYMENT_APPROVE", "")
 	if err != nil {
@@ -518,6 +519,42 @@ func TestPgStore_CheckSoDConflict(t *testing.T) {
 	}
 }
 
+// publishSoD proposes a rule and has a second person publish it (000036): a
+// proposed rule denies nothing.
+func publishSoD(t *testing.T, s *store.PgStore, tenant string, p domain.CreateSoDRuleParams) *domain.SoDRule {
+	t.Helper()
+	ctx := context.Background()
+	p.RequestedBy = "it-maker"
+	r, err := s.CreateSoDRule(ctx, p)
+	if err != nil {
+		t.Fatalf("create sod rule: %v", err)
+	}
+	pub, err := s.DecideSoDRuleChange(ctx, r.SoDRuleID, tenant, p.TenantID == nil, "it-checker", true)
+	if err != nil {
+		t.Fatalf("publish sod rule: %v", err)
+	}
+	return pub
+}
+
+// publishABAC: the same for an ABAC rule.
+func publishABAC(t *testing.T, s *store.PgStore, p domain.CreateABACRuleParams) *domain.ABACRule {
+	t.Helper()
+	ctx := context.Background()
+	r, err := s.CreateABACRule(ctx, p)
+	if err != nil {
+		t.Fatalf("create abac rule %s: %v", p.RuleCode, err)
+	}
+	tenant := ""
+	if p.TenantID != nil {
+		tenant = *p.TenantID
+	}
+	pub, err := s.DecideABACRuleChange(ctx, r.ABACRuleID, tenant, p.TenantID == nil, "it-checker", true)
+	if err != nil {
+		t.Fatalf("publish abac rule %s: %v", p.RuleCode, err)
+	}
+	return pub
+}
+
 func TestPgStore_CheckSoDConflict_TenantScoping(t *testing.T) {
 	pool := getTestPool(t)
 	defer pool.Close()
@@ -529,12 +566,10 @@ func TestPgStore_CheckSoDConflict_TenantScoping(t *testing.T) {
 	tenantA := "11111111-1111-1111-1111-111111111111"
 	tenantB := "22222222-2222-2222-2222-222222222222"
 
-	if _, err := s.CreateSoDRule(ctx, domain.CreateSoDRuleParams{
+	publishSoD(t, s, tenantA, domain.CreateSoDRuleParams{
 		DomainCode: "HR", ActionA: "OFFBOARD_INITIATE", ActionB: "OFFBOARD_APPROVE", ConflictType: "MUTUALLY_EXCLUSIVE",
 		TenantID: &tenantA,
-	}); err != nil {
-		t.Fatalf("create tenant-scoped sod rule: %v", err)
-	}
+	})
 
 	// Same principal, same held action, different tenants: tenant A's rule
 	// must apply for tenant A and must NOT leak into tenant B's evaluation.
@@ -581,12 +616,10 @@ func TestPgStore_CheckOwnObjectSoD(t *testing.T) {
 	s := store.New(pool, zap.NewNop())
 	ctx := context.Background()
 
-	if _, err := s.CreateSoDRule(ctx, domain.CreateSoDRuleParams{
+	publishSoD(t, s, "", domain.CreateSoDRuleParams{
 		DomainCode: "AP", ActionA: "AP_INVOICE_APPROVE", ActionB: "AP_INVOICE_APPROVE",
 		ConflictType: domain.ConflictTypeOwnObjectForbidden,
-	}); err != nil {
-		t.Fatalf("create own-object sod rule: %v", err)
-	}
+	})
 
 	forbidden, err := s.CheckOwnObjectSoD(ctx, "AP_INVOICE_APPROVE", "")
 	if err != nil {

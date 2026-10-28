@@ -1,0 +1,1 @@
+DROP INDEX IF EXISTS uq_payment_execution_states_unresolved_source_reference;

@@ -12,6 +12,10 @@ ACC-01 surface completed in the command-per-commit pass — `AmendAccountVersion
 `ActivateAccount`, `ReparentAccount`, `ResolvePostingEligibility`,
 `GetAccountAsOf` (on top of the existing `CreateAccount`, `GetAccount`,
 `ListAccounts`, `DeactivateAccount`). Later ACC-0x surfaces will extend it.
+The 2026-10-26 ACC-14 close-review extension is recorded in A14 and B13.
+The 2026-10-26 ACC-05 `QueryLedger` date-window extension (for
+reconciliation-intelligence-svc's A2a candidate search) is recorded in A15 and
+B14.
 
 Overall: all nine named commands/queries now exist with real guards (cycles,
 optimistic version checks, append-only version history, half-open effective
@@ -134,6 +138,32 @@ The deliberate design decisions a reviewer may want to reverse are B1–B12.
   `/resolve-posting-eligibility` and `/as-of` variants that read the code from
   body/query. An internal alias surface was not added; if a gateway contract
   needs one it should be a routing change, not a second implementation.
+- **A14. The period-state guard is still API-layer only; no database guard.**
+  This service decides HardClosed / CLOSE_REVIEW / SOFT_CLOSE by calling
+  financial-close-svc before create, validate-commit, post, approved-post,
+  adopt and reprocess. There is no database constraint or trigger that refuses
+  a direct INSERT/UPDATE of a journal row into a closed period; a future
+  DB-level guard is financial-close-svc's A5 and is deliberately not fixed
+  here. The new `journal_headers.close_journal_designation` column is part of
+  the row such a guard must consult: a guard that knows only the period state
+  would either refuse a legitimate designated close journal or be too
+  permissive. Migration 000027's down migration refuses while any row still
+  carries a designation, so the evidence cannot be erased while a journal
+  depends on it.
+- **A15. `QueryLedger` has no cursor and returns float amounts.** ACC-05's
+  read contract is a bounded list.
+  - *No cursor.* It is capped at 1000 entries, and a larger `limit` is
+    silently replaced by the default of 200. A reader cannot tell a full
+    page from a truncated one. reconciliation-intelligence-svc therefore
+    asks for exactly 1000 and refuses a full page (422) rather than trust
+    it.
+  - *Float amounts.* `LedgerEntry.debit_amount`/`credit_amount` are float64
+    on the wire. The columns are exact NUMERIC. A reader that needs
+    exactness parses the JSON number text directly, never through float64.
+    That is exact for any amount below about 2^53 minor units; this read
+    does not offer the exact decimal string `LedgerBalance` already does.
+  - *Needed:* a keyset cursor (`after_entry_seq`) and exact decimal strings
+    on `LedgerEntry`.
 
 ## B. Interpretations and additions (decisions a reviewer may want to reverse)
 
@@ -262,7 +292,6 @@ The deliberate design decisions a reviewer may want to reverse are B1–B12.
   `command_idempotency` row counts read directly, cross-command conflict, and a
   stale-version refusal that does not consume the key so the corrected retry
   runs).
-
 - **B13. A1 is answered with entity- and book-scoped account versions, not a re-keyed chart.** The chart stays tenant-wide for what an
   account *is*: its code, type and control nature mean the same thing in every entity of a tenant, and every journal line, ledger entry,
   mapping and join keeps pointing at that one row. Re-keying the identity itself would change every one of those references and
@@ -285,3 +314,77 @@ The deliberate design decisions a reviewer may want to reverse are B1–B12.
   - *Still tenant-level.* Account type, control type, direct-posting restriction and book applicability (`PUT /v1/account-applicability`).
     A1's consequence "two entities cannot hold different versions of the same account code" no longer holds for the facts above; it
     still does for the type.
+- **B14. CLOSE_REVIEW admits a journal-level designated close journal, not a
+  permission-only bypass (closes financial-close-svc A4).** ACC-14's posting
+  table says CLOSE_REVIEW permits "Only designated close journals/workflows"
+  but defines neither the designation nor the mechanism. This service now
+  persists a nullable `journal_headers.close_journal_designation` (migration
+  `000027_add_close_journal_designation`) from a closed allowlist:
+  `ACCRUAL_RECOGNITION` (ACC-07), `PREPAYMENT_RECOGNITION` and
+  `PREPAYMENT_TERMINATION` (ACC-08). Every value must agree with the journal's
+  ACC-03 type — all three are `ACCRUAL` — and the database CHECK repeats that
+  rule. A caller cannot invent a designation; an unrecognised value or a
+  type mismatch is 422 `invalid_close_journal_designation` even in an OPEN
+  period. The designation is not the SOFT_CLOSE override: `SOFT_CLOSE`
+  (`RESTRICTED`) still requires `override_soft_close=true`, a non-empty
+  `soft_close_override_reason`, and `GL_SOFT_CLOSE_POSTING_OVERRIDE`; that
+  override is not a CLOSE_REVIEW mechanism and an ordinary journal carrying it
+  is still refused in CLOSE_REVIEW. During `CLOSE_JOURNALS_ONLY`, a valid
+  designation is honored only when the poster also holds the separate
+  `GL_CLOSE_REVIEW_POSTING` action (registered by access-control-svc migration
+  `000019`), checked at creation, validation-commit, posting, approved posting,
+  adoption and reprocessing. Registration only makes the action authorable; a
+  deployment must still grant it to the principal that posts close journals
+  (financial-close-svc uses the human request principal). A `CLOSED` period
+  returns `ErrPeriodHardClosed` and is never turned into an allowance by a
+  designation.
+  The external refusal for an ordinary non-designated journal in CLOSE_REVIEW
+  remains HTTP 412 `period_locked`, exactly as before; internally the close
+  client now distinguishes `ErrCloseJournalsOnly` from
+  `ErrPeriodHardClosed` so the handler can make the designated-only decision.
+  The created outbox event carries the designation as audit evidence.
+  Verification: handler tests in `internal/handler/close_review_posting_test.go`
+  (ordinary CLOSE_REVIEW refusal, designated create/post, missing action,
+  invalid and type-mismatched designations, hard-closed refusal),
+  `internal/handler/posting_engine_test.go` (ordinary ACC-04 event refusal),
+  `internal/close/client_test.go` (policy mapping), store integration tests in
+  `internal/store/close_journal_designation_store_test.go` (round trip, outbox,
+  DB CHECK, and the guarded down migration refusing while a row depends), and
+  financial-close-svc's `internal/handler/close_journal_meta_test.go` plus
+  `internal/clients/gl_journal_contract_test.go` (request shape for ACC-07/08
+  recognition and termination, SOFT_CLOSE override only in SOFT_CLOSE).
+- **B15. `QueryLedger` gains a transaction-date window and a journal-status
+  filter (2026-10-26).** Added for reconciliation-intelligence-svc's A2a: it
+  proposes the book side of an UNMATCHED bank statement line from one cash
+  account's entries near the statement date. ACC-05 names `QueryLedger` as
+  its read contract, so this extends that route in its existing `?field=`
+  style rather than adding a search route.
+  - *Parameters:* `transaction_date_from` / `transaction_date_to`
+    (YYYY-MM-DD, inclusive, either end optional) and `journal_status`. They
+    are accepted on `/v1/ledger/entries` and on `/v1/ledger/as-of`, which
+    builds the same filter.
+  - *Validation (400):* a malformed date, `from` after `to`, or a status
+    other than FINALIZED or REVERSED.
+  - *Why a status filter:* `ledger_entries` is append-only, so a REVERSED
+    journal's entries stay listed. bank-reconciliation-svc refuses to match
+    a journal that is not FINALIZED, so a reader looking for live postings
+    asks for `journal_status=FINALIZED`. The filter is one EXISTS probe on
+    `journal_headers`' primary key per candidate row, not a second query.
+  - *transaction_date, not posting_date:* the business date of the cash
+    movement is what a bank statement date reflects. posting_date can be
+    the period end of an accrual.
+  - *Index:* migration 000028 adds `idx_ledger_entries_account_txn_date`
+    `(tenant_id, legal_entity_id, account_code, transaction_date)`. The
+    existing scope index puts `book_id` before `account_code` and carries no
+    date.
+  - *Why the down migration has no refusal guard:* the up adds only an
+    index, which holds no data. Dropping it loses nothing a re-run cannot
+    rebuild; the read stays correct, only slower.
+  - *Verification:*
+    - handler tests in `internal/handler/acc05_ledger_test.go`: the filter
+      reaches the store from both routes, and malformed input gets 400;
+    - `internal/store/ledger_window_pg_smoke_test.go` on real Postgres: the
+      window is inclusive at both ends, and FINALIZED drops a reversed
+      journal and keeps its reversal;
+    - 000001–000028 applied from empty with `psql --single-transaction -v
+      ON_ERROR_STOP=1`, and 000028 taken down and up again by hand.

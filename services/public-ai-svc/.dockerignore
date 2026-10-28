@@ -1,0 +1,9 @@
+# Keep test data, local builds and secrets out of the image.
+.env
+*.exe
+*.release.json
+eval-report.json
+**/*_test.go
+testdata/
+internal/e2e/
+internal/store/storetest/

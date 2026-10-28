@@ -61,22 +61,22 @@ func TestPgStore_A9_EveryStateChangeIsRecorded(t *testing.T) {
 		t.Fatalf("CreateEntry: %v", err)
 	}
 	id := entry.IntercompanyEntryID
-	if err := s.AcknowledgeCounterparty(ctx, id, "acker", "corr-ack"); err != nil {
+	if _, err := s.AcknowledgeCounterparty(ctx, id, "k1", "acker", "corr-ack"); err != nil {
 		t.Fatalf("Acknowledge: %v", err)
 	}
 	mismatch(entry, "amount_mismatch: first")
-	if err := s.UpdateMatch(ctx, entry, testAttempt(entry), "matcher", "corr-m1"); err != nil {
+	if _, err := s.UpdateMatch(ctx, entry, testAttempt(entry), "k2", "matcher", "corr-m1"); err != nil {
 		t.Fatalf("UpdateMatch 1: %v", err)
 	}
 	// A second mismatch is a new attempt, not a state change: no new row.
 	mismatch(entry, "amount_mismatch: second")
-	if err := s.UpdateMatch(ctx, entry, testAttempt(entry), "matcher", "corr-m2"); err != nil {
+	if _, err := s.UpdateMatch(ctx, entry, testAttempt(entry), "k3", "matcher", "corr-m2"); err != nil {
 		t.Fatalf("UpdateMatch 2: %v", err)
 	}
-	if err := s.DisputeIntercompany(ctx, id, "disputer", "wrong rate", "corr-dispute"); err != nil {
+	if _, err := s.DisputeIntercompany(ctx, id, "k4", "disputer", "wrong rate", "corr-dispute"); err != nil {
 		t.Fatalf("Dispute: %v", err)
 	}
-	if err := s.ResolveMismatch(ctx, id, "resolver", "corrected on the UK side", domain.ResolutionCorrected, "corr-resolve"); err != nil {
+	if _, err := s.ResolveMismatch(ctx, id, "k5", "resolver", "corrected on the UK side", domain.ResolutionCorrected, "corr-resolve"); err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
 
@@ -127,16 +127,16 @@ func TestPgStore_A9_CloseOnlyFromMatched(t *testing.T) {
 	id := entry.IntercompanyEntryID
 
 	// Not yet matched: an open pair cannot be closed out of view.
-	if err := s.ClosePair(ctx, id, "closer", "too early", "c2"); !errors.Is(err, domain.ErrInvalidPairTransition) {
+	if _, err := s.ClosePair(ctx, id, "k1", "closer", "too early", "c2"); !errors.Is(err, domain.ErrInvalidPairTransition) {
 		t.Fatalf("close from UNMATCHED: expected ErrInvalidPairTransition, got %v", err)
 	}
 
 	targetJ := uuid.New().String()
 	entry.TargetJournalID, entry.MatchStatus, entry.MismatchReason = &targetJ, domain.MatchStatusMatched, nil
-	if err := s.UpdateMatch(ctx, entry, testAttempt(entry), "matcher", "c3"); err != nil {
+	if _, err := s.UpdateMatch(ctx, entry, testAttempt(entry), "k3", "matcher", "c3"); err != nil {
 		t.Fatalf("UpdateMatch: %v", err)
 	}
-	if err := s.ClosePair(ctx, id, "closer", "period 2026-09 consolidated", "c4"); err != nil {
+	if _, err := s.ClosePair(ctx, id, "k4", "closer", "period 2026-09 consolidated", "c4"); err != nil {
 		t.Fatalf("ClosePair: %v", err)
 	}
 
@@ -150,11 +150,11 @@ func TestPgStore_A9_CloseOnlyFromMatched(t *testing.T) {
 	}
 
 	// Terminal: no second close, no re-match.
-	if err := s.ClosePair(ctx, id, "closer", "again", "c5"); !errors.Is(err, domain.ErrInvalidPairTransition) {
+	if _, err := s.ClosePair(ctx, id, "k5", "closer", "again", "c5"); !errors.Is(err, domain.ErrInvalidPairTransition) {
 		t.Fatalf("second close: expected ErrInvalidPairTransition, got %v", err)
 	}
 	entry.MatchStatus = domain.MatchStatusMatched
-	if err := s.UpdateMatch(ctx, entry, testAttempt(entry), "matcher", "c6"); !errors.Is(err, domain.ErrInvalidPairTransition) {
+	if _, err := s.UpdateMatch(ctx, entry, testAttempt(entry), "k6", "matcher", "c6"); !errors.Is(err, domain.ErrInvalidPairTransition) {
 		t.Fatalf("match after close: expected ErrInvalidPairTransition, got %v", err)
 	}
 
@@ -164,7 +164,7 @@ func TestPgStore_A9_CloseOnlyFromMatched(t *testing.T) {
 		{domain.MatchStatusMatched, domain.MatchStatusClosed},
 	})
 
-	if err := s.ClosePair(ctx, uuid.New().String(), "closer", "r", "c7"); !errors.Is(err, domain.ErrEntryNotFound) {
+	if _, err := s.ClosePair(ctx, uuid.New().String(), "k7", "closer", "r", "c7"); !errors.Is(err, domain.ErrEntryNotFound) {
 		t.Fatalf("unknown pair: expected ErrEntryNotFound, got %v", err)
 	}
 }
@@ -180,13 +180,13 @@ func TestPgStore_A9_ResolveRequiresOutcome(t *testing.T) {
 		t.Fatal(err)
 	}
 	mismatch(entry, "x")
-	if err := s.UpdateMatch(ctx, entry, testAttempt(entry), "a", "c"); err != nil {
+	if _, err := s.UpdateMatch(ctx, entry, testAttempt(entry), "k1", "a", "c"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.DisputeIntercompany(ctx, entry.IntercompanyEntryID, "a", "r", "c"); err != nil {
+	if _, err := s.DisputeIntercompany(ctx, entry.IntercompanyEntryID, "k2", "a", "r", "c"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.ResolveMismatch(ctx, entry.IntercompanyEntryID, "a", "n", "", "c"); !errors.Is(err, domain.ErrResolutionOutcomeInvalid) {
+	if _, err := s.ResolveMismatch(ctx, entry.IntercompanyEntryID, "k3", "a", "n", "", "c"); !errors.Is(err, domain.ErrResolutionOutcomeInvalid) {
 		t.Fatalf("expected ErrResolutionOutcomeInvalid, got %v", err)
 	}
 	// And the database refuses a new RESOLVED row without one, whatever wrote it.

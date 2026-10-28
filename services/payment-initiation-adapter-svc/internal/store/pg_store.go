@@ -29,6 +29,12 @@ func isUniqueViolation(err error) bool {
 	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }
 
+// unresolvedSourceReferenceIndex is migration 000007's partial unique index.
+// Naming it here lets PrepareAttempt tell a concurrent duplicate
+// source_reference (return the existing attempt) from a duplicate
+// idempotency_key (same-or-another-tenant replay).
+const unresolvedSourceReferenceIndex = "uq_payment_initiation_attempts_unresolved_source_reference"
+
 type nullString struct{ dest *string }
 
 func (n *nullString) Scan(src interface{}) error {
@@ -47,11 +53,11 @@ type Store interface {
 	FindAttempt(ctx context.Context, attemptID string) (*domain.PaymentInitiationAttempt, error)
 	FindByIdempotencyKey(ctx context.Context, idempotencyKey string) (*domain.PaymentInitiationAttempt, error)
 
-	MarkSubmitted(ctx context.Context, attemptID, providerRequestID, responseRef, principalID string) (*domain.PaymentInitiationAttempt, error)
-	MarkPendingUnknown(ctx context.Context, attemptID, principalID string) (*domain.PaymentInitiationAttempt, error)
-	MarkRejected(ctx context.Context, attemptID, reason, principalID string) (*domain.PaymentInitiationAttempt, error)
+	MarkSubmitted(ctx context.Context, attemptID, providerRequestID, responseRef, principalID, correlationID string) (*domain.PaymentInitiationAttempt, error)
+	MarkPendingUnknown(ctx context.Context, attemptID, principalID, correlationID string) (*domain.PaymentInitiationAttempt, error)
+	MarkRejected(ctx context.Context, attemptID, reason, principalID, correlationID string) (*domain.PaymentInitiationAttempt, error)
 	CancelAttempt(ctx context.Context, attemptID, principalID string) (*domain.PaymentInitiationAttempt, error)
-	QuarantineAttempt(ctx context.Context, attemptID string, req domain.QuarantineRequest, principalID string) (*domain.PaymentInitiationAttempt, error)
+	QuarantineAttempt(ctx context.Context, attemptID string, req domain.QuarantineRequest, principalID, correlationID string) (*domain.PaymentInitiationAttempt, error)
 	ResolveAmbiguous(ctx context.Context, attemptID string, req domain.ResolveAmbiguousRequest, principalID string) (*domain.PaymentInitiationAttempt, error)
 
 	ListEvents(ctx context.Context, attemptID string) ([]domain.AttemptEvent, error)
@@ -145,7 +151,16 @@ func (s *PgStore) enqueueEvent(ctx context.Context, tx pgx.Tx, canonicalType, le
 	return nil
 }
 
+// attemptColumns selects amount as text, so the NUMERIC is read into a
+// domain.Decimal exactly and never through a float (A6). attemptInsertColumns
+// is the same list for an INSERT's column list, where a cast cannot appear.
 const attemptColumns = `
+	attempt_id, tenant_id, legal_entity_id, source_reference, authorization_fingerprint, authorization_id, authorization_source, payer_account_ref,
+	payee_ref, amount::text, currency, execution_date, payment_reference, payer_account_verified, idempotency_key,
+	status, provider_request_id, provider_response_ref, rejection_reason, quarantine_reason,
+	ambiguous_resolution_note, submitted_at, resolved_at, created_by_principal_id, created_at, updated_at`
+
+const attemptInsertColumns = `
 	attempt_id, tenant_id, legal_entity_id, source_reference, authorization_fingerprint, authorization_id, authorization_source, payer_account_ref,
 	payee_ref, amount, currency, execution_date, payment_reference, payer_account_verified, idempotency_key,
 	status, provider_request_id, provider_response_ref, rejection_reason, quarantine_reason,
@@ -171,6 +186,11 @@ func scanAttempt(row pgx.Row) (*domain.PaymentInitiationAttempt, error) {
 // adapter — see internal/domain's package doc. Relies on the migration's
 // unique index on idempotency_key to reject a duplicate.
 func (s *PgStore) PrepareAttempt(ctx context.Context, tenantID string, req domain.PrepareAttemptRequest, principalID, correlationID string) (*domain.PaymentInitiationAttempt, error) {
+	// A6: NUMERIC(18,2) rounds an amount with more places instead of
+	// refusing it, so an amount it cannot hold exactly never reaches it.
+	if _, err := domain.ValidatePositiveAmount(req.Amount); err != nil {
+		return nil, err
+	}
 	id := uuid.New().String()
 	var a *domain.PaymentInitiationAttempt
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
@@ -207,12 +227,12 @@ func (s *PgStore) PrepareAttempt(ctx context.Context, tenantID string, req domai
 		}
 
 		inserted, err := scanAttempt(tx.QueryRow(ctx, `
-			INSERT INTO payment_initiation_attempts (`+attemptColumns+`)
+			INSERT INTO payment_initiation_attempts (`+attemptInsertColumns+`)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'PREPARED', '', '', '', '', '', NULL, NULL, $16, NOW(), NOW())
 			RETURNING `+attemptColumns,
 			id, nullableTenant(tenantID), req.LegalEntityID, req.SourceReference, req.AuthorizationFingerprint,
 			req.AuthorizationID, req.AuthorizationSource,
-			req.PayerAccountRef, req.PayeeRef, req.Amount, req.Currency, req.ExecutionDate, req.PaymentReference,
+			req.PayerAccountRef, req.PayeeRef, string(req.Amount), req.Currency, req.ExecutionDate, req.PaymentReference,
 			req.PayerAccountVerified, req.IdempotencyKey, principalID,
 		))
 		if err != nil {
@@ -236,6 +256,18 @@ func (s *PgStore) PrepareAttempt(ctx context.Context, tenantID string, req domai
 		return a, domain.ErrUnresolvedAttemptExists
 	}
 	if isUniqueViolation(err) {
+		if pgConstraint(err) == unresolvedSourceReferenceIndex {
+			// The pre-insert check and this insert are not atomic without the
+			// index: two concurrent prepares for one source_reference can both
+			// pass the check, and exactly one insert then loses here. Return
+			// the winner, the same answer a sequential retry gets.
+			existing, findErr := s.findUnresolvedBySourceReference(ctx, req.SourceReference)
+			if findErr == nil {
+				return existing, domain.ErrUnresolvedAttemptExists
+			}
+			s.log.Error("pg PrepareAttempt: lost source_reference race but could not find the winner", zap.Error(findErr))
+			return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, findErr)
+		}
 		return nil, domain.ErrDuplicateIdempotencyKey
 	}
 	if err != nil {
@@ -279,7 +311,50 @@ func (s *PgStore) FindByIdempotencyKey(ctx context.Context, idempotencyKey strin
 	return a, nil
 }
 
-func (s *PgStore) MarkSubmitted(ctx context.Context, attemptID, providerRequestID, responseRef, principalID string) (*domain.PaymentInitiationAttempt, error) {
+// findUnresolvedBySourceReference returns the attempt that currently owns a
+// source_reference under Invariant #16, in this tenant's scope.
+func (s *PgStore) findUnresolvedBySourceReference(ctx context.Context, sourceReference string) (*domain.PaymentInitiationAttempt, error) {
+	var a *domain.PaymentInitiationAttempt
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		var err error
+		a, err = scanAttempt(tx.QueryRow(ctx, `
+			SELECT `+attemptColumns+` FROM payment_initiation_attempts
+			WHERE source_reference = $1 AND status IN ('PREPARED', 'SUBMITTING', 'PENDING_UNKNOWN', 'SUBMITTED')
+			LIMIT 1
+		`, sourceReference))
+		return err
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrAttemptNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return a, nil
+}
+
+// attemptTenantString dereferences the nullable tenant for an event envelope.
+func attemptTenantString(a *domain.PaymentInitiationAttempt) string {
+	if a.TenantID == nil {
+		return ""
+	}
+	return *a.TenantID
+}
+
+// attemptEventData is the stable payload of the legacy-stub outcome events.
+// The engine path has its own submittedData; both describe the attempt, not
+// provider internals.
+func attemptEventData(a *domain.PaymentInitiationAttempt, extra map[string]any) map[string]any {
+	d := map[string]any{
+		"attempt_id": a.AttemptID, "status": a.Status, "idempotency_key": a.IdempotencyKey, "currency": a.Currency,
+	}
+	for k, v := range extra {
+		d[k] = v
+	}
+	return d
+}
+
+func (s *PgStore) MarkSubmitted(ctx context.Context, attemptID, providerRequestID, responseRef, principalID, correlationID string) (*domain.PaymentInitiationAttempt, error) {
 	var a *domain.PaymentInitiationAttempt
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
 		var err error
@@ -293,7 +368,12 @@ func (s *PgStore) MarkSubmitted(ctx context.Context, attemptID, providerRequestI
 		if err != nil {
 			return err
 		}
-		return s.recordEvent(ctx, tx, a.TenantID, attemptID, domain.EventPaymentSubmitted, providerRequestID, principalID)
+		if err := s.recordEvent(ctx, tx, a.TenantID, attemptID, domain.EventPaymentSubmitted, providerRequestID, principalID); err != nil {
+			return err
+		}
+		return s.enqueueEvent(ctx, tx, "com.zoikosuite.banking.payment-initiation-attempt.submitted", "PAYMENT_SUBMITTED",
+			"payment-initiation-attempt", attemptID, attemptTenantString(a), a.LegalEntityID, principalID, correlationID,
+			attemptEventData(a, map[string]any{"provider_ref": providerRequestID}))
 	})
 	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		return nil, domain.ErrInvalidTransition
@@ -305,7 +385,7 @@ func (s *PgStore) MarkSubmitted(ctx context.Context, attemptID, providerRequestI
 	return a, nil
 }
 
-func (s *PgStore) MarkPendingUnknown(ctx context.Context, attemptID, principalID string) (*domain.PaymentInitiationAttempt, error) {
+func (s *PgStore) MarkPendingUnknown(ctx context.Context, attemptID, principalID, correlationID string) (*domain.PaymentInitiationAttempt, error) {
 	var a *domain.PaymentInitiationAttempt
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
 		var err error
@@ -318,7 +398,11 @@ func (s *PgStore) MarkPendingUnknown(ctx context.Context, attemptID, principalID
 		if err != nil {
 			return err
 		}
-		return s.recordEvent(ctx, tx, a.TenantID, attemptID, domain.EventSubmissionAmbiguous, "", principalID)
+		if err := s.recordEvent(ctx, tx, a.TenantID, attemptID, domain.EventSubmissionAmbiguous, "", principalID); err != nil {
+			return err
+		}
+		return s.enqueueEvent(ctx, tx, "com.zoikosuite.banking.payment-initiation-attempt.ambiguous", "PAYMENT_SUBMISSION_AMBIGUOUS",
+			"payment-initiation-attempt", attemptID, attemptTenantString(a), a.LegalEntityID, principalID, correlationID, attemptEventData(a, nil))
 	})
 	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		return nil, domain.ErrInvalidTransition
@@ -330,7 +414,7 @@ func (s *PgStore) MarkPendingUnknown(ctx context.Context, attemptID, principalID
 	return a, nil
 }
 
-func (s *PgStore) MarkRejected(ctx context.Context, attemptID, reason, principalID string) (*domain.PaymentInitiationAttempt, error) {
+func (s *PgStore) MarkRejected(ctx context.Context, attemptID, reason, principalID, correlationID string) (*domain.PaymentInitiationAttempt, error) {
 	var a *domain.PaymentInitiationAttempt
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
 		var err error
@@ -343,7 +427,12 @@ func (s *PgStore) MarkRejected(ctx context.Context, attemptID, reason, principal
 		if err != nil {
 			return err
 		}
-		return s.recordEvent(ctx, tx, a.TenantID, attemptID, domain.EventSubmissionRejected, reason, principalID)
+		if err := s.recordEvent(ctx, tx, a.TenantID, attemptID, domain.EventSubmissionRejected, reason, principalID); err != nil {
+			return err
+		}
+		return s.enqueueEvent(ctx, tx, "com.zoikosuite.banking.payment-initiation-attempt.rejected", "PAYMENT_SUBMISSION_REJECTED",
+			"payment-initiation-attempt", attemptID, attemptTenantString(a), a.LegalEntityID, principalID, correlationID,
+			attemptEventData(a, map[string]any{"reason": reason}))
 	})
 	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		return nil, domain.ErrInvalidTransition
@@ -380,7 +469,7 @@ func (s *PgStore) CancelAttempt(ctx context.Context, attemptID, principalID stri
 	return a, nil
 }
 
-func (s *PgStore) QuarantineAttempt(ctx context.Context, attemptID string, req domain.QuarantineRequest, principalID string) (*domain.PaymentInitiationAttempt, error) {
+func (s *PgStore) QuarantineAttempt(ctx context.Context, attemptID string, req domain.QuarantineRequest, principalID, correlationID string) (*domain.PaymentInitiationAttempt, error) {
 	var a *domain.PaymentInitiationAttempt
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
 		var err error
@@ -393,7 +482,12 @@ func (s *PgStore) QuarantineAttempt(ctx context.Context, attemptID string, req d
 		if err != nil {
 			return err
 		}
-		return s.recordEvent(ctx, tx, a.TenantID, attemptID, domain.EventAttemptQuarantined, req.Reason, principalID)
+		if err := s.recordEvent(ctx, tx, a.TenantID, attemptID, domain.EventAttemptQuarantined, req.Reason, principalID); err != nil {
+			return err
+		}
+		return s.enqueueEvent(ctx, tx, "com.zoikosuite.banking.payment-initiation-attempt.quarantined", domain.EventAttemptQuarantined,
+			"payment-initiation-attempt", attemptID, attemptTenantString(a), a.LegalEntityID, principalID, correlationID,
+			attemptEventData(a, map[string]any{"reason": req.Reason}))
 	})
 	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		return nil, domain.ErrInvalidTransition

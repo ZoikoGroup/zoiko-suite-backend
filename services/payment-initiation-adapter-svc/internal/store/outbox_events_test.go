@@ -4,6 +4,7 @@ package store_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -49,7 +50,7 @@ func TestPgStore_PrepareAttempt_EnqueuesPreparedEvent(t *testing.T) {
 
 	attempt, err := testStore.PrepareAttempt(ctx, tenantID, domain.PrepareAttemptRequest{
 		LegalEntityID: legalEntityID, PayerAccountRef: "acct-src", PayeeRef: "acct-dst",
-		Amount: 100.00, Currency: "USD", ExecutionDate: time.Now().Add(24 * time.Hour),
+		Amount: "100.00", Currency: "USD", ExecutionDate: time.Now().Add(24 * time.Hour),
 		PayerAccountVerified: true, IdempotencyKey: "corr-outbox-1",
 	}, "maker-1", "corr-outbox-1")
 	require.NoError(t, err)
@@ -72,7 +73,7 @@ func TestPgStore_PrepareAttempt_IdempotentReplay_NoReEnqueue(t *testing.T) {
 	first, err := testStore.PrepareAttempt(ctx, tenantID, domain.PrepareAttemptRequest{
 		LegalEntityID: legalEntityID, SourceReference: sourceRef,
 		PayerAccountRef: "acct-src", PayeeRef: "acct-dst",
-		Amount: 75.00, Currency: "USD", ExecutionDate: time.Now().Add(24 * time.Hour),
+		Amount: "75.00", Currency: "USD", ExecutionDate: time.Now().Add(24 * time.Hour),
 		PayerAccountVerified: true, IdempotencyKey: "corr-replay-1",
 	}, "maker-1", "corr-replay-1")
 	require.NoError(t, err)
@@ -86,7 +87,7 @@ func TestPgStore_PrepareAttempt_IdempotentReplay_NoReEnqueue(t *testing.T) {
 	second, err := testStore.PrepareAttempt(ctx, tenantID, domain.PrepareAttemptRequest{
 		LegalEntityID: legalEntityID, SourceReference: sourceRef,
 		PayerAccountRef: "acct-src", PayeeRef: "acct-dst",
-		Amount: 75.00, Currency: "USD", ExecutionDate: time.Now().Add(24 * time.Hour),
+		Amount: "75.00", Currency: "USD", ExecutionDate: time.Now().Add(24 * time.Hour),
 		PayerAccountVerified: true, IdempotencyKey: "corr-replay-2",
 	}, "maker-1", "corr-replay-2")
 	require.ErrorIs(t, err, domain.ErrUnresolvedAttemptExists)
@@ -95,4 +96,55 @@ func TestPgStore_PrepareAttempt_IdempotentReplay_NoReEnqueue(t *testing.T) {
 
 	gotAfterRetry := outboxEventCount(t, ctx, tenantID, first.AttemptID, "payment-initiation-attempt.prepared")
 	assert.Equal(t, 1, gotAfterRetry, "a retry returning ErrUnresolvedAttemptExists must not re-enqueue PAYMENT_INITIATION_PREPARED")
+}
+
+// TestPgStore_LegacyStub_OutcomeEventsWithCorrelation proves the legacy stub
+// path (no provider_key, no INT-07 engine) publishes the same outcome events
+// the engine path does, atomically with the state change and carrying the
+// caller's correlation id. Before this, only the engine's FinishSend wrote
+// the outbox; a stub submission was invisible to every downstream consumer.
+func TestPgStore_LegacyStub_OutcomeEventsWithCorrelation(t *testing.T) {
+	tenantID := uuid.New().String()
+	ctx := middleware.WithTenant(context.Background(), tenantID)
+
+	prepare := func(key string) *domain.PaymentInitiationAttempt {
+		a, err := testStore.PrepareAttempt(ctx, tenantID, domain.PrepareAttemptRequest{
+			LegalEntityID: uuid.New().String(), PayerAccountRef: "acct-src", PayeeRef: "acct-dst",
+			Amount: "15.00", Currency: "USD", ExecutionDate: time.Now().Add(24 * time.Hour),
+			PayerAccountVerified: true, IdempotencyKey: key,
+		}, "maker-1", "corr-"+key)
+		require.NoError(t, err)
+		return a
+	}
+	assertEvent := func(a *domain.PaymentInitiationAttempt, suffix, correlationID string) {
+		t.Helper()
+		assert.Equal(t, 1, outboxEventCount(t, ctx, tenantID, a.AttemptID, suffix))
+		var payload string
+		require.NoError(t, testPool.QueryRow(ctx, `
+			SELECT convert_from(payload, 'UTF8') FROM eventing_outbox
+			WHERE tenant_id = $1 AND aggregate_id = $2 AND event_type LIKE $3 LIMIT 1`,
+			tenantID, a.AttemptID, "%"+suffix).Scan(&payload))
+		assert.True(t, strings.Contains(payload, correlationID),
+			"event %s must carry correlation id %s, payload: %s", suffix, correlationID, payload)
+	}
+
+	submitted := prepare("legacy-submitted")
+	_, err := testStore.MarkSubmitted(ctx, submitted.AttemptID, "prv-1", "resp-1", "maker-1", "corr-legacy-submitted")
+	require.NoError(t, err)
+	assertEvent(submitted, "payment-initiation-attempt.submitted", "corr-legacy-submitted")
+
+	pending := prepare("legacy-ambiguous")
+	_, err = testStore.MarkPendingUnknown(ctx, pending.AttemptID, "maker-1", "corr-legacy-ambiguous")
+	require.NoError(t, err)
+	assertEvent(pending, "payment-initiation-attempt.ambiguous", "corr-legacy-ambiguous")
+
+	rejected := prepare("legacy-rejected")
+	_, err = testStore.MarkRejected(ctx, rejected.AttemptID, "profile cannot carry it", "maker-1", "corr-legacy-rejected")
+	require.NoError(t, err)
+	assertEvent(rejected, "payment-initiation-attempt.rejected", "corr-legacy-rejected")
+
+	quarantined := prepare("legacy-quarantined")
+	_, err = testStore.QuarantineAttempt(ctx, quarantined.AttemptID, domain.QuarantineRequest{Reason: "operator review"}, "maker-1", "corr-legacy-quarantined")
+	require.NoError(t, err)
+	assertEvent(quarantined, "payment-initiation-attempt.quarantined", "corr-legacy-quarantined")
 }

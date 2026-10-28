@@ -1,0 +1,133 @@
+asyncapi: 3.0.0
+info:
+  title: public-ai-svc events (zoikosuite-public-ai)
+  version: "1.0"
+  description: >
+    The six R0 events (Doc 05 §21), CloudEvents 1.0 structured JSON, published at-least-once from a
+    transactional outbox (Doc 05 §20). Consumers must be idempotent on the CloudEvents id, tolerate
+    out-of-order delivery and re-check the revocation epoch on replay. Payloads carry identifiers, enums
+    and coarse buckets only, never visitor text, prompts, model output, grants or contact data. Events that
+    fail 10 times are diverted to "<topic>.dlq". The browser never publishes events.
+defaultContentType: application/cloudevents+json
+channels:
+  telemetry:
+    address: publicai.telemetry.v1
+    messages:
+      turnCompleted: {$ref: "#/components/messages/turnCompleted"}
+      handoffClicked: {$ref: "#/components/messages/handoffClicked"}
+      securitySignal: {$ref: "#/components/messages/securitySignal"}
+  control:
+    address: publicai.control.v1
+    messages:
+      killSwitchChanged: {$ref: "#/components/messages/killSwitchChanged"}
+  governance:
+    address: kb.governance.v1
+    messages:
+      releasePromoted: {$ref: "#/components/messages/releasePromoted"}
+      sourceRevoked: {$ref: "#/components/messages/sourceRevoked"}
+operations:
+  publishTelemetry:
+    action: send
+    channel: {$ref: "#/channels/telemetry"}
+  publishControl:
+    action: send
+    channel: {$ref: "#/channels/control"}
+  publishGovernance:
+    action: send
+    channel: {$ref: "#/channels/governance"}
+components:
+  schemas:
+    envelope:
+      type: object
+      required: [specversion, id, source, type, time, datacontenttype, data]
+      properties:
+        specversion: {const: "1.0"}
+        id: {type: string, description: Unique per event; the idempotency key for consumers}
+        source: {const: "urn:zoikosuite:publicai:orchestrator"}
+        type: {type: string}
+        time: {type: string, format: date-time}
+        datacontenttype: {const: application/json}
+  messages:
+    turnCompleted:
+      name: chat.turn.completed.v1
+      payload:
+        allOf:
+          - {$ref: "#/components/schemas/envelope"}
+          - properties:
+              data:
+                type: object
+                additionalProperties: false
+                properties:
+                  request_id: {type: string}
+                  intent_id: {type: string}
+                  status: {type: string, enum: [ANSWERED, CLARIFY, REFUSED_ACTION, ABSTAIN, HANDOFF, UNAVAILABLE]}
+                  latency_bucket: {type: string, enum: ["<2s", "2s-5s", "5s-15s", ">15s"]}
+                  release_id: {type: string}
+    handoffClicked:
+      name: chat.handoff.clicked.v1
+      summary: A visitor opened an official route. Never means a case, ticket, lead or booking exists.
+      payload:
+        allOf:
+          - {$ref: "#/components/schemas/envelope"}
+          - properties:
+              data:
+                type: object
+                additionalProperties: false
+                properties:
+                  route_key: {type: string}
+                  market_code_if_explicit: {type: string}
+                  consent_flag: {type: boolean}
+    securitySignal:
+      name: chat.security.signal.v1
+      payload:
+        allOf:
+          - {$ref: "#/components/schemas/envelope"}
+          - properties:
+              data:
+                type: object
+                additionalProperties: false
+                properties:
+                  reason_class: {type: string, enum: [PROMPT_INJECTION, SENSITIVE_INPUT, SECURITY_REPORT]}
+                  request_id: {type: string}
+                  severity: {type: string}
+    killSwitchChanged:
+      name: publicai.kill_switch.changed.v1
+      payload:
+        allOf:
+          - {$ref: "#/components/schemas/envelope"}
+          - properties:
+              data:
+                type: object
+                additionalProperties: false
+                properties:
+                  flag: {type: string}
+                  actor_ref: {type: string}
+                  approval_ref: {type: string}
+                  environment: {type: string}
+    releasePromoted:
+      name: kb.release.promoted.v1
+      payload:
+        allOf:
+          - {$ref: "#/components/schemas/envelope"}
+          - properties:
+              data:
+                type: object
+                additionalProperties: false
+                properties:
+                  release_id: {type: string}
+                  signer_refs: {type: array, items: {type: string}}
+                  digest: {type: string}
+                  effective_at: {type: string, format: date-time}
+    sourceRevoked:
+      name: kb.source.revoked.v1
+      payload:
+        allOf:
+          - {$ref: "#/components/schemas/envelope"}
+          - properties:
+              data:
+                type: object
+                additionalProperties: false
+                properties:
+                  source_version_id: {type: string}
+                  reason_code: {type: string}
+                  effective_at: {type: string, format: date-time}

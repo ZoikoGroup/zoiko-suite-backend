@@ -956,7 +956,7 @@ func (h *Handler) PollInstructionStatus(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
-	state, err := h.status.GetStatus(r.Context(), verifiedTenant, ins.Bnk07PaymentID)
+	state, err := h.status.GetStatus(r.Context(), verifiedTenant, principalID, ins.Bnk07PaymentID)
 	if err != nil {
 		h.log.Error("PollInstructionStatus: payment-status-svc lookup failed", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, domain.ErrPaymentStatusUnavailable.Error())

@@ -115,8 +115,8 @@ func decodeError(t *testing.T, rr *httptest.ResponseRecorder) map[string]any {
 	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
 		t.Fatalf("failed to decode error body: %v", err)
 	}
-	if body["error"] != body["code"] {
-		t.Errorf("expected legacy error alias to equal code, got error=%v code=%v", body["error"], body["code"])
+			if body["code"] == "" {
+			t.Errorf("expected code field present, got code=%v", body["code"])
 	}
 	return body
 }
@@ -127,8 +127,8 @@ func decodeError(t *testing.T, rr *httptest.ResponseRecorder) map[string]any {
 func requireMissingField(t *testing.T, rr *httptest.ResponseRecorder, field string) {
 	t.Helper()
 	body := decodeError(t, rr)
-	if body["error"] != "missing_field" {
-		t.Fatalf("expected error=missing_field, got %v", body)
+			if body["code"] != "missing_field" {
+		t.Fatalf("expected code=missing_field, got %v", body)
 	}
 	errs, ok := body["errors"].([]any)
 	if !ok || len(errs) != 1 {
@@ -211,8 +211,8 @@ func TestAdminRoutes_401_WithoutPrincipal(t *testing.T) {
 			if rr.Code != http.StatusUnauthorized {
 				t.Fatalf("expected 401 without a principal, got %d — body: %s", rr.Code, rr.Body.String())
 			}
-			if got := decodeError(t, rr)["error"]; got != "missing_principal" {
-				t.Errorf("expected error=missing_principal, got %q", got)
+			if got := decodeError(t, rr)["code"]; got != "missing_principal" {
+				t.Errorf("expected code=missing_principal, got %q", got)
 			}
 			if st.storeCalled {
 				t.Error("FAIL: an unauthenticated request reached the store")
@@ -292,8 +292,8 @@ func TestAdminRoutes_503_AuthzUnavailableFailsClosed(t *testing.T) {
 			if rr.Code != http.StatusServiceUnavailable {
 				t.Fatalf("expected 503, got %d — body: %s", rr.Code, rr.Body.String())
 			}
-			if got := decodeError(t, rr)["error"]; got != "authz_unavailable" {
-				t.Errorf("expected error=authz_unavailable, got %q", got)
+			if got := decodeError(t, rr)["code"]; got != "authz_unavailable" {
+				t.Errorf("expected code=authz_unavailable, got %q", got)
 			}
 			if st.storeCalled {
 				t.Error("FAIL: a request reached the store without an authorization decision")
@@ -354,8 +354,8 @@ func TestCreateJurisdiction_409_Conflict(t *testing.T) {
 	if rr.Code != http.StatusConflict {
 		t.Fatalf("expected 409, got %d", rr.Code)
 	}
-	if got := decodeError(t, rr)["error"]; got != "conflict" {
-		t.Fatalf("expected error=conflict, got %q", got)
+	if got := decodeError(t, rr)["code"]; got != "conflict" {
+		t.Fatalf("expected code=conflict, got %q", got)
 	}
 }
 
@@ -372,8 +372,8 @@ func TestCreateJurisdiction_404_ParentNotFound(t *testing.T) {
 	if rr.Code != http.StatusNotFound {
 		t.Fatalf("expected 404, got %d — body: %s", rr.Code, rr.Body.String())
 	}
-	if got := decodeError(t, rr)["error"]; got != "parent_jurisdiction_not_found" {
-		t.Errorf("expected error=parent_jurisdiction_not_found, got %q", got)
+	if got := decodeError(t, rr)["code"]; got != "parent_jurisdiction_not_found" {
+		t.Errorf("expected code=parent_jurisdiction_not_found, got %q", got)
 	}
 }
 
@@ -400,8 +400,8 @@ func TestCreateJurisdiction_400_OverLengthFields(t *testing.T) {
 			if rr.Code != http.StatusBadRequest {
 				t.Fatalf("expected 400 for over-length %s, got %d — body: %s", tc.field, rr.Code, rr.Body.String())
 			}
-			if got := decodeError(t, rr)["error"]; got != tc.code {
-				t.Errorf("expected error=%s, got %q", tc.code, got)
+			if got := decodeError(t, rr)["code"]; got != tc.code {
+				t.Errorf("expected code=%s, got %q", tc.code, got)
 			}
 			if st.storeCalled {
 				t.Error("an over-length create reached the store")
@@ -422,8 +422,8 @@ func TestCreateJurisdiction_400_InputTooLongNet(t *testing.T) {
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for a 22001 store failure, got %d — body: %s", rr.Code, rr.Body.String())
 	}
-	if got := decodeError(t, rr)["error"]; got != "input_too_long" {
-		t.Errorf("expected error=input_too_long, got %q", got)
+	if got := decodeError(t, rr)["code"]; got != "input_too_long" {
+		t.Errorf("expected code=input_too_long, got %q", got)
 	}
 }
 
@@ -490,8 +490,8 @@ func TestCreateJurisdiction_400_InvertedEffectivePeriod(t *testing.T) {
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d — body: %s", rr.Code, rr.Body.String())
 	}
-	if got := decodeError(t, rr)["error"]; got != "invalid_effective_period" {
-		t.Errorf("expected error=invalid_effective_period, got %q", got)
+	if got := decodeError(t, rr)["code"]; got != "invalid_effective_period" {
+		t.Errorf("expected code=invalid_effective_period, got %q", got)
 	}
 	if st.storeCalled {
 		t.Error("an invalid effective period reached the store")
@@ -630,8 +630,8 @@ func TestCreateRule_409_OverlappingRule(t *testing.T) {
 	if rr.Code != http.StatusConflict {
 		t.Fatalf("expected 409, got %d", rr.Code)
 	}
-	if got := decodeError(t, rr)["error"]; got != "overlapping_rule" {
-		t.Errorf("expected error=overlapping_rule, got %q", got)
+	if got := decodeError(t, rr)["code"]; got != "overlapping_rule" {
+		t.Errorf("expected code=overlapping_rule, got %q", got)
 	}
 }
 
@@ -644,8 +644,8 @@ func TestCreateRule_404_JurisdictionNotFound(t *testing.T) {
 	if rr.Code != http.StatusNotFound {
 		t.Fatalf("expected 404, got %d", rr.Code)
 	}
-	if got := decodeError(t, rr)["error"]; got != "jurisdiction_not_found" {
-		t.Errorf("expected error=jurisdiction_not_found, got %q", got)
+	if got := decodeError(t, rr)["code"]; got != "jurisdiction_not_found" {
+		t.Errorf("expected code=jurisdiction_not_found, got %q", got)
 	}
 }
 
@@ -689,8 +689,8 @@ func TestCreateRule_400_OverLengthFields(t *testing.T) {
 			if rr.Code != http.StatusBadRequest {
 				t.Fatalf("expected 400 for over-length %s, got %d — body: %s", tc.field, rr.Code, rr.Body.String())
 			}
-			if got := decodeError(t, rr)["error"]; got != tc.code {
-				t.Errorf("expected error=%s, got %q", tc.code, got)
+			if got := decodeError(t, rr)["code"]; got != tc.code {
+				t.Errorf("expected code=%s, got %q", tc.code, got)
 			}
 			if st.storeCalled {
 				t.Error("an over-length create reached the store")
@@ -715,8 +715,8 @@ func TestCreateRule_400_RejectsNonCreateableStatus(t *testing.T) {
 			if rr.Code != http.StatusBadRequest {
 				t.Fatalf("expected 400 for rule_status=%q, got %d — body: %s", status, rr.Code, rr.Body.String())
 			}
-			if got := decodeError(t, rr)["error"]; got != "invalid_rule_status" {
-				t.Errorf("expected error=invalid_rule_status, got %q", got)
+			if got := decodeError(t, rr)["code"]; got != "invalid_rule_status" {
+				t.Errorf("expected code=invalid_rule_status, got %q", got)
 			}
 			if st.storeCalled {
 				t.Error("a rule with an uncreateable status reached the store")
@@ -920,8 +920,8 @@ func TestTransitionRuleStatus_400_UnrecognizedTargetStatus(t *testing.T) {
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d", rr.Code)
 	}
-	if got := decodeError(t, rr)["error"]; got != "invalid_status" {
-		t.Fatalf("expected error=invalid_status, got %q", got)
+	if got := decodeError(t, rr)["code"]; got != "invalid_status" {
+		t.Fatalf("expected code=invalid_status, got %q", got)
 	}
 }
 
@@ -934,8 +934,8 @@ func TestTransitionRuleStatus_409_InvalidTransition(t *testing.T) {
 	if rr.Code != http.StatusConflict {
 		t.Fatalf("expected 409, got %d", rr.Code)
 	}
-	if got := decodeError(t, rr)["error"]; got != "invalid_transition" {
-		t.Fatalf("expected error=invalid_transition, got %q", got)
+	if got := decodeError(t, rr)["code"]; got != "invalid_transition" {
+		t.Fatalf("expected code=invalid_transition, got %q", got)
 	}
 }
 
@@ -948,8 +948,8 @@ func TestTransitionRuleStatus_404_RuleNotFound(t *testing.T) {
 	if rr.Code != http.StatusNotFound {
 		t.Fatalf("expected 404, got %d", rr.Code)
 	}
-	if got := decodeError(t, rr)["error"]; got != "rule_not_found" {
-		t.Fatalf("expected error=rule_not_found, got %q", got)
+	if got := decodeError(t, rr)["code"]; got != "rule_not_found" {
+		t.Fatalf("expected code=rule_not_found, got %q", got)
 	}
 }
 
@@ -1034,8 +1034,8 @@ func TestRecordDrift_400_InvalidState(t *testing.T) {
 			if rr.Code != http.StatusBadRequest {
 				t.Fatalf("expected 400 for drift_state=%q, got %d", state, rr.Code)
 			}
-			if got := decodeError(t, rr)["error"]; got != "invalid_drift_state" {
-				t.Errorf("expected error=invalid_drift_state, got %q", got)
+			if got := decodeError(t, rr)["code"]; got != "invalid_drift_state" {
+				t.Errorf("expected code=invalid_drift_state, got %q", got)
 			}
 			if st.storeCalled {
 				t.Error("an invalid drift state reached the store")

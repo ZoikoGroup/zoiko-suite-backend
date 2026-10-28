@@ -57,19 +57,19 @@ func (h *Handler) Use(w http.ResponseWriter, r *http.Request) {
 	}
 	for f, v := range map[string]string{"requested_by_principal_id": req.RequestedByPrincipalID, "request_id": req.RequestID} {
 		if v == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": f})
+			writeError(w, r, http.StatusBadRequest, "missing_field", f)
 			return
 		}
 	}
 	if req.SecretPath == "" && req.SecretPolicyID == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "secret_path"})
+		writeError(w, r, http.StatusBadRequest, "missing_field", "secret_path")
 		return
 	}
 	tenantScope, ok := h.requireTenant(w, r)
 	if !ok {
 		return
 	}
-	if h.refuseForeignTenant(w, req.TenantID, tenantScope) {
+	if h.refuseForeignTenant(w, r, req.TenantID, tenantScope) {
 		return
 	}
 	req.TenantID = &tenantScope
@@ -92,7 +92,7 @@ func (h *Handler) Use(w http.ResponseWriter, r *http.Request) {
 	if req.RequestedByPrincipalID != env.Actor() {
 		deny("", nil, "requested_by_principal_id does not match the gateway-verified envelope identity", env.Actor())
 		h.metrics.BrokerDecision("use_denied")
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "workload_identity_mismatch", "secret_path": req.SecretPath})
+		writeError(w, r, http.StatusForbidden, "workload_identity_mismatch", req.SecretPath)
 		return
 	}
 
@@ -102,10 +102,10 @@ func (h *Handler) Use(w http.ResponseWriter, r *http.Request) {
 			if errors.Is(perr, domain.ErrSecretPolicyNotFound) || isInvalidID(perr) {
 				deny("", nil, "no secret policy with that id", req.RequestedByPrincipalID)
 				h.metrics.BrokerDecision("use_no_policy")
-				writeJSON(w, http.StatusNotFound, map[string]string{"error": "no_applicable_secret_policy"})
+				writeError(w, r, http.StatusNotFound, "no_applicable_secret_policy", "")
 			} else {
 				h.log.Error("Use: store unavailable resolving policy id", zap.String("correlation_id", correlationID), zap.Error(perr))
-				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+				writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
 			}
 			return
 		}
@@ -118,11 +118,11 @@ func (h *Handler) Use(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, domain.ErrSecretPolicyNotFound), errors.Is(err, domain.ErrSecretPolicyVersionNotFound):
 			deny("", nil, "no applicable secret policy for this path/scope", req.RequestedByPrincipalID)
 			h.metrics.BrokerDecision("use_no_policy")
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "no_applicable_secret_policy", "secret_path": req.SecretPath})
+			writeError(w, r, http.StatusNotFound, "no_applicable_secret_policy", req.SecretPath)
 		default:
 			h.log.Error("Use: store unavailable resolving policy", zap.String("correlation_id", correlationID), zap.Error(err))
 			h.metrics.BrokerDecision("use_error")
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
 		}
 		return
 	}
@@ -130,20 +130,20 @@ func (h *Handler) Use(w http.ResponseWriter, r *http.Request) {
 	if applicable.SecretClass != ProviderCredentialClass && applicable.SecretClass != CallbackSecretClass {
 		deny(applicable.SecretClass, &spv, "secret class may not be returned by the use operation", req.RequestedByPrincipalID)
 		h.metrics.BrokerDecision("use_denied")
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "not_a_usable_secret", "secret_path": req.SecretPath})
+		writeError(w, r, http.StatusForbidden, "not_a_usable_secret", req.SecretPath)
 		return
 	}
 	var allowed []string
 	if err := json.Unmarshal(applicable.AllowedWorkloadIDs, &allowed); err != nil {
 		h.log.Error("Use: policy version has invalid allowed_workload_ids", zap.String("secret_policy_version_id", spv), zap.Error(err))
 		h.metrics.BrokerDecision("use_error")
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "invalid_policy_payload"})
+		writeError(w, r, http.StatusInternalServerError, "invalid_policy_payload", "")
 		return
 	}
 	if !contains(allowed, req.RequestedByPrincipalID) {
 		deny(applicable.SecretClass, &spv, "requesting principal not in allowed_workload_ids", req.RequestedByPrincipalID)
 		h.metrics.BrokerDecision("use_denied")
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "access_denied", "secret_path": req.SecretPath})
+		writeError(w, r, http.StatusForbidden, "access_denied", req.SecretPath)
 		return
 	}
 
@@ -152,7 +152,7 @@ func (h *Handler) Use(w http.ResponseWriter, r *http.Request) {
 		h.log.Error("Use: vault backend unavailable", zap.String("secret_path", applicable.SecretPath), zap.Error(err))
 		h.metrics.VaultBackendError("get")
 		h.metrics.BrokerDecision("use_vault_error")
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "vault_backend_unavailable"})
+		writeError(w, r, http.StatusServiceUnavailable, "vault_backend_unavailable", "")
 		return
 	}
 	encoded := base64.StdEncoding.EncodeToString(material)
@@ -169,7 +169,7 @@ func (h *Handler) Use(w http.ResponseWriter, r *http.Request) {
 	}); err != nil {
 		h.log.Error("Use: failed to record USED audit entry; withholding the credential", zap.String("correlation_id", correlationID), zap.Error(err))
 		h.metrics.BrokerDecision("use_error")
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "audit_unavailable"})
+		writeError(w, r, http.StatusServiceUnavailable, "audit_unavailable", "")
 		return
 	}
 	h.metrics.BrokerDecision("use_granted")
@@ -184,3 +184,4 @@ func (h *Handler) Use(w http.ResponseWriter, r *http.Request) {
 func isInvalidID(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "invalid input syntax for type uuid")
 }
+

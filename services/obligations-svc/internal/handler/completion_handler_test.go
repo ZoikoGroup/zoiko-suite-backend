@@ -56,7 +56,7 @@ func problem(t *testing.T, w *httptest.ResponseRecorder) map[string]any {
 	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
 		t.Fatalf("problem body: %v", err)
 	}
-	for _, k := range []string{"type", "title", "status", "code", "error"} {
+	for _, k := range []string{"type", "title", "status", "code"} {
 		if _, ok := body[k]; !ok {
 			t.Fatalf("problem document has no %q: %v", k, body)
 		}
@@ -87,7 +87,7 @@ func TestCreateObligation_LegalEntityMustExistInTenant(t *testing.T) {
 			if w.Code != tc.wantCode {
 				t.Fatalf("status %d, want %d: %s", w.Code, tc.wantCode, w.Body.String())
 			}
-			if got := problem(t, w)["error"]; got != tc.wantErr {
+			if got := problem(t, w)["code"]; got != tc.wantErr {
 				t.Fatalf("error %v, want %s", got, tc.wantErr)
 			}
 			if len(reg.calls) != 1 || reg.calls[0] != testTenant+"/le-1" {
@@ -122,7 +122,7 @@ func TestUpdateObligationStatus_UnknownValueIs400Not409(t *testing.T) {
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("status %d, want 400: %s", w.Code, w.Body.String())
 	}
-	if problem(t, w)["error"] != "invalid_field" {
+	if problem(t, w)["code"] != "invalid_field" {
 		t.Fatalf("body %s", w.Body.String())
 	}
 }
@@ -134,13 +134,13 @@ func TestErrorsCarryTheStableClass(t *testing.T) {
 	if w.Code != http.StatusPreconditionFailed {
 		t.Fatalf("status %d: %s", w.Code, w.Body.String())
 	}
-	if c := problem(t, w)["error_class"]; c != "CONCURRENCY_CONFLICT" {
-		t.Fatalf("error_class = %v, want CONCURRENCY_CONFLICT (§16)", c)
+	if c := problem(t, w)["code"]; c != "VERSION_MISMATCH" {
+		t.Fatalf("code = %v, want VERSION_MISMATCH (§16)", c)
 	}
 	denied := do(t, completionRouter(&stubStore{findObligation: existing()}, &stubRegistry{}, &stubAuthz{err: domain.ErrAuthorizationDenied}),
 		http.MethodGet, "/v1/obligations/"+existing().ObligationID, "", nil)
-	if c := problem(t, denied)["error_class"]; c != "AUTHORIZATION_DENIED" {
-		t.Fatalf("403 error_class = %v", c)
+	if c := problem(t, denied)["code"]; c != "forbidden" {
+		t.Fatalf("403 code = %v", c)
 	}
 }
 
@@ -237,7 +237,7 @@ func TestApplicability_ValidationReplayAndLocation(t *testing.T) {
 		t.Fatal("the store was given no request hash to compare a retry against")
 	}
 	s.applicabilityReplayed, s.applicabilityCreateErr = false, domain.ErrIdempotencyKeyConflict
-	if w := do(t, r, http.MethodPost, path, good, nil); w.Code != http.StatusConflict || problem(t, w)["error_class"] != "IDEMPOTENCY_MISMATCH" {
+	if w := do(t, r, http.MethodPost, path, good, nil); w.Code != http.StatusConflict || problem(t, w)["code"] != "IDEMPOTENCY_KEY_CONFLICT" {
 		t.Fatalf("same key, different body: %d %s", w.Code, w.Body.String())
 	}
 }
@@ -273,7 +273,7 @@ func TestDefinitions_CreateAndRaiseFromDefinition(t *testing.T) {
 	}
 	clash := `{"obligation_definition_id":"def-1","legal_entity_id":"le-1","obligation_code":"GST-2026-11","severity_level":"LOW",
 		"due_date":"2026-11-20T00:00:00Z","created_by_principal_id":"` + testPrincipal + `"}`
-	if w := do(t, r, http.MethodPost, "/v1/obligations", clash, nil); w.Code != http.StatusBadRequest || problem(t, w)["field"] != "severity_level" {
+	if w := do(t, r, http.MethodPost, "/v1/obligations", clash, nil); w.Code != http.StatusBadRequest || problem(t, w)["code"] != "definition_mismatch" {
 		t.Fatalf("a field that contradicts the definition: %d %s", w.Code, w.Body.String())
 	}
 	version := `{"jurisdiction_id":"jur-1","obligation_type":"FILING","obligation_source_type":"JURISDICTION_RULE",

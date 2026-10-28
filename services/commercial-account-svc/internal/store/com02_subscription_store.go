@@ -680,6 +680,14 @@ func (s *PgStore) StartSubscription(ctx context.Context, p domain.StartSubscript
 		}); err != nil {
 			return err
 		}
+		// COM-02 §4.2: a transition must atomically invalidate/recompute the
+		// dependent entitlement state. A start that is already effective is a
+		// real transition; a future start is left to the boundary worker.
+		if !p.StartsAt.After(p.Now) {
+			if _, err := recomputeEntitlementsTx(ctx, tx, org, p.Actor, p.Now); err != nil {
+				return err
+			}
+		}
 		if agg, err = loadAggregate(ctx, tx, p.SubscriptionID, false); err != nil {
 			return err
 		}
@@ -777,10 +785,13 @@ func (s *PgStore) ActivateSubscription(ctx context.Context, c domain.Subscriptio
 		if err := setEndsAt(ctx, tx, a.sub.SubscriptionID, lp.EndsAt); err != nil {
 			return err
 		}
-		return emitSubscriptionEvent(ctx, tx, "subscription.activated", a.sub, m, subscriptionEvent{
+		if err := emitSubscriptionEvent(ctx, tx, "subscription.activated", a.sub, m, subscriptionEvent{
 			ChangeType: lp.Versions[0].ChangeType, Status: domain.LifecycleActive,
 			EffectiveAt: lp.Versions[0].EffectiveFrom, EndsAt: lp.EndsAt, Schedule: lp.Versions,
-		})
+		}); err != nil {
+			return err
+		}
+		return recomputeAfterLifecycle(ctx, tx, a, m)
 	})
 }
 
@@ -815,9 +826,12 @@ func (s *PgStore) ScheduleCancellation(ctx context.Context, c domain.Subscriptio
 		if err := setEndsAt(ctx, tx, a.sub.SubscriptionID, &boundary); err != nil {
 			return err
 		}
-		return emitSubscriptionEvent(ctx, tx, "subscription.cancellation_scheduled", a.sub, m, subscriptionEvent{
+		if err := emitSubscriptionEvent(ctx, tx, "subscription.cancellation_scheduled", a.sub, m, subscriptionEvent{
 			ChangeType: domain.ChangeCancellationScheduled, Status: domain.LifecycleCanceled, EffectiveAt: boundary, EndsAt: &boundary,
-		})
+		}); err != nil {
+			return err
+		}
+		return recomputeAfterLifecycle(ctx, tx, a, m)
 	})
 }
 
@@ -851,9 +865,12 @@ func (s *PgStore) CancelNow(ctx context.Context, c domain.SubscriptionCommand, c
 		if err := setEndsAt(ctx, tx, a.sub.SubscriptionID, &endsAt); err != nil {
 			return err
 		}
-		return emitSubscriptionEvent(ctx, tx, "subscription.canceled", a.sub, m, subscriptionEvent{
+		if err := emitSubscriptionEvent(ctx, tx, "subscription.canceled", a.sub, m, subscriptionEvent{
 			ChangeType: domain.ChangeCanceledNow, Status: domain.LifecycleCanceled, EffectiveAt: c.Now, EndsAt: &endsAt,
-		})
+		}); err != nil {
+			return err
+		}
+		return recomputeAfterLifecycle(ctx, tx, a, m)
 	})
 }
 
@@ -876,9 +893,12 @@ func (s *PgStore) Reactivate(ctx context.Context, c domain.SubscriptionCommand, 
 		if err := setEndsAt(ctx, tx, a.sub.SubscriptionID, nil); err != nil {
 			return err
 		}
-		return emitSubscriptionEvent(ctx, tx, "subscription.changed", a.sub, m, subscriptionEvent{
+		if err := emitSubscriptionEvent(ctx, tx, "subscription.changed", a.sub, m, subscriptionEvent{
 			ChangeType: domain.ChangeReactivated, Status: domain.LifecycleActive, EffectiveAt: c.Now,
-		})
+		}); err != nil {
+			return err
+		}
+		return recomputeAfterLifecycle(ctx, tx, a, m)
 	})
 }
 
@@ -891,8 +911,25 @@ func (s *PgStore) Reactivate(ctx context.Context, c domain.SubscriptionCommand, 
 // (COM-CTRL-003).
 func (s *PgStore) Renew(ctx context.Context, c domain.SubscriptionCommand, claim domain.IdempotencyClaim) (*domain.SubscriptionView, error) {
 	return s.subscriptionCommand(ctx, c, claim, func(tx pgx.Tx, a *subscriptionAggregate, m changeMeta) error {
-		return renewApply(ctx, tx, a, m)
+		if err := renewApply(ctx, tx, a, m); err != nil {
+			return err
+		}
+		return recomputeAfterLifecycle(ctx, tx, a, m)
 	})
+}
+
+// recomputeAfterLifecycle is the COM-02 §4.2 atomicity hook: every
+// lifecycle transition that is already effective recomputes COM-03's
+// snapshot in the same transaction, so a cache-fronted consumer receives
+// EntitlementSnapshotChanged with the transition, not after a separate
+// operator call. A future start/activation is intentionally skipped: its
+// boundary worker will recompute when the effective time arrives.
+func recomputeAfterLifecycle(ctx context.Context, tx pgx.Tx, a *subscriptionAggregate, m changeMeta) error {
+	if a.sub.StartsAt.After(m.now) {
+		return nil
+	}
+	_, err := recomputeEntitlementsTx(ctx, tx, a.sub.OrganizationID, m.actor, m.now)
+	return err
 }
 
 // renewApply is Renew's body, shared with the boundary worker.

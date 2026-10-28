@@ -14,9 +14,9 @@ import (
 
 func TestHTTPClient_CheckPeriodOpen_PostingPolicy(t *testing.T) {
 	tests := []struct {
-		name           string
-		postingPolicy  string
-		expectedErr    error
+		name          string
+		postingPolicy string
+		expectedErr   error
 	}{
 		{
 			name:          "OPEN policy allows posting",
@@ -29,29 +29,29 @@ func TestHTTPClient_CheckPeriodOpen_PostingPolicy(t *testing.T) {
 			expectedErr:   nil,
 		},
 		{
-			name:           "RESTRICTED policy requires soft-close override",
-			postingPolicy:  "RESTRICTED",
-			expectedErr:    domain.ErrSoftCloseOverrideRequired,
+			name:          "RESTRICTED policy requires soft-close override",
+			postingPolicy: "RESTRICTED",
+			expectedErr:   domain.ErrSoftCloseOverrideRequired,
 		},
 		{
-			name:           "CLOSE_JOURNALS_ONLY policy treated as hard closed",
-			postingPolicy:  "CLOSE_JOURNALS_ONLY",
-			expectedErr:    domain.ErrPeriodHardClosed,
+			name:          "CLOSE_JOURNALS_ONLY policy admits only designated close journals",
+			postingPolicy: "CLOSE_JOURNALS_ONLY",
+			expectedErr:   domain.ErrCloseJournalsOnly,
 		},
 		{
-			name:           "CLOSED policy refuses posting",
-			postingPolicy:  "CLOSED",
-			expectedErr:    domain.ErrPeriodHardClosed,
+			name:          "CLOSED policy refuses posting",
+			postingPolicy: "CLOSED",
+			expectedErr:   domain.ErrPeriodHardClosed,
 		},
 		{
-			name:           "unknown policy fails closed",
-			postingPolicy:  "SOME_UNKNOWN_VALUE",
-			expectedErr:    domain.ErrPeriodHardClosed,
+			name:          "unknown policy fails closed",
+			postingPolicy: "SOME_UNKNOWN_VALUE",
+			expectedErr:   domain.ErrPeriodHardClosed,
 		},
 		{
-			name:           "empty policy fails closed",
-			postingPolicy:  "",
-			expectedErr:    domain.ErrPeriodHardClosed,
+			name:          "empty policy fails closed",
+			postingPolicy: "",
+			expectedErr:   domain.ErrPeriodHardClosed,
 		},
 	}
 

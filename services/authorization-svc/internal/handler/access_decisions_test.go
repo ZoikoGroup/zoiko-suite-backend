@@ -132,9 +132,12 @@ func TestListAccessDecisions_RefusesUnknownOutcomeFilter(t *testing.T) {
 		t.Error("the store was queried despite an invalid filter — the refusal must happen before the read")
 	}
 
-	var body map[string]string
+	var body map[string]any
 	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
 		t.Fatalf("unmarshal: %v", err)
+	}
+	if body["code"] != "invalid_filter" || body["detail"] != domain.ErrInvalidDecisionOutcomeFilter.Error() {
+		t.Errorf("error has wrong code/detail: %v", body)
 	}
 	if body["field"] != "decision_outcome" {
 		t.Errorf("error names field %q, want decision_outcome — the caller has to know which filter was wrong", body["field"])

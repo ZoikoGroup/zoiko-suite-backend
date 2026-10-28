@@ -133,16 +133,23 @@ func (p *PgStore) CreateConnection(ctx context.Context, c *domain.BankConnection
 // forbidden error, so a probe cannot confirm that another tenant's
 // connection_id exists.
 func (p *PgStore) GetConnectionByID(ctx context.Context, id string) (*domain.BankConnection, error) {
+	// Select the full BNK-02 row, not just the original nine columns. The
+	// BNK-02 lifecycle handlers load the connection through this method
+	// before acting on it; a partial row left Region and TokenLeaseRef empty,
+	// so region enforcement compared against "" and suspend/revoke passed an
+	// empty lease to the vault (a no-op revoke). Treasury-svc's BNK-01
+	// ListConnectionOptions also reads this endpoint and filters on
+	// bank_account_id, which the partial row never returned. One projection
+	// feeds all three callers.
 	query := `
-		SELECT connection_id, tenant_id, legal_entity_id, bank_name, bic, account_number, currency, status, created_at, updated_at
+		SELECT ` + bnk02Columns + `
 		FROM bank_connections
 		WHERE connection_id = $1
 		  AND tenant_id = $2
 	`
 	var c domain.BankConnection
 	err := p.withTenant(ctx, func(tx pgx.Tx) error {
-		return tx.QueryRow(ctx, query, id, middleware.GetTenantID(ctx)).Scan(
-			&c.ConnectionID, &c.TenantID, &c.LegalEntityID, &c.BankName, &c.BIC, &c.AccountNumber, &c.Currency, &c.Status, &c.CreatedAt, &c.UpdatedAt)
+		return scanConnection(tx.QueryRow(ctx, query, id, middleware.GetTenantID(ctx)), &c)
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -163,8 +170,11 @@ func (p *PgStore) GetConnectionByID(ctx context.Context, id string) (*domain.Ban
 // legal-entity dimension stays optional because narrowing within your own
 // tenant is a legitimate choice; the tenant dimension never is.
 func (p *PgStore) ListConnections(ctx context.Context, legalEntityID string) ([]domain.BankConnection, error) {
+	// Same full BNK-02 projection as GetConnectionByID — treasury-svc's
+	// BNK-01 ListConnectionOptions route reads this response and filters on
+	// bank_account_id, which the original nine-column projection omitted.
 	query := `
-		SELECT connection_id, tenant_id, legal_entity_id, bank_name, bic, account_number, currency, status, created_at, updated_at
+		SELECT ` + bnk02Columns + `
 		FROM bank_connections
 		WHERE tenant_id = $2
 		  AND ($1 = '' OR legal_entity_id = $1)
@@ -180,7 +190,7 @@ func (p *PgStore) ListConnections(ctx context.Context, legalEntityID string) ([]
 
 		for rows.Next() {
 			var c domain.BankConnection
-			if err := rows.Scan(&c.ConnectionID, &c.TenantID, &c.LegalEntityID, &c.BankName, &c.BIC, &c.AccountNumber, &c.Currency, &c.Status, &c.CreatedAt, &c.UpdatedAt); err != nil {
+			if err := scanConnection(rows, &c); err != nil {
 				return err
 			}
 			res = append(res, c)
@@ -200,6 +210,10 @@ func (p *PgStore) RecordStatement(ctx context.Context, stmt *domain.BankStatemen
 	}
 	stmt.IngestedAt = time.Now().UTC()
 	stmt.TenantID = tenantID
+	// The legacy header-only path inserts straight into the terminal
+	// ACCEPTED state (migration 004's backward-compatible default). Reflect
+	// that in the returned/event payload instead of leaving an empty status.
+	stmt.Status = domain.StatementAccepted
 
 	query := `
 		INSERT INTO bank_statements (statement_id, connection_id, tenant_id, statement_format, statement_date, opening_balance, closing_balance, transaction_count, ingested_at)
@@ -224,8 +238,12 @@ func (p *PgStore) RecordStatement(ctx context.Context, stmt *domain.BankStatemen
 // alone, so any caller holding another tenant's connection_id could read
 // its statements — opening/closing balances and transaction counts.
 func (p *PgStore) ListStatements(ctx context.Context, connectionID string) ([]domain.BankStatement, error) {
+	// Return the full ingestion record, including status, raw-source hash,
+	// source/import-batch ids and quarantine reason. The earlier nine-column
+	// projection hid whether a statement was accepted, quarantined or
+	// rejected, and which source evidence it represented.
 	query := `
-		SELECT statement_id, connection_id, tenant_id, statement_format, statement_date, opening_balance, closing_balance, transaction_count, ingested_at
+		SELECT ` + statementColumns + `
 		FROM bank_statements
 		WHERE connection_id = $1
 		  AND tenant_id = $2
@@ -241,7 +259,7 @@ func (p *PgStore) ListStatements(ctx context.Context, connectionID string) ([]do
 
 		for rows.Next() {
 			var s domain.BankStatement
-			if err := rows.Scan(&s.StatementID, &s.ConnectionID, &s.TenantID, &s.StatementFormat, &s.StatementDate, &s.OpeningBalance, &s.ClosingBalance, &s.TransactionCount, &s.IngestedAt); err != nil {
+			if err := scanStatement(rows, &s); err != nil {
 				return err
 			}
 			res = append(res, s)

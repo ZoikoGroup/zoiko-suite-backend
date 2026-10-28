@@ -59,7 +59,7 @@ func newBound(t *testing.T, st *store.PgStore, tenant string) *domain.PaymentIni
 	t.Helper()
 	key := "k-" + uuid.NewString()
 	a, err := st.PrepareAttempt(tctx(tenant), tenant, domain.PrepareAttemptRequest{
-		LegalEntityID: uuid.NewString(), SourceReference: "src-" + key, PayerAccountRef: "DE00AA", PayeeRef: "FR00BB", Amount: 10.50,
+		LegalEntityID: uuid.NewString(), SourceReference: "src-" + key, PayerAccountRef: "DE00AA", PayeeRef: "FR00BB", Amount: "10.50",
 		Currency: "EUR", ExecutionDate: time.Now().Add(24 * time.Hour), PayerAccountVerified: true, IdempotencyKey: key,
 		ProviderKey: "simbank", Rail: "SEPA_CT@1", ConnectorID: uuid.NewString(),
 	}, "maker", "corr-"+key)
@@ -98,7 +98,7 @@ func TestDispatch_PrepareBindsTheProviderAndTheExactAmount(t *testing.T) {
 	_, err = st.BeginSend(tctx(tenant), a.AttemptID, domain.StatusPrepared, 1, "h", "op")
 	require.NoError(t, err)
 	_, err = st.PrepareAttempt(tctx(tenant), tenant, domain.PrepareAttemptRequest{
-		LegalEntityID: a.LegalEntityID, SourceReference: a.SourceReference, PayerAccountRef: "x", PayeeRef: "y", Amount: 1, Currency: "EUR",
+		LegalEntityID: a.LegalEntityID, SourceReference: a.SourceReference, PayerAccountRef: "x", PayeeRef: "y", Amount: "1", Currency: "EUR",
 		ExecutionDate: time.Now(), PayerAccountVerified: true, IdempotencyKey: "other-" + uuid.NewString(),
 	}, "maker", "c")
 	assert.ErrorIs(t, err, domain.ErrUnresolvedAttemptExists)
@@ -256,7 +256,7 @@ func TestDispatch_TriggersPinTheContextAndGuardInFlight(t *testing.T) {
 	assert.Error(t, su(`UPDATE payment_initiation_attempts SET status = 'QUARANTINED', in_flight_since = NULL WHERE attempt_id = $1`, b.AttemptID))
 	_, err = st.CancelAttempt(ctx, b.AttemptID, "op")
 	assert.ErrorIs(t, err, domain.ErrInvalidTransition, "cancel through the store is also refused while in flight")
-	_, err = st.QuarantineAttempt(ctx, b.AttemptID, domain.QuarantineRequest{Reason: "x"}, "op")
+	_, err = st.QuarantineAttempt(ctx, b.AttemptID, domain.QuarantineRequest{Reason: "x"}, "op", "corr-q")
 	assert.ErrorIs(t, err, domain.ErrInvalidTransition)
 
 	// SUBMITTING and its timestamp are one fact

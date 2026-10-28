@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math/big"
 	"net/http"
 	"time"
 
@@ -23,6 +24,7 @@ type Store interface {
 	UpdateBankAccountStatus(ctx context.Context, bankAccountID, status string) error
 	CreateCashBalance(ctx context.Context, bal *domain.CashBalance) error
 	GetLatestCashBalance(ctx context.Context, bankAccountID string) (*domain.CashBalance, error)
+	GetLatestCashBalances(ctx context.Context, bankAccountIDs []string) (map[string]*domain.CashBalance, error)
 	SetLiquidityThreshold(ctx context.Context, threshold *domain.LiquidityThreshold) error
 	GetLiquidityThreshold(ctx context.Context, legalEntityID, currencyCode string) (*domain.LiquidityThreshold, error)
 
@@ -50,6 +52,7 @@ type Store interface {
 	RecordFXRate(ctx context.Context, p domain.RecordFXRateParams) (*domain.FXRate, error)
 	GetLatestFXRate(ctx context.Context, tenantID, currencyPair string) (*domain.FXRate, error)
 	CreateFXExposureSnapshot(ctx context.Context, p domain.CalculateFXExposureParams, calc domain.FXExposureCalculation) (*domain.FXExposureSnapshot, error)
+	RefreshFXExposureSnapshot(ctx context.Context, p domain.RefreshFXExposureParams, calc domain.FXExposureCalculation) (*domain.FXExposureSnapshot, error)
 	GetFXExposureSnapshot(ctx context.Context, tenantID, snapshotID string) (*domain.FXExposureSnapshot, error)
 	GetLatestFXExposure(ctx context.Context, tenantID, legalEntityID, exposureCurrency, functionalCurrency string) (*domain.FXExposureSnapshot, error)
 	GetFXExposureAsOf(ctx context.Context, tenantID, legalEntityID, exposureCurrency, functionalCurrency string, asOf time.Time) (*domain.FXExposureSnapshot, error)
@@ -59,6 +62,7 @@ type Store interface {
 
 	// BNK-08 — see internal/store/bnk08_store.go's own doc comments.
 	CreateCashPositionSnapshot(ctx context.Context, p domain.CalculateCashPositionParams, calc domain.CashPositionCalculation) (*domain.CashPositionSnapshot, error)
+	RefreshCashPositionSnapshot(ctx context.Context, p domain.RefreshCashPositionParams, calc domain.CashPositionCalculation) (*domain.CashPositionSnapshot, error)
 	GetCashPositionSnapshot(ctx context.Context, tenantID, snapshotID string) (*domain.CashPositionSnapshot, error)
 	GetLatestCashPosition(ctx context.Context, tenantID, legalEntityID, reportingCurrency string) (*domain.CashPositionSnapshot, error)
 	GetCashPositionAsOf(ctx context.Context, tenantID, legalEntityID, reportingCurrency string, asOf time.Time) (*domain.CashPositionSnapshot, error)
@@ -90,9 +94,9 @@ type AuthZClient interface {
 
 // Clients defines third-party internal integration interfaces.
 type Clients interface {
-	GetPendingAPCommitments(ctx context.Context, tenantID, legalEntityID, currencyCode string) (float64, error)
-	GetOutstandingObligations(ctx context.Context, tenantID, legalEntityID, currencyCode string) (float64, float64, error)
-	GetForecastedInflows(ctx context.Context, tenantID, legalEntityID, currencyCode string) (float64, error)
+	GetPendingAPCommitments(ctx context.Context, tenantID, legalEntityID, currencyCode string) (domain.Decimal, error)
+	GetOutstandingObligations(ctx context.Context, tenantID, legalEntityID, currencyCode string) (domain.Decimal, domain.Decimal, error)
+	GetForecastedInflows(ctx context.Context, tenantID, legalEntityID, currencyCode string) (domain.Decimal, error)
 	GetLiquidityForecastData(ctx context.Context, tenantID, legalEntityID, currencyCode string) ([]domain.ExpectedCashFlow, []domain.ExpectedCashFlow, error)
 }
 
@@ -100,9 +104,9 @@ type Clients interface {
 // payment-initiation-adapter-svc, general-ledger-svc and
 // intercompany-accounting-svc — see internal/clients/bnk09_clients.go.
 type TransferClients interface {
-	SubmitTreasuryPayment(ctx context.Context, tenantID, principalID, correlationID, legalEntityID, transferID, payerAccountRef, payeeRef, fingerprint string, amount float64, currency string) (string, error)
-	PostTreasuryTransferJournal(ctx context.Context, tenantID, principalID, correlationID, legalEntityID, fiscalPeriod, transferID string, amount float64) (string, error)
-	PairTreasuryTransferIntercompany(ctx context.Context, tenantID, principalID, correlationID, sourceLegalEntityID, targetLegalEntityID, sourceJournalID string, amount float64, currencyCode string) (string, error)
+	SubmitTreasuryPayment(ctx context.Context, tenantID, principalID, correlationID, legalEntityID, transferID, payerAccountRef, payeeRef, fingerprint string, amount domain.Decimal, currency string) (string, error)
+	PostTreasuryTransferJournal(ctx context.Context, tenantID, principalID, correlationID, legalEntityID, fiscalPeriod, transferID string, amount domain.Decimal) (string, error)
+	PairTreasuryTransferIntercompany(ctx context.Context, tenantID, principalID, correlationID, sourceLegalEntityID, targetLegalEntityID, sourceJournalID string, amount domain.Decimal, currencyCode string) (string, error)
 }
 
 // BankingConnector is BNK-01's read-only dependency on banking-connector-svc
@@ -122,14 +126,14 @@ const (
 	// actionAuthorizeTransfer gates AuthorizeTreasuryTransfer — the doc's
 	// "treasury.transfer.authorize" permission, distinct from approve.
 	actionAuthorizeTransfer = "TREASURY_TRANSFER_AUTHORIZE"
-	actionExecuteTransfer  = "TREASURY_TRANSFER_EXECUTE"
+	actionExecuteTransfer   = "TREASURY_TRANSFER_EXECUTE"
 	// actionModifyTransfer gates Amend/SubmitForApproval/CancelBeforeSubmission
 	// — the maker-only commands over a not-yet-approved transfer.
 	// actionResolveTransfer gates MarkTransferReturned/ResolveTreasuryTransfer
 	// — operator-facing, post-submission recovery actions.
 	actionModifyTransfer  = "TREASURY_TRANSFER_MODIFY"
 	actionResolveTransfer = "TREASURY_TRANSFER_RESOLVE"
-	actionViewPositions    = "TREASURY_POSITIONS_VIEW"
+	actionViewPositions   = "TREASURY_POSITIONS_VIEW"
 	// actionCalculateCashPosition gates Calculate/RefreshCashPosition —
 	// the doc's own "cash.position.calculate"-equivalent permission.
 	// actionPublishCashPosition gates PublishCashPositionSnapshot only —
@@ -308,8 +312,8 @@ func (h *Handler) RegisterBankAccount(w http.ResponseWriter, r *http.Request) {
 		BalanceID:        uuid.New().String(),
 		TenantID:         tenantID,
 		BankAccountID:    acct.BankAccountID,
-		LedgerBalance:    0.0,
-		AvailableBalance: 0.0,
+		LedgerBalance:    "0",
+		AvailableBalance: "0",
 		AsOfTimestamp:    time.Now().UTC(),
 		CorrelationID:    r.Header.Get("X-Correlation-ID"),
 	}
@@ -320,18 +324,24 @@ func (h *Handler) RegisterBankAccount(w http.ResponseWriter, r *http.Request) {
 
 // ── GET /v1/treasury/accounts ────────────────────────────────────────────────────
 
+// ListBankAccounts lists one legal entity's accounts. legal_entity_id is
+// required: permission is granted per legal entity, and without one there
+// was nothing to authorize against — the list skipped the permission check
+// and returned every account in the tenant.
 func (h *Handler) ListBankAccounts(w http.ResponseWriter, r *http.Request) {
 	legalEntityID := r.URL.Query().Get("legal_entity_id")
+	if legalEntityID == "" {
+		writeError(w, http.StatusBadRequest, "missing_field", "legal_entity_id is required")
+		return
+	}
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
 	}
 
-	if legalEntityID != "" {
-		if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionViewPositions); err != nil {
-			h.writeAuthzErr(w, err)
-			return
-		}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionViewPositions); err != nil {
+		h.writeAuthzErr(w, err)
+		return
 	}
 
 	list, err := h.store.ListBankAccounts(r.Context(), legalEntityID)
@@ -368,13 +378,21 @@ func (h *Handler) GetCashPositions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ids := make([]string, 0, len(accts))
+	for _, acct := range accts {
+		ids = append(ids, acct.BankAccountID)
+	}
+	// One batched read; a store failure fails closed instead of silently
+	// omitting accounts.
+	balances, err := h.store.GetLatestCashBalances(r.Context(), ids)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "store_error", err.Error())
+		return
+	}
+
 	var out []domain.CashPositionResponse
 	for _, acct := range accts {
-		bal, err := h.store.GetLatestCashBalance(r.Context(), acct.BankAccountID)
-		if err != nil {
-			continue
-		}
-		if bal != nil {
+		if bal := balances[acct.BankAccountID]; bal != nil {
 			out = append(out, domain.CashPositionResponse{
 				BankAccountID:    acct.BankAccountID,
 				AccountName:      acct.AccountName,
@@ -406,6 +424,13 @@ func (h *Handler) SetLiquidityThreshold(w http.ResponseWriter, r *http.Request) 
 
 	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionSetThreshold); err != nil {
 		h.writeAuthzErr(w, err)
+		return
+	}
+
+	// A threshold the NUMERIC(20,4) column would round is refused, never
+	// silently changed: the breach comparison uses the stored figure.
+	if _, err := domain.ValidateNonNegativeMoney(req.MinimumRequiredBalance); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_amount", err.Error())
 		return
 	}
 
@@ -449,42 +474,21 @@ func (h *Handler) GetEffectiveCash(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 1. Current bank balance
-	accts, err := h.store.ListBankAccounts(r.Context(), legalEntityID)
-	if err != nil {
-		writeError(w, http.StatusServiceUnavailable, "store_error", err.Error())
-		return
-	}
-
-	// oldestBankBalanceAsOf tracks the LEAST recent as_of_timestamp across
-	// every account composed into bankSum — the position as a whole is
-	// only as fresh as its stalest contributing account, so a single
-	// out-of-date account is enough to flag the composed figure.
-	var bankSum float64
-	var oldestBankBalanceAsOf time.Time
-	var haveBankBalance bool
-	for _, acct := range accts {
-		if acct.CurrencyCode == currencyCode && acct.AccountStatus == "ACTIVE" {
-			bal, err := h.store.GetLatestCashBalance(r.Context(), acct.BankAccountID)
-			if err == nil && bal != nil {
-				bankSum += bal.AvailableBalance
-				if !haveBankBalance || bal.AsOfTimestamp.Before(oldestBankBalanceAsOf) {
-					oldestBankBalanceAsOf = bal.AsOfTimestamp
-				}
-				haveBankBalance = true
-			}
-		}
-	}
+	// 1. Current bank balance — the same composition the BNK-08 snapshot
+	// uses: one batched read, fail closed on a store error, and an ACTIVE
+	// account with no balance marks the figure partial. The position as a
+	// whole is only as fresh as its oldest contributing balance.
+	//
 	// Flagged, not blocked: unlike AP/obligations being fully unreachable
 	// (nothing to show at all, so this handler fails closed), a stale
 	// bank balance is real data that's merely old — the doc's rule is
 	// "never show it AS CURRENT," which HasStaleComponent/IsStale below
 	// satisfies by labeling it, not by withholding the whole response.
-	bankBalanceStale := haveBankBalance && time.Since(oldestBankBalanceAsOf) > domain.BankBalanceStalenessThreshold
-	if bankBalanceStale {
-		h.log.Warn("effective cash: bank balance component is stale",
-			zap.String("legal_entity_id", legalEntityID), zap.Time("oldest_as_of", oldestBankBalanceAsOf))
+	breakdown, bankSum, bankBalanceStale, ok := h.composeBankBalances(w, r, legalEntityID, currencyCode)
+	if !ok {
+		return
 	}
+	oldestBankBalanceAsOf, _ := domain.OldestBankBalanceAsOf(breakdown)
 
 	// 2. Pending AP Commitments — fail closed: if AP is unavailable the figure is
 	// unreliable; return an error rather than presenting a partial cash position
@@ -506,15 +510,26 @@ func (h *Handler) GetEffectiveCash(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	effectiveCash := bankSum - apSum - payrollSum - taxSum
+	effectiveCash, err := domain.NetDecimals(bankSum, apSum, payrollSum, taxSum)
+	if err != nil {
+		h.log.Error("effective cash: exact decimal arithmetic failed", zap.Error(err))
+		writeError(w, http.StatusInternalServerError, "invalid_amount", err.Error())
+		return
+	}
 
 	// 4. Threshold check
 	threshold, err := h.store.GetLiquidityThreshold(r.Context(), legalEntityID, currencyCode)
 	var details *domain.ThresholdAlertDetail
 	if err == nil && threshold != nil {
+		cmp, cmpErr := effectiveCash.Cmp(threshold.MinimumRequiredBalance)
+		if cmpErr != nil {
+			h.log.Error("effective cash: threshold comparison failed", zap.Error(cmpErr))
+			writeError(w, http.StatusInternalServerError, "invalid_amount", cmpErr.Error())
+			return
+		}
 		details = &domain.ThresholdAlertDetail{
 			MinimumRequiredBalance: threshold.MinimumRequiredBalance,
-			IsBreached:             effectiveCash < threshold.MinimumRequiredBalance,
+			IsBreached:             cmp < 0,
 		}
 	}
 
@@ -537,7 +552,7 @@ func (h *Handler) GetEffectiveCash(w http.ResponseWriter, r *http.Request) {
 		PendingAPCommitments:     apSum,
 		PayrollObligations:       payrollSum,
 		TaxLiabilities:           taxSum,
-		ReservedPendingApprovals: 0.0,
+		ReservedPendingApprovals: "0",
 		EffectiveAvailableCash:   effectiveCash,
 		AsOfTimestamp:            now,
 		ThresholdDetails:         details,
@@ -584,15 +599,30 @@ func (h *Handler) GetForecasts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var currentCash float64
+	var ids []string
 	for _, acct := range accts {
 		if acct.CurrencyCode == currencyCode && acct.AccountStatus == "ACTIVE" {
-			bal, err := h.store.GetLatestCashBalance(r.Context(), acct.BankAccountID)
-			if err == nil && bal != nil {
-				currentCash += bal.AvailableBalance
-			}
+			ids = append(ids, acct.BankAccountID)
 		}
 	}
+	// One batched read; a store failure fails closed instead of silently
+	// leaving accounts out of the starting balance.
+	balances, err := h.store.GetLatestCashBalances(r.Context(), ids)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "store_error", err.Error())
+		return
+	}
+	currentCashRat := new(big.Rat)
+	for _, bal := range balances {
+		r, rerr := bal.AvailableBalance.Rat()
+		if rerr != nil {
+			h.log.Error("forecast: invalid stored balance", zap.Error(rerr))
+			writeError(w, http.StatusInternalServerError, "invalid_amount", rerr.Error())
+			return
+		}
+		currentCashRat.Add(currentCashRat, r)
+	}
+	currentCash := domain.Decimal(domain.CanonicalAmount(currentCashRat))
 
 	// 2. Fetch forecast data from clients
 	inflows, outflows, err := h.clients.GetLiquidityForecastData(r.Context(), tenantID, legalEntityID, currencyCode)
@@ -606,32 +636,46 @@ func (h *Handler) GetForecasts(w http.ResponseWriter, r *http.Request) {
 	t30 := now.AddDate(0, 0, 30)
 	t90 := now.AddDate(0, 0, 90)
 
-	var in7, out7 float64
-	var in30, out30 float64
-	var in90, out90 float64
+	in7, in30, in90 := new(big.Rat), new(big.Rat), new(big.Rat)
+	out7, out30, out90 := new(big.Rat), new(big.Rat), new(big.Rat)
 
 	for _, flow := range inflows {
+		r, rerr := flow.Amount.Rat()
+		if rerr != nil {
+			writeError(w, http.StatusBadGateway, "invalid_amount", rerr.Error())
+			return
+		}
 		if flow.DueDate.Before(t7) || flow.DueDate.Equal(t7) {
-			in7 += flow.Amount
+			in7.Add(in7, r)
 		}
 		if flow.DueDate.Before(t30) || flow.DueDate.Equal(t30) {
-			in30 += flow.Amount
+			in30.Add(in30, r)
 		}
 		if flow.DueDate.Before(t90) || flow.DueDate.Equal(t90) {
-			in90 += flow.Amount
+			in90.Add(in90, r)
 		}
 	}
 
 	for _, flow := range outflows {
+		r, rerr := flow.Amount.Rat()
+		if rerr != nil {
+			writeError(w, http.StatusBadGateway, "invalid_amount", rerr.Error())
+			return
+		}
 		if flow.DueDate.Before(t7) || flow.DueDate.Equal(t7) {
-			out7 += flow.Amount
+			out7.Add(out7, r)
 		}
 		if flow.DueDate.Before(t30) || flow.DueDate.Equal(t30) {
-			out30 += flow.Amount
+			out30.Add(out30, r)
 		}
 		if flow.DueDate.Before(t90) || flow.DueDate.Equal(t90) {
-			out90 += flow.Amount
+			out90.Add(out90, r)
 		}
+	}
+
+	decimalOf := func(r *big.Rat) domain.Decimal { return domain.Decimal(domain.CanonicalAmount(r)) }
+	forecastOf := func(in, out *big.Rat) domain.Decimal {
+		return decimalOf(new(big.Rat).Sub(new(big.Rat).Add(currentCashRat, in), out))
 	}
 
 	resp := domain.LiquidityForecastResponse{
@@ -642,21 +686,21 @@ func (h *Handler) GetForecasts(w http.ResponseWriter, r *http.Request) {
 		AsOfTimestamp:      now,
 		Forecast7Day: domain.ForecastIntervalDetail{
 			IntervalDays:      7,
-			ExpectedInflows:   in7,
-			ExpectedOutflows:  out7,
-			ForecastedBalance: currentCash + in7 - out7,
+			ExpectedInflows:   decimalOf(in7),
+			ExpectedOutflows:  decimalOf(out7),
+			ForecastedBalance: forecastOf(in7, out7),
 		},
 		Forecast30Day: domain.ForecastIntervalDetail{
 			IntervalDays:      30,
-			ExpectedInflows:   in30,
-			ExpectedOutflows:  out30,
-			ForecastedBalance: currentCash + in30 - out30,
+			ExpectedInflows:   decimalOf(in30),
+			ExpectedOutflows:  decimalOf(out30),
+			ForecastedBalance: forecastOf(in30, out30),
 		},
 		Forecast90Day: domain.ForecastIntervalDetail{
 			IntervalDays:      90,
-			ExpectedInflows:   in90,
-			ExpectedOutflows:  out90,
-			ForecastedBalance: currentCash + in90 - out90,
+			ExpectedInflows:   decimalOf(in90),
+			ExpectedOutflows:  decimalOf(out90),
+			ForecastedBalance: forecastOf(in90, out90),
 		},
 	}
 

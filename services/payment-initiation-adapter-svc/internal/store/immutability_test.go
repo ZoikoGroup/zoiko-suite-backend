@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 	"testing"
 	"time"
 
@@ -128,7 +129,7 @@ func TestPgStore_PreparedAttempt_AuthorizedFieldsAreImmutable(t *testing.T) {
 
 	attempt, err := testStore.PrepareAttempt(ctx, tenantID, domain.PrepareAttemptRequest{
 		LegalEntityID: uuid.New().String(), PayerAccountRef: "acct-src", PayeeRef: "acct-dst",
-		Amount: 100.00, Currency: "USD", ExecutionDate: time.Now(), PayerAccountVerified: true,
+		Amount: "100.00", Currency: "USD", ExecutionDate: time.Now(), PayerAccountVerified: true,
 		IdempotencyKey: "corr-immutable-1",
 	}, "maker-1", "corr-immutable-1")
 	if err != nil {
@@ -177,7 +178,7 @@ func TestPgStore_PreparedAttempt_AuthorizationFieldsPersistAndAreImmutable(t *te
 
 	attempt, err := testStore.PrepareAttempt(ctx, tenantID, domain.PrepareAttemptRequest{
 		LegalEntityID: uuid.New().String(), PayerAccountRef: "acct-src", PayeeRef: "acct-dst",
-		Amount: 250.00, Currency: "USD", ExecutionDate: time.Now(), PayerAccountVerified: true,
+		Amount: "250.00", Currency: "USD", ExecutionDate: time.Now(), PayerAccountVerified: true,
 		IdempotencyKey: "corr-auth-fields-1",
 		AuthorizationFingerprint: "sha256:real-fingerprint", AuthorizationID: "auth-real-1",
 		AuthorizationSource: domain.AuthorizationSourcePaymentAuthorization,
@@ -220,13 +221,13 @@ func TestPgStore_SubmittedAttempt_IsFullyTerminal(t *testing.T) {
 
 	attempt, err := testStore.PrepareAttempt(ctx, tenantID, domain.PrepareAttemptRequest{
 		LegalEntityID: uuid.New().String(), PayerAccountRef: "acct-src", PayeeRef: "acct-dst",
-		Amount: 50.00, Currency: "USD", ExecutionDate: time.Now(), PayerAccountVerified: true,
+		Amount: "50.00", Currency: "USD", ExecutionDate: time.Now(), PayerAccountVerified: true,
 		IdempotencyKey: "corr-immutable-2",
 	}, "maker-1", "corr-immutable-2")
 	if err != nil {
 		t.Fatalf("PrepareAttempt: %v", err)
 	}
-	if _, err := testStore.MarkSubmitted(ctx, attempt.AttemptID, "provider-req-1", "provider-resp-1", "maker-1"); err != nil {
+	if _, err := testStore.MarkSubmitted(ctx, attempt.AttemptID, "provider-req-1", "provider-resp-1", "maker-1", "corr-immutable-2"); err != nil {
 		t.Fatalf("MarkSubmitted: %v", err)
 	}
 
@@ -251,7 +252,7 @@ func TestPgStore_PrepareAttempt_RejectsSecondUnresolvedAttempt(t *testing.T) {
 	first, err := testStore.PrepareAttempt(ctx, tenantID, domain.PrepareAttemptRequest{
 		LegalEntityID: uuid.New().String(), SourceReference: sourceRef,
 		PayerAccountRef: "acct-src", PayeeRef: "acct-dst",
-		Amount: 75.00, Currency: "USD", ExecutionDate: time.Now(), PayerAccountVerified: true,
+		Amount: "75.00", Currency: "USD", ExecutionDate: time.Now(), PayerAccountVerified: true,
 		IdempotencyKey: "corr-unresolved-1",
 	}, "maker-1", "corr-unresolved-1")
 	if err != nil {
@@ -263,7 +264,7 @@ func TestPgStore_PrepareAttempt_RejectsSecondUnresolvedAttempt(t *testing.T) {
 	second, err := testStore.PrepareAttempt(ctx, tenantID, domain.PrepareAttemptRequest{
 		LegalEntityID: uuid.New().String(), SourceReference: sourceRef,
 		PayerAccountRef: "acct-src", PayeeRef: "acct-dst",
-		Amount: 75.00, Currency: "USD", ExecutionDate: time.Now(), PayerAccountVerified: true,
+		Amount: "75.00", Currency: "USD", ExecutionDate: time.Now(), PayerAccountVerified: true,
 		IdempotencyKey: "corr-unresolved-2",
 	}, "maker-1", "corr-unresolved-2")
 	if !errors.Is(err, domain.ErrUnresolvedAttemptExists) {
@@ -288,13 +289,13 @@ func TestPgStore_PrepareAttempt_RejectsSecondUnresolvedAttempt(t *testing.T) {
 	// tracking is BNK-07/payment-status-svc's concern), so a duplicate
 	// send must never be allowed regardless of how the first one later
 	// resolves downstream.
-	if _, err := testStore.MarkSubmitted(ctx, first.AttemptID, "provider-req-1", "provider-resp-1", "maker-1"); err != nil {
+	if _, err := testStore.MarkSubmitted(ctx, first.AttemptID, "provider-req-1", "provider-resp-1", "maker-1", "corr-unresolved-3"); err != nil {
 		t.Fatalf("MarkSubmitted: %v", err)
 	}
 	third, err := testStore.PrepareAttempt(ctx, tenantID, domain.PrepareAttemptRequest{
 		LegalEntityID: uuid.New().String(), SourceReference: sourceRef,
 		PayerAccountRef: "acct-src", PayeeRef: "acct-dst",
-		Amount: 75.00, Currency: "USD", ExecutionDate: time.Now(), PayerAccountVerified: true,
+		Amount: "75.00", Currency: "USD", ExecutionDate: time.Now(), PayerAccountVerified: true,
 		IdempotencyKey: "corr-unresolved-3",
 	}, "maker-1", "corr-unresolved-3")
 	if !errors.Is(err, domain.ErrUnresolvedAttemptExists) {
@@ -309,7 +310,7 @@ func TestPgStore_PrepareAttempt_RejectsSecondUnresolvedAttempt(t *testing.T) {
 	fourth, err := testStore.PrepareAttempt(ctx, tenantID, domain.PrepareAttemptRequest{
 		LegalEntityID: uuid.New().String(), SourceReference: "instruction-" + uuid.New().String(),
 		PayerAccountRef: "acct-src", PayeeRef: "acct-dst",
-		Amount: 75.00, Currency: "USD", ExecutionDate: time.Now(), PayerAccountVerified: true,
+		Amount: "75.00", Currency: "USD", ExecutionDate: time.Now(), PayerAccountVerified: true,
 		IdempotencyKey: "corr-unresolved-4",
 	}, "maker-1", "corr-unresolved-4")
 	if err != nil {
@@ -317,6 +318,78 @@ func TestPgStore_PrepareAttempt_RejectsSecondUnresolvedAttempt(t *testing.T) {
 	}
 	if fourth.AttemptID == first.AttemptID {
 		t.Fatal("expected a genuinely new attempt row for a different source_reference")
+	}
+}
+
+// TestPgStore_PrepareAttempt_ConcurrentSameSourceReference_OneWins proves
+// the source_reference invariant holds under a real race, not just when the
+// pre-insert SELECT happens to see the first row. Every concurrent caller
+// with a distinct idempotency_key must end up with the same, single attempt.
+func TestPgStore_PrepareAttempt_ConcurrentSameSourceReference_OneWins(t *testing.T) {
+	tenantID := uuid.New().String()
+	ctx := middleware.WithTenant(context.Background(), tenantID)
+	sourceRef := "instruction-race-" + uuid.New().String()
+
+	type result struct {
+		attempt *domain.PaymentInitiationAttempt
+		err     error
+	}
+	const callers = 8
+	start := make(chan struct{})
+	results := make(chan result, callers)
+	var wg sync.WaitGroup
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			a, err := testStore.PrepareAttempt(ctx, tenantID, domain.PrepareAttemptRequest{
+				LegalEntityID: uuid.New().String(), SourceReference: sourceRef,
+				PayerAccountRef: "acct-src", PayeeRef: "acct-dst",
+				Amount: "42.00", Currency: "USD", ExecutionDate: time.Now(), PayerAccountVerified: true,
+				IdempotencyKey: fmt.Sprintf("corr-race-%d-%s", i, uuid.New().String()),
+			}, "maker-1", "corr-race")
+			results <- result{attempt: a, err: err}
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+
+	var winner string
+	successes, duplicates := 0, 0
+	var returned []string
+	for res := range results {
+		switch {
+		case res.err == nil:
+			successes++
+			winner = res.attempt.AttemptID
+			returned = append(returned, res.attempt.AttemptID)
+		case errors.Is(res.err, domain.ErrUnresolvedAttemptExists):
+			duplicates++
+			if res.attempt == nil {
+				t.Fatalf("a losing concurrent prepare must return the winner, got nil")
+			}
+			returned = append(returned, res.attempt.AttemptID)
+		default:
+			t.Fatalf("unexpected concurrent prepare error: %v", res.err)
+		}
+	}
+	if successes != 1 || duplicates != callers-1 {
+		t.Fatalf("expected exactly 1 winner and %d duplicate answers, got %d and %d", callers-1, successes, duplicates)
+	}
+	for _, id := range returned {
+		if id != winner {
+			t.Fatalf("every concurrent caller must resolve to the same attempt %s, got %s", winner, id)
+		}
+	}
+
+	var count int
+	if err := testPool.QueryRow(ctx, `SELECT COUNT(*) FROM payment_initiation_attempts WHERE source_reference = $1`, sourceRef).Scan(&count); err != nil {
+		t.Fatalf("count query: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected exactly 1 attempt row under a concurrent race, got %d", count)
 	}
 }
 
@@ -330,7 +403,7 @@ func TestPgStore_PrepareAttempt_EmptySourceReference_NeverDeduped(t *testing.T) 
 
 	first, err := testStore.PrepareAttempt(ctx, tenantID, domain.PrepareAttemptRequest{
 		LegalEntityID: uuid.New().String(), PayerAccountRef: "acct-src", PayeeRef: "acct-dst",
-		Amount: 10.00, Currency: "USD", ExecutionDate: time.Now(), PayerAccountVerified: true,
+		Amount: "10.00", Currency: "USD", ExecutionDate: time.Now(), PayerAccountVerified: true,
 		IdempotencyKey: "corr-empty-ref-1",
 	}, "maker-1", "corr-empty-ref-1")
 	if err != nil {
@@ -338,7 +411,7 @@ func TestPgStore_PrepareAttempt_EmptySourceReference_NeverDeduped(t *testing.T) 
 	}
 	second, err := testStore.PrepareAttempt(ctx, tenantID, domain.PrepareAttemptRequest{
 		LegalEntityID: uuid.New().String(), PayerAccountRef: "acct-src", PayeeRef: "acct-dst",
-		Amount: 20.00, Currency: "USD", ExecutionDate: time.Now(), PayerAccountVerified: true,
+		Amount: "20.00", Currency: "USD", ExecutionDate: time.Now(), PayerAccountVerified: true,
 		IdempotencyKey: "corr-empty-ref-2",
 	}, "maker-1", "corr-empty-ref-2")
 	if err != nil {

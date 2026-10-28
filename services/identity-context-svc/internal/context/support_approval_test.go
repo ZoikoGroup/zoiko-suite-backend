@@ -54,14 +54,14 @@ func TestSupportApprovalRoute(t *testing.T) {
 	// The requester approving their own request: 403 SOD_CONFLICT.
 	code, body := approve(requesterID)
 	assert.Equal(t, http.StatusForbidden, code)
-	assert.Equal(t, domain.ErrCodeSoDConflict, body["error_code"])
+	assert.Equal(t, domain.ErrCodeSoDConflict, body["code"])
 	// The grantee approving their own elevation: the same.
 	code, _ = approve("support-eng-1")
 	assert.Equal(t, http.StatusForbidden, code)
 	// Somebody other than the named approver: 403 AUTHORIZATION_DENIED.
 	code, body = approve("someone-else")
 	assert.Equal(t, http.StatusForbidden, code)
-	assert.Equal(t, domain.ErrCodeAuthorizationDenied, body["error_code"])
+	assert.Equal(t, domain.ErrCodeAuthorizationDenied, body["code"])
 	assert.Equal(t, domain.SupportPendingApproval, h.support.contexts[created.SupportContextID].ApprovalStatus)
 
 	// The named approver: granted, and only once.

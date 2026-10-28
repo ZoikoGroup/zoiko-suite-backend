@@ -142,7 +142,7 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 		ExemptionCertificateRef: req.ExemptionCertificateRef,
 		Notes:                   req.Notes,
 		EffectiveFrom:           req.EffectiveFrom,
-		CreatedBy:               req.CreatedBy,
+		CreatedBy:               principalID,
 	}
 
 	if err := h.store.Create(r.Context(), o); err != nil {
@@ -208,6 +208,12 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "failed to fetch withholding tax obligation")
+		return
+	}
+
+	// Immutability guard (INV-07 / D3): REMITTED records cannot be edited in place.
+	if existing.Status == domain.StatusRemitted {
+		writeError(w, http.StatusConflict, "cannot update a REMITTED withholding tax obligation")
 		return
 	}
 

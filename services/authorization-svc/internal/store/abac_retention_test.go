@@ -156,15 +156,11 @@ func TestPgStore_FindABACRules_ScopeAndActiveFlag(t *testing.T) {
 	ctx := context.Background()
 
 	mk := func(code string, tenant *string, action string) *domain.ABACRule {
-		r, err := s.CreateABACRule(ctx, domain.CreateABACRuleParams{
+		return publishABAC(t, s, domain.CreateABACRuleParams{
 			TenantID: tenant, RuleCode: code, ActionType: action,
 			Effect: domain.EffectForbid, AttributeKey: "channel", Operator: "eq",
 			AttributeValue: strptr("SELF_SERVICE"), CreatedByPrincipalID: "admin-1",
 		})
-		if err != nil {
-			t.Fatalf("create %s: %v", code, err)
-		}
-		return r
 	}
 
 	mk("TENANT_A_RULE", strptr(abacTenantA), "PAYMENT_APPROVE")
@@ -218,14 +214,11 @@ func TestPgStore_SetABACRuleActive_CannotRetireAPlatformWideRule(t *testing.T) {
 	s := store.New(pool, zap.NewNop())
 	ctx := context.Background()
 
-	global, err := s.CreateABACRule(ctx, domain.CreateABACRuleParams{
+	global := publishABAC(t, s, domain.CreateABACRuleParams{
 		TenantID: nil, RuleCode: "GLOBAL_RULE", ActionType: "PAYMENT_APPROVE",
 		Effect: domain.EffectForbid, AttributeKey: "channel", Operator: "eq",
 		AttributeValue: strptr("SELF_SERVICE"), CreatedByPrincipalID: "admin-1",
 	})
-	if err != nil {
-		t.Fatalf("create platform-wide rule: %v", err)
-	}
 
 	if _, err := s.SetABACRuleActive(ctx, global.ABACRuleID, abacTenantA, false, 0); !errors.Is(err, domain.ErrABACRuleNotFound) {
 		t.Fatalf("err = %v, want ErrABACRuleNotFound — one tenant must not be able to disable a control binding every tenant", err)
@@ -260,13 +253,11 @@ func TestPgStore_ABACRules_TenantIsolationUnderOrdinaryRole(t *testing.T) {
 		{"TENANT_B_RULE", strptr(abacTenantB)},
 		{"GLOBAL_RULE", nil},
 	} {
-		if _, err := adminStore.CreateABACRule(ctx, domain.CreateABACRuleParams{
+		publishABAC(t, adminStore, domain.CreateABACRuleParams{
 			TenantID: tc.tenant, RuleCode: tc.code, ActionType: "PAYMENT_APPROVE",
 			Effect: domain.EffectForbid, AttributeKey: "channel", Operator: "eq",
 			AttributeValue: strptr("SELF_SERVICE"), CreatedByPrincipalID: "admin-1",
-		}); err != nil {
-			t.Fatalf("create %s: %v", tc.code, err)
-		}
+		})
 	}
 
 	rlsPool := getRLSPool(t, admin)

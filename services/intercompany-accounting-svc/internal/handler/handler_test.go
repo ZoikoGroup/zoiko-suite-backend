@@ -113,16 +113,16 @@ func (s *stubStoreReal) ListEntries(_ context.Context, sourceEntityID, targetEnt
 	return out, nil
 }
 
-func (s *stubStoreReal) UpdateMatch(_ context.Context, entry *domain.IntercompanyEntry, attempt *domain.MatchAttempt, actorID, correlationID string) error {
+func (s *stubStoreReal) UpdateMatch(_ context.Context, entry *domain.IntercompanyEntry, attempt *domain.MatchAttempt, _ /* idempotencyKey */, actorID, correlationID string) (*domain.IntercompanyEntry, error) {
 	if s.updateMatchErr != nil {
-		return s.updateMatchErr
+		return nil, s.updateMatchErr
 	}
 	existing, ok := s.entries[entry.IntercompanyEntryID]
 	if !ok {
-		return domain.ErrEntryNotFound
+		return nil, domain.ErrEntryNotFound
 	}
 	if !slices.Contains(domain.MatchableStatuses, existing.MatchStatus) {
-		return domain.ErrInvalidPairTransition
+		return nil, domain.ErrInvalidPairTransition
 	}
 	existing.TargetJournalID = entry.TargetJournalID
 	existing.MatchStatus = entry.MatchStatus
@@ -130,51 +130,51 @@ func (s *stubStoreReal) UpdateMatch(_ context.Context, entry *domain.Intercompan
 	existing.UpdatedAt = time.Now().UTC()
 	s.attempts[entry.IntercompanyEntryID] = append(s.attempts[entry.IntercompanyEntryID], *attempt)
 	s.matchEvents = append(s.matchEvents, eventRecord{entry: *existing, actorID: actorID, correlationID: correlationID})
-	return nil
+	return existing, nil
 }
 
-func (s *stubStoreReal) AcknowledgeCounterparty(_ context.Context, id, principalID, _ string) error {
+func (s *stubStoreReal) AcknowledgeCounterparty(_ context.Context, id, _ /* idempotencyKey */, principalID, _ string) (*domain.IntercompanyEntry, error) {
 	entry, ok := s.entries[id]
 	if !ok || entry.MatchStatus != domain.MatchStatusUnmatched {
-		return domain.ErrInvalidPairTransition
+		return nil, domain.ErrInvalidPairTransition
 	}
 	now := time.Now().UTC()
 	entry.MatchStatus, entry.AcknowledgedAt, entry.AcknowledgedByPrincipalID = domain.MatchStatusAwaitingCounterparty, &now, &principalID
-	return nil
+	return entry, nil
 }
 
-func (s *stubStoreReal) DisputeIntercompany(_ context.Context, id, principalID, reason, _ string) error {
+func (s *stubStoreReal) DisputeIntercompany(_ context.Context, id, _ /* idempotencyKey */, principalID, reason, _ string) (*domain.IntercompanyEntry, error) {
 	entry, ok := s.entries[id]
 	if !ok || entry.MatchStatus != domain.MatchStatusMismatch {
-		return domain.ErrInvalidPairTransition
+		return nil, domain.ErrInvalidPairTransition
 	}
 	now := time.Now().UTC()
 	entry.MatchStatus, entry.DisputedAt, entry.DisputedByPrincipalID, entry.DisputeReason = domain.MatchStatusDisputed, &now, &principalID, &reason
-	return nil
+	return entry, nil
 }
 
-func (s *stubStoreReal) ResolveMismatch(_ context.Context, id, principalID, resolutionNote, outcome, _ string) error {
+func (s *stubStoreReal) ResolveMismatch(_ context.Context, id, _ /* idempotencyKey */, principalID, resolutionNote, outcome, _ string) (*domain.IntercompanyEntry, error) {
 	entry, ok := s.entries[id]
 	if !ok || entry.MatchStatus != domain.MatchStatusDisputed {
-		return domain.ErrInvalidPairTransition
+		return nil, domain.ErrInvalidPairTransition
 	}
 	now := time.Now().UTC()
 	entry.MatchStatus, entry.ResolvedAt, entry.ResolvedByPrincipalID, entry.ResolutionNote = domain.MatchStatusResolved, &now, &principalID, &resolutionNote
 	entry.ResolutionOutcome = &outcome
-	return nil
+	return entry, nil
 }
 
-func (s *stubStoreReal) ClosePair(_ context.Context, id, principalID, reason, _ string) error {
+func (s *stubStoreReal) ClosePair(_ context.Context, id, _ /* idempotencyKey */, principalID, reason, _ string) (*domain.IntercompanyEntry, error) {
 	entry, ok := s.entries[id]
 	if !ok {
-		return domain.ErrEntryNotFound
+		return nil, domain.ErrEntryNotFound
 	}
 	if entry.MatchStatus != domain.MatchStatusMatched {
-		return domain.ErrInvalidPairTransition
+		return nil, domain.ErrInvalidPairTransition
 	}
 	now := time.Now().UTC()
 	entry.MatchStatus, entry.ClosedAt, entry.ClosedByPrincipalID, entry.CloseReason = domain.MatchStatusClosed, &now, &principalID, &reason
-	return nil
+	return entry, nil
 }
 
 func (s *stubStoreReal) ListMatchAttempts(_ context.Context, id string) ([]domain.MatchAttempt, error) {
@@ -244,6 +244,12 @@ func doReq(r chi.Router, method, path string, body any, principalID string) *htt
 	if principalID != "" {
 		req.Header.Set("X-Principal-Id", principalID)
 	}
+	// SPEC_DEVIATIONS A10: every lifecycle command now requires an
+	// Idempotency-Key. A fixed per-test value is fine here — these tests
+	// exercise lifecycle transitions, not replay semantics, and the stub
+	// store below does not implement claim/replay (that belongs to the
+	// real Postgres-backed tests in internal/store).
+	req.Header.Set("Idempotency-Key", "test-"+method+"-"+path)
 	rr := httptest.NewRecorder()
 	r.ServeHTTP(rr, req)
 	return rr

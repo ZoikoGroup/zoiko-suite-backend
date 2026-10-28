@@ -398,29 +398,62 @@ func (s *PgStore) ListEntries(ctx context.Context, sourceEntityID, targetEntityI
 // it would be silently overwritten. Returns domain.ErrInvalidPairTransition
 // in that case. A change of status is recorded in the pair's transition
 // history in the same transaction.
-func (s *PgStore) UpdateMatch(ctx context.Context, entry *domain.IntercompanyEntry, attempt *domain.MatchAttempt, actorID, correlationID string) error {
+//
+// idempotencyKey is claimed inside the same transaction: a repeat for the
+// same key and command replays the entry as it now stands; the same key for
+// a different command or entry is a conflict.
+func (s *PgStore) UpdateMatch(ctx context.Context, entry *domain.IntercompanyEntry, attempt *domain.MatchAttempt, idempotencyKey, actorID, correlationID string) (*domain.IntercompanyEntry, error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
-		return domain.ErrIdentityMissing
+		return nil, domain.ErrIdentityMissing
 	}
 
 	// A match produces exactly these two outcomes; any other target status
 	// belongs to a lifecycle command with its own guard (pair_lifecycle.go).
 	if entry.MatchStatus != domain.MatchStatusMatched && entry.MatchStatus != domain.MatchStatusMismatch {
-		return domain.ErrInvalidPairTransition
+		return nil, domain.ErrInvalidPairTransition
 	}
 	if attempt == nil || attempt.Outcome != entry.MatchStatus || attempt.IntercompanyEntryID != entry.IntercompanyEntryID {
-		return fmt.Errorf("match attempt does not describe this outcome")
+		return nil, fmt.Errorf("match attempt does not describe this outcome")
 	}
 
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+	var result *domain.IntercompanyEntry
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		current, period, err := lockPair(ctx, tx, tenantID, entry.IntercompanyEntryID)
 		if err != nil {
 			return err
 		}
 		if !slices.Contains(domain.MatchableStatuses, current) {
+			// Before refusing, check if this is a replay.
+			replay, claimErr := claimIdempotency(ctx, tx, tenantID, idempotencyKey, "MATCH", entry.IntercompanyEntryID)
+			if claimErr != nil {
+				return claimErr
+			}
+			if replay {
+				loaded, err := loadEntry(ctx, tx, tenantID, entry.IntercompanyEntryID)
+				if err != nil {
+					return err
+				}
+				result = loaded
+				return nil
+			}
 			return domain.ErrInvalidPairTransition
 		}
+
+		// Claim the key after the status guard, inside the same transaction.
+		replay, err := claimIdempotency(ctx, tx, tenantID, idempotencyKey, "MATCH", entry.IntercompanyEntryID)
+		if err != nil {
+			return err
+		}
+		if replay {
+			loaded, err := loadEntry(ctx, tx, tenantID, entry.IntercompanyEntryID)
+			if err != nil {
+				return err
+			}
+			result = loaded
+			return nil
+		}
+
 		now := time.Now().UTC()
 		res, err := tx.Exec(ctx, `
 			UPDATE intercompany_entries
@@ -452,18 +485,25 @@ func (s *PgStore) UpdateMatch(ctx context.Context, entry *domain.IntercompanyEnt
 		entry.TenantID = tenantID
 		entry.UpdatedAt = now
 
+		loaded, err := loadEntry(ctx, tx, tenantID, entry.IntercompanyEntryID)
+		if err != nil {
+			return err
+		}
+		result = loaded
+
 		switch entry.MatchStatus {
 		case domain.MatchStatusMatched:
 			// "matched" is the event's real name; "posted" is kept only as
 			// its legacy event_type for one release so a consumer still
 			// filtering on the old name keeps working (SPEC_DEVIATIONS B11).
-			return s.enqueueEntryEvent(ctx, tx, "matched", "intercompany.entry.posted", actorID, correlationID, entry)
+			return s.enqueueEntryEvent(ctx, tx, "matched", "intercompany.entry.posted", actorID, correlationID, loaded)
 		case domain.MatchStatusMismatch:
-			return s.enqueueEntryEvent(ctx, tx, "mismatch-detected", "intercompany.mismatch.detected", actorID, correlationID, entry)
+			return s.enqueueEntryEvent(ctx, tx, "mismatch-detected", "intercompany.mismatch.detected", actorID, correlationID, loaded)
 		default:
 			// The other lifecycle commands use their own store methods
 			// (pair_lifecycle.go), not this one.
 			return nil
 		}
 	})
+	return result, err
 }

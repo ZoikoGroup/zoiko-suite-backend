@@ -1,0 +1,21 @@
+# Doc 09 register entry
+- Filename: ZoikoSuite_Suivo_Chatbot_Document_09_Administration_Console_Knowledge_Operations_and_Human_Handoff.md
+- Document ID (exact): ZS-SUIVO-ENG-009
+- Title (exact, from the title line, not the ID line): Administration Console, Knowledge Operations & Human Handoff Specification
+- Version (exact): VERSION 1.0
+- Date (exact): 24 OCTOBER 2026
+- Status / approval wording (quote the full sentence): APPROVAL STATUS AND IMPORTANT LIMITATION FOR FOUNDER / GLOBAL CTO / PRODUCT / SECURITY / SUPPORT / KNOWLEDGE GOVERNANCE APPROVAL. This document describes target operations, not verified running staff consoles, CRM integrations, helpdesk licences, live case volumes, staffing levels, response-time commitments or repository code. All example routes, roles, SLAs, schemas and navigation are proposals requiring engineering and business owner confirmation.
+- Approver roles (exactly as written in the status or approval text): FOUNDER / GLOBAL CTO / PRODUCT / SECURITY / SUPPORT / KNOWLEDGE GOVERNANCE
+- Classification (if stated): Internal controlled engineering document
+- Other document IDs mentioned in lines 1—80 (list each ID + the line number):
+  - ZS-SUIVO-ENG-009 (line 18)
+  - Docs 01—08 (line 20)
+- Line numbers where each value above was found:
+  - Document ID (exact): line 18
+  - Title (exact): line 7
+  - Version (exact): line 9
+  - Date (exact): line 9
+  - Status / approval wording: line 13
+  - Approver roles: line 13
+  - Classification: not found in lines 1—80
+  - Other document IDs: line 18, line 20

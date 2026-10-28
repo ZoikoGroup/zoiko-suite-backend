@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	chimw "github.com/go-chi/chi/v5/middleware"
 	"go.uber.org/zap"
+	apicontract "zoiko.io/identity-envelope/apicontract"
 	authzpkg "zoiko.io/siem-integration-svc/internal/authz"
 	"zoiko.io/siem-integration-svc/internal/domain"
 	svcenvelope "zoiko.io/siem-integration-svc/internal/envelope"
@@ -32,11 +34,11 @@ import (
 func requireTenant(w http.ResponseWriter, r *http.Request) (string, bool) {
 	tenantID := r.Header.Get("X-Tenant-ID")
 	if tenantID == "" {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusUnauthorized)
-		_ = json.NewEncoder(w).Encode(map[string]string{
-			"error":   "missing_tenant_scope",
-			"message": "X-Tenant-ID is required — the gateway sets it from a verified identity envelope",
+		apicontract.WriteProblem(w, r, apicontract.Problem{
+			Status:    http.StatusUnauthorized,
+			Code:      "missing_tenant_scope",
+			Detail:    "X-Tenant-ID is required — the gateway sets it from a verified identity envelope",
+			Retryable: false,
 		})
 		return "", false
 	}
@@ -89,20 +91,24 @@ func New(s store.Store, az AuthzChecker, l *zap.Logger) *Handler {
 //
 // The correct control for those two routes is a SERVICE identity — mutual
 // TLS, which is exactly what mtls-management-svc exists to issue — not a
-// user principal. Until that is wired, they remain tenant-scoped only, and
-// the residual exposure is logged as its own tracker row rather than
-// papered over: a caller holding a tenant header can inject fabricated
-// security events, and can enumerate exporter names and endpoint URLs.
-// Event injection into a SIEM feed is a real concern (it is how an attacker
-// buries a trail), so this is a gap being named, not dismissed.
+// user principal. Until that is wired, POST /v1/siem/stream remains
+// tenant-scoped only, and the residual exposure is logged as its own tracker
+// row rather than papered over: a caller holding a tenant header can inject
+// fabricated security events. Event injection into a SIEM feed is a real
+// concern (it is how an attacker buries a trail), so this is a gap being
+// named, not dismissed.
 //
-// What that residual exposure no longer includes is the credential itself:
-// domain.SIEMExporter.AuthToken is now json:"-", so the list route cannot
-// serialise it regardless of who calls it. That was the actual leak.
+// GET /v1/siem/exporters no longer lists anything unauthorized (28 Oct 2026).
+// A caller WITH a principal is a person: it must name legal_entity_id and is
+// authorized SIEM_EXPORTER_READ there, like every other read. A caller
+// WITHOUT one is the fan-out lookup above, and gets only what those clients
+// decode — the id and status of each ACTIVE exporter — never a name,
+// platform, legal entity or endpoint URL. The credential was already out of
+// reach: domain.SIEMExporter.AuthToken is json:"-".
 func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
 	principalID := r.Header.Get("X-Principal-Id")
 	if principalID == "" {
-		h.errJSON(w, http.StatusUnauthorized,
+		h.errJSON(w, r, http.StatusUnauthorized,
 			"X-Principal-Id is required — the gateway sets it from a verified identity envelope")
 		return "", false
 	}
@@ -114,11 +120,11 @@ func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (stri
 func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID, legalEntityID, actionType string) bool {
 	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionType); err != nil {
 		if errors.Is(err, authzpkg.ErrAuthorizationDenied) {
-			h.errJSON(w, http.StatusForbidden, "not authorized to perform this action")
+			h.errJSON(w, r, http.StatusForbidden, "not authorized to perform this action")
 			return false
 		}
 		h.logger.Error("authorization check failed", zap.Error(err))
-		h.errJSON(w, http.StatusServiceUnavailable, "authorization service unavailable")
+		h.errJSON(w, r, http.StatusServiceUnavailable, "authorization service unavailable")
 		return false
 	}
 	return true
@@ -142,6 +148,8 @@ func NewRouter(h *Handler) http.Handler {
 	// /v1/context/resolve. TestServiceToServiceRoutesStillWork pins it.
 	envelopePolicy := svcenvelope.ServicePolicy()
 	envelopePolicy.ExemptPaths = []string{"/v1/siem/stream"}
+	// Refusals rendered as RFC 9457 problem+json, like every other error here.
+	r.Use(apicontract.EnvelopeRefusals)
 	r.Use(svcenvelope.Middleware(envelopePolicy, svcenvelope.DefaultReporter()))
 	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -164,11 +172,11 @@ func (h *Handler) CreateExporter(w http.ResponseWriter, r *http.Request) {
 	}
 	var req domain.CreateExporterRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.errJSON(w, 400, "invalid body")
+		h.errJSON(w, r, 400, "invalid body")
 		return
 	}
 	if err := req.Validate(); err != nil {
-		h.errJSON(w, 400, err.Error())
+		h.errJSON(w, r, 400, err.Error())
 		return
 	}
 	principalID, ok := h.requirePrincipal(w, r)
@@ -186,10 +194,10 @@ func (h *Handler) CreateExporter(w http.ResponseWriter, r *http.Request) {
 		AuthToken:     req.AuthToken,
 	}
 	if err := h.store.CreateExporter(r.Context(), tenantID, exp); err != nil {
-		h.errJSON(w, 500, "failed to create exporter")
+		h.errJSON(w, r, 500, "failed to create exporter")
 		return
 	}
-	h.okJSON(w, 201, exp)
+	h.okJSON(w, r, 201, exp)
 }
 
 func (h *Handler) GetExporter(w http.ResponseWriter, r *http.Request) {
@@ -203,7 +211,7 @@ func (h *Handler) GetExporter(w http.ResponseWriter, r *http.Request) {
 	}
 	exp, err := h.store.GetExporterByID(r.Context(), tenantID, chi.URLParam(r, "id"))
 	if err != nil {
-		h.errJSON(w, 404, "exporter not found")
+		h.errJSON(w, r, 404, "exporter not found")
 		return
 	}
 	// Authorized against the exporter row's own legal entity, never a
@@ -212,7 +220,7 @@ func (h *Handler) GetExporter(w http.ResponseWriter, r *http.Request) {
 	if !h.authorize(w, r, principalID, exp.LegalEntityID, SiemExporterRead) {
 		return
 	}
-	h.okJSON(w, 200, exp)
+	h.okJSON(w, r, 200, exp)
 }
 
 func (h *Handler) ListExporters(w http.ResponseWriter, r *http.Request) {
@@ -220,11 +228,55 @@ func (h *Handler) ListExporters(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	exps, _ := h.store.ListExporters(r.Context(), tenantID, r.URL.Query().Get("legal_entity_id"))
+	// No principal: the service-to-service fan-out lookup (see the note above
+	// requirePrincipal). Only which exporters are ACTIVE, nothing that
+	// describes them.
+	if strings.TrimSpace(r.Header.Get("X-Principal-Id")) == "" {
+		exps, err := h.store.ListExporters(r.Context(), tenantID, "")
+		if err != nil {
+			h.errJSON(w, r, http.StatusServiceUnavailable, "could not list exporters")
+			return
+		}
+		refs := make([]exporterRef, 0, len(exps))
+		for _, e := range exps {
+			if e.Status == domain.ExporterActive {
+				refs = append(refs, exporterRef{ID: e.ID, Status: e.Status})
+			}
+		}
+		h.okJSON(w, r, 200, map[string]interface{}{"data": refs, "count": len(refs)})
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	// legal_entity_id is REQUIRED for a person: it is the authorization scope,
+	// and an optional scope is one that disables itself.
+	legalEntityID := r.URL.Query().Get("legal_entity_id")
+	if legalEntityID == "" {
+		h.errJSON(w, r, http.StatusBadRequest,
+			"legal_entity_id query parameter is required — it is the authorization scope for this listing")
+		return
+	}
+	if !h.authorize(w, r, principalID, legalEntityID, SiemExporterRead) {
+		return
+	}
+	exps, err := h.store.ListExporters(r.Context(), tenantID, legalEntityID)
+	if err != nil {
+		h.errJSON(w, r, http.StatusServiceUnavailable, "could not list exporters")
+		return
+	}
 	if exps == nil {
 		exps = []domain.SIEMExporter{}
 	}
-	h.okJSON(w, 200, map[string]interface{}{"data": exps, "count": len(exps)})
+	h.okJSON(w, r, 200, map[string]interface{}{"data": exps, "count": len(exps)})
+}
+
+// exporterRef is all the principal-less fan-out lookup is told about an
+// exporter.
+type exporterRef struct {
+	ID     string                `json:"id"`
+	Status domain.ExporterStatus `json:"status"`
 }
 
 func (h *Handler) StreamEvent(w http.ResponseWriter, r *http.Request) {
@@ -234,11 +286,11 @@ func (h *Handler) StreamEvent(w http.ResponseWriter, r *http.Request) {
 	}
 	var req domain.StreamEventRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.errJSON(w, 400, "invalid body")
+		h.errJSON(w, r, 400, "invalid body")
 		return
 	}
 	if err := req.Validate(); err != nil {
-		h.errJSON(w, 400, err.Error())
+		h.errJSON(w, r, 400, err.Error())
 		return
 	}
 	evt := &domain.SIEMEvent{
@@ -250,10 +302,10 @@ func (h *Handler) StreamEvent(w http.ResponseWriter, r *http.Request) {
 		Payload:    req.Payload,
 	}
 	if err := h.store.StreamEvent(r.Context(), tenantID, evt); err != nil {
-		h.errJSON(w, 404, err.Error())
+		h.errJSON(w, r, 404, err.Error())
 		return
 	}
-	h.okJSON(w, 201, evt)
+	h.okJSON(w, r, 201, evt)
 }
 
 func (h *Handler) ListEvents(w http.ResponseWriter, r *http.Request) {
@@ -278,13 +330,13 @@ func (h *Handler) ListEvents(w http.ResponseWriter, r *http.Request) {
 	// defences are weakest.
 	exporterID := r.URL.Query().Get("exporter_id")
 	if exporterID == "" {
-		h.errJSON(w, http.StatusBadRequest,
+		h.errJSON(w, r, http.StatusBadRequest,
 			"exporter_id query parameter is required — it identifies the authorization scope for this listing")
 		return
 	}
 	exp, err := h.store.GetExporterByID(r.Context(), tenantID, exporterID)
 	if err != nil {
-		h.errJSON(w, 404, "exporter not found")
+		h.errJSON(w, r, 404, "exporter not found")
 		return
 	}
 	if !h.authorize(w, r, principalID, exp.LegalEntityID, SiemEventRead) {
@@ -294,14 +346,23 @@ func (h *Handler) ListEvents(w http.ResponseWriter, r *http.Request) {
 	if evts == nil {
 		evts = []domain.SIEMEvent{}
 	}
-	h.okJSON(w, 200, map[string]interface{}{"data": evts, "count": len(evts)})
+	h.okJSON(w, r, 200, map[string]interface{}{"data": evts, "count": len(evts)})
 }
 
-func (h *Handler) okJSON(w http.ResponseWriter, code int, v interface{}) {
+// errJSON answers a refusal that names no code of its own. The code is the
+// status's class (apicontract.CodeForStatus), never a blanket internal_error,
+// so a caller has a stable value to match on (ZS-API-001 §12).
+func (h *Handler) errJSON(w http.ResponseWriter, r *http.Request, code int, msg string) {
+	apicontract.WriteProblem(w, r, apicontract.Problem{
+		Status:    code,
+		Code:      apicontract.CodeForStatus(code),
+		Detail:    msg,
+		Retryable: code >= 500,
+	})
+}
+
+func (h *Handler) okJSON(w http.ResponseWriter, r *http.Request, code int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(v)
-}
-func (h *Handler) errJSON(w http.ResponseWriter, code int, msg string) {
-	h.okJSON(w, code, map[string]string{"error": msg})
 }

@@ -7,14 +7,16 @@ import (
 	"github.com/google/uuid"
 
 	"zoiko.io/payment-initiation-adapter-svc/internal/domain"
+	"zoiko.io/payment-initiation-adapter-svc/internal/middleware"
 )
 
 // stubStore is a real, working in-memory implementation of store.Store —
 // replicates PgStore's actual state-machine and uniqueness semantics.
 type stubStore struct {
-	attempts      map[string]*domain.PaymentInitiationAttempt
-	byIdempotency map[string]string // idempotency_key -> attempt_id
-	events        map[string][]domain.AttemptEvent
+	attempts          map[string]*domain.PaymentInitiationAttempt
+	byIdempotency     map[string]string // platform-wide, like uq_payment_initiation_attempts_idempotency_key
+	idempotencyTenant map[string]string // idempotency_key -> owning tenant (RLS-visible lookup)
+	events            map[string][]domain.AttemptEvent
 
 	// control-population stub state (control_population_test.go)
 	popTenant string
@@ -22,26 +24,15 @@ type stubStore struct {
 	popPage   *domain.ControlPopulationPage
 	popErr    error
 	popCalls  int
-}
 
-// QueryPaymentAttempts records the query it was given and returns the configured page.
-func (s *stubStore) QueryPaymentAttempts(_ context.Context, tenantID string, q domain.PaymentAttemptsQuery) (*domain.ControlPopulationPage, error) {
-	s.popCalls++
-	s.popTenant, s.popQuery = tenantID, q
-	if s.popErr != nil {
-		return nil, s.popErr
-	}
-	if s.popPage != nil {
-		return s.popPage, nil
-	}
-	return &domain.ControlPopulationPage{Watermark: "pa1:n=0;md5=x"}, nil
 }
 
 func newStubStore() *stubStore {
 	return &stubStore{
-		attempts:      map[string]*domain.PaymentInitiationAttempt{},
-		byIdempotency: map[string]string{},
-		events:        map[string][]domain.AttemptEvent{},
+		attempts:          map[string]*domain.PaymentInitiationAttempt{},
+		byIdempotency:     map[string]string{},
+		idempotencyTenant: map[string]string{},
+		events:            map[string][]domain.AttemptEvent{},
 	}
 }
 
@@ -75,6 +66,7 @@ func (s *stubStore) PrepareAttempt(_ context.Context, tenantID string, req domai
 	}
 	s.attempts[a.AttemptID] = a
 	s.byIdempotency[req.IdempotencyKey] = a.AttemptID
+	s.idempotencyTenant[req.IdempotencyKey] = tenantID
 	s.recordEvent(a, domain.EventInitiationPrepared, "", principalID)
 	return a, nil
 }
@@ -87,15 +79,15 @@ func (s *stubStore) FindAttempt(_ context.Context, attemptID string) (*domain.Pa
 	return a, nil
 }
 
-func (s *stubStore) FindByIdempotencyKey(_ context.Context, idempotencyKey string) (*domain.PaymentInitiationAttempt, error) {
+func (s *stubStore) FindByIdempotencyKey(ctx context.Context, idempotencyKey string) (*domain.PaymentInitiationAttempt, error) {
 	id, ok := s.byIdempotency[idempotencyKey]
-	if !ok {
+	if !ok || s.idempotencyTenant[idempotencyKey] != middleware.TenantFromContext(ctx) {
 		return nil, domain.ErrAttemptNotFound
 	}
 	return s.attempts[id], nil
 }
 
-func (s *stubStore) MarkSubmitted(_ context.Context, attemptID, providerRequestID, responseRef, principalID string) (*domain.PaymentInitiationAttempt, error) {
+func (s *stubStore) MarkSubmitted(_ context.Context, attemptID, providerRequestID, responseRef, principalID, _ string) (*domain.PaymentInitiationAttempt, error) {
 	a, ok := s.attempts[attemptID]
 	if !ok || !(a.Status == domain.StatusPrepared || a.Status == domain.StatusPendingUnknown) {
 		return nil, domain.ErrInvalidTransition
@@ -110,7 +102,7 @@ func (s *stubStore) MarkSubmitted(_ context.Context, attemptID, providerRequestI
 	return a, nil
 }
 
-func (s *stubStore) MarkPendingUnknown(_ context.Context, attemptID, principalID string) (*domain.PaymentInitiationAttempt, error) {
+func (s *stubStore) MarkPendingUnknown(_ context.Context, attemptID, principalID, _ string) (*domain.PaymentInitiationAttempt, error) {
 	a, ok := s.attempts[attemptID]
 	if !ok || !(a.Status == domain.StatusPrepared || a.Status == domain.StatusPendingUnknown) {
 		return nil, domain.ErrInvalidTransition
@@ -121,7 +113,7 @@ func (s *stubStore) MarkPendingUnknown(_ context.Context, attemptID, principalID
 	return a, nil
 }
 
-func (s *stubStore) MarkRejected(_ context.Context, attemptID, reason, principalID string) (*domain.PaymentInitiationAttempt, error) {
+func (s *stubStore) MarkRejected(_ context.Context, attemptID, reason, principalID, _ string) (*domain.PaymentInitiationAttempt, error) {
 	a, ok := s.attempts[attemptID]
 	if !ok || !(a.Status == domain.StatusPrepared || a.Status == domain.StatusPendingUnknown) {
 		return nil, domain.ErrInvalidTransition
@@ -144,7 +136,7 @@ func (s *stubStore) CancelAttempt(_ context.Context, attemptID, principalID stri
 	return a, nil
 }
 
-func (s *stubStore) QuarantineAttempt(_ context.Context, attemptID string, req domain.QuarantineRequest, principalID string) (*domain.PaymentInitiationAttempt, error) {
+func (s *stubStore) QuarantineAttempt(_ context.Context, attemptID string, req domain.QuarantineRequest, principalID, _ string) (*domain.PaymentInitiationAttempt, error) {
 	a, ok := s.attempts[attemptID]
 	if !ok || !(a.Status == domain.StatusPrepared || a.Status == domain.StatusPendingUnknown) {
 		return nil, domain.ErrInvalidTransition

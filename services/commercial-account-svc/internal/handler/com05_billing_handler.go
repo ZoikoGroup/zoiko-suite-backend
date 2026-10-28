@@ -3,6 +3,7 @@
 package handler
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strings"
@@ -121,6 +122,21 @@ func (h *BillingHandler) fail(w http.ResponseWriter, r *http.Request, err error)
 	writeFailure(w, r, h.logger, err)
 }
 
+// invoiceCandidateSellerReader is an optional capability of the concrete
+// store. Replay of seller commands has no tenant context yet, and candidate
+// ids are globally unique, so the seller plane is the correct read scope.
+// Keeping it optional preserves the BillingStore test seam.
+type invoiceCandidateSellerReader interface {
+	GetInvoiceCandidateAsSeller(ctx context.Context, candidateID string) (*domain.InvoiceCandidate, error)
+}
+
+func (h *BillingHandler) candidateForReplay(ctx context.Context, candidateID string) (*domain.InvoiceCandidate, error) {
+	if reader, ok := h.store.(invoiceCandidateSellerReader); ok {
+		return reader.GetInvoiceCandidateAsSeller(ctx, candidateID)
+	}
+	return h.store.GetInvoiceCandidate(ctx, candidateID)
+}
+
 func (h *BillingHandler) principal(w http.ResponseWriter, r *http.Request) (string, bool) {
 	p := strings.TrimSpace(r.Header.Get("X-Principal-Id"))
 	if p == "" {
@@ -223,6 +239,15 @@ func (h *BillingHandler) OpenBillingAccount(w http.ResponseWriter, r *http.Reque
 	}
 	created, err := h.store.OpenBillingAccount(r.Context(), b, cmd.claim)
 	if err != nil {
+		var replay *domain.IdempotentReplayError
+		if errors.As(err, &replay) {
+			ctx := svcmiddleware.WithTenant(r.Context(), req.OrganizationID)
+			if existing, gerr := h.store.GetBillingAccount(ctx, req.OrganizationID); gerr == nil {
+				w.Header().Set("Idempotent-Replayed", "true")
+				writeJSON(w, http.StatusCreated, existing)
+				return
+			}
+		}
 		h.fail(w, r, err)
 		return
 	}
@@ -293,7 +318,7 @@ func (h *BillingHandler) GenerateInvoiceCandidate(w http.ResponseWriter, r *http
 	if err != nil {
 		var replay *domain.IdempotentReplayError
 		if errors.As(err, &replay) {
-			if existing, gerr := h.store.GetInvoiceCandidate(r.Context(), replay.ResourceID); gerr == nil {
+			if existing, gerr := h.candidateForReplay(r.Context(), replay.ResourceID); gerr == nil {
 				w.Header().Set("Idempotent-Replayed", "true")
 				writeJSON(w, http.StatusCreated, existing)
 				return
@@ -349,7 +374,7 @@ func (h *BillingHandler) InvoiceCandidateAction(w http.ResponseWriter, r *http.R
 		return
 	}
 	if action == "approve" {
-		if existing, err := h.store.GetInvoiceCandidate(r.Context(), id); err == nil && existing != nil {
+		if existing, err := h.candidateForReplay(r.Context(), id); err == nil && existing != nil {
 			if principal == existing.CreatedByPrincipalID {
 				h.fail(w, r, domain.ErrInvoiceCandidateSelfApproval)
 				return
@@ -358,7 +383,7 @@ func (h *BillingHandler) InvoiceCandidateAction(w http.ResponseWriter, r *http.R
 		c, err := h.store.ApproveInvoiceCandidate(r.Context(), id, principal, h.now(), cmd.claim)
 		if err != nil {
 			if HandleIdempotentReplay(w, r, err, func(resourceID string) (any, error) {
-				return h.store.GetInvoiceCandidate(r.Context(), resourceID)
+				return h.candidateForReplay(r.Context(), resourceID)
 			}) {
 				return
 			}
@@ -370,6 +395,20 @@ func (h *BillingHandler) InvoiceCandidateAction(w http.ResponseWriter, r *http.R
 	}
 	inv, err := h.store.IssueInvoice(r.Context(), id, principal, h.now(), cmd.claim)
 	if err != nil {
+		var replay *domain.IdempotentReplayError
+		if errors.As(err, &replay) {
+			// IssueInvoice's claim resource id is the candidate id, but its
+			// result is the invoice. Resolve the candidate first, then read
+			// the issued invoice under that candidate's tenant scope.
+			if c, gerr := h.candidateForReplay(r.Context(), replay.ResourceID); gerr == nil && c.IssuedInvoiceID != nil {
+				ctx := svcmiddleware.WithTenant(r.Context(), c.OrganizationID)
+				if existing, ierr := h.store.GetInvoice(ctx, *c.IssuedInvoiceID); ierr == nil {
+					w.Header().Set("Idempotent-Replayed", "true")
+					writeJSON(w, http.StatusCreated, existing)
+					return
+				}
+			}
+		}
 		if HandleIdempotentReplay(w, r, err, func(resourceID string) (any, error) {
 			return h.store.GetInvoice(r.Context(), resourceID)
 		}) {

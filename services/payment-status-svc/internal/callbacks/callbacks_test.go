@@ -198,6 +198,7 @@ func TestStoreOutcomesMapToResponses(t *testing.T) {
 	for outcome, want := range map[string]int{
 		store.OutcomeApplied: 200, store.OutcomeDuplicate: 200, store.OutcomeRegressionBlocked: 200, store.OutcomeStaleIgnored: 200,
 		store.OutcomeUnknownPayment: 202, store.OutcomeAmbiguousPayment: 202,
+		store.OutcomeConflictBlocked: 202, store.OutcomeProviderMismatch: 202,
 	} {
 		p, _, st, _ := newProc("hmac-sha256-hex")
 		st.res = &store.CallbackResult{Outcome: outcome}

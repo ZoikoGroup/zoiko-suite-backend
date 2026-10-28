@@ -13,7 +13,7 @@ import (
 	svcmiddleware "zoiko.io/treasury-svc/internal/middleware"
 )
 
-func seedCashPositionAccount(t *testing.T, ctx context.Context, tenantID, legalEntityID string, balance float64) {
+func seedCashPositionAccount(t *testing.T, ctx context.Context, tenantID, legalEntityID string, balance domain.Decimal) {
 	t.Helper()
 	s := testStore
 	acct := newTestAccount(tenantID, legalEntityID)
@@ -41,11 +41,11 @@ func TestPgStore_CashPositionSnapshot_CalculateThenPublish(t *testing.T) {
 
 	snap, err := s.CreateCashPositionSnapshot(ctx, domain.CalculateCashPositionParams{
 		TenantID: tenantID, LegalEntityID: legalEntityID, ReportingCurrency: "USD",
-		RestrictedAmount: 1000, ActorPrincipalID: "analyst-1", CorrelationID: "corr-calc-1",
+		RestrictedAmount: "1000", ActorPrincipalID: "analyst-1", CorrelationID: "corr-calc-1",
 	}, domain.CashPositionCalculation{
-		BankBalance: 10000, PendingAPCommitments: 2000, PayrollObligations: 500, TaxLiabilities: 300,
-		AvailableCash: 10000 - 1000 - 2000 - 500 - 300, AsOfTimestamp: time.Now().UTC(),
-		AccountBreakdown: []domain.CashPositionAccountLine{{BankAccountID: "acct-1", AccountName: "Main", Balance: 10000, AsOfTimestamp: time.Now().UTC()}},
+		BankBalance: "10000", PendingAPCommitments: "2000", PayrollObligations: "500", TaxLiabilities: "300",
+		AvailableCash: "6200", AsOfTimestamp: time.Now().UTC(),
+		AccountBreakdown: []domain.CashPositionAccountLine{{BankAccountID: "acct-1", AccountName: "Main", Balance: "10000", AsOfTimestamp: time.Now().UTC()}},
 	})
 	if err != nil {
 		t.Fatalf("create snapshot: %v", err)
@@ -53,7 +53,7 @@ func TestPgStore_CashPositionSnapshot_CalculateThenPublish(t *testing.T) {
 	if snap.Status != domain.CashPositionCalculated || snap.EffectiveStatus != domain.CashPositionCalculated {
 		t.Fatalf("expected CALCULATED, got status=%s effective=%s", snap.Status, snap.EffectiveStatus)
 	}
-	if snap.AvailableCash != 6200 {
+	if snap.AvailableCash != domain.Decimal("6200") {
 		t.Fatalf("expected available_cash=6200 (10000-1000-2000-500-300), got %v", snap.AvailableCash)
 	}
 	if len(snap.AccountBreakdown) != 1 || snap.AccountBreakdown[0].BankAccountID != "acct-1" {
@@ -87,7 +87,7 @@ func TestPgStore_CashPositionSnapshot_StaleCannotPublish(t *testing.T) {
 	snap, err := s.CreateCashPositionSnapshot(ctx, domain.CalculateCashPositionParams{
 		TenantID: tenantID, LegalEntityID: legalEntityID, ReportingCurrency: "USD", ActorPrincipalID: "analyst-1",
 	}, domain.CashPositionCalculation{
-		BankBalance: 5000, AvailableCash: 5000, AsOfTimestamp: time.Now().UTC(), HasStaleComponent: true,
+		BankBalance: "5000", AvailableCash: "5000", AsOfTimestamp: time.Now().UTC(), HasStaleComponent: true,
 	})
 	if err != nil {
 		t.Fatalf("create snapshot: %v", err)
@@ -123,7 +123,7 @@ func TestPgStore_CashPositionSnapshot_RefreshSupersedesPrior(t *testing.T) {
 
 	first, err := s.CreateCashPositionSnapshot(ctx, domain.CalculateCashPositionParams{
 		TenantID: tenantID, LegalEntityID: legalEntityID, ReportingCurrency: "USD", ActorPrincipalID: "analyst-1",
-	}, domain.CashPositionCalculation{BankBalance: 1000, AvailableCash: 1000, AsOfTimestamp: time.Now().UTC()})
+	}, domain.CashPositionCalculation{BankBalance: "1000", AvailableCash: "1000", AsOfTimestamp: time.Now().UTC()})
 	if err != nil {
 		t.Fatalf("create first: %v", err)
 	}
@@ -133,7 +133,7 @@ func TestPgStore_CashPositionSnapshot_RefreshSupersedesPrior(t *testing.T) {
 
 	second, err := s.CreateCashPositionSnapshot(ctx, domain.CalculateCashPositionParams{
 		TenantID: tenantID, LegalEntityID: legalEntityID, ReportingCurrency: "USD", ActorPrincipalID: "analyst-1",
-	}, domain.CashPositionCalculation{BankBalance: 1500, AvailableCash: 1500, AsOfTimestamp: time.Now().UTC()})
+	}, domain.CashPositionCalculation{BankBalance: "1500", AvailableCash: "1500", AsOfTimestamp: time.Now().UTC()})
 	if err != nil {
 		t.Fatalf("create second: %v", err)
 	}
@@ -164,13 +164,13 @@ func TestPgStore_CashPositionSnapshot_SupersededIsImmutable(t *testing.T) {
 
 	first, err := s.CreateCashPositionSnapshot(ctx, domain.CalculateCashPositionParams{
 		TenantID: tenantID, LegalEntityID: legalEntityID, ReportingCurrency: "USD", ActorPrincipalID: "analyst-1",
-	}, domain.CashPositionCalculation{BankBalance: 1000, AvailableCash: 1000, AsOfTimestamp: time.Now().UTC()})
+	}, domain.CashPositionCalculation{BankBalance: "1000", AvailableCash: "1000", AsOfTimestamp: time.Now().UTC()})
 	if err != nil {
 		t.Fatalf("create first: %v", err)
 	}
 	second, err := s.CreateCashPositionSnapshot(ctx, domain.CalculateCashPositionParams{
 		TenantID: tenantID, LegalEntityID: legalEntityID, ReportingCurrency: "USD", ActorPrincipalID: "analyst-1",
-	}, domain.CashPositionCalculation{BankBalance: 2000, AvailableCash: 2000, AsOfTimestamp: time.Now().UTC()})
+	}, domain.CashPositionCalculation{BankBalance: "2000", AvailableCash: "2000", AsOfTimestamp: time.Now().UTC()})
 	if err != nil {
 		t.Fatalf("create second: %v", err)
 	}
@@ -208,7 +208,7 @@ func TestPgStore_CashPositionSnapshot_AsOfReconstructsHistory(t *testing.T) {
 
 	first, err := s.CreateCashPositionSnapshot(ctx, domain.CalculateCashPositionParams{
 		TenantID: tenantID, LegalEntityID: legalEntityID, ReportingCurrency: "USD", ActorPrincipalID: "analyst-1",
-	}, domain.CashPositionCalculation{BankBalance: 1000, AvailableCash: 1000, AsOfTimestamp: time.Now().UTC()})
+	}, domain.CashPositionCalculation{BankBalance: "1000", AvailableCash: "1000", AsOfTimestamp: time.Now().UTC()})
 	if err != nil {
 		t.Fatalf("create first: %v", err)
 	}
@@ -220,7 +220,7 @@ func TestPgStore_CashPositionSnapshot_AsOfReconstructsHistory(t *testing.T) {
 
 	if _, err := s.CreateCashPositionSnapshot(ctx, domain.CalculateCashPositionParams{
 		TenantID: tenantID, LegalEntityID: legalEntityID, ReportingCurrency: "USD", ActorPrincipalID: "analyst-1",
-	}, domain.CashPositionCalculation{BankBalance: 2000, AvailableCash: 2000, AsOfTimestamp: time.Now().UTC()}); err != nil {
+	}, domain.CashPositionCalculation{BankBalance: "2000", AvailableCash: "2000", AsOfTimestamp: time.Now().UTC()}); err != nil {
 		t.Fatalf("create second: %v", err)
 	}
 
@@ -228,12 +228,12 @@ func TestPgStore_CashPositionSnapshot_AsOfReconstructsHistory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetCashPositionAsOf: %v", err)
 	}
-	if asOf == nil || asOf.BankBalance != 1000 {
+	if asOf == nil || asOf.BankBalance != domain.Decimal("1000") {
 		t.Fatalf("expected the FIRST snapshot's bank_balance=1000 at the midpoint, got %+v", asOf)
 	}
 
 	current, err := s.GetCashPositionAsOf(ctx, tenantID, legalEntityID, "USD", time.Now().UTC())
-	if err != nil || current == nil || current.BankBalance != 2000 {
+	if err != nil || current == nil || current.BankBalance != domain.Decimal("2000") {
 		t.Fatalf("expected the SECOND (latest) snapshot's bank_balance=2000 as of now, got %+v err=%v", current, err)
 	}
 }
@@ -250,12 +250,12 @@ func TestPgStore_ListCurrencyBreakdown_ReturnsLatestPerCurrency(t *testing.T) {
 
 	if _, err := s.CreateCashPositionSnapshot(ctx, domain.CalculateCashPositionParams{
 		TenantID: tenantID, LegalEntityID: legalEntityID, ReportingCurrency: "USD", ActorPrincipalID: "analyst-1",
-	}, domain.CashPositionCalculation{BankBalance: 1000, AvailableCash: 1000, AsOfTimestamp: time.Now().UTC()}); err != nil {
+	}, domain.CashPositionCalculation{BankBalance: "1000", AvailableCash: "1000", AsOfTimestamp: time.Now().UTC()}); err != nil {
 		t.Fatalf("create USD: %v", err)
 	}
 	if _, err := s.CreateCashPositionSnapshot(ctx, domain.CalculateCashPositionParams{
 		TenantID: tenantID, LegalEntityID: legalEntityID, ReportingCurrency: "EUR", ActorPrincipalID: "analyst-1",
-	}, domain.CashPositionCalculation{BankBalance: 500, AvailableCash: 500, AsOfTimestamp: time.Now().UTC()}); err != nil {
+	}, domain.CashPositionCalculation{BankBalance: "500", AvailableCash: "500", AsOfTimestamp: time.Now().UTC()}); err != nil {
 		t.Fatalf("create EUR: %v", err)
 	}
 

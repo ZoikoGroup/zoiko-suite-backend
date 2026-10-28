@@ -52,16 +52,16 @@ type prepareAttemptRequest struct {
 	// own GetTreasuryTransferFingerprint, instead of the AuthorizationSourcePaymentAuthorization
 	// path (which would look for it in payment-authorization-svc) or
 	// leaving it unverified.
-	AuthorizationID          string
-	AuthorizationSource      string
-	PayerAccountRef          string
-	PayeeRef                 string
-	Amount                   float64
-	Currency                 string
-	ExecutionDate            time.Time
-	PaymentReference         string
-	PayerAccountVerified     bool
-	IdempotencyKey           string
+	AuthorizationID      string
+	AuthorizationSource  string
+	PayerAccountRef      string
+	PayeeRef             string
+	Amount               domain.Decimal
+	Currency             string
+	ExecutionDate        time.Time
+	PaymentReference     string
+	PayerAccountVerified bool
+	IdempotencyKey       string
 }
 
 // authorizationSourceTreasury must match payment-initiation-adapter-svc's
@@ -84,7 +84,7 @@ type paymentInitiationAttempt struct {
 // AttemptID once the attempt is durably SUBMITTED, or a sentinel error —
 // PENDING_UNKNOWN and REJECTED_BEFORE_SUBMISSION are both surfaced as
 // errors, since neither is a safe state for the caller to treat as done.
-func (c *TransferClients) SubmitTreasuryPayment(ctx context.Context, tenantID, principalID, correlationID, legalEntityID, transferID, payerAccountRef, payeeRef, fingerprint string, amount float64, currency string) (string, error) {
+func (c *TransferClients) SubmitTreasuryPayment(ctx context.Context, tenantID, principalID, correlationID, legalEntityID, transferID, payerAccountRef, payeeRef, fingerprint string, amount domain.Decimal, currency string) (string, error) {
 	body, err := json.Marshal(prepareAttemptRequest{
 		LegalEntityID: legalEntityID, SourceReference: "treasury-transfer:" + transferID,
 		AuthorizationFingerprint: fingerprint, AuthorizationID: transferID, AuthorizationSource: authorizationSourceTreasury,
@@ -134,9 +134,9 @@ func (c *TransferClients) SubmitTreasuryPayment(ctx context.Context, tenantID, p
 // configured in general-ledger-svc; documented here as the honest
 // deployment prerequisite rather than a fabricated account code.
 type postingEventLine struct {
-	MappingKey   string  `json:"mapping_key"`
-	DebitAmount  float64 `json:"debit_amount,omitempty"`
-	CreditAmount float64 `json:"credit_amount,omitempty"`
+	MappingKey   string         `json:"mapping_key"`
+	DebitAmount  domain.Decimal `json:"debit_amount,omitempty"`
+	CreditAmount domain.Decimal `json:"credit_amount,omitempty"`
 }
 
 type postAccountingEventRequest struct {
@@ -158,7 +158,7 @@ type postingExecutionResponse struct {
 // general-ledger-svc's own (tenant_id, source_event_id) uniqueness makes
 // a resumed ExecuteTreasuryTransfer's re-post return the prior execution
 // rather than posting twice.
-func (c *TransferClients) PostTreasuryTransferJournal(ctx context.Context, tenantID, principalID, correlationID, legalEntityID, fiscalPeriod, transferID string, amount float64) (string, error) {
+func (c *TransferClients) PostTreasuryTransferJournal(ctx context.Context, tenantID, principalID, correlationID, legalEntityID, fiscalPeriod, transferID string, amount domain.Decimal) (string, error) {
 	body, err := json.Marshal(postAccountingEventRequest{
 		LegalEntityID: legalEntityID, FiscalPeriod: fiscalPeriod,
 		Description:   "Treasury transfer " + transferID,
@@ -184,11 +184,11 @@ func (c *TransferClients) PostTreasuryTransferJournal(ctx context.Context, tenan
 }
 
 type createIntercompanyEntryRequest struct {
-	SourceLegalEntityID string  `json:"source_legal_entity_id"`
-	TargetLegalEntityID string  `json:"target_legal_entity_id"`
-	SourceJournalID     string  `json:"source_journal_id"`
-	Amount              float64 `json:"amount"`
-	CurrencyCode        string  `json:"currency_code"`
+	SourceLegalEntityID string         `json:"source_legal_entity_id"`
+	TargetLegalEntityID string         `json:"target_legal_entity_id"`
+	SourceJournalID     string         `json:"source_journal_id"`
+	Amount              domain.Decimal `json:"amount"`
+	CurrencyCode        string         `json:"currency_code"`
 }
 
 type intercompanyEntry struct {
@@ -199,7 +199,7 @@ type intercompanyEntry struct {
 // the journal_id PostTreasuryTransferJournal just produced —
 // intercompany-accounting-svc dedupes on source_journal_id, so a resumed
 // call is safe to repeat.
-func (c *TransferClients) PairTreasuryTransferIntercompany(ctx context.Context, tenantID, principalID, correlationID, sourceLegalEntityID, targetLegalEntityID, sourceJournalID string, amount float64, currencyCode string) (string, error) {
+func (c *TransferClients) PairTreasuryTransferIntercompany(ctx context.Context, tenantID, principalID, correlationID, sourceLegalEntityID, targetLegalEntityID, sourceJournalID string, amount domain.Decimal, currencyCode string) (string, error) {
 	body, err := json.Marshal(createIntercompanyEntryRequest{
 		SourceLegalEntityID: sourceLegalEntityID, TargetLegalEntityID: targetLegalEntityID,
 		SourceJournalID: sourceJournalID, Amount: amount, CurrencyCode: currencyCode,

@@ -40,3 +40,8 @@ b4634f13b0fe152baeb1971abbf6c1c68a7c8852:services/eventing/integration/integrati
 # Both lines now carry `gitleaks:allow`; these cover the commit already pushed.
 75ca7b900d4ba4afc2bbeff36c78409750fc6b90:deployments/docker-compose.yml:generic-api-key:674
 75ca7b900d4ba4afc2bbeff36c78409750fc6b90:services/identity-context-svc/internal/config/config_mfa_test.go:generic-api-key:8
+#
+# 4f6ff90d (public-ai-svc STEPs 3-4): api_test.go line 283 was a random UUID
+# used as an Idempotency-Key header in a test, flagged as generic-api-key. It
+# is not a secret; the line is now a low-entropy key with `gitleaks:allow`.
+4f6ff90dcb85ebc12164c3cc35c68050263177c5:services/public-ai-svc/internal/httpapi/api_test.go:generic-api-key:283

@@ -255,3 +255,19 @@ func TestDateOnly(t *testing.T) {
 		t.Error("expected an error for a non-date")
 	}
 }
+
+// gl_cash_account_code is decoded (A2a): it is the account a candidate
+// journal must post to. A line without one — null, as bank-reconciliation-svc
+// sends for lines ingested before it recorded one — decodes to "".
+func TestListUnmatchedLines_DecodesGLCashAccountCode(t *testing.T) {
+	withCash := strings.TrimSuffix(lineJSON("sl-1", "10"), "}") + `,"gl_cash_account_code":"1000-Cash"}`
+	withNull := strings.TrimSuffix(lineJSON("sl-2", "10"), "}") + `,"gl_cash_account_code":null}`
+	c := serve(t, http.StatusOK, "["+withCash+","+withNull+"]", nil)
+	lines, err := c.ListUnmatchedLines(context.Background(), scope, testRun())
+	if err != nil {
+		t.Fatalf("ListUnmatchedLines: %v", err)
+	}
+	if lines[0].GLCashAccountCode != "1000-Cash" || lines[1].GLCashAccountCode != "" {
+		t.Fatalf("gl_cash_account_code = %q, %q; want 1000-Cash and empty", lines[0].GLCashAccountCode, lines[1].GLCashAccountCode)
+	}
+}
