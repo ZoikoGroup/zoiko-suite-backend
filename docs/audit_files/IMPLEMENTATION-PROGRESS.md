@@ -226,7 +226,26 @@ Mutation checks:
 
 All of these were restored.
 
-**Noted, not fixed (not API-2):** siem-integration's `GET /v1/siem/exporters` lists a tenant's exporters with no authorization check, while creating one is authorized at the entity.
+**Docker, verified 28 Oct once Docker was up:**
+- `docker compose -f docker-compose.phase6.yml build` succeeds for mtls-management, siem-integration, carta and key-management. So does `docker compose -f docker-compose.yml build mtls-management-svc`.
+- Live probe of the new siem image, run alone with authorization-svc unreachable:
+  - `/healthz` answers 200.
+  - A principal-less list answers 200 `{"count":0,"data":[]}` with `Zoiko-Request-Id` echoed.
+  - A person's list without `legal_entity_id` answers a 400 problem.
+  - A person's list with an entity answers a 503 problem (`retryable: true`, fails closed).
+  - An envelope-less POST answers a 401 problem with `X-Envelope-Contract: violated` and `Cache-Control: private, no-store`.
+
+**Fixed 28 Oct (found during this review, not API-2): siem-integration exporter list had no authorization.**
+- `GET /v1/siem/exporters` returned every exporter's name, platform, legal entity and endpoint URL to anyone holding a tenant header. It stayed unguarded because five services' SIEM clients (authorization, gateway-auth, identity-context, key-management, mtls-management) call it with only `X-Tenant-ID`. All five decode only `id` and `status`.
+- A caller with `X-Principal-Id` (a person) must now name `legal_entity_id` and is authorized `SIEM_EXPORTER_READ` at that entity. A principal-less caller (the fan-out lookup) gets only `{id, status}` of ACTIVE exporters. The five clients are unchanged and keep working; `TestServiceToServiceRoutesStillWork` still passes.
+- Its siblings `SIEM_EXPORTER_CREATE`, `SIEM_EXPORTER_READ` and `SIEM_EVENT_READ` were never registered (R5), so every guarded siem route answered 403 to every person. access-control `000024` registers them (CREATE HIGH, EXPORTER_READ STANDARD, EVENT_READ HIGH). It also adds two templates: `SECURITY_OPERATIONS_ANALYST` (the two reads) and `SECURITY_SIEM_ADMINISTRATOR` (create and read exporters).
+- Tests: `TestListExporters_PersonIsAuthorizedAtTheEntity` (200/400/403/503, scope and action asserted), `TestListExporters_ServiceLookupSeesOnlyActiveIDs` and access-control `TestSIEMActions_AreRegisteredAndCarriedByATemplate`.
+- Results:
+  - siem: 36/0/0.
+  - access-control: untagged 154/0/0; `-tags=integration` store 39/0/0.
+  - `000024` applies up, then down, then up again on a fresh database.
+  - Removing the new `authorize` call fails the person test.
+- Still open: `POST /v1/siem/stream` remains tenant-scoped only until siem gets a service identity (mTLS). The `CARTA_*` and `KEY_*` actions those services check are not registered in access-control either (SEC-5, SEC-1).
 
 ## Decisions taken during implementation
 
