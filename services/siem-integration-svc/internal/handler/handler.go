@@ -143,6 +143,8 @@ func NewRouter(h *Handler) http.Handler {
 	// /v1/context/resolve. TestServiceToServiceRoutesStillWork pins it.
 	envelopePolicy := svcenvelope.ServicePolicy()
 	envelopePolicy.ExemptPaths = []string{"/v1/siem/stream"}
+	// Refusals rendered as RFC 9457 problem+json, like every other error here.
+	r.Use(apicontract.EnvelopeRefusals)
 	r.Use(svcenvelope.Middleware(envelopePolicy, svcenvelope.DefaultReporter()))
 	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -298,10 +300,13 @@ func (h *Handler) ListEvents(w http.ResponseWriter, r *http.Request) {
 	h.okJSON(w, r, 200, map[string]interface{}{"data": evts, "count": len(evts)})
 }
 
+// errJSON answers a refusal that names no code of its own. The code is the
+// status's class (apicontract.CodeForStatus), never a blanket internal_error,
+// so a caller has a stable value to match on (ZS-API-001 §12).
 func (h *Handler) errJSON(w http.ResponseWriter, r *http.Request, code int, msg string) {
 	apicontract.WriteProblem(w, r, apicontract.Problem{
 		Status:    code,
-		Code:      "internal_error",
+		Code:      apicontract.CodeForStatus(code),
 		Detail:    msg,
 		Retryable: code >= 500,
 	})
