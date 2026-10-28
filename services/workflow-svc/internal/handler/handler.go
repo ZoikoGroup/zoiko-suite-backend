@@ -16,8 +16,8 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
-	apicontract "zoiko.io/identity-envelope/apicontract"
 	idenv "zoiko.io/identity-envelope"
+	apicontract "zoiko.io/identity-envelope/apicontract"
 
 	"zoiko.io/workflow-svc/internal/authz"
 	"zoiko.io/workflow-svc/internal/documentvault"
@@ -2369,27 +2369,39 @@ func writeStoreErr(w http.ResponseWriter, r *http.Request, log *zap.Logger, err 
 // writeJSON serialises v. An error body ({"error": code, ...}) is rendered as
 // RFC 9457 application/problem+json with the §16 error_class via apicontract.
 func writeJSON(w http.ResponseWriter, r *http.Request, status int, v any) {
-	if errResp, ok := v.(map[string]any); ok {
-		if errCode, ok := errResp["error"].(string); ok {
-			message := ""
-			if msg, ok := errResp["message"].(string); ok {
-				message = msg
-			}
-			extra := map[string]any{}
-			for k, v := range errResp {
-				if k != "error" && k != "message" && k != "correlation_id" {
-					extra[k] = v
-				}
-			}
-			apicontract.WriteProblem(w, r, apicontract.Problem{
-				Status:    status,
-				Code:      errCode,
-				Detail:    message,
-				Retryable: status >= 500,
-				Extra:     extra,
-			})
-			return
+	// Most refusals are map[string]string literals; both map shapes are
+	// error bodies. A 2xx (or a 409 decision result) has no "error" member.
+	var errResp map[string]any
+	switch t := v.(type) {
+	case map[string]any:
+		errResp = t
+	case map[string]string:
+		errResp = make(map[string]any, len(t))
+		for k, s := range t {
+			errResp[k] = s
 		}
+	}
+	if errCode, ok := errResp["error"].(string); ok && status >= 400 {
+		message := ""
+		if msg, ok := errResp["message"].(string); ok {
+			message = msg
+		}
+		correlationID, _ := errResp["correlation_id"].(string)
+		extra := map[string]any{}
+		for k, v := range errResp {
+			if k != "error" && k != "message" && k != "correlation_id" {
+				extra[k] = v
+			}
+		}
+		apicontract.WriteProblem(w, r, apicontract.Problem{
+			Status:        status,
+			Code:          errCode,
+			Detail:        message,
+			CorrelationID: correlationID,
+			Retryable:     status >= 500,
+			Extra:         extra,
+		})
+		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
