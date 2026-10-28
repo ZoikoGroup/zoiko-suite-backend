@@ -557,3 +557,77 @@ func TestRulePackInstantiationIsGovernedAndRepeatable(t *testing.T) {
 		t.Fatalf("the author cannot approve a pack rule: %d", st)
 	}
 }
+
+// Rollout readiness: what a pack (or the active rules) names must resolve for the tenant before the first event arrives.
+func TestRolloutReadinessReportsUnmappedKeysUntilTheTenantIsConfigured(t *testing.T) {
+	e := newKEnv(t)
+	st, b := e.call("GET", "/v1/rollout-readiness?pack=bank-standard&on=2026-03-01", e.tenant, "builder", nil)
+	if st != 200 || b["ready"] != false || b["blocking"].(float64) < 1 {
+		t.Fatalf("an unconfigured tenant is not ready: %d %v", st, b)
+	}
+	items := b["items"].([]any)
+	var keys []string
+	for _, it := range items {
+		m := it.(map[string]any)
+		if m["kind"] == "MAPPING" && m["state"] != "UNMAPPED" {
+			t.Fatalf("%v", m)
+		}
+		if m["kind"] == "MAPPING" {
+			keys = append(keys, m["key"].(string))
+		}
+	}
+	if len(keys) == 0 {
+		t.Fatal("bank-standard names mapping keys")
+	}
+	// the mapping exists but its account does not: still blocked, and the report says so
+	if err := e.exec(`INSERT INTO account_mappings (account_mapping_id, tenant_id, mapping_key, account_code, effective_from, created_by_principal_id) VALUES ($1,$2,$3,'9999','2026-01-01','seed')`, uuid.NewString(), e.tenant, keys[0]); err != nil {
+		t.Fatal(err)
+	}
+	_, b = e.call("GET", "/v1/rollout-readiness?pack=bank-standard&on=2026-03-01", e.tenant, "builder", nil)
+	var found bool
+	for _, it := range b["items"].([]any) {
+		if m := it.(map[string]any); m["key"] == keys[0] {
+			found = m["state"] == "ACCOUNT_MISSING" && m["account_code"] == "9999"
+		}
+	}
+	if !found {
+		t.Fatalf("a mapping to a missing account must be reported: %v", b)
+	}
+	// a mapping that starts after the date is not in force on it
+	if err := e.exec(`UPDATE account_mappings SET effective_from='2026-06-01' WHERE tenant_id=$1`, e.tenant); err != nil {
+		t.Fatal(err)
+	}
+	_, b = e.call("GET", "/v1/rollout-readiness?pack=bank-standard&on=2026-03-01", e.tenant, "builder", nil)
+	for _, it := range b["items"].([]any) {
+		if m := it.(map[string]any); m["key"] == keys[0] && m["state"] != "UNMAPPED" {
+			t.Fatalf("not yet in force: %v", m)
+		}
+	}
+	// configure everything: chart accounts + mappings, then it is ready, and the tenant's own active rules agree
+	if err := e.exec(`DELETE FROM account_mappings WHERE tenant_id=$1`, e.tenant); err != nil {
+		t.Fatal(err)
+	}
+	for i, k := range keys {
+		code := fmt.Sprintf("7%03d", i)
+		if err := e.exec(`INSERT INTO chart_of_accounts (account_id, tenant_id, account_code, account_name, account_type, created_by_principal_id) VALUES ($1,$2,$3,$4,'ASSET','seed')`, uuid.NewString(), e.tenant, code, "acct "+code); err != nil {
+			t.Fatal(err)
+		}
+		if err := e.exec(`INSERT INTO account_mappings (account_mapping_id, tenant_id, mapping_key, account_code, effective_from, created_by_principal_id) VALUES ($1,$2,$3,$4,'2026-01-01','seed')`, uuid.NewString(), e.tenant, k, code); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st, b = e.call("GET", "/v1/rollout-readiness?pack=bank-standard&on=2026-07-01", e.tenant, "builder", nil)
+	if st != 200 || b["ready"] != true || b["blocking"].(float64) != 0 {
+		t.Fatalf("fully configured: %d %v", st, b)
+	}
+	st, b = e.call("GET", "/v1/rollout-readiness", e.tenant, "builder", nil)
+	if st != 200 || b["source"] != "active-rule-sets" || b["rule_count"].(float64) != 0 || b["ready"] != true {
+		t.Fatalf("no active rules need nothing: %d %v", st, b)
+	}
+	if st, _ := e.call("GET", "/v1/rollout-readiness?pack=nope", e.tenant, "builder", nil); st != 404 {
+		t.Fatalf("%d", st)
+	}
+	if st, _ := e.call("GET", "/v1/rollout-readiness?on=01-03-2026", e.tenant, "builder", nil); st != 400 {
+		t.Fatalf("%d", st)
+	}
+}

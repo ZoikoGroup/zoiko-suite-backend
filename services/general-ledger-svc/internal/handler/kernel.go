@@ -151,6 +151,7 @@ func RegisterKernelRoutes(r chi.Router, h *KernelHandler) {
 	r.Post("/v1/reconciliation-tolerances", h.CreateReconciliationTolerance)
 	r.Get("/v1/reconciliation-tolerances", h.ListReconciliationTolerances)
 	r.Get("/v1/counterparty-balances", h.GetCounterpartyBalances)
+	r.Get("/v1/rollout-readiness", h.GetRolloutReadiness)
 	r.Get("/v1/posting-rule-packs", h.ListRulePacks)
 	r.Post("/v1/posting-rule-packs/{name}/instantiate", h.InstantiateRulePack)
 	r.Get("/v1/account-applicability/{account_code}", h.GetAccountScope)

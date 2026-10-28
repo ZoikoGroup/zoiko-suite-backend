@@ -71,11 +71,12 @@ func TestTemplatesSeedTheArchetypes(t *testing.T) {
 		byCode[tpl.TemplateCode] = tpl.LatestActions
 		if tpl.IsArchetype {
 			archetypes++
-			// 000021 published version 2 of the read-only archetype (the
-			// governance-platform reads); every other archetype is at 1.
+			// 000021 and 000022 published versions 2 and 3 of the read-only
+			// archetype (governance-platform and accounting-kernel reads);
+			// every other archetype is at 1.
 			want := 1
 			if tpl.TemplateCode == "VIEWER_AUDITOR_READ_ONLY" {
-				want = 2
+				want = 3
 			}
 			require.Equal(t, want, tpl.LatestVersion, tpl.TemplateCode)
 			require.NotEmpty(t, tpl.LatestActions)
@@ -97,6 +98,53 @@ func TestTemplatesSeedTheArchetypes(t *testing.T) {
 	require.Equal(t, []string{"payment.read", "payment.release"}, v.PermittedActions)
 	_, err = s.GetTemplateVersion(ctx, "TREASURY_RELEASER", 9)
 	require.ErrorIs(t, err, domain.ErrTemplateVersionNotFound)
+}
+
+// 000022: every action the Global Accounting Kernel checks is registered, the
+// maker-checker pairs are split across templates, and the read-only archetype
+// reads the kernel.
+func TestAccountingKernelActionsAreRegisteredAndSplit(t *testing.T) {
+	s := store.New(appPool)
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantGov)
+	list, err := s.ListTemplates(ctx)
+	require.NoError(t, err)
+	byCode := map[string][]string{}
+	for _, tpl := range list {
+		byCode[tpl.TemplateCode] = tpl.LatestActions
+	}
+
+	cat := store.NewPermissionCatalogue(store.New(appPool))
+	names := []string{"GL_BOOK_MANAGE", "GL_RULE_APPROVE", "GL_PERIOD_SEAL", "GL_PERIOD_REOPEN", "GL_CONSOLIDATION_CERTIFY",
+		"GL_ALLOCATION_RUN", "GL_RECON_APPROVE", "GL_SNAPSHOT_SIGN", "GL_RECURRING_GENERATE", "GL_FX_RATE_APPROVE"}
+	got, err := cat.Lookup(ctx, names)
+	require.NoError(t, err)
+	for _, n := range names {
+		require.Contains(t, got, n, "registered")
+	}
+	for _, high := range []string{"GL_RULE_APPROVE", "GL_PERIOD_SEAL", "GL_PERIOD_REOPEN", "GL_CONSOLIDATION_CERTIFY", "GL_RECON_APPROVE", "GL_SNAPSHOT_SIGN"} {
+		require.Equal(t, domain.RiskHigh, got[high].RiskTier, high)
+	}
+
+	// Maker-checker: the author cannot approve or activate, the preparer cannot
+	// certify, the runner cannot accept a difference, the closer cannot reopen.
+	for _, pair := range [][2]string{
+		{"GL_RULE_AUTHOR", "GL_RULE_APPROVE"}, {"GL_RULE_AUTHOR", "GL_RULE_ACTIVATE"},
+		{"GL_CONSOLIDATION_PREPARER", "GL_CONSOLIDATION_CERTIFY"}, {"GL_ALLOCATION_PREPARER", "GL_ALLOCATION_APPROVE"},
+		{"GL_RECONCILIATION_ANALYST", "GL_RECON_APPROVE"}, {"GL_PERIOD_CLOSE_OPERATOR", "GL_PERIOD_REOPEN"},
+		{"GL_KERNEL_ADMINISTRATOR", "GL_FX_RATE_APPROVE"},
+	} {
+		require.NotEmpty(t, byCode[pair[0]], pair[0])
+		require.NotContains(t, byCode[pair[0]], pair[1], pair[0]+" must not hold "+pair[1])
+	}
+	require.Contains(t, byCode["GL_RULE_APPROVER"], "GL_RULE_ACTIVATE")
+	require.Contains(t, byCode["GL_SUBLEDGER_POSTER"], "GL_EVENT_REGISTER")
+	require.Contains(t, byCode["GL_SUBLEDGER_POSTER"], "GL_POSTING_EXECUTE")
+	require.Contains(t, byCode["VIEWER_AUDITOR_READ_ONLY"], "GL_CONSOLIDATION_READ")
+	require.Contains(t, byCode["VIEWER_AUDITOR_READ_ONLY"], "WORKFLOW_READ", "version 3 keeps what version 2 granted")
+	for _, a := range byCode["VIEWER_AUDITOR_READ_ONLY"] {
+		require.NotContains(t, a, "MANAGE")
+		require.NotContains(t, a, "APPROVE")
+	}
 }
 
 func TestTemplateRoleCreateAndUpgradeEnqueueTheirEvents(t *testing.T) {

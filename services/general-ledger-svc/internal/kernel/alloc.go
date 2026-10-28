@@ -31,12 +31,23 @@ const AllocFixed = "FIXED"
 // MapAllocationRounding is the mapping key of the account that carries a run's rounding residual.
 const MapAllocationRounding = "ALLOCATION_ROUNDING"
 
-// AllocRecipient is where part of the pool goes: an account, with the dimensions the allocated cost is to carry.
+// Mapping keys of the intercompany accounts a cross-entity allocation uses: the source entity books what it recharged as a receivable
+// from the recipient entity, and the recipient entity books the cost against a payable to the source entity.
+const (
+	MapAllocationICReceivable = "ALLOCATION_IC_RECEIVABLE"
+	MapAllocationICPayable    = "ALLOCATION_IC_PAYABLE"
+)
+
+// AllocRecipient is where part of the pool goes: an account, with the dimensions the allocated cost is to carry. A recipient that
+// names another legal entity (and that entity's book) is charged across entities: the cost lands in that entity's ledger and the two
+// entities are left with an intercompany receivable and payable the consolidation can pair.
 type AllocRecipient struct {
-	Key        string            `json:"key"`
-	Account    string            `json:"account_code"`
-	Dimensions map[string]string `json:"dimensions,omitempty"`
-	Percent    string            `json:"percent,omitempty"` // FIXED rules only
+	Key           string            `json:"key"`
+	Account       string            `json:"account_code"`
+	Dimensions    map[string]string `json:"dimensions,omitempty"`
+	Percent       string            `json:"percent,omitempty"` // FIXED rules only
+	LegalEntityID string            `json:"legal_entity_id,omitempty"`
+	BookID        string            `json:"book_id,omitempty"`
 }
 
 // AllocContent is the governed content of an allocation rule version.
@@ -73,12 +84,31 @@ type PoolLine struct {
 
 // AllocShare is one recipient's part of a run.
 type AllocShare struct {
-	Key        string            `json:"key"`
-	Account    string            `json:"account_code"`
-	Dimensions map[string]string `json:"dimensions,omitempty"`
-	Driver     string            `json:"driver"`
-	Exact      string            `json:"exact_share"`
-	Amount     string            `json:"amount"`
+	Key           string            `json:"key"`
+	Account       string            `json:"account_code"`
+	Dimensions    map[string]string `json:"dimensions,omitempty"`
+	Driver        string            `json:"driver"`
+	Exact         string            `json:"exact_share"`
+	Amount        string            `json:"amount"`
+	LegalEntityID string            `json:"legal_entity_id,omitempty"`
+	BookID        string            `json:"book_id,omitempty"`
+}
+
+// AllocRemoteJournal is the journal a cross-entity allocation posted in a recipient entity's book, and the one that reversed it.
+type AllocRemoteJournal struct {
+	LegalEntityID     string `json:"legal_entity_id"`
+	BookID            string `json:"accounting_book_id"`
+	BookCode          string `json:"book_code"`
+	Currency          string `json:"currency"`
+	JournalID         string `json:"journal_id"`
+	JournalNumber     string `json:"journal_number,omitempty"`
+	ReversalJournalID string `json:"reversal_journal_id,omitempty"`
+}
+
+// AllocRemote is what a cross-entity allocation posts in one recipient book: the cost lines and the intercompany payable.
+type AllocRemote struct {
+	Book  Book
+	Lines []AllocLine
 }
 
 // AllocPopulation is the immutable record of what a run took and distributed.
@@ -122,6 +152,8 @@ type AllocRun struct {
 	ReversedAt        *time.Time      `json:"reversed_at,omitempty"`
 	ReversalReason    string          `json:"reversal_reason,omitempty"`
 	Existing          bool            `json:"existing,omitempty"`
+	// RemoteJournals are the journals posted in the books of other entities by a cross-entity allocation (none for a same-entity run).
+	RemoteJournals []AllocRemoteJournal `json:"remote_journals,omitempty"`
 }
 
 // AllocPlan is what the repository writes in one transaction: the journal and the run.
@@ -135,17 +167,19 @@ type AllocPlan struct {
 	SourceAccts []string
 	SourceDims  map[string]string
 	Lines       []AllocLine
+	Remote      []AllocRemote
 	Actor       string
 	Correlation string
 }
 
 // AllocLine is one line of the allocation journal, signed: positive is a debit.
 type AllocLine struct {
-	Account     string
-	Amount      string
-	Dimensions  map[string]string
-	Description string
-	Ref         string
+	Account      string
+	Amount       string
+	Dimensions   map[string]string
+	Description  string
+	Ref          string
+	Counterparty string
 }
 
 // AllocRepo is the persistence boundary of allocations.
@@ -225,6 +259,17 @@ func (c *AllocContent) Validate() error {
 		keys[r.Key] = true
 		if strings.TrimSpace(r.Account) == "" || src[r.Account] {
 			return allocBad("content.recipients", fmt.Sprintf("recipient %s needs an account that is not one of the source accounts", r.Key))
+		}
+		if (r.LegalEntityID == "") != (r.BookID == "") {
+			return allocBad("content.recipients", fmt.Sprintf("recipient %s: a cross-entity recipient names both its legal entity and that entity's book", r.Key))
+		}
+		if r.LegalEntityID != "" {
+			if _, e := uuid.Parse(r.LegalEntityID); e != nil {
+				return allocBad("content.recipients", fmt.Sprintf("recipient %s: legal_entity_id is not an entity id", r.Key))
+			}
+			if _, e := uuid.Parse(r.BookID); e != nil {
+				return allocBad("content.recipients", fmt.Sprintf("recipient %s: book_id is not a book id", r.Key))
+			}
 		}
 		if c.Driver == AllocFixed {
 			p, ok := new(big.Rat).SetString(r.Percent)
@@ -423,44 +468,116 @@ func (s *AllocService) Run(ctx context.Context, tenant string, a Actor, req Allo
 	}
 
 	// every account and dimension the journal will use must be valid for this book on the date
-	check := func(code string, dims map[string]string) error {
-		info, aerr := s.Dir.ResolveAccount(ctx, AccountRef{AccountCode: code}, bk.BookID, asOf)
+	check := func(book *Book, code string, dims map[string]string) error {
+		info, aerr := s.Dir.ResolveAccount(ctx, AccountRef{AccountCode: code}, book.BookID, asOf)
 		if aerr != nil || info == nil || !info.Active || !info.Postable {
 			return exc(FamCOA, "ACCOUNT_UNAVAILABLE", "account %s is not an active, postable account", code).with("account_code", code)
 		}
 		if len(info.BookIDs) > 0 {
 			in := false
 			for _, id := range info.BookIDs {
-				in = in || id == bk.BookID
+				in = in || id == book.BookID
 			}
 			if !in {
-				return exc(FamCOA, "ACCOUNT_NOT_IN_BOOK", "account %s is not valid in book %s", code, bk.BookCode).with("account_code", code)
+				return exc(FamCOA, "ACCOUNT_NOT_IN_BOOK", "account %s is not valid in book %s", code, book.BookCode).with("account_code", code)
 			}
 		}
 		for d, v := range dims {
-			okd, derr := s.Dir.DimensionAllowed(ctx, d, v, bk.LegalEntityID, bk.BookID, asOf)
+			okd, derr := s.Dir.DimensionAllowed(ctx, d, v, book.LegalEntityID, book.BookID, asOf)
 			if derr != nil || !okd {
 				return exc(FamDim, "DIMENSION_INVALID", "%s=%s is not an allowed value of dimension %s for this entity on %s", d, v, d, asOf.Format("2006-01-02")).with("dimension", d)
 			}
 		}
 		return nil
 	}
+	// a recipient in another entity is charged in that entity's own book: the book must belong to the entity, be in force, be of the
+	// same type and keep its accounts in the same currency (a cross-currency recharge needs a rate and is not made here)
+	remoteBooks := map[string]*Book{}
 	for _, r := range c.Recipients {
-		if err := check(r.Account, r.Dimensions); err != nil {
+		if r.LegalEntityID == "" {
+			if err := check(bk, r.Account, r.Dimensions); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if r.LegalEntityID == bk.LegalEntityID {
+			return nil, allocBad("content.recipients", fmt.Sprintf("recipient %s names the source entity: leave the entity out for a recipient in the same entity", r.Key))
+		}
+		rb, ok := remoteBooks[r.BookID]
+		if !ok {
+			var rerr error
+			if rb, rerr = s.Books.GetBook(ctx, tenant, r.BookID); rerr != nil {
+				return nil, rerr
+			}
+			remoteBooks[r.BookID] = rb
+		}
+		switch {
+		case rb.LegalEntityID != r.LegalEntityID:
+			return nil, exc(FamRule, "ALLOCATION_RECIPIENT_BOOK", "book %s does not belong to entity %s (recipient %s)", rb.BookCode, r.LegalEntityID, r.Key).with("recipient", r.Key)
+		case !rb.InForce(asOf):
+			return nil, exc(FamRule, "BOOK_NOT_IN_FORCE", "recipient book %s is %s on %s", rb.BookCode, strings.ToLower(rb.Status), asOf.Format("2006-01-02")).with("recipient", r.Key)
+		case rb.BookType != bk.BookType:
+			return nil, exc(FamRule, "ALLOCATION_RECIPIENT_BOOK", "recipient book %s is a %s book and the source book a %s book", rb.BookCode, rb.BookType, bk.BookType).with("recipient", r.Key)
+		case rb.FunctionalCurrency != bk.FunctionalCurrency:
+			return nil, exc(FamFX, "ALLOCATION_CURRENCY_MISMATCH", "recipient book %s keeps its accounts in %s and the source book in %s: a cross-entity allocation is made in one currency", rb.BookCode, rb.FunctionalCurrency, bk.FunctionalCurrency).with("recipient", r.Key)
+		}
+		if err := check(rb, r.Account, r.Dimensions); err != nil {
 			return nil, err
 		}
+	}
+	postable := func(book *Book, key string) (string, error) {
+		info, aerr := s.Dir.ResolveAccount(ctx, AccountRef{MappingKey: key}, book.BookID, asOf)
+		if aerr != nil || info == nil || !info.Active || !info.Postable {
+			return "", exc(FamCOA, "ALLOCATION_ACCOUNT_UNAVAILABLE", "the mapping %s does not resolve to a postable account in book %s on %s: a cross-entity allocation needs it", key, book.BookCode, asOf.Format("2006-01-02")).with("mapping_key", key)
+		}
+		return info.Code, nil
 	}
 
 	pop := AllocPopulation{Currency: bk.FunctionalCurrency, PeriodStart: pstart.Format("2006-01-02"), AsOf: asOf.Format("2006-01-02"), RuleCode: rule.RuleCode, RuleVersion: rule.Version,
 		RuleHash: rule.ContentHash, Pool: pool, DriverName: c.Driver, DriverRef: req.DriverRef, Drivers: snapshot, SourceDims: c.SourceDimensions, PostingDateStr: asOf.Format("2006-01-02")}
 	plan := &AllocPlan{Tenant: tenant, Book: *bk, Rule: *rule, PostingDate: asOf, PeriodStart: pstart, SourceAccts: c.SourceAccounts, SourceDims: c.SourceDimensions, Actor: a.PrincipalID, Correlation: a.CorrelationID}
 	allocated := new(big.Rat)
+	var remotes []*AllocRemote
+	remoteAt := map[string]*AllocRemote{}
+	recharged := map[string]*big.Rat{} // by recipient book: what the source entity is owed
 	for i, r := range c.Recipients {
 		allocated.Add(allocated, amounts[i])
-		pop.Shares = append(pop.Shares, AllocShare{Key: r.Key, Account: r.Account, Dimensions: r.Dimensions, Driver: snapshot[r.Key], Exact: exact[i].FloatString(8), Amount: amounts[i].FloatString(scale)})
-		if amounts[i].Sign() != 0 {
-			plan.Lines = append(plan.Lines, AllocLine{Account: r.Account, Amount: amounts[i].FloatString(scale), Dimensions: r.Dimensions, Description: "allocation " + rule.RuleCode + " to " + r.Key, Ref: "ALLOC_" + r.Key})
+		pop.Shares = append(pop.Shares, AllocShare{Key: r.Key, Account: r.Account, Dimensions: r.Dimensions, Driver: snapshot[r.Key], Exact: exact[i].FloatString(8), Amount: amounts[i].FloatString(scale),
+			LegalEntityID: r.LegalEntityID, BookID: r.BookID})
+		if amounts[i].Sign() == 0 {
+			continue
 		}
+		line := AllocLine{Account: r.Account, Amount: amounts[i].FloatString(scale), Dimensions: r.Dimensions, Description: "allocation " + rule.RuleCode + " to " + r.Key, Ref: "ALLOC_" + r.Key}
+		if r.LegalEntityID == "" {
+			plan.Lines = append(plan.Lines, line)
+			continue
+		}
+		rm, ok := remoteAt[r.BookID]
+		if !ok {
+			rm = &AllocRemote{Book: *remoteBooks[r.BookID]}
+			remoteAt[r.BookID] = rm
+			remotes = append(remotes, rm)
+			recharged[r.BookID] = new(big.Rat)
+		}
+		line.Description = "allocation " + rule.RuleCode + " from " + bk.LegalEntityID + " to " + r.Key
+		rm.Lines = append(rm.Lines, line)
+		recharged[r.BookID].Add(recharged[r.BookID], amounts[i])
+	}
+	// the source entity is owed what it recharged, and each recipient entity owes it: one intercompany line on each side, carrying the
+	// other entity as counterparty so the consolidation pairs them
+	for _, rm := range remotes {
+		amt := recharged[rm.Book.BookID].FloatString(scale)
+		recvAcct, err := postable(bk, MapAllocationICReceivable)
+		if err != nil {
+			return nil, err
+		}
+		payAcct, err := postable(&rm.Book, MapAllocationICPayable)
+		if err != nil {
+			return nil, err
+		}
+		plan.Lines = append(plan.Lines, AllocLine{Account: recvAcct, Amount: amt, Description: "allocation " + rule.RuleCode + " recharged to " + rm.Book.LegalEntityID, Ref: "ALLOC_IC_RECEIVABLE", Counterparty: rm.Book.LegalEntityID})
+		rm.Lines = append(rm.Lines, AllocLine{Account: payAcct, Amount: "-" + amt, Description: "allocation " + rule.RuleCode + " recharged by " + bk.LegalEntityID, Ref: "ALLOC_IC_PAYABLE", Counterparty: bk.LegalEntityID})
+		plan.Remote = append(plan.Remote, *rm)
 	}
 	pop.Residual = residual.FloatString(scale)
 	if residual.Sign() != 0 {
@@ -482,6 +599,11 @@ func (s *AllocService) Run(ctx context.Context, tenant string, a Actor, req Allo
 	if s.Gate != nil {
 		if err := s.Gate.CheckPostable(ctx, tenant, bk.LegalEntityID, req.FiscalPeriod, asOf, false, "", a.PrincipalID); err != nil {
 			return nil, err
+		}
+		for _, rm := range plan.Remote {
+			if err := s.Gate.CheckPostable(ctx, tenant, rm.Book.LegalEntityID, req.FiscalPeriod, asOf, false, "", a.PrincipalID); err != nil {
+				return nil, err
+			}
 		}
 	}
 	plan.Run = AllocRun{RunID: uuid.NewString(), RuleID: rule.RuleID, LegalEntityID: bk.LegalEntityID, BookID: bk.BookID, FiscalPeriod: req.FiscalPeriod, Status: "POSTED", LedgerWatermark: wm,
@@ -509,6 +631,11 @@ func (s *AllocService) Reverse(ctx context.Context, tenant string, a Actor, id, 
 	if s.Gate != nil {
 		if err := s.Gate.CheckPostable(ctx, tenant, run.LegalEntityID, run.FiscalPeriod, pd, false, "", a.PrincipalID); err != nil {
 			return nil, err
+		}
+		for _, rj := range run.RemoteJournals {
+			if err := s.Gate.CheckPostable(ctx, tenant, rj.LegalEntityID, run.FiscalPeriod, pd, false, "", a.PrincipalID); err != nil {
+				return nil, err
+			}
 		}
 	}
 	return s.Repo.ReverseAllocation(ctx, tenant, id, a.PrincipalID, strings.TrimSpace(reason), s.now(), pd, *bk)
