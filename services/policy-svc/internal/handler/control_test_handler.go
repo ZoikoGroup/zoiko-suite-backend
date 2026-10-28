@@ -90,7 +90,7 @@ func (h *Handler) CreateControlTestDefinition(w http.ResponseWriter, r *http.Req
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-if missing := req.missingField(); missing != "" {
+	if missing := req.missingField(); missing != "" {
 		writeError(w, r, http.StatusBadRequest, codeInvalidRequest, "missing_field", "", map[string]any{"field": missing})
 		return
 	}
@@ -232,7 +232,7 @@ func (h *Handler) CreateControlTestExecution(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	if missing := req.missingField(); missing != "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": missing})
+		missingField(w, r, missing)
 		return
 	}
 	if (req.ControlTestExecutionID != "" && !requireUUID(w, r, "control_test_execution_id", req.ControlTestExecutionID)) ||
@@ -408,7 +408,7 @@ func (h *Handler) CreateAttestation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if missing := req.missingField(); missing != "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": missing})
+		missingField(w, r, missing)
 		return
 	}
 	if (req.AttestationID != "" && !requireUUID(w, r, "attestation_id", req.AttestationID)) ||

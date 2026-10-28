@@ -221,6 +221,8 @@ func main() {
 	// or tenant-wide version have no legal entity. Where a body names one, the
 	// handlers reconcile it with X-Legal-Entity-Id (a mismatch is 400).
 	envelopePolicy.LegalEntityID = svcenvelope.NotRequired
+	// Refusals rendered as RFC 9457 problem+json, like every other error here.
+	r.Use(apicontract.EnvelopeRefusals)
 	r.Use(svcenvelope.Middleware(envelopePolicy, svcenvelope.DefaultReporter()))
 
 	h := handler.New(pgStore, resolutionCache, authzClient, handler.Options{

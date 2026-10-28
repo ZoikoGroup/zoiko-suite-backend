@@ -137,6 +137,18 @@ func writeError(w http.ResponseWriter, r *http.Request, status int, code, legacy
 	if detail == "" {
 		detail = legacy
 	}
+	// code is the §16 class (this service's contract before API-2 too); the
+	// specific refusal (policy_not_found, missing_field, ...) stays as
+	// reason_code, which a detail message would otherwise hide.
+	if legacy != "" {
+		if _, taken := extra["reason_code"]; !taken {
+			withReason := map[string]any{"reason_code": legacy}
+			for k, v := range extra {
+				withReason[k] = v
+			}
+			extra = withReason
+		}
+	}
 	apicontract.WriteProblem(w, r, apicontract.Problem{
 		Status:    status,
 		Code:      code,
