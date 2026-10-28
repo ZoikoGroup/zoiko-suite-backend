@@ -965,3 +965,95 @@ groups:
           description: >-
             Dead-lettered events are replayed only with an operator, a different approver, an approval reference and a
             reason, and only into a region this deployment serves. Review them rather than letting them age.
+
+  # ---------------------------------------------------------------------------
+  # Global Accounting Kernel (general-ledger-svc, standard §38)
+  # ---------------------------------------------------------------------------
+  #
+  # Accounting-control failures and infrastructure failures are separate alerts on purpose: a refused posting, an imbalance or a
+  # break is for finance operations, a dependency outage is for the platform team, and neither shows up as a 5xx.
+  - name: gl-accounting-kernel
+    rules:
+      - alert: GLKernelImbalanceDetected
+        expr: increase(gl_kernel_exceptions_total{service="general-ledger-svc",family="AK-BAL"}[15m]) > 0
+        labels:
+          severity: page
+        annotations:
+          summary: "general-ledger-svc: a posting was refused because debits and credits did not balance (AK-BAL)"
+          description: >-
+            Nothing was written, so no ledger state is wrong, but a rule or an event produced an unbalanced proposal.
+            Find the event in the quarantined posting executions and fix the rule, not the data.
+
+      - alert: GLKernelEventsQuarantined
+        expr: >-
+          increase(gl_kernel_exceptions_total{service="general-ledger-svc",family="AK-DATA",code!~".*INVALID.*"}[15m]) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: "general-ledger-svc: events or proposals failed provenance, schema or precision checks (AK-DATA)"
+          description: >-
+            Quarantined executions keep their evidence and wait for a decision. Review them; do not let them age, and never
+            mark one posted by hand.
+
+      - alert: GLKernelPostingRefusalRateHigh
+        expr: >-
+          sum(rate(gl_kernel_commands_total{service="general-ledger-svc",command="post_event",outcome="refused"}[15m]))
+          / sum(rate(gl_kernel_commands_total{service="general-ledger-svc",command="post_event"}[15m])) > 0.10
+          and sum(rate(gl_kernel_commands_total{service="general-ledger-svc",command="post_event"}[15m])) > 0.01
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "general-ledger-svc: over 10% of posting commands are refused by an accounting control"
+          description: >-
+            Look at gl_kernel_exceptions_total by family and code: a missing rule or mapping (AK-RULE, AK-COA), a closed
+            period (AK-PERIOD) or missing dimensions (AK-DIM) usually means a rollout step was skipped.
+
+      - alert: GLKernelDependencyUnavailable
+        expr: >-
+          increase(gl_kernel_commands_total{service="general-ledger-svc",outcome="dependency"}[10m]) > 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "general-ledger-svc: kernel commands are failing because a dependency is unavailable"
+          description: >-
+            The currency registry, the period service or the authorization service is down. The kernel fails closed and
+            writes nothing; commands are safe to retry once the dependency recovers.
+
+      - alert: GLKernelUnexpectedErrors
+        expr: increase(gl_kernel_commands_total{service="general-ledger-svc",outcome="error"}[10m]) > 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "general-ledger-svc: kernel commands are failing with unexpected errors"
+          description: "This is an infrastructure or defect signal, not an accounting refusal. Check the service log by correlation id."
+
+      - alert: GLKernelReconciliationBreak
+        expr: increase(gl_kernel_reconciliation_runs_total{service="general-ledger-svc",status="BREAK"}[1h]) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: "general-ledger-svc: a reconciliation run ended in a break"
+          description: >-
+            A break is a governed case with an owner and an SLA. It blocks the period close gate until it is resolved or
+            accepted as an exception by someone other than the runner.
+
+      - alert: GLKernelPeriodSealRefused
+        expr: increase(gl_kernel_commands_total{service="general-ledger-svc",command="period_seal",outcome="refused"}[1h]) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: "general-ledger-svc: a period seal or reopen was refused"
+          description: "Read the close evidence for the period: open reconciliation cases, failed postings or unrevalued foreign items block a seal."
+
+      - alert: GLKernelPostingLatencyHigh
+        expr: >-
+          histogram_quantile(0.95, sum by (le) (rate(gl_kernel_command_duration_seconds_bucket{service="general-ledger-svc",command="post_event"}[10m]))) > 2
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "general-ledger-svc: p95 posting latency is above 2 seconds"
+          description: "Posting is one transaction; a slow one usually means lock contention on a period seal or an overloaded database."

@@ -43,6 +43,7 @@ type kenv struct {
 	denied sync.Map
 	periods *fakePeriods
 	pg      *store.PgStore
+	obs     *recObs
 }
 
 type fakeAuthz struct{ e *kenv }
@@ -86,11 +87,13 @@ func newKEnv(t *testing.T) *kenv {
 	e.svc = &kernel.Service{Repo: e.repo}
 	e.periods = &fakePeriods{states: map[string]string{}}
 	e.pg = store.New(app, zap.NewNop(), store.WithEventRegion("uk"))
+	e.obs = &recObs{}
 	r := chi.NewRouter()
 	r.Use(svcmiddleware.TenantContext())
 	r.Use(svcenvelope.MiddlewareWithMode(svcenvelope.ServicePolicy(), svcenvelope.ModeObserve, nil))
 	handler.RegisterKernelRoutes(r, handler.NewKernel(e.svc, e.repo, e.repo, fakeUnits{"JPY": 0}, nil, fakeAuthz{e}, zap.NewNop()).
 		WithPeriodGate(handler.ClosePeriodGate{Close: e.periods, Authz: fakeAuthz{e}}).
+		WithObserver(e.obs).
 		WithSigner(kernel.HMACSigner{Key: []byte("test-signing-key-test-signing-key!!"), KeyID: "test-k1"}))
 	handler.RegisterRoutes(r, handler.New(e.pg, nopPublisher{}, fakeAuthz{e}, e.periods, kenvLogger()).
 		WithJournalControls(e.pg, handler.ManualJournalPolicy{EvidenceThresholdCents: 1000000}))

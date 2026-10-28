@@ -49,6 +49,7 @@ func (h *KernelHandler) RunReconciliation(w http.ResponseWriter, r *http.Request
 		h.fail(w, err)
 		return
 	}
+	h.observer().ReconciliationResult(run.Type, run.Status)
 	writeJSON(w, http.StatusCreated, run)
 }
 
