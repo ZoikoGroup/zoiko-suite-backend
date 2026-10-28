@@ -33,6 +33,7 @@ func (r *obsRecorder) WriteHeader(code int) {
 // idempotentCommands answer 200 for a repeat that returned the earlier result and 201 for new work.
 var idempotentCommands = map[string]bool{
 	"register_event": true, "post_event": true, "allocation_run": true, "consolidation_run": true, "revaluation_run": true,
+	"migration_stage": true, "migration_post": true,
 }
 
 // outcomeOf classifies a response: a refusal by an accounting control, an unavailable dependency and an unexpected failure are

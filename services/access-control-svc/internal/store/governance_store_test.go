@@ -71,12 +71,12 @@ func TestTemplatesSeedTheArchetypes(t *testing.T) {
 		byCode[tpl.TemplateCode] = tpl.LatestActions
 		if tpl.IsArchetype {
 			archetypes++
-			// 000021 and 000022 published versions 2 and 3 of the read-only
-			// archetype (governance-platform and accounting-kernel reads);
-			// every other archetype is at 1.
+			// 000021, 000022 and 000023 published versions 2, 3 and 4 of the
+			// read-only archetype (governance-platform, accounting-kernel and
+			// migration reads); every other archetype is at 1.
 			want := 1
 			if tpl.TemplateCode == "VIEWER_AUDITOR_READ_ONLY" {
-				want = 3
+				want = 4
 			}
 			require.Equal(t, want, tpl.LatestVersion, tpl.TemplateCode)
 			require.NotEmpty(t, tpl.LatestActions)
@@ -283,4 +283,31 @@ func TestIdempotencyKeysBindTheFingerprint(t *testing.T) {
 	rec, err = s.ClaimIdempotencyKey(ctx, tenantB, "POST /x", key, fp2)
 	require.NoError(t, err)
 	require.Nil(t, rec, "keys are per tenant")
+}
+
+// 000023: staging, approving and posting an opening balance are three different people.
+func TestMigrationCutoverActionsAreSplitAcrossThreeTemplates(t *testing.T) {
+	s := store.New(appPool)
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantGov)
+	list, err := s.ListTemplates(ctx)
+	require.NoError(t, err)
+	byCode := map[string][]string{}
+	for _, tpl := range list {
+		byCode[tpl.TemplateCode] = tpl.LatestActions
+	}
+	got, err := store.NewPermissionCatalogue(store.New(appPool)).Lookup(ctx, []string{"GL_MIGRATION_APPROVE", "GL_MIGRATION_POST", "GL_MIGRATION_STAGE"})
+	require.NoError(t, err)
+	require.Equal(t, domain.RiskHigh, got["GL_MIGRATION_APPROVE"].RiskTier)
+	require.Equal(t, domain.RiskHigh, got["GL_MIGRATION_POST"].RiskTier)
+	require.Contains(t, got, "GL_MIGRATION_STAGE")
+
+	require.Contains(t, byCode["GL_MIGRATION_PREPARER"], "GL_MIGRATION_STAGE")
+	require.NotContains(t, byCode["GL_MIGRATION_PREPARER"], "GL_MIGRATION_APPROVE")
+	require.NotContains(t, byCode["GL_MIGRATION_PREPARER"], "GL_MIGRATION_POST")
+	require.Equal(t, []string{"GL_MIGRATION_APPROVE", "GL_MIGRATION_READ"}, byCode["GL_MIGRATION_AUTHORITY"])
+	require.Contains(t, byCode["GL_MIGRATION_POSTER"], "GL_MIGRATION_POST")
+	require.NotContains(t, byCode["GL_MIGRATION_POSTER"], "GL_MIGRATION_STAGE")
+	require.NotContains(t, byCode["GL_MIGRATION_POSTER"], "GL_MIGRATION_APPROVE")
+	require.Contains(t, byCode["VIEWER_AUDITOR_READ_ONLY"], "GL_MIGRATION_READ")
+	require.Contains(t, byCode["VIEWER_AUDITOR_READ_ONLY"], "GL_CONSOLIDATION_READ", "version 4 keeps what version 3 granted")
 }
