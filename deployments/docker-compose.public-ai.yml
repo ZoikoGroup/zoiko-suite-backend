@@ -1,0 +1,72 @@
+# Suivo public AI assistant (public-ai-svc, Release R0) — standalone stack.
+#
+# Deliberately NOT part of docker-compose.yml: the public chatbot must have no
+# network route, database or credentials shared with the private ZoikoSuite
+# services (INV-01, Doc 04 §05 zones Z2/Z6, Doc 06 TB-X). It gets its own
+# Postgres instance and its own isolated network.
+#
+#   cp services/public-ai-svc/.env.example deployments/.env.public-ai   # then fill in values
+#   docker compose -f deployments/docker-compose.public-ai.yml --env-file deployments/.env.public-ai up -d --build
+#
+# Required: PUBLIC_AI_DB_PASSWORD, PUBLIC_AI_SIGNING_PUBLIC_KEY (from `kbctl keygen`).
+# Load releases with kbctl inside the container (see services/public-ai-svc/RUNBOOK.md).
+
+name: public-ai
+
+services:
+  public-ai-postgres:
+    image: postgres:16-alpine
+    container_name: public-ai-postgres
+    environment:
+      POSTGRES_DB: public_ai
+      POSTGRES_USER: public_ai_app
+      POSTGRES_PASSWORD: ${PUBLIC_AI_DB_PASSWORD:?set PUBLIC_AI_DB_PASSWORD}
+    volumes:
+      - public-ai-pgdata:/var/lib/postgresql/data
+    networks: [public-ai]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U public_ai_app -d public_ai"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  public-ai-svc:
+    build:
+      context: ../services/public-ai-svc
+      args:
+        GIT_SHA: ${GIT_SHA:-unknown}
+    container_name: public-ai-svc
+    depends_on:
+      public-ai-postgres:
+        condition: service_healthy
+    environment:
+      PUBLIC_AI_ENABLED: ${PUBLIC_AI_ENABLED:-false}
+      PUBLIC_AI_HTTP_ADDR: ":8080"
+      PUBLIC_AI_DATABASE_URL: postgres://public_ai_app:${PUBLIC_AI_DB_PASSWORD}@public-ai-postgres:5432/public_ai?sslmode=disable
+      PUBLIC_AI_ALLOWED_ORIGINS: ${PUBLIC_AI_ALLOWED_ORIGINS:-http://localhost:3000}
+      PUBLIC_AI_MODEL_PROFILE: fake-v0
+      PUBLIC_AI_SIGNING_PUBLIC_KEY: ${PUBLIC_AI_SIGNING_PUBLIC_KEY:?set PUBLIC_AI_SIGNING_PUBLIC_KEY}
+      PUBLIC_AI_KAFKA_BROKERS: ${PUBLIC_AI_KAFKA_BROKERS:-}
+      PUBLIC_AI_LOG_RAW_PROMPT: "false"
+      PUBLIC_AI_PRODUCTION_CHAT_PII_CAPTURE: "false"
+    volumes:
+      # Signed release files built offline with `kbctl build-kb/build-claims`.
+      # Read-only; the private signing key never enters the container.
+      - ${PUBLIC_AI_RELEASES_DIR:-./public-ai-releases}:/releases:ro
+    ports:
+      - "127.0.0.1:18080:8080"
+    networks: [public-ai]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 256m
+    restart: unless-stopped
+
+networks:
+  public-ai:
+    name: public-ai
+    # Not attached to the main stack's network; nothing private is reachable.
+
+volumes:
+  public-ai-pgdata:

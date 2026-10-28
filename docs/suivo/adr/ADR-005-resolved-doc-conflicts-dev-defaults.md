@@ -1,0 +1,25 @@
+# ADR-005: Resolved doc conflicts (dev defaults)
+
+- Status: Proposed — pending Global CTO + Backend Lead
+- Date: 2026-10-27
+- Context: Conflicts between docs (idempotency header vs client_turn_id, market_code malformed vs unsupported). Must use dev defaults and record.
+- Decision: Apply defaults from IMPLEMENTATION_PROMPT.md:
+- Idempotency: POST /sessions requires Idempotency-Key (dev default per §3); POST /turns uses Idempotency-Key = client_turn_id; header≠client_turn_id → 400 publicai.idempotency_header_mismatch.
+- market_code malformed pattern → 422 validation_failed; valid but unsupported market → 200 CLARIFY.
+- Assistant display name default "ZoikoSuite assistant" until brand clearance DEC-04.
+- Route fixtures use https://example.invalid/... until DEC-10.
+- TTL/budget/rate limits are dev defaults pending DEC-07/DEC-08/D06-05.
+- Additional dev defaults (from Sections 3–5, with conflicts cited):
+  - Citations: schema max 5 (Doc 04/05), orchestrator emits at most 3 (Doc 01/03). `claim_ids[]` included in citations (Doc 05 §10) vs internal-trace only (Doc 03 §15) — carry `claim_ids[]` in citation objects and validate against resolved claims.
+  - Actions: schema max 3, at most 1 primary CTA emitted (Doc 02 §16).
+  - Error codes: 415 `unsupported_media_type` added (Doc 05 CT-005 vs §13 table).
+  - SSE: `GET /public-ai/v1/turns/{turn_id}/events` returns 404 in R0 (stream_enabled=false).
+  - Events: exactly the six Doc 05 §21 events — `chat.turn.completed.v1`, `chat.handoff.clicked.v1`, `kb.release.promoted.v1`, `kb.source.revoked.v1`, `publicai.kill_switch.changed.v1`, `chat.security.signal.v1`.
+  - Gate numbering: Doc 11 G0–G7 is the master gate list; Docs 05/06/07/08 gate numbers are mapped to it.
+  - Status enum: Doc 05 status enum is master; Doc 01/02/03 answer classes and abstention codes map onto it.
+- Consequences: Deterministic behavior now; must be revisited on approval.
+- Dev defaults: As listed above.
+
+- Config extension (STEP 13 prep): `GET /config` adds `citation_links` [{url_key, url, title}] so the widget can link citations. URLs come only from the signed release's source registry (allowlisted HTTPS origins), never from model output; Doc 05 §15 does not list this field. Approver: Backend Lead.
+
+- Extensions for Docs 01/05 gaps (Approver: Backend Lead + Product): `POST /turns/{turn_id}/feedback` (Doc 01 FR-09, enums only, no free text) and `POST /handoffs` (emits `chat.handoff.clicked.v1`, Doc 05 §21; route-only, returns the approved URL). Neither is in the Doc 05 §07 endpoint list. Retention purge uses `PUBLIC_AI_RETENTION` (dev default 24h) pending DEC-06.
