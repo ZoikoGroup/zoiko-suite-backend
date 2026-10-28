@@ -97,6 +97,16 @@ const (
 	JournalTypeClosing    JournalType = "CLOSING"
 	JournalTypeReclass    JournalType = "RECLASS"
 
+	// JournalTypeRevaluation is the journal the kernel posts for period-end revaluation. It is never accepted from a caller:
+	// only the kernel originates it (standard §8.1).
+	JournalTypeRevaluation JournalType = "REVALUATION"
+
+	// JournalTypeConsolidation and JournalTypeElimination are the journals the kernel posts into a group book when it consolidates:
+	// the translated member balances and the intercompany eliminations. Like revaluation, only the kernel originates them.
+	JournalTypeAllocation    JournalType = "ALLOCATION"
+	JournalTypeConsolidation JournalType = "CONSOLIDATION"
+	JournalTypeElimination   JournalType = "ELIMINATION"
+
 	// JournalTypeUnspecified marks rows written before migration 000006 added
 	// the field. It is never accepted on a new journal — see ValidJournalType —
 	// and exists only so historical postings remain readable and identifiable
@@ -232,6 +242,45 @@ type JournalHeader struct {
 	// with override_soft_close=true. Persisted per ZS-SVC-B-001 ACC-14 §10.1
 	// and emitted in the JournalCreated outbox event for audit traceability.
 	SoftCloseOverrideReason *string `json:"soft_close_override_reason,omitempty"`
+
+	// CloseJournalDesignation names the close workflow that produced this
+	// journal (see close_journal.go). ACC-14's CLOSE_REVIEW policy admits
+	// "only designated close journals/workflows"; this is the persisted,
+	// server-validated designation that policy consults. Nil for an ordinary
+	// journal. A designation never admits a journal to CLOSED — it is only
+	// meaningful while the period's policy is CLOSE_JOURNALS_ONLY.
+	CloseJournalDesignation *string `json:"close_journal_designation,omitempty"`
+
+	// ── Accounting Kernel journal model (standard §8.1) ──────────────────────
+	//
+	// JournalNumber is the human-readable sequence, unique per entity+book+year and allocated when the journal is posted;
+	// it is never a relational key. AccountingBookID names the kernel book (BookID above stays the legacy book code that
+	// ledger entries are keyed by). SourceAccountingEventID and PostingExecutionID tie a system journal to the exact event
+	// and rule execution that produced it. JournalHash seals the posted content (AK-INV: posted journals are immutable).
+	JournalNumber           *string `json:"journal_number,omitempty"`
+	AccountingBookID        *string `json:"accounting_book_id,omitempty"`
+	SourceAccountingEventID *string `json:"source_accounting_event_id,omitempty"`
+	PostingExecutionID      *string `json:"posting_execution_id,omitempty"`
+	JournalHash             *string `json:"journal_hash,omitempty"`
+
+	// JournalPurpose is the controlled classification a manual journal must carry (§9). CorrectionKind and
+	// ReversalReason record the nature of a correction (§11), so a policy change is never filed as an error correction.
+	JournalPurpose *string `json:"journal_purpose,omitempty"`
+	CorrectionKind *string `json:"correction_kind,omitempty"`
+	ReversalReason *string `json:"reversal_reason,omitempty"`
+
+	// CopyOfJournalID and RecurringTemplateID record provenance: a copy or a generated instance is a new draft with a
+	// new identity, never a duplicate of posting identifiers (§9).
+	CopyOfJournalID     *string `json:"copy_of_journal_id,omitempty"`
+	RecurringTemplateID *string `json:"recurring_template_id,omitempty"`
+
+	WithdrawnAt            *time.Time `json:"withdrawn_at,omitempty"`
+	WithdrawnByPrincipalID *string    `json:"withdrawn_by_principal_id,omitempty"`
+	WithdrawnReason        *string    `json:"withdrawn_reason,omitempty"`
+
+	// ReconciliationCaseID names the reconciliation case a reconciliation adjustment settles (standard §17): a bank or
+	// subledger adjustment is never a free-standing correction.
+	ReconciliationCaseID *string `json:"reconciliation_case_id,omitempty"`
 }
 
 // JournalLine is one debit or credit line within a journal. Exactly one of
@@ -267,6 +316,18 @@ type JournalLine struct {
 	// values are valid for one, so the keys are recorded as supplied and not
 	// validated — the same posture as account_code with no Chart of Accounts.
 	Dimensions Dimensions `json:"dimensions,omitempty"`
+
+	// Foreign-currency and provenance data (standard §8.2). Debit/credit above are always in the book's functional
+	// currency; when the source transaction was in another currency the original amount, its currency and the rate that
+	// converted it are kept, and PostingRuleLineRef names the exact rule template that generated the line.
+	TransactionAmount  *string `json:"transaction_amount,omitempty"`
+	TransactionCcy     *string `json:"transaction_currency,omitempty"`
+	ExchangeRate       *string `json:"exchange_rate,omitempty"`
+	RateRef            *string `json:"rate_ref,omitempty"`
+	PostingRuleLineRef *string `json:"posting_rule_line_ref,omitempty"`
+
+	// CounterpartyID is the customer or supplier a line on a subledger control account belongs to (standard §8.2, §12).
+	CounterpartyID *string `json:"counterparty_id,omitempty"`
 }
 
 // JournalWithLines is the full aggregate returned by read endpoints.
@@ -813,6 +874,17 @@ type QueryLedgerFilter struct {
 	FiscalPeriod  string
 	JournalID     string
 	MaxEntrySeq   *int64 // set by QueryLedgerAsOf to reconstruct a point-in-time view
+
+	// TransactionDateFrom/To bound entries by transaction_date, inclusive at
+	// both ends; a zero Date leaves that end open. A bank reconciliation
+	// looks for the book side of a statement line inside a date window on
+	// one cash account, and a fiscal_period is too coarse for that.
+	TransactionDateFrom Date
+	TransactionDateTo   Date
+	// JournalStatus keeps only entries whose journal is currently in this
+	// status. ledger_entries is append-only, so a REVERSED journal's entries
+	// stay listed; a reader that needs live postings asks for FINALIZED.
+	JournalStatus JournalStatus
 }
 
 // QueryAccountBalanceRequest is QueryAccountBalance's input — reads the
@@ -851,6 +923,10 @@ type CreateJournalLineInput struct {
 
 	// ACC-03 "dimensions". See JournalLine.Dimensions.
 	Dimensions Dimensions `json:"dimensions,omitempty"`
+
+	// CounterpartyID is required on a line posted to an account that needs one (AR, AP control accounts and any account
+	// flagged counterparty_required).
+	CounterpartyID *string `json:"counterparty_id,omitempty"`
 }
 
 type CreateJournalRequest struct {
@@ -873,6 +949,13 @@ type CreateJournalRequest struct {
 	// Optional: no service can issue or validate these yet (REF-06).
 	BookID         *string `json:"book_id,omitempty"`
 	ReportingBasis *string `json:"reporting_basis,omitempty"`
+
+	// JournalPurpose is the controlled purpose of a manual journal (standard §9). Required for the adjusting journal
+	// types (ADJUSTMENT, ACCRUAL, RECLASS, OPENING, CLOSING), where free text alone is not enough.
+	JournalPurpose string `json:"journal_purpose,omitempty"`
+
+	// ReconciliationCaseID is required when the purpose is RECONCILIATION_ADJUSTMENT.
+	ReconciliationCaseID string `json:"reconciliation_case_id,omitempty"`
 
 	// EvidenceRefs may be sent in the body or, preferably, as the §4 envelope's
 	// X-Evidence-Refs header. The handler merges both — a caller that has
@@ -905,11 +988,25 @@ type CreateJournalRequest struct {
 	// Persisted on the journal header's soft_close_override_reason column and
 	// emitted in the JournalCreated outbox event for audit traceability.
 	SoftCloseOverrideReason string `json:"soft_close_override_reason,omitempty"`
+
+	// CloseJournalDesignation names a close workflow (ACCRUAL_RECOGNITION,
+	// PREPAYMENT_RECOGNITION or PREPAYMENT_TERMINATION) when this journal is
+	// one of ACC-14's designated close journals. It is validated against the
+	// closed allowlist and must agree with JournalType. It does not, by
+	// itself, grant posting authority: during CLOSE_REVIEW the poster must
+	// also hold GL_CLOSE_REVIEW_POSTING. It never admits a journal to a
+	// hard-closed period.
+	CloseJournalDesignation string `json:"close_journal_designation,omitempty"`
 }
 
 type ReverseJournalRequest struct {
 	Reason        string `json:"reason"`
 	CorrelationID string `json:"correlation_id"`
+
+	// CorrectionKind is the nature of the correction (§11); optional so existing callers keep working, validated when sent.
+	// PostingDate lets the caller choose the date the reversal takes effect (§32); it defaults as it always has.
+	CorrectionKind string `json:"correction_kind,omitempty"`
+	PostingDate    Date   `json:"posting_date,omitempty"`
 
 	// OverrideSoftClose and SoftCloseOverrideReason mirror the fields on
 	// CreateJournalRequest — see those field docs for semantics.
@@ -1008,10 +1105,12 @@ var (
 	// closed, same pattern as schema-registry-svc.
 	ErrIdentityMissing = errorString("caller identity missing")
 
-	ErrPeriodLocked              = errorString("accounting period is closed or locked")
-	ErrSoftCloseOverrideRequired = errorString("soft-close override required: elevated finance role and non-empty reason must be provided")
-	ErrPeriodHardClosed          = errorString("accounting period is hard-closed and cannot be posted to")
-	ErrCloseServiceUnavailable   = errorString("financial-close-svc unavailable")
+	ErrPeriodLocked                   = errorString("accounting period is closed or locked")
+	ErrSoftCloseOverrideRequired      = errorString("soft-close override required: elevated finance role and non-empty reason must be provided")
+	ErrCloseJournalsOnly              = errorString("accounting period is in close review; only designated close journals may post")
+	ErrPeriodHardClosed               = errorString("accounting period is hard-closed and cannot be posted to")
+	ErrInvalidCloseJournalDesignation = errorString("close_journal_designation must name a recognised close workflow for this journal type")
+	ErrCloseServiceUnavailable        = errorString("financial-close-svc unavailable")
 
 	// ErrInvalidIdentifier is returned when an id cannot be a UUID at all.
 	// journal_id, tenant_id and legal_entity_id are uuid columns, so Postgres
@@ -1130,6 +1229,7 @@ var (
 	// guard against "Cross-book query leakage": legal_entity_id must
 	// always be supplied and is never inferred or defaulted.
 	ErrLedgerScopeRequired = errorString("legal_entity_id is required to query the ledger")
+	ErrLedgerDateWindow    = errorString("transaction_date_from must not be after transaction_date_to")
 )
 
 // ValidCurrencyCode reports whether s has the shape of an ISO 4217 alphabetic

@@ -73,6 +73,7 @@ The `authorization-svc` client caches GRANTED/DENIED decisions for up to **5 sec
 | `/privacy/processing-activities/{id}?as_of=&known_as_of=` | — | `GET` | `PRIVACY_ACTIVITY_READ` |
 | `…/{id}/versions` | — | `POST` | `PRIVACY_ACTIVITY_CREATE` |
 | — | `…/{id}/versions/{vid}` | `GET` | `PRIVACY_ACTIVITY_READ` |
+| `…/{id}/audit` | — | `GET` | `PRIVACY_ACTIVITY_READ` — the activity's append-only `activity_lifecycle_audit` rows, oldest first (actor, from/to status, correlation id, reason). Tenant-scoped by row-level security; an unknown or other-tenant id returns an empty list, never a 404 |
 | `…/{id}/validate` | `…/versions/{vid}/validate` | `POST` | `PRIVACY_ACTIVITY_VALIDATE` |
 | `…/{id}/submit` | `…/versions/{vid}/submit` | `POST` | `PRIVACY_ACTIVITY_SUBMIT` |
 | `…/{id}/approve` | `…/versions/{vid}/approve` | `POST` | `PRIVACY_ACTIVITY_APPROVE` (maker-checker) |

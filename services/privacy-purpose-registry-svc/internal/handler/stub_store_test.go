@@ -326,6 +326,10 @@ func (s *stubStore) statusAt(v *domain.ProcessingActivityVersion, asOf, knownAsO
 	return domain.ActivityStatusActive
 }
 
+func (s *stubStore) ListActivityAudit(_ context.Context, _ string) ([]domain.ActivityLifecycleAudit, error) {
+	return []domain.ActivityLifecycleAudit{}, nil
+}
+
 func (s *stubStore) ListActiveActivities(ctx context.Context, role, jurisdiction string) ([]domain.ProcessingActivityVersion, error) {
 	var out []domain.ProcessingActivityVersion
 	now := time.Now().UTC()

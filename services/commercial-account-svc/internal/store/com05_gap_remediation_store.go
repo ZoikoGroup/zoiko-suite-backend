@@ -301,3 +301,15 @@ func (s *PgStore) GetDispute(ctx context.Context, disputeID string) (*domain.Dis
 	})
 	return out, err
 }
+
+// GetDisputeAsSeller is the replay reader for seller commands whose claim
+// resource id is the dispute id (OpenDispute, RecordOutcome/Close).
+func (s *PgStore) GetDisputeAsSeller(ctx context.Context, disputeID string) (*domain.DisputeCase, error) {
+	var out *domain.DisputeCase
+	err := s.disputeSellerTx(ctx, func(tx pgx.Tx) error {
+		d, err := loadDisputeCase(ctx, tx, disputeID, false)
+		out = d
+		return err
+	})
+	return out, err
+}

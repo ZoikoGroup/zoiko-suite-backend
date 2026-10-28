@@ -27,9 +27,11 @@ var ErrVaultUnavailable = errors.New("secret-vault-integration-svc unavailable")
 //
 // What IS real: revoking a lease you already hold the ID for is a single,
 // simple call with no provisioning prerequisite — RevokeConnection and
-// SuspendConnection call this for real, so "revoked consent still used"
-// (the spec's own named negative path) is backed by an actual vault call,
-// not just a local status flip.
+// RotateConnectionCredential call this for real, so "revoked consent still
+// used" (the spec's own named negative path) is backed by an actual vault
+// call, not just a local status flip. SuspendConnection deliberately does
+// not revoke: suspension is reversible, and ReconnectProvider must be able
+// to resume on the same live lease.
 type VaultClient interface {
 	RevokeLease(ctx context.Context, tenantID, leaseID, principalID, correlationID string) error
 }

@@ -5475,8 +5475,11 @@ services:
   # is exactly what a real provider integration would need. Swapping in a
   # real provider means pointing its webhook config at this endpoint and
   # sharing its signing secret via WEBHOOK_SHARED_SECRET below — nothing
-  # else changes. WEBHOOK_SHARED_SECRET's default is dev-only and must be
-  # replaced before any real provider is ever connected.
+  # else changes. The secret is deliberately unset by default: with no
+  # secret the legacy shared-secret receiver refuses every callback (503)
+  # instead of trusting a publicly known development value. The
+  # profile-driven INT-07 endpoint does not use this secret; it fetches a
+  # per-tenant secret from the vault for each verification.
   payment-status-svc:
     build:
       context: ../services
@@ -5492,7 +5495,7 @@ services:
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.payment-status.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
-      WEBHOOK_SHARED_SECRET: "dev-only-shared-secret-replace-before-any-real-integration"
+      WEBHOOK_SHARED_SECRET: "${WEBHOOK_SHARED_SECRET:-}"
     depends_on:
       postgres:
         condition: service_healthy

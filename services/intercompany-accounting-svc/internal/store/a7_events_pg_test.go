@@ -107,7 +107,7 @@ func TestPgStore_A7_MatchEmitsMatchedWithPostedAsLegacyType(t *testing.T) {
 	}
 	targetJ := uuid.New().String()
 	entry.TargetJournalID, entry.MatchStatus, entry.MismatchReason = &targetJ, domain.MatchStatusMatched, nil
-	if err := s.UpdateMatch(ctx, entry, testAttempt(entry), "matcher", "corr-match"); err != nil {
+	if _, err := s.UpdateMatch(ctx, entry, testAttempt(entry), "k1", "matcher", "corr-match"); err != nil {
 		t.Fatalf("UpdateMatch: %v", err)
 	}
 
@@ -153,13 +153,13 @@ func TestPgStore_A7_DisputeAndResolveEventsCarryResolutionOutcome(t *testing.T) 
 		t.Fatalf("CreateEntry: %v", err)
 	}
 	mismatch(entry, "amount_mismatch: counterparty booked 4000, expected 5000")
-	if err := s.UpdateMatch(ctx, entry, testAttempt(entry), "matcher", "corr-match"); err != nil {
+	if _, err := s.UpdateMatch(ctx, entry, testAttempt(entry), "k1", "matcher", "corr-match"); err != nil {
 		t.Fatalf("UpdateMatch: %v", err)
 	}
-	if err := s.DisputeIntercompany(ctx, entry.IntercompanyEntryID, "disputer", "the UK side booked a different rate", "corr-dispute"); err != nil {
+	if _, err := s.DisputeIntercompany(ctx, entry.IntercompanyEntryID, "k2", "disputer", "the UK side booked a different rate", "corr-dispute"); err != nil {
 		t.Fatalf("DisputeIntercompany: %v", err)
 	}
-	if err := s.ResolveMismatch(ctx, entry.IntercompanyEntryID, "resolver", "corrected on the UK side", domain.ResolutionCorrected, "corr-resolve"); err != nil {
+	if _, err := s.ResolveMismatch(ctx, entry.IntercompanyEntryID, "k3", "resolver", "corrected on the UK side", domain.ResolutionCorrected, "corr-resolve"); err != nil {
 		t.Fatalf("ResolveMismatch: %v", err)
 	}
 
@@ -216,11 +216,11 @@ func TestPgStore_A7_EventFailureRollsBackTheTransition(t *testing.T) {
 		t.Fatalf("CreateEntry: %v", err)
 	}
 	mismatch(entry, "amount_mismatch: test")
-	if err := working.UpdateMatch(ctx, entry, testAttempt(entry), "matcher", "corr-match"); err != nil {
+	if _, err := working.UpdateMatch(ctx, entry, testAttempt(entry), "k1", "matcher", "corr-match"); err != nil {
 		t.Fatalf("UpdateMatch: %v", err)
 	}
 
-	if err := unconfigured.DisputeIntercompany(ctx, entry.IntercompanyEntryID, "disputer", "reason", "corr-dispute"); err == nil {
+	if _, err := unconfigured.DisputeIntercompany(ctx, entry.IntercompanyEntryID, "k2", "disputer", "reason", "corr-dispute"); err == nil {
 		t.Fatal("expected the dispute to fail when its event cannot be built")
 	}
 
@@ -251,7 +251,7 @@ func TestPgStore_A7_AcknowledgeEmitsNoEventAndRefusedTransitionEmitsNothing(t *t
 	if _, err := s.CreateEntry(ctx, entry, "creator", "corr-create"); err != nil {
 		t.Fatalf("CreateEntry: %v", err)
 	}
-	if err := s.AcknowledgeCounterparty(ctx, entry.IntercompanyEntryID, "counterparty", "corr-ack"); err != nil {
+	if _, err := s.AcknowledgeCounterparty(ctx, entry.IntercompanyEntryID, "k1", "counterparty", "corr-ack"); err != nil {
 		t.Fatalf("AcknowledgeCounterparty: %v", err)
 	}
 
@@ -260,7 +260,7 @@ func TestPgStore_A7_AcknowledgeEmitsNoEventAndRefusedTransitionEmitsNothing(t *t
 		t.Fatalf("acknowledge must emit no event; events = %v", a7CanonicalTypes(events))
 	}
 
-	if err := s.ResolveMismatch(ctx, entry.IntercompanyEntryID, "resolver", "note", domain.ResolutionAccepted, "corr-resolve"); err == nil {
+	if _, err := s.ResolveMismatch(ctx, entry.IntercompanyEntryID, "k2", "resolver", "note", domain.ResolutionAccepted, "corr-resolve"); err == nil {
 		t.Fatal("expected ResolveMismatch from AWAITING_COUNTERPARTY to be refused")
 	}
 	after := a7Events(t, pool, tenantID, entry.IntercompanyEntryID)

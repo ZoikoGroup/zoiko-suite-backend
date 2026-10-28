@@ -23,6 +23,10 @@ type Config struct {
 	// posts through its ACC-04 system-originated posting path
 	// (POST /v1/postings/events), never a bespoke ledger write.
 	LedgerServiceURL string
+	// LedgerKernelBookID and LedgerKernelCurrency, both set, post inventory valuation through the accounting kernel of general-ledger-svc into
+	// that accounting book and in its functional currency, instead of the legacy posting command. Empty keeps the legacy path.
+	LedgerKernelBookID   string
+	LedgerKernelCurrency string
 	// GRNIReclassMappingKey is the ACC-02 mapping key AP-03 debits when it
 	// accrues a receipt (its GRNI_DEBIT_MAPPING_KEY); INV-04 credits it
 	// when it reclasses that cost into inventory. Must match AP-03.
@@ -89,6 +93,8 @@ func Load() (*Config, error) {
 		AuthZServiceURL:  env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
 		CloseServiceURL:  env("CLOSE_SERVICE_URL", "http://financial-close-svc:8104"),
 		LedgerServiceURL: env("LEDGER_SERVICE_URL", "http://general-ledger-svc:8098"),
+		LedgerKernelBookID:   env("LEDGER_KERNEL_BOOK_ID", ""),
+		LedgerKernelCurrency: env("LEDGER_KERNEL_CURRENCY", ""),
 
 		GRNIReclassMappingKey: env("GRNI_RECLASS_MAPPING_KEY", "AP_GRNI_EXPENSE"),
 

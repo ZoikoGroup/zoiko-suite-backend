@@ -112,7 +112,7 @@ func (h *Handler) CreateContract(w http.ResponseWriter, r *http.Request) {
 		EffectiveTo:      req.EffectiveTo,
 		Currency:         req.Currency,
 		TotalValue:       req.TotalValue,
-		CreatedBy:        req.CreatedBy,
+		CreatedBy:        principalID,
 	}
 
 	if err := h.store.CreateContract(r.Context(), c); err != nil {

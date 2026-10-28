@@ -251,7 +251,12 @@ func main() {
 		SetWorkflowRefs(pgStore, cfg.WorkflowRefCallers).
 		SetSubledgerControlGateEnforced(cfg.SubledgerControlGateMode == "enforce").
 		SetBankReconciliationGate(cfg.BankReconGateMode == "enforce", cfg.BankReconCutoffDays).
+		SetKernelClose(clientsWrapper, cfg.KernelCloseGateMode == "enforce", cfg.KernelPeriodSealMode == "enforce", cfg.KernelRequiredReconciliations).
 		SetPeriodMirror(periodMirror)
+	if cfg.KernelModeInvalid {
+		log.Warn("unrecognised KERNEL_CLOSE_GATE_MODE or KERNEL_PERIOD_SEAL_MODE; treating as enforce (fail closed)")
+	}
+	log.Info("accounting kernel close integration", zap.String("close_gate", cfg.KernelCloseGateMode), zap.String("period_seal", cfg.KernelPeriodSealMode), zap.Strings("required_reconciliations", cfg.KernelRequiredReconciliations))
 	handler.RegisterRoutes(r, h)
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────

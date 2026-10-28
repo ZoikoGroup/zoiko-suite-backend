@@ -296,6 +296,8 @@ type DepreciationRun struct {
 	AccumulatedDepreciationAccountCode string     `json:"accumulated_depreciation_account_code"`
 	Status                             string     `json:"status"`
 	JournalID                          *string    `json:"journal_id,omitempty"`
+	// LedgerJournalIDs lists every journal the run posted when it went through the kernel (one per asset category); JournalID is the first.
+	LedgerJournalIDs []string `json:"ledger_journal_ids,omitempty"`
 	SupersedesRunID                    *string    `json:"supersedes_run_id,omitempty"`
 	SupersededByRunID                  *string    `json:"superseded_by_run_id,omitempty"`
 	CreatedAt                          time.Time  `json:"created_at"`
@@ -362,6 +364,7 @@ var (
 	ErrSelfApprovalNotPermittedRun = errorString("the principal who created this depreciation run may not also approve it")
 
 	ErrPeriodCheckUnavailable = errorString("financial-close-svc unavailable")
+	ErrLedgerUnavailable      = errorString("general-ledger-svc unavailable")
 	ErrPeriodLocked           = errorString("cannot apply an asset event into a LOCKED fiscal period")
 )
 

@@ -1,0 +1,20 @@
+﻿# Doc 01 register entry
+- Filename: ZoikoSuite_Suivo_Chatbot_Document_01_Product_Requirements_and_Wireframe.md
+- Document ID (exact): ZS-AI-PUB-001
+- Title (exact, from the title line, not the ID line): PRODUCT REQUIREMENTS, EXPERIENCE FLOWS & DETAILED WIREFRAMES
+- Version (exact): Version 1.0
+- Date (exact): 24 October 2026
+- Status / approval wording (quote the full sentence): Approval state: PROPOSED FOR FOUNDER / PRODUCT / ENGINEERING REVIEW. Not a claim of implemented services, approved API contracts, live integrations, product availability, or trademark clearance.
+- Approver roles (exactly as written in the status or approval text): FOUNDER / PRODUCT / ENGINEERING
+- Classification (if stated): not stated in lines 1–200
+- Other document IDs mentioned in lines 1–200 (list each ID + the line number):
+  - ZS-AI-PUB-001 (line 9)
+- Line numbers where each value above was found:
+  - Filename: 1 (title block area) / file name as given
+- Document ID (exact): line 11
+- Title (exact): line 9
+- Version (exact): line 13
+- Date (exact): line 13
+- Status / approval wording: line 15
+- Approver roles: line 15
+- Other document IDs: line 11 (ZS-AI-PUB-001)

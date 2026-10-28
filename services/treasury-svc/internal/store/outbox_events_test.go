@@ -144,7 +144,7 @@ func TestPgStore_Outbox_CreateTreasuryTransfer_EnqueuesCreatedEvent(t *testing.T
 
 	transfer, created, err := testStore.CreateTreasuryTransfer(ctx, domain.CreateTreasuryTransferParams{
 		TenantID: tenantID, SourceBankAccountID: src, TargetBankAccountID: tgt,
-		Amount: 100, CurrencyCode: "USD", IsCrossEntity: false, CorrelationID: "corr-outbox-transfer-1", MakerPrincipalID: "maker-1",
+		Amount: "100", CurrencyCode: "USD", IsCrossEntity: false, CorrelationID: "corr-outbox-transfer-1", MakerPrincipalID: "maker-1",
 	})
 	if err != nil || !created {
 		t.Fatalf("create transfer: created=%v err=%v", created, err)
@@ -171,10 +171,10 @@ func TestPgStore_Outbox_CashPositionSnapshot_EnqueuesCalculatedAndStaleEvents(t 
 
 	snap, err := testStore.CreateCashPositionSnapshot(ctx, domain.CalculateCashPositionParams{
 		TenantID: tenantID, LegalEntityID: legalEntityID, ReportingCurrency: "USD",
-		RestrictedAmount: 0, ActorPrincipalID: "analyst-1", CorrelationID: "corr-outbox-cash-1",
+		RestrictedAmount: "0", ActorPrincipalID: "analyst-1", CorrelationID: "corr-outbox-cash-1",
 	}, domain.CashPositionCalculation{
-		BankBalance: 5000, AvailableCash: 5000, AsOfTimestamp: time.Now().UTC(),
-		AccountBreakdown: []domain.CashPositionAccountLine{{BankAccountID: "acct-outbox-1", AccountName: "Main", Balance: 5000, AsOfTimestamp: time.Now().UTC()}},
+		BankBalance: "5000", AvailableCash: "5000", AsOfTimestamp: time.Now().UTC(),
+		AccountBreakdown: []domain.CashPositionAccountLine{{BankAccountID: "acct-outbox-1", AccountName: "Main", Balance: "5000", AsOfTimestamp: time.Now().UTC()}},
 	})
 	if err != nil {
 		t.Fatalf("create snapshot: %v", err)
@@ -200,11 +200,11 @@ func TestPgStore_Outbox_FXExposureSnapshot_EnqueuesCalculatedEvent(t *testing.T)
 		TenantID: tenantID, LegalEntityID: legalEntityID, ExposureCurrency: "EUR", FunctionalCurrency: "USD",
 		NettingScope: "SINGLE_ENTITY:" + legalEntityID, ActorPrincipalID: "analyst-1", CorrelationID: "corr-outbox-fx-1",
 	}, domain.FXExposureCalculation{
-		RateUsed: 1.08, RateAsOf: time.Now().UTC(), RateVersion: "rate-outbox-1", HasStaleComponent: false,
+		RateUsed: "1.08", RateAsOf: time.Now().UTC(), RateVersion: "rate-outbox-1", HasStaleComponent: false,
 		Buckets: []domain.FXExposureBucket{
-			{MaturityBucket: "0-30D", Category: "RECEIVABLE", ExposureCurrencyAmount: 1000, FunctionalCurrencyAmount: 1080},
+			{MaturityBucket: "0-30D", Category: "RECEIVABLE", ExposureCurrencyAmount: "1000", FunctionalCurrencyAmount: "1080"},
 		},
-		GrossExposureAmount: 1080, NetExposureAmount: 1080, AsOfTimestamp: time.Now().UTC(),
+		GrossExposureAmount: "1080", NetExposureAmount: "1080", AsOfTimestamp: time.Now().UTC(),
 	})
 	if err != nil {
 		t.Fatalf("create snapshot: %v", err)

@@ -94,8 +94,7 @@ func (h *Handler) AllocateLandedCost(w http.ResponseWriter, r *http.Request) {
 		lines = append(lines, clients.LedgerLine{AccountCode: a.OffsetAccountCode, CreditAmount: a.Amount})
 
 		correlationID := getCorrelationID(r)
-		journalID, err := h.ledger.PostInventoryAccountingEvent(r.Context(), tenantID, principalID, a.LegalEntityID, a.FiscalPeriod,
-			"Inventory landed cost "+a.AllocationID, a.AllocationID, correlationID, lines)
+		journalID, err := h.postLandedCostJournal(r.Context(), tenantID, principalID, correlationID, a, lines)
 		if err != nil {
 			// The layer is already updated and the allocation is PENDING_POSTING:
 			// retrying the same idempotency_key resumes the posting.

@@ -156,3 +156,50 @@ func TestRebuildDerivedBalanceProjection_Authorized_CallsStoreWithScope(t *testi
 		t.Fatalf("expected the rebuild scope to be passed through, got %+v", s.lastRebuildRequest)
 	}
 }
+
+// ── QueryLedger date window and journal status ──────────────────────────────
+
+func TestQueryLedger_DateWindowAndJournalStatus_ReachTheStore(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	resp := doRequest(r, http.MethodGet, "/v1/ledger/entries?legal_entity_id=entity-a&account_code=1000"+
+		"&transaction_date_from=2026-07-01&transaction_date_to=2026-07-31&journal_status=FINALIZED", nil, "reader-1")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", resp.Code, resp.Body.String())
+	}
+	f := s.lastLedgerFilter
+	if f.AccountCode != "1000" || f.TransactionDateFrom != domain.NewDate(2026, 7, 1) ||
+		f.TransactionDateTo != domain.NewDate(2026, 7, 31) || f.JournalStatus != domain.JournalStatusFinalized {
+		t.Fatalf("filter not passed through: %+v", f)
+	}
+}
+
+func TestQueryLedger_MalformedWindowOrStatus_Returns400(t *testing.T) {
+	for _, q := range []string{
+		"transaction_date_from=2026-7-1",
+		"transaction_date_to=31/07/2026",
+		"transaction_date_from=2026-08-01&transaction_date_to=2026-07-01",
+		"journal_status=PENDING",
+		"journal_status=finalized",
+	} {
+		t.Run(q, func(t *testing.T) {
+			r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+			resp := doRequest(r, http.MethodGet, "/v1/ledger/entries?legal_entity_id=entity-a&"+q, nil, "reader-1")
+			if resp.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400, got %d: %s", resp.Code, resp.Body.String())
+			}
+		})
+	}
+}
+
+func TestQueryLedgerAsOf_AcceptsTheSameWindow(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	resp := doRequest(r, http.MethodGet, "/v1/ledger/as-of?legal_entity_id=entity-a&as_of_entry_seq=10&transaction_date_from=2026-07-01&journal_status=FINALIZED", nil, "reader-1")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", resp.Code, resp.Body.String())
+	}
+	if s.lastLedgerFilter.TransactionDateFrom != domain.NewDate(2026, 7, 1) || s.lastLedgerFilter.JournalStatus != domain.JournalStatusFinalized {
+		t.Fatalf("as-of filter not passed through: %+v", s.lastLedgerFilter)
+	}
+}

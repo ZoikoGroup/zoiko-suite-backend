@@ -178,16 +178,19 @@ func (s *PgStore) UpdateVATReturn(ctx context.Context, r *domain.VATReturn) erro
 	r.UpdatedAt = time.Now().UTC()
 	tenantID := middleware.GetTenantID(ctx)
 
-	_, err = tx.Exec(ctx, `
+	cmdTag, err := tx.Exec(ctx, `
 		UPDATE vat_returns
 		SET total_sales_amount=$1, total_purchase_amount=$2, output_tax_amount=$3, input_tax_amount=$4,
-		    net_tax_payable=$5, status=$6, effective_to=$7, updated_at=$8
-		WHERE return_id=$9 AND tenant_id=$10`,
+		    net_tax_payable=$5, effective_to=$6, updated_at=$7
+		WHERE return_id=$8 AND tenant_id=$9 AND status != 'FILED'`,
 		r.TotalSalesAmount, r.TotalPurchaseAmount, r.OutputTaxAmount, r.InputTaxAmount,
-		r.NetTaxPayable, string(r.Status), r.EffectiveTo, r.UpdatedAt, r.ReturnID, tenantID,
+		r.NetTaxPayable, r.EffectiveTo, r.UpdatedAt, r.ReturnID, tenantID,
 	)
 	if err != nil {
 		return fmt.Errorf("update vat return: %w", err)
+	}
+	if cmdTag.RowsAffected() == 0 {
+		return fmt.Errorf("vat return not found or already filed")
 	}
 
 	return tx.Commit(ctx)

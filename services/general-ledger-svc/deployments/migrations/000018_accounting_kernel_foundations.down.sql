@@ -1,0 +1,11 @@
+DROP TABLE IF EXISTS dimension_values;
+DROP TABLE IF EXISTS dimension_definitions;
+DROP TABLE IF EXISTS posting_rule_set_events;
+DROP TABLE IF EXISTS posting_rule_sets;
+DROP TABLE IF EXISTS accounting_events;
+DROP TABLE IF EXISTS accounting_books;
+DROP FUNCTION IF EXISTS dimension_values_guard();
+DROP FUNCTION IF EXISTS kernel_append_only();
+DROP FUNCTION IF EXISTS posting_rule_sets_guard();
+DROP FUNCTION IF EXISTS accounting_events_immutable();
+DROP FUNCTION IF EXISTS accounting_books_guard();

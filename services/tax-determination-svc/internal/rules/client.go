@@ -3,11 +3,17 @@ package rules
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
+)
+
+var (
+	ErrTaxRuleNotFound     = errors.New("no active tax rule found matching jurisdiction and category")
+	ErrTaxRulesUnavailable = errors.New("tax-rules-svc is unavailable")
 )
 
 type TaxRuleDTO struct {
@@ -45,41 +51,28 @@ func (c *Client) FetchActiveRule(ctx context.Context, tenantID, jurisdictionID, 
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		// Fallback default if tax-rules-svc is unavailable
-		return &TaxRuleDTO{
-			RuleID:            "trule-default-fallback",
-			JurisdictionID:    jurisdictionID,
-			RuleCode:          "FALLBACK-TAX",
-			Name:              "Default Tax Fallback",
-			Category:          category,
-			TaxRatePercentage: 0.0,
-			Status:            "ACTIVE",
-		}, nil
+		return nil, fmt.Errorf("%w: %v", ErrTaxRulesUnavailable, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, ErrTaxRuleNotFound
+	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("tax-rules-svc returned %d", resp.StatusCode)
+		return nil, fmt.Errorf("%w: tax-rules-svc returned %d", ErrTaxRulesUnavailable, resp.StatusCode)
 	}
 
 	var payload struct {
 		Rules []TaxRuleDTO `json:"rules"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("decode tax rules response: %w", err)
 	}
 
 	if len(payload.Rules) > 0 {
 		return &payload.Rules[0], nil
 	}
 
-	return &TaxRuleDTO{
-		RuleID:            "trule-default-zero",
-		JurisdictionID:    jurisdictionID,
-		RuleCode:          "ZERO-TAX",
-		Name:              "Zero Tax Rate",
-		Category:          category,
-		TaxRatePercentage: 0.0,
-		Status:            "ACTIVE",
-	}, nil
+	return nil, ErrTaxRuleNotFound
 }
+

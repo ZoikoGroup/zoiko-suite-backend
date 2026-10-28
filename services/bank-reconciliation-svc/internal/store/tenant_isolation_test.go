@@ -67,7 +67,7 @@ func TestMain(m *testing.M) {
 				// to whatever major the library calls "latest," and that patch
 				// build can stop resolving from the remote binary repo with no
 				// code change on our side (this is what broke PR #105's CI).
-				Version(embeddedpostgres.V16).
+				Version(embeddedpostgres.PostgresVersion("16.15.0")).
 				Port(dbPort).
 				Database("bankrec_isolation_test").
 				Username("postgres").
@@ -110,14 +110,14 @@ func TestMain(m *testing.M) {
 	}
 
 	_, _ = testPool.Exec(ctx, `
-		DROP TABLE IF EXISTS reconciliation_evidence_conflicts CASCADE;
-		DROP TABLE IF EXISTS reconciliation_population_lines CASCADE;
-		DROP TABLE IF EXISTS reconciliation_populations CASCADE;
-		DROP TABLE IF EXISTS reconciliation_policies CASCADE;
-		DROP TABLE IF EXISTS reconciliation_runs CASCADE;
-		DROP TABLE IF EXISTS reconciliation_certificates CASCADE;
-		DROP TABLE IF EXISTS statement_lines CASCADE;
-	`)
+			DROP TABLE IF EXISTS reconciliation_evidence_conflicts CASCADE;
+			DROP TABLE IF EXISTS reconciliation_population_lines CASCADE;
+			DROP TABLE IF EXISTS reconciliation_populations CASCADE;
+			DROP TABLE IF EXISTS reconciliation_policies CASCADE;
+			DROP TABLE IF EXISTS reconciliation_runs CASCADE;
+			DROP TABLE IF EXISTS reconciliation_certificates CASCADE;
+			DROP TABLE IF EXISTS statement_lines CASCADE;
+		`)
 
 	// EVERY *.up.sql, BY GLOB, NOT A NAMED LIST.
 	//

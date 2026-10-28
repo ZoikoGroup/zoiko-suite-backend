@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -21,9 +22,9 @@ const statementColumns = `
 	statement_id, connection_id, tenant_id, statement_format, statement_date, opening_balance, closing_balance, transaction_count, ingested_at,
 	content_hash, source_id, import_batch_id, status, quarantine_reason, created_by_principal_id`
 
-func scanStatement(row pgx.Row, s *domain.BankStatement, contentHash, sourceID, importBatchID, status, quarantineReason, createdBy *string) error {
+func scanStatement(row pgx.Row, s *domain.BankStatement) error {
 	return row.Scan(&s.StatementID, &s.ConnectionID, &s.TenantID, &s.StatementFormat, &s.StatementDate, &s.OpeningBalance, &s.ClosingBalance, &s.TransactionCount, &s.IngestedAt,
-		contentHash, sourceID, importBatchID, status, quarantineReason, createdBy)
+		&s.ContentHash, &s.SourceID, &s.ImportBatchID, &s.Status, &s.QuarantineReason, &s.CreatedByPrincipalID)
 }
 
 // IngestStatement is BNK-03's real entry point: a RECEIVED-status header
@@ -35,7 +36,6 @@ func (p *PgStore) IngestStatement(ctx context.Context, tenantID string, req doma
 	err := p.withTenant(ctx, func(tx pgx.Tx) error {
 		statementID := uuid.New().String()
 		var s domain.BankStatement
-		var contentHash, sourceID, importBatchID, status, quarantineReason, createdBy string
 		row := tx.QueryRow(ctx, `
 			INSERT INTO bank_statements (
 				statement_id, connection_id, tenant_id, statement_format, statement_date, opening_balance, closing_balance, transaction_count, ingested_at,
@@ -45,20 +45,64 @@ func (p *PgStore) IngestStatement(ctx context.Context, tenantID string, req doma
 			RETURNING `+statementColumns,
 			statementID, req.ConnectionID, tenantID, req.StatementFormat, req.StatementDate, req.OpeningBalance, req.ClosingBalance, len(req.Lines),
 			req.ContentHash, req.SourceID, req.ImportBatchID, actorPrincipalID)
-		err := scanStatement(row, &s, &contentHash, &sourceID, &importBatchID, &status, &quarantineReason, &createdBy)
+		err := scanStatement(row, &s)
 		if err == nil {
 			result.Created = true
+			// One set-based INSERT for the whole immutable line population.
+			// The previous per-line INSERT ... RETURNING loop was a true
+			// N+1: one network round trip per statement line, inside the
+			// ingest transaction.
+			lineIDs := make([]string, len(req.Lines))
+			statementIDs := make([]string, len(req.Lines))
+			tenantIDs := make([]string, len(req.Lines))
+			seqs := make([]int32, len(req.Lines))
+			postedDates := make([]time.Time, len(req.Lines))
+			amounts := make([]float64, len(req.Lines))
+			currencies := make([]string, len(req.Lines))
+			descriptions := make([]string, len(req.Lines))
+			rawReferences := make([]string, len(req.Lines))
+			bankCodes := make([]string, len(req.Lines))
 			for i, line := range req.Lines {
-				var l domain.StatementLine
-				lrow := tx.QueryRow(ctx, `
+				lineIDs[i] = uuid.New().String()
+				statementIDs[i] = s.StatementID
+				tenantIDs[i] = tenantID
+				seqs[i] = int32(i + 1)
+				postedDates[i] = line.PostedDate
+				amounts[i] = line.Amount
+				currencies[i] = line.Currency
+				descriptions[i] = line.Description
+				rawReferences[i] = line.RawReference
+				bankCodes[i] = line.BankCode
+			}
+			rows, err := tx.Query(ctx, `
+				WITH input AS (
+					SELECT *
+					FROM unnest(
+						$1::text[], $2::text[], $3::text[], $4::int4[], $5::timestamptz[],
+						$6::float8[], $7::text[], $8::text[], $9::text[], $10::text[]
+					) AS t(line_id, statement_id, tenant_id, line_seq, posted_date, amount, currency, description, raw_reference, bank_code)
+				), inserted AS (
 					INSERT INTO bank_statement_lines (line_id, statement_id, tenant_id, line_seq, posted_date, amount, currency, description, raw_reference, bank_code)
-					VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-					RETURNING line_id, statement_id, tenant_id, line_seq, posted_date, amount, currency, description, raw_reference, bank_code, created_at`,
-					uuid.New().String(), s.StatementID, tenantID, i+1, line.PostedDate, line.Amount, line.Currency, line.Description, line.RawReference, line.BankCode)
-				if err := lrow.Scan(&l.LineID, &l.StatementID, &l.TenantID, &l.LineSeq, &l.PostedDate, &l.Amount, &l.Currency, &l.Description, &l.RawReference, &l.BankCode, &l.CreatedAt); err != nil {
+					SELECT line_id, statement_id, tenant_id, line_seq, posted_date, amount, currency, description, raw_reference, bank_code
+					FROM input
+					RETURNING line_id, statement_id, tenant_id, line_seq, posted_date, amount, currency, description, raw_reference, bank_code, created_at
+				)
+				SELECT line_id, statement_id, tenant_id, line_seq, posted_date, amount, currency, description, raw_reference, bank_code, created_at
+				FROM inserted ORDER BY line_seq ASC`,
+				lineIDs, statementIDs, tenantIDs, seqs, postedDates, amounts, currencies, descriptions, rawReferences, bankCodes)
+			if err != nil {
+				return err
+			}
+			defer rows.Close()
+			for rows.Next() {
+				var l domain.StatementLine
+				if err := rows.Scan(&l.LineID, &l.StatementID, &l.TenantID, &l.LineSeq, &l.PostedDate, &l.Amount, &l.Currency, &l.Description, &l.RawReference, &l.BankCode, &l.CreatedAt); err != nil {
 					return err
 				}
 				result.Lines = append(result.Lines, l)
+			}
+			if err := rows.Err(); err != nil {
+				return err
 			}
 			result.Statement = s
 			return p.enqueueEvent(ctx, tx, "com.zoikosuite.banking.bank-statement.ingested", "banking.statement.ingested",
@@ -69,7 +113,7 @@ func (p *PgStore) IngestStatement(ctx context.Context, tenantID string, req doma
 		}
 		// Conflict: return the original import and its existing lines.
 		row = tx.QueryRow(ctx, `SELECT `+statementColumns+` FROM bank_statements WHERE connection_id=$1 AND content_hash=$2`, req.ConnectionID, req.ContentHash)
-		if err := scanStatement(row, &s, &contentHash, &sourceID, &importBatchID, &status, &quarantineReason, &createdBy); err != nil {
+		if err := scanStatement(row, &s); err != nil {
 			return err
 		}
 		rows, err := tx.Query(ctx, `SELECT line_id, statement_id, tenant_id, line_seq, posted_date, amount, currency, description, raw_reference, bank_code, created_at
@@ -94,6 +138,39 @@ func (p *PgStore) IngestStatement(ctx context.Context, tenantID string, req doma
 	return result, nil
 }
 
+// loadStatementLine reads the immutable raw evidence for one line. Every
+// canonical write is derived from this row, not from the request body.
+func loadStatementLine(ctx context.Context, tx pgx.Tx, tenantID, lineID string) (*domain.StatementLine, error) {
+	var l domain.StatementLine
+	err := tx.QueryRow(ctx, `
+		SELECT line_id, statement_id, tenant_id, line_seq, posted_date, amount, currency, description, raw_reference, bank_code, created_at
+		FROM bank_statement_lines WHERE line_id=$1 AND tenant_id=$2`, lineID, tenantID).
+		Scan(&l.LineID, &l.StatementID, &l.TenantID, &l.LineSeq, &l.PostedDate, &l.Amount, &l.Currency, &l.Description, &l.RawReference, &l.BankCode, &l.CreatedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, domain.ErrStatementLineNotFound
+		}
+		return nil, err
+	}
+	return &l, nil
+}
+
+// assertRawEvidence refuses a caller-supplied date/amount/currency that
+// contradicts the raw line. The parameters are optional assertions; the
+// canonical insert always uses the raw values returned by loadStatementLine.
+func assertRawEvidence(line *domain.StatementLine, date *time.Time, amount *float64, currency string) error {
+	if date != nil && !date.Equal(line.PostedDate) {
+		return domain.ErrTransactionEvidenceMismatch
+	}
+	if amount != nil && *amount != line.Amount {
+		return domain.ErrTransactionEvidenceMismatch
+	}
+	if currency != "" && !strings.EqualFold(strings.TrimSpace(currency), line.Currency) {
+		return domain.ErrTransactionEvidenceMismatch
+	}
+	return nil
+}
+
 func (p *PgStore) notFoundOrInvalidStatement(ctx context.Context, tenantID, statementID string) error {
 	var exists bool
 	err := p.withTenant(ctx, func(tx pgx.Tx) error {
@@ -108,14 +185,15 @@ func (p *PgStore) notFoundOrInvalidStatement(ctx context.Context, tenantID, stat
 	return domain.ErrInvalidStatementTransition
 }
 
-// ValidateStatement is BNK-03's actual completeness/balance check: it
-// verifies opening_balance + sum(all ingested line amounts) equals
-// closing_balance before letting the statement reach a state from which it
-// can be ACCEPTED. A mismatch never surfaces as a plain error to the
-// caller — it auto-transitions the statement straight to QUARANTINED with
-// a reason, the same fail-closed posture as every other evidence-integrity
-// check in this service, so a caller cannot retry their way past a bad
-// statement by calling AcceptStatement directly.
+// ValidateStatement is BNK-03's balance check: it verifies
+// opening_balance + sum(all ingested line amounts) equals closing_balance
+// before letting the statement reach a state from which it can be ACCEPTED.
+// It is not a full completeness check: it does not compare the declared line
+// count, account, currency, period or watermark. A mismatch auto-transitions
+// the statement straight to QUARANTINED with a reason and is then returned as
+// ErrStatementBalanceMismatch, the same fail-closed posture as every other
+// evidence-integrity check in this service, so a caller cannot retry their
+// way past a bad statement by calling AcceptStatement directly.
 func (p *PgStore) ValidateStatement(ctx context.Context, tenantID, statementID string) error {
 	var mismatchReason string
 	err := p.withTenant(ctx, func(tx pgx.Tx) error {
@@ -241,14 +319,14 @@ func scanCanonicalTxn(row pgx.Row, t *domain.CanonicalTransaction) error {
 func (p *PgStore) NormalizeTransaction(ctx context.Context, params domain.NormalizeTransactionParams) (*domain.NormalizeTransactionResult, error) {
 	var result domain.NormalizeTransactionResult
 	err := p.withTenant(ctx, func(tx pgx.Tx) error {
-		var bankCode string
-		err := tx.QueryRow(ctx, `SELECT bank_code FROM bank_statement_lines WHERE line_id=$1 AND tenant_id=$2`, params.StatementLineID, params.TenantID).Scan(&bankCode)
+		line, err := loadStatementLine(ctx, tx, params.TenantID, params.StatementLineID)
 		if err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				return domain.ErrStatementLineNotFound
-			}
 			return err
 		}
+		if err := assertRawEvidence(line, params.TransactionDate, params.Amount, params.Currency); err != nil {
+			return err
+		}
+		bankCode := line.BankCode
 
 		var category string
 		err = tx.QueryRow(ctx, `SELECT category FROM bank_transaction_mappings WHERE tenant_id=$1 AND bank_code=$2`, params.TenantID, bankCode).Scan(&category)
@@ -295,7 +373,7 @@ func (p *PgStore) NormalizeTransaction(ctx context.Context, params domain.Normal
 			INSERT INTO bank_transactions_canonical (transaction_id, tenant_id, statement_line_id, transaction_date, amount, currency, category, counterparty, created_by_principal_id)
 			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
 			RETURNING `+canonicalTxnColumns,
-			uuid.New().String(), params.TenantID, params.StatementLineID, params.TransactionDate, params.Amount, params.Currency, category, params.Counterparty, params.ActorPrincipalID)
+			uuid.New().String(), params.TenantID, params.StatementLineID, line.PostedDate, line.Amount, line.Currency, category, params.Counterparty, params.ActorPrincipalID)
 		if err := scanCanonicalTxn(row, &t); err != nil {
 			return err
 		}
@@ -351,6 +429,13 @@ func (p *PgStore) ReNormalizeTransaction(ctx context.Context, params domain.ReNo
 		if prior.Status != domain.TxnNormalized {
 			return domain.ErrInvalidTransactionTransition
 		}
+		line, err := loadStatementLine(ctx, tx, params.TenantID, prior.StatementLineID)
+		if err != nil {
+			return err
+		}
+		if err := assertRawEvidence(line, params.TransactionDate, params.Amount, params.Currency); err != nil {
+			return err
+		}
 		newID := uuid.New().String()
 		// The active-line uniqueness index is on statement_line_id, so the
 		// old row must be marked SUPERSEDED first, freeing the slot, before
@@ -362,7 +447,7 @@ func (p *PgStore) ReNormalizeTransaction(ctx context.Context, params domain.ReNo
 			INSERT INTO bank_transactions_canonical (transaction_id, tenant_id, statement_line_id, mapping_version, transaction_date, amount, currency, category, counterparty, created_by_principal_id)
 			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
 			RETURNING `+canonicalTxnColumns,
-			newID, params.TenantID, prior.StatementLineID, prior.MappingVersion+1, params.TransactionDate, params.Amount, params.Currency, params.Category, params.Counterparty, params.ActorPrincipalID)
+			newID, params.TenantID, prior.StatementLineID, prior.MappingVersion+1, line.PostedDate, line.Amount, line.Currency, params.Category, params.Counterparty, params.ActorPrincipalID)
 		if err := scanCanonicalTxn(row, &newTxn); err != nil {
 			return err
 		}
@@ -423,12 +508,19 @@ func (p *PgStore) ApproveMappingException(ctx context.Context, params domain.App
 		if e.RaisedByPrincipalID == params.ApproverPrincipalID {
 			return domain.ErrMappingExceptionSelfApproval
 		}
+		line, err := loadStatementLine(ctx, tx, params.TenantID, e.StatementLineID)
+		if err != nil {
+			return err
+		}
+		if err := assertRawEvidence(line, params.TransactionDate, params.Amount, params.Currency); err != nil {
+			return err
+		}
 
 		txnRow := tx.QueryRow(ctx, `
 			INSERT INTO bank_transactions_canonical (transaction_id, tenant_id, statement_line_id, transaction_date, amount, currency, category, counterparty, created_by_principal_id)
 			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
 			RETURNING `+canonicalTxnColumns,
-			uuid.New().String(), params.TenantID, e.StatementLineID, params.TransactionDate, params.Amount, params.Currency, params.Category, params.Counterparty, params.ApproverPrincipalID)
+			uuid.New().String(), params.TenantID, e.StatementLineID, line.PostedDate, line.Amount, line.Currency, params.Category, params.Counterparty, params.ApproverPrincipalID)
 		if err := scanCanonicalTxn(txnRow, &t); err != nil {
 			return err
 		}
@@ -459,4 +551,3 @@ func (p *PgStore) GetCanonicalTransaction(ctx context.Context, tenantID, transac
 	}
 	return &t, nil
 }
-

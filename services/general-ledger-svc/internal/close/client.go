@@ -100,7 +100,11 @@ func (c *HTTPClient) CheckPeriodOpen(ctx context.Context, tenantID, legalEntityI
 	case "RESTRICTED":
 		return domain.ErrSoftCloseOverrideRequired
 	case "CLOSE_JOURNALS_ONLY":
-		return domain.ErrPeriodHardClosed
+		// Distinct from CLOSED on purpose: this state admits a designated
+		// close journal. The handler decides whether the journal carries a
+		// valid designation; the client never treats the state itself as
+		// hard-closed.
+		return domain.ErrCloseJournalsOnly
 	case "CLOSED":
 		return domain.ErrPeriodHardClosed
 	default:

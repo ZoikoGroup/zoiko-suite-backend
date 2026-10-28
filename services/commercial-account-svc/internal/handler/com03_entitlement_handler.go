@@ -266,6 +266,15 @@ func (h *EntitlementHandler) CreateSnapshot(w http.ResponseWriter, r *http.Reque
 	}
 	ds, err := h.store.CreateSnapshot(r.Context(), req.OrganizationID, principal, h.now(), cmd.claim)
 	if err != nil {
+		var replay *domain.IdempotentReplayError
+		if errors.As(err, &replay) {
+			ctx := svcmiddleware.WithTenant(r.Context(), req.OrganizationID)
+			if existing, gerr := h.store.GetEffectiveEntitlements(ctx, h.now()); gerr == nil {
+				w.Header().Set("Idempotent-Replayed", "true")
+				writeJSON(w, http.StatusCreated, map[string]any{"decisions": existing})
+				return
+			}
+		}
 		h.fail(w, r, err)
 		return
 	}
@@ -353,8 +362,21 @@ func (h *EntitlementHandler) ApplyRestriction(w http.ResponseWriter, r *http.Req
 	if !ok {
 		return
 	}
-	created, err := h.store.ApplyRestriction(svcmiddleware.WithTenant(r.Context(), req.OrganizationID), rest, cmd.claim)
+	ctx := svcmiddleware.WithTenant(r.Context(), req.OrganizationID)
+	created, err := h.store.ApplyRestriction(ctx, rest, cmd.claim)
 	if err != nil {
+		var replay *domain.IdempotentReplayError
+		if errors.As(err, &replay) {
+			if rs, gerr := h.store.ListRestrictions(ctx); gerr == nil {
+				for i := range rs {
+					if rs[i].RestrictionID == replay.ResourceID {
+						w.Header().Set("Idempotent-Replayed", "true")
+						writeJSON(w, http.StatusCreated, &rs[i])
+						return
+					}
+				}
+			}
+		}
 		h.fail(w, r, err)
 		return
 	}
@@ -452,6 +474,14 @@ func (h *EntitlementHandler) PublishPolicy(w http.ResponseWriter, r *http.Reques
 	}
 	created, err := h.store.PublishEntitlementPolicy(r.Context(), p, cmd.claim)
 	if err != nil {
+		var replay *domain.IdempotentReplayError
+		if errors.As(err, &replay) {
+			if existing, gerr := h.store.GetEntitlementPolicy(r.Context(), h.now()); gerr == nil && existing != nil {
+				w.Header().Set("Idempotent-Replayed", "true")
+				writeJSON(w, http.StatusCreated, existing)
+				return
+			}
+		}
 		h.fail(w, r, err)
 		return
 	}

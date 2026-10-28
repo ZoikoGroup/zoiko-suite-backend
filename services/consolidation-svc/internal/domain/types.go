@@ -201,6 +201,8 @@ func (e errorString) Error() string { return string(e) }
 var (
 	ErrRunNotFound             = errorString("consolidation run not found")
 	ErrGLServiceUnavailable    = errorString("general-ledger-svc unavailable")
+	ErrNoGroupBook             = errorString("no consolidation group of the group book has this legal entity as its reporting entity")
+	ErrAdjustmentInGroupRun    = errorString("the adjustment is in the group figures of a consolidation run: supersede that run first")
 	ErrIntercompanyUnavailable = errorString("intercompany-accounting-svc unavailable")
 	ErrAuthorizationDenied     = errorString("authorization denied for consolidation action")
 	ErrAuthzServiceUnavailable = errorString("authorization-svc unavailable")

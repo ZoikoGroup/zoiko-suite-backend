@@ -39,7 +39,8 @@ type Store interface {
 	ListJobs(ctx context.Context, tenantID, legalEntityID, sourceA, status string) ([]domain.ReconciliationJob, error)
 	// ApplyResolution enqueues "reconciliation.resolution_recommended" in
 	// the same transaction as the update.
-	ApplyResolution(ctx context.Context, tenantID, jobID, itemID string, status domain.SuggestionStatus, notes, legalEntityID, actorID, correlationID string) (*domain.ReconciliationSuggestion, error)
+	// ref is the owning domain's record behind an EXECUTED decision (A5).
+	ApplyResolution(ctx context.Context, tenantID, jobID, itemID string, status domain.SuggestionStatus, notes string, ref *domain.AuthoritativeRef, legalEntityID, actorID, correlationID string) (*domain.ReconciliationSuggestion, error)
 	ArchiveJob(ctx context.Context, tenantID, id string) error
 }
 
@@ -139,9 +140,11 @@ func (s *PgStore) CreateJob(ctx context.Context, tenantID string, job *domain.Re
 			id, tenant_id, legal_entity_id, job_id, source_record_a, source_record_b, amount_a, amount_b,
 			discrepancy_amount, discrepancy_type, confidence_score, heuristic_rule, tolerance_version,
 			recommendation, suggestion_status, resolution_notes, created_at, updated_at,
-			bank_reconciliation_run_id, statement_line_id, counterpart_statement_line_id
+			bank_reconciliation_run_id, statement_line_id, counterpart_statement_line_id,
+			counterpart_journal_id, candidate_search_outcome, date_tolerance_version
 		) VALUES ($1, $2, $3, $4, $5, $6, $7::numeric, $8::numeric, $9::numeric, $10, $11, $12, $13, $14, $15, $16, $17, $18,
-			NULLIF($19, '')::uuid, NULLIF($20, '')::uuid, NULLIF($21, '')::uuid)`
+			NULLIF($19, '')::uuid, NULLIF($20, '')::uuid, NULLIF($21, '')::uuid,
+			NULLIF($22, '')::uuid, NULLIF($23, ''), NULLIF($24, 0))`
 
 	for i := range items {
 		item := &items[i]
@@ -159,6 +162,7 @@ func (s *PgStore) CreateJob(ctx context.Context, tenantID string, job *domain.Re
 			nullableHeuristicRule(item.HeuristicRule), nullableToleranceVersion(item.ToleranceVersion), string(item.Recommendation),
 			string(item.SuggestionStatus), item.ResolutionNotes, item.CreatedAt, item.UpdatedAt,
 			item.BankReconciliationRunID, item.StatementLineID, item.CounterpartStatementLineID,
+			item.CounterpartJournalID, string(item.CandidateSearchOutcome), item.DateToleranceVersion,
 		)
 		if err != nil {
 			return fmt.Errorf("insert reconciliation_unmatched_item failed: %w", err)
@@ -250,7 +254,9 @@ const itemColumns = `id, tenant_id, legal_entity_id, job_id, source_record_a, so
 	COALESCE(tolerance_version, 0), recommendation, suggestion_status,
 	COALESCE(resolution_notes, ''), created_at, updated_at,
 	COALESCE(bank_reconciliation_run_id::text, ''), COALESCE(statement_line_id::text, ''),
-	COALESCE(counterpart_statement_line_id::text, '')`
+	COALESCE(counterpart_statement_line_id::text, ''),
+	COALESCE(authoritative_ref_kind, ''), COALESCE(authoritative_ref_id::text, ''),
+	COALESCE(counterpart_journal_id::text, ''), COALESCE(candidate_search_outcome, ''), COALESCE(date_tolerance_version, 0)`
 
 func scanJob(row pgx.Row, j *domain.ReconciliationJob) error {
 	return row.Scan(
@@ -261,14 +267,21 @@ func scanJob(row pgx.Row, j *domain.ReconciliationJob) error {
 }
 
 func scanItem(row pgx.Row, item *domain.ReconciliationSuggestion) error {
+	var refKind, refID string
 	if err := row.Scan(
 		&item.ID, &item.TenantID, &item.LegalEntityID, &item.JobID, &item.SourceRecordA, &item.SourceRecordB,
 		&item.AmountA, &item.AmountB, &item.DiscrepancyAmount, &item.DiscrepancyType, &item.ConfidenceScore,
 		&item.HeuristicRule, &item.ToleranceVersion,
 		&item.Recommendation, &item.SuggestionStatus, &item.ResolutionNotes, &item.CreatedAt, &item.UpdatedAt,
 		&item.BankReconciliationRunID, &item.StatementLineID, &item.CounterpartStatementLineID,
+		&refKind, &refID,
+		&item.CounterpartJournalID, &item.CandidateSearchOutcome, &item.DateToleranceVersion,
 	); err != nil {
 		return err
+	}
+	item.AuthoritativeRef = nil
+	if refID != "" {
+		item.AuthoritativeRef = &domain.AuthoritativeRef{Kind: domain.AuthoritativeRefKind(refKind), JournalID: refID}
 	}
 	return canonicalizeItemAmounts(item)
 }
@@ -322,7 +335,7 @@ func (s *PgStore) ListJobs(ctx context.Context, tenantID, legalEntityID, sourceA
 	return jobs, nil
 }
 
-func (s *PgStore) ApplyResolution(ctx context.Context, tenantID, jobID, itemID string, status domain.SuggestionStatus, notes, legalEntityID, actorID, correlationID string) (*domain.ReconciliationSuggestion, error) {
+func (s *PgStore) ApplyResolution(ctx context.Context, tenantID, jobID, itemID string, status domain.SuggestionStatus, notes string, ref *domain.AuthoritativeRef, legalEntityID, actorID, correlationID string) (*domain.ReconciliationSuggestion, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -344,6 +357,11 @@ func (s *PgStore) ApplyResolution(ctx context.Context, tenantID, jobID, itemID s
 	if err := domain.ValidateResolutionTransition(item.SuggestionStatus, status); err != nil {
 		return nil, err
 	}
+	// The recommendation is on the row just locked, so whether this decision
+	// needs an authoritative reference costs no further read.
+	if err := domain.ValidateExecutionRef(item.Recommendation, status, ref); err != nil {
+		return nil, err
+	}
 
 	// Append rather than overwrite. item.ResolutionNotes at this point still
 	// holds whatever AnalyzeUnmatchedStatementLines recorded as the
@@ -357,10 +375,17 @@ func (s *PgStore) ApplyResolution(ctx context.Context, tenantID, jobID, itemID s
 
 	item.SuggestionStatus = status
 	item.ResolutionNotes = combinedNotes
+	item.AuthoritativeRef = ref
 	item.UpdatedAt = time.Now()
 
-	updateQuery := `UPDATE reconciliation_unmatched_items SET suggestion_status = $1, resolution_notes = $2, updated_at = $3 WHERE id = $4`
-	_, err = tx.Exec(ctx, updateQuery, string(status), combinedNotes, item.UpdatedAt, itemID)
+	var refKind, refID any
+	if ref != nil {
+		refKind, refID = string(ref.Kind), ref.JournalID
+	}
+	updateQuery := `UPDATE reconciliation_unmatched_items
+		SET suggestion_status = $1, resolution_notes = $2, updated_at = $3, authoritative_ref_kind = $4, authoritative_ref_id = $5
+		WHERE id = $6`
+	_, err = tx.Exec(ctx, updateQuery, string(status), combinedNotes, item.UpdatedAt, refKind, refID, itemID)
 	if err != nil {
 		return nil, err
 	}
@@ -374,12 +399,21 @@ func (s *PgStore) ApplyResolution(ctx context.Context, tenantID, jobID, itemID s
 			"bank_reconciliation_run_id":    item.BankReconciliationRunID,
 			"statement_line_id":             item.StatementLineID,
 			"counterpart_statement_line_id": item.CounterpartStatementLineID,
+			// The general-ledger-svc journal an AUTO_MATCH / DATE_SKEW
+			// proposal named (A2a), and what the candidate search found; ""
+			// when not applicable. A decision here matches nothing: the
+			// match is made in bank-reconciliation-svc.
+			"counterpart_journal_id":   item.CounterpartJournalID,
+			"candidate_search_outcome": string(item.CandidateSearchOutcome),
 			// suggestion_status is canonical; resolution_status is the
 			// pre-rename alias kept for one release (A9/B5). Both carry the
 			// same value, so they cannot disagree.
 			"suggestion_status": string(item.SuggestionStatus),
 			"resolution_status": string(item.SuggestionStatus),
 			"resolution_notes":  item.ResolutionNotes,
+			// The owning domain's record behind an EXECUTED decision; null
+			// otherwise.
+			"authoritative_ref": item.AuthoritativeRef,
 		}); err != nil {
 		return nil, err
 	}
@@ -519,7 +553,7 @@ func (m *MemoryStore) ListJobs(ctx context.Context, tenantID, legalEntityID, sou
 	return result, nil
 }
 
-func (m *MemoryStore) ApplyResolution(ctx context.Context, tenantID, jobID, itemID string, status domain.SuggestionStatus, notes, legalEntityID, actorID, correlationID string) (*domain.ReconciliationSuggestion, error) {
+func (m *MemoryStore) ApplyResolution(ctx context.Context, tenantID, jobID, itemID string, status domain.SuggestionStatus, notes string, ref *domain.AuthoritativeRef, legalEntityID, actorID, correlationID string) (*domain.ReconciliationSuggestion, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -533,11 +567,15 @@ func (m *MemoryStore) ApplyResolution(ctx context.Context, tenantID, jobID, item
 			if err := domain.ValidateResolutionTransition(j.UnmatchedItems[i].SuggestionStatus, status); err != nil {
 				return nil, err
 			}
+			if err := domain.ValidateExecutionRef(j.UnmatchedItems[i].Recommendation, status, ref); err != nil {
+				return nil, err
+			}
 			// Append rather than overwrite — mirrors PgStore exactly. See its
 			// comment: the machine's rationale must survive a human's
 			// empty-note approval.
 			j.UnmatchedItems[i].SuggestionStatus = status
 			j.UnmatchedItems[i].ResolutionNotes = appendResolutionNote(j.UnmatchedItems[i].ResolutionNotes, notes)
+			j.UnmatchedItems[i].AuthoritativeRef = ref
 			j.UnmatchedItems[i].UpdatedAt = time.Now()
 			return &j.UnmatchedItems[i], nil
 		}

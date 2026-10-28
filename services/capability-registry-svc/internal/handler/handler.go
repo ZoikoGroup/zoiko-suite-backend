@@ -37,14 +37,20 @@ const (
 	// Read actions, same CREATE/READ naming convention as above. Added per
 	// the 2026-10-05 re-audit: GetCapability, ListIntegrationCapabilities,
 	// and ListCapabilityClaims had no auth check and no documented rationale
-	// for that exemption — unlike ResolveCapability, which has one
-	// ("every service needs to hit cheaply and often") and is deliberately
-	// left unauthenticated. ListCapabilityClaims in particular returns
+	// for that exemption. ListCapabilityClaims in particular returns
 	// wording_owner_principal_id/approved_by_principal_id — who proposed and
 	// approved a not-yet-public marketing claim.
 	CapabilityRead            = "CAPABILITY_READ"
 	IntegrationCapabilityRead = "INTEGRATION_CAPABILITY_READ"
 	CapabilityClaimRead       = "CAPABILITY_CLAIM_READ"
+
+	// CapabilityResolve gates the capability-resolution read. It is a
+	// platform-scope read of the technical catalogue, not a tenant-data read
+	// (SPEC_DEVIATIONS B12), but it still reveals unreleased capabilities,
+	// incident restrictions and provider health. An identified actor alone is
+	// therefore not sufficient; the same platform-scope grant convention as
+	// the other reads applies.
+	CapabilityResolve = "CAPABILITY_RESOLVE"
 )
 
 type AuthzChecker interface {
@@ -494,6 +500,10 @@ func (h *Handler) SetReleaseState(w http.ResponseWriter, r *http.Request) {
 		if finishOrReplay(w, err) {
 			return
 		}
+		if errors.Is(err, domain.ErrCapabilityNotFound) {
+			writeError(w, http.StatusNotFound, "capability not found")
+			return
+		}
 		h.logger.Error("set release state failed", zap.Error(err))
 		writeError(w, http.StatusInternalServerError, "failed to set release state")
 		return
@@ -585,9 +595,27 @@ func (h *Handler) ListCapabilityClaims(w http.ResponseWriter, r *http.Request) {
 }
 
 // ResolveCapability is doc7 §C1's answer service: never let the caller infer
-// availability from plan alone. No principal/authz check — this is a read
-// path every service (and eventually the UI) needs to hit cheaply and often.
+// availability from plan alone. The five registry tables are platform-scope:
+// capability existence, operational release state, market approval and
+// provider health are the same facts for every tenant, so the resolver takes
+// no tenant argument and the request tenant is not an input to the answer
+// (SPEC_DEVIATIONS B12). That is deliberately NOT a tenant-exposure decision —
+// GOV-11's per-tenant EvaluateFeaturePolicy is absent and tracked separately.
+//
+// The endpoint is nevertheless not public: it requires an identified principal
+// and a CAPABILITY_RESOLVE grant at platform scope. The answer exposes
+// unreleased capabilities, incident restrictions and provider health, so
+// "anyone who reached the gateway" is not an acceptable caller. The authz
+// client's short decision cache keeps the documented cheap-read posture.
 func (h *Handler) ResolveCapability(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, CapabilityResolve) {
+		return
+	}
+
 	capabilityCode := chi.URLParam(r, "capabilityCode")
 	marketCode := r.URL.Query().Get("market_code")
 	resolved, err := h.store.ResolveCapability(r.Context(), capabilityCode, marketCode)

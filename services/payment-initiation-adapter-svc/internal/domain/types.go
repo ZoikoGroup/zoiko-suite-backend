@@ -38,12 +38,13 @@
 //     payer/payee references, authorization fingerprint) are immutable —
 //     enforced by a database trigger — the direct fix for "payment amount
 //     changed after authorization."
-//   - "Payment sent from suspended/unverified account" has no real
-//     account-status source to check against (AP-09/AP-10 already treat
-//     bank account references as opaque — see their own package docs), so
-//     this service requires the caller to explicitly assert
-//     PayerAccountVerified=true at PrepareAttempt time — a real,
-//     caller-attested gate, not a fabricated automatic check.
+//   - "Payment sent from suspended/unverified account" is checked against
+//     treasury-svc's BNK-01 record: PrepareAttempt requires the caller to
+//     assert PayerAccountVerified=true AND re-fetches the account, refusing
+//     it unless it is ACTIVE with ownership verified in the caller's tenant.
+//     The caller-attested flag alone is only a cheap early rejection; the
+//     treasury-svc lookup is the gate. A treasury-svc failure is a 503, never
+//     an assumed-good account.
 package domain
 
 import "time"
@@ -116,7 +117,7 @@ type PaymentInitiationAttempt struct {
 	AuthorizationSource  string
 	PayerAccountRef      string
 	PayeeRef             string
-	Amount               float64
+	Amount               Decimal
 	Currency             string
 	ExecutionDate        time.Time
 	PaymentReference     string
@@ -169,7 +170,7 @@ type PrepareAttemptRequest struct {
 	AuthorizationSource      string
 	PayerAccountRef          string
 	PayeeRef                 string
-	Amount                   float64
+	Amount                   Decimal
 	Currency                 string
 	ExecutionDate            time.Time
 	PaymentReference         string
@@ -222,6 +223,11 @@ const (
 	ErrInvalidResolution          = sentinel("resolved_status must be SUBMITTED or REJECTED_BEFORE_SUBMISSION")
 	ErrProviderAdapterUnavailable = sentinel("provider adapter unavailable")
 	ErrStoreUnavailable           = sentinel("store unavailable")
+
+	// ErrInvalidAmount/ErrAmountPrecision: Amount is not a positive decimal,
+	// or the NUMERIC(18,2) column cannot hold it exactly — see decimal.go.
+	ErrInvalidAmount   = sentinel("amount must be a positive decimal number")
+	ErrAmountPrecision = sentinel("amount must have at most two decimal places and at most 16 integer digits")
 
 	// ErrAuthorizationFingerprintRequired/Mismatch/Unavailable are Wave
 	// 11a's real fingerprint verification outcomes for an

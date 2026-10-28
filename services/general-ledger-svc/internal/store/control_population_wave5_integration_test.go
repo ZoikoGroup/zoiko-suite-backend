@@ -585,7 +585,7 @@ func TestManualJournals_ReversedStatusIncluded(t *testing.T) {
 	f := newW4Fixture(t)
 	d := domain.NewDate(2026, 9, 9)
 	j := f.manual(t, "2026-09", d, dr("1200", 9), cr("4000", 9))
-	if _, err := f.pool.Exec(context.Background(),
+	if err := fixtureExec(context.Background(), f.pool,
 		`UPDATE journal_headers SET status='REVERSED' WHERE tenant_id=$1 AND journal_id=$2`, f.tenant, j); err != nil {
 		t.Skipf("cannot force REVERSED status: %v", err)
 	}
@@ -619,7 +619,7 @@ func TestManualJournals_Paging_Watermark_Isolation(t *testing.T) {
 	}
 	// An approval change alters the record, hence the watermark.
 	before := f.fp(t, "manual-journals", "2026-09", 100, "")
-	if _, err := f.pool.Exec(context.Background(),
+	if err := fixtureExec(context.Background(), f.pool,
 		`UPDATE journal_headers SET approved_by_principal_id='someone' WHERE tenant_id=$1 AND journal_id=$2`,
 		f.tenant, before.Records[0].RecordID); err != nil {
 		t.Fatal(err)

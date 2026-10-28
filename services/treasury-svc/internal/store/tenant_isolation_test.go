@@ -40,7 +40,7 @@ func TestMain(m *testing.M) {
 				// to whatever major the library calls "latest," and that patch
 				// build can stop resolving from the remote binary repo with no
 				// code change on our side (this is what broke PR #105's CI).
-				Version(embeddedpostgres.V16).
+				Version(embeddedpostgres.PostgresVersion("16.15.0")).
 				Port(dbPort).
 				Database("treasury_isolation_test").
 				Username("postgres").
@@ -201,7 +201,7 @@ func TestPgStore_CreateTreasuryTransfer_RetriedCorrelationID_DoesNotCreateASecon
 
 	params := domain.CreateTreasuryTransferParams{
 		TenantID: tenantID, SourceBankAccountID: src.BankAccountID, TargetBankAccountID: tgt.BankAccountID,
-		Amount: 200.0, CurrencyCode: "USD", CorrelationID: "corr-retry-1", MakerPrincipalID: "maker-1",
+		Amount: "200", CurrencyCode: "USD", CorrelationID: "corr-retry-1", MakerPrincipalID: "maker-1",
 	}
 	first, created1, err := s.CreateTreasuryTransfer(ctx, params)
 	if err != nil {
@@ -310,7 +310,7 @@ func TestPgStore_CreateTreasuryTransfer_Isolation(t *testing.T) {
 
 	created, _, err := s.CreateTreasuryTransfer(ctxA, domain.CreateTreasuryTransferParams{
 		TenantID: tenantA, SourceBankAccountID: acctA1.BankAccountID, TargetBankAccountID: acctA2.BankAccountID,
-		Amount: 200.0, CurrencyCode: "USD", CorrelationID: "valid-transfer", MakerPrincipalID: "maker-1",
+		Amount: "200", CurrencyCode: "USD", CorrelationID: "valid-transfer", MakerPrincipalID: "maker-1",
 	})
 	if err != nil {
 		t.Fatalf("transfer creation failed: %v", err)

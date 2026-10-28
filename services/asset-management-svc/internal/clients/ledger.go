@@ -20,6 +20,8 @@ type Clients struct {
 	closeURL  string
 	http      *http.Client
 	log       *zap.Logger
+
+	kernelBookID, kernelCurrency string
 }
 
 func New(ledgerURL, closeURL string, log *zap.Logger) *Clients {

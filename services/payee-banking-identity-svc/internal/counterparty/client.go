@@ -30,9 +30,10 @@ type Counterparty struct {
 }
 
 type Client interface {
-	// GetParty confirms partyRef exists and belongs to legalEntityID,
-	// surfacing its real ComplianceStatus as this service's own
-	// "party status" server-resolved-context signal.
+	// GetParty confirms partyRef exists and belongs to legalEntityID. The
+	// response includes Status and ComplianceStatus, but the caller
+	// currently does not enforce either one; see SPEC_DEVIATIONS A3 for
+	// the server-resolved-context gap.
 	GetParty(ctx context.Context, tenantID, legalEntityID, partyRef string) (*Counterparty, error)
 }
 

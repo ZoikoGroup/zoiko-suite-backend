@@ -32,7 +32,7 @@ func (f *w4Fixture) ejJournal(t *testing.T, source string, at time.Time, amt flo
 
 func (f *w4Fixture) pinJournalTime(t *testing.T, journalID string, at time.Time) {
 	t.Helper()
-	if _, err := f.pool.Exec(context.Background(),
+	if err := fixtureExec(context.Background(), f.pool,
 		`UPDATE journal_headers SET created_at=$1, posted_at=$1 WHERE tenant_id=$2 AND journal_id=$3`,
 		at, f.tenant, journalID); err != nil {
 		t.Fatalf("pin journal time: %v", err)
@@ -55,7 +55,7 @@ func (f *w4Fixture) ejExec(t *testing.T, source string, created time.Time) strin
 
 func (f *w4Fixture) ejExecSQL(t *testing.T, sql string, args ...any) {
 	t.Helper()
-	if _, err := f.pool.Exec(context.Background(), sql, args...); err != nil {
+	if err := fixtureExec(context.Background(), f.pool, sql, args...); err != nil {
 		t.Fatalf("sql: %v", err)
 	}
 }

@@ -342,8 +342,8 @@ func (s *PgStore) CreateCashBalance(ctx context.Context, bal *domain.CashBalance
 				balance_id, tenant_id, bank_account_id, ledger_balance,
 				available_balance, as_of_timestamp, correlation_id, created_at
 			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-		`, bal.BalanceID, tenantID, bal.BankAccountID, bal.LedgerBalance,
-			bal.AvailableBalance, bal.AsOfTimestamp, bal.CorrelationID, now)
+		`, bal.BalanceID, tenantID, bal.BankAccountID, bal.LedgerBalance.OrZero(),
+			bal.AvailableBalance.OrZero(), bal.AsOfTimestamp, bal.CorrelationID, now)
 		if err != nil {
 			return err
 		}
@@ -363,8 +363,8 @@ func (s *PgStore) GetLatestCashBalance(ctx context.Context, bankAccountID string
 	var bal domain.CashBalance
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		row := tx.QueryRow(ctx, `
-			SELECT balance_id, tenant_id, bank_account_id, ledger_balance,
-			       available_balance, as_of_timestamp, correlation_id, created_at
+			SELECT balance_id, tenant_id, bank_account_id, ledger_balance::text,
+			       available_balance::text, as_of_timestamp, correlation_id, created_at
 			FROM cash_balances
 			WHERE bank_account_id = $1 AND tenant_id = $2
 			ORDER BY as_of_timestamp DESC
@@ -384,6 +384,48 @@ func (s *PgStore) GetLatestCashBalance(ctx context.Context, bankAccountID string
 	return &bal, nil
 }
 
+// GetLatestCashBalances returns the latest balance of each of the given
+// accounts in one query, keyed by bank_account_id; an account with no
+// balance on file is simply absent. The cash-position paths used to call
+// GetLatestCashBalance once per account, each in its own transaction.
+func (s *PgStore) GetLatestCashBalances(ctx context.Context, bankAccountIDs []string) (map[string]*domain.CashBalance, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	out := make(map[string]*domain.CashBalance, len(bankAccountIDs))
+	if len(bankAccountIDs) == 0 {
+		return out, nil
+	}
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT DISTINCT ON (bank_account_id)
+			       balance_id, tenant_id, bank_account_id, ledger_balance::text,
+			       available_balance::text, as_of_timestamp, correlation_id, created_at
+			FROM cash_balances
+			WHERE tenant_id = $1 AND bank_account_id = ANY($2::uuid[])
+			ORDER BY bank_account_id, as_of_timestamp DESC
+		`, tenantID, bankAccountIDs)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var bal domain.CashBalance
+			if err := rows.Scan(&bal.BalanceID, &bal.TenantID, &bal.BankAccountID, &bal.LedgerBalance,
+				&bal.AvailableBalance, &bal.AsOfTimestamp, &bal.CorrelationID, &bal.CreatedAt); err != nil {
+				return err
+			}
+			out[bal.BankAccountID] = &bal
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // SetLiquidityThreshold registers/replaces minimum liquidity requirements.
 func (s *PgStore) SetLiquidityThreshold(ctx context.Context, threshold *domain.LiquidityThreshold) error {
 	tenantID := tenantFromCtxOrFallback(ctx, threshold.TenantID)
@@ -400,7 +442,7 @@ func (s *PgStore) SetLiquidityThreshold(ctx context.Context, threshold *domain.L
 				minimum_required_balance = EXCLUDED.minimum_required_balance,
 				escalation_email = EXCLUDED.escalation_email
 		`, threshold.ThresholdID, tenantID, threshold.LegalEntityID, threshold.CurrencyCode,
-			threshold.MinimumRequiredBalance, threshold.EscalationEmail, now)
+			threshold.MinimumRequiredBalance.OrZero(), threshold.EscalationEmail, now)
 		if err != nil {
 			return err
 		}
@@ -421,7 +463,7 @@ func (s *PgStore) GetLiquidityThreshold(ctx context.Context, legalEntityID, curr
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		row := tx.QueryRow(ctx, `
 			SELECT threshold_id, tenant_id, legal_entity_id, currency_code,
-			       minimum_required_balance, escalation_email, created_at
+			       minimum_required_balance::text, escalation_email, created_at
 			FROM liquidity_thresholds
 			WHERE tenant_id = $1 AND legal_entity_id = $2 AND currency_code = $3
 			ORDER BY created_at DESC

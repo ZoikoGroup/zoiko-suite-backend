@@ -77,8 +77,8 @@ type DomainClients interface {
 	FetchJournal(ctx context.Context, tenantID, journalID string) (*domain.PostedJournal, error)
 
 	// ACC-12's own real "ACC-04/05 consolidation book" dependency.
-	PostConsolidationAdjustmentJournal(ctx context.Context, tenantID, principalID, legalEntityID, fiscalPeriod, description, sourceEventID, correlationID string, lines []clients.JournalLine) (journalID string, err error)
-	ReverseConsolidationAdjustmentJournal(ctx context.Context, tenantID, principalID, journalID, reason string) error
+	PostConsolidationAdjustmentJournal(ctx context.Context, tenantID, principalID, approverPrincipalID, legalEntityID, fiscalPeriod, description, sourceEventID, correlationID string, lines []clients.JournalLine) (journalID string, err error)
+	ReverseConsolidationAdjustmentJournal(ctx context.Context, tenantID, principalID, legalEntityID, adjustmentID, reason string) error
 }
 
 const (
@@ -936,11 +936,19 @@ func (h *Handler) PostConsolidationAdjustment(w http.ResponseWriter, r *http.Req
 	for i, l := range a.Lines {
 		lines[i] = clients.JournalLine{AccountCode: l.AccountCode, DebitAmount: l.DebitAmount, CreditAmount: l.CreditAmount}
 	}
+	approver := principalID
+	if a.ApprovedByPrincipalID != nil {
+		approver = *a.ApprovedByPrincipalID
+	}
 	journalID, err := h.clients.PostConsolidationAdjustmentJournal(
-		r.Context(), tenantID, principalID, a.GroupLegalEntityID, a.FiscalPeriod, a.Description,
+		r.Context(), tenantID, principalID, approver, a.GroupLegalEntityID, a.FiscalPeriod, a.Description,
 		a.ConsolidationAdjustmentID, correlationID, lines,
 	)
 	if err != nil {
+		if errors.Is(err, domain.ErrNoGroupBook) {
+			writeError(w, http.StatusUnprocessableEntity, "no_group_book", err.Error())
+			return
+		}
 		h.log.Error("failed to post consolidation adjustment journal", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "gl_post_failed", err.Error())
 		return
@@ -1070,7 +1078,11 @@ func (h *Handler) ReverseConsolidationAdjustment(w http.ResponseWriter, r *http.
 
 	tenantID := svcmiddleware.TenantFromContext(r.Context())
 	if a.ConsolidationBookJournalID != nil {
-		if err := h.clients.ReverseConsolidationAdjustmentJournal(r.Context(), tenantID, principalID, *a.ConsolidationBookJournalID, req.Reason); err != nil {
+		if err := h.clients.ReverseConsolidationAdjustmentJournal(r.Context(), tenantID, principalID, a.GroupLegalEntityID, *a.ConsolidationBookJournalID, req.Reason); err != nil {
+			if errors.Is(err, domain.ErrAdjustmentInGroupRun) {
+				writeError(w, http.StatusConflict, "adjustment_in_group_run", err.Error())
+				return
+			}
 			h.log.Error("failed to reverse consolidation adjustment journal", zap.Error(err))
 			writeError(w, http.StatusServiceUnavailable, "gl_reverse_failed", err.Error())
 			return
