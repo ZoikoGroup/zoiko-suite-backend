@@ -2878,8 +2878,10 @@ services:
   # issued certificate's trust chain.
   mtls-management-svc:
     build:
-      context: ../services/mtls-management-svc
-      dockerfile: Dockerfile
+      # Root context: go.mod replaces zoiko.io/identity-envelope with the
+      # sibling module, so the build must see both (see the Dockerfile).
+      context: ..
+      dockerfile: services/mtls-management-svc/Dockerfile
     container_name: mtls-management-svc
     mem_limit: 256m
     cpus: "0.5"

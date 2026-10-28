@@ -98,8 +98,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Tenant"
-        "409": { description: "external_customer_key already used for a different onboarding request, or tenant_code taken" }
-        "422": { description: "external_customer_key is required" }
+        "409": { description: "external_customer_key already used for a different onboarding request, or tenant_code taken", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "422": { description: "external_customer_key is required", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
         "400": { $ref: "#/components/responses/BadRequest" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "503": { $ref: "#/components/responses/ServiceUnavailable" }
@@ -606,7 +606,7 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/TaxIdentityBundle"
-        "403": { description: "Sensitive bundle without the scoped-access permission and purpose" }
+        "403": { description: "Sensitive bundle without the scoped-access permission and purpose", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
         "404": { $ref: "#/components/responses/NotFound" }
 
   /v1/tax-identity-bundles/{bundleID}/status:
@@ -669,7 +669,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/ResolvedTenantRegion"
         "404": { $ref: "#/components/responses/NotFound" }
-        "409": { description: "The tenant's residency policy has no region assigned" }
+        "409": { description: "The tenant's residency policy has no region assigned", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
 
   # ── ORG-02 §4.2: tenant named commands ─────────────────────────────────────
 
@@ -737,9 +737,9 @@ paths:
                 $ref: "#/components/schemas/PendingApproval"
         "400": { $ref: "#/components/responses/BadRequest" }
         "403": { $ref: "#/components/responses/Forbidden" }
-        "404": { description: "Tenant not found, or the command is not an ORG-02 command" }
-        "409": { description: "expected_version is stale, the tenant moved first, or an approval is already pending for this tenant" }
-        "422": { description: "Command not reachable from the current state, creation not yet approved, or approved_by_principal_id supplied" }
+        "404": { description: "Tenant not found, or the command is not an ORG-02 command", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "409": { description: "expected_version is stale, the tenant moved first, or an approval is already pending for this tenant", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "422": { description: "Command not reachable from the current state, creation not yet approved, or approved_by_principal_id supplied", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
 
   /v1/tenants/{tenantID}/defaults:
     get:
@@ -787,7 +787,7 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
-        "409": { description: "expected_version is stale, or the tenant may not transact" }
+        "409": { description: "expected_version is stale, or the tenant may not transact", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
 
   /v1/tenants/{tenantID}/home-region:
     post:
@@ -822,11 +822,11 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/PendingApproval"
-        "400": { description: "residency_region_id is not a UUID (VALIDATION_FAILED), or home_region_decision_ref is missing (SOURCE_UNVERIFIED)" }
+        "400": { description: "residency_region_id is not a UUID (VALIDATION_FAILED), or home_region_decision_ref is missing (SOURCE_UNVERIFIED)", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
-        "409": { description: "expected_version is stale (VERSION_CONFLICT), or a change is already pending (DUPLICATE_CANDIDATE)" }
-        "422": { description: "the tenant is OFFBOARDING or TERMINATED (INVALID_TRANSITION)" }
+        "409": { description: "expected_version is stale (VERSION_CONFLICT), or a change is already pending (DUPLICATE_CANDIDATE)", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "422": { description: "the tenant is OFFBOARDING or TERMINATED (INVALID_TRANSITION)", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
 
   /v1/tenants/{tenantID}/lifecycle-history:
     get:
@@ -898,7 +898,7 @@ paths:
                 $ref: "#/components/schemas/TenantHostBinding"
         "400": { $ref: "#/components/responses/BadRequest" }
         "403": { $ref: "#/components/responses/Forbidden" }
-        "409": { description: "Hostname already bound, or the tenant already has a primary hostname" }
+        "409": { description: "Hostname already bound, or the tenant already has a primary hostname", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
 
   /v1/resolve-tenant:
     get:
@@ -926,7 +926,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/ResolvedTenantByHost"
         "400": { $ref: "#/components/responses/BadRequest" }
-        "404": { description: "Hostname is not bound to any tenant" }
+        "404": { description: "Hostname is not bound to any tenant", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
 
   # ── ORG-03 §4.3: profile amendment commands ────────────────────────────────
 
@@ -982,8 +982,8 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
-        "409": { description: "expected_version is stale, the tenant may not transact, the registry identity is already claimed and has been quarantined, or an approval is already pending" }
-        "422": { description: "approved_by_principal_id supplied" }
+        "409": { description: "expected_version is stale, the tenant may not transact, the registry identity is already claimed and has been quarantined, or an approval is already pending", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "422": { description: "approved_by_principal_id supplied", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
 
   /v1/entities/{entityID}/legal-name:
     post:
@@ -1024,8 +1024,8 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
-        "409": { description: "expected_version is stale, the tenant may not transact, or an approval is already pending" }
-        "422": { description: "approved_by_principal_id supplied" }
+        "409": { description: "expected_version is stale, the tenant may not transact, or an approval is already pending", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "422": { description: "approved_by_principal_id supplied", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
 
   /v1/entities/{entityID}/registered-office:
     post:
@@ -1058,7 +1058,7 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
-        "409": { description: "expected_version is stale or the tenant may not transact" }
+        "409": { description: "expected_version is stale or the tenant may not transact", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
 
   # ── ORG-03 §4.3: Draft → Verified → Active, MergeDuplicateCandidate ───────
 
@@ -1091,8 +1091,8 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
-        "409": { description: "Stale expected_version, tenant may not transact, or a verification is already pending" }
-        "422": { description: "Entity is not DRAFT" }
+        "409": { description: "Stale expected_version, tenant may not transact, or a verification is already pending", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "422": { description: "Entity is not DRAFT", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
 
   /v1/entities/{entityID}/activation:
     post:
@@ -1119,8 +1119,8 @@ paths:
                 $ref: "#/components/schemas/LegalEntity"
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
-        "409": { description: "Stale expected_version or the tenant may not transact" }
-        "422": { description: "Entity is not VERIFIED" }
+        "409": { description: "Stale expected_version or the tenant may not transact", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "422": { description: "Entity is not VERIFIED", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
 
   /v1/entities/{entityID}/merge:
     post:
@@ -1153,8 +1153,8 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
-        "409": { description: "Already merged, survivor not ACTIVE/unmerged, stale version, or a merge already pending" }
-        "422": { description: "Entity status cannot be merged" }
+        "409": { description: "Already merged, survivor not ACTIVE/unmerged, stale version, or a merge already pending", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "422": { description: "Entity status cannot be merged", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
 
   /v1/entities/{entityID}/unmerge:
     post:
@@ -1182,7 +1182,7 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
-        "409": { description: "Entity is not merged, or stale version" }
+        "409": { description: "Entity is not merged, or stale version", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
 
   /v1/entities/{entityID}/merge-records:
     get:
@@ -1369,7 +1369,7 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
-        "409": { description: "Already resolved, or a resolution is already pending approval" }
+        "409": { description: "Already resolved, or a resolution is already pending approval", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
 
   # ── Verified maker-checker (ORG-02 §4.2, ORG-03 §4.3) ─────────────────────
   #
@@ -1451,9 +1451,9 @@ paths:
               schema:
                 $ref: "#/components/schemas/ApprovalOutcome"
         "400": { $ref: "#/components/responses/BadRequest" }
-        "403": { description: "The caller is the maker (or the quarantined claimant), or lacks the approve permission" }
+        "403": { description: "The caller is the maker (or the quarantined claimant), or lacks the approve permission", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
         "404": { $ref: "#/components/responses/NotFound" }
-        "409": { description: "Not pending, expired, fingerprint mismatch, or the subject changed since the proposal" }
+        "409": { description: "Not pending, expired, fingerprint mismatch, or the subject changed since the proposal", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
 
   /v1/approval-requests/{approvalRequestID}/reject:
     post:
@@ -1479,9 +1479,9 @@ paths:
               schema:
                 $ref: "#/components/schemas/ApprovalRequest"
         "400": { $ref: "#/components/responses/BadRequest" }
-        "403": { description: "The caller is the maker, or lacks the approve permission" }
+        "403": { description: "The caller is the maker, or lacks the approve permission", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
         "404": { $ref: "#/components/responses/NotFound" }
-        "409": { description: "Not pending, or expired" }
+        "409": { description: "Not pending, or expired", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
 
   # ── Workspaces ─────────────────────────────────────────────────────────────
   #
@@ -1518,7 +1518,7 @@ paths:
                 $ref: "#/components/schemas/Workspace"
         "400": { $ref: "#/components/responses/BadRequest" }
         "403": { $ref: "#/components/responses/Forbidden" }
-        "409": { description: "Tenant may not transact" }
+        "409": { description: "Tenant may not transact", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
 
   /v1/tenants/{tenantID}/workspaces:
     get:
@@ -1582,7 +1582,7 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
-        "409": { description: "Tenant may not transact" }
+        "409": { description: "Tenant may not transact", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
 
   /v1/workspaces/{workspaceID}/status:
     post:
@@ -2013,6 +2013,75 @@ components:
         service:   { type: string }
 
     # ── Error ─────────────────────────────────────────────────────────────────
+
+    Problem:
+      type: object
+      description: RFC 9457 problem document with ZS-API-001 extensions
+      required: [type, title, status, code]
+      properties:
+        type:
+          type: string
+          format: uri
+          description: A URI reference that identifies the problem type
+          example: "https://api.zoikosuite.com/problems/validation_failed"
+        title:
+          type: string
+          description: A short, human-readable summary of the problem type
+          example: "Bad Request"
+        status:
+          type: integer
+          format: int32
+          description: The HTTP status code generated by the origin server for this occurrence of the problem
+          example: 400
+        detail:
+          type: string
+          description: A human-readable explanation specific to this occurrence of the problem
+          example: "external_customer_key is required"
+        instance:
+          type: string
+          format: uri
+          description: A URI reference that identifies the specific occurrence of the problem
+          example: "urn:zoikosuite:problem:req_01h4k2m9x8n7p3q2r1s0"
+        code:
+          type: string
+          description: A stable, machine-readable error code (ORG §3)
+          example: "VALIDATION_FAILED"
+        request_id:
+          type: string
+          description: The request identifier (Zoiko-Request-Id)
+          example: "req_01h4k2m9x8n7p3q2r1s0"
+        correlation_id:
+          type: string
+          description: The correlation identifier (Zoiko-Correlation-Id or X-Correlation-ID)
+          example: "corr_abc123"
+        retryable:
+          type: boolean
+          description: Whether the client may retry the request
+          example: false
+        errors:
+          type: array
+          description: Field-level validation errors
+          items:
+            type: object
+            required: [code]
+            properties:
+              pointer:
+                type: string
+                description: JSON Pointer to the field with the error
+                example: "/external_customer_key"
+              code:
+                type: string
+                description: Field-specific error code
+                example: "REQUIRED"
+              detail:
+                type: string
+                description: Human-readable field error
+                example: "external_customer_key is required"
+        current_version:
+          type: integer
+          format: int64
+          description: The current version of the aggregate (for stale_version errors)
+          example: 5
 
     ErrorResponse:
       type: object
@@ -2560,30 +2629,30 @@ components:
     BadRequest:
       description: Invalid request body or missing required fields
       content:
-        application/json:
+        application/problem+json:
           schema:
-            $ref: "#/components/schemas/ErrorResponse"
+            $ref: "#/components/schemas/Problem"
     NotFound:
       description: Resource not found
       content:
-        application/json:
+        application/problem+json:
           schema:
-            $ref: "#/components/schemas/ErrorResponse"
+            $ref: "#/components/schemas/Problem"
     Forbidden:
       description: Authorization denied
       content:
-        application/json:
+        application/problem+json:
           schema:
-            $ref: "#/components/schemas/ErrorResponse"
+            $ref: "#/components/schemas/Problem"
     UnprocessableEntity:
       description: Invalid state transition
       content:
-        application/json:
+        application/problem+json:
           schema:
-            $ref: "#/components/schemas/ErrorResponse"
+            $ref: "#/components/schemas/Problem"
     ServiceUnavailable:
       description: Upstream service (AuthZ or Jurisdiction Rules) unreachable — request rejected fail-closed
       content:
-        application/json:
+        application/problem+json:
           schema:
-            $ref: "#/components/schemas/ErrorResponse"
+            $ref: "#/components/schemas/Problem"

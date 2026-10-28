@@ -14,6 +14,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
+	"zoiko.io/identity-envelope/apicontract"
 	"zoiko.io/notification-svc/internal/ledger"
 	"zoiko.io/notification-svc/internal/store"
 )
@@ -235,12 +236,12 @@ func (g *Gateway) HandleExecute(w http.ResponseWriter, r *http.Request) {
 
 func (g *Gateway) renderError(w http.ResponseWriter, r *http.Request, status int, title, message string) {
 	if wantsJSON(r) {
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		w.WriteHeader(status)
-		_ = json.NewEncoder(w).Encode(map[string]string{
-			"error":   title,
-			"message": message,
-		})
+		// An API caller gets an RFC 9457 problem (ZS-API-001 §12); the code is
+		// the page title in snake case, e.g. "Action Link Expired" ->
+		// action_link_expired.
+		p := apicontract.ProblemFor(status, strings.ToLower(strings.ReplaceAll(title, " ", "_")), message)
+		p.Title = title
+		apicontract.WriteProblem(w, r, p)
 		return
 	}
 

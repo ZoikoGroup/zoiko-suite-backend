@@ -74,16 +74,16 @@ func (h *Handler) Sign(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if missing := req.missingField(); missing != "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": missing})
+		writeError(w, r, http.StatusBadRequest, "missing_field", missing)
 		return
 	}
 	if req.Algorithm != "" && req.Algorithm != "HMAC-SHA256" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unsupported_algorithm"})
+		writeError(w, r, http.StatusBadRequest, "unsupported_algorithm", "")
 		return
 	}
 	message, err := base64.StdEncoding.DecodeString(req.MessageBase64)
 	if err != nil || len(message) == 0 || len(message) > maxSignedMessageBytes {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_field", "field": "message_base64"})
+		writeError(w, r, http.StatusBadRequest, "invalid_field", "message_base64")
 		return
 	}
 
@@ -91,7 +91,7 @@ func (h *Handler) Sign(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if h.refuseForeignTenant(w, req.TenantID, tenantScope) {
+	if h.refuseForeignTenant(w, r, req.TenantID, tenantScope) {
 		return
 	}
 	// A signing key belongs to a tenant: pin the lookup to the verified tenant (that
@@ -124,7 +124,7 @@ func (h *Handler) Sign(w http.ResponseWriter, r *http.Request) {
 	if req.RequestedByPrincipalID != env.Actor() {
 		deny("", nil, "requested_by_principal_id does not match the gateway-verified envelope identity", env.Actor())
 		h.metrics.BrokerDecision("sign_denied")
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "workload_identity_mismatch", "secret_path": req.SecretPath})
+		writeError(w, r, http.StatusForbidden, "workload_identity_mismatch", req.SecretPath)
 		return
 	}
 
@@ -134,10 +134,10 @@ func (h *Handler) Sign(w http.ResponseWriter, r *http.Request) {
 			if errors.Is(perr, domain.ErrSecretPolicyNotFound) || isInvalidID(perr) {
 				deny("", nil, "no secret policy with that id", req.RequestedByPrincipalID)
 				h.metrics.BrokerDecision("sign_no_policy")
-				writeJSON(w, http.StatusNotFound, map[string]string{"error": "no_applicable_secret_policy"})
+				writeError(w, r, http.StatusNotFound, "no_applicable_secret_policy", "")
 			} else {
 				h.log.Error("Sign: store unavailable resolving policy id", zap.String("correlation_id", correlationID), zap.Error(perr))
-				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+				writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
 			}
 			return
 		}
@@ -150,11 +150,11 @@ func (h *Handler) Sign(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, domain.ErrSecretPolicyNotFound), errors.Is(err, domain.ErrSecretPolicyVersionNotFound):
 			deny("", nil, "no applicable secret policy for this path/scope", req.RequestedByPrincipalID)
 			h.metrics.BrokerDecision("sign_no_policy")
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "no_applicable_secret_policy", "secret_path": req.SecretPath})
+			writeError(w, r, http.StatusNotFound, "no_applicable_secret_policy", req.SecretPath)
 		default:
 			h.log.Error("Sign: store unavailable resolving policy", zap.String("correlation_id", correlationID), zap.Error(err))
 			h.metrics.BrokerDecision("sign_error")
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
 		}
 		return
 	}
@@ -162,20 +162,20 @@ func (h *Handler) Sign(w http.ResponseWriter, r *http.Request) {
 	if applicable.SecretClass != SigningSecretClass {
 		deny(applicable.SecretClass, &spv, "secret class is not a signing class", req.RequestedByPrincipalID)
 		h.metrics.BrokerDecision("sign_denied")
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "not_a_signing_secret", "secret_path": req.SecretPath})
+		writeError(w, r, http.StatusForbidden, "not_a_signing_secret", req.SecretPath)
 		return
 	}
 	var allowed []string
 	if err := json.Unmarshal(applicable.AllowedWorkloadIDs, &allowed); err != nil {
 		h.log.Error("Sign: policy version has invalid allowed_workload_ids", zap.String("secret_policy_version_id", spv), zap.Error(err))
 		h.metrics.BrokerDecision("sign_error")
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "invalid_policy_payload"})
+		writeError(w, r, http.StatusInternalServerError, "invalid_policy_payload", "")
 		return
 	}
 	if !contains(allowed, req.RequestedByPrincipalID) {
 		deny(applicable.SecretClass, &spv, "requesting principal not in allowed_workload_ids", req.RequestedByPrincipalID)
 		h.metrics.BrokerDecision("sign_denied")
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "access_denied", "secret_path": req.SecretPath})
+		writeError(w, r, http.StatusForbidden, "access_denied", req.SecretPath)
 		return
 	}
 
@@ -184,7 +184,7 @@ func (h *Handler) Sign(w http.ResponseWriter, r *http.Request) {
 		h.log.Error("Sign: vault backend unavailable", zap.String("secret_path", applicable.SecretPath), zap.Error(err))
 		h.metrics.VaultBackendError("get")
 		h.metrics.BrokerDecision("sign_vault_error")
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "vault_backend_unavailable"})
+		writeError(w, r, http.StatusServiceUnavailable, "vault_backend_unavailable", "")
 		return
 	}
 	mac := hmac.New(sha256.New, material)
@@ -210,7 +210,7 @@ func (h *Handler) Sign(w http.ResponseWriter, r *http.Request) {
 	}); err != nil {
 		h.log.Error("Sign: failed to record SIGNED audit entry; refusing the signature", zap.String("correlation_id", correlationID), zap.Error(err))
 		h.metrics.BrokerDecision("sign_error")
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "audit_unavailable"})
+		writeError(w, r, http.StatusServiceUnavailable, "audit_unavailable", "")
 		return
 	}
 	h.metrics.BrokerDecision("sign_granted")
@@ -218,3 +218,4 @@ func (h *Handler) Sign(w http.ResponseWriter, r *http.Request) {
 		SecretPath: applicable.SecretPath, Algorithm: "HMAC-SHA256", SignatureHex: sig, PolicyVersionRef: spv,
 	})
 }
+

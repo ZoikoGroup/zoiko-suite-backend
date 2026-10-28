@@ -387,8 +387,8 @@ func TestGetJurisdiction_404_NotFound(t *testing.T) {
 	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
 		t.Fatalf("failed to decode error body: %v", err)
 	}
-	if body["error"] != "jurisdiction_not_found" {
-		t.Errorf("expected error=jurisdiction_not_found, got %q", body["error"])
+	if body["code"] != "jurisdiction_not_found" {
+		t.Errorf("expected code=jurisdiction_not_found, got %q", body["code"])
 	}
 }
 
@@ -415,8 +415,8 @@ func TestGetJurisdiction_503_StoreUnavailable(t *testing.T) {
 	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
 		t.Fatalf("failed to decode error body: %v", err)
 	}
-	if body["error"] != "store_unavailable" {
-		t.Errorf("expected error=store_unavailable, got %q", body["error"])
+	if body["code"] != "store_unavailable" {
+		t.Errorf("expected code=store_unavailable, got %q", body["code"])
 	}
 }
 
@@ -543,8 +543,8 @@ func TestListJurisdictions_503_StoreUnavailable(t *testing.T) {
 	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
 		t.Fatalf("failed to decode error body: %v", err)
 	}
-	if body["error"] != "store_unavailable" {
-		t.Errorf("expected error=store_unavailable, got %q", body["error"])
+	if body["code"] != "store_unavailable" {
+		t.Errorf("expected code=store_unavailable, got %q", body["code"])
 	}
 }
 
@@ -658,8 +658,8 @@ func TestGetAncestors_404_JurisdictionNotFound(t *testing.T) {
 	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
 		t.Fatalf("failed to decode error body: %v", err)
 	}
-	if body["error"] != "jurisdiction_not_found" {
-		t.Errorf("expected error=jurisdiction_not_found, got %q", body["error"])
+	if body["code"] != "jurisdiction_not_found" {
+		t.Errorf("expected code=jurisdiction_not_found, got %q", body["code"])
 	}
 }
 
@@ -678,8 +678,8 @@ func TestGetAncestors_503_StoreUnavailable(t *testing.T) {
 	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
 		t.Fatalf("failed to decode error body: %v", err)
 	}
-	if body["error"] != "store_unavailable" {
-		t.Errorf("expected error=store_unavailable, got %q", body["error"])
+	if body["code"] != "store_unavailable" {
+		t.Errorf("expected code=store_unavailable, got %q", body["code"])
 	}
 }
 
@@ -790,7 +790,7 @@ func TestGetRules_400_InvalidEffectiveAt(t *testing.T) {
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d", rr.Code)
 	}
-	if got := decodeError(t, rr)["error"]; got != "invalid_effective_at" {
+	if got := decodeError(t, rr)["code"]; got != "invalid_effective_at" {
 		t.Errorf("expected error=invalid_effective_at, got %q", got)
 	}
 	if st.storeCalled {
@@ -878,7 +878,7 @@ func TestGetRule_404(t *testing.T) {
 	if rr.Code != http.StatusNotFound {
 		t.Fatalf("expected 404, got %d", rr.Code)
 	}
-	if got := decodeError(t, rr)["error"]; got != "rule_not_found" {
+	if got := decodeError(t, rr)["code"]; got != "rule_not_found" {
 		t.Errorf("expected error=rule_not_found, got %q", got)
 	}
 }

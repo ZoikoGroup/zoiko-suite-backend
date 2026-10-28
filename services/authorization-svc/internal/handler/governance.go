@@ -197,7 +197,7 @@ func (h *Handler) refuseToxicForHolders(w http.ResponseWriter, r *http.Request, 
 	}
 	holders, err := h.store.ListRoleAssignments(r.Context(), tenantID, "", roleID, false)
 	if err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "", nil)
 		return true
 	}
 	now := time.Now()
@@ -211,7 +211,7 @@ func (h *Handler) refuseToxicForHolders(w http.ResponseWriter, r *http.Request, 
 		seen[a.PrincipalID] = true
 		held, err := h.heldActionsInTenant(r, a.PrincipalID, tenantID)
 		if err != nil {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "", nil)
 			return true
 		}
 		var heldList []string
@@ -220,7 +220,7 @@ func (h *Handler) refuseToxicForHolders(w http.ResponseWriter, r *http.Request, 
 		}
 		conflicts, err := h.sodConflictsFor(r.Context(), dedupeSorted(heldList), candidates, tenantID)
 		if err != nil {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "", nil)
 			return true
 		}
 		if len(conflicts) > 0 {
@@ -300,16 +300,16 @@ func (h *Handler) decideRoleAssignment(w http.ResponseWriter, r *http.Request, d
 	finder, okF := h.store.(roleAssignmentFinder)
 	decider, okD := h.store.(assignmentDecider)
 	if !okF || !okD {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "", nil)
 		return
 	}
 	pending, err := finder.FindRoleAssignmentByID(r.Context(), assignmentID, tenantScope)
 	if err != nil {
 		if errors.Is(err, domain.ErrRoleAssignmentNotFound) {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "role_assignment_not_found"})
+			writeError(w, r, http.StatusNotFound, "role_assignment_not_found", "", nil)
 			return
 		}
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "", nil)
 		return
 	}
 	if pending.ApprovalStatus != domain.ApprovalPending {
@@ -329,7 +329,7 @@ func (h *Handler) decideRoleAssignment(w http.ResponseWriter, r *http.Request, d
 	}
 	entitled, err := h.holdsPrivilegedApproval(r, principalID, tenantScope, entity)
 	if err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "", nil)
 		return
 	}
 	if !entitled {
@@ -358,14 +358,14 @@ func (h *Handler) decideRoleAssignment(w http.ResponseWriter, r *http.Request, d
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "approval_expired", "message": err.Error()})
 		return
 	case errors.Is(err, domain.ErrApprovalNotPending):
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "approval_not_pending"})
+		writeError(w, r, http.StatusConflict, "approval_not_pending", "", nil)
 		return
 	case errors.Is(err, domain.ErrRoleAssignmentNotFound):
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "role_assignment_not_found"})
+		writeError(w, r, http.StatusNotFound, "role_assignment_not_found", "", nil)
 		return
 	case err != nil:
 		h.log.Error("decideRoleAssignment: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "", nil)
 		return
 	}
 	h.log.Info("privileged assignment decided",

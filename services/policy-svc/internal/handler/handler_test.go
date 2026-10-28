@@ -442,8 +442,8 @@ func TestCreatePolicy_ReplayAndConflict(t *testing.T) {
 
 	g = newRig(&stubStore{policyErr: domain.ErrConflict}, nil, nil)
 	body := expect(t, g.do(http.MethodPost, "/v1/policies", `{"policy_code":"A","policy_name":"B","policy_type":"T"}`), http.StatusConflict, "IDEMPOTENCY_MISMATCH")
-	if body["error"] != "policy_conflict" {
-		t.Fatalf("the legacy error value must be kept for existing callers, got %v", body["error"])
+	if body["code"] != "IDEMPOTENCY_MISMATCH" || body["detail"] != "policy_conflict" {
+		t.Fatalf("the legacy error value must be kept for existing callers, got %v", body)
 	}
 }
 
@@ -545,8 +545,8 @@ func TestCreatePolicyVersion_NegativePaths(t *testing.T) {
 func TestCreatePolicyVersion_IdempotencyMismatch409(t *testing.T) {
 	g := newRig(&stubStore{versionErr: domain.ErrIdempotencyMismatch}, nil, nil)
 	body := expect(t, g.do(http.MethodPost, versionsPath(policyID), versionBody, header("Idempotency-Key", "k")), http.StatusConflict, "IDEMPOTENCY_MISMATCH")
-	if body["error"] != "policy_version_conflict" {
-		t.Fatalf("legacy error value lost: %v", body["error"])
+	if body["code"] != "IDEMPOTENCY_MISMATCH" || body["detail"] != "this Idempotency-Key or policy_version_id was already used with different content" {
+		t.Fatalf("legacy error value lost: %v", body)
 	}
 }
 
@@ -614,13 +614,13 @@ func TestLifecycle_StoreRefusalsMapToStableClasses(t *testing.T) {
 		err    error
 		status int
 		code   string
-		legacy string
+		detail string
 	}{
-		{domain.ErrApprovalRequired, http.StatusConflict, "APPROVAL_REQUIRED", "approval_required"},
-		{domain.ErrSoDConflict, http.StatusForbidden, "SOD_CONFLICT", "maker_checker_violation"},
-		{domain.ErrPolicyConflicted, http.StatusConflict, "POLICY_CONFLICTED", "policy_overlap"},
-		{domain.ErrConcurrencyConflict, http.StatusConflict, "CONCURRENCY_CONFLICT", "concurrency_conflict"},
-		{domain.ErrInvalidTransition, http.StatusConflict, "CONCURRENCY_CONFLICT", "invalid_transition"},
+		{domain.ErrApprovalRequired, http.StatusConflict, "APPROVAL_REQUIRED", "submit the version for review and have an independent approver approve it before activation"},
+		{domain.ErrSoDConflict, http.StatusForbidden, "SOD_CONFLICT", "the maker cannot be the checker: the author cannot approve or activate, and the suspender cannot review the suspension"},
+		{domain.ErrPolicyConflicted, http.StatusConflict, "POLICY_CONFLICTED", "conflicting policies"},
+		{domain.ErrConcurrencyConflict, http.StatusConflict, "CONCURRENCY_CONFLICT", "concurrency conflict"},
+		{domain.ErrInvalidTransition, http.StatusConflict, "CONCURRENCY_CONFLICT", "the version's current status does not allow this command"},
 		{domain.ErrStoreUnavailable, http.StatusServiceUnavailable, "SERVICE_UNAVAILABLE", "store_unavailable"},
 	}
 	for _, tc := range cases {
@@ -628,8 +628,8 @@ func TestLifecycle_StoreRefusalsMapToStableClasses(t *testing.T) {
 		s.transitionErr = tc.err
 		g := newRig(s, nil, nil)
 		body := expect(t, g.do(http.MethodPost, lifecyclePath("activate"), "", ifm), tc.status, tc.code)
-		if body["error"] != tc.legacy {
-			t.Errorf("%v: expected legacy error %s, got %v", tc.err, tc.legacy, body["error"])
+		if body["code"] != tc.code || body["detail"] != tc.detail {
+			t.Errorf("%v: expected legacy error %s, got %v", tc.err, tc.detail, body)
 		}
 	}
 }

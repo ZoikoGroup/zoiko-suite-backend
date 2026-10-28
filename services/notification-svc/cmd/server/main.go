@@ -13,7 +13,7 @@ import (
 
 	"github.com/exaring/otelpgx"
 	"github.com/go-chi/chi/v5"
-	"github.com/go-chi/chi/v5/middleware"
+	chimiddleware "github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -21,6 +21,7 @@ import (
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 	idenv "zoiko.io/identity-envelope"
+	apicontract "zoiko.io/identity-envelope/apicontract"
 
 	"zoiko.io/notification-svc/internal/actionlink"
 	"zoiko.io/notification-svc/internal/authz"
@@ -406,16 +407,16 @@ func main() {
 	log.Info("identity gate", gateSettings.Fields()...)
 
 	r := chi.NewRouter()
-	r.Use(idenv.RequestID)
-	r.Use(middleware.RequestID)
-	r.Use(middleware.RealIP)
-	r.Use(middleware.Recoverer)
+	r.Use(apicontract.RequestID)
+	r.Use(apicontract.DefaultCache)
+	r.Use(chimiddleware.RealIP)
+	r.Use(chimiddleware.Recoverer)
 	r.Use(otelchi.Middleware("notification-svc", otelchi.WithChiRoutes(r)))
 	r.Use(metrics.HTTPMiddleware)
 	r.Use(correlationIDMiddleware)
 	r.Use(gate.Middleware)
 	r.Use(svcmiddleware.TenantContext())
-	r.Use(middleware.Logger)
+	r.Use(chimiddleware.Logger)
 
 	// Canonical Service Input Contract (ZS-ARCH-SVC-001 v2.0 §4). Runs after
 	// Recoverer and telemetry so a refusal is still traced, and ahead of every
@@ -454,6 +455,9 @@ func main() {
 		}
 		return false
 	}
+	// The vendored envelope middleware answers refusals as legacy JSON; render
+	// them as RFC 9457 problem+json like every other error (ZS-API-001 §12).
+	r.Use(apicontract.EnvelopeRefusals)
 	r.Use(svcenvelope.Middleware(envelopePolicy, svcenvelope.DefaultReporter()))
 	// Idempotency-Key is honoured, not merely demanded: a repeated command is
 	// answered from its first response (migration 000015).

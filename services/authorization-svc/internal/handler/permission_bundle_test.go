@@ -250,8 +250,8 @@ func TestRetirePermissionBundle_NotFoundIs404(t *testing.T) {
 	}
 	var body map[string]string
 	_ = json.Unmarshal(w.Body.Bytes(), &body)
-	if body["error"] != "permission_bundle_not_found" {
-		t.Errorf("error code %q, want permission_bundle_not_found", body["error"])
+	if body["code"] != "permission_bundle_not_found" {
+		t.Errorf("error code %q, want permission_bundle_not_found", body["code"])
 	}
 }
 

@@ -55,6 +55,7 @@ import (
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 	idenv "zoiko.io/identity-envelope"
+	apicontract "zoiko.io/identity-envelope/apicontract"
 
 	"zoiko.io/search-client/searchclient"
 	"zoiko.io/search-indexer-svc/internal/authz"
@@ -320,8 +321,8 @@ func run(log *zap.Logger) error {
 	log.Info("identity gate", gateSettings.Fields()...)
 
 	r := chi.NewRouter()
-	r.Use(idenv.RequestID)
-	r.Use(chimiddleware.RequestID)
+	r.Use(apicontract.RequestID)
+	r.Use(apicontract.DefaultCache)
 	r.Use(chimiddleware.RealIP)
 	r.Use(chimiddleware.Recoverer)
 	r.Use(otelchi.Middleware(serviceName, otelchi.WithChiRoutes(r)))
@@ -338,6 +339,9 @@ func run(log *zap.Logger) error {
 	r.Handle("/metrics", metrics.MetricsHandler(healthH.Readiness, promhttp.Handler()))
 
 	r.Group(func(r chi.Router) {
+		// The vendored envelope middleware answers refusals as legacy JSON; render
+		// them as RFC 9457 problem+json like every other error (ZS-API-001 §12).
+		r.Use(apicontract.EnvelopeRefusals)
 		r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(),
 			func(req *http.Request, e svcenvelope.Envelope, verr *svcenvelope.ValidationError) {
 				log.Warn("canonical input contract violated",

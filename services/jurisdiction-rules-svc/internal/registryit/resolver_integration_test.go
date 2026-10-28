@@ -183,7 +183,7 @@ func TestResolver_IdempotencyKeyBindsOneQuestion(t *testing.T) {
 	other := c.resolveReq(at.Add(time.Hour))
 	code, r := do("k-1", other)
 	mustStatus(t, 409, code, r)
-	assert.Equal(t, "idempotency_conflict", r["error"])
+	assert.Equal(t, "idempotency_conflict", r["code"])
 	var n int
 	require.NoError(t, pool.QueryRow(ctx, `SELECT COUNT(*) FROM rule_decision_evidence WHERE idempotency_key='k-1'`).Scan(&n))
 	assert.Equal(t, 1, n)
@@ -231,7 +231,7 @@ func TestResolver_FailsClosed_OnRevokedKey_AndOnTamperedArtifact(t *testing.T) {
 		require.NoError(t, err)
 		code, r := e.do("POST", "/v1/rule-resolutions:resolve", "tax-engine", c.resolveReq(time.Now()))
 		mustStatus(t, 503, code, r)
-		assert.Equal(t, "pack_unverified", r["error"])
+		assert.Equal(t, "pack_unverified", r["code"])
 		assert.Contains(t, mustString(r["failures"]), domain.ReasonDigestMismatch)
 		assert.GreaterOrEqual(t, e.pub.count(events.EventPackVerificationFailed), 1)
 		_, err = pool.Exec(ctx, `UPDATE pack_artifacts a SET artifact = replace(artifact, '0.0000', '0.2000') FROM jurisdiction_pack_versions v
@@ -300,7 +300,7 @@ func TestResolver_PicksNewestReleasedVersion_AndPinnedReplayReproducesHistory(t 
 	setStatus(t, c, "2026.08.1", "WITHDRAWN")
 	code, r = e.do("POST", "/v1/rule-resolutions:resolve", "auditor", pinned)
 	mustStatus(t, 409, code, r)
-	assert.Equal(t, "pinned_pack_not_eligible", r["error"])
+	assert.Equal(t, "pinned_pack_not_eligible", r["code"])
 	pinned["pack_version"] = "9.9.9"
 	code, _ = e.do("POST", "/v1/rule-resolutions:resolve", "auditor", pinned)
 	assert.Equal(t, 404, code)

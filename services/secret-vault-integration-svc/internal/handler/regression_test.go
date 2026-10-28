@@ -69,18 +69,27 @@ func TestPathParams_MalformedUUID_Are400NotServiceUnavailable(t *testing.T) {
 			if w.Code != http.StatusBadRequest {
 				t.Fatalf("expected 400 for a malformed id, got %d: %s", w.Code, w.Body.String())
 			}
-			var got map[string]string
+			var got map[string]any
 			if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
 				t.Fatalf("failed to unmarshal refusal: %v", err)
 			}
-			if got["error"] != "invalid_path_parameter" {
-				t.Errorf("expected error=invalid_path_parameter, got %q", got["error"])
+			if got["code"] != "invalid_path_parameter" {
+				t.Errorf("expected code=invalid_path_parameter, got %q", got["code"])
 			}
 			// The caller has to be told WHICH id it got wrong: two of these
 			// routes carry two ids, and "invalid" without a field name is not
 			// actionable on the one that has both.
-			if got["field"] != tc.field {
-				t.Errorf("expected field=%q, got %q", tc.field, got["field"])
+			// Field is now in the errors array per RFC 7807
+			var field string
+			if errors, ok := got["errors"].([]any); ok && len(errors) > 0 {
+				if errMap, ok := errors[0].(map[string]any); ok {
+					if ptr, ok := errMap["pointer"].(string); ok {
+						field = strings.TrimPrefix(ptr, "#/")
+					}
+				}
+			}
+			if field != tc.field {
+				t.Errorf("expected field=%q, got %q", tc.field, field)
 			}
 		})
 	}

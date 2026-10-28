@@ -80,13 +80,13 @@ func (h *Handler) RetireFlag(w http.ResponseWriter, r *http.Request) {
 	}
 	switch {
 	case req.Environment == "":
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "environment"})
+		writeError(w, r, http.StatusBadRequest, "missing_field", "environment")
 		return
 	case req.FinalEnabled == nil:
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "final_enabled"})
+		writeError(w, r, http.StatusBadRequest, "missing_field", "final_enabled")
 		return
 	}
-	if h.refuseForeignTenant(w, req.TenantID, tenantScope) {
+	if h.refuseForeignTenant(w, r, req.TenantID, tenantScope) {
 		return
 	}
 	action := governedAction("flag", req.TenantID)
@@ -105,7 +105,7 @@ func (h *Handler) RetireFlag(w http.ResponseWriter, r *http.Request) {
 		CallerTenantID:       tenantScope, ActorPrincipalID: principalID, CorrelationID: correlationID,
 	})
 	if err != nil {
-		h.governedRefusal(w, action, "RetireFlag", correlationID, err)
+		h.governedRefusal(w, r, action, "RetireFlag", correlationID, err)
 		return
 	}
 	h.metrics.GovernedWrites.WithLabelValues(action, telemetry.WriteCreated).Inc()
@@ -149,11 +149,11 @@ func (h *Handler) MarkFlagRemoved(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Environment == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "environment"})
+		writeError(w, r, http.StatusBadRequest, "missing_field", "environment")
 		return
 	}
 	if len(req.ConsumerScanEvidence) == 0 {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "consumer_scan_evidence"})
+		writeError(w, r, http.StatusBadRequest, "missing_field", "consumer_scan_evidence")
 		return
 	}
 	action := telemetry.ActionFlagGlobalWrite
@@ -166,7 +166,7 @@ func (h *Handler) MarkFlagRemoved(w http.ResponseWriter, r *http.Request) {
 		CallerTenantID: tenantScope, ActorPrincipalID: principalID,
 	})
 	if err != nil {
-		h.governedRefusal(w, action, "MarkFlagRemoved", correlationID, err)
+		h.governedRefusal(w, r, action, "MarkFlagRemoved", correlationID, err)
 		return
 	}
 	h.metrics.GovernedWrites.WithLabelValues(action, telemetry.WriteCreated).Inc()

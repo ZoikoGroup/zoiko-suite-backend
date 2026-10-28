@@ -37,7 +37,7 @@ paths:
         '200':
           description: OK
           content: &id001
-            application/json:
+            application/problem+json:
               schema:
                 type: object
         '400':
@@ -2695,7 +2695,7 @@ paths:
       requestBody:
         required: true
         content:
-          application/json:
+          application/problem+json:
             schema:
               type: object
               required: [recipient_principal_id, address, verification_ref, reason]
@@ -2709,7 +2709,7 @@ paths:
         '202':
           description: Recorded PENDING; honoured only once a second principal approves it.
           content:
-            application/json:
+            application/problem+json:
               schema:
                 type: object
                 additionalProperties: true
@@ -3076,13 +3076,13 @@ paths:
       requestBody:
         required: true
         content:
-          application/json:
+          application/problem+json:
             schema: {type: object, required: [legal_entity_id, name, destination_url, event_types, signing_key_path, destination_region]}
       responses:
         "201": {description: Created (DRAFT)}
-        "400": {description: "INT-SCHEMA-004: invalid configuration"}
-        "403": {description: "INT-AUTH-003 or INT-REG-002: not authorized, or the destination or region is not allowed"}
-        "422": {description: "INT-SCOPE-013: an allowed field names restricted data"}
+        "400": {description: "INT-SCHEMA-004: invalid configuration", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "403": {description: "INT-AUTH-003 or INT-REG-002: not authorized, or the destination or region is not allowed", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "422": {description: "INT-SCOPE-013: an allowed field names restricted data", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
     get:
       tags: [Outbound webhooks]
       summary: List subscriptions (WEBHOOK_SUBSCRIPTION_READ on X-Legal-Entity-Id)
@@ -3090,13 +3090,14 @@ paths:
       responses:
         "200": {description: Subscriptions}
   /v1/webhook-subscriptions/{id}:
+    parameters: [{name: id, in: path, required: true, schema: {type: string}}]
     get:
       tags: [Outbound webhooks]
       summary: Get a subscription
       operationId: getWebhookSubscription
       responses:
         "200": {description: The subscription}
-        "404": {description: Not found (also for another tenant's subscription)}
+        "404": {description: Not found (also for another tenant's subscription), content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
     patch:
       tags: [Outbound webhooks]
       summary: Change a subscription
@@ -3107,10 +3108,12 @@ paths:
         a name or retry-budget change does not.
       responses:
         "200": {description: Updated}
-        "409": {description: "INT-IDEM-005: stale version; INT-SCOPE-013: revoked"}
+        "409": {description: "INT-IDEM-005: stale version; INT-SCOPE-013: revoked", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
   /v1/webhook-subscriptions/{id}/submit:
+    parameters: [{name: id, in: path, required: true, schema: {type: string}}]
     post: {tags: [Outbound webhooks], summary: "Submit for approval (checks egress and the signing key reference)", operationId: submitWebhookSubscription, responses: {"200": {description: PENDING_APPROVAL}}}
   /v1/webhook-subscriptions/{id}/approve:
+    parameters: [{name: id, in: path, required: true, schema: {type: string}}]
     post:
       tags: [Outbound webhooks]
       summary: Approve (maker-checker)
@@ -3118,29 +3121,38 @@ paths:
       description: The approver must not be the person who last changed the configuration. Egress, region and the signing key reference are checked again as the approver.
       responses:
         "200": {description: ACTIVE}
-        "403": {description: "INT-AUTH-003: self-approval or not authorized; INT-REG-002: destination not allowed"}
-        "422": {description: "INT-CRED-010: the signing key reference could not be confirmed"}
+        "403": {description: "INT-AUTH-003: self-approval or not authorized; INT-REG-002: destination not allowed", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "422": {description: "INT-CRED-010: the signing key reference could not be confirmed", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
   /v1/webhook-subscriptions/{id}/reject:
+    parameters: [{name: id, in: path, required: true, schema: {type: string}}]
     post: {tags: [Outbound webhooks], summary: Reject back to DRAFT (reason required), operationId: rejectWebhookSubscription, responses: {"200": {description: DRAFT}}}
   /v1/webhook-subscriptions/{id}/rotate-signing-key:
+    parameters: [{name: id, in: path, required: true, schema: {type: string}}]
     post: {tags: [Outbound webhooks], summary: "Rotate the signing key reference (both keys sign during grace_period_seconds, at most 30 days)", operationId: rotateWebhookSigningKey, responses: {"200": {description: Rotated}}}
   /v1/webhook-subscriptions/{id}/suspend:
+    parameters: [{name: id, in: path, required: true, schema: {type: string}}]
     post: {tags: [Outbound webhooks], summary: Suspend (reason required; deliveries stay queued), operationId: suspendWebhookSubscription, responses: {"200": {description: SUSPENDED}}}
   /v1/webhook-subscriptions/{id}/resume:
+    parameters: [{name: id, in: path, required: true, schema: {type: string}}]
     post: {tags: [Outbound webhooks], summary: Resume a suspended or disabled subscription, operationId: resumeWebhookSubscription, responses: {"200": {description: ACTIVE}}}
   /v1/webhook-subscriptions/{id}/revoke:
+    parameters: [{name: id, in: path, required: true, schema: {type: string}}]
     post: {tags: [Outbound webhooks], summary: Revoke for good (undelivered deliveries are dead-lettered), operationId: revokeWebhookSubscription, responses: {"200": {description: REVOKED}}}
   /v1/webhook-subscriptions/{id}/log:
+    parameters: [{name: id, in: path, required: true, schema: {type: string}}]
     get: {tags: [Outbound webhooks], summary: The subscription's append-only log, operationId: webhookSubscriptionLog, responses: {"200": {description: Log entries}}}
   /v1/webhook-subscriptions/{id}/deliveries:
-    get: {tags: [Outbound webhooks], summary: List deliveries, operationId: listWebhookDeliveries, responses: {"200": {description: Deliveries (payload hash only, never the body)}}}
+    parameters: [{name: id, in: path, required: true, schema: {type: string}}]
+    get: {tags: [Outbound webhooks], summary: List deliveries, operationId: listWebhookDeliveries, responses: {"200": {description: "Deliveries (payload hash only, never the body)"}}}
   /v1/webhook-subscriptions/{id}/health:
-    get: {tags: [Outbound webhooks], summary: Destination health (breaker, failures, queue depth), operationId: webhookDestinationHealth, responses: {"200": {description: Health}}}
+    parameters: [{name: id, in: path, required: true, schema: {type: string}}]
+    get: {tags: [Outbound webhooks], summary: "Destination health (breaker, failures, queue depth)", operationId: webhookDestinationHealth, responses: {"200": {description: Health}}}
   /v1/webhook-dead-letters:
     get: {tags: [Outbound webhooks], summary: List dead-lettered deliveries, operationId: listWebhookDeadLetters, responses: {"200": {description: Dead letters}}}
   /v1/webhook-deliveries/{id}:
-    get: {tags: [Outbound webhooks], summary: "Delivery evidence: attempts with response code, response-body hash, signature metadata and destination host", operationId: getWebhookDeliveryEvidence, responses: {"200": {description: Evidence}}}
+    get: {tags: [Outbound webhooks], summary: "Delivery evidence: attempts with response code, response-body hash, signature metadata and destination host", operationId: getWebhookDeliveryEvidence, parameters: [{name: id, in: path, required: true, schema: {type: string}}], responses: {"200": {description: Evidence}}}
   /v1/webhook-deliveries/{id}/replay:
+    parameters: [{name: id, in: path, required: true, schema: {type: string}}]
     post:
       tags: [Outbound webhooks]
       summary: Replay a dead-lettered delivery
@@ -3148,8 +3160,8 @@ paths:
       description: Keeps the delivery's identity and gives it a fresh retry budget. Needs approver_principal_id (a different person who is themselves entitled), approval_ref and reason.
       responses:
         "202": {description: Back on the queue}
-        "403": {description: "INT-AUTH-003: no valid approver"}
-        "409": {description: Not a dead letter, or the subscription is not active}
+        "403": {description: "INT-AUTH-003: no valid approver", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "409": {description: "Not a dead letter, or the subscription is not active", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
 components:
   parameters:
     TenantId:
@@ -3202,26 +3214,30 @@ components:
         type: string
       description: Mandatory on writes (INV-08); a repeat is answered from the first response.
   schemas:
-    Error:
+    Problem:
       type: object
-      required:
-      - error_code
+      required: [type, title, status, code]
       properties:
-        error_code:
-          type: string
-        error_message:
-          type: string
-    EnvelopeError:
-      type: object
-      properties:
-        error:
-          type: string
-        detail:
-          type: string
-        violations:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        code: { type: string }
+        request_id: { type: string }
+        correlation_id: { type: string }
+        retryable: { type: boolean }
+        retry_after: { type: integer }
+        errors:
           type: array
           items:
             type: object
+            properties:
+              pointer: { type: string }
+              code: { type: string }
+              detail: { type: string }
+        current_version: { type: integer, format: int64 }
+        decision_id: { type: string }
     Refusal:
       type: object
       required:
@@ -3261,44 +3277,42 @@ components:
     Invalid:
       description: Invalid request, or the 4-envelope is incomplete
       content:
-        application/json:
+        application/problem+json:
           schema:
-            oneOf:
-            - $ref: '#/components/schemas/Error'
-            - $ref: '#/components/schemas/EnvelopeError'
+            $ref: '#/components/schemas/Problem'
     Unauthenticated:
       description: No principal or tenant, or an unauthenticated callback
       content:
-        application/json:
+        application/problem+json:
           schema:
-            $ref: '#/components/schemas/Error'
+            $ref: '#/components/schemas/Problem'
     Forbidden:
       description: Not granted, or segregation of duties
       content:
-        application/json:
+        application/problem+json:
           schema:
-            $ref: '#/components/schemas/Error'
+            $ref: '#/components/schemas/Problem'
     NotFound:
       description: Not found in this tenant
       content:
-        application/json:
+        application/problem+json:
           schema:
-            $ref: '#/components/schemas/Error'
+            $ref: '#/components/schemas/Problem'
     Conflict:
       description: The object's state does not permit the command
       content:
-        application/json:
+        application/problem+json:
           schema:
-            $ref: '#/components/schemas/Error'
+            $ref: '#/components/schemas/Problem'
     Refused:
       description: A 10.3 coded refusal (NCD-001 to NCD-020)
       content:
-        application/json:
+        application/problem+json:
           schema:
-            $ref: '#/components/schemas/Refusal'
+            $ref: '#/components/schemas/Problem'
     Unavailable:
       description: A dependency or the store is unavailable; nothing was done
       content:
-        application/json:
+        application/problem+json:
           schema:
-            $ref: '#/components/schemas/Error'
+            $ref: '#/components/schemas/Problem'

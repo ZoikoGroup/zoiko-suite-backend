@@ -24,11 +24,14 @@ import (
 // errorCode unmarshals the {"error": "<code>"} body shape every refusal uses.
 func errorCode(t *testing.T, body []byte) string {
 	t.Helper()
-	var got map[string]string
+	var got map[string]any
 	if err := json.Unmarshal(body, &got); err != nil {
 		t.Fatalf("refusal body is not JSON: %v: %s", err, body)
 	}
-	return got["error"]
+	if code, ok := got["code"].(string); ok {
+		return code
+	}
+	return ""
 }
 
 func TestUpsertConfigEntry_CodedRefusalsAnswerTheirDocumented4xx(t *testing.T) {

@@ -306,8 +306,12 @@ func TestSecondPassIT_SoDExceptions(t *testing.T) {
 	f := newFixture(t)
 	tenant := f.tenant
 	rule, err := f.s.CreateSoDRule(f.ctx, domain.CreateSoDRuleParams{DomainCode: "TREASURY", ActionA: "payment.prepare", ActionB: "payment.release",
-		ConflictType: "STATIC", TenantID: &tenant})
+		ConflictType: "STATIC", TenantID: &tenant, RequestedBy: "it-maker"})
 	if err != nil {
+		t.Fatal(err)
+	}
+	// A proposed rule denies nothing until someone else publishes it (000036).
+	if _, err := f.s.DecideSoDRuleChange(f.ctx, rule.SoDRuleID, f.tenant, false, "it-checker", true); err != nil {
 		t.Fatal(err)
 	}
 	exp := time.Now().Add(3 * time.Second)

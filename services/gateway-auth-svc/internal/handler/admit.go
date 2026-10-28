@@ -9,9 +9,9 @@ import (
 
 	"github.com/go-chi/chi/v5/middleware"
 	"go.uber.org/zap"
+	apicontract "zoiko.io/identity-envelope/apicontract"
 
 	"zoiko.io/gateway-auth-svc/internal/admission"
-	"zoiko.io/gateway-auth-svc/internal/problem"
 	"zoiko.io/gateway-auth-svc/internal/siem"
 )
 
@@ -75,7 +75,7 @@ func (h *Handler) admit(w http.ResponseWriter, r *http.Request, rc *reqCtx) (rel
 	noop := func() {}
 	if !h.adm.Gate.Acquire() {
 		h.refuse(w, r, rc, refusal{
-			outcome: outcomeOverloaded, code: problem.CodeBackpressure, status: http.StatusServiceUnavailable,
+			outcome: outcomeOverloaded, code: "backpressure", status: http.StatusServiceUnavailable,
 			detail: "the gateway is shedding load; retry shortly", retryable: true, retryAfter: 1,
 			event: "integration_backpressure_active", severity: siem.SeverityHigh,
 		})
@@ -87,7 +87,7 @@ func (h *Handler) admit(w http.ResponseWriter, r *http.Request, rc *reqCtx) (rel
 	// quota like any other, or the cheap checks below become the attack surface.
 	if allowed, wait := h.adm.IPLimiter.Allow(rc.clientKey); !allowed {
 		h.refuse(w, r, rc, refusal{
-			outcome: outcomeRateLimited, code: problem.CodeRateLimited, status: http.StatusTooManyRequests,
+			outcome: outcomeRateLimited, code: "rate_limited", status: http.StatusTooManyRequests,
 			detail: "request rate for this client exceeds its quota", retryable: true, retryAfter: ceilSeconds(wait),
 			event: "api_rate_limited", severity: siem.SeverityMedium,
 		})
@@ -101,10 +101,10 @@ func (h *Handler) admit(w http.ResponseWriter, r *http.Request, rc *reqCtx) (rel
 		f := refusal{outcome: string(v.Kind), status: v.Status, detail: v.Detail, severity: siem.SeverityLow}
 		switch v.Kind {
 		case admission.KindVersionUnsupported:
-			f.code = problem.CodeVersionUnsupported
+			f.code = "version_unsupported"
 			f.event = "api_route_version_unavailable"
 		default:
-			f.code = problem.CodeSchemaMismatch
+			f.code = "schema_mismatch"
 			f.event = "api_request_denied"
 		}
 		h.refuse(w, r, rc, f)
@@ -121,7 +121,7 @@ func (h *Handler) admitTenant(w http.ResponseWriter, r *http.Request, rc *reqCtx
 		return true
 	}
 	h.refuse(w, r, rc, refusal{
-		outcome: outcomeRateLimited, code: problem.CodeRateLimited, status: http.StatusTooManyRequests,
+		outcome: outcomeRateLimited, code: "rate_limited", status: http.StatusTooManyRequests,
 		detail: "request rate for this tenant exceeds its quota", retryable: true, retryAfter: ceilSeconds(wait),
 		event: "api_rate_limited", severity: siem.SeverityMedium,
 	})
@@ -139,7 +139,7 @@ func ceilSeconds(d time.Duration) int {
 // refusal describes one terminal refusal of /verify.
 type refusal struct {
 	outcome    string
-	code       problem.Code
+	code       string
 	status     int
 	detail     string
 	retryable  bool
@@ -166,20 +166,25 @@ func (h *Handler) refuse(w http.ResponseWriter, r *http.Request, rc *reqCtx, f r
 	d, abusive := h.rec.Record(admission.Decision{
 		TenantID: rc.tenantID, PrincipalID: rc.principalID, ClientKey: rc.clientKey,
 		Method: rc.method, Path: rc.path, APIVersion: rc.apiVersion,
-		Outcome: f.outcome, Code: string(f.code), Status: f.status, Detail: f.detail,
+		Outcome: f.outcome, Code: f.code, Status: f.status, Detail: f.detail,
 		CorrelationID: rc.correlation,
 	})
 	h.metrics.VerifyDecision(f.outcome)
 
 	w.Header().Set(denialReasonHeader, f.outcome)
-	w.Header().Set("X-Gateway-Decision-Id", d.ID)
 	for _, kv := range f.headers {
 		w.Header().Set(kv[0], kv[1])
 	}
-	problem.Write(w, problem.Spec{
-		Code: f.code, Status: f.status, Detail: f.detail, Instance: rc.path,
-		Retryable: f.retryable, RetryAfter: f.retryAfter,
-		CorrelationID: rc.correlation, DecisionID: d.ID,
+	apicontract.WriteProblem(w, r, apicontract.Problem{
+		Status:        f.status,
+		Code:          f.code,
+		Detail:        f.detail,
+		Instance:      rc.path,
+		Retryable:     f.retryable,
+		RetryAfter:    f.retryAfter,
+		CorrelationID: rc.correlation,
+		DecisionID:    d.ID,
+		CurrentVersion: nil,
 	})
 
 	name := f.event
@@ -215,7 +220,7 @@ func (h *Handler) emit(ctx context.Context, tenantID, event string, sev siem.Sev
 
 // refuseAuth answers 401: the caller could not be authenticated.
 func (h *Handler) refuseAuth(w http.ResponseWriter, r *http.Request, rc *reqCtx, outcome, detail string) {
-	h.refuse(w, r, rc, refusal{outcome: outcome, code: problem.CodeAuthDenied, status: http.StatusUnauthorized, detail: detail})
+	h.refuse(w, r, rc, refusal{outcome: outcome, code: "auth_denied", status: http.StatusUnauthorized, detail: detail})
 }
 
 // clientHost is the client address WITHOUT a port, for the per-client quota and

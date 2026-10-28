@@ -11,6 +11,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
+	apicontract "zoiko.io/identity-envelope/apicontract"
 
 	"zoiko.io/delegated-authority-svc/internal/domain"
 	svcmiddleware "zoiko.io/delegated-authority-svc/internal/middleware"
@@ -221,7 +222,7 @@ func (h *Handler) ListDelegations(w http.ResponseWriter, r *http.Request) {
 		// A misspelled filter used to return an empty list, which on a
 		// register of delegated authority reads as "nobody holds any" -- the
 		// most reassuring possible answer, and a false one.
-		writeError(w, http.StatusBadRequest, "unknown_status", string(domain.ErrUnknownStatus))
+		writeError(w, r, http.StatusBadRequest, "unknown_status", string(domain.ErrUnknownStatus))
 		return
 	}
 
@@ -233,7 +234,7 @@ func (h *Handler) ListDelegations(w http.ResponseWriter, r *http.Request) {
 
 	if f.LegalEntityID != "" {
 		if err := h.checkAllowed(r.Context(), principalID, f.LegalEntityID, actionDelegationView); err != nil {
-			h.writeAuthzErr(w, err)
+			h.writeAuthzErr(w, r, err)
 			return
 		}
 		h.countRead(telemetry.ReadScopeEntity)
@@ -244,7 +245,7 @@ func (h *Handler) ListDelegations(w http.ResponseWriter, r *http.Request) {
 		// instead of silently narrowed to the caller.
 		if (f.DelegatorPrincipalID != "" && f.DelegatorPrincipalID != principalID) ||
 			(f.DelegatePrincipalID != "" && f.DelegatePrincipalID != principalID) {
-			writeError(w, http.StatusForbidden, "forbidden",
+			writeError(w, r, http.StatusForbidden, "forbidden",
 				"reading another principal's delegations requires legal_entity_id and DELEGATION_VIEW on it")
 			return
 		}
@@ -260,16 +261,16 @@ func (h *Handler) ListDelegations(w http.ResponseWriter, r *http.Request) {
 	if v := r.URL.Query().Get("as_of"); v != "" {
 		asOf, err := time.Parse(time.RFC3339, v)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, "invalid_as_of", "as_of must be an RFC 3339 timestamp")
+			writeError(w, r, http.StatusBadRequest, "invalid_as_of", "as_of must be an RFC 3339 timestamp")
 			return
 		}
 		if f.Status != "" {
-			writeError(w, http.StatusBadRequest, "invalid_filter", "as_of answers what was effective then; it cannot be combined with status")
+			writeError(w, r, http.StatusBadRequest, "invalid_filter", "as_of answers what was effective then; it cannot be combined with status")
 			return
 		}
 		list, err := h.store.ListEffectiveAsOf(r.Context(), f, asOf)
 		if err != nil {
-			h.writeStoreErr(w, err)
+			h.writeStoreErr(w, r, err)
 			return
 		}
 		if list == nil {
@@ -281,7 +282,7 @@ func (h *Handler) ListDelegations(w http.ResponseWriter, r *http.Request) {
 
 	list, err := h.store.ListDelegations(r.Context(), f)
 	if err != nil {
-		h.writeStoreErr(w, err)
+		h.writeStoreErr(w, r, err)
 		return
 	}
 	if list == nil {
@@ -307,7 +308,7 @@ func (h *Handler) GetDelegation(w http.ResponseWriter, r *http.Request) {
 
 	d, err := h.store.GetDelegation(r.Context(), delegationID)
 	if err != nil {
-		h.writeStoreErr(w, err)
+		h.writeStoreErr(w, r, err)
 		return
 	}
 	// A party to the grant may read it, as the list already allows; anyone
@@ -322,10 +323,10 @@ func (h *Handler) GetDelegation(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := h.checkAllowed(r.Context(), principalID, d.LegalEntityID, actionDelegationView); err != nil {
 		if errors.Is(err, domain.ErrAuthorizationDenied) {
-			writeError(w, http.StatusNotFound, "not_found", string(domain.ErrDelegationNotFound))
+			writeError(w, r, http.StatusNotFound, "not_found", string(domain.ErrDelegationNotFound))
 			return
 		}
-		h.writeAuthzErr(w, err)
+		h.writeAuthzErr(w, r, err)
 		return
 	}
 	h.countRead(telemetry.ReadScopeEntity)
@@ -361,7 +362,7 @@ func (h *Handler) ExplainDelegationChain(w http.ResponseWriter, r *http.Request)
 	actionType := r.URL.Query().Get("action_type")
 
 	if legalEntityID == "" || startPrincipalID == "" || targetPrincipalID == "" || actionType == "" {
-		writeError(w, http.StatusBadRequest, "missing_fields", "legal_entity_id, start_principal_id, target_principal_id, action_type are required")
+		writeError(w, r, http.StatusBadRequest, "missing_fields", "legal_entity_id, start_principal_id, target_principal_id, action_type are required")
 		return
 	}
 
@@ -373,9 +374,9 @@ func (h *Handler) ExplainDelegationChain(w http.ResponseWriter, r *http.Request)
 	// Check authorization - requires DELEGATION_VIEW on the entity
 	if err := h.checkAllowed(r.Context(), principalID, legalEntityID, actionDelegationView); err != nil {
 		if errors.Is(err, domain.ErrAuthorizationDenied) {
-			writeError(w, http.StatusForbidden, "forbidden", "DELEGATION_VIEW required")
+			writeError(w, r, http.StatusForbidden, "forbidden", "DELEGATION_VIEW required")
 		} else {
-			h.writeAuthzErr(w, err)
+			h.writeAuthzErr(w, r, err)
 		}
 		return
 	}
@@ -383,7 +384,7 @@ func (h *Handler) ExplainDelegationChain(w http.ResponseWriter, r *http.Request)
 	tenantID := svcmiddleware.TenantFromContext(r.Context())
 	chain, err := h.store.ExplainDelegationChain(r.Context(), tenantID, legalEntityID, startPrincipalID, targetPrincipalID, actionType)
 	if err != nil {
-		h.writeStoreErr(w, err)
+		h.writeStoreErr(w, r, err)
 		return
 	}
 
@@ -456,17 +457,17 @@ func (h *Handler) recordRefusedEscalation(ctx context.Context, reason string, re
 func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
 	principalID := r.Header.Get("X-Principal-Id")
 	if principalID == "" {
-		writeError(w, http.StatusUnauthorized, "identity_missing", string(domain.ErrIdentityMissing))
+		writeError(w, r, http.StatusUnauthorized, "identity_missing", string(domain.ErrIdentityMissing))
 		return "", false
 	}
 	return principalID, true
 }
 
-func (h *Handler) writeAuthzErr(w http.ResponseWriter, err error) {
+func (h *Handler) writeAuthzErr(w http.ResponseWriter, r *http.Request, err error) {
 	if errors.Is(err, domain.ErrAuthorizationDenied) {
-		writeError(w, http.StatusForbidden, "forbidden", err.Error())
+		writeError(w, r, http.StatusForbidden, "forbidden", err.Error())
 	} else {
-		writeError(w, http.StatusServiceUnavailable, "authz_unavailable", err.Error())
+		writeError(w, r, http.StatusServiceUnavailable, "authz_unavailable", err.Error())
 	}
 }
 
@@ -476,7 +477,7 @@ func (h *Handler) writeAuthzErr(w http.ResponseWriter, err error) {
 func (h *Handler) requireTenant(w http.ResponseWriter, r *http.Request) (string, bool) {
 	tenantID := svcmiddleware.TenantFromContext(r.Context())
 	if tenantID == "" {
-		writeError(w, http.StatusUnauthorized, "tenant_missing", string(domain.ErrTenantMissing))
+		writeError(w, r, http.StatusUnauthorized, "tenant_missing", string(domain.ErrTenantMissing))
 		return "", false
 	}
 	return tenantID, true
@@ -491,7 +492,7 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(dst); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+		writeError(w, r, http.StatusBadRequest, "invalid_json", err.Error())
 		return false
 	}
 	return true
@@ -502,7 +503,7 @@ func parsePaging(w http.ResponseWriter, r *http.Request) (limit, offset int, ok 
 	if v := r.URL.Query().Get("limit"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil || n < 1 || n > maxPageLimit {
-			writeError(w, http.StatusBadRequest, "invalid_paging", string(domain.ErrInvalidPaging))
+			writeError(w, r, http.StatusBadRequest, "invalid_paging", string(domain.ErrInvalidPaging))
 			return 0, 0, false
 		}
 		limit = n
@@ -510,7 +511,7 @@ func parsePaging(w http.ResponseWriter, r *http.Request) (limit, offset int, ok 
 	if v := r.URL.Query().Get("offset"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil || n < 0 {
-			writeError(w, http.StatusBadRequest, "invalid_paging", string(domain.ErrInvalidPaging))
+			writeError(w, r, http.StatusBadRequest, "invalid_paging", string(domain.ErrInvalidPaging))
 			return 0, 0, false
 		}
 		offset = n
@@ -518,39 +519,34 @@ func parsePaging(w http.ResponseWriter, r *http.Request) (limit, offset int, ok 
 	return limit, offset, true
 }
 
-func (h *Handler) writeStoreErr(w http.ResponseWriter, err error) {
+func (h *Handler) writeStoreErr(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
 	case errors.Is(err, domain.ErrTenantMissing):
-		writeError(w, http.StatusUnauthorized, "tenant_missing", err.Error())
+		writeError(w, r, http.StatusUnauthorized, "tenant_missing", err.Error())
 	case errors.Is(err, domain.ErrIdentityMissing):
-		writeError(w, http.StatusUnauthorized, "identity_missing", err.Error())
+		writeError(w, r, http.StatusUnauthorized, "identity_missing", err.Error())
 	case errors.Is(err, domain.ErrDelegationNotFound):
-		writeError(w, http.StatusNotFound, "not_found", err.Error())
+		writeError(w, r, http.StatusNotFound, "not_found", err.Error())
 	case errors.Is(err, domain.ErrInvalidTransition):
-		writeError(w, http.StatusConflict, "invalid_transition", err.Error())
+		writeError(w, r, http.StatusConflict, "invalid_transition", err.Error())
 	case errors.Is(err, domain.ErrVersionRequired):
-		writeError(w, http.StatusPreconditionRequired, "version_required", err.Error())
+		writeError(w, r, http.StatusPreconditionRequired, "version_required", err.Error())
 	case errors.Is(err, domain.ErrVersionMismatch):
-		writeError(w, http.StatusConflict, "version_mismatch", err.Error())
+		writeError(w, r, http.StatusConflict, "version_mismatch", err.Error())
 	case errors.Is(err, domain.ErrLapsed):
-		writeError(w, http.StatusConflict, "lapsed", err.Error())
+		writeError(w, r, http.StatusConflict, "lapsed", err.Error())
 	case errors.Is(err, domain.ErrCannotExtend):
-		writeError(w, http.StatusConflict, "cannot_extend", err.Error())
+		writeError(w, r, http.StatusConflict, "cannot_extend", err.Error())
 	case errors.Is(err, domain.ErrOverlapConflict):
-		writeError(w, http.StatusConflict, "overlap_conflict", err.Error())
+		writeError(w, r, http.StatusConflict, "overlap_conflict", err.Error())
 	default:
 		h.log.Error("delegated authority store error", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 	}
 }
 
-func writeError(w http.ResponseWriter, status int, code, msg string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]string{
-		"error_code":    code,
-		"error_message": msg,
-	})
+func writeError(w http.ResponseWriter, r *http.Request, status int, code, msg string) {
+	apicontract.WriteError(w, r, status, code, msg)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

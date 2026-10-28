@@ -35,7 +35,6 @@ package identity
 import (
 	"context"
 	"crypto/rsa"
-	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
@@ -44,6 +43,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"go.uber.org/zap"
 	idenv "zoiko.io/identity-envelope"
+	apicontract "zoiko.io/identity-envelope/apicontract"
 
 	"zoiko.io/authorization-svc/internal/workload"
 )
@@ -257,21 +257,21 @@ func (g *Gate) Middleware(next http.Handler) http.Handler {
 				// "warn" is for callers that have not started sending one, not
 				// for credentials that are expired, forged or for someone else.
 				g.log.Warn("identity assertion refused", zap.String("path", r.URL.Path), zap.Error(err))
-				refuse(w, http.StatusUnauthorized, "identity_assertion_invalid", "AUTHENTICATION_FAILED",
+				refuse(w, r, http.StatusUnauthorized, "identity_assertion_invalid", "AUTHENTICATION_FAILED",
 					"the identity envelope in Authorization did not verify")
 				return
 			}
 			if hp := strings.TrimSpace(r.Header.Get("X-Principal-Id")); hp != "" && hp != a.PrincipalID {
 				g.log.Warn("X-Principal-Id contradicts the verified envelope — refused",
 					zap.String("path", r.URL.Path), zap.String("envelope_principal", a.PrincipalID), zap.String("header_principal", hp))
-				refuse(w, http.StatusForbidden, "identity_mismatch", "AUTHORIZATION_DENIED",
+				refuse(w, r, http.StatusForbidden, "identity_mismatch", "AUTHORIZATION_DENIED",
 					"X-Principal-Id does not name the principal the identity envelope was issued to")
 				return
 			}
 			if ht := strings.TrimSpace(r.Header.Get("X-Tenant-Id")); ht != "" && ht != a.TenantID {
 				g.log.Warn("X-Tenant-Id contradicts the verified envelope — refused",
 					zap.String("path", r.URL.Path), zap.String("envelope_tenant", a.TenantID), zap.String("header_tenant", ht))
-				refuse(w, http.StatusForbidden, "tenant_scope_mismatch", "AUTHORIZATION_DENIED",
+				refuse(w, r, http.StatusForbidden, "tenant_scope_mismatch", "AUTHORIZATION_DENIED",
 					"X-Tenant-Id does not name the tenant the identity envelope was issued for")
 				return
 			}
@@ -301,7 +301,7 @@ func (g *Gate) Middleware(next http.Handler) http.Handler {
 		if g.mode == ModeRequire {
 			g.log.Warn("identity assertion missing — refused", zap.String("path", r.URL.Path),
 				zap.String("claimed_principal", r.Header.Get("X-Principal-Id")), zap.String("remote_addr", r.RemoteAddr))
-			refuse(w, http.StatusUnauthorized, "identity_assertion_required", "AUTHENTICATION_FAILED",
+			refuse(w, r, http.StatusUnauthorized, "identity_assertion_required", "AUTHENTICATION_FAILED",
 				"send the caller's identity envelope as Authorization: Bearer, or call over mTLS as a registered delegate")
 			return
 		}
@@ -329,11 +329,11 @@ func (g *Gate) sessionLive(w http.ResponseWriter, r *http.Request, token string,
 	case errors.Is(err, idenv.ErrRevoked):
 		g.log.Warn("identity session revoked — refused", zap.String("path", r.URL.Path),
 			zap.String("principal_id", a.PrincipalID), zap.String("session_context_id", a.SessionContextID), zap.Error(err))
-		refuse(w, http.StatusUnauthorized, "session_revoked", "AUTHENTICATION_FAILED",
+		refuse(w, r, http.StatusUnauthorized, "session_revoked", "AUTHENTICATION_FAILED",
 			"the identity envelope's session has ended; sign in again")
 	default:
 		g.log.Error("identity session status unavailable — failing closed", zap.String("path", r.URL.Path), zap.Error(err))
-		refuse(w, http.StatusServiceUnavailable, "session_status_unavailable", "DEPENDENCY_UNAVAILABLE",
+		refuse(w, r, http.StatusServiceUnavailable, "session_status_unavailable", "DEPENDENCY_UNAVAILABLE",
 			"the identity session could not be confirmed")
 	}
 	return false
@@ -347,11 +347,13 @@ func bearer(header string) (string, bool) {
 	return strings.TrimSpace(token), true
 }
 
-func refuse(w http.ResponseWriter, status int, code, class, msg string) {
-	w.Header().Set("Content-Type", "application/json")
+// refuse answers as RFC 9457 problem+json (ZS-API-001 §12), with the §16
+// class beside the code.
+func refuse(w http.ResponseWriter, r *http.Request, status int, code, class, msg string) {
 	if status == http.StatusUnauthorized {
 		w.Header().Set("WWW-Authenticate", `Bearer realm="authorization-svc"`)
 	}
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]string{"error": code, "error_class": class, "message": msg})
+	p := apicontract.ProblemFor(status, code, msg)
+	p.Extra = map[string]any{"error_class": class}
+	apicontract.WriteProblem(w, r, p)
 }
