@@ -23,10 +23,11 @@ and never posts, waives or clears anything — and the tolerance gate is real.
 It now consumes bank-reconciliation (A1), detects duplicate entries within
 a run (A2), and proposes the book side of an UNMATCHED line: a FINALIZED
 general-ledger-svc journal, as an advisory AUTO_MATCH or DATE_SKEW (A2a,
-2026-10-26). It does not yet propose a banking-connector-svc canonical
-transaction (A2b). Two defects were fixed in this pass (B1, B2); a later pass
-closed A7 and the decimal half of A4; a third closed A1, A3 and A6; a fourth
-closed A8 and A9; a fifth closed A5; the latest closes A2a.
+2026-10-26) — or, when no journal matches, a NORMALIZED banking-connector-svc
+canonical transaction (A2b part 1, 2026-10-28). Two defects were fixed in
+this pass (B1, B2); a later pass closed A7 and the decimal half of A4; a
+third closed A1, A3 and A6; a fourth closed A8 and A9; a fifth closed A5; a
+sixth closed A2a; the latest closes A2b part 1.
 
 ## A. Not implemented / weaker than the spec
 
@@ -216,17 +217,88 @@ closed A8 and A9; a fifth closed A5; the latest closes A2a.
     the CHECKs refusing inconsistent rows, and the down migration refusing
     while a result exists and succeeding once none does.
 - **A2b. No candidate match against a banking-connector-svc canonical
-  transaction, and the ledger search has known limits** (open, narrower than
-  A2a).
-  1. *The canonical side.* Unblocked 2026-10-27, not yet built.
-     banking-connector-svc now serves BNK-04 `ListTransactions`
-     (`GET /v1/banking/canonical-transactions`, its A20). It returns
-     NORMALIZED rows only, filtered by legal entity, bank account, currency
-     and a UTC date window, with an exact decimal-string amount and
-     `next_cursor` pagination. It is authorized as `bank.transaction.read`,
-     so this service's principal needs a bundle granting it. This service
-     has no client for it yet, and no rule for when a canonical transaction
-     rather than a journal is a line's counterpart.
+  transaction, and the ledger search has known limits** (part 1 closed
+  2026-10-28; parts 2–4 open).
+  1. *The canonical side* (closed 2026-10-28). banking-connector-svc serves
+     BNK-04 `ListTransactions` (`GET /v1/banking/canonical-transactions`, its
+     A20).
+     - **When.** Only on a line the journal search (A2a, including its
+       cross-line exclusivity pass) leaves `NO_CANDIDATE`. A line with a
+       journal proposal, a journal `AMBIGUOUS`, or `NO_CASH_ACCOUNT` keeps
+       that result and is never also searched here, so a line never carries
+       both kinds of candidate. `domain.CanonicalSearchLines` names those
+       lines; the handler reads banking-connector-svc only when there is at
+       least one, so a run whose lines all have a journal result never calls
+       it.
+     - **The read.** A new read-only `internal/banking` client, built like
+       `internal/ledger`: one `GET` per (bank account, currency, statement
+       date) — normally one per run — with `legal_entity_id`,
+       `bank_account_id` (the line's own, from bank-reconciliation-svc; both
+       services key it to treasury-svc's BNK-01 account), `currency`, the
+       same `[statement date ± horizon]` window as the ledger read, and
+       `limit=5000` (the route's cap). Every row is re-checked against the
+       tenant, entity, bank account, currency and window asked for, must be
+       NORMALIZED, have a UUID id, and carry its amount as a decimal *string*
+       held exactly (a bare JSON number is refused as a contract
+       regression). A non-empty `next_cursor` is refused as
+       `ErrWindowTooLarge`: cursor-following is not implemented, and a
+       partial page cannot prove there is no candidate.
+     - **The match rule.** bank-reconciliation-svc's `verifyCanonicalMatch`
+       accepts a NORMALIZED transaction of the same tenant and currency
+       whose amount equals the line's, compared signed, in cents. Both
+       services sign an amount the same way — banking-connector-svc copies
+       the raw posted amount (opening + Σ lines = closing), and a
+       bank-reconciliation-svc line is positive for money in — so the rule
+       here is a direct signed equality, as `big.Rat` (stricter than cents).
+       It also requires the line's legal entity and bank account, which that
+       check does not.
+     - **Outcomes.** As for journals, under the same governed date
+       tolerance: one within it is `AUTO_MATCH`, one only beyond it inside
+       the horizon is `DATE_SKEW` / `MANUAL_REVIEW`, more than one — or one
+       transaction claimed by two lines — is `AMBIGUOUS`, none is
+       `NO_CANDIDATE` (now stating that both services were searched). The
+       outcome values are reused; the rule names the source:
+       `CANDIDATE_TRANSACTION_WITHIN_DATE_TOLERANCE`,
+       `CANDIDATE_TRANSACTION_DATE_SKEW`, `CANDIDATE_TRANSACTION_AMBIGUOUS`.
+       The rationale names banking-connector-svc, the transaction and the
+       bank account, and says no journal matched first. Cross-line
+       exclusivity is per record kind: a journal and a transaction are never
+       treated as the same record, even with equal ids.
+     - **Storage.** Migration 000009 adds `counterpart_transaction_id` and
+       replaces 000008's counterpart CHECKs: exactly one of journal or
+       transaction is named exactly when the outcome is
+       WITHIN_DATE_TOLERANCE or DATE_SKEW, AUTO_MATCH names one, and a named
+       journal or transaction must sit under its own kind's rule. The
+       resolution event carries `counterpart_transaction_id`. The down
+       migration refuses while any row carries a canonical result.
+     - **Fail closed.** If the read is needed and fails, nothing is
+       analyzed: unreachable 503; a `next_cursor` 422; a refusal (including
+       403 while the principal lacks `bank.transaction.read`) or an
+       inconsistent row 502. The domain refuses too: a `NO_CANDIDATE` line
+       whose bank account was not read is an error, never "no candidate".
+     - **Deployment prerequisite.** This service's principal needs a role
+       bundle granting `bank.transaction.read` (access-control-svc migration
+       000022 registers the permission) on each legal entity it analyzes.
+       Until it is granted, analysis of any run with a `NO_CANDIDATE` line
+       is 502. `BANKING_CONNECTOR_SERVICE_URL` defaults to
+       `http://banking-connector-svc:8145`.
+     - **Not searched.** A `NO_CASH_ACCOUNT` line is not searched for a
+       canonical transaction, although bank-reconciliation-svc could verify
+       one for it. Widening the gate is a reviewer's call.
+
+     *Tests:* `internal/banking/client_test.go` (exact query, envelope,
+     scope/entity/account/currency/status/window/UTC rows refused, a
+     `next_cursor` page refused, an amount float64 cannot distinguish held
+     exactly, 400/403/503/unreachable); `internal/domain/canonical_candidates_test.go`
+     (AUTO_MATCH, DATE_SKEW, beyond horizon, NO_CANDIDATE naming both,
+     NO_CANDIDATE-only gating against journal AUTO_MATCH / DATE_SKEW /
+     AMBIGUOUS and NO_CASH_ACCOUNT, an unread account refused, signed and
+     exact amounts, out-of-scope rows, AMBIGUOUS, cross-line exclusivity
+     across both kinds); `internal/handler/canonical_candidate_match_test.go`
+     through the real analyze route (proposal on the wire, one read with its
+     exact parameters, no read when not needed, 503/422/502);
+     `internal/store/candidate_transaction_test.go` on real Postgres (round
+     trip, the CHECKs, the down migration).
   2. *Multiple journals.* A journal is a candidate only if its own net
      movement equals the line. One payment booked as two journals is not
      found.

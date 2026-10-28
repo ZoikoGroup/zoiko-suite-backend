@@ -14,6 +14,7 @@ import (
 	"zoiko.io/eventing/kafkaout"
 	"zoiko.io/eventing/outbox"
 	"zoiko.io/reconciliation-intelligence-svc/internal/authz"
+	"zoiko.io/reconciliation-intelligence-svc/internal/banking"
 	"zoiko.io/reconciliation-intelligence-svc/internal/bankrec"
 	"zoiko.io/reconciliation-intelligence-svc/internal/config"
 	"zoiko.io/reconciliation-intelligence-svc/internal/financialcontrol"
@@ -119,8 +120,9 @@ func main() {
 	bankRecClient := bankrec.NewClient(cfg.BankReconciliationURL, logger)
 
 	ledgerClient := ledger.NewClient(cfg.GeneralLedgerURL, logger)
+	bankingClient := banking.NewClient(cfg.BankingConnectorURL, logger)
 
-	h := handler.NewHandler(dataStore, authzClient, financialControlClient, bankRecClient, ledgerClient, cfg.CandidateSearchHorizonDays, logger)
+	h := handler.NewHandler(dataStore, authzClient, financialControlClient, bankRecClient, ledgerClient, bankingClient, cfg.CandidateSearchHorizonDays, logger)
 	router := handler.NewRouter(h)
 
 	srv := &http.Server{

@@ -11,6 +11,7 @@ import (
 
 	"go.uber.org/zap"
 	"zoiko.io/reconciliation-intelligence-svc/internal/authz"
+	"zoiko.io/reconciliation-intelligence-svc/internal/banking"
 	"zoiko.io/reconciliation-intelligence-svc/internal/bankrec"
 	"zoiko.io/reconciliation-intelligence-svc/internal/financialcontrol"
 	"zoiko.io/reconciliation-intelligence-svc/internal/handler"
@@ -227,6 +228,70 @@ func newFakeLedgerServer(t *testing.T, entries []fakeLedgerEntry, queries *[]str
 	return srv
 }
 
+// fakeCanonicalTxn is one banking-connector-svc NORMALIZED canonical
+// transaction the fake serves. Amount is the decimal string the real route
+// sends; Date is the UTC calendar day of transaction_date.
+type fakeCanonicalTxn struct {
+	ID, TenantID, LegalEntityID, BankAccountID, Currency, Date, Amount string
+}
+
+// fakeBanking stands in for banking-connector-svc's ListTransactions. It
+// applies the legal-entity, bank-account, currency and date-window filters
+// the real route applies, records every query, and fails the test on any
+// non-GET: this service must never write to banking-connector-svc.
+// nextCursor, when set, is sent on every page, as for a result larger than
+// one page.
+type fakeBanking struct {
+	txns       []fakeCanonicalTxn
+	nextCursor string
+	status     int // non-zero: answer every request with this status
+	mu         sync.Mutex
+	queries    []string
+}
+
+func (f *fakeBanking) server(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/banking/canonical-transactions" {
+			t.Errorf("reconciliation-intelligence-svc sent %s %s to banking-connector-svc; it is read-only", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		f.mu.Lock()
+		f.queries = append(f.queries, r.URL.RawQuery)
+		f.mu.Unlock()
+		if f.status != 0 {
+			w.WriteHeader(f.status)
+			return
+		}
+		q := r.URL.Query()
+		parts := []string{}
+		for _, x := range f.txns {
+			if x.LegalEntityID != q.Get("legal_entity_id") || x.BankAccountID != q.Get("bank_account_id") ||
+				x.Currency != q.Get("currency") || x.Date < q.Get("transaction_date_from") || x.Date > q.Get("transaction_date_to") {
+				continue
+			}
+			parts = append(parts, fmt.Sprintf(
+				`{"transaction_id":%q,"tenant_id":%q,"legal_entity_id":%q,"connection_id":"conn-1","bank_account_id":%q,"statement_line_id":"bcl-1","mapping_version":1,"transaction_date":"%sT00:00:00Z","amount":%q,"currency":%q,"category":"TRANSFER","counterparty":"","status":"NORMALIZED"}`,
+				x.ID, x.TenantID, x.LegalEntityID, x.BankAccountID, x.Date, x.Amount, x.Currency))
+		}
+		body := `{"transactions":[` + strings.Join(parts, ",") + `]`
+		if f.nextCursor != "" {
+			body += fmt.Sprintf(`,"next_cursor":%q`, f.nextCursor)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(body + "}"))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func (f *fakeBanking) asked() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.queries...)
+}
+
 // deps selects what newTestRouter wires in; zero values mean the standard
 // fakes.
 type deps struct {
@@ -237,6 +302,7 @@ type deps struct {
 	financialControlURL string
 	bankRecURL          string
 	ledgerURL           string
+	bankingURL          string
 }
 
 func newTestRouter(t *testing.T, d deps) http.Handler {
@@ -263,11 +329,15 @@ func newTestRouter(t *testing.T, d deps) http.Handler {
 	if d.ledgerURL == "" {
 		d.ledgerURL = newFakeLedgerServer(t, nil, nil).URL
 	}
+	if d.bankingURL == "" {
+		d.bankingURL = (&fakeBanking{}).server(t).URL
+	}
 	h := handler.NewHandler(d.store,
 		authz.NewClient(d.authzURL, logger),
 		financialcontrol.NewClient(d.financialControlURL, logger),
 		bankrec.NewClient(d.bankRecURL, logger),
 		ledger.NewClient(d.ledgerURL, logger),
+		banking.NewClient(d.bankingURL, logger),
 		31,
 		logger)
 	return handler.NewRouter(h)

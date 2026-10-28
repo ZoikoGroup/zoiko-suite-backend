@@ -49,6 +49,7 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 		"000006_suggestion_data_model_names.up.sql",
 		"000007_suggestion_authoritative_ref.up.sql",
 		"000008_suggestion_candidate_match.up.sql",
+		"000009_suggestion_candidate_transaction.up.sql",
 	} {
 		sql, err := os.ReadFile(filepath.Join(base, "../../deployments/migrations", migration))
 		if err != nil {

@@ -36,6 +36,14 @@ const (
 	HeuristicCandidateWithinDateTolerance HeuristicRule = "CANDIDATE_JOURNAL_WITHIN_DATE_TOLERANCE"
 	HeuristicCandidateDateSkew            HeuristicRule = "CANDIDATE_JOURNAL_DATE_SKEW"
 	HeuristicCandidateAmbiguous           HeuristicRule = "CANDIDATE_JOURNAL_AMBIGUOUS"
+
+	// The same three outcomes when the counterpart is a banking-connector-svc
+	// canonical transaction rather than a journal (A2b). The outcome says
+	// what the search found; the rule says which service and kind of record
+	// it found it in.
+	HeuristicCandidateTransactionWithinDateTolerance HeuristicRule = "CANDIDATE_TRANSACTION_WITHIN_DATE_TOLERANCE"
+	HeuristicCandidateTransactionDateSkew            HeuristicRule = "CANDIDATE_TRANSACTION_DATE_SKEW"
+	HeuristicCandidateTransactionAmbiguous           HeuristicRule = "CANDIDATE_TRANSACTION_AMBIGUOUS"
 )
 
 // Fixed labels, like the other rules' (types.go): a named rule fired, not a
@@ -77,12 +85,18 @@ type LedgerEntry struct {
 
 // CandidateSearch is the input to the counterpart search for one run: the
 // governed tolerance, the outer bound on how far from the statement date a
-// DATE_SKEW candidate may lie, and the FINALIZED entries read for each cash
-// account the run's lines use.
+// DATE_SKEW candidate may lie, the FINALIZED entries read for each cash
+// account the run's lines use, and the NORMALIZED canonical transactions read
+// for each bank account whose lines no journal matched (A2b).
+//
+// A key present in TransactionsByBankAccount means that account was read,
+// even when its slice is empty. A line that needs the canonical search on an
+// account that was not read is refused, never treated as "no candidate".
 type CandidateSearch struct {
-	Tolerance        DateTolerance
-	HorizonDays      int
-	EntriesByAccount map[string][]LedgerEntry
+	Tolerance                 DateTolerance
+	HorizonDays               int
+	EntriesByAccount          map[string][]LedgerEntry
+	TransactionsByBankAccount map[string][]CanonicalTransaction
 }
 
 // candidateJournal is one journal's net movement on a line's cash account.
@@ -94,10 +108,18 @@ type candidateJournal struct {
 }
 
 // lineSearch is the per-line result before the cross-line exclusivity pass.
+// At most one of the journal and transaction halves is set: the canonical
+// search runs only on a line the journal search left NO_CANDIDATE.
 type lineSearch struct {
 	outcome    CandidateSearchOutcome
 	proposed   *candidateJournal
 	candidates []candidateJournal // every qualifying journal, for an AMBIGUOUS rationale
+
+	proposedTxn   *candidateTransaction
+	txnCandidates []candidateTransaction // every qualifying transaction, for an AMBIGUOUS rationale
+	// txnSearched: the canonical search ran on this line, so a final
+	// NO_CANDIDATE means neither service had a counterpart.
+	txnSearched bool
 }
 
 // searchCandidates finds, for each line, the journals bank-reconciliation-svc
@@ -213,6 +235,74 @@ func searchCandidates(lines []BankStatementLine, amounts []*big.Rat, searched ma
 	return out, nil
 }
 
+// journalPhase is an analysis up to and including the journal search: the
+// exact amounts, the duplicate copies, and each searched line's result.
+type journalPhase struct {
+	amounts []*big.Rat
+	dupOf   map[int]duplicateOf
+	dupsOf  map[int][]int
+	found   map[int]lineSearch
+}
+
+// analyzeSearch runs the deterministic first half of an analysis — amounts,
+// duplicates, the journal search — shared by AnalyzeUnmatchedStatementLines
+// and CanonicalSearchLines so both see exactly the same NO_CANDIDATE lines.
+func analyzeSearch(lines []BankStatementLine, tenantID string, search *CandidateSearch) (*journalPhase, error) {
+	if search == nil || search.Tolerance.Version <= 0 || search.Tolerance.Days < 0 || search.HorizonDays < search.Tolerance.Days {
+		return nil, fmt.Errorf("a governed candidate date tolerance and a search horizon at least as wide are required")
+	}
+	amounts := make([]*big.Rat, len(lines))
+	for i, line := range lines {
+		amount, err := ParseStorableAmount(line.Amount)
+		if err != nil {
+			return nil, fmt.Errorf("statement line %s: %w", line.StatementLineID, err)
+		}
+		amounts[i] = amount
+	}
+
+	// Duplicate detection runs first and is exclusive for the duplicate: a
+	// line identified as a copy of another gets ONE suggestion,
+	// DUPLICATE_ENTRY, and not also a write-off or review recommendation.
+	// Writing off or investigating a copy is the wrong action, and two
+	// suggestions about the same line could contradict each other. The
+	// anchor — the entry that stays — still goes through the rules below:
+	// once the copy is removed it is one real entry that is still UNMATCHED.
+	// So every line is still the subject of exactly one suggestion.
+	dupOf, dupsOf := findDuplicates(lines, amounts)
+
+	// A copy is not searched: the entry it duplicates is, once.
+	searched := make(map[int]bool, len(lines))
+	for i := range lines {
+		if _, isDup := dupOf[i]; !isDup {
+			searched[i] = true
+		}
+	}
+	found, err := searchCandidates(lines, amounts, searched, tenantID, search)
+	if err != nil {
+		return nil, err
+	}
+	return &journalPhase{amounts: amounts, dupOf: dupOf, dupsOf: dupsOf, found: found}, nil
+}
+
+// CanonicalSearchLines returns the lines whose analysis needs
+// banking-connector-svc's canonical transactions: exactly those the journal
+// search (EntriesByAccount) leaves NO_CANDIDATE. The caller reads each such
+// line's bank account into TransactionsByBankAccount before
+// AnalyzeUnmatchedStatementLines; when no line needs it, nothing is read.
+func CanonicalSearchLines(lines []BankStatementLine, tenantID string, search *CandidateSearch) ([]BankStatementLine, error) {
+	a, err := analyzeSearch(lines, tenantID, search)
+	if err != nil {
+		return nil, err
+	}
+	var out []BankStatementLine
+	for i, line := range lines {
+		if ls, searched := a.found[i]; searched && ls.outcome == CandidateNone {
+			out = append(out, line)
+		}
+	}
+	return out, nil
+}
+
 func sortCandidates(cs []candidateJournal) {
 	sort.Slice(cs, func(a, b int) bool {
 		if cs[a].days != cs[b].days {
@@ -272,6 +362,18 @@ func candidateItem(line BankStatementLine, amount *big.Rat, outcome CandidateSea
 // candidateNote is appended to a missing-reference suggestion's rationale so
 // the search result reads alongside the rule that fired.
 func candidateNote(ls lineSearch, line BankStatementLine, search *CandidateSearch) string {
+	switch {
+	case ls.outcome == CandidateAmbiguous && len(ls.txnCandidates) > 0:
+		ids := make([]string, len(ls.txnCandidates))
+		for k, c := range ls.txnCandidates {
+			ids[k] = fmt.Sprintf("%s (%s)", c.transactionID, c.date)
+		}
+		return fmt.Sprintf("; candidate search found no FINALIZED general-ledger-svc journal on cash account %s, then on bank account %s found more than one qualifying NORMALIZED banking-connector-svc canonical transaction, or a transaction another line also qualifies for (date tolerance %d day(s), policy version %d, horizon %d day(s)): %s — none is proposed; a human picks the match",
+			line.GLCashAccountCode, line.BankAccountID, search.Tolerance.Days, search.Tolerance.Version, search.HorizonDays, strings.Join(ids, ", "))
+	case ls.outcome == CandidateNone && ls.txnSearched:
+		return fmt.Sprintf("; candidate search found no FINALIZED general-ledger-svc journal of this legal entity and currency moving cash account %s by exactly this amount, and no NORMALIZED banking-connector-svc canonical transaction on bank account %s of exactly this signed amount and currency, within %d day(s) of the statement date (date tolerance policy version %d)",
+			line.GLCashAccountCode, line.BankAccountID, search.HorizonDays, search.Tolerance.Version)
+	}
 	switch ls.outcome {
 	case CandidateAmbiguous:
 		ids := make([]string, len(ls.candidates))

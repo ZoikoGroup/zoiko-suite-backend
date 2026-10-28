@@ -12,6 +12,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"go.uber.org/zap"
 	"zoiko.io/reconciliation-intelligence-svc/internal/authz"
+	"zoiko.io/reconciliation-intelligence-svc/internal/banking"
 	"zoiko.io/reconciliation-intelligence-svc/internal/bankrec"
 	"zoiko.io/reconciliation-intelligence-svc/internal/domain"
 	svcenvelope "zoiko.io/reconciliation-intelligence-svc/internal/envelope"
@@ -39,19 +40,21 @@ type Handler struct {
 	financialControl *financialcontrol.Client
 	bankRec          *bankrec.Client
 	ledger           *ledger.Client
+	banking          *banking.Client
 	// searchHorizonDays bounds the candidate search's ledger read; see
 	// config.CandidateSearchHorizonDays.
 	searchHorizonDays int
 	logger            *zap.Logger
 }
 
-func NewHandler(s store.Store, a *authz.Client, fc *financialcontrol.Client, br *bankrec.Client, gl *ledger.Client, searchHorizonDays int, l *zap.Logger) *Handler {
+func NewHandler(s store.Store, a *authz.Client, fc *financialcontrol.Client, br *bankrec.Client, gl *ledger.Client, bc *banking.Client, searchHorizonDays int, l *zap.Logger) *Handler {
 	return &Handler{
 		store:             s,
 		authz:             a,
 		financialControl:  fc,
 		bankRec:           br,
 		ledger:            gl,
+		banking:           bc,
 		searchHorizonDays: searchHorizonDays,
 		logger:            l,
 	}
@@ -179,6 +182,13 @@ func (h *Handler) AnalyzeReconciliation(w http.ResponseWriter, r *http.Request) 
 	search, err := h.readCandidates(r.Context(), ledger.Scope(scope), lines, dateTolerance)
 	if err != nil {
 		h.writeLedgerErr(w, err)
+		return
+	}
+	// A line no journal matches is searched for a banking-connector-svc
+	// canonical transaction instead (A2b) — read only when some line needs
+	// it, and then required: an unread account is never "no candidate".
+	if err := h.readCanonicalCandidates(r.Context(), banking.Scope(scope), lines, tenantID, search); err != nil {
+		h.writeBankingErr(w, err)
 		return
 	}
 
@@ -451,6 +461,59 @@ func (h *Handler) readCandidates(ctx context.Context, scope ledger.Scope, lines 
 		search.EntriesByAccount[l.GLCashAccountCode] = append(search.EntriesByAccount[l.GLCashAccountCode], entries...)
 	}
 	return search, nil
+}
+
+// readCanonicalCandidates reads, for each distinct (bank account, currency,
+// statement date) among the lines the journal search left NO_CANDIDATE,
+// that account's NORMALIZED canonical transactions in the same window the
+// ledger read uses. A run is one bank account and one statement date, so
+// this is at most one read per currency, and none when every line has a
+// journal result.
+func (h *Handler) readCanonicalCandidates(ctx context.Context, scope banking.Scope, lines []domain.BankStatementLine, tenantID string, search *domain.CandidateSearch) error {
+	need, err := domain.CanonicalSearchLines(lines, tenantID, search)
+	if err != nil {
+		return fmt.Errorf("%w: %v", banking.ErrInconsistent, err)
+	}
+	search.TransactionsByBankAccount = map[string][]domain.CanonicalTransaction{}
+	type window struct{ account, currency, date string }
+	seen := map[window]bool{}
+	for _, l := range need {
+		wnd := window{l.BankAccountID, l.CurrencyCode, l.StatementDate}
+		if seen[wnd] {
+			continue
+		}
+		seen[wnd] = true
+		date, err := time.Parse("2006-01-02", l.StatementDate)
+		if err != nil {
+			return fmt.Errorf("%w: statement line %s date %q", banking.ErrInconsistent, l.StatementLineID, l.StatementDate)
+		}
+		from := date.AddDate(0, 0, -search.HorizonDays).Format("2006-01-02")
+		to := date.AddDate(0, 0, search.HorizonDays).Format("2006-01-02")
+		txns, err := h.banking.ListBankAccountTransactions(ctx, scope, l.BankAccountID, l.CurrencyCode, from, to)
+		if err != nil {
+			return err
+		}
+		// The key is set even when nothing came back: the account was read.
+		search.TransactionsByBankAccount[l.BankAccountID] = append(search.TransactionsByBankAccount[l.BankAccountID], txns...)
+	}
+	return nil
+}
+
+// writeBankingErr responds to a failed canonical-transaction read, the same
+// way writeLedgerErr does: nothing is analyzed without it.
+func (h *Handler) writeBankingErr(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, banking.ErrWindowTooLarge):
+		h.respondError(w, http.StatusUnprocessableEntity, "the bank account has too many canonical transactions in the candidate search window to read in one page")
+	case errors.Is(err, banking.ErrServiceUnavailable):
+		h.logger.Error("banking-connector-svc candidate read failed", zap.Error(err))
+		h.respondError(w, http.StatusServiceUnavailable, "banking-connector-svc unavailable")
+	default:
+		// ErrRequestRefused (including this principal lacking
+		// bank.transaction.read), ErrInconsistent, ErrScopeMissing.
+		h.logger.Error("banking-connector-svc candidate read was refused or inconsistent", zap.Error(err))
+		h.respondError(w, http.StatusBadGateway, "banking-connector-svc returned canonical transactions that could not be used")
+	}
 }
 
 // writeLedgerErr responds to a failed candidate-search read. Nothing is

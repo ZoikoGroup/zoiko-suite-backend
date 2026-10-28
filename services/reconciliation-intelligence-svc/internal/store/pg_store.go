@@ -141,10 +141,12 @@ func (s *PgStore) CreateJob(ctx context.Context, tenantID string, job *domain.Re
 			discrepancy_amount, discrepancy_type, confidence_score, heuristic_rule, tolerance_version,
 			recommendation, suggestion_status, resolution_notes, created_at, updated_at,
 			bank_reconciliation_run_id, statement_line_id, counterpart_statement_line_id,
-			counterpart_journal_id, candidate_search_outcome, date_tolerance_version
+			counterpart_journal_id, candidate_search_outcome, date_tolerance_version,
+			counterpart_transaction_id
 		) VALUES ($1, $2, $3, $4, $5, $6, $7::numeric, $8::numeric, $9::numeric, $10, $11, $12, $13, $14, $15, $16, $17, $18,
 			NULLIF($19, '')::uuid, NULLIF($20, '')::uuid, NULLIF($21, '')::uuid,
-			NULLIF($22, '')::uuid, NULLIF($23, ''), NULLIF($24, 0))`
+			NULLIF($22, '')::uuid, NULLIF($23, ''), NULLIF($24, 0),
+			NULLIF($25, '')::uuid)`
 
 	for i := range items {
 		item := &items[i]
@@ -163,6 +165,7 @@ func (s *PgStore) CreateJob(ctx context.Context, tenantID string, job *domain.Re
 			string(item.SuggestionStatus), item.ResolutionNotes, item.CreatedAt, item.UpdatedAt,
 			item.BankReconciliationRunID, item.StatementLineID, item.CounterpartStatementLineID,
 			item.CounterpartJournalID, string(item.CandidateSearchOutcome), item.DateToleranceVersion,
+			item.CounterpartTransactionID,
 		)
 		if err != nil {
 			return fmt.Errorf("insert reconciliation_unmatched_item failed: %w", err)
@@ -256,7 +259,8 @@ const itemColumns = `id, tenant_id, legal_entity_id, job_id, source_record_a, so
 	COALESCE(bank_reconciliation_run_id::text, ''), COALESCE(statement_line_id::text, ''),
 	COALESCE(counterpart_statement_line_id::text, ''),
 	COALESCE(authoritative_ref_kind, ''), COALESCE(authoritative_ref_id::text, ''),
-	COALESCE(counterpart_journal_id::text, ''), COALESCE(candidate_search_outcome, ''), COALESCE(date_tolerance_version, 0)`
+	COALESCE(counterpart_journal_id::text, ''), COALESCE(candidate_search_outcome, ''), COALESCE(date_tolerance_version, 0),
+	COALESCE(counterpart_transaction_id::text, '')`
 
 func scanJob(row pgx.Row, j *domain.ReconciliationJob) error {
 	return row.Scan(
@@ -276,6 +280,7 @@ func scanItem(row pgx.Row, item *domain.ReconciliationSuggestion) error {
 		&item.BankReconciliationRunID, &item.StatementLineID, &item.CounterpartStatementLineID,
 		&refKind, &refID,
 		&item.CounterpartJournalID, &item.CandidateSearchOutcome, &item.DateToleranceVersion,
+		&item.CounterpartTransactionID,
 	); err != nil {
 		return err
 	}
@@ -405,6 +410,9 @@ func (s *PgStore) ApplyResolution(ctx context.Context, tenantID, jobID, itemID s
 			// match is made in bank-reconciliation-svc.
 			"counterpart_journal_id":   item.CounterpartJournalID,
 			"candidate_search_outcome": string(item.CandidateSearchOutcome),
+			// The banking-connector-svc canonical transaction proposed
+			// instead, when no journal matched (A2b); "" otherwise.
+			"counterpart_transaction_id": item.CounterpartTransactionID,
 			// suggestion_status is canonical; resolution_status is the
 			// pre-rename alias kept for one release (A9/B5). Both carry the
 			// same value, so they cannot disagree.
