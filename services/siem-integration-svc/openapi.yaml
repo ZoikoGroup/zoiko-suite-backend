@@ -95,23 +95,47 @@ paths:
     get:
       summary: List SIEM exporters
       description: |
-        Returns all exporters in the caller's tenant, optionally filtered
-        by `legal_entity_id`. Does not return `auth_token` (tagged
-        `json:"-"`). No principal required — service-to-service callers
-        send only `X-Tenant-Id`.
+        With `X-Principal-Id` (a person): `legal_entity_id` is required, the
+        call is authorized on `SIEM_EXPORTER_READ` at that entity, and the
+        entity's exporters are returned. `auth_token` is never returned
+        (tagged `json:"-"`).
+
+        Without `X-Principal-Id` (the service-to-service fan-out lookup the
+        platform's SIEM clients make with only `X-Tenant-Id`): only the `id`
+        and `status` of each ACTIVE exporter in the tenant — no name,
+        platform, legal entity or endpoint.
       operationId: ListExporters
       parameters:
         - name: legal_entity_id
           in: query
+          description: Required when X-Principal-Id is present; it is the authorization scope.
           schema: { type: string, format: uuid }
       responses:
         '200':
-          description: List of exporters
+          description: Exporters (full rows for a person, id and status only for a service)
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/ExporterListResponse' }
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/ExporterListResponse'
+                  - $ref: '#/components/schemas/ExporterRefListResponse'
+        '400':
+          description: A person did not name legal_entity_id
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '401':
           description: Missing tenant
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '403':
+          description: Not authorized to read that entity's exporters
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '503':
+          description: Authorization or the store unavailable (fails closed)
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
@@ -278,6 +302,18 @@ components:
         data:
           type: array
           items: { $ref: '#/components/schemas/SIEMExporter' }
+        count: { type: integer }
+
+    ExporterRefListResponse:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string, format: uuid }
+              status: { type: string, enum: [ACTIVE] }
         count: { type: integer }
 
     StreamEventRequest:

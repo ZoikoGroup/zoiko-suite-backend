@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	chimw "github.com/go-chi/chi/v5/middleware"
@@ -90,16 +91,20 @@ func New(s store.Store, az AuthzChecker, l *zap.Logger) *Handler {
 //
 // The correct control for those two routes is a SERVICE identity — mutual
 // TLS, which is exactly what mtls-management-svc exists to issue — not a
-// user principal. Until that is wired, they remain tenant-scoped only, and
-// the residual exposure is logged as its own tracker row rather than
-// papered over: a caller holding a tenant header can inject fabricated
-// security events, and can enumerate exporter names and endpoint URLs.
-// Event injection into a SIEM feed is a real concern (it is how an attacker
-// buries a trail), so this is a gap being named, not dismissed.
+// user principal. Until that is wired, POST /v1/siem/stream remains
+// tenant-scoped only, and the residual exposure is logged as its own tracker
+// row rather than papered over: a caller holding a tenant header can inject
+// fabricated security events. Event injection into a SIEM feed is a real
+// concern (it is how an attacker buries a trail), so this is a gap being
+// named, not dismissed.
 //
-// What that residual exposure no longer includes is the credential itself:
-// domain.SIEMExporter.AuthToken is now json:"-", so the list route cannot
-// serialise it regardless of who calls it. That was the actual leak.
+// GET /v1/siem/exporters no longer lists anything unauthorized (28 Oct 2026).
+// A caller WITH a principal is a person: it must name legal_entity_id and is
+// authorized SIEM_EXPORTER_READ there, like every other read. A caller
+// WITHOUT one is the fan-out lookup above, and gets only what those clients
+// decode — the id and status of each ACTIVE exporter — never a name,
+// platform, legal entity or endpoint URL. The credential was already out of
+// reach: domain.SIEMExporter.AuthToken is json:"-".
 func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
 	principalID := r.Header.Get("X-Principal-Id")
 	if principalID == "" {
@@ -223,11 +228,55 @@ func (h *Handler) ListExporters(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	exps, _ := h.store.ListExporters(r.Context(), tenantID, r.URL.Query().Get("legal_entity_id"))
+	// No principal: the service-to-service fan-out lookup (see the note above
+	// requirePrincipal). Only which exporters are ACTIVE, nothing that
+	// describes them.
+	if strings.TrimSpace(r.Header.Get("X-Principal-Id")) == "" {
+		exps, err := h.store.ListExporters(r.Context(), tenantID, "")
+		if err != nil {
+			h.errJSON(w, r, http.StatusServiceUnavailable, "could not list exporters")
+			return
+		}
+		refs := make([]exporterRef, 0, len(exps))
+		for _, e := range exps {
+			if e.Status == domain.ExporterActive {
+				refs = append(refs, exporterRef{ID: e.ID, Status: e.Status})
+			}
+		}
+		h.okJSON(w, r, 200, map[string]interface{}{"data": refs, "count": len(refs)})
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	// legal_entity_id is REQUIRED for a person: it is the authorization scope,
+	// and an optional scope is one that disables itself.
+	legalEntityID := r.URL.Query().Get("legal_entity_id")
+	if legalEntityID == "" {
+		h.errJSON(w, r, http.StatusBadRequest,
+			"legal_entity_id query parameter is required — it is the authorization scope for this listing")
+		return
+	}
+	if !h.authorize(w, r, principalID, legalEntityID, SiemExporterRead) {
+		return
+	}
+	exps, err := h.store.ListExporters(r.Context(), tenantID, legalEntityID)
+	if err != nil {
+		h.errJSON(w, r, http.StatusServiceUnavailable, "could not list exporters")
+		return
+	}
 	if exps == nil {
 		exps = []domain.SIEMExporter{}
 	}
 	h.okJSON(w, r, 200, map[string]interface{}{"data": exps, "count": len(exps)})
+}
+
+// exporterRef is all the principal-less fan-out lookup is told about an
+// exporter.
+type exporterRef struct {
+	ID     string                `json:"id"`
+	Status domain.ExporterStatus `json:"status"`
 }
 
 func (h *Handler) StreamEvent(w http.ResponseWriter, r *http.Request) {
