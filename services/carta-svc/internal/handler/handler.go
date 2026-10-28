@@ -9,11 +9,11 @@ import (
 	"github.com/go-chi/chi/v5"
 	chimw "github.com/go-chi/chi/v5/middleware"
 	"go.uber.org/zap"
-	apicontract "zoiko.io/identity-envelope/apicontract"
 	authzpkg "zoiko.io/carta-svc/internal/authz"
 	"zoiko.io/carta-svc/internal/domain"
 	svcenvelope "zoiko.io/carta-svc/internal/envelope"
 	"zoiko.io/carta-svc/internal/store"
+	apicontract "zoiko.io/identity-envelope/apicontract"
 )
 
 // requireTenant returns the gateway-verified tenant, or refuses the
@@ -155,6 +155,8 @@ func NewRouter(h *Handler) http.Handler {
 	// TestEvaluateStillWorksWithoutPrincipal pins it.
 	envelopePolicy := svcenvelope.ServicePolicy()
 	envelopePolicy.ExemptPaths = []string{"/v1/carta/evaluate"}
+	// Refusals rendered as RFC 9457 problem+json, like every other error here.
+	r.Use(apicontract.EnvelopeRefusals)
 	r.Use(svcenvelope.Middleware(envelopePolicy, svcenvelope.DefaultReporter()))
 	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -246,10 +248,14 @@ func (h *Handler) okJSON(w http.ResponseWriter, r *http.Request, code int, v int
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(v)
 }
+
+// errJSON answers a refusal that names no code of its own. The code is the
+// status's class (apicontract.CodeForStatus), never a blanket internal_error,
+// so a caller has a stable value to match on (ZS-API-001 §12).
 func (h *Handler) errJSON(w http.ResponseWriter, r *http.Request, code int, msg string) {
 	apicontract.WriteProblem(w, r, apicontract.Problem{
 		Status:    code,
-		Code:      "internal_error",
+		Code:      apicontract.CodeForStatus(code),
 		Detail:    msg,
 		Retryable: code >= 500,
 	})
