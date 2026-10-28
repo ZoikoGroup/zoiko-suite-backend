@@ -4,6 +4,7 @@ package store_test
 
 import (
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -21,7 +22,7 @@ func prepareAttempt(t *testing.T, tenant, entity, payRef string, amount float64,
 	t.Helper()
 	key := "k-" + uuid.NewString()
 	a, err := app(t).PrepareAttempt(tctx(tenant), tenant, domain.PrepareAttemptRequest{
-		LegalEntityID: entity, SourceReference: "src-" + key, PayerAccountRef: "DE00AA", PayeeRef: "FR00BB", Amount: amount,
+		LegalEntityID: entity, SourceReference: "src-" + key, PayerAccountRef: "DE00AA", PayeeRef: "FR00BB", Amount: domain.Decimal(strconv.FormatFloat(amount, 'f', -1, 64)),
 		Currency: ccy, ExecutionDate: exec, PaymentReference: payRef, PayerAccountVerified: true, IdempotencyKey: key,
 	}, "maker", "corr-"+key)
 	require.NoError(t, err)

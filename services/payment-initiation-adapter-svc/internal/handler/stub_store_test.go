@@ -165,3 +165,16 @@ func (s *stubStore) ResolveAmbiguous(_ context.Context, attemptID string, req do
 func (s *stubStore) ListEvents(_ context.Context, attemptID string) ([]domain.AttemptEvent, error) {
 	return s.events[attemptID], nil
 }
+
+// QueryPaymentAttempts records the query it was given and returns the configured page.
+func (s *stubStore) QueryPaymentAttempts(_ context.Context, tenantID string, q domain.PaymentAttemptsQuery) (*domain.ControlPopulationPage, error) {
+	s.popCalls++
+	s.popTenant, s.popQuery = tenantID, q
+	if s.popErr != nil {
+		return nil, s.popErr
+	}
+	if s.popPage != nil {
+		return s.popPage, nil
+	}
+	return &domain.ControlPopulationPage{Watermark: "pa1:n=0;md5=x"}, nil
+}

@@ -5,6 +5,7 @@ package store_test
 import (
 	"context"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -20,7 +21,7 @@ import (
 func recordRate(t *testing.T, ctx context.Context, tenant, pair string, rate float64, at time.Time) {
 	t.Helper()
 	if _, err := testStore.RecordFXRate(ctx, domain.RecordFXRateParams{
-		TenantID: tenant, CurrencyPair: pair, Rate: rate, EffectiveAt: at, RecordedByPrincipalID: "fx-admin-1"}); err != nil {
+		TenantID: tenant, CurrencyPair: pair, Rate: domain.Decimal(strconv.FormatFloat(rate, 'f', -1, 64)), EffectiveAt: at, RecordedByPrincipalID: "fx-admin-1"}); err != nil {
 		t.Fatalf("record %s: %v", pair, err)
 	}
 }
