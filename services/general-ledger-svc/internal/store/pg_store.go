@@ -2085,7 +2085,7 @@ func (s *PgStore) MarkPostingExecutionFailed(ctx context.Context, tenantID, exec
 func (s *PgStore) SubmitJournalForApproval(ctx context.Context, tenantID, journalID, principalID string) error {
 	return s.transitionApproval(ctx, tenantID, journalID,
 		domain.ApprovalStatusDraft, domain.ApprovalStatusPendingApproval,
-		"submitted_by_principal_id", "submitted_at", principalID)
+		"submitted_by_principal_id", "submitted_at", principalID, "proposed", map[string]any{"submitted_by": principalID})
 }
 
 // ApproveJournal moves PENDING_APPROVAL -> APPROVED, recording the
@@ -2093,19 +2093,22 @@ func (s *PgStore) SubmitJournalForApproval(ctx context.Context, tenantID, journa
 // content was approved (see migration 000010's doc comment).
 func (s *PgStore) ApproveJournal(ctx context.Context, tenantID, journalID, principalID, fingerprint string) error {
 	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx, `
+		var entity, correlation string
+		err := tx.QueryRow(ctx, `
 			UPDATE journal_headers
 			SET approval_status = $1, approved_by_principal_id = $2, approved_at = $3, approval_fingerprint = $4
 			WHERE journal_id = $5 AND approval_status = $6 AND tenant_id = $7
+			RETURNING legal_entity_id::text, correlation_id
 		`, string(domain.ApprovalStatusApproved), principalID, time.Now().UTC(), fingerprint,
-			journalID, string(domain.ApprovalStatusPendingApproval), tenantID)
+			journalID, string(domain.ApprovalStatusPendingApproval), tenantID).Scan(&entity, &correlation)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrInvalidApprovalTransition
+		}
 		if err != nil {
 			return mapPgError(err)
 		}
-		if tag.RowsAffected() == 0 {
-			return domain.ErrInvalidApprovalTransition
-		}
-		return nil
+		return s.enqueueJournalEvent(ctx, tx, "approved", tenantID, entity, journalID, principalID, correlation,
+			map[string]any{"journal_id": journalID, "approved_by": principalID, "approval_fingerprint": fingerprint})
 	})
 }
 
@@ -2113,19 +2116,22 @@ func (s *PgStore) ApproveJournal(ctx context.Context, tenantID, journalID, princ
 // "rejected/cancelled before posting," per the spec's own state model.
 func (s *PgStore) RejectJournal(ctx context.Context, tenantID, journalID, principalID, reason string) error {
 	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx, `
+		var entity, correlation string
+		err := tx.QueryRow(ctx, `
 			UPDATE journal_headers
 			SET approval_status = $1, rejected_by_principal_id = $2, rejected_at = $3, rejection_reason = $4
 			WHERE journal_id = $5 AND approval_status = $6 AND tenant_id = $7
+			RETURNING legal_entity_id::text, correlation_id
 		`, string(domain.ApprovalStatusRejected), principalID, time.Now().UTC(), reason,
-			journalID, string(domain.ApprovalStatusPendingApproval), tenantID)
+			journalID, string(domain.ApprovalStatusPendingApproval), tenantID).Scan(&entity, &correlation)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrInvalidApprovalTransition
+		}
 		if err != nil {
 			return mapPgError(err)
 		}
-		if tag.RowsAffected() == 0 {
-			return domain.ErrInvalidApprovalTransition
-		}
-		return nil
+		return s.enqueueJournalEvent(ctx, tx, "rejected", tenantID, entity, journalID, principalID, correlation,
+			map[string]any{"journal_id": journalID, "rejected_by": principalID, "reason": reason})
 	})
 }
 
@@ -2135,7 +2141,7 @@ func (s *PgStore) RejectJournal(ctx context.Context, tenantID, journalID, princi
 func (s *PgStore) RequestJournalPosting(ctx context.Context, tenantID, journalID, principalID string) error {
 	return s.transitionApproval(ctx, tenantID, journalID,
 		domain.ApprovalStatusApproved, domain.ApprovalStatusPostingRequested,
-		"posting_requested_by_principal_id", "posting_requested_at", principalID)
+		"posting_requested_by_principal_id", "posting_requested_at", principalID, "", nil)
 }
 
 // MarkJournalPosted moves POSTING_REQUESTED -> POSTED — called by ACC-04's
@@ -2160,22 +2166,32 @@ func (s *PgStore) MarkJournalPosted(ctx context.Context, tenantID, journalID str
 }
 
 // transitionApproval is the shared guarded UPDATE every simple
-// ApprovalStatus move uses — mirrors TransitionJournal's own pattern.
-func (s *PgStore) transitionApproval(ctx context.Context, tenantID, journalID string, from, to domain.ApprovalStatus, actorColumn, timeColumn, principalID string) error {
+// ApprovalStatus move uses — mirrors TransitionJournal's own pattern. A non-empty fact is the lifecycle event the move raises,
+// written in the same transaction (standard §33).
+func (s *PgStore) transitionApproval(ctx context.Context, tenantID, journalID string, from, to domain.ApprovalStatus, actorColumn, timeColumn, principalID, fact string, data map[string]any) error {
 	query := fmt.Sprintf(`
 		UPDATE journal_headers
 		SET approval_status = $1, %s = $2, %s = $3
 		WHERE journal_id = $4 AND approval_status = $5 AND tenant_id = $6
+		RETURNING legal_entity_id::text, correlation_id
 	`, actorColumn, timeColumn)
 	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx, query, string(to), principalID, time.Now().UTC(), journalID, string(from), tenantID)
+		var entity, correlation string
+		err := tx.QueryRow(ctx, query, string(to), principalID, time.Now().UTC(), journalID, string(from), tenantID).Scan(&entity, &correlation)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrInvalidApprovalTransition
+		}
 		if err != nil {
 			return mapPgError(err)
 		}
-		if tag.RowsAffected() == 0 {
-			return domain.ErrInvalidApprovalTransition
+		if fact == "" {
+			return nil
 		}
-		return nil
+		d := map[string]any{"journal_id": journalID}
+		for k, v := range data {
+			d[k] = v
+		}
+		return s.enqueueJournalEvent(ctx, tx, fact, tenantID, entity, journalID, principalID, correlation, d)
 	})
 }
 

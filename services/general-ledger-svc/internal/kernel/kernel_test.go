@@ -561,3 +561,62 @@ func TestTestPackAndLifecycle(t *testing.T) {
 		t.Fatal("different scopes never overlap")
 	}
 }
+
+// rejectRecorder is a repository that only records the rejections raised at intake.
+type rejectRecorder struct {
+	Repo
+	got []OutEvent
+	err error
+}
+
+func (r *rejectRecorder) GetEvent(context.Context, string, string) (*AccountingEvent, error) {
+	return nil, ErrNotFound
+}
+func (r *rejectRecorder) RecordEventRejection(_ context.Context, _ string, o OutEvent) error {
+	r.got = append(r.got, o)
+	return r.err
+}
+
+// An event refused at intake raises AccountingEventRejected (§33); a refusal of the caller or of a dependency is not a verdict on
+// the event, and a failure to record the notice never replaces the refusal the producer is told.
+func TestEventRejectionIsRaisedOnlyForVerdictsOnTheEvent(t *testing.T) {
+	rec := &rejectRecorder{}
+	s := &Service{Repo: rec}
+	a := Actor{PrincipalID: "ar-svc"}
+	bad := *event(okFacts())
+	bad.IdempotencyKey = ""
+	_, _, err := s.RegisterEvent(context.Background(), tenant, a, bad)
+	if _, ok := AsException(err); !ok || len(rec.got) != 1 {
+		t.Fatalf("an invalid event is rejected: %v %d", err, len(rec.got))
+	}
+	o := rec.got[0]
+	if o.Fact != "event.rejected" || o.AggregateID != "ar/se-1" || o.Data["code"] == "" || o.Data["source_event_id"] != "se-1" {
+		t.Fatalf("%+v", o)
+	}
+	if o.LegalEntityID != "" && o.LegalEntityID != entity {
+		t.Fatalf("an entity id that is not an identifier is not passed on: %q", o.LegalEntityID)
+	}
+
+	for name, cause := range map[string]error{
+		"authorization": exc(FamAuth, "FORBIDDEN", "no"),
+		"dependency":    exc(FamExt, "DIRECTORY_DOWN", "down"),
+		"storage":       errors.New("connection reset"),
+	} {
+		rec.got = nil
+		s.eventRejected(context.Background(), tenant, a, *event(okFacts()), cause)
+		if len(rec.got) != 0 {
+			t.Errorf("%s is not a rejection of the event", name)
+		}
+	}
+	rec.got = nil
+	s.eventRejected(context.Background(), tenant, a, *event(okFacts()), exc(FamAuth, "ENTITY_MISMATCH", "wrong entity"))
+	if len(rec.got) != 1 {
+		t.Error("a correction naming another entity's event is rejected")
+	}
+
+	rec.err = errors.New("outbox down")
+	_, _, err = s.RegisterEvent(context.Background(), tenant, a, bad)
+	if e, ok := AsException(err); !ok || e.Code == "" {
+		t.Fatalf("the producer is told the refusal, not the failure to record it: %v", err)
+	}
+}

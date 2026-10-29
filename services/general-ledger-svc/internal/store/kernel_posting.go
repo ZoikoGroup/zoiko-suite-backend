@@ -244,6 +244,11 @@ func (r *KernelRepo) PostUnit(ctx context.Context, u *kernel.PostingUnit) (*kern
 	return out, nil
 }
 
+// RecordEventRejection implements kernel.Repo: it raises the rejection of an event at intake on the outbox and stores nothing else.
+func (r *KernelRepo) RecordEventRejection(ctx context.Context, tenant string, out kernel.OutEvent) error {
+	return r.tx(ctx, tenant, func(t pgx.Tx) error { return r.enqueue(ctx, t, tenant, out) })
+}
+
 // RecordPostingFailure implements kernel.Repo.
 func (r *KernelRepo) RecordPostingFailure(ctx context.Context, f *kernel.PostingFailure) error {
 	return r.tx(ctx, f.Tenant, func(t pgx.Tx) error {
