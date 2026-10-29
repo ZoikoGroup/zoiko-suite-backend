@@ -60,6 +60,9 @@ type Store interface {
 	RecalculateSchedule(ctx context.Context, scheduleID string, newVersion *domain.DepreciationSchedule, at time.Time) error
 	CreateDepreciationRun(ctx context.Context, r *domain.DepreciationRun) error
 	GetDepreciationRun(ctx context.Context, runID string) (*domain.DepreciationRun, error)
+
+	// QueryDepreciationRunPostings serves the FIN-CTRL-011 control population (see control_population.go).
+	QueryDepreciationRunPostings(ctx context.Context, tenantID string, q domain.DepreciationRunPostingsQuery) (*domain.ControlPopulationPage, error)
 	FreezeDepreciationPopulation(ctx context.Context, runID, legalEntityID string, at time.Time) (frozenCount int, err error)
 	ValidateDepreciationRun(ctx context.Context, runID string, at time.Time) (lineCount int, err error)
 	ApproveDepreciationRun(ctx context.Context, runID, principalID string, at time.Time) error
@@ -204,6 +207,7 @@ func (h *Handler) WithLedgerClient(c DepreciationLedgerClient) *Handler {
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
+	r.Get("/v1/control-populations/{population}", h.GetControlPopulation)
 	r.Route("/v1/assets", func(r chi.Router) {
 		r.Post("/", h.CreateAssetCandidate)
 		r.Get("/", h.ListAssets)

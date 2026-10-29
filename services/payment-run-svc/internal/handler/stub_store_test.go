@@ -20,6 +20,12 @@ type stubStore struct {
 	reconciledEvents  map[string]map[string]bool // instruction_id -> provider_event_ref -> applied
 	events            map[string][]domain.RunEvent
 	accounting        map[string][]*store.AccountingRequest // run_id -> posting requests
+
+	// control-population stub state
+	popTenant string
+	popQuery  domain.UnappliedPaymentsQuery
+	popPage   *domain.ControlPopulationPage
+	popErr    error
 }
 
 func newStubStore() *stubStore {
@@ -32,6 +38,18 @@ func newStubStore() *stubStore {
 		events:            map[string][]domain.RunEvent{},
 		accounting:        map[string][]*store.AccountingRequest{},
 	}
+}
+
+// QueryUnappliedSupplierPayments records the query it was given and returns the configured page.
+func (s *stubStore) QueryUnappliedSupplierPayments(_ context.Context, tenantID string, q domain.UnappliedPaymentsQuery) (*domain.ControlPopulationPage, error) {
+	s.popTenant, s.popQuery = tenantID, q
+	if s.popErr != nil {
+		return nil, s.popErr
+	}
+	if s.popPage == nil {
+		return &domain.ControlPopulationPage{Watermark: "pr1:n=0;md5=x"}, nil
+	}
+	return s.popPage, nil
 }
 
 func strp(s string) *string {

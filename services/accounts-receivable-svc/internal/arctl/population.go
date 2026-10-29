@@ -5,6 +5,7 @@ import (
 	"crypto/md5" //nolint:gosec // a watermark digest, not a security primitive
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"sort"
 	"strconv"
 	"time"
@@ -87,6 +88,23 @@ var receiptsScope = scopeSpec{cte: `
 		                          'bank_transaction_id', r.bank_transaction_id::text) AS attrs
 		FROM ar08_receipts r
 		WHERE r.tenant_id = $1::uuid AND r.legal_entity_id = $2::uuid AND ($3::date IS NULL OR r.value_date <= $3::date)
+	)`}
+
+// agedUnappliedScope: AR-08 receipts that still hold unapplied cash (unapplied_amount > 0) with a value date strictly before
+// the cut-off ($3, the `unapplied_before` parameter). Amount is the UNAPPLIED amount, so declared totals are the aged
+// unapplied-cash exposure; age_days is computed from the parameter, never from now(). Blocked and fully-unapplied receipts are
+// reported (nothing is pre-filtered) and carry their flags in attributes.
+var agedUnappliedScope = scopeSpec{cte: `
+	WITH scope AS (
+		SELECT r.receipt_id AS id, r.settlement_ref AS ref, r.currency::text AS currency, r.value_date AS doc_date,
+		       r.unapplied_amount AS amount, r.state AS status,
+		       jsonb_build_object('status', r.state, 'customer_id', COALESCE(r.customer_party_id::text, ''),
+		                          'receipt_amount', r.amount::text, 'applied_amount', r.applied_amount::text,
+		                          'unapplied_amount', r.unapplied_amount::text, 'blocked', r.blocked::text,
+		                          'age_days', ($3::date - r.value_date)::text) AS attrs
+		FROM ar08_receipts r
+		WHERE r.tenant_id = $1::uuid AND r.legal_entity_id = $2::uuid
+		  AND r.unapplied_amount > 0 AND r.value_date < $3::date
 	)`}
 
 // servePopulation runs the contract over one scope in a single REPEATABLE READ read-only snapshot.
@@ -175,6 +193,23 @@ func CreditDebitNotes(db *kit.DB) PopulationFunc {
 func CashReceipts(db *kit.DB) PopulationFunc {
 	return func(ctx context.Context, q domain.ControlPopulationQuery) (*domain.ControlPopulationPage, error) {
 		return servePopulation(ctx, db, receiptsScope, q)
+	}
+}
+
+// ParamUnappliedBefore is the required parameter of the `aged-unapplied-receipts` population: a YYYY-MM-DD date; receipts
+// with a value date strictly before it are in scope.
+const ParamUnappliedBefore = "unapplied_before"
+
+// AgedUnappliedReceipts serves the `aged-unapplied-receipts` population (FIN-CTRL-029). It is a violation-set population:
+// the policy age limit is a controlled decision, so the caller chooses the cut-off (run date minus the approved limit).
+func AgedUnappliedReceipts(db *kit.DB) PopulationFunc {
+	return func(ctx context.Context, q domain.ControlPopulationQuery) (*domain.ControlPopulationPage, error) {
+		d, err := time.Parse("2006-01-02", q.Params[ParamUnappliedBefore])
+		if err != nil {
+			return nil, fmt.Errorf("%w: %s must be YYYY-MM-DD", domain.ErrInvalidPopulationParam, ParamUnappliedBefore)
+		}
+		q.CutOff = &d
+		return servePopulation(ctx, db, agedUnappliedScope, q)
 	}
 }
 

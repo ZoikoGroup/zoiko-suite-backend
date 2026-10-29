@@ -11,6 +11,7 @@ import (
 type seedRequest struct {
 	Wave int `json:"wave"`
 	catalogue.Wave2Options
+	catalogue.Wave3Options
 	catalogue.Wave4Options
 }
 
@@ -40,7 +41,7 @@ func (h *Handler) SeedCatalogue(w http.ResponseWriter, r *http.Request) {
 	case 2:
 		defs, err = catalogue.Wave2(req.Wave2Options)
 	case 3:
-		defs, err = catalogue.Wave3(req.EffectiveFrom)
+		defs, err = catalogue.Wave3(req.EffectiveFrom, req.Wave3Options)
 	case 4:
 		defs, err = catalogue.Wave4(req.EffectiveFrom, req.Wave4Options)
 	case 5:

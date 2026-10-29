@@ -203,6 +203,37 @@ func TestPopulation_CashReceipts(t *testing.T) {
 	p.contract("isolation", fn, p.tenant, uuid.NewString(), nil, 0, nil)
 }
 
+// FIN-CTRL-029: only receipts still holding unapplied cash, dated strictly before the cut-off; amount is the unapplied
+// amount and age_days comes from the parameter.
+func TestPopulation_AgedUnappliedReceipts(t *testing.T) {
+	p := newPopEnv(t)
+	p.receipt("100.00", "0")  // unapplied 100
+	p.receipt("250.00", "100") // unapplied 150
+	p.receipt("80.00", "80")   // fully applied: never in scope
+	fn := func(before string) PopulationFunc {
+		inner := AgedUnappliedReceipts(p.db)
+		return func(ctx context.Context, q domain.ControlPopulationQuery) (*domain.ControlPopulationPage, error) {
+			q.Params = map[string]string{ParamUnappliedBefore: before}
+			return inner(ctx, q)
+		}
+	}
+	p.contract("aged@10-01", fn("2026-10-01"), p.tenant, p.entity, nil, 2, map[string]string{"USD": "250.00"})
+	recs, _, _ := p.pageAll(fn("2026-10-01"), p.tenant, p.entity, nil, 10)
+	for _, r := range recs {
+		require.Equal(t, "16", r.Attributes["age_days"], "2026-10-01 minus value date 2026-09-15")
+		require.NotEqual(t, "0.0000", r.Attributes["unapplied_amount"])
+	}
+	p.contract("aged@09-15 strict", fn("2026-09-15"), p.tenant, p.entity, nil, 0, nil)
+	p.contract("isolation", fn("2026-10-01"), uuid.NewString(), p.entity, nil, 0, nil)
+	p.contract("entity isolation", fn("2026-10-01"), p.tenant, uuid.NewString(), nil, 0, nil)
+
+	for _, bad := range []string{"", "not-a-date", "2026-13-01"} {
+		_, err := AgedUnappliedReceipts(p.db)(context.Background(), domain.ControlPopulationQuery{
+			TenantID: p.tenant, LegalEntityID: p.entity, Limit: 10, Params: map[string]string{ParamUnappliedBefore: bad}})
+		require.ErrorIs(t, err, domain.ErrInvalidPopulationParam, bad)
+	}
+}
+
 // The 200000-record cap: above it the provider answers ErrPopulationTooLarge (HTTP 422) rather than a truncated page.
 func TestPopulation_CapExceeded(t *testing.T) {
 	e := newEnv(t)

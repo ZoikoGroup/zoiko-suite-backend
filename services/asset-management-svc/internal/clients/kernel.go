@@ -27,6 +27,10 @@ func (c *Clients) WithKernelBook(bookID, currency string) *Clients {
 // KernelPostingEnabled reports whether depreciation posts through the kernel.
 func (c *Clients) KernelPostingEnabled() bool { return c.kernelBookID != "" && c.kernelCurrency != "" }
 
+// KernelCurrency is the currency depreciation is posted in on the kernel path (the book's functional currency), or ""
+// when the kernel path is off.
+func (c *Clients) KernelCurrency() string { return c.kernelCurrency }
+
 func (c *Clients) kernelDo(ctx context.Context, path, tenantID, principalID, legalEntityID, correlationID, idempotencyKey string, body any) (int, []byte, error) {
 	payload, err := json.Marshal(body)
 	if err != nil {

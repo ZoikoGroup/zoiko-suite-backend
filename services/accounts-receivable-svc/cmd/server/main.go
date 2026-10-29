@@ -273,6 +273,9 @@ func main() {
 	for _, n := range []string{"cash-receipts", "cash_receipts"} {
 		handler.RegisterPopulation(n, arctl.CashReceipts(kitDeps.DB))
 	}
+	for _, n := range []string{"aged-unapplied-receipts", "aged_unapplied_receipts"} {
+		handler.RegisterPopulationWithParams(n, arctl.AgedUnappliedReceipts(kitDeps.DB), arctl.ParamUnappliedBefore)
+	}
 	ar10Exceptions := arctl.NewExceptionSource("AR10", func(ctx context.Context, tenantID, legalEntityID string) ([]arctl.ExceptionItem, error) {
 		ex, err := ar10m.ControlExceptions(ctx, tenantID, legalEntityID)
 		if err != nil {

@@ -106,6 +106,35 @@ type UnpostedEventsQuery struct {
 	AfterRecordID string
 }
 
+// ClearingBalanceAgingQuery scopes one page of the clearing-balance-aging
+// population: the portion of each clearing account's open balance that is older
+// than AgedBefore (a YYYY-MM-DD date; postings dated on or after it are recent).
+type ClearingBalanceAgingQuery struct {
+	LegalEntityID string
+	AgedBefore    string
+	Limit         int
+	AfterRecordID string
+}
+
+// FXRateObservationsQuery scopes one page of the fx-rate-observations population: the
+// tenant's ledger FX rates of one RateType whose rate_date lies in the calendar month
+// PeriodID (YYYY-MM). Ledger FX rates are tenant-level, not scoped to an entity.
+type FXRateObservationsQuery struct {
+	PeriodID      string
+	RateType      string
+	Limit         int
+	AfterRecordID string
+}
+
+// PostSealEntriesQuery scopes one page of the post-seal-entries population: ledger
+// entries of the entity written after the close watermark of a period that is
+// currently SEALED.
+type PostSealEntriesQuery struct {
+	LegalEntityID string
+	Limit         int
+	AfterRecordID string
+}
+
 // EventJournalBreaksQuery scopes one page of the event-journal-breaks
 // population: accounting-event/journal linkage breaks strictly before
 // CreatedBefore.
