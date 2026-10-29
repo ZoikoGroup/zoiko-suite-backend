@@ -6,6 +6,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
 	"zoiko.io/general-ledger-svc/internal/kernel"
@@ -346,4 +347,42 @@ func (r *KernelRepo) EventConsequences(ctx context.Context, tenant, eventID stri
 		return frows.Err()
 	})
 	return out, kernelErr(err)
+}
+
+// IncompleteCandidates implements kernel.ConsequenceRepo: the events of an entity whose posting date is in the range and that have no
+// posting in at least one active book that has an active rule for them — a superset of the incomplete events, narrowed precisely by the
+// orchestration. It returns the first limit of them, oldest first, and how many there are in all.
+func (r *KernelRepo) IncompleteCandidates(ctx context.Context, tenant, entity string, from, to time.Time, limit int) ([]kernel.AccountingEvent, int, error) {
+	const from_ = ` FROM accounting_events ev CROSS JOIN LATERAL (SELECT COALESCE(ev.posting_date_requested, ev.document_date, ev.occurred_at)::date AS d) x
+		WHERE ev.tenant_id = $1::uuid AND ev.legal_entity_id = $2::uuid AND x.d BETWEEN $3::date AND $4::date
+		AND EXISTS (SELECT 1 FROM accounting_books b WHERE b.tenant_id = ev.tenant_id AND b.legal_entity_id = ev.legal_entity_id AND b.status = 'ACTIVE'
+			AND b.effective_from <= x.d AND (b.effective_to IS NULL OR b.effective_to > x.d)
+			AND EXISTS (SELECT 1 FROM posting_rule_sets rs WHERE rs.tenant_id = ev.tenant_id AND rs.event_type = ev.event_type AND rs.book_type = b.book_type
+				AND rs.accounting_framework_id = b.accounting_framework_id AND rs.jurisdiction IN ('', b.jurisdiction) AND rs.status = 'ACTIVE'
+				AND rs.effective_from <= x.d AND (rs.effective_to IS NULL OR rs.effective_to > x.d))
+			AND NOT EXISTS (SELECT 1 FROM event_posting_links l WHERE l.tenant_id = ev.tenant_id AND l.accounting_event_id = ev.accounting_event_id AND l.accounting_book_id = b.book_id))`
+	if _, err := uuid.Parse(entity); err != nil {
+		return []kernel.AccountingEvent{}, 0, nil
+	}
+	out := []kernel.AccountingEvent{}
+	total := 0
+	err := r.tx(ctx, tenant, func(t pgx.Tx) error {
+		if e := t.QueryRow(ctx, `SELECT count(*)`+from_, tenant, entity, from, to).Scan(&total); e != nil {
+			return e
+		}
+		rows, e := t.Query(ctx, `SELECT `+eventCols+from_+` ORDER BY ev.registered_at, ev.accounting_event_id LIMIT $5`, tenant, entity, from, to, limit)
+		if e != nil {
+			return e
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var ev kernel.AccountingEvent
+			if e := scanEvent(rows, &ev); e != nil {
+				return e
+			}
+			out = append(out, ev)
+		}
+		return rows.Err()
+	})
+	return out, total, kernelErr(err)
 }

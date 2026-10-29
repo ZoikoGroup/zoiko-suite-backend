@@ -129,7 +129,11 @@ func (h *KernelHandler) GetCloseEvidence(w http.ResponseWriter, r *http.Request)
 	if v := q.Get("require"); v != "" {
 		require = strings.Split(v, ",")
 	}
-	ev, err := (&kernel.EvidenceService{Books: h.repo, Recon: rec, Reval: rev, Seals: se, Snaps: sn, Pending: pe}).For(r.Context(), tenant, entity, q.Get("fiscal_period"), require)
+	esvc := &kernel.EvidenceService{Books: h.repo, Recon: rec, Reval: rev, Seals: se, Snaps: sn, Pending: pe}
+	if cr, ok := h.repo.(kernel.ConsequenceRepo); ok {
+		esvc.Orch = &kernel.OrchestrationService{Repo: h.repo, Cons: cr}
+	}
+	ev, err := esvc.For(r.Context(), tenant, entity, q.Get("fiscal_period"), require)
 	if err != nil {
 		h.fail(w, err)
 		return

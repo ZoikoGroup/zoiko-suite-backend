@@ -189,3 +189,39 @@ func TestIncompleteEventsListSkipsCompleteAndTooRecentOnes(t *testing.T) {
 		t.Fatalf("%+v", res)
 	}
 }
+
+// IncompleteCandidates serves every event: the real one narrows them in the ledger, and the orchestration judges each precisely.
+func (r *orchRepo) IncompleteCandidates(_ context.Context, _, _ string, _, _ time.Time, limit int) ([]AccountingEvent, int, error) {
+	n := len(r.events)
+	if limit < n {
+		return r.events[:limit], n, nil
+	}
+	return r.events, n, nil
+}
+
+func TestPeriodIncompleteCountsOnlyEventsThatAreReallyIncomplete(t *testing.T) {
+	rule := []RuleSet{{Name: "r", Version: "1.0.0"}}
+	mk := func(id string) AccountingEvent {
+		e := *event(okFacts())
+		e.AccountingEventID = id
+		return e
+	}
+	r := &orchRepo{
+		events: []AccountingEvent{mk("a"), mk("b"), mk("c")},
+		books:  []Book{orchBook("b-stat", "STAT", BookStatutory), orchBook("b-mgmt", "MGMT", "MANAGEMENT")},
+		rules:  map[string][]RuleSet{"b-stat": rule, "b-mgmt": rule},
+		cons: map[string]map[string]ConsequenceRecord{
+			"a": {"b-stat": posted("j1")},                         // incomplete: MGMT missing
+			"b": {"b-stat": posted("j2"), "b-mgmt": posted("j3")}, // complete: a candidate that the precise check clears
+			"c": {},                                               // incomplete
+		},
+	}
+	svc := &OrchestrationService{Repo: r, Cons: r}
+	res, err := svc.InPeriod(context.Background(), tenant, entity, "2026-03")
+	if err != nil || res.Count != 2 || len(res.EventIDs) != 2 || res.EventIDs[0] != "a" || res.EventIDs[1] != "c" || res.Truncated {
+		t.Fatalf("%+v %v", res, err)
+	}
+	if _, err := svc.InPeriod(context.Background(), tenant, entity, "March"); err == nil {
+		t.Fatal("a period is YYYY-MM")
+	}
+}

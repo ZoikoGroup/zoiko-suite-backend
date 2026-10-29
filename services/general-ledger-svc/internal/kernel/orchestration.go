@@ -49,6 +49,9 @@ type ConsequenceRecord struct {
 // ConsequenceRepo reads what has been posted for an event, by book.
 type ConsequenceRepo interface {
 	EventConsequences(ctx context.Context, tenant, eventID string) (map[string]ConsequenceRecord, error)
+	// IncompleteCandidates returns the events of an entity posted in a date range that lack a posting in some active book with an active rule
+	// for them (a superset of the incomplete ones), the first limit of them oldest first, and how many there are in all.
+	IncompleteCandidates(ctx context.Context, tenant, entity string, from, to time.Time, limit int) ([]AccountingEvent, int, error)
 }
 
 // BookOutcome is the state of one book for one event.
@@ -225,6 +228,52 @@ func (s *OrchestrationService) Incomplete(ctx context.Context, tenant, entity st
 			res.Incomplete = append(res.Incomplete, *st)
 			if len(res.Incomplete) >= limit {
 				break
+			}
+		}
+	}
+	return res, nil
+}
+
+// PeriodIncomplete is the incomplete events of one period of an entity, for the close evidence.
+type PeriodIncomplete struct {
+	Count int `json:"count"`
+	// EventIDs are the first of them, oldest first; Truncated says there are more than were examined.
+	EventIDs  []string `json:"accounting_event_ids"`
+	Truncated bool     `json:"truncated,omitempty"`
+}
+
+// MaxPeriodIncompleteExamined bounds how many candidate events the close evidence examines one by one.
+const MaxPeriodIncompleteExamined = 200
+
+// InPeriod finds the events of the period (by their posting date) that are not complete across their books. The ledger narrows the
+// candidates; each is then judged by the same rule as Status. When there are more candidates than are examined, Count is a floor and
+// Truncated is set: a period with that many unposted events is not ready in any case.
+func (s *OrchestrationService) InPeriod(ctx context.Context, tenant, entity, period string) (*PeriodIncomplete, error) {
+	from, to, ok := periodBounds(period)
+	if !ok {
+		return nil, exc(FamData, "EVIDENCE_INVALID", "fiscal_period: a period, YYYY-MM").with("field", "fiscal_period")
+	}
+	cands, total, err := s.Cons.IncompleteCandidates(ctx, tenant, entity, from, to, MaxPeriodIncompleteExamined)
+	if err != nil {
+		return nil, err
+	}
+	res := &PeriodIncomplete{EventIDs: []string{}, Truncated: total > len(cands)}
+	if len(cands) == 0 {
+		return res, nil
+	}
+	books, err := s.Repo.ListBooks(ctx, tenant, BookFilter{LegalEntityID: entity, Status: BookActive, Limit: 200})
+	if err != nil {
+		return nil, err
+	}
+	for i := range cands {
+		st, err := s.statusOf(ctx, tenant, &cands[i], append([]Book(nil), books...))
+		if err != nil {
+			return nil, err
+		}
+		if st.Status == EventIncomplete {
+			res.Count++
+			if len(res.EventIDs) < 20 {
+				res.EventIDs = append(res.EventIDs, st.AccountingEventID)
 			}
 		}
 	}

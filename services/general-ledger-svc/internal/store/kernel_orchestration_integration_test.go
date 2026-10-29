@@ -1,6 +1,9 @@
 package store_test
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // §4, §37: one event can have a consequence in several books of an entity. Each posting is atomic by itself; the event is incomplete
 // until every book that must carry it has posted, and a posted book never hides one that has not.
@@ -55,6 +58,26 @@ func TestMultiBookEventIsIncompleteUntilEveryRequiredBookHasPosted(t *testing.T)
 	if s["status"] != "INCOMPLETE" || s["posted_books"].(float64) != 1 || len(out) != 1 || out[0] != "MGMT" || books(s)["STAT"] != "POSTED" || books(s)["MGMT"] != "PENDING" {
 		t.Fatalf("a posted book must not hide the one that has not: %v", s)
 	}
+	// the close evidence says so too: a period with an event that has not posted everywhere is not ready, whatever each book says alone
+	closeEvidence := func() map[string]any {
+		t.Helper()
+		st, c := e.call("GET", "/v1/close-evidence?legal_entity_id="+e.entity+"&fiscal_period=2026-03", e.tenant, "close-svc", nil)
+		if st != 200 {
+			t.Fatalf("%d %v", st, c)
+		}
+		return c
+	}
+	hasIssue := func(c map[string]any, prefix string) bool {
+		for _, x := range c["blocking_issues"].([]any) {
+			if strings.HasPrefix(x.(string), prefix) {
+				return true
+			}
+		}
+		return false
+	}
+	if c := closeEvidence(); c["ready"] != false || !hasIssue(c, "incomplete_events: 1 ") || c["incomplete_events"].(map[string]any)["accounting_event_ids"].([]any)[0] != ev {
+		t.Fatalf("%v", c)
+	}
 	// the list an operator works from shows it, but not once it has aged out of the window they asked for
 	list := func(q string) map[string]any {
 		t.Helper()
@@ -79,6 +102,9 @@ func TestMultiBookEventIsIncompleteUntilEveryRequiredBookHasPosted(t *testing.T)
 	}
 	if l := list(""); len(l["incomplete_events"].([]any)) != 0 {
 		t.Fatalf("%v", l)
+	}
+	if c := closeEvidence(); hasIssue(c, "incomplete_events") || c["incomplete_events"].(map[string]any)["count"].(float64) != 0 {
+		t.Fatalf("nothing is outstanding once both books have posted: %v", c)
 	}
 
 	// a failed attempt in one book is an exception in that book, and the event stays incomplete
