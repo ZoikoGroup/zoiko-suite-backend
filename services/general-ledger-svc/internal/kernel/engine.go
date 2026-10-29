@@ -358,6 +358,25 @@ func Evaluate(ctx context.Context, in EvalInput) (*Proposal, error) {
 			}
 		}
 	}
+	if fdr.Cmp(fcr) == 0 && dr.Cmp(cr) == 0 {
+		added, berr := balanceByDimension(ctx, in, c, &lines)
+		if berr != nil {
+			return nil, berr
+		}
+		if len(added) > 0 {
+			step("balancing", "the journal was balanced within each value of "+c.BalancingDimension.Dimension+" with explicit lines: "+strings.Join(added, ", "))
+			dr, cr, fdr, fcr = new(big.Int), new(big.Int), new(big.Int), new(big.Int)
+			for _, l := range lines {
+				if l.t.Side == Debit {
+					dr.Add(dr, l.minor)
+					fdr.Add(fdr, l.funcMn)
+				} else {
+					cr.Add(cr, l.minor)
+					fcr.Add(fcr, l.funcMn)
+				}
+			}
+		}
+	}
 	if fdr.Cmp(fcr) != 0 || dr.Cmp(cr) != 0 {
 		return nil, exc(FamBal, "UNBALANCED", "debits do not equal credits after rounding")
 	}

@@ -115,16 +115,17 @@ type TaxDependency struct {
 
 // RuleContent is the declarative body of a rule set. Everything here is covered by the content hash.
 type RuleContent struct {
-	Conditions       []Condition      `json:"conditions,omitempty"`
-	LineTemplates    []LineTemplate   `json:"line_templates"`
-	RoundingPolicyID string           `json:"rounding_policy_id"`
-	RoundingAccount  *AccountRef      `json:"rounding_account,omitempty"`
-	DimensionRules   []DimensionRule  `json:"dimension_rules,omitempty"`
-	DimensionCombos  []DimensionCombo `json:"dimension_combinations,omitempty"`
-	TaxDependency    *TaxDependency   `json:"tax_dependency,omitempty"`
-	FXPolicyID       string           `json:"fx_policy_id,omitempty"`
-	RealizedFX       *RealizedFX      `json:"realized_fx,omitempty"`
-	ApprovalPolicyID string           `json:"approval_policy_id,omitempty"`
+	Conditions         []Condition         `json:"conditions,omitempty"`
+	LineTemplates      []LineTemplate      `json:"line_templates"`
+	RoundingPolicyID   string              `json:"rounding_policy_id"`
+	RoundingAccount    *AccountRef         `json:"rounding_account,omitempty"`
+	DimensionRules     []DimensionRule     `json:"dimension_rules,omitempty"`
+	DimensionCombos    []DimensionCombo    `json:"dimension_combinations,omitempty"`
+	BalancingDimension *BalancingDimension `json:"balancing_dimension,omitempty"`
+	TaxDependency      *TaxDependency      `json:"tax_dependency,omitempty"`
+	FXPolicyID         string              `json:"fx_policy_id,omitempty"`
+	RealizedFX         *RealizedFX         `json:"realized_fx,omitempty"`
+	ApprovalPolicyID   string              `json:"approval_policy_id,omitempty"`
 }
 
 // TestCase is one regression case of a rule set's test pack: an event, what the directory resolves, and what must come
@@ -340,6 +341,11 @@ func (c *RuleContent) Validate() error {
 			}
 		default:
 			return bad(at+"mode", "REQUIRED, OPTIONAL, DERIVED or PROHIBITED")
+		}
+	}
+	if c.BalancingDimension != nil {
+		if why := c.BalancingDimension.validate(); why != "" {
+			return bad("balancing_dimension", why)
 		}
 	}
 	if len(c.DimensionCombos) > 20 {
