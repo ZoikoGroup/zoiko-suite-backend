@@ -300,3 +300,50 @@ func getEventTx(ctx context.Context, t pgx.Tx, tenant, id string) (*kernel.Accou
 	}
 	return &e, nil
 }
+
+// EventConsequences implements kernel.ConsequenceRepo: for each book, the journals an event posted there and the latest failed attempt,
+// which is how the completion of an event across several books is told (standard §4, §37).
+func (r *KernelRepo) EventConsequences(ctx context.Context, tenant, eventID string) (map[string]kernel.ConsequenceRecord, error) {
+	out := map[string]kernel.ConsequenceRecord{}
+	err := r.tx(ctx, tenant, func(t pgx.Tx) error {
+		rows, err := t.Query(ctx, `SELECT accounting_book_id::text, journal_id::text, posting_basis FROM event_posting_links
+			WHERE tenant_id = $1::uuid AND accounting_event_id = $2::uuid ORDER BY created_at, journal_id`, tenant, eventID)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var book string
+			var j kernel.ConsequenceJournal
+			if err := rows.Scan(&book, &j.JournalID, &j.Basis); err != nil {
+				rows.Close()
+				return err
+			}
+			rec := out[book]
+			rec.Journals = append(rec.Journals, j)
+			out[book] = rec
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		frows, err := t.Query(ctx, `SELECT DISTINCT ON (accounting_book_id) accounting_book_id::text, execution_id::text, status, COALESCE(failure_reason, ''), created_at
+			FROM posting_executions WHERE tenant_id = $1::uuid AND accounting_event_id = $2::uuid AND accounting_book_id IS NOT NULL AND status IN ('FAILED', 'QUARANTINED', 'RESOLVED')
+			ORDER BY accounting_book_id, created_at DESC`, tenant, eventID)
+		if err != nil {
+			return err
+		}
+		defer frows.Close()
+		for frows.Next() {
+			var book string
+			var f kernel.ConsequenceFailure
+			if err := frows.Scan(&book, &f.ExecutionID, &f.Status, &f.Reason, &f.At); err != nil {
+				return err
+			}
+			rec := out[book]
+			rec.LastFailure = &f
+			out[book] = rec
+		}
+		return frows.Err()
+	})
+	return out, kernelErr(err)
+}

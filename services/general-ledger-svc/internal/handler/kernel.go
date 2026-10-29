@@ -70,7 +70,9 @@ func RegisterKernelRoutes(r chi.Router, h *KernelHandler) {
 	r.Route("/v1/accounting-events", func(r chi.Router) {
 		r.With(h.observe("register_event")).Post("/", h.RegisterEvent)
 		r.Get("/", h.ListEvents)
+		r.Get("/incomplete", h.ListIncompleteEvents)
 		r.Get("/{id}", h.GetEvent)
+		r.Get("/{id}/posting-status", h.GetEventPostingStatus)
 	})
 	r.Route("/v1/posting-rule-sets", func(r chi.Router) {
 		r.Post("/", h.CreateRuleSet)
