@@ -127,12 +127,14 @@ type Notification struct {
 	CancelledAt  *time.Time `json:"cancelled_at,omitempty"`
 	CancelReason string     `json:"cancel_reason,omitempty"`
 
-	// Resend summary (migration 000014). The full reasoned chain is in the
-	// attempt records; these say how often and why most recently.
+// Resend summary (migration 000014). The full reasoned chain is in the
+// attempt records; these say how often and why most recently.
 	ResendCount             int        `json:"resend_count"`
 	LastResendReason        string     `json:"last_resend_reason,omitempty"`
 	LastResentAt            *time.Time `json:"last_resent_at,omitempty"`
 	LastResentByPrincipalID string     `json:"last_resent_by_principal_id,omitempty"`
+	// RecordVersion is the optimistic-concurrency token (migration 000034).
+	RecordVersion int64 `json:"record_version"`
 }
 
 // Status values for Notification.Status. Named here so new code has a
@@ -404,14 +406,18 @@ var (
 	// failure, a reportable code describing the notification's own state.
 	ErrDeliveryOutcomeUnknown = errorString("provider state ambiguous; original notification attempt must be resolved")
 
-	// ErrResendReasonRequired — §3.4: a user-initiated resend carries an
-	// explicit reason.
-	ErrResendReasonRequired = errorString("a resend requires a reason")
+// ErrResendReasonRequired — §3.4: a user-initiated resend carries an
+// explicit reason.
+ErrResendReasonRequired = errorString("a resend requires a reason")
 
-	// ErrNotResendable — only a SENT or FAILED notification can be resent. A
-	// PENDING one is still being attempted; a PENDING_UNKNOWN one must be
-	// resolved first (§6.2: UNKNOWN never authorizes a blind second send).
-	ErrNotResendable = errorString("only a SENT or FAILED notification can be resent")
+// ErrNotResendable — only a SENT or FAILED notification can be resent. A
+// PENDING one is still being attempted; a PENDING_UNKNOWN one must be
+// resolved first (§6.2: UNKNOWN never authorizes a blind second send).
+ErrNotResendable = errorString("only a SENT or FAILED notification can be resent")
+
+// ErrVersionConflict is returned when an If-Match header specifies a record_version
+// that no longer matches the current aggregate version.
+ErrVersionConflict = errorString("version conflict: the object has been modified since the expected version")
 )
 
 // ── Durable delivery attempts (ZS-SVC-Y-001 §3.4, §6.2; migration 000011) ──

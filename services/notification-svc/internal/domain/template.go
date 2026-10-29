@@ -26,6 +26,8 @@ type TemplateDefinition struct {
 	CreatedAt            time.Time  `json:"created_at"`
 	RetiredAt            *time.Time `json:"retired_at,omitempty"`
 	RetiredByPrincipalID *string    `json:"retired_by_principal_id,omitempty"`
+	// RecordVersion is the optimistic-concurrency token (migration 000034).
+	RecordVersion int64 `json:"record_version"`
 }
 
 // TemplateVersionStatus values. Draft -> Review -> Approved -> Published
@@ -65,6 +67,8 @@ type TemplateVersion struct {
 	PublishedAt           *time.Time `json:"published_at,omitempty"`
 	RetiredAt             *time.Time `json:"retired_at,omitempty"`
 	SupersededByVersionID *string    `json:"superseded_by_version_id,omitempty"`
+	// RecordVersion is the optimistic-concurrency token (migration 000034).
+	RecordVersion int64 `json:"record_version"`
 }
 
 // CreateTemplateParams is CreateTemplate's input.

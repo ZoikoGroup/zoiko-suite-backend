@@ -39,13 +39,13 @@ type Store interface {
 	RoleCodeTaken(ctx context.Context, roleCode, exceptCorrelationID string) (bool, error)
 	GetRole(ctx context.Context, roleDefinitionID string) (*domain.RoleDefinition, error)
 	ListRoles(ctx context.Context, filter domain.ListFilter) ([]domain.RoleDefinition, error)
-	UpdateRole(ctx context.Context, roleDefinitionID, roleName, status, updatedByPrincipalID string) (*domain.RoleDefinition, error)
+	UpdateRole(ctx context.Context, roleDefinitionID, roleName, status, updatedByPrincipalID string, expectedVersion int64) (*domain.RoleDefinition, error)
 
 	CreateBundle(ctx context.Context, b *domain.PermissionBundleDef, actorID string) (created bool, err error)
 	BundleCodeTaken(ctx context.Context, roleDefinitionID, bundleCode, exceptCorrelationID string) (bool, error)
 	ListBundles(ctx context.Context, roleDefinitionID string) ([]domain.PermissionBundleDef, error)
 	GetBundle(ctx context.Context, roleDefinitionID, bundleID string) (*domain.PermissionBundleDef, error)
-	UpdateBundle(ctx context.Context, roleDefinitionID, bundleID string, permittedActions []string, activeFlag *bool, updatedByPrincipalID string) (*domain.PermissionBundleDef, error)
+	UpdateBundle(ctx context.Context, roleDefinitionID, bundleID string, permittedActions []string, activeFlag *bool, updatedByPrincipalID string, expectedVersion int64) (*domain.PermissionBundleDef, error)
 	ListAllBundles(ctx context.Context, filter domain.BundleListFilter) ([]domain.PermissionBundleDef, error)
 
 	// RecordRefusedEscalation writes a durable record of a pre-provisioning refusal.
@@ -373,7 +373,7 @@ func (h *Handler) GetRole(w http.ResponseWriter, r *http.Request) {
 		h.writeStoreErr(w, r, err, nil)
 		return
 	}
-	writeJSON(w, http.StatusOK, role)
+	writeJSONWithETag(w, http.StatusOK, role, role.RecordVersion)
 }
 
 // ── PATCH /v1/role-definitions/{role_definition_id} ───────────────────────────
@@ -420,6 +420,16 @@ func (h *Handler) UpdateRole(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Read current role for optimistic concurrency check (API-3).
+	current, err := h.store.GetRole(r.Context(), roleDefinitionID)
+	if err != nil {
+		h.writeStoreErr(w, r, err, h.metrics.RoleWrites)
+		return
+	}
+	if !h.requireIfMatch(w, r, current.RecordVersion) {
+		return
+	}
+
 	// PROPAGATE THE STATUS CHANGE BEFORE RECORDING IT, and fail closed.
 	//
 	// This is the same ordering CreateRole uses, for the same reason: the
@@ -434,11 +444,6 @@ func (h *Handler) UpdateRole(w http.ResponseWriter, r *http.Request) {
 	// only", and PATCHing the status it already has is a no-op here rather than
 	// a redundant call -- though the remote is idempotent either way.
 	if req.Status != "" {
-		current, err := h.store.GetRole(r.Context(), roleDefinitionID)
-		if err != nil {
-			h.writeStoreErr(w, r, err, h.metrics.RoleWrites)
-			return
-		}
 		if req.Status != string(current.Status) {
 			active := req.Status == string(domain.RoleStatusActive)
 			// req.LegalEntityID, not the stored definition: RoleDefinition does
@@ -464,14 +469,14 @@ func (h *Handler) UpdateRole(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	updated, err := h.store.UpdateRole(r.Context(), roleDefinitionID, req.RoleName, req.Status, principalID)
+	updated, err := h.store.UpdateRole(r.Context(), roleDefinitionID, req.RoleName, req.Status, principalID, current.RecordVersion)
 	if err != nil {
 		h.writeStoreErr(w, r, err, h.metrics.RoleWrites)
 		return
 	}
 
 	h.roleWrite(telemetry.WriteUpdated)
-	writeJSON(w, http.StatusOK, updated)
+	writeJSONWithETag(w, http.StatusOK, updated, updated.RecordVersion)
 }
 
 // ── POST /v1/role-definitions/{role_definition_id}/permission-bundles ────────
@@ -648,7 +653,7 @@ func (h *Handler) GetBundle(w http.ResponseWriter, r *http.Request) {
 		h.writeStoreErr(w, r, err, nil)
 		return
 	}
-	writeJSON(w, http.StatusOK, bundle)
+	writeJSONWithETag(w, http.StatusOK, bundle, bundle.RecordVersion)
 }
 
 // ── PATCH /v1/role-definitions/{role_definition_id}/permission-bundles/{bundle_id} ──
@@ -721,6 +726,11 @@ func (h *Handler) UpdateBundle(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		h.writeStoreErr(w, r, err, h.metrics.BundleWrites)
 		h.recordRefusal(r.Context(), tenantID, req.LegalEntityID, principalID, req.CorrelationID, "UPDATE_BUNDLE", "bundle_not_found", "not_found", err.Error(), req)
+		return
+	}
+
+	// Check If-Match for optimistic concurrency (API-3).
+	if !h.requireIfMatch(w, r, current.RecordVersion) {
 		return
 	}
 
@@ -813,14 +823,14 @@ func (h *Handler) UpdateBundle(w http.ResponseWriter, r *http.Request) {
 		h.metrics.AuthzAdminCalls.WithLabelValues(telemetry.AdminSetBundle, telemetry.AdminOK).Inc()
 	}
 
-	updated, err := h.store.UpdateBundle(r.Context(), roleDefinitionID, bundleID, req.PermittedActions, req.ActiveFlag, principalID)
+	updated, err := h.store.UpdateBundle(r.Context(), roleDefinitionID, bundleID, req.PermittedActions, req.ActiveFlag, principalID, current.RecordVersion)
 	if err != nil {
 		h.writeStoreErr(w, r, err, h.metrics.BundleWrites)
 		return
 	}
 
 	h.bundleWrite(telemetry.WriteUpdated)
-	writeJSON(w, http.StatusOK, updated)
+	writeJSONWithETag(w, http.StatusOK, updated, updated.RecordVersion)
 }
 
 // ── DELETE /v1/role-definitions/{role_definition_id}/permission-bundles/{bundle_id} ──
@@ -882,6 +892,12 @@ func (h *Handler) DetachBundle(w http.ResponseWriter, r *http.Request) {
 		h.writeStoreErr(w, r, err, h.metrics.BundleWrites)
 		return
 	}
+
+	// Check If-Match for optimistic concurrency (API-3).
+	if !h.requireIfMatch(w, r, current.RecordVersion) {
+		return
+	}
+
 	if !current.ActiveFlag {
 		h.bundleWrite(telemetry.WriteAlreadyDetachedNoop)
 		writeJSON(w, http.StatusOK, current)
@@ -905,14 +921,18 @@ func (h *Handler) DetachBundle(w http.ResponseWriter, r *http.Request) {
 	h.metrics.AuthzAdminCalls.WithLabelValues(telemetry.AdminSetBundle, telemetry.AdminOK).Inc()
 
 	detached := false
-	updated, err := h.store.UpdateBundle(r.Context(), roleDefinitionID, bundleID, nil, &detached, principalID)
+	// Check If-Match for optimistic concurrency (API-3).
+	if !h.requireIfMatch(w, r, current.RecordVersion) {
+		return
+	}
+	updated, err := h.store.UpdateBundle(r.Context(), roleDefinitionID, bundleID, nil, &detached, principalID, current.RecordVersion)
 	if err != nil {
 		h.writeStoreErr(w, r, err, h.metrics.BundleWrites)
 		return
 	}
 
 	h.bundleWrite(telemetry.WriteDetached)
-	writeJSON(w, http.StatusOK, updated)
+	writeJSONWithETag(w, http.StatusOK, updated, updated.RecordVersion)
 }
 
 // ── GET /v1/permission-bundles ────────────────────────────────────────────────
@@ -1336,4 +1356,15 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// writeJSONWithETag writes a JSON response with an ETag header.
+func writeJSONWithETag(w http.ResponseWriter, status int, body any, version int64) {
+	apicontract.WriteETag(w, version)
+	writeJSON(w, status, body)
+}
+
+// requireIfMatch checks the If-Match header and returns false if the request should be rejected.
+func (h *Handler) requireIfMatch(w http.ResponseWriter, r *http.Request, currentVersion int64) bool {
+	return apicontract.CheckIfMatch(w, r, currentVersion)
 }

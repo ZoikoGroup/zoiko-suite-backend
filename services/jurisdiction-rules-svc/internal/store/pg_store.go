@@ -786,7 +786,7 @@ func (s *PgStore) CreateJurisdictionWithQuerier(ctx context.Context, q Querier, 
 // satisfying every effective_to-based query in this service and in callers
 // that read the record directly.
 func (s *PgStore) DeactivateJurisdiction(ctx context.Context, jurisdictionID, actorID string) (*domain.Jurisdiction, bool, error) {
-	return s.DeactivateJurisdictionWithQuerier(ctx, s.pool, jurisdictionID, actorID)
+	return s.DeactivateJurisdictionWithQuerier(ctx, s.pool, jurisdictionID, actorID, nil)
 }
 
 // DeactivateJurisdictionWithQuerier is the same as DeactivateJurisdiction but uses the provided querier (transaction).
@@ -794,7 +794,8 @@ func (s *PgStore) DeactivateJurisdiction(ctx context.Context, jurisdictionID, ac
 // false when it was already deactivated (the trg_prevent_duplicate_deactivation
 // trigger skips the UPDATE, so no row is returned): an idempotent replay that a
 // caller must not re-announce.
-func (s *PgStore) DeactivateJurisdictionWithQuerier(ctx context.Context, q Querier, jurisdictionID, actorID string) (*domain.Jurisdiction, bool, error) {
+// expectedRowVersion: when non-nil, the UPDATE only succeeds if the current row_version matches.
+func (s *PgStore) DeactivateJurisdictionWithQuerier(ctx context.Context, q Querier, jurisdictionID, actorID string, expectedRowVersion *int64) (*domain.Jurisdiction, bool, error) {
 	query := `
 		UPDATE jurisdictions
 		SET active_flag             = FALSE,
@@ -802,16 +803,29 @@ func (s *PgStore) DeactivateJurisdictionWithQuerier(ctx context.Context, q Queri
 		    updated_at              = NOW(),
 		    updated_by_principal_id = $2
 		WHERE jurisdiction_id = $1
-		RETURNING ` + jurisdictionColumns + `;`
+	`
+	if expectedRowVersion != nil {
+		query += " AND row_version = $3"
+	}
+	query += " RETURNING " + jurisdictionColumns + ";"
 
-	j, err := scanJurisdiction(q.QueryRow(ctx, query, jurisdictionID, actorID))
+	var args []any
+	if expectedRowVersion != nil {
+		args = []any{jurisdictionID, actorID, *expectedRowVersion}
+	} else {
+		args = []any{jurisdictionID, actorID}
+	}
+
+	j, err := scanJurisdiction(q.QueryRow(ctx, query, args...))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			// Trigger skipped the update because already deactivated.
-			// Fetch the existing jurisdiction; nothing changed.
+			// Trigger skipped the update because already deactivated, or row_version didn't match.
 			existing, findErr := s.FindByIDAny(ctx, jurisdictionID)
 			if findErr != nil {
 				return nil, false, findErr
+			}
+			if expectedRowVersion != nil && existing.RowVersion != *expectedRowVersion {
+				return nil, false, domain.ErrVersionConflict
 			}
 			return existing, false, nil
 		}

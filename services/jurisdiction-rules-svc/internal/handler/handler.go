@@ -48,7 +48,7 @@ type JurisdictionStore interface {
 	// The bool reports whether anything actually changed (false = already
 	// deactivated; an idempotent replay that must not re-publish).
 	DeactivateJurisdiction(ctx context.Context, jurisdictionID, actorID string) (*domain.Jurisdiction, bool, error)
-	DeactivateJurisdictionWithQuerier(ctx context.Context, q store.Querier, jurisdictionID, actorID string) (*domain.Jurisdiction, bool, error)
+	DeactivateJurisdictionWithQuerier(ctx context.Context, q store.Querier, jurisdictionID, actorID string, expectedRowVersion *int64) (*domain.Jurisdiction, bool, error)
 
 	// FindRuleByID looks up a rule by ID.
 	FindRuleByID(ctx context.Context, ruleID string) (*domain.JurisdictionRule, error)
@@ -316,6 +316,7 @@ func (h *Handler) GetJurisdiction(w http.ResponseWriter, r *http.Request) {
 		zap.String("jurisdiction_code", j.JurisdictionCode),
 		zap.String("correlation_id", correlationID),
 	)
+	setETag(w, j.RowVersion)
 	writeJSON(w, http.StatusOK, j)
 }
 
@@ -730,6 +731,7 @@ func (h *Handler) CreateJurisdiction(w http.ResponseWriter, r *http.Request) {
 //	401 → no caller identity on the request
 //	403 → authorization denied
 //	404 → jurisdiction_id not found
+//	412 → precondition failed (stale If-Match)
 //	503 → authz or store unavailable
 func (h *Handler) DeactivateJurisdiction(w http.ResponseWriter, r *http.Request) {
 	jurisdictionID := chi.URLParam(r, "jurisdiction_id")
@@ -744,12 +746,18 @@ func (h *Handler) DeactivateJurisdiction(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Check If-Match for optimistic concurrency (API-3).
+	ifMatch, ok := parseIfMatch(w, r)
+	if !ok {
+		return
+	}
+
 	var j *domain.Jurisdiction
 	var changed bool
 	err := h.store.WithTransaction(r.Context(), func(q store.Querier) error {
 		ctx := events.WithBatch(r.Context())
 		var err error
-		j, changed, err = h.store.DeactivateJurisdictionWithQuerier(r.Context(), q, jurisdictionID, principalID)
+		j, changed, err = h.store.DeactivateJurisdictionWithQuerier(r.Context(), q, jurisdictionID, principalID, ifMatch)
 		if err != nil {
 			return err
 		}
@@ -774,6 +782,7 @@ func (h *Handler) DeactivateJurisdiction(w http.ResponseWriter, r *http.Request)
 		zap.String("principal_id", principalID),
 		zap.String("correlation_id", correlationID),
 	)
+	setETag(w, j.RowVersion)
 	writeJSON(w, http.StatusOK, j)
 }
 

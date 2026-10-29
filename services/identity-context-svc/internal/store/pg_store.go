@@ -93,7 +93,7 @@ func (s *PgStore) FindByIDPSubject(ctx context.Context, subject, tenantID string
 
 	const query = `
 		SELECT principal_id, tenant_id, principal_type, identity_provider_subject,
-		       email, display_name, status, created_at, data_classification
+		       email, display_name, status, created_at, data_classification, record_version
 		FROM principals
 		WHERE identity_provider_subject = $1
 		  AND tenant_id = $2
@@ -120,7 +120,7 @@ func (s *PgStore) FindByID(ctx context.Context, principalID, tenantID string) (*
 
 	const query = `
 		SELECT principal_id, tenant_id, principal_type, identity_provider_subject,
-		       email, display_name, status, created_at, data_classification
+		       email, display_name, status, created_at, data_classification, record_version
 		FROM principals
 		WHERE principal_id = $1
 		  AND tenant_id = $2
@@ -141,7 +141,7 @@ func (s *PgStore) scanOnePrincipal(row pgx.Row) (*domain.Principal, error) {
 	var p domain.Principal
 	err := row.Scan(
 		&p.PrincipalID, &p.TenantID, &p.PrincipalType, &p.IdentityProviderSubject,
-		&p.Email, &p.DisplayName, &p.Status, &p.CreatedAt, &p.DataClassification,
+		&p.Email, &p.DisplayName, &p.Status, &p.CreatedAt, &p.DataClassification, &p.RecordVersion,
 	)
 	if err != nil {
 		return nil, err
@@ -286,7 +286,7 @@ func (s *PgStore) UpdateStatus(
 	}
 
 	err = tx.QueryRow(ctx, `
-		UPDATE principals SET status = $1, updated_at = $2
+		UPDATE principals SET status = $1, updated_at = $2, record_version = record_version + 1
 		WHERE principal_id = $3 AND tenant_id = $4 AND status != $1
 		RETURNING tenant_id
 	`, string(newStatus), time.Now().UTC(), principalID, tenantID).Scan(&tenantID)

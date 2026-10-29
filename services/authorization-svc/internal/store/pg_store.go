@@ -3030,7 +3030,8 @@ func isUndefinedTable(err error) bool {
 
 const privilegedSessionColumns = `session_id, tenant_id, principal_id, requested_actions, ticket_ref, reason, status, duration_seconds, expires_at, created_at, revoked_at, revoked_by,
 	requested_by, resource_scope, target_environment, high_impact, approved_by, approved_at, review_status, reviewed_by, reviewed_at, review_notes,
-	requester_assurance, requester_authn_at, requester_identity_session, approver_assurance, approver_authn_at, approver_identity_session`
+	requester_assurance, requester_authn_at, requester_identity_session, approver_assurance, approver_authn_at, approver_identity_session,
+	record_version`
 
 func scanPrivilegedSession(row pgx.Row) (*domain.PrivilegedSession, error) {
 	var ps domain.PrivilegedSession
@@ -3062,6 +3063,7 @@ func scanPrivilegedSession(row pgx.Row) (*domain.PrivilegedSession, error) {
 		&ps.ReviewNotes,
 		&reqAssurance, &reqAuthnAt, &reqSession,
 		&apprAssurance, &apprAuthnAt, &apprSession,
+		&ps.RecordVersion,
 	)
 	if err != nil {
 		return nil, err
@@ -3333,7 +3335,8 @@ func (s *PgStore) ReviewSession(ctx context.Context, kind, sessionID, tenantID, 
 // ── Break-Glass Emergency Sessions (ZS-IAM-001 §14 & §21) ───────────────────
 
 const breakGlassSessionColumns = "session_id, tenant_id, principal_id, incident_id, reason, requested_actions, status, duration_seconds, expires_at, created_at, revoked_at, revoked_by, requested_by, review_status, reviewed_by, reviewed_at, review_notes, requester_assurance, requester_authn_at, requester_identity_session, " +
-	"approvals_required, approved_by, approved_at, rejected_by, rejected_at, request_expires_at"
+	"approvals_required, approved_by, approved_at, rejected_by, rejected_at, request_expires_at, " +
+	"record_version"
 
 func scanBreakGlassSession(row pgx.Row) (*domain.BreakGlassSession, error) {
 	var bg domain.BreakGlassSession
@@ -3361,6 +3364,7 @@ func scanBreakGlassSession(row pgx.Row) (*domain.BreakGlassSession, error) {
 		&bg.ReviewNotes,
 		&reqAssurance, &reqAuthnAt, &reqSession,
 		&approvalsRequired, &bg.ApprovedBy, &bg.ApprovedAt, &bg.RejectedBy, &bg.RejectedAt, &bg.RequestExpiresAt,
+		&bg.RecordVersion,
 	)
 	if err != nil {
 		return nil, err
@@ -3579,7 +3583,7 @@ func (s *PgStore) RevokeBreakGlassSession(ctx context.Context, sessionID, tenant
 
 // ── Tenant Support Sessions (ZS-IAM-001 §15 & §21) ──────────────────────────
 
-const supportSessionColumns = "session_id, tenant_id, support_operator_id, ticket_ref, purpose, read_only, allow_bulk_export, allowed_actions, status, duration_seconds, expires_at, tenant_consent_obtained, created_at, revoked_at, revoked_by, requested_by"
+const supportSessionColumns = "session_id, tenant_id, support_operator_id, ticket_ref, purpose, read_only, allow_bulk_export, allowed_actions, status, duration_seconds, expires_at, tenant_consent_obtained, created_at, revoked_at, revoked_by, requested_by, record_version"
 
 func scanSupportSession(row pgx.Row) (*domain.SupportSession, error) {
 	var ss domain.SupportSession
@@ -3601,6 +3605,7 @@ func scanSupportSession(row pgx.Row) (*domain.SupportSession, error) {
 		&ss.RevokedAt,
 		&ss.RevokedBy,
 		&ss.RequestedBy,
+		&ss.RecordVersion,
 	)
 	if err != nil {
 		return nil, err

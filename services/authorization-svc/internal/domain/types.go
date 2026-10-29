@@ -474,6 +474,8 @@ type PrivilegedSession struct {
 	// 000033: the step-up the requester and the approver each proved (A-03).
 	RequesterStepUp *StepUpEvidence `json:"requester_step_up,omitempty"`
 	ApproverStepUp  *StepUpEvidence `json:"approver_step_up,omitempty"`
+	// RecordVersion is the optimistic-concurrency token (migration 000037).
+	RecordVersion int64 `json:"record_version"`
 }
 
 // CreatePrivilegedSessionParams holds the parameters to issue a new JIT privileged session.
@@ -538,6 +540,8 @@ type BreakGlassSession struct {
 	RejectedBy        *string              `json:"rejected_by,omitempty"`
 	RejectedAt        *time.Time           `json:"rejected_at,omitempty"`
 	RequestExpiresAt  *time.Time           `json:"request_expires_at,omitempty"`
+	// RecordVersion is the optimistic-concurrency token (migration 000037).
+	RecordVersion int64 `json:"record_version"`
 }
 
 // BreakGlassApproval is one independent approver's approval of a break-glass
@@ -589,6 +593,8 @@ type SupportSession struct {
 	RevokedAt             *time.Time `json:"revoked_at,omitempty"`
 	RevokedBy             *string    `json:"revoked_by,omitempty"`
 	RequestedBy           *string    `json:"requested_by,omitempty"`
+	// RecordVersion is the optimistic-concurrency token (migration 000037).
+	RecordVersion int64 `json:"record_version"`
 }
 
 type CreateSupportSessionParams struct {

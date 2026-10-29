@@ -56,11 +56,13 @@ type Service interface {
 	CreateHierarchy(ctx context.Context, req domain.CreateHierarchyRequest) (*domain.EntityHierarchy, error)
 	EndDateHierarchy(ctx context.Context, hierarchyID string, endDate time.Time, correlationID string) error
 	ListHierarchies(ctx context.Context, legalEntityID string) ([]*domain.EntityHierarchy, error)
+	GetHierarchyByID(ctx context.Context, hierarchyID string) (*domain.EntityHierarchy, error)
 
 	// Jurisdiction assignment
 	AssignJurisdiction(ctx context.Context, legalEntityID string, req domain.AssignJurisdictionRequest) (*domain.EntityJurisdictionAssignment, error)
 	ListJurisdictions(ctx context.Context, legalEntityID string) ([]*domain.EntityJurisdictionAssignment, error)
 	EndDateJurisdictionAssignment(ctx context.Context, assignmentID string, endDate time.Time, correlationID string) error
+	GetJurisdictionAssignmentByID(ctx context.Context, assignmentID string) (*domain.EntityJurisdictionAssignment, error)
 
 	// Residency policy
 	CreateResidencyPolicy(ctx context.Context, req domain.CreateResidencyPolicyRequest) (*domain.DataResidencyPolicy, error)
@@ -208,7 +210,7 @@ func (h *Handler) GetTenant(w http.ResponseWriter, r *http.Request) {
 		h.writeErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, t)
+	writeJSONWithETag(w, http.StatusOK, t, t.RecordVersion)
 }
 
 // ResolveTenantRegion handles GET /v1/tenants/{tenantID}/residency-region
@@ -230,7 +232,17 @@ func (h *Handler) TransitionTenantLifecycle(w http.ResponseWriter, r *http.Reque
 	if !decode(w, r, &req) {
 		return
 	}
-	if err := h.svc.TransitionTenantLifecycle(r.Context(), chi.URLParam(r, "tenantID"), req); err != nil {
+	// Check If-Match for mutations of existing aggregates
+	tenantID := chi.URLParam(r, "tenantID")
+	t, err := h.svc.GetTenant(r.Context(), tenantID)
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	if !h.requireIfMatch(w, r, t.RecordVersion) {
+		return
+	}
+	if err := h.svc.TransitionTenantLifecycle(r.Context(), tenantID, req); err != nil {
 		h.writeErr(w, r, err)
 		return
 	}
@@ -263,7 +275,7 @@ func (h *Handler) GetEntity(w http.ResponseWriter, r *http.Request) {
 		h.writeErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, e)
+	writeJSONWithETag(w, http.StatusOK, e, e.RecordVersion)
 }
 
 func (h *Handler) ListEntities(w http.ResponseWriter, r *http.Request) {
@@ -299,7 +311,7 @@ func (h *Handler) GetWorkspace(w http.ResponseWriter, r *http.Request) {
 		h.writeErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, ws)
+	writeJSONWithETag(w, http.StatusOK, ws, ws.RecordVersion)
 }
 
 func (h *Handler) ListWorkspaces(w http.ResponseWriter, r *http.Request) {
@@ -322,13 +334,23 @@ func (h *Handler) UpdateWorkspace(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	req.CorrelationID = correlationID(r)
-	ws, err := h.svc.UpdateWorkspace(r.Context(), chi.URLParam(r, "workspaceID"), req)
+	// Check If-Match for mutations of existing aggregates
+	workspaceID := chi.URLParam(r, "workspaceID")
+	ws, err := h.svc.GetWorkspace(r.Context(), workspaceID)
 	if err != nil {
 		h.writeErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, ws)
+	if !h.requireIfMatch(w, r, ws.RecordVersion) {
+		return
+	}
+	req.CorrelationID = correlationID(r)
+	ws, err = h.svc.UpdateWorkspace(r.Context(), workspaceID, req)
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	writeJSONWithETag(w, http.StatusOK, ws, ws.RecordVersion)
 }
 
 // TransitionWorkspaceStatus — POST /v1/workspaces/{workspaceID}/status
@@ -338,8 +360,18 @@ func (h *Handler) TransitionWorkspaceStatus(w http.ResponseWriter, r *http.Reque
 	if !decode(w, r, &req) {
 		return
 	}
+	// Check If-Match for mutations of existing aggregates
+	workspaceID := chi.URLParam(r, "workspaceID")
+	ws, err := h.svc.GetWorkspace(r.Context(), workspaceID)
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	if !h.requireIfMatch(w, r, ws.RecordVersion) {
+		return
+	}
 	req.CorrelationID = correlationID(r)
-	if err := h.svc.TransitionWorkspaceStatus(r.Context(), chi.URLParam(r, "workspaceID"), req); err != nil {
+	if err := h.svc.TransitionWorkspaceStatus(r.Context(), workspaceID, req); err != nil {
 		h.writeErr(w, r, err)
 		return
 	}
@@ -351,17 +383,27 @@ func (h *Handler) UpdateEntity(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
+	// Check If-Match for mutations of existing aggregates
+	entityID := chi.URLParam(r, "entityID")
+	e, err := h.svc.GetEntity(r.Context(), entityID)
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	if !h.requireIfMatch(w, r, e.RecordVersion) {
+		return
+	}
 	// The envelope's correlation id when the body names none, so the
 	// event this write emits can be traced back to the request.
 	if req.CorrelationID == "" {
 		req.CorrelationID = correlationID(r)
 	}
-	e, err := h.svc.UpdateEntity(r.Context(), chi.URLParam(r, "entityID"), req)
+	e, err = h.svc.UpdateEntity(r.Context(), entityID, req)
 	if err != nil {
 		h.writeErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, e)
+	writeJSONWithETag(w, http.StatusOK, e, e.RecordVersion)
 }
 
 // GetEntityStatus — GET /v1/entities/{entityID}/status
@@ -382,8 +424,18 @@ func (h *Handler) TransitionEntityStatus(w http.ResponseWriter, r *http.Request)
 	if !decode(w, r, &req) {
 		return
 	}
+	// Check If-Match for mutations of existing aggregates
+	entityID := chi.URLParam(r, "entityID")
+	e, err := h.svc.GetEntity(r.Context(), entityID)
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	if !h.requireIfMatch(w, r, e.RecordVersion) {
+		return
+	}
 	req.CorrelationID = correlationID(r)
-	if err := h.svc.TransitionEntityStatus(r.Context(), chi.URLParam(r, "entityID"), req); err != nil {
+	if err := h.svc.TransitionEntityStatus(r.Context(), entityID, req); err != nil {
 		h.writeErr(w, r, err)
 		return
 	}
@@ -426,7 +478,21 @@ func (h *Handler) EndDateHierarchy(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if err := h.svc.EndDateHierarchy(r.Context(), chi.URLParam(r, "hierarchyID"), endDate, correlationID(r)); err != nil {
+	// Check If-Match for mutations of existing aggregates
+	hierarchyID := chi.URLParam(r, "hierarchyID")
+	hier, err := h.svc.GetHierarchyByID(r.Context(), hierarchyID)
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	if hier == nil {
+		h.writeErr(w, r, registry.ErrNotFound)
+		return
+	}
+	if !h.requireIfMatch(w, r, hier.RecordVersion) {
+		return
+	}
+	if err := h.svc.EndDateHierarchy(r.Context(), hierarchyID, endDate, correlationID(r)); err != nil {
 		h.writeErr(w, r, err)
 		return
 	}
@@ -462,12 +528,27 @@ func (h *Handler) ListJurisdictions(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, list)
 }
 
+// EndDateJurisdictionAssignment
 func (h *Handler) EndDateJurisdictionAssignment(w http.ResponseWriter, r *http.Request) {
 	endDate, ok := parseEndDate(w, r)
 	if !ok {
 		return
 	}
-	if err := h.svc.EndDateJurisdictionAssignment(r.Context(), chi.URLParam(r, "assignmentID"), endDate, correlationID(r)); err != nil {
+	// Check If-Match for mutations of existing aggregates
+	assignmentID := chi.URLParam(r, "assignmentID")
+	a, err := h.svc.GetJurisdictionAssignmentByID(r.Context(), assignmentID)
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	if a == nil {
+		h.writeErr(w, r, registry.ErrNotFound)
+		return
+	}
+	if !h.requireIfMatch(w, r, a.RecordVersion) {
+		return
+	}
+	if err := h.svc.EndDateJurisdictionAssignment(r.Context(), assignmentID, endDate, correlationID(r)); err != nil {
 		h.writeErr(w, r, err)
 		return
 	}
@@ -495,7 +576,7 @@ func (h *Handler) GetResidencyPolicy(w http.ResponseWriter, r *http.Request) {
 		h.writeErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, p)
+	writeJSONWithETag(w, http.StatusOK, p, p.RecordVersion)
 }
 
 // ── ResidencyRegion handlers — read-only (IaC-managed) ──────────────────────
@@ -539,7 +620,7 @@ func (h *Handler) GetTaxIdentityBundle(w http.ResponseWriter, r *http.Request) {
 		h.writeErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, b)
+	writeJSONWithETag(w, http.StatusOK, b, b.RecordVersion)
 }
 
 func (h *Handler) ListTaxIdentityBundles(w http.ResponseWriter, r *http.Request) {
@@ -556,7 +637,17 @@ func (h *Handler) TransitionTaxIdentityBundleStatus(w http.ResponseWriter, r *ht
 	if !decode(w, r, &req) {
 		return
 	}
-	if err := h.svc.TransitionTaxIdentityBundleStatus(r.Context(), chi.URLParam(r, "bundleID"), req); err != nil {
+	// Check If-Match for mutations of existing aggregates
+	bundleID := chi.URLParam(r, "bundleID")
+	b, err := h.svc.GetTaxIdentityBundle(r.Context(), bundleID)
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	if !h.requireIfMatch(w, r, b.RecordVersion) {
+		return
+	}
+	if err := h.svc.TransitionTaxIdentityBundleStatus(r.Context(), bundleID, req); err != nil {
 		h.writeErr(w, r, err)
 		return
 	}
@@ -640,10 +731,22 @@ func writeErrCoded(w http.ResponseWriter, r *http.Request, status int, code, msg
 	apicontract.WriteProblem(w, r, p)
 }
 
+// writeJSON writes a JSON response with the appropriate headers.
 func writeJSON(w http.ResponseWriter, status int, body any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(body)
+}
+
+// writeJSONWithETag writes a JSON response with an ETag header.
+func writeJSONWithETag(w http.ResponseWriter, status int, body any, version int64) {
+	apicontract.WriteETag(w, version)
+	writeJSON(w, status, body)
+}
+
+// requireIfMatch checks the If-Match header and returns false if the request should be rejected.
+func (h *Handler) requireIfMatch(w http.ResponseWriter, r *http.Request, currentVersion int64) bool {
+	return apicontract.CheckIfMatch(w, r, currentVersion)
 }
 
 func decode(w http.ResponseWriter, r *http.Request, dst any) bool {

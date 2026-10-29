@@ -125,7 +125,8 @@ const policyColumns = `
 	policy_status,
 	versioning_mode,
 	created_at,
-	created_by_principal_id`
+	created_by_principal_id,
+	record_version`
 
 func scanPolicy(row pgx.Row) (*domain.Policy, error) {
 	p := &domain.Policy{}
@@ -139,6 +140,7 @@ func scanPolicy(row pgx.Row) (*domain.Policy, error) {
 		&p.VersioningMode,
 		&p.CreatedAt,
 		&p.CreatedByPrincipalID,
+		&p.RecordVersion,
 	)
 	return p, err
 }

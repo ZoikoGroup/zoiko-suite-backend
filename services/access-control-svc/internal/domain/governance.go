@@ -136,6 +136,8 @@ type AssignmentRequest struct {
 	CorrelationID        string     `json:"correlation_id"`
 	CreatedAt            time.Time  `json:"created_at"`
 	UpdatedAt            time.Time  `json:"updated_at"`
+	// RecordVersion is the optimistic-concurrency token (migration 000025).
+	RecordVersion int64 `json:"record_version"`
 }
 
 type CreateAssignmentRequest struct {
@@ -238,6 +240,8 @@ type ReviewCampaign struct {
 	UpdatedAt                  time.Time      `json:"updated_at"`
 	Items                      []ReviewItem   `json:"items,omitempty"`
 	Summary                    map[string]int `json:"summary,omitempty"`
+	// RecordVersion is the optimistic-concurrency token (migration 000025).
+	RecordVersion int64 `json:"record_version"`
 }
 
 type ReviewItem struct {
@@ -260,10 +264,12 @@ type ReviewItem struct {
 	DecidedAt            *time.Time `json:"decided_at,omitempty"`
 	RevocationApplied    bool       `json:"revocation_applied"`
 	// Evidence for the DORMANT / SUBJECT_INACTIVE flags, as read at snapshot.
-	LastGrantedAt *time.Time `json:"last_granted_at,omitempty"`
+	LastGrantedAt *time.Time `json:"last_grantied_at,omitempty"`
 	SubjectStatus string     `json:"subject_status,omitempty"`
 	CreatedAt     time.Time  `json:"created_at"`
 	UpdatedAt     time.Time  `json:"updated_at"`
+	// RecordVersion is the optimistic-concurrency token (migration 000025).
+	RecordVersion int64 `json:"record_version"`
 }
 
 type CreateCampaignRequest struct {
@@ -372,6 +378,8 @@ type Group struct {
 	CreatedAt            time.Time     `json:"created_at"`
 	UpdatedAt            time.Time     `json:"updated_at"`
 	Members              []GroupMember `json:"members,omitempty"`
+	// RecordVersion is the optimistic-concurrency token (migration 000025).
+	RecordVersion int64 `json:"record_version"`
 }
 
 // GroupMember is one live membership. AddedAt distinguishes a re-added member
@@ -381,6 +389,8 @@ type GroupMember struct {
 	PrincipalID        string    `json:"principal_id"`
 	AddedByPrincipalID string    `json:"added_by_principal_id"`
 	AddedAt            time.Time `json:"added_at"`
+	// RecordVersion is the optimistic-concurrency token (migration 000025).
+	RecordVersion int64 `json:"record_version"`
 }
 
 const (
@@ -425,6 +435,8 @@ type GroupAssignment struct {
 	CreatedAt            time.Time  `json:"created_at"`
 	// Members is the per-member outcome of a fan-out, on command responses.
 	Members []GroupMemberOutcome `json:"members,omitempty"`
+	// RecordVersion is the optimistic-concurrency token (migration 000025).
+	RecordVersion int64 `json:"record_version"`
 }
 
 const (

@@ -478,7 +478,7 @@ func (h *Handler) CreatePolicy(w http.ResponseWriter, r *http.Request) {
 	if created {
 		status = http.StatusCreated
 	}
-	writeJSON(w, status, p)
+	writeJSONWithETag(w, status, p, p.RecordVersion)
 }
 
 // GetPolicy handles GET /v1/policies/{policy_id}: a family visible to the
@@ -503,7 +503,7 @@ func (h *Handler) GetPolicy(w http.ResponseWriter, r *http.Request) {
 		h.storeUnavailable(w, r, "GetPolicy", err)
 		return
 	}
-	writeJSON(w, http.StatusOK, p)
+	writeJSONWithETag(w, http.StatusOK, p, p.RecordVersion)
 }
 
 // ── POST /v1/policies/{policy_id}/versions ──────────────────────────────────
@@ -677,7 +677,7 @@ func (h *Handler) CreatePolicyVersion(w http.ResponseWriter, r *http.Request) {
 	if created {
 		status = http.StatusCreated
 	}
-	writeVersion(w, status, v)
+	writeJSONWithETag(w, status, v, int64(v.RowVersion))
 }
 
 // writeVersion writes a version with its row_version as the ETag, the value
@@ -774,46 +774,7 @@ func (h *Handler) lifecycle(command string) http.HandlerFunc {
 		if !decodeOptionalJSON(w, r, &req) {
 			return
 		}
-		expected, ok := ifMatch(r)
-		if !ok {
-			writeError(w, r, http.StatusBadRequest, codeInvalidRequest, "invalid_if_match", "If-Match must be a row_version", nil)
-			return
-		}
-		if req.ExpectedVersion != nil {
-			if expected != nil && *expected != *req.ExpectedVersion {
-				writeError(w, r, http.StatusBadRequest, codeInvalidRequest, "expected_version_mismatch", "If-Match and expected_version disagree", nil)
-				return
-			}
-			expected = req.ExpectedVersion
-		}
-		// GOV-05: "Idempotency-Key + expected_version where stateful" — every
-		// lifecycle command is stateful, so the version the caller decided on
-		// must be named. 428 is HTTP's own answer to a missing precondition.
-		if expected == nil {
-			writeError(w, r, http.StatusPreconditionRequired, codeInvalidRequest, "expected_version_required",
-				"send the version's row_version as If-Match or expected_version (GET the version for its ETag)", nil)
-			return
-		}
-		reason := strings.TrimSpace(req.ReasonCode)
-		if (command == domain.CommandSuspend || command == domain.CommandRetire || command == domain.CommandReviewSuspension) && reason == "" {
-			missingField(w, r, "reason_code")
-			return
-		}
-		outcome := strings.ToUpper(strings.TrimSpace(req.Outcome))
-		if command == domain.CommandReviewSuspension && outcome != domain.SuspensionUpheld && outcome != domain.SuspensionOverturned {
-			writeError(w, r, http.StatusBadRequest, codeInvalidRequest, "invalid_outcome", "outcome must be UPHELD or OVERTURNED", nil)
-			return
-		}
-		if free := strings.TrimSpace(req.Reason); free != "" {
-			if reason != "" {
-				reason += ": "
-			}
-			reason += free
-		}
-		if tooLong(w, r, "reason", reason, 2000) || tooLong(w, r, "approval_reference", req.ApprovalReference, 256) {
-			return
-		}
-
+		// Fetch the current version first for If-Match check
 		existing, err := h.store.FindPolicyVersionByID(r.Context(), versionID)
 		if err != nil {
 			if errors.Is(err, domain.ErrPolicyVersionNotFound) {
@@ -852,11 +813,57 @@ func (h *Handler) lifecycle(command string) http.HandlerFunc {
 			return
 		}
 
+		// Check If-Match using standard helper against the current version from store
+		if !h.requireIfMatch(w, r, int64(existing.RowVersion)) {
+			return
+		}
+		// Also verify the expected_version from body matches the current version
+		if req.ExpectedVersion != nil && int64(*req.ExpectedVersion) != int64(existing.RowVersion) {
+			p := apicontract.ProblemFor(http.StatusPreconditionFailed, "stale_version", "The aggregate has changed since the supplied ETag")
+			currentVer := int64(existing.RowVersion)
+			p.CurrentVersion = &currentVer
+			apicontract.WriteProblem(w, r, p)
+			return
+		}
+		reason := strings.TrimSpace(req.ReasonCode)
+		if (command == domain.CommandSuspend || command == domain.CommandRetire || command == domain.CommandReviewSuspension) && reason == "" {
+			missingField(w, r, "reason_code")
+			return
+		}
+		outcome := strings.ToUpper(strings.TrimSpace(req.Outcome))
+		if command == domain.CommandReviewSuspension && outcome != domain.SuspensionUpheld && outcome != domain.SuspensionOverturned {
+			writeError(w, r, http.StatusBadRequest, codeInvalidRequest, "invalid_outcome", "outcome must be UPHELD or OVERTURNED", nil)
+			return
+		}
+		if free := strings.TrimSpace(req.Reason); free != "" {
+			if reason != "" {
+				reason += ": "
+			}
+			reason += free
+		}
+		if tooLong(w, r, "reason", reason, 2000) || tooLong(w, r, "approval_reference", req.ApprovalReference, 256) {
+			return
+		}
+
+		// The checker's actions name the maker, so authorization-svc's
+		// own-object SoD applies as well as this service's own check.
+		switch command {
+		case domain.CommandApprove, domain.CommandActivate, domain.CommandSchedule:
+			r = r.WithContext(authz.WithResourceOwner(r.Context(), existing.CreatedByPrincipalID))
+		case domain.CommandReviewSuspension:
+			if existing.SuspendedByPrincipalID != nil {
+				r = r.WithContext(authz.WithResourceOwner(r.Context(), *existing.SuspendedByPrincipalID))
+			}
+		}
+		if !h.authorize(w, r, principalID, action, existing.LegalEntityID) {
+			return
+		}
+
 		res, err := h.store.Transition(r.Context(), domain.TransitionCommand{
 			PolicyVersionID:   versionID,
 			Command:           command,
 			ActorID:           principalID,
-			ExpectedVersion:   expected,
+			ExpectedVersion:   &existing.RowVersion,
 			Reason:            reason,
 			ApprovalReference: strings.TrimSpace(req.ApprovalReference),
 			Outcome:           outcome,
@@ -874,7 +881,7 @@ func (h *Handler) lifecycle(command string) http.HandlerFunc {
 			zap.Int("superseded_count", len(res.Superseded)),
 			zap.String("correlation_id", r.Header.Get("X-Correlation-ID")),
 		)
-		writeVersion(w, http.StatusOK, res.Version)
+		writeJSONWithETag(w, http.StatusOK, res.Version, int64(res.Version.RowVersion))
 	}
 }
 
@@ -928,7 +935,12 @@ func (h *Handler) ListVersionHistory(w http.ResponseWriter, r *http.Request) {
 	if results == nil {
 		results = []*domain.PolicyVersion{}
 	}
-	writeJSON(w, http.StatusOK, results)
+	// List endpoint: ETag based on first item's row_version
+	var etag int64
+	if len(results) > 0 {
+		etag = int64(results[0].RowVersion)
+	}
+	writeJSONWithETag(w, http.StatusOK, results, etag)
 }
 
 // GetPolicyVersionByID handles GET /v1/policy-versions/{version_id} — the
@@ -954,7 +966,7 @@ func (h *Handler) GetPolicyVersionByID(w http.ResponseWriter, r *http.Request) {
 	if _, ok := h.gate(w, r, h.opts.ReadAuthz, authz.ActionPolicyRead, v.LegalEntityID); !ok {
 		return
 	}
-	writeVersion(w, http.StatusOK, v)
+	writeJSONWithETag(w, http.StatusOK, v, int64(v.RowVersion))
 }
 
 // ListTransitions handles GET /v1/policy-versions/{version_id}/transitions —
@@ -983,7 +995,12 @@ func (h *Handler) ListTransitions(w http.ResponseWriter, r *http.Request) {
 	if ts == nil {
 		ts = []*domain.VersionTransition{}
 	}
-	writeJSON(w, http.StatusOK, ts)
+	// List endpoint: ETag based on first item's transition_id
+	var etag int64
+	if len(ts) > 0 {
+		etag = ts[0].TransitionID
+	}
+	writeJSONWithETag(w, http.StatusOK, ts, etag)
 }
 
 // ── plumbing ─────────────────────────────────────────────────────────────────
@@ -993,6 +1010,17 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// writeJSONWithETag writes a JSON response with an ETag header.
+func writeJSONWithETag(w http.ResponseWriter, status int, body any, version int64) {
+	apicontract.WriteETag(w, version)
+	writeJSON(w, status, body)
+}
+
+// requireIfMatch checks the If-Match header and returns false if the request should be rejected.
+func (h *Handler) requireIfMatch(w http.ResponseWriter, r *http.Request, currentVersion int64) bool {
+	return apicontract.CheckIfMatch(w, r, currentVersion)
 }
 
 // maxRequestBytes caps a JSON request body.

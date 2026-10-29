@@ -119,9 +119,9 @@ func (ix *Indexer) backfill(ctx context.Context, target *liveScope) {
 	src := target.projector.Source()
 	log := ix.log.With(zap.String("scope", scope), zap.String("generation_id", target.generationID))
 
-	_ = ix.store.SetBackfillState(ctx, target.generationID, domain.BackfillRunning, "")
+	_ = ix.store.SetBackfillState(ctx, target.generationID, domain.BackfillRunning, "", 0)
 	if ix.replayer == nil {
-		_ = ix.store.SetBackfillState(ctx, target.generationID, domain.BackfillFailed, "no source replayer configured")
+		_ = ix.store.SetBackfillState(ctx, target.generationID, domain.BackfillFailed, "no source replayer configured", 0)
 		log.Error("backfill impossible — no source replayer configured")
 		return
 	}
@@ -144,7 +144,7 @@ func (ix *Indexer) backfill(ctx context.Context, target *liveScope) {
 		// cannot project is a generation that cannot serve the scope.
 		state = domain.BackfillFailed
 	}
-	if werr := ix.store.SetBackfillState(ctx, target.generationID, state, note); werr != nil {
+	if werr := ix.store.SetBackfillState(ctx, target.generationID, state, note, 0); werr != nil {
 		log.Error("backfill finished but its state could not be recorded", zap.Error(werr))
 	}
 	ix.mu.Lock()

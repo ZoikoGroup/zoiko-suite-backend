@@ -1057,6 +1057,9 @@ func (s *PgStore) EndDateJurisdictionAssignment(ctx context.Context, assignmentI
 func (s *PgStore) CreateResidencyPolicy(ctx context.Context, p *domain.DataResidencyPolicy) error {
 	s.log.Debug("store.CreateResidencyPolicy", zap.String("policy_id", p.DataResidencyPolicyID))
 	tid := tenantFromCtxOrFallback(ctx, p.TenantID)
+	if p.RecordVersion < 1 {
+		p.RecordVersion = 1
+	}
 
 	return s.withRLS(ctx, tid, func(tx pgx.Tx) error {
 		query := `
@@ -1091,13 +1094,15 @@ func (s *PgStore) GetResidencyPolicyByID(ctx context.Context, policyID string) (
 		query := `
 			SELECT data_residency_policy_id, tenant_id, policy_name, policy_code,
 			       residency_mode, conflict_resolution_mode, residency_region_id, active_flag,
-			       created_at, updated_at, created_by_principal_id, updated_by_principal_id
+			       created_at, updated_at, created_by_principal_id, updated_by_principal_id,
+			       record_version
 			FROM data_residency_policies WHERE data_residency_policy_id = $1 AND tenant_id = $2
 		`
 		return tx.QueryRow(ctx, query, policyID, tid).Scan(
 			&p.DataResidencyPolicyID, &p.TenantID, &p.PolicyName, &p.PolicyCode,
 			&p.ResidencyMode, &p.ConflictResolutionMode, &p.ResidencyRegionID, &p.ActiveFlag,
 			&p.CreatedAt, &p.UpdatedAt, &p.CreatedByPrincipalID, &p.UpdatedByPrincipalID,
+			&p.RecordVersion,
 		)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -1203,13 +1208,15 @@ func (s *PgStore) GetTaxIdentityBundleByID(ctx context.Context, bundleID string)
 		query := `
 			SELECT tax_identity_bundle_id, tenant_id, legal_entity_id, jurisdiction_id, status,
 			       effective_from, effective_to, created_at, updated_at,
-			       created_by_principal_id, updated_by_principal_id, data_classification
+			       created_by_principal_id, updated_by_principal_id, data_classification,
+			       record_version
 			FROM tax_identity_bundles WHERE tax_identity_bundle_id = $1 AND tenant_id = $2
 		`
 		return tx.QueryRow(ctx, query, bundleID, tid).Scan(
 			&b.TaxIdentityBundleID, &b.TenantID, &b.LegalEntityID, &b.JurisdictionID, &b.Status,
 			&b.EffectiveFrom, &b.EffectiveTo, &b.CreatedAt, &b.UpdatedAt,
 			&b.CreatedByPrincipalID, &b.UpdatedByPrincipalID, &b.DataClassification,
+			&b.RecordVersion,
 		)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -1227,7 +1234,8 @@ func (s *PgStore) ListTaxIdentityBundlesByEntity(ctx context.Context, legalEntit
 		query := `
 			SELECT tax_identity_bundle_id, tenant_id, legal_entity_id, jurisdiction_id, status,
 			       effective_from, effective_to, created_at, updated_at,
-			       created_by_principal_id, updated_by_principal_id, data_classification
+			       created_by_principal_id, updated_by_principal_id, data_classification,
+			       record_version
 			FROM tax_identity_bundles WHERE legal_entity_id = $1 AND tenant_id = $2
 		`
 		rows, err := tx.Query(ctx, query, legalEntityID, tid)
@@ -1242,6 +1250,7 @@ func (s *PgStore) ListTaxIdentityBundlesByEntity(ctx context.Context, legalEntit
 				&b.TaxIdentityBundleID, &b.TenantID, &b.LegalEntityID, &b.JurisdictionID, &b.Status,
 				&b.EffectiveFrom, &b.EffectiveTo, &b.CreatedAt, &b.UpdatedAt,
 				&b.CreatedByPrincipalID, &b.UpdatedByPrincipalID, &b.DataClassification,
+				&b.RecordVersion,
 			); err != nil {
 				return err
 			}
@@ -1262,7 +1271,8 @@ func (s *PgStore) TransitionTaxIdentityBundleStatus(ctx context.Context, bundleI
 	return s.withRLS(ctx, tid, func(tx pgx.Tx) error {
 		query := `
 			UPDATE tax_identity_bundles
-			SET status = $1, updated_at = $2, updated_by_principal_id = $3
+			SET status = $1, updated_at = $2, updated_by_principal_id = $3,
+			    record_version = record_version + 1
 			WHERE tax_identity_bundle_id = $4 AND status != $1 AND tenant_id = $5
 		`
 		_, err := tx.Exec(ctx, query, string(newStatus), time.Now().UTC(), actorID, bundleID, tid)

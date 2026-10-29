@@ -483,7 +483,7 @@ func TestCreatePolicyVersion_CreatedAsDraftWithRequestKey(t *testing.T) {
 	g := newRig(&stubStore{version: &domain.PolicyVersion{PolicyVersionID: versionID, RowVersion: 1}, versionCreated: true}, nil, nil)
 	w := g.do(http.MethodPost, versionsPath(policyID), versionBody, header("Idempotency-Key", "key-1"))
 	expect(t, w, http.StatusCreated, "")
-	if w.Header().Get("ETag") != `"1"` {
+	if w.Header().Get("ETag") != `"v1"` {
 		t.Fatalf("a version response carries its row_version as ETag, got %q", w.Header().Get("ETag"))
 	}
 	p := g.store.versionParams
@@ -554,7 +554,7 @@ func TestCreatePolicyVersion_IdempotencyMismatch409(t *testing.T) {
 
 // ifm names the row_version lifecycleStore's version carries; every
 // lifecycle command needs one (428 without).
-var ifm = header("If-Match", `"3"`)
+var ifm = header("If-Match", `"v3"`)
 
 func lifecyclePath(cmd string) string {
 	return "/v1/policies/" + policyID + "/versions/" + versionID + "/" + cmd
@@ -579,7 +579,7 @@ func TestActivate_EmptyBodyIsAccepted(t *testing.T) {
 	if g.store.transitionCmd.Command != domain.CommandActivate || g.store.transitionCmd.ActorID != testPrincipal {
 		t.Fatalf("expected ACTIVATE by the header principal, got %+v", g.store.transitionCmd)
 	}
-	if w.Header().Get("ETag") != `"4"` {
+	if w.Header().Get("ETag") != `"v4"` {
 		t.Fatalf("expected the new row_version as ETag, got %q", w.Header().Get("ETag"))
 	}
 }
@@ -636,7 +636,7 @@ func TestLifecycle_StoreRefusalsMapToStableClasses(t *testing.T) {
 
 func TestLifecycle_ExpectedVersionFromBodyOrIfMatch(t *testing.T) {
 	g := newRig(lifecycleStore(nil), nil, nil)
-	expect(t, g.do(http.MethodPost, lifecyclePath("approve"), "", header("If-Match", `"3"`)), http.StatusOK, "")
+	expect(t, g.do(http.MethodPost, lifecyclePath("approve"), "", header("If-Match", `"v3"`)), http.StatusOK, "")
 	if ev := g.store.transitionCmd.ExpectedVersion; ev == nil || *ev != 3 {
 		t.Fatalf("If-Match must become expected_version 3, got %v", ev)
 	}
@@ -651,7 +651,7 @@ func TestLifecycle_ExpectedVersionFromBodyOrIfMatch(t *testing.T) {
 	}
 
 	g = newRig(lifecycleStore(nil), nil, nil)
-	expect(t, g.do(http.MethodPost, lifecyclePath("approve"), `{"expected_version":2}`, header("If-Match", `"3"`)), http.StatusBadRequest, "INVALID_REQUEST")
+	expect(t, g.do(http.MethodPost, lifecyclePath("approve"), `{"expected_version":2}`, header("If-Match", `"v3"`)), http.StatusBadRequest, "INVALID_REQUEST")
 	expect(t, g.do(http.MethodPost, lifecyclePath("approve"), "", header("If-Match", "abc")), http.StatusBadRequest, "INVALID_REQUEST")
 }
 
@@ -955,7 +955,7 @@ func TestReads_WarnModeAdmits(t *testing.T) {
 	g := newRig(&stubStore{findVersion: &domain.PolicyVersion{PolicyVersionID: versionID, RowVersion: 2}}, nil, &stubAuthz{err: domain.ErrAuthorizationDenied}, warnReads)
 	w := g.do(http.MethodGet, "/v1/policy-versions/"+versionID, "", noPrincipal)
 	expect(t, w, http.StatusOK, "")
-	if w.Header().Get("ETag") != `"2"` {
+	if w.Header().Get("ETag") != `"v2"` {
 		t.Fatalf("expected ETag, got %q", w.Header().Get("ETag"))
 	}
 }

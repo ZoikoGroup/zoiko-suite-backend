@@ -119,7 +119,7 @@ func insertSessionContextTx(ctx context.Context, tx pgx.Tx, sc domain.SessionCon
 			ingress_binding_version,
 			source_channel_basis, workload_id_basis, ingress_cache_state,
 			entitlement_context_status, auth_session_id)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33)
 		ON CONFLICT (session_context_id) DO NOTHING`,
 		sc.SessionContextID, sc.PrincipalID, sc.TenantID, legalEntityID,
 		sc.CorrelationID, string(sc.TrustPosture), sc.MFAVerified, sc.DeviceTrustScore,
@@ -319,8 +319,9 @@ func (s *PgStore) InsertSupportContextWithEvent(
 				support_context_id, tenant_id, support_principal_id, subject_principal_id,
 				reason_code, justification, ticket_ref, approver_principal_id,
 				granted_at, expires_at, evidence_id, correlation_id,
-				requested_by_principal_id, approval_status, requested_ttl_seconds)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NULLIF($13::text, ''),$14,NULLIF($15::int, 0))`,
+				requested_by_principal_id, approval_status, requested_ttl_seconds,
+				record_version)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NULLIF($13::text, ''),$14,NULLIF($15::int, 0), 1)`,
 			sc.SupportContextID, sc.TenantID, sc.SupportPrincipalID, sc.SubjectPrincipalID,
 			sc.ReasonCode, sc.Justification, sc.TicketRef, sc.ApproverPrincipalID,
 			sc.GrantedAt, sc.ExpiresAt, sc.EvidenceID, sc.CorrelationID,
@@ -412,7 +413,8 @@ func (s *PgStore) RevokeSupportContextWithEvent(
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, `
 			UPDATE support_contexts
-			   SET revoked_at = $1, revocation_reason = $2
+			   SET revoked_at = $1, revocation_reason = $2,
+			       record_version = record_version + 1
 			 WHERE support_context_id = $3
 			   AND tenant_id = $4
 			   AND revoked_at IS NULL`,
@@ -580,7 +582,7 @@ const supportContextColumns = `
 	       reason_code, justification, ticket_ref, approver_principal_id,
 	       granted_at, expires_at, revoked_at, revocation_reason,
 	       reviewed_at, reviewed_by, evidence_id, correlation_id,
-	       COALESCE(requested_by_principal_id, ''), approval_status, approved_at, COALESCE(requested_ttl_seconds, 0)
+	       COALESCE(requested_by_principal_id, ''), approval_status, approved_at, COALESCE(requested_ttl_seconds, 0), record_version
 	  FROM support_contexts`
 
 // rowScanner is satisfied by both pgx.Row and pgx.Rows.
@@ -595,6 +597,7 @@ func scanSupportContext(r rowScanner, sc *domain.SupportContext) error {
 		&sc.GrantedAt, &sc.ExpiresAt, &sc.RevokedAt, &sc.RevocationReason,
 		&sc.ReviewedAt, &sc.ReviewedBy, &sc.EvidenceID, &sc.CorrelationID,
 		&sc.RequestedByPrincipalID, &sc.ApprovalStatus, &sc.ApprovedAt, &sc.RequestedTTLSeconds,
+		&sc.RecordVersion,
 	)
 }
 
@@ -622,7 +625,8 @@ func (s *PgStore) ApproveSupportContextWithEvent(
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, `
 			UPDATE support_contexts
-			   SET approval_status = 'APPROVED', approved_at = $1, granted_at = $1, expires_at = $2
+			   SET approval_status = 'APPROVED', approved_at = $1, granted_at = $1, expires_at = $2,
+			       record_version = record_version + 1
 			 WHERE support_context_id = $3
 			   AND tenant_id = $4
 			   AND approver_principal_id = $5

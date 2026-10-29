@@ -77,6 +77,9 @@ func (s *stubStore) CreateNotification(ctx context.Context, n *domain.Notificati
 		*n = *s.byID[id]
 		return false, nil
 	}
+	if n.RecordVersion == 0 {
+		n.RecordVersion = 1
+	}
 	s.byID[n.NotificationID] = n
 	s.byCorr[key] = n.NotificationID
 	return true, nil
@@ -120,6 +123,7 @@ func (s *stubStore) CompleteDelivery(_ context.Context, id, newStatus, failureRe
 	n.FailureReason = failureReason
 	n.ProviderResponse = providerResponse
 	n.SentAt = sentAt
+	n.RecordVersion++
 	if newStatus == domain.StatusSent {
 		s.emit("notification.sent")
 	} else {
@@ -151,6 +155,7 @@ func (s *stubStore) ScheduleRetry(_ context.Context, id, _, failureReason string
 	n.DeliveryAttempts++
 	n.LastAttemptAt = &attemptedAt
 	n.NextAttemptAt = &nextAttemptAt
+	n.RecordVersion++
 	s.scheduled = append(s.scheduled, scheduledRetry{reason: failureReason, nextAttemptAt: nextAttemptAt})
 	return nil
 }
@@ -166,6 +171,7 @@ func (s *stubStore) MarkOutcomeUnknown(_ context.Context, id, _, reason string, 
 	n.LastAttemptAt = &attemptedAt
 	n.SentAt = &attemptedAt
 	n.UnknownAt = &attemptedAt
+	n.RecordVersion++
 	s.emit("notification.outcome_unknown")
 	return nil
 }
@@ -190,6 +196,7 @@ func (s *stubStore) ResolveDeliveryOutcome(_ context.Context, p domain.ResolveDe
 	n.ResolvedAt = &resolvedAt
 	n.ResolvedByPrincipalID = p.ActorPrincipalID
 	n.ResolutionNote = p.ResolutionNote
+	n.RecordVersion++
 	if p.ResolvedStatus == domain.StatusSent {
 		s.emit("notification.sent")
 	} else {
@@ -205,6 +212,7 @@ func (s *stubStore) MarkRead(_ context.Context, id, recipientPrincipalID string,
 	}
 	if n.ReadAt == nil {
 		n.ReadAt = &readAt
+		n.RecordVersion++
 	}
 	return nil
 }
@@ -228,6 +236,7 @@ func (s *stubStore) CreateTemplate(_ context.Context, p domain.CreateTemplatePar
 		TemplateID: fmt.Sprintf("template-%d", s.templateSeq), TenantID: "tenant-abc",
 		LegalEntityID: p.LegalEntityID, Name: p.Name, BusinessPurpose: p.BusinessPurpose,
 		OwnerPrincipalID: p.OwnerPrincipalID, Status: "ACTIVE", CreatedAt: time.Now().UTC(),
+		RecordVersion: 1,
 	}
 	if p.IntentID != "" {
 		id := p.IntentID
@@ -272,6 +281,7 @@ func (s *stubStore) CreateVersion(_ context.Context, p domain.CreateVersionParam
 		TenantID: "tenant-abc", LegalEntityID: tmpl.LegalEntityID, VersionNumber: s.versionSeq, Locale: p.Locale,
 		Content: p.Content, VariableSchema: p.VariableSchema, Subject: subjectPtr, SubjectVariables: append([]string{}, p.SubjectVariables...), Status: domain.TemplateVersionDraft,
 		CreatedByPrincipalID: p.CreatedByPrincipalID, CreatedAt: time.Now().UTC(),
+		RecordVersion: 1,
 	}
 	s.versions[v.VersionID] = v
 	return v, nil
@@ -299,6 +309,7 @@ func (s *stubStore) ValidateTemplate(_ context.Context, versionID string) (*doma
 	now := time.Now().UTC()
 	v.Status = domain.TemplateVersionReview
 	v.ValidatedAt = &now
+	v.RecordVersion++
 	return v, nil
 }
 
@@ -317,6 +328,7 @@ func (s *stubStore) ApproveTemplate(_ context.Context, p domain.ApproveVersionPa
 	v.Status = domain.TemplateVersionApproved
 	v.ApprovedByPrincipalID = &p.ApprovedByPrincipalID
 	v.ApprovedAt = &now
+	v.RecordVersion++
 	s.emit("template.version_approved")
 	return v, nil
 }
@@ -332,10 +344,12 @@ func (s *stubStore) PublishTemplate(_ context.Context, p domain.PublishVersionPa
 	now := time.Now().UTC()
 	v.Status = domain.TemplateVersionPublished
 	v.PublishedAt = &now
+	v.RecordVersion++
 	for _, other := range s.versions {
 		if other.VersionID != v.VersionID && other.TemplateID == v.TemplateID &&
 			other.Locale == v.Locale && other.Status == domain.TemplateVersionPublished {
 			other.Status = domain.TemplateVersionSuperseded
+			other.RecordVersion++
 			id := v.VersionID
 			other.SupersededByVersionID = &id
 		}
@@ -366,10 +380,12 @@ func (s *stubStore) RetireTemplate(_ context.Context, p domain.RetireTemplatePar
 	d.Status = "RETIRED"
 	d.RetiredAt = &now
 	d.RetiredByPrincipalID = &p.RetiredByPrincipalID
+	d.RecordVersion++
 	for _, v := range s.versions {
 		if v.TemplateID == p.TemplateID && v.Status == domain.TemplateVersionPublished {
 			v.Status = domain.TemplateVersionRetired
 			v.RetiredAt = &now
+			v.RecordVersion++
 		}
 	}
 	s.emit("template.retired")
@@ -565,6 +581,25 @@ func doReq(r chi.Router, method, path string, body any, principalID string) *htt
 	req.Header.Set("Content-Type", "application/json")
 	if principalID != "" {
 		req.Header.Set("X-Principal-Id", principalID)
+	}
+	// Add If-Match header for mutating requests (required by API-3)
+	if method == http.MethodPost || method == http.MethodPatch || method == http.MethodDelete {
+		// Check if this is a mutation of an existing aggregate (not a create)
+		// Create operations don't need If-Match; mutations of existing aggregates do
+		// Mutating paths include:
+		// - /v1/notifications/{id}/cancel
+		// - /v1/notifications/{id}/resend
+		// - /v1/notifications/{id}/resolve-delivery-outcome
+		// - /v1/notifications/{id}/read
+		// - /v1/templates/{templateID} (retire)
+		// - /v1/templates/{templateID}/versions/{versionID} (validate, approve, publish)
+		// Note: POST /v1/templates/{templateID}/versions is a CREATE, not a mutation
+		if strings.Contains(path, "/cancel") || strings.Contains(path, "/resend") ||
+			strings.Contains(path, "/resolve-delivery-outcome") || strings.Contains(path, "/read") ||
+			strings.Contains(path, "/retire") ||
+			(strings.Contains(path, "/versions/") && !strings.HasSuffix(path, "/versions")) {
+			req.Header.Set("If-Match", `"v1"`)
+		}
 	}
 	rr := httptest.NewRecorder()
 	r.ServeHTTP(rr, req)
@@ -1321,6 +1356,7 @@ func seedPendingUnknown(store *stubStore, id, legalEntityID string) *domain.Noti
 		Status: domain.StatusPendingUnknown, CorrelationID: "corr-" + id,
 		CreatedByPrincipalID: "principal-1", CreatedAt: now,
 		FailureReason: "connection dropped at verdict", SentAt: &now, UnknownAt: &now,
+		RecordVersion: 1,
 	}
 	store.byID[id] = n
 	return n
@@ -1355,6 +1391,7 @@ func TestGetDeliveryStatus_Sent_CarriesNoErrorCode(t *testing.T) {
 	store.byID["n1"] = &domain.Notification{
 		NotificationID: "n1", TenantID: "tenant-abc", LegalEntityID: "le-us",
 		RecipientPrincipalID: "principal-2", Channel: "EMAIL", Status: "SENT", SentAt: &now,
+		RecordVersion: 1,
 	}
 	r := newRouter(store, &stubPublisher{}, &stubAuthZ{})
 
@@ -1441,6 +1478,7 @@ func TestResolveDeliveryOutcome_NotPendingUnknown_Returns409(t *testing.T) {
 	store.byID["n1"] = &domain.Notification{
 		NotificationID: "n1", TenantID: "tenant-abc", LegalEntityID: "le-us",
 		RecipientPrincipalID: "principal-2", Channel: "EMAIL", Status: "SENT", SentAt: &now,
+		RecordVersion: 1,
 	}
 	r := newRouter(store, &stubPublisher{}, &stubAuthZ{})
 

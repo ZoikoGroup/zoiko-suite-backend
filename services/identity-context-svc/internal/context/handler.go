@@ -667,7 +667,7 @@ func (h *Handler) GetPrincipal(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusNotFound, "principal not found")
 		return
 	}
-	writeJSON(w, http.StatusOK, p)
+	writeJSONWithETag(w, http.StatusOK, p, p.RecordVersion)
 }
 
 // ── GET /v1/principals/:principalID/roles ────────────────────────────────────
@@ -744,6 +744,16 @@ func (h *Handler) UpdatePrincipalStatus(w http.ResponseWriter, r *http.Request) 
 	principalID := chi.URLParam(r, "principalID")
 	correlationID := r.Header.Get("X-Correlation-ID")
 
+	// Check If-Match for mutations of existing aggregates
+	p, err := h.principals.FindByID(r.Context(), principalID, tenantID)
+	if err != nil || p == nil {
+		writeError(w, r, http.StatusNotFound, "principal not found")
+		return
+	}
+	if !h.requireIfMatch(w, r, p.RecordVersion) {
+		return
+	}
+
 	if !h.authorize(w, r, callerPrincipalID, tenantID, IdentityPrincipalStatus) {
 		return
 	}
@@ -784,6 +794,17 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(body)
+}
+
+// writeJSONWithETag writes a JSON response with an ETag header.
+func writeJSONWithETag(w http.ResponseWriter, status int, body any, version int64) {
+	apicontract.WriteETag(w, version)
+	writeJSON(w, status, body)
+}
+
+// requireIfMatch checks the If-Match header and returns false if the request should be rejected.
+func (h *Handler) requireIfMatch(w http.ResponseWriter, r *http.Request, currentVersion int64) bool {
+	return apicontract.CheckIfMatch(w, r, currentVersion)
 }
 
 func writeError(w http.ResponseWriter, r *http.Request, status int, msg string) {

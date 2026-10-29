@@ -276,7 +276,11 @@ func (h *Handler) ListDelegations(w http.ResponseWriter, r *http.Request) {
 		if list == nil {
 			list = []domain.DelegationGrant{}
 		}
-		writeJSON(w, http.StatusOK, list)
+		var etag int64
+		if len(list) > 0 {
+			etag = list[0].Version
+		}
+		writeJSONWithETag(w, http.StatusOK, list, etag)
 		return
 	}
 
@@ -288,7 +292,12 @@ func (h *Handler) ListDelegations(w http.ResponseWriter, r *http.Request) {
 	if list == nil {
 		list = []domain.DelegationGrant{}
 	}
-	writeJSON(w, http.StatusOK, list)
+	// For list endpoint, use a weak ETag based on first item's version and count
+	var etag int64
+	if len(list) > 0 {
+		etag = list[0].Version
+	}
+	writeJSONWithETag(w, http.StatusOK, list, etag)
 }
 
 // ── GET /v1/delegations/{delegation_id} ───────────────────────────────────────
@@ -318,7 +327,7 @@ func (h *Handler) GetDelegation(w http.ResponseWriter, r *http.Request) {
 	// delegation ids were real.
 	if principalID == d.DelegatorPrincipalID || principalID == d.DelegatePrincipalID || principalID == d.CreatedByPrincipalID {
 		h.countRead(telemetry.ReadScopeSelf)
-		writeJSON(w, http.StatusOK, d)
+		writeJSONWithETag(w, http.StatusOK, d, d.Version)
 		return
 	}
 	if err := h.checkAllowed(r.Context(), principalID, d.LegalEntityID, actionDelegationView); err != nil {
@@ -330,7 +339,7 @@ func (h *Handler) GetDelegation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.countRead(telemetry.ReadScopeEntity)
-	writeJSON(w, http.StatusOK, d)
+	writeJSONWithETag(w, http.StatusOK, d, d.Version)
 }
 
 func (h *Handler) countRevokeStoreErr(err error) {
@@ -391,10 +400,10 @@ func (h *Handler) ExplainDelegationChain(w http.ResponseWriter, r *http.Request)
 	if chain == nil {
 		chain = []domain.DelegationChainStep{}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	writeJSONWithETag(w, http.StatusOK, map[string]any{
 		"chain": chain,
 		"found": len(chain) > 0,
-	})
+	}, 0)
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -553,4 +562,15 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// writeJSONWithETag writes a JSON response with an ETag header.
+func writeJSONWithETag(w http.ResponseWriter, status int, body any, version int64) {
+	apicontract.WriteETag(w, version)
+	writeJSON(w, status, body)
+}
+
+// requireIfMatch checks the If-Match header and returns false if the request should be rejected.
+func (h *Handler) requireIfMatch(w http.ResponseWriter, r *http.Request, currentVersion int64) bool {
+	return apicontract.CheckIfMatch(w, r, currentVersion)
 }

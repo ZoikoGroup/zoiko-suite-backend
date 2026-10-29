@@ -117,7 +117,7 @@ func (s *stubStore) ListRoles(_ context.Context, filter domain.ListFilter) ([]do
 	return out, nil
 }
 
-func (s *stubStore) UpdateRole(_ context.Context, roleDefinitionID, roleName, status, updatedByPrincipalID string) (*domain.RoleDefinition, error) {
+func (s *stubStore) UpdateRole(_ context.Context, roleDefinitionID, roleName, status, updatedByPrincipalID string, expectedVersion int64) (*domain.RoleDefinition, error) {
 	r, ok := s.rolesByID[roleDefinitionID]
 	if !ok {
 		return nil, domain.ErrRoleNotFound
@@ -125,7 +125,7 @@ func (s *stubStore) UpdateRole(_ context.Context, roleDefinitionID, roleName, st
 	if roleName != "" {
 		r.RoleName = roleName
 	}
-	if status != "" {
+if status != "" {
 		r.Status = domain.RoleStatus(status)
 	}
 	r.UpdatedByPrincipalID = updatedByPrincipalID
@@ -175,7 +175,7 @@ func (s *stubStore) GetBundle(_ context.Context, roleDefinitionID, bundleID stri
 	return &cp, nil
 }
 
-func (s *stubStore) UpdateBundle(_ context.Context, roleDefinitionID, bundleID string, permittedActions []string, activeFlag *bool, updatedByPrincipalID string) (*domain.PermissionBundleDef, error) {
+func (s *stubStore) UpdateBundle(_ context.Context, roleDefinitionID, bundleID string, permittedActions []string, activeFlag *bool, updatedByPrincipalID string, expectedVersion int64) (*domain.PermissionBundleDef, error) {
 	b, ok := s.bundlesByID[bundleID]
 	if !ok || b.RoleDefinitionID != roleDefinitionID {
 		return nil, domain.ErrBundleNotFound
@@ -372,6 +372,10 @@ func doReq(r chi.Router, method, path string, body any, principalID string) *htt
 	req.Header.Set("Content-Type", "application/json")
 	if principalID != "" {
 		req.Header.Set("X-Principal-Id", principalID)
+	}
+	// Add If-Match header for mutating requests (required by API-3)
+	if method == http.MethodPatch || method == http.MethodPost || method == http.MethodDelete {
+		req.Header.Set("If-Match", `"v1"`)
 	}
 	rr := httptest.NewRecorder()
 	r.ServeHTTP(rr, req)

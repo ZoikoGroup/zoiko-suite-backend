@@ -102,7 +102,7 @@ func TestListFailedRestrictions_TenantScopedUnderRLS(t *testing.T) {
 		if i == 2 {
 			state = domain.PropagationVerified
 		}
-		require.NoError(t, s.MarkTombstoneState(ctx, tenant, "doc", tomb.SourceID, tomb.SourceEventID, state, ""))
+		require.NoError(t, s.MarkTombstoneState(ctx, tenant, "doc", tomb.SourceID, tomb.SourceEventID, state, "", 0))
 	}
 
 	pool := nonSuperuserPool(t, s)
@@ -232,7 +232,7 @@ func TestGeneration_BackfillStateAndEvaluations(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, domain.BackfillState(""), got.BackfillState)
 
-	require.NoError(t, s.SetBackfillState(ctx, g.GenerationID, domain.BackfillComplete, "replayed=3 written=3"))
+	require.NoError(t, s.SetBackfillState(ctx, g.GenerationID, domain.BackfillComplete, "replayed=3 written=3", 0))
 	got, err = s.GetGeneration(ctx, g.GenerationID)
 	require.NoError(t, err)
 	assert.Equal(t, domain.BackfillComplete, got.BackfillState)

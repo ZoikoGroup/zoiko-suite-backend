@@ -343,6 +343,8 @@ type IndexContract struct {
 	CreatedAt            time.Time      `json:"created_at"`
 	PublishedAt          *time.Time     `json:"published_at,omitempty"`
 	CreatedByPrincipalID string         `json:"created_by_principal_id"`
+	// RecordVersion is the optimistic-concurrency token (migration 000005).
+	RecordVersion int64 `json:"record_version"`
 }
 
 // EmbeddingSpec is §10.1's first control: "embedding model/version and
@@ -437,6 +439,8 @@ type IndexGeneration struct {
 	// created before backfill existed. READY requires COMPLETE.
 	BackfillState BackfillState `json:"backfill_state,omitempty"`
 	BackfillNote  string        `json:"backfill_note,omitempty"`
+	// RecordVersion is the optimistic-concurrency token (migration 000005).
+	RecordVersion int64 `json:"record_version"`
 }
 
 // BackfillState is a generation's source-replay progress.
@@ -468,18 +472,25 @@ type IndexCheckpoint struct {
 // events arrive out of order → monotonic epoch/version prevents visibility
 // resurrection."
 type RestrictionTombstone struct {
-	TenantID      string           `json:"tenant_id"`
-	SourceType    string           `json:"source_type"`
-	SourceID      string           `json:"source_id"`
-	ScopeName     string           `json:"scope_name"`
-	Reason        string           `json:"reason"`
-	Epoch         int64            `json:"epoch"`
+	TombstoneID  string           `json:"tombstone_id"`
+	TenantID     string           `json:"tenant_id"`
+	ScopeName    string           `json:"scope_name"`
+	SourceType   string           `json:"source_type"`
+	SourceID     string           `json:"source_id"`
+	Reason       string           `json:"reason"`
+	Epoch        int64            `json:"epoch"`
 	SourceEventID string           `json:"source_event_id"`
-	EffectiveAt   time.Time        `json:"effective_at"`
+	EffectiveAt  time.Time        `json:"effective_at"`
 	PropagatedAt  *time.Time       `json:"propagated_at,omitempty"`
+	// VerifiedAt is separate from PropagatedAt because §2.2 says APPLIED is
+	// not VERIFIED until search visibility has been tested. TC-08: "every
+	// restriction verification records when invisibility was proven."
 	VerifiedAt    *time.Time       `json:"verified_at,omitempty"`
 	State         PropagationState `json:"state"`
 	FailureReason string           `json:"failure_reason,omitempty"`
+	CreatedAt     time.Time        `json:"created_at"`
+	// RecordVersion is the optimistic-concurrency token (migration 000005).
+	RecordVersion int64 `json:"record_version"`
 }
 
 // SearchEvidence is replay/audit evidence for one executed search (§2.1, TC-10).
@@ -561,4 +572,8 @@ var (
 	// ESR-010 rather than reporting a hydration fault, because nothing is
 	// broken — the record is simply not there to show.
 	ErrSourceGone = errors.New("source record no longer exists")
+
+	// ErrVersionConflict is returned when an If-Match header specifies a record_version
+	// that no longer matches the current aggregate version.
+	ErrVersionConflict = errors.New("version conflict: the object has been modified since the expected version")
 )

@@ -312,6 +312,10 @@ var ErrParentNotFound = errorString("parent jurisdiction not found")
 // this, so it is enforced in the store.
 var ErrCyclicHierarchy = errorString("parent assignment would create a cycle in the jurisdiction hierarchy")
 
+// ErrVersionConflict is returned when an If-Match header specifies a row_version
+// that no longer matches the current aggregate version.
+var ErrVersionConflict = errorString("version conflict: the object has been modified since the expected version")
+
 // ErrOverlappingRule is returned when a new rule's effective period overlaps
 // an existing non-retired rule with the same (jurisdiction_id, rule_domain,
 // rule_code). Two rules matching the same point-in-time query make "the

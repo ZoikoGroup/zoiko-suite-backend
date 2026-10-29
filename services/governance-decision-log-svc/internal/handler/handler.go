@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"reflect"
@@ -731,7 +732,9 @@ func (h *Handler) GetDecision(w http.ResponseWriter, r *http.Request) {
 	if !h.authorizeReadOf(w, r, principalID, d.LegalEntityID) {
 		return
 	}
-	writeJSON(w, http.StatusOK, d)
+	// GovernanceDecision is immutable; ETag based on stored_at for cache validation.
+	etag := fmt.Sprintf(`"%s-%s"`, d.DecisionID, d.RecordedAt.UTC().Format(time.RFC3339Nano))
+	writeJSONWithETag(w, http.StatusOK, d, etag)
 }
 
 // ── POST /v1/decisions/{decision_id}/replay ─────────────────────────────────
@@ -1005,7 +1008,14 @@ func (h *Handler) ListReplayManifests(w http.ResponseWriter, r *http.Request) {
 	if results == nil {
 		results = []*domain.ReplayManifest{}
 	}
-	writeJSON(w, http.StatusOK, results)
+	// ReplayManifest list: ETag based on count and first item's replayed_at.
+	var etag string
+	if len(results) > 0 {
+		etag = fmt.Sprintf(`"replay-list-%d-%s"`, len(results), results[0].ReplayedAt.UTC().Format(time.RFC3339Nano))
+	} else {
+		etag = `"replay-list-0"`
+	}
+	writeJSONWithETag(w, http.StatusOK, results, etag)
 }
 
 // ListDecisions handles GET /v1/decisions.
@@ -1108,7 +1118,14 @@ func (h *Handler) ListDecisions(w http.ResponseWriter, r *http.Request) {
 	if results == nil {
 		results = []*domain.GovernanceDecision{}
 	}
-	writeJSON(w, http.StatusOK, results)
+	// List endpoint: ETag based on count and last item's stored_at for cache validation.
+	var etag string
+	if len(results) > 0 {
+		etag = fmt.Sprintf(`"list-%d-%s"`, len(results), results[0].RecordedAt.UTC().Format(time.RFC3339Nano))
+	} else {
+		etag = `"list-0"`
+	}
+	writeJSONWithETag(w, http.StatusOK, results, etag)
 }
 
 // writeJSON serialises v as JSON and writes it to w with the given status code.
@@ -1116,6 +1133,12 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// writeJSONWithETag writes a JSON response with an ETag header.
+func writeJSONWithETag(w http.ResponseWriter, status int, v any, version string) {
+	w.Header().Set("ETag", version)
+	writeJSON(w, status, v)
 }
 
 

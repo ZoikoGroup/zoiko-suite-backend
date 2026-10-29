@@ -64,6 +64,12 @@ func (h *Handler) ResendNotification(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
+
+	// Check If-Match for optimistic concurrency (API-3).
+	if !h.requireIfMatch(w, r, existing.RecordVersion) {
+		return
+	}
+
 	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionSend); err != nil {
 		h.writeAuthzErr(w, r, err)
 		return

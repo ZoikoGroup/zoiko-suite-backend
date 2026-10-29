@@ -184,7 +184,7 @@ func (h *Handler) CreateDelegation(w http.ResponseWriter, r *http.Request) {
 	// different facts.
 	if !created {
 		h.countGrant(telemetry.GrantReplayed)
-		writeJSON(w, http.StatusOK, d)
+		writeJSONWithETag(w, http.StatusOK, d, d.Version)
 		return
 	}
 	if d.Status == domain.DelegationStatusProposed {
@@ -192,7 +192,7 @@ func (h *Handler) CreateDelegation(w http.ResponseWriter, r *http.Request) {
 	} else {
 		h.countGrant(telemetry.GrantCreated)
 	}
-	writeJSON(w, http.StatusCreated, d)
+	writeJSONWithETag(w, http.StatusCreated, d, d.Version)
 }
 
 // grantFacts is what the "does not exceed the delegator" checks need.
@@ -324,7 +324,7 @@ func (h *Handler) apply(w http.ResponseWriter, r *http.Request, d *domain.Delega
 		h.writeStoreErr(w, r, err)
 		return false
 	}
-	writeJSON(w, http.StatusOK, updated)
+	writeJSONWithETag(w, http.StatusOK, updated, updated.Version)
 	return true
 }
 
@@ -482,7 +482,7 @@ func (h *Handler) RevokeDelegation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.countRevoke(telemetry.RevokeRevoked)
-	writeJSON(w, http.StatusOK, updated)
+	writeJSONWithETag(w, http.StatusOK, updated, updated.Version)
 }
 
 // ExtendDelegation moves an ACTIVE grant's effective_to later (ORG-06

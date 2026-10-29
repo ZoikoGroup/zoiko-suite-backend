@@ -23,6 +23,8 @@ type Principal struct {
 	Status                  PrincipalStatus `json:"status"`
 	CreatedAt               time.Time       `json:"created_at"`
 	DataClassification      string          `json:"data_classification"`
+	// RecordVersion is the optimistic-concurrency token (migration 000016).
+	RecordVersion int64 `json:"record_version"`
 }
 
 // ---------------------------------------------------------------------------
@@ -197,6 +199,8 @@ type SessionContext struct {
 	// rather than a policy evaluation per row.
 	DispositionDueAt *time.Time `json:"disposition_due_at,omitempty"`
 	DisposedAt       *time.Time `json:"disposed_at,omitempty"`
+	// RecordVersion is the optimistic-concurrency token (migration 000016).
+	RecordVersion int64 `json:"record_version"`
 }
 
 // ---------------------------------------------------------------------------

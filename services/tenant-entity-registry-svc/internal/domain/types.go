@@ -197,6 +197,8 @@ type DataResidencyPolicy struct {
 	UpdatedAt            time.Time `json:"updated_at"`
 	CreatedByPrincipalID string    `json:"created_by_principal_id"`
 	UpdatedByPrincipalID string    `json:"updated_by_principal_id"`
+	// RecordVersion is the optimistic-concurrency token (migration 000014).
+	RecordVersion int64 `json:"record_version"`
 }
 
 // ---------------------------------------------------------------------------
@@ -240,6 +242,8 @@ type TaxIdentityBundle struct {
 	CreatedByPrincipalID string                  `json:"created_by_principal_id"`
 	UpdatedByPrincipalID string                  `json:"updated_by_principal_id"`
 	DataClassification   string                  `json:"data_classification"`
+	// RecordVersion is the optimistic-concurrency token (migration 000014).
+	RecordVersion int64 `json:"record_version"`
 }
 
 // ---------------------------------------------------------------------------

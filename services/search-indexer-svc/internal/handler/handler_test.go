@@ -122,7 +122,7 @@ func (f *fakeStore) GetContract(_ context.Context, id string) (*domain.IndexCont
 	}
 	return f.contract, nil
 }
-func (f *fakeStore) TransitionContract(context.Context, string, domain.ContractState, domain.ContractState) error {
+func (f *fakeStore) TransitionContract(context.Context, string, domain.ContractState, domain.ContractState, int64) error {
 	return nil
 }
 func (f *fakeStore) NextContractVersion(context.Context, string) (int, error)       { return 1, nil }
@@ -142,7 +142,7 @@ func (f *fakeStore) ListGenerations(context.Context, string) ([]domain.IndexGene
 	}
 	return []domain.IndexGeneration{*f.generation}, nil
 }
-func (f *fakeStore) TransitionGeneration(context.Context, string, domain.GenerationState, domain.GenerationState, string, string) error {
+func (f *fakeStore) TransitionGeneration(context.Context, string, domain.GenerationState, domain.GenerationState, string, string, int64) error {
 	return nil
 }
 func (f *fakeStore) UpsertCheckpoint(context.Context, domain.IndexCheckpoint) error { return nil }
@@ -208,7 +208,7 @@ func (f *fakeStore) UpsertProjectionRecord(_ context.Context, r domain.Projectio
 func (f *fakeStore) CountProjections(context.Context, string) (int64, int64, error) {
 	return 42, 0, nil
 }
-func (f *fakeStore) MarkTombstoneState(context.Context, string, string, string, string, domain.PropagationState, string) error {
+func (f *fakeStore) MarkTombstoneState(context.Context, string, string, string, string, domain.PropagationState, string, int64) error {
 	return nil
 }
 func (f *fakeStore) ListPendingVerification(context.Context, int) ([]domain.RestrictionTombstone, error) {
@@ -225,7 +225,7 @@ func (f *fakeStore) ListEvidence(context.Context, string, string, int) ([]domain
 	return f.evidence, nil
 }
 func (f *fakeStore) Ping(context.Context) error { return nil }
-func (f *fakeStore) SetBackfillState(_ context.Context, id string, st domain.BackfillState, note string) error {
+func (f *fakeStore) SetBackfillState(_ context.Context, id string, st domain.BackfillState, note string, _ int64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.backfillStates == nil {

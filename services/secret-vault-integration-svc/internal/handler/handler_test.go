@@ -338,12 +338,13 @@ func TestCreateSecretPolicyVersion_PolicyNotFound(t *testing.T) {
 
 func TestActivateVersion_Success(t *testing.T) {
 	s := &stubStore{
-		findVersionResult: &domain.SecretPolicyVersion{SecretPolicyVersionID: "22222222-0000-4000-8000-000000000001", SecretPolicyID: "11111111-0000-4000-8000-000000000001", VersionStatus: "DRAFT"},
-		activated:         &domain.SecretPolicyVersion{SecretPolicyVersionID: "22222222-0000-4000-8000-000000000001", SecretPolicyID: "11111111-0000-4000-8000-000000000001", VersionStatus: "ACTIVE"},
+		findVersionResult: &domain.SecretPolicyVersion{SecretPolicyVersionID: "22222222-0000-4000-8000-000000000001", SecretPolicyID: "11111111-0000-4000-8000-000000000001", VersionStatus: "DRAFT", RecordVersion: 1},
+		activated:         &domain.SecretPolicyVersion{SecretPolicyVersionID: "22222222-0000-4000-8000-000000000001", SecretPolicyID: "11111111-0000-4000-8000-000000000001", VersionStatus: "ACTIVE", RecordVersion: 2},
 	}
 	r := defaultRouter(s)
 	body := `{"activated_by_principal_id":"admin-1"}`
 	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secret-policies/11111111-0000-4000-8000-000000000001/versions/22222222-0000-4000-8000-000000000001/activate", strings.NewReader(body)))
+	req.Header.Set("If-Match", `"v1"`)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
@@ -354,6 +355,7 @@ func TestActivateVersion_Success(t *testing.T) {
 func TestActivateVersion_MissingActor(t *testing.T) {
 	r := defaultRouter(&stubStore{})
 	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secret-policies/11111111-0000-4000-8000-000000000001/versions/22222222-0000-4000-8000-000000000001/activate", strings.NewReader(`{}`)))
+	req.Header.Set("If-Match", `"v1"`)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusBadRequest {
@@ -362,10 +364,11 @@ func TestActivateVersion_MissingActor(t *testing.T) {
 }
 
 func TestActivateVersion_PolicyMismatch(t *testing.T) {
-	s := &stubStore{findVersionResult: &domain.SecretPolicyVersion{SecretPolicyVersionID: "22222222-0000-4000-8000-000000000001", SecretPolicyID: "OTHER"}}
+	s := &stubStore{findVersionResult: &domain.SecretPolicyVersion{SecretPolicyVersionID: "22222222-0000-4000-8000-000000000001", SecretPolicyID: "OTHER", RecordVersion: 1}}
 	r := defaultRouter(s)
 	body := `{"activated_by_principal_id":"admin-1"}`
 	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secret-policies/11111111-0000-4000-8000-000000000001/versions/22222222-0000-4000-8000-000000000001/activate", strings.NewReader(body)))
+	req.Header.Set("If-Match", `"v1"`)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusNotFound {
@@ -695,12 +698,13 @@ func TestRevokeLease_Success(t *testing.T) {
 	s := &stubStore{
 		// The revoke path reads the lease first, so the scope can be checked
 		// before a transition that cannot be undone.
-		findLeaseResult:         &domain.SecretLease{LeaseID: "33333333-0000-4000-8000-000000000001", Status: "ACTIVE"},
-		revokeLeaseResult:       &domain.SecretLease{LeaseID: "33333333-0000-4000-8000-000000000001", Status: "REVOKED"},
+		findLeaseResult:         &domain.SecretLease{LeaseID: "33333333-0000-4000-8000-000000000001", Status: "ACTIVE", RecordVersion: 1},
+		revokeLeaseResult:       &domain.SecretLease{LeaseID: "33333333-0000-4000-8000-000000000001", Status: "REVOKED", RecordVersion: 2},
 		revokeLeaseTransitioned: true,
 	}
 	r := defaultRouter(s)
 	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secrets/leases/33333333-0000-4000-8000-000000000001/revoke", nil))
+	req.Header.Set("If-Match", `"v1"`)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
@@ -729,16 +733,19 @@ func TestRevokeLease_RecordsTheRevokerNotTheLeaseHolder(t *testing.T) {
 			LeaseID:                "33333333-0000-4000-8000-000000000001",
 			Status:                 "ACTIVE",
 			RequestedByPrincipalID: holder,
+			RecordVersion:          1,
 		},
 		revokeLeaseResult: &domain.SecretLease{
 			LeaseID:                "33333333-0000-4000-8000-000000000001",
 			Status:                 "REVOKED",
 			RequestedByPrincipalID: holder,
+			RecordVersion:          2,
 		},
 		revokeLeaseTransitioned: true,
 	}
 	r := defaultRouter(s)
 	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secrets/leases/33333333-0000-4000-8000-000000000001/revoke", nil))
+	req.Header.Set("If-Match", `"v1"`)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
@@ -863,11 +870,12 @@ func assertEveryEntryNamesAnActor(t *testing.T, entries []domain.RecordAuditEntr
 
 func TestRevokeLease_InvalidTransition(t *testing.T) {
 	s := &stubStore{
-		findLeaseResult: &domain.SecretLease{LeaseID: "33333333-0000-4000-8000-000000000001", Status: "REVOKED"},
+		findLeaseResult: &domain.SecretLease{LeaseID: "33333333-0000-4000-8000-000000000001", Status: "REVOKED", RecordVersion: 1},
 		revokeLeaseErr:  domain.ErrInvalidTransition,
 	}
 	r := defaultRouter(s)
 	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secrets/leases/33333333-0000-4000-8000-000000000001/revoke", nil))
+	req.Header.Set("If-Match", `"v1"`)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusConflict {
@@ -1244,12 +1252,13 @@ func TestGetLease_AnotherTenantsLease_NotFound(t *testing.T) {
 func TestRevokeLease_AnotherTenantsLease_NotFoundAndNotRevoked(t *testing.T) {
 	other := otherTenant
 	s := &stubStore{
-		findLeaseResult:         &domain.SecretLease{LeaseID: "33333333-0000-4000-8000-000000000001", TenantID: &other, Status: "GRANTED"},
-		revokeLeaseResult:       &domain.SecretLease{LeaseID: "33333333-0000-4000-8000-000000000001", Status: "REVOKED"},
+		findLeaseResult:         &domain.SecretLease{LeaseID: "33333333-0000-4000-8000-000000000001", TenantID: &other, Status: "GRANTED", RecordVersion: 1},
+		revokeLeaseResult:       &domain.SecretLease{LeaseID: "33333333-0000-4000-8000-000000000001", Status: "REVOKED", RecordVersion: 2},
 		revokeLeaseTransitioned: true,
 	}
 	r := defaultRouter(s)
 	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secrets/leases/33333333-0000-4000-8000-000000000001/revoke", nil))
+	req.Header.Set("If-Match", `"v1"`)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusNotFound {
@@ -1440,7 +1449,7 @@ func TestBroker_Replay_TokenBoundToOriginalLeaseExpiry(t *testing.T) {
 
 func TestCreateSharedSecretException_Created(t *testing.T) {
 	s := &stubStore{
-		exceptionResult:  &domain.SharedSecretException{ExceptionID: "44444444-0000-4000-8000-000000000001", SecretPath: "kv/db", Status: "ACTIVE"},
+		exceptionResult:  &domain.SharedSecretException{ExceptionID: "44444444-0000-4000-8000-000000000001", SecretPath: "kv/db", Status: "ACTIVE", RecordVersion: 1},
 		exceptionCreated: true,
 	}
 	r := defaultRouter(s)
@@ -1491,11 +1500,13 @@ func TestListSharedSecretExceptions(t *testing.T) {
 
 func TestRevokeSharedSecretException(t *testing.T) {
 	s := &stubStore{
-		revokeExceptionResult:       &domain.SharedSecretException{ExceptionID: "44444444-0000-4000-8000-000000000001", SecretPath: "kv/db", Status: "REVOKED"},
+		exceptionResult:             &domain.SharedSecretException{ExceptionID: "44444444-0000-4000-8000-000000000001", SecretPath: "kv/db", Status: "ACTIVE", RecordVersion: 1},
+		revokeExceptionResult:       &domain.SharedSecretException{ExceptionID: "44444444-0000-4000-8000-000000000001", SecretPath: "kv/db", Status: "REVOKED", RecordVersion: 2},
 		revokeExceptionTransitioned: true,
 	}
 	r := defaultRouter(s)
 	req := authed(httptest.NewRequest(http.MethodPost, "/v1/shared-secret-exceptions/44444444-0000-4000-8000-000000000001/revoke", nil))
+	req.Header.Set("If-Match", `"v1"`)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {

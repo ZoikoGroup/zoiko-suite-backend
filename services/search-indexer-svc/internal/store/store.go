@@ -44,7 +44,7 @@ type Store interface {
 	GetContract(ctx context.Context, contractID string) (*domain.IndexContract, error)
 	GetPublishedContract(ctx context.Context, scopeName string) (*domain.IndexContract, error)
 	ListContracts(ctx context.Context, scopeName string) ([]domain.IndexContract, error)
-	TransitionContract(ctx context.Context, contractID string, from, to domain.ContractState) error
+	TransitionContract(ctx context.Context, contractID string, from, to domain.ContractState, expectedVersion int64) error
 	NextContractVersion(ctx context.Context, scopeName string) (int, error)
 
 	// ── ESR-05 ───────────────────────────────────────────────────────────
@@ -52,8 +52,8 @@ type Store interface {
 	GetGeneration(ctx context.Context, generationID string) (*domain.IndexGeneration, error)
 	ListGenerations(ctx context.Context, scopeName string) ([]domain.IndexGeneration, error)
 	GetActiveGeneration(ctx context.Context, scopeName string) (*domain.IndexGeneration, error)
-	TransitionGeneration(ctx context.Context, generationID string, from, to domain.GenerationState, digest, note string) error
-	SetBackfillState(ctx context.Context, generationID string, state domain.BackfillState, note string) error
+	TransitionGeneration(ctx context.Context, generationID string, from, to domain.GenerationState, digest, note string, expectedVersion int64) error
+	SetBackfillState(ctx context.Context, generationID string, state domain.BackfillState, note string, expectedVersion int64) error
 
 	UpsertCheckpoint(ctx context.Context, cp domain.IndexCheckpoint) error
 	ListCheckpoints(ctx context.Context, scopeName string) ([]domain.IndexCheckpoint, error)
@@ -65,7 +65,7 @@ type Store interface {
 	CountProjections(ctx context.Context, scopeName string) (live int64, tombstoned int64, err error)
 
 	UpsertTombstone(ctx context.Context, t domain.RestrictionTombstone, tombstoneID string) (applied bool, err error)
-	MarkTombstoneState(ctx context.Context, tenantID, sourceType, sourceID, sourceEventID string, state domain.PropagationState, reason string) error
+	MarkTombstoneState(ctx context.Context, tenantID, sourceType, sourceID, sourceEventID string, state domain.PropagationState, reason string, expectedVersion int64) error
 	ListPendingVerification(ctx context.Context, limit int) ([]domain.RestrictionTombstone, error)
 	ListTombstones(ctx context.Context, tenantID, scopeName string, limit int) ([]domain.RestrictionTombstone, error)
 	ListFailedRestrictions(ctx context.Context, tenantID, scopeName string, limit int) ([]string, error)
@@ -316,7 +316,8 @@ const contractColumns = `contract_id, source_id, scope_name, version, schema_dig
 	publication_state, freshness_class, retrieval_class, analyzer_profile, authz_action,
 	created_at, published_at, created_by_principal_id,
 	embedding_model, embedding_model_version, embedding_dimensions,
-	embedding_source_fields, embedding_preprocessing, embedding_similarity`
+	embedding_source_fields, embedding_preprocessing, embedding_similarity,
+	record_version`
 
 // embeddingCols is the nullable column group behind domain.EmbeddingSpec.
 // All NULL for a lexical contract, all set for a semantic one — the
@@ -365,7 +366,8 @@ func scanContract(row pgx.Row) (*domain.IndexContract, error) {
 	err := row.Scan(&c.ContractID, &c.SourceID, &c.ScopeName, &c.Version, &c.SchemaDigest,
 		&state, &c.FreshnessClass, &retrieval, &c.AnalyzerProfile, &c.AuthzAction,
 		&c.CreatedAt, &c.PublishedAt, &c.CreatedByPrincipalID,
-		&emb.model, &emb.version, &emb.dimensions, &emb.fields, &emb.preprocessing, &emb.similarity)
+		&emb.model, &emb.version, &emb.dimensions, &emb.fields, &emb.preprocessing, &emb.similarity,
+		&c.RecordVersion)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, domain.ErrNotFound
 	}
@@ -485,7 +487,7 @@ func (s *PgStore) ListContracts(ctx context.Context, scopeName string) ([]domain
 // Two concurrent publishes would otherwise both read DRAFT, both find the
 // transition legal, and both write — the compare-and-set makes the second one
 // affect zero rows and report a conflict.
-func (s *PgStore) TransitionContract(ctx context.Context, contractID string, from, to domain.ContractState) error {
+func (s *PgStore) TransitionContract(ctx context.Context, contractID string, from, to domain.ContractState, expectedVersion int64) error {
 	return s.withPool(ctx, func(tx pgx.Tx) error {
 		publishedAt := "published_at"
 		if to == domain.ContractPublished {
@@ -499,18 +501,27 @@ func (s *PgStore) TransitionContract(ctx context.Context, contractID string, fro
 			// ITS OWN contract, so v1's generation keeps answering until a v2
 			// generation is certified and activated (§8.1, §10.1).
 			if _, err := tx.Exec(ctx, `
-				UPDATE index_contracts SET publication_state = 'RETIRED'
+				UPDATE index_contracts SET publication_state = 'RETIRED', record_version = record_version + 1
 				WHERE publication_state = 'PUBLISHED'
 				  AND scope_name = (SELECT scope_name FROM index_contracts WHERE contract_id = $1)
 				  AND contract_id <> $1`, contractID); err != nil {
 				return err
 			}
 		}
-		tag, err := tx.Exec(ctx, `
+		query := `
 			UPDATE index_contracts
-			SET publication_state = $1, published_at = `+publishedAt+`
-			WHERE contract_id = $2 AND publication_state = $3`,
-			string(to), contractID, string(from))
+			SET publication_state = $1, published_at = `+publishedAt+`, record_version = record_version + 1
+			WHERE contract_id = $2 AND publication_state = $3`
+		if expectedVersion > 0 {
+			query += " AND record_version = $4"
+		}
+		var tag pgconn.CommandTag
+		var err error
+		if expectedVersion > 0 {
+			tag, err = tx.Exec(ctx, query, string(to), contractID, string(from), expectedVersion)
+		} else {
+			tag, err = tx.Exec(ctx, query, string(to), contractID, string(from))
+		}
 		if isUniqueViolation(err) {
 			return fmt.Errorf("%w: another version of this scope is already PUBLISHED", domain.ErrConflict)
 		}
@@ -518,6 +529,9 @@ func (s *PgStore) TransitionContract(ctx context.Context, contractID string, fro
 			return err
 		}
 		if tag.RowsAffected() == 0 {
+			if expectedVersion > 0 {
+				return domain.ErrVersionConflict
+			}
 			return fmt.Errorf("%w: contract is not in state %s", domain.ErrConflict, from)
 		}
 		return nil
@@ -554,7 +568,8 @@ func (s *PgStore) CreateGeneration(ctx context.Context, g domain.IndexGeneration
 
 const generationColumns = `generation_id, contract_id, contract_version, scope_name, physical_index,
 	state, build_from, validation_digest, validation_note, activated_at, retired_at,
-	created_at, created_by_principal_id, backfill_state, backfill_note`
+	created_at, created_by_principal_id, backfill_state, backfill_note,
+	record_version`
 
 func scanGeneration(row pgx.Row) (*domain.IndexGeneration, error) {
 	var g domain.IndexGeneration
@@ -562,7 +577,8 @@ func scanGeneration(row pgx.Row) (*domain.IndexGeneration, error) {
 	var backfill *string
 	err := row.Scan(&g.GenerationID, &g.ContractID, &g.ContractVersion, &g.ScopeName, &g.PhysicalIndex,
 		&state, &g.BuildFrom, &g.ValidationDigest, &g.ValidationNote, &g.ActivatedAt, &g.RetiredAt,
-		&g.CreatedAt, &g.CreatedByPrincipalID, &backfill, &g.BackfillNote)
+		&g.CreatedAt, &g.CreatedByPrincipalID, &backfill, &g.BackfillNote,
+		&g.RecordVersion)
 	if backfill != nil {
 		g.BackfillState = domain.BackfillState(*backfill)
 	}
@@ -630,7 +646,7 @@ func (s *PgStore) ListGenerations(ctx context.Context, scopeName string) ([]doma
 // concurrent activations of different generations cannot both succeed even if
 // both pass the CAS — the second gets a unique violation, reported as a
 // conflict rather than as a 500.
-func (s *PgStore) TransitionGeneration(ctx context.Context, generationID string, from, to domain.GenerationState, digest, note string) error {
+func (s *PgStore) TransitionGeneration(ctx context.Context, generationID string, from, to domain.GenerationState, digest, note string, expectedVersion int64) error {
 	return s.withPool(ctx, func(tx pgx.Tx) error {
 		var timestampSet string
 		switch to {
@@ -639,14 +655,24 @@ func (s *PgStore) TransitionGeneration(ctx context.Context, generationID string,
 		case domain.GenerationRetired:
 			timestampSet = ", retired_at = now()"
 		}
-		tag, err := tx.Exec(ctx, `
+		query := `
 			UPDATE index_generations
 			SET state = $1,
 			    validation_digest = CASE WHEN $2 = '' THEN validation_digest ELSE $2 END,
-			    validation_note   = CASE WHEN $3 = '' THEN validation_note   ELSE $3 END`+
-			timestampSet+`
-			WHERE generation_id = $4 AND state = $5`,
-			string(to), digest, note, generationID, string(from))
+			    validation_note   = CASE WHEN $3 = '' THEN validation_note   ELSE $3 END,
+			    record_version = record_version + 1` +
+			timestampSet + `
+			WHERE generation_id = $4 AND state = $5`
+		if expectedVersion > 0 {
+			query += " AND record_version = $6"
+		}
+		var tag pgconn.CommandTag
+		var err error
+		if expectedVersion > 0 {
+			tag, err = tx.Exec(ctx, query, string(to), digest, note, generationID, string(from), expectedVersion)
+		} else {
+			tag, err = tx.Exec(ctx, query, string(to), digest, note, generationID, string(from))
+		}
 		if isUniqueViolation(err) {
 			return fmt.Errorf("%w: another generation is already ACTIVE for this scope", domain.ErrConflict)
 		}
@@ -654,6 +680,9 @@ func (s *PgStore) TransitionGeneration(ctx context.Context, generationID string,
 			return err
 		}
 		if tag.RowsAffected() == 0 {
+			if expectedVersion > 0 {
+				return domain.ErrVersionConflict
+			}
 			return fmt.Errorf("%w: generation is not in state %s", domain.ErrConflict, from)
 		}
 		return nil
@@ -661,11 +690,30 @@ func (s *PgStore) TransitionGeneration(ctx context.Context, generationID string,
 }
 
 // SetBackfillState records a generation's source-replay progress.
-func (s *PgStore) SetBackfillState(ctx context.Context, generationID string, state domain.BackfillState, note string) error {
+func (s *PgStore) SetBackfillState(ctx context.Context, generationID string, state domain.BackfillState, note string, expectedVersion int64) error {
 	return s.withPool(ctx, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `
-			UPDATE index_generations SET backfill_state = $1, backfill_note = $2
-			WHERE generation_id = $3`, string(state), note, generationID)
+		query := `
+			UPDATE index_generations SET backfill_state = $1, backfill_note = $2, record_version = record_version + 1
+			WHERE generation_id = $3`
+		if expectedVersion > 0 {
+			query += " AND record_version = $4"
+		}
+		var tag pgconn.CommandTag
+		var err error
+		if expectedVersion > 0 {
+			tag, err = tx.Exec(ctx, query, string(state), note, generationID, expectedVersion)
+		} else {
+			tag, err = tx.Exec(ctx, query, string(state), note, generationID)
+		}
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			if expectedVersion > 0 {
+				return domain.ErrVersionConflict
+			}
+			return domain.ErrNotFound
+		}
 		return err
 	})
 }
@@ -911,7 +959,7 @@ func (s *PgStore) UpsertTombstone(ctx context.Context, t domain.RestrictionTombs
 	return applied, err
 }
 
-func (s *PgStore) MarkTombstoneState(ctx context.Context, tenantID, sourceType, sourceID, sourceEventID string, state domain.PropagationState, reason string) error {
+func (s *PgStore) MarkTombstoneState(ctx context.Context, tenantID, sourceType, sourceID, sourceEventID string, state domain.PropagationState, reason string, expectedVersion int64) error {
 	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		var timestampSet string
 		switch state {
@@ -920,23 +968,43 @@ func (s *PgStore) MarkTombstoneState(ctx context.Context, tenantID, sourceType, 
 		case domain.PropagationVerified:
 			timestampSet = ", verified_at = now()"
 		}
-		_, err := tx.Exec(ctx, `
+		query := `
 			UPDATE restriction_tombstones
-			SET state = $1, failure_reason = $2`+timestampSet+`
-			WHERE tenant_id = $3 AND source_type = $4 AND source_id = $5 AND source_event_id = $6`,
-			string(state), reason, tenantID, sourceType, sourceID, sourceEventID)
-		return err
+			SET state = $1, failure_reason = $2, record_version = record_version + 1` + timestampSet + `
+			WHERE tenant_id = $3 AND source_type = $4 AND source_id = $5 AND source_event_id = $6`
+		if expectedVersion > 0 {
+			query += " AND record_version = $7"
+		}
+		var tag pgconn.CommandTag
+		var err error
+		if expectedVersion > 0 {
+			tag, err = tx.Exec(ctx, query, string(state), reason, tenantID, sourceType, sourceID, sourceEventID, expectedVersion)
+		} else {
+			tag, err = tx.Exec(ctx, query, string(state), reason, tenantID, sourceType, sourceID, sourceEventID)
+		}
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			if expectedVersion > 0 {
+				return domain.ErrVersionConflict
+			}
+			return domain.ErrNotFound
+		}
+		return nil
 	})
 }
 
 const tombstoneColumns = `tenant_id, scope_name, source_type, source_id, reason, epoch,
-	source_event_id, effective_at, propagated_at, verified_at, state, failure_reason`
+	source_event_id, effective_at, propagated_at, verified_at, state, failure_reason,
+	record_version`
 
 func scanTombstone(rows pgx.Rows) (domain.RestrictionTombstone, error) {
 	var t domain.RestrictionTombstone
 	var state string
 	err := rows.Scan(&t.TenantID, &t.ScopeName, &t.SourceType, &t.SourceID, &t.Reason, &t.Epoch,
-		&t.SourceEventID, &t.EffectiveAt, &t.PropagatedAt, &t.VerifiedAt, &state, &t.FailureReason)
+		&t.SourceEventID, &t.EffectiveAt, &t.PropagatedAt, &t.VerifiedAt, &state, &t.FailureReason,
+		&t.RecordVersion)
 	t.State = domain.PropagationState(state)
 	return t, err
 }

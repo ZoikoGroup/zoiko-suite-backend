@@ -99,7 +99,7 @@ func (f *fakeStore) UpsertTombstone(_ context.Context, t domain.RestrictionTombs
 	return true, nil
 }
 
-func (f *fakeStore) MarkTombstoneState(_ context.Context, tenantID, sourceType, sourceID, eventID string, s domain.PropagationState, _ string) error {
+func (f *fakeStore) MarkTombstoneState(_ context.Context, tenantID, sourceType, sourceID, eventID string, s domain.PropagationState, _ string, _ int64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.states[tenantID+"|"+sourceType+"|"+sourceID+"|"+eventID] = s
@@ -141,7 +141,7 @@ func (f *fakeStore) GetPublishedContract(context.Context, string) (*domain.Index
 func (f *fakeStore) ListContracts(context.Context, string) ([]domain.IndexContract, error) {
 	return f.contracts, nil
 }
-func (f *fakeStore) TransitionContract(context.Context, string, domain.ContractState, domain.ContractState) error {
+func (f *fakeStore) TransitionContract(context.Context, string, domain.ContractState, domain.ContractState, int64) error {
 	return nil
 }
 func (f *fakeStore) NextContractVersion(context.Context, string) (int, error)       { return 1, nil }
@@ -155,7 +155,7 @@ func (f *fakeStore) ListGenerations(context.Context, string) ([]domain.IndexGene
 func (f *fakeStore) GetActiveGeneration(context.Context, string) (*domain.IndexGeneration, error) {
 	return nil, domain.ErrNotFound
 }
-func (f *fakeStore) TransitionGeneration(context.Context, string, domain.GenerationState, domain.GenerationState, string, string) error {
+func (f *fakeStore) TransitionGeneration(context.Context, string, domain.GenerationState, domain.GenerationState, string, string, int64) error {
 	return nil
 }
 func (f *fakeStore) UpsertCheckpoint(_ context.Context, cp domain.IndexCheckpoint) error {
@@ -206,7 +206,7 @@ func (f *fakeStore) ListEvidence(context.Context, string, string, int) ([]domain
 	return nil, nil
 }
 func (f *fakeStore) Ping(context.Context) error { return nil }
-func (f *fakeStore) SetBackfillState(_ context.Context, id string, st domain.BackfillState, note string) error {
+func (f *fakeStore) SetBackfillState(_ context.Context, id string, st domain.BackfillState, note string, _ int64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.backfill == nil {
