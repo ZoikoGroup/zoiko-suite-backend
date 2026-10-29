@@ -1,0 +1,1127 @@
+asyncapi: 2.6.0
+
+# general-ledger-svc events - the Global Accounting Kernel's domain event catalogue (standard ZS-ACC-KERNEL-001, section 33), on one topic:
+#   zoiko.general-ledger.events
+#
+# WHAT A CONSUMER MUST KNOW
+#
+# 1. EVERY EVENT GOES THROUGH THE TRANSACTIONAL OUTBOX. It is written in the same transaction as the change it reports and delivered
+#    afterwards by a relay, so an event is never published for a change that rolled back and never lost for one that committed. Delivery
+#    is AT-LEAST-ONCE: consumers must be idempotent, using the envelope's id. A retry re-sends the same id.
+#
+# 2. THE ENVELOPE IS A CLOUDEVENTS 1.0 STRUCTURED MESSAGE (ZS-EVENT-001). The business payload is the data member. The type is
+#    com.zoikosuite.accounting.journal.<fact> for the journal lifecycle and com.zoikosuite.accounting.kernel.<fact> for everything else.
+#    The journal events also carry the pre-standard name (journal.posted and so on) in the legacy members for older consumers.
+#
+# 3. ORDERING. The message key is an opaque hash of tenant, aggregate type and aggregate id, so every event about one aggregate (one
+#    journal, one reconciliation run, one rule set) lands on one partition and keeps its order. There is no order across aggregates.
+#
+# 4. EVENTS ARE FACTS, NOT THE GATE. A consumer may refresh a view or start a follow-up from an event; it must not derive posting
+#    permission from one. The period gate is read from the period service at the time of posting, and a seal is read from the ledger.
+#
+# 5. WHAT IS NOT RAISED. A journal reversal has no journal.posted of its own: journal.reversed is its event. A repeat of work that
+#    already happened (an accounting event registered again, a posting repeated, a run repeated) raises nothing the second time. A refused
+#    authorization or an unavailable dependency raises nothing: only deterministic accounting refusals do (event.rejected,
+#    posting.exception-raised).
+#
+# 6. DATA CARRIES NO SECRETS AND NO PERSONAL DATA. Actors are opaque principal ids. Amounts are decimal strings. The classification of
+#    every event here is confidential: they are records of a tenant's books.
+
+info:
+  title: general-ledger-svc events
+  version: "1.0.0"
+
+servers:
+  local:
+    url: kafka:9094
+    protocol: kafka
+
+channels:
+  zoiko.general-ledger.events:
+    description: Every fact the general ledger raises, on one topic. The topic name is the default of KAFKA_EVENTS_TOPIC.
+    subscribe:
+      operationId: onGeneralLedgerEvent
+      message:
+        oneOf:
+          - $ref: '#/components/messages/JournalCreated'
+          - $ref: '#/components/messages/JournalValidated'
+          - $ref: '#/components/messages/JournalProposed'
+          - $ref: '#/components/messages/JournalApproved'
+          - $ref: '#/components/messages/JournalRejected'
+          - $ref: '#/components/messages/JournalWithdrawn'
+          - $ref: '#/components/messages/JournalPosted'
+          - $ref: '#/components/messages/JournalReversed'
+          - $ref: '#/components/messages/AccountingEventAccepted'
+          - $ref: '#/components/messages/AccountingEventRejected'
+          - $ref: '#/components/messages/PostingExceptionRaised'
+          - $ref: '#/components/messages/BookCreated'
+          - $ref: '#/components/messages/BookStatusChanged'
+          - $ref: '#/components/messages/RuleSetCreated'
+          - $ref: '#/components/messages/RuleSetTested'
+          - $ref: '#/components/messages/RuleSetTestFailed'
+          - $ref: '#/components/messages/RuleSetApproved'
+          - $ref: '#/components/messages/RuleSetActivated'
+          - $ref: '#/components/messages/RuleSetRetired'
+          - $ref: '#/components/messages/RuleSetReturnedToDraft'
+          - $ref: '#/components/messages/AccountScopeChanged'
+          - $ref: '#/components/messages/FxRateIngested'
+          - $ref: '#/components/messages/FxOverrideRequested'
+          - $ref: '#/components/messages/FxOverrideApproved'
+          - $ref: '#/components/messages/FxOverrideRejected'
+          - $ref: '#/components/messages/RevaluationCompleted'
+          - $ref: '#/components/messages/BalanceSnapshotSigned'
+          - $ref: '#/components/messages/PeriodSealed'
+          - $ref: '#/components/messages/PeriodReopened'
+          - $ref: '#/components/messages/PeriodResealed'
+          - $ref: '#/components/messages/ReconciliationBreakRaised'
+          - $ref: '#/components/messages/ReconciliationExceptionAccepted'
+          - $ref: '#/components/messages/ReconciliationResolved'
+          - $ref: '#/components/messages/ReconciliationToleranceSet'
+          - $ref: '#/components/messages/AllocationRuleCreated'
+          - $ref: '#/components/messages/AllocationRuleActivated'
+          - $ref: '#/components/messages/AllocationRuleRetired'
+          - $ref: '#/components/messages/AllocationRunPosted'
+          - $ref: '#/components/messages/AllocationRunReversed'
+          - $ref: '#/components/messages/ConsolidationGroupCreated'
+          - $ref: '#/components/messages/ConsolidationMemberAdded'
+          - $ref: '#/components/messages/ConsolidationMemberEnded'
+          - $ref: '#/components/messages/ConsolidationMappingVersioned'
+          - $ref: '#/components/messages/ConsolidationAdjustmentProposed'
+          - $ref: '#/components/messages/ConsolidationAdjustmentApproved'
+          - $ref: '#/components/messages/ConsolidationAdjustmentWithdrawn'
+          - $ref: '#/components/messages/ConsolidationRunCompleted'
+          - $ref: '#/components/messages/ConsolidationRunCertified'
+          - $ref: '#/components/messages/ConsolidationRunSuperseded'
+          - $ref: '#/components/messages/MigrationBatchStaged'
+          - $ref: '#/components/messages/MigrationBatchValidated'
+          - $ref: '#/components/messages/MigrationBatchApproved'
+          - $ref: '#/components/messages/MigrationBatchCancelled'
+          - $ref: '#/components/messages/MigrationBatchPosted'
+
+components:
+  messages:
+    JournalCreated:
+      name: JournalCreated
+      title: com.zoikosuite.accounting.journal.created
+      summary: 'A journal was created (a draft, or a journal born posted by a posting path).'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              type: {const: com.zoikosuite.accounting.journal.created}
+              data:
+                type: object
+                properties:
+                  journal_id: {type: string}
+                  tenant_id: {type: string}
+                  legal_entity_id: {type: string}
+                  fiscal_period: {type: string}
+                  soft_close_override_reason: {type: string}
+    JournalValidated:
+      name: JournalValidated
+      title: com.zoikosuite.accounting.journal.validated
+      summary: 'A journal passed validation.'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              type: {const: com.zoikosuite.accounting.journal.validated}
+              data:
+                type: object
+                properties:
+                  journal_id: {type: string}
+    JournalProposed:
+      name: JournalProposed
+      title: com.zoikosuite.accounting.journal.proposed
+      summary: 'A manual journal was submitted for approval. Raised in the transaction that moved it to PENDING_APPROVAL.'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              type: {const: com.zoikosuite.accounting.journal.proposed}
+              data:
+                type: object
+                properties:
+                  journal_id: {type: string}
+                  submitted_by: {type: string}
+    JournalApproved:
+      name: JournalApproved
+      title: com.zoikosuite.accounting.journal.approved
+      summary: 'The required approval completed. The approval fingerprint identifies exactly the content that was approved.'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              type: {const: com.zoikosuite.accounting.journal.approved}
+              data:
+                type: object
+                properties:
+                  journal_id: {type: string}
+                  approved_by: {type: string}
+                  approval_fingerprint: {type: string}
+    JournalRejected:
+      name: JournalRejected
+      title: com.zoikosuite.accounting.journal.rejected
+      summary: 'A journal under review was rejected, with the reviewer''s reason. Rejection is final.'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              type: {const: com.zoikosuite.accounting.journal.rejected}
+              data:
+                type: object
+                properties:
+                  journal_id: {type: string}
+                  rejected_by: {type: string}
+                  reason: {type: string}
+    JournalWithdrawn:
+      name: JournalWithdrawn
+      title: com.zoikosuite.accounting.journal.withdrawn
+      summary: 'A draft that was never submitted was withdrawn. It stays on record.'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              type: {const: com.zoikosuite.accounting.journal.withdrawn}
+              data:
+                type: object
+                properties:
+                  journal_id: {type: string}
+                  reason: {type: string}
+    JournalPosted:
+      name: JournalPosted
+      title: com.zoikosuite.accounting.journal.posted
+      summary: 'The atomic ledger posting committed. A kernel posting carries its lineage: the event, book, rule version, execution and proposal hash it came from; a system journal (allocation, revaluation, consolidation, migration) carries its journal type.'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              type: {const: com.zoikosuite.accounting.journal.posted}
+              data:
+                type: object
+                properties:
+                  journal_id: {type: string}
+                  journal_number: {type: string}
+                  journal_type: {type: string}
+                  accounting_event_id: {type: string}
+                  book_id: {type: string}
+                  posting_basis: {type: string}
+                  posting_execution_id: {type: string}
+                  posting_rule_set_id: {type: string}
+                  rule_version: {type: string}
+                  proposal_hash: {type: string}
+                  ledger_watermark: {type: integer}
+                  posting_date: {type: string, format: date}
+                  fiscal_period: {type: string}
+    JournalReversed:
+      name: JournalReversed
+      title: com.zoikosuite.accounting.journal.reversed
+      summary: 'A reversal posted. The reversing journal is born posted and has no journal.posted event of its own: this is its event.'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              type: {const: com.zoikosuite.accounting.journal.reversed}
+              data:
+                type: object
+                properties:
+                  journal_id: {type: string}
+                  reversing_journal_id: {type: string}
+    AccountingEventAccepted:
+      name: AccountingEventAccepted
+      title: com.zoikosuite.accounting.kernel.event.registered
+      summary: 'A canonical accounting event passed intake validation and was stored. A repeat of the same event raises nothing.'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              type: {const: com.zoikosuite.accounting.kernel.event.registered}
+              data:
+                type: object
+                properties:
+                  accounting_event_id: {type: string}
+                  event_type: {type: string}
+                  event_version: {type: integer}
+                  legal_entity_id: {type: string}
+                  source_system: {type: string}
+                  source_event_id: {type: string}
+                  payload_hash: {type: string}
+    AccountingEventRejected:
+      name: AccountingEventRejected
+      title: com.zoikosuite.accounting.kernel.event.rejected
+      summary: 'An accounting event was refused at intake: invalid, a producer event or idempotency key reused with other content, or a correction naming an unknown event. Nothing is stored. Raised for deterministic refusals only, never for an authorization failure or an unavailable dependency.'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              type: {const: com.zoikosuite.accounting.kernel.event.rejected}
+              data:
+                type: object
+                properties:
+                  event_type: {type: string}
+                  event_version: {type: integer}
+                  source_system: {type: string}
+                  source_event_id: {type: string}
+                  idempotency_key: {type: string}
+                  family: {type: string}
+                  code: {type: string}
+                  detail: {type: string}
+                  legal_entity_id: {type: string}
+    PostingExceptionRaised:
+      name: PostingExceptionRaised
+      title: com.zoikosuite.accounting.kernel.posting.exception-raised
+      summary: 'A posting could not complete. No journal exists; the failure is recorded and raised so operations and the source domain can act.'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              type: {const: com.zoikosuite.accounting.kernel.posting.exception-raised}
+              data:
+                type: object
+                properties:
+                  accounting_event_id: {type: string}
+                  book_id: {type: string}
+                  posting_execution_id: {type: string}
+                  status: {type: string}
+                  family: {type: string}
+                  code: {type: string}
+                  detail: {type: string}
+                  facts: {type: object}
+    BookCreated:
+      name: BookCreated
+      title: com.zoikosuite.accounting.kernel.book.created
+      summary: 'An accounting book was created.'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              type: {const: com.zoikosuite.accounting.kernel.book.created}
+              data:
+                type: object
+                properties:
+                  book_id: {type: string}
+                  legal_entity_id: {type: string}
+                  book_type: {type: string}
+                  framework: {type: string}
+    BookStatusChanged:
+      name: BookStatusChanged
+      title: com.zoikosuite.accounting.kernel.book.status-changed
+      summary: 'A book moved along its lifecycle (activated, suspended or retired).'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              type: {const: com.zoikosuite.accounting.kernel.book.status-changed}
+              data:
+                type: object
+                properties:
+                  book_id: {type: string}
+                  from: {type: string}
+                  to: {type: string}
+    RuleSetCreated:
+      name: RuleSetCreated
+      title: com.zoikosuite.accounting.kernel.rule-set.created
+      summary: 'A posting rule set version was drafted.'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              type: {const: com.zoikosuite.accounting.kernel.rule-set.created}
+              data:
+                type: object
+                properties:
+                  posting_rule_set_id: {type: string}
+                  name: {type: string}
+                  version: {type: string}
+                  event_type: {type: string}
+                  book_type: {type: string}
+                  framework: {type: string}
+                  content_hash: {type: string}
+    RuleSetTested:
+      name: RuleSetTested
+      title: com.zoikosuite.accounting.kernel.rule-set.tested
+      summary: 'A rule set''s regression pack passed.'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              type: {const: com.zoikosuite.accounting.kernel.rule-set.tested}
+              data:
+                type: object
+                properties:
+                  posting_rule_set_id: {type: string}
+                  name: {type: string}
+                  version: {type: string}
+                  event_type: {type: string}
+                  book_type: {type: string}
+                  framework: {type: string}
+                  content_hash: {type: string}
+                  cases: {type: integer}
+    RuleSetTestFailed:
+      name: RuleSetTestFailed
+      title: com.zoikosuite.accounting.kernel.rule-set.test-failed
+      summary: 'A rule set''s regression pack failed.'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              type: {const: com.zoikosuite.accounting.kernel.rule-set.test-failed}
+              data:
+                type: object
+                properties:
+                  posting_rule_set_id: {type: string}
+                  name: {type: string}
+                  version: {type: string}
+                  event_type: {type: string}
+                  book_type: {type: string}
+                  framework: {type: string}
+                  content_hash: {type: string}
+                  failed_cases: {type: integer}
+    RuleSetApproved:
+      name: RuleSetApproved
+      title: com.zoikosuite.accounting.kernel.rule-set.approved
+      summary: 'A tested rule set was approved by someone other than its author.'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              type: {const: com.zoikosuite.accounting.kernel.rule-set.approved}
+              data:
+                type: object
+                properties:
+                  posting_rule_set_id: {type: string}
+                  name: {type: string}
+                  version: {type: string}
+                  event_type: {type: string}
+                  book_type: {type: string}
+                  framework: {type: string}
+                  content_hash: {type: string}
+    RuleSetActivated:
+      name: RuleSetActivated
+      title: com.zoikosuite.accounting.kernel.rule-set.activated
+      summary: 'A rule set became active and superseded the version it replaces.'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              type: {const: com.zoikosuite.accounting.kernel.rule-set.activated}
+              data:
+                type: object
+                properties:
+                  posting_rule_set_id: {type: string}
+                  name: {type: string}
+                  version: {type: string}
+                  event_type: {type: string}
+                  book_type: {type: string}
+                  framework: {type: string}
+                  content_hash: {type: string}
+    RuleSetRetired:
+      name: RuleSetRetired
+      title: com.zoikosuite.accounting.kernel.rule-set.retired
+      summary: 'A rule set was retired.'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              type: {const: com.zoikosuite.accounting.kernel.rule-set.retired}
+              data:
+                type: object
+                properties:
+                  posting_rule_set_id: {type: string}
+                  name: {type: string}
+                  version: {type: string}
+                  event_type: {type: string}
+                  book_type: {type: string}
+                  framework: {type: string}
+                  content_hash: {type: string}
+    RuleSetReturnedToDraft:
+      name: RuleSetReturnedToDraft
+      title: com.zoikosuite.accounting.kernel.rule-set.returned-to-draft
+      summary: 'A rule set was returned to draft.'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              type: {const: com.zoikosuite.accounting.kernel.rule-set.returned-to-draft}
+              data:
+                type: object
+                properties:
+                  posting_rule_set_id: {type: string}
+                  name: {type: string}
+                  version: {type: string}
+                  event_type: {type: string}
+                  book_type: {type: string}
+                  framework: {type: string}
+                  content_hash: {type: string}
+    AccountScopeChanged:
+      name: AccountScopeChanged
+      title: com.zoikosuite.accounting.kernel.account.scope-changed
+      summary: 'Where an account may be used or how its lines are classified changed: books, currency, control type, counterparty rule, dimension policy or replacement account.'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              type: {const: com.zoikosuite.accounting.kernel.account.scope-changed}
+              data:
+                type: object
+                properties:
+                  account_code: {type: string}
+                  book_ids: {type: array, items: {type: string}}
+                  currency_restriction: {type: string}
+                  control_type: {type: string}
+                  counterparty_required: {type: boolean}
+                  dimension_policy: {type: object}
+                  replacement_account: {type: string}
+    FxRateIngested:
+      name: FxRateIngested
+      title: com.zoikosuite.accounting.kernel.fx.rate-ingested
+      summary: 'A sourced exchange rate was stored.'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              type: {const: com.zoikosuite.accounting.kernel.fx.rate-ingested}
+              data:
+                type: object
+                properties:
+                  fx_rate_id: {type: string}
+                  pair: {type: string}
+                  rate: {type: string, description: A decimal amount, as a string.}
+                  rate_date: {type: string, format: date}
+                  rate_type: {type: string}
+                  source: {type: string}
+    FxOverrideRequested:
+      name: FxOverrideRequested
+      title: com.zoikosuite.accounting.kernel.fx.override-requested
+      summary: 'A hand-keyed rate was requested. It is not a rate until a second person approves it.'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              type: {const: com.zoikosuite.accounting.kernel.fx.override-requested}
+              data:
+                type: object
+                properties:
+                  request_id: {type: string}
+                  pair: {type: string}
+                  rate: {type: string, description: A decimal amount, as a string.}
+                  reason: {type: string}
+    FxOverrideApproved:
+      name: FxOverrideApproved
+      title: com.zoikosuite.accounting.kernel.fx.override-approved
+      summary: 'A rate override was approved and became a rate.'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              type: {const: com.zoikosuite.accounting.kernel.fx.override-approved}
+              data:
+                type: object
+                properties:
+                  request_id: {type: string}
+    FxOverrideRejected:
+      name: FxOverrideRejected
+      title: com.zoikosuite.accounting.kernel.fx.override-rejected
+      summary: 'A rate override was rejected, with a reason.'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              type: {const: com.zoikosuite.accounting.kernel.fx.override-rejected}
+              data:
+                type: object
+                properties:
+                  request_id: {type: string}
+    RevaluationCompleted:
+      name: RevaluationCompleted
+      title: com.zoikosuite.accounting.kernel.revaluation.completed
+      summary: 'Open foreign monetary items were revalued and the unrealized difference posted.'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              type: {const: com.zoikosuite.accounting.kernel.revaluation.completed}
+              data:
+                type: object
+                properties:
+                  revaluation_run_id: {type: string}
+                  book_id: {type: string}
+                  fiscal_period: {type: string}
+                  valuation_date: {type: string, format: date}
+                  items: {type: integer}
+                  total_gain: {type: string, description: A decimal amount, as a string.}
+                  total_loss: {type: string, description: A decimal amount, as a string.}
+                  journal_id: {type: string}
+                  reversal_journal_id: {type: string}
+    BalanceSnapshotSigned:
+      name: BalanceSnapshotSigned
+      title: com.zoikosuite.accounting.kernel.balance-snapshot.signed
+      summary: 'A balance snapshot was taken, signed and retained.'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              type: {const: com.zoikosuite.accounting.kernel.balance-snapshot.signed}
+              data:
+                type: object
+                properties:
+                  snapshot_id: {type: string}
+                  book_id: {type: string}
+                  fiscal_period: {type: string}
+                  purpose: {type: string}
+                  ledger_watermark: {type: integer}
+                  total_debit: {type: string, description: A decimal amount, as a string.}
+                  content_hash: {type: string}
+                  key_id: {type: string}
+    PeriodSealed:
+      name: PeriodSealed
+      title: com.zoikosuite.accounting.kernel.period.sealed
+      summary: 'A period was sealed at a ledger watermark. No posting transaction writes into it afterwards.'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              type: {const: com.zoikosuite.accounting.kernel.period.sealed}
+              data:
+                type: object
+                properties:
+                  legal_entity_id: {type: string}
+                  fiscal_period: {type: string}
+                  status: {type: string}
+                  ledger_watermark: {type: integer}
+                  authority_ref: {type: string}
+    PeriodReopened:
+      name: PeriodReopened
+      title: com.zoikosuite.accounting.kernel.period.reopened
+      summary: 'A sealed period was reopened under named authority.'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              type: {const: com.zoikosuite.accounting.kernel.period.reopened}
+              data:
+                type: object
+                properties:
+                  legal_entity_id: {type: string}
+                  fiscal_period: {type: string}
+                  status: {type: string}
+                  ledger_watermark: {type: integer}
+                  authority_ref: {type: string}
+    PeriodResealed:
+      name: PeriodResealed
+      title: com.zoikosuite.accounting.kernel.period.resealed
+      summary: 'A reopened period was sealed again.'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              type: {const: com.zoikosuite.accounting.kernel.period.resealed}
+              data:
+                type: object
+                properties:
+                  legal_entity_id: {type: string}
+                  fiscal_period: {type: string}
+                  status: {type: string}
+                  ledger_watermark: {type: integer}
+                  authority_ref: {type: string}
+    ReconciliationBreakRaised:
+      name: ReconciliationBreakRaised
+      title: com.zoikosuite.accounting.kernel.reconciliation.break-raised
+      summary: 'A reconciliation produced a warning or a break: a governed case with an owner and a service deadline.'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              type: {const: com.zoikosuite.accounting.kernel.reconciliation.break-raised}
+              data:
+                type: object
+                properties:
+                  reconciliation_run_id: {type: string}
+                  reconciliation_type: {type: string}
+                  status: {type: string}
+                  book_id: {type: string}
+                  fiscal_period: {type: string}
+                  difference: {type: string, description: A decimal amount, as a string.}
+                  currency: {type: string}
+                  owner: {type: string}
+                  sla_due_at: {type: string, format: date-time}
+    ReconciliationExceptionAccepted:
+      name: ReconciliationExceptionAccepted
+      title: com.zoikosuite.accounting.kernel.reconciliation.exception-accepted
+      summary: 'A break was accepted as an exception by someone other than the person who raised it.'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              type: {const: com.zoikosuite.accounting.kernel.reconciliation.exception-accepted}
+              data:
+                type: object
+                properties:
+                  reconciliation_run_id: {type: string}
+                  reconciliation_type: {type: string}
+                  difference: {type: string, description: A decimal amount, as a string.}
+                  approved_by: {type: string}
+    ReconciliationResolved:
+      name: ReconciliationResolved
+      title: com.zoikosuite.accounting.kernel.reconciliation.resolved
+      summary: 'A case was resolved with a controlled resolution type and evidence.'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              type: {const: com.zoikosuite.accounting.kernel.reconciliation.resolved}
+              data:
+                type: object
+                properties:
+                  reconciliation_run_id: {type: string}
+                  reconciliation_type: {type: string}
+                  difference: {type: string, description: A decimal amount, as a string.}
+                  resolution_type: {type: string}
+    ReconciliationToleranceSet:
+      name: ReconciliationToleranceSet
+      title: com.zoikosuite.accounting.kernel.reconciliation.tolerance-set
+      summary: 'A new version of a reconciliation tolerance took effect.'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              type: {const: com.zoikosuite.accounting.kernel.reconciliation.tolerance-set}
+              data:
+                type: object
+                properties:
+                  tolerance_rule_id: {type: string}
+                  reconciliation_type: {type: string}
+                  legal_entity_id: {type: string}
+                  match_amount: {type: string, description: A decimal amount, as a string.}
+                  warning_amount: {type: string, description: A decimal amount, as a string.}
+                  effective_from: {type: string, format: date}
+    AllocationRuleCreated:
+      name: AllocationRuleCreated
+      title: com.zoikosuite.accounting.kernel.allocation-rule.created
+      summary: 'An allocation rule was drafted.'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              type: {const: com.zoikosuite.accounting.kernel.allocation-rule.created}
+              data:
+                type: object
+                properties:
+                  allocation_rule_id: {type: string}
+                  rule_code: {type: string}
+                  content_hash: {type: string}
+    AllocationRuleActivated:
+      name: AllocationRuleActivated
+      title: com.zoikosuite.accounting.kernel.allocation-rule.activated
+      summary: 'An allocation rule was approved and became active.'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              type: {const: com.zoikosuite.accounting.kernel.allocation-rule.activated}
+              data:
+                type: object
+                properties:
+                  allocation_rule_id: {type: string}
+                  rule_code: {type: string}
+                  version: {type: string}
+                  content_hash: {type: string}
+    AllocationRuleRetired:
+      name: AllocationRuleRetired
+      title: com.zoikosuite.accounting.kernel.allocation-rule.retired
+      summary: 'An allocation rule was retired.'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              type: {const: com.zoikosuite.accounting.kernel.allocation-rule.retired}
+              data:
+                type: object
+                properties:
+                  allocation_rule_id: {type: string}
+    AllocationRunPosted:
+      name: AllocationRunPosted
+      title: com.zoikosuite.accounting.kernel.allocation-run.posted
+      summary: 'An allocation run posted its journal, and the journals of any recipient entities, atomically.'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              type: {const: com.zoikosuite.accounting.kernel.allocation-run.posted}
+              data:
+                type: object
+                properties:
+                  allocation_run_id: {type: string}
+                  allocation_rule_id: {type: string}
+                  book_id: {type: string}
+                  fiscal_period: {type: string}
+                  journal_id: {type: string}
+                  pool_amount: {type: string, description: A decimal amount, as a string.}
+                  rounding_residual: {type: string, description: A decimal amount, as a string.}
+    AllocationRunReversed:
+      name: AllocationRunReversed
+      title: com.zoikosuite.accounting.kernel.allocation-run.reversed
+      summary: 'An allocation run was withdrawn: every journal it posted, in every entity, was reversed together.'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              type: {const: com.zoikosuite.accounting.kernel.allocation-run.reversed}
+              data:
+                type: object
+                properties:
+                  allocation_run_id: {type: string}
+                  reversal_journal_id: {type: string}
+                  recipient_journals_reversed: {type: integer}
+                  reason: {type: string}
+    ConsolidationGroupCreated:
+      name: ConsolidationGroupCreated
+      title: com.zoikosuite.accounting.kernel.consolidation-group.created
+      summary: 'A consolidation group was created.'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              type: {const: com.zoikosuite.accounting.kernel.consolidation-group.created}
+              data:
+                type: object
+                properties:
+                  group_id: {type: string}
+                  group_code: {type: string}
+                  group_book_id: {type: string}
+                  presentation_currency: {type: string}
+    ConsolidationMemberAdded:
+      name: ConsolidationMemberAdded
+      title: com.zoikosuite.accounting.kernel.consolidation-member.added
+      summary: 'A legal entity joined a consolidation group.'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              type: {const: com.zoikosuite.accounting.kernel.consolidation-member.added}
+              data:
+                type: object
+                properties:
+                  group_id: {type: string}
+                  member_id: {type: string}
+                  legal_entity_id: {type: string}
+                  ownership_pct: {type: string, description: A decimal amount, as a string.}
+                  effective_from: {type: string, format: date}
+    ConsolidationMemberEnded:
+      name: ConsolidationMemberEnded
+      title: com.zoikosuite.accounting.kernel.consolidation-member.ended
+      summary: 'A member left a consolidation group.'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              type: {const: com.zoikosuite.accounting.kernel.consolidation-member.ended}
+              data:
+                type: object
+                properties:
+                  group_id: {type: string}
+                  member_id: {type: string}
+                  effective_to: {type: string, format: date}
+    ConsolidationMappingVersioned:
+      name: ConsolidationMappingVersioned
+      title: com.zoikosuite.accounting.kernel.consolidation-mapping.versioned
+      summary: 'A new version of a group''s account mapping took effect.'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              type: {const: com.zoikosuite.accounting.kernel.consolidation-mapping.versioned}
+              data:
+                type: object
+                properties:
+                  group_id: {type: string}
+                  accounts: {type: object}
+                  ic_roles: {type: object}
+    ConsolidationAdjustmentProposed:
+      name: ConsolidationAdjustmentProposed
+      title: com.zoikosuite.accounting.kernel.consolidation-adjustment.proposed
+      summary: 'A group policy adjustment was proposed.'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              type: {const: com.zoikosuite.accounting.kernel.consolidation-adjustment.proposed}
+              data:
+                type: object
+                properties:
+                  adjustment_id: {type: string}
+                  group_id: {type: string}
+                  fiscal_period: {type: string}
+                  policy_ref: {type: string}
+                  source_ref: {type: string}
+    ConsolidationAdjustmentApproved:
+      name: ConsolidationAdjustmentApproved
+      title: com.zoikosuite.accounting.kernel.consolidation-adjustment.approved
+      summary: 'A group policy adjustment was approved by someone other than its proposer.'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              type: {const: com.zoikosuite.accounting.kernel.consolidation-adjustment.approved}
+              data:
+                type: object
+                properties:
+                  adjustment_id: {type: string}
+                  group_id: {type: string}
+                  fiscal_period: {type: string}
+    ConsolidationAdjustmentWithdrawn:
+      name: ConsolidationAdjustmentWithdrawn
+      title: com.zoikosuite.accounting.kernel.consolidation-adjustment.withdrawn
+      summary: 'A group policy adjustment was withdrawn.'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              type: {const: com.zoikosuite.accounting.kernel.consolidation-adjustment.withdrawn}
+              data:
+                type: object
+                properties:
+                  adjustment_id: {type: string}
+                  group_id: {type: string}
+                  reason: {type: string}
+    ConsolidationRunCompleted:
+      name: ConsolidationRunCompleted
+      title: com.zoikosuite.accounting.kernel.consolidation-run.completed
+      summary: 'A consolidation run froze its populations, translated, eliminated and posted the group book.'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              type: {const: com.zoikosuite.accounting.kernel.consolidation-run.completed}
+              data:
+                type: object
+                properties:
+                  consolidation_run_id: {type: string}
+                  group_id: {type: string}
+                  fiscal_period: {type: string}
+                  run_hash: {type: string}
+                  translation_journal_id: {type: string}
+                  elimination_journal_id: {type: string}
+                  blocking_exceptions: {type: integer}
+    ConsolidationRunCertified:
+      name: ConsolidationRunCertified
+      title: com.zoikosuite.accounting.kernel.consolidation-run.certified
+      summary: 'A completed run was certified against a signed group snapshot.'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              type: {const: com.zoikosuite.accounting.kernel.consolidation-run.certified}
+              data:
+                type: object
+                properties:
+                  consolidation_run_id: {type: string}
+                  group_id: {type: string}
+                  fiscal_period: {type: string}
+                  group_snapshot_id: {type: string}
+                  mapping_version: {type: string}
+                  run_hash: {type: string}
+    ConsolidationRunSuperseded:
+      name: ConsolidationRunSuperseded
+      title: com.zoikosuite.accounting.kernel.consolidation-run.superseded
+      summary: 'A consolidation run was superseded and its journals reversed.'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              type: {const: com.zoikosuite.accounting.kernel.consolidation-run.superseded}
+              data:
+                type: object
+                properties:
+                  consolidation_run_id: {type: string}
+                  group_id: {type: string}
+                  fiscal_period: {type: string}
+                  reason: {type: string}
+    MigrationBatchStaged:
+      name: MigrationBatchStaged
+      title: com.zoikosuite.accounting.kernel.migration-batch.staged
+      summary: 'A batch of opening lines was staged from a source extract.'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              type: {const: com.zoikosuite.accounting.kernel.migration-batch.staged}
+              data:
+                type: object
+                properties:
+                  batch_id: {type: string}
+                  batch_code: {type: string}
+                  legal_entity_id: {type: string}
+                  book_id: {type: string}
+                  batch_kind: {type: string}
+                  cutover_date: {type: string, format: date}
+                  line_count: {type: integer}
+                  lines_hash: {type: string}
+                  source_extract_hash: {type: string}
+    MigrationBatchValidated:
+      name: MigrationBatchValidated
+      title: com.zoikosuite.accounting.kernel.migration-batch.validated
+      summary: 'A staged batch was validated; valid says whether it is clean.'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              type: {const: com.zoikosuite.accounting.kernel.migration-batch.validated}
+              data:
+                type: object
+                properties:
+                  batch_id: {type: string}
+                  batch_code: {type: string}
+                  legal_entity_id: {type: string}
+                  book_id: {type: string}
+                  batch_kind: {type: string}
+                  cutover_date: {type: string, format: date}
+                  valid: {type: boolean}
+                  issues: {type: integer}
+    MigrationBatchApproved:
+      name: MigrationBatchApproved
+      title: com.zoikosuite.accounting.kernel.migration-batch.approved
+      summary: 'A batch was approved, by someone other than its preparer, under named authority and for a cutover window.'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              type: {const: com.zoikosuite.accounting.kernel.migration-batch.approved}
+              data:
+                type: object
+                properties:
+                  batch_id: {type: string}
+                  batch_code: {type: string}
+                  legal_entity_id: {type: string}
+                  book_id: {type: string}
+                  batch_kind: {type: string}
+                  cutover_date: {type: string, format: date}
+                  authority_ref: {type: string}
+                  window_start: {type: string, format: date-time}
+                  window_end: {type: string, format: date-time}
+    MigrationBatchCancelled:
+      name: MigrationBatchCancelled
+      title: com.zoikosuite.accounting.kernel.migration-batch.cancelled
+      summary: 'A batch that was not posted was cancelled, with a reason.'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              type: {const: com.zoikosuite.accounting.kernel.migration-batch.cancelled}
+              data:
+                type: object
+                properties:
+                  batch_id: {type: string}
+                  batch_code: {type: string}
+                  legal_entity_id: {type: string}
+                  book_id: {type: string}
+                  batch_kind: {type: string}
+                  cutover_date: {type: string, format: date}
+                  reason: {type: string}
+    MigrationBatchPosted:
+      name: MigrationBatchPosted
+      title: com.zoikosuite.accounting.kernel.migration-batch.posted
+      summary: 'An approved batch posted as one OPENING journal inside its cutover window.'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              type: {const: com.zoikosuite.accounting.kernel.migration-batch.posted}
+              data:
+                type: object
+                properties:
+                  batch_id: {type: string}
+                  batch_code: {type: string}
+                  legal_entity_id: {type: string}
+                  book_id: {type: string}
+                  batch_kind: {type: string}
+                  cutover_date: {type: string, format: date}
+                  journal_id: {type: string}
+                  journal_number: {type: string}
+                  line_count: {type: integer}
+                  lines_hash: {type: string}
+  schemas:
+    Envelope:
+      type: object
+      description: The CloudEvents structured envelope every event is wrapped in.
+      required: [specversion, id, source, type, time, datacontenttype, dataschema, tenantid, residencyregion, classification, schemaversion, payloadhash, data]
+      properties:
+        specversion: {type: string, const: '1.0'}
+        id: {type: string, description: Allocated before the producing transaction commits and never replaced; a publish retry re-sends it.}
+        source: {type: string}
+        type: {type: string}
+        subject: {type: string}
+        time: {type: string, format: date-time}
+        datacontenttype: {type: string, const: application/json}
+        dataschema: {type: string}
+        tenantid: {type: string}
+        legalentityid: {type: string}
+        bookid: {type: string}
+        aggregateid: {type: string}
+        aggregateversion: {type: integer}
+        correlationid: {type: string}
+        causationid: {type: string}
+        requestid: {type: string}
+        effectiveat: {type: string, format: date-time}
+        actorid: {type: string, description: An opaque principal id.}
+        jurisdiction: {type: string}
+        residencyregion: {type: string}
+        classification: {type: string, enum: [public, internal, confidential, restricted]}
+        schemaversion: {type: string}
+        payloadhash: {type: string}
+        traceparent: {type: string}
+        data: {type: object, description: The event's own payload.}

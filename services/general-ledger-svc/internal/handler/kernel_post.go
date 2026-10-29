@@ -159,7 +159,8 @@ func (h *KernelHandler) GetAccountScope(w http.ResponseWriter, r *http.Request) 
 		DimensionPolicy: sc.DimensionPolicy, ReplacementAccount: sc.ReplacementAccount})
 }
 
-// SetAccountScope sets an account's books, currency, control type, counterparty rule, dimension policy and replacement account. An empty body\n// lifts every restriction.
+// SetAccountScope sets an account's books, currency, control type, counterparty rule, dimension policy and replacement account. An empty body
+// lifts every restriction.
 func (h *KernelHandler) SetAccountScope(w http.ResponseWriter, r *http.Request) {
 	var req scopeBody
 	if !decodeJSON(w, r, &req) {
