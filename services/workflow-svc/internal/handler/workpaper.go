@@ -37,20 +37,20 @@ func (h *Handler) CreateWorkpaper(w http.ResponseWriter, r *http.Request) {
 	}
 	engagement, err := h.store.GetAuditEngagement(r.Context(), tenantID, chi.URLParam(r, "engagement_id"))
 	if err != nil {
-		h.writeAuditEngagementErr(w, err)
+		h.writeAuditEngagementErr(w, r, err)
 		return
 	}
 	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionWorkpaperManage, ""); err != nil {
-		h.writeAuditEngagementAuthzErr(w, err)
+		h.writeAuditEngagementAuthzErr(w, r, err)
 		return
 	}
 	var req createWorkpaperRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
 		return
 	}
 	if req.Reference == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "reference"})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "reference"})
 		return
 	}
 	wp, created, err := h.store.CreateWorkpaper(r.Context(), domain.CreateWorkpaperParams{
@@ -58,14 +58,14 @@ func (h *Handler) CreateWorkpaper(w http.ResponseWriter, r *http.Request) {
 		Required: req.Required, CreatedByPrincipalID: actor, CorrelationID: correlationID,
 	})
 	if err != nil {
-		h.writeWorkpaperErr(w, err)
+		h.writeWorkpaperErr(w, r, err)
 		return
 	}
 	status := http.StatusOK
 	if created {
 		status = http.StatusCreated
 	}
-	writeJSON(w, status, wp)
+	writeJSON(w, r, status, wp)
 }
 
 func (h *Handler) getWorkpaperForAccess(w http.ResponseWriter, r *http.Request, action string) (*domain.Workpaper, bool) {
@@ -79,16 +79,16 @@ func (h *Handler) getWorkpaperForAccess(w http.ResponseWriter, r *http.Request, 
 	}
 	wp, err := h.store.GetWorkpaper(r.Context(), tenantID, chi.URLParam(r, "workpaper_id"))
 	if err != nil {
-		h.writeWorkpaperErr(w, err)
+		h.writeWorkpaperErr(w, r, err)
 		return nil, false
 	}
 	engagement, err := h.store.GetAuditEngagement(r.Context(), tenantID, wp.EngagementID)
 	if err != nil {
-		h.writeAuditEngagementErr(w, err)
+		h.writeAuditEngagementErr(w, r, err)
 		return nil, false
 	}
 	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, action, ""); err != nil {
-		h.writeAuditEngagementAuthzErr(w, err)
+		h.writeAuditEngagementAuthzErr(w, r, err)
 		return nil, false
 	}
 	return wp, true
@@ -99,7 +99,7 @@ func (h *Handler) GetWorkpaper(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	writeJSON(w, http.StatusOK, wp)
+	writeJSON(w, r, http.StatusOK, wp)
 }
 
 type descriptionRequest struct {
@@ -113,14 +113,14 @@ func (h *Handler) RecordProcedure(w http.ResponseWriter, r *http.Request) {
 	}
 	var req descriptionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Description == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "description"})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "description"})
 		return
 	}
 	if err := h.store.RecordProcedure(r.Context(), domain.RecordProcedureParams{WorkpaperID: wp.WorkpaperID, TenantID: wp.TenantID, Description: req.Description}); err != nil {
-		h.writeWorkpaperErr(w, err)
+		h.writeWorkpaperErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]string{"status": "recorded"})
+	writeJSON(w, r, http.StatusCreated, map[string]string{"status": "recorded"})
 }
 
 func (h *Handler) RecordResult(w http.ResponseWriter, r *http.Request) {
@@ -130,14 +130,14 @@ func (h *Handler) RecordResult(w http.ResponseWriter, r *http.Request) {
 	}
 	var req descriptionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Description == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "description"})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "description"})
 		return
 	}
 	if err := h.store.RecordResult(r.Context(), domain.RecordResultParams{WorkpaperID: wp.WorkpaperID, TenantID: wp.TenantID, Description: req.Description}); err != nil {
-		h.writeWorkpaperErr(w, err)
+		h.writeWorkpaperErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]string{"status": "recorded"})
+	writeJSON(w, r, http.StatusCreated, map[string]string{"status": "recorded"})
 }
 
 func (h *Handler) RecordConclusion(w http.ResponseWriter, r *http.Request) {
@@ -147,14 +147,14 @@ func (h *Handler) RecordConclusion(w http.ResponseWriter, r *http.Request) {
 	}
 	var req descriptionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Description == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "description"})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "description"})
 		return
 	}
 	if err := h.store.RecordConclusion(r.Context(), domain.RecordConclusionParams{WorkpaperID: wp.WorkpaperID, TenantID: wp.TenantID, Description: req.Description}); err != nil {
-		h.writeWorkpaperErr(w, err)
+		h.writeWorkpaperErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]string{"status": "recorded"})
+	writeJSON(w, r, http.StatusCreated, map[string]string{"status": "recorded"})
 }
 
 type addCrossReferenceRequest struct {
@@ -168,16 +168,16 @@ func (h *Handler) AddCrossReference(w http.ResponseWriter, r *http.Request) {
 	}
 	var req addCrossReferenceRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ToWorkpaperID == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "to_workpaper_id"})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "to_workpaper_id"})
 		return
 	}
 	if err := h.store.AddWorkpaperCrossReference(r.Context(), domain.AddWorkpaperCrossReferenceParams{
 		FromWorkpaperID: wp.WorkpaperID, ToWorkpaperID: req.ToWorkpaperID, TenantID: wp.TenantID,
 	}); err != nil {
-		h.writeWorkpaperErr(w, err)
+		h.writeWorkpaperErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]string{"status": "linked"})
+	writeJSON(w, r, http.StatusCreated, map[string]string{"status": "linked"})
 }
 
 type linkEvidenceRequest struct {
@@ -195,14 +195,14 @@ func (h *Handler) LinkEvidence(w http.ResponseWriter, r *http.Request) {
 	actor, _ := h.requirePrincipal(w, r)
 	var req linkEvidenceRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.EvidenceID == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "evidence_id"})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "evidence_id"})
 		return
 	}
 	contradictionFlag := false
 	if h.evidence != nil {
 		flag, err := h.evidence.GetContradictionFlag(r.Context(), wp.TenantID, req.EvidenceID, actor, r.Header.Get("X-Correlation-ID"))
 		if err != nil {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "evidence_service_unavailable"})
+			writeJSON(w, r, http.StatusServiceUnavailable, map[string]string{"error": "evidence_service_unavailable"})
 			return
 		}
 		contradictionFlag = flag
@@ -210,10 +210,10 @@ func (h *Handler) LinkEvidence(w http.ResponseWriter, r *http.Request) {
 	if err := h.store.LinkWorkpaperEvidence(r.Context(), domain.LinkWorkpaperEvidenceParams{
 		WorkpaperID: wp.WorkpaperID, TenantID: wp.TenantID, EvidenceID: req.EvidenceID, LinkedByPrincipalID: actor, ContradictionFlag: contradictionFlag,
 	}); err != nil {
-		h.writeWorkpaperErr(w, err)
+		h.writeWorkpaperErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{"status": "linked", "contradiction_flag": contradictionFlag})
+	writeJSON(w, r, http.StatusCreated, map[string]any{"status": "linked", "contradiction_flag": contradictionFlag})
 }
 
 func (h *Handler) MarkWorkpaperPrepared(w http.ResponseWriter, r *http.Request) {
@@ -228,10 +228,10 @@ func (h *Handler) MarkWorkpaperPrepared(w http.ResponseWriter, r *http.Request) 
 	}
 	updated, _, err := h.store.MarkWorkpaperPrepared(r.Context(), domain.MarkWorkpaperPreparedParams{WorkpaperID: wp.WorkpaperID, TenantID: wp.TenantID, ActorPrincipalID: actor, CorrelationID: correlationID})
 	if err != nil {
-		h.writeWorkpaperErr(w, err)
+		h.writeWorkpaperErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, updated)
+	writeJSON(w, r, http.StatusOK, updated)
 }
 
 // LockWorkpaper is the real enforcement point for "purpose/procedure/
@@ -249,10 +249,10 @@ func (h *Handler) LockWorkpaper(w http.ResponseWriter, r *http.Request) {
 	}
 	locked, _, err := h.store.LockWorkpaper(r.Context(), domain.LockWorkpaperParams{WorkpaperID: wp.WorkpaperID, TenantID: wp.TenantID, ActorPrincipalID: actor, CorrelationID: correlationID})
 	if err != nil {
-		h.writeWorkpaperErr(w, err)
+		h.writeWorkpaperErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, locked)
+	writeJSON(w, r, http.StatusOK, locked)
 }
 
 type addPostLockAddendumRequest struct {
@@ -269,30 +269,30 @@ func (h *Handler) AddPostLockAddendum(w http.ResponseWriter, r *http.Request) {
 	actor, _ := h.requirePrincipal(w, r)
 	var req addPostLockAddendumRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
 		return
 	}
 	addendum, err := h.store.AddPostLockAddendum(r.Context(), domain.AddPostLockAddendumParams{
 		WorkpaperID: wp.WorkpaperID, TenantID: wp.TenantID, ActorPrincipalID: actor, Reason: req.Reason, Effect: req.Effect, Content: req.Content,
 	})
 	if err != nil {
-		h.writeWorkpaperErr(w, err)
+		h.writeWorkpaperErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, addendum)
+	writeJSON(w, r, http.StatusCreated, addendum)
 }
 
-func (h *Handler) writeWorkpaperErr(w http.ResponseWriter, err error) {
+func (h *Handler) writeWorkpaperErr(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
 	case errors.Is(err, domain.ErrWorkpaperNotFound):
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "workpaper_not_found"})
+		writeJSON(w, r, http.StatusNotFound, map[string]string{"error": "workpaper_not_found"})
 	case errors.Is(err, domain.ErrWorkpaperInvalidState):
-		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "invalid_workpaper_state"})
+		writeJSON(w, r, http.StatusUnprocessableEntity, map[string]string{"error": "invalid_workpaper_state"})
 	case errors.Is(err, domain.ErrWorkpaperLockRequiresContent):
-		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "lock_requires_content"})
+		writeJSON(w, r, http.StatusUnprocessableEntity, map[string]string{"error": "lock_requires_content"})
 	case errors.Is(err, domain.ErrWorkpaperAddendumIncomplete):
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "addendum_requires_reason_and_effect"})
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "addendum_requires_reason_and_effect"})
 	default:
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		writeJSON(w, r, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
 	}
 }

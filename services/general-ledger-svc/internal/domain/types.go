@@ -243,6 +243,14 @@ type JournalHeader struct {
 	// and emitted in the JournalCreated outbox event for audit traceability.
 	SoftCloseOverrideReason *string `json:"soft_close_override_reason,omitempty"`
 
+	// CloseJournalDesignation names the close workflow that produced this
+	// journal (see close_journal.go). ACC-14's CLOSE_REVIEW policy admits
+	// "only designated close journals/workflows"; this is the persisted,
+	// server-validated designation that policy consults. Nil for an ordinary
+	// journal. A designation never admits a journal to CLOSED — it is only
+	// meaningful while the period's policy is CLOSE_JOURNALS_ONLY.
+	CloseJournalDesignation *string `json:"close_journal_designation,omitempty"`
+
 	// ── Accounting Kernel journal model (standard §8.1) ──────────────────────
 	//
 	// JournalNumber is the human-readable sequence, unique per entity+book+year and allocated when the journal is posted;
@@ -873,6 +881,17 @@ type QueryLedgerFilter struct {
 	FiscalPeriod  string
 	JournalID     string
 	MaxEntrySeq   *int64 // set by QueryLedgerAsOf to reconstruct a point-in-time view
+
+	// TransactionDateFrom/To bound entries by transaction_date, inclusive at
+	// both ends; a zero Date leaves that end open. A bank reconciliation
+	// looks for the book side of a statement line inside a date window on
+	// one cash account, and a fiscal_period is too coarse for that.
+	TransactionDateFrom Date
+	TransactionDateTo   Date
+	// JournalStatus keeps only entries whose journal is currently in this
+	// status. ledger_entries is append-only, so a REVERSED journal's entries
+	// stay listed; a reader that needs live postings asks for FINALIZED.
+	JournalStatus JournalStatus
 }
 
 // QueryAccountBalanceRequest is QueryAccountBalance's input — reads the
@@ -976,6 +995,15 @@ type CreateJournalRequest struct {
 	// Persisted on the journal header's soft_close_override_reason column and
 	// emitted in the JournalCreated outbox event for audit traceability.
 	SoftCloseOverrideReason string `json:"soft_close_override_reason,omitempty"`
+
+	// CloseJournalDesignation names a close workflow (ACCRUAL_RECOGNITION,
+	// PREPAYMENT_RECOGNITION or PREPAYMENT_TERMINATION) when this journal is
+	// one of ACC-14's designated close journals. It is validated against the
+	// closed allowlist and must agree with JournalType. It does not, by
+	// itself, grant posting authority: during CLOSE_REVIEW the poster must
+	// also hold GL_CLOSE_REVIEW_POSTING. It never admits a journal to a
+	// hard-closed period.
+	CloseJournalDesignation string `json:"close_journal_designation,omitempty"`
 }
 
 type ReverseJournalRequest struct {
@@ -1084,10 +1112,12 @@ var (
 	// closed, same pattern as schema-registry-svc.
 	ErrIdentityMissing = errorString("caller identity missing")
 
-	ErrPeriodLocked              = errorString("accounting period is closed or locked")
-	ErrSoftCloseOverrideRequired = errorString("soft-close override required: elevated finance role and non-empty reason must be provided")
-	ErrPeriodHardClosed          = errorString("accounting period is hard-closed and cannot be posted to")
-	ErrCloseServiceUnavailable   = errorString("financial-close-svc unavailable")
+	ErrPeriodLocked                   = errorString("accounting period is closed or locked")
+	ErrSoftCloseOverrideRequired      = errorString("soft-close override required: elevated finance role and non-empty reason must be provided")
+	ErrCloseJournalsOnly              = errorString("accounting period is in close review; only designated close journals may post")
+	ErrPeriodHardClosed               = errorString("accounting period is hard-closed and cannot be posted to")
+	ErrInvalidCloseJournalDesignation = errorString("close_journal_designation must name a recognised close workflow for this journal type")
+	ErrCloseServiceUnavailable        = errorString("financial-close-svc unavailable")
 
 	// ErrInvalidIdentifier is returned when an id cannot be a UUID at all.
 	// journal_id, tenant_id and legal_entity_id are uuid columns, so Postgres
@@ -1206,6 +1236,7 @@ var (
 	// guard against "Cross-book query leakage": legal_entity_id must
 	// always be supplied and is never inferred or defaulted.
 	ErrLedgerScopeRequired = errorString("legal_entity_id is required to query the ledger")
+	ErrLedgerDateWindow    = errorString("transaction_date_from must not be after transaction_date_to")
 )
 
 // ValidCurrencyCode reports whether s has the shape of an ISO 4217 alphabetic

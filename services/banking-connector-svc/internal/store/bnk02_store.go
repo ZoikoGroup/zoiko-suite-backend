@@ -44,6 +44,13 @@ func (p *PgStore) InitiateConnection(ctx context.Context, params domain.Initiate
 		if requestedScope == nil {
 			requestedScope = []string{}
 		}
+		currency := params.Currency
+		if currency == "" {
+			// Direct/in-process callers predating the BNK-01 currency lookup
+			// keep the legacy value. The HTTP path always supplies the
+			// verified account currency and never reaches this fallback.
+			currency = "USD"
+		}
 		row := tx.QueryRow(ctx, `
 			INSERT INTO bank_connections (
 				connection_id, tenant_id, legal_entity_id, bank_name, bic, account_number, currency, status,
@@ -51,7 +58,7 @@ func (p *PgStore) InitiateConnection(ctx context.Context, params domain.Initiate
 			) VALUES ($1,$2,$3,$4,'','',$5,$6,$7,$8,$9,$10,$11,$12)
 			ON CONFLICT (tenant_id, correlation_id) WHERE correlation_id <> '' DO NOTHING
 			RETURNING `+bnk02Columns,
-			uuid.New().String(), tenantID, params.LegalEntityID, params.BankName, "USD", domain.ConnStatusRequested,
+			uuid.New().String(), tenantID, params.LegalEntityID, params.BankName, currency, domain.ConnStatusRequested,
 			params.BankAccountID, params.ProviderRef, requestedScope, params.Region, params.CorrelationID, params.CreatedByPrincipalID)
 		if err := scanConnection(row, &c); err == nil {
 			created = true

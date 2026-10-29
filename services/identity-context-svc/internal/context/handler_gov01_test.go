@@ -209,7 +209,7 @@ func TestExplainRoute_AsOfMustBeRFC3339(t *testing.T) {
 
 	var body map[string]any
 	decodeBody(t, w, &body)
-	assert.Equal(t, domain.ErrCodeContextUnresolved, body["error_code"])
+	assert.Equal(t, domain.ErrCodeContextUnresolved, body["code"])
 }
 
 func TestExplainRoute_AsOfIsHonoured(t *testing.T) {
@@ -393,7 +393,7 @@ func TestAttachSupportRoute_SelfApprovalIsRefusedWithAStableCode(t *testing.T) {
 
 	var body map[string]any
 	decodeBody(t, w, &body)
-	assert.Equal(t, domain.ErrCodeBreakGlassRequired, body["error_code"])
+	assert.Equal(t, domain.ErrCodeBreakGlassRequired, body["code"])
 }
 
 func TestAttachSupportRoute_SoDConflictIs409WithItsOwnCode(t *testing.T) {
@@ -417,7 +417,7 @@ func TestAttachSupportRoute_SoDConflictIs409WithItsOwnCode(t *testing.T) {
 	decodeBody(t, w, &body)
 	// Distinct from AUTHORIZATION_DENIED: a caller told the latter goes and
 	// asks for a permission grant, which cannot fix a segregation conflict.
-	assert.Equal(t, domain.ErrCodeSoDConflict, body["error_code"])
+	assert.Equal(t, domain.ErrCodeSoDConflict, body["code"])
 }
 
 func TestAttachSupportRoute_SoDOutageIs503NotAGrant(t *testing.T) {

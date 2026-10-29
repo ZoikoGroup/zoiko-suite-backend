@@ -3,6 +3,7 @@
 package handler
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strings"
@@ -88,6 +89,38 @@ func RegisterCreditRoutes(r chi.Router, h *CreditHandler) {
 
 func (h *CreditHandler) fail(w http.ResponseWriter, r *http.Request, err error) {
 	writeFailure(w, r, h.logger, err)
+}
+
+// Replay readers are optional concrete-store capabilities: a replayed
+// credit/write-off/refund command has no tenant context yet, but its claim
+// resource id is globally unique and the seller plane may read it.
+type creditNoteSellerReader interface {
+	GetCreditNoteAsSeller(ctx context.Context, creditNoteID string) (*domain.CreditNote, error)
+}
+type writeOffSellerReader interface {
+	GetWriteOffAsSeller(ctx context.Context, writeOffID string) (*domain.WriteOff, error)
+}
+type refundSellerReader interface {
+	GetRefundRequestAsSeller(ctx context.Context, refundID string) (*domain.RefundRequest, error)
+}
+
+func (h *CreditHandler) creditNoteForReplay(ctx context.Context, id string) (*domain.CreditNote, error) {
+	if reader, ok := h.store.(creditNoteSellerReader); ok {
+		return reader.GetCreditNoteAsSeller(ctx, id)
+	}
+	return h.store.GetCreditNote(ctx, id)
+}
+func (h *CreditHandler) writeOffForReplay(ctx context.Context, id string) (*domain.WriteOff, error) {
+	if reader, ok := h.store.(writeOffSellerReader); ok {
+		return reader.GetWriteOffAsSeller(ctx, id)
+	}
+	return h.store.GetWriteOff(ctx, id)
+}
+func (h *CreditHandler) refundForReplay(ctx context.Context, id string) (*domain.RefundRequest, error) {
+	if reader, ok := h.store.(refundSellerReader); ok {
+		return reader.GetRefundRequestAsSeller(ctx, id)
+	}
+	return h.store.GetRefundRequest(ctx, id)
 }
 
 func (h *CreditHandler) principal(w http.ResponseWriter, r *http.Request) (string, bool) {
@@ -180,7 +213,7 @@ func (h *CreditHandler) IssueCreditNote(w http.ResponseWriter, r *http.Request) 
 	c, err := h.store.IssueCreditNote(r.Context(), id, invoiceID, req.Amount, req.Reason, principal, h.now(), cmd.claim)
 	if err != nil {
 		if HandleIdempotentReplay(w, r, err, func(resourceID string) (any, error) {
-			return h.store.GetCreditNote(r.Context(), resourceID)
+			return h.creditNoteForReplay(r.Context(), resourceID)
 		}) {
 			return
 		}
@@ -238,7 +271,7 @@ func (h *CreditHandler) ApplyWriteOff(w http.ResponseWriter, r *http.Request) {
 	wo, err := h.store.ApplyWriteOff(r.Context(), id, invoiceID, req.Amount, req.Reason, principal, h.now(), cmd.claim)
 	if err != nil {
 		if HandleIdempotentReplay(w, r, err, func(resourceID string) (any, error) {
-			return h.store.GetWriteOff(r.Context(), resourceID)
+			return h.writeOffForReplay(r.Context(), resourceID)
 		}) {
 			return
 		}
@@ -308,7 +341,7 @@ func (h *CreditHandler) RequestRefund(w http.ResponseWriter, r *http.Request) {
 	rr, err := h.store.RequestRefund(r.Context(), id, invoiceID, attemptID, req.Amount, req.DestinationRef, req.Reason, principal, h.now(), cmd.claim)
 	if err != nil {
 		if HandleIdempotentReplay(w, r, err, func(resourceID string) (any, error) {
-			return h.store.GetRefundRequest(r.Context(), resourceID)
+			return h.refundForReplay(r.Context(), resourceID)
 		}) {
 			return
 		}
@@ -354,7 +387,7 @@ func (h *CreditHandler) SettleRefund(w http.ResponseWriter, r *http.Request) {
 	rr, err := h.store.SettleRefund(r.Context(), domainReq, cmd.claim)
 	if err != nil {
 		if HandleIdempotentReplay(w, r, err, func(resourceID string) (any, error) {
-			return h.store.GetRefundRequest(r.Context(), resourceID)
+			return h.refundForReplay(r.Context(), resourceID)
 		}) {
 			return
 		}

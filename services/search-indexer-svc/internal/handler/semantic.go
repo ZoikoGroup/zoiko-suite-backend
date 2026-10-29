@@ -207,28 +207,28 @@ func (h *Handler) EvaluateRetrieval(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(req.Cases) == 0 || len(req.Cases) > maxEvaluationCases {
-		writeError(w, http.StatusBadRequest, "invalid_request",
+		writeError(w, r, http.StatusBadRequest, "invalid_request",
 			fmt.Sprintf("an evaluation needs between 1 and %d cases", maxEvaluationCases))
 		return
 	}
 	if req.MinRecall <= 0 || req.MinRecall > 1 {
-		writeError(w, http.StatusBadRequest, "invalid_request",
+		writeError(w, r, http.StatusBadRequest, "invalid_request",
 			"min_recall must be in (0, 1]; the threshold is the operator's to state (OD-15)")
 		return
 	}
 	if req.K <= 0 || req.K > h.maxResultWindow {
-		writeError(w, http.StatusBadRequest, "invalid_request",
+		writeError(w, r, http.StatusBadRequest, "invalid_request",
 			fmt.Sprintf("k must be between 1 and %d", h.maxResultWindow))
 		return
 	}
 	if env.TenantID == "" {
-		writeErrorCode(w, http.StatusUnauthorized, "tenant_context_missing",
+		writeErrorCode(w, r, http.StatusUnauthorized, "tenant_context_missing",
 			"an evaluation runs inside the caller's verified tenant", domain.ReasonTenantContextMissing)
 		return
 	}
 	for i, c := range req.Cases {
 		if strings.TrimSpace(c.Query) == "" || len(c.ExpectedSourceIDs) == 0 || len(c.ExpectedSourceIDs) > maxExpectedPerCase {
-			writeError(w, http.StatusBadRequest, "invalid_request",
+			writeError(w, r, http.StatusBadRequest, "invalid_request",
 				fmt.Sprintf("case %d: needs a query and 1..%d expected_source_ids", i, maxExpectedPerCase))
 			return
 		}
@@ -237,7 +237,7 @@ func (h *Handler) EvaluateRetrieval(w http.ResponseWriter, r *http.Request) {
 	gen, err := h.store.GetGeneration(r.Context(), generationID)
 	if err != nil {
 		if errors.Is(err, domain.ErrNotFound) {
-			writeError(w, http.StatusNotFound, "not_found", "no such generation")
+			writeError(w, r, http.StatusNotFound, "not_found", "no such generation")
 			return
 		}
 		h.internal(w, r, "get generation", err)
@@ -246,7 +246,7 @@ func (h *Handler) EvaluateRetrieval(w http.ResponseWriter, r *http.Request) {
 	switch gen.State {
 	case domain.GenerationBuilding, domain.GenerationValidating, domain.GenerationReady, domain.GenerationActive:
 	default:
-		writeError(w, http.StatusConflict, "invalid_state",
+		writeError(w, r, http.StatusConflict, "invalid_state",
 			fmt.Sprintf("a %s generation cannot be evaluated", gen.State))
 		return
 	}
@@ -256,7 +256,7 @@ func (h *Handler) EvaluateRetrieval(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if contract.Embedding == nil {
-		writeErrorCode(w, http.StatusConflict, "not_semantic",
+		writeErrorCode(w, r, http.StatusConflict, "not_semantic",
 			"this generation's contract pins no embedding model; there is nothing to certify",
 			domain.ReasonSemanticModelMismatch)
 		return
@@ -268,7 +268,7 @@ func (h *Handler) EvaluateRetrieval(w http.ResponseWriter, r *http.Request) {
 	}
 	vectors, err := h.embedCases(r, *contract.Embedding, queries)
 	if err != nil {
-		writeErrorCode(w, http.StatusServiceUnavailable, "embedding_unavailable",
+		writeErrorCode(w, r, http.StatusServiceUnavailable, "embedding_unavailable",
 			"the pinned model could not embed the evaluation queries: "+err.Error(),
 			domain.ReasonSemanticModelMismatch)
 		return
@@ -379,7 +379,7 @@ func (h *Handler) GetRetrievalEvaluation(w http.ResponseWriter, r *http.Request)
 	eval, err := h.store.LatestRetrievalEvaluation(r.Context(), generationID)
 	if err != nil {
 		if errors.Is(err, domain.ErrNotFound) {
-			writeError(w, http.StatusNotFound, "not_found", "this generation has not been evaluated")
+			writeError(w, r, http.StatusNotFound, "not_found", "this generation has not been evaluated")
 			return
 		}
 		h.internal(w, r, "get evaluation", err)

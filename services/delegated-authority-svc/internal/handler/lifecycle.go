@@ -54,7 +54,7 @@ func (h *Handler) CreateDelegation(w http.ResponseWriter, r *http.Request) {
 	if req.LegalEntityID == "" || req.DelegatorPrincipalID == "" || req.DelegatePrincipalID == "" || req.ActionType == "" ||
 		req.CorrelationID == "" || strings.TrimSpace(req.Reason) == "" {
 		h.countGrant(telemetry.GrantInvalidRequest)
-		writeError(w, http.StatusBadRequest, "missing_fields",
+		writeError(w, r, http.StatusBadRequest, "missing_fields",
 			"legal_entity_id, delegator_principal_id, delegate_principal_id, action_type, correlation_id and reason are required")
 		return
 	}
@@ -63,25 +63,25 @@ func (h *Handler) CreateDelegation(w http.ResponseWriter, r *http.Request) {
 	if req.DelegatorPrincipalID == req.DelegatePrincipalID {
 		h.countGrant(telemetry.GrantDelegateIsDelegator)
 		refuse("delegate_is_delegator")
-		writeError(w, http.StatusBadRequest, "delegate_is_delegator", string(domain.ErrDelegateIsDelegator))
+		writeError(w, r, http.StatusBadRequest, "delegate_is_delegator", string(domain.ErrDelegateIsDelegator))
 		return
 	}
 	if !req.EffectiveTo.After(req.EffectiveFrom) {
 		h.countGrant(telemetry.GrantInvalidWindow)
 		refuse("invalid_window")
-		writeError(w, http.StatusBadRequest, "invalid_time_window", string(domain.ErrInvalidTimeWindow))
+		writeError(w, r, http.StatusBadRequest, "invalid_time_window", string(domain.ErrInvalidTimeWindow))
 		return
 	}
 	if !req.EffectiveTo.After(time.Now()) {
 		h.countGrant(telemetry.GrantInvalidWindow)
 		refuse("invalid_window")
-		writeError(w, http.StatusBadRequest, "invalid_time_window", "effective_to must be in the future")
+		writeError(w, r, http.StatusBadRequest, "invalid_time_window", "effective_to must be in the future")
 		return
 	}
 	if err := domain.ValidateLimit(req.AuthorityLimitCents, req.AuthorityLimitCurrency, req.AuthorityLimitQuantity); err != nil {
 		h.countGrant("invalid_limit")
 		refuse("invalid_limit")
-		writeError(w, http.StatusBadRequest, "invalid_limit", err.Error())
+		writeError(w, r, http.StatusBadRequest, "invalid_limit", err.Error())
 		return
 	}
 
@@ -92,7 +92,7 @@ func (h *Handler) CreateDelegation(w http.ResponseWriter, r *http.Request) {
 		} else {
 			h.countGrant(telemetry.GrantAuthzUnavailable)
 		}
-		h.writeAuthzErr(w, err)
+		h.writeAuthzErr(w, r, err)
 		return
 	}
 
@@ -105,18 +105,18 @@ func (h *Handler) CreateDelegation(w http.ResponseWriter, r *http.Request) {
 		if req.DelegatePrincipalID == principalID {
 			h.countGrant(telemetry.GrantSelfDealing)
 			refuse("self_dealing")
-			writeError(w, http.StatusForbidden, "self_dealing", string(domain.ErrSelfDealing))
+			writeError(w, r, http.StatusForbidden, "self_dealing", string(domain.ErrSelfDealing))
 			return
 		}
 		if err := h.checkAllowed(r.Context(), principalID, req.LegalEntityID, actionDelegationAdminister); err != nil {
 			if errors.Is(err, domain.ErrAuthorizationDenied) {
 				h.countGrant(telemetry.GrantDelegatorMismatch)
 				refuse("delegator_mismatch")
-				writeError(w, http.StatusForbidden, "delegator_mismatch", string(domain.ErrDelegatorMismatch))
+				writeError(w, r, http.StatusForbidden, "delegator_mismatch", string(domain.ErrDelegatorMismatch))
 				return
 			}
 			h.countGrant(telemetry.GrantAuthzUnavailable)
-			h.writeAuthzErr(w, err)
+			h.writeAuthzErr(w, r, err)
 			return
 		}
 	}
@@ -131,18 +131,18 @@ func (h *Handler) CreateDelegation(w http.ResponseWriter, r *http.Request) {
 			refuse(code)
 		}
 		h.countGrant(code)
-		writeError(w, status, nonEmpty(code, "authz_unavailable"), err.Error())
+		writeError(w, r, status, nonEmpty(code, "authz_unavailable"), err.Error())
 		return
 	}
 	if err := h.store.CheckOverlap(r.Context(), g.tenantID, g.legalEntityID, g.delegate, g.actionType, g.from, g.to, req.CorrelationID, ""); err != nil {
 		if errors.Is(err, domain.ErrOverlapConflict) {
 			h.countGrant(telemetry.GrantOverlapConflict)
 			refuse("overlap_conflict")
-			writeError(w, http.StatusConflict, "overlap_conflict", err.Error())
+			writeError(w, r, http.StatusConflict, "overlap_conflict", err.Error())
 			return
 		}
 		h.countGrant(telemetry.GrantStoreUnavailable)
-		h.writeStoreErr(w, err)
+		h.writeStoreErr(w, r, err)
 		return
 	}
 
@@ -165,18 +165,18 @@ func (h *Handler) CreateDelegation(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if errors.Is(err, domain.ErrCorrelationReused) {
 			h.countGrant(telemetry.GrantInvalidRequest)
-			writeError(w, http.StatusConflict, "correlation_reused", err.Error())
+			writeError(w, r, http.StatusConflict, "correlation_reused", err.Error())
 			return
 		}
 		if errors.Is(err, domain.ErrOverlapConflict) {
 			h.countGrant(telemetry.GrantOverlapConflict)
 			refuse("overlap_conflict")
-			writeError(w, http.StatusConflict, "overlap_conflict", err.Error())
+			writeError(w, r, http.StatusConflict, "overlap_conflict", err.Error())
 			return
 		}
 		h.countGrant(telemetry.GrantStoreUnavailable)
 		h.log.Error("failed to create delegation", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
 	// 201 for a grant written now, 200 for a replay of one that already was:
@@ -271,12 +271,12 @@ func expectedVersion(w http.ResponseWriter, r *http.Request) (int64, bool) {
 		v = strings.Trim(strings.TrimPrefix(r.Header.Get("If-Match"), "W/"), `"`)
 	}
 	if v == "" {
-		writeError(w, http.StatusPreconditionRequired, "version_required", string(domain.ErrVersionRequired))
+		writeError(w, r, http.StatusPreconditionRequired, "version_required", string(domain.ErrVersionRequired))
 		return 0, false
 	}
 	n, err := strconv.ParseInt(v, 10, 64)
 	if err != nil || n <= 0 {
-		writeError(w, http.StatusBadRequest, "invalid_expected_version", "expected_version must be a positive integer")
+		writeError(w, r, http.StatusBadRequest, "invalid_expected_version", "expected_version must be a positive integer")
 		return 0, false
 	}
 	return n, true
@@ -300,7 +300,7 @@ func (h *Handler) transitionPrelude(w http.ResponseWriter, r *http.Request, need
 	}
 	reason := strings.TrimSpace(body.Reason)
 	if needReason && reason == "" {
-		writeError(w, http.StatusBadRequest, "reason_required", string(domain.ErrReasonRequired))
+		writeError(w, r, http.StatusBadRequest, "reason_required", string(domain.ErrReasonRequired))
 		return nil, "", 0, "", false
 	}
 	principalID, ok := h.requirePrincipal(w, r)
@@ -312,7 +312,7 @@ func (h *Handler) transitionPrelude(w http.ResponseWriter, r *http.Request, need
 	h.sweepExpired(r.Context())
 	d, err := h.store.GetDelegation(r.Context(), chi.URLParam(r, "delegation_id"))
 	if err != nil {
-		h.writeStoreErr(w, err)
+		h.writeStoreErr(w, r, err)
 		return nil, "", 0, "", false
 	}
 	return d, principalID, version, reason, true
@@ -321,7 +321,7 @@ func (h *Handler) transitionPrelude(w http.ResponseWriter, r *http.Request, need
 func (h *Handler) apply(w http.ResponseWriter, r *http.Request, d *domain.DelegationGrant, kind store.TransitionKind, in domain.TransitionInput) bool {
 	updated, err := h.store.Transition(r.Context(), d.DelegationID, kind, in)
 	if err != nil {
-		h.writeStoreErr(w, err)
+		h.writeStoreErr(w, r, err)
 		return false
 	}
 	writeJSON(w, http.StatusOK, updated)
@@ -338,16 +338,16 @@ func (h *Handler) keepWithinDelegator(w http.ResponseWriter, r *http.Request, d 
 		if code != "" {
 			h.recordRefusedEscalation(r.Context(), code, requestOf(d, to), caller, r)
 		}
-		writeError(w, status, nonEmpty(code, "authz_unavailable"), err.Error())
+		writeError(w, r, status, nonEmpty(code, "authz_unavailable"), err.Error())
 		return false
 	}
 	if err := h.store.CheckOverlap(r.Context(), d.TenantID, d.LegalEntityID, d.DelegatePrincipalID, d.ActionType, d.EffectiveFrom, to, "", d.DelegationID); err != nil {
 		if errors.Is(err, domain.ErrOverlapConflict) {
 			h.recordRefusedEscalation(r.Context(), "overlap_conflict", requestOf(d, to), caller, r)
-			writeError(w, http.StatusConflict, "overlap_conflict", err.Error())
+			writeError(w, r, http.StatusConflict, "overlap_conflict", err.Error())
 			return false
 		}
-		h.writeStoreErr(w, err)
+		h.writeStoreErr(w, r, err)
 		return false
 	}
 	return true
@@ -364,7 +364,7 @@ func (h *Handler) segregatedFromMaker(w http.ResponseWriter, r *http.Request, d 
 		return true
 	}
 	h.recordRefusedEscalation(r.Context(), "approval_not_segregated", requestOf(d, d.EffectiveTo), caller, r)
-	writeError(w, http.StatusForbidden, "approval_not_segregated", string(domain.ErrApprovalNotSegregated))
+	writeError(w, r, http.StatusForbidden, "approval_not_segregated", string(domain.ErrApprovalNotSegregated))
 	return false
 }
 
@@ -387,17 +387,17 @@ func (h *Handler) ActivateDelegation(w http.ResponseWriter, r *http.Request) {
 	if caller != d.DelegatorPrincipalID {
 		if caller == d.CreatedByPrincipalID || caller == d.DelegatePrincipalID {
 			h.recordRefusedEscalation(r.Context(), "approval_not_segregated", requestOf(d, d.EffectiveTo), caller, r)
-			writeError(w, http.StatusForbidden, "approval_not_segregated", string(domain.ErrApprovalNotSegregated))
+			writeError(w, r, http.StatusForbidden, "approval_not_segregated", string(domain.ErrApprovalNotSegregated))
 			return
 		}
 		if err := h.checkAllowed(r.Context(), caller, d.LegalEntityID, actionDelegationAdminister); err != nil {
-			h.writeAuthzErr(w, err)
+			h.writeAuthzErr(w, r, err)
 			return
 		}
 		method = domain.ApprovalAdministrator
 	}
 	if d.Status != domain.DelegationStatusProposed {
-		writeError(w, http.StatusConflict, "invalid_transition", "only a PROPOSED delegation can be activated")
+		writeError(w, r, http.StatusConflict, "invalid_transition", "only a PROPOSED delegation can be activated")
 		return
 	}
 	if !h.keepWithinDelegator(w, r, d, caller, d.EffectiveTo) {
@@ -417,7 +417,7 @@ func (h *Handler) SuspendDelegation(w http.ResponseWriter, r *http.Request) {
 	}
 	if caller != d.DelegatorPrincipalID {
 		if err := h.checkAllowed(r.Context(), caller, d.LegalEntityID, actionDelegationRevoke); err != nil {
-			h.writeAuthzErr(w, err)
+			h.writeAuthzErr(w, r, err)
 			return
 		}
 	}
@@ -436,19 +436,19 @@ func (h *Handler) ResumeDelegation(w http.ResponseWriter, r *http.Request) {
 	if caller != d.DelegatorPrincipalID {
 		if caller == d.DelegatePrincipalID {
 			h.recordRefusedEscalation(r.Context(), "self_dealing", requestOf(d, d.EffectiveTo), caller, r)
-			writeError(w, http.StatusForbidden, "self_dealing", "the delegate may not resume their own delegation")
+			writeError(w, r, http.StatusForbidden, "self_dealing", "the delegate may not resume their own delegation")
 			return
 		}
 		if !h.segregatedFromMaker(w, r, d, caller) {
 			return
 		}
 		if err := h.checkAllowed(r.Context(), caller, d.LegalEntityID, actionDelegationAdminister); err != nil {
-			h.writeAuthzErr(w, err)
+			h.writeAuthzErr(w, r, err)
 			return
 		}
 	}
 	if d.Status != domain.DelegationStatusSuspended {
-		writeError(w, http.StatusConflict, "invalid_transition", "only a SUSPENDED delegation can be resumed")
+		writeError(w, r, http.StatusConflict, "invalid_transition", "only a SUSPENDED delegation can be resumed")
 		return
 	}
 	if !h.keepWithinDelegator(w, r, d, caller, d.EffectiveTo) {
@@ -471,14 +471,14 @@ func (h *Handler) RevokeDelegation(w http.ResponseWriter, r *http.Request) {
 		} else {
 			h.countRevoke(telemetry.RevokeUnavailable)
 		}
-		h.writeAuthzErr(w, err)
+		h.writeAuthzErr(w, r, err)
 		return
 	}
 	updated, err := h.store.Transition(r.Context(), d.DelegationID, store.Revoke,
 		domain.TransitionInput{ExpectedVersion: version, ActorPrincipalID: caller, Reason: reason})
 	if err != nil {
 		h.countRevokeStoreErr(err)
-		h.writeStoreErr(w, err)
+		h.writeStoreErr(w, r, err)
 		return
 	}
 	h.countRevoke(telemetry.RevokeRevoked)
@@ -505,7 +505,7 @@ func (h *Handler) ExtendDelegation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.NewEffectiveTo.IsZero() || req.CorrelationID == "" || strings.TrimSpace(req.Reason) == "" {
-		writeError(w, http.StatusBadRequest, "missing_fields", "new_effective_to, correlation_id and reason are required")
+		writeError(w, r, http.StatusBadRequest, "missing_fields", "new_effective_to, correlation_id and reason are required")
 		return
 	}
 	caller, ok := h.requirePrincipal(w, r)
@@ -515,13 +515,13 @@ func (h *Handler) ExtendDelegation(w http.ResponseWriter, r *http.Request) {
 	h.sweepExpired(r.Context())
 	d, err := h.store.GetDelegation(r.Context(), chi.URLParam(r, "delegation_id"))
 	if err != nil {
-		h.writeStoreErr(w, err)
+		h.writeStoreErr(w, r, err)
 		return
 	}
 	if caller != d.DelegatorPrincipalID {
 		if caller == d.DelegatePrincipalID {
 			h.recordRefusedEscalation(r.Context(), "self_dealing", requestOf(d, d.EffectiveTo), caller, r)
-			writeError(w, http.StatusForbidden, "self_dealing", "the delegate may not extend their own delegation")
+			writeError(w, r, http.StatusForbidden, "self_dealing", "the delegate may not extend their own delegation")
 			return
 		}
 		if !h.segregatedFromMaker(w, r, d, caller) {
@@ -529,19 +529,19 @@ func (h *Handler) ExtendDelegation(w http.ResponseWriter, r *http.Request) {
 		}
 		if err := h.checkAllowed(r.Context(), caller, d.LegalEntityID, actionDelegationAdminister); err != nil {
 			if errors.Is(err, domain.ErrAuthorizationDenied) {
-				writeError(w, http.StatusForbidden, "forbidden", "only the delegator or an administrator may extend a delegation")
+				writeError(w, r, http.StatusForbidden, "forbidden", "only the delegator or an administrator may extend a delegation")
 			} else {
-				h.writeAuthzErr(w, err)
+				h.writeAuthzErr(w, r, err)
 			}
 			return
 		}
 	}
 	if d.Status != domain.DelegationStatusActive {
-		writeError(w, http.StatusConflict, "cannot_extend", string(domain.ErrCannotExtend))
+		writeError(w, r, http.StatusConflict, "cannot_extend", string(domain.ErrCannotExtend))
 		return
 	}
 	if !req.NewEffectiveTo.After(d.EffectiveTo) {
-		writeError(w, http.StatusBadRequest, "invalid_time_window", "new_effective_to must be after current effective_to")
+		writeError(w, r, http.StatusBadRequest, "invalid_time_window", "new_effective_to must be after current effective_to")
 		return
 	}
 	if !h.keepWithinDelegator(w, r, d, caller, req.NewEffectiveTo) {

@@ -22,6 +22,7 @@ func scanRun(row interface{ Scan(...any) error }, r *domain.ReconciliationRun) e
 	if err := row.Scan(
 		&r.RunID, &r.TenantID, &r.LegalEntityID, &r.BankAccountID, &r.StatementDate,
 		&status, &r.PolicyID, &r.PolicyVersion, &r.MaxUnmatchedCount, &r.MaxUnmatchedPct,
+		&r.MaxUnresolvedAmount, &r.PolicyCurrency,
 		&r.PopulationID, &r.PopulationVersion,
 		&r.CertifiedByPrincipalID, &r.CertifiedAt,
 		&r.SupersededByRunID, &r.PriorRunID,
@@ -36,6 +37,7 @@ func scanRun(row interface{ Scan(...any) error }, r *domain.ReconciliationRun) e
 const runSelectColumns = `
 	run_id, tenant_id, legal_entity_id, bank_account_id, statement_date::text,
 	status, policy_id, policy_version, max_unmatched_count, max_unmatched_pct,
+	max_unresolved_amount, policy_currency,
 	population_id, population_version,
 	certified_by_principal_id, certified_at,
 	superseded_by_run_id, prior_run_id,
@@ -390,33 +392,52 @@ func (s *PgStore) AdvanceRunStatus(ctx context.Context, tenantID, runID string, 
 func (s *PgStore) CreatePolicy(ctx context.Context, tenantID string, req domain.CreatePolicyRequest, principalID string) (*domain.ReconciliationPolicy, error) {
 	var pol domain.ReconciliationPolicy
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		// 1. Find the highest active-run-bound policy for this legal entity.
-		// If any active run is bound to a policy that is stricter than what
-		// we're trying to create, reject (cannot widen during active run).
-		row := tx.QueryRow(ctx, `
-			SELECT p.max_unmatched_count, p.max_unmatched_pct
+		// 1. Every policy bound to an active run for this legal entity is a
+		// constraint, not just the newest one. A run bound to an older,
+		// stricter policy must not have its tolerance widened underneath it
+		// just because a newer, looser policy also exists.
+		rows, err := tx.Query(ctx, `
+			SELECT p.max_unmatched_count, p.max_unmatched_pct,
+			       p.max_unresolved_amount, p.currency
 			FROM reconciliation_runs r
 			JOIN reconciliation_policies p ON p.policy_id = r.policy_id
 			WHERE r.tenant_id = $1
 			  AND r.legal_entity_id = $2
 			  AND r.status = ANY($3)
 			  AND r.policy_id IS NOT NULL
-			ORDER BY p.policy_version DESC
-			LIMIT 1
 		`, tenantID, req.LegalEntityID, activeRunStatuses)
-
-		var boundCount int
-		var boundPct float64
-		err := row.Scan(&boundCount, &boundPct)
-		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		if err != nil {
 			return err
 		}
-		if err == nil {
-			// A policy is bound to an active run. Reject if new policy is wider.
+		for rows.Next() {
+			var boundCount int
+			var boundPct, boundAmount float64
+			var boundCurrency string
+			if err := rows.Scan(&boundCount, &boundPct, &boundAmount, &boundCurrency); err != nil {
+				rows.Close()
+				return err
+			}
 			if req.MaxUnmatchedCount > boundCount || req.MaxUnmatchedPct > boundPct {
+				rows.Close()
+				return domain.ErrPolicyWouldWidenActiveRun
+			}
+			// A currency change makes the two amounts incomparable. The
+			// service has no FX basis, so it cannot prove the new amount is
+			// not wider; refuse while a run is bound rather than guess.
+			if req.Currency != boundCurrency {
+				rows.Close()
+				return domain.ErrPolicyWouldWidenActiveRun
+			}
+			if req.MaxUnresolvedAmount > boundAmount {
+				rows.Close()
 				return domain.ErrPolicyWouldWidenActiveRun
 			}
 		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		rows.Close()
 
 		// 2. Assign next version number for this tenant+legal_entity.
 		var maxVersion int
@@ -504,13 +525,15 @@ func (s *PgStore) BindPolicy(ctx context.Context, tenantID, runID, policyID stri
 		// Verify policy belongs to tenant.
 		var polVersion int
 		var maxCount int
-		var maxPct float64
+		var maxPct, maxAmount float64
+		var currency string
 		polRow := tx.QueryRow(ctx, `
-			SELECT policy_version, max_unmatched_count, max_unmatched_pct
+			SELECT policy_version, max_unmatched_count, max_unmatched_pct,
+			       max_unresolved_amount, currency
 			FROM reconciliation_policies
 			WHERE policy_id = $1 AND tenant_id = $2
 		`, policyID, tenantID)
-		if err := polRow.Scan(&polVersion, &maxCount, &maxPct); err != nil {
+		if err := polRow.Scan(&polVersion, &maxCount, &maxPct, &maxAmount, &currency); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return domain.ErrPolicyNotFound
 			}
@@ -521,9 +544,10 @@ func (s *PgStore) BindPolicy(ctx context.Context, tenantID, runID, policyID stri
 			UPDATE reconciliation_runs
 			SET policy_id = $1, policy_version = $2,
 			    max_unmatched_count = $3, max_unmatched_pct = $4,
+			    max_unresolved_amount = $5, policy_currency = $6,
 			    updated_at = now()
-			WHERE run_id = $5 AND tenant_id = $6 AND status = 'DRAFT'
-		`, policyID, polVersion, maxCount, maxPct, runID, tenantID)
+			WHERE run_id = $7 AND tenant_id = $8 AND status = 'DRAFT'
+		`, policyID, polVersion, maxCount, maxPct, maxAmount, currency, runID, tenantID)
 		if err != nil {
 			return err
 		}
@@ -550,8 +574,10 @@ func (s *PgStore) CertifyRun(ctx context.Context, tenantID, runID, certifierPrin
 	var created bool
 
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		// 1. Load run.
-		runRow := tx.QueryRow(ctx, `SELECT `+runSelectColumns+` FROM reconciliation_runs WHERE run_id = $1 AND tenant_id = $2`, runID, tenantID)
+		// 1. Load and lock the run. Two certifiers racing must serialise here:
+		// the second waits, then sees CERTIFIED and returns the original
+		// certificate instead of inserting a second one.
+		runRow := tx.QueryRow(ctx, `SELECT `+runSelectColumns+` FROM reconciliation_runs WHERE run_id = $1 AND tenant_id = $2 FOR UPDATE`, runID, tenantID)
 		var run domain.ReconciliationRun
 		if err := scanRun(runRow, &run); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
@@ -597,38 +623,73 @@ func (s *PgStore) CertifyRun(ctx context.Context, tenantID, runID, certifierPrin
 			return domain.ErrRunPopulationNotFrozen
 		}
 
-		// 4b. Run-level SoD: the certifying principal must not be the
-		// matcher of record for any MATCHED line in this run's frozen
-		// population — otherwise the same person who did the matching
-		// could also sign off on it. Line-level maker-checker already
-		// blocks self-confirmation for an individual PENDING_CONFIRMATION
-		// match (ConfirmMatch); this is the run-level analogue, closing
-		// the same class of gap at certification.
-		var selfCertifiedCount int
-		scRow := tx.QueryRow(ctx, `
-			SELECT COUNT(*)
-			FROM statement_lines sl
-			JOIN reconciliation_population_lines pl ON pl.statement_line_id = sl.statement_line_id
-			WHERE pl.population_id = $1 AND pl.tenant_id = $2::uuid AND pl.included = TRUE
-			  AND sl.status = 'MATCHED' AND sl.matched_by_principal_id = $3
-		`, *run.PopulationID, tenantID, certifierPrincipalID)
-		if err := scRow.Scan(&selfCertifiedCount); err != nil {
+		// 4b. Run-level SoD: the certifier must be independent of EVERYONE who
+		// prepared this run — its creator, the principal who froze its
+		// population, every proposer and matcher of record in the frozen
+		// population, and (through the creator of a reperformed run) whoever
+		// reperformed it. Line-level maker-checker already blocks
+		// self-confirmation for an individual PENDING_CONFIRMATION match
+		// (ConfirmMatch); this is the run-level analogue, using the complete
+		// preparer set rather than only the matcher of the last line.
+		prepRows, err := tx.Query(ctx, `
+			SELECT DISTINCT principal_id
+			FROM (
+				SELECT created_by_principal_id AS principal_id
+				FROM reconciliation_runs
+				WHERE run_id = $1 AND tenant_id = $2::uuid
+				UNION
+				SELECT frozen_by_principal_id
+				FROM reconciliation_populations
+				WHERE population_id = $3 AND tenant_id = $2::uuid
+				UNION
+				SELECT sl.matched_by_principal_id
+				FROM statement_lines sl
+				JOIN reconciliation_population_lines pl ON pl.statement_line_id = sl.statement_line_id
+				WHERE pl.population_id = $3 AND pl.tenant_id = $2::uuid AND pl.included = TRUE
+				  AND sl.matched_by_principal_id IS NOT NULL
+				UNION
+				SELECT sl.proposed_by_principal_id
+				FROM statement_lines sl
+				JOIN reconciliation_population_lines pl ON pl.statement_line_id = sl.statement_line_id
+				WHERE pl.population_id = $3 AND pl.tenant_id = $2::uuid AND pl.included = TRUE
+				  AND sl.proposed_by_principal_id IS NOT NULL
+			) p
+			WHERE principal_id IS NOT NULL AND principal_id <> ''
+		`, runID, tenantID, *run.PopulationID)
+		if err != nil {
 			return err
 		}
-		if selfCertifiedCount > 0 {
-			return domain.ErrRunSelfCertificationForbidden
+		var preparers []string
+		for prepRows.Next() {
+			var principalID string
+			if err := prepRows.Scan(&principalID); err != nil {
+				prepRows.Close()
+				return err
+			}
+			preparers = append(preparers, principalID)
+		}
+		prepRows.Close()
+		if err := prepRows.Err(); err != nil {
+			return err
+		}
+		if err := domain.CheckCertifierIndependence(certifierPrincipalID, preparers); err != nil {
+			return err
 		}
 
-		// 5. Count unmatched lines within the frozen population (not live statement_lines).
-		var unmatchedCount int
+		// 5. Count every included line that is not MATCHED as unresolved.
+		// UNMATCHED, EXCEPTION and PENDING_CONFIRMATION are all unresolved:
+		// an exception is an explained-but-unreconciled item, and a pending
+		// proposal has not been approved by a checker yet. Counting only
+		// UNMATCHED let a run certify with either of those still outstanding.
+		var unresolvedCount int
 		umRow := tx.QueryRow(ctx, `
 			SELECT COUNT(*)
 			FROM statement_lines sl
 			JOIN reconciliation_population_lines pl ON pl.statement_line_id = sl.statement_line_id
 			WHERE pl.population_id = $1 AND pl.tenant_id = $2::uuid AND pl.included = TRUE
-			  AND sl.status = 'UNMATCHED'
+			  AND sl.status <> 'MATCHED'
 		`, *run.PopulationID, tenantID)
-		if err := umRow.Scan(&unmatchedCount); err != nil {
+		if err := umRow.Scan(&unresolvedCount); err != nil {
 			return err
 		}
 
@@ -646,15 +707,43 @@ func (s *PgStore) CertifyRun(ctx context.Context, tenantID, runID, certifierPrin
 		}
 
 		// 7. Policy check.
-		if run.MaxUnmatchedCount >= 0 && unmatchedCount > run.MaxUnmatchedCount {
+		if run.MaxUnmatchedCount >= 0 && unresolvedCount > run.MaxUnmatchedCount {
 			// Check pct tolerance only if count check fails.
-			totalLines := unmatchedCount + matchedCount
+			totalLines := unresolvedCount + matchedCount
 			if totalLines > 0 {
-				unmatchedPct := float64(unmatchedCount) / float64(totalLines)
+				unmatchedPct := float64(unresolvedCount) / float64(totalLines)
 				if unmatchedPct > run.MaxUnmatchedPct {
 					return domain.ErrMaterialResidualBlocked
 				}
 			} else {
+				return domain.ErrMaterialResidualBlocked
+			}
+		}
+
+		// 7b. Unresolved exposure, in the currency the run pinned at bind
+		// time. MaxUnresolvedAmount was stored on the policy but never
+		// applied; a count/per cent tolerance alone lets one enormous
+		// exception through. A line in another currency cannot be assessed
+		// without an FX basis, so that is refused rather than assumed within
+		// tolerance.
+		if run.PolicyID != nil {
+			var exposureCents int64
+			var foreignCurrencyCount int
+			exRow := tx.QueryRow(ctx, `
+				SELECT COALESCE(SUM(ABS(ROUND(sl.amount * 100))), 0)::bigint,
+				       COUNT(*) FILTER (WHERE sl.currency_code <> $3)::int
+				FROM statement_lines sl
+				JOIN reconciliation_population_lines pl ON pl.statement_line_id = sl.statement_line_id
+				WHERE pl.population_id = $1 AND pl.tenant_id = $2::uuid AND pl.included = TRUE
+				  AND sl.status <> 'MATCHED'
+			`, *run.PopulationID, tenantID, run.PolicyCurrency)
+			if err := exRow.Scan(&exposureCents, &foreignCurrencyCount); err != nil {
+				return err
+			}
+			if foreignCurrencyCount > 0 {
+				return domain.ErrUnresolvedExposureUnassessable
+			}
+			if exposureCents > int64(math.Round(run.MaxUnresolvedAmount*100)) {
 				return domain.ErrMaterialResidualBlocked
 			}
 		}
@@ -740,13 +829,15 @@ func (s *PgStore) SupersedeRun(ctx context.Context, tenantID, existingRunID, pri
 			INSERT INTO reconciliation_runs (
 				tenant_id, legal_entity_id, bank_account_id, statement_date,
 				status, prior_run_id, created_by_principal_id, correlation_id,
-				policy_id, policy_version, max_unmatched_count, max_unmatched_pct
-			) VALUES ($1,$2,$3,$4,'DRAFT',$5,$6,$7,$8,$9,$10,$11)
+				policy_id, policy_version, max_unmatched_count, max_unmatched_pct,
+				max_unresolved_amount, policy_currency
+			) VALUES ($1,$2,$3,$4,'DRAFT',$5,$6,$7,$8,$9,$10,$11,$12,$13)
 			RETURNING `+runSelectColumns,
 			tenantID, existing.LegalEntityID, existing.BankAccountID, existing.StatementDate,
 			existingRunID, principalID, correlationID,
 			existing.PolicyID, existing.PolicyVersion,
 			existing.MaxUnmatchedCount, existing.MaxUnmatchedPct,
+			existing.MaxUnresolvedAmount, existing.PolicyCurrency,
 		)
 		if err := scanRun(newRunRow, &newRun); err != nil {
 			return err

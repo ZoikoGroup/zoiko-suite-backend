@@ -327,7 +327,7 @@ func (h *Handler) GetLegalEntityAsOf(w http.ResponseWriter, r *http.Request) {
 	if raw != "" {
 		parsed, err := parseAsOf(raw)
 		if err != nil {
-			writeErrJSON(w, http.StatusBadRequest,
+			writeErrJSON(w, r, http.StatusBadRequest,
 				"as_of must be an RFC3339 timestamp or a YYYY-MM-DD date", correlationID(r))
 			return
 		}

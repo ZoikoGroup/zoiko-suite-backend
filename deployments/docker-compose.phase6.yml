@@ -265,8 +265,10 @@ services:
   # ── 07. Mutual TLS Management Service ─────────────────────────────────────
   mtls-management-svc:
     build:
-      context: ../services/mtls-management-svc
-      dockerfile: Dockerfile
+      # Root context: go.mod replaces zoiko.io/identity-envelope with the
+      # sibling module, so the build must see both (see the Dockerfile).
+      context: ..
+      dockerfile: services/mtls-management-svc/Dockerfile
     container_name: mtls-management-svc-p6
     ports:
       - "8140:8140"
@@ -290,8 +292,10 @@ services:
   # ── 08. SIEM Integration Service ──────────────────────────────────────────
   siem-integration-svc:
     build:
-      context: ../services/siem-integration-svc
-      dockerfile: Dockerfile
+      # Root context: go.mod replaces zoiko.io/identity-envelope with the
+      # sibling module, so the build must see both (see the Dockerfile).
+      context: ..
+      dockerfile: services/siem-integration-svc/Dockerfile
     container_name: siem-integration-svc-p6
     ports:
       - "8141:8141"
@@ -312,8 +316,10 @@ services:
   # ── 09. CARTA Service ───────────────────────────────────────────────────────
   carta-svc:
     build:
-      context: ../services/carta-svc
-      dockerfile: Dockerfile
+      # Root context: go.mod replaces zoiko.io/identity-envelope with the
+      # sibling module, so the build must see both (see the Dockerfile).
+      context: ..
+      dockerfile: services/carta-svc/Dockerfile
     container_name: carta-svc-p6
     ports:
       - "8142:8142"
@@ -334,8 +340,10 @@ services:
   # ── 10. BYOK / HYOK Key Management Service ─────────────────────────────────
   key-management-svc:
     build:
-      context: ../services/key-management-svc
-      dockerfile: Dockerfile
+      # Root context: go.mod replaces zoiko.io/identity-envelope with the
+      # sibling module, so the build must see both (see the Dockerfile).
+      context: ..
+      dockerfile: services/key-management-svc/Dockerfile
     container_name: key-management-svc-p6
     ports:
       - "8143:8143"

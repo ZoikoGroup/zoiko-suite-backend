@@ -34,9 +34,9 @@ func TestHTTPClient_CheckPeriodOpen_PostingPolicy(t *testing.T) {
 			expectedErr:   domain.ErrSoftCloseOverrideRequired,
 		},
 		{
-			name:          "CLOSE_JOURNALS_ONLY policy treated as hard closed",
+			name:          "CLOSE_JOURNALS_ONLY policy admits only designated close journals",
 			postingPolicy: "CLOSE_JOURNALS_ONLY",
-			expectedErr:   domain.ErrPeriodHardClosed,
+			expectedErr:   domain.ErrCloseJournalsOnly,
 		},
 		{
 			name:          "CLOSED policy refuses posting",

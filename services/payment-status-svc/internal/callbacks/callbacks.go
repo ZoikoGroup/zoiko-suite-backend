@@ -101,12 +101,14 @@ type Result struct {
 
 // Counters are exposed for operators; every refusal is counted by reason.
 type Counters struct {
-	SignatureFailed atomic.Int64
-	Stale           atomic.Int64
-	Malformed       atomic.Int64
-	UnknownProvider atomic.Int64
-	Applied         atomic.Int64
-	Duplicate       atomic.Int64
+	SignatureFailed  atomic.Int64
+	Stale            atomic.Int64
+	Malformed        atomic.Int64
+	UnknownProvider  atomic.Int64
+	Applied          atomic.Int64
+	Duplicate        atomic.Int64
+	ConflictBlocked  atomic.Int64
+	ProviderMismatch atomic.Int64
 }
 
 // Processor handles callbacks.
@@ -229,6 +231,10 @@ func (p *Processor) Handle(ctx context.Context, providerKey, tenantID string, hd
 		p.Count.Applied.Add(1)
 	case store.OutcomeDuplicate:
 		p.Count.Duplicate.Add(1)
+	case store.OutcomeConflictBlocked:
+		p.Count.ConflictBlocked.Add(1)
+	case store.OutcomeProviderMismatch:
+		p.Count.ProviderMismatch.Add(1)
 	}
 	out := map[string]any{"outcome": res.Outcome, "applied": res.Outcome == store.OutcomeApplied}
 	if res.Detail != "" {
@@ -236,9 +242,11 @@ func (p *Processor) Handle(ctx context.Context, providerKey, tenantID string, hd
 	}
 	// 200 for every decided outcome, including "ignored": a provider that gets a non-2xx retries, and
 	// retrying a decided event can only produce another receipt, never a different effect.
-	// An unknown payment is 202: not decided, so the provider keeps retrying until we know it.
+	// Not-decided outcomes are 202: the provider keeps retrying until the payment is known, the
+	// conflict is resolved, or the provider that actually owns the payment calls.
 	code := http.StatusOK
-	if res.Outcome == store.OutcomeUnknownPayment || res.Outcome == store.OutcomeAmbiguousPayment {
+	switch res.Outcome {
+	case store.OutcomeUnknownPayment, store.OutcomeAmbiguousPayment, store.OutcomeConflictBlocked, store.OutcomeProviderMismatch:
 		code = http.StatusAccepted
 	}
 	return Result{Status: code, Outcome: res.Outcome, Body: out}

@@ -10,10 +10,12 @@ package store_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 	"go.uber.org/zap"
 
 	"zoiko.io/financial-close-svc/internal/domain"
@@ -25,6 +27,7 @@ func approvedAllocationRule(t *testing.T, ctx context.Context, s *store.PgStore,
 	t.Helper()
 	ruleID := uuid.New().String()
 	rule := &domain.AllocationRule{
+		CurrencyCode:  storeTestCurrency,
 		RuleVersionID: ruleID, RuleID: ruleID, Version: 1, TenantID: tenantID, LegalEntityID: "le-1",
 		Name: "IT shared cost allocation", SourceAccountCode: "5000-ITSharedCost",
 		Drivers: []domain.AllocationDriver{
@@ -33,7 +36,7 @@ func approvedAllocationRule(t *testing.T, ctx context.Context, s *store.PgStore,
 		},
 		Status: domain.AllocationRuleStatusDraft, CreatedAt: time.Now().UTC(), CreatedByPrincipalID: "preparer-1",
 	}
-	if err := s.CreateAllocationRule(ctx, rule); err != nil {
+	if _, err := s.CreateAllocationRule(ctx, rule, "key-"+rule.RuleVersionID, testRequestHash); err != nil {
 		t.Fatalf("CreateAllocationRule: %v", err)
 	}
 	if err := s.ApproveAllocationRule(ctx, rule.RuleVersionID, "approver-1", time.Now().UTC()); err != nil {
@@ -52,6 +55,7 @@ func TestPgStore_ACC09_SupersedeAllocationRule_RealDB(t *testing.T) {
 	original := approvedAllocationRule(t, ctx, s, tenantID)
 
 	newVersion := &domain.AllocationRule{
+		CurrencyCode:  storeTestCurrency,
 		RuleVersionID: uuid.New().String(), LegalEntityID: "le-1",
 		Name: "IT shared cost allocation (revised)", SourceAccountCode: "5000-ITSharedCost",
 		Drivers: []domain.AllocationDriver{
@@ -100,16 +104,18 @@ func TestPgStore_ACC09_SupersedeAllocationRule_NoCurrentVersion_Refused(t *testi
 
 	ruleID := uuid.New().String()
 	draft := &domain.AllocationRule{
+		CurrencyCode:  storeTestCurrency,
 		RuleVersionID: ruleID, RuleID: ruleID, Version: 1, TenantID: tenantID, LegalEntityID: "le-1",
 		Name: "draft rule", SourceAccountCode: "5000-X",
 		Drivers: []domain.AllocationDriver{{RecipientAccountCode: "6100-Sales", WeightPercentage: 100}},
 		Status:  domain.AllocationRuleStatusDraft, CreatedAt: time.Now().UTC(), CreatedByPrincipalID: "preparer-1",
 	}
-	if err := s.CreateAllocationRule(ctx, draft); err != nil {
+	if _, err := s.CreateAllocationRule(ctx, draft, "key-"+draft.RuleVersionID, testRequestHash); err != nil {
 		t.Fatalf("CreateAllocationRule: %v", err)
 	}
 
 	newVersion := &domain.AllocationRule{
+		CurrencyCode:  storeTestCurrency,
 		RuleVersionID: uuid.New().String(), LegalEntityID: "le-1", Name: "x", SourceAccountCode: "5000-X",
 		Drivers:   []domain.AllocationDriver{{RecipientAccountCode: "6100-Sales", WeightPercentage: 100}},
 		CreatedAt: time.Now().UTC(), CreatedByPrincipalID: "preparer-1",
@@ -142,11 +148,14 @@ func TestPgStore_ACC09_CurrentVersionUniqueConstraint_RealDB(t *testing.T) {
 	_, err = pool.Exec(ctx, `
 		INSERT INTO allocation_rules (
 			rule_version_id, rule_id, version, tenant_id, legal_entity_id, name,
-			source_account_code, status, created_at, created_by_principal_id
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+			source_account_code, status, created_at, created_by_principal_id, currency_code
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 	`, uuid.New().String(), original.RuleID, 2, tenantID, "le-1", "duplicate current version",
-		"5000-ITSharedCost", domain.AllocationRuleStatusDraft, time.Now().UTC(), "preparer-1")
-	if err == nil {
-		t.Fatal("expected the UNIQUE(rule_id) WHERE effective_to IS NULL constraint to reject a second current version")
+		"5000-ITSharedCost", domain.AllocationRuleStatusDraft, time.Now().UTC(), "preparer-1", storeTestCurrency)
+	// Asserted by name: a row the currency guard (migration 000022) refused
+	// would also be an error, and would pass this test for the wrong reason.
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.ConstraintName != "idx_allocation_rules_current_version" {
+		t.Fatalf("expected idx_allocation_rules_current_version to reject a second current version, got %v", err)
 	}
 }

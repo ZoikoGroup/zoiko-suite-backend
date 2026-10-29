@@ -59,7 +59,7 @@ func problemOf(t *testing.T, rec *httptest.ResponseRecorder) map[string]any {
 	require.Equal(t, "application/problem+json", rec.Header().Get("Content-Type"), rec.Body.String())
 	var body map[string]any
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
-	for _, k := range []string{"type", "title", "status", "code", "error"} {
+	for _, k := range []string{"type", "title", "status", "code"} {
 		require.Contains(t, body, k)
 	}
 	return body
@@ -72,7 +72,8 @@ func TestEvaluate_IsAuthorizedAtTheEntity(t *testing.T) {
 
 	rec := do(t, h, http.MethodPost, "/v1/evidence/evaluate", evaluateBody(), testTenant, testPrincipal)
 	assert.Equal(t, http.StatusForbidden, rec.Code)
-	assert.Equal(t, "AUTHORIZATION_DENIED", problemOf(t, rec)["error_class"])
+	body := problemOf(t, rec)
+	assert.Equal(t, "authorization_denied", body["code"])
 	assert.Equal(t, []string{"EVIDENCE_EVALUATE@" + testEntity}, az.asked)
 	assert.Empty(t, st.recordedEvals, "a refused evaluation must not write a governance record")
 

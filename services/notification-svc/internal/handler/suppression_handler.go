@@ -42,7 +42,7 @@ func (h *Handler) AddSuppression(w http.ResponseWriter, r *http.Request) {
 	}
 	req.RecipientEmail = strings.ToLower(strings.TrimSpace(req.RecipientEmail))
 	if req.RecipientEmail == "" || req.Reason == "" {
-		writeError(w, http.StatusBadRequest, "missing_fields", "recipient_email and reason are required")
+		writeError(w, r, http.StatusBadRequest, "missing_fields", "recipient_email and reason are required")
 		return
 	}
 
@@ -52,13 +52,13 @@ func (h *Handler) AddSuppression(w http.ResponseWriter, r *http.Request) {
 	// about which principal can create records in it.
 	if h.authz != nil {
 		if err := h.authz.CheckAllowed(r.Context(), principalID, tenantID, actionSuppressionManage); err != nil {
-			h.writeAuthzErr(w, err)
+			h.writeAuthzErr(w, r, err)
 			return
 		}
 	}
 
 	if h.suppressions == nil {
-		writeError(w, http.StatusServiceUnavailable, "service_unavailable", "suppression store not configured")
+		writeError(w, r, http.StatusServiceUnavailable, "service_unavailable", "suppression store not configured")
 		return
 	}
 
@@ -74,7 +74,7 @@ func (h *Handler) AddSuppression(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := h.suppressions.AddSuppression(r.Context(), supp); err != nil {
 		h.log.Error("failed to add suppression", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusCreated, supp)
@@ -96,7 +96,7 @@ func (h *Handler) ListSuppressions(w http.ResponseWriter, r *http.Request) {
 
 	if h.authz != nil {
 		if err := h.authz.CheckAllowed(r.Context(), principalID, tenantID, actionSuppressionManage); err != nil {
-			h.writeAuthzErr(w, err)
+			h.writeAuthzErr(w, r, err)
 			return
 		}
 	}
@@ -107,14 +107,14 @@ func (h *Handler) ListSuppressions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if h.suppressions == nil {
-		writeError(w, http.StatusServiceUnavailable, "service_unavailable", "suppression store not configured")
+		writeError(w, r, http.StatusServiceUnavailable, "service_unavailable", "suppression store not configured")
 		return
 	}
 
 	list, err := h.suppressions.ListSuppressions(r.Context(), tenantID, limit, offset)
 	if err != nil {
 		h.log.Error("failed to list suppressions", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
 	if list == nil {
@@ -142,7 +142,7 @@ func (h *Handler) ListSuppressions(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) HandleUnsubscribe(w http.ResponseWriter, r *http.Request) {
 	if h.suppressions == nil || h.unsubscribe == nil {
 		h.log.Error("unsubscribe receiver called but unsubscribe is not configured")
-		writeError(w, http.StatusServiceUnavailable, "service_unavailable", "unsubscribe is not configured")
+		writeError(w, r, http.StatusServiceUnavailable, "service_unavailable", "unsubscribe is not configured")
 		return
 	}
 
@@ -162,14 +162,14 @@ func (h *Handler) HandleUnsubscribe(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if token == "" {
-		writeError(w, http.StatusBadRequest, "invalid_request", "an unsubscribe token is required")
+		writeError(w, r, http.StatusBadRequest, "invalid_request", "an unsubscribe token is required")
 		return
 	}
 
 	claims, err := h.unsubscribe.Open(token)
 	if err != nil {
 		h.log.Warn("unsubscribe refused: token does not verify", zap.String("remote", r.RemoteAddr))
-		writeError(w, http.StatusForbidden, "invalid_token", "the unsubscribe link is not valid")
+		writeError(w, r, http.StatusForbidden, "invalid_token", "the unsubscribe link is not valid")
 		return
 	}
 
@@ -184,7 +184,7 @@ func (h *Handler) HandleUnsubscribe(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := h.suppressions.AddSuppression(r.Context(), supp); err != nil {
 		h.log.Error("failed to record unsubscribe suppression", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "the unsubscribe could not be recorded; try again")
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "the unsubscribe could not be recorded; try again")
 		return
 	}
 

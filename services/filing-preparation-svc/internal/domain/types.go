@@ -6,10 +6,11 @@ import (
 )
 
 var (
-	ErrDraftNotFound      = errors.New("filing draft not found")
-	ErrDraftAlreadyFinal  = errors.New("filing draft is already finalized")
-	ErrValidationBlocked  = errors.New("filing draft evidence validation failed")
-	ErrMissingRequiredDoc = errors.New("missing required evidence document")
+	ErrDraftNotFound       = errors.New("filing draft not found")
+	ErrDraftAlreadyFinal   = errors.New("filing draft is already finalized")
+	ErrValidationBlocked   = errors.New("filing draft evidence validation failed")
+	ErrValidationRequired  = errors.New("filing draft must be validated before finalization")
+	ErrMissingRequiredDoc  = errors.New("missing required evidence document")
 
 	// ErrTenantMissing means the request carried no X-Tenant-Id. It is an
 	// unauthenticated request, not an empty tenant named "default".

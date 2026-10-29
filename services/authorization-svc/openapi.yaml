@@ -36,12 +36,13 @@ info:
     refused wherever they hold the permission, with basis
     `principal_status:<status>`.
 
-    **Errors.** `{"error": "<code>", "message": "...", "error_class":
-    "<class>"}`. `error` is the stable code callers match on; `error_class`
-    is the Governance Control Plane A16 class (`CONTEXT_UNRESOLVED`,
+    **Errors.** RFC 9457 `application/problem+json` (ZS-API-001 A12). `code`
+    is the stable code callers match on; `error_class` is the Governance
+    Control Plane A16 class (`CONTEXT_UNRESOLVED`, `AUTHENTICATION_FAILED`,
     `AUTHORIZATION_DENIED`, `SOD_CONFLICT`, `APPROVAL_INVALIDATED`,
-    `CONCURRENCY_CONFLICT`, `IDEMPOTENCY_MISMATCH`), present where one
-    applies.
+    `CONCURRENCY_CONFLICT`, `IDEMPOTENCY_MISMATCH`, `DEPENDENCY_UNAVAILABLE`),
+    present where one applies. Other members of a refusal (`field`, `reason`,
+    `approval_status`, ...) are extension members.
 
     **Idempotency.** Every material write honours `Idempotency-Key`: a retry
     returns the first response (`X-Idempotent-Replay: true`, `201` answered
@@ -164,9 +165,9 @@ paths:
         '403':
           description: tenant_scope_mismatch / tenant_required / workload_not_registered / authorization_denied — fail-closed.
           content:
-            application/json:
+            application/problem+json:
               schema:
-                $ref: '#/components/schemas/Error'
+                $ref: '#/components/schemas/Problem'
         '503':
           $ref: '#/components/responses/StoreUnavailable'
 
@@ -390,6 +391,10 @@ paths:
         matched grants / delegation removed — the reason codes remain.
         Asking for another principal is `403`.
       parameters:
+        - name: session_id
+          in: query
+          schema: { type: string, format: uuid }
+          description: Only decisions made in this JIT, break-glass or support session (AU-13).
         - $ref: '#/components/parameters/TenantHeader'
         - name: principal_id
           in: query
@@ -537,15 +542,15 @@ paths:
         '403':
           description: 'Forbidden — including `self_grant_not_allowed` on reactivation of a held role.'
           content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
           description: 'Conflict — `version_conflict`, or `sod_conflict` naming the holders.'
           content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
 
   /v1/admin/roles/{role_id}/reactivate:
     post:
@@ -573,15 +578,15 @@ paths:
         '403':
           description: 'Forbidden — including `self_grant_not_allowed`.'
           content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
           description: 'Conflict — `version_conflict` or `sod_conflict`.'
           content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
 
   /v1/admin/roles/{role_id}/permission-bundles:
     post:
@@ -757,13 +762,13 @@ paths:
         '403':
           description: 'Forbidden — including `self_grant_not_allowed`.'
           content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '409':
           description: 'Conflict — `sod_conflict` at the assignment scope, or `idempotency_mismatch`.'
           content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
     get:
       tags: [Role Assignments]
       summary: List role assignments
@@ -820,15 +825,15 @@ paths:
         '403':
           description: 'Forbidden — including `checker_not_independent`.'
           content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
           description: 'Conflict — `approval_expired`, `sod_conflict` after re-check, or `version_conflict`.'
           content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
 
   /v1/admin/role-assignments/{assignment_id}/reject:
     post:
@@ -1008,8 +1013,8 @@ paths:
             schema:
               $ref: '#/components/schemas/CreateSoDRuleRequest'
       responses:
-        '201':
-          description: Rule created.
+        '202':
+          description: Proposed — inactive until published by someone else (AU-17).
           content:
             application/json:
               schema:
@@ -1021,8 +1026,8 @@ paths:
         '403':
           description: 'Forbidden — a tenant-wide rule without `SOD_RULE_MANAGE_GLOBAL` is `403 authorization_denied`.'
           content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '409':
           $ref: '#/components/responses/Conflict'
     get:
@@ -1060,8 +1065,8 @@ paths:
       requestBody:
         $ref: '#/components/requestBodies/CommandBody'
       responses:
-        '200':
-          description: Rule retired.
+        '202':
+          description: Change requested; the rule is unchanged until published by someone else (AU-17). 200 when already in that state.
           content:
             application/json:
               schema:
@@ -1073,8 +1078,8 @@ paths:
         '403':
           description: 'Forbidden — including `sod_self_interest`.'
           content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
@@ -1093,8 +1098,8 @@ paths:
       requestBody:
         $ref: '#/components/requestBodies/CommandBody'
       responses:
-        '200':
-          description: Rule reactivated.
+        '202':
+          description: Change requested; the rule is unchanged until published by someone else (AU-17). 200 when already in that state.
           content:
             application/json:
               schema:
@@ -1225,8 +1230,8 @@ paths:
         '403':
           description: 'Forbidden — requester or subject: `checker_not_independent`.'
           content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
@@ -1310,8 +1315,8 @@ paths:
               description: 'Rule code, action, effect and conditions. A REQUIRE rule whose attribute the caller does not send is a denial (`abac:require_failed`).'
               additionalProperties: true
       responses:
-        '201':
-          description: Rule created.
+        '202':
+          description: Proposed — inactive until published by someone else (AU-17).
           content:
             application/json:
               schema:
@@ -1359,8 +1364,8 @@ paths:
       requestBody:
         $ref: '#/components/requestBodies/CommandBody'
       responses:
-        '200':
-          description: Rule retired.
+        '202':
+          description: Change requested; the rule is unchanged until published by someone else (AU-17). 200 when already in that state.
           content:
             application/json:
               schema:
@@ -1389,8 +1394,8 @@ paths:
       requestBody:
         $ref: '#/components/requestBodies/CommandBody'
       responses:
-        '200':
-          description: Rule reactivated.
+        '202':
+          description: Change requested; the rule is unchanged until published by someone else (AU-17). 200 when already in that state.
           content:
             application/json:
               schema:
@@ -1919,8 +1924,8 @@ paths:
             schema:
               $ref: '#/components/schemas/CreateBreakGlassSessionRequest'
       responses:
-        '201':
-          description: Session ACTIVE.
+        '202':
+          description: Requested — PENDING_APPROVAL until independent approvers approve it (AU-02).
           content:
             application/json:
               schema:
@@ -1969,8 +1974,8 @@ paths:
             schema:
               $ref: '#/components/schemas/CreateBreakGlassSessionRequest'
       responses:
-        '201':
-          description: Session ACTIVE.
+        '202':
+          description: Requested — PENDING_APPROVAL until independent approvers approve it (AU-02).
           content:
             application/json:
               schema:
@@ -2289,6 +2294,530 @@ paths:
         '409':
           $ref: '#/components/responses/Conflict'
 
+  /admin/v1/privileged-sessions/{session_id}/activity:
+    get:
+      tags: [Privileged Sessions]
+      summary: What was done in a JIT session
+      description: '`iam.session.review` or the kind''s manage permission. Every decision recorded in the session, newest first (max 500, `truncated` beyond), with granted / denied counts and the actions and resources touched (AU-13).'
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Done.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionActivity'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/admin/privileged-sessions/{session_id}/activity:
+    get:
+      tags: [Privileged Sessions]
+      summary: What was done in a JIT session — /v1/admin spelling
+      description: '`iam.session.review` or the kind''s manage permission. Every decision recorded in the session, newest first (max 500, `truncated` beyond), with granted / denied counts and the actions and resources touched (AU-13).'
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Done.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionActivity'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /admin/v1/break-glass-sessions/{session_id}/approve:
+    post:
+      tags: [Break-Glass Sessions]
+      summary: Approve a break-glass request
+      description: '`iam.break_glass.approve`, a §16 reason, and a recent MFA step-up (401 `step_up_required` otherwise). The approver is never the subject or the requester (403 `checker_not_independent`); each approver counts once (409 `already_approved`). When approvals reach `approvals_required` (AUTHZ_BREAK_GLASS_APPROVALS, default 1) the session becomes ACTIVE and its duration starts (AU-02; GOV-12).'
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        $ref: '#/components/requestBodies/CommandBody'
+      responses:
+        '200':
+          description: Approval recorded; status ACTIVE once the quorum is met.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BreakGlassSession'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/StepUpRequired'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/v1/break-glass-sessions/{session_id}/reject:
+    post:
+      tags: [Break-Glass Sessions]
+      summary: Reject a break-glass request
+      description: '`iam.break_glass.approve` and a §16 reason; no step-up. One independent rejection ends the request: REJECTED, nothing granted (GOV-12 "approval ambiguity => no activation").'
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        $ref: '#/components/requestBodies/CommandBody'
+      responses:
+        '200':
+          description: Rejected.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BreakGlassSession'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/v1/break-glass-sessions/{session_id}/activity:
+    get:
+      tags: [Break-Glass Sessions]
+      summary: What was done in a break-glass session
+      description: '`iam.session.review` or the kind''s manage permission. Every decision recorded in the session, newest first (max 500, `truncated` beyond), with granted / denied counts and the actions and resources touched (AU-13).'
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Done.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionActivity'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/admin/break-glass-sessions/{session_id}/approve:
+    post:
+      tags: [Break-Glass Sessions]
+      summary: Approve a break-glass request — /v1/admin spelling
+      description: '`iam.break_glass.approve`, a §16 reason, and a recent MFA step-up (401 `step_up_required` otherwise). The approver is never the subject or the requester (403 `checker_not_independent`); each approver counts once (409 `already_approved`). When approvals reach `approvals_required` (AUTHZ_BREAK_GLASS_APPROVALS, default 1) the session becomes ACTIVE and its duration starts (AU-02; GOV-12).'
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        $ref: '#/components/requestBodies/CommandBody'
+      responses:
+        '200':
+          description: Approval recorded; status ACTIVE once the quorum is met.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BreakGlassSession'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/StepUpRequired'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /v1/admin/break-glass-sessions/{session_id}/reject:
+    post:
+      tags: [Break-Glass Sessions]
+      summary: Reject a break-glass request — /v1/admin spelling
+      description: '`iam.break_glass.approve` and a §16 reason; no step-up. One independent rejection ends the request: REJECTED, nothing granted (GOV-12 "approval ambiguity => no activation").'
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        $ref: '#/components/requestBodies/CommandBody'
+      responses:
+        '200':
+          description: Rejected.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BreakGlassSession'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /v1/admin/break-glass-sessions/{session_id}/activity:
+    get:
+      tags: [Break-Glass Sessions]
+      summary: What was done in a break-glass session — /v1/admin spelling
+      description: '`iam.session.review` or the kind''s manage permission. Every decision recorded in the session, newest first (max 500, `truncated` beyond), with granted / denied counts and the actions and resources touched (AU-13).'
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Done.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionActivity'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/support/sessions/{session_id}/activity:
+    get:
+      tags: [Support Sessions]
+      summary: What was done in a support session
+      description: '`iam.session.review` or the kind''s manage permission. Every decision recorded in the session, newest first (max 500, `truncated` beyond), with granted / denied counts and the actions and resources touched (AU-13).'
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Done.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionActivity'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/admin/sod-rules/{sod_rule_id}/approve:
+    post:
+      tags: [Segregation of Duties]
+      summary: Publish a requested rule change
+      description: '`iam.sod_rule.publish` (a platform-wide rule: `SOD_RULE_MANAGE_GLOBAL` at platform scope) and a §16 reason. Applies the pending change — PUBLISH and REACTIVATE switch the rule on, RETIRE switches it off — by someone other than the requester (403 `checker_not_independent`); 409 `approval_not_pending` when nothing awaits a decision (AU-17).'
+      parameters:
+        - name: sod_rule_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        $ref: '#/components/requestBodies/CommandBody'
+      responses:
+        '200':
+          description: Published.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SoDRule'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /v1/admin/sod-rules/{sod_rule_id}/reject:
+    post:
+      tags: [Segregation of Duties]
+      summary: Reject a requested rule change
+      description: '`iam.sod_rule.publish` and a §16 reason. Clears the pending change; a rejected PUBLISH leaves the rule REJECTED for good.'
+      parameters:
+        - name: sod_rule_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        $ref: '#/components/requestBodies/CommandBody'
+      responses:
+        '200':
+          description: Rejected.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SoDRule'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /v1/admin/abac-rules/{abac_rule_id}/approve:
+    post:
+      tags: [ABAC Rules]
+      summary: Publish a requested rule change
+      description: '`iam.policy.publish` (a platform-wide rule: `ABAC_RULE_MANAGE_GLOBAL` at platform scope) and a §16 reason. Applies the pending change — PUBLISH and REACTIVATE switch the rule on, RETIRE switches it off — by someone other than the requester (403 `checker_not_independent`); 409 `approval_not_pending` when nothing awaits a decision (AU-17).'
+      parameters:
+        - name: abac_rule_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        $ref: '#/components/requestBodies/CommandBody'
+      responses:
+        '200':
+          description: Published.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ABACRule'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /v1/admin/abac-rules/{abac_rule_id}/reject:
+    post:
+      tags: [ABAC Rules]
+      summary: Reject a requested rule change
+      description: '`iam.policy.publish` and a §16 reason. Clears the pending change; a rejected PUBLISH leaves the rule REJECTED for good.'
+      parameters:
+        - name: abac_rule_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        $ref: '#/components/requestBodies/CommandBody'
+      responses:
+        '200':
+          description: Rejected.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ABACRule'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /v1/admin/authority-limits:
+    get:
+      tags: [Authority Limits]
+      summary: List approval and signing authority limits
+      description: '`iam.policy.read`. Every version, newest first. `?status=` (PENDING_APPROVAL, ACTIVE, REJECTED, RETIRED, SUPERSEDED, or PENDING for anything awaiting a decision), `?principal_id=`, `?role_id=`, `?authority_type=` narrow it.'
+      responses:
+        '200':
+          description: Done.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthorityLimitList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags: [Authority Limits]
+      summary: Request a new authority limit
+      description: '`iam.authority_limit.manage` and a §16 reason. Recorded PENDING_APPROVAL; it limits nothing until an independent holder of `iam.authority_limit.approve` approves it (AU-03; ZS-IAM-001 §12).'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateAuthorityLimitRequest'
+      responses:
+        '202':
+          description: Requested.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthorityLimit'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /v1/admin/authority-limits/{authority_limit_id}/change:
+    post:
+      tags: [Authority Limits]
+      summary: Request a change to a limit in force
+      description: '`iam.authority_limit.manage`. Proposes new amounts or dates as a new PENDING_APPROVAL version naming the one it supersedes; the current limit applies until the change is approved. Who and where it applies to cannot change. One open change per limit (409 `change_pending`).'
+      parameters:
+        - name: authority_limit_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateAuthorityLimitRequest'
+      responses:
+        '202':
+          description: Change requested.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthorityLimit'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /v1/admin/authority-limits/{authority_limit_id}/retire:
+    post:
+      tags: [Authority Limits]
+      summary: Request a limit''s retirement
+      description: '`iam.authority_limit.manage` and a §16 reason. Marks the ACTIVE limit `pending_action: RETIRE`; it keeps applying until the retirement is approved.'
+      parameters:
+        - name: authority_limit_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        $ref: '#/components/requestBodies/CommandBody'
+      responses:
+        '202':
+          description: Retirement requested.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthorityLimit'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /v1/admin/authority-limits/{authority_limit_id}/approve:
+    post:
+      tags: [Authority Limits]
+      summary: Approve what is pending on a limit
+      description: '`iam.authority_limit.approve` and a §16 reason. The checker is neither the requester nor the person the limit is for (403 `checker_not_independent`). Approving a change supersedes the version it replaces in the same transaction; emits `iam.authority_limit.changed`.'
+      parameters:
+        - name: authority_limit_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        $ref: '#/components/requestBodies/CommandBody'
+      responses:
+        '200':
+          description: Approved.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthorityLimit'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /v1/admin/authority-limits/{authority_limit_id}/reject:
+    post:
+      tags: [Authority Limits]
+      summary: Reject what is pending on a limit
+      description: '`iam.authority_limit.approve` and a §16 reason. A pending limit or change becomes REJECTED; a pending retirement is cleared and the limit stays in force.'
+      parameters:
+        - name: authority_limit_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        $ref: '#/components/requestBodies/CommandBody'
+      responses:
+        '200':
+          description: Rejected.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthorityLimit'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
   /v1/admin/authorization-cache/invalidate:
     post:
       tags: [GOV-03 Commands]
@@ -2465,47 +2994,74 @@ components:
     BadRequest:
       description: 'Bad request — `400`. Codes include `missing_field`, `envelope_incomplete`, `invalid_json`, `duration_exceeds_maximum`, `protected_privilege_not_delegable`, `missing_tenant_scope`.'
       content:
-        application/json:
+        application/problem+json:
           schema:
-            $ref: '#/components/schemas/Error'
+            $ref: '#/components/schemas/Problem'
     Unauthorized:
       description: 'Unauthorized — `401`. Codes include `identity_assertion_required`, `identity_assertion_invalid`, `client_certificate_required`, `step_up_required`.'
       content:
-        application/json:
+        application/problem+json:
           schema:
-            $ref: '#/components/schemas/Error'
+            $ref: '#/components/schemas/Problem'
     Forbidden:
       description: 'Forbidden — `403`. Codes include `authorization_denied`, `tenant_scope_mismatch`, `tenant_required`, `identity_mismatch`, `self_grant_not_allowed`, `checker_not_independent`, `sod_self_interest`, `workload_not_registered`, `workload_identity_mismatch`.'
       content:
-        application/json:
+        application/problem+json:
           schema:
-            $ref: '#/components/schemas/Error'
+            $ref: '#/components/schemas/Problem'
     NotFound:
       description: 'Not found — `404`.'
       content:
-        application/json:
+        application/problem+json:
           schema:
-            $ref: '#/components/schemas/Error'
+            $ref: '#/components/schemas/Problem'
     Conflict:
       description: 'Conflict — `409`. Codes include `sod_conflict`, `version_conflict`, `idempotency_mismatch`, `approval_expired`.'
       content:
-        application/json:
+        application/problem+json:
           schema:
-            $ref: '#/components/schemas/Error'
+            $ref: '#/components/schemas/Problem'
     StepUpRequired:
       description: 'Step-up required — `401 step_up_required` with the reason and `WWW-Authenticate: Bearer error="insufficient_user_authentication"`.'
       content:
-        application/json:
+        application/problem+json:
           schema:
             $ref: '#/components/schemas/StepUpRequired'
     StoreUnavailable:
       description: '`503` — cannot answer: `store_unavailable`, or `entity_registry_unavailable` when the registry lookup fails. Fail-closed: a 503 is never "no".'
       content:
-        application/json:
+        application/problem+json:
           schema:
-            $ref: '#/components/schemas/Error'
+            $ref: '#/components/schemas/Problem'
 
   schemas:
+    Problem:
+      type: object
+      required: [type, title, status, code]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        code: { type: string }
+        request_id: { type: string }
+        correlation_id: { type: string }
+        retryable: { type: boolean }
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              pointer: { type: string }
+              code: { type: string }
+              detail: { type: string }
+        current_version: { type: integer, format: int64 }
+        decision_id: { type: string }
+        error_class:
+          type: string
+          enum: [CONTEXT_UNRESOLVED, AUTHENTICATION_FAILED, AUTHORIZATION_DENIED, SOD_CONFLICT, APPROVAL_INVALIDATED, CONCURRENCY_CONFLICT, IDEMPOTENCY_MISMATCH, DEPENDENCY_UNAVAILABLE]
+
     Error:
       type: object
       required: [error]
@@ -2526,15 +3082,17 @@ components:
       additionalProperties: true
 
     StepUpRequired:
-      type: object
-      properties:
-        error: { type: string, const: step_up_required }
-        reason:
-          type: string
-          enum: [no_verified_identity, delegated_caller, single_factor, step_up_stale, authn_time_unknown, authn_time_in_future, assertion_principal_mismatch]
-        required_assurance: { type: string, const: MFA }
-        max_authn_age_seconds: { type: integer }
-      additionalProperties: true
+      description: A problem with code `step_up_required`, plus the step-up members.
+      allOf:
+        - $ref: '#/components/schemas/Problem'
+        - type: object
+          properties:
+            code: { type: string, const: step_up_required }
+            reason:
+              type: string
+              enum: [no_verified_identity, delegated_caller, single_factor, step_up_stale, authn_time_unknown, authn_time_in_future, assertion_principal_mismatch]
+            required_assurance: { type: string, const: MFA }
+            max_authn_age_seconds: { type: integer }
 
     AuthorizeRequest:
       type: object
@@ -2606,8 +3164,10 @@ components:
       properties:
         access_decision_id: { type: string }
         decision: { type: string, enum: [PERMIT, DENY, STEP_UP, REQUIRE_APPROVAL] }
+        decision_outcome: { type: string, enum: [GRANTED, DENIED, STEP_UP] }
         principal_id: { type: string }
         tenant_id: { type: string }
+        legal_entity_id: { type: string }
         action_type: { type: string }
         resource_type: { type: string }
         resource_id: { type: string }
@@ -2618,8 +3178,10 @@ components:
         policy_set_version: { type: string }
         on_behalf_of: { type: string }
         delegation_id: { type: string }
+        session_kind: { type: string, enum: [PRIVILEGED, BREAK_GLASS, SUPPORT], description: 'AU-13: the session the decision was made in.' }
+        session_id: { type: string }
         expires_at: { type: string, format: date-time }
-        created_at: { type: string, format: date-time }
+        decided_at: { type: string, format: date-time }
       additionalProperties: true
 
     Role:
@@ -2727,22 +3289,34 @@ components:
       properties:
         sod_rule_id: { type: string }
         tenant_id: { type: string, nullable: true, description: Null means platform-wide (SOD_RULE_MANAGE_GLOBAL). }
-        rule_code: { type: string }
+        domain_code: { type: string }
         action_a: { type: string }
         action_b: { type: string }
-        severity: { type: string }
-        status: { type: string, enum: [ACTIVE, RETIRED] }
+        conflict_type: { type: string }
+        jurisdiction_id: { type: string, nullable: true }
+        active_flag: { type: boolean, description: What evaluation reads; changes only when a change is published. }
         version: { type: integer }
+        created_at: { type: string, format: date-time }
+        publication_status: { type: string, enum: [PENDING_APPROVAL, PUBLISHED, REJECTED], description: 'AU-17: only a PUBLISHED rule can be active.' }
+        pending_change: { type: string, nullable: true, enum: [PUBLISH, REACTIVATE, RETIRE] }
+        change_requested_by: { type: string, nullable: true }
+        change_requested_at: { type: string, format: date-time, nullable: true }
+        change_reason: { type: string, nullable: true }
+        published_by: { type: string, nullable: true }
+        published_at: { type: string, format: date-time, nullable: true }
+        rejected_by: { type: string, nullable: true }
+        rejected_at: { type: string, format: date-time, nullable: true }
       additionalProperties: true
 
     CreateSoDRuleRequest:
       type: object
-      required: [rule_code]
+      required: [domain_code, action_a, action_b, conflict_type]
       properties:
-        rule_code: { type: string }
+        domain_code: { type: string }
         action_a: { type: string }
         action_b: { type: string }
-        severity: { type: string }
+        conflict_type: { type: string }
+        jurisdiction_id: { type: string }
         tenant_id: { type: string, description: Omit for a platform-wide rule (needs SOD_RULE_MANAGE_GLOBAL). }
         reason_code: { type: string }
         purpose: { type: string }
@@ -2777,12 +3351,26 @@ components:
       type: object
       properties:
         abac_rule_id: { type: string }
-        tenant_id: { type: string }
+        tenant_id: { type: string, nullable: true }
         rule_code: { type: string }
         action_type: { type: string }
-        effect: { type: string, enum: [REQUIRE, DENY] }
-        status: { type: string, enum: [ACTIVE, RETIRED] }
+        effect: { type: string, enum: [REQUIRE, FORBID] }
+        attribute_key: { type: string }
+        operator: { type: string }
+        attribute_value: { type: string, nullable: true }
+        active_flag: { type: boolean }
+        created_by_principal_id: { type: string }
         version: { type: integer }
+        created_at: { type: string, format: date-time }
+        publication_status: { type: string, enum: [PENDING_APPROVAL, PUBLISHED, REJECTED], description: 'AU-17: only a PUBLISHED rule can be active.' }
+        pending_change: { type: string, nullable: true, enum: [PUBLISH, REACTIVATE, RETIRE] }
+        change_requested_by: { type: string, nullable: true }
+        change_requested_at: { type: string, format: date-time, nullable: true }
+        change_reason: { type: string, nullable: true }
+        published_by: { type: string, nullable: true }
+        published_at: { type: string, format: date-time, nullable: true }
+        rejected_by: { type: string, nullable: true }
+        rejected_at: { type: string, format: date-time, nullable: true }
       additionalProperties: true
 
     WorkloadBinding:
@@ -2840,8 +3428,27 @@ components:
         incident_id: { type: string }
         reason: { type: string }
         requested_actions: { type: array, items: { type: string } }
-        status: { type: string, enum: [ACTIVE, REVOKED, EXPIRED, ENDED] }
+        status: { type: string, enum: [PENDING_APPROVAL, ACTIVE, REJECTED, REVOKED, EXPIRED] }
+        duration_seconds: { type: integer }
+        expires_at: { type: string, format: date-time, description: Starts at activation. }
+        requested_by: { type: string }
+        approvals_required: { type: integer, description: 'AU-02 quorum (AUTHZ_BREAK_GLASS_APPROVALS).' }
+        approvals: { type: array, items: { $ref: '#/components/schemas/BreakGlassApproval' } }
+        approved_by: { type: string, nullable: true }
+        approved_at: { type: string, format: date-time, nullable: true }
+        rejected_by: { type: string, nullable: true }
+        rejected_at: { type: string, format: date-time, nullable: true }
+        request_expires_at: { type: string, format: date-time, nullable: true, description: An unanswered request lapses (EXPIRED) after an hour. }
+        review_status: { type: string, enum: [NOT_REQUIRED, PENDING, ATTESTED, FLAGGED] }
+        requester_step_up: { $ref: '#/components/schemas/StepUpEvidence' }
       additionalProperties: true
+
+    BreakGlassApproval:
+      type: object
+      properties:
+        approver_id: { type: string }
+        approved_at: { type: string, format: date-time }
+        step_up: { $ref: '#/components/schemas/StepUpEvidence' }
 
     CreateBreakGlassSessionRequest:
       type: object
@@ -2947,3 +3554,65 @@ components:
         principal_id: { type: string }
         capabilities: { type: array, items: { type: string } }
       additionalProperties: true
+
+    SessionActivity:
+      type: object
+      properties:
+        session_kind: { type: string, enum: [PRIVILEGED, BREAK_GLASS, SUPPORT] }
+        session_id: { type: string }
+        granted: { type: integer }
+        denied: { type: integer }
+        actions: { type: array, items: { type: string } }
+        resources: { type: array, items: { type: string } }
+        decisions: { type: array, items: { $ref: '#/components/schemas/AccessDecision' } }
+        truncated: { type: boolean }
+
+    AuthorityLimit:
+      type: object
+      properties:
+        authority_limit_id: { type: string }
+        tenant_id: { type: string }
+        principal_id: { type: string, nullable: true }
+        role_id: { type: string, nullable: true }
+        authority_type: { type: string }
+        legal_entity_id: { type: string, nullable: true }
+        book_id: { type: string, nullable: true }
+        org_unit_id: { type: string, nullable: true }
+        currency: { type: string }
+        lower_limit: { type: string }
+        upper_limit: { type: string }
+        effective_from: { type: string, format: date-time }
+        effective_to: { type: string, format: date-time, nullable: true }
+        status: { type: string, enum: [PENDING_APPROVAL, ACTIVE, REJECTED, RETIRED, SUPERSEDED], description: Only ACTIVE limits anything. }
+        pending_action: { type: string, nullable: true, enum: [RETIRE] }
+        supersedes_id: { type: string, nullable: true }
+        requested_by: { type: string, nullable: true }
+        requested_at: { type: string, format: date-time, nullable: true }
+        request_reason: { type: string, nullable: true }
+        decided_by: { type: string, nullable: true }
+        decided_at: { type: string, format: date-time, nullable: true }
+        last_decision: { type: string, nullable: true, enum: [APPROVED, REJECTED] }
+        version: { type: integer }
+
+    AuthorityLimitList:
+      type: object
+      properties:
+        authority_limits: { type: array, items: { $ref: '#/components/schemas/AuthorityLimit' } }
+
+    CreateAuthorityLimitRequest:
+      type: object
+      properties:
+        principal_id: { type: string, description: One of principal_id or role_id (create only). }
+        role_id: { type: string }
+        authority_type: { type: string, description: 'What it governs, e.g. invoice_approval, payment_release (create only).' }
+        legal_entity_id: { type: string }
+        book_id: { type: string }
+        org_unit_id: { type: string }
+        currency: { type: string, enum: [GBP, USD, EUR, CAD, AUD, JPY, CHF] }
+        lower_limit: { type: string, example: '0' }
+        upper_limit: { type: string, example: '25000.00' }
+        effective_from: { type: string, format: date-time }
+        effective_to: { type: string, format: date-time }
+        reason_code: { type: string }
+        purpose: { type: string }
+        expected_version: { type: integer, description: Change only — the version of the limit being replaced. }

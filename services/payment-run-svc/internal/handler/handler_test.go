@@ -201,7 +201,7 @@ func (s *stubStatus) RecordInitialStatus(_ context.Context, _, _ string, req pay
 	return &paymentstatus.PaymentState{PaymentID: id, Status: "PREPARED"}, nil
 }
 
-func (s *stubStatus) GetStatus(_ context.Context, _, paymentID string) (*paymentstatus.PaymentState, error) {
+func (s *stubStatus) GetStatus(_ context.Context, _, _, paymentID string) (*paymentstatus.PaymentState, error) {
 	status, ok := s.statuses[paymentID]
 	if !ok {
 		return nil, domain.ErrPaymentStatusUnavailable

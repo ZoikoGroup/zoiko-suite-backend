@@ -13,6 +13,47 @@ import (
 	svcmiddleware "zoiko.io/intercompany-accounting-svc/internal/middleware"
 )
 
+// ─── Command idempotency ─────────────────────────────────────────────────────
+//
+// Every lifecycle command (AcknowledgeCounterparty, MatchIntercompany,
+// DisputeIntercompany, ResolveMismatch) claims an Idempotency-Key in the
+// command_idempotency table (migration 000009) inside the SAME transaction
+// that writes the state change. A repeat for the same key and command
+// replays the original result; the same key for a different command or entry
+// is a conflict. A command that fails its status guard never records its
+// key, so the key is available for the corrected retry (the "claim-then-work"
+// ordering established in financial-control-svc's BeginExecution).
+
+// ErrIdempotencyConflict is returned when the idempotency key has already
+// been used for a different command or entry.
+var ErrIdempotencyConflict = fmt.Errorf("%w: idempotency key already used for a different command", domain.ErrInvalidPairTransition)
+
+// claimIdempotency checks or records a (tenant, key, command, entry) claim
+// inside tx. It returns replay=true when the key already exists for this
+// exact command+entry; a key used for anything else is a conflict error.
+// The caller MUST call this AFTER the row lock and status guard, so a
+// refused command never consumes its key.
+func claimIdempotency(ctx context.Context, tx pgx.Tx, tenantID, idempotencyKey, command, entryID string) (replay bool, err error) {
+	var existingEntry, existingCmd string
+	err = tx.QueryRow(ctx, `SELECT intercompany_entry_id::text, command FROM command_idempotency
+		WHERE tenant_id = $1 AND idempotency_key = $2`, tenantID, idempotencyKey).Scan(&existingEntry, &existingCmd)
+	switch {
+	case err == nil:
+		if existingEntry != entryID || existingCmd != command {
+			return false, ErrIdempotencyConflict
+		}
+		return true, nil
+	case !errors.Is(err, pgx.ErrNoRows):
+		return false, err
+	}
+	// Key is fresh — record the claim.
+	if _, err := tx.Exec(ctx, `INSERT INTO command_idempotency (tenant_id, idempotency_key, command, intercompany_entry_id)
+		VALUES ($1,$2,$3,$4)`, tenantID, idempotencyKey, command, entryID); err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
 // Every change to a pair's match_status is recorded, in the transaction that
 // makes it, as one row of intercompany_pair_transitions (migration 000006).
 // The table is append-only, enforced by trigger, so the history cannot be
@@ -69,23 +110,60 @@ func recordTransition(ctx context.Context, tx pgx.Tx, tenantID, id string, t tra
 
 // moveLifecycle moves a pair from one of allowedFrom to t.to: it locks the
 // row, refuses any other current status with ErrInvalidPairTransition,
+// claims the idempotency key (so a refused command never consumes it),
 // applies set (an UPDATE that must also carry the status guard, as defence
 // in depth), records the transition, and — when event is non-nil — enqueues
-// the event that state change implies, all in one transaction.
-func (s *PgStore) moveLifecycle(ctx context.Context, id string, allowedFrom []string, t transition, event *lifecycleEvent,
-	set func(tx pgx.Tx, tenantID string, now time.Time) (int64, error)) error {
+// the event that state change implies, all in one transaction. On a replay
+// (key already claimed for the same command+entry) it returns the entry as
+// it now stands and replay=true through the returned *domain.IntercompanyEntry.
+func (s *PgStore) moveLifecycle(ctx context.Context, id, idempotencyKey, command string, allowedFrom []string, t transition, event *lifecycleEvent,
+	set func(tx pgx.Tx, tenantID string, now time.Time) (int64, error)) (*domain.IntercompanyEntry, error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
-		return domain.ErrIdentityMissing
+		return nil, domain.ErrIdentityMissing
 	}
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+	var result *domain.IntercompanyEntry
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		current, period, err := lockPair(ctx, tx, tenantID, id)
 		if err != nil {
 			return err
 		}
+
+		// Status guard first: a command against the wrong status never
+		// consumes its idempotency key, so the corrected retry can reuse it.
 		if !slices.Contains(allowedFrom, current) {
+			// Before refusing, check if this is a replay of an already-
+			// completed command (the pair moved on because this key already
+			// succeeded). Return the current state instead of 422.
+			replay, claimErr := claimIdempotency(ctx, tx, tenantID, idempotencyKey, command, id)
+			if claimErr != nil {
+				return claimErr
+			}
+			if replay {
+				entry, err := loadEntry(ctx, tx, tenantID, id)
+				if err != nil {
+					return err
+				}
+				result = entry
+				return nil
+			}
 			return domain.ErrInvalidPairTransition
 		}
+
+		// Claim the key inside the same transaction and row lock.
+		replay, err := claimIdempotency(ctx, tx, tenantID, idempotencyKey, command, id)
+		if err != nil {
+			return err
+		}
+		if replay {
+			entry, err := loadEntry(ctx, tx, tenantID, id)
+			if err != nil {
+				return err
+			}
+			result = entry
+			return nil
+		}
+
 		n, err := set(tx, tenantID, time.Now().UTC())
 		if err != nil {
 			return err
@@ -97,18 +175,22 @@ func (s *PgStore) moveLifecycle(ctx context.Context, id string, allowedFrom []st
 		if err := recordTransition(ctx, tx, tenantID, id, t); err != nil {
 			return err
 		}
+
+		entry, err := loadEntry(ctx, tx, tenantID, id)
+		if err != nil {
+			return err
+		}
+		result = entry
+
 		if event == nil {
 			return nil
 		}
 		// The event carries the row as this transaction committed it (it is
 		// read after the guarded UPDATE, under the same row lock), not the
 		// stale copy the handler read before the lock.
-		entry, err := loadEntry(ctx, tx, tenantID, id)
-		if err != nil {
-			return err
-		}
 		return s.enqueueEntryEvent(ctx, tx, event.fact, event.legacyType, t.actor, t.correlationID, entry)
 	})
+	return result, err
 }
 
 // AcknowledgeCounterparty is ACC-11's own AcknowledgeCounterparty command
@@ -117,8 +199,8 @@ func (s *PgStore) moveLifecycle(ctx context.Context, id string, allowedFrom []st
 // order. It emits no event: the governing spec's ACC-11 "Events produced"
 // row names only PairCreated, Matched, MismatchDetected and DisputeResolved,
 // and §23 repeats Matched/MismatchDetected (A7/B11).
-func (s *PgStore) AcknowledgeCounterparty(ctx context.Context, id, principalID, correlationID string) error {
-	return s.moveLifecycle(ctx, id, []string{domain.MatchStatusUnmatched},
+func (s *PgStore) AcknowledgeCounterparty(ctx context.Context, id, idempotencyKey, principalID, correlationID string) (*domain.IntercompanyEntry, error) {
+	return s.moveLifecycle(ctx, id, idempotencyKey, "ACKNOWLEDGE", []string{domain.MatchStatusUnmatched},
 		transition{to: domain.MatchStatusAwaitingCounterparty, actor: principalID, correlationID: correlationID}, nil,
 		func(tx pgx.Tx, tenantID string, now time.Time) (int64, error) {
 			res, err := tx.Exec(ctx, `
@@ -135,8 +217,8 @@ func (s *PgStore) AcknowledgeCounterparty(ctx context.Context, id, principalID, 
 // is nothing to dispute about a pair that already matched or was never
 // even checked. Its event carries the dispute reason, so a consumer can act
 // on the fact without reading the pair back (A7/B11).
-func (s *PgStore) DisputeIntercompany(ctx context.Context, id, principalID, reason, correlationID string) error {
-	return s.moveLifecycle(ctx, id, []string{domain.MatchStatusMismatch},
+func (s *PgStore) DisputeIntercompany(ctx context.Context, id, idempotencyKey, principalID, reason, correlationID string) (*domain.IntercompanyEntry, error) {
+	return s.moveLifecycle(ctx, id, idempotencyKey, "DISPUTE", []string{domain.MatchStatusMismatch},
 		transition{to: domain.MatchStatusDisputed, reason: &reason, actor: principalID, correlationID: correlationID},
 		&lifecycleEvent{fact: "dispute-raised", legacyType: "intercompany.entry.dispute-raised"},
 		func(tx pgx.Tx, tenantID string, now time.Time) (int64, error) {
@@ -155,11 +237,11 @@ func (s *PgStore) DisputeIntercompany(ctx context.Context, id, principalID, reas
 // resolution is a human decision recorded as evidence, not an automatic
 // recheck. Its event carries the resolution note and outcome, so a consumer
 // reacting to a resolution knows what was decided (A7/B11).
-func (s *PgStore) ResolveMismatch(ctx context.Context, id, principalID, resolutionNote, outcome, correlationID string) error {
+func (s *PgStore) ResolveMismatch(ctx context.Context, id, idempotencyKey, principalID, resolutionNote, outcome, correlationID string) (*domain.IntercompanyEntry, error) {
 	if !domain.ValidResolutionOutcome(outcome) {
-		return domain.ErrResolutionOutcomeInvalid
+		return nil, domain.ErrResolutionOutcomeInvalid
 	}
-	return s.moveLifecycle(ctx, id, []string{domain.MatchStatusDisputed},
+	return s.moveLifecycle(ctx, id, idempotencyKey, "RESOLVE", []string{domain.MatchStatusDisputed},
 		transition{to: domain.MatchStatusResolved, reason: &resolutionNote, outcome: &outcome, actor: principalID, correlationID: correlationID},
 		&lifecycleEvent{fact: "dispute-resolved", legacyType: "intercompany.entry.dispute-resolved"},
 		func(tx pgx.Tx, tenantID string, now time.Time) (int64, error) {
@@ -179,8 +261,8 @@ func (s *PgStore) ResolveMismatch(ctx context.Context, id, principalID, resoluti
 // would take that difference out of view ("Unmatched intercompany balances
 // remain visible and are not silently eliminated"). It emits no event: A7
 // names no close event, and B11 does not invent one.
-func (s *PgStore) ClosePair(ctx context.Context, id, principalID, reason, correlationID string) error {
-	return s.moveLifecycle(ctx, id, []string{domain.MatchStatusMatched},
+func (s *PgStore) ClosePair(ctx context.Context, id, idempotencyKey, principalID, reason, correlationID string) (*domain.IntercompanyEntry, error) {
+	return s.moveLifecycle(ctx, id, idempotencyKey, "CLOSE", []string{domain.MatchStatusMatched},
 		transition{to: domain.MatchStatusClosed, reason: &reason, actor: principalID, correlationID: correlationID}, nil,
 		func(tx pgx.Tx, tenantID string, now time.Time) (int64, error) {
 			res, err := tx.Exec(ctx, `

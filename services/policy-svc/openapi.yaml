@@ -1,0 +1,1004 @@
+openapi: 3.0.3
+info:
+  title: policy-svc
+  version: 1.0.0
+  description: |
+    Policy definitions, versioned policy rules and their governed lifecycle,
+    effective-policy resolution and evaluation (ZS-SVC-V-001 PDC-01..05,
+    Doc 03 §8.1), plus control tests and attestations.
+
+    **Identity.** The gateway verifies the caller and sets `X-Tenant-Id` and
+    `X-Principal-Id`; a body never names the actor. Every route also passes
+    the canonical service input contract (ZS-ARCH-SVC-001 v2.0 §4): mutations
+    need `Idempotency-Key`, `X-Correlation-ID`, `X-Request-Id` and
+    `X-Source-Channel`.
+
+    **Errors.** RFC 9457 `application/problem+json` (ZS-API-001 §12). `code`
+    is the Governance Control Plane §16 class (`CONTEXT_UNRESOLVED`,
+    `AUTHORIZATION_DENIED`, `POLICY_NOT_EFFECTIVE`, `APPROVAL_REQUIRED`,
+    `SOD_CONFLICT`, `CONCURRENCY_CONFLICT`, `IDEMPOTENCY_MISMATCH`,
+    `EVIDENCE_INTEGRITY_FAILED`, `POLICY_CONFLICTED`, `INVALID_REQUEST`,
+    `NOT_FOUND`, `SERVICE_UNAVAILABLE`, `NOT_IMPLEMENTED`); `reason_code`
+    names the specific refusal (`policy_not_found`, `missing_field`, ...).
+    Other members (`field`, `policy_version_id`, ...) are extension members.
+
+    **Concurrency.** A version's `row_version` is its `ETag`. Lifecycle
+    commands need it back as `If-Match` (or `expected_version` in the body):
+    428 when absent, 409 `CONCURRENCY_CONFLICT` when stale.
+servers:
+  - url: http://policy-svc:8080
+security:
+  - gatewayIdentity: []
+tags:
+  - name: policies
+  - name: versions
+  - name: resolution
+  - name: evaluation
+  - name: controls
+  - name: attestations
+  - name: health
+
+paths:
+  /healthz:
+    get:
+      tags: [health]
+      operationId: liveness
+      security: []
+      responses:
+        '200': {description: The process is up}
+  /readyz:
+    get:
+      tags: [health]
+      operationId: readiness
+      security: []
+      responses:
+        '200': {description: The database answers}
+        '503': {description: Not ready}
+
+  /v1/policies:
+    post:
+      tags: [policies]
+      operationId: createPolicy
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CorrelationID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CreatePolicyRequest'}
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Policy'}
+        '200':
+          description: Replay of the same request
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Policy'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '413': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+    get:
+      tags: [resolution]
+      operationId: listApplicablePolicyVersions
+      description: The governing version of every applicable chain, most specific scope first.
+      parameters:
+        - $ref: '#/components/parameters/PolicyType'
+        - $ref: '#/components/parameters/TenantIDQuery'
+        - $ref: '#/components/parameters/LegalEntityIDQuery'
+        - $ref: '#/components/parameters/AsOf'
+        - $ref: '#/components/parameters/KnownAt'
+      responses:
+        '200':
+          description: Applicable versions
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: '#/components/schemas/ApplicablePolicyVersion'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
+  /v1/policies/resolve:
+    get:
+      tags: [resolution]
+      operationId: resolveEffectivePolicy
+      parameters:
+        - $ref: '#/components/parameters/PolicyType'
+        - $ref: '#/components/parameters/TenantIDQuery'
+        - $ref: '#/components/parameters/LegalEntityIDQuery'
+        - $ref: '#/components/parameters/AsOf'
+        - $ref: '#/components/parameters/KnownAt'
+      responses:
+        '200':
+          description: The resolution (no trace)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Resolution'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
+  /v1/policies/explain:
+    get:
+      tags: [resolution]
+      operationId: explainPolicyResolution
+      parameters:
+        - $ref: '#/components/parameters/PolicyType'
+        - $ref: '#/components/parameters/TenantIDQuery'
+        - $ref: '#/components/parameters/LegalEntityIDQuery'
+        - $ref: '#/components/parameters/AsOf'
+        - $ref: '#/components/parameters/KnownAt'
+      responses:
+        '200':
+          description: The resolution with one trace entry per candidate
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Resolution'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
+  /v1/policies/evaluate:
+    post:
+      tags: [evaluation]
+      operationId: evaluatePolicy
+      parameters:
+        - $ref: '#/components/parameters/CorrelationID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/EvaluateRequest'}
+      responses:
+        '200':
+          description: The decision, recorded as evidence (replayed for the same decision_id)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/EvaluateResponse'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '413': {$ref: '#/components/responses/Problem'}
+        '500': {$ref: '#/components/responses/Problem'}
+        '501': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
+  /v1/policies/{policy_id}:
+    parameters:
+      - $ref: '#/components/parameters/PolicyID'
+    get:
+      tags: [policies]
+      operationId: getPolicy
+      responses:
+        '200':
+          description: The policy
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Policy'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
+  /v1/policies/{policy_id}/versions:
+    parameters:
+      - $ref: '#/components/parameters/PolicyID'
+    post:
+      tags: [versions]
+      operationId: createPolicyVersion
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CorrelationID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CreatePolicyVersionRequest'}
+      responses:
+        '201': {$ref: '#/components/responses/PolicyVersion'}
+        '200': {$ref: '#/components/responses/PolicyVersion'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '413': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+    get:
+      tags: [versions]
+      operationId: listVersionHistory
+      responses:
+        '200':
+          description: Every version visible to the caller's tenant, newest first
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: '#/components/schemas/PolicyVersion'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
+  /v1/policies/{policy_id}/versions/{version_id}/submit-review:
+    parameters:
+      - $ref: '#/components/parameters/PolicyID'
+      - $ref: '#/components/parameters/VersionID'
+    post:
+      tags: [versions]
+      operationId: submitPolicyVersionForReview
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody: {$ref: '#/components/requestBodies/Lifecycle'}
+      responses:
+        '200': {$ref: '#/components/responses/PolicyVersion'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '428': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /v1/policies/{policy_id}/versions/{version_id}/approve:
+    parameters:
+      - $ref: '#/components/parameters/PolicyID'
+      - $ref: '#/components/parameters/VersionID'
+    post:
+      tags: [versions]
+      operationId: approvePolicyVersion
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody: {$ref: '#/components/requestBodies/Lifecycle'}
+      responses:
+        '200': {$ref: '#/components/responses/PolicyVersion'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '428': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /v1/policies/{policy_id}/versions/{version_id}/activate:
+    parameters:
+      - $ref: '#/components/parameters/PolicyID'
+      - $ref: '#/components/parameters/VersionID'
+    post:
+      tags: [versions]
+      operationId: activatePolicyVersion
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody: {$ref: '#/components/requestBodies/Lifecycle'}
+      responses:
+        '200': {$ref: '#/components/responses/PolicyVersion'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '428': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /v1/policies/{policy_id}/versions/{version_id}/schedule:
+    parameters:
+      - $ref: '#/components/parameters/PolicyID'
+      - $ref: '#/components/parameters/VersionID'
+    post:
+      tags: [versions]
+      operationId: schedulePolicyVersion
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody: {$ref: '#/components/requestBodies/Lifecycle'}
+      responses:
+        '200': {$ref: '#/components/responses/PolicyVersion'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '428': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /v1/policies/{policy_id}/versions/{version_id}/suspend:
+    parameters:
+      - $ref: '#/components/parameters/PolicyID'
+      - $ref: '#/components/parameters/VersionID'
+    post:
+      tags: [versions]
+      operationId: suspendPolicyVersion
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody: {$ref: '#/components/requestBodies/Lifecycle'}
+      responses:
+        '200': {$ref: '#/components/responses/PolicyVersion'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '428': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /v1/policies/{policy_id}/versions/{version_id}/retire:
+    parameters:
+      - $ref: '#/components/parameters/PolicyID'
+      - $ref: '#/components/parameters/VersionID'
+    post:
+      tags: [versions]
+      operationId: retirePolicyVersion
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody: {$ref: '#/components/requestBodies/Lifecycle'}
+      responses:
+        '200': {$ref: '#/components/responses/PolicyVersion'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '428': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /v1/policies/{policy_id}/versions/{version_id}/review-suspension:
+    parameters:
+      - $ref: '#/components/parameters/PolicyID'
+      - $ref: '#/components/parameters/VersionID'
+    post:
+      tags: [versions]
+      operationId: reviewPolicyVersionSuspension
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody: {$ref: '#/components/requestBodies/Lifecycle'}
+      responses:
+        '200': {$ref: '#/components/responses/PolicyVersion'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '428': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
+  /v1/policy-versions/compare:
+    get:
+      tags: [versions]
+      operationId: comparePolicyVersions
+      parameters:
+        - {name: base, in: query, required: true, schema: {type: string, format: uuid}}
+        - {name: target, in: query, required: true, schema: {type: string, format: uuid}}
+      responses:
+        '200':
+          description: Field and payload differences between two versions
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Comparison'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
+  /v1/policy-versions/{version_id}:
+    parameters:
+      - $ref: '#/components/parameters/VersionID'
+    get:
+      tags: [versions]
+      operationId: getPolicyVersion
+      responses:
+        '200': {$ref: '#/components/responses/PolicyVersion'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
+  /v1/policy-versions/{version_id}/transitions:
+    parameters:
+      - $ref: '#/components/parameters/VersionID'
+    get:
+      tags: [versions]
+      operationId: listPolicyVersionTransitions
+      responses:
+        '200':
+          description: Lifecycle transitions, oldest first
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: '#/components/schemas/VersionTransition'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
+  /v1/policy-evaluations/{evidence_id}:
+    parameters:
+      - {name: evidence_id, in: path, required: true, schema: {type: string, format: uuid}}
+    get:
+      tags: [evaluation]
+      operationId: getPolicyEvaluation
+      responses:
+        '200':
+          description: The recorded evaluation evidence
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Evaluation'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
+  /v1/control-test-definitions:
+    post:
+      tags: [controls]
+      operationId: createControlTestDefinition
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CreateControlTestDefinitionRequest'}
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ControlTestDefinition'}
+        '200':
+          description: Replay of the same request
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ControlTestDefinition'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '413': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
+  /v1/control-test-definitions/{id}:
+    parameters:
+      - $ref: '#/components/parameters/ID'
+    get:
+      tags: [controls]
+      operationId: getControlTestDefinition
+      responses:
+        '200':
+          description: The definition
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ControlTestDefinition'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
+  /v1/control-test-definitions/{id}/executions:
+    parameters:
+      - $ref: '#/components/parameters/ID'
+    post:
+      tags: [controls]
+      operationId: createControlTestExecution
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CreateControlTestExecutionRequest'}
+      responses:
+        '201':
+          description: Recorded
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ControlTestExecution'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '413': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+    get:
+      tags: [controls]
+      operationId: listControlTestExecutions
+      responses:
+        '200':
+          description: Executions of this definition
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: '#/components/schemas/ControlTestExecution'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
+  /v1/controls/{control_ref}/effectiveness:
+    parameters:
+      - {name: control_ref, in: path, required: true, schema: {type: string}}
+    get:
+      tags: [controls]
+      operationId: getControlEffectiveness
+      responses:
+        '200':
+          description: Design status and operating effectiveness from the latest reviewed execution
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ControlEffectiveness'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
+  /v1/attestations:
+    post:
+      tags: [attestations]
+      operationId: createAttestation
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CreateAttestationRequest'}
+      responses:
+        '201':
+          description: Signed
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Attestation'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '413': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
+  /v1/attestations/{id}:
+    parameters:
+      - $ref: '#/components/parameters/ID'
+    get:
+      tags: [attestations]
+      operationId: getAttestation
+      responses:
+        '200':
+          description: The attestation
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Attestation'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
+  /v1/attestations/{id}/revoke:
+    parameters:
+      - $ref: '#/components/parameters/ID'
+    post:
+      tags: [attestations]
+      operationId: revokeAttestation
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason: {type: string}
+      responses:
+        '200':
+          description: Revoked
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Attestation'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
+components:
+  securitySchemes:
+    gatewayIdentity:
+      type: apiKey
+      in: header
+      name: X-Principal-Id
+      description: Set by the gateway from a verified identity envelope, with X-Tenant-Id.
+
+  parameters:
+    PolicyID: {name: policy_id, in: path, required: true, schema: {type: string, format: uuid}}
+    VersionID: {name: version_id, in: path, required: true, schema: {type: string, format: uuid}}
+    ID: {name: id, in: path, required: true, schema: {type: string, format: uuid}}
+    IdempotencyKey: {name: Idempotency-Key, in: header, required: false, schema: {type: string}, description: 'Required on material writes by the input contract.'}
+    CorrelationID: {name: X-Correlation-ID, in: header, required: false, schema: {type: string}}
+    IfMatch: {name: If-Match, in: header, required: false, schema: {type: string}, description: 'The version''s ETag (row_version). Required unless the body carries expected_version: 428 when neither is sent.'}
+    PolicyType: {name: policy_type, in: query, required: true, schema: {type: string, maxLength: 64}}
+    TenantIDQuery: {name: tenant_id, in: query, required: false, schema: {type: string, format: uuid}, description: 'Must equal the verified tenant when sent.'}
+    LegalEntityIDQuery: {name: legal_entity_id, in: query, required: false, schema: {type: string, format: uuid}}
+    AsOf: {name: as_of, in: query, required: false, schema: {type: string, format: date-time}, description: 'Effective-time cut (default now).'}
+    KnownAt: {name: known_at, in: query, required: false, schema: {type: string, format: date-time}, description: 'Knowledge cut (default as_of if past, else now).'}
+
+  requestBodies:
+    Lifecycle:
+      description: Optional, except suspend and retire need reason_code and review-suspension needs outcome.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/LifecycleRequest'}
+
+  responses:
+    Problem:
+      description: RFC 9457 problem details
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    PolicyVersion:
+      description: The version; its row_version is the ETag
+      headers:
+        ETag: {schema: {type: string}}
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/PolicyVersion'}
+
+  schemas:
+    Problem:
+      type: object
+      required: [type, title, status, code]
+      properties:
+        type: {type: string, format: uri}
+        title: {type: string}
+        status: {type: integer}
+        detail: {type: string}
+        instance: {type: string}
+        code: {type: string, description: The §16 class callers match on.}
+        reason_code: {type: string, description: The specific refusal.}
+        request_id: {type: string}
+        correlation_id: {type: string}
+        retryable: {type: boolean}
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              pointer: {type: string}
+              code: {type: string}
+              detail: {type: string}
+        field: {type: string}
+
+    CreatePolicyRequest:
+      type: object
+      required: [policy_code, policy_name, policy_type]
+      properties:
+        policy_id: {type: string, format: uuid}
+        policy_code: {type: string}
+        policy_name: {type: string}
+        policy_type: {type: string}
+        scope: {type: string, enum: [GLOBAL, TENANT]}
+
+    Policy:
+      type: object
+      properties:
+        policy_id: {type: string, format: uuid}
+        policy_code: {type: string}
+        policy_name: {type: string}
+        policy_type: {type: string}
+        tenant_id: {type: string, format: uuid, nullable: true}
+        policy_status: {type: string}
+        versioning_mode: {type: string}
+        created_at: {type: string, format: date-time}
+        created_by_principal_id: {type: string}
+
+    CreatePolicyVersionRequest:
+      type: object
+      required: [effective_from]
+      properties:
+        policy_version_id: {type: string, format: uuid}
+        tenant_id: {type: string, format: uuid, nullable: true}
+        legal_entity_id: {type: string, format: uuid, nullable: true}
+        rule_payload: {type: object, additionalProperties: true}
+        effective_from: {type: string, format: date-time}
+        effective_to: {type: string, format: date-time, nullable: true}
+        source: {type: string}
+        rationale: {type: string}
+
+    PolicyVersion:
+      type: object
+      properties:
+        policy_version_id: {type: string, format: uuid}
+        policy_id: {type: string, format: uuid}
+        tenant_id: {type: string, format: uuid, nullable: true}
+        legal_entity_id: {type: string, format: uuid, nullable: true}
+        scope_type: {type: string}
+        rule_payload: {type: object, additionalProperties: true}
+        effective_from: {type: string, format: date-time}
+        effective_to: {type: string, format: date-time, nullable: true}
+        version_status: {type: string}
+        version_number: {type: integer}
+        source: {type: string}
+        rationale: {type: string}
+        artifact_digest: {type: string}
+        known_from: {type: string, format: date-time}
+        activated_by_principal_id: {type: string, nullable: true}
+        activated_at: {type: string, format: date-time, nullable: true}
+        row_version: {type: integer}
+        submitted_by_principal_id: {type: string}
+        submitted_at: {type: string, format: date-time}
+        approved_by_principal_id: {type: string}
+        approved_at: {type: string, format: date-time}
+        approval_reference: {type: string}
+        withdrawn_at: {type: string, format: date-time}
+        superseded_at: {type: string, format: date-time}
+        superseded_by_version_id: {type: string, format: uuid}
+        suspended_by_principal_id: {type: string}
+        suspension_reviewed_by_principal_id: {type: string}
+        suspension_reviewed_at: {type: string, format: date-time}
+        suspension_review_outcome: {type: string}
+        created_at: {type: string, format: date-time}
+        created_by_principal_id: {type: string}
+
+    ApplicablePolicyVersion:
+      allOf:
+        - $ref: '#/components/schemas/PolicyVersion'
+        - type: object
+          properties:
+            policy_code: {type: string}
+
+    LifecycleRequest:
+      type: object
+      properties:
+        expected_version: {type: integer, description: Alternative to If-Match.}
+        reason_code: {type: string}
+        reason: {type: string}
+        approval_reference: {type: string}
+        outcome: {type: string, enum: [UPHELD, OVERTURNED]}
+
+    VersionTransition:
+      type: object
+      properties:
+        transition_id: {type: integer, format: int64}
+        policy_version_id: {type: string, format: uuid}
+        from_status: {type: string, nullable: true}
+        to_status: {type: string}
+        actor_id: {type: string}
+        reason: {type: string}
+        approval_reference: {type: string}
+        correlation_id: {type: string}
+        occurred_at: {type: string, format: date-time}
+
+    Resolution:
+      type: object
+      properties:
+        status: {type: string, enum: [RESOLVED, NOT_APPLICABLE, CONFLICTED]}
+        as_of: {type: string, format: date-time}
+        known_at: {type: string, format: date-time}
+        selected: {$ref: '#/components/schemas/ApplicablePolicyVersion'}
+        conflicting:
+          type: array
+          items: {$ref: '#/components/schemas/ApplicablePolicyVersion'}
+        trace:
+          type: array
+          nullable: true
+          items:
+            type: object
+            properties:
+              policy_version_id: {type: string}
+              policy_id: {type: string}
+              policy_code: {type: string}
+              version_number: {type: integer}
+              scope_type: {type: string}
+              version_status: {type: string}
+              governs: {type: boolean}
+              reason: {type: string}
+
+    Comparison:
+      type: object
+      properties:
+        base: {$ref: '#/components/schemas/PolicyVersion'}
+        target: {$ref: '#/components/schemas/PolicyVersion'}
+        same_content: {type: boolean}
+        field_changes:
+          type: array
+          items:
+            type: object
+            properties:
+              field: {type: string}
+              base: {}
+              target: {}
+        payload_changes:
+          type: array
+          items:
+            type: object
+            properties:
+              path: {type: string}
+              change: {type: string, enum: [added, removed, changed]}
+              base: {}
+              target: {}
+
+    EvaluateRequest:
+      type: object
+      required: [policy_type, decision_id]
+      properties:
+        policy_type: {type: string}
+        tenant_id: {type: string, format: uuid, nullable: true}
+        legal_entity_id: {type: string, format: uuid, nullable: true}
+        action_context: {type: object, additionalProperties: true}
+        decision_id: {type: string}
+        as_of: {type: string, format: date-time}
+        known_at: {type: string, format: date-time}
+
+    EvaluateResponse:
+      type: object
+      properties:
+        result: {type: string}
+        policy_version_id: {type: string}
+        rule_basis: {type: string}
+        evidence_id: {type: string}
+        decision_id: {type: string}
+        policy_id: {type: string}
+        policy_code: {type: string}
+        artifact_digest: {type: string}
+        selected_rule_ids: {type: array, items: {type: string}}
+        evaluator_version: {type: string}
+        input_fingerprint: {type: string}
+        as_of: {type: string, format: date-time}
+        known_at: {type: string, format: date-time}
+        ledger_status: {type: string}
+        replayed: {type: boolean}
+
+    Evaluation:
+      type: object
+      properties:
+        evidence_id: {type: string}
+        tenant_id: {type: string}
+        decision_id: {type: string}
+        legal_entity_id: {type: string}
+        policy_type: {type: string}
+        requested_by_principal_id: {type: string}
+        input_fingerprint: {type: string}
+        action_context: {type: object, additionalProperties: true}
+        as_of: {type: string, format: date-time}
+        known_at: {type: string, format: date-time}
+        result: {type: string}
+        outcome: {type: string}
+        policy_id: {type: string}
+        policy_version_id: {type: string}
+        policy_code: {type: string}
+        artifact_digest: {type: string}
+        rule_basis: {type: string}
+        selected_rule_ids: {type: array, items: {type: string}}
+        evaluator_version: {type: string}
+        correlation_id: {type: string}
+        causation_id: {type: string}
+        request_id: {type: string}
+        evaluated_at: {type: string, format: date-time}
+        ledger_status: {type: string}
+
+    CreateControlTestDefinitionRequest:
+      type: object
+      required: [control_ref, test_code, title, methodology]
+      properties:
+        control_test_definition_id: {type: string, format: uuid}
+        control_ref: {type: string}
+        test_code: {type: string}
+        title: {type: string}
+        methodology: {type: string}
+        sample_approach: {type: string}
+        test_frequency: {type: string}
+
+    ControlTestDefinition:
+      type: object
+      properties:
+        control_test_definition_id: {type: string, format: uuid}
+        tenant_id: {type: string, format: uuid, nullable: true}
+        control_ref: {type: string}
+        test_code: {type: string}
+        title: {type: string}
+        methodology: {type: string}
+        sample_approach: {type: string}
+        test_frequency: {type: string}
+        design_status: {type: string}
+        created_at: {type: string, format: date-time}
+        created_by_principal_id: {type: string}
+
+    CreateControlTestExecutionRequest:
+      type: object
+      required: [period_start, period_end, result]
+      properties:
+        control_test_execution_id: {type: string, format: uuid}
+        period_start: {type: string, format: date-time}
+        period_end: {type: string, format: date-time}
+        population_description: {type: string}
+        sample_description: {type: string}
+        procedure_notes: {type: string}
+        evidence_refs: {type: array, items: {type: string}}
+        result: {type: string}
+        exceptions_noted: {type: string}
+        reviewer_principal_id: {type: string}
+
+    ControlTestExecution:
+      type: object
+      properties:
+        control_test_execution_id: {type: string, format: uuid}
+        tenant_id: {type: string, format: uuid, nullable: true}
+        control_test_definition_id: {type: string, format: uuid}
+        period_start: {type: string, format: date-time}
+        period_end: {type: string, format: date-time}
+        population_description: {type: string}
+        sample_description: {type: string}
+        procedure_notes: {type: string}
+        evidence_refs: {type: array, items: {type: string}}
+        tester_principal_id: {type: string}
+        result: {type: string}
+        exceptions_noted: {type: string}
+        reviewer_principal_id: {type: string}
+        reviewed_at: {type: string, format: date-time}
+        created_at: {type: string, format: date-time}
+        created_by_principal_id: {type: string}
+
+    ControlEffectiveness:
+      type: object
+      properties:
+        control_ref: {type: string}
+        design_status: {type: string}
+        operating_effectiveness: {type: string}
+        as_of: {type: string, format: date-time}
+        latest_execution_id: {type: string}
+
+    CreateAttestationRequest:
+      type: object
+      required: [statement, statement_version, subject_ref, period_start, period_end, signer_role]
+      properties:
+        attestation_id: {type: string, format: uuid}
+        statement: {type: string}
+        statement_version: {type: string}
+        subject_ref: {type: string}
+        period_start: {type: string, format: date-time}
+        period_end: {type: string, format: date-time}
+        signer_role: {type: string}
+        evidence_refs: {type: array, items: {type: string}}
+        expires_at: {type: string, format: date-time}
+
+    Attestation:
+      type: object
+      properties:
+        attestation_id: {type: string, format: uuid}
+        tenant_id: {type: string, format: uuid, nullable: true}
+        statement: {type: string}
+        statement_version: {type: string}
+        subject_ref: {type: string}
+        period_start: {type: string, format: date-time}
+        period_end: {type: string, format: date-time}
+        signer_principal_id: {type: string}
+        signer_role: {type: string}
+        signed_at: {type: string, format: date-time}
+        evidence_refs: {type: array, items: {type: string}}
+        expires_at: {type: string, format: date-time}
+        attestation_status: {type: string}
+        revocation_reason: {type: string}
+        created_at: {type: string, format: date-time}
+        created_by_principal_id: {type: string}

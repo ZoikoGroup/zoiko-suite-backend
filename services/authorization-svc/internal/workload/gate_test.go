@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"io"
 	"math/big"
@@ -203,5 +204,26 @@ func TestCertificateFromAnotherCA_FailsHandshake(t *testing.T) {
 
 	if code, _ := post(t, c, srv.URL+"/v1/authorize", nil); code != 0 {
 		t.Fatalf("a registered name on a certificate from another CA must not complete the handshake, got HTTP %d", code)
+	}
+}
+
+// A refusal is RFC 9457 problem+json (ZS-API-001 §12), with the §16 class
+// beside the code, like every other error from this service.
+func TestRefusalIsAProblem(t *testing.T) {
+	gate := workload.New(workload.ModeRequire, []string{"access-control-svc"}, nil)
+	srv := httptest.NewServer(gate.Middleware(echo))
+	defer srv.Close()
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/v1/authorize", strings.NewReader("{}"))
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	var p map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&p)
+	if resp.StatusCode != http.StatusUnauthorized || resp.Header.Get("Content-Type") != "application/problem+json" ||
+		p["code"] != "client_certificate_required" || p["error_class"] != "CONTEXT_UNRESOLVED" {
+		t.Fatalf("want a 401 problem with code client_certificate_required, got %d %q %v",
+			resp.StatusCode, resp.Header.Get("Content-Type"), p)
 	}
 }

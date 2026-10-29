@@ -123,17 +123,23 @@ paths:
             `missing_fields` (including a missing `reason`), `invalid_json`,
             `delegate_is_delegator`, `invalid_time_window` or `invalid_limit`.
           content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
               examples:
                 delegate_is_delegator:
                   value:
-                    error_code: delegate_is_delegator
-                    error_message: delegate_principal_id must differ from delegator_principal_id
+                    type: https://api.zoikosuite.com/problems/delegate-is-delegator
+                    title: Bad Request
+                    status: 400
+                    code: delegate_is_delegator
+                    detail: delegate_principal_id must differ from delegator_principal_id
                 invalid_time_window:
                   value:
-                    error_code: invalid_time_window
-                    error_message: effective_to must be after effective_from
+                    type: https://api.zoikosuite.com/problems/invalid-time-window
+                    title: Bad Request
+                    status: 400
+                    code: invalid_time_window
+                    detail: effective_to must be after effective_from
         '401':
           $ref: '#/components/responses/Unauthenticated'
         '403':
@@ -157,21 +163,30 @@ paths:
 
             Every one of these is recorded in `refused_escalations`.
           content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
               examples:
                 delegator_mismatch:
                   value:
-                    error_code: delegator_mismatch
-                    error_message: caller may only delegate their own authority
+                    type: https://api.zoikosuite.com/problems/delegator-mismatch
+                    title: Forbidden
+                    status: 403
+                    code: delegator_mismatch
+                    detail: caller may only delegate their own authority
                 self_dealing:
                   value:
-                    error_code: self_dealing
-                    error_message: a delegation administered for another principal may not name the caller as delegate
+                    type: https://api.zoikosuite.com/problems/self-dealing
+                    title: Forbidden
+                    status: 403
+                    code: self_dealing
+                    detail: a delegation administered for another principal may not name the caller as delegate
                 delegator_lacks_authority:
                   value:
-                    error_code: delegator_lacks_authority
-                    error_message: delegator does not hold the authority being delegated
+                    type: https://api.zoikosuite.com/problems/delegator-lacks-authority
+                    title: Forbidden
+                    status: 403
+                    code: delegator_lacks_authority
+                    detail: delegator does not hold the authority being delegated
         '409':
           description: |
             `overlap_conflict` — the delegate already holds this action on this
@@ -180,8 +195,8 @@ paths:
             `correlation_reused` — this `correlation_id` was already used for a
             different grant.
           content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '503':
           $ref: '#/components/responses/Unavailable'
 
@@ -244,8 +259,8 @@ paths:
         '400':
           description: '`unknown_status` or `invalid_paging`.'
           content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '401':
           $ref: '#/components/responses/Unauthenticated'
         '403':
@@ -253,8 +268,8 @@ paths:
             `forbidden` — either the caller lacks `DELEGATION_VIEW` on the named
             entity, or the read named another principal with no entity scope.
           content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '503':
           $ref: '#/components/responses/Unavailable'
 
@@ -287,8 +302,8 @@ paths:
             it as an outage sent whoever was on call to look at a healthy
             database.
           content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '503':
           $ref: '#/components/responses/Unavailable'
 
@@ -330,18 +345,18 @@ paths:
         '403':
           description: '`forbidden` — the caller lacks `DELEGATION_REVOKE`.'
           content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '404':
           description: '`not_found`.'
           content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '428':
           description: '`version_required`.'
           content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '409':
           description: |
             `version_mismatch`, or `invalid_transition` — already `REVOKED` or `EXPIRED`. Not a fault
@@ -349,8 +364,8 @@ paths:
             rising rate of it means two operators are chasing the same
             delegation.
           content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '503':
           $ref: '#/components/responses/Unavailable'
 
@@ -394,8 +409,8 @@ paths:
         '400':
           description: '`missing_fields`, `invalid_json`, or `invalid_time_window` (new_effective_to not after current).'
           content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '401':
           $ref: '#/components/responses/Unauthenticated'
         '403':
@@ -407,21 +422,21 @@ paths:
             `delegator_exceeds_limit` or `sod_conflict` — the extended grant
             would exceed the delegator.
           content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '404':
           description: '`not_found`.'
           content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '409':
           description: |
             `overlap_conflict` — another ACTIVE delegation for the same delegate
             and action would overlap the new window.
             `cannot_extend` — delegation is not ACTIVE.
           content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '503':
           $ref: '#/components/responses/Unavailable'
 
@@ -457,30 +472,30 @@ paths:
         '400':
           description: '`reason_required`, `invalid_expected_version` or `invalid_json`.'
           content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '401':
           $ref: '#/components/responses/Unauthenticated'
         '403':
           description: '`approval_not_segregated`, `delegator_lacks_authority`, `delegator_exceeds_limit`, `sod_conflict` or `forbidden`.'
           content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '404':
           description: '`not_found`.'
           content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '409':
           description: '`invalid_transition`, `version_mismatch`, `lapsed` (window already ended) or `overlap_conflict`.'
           content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '428':
           description: '`version_required` — no expected_version.'
           content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '503':
           $ref: '#/components/responses/Unavailable'
 
@@ -514,30 +529,30 @@ paths:
         '400':
           description: '`reason_required`, `invalid_expected_version` or `invalid_json`.'
           content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '401':
           $ref: '#/components/responses/Unauthenticated'
         '403':
           description: '`forbidden` — not the delegator and lacks `DELEGATION_REVOKE`.'
           content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '404':
           description: '`not_found`.'
           content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '409':
           description: '`invalid_transition`, `version_mismatch`, `lapsed` (window already ended) or `overlap_conflict`.'
           content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '428':
           description: '`version_required` — no expected_version.'
           content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '503':
           $ref: '#/components/responses/Unavailable'
 
@@ -570,30 +585,30 @@ paths:
         '400':
           description: '`reason_required`, `invalid_expected_version` or `invalid_json`.'
           content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '401':
           $ref: '#/components/responses/Unauthenticated'
         '403':
           description: '`self_dealing`, `approval_not_segregated` (the grant''s maker resuming it alone), `delegator_lacks_authority`, `delegator_authority_delegated`, `delegator_exceeds_limit`, `sod_conflict` or `forbidden`.'
           content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '404':
           description: '`not_found`.'
           content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '409':
           description: '`invalid_transition`, `version_mismatch`, `lapsed` (window already ended) or `overlap_conflict`.'
           content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '428':
           description: '`version_required` — no expected_version.'
           content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '503':
           $ref: '#/components/responses/Unavailable'
 
@@ -629,15 +644,15 @@ paths:
         '400':
           description: '`missing_fields`.'
           content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '401':
           $ref: '#/components/responses/Unauthenticated'
         '403':
           description: '`forbidden` — `DELEGATION_VIEW` required.'
           content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '503':
           $ref: '#/components/responses/Unavailable'
 
@@ -736,15 +751,15 @@ components:
         forgotten tenant header must not be reported as a missing principal,
         because the two are fixed in different places.
       content:
-        application/json:
-          schema: { $ref: '#/components/schemas/Error' }
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
     Unavailable:
       description: |
         `authz_unavailable` or `store_unavailable`. Nothing was written — this
         service fails closed rather than guessing a decision.
       content:
-        application/json:
-          schema: { $ref: '#/components/schemas/Error' }
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
 
   schemas:
     DelegationStatus:
@@ -943,32 +958,25 @@ components:
         effective_to: { type: string, format: date-time }
         status: { $ref: '#/components/schemas/DelegationStatus' }
 
-    Error:
+    Problem:
       type: object
-      required: [error_code, error_message]
+      required: [type, title, status, code]
       properties:
-        error_code:
-          type: string
-          description: |
-            Stable, machine-readable. Clients branch on this, never on the
-            message.
-          enum:
-            - missing_fields
-            - invalid_json
-            - delegate_is_delegator
-            - invalid_time_window
-            - unknown_status
-            - invalid_paging
-            - tenant_missing
-            - identity_missing
-            - forbidden
-            - delegator_mismatch
-            - self_dealing
-            - delegator_lacks_authority
-            - not_found
-            - invalid_transition
-            - authz_unavailable
-            - store_unavailable
-        error_message:
-          type: string
-          description: Human-readable. Wording may change; the code may not.
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        code: { type: string }
+        request_id: { type: string }
+        correlation_id: { type: string }
+        retryable: { type: boolean }
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              pointer: { type: string }
+              code: { type: string }
+              detail: { type: string }
+        current_version: { type: integer, format: int64 }

@@ -138,12 +138,16 @@ reconciliation-engine-svc holds for DATA-07.
   CLOSED pairs, not MATCHED only (see B8) — it still does not read
   `resolution_outcome`.
 - **A10. No `Idempotency-Key` or `expected_version` on the lifecycle
-  commands.** The wireframe requires both on every command. Create is
-  idempotent by `(tenant_id, source_journal_id)`; acknowledge, match, dispute
-  and resolve are protected only by their status guards, so a retried dispute
-  after a lost response gets 422 instead of its original result, and there is
-  no version a client can send to say "only if nothing changed since I read
-  it". There is no version column.
+  commands. — Closed for `Idempotency-Key` (B14).** The wireframe requires
+  both on every command. Create was already idempotent by
+  `(tenant_id, source_journal_id)` and stays that way. Acknowledge, match,
+  dispute and resolve now require `Idempotency-Key` and claim it in
+  `command_idempotency` (migration 000009), the same platform table and rule
+  financial-control-svc's `BeginExecution` uses and consolidation-svc follows
+  for ACC-12/13: a retry under the same key and target replays the original
+  result instead of hitting the status guard a second time; the same key for
+  a different command or target is a conflict. `expected_version` is not
+  added: see B14 for why the status guard already serves that purpose here.
 - **A11. Group relationship check is optional and as-of now. — Closed (B13).**
   `MatchIntercompany` now evaluates the relationship at the end of the pair's
   `fiscal_period` when it is a `YYYY-MM` period — the same "as of the end of
@@ -481,3 +485,33 @@ reconciliation-engine-svc holds for DATA-07.
     although open today (it passed under the old check), and one that ended
     inside the period and is MISMATCH. The existing intact/lost tests seed no
     period, so they continue to cover the as-of-now fallback.
+- **B14. How the lifecycle commands became idempotent (A10).**
+  - *Scope.* `AcknowledgeCounterparty`, `MatchIntercompany`, `DisputeIntercompany`
+    and `ResolveMismatch` all claim their `Idempotency-Key` in
+    `command_idempotency` (tenant, key, command, the pair acted on) inside the
+    same transaction as the write, under the row lock `moveLifecycle` already
+    takes for the three commands that share it. `UpdateMatch` (the fourth,
+    outside `moveLifecycle`) claims its own key the same way, including on the
+    refusal path: a key retried against a pair no longer in a matchable status
+    replays the original match/mismatch instead of failing a second time, so a
+    client that successfully matched a pair and then retried after a lost
+    response does not see a spurious 422. A key claimed for one command or
+    pair and reused for another is a 409, not a silent cross-command replay.
+  - *`expected_version`: not added.* Every one of these four commands already
+    guards its write on the pair's current `match_status` (e.g. `UPDATE …
+    WHERE match_status = ANY($n)`), checked under the same row lock the
+    `Idempotency-Key` claim is made in. There is no field these commands touch
+    that can change independent of `match_status` — unlike general-ledger-svc's
+    account (B4), where other fields move without a status change and
+    `expected_version` catches a stale read, a stale read of one of these four
+    commands is already caught by the status guard itself. Adding a version
+    column would duplicate that guard, not strengthen it.
+  - *Down migration.* `000009`'s down refuses while any claim is recorded —
+    same posture as every other `command_idempotency` down this session
+    (financial-control-svc 000007, consolidation-svc 000008): dropping it
+    would let a retried command re-execute instead of replaying.
+  - *Tests.* Real-database coverage for all four commands' claim/replay and
+    conflict paths, plus the existing lifecycle tests updated to send a key —
+    each logically distinct action in a test uses its own key, since the real
+    store treats a repeated key for the same command and pair as a replay, not
+    a new attempt.

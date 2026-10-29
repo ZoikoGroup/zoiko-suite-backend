@@ -12,13 +12,14 @@ import (
 
 	svcenvelope "zoiko.io/governance-decision-log-svc/internal/envelope"
 	"zoiko.io/governance-decision-log-svc/internal/handler"
+	"zoiko.io/identity-envelope/apicontract"
 )
 
 // envelopedRouter is the production middleware order: the problem rewriter in
 // front of the generated envelope middleware, in front of the handlers.
 func envelopedRouter() http.Handler {
 	r := chi.NewRouter()
-	r.Use(handler.ProblemEnvelopeRefusals)
+	r.Use(apicontract.EnvelopeRefusals)
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), nil))
 	handler.RegisterRoutes(r, handler.New(&stubStore{created: true}, testAuthz(), &stubPolicyClient{}, testAuthzScopeID, zap.NewNop()))
 	return r
@@ -41,6 +42,7 @@ func TestEnvelopeRefusal_IsProblemJSONAndKeepsItsMembers(t *testing.T) {
 	}
 	var p struct {
 		Type       string            `json:"type"`
+		Code       string            `json:"code"`
 		Title      string            `json:"title"`
 		Status     int               `json:"status"`
 		Detail     string            `json:"detail"`
@@ -50,7 +52,7 @@ func TestEnvelopeRefusal_IsProblemJSONAndKeepsItsMembers(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &p); err != nil {
 		t.Fatalf("body is not JSON: %v — %s", err, w.Body.String())
 	}
-	if p.Type != "ENVELOPE_INCOMPLETE" || p.Status != 400 || p.Title == "" {
+	if p.Code != "envelope_incomplete" || !strings.HasPrefix(p.Type, apicontract.ProblemBase) || p.Status != 400 || p.Title == "" {
 		t.Errorf("not an RFC 9457 problem: %+v", p)
 	}
 	if p.Error != "envelope_incomplete" || p.Detail == "" || len(p.Violations) == 0 {
@@ -63,7 +65,7 @@ func TestEnvelopeRefusal_MissingIdentityIs401Problem(t *testing.T) {
 	w := httptest.NewRecorder()
 	envelopedRouter().ServeHTTP(w, req)
 	if w.Code != http.StatusUnauthorized || w.Header().Get("Content-Type") != "application/problem+json" ||
-		!strings.Contains(w.Body.String(), `"type":"UNAUTHORIZED"`) {
+		!strings.Contains(w.Body.String(), `"code":"identity_missing"`) {
 		t.Fatalf("expected a 401 problem, got %d %s — %s", w.Code, w.Header().Get("Content-Type"), w.Body.String())
 	}
 }

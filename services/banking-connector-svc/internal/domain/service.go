@@ -105,13 +105,34 @@ type ConnectionEvent struct {
 
 type InitiateConnectionParams struct {
 	TenantID, LegalEntityID, BankAccountID, ProviderRef, BankName, Region string
-	RequestedScope                                                        []string
+	// Currency is resolved from BNK-01's verified bank account, never from
+	// the request body. The store falls back to the legacy USD value only
+	// for direct/in-process callers that do not pass one.
+	Currency       string
+	RequestedScope []string
 	// CorrelationID is the caller-supplied idempotency/dedup key (ON
 	// CONFLICT (tenant_id, correlation_id)). RequestCorrelationID is the
 	// request-tracing correlation id (X-Correlation-ID) carried on the
 	// emitted event — a distinct concern, not reused for the dedup key.
 	CreatedByPrincipalID, CorrelationID string
 	RequestCorrelationID                string
+}
+
+// ScopeSubset reports whether every granted scope was also requested. BNK-02
+// forbids expanding scope without reauthorization: an authorization response
+// that grants a scope the connection never asked for is a failed handshake,
+// not a silent widening of consent.
+func ScopeSubset(granted, requested []string) bool {
+	requestedSet := make(map[string]struct{}, len(requested))
+	for _, s := range requested {
+		requestedSet[s] = struct{}{}
+	}
+	for _, s := range granted {
+		if _, ok := requestedSet[s]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 type CompleteConnectionAuthorizationParams struct {
@@ -185,7 +206,7 @@ type CreateRegionPolicyParams struct {
 }
 
 var (
-	ErrRegionPolicyAlreadyExists = errors.New("this region is already an allowed region for this legal entity")
+	ErrRegionPolicyAlreadyExists  = errors.New("this region is already an allowed region for this legal entity")
 	ErrConnectionRegionNotAllowed = errors.New("connection region is not an allowed region for its legal entity")
 )
 
@@ -199,6 +220,19 @@ type BankStatement struct {
 	ClosingBalance   float64   `json:"closing_balance"`
 	TransactionCount int       `json:"transaction_count"`
 	IngestedAt       time.Time `json:"ingested_at"`
+
+	// BNK-03 ingestion evidence. These are part of the statement's
+	// authoritative record, not handler-local bookkeeping: a caller that
+	// cannot see the status, raw-source hash, source/batch ids and
+	// quarantine reason cannot prove which import it is looking at or
+	// whether the evidence was accepted. The raw payload itself is still
+	// not stored (see SPEC_DEVIATIONS.md A10).
+	ContentHash          string `json:"content_hash,omitempty"`
+	SourceID             string `json:"source_id,omitempty"`
+	ImportBatchID        string `json:"import_batch_id,omitempty"`
+	Status               string `json:"status,omitempty"`
+	QuarantineReason     string `json:"quarantine_reason,omitempty"`
+	CreatedByPrincipalID string `json:"created_by_principal_id,omitempty"`
 }
 
 type CreateConnectionRequest struct {

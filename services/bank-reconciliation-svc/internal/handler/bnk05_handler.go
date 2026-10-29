@@ -57,7 +57,7 @@ func (h *Handler) ProposeMatch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if h.banking != nil && req.TransactionID != "" {
-		if err := h.verifyCanonicalMatch(r.Context(), *l, req.TransactionID); err != nil {
+		if err := h.verifyCanonicalMatch(r.Context(), *l, principalID, req.TransactionID); err != nil {
 			switch {
 			case errors.Is(err, domain.ErrCanonicalTransactionNotFound):
 				writeError(w, http.StatusNotFound, "canonical_transaction_not_found", err.Error())
@@ -141,7 +141,7 @@ func (h *Handler) ConfirmMatch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if h.banking != nil && l.ProposedTransactionID != nil {
-		if err := h.verifyCanonicalMatch(r.Context(), *l, *l.ProposedTransactionID); err != nil {
+		if err := h.verifyCanonicalMatch(r.Context(), *l, principalID, *l.ProposedTransactionID); err != nil {
 			switch {
 			case errors.Is(err, domain.ErrCanonicalTransactionNotFound):
 				writeError(w, http.StatusNotFound, "canonical_transaction_not_found", err.Error())

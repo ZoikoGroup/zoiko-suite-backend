@@ -258,7 +258,7 @@ func TestBNK04_NormalizeTransaction_ActiveLineUniqueness(t *testing.T) {
 	lineID := result.Lines[0].LineID
 
 	normResult, err := s.NormalizeTransaction(ctx, domain.NormalizeTransactionParams{
-		TenantID: "tenant-bnk04-a", StatementLineID: lineID, TransactionDate: time.Now(), Amount: 250, Currency: "USD",
+		TenantID: "tenant-bnk04-a", StatementLineID: lineID,
 		Counterparty: "Acme Corp", ActorPrincipalID: "ops-1",
 	})
 	if err != nil {
@@ -276,7 +276,7 @@ func TestBNK04_NormalizeTransaction_ActiveLineUniqueness(t *testing.T) {
 	// enforced by idx_bank_txn_canonical_active_line, not application
 	// logic that could be bypassed.
 	if _, err := s.NormalizeTransaction(ctx, domain.NormalizeTransactionParams{
-		TenantID: "tenant-bnk04-a", StatementLineID: lineID, TransactionDate: time.Now(), Amount: 250, Currency: "USD",
+		TenantID: "tenant-bnk04-a", StatementLineID: lineID,
 		Counterparty: "Acme Corp", ActorPrincipalID: "ops-1",
 	}); err == nil {
 		t.Fatal("expected a second normalize on an already-normalized line to fail")
@@ -285,7 +285,7 @@ func TestBNK04_NormalizeTransaction_ActiveLineUniqueness(t *testing.T) {
 	// Correction via supersession must succeed, preserve the prior row
 	// (now SUPERSEDED, pointing at the new one), and bump mapping_version.
 	corrected, err := s.ReNormalizeTransaction(ctx, domain.ReNormalizeTransactionParams{
-		TenantID: "tenant-bnk04-a", PriorTransactionID: txn.TransactionID, TransactionDate: time.Now(), Amount: 250, Currency: "USD",
+		TenantID: "tenant-bnk04-a", PriorTransactionID: txn.TransactionID,
 		Category: "WIRE_IN_CORRECTED", Counterparty: "Acme Corporation", ActorPrincipalID: "ops-2",
 	})
 	if err != nil {
@@ -297,7 +297,7 @@ func TestBNK04_NormalizeTransaction_ActiveLineUniqueness(t *testing.T) {
 
 	// Re-normalizing the now-SUPERSEDED prior row must be rejected.
 	if _, err := s.ReNormalizeTransaction(ctx, domain.ReNormalizeTransactionParams{
-		TenantID: "tenant-bnk04-a", PriorTransactionID: txn.TransactionID, TransactionDate: time.Now(), Amount: 250, Currency: "USD",
+		TenantID: "tenant-bnk04-a", PriorTransactionID: txn.TransactionID,
 		Category: "X", Counterparty: "Y", ActorPrincipalID: "ops-2",
 	}); err != domain.ErrInvalidTransactionTransition {
 		t.Fatalf("expected ErrInvalidTransactionTransition re-normalizing an already-SUPERSEDED row, got %v", err)
@@ -330,7 +330,7 @@ func TestBNK04_CanonicalTransaction_SupersededIsImmutable(t *testing.T) {
 		t.Fatalf("ingest: %v", err)
 	}
 	normResult, err := s.NormalizeTransaction(ctx, domain.NormalizeTransactionParams{
-		TenantID: "tenant-bnk04-b", StatementLineID: result.Lines[0].LineID, TransactionDate: time.Now(), Amount: 75, Currency: "USD",
+		TenantID: "tenant-bnk04-b", StatementLineID: result.Lines[0].LineID,
 		ActorPrincipalID: "ops-1",
 	})
 	if err != nil {
@@ -341,7 +341,7 @@ func TestBNK04_CanonicalTransaction_SupersededIsImmutable(t *testing.T) {
 	}
 	txn := normResult.Transaction
 	if _, err := s.ReNormalizeTransaction(ctx, domain.ReNormalizeTransactionParams{
-		TenantID: "tenant-bnk04-b", PriorTransactionID: txn.TransactionID, TransactionDate: time.Now(), Amount: 75, Currency: "USD",
+		TenantID: "tenant-bnk04-b", PriorTransactionID: txn.TransactionID,
 		Category: "MISC_CORRECTED", ActorPrincipalID: "ops-2",
 	}); err != nil {
 		t.Fatalf("re-normalize: %v", err)
@@ -396,7 +396,7 @@ func TestBNK04_ApproveMappingException_RejectsSelfApproval(t *testing.T) {
 
 	// Same principal approving their own exception must be rejected.
 	if _, err := s.ApproveMappingException(ctx, domain.ApproveMappingExceptionParams{
-		TenantID: "tenant-bnk04-c", ExceptionID: exc.ExceptionID, TransactionDate: time.Now(), Amount: 42, Currency: "USD",
+		TenantID: "tenant-bnk04-c", ExceptionID: exc.ExceptionID,
 		Category: "MISC", ApproverPrincipalID: "ops-1",
 	}); err != domain.ErrMappingExceptionSelfApproval {
 		t.Fatalf("expected ErrMappingExceptionSelfApproval, got %v", err)
@@ -405,7 +405,7 @@ func TestBNK04_ApproveMappingException_RejectsSelfApproval(t *testing.T) {
 	// A different principal approving must succeed, create the real
 	// canonical transaction, and close the exception.
 	txn, err := s.ApproveMappingException(ctx, domain.ApproveMappingExceptionParams{
-		TenantID: "tenant-bnk04-c", ExceptionID: exc.ExceptionID, TransactionDate: time.Now(), Amount: 42, Currency: "USD",
+		TenantID: "tenant-bnk04-c", ExceptionID: exc.ExceptionID,
 		Category: "MISC", ApproverPrincipalID: "ops-2",
 	})
 	if err != nil || txn.StatementLineID != lineID {
@@ -414,7 +414,7 @@ func TestBNK04_ApproveMappingException_RejectsSelfApproval(t *testing.T) {
 
 	// Approving an already-resolved exception a second time must fail.
 	if _, err := s.ApproveMappingException(ctx, domain.ApproveMappingExceptionParams{
-		TenantID: "tenant-bnk04-c", ExceptionID: exc.ExceptionID, TransactionDate: time.Now(), Amount: 42, Currency: "USD",
+		TenantID: "tenant-bnk04-c", ExceptionID: exc.ExceptionID,
 		Category: "MISC", ApproverPrincipalID: "ops-3",
 	}); err != domain.ErrMappingExceptionNotOpen {
 		t.Fatalf("expected ErrMappingExceptionNotOpen re-approving a resolved exception, got %v", err)
@@ -449,7 +449,7 @@ func TestBNK04_NormalizeTransaction_KnownCode_NormalizesAutomatically(t *testing
 	}
 
 	normResult, err := s.NormalizeTransaction(ctx, domain.NormalizeTransactionParams{
-		TenantID: "tenant-bnk04-map-known", StatementLineID: result.Lines[0].LineID, TransactionDate: time.Now(), Amount: 500, Currency: "USD",
+		TenantID: "tenant-bnk04-map-known", StatementLineID: result.Lines[0].LineID,
 		Counterparty: "Employer Inc", ActorPrincipalID: "ops-1",
 	})
 	if err != nil {
@@ -487,7 +487,7 @@ func TestBNK04_NormalizeTransaction_UnknownCode_AutoQuarantines(t *testing.T) {
 	lineID := result.Lines[0].LineID
 
 	first, err := s.NormalizeTransaction(ctx, domain.NormalizeTransactionParams{
-		TenantID: "tenant-bnk04-map-unknown", StatementLineID: lineID, TransactionDate: time.Now(), Amount: 999, Currency: "USD",
+		TenantID: "tenant-bnk04-map-unknown", StatementLineID: lineID,
 		Counterparty: "Unknown Corp", ActorPrincipalID: "ops-1",
 	})
 	if err != nil {
@@ -501,7 +501,7 @@ func TestBNK04_NormalizeTransaction_UnknownCode_AutoQuarantines(t *testing.T) {
 	}
 
 	second, err := s.NormalizeTransaction(ctx, domain.NormalizeTransactionParams{
-		TenantID: "tenant-bnk04-map-unknown", StatementLineID: lineID, TransactionDate: time.Now(), Amount: 999, Currency: "USD",
+		TenantID: "tenant-bnk04-map-unknown", StatementLineID: lineID,
 		Counterparty: "Unknown Corp", ActorPrincipalID: "ops-1",
 	})
 	if err != nil {
@@ -532,5 +532,254 @@ func TestBNK04_CreateTransactionMapping_RejectsDuplicateBankCode(t *testing.T) {
 		TenantID: "tenant-bnk04-map-dup", BankCode: "DUP-CODE", Category: "SOMETHING_ELSE", ActorPrincipalID: "ops-admin",
 	}); err != domain.ErrMappingAlreadyExists {
 		t.Fatalf("expected ErrMappingAlreadyExists, got %v", err)
+	}
+}
+
+// TestBNK03_ReprocessQuarantinedStatement_AllowsOnlyNarrowReset proves the
+// migration-008 exception: QUARANTINED -> RECEIVED is possible again, but a
+// reprocess cannot rewrite any other statement column.
+func TestBNK03_ReprocessQuarantinedStatement_AllowsOnlyNarrowReset(t *testing.T) {
+	admin := openAdminPool(t)
+	appPool := appRolePool(t, admin)
+	s := store.NewPgStore(appPool, store.WithEventRegion("uk"))
+
+	ctx := middleware.WithTenant(context.Background(), "tenant-bnk03-reprocess")
+	connID := seedConnection(t, ctx, s, "tenant-bnk03-reprocess")
+	result, err := s.IngestStatement(ctx, "tenant-bnk03-reprocess", domain.IngestStatementLinesRequest{
+		ConnectionID: connID, StatementFormat: domain.FormatBAI2, StatementDate: time.Now(), ContentHash: "hash-reprocess",
+		OpeningBalance: 100, ClosingBalance: 999,
+		Lines: []domain.StatementLineIn{{PostedDate: time.Now(), Amount: 10, Currency: "USD"}},
+	}, "auditor-1", "")
+	if err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	stmtID := result.Statement.StatementID
+	if err := s.ValidateStatement(ctx, "tenant-bnk03-reprocess", stmtID); err != domain.ErrStatementBalanceMismatch {
+		t.Fatalf("expected balance mismatch, got %v", err)
+	}
+
+	if err := s.ReprocessQuarantinedStatement(ctx, "tenant-bnk03-reprocess", stmtID); err != nil {
+		t.Fatalf("reprocess quarantined statement: %v", err)
+	}
+	var status, reason string
+	if err := admin.QueryRow(ctx, `SELECT status, quarantine_reason FROM bank_statements WHERE statement_id=$1`, stmtID).Scan(&status, &reason); err != nil {
+		t.Fatalf("read reprocessed statement: %v", err)
+	}
+	if status != domain.StatementReceived || reason != "" {
+		t.Fatalf("expected RECEIVED with an empty reason, got status=%s reason=%q", status, reason)
+	}
+
+	// Quarantine it again, then prove the narrow exception cannot be used
+	// to smuggle in a field edit.
+	if err := s.ValidateStatement(ctx, "tenant-bnk03-reprocess", stmtID); err != domain.ErrStatementBalanceMismatch {
+		t.Fatalf("expected second balance mismatch, got %v", err)
+	}
+	if _, err := admin.Exec(ctx, `UPDATE bank_statements SET status='RECEIVED', quarantine_reason='', opening_balance=0 WHERE statement_id=$1`, stmtID); err == nil {
+		t.Fatal("expected reprocess trigger to refuse a changed opening_balance")
+	}
+	if err := s.ReprocessQuarantinedStatement(ctx, "tenant-bnk03-reprocess", stmtID); err != nil {
+		t.Fatalf("legitimate reprocess after refused field edit: %v", err)
+	}
+}
+
+// TestBNK03_ListStatements_ReturnsIngestionEvidence proves status, raw-source
+// hash, source/batch ids and quarantine reason survive the read projection.
+func TestBNK03_ListStatements_ReturnsIngestionEvidence(t *testing.T) {
+	admin := openAdminPool(t)
+	appPool := appRolePool(t, admin)
+	s := store.NewPgStore(appPool, store.WithEventRegion("uk"))
+
+	ctx := middleware.WithTenant(context.Background(), "tenant-bnk03-evidence")
+	connID := seedConnection(t, ctx, s, "tenant-bnk03-evidence")
+	result, err := s.IngestStatement(ctx, "tenant-bnk03-evidence", domain.IngestStatementLinesRequest{
+		ConnectionID: connID, StatementFormat: domain.FormatBAI2, StatementDate: time.Now(),
+		ContentHash: "hash-evidence", SourceID: "src-42", ImportBatchID: "batch-42",
+		Lines: []domain.StatementLineIn{{PostedDate: time.Now(), Amount: 1, Currency: "USD"}},
+	}, "auditor-1", "")
+	if err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if result.Statement.Status != domain.StatementReceived || result.Statement.ContentHash != "hash-evidence" ||
+		result.Statement.SourceID != "src-42" || result.Statement.ImportBatchID != "batch-42" {
+		t.Fatalf("ingest response omitted evidence: %+v", result.Statement)
+	}
+
+	list, err := s.ListStatements(ctx, connID)
+	if err != nil {
+		t.Fatalf("list statements: %v", err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("expected 1 statement, got %d", len(list))
+	}
+	if list[0].Status != domain.StatementReceived || list[0].ContentHash != "hash-evidence" ||
+		list[0].SourceID != "src-42" || list[0].ImportBatchID != "batch-42" {
+		t.Fatalf("ListStatements omitted ingestion evidence: %+v", list[0])
+	}
+}
+
+// TestBNK03_IngestStatement_BatchPersistsEveryLine exercises the set-based
+// line insert with enough rows that the old per-line loop was a visible N+1,
+// and proves replay returns the same persisted population.
+func TestBNK03_IngestStatement_BatchPersistsEveryLine(t *testing.T) {
+	admin := openAdminPool(t)
+	appPool := appRolePool(t, admin)
+	s := store.NewPgStore(appPool, store.WithEventRegion("uk"))
+
+	ctx := middleware.WithTenant(context.Background(), "tenant-bnk03-batch")
+	connID := seedConnection(t, ctx, s, "tenant-bnk03-batch")
+
+	const lineCount = 250
+	lines := make([]domain.StatementLineIn, lineCount)
+	for i := range lines {
+		lines[i] = domain.StatementLineIn{
+			PostedDate:  time.Now().UTC().Add(time.Duration(i) * time.Minute),
+			Amount:      float64(i + 1),
+			Currency:    "USD",
+			Description: "line",
+		}
+	}
+	req := domain.IngestStatementLinesRequest{
+		ConnectionID: connID, StatementFormat: domain.FormatBAI2, StatementDate: time.Now(),
+		ContentHash: "hash-batch-250", Lines: lines,
+	}
+	first, err := s.IngestStatement(ctx, "tenant-bnk03-batch", req, "auditor-1", "")
+	if err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if !first.Created || len(first.Lines) != lineCount {
+		t.Fatalf("expected %d created lines, got created=%v count=%d", lineCount, first.Created, len(first.Lines))
+	}
+	for i, line := range first.Lines {
+		if line.LineSeq != i+1 || line.Amount != float64(i+1) {
+			t.Fatalf("line %d persisted out of order or with the wrong amount: %+v", i, line)
+		}
+	}
+
+	replay, err := s.IngestStatement(ctx, "tenant-bnk03-batch", req, "auditor-1", "")
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if replay.Created || len(replay.Lines) != lineCount || replay.Statement.StatementID != first.Statement.StatementID {
+		t.Fatalf("replay was not stable: created=%v count=%d id=%s", replay.Created, len(replay.Lines), replay.Statement.StatementID)
+	}
+}
+
+func floatPtr(v float64) *float64    { return &v }
+func timePtr(v time.Time) *time.Time { return &v }
+
+// TestBNK04_NormalizeTransaction_UsesRawEvidenceAndRejectsMismatch proves a
+// canonical transaction can never carry a date/amount/currency that differs
+// from the immutable statement line, whether the caller lies or simply omits
+// those fields.
+func TestBNK04_NormalizeTransaction_UsesRawEvidenceAndRejectsMismatch(t *testing.T) {
+	admin := openAdminPool(t)
+	appPool := appRolePool(t, admin)
+	s := store.NewPgStore(appPool, store.WithEventRegion("uk"))
+
+	ctx := middleware.WithTenant(context.Background(), "tenant-bnk04-raw")
+	connID := seedConnection(t, ctx, s, "tenant-bnk04-raw")
+	if _, err := s.CreateTransactionMapping(ctx, domain.CreateTransactionMappingParams{
+		TenantID: "tenant-bnk04-raw", BankCode: "RAW-CODE", Category: "RAW_CATEGORY", ActorPrincipalID: "ops-admin",
+	}); err != nil {
+		t.Fatalf("create mapping: %v", err)
+	}
+	posted := time.Date(2026, 10, 1, 12, 30, 0, 0, time.UTC)
+	result, err := s.IngestStatement(ctx, "tenant-bnk04-raw", domain.IngestStatementLinesRequest{
+		ConnectionID: connID, StatementFormat: domain.FormatBAI2, StatementDate: posted, ContentHash: "hash-raw",
+		Lines: []domain.StatementLineIn{{PostedDate: posted, Amount: 123.45, Currency: "EUR", BankCode: "RAW-CODE"}},
+	}, "auditor-1", "")
+	if err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	lineID := result.Lines[0].LineID
+
+	wrongDate := posted.Add(time.Hour)
+	if _, err := s.NormalizeTransaction(ctx, domain.NormalizeTransactionParams{
+		TenantID: "tenant-bnk04-raw", StatementLineID: lineID, TransactionDate: &wrongDate, ActorPrincipalID: "ops-1",
+	}); err != domain.ErrTransactionEvidenceMismatch {
+		t.Fatalf("expected date mismatch, got %v", err)
+	}
+	if _, err := s.NormalizeTransaction(ctx, domain.NormalizeTransactionParams{
+		TenantID: "tenant-bnk04-raw", StatementLineID: lineID, Amount: floatPtr(999.99), ActorPrincipalID: "ops-1",
+	}); err != domain.ErrTransactionEvidenceMismatch {
+		t.Fatalf("expected amount mismatch, got %v", err)
+	}
+	if _, err := s.NormalizeTransaction(ctx, domain.NormalizeTransactionParams{
+		TenantID: "tenant-bnk04-raw", StatementLineID: lineID, Currency: "USD", ActorPrincipalID: "ops-1",
+	}); err != domain.ErrTransactionEvidenceMismatch {
+		t.Fatalf("expected currency mismatch, got %v", err)
+	}
+
+	sameDate, sameAmount := posted, 123.45
+	norm, err := s.NormalizeTransaction(ctx, domain.NormalizeTransactionParams{
+		TenantID: "tenant-bnk04-raw", StatementLineID: lineID, TransactionDate: &sameDate, Amount: &sameAmount,
+		Currency: "eur", Counterparty: "Acme", ActorPrincipalID: "ops-1",
+	})
+	if err != nil || norm.Transaction == nil {
+		t.Fatalf("normalize with exact evidence: %+v err=%v", norm, err)
+	}
+	txn := norm.Transaction
+	if !txn.TransactionDate.Equal(posted) || txn.Amount != 123.45 || txn.Currency != "EUR" {
+		t.Fatalf("canonical transaction did not use raw line evidence: %+v", txn)
+	}
+
+	if _, err := s.ReNormalizeTransaction(ctx, domain.ReNormalizeTransactionParams{
+		TenantID: "tenant-bnk04-raw", PriorTransactionID: txn.TransactionID, Category: "CORRECTED",
+		Amount: floatPtr(1), ActorPrincipalID: "ops-2",
+	}); err != domain.ErrTransactionEvidenceMismatch {
+		t.Fatalf("expected re-normalize amount mismatch, got %v", err)
+	}
+	corrected, err := s.ReNormalizeTransaction(ctx, domain.ReNormalizeTransactionParams{
+		TenantID: "tenant-bnk04-raw", PriorTransactionID: txn.TransactionID, Category: "CORRECTED", ActorPrincipalID: "ops-2",
+	})
+	if err != nil {
+		t.Fatalf("re-normalize: %v", err)
+	}
+	if !corrected.TransactionDate.Equal(posted) || corrected.Amount != 123.45 || corrected.Currency != "EUR" {
+		t.Fatalf("re-normalization changed raw evidence: %+v", corrected)
+	}
+}
+
+// TestBNK04_ApproveMappingException_UsesRawEvidence proves the maker-checker
+// approval cannot invent a different date/amount/currency for the line.
+func TestBNK04_ApproveMappingException_UsesRawEvidence(t *testing.T) {
+	admin := openAdminPool(t)
+	appPool := appRolePool(t, admin)
+	s := store.NewPgStore(appPool, store.WithEventRegion("uk"))
+
+	ctx := middleware.WithTenant(context.Background(), "tenant-bnk04-approve-raw")
+	connID := seedConnection(t, ctx, s, "tenant-bnk04-approve-raw")
+	posted := time.Date(2026, 9, 15, 8, 0, 0, 0, time.UTC)
+	result, err := s.IngestStatement(ctx, "tenant-bnk04-approve-raw", domain.IngestStatementLinesRequest{
+		ConnectionID: connID, StatementFormat: domain.FormatBAI2, StatementDate: posted, ContentHash: "hash-approve-raw",
+		Lines: []domain.StatementLineIn{{PostedDate: posted, Amount: 77.77, Currency: "GBP", BankCode: "UNMAPPED-RAW"}},
+	}, "auditor-1", "")
+	if err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	norm, err := s.NormalizeTransaction(ctx, domain.NormalizeTransactionParams{
+		TenantID: "tenant-bnk04-approve-raw", StatementLineID: result.Lines[0].LineID, ActorPrincipalID: "ops-1",
+	})
+	if err != nil || norm.QuarantinedException == nil {
+		t.Fatalf("expected quarantined exception, got %+v err=%v", norm, err)
+	}
+	exc := norm.QuarantinedException
+
+	if _, err := s.ApproveMappingException(ctx, domain.ApproveMappingExceptionParams{
+		TenantID: "tenant-bnk04-approve-raw", ExceptionID: exc.ExceptionID, Category: "MISC",
+		Amount: floatPtr(1), ApproverPrincipalID: "ops-2",
+	}); err != domain.ErrTransactionEvidenceMismatch {
+		t.Fatalf("expected approval amount mismatch, got %v", err)
+	}
+
+	txn, err := s.ApproveMappingException(ctx, domain.ApproveMappingExceptionParams{
+		TenantID: "tenant-bnk04-approve-raw", ExceptionID: exc.ExceptionID, Category: "MISC",
+		ApproverPrincipalID: "ops-2",
+	})
+	if err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	if !txn.TransactionDate.Equal(posted) || txn.Amount != 77.77 || txn.Currency != "GBP" {
+		t.Fatalf("approved canonical transaction did not use raw evidence: %+v", txn)
 	}
 }

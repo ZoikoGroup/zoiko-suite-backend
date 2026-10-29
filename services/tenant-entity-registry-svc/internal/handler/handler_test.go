@@ -641,9 +641,38 @@ func TestWriteErr_PendingApprovalIs202WithTheRequest(t *testing.T) {
 			if rec.Code != http.StatusAccepted {
 				t.Fatalf("pending approval mapped to %d, want 202", rec.Code)
 			}
-			for _, want := range []string{`"PENDING_APPROVAL"`, `"apr-9"`, `"fp-9"`} {
-				if !strings.Contains(rec.Body.String(), want) {
-					t.Fatalf("202 body %s lacks %s", rec.Body.String(), want)
+			// Check new problem details format
+			var body struct {
+				Code     string `json:"code"`
+				Detail   string `json:"detail"`
+				Extra    map[string]any `json:"-"`
+			}
+			// Parse the full body to check Extra
+			var fullBody map[string]any
+			if err := json.Unmarshal(rec.Body.Bytes(), &fullBody); err != nil {
+				t.Fatalf("body is not JSON: %s", rec.Body.String())
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+				t.Fatalf("body is not JSON: %s", rec.Body.String())
+			}
+			if body.Code != "pending_approval" {
+				t.Fatalf("code = %q, want %q", body.Code, "pending_approval")
+			}
+			if body.Detail != "Command filed for independent approval" {
+				t.Fatalf("detail = %q, want %q", body.Detail, "Command filed for independent approval")
+			}
+			// Check Extra contains the approval request
+			if extra, ok := fullBody["approval_status"].(string); !ok || extra != "PENDING_APPROVAL" {
+				t.Fatalf("Extra.approval_status = %v, want %q", fullBody["approval_status"], "PENDING_APPROVAL")
+			}
+			if approvalReq, ok := fullBody["approval_request"].(map[string]any); !ok {
+				t.Fatalf("Extra.approval_request missing or not object")
+			} else {
+				if approvalReq["approval_request_id"] != "apr-9" {
+					t.Fatalf("approval_request.approval_request_id = %v, want %q", approvalReq["approval_request_id"], "apr-9")
+				}
+				if approvalReq["payload_fingerprint"] != "fp-9" {
+					t.Fatalf("approval_request.payload_fingerprint = %v, want %q", approvalReq["payload_fingerprint"], "fp-9")
 				}
 			}
 		})
@@ -731,17 +760,20 @@ func TestWriteErr_EveryRefusalCarriesItsTypedCode(t *testing.T) {
 		t.Run(tc.err.Error(), func(t *testing.T) {
 			rec := do(newRouter(&stubSvc{err: tc.err}), http.MethodGet, "/v1/tenants/"+tenantID, "")
 			var body struct {
-				Error     string `json:"error"`
-				ErrorCode string `json:"error_code"`
+				Code   string `json:"code"`
+				Detail string `json:"detail"`
 			}
 			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 				t.Fatalf("body is not JSON: %s", rec.Body.String())
 			}
-			if rec.Code != tc.wantStatus || body.ErrorCode != tc.wantCode {
-				t.Fatalf("got %d %q, want %d %q (body %s)", rec.Code, body.ErrorCode, tc.wantStatus, tc.wantCode, rec.Body.String())
+			if rec.Code != tc.wantStatus || body.Code != tc.wantCode {
+				t.Fatalf("got %d %q, want %d %q (body %s)", rec.Code, body.Code, tc.wantStatus, tc.wantCode, rec.Body.String())
 			}
-			if strings.Contains(body.Error, "already exists") && tc.wantCode != "DUPLICATE_CANDIDATE" {
-				t.Fatalf("a %s must not read as a duplicate: %q", tc.wantCode, body.Error)
+			if ct := rec.Header().Get("Content-Type"); ct != "application/problem+json" {
+				t.Fatalf("Content-Type = %q, want application/problem+json (API-2)", ct)
+			}
+			if strings.Contains(body.Detail, "already exists") && tc.wantCode != "DUPLICATE_CANDIDATE" {
+				t.Fatalf("a %s must not read as a duplicate: %q", tc.wantCode, body.Detail)
 			}
 		})
 	}
@@ -750,7 +782,13 @@ func TestWriteErr_EveryRefusalCarriesItsTypedCode(t *testing.T) {
 // A malformed body has no service error behind it and still gets a code.
 func TestWriteErr_MalformedBodyIsValidationFailed(t *testing.T) {
 	rec := do(newRouter(&stubSvc{}), http.MethodPost, "/v1/entities", "{")
-	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), `"error_code":"VALIDATION_FAILED"`) {
+	var body struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("body is not JSON: %s", rec.Body.String())
+	}
+	if rec.Code != http.StatusBadRequest || body.Code != "VALIDATION_FAILED" {
 		t.Fatalf("got %d %s", rec.Code, rec.Body.String())
 	}
 }

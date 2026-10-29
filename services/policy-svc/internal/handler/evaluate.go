@@ -118,13 +118,13 @@ func (h *Handler) Evaluate(w http.ResponseWriter, r *http.Request) {
 	}
 	switch {
 	case req.PolicyType == "":
-		missingField(w, "policy_type")
+		missingField(w, r, "policy_type")
 		return
 	case req.DecisionID == "":
-		missingField(w, "decision_id")
+		missingField(w, r, "decision_id")
 		return
 	}
-	if tooLong(w, "policy_type", req.PolicyType, 64) || tooLong(w, "decision_id", req.DecisionID, 64) {
+	if tooLong(w, r, "policy_type", req.PolicyType, 64) || tooLong(w, r, "decision_id", req.DecisionID, 64) {
 		return
 	}
 
@@ -134,7 +134,7 @@ func (h *Handler) Evaluate(w http.ResponseWriter, r *http.Request) {
 	}
 	// tenant_id selects whose policy set decides; omitting it means global
 	// policy only. Naming another tenant would borrow their rules.
-	if !optionalUUID(w, "tenant_id", req.TenantID) || h.refuseForeignTenant(w, req.TenantID, tenantID) {
+	if !optionalUUID(w, r, "tenant_id", req.TenantID) || h.refuseForeignTenant(w, r, req.TenantID, tenantID) {
 		return
 	}
 	if req.TenantID != nil && *req.TenantID == "" {
@@ -147,7 +147,7 @@ func (h *Handler) Evaluate(w http.ResponseWriter, r *http.Request) {
 	if len(req.ActionContext) > 0 {
 		var obj map[string]json.RawMessage
 		if err := json.Unmarshal(req.ActionContext, &obj); err != nil {
-			writeError(w, http.StatusBadRequest, codeInvalidRequest, "invalid_action_context", "action_context must be a JSON object", nil)
+			writeError(w, r, http.StatusBadRequest, codeInvalidRequest, "invalid_action_context", "action_context must be a JSON object", nil)
 			return
 		}
 	}
@@ -160,12 +160,12 @@ func (h *Handler) Evaluate(w http.ResponseWriter, r *http.Request) {
 	now := h.opts.Now().UTC()
 	asOf, knownAt, ok := resolve.Times(req.AsOf, req.KnownAt, now)
 	if !ok {
-		writeError(w, http.StatusBadRequest, codeInvalidRequest, "invalid_known_at", "known_at cannot be in the future", nil)
+		writeError(w, r, http.StatusBadRequest, codeInvalidRequest, "invalid_known_at", "known_at cannot be in the future", nil)
 		return
 	}
 	fp, err := inputFingerprint(req, legalEntityID)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, codeInvalidRequest, "invalid_action_context", err.Error(), nil)
+		writeError(w, r, http.StatusBadRequest, codeInvalidRequest, "invalid_action_context", err.Error(), nil)
 		return
 	}
 
@@ -173,7 +173,7 @@ func (h *Handler) Evaluate(w http.ResponseWriter, r *http.Request) {
 	existing, err := h.store.FindEvaluationByDecision(r.Context(), tenantID, req.DecisionID)
 	switch {
 	case err == nil:
-		h.answerReplay(w, existing, fp)
+		h.answerReplay(w, r, existing, fp)
 		return
 	case !errors.Is(err, domain.ErrEvaluationNotFound):
 		h.storeUnavailable(w, r, "Evaluate", err)
@@ -191,7 +191,7 @@ func (h *Handler) Evaluate(w http.ResponseWriter, r *http.Request) {
 		// Nothing governs. This service does not guess fail-open or
 		// fail-closed for the caller; nothing was evaluated, so nothing is
 		// recorded as a decision.
-		writeError(w, http.StatusNotFound, codePolicyNotEffective, "no_applicable_policy", "",
+		writeError(w, r, http.StatusNotFound, codePolicyNotEffective, "no_applicable_policy", "",
 			map[string]any{"policy_type": req.PolicyType, "as_of": asOf, "known_at": knownAt})
 		return
 	case resolve.Conflicted:
@@ -206,7 +206,7 @@ func (h *Handler) Evaluate(w http.ResponseWriter, r *http.Request) {
 		h.log.Error("Evaluate: stored payload does not match its artifact digest",
 			zap.String("policy_version_id", selected.PolicyVersionID),
 			zap.String("correlation_id", correlationID))
-		writeError(w, http.StatusInternalServerError, codeEvidenceIntegrity, "artifact_digest_mismatch", "",
+		writeError(w, r, http.StatusInternalServerError, codeEvidenceIntegrity, "artifact_digest_mismatch", "",
 			map[string]any{"policy_version_id": selected.PolicyVersionID})
 		return
 	}
@@ -215,12 +215,12 @@ func (h *Handler) Evaluate(w http.ResponseWriter, r *http.Request) {
 	var selectedRules []string
 	switch req.PolicyType {
 	case policyTypeApprovalThreshold:
-		result, selectedRules, ok = h.evaluateApprovalThreshold(w, req, selected)
+		result, selectedRules, ok = h.evaluateApprovalThreshold(w, r, req, selected)
 		if !ok {
 			return
 		}
 	default:
-		writeError(w, http.StatusNotImplemented, codeNotImplemented, "policy_type_not_implemented", "",
+		writeError(w, r, http.StatusNotImplemented, codeNotImplemented, "policy_type_not_implemented", "",
 			map[string]any{"policy_type": req.PolicyType})
 		return
 	}
@@ -263,15 +263,15 @@ func (h *Handler) Evaluate(w http.ResponseWriter, r *http.Request) {
 	}
 	if !created {
 		// A concurrent request with the same decision_id won the insert.
-		h.answerReplay(w, saved, fp)
+		h.answerReplay(w, r, saved, fp)
 		return
 	}
 	writeJSON(w, http.StatusOK, responseFor(saved, false))
 }
 
-func (h *Handler) answerReplay(w http.ResponseWriter, ev *domain.Evaluation, fingerprint string) {
+func (h *Handler) answerReplay(w http.ResponseWriter, r *http.Request, ev *domain.Evaluation, fingerprint string) {
 	if ev.InputFingerprint != fingerprint {
-		writeError(w, http.StatusConflict, codeIdempotencyMismatch, "decision_id_conflict",
+		writeError(w, r, http.StatusConflict, codeIdempotencyMismatch, "decision_id_conflict",
 			"decision_id was already evaluated with different input", map[string]any{"decision_id": ev.DecisionID, "evidence_id": ev.EvaluationID})
 		return
 	}
@@ -313,7 +313,7 @@ func (h *Handler) reportConflict(w http.ResponseWriter, r *http.Request, req eva
 	h.log.Warn("Evaluate: conflicting policies at the same specificity",
 		zap.String("policy_type", req.PolicyType), zap.Strings("policy_version_ids", ids),
 		zap.String("correlation_id", meta.CorrelationID))
-	writeError(w, http.StatusConflict, codePolicyConflicted, "conflicting_policies",
+	writeError(w, r, http.StatusConflict, codePolicyConflicted, "conflicting_policies",
 		"multiple distinct policies govern the same scope; none was applied",
 		map[string]any{"policy_type": req.PolicyType, "candidate_version_ids": ids})
 }
@@ -393,21 +393,21 @@ func decodeExactAmount(raw json.RawMessage, field string) (*big.Rat, bool, error
 // version's rule_payload.threshold_amount, exactly: amount > threshold is
 // APPROVAL_REQUIRED, otherwise WITHIN_THRESHOLD. It writes its own error
 // response and returns ok=false when it cannot decide.
-func (h *Handler) evaluateApprovalThreshold(w http.ResponseWriter, req evaluateRequest, v *domain.ApplicablePolicyVersion) (string, []string, bool) {
+func (h *Handler) evaluateApprovalThreshold(w http.ResponseWriter, r *http.Request, req evaluateRequest, v *domain.ApplicablePolicyVersion) (string, []string, bool) {
 	threshold, present, err := decodeExactAmount(v.RulePayload, "threshold_amount")
 	if err != nil || !present {
 		h.log.Error("evaluateApprovalThreshold: policy version has invalid/missing threshold_amount",
 			zap.String("policy_version_id", v.PolicyVersionID), zap.Error(err))
-		writeError(w, http.StatusInternalServerError, codeEvidenceIntegrity, "invalid_policy_payload", "", nil)
+		writeError(w, r, http.StatusInternalServerError, codeEvidenceIntegrity, "invalid_policy_payload", "", nil)
 		return "", nil, false
 	}
 	if len(req.ActionContext) == 0 {
-		missingField(w, "action_context.amount")
+		missingField(w, r, "action_context.amount")
 		return "", nil, false
 	}
 	amount, present, err := decodeExactAmount(req.ActionContext, "amount")
 	if err != nil || !present {
-		missingField(w, "action_context.amount")
+		missingField(w, r, "action_context.amount")
 		return "", nil, false
 	}
 	result := "WITHIN_THRESHOLD"

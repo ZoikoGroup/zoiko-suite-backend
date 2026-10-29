@@ -60,20 +60,20 @@ func (h *Handler) ResolveRetention(w http.ResponseWriter, r *http.Request) {
 	}
 	if field := firstBlank(requiredField{"jurisdiction", req.Jurisdiction}, requiredField{"record_class", req.RecordClass},
 		requiredField{"trigger_date", req.TriggerDate}); field != "" {
-		writeMissingField(w, field)
+		writeMissingField(w, r, field)
 		return
 	}
 	day, err := time.Parse("2006-01-02", req.TriggerDate)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_trigger_date", "trigger_date must be a date, YYYY-MM-DD")
+		writeError(w, r, http.StatusBadRequest, "invalid_trigger_date", "trigger_date must be a date, YYYY-MM-DD")
 		return
 	}
 	if req.Trigger != "" && !contains(domain.RetentionTriggers, req.Trigger) {
-		writeError(w, http.StatusBadRequest, "invalid_trigger", "trigger must be one of "+strings.Join(domain.RetentionTriggers, ", "))
+		writeError(w, r, http.StatusBadRequest, "invalid_trigger", "trigger must be one of "+strings.Join(domain.RetentionTriggers, ", "))
 		return
 	}
 	if req.TenantMinimum != nil && !req.TenantMinimum.Valid() {
-		writeError(w, http.StatusBadRequest, "invalid_tenant_minimum", "tenant_minimum needs years 0-100, months 0-11, days 0-365 and a positive total")
+		writeError(w, r, http.StatusBadRequest, "invalid_tenant_minimum", "tenant_minimum needs years 0-100, months 0-11, days 0-365 and a positive total")
 		return
 	}
 	idemKey, ok := h.idempotencyKey(w, r)
@@ -84,7 +84,7 @@ func (h *Handler) ResolveRetention(w http.ResponseWriter, r *http.Request) {
 	d, err := h.resolver.Resolve(r.Context(), resolver.Request{Jurisdiction: req.Jurisdiction, RuleDomain: domain.RetentionDomain,
 		RuleCode: req.RecordClass, At: day, PackRef: req.PackRef, PackVersion: req.PackVersion})
 	if err != nil {
-		h.writeResolveError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeResolveError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	out := RetentionResponse{Outcome: d.Outcome, Resolution: d}
@@ -133,12 +133,12 @@ func (h *Handler) ResolveMapping(w http.ResponseWriter, r *http.Request) {
 	}
 	if field := firstBlank(requiredField{"jurisdiction", req.Jurisdiction}, requiredField{"mapping_code", req.MappingCode},
 		requiredField{"effective_at", req.EffectiveAt}); field != "" {
-		writeMissingField(w, field)
+		writeMissingField(w, r, field)
 		return
 	}
 	at, err := time.Parse(time.RFC3339Nano, req.EffectiveAt)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_effective_at", "effective_at must be an RFC3339 instant")
+		writeError(w, r, http.StatusBadRequest, "invalid_effective_at", "effective_at must be an RFC3339 instant")
 		return
 	}
 	idemKey, ok := h.idempotencyKey(w, r)
@@ -151,7 +151,7 @@ func (h *Handler) ResolveMapping(w http.ResponseWriter, r *http.Request) {
 	d, err := h.resolver.Resolve(r.Context(), resolver.Request{Jurisdiction: req.Jurisdiction, RuleDomain: domain.MappingDomain,
 		RuleCode: req.MappingCode, At: at, PackRef: req.PackRef, PackVersion: req.PackVersion})
 	if err != nil {
-		h.writeResolveError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeResolveError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	out := MappingResponse{Outcome: d.Outcome, Resolution: d}
@@ -174,7 +174,7 @@ func (h *Handler) idempotencyKey(w http.ResponseWriter, r *http.Request) (*strin
 		return nil, true
 	}
 	if len(k) > maxIdempotencyKey {
-		writeError(w, http.StatusBadRequest, "invalid_idempotency_key", "Idempotency-Key is too long")
+		writeError(w, r, http.StatusBadRequest, "invalid_idempotency_key", "Idempotency-Key is too long")
 		return nil, false
 	}
 	return &k, true
@@ -196,7 +196,7 @@ func (h *Handler) finishRecordDecision(w http.ResponseWriter, r *http.Request, k
 	reqDigest, _ := domain.DigestOf(rawReq)
 	respJSON, err := json.Marshal(body)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "encode_failed", "could not encode the answer")
+		writeError(w, r, http.StatusInternalServerError, "encode_failed", "could not encode the answer")
 		return
 	}
 	rec := store.DecisionRecord{Kind: kind, RequestedBy: actor, CorrelationID: corr, IdempotencyKey: idemKey, RequestDigest: reqDigest,
@@ -218,10 +218,10 @@ func (h *Handler) finishRecordDecision(w http.ResponseWriter, r *http.Request, k
 	stored, replayed, err := h.registry.RecordDecision(r.Context(), rec)
 	if err != nil {
 		if errors.Is(err, domain.ErrIdempotencyConflict) {
-			writeError(w, http.StatusConflict, "idempotency_conflict", err.Error())
+			writeError(w, r, http.StatusConflict, "idempotency_conflict", err.Error())
 			return
 		}
-		h.writeRegistryError(w, err, corr)
+		h.writeRegistryError(w, r, err, corr)
 		return
 	}
 	status := http.StatusOK
@@ -234,3 +234,4 @@ func (h *Handler) finishRecordDecision(w http.ResponseWriter, r *http.Request, k
 	}
 	writeJSON(w, status, map[string]any{"decision_id": stored.DecisionID, "replayed": replayed, key: json.RawMessage(stored.Response)})
 }
+

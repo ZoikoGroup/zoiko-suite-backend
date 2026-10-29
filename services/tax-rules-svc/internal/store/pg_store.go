@@ -91,11 +91,12 @@ func (s *PgStore) GetTaxRule(ctx context.Context, id string) (*domain.TaxRule, e
 
 	var r domain.TaxRule
 	var cat, status string
+	tenantID := middleware.GetTenantID(ctx)
 	err = tx.QueryRow(ctx, `
 		SELECT rule_id, tenant_id, jurisdiction_id, rule_code, name, category, tax_rate_percentage,
 		       standard_deductions, exemptions_json, status, version, effective_from::text, effective_to::text,
 		       created_by, created_at, updated_at
-		FROM tax_rules WHERE rule_id = $1`, id,
+		FROM tax_rules WHERE rule_id = $1 AND tenant_id = $2`, id, tenantID,
 	).Scan(
 		&r.RuleID, &r.TenantID, &r.JurisdictionID, &r.RuleCode, &r.Name, &cat, &r.TaxRatePercentage,
 		&r.StandardDeductions, &r.ExemptionsJSON, &status, &r.Version, &r.EffectiveFrom, &r.EffectiveTo,
@@ -123,15 +124,17 @@ func (s *PgStore) ListTaxRules(ctx context.Context, jurisdictionID, category, st
 		return nil, err
 	}
 
+	tenantID := middleware.GetTenantID(ctx)
 	rows, err := tx.Query(ctx, `
 		SELECT rule_id, tenant_id, jurisdiction_id, rule_code, name, category, tax_rate_percentage,
 		       standard_deductions, exemptions_json, status, version, effective_from::text, effective_to::text,
 		       created_by, created_at, updated_at
 		FROM tax_rules
-		WHERE ($1 = '' OR jurisdiction_id = $1)
+		WHERE tenant_id = $4
+		  AND ($1 = '' OR jurisdiction_id = $1)
 		  AND ($2 = '' OR category = $2)
 		  AND ($3 = '' OR status = $3)
-		ORDER BY created_at DESC`, jurisdictionID, category, status,
+		ORDER BY created_at DESC`, jurisdictionID, category, status, tenantID,
 	)
 	if err != nil {
 		return nil, err
@@ -169,14 +172,15 @@ func (s *PgStore) UpdateTaxRule(ctx context.Context, r *domain.TaxRule) error {
 
 	r.Version++
 	r.UpdatedAt = time.Now().UTC()
+	tenantID := middleware.GetTenantID(ctx)
 
 	_, err = tx.Exec(ctx, `
 		UPDATE tax_rules
 		SET name=$1, category=$2, tax_rate_percentage=$3, standard_deductions=$4,
 		    exemptions_json=$5, status=$6, version=$7, effective_to=$8, updated_at=$9
-		WHERE rule_id=$10`,
+		WHERE rule_id=$10 AND tenant_id=$11`,
 		r.Name, string(r.Category), r.TaxRatePercentage, r.StandardDeductions,
-		r.ExemptionsJSON, string(r.Status), r.Version, r.EffectiveTo, r.UpdatedAt, r.RuleID,
+		r.ExemptionsJSON, string(r.Status), r.Version, r.EffectiveTo, r.UpdatedAt, r.RuleID, tenantID,
 	)
 	if err != nil {
 		return fmt.Errorf("update tax rule: %w", err)

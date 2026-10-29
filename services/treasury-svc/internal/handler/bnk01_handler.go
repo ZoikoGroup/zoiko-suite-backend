@@ -341,6 +341,14 @@ type amendMetadataRequest struct {
 	AccountType    string `json:"account_type"`
 }
 
+// AmendBankAccountMetadata changes only the fields the request supplies;
+// an omitted or empty field keeps its current value. bank_identifier is an
+// account identifier, which migration 000003 lets change only through
+// RotateAccountIdentifierToken (with a token_version bump), so a request
+// that tries to change it here is refused with a pointer to rotate-token.
+// Before, the store wrote every field as sent: an amend that left out
+// bank_identifier tripped the identifier trigger and failed as a 503, and
+// one that left out branch_ref, country or account_type blanked them.
 func (h *Handler) AmendBankAccountMetadata(w http.ResponseWriter, r *http.Request) {
 	var req amendMetadataRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -364,10 +372,15 @@ func (h *Handler) AmendBankAccountMetadata(w http.ResponseWriter, r *http.Reques
 		h.writeAuthzErr(w, err)
 		return
 	}
+	if req.BankIdentifier != "" && req.BankIdentifier != acct.BankIdentifier {
+		writeError(w, http.StatusBadRequest, "identifier_change_requires_rotation",
+			"bank_identifier is an account identifier; change it with POST /accounts/{accountID}/rotate-token")
+		return
+	}
 	tenantID := svcmiddleware.TenantFromContext(r.Context())
 	updated, err := h.store.AmendBankAccountMetadata(r.Context(), domain.AmendBankAccountMetadataParams{
 		BankAccountID: accountID, TenantID: tenantID, AccountName: req.AccountName, BranchRef: req.BranchRef,
-		BankIdentifier: req.BankIdentifier, Country: req.Country, AccountType: req.AccountType, ActorPrincipalID: principalID,
+		Country: req.Country, AccountType: req.AccountType, ActorPrincipalID: principalID,
 	})
 	if err != nil {
 		h.writeBankAccountErr(w, err)

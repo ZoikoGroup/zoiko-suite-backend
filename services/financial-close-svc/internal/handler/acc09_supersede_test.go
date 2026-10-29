@@ -51,7 +51,7 @@ func TestSupersedeAllocationRule_StillDraft_Refused(t *testing.T) {
 	if cl.accountStatuses == nil {
 		cl.accountStatuses = map[string]string{}
 	}
-	req := domain.CreateAllocationRuleRequest{LegalEntityID: "le-1", Name: "x", SourceAccountCode: "5000", Drivers: evenDrivers()}
+	req := domain.CreateAllocationRuleRequest{CurrencyCode: testCurrency, LegalEntityID: "le-1", Name: "x", SourceAccountCode: "5000", Drivers: evenDrivers()}
 	rr := doReq(r, http.MethodPost, "/v1/allocation-rules/", req, "preparer-1")
 	var rule domain.AllocationRule
 	_ = json.NewDecoder(rr.Body).Decode(&rule)

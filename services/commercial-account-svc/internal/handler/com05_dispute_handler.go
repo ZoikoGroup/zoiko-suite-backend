@@ -3,6 +3,7 @@
 package handler
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strings"
@@ -70,6 +71,17 @@ func RegisterDisputeRoutes(r chi.Router, h *DisputeHandler) {
 
 func (h *DisputeHandler) fail(w http.ResponseWriter, r *http.Request, err error) {
 	writeFailure(w, r, h.logger, err)
+}
+
+type disputeSellerReader interface {
+	GetDisputeAsSeller(ctx context.Context, disputeID string) (*domain.DisputeCase, error)
+}
+
+func (h *DisputeHandler) disputeForReplay(ctx context.Context, disputeID string) (*domain.DisputeCase, error) {
+	if reader, ok := h.store.(disputeSellerReader); ok {
+		return reader.GetDisputeAsSeller(ctx, disputeID)
+	}
+	return h.store.GetDispute(ctx, disputeID)
 }
 
 func (h *DisputeHandler) principal(w http.ResponseWriter, r *http.Request) (string, bool) {
@@ -158,6 +170,14 @@ func (h *DisputeHandler) OpenDispute(w http.ResponseWriter, r *http.Request) {
 	}
 	d, err := h.store.OpenDispute(r.Context(), id, invoiceID, attemptID, req.Reason, principal, h.now(), cmd.claim)
 	if err != nil {
+		var replay *domain.IdempotentReplayError
+		if errors.As(err, &replay) {
+			if existing, gerr := h.disputeForReplay(r.Context(), replay.ResourceID); gerr == nil {
+				w.Header().Set("Idempotent-Replayed", "true")
+				writeJSON(w, http.StatusCreated, existing)
+				return
+			}
+		}
 		h.fail(w, r, err)
 		return
 	}
@@ -204,6 +224,11 @@ func (h *DisputeHandler) DisputeAction(w http.ResponseWriter, r *http.Request) {
 		d, err = h.store.CloseDispute(r.Context(), id, reason, principal, h.now(), cmd.claim)
 	}
 	if err != nil {
+		if HandleIdempotentReplay(w, r, err, func(resourceID string) (any, error) {
+			return h.disputeForReplay(r.Context(), resourceID)
+		}) {
+			return
+		}
 		h.fail(w, r, err)
 		return
 	}

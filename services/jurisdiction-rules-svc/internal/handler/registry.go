@@ -184,7 +184,7 @@ func (h *Handler) admin(w http.ResponseWriter, r *http.Request, resource, action
 		return "", false
 	}
 	if err := h.checkAuthz(r, principalID, resource, action); err != nil {
-		h.writeAuthzError(w, err)
+		h.writeAuthzError(w, r, err)
 		return "", false
 	}
 	return principalID, true
@@ -201,38 +201,38 @@ func (h *Handler) emitRegistry(r *http.Request, eventType, aggregateID, actor st
 }
 
 // writeRegistryError maps registry errors, then defers to the shared mapper.
-func (h *Handler) writeRegistryError(w http.ResponseWriter, err error, corr string) {
+func (h *Handler) writeRegistryError(w http.ResponseWriter, r *http.Request, err error, corr string) {
 	switch {
 	case errors.Is(err, domain.ErrRegimeNotFound):
-		writeError(w, http.StatusNotFound, "regime_not_found", "no such regulatory regime")
+		writeError(w, r, http.StatusNotFound, "regime_not_found", "no such regulatory regime")
 	case errors.Is(err, domain.ErrSourceNotFound):
-		writeError(w, http.StatusNotFound, "source_not_found", "no such regulatory source")
+		writeError(w, r, http.StatusNotFound, "source_not_found", "no such regulatory source")
 	case errors.Is(err, domain.ErrInterpretationNotFound):
-		writeError(w, http.StatusNotFound, "interpretation_not_found", "no such interpretation record")
+		writeError(w, r, http.StatusNotFound, "interpretation_not_found", "no such interpretation record")
 	case errors.Is(err, domain.ErrPackNotFound):
-		writeError(w, http.StatusNotFound, "pack_not_found", "no such jurisdiction pack")
+		writeError(w, r, http.StatusNotFound, "pack_not_found", "no such jurisdiction pack")
 	case errors.Is(err, domain.ErrPackVersionNotFound):
-		writeError(w, http.StatusNotFound, "pack_version_not_found", "no such pack version")
+		writeError(w, r, http.StatusNotFound, "pack_version_not_found", "no such pack version")
 	case errors.Is(err, domain.ErrNotIndependent):
-		writeError(w, http.StatusForbidden, "segregation_of_duties", err.Error())
+		writeError(w, r, http.StatusForbidden, "segregation_of_duties", err.Error())
 	case errors.Is(err, domain.ErrAlreadyDecided):
-		writeError(w, http.StatusConflict, "already_decided", err.Error())
+		writeError(w, r, http.StatusConflict, "already_decided", err.Error())
 	case errors.Is(err, domain.ErrNotDraft):
-		writeError(w, http.StatusConflict, "not_draft", err.Error())
+		writeError(w, r, http.StatusConflict, "not_draft", err.Error())
 	case errors.Is(err, domain.ErrVersionNotNewer):
-		writeError(w, http.StatusConflict, "version_not_newer", err.Error())
+		writeError(w, r, http.StatusConflict, "version_not_newer", err.Error())
 	case errors.Is(err, domain.ErrUnapprovedInterpretation):
-		writeError(w, http.StatusConflict, "interpretation_not_approved", err.Error())
+		writeError(w, r, http.StatusConflict, "interpretation_not_approved", err.Error())
 	case errors.Is(err, domain.ErrSourceNotReady):
-		writeError(w, http.StatusConflict, "source_not_ready", err.Error())
+		writeError(w, r, http.StatusConflict, "source_not_ready", err.Error())
 	case errors.Is(err, domain.ErrSupersedesTaken):
-		writeError(w, http.StatusConflict, "supersedes_taken", err.Error())
+		writeError(w, r, http.StatusConflict, "supersedes_taken", err.Error())
 	case errors.Is(err, domain.ErrInvalidReference):
-		writeError(w, http.StatusBadRequest, "invalid_reference", err.Error())
+		writeError(w, r, http.StatusBadRequest, "invalid_reference", err.Error())
 	case errors.Is(err, domain.ErrManifestInvalid):
-		writeError(w, http.StatusBadRequest, "invalid_manifest", err.Error())
+		writeError(w, r, http.StatusBadRequest, "invalid_manifest", err.Error())
 	default:
-		h.writeStoreError(w, err, corr)
+		h.writeStoreError(w, r, err, corr)
 	}
 }
 
@@ -258,14 +258,14 @@ func (h *Handler) CreateRegime(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if field := firstBlank(requiredField{"regime_code", req.RegimeCode}, requiredField{"regime_name", req.RegimeName}); field != "" {
-		writeMissingField(w, field)
+		writeMissingField(w, r, field)
 		return
 	}
 	x, created, err := h.registry.CreateRegime(r.Context(), domain.CreateRegimeParams{
 		RegimeCode: strings.ToUpper(strings.TrimSpace(req.RegimeCode)), RegimeName: req.RegimeName,
 		Description: req.Description, CreatedBy: actor})
 	if err != nil {
-		h.writeRegistryError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeRegistryError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	if created {
@@ -280,7 +280,7 @@ func (h *Handler) CreateRegime(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) GetRegime(w http.ResponseWriter, r *http.Request) {
 	x, err := h.registry.GetRegime(r.Context(), chi.URLParam(r, "regime"))
 	if err != nil {
-		h.writeRegistryError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeRegistryError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	writeJSON(w, http.StatusOK, x)
@@ -289,7 +289,7 @@ func (h *Handler) GetRegime(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) ListRegimes(w http.ResponseWriter, r *http.Request) {
 	xs, err := h.registry.ListRegimes(r.Context())
 	if err != nil {
-		h.writeRegistryError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeRegistryError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"regimes": xs})
@@ -331,12 +331,12 @@ func (h *Handler) CreateSource(w http.ResponseWriter, r *http.Request) {
 		TranslationRef: req.TranslationRef, InterpretationNotes: req.InterpretationNotes, CreatedBy: actor,
 	}
 	if err := domain.ValidateSource(p); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_source", err.Error())
+		writeError(w, r, http.StatusBadRequest, "invalid_source", err.Error())
 		return
 	}
 	x, created, err := h.registry.CreateSource(r.Context(), p)
 	if err != nil {
-		h.writeRegistryError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeRegistryError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	if created {
@@ -352,7 +352,7 @@ func (h *Handler) CreateSource(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) GetSource(w http.ResponseWriter, r *http.Request) {
 	x, err := h.registry.GetSource(r.Context(), chi.URLParam(r, "source_id"))
 	if err != nil {
-		h.writeRegistryError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeRegistryError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	writeJSON(w, http.StatusOK, x)
@@ -360,13 +360,13 @@ func (h *Handler) GetSource(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) ListSources(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	limit, offset, ok := h.parsePaging(w, q)
+	limit, offset, ok := h.parsePaging(w, r, q)
 	if !ok {
 		return
 	}
 	xs, err := h.registry.ListSources(r.Context(), q.Get("jurisdiction_id"), q.Get("authority"), limit, offset)
 	if err != nil {
-		h.writeRegistryError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeRegistryError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"sources": xs})
@@ -380,7 +380,7 @@ func (h *Handler) ReviewSource(w http.ResponseWriter, r *http.Request) {
 	}
 	x, changed, err := h.registry.ReviewSource(r.Context(), chi.URLParam(r, "source_id"), actor)
 	if err != nil {
-		h.writeRegistryError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeRegistryError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	if changed {
@@ -404,12 +404,12 @@ func (h *Handler) SupersedeSource(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if strings.TrimSpace(req.ReplacementSourceID) == "" {
-		writeMissingField(w, "replacement_source_id")
+		writeMissingField(w, r, "replacement_source_id")
 		return
 	}
 	x, changed, err := h.registry.SupersedeSource(r.Context(), chi.URLParam(r, "source_id"), req.ReplacementSourceID)
 	if err != nil {
-		h.writeRegistryError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeRegistryError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	if changed {
@@ -441,18 +441,18 @@ func (h *Handler) CreateInterpretation(w http.ResponseWriter, r *http.Request) {
 	}
 	if field := firstBlank(requiredField{"jurisdiction_id", req.JurisdictionID}, requiredField{"subject", req.Subject},
 		requiredField{"decision", req.Decision}, requiredField{"rationale", req.Rationale}); field != "" {
-		writeMissingField(w, field)
+		writeMissingField(w, r, field)
 		return
 	}
 	if len(req.SourceIDs) == 0 {
-		writeError(w, http.StatusBadRequest, "missing_sources", "an interpretation must cite at least one authoritative source")
+		writeError(w, r, http.StatusBadRequest, "missing_sources", "an interpretation must cite at least one authoritative source")
 		return
 	}
 	x, err := h.registry.CreateInterpretation(r.Context(), domain.CreateInterpretationParams{
 		JurisdictionID: req.JurisdictionID, RegimeID: req.RegimeID, Subject: req.Subject, Decision: req.Decision,
 		Rationale: req.Rationale, SourceIDs: req.SourceIDs, CreatedBy: actor})
 	if err != nil {
-		h.writeRegistryError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeRegistryError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	h.emitRegistry(r, events.EventInterpretationRecorded, x.InterpretationID, actor,
@@ -463,7 +463,7 @@ func (h *Handler) CreateInterpretation(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) GetInterpretation(w http.ResponseWriter, r *http.Request) {
 	x, err := h.registry.GetInterpretation(r.Context(), chi.URLParam(r, "interpretation_id"))
 	if err != nil {
-		h.writeRegistryError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeRegistryError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	writeJSON(w, http.StatusOK, x)
@@ -478,7 +478,7 @@ func (h *Handler) ApproveInterpretation(w http.ResponseWriter, r *http.Request) 
 	}
 	x, changed, err := h.registry.ApproveInterpretation(r.Context(), chi.URLParam(r, "interpretation_id"), actor)
 	if err != nil {
-		h.writeRegistryError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeRegistryError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	if changed {
@@ -508,17 +508,17 @@ func (h *Handler) CreatePack(w http.ResponseWriter, r *http.Request) {
 	}
 	if field := firstBlank(requiredField{"pack_ref", req.PackRef}, requiredField{"pack_name", req.PackName},
 		requiredField{"owner", req.Owner}); field != "" {
-		writeMissingField(w, field)
+		writeMissingField(w, r, field)
 		return
 	}
 	if !domain.ValidPackRef(req.PackRef) {
-		writeError(w, http.StatusBadRequest, "invalid_pack_ref", "pack_ref must look like jur.gb.tax.core")
+		writeError(w, r, http.StatusBadRequest, "invalid_pack_ref", "pack_ref must look like jur.gb.tax.core")
 		return
 	}
 	x, created, err := h.registry.CreatePack(r.Context(), domain.CreatePackParams{
 		PackRef: req.PackRef, PackName: req.PackName, Owner: req.Owner, SupportOwner: req.SupportOwner, CreatedBy: actor})
 	if err != nil {
-		h.writeRegistryError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeRegistryError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	if created {
@@ -532,20 +532,20 @@ func (h *Handler) CreatePack(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) GetPack(w http.ResponseWriter, r *http.Request) {
 	x, err := h.registry.GetPack(r.Context(), chi.URLParam(r, "pack_ref"))
 	if err != nil {
-		h.writeRegistryError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeRegistryError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	writeJSON(w, http.StatusOK, x)
 }
 
 func (h *Handler) ListPacks(w http.ResponseWriter, r *http.Request) {
-	limit, offset, ok := h.parsePaging(w, r.URL.Query())
+	limit, offset, ok := h.parsePaging(w, r, r.URL.Query())
 	if !ok {
 		return
 	}
 	xs, err := h.registry.ListPacks(r.Context(), limit, offset)
 	if err != nil {
-		h.writeRegistryError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeRegistryError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"packs": xs})
@@ -563,32 +563,32 @@ func (h *Handler) CreatePackVersion(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
 	raw, err := io.ReadAll(r.Body)
 	if err != nil {
-		writeError(w, http.StatusRequestEntityTooLarge, "request_body_too_large", "manifest too large")
+		writeError(w, r, http.StatusRequestEntityTooLarge, "request_body_too_large", "manifest too large")
 		return
 	}
 	m, err := domain.ParseManifest(raw)
 	if err != nil {
-		h.writeRegistryError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeRegistryError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	if m.PackID != ref {
-		writeError(w, http.StatusBadRequest, "pack_mismatch", "manifest pack_id must equal the pack in the URL")
+		writeError(w, r, http.StatusBadRequest, "pack_mismatch", "manifest pack_id must equal the pack in the URL")
 		return
 	}
 	canonical, err := domain.CanonicalJSON(raw)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_manifest", err.Error())
+		writeError(w, r, http.StatusBadRequest, "invalid_manifest", err.Error())
 		return
 	}
 	digest, err := domain.DigestOf(raw)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_manifest", err.Error())
+		writeError(w, r, http.StatusBadRequest, "invalid_manifest", err.Error())
 		return
 	}
 	v, created, err := h.registry.CreatePackVersion(r.Context(), domain.CreatePackVersionParams{
 		PackRef: ref, Manifest: m, ManifestJSON: canonical, ManifestDigest: digest, CreatedBy: actor})
 	if err != nil {
-		h.writeRegistryError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeRegistryError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	if created {
@@ -603,7 +603,7 @@ func (h *Handler) CreatePackVersion(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) GetPackVersion(w http.ResponseWriter, r *http.Request) {
 	v, err := h.registry.GetPackVersion(r.Context(), chi.URLParam(r, "pack_ref"), chi.URLParam(r, "version"))
 	if err != nil {
-		h.writeRegistryError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeRegistryError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	writeJSON(w, http.StatusOK, v)
@@ -612,7 +612,7 @@ func (h *Handler) GetPackVersion(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) ListPackVersions(w http.ResponseWriter, r *http.Request) {
 	vs, err := h.registry.ListPackVersions(r.Context(), chi.URLParam(r, "pack_ref"))
 	if err != nil {
-		h.writeRegistryError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeRegistryError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"versions": vs})
@@ -625,7 +625,7 @@ func (h *Handler) SubmitPackVersionForReview(w http.ResponseWriter, r *http.Requ
 	}
 	v, changed, err := h.registry.SubmitPackVersionForReview(r.Context(), chi.URLParam(r, "pack_ref"), chi.URLParam(r, "version"), actor)
 	if err != nil {
-		h.writeRegistryError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeRegistryError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	if changed {
@@ -660,7 +660,7 @@ func (h *Handler) SetRuleProvenance(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.PublishedOn != nil {
 		if _, err := parseDate(*req.PublishedOn); err != nil {
-			writeError(w, http.StatusBadRequest, "invalid_published_on", "published_on must be a YYYY-MM-DD date")
+			writeError(w, r, http.StatusBadRequest, "invalid_published_on", "published_on must be a YYYY-MM-DD date")
 			return
 		}
 	}
@@ -670,7 +670,7 @@ func (h *Handler) SetRuleProvenance(w http.ResponseWriter, r *http.Request) {
 		SupersedesRuleID: req.SupersedesRuleID, Precedence: req.Precedence, PublishedOn: req.PublishedOn,
 		SourceIDs: req.SourceIDs, ActorID: actor})
 	if err != nil {
-		h.writeRegistryError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeRegistryError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	h.emitRegistry(r, events.EventRuleProvenanceSet, id, actor,
@@ -682,8 +682,9 @@ func (h *Handler) SetRuleProvenance(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) GetRuleProvenance(w http.ResponseWriter, r *http.Request) {
 	p, err := h.registry.GetRuleProvenance(r.Context(), chi.URLParam(r, "jurisdiction_rule_id"))
 	if err != nil {
-		h.writeRegistryError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeRegistryError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	writeJSON(w, http.StatusOK, p)
 }
+

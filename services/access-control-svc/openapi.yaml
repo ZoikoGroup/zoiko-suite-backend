@@ -182,11 +182,14 @@ paths:
         '409':
           description: A role definition with that `role_code` already exists in this tenant.
           content:
-            application/json:
-              schema: { $ref: '#/components/schemas/ServiceError' }
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
               example:
-                error_code: role_code_exists
-                error_message: a role definition with that role_code already exists in this tenant
+                type: https://api.zoikosuite.com/problems/role-code-exists
+                title: Conflict
+                status: 409
+                code: role_code_exists
+                detail: a role definition with that role_code already exists in this tenant
         '503': { $ref: '#/components/responses/ProvisioningUnavailable' }
 
   /v1/role-definitions/{role_definition_id}:
@@ -333,11 +336,14 @@ paths:
         '409':
           description: That `bundle_code` is already attached to this role.
           content:
-            application/json:
-              schema: { $ref: '#/components/schemas/ServiceError' }
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
               example:
-                error_code: bundle_code_exists
-                error_message: a permission bundle with that bundle_code is already attached to this role
+                type: https://api.zoikosuite.com/problems/bundle-code-exists
+                title: Conflict
+                status: 409
+                code: bundle_code_exists
+                detail: a permission bundle with that bundle_code is already attached to this role
         '503': { $ref: '#/components/responses/ProvisioningUnavailable' }
 
   /v1/role-definitions/{role_definition_id}/permission-bundles/{bundle_id}:
@@ -408,8 +414,8 @@ paths:
             explicitly empty action list — a bundle that grants nothing is a
             control in name only; detach it instead).
           content:
-            application/json:
-              schema: { $ref: '#/components/schemas/ServiceError' }
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -2252,25 +2258,42 @@ components:
           type: object
           additionalProperties: { type: string }
 
+    Problem:
+      type: object
+      required: [type, title, status, code]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        code: { type: string }
+        request_id: { type: string }
+        correlation_id: { type: string }
+        retryable: { type: boolean }
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              pointer: { type: string }
+              code: { type: string }
+              detail: { type: string }
+        current_version: { type: integer, format: int64 }
+
   responses:
     BadRequest:
       description: Malformed request, or a violated envelope.
       content:
-        application/json:
-          schema:
-            oneOf:
-              - $ref: '#/components/schemas/ServiceError'
-              - $ref: '#/components/schemas/EnvelopeError'
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
     Unauthenticated:
       description: |
         No verified tenant (`tenant_missing`) or no verified actor
         (`identity_missing`), or an incomplete envelope on a write.
       content:
-        application/json:
-          schema:
-            oneOf:
-              - $ref: '#/components/schemas/ServiceError'
-              - $ref: '#/components/schemas/EnvelopeError'
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
     Forbidden:
       description: |
         A refusal. Nothing was written. One of:
@@ -2288,22 +2311,28 @@ components:
         - `security_approval_required` (approve): the request is CRITICAL and
           the approver does not hold `iam.assignment.approve_privileged`.
       content:
-        application/json:
-          schema: { $ref: '#/components/schemas/ServiceError' }
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
           example:
-            error_code: forbidden
-            error_message: authorization denied for this access control action
+            type: https://api.zoikosuite.com/problems/forbidden
+            title: Forbidden
+            status: 403
+            code: forbidden
+            detail: authorization denied for this access control action
     NotFound:
       description: |
         No such definition or bundle in this tenant. A malformed id, a foreign
         tenant's id and an id that never existed are all answered the same way,
         deliberately.
       content:
-        application/json:
-          schema: { $ref: '#/components/schemas/ServiceError' }
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
           example:
-            error_code: not_found
-            error_message: role definition not found
+            type: https://api.zoikosuite.com/problems/not-found
+            title: Not Found
+            status: 404
+            code: not_found
+            detail: role definition not found
     Conflict:
       description: |
         A state conflict. Nothing was written. The code says which:
@@ -2315,13 +2344,13 @@ components:
         `group_code_exists`, `group_retired`, `member_exists`, `group_assignment_revoked`,
         `IDEMPOTENCY_MISMATCH`, `IDEMPOTENCY_IN_FLIGHT`.
       content:
-        application/json:
-          schema: { $ref: '#/components/schemas/ServiceError' }
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
     StoreUnavailable:
       description: The catalogue's database could not be reached. Nothing was changed.
       content:
-        application/json:
-          schema: { $ref: '#/components/schemas/ServiceError' }
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
     ProvisioningUnavailable:
       description: |
         `authz_admin_unavailable`, `authz_unavailable`, `sod_unavailable` or
@@ -2329,8 +2358,11 @@ components:
         fail closed: no verdict is never read as a pass. On a retirement this means the role is still being enforced;
         it is not a transient blip and must not be rendered as one.
       content:
-        application/json:
-          schema: { $ref: '#/components/schemas/ServiceError' }
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
           example:
-            error_code: authz_admin_unavailable
-            error_message: authorization-svc admin API unavailable
+            type: https://api.zoikosuite.com/problems/authz-admin-unavailable
+            title: Service Unavailable
+            status: 503
+            code: authz_admin_unavailable
+            detail: authorization-svc admin API unavailable

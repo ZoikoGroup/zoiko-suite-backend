@@ -22,6 +22,11 @@ const (
 	OutcomeStaleIgnored      = "STALE_IGNORED"
 	OutcomeUnknownPayment    = "UNKNOWN_PAYMENT"
 	OutcomeAmbiguousPayment  = "AMBIGUOUS_PAYMENT"
+	// A callback blocked by an open evidence conflict or by a provider that
+	// does not own the payment is NOT decided: the provider's retry must be
+	// able to apply once the conflict is resolved / the right provider calls.
+	OutcomeConflictBlocked  = "CONFLICT_BLOCKED"
+	OutcomeProviderMismatch = "PROVIDER_MISMATCH"
 
 	// QuarantineOwner is the queue that owns a provider callback no durable payment could be found for (INT-CTRL-034). The
 	// quarantine event names it, so an alert routes somewhere instead of nowhere.
@@ -150,10 +155,16 @@ func (s *PgStore) ApplyProviderCallback(ctx context.Context, in CallbackInput) (
 			return nil
 		}
 
-		// find the payment, by our id or by the provider's reference, in this tenant only
+		// find the payment, by our id or by the provider's reference, in this tenant only.
+		// payment_id is compared as a uuid (not payment_id::text) so the primary-key
+		// index is usable; a non-uuid provider reference can never match one.
+		payID := in.PaymentRef
+		if _, perr := uuid.Parse(payID); perr != nil {
+			payID = uuid.Nil.String()
+		}
 		rows, err := tx.Query(ctx, `
 			SELECT payment_id::text, legal_entity_id::text FROM payment_execution_states
-			WHERE (provider_request_id = $1 OR payment_id::text = $1) ORDER BY created_at LIMIT 2 FOR UPDATE`, in.PaymentRef)
+			WHERE (provider_request_id = $1 OR payment_id = $2) ORDER BY created_at LIMIT 2 FOR UPDATE`, in.PaymentRef, payID)
 		if err != nil {
 			return err
 		}
@@ -190,11 +201,22 @@ func (s *PgStore) ApplyProviderCallback(ctx context.Context, in CallbackInput) (
 		if err := tx.QueryRow(ctx, `
 			SELECT count(*) FROM provider_callback_receipts
 			WHERE tenant_id = $1 AND provider_key = $2 AND event_ref = $3
-			  AND outcome NOT IN ('DUPLICATE', 'UNKNOWN_PAYMENT', 'AMBIGUOUS_PAYMENT')`, tenant, in.Provider, in.EventRef).Scan(&already); err != nil {
+			  AND outcome NOT IN ('DUPLICATE', 'UNKNOWN_PAYMENT', 'AMBIGUOUS_PAYMENT', 'CONFLICT_BLOCKED', 'PROVIDER_MISMATCH')`, tenant, in.Provider, in.EventRef).Scan(&already); err != nil {
 			return err
 		}
 		if already > 0 {
 			return receipt(OutcomeDuplicate, "this provider event was already decided", &pid, &entity)
+		}
+
+		// Neither a conflict nor a provider that does not own the payment may
+		// mutate it. Both outcomes are deliberately NOT "decided": the provider
+		// keeps retrying (202), and the same event can still apply once the
+		// conflict is resolved / the correct provider calls.
+		if current.HasOpenConflict {
+			return receipt(OutcomeConflictBlocked, "the payment has an open status conflict; the callback is not applied until it is resolved", &pid, &entity)
+		}
+		if current.ProviderKey != "" && current.ProviderKey != in.Provider {
+			return receipt(OutcomeProviderMismatch, "the payment is bound to provider "+current.ProviderKey+", not "+in.Provider, &pid, &entity)
 		}
 
 		var lastAt *time.Time
@@ -262,14 +284,18 @@ func (s *PgStore) ListReceipts(ctx context.Context, legalEntityID string, includ
 		limit = 100
 	}
 	var out []Receipt
+	var paymentFilter *string
+	if paymentID != "" {
+		paymentFilter = &paymentID
+	}
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `
 			SELECT receipt_id::text, provider_key, event_ref, payment_ref, payment_id::text, legal_entity_id::text, scheme, reported_status,
 				mapped_status, event_time, body_hash, outcome, detail, received_at
 			FROM provider_callback_receipts
-			WHERE (legal_entity_id::text = $1 OR ($2 AND legal_entity_id IS NULL))
-			  AND ($3 = '' OR payment_id::text = $3)
-			ORDER BY received_at DESC, receipt_id LIMIT $4`, legalEntityID, includeUnmatched, paymentID, limit)
+			WHERE (legal_entity_id = $1::uuid OR ($2 AND legal_entity_id IS NULL))
+			  AND ($3::uuid IS NULL OR payment_id = $3::uuid)
+			ORDER BY received_at DESC, receipt_id LIMIT $4`, legalEntityID, includeUnmatched, paymentFilter, limit)
 		if err != nil {
 			return err
 		}
