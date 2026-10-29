@@ -135,6 +135,7 @@ func RegisterKernelRoutes(r chi.Router, h *KernelHandler) {
 	r.Get("/v1/balance-snapshots", h.ListBalanceSnapshots)
 	r.Get("/v1/balance-snapshots/{id}", h.GetBalanceSnapshot)
 	r.Post("/v1/balance-snapshots/{id}/verify", h.VerifyBalanceSnapshot)
+	r.Get("/v1/balance-snapshots/{id}/trace", h.GetBalanceSnapshotTrace)
 	r.Get("/v1/close-evidence", h.GetCloseEvidence)
 	r.With(h.observe("period_seal")).Post("/v1/period-seals", h.ApplyPeriodSeal)
 	r.Get("/v1/period-seals", h.ListPeriodSeals)

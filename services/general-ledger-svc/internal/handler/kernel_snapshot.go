@@ -2,6 +2,7 @@ package handler
 
 import (
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/go-chi/chi/v5"
@@ -134,4 +135,60 @@ func (h *KernelHandler) GetCloseEvidence(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	writeJSON(w, http.StatusOK, ev)
+}
+
+// GetBalanceSnapshotTrace explains one account of a retained snapshot (standard §31, §32): the ledger entries behind its figure, and
+// for each one the journal, accounting event, rule version and evidence it came from, with a check that they add up to the figure.
+// Reading it needs both the right to read snapshots and the right to see postings in the snapshot's entity.
+func (h *KernelHandler) GetBalanceSnapshotTrace(w http.ResponseWriter, r *http.Request) {
+	tenant, _, ok := h.guard(w, r, actionSnapshotRead)
+	if !ok {
+		return
+	}
+	svc, ok := h.snapshots(w)
+	tr, ok2 := h.repo.(kernel.SnapshotTraceRepo)
+	if !ok || !ok2 {
+		if ok {
+			writeError(w, http.StatusNotImplemented, "snapshot_trace_not_configured", "")
+		}
+		return
+	}
+	q := r.URL.Query()
+	account := strings.TrimSpace(q.Get("account_code"))
+	if account == "" {
+		writeError(w, http.StatusBadRequest, "account_code_required", "name the account of the snapshot to trace")
+		return
+	}
+	after, limit := int64(0), 0
+	if v := q.Get("after"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n < 0 {
+			writeError(w, http.StatusBadRequest, "invalid_after", "after is the last ledger entry sequence already seen")
+			return
+		}
+		after = n
+	}
+	if v := q.Get("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			writeError(w, http.StatusBadRequest, "invalid_limit", "limit is a positive number")
+			return
+		}
+		limit = n
+	}
+	id := chi.URLParam(r, "id")
+	snap, err := svc.Repo.GetSnapshot(r.Context(), tenant, id)
+	if err != nil {
+		h.fail(w, err)
+		return
+	}
+	if _, _, ok := h.guardFor(w, r, actionPostingView, snap.LegalEntityID); !ok {
+		return
+	}
+	res, err := tr.SnapshotTrace(r.Context(), tenant, kernel.SnapshotTraceQuery{SnapshotID: id, AccountCode: account, After: after, Limit: limit})
+	if err != nil {
+		h.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
 }
