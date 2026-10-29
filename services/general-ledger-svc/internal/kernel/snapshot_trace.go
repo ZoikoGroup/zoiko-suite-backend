@@ -61,6 +61,7 @@ type SnapshotTraceEntry struct {
 	Description      string          `json:"description,omitempty"`
 	RuleLineRef      string          `json:"posting_rule_line_ref,omitempty"`
 	TaxDetailRef     string          `json:"tax_detail_ref,omitempty"`
+	SourceLineRef    string          `json:"source_line_ref,omitempty"`
 	EvidenceBundleID string          `json:"evidence_bundle_id,omitempty"`
 	EvidenceRefs     []string        `json:"evidence_refs,omitempty"`
 	Source           *TraceSource    `json:"source,omitempty"`

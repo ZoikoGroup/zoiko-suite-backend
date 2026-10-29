@@ -11,7 +11,9 @@ func taxRule(version string) map[string]any {
 	content := r["content"].(map[string]any)
 	content["line_templates"].([]any)[2].(map[string]any)["tax_detail"] = "$facts.tax_determination_id"
 	content["line_templates"].([]any)[1].(map[string]any)["tax_detail"] = "TAXCODE-STD"
+	content["line_templates"].([]any)[1].(map[string]any)["source_line"] = "$facts.invoice_line_id"
 	r["test_pack"].([]any)[0].(map[string]any)["event"].(map[string]any)["facts"].(map[string]any)["tax_determination_id"] = "td-test"
+	r["test_pack"].([]any)[0].(map[string]any)["event"].(map[string]any)["facts"].(map[string]any)["invoice_line_id"] = "il-test"
 	return r
 }
 
@@ -57,15 +59,20 @@ func TestJournalLinesLinkTheirTaxDeterminationAndHeadersTheirEvidenceBundle(t *t
 	e.activate(t, taxRule("1.0.0"), book)
 
 	// the determination the rule links to must be on the event: without it nothing is posted
-	noTax := e.taxEvent(t, "se-t0", nil)
+	noTax := e.taxEvent(t, "se-t0", map[string]any{"invoice_line_id": "INV-0/1"})
 	if st, b := e.post(noTax, book, nil); st != 422 || !strings.Contains(strings.ToLower(b["error"].(string)), "tax_detail_missing") {
 		t.Fatalf("a missing determination: %d %v", st, b)
 	}
 	if n := e.count(t, `SELECT count(*) FROM journal_headers WHERE source_accounting_event_id=$1::uuid`, noTax); n != 0 {
 		t.Fatalf("a refused posting leaves no journal, found %d", n)
 	}
+	// the source line the rule links to must be on the event too, and is refused rather than posted unlinked
+	noLine := e.taxEvent(t, "se-t0b", map[string]any{"tax_determination_id": "TD-1"})
+	if st, b := e.post(noLine, book, nil); st != 422 || !strings.Contains(strings.ToLower(b["error"].(string)), "source_line_missing") {
+		t.Fatalf("a missing source line: %d %v", st, b)
+	}
 
-	ev := e.taxEvent(t, "se-t1", map[string]any{"tax_determination_id": "TD-100"}, "doc-2", "doc-1")
+	ev := e.taxEvent(t, "se-t1", map[string]any{"tax_determination_id": "TD-100", "invoice_line_id": "INV-77/2"}, "doc-2", "doc-1")
 	res := e.mustPost(t, ev, book)
 	jid := res["journal_id"].(string)
 	line := func(code string) string {
@@ -77,6 +84,14 @@ func TestJournalLinesLinkTheirTaxDeterminationAndHeadersTheirEvidenceBundle(t *t
 	if e.count(t, `SELECT count(*) FROM journal_lines WHERE journal_id=$1::uuid AND account_code='1100' AND tax_detail_ref IS NULL`, jid) != 1 {
 		t.Fatal("a line with no determination stores none, not an empty string")
 	}
+	// the line of the source document each journal line came from (§8.2)
+	srcOf := func(journal, code string) string {
+		return e.scalar(t, `SELECT source_line_ref FROM journal_lines WHERE journal_id=$1::uuid AND account_code=$2`, journal, code)
+	}
+	if srcOf(jid, "4000") != "INV-77/2" || srcOf(jid, "2200") != "" || srcOf(jid, "1100") != "" {
+		t.Fatalf("source lines: REV=%q VAT=%q AR=%q", srcOf(jid, "4000"), srcOf(jid, "2200"), srcOf(jid, "1100"))
+	}
+	wantRefused(t, "re-point a posted line at another source line", e.asApp(e.tenant, `UPDATE journal_lines SET source_line_ref='INV-77/9' WHERE journal_id=$1::uuid AND account_code='4000'`, jid), "immutable")
 
 	// the header's bundle follows the event's references, whatever order they came in
 	bundle := e.scalar(t, `SELECT evidence_bundle_id FROM journal_headers WHERE journal_id=$1::uuid`, jid)
@@ -126,15 +141,24 @@ func TestJournalLinesLinkTheirTaxDeterminationAndHeadersTheirEvidenceBundle(t *t
 		e.scalar(t, `SELECT evidence_bundle_id FROM journal_headers WHERE journal_id=$1::uuid`, rid) != bundle {
 		t.Fatal("the reversal keeps the determination and the bundle")
 	}
+	if srcOf(rid, "4000") != "INV-77/2" {
+		t.Fatal("the reversal points at the same source line")
+	}
+	// and the trace of a snapshot account leads down to it
+	if st, snap := e.call("POST", "/v1/balance-snapshots", e.tenant, "close-svc", map[string]any{"book_id": book, "fiscal_period": "2026-03", "purpose": "AD_HOC"}); st != 201 {
+		t.Fatalf("%d %v", st, snap)
+	} else if st, tr := e.call("GET", "/v1/balance-snapshots/"+snap["snapshot_id"].(string)+"/trace?account_code=4000", e.tenant, "auditor", nil); st != 200 || tr["entries"].([]any)[0].(map[string]any)["source_line_ref"] != "INV-77/2" {
+		t.Fatalf("the snapshot trace names the source line: %d %v", st, tr)
+	}
 
 	// an event that names its evidence bundle keeps that name
-	named := e.mustPost(t, e.taxEvent(t, "se-t2", map[string]any{"tax_determination_id": "TD-200", "evidence_bundle_id": " EB-2026-9 "}, "doc-9"), book)
+	named := e.mustPost(t, e.taxEvent(t, "se-t2", map[string]any{"tax_determination_id": "TD-200", "invoice_line_id": "INV-78/1", "evidence_bundle_id": " EB-2026-9 "}, "doc-9"), book)
 	if e.scalar(t, `SELECT evidence_bundle_id FROM journal_headers WHERE journal_id=$1::uuid`, named["journal_id"].(string)) != "EB-2026-9" {
 		t.Fatal("an explicit bundle id is kept, trimmed")
 	}
 
 	// an event with no evidence has no bundle
-	bare := e.mustPost(t, e.taxEvent(t, "se-t3", map[string]any{"tax_determination_id": "TD-300"}), book)
+	bare := e.mustPost(t, e.taxEvent(t, "se-t3", map[string]any{"tax_determination_id": "TD-300", "invoice_line_id": "INV-79/1"}), book)
 	if e.count(t, `SELECT count(*) FROM journal_headers WHERE journal_id=$1::uuid AND evidence_bundle_id IS NULL AND evidence_refs IS NULL`, bare["journal_id"].(string)) != 1 {
 		t.Fatal("a journal with no evidence has no bundle")
 	}

@@ -446,6 +446,9 @@ func TestRuleSetValidation(t *testing.T) {
 		"tax detail fact":    func(r *RuleSet) { r.Content.LineTemplates[2].TaxDetail = "$facts.not a name" },
 		"tax detail padded":  func(r *RuleSet) { r.Content.LineTemplates[2].TaxDetail = " TD-1 " },
 		"tax detail long":    func(r *RuleSet) { r.Content.LineTemplates[2].TaxDetail = strings.Repeat("x", 201) },
+		"source line fact":   func(r *RuleSet) { r.Content.LineTemplates[0].SourceLine = "$facts.not a name" },
+		"source line padded": func(r *RuleSet) { r.Content.LineTemplates[0].SourceLine = " L1 " },
+		"source line long":   func(r *RuleSet) { r.Content.LineTemplates[0].SourceLine = strings.Repeat("x", 201) },
 	} {
 		if err := mut(f); err == nil {
 			t.Errorf("%s must be refused", name)
@@ -619,4 +622,37 @@ func TestEventRejectionIsRaisedOnlyForVerdictsOnTheEvent(t *testing.T) {
 	if e, ok := AsException(err); !ok || e.Code == "" {
 		t.Fatalf("the producer is told the refusal, not the failure to record it: %v", err)
 	}
+}
+
+// A line links back to the line of the source document it came from (§8.2), by a fixed reference or by the one the event carries; the
+// event that does not carry it is refused, and the link is part of what was proposed.
+func TestSourceLineLinksTheLine(t *testing.T) {
+	c := invoiceContent()
+	c.LineTemplates[1].SourceLine = "$facts.invoice_line_id"
+	c.LineTemplates[0].SourceLine = "HEADER"
+	if err := rule(c).Validate(); err != nil {
+		t.Fatal(err)
+	}
+	f := okFacts()
+	f["invoice_line_id"] = " INV-9/3 "
+	p, err := eval(t, event(f), rule(c), dir(), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, l := range p.Lines {
+		got[l.LineRef] = l.SourceLineRef
+	}
+	if got["L1"] != "HEADER" || got["L2"] != "INV-9/3" || got["L3"] != "" {
+		t.Fatalf("source line refs = %v", got)
+	}
+	f["invoice_line_id"] = "INV-9/4"
+	if p2, err := eval(t, event(f), rule(c), dir(), nil, nil); err != nil || p2.ProposalHash == p.ProposalHash {
+		t.Fatalf("a different source line must change the proposal: %v", err)
+	}
+	_, err = eval(t, event(okFacts()), rule(c), dir(), nil, nil)
+	wantFam(t, err, FamData, "SOURCE_LINE_MISSING")
+	f["invoice_line_id"] = strings.Repeat("x", 201)
+	_, err = eval(t, event(f), rule(c), dir(), nil, nil)
+	wantFam(t, err, FamData, "SOURCE_LINE_INVALID")
 }

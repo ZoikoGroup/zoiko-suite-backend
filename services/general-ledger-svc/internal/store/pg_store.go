@@ -101,14 +101,14 @@ const journalLineColumns = `
 	journal_line_id, journal_id, line_number, account_code,
 	debit_amount, credit_amount, COALESCE(description, ''),
 	tax_code, tax_logic_snapshot_id, dimensions,
-	transaction_amount::text, transaction_currency, exchange_rate::text, rate_ref, posting_rule_line_ref, counterparty_id, tax_detail_ref`
+	transaction_amount::text, transaction_currency, exchange_rate::text, rate_ref, posting_rule_line_ref, counterparty_id, tax_detail_ref, source_line_ref`
 
 func scanLineTargets(l *domain.JournalLine) []any {
 	return []any{
 		&l.JournalLineID, &l.JournalID, &l.LineNumber, &l.AccountCode,
 		&l.DebitAmount, &l.CreditAmount, &l.Description,
 		&l.TaxCode, &l.TaxLogicSnapshotID, &l.Dimensions,
-		&l.TransactionAmount, &l.TransactionCcy, &l.ExchangeRate, &l.RateRef, &l.PostingRuleLineRef, &l.CounterpartyID, &l.TaxDetailRef,
+		&l.TransactionAmount, &l.TransactionCcy, &l.ExchangeRate, &l.RateRef, &l.PostingRuleLineRef, &l.CounterpartyID, &l.TaxDetailRef, &l.SourceLineRef,
 	}
 }
 
@@ -331,12 +331,12 @@ func insertJournal(ctx context.Context, tx pgx.Tx, tenantID string, h *domain.Jo
 				journal_line_id, journal_id, tenant_id, line_number,
 				account_code, debit_amount, credit_amount, description,
 				tax_code, tax_logic_snapshot_id, dimensions,
-				transaction_amount, transaction_currency, exchange_rate, rate_ref, posting_rule_line_ref, counterparty_id, tax_detail_ref
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::numeric, $13, $14::numeric, $15, $16, $17, $18)
+				transaction_amount, transaction_currency, exchange_rate, rate_ref, posting_rule_line_ref, counterparty_id, tax_detail_ref, source_line_ref
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::numeric, $13, $14::numeric, $15, $16, $17, $18, $19)
 		`, lines[i].JournalLineID, h.JournalID, tenantID, lines[i].LineNumber,
 			lines[i].AccountCode, lines[i].DebitAmount, lines[i].CreditAmount, lines[i].Description,
 			lines[i].TaxCode, lines[i].TaxLogicSnapshotID, lines[i].Dimensions,
-			lines[i].TransactionAmount, lines[i].TransactionCcy, lines[i].ExchangeRate, lines[i].RateRef, lines[i].PostingRuleLineRef, lines[i].CounterpartyID, lines[i].TaxDetailRef); err != nil {
+			lines[i].TransactionAmount, lines[i].TransactionCcy, lines[i].ExchangeRate, lines[i].RateRef, lines[i].PostingRuleLineRef, lines[i].CounterpartyID, lines[i].TaxDetailRef, lines[i].SourceLineRef); err != nil {
 			return nil, false, mapPgError(err)
 		}
 	}
@@ -1195,7 +1195,7 @@ func insertAccountVersion(ctx context.Context, tx pgx.Tx, v *domain.AccountVersi
 			account_name, account_type, parent_account_id, is_control_account,
 			direct_posting_restricted, status, effective_from, effective_to,
 			change_kind, change_reason, evidence_refs, created_at, created_by_principal_id
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
 	`, v.AccountVersionID, v.TenantID, v.AccountID, v.AccountCode, v.Version,
 		v.AccountName, string(v.AccountType), v.ParentAccountID, v.IsControlAccount,
 		v.DirectPostingRestricted, v.Status, v.EffectiveFrom, v.EffectiveTo,

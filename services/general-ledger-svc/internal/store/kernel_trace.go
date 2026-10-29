@@ -270,7 +270,7 @@ func loadTraceJournal(ctx context.Context, t pgx.Tx, tenant, id, role string) (*
 	j.EvidenceBundle = deref(bundle)
 
 	rows, err := t.Query(ctx, `SELECT l.line_number, l.account_code, l.debit_amount::text, l.credit_amount::text, l.transaction_amount::text, l.transaction_currency,
-			l.exchange_rate::text, l.rate_ref, l.posting_rule_line_ref, l.dimensions, COALESCE(l.description, ''), e.entry_seq, l.tax_detail_ref
+			l.exchange_rate::text, l.rate_ref, l.posting_rule_line_ref, l.dimensions, COALESCE(l.description, ''), e.entry_seq, l.tax_detail_ref, l.source_line_ref
 		FROM journal_lines l LEFT JOIN ledger_entries e ON e.tenant_id = l.tenant_id AND e.journal_id = l.journal_id AND e.journal_line_id = l.journal_line_id
 		WHERE l.tenant_id = $1::uuid AND l.journal_id = $2::uuid ORDER BY l.line_number`, tenant, id)
 	if err != nil {
@@ -279,12 +279,12 @@ func loadTraceJournal(ctx context.Context, t pgx.Tx, tenant, id, role string) (*
 	defer rows.Close()
 	for rows.Next() {
 		var l kernel.TraceLine
-		var txAmt, txCcy, rate, rateRef, ruleRef, taxRef *string
+		var txAmt, txCcy, rate, rateRef, ruleRef, taxRef, srcRef *string
 		var dims []byte
-		if err := rows.Scan(&l.LineNo, &l.AccountCode, &l.Debit, &l.Credit, &txAmt, &txCcy, &rate, &rateRef, &ruleRef, &dims, &l.Description, &l.LedgerEntrySeq, &taxRef); err != nil {
+		if err := rows.Scan(&l.LineNo, &l.AccountCode, &l.Debit, &l.Credit, &txAmt, &txCcy, &rate, &rateRef, &ruleRef, &dims, &l.Description, &l.LedgerEntrySeq, &taxRef, &srcRef); err != nil {
 			return nil, err
 		}
-		l.TaxDetailRef = deref(taxRef)
+		l.TaxDetailRef, l.SourceLineRef = deref(taxRef), deref(srcRef)
 		l.TransactionAmt, l.TransactionCcy, l.ExchangeRate, l.RateRef, l.RuleLineRef = deref(txAmt), deref(txCcy), deref(rate), deref(rateRef), deref(ruleRef)
 		if len(dims) > 0 {
 			_ = json.Unmarshal(dims, &l.Dimensions)

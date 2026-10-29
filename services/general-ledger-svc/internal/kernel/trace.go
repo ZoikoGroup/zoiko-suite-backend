@@ -87,6 +87,7 @@ type TraceLine struct {
 	RateRef        string            `json:"rate_ref,omitempty"`
 	RuleLineRef    string            `json:"posting_rule_line_ref,omitempty"`
 	TaxDetailRef   string            `json:"tax_detail_ref,omitempty"`
+	SourceLineRef  string            `json:"source_line_ref,omitempty"`
 	Dimensions     map[string]string `json:"dimensions,omitempty"`
 	LedgerEntrySeq *int64            `json:"ledger_entry_seq,omitempty"`
 	Description    string            `json:"description,omitempty"`

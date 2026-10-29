@@ -322,6 +322,8 @@ type JournalLine struct {
 	PostingRuleLineRef *string `json:"posting_rule_line_ref,omitempty"`
 	// TaxDetailRef links the line to the authoritative tax determination it rests on (§8.2).
 	TaxDetailRef *string `json:"tax_detail_ref,omitempty"`
+	// SourceLineRef links the line to the line of the source document it came from (§8.2).
+	SourceLineRef *string `json:"source_line_ref,omitempty"`
 
 	// CounterpartyID is the customer or supplier a line on a subledger control account belongs to (standard §8.2, §12).
 	CounterpartyID *string `json:"counterparty_id,omitempty"`

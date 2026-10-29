@@ -58,7 +58,7 @@ func (r *KernelRepo) SnapshotTrace(ctx context.Context, tenant string, q kernel.
 
 		rows, e := t.Query(ctx, `
 			SELECT e.entry_seq, e.journal_id::text, h.journal_number, h.journal_type, h.journal_purpose, e.posting_date::text, e.fiscal_period, e.line_number,
-			       e.debit_amount::text, e.credit_amount::text, COALESCE(l.description, ''), l.posting_rule_line_ref, l.tax_detail_ref, h.evidence_bundle_id, h.evidence_refs,
+			       e.debit_amount::text, e.credit_amount::text, COALESCE(l.description, ''), l.posting_rule_line_ref, l.tax_detail_ref, l.source_line_ref, h.evidence_bundle_id, h.evidence_refs,
 			       ev.accounting_event_id::text, ev.event_type, ev.source_system, ev.source_object_type, ev.source_object_id, ev.source_event_id, ev.evidence_refs,
 			       px.execution_id::text, px.posting_rule_set_id::text, rs.name, px.rule_version
 			FROM ledger_entries e
@@ -77,14 +77,14 @@ func (r *KernelRepo) SnapshotTrace(ctx context.Context, tenant string, q kernel.
 		defer rows.Close()
 		for rows.Next() {
 			var en kernel.SnapshotTraceEntry
-			var number, purpose, ruleRef, taxRef, bundle, evID, evType, evSys, evObjType, evObj, evSrc, execID, ruleID, ruleName, ruleVer *string
+			var number, purpose, ruleRef, taxRef, srcRef, bundle, evID, evType, evSys, evObjType, evObj, evSrc, execID, ruleID, ruleName, ruleVer *string
 			var hdrRefs []string
 			var evRefs []byte
 			if e := rows.Scan(&en.EntrySeq, &en.JournalID, &number, &en.JournalType, &purpose, &en.PostingDate, &en.FiscalPeriod, &en.LineNo, &en.Debit, &en.Credit,
-				&en.Description, &ruleRef, &taxRef, &bundle, &hdrRefs, &evID, &evType, &evSys, &evObjType, &evObj, &evSrc, &evRefs, &execID, &ruleID, &ruleName, &ruleVer); e != nil {
+				&en.Description, &ruleRef, &taxRef, &srcRef, &bundle, &hdrRefs, &evID, &evType, &evSys, &evObjType, &evObj, &evSrc, &evRefs, &execID, &ruleID, &ruleName, &ruleVer); e != nil {
 				return e
 			}
-			en.JournalNumber, en.JournalPurpose, en.RuleLineRef, en.TaxDetailRef, en.EvidenceBundleID = str(number), str(purpose), str(ruleRef), str(taxRef), str(bundle)
+			en.JournalNumber, en.JournalPurpose, en.RuleLineRef, en.TaxDetailRef, en.EvidenceBundleID, en.SourceLineRef = str(number), str(purpose), str(ruleRef), str(taxRef), str(bundle), str(srcRef)
 			en.EvidenceRefs = hdrRefs
 			if evID != nil {
 				src := &kernel.TraceSource{AccountingEventID: *evID, EventType: str(evType), SourceSystem: str(evSys), SourceObjectType: str(evObjType), SourceObjectID: str(evObj), SourceEventID: str(evSrc)}

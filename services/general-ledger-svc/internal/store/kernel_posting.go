@@ -177,10 +177,10 @@ func (r *KernelRepo) PostUnit(ctx context.Context, u *kernel.PostingUnit) (*kern
 			txAmt, txCcy, ruleRef := l.AmountTx, l.Currency, l.LineRef
 			if _, e := t.Exec(ctx, `
 				INSERT INTO journal_lines (journal_line_id, journal_id, tenant_id, line_number, account_code, debit_amount, credit_amount,
-					description, dimensions, transaction_amount, transaction_currency, exchange_rate, rate_ref, posting_rule_line_ref, counterparty_id, tax_detail_ref)
-				VALUES ($1, $2, $3, $4, $5, $6::numeric, $7::numeric, $8, $9, $10::numeric, $11, $12::numeric, $13, $14, NULLIF($15, ''), NULLIF($16, ''))`,
+					description, dimensions, transaction_amount, transaction_currency, exchange_rate, rate_ref, posting_rule_line_ref, counterparty_id, tax_detail_ref, source_line_ref)
+				VALUES ($1, $2, $3, $4, $5, $6::numeric, $7::numeric, $8, $9, $10::numeric, $11, $12::numeric, $13, $14, NULLIF($15, ''), NULLIF($16, ''), NULLIF($17, ''))`,
 				uuid.NewString(), jid, u.Tenant, l.LineNo, l.AccountCode, debit, credit, l.Description, domain.Dimensions(l.Dimensions),
-				txAmt, txCcy, rate, rateRef, ruleRef, l.CounterpartyID, l.TaxDetailRef); e != nil {
+				txAmt, txCcy, rate, rateRef, ruleRef, l.CounterpartyID, l.TaxDetailRef, l.SourceLineRef); e != nil {
 				return mapPgError(e)
 			}
 		}

@@ -67,6 +67,8 @@ type LineTemplate struct {
 	// TaxDetail links the line to the authoritative tax determination it rests on (standard §8.2): a literal reference or
 	// "$facts.<name>" for the one the event carries. A line that names a fact the event lacks is refused as AK-TAX.
 	TaxDetail string `json:"tax_detail,omitempty"`
+	// SourceLine links the line to the line of the source document it comes from (§8.2), with the same two forms as TaxDetail.
+	SourceLine string `json:"source_line,omitempty"`
 }
 
 // RealizedFX names the accounts a realized exchange difference is posted to. A rule that settles items at their carrying
@@ -290,14 +292,11 @@ func (c *RuleContent) Validate() error {
 		if err := validateConditions(t.When); err != nil {
 			return bad(at+"when", err.Error())
 		}
-		if t.TaxDetail != "" {
-			if f, ok := strings.CutPrefix(t.TaxDetail, "$facts."); ok {
-				if !identRE.MatchString(f) {
-					return bad(at+"tax_detail", f+" is not a fact name")
-				}
-			} else if strings.TrimSpace(t.TaxDetail) != t.TaxDetail || len(t.TaxDetail) > 200 {
-				return bad(at+"tax_detail", "a literal reference of at most 200 characters or $facts.x")
-			}
+		if why := badLineRef(t.TaxDetail); why != "" {
+			return bad(at+"tax_detail", why)
+		}
+		if why := badLineRef(t.SourceLine); why != "" {
+			return bad(at+"source_line", why)
 		}
 		for d, v := range t.Dimensions {
 			if !codeRE.MatchString(d) || strings.TrimSpace(v) == "" || len(v) > 120 {
@@ -546,4 +545,22 @@ func preferJurisdiction(sets []RuleSet, jurisdiction string) []RuleSet {
 // AppliesToJurisdiction reports whether a rule set may be used in a book kept under the jurisdiction.
 func (r *RuleSet) AppliesToJurisdiction(bookJurisdiction string) bool {
 	return r.Jurisdiction == "" || r.Jurisdiction == bookJurisdiction
+}
+
+// badLineRef says why a line's link to a tax determination or a source line is not acceptable: it is a literal reference or
+// $facts.<name> for the one the event carries. Empty means no link, which is fine.
+func badLineRef(v string) string {
+	if v == "" {
+		return ""
+	}
+	if f, ok := strings.CutPrefix(v, "$facts."); ok {
+		if !identRE.MatchString(f) {
+			return f + " is not a fact name"
+		}
+		return ""
+	}
+	if strings.TrimSpace(v) != v || len(v) > 200 {
+		return "a literal reference of at most 200 characters or $facts.x"
+	}
+	return ""
 }

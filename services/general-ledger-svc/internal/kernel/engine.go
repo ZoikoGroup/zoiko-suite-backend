@@ -70,6 +70,7 @@ type ProposalLine struct {
 	CounterpartyID   string            `json:"counterparty_id,omitempty"`
 	ControlType      string            `json:"control_type,omitempty"`
 	TaxDetailRef     string            `json:"tax_detail_ref,omitempty"`
+	SourceLineRef    string            `json:"source_line_ref,omitempty"`
 }
 
 // Provenance identifies the rule that produced a proposal (AK-INV-008).
@@ -121,6 +122,7 @@ type rawLine struct {
 	round  bool
 	cp     string
 	taxRef string
+	srcRef string
 	// fixed is a functional amount the rule stated (carrying basis), exempt from conversion; realized marks the realized-FX line.
 	fixed    *big.Rat
 	realized bool
@@ -244,16 +246,15 @@ func Evaluate(ctx context.Context, in EvalInput) (*Proposal, error) {
 			}
 			step("carrying", t.LineRef+": functional "+t.Functional+" = "+ratString(fixed)+" (retired at its carrying amount)")
 		}
-		taxRef := t.TaxDetail
-		if f, ok := strings.CutPrefix(t.TaxDetail, "$facts."); ok {
-			if taxRef = strings.TrimSpace(ev.Facts[f]); taxRef == "" {
-				return nil, exc(FamTax, "TAX_DETAIL_MISSING", "%s links to the tax determination %q and the event does not carry it", t.LineRef, f).with("line_ref", t.LineRef).with("fact", f)
-			}
-			if len(taxRef) > 200 {
-				return nil, exc(FamTax, "TAX_DETAIL_INVALID", "%s: the tax determination reference %q is longer than 200 characters", t.LineRef, f).with("line_ref", t.LineRef)
-			}
+		taxRef, terr := lineRef(ev, t, t.TaxDetail, FamTax, "TAX_DETAIL", "the tax determination")
+		if terr != nil {
+			return nil, terr
 		}
-		lines = append(lines, &rawLine{t: t, minor: minor, acct: info, dims: dims, exact: exact, cp: cp, fixed: fixed, taxRef: taxRef})
+		srcRef, serr := lineRef(ev, t, t.SourceLine, FamData, "SOURCE_LINE", "the source line")
+		if serr != nil {
+			return nil, serr
+		}
+		lines = append(lines, &rawLine{t: t, minor: minor, acct: info, dims: dims, exact: exact, cp: cp, fixed: fixed, taxRef: taxRef, srcRef: srcRef})
 	}
 	if len(lines) < 2 {
 		return nil, exc(FamRule, "NO_LINES", "the rule produced fewer than two lines for this event")
@@ -363,7 +364,7 @@ func Evaluate(ctx context.Context, in EvalInput) (*Proposal, error) {
 		prov.Branch = append(prov.Branch, l.t.LineRef)
 		p.Lines = append(p.Lines, ProposalLine{LineNo: i + 1, LineRef: l.t.LineRef, Side: l.t.Side, AccountCode: l.acct.Code,
 			AmountTx: FormatMinor(l.minor, tscale), Currency: tccy, AmountFunctional: FormatMinor(l.funcMn, fscale), Dimensions: l.dims,
-			Description: l.t.Description, Rounding: l.round, RealizedFX: l.realized, CounterpartyID: l.cp, ControlType: l.acct.ControlType, TaxDetailRef: l.taxRef})
+			Description: l.t.Description, Rounding: l.round, RealizedFX: l.realized, CounterpartyID: l.cp, ControlType: l.acct.ControlType, TaxDetailRef: l.taxRef, SourceLineRef: l.srcRef})
 	}
 	p.Provenance, p.Trace = prov, trace
 	b, _ := json.Marshal(struct {
@@ -579,4 +580,21 @@ func (d testDirectory) ResolveAccount(_ context.Context, ref AccountRef, _ strin
 
 func (d testDirectory) DimensionAllowed(context.Context, string, string, string, string, time.Time) (bool, error) {
 	return true, nil
+}
+
+// lineRef resolves a line template's link to a tax determination or a source line: a literal, or the fact the event carries. A fact the
+// event does not carry, or one that is too long, is a refusal of the event rather than a line posted without its link.
+func lineRef(ev *AccountingEvent, t LineTemplate, v string, fam, code, what string) (string, error) {
+	f, ok := strings.CutPrefix(v, "$facts.")
+	if !ok {
+		return v, nil
+	}
+	ref := strings.TrimSpace(ev.Facts[f])
+	if ref == "" {
+		return "", exc(fam, code+"_MISSING", "%s links to %s %q and the event does not carry it", t.LineRef, what, f).with("line_ref", t.LineRef).with("fact", f)
+	}
+	if len(ref) > 200 {
+		return "", exc(fam, code+"_INVALID", "%s: the reference %q to %s is longer than 200 characters", t.LineRef, f, what).with("line_ref", t.LineRef)
+	}
+	return ref, nil
 }
