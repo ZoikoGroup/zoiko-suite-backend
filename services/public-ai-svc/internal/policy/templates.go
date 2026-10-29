@@ -2,6 +2,7 @@ package policy
 
 import (
 	"errors"
+	"regexp"
 	"strings"
 
 	"zoiko.io/public-ai-svc/internal/contract"
@@ -15,60 +16,152 @@ type Template struct {
 	Text     string
 	RouteKey string // official route for the single CTA; "" for none
 	Human    bool   // sets flags.requires_human
+	Reason   string // contract.Reason*: why the turn ended this way
 }
 
 // ExceptionTemplates answer intercepted exception classes.
 var ExceptionTemplates = map[string]Template{
 	X01PrivateAction: {contract.RefusedAction,
-		"I can't access account, financial, payroll or employee records. I'm a public guide to ZoikoSuite and have no access to customer data. Please sign in to ZoikoSuite or contact support through the official support page.",
-		"support", false},
+		// Doc 02 T21.
+		"I cannot view or change your financial, payroll or tax records in this public chat. To work with your account securely, use the authorized ZoikoSuite application or approved support channel.",
+		"support", false, ""},
 	X02ActionDenied: {contract.RefusedAction,
-		"I can't carry out actions such as payments, approvals, filings, exports or account changes. I only provide public product information. Please use your ZoikoSuite account or contact support.",
-		"support", false},
+		// Doc 02 T21.
+		"I cannot view or change your financial, payroll or tax records in this public chat. To work with your account securely, use the authorized ZoikoSuite application or approved support channel.",
+		"support", false, ""},
 	X03SensitiveInput: {contract.RefusedAction,
-		"For your security, please don't share passwords, codes, card, bank or ID numbers here. I haven't kept what you sent. If you need help with your account, please use the official support page.",
-		"support", false},
+		// Doc 02 T22.
+		"Please do not share passwords, codes, bank details or personal financial or employee records here. I will not repeat that information. Use the official secure support route if you need help with your account.",
+		"support", false, ""},
 	X04RegulatedAdvice: {contract.RefusedAction,
-		"I can't give tax, legal, accounting, employment or investment advice. Please consult a qualified professional for decisions like this. I can explain what ZoikoSuite's modules do.",
-		"core_modules", false},
+		// Doc 02 T20.
+		"I can explain ZoikoSuite's published product capabilities, but I cannot provide advice tailored to your accounting, tax, employment or legal position. A qualified professional should assess the facts and jurisdiction.",
+		"core_modules", false, ""},
 	X05SecurityEscalate: {contract.Handoff,
-		"Thank you for raising this. Please report security concerns through ZoikoSuite's official trust and security page so the security team can review them. I can't assess security issues in this chat.",
-		"trust", true},
+		// Doc 02 T23.
+		"If you believe there is a security incident or vulnerability, please use ZoikoSuite's official security disclosure/reporting channel. Do not post credentials, exploit details or customer records in this chat.",
+		"trust", true, ""},
 	X06PromptInjection: {contract.RefusedAction,
 		"I can't change how I work or share my instructions. I can help with questions about ZoikoSuite's products, plans, integrations and security.",
-		"", false},
+		"", false, ""},
 	X07CrossProduct: {contract.Abstain,
-		"I can only help with ZoikoSuite. For other Zoiko products, please visit that product's official website.",
-		"", false},
+		// Doc 02 T19, with "This assistant" for the uncleared working name.
+		"This assistant covers ZoikoSuite public information. Zoiko One and ZoikoLogia are separate products with their own capabilities and policies. I can point you to the relevant official product page if one is available.",
+		"", false, ""},
 	X08ClaimVerification: {contract.Abstain,
 		"I can't give guarantees or confirm commitments in this chat. Official terms are published on ZoikoSuite's pages, and the sales team can confirm details in writing.",
-		"demo", false},
+		"demo", false, ""},
 }
 
 // Named outcome templates used by the orchestrator.
 var (
-	TplAbstainNoEvidence = Template{contract.Abstain, "I couldn't verify that from approved ZoikoSuite sources, so I won't guess.", "", false}
-	TplAbstainStale      = Template{contract.Abstain, "I can't verify the current position on that right now, so I won't guess.", "", false}
-	TplAbstainConflict   = Template{contract.Abstain, "I can't give a reliable answer on that right now because the official information is being reviewed.", "", false}
-	TplClarifyMarket     = Template{contract.Clarify, "Which country are you evaluating ZoikoSuite for?", "", false}
-	TplClarifyPlan       = Template{contract.Clarify, "Which plan are you asking about?", "pricing", false}
-	TplUnavailable       = Template{contract.Unavailable, "I can't answer right now. Please use the official ZoikoSuite pages for pricing, demos and support.", "support", false}
-	TplOutOfScope        = Template{contract.Abstain, "I can help with questions about ZoikoSuite's products, plans, integrations and security. Could you rephrase your question about ZoikoSuite?", "", false}
-	TplClarifyGiveUp     = Template{contract.Abstain, "I'm not sure I can help with that here. The support team can point you in the right direction.", "support", false}
+	TplAbstainNoEvidence = Template{contract.Abstain, "I couldn't verify that from approved ZoikoSuite sources, so I won't guess.", "", false, ""}
+	TplAbstainStale      = Template{contract.Abstain, "I can't verify the current position on that right now, so I won't guess.", "", false, ""}
+	TplAbstainConflict   = Template{contract.Abstain, "I can't give a reliable answer on that right now because the official information is being reviewed.", "", false, ""}
+	TplClarifyMarket     = Template{contract.Clarify, "I can help you compare ZoikoSuite plans. Prices, taxes, billing options and availability are market-dependent. Which country are you evaluating ZoikoSuite for?", "", false, ""} // Doc 02 T05
+	TplClarifyPlan       = Template{contract.Clarify, "Which plan are you asking about?", "pricing", false, ""}
+	TplUnavailable       = Template{contract.Unavailable, "I'm unable to retrieve reliable information right now. Please try again or use the official ZoikoSuite Support Center.", "support", false, ""}                                           // Doc 02 T24 (the widget shows the reference)
+	TplOutOfScope        = Template{contract.Abstain, "I'm here to help with ZoikoSuite capabilities, plans, security, integrations, demos and support. I can help you find the right product information or support route.", "support", false, ""} // Doc 02 T25
+	TplClarifyGiveUp     = Template{contract.Abstain, "I'm not sure I can help with that here. The support team can point you in the right direction.", "support", false, ""}
+	// TplAbstainCoverage: a regional capability in a named country without
+	// market-specific evidence (G12, G13): no assumed coverage.
+	TplAbstainCoverage = Template{contract.Abstain, "I can't confirm what's available in that country from approved ZoikoSuite sources. The team can confirm coverage for your country.", "demo", false, ""}
+	// TplAbstainTrialStale: trial terms for the named market cannot be
+	// verified (expired or revoked claim). {{market}} is a display name.
+	TplAbstainTrialStale = Template{contract.Abstain, "I can't verify the current trial terms for {{market}} right now. The official pricing page has the current information.", "pricing", false, ""}
+	// TplLivePlatform: live platform state, tenant data or dashboard counts.
+	TplLivePlatform = Template{contract.RefusedAction, "I can't see live platform data or account information. I can explain what ZoikoSuite's services and modules do, using public information.", "", false, ""}
+	// TplNoApprovedInfo: a public question with no approved content yet.
+	TplNoApprovedInfo = Template{contract.Abstain, "I don't have approved information on that yet. Which ZoikoSuite area are you asking about?", "", false, ""}
 	// TplWelcome answers a bare greeting (Doc 02 T01).
-	TplWelcome = Template{contract.Clarify, "Hi! I'm the ZoikoSuite assistant. I can answer questions about ZoikoSuite's modules, plans, integrations and security. What would you like to know?", "core_modules", false}
+	TplWelcome = Template{contract.Clarify, "Hello! I'm the ZoikoSuite AI guide. I can help you understand capabilities, current plans, security information, or how to arrange a demonstration. What would you like to explore?", "core_modules", false, ""} // Doc 02 T01
 )
+
+func init() {
+	for p, r := range map[*Template]string{
+		&TplAbstainNoEvidence: contract.ReasonNoEvidence, &TplAbstainStale: contract.ReasonExpiredSource,
+		&TplAbstainConflict: contract.ReasonClaimConflict, &TplClarifyMarket: contract.ReasonMarketRequired,
+		&TplClarifyPlan: contract.ReasonPlanRequired, &TplUnavailable: contract.ReasonKnowledgeUnavailable,
+		&TplOutOfScope: contract.ReasonOutOfScope, &TplClarifyGiveUp: contract.ReasonClarifyExhausted,
+		&TplAbstainCoverage: contract.ReasonMarketNotCovered, &TplWelcome: contract.ReasonGreeting,
+		&TplAbstainTrialStale: contract.ReasonExpiredSource, &TplLivePlatform: contract.ReasonLivePlatformData,
+		&TplNoApprovedInfo: contract.ReasonNoApprovedInfo,
+	} {
+		p.Reason = r
+	}
+	for code, r := range map[string]string{
+		X01PrivateAction: contract.ReasonPrivateData, X02ActionDenied: contract.ReasonActionDenied,
+		X03SensitiveInput: contract.ReasonSensitiveInput, X04RegulatedAdvice: contract.ReasonRegulatedAdvice,
+		X05SecurityEscalate: contract.ReasonSecurityReport, X06PromptInjection: contract.ReasonPromptInjection,
+		X07CrossProduct: contract.ReasonCrossProduct, X08ClaimVerification: contract.ReasonUnsupportedClaim,
+	} {
+		t := ExceptionTemplates[code]
+		t.Reason = r
+		ExceptionTemplates[code] = t
+	}
+	for id, t := range RouteTemplates {
+		t.Reason = contract.ReasonRouteOnly
+		RouteTemplates[id] = t
+	}
+}
+
+// Suggestion chips offered when the assistant cannot answer.
+var (
+	SuggestLivePlatform = []contract.Chip{{Label: "Explore modules", Message: "What modules does ZoikoSuite include?"}, {Label: "Get support", Message: "I need help from support"}}
+	SuggestAreas        = []contract.Chip{{Label: "Explore modules", Message: "What modules does ZoikoSuite include?"}, {Label: "Pricing and trial", Message: "What plans are available, and is there a free trial?"}, {Label: "Security and trust", Message: "How is data secured?"}}
+)
+
+// MarketName is how a market code is named in template text.
+func MarketName(code string) string {
+	if n, ok := marketNames[code]; ok {
+		return n
+	}
+	return "that country"
+}
+
+var marketNames = map[string]string{"US": "the United States", "GB": "the United Kingdom", "IE": "Ireland"}
+
+// BoundaryTemplates are Doc 02's approved replies for intents whose answer
+// needs an approved source that does not exist yet. They are used only when
+// no retrieved article is tagged for the intent, so an approved article
+// always wins once it is published.
+var BoundaryTemplates = map[string]Template{
+	// T07 Enterprise.
+	"I09": {contract.Handoff, "For multi-entity organizations or advanced governance, ZoikoSuite offers an enterprise discussion route. A specialist can confirm the deployment, integration, coverage and subscription scope relevant to your requirements.", "demo", false, contract.ReasonRouteOnly},
+	// T11 Data residency.
+	"I14": {contract.Abstain, "Data residency needs to be evaluated across storage, processing, backups, logs and subprocessors for the proposed deployment. I cannot guarantee a single-country boundary without an approved deployment-specific residency assessment.", "", false, contract.ReasonNoApprovedInfo},
+	// T18 No verified status (availability, roadmap, release dates).
+	"I25": {contract.Abstain, "I couldn't verify the current availability of that feature for your market and plan from an approved source. I can help you request confirmation from the appropriate ZoikoSuite team.", "demo", false, contract.ReasonNoApprovedInfo},
+	// T30 Accessibility feedback.
+	"I27": {contract.Handoff, "Thank you for raising an accessibility concern. Please use the official accessibility feedback route so the team can review the affected page and interaction. You do not need to share sensitive personal details in this chat.", "support", false, contract.ReasonRouteOnly},
+	// I30 Responsible AI: the assistant's own disclosure (ui.welcome.disclosure).
+	"I30": {contract.Abstain, "I'm an AI assistant, and my answers use public ZoikoSuite information only. I don't have approved information yet on how ZoikoSuite products use AI.", "", false, contract.ReasonNoApprovedInfo},
+}
+
+// AssuranceQuestionRe marks questions about legal admissibility or
+// independent assurance (Doc 02 G14). They are answered only from a passage
+// that addresses admissibility, else with TplEvidenceAssurance.
+var AssuranceQuestionRe = regexp.MustCompile(`(?i)\badmissib|\bindependent(?:ly)? assur|\bassurance\b|\bstand up in court\b|\bcourt-?proof\b`)
+
+// TplEvidenceAssurance is Doc 02 T14: evidence workflows, with no legal or
+// assurance guarantee.
+var TplEvidenceAssurance = Template{contract.Abstain, "ZoikoSuite describes evidence-linked workflows designed to preserve decision context, policies, approvals and supporting records. Independent assurance and legal admissibility require separate evidence and cannot be assumed from this description.", "", false, contract.ReasonNoApprovedInfo}
+
+// TplAbstainCertification answers a certification question that has no
+// verified trust claim: T10's due-diligence guidance, never a status.
+var TplAbstainCertification = Template{contract.Abstain, "I can't confirm a certification status from an approved trust claim in this chat. For due diligence, please review the current Trust Center or request scoped evidence.", "trust", false, contract.ReasonNoEvidence}
 
 // RouteTemplates are route-only intents: the assistant offers an official
 // link and never claims a booking, ticket or callback exists (Doc 09 §11).
 var RouteTemplates = map[string]Template{
-	"I08": {contract.Handoff, "You can request a demo through ZoikoSuite's official demo page. I haven't booked anything for you.", "demo", false},
-	"I22": {contract.Handoff, "I can't access accounts or sign you in. Please use the official ZoikoSuite sign-in or support page.", "support", false},
-	"I23": {contract.Handoff, "I can't open support requests from this chat. Please contact the support team through the official support page.", "support", false},
-	"I24": {contract.Handoff, "I can't connect you to a person from this chat, and I haven't created a request. You can reach the team through the official contact page.", "support", true},
+	"I08": {contract.Handoff, "You can request a demo through ZoikoSuite's official demo page. I haven't booked anything for you.", "demo", false, ""},
+	"I22": {contract.Handoff, "For account-specific information, please sign in through the official ZoikoSuite sign-in page. Do not share passwords, one-time codes or account records here.", "support", false, ""}, // Doc 02 T17
+	// Doc 02 T16 (I21/I23) copy.
+	"I23": {contract.Handoff, "I can help you find public guidance, but I cannot view your workspace or case history from this chat. Please use the secure Support Center to access the channels available to your account and plan.", "support", false, ""},
+	"I24": {contract.Handoff, "I can direct you to the appropriate ZoikoSuite team. Is your enquiry about a product demonstration, an existing account, or security/procurement review?", "support", true, ""}, // Doc 02 T26
 	// Doc 02 I26: ZoikoSuite facts only, never claims about other vendors.
-	"I26": {contract.Abstain, "I can only describe ZoikoSuite, not other vendors' products. You can explore ZoikoSuite's modules to compare them with your requirements.", "core_modules", false},
-	"I28": {contract.Handoff, "I can't see billing details. Please use your ZoikoSuite account or the official support page for billing questions.", "support", false},
+	"I26": {contract.Abstain, "I can only describe ZoikoSuite, not other vendors' products. You can explore ZoikoSuite's modules to compare them with your requirements.", "core_modules", false, ""},
+	"I28": {contract.Handoff, "I can't see billing details. Please use your ZoikoSuite account or the official support page for billing questions.", "support", false, ""},
 }
 
 // DefaultRoute is the CTA offered alongside answers for each intent.

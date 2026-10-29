@@ -314,6 +314,66 @@
       "conflict_ids": []
     },
     {
+      "claim_id": "c-trial-ie-starter",
+      "claim_revision": 1,
+      "claim_type": "TRIAL",
+      "subject_id": "TEST_STARTER",
+      "predicate": "trial_available",
+      "normalized_value": "true",
+      "public_statement": "TEST-ONLY: A TEST_STARTER trial is available in IE where enabled.",
+      "market": "IE",
+      "plan": "TEST_STARTER",
+      "segment": "",
+      "locale": "en-US",
+      "billing_term": "",
+      "currency": "",
+      "status": "ACTIVE",
+      "operationally_enabled": true,
+      "publicly_publishable": true,
+      "valid_from": "2026-01-01T00:00:00Z",
+      "valid_until": "2026-06-30T00:00:00Z",
+      "authority_ref": "TEST-PRICE-BOOK",
+      "evidence_source_version_ids": [
+        "src-pricing-v1"
+      ],
+      "citation_url_key": "pricing",
+      "approval_refs": [
+        "approval-commercial",
+        "approval-finance"
+      ],
+      "conflict_ids": []
+    },
+    {
+      "claim_id": "c-integration-ledgerlink",
+      "claim_revision": 1,
+      "claim_type": "INTEGRATION_STATUS",
+      "subject_id": "LedgerLink",
+      "predicate": "status",
+      "normalized_value": "planned",
+      "public_statement": "TEST-ONLY: The LedgerLink connector is planned.",
+      "market": "ALL",
+      "plan": "",
+      "segment": "",
+      "locale": "en-US",
+      "billing_term": "",
+      "currency": "",
+      "status": "HOLD",
+      "operationally_enabled": true,
+      "publicly_publishable": true,
+      "valid_from": "2026-01-01T00:00:00Z",
+      "valid_until": "2099-12-31T00:00:00Z",
+      "authority_ref": "TEST-PRICE-BOOK",
+      "evidence_source_version_ids": [
+        "src-integrations-v1"
+      ],
+      "citation_url_key": "integrations",
+      "approval_refs": [
+        "approval-commercial",
+        "approval-finance"
+      ],
+      "conflict_ids": []
+    },
+    {
       "claim_id": "c-cert-soc2",
       "claim_revision": 1,
       "claim_type": "CERTIFICATION",

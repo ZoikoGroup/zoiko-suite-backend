@@ -26,6 +26,7 @@ type Input struct {
 // values only, never the visitor's words (Doc 02 §10).
 type Pending struct {
 	Intent         string `json:"intent"`
+	Secondary      string `json:"secondary,omitempty"`
 	PlanName       string `json:"plan,omitempty"`
 	BillingCadence string `json:"billing,omitempty"`
 	Integration    string `json:"integration,omitempty"`
@@ -41,11 +42,39 @@ type Result struct {
 	Actions            []contract.Action
 	KnowledgeReleaseID string
 	Flags              *contract.Flags
-	Tokens             int64
+	// AnswerClass ("" = contract.DefaultClass), StatusLabel, MarketCode and
+	// Clarification are the qualifier fields of the envelope.
+	AnswerClass   string
+	StatusLabel   string
+	MarketCode    string
+	Clarification *contract.Clarification
+	// SecondaryIntentID is the second intent of a two-part question; Reason
+	// (contract.Reason*) says why the turn ended this way.
+	SecondaryIntentID string
+	Reason            string
+	Suggestions       []contract.Chip
+	// Draft is set when the answer comes from DRAFT_PENDING_REVIEW articles
+	// (served only in local/dev); the UI labels it "Draft content".
+	Draft bool
+	// Diag is per-turn diagnostics (no message text): logged in dev/test.
+	Diag   Diag
+	Tokens int64
 	// LatencyBucket and SecuritySignal feed redacted events.
 	SecuritySignal string
 	// Pending, when set, must be stored for the next turn; nil clears it.
 	Pending *Pending
+}
+
+// Diag records how a turn was decided: slots, claim verdict, retrieval
+// counts before and after the access filters, top score and evidence ids.
+type Diag struct {
+	Slots               map[string]string
+	ClaimVerdict        string
+	RetrievalMode       string
+	CandidatesBeforeACL int
+	CandidatesAfterACL  int
+	TopScore            float64
+	EvidenceIDs         []string
 }
 
 // Answerer produces a turn result. Implementations must never return an

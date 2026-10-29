@@ -36,6 +36,118 @@ const (
 
 var validStatus = map[Status]bool{Answered: true, Clarify: true, RefusedAction: true, Abstain: true, Handoff: true, Unavailable: true}
 
+// Answer classes (Master prompt §4.1, Doc 02 §12): how much of the answer is
+// a governed fact. Every status maps to exactly one class.
+const (
+	VerifiedFact       = "VERIFIED_FACT"
+	StatusQualified    = "STATUS_QUALIFIED"
+	ProcessExplanation = "PROCESS_EXPLANATION"
+	HandoffUnknown     = "HANDOFF_UNKNOWN"
+)
+
+var validClass = map[string]bool{VerifiedFact: true, StatusQualified: true, ProcessExplanation: true, HandoffUnknown: true}
+
+// StatusLabels is the governed status vocabulary. A label is shown only when
+// it comes from the signed claim registry; it is never inferred or upgraded.
+var StatusLabels = map[string]bool{
+	"Available": true, "Limited": true, "Partner-Supported": true, "Planned": true, "Not Available": true,
+	"Unverified": true, "Current Architecture": true, "Implemented": true, "In Validation": true, "Readiness": true,
+	"MARKET_DEPENDENT": true,
+	// VERIFIED: backed by a signed claim with no narrower status.
+	"VERIFIED": true,
+}
+
+// OverviewOption is the clarification choice that skips the missing slot and
+// asks for the general, non-market answer instead. OtherOption is "a country
+// not listed": it is answered as not covered, never guessed.
+const (
+	OverviewOption = "GENERAL_OVERVIEW"
+	OtherOption    = "OTHER"
+)
+
+// Reasons say why a turn ended the way it did, so the UI can word it and
+// diagnostics can name the failing stage. UNAVAILABLE carries only the
+// infrastructure reasons (kill switch, model, knowledge); "no evidence" and
+// "market not covered" are business outcomes (ABSTAIN, HTTP 200).
+const (
+	ReasonAnswered             = "ANSWERED"
+	ReasonGreeting             = "GREETING"
+	ReasonMarketRequired       = "MARKET_REQUIRED"
+	ReasonPlanRequired         = "PLAN_REQUIRED"
+	ReasonClarifyExhausted     = "CLARIFY_EXHAUSTED"
+	ReasonNoEvidence           = "NO_EVIDENCE"
+	ReasonClaimConflict        = "CLAIM_CONFLICT"
+	ReasonExpiredSource        = "EXPIRED_SOURCE"
+	ReasonSourceRevoked        = "SOURCE_REVOKED"
+	ReasonMarketNotCovered     = "MARKET_NOT_COVERED"
+	ReasonOutOfScope           = "OUT_OF_SCOPE"
+	ReasonRouteOnly            = "ROUTE_ONLY"
+	ReasonSensitiveInput       = "SENSITIVE_INPUT"
+	ReasonPrivateData          = "PRIVATE_DATA"
+	ReasonActionDenied         = "ACTION_DENIED"
+	ReasonRegulatedAdvice      = "REGULATED_ADVICE"
+	ReasonSecurityReport       = "SECURITY_REPORT"
+	ReasonPromptInjection      = "PROMPT_INJECTION"
+	ReasonCrossProduct         = "CROSS_PRODUCT"
+	ReasonUnsupportedClaim     = "UNSUPPORTED_GUARANTEE"
+	ReasonValidationFailed     = "VALIDATION_FAILED"
+	ReasonToolInstruction      = "TOOL_INSTRUCTION"
+	ReasonPricingDisabled      = "PRICING_DISABLED"
+	ReasonKillSwitch           = "KILL_SWITCH"
+	ReasonIntentDisabled       = "INTENT_DISABLED"
+	ReasonGenerationDisabled   = "GENERATION_DISABLED"
+	ReasonModelUnavailable     = "MODEL_UNAVAILABLE"
+	ReasonModelTimeout         = "MODEL_TIMEOUT"
+	ReasonKnowledgeUnavailable = "KNOWLEDGE_UNAVAILABLE"
+	ReasonLivePlatformData     = "LIVE_PLATFORM_DATA"
+	ReasonNoApprovedInfo       = "NO_APPROVED_INFO"
+)
+
+// Pipeline stages named in diagnostics (Master prompt STEP 1).
+const (
+	StageEdge     = "EDGE"
+	StagePolicy   = "POLICY"
+	StageClassify = "CLASSIFY"
+	StageClaims   = "CLAIMS"
+	StageRetrieve = "RETRIEVE"
+	StageCompose  = "COMPOSE"
+	StageValidate = "VALIDATE"
+	StageDone     = "DONE"
+)
+
+var reasonStage = map[string]string{
+	ReasonAnswered: StageDone, ReasonGreeting: StageDone, ReasonRouteOnly: StageDone,
+	ReasonMarketRequired: StageClaims, ReasonPlanRequired: StageClaims, ReasonClarifyExhausted: StageClaims,
+	ReasonNoEvidence: StageRetrieve, ReasonClaimConflict: StageClaims, ReasonExpiredSource: StageClaims,
+	ReasonSourceRevoked: StageClaims, ReasonMarketNotCovered: StageClaims, ReasonOutOfScope: StageClassify,
+	ReasonSensitiveInput: StagePolicy, ReasonPrivateData: StagePolicy, ReasonActionDenied: StagePolicy,
+	ReasonRegulatedAdvice: StagePolicy, ReasonSecurityReport: StagePolicy, ReasonPromptInjection: StagePolicy,
+	ReasonCrossProduct: StagePolicy, ReasonUnsupportedClaim: StagePolicy, ReasonValidationFailed: StageValidate,
+	ReasonToolInstruction: StageValidate, ReasonPricingDisabled: StageEdge, ReasonKillSwitch: StageEdge,
+	ReasonIntentDisabled: StageEdge, ReasonGenerationDisabled: StageCompose, ReasonModelUnavailable: StageCompose,
+	ReasonModelTimeout: StageCompose, ReasonKnowledgeUnavailable: StageRetrieve,
+	ReasonLivePlatformData: StagePolicy, ReasonNoApprovedInfo: StageRetrieve,
+}
+
+// infraReason are the only reasons an UNAVAILABLE turn may carry.
+var infraReason = map[string]bool{ReasonKillSwitch: true, ReasonIntentDisabled: true, ReasonGenerationDisabled: true,
+	ReasonModelUnavailable: true, ReasonModelTimeout: true, ReasonKnowledgeUnavailable: true}
+
+// StageFor names the pipeline stage a reason comes from ("" if unknown).
+func StageFor(reason string) string { return reasonStage[reason] }
+
+// DefaultClass is the class for a status when the orchestrator set none.
+func DefaultClass(s Status) string {
+	switch s {
+	case Answered:
+		return ProcessExplanation
+	case Clarify:
+		return StatusQualified
+	default:
+		return HandoffUnknown
+	}
+}
+
 // PageContexts is the allowlisted page_context enum (Doc 05 §08).
 var PageContexts = map[string]bool{"home": true, "pricing": true, "core_modules": true, "demo": true, "support": true, "other": true}
 
@@ -98,6 +210,14 @@ type Flags struct {
 	RequiresHuman bool `json:"requires_human,omitempty"`
 }
 
+// Clarification is the one question a CLARIFY turn asks: the slot it fills
+// and the allowed choices (market codes plus OverviewOption).
+type Clarification struct {
+	Slot     string   `json:"slot"`
+	Question string   `json:"question"`
+	Options  []string `json:"options"`
+}
+
 // Envelope is the turn response (zs-public-answer-v1).
 type Envelope struct {
 	SchemaVersion      string     `json:"schema_version"`
@@ -112,6 +232,21 @@ type Envelope struct {
 	KnowledgeReleaseID string     `json:"knowledge_release_id"`
 	PolicyVersion      string     `json:"policy_version"`
 	Flags              *Flags     `json:"flags,omitempty"`
+	// AnswerClass, StatusLabel and MarketCode are the qualifier the UI shows
+	// next to the answer; Clarification is set only on CLARIFY.
+	AnswerClass   string         `json:"answer_class"`
+	StatusLabel   string         `json:"status_label,omitempty"`
+	MarketCode    string         `json:"market_code,omitempty"`
+	Clarification *Clarification `json:"clarification,omitempty"`
+	// SecondaryIntentID is the second intent of a two-part question (e.g.
+	// plans and trial); Reason says why the turn ended this way.
+	SecondaryIntentID string `json:"secondary_intent_id,omitempty"`
+	Reason            string `json:"reason,omitempty"`
+	// Suggestions are pre-approved follow-up questions shown as chips when
+	// the assistant cannot answer (never links, never CTAs).
+	Suggestions []Chip `json:"suggestions,omitempty"`
+	// Draft: answered from DRAFT_PENDING_REVIEW articles (local/dev only).
+	Draft bool `json:"draft,omitempty"`
 }
 
 // ConfigResponse is the body of GET /config (Doc 05 §15).
@@ -127,6 +262,16 @@ type ConfigResponse struct {
 	// §15 recorded in ADR-005.
 	CitationLinks    []CitationLink `json:"citation_links"`
 	PrivacyNoticeKey string         `json:"privacy_notice_key"`
+	// Microcopy (ui.* keys) and Chips (starter questions by page_context)
+	// let the widget render pre-approved wording only (Master prompt §6.4).
+	Microcopy map[string]string `json:"microcopy"`
+	Chips     map[string][]Chip `json:"chips"`
+}
+
+// Chip is one welcome-card starter: a label and the fixed message it sends.
+type Chip struct {
+	Label   string `json:"label"`
+	Message string `json:"message"`
 }
 
 // FieldError is a 422 validation failure (safe to show publicly).
@@ -190,8 +335,10 @@ func (r *TurnRequest) Validate() error {
 	}
 	r.ClientTurnID = strings.ToLower(r.ClientTurnID)
 	r.Message = NormalizeMessage(r.Message)
-	if n := utf8.RuneCountInString(r.Message); n < 1 || n > MaxMessageRunes {
-		return &FieldError{"message", fmt.Sprintf("must be 1-%d characters", MaxMessageRunes)}
+	if n := utf8.RuneCountInString(r.Message); n < 1 {
+		return &FieldError{"message", "must not be empty"}
+	} else if n > MaxMessageRunes {
+		return &FieldError{"message", fmt.Sprintf("too long: at most %d characters", MaxMessageRunes)}
 	}
 	if r.RequestedResponseMode != "" && r.RequestedResponseMode != "json" {
 		return &FieldError{"requested_response_mode", "only json is supported"}
@@ -218,6 +365,22 @@ func (e *Envelope) Validate() error {
 		return errors.New("release/policy required")
 	case e.TurnSequence < 1:
 		return errors.New("turn_sequence")
+	case !validClass[e.AnswerClass]:
+		return errors.New("answer_class")
+	case e.StatusLabel != "" && !StatusLabels[e.StatusLabel]:
+		return errors.New("status_label")
+	case e.MarketCode != "" && !marketRe.MatchString(e.MarketCode):
+		return errors.New("market_code")
+	case e.Clarification != nil && e.Status != Clarify:
+		return errors.New("clarification only on CLARIFY")
+	case e.AnswerClass == HandoffUnknown && e.Status == Answered:
+		return errors.New("ANSWERED cannot be HANDOFF_UNKNOWN")
+	case e.Reason != "" && reasonStage[e.Reason] == "":
+		return errors.New("reason")
+	case e.SecondaryIntentID != "" && !intentRe.MatchString(e.SecondaryIntentID):
+		return errors.New("secondary_intent_id")
+	case e.Status == Unavailable && e.Reason != "" && !infraReason[e.Reason]:
+		return errors.New("UNAVAILABLE is only for infrastructure failures")
 	}
 	for _, a := range e.Actions {
 		if a.Type != ActionOpenRoute || a.RouteKey == "" {

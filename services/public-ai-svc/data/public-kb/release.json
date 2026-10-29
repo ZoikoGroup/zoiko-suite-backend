@@ -1,0 +1,88 @@
+{
+  "allowed_hosts": [
+    "pending-review.invalid"
+  ],
+  "capability_ids": [],
+  "approved_by": [
+    "approver-a",
+    "approver-b"
+  ],
+  "eval_run_id": "eval-public-kb-0",
+  "routes": [],
+  "synonyms": {
+    "ar": [
+      "accounts",
+      "receivable"
+    ],
+    "ap": [
+      "accounts",
+      "payable"
+    ],
+    "gl": [
+      "general",
+      "ledger"
+    ],
+    "vat": [
+      "indirect",
+      "tax"
+    ],
+    "gst": [
+      "indirect",
+      "tax"
+    ],
+    "siem": [
+      "security",
+      "information",
+      "event"
+    ],
+    "hris": [
+      "human",
+      "resources",
+      "integrations"
+    ],
+    "esignature": [
+      "electronic",
+      "signature",
+      "integrations"
+    ],
+    "mtls": [
+      "mutual",
+      "tls",
+      "certificates"
+    ],
+    "delegation": [
+      "delegated",
+      "authority"
+    ],
+    "resolutions": [
+      "board",
+      "legal"
+    ],
+    "requisition": [
+      "purchase",
+      "request"
+    ],
+    "order": [
+      "purchase",
+      "request"
+    ],
+    "connectors": [
+      "integrations"
+    ],
+    "banking": [
+      "integrations",
+      "connectors"
+    ],
+    "hr": [
+      "human",
+      "resources"
+    ],
+    "admissible": [
+      "admissibility"
+    ],
+    "logs": [
+      "evidence",
+      "records"
+    ]
+  }
+}

@@ -269,8 +269,9 @@ func TestTrialRouteGatedByClaim(t *testing.T) {
 	}
 	cfg := e.rt.PublicConfig()
 	for _, l := range cfg.CitationLinks {
-		if !strings.HasPrefix(l.URL, "https://example.invalid/") || l.URLKey == "" {
-			t.Fatalf("citation link not from an approved source: %+v", l)
+		// Fixture sources live on a placeholder host: the title is kept, the URL is never exposed.
+		if l.URL != "" || l.URLKey == "" || l.Title == "" {
+			t.Fatalf("citation link exposes a placeholder URL or lacks a title: %+v", l)
 		}
 		if l.URLKey == "internal-payroll" || l.URLKey == "release-notes" {
 			t.Fatalf("quarantined source exposed as a citation link: %+v", l)

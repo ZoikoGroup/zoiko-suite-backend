@@ -17,17 +17,24 @@ import (
 	"zoiko.io/public-ai-svc/internal/claims"
 	"zoiko.io/public-ai-svc/internal/contract"
 	"zoiko.io/public-ai-svc/internal/knowledge"
+	"zoiko.io/public-ai-svc/internal/policy"
 	"zoiko.io/public-ai-svc/internal/signing"
 	"zoiko.io/public-ai-svc/internal/store"
 )
 
 // Snapshot is an immutable view used for one turn.
 type Snapshot struct {
-	KB        *knowledge.Index
+	KB *knowledge.Index
+	// Retriever searches KB: the lexical index itself, or Hybrid when an
+	// embedder is configured (ADR-002).
+	Retriever knowledge.Retriever
 	Claims    *claims.Resolver
 	Routes    []knowledge.Route
 	Watermark int64
 	rev       *revocationSet
+
+	kbManifest    *knowledge.Manifest
+	claimsChanged bool
 }
 
 // SourceRevoked implements knowledge.Revocations.
@@ -73,6 +80,16 @@ type revocationSet struct {
 type Runtime struct {
 	store  store.Store
 	pubKey string
+	// AllowDraft lets a local/dev runtime serve a release that contains
+	// DRAFT_PENDING_REVIEW content. Anywhere else such a release is refused
+	// and the service stays not-ready (fail closed).
+	AllowDraft bool
+	// Embedder, when set, adds vector recall (knowledge.Hybrid) to each KB
+	// release. Nil (the R0 default: no approved model) keeps retrieval
+	// lexical. If embedding a release fails, that release is served
+	// lexically and VectorError reports why.
+	Embedder knowledge.Embedder
+	vecErr   error
 
 	mu          sync.RWMutex
 	snap        *Snapshot
@@ -121,7 +138,27 @@ func (r *Runtime) refresh(ctx context.Context) error {
 			r.invalidate()
 			return err
 		}
-		next.KB, next.Routes = knowledge.NewIndex(m), m.Routes
+		if err := m.Validate(); err != nil {
+			r.invalidate()
+			return fmt.Errorf("release %s: %w", newKB, err)
+		}
+		if m.HasDraft() && !r.AllowDraft {
+			r.invalidate()
+			return fmt.Errorf("release %s: %w", newKB, ErrDraftInRelease)
+		}
+		next.KB, next.Routes, next.kbManifest = knowledge.NewIndex(m), m.Routes, &m
+		next.Retriever = next.KB
+		var vecErr error
+		if r.Embedder != nil {
+			if h, err := knowledge.NewHybrid(ctx, next.KB, r.Embedder); err != nil {
+				vecErr = err
+			} else {
+				next.Retriever = h
+			}
+		}
+		r.mu.Lock()
+		r.vecErr = vecErr
+		r.mu.Unlock()
 	}
 	newClaims, err := r.store.GetPointer(ctx, claims.KindClaims)
 	if err != nil {
@@ -134,6 +171,11 @@ func (r *Runtime) refresh(ctx context.Context) error {
 			return err
 		}
 		next.Claims = claims.NewResolver(m)
+		next.claimsChanged = true
+	}
+	if next.claimsChanged || newKB != kbID {
+		next.Claims = next.Claims.WithDisputes(PriceDisputes(next.kbManifest, next.Claims.Manifest()))
+		next.claimsChanged = false
 	}
 	revs, err := r.store.Revocations(ctx, cur.Watermark)
 	if err != nil {
@@ -269,13 +311,20 @@ func (r *Runtime) ResolveRoute(key, market string) (string, bool) {
 // PublicConfig implements httpapi.ConfigSource from the active releases.
 func (r *Runtime) PublicConfig() contract.ConfigResponse {
 	cfg := contract.ConfigResponse{
-		AssistantDisplayName: "ZoikoSuite assistant", // neutral until brand clearance (DEC-04)
+		AssistantDisplayName: "ZoikoSuite Assistant", // neutral until brand clearance (DEC-04)
 		Capabilities:         contract.Capabilities{},
 		SupportedLocales:     []string{"en-US"},
 		MarketChoices:        []string{},
 		PublicRoutes:         []contract.PublicRoute{},
 		CitationLinks:        []contract.CitationLink{},
 		PrivacyNoticeKey:     "privacy-notice-pending-dpo",
+		Microcopy:            policy.Microcopy,
+		Chips:                map[string][]contract.Chip{},
+	}
+	for page, chips := range policy.Chips {
+		for _, c := range chips {
+			cfg.Chips[page] = append(cfg.Chips[page], contract.Chip{Label: c.Label, Message: c.Message})
+		}
 	}
 	f := false
 	cfg.Capabilities.Authenticated = &f
@@ -295,10 +344,18 @@ func (r *Runtime) PublicConfig() contract.ConfigResponse {
 			continue
 		}
 		seen[rt.RouteKey] = true
+		if knowledge.IsPlaceholderURL(rt.URL) {
+			continue // no real public page yet: the CTA is hidden, never a placeholder link
+		}
 		cfg.PublicRoutes = append(cfg.PublicRoutes, contract.PublicRoute{RouteKey: rt.RouteKey, URL: rt.URL})
 	}
 	sort.Slice(cfg.PublicRoutes, func(i, j int) bool { return cfg.PublicRoutes[i].RouteKey < cfg.PublicRoutes[j].RouteKey })
 	cfg.CitationLinks = snap.KB.CitationLinks()
+	for i, l := range cfg.CitationLinks {
+		if knowledge.IsPlaceholderURL(l.URL) {
+			cfg.CitationLinks[i].URL = "" // the approved title is shown, unlinked
+		}
+	}
 	return cfg
 }
 
@@ -309,4 +366,12 @@ func anyMarketVerified(s *Snapshot, subject string, now time.Time) bool {
 		}
 	}
 	return false
+}
+
+// VectorError is why the active KB release is served without vector recall
+// although an Embedder is configured (nil when hybrid is active or off).
+func (r *Runtime) VectorError() error {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.vecErr
 }

@@ -8,13 +8,19 @@ import (
 	"mime"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
 	"zoiko.io/public-ai-svc/internal/problem"
+	"zoiko.io/public-ai-svc/internal/telemetry"
 )
 
 // RequestID always issues a fresh server-side request id (Doc 05 §06: the
@@ -112,6 +118,24 @@ func Origin(allowed []string) func(http.Handler) http.Handler {
 	}
 }
 
+// Host rejects requests for an unexpected Host header when an allowlist is
+// configured (Doc 04 §08: validate Origin/Host before any work).
+func Host(allowed []string) func(http.Handler) http.Handler {
+	allow := map[string]bool{}
+	for _, h := range allowed {
+		allow[strings.ToLower(h)] = true
+	}
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if len(allow) > 0 && !allow[strings.ToLower(r.Host)] {
+				problem.Write(w, r, problem.OriginDenied, "")
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
 // RequireJSON enforces application/json on requests that carry a body.
 func RequireJSON(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -178,4 +202,31 @@ func AccessLog(log *zap.Logger) func(http.Handler) http.Handler {
 			)
 		})
 	}
+}
+
+// Trace opens the server span for a request, continuing a valid W3C
+// traceparent. It records the method, route pattern, status and request id
+// only: no query string, headers, body or session grant (Doc 08 §14).
+func Trace(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header))
+		ctx, span := telemetry.Tracer().Start(ctx, r.Method, trace.WithSpanKind(trace.SpanKindServer))
+		defer span.End()
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(rec, r.WithContext(ctx))
+		route := "unmatched"
+		if rc := chi.RouteContext(r.Context()); rc != nil && rc.RoutePattern() != "" {
+			route = rc.RoutePattern()
+		}
+		span.SetName(r.Method + " " + route)
+		span.SetAttributes(
+			attribute.String("http.request.method", r.Method),
+			attribute.String("http.route", route),
+			attribute.Int("http.response.status_code", rec.status),
+			attribute.String("request_id", w.Header().Get("X-Request-ID")),
+		)
+		if rec.status >= 500 {
+			telemetry.Fail(span, strconv.Itoa(rec.status))
+		}
+	})
 }

@@ -27,6 +27,7 @@ import (
 	"zoiko.io/public-ai-svc/deployments/migrations"
 	"zoiko.io/public-ai-svc/internal/events"
 	"zoiko.io/public-ai-svc/internal/flags"
+	"zoiko.io/public-ai-svc/internal/knowledge"
 	"zoiko.io/public-ai-svc/internal/release"
 	"zoiko.io/public-ai-svc/internal/signing"
 	"zoiko.io/public-ai-svc/internal/store"
@@ -101,7 +102,11 @@ func buildKB(args []string) error {
 	if err != nil {
 		return err
 	}
-	manifest, sig, reports, err := release.BuildKB(*in, *id, time.Now(), key)
+	// Drafts are admitted only for local/dev builds (KB_ALLOW_DRAFT=true with
+	// PUBLIC_AI_ENVIRONMENT dev or test); any other build with a draft fails.
+	env := envOr("PUBLIC_AI_ENVIRONMENT", "dev")
+	allowDraft := os.Getenv("KB_ALLOW_DRAFT") == "true" && (env == "dev" || env == "test")
+	manifest, sig, reports, err := release.BuildKBWith(*in, *id, time.Now(), key, knowledge.IngestOptions{AllowDraft: allowDraft})
 	for _, r := range reports {
 		fmt.Printf("%-30s %-24s %-20s %s\n", r.File, r.SourceID, r.State, r.Reason)
 	}

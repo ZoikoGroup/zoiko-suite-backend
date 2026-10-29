@@ -2,6 +2,7 @@ package limits
 
 import (
 	"context"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -66,8 +67,56 @@ func TestPerSessionLimitAcrossIPs(t *testing.T) {
 }
 
 func TestIPv6Coarsened(t *testing.T) {
-	if clientKey("[2001:db8:1:2:aaaa::1]:5") != clientKey("[2001:db8:1:2:bbbb::9]:5") {
+	if clientKey(net.ParseIP("2001:db8:1:2:aaaa::1")) != clientKey(net.ParseIP("2001:db8:1:2:bbbb::9")) {
 		t.Fatal("IPv6 addresses in one /64 must share a bucket")
+	}
+}
+
+// Visitors behind the console proxy get their own buckets; a forged
+// X-Forwarded-For cannot pick a bucket.
+func TestClientIPThroughTrustedProxy(t *testing.T) {
+	cfg := config.Config{TrustedProxies: []string{"127.0.0.1/32", "::1/128", "10.0.0.0/8"}}
+	g := New(cfg, store.NewMemory(), fixedFlags{flags.Defaults()})
+	cases := []struct{ peer, xff, want string }{
+		{"127.0.0.1", "203.0.113.7", "203.0.113.7"},           // console proxy
+		{"[::1]", "203.0.113.7", "203.0.113.7"},               // IPv6 loopback proxy
+		{"127.0.0.1", "6.6.6.6, 203.0.113.7", "203.0.113.7"},  // forged left entry ignored
+		{"127.0.0.1", "203.0.113.7, 10.1.2.3", "203.0.113.7"}, // trusted edge hop skipped
+		{"127.0.0.1", "", "127.0.0.1"},                        // no header: the peer
+		{"127.0.0.1", "not-an-ip", "127.0.0.1"},               // malformed: the peer
+		{"198.51.100.4", "203.0.113.7", "198.51.100.4"},       // untrusted peer: header ignored
+	}
+	for _, c := range cases {
+		r := httptest.NewRequest(http.MethodPost, "/public-ai/v1/turns", nil)
+		r.RemoteAddr = c.peer + ":1234"
+		if c.xff != "" {
+			r.Header.Set("X-Forwarded-For", c.xff)
+		}
+		if got := g.clientIP(r).String(); got != c.want {
+			t.Errorf("peer %s xff %q: got %s, want %s", c.peer, c.xff, got, c.want)
+		}
+	}
+}
+
+func TestVisitorsBehindProxyHaveSeparateBuckets(t *testing.T) {
+	cfg := config.Config{RateLimitPerIPPerMinute: 12, RateLimitPerSessionPerMin: 1000, TrustedProxies: []string{"127.0.0.1/32"}}
+	h := New(cfg, store.NewMemory(), fixedFlags{flags.Defaults()}).Middleware(ok)
+	via := func(visitor string) int {
+		r := httptest.NewRequest(http.MethodPost, "/public-ai/v1/turns", nil)
+		r.RemoteAddr = "127.0.0.1:5000"
+		r.Header.Set("X-Forwarded-For", visitor)
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w.Code
+	}
+	for i := 0; i < 3; i++ {
+		via("203.0.113.7")
+	}
+	if via("203.0.113.7") != http.StatusTooManyRequests {
+		t.Fatal("the busy visitor must be limited")
+	}
+	if via("203.0.113.8") != 200 {
+		t.Fatal("another visitor behind the same proxy must not be limited")
 	}
 }
 

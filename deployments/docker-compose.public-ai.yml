@@ -55,7 +55,7 @@ services:
       # Read-only; the private signing key never enters the container.
       - ${PUBLIC_AI_RELEASES_DIR:-./public-ai-releases}:/releases:ro
     ports:
-      - "127.0.0.1:18080:8080"
+      - "127.0.0.1:8001:8080"
     networks: [public-ai]
     read_only: true
     cap_drop: [ALL]

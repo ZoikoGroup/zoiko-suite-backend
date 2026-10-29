@@ -1,0 +1,45 @@
+{
+  "source": {
+    "source_type": "WEB_PAGE",
+    "product_id": "zoikosuite",
+    "audience": "PUBLIC_ANONYMOUS",
+    "classification": "PUBLIC_APPROVED",
+    "pii_state": "CLEAR",
+    "authority_tier": "P3",
+    "subject_type": "TRUST",
+    "owner_id": "owner-web",
+    "approver_ids": [
+      "approver-a"
+    ],
+    "market_codes": [
+      "ALL"
+    ],
+    "locale": "en-US",
+    "plan_codes": [],
+    "capability_ids": [],
+    "intent_ids": [
+      "I12",
+      "I13",
+      "I14",
+      "I15"
+    ],
+    "approval_state": "APPROVED",
+    "approval_ts": "2026-01-02T00:00:00Z",
+    "effective_from": "2026-01-01T00:00:00Z",
+    "effective_until": null,
+    "review_due_at": "2027-06-01T00:00:00Z",
+    "expires_at": "2099-12-31T00:00:00Z",
+    "content_sha256": "",
+    "signing_ref": "kbctl-dev",
+    "license": "OWNED_PUBLIC",
+    "supersedes": "",
+    "revocation_reason": "",
+    "source_id": "src-trust",
+    "source_version_id": "src-trust-v1",
+    "origin_uri": "https://example.invalid/trust",
+    "url_key": "trust",
+    "title": "Security and trust",
+    "synthetic": true
+  },
+  "body": "SYNTHETIC seed data. Not ZoikoSuite fact.\n\n# Security practices\nZoikoSuite applies role-based access, approvals and audit trails across modules. Certification status is published only on the official trust center.\n# Privacy\nPersonal data handling is described in the official privacy notice; this assistant cannot see customer accounts."
+}

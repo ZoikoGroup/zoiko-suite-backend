@@ -4,7 +4,10 @@
 // retrieval with mandatory filters (§14, Doc 05 §18).
 package knowledge
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 const (
 	ProductID      = "zoikosuite"
@@ -49,6 +52,15 @@ type Source struct {
 	License          string     `json:"license"`
 	Supersedes       string     `json:"supersedes"`
 	RevocationReason string     `json:"revocation_reason"`
+	// Synthetic marks seed data that is not ZoikoSuite fact.
+	Synthetic bool `json:"synthetic,omitempty"`
+	// Domain and ModuleID place a public-KB article in the taxonomy (pending
+	// the signed Services/Categories Reconciliation v2.1).
+	Domain   string `json:"domain,omitempty"`
+	ModuleID string `json:"module_id,omitempty"`
+	// Draft is DRAFT_PENDING_REVIEW content admitted only by a dev-only
+	// ingest option (KB_ALLOW_DRAFT); a production runtime refuses it.
+	Draft bool `json:"draft,omitempty"`
 }
 
 // Chunk is an indexable segment. It inherits scope, validity and revocation
@@ -73,6 +85,7 @@ type Chunk struct {
 	ValidFrom       time.Time `json:"valid_from"`
 	ValidUntil      time.Time `json:"valid_until"`
 	ReleaseID       string    `json:"retrieval_release_id"`
+	Draft           bool      `json:"draft,omitempty"`
 }
 
 // Route is an official destination (Doc 05 §15). URL is never shown to the
@@ -88,6 +101,43 @@ type Route struct {
 	// RequiresClaim gates the route on a VERIFIED claim (signup_or_trial
 	// requires trial eligibility, Doc 05 §15).
 	RequiresClaim string `json:"requires_claim,omitempty"`
+	Synthetic     bool   `json:"synthetic,omitempty"`
+}
+
+// HasDraft reports whether any chunk is DRAFT_PENDING_REVIEW content.
+func (m Manifest) HasDraft() bool {
+	for _, c := range m.Chunks {
+		if c.Draft {
+			return true
+		}
+	}
+	return false
+}
+
+// Validate checks a manifest's internal consistency before it is signed or
+// served (KB-008, A14): every chunk must belong to a listed, approved,
+// PUBLIC_APPROVED source and carry the same labels; no orphan chunks.
+func (m Manifest) Validate() error {
+	if m.Kind != KindKB || m.ReleaseID == "" {
+		return fmt.Errorf("manifest kind/release id invalid")
+	}
+	sources := map[string]Source{}
+	for _, s := range m.Sources {
+		if !(s.ApprovalState == "APPROVED" || (s.Draft && s.ApprovalState == ApprovalDraft)) || s.Classification != Classification || s.Audience != Audience || s.ProductID != ProductID {
+			return fmt.Errorf("source %s is not an approved public source", s.SourceVersionID)
+		}
+		sources[s.SourceVersionID] = s
+	}
+	for _, c := range m.Chunks {
+		s, ok := sources[c.SourceVersionID]
+		if !ok {
+			return fmt.Errorf("chunk %s has no source in this release", c.ChunkID)
+		}
+		if c.Classification != s.Classification || c.Audience != s.Audience || c.ReleaseID != m.ReleaseID {
+			return fmt.Errorf("chunk %s lost its parent labels", c.ChunkID)
+		}
+	}
+	return nil
 }
 
 // HeadingPrefix marks the start of a section inside chunk text. Retrieval and

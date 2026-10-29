@@ -496,7 +496,7 @@
       "assert": {
         "application_outcome": "CLARIFY",
         "must_contain": [
-          "ZoikoSuite assistant"
+          "ZoikoSuite AI guide"
         ]
       }
     },

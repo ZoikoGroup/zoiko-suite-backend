@@ -1,0 +1,669 @@
+{
+  "synthetic": true,
+  "approved_by": [
+    "approval-commercial",
+    "approval-finance"
+  ],
+  "plan_aliases": {
+    "starter": "STARTER",
+    "growth": "GROWTH",
+    "enterprise": "ENTERPRISE"
+  },
+  "markets": [
+    "US",
+    "GB"
+  ],
+  "claims": [
+    {
+      "claim_id": "c-plans-us",
+      "claim_revision": 1,
+      "claim_type": "PLAN_AVAILABILITY",
+      "subject_id": "zoikosuite",
+      "predicate": "plans_offered",
+      "normalized_value": "available",
+      "public_statement": "SYNTHETIC: Starter, Growth and Enterprise plans are available in the United States.",
+      "market": "US",
+      "plan": "",
+      "segment": "",
+      "locale": "en-US",
+      "billing_term": "",
+      "currency": "",
+      "status": "ACTIVE",
+      "operationally_enabled": true,
+      "publicly_publishable": true,
+      "valid_from": "2026-01-01T00:00:00Z",
+      "valid_until": "2099-12-31T00:00:00Z",
+      "authority_ref": "SYNTHETIC-PRICE-BOOK",
+      "evidence_source_version_ids": [
+        "src-plans-v1"
+      ],
+      "citation_url_key": "pricing",
+      "approval_refs": [
+        "approval-commercial",
+        "approval-finance"
+      ],
+      "conflict_ids": [],
+      "synthetic": true
+    },
+    {
+      "claim_id": "c-market-us",
+      "claim_revision": 1,
+      "claim_type": "MARKET_AVAILABILITY",
+      "subject_id": "zoikosuite",
+      "predicate": "available",
+      "normalized_value": "true",
+      "public_statement": "SYNTHETIC: ZoikoSuite is offered in the United States.",
+      "market": "US",
+      "plan": "",
+      "segment": "",
+      "locale": "en-US",
+      "billing_term": "",
+      "currency": "",
+      "status": "ACTIVE",
+      "operationally_enabled": true,
+      "publicly_publishable": true,
+      "valid_from": "2026-01-01T00:00:00Z",
+      "valid_until": "2099-12-31T00:00:00Z",
+      "authority_ref": "SYNTHETIC-PRICE-BOOK",
+      "evidence_source_version_ids": [
+        "src-plans-v1"
+      ],
+      "citation_url_key": "pricing",
+      "approval_refs": [
+        "approval-commercial",
+        "approval-finance"
+      ],
+      "conflict_ids": [],
+      "synthetic": true
+    },
+    {
+      "claim_id": "c-price-us-starter-m",
+      "claim_revision": 1,
+      "claim_type": "PRICE",
+      "subject_id": "STARTER",
+      "predicate": "list_price",
+      "normalized_value": "[price]/user/month",
+      "public_statement": "SYNTHETIC: The Starter plan is listed at [price] per user per month in the United States, billed monthly.",
+      "market": "US",
+      "plan": "STARTER",
+      "segment": "",
+      "locale": "en-US",
+      "billing_term": "monthly",
+      "currency": "",
+      "status": "ACTIVE",
+      "operationally_enabled": true,
+      "publicly_publishable": true,
+      "valid_from": "2026-01-01T00:00:00Z",
+      "valid_until": "2099-12-31T00:00:00Z",
+      "authority_ref": "SYNTHETIC-PRICE-BOOK",
+      "evidence_source_version_ids": [
+        "src-plans-v1"
+      ],
+      "citation_url_key": "pricing",
+      "approval_refs": [
+        "approval-commercial",
+        "approval-finance"
+      ],
+      "conflict_ids": [],
+      "synthetic": true
+    },
+    {
+      "claim_id": "c-price-us-starter-a",
+      "claim_revision": 1,
+      "claim_type": "PRICE",
+      "subject_id": "STARTER",
+      "predicate": "list_price",
+      "normalized_value": "[price]/user/year",
+      "public_statement": "SYNTHETIC: The Starter plan is listed at [price] per user per year in the United States, billed annually.",
+      "market": "US",
+      "plan": "STARTER",
+      "segment": "",
+      "locale": "en-US",
+      "billing_term": "annual",
+      "currency": "",
+      "status": "ACTIVE",
+      "operationally_enabled": true,
+      "publicly_publishable": true,
+      "valid_from": "2026-01-01T00:00:00Z",
+      "valid_until": "2099-12-31T00:00:00Z",
+      "authority_ref": "SYNTHETIC-PRICE-BOOK",
+      "evidence_source_version_ids": [
+        "src-plans-v1"
+      ],
+      "citation_url_key": "pricing",
+      "approval_refs": [
+        "approval-commercial",
+        "approval-finance"
+      ],
+      "conflict_ids": [],
+      "synthetic": true
+    },
+    {
+      "claim_id": "c-trial-us-starter",
+      "claim_revision": 1,
+      "claim_type": "TRIAL",
+      "subject_id": "STARTER",
+      "predicate": "trial_available",
+      "normalized_value": "[N] days",
+      "public_statement": "SYNTHETIC: A Starter trial of [N] days is available in the United States; no payment details are collected in this chat.",
+      "market": "US",
+      "plan": "STARTER",
+      "segment": "",
+      "locale": "en-US",
+      "billing_term": "",
+      "currency": "",
+      "status": "ACTIVE",
+      "operationally_enabled": true,
+      "publicly_publishable": true,
+      "valid_from": "2026-01-01T00:00:00Z",
+      "valid_until": "2099-12-31T00:00:00Z",
+      "authority_ref": "SYNTHETIC-PRICE-BOOK",
+      "evidence_source_version_ids": [
+        "src-plans-v1"
+      ],
+      "citation_url_key": "pricing",
+      "approval_refs": [
+        "approval-commercial",
+        "approval-finance"
+      ],
+      "conflict_ids": [],
+      "synthetic": true
+    },
+    {
+      "claim_id": "c-price-us-growth-m",
+      "claim_revision": 1,
+      "claim_type": "PRICE",
+      "subject_id": "GROWTH",
+      "predicate": "list_price",
+      "normalized_value": "[price]/user/month",
+      "public_statement": "SYNTHETIC: The Growth plan is listed at [price] per user per month in the United States, billed monthly.",
+      "market": "US",
+      "plan": "GROWTH",
+      "segment": "",
+      "locale": "en-US",
+      "billing_term": "monthly",
+      "currency": "",
+      "status": "ACTIVE",
+      "operationally_enabled": true,
+      "publicly_publishable": true,
+      "valid_from": "2026-01-01T00:00:00Z",
+      "valid_until": "2099-12-31T00:00:00Z",
+      "authority_ref": "SYNTHETIC-PRICE-BOOK",
+      "evidence_source_version_ids": [
+        "src-plans-v1"
+      ],
+      "citation_url_key": "pricing",
+      "approval_refs": [
+        "approval-commercial",
+        "approval-finance"
+      ],
+      "conflict_ids": [],
+      "synthetic": true
+    },
+    {
+      "claim_id": "c-price-us-growth-a",
+      "claim_revision": 1,
+      "claim_type": "PRICE",
+      "subject_id": "GROWTH",
+      "predicate": "list_price",
+      "normalized_value": "[price]/user/year",
+      "public_statement": "SYNTHETIC: The Growth plan is listed at [price] per user per year in the United States, billed annually.",
+      "market": "US",
+      "plan": "GROWTH",
+      "segment": "",
+      "locale": "en-US",
+      "billing_term": "annual",
+      "currency": "",
+      "status": "ACTIVE",
+      "operationally_enabled": true,
+      "publicly_publishable": true,
+      "valid_from": "2026-01-01T00:00:00Z",
+      "valid_until": "2099-12-31T00:00:00Z",
+      "authority_ref": "SYNTHETIC-PRICE-BOOK",
+      "evidence_source_version_ids": [
+        "src-plans-v1"
+      ],
+      "citation_url_key": "pricing",
+      "approval_refs": [
+        "approval-commercial",
+        "approval-finance"
+      ],
+      "conflict_ids": [],
+      "synthetic": true
+    },
+    {
+      "claim_id": "c-trial-us-growth",
+      "claim_revision": 1,
+      "claim_type": "TRIAL",
+      "subject_id": "GROWTH",
+      "predicate": "trial_available",
+      "normalized_value": "[N] days",
+      "public_statement": "SYNTHETIC: A Growth trial of [N] days is available in the United States; no payment details are collected in this chat.",
+      "market": "US",
+      "plan": "GROWTH",
+      "segment": "",
+      "locale": "en-US",
+      "billing_term": "",
+      "currency": "",
+      "status": "ACTIVE",
+      "operationally_enabled": true,
+      "publicly_publishable": true,
+      "valid_from": "2026-01-01T00:00:00Z",
+      "valid_until": "2099-12-31T00:00:00Z",
+      "authority_ref": "SYNTHETIC-PRICE-BOOK",
+      "evidence_source_version_ids": [
+        "src-plans-v1"
+      ],
+      "citation_url_key": "pricing",
+      "approval_refs": [
+        "approval-commercial",
+        "approval-finance"
+      ],
+      "conflict_ids": [],
+      "synthetic": true
+    },
+    {
+      "claim_id": "c-price-us-enterprise",
+      "claim_revision": 1,
+      "claim_type": "PRICE",
+      "subject_id": "ENTERPRISE",
+      "predicate": "list_price",
+      "normalized_value": "quote",
+      "public_statement": "SYNTHETIC: Enterprise pricing in the United States is quoted by the sales team ([price] on request).",
+      "market": "US",
+      "plan": "ENTERPRISE",
+      "segment": "",
+      "locale": "en-US",
+      "billing_term": "",
+      "currency": "",
+      "status": "ACTIVE",
+      "operationally_enabled": true,
+      "publicly_publishable": true,
+      "valid_from": "2026-01-01T00:00:00Z",
+      "valid_until": "2099-12-31T00:00:00Z",
+      "authority_ref": "SYNTHETIC-PRICE-BOOK",
+      "evidence_source_version_ids": [
+        "src-plans-v1"
+      ],
+      "citation_url_key": "pricing",
+      "approval_refs": [
+        "approval-commercial",
+        "approval-finance"
+      ],
+      "conflict_ids": [],
+      "synthetic": true
+    },
+    {
+      "claim_id": "c-plans-gb",
+      "claim_revision": 1,
+      "claim_type": "PLAN_AVAILABILITY",
+      "subject_id": "zoikosuite",
+      "predicate": "plans_offered",
+      "normalized_value": "available",
+      "public_statement": "SYNTHETIC: Starter, Growth and Enterprise plans are available in the United Kingdom.",
+      "market": "GB",
+      "plan": "",
+      "segment": "",
+      "locale": "en-US",
+      "billing_term": "",
+      "currency": "",
+      "status": "ACTIVE",
+      "operationally_enabled": true,
+      "publicly_publishable": true,
+      "valid_from": "2026-01-01T00:00:00Z",
+      "valid_until": "2099-12-31T00:00:00Z",
+      "authority_ref": "SYNTHETIC-PRICE-BOOK",
+      "evidence_source_version_ids": [
+        "src-plans-v1"
+      ],
+      "citation_url_key": "pricing",
+      "approval_refs": [
+        "approval-commercial",
+        "approval-finance"
+      ],
+      "conflict_ids": [],
+      "synthetic": true
+    },
+    {
+      "claim_id": "c-market-gb",
+      "claim_revision": 1,
+      "claim_type": "MARKET_AVAILABILITY",
+      "subject_id": "zoikosuite",
+      "predicate": "available",
+      "normalized_value": "true",
+      "public_statement": "SYNTHETIC: ZoikoSuite is offered in the United Kingdom.",
+      "market": "GB",
+      "plan": "",
+      "segment": "",
+      "locale": "en-US",
+      "billing_term": "",
+      "currency": "",
+      "status": "ACTIVE",
+      "operationally_enabled": true,
+      "publicly_publishable": true,
+      "valid_from": "2026-01-01T00:00:00Z",
+      "valid_until": "2099-12-31T00:00:00Z",
+      "authority_ref": "SYNTHETIC-PRICE-BOOK",
+      "evidence_source_version_ids": [
+        "src-plans-v1"
+      ],
+      "citation_url_key": "pricing",
+      "approval_refs": [
+        "approval-commercial",
+        "approval-finance"
+      ],
+      "conflict_ids": [],
+      "synthetic": true
+    },
+    {
+      "claim_id": "c-price-gb-starter-m",
+      "claim_revision": 1,
+      "claim_type": "PRICE",
+      "subject_id": "STARTER",
+      "predicate": "list_price",
+      "normalized_value": "[price]/user/month",
+      "public_statement": "SYNTHETIC: The Starter plan is listed at [price] per user per month in the United Kingdom, billed monthly.",
+      "market": "GB",
+      "plan": "STARTER",
+      "segment": "",
+      "locale": "en-US",
+      "billing_term": "monthly",
+      "currency": "",
+      "status": "ACTIVE",
+      "operationally_enabled": true,
+      "publicly_publishable": true,
+      "valid_from": "2026-01-01T00:00:00Z",
+      "valid_until": "2099-12-31T00:00:00Z",
+      "authority_ref": "SYNTHETIC-PRICE-BOOK",
+      "evidence_source_version_ids": [
+        "src-plans-v1"
+      ],
+      "citation_url_key": "pricing",
+      "approval_refs": [
+        "approval-commercial",
+        "approval-finance"
+      ],
+      "conflict_ids": [],
+      "synthetic": true
+    },
+    {
+      "claim_id": "c-price-gb-starter-a",
+      "claim_revision": 1,
+      "claim_type": "PRICE",
+      "subject_id": "STARTER",
+      "predicate": "list_price",
+      "normalized_value": "[price]/user/year",
+      "public_statement": "SYNTHETIC: The Starter plan is listed at [price] per user per year in the United Kingdom, billed annually.",
+      "market": "GB",
+      "plan": "STARTER",
+      "segment": "",
+      "locale": "en-US",
+      "billing_term": "annual",
+      "currency": "",
+      "status": "ACTIVE",
+      "operationally_enabled": true,
+      "publicly_publishable": true,
+      "valid_from": "2026-01-01T00:00:00Z",
+      "valid_until": "2099-12-31T00:00:00Z",
+      "authority_ref": "SYNTHETIC-PRICE-BOOK",
+      "evidence_source_version_ids": [
+        "src-plans-v1"
+      ],
+      "citation_url_key": "pricing",
+      "approval_refs": [
+        "approval-commercial",
+        "approval-finance"
+      ],
+      "conflict_ids": [],
+      "synthetic": true
+    },
+    {
+      "claim_id": "c-trial-gb-starter",
+      "claim_revision": 1,
+      "claim_type": "TRIAL",
+      "subject_id": "STARTER",
+      "predicate": "trial_available",
+      "normalized_value": "[N] days",
+      "public_statement": "SYNTHETIC: A Starter trial of [N] days is available in the United Kingdom; no payment details are collected in this chat.",
+      "market": "GB",
+      "plan": "STARTER",
+      "segment": "",
+      "locale": "en-US",
+      "billing_term": "",
+      "currency": "",
+      "status": "ACTIVE",
+      "operationally_enabled": true,
+      "publicly_publishable": true,
+      "valid_from": "2026-01-01T00:00:00Z",
+      "valid_until": "2026-06-30T00:00:00Z",
+      "authority_ref": "SYNTHETIC-PRICE-BOOK",
+      "evidence_source_version_ids": [
+        "src-plans-v1"
+      ],
+      "citation_url_key": "pricing",
+      "approval_refs": [
+        "approval-commercial",
+        "approval-finance"
+      ],
+      "conflict_ids": [],
+      "synthetic": true
+    },
+    {
+      "claim_id": "c-price-gb-growth-m",
+      "claim_revision": 1,
+      "claim_type": "PRICE",
+      "subject_id": "GROWTH",
+      "predicate": "list_price",
+      "normalized_value": "[price]/user/month",
+      "public_statement": "SYNTHETIC: The Growth plan is listed at [price] per user per month in the United Kingdom, billed monthly.",
+      "market": "GB",
+      "plan": "GROWTH",
+      "segment": "",
+      "locale": "en-US",
+      "billing_term": "monthly",
+      "currency": "",
+      "status": "ACTIVE",
+      "operationally_enabled": true,
+      "publicly_publishable": true,
+      "valid_from": "2026-01-01T00:00:00Z",
+      "valid_until": "2099-12-31T00:00:00Z",
+      "authority_ref": "SYNTHETIC-PRICE-BOOK",
+      "evidence_source_version_ids": [
+        "src-plans-v1"
+      ],
+      "citation_url_key": "pricing",
+      "approval_refs": [
+        "approval-commercial",
+        "approval-finance"
+      ],
+      "conflict_ids": [],
+      "synthetic": true
+    },
+    {
+      "claim_id": "c-price-gb-growth-a",
+      "claim_revision": 1,
+      "claim_type": "PRICE",
+      "subject_id": "GROWTH",
+      "predicate": "list_price",
+      "normalized_value": "[price]/user/year",
+      "public_statement": "SYNTHETIC: The Growth plan is listed at [price] per user per year in the United Kingdom, billed annually.",
+      "market": "GB",
+      "plan": "GROWTH",
+      "segment": "",
+      "locale": "en-US",
+      "billing_term": "annual",
+      "currency": "",
+      "status": "ACTIVE",
+      "operationally_enabled": true,
+      "publicly_publishable": true,
+      "valid_from": "2026-01-01T00:00:00Z",
+      "valid_until": "2099-12-31T00:00:00Z",
+      "authority_ref": "SYNTHETIC-PRICE-BOOK",
+      "evidence_source_version_ids": [
+        "src-plans-v1"
+      ],
+      "citation_url_key": "pricing",
+      "approval_refs": [
+        "approval-commercial",
+        "approval-finance"
+      ],
+      "conflict_ids": [],
+      "synthetic": true
+    },
+    {
+      "claim_id": "c-trial-gb-growth",
+      "claim_revision": 1,
+      "claim_type": "TRIAL",
+      "subject_id": "GROWTH",
+      "predicate": "trial_available",
+      "normalized_value": "[N] days",
+      "public_statement": "SYNTHETIC: A Growth trial of [N] days is available in the United Kingdom; no payment details are collected in this chat.",
+      "market": "GB",
+      "plan": "GROWTH",
+      "segment": "",
+      "locale": "en-US",
+      "billing_term": "",
+      "currency": "",
+      "status": "ACTIVE",
+      "operationally_enabled": true,
+      "publicly_publishable": true,
+      "valid_from": "2026-01-01T00:00:00Z",
+      "valid_until": "2026-06-30T00:00:00Z",
+      "authority_ref": "SYNTHETIC-PRICE-BOOK",
+      "evidence_source_version_ids": [
+        "src-plans-v1"
+      ],
+      "citation_url_key": "pricing",
+      "approval_refs": [
+        "approval-commercial",
+        "approval-finance"
+      ],
+      "conflict_ids": [],
+      "synthetic": true
+    },
+    {
+      "claim_id": "c-price-gb-enterprise",
+      "claim_revision": 1,
+      "claim_type": "PRICE",
+      "subject_id": "ENTERPRISE",
+      "predicate": "list_price",
+      "normalized_value": "quote",
+      "public_statement": "SYNTHETIC: Enterprise pricing in the United Kingdom is quoted by the sales team ([price] on request).",
+      "market": "GB",
+      "plan": "ENTERPRISE",
+      "segment": "",
+      "locale": "en-US",
+      "billing_term": "",
+      "currency": "",
+      "status": "ACTIVE",
+      "operationally_enabled": true,
+      "publicly_publishable": true,
+      "valid_from": "2026-01-01T00:00:00Z",
+      "valid_until": "2099-12-31T00:00:00Z",
+      "authority_ref": "SYNTHETIC-PRICE-BOOK",
+      "evidence_source_version_ids": [
+        "src-plans-v1"
+      ],
+      "citation_url_key": "pricing",
+      "approval_refs": [
+        "approval-commercial",
+        "approval-finance"
+      ],
+      "conflict_ids": [],
+      "synthetic": true
+    },
+    {
+      "claim_id": "c-cert-soc2",
+      "claim_revision": 1,
+      "claim_type": "CERTIFICATION",
+      "subject_id": "SOC2",
+      "predicate": "status",
+      "normalized_value": "readiness",
+      "public_statement": "SYNTHETIC: SOC 2 readiness work is in progress; this is not a certification.",
+      "market": "ALL",
+      "plan": "",
+      "segment": "",
+      "locale": "en-US",
+      "billing_term": "",
+      "currency": "",
+      "status": "HOLD",
+      "operationally_enabled": true,
+      "publicly_publishable": true,
+      "valid_from": "2026-01-01T00:00:00Z",
+      "valid_until": "2099-12-31T00:00:00Z",
+      "authority_ref": "SYNTHETIC-PRICE-BOOK",
+      "evidence_source_version_ids": [
+        "src-trust-v1"
+      ],
+      "citation_url_key": "trust",
+      "approval_refs": [
+        "approval-commercial",
+        "approval-finance"
+      ],
+      "conflict_ids": [],
+      "synthetic": true
+    },
+    {
+      "claim_id": "c-integration-sampleledger",
+      "claim_revision": 1,
+      "claim_type": "INTEGRATION_STATUS",
+      "subject_id": "SampleLedger",
+      "predicate": "status",
+      "normalized_value": "partner_supported",
+      "public_statement": "SYNTHETIC: The SampleLedger connector is partner-supported.",
+      "market": "ALL",
+      "plan": "",
+      "segment": "",
+      "locale": "en-US",
+      "billing_term": "",
+      "currency": "",
+      "status": "ACTIVE",
+      "operationally_enabled": true,
+      "publicly_publishable": true,
+      "valid_from": "2026-01-01T00:00:00Z",
+      "valid_until": "2099-12-31T00:00:00Z",
+      "authority_ref": "SYNTHETIC-PRICE-BOOK",
+      "evidence_source_version_ids": [
+        "src-integrations-v1"
+      ],
+      "citation_url_key": "integrations",
+      "approval_refs": [
+        "approval-commercial",
+        "approval-finance"
+      ],
+      "conflict_ids": [],
+      "synthetic": true
+    },
+    {
+      "claim_id": "c-integration-futurebooks",
+      "claim_revision": 1,
+      "claim_type": "INTEGRATION_STATUS",
+      "subject_id": "FutureBooks",
+      "predicate": "status",
+      "normalized_value": "planned",
+      "public_statement": "SYNTHETIC: A FutureBooks connector is planned and not yet available.",
+      "market": "ALL",
+      "plan": "",
+      "segment": "",
+      "locale": "en-US",
+      "billing_term": "",
+      "currency": "",
+      "status": "ACTIVE",
+      "operationally_enabled": true,
+      "publicly_publishable": true,
+      "valid_from": "2026-01-01T00:00:00Z",
+      "valid_until": "2099-12-31T00:00:00Z",
+      "authority_ref": "SYNTHETIC-PRICE-BOOK",
+      "evidence_source_version_ids": [
+        "src-integrations-v1"
+      ],
+      "citation_url_key": "integrations",
+      "approval_refs": [
+        "approval-commercial",
+        "approval-finance"
+      ],
+      "conflict_ids": [],
+      "synthetic": true
+    }
+  ]
+}

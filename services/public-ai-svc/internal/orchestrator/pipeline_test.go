@@ -336,3 +336,26 @@ func TestOutOfScope(t *testing.T) {
 		t.Fatalf("got %+v", r)
 	}
 }
+
+// killDuringGenerate throws the kill switch while the model is generating.
+type killDuringGenerate struct {
+	inner model.Provider
+	flip  func()
+}
+
+func (k killDuringGenerate) Name() string { return k.inner.Name() }
+
+func (k killDuringGenerate) Generate(ctx context.Context, req model.Request) (model.Draft, error) {
+	k.flip()
+	return k.inner.Generate(ctx, req)
+}
+
+// CT-048: a kill switch thrown mid-flight withholds the active turn's final.
+func TestKillSwitchMidFlightWithholdsAnswer(t *testing.T) {
+	e := newEnv(t)
+	e.Pipeline.Model.Provider = killDuringGenerate{inner: e.Pipeline.Model.Provider, flip: func() { setFlag(t, e, flags.PublicAIEnabled, "false") }}
+	r := ask(e, "Which finance modules does ZoikoSuite include?", "")
+	if r.Status != contract.Unavailable || r.Reason != contract.ReasonKillSwitch || len(r.Citations) != 0 {
+		t.Fatalf("got %s %s %+v", r.Status, r.Reason, r.Citations)
+	}
+}

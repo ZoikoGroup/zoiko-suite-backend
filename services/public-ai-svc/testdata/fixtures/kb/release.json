@@ -100,37 +100,16 @@
   ],
   "synonyms": {
     "ar": [
-      "accounts receivable"
+      "accounts",
+      "receivable"
     ],
     "ap": [
-      "accounts payable"
+      "accounts",
+      "payable"
     ],
     "gl": [
-      "general ledger"
-    ],
-    "payables": [
-      "accounts payable"
-    ],
-    "receivables": [
-      "accounts receivable"
-    ],
-    "ledger": [
-      "general ledger"
-    ],
-    "hr": [
-      "human resources"
-    ],
-    "sso": [
-      "single sign-on"
-    ],
-    "mfa": [
-      "multi-factor authentication"
-    ],
-    "gst": [
-      "indirect taxes"
-    ],
-    "erp": [
-      "business operations platform"
+      "general",
+      "ledger"
     ]
   }
 }

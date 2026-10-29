@@ -21,6 +21,7 @@ var (
 	ErrProhibitedPhrase = errors.New("prohibited commitment phrase")
 	ErrUnsupportedFact  = errors.New("number not present in verified claims or evidence")
 	ErrInstructionLeak  = errors.New("output discusses instructions")
+	ErrToolInstruction  = errors.New("output contains a tool or function instruction")
 )
 
 var (
@@ -29,14 +30,19 @@ var (
 	phoneRe  = regexp.MustCompile(`\+?\d[\d\s().-]{7,}\d`)
 	markupRe = regexp.MustCompile(`(?i)<\s*/?\s*[a-z][^>]*>|javascript:|on[a-z]+\s*=|\]\(|!\[`)
 	numberRe = regexp.MustCompile(`\d+(?:[.,]\d+)*%?`)
-	leakRe   = regexp.MustCompile(`(?i)system prompt|my instructions|approved_public_evidence|verified_claim|L1-PROMPT`)
-	spaceRe  = regexp.MustCompile(`\s{2,}`)
+	toolRe   = regexp.MustCompile(`(?i)tool_call|function_call|"tool"\s*:|<\s*tool|call_tool|execute_action|"arguments"\s*:`)
+	// Also the uncleared working name: public UI says "ZoikoSuite Assistant".
+	leakRe  = regexp.MustCompile(`(?i)system prompt|my instructions|approved_public_evidence|verified_claim|L1-PROMPT|\bsuivo\b`)
+	spaceRe = regexp.MustCompile(`\s{2,}`)
 )
 
 // Prohibited unless a verified claim statement contains the exact phrase
 // (Doc 02 §16, Doc 10 §08).
 var prohibited = []string{"guarantee", "guaranteed", "fully compliant", "100%", "unlimited", "instant", "soc 2 certified",
-	"i booked you", "i have booked", "ticket created", "i opened your account", "automatically enrolled", "an agent will call"}
+	"i booked you", "i have booked", "ticket created", "i opened your account", "automatically enrolled", "an agent will call",
+	// Master prompt §4 step 10: banned absolutes and claims of having acted.
+	"100% compliant", "24/7", "round-the-clock", "works with every", "works with all", "i've booked", "i've submitted",
+	"i have submitted", "i've created", "i have created", "i've sent", "i have sent", "i've scheduled", "i have scheduled"}
 
 // Check validates a draft against the claims and evidence actually supplied.
 // It returns the cleaned text: model-produced URLs, emails and phone numbers
@@ -68,6 +74,9 @@ func Check(d model.Draft, claims []model.ClaimCard, evidence []model.Evidence) (
 	}
 
 	text := d.Text
+	if toolRe.MatchString(text) {
+		return "", ErrToolInstruction
+	}
 	if markupRe.MatchString(text) {
 		return "", ErrMarkup
 	}
