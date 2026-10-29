@@ -94,6 +94,20 @@ type DimensionRule struct {
 	From string `json:"from,omitempty"`
 }
 
+// DimensionMatch says when a combination applies: the line carries the dimension, with the value when one is given.
+type DimensionMatch struct {
+	Dimension string `json:"dimension"`
+	Value     string `json:"value,omitempty"`
+}
+
+// DimensionCombo is a rule-driven combination of dimensions (standard Â§13): where a line carries a dimension (and, when given, that value),
+// it must also carry the dimensions in Require and must not carry those in Forbid.
+type DimensionCombo struct {
+	When    DimensionMatch `json:"when"`
+	Require []string       `json:"require,omitempty"`
+	Forbid  []string       `json:"forbid,omitempty"`
+}
+
 // TaxDependency makes a rule wait for an authoritative tax result: without these facts no posting is proposed (AK-TAX).
 type TaxDependency struct {
 	RequiredFacts []string `json:"required_facts"`
@@ -101,15 +115,16 @@ type TaxDependency struct {
 
 // RuleContent is the declarative body of a rule set. Everything here is covered by the content hash.
 type RuleContent struct {
-	Conditions       []Condition     `json:"conditions,omitempty"`
-	LineTemplates    []LineTemplate  `json:"line_templates"`
-	RoundingPolicyID string          `json:"rounding_policy_id"`
-	RoundingAccount  *AccountRef     `json:"rounding_account,omitempty"`
-	DimensionRules   []DimensionRule `json:"dimension_rules,omitempty"`
-	TaxDependency    *TaxDependency  `json:"tax_dependency,omitempty"`
-	FXPolicyID       string          `json:"fx_policy_id,omitempty"`
-	RealizedFX       *RealizedFX     `json:"realized_fx,omitempty"`
-	ApprovalPolicyID string          `json:"approval_policy_id,omitempty"`
+	Conditions       []Condition      `json:"conditions,omitempty"`
+	LineTemplates    []LineTemplate   `json:"line_templates"`
+	RoundingPolicyID string           `json:"rounding_policy_id"`
+	RoundingAccount  *AccountRef      `json:"rounding_account,omitempty"`
+	DimensionRules   []DimensionRule  `json:"dimension_rules,omitempty"`
+	DimensionCombos  []DimensionCombo `json:"dimension_combinations,omitempty"`
+	TaxDependency    *TaxDependency   `json:"tax_dependency,omitempty"`
+	FXPolicyID       string           `json:"fx_policy_id,omitempty"`
+	RealizedFX       *RealizedFX      `json:"realized_fx,omitempty"`
+	ApprovalPolicyID string           `json:"approval_policy_id,omitempty"`
 }
 
 // TestCase is one regression case of a rule set's test pack: an event, what the directory resolves, and what must come
@@ -325,6 +340,25 @@ func (c *RuleContent) Validate() error {
 			}
 		default:
 			return bad(at+"mode", "REQUIRED, OPTIONAL, DERIVED or PROHIBITED")
+		}
+	}
+	if len(c.DimensionCombos) > 20 {
+		return bad("dimension_combinations", "at most 20 combinations")
+	}
+	for i, cb := range c.DimensionCombos {
+		at := fmt.Sprintf("dimension_combinations[%d].", i)
+		if !codeRE.MatchString(cb.When.Dimension) || len(cb.When.Value) > 120 {
+			return bad(at+"when", "a dimension code and, optionally, a value")
+		}
+		if len(cb.Require)+len(cb.Forbid) == 0 || len(cb.Require) > 10 || len(cb.Forbid) > 10 {
+			return bad(at+"require", "a combination requires or forbids at least one dimension, and at most 10 each")
+		}
+		seenDim := map[string]bool{cb.When.Dimension: true}
+		for _, d := range append(append([]string{}, cb.Require...), cb.Forbid...) {
+			if !codeRE.MatchString(d) || seenDim[d] {
+				return bad(at+"require", "each dimension once, and not the one the combination is about")
+			}
+			seenDim[d] = true
 		}
 	}
 	if c.TaxDependency != nil {

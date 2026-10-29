@@ -83,4 +83,6 @@ var ErrReconciliationCaseNotOpen = errorString("the reconciliation case is not o
 type AccountControl struct {
 	ControlType          string
 	CounterpartyRequired bool
+	// DimensionPolicy is the account's dimension policy: REQUIRED, OPTIONAL or PROHIBITED by dimension.
+	DimensionPolicy map[string]string
 }

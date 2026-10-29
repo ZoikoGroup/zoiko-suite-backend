@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -115,11 +116,13 @@ type scopeStore interface {
 }
 
 type scopeBody struct {
-	BookIDs                 []string `json:"book_ids"`
-	CurrencyRestriction     string   `json:"currency_restriction"`
-	ControlType             string   `json:"control_type"`
-	CounterpartyRequired    bool     `json:"counterparty_required"`
-	DirectPostingRestricted *bool    `json:"direct_posting_restricted,omitempty"`
+	BookIDs                 []string          `json:"book_ids"`
+	CurrencyRestriction     string            `json:"currency_restriction"`
+	ControlType             string            `json:"control_type"`
+	CounterpartyRequired    bool              `json:"counterparty_required"`
+	DirectPostingRestricted *bool             `json:"direct_posting_restricted,omitempty"`
+	DimensionPolicy         map[string]string `json:"dimension_policy,omitempty"`
+	ReplacementAccount      string            `json:"replacement_account,omitempty"`
 }
 
 // ControlTypes are the areas that can own a control account (§12).
@@ -152,10 +155,11 @@ func (h *KernelHandler) GetAccountScope(w http.ResponseWriter, r *http.Request) 
 	if sc.BookIDs == nil {
 		sc.BookIDs = []string{}
 	}
-	writeJSON(w, http.StatusOK, scopeBody{BookIDs: sc.BookIDs, CurrencyRestriction: sc.Currency, ControlType: sc.ControlType, CounterpartyRequired: sc.CounterpartyRequired})
+	writeJSON(w, http.StatusOK, scopeBody{BookIDs: sc.BookIDs, CurrencyRestriction: sc.Currency, ControlType: sc.ControlType, CounterpartyRequired: sc.CounterpartyRequired,
+		DimensionPolicy: sc.DimensionPolicy, ReplacementAccount: sc.ReplacementAccount})
 }
 
-// SetAccountScope sets an account's books, currency, control type and counterparty rule. An empty body lifts every restriction.
+// SetAccountScope sets an account's books, currency, control type, counterparty rule, dimension policy and replacement account. An empty body\n// lifts every restriction.
 func (h *KernelHandler) SetAccountScope(w http.ResponseWriter, r *http.Request) {
 	var req scopeBody
 	if !decodeJSON(w, r, &req) {
@@ -184,7 +188,8 @@ func (h *KernelHandler) SetAccountScope(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	code := chi.URLParam(r, "account_code")
-	sc := kernel.AccountScope{BookIDs: req.BookIDs, Currency: req.CurrencyRestriction, ControlType: req.ControlType, CounterpartyRequired: req.CounterpartyRequired, DirectPostingRestricted: req.DirectPostingRestricted}
+	sc := kernel.AccountScope{BookIDs: req.BookIDs, Currency: req.CurrencyRestriction, ControlType: req.ControlType, CounterpartyRequired: req.CounterpartyRequired, DirectPostingRestricted: req.DirectPostingRestricted,
+		DimensionPolicy: req.DimensionPolicy, ReplacementAccount: strings.TrimSpace(req.ReplacementAccount)}
 	if err := s.SetAccountScope(r.Context(), tenant, code, sc, a); err != nil {
 		h.fail(w, err)
 		return

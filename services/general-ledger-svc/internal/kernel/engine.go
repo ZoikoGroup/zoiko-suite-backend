@@ -34,6 +34,10 @@ type AccountInfo struct {
 	ControlType          string
 	CounterpartyRequired bool
 	DimensionPolicy      map[string]string // dimension -> REQUIRED | PROHIBITED | OPTIONAL
+	// Replacement is the account a retired account names as its replacement; ReplacedFrom lists the retired accounts the directory followed
+	// to reach this one, so the evidence can say a posting was mapped forward.
+	Replacement  string
+	ReplacedFrom []string
 }
 
 // Directory is the reference data an evaluation reads: currency precision, the chart and the dimension registry. It is
@@ -211,6 +215,9 @@ func Evaluate(ctx context.Context, in EvalInput) (*Proposal, error) {
 		info, aerr := in.Directory.ResolveAccount(ctx, t.Account, bk.BookID, in.PostingDate)
 		if aerr != nil {
 			return nil, exc(FamCOA, "ACCOUNT_UNRESOLVED", "%s (%s): %v", t.LineRef, t.Account, aerr).with("line_ref", t.LineRef)
+		}
+		if info != nil && len(info.ReplacedFrom) > 0 {
+			step("coa", t.LineRef+": "+strings.Join(info.ReplacedFrom, ", ")+" is retired and maps forward to "+info.Code)
 		}
 		if info == nil || !info.Active || !info.Postable {
 			return nil, exc(FamCOA, "ACCOUNT_NOT_POSTABLE", "%s resolves to an account that is inactive or a header account", t.LineRef).with("line_ref", t.LineRef)
@@ -476,6 +483,21 @@ func resolveDimensions(ctx context.Context, in EvalInput, c RuleContent, t LineT
 			}
 		}
 	}
+	for _, c := range c.DimensionCombos {
+		if dims[c.When.Dimension] == "" || (c.When.Value != "" && dims[c.When.Dimension] != c.When.Value) {
+			continue
+		}
+		for _, r := range c.Require {
+			if dims[r] == "" {
+				return nil, exc(FamDim, "DIMENSION_COMBINATION_REQUIRED", "line %s: %s%s requires dimension %s", t.LineRef, c.When.Dimension, whenValue(c.When), r).with("line_ref", t.LineRef)
+			}
+		}
+		for _, f := range c.Forbid {
+			if dims[f] != "" {
+				return nil, exc(FamDim, "DIMENSION_COMBINATION_FORBIDDEN", "line %s: %s%s forbids dimension %s", t.LineRef, c.When.Dimension, whenValue(c.When), f).with("line_ref", t.LineRef)
+			}
+		}
+	}
 	for _, d := range sortedKeys(dims) {
 		if dims[d] == "" {
 			delete(dims, d)
@@ -597,4 +619,12 @@ func lineRef(ev *AccountingEvent, t LineTemplate, v string, fam, code, what stri
 		return "", exc(fam, code+"_INVALID", "%s: the reference %q to %s is longer than 200 characters", t.LineRef, f, what).with("line_ref", t.LineRef)
 	}
 	return ref, nil
+}
+
+// whenValue words the value a combination applies to.
+func whenValue(w DimensionMatch) string {
+	if w.Value == "" {
+		return ""
+	}
+	return " = " + w.Value
 }
