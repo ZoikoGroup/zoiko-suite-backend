@@ -451,15 +451,15 @@ func TestPostedJournalsAreImmutable(t *testing.T) {
 	jid := e.mustPost(t, e.registerEvent(t, "se-imm", "120.00", "100.00", "20.00"), book)["journal_id"].(string)
 
 	for what, q := range map[string]string{
-		"edit the description":        `UPDATE journal_headers SET description='changed' WHERE journal_id=$1::uuid`,
-		"edit the posting date":       `UPDATE journal_headers SET posting_date='2026-01-01' WHERE journal_id=$1::uuid`,
-		"edit the number":             `UPDATE journal_headers SET journal_number='JE-2026-999999' WHERE journal_id=$1::uuid`,
-		"edit the hash":               `UPDATE journal_headers SET journal_hash='x' WHERE journal_id=$1::uuid`,
-		"take it back to pending":     `UPDATE journal_headers SET status='PENDING' WHERE journal_id=$1::uuid`,
-		"delete it":                   `DELETE FROM journal_headers WHERE journal_id=$1::uuid`,
-		"edit a line":                 `UPDATE journal_lines SET debit_amount=999 WHERE journal_id=$1::uuid AND line_number=1`,
-		"delete a line":               `DELETE FROM journal_lines WHERE journal_id=$1::uuid AND line_number=1`,
-		"add a line to a sealed one":  `INSERT INTO journal_lines (journal_line_id, journal_id, tenant_id, line_number, account_code, debit_amount, credit_amount) SELECT gen_random_uuid(), journal_id, tenant_id, 9, '1100', 1, 0 FROM journal_headers WHERE journal_id=$1::uuid`,
+		"edit the description":       `UPDATE journal_headers SET description='changed' WHERE journal_id=$1::uuid`,
+		"edit the posting date":      `UPDATE journal_headers SET posting_date='2026-01-01' WHERE journal_id=$1::uuid`,
+		"edit the number":            `UPDATE journal_headers SET journal_number='JE-2026-999999' WHERE journal_id=$1::uuid`,
+		"edit the hash":              `UPDATE journal_headers SET journal_hash='x' WHERE journal_id=$1::uuid`,
+		"take it back to pending":    `UPDATE journal_headers SET status='PENDING' WHERE journal_id=$1::uuid`,
+		"delete it":                  `DELETE FROM journal_headers WHERE journal_id=$1::uuid`,
+		"edit a line":                `UPDATE journal_lines SET debit_amount=999 WHERE journal_id=$1::uuid AND line_number=1`,
+		"delete a line":              `DELETE FROM journal_lines WHERE journal_id=$1::uuid AND line_number=1`,
+		"add a line to a sealed one": `INSERT INTO journal_lines (journal_line_id, journal_id, tenant_id, line_number, account_code, debit_amount, credit_amount) SELECT gen_random_uuid(), journal_id, tenant_id, 9, '1100', 1, 0 FROM journal_headers WHERE journal_id=$1::uuid`,
 	} {
 		wantRefused(t, what, e.asApp(e.tenant, q, jid), "")
 	}

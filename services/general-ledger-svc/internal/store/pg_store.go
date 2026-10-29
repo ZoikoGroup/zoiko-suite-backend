@@ -66,7 +66,7 @@ const journalHeaderColumns = `
 	correction_of_journal_id, soft_close_override_reason,
 	journal_number, accounting_book_id, source_accounting_event_id, posting_execution_id, journal_hash,
 	journal_purpose, correction_kind, reversal_reason, copy_of_journal_id, recurring_template_id,
-	withdrawn_at, withdrawn_by_principal_id, withdrawn_reason, reconciliation_case_id`
+	withdrawn_at, withdrawn_by_principal_id, withdrawn_reason, reconciliation_case_id, evidence_bundle_id`
 
 // scanHeaderTargets returns scan destinations matching journalHeaderColumns,
 // column for column. status and approvalStatus are scanned into plain
@@ -93,7 +93,7 @@ func scanHeaderTargets(h *domain.JournalHeader, status, approvalStatus *string) 
 		&h.CorrectionOfJournalID, &h.SoftCloseOverrideReason,
 		&h.JournalNumber, &h.AccountingBookID, &h.SourceAccountingEventID, &h.PostingExecutionID, &h.JournalHash,
 		&h.JournalPurpose, &h.CorrectionKind, &h.ReversalReason, &h.CopyOfJournalID, &h.RecurringTemplateID,
-		&h.WithdrawnAt, &h.WithdrawnByPrincipalID, &h.WithdrawnReason, &h.ReconciliationCaseID,
+		&h.WithdrawnAt, &h.WithdrawnByPrincipalID, &h.WithdrawnReason, &h.ReconciliationCaseID, &h.EvidenceBundleID,
 	}
 }
 
@@ -101,14 +101,14 @@ const journalLineColumns = `
 	journal_line_id, journal_id, line_number, account_code,
 	debit_amount, credit_amount, COALESCE(description, ''),
 	tax_code, tax_logic_snapshot_id, dimensions,
-	transaction_amount::text, transaction_currency, exchange_rate::text, rate_ref, posting_rule_line_ref, counterparty_id`
+	transaction_amount::text, transaction_currency, exchange_rate::text, rate_ref, posting_rule_line_ref, counterparty_id, tax_detail_ref`
 
 func scanLineTargets(l *domain.JournalLine) []any {
 	return []any{
 		&l.JournalLineID, &l.JournalID, &l.LineNumber, &l.AccountCode,
 		&l.DebitAmount, &l.CreditAmount, &l.Description,
 		&l.TaxCode, &l.TaxLogicSnapshotID, &l.Dimensions,
-		&l.TransactionAmount, &l.TransactionCcy, &l.ExchangeRate, &l.RateRef, &l.PostingRuleLineRef, &l.CounterpartyID,
+		&l.TransactionAmount, &l.TransactionCcy, &l.ExchangeRate, &l.RateRef, &l.PostingRuleLineRef, &l.CounterpartyID, &l.TaxDetailRef,
 	}
 }
 
@@ -279,10 +279,10 @@ func insertJournal(ctx context.Context, tx pgx.Tx, tenantID string, h *domain.Jo
 			soft_close_override_reason,
 			journal_number, accounting_book_id, source_accounting_event_id, posting_execution_id, journal_hash,
 			journal_purpose, correction_kind, reversal_reason, copy_of_journal_id, recurring_template_id,
-			withdrawn_at, withdrawn_by_principal_id, withdrawn_reason, reconciliation_case_id
+			withdrawn_at, withdrawn_by_principal_id, withdrawn_reason, reconciliation_case_id, evidence_bundle_id
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
 		          $19, $20, $21, $22, $23, $24, $25, $26, $27,
-		          $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41)
+		          $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42)
 		ON CONFLICT (tenant_id, correlation_id) WHERE correlation_id != '' DO NOTHING
 	`, h.JournalID, tenantID, h.LegalEntityID, h.FiscalPeriod, string(h.Status),
 		h.ReversalOfJournalID, h.Description, h.CreatedByPrincipalID,
@@ -294,7 +294,7 @@ func insertJournal(ctx context.Context, tx pgx.Tx, tenantID string, h *domain.Jo
 		h.SoftCloseOverrideReason,
 		h.JournalNumber, h.AccountingBookID, h.SourceAccountingEventID, h.PostingExecutionID, h.JournalHash,
 		h.JournalPurpose, h.CorrectionKind, h.ReversalReason, h.CopyOfJournalID, h.RecurringTemplateID,
-		h.WithdrawnAt, h.WithdrawnByPrincipalID, h.WithdrawnReason, h.ReconciliationCaseID)
+		h.WithdrawnAt, h.WithdrawnByPrincipalID, h.WithdrawnReason, h.ReconciliationCaseID, h.EvidenceBundleID)
 	if err != nil {
 		return nil, false, mapPgError(err)
 	}
@@ -331,12 +331,12 @@ func insertJournal(ctx context.Context, tx pgx.Tx, tenantID string, h *domain.Jo
 				journal_line_id, journal_id, tenant_id, line_number,
 				account_code, debit_amount, credit_amount, description,
 				tax_code, tax_logic_snapshot_id, dimensions,
-				transaction_amount, transaction_currency, exchange_rate, rate_ref, posting_rule_line_ref, counterparty_id
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::numeric, $13, $14::numeric, $15, $16, $17)
+				transaction_amount, transaction_currency, exchange_rate, rate_ref, posting_rule_line_ref, counterparty_id, tax_detail_ref
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::numeric, $13, $14::numeric, $15, $16, $17, $18)
 		`, lines[i].JournalLineID, h.JournalID, tenantID, lines[i].LineNumber,
 			lines[i].AccountCode, lines[i].DebitAmount, lines[i].CreditAmount, lines[i].Description,
 			lines[i].TaxCode, lines[i].TaxLogicSnapshotID, lines[i].Dimensions,
-			lines[i].TransactionAmount, lines[i].TransactionCcy, lines[i].ExchangeRate, lines[i].RateRef, lines[i].PostingRuleLineRef, lines[i].CounterpartyID); err != nil {
+			lines[i].TransactionAmount, lines[i].TransactionCcy, lines[i].ExchangeRate, lines[i].RateRef, lines[i].PostingRuleLineRef, lines[i].CounterpartyID, lines[i].TaxDetailRef); err != nil {
 			return nil, false, mapPgError(err)
 		}
 	}

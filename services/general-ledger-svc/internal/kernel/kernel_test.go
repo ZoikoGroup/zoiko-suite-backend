@@ -323,6 +323,45 @@ func TestTaxDependency(t *testing.T) {
 	}
 }
 
+// A line that rests on a tax determination links to it (§8.2): by the reference the event carries or by a fixed one. A line whose
+// determination the event does not carry is refused rather than posted unlinked.
+func TestTaxDetailLinksTheLine(t *testing.T) {
+	c := invoiceContent()
+	c.LineTemplates[2].TaxDetail = "$facts.tax_determination_id"
+	c.LineTemplates[1].TaxDetail = "TAXCODE-STD"
+	if err := rule(c).Validate(); err != nil {
+		t.Fatal(err)
+	}
+	f := okFacts()
+	f["tax_determination_id"] = " td-77 "
+	p, err := eval(t, event(f), rule(c), dir(), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, l := range p.Lines {
+		got[l.LineRef] = l.TaxDetailRef
+	}
+	if got["L1"] != "" || got["L2"] != "TAXCODE-STD" || got["L3"] != "td-77" {
+		t.Fatalf("tax detail refs = %v", got)
+	}
+	// the link is part of what was proposed, so a different determination is a different proposal
+	f["tax_determination_id"] = "td-78"
+	p2, err := eval(t, event(f), rule(c), dir(), nil, nil)
+	if err != nil || p2.ProposalHash == p.ProposalHash {
+		t.Fatalf("a different determination must change the proposal: %v", err)
+	}
+	_, err = eval(t, event(okFacts()), rule(c), dir(), nil, nil)
+	wantFam(t, err, FamTax, "TAX_DETAIL_MISSING")
+	// a line that is not produced for this event does not need its determination
+	nt := okFacts()
+	nt["tax"] = "0"
+	nt["gross"], nt["net"] = "100.00", "100.00"
+	if _, err := eval(t, event(nt), rule(c), dir(), nil, nil); err != nil {
+		t.Fatalf("an event with no tax line needs no tax determination: %v", err)
+	}
+}
+
 func TestAccountAndDimensionControls(t *testing.T) {
 	d := dir()
 	d.accounts["map:REV"] = &AccountInfo{Code: "4000", Postable: false, Active: true}
@@ -404,6 +443,9 @@ func TestRuleSetValidation(t *testing.T) {
 		"derived needs from": func(r *RuleSet) { r.Content.DimensionRules = []DimensionRule{{Dimension: "p", Mode: DimDerived}} },
 		"unknown dim mode":   func(r *RuleSet) { r.Content.DimensionRules = []DimensionRule{{Dimension: "p", Mode: "MAYBE"}} },
 		"empty tax facts":    func(r *RuleSet) { r.Content.TaxDependency = &TaxDependency{} },
+		"tax detail fact":    func(r *RuleSet) { r.Content.LineTemplates[2].TaxDetail = "$facts.not a name" },
+		"tax detail padded":  func(r *RuleSet) { r.Content.LineTemplates[2].TaxDetail = " TD-1 " },
+		"tax detail long":    func(r *RuleSet) { r.Content.LineTemplates[2].TaxDetail = strings.Repeat("x", 201) },
 	} {
 		if err := mut(f); err == nil {
 			t.Errorf("%s must be refused", name)

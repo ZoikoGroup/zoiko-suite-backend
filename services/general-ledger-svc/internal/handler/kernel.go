@@ -34,12 +34,12 @@ const (
 // KernelHandler serves the Global Accounting Kernel: books, accounting events, posting rule sets, evaluation and
 // dimensions. Evaluation is a dry run: nothing here writes a journal.
 type KernelHandler struct {
-	svc   *kernel.Service
-	repo  kernel.Repo
-	ref   kernel.RefData
-	units kernel.CurrencyUnits
-	fx    kernel.FXSource
-	authz AuthZClient
+	svc    *kernel.Service
+	repo   kernel.Repo
+	ref    kernel.RefData
+	units  kernel.CurrencyUnits
+	fx     kernel.FXSource
+	authz  AuthZClient
 	gate   kernel.PeriodGate
 	signer kernel.Signer
 	obs    kernel.Observer

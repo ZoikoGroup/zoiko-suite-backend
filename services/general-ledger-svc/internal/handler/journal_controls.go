@@ -506,7 +506,6 @@ func ParseManualJournalPolicy(threshold, types string) (ManualJournalPolicy, err
 	return p, nil
 }
 
-
 // checkWave2Controls applies the subledger-aware rules of §12 and §17 to a manual journal: a line on an AR or AP control
 // account (or any account flagged for it) names its counterparty, and a reconciliation adjustment names the open case it settles.
 // Writes its own response and returns false on a refusal.

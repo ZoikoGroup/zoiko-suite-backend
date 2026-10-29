@@ -22,9 +22,9 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/general-ledger-svc/internal/domain"
+	svcenvelope "zoiko.io/general-ledger-svc/internal/envelope"
 	"zoiko.io/general-ledger-svc/internal/handler"
 	"zoiko.io/general-ledger-svc/internal/kernel"
-	svcenvelope "zoiko.io/general-ledger-svc/internal/envelope"
 	svcmiddleware "zoiko.io/general-ledger-svc/internal/middleware"
 	"zoiko.io/general-ledger-svc/internal/store"
 )
@@ -33,14 +33,14 @@ import (
 // force, the guard triggers refuse what the service would never ask for, and the HTTP surface is exercised end to end.
 
 type kenv struct {
-	admin  *pgxpool.Pool
-	app    *pgxpool.Pool
-	repo   *store.KernelRepo
-	svc    *kernel.Service
-	tenant string
-	entity string
-	ts     *httptest.Server
-	denied sync.Map
+	admin   *pgxpool.Pool
+	app     *pgxpool.Pool
+	repo    *store.KernelRepo
+	svc     *kernel.Service
+	tenant  string
+	entity  string
+	ts      *httptest.Server
+	denied  sync.Map
 	periods *fakePeriods
 	pg      *store.PgStore
 	obs     *recObs

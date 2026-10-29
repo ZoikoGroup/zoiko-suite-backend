@@ -345,13 +345,13 @@ func TestReconciliationCaseLifecycle(t *testing.T) {
 
 	// the run itself never changes
 	for what, q := range map[string]string{
-		"change the totals":          `UPDATE reconciliation_runs SET actual_total = 0, expected_total = 0, difference = 0 WHERE reconciliation_run_id=$1::uuid`,
-		"change the populations":     `UPDATE reconciliation_runs SET population_a = '{}'::jsonb WHERE reconciliation_run_id=$1::uuid`,
-		"delete the run":             `DELETE FROM reconciliation_runs WHERE reconciliation_run_id=$1::uuid`,
-		"reopen a resolved case":     `UPDATE reconciliation_runs SET status='BREAK' WHERE reconciliation_run_id=$1::uuid`,
-		"turn a break into a match":  `UPDATE reconciliation_runs SET status='MATCHED' WHERE reconciliation_run_id=$1::uuid`,
-		"rewrite the history":        `UPDATE reconciliation_case_events SET actor='x' WHERE reconciliation_run_id=$1::uuid`,
-		"delete the history":         `DELETE FROM reconciliation_case_events WHERE reconciliation_run_id=$1::uuid`,
+		"change the totals":         `UPDATE reconciliation_runs SET actual_total = 0, expected_total = 0, difference = 0 WHERE reconciliation_run_id=$1::uuid`,
+		"change the populations":    `UPDATE reconciliation_runs SET population_a = '{}'::jsonb WHERE reconciliation_run_id=$1::uuid`,
+		"delete the run":            `DELETE FROM reconciliation_runs WHERE reconciliation_run_id=$1::uuid`,
+		"reopen a resolved case":    `UPDATE reconciliation_runs SET status='BREAK' WHERE reconciliation_run_id=$1::uuid`,
+		"turn a break into a match": `UPDATE reconciliation_runs SET status='MATCHED' WHERE reconciliation_run_id=$1::uuid`,
+		"rewrite the history":       `UPDATE reconciliation_case_events SET actor='x' WHERE reconciliation_run_id=$1::uuid`,
+		"delete the history":        `DELETE FROM reconciliation_case_events WHERE reconciliation_run_id=$1::uuid`,
 	} {
 		wantRefused(t, what, w.asApp(w.tenant, q, id), "")
 	}

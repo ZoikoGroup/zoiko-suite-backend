@@ -254,6 +254,9 @@ type JournalHeader struct {
 	SourceAccountingEventID *string `json:"source_accounting_event_id,omitempty"`
 	PostingExecutionID      *string `json:"posting_execution_id,omitempty"`
 	JournalHash             *string `json:"journal_hash,omitempty"`
+	// EvidenceBundleID identifies the evidence chain behind the journal (§8.1). It is the bundle an event named or, failing that,
+	// the one the journal's evidence references make up.
+	EvidenceBundleID *string `json:"evidence_bundle_id,omitempty"`
 
 	// JournalPurpose is the controlled classification a manual journal must carry (§9). CorrectionKind and
 	// ReversalReason record the nature of a correction (§11), so a policy change is never filed as an error correction.
@@ -317,6 +320,8 @@ type JournalLine struct {
 	ExchangeRate       *string `json:"exchange_rate,omitempty"`
 	RateRef            *string `json:"rate_ref,omitempty"`
 	PostingRuleLineRef *string `json:"posting_rule_line_ref,omitempty"`
+	// TaxDetailRef links the line to the authoritative tax determination it rests on (§8.2).
+	TaxDetailRef *string `json:"tax_detail_ref,omitempty"`
 
 	// CounterpartyID is the customer or supplier a line on a subledger control account belongs to (standard §8.2, §12).
 	CounterpartyID *string `json:"counterparty_id,omitempty"`

@@ -26,14 +26,14 @@ type AccountInfo struct {
 	Code               string
 	Postable           bool // header/parent accounts are not
 	Active             bool
-	CurrencyRestricted []string          // empty = any
-	BookIDs            []string          // books the account is valid in; empty = every book
+	CurrencyRestricted []string // empty = any
+	BookIDs            []string // books the account is valid in; empty = every book
 	// ControlType is the subledger or system area that owns the account (AR, AP, BANK, ...); empty for an ordinary account.
 	// CounterpartyRequired makes a line on the account carry the counterparty (customer, supplier). The AR and AP control
 	// accounts always do: a receivable or payable with no one it is owed by or to cannot be reconciled to its subledger.
 	ControlType          string
 	CounterpartyRequired bool
-	DimensionPolicy    map[string]string // dimension -> REQUIRED | PROHIBITED | OPTIONAL
+	DimensionPolicy      map[string]string // dimension -> REQUIRED | PROHIBITED | OPTIONAL
 }
 
 // Directory is the reference data an evaluation reads: currency precision, the chart and the dimension registry. It is
@@ -69,6 +69,7 @@ type ProposalLine struct {
 	RealizedFX       bool              `json:"realized_fx,omitempty"`
 	CounterpartyID   string            `json:"counterparty_id,omitempty"`
 	ControlType      string            `json:"control_type,omitempty"`
+	TaxDetailRef     string            `json:"tax_detail_ref,omitempty"`
 }
 
 // Provenance identifies the rule that produced a proposal (AK-INV-008).
@@ -119,6 +120,7 @@ type rawLine struct {
 	funcMn *big.Int
 	round  bool
 	cp     string
+	taxRef string
 	// fixed is a functional amount the rule stated (carrying basis), exempt from conversion; realized marks the realized-FX line.
 	fixed    *big.Rat
 	realized bool
@@ -242,7 +244,16 @@ func Evaluate(ctx context.Context, in EvalInput) (*Proposal, error) {
 			}
 			step("carrying", t.LineRef+": functional "+t.Functional+" = "+ratString(fixed)+" (retired at its carrying amount)")
 		}
-		lines = append(lines, &rawLine{t: t, minor: minor, acct: info, dims: dims, exact: exact, cp: cp, fixed: fixed})
+		taxRef := t.TaxDetail
+		if f, ok := strings.CutPrefix(t.TaxDetail, "$facts."); ok {
+			if taxRef = strings.TrimSpace(ev.Facts[f]); taxRef == "" {
+				return nil, exc(FamTax, "TAX_DETAIL_MISSING", "%s links to the tax determination %q and the event does not carry it", t.LineRef, f).with("line_ref", t.LineRef).with("fact", f)
+			}
+			if len(taxRef) > 200 {
+				return nil, exc(FamTax, "TAX_DETAIL_INVALID", "%s: the tax determination reference %q is longer than 200 characters", t.LineRef, f).with("line_ref", t.LineRef)
+			}
+		}
+		lines = append(lines, &rawLine{t: t, minor: minor, acct: info, dims: dims, exact: exact, cp: cp, fixed: fixed, taxRef: taxRef})
 	}
 	if len(lines) < 2 {
 		return nil, exc(FamRule, "NO_LINES", "the rule produced fewer than two lines for this event")
@@ -352,7 +363,7 @@ func Evaluate(ctx context.Context, in EvalInput) (*Proposal, error) {
 		prov.Branch = append(prov.Branch, l.t.LineRef)
 		p.Lines = append(p.Lines, ProposalLine{LineNo: i + 1, LineRef: l.t.LineRef, Side: l.t.Side, AccountCode: l.acct.Code,
 			AmountTx: FormatMinor(l.minor, tscale), Currency: tccy, AmountFunctional: FormatMinor(l.funcMn, fscale), Dimensions: l.dims,
-			Description: l.t.Description, Rounding: l.round, RealizedFX: l.realized, CounterpartyID: l.cp, ControlType: l.acct.ControlType})
+			Description: l.t.Description, Rounding: l.round, RealizedFX: l.realized, CounterpartyID: l.cp, ControlType: l.acct.ControlType, TaxDetailRef: l.taxRef})
 	}
 	p.Provenance, p.Trace = prov, trace
 	b, _ := json.Marshal(struct {

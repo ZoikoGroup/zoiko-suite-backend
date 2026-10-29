@@ -64,6 +64,9 @@ type LineTemplate struct {
 	// carrying amount it was recognised and revalued at; the difference from what the settlement is worth is the realized
 	// exchange difference (standard §24).
 	Functional string `json:"functional,omitempty"`
+	// TaxDetail links the line to the authoritative tax determination it rests on (standard §8.2): a literal reference or
+	// "$facts.<name>" for the one the event carries. A line that names a fact the event lacks is refused as AK-TAX.
+	TaxDetail string `json:"tax_detail,omitempty"`
 }
 
 // RealizedFX names the accounts a realized exchange difference is posted to. A rule that settles items at their carrying
@@ -119,7 +122,7 @@ type TestCase struct {
 	// Controls gives the control type of an account code the case resolves to (AR, AP, ...), so a case can exercise the
 	// counterparty rule of a control account.
 	Controls map[string]string `json:"control_types,omitempty"`
-	Expect     TestExpectation   `json:"expect"`
+	Expect   TestExpectation   `json:"expect"`
 }
 
 // TestEvent is the part of an event a rule looks at.
@@ -286,6 +289,15 @@ func (c *RuleContent) Validate() error {
 		}
 		if err := validateConditions(t.When); err != nil {
 			return bad(at+"when", err.Error())
+		}
+		if t.TaxDetail != "" {
+			if f, ok := strings.CutPrefix(t.TaxDetail, "$facts."); ok {
+				if !identRE.MatchString(f) {
+					return bad(at+"tax_detail", f+" is not a fact name")
+				}
+			} else if strings.TrimSpace(t.TaxDetail) != t.TaxDetail || len(t.TaxDetail) > 200 {
+				return bad(at+"tax_detail", "a literal reference of at most 200 characters or $facts.x")
+			}
 		}
 		for d, v := range t.Dimensions {
 			if !codeRE.MatchString(d) || strings.TrimSpace(v) == "" || len(v) > 120 {
