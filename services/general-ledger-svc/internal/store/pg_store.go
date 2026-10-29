@@ -49,7 +49,7 @@ const MaxListLimit = 1000
 // journalHeaderColumns is the header SELECT list. It is a single const, and
 // scanHeaderTargets below is derived from it in the same order, because the
 // two drifting apart is the failure mode that hand-written pairs invite: this
-// service has four read paths over the same eighteen columns.
+// service has four read paths over the same columns.
 const journalHeaderColumns = `
 	journal_id, tenant_id, legal_entity_id, fiscal_period, status,
 	reversal_of_journal_id, description, created_by_principal_id,
@@ -63,7 +63,11 @@ const journalHeaderColumns = `
 	approved_at, approved_by_principal_id,
 	rejected_at, rejected_by_principal_id, rejection_reason,
 	posting_requested_at, posting_requested_by_principal_id,
-	correction_of_journal_id, soft_close_override_reason`
+	correction_of_journal_id, soft_close_override_reason,
+	close_journal_designation,
+	journal_number, accounting_book_id, source_accounting_event_id, posting_execution_id, journal_hash,
+	journal_purpose, correction_kind, reversal_reason, copy_of_journal_id, recurring_template_id,
+	withdrawn_at, withdrawn_by_principal_id, withdrawn_reason, reconciliation_case_id`
 
 // scanHeaderTargets returns scan destinations matching journalHeaderColumns,
 // column for column. status and approvalStatus are scanned into plain
@@ -88,19 +92,25 @@ func scanHeaderTargets(h *domain.JournalHeader, status, approvalStatus *string) 
 		&h.RejectedAt, &h.RejectedByPrincipalID, &h.RejectionReason,
 		&h.PostingRequestedAt, &h.PostingRequestedByPrincipalID,
 		&h.CorrectionOfJournalID, &h.SoftCloseOverrideReason,
+		&h.CloseJournalDesignation,
+		&h.JournalNumber, &h.AccountingBookID, &h.SourceAccountingEventID, &h.PostingExecutionID, &h.JournalHash,
+		&h.JournalPurpose, &h.CorrectionKind, &h.ReversalReason, &h.CopyOfJournalID, &h.RecurringTemplateID,
+		&h.WithdrawnAt, &h.WithdrawnByPrincipalID, &h.WithdrawnReason, &h.ReconciliationCaseID,
 	}
 }
 
 const journalLineColumns = `
 	journal_line_id, journal_id, line_number, account_code,
 	debit_amount, credit_amount, COALESCE(description, ''),
-	tax_code, tax_logic_snapshot_id, dimensions`
+	tax_code, tax_logic_snapshot_id, dimensions,
+	transaction_amount::text, transaction_currency, exchange_rate::text, rate_ref, posting_rule_line_ref, counterparty_id`
 
 func scanLineTargets(l *domain.JournalLine) []any {
 	return []any{
 		&l.JournalLineID, &l.JournalID, &l.LineNumber, &l.AccountCode,
 		&l.DebitAmount, &l.CreditAmount, &l.Description,
 		&l.TaxCode, &l.TaxLogicSnapshotID, &l.Dimensions,
+		&l.TransactionAmount, &l.TransactionCcy, &l.ExchangeRate, &l.RateRef, &l.PostingRuleLineRef, &l.CounterpartyID,
 	}
 }
 
@@ -268,9 +278,13 @@ func insertJournal(ctx context.Context, tx pgx.Tx, tenantID string, h *domain.Jo
 			source_event_id, governance_decision_id,
 			journal_type, transaction_date, posting_date, currency_code,
 			book_id, reporting_basis, evidence_refs, approval_status,
-			soft_close_override_reason
+			soft_close_override_reason, close_journal_designation,
+			journal_number, accounting_book_id, source_accounting_event_id, posting_execution_id, journal_hash,
+			journal_purpose, correction_kind, reversal_reason, copy_of_journal_id, recurring_template_id,
+			withdrawn_at, withdrawn_by_principal_id, withdrawn_reason, reconciliation_case_id
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
-		          $19, $20, $21, $22, $23, $24, $25, $26, $27)
+		          $19, $20, $21, $22, $23, $24, $25, $26, $27, $28,
+		          $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42)
 		ON CONFLICT (tenant_id, correlation_id) WHERE correlation_id != '' DO NOTHING
 	`, h.JournalID, tenantID, h.LegalEntityID, h.FiscalPeriod, string(h.Status),
 		h.ReversalOfJournalID, h.Description, h.CreatedByPrincipalID,
@@ -279,7 +293,10 @@ func insertJournal(ctx context.Context, tx pgx.Tx, tenantID string, h *domain.Jo
 		h.SourceEventID, h.GovernanceDecisionID,
 		h.JournalType, h.TransactionDate, h.PostingDate, h.CurrencyCode,
 		h.BookID, h.ReportingBasis, h.EvidenceRefs, string(h.ApprovalStatus),
-		h.SoftCloseOverrideReason)
+		h.SoftCloseOverrideReason, h.CloseJournalDesignation,
+		h.JournalNumber, h.AccountingBookID, h.SourceAccountingEventID, h.PostingExecutionID, h.JournalHash,
+		h.JournalPurpose, h.CorrectionKind, h.ReversalReason, h.CopyOfJournalID, h.RecurringTemplateID,
+		h.WithdrawnAt, h.WithdrawnByPrincipalID, h.WithdrawnReason, h.ReconciliationCaseID)
 	if err != nil {
 		return nil, false, mapPgError(err)
 	}
@@ -315,11 +332,13 @@ func insertJournal(ctx context.Context, tx pgx.Tx, tenantID string, h *domain.Jo
 			INSERT INTO journal_lines (
 				journal_line_id, journal_id, tenant_id, line_number,
 				account_code, debit_amount, credit_amount, description,
-				tax_code, tax_logic_snapshot_id, dimensions
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+				tax_code, tax_logic_snapshot_id, dimensions,
+				transaction_amount, transaction_currency, exchange_rate, rate_ref, posting_rule_line_ref, counterparty_id
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::numeric, $13, $14::numeric, $15, $16, $17)
 		`, lines[i].JournalLineID, h.JournalID, tenantID, lines[i].LineNumber,
 			lines[i].AccountCode, lines[i].DebitAmount, lines[i].CreditAmount, lines[i].Description,
-			lines[i].TaxCode, lines[i].TaxLogicSnapshotID, lines[i].Dimensions); err != nil {
+			lines[i].TaxCode, lines[i].TaxLogicSnapshotID, lines[i].Dimensions,
+			lines[i].TransactionAmount, lines[i].TransactionCcy, lines[i].ExchangeRate, lines[i].RateRef, lines[i].PostingRuleLineRef, lines[i].CounterpartyID); err != nil {
 			return nil, false, mapPgError(err)
 		}
 	}
@@ -395,6 +414,12 @@ func (s *PgStore) CreateJournal(ctx context.Context, h *domain.JournalHeader, li
 		if h.SoftCloseOverrideReason != nil && *h.SoftCloseOverrideReason != "" {
 			createdData["soft_close_override_reason"] = *h.SoftCloseOverrideReason
 		}
+		// The designation is the evidence that CLOSE_REVIEW's admission was
+		// based on a named close workflow, not on the caller's permission
+		// alone. Emit it alongside the created fact.
+		if h.CloseJournalDesignation != nil && *h.CloseJournalDesignation != "" {
+			createdData["close_journal_designation"] = *h.CloseJournalDesignation
+		}
 		if err := s.enqueueJournalEvent(ctx, tx, "created", h.TenantID, h.LegalEntityID,
 			h.JournalID, h.CreatedByPrincipalID, h.CorrelationID, createdData); err != nil {
 			return err
@@ -445,6 +470,33 @@ func (s *PgStore) ReverseJournal(
 		if !created {
 			return nil
 		}
+		if err := assertPeriodOpen(ctx, tx, tenantID, reversing.LegalEntityID, reversing.FiscalPeriod); err != nil {
+			return err
+		}
+
+		// A reversal of a kernel posting is itself an execution: it records who reversed what, why and under which
+		// rule version the original was posted (standard §11, §31.1).
+		if reversing.PostingExecutionID != nil {
+			reason := ""
+			if reversing.ReversalReason != nil {
+				reason = *reversing.ReversalReason
+			}
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO posting_executions (execution_id, tenant_id, legal_entity_id, kind, status, calculation_trace, correlation_id,
+					created_at, created_by_principal_id, committed_at, journal_id, accounting_event_id, accounting_book_id, posting_basis,
+					posting_rule_set_id, rule_version, proposal_hash)
+				SELECT $1::uuid, h.tenant_id, h.legal_entity_id, 'KERNEL_REVERSAL', 'COMMITTED',
+				       jsonb_build_object('reversal_of', h.journal_id, 'reason', $5::text, 'correction_kind', $6::text),
+				       $3, $4, $2, $4, $7::uuid, h.source_accounting_event_id, h.accounting_book_id, 'REVERSAL',
+				       l.posting_rule_set_id, l.rule_version, l.proposal_hash
+				FROM journal_headers h
+				LEFT JOIN event_posting_links l ON l.tenant_id = h.tenant_id AND l.journal_id = h.journal_id
+				WHERE h.tenant_id = $8::uuid AND h.journal_id = $9::uuid`,
+				*reversing.PostingExecutionID, actorPrincipalID, reversing.CorrelationID, time.Now().UTC(), reason,
+				reversing.CorrectionKind, reversing.JournalID, tenantID, originalJournalID); err != nil {
+				return mapPgError(err)
+			}
+		}
 
 		var origLegalEntityID, origCorrelationID string
 		err = tx.QueryRow(ctx, `
@@ -486,6 +538,9 @@ func (s *PgStore) ReverseJournal(
 		// journal.posted event: journal.reversed above is the reversal's event
 		// (outbox_atomicity_test pins that contract).
 		if err := appendLedgerEntries(ctx, tx, tenantID, reversing.JournalID); err != nil {
+			return err
+		}
+		if _, err := sealJournal(ctx, tx, tenantID, reversing.JournalID); err != nil {
 			return err
 		}
 
@@ -649,13 +704,13 @@ func (s *PgStore) TransitionJournal(ctx context.Context, tenantID, journalID str
 		UPDATE journal_headers
 		SET status = $1, %s = $2, %s = $3
 		WHERE journal_id = $4 AND status = $5 AND tenant_id = $6
-		RETURNING legal_entity_id::text, correlation_id
+		RETURNING legal_entity_id::text, correlation_id, fiscal_period
 	`, actorColumn, timeColumn)
 
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		var legalEntityID, correlationID string
+		var legalEntityID, correlationID, fiscalPeriod string
 		err := tx.QueryRow(ctx, query, string(toStatus), actorPrincipalID, time.Now().UTC(), journalID, string(fromStatus), tenantID).
-			Scan(&legalEntityID, &correlationID)
+			Scan(&legalEntityID, &correlationID, &fiscalPeriod)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return domain.ErrInvalidTransition
@@ -676,13 +731,21 @@ func (s *PgStore) TransitionJournal(ctx context.Context, tenantID, journalID str
 			// flip — never a second call a future call site could forget,
 			// the same bug class already hit twice this session with
 			// MarkJournalPosted. See migration 000011's doc comment.
+			if err := assertPeriodOpen(ctx, tx, tenantID, legalEntityID, fiscalPeriod); err != nil {
+				return err
+			}
 			if err := appendLedgerEntries(ctx, tx, tenantID, journalID); err != nil {
+				return err
+			}
+			number, err := sealJournal(ctx, tx, tenantID, journalID)
+			if err != nil {
 				return err
 			}
 
 			if err := s.enqueueJournalEvent(ctx, tx, "posted", tenantID, legalEntityID,
 				journalID, actorPrincipalID, correlationID, map[string]any{
-					"journal_id": journalID,
+					"journal_id":     journalID,
+					"journal_number": number,
 				}); err != nil {
 				return err
 			}
@@ -726,9 +789,10 @@ func appendLedgerEntries(ctx context.Context, tx pgx.Tx, tenantID, journalID str
 		       jl.debit_amount, jl.credit_amount, jl.dimensions,
 		       jh.legal_entity_id, COALESCE(jh.book_id, ''), jh.fiscal_period,
 		       jh.currency_code, jh.transaction_date, jh.posting_date,
-		       jh.source_event_id, jh.correlation_id
+		       jh.source_event_id, jh.correlation_id, jl.counterparty_id, coa.control_type, jl.transaction_amount::text, jl.transaction_currency
 		FROM journal_lines jl
 		JOIN journal_headers jh ON jh.journal_id = jl.journal_id
+		LEFT JOIN chart_of_accounts coa ON coa.tenant_id = jh.tenant_id AND coa.account_code = jl.account_code
 		WHERE jl.journal_id = $1 AND jh.tenant_id = $2
 	`, journalID, tenantID)
 	if err != nil {
@@ -741,13 +805,14 @@ func appendLedgerEntries(ctx context.Context, tx pgx.Tx, tenantID, journalID str
 		dimensions                                                                            domain.Dimensions
 		transactionDate, postingDate                                                          domain.Date
 		sourceEventID                                                                         *string
+		counterparty, controlType, txAmount, txCurrency                                       *string
 	}
 	var entries []entryRow
 	for rows.Next() {
 		var e entryRow
 		if err := rows.Scan(&e.lineID, &e.lineNumber, &e.accountCode, &e.debit, &e.credit, &e.dimensions,
 			&e.legalEntityID, &e.bookID, &e.fiscalPeriod, &e.currencyCode, &e.transactionDate, &e.postingDate,
-			&e.sourceEventID, &e.correlationID); err != nil {
+			&e.sourceEventID, &e.correlationID, &e.counterparty, &e.controlType, &e.txAmount, &e.txCurrency); err != nil {
 			rows.Close()
 			return mapPgError(err)
 		}
@@ -765,13 +830,14 @@ func appendLedgerEntries(ctx context.Context, tx pgx.Tx, tenantID, journalID str
 				ledger_entry_id, tenant_id, legal_entity_id, book_id, fiscal_period,
 				journal_id, journal_line_id, line_number, account_code,
 				debit_amount, credit_amount, currency_code, dimensions,
-				transaction_date, posting_date, source_event_id, correlation_id, created_at
-			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+				transaction_date, posting_date, source_event_id, correlation_id, created_at, counterparty_id, control_type,
+				transaction_amount, transaction_currency
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21::numeric,$22)
 			ON CONFLICT (tenant_id, journal_id, journal_line_id) DO NOTHING
 		`, uuid.NewString(), tenantID, e.legalEntityID, e.bookID, e.fiscalPeriod,
 			journalID, e.lineID, e.lineNumber, e.accountCode,
 			e.debit, e.credit, e.currencyCode, e.dimensions,
-			e.transactionDate, e.postingDate, e.sourceEventID, e.correlationID, now); err != nil {
+			e.transactionDate, e.postingDate, e.sourceEventID, e.correlationID, now, e.counterparty, e.controlType, e.txAmount, e.txCurrency); err != nil {
 			return mapPgError(err)
 		}
 	}
@@ -813,6 +879,21 @@ func (s *PgStore) QueryLedger(ctx context.Context, tenantID string, filter domai
 	if filter.MaxEntrySeq != nil {
 		args = append(args, *filter.MaxEntrySeq)
 		query += fmt.Sprintf(" AND entry_seq <= $%d", len(args))
+	}
+	if !filter.TransactionDateFrom.IsZero() {
+		args = append(args, filter.TransactionDateFrom.Time)
+		query += fmt.Sprintf(" AND transaction_date >= $%d", len(args))
+	}
+	if !filter.TransactionDateTo.IsZero() {
+		args = append(args, filter.TransactionDateTo.Time)
+		query += fmt.Sprintf(" AND transaction_date <= $%d", len(args))
+	}
+	if filter.JournalStatus != "" {
+		// The journal's current status, one indexed probe per candidate row
+		// (journal_headers' primary key), not a second query per entry.
+		args = append(args, string(filter.JournalStatus))
+		query += fmt.Sprintf(` AND EXISTS (SELECT 1 FROM journal_headers jh
+			WHERE jh.journal_id = ledger_entries.journal_id AND jh.tenant_id = ledger_entries.tenant_id AND jh.status = $%d)`, len(args))
 	}
 	args = append(args, limit)
 	query += fmt.Sprintf(" ORDER BY entry_seq ASC LIMIT $%d", len(args))

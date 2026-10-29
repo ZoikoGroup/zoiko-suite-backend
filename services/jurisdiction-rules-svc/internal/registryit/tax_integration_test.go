@@ -152,7 +152,7 @@ func TestRuleParameters_AreValidatedFrozenAndDefendedInTheDatabase(t *testing.T)
 		"unknown field":    `{"family":"TAX_RATE","rate":"0.2","rounding":{"mode":"HALF_UP","scale":2},"formula":"x"}`,
 	} {
 		r := s.setParams(t, raw, 400)
-		assert.Equal(t, "invalid_parameters", r["error"], name)
+		assert.Equal(t, "invalid_parameters", r["code"], name)
 	}
 	code, r := e.do("PUT", "/v1/admin/rules/"+s.ruleID+"/parameters", "rule-author", map[string]any{})
 	mustStatus(t, 400, code, r) // "parameters" is required; null clears
@@ -181,7 +181,7 @@ func TestRuleParameters_AreValidatedFrozenAndDefendedInTheDatabase(t *testing.T)
 	require.NoError(t, err)
 	code, r = e.do("PUT", "/v1/admin/rules/"+s.ruleID+"/parameters", "rule-author", map[string]any{"parameters": nil})
 	mustStatus(t, 409, code, r)
-	assert.Equal(t, "not_draft", r["error"])
+	assert.Equal(t, "not_draft", r["code"])
 	_, err = pool.Exec(ctx, `UPDATE jurisdiction_rules SET rule_parameters='{"family":"TAX_RATE"}'::jsonb WHERE jurisdiction_rule_id=$1`, s.ruleID)
 	require.Error(t, err, "an ACTIVE rule's rate cannot be edited, not even directly")
 	_, err = pool.Exec(ctx, `UPDATE jurisdiction_rules SET rule_parameters=NULL WHERE jurisdiction_rule_id=$1`, s.ruleID)
@@ -319,7 +319,7 @@ func TestTaxCalculation_AQuietlyAlteredRateCannotBeServed(t *testing.T) {
 			JOIN jurisdiction_packs p USING (pack_id) WHERE p.pack_ref=$1 AND a.artifact LIKE '%"rate":"0.02"%'`, s.packRef).Scan(&changed))
 		require.Equal(t, 1, changed, "the tamper really changed the stored rate")
 		r := s.execute(t, nil, 503)
-		assert.Equal(t, "pack_unverified", r["error"], "the wrong tax is never calculated: there is no answer instead")
+		assert.Equal(t, "pack_unverified", r["code"], "the wrong tax is never calculated: there is no answer instead")
 		assert.Contains(t, mustString(r["failures"]), domain.ReasonDigestMismatch)
 		_, err = pool.Exec(ctx, `UPDATE pack_artifacts a SET artifact = replace(artifact, '"rate":"0.02"', '"rate":"0.2"') FROM jurisdiction_pack_versions v
 			JOIN jurisdiction_packs p USING (pack_id) WHERE a.pack_version_id=v.pack_version_id AND p.pack_ref=$1`, s.packRef)

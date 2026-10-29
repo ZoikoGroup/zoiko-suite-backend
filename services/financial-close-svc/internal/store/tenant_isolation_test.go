@@ -103,7 +103,7 @@ func TestMain(m *testing.M) {
 		migration_crosswalk_entries, migration_batches,
 		financial_snapshots,
 		lineage_edges, lineage_projection_status, lineage_trace_verifications, lineage_quarantined_gaps,
-		eventing_outbox
+		eventing_outbox, command_idempotency
 		CASCADE;`)
 
 	migrations, err := filepath.Glob("../../deployments/migrations/*.up.sql")
@@ -187,6 +187,24 @@ func setupIsolationFixture(t *testing.T, tenantLabel string) periodFixture {
 	return f
 }
 
+// advancePeriod walks a period through each state in turn, as the close
+// commands do, without enqueuing events. The fiscal_periods guard (migration
+// 000021) refuses a jump such as OPEN -> HARD_CLOSED, so a fixture that needs
+// a closed period gets there the legal way.
+func advancePeriod(t *testing.T, ctx context.Context, periodID string, states ...string) {
+	t.Helper()
+	at := time.Now().UTC()
+	for _, to := range states {
+		u := domain.PeriodUpdate{To: to, PrincipalID: "fixture", At: at}
+		if to == domain.PeriodHardClosed {
+			u.LockedAt = &at
+		}
+		_, err := testStore.ApplyPeriodTransition(ctx, periodID, []string{domain.PeriodOpen, domain.PeriodSoftClose, domain.PeriodCloseReview},
+			u, "", "", "corr-fixture-"+to, "fixture")
+		require.NoError(t, err, "advancing fixture period to %s", to)
+	}
+}
+
 func TestPgStore_TenantIsolation_GetFiscalPeriod(t *testing.T) {
 	a := setupIsolationFixture(t, "A-GetFiscalPeriod")
 	b := setupIsolationFixture(t, "B-GetFiscalPeriod")
@@ -230,10 +248,9 @@ func TestPgStore_TenantIsolation_ApplyPeriodTransition(t *testing.T) {
 		"ISOLATION FAILURE: tenant A's period status was mutated by tenant B")
 
 	// Sanity: tenant B can still transition its OWN period (from CLOSE_REVIEW,
-	// the state setupIsolationFixture leaves it in only if asked — set it here).
-	_, err = testStore.ApplyPeriodTransition(ctxB, b.fiscalPeriodID, []string{domain.PeriodOpen},
-		domain.PeriodUpdate{To: domain.PeriodCloseReview, PrincipalID: "owner", At: lockedAt}, "", "", "corr-isolation-owner-1", "owner")
-	require.NoError(t, err)
+	// the state setupIsolationFixture leaves it in only if asked — set it here,
+	// through SOFT_CLOSE: migration 000021's guard admits no shortcut).
+	advancePeriod(t, ctxB, b.fiscalPeriodID, domain.PeriodSoftClose, domain.PeriodCloseReview)
 	_, err = testStore.ApplyPeriodTransition(ctxB, b.fiscalPeriodID, []string{domain.PeriodCloseReview},
 		domain.PeriodUpdate{To: domain.PeriodHardClosed, PrincipalID: "owner", At: lockedAt,
 			LockedAt: &lockedAt, EvidenceDocID: &docID}, "", "", "corr-isolation-owner-2", "owner")

@@ -419,6 +419,11 @@ func (h *Handler) EmitInventoryAccountingEvent(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	if kp, ok := h.kernelPoster(); ok {
+		h.emitValuationRunThroughKernel(w, r, kp, run, id, tenantID, principalID)
+		return
+	}
+
 	var totalOutbound float64
 	for _, e := range run.Entries {
 		if e.EntryType == domain.ValuationEntryTypeOutbound {
@@ -539,8 +544,7 @@ func (h *Handler) RecordInventoryWriteDown(w http.ResponseWriter, r *http.Reques
 		{AccountCode: req.ExpenseAccountCode, DebitAmount: req.Amount},
 		{AccountCode: req.InventoryAccountCode, CreditAmount: req.Amount},
 	}
-	journalID, err := h.ledger.PostInventoryAccountingEvent(r.Context(), tenantID, principalID, item.LegalEntityID, req.FiscalPeriod,
-		"Inventory write-down "+w2.WriteDownID, w2.WriteDownID, correlationID, lines)
+	journalID, err := h.postWriteDownJournal(r.Context(), tenantID, principalID, correlationID, w2, req.FiscalPeriod, lines)
 	if err != nil {
 		h.log.Error("RecordInventoryWriteDown: journal posting failed", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "journal_posting_failed", err.Error())

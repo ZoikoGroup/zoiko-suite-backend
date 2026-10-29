@@ -664,6 +664,11 @@ type stubLedger struct {
 	lastDocumentDate        string
 
 	checkPeriodErr error
+
+	kernel      bool
+	kernelErr   error
+	kernelPosts []kernelPost
+	reversed    []string
 }
 
 func (l *stubLedger) PostDepreciationAccountingEvent(_ context.Context, _, _, _, _, _, sourceEventID, _ string, _ []clients.LedgerLine) (string, error) {
@@ -678,8 +683,9 @@ func (l *stubLedger) PostDepreciationAccountingEvent(_ context.Context, _, _, _,
 	return "journal-generated", nil
 }
 
-func (l *stubLedger) ReverseDepreciationJournal(_ context.Context, _, _, _, _ string) error {
+func (l *stubLedger) ReverseDepreciationJournal(_ context.Context, _, _, journalID, _ string) error {
 	l.reverseCalls++
+	l.reversed = append(l.reversed, journalID)
 	return l.reverseErr
 }
 
@@ -1055,4 +1061,37 @@ func TestCreateAssetCandidate_AuthorizationDenied_Returns403(t *testing.T) {
 	if rr.Code != http.StatusForbidden {
 		t.Fatalf("expected 403, got %d: %s", rr.Code, rr.Body.String())
 	}
+}
+
+// ── kernel posting stubs ─────────────────────────────────────────────────────
+
+func (s *stubStore) AssetCategories(_ context.Context, ids []string) (map[string]string, error) {
+	out := map[string]string{}
+	for _, id := range ids {
+		if a, ok := s.assets[id]; ok {
+			out[id] = a.AssetCategory
+		}
+	}
+	return out, nil
+}
+
+func (s *stubStore) MarkDepreciationRunEmittedToKernel(_ context.Context, runID string, journalIDs []string, at time.Time) error {
+	r, ok := s.runs[runID]
+	if !ok || r.Status != domain.DepreciationRunStatusApproved || len(journalIDs) == 0 {
+		return domain.ErrInvalidRunTransition
+	}
+	r.Status, r.EmittedAt, r.JournalID, r.LedgerJournalIDs = domain.DepreciationRunStatusAccountingEventEmitted, &at, &journalIDs[0], journalIDs
+	return nil
+}
+
+type kernelPost struct{ category, amount, runID string }
+
+func (l *stubLedger) KernelPostingEnabled() bool { return l.kernel }
+
+func (l *stubLedger) PostDepreciationKernelEvent(_ context.Context, _, _, _, _, runID, category, amount, _ string) (string, error) {
+	if l.kernelErr != nil {
+		return "", l.kernelErr
+	}
+	l.kernelPosts = append(l.kernelPosts, kernelPost{category, amount, runID})
+	return "kj-" + category, nil
 }

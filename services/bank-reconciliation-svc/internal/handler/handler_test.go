@@ -437,31 +437,6 @@ func (l *stubLedger) GetJournal(_ context.Context, _, _ string) (*ledger.Journal
 	return l.journal, l.err
 }
 
-// stubBanking is a no-op banking.Client that returns ErrTransactionNotFound by
-// default, so tests that don't care about canonical matching just get the
-// journal path. Assign txn/err to override.
-type stubBanking struct {
-	txn *bankingCanonical
-	err error
-}
-
-// bankingCanonical mirrors banking.CanonicalTransaction without importing it
-// (test package is external; we just need the interface).
-type bankingCanonical struct {
-	TransactionID string
-	TenantID      string
-	Amount        float64
-	Currency      string
-	Status        string
-}
-
-// GetCanonicalTransaction satisfies banking.Client.
-// We return nil / ErrTransactionNotFound by default so existing tests that
-// don't pass a transaction_id don't break.
-func (b *stubBanking) GetCanonicalTransaction(_ context.Context, _, _ string) (interface{}, error) {
-	return nil, nil // never called in existing tests
-}
-
 // stubClose is the Wave 13 test double for internal/close.Client — defaults
 // to "open" (nil error) so every pre-existing CertifyRun test, none of
 // which is about the closed-period check itself, keeps passing unchanged.
@@ -1224,6 +1199,35 @@ func TestBindPolicy_Success_Returns200(t *testing.T) {
 	rec := doRequest(r, http.MethodPost, "/v1/reconciliation-runs/run-1/bind-policy", map[string]string{"policy_id": "pol-1"}, "principal-1")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// Freezing a population decides what will be certified, and binding a policy
+// pins the thresholds it will be certified against. Both are run commands and
+// must be authorized as such; they previously accepted any principal.
+func TestFreezePopulation_AuthorizationDenied_Returns403(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{err: domain.ErrAuthorizationDenied}, &stubLedger{})
+	rec := doRequest(r, http.MethodPost, "/v1/reconciliation-runs/run-1/freeze", nil, "principal-1")
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 when BANKREC_RUN is denied, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestBindPolicy_AuthorizationDenied_Returns403(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{err: domain.ErrAuthorizationDenied}, &stubLedger{})
+	rec := doRequest(r, http.MethodPost, "/v1/reconciliation-runs/run-1/bind-policy", map[string]string{"policy_id": "pol-1"}, "principal-1")
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 when BANKREC_RUN is denied, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestCertifyRun_UnresolvedExposureUnassessable_Returns422(t *testing.T) {
+	s := newStubStore()
+	s.certifyRunErr = domain.ErrUnresolvedExposureUnassessable
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubLedger{})
+	rec := doRequest(r, http.MethodPost, "/v1/reconciliation-runs/run-1/certify", nil, "principal-1")
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 when unresolved exposure is in an unassessable currency, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
 

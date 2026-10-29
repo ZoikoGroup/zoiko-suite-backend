@@ -434,7 +434,7 @@ func decodeBody[T any](t *testing.T, raw []byte) T {
 func govCode(raw []byte) string {
 	var m map[string]string
 	_ = json.Unmarshal(raw, &m)
-	return m["error_code"]
+	return m["code"]
 }
 
 // ── taxonomy on the existing bundle paths ───────────────────────────────────

@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"regexp"
 	"strconv"
-	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
@@ -56,21 +55,6 @@ func (h *Handler) providerStore() providers.Store {
 	return h.engine.Store
 }
 
-// exactAmount renders the request's amount as an exact decimal with at most two places (the column is
-// NUMERIC(18,2)); anything finer would be silently rounded by the database, which is a change to the money.
-func exactAmount(f float64) (string, bool) {
-	s := strconv.FormatFloat(f, 'f', -1, 64)
-	if i := strings.IndexByte(s, '.'); i >= 0 && len(s)-i-1 > 2 {
-		return "", false
-	}
-	if !strings.Contains(s, ".") {
-		s += ".00"
-	} else if len(s)-strings.IndexByte(s, '.')-1 == 1 {
-		s += "0"
-	}
-	return s, true
-}
-
 // checkProviderBinding validates the optional provider fields of a prepare request. It refuses early what
 // the provider profile can never carry.
 func (h *Handler) checkProviderBinding(w http.ResponseWriter, r *http.Request, req *domain.PrepareAttemptRequest) bool {
@@ -89,12 +73,9 @@ func (h *Handler) checkProviderBinding(w http.ResponseWriter, r *http.Request, r
 		writeError(w, http.StatusBadRequest, "provider_key, rail and connector_id are all required for a provider-bound attempt")
 		return false
 	}
-	amount, ok := exactAmount(req.Amount)
-	if !ok {
-		writeError(w, http.StatusBadRequest, "amount must have at most two decimal places")
-		return false
-	}
-	if err := h.engine.CheckBinding(r.Context(), req.ProviderKey, req.Rail, req.Currency, amount); err != nil {
+	// PrepareAttempt has already validated the amount and put it in the column's form ("10.50"), which is
+	// the text the send path reads back, hashes and translates.
+	if err := h.engine.CheckBinding(r.Context(), req.ProviderKey, req.Rail, req.Currency, string(req.Amount)); err != nil {
 		switch {
 		case errors.Is(err, providers.ErrProfileNotFound):
 			writeError(w, http.StatusUnprocessableEntity, "no certified provider profile for this provider_key")

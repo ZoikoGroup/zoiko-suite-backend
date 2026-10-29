@@ -41,7 +41,7 @@ func (h *Handler) ResendNotification(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Reason == "" {
-		writeError(w, http.StatusBadRequest, "missing_fields", domain.ErrResendReasonRequired.Error())
+		writeError(w, r, http.StatusBadRequest, "missing_fields", domain.ErrResendReasonRequired.Error())
 		return
 	}
 
@@ -56,44 +56,44 @@ func (h *Handler) ResendNotification(w http.ResponseWriter, r *http.Request) {
 
 	existing, err := h.store.GetNotification(r.Context(), id)
 	if errors.Is(err, domain.ErrNotificationNotFound) {
-		writeError(w, http.StatusNotFound, "notification_not_found", "")
+		writeError(w, r, http.StatusNotFound, "notification_not_found", "")
 		return
 	}
 	if err != nil {
 		h.log.Error("failed to fetch notification", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionSend); err != nil {
-		h.writeAuthzErr(w, err)
+		h.writeAuthzErr(w, r, err)
 		return
 	}
 
 	switch existing.Status {
 	case domain.StatusPendingUnknown:
-		writeError(w, http.StatusConflict, "DELIVERY_OUTCOME_UNKNOWN",
+		writeError(w, r, http.StatusConflict, "DELIVERY_OUTCOME_UNKNOWN",
 			"NCD-014: the last attempt's outcome is ambiguous and must be resolved "+
 				"(POST /{id}/resolve-delivery-outcome) before it may be resent")
 		return
 	case domain.StatusPending:
-		writeError(w, http.StatusConflict, "delivery_in_progress",
+		writeError(w, r, http.StatusConflict, "delivery_in_progress",
 			"this notification is still being attempted; it can be resent once it has concluded")
 		return
 	}
 
 	n, err := h.store.BeginResend(r.Context(), id, tenantID, principalID, req.Reason, time.Now().UTC())
 	if errors.Is(err, domain.ErrResendLedgerOwned) {
-		writeError(w, http.StatusConflict, "ledger_communication_not_resendable", err.Error())
+		writeError(w, r, http.StatusConflict, "ledger_communication_not_resendable", err.Error())
 		return
 	}
 	if errors.Is(err, domain.ErrNotResendable) {
 		// A race: another resend (or a resolution) moved it first.
-		writeError(w, http.StatusConflict, "not_resendable", err.Error())
+		writeError(w, r, http.StatusConflict, "not_resendable", err.Error())
 		return
 	}
 	if err != nil {
 		h.log.Error("failed to reopen notification for resend", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
 

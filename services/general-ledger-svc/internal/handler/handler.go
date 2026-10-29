@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -163,6 +164,14 @@ const (
 	// a different (typically narrower) group.
 	actionOverrideSoftClose = "GL_SOFT_CLOSE_POSTING_OVERRIDE"
 
+	// actionCloseReviewPosting gates use of a journal's close-journal
+	// designation in CLOSE_REVIEW (posting_policy CLOSE_JOURNALS_ONLY). It is
+	// a separate action from actionOverrideSoftClose because CLOSE_REVIEW's
+	// "only designated close journals/workflows" rule is not a soft-close
+	// exception: it admits a specific class of journal, not an arbitrary
+	// posting with a reason. It never bypasses a hard-closed period.
+	actionCloseReviewPosting = "GL_CLOSE_REVIEW_POSTING"
+
 	// ACC-02 Account Mapping actions.
 	actionSetAccountMapping  = "COA_MAPPING_SET"
 	actionViewAccountMapping = "COA_MAPPING_VIEW"
@@ -228,6 +237,10 @@ type Handler struct {
 	closeClient close.Client
 	evidence    EvidenceChecker
 	log         *zap.Logger
+
+	// ctl and policy are the kernel's manual-journal controls (standard §9); see WithJournalControls.
+	ctl    JournalControlStore
+	policy ManualJournalPolicy
 
 	// clock supplies the reversal posting date. Injectable because a test that
 	// asserts which day a reversal posts to cannot do so against time.Now, and
@@ -316,6 +329,8 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{journal_id}/validate", h.ValidateJournal)
 		r.Post("/{journal_id}/post", h.PostJournal)
 		r.Post("/{journal_id}/reverse", h.ReverseJournal)
+		r.Post("/{journal_id}/withdraw", h.WithdrawJournal)
+		r.Post("/{journal_id}/copy", h.CopyJournal)
 
 		// ACC-03 journal proposal/approval lifecycle.
 		r.Post("/{journal_id}/amend", h.AmendDraftJournal)
@@ -326,6 +341,15 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{journal_id}/correct", h.RequestCorrection)
 		r.Get("/{journal_id}/available-actions", h.GetAvailableActions)
 		r.Get("/{journal_id}/history", h.GetJournalHistory)
+	})
+	r.Route("/v1/recurring-journal-templates", func(r chi.Router) {
+		r.Post("/", h.CreateRecurringTemplate)
+		r.Get("/", h.ListRecurringTemplates)
+		r.Get("/{template_id}", h.GetRecurringTemplate)
+		r.Post("/{template_id}/generate", h.GenerateRecurringJournal)
+		r.Post("/{template_id}/pause", h.SetRecurringStatus("PAUSED"))
+		r.Post("/{template_id}/resume", h.SetRecurringStatus("ACTIVE"))
+		r.Post("/{template_id}/end", h.SetRecurringStatus("ENDED"))
 	})
 	r.Route("/v1/trial-balance", func(r chi.Router) {
 		r.Post("/compile", h.CompileTrialBalance)
@@ -347,6 +371,8 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{account_code}/activate", h.ActivateAccount)
 		r.Post("/{account_code}/deactivate", h.DeactivateAccount)
 		r.Post("/{account_code}/reparent", h.ReparentAccount)
+		r.Post("/{account_code}/scoped-versions", h.CreateAccountScopeVersion)
+		r.Get("/{account_code}/scoped-versions", h.ListAccountScopeVersions)
 	})
 	r.Route("/v1/account-mappings", func(r chi.Router) {
 		r.Post("/", h.SetAccountMapping)
@@ -380,6 +406,12 @@ func (h *Handler) CreateJournal(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
+	h.createJournal(w, r, req, nil)
+}
+
+// createJournal is CreateJournal after the body is decoded, shared with CopyJournal: a copy is a new journal and passes
+// every check a new journal passes. copyOf is the journal being copied, or nil.
+func (h *Handler) createJournal(w http.ResponseWriter, r *http.Request, req domain.CreateJournalRequest, copyOf *string) {
 	if missing := requiredJournalFieldMissing(req); missing != "" {
 		writeError(w, http.StatusBadRequest, "missing_field", missing)
 		return
@@ -421,6 +453,17 @@ func (h *Handler) CreateJournal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A designation is validated even in OPEN: an unrecognised value or one
+	// that disagrees with the journal type is a bad request, not something to
+	// store and discover at posting time. The dedicated authorization action
+	// is checked only when CLOSE_REVIEW actually relies on the designation, so
+	// ordinary open-period postings do not need the close-review grant.
+	if !domain.ValidCloseJournalDesignation(req.CloseJournalDesignation, req.JournalType) {
+		writeError(w, http.StatusUnprocessableEntity, "invalid_close_journal_designation",
+			domain.ErrInvalidCloseJournalDesignation.Error())
+		return
+	}
+
 	// Enforce Period Lock Check with soft-close override support
 	if err := h.closeClient.CheckPeriodOpenAt(r.Context(), req.TenantID, close.PeriodRef{
 		LegalEntityID: req.LegalEntityID, PeriodName: req.FiscalPeriod,
@@ -428,12 +471,18 @@ func (h *Handler) CreateJournal(w http.ResponseWriter, r *http.Request) {
 		// validated non-zero by requiredJournalFieldMissing above.
 		PostingDate: req.PostingDate,
 	}); err != nil {
-		if errors.Is(err, domain.ErrSoftCloseOverrideRequired) {
+		switch {
+		case errors.Is(err, domain.ErrSoftCloseOverrideRequired):
 			if !h.checkSoftCloseOverride(w, r, req.OverrideSoftClose, req.SoftCloseOverrideReason, principalID, req.LegalEntityID) {
 				return
 			}
 			// Override allowed — fall through to create the journal
-		} else {
+		case errors.Is(err, domain.ErrCloseJournalsOnly):
+			if !h.closeReviewPostingAllowed(w, r, principalID, req.LegalEntityID, req.CloseJournalDesignation, req.JournalType) {
+				return
+			}
+			// Designated close journal, authorized — fall through
+		default:
 			h.writePeriodErr(w, err)
 			return
 		}
@@ -451,6 +500,10 @@ func (h *Handler) CreateJournal(w http.ResponseWriter, r *http.Request) {
 	if !h.checkAccountRestrictions(w, r, req, principalID) {
 		return
 	}
+	reconBook, ok := h.checkWave2Controls(w, r, req)
+	if !ok {
+		return
+	}
 
 	// ACC-03's book input. §4 makes book_id server-resolvable, so an envelope
 	// value is preferred over the body's — the header is set by the gateway
@@ -462,6 +515,20 @@ func (h *Handler) CreateJournal(w http.ResponseWriter, r *http.Request) {
 	}
 	if env.ReportingBasis != "" {
 		reportingBasis = &env.ReportingBasis
+	}
+	if reconBook != "" {
+		// a reconciliation adjustment lands in the book of the case it settles, or the reconciliation could never see it
+		if bookID != nil && *bookID != reconBook {
+			writeError(w, http.StatusUnprocessableEntity, "book_mismatch", "a reconciliation adjustment belongs to the book of its case ("+reconBook+")")
+			return
+		}
+		bookID = &reconBook
+	}
+
+	var closeJournalDesignation *string
+	if req.CloseJournalDesignation != "" {
+		d := req.CloseJournalDesignation
+		closeJournalDesignation = &d
 	}
 
 	header := &domain.JournalHeader{
@@ -484,6 +551,10 @@ func (h *Handler) CreateJournal(w http.ResponseWriter, r *http.Request) {
 		ReportingBasis:          reportingBasis,
 		EvidenceRefs:            mergeEvidenceRefs(req.EvidenceRefs, env.EvidenceRefs),
 		SoftCloseOverrideReason: &req.SoftCloseOverrideReason,
+		CloseJournalDesignation: closeJournalDesignation,
+		JournalPurpose:          optionalString(req.JournalPurpose),
+		CopyOfJournalID:         copyOf,
+		ReconciliationCaseID:    optionalString(req.ReconciliationCaseID),
 
 		// ACC-03: every ordinary journal a human creates starts as a
 		// proposal nobody has acted on yet — explicit here rather than
@@ -501,6 +572,7 @@ func (h *Handler) CreateJournal(w http.ResponseWriter, r *http.Request) {
 			TaxCode:            l.TaxCode,
 			TaxLogicSnapshotID: l.TaxLogicSnapshotID,
 			Dimensions:         l.Dimensions,
+			CounterpartyID:     l.CounterpartyID,
 		}
 	}
 
@@ -557,7 +629,23 @@ func (h *Handler) checkAccountRestrictions(w http.ResponseWriter, r *http.Reques
 			writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
 			return false
 		}
-		if acct.Status != "ACTIVE" {
+		status := acct.Status
+		bookRef := ""
+		if req.BookID != nil {
+			bookRef = *req.BookID
+		}
+		on := req.PostingDate.Time
+		if on.IsZero() {
+			on = time.Now().UTC()
+		}
+		if st, overridden, serr := h.scopedAccountStatus(r.Context(), req.TenantID, l.AccountCode, req.LegalEntityID, bookRef, on); serr != nil {
+			h.log.Error("checkAccountRestrictions: scoped account status unavailable", zap.Error(serr))
+			writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+			return false
+		} else if overridden {
+			status = st
+		}
+		if status != "ACTIVE" {
 			writeError(w, http.StatusUnprocessableEntity, "account_inactive",
 				domain.ErrAccountInactive.Error()+": "+l.AccountCode)
 			return false
@@ -601,6 +689,53 @@ func (h *Handler) checkSoftCloseOverride(w http.ResponseWriter, r *http.Request,
 		return false
 	}
 	return true
+}
+
+// authorizeCloseReviewPosting is the CLOSE_REVIEW gate for a designated close
+// journal. It is deliberately separate from checkSoftCloseOverride: SOFT_CLOSE
+// admits an arbitrary posting only with an elevated reason, while CLOSE_REVIEW
+// admits only a journal whose persisted designation names a recognised close
+// workflow. An empty designation is an ordinary journal and is refused with
+// ErrCloseJournalsOnly; the caller must also hold GL_CLOSE_REVIEW_POSTING.
+//
+// The period state itself is checked by the close client before this runs.
+// Nothing here can turn a CLOSED result into an allowance: the handler only
+// calls this for ErrCloseJournalsOnly.
+func (h *Handler) authorizeCloseReviewPosting(ctx context.Context, principalID, legalEntityID, designation string, journalType domain.JournalType) error {
+	if designation == "" {
+		return domain.ErrCloseJournalsOnly
+	}
+	if !domain.ValidCloseJournalDesignation(designation, journalType) {
+		return domain.ErrInvalidCloseJournalDesignation
+	}
+	return h.authz.CheckAllowed(ctx, principalID, legalEntityID, actionCloseReviewPosting)
+}
+
+// closeReviewPostingAllowed is authorizeCloseReviewPosting with the HTTP
+// response written for the handler paths that have a ResponseWriter.
+func (h *Handler) closeReviewPostingAllowed(w http.ResponseWriter, r *http.Request, principalID, legalEntityID, designation string, journalType domain.JournalType) bool {
+	err := h.authorizeCloseReviewPosting(r.Context(), principalID, legalEntityID, designation, journalType)
+	switch {
+	case err == nil:
+		return true
+	case errors.Is(err, domain.ErrCloseJournalsOnly):
+		h.writePeriodErr(w, err)
+	case errors.Is(err, domain.ErrInvalidCloseJournalDesignation):
+		writeError(w, http.StatusUnprocessableEntity, "invalid_close_journal_designation", err.Error())
+	default:
+		h.writeAuthzErr(w, err)
+	}
+	return false
+}
+
+// closeJournalDesignationOf returns a stored designation, or "" when the
+// journal is ordinary. It keeps the nil-pointer handling out of every period
+// check that needs to ask "is this a designated close journal?".
+func closeJournalDesignationOf(header *domain.JournalHeader) string {
+	if header.CloseJournalDesignation == nil {
+		return ""
+	}
+	return *header.CloseJournalDesignation
 }
 
 // ── GET /v1/journals/{journal_id} ────────────────────────────────────────────
@@ -1006,6 +1141,13 @@ func (h *Handler) ResolvePostingEligibility(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	if req.LegalEntityID != "" {
+		if st, overridden, serr := h.scopedAccountStatus(r.Context(), tenantID, accountCode, req.LegalEntityID, q.Get("book_id"), time.Now().UTC()); serr == nil && overridden {
+			scoped := *acct
+			scoped.Status = st
+			acct = &scoped
+		}
+	}
 	eligibility := domain.EvaluatePostingEligibility(accountCode, acct, req.OverrideControlAccountRestriction)
 	if eligibility.RequiresOverride && req.OverrideControlAccountRestriction {
 		scope := req.LegalEntityID
@@ -1076,6 +1218,22 @@ func (h *Handler) GetAccountAsOf(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if entity := q.Get("legal_entity_id"); entity != "" {
+		if st, ok := h.scopedAccounts(); ok {
+			scoped, err := st.GetScopedAccountAsOf(r.Context(), tenantID, accountCode, entity, q.Get("book_id"), asOf.Time)
+			if errors.Is(err, domain.ErrAccountNotFound) {
+				writeError(w, http.StatusNotFound, "account_not_found", "")
+				return
+			}
+			if err != nil {
+				h.log.Error("GetAccountAsOf: store unavailable", zap.Error(err))
+				writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+				return
+			}
+			writeJSON(w, http.StatusOK, scoped)
+			return
+		}
+	}
 	version, err := h.store.GetAccountAsOf(r.Context(), tenantID, accountCode, asOf.Time)
 	if errors.Is(err, domain.ErrAccountNotFound) {
 		writeError(w, http.StatusNotFound, "account_not_found", "")
@@ -1456,6 +1614,9 @@ func (h *Handler) PostJournal(w http.ResponseWriter, r *http.Request) {
 	if !h.checkEvidence(w, r, header.TenantID, header.LegalEntityID, principalID, header.EvidenceRefs) {
 		return
 	}
+	if !h.refuseFutureDated(w, header) {
+		return
+	}
 
 	// Soft-close override: if the journal was created with a soft-close override
 	// reason, allow it through SOFT_CLOSE without requiring a new override at post time.
@@ -1464,12 +1625,19 @@ func (h *Handler) PostJournal(w http.ResponseWriter, r *http.Request) {
 		softCloseOverrideReason = *header.SoftCloseOverrideReason
 	}
 	if err := h.closeClient.CheckPeriodOpenAt(r.Context(), header.TenantID, periodRefOf(header)); err != nil {
-		if errors.Is(err, domain.ErrSoftCloseOverrideRequired) && softCloseOverrideReason != "" {
+		switch {
+		case errors.Is(err, domain.ErrSoftCloseOverrideRequired) && softCloseOverrideReason != "":
 			if !h.checkSoftCloseOverride(w, r, true, softCloseOverrideReason, principalID, header.LegalEntityID) {
 				return
 			}
 			// Override allowed — fall through
-		} else {
+		case errors.Is(err, domain.ErrCloseJournalsOnly):
+			if !h.closeReviewPostingAllowed(w, r, principalID, header.LegalEntityID,
+				closeJournalDesignationOf(header), header.JournalType) {
+				return
+			}
+			// Designated close journal, authorized — fall through
+		default:
 			h.writePeriodErr(w, err)
 			return
 		}
@@ -1506,6 +1674,10 @@ func (h *Handler) ReverseJournal(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.CorrelationID == "" {
 		writeError(w, http.StatusBadRequest, "missing_field", "correlation_id")
+		return
+	}
+	if req.CorrectionKind != "" && !domain.ValidCorrectionKind(req.CorrectionKind) {
+		writeError(w, http.StatusBadRequest, "invalid_correction_kind", "correction_kind is the nature of the correction: ERROR_CORRECTION, ESTIMATE_CHANGE, POLICY_CHANGE, SOURCE_DOCUMENT_CORRECTION, COMMERCIAL_ADJUSTMENT, PERIOD_REOPEN_CORRECTION or MIGRATION_CORRECTION")
 		return
 	}
 
@@ -1551,8 +1723,21 @@ func (h *Handler) ReverseJournal(w http.ResponseWriter, r *http.Request) {
 	// SHADOW DATE (site 3, ReverseJournal): the date the reversal journal will
 	// actually carry (see reversalPostingDate), computed once and reused below.
 	reversalPostingDate := h.reversalPostingDate(header)
+	if !req.PostingDate.IsZero() {
+		// The caller chooses the date the reversal takes effect (§32). It may not precede the document it neutralizes.
+		if req.PostingDate.Before(header.TransactionDate.Time) {
+			writeError(w, http.StatusBadRequest, "invalid_posting_date", domain.ErrPostingBeforeTransaction.Error())
+			return
+		}
+		reversalPostingDate = req.PostingDate
+	}
+	// A reversal the caller dates explicitly belongs to the period that date falls in; without a date it stays in the original's.
+	reversalPeriod := header.FiscalPeriod
+	if !req.PostingDate.IsZero() {
+		reversalPeriod = reversalPostingDate.Format("2006-01")
+	}
 	if err := h.closeClient.CheckPeriodOpenAt(r.Context(), header.TenantID, close.PeriodRef{
-		LegalEntityID: header.LegalEntityID, PeriodName: header.FiscalPeriod,
+		LegalEntityID: header.LegalEntityID, PeriodName: reversalPeriod,
 		PostingDate: reversalPostingDate, JournalID: header.JournalID,
 	}); err != nil {
 		h.writePeriodErr(w, err)
@@ -1574,7 +1759,7 @@ func (h *Handler) ReverseJournal(w http.ResponseWriter, r *http.Request) {
 		JournalID:               uuid.NewString(),
 		TenantID:                header.TenantID,
 		LegalEntityID:           header.LegalEntityID,
-		FiscalPeriod:            header.FiscalPeriod,
+		FiscalPeriod:            reversalPeriod,
 		Status:                  domain.JournalStatusFinalized,
 		ReversalOfJournalID:     &reversalID,
 		Description:             "Reversal of " + journalID + ": " + req.Reason,
@@ -1590,6 +1775,17 @@ func (h *Handler) ReverseJournal(w http.ResponseWriter, r *http.Request) {
 		BookID:          header.BookID,
 		ReportingBasis:  header.ReportingBasis,
 		EvidenceRefs:    header.EvidenceRefs,
+
+		// Lineage (§11): the reversal stays in the original's book and under the original's accounting event, carries the
+		// reason and the nature of the correction, and — for a kernel posting — gets an execution record of its own.
+		AccountingBookID:        header.AccountingBookID,
+		SourceAccountingEventID: header.SourceAccountingEventID,
+		ReversalReason:          optionalString(req.Reason),
+		CorrectionKind:          optionalString(req.CorrectionKind),
+	}
+	if header.SourceAccountingEventID != nil {
+		execID := uuid.NewString()
+		reversingHeader.PostingExecutionID = &execID
 	}
 	reversingLines := make([]domain.JournalLine, len(lines))
 	for i, l := range lines {
@@ -1601,6 +1797,10 @@ func (h *Handler) ReverseJournal(w http.ResponseWriter, r *http.Request) {
 			TaxCode:            l.TaxCode, // same tax basis as the line being reversed
 			TaxLogicSnapshotID: l.TaxLogicSnapshotID,
 			Dimensions:         l.Dimensions, // reverse against the same analysis axes
+
+			// The original foreign-currency basis and rule provenance are kept: the reversal neutralizes at the same rate.
+			TransactionAmount: l.TransactionAmount, TransactionCcy: l.TransactionCcy, ExchangeRate: l.ExchangeRate,
+			RateRef: l.RateRef, PostingRuleLineRef: l.PostingRuleLineRef, CounterpartyID: l.CounterpartyID,
 		}
 	}
 
@@ -1618,6 +1818,10 @@ func (h *Handler) ReverseJournal(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, domain.ErrInvalidTransition) {
 			writeError(w, http.StatusUnprocessableEntity, "only_finalized_reversible",
 				domain.ErrOnlyFinalizedReversible.Error())
+			return
+		}
+		if errors.Is(err, domain.ErrPeriodLocked) {
+			writeError(w, http.StatusPreconditionFailed, "period_locked", err.Error())
 			return
 		}
 		h.log.Error("ReverseJournal: failed to post reversing journal", zap.Error(err))
@@ -1801,6 +2005,9 @@ func (h *Handler) SubmitJournal(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnprocessableEntity, "unbalanced_journal", domain.ErrJournalUnbalancedAtSubmit.Error())
 		return
 	}
+	if !h.requireEvidence(w, header, debitTotal) {
+		return
+	}
 
 	if err := h.store.SubmitJournalForApproval(r.Context(), tenantID, journalID, principalID); err != nil {
 		if errors.Is(err, domain.ErrInvalidApprovalTransition) {
@@ -1847,7 +2054,7 @@ func (h *Handler) ApproveJournal(w http.ResponseWriter, r *http.Request) {
 		h.writeAuthzErr(w, err)
 		return
 	}
-	if header.SubmittedByPrincipalID != nil && *header.SubmittedByPrincipalID == principalID {
+	if (header.SubmittedByPrincipalID != nil && *header.SubmittedByPrincipalID == principalID) || header.CreatedByPrincipalID == principalID {
 		writeError(w, http.StatusForbidden, "self_approval_not_permitted", domain.ErrSelfApprovalNotPermitted.Error())
 		return
 	}
@@ -2235,11 +2442,22 @@ func (h *Handler) commitJournal(ctx context.Context, header *domain.JournalHeade
 		domain.JournalStatusPending, domain.JournalStatusValidated, principalID); err != nil {
 		return err
 	}
-	// Re-check period with soft-close override from journal header if present
+	// Re-check period with the override/designation declared at journal
+	// creation. A close-journal designation is only usable here when the
+	// period is actually CLOSE_JOURNALS_ONLY; a CLOSED result is returned
+	// unchanged and cannot be overridden.
 	if err := h.closeClient.CheckPeriodOpenAt(ctx, header.TenantID, periodRefOf(header)); err != nil {
-		if errors.Is(err, domain.ErrSoftCloseOverrideRequired) && header.SoftCloseOverrideReason != nil && *header.SoftCloseOverrideReason != "" {
+		switch {
+		case errors.Is(err, domain.ErrSoftCloseOverrideRequired) &&
+			header.SoftCloseOverrideReason != nil && *header.SoftCloseOverrideReason != "":
 			// Override was declared at journal creation — honor it
-		} else {
+		case errors.Is(err, domain.ErrCloseJournalsOnly):
+			if authErr := h.authorizeCloseReviewPosting(ctx, principalID, header.LegalEntityID,
+				closeJournalDesignationOf(header), header.JournalType); authErr != nil {
+				return authErr
+			}
+			// Designated close journal, authorized — fall through
+		default:
 			return err
 		}
 	}
@@ -2608,12 +2826,20 @@ func (h *Handler) adoptExistingJournal(w http.ResponseWriter, r *http.Request, t
 			softCloseOverrideReason = *header.SoftCloseOverrideReason
 		}
 		if err := h.closeClient.CheckPeriodOpen(ctx, header.TenantID, header.LegalEntityID, header.FiscalPeriod); err != nil {
-			if errors.Is(err, domain.ErrSoftCloseOverrideRequired) && softCloseOverrideReason != "" {
+			switch {
+			case errors.Is(err, domain.ErrSoftCloseOverrideRequired) && softCloseOverrideReason != "":
 				if !h.checkSoftCloseOverride(w, r, true, softCloseOverrideReason, principalID, header.LegalEntityID) {
 					return "", false
 				}
 				// Override allowed — fall through to commit
-			} else {
+			case errors.Is(err, domain.ErrCloseJournalsOnly):
+				if !h.closeReviewPostingAllowed(w, r, principalID, header.LegalEntityID,
+					closeJournalDesignationOf(header), header.JournalType) {
+					h.failExecution(ctx, tenantID, exec.ExecutionID, err)
+					return "", false
+				}
+				// Designated close journal, authorized — commitJournal re-checks
+			default:
 				h.failExecution(ctx, tenantID, exec.ExecutionID, err)
 				h.writePeriodErr(w, err)
 				return "", false
@@ -2653,8 +2879,21 @@ func (h *Handler) writePeriodErr(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusPreconditionFailed, "soft_close_override_required", err.Error())
 		return
 	}
-	if errors.Is(err, domain.ErrPeriodHardClosed) || errors.Is(err, domain.ErrPeriodLocked) {
+	// CLOSE_JOURNALS_ONLY keeps the same external refusal ordinary posting
+	// has always received. The distinction is internal: the handler uses it
+	// to decide whether a designated close journal may pass, and never
+	// exposes a different code that would make the state look hard-closed.
+	if errors.Is(err, domain.ErrCloseJournalsOnly) ||
+		errors.Is(err, domain.ErrPeriodHardClosed) || errors.Is(err, domain.ErrPeriodLocked) {
 		writeError(w, http.StatusPreconditionFailed, "period_locked", err.Error())
+		return
+	}
+	if errors.Is(err, domain.ErrInvalidCloseJournalDesignation) {
+		writeError(w, http.StatusUnprocessableEntity, "invalid_close_journal_designation", err.Error())
+		return
+	}
+	if errors.Is(err, domain.ErrAuthorizationDenied) || errors.Is(err, domain.ErrAuthorizationServiceUnavailable) {
+		h.writeAuthzErr(w, err)
 		return
 	}
 	if errors.Is(err, domain.ErrUnbalancedJournal) {
@@ -2728,6 +2967,9 @@ func (h *Handler) PostApprovedJournal(w http.ResponseWriter, r *http.Request) {
 		softCloseOverrideReason = *header.SoftCloseOverrideReason
 	}
 
+	if !h.refuseFutureDated(w, header) {
+		return
+	}
 	exec := &domain.PostingExecution{
 		ExecutionID: uuid.NewString(), TenantID: tenantID, LegalEntityID: header.LegalEntityID, Kind: domain.PostingExecutionKindApprovedJournal,
 		Status: domain.PostingExecutionStatusSubmitted, CalculationTrace: "{}", CorrelationID: header.CorrelationID,
@@ -2740,12 +2982,20 @@ func (h *Handler) PostApprovedJournal(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.closeClient.CheckPeriodOpenAt(r.Context(), header.TenantID, periodRefOf(header)); err != nil {
-		if errors.Is(err, domain.ErrSoftCloseOverrideRequired) && softCloseOverrideReason != "" {
+		switch {
+		case errors.Is(err, domain.ErrSoftCloseOverrideRequired) && softCloseOverrideReason != "":
 			if !h.checkSoftCloseOverride(w, r, true, softCloseOverrideReason, principalID, header.LegalEntityID) {
 				return
 			}
 			// Override allowed — fall through
-		} else {
+		case errors.Is(err, domain.ErrCloseJournalsOnly):
+			if !h.closeReviewPostingAllowed(w, r, principalID, header.LegalEntityID,
+				closeJournalDesignationOf(header), header.JournalType) {
+				h.failExecution(r.Context(), tenantID, exec.ExecutionID, err)
+				return
+			}
+			// Designated close journal, authorized — fall through
+		default:
 			h.failExecution(r.Context(), tenantID, exec.ExecutionID, err)
 			h.writePeriodErr(w, err)
 			return
@@ -2863,6 +3113,18 @@ func (h *Handler) CreateReversalPosting(w http.ResponseWriter, r *http.Request) 
 		PostedByPrincipalID:     &principalID,
 		CorrelationID:           correlationID,
 		SoftCloseOverrideReason: &req.SoftCloseOverrideReason,
+
+		// A reversal inherits the ACC-03 inputs of the journal it neutralizes (same book, currency and document); only its type and
+		// its posting date differ. Without them the journal header is incomplete and the ledger refuses it.
+		JournalType:      domain.JournalTypeReversal,
+		TransactionDate:  header.TransactionDate,
+		PostingDate:      h.reversalPostingDate(header),
+		CurrencyCode:     header.CurrencyCode,
+		BookID:           header.BookID,
+		ReportingBasis:   header.ReportingBasis,
+		EvidenceRefs:     header.EvidenceRefs,
+		AccountingBookID: header.AccountingBookID,
+		ReversalReason:   optionalString(req.Reason),
 	}
 	_, originalLines, err := h.store.GetJournal(r.Context(), req.OriginalJournalID)
 	if err != nil {
@@ -2872,7 +3134,9 @@ func (h *Handler) CreateReversalPosting(w http.ResponseWriter, r *http.Request) 
 	}
 	reversingLines := make([]domain.JournalLine, len(originalLines))
 	for i, l := range originalLines {
-		reversingLines[i] = domain.JournalLine{AccountCode: l.AccountCode, DebitAmount: l.CreditAmount, CreditAmount: l.DebitAmount, Description: l.Description}
+		reversingLines[i] = domain.JournalLine{AccountCode: l.AccountCode, DebitAmount: l.CreditAmount, CreditAmount: l.DebitAmount, Description: l.Description,
+			TaxCode: l.TaxCode, TaxLogicSnapshotID: l.TaxLogicSnapshotID, Dimensions: l.Dimensions,
+			TransactionAmount: l.TransactionAmount, TransactionCcy: l.TransactionCcy, ExchangeRate: l.ExchangeRate, RateRef: l.RateRef, PostingRuleLineRef: l.PostingRuleLineRef, CounterpartyID: l.CounterpartyID}
 	}
 
 	_, _, err = h.store.ReverseJournal(r.Context(), header.TenantID, req.OriginalJournalID, reversingHeader, reversingLines, principalID)
@@ -2956,9 +3220,17 @@ func (h *Handler) ReprocessFailedPosting(w http.ResponseWriter, r *http.Request)
 		}
 	} else if header.Status == domain.JournalStatusValidated {
 		if err := h.closeClient.CheckPeriodOpenAt(r.Context(), header.TenantID, periodRefOf(header)); err != nil {
-			h.failExecution(r.Context(), tenantID, executionID, err)
-			h.writePeriodErr(w, err)
-			return
+			if errors.Is(err, domain.ErrCloseJournalsOnly) &&
+				h.closeReviewPostingAllowed(w, r, principalID, header.LegalEntityID,
+					closeJournalDesignationOf(header), header.JournalType) {
+				// Designated close journal, authorized — fall through
+			} else {
+				h.failExecution(r.Context(), tenantID, executionID, err)
+				if !errors.Is(err, domain.ErrCloseJournalsOnly) {
+					h.writePeriodErr(w, err)
+				}
+				return
+			}
 		}
 		if err := h.store.TransitionJournal(r.Context(), header.TenantID, header.JournalID,
 			domain.JournalStatusValidated, domain.JournalStatusFinalized, principalID); err != nil {
@@ -3108,6 +3380,9 @@ func (h *Handler) QueryLedger(w http.ResponseWriter, r *http.Request) {
 		FiscalPeriod:  q.Get("fiscal_period"),
 		JournalID:     q.Get("journal_id"),
 	}
+	if !parseLedgerWindow(w, q, &filter) {
+		return
+	}
 	entries, err := h.store.QueryLedger(r.Context(), tenantID, filter, limit)
 	if err != nil {
 		h.log.Error("QueryLedger: store unavailable", zap.Error(err))
@@ -3118,6 +3393,43 @@ func (h *Handler) QueryLedger(w http.ResponseWriter, r *http.Request) {
 		entries = []domain.LedgerEntry{}
 	}
 	writeJSON(w, http.StatusOK, entries)
+}
+
+// parseLedgerWindow reads QueryLedger's optional transaction-date window and
+// journal-status narrowing into filter, answering 400 itself on a malformed
+// value. Dates are YYYY-MM-DD and inclusive. journal_status is FINALIZED or
+// REVERSED: those are the only statuses a journal with ledger entries can be
+// in, so any other value could only ever return nothing.
+func parseLedgerWindow(w http.ResponseWriter, q url.Values, filter *domain.QueryLedgerFilter) bool {
+	for _, f := range []struct {
+		param string
+		into  *domain.Date
+	}{{"transaction_date_from", &filter.TransactionDateFrom}, {"transaction_date_to", &filter.TransactionDateTo}} {
+		raw := q.Get(f.param)
+		if raw == "" {
+			continue
+		}
+		d, err := domain.ParseDate(raw)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_field", f.param+": "+err.Error())
+			return false
+		}
+		*f.into = d
+	}
+	if !filter.TransactionDateFrom.IsZero() && !filter.TransactionDateTo.IsZero() &&
+		filter.TransactionDateFrom.After(filter.TransactionDateTo.Time) {
+		writeError(w, http.StatusBadRequest, "invalid_field", domain.ErrLedgerDateWindow.Error())
+		return false
+	}
+	switch status := domain.JournalStatus(q.Get("journal_status")); status {
+	case "":
+	case domain.JournalStatusFinalized, domain.JournalStatusReversed:
+		filter.JournalStatus = status
+	default:
+		writeError(w, http.StatusBadRequest, "invalid_field", "journal_status must be FINALIZED or REVERSED")
+		return false
+	}
+	return true
 }
 
 // QueryLedgerAsOf is QueryLedger scoped to entries whose entry_seq does not
@@ -3163,6 +3475,9 @@ func (h *Handler) QueryLedgerAsOf(w http.ResponseWriter, r *http.Request) {
 		AccountCode:   q.Get("account_code"),
 		FiscalPeriod:  q.Get("fiscal_period"),
 		MaxEntrySeq:   &watermark,
+	}
+	if !parseLedgerWindow(w, q, &filter) {
+		return
 	}
 	entries, err := h.store.QueryLedger(r.Context(), tenantID, filter, limit)
 	if err != nil {
@@ -3301,6 +3616,8 @@ func (h *Handler) handleTransitionErr(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, domain.ErrInvalidTransition):
 		writeError(w, http.StatusUnprocessableEntity, "invalid_transition", domain.ErrInvalidTransition.Error())
+	case errors.Is(err, domain.ErrPeriodLocked):
+		writeError(w, http.StatusPreconditionFailed, "period_locked", err.Error())
 	default:
 		h.log.Error("TransitionJournal: store unavailable", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
@@ -3353,6 +3670,13 @@ func invalidJournalInput(req domain.CreateJournalRequest) (code, detail string) 
 	}
 	if req.PostingDate.Before(req.TransactionDate.Time) {
 		return "invalid_posting_date", domain.ErrPostingBeforeTransaction.Error()
+	}
+	// Standard §9: a manual journal selects a controlled purpose; free text alone is not enough.
+	if req.JournalPurpose != "" && !domain.ValidJournalPurpose(req.JournalPurpose) {
+		return "invalid_journal_purpose", "journal_purpose must be one of " + strings.Join(domain.JournalPurposes(), ", ")
+	}
+	if req.JournalPurpose == "" && domain.PurposeRequired(req.JournalType) {
+		return "journal_purpose_required", "a " + string(req.JournalType) + " journal needs a journal_purpose: " + strings.Join(domain.JournalPurposes(), ", ")
 	}
 	return "", ""
 }

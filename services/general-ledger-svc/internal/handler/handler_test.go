@@ -65,6 +65,8 @@ type stubStore struct {
 	setMappingErr   error
 
 	ledgerEntries      []domain.LedgerEntry
+	// lastLedgerFilter is the filter QueryLedger was last called with.
+	lastLedgerFilter domain.QueryLedgerFilter
 	postingsPage       *domain.AccountPostingsPage
 	postingsErr        error
 	postingsCalls      []postingsCall
@@ -725,6 +727,7 @@ func (s *stubStore) AmendDraftJournal(_ context.Context, _, journalID string, up
 }
 
 func (s *stubStore) QueryLedger(_ context.Context, _ string, filter domain.QueryLedgerFilter, _ int) ([]domain.LedgerEntry, error) {
+	s.lastLedgerFilter = filter
 	var out []domain.LedgerEntry
 	for _, e := range s.ledgerEntries {
 		if e.LegalEntityID != filter.LegalEntityID {

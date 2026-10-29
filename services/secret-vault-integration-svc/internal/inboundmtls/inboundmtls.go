@@ -26,6 +26,8 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+
+	"zoiko.io/identity-envelope/apicontract"
 )
 
 // NewServerTLSConfig returns the *tls.Config for serving inbound HTTPS.
@@ -116,7 +118,7 @@ func rejectsIdentity(w http.ResponseWriter, r *http.Request, trustedForwarders [
 			log.Warn("inbound mTLS identity check: no verified identity header present to match cert against",
 				zap.String("remote_addr", r.RemoteAddr))
 		}
-		http.Error(w, `{"error":"identity_claim_missing"}`, http.StatusUnauthorized)
+		apicontract.WriteError(w, r, http.StatusUnauthorized, "identity_claim_missing", "no verified identity header to match the client certificate against")
 		return true
 	}
 
@@ -137,7 +139,7 @@ func rejectsIdentity(w http.ResponseWriter, r *http.Request, trustedForwarders [
 					zap.String("cert_cn", leaf.Subject.CommonName),
 					zap.String("remote_addr", r.RemoteAddr))
 			}
-			http.Error(w, `{"error":"identity_mismatch"}`, http.StatusForbidden)
+			apicontract.WriteError(w, r, http.StatusForbidden, "identity_mismatch", "the client certificate does not match the verified caller identity")
 			return true
 		}
 	}
@@ -200,7 +202,7 @@ func CertPolicy(maxLifetime time.Duration, requiredURIPrefix string, log *zap.Lo
 					log.Warn("inbound mTLS certificate policy refused", zap.String("reason", reason),
 						zap.String("cert_cn", r.TLS.PeerCertificates[0].Subject.CommonName), zap.String("remote_addr", r.RemoteAddr))
 				}
-				http.Error(w, `{"error":"client_certificate_policy","reason":"`+reason+`"}`, http.StatusForbidden)
+				apicontract.WriteError(w, r, http.StatusForbidden, "client_certificate_policy", reason)
 				return
 			}
 			next.ServeHTTP(w, r)

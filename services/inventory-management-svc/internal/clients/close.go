@@ -19,6 +19,8 @@ type Clients struct {
 	ledgerURL string
 	http      *http.Client
 	log       *zap.Logger
+
+	kernelBookID, kernelCurrency string
 }
 
 func New(closeURL, ledgerURL string, log *zap.Logger) *Clients {

@@ -164,10 +164,10 @@ func TestCalendarAndObligation_AuthoringIsSourcedIndependentAndImmutable(t *test
 	// The fixture rule is PUBLISHED: nothing about it or the calendar can change any more.
 	code, r := e.do("PUT", "/v1/admin/obligation-rules/"+s.oblID+"/provenance", "obl-author", map[string]any{"regime_id": s.regimeID})
 	mustStatus(t, 409, code, r)
-	assert.Equal(t, "not_draft", r["error"])
+	assert.Equal(t, "not_draft", r["code"])
 	code, r = e.do("PUT", "/v1/admin/calendars/"+s.calCode+"/versions/1/sources", "cal-author", map[string]any{"source_ids": []string{s.sourceID}})
 	mustStatus(t, 409, code, r)
-	assert.Equal(t, "not_draft", r["error"])
+	assert.Equal(t, "not_draft", r["code"])
 	for _, q := range []string{
 		`UPDATE regulatory_calendar_versions SET timezone='UTC' WHERE calendar_version_id=$1`,
 		`UPDATE regulatory_holidays SET name='x' WHERE calendar_version_id=$1`,
@@ -195,12 +195,12 @@ func TestCalendarAndObligation_AuthoringIsSourcedIndependentAndImmutable(t *test
 	v2 := r["calendar_version_id"].(string)
 	code, r = e.do("POST", "/v1/admin/calendars/"+s.calCode+"/versions/2/publish", "cal-publisher", nil)
 	mustStatus(t, 409, code, r) // no sources yet
-	assert.Equal(t, "source_not_ready", r["error"])
+	assert.Equal(t, "source_not_ready", r["code"])
 	code, r = e.do("PUT", "/v1/admin/calendars/"+s.calCode+"/versions/2/sources", "cal-author", map[string]any{"source_ids": []string{s.sourceID}})
 	mustStatus(t, 200, code, r)
 	code, r = e.do("POST", "/v1/admin/calendars/"+s.calCode+"/versions/2/publish", "cal-author", nil)
 	mustStatus(t, 403, code, r)
-	assert.Equal(t, "segregation_of_duties", r["error"])
+	assert.Equal(t, "segregation_of_duties", r["code"])
 	_, err := pool.Exec(ctx, `UPDATE regulatory_calendar_versions SET status='PUBLISHED', published_at=NOW(), published_by=created_by_principal_id WHERE calendar_version_id=$1`, v2)
 	require.Error(t, err, "published_by must differ from the author at the database too")
 	code, r = e.do("POST", "/v1/admin/calendars/"+s.calCode+"/versions/2/publish", "cal-publisher", nil)
@@ -216,12 +216,12 @@ func TestCalendarAndObligation_AuthoringIsSourcedIndependentAndImmutable(t *test
 	id2 := r["obligation_rule_id"].(string)
 	code, r = e.do("POST", "/v1/admin/obligation-rules/"+id2+"/publish", "obl-publisher", nil)
 	mustStatus(t, 409, code, r) // no provenance
-	assert.Equal(t, "source_not_ready", r["error"])
+	assert.Equal(t, "source_not_ready", r["code"])
 	_, pending := e.do("POST", "/v1/admin/interpretations", "author", map[string]any{"jurisdiction_id": s.jur.JurisdictionID, "subject": "s", "decision": "d", "rationale": "r", "source_ids": []string{s.sourceID}})
 	code, r = e.do("PUT", "/v1/admin/obligation-rules/"+id2+"/provenance", "obl-author", map[string]any{
 		"regime_id": s.regimeID, "interpretation_id": pending["interpretation_id"], "source_ids": []string{s.sourceID}})
 	mustStatus(t, 409, code, r)
-	assert.Equal(t, "interpretation_not_approved", r["error"], "JUR-NEG-18")
+	assert.Equal(t, "interpretation_not_approved", r["code"], "JUR-NEG-18")
 	code, r = e.do("PUT", "/v1/admin/obligation-rules/"+id2+"/provenance", "obl-author", map[string]any{
 		"regime_id": s.regimeID, "interpretation_id": s.interpID, "source_ids": []string{s.sourceID}})
 	mustStatus(t, 200, code, r)
@@ -238,7 +238,7 @@ func TestCalendarAndObligation_AuthoringIsSourcedIndependentAndImmutable(t *test
 	e.do("PUT", "/v1/admin/obligation-rules/"+id3+"/provenance", "obl-author", map[string]any{"regime_id": s.regimeID, "interpretation_id": s.interpID, "source_ids": []string{s.sourceID}})
 	code, r = e.do("POST", "/v1/admin/obligation-rules/"+id3+"/publish", "obl-publisher", nil)
 	mustStatus(t, 400, code, r)
-	assert.Equal(t, "invalid_reference", r["error"])
+	assert.Equal(t, "invalid_reference", r["code"])
 
 	// A source nobody has reviewed cannot back a publication.
 	_, fresh := e.do("POST", "/v1/admin/sources", "author", sourceBody(s.jur.JurisdictionID))
@@ -248,7 +248,7 @@ func TestCalendarAndObligation_AuthoringIsSourcedIndependentAndImmutable(t *test
 	e.do("PUT", "/v1/admin/calendars/"+s.calCode+"/versions/3/sources", "cal-author", map[string]any{"source_ids": []string{fresh["source_id"].(string)}})
 	code, r = e.do("POST", "/v1/admin/calendars/"+s.calCode+"/versions/3/publish", "cal-publisher", nil)
 	mustStatus(t, 409, code, r)
-	assert.Equal(t, "source_not_ready", r["error"])
+	assert.Equal(t, "source_not_ready", r["code"])
 
 	// Reads.
 	code, got := e.do("GET", "/v1/calendars/"+s.calCode+"/versions/1", "", nil)

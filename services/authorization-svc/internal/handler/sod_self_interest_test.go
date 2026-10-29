@@ -47,15 +47,15 @@ func TestSoDRetire_EndedAssignmentDoesNotCount(t *testing.T) {
 	s := sodStore("PAYMENT_APPROVE")
 	ended := time.Now().Add(-time.Hour)
 	s.listAssignments[0].EffectiveTo = &ended
-	if w := postAsAdmin(s, "/v1/admin/sod-rules/s-1/retire", `{}`); w.Code != http.StatusOK {
-		t.Fatalf("ended assignment: want 200, got %d: %s", w.Code, w.Body.String())
+	if w := postAsAdmin(s, "/v1/admin/sod-rules/s-1/retire", `{}`); w.Code != http.StatusAccepted {
+		t.Fatalf("ended assignment: want 202, got %d: %s", w.Code, w.Body.String())
 	}
 }
 
 func TestSoDRetire_DisinterestedAdminAllowed(t *testing.T) {
 	s := sodStore("REPORT_VIEW")
-	if w := postAsAdmin(s, "/v1/admin/sod-rules/s-1/retire", `{}`); w.Code != http.StatusOK {
-		t.Fatalf("admin holding neither action: want 200, got %d: %s", w.Code, w.Body.String())
+	if w := postAsAdmin(s, "/v1/admin/sod-rules/s-1/retire", `{}`); w.Code != http.StatusAccepted {
+		t.Fatalf("admin holding neither action: want 202, got %d: %s", w.Code, w.Body.String())
 	}
 	if s.gotSoDActiveID != "s-1" || s.gotSoDActiveValue {
 		t.Errorf("SetSoDRuleActive got id=%q active=%v", s.gotSoDActiveID, s.gotSoDActiveValue)
@@ -64,8 +64,8 @@ func TestSoDRetire_DisinterestedAdminAllowed(t *testing.T) {
 
 // Reactivating only restores a denial, so an interested party may do it.
 func TestSoDReactivate_HolderAllowed(t *testing.T) {
-	if w := postAsAdmin(sodStore("PAYMENT_APPROVE", "PAYMENT_INITIATE"), "/v1/admin/sod-rules/s-1/reactivate", `{}`); w.Code != http.StatusOK {
-		t.Fatalf("reactivate by holder: want 200, got %d", w.Code)
+	if w := postAsAdmin(sodStore("PAYMENT_APPROVE", "PAYMENT_INITIATE"), "/v1/admin/sod-rules/s-1/reactivate", `{}`); w.Code != http.StatusAccepted {
+		t.Fatalf("reactivate by holder: want 202, got %d", w.Code)
 	}
 }
 

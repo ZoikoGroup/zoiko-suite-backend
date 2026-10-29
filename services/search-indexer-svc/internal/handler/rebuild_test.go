@@ -47,7 +47,7 @@ func TestTransitionGeneration_ReadyRequiresACompleteBackfill(t *testing.T) {
 	h.store.generation.BackfillState = domain.BackfillRunning
 	w := do(h, req(t, http.MethodPost, "/v1/index-generations/"+generationID+"/state", map[string]any{"state": "READY"}))
 	require.Equal(t, http.StatusConflict, w.Code)
-	assert.Equal(t, "backfill_incomplete", bodyOf(t, w)["error"])
+	assert.Equal(t, "backfill_incomplete", errorCode(t, w))
 }
 
 // The empty-rebuild finding: "engine=0 ledger=4" passed validation and

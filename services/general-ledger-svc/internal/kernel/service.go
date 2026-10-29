@@ -94,8 +94,19 @@ type Repo interface {
 	// ActivateRuleSet makes an approved rule set ACTIVE and supersedes the open-ended active version it replaces, in one
 	// transaction under the scope lock. It returns the ids it superseded.
 	ActivateRuleSet(ctx context.Context, tenant, id string, expectedRowVersion int64, actor string, out OutEvent) (*RuleSet, []string, error)
-	ActiveRuleSets(ctx context.Context, tenant, eventType, bookType, framework string, on time.Time) ([]RuleSet, error)
+	ActiveRuleSets(ctx context.Context, tenant, eventType, bookType, framework, jurisdiction string, on time.Time) ([]RuleSet, error)
 	RuleSetEvents(ctx context.Context, tenant, id string) ([]RuleEvent, error)
+
+	// FindPosting returns the posting consequence of an event in a book under a basis, or ErrNotFound.
+	FindPosting(ctx context.Context, tenant, eventID, bookID, basis string) (*PostResult, error)
+	// PostUnit writes the journal, its lines, the posting execution, the event-to-posting record, the ledger entries and the
+	// outbox event in one transaction, or nothing. When the consequence already exists (a concurrent or repeated post) it
+	// returns that one with Existing=true.
+	PostUnit(ctx context.Context, u *PostingUnit) (*PostResult, error)
+	// RecordPostingFailure stores the evidence of a posting that did not complete and raises it on the outbox.
+	RecordPostingFailure(ctx context.Context, f *PostingFailure) error
+	// PostingTrace resolves the lineage of a posting: event, rule, execution, journals, lines, relations and outbox ids.
+	PostingTrace(ctx context.Context, tenant string, q TraceQuery) (*Trace, error)
 
 	InsertDimension(ctx context.Context, tenant string, d *Dimension) error
 	ListDimensions(ctx context.Context, tenant string) ([]Dimension, error)
@@ -181,6 +192,18 @@ func (s *Service) RegisterEvent(ctx context.Context, tenant string, a Actor, e A
 	if e.Facts == nil {
 		e.Facts = map[string]string{}
 	}
+	if e.SupersedesEventID != "" {
+		prior, err := s.Repo.GetEvent(ctx, tenant, e.SupersedesEventID)
+		if err != nil {
+			if errors.Is(err, ErrNotFound) {
+				return nil, false, exc(FamData, "SUPERSEDED_EVENT_UNKNOWN", "the event this one supersedes does not exist").with("supersedes_event_id", e.SupersedesEventID)
+			}
+			return nil, false, err
+		}
+		if prior.LegalEntityID != e.LegalEntityID {
+			return nil, false, exc(FamAuth, "ENTITY_MISMATCH", "a correction belongs to the legal entity of the event it corrects")
+		}
+	}
 	return s.Repo.InsertEvent(ctx, &e, OutEvent{Fact: "event.registered", AggregateType: "accounting-event", AggregateID: e.AccountingEventID, Actor: a.PrincipalID,
 		CorrelationID: e.CorrelationID, LegalEntityID: e.LegalEntityID,
 		Data: map[string]any{"accounting_event_id": e.AccountingEventID, "event_type": e.EventType, "event_version": e.EventVersion, "legal_entity_id": e.LegalEntityID,
@@ -226,7 +249,7 @@ func (s *Service) TestRuleSet(ctx context.Context, tenant string, a Actor, id st
 	if err != nil {
 		return nil, nil, err
 	}
-	if bk.BookType != rs.BookType || bk.AccountingFrameworkID != rs.FrameworkID {
+	if bk.BookType != rs.BookType || bk.AccountingFrameworkID != rs.FrameworkID || !rs.AppliesToJurisdiction(bk.Jurisdiction) {
 		return nil, nil, exc(FamRule, "BOOK_NOT_APPLICABLE", "the book is %s / %s and the rule set is for %s / %s", bk.BookType, bk.AccountingFrameworkID, rs.BookType, rs.FrameworkID)
 	}
 	if rs.Status != RuleDraft && rs.Status != RuleTest {
@@ -331,7 +354,7 @@ func (s *Service) ReturnToDraft(ctx context.Context, tenant string, a Actor, id 
 type Resolver interface {
 	Directory
 	// FXBasis returns the rate basis for converting from a currency into the book's functional currency, or nil.
-	FXBasis(ctx context.Context, from, to string, asOf time.Time) (*FXBasis, error)
+	FXBasis(ctx context.Context, policyID, from, to string, asOf time.Time) (*FXBasis, error)
 }
 
 // EvaluateRequest names an event and the book whose consequence is wanted.
@@ -369,10 +392,11 @@ func (s *Service) Evaluate(ctx context.Context, tenant string, req EvaluateReque
 		}
 	}
 	pd = today(pd)
-	sets, err := s.Repo.ActiveRuleSets(ctx, tenant, ev.EventType, bk.BookType, bk.AccountingFrameworkID, pd)
+	sets, err := s.Repo.ActiveRuleSets(ctx, tenant, ev.EventType, bk.BookType, bk.AccountingFrameworkID, bk.Jurisdiction, pd)
 	if err != nil {
 		return nil, err
 	}
+	sets = preferJurisdiction(sets, bk.Jurisdiction)
 	switch len(sets) {
 	case 0:
 		return nil, exc(FamRule, "NO_RULE", "no active rule set for %s in a %s book under %s on %s", ev.EventType, bk.BookType, bk.AccountingFrameworkID, pd.Format("2006-01-02")).
@@ -385,10 +409,19 @@ func (s *Service) Evaluate(ctx context.Context, tenant string, req EvaluateReque
 		}
 		return nil, exc(FamRule, "AMBIGUOUS_RULE", "%d active rule sets claim this event on %s", len(sets), pd.Format("2006-01-02")).with("candidates", ids)
 	}
+	if req.FX != nil && res != nil {
+		// Where a rate source is configured, a caller does not bring its own rate: that is what the override workflow is for.
+		if enf, ok := res.(interface{ RejectSuppliedFX() bool }); ok && enf.RejectSuppliedFX() {
+			return nil, exc(FamFX, "RATE_OVERRIDE_NOT_ALLOWED", "an exchange rate comes from the rate store; a hand-keyed rate goes through the override workflow, which needs a reason and a second person")
+		}
+	}
 	fx := req.FX
 	if fx == nil && bk.FunctionalCurrency != ev.TransactionCurrency && ev.TransactionCurrency != "" && res != nil {
 		var ferr error
-		if fx, ferr = res.FXBasis(ctx, ev.TransactionCurrency, bk.FunctionalCurrency, pd); ferr != nil {
+		if fx, ferr = res.FXBasis(ctx, sets[0].Content.FXPolicyID, ev.TransactionCurrency, bk.FunctionalCurrency, pd); ferr != nil {
+			if e, isExc := AsException(ferr); isExc {
+				return nil, e
+			}
 			return nil, exc(FamFX, "RATE_UNAVAILABLE", "no exchange rate could be resolved: %v", ferr)
 		}
 	}

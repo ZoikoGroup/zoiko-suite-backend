@@ -321,35 +321,28 @@ components:
     # internal/context/contract_test.go now does, and found this duplicate on
     # its first run.
 
-    ErrorResponse:
+    Problem:
       type: object
-      description: |
-        Every refusal from this service carries one of the control plane's
-        stable error classes. The message is for a human reading a log; the
-        CODE is what a client branches on, and it is the half that must not
-        change with a refactor. Before these existed a caller could only
-        distinguish a wrong password from a residency denial by matching prose.
+      required: [type, title, status, code]
       properties:
-        error:
-          type: string
-        error_code:
-          type: string
-          enum:
-            - CONTEXT_UNRESOLVED
-            - RESIDENCY_DENIED
-            - AUTHORIZATION_DENIED
-            - SOD_CONFLICT
-            - BREAK_GLASS_REQUIRED
-            - BREAK_GLASS_EXPIRED
-            - LEGAL_HOLD_ACTIVE
-            - IDEMPOTENCY_MISMATCH
-            - TRUST_POSTURE_BLOCKED
-            - UPSTREAM_UNAVAILABLE
-            - UNSUPPORTED
-        correlation_id:
-          type: string
-        evidence_id:
-          type: string
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        code: { type: string, enum: [CONTEXT_UNRESOLVED, RESIDENCY_DENIED, SOD_CONFLICT, BREAK_GLASS_REQUIRED, BREAK_GLASS_EXPIRED, LEGAL_HOLD_ACTIVE, IDEMPOTENCY_MISMATCH, TRUST_POSTURE_BLOCKED, UPSTREAM_UNAVAILABLE, UNSUPPORTED, AUTHORIZATION_DENIED] }
+        request_id: { type: string }
+        correlation_id: { type: string }
+        retryable: { type: boolean }
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              pointer: { type: string }
+              code: { type: string }
+              detail: { type: string }
+        current_version: { type: integer, format: int64 }
 
     ResolveResponseV2:
       type: object
@@ -704,9 +697,9 @@ paths:
         "400":
           description: tenant_id, email or password absent
           content:
-            application/json:
+            application/problem+json:
               schema:
-                $ref: "#/components/schemas/ErrorResponse"
+                $ref: "#/components/schemas/Problem"
         "401":
           description: |
             Invalid credentials. Covers unknown principal, absent credential,
@@ -715,9 +708,9 @@ paths:
             with `error_code: invalid_client`; it is checked before the account
             is touched, so it costs the account no lockout attempt.
           content:
-            application/json:
+            application/problem+json:
               schema:
-                $ref: "#/components/schemas/ErrorResponse"
+                $ref: "#/components/schemas/Problem"
         "503":
           description: |
             The attempt could not be decided — credential store unreachable, the
@@ -725,9 +718,9 @@ paths:
             401 on purpose: reporting "we cannot tell" as "you are wrong" sends
             a user to a password reset that cannot help.
           content:
-            application/json:
+            application/problem+json:
               schema:
-                $ref: "#/components/schemas/ErrorResponse"
+                $ref: "#/components/schemas/Problem"
 
   /.well-known/jwks.json:
     get:
@@ -776,15 +769,15 @@ paths:
         "401":
           description: Token invalid, principal inactive, or trust posture BLOCKED
           content:
-            application/json:
+            application/problem+json:
               schema:
-                $ref: "#/components/schemas/ErrorResponse"
+                $ref: "#/components/schemas/Problem"
         "503":
           description: Upstream dependency unavailable — failing closed
           content:
-            application/json:
+            application/problem+json:
               schema:
-                $ref: "#/components/schemas/ErrorResponse"
+                $ref: "#/components/schemas/Problem"
 
   /v1/context/session/{sessionContextId}:
     get:
@@ -816,6 +809,10 @@ paths:
                 $ref: "#/components/schemas/IdentityContextEnvelopeResponse"
           description: Cached envelope
         "404":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: Session not found or expired
 
   /v1/context/session/{sessionContextId}/invalidate:
@@ -875,6 +872,10 @@ paths:
         "200":
           description: Principal profile
         "404":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: Principal not found
 
   /v1/principals/{principalId}/roles:
@@ -944,14 +945,30 @@ paths:
         "204":
           description: Status updated (or already in that status)
         "400":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: Malformed body, or a status other than ACTIVE, SUSPENDED or DISABLED
         "403":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: |
             The caller lacks IDENTITY_PRINCIPAL_STATUS, or (`self_status_change`)
             tried to disable or suspend their own account.
         "501":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: The status command is not configured in this deployment
         "503":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: authorization-svc is unreachable
 
   # -- GOV-01 contract operations ---------------------------------------------
@@ -1023,12 +1040,28 @@ paths:
               schema:
                 $ref: "#/components/schemas/ContextExplanation"
         "400":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: as_of is not a valid RFC3339 timestamp
         "401":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: No verified tenant or principal
         "403":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: Not authorized to explain another principal's resolution
         "404":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: Session not found, expired, or in another tenant
 
   /v1/context/cache/refresh:
@@ -1079,10 +1112,22 @@ paths:
               schema:
                 $ref: "#/components/schemas/RefreshCacheResponse"
         "401":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: No verified tenant or principal
         "403":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: Not authorized
         "501":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: Context cache commands are not configured in this deployment
 
   /v1/context/tenant/invalidate:
@@ -1133,12 +1178,28 @@ paths:
               schema:
                 $ref: "#/components/schemas/InvalidateTenantContextResponse"
         "400":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: justification missing
         "401":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: No verified tenant or principal
         "403":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: Not authorized
         "500":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: |
             Partial revocation. The body carries sessions_revoked -- those
             sessions really are revoked, and a caller who assumed otherwise
@@ -1205,21 +1266,45 @@ paths:
               schema:
                 $ref: "#/components/schemas/AttachSupportContextResponse"
         "400":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: |
             Self-approval (the grantee or the caller named as approver), a TTL above the maximum, an unrecognised reason
             code, a justification under the minimum length, or a missing
             ticket reference. error_code is BREAK_GLASS_REQUIRED.
         "401":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: No verified principal
         "403":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: Not authorized in the target tenant
         "409":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: Segregation of duties conflict (error_code SOD_CONFLICT)
         "503":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: |
             GOV-04 could not be reached, so no grant was made. A conflict check
             that did not run is not a check that passed.
         "501":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: Support context is not configured in this deployment
 
   /v1/context/support/{supportContextId}:
@@ -1250,6 +1335,10 @@ paths:
               schema:
                 $ref: "#/components/schemas/SupportContext"
         "404":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: Not found in this tenant
     delete:
       summary: Revoke a support context early
@@ -1289,6 +1378,10 @@ paths:
         "204":
           description: Revoked, or already revoked
         "404":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: Not found in this tenant
 
   /v1/context/support/{supportContextId}/approve:
@@ -1336,14 +1429,34 @@ paths:
               schema:
                 $ref: "#/components/schemas/AttachSupportContextResponse"
         "403":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: The requester or grantee (SOD_CONFLICT), or not the named approver (AUTHORIZATION_DENIED), or no approve grant.
         "404":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: No such request in this tenant, or revoked.
         "409":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: Already approved (BREAK_GLASS_REQUIRED), the approval window lapsed (BREAK_GLASS_EXPIRED), or a GOV-04 conflict (SOD_CONFLICT).
         "503":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: GOV-04 could not be reached; nothing was granted.
         "501":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: Support context is not configured in this deployment
 
   /v1/context/support/{supportContextId}/review:
@@ -1398,14 +1511,30 @@ paths:
         "204":
           description: Review recorded
         "403":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: |
             The caller is the grantee or the approver of this elevation
             (`SOD_CONFLICT`), or holds no review grant.
         "404":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: Not found in this tenant
         "409":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: Idempotency key reused with a different request body
         "501":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: Support context is not configured in this deployment
 
   /v1/authenticate/step-up:
@@ -1446,17 +1575,37 @@ paths:
               schema:
                 $ref: "#/components/schemas/AuthenticateResponse"
         "400":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: The code is not 6 digits
         "401":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: |
             `session_invalid` (bearer missing, forged, expired, or its session
             invalidated, or the principal no longer active) or `invalid_code`
             (wrong, replayed, or the factor is locked — one answer for all three).
         "403":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: "`identity_mismatch`: a header names someone other than the session"
         "409":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: "`mfa_not_enrolled`: no ACTIVE factor"
         "503":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: "`mfa_unavailable` (no MFA_SECRET_KEY) or the store is unreachable"
 
   /v1/mfa/totp/enroll:
@@ -1479,10 +1628,22 @@ paths:
               schema:
                 $ref: "#/components/schemas/TOTPEnrollment"
         "401":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: "`session_invalid` or `reauthentication_required`"
         "403":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: "`step_up_required` or `identity_mismatch`"
         "503":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: "`mfa_unavailable`"
 
   /v1/mfa/totp/activate:
@@ -1507,12 +1668,28 @@ paths:
               schema:
                 $ref: "#/components/schemas/MFAFactor"
         "400":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: factor_id missing or the code is not 6 digits
         "401":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: "`session_invalid` or `invalid_code`"
         "404":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: "`factor_not_found`: no PENDING factor with that id for this principal"
         "503":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: "`mfa_unavailable`"
 
   /v1/mfa/totp/revoke:
@@ -1533,10 +1710,22 @@ paths:
         "200":
           description: Retired
         "401":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: "`session_invalid`"
         "403":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: "`step_up_required` or `identity_mismatch`"
         "404":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: "`factor_not_found`"
 
   /v1/mfa/factors:
@@ -1558,6 +1747,10 @@ paths:
                   count:
                     type: integer
         "401":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: "`session_invalid`"
 
   /v1/principals/{principalId}/mfa/reset:
@@ -1602,16 +1795,36 @@ paths:
                   factors_retired:
                     type: integer
         "400":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: reason_code missing
         "401":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: "`session_invalid`"
         "403":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: |
             `self_reset_refused`, `step_up_required`, `identity_mismatch`, or
             the administrator lacks IDENTITY_MFA_RESET.
         "404":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: No such principal in the tenant
         "503":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: authorization-svc or the store is unreachable
 
   # -- OpenID Connect provider (internal/oidc; AU-01, AU-04, AU-06, AU-10, AU-12, AU-27) --
@@ -1828,8 +2041,16 @@ paths:
         "204":
           description: Logged out
         "401":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: identity_assertion_required / identity_assertion_invalid
         "503":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: logout_unavailable
 
   /v1/context/session/introspect:
@@ -1845,8 +2066,16 @@ paths:
         "200":
           description: "{active, reason, session_context_id, sid, invalidated_at}"
         "400":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: token is required
         "503":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: session_status_unavailable
 
   # ── INT-10 identity federation ─────────────────────────────────────────────────
@@ -1889,10 +2118,22 @@ paths:
               schema:
                 $ref: "#/components/schemas/AuthenticateResponse"
         "400":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: tenant_id or id_token absent
         "401":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: Refused. Indistinguishable by design.
         "503":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
           description: The attempt could not be decided (keys unavailable, store unavailable).
 
   /v1/federation/connections:
@@ -1907,10 +2148,10 @@ paths:
         the outage behaviour (FAIL_CLOSED, or CACHED_KEYS with a bounded grace) and whether just-in-time
         provisioning is allowed. Naming `connection_id` proposes a new version; the approved one keeps serving.
       responses:
-        "202": { description: Proposed; awaiting approval }
-        "400": { description: Invalid configuration }
-        "403": { description: Not authorized }
-        "409": { description: A version is already awaiting approval, or the connection is revoked }
+        "202": { description: "Proposed; awaiting approval" }
+        "400": { description: Invalid configuration, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "403": { description: Not authorized, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "409": { description: "A version is already awaiting approval, or the connection is revoked", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
     get:
       summary: List the tenant's federation connections
       operationId: listFederationConnections
@@ -1921,11 +2162,26 @@ paths:
     get:
       summary: GetFederationConfig — a connection with every version
       operationId: getFederationConfig
+      security: []
+      parameters:
+        - name: connectionId
+          in: path
+          required: true
+          schema: { type: string }
       responses:
         "200": { description: The connection }
-        "404": { description: Not found in this tenant }
+        "404": { description: Not found in this tenant, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
 
   /v1/federation/connections/{connectionId}/versions/{version}/approve:
+    parameters:
+      - name: connectionId
+        in: path
+        required: true
+        schema: { type: string }
+      - name: version
+        in: path
+        required: true
+        schema: { type: string }
     post:
       summary: ApproveFederation
       operationId: approveFederation
@@ -1935,10 +2191,19 @@ paths:
         per tenant. Approval supersedes the version it replaces.
       responses:
         "200": { description: Approved }
-        "403": { description: Self-approval, or not authorized }
-        "409": { description: Fingerprint mismatch, already decided, or issuer already trusted by another connection }
+        "403": { description: "Self-approval, or not authorized", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "409": { description: "Fingerprint mismatch, already decided, or issuer already trusted by another connection", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
 
   /v1/federation/connections/{connectionId}/versions/{version}/reject:
+    parameters:
+      - name: connectionId
+        in: path
+        required: true
+        schema: { type: string }
+      - name: version
+        in: path
+        required: true
+        schema: { type: string }
     post:
       summary: Reject a proposed version (a reason is required)
       operationId: rejectFederationVersion
@@ -1946,38 +2211,63 @@ paths:
         "200": { description: Rejected }
 
   /v1/federation/connections/{connectionId}/rotate-metadata:
+    parameters:
+      - name: connectionId
+        in: path
+        required: true
+        schema: { type: string }
     post:
       summary: RotateMetadataOrCertificateRef — propose a new key location
       operationId: rotateMetadataOrCertificateRef
       description: Where signing keys come from is a trust decision, so a new location is a new version awaiting approval. Rotation of the keys at an unchanged location needs no approval; that is a refresh.
       responses:
         "202": { description: Proposed }
-        "400": { description: Unchanged or forbidden destination }
+        "400": { description: Unchanged or forbidden destination, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
 
   /v1/federation/connections/{connectionId}/keys/refresh:
+    parameters:
+      - name: connectionId
+        in: path
+        required: true
+        schema: { type: string }
     post:
       summary: Fetch the signing keys now from the approved location
       operationId: refreshFederationKeys
       responses:
-        "200": { description: Refreshed; key_count returned }
-        "503": { description: The identity provider's keys could not be obtained }
+        "200": { description: "Refreshed; key_count returned" }
+        "503": { description: The identity provider's keys could not be obtained, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
 
   /v1/federation/connections/{connectionId}/suspend:
+    parameters:
+      - name: connectionId
+        in: path
+        required: true
+        schema: { type: string }
     post:
       summary: SuspendFederation (a reason is required)
       operationId: suspendFederation
       responses:
-        "200": { description: Suspended; new logins are refused }
+        "200": { description: "Suspended; new logins are refused" }
 
   /v1/federation/connections/{connectionId}/resume:
+    parameters:
+      - name: connectionId
+        in: path
+        required: true
+        schema: { type: string }
     post:
       summary: Return a suspended connection to service
       operationId: resumeFederation
       responses:
         "200": { description: Resumed }
-        "409": { description: Not suspended }
+        "409": { description: Not suspended, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
 
   /v1/federation/connections/{connectionId}/revoke:
+    parameters:
+      - name: connectionId
+        in: path
+        required: true
+        schema: { type: string }
     post:
       summary: Revoke a connection (final; a reason is required)
       operationId: revokeFederation
@@ -1985,6 +2275,11 @@ paths:
         "200": { description: Revoked }
 
   /v1/federation/connections/{connectionId}/logins:
+    parameters:
+      - name: connectionId
+        in: path
+        required: true
+        schema: { type: string }
     get:
       summary: Evidence of recent federated logins whose signature verified
       operationId: listFederationLogins
@@ -1997,8 +2292,8 @@ paths:
       operationId: linkExternalSubject
       responses:
         "201": { description: Linked }
-        "409": { description: The external subject or the principal is already linked }
-        "422": { description: Unknown principal, or one of another tenant }
+        "409": { description: The external subject or the principal is already linked, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "422": { description: "Unknown principal, or one of another tenant", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
     get:
       summary: List external-subject links
       operationId: listExternalSubjectLinks
@@ -2006,14 +2301,24 @@ paths:
         "200": { description: The links }
 
   /v1/federation/links/{linkId}:
+    parameters:
+      - name: linkId
+        in: path
+        required: true
+        schema: { type: string }
     get:
       summary: GetExternalSubjectLink
       operationId: getExternalSubjectLink
       responses:
         "200": { description: The link }
-        "404": { description: Not found in this tenant }
+        "404": { description: Not found in this tenant, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
 
   /v1/federation/connections/{connectionId}/mapping:
+    parameters:
+      - name: connectionId
+        in: path
+        required: true
+        schema: { type: string }
     post:
       summary: ConfigureProvisioningMapping — propose how directory attributes map to baseline roles
       operationId: configureProvisioningMapping
@@ -2025,8 +2330,8 @@ paths:
         independent approver and the roles are checked again at approval.
       responses:
         "202": { description: Proposed }
-        "400": { description: Invalid, or names a role that is not baseline }
-        "503": { description: Eligibility could not be established }
+        "400": { description: "Invalid, or names a role that is not baseline", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "503": { description: Eligibility could not be established, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
     get:
       summary: The mapping versions of a connection and the one in force
       operationId: getProvisioningMapping
@@ -2034,16 +2339,34 @@ paths:
         "200": { description: The mapping }
 
   /v1/federation/connections/{connectionId}/mapping/versions/{version}/approve:
+    parameters:
+      - name: connectionId
+        in: path
+        required: true
+        schema: { type: string }
+      - name: version
+        in: path
+        required: true
+        schema: { type: string }
     post:
       summary: Approve a proposed mapping (by fingerprint; not by its author)
       operationId: approveProvisioningMapping
       responses:
         "200": { description: Approved }
-        "400": { description: A role has stopped being baseline since the proposal }
-        "403": { description: Self-approval }
-        "409": { description: Fingerprint mismatch or already decided }
+        "400": { description: A role has stopped being baseline since the proposal, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "403": { description: Self-approval, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "409": { description: Fingerprint mismatch or already decided, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
 
   /v1/federation/connections/{connectionId}/mapping/versions/{version}/reject:
+    parameters:
+      - name: connectionId
+        in: path
+        required: true
+        schema: { type: string }
+      - name: version
+        in: path
+        required: true
+        schema: { type: string }
     post:
       summary: Reject a proposed mapping
       operationId: rejectProvisioningMapping
@@ -2051,6 +2374,11 @@ paths:
         "200": { description: Rejected }
 
   /v1/federation/connections/{connectionId}/scim-token:
+    parameters:
+      - name: connectionId
+        in: path
+        required: true
+        schema: { type: string }
     post:
       summary: Issue the connection's SCIM bearer token
       operationId: issueScimToken
@@ -2059,6 +2387,11 @@ paths:
         "201": { description: Issued (never cacheable) }
 
   /v1/federation/connections/{connectionId}/scim-token/revoke:
+    parameters:
+      - name: connectionId
+        in: path
+        required: true
+        schema: { type: string }
     post:
       summary: Revoke the connection's SCIM token
       operationId: revokeScimToken
@@ -2066,13 +2399,23 @@ paths:
         "200": { description: Number revoked }
 
   /v1/federation/connections/{connectionId}/provisioning/status:
+    parameters:
+      - name: connectionId
+        in: path
+        required: true
+        schema: { type: string }
     get:
       summary: GetProvisioningStatus
       operationId: getProvisioningStatus
       responses:
-        "200": { description: Links, events, assignments, open exceptions, deprovision backlog }
+        "200": { description: "Links, events, assignments, open exceptions, deprovision backlog" }
 
   /v1/federation/connections/{connectionId}/provisioning/events:
+    parameters:
+      - name: connectionId
+        in: path
+        required: true
+        schema: { type: string }
     get:
       summary: The provisioning event ledger
       operationId: listProvisioningEvents
@@ -2080,28 +2423,52 @@ paths:
         "200": { description: Newest first }
 
   /v1/federation/connections/{connectionId}/provisioning/exceptions:
+    parameters:
+      - name: connectionId
+        in: path
+        required: true
+        schema: { type: string }
     get:
       summary: ListSyncExceptions — what provisioning could not settle by itself
       operationId: listSyncExceptions
       responses:
-        "200": { description: Quarantined identities and mappings, refused or unreachable assignments, late deprovisioning }
+        "200": { description: "Quarantined identities and mappings, refused or unreachable assignments, late deprovisioning" }
 
   /v1/federation/connections/{connectionId}/provisioning/exceptions/{exceptionId}/resolve:
+    parameters:
+      - name: connectionId
+        in: path
+        required: true
+        schema: { type: string }
+      - name: exceptionId
+        in: path
+        required: true
+        schema: { type: string }
     post:
       summary: Close an exception with a note
       operationId: resolveSyncException
       responses:
         "200": { description: Resolved }
-        "409": { description: Not open }
+        "409": { description: Not open, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
 
   /v1/federation/connections/{connectionId}/provisioning/deprovision-latency:
+    parameters:
+      - name: connectionId
+        in: path
+        required: true
+        schema: { type: string }
     get:
       summary: GetDeprovisionLatency — how long deprovisioning took to take effect, against its objective
       operationId: getDeprovisionLatency
       responses:
-        "200": { description: Per person, plus completed, pending, escalated, median and maximum }
+        "200": { description: "Per person, plus completed, pending, escalated, median and maximum" }
 
   /v1/federation/connections/{connectionId}/provisioning/reconcile:
+    parameters:
+      - name: connectionId
+        in: path
+        required: true
+        schema: { type: string }
     post:
       summary: ReconcileDirectorySync — a directory snapshot as a safety net for deprovisioning never sent
       operationId: reconcileDirectorySync
@@ -2111,8 +2478,8 @@ paths:
         refused unless `allow_mass` is set. An incomplete snapshot only reports.
       responses:
         "200": { description: Report }
-        "400": { description: Empty or malformed snapshot }
-        "409": { description: Over the safety limit, or already run }
+        "400": { description: Empty or malformed snapshot, content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "409": { description: "Over the safety limit, or already run", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
 
   # SCIM 2.0. Served outside the platform envelope and replay middleware: a directory has no platform identity. The
   # connection's bearer token, with the tenant and connection in the path, authenticates every request before anything
@@ -2123,14 +2490,32 @@ paths:
       summary: SCIM ServiceProviderConfig
       operationId: scimServiceProviderConfig
       security: []
+      parameters:
+        - name: tenantId
+          in: path
+          required: true
+          schema: { type: string }
+        - name: connectionId
+          in: path
+          required: true
+          schema: { type: string }
       responses:
-        "200": { description: Patch and filter supported; bulk, sort, change-password and etag are not }
+        "200": { description: "Patch and filter supported; bulk, sort, change-password and etag are not" }
 
   /scim/v2/{tenantId}/{connectionId}/Users:
     post:
       summary: Provision a user
       operationId: scimCreateUser
       security: []
+      parameters:
+        - name: tenantId
+          in: path
+          required: true
+          schema: { type: string }
+        - name: connectionId
+          in: path
+          required: true
+          schema: { type: string }
       description: |
         `externalId` (the directory's stable identifier) is required: it, not the userName or email, is the identity.
         An email already held by a different principal quarantines the record (409 uniqueness) rather than merging
@@ -2140,15 +2525,24 @@ paths:
         minutes is absorbed. A user is not created inactive.
       responses:
         "201": { description: Created }
-        "200": { description: The user already existed, or a replay }
+        "200": { description: "The user already existed, or a replay" }
         "400": { description: Invalid }
         "401": { description: Bad token }
         "403": { description: The connection is suspended }
-        "409": { description: Quarantined, or the event id was reused with a different request }
+        "409": { description: "Quarantined, or the event id was reused with a different request" }
     get:
       summary: Look a user up by filter
       operationId: scimListUsers
       security: []
+      parameters:
+        - name: tenantId
+          in: path
+          required: true
+          schema: { type: string }
+        - name: connectionId
+          in: path
+          required: true
+          schema: { type: string }
       description: Only `userName eq "…"` and `externalId eq "…"` are understood; anything else is 400 invalidFilter. Without a filter the result is empty.
       responses:
         "200": { description: ListResponse }
@@ -2158,6 +2552,19 @@ paths:
       summary: Read a user
       operationId: scimGetUser
       security: []
+      parameters:
+        - name: tenantId
+          in: path
+          required: true
+          schema: { type: string }
+        - name: connectionId
+          in: path
+          required: true
+          schema: { type: string }
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
       responses:
         "200": { description: The user }
         "404": { description: No such user }
@@ -2165,12 +2572,38 @@ paths:
       summary: Replace a user (externalId cannot change)
       operationId: scimReplaceUser
       security: []
+      parameters:
+        - name: tenantId
+          in: path
+          required: true
+          schema: { type: string }
+        - name: connectionId
+          in: path
+          required: true
+          schema: { type: string }
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
       responses:
         "200": { description: Replaced }
     patch:
       summary: Patch a user (add/replace/remove on active, userName, displayName, emails, groups, roles, title, userType, department)
       operationId: scimPatchUser
       security: []
+      parameters:
+        - name: tenantId
+          in: path
+          required: true
+          schema: { type: string }
+        - name: connectionId
+          in: path
+          required: true
+          schema: { type: string }
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
       description: |
         Applied to a copy, so a patch that fails changes nothing. `active:false` deprovisions: the principal is disabled
         in the same transaction, live sessions are ended, and assignment revocation is queued and retried (revocations
@@ -2179,11 +2612,24 @@ paths:
       responses:
         "200": { description: Patched }
         "400": { description: Unsupported path or operation }
-        "409": { description: Concurrent change, or the earlier deprovisioning is still in progress }
+        "409": { description: "Concurrent change, or the earlier deprovisioning is still in progress" }
     delete:
       summary: Deprovision a user (the principal is disabled; nothing is erased)
       operationId: scimDeleteUser
       security: []
+      parameters:
+        - name: tenantId
+          in: path
+          required: true
+          schema: { type: string }
+        - name: connectionId
+          in: path
+          required: true
+          schema: { type: string }
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
       responses:
         "204": { description: Deprovisioned }
         "404": { description: No such user }

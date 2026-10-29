@@ -22,7 +22,7 @@ import (
 
 	"github.com/exaring/otelpgx"
 	"github.com/go-chi/chi/v5"
-	"github.com/go-chi/chi/v5/middleware"
+	chimiddleware "github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -30,6 +30,7 @@ import (
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 	idenv "zoiko.io/identity-envelope"
+	apicontract "zoiko.io/identity-envelope/apicontract"
 
 	"zoiko.io/workflow-svc/internal/authz"
 	"zoiko.io/workflow-svc/internal/config"
@@ -148,13 +149,14 @@ func main() {
 	log.Info("identity gate", gateSettings.Fields()...)
 
 	r := chi.NewRouter()
-	r.Use(middleware.RequestID)
-	r.Use(middleware.RealIP)
-	r.Use(middleware.Recoverer)
+	r.Use(apicontract.RequestID)
+	r.Use(apicontract.DefaultCache)
+	r.Use(chimiddleware.RealIP)
+	r.Use(chimiddleware.Recoverer)
 	r.Use(otelchi.Middleware("workflow-svc", otelchi.WithChiRoutes(r)))
 	r.Use(metrics.HTTPMiddleware)
 	r.Use(correlationIDMiddleware)
-	r.Use(middleware.Logger)
+	r.Use(chimiddleware.Logger)
 	r.Use(gate.Middleware)
 	r.Use(svcmiddleware.TenantContext())
 
@@ -163,6 +165,8 @@ func main() {
 	// handler so no request reaches business logic without a resolved tenant,
 	// actor, correlation and — on material writes — an idempotency key.
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
+	// Refusals rendered as RFC 9457 problem+json, like every other error here.
+	r.Use(apicontract.EnvelopeRefusals)
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
 	h := handler.New(pgStore, publisher, authzClient, documentVaultClient, log)

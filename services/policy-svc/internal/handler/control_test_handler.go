@@ -91,12 +91,12 @@ func (h *Handler) CreateControlTestDefinition(w http.ResponseWriter, r *http.Req
 		return
 	}
 	if missing := req.missingField(); missing != "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": missing})
+		writeError(w, r, http.StatusBadRequest, codeInvalidRequest, "missing_field", "", map[string]any{"field": missing})
 		return
 	}
-	if (req.ControlTestDefinitionID != "" && !requireUUID(w, "control_test_definition_id", req.ControlTestDefinitionID)) ||
-		tooLong(w, "control_ref", req.ControlRef, 128) || tooLong(w, "test_code", req.TestCode, 128) ||
-		tooLong(w, "test_frequency", req.TestFrequency, 32) {
+	if (req.ControlTestDefinitionID != "" && !requireUUID(w, r, "control_test_definition_id", req.ControlTestDefinitionID)) ||
+		tooLong(w, r, "control_ref", req.ControlRef, 128) || tooLong(w, r, "test_code", req.TestCode, 128) ||
+		tooLong(w, r, "test_frequency", req.TestFrequency, 32) {
 		return
 	}
 
@@ -116,10 +116,10 @@ func (h *Handler) CreateControlTestDefinition(w http.ResponseWriter, r *http.Req
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrConflict):
-			writeJSON(w, http.StatusConflict, map[string]string{"error": "control_test_definition_conflict", "test_code": req.TestCode})
+			writeError(w, r, http.StatusConflict, codeIdempotencyMismatch, "control_test_definition_conflict", "", map[string]any{"test_code": req.TestCode})
 		default:
 			h.log.Error("CreateControlTestDefinition: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			writeError(w, r, http.StatusServiceUnavailable, codeUnavailable, "store_unavailable", "", nil)
 		}
 		return
 	}
@@ -143,7 +143,7 @@ func (h *Handler) GetControlTestDefinition(w http.ResponseWriter, r *http.Reques
 	if _, ok := h.requireTenant(w, r); !ok {
 		return
 	}
-	if !requireUUID(w, "control_test_definition_id", id) {
+	if !requireUUID(w, r, "control_test_definition_id", id) {
 		return
 	}
 	// Control test definitions are global (not tenant-scoped), so authorize
@@ -155,11 +155,11 @@ func (h *Handler) GetControlTestDefinition(w http.ResponseWriter, r *http.Reques
 	d, err := h.store.FindControlTestDefinitionByID(r.Context(), id)
 	if err != nil {
 		if errors.Is(err, domain.ErrControlTestDefinitionNotFound) {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "control_test_definition_not_found"})
+			writeError(w, r, http.StatusNotFound, codeNotFound, "control_test_definition_not_found", "", map[string]any{"control_test_definition_id": id})
 			return
 		}
 		h.log.Error("GetControlTestDefinition: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		writeError(w, r, http.StatusServiceUnavailable, codeUnavailable, "store_unavailable", "", nil)
 		return
 	}
 	writeJSON(w, http.StatusOK, d)
@@ -220,7 +220,7 @@ func (h *Handler) CreateControlTestExecution(w http.ResponseWriter, r *http.Requ
 	if !ok {
 		return
 	}
-	if !requireUUID(w, "control_test_definition_id", definitionID) {
+	if !requireUUID(w, r, "control_test_definition_id", definitionID) {
 		return
 	}
 	if !h.authorize(w, r, principalID, authz.ActionControlTestExecutionRecord, nil) {
@@ -232,15 +232,15 @@ func (h *Handler) CreateControlTestExecution(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	if missing := req.missingField(); missing != "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": missing})
+		missingField(w, r, missing)
 		return
 	}
-	if (req.ControlTestExecutionID != "" && !requireUUID(w, "control_test_execution_id", req.ControlTestExecutionID)) ||
-		tooLong(w, "result", req.Result, 32) {
+	if (req.ControlTestExecutionID != "" && !requireUUID(w, r, "control_test_execution_id", req.ControlTestExecutionID)) ||
+		tooLong(w, r, "result", req.Result, 32) {
 		return
 	}
 	if !req.PeriodEnd.After(req.PeriodStart) {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_period", "message": "period_end must be after period_start"})
+		writeError(w, r, http.StatusBadRequest, codeInvalidRequest, "invalid_period", "period_end must be after period_start", nil)
 		return
 	}
 
@@ -265,12 +265,12 @@ func (h *Handler) CreateControlTestExecution(w http.ResponseWriter, r *http.Requ
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrControlTestDefinitionNotFound):
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "control_test_definition_not_found"})
+			writeError(w, r, http.StatusNotFound, codeNotFound, "control_test_definition_not_found", "", map[string]any{"control_test_definition_id": definitionID})
 		case errors.Is(err, domain.ErrConflict):
-			writeJSON(w, http.StatusConflict, map[string]string{"error": "control_test_execution_conflict"})
+			writeError(w, r, http.StatusConflict, codeIdempotencyMismatch, "control_test_execution_conflict", "", nil)
 		default:
 			h.log.Error("CreateControlTestExecution: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			writeError(w, r, http.StatusServiceUnavailable, codeUnavailable, "store_unavailable", "", nil)
 		}
 		return
 	}
@@ -290,7 +290,7 @@ func (h *Handler) ListControlTestExecutions(w http.ResponseWriter, r *http.Reque
 	if _, ok := h.requireTenant(w, r); !ok {
 		return
 	}
-	if !requireUUID(w, "control_test_definition_id", definitionID) {
+	if !requireUUID(w, r, "control_test_definition_id", definitionID) {
 		return
 	}
 	if !h.authorize(w, r, principalID, authz.ActionControlTestExecutionRead, nil) {
@@ -300,7 +300,7 @@ func (h *Handler) ListControlTestExecutions(w http.ResponseWriter, r *http.Reque
 	results, err := h.store.ListControlTestExecutions(r.Context(), definitionID)
 	if err != nil {
 		h.log.Error("ListControlTestExecutions: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		writeError(w, r, http.StatusServiceUnavailable, codeUnavailable, "store_unavailable", "", nil)
 		return
 	}
 	if results == nil {
@@ -330,13 +330,13 @@ func (h *Handler) GetControlEffectiveness(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if tooLong(w, "control_ref", controlRef, 128) {
+	if tooLong(w, r, "control_ref", controlRef, 128) {
 		return
 	}
 	result, err := h.store.ResolveControlEffectiveness(r.Context(), controlRef)
 	if err != nil {
 		h.log.Error("GetControlEffectiveness: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		writeError(w, r, http.StatusServiceUnavailable, codeUnavailable, "store_unavailable", "", nil)
 		return
 	}
 	writeJSON(w, http.StatusOK, result)
@@ -408,16 +408,16 @@ func (h *Handler) CreateAttestation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if missing := req.missingField(); missing != "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": missing})
+		missingField(w, r, missing)
 		return
 	}
-	if (req.AttestationID != "" && !requireUUID(w, "attestation_id", req.AttestationID)) ||
-		tooLong(w, "statement_version", req.StatementVersion, 64) || tooLong(w, "subject_ref", req.SubjectRef, 255) ||
-		tooLong(w, "signer_role", req.SignerRole, 64) {
+	if (req.AttestationID != "" && !requireUUID(w, r, "attestation_id", req.AttestationID)) ||
+		tooLong(w, r, "statement_version", req.StatementVersion, 64) || tooLong(w, r, "subject_ref", req.SubjectRef, 255) ||
+		tooLong(w, r, "signer_role", req.SignerRole, 64) {
 		return
 	}
 	if !req.PeriodEnd.After(req.PeriodStart) {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_period", "message": "period_end must be after period_start"})
+		writeError(w, r, http.StatusBadRequest, codeInvalidRequest, "invalid_period", "period_end must be after period_start", nil)
 		return
 	}
 
@@ -439,11 +439,11 @@ func (h *Handler) CreateAttestation(w http.ResponseWriter, r *http.Request) {
 	a, err := h.store.CreateAttestation(r.Context(), params)
 	if err != nil {
 		if errors.Is(err, domain.ErrConflict) {
-			writeJSON(w, http.StatusConflict, map[string]string{"error": "attestation_conflict"})
+			writeError(w, r, http.StatusConflict, codeIdempotencyMismatch, "attestation_conflict", "", nil)
 			return
 		}
 		h.log.Error("CreateAttestation: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		writeError(w, r, http.StatusServiceUnavailable, codeUnavailable, "store_unavailable", "", nil)
 		return
 	}
 	writeJSON(w, http.StatusCreated, a)
@@ -461,7 +461,7 @@ func (h *Handler) GetAttestation(w http.ResponseWriter, r *http.Request) {
 	if _, ok := h.requireTenant(w, r); !ok {
 		return
 	}
-	if !requireUUID(w, "attestation_id", id) {
+	if !requireUUID(w, r, "attestation_id", id) {
 		return
 	}
 	if !h.authorize(w, r, principalID, authz.ActionAttestationRead, nil) {
@@ -471,11 +471,11 @@ func (h *Handler) GetAttestation(w http.ResponseWriter, r *http.Request) {
 	a, err := h.store.FindAttestationByID(r.Context(), id)
 	if err != nil {
 		if errors.Is(err, domain.ErrAttestationNotFound) {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "attestation_not_found"})
+			writeError(w, r, http.StatusNotFound, codeNotFound, "attestation_not_found", "", map[string]any{"attestation_id": id})
 			return
 		}
 		h.log.Error("GetAttestation: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		writeError(w, r, http.StatusServiceUnavailable, codeUnavailable, "store_unavailable", "", nil)
 		return
 	}
 	writeJSON(w, http.StatusOK, a)
@@ -509,7 +509,7 @@ func (h *Handler) RevokeAttestation(w http.ResponseWriter, r *http.Request) {
 	if _, ok := h.requireTenant(w, r); !ok {
 		return
 	}
-	if !requireUUID(w, "attestation_id", id) {
+	if !requireUUID(w, r, "attestation_id", id) {
 		return
 	}
 	if !h.authorize(w, r, principalID, authz.ActionAttestationRevoke, nil) {
@@ -525,12 +525,12 @@ func (h *Handler) RevokeAttestation(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrAttestationNotFound):
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "attestation_not_found"})
+			writeError(w, r, http.StatusNotFound, codeNotFound, "attestation_not_found", "", map[string]any{"attestation_id": id})
 		case errors.Is(err, domain.ErrInvalidAttestationTransition):
-			writeJSON(w, http.StatusConflict, map[string]string{"error": "invalid_transition"})
+			writeError(w, r, http.StatusConflict, codeInvalidRequest, "invalid_transition", "attestation cannot be revoked from its current state", nil)
 		default:
 			h.log.Error("RevokeAttestation: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			writeError(w, r, http.StatusServiceUnavailable, codeUnavailable, "store_unavailable", "", nil)
 		}
 		return
 	}

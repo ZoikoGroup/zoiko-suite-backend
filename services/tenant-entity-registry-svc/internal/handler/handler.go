@@ -20,6 +20,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
+	"zoiko.io/identity-envelope/apicontract"
 	"zoiko.io/tenant-entity-registry-svc/internal/domain"
 	"zoiko.io/tenant-entity-registry-svc/internal/registry"
 )
@@ -574,61 +575,69 @@ func (h *Handler) writeErr(w http.ResponseWriter, r *http.Request, err error) {
 	// Not a failure: a maker-checker command was filed rather than executed.
 	var pending *registry.PendingApprovalError
 	if errors.As(err, &pending) {
-		writeJSON(w, http.StatusAccepted, pendingApprovalResponse{
-			Status:          "PENDING_APPROVAL",
-			ApprovalRequest: pending.Request,
+		apicontract.WriteProblem(w, r, apicontract.Problem{
+			Status: http.StatusAccepted,
+			Code:   "pending_approval",
+			Detail: "Command filed for independent approval",
+			Extra: map[string]any{
+				"approval_status":  "PENDING_APPROVAL",
+				"approval_request": pending.Request,
+			},
 		})
 		return
 	}
 
 	// Every refusal carries its §3 typed code (errcodes.go).
-	writeErrJSON := func(w http.ResponseWriter, status int, msg, corrID string) {
+	writeErrJSON := func(w http.ResponseWriter, r *http.Request, status int, msg, corrID string) {
 		code, ok := errorCodeFor(err)
 		if !ok {
 			code = codeForStatus(status)
 		}
-		writeErrCoded(w, status, code, msg, corrID)
+		writeErrCoded(w, r, status, code, msg, corrID)
 	}
 
 	if status, msg, ok := mapORGError(err); ok {
-		writeErrJSON(w, status, msg, corrID)
+		writeErrJSON(w, r, status, msg, corrID)
 		return
 	}
 
 	switch {
 	case errors.Is(err, registry.ErrNotFound):
-		writeErrJSON(w, http.StatusNotFound, "not found", corrID)
+		writeErrJSON(w, r, http.StatusNotFound, "not found", corrID)
 	case errors.Is(err, registry.ErrInvalidTransition):
-		writeErrJSON(w, http.StatusUnprocessableEntity, err.Error(), corrID)
+		writeErrJSON(w, r, http.StatusUnprocessableEntity, err.Error(), corrID)
 	case errors.Is(err, registry.ErrUnauthenticated):
 		// 401, not 403: the caller was never identified, so there is no
 		// principal to evaluate a grant against. Kept distinct so an operator
 		// can tell "the gateway did not forward an identity" apart from
 		// "this principal is not permitted".
-		writeErrJSON(w, http.StatusUnauthorized, "unauthenticated: no verified principal on request", corrID)
+		writeErrJSON(w, r, http.StatusUnauthorized, "unauthenticated: no verified principal on request", corrID)
 	case errors.Is(err, registry.ErrUnauthorized):
-		writeErrJSON(w, http.StatusForbidden, "forbidden", corrID)
+		writeErrJSON(w, r, http.StatusForbidden, "forbidden", corrID)
 	case errors.Is(err, registry.ErrServiceUnavailable):
-		writeErrJSON(w, http.StatusServiceUnavailable, "upstream service unavailable — request rejected", corrID)
+		writeErrJSON(w, r, http.StatusServiceUnavailable, "upstream service unavailable — request rejected", corrID)
 	case errors.Is(err, registry.ErrInvalidInput):
-		writeErrJSON(w, http.StatusBadRequest, err.Error(), corrID)
+		writeErrJSON(w, r, http.StatusBadRequest, err.Error(), corrID)
 	case errors.Is(err, registry.ErrConflict):
-		writeErrJSON(w, http.StatusConflict, err.Error(), corrID)
+		writeErrJSON(w, r, http.StatusConflict, err.Error(), corrID)
 	case errors.Is(err, registry.ErrRegionUnresolved):
-		writeErrJSON(w, http.StatusConflict, err.Error(), corrID)
+		writeErrJSON(w, r, http.StatusConflict, err.Error(), corrID)
 	default:
 		h.log.Error("unhandled service error", zap.Error(err), zap.String("correlation_id", corrID))
-		writeErrCoded(w, http.StatusInternalServerError, CodeInternal, "internal server error", corrID)
+		writeErrCoded(w, r, http.StatusInternalServerError, CodeInternal, "internal server error", corrID)
 	}
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
+// writeErrJSON writes a refusal that has no service error behind it; the code
+// follows from the status.
+func writeErrJSON(w http.ResponseWriter, r *http.Request, status int, msg, corrID string) {
+	writeErrCoded(w, r, status, codeForStatus(status), msg, corrID)
+}
 
-type errorResponse struct {
-	Error string `json:"error"`
-	// ErrorCode is the stable §3 typed code; Error is prose and may change.
-	ErrorCode     string `json:"error_code"`
-	CorrelationID string `json:"correlation_id,omitempty"`
+func writeErrCoded(w http.ResponseWriter, r *http.Request, status int, code, msg, corrID string) {
+	p := apicontract.ProblemFor(status, code, msg)
+	p.CorrelationID = corrID
+	apicontract.WriteProblem(w, r, p)
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {
@@ -637,19 +646,9 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 	_ = json.NewEncoder(w).Encode(body)
 }
 
-// writeErrJSON writes a refusal that has no service error behind it; the code
-// follows from the status.
-func writeErrJSON(w http.ResponseWriter, status int, msg, corrID string) {
-	writeErrCoded(w, status, codeForStatus(status), msg, corrID)
-}
-
-func writeErrCoded(w http.ResponseWriter, status int, code, msg, corrID string) {
-	writeJSON(w, status, errorResponse{Error: msg, ErrorCode: code, CorrelationID: corrID})
-}
-
 func decode(w http.ResponseWriter, r *http.Request, dst any) bool {
 	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
-		writeErrJSON(w, http.StatusBadRequest, "invalid request body", correlationID(r))
+		writeErrJSON(w, r, http.StatusBadRequest, "invalid request body", correlationID(r))
 		return false
 	}
 	return true
@@ -671,12 +670,12 @@ func correlationID(r *http.Request) string {
 func parseEndDate(w http.ResponseWriter, r *http.Request) (time.Time, bool) {
 	raw := r.URL.Query().Get("end_date")
 	if raw == "" {
-		writeErrJSON(w, http.StatusBadRequest, "end_date query parameter is required (RFC3339)", correlationID(r))
+		writeErrJSON(w, r, http.StatusBadRequest, "end_date query parameter is required (RFC3339)", correlationID(r))
 		return time.Time{}, false
 	}
 	t, err := time.Parse(time.RFC3339, raw)
 	if err != nil {
-		writeErrJSON(w, http.StatusBadRequest, "end_date must be RFC3339 format", correlationID(r))
+		writeErrJSON(w, r, http.StatusBadRequest, "end_date must be RFC3339 format", correlationID(r))
 		return time.Time{}, false
 	}
 	return t, true

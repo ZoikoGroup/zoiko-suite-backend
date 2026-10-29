@@ -32,7 +32,7 @@ func catalogue() *stubProtectedActions {
 func errCode(t *testing.T, body string) string {
 	t.Helper()
 	var e struct {
-		ErrorCode string `json:"error_code"`
+		ErrorCode string `json:"code"`
 	}
 	if err := json.Unmarshal([]byte(body), &e); err != nil {
 		t.Fatalf("error body is not JSON: %q", body)

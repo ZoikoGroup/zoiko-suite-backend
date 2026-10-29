@@ -268,7 +268,7 @@ func TestCreateContract_EmbeddingPinIsValidated(t *testing.T) {
 			h.store.sources = []domain.SearchSource{{SourceID: "s-1", SourceType: "obligation", SensitivityCeiling: domain.SensitivityRestricted}}
 			w := do(h, req(t, http.MethodPost, "/v1/index-contracts", contractBody(emb)))
 			assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
-			assert.Equal(t, "invalid_embedding_contract", bodyOf(t, w)["error"])
+			assert.Equal(t, "invalid_embedding_contract", errorCode(t, w))
 		})
 	}
 }
@@ -328,13 +328,13 @@ func TestTransitionGeneration_MigrationNeedsCertification(t *testing.T) {
 
 	w := do(h, req(t, http.MethodPost, path, map[string]any{"state": "READY"}))
 	require.Equal(t, http.StatusConflict, w.Code, w.Body.String())
-	assert.Equal(t, "retrieval_evaluation_required", bodyOf(t, w)["error"])
+	assert.Equal(t, "retrieval_evaluation_required", errorCode(t, w))
 
 	h.store.evaluations = []domain.RetrievalEvaluation{{GenerationID: "88888888-8888-8888-8888-888888888888",
 		PinnedModel: "m@1", K: 10, Recall: 0.4, MinRecall: 0.8, Passed: false}}
 	w = do(h, req(t, http.MethodPost, path, map[string]any{"state": "READY"}))
 	require.Equal(t, http.StatusConflict, w.Code)
-	assert.Equal(t, "retrieval_evaluation_failed", bodyOf(t, w)["error"])
+	assert.Equal(t, "retrieval_evaluation_failed", errorCode(t, w))
 
 	h.store.evaluations = append(h.store.evaluations, domain.RetrievalEvaluation{
 		GenerationID: "88888888-8888-8888-8888-888888888888", PinnedModel: "m@1", K: 10, Recall: 0.9, MinRecall: 0.8, Passed: true})

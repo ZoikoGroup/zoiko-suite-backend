@@ -20,12 +20,13 @@ service refuses to analyze without them.
 
 Overall: the advisory claim holds — the service writes only its own tables
 and never posts, waives or clears anything — and the tolerance gate is real.
-It now consumes bank-reconciliation (A1), but it still never proposes a
-candidate match against a counterpart record (A2a; duplicate-entry detection
-within a run is done, A2), which is the other half of what the data model and the
-ownership table say it is for. Two defects were fixed in this pass (B1, B2);
-a later pass closed A7 and the decimal half of A4; a third closed A1, A3 and
-A6; the latest closes A8 and A9.
+It now consumes bank-reconciliation (A1), detects duplicate entries within
+a run (A2), and proposes the book side of an UNMATCHED line: a FINALIZED
+general-ledger-svc journal, as an advisory AUTO_MATCH or DATE_SKEW (A2a,
+2026-10-26). It does not yet propose a banking-connector-svc canonical
+transaction (A2b). Two defects were fixed in this pass (B1, B2); a later pass
+closed A7 and the decimal half of A4; a third closed A1, A3 and A6; a fourth
+closed A8 and A9; a fifth closed A5; the latest closes A2a.
 
 ## A. Not implemented / weaker than the spec
 
@@ -85,7 +86,8 @@ A6; the latest closes A8 and A9.
   human. `AMOUNT_MISMATCH` / `TIMING_ADJUSTMENT` are produced only on pre-A1
   jobs.
 - **A2a. No candidate match against a counterpart record: `AUTO_MATCH` and
-  `DATE_SKEW` are never produced.** Both mean proposing a counterpart for an
+  `DATE_SKEW` are never produced** (closed 2026-10-26 for the ledger side; the
+  canonical-transaction side is A2b). *Finding, as recorded:* Both mean proposing a counterpart for an
   UNMATCHED statement line, and that counterpart is never another
   bank-reconciliation-svc record. bank-reconciliation-svc's own match
   verification (`MatchStatementLine` / `RunAutomaticMatching` →
@@ -111,6 +113,126 @@ A6; the latest closes A8 and A9.
   tolerance) or `DATE_SKEW` (same amount, dated beyond it), naming the journal or
   transaction id — still advisory: the match is proposed and confirmed in
   bank-reconciliation-svc's own maker-checker flow, by humans.
+
+  *Resolution (2026-10-26).* The ledger side is done.
+
+  - **Why the ledger side.** A run's lines are the bank side. BNK-05's own
+    purpose is reconciling bank activity "to authoritative
+    ledger/subledger/payment/receipt populations", so the counterpart that
+    makes a line reconciled is a book entry. A canonical transaction is
+    BNK-04's normalized form of a bank statement line, the same bank fact
+    again.
+  - **The read.** general-ledger-svc's ACC-05 `QueryLedger` gains a
+    transaction-date window and a journal-status filter, plus an index
+    (its B14).
+    - `internal/bankrec` now decodes `gl_cash_account_code`.
+    - A new read-only `internal/ledger` client reads one cash account's
+      FINALIZED entries in `[statement date − horizon, statement date +
+      horizon]`.
+    - A run is one bank account and one statement date, so this is one read
+      per run, not per line.
+  - **The match rule.** `domain/candidates.go` applies bank-reconciliation-
+    svc's own acceptance rule (`verifyJournalMatches`). Entries are grouped
+    per journal, and the journal's net movement on the line's cash account
+    (debits minus credits) must equal the line's signed amount exactly, as
+    `big.Rat`. It must also be of the line's tenant and legal entity, which
+    the read is scoped to and the client re-checks.
+    - The journal's entries must also be in the line's currency, which
+      bank-reconciliation-svc does not check for journals.
+    - Direction follows from the sign: money in is a debit to cash.
+  - **Outcomes.**
+    - *One journal within the governed date tolerance:* `AUTO_MATCH`, naming
+      it in `counterpart_journal_id`, confidence label 90.
+    - *None within the tolerance, one beyond it inside the horizon:*
+      `DATE_SKEW` with `MANUAL_REVIEW`, naming it, confidence label 65.
+    - *More than one candidate, or one journal qualifying for two lines:*
+      `AMBIGUOUS`. Nothing is named, and the candidates are listed in the
+      rationale. One journal can be matched to one line only, so naming it
+      for two would invite a human to confirm both.
+    - *No candidate:* `NO_CANDIDATE`.
+    - *A line with no `gl_cash_account_code`:* `NO_CASH_ACCOUNT`.
+  - **How results are recorded.**
+    - Every searched line stores its outcome (`candidate_search_outcome`)
+      and the tolerance version it was judged by (`date_tolerance_version`),
+      so "searched, nothing found" is a recorded result.
+    - A proposal replaces the missing-reference suggestion. Every other
+      outcome is noted on it, so each line is still the subject of exactly
+      one suggestion (A3's invariant).
+    - An AMBIGUOUS line is never recommended for write-off.
+    - A DUPLICATE_ENTRY copy is not searched; the entry it duplicates is.
+  - **The tolerance is governed.** AUTO_MATCH against DATE_SKEW is decided by
+    a financial-control-svc TolerancePolicy, metric
+    `RECONCILIATION_CANDIDATE_DATE_MATCH`. That is the same versioned
+    registry the write-off tolerance comes from: its `date_tolerance_days`
+    with `date_basis`.
+    - No policy is 424, as for the write-off tolerance.
+    - A `BUSINESS` basis is also 424. No business-day calendar exists, and
+      financial-control-svc's own matcher counts calendar days too.
+    - **Deployment prerequisite:** analyses for a legal entity return 424
+      until an operator approves that policy for it.
+  - **Fail closed.** If the read fails, nothing is analyzed, because "could
+    not look" must never become "no candidate":
+    - general-ledger-svc unreachable: 503;
+    - a row outside the requested tenant, entity, account or window, or an
+      amount that cannot be held exactly: 502;
+    - a full page of 1000 entries (there is no cursor, general-ledger-svc
+      A15): 422.
+  - **Still advisory.** Every suggestion is `RECOMMENDED`. Nothing here
+    writes to bank-reconciliation-svc or general-ledger-svc; both test fakes
+    fail on any non-GET. `ValidateExecutionRef` already refuses a ledger
+    journal on an EXECUTED `AUTO_MATCH`: that match is made in
+    bank-reconciliation-svc's propose/confirm flow, by humans.
+  - **Storage.** Migration 000008 adds `counterpart_journal_id`,
+    `candidate_search_outcome` and `date_tolerance_version`, with CHECKs:
+    - a journal is named exactly when the outcome is
+      WITHIN_DATE_TOLERANCE or DATE_SKEW;
+    - AUTO_MATCH requires WITHIN_DATE_TOLERANCE and a journal;
+    - an outcome has a positive version.
+
+    The resolution event carries the journal and outcome. The down
+    migration refuses while any row carries a result. It turns
+    `row_security` off first, so a role subject to RLS fails the guard
+    loudly instead of seeing no rows and dropping the data.
+
+  *Tests:*
+  - `internal/domain/candidates_test.go`: AUTO_MATCH; DATE_SKEW; NO_CANDIDATE
+    as an explicit result; a same-amount journal of another legal entity,
+    currency or tenant never proposed; direction and per-journal netting;
+    ambiguity, including one journal for two lines; within beats skew;
+    no-cash-account; duplicate copies not searched.
+  - `internal/handler/candidate_match_test.go`, through the real analyze
+    route:
+    - proposals, with one ledger read for a three-line run and its exact
+      query parameters;
+    - a currency mismatch is not proposed;
+    - another entity's journal in the response is 502, unreachable is 503,
+      and a full page is 422;
+    - an ungoverned or BUSINESS date tolerance is 424;
+    - an approved AUTO_MATCH executed with a journal reference is refused
+      by the execution-reference rule.
+  - `internal/ledger/client_test.go`, `internal/financialcontrol/date_tolerance_test.go`,
+    and the `gl_cash_account_code` decode test in `internal/bankrec`.
+  - `internal/store/candidate_match_test.go` on real Postgres: round trip,
+    the CHECKs refusing inconsistent rows, and the down migration refusing
+    while a result exists and succeeding once none does.
+- **A2b. No candidate match against a banking-connector-svc canonical
+  transaction, and the ledger search has known limits** (open, narrower than
+  A2a).
+  1. *The canonical side.* banking-connector-svc still exposes canonical
+     transactions only by id (`GET /v1/banking/canonical-transactions/{id}`).
+     Proposing one needs a scoped list route there: by tenant, bank account
+     or connection, currency and a date window, NORMALIZED only. Its
+     ZS-SVC-E-001 BNK-04 read contract has no such query yet.
+  2. *Multiple journals.* A journal is a candidate only if its own net
+     movement equals the line. One payment booked as two journals is not
+     found.
+  3. *Already-matched journals.* A journal already matched to another line
+     in an earlier run is still a candidate. bank-reconciliation-svc offers
+     no lookup by journal id, so this service cannot exclude it;
+     bank-reconciliation-svc's confirm step is where a double match would
+     have to be refused.
+  4. *No paging.* A cash account with 1000 or more entries in the window
+     cannot be read (general-ledger-svc A15).
 - **A3. One-directional** (closed — the framing no longer applies). Only side
   A was walked: a side-B item with no side-A counterpart was never reported,
   and `total_processed_count` and the rate counted side A only. Since A1 there
@@ -141,13 +263,28 @@ A6; the latest closes A8 and A9.
   Since A1 the source line does have one (bank-reconciliation-svc's
   `currency_code`); it is read but not yet stored or compared.
 - **A5. `WRITE_OFF` and `TIMING_ADJUSTMENT` are accounting actions, and
-  `EXECUTED` has no reference.** The service recommends them, which is
-  allowed (advisory), but marking a suggestion `EXECUTED` records no
-  reference to the authoritative command that did it (journal id, adjustment
-  id). ZS-CONTROL-001 §21/§24 require remediation to reference the owning
-  domain's command, never free text. Scope: require an `authoritative_ref` on
-  `EXECUTED`, or drop `EXECUTED` and let the owning domain's event close the
-  suggestion.
+  `EXECUTED` has no reference.** — Closed (B6). The service recommends them,
+  which is allowed (advisory), but marking a suggestion `EXECUTED` recorded no
+  reference to the authoritative command that did it, only free text in
+  `resolution_notes`. ZS-CONTROL-001 requires the RemediationAction to carry
+  an "authoritative command reference", and its evidence standard says
+  "Journal/reversal/adjustment/credit/debit note IDs; control does not embed
+  authoritative correction as free text". `POST …/apply` now takes a
+  structured `authoritative_ref`, `{"kind":"GL_JOURNAL","journal_id":"<uuid>"}`:
+  the general-ledger-svc journal that posted the correction. Marking a
+  `WRITE_OFF` or `TIMING_ADJUSTMENT` `EXECUTED` without one is 400, and the
+  suggestion stays `APPROVED`. A note is not accepted in its place. A
+  reference that is malformed, or sent with any decision other than
+  `EXECUTED`, is also 400. Migration 000007 stores it in two columns, and the
+  database refuses an `EXECUTED` accounting action without one. The reference
+  is returned on the suggestion and carried on the
+  `reconciliation.resolution_recommended` event. `EXECUTED` is kept: the
+  doc's other option, dropping it and letting the owning domain's event close
+  the suggestion, is a larger change than this gap needs.
+  *Still open:* the reference is caller-asserted. Its shape is checked, but
+  general-ledger-svc is not asked whether the journal exists, is posted, or
+  belongs to the suggestion's entity (B6). Suggestions `EXECUTED` before
+  000007 carry no reference, and none is reconstructed.
 - **A6. Reads are not authorized** (closed). `GET /v1/reconciliations` and
   `GET /v1/reconciliations/{id}` checked only the tenant (RLS); any principal
   of the tenant could read every legal entity's jobs and items. Both now
@@ -250,3 +387,64 @@ A6; the latest closes A8 and A9.
   in-repo consumer of the old names is the Postman collection, whose apply
   request still sends `resolution_status`, so it exercises the alias rather
   than a hard break.
+- **B7. Candidate-search decisions (A2a) a reviewer may reverse.**
+  - *The search horizon is a service setting.* `CANDIDATE_SEARCH_HORIZON_DAYS`
+    (1–366, default 31, refused at startup otherwise) bounds how far the
+    ledger read reaches for a DATE_SKEW candidate. It is a read bound, not a
+    match criterion: AUTO_MATCH against DATE_SKEW is the governed tolerance,
+    and the window read is never narrower than it. It could instead be a
+    second governed policy field.
+  - *What AUTO_MATCH is recorded as.* An in-tolerance proposal is
+    `MISSING_REFERENCE` / `AUTO_MATCH`: the line's discrepancy is its
+    missing link to a book entry, and the discrepancy amount is 0.
+    `DATE_SKEW` gets `MANUAL_REVIEW`, never `TIMING_ADJUSTMENT`, because a
+    timing adjustment is a posting (A5) and here the question is only
+    whether the dates are close enough to match.
+  - *Exact amount.* Matching requires the exact amount, as
+    bank-reconciliation-svc's own verification does. No amount tolerance
+    applies to a proposal.
+  - *Currency.* It is required to match, which is stricter than
+    bank-reconciliation-svc's journal check.
+- **B6. A5's reference is a ledger journal id, asserted by the caller, and
+  required only for accounting actions.**
+  1. *One shape, `journal_id`.* Both `WRITE_OFF` and `TIMING_ADJUSTMENT` of a
+     bank reconciling item are postings to the entity's own books.
+     general-ledger-svc is the only service that posts them, and it returns
+     the same identifier for every journal it posts: the UUID `journal_id`.
+     That covers its ADJUSTMENT, ACCRUAL, REVERSAL and STANDARD journals, so
+     a reversal is a journal id as well. Nothing that owns a bank line issues
+     an `adjustment_id`. bank-reconciliation-svc has no write-off or
+     adjustment command. consolidation-svc's `adjustment_id` is for
+     consolidation-only adjustments, which never touch an entity's books, and
+     accounts-receivable-svc's is for receivables. The reference still
+     carries `kind` (only `GL_JOURNAL` today), so another owning domain's
+     command can be added without changing what is stored.
+  2. *Which recommendations need one.* `WRITE_OFF` and `TIMING_ADJUSTMENT`
+     must have one. `MANUAL_REVIEW` may have one, because a review can end in
+     a journal or in nothing to post. `CONFIRM_DUPLICATE` and `AUTO_MATCH`
+     refuse one, because they are carried out in bank-reconciliation-svc, not
+     the ledger. bank-reconciliation-svc has no command that removes a
+     duplicate line, so those two still reach `EXECUTED` with no reference;
+     there is nothing yet for them to name.
+  3. *Asserted, not verified.* Nothing else in the apply request is checked
+     against another service: the status is checked against the allowed
+     decisions, and the note is free text. The only outside call is the
+     authorization check. The reference follows the same rule. It must be
+     whole, of a known kind, and a UUID, which is canonicalized. Whether it
+     is required depends on the suggestion's recommendation, which the store
+     reads from the row it already locks. So a decision adds no query and no
+     outside call, on a path every decision takes. Verifying it would need a
+     call to general-ledger-svc for each `EXECUTED` decision, made
+     before the row is locked. That call would return the journal's status
+     and legal entity.
+  4. *Database.* Two CHECKs in migration 000007 enforce this:
+     - `reconciliation_suggestion_authoritative_ref_check`: a reference is
+       whole or absent, is `GL_JOURNAL`, is recorded only on `EXECUTED`, and
+       only on `WRITE_OFF`, `TIMING_ADJUSTMENT` or `MANUAL_REVIEW`.
+     - `reconciliation_suggestion_accounting_execution_check`: an `EXECUTED`
+       `WRITE_OFF` or `TIMING_ADJUSTMENT` has a reference. It is `NOT VALID`,
+       so rows `EXECUTED` before 000007 stay as they are, and every new write
+       is held to it.
+
+     The down migration refuses, with "cannot roll back 000007: recorded
+     authoritative references exist", while any reference is recorded.

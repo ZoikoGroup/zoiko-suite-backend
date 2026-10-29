@@ -2,7 +2,9 @@ package config
 
 import (
 	"errors"
+	"fmt"
 	"os"
+	"strconv"
 )
 
 type Config struct {
@@ -31,6 +33,19 @@ type Config struct {
 	// only: nothing here writes to it (see internal/bankrec).
 	BankReconciliationURL string
 
+	// GeneralLedgerURL is general-ledger-svc's base URL — read-only, for the
+	// FINALIZED ledger entries a candidate search proposes a statement
+	// line's book side from (A2a; see internal/ledger).
+	GeneralLedgerURL string
+
+	// CandidateSearchHorizonDays bounds how far from a statement date the
+	// candidate search reads (CANDIDATE_SEARCH_HORIZON_DAYS, 1-366, default
+	// 31). It is a read bound, not a match criterion: whether a journal is an
+	// AUTO_MATCH or only a DATE_SKEW is decided by the governed
+	// RECONCILIATION_CANDIDATE_DATE_MATCH tolerance from financial-control-svc.
+	// The window actually read is never narrower than that tolerance.
+	CandidateSearchHorizonDays int
+
 	// AuthzMTLSEnabled/AuthzMTLSURL wire this service into the material-path
 	// mTLS pilot (see authorization-svc/internal/mtls's doc comment).
 	// Disabled by default — AuthzURL (plain HTTP) keeps being used unless
@@ -54,6 +69,11 @@ func Load() (*Config, error) {
 	logLevel := getEnv("LOG_LEVEL", "info")
 	financialControlURL := getEnv("FINANCIAL_CONTROL_SERVICE_URL", "http://financial-control-svc:8171")
 	bankReconciliationURL := getEnv("BANK_RECONCILIATION_SERVICE_URL", "http://bank-reconciliation-svc:8102")
+	generalLedgerURL := getEnv("GENERAL_LEDGER_SERVICE_URL", "http://general-ledger-svc:8098")
+	horizon, err := strconv.Atoi(getEnv("CANDIDATE_SEARCH_HORIZON_DAYS", "31"))
+	if err != nil || horizon < 1 || horizon > 366 {
+		return nil, fmt.Errorf("CANDIDATE_SEARCH_HORIZON_DAYS must be a whole number of days from 1 to 366")
+	}
 
 	return &Config{
 		EventResidencyRegion: region,
@@ -66,6 +86,9 @@ func Load() (*Config, error) {
 		FinancialControlURL:  financialControlURL,
 
 		BankReconciliationURL: bankReconciliationURL,
+
+		GeneralLedgerURL:           generalLedgerURL,
+		CandidateSearchHorizonDays: horizon,
 
 		AuthzMTLSEnabled:         getEnv("AUTHZ_MTLS_ENABLED", "false") == "true",
 		AuthzMTLSURL:             getEnv("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),

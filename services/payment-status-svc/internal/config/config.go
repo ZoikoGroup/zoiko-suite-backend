@@ -37,14 +37,10 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("DATABASE_URL is required")
 	}
 	secret := os.Getenv("WEBHOOK_SHARED_SECRET")
-	if secret == "" {
-		// A real provider integration would set this to the actual secret
-		// the provider issues at webhook-configuration time. This default
-		// only exists so the service is runnable in a fresh dev
-		// environment with no real provider connected — it must never be
-		// used in any environment a real callback could reach.
-		secret = "dev-only-shared-secret-replace-before-any-real-integration"
-	}
+	// No development default: a shared secret that is publicly known is
+	// equivalent to no authentication at all. Empty leaves the legacy webhook
+	// receiver switched off (it fails closed with 503) while the profile-driven
+	// endpoint keeps using per-tenant vault secrets.
 	return &Config{
 		Port:                  port,
 		DatabaseURL:           dbURL,

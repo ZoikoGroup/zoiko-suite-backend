@@ -24,6 +24,7 @@ import (
 	"zoiko.io/general-ledger-svc/internal/domain"
 	"zoiko.io/general-ledger-svc/internal/handler"
 	"zoiko.io/general-ledger-svc/internal/kernel"
+	svcenvelope "zoiko.io/general-ledger-svc/internal/envelope"
 	svcmiddleware "zoiko.io/general-ledger-svc/internal/middleware"
 	"zoiko.io/general-ledger-svc/internal/store"
 )
@@ -40,6 +41,8 @@ type kenv struct {
 	entity string
 	ts     *httptest.Server
 	denied sync.Map
+	periods *fakePeriods
+	pg      *store.PgStore
 }
 
 type fakeAuthz struct{ e *kenv }
@@ -66,7 +69,7 @@ func newKEnv(t *testing.T) *kenv {
 	ctx := context.Background()
 	_, _ = admin.Exec(ctx, `DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='kernel_app') THEN
 		CREATE ROLE kernel_app LOGIN PASSWORD 'app' NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS; END IF; END $$`)
-	for _, q := range []string{`GRANT USAGE ON SCHEMA public TO kernel_app`, `GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO kernel_app`} {
+	for _, q := range []string{`GRANT USAGE ON SCHEMA public TO kernel_app`, `GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO kernel_app`, `GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO kernel_app`} {
 		if _, err := admin.Exec(ctx, q); err != nil {
 			t.Fatal(err)
 		}
@@ -81,9 +84,16 @@ func newKEnv(t *testing.T) *kenv {
 	e := &kenv{admin: admin, app: app, tenant: uuid.NewString(), entity: uuid.NewString()}
 	e.repo = store.NewKernelRepo(app, "uk")
 	e.svc = &kernel.Service{Repo: e.repo}
+	e.periods = &fakePeriods{states: map[string]string{}}
+	e.pg = store.New(app, zap.NewNop(), store.WithEventRegion("uk"))
 	r := chi.NewRouter()
 	r.Use(svcmiddleware.TenantContext())
-	handler.RegisterKernelRoutes(r, handler.NewKernel(e.svc, e.repo, e.repo, fakeUnits{"JPY": 0}, nil, fakeAuthz{e}, zap.NewNop()))
+	r.Use(svcenvelope.MiddlewareWithMode(svcenvelope.ServicePolicy(), svcenvelope.ModeObserve, nil))
+	handler.RegisterKernelRoutes(r, handler.NewKernel(e.svc, e.repo, e.repo, fakeUnits{"JPY": 0}, nil, fakeAuthz{e}, zap.NewNop()).
+		WithPeriodGate(handler.ClosePeriodGate{Close: e.periods, Authz: fakeAuthz{e}}).
+		WithSigner(kernel.HMACSigner{Key: []byte("test-signing-key-test-signing-key!!"), KeyID: "test-k1"}))
+	handler.RegisterRoutes(r, handler.New(e.pg, nopPublisher{}, fakeAuthz{e}, e.periods, kenvLogger()).
+		WithJournalControls(e.pg, handler.ManualJournalPolicy{EvidenceThresholdCents: 1000000}))
 	e.ts = httptest.NewServer(r)
 	t.Cleanup(e.ts.Close)
 	return e

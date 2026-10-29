@@ -95,24 +95,24 @@ type ProfileResponse struct {
 	Check      *domain.DependencyCheck   `json:"dependency_check,omitempty"`
 }
 
-func (h *Handler) parseProfileRequest(w http.ResponseWriter, req *ProfileRequest) (time.Time, bool) {
+func (h *Handler) parseProfileRequest(w http.ResponseWriter, r *http.Request, req *ProfileRequest) (time.Time, bool) {
 	if field := firstBlank(requiredField{"jurisdiction", req.Jurisdiction}, requiredField{"kind", req.Kind},
 		requiredField{"profile_code", req.ProfileCode}, requiredField{"effective_at", req.EffectiveAt}); field != "" {
-		writeMissingField(w, field)
+		writeMissingField(w, r, field)
 		return time.Time{}, false
 	}
 	if _, _, ok := profileDomain(req.Kind); !ok {
-		writeError(w, http.StatusBadRequest, "invalid_kind", "kind must be EINVOICE or FILING")
+		writeError(w, r, http.StatusBadRequest, "invalid_kind", "kind must be EINVOICE or FILING")
 		return time.Time{}, false
 	}
 	at, err := time.Parse(time.RFC3339Nano, req.EffectiveAt)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_effective_at", "effective_at must be an RFC3339 instant")
+		writeError(w, r, http.StatusBadRequest, "invalid_effective_at", "effective_at must be an RFC3339 instant")
 		return time.Time{}, false
 	}
 	for _, u := range req.Used {
 		if strings.TrimSpace(u.Ref) == "" || strings.TrimSpace(u.Version) == "" {
-			writeError(w, http.StatusBadRequest, "invalid_dependencies_used", "each dependencies_used entry needs ref and version")
+			writeError(w, r, http.StatusBadRequest, "invalid_dependencies_used", "each dependencies_used entry needs ref and version")
 			return time.Time{}, false
 		}
 	}
@@ -134,7 +134,7 @@ func (h *Handler) ResolveSubmissionProfile(w http.ResponseWriter, r *http.Reques
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	at, ok := h.parseProfileRequest(w, &req)
+	at, ok := h.parseProfileRequest(w, r, &req)
 	if !ok {
 		return
 	}
@@ -147,7 +147,7 @@ func (h *Handler) ResolveSubmissionProfile(w http.ResponseWriter, r *http.Reques
 	rawReq, _ := json.Marshal(canon)
 	res, err := h.resolveProfile(r, req.Kind, req.Jurisdiction, req.ProfileCode, at, req.Used, req.PackRef, req.PackVersion)
 	if err != nil {
-		h.writeResolveError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeResolveError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	body := ProfileResponse{Outcome: res.Outcome, Resolution: res.Decision, Profile: res.Profile, Check: res.Check}
@@ -177,16 +177,16 @@ func (h *Handler) RegisterSubmission(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	at, ok := h.parseProfileRequest(w, &req.ProfileRequest)
+	at, ok := h.parseProfileRequest(w, r, &req.ProfileRequest)
 	if !ok {
 		return
 	}
 	if field := firstBlank(requiredField{"subject_ref", req.SubjectRef}, requiredField{"payload_hash", req.PayloadHash}); field != "" {
-		writeMissingField(w, field)
+		writeMissingField(w, r, field)
 		return
 	}
 	if len(req.SubjectRef) > 256 || !sha256Re.MatchString(req.PayloadHash) {
-		writeError(w, http.StatusBadRequest, "invalid_payload", "subject_ref is at most 256 characters and payload_hash must be sha256:<64 hex>")
+		writeError(w, r, http.StatusBadRequest, "invalid_payload", "subject_ref is at most 256 characters and payload_hash must be sha256:<64 hex>")
 		return
 	}
 	idemKey, ok := h.idempotencyKey(w, r)
@@ -201,7 +201,7 @@ func (h *Handler) RegisterSubmission(w http.ResponseWriter, r *http.Request) {
 
 	res, err := h.resolveProfile(r, req.Kind, req.Jurisdiction, req.ProfileCode, at, req.Used, req.PackRef, req.PackVersion)
 	if err != nil {
-		h.writeResolveError(w, err, corr)
+		h.writeResolveError(w, r, err, corr)
 		return
 	}
 	outcome, check := res.Outcome, res.Check
@@ -228,10 +228,10 @@ func (h *Handler) RegisterSubmission(w http.ResponseWriter, r *http.Request) {
 		SubmittedBy: actor, RequestDigest: reqDigest, IdempotencyKey: idemKey})
 	if err != nil {
 		if errors.Is(err, domain.ErrIdempotencyConflict) {
-			writeError(w, http.StatusConflict, "idempotency_conflict", err.Error())
+			writeError(w, r, http.StatusConflict, "idempotency_conflict", err.Error())
 			return
 		}
-		h.writeRegistryError(w, err, corr)
+		h.writeRegistryError(w, r, err, corr)
 		return
 	}
 	status := http.StatusCreated
@@ -262,18 +262,18 @@ func (h *Handler) GetSubmission(w http.ResponseWriter, r *http.Request) {
 	}
 	sub, events, err := h.registry.GetSubmission(r.Context(), chi.URLParam(r, "submission_id"))
 	if err != nil {
-		h.writeSubmissionError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeSubmissionError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"submission": sub, "events": events})
 }
 
-func (h *Handler) writeSubmissionError(w http.ResponseWriter, err error, corr string) {
+func (h *Handler) writeSubmissionError(w http.ResponseWriter, r *http.Request, err error, corr string) {
 	if errors.Is(err, domain.ErrSubmissionNotFound) {
-		writeError(w, http.StatusNotFound, "submission_not_found", err.Error())
+		writeError(w, r, http.StatusNotFound, "submission_not_found", err.Error())
 		return
 	}
-	h.writeRegistryError(w, err, corr)
+	h.writeRegistryError(w, r, err, corr)
 }
 
 type SubmissionEventRequest struct {
@@ -299,22 +299,22 @@ func (h *Handler) RecordSubmissionEvent(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if field := firstBlank(requiredField{"provider_event_id", req.ProviderEventID}, requiredField{"status", req.Status}, requiredField{"occurred_at", req.OccurredAt}); field != "" {
-		writeMissingField(w, field)
+		writeMissingField(w, r, field)
 		return
 	}
 	if len(req.ProviderEventID) > 128 || len(req.ReceiptID) > 256 || !upperSnakeRe.MatchString(req.Status) {
-		writeError(w, http.StatusBadRequest, "invalid_event", "provider_event_id is at most 128 characters, receipt_id at most 256, and status must be UPPER_SNAKE")
+		writeError(w, r, http.StatusBadRequest, "invalid_event", "provider_event_id is at most 128 characters, receipt_id at most 256, and status must be UPPER_SNAKE")
 		return
 	}
 	occurred, err := time.Parse(time.RFC3339Nano, req.OccurredAt)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_occurred_at", "occurred_at must be an RFC3339 instant")
+		writeError(w, r, http.StatusBadRequest, "invalid_occurred_at", "occurred_at must be an RFC3339 instant")
 		return
 	}
 	if len(req.Detail) > 0 && string(req.Detail) != "null" {
 		var obj map[string]any
 		if json.Unmarshal(req.Detail, &obj) != nil || len(req.Detail) > 16*1024 {
-			writeError(w, http.StatusBadRequest, "invalid_detail", "detail must be a JSON object of at most 16 KiB")
+			writeError(w, r, http.StatusBadRequest, "invalid_detail", "detail must be a JSON object of at most 16 KiB")
 			return
 		}
 	} else {
@@ -323,10 +323,11 @@ func (h *Handler) RecordSubmissionEvent(w http.ResponseWriter, r *http.Request) 
 	res, err := h.registry.RecordSubmissionEvent(r.Context(), chi.URLParam(r, "submission_id"), store.SubmissionEventParams{
 		ProviderEventID: req.ProviderEventID, Status: req.Status, ReceiptID: req.ReceiptID, OccurredAt: occurred.UTC(), Detail: req.Detail, RecordedBy: actor})
 	if err != nil {
-		h.writeSubmissionError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeSubmissionError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"replayed": res.Replayed, "applied": res.Event.Disposition == domain.DispApplied, "disposition": res.Event.Disposition,
 		"status": res.Submission.Status, "is_terminal": res.Submission.IsTerminal, "event": res.Event})
 }
+

@@ -3,6 +3,8 @@ package clients
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"math/big"
 	"net/http"
 	"net/url"
 	"time"
@@ -30,21 +32,21 @@ func New(apURL, arURL, obligationsURL string, log *zap.Logger) *Clients {
 }
 
 type apInvoice struct {
-	InvoiceID     string    `json:"invoice_id"`
-	Amount        float64   `json:"amount"`
-	CurrencyCode  string    `json:"currency_code"`
-	Status        string    `json:"status"`
-	LegalEntityID string    `json:"legal_entity_id"`
-	DueDate       time.Time `json:"due_date"`
+	InvoiceID     string         `json:"invoice_id"`
+	Amount        domain.Decimal `json:"amount"`
+	CurrencyCode  string         `json:"currency_code"`
+	Status        string         `json:"status"`
+	LegalEntityID string         `json:"legal_entity_id"`
+	DueDate       time.Time      `json:"due_date"`
 }
 
 type arInvoice struct {
-	InvoiceID     string    `json:"invoice_id"`
-	Amount        float64   `json:"amount"`
-	CurrencyCode  string    `json:"currency_code"`
-	Status        string    `json:"status"`
-	LegalEntityID string    `json:"legal_entity_id"`
-	DueDate       time.Time `json:"due_date"`
+	InvoiceID     string         `json:"invoice_id"`
+	Amount        domain.Decimal `json:"amount"`
+	CurrencyCode  string         `json:"currency_code"`
+	Status        string         `json:"status"`
+	LegalEntityID string         `json:"legal_entity_id"`
+	DueDate       time.Time      `json:"due_date"`
 }
 
 type obligation struct {
@@ -57,10 +59,10 @@ type obligation struct {
 }
 
 // GetPendingAPCommitments gets the sum of AP commitments (validated, approved, payment_requested)
-func (c *Clients) GetPendingAPCommitments(ctx context.Context, tenantID, legalEntityID, currencyCode string) (float64, error) {
+func (c *Clients) GetPendingAPCommitments(ctx context.Context, tenantID, legalEntityID, currencyCode string) (domain.Decimal, error) {
 	u, err := url.Parse(c.apURL + "/v1/invoices")
 	if err != nil {
-		return 0, err
+		return "", err
 	}
 	q := u.Query()
 	q.Set("tenant_id", tenantID)
@@ -69,41 +71,45 @@ func (c *Clients) GetPendingAPCommitments(ctx context.Context, tenantID, legalEn
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
-		return 0, err
+		return "", err
 	}
 	req.Header.Set("X-Tenant-Id", tenantID)
 
 	resp, err := c.http.Do(req)
 	if err != nil {
 		c.log.Error("failed to query AP service", zap.Error(err))
-		return 0, domain.ErrAPServiceUnavailable
+		return "", domain.ErrAPServiceUnavailable
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		c.log.Error("AP service returned non-200 status", zap.Int("status", resp.StatusCode))
-		return 0, domain.ErrAPServiceUnavailable
+		return "", domain.ErrAPServiceUnavailable
 	}
 
 	var list []apInvoice
 	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
-		return 0, err
+		return "", err
 	}
 
-	var sum float64
+	sum := new(big.Rat)
 	for _, inv := range list {
 		if inv.CurrencyCode == currencyCode && (inv.Status == "VALIDATED" || inv.Status == "APPROVED" || inv.Status == "PAYMENT_REQUESTED") {
-			sum += inv.Amount
+			r, err := domain.ValidateMoney(inv.Amount)
+			if err != nil {
+				return "", fmt.Errorf("accounts-payable-svc invoice %s: %w", inv.InvoiceID, err)
+			}
+			sum.Add(sum, r)
 		}
 	}
-	return sum, nil
+	return domain.Decimal(domain.CanonicalAmount(sum)), nil
 }
 
 // GetOutstandingObligations queries obligations service and parses numeric values from SourceReference
-func (c *Clients) GetOutstandingObligations(ctx context.Context, tenantID, legalEntityID, currencyCode string) (float64, float64, error) {
+func (c *Clients) GetOutstandingObligations(ctx context.Context, tenantID, legalEntityID, currencyCode string) (domain.Decimal, domain.Decimal, error) {
 	u, err := url.Parse(c.obligationsURL + "/v1/obligations")
 	if err != nil {
-		return 0, 0, err
+		return "", "", err
 	}
 	q := u.Query()
 	q.Set("legal_entity_id", legalEntityID)
@@ -112,31 +118,31 @@ func (c *Clients) GetOutstandingObligations(ctx context.Context, tenantID, legal
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
-		return 0, 0, err
+		return "", "", err
 	}
 	req.Header.Set("X-Tenant-Id", tenantID)
 
 	resp, err := c.http.Do(req)
 	if err != nil {
 		c.log.Error("failed to query Obligations service", zap.Error(err))
-		return 0, 0, domain.ErrObligationsUnavailable
+		return "", "", domain.ErrObligationsUnavailable
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotFound {
-		return 0, 0, nil
+		return "0", "0", nil
 	}
 	if resp.StatusCode != http.StatusOK {
 		c.log.Error("Obligations service returned non-200 status", zap.Int("status", resp.StatusCode))
-		return 0, 0, domain.ErrObligationsUnavailable
+		return "", "", domain.ErrObligationsUnavailable
 	}
 
 	var list []obligation
 	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
-		return 0, 0, err
+		return "", "", err
 	}
 
-	var payrollSum, taxSum float64
+	var payrollSum, taxSum domain.Decimal = "0", "0"
 
 	// V1 DOCUMENTED GAP: obligations-svc's Obligation struct carries no monetary
 	// field — SourceReference is a human-readable citation string (e.g.
@@ -152,10 +158,10 @@ func (c *Clients) GetOutstandingObligations(ctx context.Context, tenantID, legal
 }
 
 // GetForecastedInflows aggregates outstanding customer receivables (issued, sent, overdue status)
-func (c *Clients) GetForecastedInflows(ctx context.Context, tenantID, legalEntityID, currencyCode string) (float64, error) {
+func (c *Clients) GetForecastedInflows(ctx context.Context, tenantID, legalEntityID, currencyCode string) (domain.Decimal, error) {
 	u, err := url.Parse(c.arURL + "/v1/invoices")
 	if err != nil {
-		return 0, err
+		return "", err
 	}
 	q := u.Query()
 	q.Set("tenant_id", tenantID)
@@ -164,40 +170,45 @@ func (c *Clients) GetForecastedInflows(ctx context.Context, tenantID, legalEntit
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
-		return 0, err
+		return "", err
 	}
 	req.Header.Set("X-Tenant-Id", tenantID)
 
 	resp, err := c.http.Do(req)
 	if err != nil {
 		c.log.Error("failed to query AR service", zap.Error(err))
-		return 0, domain.ErrARServiceUnavailable
+		return "", domain.ErrARServiceUnavailable
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		c.log.Error("AR service returned non-200 status", zap.Int("status", resp.StatusCode))
-		return 0, domain.ErrARServiceUnavailable
+		return "", domain.ErrARServiceUnavailable
 	}
 
 	var list []arInvoice
 	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
-		return 0, err
+		return "", err
 	}
 
-	var sum float64
+	sum := new(big.Rat)
 	for _, inv := range list {
 		if inv.CurrencyCode == currencyCode && (inv.Status == "ISSUED" || inv.Status == "SENT" || inv.Status == "OVERDUE") {
-			sum += inv.Amount
+			r, err := domain.ValidateMoney(inv.Amount)
+			if err != nil {
+				return "", fmt.Errorf("accounts-receivable-svc invoice %s: %w", inv.InvoiceID, err)
+			}
+			sum.Add(sum, r)
 		}
 	}
-	return sum, nil
+	return domain.Decimal(domain.CanonicalAmount(sum)), nil
 }
 
 // GetLiquidityForecastData queries AP, AR, and Obligations services and builds list of expected inflows and outflows
 func (c *Clients) GetLiquidityForecastData(ctx context.Context, tenantID, legalEntityID, currencyCode string) ([]domain.ExpectedCashFlow, []domain.ExpectedCashFlow, error) {
 	var inflows []domain.ExpectedCashFlow
 	var outflows []domain.ExpectedCashFlow
+	var amountErr error
 
 	// 1. Get AR invoices
 	uAR, err := url.Parse(c.arURL + "/v1/invoices")
@@ -215,6 +226,10 @@ func (c *Clients) GetLiquidityForecastData(ctx context.Context, tenantID, legalE
 				if json.NewDecoder(resp.Body).Decode(&list) == nil {
 					for _, inv := range list {
 						if inv.CurrencyCode == currencyCode && (inv.Status == "ISSUED" || inv.Status == "SENT" || inv.Status == "OVERDUE") {
+							if _, verr := domain.ValidateMoney(inv.Amount); verr != nil {
+								amountErr = fmt.Errorf("accounts-receivable-svc invoice %s: %w", inv.InvoiceID, verr)
+								break
+							}
 							inflows = append(inflows, domain.ExpectedCashFlow{
 								Amount:   inv.Amount,
 								DueDate:  inv.DueDate,
@@ -244,6 +259,10 @@ func (c *Clients) GetLiquidityForecastData(ctx context.Context, tenantID, legalE
 				if json.NewDecoder(resp.Body).Decode(&list) == nil {
 					for _, inv := range list {
 						if inv.CurrencyCode == currencyCode && (inv.Status == "VALIDATED" || inv.Status == "APPROVED" || inv.Status == "PAYMENT_REQUESTED") {
+							if _, verr := domain.ValidateMoney(inv.Amount); verr != nil {
+								amountErr = fmt.Errorf("accounts-payable-svc invoice %s: %w", inv.InvoiceID, verr)
+								break
+							}
 							outflows = append(outflows, domain.ExpectedCashFlow{
 								Amount:   inv.Amount,
 								DueDate:  inv.DueDate,
@@ -277,7 +296,7 @@ func (c *Clients) GetLiquidityForecastData(ctx context.Context, tenantID, legalE
 							continue
 						}
 						outflows = append(outflows, domain.ExpectedCashFlow{
-							Amount:   0, // No monetary field available in obligations-svc v1
+							Amount:   "0", // No monetary field available in obligations-svc v1
 							DueDate:  o.DueDate,
 							Category: "OBLIGATION",
 						})
@@ -288,5 +307,5 @@ func (c *Clients) GetLiquidityForecastData(ctx context.Context, tenantID, legalE
 		}
 	}
 
-	return inflows, outflows, nil
+	return inflows, outflows, amountErr
 }

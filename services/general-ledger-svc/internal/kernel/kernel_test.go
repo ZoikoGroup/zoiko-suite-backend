@@ -79,7 +79,7 @@ func rule(c RuleContent) *RuleSet {
 		TestPack: []TestCase{{Name: "basic", Event: TestEvent{EventType: "AR.INVOICE_ISSUED", TransactionCurrency: "GBP",
 			Facts: map[string]string{"document_type": "INVOICE", "gross": "120.00", "net": "100.00", "tax": "20.00"},
 		}, Accounts: map[string]string{"AR": "1100", "REV": "4000", "VAT": "2200", "ROUND": "7999"},
-			Expect: TestExpectation{Lines: []ExpectedLine{{Debit, "1100", "120.00"}, {Credit, "4000", "100.00"}, {Credit, "2200", "20.00"}}}}}}
+			Expect: TestExpectation{Lines: []ExpectedLine{{Side: Debit, AccountCode: "1100", Amount: "120.00"}, {Side: Credit, AccountCode: "4000", Amount: "100.00"}, {Side: Credit, AccountCode: "2200", Amount: "20.00"}}}}}}
 	rs.ContentHash = HashContent(rs.Content, rs.TestPack)
 	return rs
 }
@@ -483,7 +483,7 @@ func TestTestPackAndLifecycle(t *testing.T) {
 	}
 	rs = rule(invoiceContent())
 	rs.TestPack = append(rs.TestPack, TestCase{Name: "missing tax fact", Event: TestEvent{EventType: "AR.INVOICE_ISSUED", TransactionCurrency: "GBP", Facts: map[string]string{"document_type": "INVOICE", "gross": "1.00", "net": "1.00"}},
-		Accounts: map[string]string{"AR": "1100", "REV": "4000", "VAT": "2200"}, Expect: TestExpectation{Lines: []ExpectedLine{{Debit, "1100", "1.00"}, {Credit, "4000", "1.00"}}}})
+		Accounts: map[string]string{"AR": "1100", "REV": "4000", "VAT": "2200"}, Expect: TestExpectation{Lines: []ExpectedLine{{Side: Debit, AccountCode: "1100", Amount: "1.00"}, {Side: Credit, AccountCode: "4000", Amount: "1.00"}}}})
 	rs.TestPack = append(rs.TestPack, TestCase{Name: "no branch", Event: TestEvent{EventType: "AR.INVOICE_ISSUED", TransactionCurrency: "GBP", Facts: map[string]string{"document_type": "CREDIT_NOTE", "gross": "1.00", "net": "1.00", "tax": "0"}},
 		Accounts: map[string]string{"AR": "1100", "REV": "4000", "VAT": "2200"}, Expect: TestExpectation{Exception: FamRule}})
 	if failed := RunTestPack(context.Background(), rs, *book()); len(failed) != 0 {

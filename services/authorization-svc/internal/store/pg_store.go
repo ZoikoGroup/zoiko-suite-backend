@@ -1463,24 +1463,43 @@ func (s *PgStore) RevokeDelegatedAuthority(ctx context.Context, delegatedAuthori
 
 // ── sod_rules ─────────────────────────────────────────────────────────────────
 
+// sodRuleColumns / scanSoDRule: every read of a whole rule, so the 000036
+// publication state travels with it.
+const sodRuleColumns = `sod_rule_id, domain_code, action_a, action_b, conflict_type, jurisdiction_id, tenant_id, active_flag, created_at, version, ` + rulePublicationColumns
+
+func scanSoDRule(row pgx.Row) (*domain.SoDRule, error) {
+	r := &domain.SoDRule{}
+	p := &r.RulePublication
+	err := row.Scan(&r.SoDRuleID, &r.DomainCode, &r.ActionA, &r.ActionB, &r.ConflictType, &r.JurisdictionID, &r.TenantID, &r.ActiveFlag, &r.CreatedAt, &r.Version,
+		&p.PublicationStatus, &p.PendingChange, &p.ChangeRequestedBy, &p.ChangeRequestedAt, &p.ChangeReason,
+		&p.PublishedBy, &p.PublishedAt, &p.RejectedBy, &p.RejectedAt)
+	return r, err
+}
+
+// CreateSoDRule records a REQUEST to publish a conflict rule (000036, AU-17):
+// the rule is inactive and PENDING_APPROVAL until an independent holder of
+// iam.sod_rule.publish approves it (DecideSoDRuleChange).
 func (s *PgStore) CreateSoDRule(ctx context.Context, params domain.CreateSoDRuleParams) (*domain.SoDRule, error) {
 	if params.SoDRuleID == "" {
 		params.SoDRuleID = uuid.New().String()
 	}
 
 	const query = `
-		INSERT INTO sod_rules (sod_rule_id, domain_code, action_a, action_b, conflict_type, jurisdiction_id, tenant_id)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
-		RETURNING sod_rule_id, domain_code, action_a, action_b, conflict_type, jurisdiction_id, tenant_id, active_flag, created_at, version;`
+		INSERT INTO sod_rules (sod_rule_id, domain_code, action_a, action_b, conflict_type, jurisdiction_id, tenant_id,
+			active_flag, publication_status, pending_change, change_requested_by, change_requested_at, change_reason)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, FALSE, 'PENDING_APPROVAL', 'PUBLISH', NULLIF($8, ''), NOW(), NULLIF($9, ''))
+		RETURNING ` + sodRuleColumns + `;`
 
 	var tenantID string
 	if params.TenantID != nil {
 		tenantID = *params.TenantID
 	}
-	r := &domain.SoDRule{}
+	var r *domain.SoDRule
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		return tx.QueryRow(ctx, query, params.SoDRuleID, params.DomainCode, params.ActionA, params.ActionB, params.ConflictType, params.JurisdictionID, params.TenantID).
-			Scan(&r.SoDRuleID, &r.DomainCode, &r.ActionA, &r.ActionB, &r.ConflictType, &r.JurisdictionID, &r.TenantID, &r.ActiveFlag, &r.CreatedAt, &r.Version)
+		var scanErr error
+		r, scanErr = scanSoDRule(tx.QueryRow(ctx, query, params.SoDRuleID, params.DomainCode, params.ActionA, params.ActionB,
+			params.ConflictType, params.JurisdictionID, params.TenantID, params.RequestedBy, params.Reason))
+		return scanErr
 	})
 	if err != nil {
 		s.log.Error("pg CreateSoDRule failed", zap.Error(err))
@@ -1498,8 +1517,7 @@ func (s *PgStore) CreateSoDRule(ctx context.Context, params domain.CreateSoDRule
 // the ones nobody in the tenant can edit.
 func (s *PgStore) ListSoDRules(ctx context.Context, tenantID string) ([]domain.SoDRule, error) {
 	const query = `
-		SELECT sod_rule_id, domain_code, action_a, action_b, conflict_type,
-		       jurisdiction_id, tenant_id, active_flag, created_at, version
+		SELECT ` + sodRuleColumns + `
 		  FROM sod_rules
 		 WHERE tenant_id IS NULL
 		    OR tenant_id = NULLIF($1, '')::uuid
@@ -1514,12 +1532,11 @@ func (s *PgStore) ListSoDRules(ctx context.Context, tenantID string) ([]domain.S
 		}
 		defer rows.Close()
 		for rows.Next() {
-			var r domain.SoDRule
-			if scanErr := rows.Scan(&r.SoDRuleID, &r.DomainCode, &r.ActionA, &r.ActionB,
-				&r.ConflictType, &r.JurisdictionID, &r.TenantID, &r.ActiveFlag, &r.CreatedAt, &r.Version); scanErr != nil {
+			r, scanErr := scanSoDRule(rows)
+			if scanErr != nil {
 				return scanErr
 			}
-			out = append(out, r)
+			out = append(out, *r)
 		}
 		return rows.Err()
 	})
@@ -1565,15 +1582,13 @@ func (s *PgStore) SetSoDRuleActive(ctx context.Context, sodRuleID, tenantID stri
 		   SET active_flag = $2
 		 WHERE sod_rule_id = $1 AND tenant_id = $3::uuid
 		   AND ($4::bigint = 0 OR version = $4)
-		RETURNING sod_rule_id, domain_code, action_a, action_b, conflict_type,
-		          jurisdiction_id, tenant_id, active_flag, created_at, version;`
+		RETURNING ` + sodRuleColumns + `;`
 
 	var r *domain.SoDRule
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		r = &domain.SoDRule{}
-		return tx.QueryRow(ctx, query, sodRuleID, active, tenantID, expectedVersion).Scan(
-			&r.SoDRuleID, &r.DomainCode, &r.ActionA, &r.ActionB, &r.ConflictType,
-			&r.JurisdictionID, &r.TenantID, &r.ActiveFlag, &r.CreatedAt, &r.Version)
+		var scanErr error
+		r, scanErr = scanSoDRule(tx.QueryRow(ctx, query, sodRuleID, active, tenantID, expectedVersion))
+		return scanErr
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -1588,12 +1603,15 @@ func (s *PgStore) SetSoDRuleActive(ctx context.Context, sodRuleID, tenantID stri
 
 // ── abac_rules ───────────────────────────────────────────────────────────────
 
-const abacRuleColumns = `abac_rule_id, tenant_id, rule_code, action_type, effect, attribute_key, operator, attribute_value, active_flag, created_at, created_by_principal_id, version`
+const abacRuleColumns = `abac_rule_id, tenant_id, rule_code, action_type, effect, attribute_key, operator, attribute_value, active_flag, created_at, created_by_principal_id, version, ` + rulePublicationColumns
 
 func scanABACRule(row pgx.Row) (*domain.ABACRule, error) {
 	r := &domain.ABACRule{}
+	p := &r.RulePublication
 	err := row.Scan(&r.ABACRuleID, &r.TenantID, &r.RuleCode, &r.ActionType, &r.Effect,
-		&r.AttributeKey, &r.Operator, &r.AttributeValue, &r.ActiveFlag, &r.CreatedAt, &r.CreatedByPrincipalID, &r.Version)
+		&r.AttributeKey, &r.Operator, &r.AttributeValue, &r.ActiveFlag, &r.CreatedAt, &r.CreatedByPrincipalID, &r.Version,
+		&p.PublicationStatus, &p.PendingChange, &p.ChangeRequestedBy, &p.ChangeRequestedAt, &p.ChangeReason,
+		&p.PublishedBy, &p.PublishedAt, &p.RejectedBy, &p.RejectedAt)
 	return r, err
 }
 
@@ -1623,9 +1641,12 @@ func (s *PgStore) CreateABACRule(ctx context.Context, params domain.CreateABACRu
 		return nil, domain.ErrABACOperandRequired
 	}
 
+	// Inserted as a REQUEST (000036, AU-17): inactive and PENDING_APPROVAL
+	// until an independent holder of iam.policy.publish approves it.
 	const query = `
-		INSERT INTO abac_rules (abac_rule_id, tenant_id, rule_code, action_type, effect, attribute_key, operator, attribute_value, created_by_principal_id)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		INSERT INTO abac_rules (abac_rule_id, tenant_id, rule_code, action_type, effect, attribute_key, operator, attribute_value, created_by_principal_id,
+			active_flag, publication_status, pending_change, change_requested_by, change_requested_at, change_reason)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, FALSE, 'PENDING_APPROVAL', 'PUBLISH', NULLIF($9, ''), NOW(), NULLIF($10, ''))
 		RETURNING ` + abacRuleColumns + `;`
 
 	var tenantID string
@@ -1637,7 +1658,7 @@ func (s *PgStore) CreateABACRule(ctx context.Context, params domain.CreateABACRu
 		var scanErr error
 		r, scanErr = scanABACRule(tx.QueryRow(ctx, query, params.ABACRuleID, params.TenantID, params.RuleCode,
 			params.ActionType, params.Effect, params.AttributeKey, params.Operator, params.AttributeValue,
-			params.CreatedByPrincipalID))
+			params.CreatedByPrincipalID, params.Reason))
 		return scanErr
 	})
 	if err != nil {
@@ -2446,19 +2467,20 @@ func (s *PgStore) DetachAccessDecisionPartitionsBefore(ctx context.Context, cuto
 
 const accessDecisionColumns = `access_decision_id, principal_id, legal_entity_id, action_type, decision_outcome, decision_basis, tenant_id, correlation_id, decided_at,
 	decision, policy_set_version, obligations, reason_codes, matched_grants, resource_type, resource_id, resource_version,
-	attributes_digest, session_assurance, on_behalf_of, delegation_id, expires_at`
+	attributes_digest, session_assurance, on_behalf_of, delegation_id, expires_at, session_kind, session_id::text`
 
 func scanAccessDecision(row pgx.Row) (*domain.AccessDecisionLog, error) {
 	d := &domain.AccessDecisionLog{}
-	var decision, psv, rType, rID, rVer, digest, assurance, obo, delegationID *string
+	var decision, psv, rType, rID, rVer, digest, assurance, obo, delegationID, sessionKind, sessionID *string
 	var obligations, reasonCodes, grants []byte
 	err := row.Scan(&d.AccessDecisionID, &d.PrincipalID, &d.LegalEntityID, &d.ActionType,
 		&d.DecisionOutcome, &d.DecisionBasis, &d.TenantID, &d.CorrelationID, &d.DecidedAt,
 		&decision, &psv, &obligations, &reasonCodes, &grants, &rType, &rID, &rVer,
-		&digest, &assurance, &obo, &delegationID, &d.ExpiresAt)
+		&digest, &assurance, &obo, &delegationID, &d.ExpiresAt, &sessionKind, &sessionID)
 	if err != nil {
 		return d, err
 	}
+	d.SessionKind, d.SessionID = deref(sessionKind), deref(sessionID)
 	d.Decision, d.PolicySetVersion = deref(decision), deref(psv)
 	d.ResourceType, d.ResourceID, d.ResourceVersion = deref(rType), deref(rID), deref(rVer)
 	d.AttributesDigest, d.SessionAssurance = deref(digest), deref(assurance)
@@ -2528,10 +2550,10 @@ func (s *PgStore) RecordAccessDecision(ctx context.Context, params domain.Record
 	const query = `
 		INSERT INTO access_decision_log (principal_id, legal_entity_id, action_type, decision_outcome, decision_basis, correlation_id, tenant_id,
 			decision, policy_set_version, obligations, reason_codes, matched_grants, resource_type, resource_id, resource_version,
-			attributes_digest, session_assurance, on_behalf_of, delegation_id, expires_at)
+			attributes_digest, session_assurance, on_behalf_of, delegation_id, expires_at, session_kind, session_id)
 		VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, '')::uuid,
 			$8, (SELECT 'cfg.' || COALESCE(max(history_id), 0) FROM authz_config_history), $9, $10, $11, $12, $13, $14,
-			$15, $16, $17, $18, $19)
+			$15, $16, $17, $18, $19, $20, NULLIF($21, '')::uuid)
 		RETURNING ` + accessDecisionColumns + `;`
 
 	var d *domain.AccessDecisionLog
@@ -2543,7 +2565,7 @@ func (s *PgStore) RecordAccessDecision(ctx context.Context, params domain.Record
 			nullIfEmpty(params.Decision), jsonArray(params.Obligations), jsonArray(params.ReasonCodes), jsonArray(params.MatchedGrants),
 			nullIfEmpty(params.ResourceType), nullIfEmpty(params.ResourceID), nullIfEmpty(params.ResourceVersion),
 			nullIfEmpty(params.AttributesDigest), nullIfEmpty(params.SessionAssurance), nullIfEmpty(params.OnBehalfOf),
-			nullIfEmpty(params.DelegationID), params.ExpiresAt))
+			nullIfEmpty(params.DelegationID), params.ExpiresAt, nullIfEmpty(params.SessionKind), params.SessionID))
 		if scanErr != nil || params.Events == nil {
 			return scanErr
 		}
@@ -2670,6 +2692,7 @@ func (s *PgStore) ListAccessDecisions(ctx context.Context, tenantID string, para
 		   AND ($6::timestamptz IS NULL OR decided_at >= $6)
 		   AND ($7::timestamptz IS NULL OR decided_at <  $7)
 		   AND ($10 OR (decided_at, access_decision_id) < ($8::timestamptz, $9::uuid))
+		   AND ($12 = '' OR session_id = NULLIF($12, '')::uuid)
 		 ORDER BY decided_at DESC, access_decision_id DESC
 		 LIMIT $11;`
 
@@ -2697,6 +2720,7 @@ func (s *PgStore) ListAccessDecisions(ctx context.Context, tenantID string, para
 			// One more than asked for: the extra row is the existence proof
 			// for a next page and is discarded below.
 			limit+1,
+			params.SessionID,
 		)
 		if qErr != nil {
 			return qErr
@@ -3308,13 +3332,15 @@ func (s *PgStore) ReviewSession(ctx context.Context, kind, sessionID, tenantID, 
 
 // ── Break-Glass Emergency Sessions (ZS-IAM-001 §14 & §21) ───────────────────
 
-const breakGlassSessionColumns = "session_id, tenant_id, principal_id, incident_id, reason, requested_actions, status, duration_seconds, expires_at, created_at, revoked_at, revoked_by, requested_by, review_status, reviewed_by, reviewed_at, review_notes, requester_assurance, requester_authn_at, requester_identity_session"
+const breakGlassSessionColumns = "session_id, tenant_id, principal_id, incident_id, reason, requested_actions, status, duration_seconds, expires_at, created_at, revoked_at, revoked_by, requested_by, review_status, reviewed_by, reviewed_at, review_notes, requester_assurance, requester_authn_at, requester_identity_session, " +
+	"approvals_required, approved_by, approved_at, rejected_by, rejected_at, request_expires_at"
 
 func scanBreakGlassSession(row pgx.Row) (*domain.BreakGlassSession, error) {
 	var bg domain.BreakGlassSession
 	var tenantUUID, sessionUUID uuid.UUID
 	var reqAssurance, reqSession *string
 	var reqAuthnAt *time.Time
+	var approvalsRequired int16
 	err := row.Scan(
 		&sessionUUID,
 		&tenantUUID,
@@ -3334,11 +3360,14 @@ func scanBreakGlassSession(row pgx.Row) (*domain.BreakGlassSession, error) {
 		&bg.ReviewedAt,
 		&bg.ReviewNotes,
 		&reqAssurance, &reqAuthnAt, &reqSession,
+		&approvalsRequired, &bg.ApprovedBy, &bg.ApprovedAt, &bg.RejectedBy, &bg.RejectedAt, &bg.RequestExpiresAt,
 	)
 	if err != nil {
 		return nil, err
 	}
 	bg.RequesterStepUp = stepUpEvidence(reqAssurance, reqAuthnAt, reqSession)
+	bg.ApprovalsRequired = int(approvalsRequired)
+	bg.Approvals = []domain.BreakGlassApproval{}
 	bg.SessionID = sessionUUID.String()
 	bg.TenantID = tenantUUID.String()
 	return &bg, nil
@@ -3361,7 +3390,17 @@ func (s *PgStore) CreateBreakGlassSession(ctx context.Context, params domain.Cre
 		return nil, err
 	}
 
-	expiresAt := time.Now().UTC().Add(time.Duration(durationSec) * time.Second)
+	// AU-02: a REQUEST. It grants nothing until approvals_required independent
+	// approvers approve it (ApproveBreakGlassSession), and its clock starts
+	// then; expires_at is a placeholder until that moment. Unanswered, it
+	// lapses at request_expires_at.
+	now := time.Now().UTC()
+	expiresAt := now.Add(time.Duration(durationSec) * time.Second)
+	requestExpiresAt := now.Add(domain.BreakGlassApprovalWindow)
+	quorum := params.ApprovalsRequired
+	if quorum < 1 {
+		quorum = 1
+	}
 
 	actions := params.RequestedActions
 	if actions == nil {
@@ -3371,9 +3410,9 @@ func (s *PgStore) CreateBreakGlassSession(ctx context.Context, params domain.Cre
 	const query = `
 		INSERT INTO break_glass_sessions (
 			tenant_id, principal_id, incident_id, reason, requested_actions, status, duration_seconds, expires_at, requested_by,
-			requester_assurance, requester_authn_at, requester_identity_session
+			requester_assurance, requester_authn_at, requester_identity_session, approvals_required, request_expires_at
 		) VALUES (
-			$1::uuid, $2, $3, $4, $5, 'ACTIVE', $6, $7, NULLIF($8, ''), $9, $10, $11
+			$1::uuid, $2, $3, $4, $5, 'PENDING_APPROVAL', $6, $7, NULLIF($8, ''), $9, $10, $11, $12, $13
 		) RETURNING ` + breakGlassSessionColumns + `;`
 
 	assurance, authnAt, idSession := stepUpColumns(params.StepUp)
@@ -3382,7 +3421,7 @@ func (s *PgStore) CreateBreakGlassSession(ctx context.Context, params domain.Cre
 		var scanErr error
 		bg, scanErr = scanBreakGlassSession(tx.QueryRow(ctx, query,
 			params.TenantID, params.PrincipalID, params.IncidentID, params.Reason, actions, durationSec, expiresAt, params.RequestedBy,
-			assurance, authnAt, idSession,
+			assurance, authnAt, idSession, quorum, requestExpiresAt,
 		))
 		return scanErr
 	})
@@ -3406,14 +3445,18 @@ func (s *PgStore) FindBreakGlassSessionByID(ctx context.Context, sessionID, tena
 	if tenantID != "" {
 		err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 			var scanErr error
-			bg, scanErr = scanBreakGlassSession(tx.QueryRow(ctx, scopedQuery, sessionID, tenantID))
-			return scanErr
+			if bg, scanErr = scanBreakGlassSession(tx.QueryRow(ctx, scopedQuery, sessionID, tenantID)); scanErr != nil {
+				return scanErr
+			}
+			return attachBreakGlassApprovals(ctx, tx, []*domain.BreakGlassSession{bg})
 		})
 	} else {
 		err = s.withPlatformScope(ctx, func(tx pgx.Tx) error {
 			var scanErr error
-			bg, scanErr = scanBreakGlassSession(tx.QueryRow(ctx, unscopedQuery, sessionID))
-			return scanErr
+			if bg, scanErr = scanBreakGlassSession(tx.QueryRow(ctx, unscopedQuery, sessionID)); scanErr != nil {
+				return scanErr
+			}
+			return attachBreakGlassApprovals(ctx, tx, []*domain.BreakGlassSession{bg})
 		})
 	}
 
@@ -3460,14 +3503,25 @@ func (s *PgStore) ListBreakGlassSessions(ctx context.Context, tenantID, principa
 		}
 		defer rows.Close()
 
+		var found []*domain.BreakGlassSession
 		for rows.Next() {
 			bg, scanErr := scanBreakGlassSession(rows)
 			if scanErr != nil {
 				return scanErr
 			}
+			found = append(found, bg)
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		rows.Close()
+		if err := attachBreakGlassApprovals(ctx, tx, found); err != nil {
+			return err
+		}
+		for _, bg := range found {
 			list = append(list, *bg)
 		}
-		return rows.Err()
+		return nil
 	})
 	if err != nil {
 		if isUndefinedTable(err) {
@@ -3727,14 +3781,17 @@ func (s *PgStore) RevokeSupportSession(ctx context.Context, sessionID, tenantID,
 
 // ── authority_limits (ZS-IAM-001 §12, §21, §22) ──────────────────────────
 
-const authorityLimitColumns = `authority_limit_id, tenant_id, principal_id, role_id, authority_type, legal_entity_id, book_id, org_unit_id, currency, lower_limit::text, upper_limit::text, effective_from, effective_to, created_at`
+const authorityLimitColumns = `authority_limit_id, tenant_id, principal_id, role_id, authority_type, legal_entity_id, book_id, org_unit_id, currency, lower_limit::text, upper_limit::text, effective_from, effective_to, created_at,
+	status, pending_action, supersedes_id::text, requested_by, requested_at, request_reason, decided_by, decided_at, last_decision, version`
 
 func scanAuthorityLimit(row pgx.Row) (*domain.AuthorityLimit, error) {
 	al := &domain.AuthorityLimit{}
 	err := row.Scan(&al.AuthorityLimitID, &al.TenantID, &al.PrincipalID, &al.RoleID,
 		&al.AuthorityType, &al.LegalEntityID, &al.BookID, &al.OrgUnitID,
 		&al.Currency, &al.LowerLimit, &al.UpperLimit,
-		&al.EffectiveFrom, &al.EffectiveTo, &al.CreatedAt)
+		&al.EffectiveFrom, &al.EffectiveTo, &al.CreatedAt,
+		&al.Status, &al.PendingAction, &al.SupersedesID, &al.RequestedBy, &al.RequestedAt, &al.RequestReason,
+		&al.DecidedBy, &al.DecidedAt, &al.LastDecision, &al.Version)
 	return al, err
 }
 
@@ -3758,13 +3815,19 @@ func (s *PgStore) CreateAuthorityLimit(ctx context.Context, params domain.Create
 		params.EffectiveFrom = time.Now().UTC()
 	}
 
+	// A REQUEST (000035, AU-03): PENDING_APPROVAL, limiting nothing until an
+	// independent holder of iam.authority_limit.approve approves it. With a
+	// supersedes_id it is a CHANGE to that limit, which stays in force until
+	// then (the partial unique index allows one open change per limit).
 	const query = `
 		INSERT INTO authority_limits (
 			authority_limit_id, tenant_id, principal_id, role_id,
 			authority_type, legal_entity_id, book_id, org_unit_id,
-			currency, lower_limit, upper_limit, effective_from, effective_to
+			currency, lower_limit, upper_limit, effective_from, effective_to,
+			status, requested_by, requested_at, request_reason, supersedes_id
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::numeric, $11::numeric, $12, $13)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::numeric, $11::numeric, $12, $13,
+			'PENDING_APPROVAL', NULLIF($14, ''), NOW(), NULLIF($15, ''), NULLIF($16, '')::uuid)
 		RETURNING ` + authorityLimitColumns + `;`
 
 	var al *domain.AuthorityLimit
@@ -3773,10 +3836,20 @@ func (s *PgStore) CreateAuthorityLimit(ctx context.Context, params domain.Create
 		al, scanErr = scanAuthorityLimit(tx.QueryRow(ctx, query,
 			params.AuthorityLimitID, params.TenantID, params.PrincipalID, params.RoleID,
 			params.AuthorityType, params.LegalEntityID, params.BookID, params.OrgUnitID,
-			params.Currency, params.LowerLimit, params.UpperLimit, params.EffectiveFrom, params.EffectiveTo))
+			params.Currency, params.LowerLimit, params.UpperLimit, params.EffectiveFrom, params.EffectiveTo,
+			params.RequestedBy, params.RequestReason, params.SupersedesID))
 		return scanErr
 	})
 	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) {
+			switch pgErr.Code {
+			case "23505": // uq_authority_limits_one_pending_change
+				return nil, domain.ErrChangePending
+			case "23514", "22P02", "22003": // bounds CHECK, unparseable or out-of-range amount
+				return nil, fmt.Errorf("%w: %s", domain.ErrAuthorityLimitInvalid, pgErr.Message)
+			}
+		}
 		s.log.Error("pg CreateAuthorityLimit failed", zap.Error(err))
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}

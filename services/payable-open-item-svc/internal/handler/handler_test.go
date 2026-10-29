@@ -51,7 +51,7 @@ type stubBank struct {
 	fail   bool
 }
 
-func (b *stubBank) GetStatus(_ context.Context, _, paymentID string) (*paymentstatus.PaymentState, error) {
+func (b *stubBank) GetStatus(_ context.Context, _, _, paymentID string) (*paymentstatus.PaymentState, error) {
 	if b.fail {
 		return nil, paymentstatus.ErrUnavailable
 	}

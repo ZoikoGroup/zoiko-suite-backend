@@ -41,15 +41,17 @@ type Store interface {
 	ReciprocalBalances(ctx context.Context, entityA, entityB, period string) ([]domain.ReciprocalBalanceGroup, error)
 	// UpdateMatch persists entry's target state and, in the same
 	// transaction, the attempt that produced it and the "matched" (legacy
-	// "posted") or "mismatch-detected" event that state implies.
-	UpdateMatch(ctx context.Context, entry *domain.IntercompanyEntry, attempt *domain.MatchAttempt, actorID, correlationID string) error
+	// "posted") or "mismatch-detected" event that state implies. The
+	// idempotency key is claimed inside the same transaction.
+	UpdateMatch(ctx context.Context, entry *domain.IntercompanyEntry, attempt *domain.MatchAttempt, idempotencyKey, actorID, correlationID string) (*domain.IntercompanyEntry, error)
 
 	// ACC-11 lifecycle — see migrations 000003 and 000006. Each records its
-	// state change in the pair's append-only transition history.
-	AcknowledgeCounterparty(ctx context.Context, id, principalID, correlationID string) error
-	DisputeIntercompany(ctx context.Context, id, principalID, reason, correlationID string) error
-	ResolveMismatch(ctx context.Context, id, principalID, resolutionNote, outcome, correlationID string) error
-	ClosePair(ctx context.Context, id, principalID, reason, correlationID string) error
+	// state change in the pair's append-only transition history. Each claims
+	// an Idempotency-Key in the same transaction (migration 000009).
+	AcknowledgeCounterparty(ctx context.Context, id, idempotencyKey, principalID, correlationID string) (*domain.IntercompanyEntry, error)
+	DisputeIntercompany(ctx context.Context, id, idempotencyKey, principalID, reason, correlationID string) (*domain.IntercompanyEntry, error)
+	ResolveMismatch(ctx context.Context, id, idempotencyKey, principalID, resolutionNote, outcome, correlationID string) (*domain.IntercompanyEntry, error)
+	ClosePair(ctx context.Context, id, idempotencyKey, principalID, reason, correlationID string) (*domain.IntercompanyEntry, error)
 	ListTransitions(ctx context.Context, id string) ([]domain.PairTransition, error)
 
 	// ListMatchAttempts is ExplainMismatch's evidence (migration 000007).
@@ -487,6 +489,11 @@ func (h *Handler) MatchEntry(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	correlationID := getCorrelationID(r)
 
+	idempotencyKey, ok := requireIdempotencyKey(w, r)
+	if !ok {
+		return
+	}
+
 	var req domain.MatchEntryRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
@@ -550,7 +557,7 @@ func (h *Handler) MatchEntry(w http.ResponseWriter, r *http.Request) {
 		// fact worth recording as MISMATCH, not a transient 503 — the
 		// caller almost certainly named the wrong journal_id, and retrying
 		// the identical request will fail identically.
-		h.recordMismatch(w, r, entry, attempt, failure.rule, failure.message)
+		h.recordMismatch(w, r, entry, attempt, idempotencyKey, failure.rule, failure.message)
 		return
 	}
 
@@ -573,7 +580,7 @@ func (h *Handler) MatchEntry(w http.ResponseWriter, r *http.Request) {
 	observeJournal(&attempt.Target, journal, journalAmount)
 
 	if failure != nil {
-		h.recordMismatch(w, r, entry, attempt, failure.rule, failure.message)
+		h.recordMismatch(w, r, entry, attempt, idempotencyKey, failure.rule, failure.message)
 		return
 	}
 
@@ -582,7 +589,7 @@ func (h *Handler) MatchEntry(w http.ResponseWriter, r *http.Request) {
 	if diff := new(big.Rat).Sub(journalAmount, expected); diff.Abs(diff).Cmp(matchTolerance) > 0 {
 		reason := fmt.Sprintf("amount_mismatch: expected counterparty amount %s %s != journal amount %s %s",
 			domain.CanonicalAmount(expected), entry.CounterpartyCurrencyCode, domain.CanonicalAmount(journalAmount), journal.CurrencyCode)
-		h.recordMismatch(w, r, entry, attempt, domain.MatchRuleAmountMismatch, reason)
+		h.recordMismatch(w, r, entry, attempt, idempotencyKey, domain.MatchRuleAmountMismatch, reason)
 		return
 	}
 
@@ -611,7 +618,7 @@ func (h *Handler) MatchEntry(w http.ResponseWriter, r *http.Request) {
 		}
 		if !entityregistry.SharesOpenGroupRelationship(sourceHierarchies, targetHierarchies, entry.SourceLegalEntityID, entry.TargetLegalEntityID, groupRelationshipAsOf(entry)) {
 			reason := domain.ErrGroupRelationshipLost.Error()
-			h.recordMismatch(w, r, entry, attempt, domain.MatchRuleGroupRelationshipLost, reason)
+			h.recordMismatch(w, r, entry, attempt, idempotencyKey, domain.MatchRuleGroupRelationshipLost, reason)
 			return
 		}
 	}
@@ -620,14 +627,15 @@ func (h *Handler) MatchEntry(w http.ResponseWriter, r *http.Request) {
 	entry.TargetJournalID = &req.TargetJournalID
 	entry.MatchStatus = domain.MatchStatusMatched
 	attempt.Outcome = domain.MatchStatusMatched
-	if err := h.store.UpdateMatch(r.Context(), entry, attempt, principalID, correlationID); err != nil {
+	result, err := h.store.UpdateMatch(r.Context(), entry, attempt, idempotencyKey, principalID, correlationID)
+	if err != nil {
 		h.writeUpdateMatchErr(w, err)
 		return
 	}
 
 	writeJSON(w, http.StatusOK, domain.MatchEntryResponse{
 		IntercompanyEntryID: id,
-		MatchStatus:         domain.MatchStatusMatched,
+		MatchStatus:         result.MatchStatus,
 	})
 }
 
@@ -828,21 +836,22 @@ func observeJournal(side *domain.MatchAttemptSide, j *ledger.JournalDetail, tota
 // recorded it (and its attempt and event): a failed write is a 503 the
 // caller can retry, and a pair whose status moved on since it was read is a
 // 422, never overwritten.
-func (h *Handler) recordMismatch(w http.ResponseWriter, r *http.Request, entry *domain.IntercompanyEntry, attempt *domain.MatchAttempt, rule, reason string) {
+func (h *Handler) recordMismatch(w http.ResponseWriter, r *http.Request, entry *domain.IntercompanyEntry, attempt *domain.MatchAttempt, idempotencyKey, rule, reason string) {
 	entry.TargetJournalID = attempt.Target.JournalID
 	entry.MatchStatus = domain.MatchStatusMismatch
 	entry.MismatchReason = &reason
 	attempt.Outcome = domain.MatchStatusMismatch
 	attempt.FailedRule = &rule
 	attempt.Message = &reason
-	if err := h.store.UpdateMatch(r.Context(), entry, attempt, attempt.AttemptedBy, derefOr(attempt.CorrelationID)); err != nil {
+	result, err := h.store.UpdateMatch(r.Context(), entry, attempt, idempotencyKey, attempt.AttemptedBy, derefOr(attempt.CorrelationID))
+	if err != nil {
 		h.writeUpdateMatchErr(w, err)
 		return
 	}
 	writeJSON(w, http.StatusUnprocessableEntity, domain.MatchEntryResponse{
-		IntercompanyEntryID: entry.IntercompanyEntryID,
-		MatchStatus:         domain.MatchStatusMismatch,
-		MismatchReason:      &reason,
+		IntercompanyEntryID: result.IntercompanyEntryID,
+		MatchStatus:         result.MatchStatus,
+		MismatchReason:      result.MismatchReason,
 		FailedRule:          &rule,
 	})
 }
@@ -874,6 +883,11 @@ func (h *Handler) writeUpdateMatchErr(w http.ResponseWriter, err error) {
 func (h *Handler) AcknowledgeCounterparty(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 
+	idempotencyKey, ok := requireIdempotencyKey(w, r)
+	if !ok {
+		return
+	}
+
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
@@ -895,12 +909,13 @@ func (h *Handler) AcknowledgeCounterparty(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if err := h.store.AcknowledgeCounterparty(r.Context(), id, principalID, getCorrelationID(r)); err != nil {
+	result, err := h.store.AcknowledgeCounterparty(r.Context(), id, idempotencyKey, principalID, getCorrelationID(r))
+	if err != nil {
 		h.writeTransitionErr(w, "failed to acknowledge counterparty", err)
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]string{"match_status": domain.MatchStatusAwaitingCounterparty})
+	writeJSON(w, http.StatusOK, map[string]string{"match_status": result.MatchStatus})
 }
 
 // ── POST /v1/intercompany/entries/{id}/dispute ────────────────────────────────────
@@ -917,6 +932,11 @@ func (h *Handler) DisputeIntercompany(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Reason == "" {
 		writeError(w, http.StatusBadRequest, "missing_field", domain.ErrDisputeReasonRequired.Error())
+		return
+	}
+
+	idempotencyKey, ok := requireIdempotencyKey(w, r)
+	if !ok {
 		return
 	}
 
@@ -941,12 +961,13 @@ func (h *Handler) DisputeIntercompany(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.store.DisputeIntercompany(r.Context(), id, principalID, req.Reason, getCorrelationID(r)); err != nil {
+	result, err := h.store.DisputeIntercompany(r.Context(), id, idempotencyKey, principalID, req.Reason, getCorrelationID(r))
+	if err != nil {
 		h.writeTransitionErr(w, "failed to dispute intercompany pair", err)
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]string{"match_status": domain.MatchStatusDisputed})
+	writeJSON(w, http.StatusOK, map[string]string{"match_status": result.MatchStatus})
 }
 
 // ── POST /v1/intercompany/entries/{id}/resolve ────────────────────────────────────
@@ -972,6 +993,11 @@ func (h *Handler) ResolveMismatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	idempotencyKey, ok := requireIdempotencyKey(w, r)
+	if !ok {
+		return
+	}
+
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
@@ -993,12 +1019,13 @@ func (h *Handler) ResolveMismatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.store.ResolveMismatch(r.Context(), id, principalID, req.ResolutionNote, req.Outcome, getCorrelationID(r)); err != nil {
+	result, err := h.store.ResolveMismatch(r.Context(), id, idempotencyKey, principalID, req.ResolutionNote, req.Outcome, getCorrelationID(r))
+	if err != nil {
 		h.writeTransitionErr(w, "failed to resolve intercompany mismatch", err)
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]string{"match_status": domain.MatchStatusResolved, "resolution_outcome": req.Outcome})
+	writeJSON(w, http.StatusOK, map[string]string{"match_status": result.MatchStatus, "resolution_outcome": derefOr(result.ResolutionOutcome)})
 }
 
 // ── POST /v1/intercompany/entries/{id}/close ──────────────────────────────────────
@@ -1019,6 +1046,11 @@ func (h *Handler) ClosePair(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	idempotencyKey, ok := requireIdempotencyKey(w, r)
+	if !ok {
+		return
+	}
+
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
@@ -1036,12 +1068,13 @@ func (h *Handler) ClosePair(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if err := h.store.ClosePair(r.Context(), id, principalID, req.Reason, getCorrelationID(r)); err != nil {
+	result, err := h.store.ClosePair(r.Context(), id, idempotencyKey, principalID, req.Reason, getCorrelationID(r))
+	if err != nil {
 		h.writeTransitionErr(w, "failed to close intercompany pair", err)
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]string{"match_status": domain.MatchStatusClosed})
+	writeJSON(w, http.StatusOK, map[string]string{"match_status": result.MatchStatus})
 }
 
 // ── GET /v1/intercompany/entries/{id}/transitions ─────────────────────────────────
@@ -1152,6 +1185,18 @@ func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (stri
 		return "", false
 	}
 	return principalID, true
+}
+
+// requireIdempotencyKey reads the Idempotency-Key header required by every
+// lifecycle command (SPEC_DEVIATIONS A10 / B14). Create is idempotent by
+// (tenant_id, source_journal_id) and does not use this header.
+func requireIdempotencyKey(w http.ResponseWriter, r *http.Request) (string, bool) {
+	key := r.Header.Get("Idempotency-Key")
+	if key == "" {
+		writeError(w, http.StatusBadRequest, "idempotency_key_required", "Idempotency-Key header is required")
+		return "", false
+	}
+	return key, true
 }
 
 func (h *Handler) writeAuthzErr(w http.ResponseWriter, err error) {

@@ -497,17 +497,27 @@ components:
   schemas:
     Problem:
       type: object
-      required: [type, title, status]
+      required: [type, title, status, code]
       properties:
-        type: {type: string}
-        title: {type: string}
-        status: {type: integer}
-        detail: {type: string}
-        code: {type: string}
-        error: {type: string}
-        error_class: {type: string}
-        retryable: {type: boolean}
-      additionalProperties: true
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        code: { type: string }
+        request_id: { type: string }
+        correlation_id: { type: string }
+        retryable: { type: boolean }
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              pointer: { type: string }
+              code: { type: string }
+              detail: { type: string }
+        current_version: { type: integer, format: int64 }
+        decision_id: { type: string }
     StageInput:
       type: object
       properties:

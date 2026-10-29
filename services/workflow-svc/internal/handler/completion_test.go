@@ -212,7 +212,7 @@ func TestEscalateTo_IsRouted(t *testing.T) {
 }
 
 // X9 / row 55: error bodies are RFC 9457 problem documents that keep the
-// legacy "error" member.
+// legacy "error" member via the apicontract package.
 func TestErrors_AreProblemJSONWithLegacyCode(t *testing.T) {
 	a := &stubAuthz{err: domain.ErrAuthorizationDenied}
 	w := get(routerWithReadMode(&stubStore{findInstance: readInstance()}, a, ""), "/v1/workflows/"+testWorkflowID, "stranger-1")
@@ -221,7 +221,8 @@ func TestErrors_AreProblemJSONWithLegacyCode(t *testing.T) {
 	}
 	var body map[string]any
 	_ = json.Unmarshal(w.Body.Bytes(), &body)
-	if body["error"] != "authorization_denied" || body["status"] != float64(403) || body["error_class"] != "AUTHORIZATION_DENIED" {
+	// The apicontract package includes the legacy "error" field for backward compatibility
+	if body["code"] != "authorization_denied" || body["detail"] != "principal is not authorized to read this workflow" || body["status"] != float64(403) {
 		t.Fatalf("body = %v", body)
 	}
 }

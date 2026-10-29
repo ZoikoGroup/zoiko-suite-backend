@@ -4,7 +4,11 @@ package store_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"fmt"
+	"strconv"
 	"testing"
 
 	"github.com/google/uuid"
@@ -12,6 +16,14 @@ import (
 	"zoiko.io/treasury-svc/internal/domain"
 	svcmiddleware "zoiko.io/treasury-svc/internal/middleware"
 )
+
+// legacyTransferHash reproduces the pre-A34 protected_field_hash exactly,
+// including its float64 %.4f rendering, so an old row can be simulated.
+func legacyTransferHash(amountText, currencyCode, srcAcctID, tgtAcctID string) string {
+	f, _ := strconv.ParseFloat(amountText, 64)
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%.4f|%s|%s|%s", f, currencyCode, srcAcctID, tgtAcctID)))
+	return hex.EncodeToString(sum[:])
+}
 
 func seedTransferPair(t *testing.T, ctx context.Context, tenantID string) (src, tgt string) {
 	t.Helper()
@@ -41,7 +53,7 @@ func TestPgStore_AuthorizeTreasuryTransfer_CrossEntityOnly(t *testing.T) {
 
 	transfer, _, err := s.CreateTreasuryTransfer(ctx, domain.CreateTreasuryTransferParams{
 		TenantID: tenantID, SourceBankAccountID: src, TargetBankAccountID: tgt,
-		Amount: 50, CurrencyCode: "USD", IsCrossEntity: false, CorrelationID: "corr-auth-same-entity", MakerPrincipalID: "maker-1",
+		Amount: "50", CurrencyCode: "USD", IsCrossEntity: false, CorrelationID: "corr-auth-same-entity", MakerPrincipalID: "maker-1",
 	})
 	if err != nil {
 		t.Fatalf("create: %v", err)
@@ -67,7 +79,7 @@ func TestPgStore_AuthorizeTreasuryTransfer_RejectsSelfAuthorization(t *testing.T
 
 	transfer, _, err := s.CreateTreasuryTransfer(ctx, domain.CreateTreasuryTransferParams{
 		TenantID: tenantID, SourceBankAccountID: src, TargetBankAccountID: tgt,
-		Amount: 300, CurrencyCode: "USD", IsCrossEntity: true, CorrelationID: "corr-auth-self", MakerPrincipalID: "maker-1",
+		Amount: "300", CurrencyCode: "USD", IsCrossEntity: true, CorrelationID: "corr-auth-self", MakerPrincipalID: "maker-1",
 	})
 	if err != nil {
 		t.Fatalf("create: %v", err)
@@ -107,7 +119,7 @@ func TestPgStore_ListTransfers_FiltersByLegalEntityAndStatus(t *testing.T) {
 	srcA, tgtA := seedTransferPair(t, ctx, tenantID)
 	transferA, _, err := s.CreateTreasuryTransfer(ctx, domain.CreateTreasuryTransferParams{
 		TenantID: tenantID, SourceBankAccountID: srcA, TargetBankAccountID: tgtA,
-		Amount: 10, CurrencyCode: "USD", CorrelationID: "corr-list-a", MakerPrincipalID: "maker-1",
+		Amount: "10", CurrencyCode: "USD", CorrelationID: "corr-list-a", MakerPrincipalID: "maker-1",
 	})
 	if err != nil {
 		t.Fatalf("create A: %v", err)
@@ -120,7 +132,7 @@ func TestPgStore_ListTransfers_FiltersByLegalEntityAndStatus(t *testing.T) {
 	srcB, tgtB := seedTransferPair(t, ctx, tenantID)
 	if _, _, err := s.CreateTreasuryTransfer(ctx, domain.CreateTreasuryTransferParams{
 		TenantID: tenantID, SourceBankAccountID: srcB, TargetBankAccountID: tgtB,
-		Amount: 20, CurrencyCode: "USD", CorrelationID: "corr-list-b", MakerPrincipalID: "maker-2",
+		Amount: "20", CurrencyCode: "USD", CorrelationID: "corr-list-b", MakerPrincipalID: "maker-2",
 	}); err != nil {
 		t.Fatalf("create B: %v", err)
 	}
@@ -172,7 +184,7 @@ func TestPgStore_ApproveTreasuryTransfer_RejectsSelfApproval(t *testing.T) {
 
 	transfer, _, err := s.CreateTreasuryTransfer(ctx, domain.CreateTreasuryTransferParams{
 		TenantID: tenantID, SourceBankAccountID: src, TargetBankAccountID: tgt,
-		Amount: 100, CurrencyCode: "USD", CorrelationID: "corr-self-approve", MakerPrincipalID: "maker-1",
+		Amount: "100", CurrencyCode: "USD", CorrelationID: "corr-self-approve", MakerPrincipalID: "maker-1",
 	})
 	if err != nil {
 		t.Fatalf("create: %v", err)
@@ -215,7 +227,7 @@ func TestPgStore_ApproveTreasuryTransfer_RejectsProtectedFieldTampering(t *testi
 
 	transfer, _, err := s.CreateTreasuryTransfer(ctx, domain.CreateTreasuryTransferParams{
 		TenantID: tenantID, SourceBankAccountID: src, TargetBankAccountID: tgt,
-		Amount: 100, CurrencyCode: "USD", CorrelationID: "corr-tamper", MakerPrincipalID: "maker-1",
+		Amount: "100", CurrencyCode: "USD", CorrelationID: "corr-tamper", MakerPrincipalID: "maker-1",
 	})
 	if err != nil {
 		t.Fatalf("create: %v", err)
@@ -236,6 +248,43 @@ func TestPgStore_ApproveTreasuryTransfer_RejectsProtectedFieldTampering(t *testi
 	}
 }
 
+// TestPgStore_ApproveTreasuryTransfer_AcceptsPreA34Hash proves the
+// compatibility half of A34: a row created before this pass carries the old
+// float-formatted hash, which can differ from exact four-place decimal text
+// for large amounts. Approval must still accept it.
+func TestPgStore_ApproveTreasuryTransfer_AcceptsPreA34Hash(t *testing.T) {
+	cleanTables(t)
+	s := testStore
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+	src, tgt := seedTransferPair(t, ctx, tenantID)
+
+	const amount = domain.Decimal("596267352650.6170")
+	transfer, _, err := s.CreateTreasuryTransfer(ctx, domain.CreateTreasuryTransferParams{
+		TenantID: tenantID, SourceBankAccountID: src, TargetBankAccountID: tgt,
+		Amount: amount, CurrencyCode: "USD", CorrelationID: "corr-legacy-hash", MakerPrincipalID: "maker-1",
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	// The old service would have stored the float-formatted hash for the
+	// input 596267352650.6169 and read the amount back as ...6170.
+	legacy := legacyTransferHash("596267352650.6170", "USD", src, tgt)
+	if legacy == transfer.ProtectedFieldHash {
+		t.Fatal("test fixture no longer distinguishes the legacy and exact hashes")
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE treasury_transfers SET protected_field_hash = $2 WHERE transfer_id = $1`, transfer.TransferID, legacy); err != nil {
+		t.Fatalf("write legacy hash: %v", err)
+	}
+
+	approved, err := s.ApproveTreasuryTransfer(ctx, domain.ApproveTreasuryTransferParams{
+		TenantID: tenantID, TransferID: transfer.TransferID, CheckerPrincipalID: "checker-1",
+	})
+	if err != nil || approved.Status != domain.TransferApproved {
+		t.Fatalf("approve with a pre-A34 hash: status=%v err=%v", approved, err)
+	}
+}
+
 // TestPgStore_TreasuryTransfer_CompletedIsImmutable is the
 // negative-controlled proof of migration 000004's own
 // reject_terminal_transfer_mutation trigger: COMPLETED is terminal.
@@ -248,7 +297,7 @@ func TestPgStore_TreasuryTransfer_CompletedIsImmutable(t *testing.T) {
 
 	transfer, _, err := s.CreateTreasuryTransfer(ctx, domain.CreateTreasuryTransferParams{
 		TenantID: tenantID, SourceBankAccountID: src, TargetBankAccountID: tgt,
-		Amount: 50, CurrencyCode: "USD", CorrelationID: "corr-terminal", MakerPrincipalID: "maker-1",
+		Amount: "50", CurrencyCode: "USD", CorrelationID: "corr-terminal", MakerPrincipalID: "maker-1",
 	})
 	if err != nil {
 		t.Fatalf("create: %v", err)
@@ -302,7 +351,7 @@ func TestPgStore_TreasuryTransfer_SameEntitySkipsIntercompanySteps(t *testing.T)
 
 	transfer, _, err := s.CreateTreasuryTransfer(ctx, domain.CreateTreasuryTransferParams{
 		TenantID: tenantID, SourceBankAccountID: src, TargetBankAccountID: tgt,
-		Amount: 75, CurrencyCode: "USD", IsCrossEntity: false, CorrelationID: "corr-same-entity", MakerPrincipalID: "maker-1",
+		Amount: "75", CurrencyCode: "USD", IsCrossEntity: false, CorrelationID: "corr-same-entity", MakerPrincipalID: "maker-1",
 	})
 	if err != nil {
 		t.Fatalf("create: %v", err)
@@ -346,7 +395,7 @@ func TestPgStore_TreasuryTransfer_DraftLifecycle_FullWalk(t *testing.T) {
 	// 1. Create as DRAFT.
 	transfer, _, err := s.CreateTreasuryTransfer(ctx, domain.CreateTreasuryTransferParams{
 		TenantID: tenantID, SourceBankAccountID: src, TargetBankAccountID: tgt,
-		Amount: 50000, CurrencyCode: "USD", CorrelationID: "corr-draft-1", MakerPrincipalID: "maker-1", SaveAsDraft: true,
+		Amount: "50000", CurrencyCode: "USD", CorrelationID: "corr-draft-1", MakerPrincipalID: "maker-1", SaveAsDraft: true,
 	})
 	if err != nil || transfer.Status != domain.TransferDraft {
 		t.Fatalf("create as draft: status=%v err=%v", transfer, err)
@@ -355,16 +404,16 @@ func TestPgStore_TreasuryTransfer_DraftLifecycle_FullWalk(t *testing.T) {
 	// 2. Amend while DRAFT — the maker corrects the amount.
 	amended, err := s.AmendTreasuryTransfer(ctx, domain.AmendTreasuryTransferParams{
 		TenantID: tenantID, TransferID: transfer.TransferID, SourceBankAccountID: src, TargetBankAccountID: tgt,
-		Amount: 45000, CurrencyCode: "USD", ActorPrincipalID: "maker-1",
+		Amount: "45000", CurrencyCode: "USD", ActorPrincipalID: "maker-1",
 	})
-	if err != nil || amended.Amount != 45000 || amended.Status != domain.TransferDraft {
+	if err != nil || amended.Amount != domain.Decimal("45000") || amended.Status != domain.TransferDraft {
 		t.Fatalf("amend: %+v err=%v", amended, err)
 	}
 
 	// Negative control: a different principal cannot amend the maker's draft.
 	if _, err := s.AmendTreasuryTransfer(ctx, domain.AmendTreasuryTransferParams{
 		TenantID: tenantID, TransferID: transfer.TransferID, SourceBankAccountID: src, TargetBankAccountID: tgt,
-		Amount: 1, CurrencyCode: "USD", ActorPrincipalID: "someone-else",
+		Amount: "1", CurrencyCode: "USD", ActorPrincipalID: "someone-else",
 	}); err != domain.ErrOnlyMakerMayModifyTransfer {
 		t.Fatalf("expected ErrOnlyMakerMayModifyTransfer amending as a non-maker, got %v", err)
 	}
@@ -380,7 +429,7 @@ func TestPgStore_TreasuryTransfer_DraftLifecycle_FullWalk(t *testing.T) {
 	// Negative control: amending after leaving DRAFT must be refused.
 	if _, err := s.AmendTreasuryTransfer(ctx, domain.AmendTreasuryTransferParams{
 		TenantID: tenantID, TransferID: transfer.TransferID, SourceBankAccountID: src, TargetBankAccountID: tgt,
-		Amount: 1, CurrencyCode: "USD", ActorPrincipalID: "maker-1",
+		Amount: "1", CurrencyCode: "USD", ActorPrincipalID: "maker-1",
 	}); err != domain.ErrInvalidTransferTransition {
 		t.Fatalf("expected ErrInvalidTransferTransition amending a PENDING_APPROVAL transfer, got %v", err)
 	}
@@ -406,7 +455,7 @@ func TestPgStore_TreasuryTransfer_DraftLifecycle_FullWalk(t *testing.T) {
 	// allowed before any submission.
 	draft2, _, err := s.CreateTreasuryTransfer(ctx, domain.CreateTreasuryTransferParams{
 		TenantID: tenantID, SourceBankAccountID: src2, TargetBankAccountID: tgt2,
-		Amount: 100, CurrencyCode: "USD", CorrelationID: "corr-draft-2", MakerPrincipalID: "maker-2", SaveAsDraft: true,
+		Amount: "100", CurrencyCode: "USD", CorrelationID: "corr-draft-2", MakerPrincipalID: "maker-2", SaveAsDraft: true,
 	})
 	if err != nil {
 		t.Fatalf("create second draft: %v", err)
@@ -431,7 +480,7 @@ func TestPgStore_TreasuryTransfer_CancelBeforeSubmission_OnlyMaker(t *testing.T)
 
 	transfer, _, err := s.CreateTreasuryTransfer(ctx, domain.CreateTreasuryTransferParams{
 		TenantID: tenantID, SourceBankAccountID: src, TargetBankAccountID: tgt,
-		Amount: 10, CurrencyCode: "USD", CorrelationID: "corr-only-maker", MakerPrincipalID: "maker-1",
+		Amount: "10", CurrencyCode: "USD", CorrelationID: "corr-only-maker", MakerPrincipalID: "maker-1",
 	})
 	if err != nil {
 		t.Fatalf("create: %v", err)
@@ -455,7 +504,7 @@ func TestPgStore_TreasuryTransfer_CancelledIsImmutable(t *testing.T) {
 
 	transfer, _, err := s.CreateTreasuryTransfer(ctx, domain.CreateTreasuryTransferParams{
 		TenantID: tenantID, SourceBankAccountID: src, TargetBankAccountID: tgt,
-		Amount: 10, CurrencyCode: "USD", CorrelationID: "corr-cancel-immutable", MakerPrincipalID: "maker-1",
+		Amount: "10", CurrencyCode: "USD", CorrelationID: "corr-cancel-immutable", MakerPrincipalID: "maker-1",
 	})
 	if err != nil {
 		t.Fatalf("create: %v", err)
@@ -497,7 +546,7 @@ func TestPgStore_TreasuryTransfer_ReturnedThenResolved_Resubmit(t *testing.T) {
 
 	transfer, _, err := s.CreateTreasuryTransfer(ctx, domain.CreateTreasuryTransferParams{
 		TenantID: tenantID, SourceBankAccountID: src, TargetBankAccountID: tgt,
-		Amount: 200, CurrencyCode: "USD", CorrelationID: "corr-returned-1", MakerPrincipalID: "maker-1",
+		Amount: "200", CurrencyCode: "USD", CorrelationID: "corr-returned-1", MakerPrincipalID: "maker-1",
 	})
 	if err != nil {
 		t.Fatalf("create: %v", err)
@@ -514,7 +563,7 @@ func TestPgStore_TreasuryTransfer_ReturnedThenResolved_Resubmit(t *testing.T) {
 	// disturbing the one under test.
 	other, _, err := s.CreateTreasuryTransfer(ctx, domain.CreateTreasuryTransferParams{
 		TenantID: tenantID, SourceBankAccountID: src, TargetBankAccountID: tgt,
-		Amount: 1, CurrencyCode: "USD", CorrelationID: "corr-not-yet-submitted", MakerPrincipalID: "maker-1",
+		Amount: "1", CurrencyCode: "USD", CorrelationID: "corr-not-yet-submitted", MakerPrincipalID: "maker-1",
 	})
 	if err != nil {
 		t.Fatalf("create other: %v", err)
@@ -562,7 +611,7 @@ func TestPgStore_TreasuryTransfer_ReturnedThenResolved_Cancel(t *testing.T) {
 
 	transfer, _, err := s.CreateTreasuryTransfer(ctx, domain.CreateTreasuryTransferParams{
 		TenantID: tenantID, SourceBankAccountID: src, TargetBankAccountID: tgt,
-		Amount: 200, CurrencyCode: "USD", CorrelationID: "corr-returned-2", MakerPrincipalID: "maker-1",
+		Amount: "200", CurrencyCode: "USD", CorrelationID: "corr-returned-2", MakerPrincipalID: "maker-1",
 	})
 	if err != nil {
 		t.Fatalf("create: %v", err)
@@ -608,7 +657,7 @@ func TestPgStore_TreasuryTransfer_CrossEntitySagaIsResumable(t *testing.T) {
 
 	transfer, _, err := s.CreateTreasuryTransfer(ctx, domain.CreateTreasuryTransferParams{
 		TenantID: tenantID, SourceBankAccountID: src, TargetBankAccountID: tgt,
-		Amount: 300, CurrencyCode: "USD", IsCrossEntity: true, CorrelationID: "corr-cross-entity", MakerPrincipalID: "maker-1",
+		Amount: "300", CurrencyCode: "USD", IsCrossEntity: true, CorrelationID: "corr-cross-entity", MakerPrincipalID: "maker-1",
 	})
 	if err != nil {
 		t.Fatalf("create: %v", err)
@@ -621,6 +670,10 @@ func TestPgStore_TreasuryTransfer_CrossEntitySagaIsResumable(t *testing.T) {
 
 	if _, err := s.ApproveTreasuryTransfer(ctx, domain.ApproveTreasuryTransferParams{TenantID: tenantID, TransferID: transfer.TransferID, CheckerPrincipalID: "checker-1"}); err != nil {
 		t.Fatalf("approve: %v", err)
+	}
+	// Cross-entity: AUTHORIZED is the only state it is submitted from.
+	if _, err := s.AuthorizeTreasuryTransfer(ctx, domain.AuthorizeTreasuryTransferParams{TenantID: tenantID, TransferID: transfer.TransferID, AuthorizerPrincipalID: "authorizer-1"}); err != nil {
+		t.Fatalf("authorize: %v", err)
 	}
 	if _, err := s.MarkTransferSubmitted(ctx, tenantID, transfer.TransferID, "attempt-1"); err != nil {
 		t.Fatalf("mark submitted: %v", err)
@@ -652,5 +705,137 @@ func TestPgStore_TreasuryTransfer_CrossEntitySagaIsResumable(t *testing.T) {
 	// step again — must fail rather than silently re-applying.
 	if _, err := s.MarkTransferIntercompanyPaired(ctx, tenantID, transfer.TransferID, "ic-entry-2"); err == nil {
 		t.Fatal("expected MarkTransferIntercompanyPaired to fail once the transfer is COMPLETED")
+	}
+}
+
+// approvedAndAuthorizedCrossEntity walks a cross-entity transfer through
+// the handler's real order: create, approve, authorize.
+func approvedAndAuthorizedCrossEntity(t *testing.T, ctx context.Context, tenantID, correlationID string) *domain.TreasuryTransfer {
+	t.Helper()
+	s := testStore
+	src, tgt := seedTransferPair(t, ctx, tenantID)
+	transfer, _, err := s.CreateTreasuryTransfer(ctx, domain.CreateTreasuryTransferParams{
+		TenantID: tenantID, SourceBankAccountID: src, TargetBankAccountID: tgt,
+		Amount: "300", CurrencyCode: "USD", IsCrossEntity: true, CorrelationID: correlationID, MakerPrincipalID: "maker-1",
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := s.ApproveTreasuryTransfer(ctx, domain.ApproveTreasuryTransferParams{TenantID: tenantID, TransferID: transfer.TransferID, CheckerPrincipalID: "checker-1"}); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	authorized, err := s.AuthorizeTreasuryTransfer(ctx, domain.AuthorizeTreasuryTransferParams{TenantID: tenantID, TransferID: transfer.TransferID, AuthorizerPrincipalID: "authorizer-1"})
+	if err != nil {
+		t.Fatalf("authorize: %v", err)
+	}
+	return authorized
+}
+
+// A cross-entity transfer is submitted from AUTHORIZED, the only state
+// ExecuteTreasuryTransfer submits it from. Before, MarkTransferSubmitted
+// only accepted APPROVED: the payment attempt had already gone to BNK-06
+// and the transfer could never record it, so the ledger and intercompany
+// steps never ran.
+func TestPgStore_CrossEntityTransfer_SubmittedFromAuthorized(t *testing.T) {
+	cleanTables(t)
+	s := testStore
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+
+	authorized := approvedAndAuthorizedCrossEntity(t, ctx, tenantID, "corr-cross-submit")
+	submitted, err := s.MarkTransferSubmitted(ctx, tenantID, authorized.TransferID, "attempt-1")
+	if err != nil || submitted.Status != domain.TransferSubmitted || submitted.PaymentAttemptID != "attempt-1" {
+		t.Fatalf("submit an AUTHORIZED cross-entity transfer: %+v err=%v", submitted, err)
+	}
+}
+
+// The store refuses to submit a cross-entity transfer that skipped
+// authorization, and a same-entity one that somehow holds AUTHORIZED. The
+// handler already checks the first; this is the second line.
+func TestPgStore_CrossEntityTransfer_NotSubmittedWithoutAuthorization(t *testing.T) {
+	cleanTables(t)
+	s := testStore
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+	src, tgt := seedTransferPair(t, ctx, tenantID)
+
+	transfer, _, err := s.CreateTreasuryTransfer(ctx, domain.CreateTreasuryTransferParams{
+		TenantID: tenantID, SourceBankAccountID: src, TargetBankAccountID: tgt,
+		Amount: "300", CurrencyCode: "USD", IsCrossEntity: true, CorrelationID: "corr-cross-unauthorized", MakerPrincipalID: "maker-1",
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := s.ApproveTreasuryTransfer(ctx, domain.ApproveTreasuryTransferParams{TenantID: tenantID, TransferID: transfer.TransferID, CheckerPrincipalID: "checker-1"}); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	if _, err := s.MarkTransferSubmitted(ctx, tenantID, transfer.TransferID, "attempt-1"); !errors.Is(err, domain.ErrInvalidTransferTransition) {
+		t.Fatalf("expected ErrInvalidTransferTransition submitting an unauthorized cross-entity transfer, got %v", err)
+	}
+}
+
+// CancelBeforeSubmission covers AUTHORIZED, as domain.CanCancelBeforeSubmission
+// and GetTransferAvailableActions already say: the bank has not seen it.
+func TestPgStore_CrossEntityTransfer_CancelWhileAuthorized(t *testing.T) {
+	cleanTables(t)
+	s := testStore
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+
+	authorized := approvedAndAuthorizedCrossEntity(t, ctx, tenantID, "corr-cross-cancel")
+	cancelled, err := s.CancelBeforeSubmission(ctx, domain.CancelBeforeSubmissionParams{
+		TenantID: tenantID, TransferID: authorized.TransferID, Reason: "no longer needed", ActorPrincipalID: "maker-1",
+	})
+	if err != nil || cancelled.Status != domain.TransferCancelled {
+		t.Fatalf("cancel an AUTHORIZED transfer: %+v err=%v", cancelled, err)
+	}
+}
+
+// AmendTreasuryTransfer stores the cross-entity classification the handler
+// re-derives from the amended accounts.
+func TestPgStore_AmendTreasuryTransfer_StoresReclassification(t *testing.T) {
+	cleanTables(t)
+	s := testStore
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+	src, tgt := seedTransferPair(t, ctx, tenantID)
+
+	draft, _, err := s.CreateTreasuryTransfer(ctx, domain.CreateTreasuryTransferParams{
+		TenantID: tenantID, SourceBankAccountID: src, TargetBankAccountID: tgt,
+		Amount: "10", CurrencyCode: "USD", CorrelationID: "corr-amend-reclassify", MakerPrincipalID: "maker-1", SaveAsDraft: true,
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	amended, err := s.AmendTreasuryTransfer(ctx, domain.AmendTreasuryTransferParams{
+		TenantID: tenantID, TransferID: draft.TransferID, SourceBankAccountID: src, TargetBankAccountID: tgt,
+		Amount: "10", CurrencyCode: "USD", IsCrossEntity: true, ActorPrincipalID: "maker-1",
+	})
+	if err != nil || !amended.IsCrossEntity {
+		t.Fatalf("amend: %+v err=%v", amended, err)
+	}
+}
+
+// RESUBMIT starts a fresh maker-checker cycle, so the prior cross-entity
+// authorizer is cleared along with the prior checker.
+func TestPgStore_ResolveResubmit_ClearsPriorAuthorizer(t *testing.T) {
+	cleanTables(t)
+	s := testStore
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+
+	authorized := approvedAndAuthorizedCrossEntity(t, ctx, tenantID, "corr-resubmit-authorizer")
+	if _, err := s.MarkTransferSubmitted(ctx, tenantID, authorized.TransferID, "attempt-1"); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if _, err := s.MarkTransferReturned(ctx, domain.MarkTransferReturnedParams{TenantID: tenantID, TransferID: authorized.TransferID, Reason: "returned", ActorPrincipalID: "ops-1"}); err != nil {
+		t.Fatalf("return: %v", err)
+	}
+	resubmitted, err := s.ResolveTreasuryTransfer(ctx, domain.ResolveTreasuryTransferParams{TenantID: tenantID, TransferID: authorized.TransferID, Resolution: domain.ResolutionResubmit, ActorPrincipalID: "ops-1"})
+	if err != nil {
+		t.Fatalf("resubmit: %v", err)
+	}
+	if resubmitted.CheckerPrincipalID != "" || resubmitted.AuthorizerPrincipalID != "" {
+		t.Fatalf("resubmitted transfer kept a prior approval: checker=%q authorizer=%q", resubmitted.CheckerPrincipalID, resubmitted.AuthorizerPrincipalID)
 	}
 }

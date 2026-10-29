@@ -24,9 +24,10 @@
 // What IS real, not fabricated:
 //   - ProposePayeeDestination verifies the named party against
 //     counterparty-management-svc's real GET /v1/counterparties/{id} —
-//     confirms it exists, belongs to the right legal entity, and surfaces
-//     its real ComplianceStatus as this service's own "party status"
-//     signal (the spec's own "Server-resolved context" line).
+//     confirms it exists and belongs to the right legal entity. The client
+//     also returns Status and ComplianceStatus, but this service does not
+//     yet enforce them; that is a real gap against the spec's
+//     "Server-resolved context" line (see SPEC_DEVIATIONS A3).
 //   - The literal enforcement of the spec's own "Minimum service
 //     acceptance" #1 ("invoice-supplied bank data never activates
 //     destination"): a destination candidate whose SourceType is
@@ -70,12 +71,14 @@
 //     session, rather than routing through a separate governance layer
 //     the spec names but this codebase's other services don't call
 //     either.
-//   - AP-10's own "fingerprints active version" dependency (payment
-//     authorization consulting this service's active destination
-//     fingerprint before authorizing) is NOT wired in this build —
-//     scoped as the natural next step, mirroring exactly how AP-11 was
-//     wired to BNK-06/BNK-07 in a later turn after those services were
-//     first built standalone.
+//   - AP-10's "fingerprints active version" dependency IS wired, but only
+//     as a pull. payment-authorization-svc's payeeidentity client re-fetches
+//     GetActivePayeeDestination at request, approval, consumption and
+//     validation time, pins DestinationID, and invalidates the authorization
+//     when it changes or disappears (internal/handler/handler.go's
+//     verifyStillEligible). Nothing consumes this service's
+//     payee-destination.* outbox events; there is no proactive invalidation
+//     between those checkpoints. See SPEC_DEVIATIONS A9.
 //   - Full account identifiers are stored in this service's own database
 //     without field-level encryption via a real KMS/secret-vault-
 //     integration-svc call — masking is real and enforced at the read
@@ -219,6 +222,18 @@ const (
 	EventPayeeDestinationSuperseded = "PAYEE_DESTINATION_SUPERSEDED"
 )
 
+// Command names recorded in command_idempotency. The target is always the
+// PayeeDestination row the command acted on; for Propose it is the row the
+// command created.
+const (
+	CommandProposeDestination   = "PROPOSE_DESTINATION"
+	CommandVerifyDestination    = "VERIFY_DESTINATION"
+	CommandApproveDestination   = "APPROVE_DESTINATION"
+	CommandActivateDestination  = "ACTIVATE_DESTINATION"
+	CommandSuspendDestination   = "SUSPEND_DESTINATION"
+	CommandSupersedeDestination = "SUPERSEDE_DESTINATION"
+)
+
 // ── request DTOs ────────────────────────────────────────────────────────────
 
 type ProposeDestinationRequest struct {
@@ -261,4 +276,6 @@ const (
 	ErrPartyServiceUnavailable    = sentinel("counterparty-management-svc unavailable")
 	ErrNoActiveDestination        = sentinel("no active payee destination for this party/scope")
 	ErrStoreUnavailable           = sentinel("store unavailable")
+	ErrIdempotencyKeyRequired     = sentinel("Idempotency-Key header is required")
+	ErrIdempotencyKeyConflict     = sentinel("idempotency key was already used for a different command, destination or request")
 )

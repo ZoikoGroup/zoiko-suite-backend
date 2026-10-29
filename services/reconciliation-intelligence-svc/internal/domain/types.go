@@ -85,6 +85,11 @@ type BankStatementLine struct {
 	Amount          string
 	CurrencyCode    string
 	BankReference   string
+	// GLCashAccountCode is the general-ledger-svc account that represents
+	// this bank account — what a counterpart journal must post to (A2a).
+	// "" only on a line bank-reconciliation-svc ingested before it recorded
+	// one; such a line cannot be searched, or matched to a journal there.
+	GLCashAccountCode string
 }
 
 // ReconciliationJob is one analysis of a bank-reconciliation run's
@@ -137,13 +142,25 @@ type ReconciliationSuggestion struct {
 	// CounterpartStatementLineID is the second record a two-record
 	// suggestion is about: on DUPLICATE_ENTRY, the line StatementLineID
 	// probably duplicates. Empty on single-line suggestions.
-	CounterpartStatementLineID string          `json:"counterpart_statement_line_id,omitempty"`
-	SourceRecordA              string          `json:"source_record_a"`
-	SourceRecordB              string          `json:"source_record_b,omitempty"`
-	AmountA                    string          `json:"amount_a"`
-	AmountB                    string          `json:"amount_b"`
-	DiscrepancyAmount          string          `json:"discrepancy_amount"`
-	DiscrepancyType            DiscrepancyType `json:"discrepancy_type"`
+	CounterpartStatementLineID string `json:"counterpart_statement_line_id,omitempty"`
+	// CounterpartJournalID is the general-ledger-svc journal proposed as
+	// this line's book side on an AUTO_MATCH or DATE_SKEW suggestion (A2a).
+	// Proposed only: the match is made in bank-reconciliation-svc, by humans.
+	CounterpartJournalID string `json:"counterpart_journal_id,omitempty"`
+	// CandidateSearchOutcome is what the search for a counterpart found, on
+	// every searched line; empty on a DUPLICATE_ENTRY copy (not searched)
+	// and on rows written before migration 000008.
+	CandidateSearchOutcome CandidateSearchOutcome `json:"candidate_search_outcome,omitempty"`
+	// DateToleranceVersion is the governed candidate date tolerance policy
+	// version the search used; zero exactly when CandidateSearchOutcome is
+	// empty.
+	DateToleranceVersion int             `json:"date_tolerance_version,omitempty"`
+	SourceRecordA        string          `json:"source_record_a"`
+	SourceRecordB        string          `json:"source_record_b,omitempty"`
+	AmountA              string          `json:"amount_a"`
+	AmountB              string          `json:"amount_b"`
+	DiscrepancyAmount    string          `json:"discrepancy_amount"`
+	DiscrepancyType      DiscrepancyType `json:"discrepancy_type"`
 	// ConfidenceScore is NOT statistically or ML-derived — it is a fixed
 	// label produced by AnalyzeUnmatchedStatementLines' hardcoded threshold
 	// rules. HeuristicRule names the exact rule that fired, so the score has
@@ -161,8 +178,12 @@ type ReconciliationSuggestion struct {
 	Recommendation   ResolutionRecommendation `json:"recommendation"`
 	SuggestionStatus SuggestionStatus         `json:"suggestion_status"`
 	ResolutionNotes  string                   `json:"resolution_notes,omitempty"`
-	CreatedAt        time.Time                `json:"created_at"`
-	UpdatedAt        time.Time                `json:"updated_at"`
+	// AuthoritativeRef is the owning domain's record that carried out an
+	// EXECUTED suggestion (A5). Set only on EXECUTED, and always on an
+	// EXECUTED WRITE_OFF or TIMING_ADJUSTMENT executed after migration 000007.
+	AuthoritativeRef *AuthoritativeRef `json:"authoritative_ref,omitempty"`
+	CreatedAt        time.Time         `json:"created_at"`
+	UpdatedAt        time.Time         `json:"updated_at"`
 }
 
 // MarshalJSON emits the canonical field names and, for one release, the
@@ -197,6 +218,9 @@ type AnalyzeReconciliationRequest struct {
 type ApplyResolutionRequest struct {
 	SuggestionStatus SuggestionStatus `json:"suggestion_status"` // APPROVED, REJECTED, EXECUTED
 	ResolutionNotes  string           `json:"resolution_notes"`
+	// AuthoritativeRef accompanies EXECUTED only; see ValidateExecutionRef
+	// for when it is required.
+	AuthoritativeRef *AuthoritativeRef `json:"authoritative_ref,omitempty"`
 }
 
 // UnmarshalJSON accepts the canonical suggestion_status and, for one release,
@@ -204,9 +228,10 @@ type ApplyResolutionRequest struct {
 // different values is refused rather than having one silently chosen.
 func (r *ApplyResolutionRequest) UnmarshalJSON(data []byte) error {
 	var wire struct {
-		SuggestionStatus SuggestionStatus `json:"suggestion_status"`
-		ResolutionStatus SuggestionStatus `json:"resolution_status"`
-		ResolutionNotes  string           `json:"resolution_notes"`
+		SuggestionStatus SuggestionStatus  `json:"suggestion_status"`
+		ResolutionStatus SuggestionStatus  `json:"resolution_status"`
+		ResolutionNotes  string            `json:"resolution_notes"`
+		AuthoritativeRef *AuthoritativeRef `json:"authoritative_ref"`
 	}
 	if err := json.Unmarshal(data, &wire); err != nil {
 		return err
@@ -219,6 +244,7 @@ func (r *ApplyResolutionRequest) UnmarshalJSON(data []byte) error {
 		r.SuggestionStatus = wire.ResolutionStatus
 	}
 	r.ResolutionNotes = wire.ResolutionNotes
+	r.AuthoritativeRef = wire.AuthoritativeRef
 	return nil
 }
 
@@ -335,12 +361,24 @@ const MetricMissingReferenceTolerance = "RECONCILIATION_MISSING_REFERENCE_WRITEO
 // missingReferenceTolerance is the current MetricMissingReferenceTolerance for
 // the run's legal entity, including the version that was actually used. All
 // money is compared exactly as big.Rat (ZS-DATA-001 D06).
-func AnalyzeUnmatchedStatementLines(lines []BankStatementLine, runID, tenantID string, missingReferenceTolerance *GovernedTolerance) ([]ReconciliationSuggestion, error) {
+//
+// search is the counterpart search (A2a, candidates.go). Every line that is
+// not a duplicate copy is searched first: a single qualifying journal becomes
+// an AUTO_MATCH (within the governed date tolerance) or DATE_SKEW (beyond it)
+// proposal *instead of* the missing-reference suggestion, so every line is
+// still the subject of exactly one suggestion. Any other result — several
+// qualifying journals, none, no cash account — is recorded on the
+// missing-reference suggestion, and several candidates force MANUAL_REVIEW:
+// a line with book-side candidates is never recommended for write-off.
+func AnalyzeUnmatchedStatementLines(lines []BankStatementLine, runID, tenantID string, missingReferenceTolerance *GovernedTolerance, search *CandidateSearch) ([]ReconciliationSuggestion, error) {
 	if missingReferenceTolerance == nil || missingReferenceTolerance.Amount == nil {
 		return nil, fmt.Errorf("the governed missing-reference tolerance is required")
 	}
 	if missingReferenceTolerance.Version <= 0 {
 		return nil, fmt.Errorf("the governed missing-reference tolerance version is required")
+	}
+	if search == nil || search.Tolerance.Version <= 0 || search.Tolerance.Days < 0 || search.HorizonDays < search.Tolerance.Days {
+		return nil, fmt.Errorf("a governed candidate date tolerance and a search horizon at least as wide are required")
 	}
 	tol := CanonicalAmount(missingReferenceTolerance.Amount)
 
@@ -363,6 +401,18 @@ func AnalyzeUnmatchedStatementLines(lines []BankStatementLine, runID, tenantID s
 	// So every line is still the subject of exactly one suggestion.
 	dupOf, dupsOf := findDuplicates(lines, amounts)
 
+	// A copy is not searched: the entry it duplicates is, once.
+	searched := make(map[int]bool, len(lines))
+	for i := range lines {
+		if _, isDup := dupOf[i]; !isDup {
+			searched[i] = true
+		}
+	}
+	found, err := searchCandidates(lines, amounts, searched, tenantID, search)
+	if err != nil {
+		return nil, err
+	}
+
 	items := make([]ReconciliationSuggestion, 0, len(lines))
 	for i, line := range lines {
 		amount := amounts[i]
@@ -370,6 +420,24 @@ func AnalyzeUnmatchedStatementLines(lines []BankStatementLine, runID, tenantID s
 
 		if d, isDup := dupOf[i]; isDup {
 			items = append(items, duplicateItem(line, lines[d.anchor], amount, amounts[d.anchor], d.exact, runID, tenantID, missingReferenceTolerance.Version, now))
+			continue
+		}
+
+		dupNote := ""
+		if dups := dupsOf[i]; len(dups) > 0 {
+			ids := make([]string, len(dups))
+			for k, j := range dups {
+				ids[k] = lines[j].StatementLineID
+			}
+			dupNote = fmt.Sprintf("; judged as one entry — %d probable duplicate(s) of it in this run (%s) carry DUPLICATE_ENTRY suggestions instead",
+				len(dups), strings.Join(ids, ", "))
+		}
+
+		ls := found[i]
+		if ls.proposed != nil {
+			item := candidateItem(line, amount, ls.outcome, *ls.proposed, runID, tenantID, missingReferenceTolerance.Version, search, now)
+			item.ResolutionNotes += dupNote
+			items = append(items, item)
 			continue
 		}
 
@@ -393,14 +461,13 @@ func AnalyzeUnmatchedStatementLines(lines []BankStatementLine, runID, tenantID s
 				"heuristic rule: statement line %s is UNMATCHED in bank-reconciliation run %s; amount magnitude %s is below the %s governed small-amount write-off tolerance",
 				line.StatementLineID, runID, mag, tol)
 		}
-		if dups := dupsOf[i]; len(dups) > 0 {
-			ids := make([]string, len(dups))
-			for k, j := range dups {
-				ids[k] = lines[j].StatementLineID
-			}
-			rationale += fmt.Sprintf("; judged as one entry — %d probable duplicate(s) of it in this run (%s) carry DUPLICATE_ENTRY suggestions instead",
-				len(dups), strings.Join(ids, ", "))
+		if ls.outcome == CandidateAmbiguous {
+			// Book-side candidates exist, so this is never a write-off.
+			rec = RecommendationManualReview
+			confScore = candidateAmbiguousConfidence
+			rule = HeuristicCandidateAmbiguous
 		}
+		rationale += dupNote + candidateNote(ls, line, search)
 
 		items = append(items, ReconciliationSuggestion{
 			TenantID:                tenantID,
@@ -415,6 +482,8 @@ func AnalyzeUnmatchedStatementLines(lines []BankStatementLine, runID, tenantID s
 			ConfidenceScore:         confScore,
 			HeuristicRule:           rule,
 			ToleranceVersion:        missingReferenceTolerance.Version,
+			CandidateSearchOutcome:  ls.outcome,
+			DateToleranceVersion:    search.Tolerance.Version,
 			Recommendation:          rec,
 			SuggestionStatus:        StatusRecommended,
 			ResolutionNotes:         rationale,

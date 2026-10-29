@@ -59,6 +59,18 @@ type LineTemplate struct {
 	Dimensions  map[string]string `json:"dimensions,omitempty"`
 	When        []Condition       `json:"when,omitempty"`
 	KeepZero    bool              `json:"keep_zero,omitempty"`
+	// Functional, when set, states the line's functional-currency amount directly (an expression over the event's facts) instead
+	// of converting its transaction amount at the event's rate. A settlement uses it to retire a receivable or payable at the
+	// carrying amount it was recognised and revalued at; the difference from what the settlement is worth is the realized
+	// exchange difference (standard §24).
+	Functional string `json:"functional,omitempty"`
+}
+
+// RealizedFX names the accounts a realized exchange difference is posted to. A rule that settles items at their carrying
+// amount needs it: without it a functional difference is an unbalanced journal.
+type RealizedFX struct {
+	Gain AccountRef `json:"gain_account"`
+	Loss AccountRef `json:"loss_account"`
 }
 
 // Dimension rule modes (standard §13).
@@ -91,6 +103,7 @@ type RuleContent struct {
 	DimensionRules   []DimensionRule `json:"dimension_rules,omitempty"`
 	TaxDependency    *TaxDependency  `json:"tax_dependency,omitempty"`
 	FXPolicyID       string          `json:"fx_policy_id,omitempty"`
+	RealizedFX       *RealizedFX     `json:"realized_fx,omitempty"`
 	ApprovalPolicyID string          `json:"approval_policy_id,omitempty"`
 }
 
@@ -103,6 +116,9 @@ type TestCase struct {
 	FX         *FXBasis          `json:"fx,omitempty"`
 	Functional string            `json:"functional_currency,omitempty"`
 	MinorUnits map[string]int    `json:"minor_units,omitempty"`
+	// Controls gives the control type of an account code the case resolves to (AR, AP, ...), so a case can exercise the
+	// counterparty rule of a control account.
+	Controls map[string]string `json:"control_types,omitempty"`
 	Expect     TestExpectation   `json:"expect"`
 }
 
@@ -126,6 +142,8 @@ type ExpectedLine struct {
 	Side        string `json:"side"`
 	AccountCode string `json:"account_code"`
 	Amount      string `json:"amount"`
+	// Functional, when set, is also compared (the functional-currency amount of the line).
+	Functional string `json:"functional,omitempty"`
 }
 
 // RuleSet is one immutable version of a posting rule set.
@@ -137,6 +155,7 @@ type RuleSet struct {
 	EventType       string      `json:"event_type"`
 	BookType        string      `json:"book_type"`
 	FrameworkID     string      `json:"accounting_framework_id"`
+	Jurisdiction    string      `json:"jurisdiction,omitempty"`
 	Version         string      `json:"version"`
 	Status          string      `json:"status"`
 	EffectiveFrom   time.Time   `json:"effective_from"`
@@ -195,6 +214,9 @@ func (r *RuleSet) Validate() error {
 	if !codeRE.MatchString(r.FrameworkID) {
 		return bad("accounting_framework_id", "a controlled identifier")
 	}
+	if !jurisdictionRE.MatchString(r.Jurisdiction) {
+		return bad("jurisdiction", "an ISO 3166 country code, optionally with a subdivision (DE, US-CA), or empty for global")
+	}
 	if !semverRE.MatchString(r.Version) {
 		return bad("version", "a semantic version such as 1.0.0")
 	}
@@ -218,6 +240,11 @@ func (c *RuleContent) Validate() error {
 	bad := func(f, why string) error {
 		return exc(FamRule, "RULE_CONTENT_INVALID", "%s: %s", f, why).with("field", f)
 	}
+	if c.FXPolicyID != "" {
+		if _, ok := fxPolicies[c.FXPolicyID]; !ok {
+			return bad("content.fx_policy_id", "an exchange-rate policy: SPOT_ON_DATE, TRANSACTION_ON_DATE, CLOSING_ON_DATE or AVERAGE_FOR_PERIOD")
+		}
+	}
 	if _, ok := BuiltinRoundingPolicies[c.RoundingPolicyID]; !ok {
 		return bad("rounding_policy_id", "a known rounding policy")
 	}
@@ -227,6 +254,9 @@ func (c *RuleContent) Validate() error {
 	}
 	if c.RoundingAccount != nil && !c.RoundingAccount.valid() {
 		return bad("rounding_account", "exactly one of account_code or mapping_key")
+	}
+	if c.RealizedFX != nil && (!c.RealizedFX.Gain.valid() || !c.RealizedFX.Loss.valid()) {
+		return bad("realized_fx", "a gain account and a loss account, each exactly one of account_code or mapping_key")
 	}
 	if len(c.LineTemplates) < 2 || len(c.LineTemplates) > 60 {
 		return bad("line_templates", "2-60 line templates")
@@ -248,6 +278,11 @@ func (c *RuleContent) Validate() error {
 		}
 		if _, err := ParseExpr(t.Amount); err != nil {
 			return bad(at+"amount", err.Error())
+		}
+		if t.Functional != "" {
+			if _, err := ParseExpr(t.Functional); err != nil {
+				return bad(at+"functional", err.Error())
+			}
 		}
 		if err := validateConditions(t.When); err != nil {
 			return bad(at+"when", err.Error())
@@ -420,7 +455,9 @@ func evalConditions(ev *AccountingEvent, cs []Condition) bool {
 }
 
 // Scope is what two rule sets must not both claim on the same date: an event type for a book type and framework.
-func (r *RuleSet) Scope() string { return r.EventType + "|" + r.BookType + "|" + r.FrameworkID }
+func (r *RuleSet) Scope() string {
+	return r.EventType + "|" + r.BookType + "|" + r.FrameworkID + "|" + r.Jurisdiction
+}
 
 // Covers reports whether the rule set applies on the date.
 func (r *RuleSet) Covers(d time.Time) bool {
@@ -471,4 +508,30 @@ func sortedKeys[V any](m map[string]V) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// jurisdictionRE is the shape of a jurisdiction code: an ISO 3166 country with an optional subdivision, or empty for global.
+var jurisdictionRE = regexp.MustCompile(`^([A-Z]{2}(-[A-Z0-9]{1,5})?)?$`)
+
+// preferJurisdiction applies the rule hierarchy (§6.1): where an extension rule set for the book's jurisdiction is active for the
+// event, it replaces the framework's global rule set; otherwise the global one stands.
+func preferJurisdiction(sets []RuleSet, jurisdiction string) []RuleSet {
+	if jurisdiction == "" {
+		return sets
+	}
+	var own []RuleSet
+	for _, s := range sets {
+		if s.Jurisdiction == jurisdiction {
+			own = append(own, s)
+		}
+	}
+	if len(own) > 0 {
+		return own
+	}
+	return sets
+}
+
+// AppliesToJurisdiction reports whether a rule set may be used in a book kept under the jurisdiction.
+func (r *RuleSet) AppliesToJurisdiction(bookJurisdiction string) bool {
+	return r.Jurisdiction == "" || r.Jurisdiction == bookJurisdiction
 }

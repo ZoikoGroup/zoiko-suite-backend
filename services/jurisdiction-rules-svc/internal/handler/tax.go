@@ -33,12 +33,12 @@ func registerCalculationRoute(r chi.Router, h *Handler) {
 	r.Post("/v1/regulatory-calculations:execute", h.ExecuteCalculation)
 }
 
-func (h *Handler) writeParametersError(w http.ResponseWriter, err error, corr string) {
+func (h *Handler) writeParametersError(w http.ResponseWriter, r *http.Request, err error, corr string) {
 	if errors.Is(err, domain.ErrParametersInvalid) {
-		writeError(w, http.StatusBadRequest, "invalid_parameters", err.Error())
+		writeError(w, r, http.StatusBadRequest, "invalid_parameters", err.Error())
 		return
 	}
-	h.writeRegistryError(w, err, corr)
+	h.writeRegistryError(w, r, err, corr)
 }
 
 type SetRuleParametersRequest struct {
@@ -57,7 +57,7 @@ func (h *Handler) SetRuleParameters(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(req.Parameters) == 0 { // absent; an explicit null arrives as the bytes "null"
-		writeMissingField(w, "parameters")
+		writeMissingField(w, r, "parameters")
 		return
 	}
 	var params json.RawMessage
@@ -67,7 +67,7 @@ func (h *Handler) SetRuleParameters(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "jurisdiction_rule_id")
 	out, err := h.registry.SetRuleParameters(r.Context(), id, params, actor)
 	if err != nil {
-		h.writeParametersError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeParametersError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"jurisdiction_rule_id": id, "parameters": json.RawMessage(nullOrRaw(out))})
@@ -84,7 +84,7 @@ func (h *Handler) GetRuleParameters(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "jurisdiction_rule_id")
 	out, err := h.registry.GetRuleParameters(r.Context(), id)
 	if err != nil {
-		h.writeParametersError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeParametersError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"jurisdiction_rule_id": id, "parameters": json.RawMessage(nullOrRaw(out))})
@@ -135,22 +135,22 @@ func (h *Handler) ExecuteCalculation(w http.ResponseWriter, r *http.Request) {
 	if field := firstBlank(requiredField{"jurisdiction", req.Jurisdiction}, requiredField{"rule_domain", req.RuleDomain},
 		requiredField{"rule_code", req.RuleCode}, requiredField{"effective_at", req.EffectiveAt},
 		requiredField{"taxable_amount", req.TaxableAmount}, requiredField{"currency", req.Currency}); field != "" {
-		writeMissingField(w, field)
+		writeMissingField(w, r, field)
 		return
 	}
 	if !currencyShapeRe.MatchString(req.Currency) {
-		writeError(w, http.StatusBadRequest, "invalid_currency", "currency must be a three-letter upper-case code (its precision is the rule's rounding scale; no currency registry exists to validate it)")
+		writeError(w, r, http.StatusBadRequest, "invalid_currency", "currency must be a three-letter upper-case code (its precision is the rule's rounding scale; no currency registry exists to validate it)")
 		return
 	}
 	at, err := time.Parse(time.RFC3339Nano, req.EffectiveAt)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_effective_at", "effective_at must be an RFC3339 instant")
+		writeError(w, r, http.StatusBadRequest, "invalid_effective_at", "effective_at must be an RFC3339 instant")
 		return
 	}
 	var idemKey *string
 	if k := strings.TrimSpace(r.Header.Get("Idempotency-Key")); k != "" {
 		if len(k) > maxIdempotencyKey {
-			writeError(w, http.StatusBadRequest, "invalid_idempotency_key", "Idempotency-Key is too long")
+			writeError(w, r, http.StatusBadRequest, "invalid_idempotency_key", "Idempotency-Key is too long")
 			return
 		}
 		idemKey = &k
@@ -164,7 +164,7 @@ func (h *Handler) ExecuteCalculation(w http.ResponseWriter, r *http.Request) {
 	d, err := h.resolver.Resolve(r.Context(), resolver.Request{Jurisdiction: req.Jurisdiction, RuleDomain: req.RuleDomain,
 		RuleCode: req.RuleCode, At: at, PackRef: req.PackRef, PackVersion: req.PackVersion})
 	if err != nil {
-		h.writeResolveError(w, err, corr)
+		h.writeResolveError(w, r, err, corr)
 		return
 	}
 
@@ -187,7 +187,7 @@ func (h *Handler) ExecuteCalculation(w http.ResponseWriter, r *http.Request) {
 
 	respJSON, err := json.Marshal(out)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "encode_failed", "could not encode the calculation")
+		writeError(w, r, http.StatusInternalServerError, "encode_failed", "could not encode the calculation")
 		return
 	}
 	rec := store.DecisionRecord{Kind: "CALCULATION", RequestedBy: actor, CorrelationID: corr, IdempotencyKey: idemKey, RequestDigest: reqDigest,
@@ -209,10 +209,10 @@ func (h *Handler) ExecuteCalculation(w http.ResponseWriter, r *http.Request) {
 	stored, replayed, err := h.registry.RecordDecision(r.Context(), rec)
 	if err != nil {
 		if errors.Is(err, domain.ErrIdempotencyConflict) {
-			writeError(w, http.StatusConflict, "idempotency_conflict", err.Error())
+			writeError(w, r, http.StatusConflict, "idempotency_conflict", err.Error())
 			return
 		}
-		h.writeRegistryError(w, err, corr)
+		h.writeRegistryError(w, r, err, corr)
 		return
 	}
 	status := http.StatusOK
@@ -224,3 +224,4 @@ func (h *Handler) ExecuteCalculation(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, status, map[string]any{"decision_id": stored.DecisionID, "replayed": replayed, "calculation": json.RawMessage(stored.Response)})
 }
+

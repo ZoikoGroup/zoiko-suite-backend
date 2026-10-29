@@ -2,6 +2,7 @@
 package handler
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strconv"
@@ -114,6 +115,10 @@ func (h *UsageHandler) fail(w http.ResponseWriter, r *http.Request, err error) {
 	writeFailure(w, r, h.logger, err)
 }
 
+type usageAdjustmentReader interface {
+	GetUsageAdjustment(ctx context.Context, targetStatementID, meterKey, sourceUsageEventID string) (*domain.UsageAdjustment, error)
+}
+
 func (h *UsageHandler) principal(w http.ResponseWriter, r *http.Request) (string, bool) {
 	p := strings.TrimSpace(r.Header.Get("X-Principal-Id"))
 	if p == "" {
@@ -211,6 +216,18 @@ func (h *UsageHandler) RegisterMeterDefinition(w http.ResponseWriter, r *http.Re
 	}
 	created, err := h.store.RegisterMeterDefinition(r.Context(), m, cmd.claim)
 	if err != nil {
+		var replay *domain.IdempotentReplayError
+		if errors.As(err, &replay) {
+			if i := strings.LastIndex(replay.ResourceID, "/"); i > 0 {
+				if version, verr := strconv.Atoi(replay.ResourceID[i+1:]); verr == nil {
+					if existing, gerr := h.store.GetMeterDefinition(r.Context(), replay.ResourceID[:i], version); gerr == nil {
+						w.Header().Set("Idempotent-Replayed", "true")
+						writeJSON(w, http.StatusCreated, existing)
+						return
+					}
+				}
+			}
+		}
 		h.fail(w, r, err)
 		return
 	}
@@ -399,6 +416,14 @@ func (h *UsageHandler) CorrectUsageEvent(w http.ResponseWriter, r *http.Request)
 	in := domain.EventInput{Quantity: req.Quantity, Dimensions: req.Dimensions, OccurredAt: req.OccurredAt.UTC().Truncate(time.Microsecond)}
 	e, err := h.store.CorrectUsageEvent(r.Context(), req.MeterKey, req.OriginalEventID, req.NewEventID, in, req.Reason, principal, h.now(), cmd.claim)
 	if err != nil {
+		var replay *domain.IdempotentReplayError
+		if errors.As(err, &replay) {
+			if existing, gerr := h.store.GetDedupStatus(r.Context(), req.MeterKey, req.NewEventID); gerr == nil {
+				w.Header().Set("Idempotent-Replayed", "true")
+				writeJSON(w, http.StatusCreated, existing)
+				return
+			}
+		}
 		h.fail(w, r, err)
 		return
 	}
@@ -456,6 +481,14 @@ func (h *UsageHandler) CloseUsageWindow(w http.ResponseWriter, r *http.Request) 
 	}
 	st, err := h.store.CloseUsageWindow(r.Context(), req.SubscriptionID, req.TermNo, req.MeterKey, principal, h.now(), cmd.claim)
 	if err != nil {
+		var replay *domain.IdempotentReplayError
+		if errors.As(err, &replay) {
+			if existing, gerr := h.store.GetUsage(r.Context(), req.SubscriptionID, req.TermNo, req.MeterKey); gerr == nil {
+				w.Header().Set("Idempotent-Replayed", "true")
+				writeJSON(w, http.StatusOK, existing)
+				return
+			}
+		}
 		h.fail(w, r, err)
 		return
 	}
@@ -502,6 +535,19 @@ func (h *UsageHandler) StatementAction(w http.ResponseWriter, r *http.Request) {
 		st, err = h.store.ReopenWindow(r.Context(), id, principal, req.Reason, h.now(), cmd.claim)
 	}
 	if err != nil {
+		var replay *domain.IdempotentReplayError
+		if errors.As(err, &replay) {
+			if existing, gerr := h.store.GetUsageStatement(r.Context(), replay.ResourceID); gerr == nil {
+				if existing.SupersededByStatementID != nil {
+					if replacement, rerr := h.store.GetUsageStatement(r.Context(), *existing.SupersededByStatementID); rerr == nil {
+						existing = replacement
+					}
+				}
+				w.Header().Set("Idempotent-Replayed", "true")
+				writeJSON(w, http.StatusOK, existing)
+				return
+			}
+		}
 		h.fail(w, r, err)
 		return
 	}
@@ -542,6 +588,16 @@ func (h *UsageHandler) createUsageAdjustment(w http.ResponseWriter, r *http.Requ
 	adj, err := h.store.CreateUsageAdjustment(r.Context(), targetStatementID, req.MeterKey, req.SourceUsageEventID,
 		req.Reason, principal, h.now(), cmd.claim)
 	if err != nil {
+		var replay *domain.IdempotentReplayError
+		if errors.As(err, &replay) {
+			if reader, ok := h.store.(usageAdjustmentReader); ok {
+				if existing, gerr := reader.GetUsageAdjustment(r.Context(), targetStatementID, req.MeterKey, req.SourceUsageEventID); gerr == nil {
+					w.Header().Set("Idempotent-Replayed", "true")
+					writeJSON(w, http.StatusCreated, existing)
+					return
+				}
+			}
+		}
 		h.fail(w, r, err)
 		return
 	}
