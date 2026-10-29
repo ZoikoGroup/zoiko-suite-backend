@@ -24,6 +24,8 @@ const (
 	Certification      = "CERTIFICATION"
 	Residency          = "RESIDENCY"
 	IntegrationStatus  = "INTEGRATION_STATUS"
+	// PlanAvailability states which plans are offered in a market.
+	PlanAvailability = "PLAN_AVAILABILITY"
 )
 
 // Claim statuses (Doc 03 §08). Only ACTIVE claims are answerable.
@@ -71,6 +73,8 @@ type Claim struct {
 	CitationURLKey           string    `json:"citation_url_key"`
 	ApprovalRefs             []string  `json:"approval_refs"`
 	ConflictIDs              []string  `json:"conflict_ids"`
+	// Synthetic marks seed data that is not ZoikoSuite fact.
+	Synthetic bool `json:"synthetic,omitempty"`
 }
 
 // Manifest is a signed claim release.
@@ -82,6 +86,7 @@ type Manifest struct {
 	PlanAliases map[string]string `json:"plan_aliases"` // visitor word → plan code
 	Markets     []string          `json:"markets"`      // markets offered as choices in config
 	Claims      []Claim           `json:"claims"`
+	Synthetic   bool              `json:"synthetic,omitempty"`
 }
 
 // Request asks for the claims about one subject.
@@ -108,7 +113,7 @@ type RevocationSet interface {
 }
 
 // needsMarket lists subjects that are meaningless without a market.
-var needsMarket = map[string]bool{Price: true, Trial: true, MarketAvailability: true, Residency: true}
+var needsMarket = map[string]bool{Price: true, Trial: true, MarketAvailability: true, Residency: true, PlanAvailability: true}
 
 // Resolver resolves requests against one verified manifest.
 type Resolver struct {

@@ -33,6 +33,7 @@ import (
 	"zoiko.io/public-ai-svc/internal/release"
 	"zoiko.io/public-ai-svc/internal/session"
 	"zoiko.io/public-ai-svc/internal/store"
+	"zoiko.io/public-ai-svc/internal/telemetry"
 )
 
 const refreshInterval = 5 * time.Second
@@ -54,6 +55,16 @@ func main() {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	shutdownTracing, err := telemetry.Setup(ctx, cfg.Environment)
+	if err != nil {
+		log.Fatal("tracing setup failed", zap.Error(err))
+	}
+	defer func() {
+		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = shutdownTracing(sctx)
+	}()
+	log.Info("tracing", zap.Bool("otlp_export", telemetry.Enabled()))
 
 	var (
 		st  store.Store
@@ -62,18 +73,31 @@ func main() {
 		pub events.Publisher = events.LogPublisher{Log: log}
 	)
 	if cfg.DatabaseURL == "" {
-		log.Warn("LOCAL DEV MODE: no PUBLIC_AI_DATABASE_URL; serving TEST-ONLY fixtures from memory")
-		env, err := fixtureenv.New(ctx, cfg.ModelTimeout)
+		log.Warn("LOCAL DEV MODE: no PUBLIC_AI_DATABASE_URL; serving SYNTHETIC data from memory",
+			zap.String("dataset", cfg.Dataset), zap.String("model_provider", cfg.ModelProvider), zap.Bool("kb_allow_draft", cfg.KBAllowDraft),
+			zap.String("retrieval", "lexical BM25 + aliases; no embeddings configured (ADR-002)"))
+		env, err := fixtureenv.NewFromDirWith(ctx, fixtureenv.DatasetDir(cfg.Dataset), store.NewMemory(), "dev-1", cfg.ModelTimeout, cfg.KBAllowDraft)
 		if err != nil {
-			log.Fatal("dev fixtures", zap.Error(err))
+			log.Fatal("dev dataset", zap.Error(err))
 		}
 		st, rt, fl = env.Store, env.Releases, env.Flags
+	} else if cfg.SeedOnStart {
+		// Dev/test only (config enforces): migrate -> seed -> sign and publish
+		// -> move the active pointers, then serve with that release's key.
+		st = openPostgres(ctx, log, cfg)
+		env, err := fixtureenv.NewFromDirWith(ctx, fixtureenv.DatasetDir(cfg.Dataset), st, "seed-"+time.Now().UTC().Format("20060102T150405"), cfg.ModelTimeout, cfg.KBAllowDraft)
+		if err != nil {
+			log.Fatal("seed on start", zap.Error(err))
+		}
+		log.Warn("SEED ON START: published and activated the SYNTHETIC dataset", zap.String("dataset", cfg.Dataset))
+		rt, fl = env.Releases, env.Flags
 	} else {
 		st = openPostgres(ctx, log, cfg)
 		if cfg.SigningPublicKey == "" {
 			log.Fatal("PUBLIC_AI_SIGNING_PUBLIC_KEY is required to verify releases")
 		}
 		rt = release.New(st, cfg.SigningPublicKey)
+		rt.AllowDraft = cfg.KBAllowDraft // config refuses it outside dev/test
 		fl = flags.NewLoader(st)
 		if len(cfg.KafkaBrokers) > 0 {
 			pub = events.NewKafkaPublisher(cfg.KafkaBrokers)
@@ -107,7 +131,7 @@ func main() {
 
 	pipeline := &orchestrator.Pipeline{
 		Releases: rt, Flags: fl, Store: st, Log: log, MaxOutputTokens: cfg.TokenBudgetPerTurn / 4,
-		Model: model.Gateway{Provider: providerFor(log, cfg), Timeout: cfg.ModelTimeout, Breaker: &model.Breaker{
+		Model: model.Gateway{Provider: providerFor(log, cfg), Timeout: cfg.ModelTimeout, ModelID: cfg.ModelID, Breaker: &model.Breaker{
 			Threshold: 5, Cooldown: 30 * time.Second,
 			OnOpen: func() {
 				log.Error("ALERT model circuit open: provider failing; serving UNAVAILABLE with official routes")
@@ -125,13 +149,20 @@ func main() {
 	serve(ctx, log, cfg, api.Router())
 }
 
-// providerFor returns the configured model provider. Only the Fake exists
-// until a vendor, model and region are approved (DEC-05, ADR-003).
+// providerFor returns the configured model provider behind the same
+// model.Provider interface (no tools): the deterministic mock (dev/test) or
+// Groq. Config has already refused unknown providers, a missing key and any
+// model id outside the allowlist. The key is never logged.
 func providerFor(log *zap.Logger, cfg config.Config) model.Provider {
-	if cfg.ModelProfile != "fake-v0" {
-		log.Fatal("no approved model provider for profile", zap.String("profile", cfg.ModelProfile))
+	switch cfg.ModelProvider {
+	case "groq":
+		log.Info("model provider", zap.String("provider", "groq"), zap.String("model", cfg.ModelID), zap.String("prompt_version", model.PromptVersion))
+		return &model.Groq{APIKey: cfg.GroqAPIKey, Model: cfg.ModelID}
+	case "mock":
+		return &model.Fake{}
 	}
-	return &model.Fake{}
+	log.Fatal("no approved model provider", zap.String("provider", cfg.ModelProvider))
+	return nil
 }
 
 func openPostgres(ctx context.Context, log *zap.Logger, cfg config.Config) store.Store {

@@ -82,7 +82,7 @@ components:
       title: zs-public-answer-v1
       type: object
       additionalProperties: false
-      required: [schema_version, turn_id, request_id, turn_sequence, status, intent_id, text, citations, actions, knowledge_release_id, policy_version]
+      required: [schema_version, turn_id, request_id, turn_sequence, status, intent_id, text, citations, actions, knowledge_release_id, policy_version, answer_class]
       properties:
         schema_version: {const: "1.0"}
         turn_id: {type: string}
@@ -99,6 +99,43 @@ components:
           type: object
           properties:
             requires_human: {type: boolean}
+        answer_class:
+          type: string
+          enum: [VERIFIED_FACT, STATUS_QUALIFIED, PROCESS_EXPLANATION, HANDOFF_UNKNOWN]
+          description: ANSWERED is never HANDOFF_UNKNOWN; refusals, abstentions and outages always are.
+        status_label:
+          type: string
+          description: Governed status from the signed claim registry only; never inferred or upgraded.
+          enum: [Available, Limited, Partner-Supported, Planned, Not Available, Unverified, Current Architecture, Implemented, In Validation, Readiness, MARKET_DEPENDENT]
+        market_code:
+          type: string
+          pattern: "^[A-Z]{2}$"
+          description: The market a STATUS_QUALIFIED answer is scoped to.
+        secondary_intent_id:
+          type: string
+          pattern: "^(I(0[1-9]|[12][0-9]|30)|X(0[1-9]|10))$"
+          description: Second intent of a two-part question (e.g. I05 plans with I06 trial).
+        reason:
+          type: string
+          description: >-
+            Why the turn ended this way, so the UI can word it. UNAVAILABLE carries only
+            KILL_SWITCH, INTENT_DISABLED, GENERATION_DISABLED, MODEL_UNAVAILABLE, MODEL_TIMEOUT
+            or KNOWLEDGE_UNAVAILABLE; "no evidence" and "market not covered" are ABSTAIN.
+          enum: [ANSWERED, GREETING, MARKET_REQUIRED, PLAN_REQUIRED, CLARIFY_EXHAUSTED, NO_EVIDENCE,
+            CLAIM_CONFLICT, EXPIRED_SOURCE, SOURCE_REVOKED, MARKET_NOT_COVERED, OUT_OF_SCOPE, ROUTE_ONLY,
+            SENSITIVE_INPUT, PRIVATE_DATA, ACTION_DENIED, REGULATED_ADVICE, SECURITY_REPORT, PROMPT_INJECTION,
+            CROSS_PRODUCT, UNSUPPORTED_GUARANTEE, VALIDATION_FAILED, TOOL_INSTRUCTION, PRICING_DISABLED,
+            KILL_SWITCH, INTENT_DISABLED, GENERATION_DISABLED, MODEL_UNAVAILABLE, MODEL_TIMEOUT,
+            KNOWLEDGE_UNAVAILABLE]
+        clarification:
+          type: object
+          description: Present only on CLARIFY. Options are market codes, OTHER and GENERAL_OVERVIEW.
+          additionalProperties: false
+          required: [slot, question, options]
+          properties:
+            slot: {type: string}
+            question: {type: string}
+            options: {type: array, items: {type: string}}
     ConfigResponse:
       type: object
       required: [config_revision, assistant_display_name, capabilities, supported_locales, market_choices, public_routes, citation_links, privacy_notice_key]
@@ -128,6 +165,21 @@ components:
               url: {type: string, format: uri}
               title: {type: string}
         privacy_notice_key: {type: string}
+        microcopy:
+          type: object
+          description: Pre-approved UI wording keyed ui.* (plain text).
+          additionalProperties: {type: string}
+        chips:
+          type: object
+          description: Starter questions keyed by page_context.
+          additionalProperties:
+            type: array
+            items:
+              type: object
+              required: [label, message]
+              properties:
+                label: {type: string}
+                message: {type: string}
     Problem:
       type: object
       required: [type, title, status, instance, code, request_id, retryable]

@@ -144,9 +144,14 @@ func (s *Server) getConfig(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(append(body, '\n'))
 }
 
-func (s *Server) postTurn(w http.ResponseWriter, r *http.Request) {
+func (s *Server) postTurn(rw http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	rid := w.Header().Get("X-Request-ID")
+	rid := rw.Header().Get("X-Request-ID")
+	// Dev diagnostics: one line per turn naming the failing stage and reason,
+	// never the message text (Master prompt STEP 1).
+	w := &statusWriter{ResponseWriter: rw}
+	var diag turnDiag
+	defer func() { s.logTurnDiag(rid, w.status, diag) }()
 
 	sess, err := s.deps.Sessions.Authenticate(ctx, r.Header.Get(sessionHeader))
 	if errors.Is(err, session.ErrExpired) {
@@ -233,12 +238,21 @@ func (s *Server) postTurn(w http.ResponseWriter, r *http.Request) {
 		TurnSequence: begun.Turn.Sequence, Status: res.Status, IntentID: res.IntentID, Text: res.Text,
 		Citations: nonNilC(res.Citations), Actions: nonNilA(res.Actions),
 		KnowledgeReleaseID: res.KnowledgeReleaseID, PolicyVersion: s.cfg.PolicyVersion, Flags: res.Flags,
+		AnswerClass: res.AnswerClass, StatusLabel: res.StatusLabel, MarketCode: res.MarketCode, Clarification: res.Clarification,
+		SecondaryIntentID: res.SecondaryIntentID, Reason: res.Reason, Suggestions: res.Suggestions, Draft: res.Draft,
+	}
+	diag = turnDiag{status: string(res.Status), intent: res.IntentID, reason: res.Reason, pipeline: res.Diag}
+	if env.AnswerClass == "" {
+		env.AnswerClass = contract.DefaultClass(env.Status)
 	}
 	if err := env.Validate(); err != nil {
 		// The orchestrator produced something outside the schema: never send it.
 		s.log.Error("response failed schema validation", zap.String("request_id", rid), zap.String("reason", err.Error()))
 		env.Status, env.IntentID, env.Text = contract.Unavailable, "UNKNOWN", unavailableText
 		env.Citations, env.Actions, env.Flags = []contract.Citation{}, []contract.Action{}, nil
+		env.AnswerClass, env.StatusLabel, env.MarketCode, env.Clarification = contract.HandoffUnknown, "", "", nil
+		env.SecondaryIntentID, env.Reason, env.Suggestions, env.Draft = "", contract.ReasonValidationFailed, nil, false
+		diag.reason = contract.ReasonValidationFailed
 		if env.KnowledgeReleaseID == "" {
 			env.KnowledgeReleaseID = "none"
 		}

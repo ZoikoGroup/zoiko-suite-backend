@@ -67,6 +67,7 @@ func New(cfg config.Config, log *zap.Logger, deps Deps) *Server {
 func (s *Server) Router() http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
+	r.Use(middleware.Trace)
 	r.Use(middleware.SecurityHeaders)
 	r.Use(middleware.AccessLog(s.log))
 	r.Use(middleware.Recover(s.log))

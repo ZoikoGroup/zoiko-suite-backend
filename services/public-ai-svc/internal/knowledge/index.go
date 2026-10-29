@@ -42,6 +42,13 @@ type Result struct {
 	Answerability string
 	Hits          []Hit
 	ReleaseID     string
+	// Diagnostics (counts and scores only, never text): chunks that scored
+	// above the floor before and after the mandatory access filters, and the
+	// best eligible score. Mode is "lexical" (no embeddings in R0, ADR-002).
+	CandidatesBeforeACL int
+	CandidatesAfterACL  int
+	TopScore            float64
+	Mode                string
 }
 
 // Index is an immutable, release-pinned lexical index (BM25).
@@ -63,7 +70,8 @@ var stopwords = map[string]bool{}
 func init() {
 	for _, w := range strings.Fields(`a an and are as at be but by can do does for from has have how i if in into is it its
 		me my of on or our so than that the their them then there these they this to us was we what when where which who
-		why will with you your about any also just more most not only other some such tell please zoikosuite`) {
+		why will with you your about any also just more most not only other some such tell please zoikosuite
+		support supports supported handle handles work works use uses used using get need want offer offers provide provides`) {
 		stopwords[w] = true
 	}
 }
@@ -121,6 +129,9 @@ func NewIndex(m Manifest) *Index {
 
 // ReleaseID is the pinned release.
 func (x *Index) ReleaseID() string { return x.releaseID }
+
+// Stats reports how many sources and chunks the release holds.
+func (x *Index) Stats() (sources, chunks int) { return len(x.sources), len(x.chunks) }
 
 // Source returns the registry record for a source version.
 func (x *Index) Source(sourceVersionID string) (Source, bool) {
@@ -221,7 +232,7 @@ func (x *Index) score(i int, qtoks []string) (float64, int) {
 
 // Search runs filtered retrieval and decides answerability.
 func (x *Index) Search(q Query, rev Revocations) Result {
-	res := Result{Answerability: NotFound, ReleaseID: x.releaseID}
+	res := Result{Answerability: NotFound, ReleaseID: x.releaseID, Mode: "lexical"}
 	qtoks := uniq(Tokens(x.expand(q.Text)))
 	if len(qtoks) == 0 || len(x.chunks) == 0 {
 		return res
@@ -237,11 +248,16 @@ func (x *Index) Search(q Query, rev Revocations) Result {
 		if q.IntentID != "" && hasIntent(c.IntentIDs, q.IntentID) {
 			sc *= intentBoost
 		}
+		if x.titleNamed(c, qtoks) {
+			sc *= titleBoost
+		}
 		if sc < minScore || matched < need {
 			continue
 		}
+		res.CandidatesBeforeACL++
 		switch el := x.eligibilityOf(c, q, rev); el {
 		case eligible:
+			res.CandidatesAfterACL++
 			res.Hits = append(res.Hits, Hit{Chunk: c, Score: sc})
 		case expired, revoked:
 			if sc > bestIneligibleScore {
@@ -266,6 +282,7 @@ func (x *Index) Search(q Query, rev Revocations) Result {
 	if len(res.Hits) > 0 {
 		bestEligible = res.Hits[0].Score
 	}
+	res.TopScore = bestEligible
 	switch {
 	case bestIneligible != eligible && bestIneligibleScore > bestEligible:
 		res.Hits = nil
@@ -282,6 +299,34 @@ func (x *Index) Search(q Query, rev Revocations) Result {
 		res.Answerability = Stale
 	}
 	return res
+}
+
+// titleBoost favours the article the visitor names ("the compliance module"
+// → Compliance), so a broader article that merely mentions it does not win.
+const titleBoost = 2.0
+
+// titleNamed reports whether every word of the chunk's article title is in
+// the query (ZoikoSuite itself is a stopword, so "ZoikoSuite areas" needs
+// "areas").
+func (x *Index) titleNamed(c Chunk, qtoks []string) bool {
+	s, ok := x.sources[c.SourceVersionID]
+	if !ok {
+		return false
+	}
+	t := Tokens(s.Title)
+	if len(t) == 0 {
+		return false
+	}
+	in := map[string]bool{}
+	for _, q := range qtoks {
+		in[q] = true
+	}
+	for _, w := range t {
+		if !in[w] {
+			return false
+		}
+	}
+	return true
 }
 
 // intentBoost favours sources tagged for the visitor's intent, so "How is
@@ -315,14 +360,19 @@ func (x *Index) expand(text string) string {
 // document order. It is the fallback when a question's words are too generic
 // to rank (for example "What is ZoikoSuite?"); every mandatory filter applies.
 func (x *Index) ByIntent(q Query, rev Revocations) Result {
-	res := Result{Answerability: NotFound, ReleaseID: x.releaseID}
+	res := Result{Answerability: NotFound, ReleaseID: x.releaseID, Mode: "intent"}
 	if q.IntentID == "" {
 		return res
 	}
 	for _, c := range x.chunks {
-		if !hasIntent(c.IntentIDs, q.IntentID) || x.eligibilityOf(c, q, rev) != eligible {
+		if !hasIntent(c.IntentIDs, q.IntentID) {
 			continue
 		}
+		res.CandidatesBeforeACL++
+		if x.eligibilityOf(c, q, rev) != eligible {
+			continue
+		}
+		res.CandidatesAfterACL++
 		res.Hits = append(res.Hits, Hit{Chunk: c})
 		if len(res.Hits) == 2 {
 			break
@@ -344,4 +394,17 @@ func uniq(xs []string) []string {
 		}
 	}
 	return out
+}
+
+// Neighbor returns the next section (segment) of c's source version when it
+// passes every mandatory filter, so an answer drawn from one section can
+// include the rest of the same topic (Doc 03 §13: sections are the chunk
+// boundary, not the answer boundary).
+func (x *Index) Neighbor(c Chunk, q Query, rev Revocations) (Chunk, bool) {
+	for _, n := range x.chunks {
+		if n.SourceVersionID == c.SourceVersionID && n.SegmentNumber == c.SegmentNumber+1 {
+			return n, x.eligibilityOf(n, q, rev) == eligible
+		}
+	}
+	return Chunk{}, false
 }

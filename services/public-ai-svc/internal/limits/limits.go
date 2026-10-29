@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -79,6 +80,7 @@ func (l *limiter) allow(key string, now time.Time) (bool, time.Duration) {
 // Guard holds the limiters.
 type Guard struct {
 	ip, sess *limiter
+	trusted  []*net.IPNet
 	inFlight atomic.Int64
 	store    store.Store
 	flags    interface{ Values() flags.Values }
@@ -89,22 +91,59 @@ type Guard struct {
 
 // New builds a Guard from configuration.
 func New(cfg config.Config, st store.Store, fl interface{ Values() flags.Values }) *Guard {
+	var trusted []*net.IPNet
+	for _, p := range cfg.TrustedProxies {
+		if _, n, err := net.ParseCIDR(p); err == nil { // Validate rejects bad entries
+			trusted = append(trusted, n)
+		}
+	}
 	return &Guard{
-		ip: newLimiter(cfg.RateLimitPerIPPerMinute), sess: newLimiter(cfg.RateLimitPerSessionPerMin),
+		ip: newLimiter(cfg.RateLimitPerIPPerMinute), sess: newLimiter(cfg.RateLimitPerSessionPerMin), trusted: trusted,
 		store: st, flags: fl, daily: cfg.DailyTokenCeiling, monthly: cfg.MonthlyTokenCeiling,
 		now: time.Now,
 	}
 }
 
-// clientKey coarsens the client address: IPv4 as is, IPv6 to /64. Only the
-// TCP peer is used; forwarded headers are not trusted (configure the edge
-// proxy to enforce its own limits).
-func clientKey(remoteAddr string) string {
-	host, _, err := net.SplitHostPort(remoteAddr)
-	if err != nil {
-		host = remoteAddr
+func (g *Guard) isTrusted(ip net.IP) bool {
+	for _, n := range g.trusted {
+		if n.Contains(ip) {
+			return true
+		}
 	}
-	ip := net.ParseIP(host)
+	return false
+}
+
+// clientIP is the visitor's address. Browser traffic arrives through the
+// console's same-origin proxy, so the TCP peer is the proxy, not the
+// visitor. X-Forwarded-For is believed only when the peer is a trusted
+// proxy (PUBLIC_AI_TRUSTED_PROXIES); it is read right to left, skipping
+// trusted hops, and the first untrusted address is the visitor. Entries
+// left of that one are client-supplied and ignored, so a visitor cannot
+// pick their own bucket.
+func (g *Guard) clientIP(r *http.Request) net.IP {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	peer := net.ParseIP(host)
+	if peer == nil || !g.isTrusted(peer) {
+		return peer
+	}
+	hops := strings.Split(strings.Join(r.Header.Values("X-Forwarded-For"), ","), ",")
+	for i := len(hops) - 1; i >= 0; i-- {
+		ip := net.ParseIP(strings.TrimSpace(hops[i]))
+		if ip == nil {
+			return peer // malformed chain: fall back to the proxy itself
+		}
+		if !g.isTrusted(ip) {
+			return ip
+		}
+	}
+	return peer
+}
+
+// clientKey coarsens the client address: IPv4 as is, IPv6 to /64.
+func clientKey(ip net.IP) string {
 	if ip == nil {
 		return "ip:unknown"
 	}
@@ -128,7 +167,7 @@ func tooMany(w http.ResponseWriter, r *http.Request, wait time.Duration) {
 func (g *Guard) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		now := g.now()
-		if ok, wait := g.ip.allow(clientKey(r.RemoteAddr), now); !ok {
+		if ok, wait := g.ip.allow(clientKey(g.clientIP(r)), now); !ok {
 			tooMany(w, r, wait)
 			return
 		}

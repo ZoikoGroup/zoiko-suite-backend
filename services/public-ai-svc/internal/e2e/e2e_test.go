@@ -84,8 +84,10 @@ func TestEndToEndConversation(t *testing.T) {
 	cfgW := c.do(http.MethodGet, "/public-ai/v1/config", "", nil)
 	var cfg contract.ConfigResponse
 	_ = json.Unmarshal(cfgW.Body.Bytes(), &cfg)
-	if len(cfg.PublicRoutes) == 0 || !strings.HasPrefix(cfg.PublicRoutes[0].URL, "https://example.invalid/") {
-		t.Fatalf("config routes: %+v", cfg.PublicRoutes)
+	// Fixture routes are placeholders (*.invalid): /config never exposes them,
+	// so the widget hides those CTAs instead of linking nowhere.
+	if len(cfg.PublicRoutes) != 0 || strings.Contains(cfgW.Body.String(), ".invalid") {
+		t.Fatalf("config exposed placeholder URLs: %s", cfgW.Body.String())
 	}
 
 	s := c.session()

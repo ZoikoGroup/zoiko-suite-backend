@@ -18,9 +18,22 @@ import (
 
 // BuildKB ingests a fixture/import directory and signs the resulting manifest.
 func BuildKB(dir, releaseID string, now time.Time, privKey string) ([]byte, []byte, []knowledge.Report, error) {
-	m, reports, err := knowledge.IngestDir(dir, releaseID, now)
+	return BuildKBWith(dir, releaseID, now, privKey, knowledge.IngestOptions{})
+}
+
+// ErrDraftInRelease means a release built without the dev-only draft option
+// contains DRAFT_PENDING_REVIEW content; such a build never ships.
+var ErrDraftInRelease = errors.New("release contains DRAFT_PENDING_REVIEW content; drafts are allowed only in local/dev (KB_ALLOW_DRAFT)")
+
+// BuildKBWith is BuildKB with ingest options. Without AllowDraft any draft
+// in the result fails the build.
+func BuildKBWith(dir, releaseID string, now time.Time, privKey string, opts knowledge.IngestOptions) ([]byte, []byte, []knowledge.Report, error) {
+	m, reports, err := knowledge.IngestDirWith(dir, releaseID, now, opts)
 	if err != nil {
 		return nil, nil, nil, err
+	}
+	if !opts.AllowDraft && m.HasDraft() {
+		return nil, nil, reports, ErrDraftInRelease
 	}
 	if len(m.Sources) == 0 {
 		return nil, nil, reports, errors.New("no source passed ingestion; refusing to build an empty release")

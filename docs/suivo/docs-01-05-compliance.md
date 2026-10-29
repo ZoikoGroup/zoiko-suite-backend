@@ -22,7 +22,7 @@ approved for production.** Status values: **Built**, **Partial**, **Blocked** (n
 | FR-08 1–3 verified links; no answer without evidence | Built | ≤3 citations from what was used; ABSTAIN otherwise |
 | FR-09 session controls + feedback | Built | Minimize/reopen, end chat (DELETE), **useful / not useful + reason** (`POST /turns/{id}/feedback`) |
 | FR-10 PII redaction, injection defence, abuse/rate controls | Built | `policy.Redact`, X06, limiter, spend ceilings |
-| FR-11 WCAG 2.2 AA, en-US, localisation gated | Partial | Keyboard, focus return, live region, 44 px buttons, 375 px sheet, mobile back button verified in browser; no screen-reader/zoom audit |
+| FR-11 WCAG 2.2 AA, en-US, localisation gated | Partial | Automated: axe, keyboard-only, Tab order, focus return, contrast, target sizes, zoom and narrow widths (Playwright). Manual screen-reader pass not done |
 | FR-12 typed events, trace IDs, redacted diagnostics | Built | Six CloudEvents; request id; `traceparent` validated |
 | FR-13–FR-16 (P1/P2) | Not in R0 | Out of scope by design |
 | States S00–S09 | Built | S02 thinking + **Stop**; S08 error with Try again + **Get help** + reference; S09 feedback + **retention notice** ("Ending the chat clears this conversation") |
@@ -65,7 +65,7 @@ approved for production.** Status values: **Built**, **Partial**, **Blocked** (n
 | Ingestion state machine 00–12 with failure states | Built | `TestIngestionStates` |
 | Two-person approval for P1 | Built | Claims need two approval refs; P1 sources two approvers; no self-approval |
 | Immutable signed releases, atomic promotion, rollback keeps revocations | Built | Ed25519; pointer swap; `TestRevocationSurvivesRollback`, drill DR-03 |
-| Chunking 300–700 tokens, structured-first, hybrid search | Partial | Packed chunks ≤450 words; claims first; lexical BM25 + intent boost (no vector — ADR-002) |
+| Chunking 300–700 tokens, structured-first, hybrid search | Partial | One chunk per section, 700-token cap with 60 overlap (estimated tokens); claims first; BM25 + intent boost; `Retriever` interface and `Hybrid` vector slot built, off until an embedding model is approved (ADR-002) |
 | **Signed synonym lexicon** ("AR" → accounts receivable) | Built | `synonyms` in the KB release; `TestSynonymLexicon` |
 | Fixed retrieval order (validate → intercept → decompose → filter → claims → search → conflict → compose → validate → trace) | Built | Pipeline order; best match revoked/expired → abstain |
 | Evidence gates: P1 over P3, typed values, CLAIM_CONFLICT without voting | Built | `TestClaimDecisions`, conflict record written |
@@ -86,9 +86,9 @@ approved for production.** Status values: **Built**, **Partial**, **Blocked** (n
 | Endpoints, envelope `zs-public-answer-v1`, errors | Built | `api/openapi.yaml`, contract tests |
 | Entities (session, turn, evidence, policy decision, route, model invocation, abuse counter, release) | Built | `store` schema + migrations 001–003 |
 | Feature flags + environment variables | Built | `flags`, `.env.example` |
-| Stack choice (framework, search, LLM, cloud) | Partial / Blocked | Go + Postgres from the repo (ADR-001/002); **LLM vendor blocked (DEC-05)** — fake provider only |
+| Stack choice (framework, search, LLM, cloud) | Partial / Blocked | Go + Postgres 16 (`public_ai` schema, own role); Groq `openai/gpt-oss-120b` provider built (ADR-007) pending vendor/DPA approval (DEC-05); cloud not chosen |
 | Targets: turn availability 99.9 %, gate p95 ≤500 ms, answer p95 ≤8 s, rollback <15 min | Partial | Rollback drill passes; latency/availability need staging |
-| OpenTelemetry | Partial | Fields defined, trace id logged; no OTel exporter yet |
+| OpenTelemetry | Built | OTLP/HTTP exporter, off unless an endpoint is set; allowlisted span attributes only, no content (`internal/telemetry`) |
 
 ## Document 05 — API integration, service contracts, event architecture (ZS-SUIVO-ENG-005)
 
@@ -108,7 +108,7 @@ approved for production.** Status values: **Built**, **Partial**, **Blocked** (n
 | **AsyncAPI 3.0 channel document** | Built | `api/asyncapi.yaml` |
 | No arbitrary inbound webhooks in v1 | Built | None exist |
 | Retention / deletion contract | Built (dev default) | DELETE wipes session context and turns; **purge of expired sessions** every 10 min, `PUBLIC_AI_RETENTION` 24 h pending DEC-06 |
-| Contract tests CT-001–052 | Partial | Core CTs covered; full numbered suite not mapped 1:1 |
+| Contract tests CT-001–052 | Partial | Mapped 1:1 in `contract-test-map.md`: 45 covered, 3 partial, 3 N/A in R0, 1 gap (CT-042) |
 | Gates G0–G5 | Blocked | All PENDING |
 
 ## What still blocks production (cannot be solved in code)

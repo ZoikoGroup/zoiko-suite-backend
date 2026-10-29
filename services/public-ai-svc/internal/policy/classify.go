@@ -51,6 +51,7 @@ var exceptionRules = map[string][]*regexp.Regexp{
 			"was hacked", "been hacked", "been compromised", "was compromised", "phishing", "report a security", "responsible disclosure", "bug bounty"),
 	},
 	X01PrivateAction: {
+		livePlatformRe,
 		regexp.MustCompile(`(?i)\b(?:my|our)\s+(?:\w+\s+){0,2}(?:invoices?|balances?|ledgers?|payroll|payslips?|pay ?stubs?|transactions?|bank statements?|tax returns?|journals?|employees?|staff records?|salar(?:y|ies)|accounts? receivable|accounts? payable|cash position|expenses?|bills?|vendors?|customers?|records?|filings?)\b`),
 		pattern("show me my", "look up my", "check my account", "what is my balance", "what's my balance", "access my data", "pull my data", "in my account", "my tenant"),
 	},
@@ -62,7 +63,7 @@ var exceptionRules = map[string][]*regexp.Regexp{
 		pattern("tax advice", "legal advice", "accounting advice", "financial advice", "investment advice", "employment law advice",
 			"should i deduct", "can i deduct", "should i claim", "can i claim", "should i file", "how much tax should", "how much tax do i",
 			"how do i avoid tax", "reduce my tax", "is it legal", "am i compliant", "are we compliant", "should i invest", "can i fire",
-			"tax liability", "how much tax do i owe", "admissible", "legally admissible", "legal guarantee",
+			"tax liability", "how much tax do i owe", "legal guarantee",
 			// Spanish (G33): regulated-advice requests are refused whatever the language.
 			"asesor*", "despedir", "despido", "consejo legal", "consejo fiscal", "impuestos debo"),
 	},
@@ -70,14 +71,18 @@ var exceptionRules = map[string][]*regexp.Regexp{
 		pattern("guarantee", "guaranteed", "promise me", "confirm in writing", "legally binding", "put it in writing", "are you sure it is free"),
 	},
 	X07CrossProduct: {
-		pattern("zoiko one", "zoikologia", "zoiko mobile", "zoiko telecom"),
+		// Other Zoiko products named in the documents, written as one word,
+		// two words or hyphenated (ZoikoOne, Zoiko One, Zoiko-Tech).
+		regexp.MustCompile(`(?i)\bzoiko[\s-]*(one|logia|tech|mobile|telecom|contracting)\b`),
 	},
 }
 
 // Intent rules (Doc 02 §06). Each phrase scores 1, or 2 for multi-word
 // phrases. tieOrder resolves equal scores (more specific / higher risk first).
 var intentRules = map[string]*regexp.Regexp{
-	"I01": pattern("what is zoikosuite", "what does zoikosuite do", "tell me about zoikosuite", "about zoikosuite", "overview", "hello", "hi", "hey", "good morning", "who are you"),
+	"I01": pattern("what is zoikosuite", "what can zoikosuite do", "what does zoikosuite offer", "what is zoiko suite", "what's zoikosuite", "whats zoikosuite", "what does zoikosuite do", "what does zoiko suite do",
+		"tell me about zoikosuite", "about zoikosuite", "explain zoikosuite", "describe zoikosuite", "introduce zoikosuite", "how does zoikosuite work",
+		"new to zoikosuite", "what kind of platform", "overview", "hello", "hi", "hey", "good morning", "who are you"),
 	"I02": pattern("feature*", "capabilit*", "module*", "accounts payable", "accounts receivable", "general ledger", "treasury", "procurement", "cash management", "what can you do"),
 	"I03": pattern("multi-entity", "multi entity", "multiple entities", "entities", "subsidiar*", "consolidat*", "intercompany", "group companies"),
 	"I04": pattern("which countries", "what countries", "available in", "jurisdiction*", "countries", "country", "markets do you", "do you support the uk", "do you operate in"),
@@ -91,15 +96,17 @@ var intentRules = map[string]*regexp.Regexp{
 	"I12": pattern("soc 2", "soc2", "iso 27001", "iso27001", "certif*", "secur*", "encrypt*", "penetration test", "pentest", "trust center", "compliance report", "mfa", "single sign-on"),
 	"I13": pattern("privacy", "gdpr", "dpa", "data processing agreement", "personal data", "data protection", "ccpa", "subprocessor*", "delete my data"),
 	"I14": pattern("data residency", "where is the data stored", "where is my data", "where is data stored", "data stored", "hosted", "hosting", "data center", "data centre", "eu data", "uk data", "deploy*", "on-premise", "on premise", "on-prem", "self-host*", "private cloud"),
-	"I15": pattern("governance", "approval workflow*", "approvals", "audit trail", "segregation of duties", "controls", "policy engine"),
-	"I16": pattern("evidence", "audit evidence", "audit-ready", "audit ready", "auditor*"),
-	"I17": pattern("tax", "vat", "gst", "sales tax", "tax compliance", "corporate tax", "withholding"),
+	"I15": pattern("governance", "approval workflow*", "approvals", "approve on behalf", "on behalf of", "who can approve", "approval limit*", "act for", "audit trail", "segregation of duties", "controls", "policy engine"),
+	"I16": pattern("evidence", "audit evidence", "audit-ready", "audit ready", "auditor*", "audit log*", "audit trail evidence", "admissib*", "assurance"),
+	"I17": pattern("tax", "taxes", "taxation", "file tax*", "tax filing*", "tax return*", "vat", "gst", "sales tax", "tax compliance", "corporate tax", "withholding"),
 	"I18": pattern("payroll", "workforce", "human resources", "hr", "paye", "benefits", "leave management", "employee onboarding"),
 	"I19": pattern("contract*", "legal workflow*", "clause*", "board resolution*", "legal module", "obligations"),
 	"I20": pattern("report*", "dashboard*", "analytics", "forecast*", "insights", "kpi*"),
-	"I21": pattern("help", "how do i", "how to", "documentation", "docs", "guide", "faq", "knowledge base", "tutorial"),
-	"I22": pattern("log in", "login", "sign in", "signin", "password reset", "reset my password", "forgot my password", "forgot password", "my account", "locked out"),
-	"I23": pattern("support ticket", "contact support", "customer support", "not working", "bug", "error", "problem with", "issue with", "broken"),
+	// "how do i" / "how to" are openers, not a topic: they no longer outscore
+	// the topic word ("How do I migrate…" is I11).
+	"I21": pattern("help", "documentation", "docs", "guide", "faq", "knowledge base", "tutorial"),
+	"I22": pattern("log in", "login", "sign in", "sign-in", "signin", "account access", "access my account", "can't log", "cannot log", "can't sign", "cannot sign", "password reset", "reset my password", "forgot my password", "forgot password", "my account", "locked out"),
+	"I23": pattern("support ticket", "help from support", "need support", "get support", "support team", "talk to support", "speak to support", "reach support", "existing customer", "my ticket", "a ticket", "ticket status", "raise a ticket", "open a ticket", "contact support", "customer support", "not working", "bug", "error", "problem with", "issue with", "broken"),
 	"I24": pattern("speak to a human", "talk to a human", "talk to a person", "speak to someone", "real person", "human", "agent", "representative", "talk to sales", "contact sales", "call me", "live chat"),
 	"I25": pattern("coming soon", "roadmap", "release date", "when will", "is it available", "availability", "launch*", "planned"),
 	"I26": pattern("compare", "comparison", "vs", "versus", "better than", "alternative to", "competitor*", "netsuite", "sage intacct"),
@@ -136,6 +143,36 @@ var (
 // IsGreeting reports whether the whole message is a greeting or thanks.
 func IsGreeting(text string) bool { return greetingRe.MatchString(text) }
 
+var overviewRe = regexp.MustCompile(`(?i)^\s*(?:` + regexp.QuoteMeta("GENERAL_OVERVIEW") + `|show (?:me )?(?:a |the )?general overview|general overview)\s*[.!]?\s*$`)
+
+var otherMarketRe = regexp.MustCompile(`(?i)^\s*(?:OTHER|other(?: country| market)?|another country|somewhere else|none of these|a different country)\s*[.!]?\s*$`)
+
+// IsOtherMarket reports whether the visitor chose "Other" (a country not
+// offered as a choice) in answer to the market question.
+func IsOtherMarket(text string) bool { return otherMarketRe.MatchString(text) }
+
+// livePlatformRe catches questions about live platform state, tenant data or
+// dashboard counts. The public assistant cannot see any of it (X01).
+var livePlatformRe = regexp.MustCompile(`(?i)\bactive\s+(?:micro)?services?\b|\bmicroservices?\b.*\b(?:active|running|up|down|ready|status|live)\b|\bhow many\b.*\b(?:services?|domains?|tenants?|users?|entities)\b.*\b(?:ready|running|active|up|live|do (?:i|we) have|are there in my)\b|\bservices?\s+(?:are\s+)?(?:ready|running|down|healthy)\b|\b(?:show|list|open)\s+(?:me\s+)?(?:my|our)\s+(?:domains?|dashboard|tenants?|services?|entities|workspace)\b|\bcluster\s+(?:readiness|status|health)\b|\b(?:live|current|platform|service|system)\s+status\b|\baction required\b|\bprobes?\s+responding\b|\b(?:domains?|services?|microservices?|cluster|platform)\s+(?:status|health|readiness|uptime)\b|\b(?:domains?\s+monitored|operational\s+status|needs\s+attention|services?\s+ready)\b`)
+
+// IsLivePlatform reports whether a message asks about live platform state,
+// tenant data or dashboard counts.
+func IsLivePlatform(text string) bool { return livePlatformRe.MatchString(text) }
+
+// moduleTermRe names ZoikoSuite areas, modules and their aliases. A question
+// that names one is never "out of scope" (classifier fallback ladder).
+var moduleTermRe = regexp.MustCompile(`(?i)\b(?:finance(?: and payments)?|payments?|legal|contracts?|commercial ops|commercial operations|purchase requests?|purchase orders?|procurement|requisitions?|tax(?:es)?|vat|gst|compliance|evidence|delegated authority|delegation of authority|board resolutions?|corporate actions?|intelligence|reporting|security|trust|integrations?|connectors?|banking|hris|e-?signatures?|siem|mtls|cap tables?|ar|ap|gl|general ledger|payables|receivables|payroll|workforce|hr|modules?)\b`)
+
+// IsModuleQuestion reports whether a message names a known area, module or
+// alias.
+func IsModuleQuestion(text string) bool {
+	return moduleTermRe.MatchString(strings.ReplaceAll(text, "&", " and "))
+}
+
+// IsGeneralOverview reports whether the visitor chose "Show general overview"
+// in answer to a clarifying question (Master prompt §4 step 6).
+func IsGeneralOverview(text string) bool { return overviewRe.MatchString(text) }
+
 // AsksPrice reports whether the message asks for a price (as opposed to,
 // say, which plans exist). Only price questions need a market (Doc 02 I05).
 func AsksPrice(text string) bool { return priceRe.MatchString(text) }
@@ -153,6 +190,18 @@ func LooksLikeInjection(text string) bool {
 
 // Classify applies sensitive-input interception, exception rules and intent
 // rules. It is pure and deterministic.
+// capabilityQuestion is "Do you / does it / can ZoikoSuite <verb> …" with no
+// "my", "our" or "for me": a question about the product, not a request to
+// act on the visitor's records (Doc 02 G12: "Tax filing in Germany" is I17).
+var (
+	capabilityRe = regexp.MustCompile(`(?i)^\s*(?:do you|does (?:it|zoikosuite|zoiko suite|the platform)|can (?:it|zoikosuite|zoiko suite|the platform)|is (?:it|zoikosuite) able to)\b`)
+	personalRe   = regexp.MustCompile(`(?i)\b(?:my|our|mine|for me|for us)\b`)
+)
+
+func capabilityQuestion(text string) bool {
+	return capabilityRe.MatchString(text) && !personalRe.MatchString(text)
+}
+
 func Classify(msg string) Decision {
 	d := Decision{Redaction: Redact(msg)}
 	text := d.Redaction.Text
@@ -165,7 +214,7 @@ func Classify(msg string) Decision {
 				continue
 			}
 			for _, re := range exceptionRules[x] {
-				if re.MatchString(text) {
+				if re.MatchString(text) && !(x == X02ActionDenied && capabilityQuestion(text)) {
 					d.Exception = x
 					break
 				}
