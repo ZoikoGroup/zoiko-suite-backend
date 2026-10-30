@@ -1,2 +1,1 @@
-DROP TABLE IF EXISTS vendor_profiles;
-
+DROP TABLE IF EXISTS vendor_profiles CASCADE;

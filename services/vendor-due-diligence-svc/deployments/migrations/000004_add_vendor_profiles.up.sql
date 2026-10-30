@@ -18,10 +18,10 @@ CREATE TABLE IF NOT EXISTS vendor_profiles (
 ALTER TABLE vendor_profiles ENABLE ROW LEVEL SECURITY;
 ALTER TABLE vendor_profiles FORCE ROW LEVEL SECURITY;
 
+DROP POLICY IF EXISTS tenant_isolation_policy ON vendor_profiles;
 CREATE POLICY tenant_isolation_policy ON vendor_profiles FOR ALL
     USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::UUID);
 
 CREATE INDEX IF NOT EXISTS idx_vendor_profiles_tenant_entity ON vendor_profiles (tenant_id, legal_entity_id);
 CREATE INDEX IF NOT EXISTS idx_vendor_profiles_counterparty   ON vendor_profiles (tenant_id, counterparty_id);
 CREATE INDEX IF NOT EXISTS idx_vendor_profiles_status         ON vendor_profiles (vendor_status);
-
