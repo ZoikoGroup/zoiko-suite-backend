@@ -59,4 +59,7 @@ type BNK0304Store interface {
 	GetCanonicalTransaction(ctx context.Context, tenantID, transactionID string) (*domain.CanonicalTransaction, error)
 	ListCanonicalTransactions(ctx context.Context, q domain.ListTransactionsQuery) (*domain.CanonicalTransactionPage, error)
 	CreateTransactionMapping(ctx context.Context, params domain.CreateTransactionMappingParams) (*domain.TransactionMapping, error)
+	GetRawLineage(ctx context.Context, tenantID, transactionID string) (*domain.RawLineage, error)
+	GetNormalizationVersion(ctx context.Context, tenantID, transactionID string) (*domain.NormalizationVersion, error)
+	ListMappingExceptions(ctx context.Context, q domain.ListMappingExceptionsQuery) (*domain.MappingExceptionPage, error)
 }

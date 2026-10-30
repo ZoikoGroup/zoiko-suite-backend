@@ -33,10 +33,12 @@ service:
   watermark, statement-period or parser/schema evidence, or a declared
   completeness population.
 - **BNK-04** has immutable canonical versions, `superseded_by` lineage,
-  unknown-code routing to a mapping exception, a maker-checker approval, and
-  raw date/amount/currency now derived from the immutable statement line. It
-  does **not** have a real mapping/schema version snapshot, raw-lineage or
-  normalization-version queries, or the spec's canonical quarantined state.
+  unknown-code routing to a mapping exception, a maker-checker approval,
+  raw date/amount/currency now derived from the immutable statement line,
+  and (2026-10-30) raw-lineage, normalization-version and list/exception
+  queries. It does **not** have a real mapping/schema version snapshot (the
+  queries honestly expose that gap rather than papering over it — see A19)
+  or the spec's canonical quarantined state.
 
 The largest open risks are **A10/A11** (raw source and watermark absent),
 **A19/A21** (mapping version and normalization authority), **A1** (read
@@ -44,7 +46,8 @@ authorization), and the cross-service BNK-05 watermark mismatch in section C
 (C1). The BNK-05 principal mismatch (C2) was closed on 2026-10-24. None of those is a small local patch; they need a source-evidence
 table, a versioned mapping registry, and a cross-service auth decision.
 
-Rough coverage after this pass: **BNK-02 ~65%, BNK-03 ~40%, BNK-04 ~55%.**
+Rough coverage after this pass: **BNK-02 ~65%, BNK-03 ~40%, BNK-04 ~60%**
+(BNK-04 revised 2026-10-30: all four table-23 queries now exist, see A20).
 The percentages are a judgment, not a test count.
 
 Status key: **Done** = implemented as named; **Partial** = route exists but a
@@ -100,10 +103,10 @@ listed gap remains; **Missing** = no route or no callable path.
 | SupersedeNormalization | Missing as a named command | —; `re-normalize` performs a supersession, but there is no mapping-correction/re-performance command (A22). |
 | ApproveMappingException | `POST /v1/banking/mapping-exceptions/{id}/approve` | Partial; maker-checker is real. Category/counterparty are arbitrary caller input and the new row gets `mapping_version = 1`, not a mapping-registry version (A19/A21). |
 | GetBankTransaction | `GET /v1/banking/canonical-transactions/{id}` | Done, but no read authz beyond the principal check (A21), and the amount is a JSON float. BNK-05's client now sends the principal (C2, closed). |
-| GetRawLineage | Missing | — (A20). |
-| GetNormalizationVersion | Missing | — (A20). |
+| GetRawLineage | `GET /v1/banking/canonical-transactions/{id}/raw-lineage` | Done (2026-10-30): traces one canonical transaction back through its statement line and statement to the connection it arrived on; `bank.transaction.read` authz on the resolved legal entity (A20). |
+| GetNormalizationVersion | `GET /v1/banking/canonical-transactions/{id}/normalization-version` | Done (2026-10-30): returns `mapping_version` with a fixed `caveat` string carrying A19's limitation into the response itself (A20). |
 | ListTransactions | `GET /v1/banking/canonical-transactions` | Done (2026-10-27): NORMALIZED rows of one legal entity, with bank-account, currency and date filters, an exact decimal amount, keyset pagination and `bank.transaction.read` authz (A20). |
-| ListNormalizationExceptions | Missing | — (A20). |
+| ListNormalizationExceptions | `GET /v1/banking/mapping-exceptions` | Done (2026-10-30): keyset-paginated, optional `status` filter; platform-scoped `mapping.exception.approve` authz, same posture as `ApproveMappingException` (A20). |
 
 ## State, events and permissions
 
@@ -344,15 +347,15 @@ listed gap remains; **Missing** = no route or no callable path.
   caller-supplied category. A later reader cannot reproduce which mapping
   produced a canonical row. This fails invariant 7 and the negative path
   “Mapping version not retained”.
-- **A20. Raw-lineage, normalization-version and list queries are missing**
-  (narrowed 2026-10-27: `ListTransactions` is done, see below).
-  `GetRawLineage`, `GetNormalizationVersion`, `ListTransactions` and
-  `ListNormalizationExceptions` have no route (table 23). Only
-  `GetBankTransaction` exists. The canonical response has
-  `statement_line_id` and `superseded_by`, but no raw hash, no mapping
-  registry version, no exception list and no way to enumerate a tenant's
-  transactions. BNK-05 cannot call a lineage/version query because there is
-  none.
+- **A20. Raw-lineage, normalization-version and list queries were missing**
+  (closed 2026-10-30: all four table-23 queries now have routes;
+  `ListTransactions` closed first, 2026-10-27). Previously only
+  `GetBankTransaction` existed; `GetRawLineage`, `GetNormalizationVersion`,
+  `ListTransactions` and `ListNormalizationExceptions` had no route (table
+  23). The remaining weakness this closure does not touch is A19: there is
+  still no real mapping/schema version, only a per-line counter —
+  `GetNormalizationVersion` exposes that honestly (a `caveat` field) rather
+  than closing it.
 
   *ListTransactions (2026-10-27).* Route:
 
@@ -442,8 +445,54 @@ listed gap remains; **Missing** = no route or no callable path.
     access-control-svc's
     `internal/store/bank_transaction_read_permission_test.go` covers the
     registration and both down paths.
-  - *Still open:* `GetRawLineage`, `GetNormalizationVersion` and
-    `ListNormalizationExceptions`.
+
+  *GetRawLineage / GetNormalizationVersion / ListNormalizationExceptions
+  (2026-10-30).* The three queries this section previously left open.
+  Routes: `GET /v1/banking/canonical-transactions/{id}/raw-lineage`,
+  `GET /v1/banking/canonical-transactions/{id}/normalization-version` and
+  `GET /v1/banking/mapping-exceptions[?status=][&limit=][&cursor=]`. Store:
+  `PgStore.GetRawLineage`, `PgStore.GetNormalizationVersion`,
+  `PgStore.ListMappingExceptions` in `internal/store/bnk0304_store.go`.
+  - *GetRawLineage.* Joins `bank_transactions_canonical` through
+    `bank_statement_lines` → `bank_statements` → `bank_connections`, the
+    same path `listCanonicalTransactionsSQL` already uses. There is no
+    per-transaction raw hash column in this schema (migration 004):
+    `statement_content_hash` in the response is the whole statement file's
+    hash (`bank_statements.content_hash`), not a per-line one;
+    `raw_reference`/`bank_code` are the actual per-line raw evidence this
+    service stores. The response is honest about this rather than inventing
+    a per-transaction hash that doesn't exist.
+  - *GetNormalizationVersion.* Returns `mapping_version` plus a fixed
+    `caveat` string (`domain.MappingVersionCaveat`) restating A19 directly
+    in the response: it is a per-line re-normalization counter, not a
+    mapping-dictionary/parser/schema version, and a caller must not treat it
+    as one. This does not fix A19 — the underlying weakness is unchanged —
+    it only stops the query from implicitly overstating what the field
+    means.
+  - *ListNormalizationExceptions.* `mapping_exceptions` has no
+    `legal_entity_id` column (it is a platform-scoped control queue), so
+    there is no legal-entity filter or per-entity authz; authorized as
+    `mapping.exception.approve` with an empty legal entity, the same
+    posture `ApproveMappingException`/`CreateTransactionMapping` already
+    use, since table 24 names no separate read permission for this queue.
+    Keyset-paginated like `ListTransactions` (default/cap limit, opaque
+    cursor); `status` is an optional allow-listed filter
+    (OPEN/APPROVED/REJECTED), any other value is 400.
+  - *Authorization.* Both `Get*` queries resolve the legal entity from the
+    joined row *after* loading it (the caller never supplies one — the same
+    load-then-authorize order `requireLegalEntityAuthz` uses for
+    statements), then ask `bank.transaction.read` on it — the already-
+    registered action from access-control-svc migration 000022, so no new
+    migration was needed for these two routes.
+  - *Tests:* `internal/store/raw_lineage_contract_test.go`, run through the
+    real router and Postgres as a NOBYPASSRLS role: raw lineage traces to
+    the seeded raw_reference/bank_code/statement content_hash; mapping
+    version differs correctly between a superseded row and the correction
+    that replaced it, and the fixed caveat string is always present; a
+    denied `bank.transaction.read` returns 403 with nothing read;
+    mapping-exception listing filters by status, isolates by tenant under
+    RLS even with no legal-entity predicate, and a denied
+    `mapping.exception.approve` returns 403 with nothing read.
 - **A21. Normalization has no legal-entity authorization or independent
   mapping control.** Normalize, re-normalize and quarantine only require a
   principal; `BANKING_TRANSACTION_NORMALIZE` is defined but never checked.
@@ -645,14 +694,19 @@ Tests:
 BNK-05's canonical client decodes `MappingVersion`, and its survey relies on
 BNK-03/04's canonical fact. This service's `mapping_version` is only a
 per-line re-normalization counter (A19); there is no mapping-registry
-version, no `BankNormalizationVersion` table, no `GetNormalizationVersion`
-query, and no `BankTransactionNormalizationSuperseded` event (A20/A22/A25).
-BNK-05 can read the current canonical amount/currency (now derived from the
-raw line) but cannot prove which mapping produced it or learn that a
-correction superseded a fact it already matched. A mapping correction can
-leave a BNK-05 match/certificate pointing at the old canonical version with
-no re-performance trigger. This is a real cross-service gap, not just a
-BNK-04 query omission.
+version and no `BankNormalizationVersion` table. `GetNormalizationVersion`
+now exists (A20, closed 2026-10-30) and returns `mapping_version`, but
+honestly — with a fixed `caveat` string saying it is that counter, not a
+mapping/schema version — so calling it does not give BNK-05 reproducibility
+A19 itself still lacks. There is also still no
+`BankTransactionNormalizationSuperseded` event (A22/A25). BNK-05 can read
+the current canonical amount/currency (now derived from the raw line) and
+can now call `GetNormalizationVersion`, but still cannot prove which
+mapping produced a row or learn that a correction superseded a fact it
+already matched. A mapping correction can leave a BNK-05 match/certificate
+pointing at the old canonical version with no re-performance trigger. This
+is a real cross-service gap that a query alone cannot close — it needs the
+versioned mapping registry A19 names.
 
 ### C4. BNK-08/BNK-01's `ListConnectionOptions` claim was false before this pass and is only partly true now
 
@@ -783,7 +837,7 @@ database was used.
 5. **P1 — lifecycle/events.** Emit the spec event names for BNK-02
    activated/degraded/reconsent/revoked/rotated, BNK-03 accepted/quarantined/
    rejected/superseded, and BNK-04 quarantined/normalization-superseded.
-   Add the missing queries.
+   (The missing table-23 queries are done — A20, closed 2026-10-30.)
 6. **P1 — legacy bypasses.** Delegate or deprecate `POST
    /v1/banking/connections` and `POST /v1/banking/statements`; do not leave a
    header-only `ACCEPTED` path or a consent-free `CONNECTED` path.
@@ -792,6 +846,15 @@ database was used.
    canonical `QUARANTINED` state if the product wants the spec state exactly.
 
 ## F. Files changed in this pass
+
+A20 GetRawLineage/GetNormalizationVersion/ListNormalizationExceptions
+(2026-10-30): `internal/handler/bnk0304_handler.go`,
+`internal/store/bnk0304_store.go`, `internal/store/store.go`,
+`internal/domain/bnk0304.go`, and
+`internal/store/raw_lineage_contract_test.go` (new). No new migration: both
+`Get*` routes reuse the already-registered `bank.transaction.read` action
+(access-control-svc migration 000022); `ListNormalizationExceptions` reuses
+the already-checked `BANKING_MAPPING_EXCEPTION_APPROVE` action.
 
 A20 ListTransactions (2026-10-27): `internal/handler/bnk0304_handler.go`,
 `internal/store/bnk0304_store.go`, `internal/store/store.go`,

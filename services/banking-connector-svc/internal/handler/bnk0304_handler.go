@@ -60,7 +60,10 @@ func RegisterBNK0304Routes(r chi.Router, h *Handler, bnk0304Store store.BNK0304S
 	r.Route("/v1/banking/canonical-transactions", func(r chi.Router) {
 		r.Get("/", bh.ListCanonicalTransactions)
 		r.Get("/{id}", bh.GetCanonicalTransaction)
+		r.Get("/{id}/raw-lineage", bh.GetRawLineage)
+		r.Get("/{id}/normalization-version", bh.GetNormalizationVersion)
 	})
+	r.Get("/v1/banking/mapping-exceptions", bh.ListMappingExceptions)
 	r.Post("/v1/banking/mapping-exceptions/{id}/approve", bh.ApproveMappingException)
 }
 
@@ -499,6 +502,122 @@ func (h *BNK0304Handler) ListCanonicalTransactions(w http.ResponseWriter, r *htt
 	if err != nil {
 		h.logger.Error("ListCanonicalTransactions: store unavailable", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "failed to list canonical transactions")
+		return
+	}
+	if page.NextCursor != "" {
+		page.NextCursor = base64.RawURLEncoding.EncodeToString([]byte(page.NextCursor))
+	}
+	writeJSON(w, http.StatusOK, page)
+}
+
+// GetRawLineage handles GET /v1/banking/canonical-transactions/{id}/raw-lineage
+// (BNK-04 GetRawLineage, table 23/25). The legal entity isn't known until the
+// row is loaded, so this loads first (under RLS/tenant isolation) and only
+// then checks bank.transaction.read on the legal entity it resolves to — the
+// same real authorization-svc decision ListCanonicalTransactions already
+// makes (A20), not just a principal check.
+func (h *BNK0304Handler) GetRawLineage(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	tenantID := middleware.GetTenantID(r.Context())
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	lineage, err := h.bnk0304Store.GetRawLineage(r.Context(), tenantID, id)
+	if err != nil {
+		h.writeTransactionErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, lineage.LegalEntityID, BANK_TRANSACTION_READ); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, lineage)
+}
+
+// GetNormalizationVersion handles
+// GET /v1/banking/canonical-transactions/{id}/normalization-version
+// (BNK-04 GetNormalizationVersion, table 23/25). Same load-then-authorize
+// order as GetRawLineage, and the same bank.transaction.read decision.
+func (h *BNK0304Handler) GetNormalizationVersion(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	tenantID := middleware.GetTenantID(r.Context())
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	v, err := h.bnk0304Store.GetNormalizationVersion(r.Context(), tenantID, id)
+	if err != nil {
+		h.writeTransactionErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, v.LegalEntityID, BANK_TRANSACTION_READ); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, v)
+}
+
+var listMappingExceptionsParams = map[string]bool{"status": true, "limit": true, "cursor": true}
+var mappingExceptionStatuses = map[string]bool{"OPEN": true, "APPROVED": true, "REJECTED": true}
+
+// ListMappingExceptions handles GET /v1/banking/mapping-exceptions (BNK-04
+// ListNormalizationExceptions, table 23). Authorized as a platform-level
+// action (empty legal_entity_id) with mapping.exception.approve — the same
+// posture ApproveMappingException and CreateTransactionMapping already use:
+// this is a shared ops/finance control queue, not a legal-entity-scoped
+// business read, and table 24 names no separate read permission for it.
+func (h *BNK0304Handler) ListMappingExceptions(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	query := r.URL.Query()
+	for k, v := range query {
+		if !listMappingExceptionsParams[k] {
+			writeError(w, http.StatusBadRequest, "unknown query parameter: "+k)
+			return
+		}
+		if len(v) != 1 {
+			writeError(w, http.StatusBadRequest, "query parameter must appear once: "+k)
+			return
+		}
+	}
+	q := domain.ListMappingExceptionsQuery{Limit: controlDefaultLimit}
+	if query.Has("status") {
+		q.Status = query.Get("status")
+		if !mappingExceptionStatuses[q.Status] {
+			writeError(w, http.StatusBadRequest, "status must be one of OPEN, APPROVED, REJECTED")
+			return
+		}
+	}
+	if query.Has("limit") {
+		n, err := strconv.Atoi(query.Get("limit"))
+		if err != nil || n < 1 {
+			writeError(w, http.StatusBadRequest, "limit must be a positive integer")
+			return
+		}
+		q.Limit = n
+		if q.Limit > controlMaxLimit {
+			q.Limit = controlMaxLimit
+		}
+	}
+	if query.Has("cursor") {
+		raw, err := base64.RawURLEncoding.DecodeString(query.Get("cursor"))
+		if err != nil || len(raw) == 0 || len(raw) > 128 || !utf8.Valid(raw) {
+			writeError(w, http.StatusBadRequest, "cursor is invalid")
+			return
+		}
+		q.AfterExceptionID = string(raw)
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, "", BANKING_MAPPING_EXCEPTION_APPROVE); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	page, err := h.bnk0304Store.ListMappingExceptions(r.Context(), q)
+	if err != nil {
+		h.logger.Error("ListMappingExceptions: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "failed to list mapping exceptions")
 		return
 	}
 	if page.NextCursor != "" {

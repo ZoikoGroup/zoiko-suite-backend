@@ -270,3 +270,67 @@ type CanonicalTransactionPage struct {
 	Transactions []CanonicalTransactionListItem `json:"transactions"`
 	NextCursor   string                         `json:"next_cursor,omitempty"`
 }
+
+// RawLineage is GetRawLineage's response (table 23's "Queries/retrieval",
+// table 25's "Raw transaction hash/ID, canonical version, mapping/version").
+// It traces one canonical transaction back through its immutable statement
+// line to the statement and connection it arrived on. There is no
+// per-transaction raw hash column in this schema (migration 004):
+// StatementContentHash is the whole statement file's hash
+// (bank_statements.content_hash), not a per-line one — RawReference is the
+// only per-line raw evidence this service actually stores, and this type
+// never pretends otherwise.
+type RawLineage struct {
+	TransactionID   string    `json:"transaction_id"`
+	TenantID        string    `json:"tenant_id"`
+	Status          string    `json:"status"`
+	MappingVersion  int       `json:"mapping_version"`
+	SupersededBy    string    `json:"superseded_by,omitempty"`
+	StatementLineID string    `json:"statement_line_id"`
+	LineSeq         int       `json:"line_seq"`
+	RawReference    string    `json:"raw_reference"`
+	BankCode        string    `json:"bank_code"`
+	PostedDate      time.Time `json:"posted_date"`
+	StatementID     string    `json:"statement_id"`
+	// StatementContentHash is the statement-level hash recorded at BNK-03
+	// ingestion, not a per-transaction one — see the type comment.
+	StatementContentHash string  `json:"statement_content_hash"`
+	StatementSourceID    string  `json:"statement_source_id"`
+	ConnectionID         string  `json:"connection_id"`
+	LegalEntityID        string  `json:"legal_entity_id"`
+	BankAccountID        *string `json:"bank_account_id,omitempty"`
+}
+
+// NormalizationVersion is GetNormalizationVersion's response. Caveat carries
+// A19 (SPEC_DEVIATIONS.md) into the response itself, not just a code
+// comment: mapping_version is honestly exposed as the per-line
+// re-normalization counter it actually is, so a caller cannot mistake it
+// for a mapping-dictionary, parser or schema version.
+type NormalizationVersion struct {
+	TransactionID  string `json:"transaction_id"`
+	TenantID       string `json:"tenant_id"`
+	LegalEntityID  string `json:"legal_entity_id"`
+	Status         string `json:"status"`
+	MappingVersion int    `json:"mapping_version"`
+	Caveat         string `json:"caveat"`
+}
+
+// MappingVersionCaveat is NormalizationVersion.Caveat's fixed text.
+const MappingVersionCaveat = "mapping_version is an integer incremented on each re-normalization of this statement line (1 at first normalization or exception approval, prior+1 at each re-normalize); it is not an identifier or version of the bank_transaction_mappings dictionary entry, parser or schema that produced this row, and cannot be used to reproduce which mapping rule was applied (SPEC_DEVIATIONS.md A19)."
+
+// ListMappingExceptionsQuery is ListNormalizationExceptions' filter. Status
+// narrows to one lifecycle value (OPEN/APPROVED/REJECTED); empty means any.
+// mapping_exceptions has no legal_entity_id column — it is a platform-scoped
+// control queue, the same posture ApproveMappingException and
+// CreateTransactionMapping already use — so there is no legal-entity filter.
+type ListMappingExceptionsQuery struct {
+	Status           string
+	AfterExceptionID string
+	Limit            int
+}
+
+// MappingExceptionPage is one keyset page of ListNormalizationExceptions.
+type MappingExceptionPage struct {
+	Exceptions []MappingException `json:"exceptions"`
+	NextCursor string             `json:"next_cursor,omitempty"`
+}
