@@ -163,3 +163,14 @@ func TestEnvelopeRejectsBadStructuredFields(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// Doc 02 X05: a security report stays on its official route; no follow-ups.
+func TestNoFollowUpsAfterSafetyReply(t *testing.T) {
+	report := orchestrator.Result{Status: contract.Handoff, IntentID: "X05", Text: "Please use the official security reporting channel.", KnowledgeReleaseID: "kb",
+		Actions: []contract.Action{{Type: contract.ActionOpenRoute, RouteKey: "trust"}}}
+	h := structuredHarness(t, true, report)
+	s := h.newSession("key-structured-x05")
+	if e := decodeEnvelope(t, h.turn(s, turnUUID, "We have a security breach right now!")); len(e.FollowUps) != 0 {
+		t.Fatalf("follow-ups after X05: %+v", e.FollowUps)
+	}
+}

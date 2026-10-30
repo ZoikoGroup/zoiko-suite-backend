@@ -3,6 +3,7 @@ package httpapi
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 
 	"zoiko.io/public-ai-svc/internal/contract"
 	"zoiko.io/public-ai-svc/internal/flags"
@@ -57,7 +58,9 @@ func (s *Server) structure(env *contract.Envelope, market string) {
 
 	// Follow-ups after an answer or a route offer; refusals and abstentions
 	// keep their own pre-approved suggestions, CLARIFY its options.
-	if (env.Status == contract.Answered || env.Status == contract.Handoff) && len(env.Suggestions) == 0 {
+	// Never after a safety reply (X01-X10): a security report, say, must stay
+	// on its official route (Doc 02 X05) without unrelated questions.
+	if (env.Status == contract.Answered || env.Status == contract.Handoff) && len(env.Suggestions) == 0 && !strings.HasPrefix(env.IntentID, "X") {
 		for _, it := range policy.FollowUps(env.IntentID) {
 			env.FollowUps = append(env.FollowUps, followUp(it))
 		}
