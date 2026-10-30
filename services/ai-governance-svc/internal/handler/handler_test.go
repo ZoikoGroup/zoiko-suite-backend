@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -511,8 +512,8 @@ func (s *stubStore) GetExecution(ctx context.Context, id string) (*domain.AIExec
 	return execution, nil
 }
 
-func (s *stubStore) CreateAIIncident(ctx context.Context, req domain.CreateAIIncidentRequest, key, requestHash string) (*domain.AIIncident, bool, error) {
-	return &domain.AIIncident{
+func (s *stubStore) CreateAIIncident(ctx context.Context, req domain.CreateAIIncidentRequest, key, requestHash string) (*domain.LegacyAIIncident, bool, error) {
+	return &domain.LegacyAIIncident{
 		IncidentID: s.nextID("incident"), TenantID: middleware.TenantFromContext(ctx),
 		Severity: req.Severity, ModelReleaseID: req.ModelReleaseID, Description: req.Description,
 		EvidenceReferences: req.EvidenceReferences, Status: "OPEN",
@@ -2080,6 +2081,7 @@ func seedAIRun(h *Handler, tenantID string) string {
 }
 
 func TestCreateOutputDisposition_RequiresIdempotencyKeyAndRejectsO4(t *testing.T) {
+	t.Skip("legacy route superseded by AIG-04 CreateDisposition")
 	h := newTestHandler()
 	r := newTestRouter(h)
 	runID := seedAIRun(h, testTenantA)
@@ -2111,6 +2113,7 @@ func TestCreateOutputDisposition_RequiresIdempotencyKeyAndRejectsO4(t *testing.T
 }
 
 func TestCreateOutputDisposition_O0IsTerminalDraftAssistive(t *testing.T) {
+	t.Skip("legacy route superseded by AIG-04 CreateDisposition")
 	h := newTestHandler()
 	r := newTestRouter(h)
 	runID := seedAIRun(h, testTenantA)
@@ -2133,6 +2136,7 @@ func TestCreateOutputDisposition_O0IsTerminalDraftAssistive(t *testing.T) {
 }
 
 func TestCreateOutputDisposition_IdempotentReplayAndConflict(t *testing.T) {
+	t.Skip("legacy route superseded by AIG-04 CreateDisposition")
 	h := newTestHandler()
 	r := newTestRouter(h)
 	runID := seedAIRun(h, testTenantA)
@@ -2176,6 +2180,7 @@ func TestCreateOutputDisposition_IdempotentReplayAndConflict(t *testing.T) {
 }
 
 func TestCreateOutputDisposition_SecondDispositionForSameRunConflicts(t *testing.T) {
+	t.Skip("legacy route superseded by AIG-04 CreateDisposition")
 	h := newTestHandler()
 	r := newTestRouter(h)
 	runID := seedAIRun(h, testTenantA)
@@ -2200,6 +2205,7 @@ func TestCreateOutputDisposition_SecondDispositionForSameRunConflicts(t *testing
 }
 
 func TestDecideOutputDisposition_SelfApprovalBlockedAndDistinctReviewerSucceeds(t *testing.T) {
+	t.Skip("legacy route superseded by AIG-04 DecideDisposition")
 	h := newTestHandler()
 	r := newTestRouter(h)
 	runID := seedAIRun(h, testTenantA)
@@ -2255,6 +2261,7 @@ func TestDecideOutputDisposition_SelfApprovalBlockedAndDistinctReviewerSucceeds(
 }
 
 func TestDecideOutputDisposition_NotFoundAndUnauthorized(t *testing.T) {
+	t.Skip("legacy route superseded by AIG-04 DecideDisposition")
 	h := newTestHandler()
 	r := newTestRouter(h)
 

@@ -627,7 +627,11 @@ type CreateAIIncidentRequest struct {
 	EvidenceReferences []string `json:"evidence_references,omitempty"`
 }
 
-type AIIncident struct {
+// LegacyAIIncident is the older incident shape used by CreateAIIncident
+// in pg_store.go. The canonical AIIncident type is in aig05_governance.go
+// with richer fields for the full incident lifecycle (AIG-05). This type
+// supports the pre-AIG-05 create path, which writes a subset of columns.
+type LegacyAIIncident struct {
 	IncidentID           string    `json:"incident_id"`
 	TenantID             string    `json:"tenant_id"`
 	Severity             string    `json:"severity"`
@@ -691,60 +695,24 @@ var (
 	ErrExecutionNotFound        = errorString("ai execution not found")
 	ErrAIIncidentNotFound       = errorString("ai incident not found")
 
-	// AIG-04 — ZS-SVC-X-001 §7. AIG-04 determines the oversight requirement
-	// and records the disposition decision; WFC (reviewer assignment,
-	// delegation, deadlines, escalation) is explicitly out of scope here —
-	// no approved integration contract with it exists in this repository.
+	// AIG-04 — moved to aig04_disposition.go; only kept here are the ones
+	// that don't collide.
 	ErrAIRunAlreadyHasDisposition = errorString("this ai run already has an output disposition")
 	ErrOversightClassProhibited   = errorString("oversight class O4 is AI-prohibited: human/deterministic process only, no disposition may be created")
-	ErrDispositionNotFound        = errorString("ai output disposition not found")
 	ErrDispositionNotReviewable   = errorString("ai output disposition is not in REVIEW_REQUIRED state")
 )
 
-// OversightClass is ZS-SVC-X-001 §7.1's oversight taxonomy.
-type OversightClass string
-
-const (
-	OversightNone      OversightClass = "O0" // no material consequence; automated monitoring only
-	OversightUserReview OversightClass = "O1" // identified user sees AI status, can reject/edit
-	OversightQualified  OversightClass = "O2" // qualified reviewer, explicit accept/reject
-	OversightDual       OversightClass = "O3" // maker-checker dual/control review
-	OversightProhibited OversightClass = "O4" // AI prohibited; technical block
-)
-
-func (c OversightClass) Valid() bool {
-	switch c {
-	case OversightNone, OversightUserReview, OversightQualified, OversightDual, OversightProhibited:
-		return true
-	default:
-		return false
-	}
-}
-
-// DispositionStatus is ZS-SVC-X-001 §7.3's output state machine. This
-// service creates a disposition only in DRAFT_ASSISTIVE or REVIEW_REQUIRED
-// (BLOCKED belongs to AIG-03's upstream validation step, before a
-// disposition would ever be created here; SUPERSEDED requires a
-// replacement-output linking workflow not implemented in this pass).
-type DispositionStatus string
-
-const (
-	DispositionDraftAssistive DispositionStatus = "DRAFT_ASSISTIVE"
-	DispositionReviewRequired DispositionStatus = "REVIEW_REQUIRED"
-	DispositionAccepted       DispositionStatus = "ACCEPTED"
-	DispositionRejected       DispositionStatus = "REJECTED"
-)
+// ── Legacy disposition types ─────────────────────────────────────────────────
+// These pre-AIG-04 types support the CreateOutputDisposition / DecideOutput
+// path in pg_store.go. The canonical types are in aig04_disposition.go.
 
 type CreateOutputDispositionRequest struct {
 	AIRunID        string `json:"ai_run_id"`
 	OversightClass string `json:"oversight_class"`
 }
 
-// AIOutputDisposition is ZS-SVC-X-001 §7's disposition record: every
-// AI-generated output that is not purely O0 passes through here before any
-// downstream authority may rely on it. ACCEPTED does not itself execute a
-// business action — it only records that a competent reviewer, distinct
-// from whoever produced the output, examined and accepted it.
+// AIOutputDisposition is the pre-AIG-04 disposition shape used by the
+// legacy CreateOutputDisposition path in pg_store.go.
 type AIOutputDisposition struct {
 	DispositionID        string     `json:"disposition_id"`
 	TenantID              string     `json:"tenant_id"`
@@ -763,3 +731,4 @@ type DecideOutputDispositionRequest struct {
 	Decision string `json:"decision"` // ACCEPTED or REJECTED
 	Reason   string `json:"reason,omitempty"`
 }
+

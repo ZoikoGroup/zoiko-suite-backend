@@ -30,6 +30,9 @@ type Store interface {
 	ConcludeCheck(ctx context.Context, checkID, riskOutcome, screeningBasis, screeningSource string, evidence *domain.VendorDDEvidence) error
 	MarkFailed(ctx context.Context, checkID, reason string) error
 	ListEvidence(ctx context.Context, checkID string) ([]domain.VendorDDEvidence, error)
+	CreateVendorProfile(ctx context.Context, p *domain.VendorProfile) error
+	GetVendorProfileByID(ctx context.Context, profileID string) (*domain.VendorProfile, error)
+	ListVendorProfiles(ctx context.Context, legalEntityID, counterpartyID string) ([]domain.VendorProfile, error)
 }
 
 type Publisher interface {
@@ -115,6 +118,12 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/", h.CreateCheck)
 		r.Get("/", h.ListChecks)
 		r.Get("/{id}", h.GetCheck)
+	})
+
+	r.Route("/v1/vendor-profiles", func(r chi.Router) {
+		r.Post("/", h.CreateVendorProfile)
+		r.Get("/", h.ListVendorProfiles)
+		r.Get("/{id}", h.GetVendorProfileByID)
 	})
 }
 
@@ -618,4 +627,134 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// ── VENDOR PROFILES ──────────────────────────────────────────────────────────
+
+func (h *Handler) CreateVendorProfile(w http.ResponseWriter, r *http.Request) {
+	var req domain.CreateVendorProfileRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+
+	req.LegalEntityID = strings.TrimSpace(req.LegalEntityID)
+	req.CounterpartyID = strings.TrimSpace(req.CounterpartyID)
+	req.VendorName = strings.TrimSpace(req.VendorName)
+
+	if req.LegalEntityID == "" || req.CounterpartyID == "" || req.VendorName == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields",
+			"legal_entity_id, counterparty_id, and vendor_name are required")
+		return
+	}
+
+	if !validScope(w, req.LegalEntityID) {
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+
+	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionInitiate); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	tenantID := svcmiddleware.TenantFromContext(r.Context())
+	now := time.Now().UTC()
+
+	vendorStatus := strings.TrimSpace(req.VendorStatus)
+	if vendorStatus == "" {
+		vendorStatus = "ACTIVE"
+	}
+	ddStatus := strings.TrimSpace(req.DueDiligenceStatus)
+	if ddStatus == "" {
+		ddStatus = "PENDING"
+	}
+	riskRating := strings.TrimSpace(req.RiskRating)
+	if riskRating == "" {
+		riskRating = "MEDIUM"
+	}
+
+	profile := &domain.VendorProfile{
+		VendorProfileID:    uuid.NewString(),
+		TenantID:           tenantID,
+		LegalEntityID:      req.LegalEntityID,
+		CounterpartyID:     req.CounterpartyID,
+		VendorName:         req.VendorName,
+		VendorStatus:       vendorStatus,
+		DueDiligenceStatus: ddStatus,
+		RiskRating:         riskRating,
+		CreatedAt:          now,
+		UpdatedAt:          now,
+	}
+
+	if err := h.store.CreateVendorProfile(r.Context(), profile); err != nil {
+		h.log.Error("failed to create vendor profile", zap.Error(err))
+		writeError(w, http.StatusInternalServerError, "store_error", err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, profile)
+}
+
+func (h *Handler) GetVendorProfileByID(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+
+	id := chi.URLParam(r, "id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "bad_request", "id is required")
+		return
+	}
+
+	profile, err := h.store.GetVendorProfileByID(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, domain.ErrVendorProfileNotFound) {
+			writeError(w, http.StatusNotFound, "not_found", "vendor profile not found")
+			return
+		}
+		h.log.Error("failed to get vendor profile", zap.Error(err))
+		writeError(w, http.StatusInternalServerError, "store_error", err.Error())
+		return
+	}
+
+	if err := h.authz.CheckAllowed(r.Context(), principalID, profile.LegalEntityID, actionView); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, profile)
+}
+
+func (h *Handler) ListVendorProfiles(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+
+	legalEntityID := strings.TrimSpace(r.URL.Query().Get("legal_entity_id"))
+	if legalEntityID != "" {
+		if !validScope(w, legalEntityID) {
+			return
+		}
+		if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionView); err != nil {
+			h.writeAuthzErr(w, err)
+			return
+		}
+	}
+
+	counterpartyID := strings.TrimSpace(r.URL.Query().Get("counterparty_id"))
+
+	profiles, err := h.store.ListVendorProfiles(r.Context(), legalEntityID, counterpartyID)
+	if err != nil {
+		h.log.Error("failed to list vendor profiles", zap.Error(err))
+		writeError(w, http.StatusInternalServerError, "store_error", err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, profiles)
 }

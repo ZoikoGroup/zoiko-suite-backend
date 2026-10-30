@@ -151,9 +151,9 @@ services:
       dockerfile: Dockerfile
     container_name: compliance-risk-scoring-svc-p6
     ports:
-      - "8136:8136"
+      - "8177:8177"
     environment:
-      PORT: "8136"
+      PORT: "8177"
       DATABASE_URL: postgres://zoiko_app:zoiko_app_password@postgres:5432/compliance_risk_scoring?sslmode=disable
       KAFKA_BROKERS: kafka:9092
       KAFKA_TOPIC: zoiko.compliance-risk-scoring.events

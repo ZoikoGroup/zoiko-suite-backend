@@ -107,12 +107,38 @@ type CheckDetailResponse struct {
 	Replayed bool `json:"replayed"`
 }
 
+// VendorProfile represents an approved/profiled vendor record per Doc 04 §14.1 / §2056.
+type VendorProfile struct {
+	VendorProfileID    string     `json:"vendor_profile_id"`
+	TenantID           string     `json:"tenant_id"`
+	LegalEntityID      string     `json:"legal_entity_id"`
+	CounterpartyID     string     `json:"counterparty_id"`
+	VendorName         string     `json:"vendor_name"`
+	VendorStatus       string     `json:"vendor_status"`
+	DueDiligenceStatus string     `json:"due_diligence_status"`
+	RiskRating         string     `json:"risk_rating"`
+	ApprovedAt         *time.Time `json:"approved_at,omitempty"`
+	ApprovedBy         *string    `json:"approved_by,omitempty"`
+	CreatedAt          time.Time  `json:"created_at"`
+	UpdatedAt          time.Time  `json:"updated_at"`
+}
+
+type CreateVendorProfileRequest struct {
+	LegalEntityID      string `json:"legal_entity_id"`
+	CounterpartyID     string `json:"counterparty_id"`
+	VendorName         string `json:"vendor_name"`
+	VendorStatus       string `json:"vendor_status,omitempty"`
+	DueDiligenceStatus string `json:"due_diligence_status,omitempty"`
+	RiskRating         string `json:"risk_rating,omitempty"`
+}
+
 type errorString string
 
 func (e errorString) Error() string { return string(e) }
 
 var (
 	ErrCheckNotFound          = errorString("vendor due diligence check not found")
+	ErrVendorProfileNotFound  = errorString("vendor profile not found")
 	ErrAuthorizationDenied    = errorString("authorization denied for vendor due diligence action")
 	ErrAuthzServiceUnavailabe = errorString("authorization-svc unavailable")
 	ErrIdentityMissing        = errorString("caller identity missing")

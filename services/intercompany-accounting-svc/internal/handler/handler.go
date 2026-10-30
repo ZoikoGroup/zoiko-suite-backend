@@ -371,15 +371,23 @@ func (h *Handler) ListEntries(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// At least one entity filter is required. Without it, the authorization
+	// check below has no entity to verify against, so any caller could
+	// retrieve ALL intercompany entries across every legal entity in the
+	// tenant. This is the "filter that disables itself" shape documented in
+	// the backend-completion-tracker.
 	entityForAuthz := sourceEntityID
 	if entityForAuthz == "" {
 		entityForAuthz = targetEntityID
 	}
-	if entityForAuthz != "" {
-		if err := h.authz.CheckAllowed(r.Context(), principalID, entityForAuthz, actionViewEntry); err != nil {
-			h.writeAuthzErr(w, err)
-			return
-		}
+	if entityForAuthz == "" {
+		writeError(w, http.StatusBadRequest, "missing_entity_filter",
+			"at least one of source_legal_entity_id or target_legal_entity_id is required")
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, entityForAuthz, actionViewEntry); err != nil {
+		h.writeAuthzErr(w, err)
+		return
 	}
 
 	list, err := h.store.ListEntries(r.Context(), sourceEntityID, targetEntityID)
