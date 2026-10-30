@@ -3098,6 +3098,10 @@ services:
     ports:
       - "8104:8104"
     environment:
+      # Accounting kernel gates (all off until a tenant is ready: see tools/gak-rollout). off | enforce.
+      KERNEL_CLOSE_GATE_MODE: "${KERNEL_CLOSE_GATE_MODE:-off}"
+      KERNEL_PERIOD_SEAL_MODE: "${KERNEL_PERIOD_SEAL_MODE:-off}"
+      KERNEL_REQUIRED_RECONCILIATIONS: "${KERNEL_REQUIRED_RECONCILIATIONS:-}"
       PORT: "8104"
       # REF-05 cutover phase 1. The mirror is best-effort dual-write of lock and
       # reopen into accounting-period-svc; financial-close-svc stays
@@ -3285,7 +3289,7 @@ services:
       # Names must match the catalogue (internal/catalogue). banking-connector-svc runs in
       # docker-compose.phase7.yml, not this file: the FIN-CTRL-003/032 controls fail closed
       # (FAILED/INDETERMINATE) until that stack is reachable on the same network.
-      SOURCE_ENDPOINTS: "accounts-receivable=http://accounts-receivable-svc:8101,accounts-payable=http://accounts-payable-svc:8099,general-ledger=http://general-ledger-svc:8098,banking-connector=http://banking-connector-svc:8145,inventory-management=http://inventory-management-svc:8168,payroll-run=http://payroll-run-svc:8110,intercompany-accounting=http://intercompany-accounting-svc:8105,consolidation=http://consolidation-svc:8106,financial-close=http://financial-close-svc:8104,payee-banking-identity=http://payee-banking-identity-svc:8166,tax-authority-interface=http://tax-authority-interface-svc:8147"
+      SOURCE_ENDPOINTS: "accounts-receivable=http://accounts-receivable-svc:8101,accounts-payable=http://accounts-payable-svc:8099,general-ledger=http://general-ledger-svc:8098,banking-connector=http://banking-connector-svc:8145,inventory-management=http://inventory-management-svc:8168,payroll-run=http://payroll-run-svc:8110,intercompany-accounting=http://intercompany-accounting-svc:8105,consolidation=http://consolidation-svc:8106,financial-close=http://financial-close-svc:8104,payee-banking-identity=http://payee-banking-identity-svc:8166,tax-authority-interface=http://tax-authority-interface-svc:8147,payment-run=http://payment-run-svc:8161,treasury=http://treasury-svc:8103,payment-initiation-adapter=http://payment-initiation-adapter-svc:8162,asset-management=http://asset-management-svc:8167"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
     depends_on:
@@ -3402,6 +3406,9 @@ services:
     ports:
       - "8167:8167"
     environment:
+      # Post depreciation through the accounting kernel. Both set, or neither (off). See tools/gak-rollout.
+      LEDGER_KERNEL_BOOK_ID: "${LEDGER_KERNEL_BOOK_ID:-}"
+      LEDGER_KERNEL_CURRENCY: "${LEDGER_KERNEL_CURRENCY:-}"
       PORT: "8167"
       DB_HOST: postgres
       DB_PORT: "5432"
@@ -3453,6 +3460,9 @@ services:
     ports:
       - "8168:8168"
     environment:
+      # Post inventory valuation through the accounting kernel. Both set, or neither (off). See tools/gak-rollout.
+      LEDGER_KERNEL_BOOK_ID: "${LEDGER_KERNEL_BOOK_ID:-}"
+      LEDGER_KERNEL_CURRENCY: "${LEDGER_KERNEL_CURRENCY:-}"
       PORT: "8168"
       DB_HOST: postgres
       DB_PORT: "5432"
@@ -3657,6 +3667,8 @@ services:
     ports:
       - "8110:8110"
     environment:
+      # Post payroll results through the accounting kernel into this book (off when empty). See tools/gak-rollout.
+      LEDGER_KERNEL_BOOK_ID: "${LEDGER_KERNEL_BOOK_ID:-}"
       PORT: "8110"
       DB_HOST: postgres
       DB_PORT: "5432"

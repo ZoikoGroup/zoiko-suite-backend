@@ -17,6 +17,14 @@ type stubStore struct {
 	byIdempotency     map[string]string // platform-wide, like uq_payment_initiation_attempts_idempotency_key
 	idempotencyTenant map[string]string // idempotency_key -> owning tenant (RLS-visible lookup)
 	events            map[string][]domain.AttemptEvent
+
+	// control-population stub state (control_population_test.go)
+	popTenant string
+	popQuery  domain.PaymentAttemptsQuery
+	popPage   *domain.ControlPopulationPage
+	popErr    error
+	popCalls  int
+
 }
 
 func newStubStore() *stubStore {
@@ -156,4 +164,17 @@ func (s *stubStore) ResolveAmbiguous(_ context.Context, attemptID string, req do
 
 func (s *stubStore) ListEvents(_ context.Context, attemptID string) ([]domain.AttemptEvent, error) {
 	return s.events[attemptID], nil
+}
+
+// QueryPaymentAttempts records the query it was given and returns the configured page.
+func (s *stubStore) QueryPaymentAttempts(_ context.Context, tenantID string, q domain.PaymentAttemptsQuery) (*domain.ControlPopulationPage, error) {
+	s.popCalls++
+	s.popTenant, s.popQuery = tenantID, q
+	if s.popErr != nil {
+		return nil, s.popErr
+	}
+	if s.popPage != nil {
+		return s.popPage, nil
+	}
+	return &domain.ControlPopulationPage{Watermark: "pa1:n=0;md5=x"}, nil
 }

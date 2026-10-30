@@ -218,7 +218,9 @@ func TestFixedAssetsReconcileByClassAndATotalDoesNotHideAWrongGroup(t *testing.T
 
 func TestInventoryReconcilesByLocationAndRefusesNegativeStock(t *testing.T) {
 	w := w4Setup(t)
-	d := func(loc string) map[string]string { return map[string]string{"location": loc, "item_class": "FINISHED"} }
+	d := func(loc string) map[string]string {
+		return map[string]string{"location": loc, "item_class": "FINISHED"}
+	}
 	w.mustPostD(t, "INVENTORY.RECEIVED", "", d("WH-1"), map[string]any{"amount": "5000.00", "receipt_ref": "GR-1", "valuation_policy": "fifo-v2"})
 	w.mustPostD(t, "INVENTORY.RECEIVED", "", d("WH-2"), map[string]any{"amount": "3000.00", "receipt_ref": "GR-2", "valuation_policy": "fifo-v2"})
 	w.mustPostD(t, "INVENTORY.ISSUED", "", d("WH-1"), map[string]any{"amount": "1200.00", "shipment_ref": "SH-1", "costing_layer_ref": "L-1", "on_hand_after": "40"})

@@ -64,6 +64,11 @@ type LineTemplate struct {
 	// carrying amount it was recognised and revalued at; the difference from what the settlement is worth is the realized
 	// exchange difference (standard §24).
 	Functional string `json:"functional,omitempty"`
+	// TaxDetail links the line to the authoritative tax determination it rests on (standard §8.2): a literal reference or
+	// "$facts.<name>" for the one the event carries. A line that names a fact the event lacks is refused as AK-TAX.
+	TaxDetail string `json:"tax_detail,omitempty"`
+	// SourceLine links the line to the line of the source document it comes from (§8.2), with the same two forms as TaxDetail.
+	SourceLine string `json:"source_line,omitempty"`
 }
 
 // RealizedFX names the accounts a realized exchange difference is posted to. A rule that settles items at their carrying
@@ -89,6 +94,20 @@ type DimensionRule struct {
 	From string `json:"from,omitempty"`
 }
 
+// DimensionMatch says when a combination applies: the line carries the dimension, with the value when one is given.
+type DimensionMatch struct {
+	Dimension string `json:"dimension"`
+	Value     string `json:"value,omitempty"`
+}
+
+// DimensionCombo is a rule-driven combination of dimensions (standard Â§13): where a line carries a dimension (and, when given, that value),
+// it must also carry the dimensions in Require and must not carry those in Forbid.
+type DimensionCombo struct {
+	When    DimensionMatch `json:"when"`
+	Require []string       `json:"require,omitempty"`
+	Forbid  []string       `json:"forbid,omitempty"`
+}
+
 // TaxDependency makes a rule wait for an authoritative tax result: without these facts no posting is proposed (AK-TAX).
 type TaxDependency struct {
 	RequiredFacts []string `json:"required_facts"`
@@ -96,15 +115,17 @@ type TaxDependency struct {
 
 // RuleContent is the declarative body of a rule set. Everything here is covered by the content hash.
 type RuleContent struct {
-	Conditions       []Condition     `json:"conditions,omitempty"`
-	LineTemplates    []LineTemplate  `json:"line_templates"`
-	RoundingPolicyID string          `json:"rounding_policy_id"`
-	RoundingAccount  *AccountRef     `json:"rounding_account,omitempty"`
-	DimensionRules   []DimensionRule `json:"dimension_rules,omitempty"`
-	TaxDependency    *TaxDependency  `json:"tax_dependency,omitempty"`
-	FXPolicyID       string          `json:"fx_policy_id,omitempty"`
-	RealizedFX       *RealizedFX     `json:"realized_fx,omitempty"`
-	ApprovalPolicyID string          `json:"approval_policy_id,omitempty"`
+	Conditions         []Condition         `json:"conditions,omitempty"`
+	LineTemplates      []LineTemplate      `json:"line_templates"`
+	RoundingPolicyID   string              `json:"rounding_policy_id"`
+	RoundingAccount    *AccountRef         `json:"rounding_account,omitempty"`
+	DimensionRules     []DimensionRule     `json:"dimension_rules,omitempty"`
+	DimensionCombos    []DimensionCombo    `json:"dimension_combinations,omitempty"`
+	BalancingDimension *BalancingDimension `json:"balancing_dimension,omitempty"`
+	TaxDependency      *TaxDependency      `json:"tax_dependency,omitempty"`
+	FXPolicyID         string              `json:"fx_policy_id,omitempty"`
+	RealizedFX         *RealizedFX         `json:"realized_fx,omitempty"`
+	ApprovalPolicyID   string              `json:"approval_policy_id,omitempty"`
 }
 
 // TestCase is one regression case of a rule set's test pack: an event, what the directory resolves, and what must come
@@ -119,7 +140,7 @@ type TestCase struct {
 	// Controls gives the control type of an account code the case resolves to (AR, AP, ...), so a case can exercise the
 	// counterparty rule of a control account.
 	Controls map[string]string `json:"control_types,omitempty"`
-	Expect     TestExpectation   `json:"expect"`
+	Expect   TestExpectation   `json:"expect"`
 }
 
 // TestEvent is the part of an event a rule looks at.
@@ -287,6 +308,12 @@ func (c *RuleContent) Validate() error {
 		if err := validateConditions(t.When); err != nil {
 			return bad(at+"when", err.Error())
 		}
+		if why := badLineRef(t.TaxDetail); why != "" {
+			return bad(at+"tax_detail", why)
+		}
+		if why := badLineRef(t.SourceLine); why != "" {
+			return bad(at+"source_line", why)
+		}
 		for d, v := range t.Dimensions {
 			if !codeRE.MatchString(d) || strings.TrimSpace(v) == "" || len(v) > 120 {
 				return bad(at+"dimensions."+d, "a dimension code and a literal or $dimensions.x / $facts.x value")
@@ -314,6 +341,30 @@ func (c *RuleContent) Validate() error {
 			}
 		default:
 			return bad(at+"mode", "REQUIRED, OPTIONAL, DERIVED or PROHIBITED")
+		}
+	}
+	if c.BalancingDimension != nil {
+		if why := c.BalancingDimension.validate(); why != "" {
+			return bad("balancing_dimension", why)
+		}
+	}
+	if len(c.DimensionCombos) > 20 {
+		return bad("dimension_combinations", "at most 20 combinations")
+	}
+	for i, cb := range c.DimensionCombos {
+		at := fmt.Sprintf("dimension_combinations[%d].", i)
+		if !codeRE.MatchString(cb.When.Dimension) || len(cb.When.Value) > 120 {
+			return bad(at+"when", "a dimension code and, optionally, a value")
+		}
+		if len(cb.Require)+len(cb.Forbid) == 0 || len(cb.Require) > 10 || len(cb.Forbid) > 10 {
+			return bad(at+"require", "a combination requires or forbids at least one dimension, and at most 10 each")
+		}
+		seenDim := map[string]bool{cb.When.Dimension: true}
+		for _, d := range append(append([]string{}, cb.Require...), cb.Forbid...) {
+			if !codeRE.MatchString(d) || seenDim[d] {
+				return bad(at+"require", "each dimension once, and not the one the combination is about")
+			}
+			seenDim[d] = true
 		}
 	}
 	if c.TaxDependency != nil {
@@ -534,4 +585,22 @@ func preferJurisdiction(sets []RuleSet, jurisdiction string) []RuleSet {
 // AppliesToJurisdiction reports whether a rule set may be used in a book kept under the jurisdiction.
 func (r *RuleSet) AppliesToJurisdiction(bookJurisdiction string) bool {
 	return r.Jurisdiction == "" || r.Jurisdiction == bookJurisdiction
+}
+
+// badLineRef says why a line's link to a tax determination or a source line is not acceptable: it is a literal reference or
+// $facts.<name> for the one the event carries. Empty means no link, which is fine.
+func badLineRef(v string) string {
+	if v == "" {
+		return ""
+	}
+	if f, ok := strings.CutPrefix(v, "$facts."); ok {
+		if !identRE.MatchString(f) {
+			return f + " is not a fact name"
+		}
+		return ""
+	}
+	if strings.TrimSpace(v) != v || len(v) > 200 {
+		return "a literal reference of at most 200 characters or $facts.x"
+	}
+	return ""
 }

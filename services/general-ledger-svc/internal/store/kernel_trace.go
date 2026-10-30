@@ -6,6 +6,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
 	"zoiko.io/general-ledger-svc/internal/kernel"
@@ -249,12 +250,12 @@ func traceJournalChain(ctx context.Context, t pgx.Tx, tenant, first string, tp *
 
 func loadTraceJournal(ctx context.Context, t pgx.Tx, tenant, id, role string) (*kernel.TraceJournal, error) {
 	j := kernel.TraceJournal{Role: role, Lines: []kernel.TraceLine{}}
-	var number, hash, postedBy, revOf, corrOf, reason, kind *string
+	var number, hash, postedBy, revOf, corrOf, reason, kind, bundle *string
 	var postingDate time.Time
 	if err := t.QueryRow(ctx, `SELECT journal_id::text, journal_number, status, journal_type, posting_date, fiscal_period, currency_code, journal_hash,
-			posted_by_principal_id, reversal_of_journal_id::text, correction_of_journal_id::text, reversal_reason, correction_kind
+			posted_by_principal_id, reversal_of_journal_id::text, correction_of_journal_id::text, reversal_reason, correction_kind, evidence_bundle_id
 		FROM journal_headers WHERE tenant_id = $1::uuid AND journal_id = $2::uuid`, tenant, id).
-		Scan(&j.JournalID, &number, &j.Status, &j.JournalType, &postingDate, &j.FiscalPeriod, &j.Currency, &hash, &postedBy, &revOf, &corrOf, &reason, &kind); err != nil {
+		Scan(&j.JournalID, &number, &j.Status, &j.JournalType, &postingDate, &j.FiscalPeriod, &j.Currency, &hash, &postedBy, &revOf, &corrOf, &reason, &kind, &bundle); err != nil {
 		return nil, kernelErr(err)
 	}
 	j.PostingDate = postingDate.Format("2006-01-02")
@@ -266,9 +267,10 @@ func loadTraceJournal(ctx context.Context, t pgx.Tx, tenant, id, role string) (*
 	}
 	j.JournalNumber, j.Hash, j.PostedBy, j.ReversalOf, j.CorrectionOf, j.Reason, j.CorrectionKnd =
 		deref(number), deref(hash), deref(postedBy), deref(revOf), deref(corrOf), deref(reason), deref(kind)
+	j.EvidenceBundle = deref(bundle)
 
 	rows, err := t.Query(ctx, `SELECT l.line_number, l.account_code, l.debit_amount::text, l.credit_amount::text, l.transaction_amount::text, l.transaction_currency,
-			l.exchange_rate::text, l.rate_ref, l.posting_rule_line_ref, l.dimensions, COALESCE(l.description, ''), e.entry_seq
+			l.exchange_rate::text, l.rate_ref, l.posting_rule_line_ref, l.dimensions, COALESCE(l.description, ''), e.entry_seq, l.tax_detail_ref, l.source_line_ref
 		FROM journal_lines l LEFT JOIN ledger_entries e ON e.tenant_id = l.tenant_id AND e.journal_id = l.journal_id AND e.journal_line_id = l.journal_line_id
 		WHERE l.tenant_id = $1::uuid AND l.journal_id = $2::uuid ORDER BY l.line_number`, tenant, id)
 	if err != nil {
@@ -277,11 +279,12 @@ func loadTraceJournal(ctx context.Context, t pgx.Tx, tenant, id, role string) (*
 	defer rows.Close()
 	for rows.Next() {
 		var l kernel.TraceLine
-		var txAmt, txCcy, rate, rateRef, ruleRef *string
+		var txAmt, txCcy, rate, rateRef, ruleRef, taxRef, srcRef *string
 		var dims []byte
-		if err := rows.Scan(&l.LineNo, &l.AccountCode, &l.Debit, &l.Credit, &txAmt, &txCcy, &rate, &rateRef, &ruleRef, &dims, &l.Description, &l.LedgerEntrySeq); err != nil {
+		if err := rows.Scan(&l.LineNo, &l.AccountCode, &l.Debit, &l.Credit, &txAmt, &txCcy, &rate, &rateRef, &ruleRef, &dims, &l.Description, &l.LedgerEntrySeq, &taxRef, &srcRef); err != nil {
 			return nil, err
 		}
+		l.TaxDetailRef, l.SourceLineRef = deref(taxRef), deref(srcRef)
 		l.TransactionAmt, l.TransactionCcy, l.ExchangeRate, l.RateRef, l.RuleLineRef = deref(txAmt), deref(txCcy), deref(rate), deref(rateRef), deref(ruleRef)
 		if len(dims) > 0 {
 			_ = json.Unmarshal(dims, &l.Dimensions)
@@ -297,4 +300,89 @@ func getEventTx(ctx context.Context, t pgx.Tx, tenant, id string) (*kernel.Accou
 		return nil, kernelErr(err)
 	}
 	return &e, nil
+}
+
+// EventConsequences implements kernel.ConsequenceRepo: for each book, the journals an event posted there and the latest failed attempt,
+// which is how the completion of an event across several books is told (standard §4, §37).
+func (r *KernelRepo) EventConsequences(ctx context.Context, tenant, eventID string) (map[string]kernel.ConsequenceRecord, error) {
+	out := map[string]kernel.ConsequenceRecord{}
+	err := r.tx(ctx, tenant, func(t pgx.Tx) error {
+		rows, err := t.Query(ctx, `SELECT accounting_book_id::text, journal_id::text, posting_basis FROM event_posting_links
+			WHERE tenant_id = $1::uuid AND accounting_event_id = $2::uuid ORDER BY created_at, journal_id`, tenant, eventID)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var book string
+			var j kernel.ConsequenceJournal
+			if err := rows.Scan(&book, &j.JournalID, &j.Basis); err != nil {
+				rows.Close()
+				return err
+			}
+			rec := out[book]
+			rec.Journals = append(rec.Journals, j)
+			out[book] = rec
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		frows, err := t.Query(ctx, `SELECT DISTINCT ON (accounting_book_id) accounting_book_id::text, execution_id::text, status, COALESCE(failure_reason, ''), created_at
+			FROM posting_executions WHERE tenant_id = $1::uuid AND accounting_event_id = $2::uuid AND accounting_book_id IS NOT NULL AND status IN ('FAILED', 'QUARANTINED', 'RESOLVED')
+			ORDER BY accounting_book_id, created_at DESC`, tenant, eventID)
+		if err != nil {
+			return err
+		}
+		defer frows.Close()
+		for frows.Next() {
+			var book string
+			var f kernel.ConsequenceFailure
+			if err := frows.Scan(&book, &f.ExecutionID, &f.Status, &f.Reason, &f.At); err != nil {
+				return err
+			}
+			rec := out[book]
+			rec.LastFailure = &f
+			out[book] = rec
+		}
+		return frows.Err()
+	})
+	return out, kernelErr(err)
+}
+
+// IncompleteCandidates implements kernel.ConsequenceRepo: the events of an entity whose posting date is in the range and that have no
+// posting in at least one active book that has an active rule for them — a superset of the incomplete events, narrowed precisely by the
+// orchestration. It returns the first limit of them, oldest first, and how many there are in all.
+func (r *KernelRepo) IncompleteCandidates(ctx context.Context, tenant, entity string, from, to time.Time, limit int) ([]kernel.AccountingEvent, int, error) {
+	const from_ = ` FROM accounting_events ev CROSS JOIN LATERAL (SELECT COALESCE(ev.posting_date_requested, ev.document_date, ev.occurred_at)::date AS d) x
+		WHERE ev.tenant_id = $1::uuid AND ev.legal_entity_id = $2::uuid AND x.d BETWEEN $3::date AND $4::date
+		AND EXISTS (SELECT 1 FROM accounting_books b WHERE b.tenant_id = ev.tenant_id AND b.legal_entity_id = ev.legal_entity_id AND b.status = 'ACTIVE'
+			AND b.effective_from <= x.d AND (b.effective_to IS NULL OR b.effective_to > x.d)
+			AND EXISTS (SELECT 1 FROM posting_rule_sets rs WHERE rs.tenant_id = ev.tenant_id AND rs.event_type = ev.event_type AND rs.book_type = b.book_type
+				AND rs.accounting_framework_id = b.accounting_framework_id AND rs.jurisdiction IN ('', b.jurisdiction) AND rs.status = 'ACTIVE'
+				AND rs.effective_from <= x.d AND (rs.effective_to IS NULL OR rs.effective_to > x.d))
+			AND NOT EXISTS (SELECT 1 FROM event_posting_links l WHERE l.tenant_id = ev.tenant_id AND l.accounting_event_id = ev.accounting_event_id AND l.accounting_book_id = b.book_id))`
+	if _, err := uuid.Parse(entity); err != nil {
+		return []kernel.AccountingEvent{}, 0, nil
+	}
+	out := []kernel.AccountingEvent{}
+	total := 0
+	err := r.tx(ctx, tenant, func(t pgx.Tx) error {
+		if e := t.QueryRow(ctx, `SELECT count(*)`+from_, tenant, entity, from, to).Scan(&total); e != nil {
+			return e
+		}
+		rows, e := t.Query(ctx, `SELECT `+eventCols+from_+` ORDER BY ev.registered_at, ev.accounting_event_id LIMIT $5`, tenant, entity, from, to, limit)
+		if e != nil {
+			return e
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var ev kernel.AccountingEvent
+			if e := scanEvent(rows, &ev); e != nil {
+				return e
+			}
+			out = append(out, ev)
+		}
+		return rows.Err()
+	})
+	return out, total, kernelErr(err)
 }

@@ -113,6 +113,92 @@ func (h *Handler) getUnpostedEvents(w http.ResponseWriter, r *http.Request, prin
 	h.writeControlPopulationPage(w, page, err)
 }
 
+const populationFXRateObservations = "fx-rate-observations"
+
+var fxRateObservationsParams = map[string]bool{"legal_entity_id": true, "period_id": true, "rate_type": true, "limit": true, "cursor": true}
+
+// fxRateTypes are the rate types the ledger's fx_rates CHECK constraint allows.
+var fxRateTypes = map[string]bool{"SPOT": true, "TRANSACTION": true, "CLOSING": true, "AVERAGE": true, "HISTORICAL": true, "CONTRACTUAL": true, "APPROVED_EXTENSION": true}
+
+// getFXRateObservations serves the flow population of one month's ledger FX rates of one type. Both period_id and
+// rate_type are required, never defaulted: a coverage test over an unstated type or month would be meaningless.
+func (h *Handler) getFXRateObservations(w http.ResponseWriter, r *http.Request, principalID, tenantID string) {
+	q := r.URL.Query()
+	entity, limit, after, ok := parseCommonPopulationParams(w, q, fxRateObservationsParams)
+	if !ok {
+		return
+	}
+	period := q.Get("period_id")
+	if _, err := time.Parse("2006-01", period); err != nil || len(period) != 7 {
+		writeError(w, http.StatusBadRequest, "invalid_field", "period_id is required (YYYY-MM)")
+		return
+	}
+	rateType := q.Get("rate_type")
+	if !fxRateTypes[rateType] {
+		writeError(w, http.StatusBadRequest, "invalid_field", "rate_type is required (SPOT, TRANSACTION, CLOSING, AVERAGE, HISTORICAL, CONTRACTUAL or APPROVED_EXTENSION)")
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, entity, actionControlPopulationRead); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	page, err := h.store.QueryFXRateObservations(r.Context(), tenantID, domain.FXRateObservationsQuery{
+		PeriodID: period, RateType: rateType, Limit: limit, AfterRecordID: after})
+	h.writeControlPopulationPage(w, page, err)
+}
+
+const populationPostSealEntries = "post-seal-entries"
+
+var postSealEntriesParams = map[string]bool{"legal_entity_id": true, "limit": true, "cursor": true}
+
+func (h *Handler) getPostSealEntries(w http.ResponseWriter, r *http.Request, principalID, tenantID string) {
+	entity, limit, after, ok := parseCommonPopulationParams(w, r.URL.Query(), postSealEntriesParams)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, entity, actionControlPopulationRead); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	page, err := h.store.QueryPostSealEntries(r.Context(), tenantID, domain.PostSealEntriesQuery{
+		LegalEntityID: entity, Limit: limit, AfterRecordID: after})
+	h.writeControlPopulationPage(w, page, err)
+}
+
+const populationClearingBalanceAging = "clearing-balance-aging"
+
+var clearingBalanceAgingParams = map[string]bool{
+	"legal_entity_id": true,
+	"aged_before":     true,
+	"limit":           true,
+	"cursor":          true,
+}
+
+func (h *Handler) getClearingBalanceAging(w http.ResponseWriter, r *http.Request, principalID, tenantID string) {
+	q := r.URL.Query()
+	entity, limit, after, ok := parseCommonPopulationParams(w, q, clearingBalanceAgingParams)
+	if !ok {
+		return
+	}
+	// A date only: the cut-off is a business date compared with transaction_date, not an instant.
+	raw := q.Get("aged_before")
+	if _, err := time.Parse("2006-01-02", raw); err != nil || len(raw) != len("2006-01-02") {
+		writeError(w, http.StatusBadRequest, "invalid_field", "aged_before is required (YYYY-MM-DD)")
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, entity, actionControlPopulationRead); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	page, err := h.store.QueryClearingBalanceAging(r.Context(), tenantID, domain.ClearingBalanceAgingQuery{
+		LegalEntityID: entity,
+		AgedBefore:    raw,
+		Limit:         limit,
+		AfterRecordID: after,
+	})
+	h.writeControlPopulationPage(w, page, err)
+}
+
 const populationEventJournalBreaks = "event-journal-breaks"
 
 func (h *Handler) getEventJournalBreaks(w http.ResponseWriter, r *http.Request, principalID, tenantID string) {

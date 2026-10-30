@@ -117,12 +117,12 @@ type RevalRepo interface {
 
 // RevalService is the command side of revaluation.
 type RevalService struct {
-	Repo   RevalRepo
-	Books  Repo
-	Rates  FXSource
-	Dir    Directory
-	Gate   PeriodGate
-	Clock  func() time.Time
+	Repo  RevalRepo
+	Books Repo
+	Rates FXSource
+	Dir   Directory
+	Gate  PeriodGate
+	Clock func() time.Time
 }
 
 func (s *RevalService) now() time.Time {
@@ -152,7 +152,9 @@ func dec(s string) *big.Rat {
 // Run values the open foreign monetary items of a book at the policy's rate and posts the unrealized difference. A run that exists
 // for the entity, book and period is returned unchanged (Existing).
 func (s *RevalService) Run(ctx context.Context, tenant string, a Actor, req RevalRequest) (*RevalRun, error) {
-	bad := func(f, why string) error { return exc(FamData, "REVALUATION_INVALID", "%s: %s", f, why).with("field", f) }
+	bad := func(f, why string) error {
+		return exc(FamData, "REVALUATION_INVALID", "%s: %s", f, why).with("field", f)
+	}
 	if _, err := uuid.Parse(req.BookID); err != nil {
 		return nil, bad("book_id", "an accounting book id")
 	}
@@ -299,4 +301,3 @@ func (s *RevalService) Run(ctx context.Context, tenant string, a Actor, req Reva
 	}
 	return s.Repo.WriteRevaluation(ctx, plan)
 }
-

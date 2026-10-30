@@ -22,9 +22,9 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/general-ledger-svc/internal/domain"
+	svcenvelope "zoiko.io/general-ledger-svc/internal/envelope"
 	"zoiko.io/general-ledger-svc/internal/handler"
 	"zoiko.io/general-ledger-svc/internal/kernel"
-	svcenvelope "zoiko.io/general-ledger-svc/internal/envelope"
 	svcmiddleware "zoiko.io/general-ledger-svc/internal/middleware"
 	"zoiko.io/general-ledger-svc/internal/store"
 )
@@ -33,16 +33,17 @@ import (
 // force, the guard triggers refuse what the service would never ask for, and the HTTP surface is exercised end to end.
 
 type kenv struct {
-	admin  *pgxpool.Pool
-	app    *pgxpool.Pool
-	repo   *store.KernelRepo
-	svc    *kernel.Service
-	tenant string
-	entity string
-	ts     *httptest.Server
-	denied sync.Map
+	admin   *pgxpool.Pool
+	app     *pgxpool.Pool
+	repo    *store.KernelRepo
+	svc     *kernel.Service
+	tenant  string
+	entity  string
+	ts      *httptest.Server
+	denied  sync.Map
 	periods *fakePeriods
 	pg      *store.PgStore
+	obs     *recObs
 }
 
 type fakeAuthz struct{ e *kenv }
@@ -86,11 +87,13 @@ func newKEnv(t *testing.T) *kenv {
 	e.svc = &kernel.Service{Repo: e.repo}
 	e.periods = &fakePeriods{states: map[string]string{}}
 	e.pg = store.New(app, zap.NewNop(), store.WithEventRegion("uk"))
+	e.obs = &recObs{}
 	r := chi.NewRouter()
 	r.Use(svcmiddleware.TenantContext())
 	r.Use(svcenvelope.MiddlewareWithMode(svcenvelope.ServicePolicy(), svcenvelope.ModeObserve, nil))
 	handler.RegisterKernelRoutes(r, handler.NewKernel(e.svc, e.repo, e.repo, fakeUnits{"JPY": 0}, nil, fakeAuthz{e}, zap.NewNop()).
 		WithPeriodGate(handler.ClosePeriodGate{Close: e.periods, Authz: fakeAuthz{e}}).
+		WithObserver(e.obs).
 		WithSigner(kernel.HMACSigner{Key: []byte("test-signing-key-test-signing-key!!"), KeyID: "test-k1"}))
 	handler.RegisterRoutes(r, handler.New(e.pg, nopPublisher{}, fakeAuthz{e}, e.periods, kenvLogger()).
 		WithJournalControls(e.pg, handler.ManualJournalPolicy{EvidenceThresholdCents: 1000000}))

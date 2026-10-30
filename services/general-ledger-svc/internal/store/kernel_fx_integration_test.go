@@ -31,10 +31,10 @@ func TestExchangeRatesAreSourcedImmutableAndResolvedByPolicy(t *testing.T) {
 		t.Fatalf("a different rate under the same reference is refused: %d %v", st, b)
 	}
 	for what, body := range map[string][]string{
-		"same currency":   {"USD", "USD", "1", "SPOT"},
-		"zero":            {"USD", "GBP", "0", "SPOT"},
-		"13 decimals":     {"USD", "GBP", "0.1234567890123", "SPOT"},
-		"unknown type":    {"USD", "GBP", "0.8", "WHATEVER"},
+		"same currency": {"USD", "USD", "1", "SPOT"},
+		"zero":          {"USD", "GBP", "0", "SPOT"},
+		"13 decimals":   {"USD", "GBP", "0.1234567890123", "SPOT"},
+		"unknown type":  {"USD", "GBP", "0.8", "WHATEVER"},
 	} {
 		if st, b := e.rate(body[0], body[1], body[2], body[3], "2026-03-10T08:00:00Z", "ecb", "bad-"+what); st != 422 && st != 400 {
 			t.Fatalf("%s: %d %v", what, st, b)

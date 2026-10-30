@@ -61,6 +61,7 @@ func New(st store.Store, az AuthzChecker, provider provideradapter.Client, treas
 
 func RegisterRoutes(r chi.Router, h *Handler) {
 	RegisterProviderRoutes(r, h)
+	r.Get("/v1/control-populations/{population}", h.GetControlPopulation)
 	r.Route("/bnk06/attempts", func(r chi.Router) {
 		r.Post("/", h.PrepareAttempt)
 		r.Get("/{attemptID}", h.GetPaymentAttempt)

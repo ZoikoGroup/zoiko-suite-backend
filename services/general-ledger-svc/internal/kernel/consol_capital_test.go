@@ -124,3 +124,75 @@ func TestApprovedGroupAdjustmentsAreInTheConsolidatedFigures(t *testing.T) {
 		t.Fatalf("balanced adjustments keep the group book balanced: %v", pop.Consolidated)
 	}
 }
+
+// Equity translated at its historical rate (IAS 21.39(c)): the share capital stays at the rate of the day it arose, and the
+// difference to the closing rate is the translation reserve, not a retranslated equity.
+func TestEquityAtItsHistoricalRateStaysAtThatRateAndTheReserveTakesTheDifference(t *testing.T) {
+	c := capitalCompute("3000.00", "80")
+	c.Rates[rateKey("USD", EquityRateClass("2025-01-01"))] = ConsolRate{Currency: "USD", Class: "EQ", Policy: "SPOT_ON_DATE", Rate: "0.750000000000", RateID: "r-hist", AsOf: "2025-01-01"}
+	c.Members[1].Input.EquityRateDate = "2025-01-01"
+	pop, err := c.Compute()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 5000 USD of capital was 3750 GBP on the day: the group holds 80% = 3000, so the investment is eliminated with no goodwill
+	if pop.Elimination["G-3000"] != "3750.00" || pop.Elimination["G-1600"] != "-3000.00" || pop.Elimination["G-NCI"] != "-750.00" {
+		t.Fatalf("%v", pop.Elimination)
+	}
+	if _, has := pop.Elimination["G-GW"]; has {
+		t.Fatalf("no goodwill at the historical rate: %v", pop.Elimination)
+	}
+	// the other balance (5000 USD of cash) is at the closing rate, so the member no longer balances: 4000 - 3750 = 250 into the reserve
+	if pop.CTA[entUS] != "-250.00" {
+		t.Fatalf("reserve %v", pop.CTA)
+	}
+	var eq *ConsolLine
+	for i := range pop.Lines {
+		if pop.Lines[i].LocalAccount == "3000" && pop.Lines[i].LegalEntityID == entUS {
+			eq = &pop.Lines[i]
+		}
+	}
+	if eq == nil || eq.Class != "EQ" || eq.Rate != "0.750000000000" || eq.Translated != "-3750.00" {
+		t.Fatalf("%+v", eq)
+	}
+	var recorded bool
+	for _, r := range pop.Rates {
+		recorded = recorded || (r.Class == "EQ" && r.AsOf == "2025-01-01")
+	}
+	if !recorded {
+		t.Fatalf("the rate the run used is part of its record: %+v", pop.Rates)
+	}
+	if sumOf(pop.Consolidated).Sign() != 0 {
+		t.Fatalf("the group still balances: %v", pop.Consolidated)
+	}
+}
+
+func TestAnEquityAccountNotNamedForTheMemberKeepsTheClosingRate(t *testing.T) {
+	c := capitalCompute("3200.00", "80")
+	c.Mapping.AccountMap["3100"], c.AccountTypes["3100"] = "G-3100", "EQUITY"
+	c.Members[1].Lines = append(c.Members[1].Lines, snapLine("3100", "-100.00"), snapLine("1000", "100.00"))
+	c.Rates[rateKey("USD", EquityRateClass("2025-01-01"))] = ConsolRate{Currency: "USD", Class: "EQ", Rate: "0.750000000000"}
+	c.Members[1].Input.EquityRateDate = "2025-01-01"
+	pop, err := c.Compute()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, l := range pop.Lines {
+		switch {
+		case l.LegalEntityID == entUS && l.LocalAccount == "3000" && l.Class != "EQ":
+			t.Fatalf("the named account is historical: %+v", l)
+		case l.LegalEntityID == entUS && l.LocalAccount == "3100" && (l.Class != "BS" || l.Rate != "0.800000000000"):
+			t.Fatalf("retained earnings and the like stay at the closing rate: %+v", l)
+		}
+	}
+}
+
+func TestAMissingHistoricalRateStopsTheRun(t *testing.T) {
+	c := capitalCompute("3000.00", "80")
+	c.Members[1].Input.EquityRateDate = "2025-01-01"
+	if _, err := c.Compute(); err == nil {
+		t.Fatal("a historical rate that was not resolved must stop the run, never fall back to closing")
+	} else if e, ok := AsException(err); !ok || e.Code != "CONSOLIDATION_RATE_UNAVAILABLE" {
+		t.Fatalf("%v", err)
+	}
+}
