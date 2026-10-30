@@ -12,6 +12,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"zoiko.io/jurisdiction-rules-svc/internal/events"
 )
 
 const subLifecycle = `{"initial":"SUBMITTED","terminal":["ACCEPTED","REJECTED"],
@@ -180,6 +182,13 @@ func TestSubmissions_RegisterRefuseAndLifecycle(t *testing.T) {
 	assert.Equal(t, "AFTER_TERMINAL", rp["disposition"])
 	rp = s.report(t, id, ev("e7", "TELEPORTED", "", "2026-08-15T14:00:00Z"))
 	assert.Equal(t, "UNKNOWN_STATUS", rp["disposition"])
+
+	// s26 external-compliance events: registrations (not refused, replayed or invalid ones) and applied reports only.
+	assert.Equal(t, 2, s.e.pub.count(events.EventEInvoiceSubmitted), "INV-1001 and INV-2002; the idempotent replay emits nothing")
+	assert.Equal(t, 1, s.e.pub.count(events.EventEInvoiceStatus), "PROCESSING applied once; the duplicate callback is not re-announced")
+	assert.Equal(t, 1, s.e.pub.count(events.EventEInvoiceAccepted))
+	assert.Equal(t, 0, s.e.pub.count(events.EventEInvoiceRejected), "a REJECTED report after the final outcome is not applied")
+	assert.Equal(t, 0, s.e.pub.count(events.EventFilingSubmitted))
 
 	code, got := s.e.do("GET", "/v1/regulatory-submissions/"+id, "auditor", nil)
 	mustStatus(t, 200, code, got)

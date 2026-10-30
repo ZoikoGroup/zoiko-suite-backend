@@ -247,6 +247,9 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	// Entity applicability: mounted only when WithEntityApplicability was called.
 	if h.entities != nil {
 		r.Get("/v1/entities/{legal_entity_id}/jurisdictions", h.GetEntityJurisdictions)
+		if h.registry != nil {
+			r.Post(determinationPath, h.ResolveJurisdictionDecision)
+		}
 	}
 
 	if h.registry != nil {

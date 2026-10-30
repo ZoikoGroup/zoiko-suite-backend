@@ -1246,7 +1246,8 @@ paths:
       description: |
         Action JURISDICTION_PACK_VERSION_PUBLISH. Re-verifies the artifact and certification (never trusting an
         earlier check), requires every registered-pack dependency to be RELEASED, and for a hotfix its rollback target
-        to be RELEASED. Optional body {evidence_ref}. RELEASED, WITHDRAWN and EMERGENCY_BLOCKED are reachable only
+        to be RELEASED, and (s10) that none of its rules or obligation rules collides with another released pack's over an overlapping period (cross_pack_conflict:
+        the resolver refuses any such overlap between packs). Optional body {evidence_ref}. RELEASED, WITHDRAWN and EMERGENCY_BLOCKED are reachable only
         through these commands (database-enforced). Publishing again is a no-op.
       operationId: publishPackVersion
       security: [{ principalHeader: [] }]
@@ -1257,11 +1258,90 @@ paths:
       tags: [Admin, Packs]
       summary: "Withdraw a version: no new use, history stays resolvable"
 
-      description: "Action JURISDICTION_PACK_VERSION_WITHDRAW. Body: reason AND evidence_ref are required. Refused while another RELEASED version depends on it. Rolls its ACTIVE deployments back with the reason."
+      description: "Action JURISDICTION_PACK_VERSION_WITHDRAW. Body: reason AND evidence_ref are required. Refused while another RELEASED version depends on it. Opens a remediation case for the decisions already made with it (remediation_case_id). Rolls its ACTIVE deployments back with the reason."
       operationId: withdrawPackVersion
       security: [{ principalHeader: [] }]
       parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: pack_ref, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }]
       responses: { "200": { description: Withdrawn (or already). }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: 'In use by a released dependent, or wrong state.', content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } }
+  /v1/admin/packs/{pack_ref}/versions/{version}/supersede:
+    post:
+      tags: [Admin, Packs]
+      summary: "Supersede a RELEASED version with a newer one (RELEASED to SUPERSEDED): history stays resolvable"
+      description: |
+        Action JURISDICTION_PACK_VERSION_SUPERSEDE (ZS-JUR-001 s23). Body: superseded_by (the newer version of the same pack) and reason are required; evidence_ref is optional.
+
+        A superseded version stays resolvable for pinned replay but is no longer eligible for NEW decisions, so it is refused (409 operation_blocked, every reason at once) unless
+        nothing it served is left without a servant: the newer version must be RELEASED, strictly later (numeric order), cover the older version's period, jurisdictions, rules and
+        obligations (not_carried_forward), and be ACTIVE in every ring and region where the older one is (newer_not_deployed). Recorded as a release event with the reason and the
+        replacing version; announced as jurisdiction-pack.superseded. Repeating it changes nothing.
+
+        HTTP: 200 superseded (changed=true) or already (changed=false); 400 superseded_by or reason missing; 404 no such version; 409 operation_blocked or invalid_lifecycle_state.
+      operationId: supersedePackVersion
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }]
+      responses: { "200": { description: Superseded (or already). }, "400": { $ref: '#/components/responses/BadRequest' }, "404": { description: No such version. }, "409": { description: 'operation_blocked (reasons listed) or wrong state.' } }
+  /v1/admin/remediation-cases:
+    post:
+      tags: [Admin, Packs]
+      summary: Open a remediation case for decisions made with a pack version (withdrawals and rollbacks open one automatically)
+      description: |
+        Action REMEDIATION_CASE_OPEN (ZS-JUR-001 s23, s31, JUR-NEG-19). Body: pack_ref, version, reason (required); ring?, region?, evidence_ref?. Snapshots the decisions made with the
+        version (in that ring and region when given) into a case. Returns the case already open for the same version and scope instead of a second one. HTTP: 201 opened; 200 already open;
+        409 nothing_to_remediate (no decision was made with the version in that scope); 404 no such version; 400 missing field. Announced as jurisdiction-remediation.opened.
+      operationId: openRemediationCase
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }]
+      responses: { "200": { description: A case was already open. }, "201": { description: Opened. }, "400": { $ref: '#/components/responses/BadRequest' }, "404": { description: No such version. }, "409": { description: nothing_to_remediate. } }
+    get:
+      tags: [Admin, Packs]
+      summary: List remediation cases (newest first; ?status=OPEN|CLOSED)
+      description: Action REMEDIATION_CASE_VIEW. Paged (limit default 50, maximum 200).
+      operationId: listRemediationCases
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/PrincipalID' }]
+      responses: { "200": { description: Cases. }, "400": { $ref: '#/components/responses/BadRequest' } }
+  /v1/admin/remediation-cases/{case_id}:
+    get:
+      tags: [Admin, Packs]
+      summary: Read a remediation case with its progress (total, dispositioned, pending, by disposition)
+      description: Action REMEDIATION_CASE_VIEW.
+      operationId: getRemediationCase
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/PrincipalID' }]
+      responses: { "200": { description: The case. }, "404": { description: No such case. } }
+  /v1/admin/remediation-cases/{case_id}/decisions:
+    get:
+      tags: [Admin, Packs]
+      summary: List the decisions of a case with their dispositions (?pending=true for those still to do)
+      description: Action REMEDIATION_CASE_VIEW. Paged (limit default 100, maximum 500). The decisions are the recorded evidence ledger rows; they are never changed.
+      operationId: listRemediationDecisions
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/PrincipalID' }]
+      responses: { "200": { description: Decisions. }, "404": { description: No such case. } }
+  /v1/admin/remediation-cases/{case_id}/dispositions:
+    post:
+      tags: [Admin, Packs]
+      summary: Record what was done about decisions of an open case (1 to 100, all or nothing)
+      description: |
+        Action REMEDIATION_CASE_DISPOSE. Body: dispositions [{decision_id, disposition, evidence_ref, note?, new_decision_id?}]. disposition is RECONFIRMED (re-checked and stands), NOT_AFFECTED,
+        RECALCULATED or SUPERSEDED_BY_NEW_DECISION (the last two name new_decision_id, a decision made with a DIFFERENT pack version than the one under remediation). evidence_ref is required.
+        Repeating an identical disposition is a replay; a different one for the same decision is refused, because dispositions are final.
+        HTTP: 200 {recorded, replayed}; 400 invalid disposition; 404 no such case; 409 case closed or disposition_differs; 422 decision_not_in_case or remediation_refused.
+      operationId: recordRemediationDispositions
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }]
+      responses: { "200": { description: Recorded. }, "400": { $ref: '#/components/responses/BadRequest' }, "404": { description: No such case. }, "409": { description: Closed or different disposition. }, "422": { description: Refused. } }
+  /v1/admin/remediation-cases/{case_id}/close:
+    post:
+      tags: [Admin, Packs]
+      summary: Close a remediation case once every decision has a disposition
+      description: |
+        Action REMEDIATION_CASE_CLOSE. Body: note (required). Refused while any decision has no disposition (409 operation_blocked) and for the person who opened the case (403): segregation of
+        duties, also enforced by the database. Closing a closed case changes nothing (changed=false). Announced as jurisdiction-remediation.closed.
+      operationId: closeRemediationCase
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }]
+      responses: { "200": { description: Closed (or already). }, "400": { $ref: '#/components/responses/BadRequest' }, "403": { description: The opener cannot close their own case. }, "404": { description: No such case. }, "409": { description: operation_blocked (decisions pending). } }
   /v1/admin/packs/{pack_ref}/versions/{version}/block:
     post: { tags: [Admin, Packs], summary: Emergency stop (RELEASED to EMERGENCY_BLOCKED), description: "Action JURISDICTION_PACK_VERSION_BLOCK. Body: reason (required). The resolver stops using it within its cache TTL.", operationId: blockPackVersion, security: [{ principalHeader: [] }], parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: pack_ref, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }], responses: { "200": { description: Blocked. }, "409": { description: Not RELEASED., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } } }
   /v1/admin/packs/{pack_ref}/versions/{version}/unblock:
@@ -1290,7 +1370,7 @@ paths:
         Action JURISDICTION_PACK_VERSION_ROLLBACK. Body: ring, region, restore_version, reason (all required). The restore
         version must be the same pack, strictly older, RELEASED, re-verify, and have been deployed in that scope before.
         Rollback changes FUTURE resolution only (JUR-NEG-19): the response counts the decisions already made with the
-        rolled-back version in that scope, states that remediating them is a separate workflow (not built), and states that
+        rolled-back version in that scope, opens a remediation case for them in the same transaction (remediation_case_id; see /v1/admin/remediation-cases), and states that
         no reconciliation was performed.
       operationId: rollbackDeployment
       security: [{ principalHeader: [] }]
@@ -1546,6 +1626,128 @@ paths:
       security: [{ principalHeader: [] }]
       parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }]
       responses: { "200": { description: 'Mapping resolved, or no rule applies.' }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: AMBIGUOUS or idempotency_conflict., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }, "422": { description: Explicit refusal., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }, "503": { description: pack_unverified., content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } } }
+
+  /v1/jurisdiction-decisions:resolve:
+    post:
+      tags: [Resolver]
+      summary: Determine which jurisdiction applies to a legal entity (a claimed jurisdiction never widens the authorised set)
+      description: |
+        Action JURISDICTION_DECISION_RESOLVE (ZS-JUR-001 s9, s25). Headers: X-Tenant-Id (required: assignments are tenant data), Idempotency-Key?. Body: legal_entity_id,
+        purpose (TAX, FILING or ANY), effective_at (RFC 3339), claimed_jurisdiction? (a jurisdiction code).
+
+        The decision rests on the entity's authorised assignments, projected from tenant-entity-registry-svc, in force at effective_at and relevant to the purpose
+        (TAX: ENTITY_PRIMARY, PRIMARY, SECONDARY, TAX_ONLY; FILING: ENTITY_PRIMARY, PRIMARY, SECONDARY, FILING_ONLY). A claimed jurisdiction is an input fact: it can select
+        among jurisdictions the entity is authorised for and can never add one (JUR-NEG-05), and it is never used when nothing is authorised. Each candidate carries its rollout
+        support answer (SUPPORTED, NOT_YET_SUPPORTED, SUSPENDED, NO_RELEASED_PACK or NO_ROLLOUT) and the assignment records it rests on.
+
+        This does NOT decide place of supply, situs or any transaction-level question (no such rules exist yet). The route exists only where the entity projection is wired.
+        Recorded as evidence (decision_kind JURISDICTION); the platform-wide ledger holds a digest of tenant and entity, never their ids. Announced as jurisdiction-decision.resolved.
+
+        HTTP: 200 JURISDICTION_DETERMINED; 409 AMBIGUOUS_JURISDICTION (several authorised and nothing selects between them) or idempotency_conflict;
+        422 NO_APPLICABLE_JURISDICTION or CLAIM_NOT_AUTHORISED; 401 no X-Tenant-Id; 503 store unavailable.
+      operationId: resolveJurisdictionDecision
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }]
+      responses: { "200": { description: 'Jurisdiction determined.' }, "400": { $ref: '#/components/responses/BadRequest' }, "401": { description: X-Tenant-Id missing. }, "409": { description: AMBIGUOUS_JURISDICTION or idempotency_conflict. }, "422": { description: NO_APPLICABLE_JURISDICTION or CLAIM_NOT_AUTHORISED. }, "503": { description: Store unavailable. } }
+
+  /v1/registration-obligations:resolve:
+    post:
+      tags: [Resolver]
+      summary: List the obligations that apply for an entity's registrations and derive each due date
+      description: |
+        Action REGISTRATION_OBLIGATION_RESOLVE (ZS-JUR-001 s15, s16). Header Idempotency-Key?. Body: jurisdiction, as_of (YYYY-MM-DD), registrations (1 to 25 of
+        {registration_code, registration_date, deregistration_date?}), facts? (the period facts obligations anchor on: period_end, event_date, anniversary_date with
+        anchor_year, extension_days with extension_evidence_ref), pack_ref?/pack_version?. Header Idempotency-Key.
+
+        A registration is in force on as_of when it started on or before it and has not ended (the deregistration date is the first day it no longer applies). For each
+        registration in force, the registration TYPE rule (registration.obligations) names the obligation codes it brings, and each due date is derived by the same engine as
+        POST /v1/obligation-calculations:calculate with registration_date set from the registration. Per obligation the answer is DUE_DATE_CALCULATED with the full derivation,
+        or the reason there is none (NO_OBLIGATION_RULE, INVALID_FACTS, AMBIGUOUS, ...), with a reason when the cause is missing period facts. A registration that is not in force, or whose
+        type is unknown, brings nothing and says so. Nothing is assumed.
+
+        The caller sends type codes and dates, never a registration number; nothing is stored about the registration. Tracking each obligation (status, overdue, filing) belongs to
+        obligations-svc. Recorded as evidence (decision_kind APPLICABILITY).
+
+        HTTP: 200 APPLICABILITY_RESOLVED (per-item outcomes are inside); 400 invalid request; 409 idempotency_conflict; 503 pack_unverified.
+      operationId: resolveRegistrationObligations
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }]
+      responses: { "200": { description: 'Applicability resolved.' }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: idempotency_conflict. }, "503": { description: pack_unverified. } }
+
+  /v1/registration-identifiers:validate:
+    post:
+      tags: [Resolver]
+      summary: Check a registration identifier's format against the registration type in force (never stores the identifier)
+      description: |
+        Action REGISTRATION_IDENTIFIER_VALIDATE (ZS-JUR-001 s16). Body: jurisdiction, registration_code, identifier, as_of (YYYY-MM-DD; the rule in force
+        that day applies), pack_ref?/pack_version?. Header Idempotency-Key.
+
+        A FORMAT check only: whether the number is actually registered is for the authority to confirm. The identifier is normalised as the rule declares
+        (NONE, UPPER, UPPER_STRIP_SEPARATORS) and matched with a linear-time pattern. The response and the evidence ledger hold a sha256 digest of the
+        normalised identifier, never the identifier. Returns the registration kind, authority, evidence_required and threshold_monitor the type names.
+        Recorded as evidence (decision_kind REGISTRATION).
+
+        HTTP: 200 IDENTIFIER_VALID, IDENTIFIER_INVALID or NO_RULE; 409 AMBIGUOUS or idempotency_conflict; 422 UNSUPPORTED_JURISDICTION or NO_PARAMETERS; 503 pack_unverified.
+      operationId: validateRegistrationIdentifier
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }]
+      responses: { "200": { description: 'Identifier checked, or no rule applies.' }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: AMBIGUOUS or idempotency_conflict. }, "422": { description: Explicit refusal. }, "503": { description: pack_unverified. } }
+
+  /v1/licences:evaluate:
+    post:
+      tags: [Resolver]
+      summary: Derive a licence's validity window and status as of a date
+      description: |
+        Action LICENCE_EVALUATE (ZS-JUR-001 s16). Body: jurisdiction, licence_code, issue_date, expiry_date? (the last valid day as printed on the licence;
+        optional when the type has a fixed term), as_of (all YYYY-MM-DD), pack_ref?/pack_version?. Header Idempotency-Key.
+
+        Returns valid_until, renewal_window_opens, grace_ends_on, days_to_expiry and a status: NOT_YET_VALID, ACTIVE, RENEWAL_WINDOW, IN_GRACE or EXPIRED. A derived
+        expiry is the day before the term anniversary; a stated expiry beyond the type's maximum term is refused (LICENCE_TERM_EXCEEDED), not trusted.
+        Recorded as evidence (decision_kind LICENCE).
+
+        HTTP: 200 LICENCE_EVALUATED or NO_RULE; 409 AMBIGUOUS or idempotency_conflict; 422 UNSUPPORTED_JURISDICTION, INVALID_FACTS, LICENCE_TERM_EXCEEDED or NO_PARAMETERS; 503 pack_unverified.
+      operationId: evaluateLicence
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }]
+      responses: { "200": { description: 'Licence evaluated, or no rule applies.' }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: AMBIGUOUS or idempotency_conflict. }, "422": { description: Explicit refusal. }, "503": { description: pack_unverified. } }
+
+  /v1/scheme-elections:evaluate:
+    post:
+      tags: [Resolver]
+      summary: Check scheme eligibility and the earliest cancellation date (records no election)
+      description: |
+        Action SCHEME_ELECTION_EVALUATE (ZS-JUR-001 s16). Body: jurisdiction, scheme_code, metric_value (a non-negative decimal string, such as "120000"), start_date,
+        cancel_date? (when a cancellation would be asked for), as_of (all YYYY-MM-DD), pack_ref?/pack_version?. Header Idempotency-Key.
+
+        Eligibility is one exact comparison of the metric to the scheme's threshold (LT, LTE, GT or GTE). With a lock-in, an election is locked in until start_date plus
+        the lock-in; a cancellation takes effect at the later of cancel_date plus the notice period and the lock-in end (deferred_by_lock_in tells the caller which).
+        This service records no election: that is a tenant tax fact owned by the Tax domain. Recorded as evidence (decision_kind SCHEME).
+
+        HTTP: 200 SCHEME_ELIGIBLE, SCHEME_NOT_ELIGIBLE or NO_RULE; 409 AMBIGUOUS or idempotency_conflict; 422 UNSUPPORTED_JURISDICTION, INVALID_FACTS or NO_PARAMETERS; 503 pack_unverified.
+      operationId: evaluateSchemeElection
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }]
+      responses: { "200": { description: 'Eligibility decided, or no rule applies.' }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: AMBIGUOUS or idempotency_conflict. }, "422": { description: Explicit refusal. }, "503": { description: pack_unverified. } }
+
+  /v1/threshold-monitors:evaluate:
+    post:
+      tags: [Resolver]
+      summary: Evaluate dated observations against a threshold monitor; returns the breach and effective dates
+      description: |
+        Action THRESHOLD_MONITOR_EVALUATE (ZS-JUR-001 s16). Body: jurisdiction, monitor_code, as_of (YYYY-MM-DD), observations ([{date, amount}], at most 5000; amounts are
+        non-negative decimal strings), pack_ref?/pack_version?. Header Idempotency-Key.
+
+        The period is STATIC (a yearly start such as 1 April) or ROLLING (the last N months, (as_of minus N months, as_of]). Amounts are summed exactly (never floating point)
+        and compared with GT or GTE. Observations dated after as_of are ignored, so a re-run for an earlier date reproduces the earlier answer. A breach reports the first date
+        the threshold was met and when it takes effect (IMMEDIATE, NEXT_PERIOD_START, DAYS_AFTER or END_OF_MONTH_FOLLOWING). For a REGISTRATION_REQUIRED breach,
+        registration_effective_date is the value to pass to the obligation engine as its registration_date fact. A monitor never registers anyone.
+        Recorded as evidence (decision_kind THRESHOLD).
+
+        HTTP: 200 THRESHOLD_EVALUATED or NO_RULE; 409 AMBIGUOUS or idempotency_conflict; 422 UNSUPPORTED_JURISDICTION, INVALID_FACTS or NO_PARAMETERS; 503 pack_unverified.
+      operationId: evaluateThresholdMonitor
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }]
+      responses: { "200": { description: 'Threshold evaluated, or no rule applies.' }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: AMBIGUOUS or idempotency_conflict. }, "422": { description: Explicit refusal. }, "503": { description: pack_unverified. } }
 
   /v1/submission-profiles:resolve:
     post:
