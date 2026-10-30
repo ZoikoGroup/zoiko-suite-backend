@@ -119,8 +119,6 @@ func MarketName(code string) string {
 	return "that country"
 }
 
-var marketNames = map[string]string{"US": "the United States", "GB": "the United Kingdom", "IE": "Ireland"}
-
 // BoundaryTemplates are Doc 02's approved replies for intents whose answer
 // needs an approved source that does not exist yet. They are used only when
 // no retrieved article is tagged for the intent, so an approved article

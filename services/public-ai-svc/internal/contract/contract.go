@@ -199,6 +199,12 @@ type Citation struct {
 	SourceVersionID string   `json:"source_version_id"`
 	ClaimIDs        []string `json:"claim_ids"`
 	URLKey          string   `json:"url_key"`
+	// Title, RouteKey and URL are resolved server-side from the signed KB
+	// and route registries when structured responses are on (ADR-008). URL
+	// is omitted until a real, allowlisted page exists.
+	Title    string `json:"title,omitempty"`
+	RouteKey string `json:"route_key,omitempty"`
+	URL      string `json:"url,omitempty"`
 }
 
 type Action struct {
@@ -247,6 +253,84 @@ type Envelope struct {
 	Suggestions []Chip `json:"suggestions,omitempty"`
 	// Draft: answered from DRAFT_PENDING_REVIEW articles (local/dev only).
 	Draft bool `json:"draft,omitempty"`
+	// Structured response fields (ADR-008), sent only while the
+	// structured_response_enabled flag is on. Outcome types the status;
+	// FollowUps come from the approved Doc 02 follow-up map, never the
+	// model; CTA is at most one primary and one secondary official route.
+	Outcome   string     `json:"outcome,omitempty"`
+	FollowUps []FollowUp `json:"followups,omitempty"`
+	CTA       *CTA       `json:"cta,omitempty"`
+}
+
+// Typed outcomes (ADR-008). CLARIFY keeps its own outcome: it asks, it
+// neither answers nor abstains.
+const (
+	OutcomeGrounded     = "GROUNDED"
+	OutcomeClarify      = "CLARIFY"
+	OutcomeAbstain      = "ABSTAIN"
+	OutcomeSafeFallback = "SAFE_FALLBACK"
+	OutcomeRefused      = "REFUSED"
+	OutcomeHandoffOffer = "HANDOFF_OFFER"
+)
+
+// MaxFollowUps bounds followups[] (ADR-008).
+const MaxFollowUps = 4
+
+// OutcomeFor maps a status to its typed outcome.
+func OutcomeFor(s Status) string {
+	switch s {
+	case Answered:
+		return OutcomeGrounded
+	case Clarify:
+		return OutcomeClarify
+	case RefusedAction:
+		return OutcomeRefused
+	case Handoff:
+		return OutcomeHandoffOffer
+	case Unavailable:
+		return OutcomeSafeFallback
+	default:
+		return OutcomeAbstain
+	}
+}
+
+var validOutcome = map[string]bool{OutcomeGrounded: true, OutcomeClarify: true, OutcomeAbstain: true,
+	OutcomeSafeFallback: true, OutcomeRefused: true, OutcomeHandoffOffer: true}
+
+// FollowUp is one approved follow-up question: the fixed message it sends
+// and the intent that message classifies to.
+type FollowUp struct {
+	ID       string `json:"id"`
+	Label    string `json:"label"`
+	IntentID string `json:"intent_id"`
+	Message  string `json:"message"`
+}
+
+// CTALink is one official route offered as a call to action. URL is set
+// only when the signed route registry has a real page for it.
+type CTALink struct {
+	RouteKey string `json:"route_key"`
+	Label    string `json:"label"`
+	URL      string `json:"url,omitempty"`
+}
+
+// CTA is at most one primary and one secondary call to action.
+type CTA struct {
+	Primary   *CTALink `json:"primary,omitempty"`
+	Secondary *CTALink `json:"secondary,omitempty"`
+}
+
+// MenuResponse is the body of GET /menu: the guided topic menu (ADR-008).
+type MenuResponse struct {
+	SchemaVersion string         `json:"schema_version"`
+	Categories    []MenuCategory `json:"categories"`
+}
+
+// MenuCategory is one Doc 02 §22 page family and its questions.
+type MenuCategory struct {
+	ID    string     `json:"id"`
+	Label string     `json:"label"`
+	Items []FollowUp `json:"items"`
 }
 
 // ConfigResponse is the body of GET /config (Doc 05 §15).
@@ -390,6 +474,27 @@ func (e *Envelope) Validate() error {
 	for _, c := range e.Citations {
 		if c.SourceVersionID == "" || c.URLKey == "" {
 			return errors.New("citation")
+		}
+	}
+	if e.Outcome != "" && (!validOutcome[e.Outcome] || e.Outcome != OutcomeFor(e.Status)) {
+		return errors.New("outcome")
+	}
+	if len(e.FollowUps) > MaxFollowUps {
+		return errors.New("too many followups")
+	}
+	for _, f := range e.FollowUps {
+		if f.ID == "" || f.Label == "" || f.Message == "" || !intentRe.MatchString(f.IntentID) {
+			return errors.New("followup")
+		}
+	}
+	if e.CTA != nil {
+		for _, l := range []*CTALink{e.CTA.Primary, e.CTA.Secondary} {
+			if l != nil && (l.RouteKey == "" || l.Label == "") {
+				return errors.New("cta")
+			}
+		}
+		if e.CTA.Primary == nil && e.CTA.Secondary != nil {
+			return errors.New("cta secondary without primary")
 		}
 	}
 	if e.Status == Answered && len(e.Citations) == 0 {

@@ -57,7 +57,11 @@ type Config struct {
 	SeedOnStart bool
 	// KBAllowDraft serves DRAFT_PENDING_REVIEW articles (labelled "Draft
 	// content") in local/dev only; it is refused anywhere else.
-	KBAllowDraft              bool
+	KBAllowDraft bool
+	// StructuredResponseDev turns structured_response_enabled on at start
+	// for the in-memory or seeded dev dataset (dev/test only). Elsewhere the
+	// flag changes only through an audited flags.Set.
+	StructuredResponseDev     bool
 	MaxBodyBytes              int64
 	ModelTimeout              time.Duration
 	RateLimitPerIPPerMinute   int
@@ -109,6 +113,7 @@ func Load() (Config, error) {
 		Dataset:                   env("PUBLIC_AI_DATASET", "public-kb"),
 		KBAllowDraft:              envBool("KB_ALLOW_DRAFT", envDefaultDev()),
 		SeedOnStart:               envBool("PUBLIC_AI_SEED_ON_START", false),
+		StructuredResponseDev:     envBool("PUBLIC_AI_STRUCTURED_RESPONSE", false),
 		MaxBodyBytes:              int64(envInt("PUBLIC_AI_MAX_BODY_BYTES", 16*1024)),
 		ModelTimeout:              envDuration("PUBLIC_AI_MODEL_TIMEOUT", 6*time.Second),
 		RateLimitPerIPPerMinute:   envInt("PUBLIC_AI_RATE_LIMIT_IP_PER_MIN", 60),
@@ -165,6 +170,8 @@ func (c Config) Validate() error {
 		return fmt.Errorf("KB_ALLOW_DRAFT is local/dev only: production content must pass two-person approval")
 	case c.SeedOnStart && !devLike:
 		return fmt.Errorf("PUBLIC_AI_SEED_ON_START is dev/test only")
+	case c.StructuredResponseDev && !devLike:
+		return fmt.Errorf("PUBLIC_AI_STRUCTURED_RESPONSE is dev/test only: elsewhere set structured_response_enabled with an approval")
 	}
 	if err := validateRetention(c); err != nil {
 		return err
