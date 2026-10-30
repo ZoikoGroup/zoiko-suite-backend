@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	_ "embed"
 	"encoding/hex"
+	"strings"
 )
 
 // Prompt layers, verbatim from the Suivo master implementation prompt §6.2
@@ -57,4 +58,18 @@ func shortHash(parts ...string) string {
 		h.Write([]byte{0})
 	}
 	return hex.EncodeToString(h.Sum(nil))[:16]
+}
+
+// ListMin is the number of parallel items from which an answer is a list,
+// as ServerContract asks of the model (Doc 02 §16: scannable, answer first).
+const ListMin = 3
+
+// ListStatements joins verified claim statements, each verbatim: one or two
+// read as a sentence run, three or more as one "- " line per statement, so
+// a deterministic claim answer has the same shape a model answer must have.
+func ListStatements(statements []string) string {
+	if len(statements) < ListMin {
+		return strings.Join(statements, " ")
+	}
+	return "- " + strings.Join(statements, "\n- ")
 }

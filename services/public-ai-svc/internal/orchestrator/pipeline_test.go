@@ -84,8 +84,13 @@ func TestClarificationCarriesPlan(t *testing.T) {
 		t.Fatalf("turn 1: %+v", r1)
 	}
 	r2 := e.Pipeline.Answer(ctx, orchestrator.Input{Message: "In the United States, per month", Pending: r1.Pending, Locale: "en-US"})
-	if r2.Status != contract.Answered || !strings.Contains(r2.Text, "XTS 49.00") || strings.Contains(r2.Text, "XTS 19.00") || r2.Pending != nil {
+	if r2.Status != contract.Answered || !strings.Contains(r2.Text, "XTS 49.00") || strings.Contains(r2.Text, "XTS 19.00") {
 		t.Fatalf("turn 2: %+v", r2)
+	}
+	// After the answer only the question stays open, for "what about the UK?"
+	// (Doc 02 G05): the old plan and billing are not carried.
+	if p := r2.Pending; p == nil || !p.Answered || p.Intent != "I05" || p.PlanName != "" || p.BillingCadence != "" {
+		t.Fatalf("turn 2 pending: %+v", r2.Pending)
 	}
 	// A new topic drops the carry-over.
 	r3 := e.Pipeline.Answer(ctx, orchestrator.Input{Message: "Can I book a demo?", Pending: r1.Pending})

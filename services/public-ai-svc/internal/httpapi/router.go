@@ -40,7 +40,9 @@ type Deps struct {
 	Answerer orchestrator.Answerer
 	Config   ConfigSource
 	Routes   RouteResolver
-	Ready    ReadinessFunc
+	// Flags, when set, gates GET /menu and the structured turn fields.
+	Flags FlagSource
+	Ready ReadinessFunc
 	// Limiter, when set, is applied to the public API (STEP 11).
 	Limiter func(http.Handler) http.Handler
 }
@@ -94,6 +96,7 @@ func (s *Server) Router() http.Handler {
 		})
 		if s.deps.Config != nil {
 			api.Get("/config", s.getConfig)
+			api.Get("/menu", s.getMenu)
 		}
 		if s.deps.Sessions != nil {
 			api.Post("/sessions", s.createSession)

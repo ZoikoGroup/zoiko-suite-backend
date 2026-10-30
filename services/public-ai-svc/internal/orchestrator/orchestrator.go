@@ -31,6 +31,10 @@ type Pending struct {
 	BillingCadence string `json:"billing,omitempty"`
 	Integration    string `json:"integration,omitempty"`
 	Clarifications int    `json:"clarifications"`
+	// Answered: the question was already answered for one market. A
+	// follow-up that names another market, plan or billing asks it again
+	// with only the new slots (Doc 02 G05: old slots and price are dropped).
+	Answered bool `json:"answered,omitempty"`
 }
 
 // Result is the orchestrator outcome. The HTTP layer adds turn identifiers.

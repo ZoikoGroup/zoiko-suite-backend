@@ -91,7 +91,9 @@ func TestG10_SOC2ISOCertified(t *testing.T) {
 
 func TestG11_DataNeverLeavesUK(t *testing.T) {
 	r := newH(t).ask("Can you promise our data never leaves the UK?")
-	lacks(t, r, "never leaves", "guarantee")
+	// No promise. Doc 02 T11's approved wording itself says "I cannot
+	// guarantee…", so only affirmative guarantees are banned.
+	lacks(t, r, "never leaves", "we guarantee", "guaranteed", "is guaranteed")
 }
 
 func TestG12_TaxFilingGermany(t *testing.T) {

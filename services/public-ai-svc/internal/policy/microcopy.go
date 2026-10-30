@@ -38,7 +38,8 @@ var Microcopy = map[string]string{
 	"ui.privacy.link":             "Privacy and AI notice",
 	"ui.placeholder":              "Ask about ZoikoSuite",
 	"ui.welcome":                  "Hi, I can explain ZoikoSuite plans, modules, trust and integrations. I can't see or change any account.",
-	"ui.thinking":                 "Checking approved sources…",
+	"ui.loading":                  "Looking for verified information…", // Doc 02 §21
+	"ui.thinking":                 "Looking for verified information…", // older widgets read this key
 	"ui.clear":                    "Clear chat",
 	"ui.clear.notice":             "Clearing the chat ends this session in your browser. It doesn't erase records the service must keep under its retention policy.",
 	"ui.sensitive.warning":        "Looks like sensitive info. Remove it before sending.",

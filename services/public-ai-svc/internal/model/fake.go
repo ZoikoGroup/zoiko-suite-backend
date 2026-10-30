@@ -149,7 +149,11 @@ func (f *Fake) Generate(ctx context.Context, req Request) (Draft, error) {
 			}
 		}
 	}
-	d.Text = joinParts(parts)
+	if len(req.Claims) > 0 {
+		d.Text = ListStatements(parts) // same shape the model contract asks for
+	} else {
+		d.Text = joinParts(parts)
+	}
 
 	switch f.Fault {
 	case FaultInjectURL:
