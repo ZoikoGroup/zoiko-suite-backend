@@ -64,9 +64,9 @@ type stubStore struct {
 	currentMappings map[string]*domain.AccountMapping // by "tenant|mapping_key"
 	setMappingErr   error
 
-	ledgerEntries      []domain.LedgerEntry
+	ledgerEntries []domain.LedgerEntry
 	// lastLedgerFilter is the filter QueryLedger was last called with.
-	lastLedgerFilter domain.QueryLedgerFilter
+	lastLedgerFilter   domain.QueryLedgerFilter
 	postingsPage       *domain.AccountPostingsPage
 	postingsErr        error
 	postingsCalls      []postingsCall
@@ -726,7 +726,7 @@ func (s *stubStore) AmendDraftJournal(_ context.Context, _, journalID string, up
 	return nil
 }
 
-func (s *stubStore) QueryLedger(_ context.Context, _ string, filter domain.QueryLedgerFilter, _ int) ([]domain.LedgerEntry, error) {
+func (s *stubStore) QueryLedger(_ context.Context, _ string, filter domain.QueryLedgerFilter, limit int) ([]domain.LedgerEntry, bool, error) {
 	s.lastLedgerFilter = filter
 	var out []domain.LedgerEntry
 	for _, e := range s.ledgerEntries {
@@ -736,9 +736,15 @@ func (s *stubStore) QueryLedger(_ context.Context, _ string, filter domain.Query
 		if filter.MaxEntrySeq != nil && e.EntrySeq > *filter.MaxEntrySeq {
 			continue
 		}
+		if filter.AfterEntrySeq != nil && e.EntrySeq <= *filter.AfterEntrySeq {
+			continue
+		}
 		out = append(out, e)
 	}
-	return out, nil
+	if limit > 0 && len(out) > limit {
+		return out[:limit], true, nil
+	}
+	return out, false, nil
 }
 
 func (s *stubStore) QueryAccountPostings(_ context.Context, tenantID string, q domain.AccountPostingsQuery) (*domain.AccountPostingsPage, error) {

@@ -874,6 +874,13 @@ type QueryLedgerFilter struct {
 	FiscalPeriod  string
 	JournalID     string
 	MaxEntrySeq   *int64 // set by QueryLedgerAsOf to reconstruct a point-in-time view
+	// AfterEntrySeq is QueryLedger's own keyset cursor (A15): entries with
+	// entry_seq strictly greater than this are returned. Unlike MaxEntrySeq
+	// (a point-in-time watermark), this narrows which page of an otherwise
+	// unbounded result is being read, not which entries exist as of some
+	// moment — the two can be set together (QueryLedgerAsOf has no cursor
+	// support today, but nothing prevents it).
+	AfterEntrySeq *int64
 
 	// TransactionDateFrom/To bound entries by transaction_date, inclusive at
 	// both ends; a zero Date leaves that end open. A bank reconciliation
@@ -885,6 +892,18 @@ type QueryLedgerFilter struct {
 	// status. ledger_entries is append-only, so a REVERSED journal's entries
 	// stay listed; a reader that needs live postings asks for FINALIZED.
 	JournalStatus JournalStatus
+}
+
+// LedgerEntryPage is one keyset page of QueryLedger (A15). NextCursor is the
+// last returned entry's own EntrySeq — pass it back as after_entry_seq to
+// fetch the next page — and is present exactly when more rows exist, so a
+// full page is never indistinguishable from the end of the result.
+// QueryLedgerAsOf does not use this type: it keeps its pre-existing bare
+// array response, since a point-in-time snapshot read does not need
+// pagination to be read correctly (see its own doc comment).
+type LedgerEntryPage struct {
+	Entries    []LedgerEntry `json:"entries"`
+	NextCursor *int64        `json:"next_cursor,omitempty"`
 }
 
 // QueryAccountBalanceRequest is QueryAccountBalance's input — reads the

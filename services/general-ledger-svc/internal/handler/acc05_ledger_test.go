@@ -2,6 +2,7 @@ package handler_test
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"testing"
 
@@ -30,12 +31,63 @@ func TestQueryLedger_ScopedToRequestedEntity_OtherEntityLeaksNothing(t *testing.
 	if resp.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", resp.Code, resp.Body.String())
 	}
-	var got []domain.LedgerEntry
+	var got domain.LedgerEntryPage
 	if err := json.Unmarshal(resp.Body.Bytes(), &got); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if len(got) != 1 || got[0].LedgerEntryID != "e1" {
-		t.Fatalf("expected only entity-a's entry, got %+v — cross-book query leakage", got)
+	if len(got.Entries) != 1 || got.Entries[0].LedgerEntryID != "e1" {
+		t.Fatalf("expected only entity-a's entry, got %+v — cross-book query leakage", got.Entries)
+	}
+	if got.NextCursor != nil {
+		t.Fatalf("expected no next_cursor for a complete page, got %v", *got.NextCursor)
+	}
+}
+
+// A15's keyset cursor: a page with more rows than the caller's limit
+// carries next_cursor set to the last returned entry_seq, and
+// after_entry_seq on the next call picks up from exactly there.
+func TestQueryLedger_CursorSignalsTruncationAndPagesForward(t *testing.T) {
+	s := newStubStore()
+	entityA := "entity-a"
+	s.ledgerEntries = []domain.LedgerEntry{
+		{LedgerEntryID: "e1", LegalEntityID: entityA, EntrySeq: 1},
+		{LedgerEntryID: "e2", LegalEntityID: entityA, EntrySeq: 2},
+		{LedgerEntryID: "e3", LegalEntityID: entityA, EntrySeq: 3},
+	}
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+
+	resp := doRequest(r, http.MethodGet, "/v1/ledger/entries?legal_entity_id="+entityA+"&limit=2", nil, "reader-1")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", resp.Code, resp.Body.String())
+	}
+	var page domain.LedgerEntryPage
+	if err := json.Unmarshal(resp.Body.Bytes(), &page); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(page.Entries) != 2 || page.NextCursor == nil || *page.NextCursor != 2 {
+		t.Fatalf("expected a 2-row page with next_cursor 2, got %+v", page)
+	}
+
+	resp = doRequest(r, http.MethodGet, fmt.Sprintf("/v1/ledger/entries?legal_entity_id=%s&limit=2&after_entry_seq=%d", entityA, *page.NextCursor), nil, "reader-1")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", resp.Code, resp.Body.String())
+	}
+	var last domain.LedgerEntryPage
+	if err := json.Unmarshal(resp.Body.Bytes(), &last); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(last.Entries) != 1 || last.Entries[0].LedgerEntryID != "e3" || last.NextCursor != nil {
+		t.Fatalf("expected the single remaining row and no next_cursor, got %+v", last)
+	}
+}
+
+func TestQueryLedger_MalformedCursor_Returns400(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	for _, cursor := range []string{"not-a-number", "-1"} {
+		resp := doRequest(r, http.MethodGet, "/v1/ledger/entries?legal_entity_id=entity-a&after_entry_seq="+cursor, nil, "reader-1")
+		if resp.Code != http.StatusBadRequest {
+			t.Fatalf("after_entry_seq=%s: expected 400, got %d: %s", cursor, resp.Code, resp.Body.String())
+		}
 	}
 }
 

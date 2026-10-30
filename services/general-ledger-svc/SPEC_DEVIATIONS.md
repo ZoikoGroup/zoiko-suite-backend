@@ -150,20 +150,45 @@ The deliberate design decisions a reviewer may want to reverse are B1–B12.
   permissive. Migration 000027's down migration refuses while any row still
   carries a designation, so the evidence cannot be erased while a journal
   depends on it.
-- **A15. `QueryLedger` has no cursor and returns float amounts.** ACC-05's
-  read contract is a bounded list.
-  - *No cursor.* It is capped at 1000 entries, and a larger `limit` is
-    silently replaced by the default of 200. A reader cannot tell a full
-    page from a truncated one. reconciliation-intelligence-svc therefore
-    asks for exactly 1000 and refuses a full page (422) rather than trust
-    it.
-  - *Float amounts.* `LedgerEntry.debit_amount`/`credit_amount` are float64
-    on the wire. The columns are exact NUMERIC. A reader that needs
-    exactness parses the JSON number text directly, never through float64.
+- **A15. `QueryLedger` had no cursor and still returns float amounts.**
+  ACC-05's read contract is a bounded list.
+  - *No cursor — closed 2026-10-30.* `GET /v1/ledger/entries` now takes
+    `after_entry_seq` and its response is `{"entries": [...],
+    "next_cursor": <entry_seq>}` (was a bare array): `next_cursor` is the
+    last returned entry's own `entry_seq`, present exactly when more rows
+    exist past the page, same keyset-pagination shape used elsewhere in
+    this codebase (e.g. banking-connector-svc's `ListTransactions`). The
+    store always fetches `limit+1` rows and trims the extra one, so
+    truncation is never inferred from `len(entries) == limit` alone.
+    `GET /v1/ledger/as-of` (`QueryLedgerAsOf`) is unchanged — still a bare
+    array capped at `limit` — because a point-in-time snapshot read has no
+    pending continuation to cursor through; it shares `QueryLedgerFilter`
+    and `PgStore.QueryLedger` but ignores the new `hasMore` return.
+    `limit > MaxListLimit` (1000) is still silently replaced by the
+    default (200) rather than clamped or refused — unrelated to this
+    close, left as found.
+    - *Only known caller.* `reconciliation-intelligence-svc/internal/ledger`
+      was the sole consumer of the old bare-array shape (checked by
+      grepping every service for `v1/ledger/entries`); it is updated in the
+      same pass (A2b part 4) to decode the new envelope and actually follow
+      `next_cursor` instead of refusing a full page.
+    - *Tests:* `internal/handler/acc05_ledger_test.go`
+      (`TestQueryLedger_CursorSignalsTruncationAndPagesForward`,
+      `TestQueryLedger_MalformedCursor_Returns400`, and the pre-existing
+      scope test updated for the new envelope);
+      `internal/store/ledger_window_pg_smoke_test.go`
+      (`TestPgStore_QueryLedger_CursorPagesThroughEveryEntryExactlyOnce`,
+      real Postgres: every entry returned exactly once, in increasing
+      `entry_seq` order, across a page boundary that falls inside one
+      journal's own two lines).
+  - *Float amounts — still open.* `LedgerEntry.debit_amount`/`credit_amount`
+    are float64 on the wire. The columns are exact NUMERIC. A reader that
+    needs exactness parses the JSON number text directly, never through
+    float64 (reconciliation-intelligence-svc's client already does this).
     That is exact for any amount below about 2^53 minor units; this read
     does not offer the exact decimal string `LedgerBalance` already does.
-  - *Needed:* a keyset cursor (`after_entry_seq`) and exact decimal strings
-    on `LedgerEntry`.
+    *Needed:* exact decimal strings on `LedgerEntry`, the same change
+    `LedgerBalance` already has.
 
 ## B. Interpretations and additions (decisions a reviewer may want to reverse)
 

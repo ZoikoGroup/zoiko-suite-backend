@@ -27,7 +27,9 @@ general-ledger-svc journal, as an advisory AUTO_MATCH or DATE_SKEW (A2a,
 canonical transaction (A2b part 1, 2026-10-28). Two defects were fixed in
 this pass (B1, B2); a later pass closed A7 and the decimal half of A4; a
 third closed A1, A3 and A6; a fourth closed A8 and A9; a fifth closed A5; a
-sixth closed A2a; the latest closes A2b part 1.
+sixth closed A2a; a seventh closed A2b part 1; the latest closes A2b part 4
+(general-ledger-svc's QueryLedger keyset cursor, A15, and this service's
+internal/ledger client following it).
 
 ## A. Not implemented / weaker than the spec
 
@@ -218,7 +220,7 @@ sixth closed A2a; the latest closes A2b part 1.
     while a result exists and succeeding once none does.
 - **A2b. No candidate match against a banking-connector-svc canonical
   transaction, and the ledger search has known limits** (part 1 closed
-  2026-10-28; parts 2–4 open).
+  2026-10-28; part 4 closed 2026-10-30; parts 2–3 open).
   1. *The canonical side* (closed 2026-10-28). banking-connector-svc serves
      BNK-04 `ListTransactions` (`GET /v1/banking/canonical-transactions`, its
      A20).
@@ -307,8 +309,31 @@ sixth closed A2a; the latest closes A2b part 1.
      no lookup by journal id, so this service cannot exclude it;
      bank-reconciliation-svc's confirm step is where a double match would
      have to be refused.
-  4. *No paging.* A cash account with 1000 or more entries in the window
-     cannot be read (general-ledger-svc A15).
+  4. *No paging — closed 2026-10-30.* general-ledger-svc's A15 added a
+     keyset cursor to `QueryLedger` (`after_entry_seq` in,
+     `{"entries": [...], "next_cursor": ...}` out, replacing the old bare
+     array). `internal/ledger.ListCashAccountEntries` now follows
+     `next_cursor` to completion instead of refusing any page of exactly
+     `maxEntries` (1000) rows — that count is no longer ambiguous between
+     "exactly this many" and "truncated," so a cash account with exactly
+     1000 matching entries in the window is read in full, not refused.
+     `ErrWindowTooLarge` still exists, now bounded by `maxPages` (20): a
+     window needing more than 20 pages (20,000 rows) is still refused
+     rather than followed forever, so a pathological or adversarial
+     upstream cannot turn this into an unbounded loop — "could not read it
+     all" must still never become "no candidate."
+     *Tests:* `internal/ledger/client_test.go`
+     (`TestListCashAccountEntries_FollowsCursorAcrossPages`,
+     `TestListCashAccountEntries_RefusesBeyondMaxPages`);
+     `internal/handler/candidate_match_test.go`
+     (`TestAnalyze_LedgerUnavailableOrTruncated_FailsClosed`'s two
+     subtests: exactly one page's worth of rows now succeeds, and a window
+     past `maxPages` is still 422) through the real analyze route and a
+     fake general-ledger-svc that implements the real cursor contract
+     (`internal/handler/fakes_test.go`'s `newFakeLedgerServer`).
+     *Still open:* parts 2 and 3 below are unaffected by this — paging
+     finds every row in the window, but a multi-journal payment or an
+     already-matched journal is still not specially handled.
 - **A3. One-directional** (closed — the framing no longer applies). Only side
   A was walked: a side-B item with no side-A counterpart was never reported,
   and `total_processed_count` and the rate counted side A only. Since A1 there

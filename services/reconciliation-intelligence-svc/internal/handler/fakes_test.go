@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -185,10 +186,14 @@ type fakeLedgerEntry struct {
 	Debit, Credit                                                   string // raw JSON numbers; "" is 0
 }
 
-// newFakeLedgerServer stands in for general-ledger-svc's QueryLedger. It
-// applies the account, date-window and legal-entity filters the real route
-// applies, records every query, and fails the test on any non-GET: this
-// service must never write to the ledger.
+// newFakeLedgerServer stands in for general-ledger-svc's QueryLedger,
+// including its keyset cursor (A15): each entry's position in entries
+// (1-based) is its entry_seq, after_entry_seq narrows to rows past it, and
+// limit caps the page — the same contract
+// reconciliation-intelligence-svc's internal/ledger client follows to
+// completion. It applies the account, date-window and legal-entity filters
+// the real route applies, records every query, and fails the test on any
+// non-GET: this service must never write to the ledger.
 func newFakeLedgerServer(t *testing.T, entries []fakeLedgerEntry, queries *[]string) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -204,12 +209,41 @@ func newFakeLedgerServer(t *testing.T, entries []fakeLedgerEntry, queries *[]str
 		if q.Get("journal_status") != "FINALIZED" {
 			t.Errorf("candidate read must ask for FINALIZED journals only, got %q", q.Get("journal_status"))
 		}
-		parts := []string{}
-		for _, e := range entries {
+		after := int64(0)
+		if raw := q.Get("after_entry_seq"); raw != "" {
+			var err error
+			after, err = strconv.ParseInt(raw, 10, 64)
+			if err != nil {
+				t.Fatalf("after_entry_seq %q: %v", raw, err)
+			}
+		}
+		limit := 1000
+		if raw := q.Get("limit"); raw != "" {
+			if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+				limit = n
+			}
+		}
+		var matched []fakeLedgerEntry
+		var matchedSeq []int64
+		for i, e := range entries {
+			seq := int64(i + 1)
+			if seq <= after {
+				continue
+			}
 			if e.LegalEntityID != q.Get("legal_entity_id") || e.AccountCode != q.Get("account_code") ||
 				e.Date < q.Get("transaction_date_from") || e.Date > q.Get("transaction_date_to") {
 				continue
 			}
+			matched = append(matched, e)
+			matchedSeq = append(matchedSeq, seq)
+		}
+		hasMore := len(matched) > limit
+		if hasMore {
+			matched = matched[:limit]
+			matchedSeq = matchedSeq[:limit]
+		}
+		parts := make([]string, len(matched))
+		for i, e := range matched {
 			debit, credit := e.Debit, e.Credit
 			if debit == "" {
 				debit = "0"
@@ -217,12 +251,16 @@ func newFakeLedgerServer(t *testing.T, entries []fakeLedgerEntry, queries *[]str
 			if credit == "" {
 				credit = "0"
 			}
-			parts = append(parts, fmt.Sprintf(
-				`{"journal_id":%q,"tenant_id":%q,"legal_entity_id":%q,"account_code":%q,"debit_amount":%s,"credit_amount":%s,"currency_code":%q,"transaction_date":%q}`,
-				e.JournalID, e.TenantID, e.LegalEntityID, e.AccountCode, debit, credit, e.Currency, e.Date))
+			parts[i] = fmt.Sprintf(
+				`{"journal_id":%q,"tenant_id":%q,"legal_entity_id":%q,"account_code":%q,"debit_amount":%s,"credit_amount":%s,"currency_code":%q,"transaction_date":%q,"entry_seq":%d}`,
+				e.JournalID, e.TenantID, e.LegalEntityID, e.AccountCode, debit, credit, e.Currency, e.Date, matchedSeq[i])
+		}
+		nextCursor := "null"
+		if hasMore && len(matchedSeq) > 0 {
+			nextCursor = strconv.FormatInt(matchedSeq[len(matchedSeq)-1], 10)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte("[" + strings.Join(parts, ",") + "]"))
+		_, _ = w.Write([]byte(`{"entries":[` + strings.Join(parts, ",") + `],"next_cursor":` + nextCursor + `}`))
 	}))
 	t.Cleanup(srv.Close)
 	return srv

@@ -90,7 +90,7 @@ type Store interface {
 	// wireframe and is deliberately NOT a Store method here — it runs
 	// only as TransitionJournal's own side effect (see appendLedgerEntries
 	// in pg_store.go), never reachable from a handler.
-	QueryLedger(ctx context.Context, tenantID string, filter domain.QueryLedgerFilter, limit int) ([]domain.LedgerEntry, error)
+	QueryLedger(ctx context.Context, tenantID string, filter domain.QueryLedgerFilter, limit int) (entries []domain.LedgerEntry, hasMore bool, err error)
 	QuerySourceEntries(ctx context.Context, tenantID, sourceEventID string) ([]domain.LedgerEntry, error)
 	QueryAccountBalance(ctx context.Context, tenantID string, req domain.QueryAccountBalanceRequest) (*domain.LedgerBalance, error)
 	RebuildDerivedBalanceProjection(ctx context.Context, tenantID string, req domain.RebuildBalanceProjectionRequest) error
@@ -3383,7 +3383,15 @@ func (h *Handler) QueryLedger(w http.ResponseWriter, r *http.Request) {
 	if !parseLedgerWindow(w, q, &filter) {
 		return
 	}
-	entries, err := h.store.QueryLedger(r.Context(), tenantID, filter, limit)
+	if raw := q.Get("after_entry_seq"); raw != "" {
+		after, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || after < 0 {
+			writeError(w, http.StatusBadRequest, "invalid_field", "after_entry_seq must be a non-negative integer")
+			return
+		}
+		filter.AfterEntrySeq = &after
+	}
+	entries, hasMore, err := h.store.QueryLedger(r.Context(), tenantID, filter, limit)
 	if err != nil {
 		h.log.Error("QueryLedger: store unavailable", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
@@ -3392,7 +3400,12 @@ func (h *Handler) QueryLedger(w http.ResponseWriter, r *http.Request) {
 	if entries == nil {
 		entries = []domain.LedgerEntry{}
 	}
-	writeJSON(w, http.StatusOK, entries)
+	page := domain.LedgerEntryPage{Entries: entries}
+	if hasMore && len(entries) > 0 {
+		last := entries[len(entries)-1].EntrySeq
+		page.NextCursor = &last
+	}
+	writeJSON(w, http.StatusOK, page)
 }
 
 // parseLedgerWindow reads QueryLedger's optional transaction-date window and
@@ -3479,7 +3492,10 @@ func (h *Handler) QueryLedgerAsOf(w http.ResponseWriter, r *http.Request) {
 	if !parseLedgerWindow(w, q, &filter) {
 		return
 	}
-	entries, err := h.store.QueryLedger(r.Context(), tenantID, filter, limit)
+	// hasMore is intentionally unused here: QueryLedgerAsOf's response stays
+	// the bare array it always was — see domain.LedgerEntryPage's doc
+	// comment on why a point-in-time snapshot read does not get a cursor.
+	entries, _, err := h.store.QueryLedger(r.Context(), tenantID, filter, limit)
 	if err != nil {
 		h.log.Error("QueryLedgerAsOf: store unavailable", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")

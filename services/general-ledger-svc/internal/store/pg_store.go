@@ -847,8 +847,11 @@ func appendLedgerEntries(ctx context.Context, tx pgx.Tx, tenantID, journalID str
 // QueryLedger is ACC-05's own read authority over ledger_entries. Filter's
 // LegalEntityID must already be validated non-empty by the caller
 // (ErrLedgerScopeRequired) — the spec's own negative path #4, "cross-book
-// query leakage."
-func (s *PgStore) QueryLedger(ctx context.Context, tenantID string, filter domain.QueryLedgerFilter, limit int) ([]domain.LedgerEntry, error) {
+// query leakage." hasMore reports whether more rows exist past the
+// returned page (A15's keyset cursor): one extra row is fetched and
+// trimmed off, never counted against the caller's own limit, so a full
+// page is never indistinguishable from the end of the result.
+func (s *PgStore) QueryLedger(ctx context.Context, tenantID string, filter domain.QueryLedgerFilter, limit int) (entries []domain.LedgerEntry, hasMore bool, err error) {
 	if limit <= 0 || limit > MaxListLimit {
 		limit = DefaultListLimit
 	}
@@ -880,6 +883,10 @@ func (s *PgStore) QueryLedger(ctx context.Context, tenantID string, filter domai
 		args = append(args, *filter.MaxEntrySeq)
 		query += fmt.Sprintf(" AND entry_seq <= $%d", len(args))
 	}
+	if filter.AfterEntrySeq != nil {
+		args = append(args, *filter.AfterEntrySeq)
+		query += fmt.Sprintf(" AND entry_seq > $%d", len(args))
+	}
 	if !filter.TransactionDateFrom.IsZero() {
 		args = append(args, filter.TransactionDateFrom.Time)
 		query += fmt.Sprintf(" AND transaction_date >= $%d", len(args))
@@ -895,11 +902,12 @@ func (s *PgStore) QueryLedger(ctx context.Context, tenantID string, filter domai
 		query += fmt.Sprintf(` AND EXISTS (SELECT 1 FROM journal_headers jh
 			WHERE jh.journal_id = ledger_entries.journal_id AND jh.tenant_id = ledger_entries.tenant_id AND jh.status = $%d)`, len(args))
 	}
-	args = append(args, limit)
+	// One extra row past the caller's own limit, trimmed below — the
+	// truncation signal, never a page-size change the caller asked for.
+	args = append(args, limit+1)
 	query += fmt.Sprintf(" ORDER BY entry_seq ASC LIMIT $%d", len(args))
 
-	var entries []domain.LedgerEntry
-	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, query, args...)
 		if err != nil {
 			return mapPgError(err)
@@ -918,9 +926,13 @@ func (s *PgStore) QueryLedger(ctx context.Context, tenantID string, filter domai
 		return mapPgError(rows.Err())
 	})
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return entries, nil
+	if len(entries) > limit {
+		entries = entries[:limit]
+		hasMore = true
+	}
+	return entries, hasMore, nil
 }
 
 // QuerySourceEntries returns every ledger entry traceable to the given
