@@ -434,9 +434,9 @@ services:
       dockerfile: Dockerfile
     container_name: filing-preparation-svc-p5
     ports:
-      - "8130:8130"
+      - "8176:8176"
     environment:
-      PORT: "8130"
+      PORT: "8176"
       DATABASE_URL: "postgres://zoiko_app:zoiko_app_password@postgres:5432/filing_preparation?sslmode=disable"
       KAFKA_BROKERS: "kafka:9092"
       KAFKA_EVENTS_TOPIC: "zoiko.filing-prep.events"

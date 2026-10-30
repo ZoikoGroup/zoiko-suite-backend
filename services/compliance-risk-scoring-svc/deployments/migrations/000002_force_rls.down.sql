@@ -1,0 +1,4 @@
+ALTER TABLE risk_score_assessments NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE risk_factor_breakdowns NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE risk_threshold_rules NO FORCE ROW LEVEL SECURITY;
+

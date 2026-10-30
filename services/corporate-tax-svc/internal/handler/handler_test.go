@@ -20,10 +20,14 @@ import (
 
 type stubStore struct {
 	returns map[string]*domain.TaxReturn
+	nexus   map[string]*domain.NexusRecord
 }
 
 func newStubStore() *stubStore {
-	return &stubStore{returns: make(map[string]*domain.TaxReturn)}
+	return &stubStore{
+		returns: make(map[string]*domain.TaxReturn),
+		nexus:   make(map[string]*domain.NexusRecord),
+	}
 }
 
 func (s *stubStore) Create(_ context.Context, r *domain.TaxReturn) error {
@@ -84,6 +88,36 @@ func (s *stubStore) Assess(_ context.Context, id string, req *domain.AssessTaxRe
 	return r, nil
 }
 
+func (s *stubStore) CreateNexusRecord(_ context.Context, r *domain.NexusRecord) error {
+	if r.NexusRecordID == "" {
+		r.NexusRecordID = "nexus-test-001"
+	}
+	s.nexus[r.NexusRecordID] = r
+	return nil
+}
+
+func (s *stubStore) GetNexusRecordByID(_ context.Context, id string) (*domain.NexusRecord, error) {
+	if r, ok := s.nexus[id]; ok {
+		cp := *r
+		return &cp, nil
+	}
+	return nil, domain.ErrNexusRecordNotFound
+}
+
+func (s *stubStore) ListNexusRecords(_ context.Context, legalEntityID, jurisdictionID string) ([]domain.NexusRecord, error) {
+	var out []domain.NexusRecord
+	for _, r := range s.nexus {
+		if legalEntityID != "" && r.LegalEntityID != legalEntityID {
+			continue
+		}
+		if jurisdictionID != "" && r.JurisdictionID != jurisdictionID {
+			continue
+		}
+		out = append(out, *r)
+	}
+	return out, nil
+}
+
 // ─── Stub Publisher ───────────────────────────────────────────────────────────
 
 type stubPublisher struct{}
@@ -96,8 +130,6 @@ var _ events.Publisher = (*stubPublisher)(nil)
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-// newStubAuthzServer stands in for authorization-svc and always grants,
-// matching its real contract: HTTP 200 with decision_outcome in the body.
 func newStubAuthzServer(t *testing.T) *authz.Client {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -149,25 +181,19 @@ func TestCreateCorporateTaxReturn(t *testing.T) {
 	if w.Code != http.StatusCreated {
 		t.Fatalf("expected 201, got %d — %s", w.Code, w.Body.String())
 	}
-	var resp domain.TaxReturn
-	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
-		t.Fatalf("decode failed: %v", err)
+	var res domain.TaxReturn
+	_ = json.NewDecoder(w.Body).Decode(&res)
+	if res.TaxableIncome != 800_000.00 {
+		t.Errorf("expected taxable income 800000, got %f", res.TaxableIncome)
 	}
-	// taxable_income = 1_000_000 - 200_000 = 800_000
-	if resp.TaxableIncome != 800_000 {
-		t.Errorf("expected taxable income 800000, got %f", resp.TaxableIncome)
+	if res.GrossTaxLiability != 200_000.00 {
+		t.Errorf("expected gross tax liability 200000, got %f", res.GrossTaxLiability)
 	}
-	// gross_tax_liability = 800_000 * 25% = 200_000
-	if resp.GrossTaxLiability != 200_000 {
-		t.Errorf("expected gross liability 200000, got %f", resp.GrossTaxLiability)
+	if res.NetTaxPayable != 190_000.00 {
+		t.Errorf("expected net tax payable 190000, got %f", res.NetTaxPayable)
 	}
-	// net_tax_payable = 200_000 - 10_000 = 190_000
-	if resp.NetTaxPayable != 190_000 {
-		t.Errorf("expected net payable 190000, got %f", resp.NetTaxPayable)
-	}
-	// balance_due = 190_000 - 50_000 = 140_000
-	if resp.BalanceDue != 140_000 {
-		t.Errorf("expected balance due 140000, got %f", resp.BalanceDue)
+	if res.BalanceDue != 140_000.00 {
+		t.Errorf("expected balance due 140000, got %f", res.BalanceDue)
 	}
 }
 
@@ -176,16 +202,16 @@ func TestSubmitCorporateTaxReturn(t *testing.T) {
 	r := chi.NewRouter()
 	RegisterRoutes(r, h)
 
-	// Create first
+	// Create
 	createBody := domain.CreateTaxReturnRequest{
-		LegalEntityID:  "le-uk-001",
-		JurisdictionID: "uk-england",
+		LegalEntityID:  "le-de-001",
+		JurisdictionID: "de",
 		FiscalYear:     2026,
 		GrossRevenue:   500_000,
-		TaxRatePercent: 19.0,
-		Currency:       "GBP",
+		TaxRatePercent: 15.0,
+		Currency:       "EUR",
 		EffectiveFrom:  "2026-01-01",
-		CreatedBy:      "tax-manager-01",
+		CreatedBy:      "cfo-01",
 	}
 	wCreate := httptest.NewRecorder()
 	r.ServeHTTP(wCreate, buildRequest(http.MethodPost, "/v1/corporate-tax-returns", createBody))
@@ -193,7 +219,7 @@ func TestSubmitCorporateTaxReturn(t *testing.T) {
 	_ = json.NewDecoder(wCreate.Body).Decode(&created)
 
 	// Submit
-	submitBody := domain.SubmitTaxReturnRequest{SubmittedBy: "tax-director"}
+	submitBody := domain.SubmitTaxReturnRequest{SubmittedBy: "principal-test-01"}
 	wSubmit := httptest.NewRecorder()
 	r.ServeHTTP(wSubmit, buildRequest(http.MethodPost, "/v1/corporate-tax-returns/"+created.ReturnID+"/submit", submitBody))
 	if wSubmit.Code != http.StatusOK {
@@ -241,5 +267,56 @@ func TestAssessCorporateTaxReturn(t *testing.T) {
 	_ = json.NewDecoder(wAssess.Body).Decode(&assessed)
 	if assessed.Status != domain.StatusAssessed {
 		t.Errorf("expected ASSESSED, got %s", assessed.Status)
+	}
+}
+
+func TestNexusRecords_CreateAndList(t *testing.T) {
+	h := newTestHandler(t)
+	r := chi.NewRouter()
+	RegisterRoutes(r, h)
+
+	nexusBody := domain.CreateNexusRecordRequest{
+		LegalEntityID:   "le-us-001",
+		JurisdictionID:  "us-california",
+		NexusType:       "ECONOMIC",
+		ThresholdAmount: 500_000.00,
+		Currency:        "USD",
+		EffectiveFrom:   "2026-01-01",
+	}
+
+	wCreate := httptest.NewRecorder()
+	r.ServeHTTP(wCreate, buildRequest(http.MethodPost, "/v1/nexus-records", nexusBody))
+	if wCreate.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d - %s", wCreate.Code, wCreate.Body.String())
+	}
+
+	var created domain.NexusRecord
+	if err := json.NewDecoder(wCreate.Body).Decode(&created); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if created.NexusType != "ECONOMIC" {
+		t.Errorf("expected nexus type ECONOMIC, got %s", created.NexusType)
+	}
+
+	// Get by ID
+	wGet := httptest.NewRecorder()
+	r.ServeHTTP(wGet, buildRequest(http.MethodGet, "/v1/nexus-records/"+created.NexusRecordID, nil))
+	if wGet.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d - %s", wGet.Code, wGet.Body.String())
+	}
+
+	// List
+	wList := httptest.NewRecorder()
+	r.ServeHTTP(wList, buildRequest(http.MethodGet, "/v1/nexus-records?legal_entity_id=le-us-001", nil))
+	if wList.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d - %s", wList.Code, wList.Body.String())
+	}
+
+	var list []domain.NexusRecord
+	if err := json.NewDecoder(wList.Body).Decode(&list); err != nil {
+		t.Fatalf("failed to decode list: %v", err)
+	}
+	if len(list) != 1 {
+		t.Errorf("expected 1 nexus record, got %d", len(list))
 	}
 }

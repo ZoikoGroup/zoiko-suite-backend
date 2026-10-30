@@ -246,12 +246,8 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/", h.CreateExecution)
 		r.Get("/{id}", h.GetExecution)
 	})
-	r.Post("/v1/ai/incidents", h.CreateAIIncident)
-	r.Route("/v1/ai/output-dispositions", func(r chi.Router) {
-		r.Post("/", h.CreateOutputDisposition)
-		r.Get("/{id}", h.GetOutputDisposition)
-		r.Post("/{id}/decision", h.DecideOutputDisposition)
-	})
+	// Legacy incident/disposition routes removed — superseded by AIG-04/05
+	// routes registered below (lines 270+).
 	r.Route("/v1/ai/model-releases", func(r chi.Router) {
 		r.Post("/", h.RegisterModelRelease)
 		r.Get("/", h.ListModelReleases)

@@ -27,6 +27,16 @@ const (
 	OversightProhibited      OversightClass = "O4" // AI prohibited: technical block
 )
 
+// Valid reports whether c is a recognised oversight class.
+func (c OversightClass) Valid() bool {
+	switch c {
+	case OversightNone, OversightUserReview, OversightQualifiedReview, OversightDualControl, OversightProhibited:
+		return true
+	default:
+		return false
+	}
+}
+
 // DetermineOversightClass maps a use case's operational class to the
 // oversight class its outputs require. requireDualControl lets the
 // caller assert that this specific output is the highest-impact slice

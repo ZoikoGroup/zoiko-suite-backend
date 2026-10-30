@@ -1,0 +1,2 @@
+ALTER TABLE recommendations NO FORCE ROW LEVEL SECURITY;
+
