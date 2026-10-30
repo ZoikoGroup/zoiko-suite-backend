@@ -992,11 +992,12 @@ func TestFindConfigDefinition_Found(t *testing.T) {
 
 func TestPublishConfigDefinition_ResolvesKeyThenPublishes(t *testing.T) {
 	s := &stubStore{
-		getDefinitionResult: &domain.ConfigDefinition{DefinitionID: "def-1", Key: "k"},
+		getDefinitionResult: &domain.ConfigDefinition{DefinitionID: "def-1", Key: "k", RecordVersion: 1},
 		publishVersion:      &domain.ConfigDefinitionVersion{VersionID: "ver-1", Version: 1},
 	}
 	r := newTestRouter(s)
 	req := authed(httptest.NewRequest(http.MethodPost, "/v1/config/definitions/k/publish", strings.NewReader(`{"lifecycle":"PUBLISHED"}`)))
+	req.Header.Set("If-Match", `"v1"`)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusCreated {

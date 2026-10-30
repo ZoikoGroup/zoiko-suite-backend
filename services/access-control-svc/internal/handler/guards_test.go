@@ -1,10 +1,12 @@
 package handler_test
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"slices"
 	"strings"
 	"testing"
@@ -122,6 +124,10 @@ func TestBundleReactivation_RunsTheGuards(t *testing.T) {
 	if rr := doReq(r, http.MethodDelete, base+"/"+first.BundleID+"?legal_entity_id=le-us", nil, "admin-1"); rr.Code != http.StatusOK {
 		t.Fatalf("detach: %d %s", rr.Code, rr.Body.String())
 	}
+	// After detach, the bundle's version is incremented. Get current version.
+	rr = doReq(r, http.MethodGet, base+"/"+first.BundleID+"?legal_entity_id=le-us", nil, "admin-1")
+	var detachedBundle domain.PermissionBundleDef
+	_ = json.NewDecoder(rr.Body).Decode(&detachedBundle)
 	if rr := doReq(r, http.MethodPost, base, bundleWith("PAYMENT_APPROVE"), "admin-1"); rr.Code != http.StatusCreated {
 		t.Fatalf("second bundle (first is detached, so no conflict): %d %s", rr.Code, rr.Body.String())
 	}
@@ -132,9 +138,15 @@ func TestBundleReactivation_RunsTheGuards(t *testing.T) {
 		}
 		return nil
 	}
-	rr = doReq(r, http.MethodPatch, base+"/"+first.BundleID, map[string]any{"legal_entity_id": "le-us", "active_flag": true}, "admin-1")
-	if rr.Code != http.StatusForbidden || errCode(t, rr.Body.String()) != "sod_conflict" {
-		t.Fatalf("reactivating into a conflict must be refused, got %d %s", rr.Code, rr.Body.String())
+	// Reactivate with correct If-Match (version after detach)
+	req := httptest.NewRequest(http.MethodPatch, base+"/"+first.BundleID, bytes.NewBufferString(`{"legal_entity_id":"le-us","active_flag":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Principal-Id", "admin-1")
+	req.Header.Set("If-Match", fmt.Sprintf(`"v%d"`, detachedBundle.RecordVersion))
+	rr2 := httptest.NewRecorder()
+	r.ServeHTTP(rr2, req)
+	if rr2.Code != http.StatusForbidden || errCode(t, rr2.Body.String()) != "sod_conflict" {
+		t.Fatalf("reactivating into a conflict must be refused, got %d %s", rr2.Code, rr2.Body.String())
 	}
 }
 

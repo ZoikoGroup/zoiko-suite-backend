@@ -549,7 +549,8 @@ const changeColumns = `
 	rollback_change_id,
 	created_by_principal_id,
 	created_at,
-	updated_at`
+	updated_at,
+	record_version`
 
 func scanChange(row pgx.Row) (*domain.ConfigChange, error) {
 	c := &domain.ConfigChange{}
@@ -566,6 +567,46 @@ func changeScanTargets(c *domain.ConfigChange, extra ...any) []any {
 		&c.Approval, &c.ApprovalRequired, &c.PlannedEffectiveAt,
 		&c.ActivatedAt, &c.VerifiedAt, &c.RollbackChangeID,
 		&c.CreatedByPrincipalID, &c.CreatedAt, &c.UpdatedAt,
+		&c.RecordVersion,
+	}, extra...)
+}
+
+// emergencyChangeColumns is the full emergency_changes row the
+// emergency-change lifecycle scans.
+const emergencyChangeColumns = `
+	emergency_change_id,
+	key,
+	environment,
+	tenant_id,
+	new_value,
+	reason,
+	incident_id,
+	actor_principal_id,
+	expires_at,
+	activated_config_entry_id,
+	prior_config_entry_id,
+	status,
+	retrospective_due_at,
+	retrospective_closed_at,
+	created_at,
+	record_version`
+
+func scanEmergencyChange(row pgx.Row) (*domain.EmergencyChange, error) {
+	e := &domain.EmergencyChange{}
+	err := row.Scan(emergencyChangeScanTargets(e)...)
+	return e, err
+}
+
+// emergencyChangeScanTargets lists the scan destinations for
+// emergencyChangeColumns, in order, followed by any extra columns a query
+// appends.
+func emergencyChangeScanTargets(e *domain.EmergencyChange, extra ...any) []any {
+	return append([]any{
+		&e.EmergencyChangeID, &e.Key, &e.Environment, &e.TenantID,
+		&e.NewValue, &e.Reason, &e.IncidentID, &e.ActorPrincipalID,
+		&e.ExpiresAt, &e.ActivatedConfigEntryID, &e.PriorConfigEntryID,
+		&e.Status, &e.RetrospectiveDueAt, &e.RetrospectiveClosedAt,
+		&e.CreatedAt, &e.RecordVersion,
 	}, extra...)
 }
 
@@ -2004,6 +2045,21 @@ func (s *PgStore) doCreateChange(ctx context.Context, callerTenantID string, cha
 	return out, nil
 }
 
+// GetChange returns a change by ID (INV-27). Used for ETag/If-Match optimistic
+// concurrency on change mutations.
+func (s *PgStore) GetChange(ctx context.Context, changeID string) (*domain.ConfigChange, error) {
+	c, err := scanChange(s.pool.QueryRow(ctx, `
+		SELECT `+changeColumns+` FROM config_changes
+		WHERE change_id = $1`, changeID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrChangeNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return c, nil
+}
+
 // ApproveChange signs a change's fit-to-serve into the approval trail
 // (INV-23/24). A change with extra approval steps can be approved without being
 // force-verifiable yet; verification still happens at activation.
@@ -2333,9 +2389,9 @@ func (s *PgStore) ActivateEmergencyChange(ctx context.Context, emergencyChangeID
 		e := &domain.EmergencyChange{EmergencyChangeID: emergencyChangeID}
 		var status string
 		if err := tx.QueryRow(ctx, `
-			SELECT key, new_value, environment, tenant_id, status, expires_at FROM emergency_changes
+			SELECT key, new_value, environment, tenant_id, status, expires_at, record_version FROM emergency_changes
 			WHERE emergency_change_id = $1 FOR UPDATE`, emergencyChangeID).
-			Scan(&e.Key, &e.NewValue, &e.Environment, &e.TenantID, &status, &e.ExpiresAt); err != nil {
+			Scan(&e.Key, &e.NewValue, &e.Environment, &e.TenantID, &status, &e.ExpiresAt, &e.RecordVersion); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return domain.ErrChangeNotFound
 			}
@@ -2422,6 +2478,39 @@ func (s *PgStore) ActivateEmergencyChange(ctx context.Context, emergencyChangeID
 		}
 		if err := enqueueSnapshotPublished(ctx, tx, callerTenantID, actor, "", *snap); err != nil {
 			return err
+		}
+		out = e
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// GetEmergencyChange returns an emergency change by ID (INV-27). Used for
+// ETag/If-Match optimistic concurrency on emergency-change mutations.
+func (s *PgStore) GetEmergencyChange(ctx context.Context, emergencyChangeID string) (*domain.EmergencyChange, error) {
+	var out *domain.EmergencyChange
+	err := s.withOps(ctx, func(tx pgx.Tx) error {
+		e := &domain.EmergencyChange{EmergencyChangeID: emergencyChangeID}
+		if err := tx.QueryRow(ctx, `
+			SELECT emergency_change_id, key, new_value, environment, tenant_id,
+			       reason, incident_id, actor_principal_id, expires_at,
+			       activated_config_entry_id, prior_config_entry_id, status,
+			       retrospective_due_at, retrospective_closed_at, created_at,
+			       record_version
+			FROM emergency_changes
+			WHERE emergency_change_id = $1`, emergencyChangeID).
+			Scan(&e.EmergencyChangeID, &e.Key, &e.NewValue, &e.Environment, &e.TenantID,
+				&e.NewValue, &e.Reason, &e.IncidentID, &e.ActorPrincipalID,
+				&e.ExpiresAt, &e.ActivatedConfigEntryID, &e.PriorConfigEntryID,
+				&e.Status, &e.RetrospectiveDueAt, &e.RetrospectiveClosedAt,
+				&e.CreatedAt, &e.RecordVersion); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return domain.ErrChangeNotFound
+			}
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 		}
 		out = e
 		return nil

@@ -615,11 +615,12 @@ func (s *stubStore) RevokePrivilegedSession(_ context.Context, sessionID, tenant
 	}
 	now := time.Now().UTC()
 	return &domain.PrivilegedSession{
-		SessionID: sessionID,
-		TenantID:  tenantID,
-		Status:    domain.PrivilegedSessionStatusRevoked,
-		RevokedAt: &now,
-		RevokedBy: &revokedBy,
+		SessionID:      sessionID,
+		TenantID:       tenantID,
+		Status:         domain.PrivilegedSessionStatusRevoked,
+		RevokedAt:      &now,
+		RevokedBy:      &revokedBy,
+		RecordVersion:  2, // Simulate version increment
 	}, nil
 }
 
@@ -651,6 +652,11 @@ func (s *stubStore) FindBreakGlassSessionByID(_ context.Context, sessionID, tena
 	}
 	if s.breakGlassSession != nil {
 		return s.breakGlassSession, nil
+	}
+	if s.revokeBreakGlassSession != nil {
+		bg := *s.revokeBreakGlassSession
+		bg.RecordVersion = 1
+		return &bg, nil
 	}
 	return nil, domain.ErrBreakGlassSessionNotFound
 }
@@ -710,6 +716,11 @@ func (s *stubStore) FindSupportSessionByID(_ context.Context, sessionID, tenantI
 	}
 	if s.supportSession != nil {
 		return s.supportSession, nil
+	}
+	if s.revokeSupportSession != nil {
+		ss := *s.revokeSupportSession
+		ss.RecordVersion = 1
+		return &ss, nil
 	}
 	return nil, domain.ErrSupportSessionNotFound
 }

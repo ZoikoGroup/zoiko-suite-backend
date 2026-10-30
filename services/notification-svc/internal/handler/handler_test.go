@@ -1606,5 +1606,477 @@ func (s *stubStore) CancelNotification(_ context.Context, id, _, actor, reason s
 	}
 	n.Status, n.NextAttemptAt, n.SentAt = domain.StatusCancelled, nil, &at
 	n.CancelledBy, n.CancelledAt, n.CancelReason = actor, &at, reason
+	n.RecordVersion++
 	return n, nil
+}
+
+// ── API-3 ETag/If-Match tests ────────────────────────────────────────────────────
+
+// TestETag_GetNotificationReturnsETag verifies that GET /v1/notifications/{id}
+// returns an ETag header with the record_version.
+func TestETag_GetNotificationReturnsETag(t *testing.T) {
+	store := newStubStore()
+	store.byID["n1"] = &domain.Notification{
+		NotificationID: "n1", TenantID: "tenant-abc", LegalEntityID: "le-us",
+		RecipientPrincipalID: "principal-2", Channel: "EMAIL", Status: "PENDING",
+		RecordVersion: 42,
+	}
+	pub := &stubPublisher{}
+	r := newRouter(store, pub, &stubAuthZ{})
+
+	rr := doReq(r, http.MethodGet, "/v1/notifications/n1", nil, "principal-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	etag := rr.Header().Get("ETag")
+	if etag == "" {
+		t.Fatal("ETag header is missing")
+	}
+	if etag != `"v42"` {
+		t.Fatalf("ETag = %q, want %q", etag, `"v42"`)
+	}
+}
+
+// TestIfMatch_CancelNotification_MissingReturns428 verifies that
+// POST /v1/notifications/{id}/cancel requires an If-Match header and returns
+// 428 Precondition Required when missing.
+func TestIfMatch_CancelNotification_MissingReturns428(t *testing.T) {
+	store := newStubStore()
+	nextAttempt := time.Now().UTC().Add(time.Hour)
+	store.byID["n1"] = &domain.Notification{
+		NotificationID: "n1", TenantID: "tenant-abc", LegalEntityID: "le-us",
+		RecipientPrincipalID: "principal-2", Channel: "EMAIL", Status: "PENDING",
+		NextAttemptAt: &nextAttempt,
+		RecordVersion: 1,
+	}
+	pub := &stubPublisher{}
+	r := newRouter(store, pub, &stubAuthZ{})
+
+	// Request without If-Match
+	req := httptest.NewRequest(http.MethodPost, "/v1/notifications/n1/cancel", bytes.NewBufferString(`{"reason":"test"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Principal-Id", "ops-1")
+	// No If-Match header
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusPreconditionRequired {
+		t.Fatalf("expected 428, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var resp struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("body is not JSON: %s", rr.Body.String())
+	}
+	if resp.Code != "precondition_required" {
+		t.Fatalf("code = %q, want %q", resp.Code, "precondition_required")
+	}
+}
+
+// TestIfMatch_CancelNotification_StaleReturns412 verifies that
+// POST /v1/notifications/{id}/cancel with a stale ETag returns 412 Precondition Failed.
+func TestIfMatch_CancelNotification_StaleReturns412(t *testing.T) {
+	store := newStubStore()
+	nextAttempt := time.Now().UTC().Add(time.Hour)
+	store.byID["n1"] = &domain.Notification{
+		NotificationID: "n1", TenantID: "tenant-abc", LegalEntityID: "le-us",
+		RecipientPrincipalID: "principal-2", Channel: "EMAIL", Status: "PENDING",
+		NextAttemptAt: &nextAttempt,
+		RecordVersion: 1,
+	}
+	pub := &stubPublisher{}
+	r := newRouter(store, pub, &stubAuthZ{})
+
+	// Request with stale If-Match
+	req := httptest.NewRequest(http.MethodPost, "/v1/notifications/n1/cancel", bytes.NewBufferString(`{"reason":"test"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Principal-Id", "ops-1")
+	req.Header.Set("If-Match", `"v999"`) // Stale version
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusPreconditionFailed {
+		t.Fatalf("expected 412, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var resp struct {
+		Code           string `json:"code"`
+		CurrentVersion int64  `json:"current_version"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("body is not JSON: %s", rr.Body.String())
+	}
+	if resp.Code != "stale_version" {
+		t.Fatalf("code = %q, want %q", resp.Code, "stale_version")
+	}
+	if resp.CurrentVersion != 1 {
+		t.Fatalf("current_version = %d, want 1", resp.CurrentVersion)
+	}
+	// Response should include the current ETag
+	etag := rr.Header().Get("ETag")
+	if etag != `"v1"` {
+		t.Fatalf("response ETag = %q, want %q", etag, `"v1"`)
+	}
+}
+
+// TestIfMatch_CancelNotification_CorrectReturns200 verifies that
+// POST /v1/notifications/{id}/cancel with a correct ETag succeeds with 200.
+func TestIfMatch_CancelNotification_CorrectReturns200(t *testing.T) {
+	store := newStubStore()
+	nextAttempt := time.Now().UTC().Add(time.Hour)
+	store.byID["n1"] = &domain.Notification{
+		NotificationID: "n1", TenantID: "tenant-abc", LegalEntityID: "le-us",
+		RecipientPrincipalID: "principal-2", Channel: "EMAIL", Status: "PENDING",
+		NextAttemptAt: &nextAttempt,
+		RecordVersion: 1,
+	}
+	pub := &stubPublisher{}
+	r := newRouter(store, pub, &stubAuthZ{})
+
+	// Request with correct If-Match
+	req := httptest.NewRequest(http.MethodPost, "/v1/notifications/n1/cancel", bytes.NewBufferString(`{"reason":"test"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Principal-Id", "ops-1")
+	req.Header.Set("If-Match", `"v1"`) // Correct version
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var n domain.Notification
+	if err := json.Unmarshal(rr.Body.Bytes(), &n); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if n.Status != domain.StatusCancelled {
+		t.Errorf("status = %q, want %q", n.Status, domain.StatusCancelled)
+	}
+	// Response should include updated ETag (version 2 after cancel)
+	etag := rr.Header().Get("ETag")
+	if etag != `"v2"` {
+		t.Fatalf("response ETag = %q, want %q", etag, `"v2"`)
+	}
+}
+
+// TestETag_GetTemplateReturnsETag verifies that GET /v1/document-templates/{templateID}
+// returns an ETag header with the record_version.
+func TestETag_GetTemplateReturnsETag(t *testing.T) {
+	store := newStubStore()
+	store.templates["template-1"] = &domain.TemplateDefinition{
+		TemplateID: "template-1", TenantID: "tenant-abc", LegalEntityID: "le-us",
+		Name: "Test", BusinessPurpose: "Test", OwnerPrincipalID: "ops-1",
+		Status: "ACTIVE", RecordVersion: 42,
+	}
+	pub := &stubPublisher{}
+	r := newRouter(store, pub, &stubAuthZ{})
+
+	rr := doReq(r, http.MethodGet, "/v1/document-templates/template-1", nil, "principal-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	etag := rr.Header().Get("ETag")
+	if etag == "" {
+		t.Fatal("ETag header is missing")
+	}
+	if etag != `"v42"` {
+		t.Fatalf("ETag = %q, want %q", etag, `"v42"`)
+	}
+}
+
+// TestIfMatch_RetireTemplate_MissingReturns428 verifies that
+// POST /v1/document-templates/{templateID}/retire requires an If-Match header and returns
+// 428 Precondition Required when missing.
+func TestIfMatch_RetireTemplate_MissingReturns428(t *testing.T) {
+	store := newStubStore()
+	store.templates["template-1"] = &domain.TemplateDefinition{
+		TemplateID: "template-1", TenantID: "tenant-abc", LegalEntityID: "le-us",
+		Name: "Test", BusinessPurpose: "Test", OwnerPrincipalID: "ops-1",
+		Status: "ACTIVE", RecordVersion: 1,
+	}
+	pub := &stubPublisher{}
+	r := newRouter(store, pub, &stubAuthZ{})
+
+	// Request without If-Match
+	req := httptest.NewRequest(http.MethodPost, "/v1/document-templates/template-1/retire", bytes.NewBufferString(`{"retired_by_principal_id":"ops-1"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Principal-Id", "ops-1")
+	// No If-Match header
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusPreconditionRequired {
+		t.Fatalf("expected 428, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var resp struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("body is not JSON: %s", rr.Body.String())
+	}
+	if resp.Code != "precondition_required" {
+		t.Fatalf("code = %q, want %q", resp.Code, "precondition_required")
+	}
+}
+
+// TestIfMatch_RetireTemplate_StaleReturns412 verifies that
+// POST /v1/document-templates/{templateID}/retire with a stale ETag returns 412 Precondition Failed.
+func TestIfMatch_RetireTemplate_StaleReturns412(t *testing.T) {
+	store := newStubStore()
+	store.templates["template-1"] = &domain.TemplateDefinition{
+		TemplateID: "template-1", TenantID: "tenant-abc", LegalEntityID: "le-us",
+		Name: "Test", BusinessPurpose: "Test", OwnerPrincipalID: "ops-1",
+		Status: "ACTIVE", RecordVersion: 1,
+	}
+	pub := &stubPublisher{}
+	r := newRouter(store, pub, &stubAuthZ{})
+
+	// Request with stale If-Match
+	req := httptest.NewRequest(http.MethodPost, "/v1/document-templates/template-1/retire", bytes.NewBufferString(`{"retired_by_principal_id":"ops-1"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Principal-Id", "ops-1")
+	req.Header.Set("If-Match", `"v999"`) // Stale version
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusPreconditionFailed {
+		t.Fatalf("expected 412, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var resp struct {
+		Code           string `json:"code"`
+		CurrentVersion int64  `json:"current_version"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("body is not JSON: %s", rr.Body.String())
+	}
+	if resp.Code != "stale_version" {
+		t.Fatalf("code = %q, want %q", resp.Code, "stale_version")
+	}
+	if resp.CurrentVersion != 1 {
+		t.Fatalf("current_version = %d, want 1", resp.CurrentVersion)
+	}
+	etag := rr.Header().Get("ETag")
+	if etag != `"v1"` {
+		t.Fatalf("response ETag = %q, want %q", etag, `"v1"`)
+	}
+}
+
+// TestIfMatch_RetireTemplate_CorrectReturns200 verifies that
+// POST /v1/document-templates/{templateID}/retire with a correct ETag succeeds with 200.
+func TestIfMatch_RetireTemplate_CorrectReturns200(t *testing.T) {
+	store := newStubStore()
+	store.templates["template-1"] = &domain.TemplateDefinition{
+		TemplateID: "template-1", TenantID: "tenant-abc", LegalEntityID: "le-us",
+		Name: "Test", BusinessPurpose: "Test", OwnerPrincipalID: "ops-1",
+		Status: "ACTIVE", RecordVersion: 1,
+	}
+	pub := &stubPublisher{}
+	r := newRouter(store, pub, &stubAuthZ{})
+
+	// Request with correct If-Match
+	req := httptest.NewRequest(http.MethodPost, "/v1/document-templates/template-1/retire", bytes.NewBufferString(`{"retired_by_principal_id":"ops-1"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Principal-Id", "ops-1")
+	req.Header.Set("If-Match", `"v1"`) // Correct version
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var d domain.TemplateDefinition
+	if err := json.Unmarshal(rr.Body.Bytes(), &d); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if d.Status != "RETIRED" {
+		t.Errorf("status = %q, want RETIRED", d.Status)
+	}
+	etag := rr.Header().Get("ETag")
+	if etag != `"v2"` {
+		t.Fatalf("response ETag = %q, want %q", etag, `"v2"`)
+	}
+}
+
+// TestIfMatch_ValidateTemplateVersion_MissingReturns428 verifies that
+// POST /v1/document-templates/versions/{versionID}/validate requires an If-Match header.
+func TestIfMatch_ValidateTemplateVersion_MissingReturns428(t *testing.T) {
+	store := newStubStore()
+	store.templates["template-1"] = &domain.TemplateDefinition{
+		TemplateID: "template-1", TenantID: "tenant-abc", LegalEntityID: "le-us",
+		Name: "Test", BusinessPurpose: "Test", OwnerPrincipalID: "ops-1",
+		Status: "ACTIVE", RecordVersion: 1,
+	}
+	store.versions["version-1"] = &domain.TemplateVersion{
+		VersionID: "version-1", TemplateID: "template-1", TenantID: "tenant-abc",
+		LegalEntityID: "le-us", VersionNumber: 1, Locale: "en-US",
+		Content: "test", VariableSchema: []string{}, Status: "DRAFT",
+		CreatedByPrincipalID: "ops-1", RecordVersion: 1,
+	}
+	pub := &stubPublisher{}
+	r := newRouter(store, pub, &stubAuthZ{})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/document-templates/versions/version-1/validate", nil)
+	req.Header.Set("X-Principal-Id", "ops-1")
+	// No If-Match header
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusPreconditionRequired {
+		t.Fatalf("expected 428, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var resp struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("body is not JSON: %s", rr.Body.String())
+	}
+	if resp.Code != "precondition_required" {
+		t.Fatalf("code = %q, want %q", resp.Code, "precondition_required")
+	}
+}
+
+// TestIfMatch_ValidateTemplateVersion_StaleReturns412 verifies stale If-Match returns 412.
+func TestIfMatch_ValidateTemplateVersion_StaleReturns412(t *testing.T) {
+	store := newStubStore()
+	store.templates["template-1"] = &domain.TemplateDefinition{
+		TemplateID: "template-1", TenantID: "tenant-abc", LegalEntityID: "le-us",
+		Name: "Test", BusinessPurpose: "Test", OwnerPrincipalID: "ops-1",
+		Status: "ACTIVE", RecordVersion: 1,
+	}
+	store.versions["version-1"] = &domain.TemplateVersion{
+		VersionID: "version-1", TemplateID: "template-1", TenantID: "tenant-abc",
+		LegalEntityID: "le-us", VersionNumber: 1, Locale: "en-US",
+		Content: "test", VariableSchema: []string{}, Status: "DRAFT",
+		CreatedByPrincipalID: "ops-1", RecordVersion: 1,
+	}
+	pub := &stubPublisher{}
+	r := newRouter(store, pub, &stubAuthZ{})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/document-templates/versions/version-1/validate", nil)
+	req.Header.Set("X-Principal-Id", "ops-1")
+	req.Header.Set("If-Match", `"v999"`)
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusPreconditionFailed {
+		t.Fatalf("expected 412, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// TestIfMatch_ValidateTemplateVersion_CorrectReturns200 verifies correct If-Match succeeds.
+func TestIfMatch_ValidateTemplateVersion_CorrectReturns200(t *testing.T) {
+	store := newStubStore()
+	store.templates["template-1"] = &domain.TemplateDefinition{
+		TemplateID: "template-1", TenantID: "tenant-abc", LegalEntityID: "le-us",
+		Name: "Test", BusinessPurpose: "Test", OwnerPrincipalID: "ops-1",
+		Status: "ACTIVE", RecordVersion: 1,
+	}
+	store.versions["version-1"] = &domain.TemplateVersion{
+		VersionID: "version-1", TemplateID: "template-1", TenantID: "tenant-abc",
+		LegalEntityID: "le-us", VersionNumber: 1, Locale: "en-US",
+		Content: "test", VariableSchema: []string{}, Status: "DRAFT",
+		CreatedByPrincipalID: "ops-1", RecordVersion: 1,
+	}
+	pub := &stubPublisher{}
+	r := newRouter(store, pub, &stubAuthZ{})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/document-templates/versions/version-1/validate", nil)
+	req.Header.Set("X-Principal-Id", "ops-1")
+	req.Header.Set("If-Match", `"v1"`)
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var v domain.TemplateVersion
+	if err := json.Unmarshal(rr.Body.Bytes(), &v); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if v.Status != "REVIEW" {
+		t.Errorf("status = %q, want REVIEW", v.Status)
+	}
+	etag := rr.Header().Get("ETag")
+	if etag != `"v2"` {
+		t.Fatalf("response ETag = %q, want %q", etag, `"v2"`)
+	}
+}
+
+// TestIfMatch_ApproveTemplateVersion_CorrectReturns200 verifies correct If-Match succeeds.
+func TestIfMatch_ApproveTemplateVersion_CorrectReturns200(t *testing.T) {
+	store := newStubStore()
+	store.templates["template-1"] = &domain.TemplateDefinition{
+		TemplateID: "template-1", TenantID: "tenant-abc", LegalEntityID: "le-us",
+		Name: "Test", BusinessPurpose: "Test", OwnerPrincipalID: "ops-1",
+		Status: "ACTIVE", RecordVersion: 1,
+	}
+	store.versions["version-1"] = &domain.TemplateVersion{
+		VersionID: "version-1", TemplateID: "template-1", TenantID: "tenant-abc",
+		LegalEntityID: "le-us", VersionNumber: 1, Locale: "en-US",
+		Content: "test", VariableSchema: []string{}, Status: "REVIEW",
+		CreatedByPrincipalID: "ops-2", RecordVersion: 1,
+	}
+	pub := &stubPublisher{}
+	r := newRouter(store, pub, &stubAuthZ{})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/document-templates/versions/version-1/approve", bytes.NewBufferString(`{"approved_by_principal_id":"ops-3"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Principal-Id", "ops-3")
+	req.Header.Set("If-Match", `"v1"`)
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var v domain.TemplateVersion
+	if err := json.Unmarshal(rr.Body.Bytes(), &v); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if v.Status != "APPROVED" {
+		t.Errorf("status = %q, want APPROVED", v.Status)
+	}
+	etag := rr.Header().Get("ETag")
+	if etag != `"v2"` {
+		t.Fatalf("response ETag = %q, want %q", etag, `"v2"`)
+	}
+}
+
+// TestIfMatch_PublishTemplateVersion_CorrectReturns200 verifies correct If-Match succeeds.
+func TestIfMatch_PublishTemplateVersion_CorrectReturns200(t *testing.T) {
+	store := newStubStore()
+	store.templates["template-1"] = &domain.TemplateDefinition{
+		TemplateID: "template-1", TenantID: "tenant-abc", LegalEntityID: "le-us",
+		Name: "Test", BusinessPurpose: "Test", OwnerPrincipalID: "ops-1",
+		Status: "ACTIVE", RecordVersion: 1,
+	}
+	store.versions["version-1"] = &domain.TemplateVersion{
+		VersionID: "version-1", TemplateID: "template-1", TenantID: "tenant-abc",
+		LegalEntityID: "le-us", VersionNumber: 1, Locale: "en-US",
+		Content: "test", VariableSchema: []string{}, Status: "APPROVED",
+		CreatedByPrincipalID: "ops-2", RecordVersion: 1,
+	}
+	pub := &stubPublisher{}
+	r := newRouter(store, pub, &stubAuthZ{})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/document-templates/versions/version-1/publish", bytes.NewBufferString(`{"published_by_principal_id":"ops-3"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Principal-Id", "ops-3")
+	req.Header.Set("If-Match", `"v1"`)
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var v domain.TemplateVersion
+	if err := json.Unmarshal(rr.Body.Bytes(), &v); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if v.Status != "PUBLISHED" {
+		t.Errorf("status = %q, want PUBLISHED", v.Status)
+	}
+	etag := rr.Header().Get("ETag")
+	if etag != `"v2"` {
+		t.Fatalf("response ETag = %q, want %q", etag, `"v2"`)
+	}
 }

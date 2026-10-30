@@ -540,10 +540,12 @@ func scoped(req *http.Request) *http.Request {
 }
 
 // scopedAs adds both a verified X-Tenant-Id and X-Principal-Id — for
-// mutation routes, which require both.
+// mutation routes, which require both. It also adds If-Match: "v1" for
+// optimistic concurrency on mutation routes.
 func scopedAs(req *http.Request, principalID string) *http.Request {
 	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 	req.Header.Set("X-Principal-Id", principalID)
+	req.Header.Set("If-Match", `"v1"`)
 	return req
 }
 
@@ -555,7 +557,7 @@ func validCreateBody() string {
 
 func TestCreateWorkflow_Created(t *testing.T) {
 	store := &stubStore{
-		instance: &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, WorkflowStatus: "PENDING"},
+		instance: &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, WorkflowStatus: "PENDING", RowVersion: 1},
 		stages:   []*domain.WorkflowStage{{WorkflowStageID: "s-1", StageOrder: 1}, {WorkflowStageID: "s-2", StageOrder: 2}},
 	}
 	pub := &stubPublisher{}
@@ -661,9 +663,9 @@ func TestCreateWorkflow_InitiatorAsApprover_Rejected(t *testing.T) {
 
 func TestSubmitAction_Approved_PublishesGrantedOnly_WhenNotFinalStage(t *testing.T) {
 	store := &stubStore{
-		findInstance:       &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, LegalEntityID: "22222222-2222-4222-8222-222222222222", WorkflowStatus: "PENDING"},
+		findInstance:       &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, LegalEntityID: "22222222-2222-4222-8222-222222222222", WorkflowStatus: "PENDING", RowVersion: 1},
 		currentStage:       &domain.WorkflowStage{StageOrder: 1, ApproverPrincipalID: "approver-1"},
-		submitInstance:     &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, WorkflowStatus: "PENDING"},
+		submitInstance:     &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, WorkflowStatus: "PENDING", RowVersion: 1},
 		submitStage:        &domain.WorkflowStage{StageOrder: 1, StageStatus: "APPROVED"},
 		submitTransitioned: true,
 	}
@@ -687,9 +689,9 @@ func TestSubmitAction_Approved_PublishesGrantedOnly_WhenNotFinalStage(t *testing
 
 func TestSubmitAction_FinalApprove_PublishesCompleted(t *testing.T) {
 	store := &stubStore{
-		findInstance:       &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, LegalEntityID: "22222222-2222-4222-8222-222222222222", WorkflowStatus: "PENDING"},
+		findInstance:       &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, LegalEntityID: "22222222-2222-4222-8222-222222222222", WorkflowStatus: "PENDING", RowVersion: 1},
 		currentStage:       &domain.WorkflowStage{StageOrder: 2, ApproverPrincipalID: "approver-2"},
-		submitInstance:     &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, WorkflowStatus: "APPROVED"},
+		submitInstance:     &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, WorkflowStatus: "APPROVED", RowVersion: 1},
 		submitStage:        &domain.WorkflowStage{StageOrder: 2, StageStatus: "APPROVED"},
 		submitTransitioned: true,
 	}
@@ -719,9 +721,9 @@ func TestSubmitAction_FinalApprove_PublishesCompleted(t *testing.T) {
 
 func TestSubmitAction_IdempotentNoOp_DoesNotRepublish(t *testing.T) {
 	store := &stubStore{
-		findInstance:       &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, LegalEntityID: "22222222-2222-4222-8222-222222222222", WorkflowStatus: "PENDING"},
+		findInstance:       &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, LegalEntityID: "22222222-2222-4222-8222-222222222222", WorkflowStatus: "PENDING", RowVersion: 1},
 		currentStage:       &domain.WorkflowStage{StageOrder: 1, ApproverPrincipalID: "approver-1"},
-		submitInstance:     &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, WorkflowStatus: "PENDING"},
+		submitInstance:     &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, WorkflowStatus: "PENDING", RowVersion: 1},
 		submitStage:        &domain.WorkflowStage{StageOrder: 1, StageStatus: "APPROVED"},
 		submitTransitioned: false,
 	}
@@ -743,7 +745,7 @@ func TestSubmitAction_IdempotentNoOp_DoesNotRepublish(t *testing.T) {
 
 func TestSubmitAction_AuthorizationDenied_Returns403_NeverTouchesStore(t *testing.T) {
 	store := &stubStore{
-		findInstance: &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, LegalEntityID: "22222222-2222-4222-8222-222222222222", WorkflowStatus: "PENDING"},
+		findInstance: &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, LegalEntityID: "22222222-2222-4222-8222-222222222222", WorkflowStatus: "PENDING", RowVersion: 1},
 		currentStage: &domain.WorkflowStage{StageOrder: 1, ApproverPrincipalID: "approver-1"},
 		submitErr:    domain.ErrWorkflowNotFound, // would only be hit if SubmitAction were called
 	}
@@ -761,7 +763,7 @@ func TestSubmitAction_AuthorizationDenied_Returns403_NeverTouchesStore(t *testin
 
 func TestSubmitAction_AuthorizationServiceUnavailable_FailsClosed(t *testing.T) {
 	store := &stubStore{
-		findInstance: &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, LegalEntityID: "22222222-2222-4222-8222-222222222222", WorkflowStatus: "PENDING"},
+		findInstance: &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, LegalEntityID: "22222222-2222-4222-8222-222222222222", WorkflowStatus: "PENDING", RowVersion: 1},
 		currentStage: &domain.WorkflowStage{StageOrder: 1, ApproverPrincipalID: "approver-1"},
 	}
 	r := newTestRouterFull(store, &stubPublisher{}, &stubAuthz{err: domain.ErrAuthorizationServiceUnavailable})
@@ -778,7 +780,7 @@ func TestSubmitAction_AuthorizationServiceUnavailable_FailsClosed(t *testing.T) 
 
 func TestSubmitAction_WrongApprover(t *testing.T) {
 	store := &stubStore{
-		findInstance: &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, LegalEntityID: "22222222-2222-4222-8222-222222222222", WorkflowStatus: "PENDING"},
+		findInstance: &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, LegalEntityID: "22222222-2222-4222-8222-222222222222", WorkflowStatus: "PENDING", RowVersion: 1},
 		currentStage: &domain.WorkflowStage{StageOrder: 1, ApproverPrincipalID: "approver-1"},
 		submitErr:    domain.ErrWrongApprover,
 	}
@@ -801,7 +803,7 @@ func TestSubmitAction_WrongApprover(t *testing.T) {
 // assigned approver for the current stage, they must still be rejected.
 func TestSubmitAction_InitiatorSelfApproval_Forbidden(t *testing.T) {
 	store := &stubStore{
-		findInstance: &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, LegalEntityID: "22222222-2222-4222-8222-222222222222", WorkflowStatus: "PENDING", InitiatedBy: "requester-1"},
+		findInstance: &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, LegalEntityID: "22222222-2222-4222-8222-222222222222", WorkflowStatus: "PENDING", InitiatedBy: "requester-1", RowVersion: 1},
 		currentStage: &domain.WorkflowStage{StageOrder: 1, ApproverPrincipalID: "requester-1"},
 		submitErr:    domain.ErrWorkflowNotFound, // would only be hit if SubmitAction were called
 	}
@@ -820,7 +822,7 @@ func TestSubmitAction_InitiatorSelfApproval_Forbidden(t *testing.T) {
 }
 
 func TestSubmitAction_InvalidAction(t *testing.T) {
-	store := &stubStore{findInstance: &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, LegalEntityID: "22222222-2222-4222-8222-222222222222"}}
+	store := &stubStore{findInstance: &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, LegalEntityID: "22222222-2222-4222-8222-222222222222", WorkflowStatus: "PENDING", RowVersion: 1}}
 	r := newTestRouter(store)
 
 	body := `{"action":"MAYBE"}`
@@ -842,6 +844,7 @@ func TestSubmitAction_IllegalTransitionEdge_NegativeControl(t *testing.T) {
 			WorkflowInstanceID: testCancelledID,
 			LegalEntityID:      "22222222-2222-4222-8222-222222222222",
 			WorkflowStatus:     "CANCELLED",
+			RowVersion:      1,
 		},
 		currentStage: &domain.WorkflowStage{StageOrder: 1, ApproverPrincipalID: "approver-1"},
 	}
@@ -885,6 +888,7 @@ func TestEscalateWorkflow_InvalidTransition(t *testing.T) {
 			TenantID:           "11111111-1111-4111-8111-111111111111",
 			LegalEntityID:      "22222222-2222-4222-8222-222222222222",
 			WorkflowStatus:     "APPROVED",
+			RowVersion:         1,
 		},
 		escalateErr: domain.ErrInvalidTransition,
 	}
@@ -906,8 +910,9 @@ func TestCancelWorkflow_Success(t *testing.T) {
 			TenantID:           "11111111-1111-4111-8111-111111111111",
 			LegalEntityID:      "22222222-2222-4222-8222-222222222222",
 			WorkflowStatus:     "PENDING",
+			RowVersion:         1,
 		},
-		cancelInstance:     &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, WorkflowStatus: "CANCELLED"},
+		cancelInstance:     &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, WorkflowStatus: "CANCELLED", RowVersion: 1},
 		cancelTransitioned: true,
 	}
 	pub := &stubPublisher{}
@@ -943,7 +948,7 @@ func TestGetNextApprover_NotFound(t *testing.T) {
 }
 
 func TestGetNextApprover_Found(t *testing.T) {
-	store := &stubStore{findInstance: &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, WorkflowStatus: "PENDING", InitiatedBy: "requester-1"}, currentStage: &domain.WorkflowStage{StageOrder: 1, ApproverPrincipalID: "approver-1"}}
+	store := &stubStore{		findInstance: &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, WorkflowStatus: "PENDING", InitiatedBy: "requester-1", RowVersion: 1}, currentStage: &domain.WorkflowStage{StageOrder: 1, ApproverPrincipalID: "approver-1"}}
 	r := newTestRouter(store)
 
 	req := scopedAs(httptest.NewRequest(http.MethodGet, "/v1/workflows/"+testWorkflowID+"/next-approver", nil), "reader-1")
@@ -972,7 +977,7 @@ func TestGetNextApprover_NoTenantScope_Refused(t *testing.T) {
 
 func TestGetWorkflow_Found(t *testing.T) {
 	store := &stubStore{
-		findInstance: &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, WorkflowStatus: "PENDING"},
+		findInstance: &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, WorkflowStatus: "PENDING", RowVersion: 1},
 		stages:       []*domain.WorkflowStage{{WorkflowStageID: "s-1", StageOrder: 1}},
 	}
 	r := newTestRouter(store)
@@ -1021,6 +1026,7 @@ func TestCreateWorkflow_WithSubjectBinding_Success(t *testing.T) {
 			SubjectID:          &subjID,
 			SubjectVersion:     &subjVer,
 			SubjectFingerprint: &fp,
+			RowVersion:      1,
 		},
 		stages: []*domain.WorkflowStage{{WorkflowStageID: "s-1", StageOrder: 1}},
 	}
@@ -1115,7 +1121,7 @@ func TestInvalidateWorkflow_Pending_Success(t *testing.T) {
 	code := "CONTROL_FAILURE"
 
 	store := &stubStore{
-		findInstance: &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, TenantID: "11111111-1111-4111-8111-111111111111", LegalEntityID: "22222222-2222-4222-8222-222222222222", WorkflowStatus: "PENDING", InitiatedBy: "requester-1"},
+		findInstance: &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, TenantID: "11111111-1111-4111-8111-111111111111", LegalEntityID: "22222222-2222-4222-8222-222222222222", WorkflowStatus: "PENDING", InitiatedBy: "requester-1", RowVersion: 1},
 		invalidateInstance: &domain.WorkflowInstance{
 			WorkflowInstanceID:     testWorkflowID,
 			WorkflowStatus:         domain.WorkflowStatusInvalidated,
@@ -1148,7 +1154,7 @@ func TestInvalidateWorkflow_Pending_Success(t *testing.T) {
 func TestInvalidateWorkflow_Approved_Success(t *testing.T) {
 	code := "CANCEL_CUSTOMER_REQUEST"
 	store := &stubStore{
-		findInstance: &domain.WorkflowInstance{WorkflowInstanceID: testApprovedID, TenantID: "11111111-1111-4111-8111-111111111111", LegalEntityID: "22222222-2222-4222-8222-222222222222", WorkflowStatus: "APPROVED", InitiatedBy: "requester-1"},
+		findInstance: &domain.WorkflowInstance{WorkflowInstanceID: testApprovedID, TenantID: "11111111-1111-4111-8111-111111111111", LegalEntityID: "22222222-2222-4222-8222-222222222222", WorkflowStatus: "APPROVED", InitiatedBy: "requester-1", RowVersion: 1},
 		invalidateInstance: &domain.WorkflowInstance{
 			WorkflowInstanceID:     testApprovedID,
 			WorkflowStatus:         domain.WorkflowStatusInvalidated,
@@ -1180,7 +1186,7 @@ func TestInvalidateWorkflow_IdempotentReplay_DoesNotRepublish(t *testing.T) {
 	store := &stubStore{
 		// PENDING when the handler read it; an identical invalidate committed
 		// in between, so the store reports no transition.
-		findInstance: &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, TenantID: "11111111-1111-4111-8111-111111111111", LegalEntityID: "22222222-2222-4222-8222-222222222222", WorkflowStatus: "PENDING", InitiatedBy: "requester-1"},
+		findInstance: &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, TenantID: "11111111-1111-4111-8111-111111111111", LegalEntityID: "22222222-2222-4222-8222-222222222222", WorkflowStatus: "PENDING", InitiatedBy: "requester-1", RowVersion: 1},
 		invalidateInstance: &domain.WorkflowInstance{
 			WorkflowInstanceID:     testWorkflowID,
 			WorkflowStatus:         domain.WorkflowStatusInvalidated,
@@ -1235,7 +1241,7 @@ func TestInvalidateWorkflow_MissingReasonCode_BadRequest(t *testing.T) {
 
 func TestInvalidateWorkflow_TerminalState_Conflict(t *testing.T) {
 	store := &stubStore{
-		findInstance:  &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, TenantID: "11111111-1111-4111-8111-111111111111", LegalEntityID: "22222222-2222-4222-8222-222222222222", WorkflowStatus: "PENDING", InitiatedBy: "requester-1"},
+		findInstance:  &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, TenantID: "11111111-1111-4111-8111-111111111111", LegalEntityID: "22222222-2222-4222-8222-222222222222", WorkflowStatus: "PENDING", InitiatedBy: "requester-1", RowVersion: 1},
 		invalidateErr: domain.ErrInvalidTransition,
 	}
 	r := newTestRouter(store)
@@ -1267,7 +1273,7 @@ func TestInvalidateWorkflow_TerminalState_Conflict(t *testing.T) {
 func TestVerifyRelease_ApprovedMatching_CanRelease(t *testing.T) {
 	fp := validSubjectFingerprint()
 	store := &stubStore{
-		findInstance: &domain.WorkflowInstance{WorkflowInstanceID: testApprovedID, TenantID: "11111111-1111-4111-8111-111111111111", LegalEntityID: "22222222-2222-4222-8222-222222222222", WorkflowStatus: "APPROVED", InitiatedBy: "requester-1"},
+		findInstance: &domain.WorkflowInstance{WorkflowInstanceID: testApprovedID, TenantID: "11111111-1111-4111-8111-111111111111", LegalEntityID: "22222222-2222-4222-8222-222222222222", WorkflowStatus: "APPROVED", InitiatedBy: "requester-1", RowVersion: 1},
 		verifyReleaseResult: &domain.ReleaseVerificationResult{
 			WorkflowInstanceID: testApprovedID,
 			CanRelease:         true,
@@ -1296,7 +1302,7 @@ func TestVerifyRelease_ApprovedMatching_CanRelease(t *testing.T) {
 func TestVerifyRelease_FingerprintMismatch_Conflict(t *testing.T) {
 	reason := domain.ErrSubjectFingerprintMismatch.Error()
 	store := &stubStore{
-		findInstance: &domain.WorkflowInstance{WorkflowInstanceID: testApprovedID, TenantID: "11111111-1111-4111-8111-111111111111", LegalEntityID: "22222222-2222-4222-8222-222222222222", WorkflowStatus: "APPROVED", InitiatedBy: "requester-1"},
+		findInstance: &domain.WorkflowInstance{WorkflowInstanceID: testApprovedID, TenantID: "11111111-1111-4111-8111-111111111111", LegalEntityID: "22222222-2222-4222-8222-222222222222", WorkflowStatus: "APPROVED", InitiatedBy: "requester-1", RowVersion: 1},
 		verifyReleaseResult: &domain.ReleaseVerificationResult{
 			WorkflowInstanceID: testApprovedID,
 			CanRelease:         false,
@@ -1327,7 +1333,7 @@ func TestVerifyRelease_FingerprintMismatch_Conflict(t *testing.T) {
 func TestVerifyRelease_UnboundSubject_FailsSafely(t *testing.T) {
 	reason := domain.ErrWorkflowUnboundSubject.Error()
 	store := &stubStore{
-		findInstance: &domain.WorkflowInstance{WorkflowInstanceID: testLegacyID, TenantID: "11111111-1111-4111-8111-111111111111", LegalEntityID: "22222222-2222-4222-8222-222222222222", WorkflowStatus: "APPROVED", InitiatedBy: "requester-1"},
+		findInstance: &domain.WorkflowInstance{WorkflowInstanceID: testLegacyID, TenantID: "11111111-1111-4111-8111-111111111111", LegalEntityID: "22222222-2222-4222-8222-222222222222", WorkflowStatus: "APPROVED", InitiatedBy: "requester-1", RowVersion: 1},
 		verifyReleaseResult: &domain.ReleaseVerificationResult{
 			WorkflowInstanceID: testLegacyID,
 			CanRelease:         false,
@@ -1355,7 +1361,7 @@ func TestVerifyRelease_UnboundSubject_FailsSafely(t *testing.T) {
 
 func TestVerifyRelease_InvalidFingerprintFormat_BadRequest(t *testing.T) {
 	r := newTestRouter(&stubStore{
-		findInstance: &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, TenantID: "11111111-1111-4111-8111-111111111111", LegalEntityID: "22222222-2222-4222-8222-222222222222", WorkflowStatus: "APPROVED", InitiatedBy: "requester-1"},
+		findInstance: &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, TenantID: "11111111-1111-4111-8111-111111111111", LegalEntityID: "22222222-2222-4222-8222-222222222222", WorkflowStatus: "APPROVED", InitiatedBy: "requester-1", RowVersion: 1},
 	})
 
 	body := `{"current_subject_fingerprint":"bad-fingerprint"}`

@@ -184,6 +184,7 @@ func TestBreakGlass_Revocation(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/admin/v1/break-glass-sessions/bg-uuid-1/revoke", nil)
 	req.Header.Set("X-Tenant-Id", testBGTenantID)
 	req.Header.Set("X-Principal-Id", testBGCaller)
+	req.Header.Set("If-Match", `"v1"`)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 

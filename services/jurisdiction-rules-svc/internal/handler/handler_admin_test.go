@@ -306,7 +306,7 @@ func TestAdminRoutes_503_AuthzUnavailableFailsClosed(t *testing.T) {
 
 func TestCreateJurisdiction_201_Created(t *testing.T) {
 	st := &stubStore{
-		createdJurisdiction:    &domain.Jurisdiction{JurisdictionID: "j-1", JurisdictionCode: "GB"},
+		createdJurisdiction:    &domain.Jurisdiction{JurisdictionID: "j-1", JurisdictionCode: "GB", RowVersion: 1},
 		jurisdictionWasCreated: true,
 	}
 	h, pub := newTestRouterWithPublisher(st, permitAll())
@@ -323,6 +323,10 @@ func TestCreateJurisdiction_201_Created(t *testing.T) {
 	if !pub.has("jurisdiction.created") {
 		t.Errorf("expected jurisdiction.created to be published, got %v", pub.emitted)
 	}
+	// API-3: response must carry ETag of the created aggregate
+	if etag := rr.Header().Get("ETag"); etag != `"1"` {
+		t.Fatalf("expected ETag \"1\", got %q", etag)
+	}
 }
 
 // TestCreateJurisdiction_200_IdempotentReplay also asserts the replay stays
@@ -330,7 +334,7 @@ func TestCreateJurisdiction_201_Created(t *testing.T) {
 // jurisdiction that already existed.
 func TestCreateJurisdiction_200_IdempotentReplay(t *testing.T) {
 	st := &stubStore{
-		createdJurisdiction:    &domain.Jurisdiction{JurisdictionID: "j-1", JurisdictionCode: "GB"},
+		createdJurisdiction:    &domain.Jurisdiction{JurisdictionID: "j-1", JurisdictionCode: "GB", RowVersion: 1},
 		jurisdictionWasCreated: false,
 	}
 	h, pub := newTestRouterWithPublisher(st, permitAll())
@@ -342,6 +346,10 @@ func TestCreateJurisdiction_200_IdempotentReplay(t *testing.T) {
 	}
 	if len(pub.emitted) != 0 {
 		t.Errorf("an idempotent replay must not publish, got %v", pub.emitted)
+	}
+	// API-3: response must carry ETag
+	if etag := rr.Header().Get("ETag"); etag != `"1"` {
+		t.Fatalf("expected ETag \"1\", got %q", etag)
 	}
 }
 
@@ -574,7 +582,7 @@ func TestDeactivateJurisdiction_404_NotFound(t *testing.T) {
 
 func TestCreateRule_201_Created(t *testing.T) {
 	st := &stubStore{
-		createdRule:    &domain.JurisdictionRule{JurisdictionRuleID: "r-1", RuleStatus: "DRAFT"},
+		createdRule:    &domain.JurisdictionRule{JurisdictionRuleID: "r-1", RuleStatus: "DRAFT", RowVersion: 1},
 		ruleWasCreated: true,
 	}
 	h, pub := newTestRouterWithPublisher(st, permitAll())
@@ -591,11 +599,15 @@ func TestCreateRule_201_Created(t *testing.T) {
 	if pub.has("jurisdiction.rule.activated") {
 		t.Errorf("a DRAFT rule must not publish rule.activated, got %v", pub.emitted)
 	}
+	// API-3: response must carry ETag of the created aggregate
+	if etag := rr.Header().Get("ETag"); etag != `"1"` {
+		t.Fatalf("expected ETag \"1\", got %q", etag)
+	}
 }
 
 func TestCreateRule_200_ReplayDoesNotPublish(t *testing.T) {
 	st := &stubStore{
-		createdRule:    &domain.JurisdictionRule{JurisdictionRuleID: "r-1", RuleStatus: "DRAFT"},
+		createdRule:    &domain.JurisdictionRule{JurisdictionRuleID: "r-1", RuleStatus: "DRAFT", RowVersion: 1},
 		ruleWasCreated: false,
 	}
 	h, pub := newTestRouterWithPublisher(st, permitAll())
@@ -607,6 +619,10 @@ func TestCreateRule_200_ReplayDoesNotPublish(t *testing.T) {
 	}
 	if len(pub.emitted) != 0 {
 		t.Errorf("an idempotent replay must not publish, got %v", pub.emitted)
+	}
+	// API-3: response must carry ETag
+	if etag := rr.Header().Get("ETag"); etag != `"1"` {
+		t.Fatalf("expected ETag \"1\", got %q", etag)
 	}
 }
 

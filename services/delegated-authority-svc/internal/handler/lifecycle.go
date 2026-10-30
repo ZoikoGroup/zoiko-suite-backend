@@ -270,6 +270,8 @@ func expectedVersion(w http.ResponseWriter, r *http.Request) (int64, bool) {
 	if v == "" {
 		v = strings.Trim(strings.TrimPrefix(r.Header.Get("If-Match"), "W/"), `"`)
 	}
+	// Accept If-Match values in the form "vN" (e.g., "v1") as well as just "N"
+	v = strings.TrimPrefix(v, "v")
 	if v == "" {
 		writeError(w, r, http.StatusPreconditionRequired, "version_required", string(domain.ErrVersionRequired))
 		return 0, false

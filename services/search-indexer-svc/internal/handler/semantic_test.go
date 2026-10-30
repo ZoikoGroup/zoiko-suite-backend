@@ -58,7 +58,7 @@ func TestSearch_StaleProtectedScopeIsRefusedWithESR012(t *testing.T) {
 	h := newHarness(t, nil)
 	h.store.checkpoint = &domain.IndexCheckpoint{Freshness: domain.FreshnessStale, LagMS: 7200000, ObservedAt: time.Now()}
 
-	w := do(h, req(t, http.MethodPost, "/v1/search", map[string]any{"scope": "obligation", "query": "GST"}))
+	w := do(h, req(t, http.MethodPost, "/v1/search", map[string]any{"scope": "obligation", "query": "GST"}, ""))
 	require.Equal(t, http.StatusServiceUnavailable, w.Code, w.Body.String())
 	assert.Equal(t, "ESR-012", bodyOf(t, w)["reason_code"])
 }
@@ -68,7 +68,7 @@ func TestSearch_UnmeasuredProtectedScopeIsRefused(t *testing.T) {
 	h := newHarness(t, nil)
 	h.store.checkpointErr = domain.ErrNotFound
 
-	w := do(h, req(t, http.MethodPost, "/v1/search", map[string]any{"scope": "obligation", "query": "GST"}))
+	w := do(h, req(t, http.MethodPost, "/v1/search", map[string]any{"scope": "obligation", "query": "GST"}, ""))
 	require.Equal(t, http.StatusServiceUnavailable, w.Code)
 	assert.Equal(t, "ESR-012", bodyOf(t, w)["reason_code"])
 }
@@ -79,7 +79,7 @@ func TestSearch_AbandonedCheckpointReadsAsUnknown(t *testing.T) {
 	h.handler.checkpointMaxAge = time.Minute
 	h.store.checkpoint = &domain.IndexCheckpoint{Freshness: domain.FreshnessCurrent, ObservedAt: time.Now().Add(-time.Hour)}
 
-	w := do(h, req(t, http.MethodPost, "/v1/search", map[string]any{"scope": "obligation", "query": "GST"}))
+	w := do(h, req(t, http.MethodPost, "/v1/search", map[string]any{"scope": "obligation", "query": "GST"}, ""))
 	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
 }
 
@@ -89,7 +89,7 @@ func TestSearch_StaleR0ScopeAnswersFlagged(t *testing.T) {
 	h.store.contract.RetrievalClass = domain.RetrievalR0
 	h.store.checkpoint = &domain.IndexCheckpoint{Freshness: domain.FreshnessStale, LagMS: 5000, ObservedAt: time.Now()}
 
-	w := do(h, req(t, http.MethodPost, "/v1/search", map[string]any{"scope": "obligation", "query": "GST"}))
+	w := do(h, req(t, http.MethodPost, "/v1/search", map[string]any{"scope": "obligation", "query": "GST"}, ""))
 	require.Equal(t, http.StatusPartialContent, w.Code, w.Body.String())
 	body := bodyOf(t, w)
 	assert.Equal(t, "STALE", body["index_freshness"])
@@ -101,7 +101,7 @@ func TestSearch_LaggingIsSurfacedNotBlocked(t *testing.T) {
 	h := newHarness(t, nil)
 	h.store.checkpoint = &domain.IndexCheckpoint{Freshness: domain.FreshnessLagging, LagMS: 200000, ObservedAt: time.Now()}
 
-	w := do(h, req(t, http.MethodPost, "/v1/search", map[string]any{"scope": "obligation", "query": "GST"}))
+	w := do(h, req(t, http.MethodPost, "/v1/search", map[string]any{"scope": "obligation", "query": "GST"}, ""))
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 	body := bodyOf(t, w)
 	assert.Equal(t, "LAGGING", body["index_freshness"])
@@ -116,7 +116,7 @@ func TestSearch_FailedRestrictionsAreExcludedAndReported(t *testing.T) {
 	h := newHarness(t, nil)
 	h.store.failedRefs = []string{"ob-9"}
 
-	w := do(h, req(t, http.MethodPost, "/v1/search", map[string]any{"scope": "obligation", "query": "GST"}))
+	w := do(h, req(t, http.MethodPost, "/v1/search", map[string]any{"scope": "obligation", "query": "GST"}, ""))
 	require.Equal(t, http.StatusPartialContent, w.Code, w.Body.String())
 	assert.Contains(t, bodyOf(t, w)["reason_codes"], "ESR-018")
 
@@ -137,7 +137,7 @@ func TestSearch_TooManyFailedRestrictionsBlocksTheScope(t *testing.T) {
 	}
 	h.store.failedRefs = refs
 
-	w := do(h, req(t, http.MethodPost, "/v1/search", map[string]any{"scope": "obligation", "query": "GST"}))
+	w := do(h, req(t, http.MethodPost, "/v1/search", map[string]any{"scope": "obligation", "query": "GST"}, ""))
 	require.Equal(t, http.StatusServiceUnavailable, w.Code)
 	assert.Equal(t, "ESR-018", bodyOf(t, w)["reason_code"])
 }
@@ -147,7 +147,7 @@ func TestRetrieve_AppliesTheSameHealthGate(t *testing.T) {
 	h.store.checkpoint = &domain.IndexCheckpoint{Freshness: domain.FreshnessStale, ObservedAt: time.Now()}
 	w := do(h, req(t, http.MethodPost, "/v1/retrieve", map[string]any{
 		"scope": "obligation", "refs": []map[string]string{{"source_type": "obligation", "source_id": "ob-1"}},
-	}))
+	}, ""))
 	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
 }
 
@@ -157,7 +157,7 @@ func TestSemantic_HappyPathEmbedsWithThePinAndFiltersInsideTheWalk(t *testing.T)
 	h, emb := semanticHarness(t)
 	w := do(h, req(t, http.MethodPost, "/v1/search/semantic", map[string]any{
 		"scope": "obligation", "query": "which filings are overdue?", "size": 5,
-	}))
+	}, ""))
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 	assert.Equal(t, 1, emb.calls)
 	assert.Equal(t, "m@1", bodyOf(t, w)["embedding_model"])
@@ -180,10 +180,10 @@ func TestSemantic_HappyPathEmbedsWithThePinAndFiltersInsideTheWalk(t *testing.T)
 func TestSemantic_RefusedRequestsAreNeverEmbedded(t *testing.T) {
 	h, emb := semanticHarness(t)
 	h.store.checkpoint = &domain.IndexCheckpoint{Freshness: domain.FreshnessStale, ObservedAt: time.Now()}
-	w := do(h, req(t, http.MethodPost, "/v1/search/semantic", map[string]any{"scope": "obligation", "query": "overdue"}))
+	w := do(h, req(t, http.MethodPost, "/v1/search/semantic", map[string]any{"scope": "obligation", "query": "overdue"}, ""))
 	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
 
-	r := req(t, http.MethodPost, "/v1/search/semantic", map[string]any{"scope": "obligation", "query": "overdue"})
+	r := req(t, http.MethodPost, "/v1/search/semantic", map[string]any{"scope": "obligation", "query": "overdue"}, "")
 	r.Header.Del("X-Purpose-Context")
 	do(h, r)
 	assert.Zero(t, emb.calls)
@@ -193,7 +193,7 @@ func TestSemantic_RefusedRequestsAreNeverEmbedded(t *testing.T) {
 func TestSemantic_NoProviderIsESR019(t *testing.T) {
 	h := newHarness(t, nil)
 	h.store.contract.Embedding = pin()
-	w := do(h, req(t, http.MethodPost, "/v1/search/semantic", map[string]any{"scope": "obligation", "query": "overdue"}))
+	w := do(h, req(t, http.MethodPost, "/v1/search/semantic", map[string]any{"scope": "obligation", "query": "overdue"}, ""))
 	require.Equal(t, http.StatusServiceUnavailable, w.Code)
 	assert.Equal(t, "ESR-019", bodyOf(t, w)["reason_code"])
 	assert.Zero(t, h.engine.lastPlan.K, "nothing was executed")
@@ -203,7 +203,7 @@ func TestSemantic_NoProviderIsESR019(t *testing.T) {
 func TestSemantic_ProviderModelDriftIsESR019(t *testing.T) {
 	h, emb := semanticHarness(t)
 	emb.err = embedding.ErrModelMismatch
-	w := do(h, req(t, http.MethodPost, "/v1/search/semantic", map[string]any{"scope": "obligation", "query": "overdue"}))
+	w := do(h, req(t, http.MethodPost, "/v1/search/semantic", map[string]any{"scope": "obligation", "query": "overdue"}, ""))
 	require.Equal(t, http.StatusServiceUnavailable, w.Code)
 	assert.Equal(t, "ESR-019", bodyOf(t, w)["reason_code"])
 }
@@ -212,7 +212,7 @@ func TestSemantic_CallerExpectingAnotherModelGets409(t *testing.T) {
 	h, _ := semanticHarness(t)
 	w := do(h, req(t, http.MethodPost, "/v1/search/semantic", map[string]any{
 		"scope": "obligation", "query": "overdue", "model": "m@2",
-	}))
+	}, ""))
 	require.Equal(t, http.StatusConflict, w.Code)
 	assert.Equal(t, "ESR-019", bodyOf(t, w)["reason_code"])
 }
@@ -220,7 +220,7 @@ func TestSemantic_CallerExpectingAnotherModelGets409(t *testing.T) {
 func TestSemantic_LexicalScopeIsNotRegistered(t *testing.T) {
 	h := newHarness(t, nil)
 	h.handler.embedder = &stubEmbedder{}
-	w := do(h, req(t, http.MethodPost, "/v1/search/semantic", map[string]any{"scope": "obligation", "query": "overdue"}))
+	w := do(h, req(t, http.MethodPost, "/v1/search/semantic", map[string]any{"scope": "obligation", "query": "overdue"}, ""))
 	require.Equal(t, http.StatusNotFound, w.Code)
 	assert.Equal(t, "ESR-002", bodyOf(t, w)["reason_code"])
 }
@@ -230,7 +230,7 @@ func TestSemantic_CallerSuppliedVectorIsRejected(t *testing.T) {
 	h, emb := semanticHarness(t)
 	w := do(h, req(t, http.MethodPost, "/v1/search/semantic", map[string]any{
 		"scope": "obligation", "query": "overdue", "vector": []float32{1, 2, 3},
-	}))
+	}, ""))
 	assert.Equal(t, http.StatusBadRequest, w.Code)
 	assert.Zero(t, emb.calls)
 }
@@ -266,7 +266,7 @@ func TestCreateContract_EmbeddingPinIsValidated(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			h := newHarness(t, nil)
 			h.store.sources = []domain.SearchSource{{SourceID: "s-1", SourceType: "obligation", SensitivityCeiling: domain.SensitivityRestricted}}
-			w := do(h, req(t, http.MethodPost, "/v1/index-contracts", contractBody(emb)))
+			w := do(h, req(t, http.MethodPost, "/v1/index-contracts", contractBody(emb), ""))
 			assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
 			assert.Equal(t, "invalid_embedding_contract", errorCode(t, w))
 		})
@@ -276,10 +276,10 @@ func TestCreateContract_EmbeddingPinIsValidated(t *testing.T) {
 func TestCreateContract_ValidPinIsStoredAndDigested(t *testing.T) {
 	h := newHarness(t, nil)
 	h.store.sources = []domain.SearchSource{{SourceID: "s-1", SourceType: "obligation", SensitivityCeiling: domain.SensitivityRestricted}}
-	lexical := bodyOf(t, do(h, req(t, http.MethodPost, "/v1/index-contracts", contractBody(nil))))
+	lexical := bodyOf(t, do(h, req(t, http.MethodPost, "/v1/index-contracts", contractBody(nil), "")))
 	semantic := bodyOf(t, do(h, req(t, http.MethodPost, "/v1/index-contracts", contractBody(map[string]any{
 		"model": "m", "model_version": "1", "dimensions": 3, "source_fields": []string{"obligation_code"},
-	}))))
+	}), "")))
 	require.NotNil(t, semantic["embedding"])
 	assert.Equal(t, "nfkc-ws-v1", semantic["embedding"].(map[string]any)["preprocessing"])
 	assert.NotEqual(t, lexical["schema_digest"], semantic["schema_digest"], "the pin is part of the contract's identity")
@@ -288,7 +288,7 @@ func TestCreateContract_ValidPinIsStoredAndDigested(t *testing.T) {
 func TestCreateGeneration_SemanticScopeRefusedWithoutProvider(t *testing.T) {
 	h := newHarness(t, nil)
 	h.store.contract.Embedding = pin()
-	w := do(h, req(t, http.MethodPost, "/v1/index-generations", map[string]any{"scope": "obligation"}))
+	w := do(h, req(t, http.MethodPost, "/v1/index-generations", map[string]any{"scope": "obligation"}, ""))
 	require.Equal(t, http.StatusConflict, w.Code, w.Body.String())
 	assert.Equal(t, "ESR-019", bodyOf(t, w)["reason_code"])
 }
@@ -309,7 +309,7 @@ func migrationHarness(t *testing.T) *harness {
 
 	candidateGen := &domain.IndexGeneration{GenerationID: "88888888-8888-8888-8888-888888888888",
 		ContractID: candidate.ContractID, ScopeName: "obligation", PhysicalIndex: "obligation-gnew",
-		State: domain.GenerationValidating, BackfillState: domain.BackfillComplete}
+		State: domain.GenerationValidating, BackfillState: domain.BackfillComplete, RecordVersion: 1}
 
 	// The real state during a migration: publishing v2 retired v1, and v1's
 	// generation keeps serving with v1's own contract.
@@ -326,19 +326,19 @@ func TestTransitionGeneration_MigrationNeedsCertification(t *testing.T) {
 	h := migrationHarness(t)
 	path := "/v1/index-generations/88888888-8888-8888-8888-888888888888/state"
 
-	w := do(h, req(t, http.MethodPost, path, map[string]any{"state": "READY"}))
+	w := do(h, req(t, http.MethodPost, path, map[string]any{"state": "READY"}, `"v1"`))
 	require.Equal(t, http.StatusConflict, w.Code, w.Body.String())
 	assert.Equal(t, "retrieval_evaluation_required", errorCode(t, w))
 
 	h.store.evaluations = []domain.RetrievalEvaluation{{GenerationID: "88888888-8888-8888-8888-888888888888",
 		PinnedModel: "m@1", K: 10, Recall: 0.4, MinRecall: 0.8, Passed: false}}
-	w = do(h, req(t, http.MethodPost, path, map[string]any{"state": "READY"}))
+	w = do(h, req(t, http.MethodPost, path, map[string]any{"state": "READY"}, `"v1"`))
 	require.Equal(t, http.StatusConflict, w.Code)
 	assert.Equal(t, "retrieval_evaluation_failed", errorCode(t, w))
 
 	h.store.evaluations = append(h.store.evaluations, domain.RetrievalEvaluation{
 		GenerationID: "88888888-8888-8888-8888-888888888888", PinnedModel: "m@1", K: 10, Recall: 0.9, MinRecall: 0.8, Passed: true})
-	w = do(h, req(t, http.MethodPost, path, map[string]any{"state": "READY"}))
+	w = do(h, req(t, http.MethodPost, path, map[string]any{"state": "READY"}, `"v1"`))
 	assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
 }
 
@@ -353,7 +353,7 @@ func TestEvaluateRetrieval_MeasuresRecallInsideTheTenant(t *testing.T) {
 	w := do(h, req(t, http.MethodPost, "/v1/index-generations/88888888-8888-8888-8888-888888888888/retrieval-evaluations",
 		map[string]any{"k": 5, "min_recall": 0.5, "cases": []map[string]any{
 			{"query": "overdue", "expected_source_ids": []string{"ob-1", "ob-2"}},
-		}}))
+		}}, ""))
 	require.Equal(t, http.StatusCreated, w.Code, w.Body.String())
 	body := bodyOf(t, w)
 	assert.Equal(t, 0.5, body["recall"])
@@ -376,6 +376,6 @@ func TestEvaluateRetrieval_RequiresPlatformGrant(t *testing.T) {
 	w := do(h, req(t, http.MethodPost, "/v1/index-generations/88888888-8888-8888-8888-888888888888/retrieval-evaluations",
 		map[string]any{"k": 5, "min_recall": 0.5, "cases": []map[string]any{
 			{"query": "overdue", "expected_source_ids": []string{"ob-1"}},
-		}}))
+		}}, ""))
 	assert.Equal(t, http.StatusForbidden, w.Code)
 }

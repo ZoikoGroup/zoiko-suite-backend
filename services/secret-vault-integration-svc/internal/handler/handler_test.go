@@ -352,6 +352,37 @@ func TestActivateVersion_Success(t *testing.T) {
 	}
 }
 
+func TestActivateVersion_WithoutIfMatch_Returns428(t *testing.T) {
+	s := &stubStore{
+		findVersionResult: &domain.SecretPolicyVersion{SecretPolicyVersionID: "22222222-0000-4000-8000-000000000001", SecretPolicyID: "11111111-0000-4000-8000-000000000001", VersionStatus: "DRAFT", RecordVersion: 1},
+		activated:         &domain.SecretPolicyVersion{SecretPolicyVersionID: "22222222-0000-4000-8000-000000000001", SecretPolicyID: "11111111-0000-4000-8000-000000000001", VersionStatus: "ACTIVE", RecordVersion: 2},
+	}
+	r := defaultRouter(s)
+	body := `{"activated_by_principal_id":"admin-1"}`
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secret-policies/11111111-0000-4000-8000-000000000001/versions/22222222-0000-4000-8000-000000000001/activate", strings.NewReader(body)))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusPreconditionRequired {
+		t.Fatalf("expected 428, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestActivateVersion_WithStaleIfMatch_Returns412(t *testing.T) {
+	s := &stubStore{
+		findVersionResult: &domain.SecretPolicyVersion{SecretPolicyVersionID: "22222222-0000-4000-8000-000000000001", SecretPolicyID: "11111111-0000-4000-8000-000000000001", VersionStatus: "DRAFT", RecordVersion: 1},
+		activated:         &domain.SecretPolicyVersion{SecretPolicyVersionID: "22222222-0000-4000-8000-000000000001", SecretPolicyID: "11111111-0000-4000-8000-000000000001", VersionStatus: "ACTIVE", RecordVersion: 2},
+	}
+	r := defaultRouter(s)
+	body := `{"activated_by_principal_id":"admin-1"}`
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secret-policies/11111111-0000-4000-8000-000000000001/versions/22222222-0000-4000-8000-000000000001/activate", strings.NewReader(body)))
+	req.Header.Set("If-Match", `"v99"`)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusPreconditionFailed {
+		t.Fatalf("expected 412, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
 func TestActivateVersion_MissingActor(t *testing.T) {
 	r := defaultRouter(&stubStore{})
 	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secret-policies/11111111-0000-4000-8000-000000000001/versions/22222222-0000-4000-8000-000000000001/activate", strings.NewReader(`{}`)))

@@ -38,7 +38,7 @@ func (r *recordingStatusChanger) ChangeStatus(_ context.Context, tenantID, actor
 }
 
 func statusRouter(changer identityctx.StatusChanger) http.Handler {
-	store := &mockPrincipalStore{principal: &domain.Principal{PrincipalID: "p-1", TenantID: "tenant-a"}}
+	store := &mockPrincipalStore{principal: &domain.Principal{PrincipalID: "p-1", TenantID: "tenant-a", RecordVersion: 1}}
 	h := identityctx.NewHandler(nil, nil, nil, store, &permittingAuthz{}, zap.NewNop())
 	if changer != nil {
 		h.WithStatusChanger(changer)
@@ -56,6 +56,7 @@ func putStatus(t *testing.T, router http.Handler, status domain.PrincipalStatus)
 	req.Header.Set("X-Tenant-Id", "tenant-a")
 	req.Header.Set("X-Principal-Id", "admin-1")
 	req.Header.Set("X-Correlation-ID", "corr-status")
+	req.Header.Set("If-Match", `"v1"`)
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 	return w

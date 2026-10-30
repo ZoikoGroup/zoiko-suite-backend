@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -67,6 +68,7 @@ func (s *stubStore) CreateRole(_ context.Context, r *domain.RoleDefinition, _ st
 		}
 	}
 	cp := *r
+	cp.RecordVersion = 1 // Set initial version for optimistic concurrency (API-3)
 	s.rolesByID[r.RoleDefinitionID] = &cp
 	s.rolesByCorrelation[r.CorrelationID] = &cp
 	s.events.roleCreated++
@@ -122,14 +124,18 @@ func (s *stubStore) UpdateRole(_ context.Context, roleDefinitionID, roleName, st
 	if !ok {
 		return nil, domain.ErrRoleNotFound
 	}
+	if expectedVersion != 0 && r.RecordVersion != expectedVersion {
+		return nil, domain.ErrVersionConflict
+	}
 	if roleName != "" {
 		r.RoleName = roleName
 	}
-if status != "" {
+	if status != "" {
 		r.Status = domain.RoleStatus(status)
 	}
 	r.UpdatedByPrincipalID = updatedByPrincipalID
 	r.UpdatedAt = time.Now().UTC()
+	r.RecordVersion++ // Increment version for optimistic concurrency (API-3)
 	s.events.roleUpdated++
 	cp := *r
 	return &cp, nil
@@ -146,6 +152,7 @@ func (s *stubStore) CreateBundle(_ context.Context, b *domain.PermissionBundleDe
 		}
 	}
 	cp := *b
+	cp.RecordVersion = 1 // Set initial version for optimistic concurrency (API-3)
 	s.bundlesByRole[b.RoleDefinitionID] = append(s.bundlesByRole[b.RoleDefinitionID], cp)
 	s.bundlesByCorrelation[b.CorrelationID] = &cp
 	s.bundlesByID[b.BundleID] = &cp
@@ -180,6 +187,9 @@ func (s *stubStore) UpdateBundle(_ context.Context, roleDefinitionID, bundleID s
 	if !ok || b.RoleDefinitionID != roleDefinitionID {
 		return nil, domain.ErrBundleNotFound
 	}
+	if expectedVersion != 0 && b.RecordVersion != expectedVersion {
+		return nil, domain.ErrVersionConflict
+	}
 	if permittedActions != nil {
 		b.PermittedActions = permittedActions
 	}
@@ -188,6 +198,7 @@ func (s *stubStore) UpdateBundle(_ context.Context, roleDefinitionID, bundleID s
 	}
 	b.UpdatedByPrincipalID = updatedByPrincipalID
 	b.UpdatedAt = time.Now().UTC()
+	b.RecordVersion++ // Increment version for optimistic concurrency (API-3)
 	s.events.bundleUpdated++
 	cp := *b
 	return &cp, nil
@@ -568,10 +579,20 @@ func TestUpdateRole_ReactivationAsksForActiveTrue(t *testing.T) {
 	// ACTIVE -> RETIRED -> ACTIVE. The second transition must ask for true.
 	_ = doReq(r, http.MethodPatch, "/v1/role-definitions/"+role.RoleDefinitionID,
 		map[string]any{"legal_entity_id": "le-us", "status": "RETIRED"}, "admin-1")
-	rr := doReq(r, http.MethodPatch, "/v1/role-definitions/"+role.RoleDefinitionID,
-		map[string]any{"legal_entity_id": "le-us", "status": "ACTIVE"}, "admin-1")
-	if rr.Code != http.StatusOK {
-		t.Fatalf("expected 200 got %d: %s", rr.Code, rr.Body.String())
+	// After retirement, version is 2. Get current version.
+	rr := doReq(r, http.MethodGet, "/v1/role-definitions/"+role.RoleDefinitionID, nil, "admin-1")
+	var retiredRole domain.RoleDefinition
+	_ = json.NewDecoder(rr.Body).Decode(&retiredRole)
+
+	// Reactivate with correct If-Match
+	req := httptest.NewRequest(http.MethodPatch, "/v1/role-definitions/"+role.RoleDefinitionID, bytes.NewBufferString(`{"legal_entity_id":"le-us","status":"ACTIVE"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Principal-Id", "admin-1")
+	req.Header.Set("If-Match", fmt.Sprintf(`"v%d"`, retiredRole.RecordVersion))
+	rr2 := httptest.NewRecorder()
+	r.ServeHTTP(rr2, req)
+	if rr2.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d: %s", rr2.Code, rr2.Body.String())
 	}
 	if len(admin.setRoleActiveWant) != 2 {
 		t.Fatalf("expected 2 propagation calls across two transitions, got %d", len(admin.setRoleActiveWant))
@@ -904,11 +925,23 @@ func TestDetachBundle_AlreadyDetachedIsIdempotent(t *testing.T) {
 		nil, "admin-1")
 	admin.setBundleActiveCalls = nil
 
-	rr := doReq(r, http.MethodDelete,
+	// After first detach, version is 2. Get current version.
+	rr := doReq(r, http.MethodGet,
 		"/v1/role-definitions/"+bundle.RoleDefinitionID+"/permission-bundles/"+bundle.BundleID+"?legal_entity_id=le-us",
 		nil, "admin-1")
-	if rr.Code != http.StatusOK {
-		t.Fatalf("expected 200 got %d: %s", rr.Code, rr.Body.String())
+	var detachedBundle domain.PermissionBundleDef
+	_ = json.NewDecoder(rr.Body).Decode(&detachedBundle)
+
+	// Second detach with correct If-Match
+	req := httptest.NewRequest(http.MethodDelete,
+		"/v1/role-definitions/"+bundle.RoleDefinitionID+"/permission-bundles/"+bundle.BundleID+"?legal_entity_id=le-us",
+		nil)
+	req.Header.Set("X-Principal-Id", "admin-1")
+	req.Header.Set("If-Match", fmt.Sprintf(`"v%d"`, detachedBundle.RecordVersion))
+	rr2 := httptest.NewRecorder()
+	r.ServeHTTP(rr2, req)
+	if rr2.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d: %s", rr2.Code, rr2.Body.String())
 	}
 	if len(admin.setBundleActiveCalls) != 0 {
 		t.Fatalf("re-detaching made %d retire calls, expected none", len(admin.setBundleActiveCalls))

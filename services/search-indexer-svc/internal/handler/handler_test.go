@@ -319,6 +319,7 @@ func testContract() *domain.IndexContract {
 		ContractID: contractID, SourceID: "s-1", ScopeName: "obligation", Version: 1,
 		State: domain.ContractPublished, RetrievalClass: domain.RetrievalR1,
 		AuthzAction: "OBLIGATION_READ",
+		RecordVersion: 1,
 		Fields: []domain.SearchFieldDefinition{
 			{FieldID: "obligation_code", Type: "TEXT", Searchable: true, Returnable: true,
 				SnippetAllowed: true, SensitivityClass: domain.SensitivityInternal},
@@ -333,6 +334,7 @@ func testGeneration() *domain.IndexGeneration {
 	return &domain.IndexGeneration{
 		GenerationID: generationID, ContractID: contractID, ScopeName: "obligation",
 		PhysicalIndex: "obligation-gabc", State: domain.GenerationActive,
+		RecordVersion: 1,
 	}
 }
 
@@ -388,7 +390,7 @@ func newHarness(t *testing.T, az *stubAuthz) *harness {
 
 // req builds a fully-enveloped request. Every §4 mandatory field is present,
 // so a refusal in a test is about the thing under test and not about a header.
-func req(t *testing.T, method, path string, body any) *http.Request {
+func req(t *testing.T, method, path string, body any, ifMatch string) *http.Request {
 	t.Helper()
 	var reader *bytes.Reader
 	if body != nil {
@@ -407,6 +409,9 @@ func req(t *testing.T, method, path string, body any) *http.Request {
 	r.Header.Set("X-Request-Id", "req-1")
 	r.Header.Set("X-Correlation-ID", "corr-1")
 	r.Header.Set("Idempotency-Key", "idem-1")
+	if ifMatch != "" {
+		r.Header.Set("If-Match", ifMatch)
+	}
 	return r
 }
 
@@ -459,14 +464,14 @@ func TestSearch_HappyPath(t *testing.T) {
 	h := newHarness(t, nil)
 	w := do(h, req(t, http.MethodPost, "/v1/search", map[string]any{
 		"scope": "obligation", "query": "GST",
-	}))
+	}, ""))
 	assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
 }
 
 // ESR-001. No tenant header, no search — and the refusal carries the code.
 func TestSearch_WithoutTenantIsRefusedWithESR001(t *testing.T) {
 	h := newHarness(t, nil)
-	r := req(t, http.MethodPost, "/v1/search", map[string]any{"scope": "obligation"})
+	r := req(t, http.MethodPost, "/v1/search", map[string]any{"scope": "obligation"}, "")
 	r.Header.Del("X-Tenant-Id")
 
 	w := do(h, r)
@@ -483,7 +488,7 @@ func TestSearch_TenantInBodyIsRejectedNotSilentlyIgnored(t *testing.T) {
 	h := newHarness(t, nil)
 	w := do(h, req(t, http.MethodPost, "/v1/search", map[string]any{
 		"scope": "obligation", "query": "GST", "tenant_id": tenantB,
-	}))
+	}, ""))
 
 	assert.Equal(t, http.StatusBadRequest, w.Code)
 	assert.Equal(t, "invalid_request", errorCode(t, w))
@@ -496,7 +501,7 @@ func TestSearch_EngineReceivesTheHeaderTenant(t *testing.T) {
 	h := newHarness(t, nil)
 	w := do(h, req(t, http.MethodPost, "/v1/search", map[string]any{
 		"scope": "obligation", "query": "GST",
-	}))
+	}, ""))
 	require.Equal(t, http.StatusOK, w.Code)
 
 	var found bool
@@ -512,7 +517,7 @@ func TestSearch_EngineReceivesTheHeaderTenant(t *testing.T) {
 // ESR-002 for an unregistered scope.
 func TestSearch_UnregisteredScopeIsESR002(t *testing.T) {
 	h := newHarness(t, nil)
-	w := do(h, req(t, http.MethodPost, "/v1/search", map[string]any{"scope": "no-such-scope"}))
+	w := do(h, req(t, http.MethodPost, "/v1/search", map[string]any{"scope": "no-such-scope"}, ""))
 
 	assert.Equal(t, http.StatusNotFound, w.Code)
 	assert.Equal(t, string(domain.ReasonScopeNotRegistered), bodyOf(t, w)["reason_code"])
@@ -521,11 +526,11 @@ func TestSearch_UnregisteredScopeIsESR002(t *testing.T) {
 // ESR-003.
 func TestSearch_ForbiddenOperatorIsESR003(t *testing.T) {
 	h := newHarness(t, nil)
-	w := do(h, req(t, http.MethodPost, "/v1/search", map[string]any{
+w := do(h, req(t, http.MethodPost, "/v1/search", map[string]any{
 		"scope": "obligation", "query": "GST*",
-	}))
+	}, ""))
 
-	assert.Equal(t, http.StatusBadRequest, w.Code)
+	require.Equal(t, http.StatusBadRequest, w.Code)
 	assert.Equal(t, string(domain.ReasonQueryOperatorForbidden), bodyOf(t, w)["reason_code"])
 }
 
@@ -535,7 +540,7 @@ func TestSearch_NonReturnableFieldIsESR006WithMeaning(t *testing.T) {
 	h := newHarness(t, nil)
 	w := do(h, req(t, http.MethodPost, "/v1/search", map[string]any{
 		"scope": "obligation", "requested_fields": []string{"api_secret"},
-	}))
+	}, ""))
 
 	require.Equal(t, http.StatusBadRequest, w.Code)
 	body := bodyOf(t, w)
@@ -548,7 +553,7 @@ func TestSearch_OversizedPageIsESR015(t *testing.T) {
 	h := newHarness(t, nil)
 	w := do(h, req(t, http.MethodPost, "/v1/search", map[string]any{
 		"scope": "obligation", "size": 9999,
-	}))
+	}, ""))
 
 	assert.Equal(t, http.StatusBadRequest, w.Code)
 	assert.Equal(t, string(domain.ReasonResultWindowExceeded), bodyOf(t, w)["reason_code"])
@@ -561,8 +566,8 @@ func TestSearch_PartialAnswerIs206(t *testing.T) {
 	h.engine.result = searchclient.Result{
 		Total: 5, Relation: "eq", Partial: true, PartialReason: "1 of 3 shards failed",
 	}
+w := do(h, req(t, http.MethodPost, "/v1/search", map[string]any{"scope": "obligation"}, ""))
 
-	w := do(h, req(t, http.MethodPost, "/v1/search", map[string]any{"scope": "obligation"}))
 	require.Equal(t, http.StatusPartialContent, w.Code)
 	assert.Equal(t, "PARTIAL", bodyOf(t, w)["completeness_state"])
 }
@@ -570,7 +575,7 @@ func TestSearch_PartialAnswerIs206(t *testing.T) {
 // Evidence is recorded on the SUCCESS path.
 func TestSearch_RecordsEvidenceOnSuccess(t *testing.T) {
 	h := newHarness(t, nil)
-	do(h, req(t, http.MethodPost, "/v1/search", map[string]any{"scope": "obligation", "query": "GST"}))
+	do(h, req(t, http.MethodPost, "/v1/search", map[string]any{"scope": "obligation", "query": "GST"}, ""))
 
 	require.Len(t, h.store.evidence, 1)
 	e := h.store.evidence[0]
@@ -586,7 +591,7 @@ func TestSearch_RecordsEvidenceOnRefusal(t *testing.T) {
 	h := newHarness(t, nil)
 	do(h, req(t, http.MethodPost, "/v1/search", map[string]any{
 		"scope": "obligation", "query": "GST*",
-	}))
+	}, ""))
 
 	require.Len(t, h.store.evidence, 1)
 	assert.Contains(t, h.store.evidence[0].ReasonCodes, string(domain.ReasonQueryOperatorForbidden))
@@ -598,7 +603,7 @@ func TestSearch_EvidenceNeverStoresQueryText(t *testing.T) {
 	h := newHarness(t, nil)
 	do(h, req(t, http.MethodPost, "/v1/search", map[string]any{
 		"scope": "obligation", "query": "Jane Doe misconduct dismissal",
-	}))
+	}, ""))
 
 	require.Len(t, h.store.evidence, 1)
 	raw, err := json.Marshal(h.store.evidence[0])
@@ -621,7 +626,7 @@ func TestRetrieve_BulkLimitIsEnforcedWithESR016(t *testing.T) {
 
 	w := do(h, req(t, http.MethodPost, "/v1/retrieve", map[string]any{
 		"scope": "obligation", "refs": refs,
-	}))
+	}, ""))
 
 	require.Equal(t, http.StatusBadRequest, w.Code)
 	assert.Equal(t, string(domain.ReasonExportAuthzRequired), bodyOf(t, w)["reason_code"])
@@ -635,7 +640,7 @@ func TestRetrieve_StillAppliesMandatoryFilters(t *testing.T) {
 	w := do(h, req(t, http.MethodPost, "/v1/retrieve", map[string]any{
 		"scope": "obligation",
 		"refs":  []map[string]string{{"source_type": "obligation", "source_id": "ob-1"}},
-	}))
+	}, ""))
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 
 	fields := map[string]bool{}
@@ -656,7 +661,7 @@ func TestExport_RequiresItsOwnAuthorization(t *testing.T) {
 	h := newHarness(t, &stubAuthz{err: authz.ErrDenied})
 	w := do(h, req(t, http.MethodPost, "/v1/search-exports", map[string]any{
 		"scope": "obligation", "reason": "regulatory disclosure",
-	}))
+	}, ""))
 
 	require.Equal(t, http.StatusForbidden, w.Code)
 	assert.Equal(t, string(domain.ReasonExportAuthzRequired), bodyOf(t, w)["reason_code"])
@@ -667,7 +672,7 @@ func TestExport_RequiresItsOwnAuthorization(t *testing.T) {
 // An export must state its own reason; the search purpose does not carry over.
 func TestExport_RequiresItsOwnReason(t *testing.T) {
 	h := newHarness(t, nil)
-	w := do(h, req(t, http.MethodPost, "/v1/search-exports", map[string]any{"scope": "obligation"}))
+	w := do(h, req(t, http.MethodPost, "/v1/search-exports", map[string]any{"scope": "obligation"}, ""))
 	assert.Equal(t, http.StatusBadRequest, w.Code)
 	assert.Equal(t, "reason_required", errorCode(t, w))
 }
@@ -676,7 +681,7 @@ func TestExport_AuthorizedRecordsEvidenceAndTransfersNothing(t *testing.T) {
 	h := newHarness(t, nil)
 	w := do(h, req(t, http.MethodPost, "/v1/search-exports", map[string]any{
 		"scope": "obligation", "reason": "regulatory disclosure",
-	}))
+	}, ""))
 
 	require.Equal(t, http.StatusAccepted, w.Code)
 	body := bodyOf(t, w)
@@ -693,7 +698,7 @@ func TestRestriction_RequiresAuthorizationAndSourceEvent(t *testing.T) {
 	w := do(h, req(t, http.MethodPost, "/v1/restrictions", map[string]any{
 		"scope": "obligation", "source_type": "obligation",
 		"source_id": "ob-1", "reason": "PRV_ERASURE",
-	}))
+	}, ""))
 	assert.Equal(t, http.StatusBadRequest, w.Code)
 	assert.Equal(t, "source_event_id_required", errorCode(t, w))
 
@@ -701,7 +706,7 @@ func TestRestriction_RequiresAuthorizationAndSourceEvent(t *testing.T) {
 	w = do(denied, req(t, http.MethodPost, "/v1/restrictions", map[string]any{
 		"scope": "obligation", "source_type": "obligation", "source_id": "ob-1",
 		"reason": "PRV_ERASURE", "source_event_id": "prv-evt-1",
-	}))
+	}, ""))
 	assert.Equal(t, http.StatusForbidden, w.Code)
 }
 
@@ -712,7 +717,7 @@ func TestRestriction_ReportsAppliedNotVerified(t *testing.T) {
 	w := do(h, req(t, http.MethodPost, "/v1/restrictions", map[string]any{
 		"scope": "obligation", "source_type": "obligation", "source_id": "ob-1",
 		"reason": "PRV_ERASURE", "source_event_id": "prv-evt-1",
-	}))
+	}, ""))
 
 	require.Equal(t, http.StatusAccepted, w.Code, w.Body.String())
 	body := bodyOf(t, w)
@@ -729,7 +734,7 @@ func TestRestriction_WritesTombstoneEvenWhenNothingIsIndexed(t *testing.T) {
 	do(h, req(t, http.MethodPost, "/v1/restrictions", map[string]any{
 		"scope": "obligation", "source_type": "obligation", "source_id": "never-indexed",
 		"reason": "PRV_ERASURE", "source_event_id": "prv-evt-2",
-	}))
+	}, ""))
 
 	require.Len(t, h.engine.indexed, 1)
 	assert.True(t, h.engine.indexed[0].Tombstoned)
@@ -746,7 +751,7 @@ func TestRestriction_StaleEpochIs409WithESR013(t *testing.T) {
 	w := do(h, req(t, http.MethodPost, "/v1/restrictions", map[string]any{
 		"scope": "obligation", "source_type": "obligation", "source_id": "ob-1",
 		"reason": "PRV_ERASURE", "source_event_id": "old-evt",
-	}))
+	}, ""))
 
 	require.Equal(t, http.StatusConflict, w.Code)
 	assert.Equal(t, string(domain.ReasonRestrictionEpochMismtch), bodyOf(t, w)["reason_code"])
@@ -763,7 +768,7 @@ func TestControlPlane_AuthorizesAgainstPlatformScope(t *testing.T) {
 		"owner_service": "obligations-svc", "source_type": "obligation",
 		"event_topic": "zoiko.obligations.events",
 		"event_types": []string{"obligation.created"},
-	}))
+	}, ""))
 
 	require.NotEmpty(t, h.authz.calls)
 	assert.Contains(t, h.authz.calls[0], platform)
@@ -778,7 +783,7 @@ func TestControlPlane_DeniedPrincipalCannotRegisterASource(t *testing.T) {
 		"owner_service": "obligations-svc", "source_type": "obligation",
 		"event_topic": "zoiko.obligations.events",
 		"event_types": []string{"obligation.created"},
-	}))
+	}, ""))
 
 	assert.Equal(t, http.StatusForbidden, w.Code)
 	assert.Empty(t, h.store.sources)
@@ -792,7 +797,7 @@ func TestControlPlane_UnavailableAuthorizerFailsClosed(t *testing.T) {
 		"owner_service": "obligations-svc", "source_type": "obligation",
 		"event_topic": "zoiko.obligations.events",
 		"event_types": []string{"obligation.created"},
-	}))
+	}, ""))
 
 	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
 	assert.Empty(t, h.store.sources)
@@ -806,7 +811,7 @@ func TestCreateSource_RefusesProhibitedCeiling(t *testing.T) {
 		"owner_service": "vault-svc", "source_type": "secret",
 		"event_topic": "zoiko.secret.events", "event_types": []string{"secret.created"},
 		"sensitivity_ceiling": "SECRET_PROHIBITED",
-	}))
+	}, ""))
 
 	assert.Equal(t, http.StatusBadRequest, w.Code)
 	assert.Equal(t, "prohibited_ceiling", errorCode(t, w))
@@ -819,7 +824,7 @@ func TestCreateSource_RefusesSourceWithNoEventTypes(t *testing.T) {
 	w := do(h, req(t, http.MethodPost, "/v1/search-sources", map[string]any{
 		"owner_service": "obligations-svc", "source_type": "obligation",
 		"event_topic": "zoiko.obligations.events",
-	}))
+	}, ""))
 
 	assert.Equal(t, http.StatusBadRequest, w.Code)
 	assert.Equal(t, "event_types_required", errorCode(t, w))
@@ -840,7 +845,7 @@ func TestCreateContract_IsAlwaysDraft(t *testing.T) {
 		"fields": []map[string]any{
 			{"name": "obligation_code", "type": "TEXT", "searchable": true, "returnable": true},
 		},
-	}))
+	}, ""))
 
 	require.Equal(t, http.StatusCreated, w.Code, w.Body.String())
 	assert.Equal(t, string(domain.ContractDraft), bodyOf(t, w)["publication_state"])
@@ -860,7 +865,7 @@ func TestCreateContract_RefusesSnippetWithoutReturnable(t *testing.T) {
 			{"name": "notes", "type": "TEXT", "searchable": true,
 				"snippet_allowed": true, "returnable": false},
 		},
-	}))
+	}, ""))
 
 	require.Equal(t, http.StatusBadRequest, w.Code)
 	assert.Contains(t, bodyOf(t, w)["detail"], "not returnable")
@@ -880,7 +885,7 @@ func TestCreateContract_RefusesExposingAProhibitedField(t *testing.T) {
 			{"name": "api_secret", "type": "KEYWORD",
 				"sensitivity_class": "SECRET_PROHIBITED", "searchable": true},
 		},
-	}))
+	}, ""))
 
 	require.Equal(t, http.StatusBadRequest, w.Code)
 	assert.Contains(t, bodyOf(t, w)["detail"], "SECRET_PROHIBITED")
@@ -900,7 +905,7 @@ func TestCreateContract_EnforcesSourceSensitivityCeiling(t *testing.T) {
 			{"name": "employee_notes", "type": "TEXT", "searchable": true,
 				"returnable": true, "sensitivity_class": "HR"},
 		},
-	}))
+	}, ""))
 
 	require.Equal(t, http.StatusBadRequest, w.Code)
 	assert.Contains(t, bodyOf(t, w)["detail"], "ceiling")
@@ -922,7 +927,7 @@ func TestCreateContract_RefusesSensitiveFieldsUnderR0(t *testing.T) {
 			{"name": "employee_notes", "type": "TEXT", "searchable": true,
 				"returnable": true, "sensitivity_class": "HR"},
 		},
-	}))
+	}, ""))
 
 	require.Equal(t, http.StatusBadRequest, w.Code)
 	assert.Contains(t, bodyOf(t, w)["detail"], "R0")
@@ -939,7 +944,7 @@ func TestCreateContract_RequiresAnAuthzAction(t *testing.T) {
 	w := do(h, req(t, http.MethodPost, "/v1/index-contracts", map[string]any{
 		"source_type": "obligation",
 		"fields":      []map[string]any{{"name": "code", "type": "TEXT", "returnable": true}},
-	}))
+	}, ""))
 
 	require.Equal(t, http.StatusBadRequest, w.Code)
 	assert.Equal(t, "authz_action_required", errorCode(t, w))
@@ -953,7 +958,7 @@ func TestTransitionGeneration_CannotActivateFromBuilding(t *testing.T) {
 
 	w := do(h, req(t, http.MethodPost, "/v1/index-generations/"+generationID+"/state", map[string]any{
 		"state": "ACTIVE",
-	}))
+	}, `"v1"`))
 
 	require.Equal(t, http.StatusConflict, w.Code)
 	assert.Equal(t, "invalid_transition", errorCode(t, w))
@@ -967,7 +972,7 @@ func TestTransitionGeneration_CannotRetireTheServingGeneration(t *testing.T) {
 
 	w := do(h, req(t, http.MethodPost, "/v1/index-generations/"+generationID+"/state", map[string]any{
 		"state": "RETIRED",
-	}))
+	}, `"v1"`))
 
 	require.Equal(t, http.StatusConflict, w.Code)
 	assert.Equal(t, "active_generation", errorCode(t, w))
@@ -978,7 +983,7 @@ func TestCreateGeneration_RequiresAPublishedContract(t *testing.T) {
 	h := newHarness(t, nil)
 	h.store.contract = nil
 
-	w := do(h, req(t, http.MethodPost, "/v1/index-generations", map[string]any{"scope": "obligation"}))
+	w := do(h, req(t, http.MethodPost, "/v1/index-generations", map[string]any{"scope": "obligation"}, ""))
 	require.Equal(t, http.StatusConflict, w.Code)
 	assert.Equal(t, "no_published_contract", errorCode(t, w))
 }
@@ -989,7 +994,7 @@ func TestCreateGeneration_RequiresAPublishedContract(t *testing.T) {
 // exist.
 func TestListScopes_DoesNotDiscloseProhibitedFields(t *testing.T) {
 	h := newHarness(t, nil)
-	w := do(h, req(t, http.MethodGet, "/v1/scopes", nil))
+	w := do(h, req(t, http.MethodGet, "/v1/scopes", nil, ""))
 
 	require.Equal(t, http.StatusOK, w.Code)
 	assert.NotContains(t, w.Body.String(), "api_secret")
@@ -1001,7 +1006,7 @@ func TestListScopes_DoesNotDiscloseProhibitedFields(t *testing.T) {
 // query was authorized.
 func TestListScopes_CarriesNoCounts(t *testing.T) {
 	h := newHarness(t, nil)
-	w := do(h, req(t, http.MethodGet, "/v1/scopes", nil))
+	w := do(h, req(t, http.MethodGet, "/v1/scopes", nil, ""))
 
 	require.Equal(t, http.StatusOK, w.Code)
 	body := strings.ToLower(w.Body.String())
@@ -1032,10 +1037,11 @@ func TestPathParams_MalformedUUIDIs404NotServerError(t *testing.T) {
 		t.Run(path, func(t *testing.T) {
 			method := http.MethodGet
 			var body any
+			ifMatch := ""
 			if strings.HasSuffix(path, "/state") {
-				method, body = http.MethodPost, map[string]any{"state": "ACTIVE"}
+				method, body, ifMatch = http.MethodPost, map[string]any{"state": "ACTIVE"}, `"v1"`
 			}
-			w := do(h, req(t, method, path, body))
+			w := do(h, req(t, method, path, body, ifMatch))
 			assert.Equal(t, http.StatusNotFound, w.Code, w.Body.String())
 			assert.Equal(t, "not_found", errorCode(t, w))
 		})

@@ -720,6 +720,7 @@ func (h *Handler) CreateJurisdiction(w http.ResponseWriter, r *http.Request) {
 		zap.String("principal_id", principalID),
 		zap.String("correlation_id", correlationID),
 	)
+	setETag(w, j.RowVersion)
 	writeJSON(w, status, j)
 }
 
@@ -940,6 +941,7 @@ func (h *Handler) CreateRule(w http.ResponseWriter, r *http.Request) {
 		zap.String("principal_id", principalID),
 		zap.String("correlation_id", correlationID),
 	)
+	setETag(w, rule.RowVersion)
 	writeJSON(w, status, rule)
 }
 

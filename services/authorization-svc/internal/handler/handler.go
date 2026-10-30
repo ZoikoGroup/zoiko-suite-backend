@@ -3642,7 +3642,24 @@ func (h *Handler) RevokePrivilegedSession(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	ps, err := h.store.RevokePrivilegedSession(r.Context(), sessionID, tenantScope, callerPrincipalID)
+	// Fetch current session to get its version for If-Match validation
+	ps, err := h.store.FindPrivilegedSessionByID(r.Context(), sessionID, tenantScope)
+	if err != nil {
+		if errors.Is(err, domain.ErrPrivilegedSessionNotFound) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "privileged_session_not_found", "session_id": sessionID})
+		} else {
+			h.log.Error("RevokePrivilegedSession: store failed", zap.Error(err))
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		}
+		return
+	}
+
+	// Validate If-Match against current version
+	if !h.requireIfMatch(w, r, ps.RecordVersion) {
+		return
+	}
+
+	ps, err = h.store.RevokePrivilegedSession(r.Context(), sessionID, tenantScope, callerPrincipalID)
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrPrivilegedSessionNotFound):
@@ -3656,7 +3673,7 @@ func (h *Handler) RevokePrivilegedSession(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	writeJSON(w, http.StatusOK, ps)
+	writeJSONWithETag(w, http.StatusOK, ps, ps.RecordVersion)
 }
 
 // ── Break-Glass Emergency Session Handlers (ZS-IAM-001 §14 & §21) ───────────
@@ -3820,7 +3837,7 @@ func (h *Handler) GetBreakGlassSession(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	writeJSON(w, http.StatusOK, bg)
+	writeJSONWithETag(w, http.StatusOK, bg, bg.RecordVersion)
 }
 
 func (h *Handler) ListBreakGlassSessions(w http.ResponseWriter, r *http.Request) {
@@ -3875,7 +3892,24 @@ func (h *Handler) RevokeBreakGlassSession(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	bg, err := h.store.RevokeBreakGlassSession(r.Context(), sessionID, tenantScope, callerPrincipalID)
+	// Fetch current session to get its version for If-Match validation
+	bg, err := h.store.FindBreakGlassSessionByID(r.Context(), sessionID, tenantScope)
+	if err != nil {
+		if errors.Is(err, domain.ErrBreakGlassSessionNotFound) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "break_glass_session_not_found", "session_id": sessionID})
+		} else {
+			h.log.Error("RevokeBreakGlassSession: store failed", zap.Error(err))
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		}
+		return
+	}
+
+	// Validate If-Match against current version
+	if !h.requireIfMatch(w, r, bg.RecordVersion) {
+		return
+	}
+
+	bg, err = h.store.RevokeBreakGlassSession(r.Context(), sessionID, tenantScope, callerPrincipalID)
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrBreakGlassSessionNotFound):
@@ -3894,7 +3928,7 @@ func (h *Handler) RevokeBreakGlassSession(w http.ResponseWriter, r *http.Request
 	// straight to Kafka and discarded the error, so every revoke published the
 	// event twice — the second copy without a tenant (second-pass scan,
 	// 13 Oct 2026). The started event had already moved to the trigger alone.
-	writeJSON(w, http.StatusOK, bg)
+	writeJSONWithETag(w, http.StatusOK, bg, bg.RecordVersion)
 }
 
 // ── Tenant Support Session Handlers (ZS-IAM-001 §15 & §21) ──────────────────
@@ -4037,13 +4071,13 @@ func (h *Handler) GetSupportSession(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
 			return
 		}
-		if !allowed {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "support_session_not_found", "session_id": sessionID})
-			return
-		}
+if !allowed {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "support_session_not_found", "session_id": sessionID})
+		return
 	}
+}
 
-	writeJSON(w, http.StatusOK, ss)
+writeJSONWithETag(w, http.StatusOK, ss, ss.RecordVersion)
 }
 
 func (h *Handler) ListSupportSessions(w http.ResponseWriter, r *http.Request) {
@@ -4098,7 +4132,24 @@ func (h *Handler) RevokeSupportSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ss, err := h.store.RevokeSupportSession(r.Context(), sessionID, tenantScope, callerPrincipalID)
+	// Fetch current session to get its version for If-Match validation
+	ss, err := h.store.FindSupportSessionByID(r.Context(), sessionID, tenantScope)
+	if err != nil {
+		if errors.Is(err, domain.ErrSupportSessionNotFound) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "support_session_not_found", "session_id": sessionID})
+		} else {
+			h.log.Error("RevokeSupportSession: store failed", zap.Error(err))
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		}
+		return
+	}
+
+	// Validate If-Match against current version
+	if !h.requireIfMatch(w, r, ss.RecordVersion) {
+		return
+	}
+
+	ss, err = h.store.RevokeSupportSession(r.Context(), sessionID, tenantScope, callerPrincipalID)
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrSupportSessionNotFound):
@@ -4112,7 +4163,7 @@ func (h *Handler) RevokeSupportSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, ss)
+	writeJSONWithETag(w, http.StatusOK, ss, ss.RecordVersion)
 }
 
 // writeError writes a RFC 9457 problem details response using the shared apicontract package.

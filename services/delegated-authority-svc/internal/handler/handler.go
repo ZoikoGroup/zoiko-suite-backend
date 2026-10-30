@@ -541,7 +541,7 @@ func (h *Handler) writeStoreErr(w http.ResponseWriter, r *http.Request, err erro
 	case errors.Is(err, domain.ErrVersionRequired):
 		writeError(w, r, http.StatusPreconditionRequired, "version_required", err.Error())
 	case errors.Is(err, domain.ErrVersionMismatch):
-		writeError(w, r, http.StatusConflict, "version_mismatch", err.Error())
+		writeError(w, r, http.StatusPreconditionFailed, "stale_version", err.Error())
 	case errors.Is(err, domain.ErrLapsed):
 		writeError(w, r, http.StatusConflict, "lapsed", err.Error())
 	case errors.Is(err, domain.ErrCannotExtend):

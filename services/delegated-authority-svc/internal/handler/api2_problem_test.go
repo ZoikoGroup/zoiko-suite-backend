@@ -46,13 +46,13 @@ func TestAPI2_ErrorResponsesAreProblemDetails(t *testing.T) {
 		status int
 		code   string
 	}{
-		{"400 invalid time window", doReq(r, http.MethodPost, "/v1/delegations/", delegationBody("delegator-1", uuid.NewString(), now, now), "caller-1"), 400, "invalid_time_window"},
-		{"401 no verified caller", doReq(r, http.MethodPost, "/v1/delegations/", body(), ""), 401, "identity_missing"},
-		{"403 delegator lacks authority", doReq(newRouter(newStubStore(), &stubAuthZ{delegatorDenied: "delegator-1"}, nil), http.MethodPost, "/v1/delegations/", body(), "caller-1"), 403, "delegator_lacks_authority"},
-		{"404 unknown delegation", doReq(r, http.MethodGet, "/v1/delegations/"+uuid.NewString(), nil, "caller-1"), 404, "not_found"},
+		{"400 invalid time window", doReq(r, http.MethodPost, "/v1/delegations/", delegationBody("delegator-1", uuid.NewString(), now, now), "caller-1", ""), 400, "invalid_time_window"},
+		{"401 no verified caller", doReq(r, http.MethodPost, "/v1/delegations/", body(), "", ""), 401, "identity_missing"},
+		{"403 delegator lacks authority", doReq(newRouter(newStubStore(), &stubAuthZ{delegatorDenied: "delegator-1"}, nil), http.MethodPost, "/v1/delegations/", body(), "caller-1", ""), 403, "delegator_lacks_authority"},
+		{"404 unknown delegation", doReq(r, http.MethodGet, "/v1/delegations/"+uuid.NewString(), nil, "caller-1", ""), 404, "not_found"},
 		{"409 already revoked", revokeReq(r, revoked.DelegationID, revoked.Version+1, "admin-1"), 409, "invalid_transition"},
-		{"428 no expected version", doReq(r, http.MethodPost, "/v1/delegations/"+active.DelegationID+"/revoke", map[string]any{"reason": "x"}, "admin-1"), 428, "version_required"},
-		{"503 authorization unavailable", doReq(newRouterAuthz(newStubStore(), &downAuthZ{}), http.MethodPost, "/v1/delegations/", body(), "caller-1"), 503, "authz_unavailable"},
+		{"428 no If-Match", doReq(r, http.MethodPost, "/v1/delegations/"+active.DelegationID+"/revoke", map[string]any{"reason": "x"}, "admin-1", ""), 428, "version_required"},
+		{"503 authorization unavailable", doReq(newRouterAuthz(newStubStore(), &downAuthZ{}), http.MethodPost, "/v1/delegations/", body(), "caller-1", ""), 503, "authz_unavailable"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if tc.rr.Code != tc.status {

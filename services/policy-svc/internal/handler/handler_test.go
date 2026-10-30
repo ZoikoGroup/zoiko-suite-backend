@@ -599,7 +599,7 @@ func TestActivate_AuthorizedAgainstStoredScope(t *testing.T) {
 		t.Fatalf("expected POLICY_VERSION_ACTIVATE on the version's own entity, got %s on %s", g.az.actionType, g.az.scope)
 	}
 
-	global := &domain.PolicyVersion{PolicyVersionID: versionID, PolicyID: policyID, VersionStatus: domain.StatusApproved}
+	global := &domain.PolicyVersion{PolicyVersionID: versionID, PolicyID: policyID, VersionStatus: domain.StatusApproved, RowVersion: 3}
 	g = newRig(lifecycleStore(global), nil, nil)
 	expect(t, g.do(http.MethodPost, lifecyclePath("activate"), "", ifm), http.StatusOK, "")
 	if g.az.actionType != authz.ActionPolicyVersionActivateGlobal || g.az.scope != testAuthzScopeID {
@@ -642,7 +642,7 @@ func TestLifecycle_ExpectedVersionFromBodyOrIfMatch(t *testing.T) {
 	}
 
 	g = newRig(lifecycleStore(nil), nil, nil)
-	expect(t, g.do(http.MethodPost, lifecyclePath("approve"), `{"expected_version":3,"approval_reference":"WF-77"}`), http.StatusOK, "")
+	expect(t, g.do(http.MethodPost, lifecyclePath("approve"), `{"expected_version":3,"approval_reference":"WF-77"}`, header("If-Match", `"v3"`)), http.StatusOK, "")
 	if ev := g.store.transitionCmd.ExpectedVersion; ev == nil || *ev != 3 || g.store.transitionCmd.ApprovalReference != "WF-77" {
 		t.Fatalf("expected expected_version 3 and the approval reference, got %+v", g.store.transitionCmd)
 	}
@@ -651,8 +651,8 @@ func TestLifecycle_ExpectedVersionFromBodyOrIfMatch(t *testing.T) {
 	}
 
 	g = newRig(lifecycleStore(nil), nil, nil)
-	expect(t, g.do(http.MethodPost, lifecyclePath("approve"), `{"expected_version":2}`, header("If-Match", `"v3"`)), http.StatusBadRequest, "INVALID_REQUEST")
-	expect(t, g.do(http.MethodPost, lifecyclePath("approve"), "", header("If-Match", "abc")), http.StatusBadRequest, "INVALID_REQUEST")
+	expect(t, g.do(http.MethodPost, lifecyclePath("approve"), `{"expected_version":2}`, header("If-Match", `"v3"`)), http.StatusPreconditionFailed, "stale_version")
+	expect(t, g.do(http.MethodPost, lifecyclePath("approve"), "", header("If-Match", "abc")), http.StatusBadRequest, "invalid_if_match")
 }
 
 // GCP §16: reason_code is required for privileged or destructive commands.

@@ -3231,7 +3231,8 @@ func (s *PgStore) RevokePrivilegedSession(ctx context.Context, sessionID, tenant
 		UPDATE privileged_sessions
 		   SET status = 'REVOKED',
 		       revoked_at = NOW(),
-		       revoked_by = $3
+		       revoked_by = $3,
+		       record_version = record_version + 1
 		 WHERE session_id = $1::uuid
 		   AND tenant_id = $2::uuid
 		   AND status = 'ACTIVE'
@@ -3552,7 +3553,8 @@ func (s *PgStore) RevokeBreakGlassSession(ctx context.Context, sessionID, tenant
 		UPDATE break_glass_sessions
 		   SET status = 'REVOKED',
 		       revoked_at = NOW(),
-		       revoked_by = $3
+		       revoked_by = $3,
+		       record_version = record_version + 1
 		 WHERE session_id = $1::uuid
 		   AND tenant_id = $2::uuid
 		   AND status = 'ACTIVE'
@@ -3755,7 +3757,8 @@ func (s *PgStore) RevokeSupportSession(ctx context.Context, sessionID, tenantID,
 		UPDATE support_sessions
 		   SET status = 'REVOKED',
 		       revoked_at = NOW(),
-		       revoked_by = $3
+		       revoked_by = $3,
+		       record_version = record_version + 1
 		 WHERE session_id = $1::uuid
 		   AND tenant_id = $2::uuid
 		   AND status = 'ACTIVE'
