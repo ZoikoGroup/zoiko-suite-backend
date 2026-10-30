@@ -3098,6 +3098,10 @@ services:
     ports:
       - "8104:8104"
     environment:
+      # Accounting kernel gates (all off until a tenant is ready: see tools/gak-rollout). off | enforce.
+      KERNEL_CLOSE_GATE_MODE: "${KERNEL_CLOSE_GATE_MODE:-off}"
+      KERNEL_PERIOD_SEAL_MODE: "${KERNEL_PERIOD_SEAL_MODE:-off}"
+      KERNEL_REQUIRED_RECONCILIATIONS: "${KERNEL_REQUIRED_RECONCILIATIONS:-}"
       PORT: "8104"
       # REF-05 cutover phase 1. The mirror is best-effort dual-write of lock and
       # reopen into accounting-period-svc; financial-close-svc stays
@@ -3402,6 +3406,9 @@ services:
     ports:
       - "8167:8167"
     environment:
+      # Post depreciation through the accounting kernel. Both set, or neither (off). See tools/gak-rollout.
+      LEDGER_KERNEL_BOOK_ID: "${LEDGER_KERNEL_BOOK_ID:-}"
+      LEDGER_KERNEL_CURRENCY: "${LEDGER_KERNEL_CURRENCY:-}"
       PORT: "8167"
       DB_HOST: postgres
       DB_PORT: "5432"
@@ -3453,6 +3460,9 @@ services:
     ports:
       - "8168:8168"
     environment:
+      # Post inventory valuation through the accounting kernel. Both set, or neither (off). See tools/gak-rollout.
+      LEDGER_KERNEL_BOOK_ID: "${LEDGER_KERNEL_BOOK_ID:-}"
+      LEDGER_KERNEL_CURRENCY: "${LEDGER_KERNEL_CURRENCY:-}"
       PORT: "8168"
       DB_HOST: postgres
       DB_PORT: "5432"
@@ -3657,6 +3667,8 @@ services:
     ports:
       - "8110:8110"
     environment:
+      # Post payroll results through the accounting kernel into this book (off when empty). See tools/gak-rollout.
+      LEDGER_KERNEL_BOOK_ID: "${LEDGER_KERNEL_BOOK_ID:-}"
       PORT: "8110"
       DB_HOST: postgres
       DB_PORT: "5432"

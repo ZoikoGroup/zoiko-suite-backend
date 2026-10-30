@@ -58,21 +58,22 @@ type TraceExecution struct {
 }
 
 type TraceJournal struct {
-	Role          string      `json:"role"` // POSTING, REVERSAL, CORRECTION
-	JournalID     string      `json:"journal_id"`
-	JournalNumber string      `json:"journal_number,omitempty"`
-	Status        string      `json:"status"`
-	JournalType   string      `json:"journal_type"`
-	PostingDate   string      `json:"posting_date"`
-	FiscalPeriod  string      `json:"fiscal_period"`
-	Currency      string      `json:"currency_code"`
-	Hash          string      `json:"journal_hash,omitempty"`
-	PostedBy      string      `json:"posted_by,omitempty"`
-	ReversalOf    string      `json:"reversal_of_journal_id,omitempty"`
-	CorrectionOf  string      `json:"correction_of_journal_id,omitempty"`
-	Reason        string      `json:"reversal_reason,omitempty"`
-	CorrectionKnd string      `json:"correction_kind,omitempty"`
-	Lines         []TraceLine `json:"lines"`
+	Role           string      `json:"role"` // POSTING, REVERSAL, CORRECTION
+	JournalID      string      `json:"journal_id"`
+	JournalNumber  string      `json:"journal_number,omitempty"`
+	Status         string      `json:"status"`
+	JournalType    string      `json:"journal_type"`
+	PostingDate    string      `json:"posting_date"`
+	FiscalPeriod   string      `json:"fiscal_period"`
+	Currency       string      `json:"currency_code"`
+	Hash           string      `json:"journal_hash,omitempty"`
+	EvidenceBundle string      `json:"evidence_bundle_id,omitempty"`
+	PostedBy       string      `json:"posted_by,omitempty"`
+	ReversalOf     string      `json:"reversal_of_journal_id,omitempty"`
+	CorrectionOf   string      `json:"correction_of_journal_id,omitempty"`
+	Reason         string      `json:"reversal_reason,omitempty"`
+	CorrectionKnd  string      `json:"correction_kind,omitempty"`
+	Lines          []TraceLine `json:"lines"`
 }
 
 type TraceLine struct {
@@ -85,6 +86,8 @@ type TraceLine struct {
 	ExchangeRate   string            `json:"exchange_rate,omitempty"`
 	RateRef        string            `json:"rate_ref,omitempty"`
 	RuleLineRef    string            `json:"posting_rule_line_ref,omitempty"`
+	TaxDetailRef   string            `json:"tax_detail_ref,omitempty"`
+	SourceLineRef  string            `json:"source_line_ref,omitempty"`
 	Dimensions     map[string]string `json:"dimensions,omitempty"`
 	LedgerEntrySeq *int64            `json:"ledger_entry_seq,omitempty"`
 	Description    string            `json:"description,omitempty"`

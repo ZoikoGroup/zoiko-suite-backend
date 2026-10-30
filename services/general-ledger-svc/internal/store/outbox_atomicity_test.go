@@ -326,4 +326,3 @@ func TestPgStore_Outbox_ForcedFailure_RollbackAtomicity_RealDB(t *testing.T) {
 	assert.Equal(t, 0, journalCount, "domain journal_headers row must not exist after rollback")
 	assert.Equal(t, 0, outboxCount, "outbox row must not exist after rollback")
 }
-

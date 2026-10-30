@@ -27,12 +27,16 @@ const (
 	ReconTax          = "TAX_GL"
 	ReconAsset        = "ASSET_GL"
 	ReconInventory    = "INVENTORY_GL"
+	// the two reconciliations the kernel runs entirely from its own records: the reciprocal balances of two entities of a group, and
+	// the ledger against a signed snapshot (the trial balance a report is made from)
+	ReconIntercompany   = "INTERCOMPANY_GL"
+	ReconLedgerSnapshot = "LEDGER_SNAPSHOT"
 )
 
 // ReconTypes lists the reconciliation types the kernel runs.
-var ReconTypes = []string{ReconAR, ReconAP, ReconBank, ReconPayroll, ReconTax, ReconAsset, ReconInventory, ReconEventPosting}
+var ReconTypes = []string{ReconAR, ReconAP, ReconBank, ReconPayroll, ReconTax, ReconAsset, ReconInventory, ReconIntercompany, ReconLedgerSnapshot, ReconEventPosting}
 
-const reconTypeList = "AR_GL, AP_GL, BANK_GL, PAYROLL_GL, TAX_GL, ASSET_GL, INVENTORY_GL or EVENT_POSTING"
+const reconTypeList = "AR_GL, AP_GL, BANK_GL, PAYROLL_GL, TAX_GL, ASSET_GL, INVENTORY_GL, INTERCOMPANY_GL, LEDGER_SNAPSHOT or EVENT_POSTING"
 
 // Case statuses.
 const (
@@ -169,6 +173,9 @@ type ReconFilter struct {
 type ReconRepo interface {
 	LedgerPosition(ctx context.Context, tenant, entity, bookCode, controlType string, asOf time.Time, upToSeq int64, opts PositionOpts) (LedgerPosition, error)
 	EventPosting(ctx context.Context, tenant, entity, bookID string, asOf time.Time, at time.Time) (EventPosting, error)
+	// IntercompanyPosition sums the INTERCOMPANY-control entries of an entity in a book that name the counterparty entity, up to a date and,
+	// when upToSeq is given, a watermark.
+	IntercompanyPosition(ctx context.Context, tenant, entity, bookCode, counterparty string, asOf time.Time, upToSeq int64) (LedgerPosition, error)
 	PickTolerance(ctx context.Context, tenant, reconType, entity string, asOf time.Time) (*Tolerance, error)
 	InsertTolerance(ctx context.Context, t *Tolerance, out OutEvent) error
 	ListTolerances(ctx context.Context, tenant, reconType string) ([]Tolerance, error)
@@ -209,6 +216,9 @@ type ReconService struct {
 	Repo  ReconRepo
 	Books Repo
 	Clock func() time.Time
+	// Snapshots and Signer are what a LEDGER_SNAPSHOT run reads and verifies; without them that type is refused.
+	Snapshots SnapshotRepo
+	Signer    Signer
 }
 
 func (s *ReconService) now() time.Time {
@@ -230,8 +240,11 @@ type RunRequest struct {
 	SLAHours     int         `json:"sla_hours,omitempty"`
 	// GroupBy names a dimension to compare group by group (population_a.groups gives the subledger's figure for each value);
 	// IncludeUnbooked also counts the entity's entries that name no book.
-	GroupBy         string `json:"group_by,omitempty"`
-	IncludeUnbooked bool   `json:"include_unbooked,omitempty"`
+	GroupBy string `json:"group_by,omitempty"`
+	// CounterpartyBookID is the other entity's book of an INTERCOMPANY_GL run; SnapshotID is the signed snapshot of a LEDGER_SNAPSHOT run.
+	CounterpartyBookID string `json:"counterparty_book_id,omitempty"`
+	SnapshotID         string `json:"snapshot_id,omitempty"`
+	IncludeUnbooked    bool   `json:"include_unbooked,omitempty"`
 }
 
 func ratFixed(r *big.Rat) string { return r.FloatString(6) }
@@ -251,8 +264,29 @@ func parseAmount(field, s string) (*big.Rat, error) {
 func (s *ReconService) Run(ctx context.Context, tenant string, a Actor, req RunRequest) (*ReconRun, error) {
 	bad := func(f, why string) error { return exc(FamData, "RECON_INVALID", "%s: %s", f, why).with("field", f) }
 	spec, supported := controlOf[req.Type]
-	if !supported && req.Type != ReconEventPosting {
+	if !supported && !ownSided(req.Type) {
 		return nil, bad("reconciliation_type", reconTypeList)
+	}
+	var snap *BalanceSnapshot
+	if req.Type == ReconLedgerSnapshot {
+		// the snapshot fixes the scope: its book, its date and its period
+		if s.Snapshots == nil {
+			return nil, exc(FamExt, "RECON_UNAVAILABLE", "signed snapshots are not available to reconcile against")
+		}
+		if _, err := uuid.Parse(req.SnapshotID); err != nil {
+			return nil, bad("snapshot_id", "a retained signed snapshot")
+		}
+		var err error
+		if snap, err = s.Snapshots.GetSnapshot(ctx, tenant, req.SnapshotID); err != nil {
+			if errors.Is(err, ErrNotFound) {
+				return nil, bad("snapshot_id", "no such snapshot")
+			}
+			return nil, err
+		}
+		if req.BookID != "" && req.BookID != snap.BookID {
+			return nil, bad("book_id", "the snapshot is of another book")
+		}
+		req.BookID, req.AsOf, req.FiscalPeriod = snap.BookID, snap.AsOf, snap.FiscalPeriod
 	}
 	if _, err := uuid.Parse(req.BookID); err != nil {
 		return nil, bad("book_id", "an accounting book id")
@@ -278,7 +312,20 @@ func (s *ReconService) Run(ctx context.Context, tenant string, a Actor, req RunR
 
 	var expected, actual *big.Rat
 	groupWorst := new(big.Rat)
-	if req.Type == ReconEventPosting {
+	forceBreak := false
+	switch req.Type {
+	case ReconIntercompany:
+		if expected, actual, err = s.reconcileIntercompany(ctx, tenant, req, bk, asOf, run); err != nil {
+			return nil, err
+		}
+	case ReconLedgerSnapshot:
+		if expected, actual, groupWorst, forceBreak, err = s.reconcileLedgerSnapshot(ctx, tenant, bk, snap, run); err != nil {
+			return nil, err
+		}
+	}
+	if req.Type == ReconIntercompany || req.Type == ReconLedgerSnapshot {
+		// both sides came from the kernel's own records
+	} else if req.Type == ReconEventPosting {
 		at := now
 		ep, err := s.Repo.EventPosting(ctx, tenant, bk.LegalEntityID, bk.BookID, asOf, at)
 		if err != nil {
@@ -376,6 +423,9 @@ func (s *ReconService) Run(ctx context.Context, tenant string, a Actor, req RunR
 		run.Status = ReconWarning
 	default:
 		run.Status = ReconBreak
+	}
+	if forceBreak {
+		run.Status = ReconBreak // a snapshot whose signature or content does not verify is not a report source, whatever its figures
 	}
 	if run.Status != ReconMatched {
 		hours := req.SLAHours
@@ -488,6 +538,12 @@ func (s *ReconService) Verify(ctx context.Context, tenant, id string) (map[strin
 	if err != nil {
 		return nil, err
 	}
+	if run.Type == ReconIntercompany || run.Type == ReconLedgerSnapshot {
+		if run.Type == ReconLedgerSnapshot && s.Snapshots == nil {
+			return nil, exc(FamExt, "RECON_UNAVAILABLE", "signed snapshots are not available to verify against")
+		}
+		return s.verifyOwnSided(ctx, tenant, run)
+	}
 	asOf, _ := time.Parse("2006-01-02", run.AsOf)
 	var recomputed *big.Rat
 	groupsOK := true
@@ -564,7 +620,7 @@ func (s *ReconService) Verify(ctx context.Context, tenant, id string) (map[strin
 
 // CreateTolerance adds a new version of a tolerance rule.
 func (s *ReconService) CreateTolerance(ctx context.Context, tenant string, a Actor, t Tolerance) (*Tolerance, error) {
-	if _, ok := controlOf[t.ReconciliationType]; !ok && t.ReconciliationType != ReconEventPosting {
+	if _, ok := controlOf[t.ReconciliationType]; !ok && !ownSided(t.ReconciliationType) {
 		return nil, exc(FamData, "RECON_INVALID", "reconciliation_type: %s", reconTypeList)
 	}
 	if t.LegalEntityID != "" {

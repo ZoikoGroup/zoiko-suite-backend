@@ -28,7 +28,11 @@ func (h *KernelHandler) recon(w http.ResponseWriter) (*kernel.ReconService, bool
 		writeError(w, http.StatusNotImplemented, "reconciliation_not_configured", "")
 		return nil, false
 	}
-	return &kernel.ReconService{Repo: rr, Books: h.repo}, true
+	svc := &kernel.ReconService{Repo: rr, Books: h.repo, Signer: h.signer}
+	if ss, ok := h.repo.(kernel.SnapshotRepo); ok {
+		svc.Snapshots = ss
+	}
+	return svc, true
 }
 
 func (h *KernelHandler) RunReconciliation(w http.ResponseWriter, r *http.Request) {
@@ -49,6 +53,7 @@ func (h *KernelHandler) RunReconciliation(w http.ResponseWriter, r *http.Request
 		h.fail(w, err)
 		return
 	}
+	h.observer().ReconciliationResult(run.Type, run.Status)
 	writeJSON(w, http.StatusCreated, run)
 }
 

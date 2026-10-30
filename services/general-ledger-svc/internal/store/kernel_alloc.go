@@ -185,15 +185,25 @@ func (r *KernelRepo) PoolBalances(ctx context.Context, tenant, entity, bookCode 
 
 const allocRunCols = `r.allocation_run_id::text, r.allocation_rule_id::text, r.legal_entity_id::text, r.accounting_book_id::text, r.fiscal_period, r.status, r.ledger_watermark, r.pool_amount::text,
 	r.population, COALESCE(r.journal_id::text, ''), COALESCE(j.journal_number, ''), COALESCE(r.reversal_journal_id::text, ''), COALESCE(rj.journal_number, ''), r.created_by, r.created_at,
-	COALESCE(r.reversed_by, ''), r.reversed_at, COALESCE(r.reversal_reason, '')`
+	COALESCE(r.reversed_by, ''), r.reversed_at, COALESCE(r.reversal_reason, ''), r.remote_journals, r.remote_reversals`
 
 const allocRunFrom = ` FROM allocation_runs r LEFT JOIN journal_headers j ON j.journal_id = r.journal_id LEFT JOIN journal_headers rj ON rj.journal_id = r.reversal_journal_id`
 
 func scanAllocRun(row pgx.Row, v *kernel.AllocRun) error {
-	var pop []byte
+	var pop, remote, reversals []byte
 	if err := row.Scan(&v.RunID, &v.RuleID, &v.LegalEntityID, &v.BookID, &v.FiscalPeriod, &v.Status, &v.LedgerWatermark, &v.PoolAmount, &pop, &v.JournalID, &v.JournalNumber,
-		&v.ReversalJournalID, &v.ReversalNumber, &v.CreatedBy, &v.CreatedAt, &v.ReversedBy, &v.ReversedAt, &v.ReversalReason); err != nil {
+		&v.ReversalJournalID, &v.ReversalNumber, &v.CreatedBy, &v.CreatedAt, &v.ReversedBy, &v.ReversedAt, &v.ReversalReason, &remote, &reversals); err != nil {
 		return err
+	}
+	if err := json.Unmarshal(remote, &v.RemoteJournals); err != nil {
+		return err
+	}
+	var rev map[string]string
+	if err := json.Unmarshal(reversals, &rev); err != nil {
+		return err
+	}
+	for i := range v.RemoteJournals {
+		v.RemoteJournals[i].ReversalJournalID = rev[v.RemoteJournals[i].JournalID]
 	}
 	return json.Unmarshal(pop, &v.Population)
 }
@@ -257,7 +267,7 @@ func allocSysLines(lines []kernel.AllocLine) []SysLine {
 	out := make([]SysLine, 0, len(lines))
 	for _, l := range lines {
 		n, _ := new(big.Rat).SetString(l.Amount)
-		sl := SysLine{Account: l.Account, Debit: "0", Credit: "0", Description: l.Description, RuleLineRef: l.Ref, Dimensions: l.Dimensions}
+		sl := SysLine{Account: l.Account, Debit: "0", Credit: "0", Description: l.Description, RuleLineRef: l.Ref, Dimensions: l.Dimensions, Counterparty: l.Counterparty}
 		if n.Sign() > 0 {
 			sl.Debit = n.FloatString(2)
 		} else {
@@ -303,11 +313,27 @@ func (r *KernelRepo) WriteAllocation(ctx context.Context, p *kernel.AllocPlan) (
 			return e
 		}
 		run.JournalID, run.JournalNumber = posted.JournalID, posted.Number
+		// a cross-entity allocation posts the cost and the intercompany payable in each recipient entity's own book, in the same transaction
+		run.RemoteJournals = []kernel.AllocRemoteJournal{}
+		for _, rm := range p.Remote {
+			rtrace, _ := json.Marshal(map[string]any{"allocation_run_id": run.RunID, "source_entity": run.LegalEntityID, "source_journal_id": run.JournalID, "rule_code": run.Population.RuleCode,
+				"rule_version": run.Population.RuleVersion, "rule_hash": run.Population.RuleHash})
+			rp, e := r.postSystemJournal(ctx, t, &SysJournal{Tenant: p.Tenant, Entity: rm.Book.LegalEntityID, Period: run.FiscalPeriod, BookID: rm.Book.BookID, BookCode: rm.Book.BookCode, Type: domain.JournalTypeAllocation,
+				Purpose: "ALLOCATION", Description: fmt.Sprintf("Allocation %s v%d from %s for %s", run.Population.RuleCode, run.Population.RuleVersion, run.LegalEntityID, run.FiscalPeriod),
+				Correlation: "alloc:" + run.RunID + ":" + rm.Book.BookID, PostingDate: p.PostingDate, Currency: rm.Book.FunctionalCurrency, Actor: p.Actor, At: run.CreatedAt,
+				ExecutionKind: "KERNEL_ALLOC", Trace: string(rtrace), Lines: allocSysLines(rm.Lines)})
+			if e != nil {
+				return e
+			}
+			run.RemoteJournals = append(run.RemoteJournals, kernel.AllocRemoteJournal{LegalEntityID: rm.Book.LegalEntityID, BookID: rm.Book.BookID, BookCode: rm.Book.BookCode,
+				Currency: rm.Book.FunctionalCurrency, JournalID: rp.JournalID, JournalNumber: rp.Number})
+		}
 		pop, _ := json.Marshal(run.Population)
+		remote, _ := json.Marshal(run.RemoteJournals)
 		if _, e := t.Exec(ctx, `INSERT INTO allocation_runs (allocation_run_id, tenant_id, allocation_rule_id, legal_entity_id, accounting_book_id, fiscal_period, status, ledger_watermark, pool_amount, population,
-				journal_id, created_by, created_at)
-			VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6, 'POSTED', $7, $8::numeric, $9::jsonb, $10::uuid, $11, $12)`,
-			run.RunID, p.Tenant, run.RuleID, run.LegalEntityID, run.BookID, run.FiscalPeriod, run.LedgerWatermark, run.PoolAmount, string(pop), run.JournalID, run.CreatedBy, run.CreatedAt); e != nil {
+				journal_id, created_by, created_at, remote_journals)
+			VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6, 'POSTED', $7, $8::numeric, $9::jsonb, $10::uuid, $11, $12, $13::jsonb)`,
+			run.RunID, p.Tenant, run.RuleID, run.LegalEntityID, run.BookID, run.FiscalPeriod, run.LedgerWatermark, run.PoolAmount, string(pop), run.JournalID, run.CreatedBy, run.CreatedAt, string(remote)); e != nil {
 			return e
 		}
 		if e := r.enqueue(ctx, t, p.Tenant, kernel.OutEvent{Fact: "allocation-run.posted", AggregateType: "allocation-run", AggregateID: run.RunID, Actor: run.CreatedBy, CorrelationID: p.Correlation,
@@ -327,50 +353,69 @@ func (r *KernelRepo) WriteAllocation(ctx context.Context, p *kernel.AllocPlan) (
 	return out, nil
 }
 
-// ReverseAllocation implements kernel.AllocRepo.
+// ReverseAllocation implements kernel.AllocRepo. The source journal and every journal the run posted in a recipient entity's book are
+// reversed together, or none is.
 func (r *KernelRepo) ReverseAllocation(ctx context.Context, tenant, id, actor, reason string, at, postingDate time.Time, book kernel.Book) (*kernel.AllocRun, error) {
 	err := r.tx(ctx, tenant, func(t pgx.Tx) error {
 		var status, jid, entity, period, ccy string
-		if e := t.QueryRow(ctx, `SELECT status, journal_id::text, legal_entity_id::text, fiscal_period, population->>'currency' FROM allocation_runs WHERE tenant_id = $1::uuid AND allocation_run_id = $2::uuid FOR UPDATE`,
-			tenant, id).Scan(&status, &jid, &entity, &period, &ccy); e != nil {
+		var remoteRaw []byte
+		if e := t.QueryRow(ctx, `SELECT status, journal_id::text, legal_entity_id::text, fiscal_period, population->>'currency', remote_journals FROM allocation_runs WHERE tenant_id = $1::uuid AND allocation_run_id = $2::uuid FOR UPDATE`,
+			tenant, id).Scan(&status, &jid, &entity, &period, &ccy, &remoteRaw); e != nil {
 			return e
 		}
 		if status != "POSTED" {
 			return kernel.ErrState
 		}
-		rows, e := t.Query(ctx, `SELECT account_code, debit_amount::text, credit_amount::text, dimensions FROM journal_lines WHERE tenant_id = $1::uuid AND journal_id = $2::uuid ORDER BY line_number`, tenant, jid)
+		var remote []kernel.AllocRemoteJournal
+		if e := json.Unmarshal(remoteRaw, &remote); e != nil {
+			return e
+		}
+		// reverseOne posts the mirror of one journal in the book it was posted in
+		reverseOne := func(journalID, ent, bookID, bookCode, currency, corr string) (*SysPosted, error) {
+			rows, e := t.Query(ctx, `SELECT account_code, debit_amount::text, credit_amount::text, dimensions, COALESCE(counterparty_id, '') FROM journal_lines WHERE tenant_id = $1::uuid AND journal_id = $2::uuid ORDER BY line_number`, tenant, journalID)
+			if e != nil {
+				return nil, e
+			}
+			var back []SysLine
+			for rows.Next() {
+				var l SysLine
+				var dr, cr string
+				var dims domain.Dimensions
+				if e := rows.Scan(&l.Account, &dr, &cr, &dims, &l.Counterparty); e != nil {
+					rows.Close()
+					return nil, e
+				}
+				l.Debit, l.Credit, l.Dimensions, l.Description, l.RuleLineRef = cr, dr, dims, "reversal: allocation withdrawn", "ALLOC_REVERSAL"
+				back = append(back, l)
+			}
+			rows.Close()
+			if e := rows.Err(); e != nil {
+				return nil, e
+			}
+			trace, _ := json.Marshal(map[string]any{"allocation_run_id": id, "reverses": journalID, "reason": reason})
+			return r.postSystemJournal(ctx, t, &SysJournal{Tenant: tenant, Entity: ent, Period: period, BookID: bookID, BookCode: bookCode, Type: domain.JournalTypeReversal, Purpose: "ALLOCATION",
+				Description: "Reversal of allocation for " + period, Correlation: corr, PostingDate: postingDate, Currency: currency, Actor: actor, At: at, ReversalOf: journalID, ReversalReason: reason,
+				ExecutionKind: "KERNEL_ALLOC_REV", Trace: string(trace), Lines: back})
+		}
+		rev, e := reverseOne(jid, entity, book.BookID, book.BookCode, ccy, "alloc-rev:"+id)
 		if e != nil {
 			return e
 		}
-		var back []SysLine
-		for rows.Next() {
-			var l SysLine
-			var dr, cr string
-			var dims domain.Dimensions
-			if e := rows.Scan(&l.Account, &dr, &cr, &dims); e != nil {
-				rows.Close()
+		reversals := map[string]string{}
+		for _, rj := range remote {
+			rr, e := reverseOne(rj.JournalID, rj.LegalEntityID, rj.BookID, rj.BookCode, rj.Currency, "alloc-rev:"+id+":"+rj.BookID)
+			if e != nil {
 				return e
 			}
-			l.Debit, l.Credit, l.Dimensions, l.Description, l.RuleLineRef = cr, dr, dims, "reversal: allocation withdrawn", "ALLOC_REVERSAL"
-			back = append(back, l)
+			reversals[rj.JournalID] = rr.JournalID
 		}
-		rows.Close()
-		if e := rows.Err(); e != nil {
-			return e
-		}
-		trace, _ := json.Marshal(map[string]any{"allocation_run_id": id, "reverses": jid, "reason": reason})
-		rev, e := r.postSystemJournal(ctx, t, &SysJournal{Tenant: tenant, Entity: entity, Period: period, BookID: book.BookID, BookCode: book.BookCode, Type: domain.JournalTypeReversal, Purpose: "ALLOCATION",
-			Description: "Reversal of allocation for " + period, Correlation: "alloc-rev:" + id, PostingDate: postingDate, Currency: ccy, Actor: actor, At: at, ReversalOf: jid, ReversalReason: reason,
-			ExecutionKind: "KERNEL_ALLOC_REV", Trace: string(trace), Lines: back})
-		if e != nil {
-			return e
-		}
-		if _, e := t.Exec(ctx, `UPDATE allocation_runs SET status = 'REVERSED', reversal_journal_id = $3::uuid, reversed_by = $4, reversed_at = $5, reversal_reason = $6 WHERE tenant_id = $1::uuid AND allocation_run_id = $2::uuid`,
-			tenant, id, rev.JournalID, actor, at, reason); e != nil {
+		revJSON, _ := json.Marshal(reversals)
+		if _, e := t.Exec(ctx, `UPDATE allocation_runs SET status = 'REVERSED', reversal_journal_id = $3::uuid, reversed_by = $4, reversed_at = $5, reversal_reason = $6, remote_reversals = $7::jsonb WHERE tenant_id = $1::uuid AND allocation_run_id = $2::uuid`,
+			tenant, id, rev.JournalID, actor, at, reason, string(revJSON)); e != nil {
 			return e
 		}
 		return r.enqueue(ctx, t, tenant, kernel.OutEvent{Fact: "allocation-run.reversed", AggregateType: "allocation-run", AggregateID: id, Actor: actor, LegalEntityID: entity,
-			Data: map[string]any{"allocation_run_id": id, "reversal_journal_id": rev.JournalID, "reason": reason}})
+			Data: map[string]any{"allocation_run_id": id, "reversal_journal_id": rev.JournalID, "reason": reason, "recipient_journals_reversed": len(remote)}})
 	})
 	if err != nil {
 		if _, ok := kernel.AsException(err); ok {

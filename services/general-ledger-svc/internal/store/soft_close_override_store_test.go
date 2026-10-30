@@ -125,4 +125,3 @@ func TestPgStore_SoftCloseOverrideReason_AbsentReadsBackAsNil(t *testing.T) {
 			*got.SoftCloseOverrideReason)
 	}
 }
-

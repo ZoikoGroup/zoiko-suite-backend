@@ -34,14 +34,15 @@ const (
 // KernelHandler serves the Global Accounting Kernel: books, accounting events, posting rule sets, evaluation and
 // dimensions. Evaluation is a dry run: nothing here writes a journal.
 type KernelHandler struct {
-	svc   *kernel.Service
-	repo  kernel.Repo
-	ref   kernel.RefData
-	units kernel.CurrencyUnits
-	fx    kernel.FXSource
-	authz AuthZClient
+	svc    *kernel.Service
+	repo   kernel.Repo
+	ref    kernel.RefData
+	units  kernel.CurrencyUnits
+	fx     kernel.FXSource
+	authz  AuthZClient
 	gate   kernel.PeriodGate
 	signer kernel.Signer
+	obs    kernel.Observer
 	log    *zap.Logger
 }
 
@@ -67,9 +68,11 @@ func RegisterKernelRoutes(r chi.Router, h *KernelHandler) {
 		r.Post("/{id}/retire", h.bookStatus(kernel.BookRetired))
 	})
 	r.Route("/v1/accounting-events", func(r chi.Router) {
-		r.Post("/", h.RegisterEvent)
+		r.With(h.observe("register_event")).Post("/", h.RegisterEvent)
 		r.Get("/", h.ListEvents)
+		r.Get("/incomplete", h.ListIncompleteEvents)
 		r.Get("/{id}", h.GetEvent)
+		r.Get("/{id}/posting-status", h.GetEventPostingStatus)
 	})
 	r.Route("/v1/posting-rule-sets", func(r chi.Router) {
 		r.Post("/", h.CreateRuleSet)
@@ -83,7 +86,7 @@ func RegisterKernelRoutes(r chi.Router, h *KernelHandler) {
 		r.Post("/{id}/return-to-draft", h.ReturnToDraft)
 	})
 	r.Post("/v1/posting-evaluations", h.Evaluate)
-	r.Post("/v1/accounting-postings", h.PostEvent)
+	r.With(h.observe("post_event")).Post("/v1/accounting-postings", h.PostEvent)
 	r.Get("/v1/posting-traces", h.GetPostingTrace)
 	r.Post("/v1/fx-rates", h.IngestFXRate)
 	r.Get("/v1/fx-rates", h.ListFXRates)
@@ -92,7 +95,7 @@ func RegisterKernelRoutes(r chi.Router, h *KernelHandler) {
 	r.Get("/v1/fx-rate-overrides", h.ListFXOverrides)
 	r.Post("/v1/fx-rate-overrides/{id}/approve", h.decideFXOverride(true))
 	r.Post("/v1/fx-rate-overrides/{id}/reject", h.decideFXOverride(false))
-	r.Post("/v1/revaluation-runs", h.RunRevaluation)
+	r.With(h.observe("revaluation_run")).Post("/v1/revaluation-runs", h.RunRevaluation)
 	r.Get("/v1/revaluation-runs", h.ListRevaluationRuns)
 	r.Get("/v1/foreign-positions", h.GetForeignPositions)
 	r.Route("/v1/consolidation-groups", func(r chi.Router) {
@@ -107,7 +110,7 @@ func RegisterKernelRoutes(r chi.Router, h *KernelHandler) {
 		r.Get("/{id}/adjustments", h.ListGroupAdjustments)
 	})
 	r.Route("/v1/consolidation-runs", func(r chi.Router) {
-		r.Post("/", h.RunConsolidation)
+		r.With(h.observe("consolidation_run")).Post("/", h.RunConsolidation)
 		r.Get("/", h.ListConsolidationRuns)
 		r.Get("/{id}", h.GetConsolidationRun)
 		r.Post("/{id}/certify", h.CertifyConsolidationRun)
@@ -124,22 +127,23 @@ func RegisterKernelRoutes(r chi.Router, h *KernelHandler) {
 		r.Post("/{id}/retire", h.RetireAllocationRule)
 	})
 	r.Route("/v1/allocation-runs", func(r chi.Router) {
-		r.Post("/", h.RunAllocation)
+		r.With(h.observe("allocation_run")).Post("/", h.RunAllocation)
 		r.Get("/", h.ListAllocationRuns)
 		r.Get("/{id}", h.GetAllocationRun)
 		r.Post("/{id}/reverse", h.ReverseAllocationRun)
 	})
 	r.Get("/v1/book-comparison", h.GetBookComparison)
-	r.Post("/v1/balance-snapshots", h.CreateBalanceSnapshot)
+	r.With(h.observe("balance_snapshot")).Post("/v1/balance-snapshots", h.CreateBalanceSnapshot)
 	r.Get("/v1/balance-snapshots", h.ListBalanceSnapshots)
 	r.Get("/v1/balance-snapshots/{id}", h.GetBalanceSnapshot)
 	r.Post("/v1/balance-snapshots/{id}/verify", h.VerifyBalanceSnapshot)
+	r.Get("/v1/balance-snapshots/{id}/trace", h.GetBalanceSnapshotTrace)
 	r.Get("/v1/close-evidence", h.GetCloseEvidence)
-	r.Post("/v1/period-seals", h.ApplyPeriodSeal)
+	r.With(h.observe("period_seal")).Post("/v1/period-seals", h.ApplyPeriodSeal)
 	r.Get("/v1/period-seals", h.ListPeriodSeals)
 	r.Get("/v1/period-seals/{entity}/{period}", h.GetPeriodSeal)
 	r.Route("/v1/reconciliation-runs", func(r chi.Router) {
-		r.Post("/", h.RunReconciliation)
+		r.With(h.observe("reconciliation_run")).Post("/", h.RunReconciliation)
 		r.Get("/", h.ListReconciliationRuns)
 		r.Get("/{id}", h.GetReconciliationRun)
 		r.Post("/{id}/assign", h.AssignReconciliationRun)
@@ -151,6 +155,20 @@ func RegisterKernelRoutes(r chi.Router, h *KernelHandler) {
 	r.Post("/v1/reconciliation-tolerances", h.CreateReconciliationTolerance)
 	r.Get("/v1/reconciliation-tolerances", h.ListReconciliationTolerances)
 	r.Get("/v1/counterparty-balances", h.GetCounterpartyBalances)
+	r.Route("/v1/migration-batches", func(r chi.Router) {
+		r.With(h.observe("migration_stage")).Post("/", h.StageMigrationBatch)
+		r.Get("/", h.ListMigrationBatches)
+		r.Get("/{id}", h.GetMigrationBatch)
+		r.Get("/{id}/lines", h.ListMigrationLines)
+		r.Get("/{id}/preview", h.PreviewMigrationBatch)
+		r.Get("/{id}/evidence", h.GetMigrationEvidence)
+		r.Post("/{id}/validate", h.ValidateMigrationBatch)
+		r.Post("/{id}/approve", h.ApproveMigrationBatch)
+		r.Post("/{id}/cancel", h.CancelMigrationBatch)
+		r.With(h.observe("migration_post")).Post("/{id}/post", h.PostMigrationBatch)
+		r.Post("/{id}/reconcile", h.ReconcileMigrationBatch)
+	})
+	r.Get("/v1/rollout-readiness", h.GetRolloutReadiness)
 	r.Get("/v1/posting-rule-packs", h.ListRulePacks)
 	r.Post("/v1/posting-rule-packs/{name}/instantiate", h.InstantiateRulePack)
 	r.Get("/v1/account-applicability/{account_code}", h.GetAccountScope)
@@ -206,6 +224,7 @@ var familyStatus = map[string]int{
 
 func (h *KernelHandler) fail(w http.ResponseWriter, err error) {
 	if e, ok := kernel.AsException(err); ok {
+		h.observer().Exception(e.Family, e.Code)
 		st := http.StatusUnprocessableEntity
 		if s, found := familyStatus[e.Family]; found {
 			st = s

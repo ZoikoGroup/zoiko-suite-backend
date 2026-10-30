@@ -43,3 +43,19 @@ func (r *KernelRepo) LedgerPosition(ctx context.Context, tenant, entity, bookCod
 	})
 	return p, kernelErr(err)
 }
+
+// IntercompanyPosition implements kernel.ReconRepo: the sums of one entity's INTERCOMPANY-control entries in a book that name the
+// counterparty entity, up to a date and, when upToSeq is given, up to a watermark, so the same position can be reproduced later.
+func (r *KernelRepo) IntercompanyPosition(ctx context.Context, tenant, entity, bookCode, counterparty string, asOf time.Time, upToSeq int64) (kernel.LedgerPosition, error) {
+	var p kernel.LedgerPosition
+	err := r.tx(ctx, tenant, func(t pgx.Tx) error {
+		return t.QueryRow(ctx, `
+			SELECT COALESCE(max(entry_seq), 0), count(*), COALESCE(sum(debit_amount), 0)::text, COALESCE(sum(credit_amount), 0)::text,
+			       COALESCE(array_agg(DISTINCT account_code), '{}')
+			FROM ledger_entries
+			WHERE tenant_id = $1::uuid AND legal_entity_id = $2::uuid AND book_id = $3 AND control_type = 'INTERCOMPANY' AND counterparty_id = $4
+			  AND posting_date <= $5::date AND ($6::bigint = 0 OR entry_seq <= $6)`,
+			tenant, entity, bookCode, counterparty, asOf, upToSeq).Scan(&p.Watermark, &p.Count, &p.DebitTotal, &p.CreditTotal, &p.AccountCodes)
+	})
+	return p, kernelErr(err)
+}

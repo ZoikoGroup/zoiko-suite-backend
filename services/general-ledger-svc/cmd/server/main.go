@@ -241,7 +241,8 @@ func main() {
 	kernelRepo := store.NewKernelRepo(pool, cfg.EventResidencyRegion)
 	kernelSvc := &kernel.Service{Repo: kernelRepo}
 	kernelH := handler.NewKernel(kernelSvc, kernelRepo, kernelRepo, currency.New(cfg.CurrencyRegistryURL), nil, authzClient, log).
-		WithPeriodGate(handler.ClosePeriodGate{Close: closeClient, Authz: authzClient})
+		WithPeriodGate(handler.ClosePeriodGate{Close: closeClient, Authz: authzClient}).
+		WithObserver(telemetry.NewKernelMetrics("general-ledger-svc"))
 	if cfg.SnapshotSigningKey != "" {
 		if len(cfg.SnapshotSigningKey) < 32 {
 			log.Fatal("SNAPSHOT_SIGNING_KEY must be at least 32 characters")

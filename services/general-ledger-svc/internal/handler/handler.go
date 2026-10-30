@@ -1771,13 +1771,14 @@ func (h *Handler) ReverseJournal(w http.ResponseWriter, r *http.Request) {
 		CorrelationID:           req.CorrelationID,
 		SoftCloseOverrideReason: &req.SoftCloseOverrideReason,
 
-		JournalType:     domain.JournalTypeReversal,
-		TransactionDate: header.TransactionDate,
-		PostingDate:     reversalPostingDate,
-		CurrencyCode:    header.CurrencyCode,
-		BookID:          header.BookID,
-		ReportingBasis:  header.ReportingBasis,
-		EvidenceRefs:    header.EvidenceRefs,
+		JournalType:      domain.JournalTypeReversal,
+		TransactionDate:  header.TransactionDate,
+		PostingDate:      reversalPostingDate,
+		CurrencyCode:     header.CurrencyCode,
+		BookID:           header.BookID,
+		ReportingBasis:   header.ReportingBasis,
+		EvidenceRefs:     header.EvidenceRefs,
+		EvidenceBundleID: header.EvidenceBundleID,
 
 		// Lineage (§11): the reversal stays in the original's book and under the original's accounting event, carries the
 		// reason and the nature of the correction, and — for a kernel posting — gets an execution record of its own.
@@ -1803,7 +1804,7 @@ func (h *Handler) ReverseJournal(w http.ResponseWriter, r *http.Request) {
 
 			// The original foreign-currency basis and rule provenance are kept: the reversal neutralizes at the same rate.
 			TransactionAmount: l.TransactionAmount, TransactionCcy: l.TransactionCcy, ExchangeRate: l.ExchangeRate,
-			RateRef: l.RateRef, PostingRuleLineRef: l.PostingRuleLineRef, CounterpartyID: l.CounterpartyID,
+			RateRef: l.RateRef, PostingRuleLineRef: l.PostingRuleLineRef, CounterpartyID: l.CounterpartyID, TaxDetailRef: l.TaxDetailRef, SourceLineRef: l.SourceLineRef,
 		}
 	}
 
@@ -3126,6 +3127,7 @@ func (h *Handler) CreateReversalPosting(w http.ResponseWriter, r *http.Request) 
 		BookID:           header.BookID,
 		ReportingBasis:   header.ReportingBasis,
 		EvidenceRefs:     header.EvidenceRefs,
+		EvidenceBundleID: header.EvidenceBundleID,
 		AccountingBookID: header.AccountingBookID,
 		ReversalReason:   optionalString(req.Reason),
 	}
@@ -3139,7 +3141,7 @@ func (h *Handler) CreateReversalPosting(w http.ResponseWriter, r *http.Request) 
 	for i, l := range originalLines {
 		reversingLines[i] = domain.JournalLine{AccountCode: l.AccountCode, DebitAmount: l.CreditAmount, CreditAmount: l.DebitAmount, Description: l.Description,
 			TaxCode: l.TaxCode, TaxLogicSnapshotID: l.TaxLogicSnapshotID, Dimensions: l.Dimensions,
-			TransactionAmount: l.TransactionAmount, TransactionCcy: l.TransactionCcy, ExchangeRate: l.ExchangeRate, RateRef: l.RateRef, PostingRuleLineRef: l.PostingRuleLineRef, CounterpartyID: l.CounterpartyID}
+			TransactionAmount: l.TransactionAmount, TransactionCcy: l.TransactionCcy, ExchangeRate: l.ExchangeRate, RateRef: l.RateRef, PostingRuleLineRef: l.PostingRuleLineRef, CounterpartyID: l.CounterpartyID, TaxDetailRef: l.TaxDetailRef, SourceLineRef: l.SourceLineRef}
 	}
 
 	_, _, err = h.store.ReverseJournal(r.Context(), header.TenantID, req.OriginalJournalID, reversingHeader, reversingLines, principalID)
