@@ -341,9 +341,18 @@ func attemptTenantString(a *domain.PaymentInitiationAttempt) string {
 // attemptEventData is the stable payload of the legacy-stub outcome events.
 // The engine path has its own submittedData; both describe the attempt, not
 // provider internals.
+//
+// source_reference is included because it is the one field a consumer in
+// another service can correlate against: payment-status-svc's BNK-07 state
+// (SPEC_DEVIATIONS A4/A5) is keyed by (tenant_id, source_reference), the
+// caller's own instruction reference, set independently of this attempt's
+// own attempt_id/idempotency_key. Without it here, PAYMENT_SUBMITTED and
+// PAYMENT_SUBMISSION_AMBIGUOUS could never be matched to the row they are
+// about.
 func attemptEventData(a *domain.PaymentInitiationAttempt, extra map[string]any) map[string]any {
 	d := map[string]any{
 		"attempt_id": a.AttemptID, "status": a.Status, "idempotency_key": a.IdempotencyKey, "currency": a.Currency,
+		"source_reference": a.SourceReference,
 	}
 	for k, v := range extra {
 		d[k] = v

@@ -346,3 +346,18 @@ A later pass closed A6.
      amounts storing nothing (handler); `9999999999999999.99`, which has no
      `float64`, round-tripping through the column, the read and the
      prepared event, and the store's own refusal (store).
+
+- **B-2026-10-29. `source_reference` added to the PAYMENT_SUBMITTED /
+  PAYMENT_SUBMISSION_AMBIGUOUS outbox payloads.** Found while building
+  payment-status-svc's BNK-06 event consumer (its own SPEC_DEVIATIONS A4):
+  neither event's payload (`attemptEventData` in `internal/store/pg_store.go`,
+  `submittedData` in `internal/store/dispatch_store.go`) carried any field a
+  consumer in another service could correlate against — only this attempt's
+  own `attempt_id` and `idempotency_key`, neither of which is
+  payment-status-svc's `(tenant_id, source_reference)` key. Both builders now
+  include `source_reference` (the caller's own instruction reference,
+  already a real column on `payment_initiation_attempts`) as an additive,
+  backward-compatible payload field. No schema registry entry exists for
+  either event type in this repository, and no existing test asserted the
+  payloads' exact key set, so this was a safe, self-contained fix — not a
+  producer redesign.

@@ -44,10 +44,10 @@ func pgConstraint(err error) string {
 const unresolvedSourceReferenceIndex = "uq_payment_execution_states_unresolved_source_reference"
 
 // unresolvedStatusesSQL is the status predicate shared by RecordPaymentStatus's
-// pre-insert lookup and migration 000007's partial unique index. These are this
-// service's not-yet-resolved states - the complement of domain.finalStates.
-// Keep it in lockstep with the migration.
-const unresolvedStatusesSQL = "('PREPARED', 'SUBMITTED', 'ACCEPTED', 'PENDING')"
+// pre-insert lookup and migration 000007/000009's partial unique index. These
+// are this service's not-yet-resolved states - the complement of
+// domain.finalStates. Keep it in lockstep with the migration.
+const unresolvedStatusesSQL = "('PREPARED', 'SUBMITTED', 'ACCEPTED', 'PENDING', 'PENDING_UNKNOWN')"
 
 // isRegressionBlocked reports whether err is the custom SQLSTATE ZK002
 // raised by the payment_execution_states trigger when a status update
@@ -86,6 +86,16 @@ type Store interface {
 	// this call returned the already-committed result.
 	ConfirmSettlement(ctx context.Context, paymentID string, req domain.ConfirmSettlementRequest, principalID, idempotencyKey, correlationID string) (*domain.PaymentExecutionState, *domain.FinalityEvidence, bool, error)
 	RecordRejection(ctx context.Context, paymentID string, req domain.RecordRejectionRequest, principalID, idempotencyKey, correlationID string) (*domain.PaymentExecutionState, *domain.FinalityEvidence, bool, error)
+
+	// ApplySubmissionEvent applies a BNK-06 event consumer (A4) fact — toStatus
+	// is StatusSubmitted or StatusPendingUnknown — to the unresolved execution
+	// state identified by (tenantID, sourceReference). Idempotent: a row
+	// already at or past toStatus is a genuine no-op (applied=false, no
+	// error), the same posture ApplyCallbackStatus takes for an out-of-order
+	// callback. ErrUnresolvedPaymentNotFound means no such row exists yet —
+	// worth retrying, since RecordPaymentStatus for this instruction may not
+	// have run yet.
+	ApplySubmissionEvent(ctx context.Context, tenantID, sourceReference string, toStatus domain.ExecutionStatus, providerRef, actorPrincipalID, correlationID string) (state *domain.PaymentExecutionState, applied bool, err error)
 
 	ListEvents(ctx context.Context, paymentID string) ([]domain.StatusEvent, error)
 	ListFinalityEvidence(ctx context.Context, paymentID string) ([]domain.FinalityEvidence, error)
@@ -184,6 +194,10 @@ func canonicalForLegacy(legacy string) string {
 		return "com.zoikosuite.banking.payment-execution-state.conflict-raised"
 	case domain.EventPaymentStatusConflictResolved:
 		return "com.zoikosuite.banking.payment-execution-state.conflict-resolved"
+	case domain.EventPaymentSubmitted:
+		return "com.zoikosuite.banking.payment-execution-state.submitted"
+	case domain.EventPaymentPendingUnknown:
+		return "com.zoikosuite.banking.payment-execution-state.pending-unknown"
 	default:
 		// eventTypeFor's own fallback ("PAYMENT_STATUS_UPDATED") and any
 		// future unmapped legacy type land here rather than failing closed
@@ -488,6 +502,98 @@ func (s *PgStore) ApplyCallbackStatus(ctx context.Context, paymentID string, pay
 	return p, applied, nil
 }
 
+// applicableFromStatuses is the set of statuses ApplySubmissionEvent (A4)
+// will actually move FROM, for a given toStatus. Anything else found at the
+// row — already at toStatus (redelivery), already past it via a real
+// provider callback (ACCEPTED/PENDING), or already a final/governed state —
+// is a genuine no-op: BNK-06's own observation of its submission attempt
+// never overrides real provider evidence or an operator's resolution.
+func applicableFromStatuses(toStatus domain.ExecutionStatus) []string {
+	switch toStatus {
+	case domain.StatusSubmitted:
+		// PENDING_UNKNOWN -> SUBMITTED is BNK-06 resolving its own ambiguity
+		// by confirming the attempt did reach the provider after all.
+		return []string{string(domain.StatusPrepared), string(domain.StatusPendingUnknown)}
+	case domain.StatusPendingUnknown:
+		return []string{string(domain.StatusPrepared), string(domain.StatusSubmitted)}
+	default:
+		return nil
+	}
+}
+
+// ApplySubmissionEvent is the BNK-06 event consumer's (A4, internal/
+// paymentinit) write path. It looks up the unresolved execution state by
+// (tenant_id, source_reference) — the same natural key RecordPaymentStatus's
+// own dedupe uses (A5) — rather than by payment_id, since the consumer only
+// ever has the caller's own instruction reference, never this service's
+// internal id.
+func (s *PgStore) ApplySubmissionEvent(ctx context.Context, tenantID, sourceReference string, toStatus domain.ExecutionStatus, providerRef, actorPrincipalID, correlationID string) (*domain.PaymentExecutionState, bool, error) {
+	from := applicableFromStatuses(toStatus)
+	if len(from) == 0 {
+		return nil, false, fmt.Errorf("%w: ApplySubmissionEvent does not accept target status %q", domain.ErrInvalidTransition, toStatus)
+	}
+	var p *domain.PaymentExecutionState
+	applied := true
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		current, lookupErr := scanState(tx.QueryRow(ctx, `
+			SELECT `+stateColumns+` FROM payment_execution_states
+			WHERE COALESCE(tenant_id::text, '') = $1 AND source_reference = $2
+			  AND status IN `+unresolvedStatusesSQL+`
+			ORDER BY created_at ASC
+			LIMIT 1
+			FOR UPDATE
+		`, tenantID, sourceReference))
+		if errors.Is(lookupErr, pgx.ErrNoRows) {
+			return domain.ErrUnresolvedPaymentNotFound
+		}
+		if lookupErr != nil {
+			return lookupErr
+		}
+		if !containsStr(from, string(current.Status)) {
+			applied = false
+			p = current
+			return nil
+		}
+		fromStatus := current.Status
+		var err error
+		p, err = scanState(tx.QueryRow(ctx, `
+			UPDATE payment_execution_states SET status = $2, updated_at = NOW()
+			WHERE payment_id = $1
+			RETURNING `+stateColumns,
+			current.PaymentID, string(toStatus),
+		))
+		if err != nil {
+			return err
+		}
+		eventType := domain.EventPaymentSubmitted
+		if toStatus == domain.StatusPendingUnknown {
+			eventType = domain.EventPaymentPendingUnknown
+		}
+		if err := s.recordEvent(ctx, tx, p.TenantID, p.PaymentID, eventType, string(fromStatus), string(toStatus), providerRef, "", actorPrincipalID); err != nil {
+			return err
+		}
+		return s.enqueueEvent(ctx, tx, canonicalForLegacy(eventType), eventType,
+			"payment-execution-state", p.PaymentID, strOrEmpty(p.TenantID), p.LegalEntityID, actorPrincipalID, correlationID, p)
+	})
+	if errors.Is(err, domain.ErrUnresolvedPaymentNotFound) {
+		return nil, false, domain.ErrUnresolvedPaymentNotFound
+	}
+	if err != nil {
+		s.log.Error("pg ApplySubmissionEvent failed", zap.Error(err))
+		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return p, applied, nil
+}
+
+func containsStr(xs []string, v string) bool {
+	for _, x := range xs {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}
+
 // LinkStatement raises a real, blocking conflict if the caller-supplied
 // statement status disagrees with the current canonical status —
 // negative-path scenario #4 — rather than overwriting either side.
@@ -645,7 +751,7 @@ func (s *PgStore) CancelPayment(ctx context.Context, paymentID string, req domai
 		var err error
 		p, err = scanState(tx.QueryRow(ctx, `
 			UPDATE payment_execution_states SET status = 'CANCELLED', updated_at = NOW()
-			WHERE payment_id = $1 AND status IN ('PREPARED', 'SUBMITTED')
+			WHERE payment_id = $1 AND status IN ('PREPARED', 'SUBMITTED', 'PENDING_UNKNOWN')
 			RETURNING `+stateColumns,
 			paymentID,
 		))

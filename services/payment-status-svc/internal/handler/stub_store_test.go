@@ -265,3 +265,45 @@ func (s *stubStore) ListUnresolved(_ context.Context, legalEntityID string) ([]d
 	}
 	return out, nil
 }
+
+// ApplySubmissionEvent replicates PgStore's: looked up by (tenant,
+// source_reference) among unresolved statuses, idempotent against a status
+// already at or past toStatus.
+func (s *stubStore) ApplySubmissionEvent(_ context.Context, tenantID, sourceReference string, toStatus domain.ExecutionStatus, providerRef, actorPrincipalID, _ string) (*domain.PaymentExecutionState, bool, error) {
+	from := map[domain.ExecutionStatus]bool{}
+	switch toStatus {
+	case domain.StatusSubmitted:
+		from[domain.StatusPrepared], from[domain.StatusPendingUnknown] = true, true
+	case domain.StatusPendingUnknown:
+		from[domain.StatusPrepared], from[domain.StatusSubmitted] = true, true
+	default:
+		return nil, false, domain.ErrInvalidTransition
+	}
+	var found *domain.PaymentExecutionState
+	for _, p := range s.payments {
+		pTenant := ""
+		if p.TenantID != nil {
+			pTenant = *p.TenantID
+		}
+		if pTenant != tenantID || p.SourceReference != sourceReference || domain.IsFinal(p.Status) {
+			continue
+		}
+		found = p
+		break
+	}
+	if found == nil {
+		return nil, false, domain.ErrUnresolvedPaymentNotFound
+	}
+	if !from[found.Status] {
+		return found, false, nil
+	}
+	fromStatus := found.Status
+	found.Status = toStatus
+	found.UpdatedAt = time.Now().UTC()
+	eventType := domain.EventPaymentSubmitted
+	if toStatus == domain.StatusPendingUnknown {
+		eventType = domain.EventPaymentPendingUnknown
+	}
+	s.recordEvent(found, eventType, string(fromStatus), string(toStatus), providerRef, "", actorPrincipalID)
+	return found, true, nil
+}
