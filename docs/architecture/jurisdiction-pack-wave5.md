@@ -50,7 +50,7 @@ Profiles are parameter-only rules: a GOLDEN case must resolve the rule and pin `
   decision (s38).
 * **Timing enforcement:** issue deadlines, retry windows and correction windows are carried and returned but not enforced; nothing retries or expires a submission.
 * **Corrections:** the permitted workflows are data on the profile; no credit, cancel or amend workflow is executed.
-* **Events:** no `submission.*` domain events are published yet.
+* **Events:** published since the s26 events change: `filing.submitted` / `einvoice.submitted` on registration, and on an *applied* status report `filing.accepted|rejected` / `einvoice.accepted|rejected` (states ACCEPTED, CLEARED, FILED, REJECTED) or `<kind>.status-changed` for any other state. Refused, replayed, duplicate, stale and after-terminal reports emit nothing.
 * **Provider reconciliation:** the document's "provider/authority state reconciliation" is limited to the lifecycle rules above; there is no polling and no reconciliation job.
 * Dependency availability per region (JUR-NEG-15) is not checked for profile dependencies; the pack-level dependency gate from Wave 7 is unchanged.
 

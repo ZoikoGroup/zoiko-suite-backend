@@ -57,14 +57,11 @@ region configured, a resolver serves only what is deployed to it, and with nothi
 intended fail-closed state.
 
 ## Deliberately not built
-* **`POST /jurisdiction-decisions:resolve` (s9, s25).** A governed jurisdiction determination needs authoritative entity,
-  registration, counterparty, establishment and transaction facts and place-of-supply rules. The entity registry is tenant-scoped and
-  requires identity forwarding, and no product rules exist for it. Without them it could only echo the client's claim, which s9 forbids
-  as the final authority (JUR-NEG-05). `GET /v1/pack-coverage` is offered instead as an explicit read model of what is supported.
+* **`POST /jurisdiction-decisions:resolve` (s9, s25): built later**, see [jurisdiction-pack-wave2-determination.md](jurisdiction-pack-wave2-determination.md). It was left out here because it could only echo the client claim; it now rests on the entity assignments projected from `tenant-entity-registry-svc`. Place of supply and other transaction-level determination are still not built. `GET /v1/pack-coverage` remains the read model of what is supported.
 * **`POST /regulatory-calculations:execute`.** Needs a rule formula language and exact-decimal execution (s38, undecided).
 * Resolution-rate, deployment-skew and stale-pack telemetry (s29, JUR-NEG-29): only cache counters are exposed.
 * Subdivision override only "where the regime permits" (s10): not modelled.
-* A shared (multi-replica) cache or push-based invalidation.
+* ~~A shared (multi-replica) cache or push-based invalidation~~: push invalidation is built (see [jurisdiction-pack-wave7-remediation.md](jurisdiction-pack-wave7-remediation.md)); each replica still keeps its own cache.
 
 ## Authorization
 `RULE_RESOLUTION_RESOLVE`, `RULE_DECISION_VIEW` (demo seed bundle `JURISDICTION_RESOLVER_CALLER`, for calling services; separate from
