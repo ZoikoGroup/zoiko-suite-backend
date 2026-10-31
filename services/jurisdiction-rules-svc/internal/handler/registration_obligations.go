@@ -94,15 +94,15 @@ func (h *Handler) ResolveRegistrationObligations(w http.ResponseWriter, r *http.
 		return
 	}
 	if field := firstBlank(requiredField{"jurisdiction", req.Jurisdiction}, requiredField{"as_of", req.AsOf}); field != "" {
-		writeMissingField(w, field)
+		writeMissingField(w, r, field)
 		return
 	}
-	asOf, ok := parseDay(w, "as_of", req.AsOf)
+	asOf, ok := parseDay(w, r, "as_of", req.AsOf)
 	if !ok {
 		return
 	}
 	if len(req.Registrations) == 0 || len(req.Registrations) > maxRegistrationFacts {
-		writeError(w, http.StatusBadRequest, "invalid_registrations", "registrations needs 1 to 25 entries")
+		writeError(w, r, http.StatusBadRequest, "invalid_registrations", "registrations needs 1 to 25 entries")
 		return
 	}
 	type parsed struct {
@@ -112,21 +112,21 @@ func (h *Handler) ResolveRegistrationObligations(w http.ResponseWriter, r *http.
 	dates := make([]parsed, len(req.Registrations))
 	for i, rf := range req.Registrations {
 		if field := firstBlank(requiredField{"registration_code", rf.RegistrationCode}, requiredField{"registration_date", rf.RegistrationDate}); field != "" {
-			writeMissingField(w, "registrations[]."+field)
+			writeMissingField(w, r, "registrations[]."+field)
 			return
 		}
-		from, ok := parseDay(w, "registration_date", rf.RegistrationDate)
+		from, ok := parseDay(w, r, "registration_date", rf.RegistrationDate)
 		if !ok {
 			return
 		}
 		dates[i].from = from
 		if rf.DeregistrationDate != nil {
-			to, ok := parseDay(w, "deregistration_date", *rf.DeregistrationDate)
+			to, ok := parseDay(w, r, "deregistration_date", *rf.DeregistrationDate)
 			if !ok {
 				return
 			}
 			if !to.After(from) {
-				writeError(w, http.StatusBadRequest, "invalid_deregistration_date", "deregistration_date must be after registration_date")
+				writeError(w, r, http.StatusBadRequest, "invalid_deregistration_date", "deregistration_date must be after registration_date")
 				return
 			}
 			dates[i].to = &to
@@ -170,7 +170,7 @@ func (h *Handler) ResolveRegistrationObligations(w http.ResponseWriter, r *http.
 			dd, err := h.resolver.CalculateDue(r.Context(), resolver.DueRequest{Jurisdiction: req.Jurisdiction, ObligationCode: code, Facts: facts,
 				PackRef: req.PackRef, PackVersion: req.PackVersion})
 			if err != nil {
-				h.writeResolveError(w, err, corr)
+				h.writeResolveError(w, r, err, corr)
 				return
 			}
 			ob := ObligationApplicability{ObligationCode: code, Outcome: dd.Outcome, Due: dd}
@@ -189,17 +189,17 @@ func (h *Handler) ResolveRegistrationObligations(w http.ResponseWriter, r *http.
 
 	respJSON, err := json.Marshal(res)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "encode_failed", "could not encode the answer")
+		writeError(w, r, http.StatusInternalServerError, "encode_failed", "could not encode the answer")
 		return
 	}
 	stored, replayed, err := h.registry.RecordDecision(r.Context(), store.DecisionRecord{Kind: "APPLICABILITY", RequestedBy: actor, CorrelationID: corr,
 		IdempotencyKey: idemKey, RequestDigest: reqDigest, RequestJSON: rawReq, EffectiveAt: asOf, Outcome: res.Outcome, ResponseJSON: respJSON})
 	if err != nil {
 		if errors.Is(err, domain.ErrIdempotencyConflict) {
-			writeError(w, http.StatusConflict, "idempotency_conflict", err.Error())
+			writeError(w, r, http.StatusConflict, "idempotency_conflict", err.Error())
 			return
 		}
-		h.writeRegistryError(w, err, corr)
+		h.writeRegistryError(w, r, err, corr)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"decision_id": stored.DecisionID, "replayed": replayed, "applicability": json.RawMessage(stored.Response)})

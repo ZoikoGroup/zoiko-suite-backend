@@ -40,7 +40,7 @@ func (h *Handler) resolveRegulatedRule(w http.ResponseWriter, r *http.Request, l
 	d, err := h.resolver.Resolve(r.Context(), resolver.Request{Jurisdiction: l.jurisdiction, RuleDomain: l.ruleDomain,
 		RuleCode: l.code, At: l.at, PackRef: l.packRef, PackVersion: l.packVersion})
 	if err != nil {
-		h.writeResolveError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeResolveError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return nil, nil, "", false
 	}
 	if d.Outcome != domain.OutcomeResolved || d.Rule == nil {
@@ -53,10 +53,10 @@ func (h *Handler) resolveRegulatedRule(w http.ResponseWriter, r *http.Request, l
 	return d, &p, d.Outcome, true
 }
 
-func parseDay(w http.ResponseWriter, field, v string) (time.Time, bool) {
+func parseDay(w http.ResponseWriter, r *http.Request, field, v string) (time.Time, bool) {
 	t, err := time.Parse("2006-01-02", v)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_"+field, field+" must be a date, YYYY-MM-DD")
+		writeError(w, r, http.StatusBadRequest, "invalid_"+field, field+" must be a date, YYYY-MM-DD")
 		return time.Time{}, false
 	}
 	return t, true
@@ -105,14 +105,14 @@ func (h *Handler) ValidateRegistrationIdentifier(w http.ResponseWriter, r *http.
 	}
 	if field := firstBlank(requiredField{"jurisdiction", req.Jurisdiction}, requiredField{"registration_code", req.RegistrationCode},
 		requiredField{"identifier", req.Identifier}, requiredField{"as_of", req.AsOf}); field != "" {
-		writeMissingField(w, field)
+		writeMissingField(w, r, field)
 		return
 	}
 	if len(req.Identifier) > 256 {
-		writeError(w, http.StatusBadRequest, "invalid_identifier", "identifier is at most 256 characters")
+		writeError(w, r, http.StatusBadRequest, "invalid_identifier", "identifier is at most 256 characters")
 		return
 	}
-	day, ok := parseDay(w, "as_of", req.AsOf)
+	day, ok := parseDay(w, r, "as_of", req.AsOf)
 	if !ok {
 		return
 	}
@@ -167,20 +167,20 @@ func (h *Handler) EvaluateLicence(w http.ResponseWriter, r *http.Request) {
 	}
 	if field := firstBlank(requiredField{"jurisdiction", req.Jurisdiction}, requiredField{"licence_code", req.LicenceCode},
 		requiredField{"issue_date", req.IssueDate}, requiredField{"as_of", req.AsOf}); field != "" {
-		writeMissingField(w, field)
+		writeMissingField(w, r, field)
 		return
 	}
-	issue, ok := parseDay(w, "issue_date", req.IssueDate)
+	issue, ok := parseDay(w, r, "issue_date", req.IssueDate)
 	if !ok {
 		return
 	}
-	asOf, ok := parseDay(w, "as_of", req.AsOf)
+	asOf, ok := parseDay(w, r, "as_of", req.AsOf)
 	if !ok {
 		return
 	}
 	var expiry *time.Time
 	if req.ExpiryDate != nil {
-		e, ok := parseDay(w, "expiry_date", *req.ExpiryDate)
+		e, ok := parseDay(w, r, "expiry_date", *req.ExpiryDate)
 		if !ok {
 			return
 		}
@@ -239,20 +239,20 @@ func (h *Handler) EvaluateSchemeElection(w http.ResponseWriter, r *http.Request)
 	}
 	if field := firstBlank(requiredField{"jurisdiction", req.Jurisdiction}, requiredField{"scheme_code", req.SchemeCode},
 		requiredField{"metric_value", req.MetricValue}, requiredField{"start_date", req.StartDate}, requiredField{"as_of", req.AsOf}); field != "" {
-		writeMissingField(w, field)
+		writeMissingField(w, r, field)
 		return
 	}
-	start, ok := parseDay(w, "start_date", req.StartDate)
+	start, ok := parseDay(w, r, "start_date", req.StartDate)
 	if !ok {
 		return
 	}
-	asOf, ok := parseDay(w, "as_of", req.AsOf)
+	asOf, ok := parseDay(w, r, "as_of", req.AsOf)
 	if !ok {
 		return
 	}
 	var cancel *time.Time
 	if req.CancelDate != nil {
-		c, ok := parseDay(w, "cancel_date", *req.CancelDate)
+		c, ok := parseDay(w, r, "cancel_date", *req.CancelDate)
 		if !ok {
 			return
 		}
@@ -309,10 +309,10 @@ func (h *Handler) EvaluateThresholdMonitor(w http.ResponseWriter, r *http.Reques
 	}
 	if field := firstBlank(requiredField{"jurisdiction", req.Jurisdiction}, requiredField{"monitor_code", req.MonitorCode},
 		requiredField{"as_of", req.AsOf}); field != "" {
-		writeMissingField(w, field)
+		writeMissingField(w, r, field)
 		return
 	}
-	asOf, ok := parseDay(w, "as_of", req.AsOf)
+	asOf, ok := parseDay(w, r, "as_of", req.AsOf)
 	if !ok {
 		return
 	}

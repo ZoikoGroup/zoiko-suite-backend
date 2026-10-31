@@ -29,20 +29,20 @@ func registerRemediationRoutes(r chi.Router, h *Handler) {
 	r.Post("/v1/admin/remediation-cases/{case_id}/close", h.CloseRemediationCase)
 }
 
-func (h *Handler) writeRemediationError(w http.ResponseWriter, err error, corr string) {
+func (h *Handler) writeRemediationError(w http.ResponseWriter, r *http.Request, err error, corr string) {
 	switch {
 	case errors.Is(err, domain.ErrRemediationNotFound):
-		writeError(w, http.StatusNotFound, "remediation_case_not_found", err.Error())
+		writeError(w, r, http.StatusNotFound, "remediation_case_not_found", err.Error())
 	case errors.Is(err, domain.ErrNothingToRemediate):
-		writeError(w, http.StatusConflict, "nothing_to_remediate", err.Error())
+		writeError(w, r, http.StatusConflict, "nothing_to_remediate", err.Error())
 	case errors.Is(err, domain.ErrDispositionDiffers):
-		writeError(w, http.StatusConflict, "disposition_differs", err.Error())
+		writeError(w, r, http.StatusConflict, "disposition_differs", err.Error())
 	case errors.Is(err, domain.ErrDecisionNotInCase):
-		writeError(w, http.StatusUnprocessableEntity, "decision_not_in_case", err.Error())
+		writeError(w, r, http.StatusUnprocessableEntity, "decision_not_in_case", err.Error())
 	case errors.Is(err, domain.ErrRemediationRefused):
-		writeError(w, http.StatusUnprocessableEntity, "remediation_refused", err.Error())
+		writeError(w, r, http.StatusUnprocessableEntity, "remediation_refused", err.Error())
 	default:
-		h.writeOpsError(w, err, corr)
+		h.writeOpsError(w, r, err, corr)
 	}
 }
 
@@ -69,13 +69,13 @@ func (h *Handler) OpenRemediationCase(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if field := firstBlank(requiredField{"pack_ref", req.PackRef}, requiredField{"version", req.Version}, requiredField{"reason", req.Reason}); field != "" {
-		writeMissingField(w, field)
+		writeMissingField(w, r, field)
 		return
 	}
 	c, err := h.registry.OpenRemediationCase(r.Context(), req.PackRef, req.Version, strings.TrimSpace(req.Ring), strings.TrimSpace(req.Region),
 		strings.TrimSpace(req.Reason), strings.TrimSpace(req.EvidenceRef), actor)
 	if err != nil {
-		h.writeRemediationError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeRemediationError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	status := http.StatusOK
@@ -94,18 +94,18 @@ func (h *Handler) ListRemediationCases(w http.ResponseWriter, r *http.Request) {
 	if _, ok := h.admin(w, r, "remediation_case", "view"); !ok {
 		return
 	}
-	limit, offset, ok := h.parsePaging(w, r.URL.Query())
+	limit, offset, ok := h.parsePaging(w, r, r.URL.Query())
 	if !ok {
 		return
 	}
 	status := strings.ToUpper(r.URL.Query().Get("status"))
 	if status != "" && status != "OPEN" && status != "CLOSED" {
-		writeError(w, http.StatusBadRequest, "invalid_status", "status must be OPEN or CLOSED")
+		writeError(w, r, http.StatusBadRequest, "invalid_status", "status must be OPEN or CLOSED")
 		return
 	}
 	out, err := h.registry.ListRemediationCases(r.Context(), status, limit, offset)
 	if err != nil {
-		h.writeRemediationError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeRemediationError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"cases": out})
@@ -117,7 +117,7 @@ func (h *Handler) GetRemediationCase(w http.ResponseWriter, r *http.Request) {
 	}
 	c, err := h.registry.GetRemediationCase(r.Context(), chi.URLParam(r, "case_id"))
 	if err != nil {
-		h.writeRemediationError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeRemediationError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	writeJSON(w, http.StatusOK, c)
@@ -128,14 +128,14 @@ func (h *Handler) ListRemediationDecisions(w http.ResponseWriter, r *http.Reques
 	if _, ok := h.admin(w, r, "remediation_case", "view"); !ok {
 		return
 	}
-	limit, offset, ok := h.parsePaging(w, r.URL.Query())
+	limit, offset, ok := h.parsePaging(w, r, r.URL.Query())
 	if !ok {
 		return
 	}
 	pending := r.URL.Query().Get("pending") == "true"
 	out, err := h.registry.ListRemediationDecisions(r.Context(), chi.URLParam(r, "case_id"), pending, limit, offset)
 	if err != nil {
-		h.writeRemediationError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeRemediationError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"decisions": out})
@@ -160,24 +160,24 @@ func (h *Handler) RecordRemediationDispositions(w http.ResponseWriter, r *http.R
 		return
 	}
 	if len(req.Dispositions) == 0 || len(req.Dispositions) > maxDispositionBatch {
-		writeError(w, http.StatusBadRequest, "invalid_dispositions", "dispositions needs 1 to 100 entries")
+		writeError(w, r, http.StatusBadRequest, "invalid_dispositions", "dispositions needs 1 to 100 entries")
 		return
 	}
 	seen := map[string]bool{}
 	for i, d := range req.Dispositions {
 		if err := d.Validate(); err != nil {
-			writeError(w, http.StatusBadRequest, "invalid_disposition", "dispositions["+strconv.Itoa(i)+"]: "+err.Error())
+			writeError(w, r, http.StatusBadRequest, "invalid_disposition", "dispositions["+strconv.Itoa(i)+"]: "+err.Error())
 			return
 		}
 		if seen[d.DecisionID] {
-			writeError(w, http.StatusBadRequest, "invalid_dispositions", "dispositions["+strconv.Itoa(i)+"]: decision "+d.DecisionID+" appears twice in the batch")
+			writeError(w, r, http.StatusBadRequest, "invalid_dispositions", "dispositions["+strconv.Itoa(i)+"]: decision "+d.DecisionID+" appears twice in the batch")
 			return
 		}
 		seen[d.DecisionID] = true
 	}
 	res, err := h.registry.RecordDispositions(r.Context(), chi.URLParam(r, "case_id"), req.Dispositions, actor)
 	if err != nil {
-		h.writeRemediationError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeRemediationError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	writeJSON(w, http.StatusOK, res)
@@ -201,12 +201,12 @@ func (h *Handler) CloseRemediationCase(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if strings.TrimSpace(req.Note) == "" {
-		writeMissingField(w, "note")
+		writeMissingField(w, r, "note")
 		return
 	}
 	c, changed, err := h.registry.CloseRemediationCase(r.Context(), chi.URLParam(r, "case_id"), strings.TrimSpace(req.Note), actor)
 	if err != nil {
-		h.writeRemediationError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeRemediationError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	if changed {

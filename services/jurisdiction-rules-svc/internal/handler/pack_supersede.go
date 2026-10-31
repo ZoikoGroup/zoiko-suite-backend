@@ -32,13 +32,13 @@ func (h *Handler) SupersedePackVersion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if field := firstBlank(requiredField{"superseded_by", req.SupersededBy}, requiredField{"reason", req.Reason}); field != "" {
-		writeMissingField(w, field)
+		writeMissingField(w, r, field)
 		return
 	}
 	ref, version := pathRefVersion(r)
 	res, err := h.registry.SupersedePackVersion(r.Context(), ref, version, strings.TrimSpace(req.SupersededBy), strings.TrimSpace(req.Reason), strings.TrimSpace(req.EvidenceRef), actor)
 	if err != nil {
-		h.writeOpsError(w, err, r.Header.Get("X-Correlation-ID"))
+		h.writeOpsError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
 	if res.Changed {

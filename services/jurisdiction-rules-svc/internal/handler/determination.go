@@ -52,7 +52,7 @@ func (h *Handler) ResolveJurisdictionDecision(w http.ResponseWriter, r *http.Req
 	}
 	tenantID := strings.TrimSpace(r.Header.Get("X-Tenant-Id"))
 	if tenantID == "" {
-		writeError(w, http.StatusUnauthorized, "missing_tenant", "X-Tenant-Id is required: entity jurisdiction assignments are tenant data")
+		writeError(w, r, http.StatusUnauthorized, "missing_tenant", "X-Tenant-Id is required: entity jurisdiction assignments are tenant data")
 		return
 	}
 	var req JurisdictionDecisionRequest
@@ -61,20 +61,20 @@ func (h *Handler) ResolveJurisdictionDecision(w http.ResponseWriter, r *http.Req
 	}
 	if field := firstBlank(requiredField{"legal_entity_id", req.LegalEntityID}, requiredField{"purpose", req.Purpose},
 		requiredField{"effective_at", req.EffectiveAt}); field != "" {
-		writeMissingField(w, field)
+		writeMissingField(w, r, field)
 		return
 	}
 	if len(req.LegalEntityID) > 128 || len(req.ClaimedJurisdiction) > 64 {
-		writeError(w, http.StatusBadRequest, "invalid_request", "legal_entity_id is at most 128 characters and claimed_jurisdiction at most 64")
+		writeError(w, r, http.StatusBadRequest, "invalid_request", "legal_entity_id is at most 128 characters and claimed_jurisdiction at most 64")
 		return
 	}
 	if !domain.ValidPurpose(req.Purpose) {
-		writeError(w, http.StatusBadRequest, "invalid_purpose", "purpose must be one of TAX, FILING, ANY")
+		writeError(w, r, http.StatusBadRequest, "invalid_purpose", "purpose must be one of TAX, FILING, ANY")
 		return
 	}
 	at, err := time.Parse(time.RFC3339Nano, req.EffectiveAt)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_effective_at", "effective_at must be an RFC3339 instant")
+		writeError(w, r, http.StatusBadRequest, "invalid_effective_at", "effective_at must be an RFC3339 instant")
 		return
 	}
 	at = at.UTC()
@@ -86,7 +86,7 @@ func (h *Handler) ResolveJurisdictionDecision(w http.ResponseWriter, r *http.Req
 
 	rows, err := h.entities.ListEntityJurisdictions(r.Context(), tenantID, req.LegalEntityID, at)
 	if err != nil {
-		h.writeStoreError(w, err, corr)
+		h.writeStoreError(w, r, err, corr)
 		return
 	}
 	var assignments []domain.Assignment
@@ -96,7 +96,7 @@ func (h *Handler) ResolveJurisdictionDecision(w http.ResponseWriter, r *http.Req
 			continue // a deactivated or unknown jurisdiction is not an authorised one
 		}
 		if err != nil {
-			h.writeStoreError(w, err, corr)
+			h.writeStoreError(w, r, err, corr)
 			return
 		}
 		assignments = append(assignments, domain.Assignment{JurisdictionID: a.JurisdictionID, JurisdictionCode: j.JurisdictionCode,
@@ -108,7 +108,7 @@ func (h *Handler) ResolveJurisdictionDecision(w http.ResponseWriter, r *http.Req
 	for i := range det.Candidates {
 		v, err := h.registry.JurisdictionSupport(r.Context(), det.Candidates[i].JurisdictionCode)
 		if err != nil {
-			h.writeRegistryError(w, err, corr)
+			h.writeRegistryError(w, r, err, corr)
 			return
 		}
 		det.Candidates[i].Support = v.Outcome
@@ -124,17 +124,17 @@ func (h *Handler) ResolveJurisdictionDecision(w http.ResponseWriter, r *http.Req
 	reqDigest, _ := domain.DigestOf(rawReq)
 	respJSON, err := json.Marshal(det)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "encode_failed", "could not encode the answer")
+		writeError(w, r, http.StatusInternalServerError, "encode_failed", "could not encode the answer")
 		return
 	}
 	stored, replayed, err := h.registry.RecordDecision(r.Context(), store.DecisionRecord{Kind: "JURISDICTION", RequestedBy: actor, CorrelationID: corr,
 		IdempotencyKey: idemKey, RequestDigest: reqDigest, RequestJSON: rawReq, EffectiveAt: at, Outcome: det.Outcome, ResponseJSON: respJSON})
 	if err != nil {
 		if errors.Is(err, domain.ErrIdempotencyConflict) {
-			writeError(w, http.StatusConflict, "idempotency_conflict", err.Error())
+			writeError(w, r, http.StatusConflict, "idempotency_conflict", err.Error())
 			return
 		}
-		h.writeRegistryError(w, err, corr)
+		h.writeRegistryError(w, r, err, corr)
 		return
 	}
 	if !replayed {
