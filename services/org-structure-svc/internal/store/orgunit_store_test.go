@@ -160,3 +160,55 @@ func TestOrgUnit_GetBeforeEffectiveDateHasNoPlacement(t *testing.T) {
 		t.Fatalf("on the effective date the parent applies: err=%v", err)
 	}
 }
+
+func TestOrgUnit_TransitionRulesAgainstDB(t *testing.T) {
+	s := store.New(openOrgUnitPool(t))
+	ctx := orgCtx("tenant-a")
+
+	parent, _, err := s.CreateOrgUnit(ctx, newUnit("entity-1", "ROOT"), "a")
+	if err != nil {
+		t.Fatalf("parent: %v", err)
+	}
+	kidReq := newUnit("entity-1", "KID")
+	kidReq.ParentUnitID = &parent.UnitID
+	kid, _, err := s.CreateOrgUnit(ctx, kidReq, "a")
+	if err != nil {
+		t.Fatalf("child: %v", err)
+	}
+
+	// A child cannot be activated under a draft parent.
+	if _, err := s.TransitionOrgUnit(ctx, kid.UnitID, domain.UnitCommandActivate, 1); !errors.Is(err, domain.ErrParentNotActive) {
+		t.Fatalf("want ErrParentNotActive, got %v", err)
+	}
+	// Stale version is refused and changes nothing.
+	if _, err := s.TransitionOrgUnit(ctx, parent.UnitID, domain.UnitCommandActivate, 7); !errors.Is(err, domain.ErrVersionConflict) {
+		t.Fatalf("want ErrVersionConflict, got %v", err)
+	}
+
+	p, err := s.TransitionOrgUnit(ctx, parent.UnitID, domain.UnitCommandActivate, 1)
+	if err != nil || p.Status != domain.UnitStatusActive || p.RecordVersion != 2 {
+		t.Fatalf("activate parent: %+v err=%v", p, err)
+	}
+	if _, err := s.TransitionOrgUnit(ctx, kid.UnitID, domain.UnitCommandActivate, 1); err != nil {
+		t.Fatalf("activate child: %v", err)
+	}
+
+	// Parent has a live child, so it cannot be deactivated.
+	if _, err := s.TransitionOrgUnit(ctx, parent.UnitID, domain.UnitCommandDeactivate, 2); !errors.Is(err, domain.ErrHasActiveChildren) {
+		t.Fatalf("want ErrHasActiveChildren, got %v", err)
+	}
+	if _, err := s.TransitionOrgUnit(ctx, kid.UnitID, domain.UnitCommandDeactivate, 2); err != nil {
+		t.Fatalf("deactivate child: %v", err)
+	}
+	if _, err := s.TransitionOrgUnit(ctx, parent.UnitID, domain.UnitCommandDeactivate, 2); err != nil {
+		t.Fatalf("deactivate parent once children are inactive: %v", err)
+	}
+
+	// An inactive unit frees its code and is never re-activated.
+	if _, err := s.TransitionOrgUnit(ctx, parent.UnitID, domain.UnitCommandActivate, 3); !errors.Is(err, domain.ErrInvalidTransition) {
+		t.Fatalf("want ErrInvalidTransition, got %v", err)
+	}
+	if _, _, err := s.CreateOrgUnit(ctx, newUnit("entity-1", "ROOT"), "a"); err != nil {
+		t.Fatalf("code of an inactive unit must be reusable: %v", err)
+	}
+}

@@ -14,3 +14,27 @@ func TestIsValidUnitType(t *testing.T) {
 		}
 	}
 }
+
+func TestOrgUnitTransition(t *testing.T) {
+	cases := []struct {
+		from, cmd, want string
+		ok              bool
+	}{
+		{UnitStatusDraft, UnitCommandActivate, UnitStatusActive, true},
+		{UnitStatusActive, UnitCommandDeactivate, UnitStatusInactive, true},
+		{UnitStatusDraft, UnitCommandDeactivate, "", false},
+		{UnitStatusActive, UnitCommandActivate, "", false},
+		{UnitStatusInactive, UnitCommandActivate, "", false},
+		{UnitStatusInactive, UnitCommandDeactivate, "", false},
+		{UnitStatusDraft, "RESURRECT", "", false},
+	}
+	for _, c := range cases {
+		got, err := OrgUnitTransition(c.from, c.cmd)
+		if c.ok && (err != nil || got != c.want) {
+			t.Errorf("%s+%s: want %s, got %q err=%v", c.from, c.cmd, c.want, got, err)
+		}
+		if !c.ok && err != ErrInvalidTransition {
+			t.Errorf("%s+%s: want ErrInvalidTransition, got %v", c.from, c.cmd, err)
+		}
+	}
+}

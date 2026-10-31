@@ -27,6 +27,11 @@ type Store interface {
 
 	AssignEmployee(ctx context.Context, req *domain.AssignEmployeeRequest) (*domain.OrgAssignment, error)
 	GetEmployeeAssignment(ctx context.Context, employeeID string) (*domain.OrgAssignment, error)
+
+	CreateOrgUnit(ctx context.Context, req *domain.CreateOrgUnitRequest, actorID string) (u *domain.OrgUnit, created bool, err error)
+	GetOrgUnit(ctx context.Context, unitID, asOf string) (*domain.OrgUnit, error)
+	ListOrgUnits(ctx context.Context, legalEntityID, asOf string) ([]domain.OrgUnit, error)
+	TransitionOrgUnit(ctx context.Context, unitID, command string, expectedVersion int64) (*domain.OrgUnit, error)
 }
 
 type Publisher interface {
@@ -82,6 +87,8 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 
 		r.Post("/assignments", h.AssignEmployee)
 		r.Get("/assignments/employee/{employee_id}", h.GetEmployeeAssignment)
+
+		registerOrgUnitRoutes(r, h)
 	})
 }
 

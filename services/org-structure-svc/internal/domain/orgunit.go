@@ -84,10 +84,38 @@ type CreateOrgUnitRequest struct {
 	CorrelationID     string  `json:"correlation_id"`
 }
 
+// OrgUnitTransition validates a lifecycle move and returns the resulting
+// status: Draft -> Active -> Inactive. A unit is never re-activated; a retired
+// unit is replaced by a new one, so its history stays unambiguous.
+func OrgUnitTransition(current, command string) (string, error) {
+	switch {
+	case current == UnitStatusDraft && command == UnitCommandActivate:
+		return UnitStatusActive, nil
+	case current == UnitStatusActive && command == UnitCommandDeactivate:
+		return UnitStatusInactive, nil
+	}
+	return "", ErrInvalidTransition
+}
+
+const (
+	UnitCommandActivate   = "ACTIVATE"
+	UnitCommandDeactivate = "DEACTIVATE"
+)
+
 var (
-	ErrOrgUnitNotFound = errorString("org unit not found")
+	ErrOrgUnitNotFound  = errorString("org unit not found")
 	ErrOrgUnitCodeTaken = errorString("org unit code already used in this legal entity and type")
 	// ErrParentInvalid: the parent is missing, in another legal entity, or
 	// not usable on the effective date.
 	ErrParentInvalid = errorString("parent org unit is missing or not in the same legal entity")
+	// ErrParentNotActive: a unit cannot be activated under a parent that is
+	// not itself active.
+	ErrParentNotActive = errorString("parent org unit is not active")
+	// ErrInvalidTransition: the command is not allowed from the unit's status.
+	ErrInvalidTransition = errorString("org unit status does not allow this command")
+	// ErrHasActiveChildren: a unit with live child units cannot be deactivated;
+	// reparent or deactivate the children first.
+	ErrHasActiveChildren = errorString("org unit has active child units")
+	// ErrVersionConflict: the caller's expected version is not the current one.
+	ErrVersionConflict = errorString("org unit version conflict")
 )

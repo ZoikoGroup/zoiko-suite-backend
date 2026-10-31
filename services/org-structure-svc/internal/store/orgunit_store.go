@@ -221,3 +221,91 @@ func (s *PgStore) ListOrgUnits(ctx context.Context, legalEntityID, asOf string) 
 	})
 	return out, err
 }
+
+// TransitionOrgUnit applies ACTIVATE or DEACTIVATE to a unit.
+//
+// The row is locked first, so two concurrent commands cannot both pass the
+// checks. expectedVersion must equal the unit's current record_version
+// (ErrVersionConflict otherwise). Activating needs the parent, if any, to be
+// ACTIVE today; deactivating needs every child placed under the unit today to
+// be INACTIVE. Success bumps record_version by one.
+func (s *PgStore) TransitionOrgUnit(ctx context.Context, unitID, command string, expectedVersion int64) (*domain.OrgUnit, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+
+	var out *domain.OrgUnit
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		var status string
+		var version int64
+		err := tx.QueryRow(ctx,
+			`SELECT status, record_version FROM org_units WHERE tenant_id = $1 AND unit_id = $2 FOR UPDATE`,
+			tenantID, unitID).Scan(&status, &version)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrOrgUnitNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if version != expectedVersion {
+			return domain.ErrVersionConflict
+		}
+
+		next, err := domain.OrgUnitTransition(status, command)
+		if err != nil {
+			return err
+		}
+
+		switch command {
+		case domain.UnitCommandActivate:
+			var parentStatus *string
+			if err := tx.QueryRow(ctx, `
+				SELECT p.status
+				FROM org_unit_hierarchy_versions hv
+				LEFT JOIN org_units p ON p.unit_id = hv.parent_unit_id
+				WHERE hv.unit_id = $1 AND hv.superseded_at IS NULL
+				  AND hv.valid_from <= CURRENT_DATE AND (hv.valid_to IS NULL OR hv.valid_to > CURRENT_DATE)`,
+				unitID).Scan(&parentStatus); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+				return err
+			}
+			if parentStatus != nil && *parentStatus != domain.UnitStatusActive {
+				return domain.ErrParentNotActive
+			}
+		case domain.UnitCommandDeactivate:
+			var live int
+			if err := tx.QueryRow(ctx, `
+				SELECT COUNT(*)
+				FROM org_unit_hierarchy_versions hv
+				JOIN org_units c ON c.unit_id = hv.unit_id
+				WHERE hv.parent_unit_id = $1 AND hv.superseded_at IS NULL
+				  AND hv.valid_from <= CURRENT_DATE AND (hv.valid_to IS NULL OR hv.valid_to > CURRENT_DATE)
+				  AND c.status <> 'INACTIVE'`, unitID).Scan(&live); err != nil {
+				return err
+			}
+			if live > 0 {
+				return domain.ErrHasActiveChildren
+			}
+		}
+
+		if _, err := tx.Exec(ctx, `
+			UPDATE org_units SET status = $1, record_version = record_version + 1, updated_at = $2
+			WHERE tenant_id = $3 AND unit_id = $4`, next, time.Now().UTC(), tenantID, unitID); err != nil {
+			return err
+		}
+
+		u, err := scanOrgUnit(tx.QueryRow(ctx, `
+			WITH d AS (SELECT CURRENT_DATE AS d) `+orgUnitSelect+`
+			WHERE u.tenant_id = $1 AND u.unit_id = $2`, tenantID, unitID))
+		out = u
+		return err
+	})
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == pgInvalidText {
+			return nil, domain.ErrOrgUnitNotFound
+		}
+		return nil, err
+	}
+	return out, nil
+}
