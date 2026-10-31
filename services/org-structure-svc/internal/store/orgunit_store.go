@@ -449,3 +449,124 @@ func sameParent(a, b *string) bool {
 	}
 	return *a == *b
 }
+
+// ChangeOrgUnitManager names a new manager from effectiveAt on by closing the
+// open manager reference and inserting a new one; the previous manager stays
+// in history. expectedVersion must be the unit's current record_version. The
+// manager must already have been resolved against employee-master-svc.
+func (s *PgStore) ChangeOrgUnitManager(ctx context.Context, unitID string, req *domain.ChangeManagerRequest, expectedVersion int64, actorID string) (*domain.OrgUnit, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+
+	var out *domain.OrgUnit
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		var status string
+		var version int64
+		err := tx.QueryRow(ctx, `
+			SELECT status, record_version FROM org_units
+			WHERE tenant_id = $1 AND unit_id = $2 FOR UPDATE`, tenantID, unitID).Scan(&status, &version)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrOrgUnitNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if version != expectedVersion {
+			return domain.ErrVersionConflict
+		}
+		if status == domain.UnitStatusInactive {
+			return domain.ErrInvalidTransition
+		}
+
+		var openRef, current string
+		var after bool
+		err = tx.QueryRow(ctx, `
+			SELECT ref_id, manager_employee_id::text, valid_from < $2::date
+			FROM org_unit_manager_refs WHERE unit_id = $1 AND valid_to IS NULL`,
+			unitID, req.EffectiveAt).Scan(&openRef, &current, &after)
+		hasOpen := err == nil
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+		if hasOpen {
+			if current == req.ManagerEmployeeID {
+				return domain.ErrNoManagerChange
+			}
+			if !after {
+				return domain.ErrEffectiveDateInvalid
+			}
+			if _, err := tx.Exec(ctx, `UPDATE org_unit_manager_refs SET valid_to = $1::date WHERE ref_id = $2`,
+				req.EffectiveAt, openRef); err != nil {
+				return err
+			}
+		}
+
+		now := time.Now().UTC()
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO org_unit_manager_refs (
+				ref_id, tenant_id, unit_id, manager_employee_id, valid_from, recorded_at, actor_id
+			) VALUES ($1, $2, $3, $4, $5::date, $6, $7)`,
+			uuid.NewString(), tenantID, unitID, req.ManagerEmployeeID, req.EffectiveAt, now, actorID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE org_units SET record_version = record_version + 1, updated_at = $1
+			WHERE tenant_id = $2 AND unit_id = $3`, now, tenantID, unitID); err != nil {
+			return err
+		}
+
+		u, err := scanOrgUnit(tx.QueryRow(ctx, `
+			WITH d AS (SELECT CURRENT_DATE AS d) `+orgUnitSelect+`
+			WHERE u.tenant_id = $1 AND u.unit_id = $2`, tenantID, unitID))
+		out = u
+		return err
+	})
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == pgInvalidText {
+			return nil, domain.ErrManagerNotFound
+		}
+		return nil, err
+	}
+	return out, nil
+}
+
+// FindUnitsByManager returns the units an employee manages as of the given
+// date (empty = today), across legal entities, ordered by entity then code.
+// Retired (INACTIVE) units are left out: they have nothing to manage.
+func (s *PgStore) FindUnitsByManager(ctx context.Context, managerEmployeeID, asOf string) ([]domain.OrgUnit, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+
+	out := []domain.OrgUnit{}
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			WITH d AS (SELECT COALESCE(NULLIF($2, '')::date, CURRENT_DATE) AS d) `+orgUnitSelect+`
+			WHERE u.tenant_id = $1 AND mg.manager_employee_id = $3::uuid AND u.status <> 'INACTIVE'
+			ORDER BY u.legal_entity_id ASC, u.code ASC`, tenantID, asOf, managerEmployeeID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			u, err := scanOrgUnit(rows)
+			if err != nil {
+				return err
+			}
+			out = append(out, *u)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == pgInvalidText {
+			return []domain.OrgUnit{}, nil // not a valid employee id, so it manages nothing
+		}
+		return nil, err
+	}
+	return out, nil
+}

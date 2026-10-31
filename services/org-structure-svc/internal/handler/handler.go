@@ -33,6 +33,8 @@ type Store interface {
 	ListOrgUnits(ctx context.Context, legalEntityID, asOf string) ([]domain.OrgUnit, error)
 	TransitionOrgUnit(ctx context.Context, unitID, command string, expectedVersion int64) (*domain.OrgUnit, error)
 	ReparentOrgUnit(ctx context.Context, unitID string, req *domain.ReparentOrgUnitRequest, expectedVersion int64, actorID string) (*domain.OrgUnit, error)
+	ChangeOrgUnitManager(ctx context.Context, unitID string, req *domain.ChangeManagerRequest, expectedVersion int64, actorID string) (*domain.OrgUnit, error)
+	FindUnitsByManager(ctx context.Context, managerEmployeeID, asOf string) ([]domain.OrgUnit, error)
 }
 
 type Publisher interface {

@@ -12,6 +12,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/org-structure-svc/internal/domain"
+	svcmiddleware "zoiko.io/org-structure-svc/internal/middleware"
 )
 
 // ORG-05 org-unit commands and queries (ZS-SVC-I-001 section 4.5).
@@ -22,6 +23,7 @@ const (
 	actionOrgUnitActivate   = "ORG_UNIT_ACTIVATE"
 	actionOrgUnitDeactivate = "ORG_UNIT_DEACTIVATE"
 	actionOrgUnitReparent   = "ORG_UNIT_REPARENT"
+	actionOrgUnitChangeMgr  = "ORG_UNIT_CHANGE_MANAGER"
 )
 
 func registerOrgUnitRoutes(r chi.Router, h *Handler) {
@@ -31,6 +33,7 @@ func registerOrgUnitRoutes(r chi.Router, h *Handler) {
 	r.Post("/units/{id}/activate", h.ActivateOrgUnit)
 	r.Post("/units/{id}/deactivate", h.DeactivateOrgUnit)
 	r.Post("/units/{id}/reparent", h.ReparentOrgUnit)
+	r.Post("/units/{id}/change-manager", h.ChangeOrgUnitManager)
 }
 
 func validDate(s string) bool {
@@ -68,6 +71,11 @@ func (h *Handler) CreateOrgUnit(w http.ResponseWriter, r *http.Request) {
 	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionOrgUnitCreate); err != nil {
 		h.writeAuthzErr(w, err)
 		return
+	}
+	if req.ManagerEmployeeID != nil {
+		if !h.resolveManager(w, r, principalID, *req.ManagerEmployeeID) {
+			return
+		}
 	}
 
 	unit, created, err := h.store.CreateOrgUnit(r.Context(), &req, principalID)
@@ -114,12 +122,16 @@ func (h *Handler) ListOrgUnits(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if legalEntityID == "" {
-		writeError(w, http.StatusBadRequest, "missing_fields", "legal_entity_id is required")
-		return
-	}
 	if asOf != "" && !validDate(asOf) {
 		writeError(w, http.StatusBadRequest, "invalid_as_of", "as_of must be a date, YYYY-MM-DD")
+		return
+	}
+	if managerID := r.URL.Query().Get("manager_employee_id"); managerID != "" {
+		h.findUnitsByManager(w, r, principalID, managerID, legalEntityID, asOf)
+		return
+	}
+	if legalEntityID == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "legal_entity_id is required")
 		return
 	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionOrgUnitView); err != nil {
@@ -208,6 +220,12 @@ func (h *Handler) writeOrgUnitErr(w http.ResponseWriter, err error, op string) {
 		writeError(w, http.StatusConflict, "has_active_children", err.Error())
 	case errors.Is(err, domain.ErrHierarchyLoop):
 		writeError(w, http.StatusUnprocessableEntity, "hierarchy_loop", err.Error())
+	case errors.Is(err, domain.ErrManagerNotFound):
+		writeError(w, http.StatusBadRequest, "manager_invalid", err.Error())
+	case errors.Is(err, domain.ErrNoManagerChange):
+		writeError(w, http.StatusConflict, "no_change", err.Error())
+	case errors.Is(err, domain.ErrEmployeeValidationFailed):
+		writeError(w, http.StatusServiceUnavailable, "employee_validation_failed", err.Error())
 	case errors.Is(err, domain.ErrNoHierarchyChange):
 		writeError(w, http.StatusConflict, "no_change", err.Error())
 	case errors.Is(err, domain.ErrEffectiveDateInvalid):
@@ -267,4 +285,128 @@ func (h *Handler) ReparentOrgUnit(w http.ResponseWriter, r *http.Request) {
 
 	h.publisher.PublishOrgStructureChanged(r.Context(), getCorrelationID(r), unit.TenantID, unit.LegalEntityID, principalID, "ORG_UNIT_REPARENTED", unit.UnitID)
 	writeJSON(w, http.StatusOK, unit)
+}
+
+// resolveManager confirms the manager is a real, current employee. The manager
+// identity is resolved server-side and fails closed: if employee-master-svc
+// cannot be reached, nothing is written.
+func (h *Handler) resolveManager(w http.ResponseWriter, r *http.Request, principalID, managerID string) bool {
+	if strings.TrimSpace(managerID) == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "manager_employee_id is required")
+		return false
+	}
+	if h.employee == nil {
+		writeError(w, http.StatusServiceUnavailable, "employee_validation_failed", domain.ErrEmployeeValidationFailed.Error())
+		return false
+	}
+	_, err := h.employee.ValidateEmployee(r.Context(), svcmiddleware.TenantFromContext(r.Context()), principalID, managerID)
+	if err == nil {
+		return true
+	}
+	if errors.Is(err, domain.ErrEmployeeNotFound) {
+		writeError(w, http.StatusBadRequest, "manager_invalid", string(domain.ErrManagerNotFound))
+		return false
+	}
+	h.log.Error("manager validation failed", zap.Error(err))
+	writeError(w, http.StatusServiceUnavailable, "employee_validation_failed", domain.ErrEmployeeValidationFailed.Error())
+	return false
+}
+
+// ChangeOrgUnitManager names a new manager from effective_at on; the previous
+// manager stays in history.
+func (h *Handler) ChangeOrgUnitManager(w http.ResponseWriter, r *http.Request) {
+	var req domain.ChangeManagerRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+		return
+	}
+	if strings.TrimSpace(req.ManagerEmployeeID) == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "manager_employee_id is required")
+		return
+	}
+	if !validDate(req.EffectiveAt) {
+		writeError(w, http.StatusBadRequest, "invalid_effective_at", "effective_at must be a date, YYYY-MM-DD")
+		return
+	}
+	if strings.TrimSpace(req.Reason) == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "reason is required: a structural change keeps its reason as evidence")
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	version, ok := parseIfMatch(w, r)
+	if !ok {
+		return
+	}
+
+	unitID := chi.URLParam(r, "id")
+	current, err := h.store.GetOrgUnit(r.Context(), unitID, "")
+	if err != nil {
+		h.writeOrgUnitErr(w, err, "change manager")
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, current.LegalEntityID, actionOrgUnitChangeMgr); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	// Only after authorization, so a caller without rights learns nothing
+	// about which employee ids exist.
+	if !h.resolveManager(w, r, principalID, req.ManagerEmployeeID) {
+		return
+	}
+
+	unit, err := h.store.ChangeOrgUnitManager(r.Context(), unitID, &req, version, principalID)
+	if err != nil {
+		h.writeOrgUnitErr(w, err, "change manager")
+		return
+	}
+
+	h.publisher.PublishOrgStructureChanged(r.Context(), getCorrelationID(r), unit.TenantID, unit.LegalEntityID, principalID, "ORG_UNIT_MANAGER_CHANGED", unit.UnitID)
+	writeJSON(w, http.StatusOK, unit)
+}
+
+// findUnitsByManager lists the units an employee manages. Units can sit in
+// several legal entities, so view access is checked per entity: entities the
+// caller may not view are left out, and a caller who may view none of them
+// gets 403 rather than an empty list that would hide the refusal.
+func (h *Handler) findUnitsByManager(w http.ResponseWriter, r *http.Request, principalID, managerID, legalEntityID, asOf string) {
+	units, err := h.store.FindUnitsByManager(r.Context(), managerID, asOf)
+	if err != nil {
+		h.writeOrgUnitErr(w, err, "find by manager")
+		return
+	}
+
+	allowed := map[string]bool{}
+	out := []domain.OrgUnit{}
+	denied := false
+	for _, u := range units {
+		if legalEntityID != "" && u.LegalEntityID != legalEntityID {
+			continue
+		}
+		ok, seen := allowed[u.LegalEntityID]
+		if !seen {
+			err := h.authz.CheckAllowed(r.Context(), principalID, u.LegalEntityID, actionOrgUnitView)
+			switch {
+			case err == nil:
+				ok = true
+			case errors.Is(err, domain.ErrAuthorizationDenied):
+				denied = true
+			default:
+				h.writeAuthzErr(w, err)
+				return
+			}
+			allowed[u.LegalEntityID] = ok
+		}
+		if ok {
+			out = append(out, u)
+		}
+	}
+	if len(out) == 0 && denied {
+		writeError(w, http.StatusForbidden, "forbidden", string(domain.ErrAuthorizationDenied))
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
 }
