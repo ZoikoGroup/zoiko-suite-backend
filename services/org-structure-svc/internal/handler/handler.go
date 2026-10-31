@@ -35,6 +35,7 @@ type Store interface {
 	ReparentOrgUnit(ctx context.Context, unitID string, req *domain.ReparentOrgUnitRequest, expectedVersion int64, actorID string) (*domain.OrgUnit, error)
 	ChangeOrgUnitManager(ctx context.Context, unitID string, req *domain.ChangeManagerRequest, expectedVersion int64, actorID string) (*domain.OrgUnit, error)
 	FindUnitsByManager(ctx context.Context, managerEmployeeID, asOf string) ([]domain.OrgUnit, error)
+	HierarchySnapshot(ctx context.Context, legalEntityID, asOf, recordedAsOf string, includeInactive bool) ([]domain.OrgUnit, error)
 }
 
 type Publisher interface {

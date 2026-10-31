@@ -30,6 +30,7 @@ type stubStore struct {
 	units             map[string]*domain.OrgUnit
 	placeFrom         map[string]string
 	managerFrom       map[string]string
+	lastSnap          snapshotCall
 }
 
 func newStubStore() *stubStore {

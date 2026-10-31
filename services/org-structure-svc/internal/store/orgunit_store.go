@@ -410,8 +410,10 @@ func (s *PgStore) ReparentOrgUnit(ctx context.Context, unitID string, req *domai
 		}
 
 		now := time.Now().UTC()
-		if _, err := tx.Exec(ctx, `UPDATE org_unit_hierarchy_versions SET valid_to = $1::date WHERE version_id = $2`,
-			req.EffectiveAt, openVersion); err != nil {
+		// closed_at records when the placement was closed, so a read "as known
+		// at" an earlier time still sees it open-ended.
+		if _, err := tx.Exec(ctx, `UPDATE org_unit_hierarchy_versions SET valid_to = $1::date, closed_at = $3 WHERE version_id = $2`,
+			req.EffectiveAt, openVersion, now); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(ctx, `
@@ -490,6 +492,7 @@ func (s *PgStore) ChangeOrgUnitManager(ctx context.Context, unitID string, req *
 		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 			return err
 		}
+		now := time.Now().UTC()
 		if hasOpen {
 			if current == req.ManagerEmployeeID {
 				return domain.ErrNoManagerChange
@@ -497,13 +500,12 @@ func (s *PgStore) ChangeOrgUnitManager(ctx context.Context, unitID string, req *
 			if !after {
 				return domain.ErrEffectiveDateInvalid
 			}
-			if _, err := tx.Exec(ctx, `UPDATE org_unit_manager_refs SET valid_to = $1::date WHERE ref_id = $2`,
-				req.EffectiveAt, openRef); err != nil {
+			if _, err := tx.Exec(ctx, `UPDATE org_unit_manager_refs SET valid_to = $1::date, closed_at = $3 WHERE ref_id = $2`,
+				req.EffectiveAt, openRef, now); err != nil {
 				return err
 			}
 		}
 
-		now := time.Now().UTC()
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO org_unit_manager_refs (
 				ref_id, tenant_id, unit_id, manager_employee_id, valid_from, recorded_at, actor_id
@@ -569,4 +571,71 @@ func (s *PgStore) FindUnitsByManager(ctx context.Context, managerEmployeeID, asO
 		return nil, err
 	}
 	return out, nil
+}
+
+// HierarchySnapshot returns every unit of a legal entity that had a place in
+// the hierarchy on asOf (YYYY-MM-DD, empty = today), as it was KNOWN at
+// recordedAsOf (RFC 3339, empty = now), each with its parent, manager and
+// cost/profit-center mapping.
+//
+// Two time axes: asOf is when the structure applied; recordedAsOf is how much of
+// it had been written down. A placement or manager reference that was closed
+// after recordedAsOf still reads as open-ended, and a unit created after it is
+// absent, so a past report can be reproduced exactly as it was produced.
+//
+// Retired (INACTIVE) units are returned only when includeInactive is set; their
+// status is the current one, because status changes are not themselves dated.
+func (s *PgStore) HierarchySnapshot(ctx context.Context, legalEntityID, asOf, recordedAsOf string, includeInactive bool) ([]domain.OrgUnit, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+
+	out := []domain.OrgUnit{}
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			WITH p AS (
+				SELECT COALESCE(NULLIF($2, '')::date, CURRENT_DATE) AS d,
+				       COALESCE(NULLIF($3, '')::timestamptz, now())  AS r
+			)
+			SELECT u.unit_id, u.tenant_id, u.legal_entity_id, u.code, u.name, u.unit_type,
+			       u.status, u.location_ref, u.record_version, u.correlation_id,
+			       u.created_by, u.created_at, u.updated_at,
+			       hv.parent_unit_id, mg.manager_employee_id,
+			       COALESCE(mp.cost_center_code, ''), COALESCE(mp.profit_center_code, '')
+			FROM p CROSS JOIN org_units u
+			JOIN org_unit_hierarchy_versions hv
+			  ON hv.unit_id = u.unit_id
+			 AND hv.recorded_at <= p.r
+			 AND (hv.superseded_at IS NULL OR hv.superseded_at > p.r)
+			 AND hv.valid_from <= p.d
+			 AND (hv.valid_to IS NULL OR hv.closed_at > p.r OR hv.valid_to > p.d)
+			LEFT JOIN org_unit_manager_refs mg
+			  ON mg.unit_id = u.unit_id
+			 AND mg.recorded_at <= p.r
+			 AND mg.valid_from <= p.d
+			 AND (mg.valid_to IS NULL OR mg.closed_at > p.r OR mg.valid_to > p.d)
+			LEFT JOIN org_unit_dimension_mappings mp
+			  ON mp.unit_id = u.unit_id
+			 AND mp.recorded_at <= p.r
+			 AND mp.valid_from <= p.d AND (mp.valid_to IS NULL OR mp.valid_to > p.d)
+			WHERE u.tenant_id = $1 AND u.legal_entity_id = $4
+			  AND u.created_at <= p.r
+			  AND ($5 OR u.status <> 'INACTIVE')
+			ORDER BY u.code ASC, u.unit_id ASC`,
+			tenantID, asOf, recordedAsOf, legalEntityID, includeInactive)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			u, err := scanOrgUnit(rows)
+			if err != nil {
+				return err
+			}
+			out = append(out, *u)
+		}
+		return rows.Err()
+	})
+	return out, err
 }

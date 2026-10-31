@@ -17,7 +17,7 @@ import (
 )
 
 // openOrgUnitPool reuses openTestPool (migrations 1 and 2) and then applies
-// the ORG-05 migration from a clean slate.
+// the ORG-05 migrations from a clean slate.
 func openOrgUnitPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	pool := openTestPool(t)
@@ -25,12 +25,14 @@ func openOrgUnitPool(t *testing.T) *pgxpool.Pool {
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS org_unit_dimension_mappings, org_unit_manager_refs, org_unit_hierarchy_versions, org_units CASCADE;`)
 
 	_, filename, _, _ := runtime.Caller(0)
-	sql, err := os.ReadFile(filepath.Join(filepath.Dir(filename), "../../deployments/migrations/000003_org_units.up.sql"))
-	if err != nil {
-		t.Fatalf("read migration: %v", err)
-	}
-	if _, err := pool.Exec(ctx, string(sql)); err != nil {
-		t.Fatalf("apply migration: %v", err)
+	for _, m := range []string{"000003_org_units.up.sql", "000004_org_unit_closed_at.up.sql"} {
+		sql, err := os.ReadFile(filepath.Join(filepath.Dir(filename), "../../deployments/migrations", m))
+		if err != nil {
+			t.Fatalf("read migration %s: %v", m, err)
+		}
+		if _, err := pool.Exec(ctx, string(sql)); err != nil {
+			t.Fatalf("apply migration %s: %v", m, err)
+		}
 	}
 	return pool
 }

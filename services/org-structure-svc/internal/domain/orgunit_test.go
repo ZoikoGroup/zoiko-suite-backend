@@ -76,3 +76,58 @@ func TestReachesUnit(t *testing.T) {
 		t.Error("an unrelated target must not be reached in a cycle")
 	}
 }
+
+func unitNode(id, code string, parent *string) OrgUnit {
+	return OrgUnit{UnitID: id, Code: code, ParentUnitID: parent}
+}
+
+func TestBuildOrgUnitTree(t *testing.T) {
+	root, mid := "root", "mid"
+	units := []OrgUnit{
+		unitNode("leaf-b", "B", &mid),
+		unitNode("mid", "M", &root),
+		unitNode("leaf-a", "A", &mid),
+		unitNode("root", "R", nil),
+		unitNode("other", "O", nil),
+	}
+	forest, err := BuildOrgUnitTree(units)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if len(forest) != 2 || forest[0].Code != "O" || forest[1].Code != "R" {
+		t.Fatalf("roots must be ordered by code, got %d: %v", len(forest), forest)
+	}
+	r := forest[1]
+	if len(r.Children) != 1 || r.Children[0].Code != "M" {
+		t.Fatalf("root has one child M, got %+v", r.Children)
+	}
+	m := r.Children[0]
+	if len(m.Children) != 2 || m.Children[0].Code != "A" || m.Children[1].Code != "B" {
+		t.Fatalf("siblings must be ordered by code, got %+v", m.Children)
+	}
+	if forest[0].Children == nil || m.Children[0].Children == nil {
+		t.Fatal("leaves must carry an empty children list, not null")
+	}
+}
+
+// A unit whose parent is not in the snapshot (for example a retired parent
+// that was left out) is returned as a root instead of vanishing.
+func TestBuildOrgUnitTree_MissingParentBecomesRoot(t *testing.T) {
+	gone := "retired"
+	forest, err := BuildOrgUnitTree([]OrgUnit{unitNode("kid", "K", &gone)})
+	if err != nil || len(forest) != 1 || forest[0].UnitID != "kid" {
+		t.Fatalf("want kid as a root, got %v err=%v", forest, err)
+	}
+}
+
+func TestBuildOrgUnitTree_EmptyAndCycle(t *testing.T) {
+	forest, err := BuildOrgUnitTree(nil)
+	if err != nil || forest == nil || len(forest) != 0 {
+		t.Fatalf("empty input must give an empty, non-nil forest, got %v err=%v", forest, err)
+	}
+
+	a, b := "a", "b"
+	if _, err := BuildOrgUnitTree([]OrgUnit{unitNode("a", "A", &b), unitNode("b", "B", &a)}); err != ErrHierarchyLoop {
+		t.Fatalf("a cycle must be reported, got %v", err)
+	}
+}

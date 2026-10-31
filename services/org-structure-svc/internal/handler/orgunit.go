@@ -34,6 +34,7 @@ func registerOrgUnitRoutes(r chi.Router, h *Handler) {
 	r.Post("/units/{id}/deactivate", h.DeactivateOrgUnit)
 	r.Post("/units/{id}/reparent", h.ReparentOrgUnit)
 	r.Post("/units/{id}/change-manager", h.ChangeOrgUnitManager)
+	r.Get("/hierarchy", h.GetHierarchy)
 }
 
 func validDate(s string) bool {
