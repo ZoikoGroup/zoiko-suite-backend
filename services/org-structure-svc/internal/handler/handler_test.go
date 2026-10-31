@@ -32,6 +32,8 @@ type stubStore struct {
 	managerFrom       map[string]string
 	lastSnap          snapshotCall
 	changes           map[string]*domain.ChangeRequest
+	seenActor         string
+	seenCorrelation   string
 }
 
 func newStubStore() *stubStore {

@@ -102,8 +102,8 @@ func TestReparent_MovesUnitAndBumpsVersion(t *testing.T) {
 	if u.ParentUnitID == nil || *u.ParentUnitID != root || u.RecordVersion != 2 {
 		t.Fatalf("leaf should now be under root at v2, got parent=%v v%d", u.ParentUnitID, u.RecordVersion)
 	}
-	if pub.orgChanged != before+1 {
-		t.Fatalf("reparent must publish once, got %d", pub.orgChanged-before)
+	if pub.orgChanged != before {
+		t.Fatalf("the store's outbox is the only event path; the handler published %d", pub.orgChanged-before)
 	}
 }
 

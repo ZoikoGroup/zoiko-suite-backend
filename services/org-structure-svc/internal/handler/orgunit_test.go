@@ -10,11 +10,13 @@ import (
 	"testing"
 
 	"zoiko.io/org-structure-svc/internal/domain"
+	"zoiko.io/org-structure-svc/internal/middleware"
 )
 
 // ── stub org-unit store: same rules as PgStore, in memory ──────────────────────
 
-func (s *stubStore) CreateOrgUnit(_ context.Context, req *domain.CreateOrgUnitRequest, actorID string) (*domain.OrgUnit, bool, error) {
+func (s *stubStore) CreateOrgUnit(ctx context.Context, req *domain.CreateOrgUnitRequest, actorID string) (*domain.OrgUnit, bool, error) {
+	s.seenActor, s.seenCorrelation = middleware.ActorFromContext(ctx), middleware.CorrelationFromContext(ctx)
 	for _, u := range s.units {
 		if u.CorrelationID == req.CorrelationID {
 			return u, false, nil
@@ -148,8 +150,8 @@ func TestOrgUnit_CreateIsDraftAndIdempotent(t *testing.T) {
 	if again.Code != http.StatusOK || decodeUnit(t, again).UnitID != u.UnitID {
 		t.Fatalf("replay: want 200 with the original unit, got %d", again.Code)
 	}
-	if pub.orgChanged != 1 {
-		t.Fatalf("replay must not publish again: %d events", pub.orgChanged)
+	if pub.orgChanged != 0 {
+		t.Fatalf("the store's outbox is the only event path; the handler published %d", pub.orgChanged)
 	}
 }
 

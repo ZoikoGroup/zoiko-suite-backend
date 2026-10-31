@@ -249,8 +249,10 @@ func TestMakerChecker_MappedMoveWaitsForApproval(t *testing.T) {
 	if *f.s.units[f.fin].ParentUnitID != f.root || f.s.units[f.fin].RecordVersion != 1 {
 		t.Fatal("nothing may move before approval")
 	}
-	if len(f.pub.events) == 0 || f.pub.events[len(f.pub.events)-1] != "ORG_UNIT_REPARENT_REQUESTED" {
-		t.Fatalf("the proposal must be announced, got %v", f.pub.events)
+	// Org-unit events are written by the store, in the change's transaction
+	// (see the outbox tests); the handler must not also publish them.
+	if len(f.pub.events) != 0 {
+		t.Fatalf("the handler must not publish org-unit events directly, got %v", f.pub.events)
 	}
 }
 
@@ -342,9 +344,8 @@ func TestMakerChecker_IndependentApprovalAppliesTheMove(t *testing.T) {
 	if *out.Unit.ParentUnitID != f.alt || out.Unit.RecordVersion != 2 {
 		t.Fatalf("the move must now be applied: %+v", out.Unit)
 	}
-	ev := strings.Join(f.pub.events, ",")
-	if !strings.Contains(ev, "ORG_UNIT_REPARENT_APPROVED") || !strings.Contains(ev, "ORG_UNIT_REPARENTED") {
-		t.Fatalf("approval and the move must both be announced, got %s", ev)
+	if len(f.pub.events) != 0 {
+		t.Fatalf("the handler must not publish org-unit events directly, got %v", f.pub.events)
 	}
 
 	if rr := call(f.r, "POST", "/v1/org/change-requests/"+id+"/approve", "checker2", "", nil); rr.Code != 409 || errCode(rr) != "change_request_decided" {

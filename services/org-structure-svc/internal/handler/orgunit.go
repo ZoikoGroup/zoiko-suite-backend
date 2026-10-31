@@ -28,19 +28,22 @@ const (
 )
 
 func registerOrgUnitRoutes(r chi.Router, h *Handler) {
-	r.Post("/units", h.CreateOrgUnit)
-	r.Get("/units", h.ListOrgUnits)
-	r.Get("/units/{id}", h.GetOrgUnit)
-	r.Post("/units/{id}/activate", h.ActivateOrgUnit)
-	r.Post("/units/{id}/deactivate", h.DeactivateOrgUnit)
-	r.Post("/units/{id}/reparent", h.ReparentOrgUnit)
-	r.Post("/units/{id}/change-manager", h.ChangeOrgUnitManager)
-	r.Get("/hierarchy", h.GetHierarchy)
-	r.Get("/units/{id}/reparent-impact", h.GetReparentImpact)
-	r.Get("/change-requests", h.ListChangeRequests)
-	r.Get("/change-requests/{id}", h.GetChangeRequest)
-	r.Post("/change-requests/{id}/approve", h.ApproveChangeRequest)
-	r.Post("/change-requests/{id}/reject", h.RejectChangeRequest)
+	// The audit context carries actor and correlation id to the store, which writes
+	// each event in the same transaction as its change (see internal/outbox).
+	g := r.With(svcmiddleware.AuditContext)
+	g.Post("/units", h.CreateOrgUnit)
+	g.Get("/units", h.ListOrgUnits)
+	g.Get("/units/{id}", h.GetOrgUnit)
+	g.Post("/units/{id}/activate", h.ActivateOrgUnit)
+	g.Post("/units/{id}/deactivate", h.DeactivateOrgUnit)
+	g.Post("/units/{id}/reparent", h.ReparentOrgUnit)
+	g.Post("/units/{id}/change-manager", h.ChangeOrgUnitManager)
+	g.Get("/hierarchy", h.GetHierarchy)
+	g.Get("/units/{id}/reparent-impact", h.GetReparentImpact)
+	g.Get("/change-requests", h.ListChangeRequests)
+	g.Get("/change-requests/{id}", h.GetChangeRequest)
+	g.Post("/change-requests/{id}/approve", h.ApproveChangeRequest)
+	g.Post("/change-requests/{id}/reject", h.RejectChangeRequest)
 }
 
 func validDate(s string) bool {
@@ -95,7 +98,6 @@ func (h *Handler) CreateOrgUnit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.publisher.PublishOrgStructureChanged(r.Context(), getCorrelationID(r), unit.TenantID, unit.LegalEntityID, principalID, "ORG_UNIT_CREATED", unit.UnitID)
 	writeJSON(w, http.StatusCreated, unit)
 }
 
@@ -155,16 +157,16 @@ func (h *Handler) ListOrgUnits(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ActivateOrgUnit(w http.ResponseWriter, r *http.Request) {
-	h.transitionOrgUnit(w, r, domain.UnitCommandActivate, actionOrgUnitActivate, "ORG_UNIT_ACTIVATED")
+	h.transitionOrgUnit(w, r, domain.UnitCommandActivate, actionOrgUnitActivate)
 }
 
 func (h *Handler) DeactivateOrgUnit(w http.ResponseWriter, r *http.Request) {
-	h.transitionOrgUnit(w, r, domain.UnitCommandDeactivate, actionOrgUnitDeactivate, "ORG_UNIT_DEACTIVATED")
+	h.transitionOrgUnit(w, r, domain.UnitCommandDeactivate, actionOrgUnitDeactivate)
 }
 
 // transitionOrgUnit runs a lifecycle command. If-Match carries the version the
 // caller read; a mutation of an existing unit without it is refused (428).
-func (h *Handler) transitionOrgUnit(w http.ResponseWriter, r *http.Request, command, action, eventType string) {
+func (h *Handler) transitionOrgUnit(w http.ResponseWriter, r *http.Request, command, action string) {
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
@@ -191,7 +193,6 @@ func (h *Handler) transitionOrgUnit(w http.ResponseWriter, r *http.Request, comm
 		return
 	}
 
-	h.publisher.PublishOrgStructureChanged(r.Context(), getCorrelationID(r), unit.TenantID, unit.LegalEntityID, principalID, eventType, unit.UnitID)
 	writeJSON(w, http.StatusOK, unit)
 }
 
@@ -310,7 +311,6 @@ func (h *Handler) ReparentOrgUnit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.publisher.PublishOrgStructureChanged(r.Context(), getCorrelationID(r), unit.TenantID, unit.LegalEntityID, principalID, "ORG_UNIT_REPARENTED", unit.UnitID)
 	writeJSON(w, http.StatusOK, unit)
 }
 
@@ -391,7 +391,6 @@ func (h *Handler) ChangeOrgUnitManager(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.publisher.PublishOrgStructureChanged(r.Context(), getCorrelationID(r), unit.TenantID, unit.LegalEntityID, principalID, "ORG_UNIT_MANAGER_CHANGED", unit.UnitID)
 	writeJSON(w, http.StatusOK, unit)
 }
 

@@ -193,7 +193,7 @@ func TestSnapshot_ScopeAndMapping(t *testing.T) {
 func TestMigration000004_BackfillsClosedAt(t *testing.T) {
 	pool := openTestPool(t)
 	ctx := context.Background()
-	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS org_unit_change_requests, org_unit_dimension_mappings, org_unit_manager_refs, org_unit_hierarchy_versions, org_units CASCADE;`)
+	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS event_outbox, org_unit_change_requests, org_unit_dimension_mappings, org_unit_manager_refs, org_unit_hierarchy_versions, org_units CASCADE;`)
 
 	_, filename, _, _ := runtime.Caller(0)
 	dir := filepath.Join(filepath.Dir(filename), "../../deployments/migrations")

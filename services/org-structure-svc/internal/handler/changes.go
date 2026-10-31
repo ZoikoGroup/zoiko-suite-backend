@@ -38,7 +38,6 @@ func (h *Handler) proposeReparent(w http.ResponseWriter, r *http.Request, unitID
 	status := http.StatusOK
 	if created {
 		status = http.StatusAccepted
-		h.publisher.PublishOrgStructureChanged(r.Context(), getCorrelationID(r), cr.TenantID, cr.LegalEntityID, principalID, "ORG_UNIT_REPARENT_REQUESTED", cr.RequestID)
 	}
 	writeJSON(w, status, ProposedChange{Status: "PENDING_APPROVAL", ChangeRequest: cr, Impact: impact})
 }
@@ -147,9 +146,6 @@ func (h *Handler) ApproveChangeRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cid := getCorrelationID(r)
-	h.publisher.PublishOrgStructureChanged(r.Context(), cid, decided.TenantID, decided.LegalEntityID, principalID, "ORG_UNIT_REPARENT_APPROVED", decided.RequestID)
-	h.publisher.PublishOrgStructureChanged(r.Context(), cid, unit.TenantID, unit.LegalEntityID, decided.RequestedBy, "ORG_UNIT_REPARENTED", unit.UnitID)
 	writeJSON(w, http.StatusOK, DecidedChange{ChangeRequest: decided, Unit: unit})
 }
 
@@ -184,6 +180,5 @@ func (h *Handler) RejectChangeRequest(w http.ResponseWriter, r *http.Request) {
 		h.writeOrgUnitErr(w, err, "reject")
 		return
 	}
-	h.publisher.PublishOrgStructureChanged(r.Context(), getCorrelationID(r), rejected.TenantID, rejected.LegalEntityID, principalID, "ORG_UNIT_REPARENT_REJECTED", rejected.RequestID)
 	writeJSON(w, http.StatusOK, rejected)
 }

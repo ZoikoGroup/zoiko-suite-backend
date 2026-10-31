@@ -22,10 +22,10 @@ func openOrgUnitPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	pool := openTestPool(t)
 	ctx := context.Background()
-	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS org_unit_change_requests, org_unit_dimension_mappings, org_unit_manager_refs, org_unit_hierarchy_versions, org_units CASCADE;`)
+	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS event_outbox, org_unit_change_requests, org_unit_dimension_mappings, org_unit_manager_refs, org_unit_hierarchy_versions, org_units CASCADE;`)
 
 	_, filename, _, _ := runtime.Caller(0)
-	for _, m := range []string{"000003_org_units.up.sql", "000004_org_unit_closed_at.up.sql", "000005_org_unit_change_requests.up.sql"} {
+	for _, m := range []string{"000003_org_units.up.sql", "000004_org_unit_closed_at.up.sql", "000005_org_unit_change_requests.up.sql", "000006_event_outbox.up.sql"} {
 		sql, err := os.ReadFile(filepath.Join(filepath.Dir(filename), "../../deployments/migrations", m))
 		if err != nil {
 			t.Fatalf("read migration %s: %v", m, err)

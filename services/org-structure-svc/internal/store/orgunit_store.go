@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"zoiko.io/org-structure-svc/internal/domain"
+	"zoiko.io/org-structure-svc/internal/events"
 	svcmiddleware "zoiko.io/org-structure-svc/internal/middleware"
 )
 
@@ -137,6 +138,20 @@ func (s *PgStore) CreateOrgUnit(ctx context.Context, req *domain.CreateOrgUnitRe
 			}
 		}
 
+		if err := emit(ctx, tx, tenantID, events.OrgEvent{
+			Name: events.EventOrgUnitCreated, LegalEntityID: req.LegalEntityID, UnitID: unitID,
+			ObjectType: events.ObjectOrgUnit, ObjectID: unitID, ObjectVersion: 1,
+			EffectiveAt: req.EffectiveFrom, RecordedAt: now, Actor: actorID, CorrelationID: tracingID(ctx, req.CorrelationID),
+			Details: map[string]any{
+				"code": req.Code, "name": req.Name, "unit_type": req.UnitType, "status": domain.UnitStatusDraft,
+				"parent_unit_id": req.ParentUnitID, "manager_employee_id": req.ManagerEmployeeID,
+				"cost_center_code": req.CostCenterCode, "profit_center_code": req.ProfitCenterCode,
+				"location_ref": req.LocationRef, "reason": req.Reason,
+			},
+		}); err != nil {
+			return err
+		}
+
 		u = &domain.OrgUnit{
 			UnitID: unitID, TenantID: tenantID, LegalEntityID: req.LegalEntityID,
 			Code: req.Code, Name: req.Name, UnitType: req.UnitType,
@@ -237,11 +252,11 @@ func (s *PgStore) TransitionOrgUnit(ctx context.Context, unitID, command string,
 
 	var out *domain.OrgUnit
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		var status string
+		var status, entityID string
 		var version int64
 		err := tx.QueryRow(ctx,
-			`SELECT status, record_version FROM org_units WHERE tenant_id = $1 AND unit_id = $2 FOR UPDATE`,
-			tenantID, unitID).Scan(&status, &version)
+			`SELECT status, record_version, legal_entity_id FROM org_units WHERE tenant_id = $1 AND unit_id = $2 FOR UPDATE`,
+			tenantID, unitID).Scan(&status, &version, &entityID)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.ErrOrgUnitNotFound
 		}
@@ -291,6 +306,18 @@ func (s *PgStore) TransitionOrgUnit(ctx context.Context, unitID, command string,
 		if _, err := tx.Exec(ctx, `
 			UPDATE org_units SET status = $1, record_version = record_version + 1, updated_at = $2
 			WHERE tenant_id = $3 AND unit_id = $4`, next, time.Now().UTC(), tenantID, unitID); err != nil {
+			return err
+		}
+
+		eventName := events.EventOrgUnitActivated
+		if command == domain.UnitCommandDeactivate {
+			eventName = events.EventOrgUnitDeactivated
+		}
+		if err := emit(ctx, tx, tenantID, events.OrgEvent{
+			Name: eventName, LegalEntityID: entityID, UnitID: unitID,
+			ObjectType: events.ObjectOrgUnit, ObjectID: unitID, ObjectVersion: version + 1, EffectiveAt: today(),
+			Details: map[string]any{"from_status": status, "to_status": next},
+		}); err != nil {
 			return err
 		}
 
@@ -456,8 +483,21 @@ func reparentTx(ctx context.Context, tx pgx.Tx, tenantID, unitID string, req *do
 	u, err := scanOrgUnit(tx.QueryRow(ctx, `
 			WITH d AS (SELECT CURRENT_DATE AS d) `+orgUnitSelect+`
 			WHERE u.tenant_id = $1 AND u.unit_id = $2`, tenantID, unitID))
+	if err != nil {
+		return err
+	}
 	*result = u
-	return err
+
+	// The event is part of this transaction. For an approved change the actor is
+	// the maker (who proposed it) and evidence_ref is the approved request.
+	return emit(ctx, tx, tenantID, events.OrgEvent{
+		Name: events.EventOrgUnitReparented, LegalEntityID: entityID, UnitID: unitID,
+		ObjectType: events.ObjectOrgUnit, ObjectID: unitID, ObjectVersion: version + 1,
+		EffectiveAt: req.EffectiveAt, RecordedAt: now, Actor: actorID, EvidenceRef: approvalRef,
+		Details: map[string]any{
+			"previous_parent_unit_id": currentParent, "new_parent_unit_id": req.NewParentUnitID, "reason": req.Reason,
+		},
+	})
 }
 
 func sameParent(a, b *string) bool {
@@ -479,11 +519,11 @@ func (s *PgStore) ChangeOrgUnitManager(ctx context.Context, unitID string, req *
 
 	var out *domain.OrgUnit
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		var status string
+		var status, entityID string
 		var version int64
 		err := tx.QueryRow(ctx, `
-			SELECT status, record_version FROM org_units
-			WHERE tenant_id = $1 AND unit_id = $2 FOR UPDATE`, tenantID, unitID).Scan(&status, &version)
+			SELECT status, record_version, legal_entity_id FROM org_units
+			WHERE tenant_id = $1 AND unit_id = $2 FOR UPDATE`, tenantID, unitID).Scan(&status, &version, &entityID)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.ErrOrgUnitNotFound
 		}
@@ -537,8 +577,23 @@ func (s *PgStore) ChangeOrgUnitManager(ctx context.Context, unitID string, req *
 		u, err := scanOrgUnit(tx.QueryRow(ctx, `
 			WITH d AS (SELECT CURRENT_DATE AS d) `+orgUnitSelect+`
 			WHERE u.tenant_id = $1 AND u.unit_id = $2`, tenantID, unitID))
+		if err != nil {
+			return err
+		}
 		out = u
-		return err
+
+		var previous *string // nil when the unit had no manager
+		if hasOpen {
+			previous = &current
+		}
+		return emit(ctx, tx, tenantID, events.OrgEvent{
+			Name: events.EventOrgUnitManagerChanged, LegalEntityID: entityID, UnitID: unitID,
+			ObjectType: events.ObjectOrgUnit, ObjectID: unitID, ObjectVersion: version + 1,
+			EffectiveAt: req.EffectiveAt, RecordedAt: now, Actor: actorID,
+			Details: map[string]any{
+				"previous_manager_employee_id": previous, "new_manager_employee_id": req.ManagerEmployeeID, "reason": req.Reason,
+			},
+		})
 	})
 	if err != nil {
 		var pgErr *pgconn.PgError

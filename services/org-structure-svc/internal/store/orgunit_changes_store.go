@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"zoiko.io/org-structure-svc/internal/domain"
+	"zoiko.io/org-structure-svc/internal/events"
 	svcmiddleware "zoiko.io/org-structure-svc/internal/middleware"
 )
 
@@ -174,7 +175,19 @@ func (s *PgStore) CreateReparentRequest(ctx context.Context, unitID string, req 
 			}
 		}
 		out, created = existing, tag.RowsAffected() == 1
-		return nil
+		if !created {
+			return nil // the same move was already pending; it was announced then
+		}
+		return emit(ctx, tx, tenantID, events.OrgEvent{
+			Name: events.EventOrgUnitReparentRequested, LegalEntityID: entityID, UnitID: unitID,
+			ObjectType: events.ObjectChangeRequest, ObjectID: existing.RequestID, ObjectVersion: 1,
+			EffectiveAt: req.EffectiveAt, RecordedAt: existing.RequestedAt, Actor: actorID,
+			Details: map[string]any{
+				"new_parent_unit_id": req.NewParentUnitID, "reason": req.Reason, "unit_version": expectedVersion,
+				"units_affected": impact.UnitsAffected, "mapped_unit_count": len(impact.MappedUnits),
+				"requires_approval": impact.RequiresApproval,
+			},
+		})
 	})
 	if err != nil {
 		return nil, false, mapReparentErr(err)
@@ -286,7 +299,14 @@ func (s *PgStore) ApproveChangeRequest(ctx context.Context, requestID, approverI
 		}
 		locked.Status, locked.DecidedBy, locked.DecidedAt = domain.ChangeApproved, &approverID, &now
 		cr = locked
-		return nil
+		// reparentTx has already written OrgUnitReparented (actor: the maker,
+		// evidence: this request); this records the approval itself.
+		return emit(ctx, tx, tenantID, events.OrgEvent{
+			Name: events.EventOrgUnitReparentApproved, LegalEntityID: locked.LegalEntityID, UnitID: locked.UnitID,
+			ObjectType: events.ObjectChangeRequest, ObjectID: locked.RequestID, ObjectVersion: 2,
+			EffectiveAt: locked.EffectiveAt, RecordedAt: now, Actor: approverID,
+			Details: map[string]any{"requested_by": locked.RequestedBy, "reason": locked.Reason},
+		})
 	})
 	if err != nil {
 		err = mapReparentErr(err)
@@ -302,12 +322,26 @@ func (s *PgStore) ApproveChangeRequest(ctx context.Context, requestID, approverI
 // in its own transaction because the approval's was rolled back.
 func (s *PgStore) failChangeRequest(ctx context.Context, tenantID, requestID, decidedBy string, cause error) error {
 	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `
+		now := time.Now().UTC()
+		var entityID, unitID, effectiveAt, requestedBy string
+		err := tx.QueryRow(ctx, `
 			UPDATE org_unit_change_requests
 			SET status = 'FAILED', decided_by = $1, decided_at = $2, failure_code = $3
-			WHERE tenant_id = $4 AND request_id = $5 AND status = 'PENDING'`,
-			decidedBy, time.Now().UTC(), domain.FailureCode(cause), tenantID, requestID)
-		return err
+			WHERE tenant_id = $4 AND request_id = $5 AND status = 'PENDING'
+			RETURNING legal_entity_id, unit_id::text, effective_at::text, requested_by`,
+			decidedBy, now, domain.FailureCode(cause), tenantID, requestID).Scan(&entityID, &unitID, &effectiveAt, &requestedBy)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil // already decided by someone else; nothing to close or announce
+		}
+		if err != nil {
+			return err
+		}
+		return emit(ctx, tx, tenantID, events.OrgEvent{
+			Name: events.EventOrgUnitReparentFailed, LegalEntityID: entityID, UnitID: unitID,
+			ObjectType: events.ObjectChangeRequest, ObjectID: requestID, ObjectVersion: 2,
+			EffectiveAt: effectiveAt, RecordedAt: now, Actor: decidedBy,
+			Details: map[string]any{"requested_by": requestedBy, "failure_code": domain.FailureCode(cause)},
+		})
 	})
 }
 
@@ -332,7 +366,12 @@ func (s *PgStore) RejectChangeRequest(ctx context.Context, requestID, deciderID,
 		}
 		cr.Status, cr.DecidedBy, cr.DecidedAt, cr.DecisionReason = domain.ChangeRejected, &deciderID, &now, reason
 		out = cr
-		return nil
+		return emit(ctx, tx, tenantID, events.OrgEvent{
+			Name: events.EventOrgUnitReparentRejected, LegalEntityID: cr.LegalEntityID, UnitID: cr.UnitID,
+			ObjectType: events.ObjectChangeRequest, ObjectID: cr.RequestID, ObjectVersion: 2,
+			EffectiveAt: cr.EffectiveAt, RecordedAt: now, Actor: deciderID,
+			Details: map[string]any{"requested_by": cr.RequestedBy, "decision_reason": reason},
+		})
 	})
 	return out, mapBadID(err, domain.ErrChangeRequestNotFound)
 }
