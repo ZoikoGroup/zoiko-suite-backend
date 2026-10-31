@@ -31,6 +31,7 @@ type stubStore struct {
 	placeFrom         map[string]string
 	managerFrom       map[string]string
 	lastSnap          snapshotCall
+	changes           map[string]*domain.ChangeRequest
 }
 
 func newStubStore() *stubStore {
@@ -44,6 +45,7 @@ func newStubStore() *stubStore {
 		units:             make(map[string]*domain.OrgUnit),
 		placeFrom:         make(map[string]string),
 		managerFrom:       make(map[string]string),
+		changes:           make(map[string]*domain.ChangeRequest),
 	}
 }
 

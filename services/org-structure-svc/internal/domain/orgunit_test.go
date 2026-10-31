@@ -131,3 +131,35 @@ func TestBuildOrgUnitTree_EmptyAndCycle(t *testing.T) {
 		t.Fatalf("a cycle must be reported, got %v", err)
 	}
 }
+
+func TestNewImpactReport(t *testing.T) {
+	none := NewImpactReport("u1", 3, nil)
+	if none.RequiresApproval || none.MappedUnits == nil || len(none.MappedUnits) != 0 || none.UnitsAffected != 3 {
+		t.Fatalf("a move with no mappings needs no approval and carries an empty list: %+v", none)
+	}
+	if len(none.Notes) != 1 || none.Notes[0] != ApprovalRulesNote {
+		t.Fatalf("the approval-rules caveat must always be stated: %v", none.Notes)
+	}
+
+	some := NewImpactReport("u1", 4, []MappedUnit{{UnitID: "u2", Code: "FIN", CostCenterCode: "CC1"}})
+	if !some.RequiresApproval {
+		t.Fatal("a mapped unit in the subtree requires independent approval")
+	}
+}
+
+func TestTerminalApplyErrors(t *testing.T) {
+	for _, e := range []error{ErrVersionConflict, ErrHierarchyLoop, ErrParentInvalid, ErrParentNotActive,
+		ErrEffectiveDateInvalid, ErrNoHierarchyChange, ErrInvalidTransition, ErrOrgUnitNotFound} {
+		if !IsTerminalApplyError(e) {
+			t.Errorf("%v can never be applied as written", e)
+		}
+		if FailureCode(e) == "apply_failed" {
+			t.Errorf("%v needs its own failure code", e)
+		}
+	}
+	for _, e := range []error{ErrStoreUnavailable, ErrIdentityMissing, ErrSelfApproval} {
+		if IsTerminalApplyError(e) {
+			t.Errorf("%v is transient or a caller error: the request must stay pending", e)
+		}
+	}
+}

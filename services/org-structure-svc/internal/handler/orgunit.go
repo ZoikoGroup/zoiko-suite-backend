@@ -24,6 +24,7 @@ const (
 	actionOrgUnitDeactivate = "ORG_UNIT_DEACTIVATE"
 	actionOrgUnitReparent   = "ORG_UNIT_REPARENT"
 	actionOrgUnitChangeMgr  = "ORG_UNIT_CHANGE_MANAGER"
+	actionOrgUnitApprove    = "ORG_UNIT_APPROVE_STRUCTURE"
 )
 
 func registerOrgUnitRoutes(r chi.Router, h *Handler) {
@@ -35,6 +36,11 @@ func registerOrgUnitRoutes(r chi.Router, h *Handler) {
 	r.Post("/units/{id}/reparent", h.ReparentOrgUnit)
 	r.Post("/units/{id}/change-manager", h.ChangeOrgUnitManager)
 	r.Get("/hierarchy", h.GetHierarchy)
+	r.Get("/units/{id}/reparent-impact", h.GetReparentImpact)
+	r.Get("/change-requests", h.ListChangeRequests)
+	r.Get("/change-requests/{id}", h.GetChangeRequest)
+	r.Post("/change-requests/{id}/approve", h.ApproveChangeRequest)
+	r.Post("/change-requests/{id}/reject", h.RejectChangeRequest)
 }
 
 func validDate(s string) bool {
@@ -227,6 +233,14 @@ func (h *Handler) writeOrgUnitErr(w http.ResponseWriter, err error, op string) {
 		writeError(w, http.StatusConflict, "no_change", err.Error())
 	case errors.Is(err, domain.ErrEmployeeValidationFailed):
 		writeError(w, http.StatusServiceUnavailable, "employee_validation_failed", err.Error())
+	case errors.Is(err, domain.ErrChangeRequestNotFound):
+		writeError(w, http.StatusNotFound, "change_request_not_found", "")
+	case errors.Is(err, domain.ErrChangeRequestDecided):
+		writeError(w, http.StatusConflict, "change_request_decided", err.Error())
+	case errors.Is(err, domain.ErrSelfApproval):
+		writeError(w, http.StatusForbidden, "sod_denied", err.Error())
+	case errors.Is(err, domain.ErrChangePending):
+		writeError(w, http.StatusConflict, "change_pending", err.Error())
 	case errors.Is(err, domain.ErrNoHierarchyChange):
 		writeError(w, http.StatusConflict, "no_change", err.Error())
 	case errors.Is(err, domain.ErrEffectiveDateInvalid):
@@ -275,6 +289,18 @@ func (h *Handler) ReparentOrgUnit(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, current.LegalEntityID, actionOrgUnitReparent); err != nil {
 		h.writeAuthzErr(w, err)
+		return
+	}
+
+	// A move that carries financial mappings is not applied by its maker: it
+	// becomes a change request that a different principal must approve.
+	impact, err := h.store.ReparentImpact(r.Context(), unitID, req.EffectiveAt)
+	if err != nil {
+		h.writeOrgUnitErr(w, err, "reparent")
+		return
+	}
+	if impact.RequiresApproval {
+		h.proposeReparent(w, r, unitID, &req, version, principalID, *impact)
 		return
 	}
 

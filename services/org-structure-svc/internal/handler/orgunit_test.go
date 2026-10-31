@@ -33,6 +33,7 @@ func (s *stubStore) CreateOrgUnit(_ context.Context, req *domain.CreateOrgUnitRe
 		UnitID: fmt.Sprintf("unit-%d", len(s.units)+1), TenantID: "tenant-abc", LegalEntityID: req.LegalEntityID,
 		Code: req.Code, Name: req.Name, UnitType: req.UnitType, Status: domain.UnitStatusDraft,
 		RecordVersion: 1, CorrelationID: req.CorrelationID, CreatedBy: actorID, ParentUnitID: req.ParentUnitID, ManagerEmployeeID: req.ManagerEmployeeID,
+		CostCenterCode: req.CostCenterCode, ProfitCenterCode: req.ProfitCenterCode,
 	}
 	s.units[u.UnitID] = u
 	s.placeFrom[u.UnitID] = req.EffectiveFrom

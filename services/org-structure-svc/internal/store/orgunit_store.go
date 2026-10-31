@@ -327,54 +327,78 @@ func (s *PgStore) ReparentOrgUnit(ctx context.Context, unitID string, req *domai
 
 	var out *domain.OrgUnit
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		// The advisory lock comes first, before any row lock. Taking a row lock
-		// first deadlocks two opposing moves: each holds its own unit, waits
-		// for the advisory lock, and the winner then needs the other's row. A
-		// unit's legal entity never changes, so reading it unlocked is safe.
-		var entityID string
-		err := tx.QueryRow(ctx, `SELECT legal_entity_id FROM org_units WHERE tenant_id = $1 AND unit_id = $2`,
-			tenantID, unitID).Scan(&entityID)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return domain.ErrOrgUnitNotFound
+		return reparentTx(ctx, tx, tenantID, unitID, req, expectedVersion, actorID, "", &out)
+	})
+	if err != nil {
+		return nil, mapReparentErr(err)
+	}
+	return out, nil
+}
+
+// mapReparentErr turns a malformed parent id (Postgres 22P02) into the typed
+// error callers expect.
+func mapReparentErr(err error) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == pgInvalidText {
+		return domain.ErrParentInvalid
+	}
+	return err
+}
+
+// reparentTx is the whole reparent inside a caller-owned transaction, so the
+// direct command, the approval of a pending request and a dry run (rolled back
+// by the caller) all run the very same checks. approvalRef, when set, is the
+// change request that authorised the move and is kept on the new placement as
+// evidence. The updated unit is written to *result.
+func reparentTx(ctx context.Context, tx pgx.Tx, tenantID, unitID string, req *domain.ReparentOrgUnitRequest, expectedVersion int64, actorID, approvalRef string, result **domain.OrgUnit) error {
+	// The advisory lock comes first, before any row lock. Taking a row lock
+	// first deadlocks two opposing moves: each holds its own unit, waits
+	// for the advisory lock, and the winner then needs the other's row. A
+	// unit's legal entity never changes, so reading it unlocked is safe.
+	var entityID string
+	err := tx.QueryRow(ctx, `SELECT legal_entity_id FROM org_units WHERE tenant_id = $1 AND unit_id = $2`,
+		tenantID, unitID).Scan(&entityID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.ErrOrgUnitNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, tenantID+"/"+entityID); err != nil {
+		return err
+	}
+
+	var status string
+	var version int64
+	if err := tx.QueryRow(ctx, `
+			SELECT status, record_version FROM org_units
+			WHERE tenant_id = $1 AND unit_id = $2 FOR UPDATE`, tenantID, unitID).Scan(&status, &version); err != nil {
+		return err
+	}
+	if version != expectedVersion {
+		return domain.ErrVersionConflict
+	}
+	if status == domain.UnitStatusInactive {
+		return domain.ErrInvalidTransition
+	}
+
+	if req.NewParentUnitID != nil {
+		var parentEntity, parentStatus string
+		err := tx.QueryRow(ctx, `
+				SELECT legal_entity_id, status FROM org_units
+				WHERE tenant_id = $1 AND unit_id = $2 FOR SHARE`, tenantID, *req.NewParentUnitID).Scan(&parentEntity, &parentStatus)
+		if errors.Is(err, pgx.ErrNoRows) || err == nil && parentEntity != entityID {
+			return domain.ErrParentInvalid
 		}
 		if err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, tenantID+"/"+entityID); err != nil {
-			return err
+		if parentStatus == domain.UnitStatusInactive || status == domain.UnitStatusActive && parentStatus != domain.UnitStatusActive {
+			return domain.ErrParentNotActive
 		}
 
-		var status string
-		var version int64
+		var loop bool
 		if err := tx.QueryRow(ctx, `
-			SELECT status, record_version FROM org_units
-			WHERE tenant_id = $1 AND unit_id = $2 FOR UPDATE`, tenantID, unitID).Scan(&status, &version); err != nil {
-			return err
-		}
-		if version != expectedVersion {
-			return domain.ErrVersionConflict
-		}
-		if status == domain.UnitStatusInactive {
-			return domain.ErrInvalidTransition
-		}
-
-		if req.NewParentUnitID != nil {
-			var parentEntity, parentStatus string
-			err := tx.QueryRow(ctx, `
-				SELECT legal_entity_id, status FROM org_units
-				WHERE tenant_id = $1 AND unit_id = $2 FOR SHARE`, tenantID, *req.NewParentUnitID).Scan(&parentEntity, &parentStatus)
-			if errors.Is(err, pgx.ErrNoRows) || err == nil && parentEntity != entityID {
-				return domain.ErrParentInvalid
-			}
-			if err != nil {
-				return err
-			}
-			if parentStatus == domain.UnitStatusInactive || status == domain.UnitStatusActive && parentStatus != domain.UnitStatusActive {
-				return domain.ErrParentNotActive
-			}
-
-			var loop bool
-			if err := tx.QueryRow(ctx, `
 				WITH RECURSIVE anc(id) AS (
 					SELECT $1::uuid
 					UNION
@@ -384,65 +408,56 @@ func (s *PgStore) ReparentOrgUnit(ctx context.Context, unitID string, req *domai
 					  AND (hv.valid_to IS NULL OR hv.valid_to > $2::date)
 				)
 				SELECT EXISTS (SELECT 1 FROM anc WHERE id = $3::uuid)`,
-				*req.NewParentUnitID, req.EffectiveAt, unitID).Scan(&loop); err != nil {
-				return err
-			}
-			if loop {
-				return domain.ErrHierarchyLoop
-			}
+			*req.NewParentUnitID, req.EffectiveAt, unitID).Scan(&loop); err != nil {
+			return err
 		}
+		if loop {
+			return domain.ErrHierarchyLoop
+		}
+	}
 
-		var openVersion string
-		var currentParent *string
-		var after bool
-		if err := tx.QueryRow(ctx, `
+	var openVersion string
+	var currentParent *string
+	var after bool
+	if err := tx.QueryRow(ctx, `
 			SELECT version_id, parent_unit_id, valid_from < $2::date
 			FROM org_unit_hierarchy_versions
 			WHERE unit_id = $1 AND valid_to IS NULL AND superseded_at IS NULL`,
-			unitID, req.EffectiveAt).Scan(&openVersion, &currentParent, &after); err != nil {
-			return err
-		}
-		if sameParent(currentParent, req.NewParentUnitID) {
-			return domain.ErrNoHierarchyChange
-		}
-		if !after {
-			return domain.ErrEffectiveDateInvalid
-		}
+		unitID, req.EffectiveAt).Scan(&openVersion, &currentParent, &after); err != nil {
+		return err
+	}
+	if sameParent(currentParent, req.NewParentUnitID) {
+		return domain.ErrNoHierarchyChange
+	}
+	if !after {
+		return domain.ErrEffectiveDateInvalid
+	}
 
-		now := time.Now().UTC()
-		// closed_at records when the placement was closed, so a read "as known
-		// at" an earlier time still sees it open-ended.
-		if _, err := tx.Exec(ctx, `UPDATE org_unit_hierarchy_versions SET valid_to = $1::date, closed_at = $3 WHERE version_id = $2`,
-			req.EffectiveAt, openVersion, now); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(ctx, `
+	now := time.Now().UTC()
+	// closed_at records when the placement was closed, so a read "as known
+	// at" an earlier time still sees it open-ended.
+	if _, err := tx.Exec(ctx, `UPDATE org_unit_hierarchy_versions SET valid_to = $1::date, closed_at = $3 WHERE version_id = $2`,
+		req.EffectiveAt, openVersion, now); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `
 			INSERT INTO org_unit_hierarchy_versions (
-				version_id, tenant_id, unit_id, parent_unit_id, valid_from, recorded_at, change_reason, actor_id
-			) VALUES ($1, $2, $3, $4, $5::date, $6, $7, $8)`,
-			uuid.NewString(), tenantID, unitID, req.NewParentUnitID, req.EffectiveAt, now, req.Reason, actorID); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(ctx, `
+				version_id, tenant_id, unit_id, parent_unit_id, valid_from, recorded_at, change_reason, actor_id, approval_ref
+			) VALUES ($1, $2, $3, $4, $5::date, $6, $7, $8, $9)`,
+		uuid.NewString(), tenantID, unitID, req.NewParentUnitID, req.EffectiveAt, now, req.Reason, actorID, approvalRef); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `
 			UPDATE org_units SET record_version = record_version + 1, updated_at = $1
 			WHERE tenant_id = $2 AND unit_id = $3`, now, tenantID, unitID); err != nil {
-			return err
-		}
+		return err
+	}
 
-		u, err := scanOrgUnit(tx.QueryRow(ctx, `
+	u, err := scanOrgUnit(tx.QueryRow(ctx, `
 			WITH d AS (SELECT CURRENT_DATE AS d) `+orgUnitSelect+`
 			WHERE u.tenant_id = $1 AND u.unit_id = $2`, tenantID, unitID))
-		out = u
-		return err
-	})
-	if err != nil {
-		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code == pgInvalidText {
-			return nil, domain.ErrParentInvalid
-		}
-		return nil, err
-	}
-	return out, nil
+	*result = u
+	return err
 }
 
 func sameParent(a, b *string) bool {
