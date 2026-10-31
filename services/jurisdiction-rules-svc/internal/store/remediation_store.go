@@ -78,7 +78,6 @@ func scanRemediation(r pgx.Row) (*RemediationCase, error) {
 	return &c, err
 }
 
-
 func refusal(err error) error {
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) && (pgErr.Code == "23514" || pgErr.Code == "23503") {

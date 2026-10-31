@@ -23,16 +23,16 @@ func TestDispositionInput_Validate(t *testing.T) {
 		d    DispositionInput
 		want string
 	}{
-		"no decision":              {DispositionInput{Disposition: DispositionReconfirmed, EvidenceRef: "E"}, "decision_id"},
-		"unknown disposition":      {DispositionInput{DecisionID: "d1", Disposition: "FORGOTTEN", EvidenceRef: "E"}, "disposition must be"},
-		"no evidence":              {DispositionInput{DecisionID: "d1", Disposition: DispositionReconfirmed}, "evidence_ref"},
-		"blank evidence":           {DispositionInput{DecisionID: "d1", Disposition: DispositionReconfirmed, EvidenceRef: "   "}, "evidence_ref"},
-		"recalculated, no new":     {DispositionInput{DecisionID: "d1", Disposition: DispositionRecalc, EvidenceRef: "E"}, "needs new_decision_id"},
-		"superseded, blank new":    {DispositionInput{DecisionID: "d1", Disposition: DispositionSuperseded, EvidenceRef: "E", NewDecisionID: rp(" ")}, "needs new_decision_id"},
-		"reconfirmed with new":     {DispositionInput{DecisionID: "d1", Disposition: DispositionReconfirmed, EvidenceRef: "E", NewDecisionID: rp("d2")}, "takes no new_decision_id"},
-		"not affected with new":    {DispositionInput{DecisionID: "d1", Disposition: DispositionNotAffected, EvidenceRef: "E", NewDecisionID: rp("d2")}, "takes no new_decision_id"},
-		"replaced by itself":       {DispositionInput{DecisionID: "d1", Disposition: DispositionRecalc, EvidenceRef: "E", NewDecisionID: rp("d1")}, "different decision"},
-		"note too long":            {DispositionInput{DecisionID: "d1", Disposition: DispositionReconfirmed, EvidenceRef: "E", Note: strings.Repeat("x", 2001)}, "note"},
+		"no decision":           {DispositionInput{Disposition: DispositionReconfirmed, EvidenceRef: "E"}, "decision_id"},
+		"unknown disposition":   {DispositionInput{DecisionID: "d1", Disposition: "FORGOTTEN", EvidenceRef: "E"}, "disposition must be"},
+		"no evidence":           {DispositionInput{DecisionID: "d1", Disposition: DispositionReconfirmed}, "evidence_ref"},
+		"blank evidence":        {DispositionInput{DecisionID: "d1", Disposition: DispositionReconfirmed, EvidenceRef: "   "}, "evidence_ref"},
+		"recalculated, no new":  {DispositionInput{DecisionID: "d1", Disposition: DispositionRecalc, EvidenceRef: "E"}, "needs new_decision_id"},
+		"superseded, blank new": {DispositionInput{DecisionID: "d1", Disposition: DispositionSuperseded, EvidenceRef: "E", NewDecisionID: rp(" ")}, "needs new_decision_id"},
+		"reconfirmed with new":  {DispositionInput{DecisionID: "d1", Disposition: DispositionReconfirmed, EvidenceRef: "E", NewDecisionID: rp("d2")}, "takes no new_decision_id"},
+		"not affected with new": {DispositionInput{DecisionID: "d1", Disposition: DispositionNotAffected, EvidenceRef: "E", NewDecisionID: rp("d2")}, "takes no new_decision_id"},
+		"replaced by itself":    {DispositionInput{DecisionID: "d1", Disposition: DispositionRecalc, EvidenceRef: "E", NewDecisionID: rp("d1")}, "different decision"},
+		"note too long":         {DispositionInput{DecisionID: "d1", Disposition: DispositionReconfirmed, EvidenceRef: "E", Note: strings.Repeat("x", 2001)}, "note"},
 	}
 	for name, c := range bad {
 		err := c.d.Validate()

@@ -94,14 +94,14 @@ type ClaimCheck struct {
 
 // Determination is the explainable outcome of a jurisdiction determination.
 type Determination struct {
-	Outcome      string     `json:"outcome"`
-	Purpose      string     `json:"purpose"`
-	EffectiveAt  time.Time  `json:"effective_at"`
-	Basis        string     `json:"basis,omitempty"`
-	Jurisdiction *Candidate `json:"jurisdiction,omitempty"`
+	Outcome      string      `json:"outcome"`
+	Purpose      string      `json:"purpose"`
+	EffectiveAt  time.Time   `json:"effective_at"`
+	Basis        string      `json:"basis,omitempty"`
+	Jurisdiction *Candidate  `json:"jurisdiction,omitempty"`
 	Candidates   []Candidate `json:"candidates"`
-	Claim        ClaimCheck `json:"claim"`
-	Explanation  []string   `json:"explanation"`
+	Claim        ClaimCheck  `json:"claim"`
+	Explanation  []string    `json:"explanation"`
 }
 
 // ValidPurpose reports whether p is a known determination purpose.

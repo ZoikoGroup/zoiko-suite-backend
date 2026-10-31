@@ -27,11 +27,11 @@ const (
 )
 
 var (
-	ErrRemediationNotFound  = errorString("remediation case not found")
-	ErrNothingToRemediate   = errorString("no decision was made with this pack version in this scope, so there is nothing to remediate")
-	ErrRemediationRefused   = errorString("the remediation record was refused")
-	ErrDecisionNotInCase    = errorString("a decision named is not part of this remediation case")
-	ErrDispositionDiffers   = errorString("this decision already has a different disposition: dispositions are final")
+	ErrRemediationNotFound = errorString("remediation case not found")
+	ErrNothingToRemediate  = errorString("no decision was made with this pack version in this scope, so there is nothing to remediate")
+	ErrRemediationRefused  = errorString("the remediation record was refused")
+	ErrDecisionNotInCase   = errorString("a decision named is not part of this remediation case")
+	ErrDispositionDiffers  = errorString("this decision already has a different disposition: dispositions are final")
 )
 
 // ValidDisposition reports whether d is a known disposition.
@@ -40,7 +40,9 @@ func ValidDisposition(d string) bool {
 }
 
 // DispositionNeedsReplacement reports whether the disposition must name the decision that replaced the original.
-func DispositionNeedsReplacement(d string) bool { return d == DispositionRecalc || d == DispositionSuperseded }
+func DispositionNeedsReplacement(d string) bool {
+	return d == DispositionRecalc || d == DispositionSuperseded
+}
 
 // DispositionInput is one decision's disposition as submitted.
 type DispositionInput struct {
