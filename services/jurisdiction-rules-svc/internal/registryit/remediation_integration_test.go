@@ -110,10 +110,10 @@ func TestRemediation_WithdrawalOpensACaseThatCannotCloseUntilEveryDecisionIsAnsw
 	// A decision that is not part of the case is refused, and so is a replacement made with the very version under remediation.
 	code, r = post(disp(uuid.NewString(), "RECONFIRMED", "E-1", ""))
 	mustStatus(t, 422, code, r)
-	assert.Equal(t, "decision_not_in_case", r["error"])
+	assert.Equal(t, "decision_not_in_case", r["code"])
 	code, r = post(disp(old[0], "RECALCULATED", "E-1", old[1]))
 	mustStatus(t, 422, code, r)
-	assert.Equal(t, "remediation_refused", r["error"])
+	assert.Equal(t, "remediation_refused", r["code"])
 	assert.Contains(t, mustString(r["detail"]), "same pack version")
 
 	// Record the dispositions. A repeat is a replay; a different answer for the same decision is refused (dispositions are final).
@@ -126,7 +126,7 @@ func TestRemediation_WithdrawalOpensACaseThatCannotCloseUntilEveryDecisionIsAnsw
 	assert.EqualValues(t, 0, r["recorded"])
 	code, r = post(disp(old[0], "RECONFIRMED", "REV-4", ""))
 	mustStatus(t, 409, code, r)
-	assert.Equal(t, "disposition_differs", r["error"])
+	assert.Equal(t, "disposition_differs", r["code"])
 	code, cs = e.do("GET", "/v1/admin/remediation-cases/"+caseID, "auditor", nil)
 	mustStatus(t, 200, code, cs)
 	assert.EqualValues(t, 1, cs["progress"].(map[string]any)["pending"])
@@ -204,7 +204,7 @@ func TestRemediation_ManualCaseAndNothingToRemediate(t *testing.T) {
 	// A scope with no decisions, a version never used, and an unknown version are refused.
 	code, r = open(map[string]any{"ring": "no-such-ring", "region": "no-such-region"})
 	mustStatus(t, 409, code, r)
-	assert.Equal(t, "nothing_to_remediate", r["error"])
+	assert.Equal(t, "nothing_to_remediate", r["code"])
 	code, r = open(map[string]any{"version": "2026.09.1"})
 	mustStatus(t, 409, code, r)
 	code, _ = open(map[string]any{"version": "9.9.9"})

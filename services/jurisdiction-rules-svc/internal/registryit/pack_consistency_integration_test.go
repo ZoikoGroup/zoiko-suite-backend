@@ -97,7 +97,7 @@ func TestSupersede_OnlyWhenNothingLosesService(t *testing.T) {
 	c.certifyVersion(t, "2026.10.1")
 	code, r = sup("2026.10.1", map[string]any{"superseded_by": "2026.09.1", "reason": "x"})
 	mustStatus(t, 409, code, r)
-	assert.Equal(t, "invalid_lifecycle_state", r["error"])
+	assert.Equal(t, "invalid_lifecycle_state", r["code"])
 }
 
 func TestSupersede_NewerVersionMustBeDeployedWhereTheOlderIs(t *testing.T) {
@@ -171,7 +171,7 @@ func TestRelease_RefusesAPackThatCollidesWithAnotherReleasedPack(t *testing.T) {
 	mustStatus(t, 200, code, r)
 	refB, code, r := s.releaseOnly(t, []string{b})
 	mustStatus(t, 409, code, r)
-	assert.Equal(t, "operation_blocked", r["error"])
+	assert.Equal(t, "operation_blocked", r["code"])
 	reasons := blockReasons(r)
 	assert.Contains(t, reasons, "cross_pack_conflict")
 	assert.Contains(t, reasons, "PAYROLL/PERSONAL_ALLOWANCE")
