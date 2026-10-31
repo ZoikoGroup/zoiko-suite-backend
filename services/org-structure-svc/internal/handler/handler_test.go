@@ -28,6 +28,7 @@ type stubStore struct {
 	assignments       map[string]*domain.OrgAssignment
 	assignmentsByCorr map[string]string
 	units             map[string]*domain.OrgUnit
+	placeFrom         map[string]string
 }
 
 func newStubStore() *stubStore {
@@ -39,6 +40,7 @@ func newStubStore() *stubStore {
 		assignments:       make(map[string]*domain.OrgAssignment),
 		assignmentsByCorr: make(map[string]string),
 		units:             make(map[string]*domain.OrgUnit),
+		placeFrom:         make(map[string]string),
 	}
 }
 

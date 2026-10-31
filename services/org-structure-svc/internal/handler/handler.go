@@ -32,6 +32,7 @@ type Store interface {
 	GetOrgUnit(ctx context.Context, unitID, asOf string) (*domain.OrgUnit, error)
 	ListOrgUnits(ctx context.Context, legalEntityID, asOf string) ([]domain.OrgUnit, error)
 	TransitionOrgUnit(ctx context.Context, unitID, command string, expectedVersion int64) (*domain.OrgUnit, error)
+	ReparentOrgUnit(ctx context.Context, unitID string, req *domain.ReparentOrgUnitRequest, expectedVersion int64, actorID string) (*domain.OrgUnit, error)
 }
 
 type Publisher interface {

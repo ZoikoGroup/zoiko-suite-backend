@@ -35,6 +35,7 @@ func (s *stubStore) CreateOrgUnit(_ context.Context, req *domain.CreateOrgUnitRe
 		RecordVersion: 1, CorrelationID: req.CorrelationID, CreatedBy: actorID, ParentUnitID: req.ParentUnitID,
 	}
 	s.units[u.UnitID] = u
+	s.placeFrom[u.UnitID] = req.EffectiveFrom
 	return u, true, nil
 }
 

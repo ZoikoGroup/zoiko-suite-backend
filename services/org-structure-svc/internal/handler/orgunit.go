@@ -21,6 +21,7 @@ const (
 	actionOrgUnitView       = "ORG_UNIT_VIEW"
 	actionOrgUnitActivate   = "ORG_UNIT_ACTIVATE"
 	actionOrgUnitDeactivate = "ORG_UNIT_DEACTIVATE"
+	actionOrgUnitReparent   = "ORG_UNIT_REPARENT"
 )
 
 func registerOrgUnitRoutes(r chi.Router, h *Handler) {
@@ -29,6 +30,7 @@ func registerOrgUnitRoutes(r chi.Router, h *Handler) {
 	r.Get("/units/{id}", h.GetOrgUnit)
 	r.Post("/units/{id}/activate", h.ActivateOrgUnit)
 	r.Post("/units/{id}/deactivate", h.DeactivateOrgUnit)
+	r.Post("/units/{id}/reparent", h.ReparentOrgUnit)
 }
 
 func validDate(s string) bool {
@@ -204,6 +206,12 @@ func (h *Handler) writeOrgUnitErr(w http.ResponseWriter, err error, op string) {
 		writeError(w, http.StatusConflict, "invalid_transition", err.Error())
 	case errors.Is(err, domain.ErrHasActiveChildren):
 		writeError(w, http.StatusConflict, "has_active_children", err.Error())
+	case errors.Is(err, domain.ErrHierarchyLoop):
+		writeError(w, http.StatusUnprocessableEntity, "hierarchy_loop", err.Error())
+	case errors.Is(err, domain.ErrNoHierarchyChange):
+		writeError(w, http.StatusConflict, "no_change", err.Error())
+	case errors.Is(err, domain.ErrEffectiveDateInvalid):
+		writeError(w, http.StatusUnprocessableEntity, "invalid_effective_date", err.Error())
 	case errors.Is(err, domain.ErrVersionConflict):
 		writeError(w, http.StatusConflict, "version_conflict", err.Error())
 	case errors.Is(err, domain.ErrIdentityMissing):
@@ -212,4 +220,51 @@ func (h *Handler) writeOrgUnitErr(w http.ResponseWriter, err error, op string) {
 		h.log.Error("org unit "+op+" failed", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 	}
+}
+
+// ReparentOrgUnit moves a unit under a new parent from effective_at on. The
+// unit's history is kept: the old placement is closed, not edited.
+func (h *Handler) ReparentOrgUnit(w http.ResponseWriter, r *http.Request) {
+	var req domain.ReparentOrgUnitRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+		return
+	}
+	if !validDate(req.EffectiveAt) {
+		writeError(w, http.StatusBadRequest, "invalid_effective_at", "effective_at must be a date, YYYY-MM-DD")
+		return
+	}
+	if strings.TrimSpace(req.Reason) == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "reason is required: a structural change keeps its reason as evidence")
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	version, ok := parseIfMatch(w, r)
+	if !ok {
+		return
+	}
+
+	unitID := chi.URLParam(r, "id")
+	current, err := h.store.GetOrgUnit(r.Context(), unitID, "")
+	if err != nil {
+		h.writeOrgUnitErr(w, err, "reparent")
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, current.LegalEntityID, actionOrgUnitReparent); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	unit, err := h.store.ReparentOrgUnit(r.Context(), unitID, &req, version, principalID)
+	if err != nil {
+		h.writeOrgUnitErr(w, err, "reparent")
+		return
+	}
+
+	h.publisher.PublishOrgStructureChanged(r.Context(), getCorrelationID(r), unit.TenantID, unit.LegalEntityID, principalID, "ORG_UNIT_REPARENTED", unit.UnitID)
+	writeJSON(w, http.StatusOK, unit)
 }
