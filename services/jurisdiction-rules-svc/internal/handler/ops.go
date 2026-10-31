@@ -70,6 +70,7 @@ func registerOpsRoutes(r chi.Router, h *Handler) {
 	r.Post("/v1/admin/deployment-rings", h.CreateRing)
 	r.Post("/v1/admin/packs/{pack_ref}/versions/{version}/publish", h.PublishPackVersion)
 	r.Post("/v1/admin/packs/{pack_ref}/versions/{version}/withdraw", h.WithdrawPackVersion)
+	r.Post("/v1/admin/packs/{pack_ref}/versions/{version}/supersede", h.SupersedePackVersion)
 	r.Post("/v1/admin/packs/{pack_ref}/versions/{version}/block", h.BlockPackVersion)
 	r.Post("/v1/admin/packs/{pack_ref}/versions/{version}/unblock", h.UnblockPackVersion)
 	r.Post("/v1/admin/packs/{pack_ref}/versions/{version}/deploy", h.DeployPackVersion)
@@ -234,6 +235,9 @@ func (h *Handler) lifecycle(w http.ResponseWriter, r *http.Request, action strin
 	if res.Changed {
 		h.emitRegistry(r, event, ref+"@"+version, actor, map[string]any{"pack_ref": ref, "version": version,
 			"from_status": res.FromStatus, "to_status": res.ToStatus, "reason": req.Reason, "evidence_ref": req.EvidenceRef})
+		if res.RemediationOpened && res.RemediationCaseID != nil {
+			h.emitRemediationOpened(r, *res.RemediationCaseID, ref, version, domain.RemediationWithdraw, res.RemediationDecisions, actor)
+		}
 	}
 	writeJSON(w, http.StatusOK, res)
 }
@@ -336,6 +340,9 @@ func (h *Handler) RollbackDeployment(w http.ResponseWriter, r *http.Request) {
 	}
 	h.emitRegistry(r, events.EventPackRolledBack, res.RolledBack.DeploymentID, actor, map[string]any{"pack_ref": ref, "version": version,
 		"ring": req.Ring, "region": req.Region, "restored_version": req.RestoreVersion, "reason": req.Reason, "decisions_affected": res.DecisionsMade})
+	if res.RemediationOpened && res.RemediationCaseID != nil {
+		h.emitRemediationOpened(r, *res.RemediationCaseID, ref, version, domain.RemediationRollback, res.RemediationDecisions, actor)
+	}
 	writeJSON(w, http.StatusOK, res)
 }
 

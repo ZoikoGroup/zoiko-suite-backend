@@ -192,11 +192,13 @@ func main() {
 		HotfixRetroSLA:  time.Duration(cfg.HotfixRetroSLAHours) * time.Hour,
 		CertAgeWarnDays: cfg.PackCertAgeWarnDays,
 	})
+	var pushResolver *resolver.Resolver
 	if cfg.ResolverEnabled {
 		res, err := resolver.New(pgStore, resolver.Config{
 			Ring: cfg.ResolverRing, Region: cfg.ResolverRegion,
 			EligibleStatuses: cfg.ResolverEligibleStatuses,
 			CacheTTL:         time.Duration(cfg.ResolverCacheTTLSeconds) * time.Second,
+			SupportGate:      supportGate(cfg.ResolverRequireLaunched, pgStore),
 			// JUR-NEG-04: a pack that fails verification at load raises a security event.
 			OnUnverified: func(packRef, version string, reasons []string) {
 				log.Error("jurisdiction pack failed verification; resolutions covering it are refused",
@@ -215,8 +217,9 @@ func main() {
 			log.Fatal("resolver could not be constructed", zap.Error(err))
 		}
 		h.WithResolver(res)
+		pushResolver = res
 		log.Info("rule resolver enabled", zap.Strings("eligible_statuses", cfg.ResolverEligibleStatuses), zap.Int("cache_ttl_seconds", cfg.ResolverCacheTTLSeconds),
-			zap.String("ring", cfg.ResolverRing), zap.String("region", cfg.ResolverRegion))
+			zap.String("ring", cfg.ResolverRing), zap.String("region", cfg.ResolverRegion), zap.Bool("require_launched", cfg.ResolverRequireLaunched))
 	} else {
 		log.Info("rule resolver disabled: set RESOLVER_ENABLED=true (with RESOLVER_RING and RESOLVER_REGION in production) to serve /v1/rule-resolutions:resolve")
 	}
@@ -247,6 +250,16 @@ func main() {
 	// entity.jurisdiction.changed from tenant-entity-registry-svc.
 	consumerCtx, stopConsumers := context.WithCancel(context.Background())
 	defer stopConsumers()
+	if pushResolver != nil && cfg.ResolverPushInvalidation {
+		// Every replica drops its resolver cache the moment a pack version, deployment, signing key or rollout changes (migration 000025).
+		go pgStore.ListenResolverChanges(consumerCtx, func(payload string) {
+			pushResolver.Invalidate()
+			log.Debug("resolver cache dropped", zap.String("change", payload))
+		})
+		log.Info("resolver push invalidation enabled (Postgres LISTEN/NOTIFY)")
+	} else if pushResolver != nil {
+		log.Warn("resolver push invalidation disabled: a withdrawal or block reaches a replica only when its cache expires or its invalidate endpoint is called")
+	}
 	if len(cfg.Kafka.Brokers) == 0 || cfg.Kafka.EntityTopic == "" {
 		log.Warn("entity consumer disabled (no KAFKA_BROKERS or KAFKA_ENTITY_TOPIC): entity jurisdiction mappings will not be projected")
 	} else {
@@ -380,4 +393,18 @@ func correlationIDMiddleware(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// supportGate is the opt-in "serve only LAUNCHED jurisdictions" gate (RESOLVER_REQUIRE_LAUNCHED). Nil when off.
+func supportGate(on bool, st *store.PgStore) resolver.SupportGate {
+	if !on {
+		return nil
+	}
+	return func(ctx context.Context, jurisdiction string) (resolver.SupportAnswer, error) {
+		v, err := st.JurisdictionSupport(ctx, jurisdiction)
+		if err != nil {
+			return resolver.SupportAnswer{}, err
+		}
+		return resolver.SupportAnswer{Supported: v.Supported, Outcome: v.Outcome}, nil
+	}
 }

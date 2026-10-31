@@ -167,7 +167,7 @@ func (p RuleParameters) validateMapping() error {
 // ParameterOnlyFamily reports families that carry values for a consumer to use
 // and are never calculated with.
 func ParameterOnlyFamily(f string) bool {
-	return f == FamilyAmount || f == FamilyRetention || f == FamilyMapping || f == FamilyEInvoiceProfile || f == FamilyFilingProfile
+	return f == FamilyAmount || f == FamilyRetention || f == FamilyMapping || f == FamilyEInvoiceProfile || f == FamilyFilingProfile || registrationFamily(f)
 }
 
 // PinnedParameterValue is the human-checkable value a golden case must state for
@@ -189,6 +189,8 @@ func PinnedParameterValue(p RuleParameters) string {
 		if p.Profile != nil {
 			return p.Profile.ProfileVersion
 		}
+	case FamilyLicenceType, FamilyScheme, FamilyThresholdMonitor:
+		return pinnedRegistrationValue(p)
 	}
 	return ""
 }
@@ -282,7 +284,7 @@ func LookupMapping(p RuleParameters, from string) MappingResult {
 // isoDurationRe matches the retention durations Duration.ISO produces (P6Y, P1Y6M, P90D).
 var isoDurationRe = regexp.MustCompile(`^P([0-9]{1,3}Y)?([0-9]{1,2}M)?([0-9]{1,3}D)?$`)
 
-var reservedDomains = []string{RetentionDomain, MappingDomain, EInvoiceDomain, FilingDomain}
+var reservedDomains = []string{RetentionDomain, MappingDomain, EInvoiceDomain, FilingDomain, RegistrationTypeDomain, LicenceTypeDomain, SchemeDomain, ThresholdDomain}
 
 // ReservedDomain reports rule domains that hold only one parameter family.
 func ReservedDomain(d string) bool { return inList(reservedDomains, d) }
@@ -299,6 +301,14 @@ func FamilyDomain(family string) string {
 		return EInvoiceDomain
 	case FamilyFilingProfile:
 		return FilingDomain
+	case FamilyRegistrationType:
+		return RegistrationTypeDomain
+	case FamilyLicenceType:
+		return LicenceTypeDomain
+	case FamilyScheme:
+		return SchemeDomain
+	case FamilyThresholdMonitor:
+		return ThresholdDomain
 	}
 	return ""
 }

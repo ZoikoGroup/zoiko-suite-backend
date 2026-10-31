@@ -347,6 +347,7 @@ func TestDueDate_FromAReleasedPack_IsDerivedExplainedAndRecorded(t *testing.T) {
 	assert.NotEmpty(t, pack["certification_id"])
 	assert.Len(t, c["sources"], 1)
 	id := r["decision_id"].(string)
+	assert.Equal(t, 1, s.e.pub.count(events.EventObligationDueDated))
 
 	// Evidence: the exact pack release and obligation rule are on the ledger, and immutable.
 	var kind, artDigest, ruleID string

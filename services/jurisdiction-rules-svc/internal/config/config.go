@@ -85,6 +85,15 @@ type Config struct {
 	// production or staging then requires a ring and a region.
 	ResolverEnabled bool
 
+	// ResolverRequireLaunched makes the resolver serve only jurisdictions whose rollout is LAUNCHED with a
+	// released pack (Wave 8). OFF by default: turning it on changes what existing callers get.
+	ResolverRequireLaunched bool
+
+	// ResolverPushInvalidation makes every replica drop its resolver cache the moment a pack version, deployment, signing key or rollout changes
+	// (Postgres LISTEN/NOTIFY, migration 000025), instead of waiting for the cache TTL. On by default; set false when the database is reached
+	// through a pooler that cannot carry LISTEN (PgBouncer transaction mode).
+	ResolverPushInvalidation bool
+
 	// HotfixRetroSLAHours is how long a hotfix retrospective may stay open
 	// before it is reported overdue (s24 leaves the SLA to a controlled
 	// decision; default 120).
@@ -164,6 +173,8 @@ func Load() (*Config, error) {
 		ResolverEligibleStatuses: envList("RESOLVER_ELIGIBLE_STATUSES", []string{"RELEASED"}),
 		ResolverCacheTTLSeconds:  envInt("RESOLVER_CACHE_TTL_SECONDS", 30),
 		ResolverEnabled:          env("RESOLVER_ENABLED", "false") == "true",
+		ResolverRequireLaunched:  env("RESOLVER_REQUIRE_LAUNCHED", "false") == "true",
+		ResolverPushInvalidation: env("RESOLVER_PUSH_INVALIDATION", "true") != "false",
 		ResolverRing:             env("RESOLVER_RING", ""),
 		ResolverRegion:           env("RESOLVER_REGION", ""),
 		HotfixRetroSLAHours:      envInt("HOTFIX_RETRO_SLA_HOURS", 120),
