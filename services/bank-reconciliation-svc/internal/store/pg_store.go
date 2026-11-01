@@ -319,12 +319,22 @@ func (s *PgStore) ListStatementLines(ctx context.Context, filter domain.ListStat
 	if filter.TenantID == "" {
 		return nil, domain.ErrTenantScopeMissing
 	}
+	if len(filter.JournalIDs) > domain.MaxJournalLookupIDs {
+		return nil, domain.ErrTooManyJournalIDs
+	}
 	limit := filter.Limit
 	if limit <= 0 {
 		limit = domain.DefaultListLimit
 	}
 	if limit > domain.MaxListLimit {
 		limit = domain.MaxListLimit
+	}
+	// nil, not an empty slice, so the SQL's "$6::uuid[] IS NULL" skips the
+	// journal filter entirely for every caller that does not use it — the
+	// overwhelmingly common case.
+	var journalIDs []string
+	if len(filter.JournalIDs) > 0 {
+		journalIDs = filter.JournalIDs
 	}
 
 	out := make([]domain.StatementLine, 0)
@@ -335,21 +345,47 @@ func (s *PgStore) ListStatementLines(ctx context.Context, filter domain.ListStat
 			  AND ($2 = '' OR bank_account_id::text = $2)
 			  AND ($3 = '' OR statement_date = $3::date)
 			  AND ($4 = '' OR status = $4)
+			  AND (
+			    $6::uuid[] IS NULL
+			    OR matched_journal_id = ANY($6)
+			    OR proposed_journal_id = ANY($6)
+			    OR EXISTS (
+			      SELECT 1 FROM statement_line_matched_journals smj
+			      WHERE smj.statement_line_id = statement_lines.statement_line_id
+			        AND smj.journal_id = ANY($6)
+			    )
+			  )
 			ORDER BY created_at DESC
 			LIMIT $5
-		`, filter.TenantID, filter.BankAccountID, filter.StatementDate, filter.Status, limit)
+		`, filter.TenantID, filter.BankAccountID, filter.StatementDate, filter.Status, limit, journalIDs)
 		if err != nil {
 			return err
 		}
 		defer rows.Close()
+		var lines []domain.StatementLine
 		for rows.Next() {
 			var l domain.StatementLine
 			if err := scanLine(rows, &l); err != nil {
 				return err
 			}
-			out = append(out, l)
+			lines = append(lines, l)
 		}
-		return rows.Err()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		// Only the journal-lookup path needs the many-to-one allocation: an
+		// ordinary list (filter.JournalIDs empty, the common case) stays one
+		// query, and a line's scalar matched_journal_id/proposed_journal_id
+		// already answers the single-journal case.
+		if len(filter.JournalIDs) > 0 {
+			for i := range lines {
+				if err := attachMatchedJournalIDs(ctx, tx, &lines[i]); err != nil {
+					return err
+				}
+			}
+		}
+		out = append(out, lines...)
+		return nil
 	})
 	if err != nil {
 		return nil, mapPgError(err)

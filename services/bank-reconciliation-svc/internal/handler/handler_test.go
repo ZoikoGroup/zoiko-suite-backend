@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 
 	"zoiko.io/bank-reconciliation-svc/internal/close"
@@ -895,6 +896,51 @@ func TestListStatementLines_RequiresVerifiedTenantScope(t *testing.T) {
 	rec := doRequestAs(r, http.MethodGet, "/v1/statement-lines/", nil, "", "")
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 with no verified tenant scope, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// ?journal_ids is A2b part 3's lookup-by-journal-id capability: a caller
+// (reconciliation-intelligence-svc) asks "has any of these journals already
+// been claimed" without naming a bank account, date or status.
+func TestListStatementLines_JournalIDsFilter_WiresDistinctValidIDs(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubLedger{})
+	j1, j2 := uuid.NewString(), uuid.NewString()
+	rec := doRequest(r, http.MethodGet, "/v1/statement-lines/?journal_ids="+j1+","+j2, nil, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(s.lastListFilter.JournalIDs) != 2 || s.lastListFilter.JournalIDs[0] != j1 || s.lastListFilter.JournalIDs[1] != j2 {
+		t.Fatalf("expected JournalIDs [%s %s], got %v", j1, j2, s.lastListFilter.JournalIDs)
+	}
+}
+
+func TestListStatementLines_JournalIDsFilter_RefusesMalformedOrDuplicateIDs(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubLedger{})
+	j1 := uuid.NewString()
+	for name, raw := range map[string]string{
+		"not a uuid":  "not-a-journal-id",
+		"empty entry": j1 + ",",
+		"duplicate":   j1 + "," + j1,
+	} {
+		t.Run(name, func(t *testing.T) {
+			rec := doRequest(r, http.MethodGet, "/v1/statement-lines/?journal_ids="+raw, nil, "")
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400, got %d: %s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestListStatementLines_NoJournalIDsParam_LeavesFilterNil(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubLedger{})
+	rec := doRequest(r, http.MethodGet, "/v1/statement-lines/", nil, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if s.lastListFilter.JournalIDs != nil {
+		t.Fatalf("expected a nil JournalIDs filter, got %v", s.lastListFilter.JournalIDs)
 	}
 }
 

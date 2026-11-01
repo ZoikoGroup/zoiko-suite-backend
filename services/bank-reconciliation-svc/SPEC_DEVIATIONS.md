@@ -217,6 +217,31 @@ unchanged by this fix.
       on real Postgres (round trip, the append-only trigger refusing
       UPDATE/DELETE once MATCHED, and the down migration refusing while a
       CONFIRMED allocation exists and succeeding once none does).
+  - *Lookup-by-journal-id — added 2026-11-01*, for
+    reconciliation-intelligence-svc's A2b part 3 ("already-matched journals
+    still counted as candidates"): `GET /v1/statement-lines` now also takes
+    `journal_ids` (comma-separated, up to `MaxJournalLookupIDs`, 200). It
+    ANDs with the existing `bank_account_id`/`statement_date`/`status`
+    filters exactly like they AND with each other; the expected caller sends
+    it alone. A line matches when one of the given ids is its scalar
+    `matched_journal_id`/`proposed_journal_id`, or is recorded against it in
+    `statement_line_matched_journals` (the many-to-one path above) — and when
+    matched that way, the response also carries `matched_journal_ids`/
+    `proposed_journal_ids` (via `attachMatchedJournalIDs`, otherwise only
+    populated by `GetStatementLine`) so the caller can see every journal the
+    line claims, not just the one it asked about. This service is the only
+    one that knows a journal has already been claimed, because the claim is
+    recorded here, not on the journal itself; bank-reconciliation-svc's own
+    propose/confirm verification remains the authoritative check regardless
+    of what this lookup reports. *Tests:* `internal/handler/handler_test.go`
+    (`TestListStatementLines_JournalIDsFilter_*`: distinct valid ids wired
+    through, malformed/duplicate/empty ids refused 400, no param leaves the
+    filter nil); `internal/store/journal_lookup_pg_smoke_test.go` on real
+    Postgres (scalar matched, scalar proposed, a multi-journal allocation
+    found by either of its two journal ids with both returned, no match is
+    `[]` not an error, the filter combines with an existing status filter
+    rather than overriding it, and more than `MaxJournalLookupIDs` ids is
+    refused with `ErrTooManyJournalIDs`).
   - no partial-match amount or residual;
   - no match identity to retrieve (`GetMatch` is absent, A4);
   - no group-level evidence or approval;

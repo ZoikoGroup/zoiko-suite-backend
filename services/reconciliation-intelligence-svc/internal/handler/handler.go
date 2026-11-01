@@ -184,6 +184,13 @@ func (h *Handler) AnalyzeReconciliation(w http.ResponseWriter, r *http.Request) 
 		h.writeLedgerErr(w, err)
 		return
 	}
+	// A2b part 3: ask bank-reconciliation-svc which of the journals just read
+	// are already somebody's matched or proposed counterpart, before any of
+	// them can be proposed again for a different line.
+	if err := h.markAlreadyMatchedJournals(r.Context(), scope, search); err != nil {
+		h.writeBankRecErr(w, err)
+		return
+	}
 	// A line no journal matches is searched for a banking-connector-svc
 	// canonical transaction instead (A2b) — read only when some line needs
 	// it, and then required: an unread account is never "no candidate".
@@ -461,6 +468,34 @@ func (h *Handler) readCandidates(ctx context.Context, scope ledger.Scope, lines 
 		search.EntriesByAccount[l.GLCashAccountCode] = append(search.EntriesByAccount[l.GLCashAccountCode], entries...)
 	}
 	return search, nil
+}
+
+// markAlreadyMatchedJournals is A2b part 3: it collects every distinct
+// journal id the ledger read just returned and asks bank-reconciliation-svc
+// which of them are already somebody's matched or pending-confirmation
+// counterpart, so the search never proposes one of them again for a
+// different line. A run with no ledger entries at all (every line
+// NO_CASH_ACCOUNT, say) makes no call.
+func (h *Handler) markAlreadyMatchedJournals(ctx context.Context, scope bankrec.Scope, search *domain.CandidateSearch) error {
+	seen := map[string]bool{}
+	var ids []string
+	for _, entries := range search.EntriesByAccount {
+		for _, e := range entries {
+			if !seen[e.JournalID] {
+				seen[e.JournalID] = true
+				ids = append(ids, e.JournalID)
+			}
+		}
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	claimed, err := h.bankRec.LookupClaimedJournalIDs(ctx, scope, ids)
+	if err != nil {
+		return err
+	}
+	search.AlreadyMatchedJournalIDs = claimed
+	return nil
 }
 
 // readCanonicalCandidates reads, for each distinct (bank account, currency,

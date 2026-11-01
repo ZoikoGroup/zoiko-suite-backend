@@ -29,9 +29,11 @@ this pass (B1, B2); a later pass closed A7 and the decimal half of A4; a
 third closed A1, A3 and A6; a fourth closed A8 and A9; a fifth closed A5; a
 sixth closed A2a; a seventh closed A2b part 1; an eighth closed A2b part 4
 (general-ledger-svc's QueryLedger keyset cursor, A15, and this service's
-internal/ledger client following it); the latest closes A2b part 2
+internal/ledger client following it); a ninth closed A2b part 2
 (two-journal matches, requiring bank-reconciliation-svc's own A2 to gain
-many-to-one support first).
+many-to-one support first); the latest closes A2b part 3 (2026-11-01),
+requiring bank-reconciliation-svc to gain a lookup-by-journal-id capability
+first — A2b is now closed in full.
 
 ## A. Not implemented / weaker than the spec
 
@@ -223,7 +225,7 @@ many-to-one support first).
 - **A2b. No candidate match against a banking-connector-svc canonical
   transaction, and the ledger search has known limits** (part 1 closed
   2026-10-28; part 4 closed 2026-10-30; part 2 closed 2026-11-01; part 3
-  open).
+  closed 2026-11-01 — A2b is now closed in full).
   1. *The canonical side* (closed 2026-10-28). banking-connector-svc serves
      BNK-04 `ListTransactions` (`GET /v1/banking/canonical-transactions`, its
      A20).
@@ -381,11 +383,58 @@ many-to-one support first).
        array length — and the down migration refusing while a result
        exists, succeeding once none does). bank-reconciliation-svc's own
        side is tested separately — see its SPEC_DEVIATIONS.md A2.
-  3. *Already-matched journals.* A journal already matched to another line
-     in an earlier run is still a candidate. bank-reconciliation-svc offers
-     no lookup by journal id, so this service cannot exclude it;
-     bank-reconciliation-svc's confirm step is where a double match would
-     have to be refused.
+  3. *Already-matched journals — closed 2026-11-01.* bank-reconciliation-svc
+     now offers the lookup this service needed: `GET /v1/statement-lines`
+     takes `journal_ids` (ANDs with its existing filters, exactly like
+     `bank_account_id`/`statement_date`/`status`; the expected caller sends
+     it alone) and returns every line, any status, that names one of the
+     given ids as its matched or proposed counterpart — scalar or, since A2b
+     part 2, recorded in `statement_line_matched_journals`. It is the only
+     service that knows a journal is claimed, because the claim is recorded
+     there, not on the journal itself.
+     (`services/bank-reconciliation-svc/internal/store/pg_store.go`'s
+     `ListStatementLines`, `internal/domain/types.go`'s
+     `ListStatementLinesFilter.JournalIDs`/`MaxJournalLookupIDs` (200),
+     `internal/handler/handler.go`'s `parseJournalIDsParam`.)
+
+     This service's `internal/bankrec.Client.LookupClaimedJournalIDs` calls
+     it once per candidate search, batched at 200 ids, after the ledger read
+     and before the journal/pair search run: every distinct journal id the
+     ledger returned is checked in one pass, not one call per line. A
+     claimed id is excluded from `searchCandidates` (the single-journal
+     search) and from `searchJournalPairs`'s pool (A2b part 2) alike — it
+     can never be proposed alone or as half of a pair. The lookup fails
+     CLOSED like every other upstream read here: a failed batch fails the
+     whole analyze call (502), never a partially-checked result. A journal
+     absent from the claimed set is simply unclaimed as of this read, not
+     guaranteed available — bank-reconciliation-svc's own verification at
+     propose/confirm time remains the real, authoritative check; this only
+     stops the suggestion from being produced in the first place.
+
+     *Tests:* bank-reconciliation-svc —
+     `internal/handler/handler_test.go` (`TestListStatementLines_JournalIDsFilter_*`:
+     distinct valid ids wired through, malformed/duplicate/empty ids
+     refused 400, no param leaves the filter nil);
+     `internal/store/journal_lookup_pg_smoke_test.go` on real Postgres
+     (scalar matched, scalar proposed, a multi-journal allocation found by
+     either of its two journal ids with both returned via
+     `ProposedJournalIDs`, no match is `[]` not an error, the filter ANDs
+     with an existing status filter rather than overriding it, and more
+     than `MaxJournalLookupIDs` ids is refused).
+     This service — `internal/bankrec/client_test.go`
+     (`TestLookupClaimedJournalIDs_*`: empty input makes no call, scalar and
+     array ids are all extracted including one the caller never asked
+     about, more than 200 ids are batched into separate requests, and a
+     failed batch fails the whole lookup);
+     `internal/domain/already_matched_journal_test.go` (a claimed journal is
+     excluded from the single-journal search, excluding it leaves a
+     genuinely unclaimed candidate usable, a claimed journal is excluded
+     from the pair pool entirely, and a nil map — every caller that predates
+     this change — excludes nothing);
+     `internal/handler/already_matched_journal_test.go` through the real
+     analyze route with a fake bank-reconciliation-svc that answers
+     `journal_ids` (`TestAnalyze_AlreadyMatchedJournal_IsExcludedFromProposal`,
+     `TestAnalyze_UnclaimedJournal_IsStillProposed`).
   4. *No paging — closed 2026-10-30.* general-ledger-svc's A15 added a
      keyset cursor to `QueryLedger` (`after_entry_seq` in,
      `{"entries": [...], "next_cursor": ...}` out, replacing the old bare
@@ -410,8 +459,8 @@ many-to-one support first).
      (`internal/handler/fakes_test.go`'s `newFakeLedgerServer`).
      *At the time:* parts 2 and 3 below were unaffected by this — paging
      finds every row in the window, but a multi-journal payment or an
-     already-matched journal was still not specially handled. Part 2 is now
-     closed (2026-11-01, below); part 3 remains open.
+     already-matched journal was still not specially handled. Both are now
+     closed (2026-11-01, above).
 - **A3. One-directional** (closed — the framing no longer applies). Only side
   A was walked: a side-B item with no side-A counterpart was never reported,
   and `total_processed_count` and the rate counted side A only. Since A1 there

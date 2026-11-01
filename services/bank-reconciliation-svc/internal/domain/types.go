@@ -223,6 +223,18 @@ type ListStatementLinesFilter struct {
 	BankAccountID string
 	StatementDate string
 	Status        string
+	// JournalIDs, when non-empty, ANDs with BankAccountID/StatementDate/Status
+	// exactly like every other field here, and additionally requires the line
+	// to name one of these general-ledger-svc journal ids as its matched or
+	// proposed counterpart — scalar (single-journal match) or recorded in
+	// statement_line_matched_journals (the many-to-one match path, A2b part
+	// 2). The expected caller asks with JournalIDs alone. This is the
+	// lookup-by-journal-id capability reconciliation-intelligence-svc's A2b
+	// part 3 needs to stop proposing a journal that is already somebody
+	// else's match or pending proposal: this service is the only one that
+	// knows a journal has been claimed, because the claim is recorded here,
+	// not on the journal itself.
+	JournalIDs []string
 	// Limit bounds the page. The register grows by one row per bank
 	// transaction, so an unbounded read is a full statement history in one
 	// response — and it was the default.
@@ -234,6 +246,12 @@ const (
 	DefaultListLimit = 200
 	MaxListLimit     = 1000
 )
+
+// MaxJournalLookupIDs bounds ListStatementLinesFilter.JournalIDs. Each id
+// costs one entry in the query's array-membership test; a caller with more
+// candidate journals than this must page the lookup in batches rather than
+// send one unbounded array.
+const MaxJournalLookupIDs = 200
 
 // MaxMatchJournals bounds journal_ids (A2b part 2's many-to-one match
 // path): each id costs one general-ledger-svc round trip to verify, so an
@@ -330,6 +348,11 @@ var (
 	// MaxMatchJournals — A2b part 2's many-to-one path is for a specific,
 	// bounded split, not an open-ended search.
 	ErrInvalidJournalIDs = errorString("journal_ids must name between 2 and 10 distinct journal ids")
+
+	// ErrTooManyJournalIDs is returned when ListStatementLinesFilter.JournalIDs
+	// names more than MaxJournalLookupIDs — a caller with more candidates must
+	// page the lookup in batches.
+	ErrTooManyJournalIDs = errorString("journal_ids lookup names more than the maximum allowed journal ids")
 
 	// EvidenceConflict errors.
 	ErrConflictNotFound        = errorString("evidence conflict not found")

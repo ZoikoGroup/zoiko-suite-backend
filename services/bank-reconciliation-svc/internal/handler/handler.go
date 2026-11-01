@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -255,6 +256,15 @@ func (h *Handler) GetStatementLine(w http.ResponseWriter, r *http.Request) {
 // register. Reads are not separately authorized (the tenant scope is the
 // boundary), matching general-ledger-svc, whose register this one reconciles
 // against.
+//
+// ?journal_ids=<comma-separated general-ledger-svc journal ids> is the
+// lookup-by-journal-id capability reconciliation-intelligence-svc's A2b part
+// 3 needs: this service is the only one that knows a journal is already
+// somebody's matched or proposed counterpart, because the claim is recorded
+// here. It ANDs with bank_account_id/statement_date/status exactly like
+// every other filter here; the expected caller asks with journal_ids alone,
+// so it answers across every status, account and date that names one of the
+// given ids, scalar or many-to-one (A2b part 2).
 func (h *Handler) ListStatementLines(w http.ResponseWriter, r *http.Request) {
 	tenantID, ok := h.requireTenant(w, r)
 	if !ok {
@@ -266,11 +276,17 @@ func (h *Handler) ListStatementLines(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_field", err.Error())
 		return
 	}
+	journalIDs, err := parseJournalIDsParam(q.Get("journal_ids"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_field", err.Error())
+		return
+	}
 	filter := domain.ListStatementLinesFilter{
 		TenantID:      tenantID,
 		BankAccountID: q.Get("bank_account_id"),
 		StatementDate: q.Get("statement_date"),
 		Status:        q.Get("status"),
+		JournalIDs:    journalIDs,
 		Limit:         limit,
 	}
 	list, err := h.store.ListStatementLines(r.Context(), filter)
@@ -279,6 +295,38 @@ func (h *Handler) ListStatementLines(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, list)
+}
+
+// parseJournalIDsParam splits a comma-separated ?journal_ids= value into
+// distinct, valid, non-empty UUIDs. An empty input is not an error: it
+// answers nil, the "no journal filter" case. A malformed or duplicate id is
+// refused rather than silently dropped or deduplicated, so a caller sees a
+// mistake in its own request instead of a quietly shorter answer.
+func parseJournalIDsParam(raw string) ([]string, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	parts := strings.Split(raw, ",")
+	if len(parts) > domain.MaxJournalLookupIDs {
+		return nil, fmt.Errorf("journal_ids names more than %d ids", domain.MaxJournalLookupIDs)
+	}
+	seen := make(map[string]bool, len(parts))
+	ids := make([]string, 0, len(parts))
+	for _, p := range parts {
+		id := strings.TrimSpace(p)
+		if id == "" {
+			return nil, errors.New("journal_ids contains an empty id")
+		}
+		if _, err := uuid.Parse(id); err != nil {
+			return nil, fmt.Errorf("journal_ids contains an invalid id %q", id)
+		}
+		if seen[id] {
+			return nil, fmt.Errorf("journal_ids contains duplicate id %q", id)
+		}
+		seen[id] = true
+		ids = append(ids, id)
+	}
+	return ids, nil
 }
 
 // ── POST /v1/statement-lines/{statement_line_id}/match ───────────────────────

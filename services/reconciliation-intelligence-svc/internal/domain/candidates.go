@@ -115,6 +115,18 @@ type CandidateSearch struct {
 	HorizonDays               int
 	EntriesByAccount          map[string][]LedgerEntry
 	TransactionsByBankAccount map[string][]CanonicalTransaction
+
+	// AlreadyMatchedJournalIDs is A2b part 3: journals bank-reconciliation-svc
+	// reports as already somebody's matched or pending-confirmation
+	// counterpart, read from its journal_ids lookup before the search runs.
+	// A journal in this set is disqualified exactly like one with entries
+	// outside the line's scope — never proposed again, whether alone or as
+	// half of an A2b part 2 pair — because bank-reconciliation-svc's own
+	// confirm step would refuse the double claim anyway; this only stops the
+	// suggestion from being produced in the first place. A nil map (the
+	// zero value) disqualifies nothing, so every existing caller that never
+	// sets this field keeps its old behavior.
+	AlreadyMatchedJournalIDs map[string]bool
 }
 
 // candidateJournal is one journal's net movement on a line's cash account.
@@ -211,6 +223,12 @@ func searchCandidates(lines []BankStatementLine, amounts []*big.Rat, searched ma
 			if !a.hasEntries || a.wrongScope || a.mixedDates || a.net.Cmp(amounts[i]) != 0 {
 				continue
 			}
+			// A2b part 3: a journal bank-reconciliation-svc already reports as
+			// matched or proposed elsewhere is not this line's book side
+			// either — it is somebody else's.
+			if search.AlreadyMatchedJournalIDs[journalID] {
+				continue
+			}
 			d, err := time.Parse(dateLayout, a.date)
 			if err != nil {
 				return nil, fmt.Errorf("journal %s: transaction date %q: %w", journalID, a.date, err)
@@ -299,6 +317,11 @@ func searchJournalPairs(byJournal map[string]*journalAccount, amount *big.Rat, s
 	var pool []eligible
 	for journalID, a := range byJournal {
 		if !a.hasEntries || a.wrongScope || a.mixedDates {
+			continue
+		}
+		// A2b part 3: excluded from the pool entirely, so it can never be
+		// half of a proposed pair either.
+		if search.AlreadyMatchedJournalIDs[journalID] {
 			continue
 		}
 		d, err := time.Parse(dateLayout, a.date)
