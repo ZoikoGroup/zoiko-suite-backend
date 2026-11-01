@@ -81,6 +81,37 @@ func TestQueryLedger_CursorSignalsTruncationAndPagesForward(t *testing.T) {
 	}
 }
 
+// A15: debit_amount/credit_amount are exact decimal strings on the wire,
+// never a bare JSON number — a float64-shaped amount above 2^53 minor
+// units would silently lose precision the instant a Go float64 decoded it,
+// exactly the defect class this closes (same rule LedgerBalance already
+// has). Decoding into json.RawMessage proves the wire token itself is a
+// quoted string, not merely that some Go string field happens to hold it.
+func TestQueryLedger_AmountsAreExactDecimalStringsOnTheWire(t *testing.T) {
+	s := newStubStore()
+	entityA := "entity-a"
+	s.ledgerEntries = []domain.LedgerEntry{
+		{LedgerEntryID: "e1", LegalEntityID: entityA, EntrySeq: 1, DebitAmount: "90071992547409.93", CreditAmount: "0"},
+	}
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	resp := doRequest(r, http.MethodGet, "/v1/ledger/entries?legal_entity_id="+entityA, nil, "reader-1")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", resp.Code, resp.Body.String())
+	}
+	var raw struct {
+		Entries []map[string]json.RawMessage `json:"entries"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(raw.Entries) != 1 {
+		t.Fatalf("expected one entry, got %d", len(raw.Entries))
+	}
+	if got := string(raw.Entries[0]["debit_amount"]); got != `"90071992547409.93"` {
+		t.Fatalf("expected debit_amount to be the quoted exact decimal string %q, got %s", "90071992547409.93", got)
+	}
+}
+
 func TestQueryLedger_MalformedCursor_Returns400(t *testing.T) {
 	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
 	for _, cursor := range []string{"not-a-number", "-1"} {

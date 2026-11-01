@@ -813,6 +813,15 @@ type CreateReversalPostingRequest struct {
 // migration 000011's doc comment and its append-only trigger). Never
 // constructed directly by a handler; only PgStore.appendLedgerEntries,
 // called from inside TransitionJournal's own transaction, ever inserts one.
+//
+// DebitAmount/CreditAmount are exact decimal strings, never float64
+// (ZS-DATA-001 D06, the same rule LedgerBalance's own doc comment already
+// explains for this package — A15). The underlying ledger_entries columns
+// are NUMERIC; scanning them into float64 silently lost exactness above
+// about 2^53 minor units. reconciliation-intelligence-svc's client already
+// decodes these as json.Number and parses them exactly — encoding/json
+// accepts a quoted numeric string into a json.Number field exactly as it
+// accepts a bare number, so this is not a breaking change for that caller.
 type LedgerEntry struct {
 	LedgerEntryID   string     `json:"ledger_entry_id"`
 	TenantID        string     `json:"tenant_id"`
@@ -823,8 +832,8 @@ type LedgerEntry struct {
 	JournalLineID   string     `json:"journal_line_id"`
 	LineNumber      int        `json:"line_number"`
 	AccountCode     string     `json:"account_code"`
-	DebitAmount     float64    `json:"debit_amount"`
-	CreditAmount    float64    `json:"credit_amount"`
+	DebitAmount     string     `json:"debit_amount"`
+	CreditAmount    string     `json:"credit_amount"`
 	CurrencyCode    string     `json:"currency_code"`
 	Dimensions      Dimensions `json:"dimensions,omitempty"`
 	TransactionDate Date       `json:"transaction_date"`

@@ -65,6 +65,22 @@ func TestListCashAccountEntries_ExactAmountsAndEnvelope(t *testing.T) {
 	}
 }
 
+// A15: general-ledger-svc's LedgerEntry.debit_amount/credit_amount are now
+// exact decimal strings on the wire, not bare JSON numbers. json.Number
+// accepts a quoted numeric string exactly as it accepts a bare number, so
+// this client needs no change for the new wire shape — this pins that down
+// against a future encoding/json behavior change or client refactor.
+func TestListCashAccountEntries_AcceptsQuotedDecimalStringAmount(t *testing.T) {
+	c := serve(t, http.StatusOK, page("null", entry("t-1", "le-1", "1000", "2026-07-02", `"125.50"`)), nil)
+	got, err := c.ListCashAccountEntries(context.Background(), scope, "1000", "2026-06-01", "2026-08-01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Debit.Cmp(big.NewRat(251, 2)) != 0 {
+		t.Fatalf("expected the quoted decimal string parsed exactly as 125.50, got %+v", got)
+	}
+}
+
 // Every row is checked against what was asked for; anything else fails the
 // whole read closed rather than becoming a proposal.
 func TestListCashAccountEntries_OutOfScopeRowFailsClosed(t *testing.T) {
