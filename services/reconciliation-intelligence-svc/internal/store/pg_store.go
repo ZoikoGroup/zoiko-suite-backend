@@ -142,11 +142,11 @@ func (s *PgStore) CreateJob(ctx context.Context, tenantID string, job *domain.Re
 			recommendation, suggestion_status, resolution_notes, created_at, updated_at,
 			bank_reconciliation_run_id, statement_line_id, counterpart_statement_line_id,
 			counterpart_journal_id, candidate_search_outcome, date_tolerance_version,
-			counterpart_transaction_id
+			counterpart_transaction_id, counterpart_journal_ids
 		) VALUES ($1, $2, $3, $4, $5, $6, $7::numeric, $8::numeric, $9::numeric, $10, $11, $12, $13, $14, $15, $16, $17, $18,
 			NULLIF($19, '')::uuid, NULLIF($20, '')::uuid, NULLIF($21, '')::uuid,
 			NULLIF($22, '')::uuid, NULLIF($23, ''), NULLIF($24, 0),
-			NULLIF($25, '')::uuid)`
+			NULLIF($25, '')::uuid, $26::uuid[])`
 
 	for i := range items {
 		item := &items[i]
@@ -158,6 +158,10 @@ func (s *PgStore) CreateJob(ctx context.Context, tenantID string, job *domain.Re
 		item.CreatedAt = time.Now()
 		item.UpdatedAt = time.Now()
 
+		var journalIDs any
+		if len(item.CounterpartJournalIDs) > 0 {
+			journalIDs = item.CounterpartJournalIDs
+		}
 		_, err := tx.Exec(ctx, queryItem,
 			item.ID, tenantID, item.LegalEntityID, job.ID, item.SourceRecordA, item.SourceRecordB, item.AmountA, item.AmountB,
 			item.DiscrepancyAmount, string(item.DiscrepancyType), item.ConfidenceScore,
@@ -165,7 +169,7 @@ func (s *PgStore) CreateJob(ctx context.Context, tenantID string, job *domain.Re
 			string(item.SuggestionStatus), item.ResolutionNotes, item.CreatedAt, item.UpdatedAt,
 			item.BankReconciliationRunID, item.StatementLineID, item.CounterpartStatementLineID,
 			item.CounterpartJournalID, string(item.CandidateSearchOutcome), item.DateToleranceVersion,
-			item.CounterpartTransactionID,
+			item.CounterpartTransactionID, journalIDs,
 		)
 		if err != nil {
 			return fmt.Errorf("insert reconciliation_unmatched_item failed: %w", err)
@@ -260,7 +264,7 @@ const itemColumns = `id, tenant_id, legal_entity_id, job_id, source_record_a, so
 	COALESCE(counterpart_statement_line_id::text, ''),
 	COALESCE(authoritative_ref_kind, ''), COALESCE(authoritative_ref_id::text, ''),
 	COALESCE(counterpart_journal_id::text, ''), COALESCE(candidate_search_outcome, ''), COALESCE(date_tolerance_version, 0),
-	COALESCE(counterpart_transaction_id::text, '')`
+	COALESCE(counterpart_transaction_id::text, ''), counterpart_journal_ids`
 
 func scanJob(row pgx.Row, j *domain.ReconciliationJob) error {
 	return row.Scan(
@@ -280,7 +284,7 @@ func scanItem(row pgx.Row, item *domain.ReconciliationSuggestion) error {
 		&item.BankReconciliationRunID, &item.StatementLineID, &item.CounterpartStatementLineID,
 		&refKind, &refID,
 		&item.CounterpartJournalID, &item.CandidateSearchOutcome, &item.DateToleranceVersion,
-		&item.CounterpartTransactionID,
+		&item.CounterpartTransactionID, &item.CounterpartJournalIDs,
 	); err != nil {
 		return err
 	}

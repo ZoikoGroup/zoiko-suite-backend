@@ -27,9 +27,11 @@ general-ledger-svc journal, as an advisory AUTO_MATCH or DATE_SKEW (A2a,
 canonical transaction (A2b part 1, 2026-10-28). Two defects were fixed in
 this pass (B1, B2); a later pass closed A7 and the decimal half of A4; a
 third closed A1, A3 and A6; a fourth closed A8 and A9; a fifth closed A5; a
-sixth closed A2a; a seventh closed A2b part 1; the latest closes A2b part 4
+sixth closed A2a; a seventh closed A2b part 1; an eighth closed A2b part 4
 (general-ledger-svc's QueryLedger keyset cursor, A15, and this service's
-internal/ledger client following it).
+internal/ledger client following it); the latest closes A2b part 2
+(two-journal matches, requiring bank-reconciliation-svc's own A2 to gain
+many-to-one support first).
 
 ## A. Not implemented / weaker than the spec
 
@@ -220,7 +222,8 @@ internal/ledger client following it).
     while a result exists and succeeding once none does.
 - **A2b. No candidate match against a banking-connector-svc canonical
   transaction, and the ledger search has known limits** (part 1 closed
-  2026-10-28; part 4 closed 2026-10-30; parts 2–3 open).
+  2026-10-28; part 4 closed 2026-10-30; part 2 closed 2026-11-01; part 3
+  open).
   1. *The canonical side* (closed 2026-10-28). banking-connector-svc serves
      BNK-04 `ListTransactions` (`GET /v1/banking/canonical-transactions`, its
      A20).
@@ -301,9 +304,83 @@ internal/ledger client following it).
      exact parameters, no read when not needed, 503/422/502);
      `internal/store/candidate_transaction_test.go` on real Postgres (round
      trip, the CHECKs, the down migration).
-  2. *Multiple journals.* A journal is a candidate only if its own net
-     movement equals the line. One payment booked as two journals is not
-     found.
+  2. *Multiple journals — closed 2026-11-01.* A journal used to be a
+     candidate only if its own net movement equaled the line; one payment
+     booked as two journals was never found. Closing this for real required
+     a change in bank-reconciliation-svc first: its match model only ever
+     accepted one journal per line (`matched_journal_id` is a scalar
+     column), so detecting a qualifying pair here would have had nothing to
+     confirm it against. bank-reconciliation-svc's own A2 now records "no
+     many-to-one, one-to-many or split matches" as partially closed on the
+     journal path (migration 000015): `ProposeMatch`/`ConfirmMatch` accept
+     `journal_ids` (2 or more, currently capped at 10), verify each one
+     independently and their combined net together, and record the
+     allocation as explicit evidence — satisfying ZS-CONTROL-001 section
+     10's "many-to-one / one-to-many ... with explicit allocation", which
+     this service's own governing-document citations already name.
+     - **The search.** `domain.searchJournalPairs` tries every distinct
+       pair of journals on the line's cash account — bounded to exactly
+       two, the case the gap names, not an open-ended combination search —
+       but only when the existing single-journal search (including its
+       cross-line exclusivity pass) finds nothing at all. A single matching
+       journal is always preferred over a pair. Each journal in a
+       candidate pair must individually be real, correctly scoped and
+       single-dated (the same per-journal checks as the single-journal
+       search), and both must be within the search horizon; their combined
+       net, not either alone, must equal the line's signed amount exactly.
+     - **Outcomes.** Reused, as for A2a/A2b part 1: one qualifying pair
+       within the governed date tolerance (the later of the two journals'
+       days from the statement date decides) is `AUTO_MATCH`; one only
+       beyond it but inside the horizon is `DATE_SKEW`/`MANUAL_REVIEW`;
+       more than one qualifying pair, or a journal shared with another
+       line's single or paired candidate, is `AMBIGUOUS`; none is
+       `NO_CANDIDATE` (now meaning both single journals and pairs were
+       tried). New rule names:
+       `CANDIDATE_MULTI_JOURNAL_WITHIN_DATE_TOLERANCE`,
+       `CANDIDATE_MULTI_JOURNAL_DATE_SKEW`,
+       `CANDIDATE_MULTI_JOURNAL_AMBIGUOUS`.
+     - **Cross-line exclusivity.** Extended, not reimplemented: the same
+       `proposedBy` journal-id map used for single-journal exclusivity now
+       also registers both halves of an accepted pair, so a journal shared
+       between a pair and a single match (or two pairs) demotes every line
+       that claimed it to `AMBIGUOUS`, exactly as for two lines sharing one
+       single journal.
+     - **Confidence — a judgment call (B-style interpretation).** A
+       two-journal proposal is scored below its single-journal counterpart
+       at the same date outcome (80 vs. 90 for AUTO_MATCH, 55 vs. 65 for
+       DATE_SKEW): it depends on two records being exactly right, not one.
+       Not spec-mandated; a reviewer may want these raised, lowered, or
+       equalized.
+     - **Storage.** Migration 000010 adds `counterpart_journal_ids`
+       (`UUID[]`, exactly 2 elements when set) alongside the existing
+       `counterpart_journal_id`/`counterpart_transaction_id`, replacing
+       000009's counterpart CHECKs with a three-way version: exactly one of
+       the three counterpart shapes is named exactly when the outcome is
+       `WITHIN_DATE_TOLERANCE` or `DATE_SKEW`, `AUTO_MATCH` names exactly
+       one, and each named shape must sit under its own kind's rule. The
+       down migration refuses while any row carries a multi-journal result.
+     - **Still not closed on the canonical-transaction path.** This
+       increment is the journal path only — the same path A2b part 1 and
+       the rest of A2a already use, and reconciliation-intelligence-svc's
+       own search order tries it first. banking-connector-svc's
+       `ListTransactions`/the canonical candidate search (A2b part 1) is
+       untouched: a canonical transaction is still matched one at a time.
+       bank-reconciliation-svc's own `journal_id`/`journal_ids` match path
+       is marked deprecated there in favor of `transaction_id` for a new
+       *single* match, so a reviewer may want many-to-one moved to (or
+       duplicated onto) the canonical-transaction path instead; this was a
+       deliberate scope decision, not an oversight.
+     - *Tests:* `internal/domain/multi_journal_candidates_test.go`
+       (AUTO_MATCH and DATE_SKEW via a pair; a single journal preferred
+       over a qualifying pair; multiple qualifying pairs are AMBIGUOUS; a
+       pair sharing a journal with another line's single match makes both
+       AMBIGUOUS; no single journal or pair still reaches NO_CANDIDATE);
+       `internal/store/candidate_multi_journal_test.go` on real Postgres
+       (round trip including the `UUID[]` column, every CHECK refusing an
+       inconsistent row — wrong counterpart combination, wrong rule, wrong
+       array length — and the down migration refusing while a result
+       exists, succeeding once none does). bank-reconciliation-svc's own
+       side is tested separately — see its SPEC_DEVIATIONS.md A2.
   3. *Already-matched journals.* A journal already matched to another line
      in an earlier run is still a candidate. bank-reconciliation-svc offers
      no lookup by journal id, so this service cannot exclude it;
@@ -331,9 +408,10 @@ internal/ledger client following it).
      past `maxPages` is still 422) through the real analyze route and a
      fake general-ledger-svc that implements the real cursor contract
      (`internal/handler/fakes_test.go`'s `newFakeLedgerServer`).
-     *Still open:* parts 2 and 3 below are unaffected by this — paging
+     *At the time:* parts 2 and 3 below were unaffected by this — paging
      finds every row in the window, but a multi-journal payment or an
-     already-matched journal is still not specially handled.
+     already-matched journal was still not specially handled. Part 2 is now
+     closed (2026-11-01, below); part 3 remains open.
 - **A3. One-directional** (closed — the framing no longer applies). Only side
   A was walked: a side-B item with no side-A counterpart was never reported,
   and `total_processed_count` and the rate counted side A only. Since A1 there

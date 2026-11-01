@@ -27,8 +27,12 @@ func (h *Handler) ProposeMatch(w http.ResponseWriter, r *http.Request) {
 	if !decodeBody(w, r, &req) {
 		return
 	}
-	if req.JournalID == "" && req.TransactionID == "" {
-		writeError(w, http.StatusBadRequest, "missing_field", "journal_id or transaction_id")
+	if req.JournalID == "" && req.TransactionID == "" && len(req.JournalIDs) == 0 {
+		writeError(w, http.StatusBadRequest, "missing_field", "journal_id, journal_ids or transaction_id")
+		return
+	}
+	if len(req.JournalIDs) > 0 && (req.JournalID != "" || req.TransactionID != "") {
+		writeError(w, http.StatusBadRequest, "invalid_field", "journal_ids is mutually exclusive with journal_id and transaction_id")
 		return
 	}
 
@@ -56,7 +60,8 @@ func (h *Handler) ProposeMatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if h.banking != nil && req.TransactionID != "" {
+	switch {
+	case h.banking != nil && req.TransactionID != "":
 		if err := h.verifyCanonicalMatch(r.Context(), *l, principalID, req.TransactionID); err != nil {
 			switch {
 			case errors.Is(err, domain.ErrCanonicalTransactionNotFound):
@@ -75,9 +80,35 @@ func (h *Handler) ProposeMatch(w http.ResponseWriter, r *http.Request) {
 		}
 		l.Status = domain.StatementLineStatusPendingConfirmation
 		l.ProposedTransactionID = &req.TransactionID
-	} else {
+	case len(req.JournalIDs) > 0:
+		allocations, err := h.verifyMultiJournalMatch(r.Context(), *l, req.JournalIDs)
+		if err != nil {
+			switch {
+			case errors.Is(err, domain.ErrCashAccountUnknown):
+				writeError(w, http.StatusUnprocessableEntity, "cash_account_unknown", err.Error())
+			case errors.Is(err, domain.ErrInvalidJournalIDs):
+				writeError(w, http.StatusBadRequest, "invalid_journal_ids", err.Error())
+			case errors.Is(err, domain.ErrLedgerVerificationFailed):
+				writeError(w, http.StatusBadRequest, "ledger_verification_failed", err.Error())
+			default:
+				h.log.Error("ledger verification unavailable — failing closed", zap.Error(err))
+				writeError(w, http.StatusServiceUnavailable, "ledger_service_unavailable", "")
+			}
+			return
+		}
+		if err := h.store.ProposeMultiMatch(r.Context(), tenantID, statementLineID, allocations, principalID); err != nil {
+			h.handleTransitionErr(w, err)
+			return
+		}
+		l.Status = domain.StatementLineStatusPendingConfirmation
+		ids := make([]string, len(allocations))
+		for i, a := range allocations {
+			ids[i] = a.JournalID
+		}
+		l.ProposedJournalIDs = ids
+	default:
 		if req.JournalID == "" {
-			writeError(w, http.StatusBadRequest, "missing_field", "journal_id is required if transaction_id is omitted")
+			writeError(w, http.StatusBadRequest, "missing_field", "journal_id is required if transaction_id and journal_ids are omitted")
 			return
 		}
 		if err := h.verifyJournalMatches(r.Context(), *l, req.JournalID); err != nil {
@@ -126,7 +157,8 @@ func (h *Handler) ConfirmMatch(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "statement_line_not_found", "")
 		return
 	}
-	if l.Status != domain.StatementLineStatusPendingConfirmation || (l.ProposedJournalID == nil && l.ProposedTransactionID == nil) {
+	if l.Status != domain.StatementLineStatusPendingConfirmation ||
+		(l.ProposedJournalID == nil && l.ProposedTransactionID == nil && len(l.ProposedJournalIDs) == 0) {
 		writeError(w, http.StatusUnprocessableEntity, "invalid_transition", domain.ErrInvalidTransition.Error())
 		return
 	}
@@ -140,7 +172,22 @@ func (h *Handler) ConfirmMatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if h.banking != nil && l.ProposedTransactionID != nil {
+	if len(l.ProposedJournalIDs) > 0 {
+		if _, err := h.verifyMultiJournalMatch(r.Context(), *l, l.ProposedJournalIDs); err != nil {
+			switch {
+			case errors.Is(err, domain.ErrCashAccountUnknown):
+				writeError(w, http.StatusUnprocessableEntity, "cash_account_unknown", err.Error())
+			case errors.Is(err, domain.ErrInvalidJournalIDs):
+				writeError(w, http.StatusBadRequest, "invalid_journal_ids", err.Error())
+			case errors.Is(err, domain.ErrLedgerVerificationFailed):
+				writeError(w, http.StatusBadRequest, "ledger_verification_failed", err.Error())
+			default:
+				h.log.Error("ledger verification unavailable — failing closed", zap.Error(err))
+				writeError(w, http.StatusServiceUnavailable, "ledger_service_unavailable", "")
+			}
+			return
+		}
+	} else if h.banking != nil && l.ProposedTransactionID != nil {
 		if err := h.verifyCanonicalMatch(r.Context(), *l, principalID, *l.ProposedTransactionID); err != nil {
 			switch {
 			case errors.Is(err, domain.ErrCanonicalTransactionNotFound):

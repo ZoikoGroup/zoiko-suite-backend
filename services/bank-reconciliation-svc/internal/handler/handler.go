@@ -34,6 +34,10 @@ type Store interface {
 
 	// BNK-05 maker-checker manual matching + certificates.
 	ProposeMatch(ctx context.Context, tenantID, statementLineID, journalID, proposedByPrincipalID string) error
+	// ProposeMultiMatch is ProposeMatch's many-to-one form (A2b part 2):
+	// allocations are already verified against general-ledger-svc by the
+	// caller before this is reached.
+	ProposeMultiMatch(ctx context.Context, tenantID, statementLineID string, allocations []domain.JournalAllocation, proposedByPrincipalID string) error
 	ConfirmMatch(ctx context.Context, tenantID, statementLineID, confirmingPrincipalID string) (*domain.StatementLine, error)
 	RejectProposedMatch(ctx context.Context, tenantID, statementLineID, reason, actorPrincipalID string) error
 	CertifyStatement(ctx context.Context, tenantID, legalEntityID, bankAccountID, statementDate, certifiedByPrincipalID, correlationID string, matchedLineCount int) (*domain.ReconciliationCertificate, bool, error)
@@ -414,6 +418,56 @@ func (h *Handler) verifyJournalMatches(ctx context.Context, l domain.StatementLi
 		return domain.ErrLedgerVerificationFailed
 	}
 	return nil
+}
+
+// verifyMultiJournalMatch is verifyJournalMatches' many-to-one form (A2b
+// part 2): every named journal must individually pass the same checks
+// (exists, FINALIZED, correct legal entity, touches the line's cash
+// account) as a single-journal match, and their combined net movement —
+// not any one of them alone — must equal the line's amount exactly. A
+// journal named twice is refused rather than silently double-counted.
+// Returns the per-journal allocation (each journal's own verified net, in
+// cents) so the caller can record it as evidence.
+func (h *Handler) verifyMultiJournalMatch(ctx context.Context, l domain.StatementLine, journalIDs []string) ([]domain.JournalAllocation, error) {
+	if l.GLCashAccountCode == nil || *l.GLCashAccountCode == "" {
+		return nil, domain.ErrCashAccountUnknown
+	}
+	if len(journalIDs) < 2 || len(journalIDs) > domain.MaxMatchJournals {
+		return nil, domain.ErrInvalidJournalIDs
+	}
+	seen := make(map[string]bool, len(journalIDs))
+	allocations := make([]domain.JournalAllocation, 0, len(journalIDs))
+	var total int64
+	for _, journalID := range journalIDs {
+		if journalID == "" || seen[journalID] {
+			return nil, domain.ErrInvalidJournalIDs
+		}
+		seen[journalID] = true
+
+		j, err := h.ledger.GetJournal(ctx, l.TenantID, journalID)
+		if err != nil {
+			if errors.Is(err, ledger.ErrJournalNotFound) {
+				return nil, domain.ErrLedgerVerificationFailed
+			}
+			return nil, domain.ErrLedgerServiceUnavailable
+		}
+		if j.Status != "FINALIZED" {
+			return nil, domain.ErrLedgerVerificationFailed
+		}
+		if j.LegalEntityID != l.LegalEntityID {
+			return nil, domain.ErrLedgerVerificationFailed
+		}
+		movedCents, touched := j.CashMovementCents(*l.GLCashAccountCode)
+		if !touched {
+			return nil, domain.ErrLedgerVerificationFailed
+		}
+		allocations = append(allocations, domain.JournalAllocation{JournalID: journalID, NetCents: movedCents})
+		total += movedCents
+	}
+	if total != ledger.ToCents(l.Amount) {
+		return nil, domain.ErrLedgerVerificationFailed
+	}
+	return allocations, nil
 }
 
 func (h *Handler) verifyCanonicalMatch(ctx context.Context, l domain.StatementLine, principalID, transactionID string) error {

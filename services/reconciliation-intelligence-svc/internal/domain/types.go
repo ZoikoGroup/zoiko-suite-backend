@@ -152,6 +152,13 @@ type ReconciliationSuggestion struct {
 	// most one of the two counterparts is ever named; HeuristicRule says
 	// which kind of record was found. Proposed only, like the journal.
 	CounterpartTransactionID string `json:"counterpart_transaction_id,omitempty"`
+	// CounterpartJournalIDs is A2b part 2's many-to-one form of
+	// CounterpartJournalID: exactly two general-ledger-svc journals whose
+	// combined net movement — not either one alone — equals the line's
+	// amount. Mutually exclusive with CounterpartJournalID and
+	// CounterpartTransactionID; HeuristicRule names it as the multi-journal
+	// rule when set.
+	CounterpartJournalIDs []string `json:"counterpart_journal_ids,omitempty"`
 	// CandidateSearchOutcome is what the search for a counterpart found, on
 	// every searched line; empty on a DUPLICATE_ENTRY copy (not searched)
 	// and on rows written before migration 000008.
@@ -426,6 +433,12 @@ func AnalyzeUnmatchedStatementLines(lines []BankStatementLine, runID, tenantID s
 			items = append(items, item)
 			continue
 		}
+		if ls.proposedPair != nil {
+			item := candidateItemMulti(line, amount, ls.outcome, *ls.proposedPair, runID, tenantID, missingReferenceTolerance.Version, search, now)
+			item.ResolutionNotes += dupNote
+			items = append(items, item)
+			continue
+		}
 		if ls.proposedTxn != nil {
 			item := canonicalItem(line, amount, ls.outcome, *ls.proposedTxn, runID, tenantID, missingReferenceTolerance.Version, search, now)
 			item.ResolutionNotes += dupNote
@@ -458,7 +471,10 @@ func AnalyzeUnmatchedStatementLines(lines []BankStatementLine, runID, tenantID s
 			rec = RecommendationManualReview
 			confScore = candidateAmbiguousConfidence
 			rule = HeuristicCandidateAmbiguous
-			if len(ls.txnCandidates) > 0 {
+			switch {
+			case len(ls.pairCandidates) > 0:
+				rule = HeuristicCandidateMultiJournalAmbiguous
+			case len(ls.txnCandidates) > 0:
 				rule = HeuristicCandidateTransactionAmbiguous
 			}
 		}

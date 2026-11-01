@@ -67,6 +67,12 @@ type StatementLine struct {
 	MatchedByPrincipalID *string    `json:"matched_by_principal_id,omitempty"`
 	MatchedAt            *time.Time `json:"matched_at,omitempty"`
 
+	// MatchedJournalIDs is set instead of MatchedJournalID when this line
+	// was matched against two or more journals together (A2b part 2):
+	// loaded from statement_line_matched_journals (migration 000015) once
+	// the line reaches MATCHED. The two fields are mutually exclusive.
+	MatchedJournalIDs []string `json:"matched_journal_ids,omitempty"`
+
 	ExceptionReason      *string    `json:"exception_reason,omitempty"`
 	FlaggedByPrincipalID *string    `json:"flagged_by_principal_id,omitempty"`
 	FlaggedAt            *time.Time `json:"flagged_at,omitempty"`
@@ -79,6 +85,11 @@ type StatementLine struct {
 	ProposedTransactionID *string    `json:"proposed_transaction_id,omitempty"`
 	ProposedByPrincipalID *string    `json:"proposed_by_principal_id,omitempty"`
 	ProposedAt            *time.Time `json:"proposed_at,omitempty"`
+
+	// ProposedJournalIDs is ProposedJournalID's many-to-one form (A2b part
+	// 2): set instead of it while the line is PENDING_CONFIRMATION against
+	// two or more journals together. The two fields are mutually exclusive.
+	ProposedJournalIDs []string `json:"proposed_journal_ids,omitempty"`
 
 	CorrelationID string    `json:"correlation_id"`
 	CreatedAt     time.Time `json:"created_at"`
@@ -182,9 +193,18 @@ type CreateStatementLineRequest struct {
 // preferred and refers to a banking-connector-svc canonical transaction.
 // journal_id is the deprecated GL-journal path kept for backward
 // compatibility — if both are present, transaction_id wins.
+//
+// journal_ids is that same deprecated journal path's many-to-one extension
+// (A2b part 2: ZS-CONTROL-001 section 10's "many-to-one / one-to-many ...
+// support split payments, consolidated receipts, fees and settlements with
+// explicit allocation") — for a payment booked as two or more journals
+// that individually never sum to the line but together do. Mutually
+// exclusive with journal_id and transaction_id, and must name 2 or more
+// distinct journal ids.
 type MatchStatementLineRequest struct {
-	TransactionID string `json:"transaction_id"` // preferred
-	JournalID     string `json:"journal_id"`     // deprecated: use transaction_id
+	TransactionID string   `json:"transaction_id"`        // preferred
+	JournalID     string   `json:"journal_id"`            // deprecated: use transaction_id
+	JournalIDs    []string `json:"journal_ids,omitempty"` // deprecated path's many-to-one form; 2 or more
 }
 
 // FlagExceptionRequest requires a reason — an exception with no stated
@@ -214,6 +234,23 @@ const (
 	DefaultListLimit = 200
 	MaxListLimit     = 1000
 )
+
+// MaxMatchJournals bounds journal_ids (A2b part 2's many-to-one match
+// path): each id costs one general-ledger-svc round trip to verify, so an
+// unbounded list would let one request fan out indefinitely.
+const MaxMatchJournals = 10
+
+// JournalAllocation is one journal's verified contribution to a many-to-one
+// match (A2b part 2): its own signed net cash movement on the statement
+// line's cash account, in the line's currency's minor units. Computed and
+// verified once (every journal's own net, summed, must equal the line's
+// amount exactly) and then recorded in statement_line_matched_journals as
+// the "explicit allocation" evidence ZS-CONTROL-001 section 10 requires —
+// never the caller's own claim.
+type JournalAllocation struct {
+	JournalID string
+	NetCents  int64
+}
 
 // ── errors ───────────────────────────────────────────────────────────────────
 
@@ -287,6 +324,12 @@ var (
 	// real dual-control rule: the principal who proposed a match cannot
 	// also confirm it.
 	ErrMatchSelfConfirmation = errorString("the principal who proposed a match cannot also confirm it")
+
+	// ErrInvalidJournalIDs is returned when journal_ids does not name at
+	// least 2 distinct, non-empty journal ids, or names more than
+	// MaxMatchJournals — A2b part 2's many-to-one path is for a specific,
+	// bounded split, not an open-ended search.
+	ErrInvalidJournalIDs = errorString("journal_ids must name between 2 and 10 distinct journal ids")
 
 	// EvidenceConflict errors.
 	ErrConflictNotFound        = errorString("evidence conflict not found")
