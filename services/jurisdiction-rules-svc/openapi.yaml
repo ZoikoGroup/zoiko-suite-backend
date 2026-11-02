@@ -221,6 +221,225 @@ paths:
               schema: { $ref: '#/components/schemas/Problem' }
         "503": { $ref: '#/components/responses/StoreUnavailable' }
 
+  /v1/jurisdiction-resolutions:
+    get:
+      tags: [Jurisdictions]
+      summary: ResolveJurisdiction, a code to exactly one jurisdiction at an instant (REF-01)
+      description: |
+        Resolves `code` to ONE jurisdiction as it was at `as_of`, or says precisely why
+        it cannot. With no `system` the code is a jurisdiction's own `jurisdiction_code`;
+        with one (for example `ISO3166-1-ALPHA2`) it is that system's code. Case and
+        surrounding whitespace are ignored; nothing else is, and a near match is never
+        offered ("never guess from free text").
+
+        Four distinct refusals, so a caller whose legal treatment depends on the answer
+        can tell them apart:
+
+        - `404 unknown_jurisdiction_code`: nothing is known by that code.
+        - `404 code_not_mapped_at`: the code is mapped, but not at `as_of`.
+        - `410 jurisdiction_retired`: it resolves to a jurisdiction that had been
+          retired by `as_of`; the body carries `retired_at`, `retirement_reason` and
+          `superseded_by_jurisdiction_id`.
+        - `409 ambiguous_jurisdiction_code`: several jurisdictions in force answer to an
+          internal code (for example a country and a tax authority both coded `GB`); the
+          body lists `candidates`, and the caller narrows with `type`. The service does
+          not choose.
+      operationId: resolveJurisdiction
+      parameters:
+        - name: code
+          in: query
+          required: true
+          schema: { type: string, maxLength: 64 }
+        - name: system
+          in: query
+          required: false
+          description: The code system. Omit for a jurisdiction's own code.
+          schema: { type: string, maxLength: 64 }
+        - name: type
+          in: query
+          required: false
+          description: Narrows an internal-code lookup to one jurisdiction_type.
+          schema: { type: string }
+        - $ref: '#/components/parameters/AsOf'
+        - $ref: '#/components/parameters/CorrelationID'
+      responses:
+        "200":
+          description: The one jurisdiction the code meant at as_of.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CodeResolution' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "409":
+          description: More than one jurisdiction in force answers to the code.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        "410":
+          description: The code resolves to a jurisdiction retired by as_of.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        "503": { $ref: '#/components/responses/StoreUnavailable' }
+
+  /v1/jurisdiction-code-mappings:
+    get:
+      tags: [Jurisdictions]
+      summary: MapExternalJurisdictionCode, an external system's code to a jurisdiction (REF-01)
+      description: |
+        The same resolution as `GET /v1/jurisdiction-resolutions`, with the code system
+        required: map one system's code to the stable internal jurisdiction. The answer
+        names the mapping used (`alias`), including its source standard and version and
+        the rationale, so the mapping can be audited. The same four refusals apply.
+      operationId: mapExternalJurisdictionCode
+      parameters:
+        - name: system
+          in: query
+          required: true
+          description: The external code system, for example ISO3166-1-ALPHA3 or an ERP's own list.
+          schema: { type: string, maxLength: 64 }
+        - name: code
+          in: query
+          required: true
+          schema: { type: string, maxLength: 64 }
+        - $ref: '#/components/parameters/AsOf'
+        - $ref: '#/components/parameters/CorrelationID'
+      responses:
+        "200":
+          description: The jurisdiction the code meant at as_of.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CodeResolution' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "410":
+          description: The code resolves to a jurisdiction retired by as_of.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        "503": { $ref: '#/components/responses/StoreUnavailable' }
+
+  /v1/jurisdictions/{jurisdiction_id}/aliases:
+    get:
+      tags: [Jurisdictions]
+      summary: The codes a jurisdiction is known by (REF-01)
+      description: |
+        Every mapping of an external code to this jurisdiction, oldest first, including
+        ended ones. With `as_of`, only those in force then. A retired jurisdiction's
+        mappings stay readable.
+      operationId: listJurisdictionAliases
+      parameters:
+        - $ref: '#/components/parameters/JurisdictionID'
+        - $ref: '#/components/parameters/AsOf'
+        - $ref: '#/components/parameters/CorrelationID'
+      responses:
+        "200":
+          description: The mappings. Always an array, never null.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/JurisdictionAlias' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "503": { $ref: '#/components/responses/StoreUnavailable' }
+
+  /v1/admin/jurisdictions/{jurisdiction_id}/aliases:
+    post:
+      tags: [Admin, Jurisdictions]
+      summary: AmendJurisdictionAlias, record that a code means this jurisdiction (REF-01)
+      description: |
+        Maps `(alias_system, alias_code)` to this jurisdiction over
+        `[valid_from, valid_to)`, with the source standard, its version and the
+        rationale (all required: a mapping without its source cannot be audited). The
+        jurisdiction must be in force; a retired jurisdiction gets no new codes.
+
+        A code can mean only ONE jurisdiction at any instant, enforced by the database,
+        so a mapping that overlaps another meaning of the same code is
+        `409 alias_conflict`, also under concurrency. To move a code to another
+        jurisdiction, give `replaces_alias_id`: the old mapping of the same code is
+        ended at `valid_from` in the same transaction, and nothing is changed if the
+        new one cannot be recorded. ISO 3166 codes are checked against the standard's
+        format. Repeating an identical request answers `200` with the original and emits
+        nothing. Publishes `jurisdiction.updated` (`change_type` `ALIAS_ADDED`).
+      operationId: amendJurisdictionAlias
+      security: [{ principalHeader: [] }]
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/TenantID'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/JurisdictionID'
+        - $ref: '#/components/parameters/PrincipalID'
+        - $ref: '#/components/parameters/CorrelationID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AmendAliasRequest' }
+      responses:
+        "200":
+          description: An identical mapping already existed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/JurisdictionAlias' }
+        "201":
+          description: The mapping was recorded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/JurisdictionAlias' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "401": { $ref: '#/components/responses/MissingPrincipal' }
+        "403": { $ref: '#/components/responses/Forbidden' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "409":
+          description: The code already means a different jurisdiction (or the same one on different evidence) during part of that interval.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
+
+  /v1/admin/jurisdictions/{jurisdiction_id}/aliases/{alias_id}/end:
+    post:
+      tags: [Admin, Jurisdictions]
+      summary: End a code mapping (REF-01)
+      description: |
+        Ends the mapping at `valid_to`, recording who ended it and why (`reason` is
+        required). The mapping is kept: what the code meant before `valid_to` stays
+        answerable. An end can only bring a mapping's end forward. Ending an already
+        ended mapping answers `200` with the original end and emits nothing. Publishes
+        `jurisdiction.updated` (`change_type` `ALIAS_ENDED`).
+      operationId: endJurisdictionAlias
+      security: [{ principalHeader: [] }]
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/TenantID'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/JurisdictionID'
+        - name: alias_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - $ref: '#/components/parameters/PrincipalID'
+        - $ref: '#/components/parameters/CorrelationID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EndAliasRequest' }
+      responses:
+        "200":
+          description: The mapping, ended.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/JurisdictionAlias' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "401": { $ref: '#/components/responses/MissingPrincipal' }
+        "403": { $ref: '#/components/responses/Forbidden' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
+
   # ── Rules (public read) ────────────────────────────────────────────────────
 
   /v1/jurisdictions/{jurisdiction_id}/rules:
@@ -2364,6 +2583,71 @@ components:
           type: string
           format: uuid
           description: The active jurisdiction that takes over. Must be a different, active jurisdiction.
+
+    JurisdictionAlias:
+      type: object
+      required: [alias_id, jurisdiction_id, alias_system, alias_code, source_standard, source_version, mapping_rationale, valid_from, created_by, created_at]
+      properties:
+        alias_id: { type: string, format: uuid }
+        jurisdiction_id: { type: string, format: uuid }
+        alias_system: { type: string }
+        alias_code: { type: string }
+        source_standard: { type: string }
+        source_version: { type: string }
+        mapping_rationale: { type: string }
+        evidence_ref: { type: string }
+        valid_from: { type: string, format: date-time }
+        valid_to: { type: string, format: date-time, nullable: true }
+        created_by: { type: string }
+        created_at: { type: string, format: date-time }
+        ended_by: { type: string }
+        ended_at: { type: string, format: date-time }
+        end_reason: { type: string }
+
+    CodeResolution:
+      type: object
+      required: [jurisdiction_id, jurisdiction_code, jurisdiction_name, jurisdiction_type, authority_type, as_of, version_no, matched_via]
+      properties:
+        jurisdiction_id: { type: string, format: uuid }
+        jurisdiction_code: { type: string }
+        jurisdiction_name: { type: string }
+        jurisdiction_type: { type: string }
+        authority_type: { type: string }
+        parent_jurisdiction_id: { type: string, format: uuid, nullable: true }
+        as_of: { type: string, format: date-time }
+        version_no: { type: integer, minimum: 1 }
+        matched_via:
+          type: string
+          description: INTERNAL for a jurisdiction_code match, or the alias system that matched.
+        alias:
+          description: The mapping used, with its source and rationale. Absent for an internal-code match.
+          $ref: '#/components/schemas/JurisdictionAlias'
+
+    AmendAliasRequest:
+      type: object
+      required: [alias_system, alias_code, source_standard, source_version, mapping_rationale, valid_from]
+      properties:
+        alias_system:
+          type: string
+          description: "Upper-case letters, digits and . _ : - (2 to 64). ISO3166-1-ALPHA2, ISO3166-1-ALPHA3, ISO3166-1-NUMERIC, ISO3166-2 and UN-M49 are validated against the standard's format. INTERNAL is reserved."
+        alias_code: { type: string, maxLength: 64 }
+        source_standard: { type: string, maxLength: 128 }
+        source_version: { type: string, maxLength: 64 }
+        mapping_rationale: { type: string }
+        evidence_ref: { type: string }
+        valid_from: { type: string, format: date-time }
+        valid_to: { type: string, format: date-time }
+        replaces_alias_id:
+          type: string
+          format: uuid
+          description: Ends that mapping of the same code at valid_from, in the same transaction.
+
+    EndAliasRequest:
+      type: object
+      required: [valid_to, reason]
+      properties:
+        valid_to: { type: string, format: date-time }
+        reason: { type: string }
 
     Jurisdiction:
       type: object

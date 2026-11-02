@@ -229,6 +229,9 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Get("/v1/jurisdictions/{jurisdiction_id}/ancestors", h.GetAncestors)
 	r.Get("/v1/jurisdictions/{jurisdiction_id}/as-of", h.GetJurisdictionAsOf)
 	r.Get("/v1/jurisdictions/{jurisdiction_id}/hierarchy", h.GetHierarchy)
+	r.Get("/v1/jurisdictions/{jurisdiction_id}/aliases", h.ListJurisdictionAliases)
+	r.Get("/v1/jurisdiction-resolutions", h.ResolveJurisdiction)
+	r.Get("/v1/jurisdiction-code-mappings", h.MapExternalJurisdictionCode)
 	r.Get("/v1/jurisdictions/{jurisdiction_id}/rules", h.GetRules)
 	r.Get("/v1/jurisdictions/{jurisdiction_id}/rule-pack", h.GetRulePack)
 	r.Get("/v1/rules/{jurisdiction_rule_id}", h.GetRule)
@@ -238,6 +241,8 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	// ── Admin mutations (AuthZ required on every route) ───────────────────────
 	r.Post("/v1/admin/jurisdictions", h.CreateJurisdiction)
 	r.Post("/v1/admin/jurisdictions/{jurisdiction_id}/deactivate", h.DeactivateJurisdiction)
+	r.Post("/v1/admin/jurisdictions/{jurisdiction_id}/aliases", h.AmendJurisdictionAlias)
+	r.Post("/v1/admin/jurisdictions/{jurisdiction_id}/aliases/{alias_id}/end", h.EndJurisdictionAlias)
 	r.Post("/v1/admin/jurisdictions/{jurisdiction_id}/rules", h.CreateRule)
 	r.Post("/v1/admin/rules/{jurisdiction_rule_id}/transition", h.TransitionRuleStatus)
 	r.Post("/v1/admin/rules/{jurisdiction_rule_id}/drift", h.RecordDrift)
