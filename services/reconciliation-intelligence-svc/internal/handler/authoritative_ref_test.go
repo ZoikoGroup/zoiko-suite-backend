@@ -35,7 +35,7 @@ func TestApplyResolution_ExecutedWriteOffNeedsJournalRef(t *testing.T) {
 			"/v1/reconciliations/"+job.ID+"/resolutions/"+job.UnmatchedItems[0].ID+"/apply", bytes.NewBufferString(body))
 		withEnvelope(r)
 		r.Header.Set("X-Tenant-ID", "tenant-a5")
-		r.Header.Set("X-Principal-Id", "principal-01")
+		r.Header.Set("X-Principal-Id", "reviewer-01") // not the analysis requester (SoD)
 		w := httptest.NewRecorder()
 		router.ServeHTTP(w, r)
 		return w
@@ -43,23 +43,23 @@ func TestApplyResolution_ExecutedWriteOffNeedsJournalRef(t *testing.T) {
 	const journal = "5b0f6a3e-2c1d-4e8f-9a7b-6c5d4e3f2a1b"
 	ref := `"authoritative_ref":{"kind":"GL_JOURNAL","journal_id":"` + journal + `"}`
 
-	if w := apply(`{"suggestion_status":"APPROVED",` + ref + `}`); w.Code != http.StatusBadRequest {
+	if w := apply(`{"suggestion_status":"APPROVED","resolution_notes":"r",` + ref + `}`); w.Code != http.StatusBadRequest {
 		t.Fatalf("reference on APPROVED: %d %s, want 400", w.Code, w.Body)
 	}
-	if w := apply(`{"suggestion_status":"APPROVED"}`); w.Code != http.StatusOK {
+	if w := apply(`{"suggestion_status":"APPROVED","resolution_notes":"write-off approved"}`); w.Code != http.StatusOK {
 		t.Fatalf("approve: %d %s", w.Code, w.Body)
 	}
 	for name, body := range map[string]string{
 		"no reference":            `{"suggestion_status":"EXECUTED","resolution_notes":"posted JE-1042"}`,
-		"journal id is free text": `{"suggestion_status":"EXECUTED","authoritative_ref":{"kind":"GL_JOURNAL","journal_id":"JE-1042"}}`,
-		"unknown kind":            `{"suggestion_status":"EXECUTED","authoritative_ref":{"kind":"ADJUSTMENT","journal_id":"` + journal + `"}}`,
+		"journal id is free text": `{"suggestion_status":"EXECUTED","resolution_notes":"r","authoritative_ref":{"kind":"GL_JOURNAL","journal_id":"JE-1042"}}`,
+		"unknown kind":            `{"suggestion_status":"EXECUTED","resolution_notes":"r","authoritative_ref":{"kind":"ADJUSTMENT","journal_id":"` + journal + `"}}`,
 	} {
 		if w := apply(body); w.Code != http.StatusBadRequest {
 			t.Errorf("%s: %d %s, want 400", name, w.Code, w.Body)
 		}
 	}
 
-	w := apply(`{"suggestion_status":"EXECUTED",` + ref + `}`)
+	w := apply(`{"suggestion_status":"EXECUTED","resolution_notes":"posted",` + ref + `}`)
 	var item domain.ReconciliationSuggestion
 	if err := json.Unmarshal(w.Body.Bytes(), &item); err != nil || w.Code != http.StatusOK {
 		t.Fatalf("execute with journal: %d %s", w.Code, w.Body)

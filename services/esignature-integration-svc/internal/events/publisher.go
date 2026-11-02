@@ -18,9 +18,12 @@ import (
 // threaded through explicitly from each handler's already-verified
 // principalID.
 type Event struct {
-	EventID       string      `json:"event_id"`
-	EventType     string      `json:"event_type"`
-	EventVersion  string      `json:"event_version"`
+	EventID      string `json:"event_id"`
+	EventType    string `json:"event_type"`
+	EventVersion string `json:"event_version"`
+	// SchemaVersion is the field the platform audit consumer (audit-event-store-svc)
+	// requires; EventVersion is kept for existing consumers. Same value.
+	SchemaVersion string      `json:"schema_version"`
 	SourceService string      `json:"source_service"`
 	AggregateID   string      `json:"aggregate_id"`
 	TenantID      string      `json:"tenant_id"`
@@ -87,6 +90,7 @@ func (p *KafkaPublisher) Publish(ctx context.Context, params PublishParams) erro
 		EventID:       "evt-" + uuid.New().String(),
 		EventType:     params.EventType,
 		EventVersion:  "1.0",
+		SchemaVersion: "1.0",
 		SourceService: "esignature-integration-svc",
 		AggregateID:   params.AggregateID,
 		TenantID:      params.TenantID,

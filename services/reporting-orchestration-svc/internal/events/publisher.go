@@ -20,9 +20,12 @@ import (
 // actor field, so actor_id is threaded through explicitly from each
 // handler's already-verified principalID.
 type Event struct {
-	EventID       string      `json:"event_id"`
-	EventType     string      `json:"event_type"`
-	EventVersion  string      `json:"event_version"`
+	EventID      string `json:"event_id"`
+	EventType    string `json:"event_type"`
+	EventVersion string `json:"event_version"`
+	// SchemaVersion is the field the platform audit consumer (audit-event-store-svc)
+	// requires; EventVersion is kept for existing consumers. Same value.
+	SchemaVersion string      `json:"schema_version"`
 	SourceService string      `json:"source_service"`
 	SubjectID     string      `json:"subject_id"`
 	TenantID      string      `json:"tenant_id"`
@@ -105,6 +108,7 @@ func (p *Publisher) Publish(ctx context.Context, params PublishParams) error {
 		EventID:       eventID,
 		EventType:     params.EventType,
 		EventVersion:  "1.0",
+		SchemaVersion: "1.0",
 		SourceService: "reporting-orchestration-svc",
 		SubjectID:     params.SubjectID,
 		TenantID:      params.TenantID,

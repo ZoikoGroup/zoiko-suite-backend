@@ -69,13 +69,20 @@ type fakeDLQ struct {
 	mu   sync.Mutex
 	err  error
 	sent []kafka.Message
+	// failFirst makes the first N writes fail (topic auto-creation race).
+	failFirst int
+	calls     int
 }
 
 func (d *fakeDLQ) WriteMessages(_ context.Context, msgs ...kafka.Message) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	d.calls++
 	if d.err != nil {
 		return d.err
+	}
+	if d.calls <= d.failFirst {
+		return errors.New("[3] Unknown Topic Or Partition: the request is for a topic or partition that does not exist on this broker")
 	}
 	d.sent = append(d.sent, msgs...)
 	return nil
@@ -215,6 +222,10 @@ func TestRunner_StoreError_DLQFailure_OffsetNotCommitted(t *testing.T) {
 func TestRunner_EventIDFallsBackToMessageCoordinates(t *testing.T) {
 	assert.Equal(t, "zoiko.test.events:2:9", extractEventID(kafka.Message{Topic: "zoiko.test.events", Partition: 2, Offset: 9}))
 	assert.Equal(t, "evt-1", extractEventID(msg(1, "evt-1")))
+	// Body ids win over coordinates (coordinates repeat after a topic reset).
+	assert.Equal(t, "body-evt", extractEventID(kafka.Message{Topic: "t", Offset: 1, Value: []byte(`{"event_id":"body-evt"}`)}))
+	assert.Equal(t, "ce-id", extractEventID(kafka.Message{Topic: "t", Offset: 1, Value: []byte(`{"id":"ce-id","type":"com.zoikosuite.x.y.z"}`)}))
+	assert.Equal(t, "t:0:4", extractEventID(kafka.Message{Topic: "t", Offset: 4, Value: []byte(`not json`)}))
 }
 
 func headerValue(m kafka.Message, key string) string {

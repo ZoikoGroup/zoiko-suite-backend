@@ -35,7 +35,7 @@ func TestApplyResolution_EnforcesDecisionPath(t *testing.T) {
 			"/v1/reconciliations/"+job.ID+"/resolutions/"+job.UnmatchedItems[0].ID+"/apply", bytes.NewBuffer(b))
 		withEnvelope(r)
 		r.Header.Set("X-Tenant-ID", "tenant-1")
-		r.Header.Set("X-Principal-Id", "principal-01")
+		r.Header.Set("X-Principal-Id", "reviewer-01") // not the analysis requester (SoD)
 		w := httptest.NewRecorder()
 		router.ServeHTTP(w, r)
 		return w

@@ -15,26 +15,29 @@
 //     ON CONFLICT DO NOTHING still functions correctly.
 //
 //   - Error handling:
-//       • Malformed events (Handler returns an error wrapping
-//         consumer.ErrMalformedEvent) → NOT retried (the message can never
-//         become valid); published to "<topic>.dlq" with the reason in
-//         X-DLQ-Reason, and only then committed. If that publish fails the
-//         offset is left uncommitted so a restart retries. They are never
-//         silently dropped.
-//       • Store errors (Handler returns non-nil)   → retried a bounded
-//         number of times against the SAME message; if every retry still
-//         fails, the message is published to "<topic>.dlq" and only then
-//         committed, so the partition advances instead of head-of-line
-//         blocking on it forever. This matters because Kafka consumer
-//         group offsets are a single per-partition watermark, not a
-//         sparse per-message ack list: without a DLQ, a later message
-//         that succeeds and commits would silently carry the offset past
-//         an earlier failed one, permanently and invisibly dropping it —
-//         exactly the silent-loss failure mode 03-microservices.md §19
-//         and Doc 01 §2.10 ("no silent state change") both prohibit.
-//         If the DLQ publish itself fails, the original message is left
-//         uncommitted (old behavior) so a restart gets another chance.
-//       • Context cancelled (shutdown)             → exit cleanly.
+//
+//   - Malformed events (Handler returns an error wrapping
+//     consumer.ErrMalformedEvent) → NOT retried (the message can never
+//     become valid); published to "<topic>.dlq" with the reason in
+//     X-DLQ-Reason, and only then committed. If that publish fails the
+//     offset is left uncommitted so a restart retries. They are never
+//     silently dropped.
+//
+//   - Store errors (Handler returns non-nil)   → retried a bounded
+//     number of times against the SAME message; if every retry still
+//     fails, the message is published to "<topic>.dlq" and only then
+//     committed, so the partition advances instead of head-of-line
+//     blocking on it forever. This matters because Kafka consumer
+//     group offsets are a single per-partition watermark, not a
+//     sparse per-message ack list: without a DLQ, a later message
+//     that succeeds and commits would silently carry the offset past
+//     an earlier failed one, permanently and invisibly dropping it —
+//     exactly the silent-loss failure mode 03-microservices.md §19
+//     and Doc 01 §2.10 ("no silent state change") both prohibit.
+//     If the DLQ publish itself fails, the original message is left
+//     uncommitted (old behavior) so a restart gets another chance.
+//
+//   - Context cancelled (shutdown)             → exit cleanly.
 //
 //   - TODO (production): TLS/SASL broker auth, StartOffset configuration,
 //     consumer group lag Prometheus metrics, and configurable
@@ -43,6 +46,7 @@ package kafka
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -54,6 +58,10 @@ import (
 	"zoiko.io/audit-event-store-svc/internal/consumer"
 	"zoiko.io/audit-event-store-svc/internal/telemetry"
 )
+
+// dlqPublishAttempts bounds retries of the DLQ publish itself (topic
+// auto-creation race on the first dead-letter of a topic).
+const dlqPublishAttempts = 6
 
 // dlqRetryAttempts bounds how many times the SAME message is retried
 // against the handler within one fetch iteration before it's dead-lettered.
@@ -122,6 +130,14 @@ func NewRunner(brokers []string, groupID, topic string, h *consumer.Consumer, me
 		// If this consumer group has no committed offset yet, start from the
 		// oldest available message so no events are silently skipped on first boot.
 		StartOffset: kafka.FirstOffset,
+
+		// Producers create topics on first publish (auto-create), often after
+		// this reader has joined. Without watching, the group's assignment is
+		// computed once with the topic absent and never revisited: every
+		// member held 0 partitions and nothing was consumed until a restart
+		// (found 2026-11-02 in the Blocks 6-10 Kafka -> audit run).
+		WatchPartitionChanges:  true,
+		PartitionWatchInterval: 5 * time.Second,
 
 		// TODO (production): set Dialer with TLS + SASL credentials.
 	})
@@ -199,7 +215,16 @@ func (r *Runner) Run(ctx context.Context) {
 			// commit past it — see the package doc comment for why leaving
 			// it uncommitted is NOT safe here (a later message's commit
 			// would silently drop it anyway).
-			if dlqErr := r.publishToDLQ(ctx, msg, err); dlqErr != nil {
+			// The first write to a new "<topic>.dlq" fails while the broker
+			// auto-creates it (Unknown Topic Or Partition). A bounded retry
+			// covers that; giving up here loses the message, because a later
+			// commit on this partition moves the offset past it.
+			dlqErr := r.publishToDLQ(ctx, msg, err)
+			for attempt := 1; dlqErr != nil && attempt < dlqPublishAttempts && ctx.Err() == nil; attempt++ {
+				time.Sleep(time.Duration(attempt) * r.backoff())
+				dlqErr = r.publishToDLQ(ctx, msg, err)
+			}
+			if dlqErr != nil {
 				outcome := "store_error"
 				if isMalformed {
 					outcome = "malformed_dlq_failed"
@@ -286,6 +311,24 @@ func extractEventID(msg kafka.Message) string {
 			return string(h.Value)
 		}
 	}
-	// Synthetic fallback — stable across re-deliveries of the same offset.
+	// The producer's own id in the body: event_id (platform envelope) or id
+	// (CloudEvents). Preferred over the Kafka coordinates, which repeat when
+	// a topic is recreated or a broker reset: a new event at a reused offset
+	// was deduplicated against an unrelated stored event and silently
+	// dropped (found 2026-11-02 in the Blocks 6-10 Kafka -> audit run).
+	var ids struct {
+		EventID string `json:"event_id"`
+		ID      string `json:"id"`
+	}
+	if json.Unmarshal(msg.Value, &ids) == nil {
+		if ids.EventID != "" {
+			return ids.EventID
+		}
+		if ids.ID != "" {
+			return ids.ID
+		}
+	}
+	// Synthetic fallback for producers that send no id at all — stable
+	// across re-deliveries of the same offset, but not across topic resets.
 	return fmt.Sprintf("%s:%d:%d", msg.Topic, msg.Partition, msg.Offset)
 }

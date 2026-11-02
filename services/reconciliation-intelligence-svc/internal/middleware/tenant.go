@@ -2,8 +2,8 @@ package middleware
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
+	"zoiko.io/reconciliation-intelligence-svc/internal/problem"
 )
 
 type contextKey string
@@ -50,12 +50,8 @@ func TenantMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		tenantID := r.Header.Get("X-Tenant-ID")
 		if tenantID == "" {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusUnauthorized)
-			_ = json.NewEncoder(w).Encode(map[string]string{
-				"error":   "missing_tenant_scope",
-				"message": "X-Tenant-ID is required — the gateway sets it from a verified identity envelope",
-			})
+			problem.Write(w, r, http.StatusUnauthorized, "missing_tenant_scope",
+				"X-Tenant-ID is required — the gateway sets it from a verified identity envelope")
 			return
 		}
 

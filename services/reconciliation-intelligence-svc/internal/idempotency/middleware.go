@@ -24,10 +24,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
+	"zoiko.io/reconciliation-intelligence-svc/internal/problem"
 
 	"go.uber.org/zap"
 )
@@ -189,7 +189,5 @@ func (r *responseRecorder) Write(b []byte) (int, error) {
 }
 
 func writeError(w http.ResponseWriter, status int, code, message string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]string{"error": code, "message": message})
+	problem.Write(w, nil, status, code, message)
 }

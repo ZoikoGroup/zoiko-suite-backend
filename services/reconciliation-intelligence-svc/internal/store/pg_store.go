@@ -42,8 +42,17 @@ type Store interface {
 	// ApplyResolution enqueues "reconciliation.resolution_recommended" in
 	// the same transaction as the update.
 	// ref is the owning domain's record behind an EXECUTED decision (A5).
-	ApplyResolution(ctx context.Context, tenantID, jobID, itemID string, status domain.SuggestionStatus, notes string, ref *domain.AuthoritativeRef, legalEntityID, actorID, correlationID string) (*domain.ReconciliationSuggestion, error)
-	ArchiveJob(ctx context.Context, tenantID, id string) error
+	//
+	// It locks the job row first and, in that transaction, refuses a decision
+	// on an ARCHIVED job (ErrJobArchived), a stale expectedVersion
+	// (ErrVersionMismatch; 0 = no If-Match sent) and the requester's own
+	// APPROVED/EXECUTED decision (ErrSegregationOfDuties), then records the
+	// decider and increments the job version. The rules live here, at the
+	// data-access boundary, not only in the HTTP handler.
+	ApplyResolution(ctx context.Context, tenantID, jobID, itemID string, status domain.SuggestionStatus, notes string, ref *domain.AuthoritativeRef, legalEntityID, actorID, correlationID string, expectedVersion int) (*domain.ReconciliationSuggestion, error)
+	// ArchiveJob soft-deletes the job under the same lock/version rules and
+	// returns it (status ARCHIVED, version incremented, archived_at/_by set).
+	ArchiveJob(ctx context.Context, tenantID, id, actorID, correlationID string, expectedVersion int) (*domain.ReconciliationJob, error)
 }
 
 type PgStore struct {
@@ -118,6 +127,8 @@ func (s *PgStore) CreateJob(ctx context.Context, tenantID string, job *domain.Re
 	job.TenantID = tenantID
 	job.AnalyzedAt = time.Now()
 	job.CreatedAt = time.Now()
+	job.RequestedBy = actorID
+	job.Version = 1
 
 	// Empty optional values are stored as NULL, not '': a run-sourced job has
 	// no second source system, and a legacy job has no run.
@@ -125,13 +136,13 @@ func (s *PgStore) CreateJob(ctx context.Context, tenantID string, job *domain.Re
 		INSERT INTO reconciliation_jobs (
 			id, tenant_id, legal_entity_id, job_name, source_system_a, source_system_b,
 			total_processed_count, matched_count, unmatched_count, reconciliation_rate, status, analyzed_at, created_at,
-			bank_reconciliation_run_id
-		) VALUES ($1, $2, $3, $4, $5, NULLIF($6, ''), $7, $8, $9, $10, $11, $12, $13, NULLIF($14, '')::uuid)`
+			bank_reconciliation_run_id, requested_by, version
+		) VALUES ($1, $2, $3, $4, $5, NULLIF($6, ''), $7, $8, $9, $10, $11, $12, $13, NULLIF($14, '')::uuid, $15, 1)`
 
 	_, err = tx.Exec(ctx, queryJob,
 		job.ID, tenantID, job.LegalEntityID, job.JobName, string(job.SourceSystemA), string(job.SourceSystemB),
 		job.TotalProcessedCount, job.MatchedCount, job.UnmatchedCount, job.ReconciliationRate, job.Status,
-		job.AnalyzedAt, job.CreatedAt, job.BankReconciliationRunID,
+		job.AnalyzedAt, job.CreatedAt, job.BankReconciliationRunID, actorID,
 	)
 	if err != nil {
 		return fmt.Errorf("insert reconciliation_job failed: %w", err)
@@ -157,6 +168,7 @@ func (s *PgStore) CreateJob(ctx context.Context, tenantID string, job *domain.Re
 		item.JobID = job.ID
 		item.CreatedAt = time.Now()
 		item.UpdatedAt = time.Now()
+		item.ResolutionStatus = item.SuggestionStatus
 
 		_, err := tx.Exec(ctx, queryItem,
 			item.ID, tenantID, item.LegalEntityID, job.ID, item.SourceRecordA, item.SourceRecordB, item.AmountA, item.AmountB,
@@ -220,11 +232,16 @@ func (s *PgStore) GetJobByID(ctx context.Context, tenantID, id string) (*domain.
 	}
 
 	var j domain.ReconciliationJob
-	if err := scanJob(tx.QueryRow(ctx, `SELECT `+jobColumns+` FROM reconciliation_jobs WHERE id = $1`, id), &j); err != nil {
-		return nil, fmt.Errorf("reconciliation job not found: %w", err)
+	// Explicit tenant predicate as well as RLS: isolation must not depend on
+	// the connection being a non-superuser role.
+	if err := scanJob(tx.QueryRow(ctx, `SELECT `+jobColumns+` FROM reconciliation_jobs WHERE id = $1 AND tenant_id = $2`, id, tenantID), &j); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, domain.ErrJobNotFound
+		}
+		return nil, fmt.Errorf("load reconciliation job: %w", err)
 	}
 
-	rows, err := tx.Query(ctx, `SELECT `+itemColumns+` FROM reconciliation_unmatched_items WHERE job_id = $1`, id)
+	rows, err := tx.Query(ctx, `SELECT `+itemColumns+` FROM reconciliation_unmatched_items WHERE job_id = $1 AND tenant_id = $2`, id, tenantID)
 	if err != nil {
 		return nil, fmt.Errorf("query unmatched items: %w", err)
 	}
@@ -249,7 +266,7 @@ func (s *PgStore) GetJobByID(ctx context.Context, tenantID, id string) (*domain.
 // system).
 const jobColumns = `id, tenant_id, legal_entity_id, job_name, source_system_a, COALESCE(source_system_b, ''),
 	total_processed_count, matched_count, unmatched_count, reconciliation_rate, status, analyzed_at, created_at,
-	COALESCE(bank_reconciliation_run_id::text, '')`
+	COALESCE(bank_reconciliation_run_id::text, ''), requested_by, version, archived_at, COALESCE(archived_by, '')`
 
 const itemColumns = `id, tenant_id, legal_entity_id, job_id, source_record_a, source_record_b, amount_a, amount_b,
 	discrepancy_amount, discrepancy_type, confidence_score, COALESCE(heuristic_rule, ''),
@@ -258,13 +275,14 @@ const itemColumns = `id, tenant_id, legal_entity_id, job_id, source_record_a, so
 	COALESCE(bank_reconciliation_run_id::text, ''), COALESCE(statement_line_id::text, ''),
 	COALESCE(counterpart_statement_line_id::text, ''),
 	COALESCE(authoritative_ref_kind, ''), COALESCE(authoritative_ref_id::text, ''),
-	COALESCE(counterpart_journal_id::text, ''), COALESCE(candidate_search_outcome, ''), COALESCE(date_tolerance_version, 0)`
+	COALESCE(counterpart_journal_id::text, ''), COALESCE(candidate_search_outcome, ''), COALESCE(date_tolerance_version, 0),
+	COALESCE(decided_by, ''), decided_at`
 
 func scanJob(row pgx.Row, j *domain.ReconciliationJob) error {
 	return row.Scan(
 		&j.ID, &j.TenantID, &j.LegalEntityID, &j.JobName, &j.SourceSystemA, &j.SourceSystemB,
 		&j.TotalProcessedCount, &j.MatchedCount, &j.UnmatchedCount, &j.ReconciliationRate, &j.Status, &j.AnalyzedAt, &j.CreatedAt,
-		&j.BankReconciliationRunID,
+		&j.BankReconciliationRunID, &j.RequestedBy, &j.Version, &j.ArchivedAt, &j.ArchivedBy,
 	)
 }
 
@@ -278,9 +296,11 @@ func scanItem(row pgx.Row, item *domain.ReconciliationSuggestion) error {
 		&item.BankReconciliationRunID, &item.StatementLineID, &item.CounterpartStatementLineID,
 		&refKind, &refID,
 		&item.CounterpartJournalID, &item.CandidateSearchOutcome, &item.DateToleranceVersion,
+		&item.DecidedBy, &item.DecidedAt,
 	); err != nil {
 		return err
 	}
+	item.ResolutionStatus = item.SuggestionStatus
 	item.AuthoritativeRef = nil
 	if refID != "" {
 		item.AuthoritativeRef = &domain.AuthoritativeRef{Kind: domain.AuthoritativeRefKind(refKind), JournalID: refID}
@@ -341,7 +361,7 @@ func (s *PgStore) ListJobs(ctx context.Context, tenantID, legalEntityID, sourceA
 	return jobs, nil
 }
 
-func (s *PgStore) ApplyResolution(ctx context.Context, tenantID, jobID, itemID string, status domain.SuggestionStatus, notes string, ref *domain.AuthoritativeRef, legalEntityID, actorID, correlationID string) (*domain.ReconciliationSuggestion, error) {
+func (s *PgStore) ApplyResolution(ctx context.Context, tenantID, jobID, itemID string, status domain.SuggestionStatus, notes string, ref *domain.AuthoritativeRef, legalEntityID, actorID, correlationID string, expectedVersion int) (*domain.ReconciliationSuggestion, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -352,12 +372,19 @@ func (s *PgStore) ApplyResolution(ctx context.Context, tenantID, jobID, itemID s
 		return nil, err
 	}
 
+	// Lock the job first: archive state, version and requester are decided
+	// on the row this transaction holds, so two concurrent decisions cannot
+	// both pass the version check and a decision cannot race an archive.
+	if err := lockJobForCommand(ctx, tx, tenantID, jobID, actorID, expectedVersion, domain.RequiresIndependentDecider(status)); err != nil {
+		return nil, err
+	}
+
 	var item domain.ReconciliationSuggestion
 	queryItem := `SELECT ` + itemColumns + `
-		FROM reconciliation_unmatched_items WHERE id = $1 AND job_id = $2
+		FROM reconciliation_unmatched_items WHERE id = $1 AND job_id = $2 AND tenant_id = $3
 		FOR UPDATE`
 
-	if err := scanItem(tx.QueryRow(ctx, queryItem, itemID, jobID), &item); err != nil {
+	if err := scanItem(tx.QueryRow(ctx, queryItem, itemID, jobID, tenantID), &item); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, domain.ErrItemNotFound
 		}
@@ -382,21 +409,29 @@ func (s *PgStore) ApplyResolution(ctx context.Context, tenantID, jobID, itemID s
 	// at exactly the moment a decision is made.
 	combinedNotes := appendResolutionNote(item.ResolutionNotes, notes)
 
+	now := time.Now()
 	item.SuggestionStatus = status
+	item.ResolutionStatus = status
 	item.ResolutionNotes = combinedNotes
 	item.AuthoritativeRef = ref
-	item.UpdatedAt = time.Now()
+	item.UpdatedAt = now
+	item.DecidedBy = actorID
+	item.DecidedAt = &now
 
 	var refKind, refID any
 	if ref != nil {
 		refKind, refID = string(ref.Kind), ref.JournalID
 	}
 	updateQuery := `UPDATE reconciliation_unmatched_items
-		SET suggestion_status = $1, resolution_notes = $2, updated_at = $3, authoritative_ref_kind = $4, authoritative_ref_id = $5
-		WHERE id = $6`
-	_, err = tx.Exec(ctx, updateQuery, string(status), combinedNotes, item.UpdatedAt, refKind, refID, itemID)
+		SET suggestion_status = $1, resolution_notes = $2, updated_at = $3, authoritative_ref_kind = $4, authoritative_ref_id = $5,
+		    decided_by = $6, decided_at = $3
+		WHERE id = $7 AND tenant_id = $8`
+	_, err = tx.Exec(ctx, updateQuery, string(status), combinedNotes, item.UpdatedAt, refKind, refID, actorID, itemID, tenantID)
 	if err != nil {
 		return nil, err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE reconciliation_jobs SET version = version + 1 WHERE id = $1 AND tenant_id = $2`, jobID, tenantID); err != nil {
+		return nil, fmt.Errorf("advance job version: %w", err)
 	}
 
 	if err := s.enqueueReconciliationEvent(ctx, tx, "resolution-recommended", "reconciliation.resolution_recommended",
@@ -420,6 +455,7 @@ func (s *PgStore) ApplyResolution(ctx context.Context, tenantID, jobID, itemID s
 			"suggestion_status": string(item.SuggestionStatus),
 			"resolution_status": string(item.SuggestionStatus),
 			"resolution_notes":  item.ResolutionNotes,
+			"decided_by":        actorID,
 			// The owning domain's record behind an EXECUTED decision; null
 			// otherwise.
 			"authoritative_ref": item.AuthoritativeRef,
@@ -433,26 +469,57 @@ func (s *PgStore) ApplyResolution(ctx context.Context, tenantID, jobID, itemID s
 	return &item, nil
 }
 
-func (s *PgStore) ArchiveJob(ctx context.Context, tenantID, id string) error {
+func (s *PgStore) ArchiveJob(ctx context.Context, tenantID, id, actorID, correlationID string, expectedVersion int) (*domain.ReconciliationJob, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer tx.Rollback(ctx)
 
 	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID); err != nil {
-		return err
+		return nil, err
 	}
+	if err := lockJobForCommand(ctx, tx, tenantID, id, actorID, expectedVersion, false); err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE reconciliation_jobs
+		SET status = 'ARCHIVED', version = version + 1, archived_at = now(), archived_by = $2
+		WHERE id = $1 AND tenant_id = $3`, id, actorID, tenantID); err != nil {
+		return nil, fmt.Errorf("archive reconciliation job: %w", err)
+	}
+	var job domain.ReconciliationJob
+	if err := scanJob(tx.QueryRow(ctx, `SELECT `+jobColumns+` FROM reconciliation_jobs WHERE id = $1 AND tenant_id = $2`, id, tenantID), &job); err != nil {
+		return nil, fmt.Errorf("reload archived job: %w", err)
+	}
+	if err := s.enqueueReconciliationEvent(ctx, tx, "archived", "reconciliation.archived",
+		id, tenantID, job.LegalEntityID, actorID, correlationID, map[string]any{
+			"job_id":      id,
+			"archived_by": actorID,
+			"version":     job.Version,
+		}); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return &job, nil
+}
 
-	cmd, err := tx.Exec(ctx, "UPDATE reconciliation_jobs SET status = 'ARCHIVED' WHERE id = $1", id)
+// lockJobForCommand locks the job row for a decision or the archive and
+// applies the rules every command shares (domain.CheckJobCommand). The row is
+// RLS-scoped, so another tenant's job reads as not found.
+func lockJobForCommand(ctx context.Context, tx pgx.Tx, tenantID, jobID, actorID string, expectedVersion int, needsIndependentDecider bool) error {
+	var status, requestedBy string
+	var version int
+	err := tx.QueryRow(ctx, `SELECT status, requested_by, version FROM reconciliation_jobs WHERE id = $1 AND tenant_id = $2 FOR UPDATE`, jobID, tenantID).
+		Scan(&status, &requestedBy, &version)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.ErrJobNotFound
+	}
 	if err != nil {
-		return err
+		return fmt.Errorf("lock reconciliation job: %w", err)
 	}
-	if cmd.RowsAffected() == 0 {
-		return fmt.Errorf("reconciliation job not found")
-	}
-
-	return tx.Commit(ctx)
+	return domain.CheckJobCommand(status, requestedBy, version, actorID, expectedVersion, needsIndependentDecider)
 }
 
 // nullableHeuristicRule stores an unset rule as NULL. That is only possible
@@ -513,6 +580,8 @@ func (m *MemoryStore) CreateJob(ctx context.Context, tenantID string, job *domai
 	job.TenantID = tenantID
 	job.AnalyzedAt = time.Now()
 	job.CreatedAt = time.Now()
+	job.RequestedBy = actorID
+	job.Version = 1
 
 	for i := range items {
 		items[i].ID = uuid.New().String()
@@ -521,6 +590,7 @@ func (m *MemoryStore) CreateJob(ctx context.Context, tenantID string, job *domai
 		items[i].JobID = job.ID
 		items[i].CreatedAt = time.Now()
 		items[i].UpdatedAt = time.Now()
+		items[i].ResolutionStatus = items[i].SuggestionStatus
 	}
 
 	job.UnmatchedItems = items
@@ -534,9 +604,11 @@ func (m *MemoryStore) GetJobByID(ctx context.Context, tenantID, id string) (*dom
 
 	j, exists := m.jobs[id]
 	if !exists || j.TenantID != tenantID {
-		return nil, fmt.Errorf("reconciliation job not found")
+		return nil, domain.ErrJobNotFound
 	}
-	return j, nil
+	cp := *j
+	cp.UnmatchedItems = append([]domain.ReconciliationSuggestion(nil), j.UnmatchedItems...)
+	return &cp, nil
 }
 
 func (m *MemoryStore) ListJobs(ctx context.Context, tenantID, legalEntityID, sourceA, status string, limit, offset int) ([]domain.ReconciliationJob, error) {
@@ -578,13 +650,16 @@ func (m *MemoryStore) ListJobs(ctx context.Context, tenantID, legalEntityID, sou
 	return result, nil
 }
 
-func (m *MemoryStore) ApplyResolution(ctx context.Context, tenantID, jobID, itemID string, status domain.SuggestionStatus, notes string, ref *domain.AuthoritativeRef, legalEntityID, actorID, correlationID string) (*domain.ReconciliationSuggestion, error) {
+func (m *MemoryStore) ApplyResolution(ctx context.Context, tenantID, jobID, itemID string, status domain.SuggestionStatus, notes string, ref *domain.AuthoritativeRef, legalEntityID, actorID, correlationID string, expectedVersion int) (*domain.ReconciliationSuggestion, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	j, exists := m.jobs[jobID]
 	if !exists || j.TenantID != tenantID {
-		return nil, fmt.Errorf("reconciliation job not found")
+		return nil, domain.ErrJobNotFound
+	}
+	if err := domain.CheckJobCommand(j.Status, j.RequestedBy, j.Version, actorID, expectedVersion, domain.RequiresIndependentDecider(status)); err != nil {
+		return nil, err
 	}
 
 	for i := range j.UnmatchedItems {
@@ -598,26 +673,40 @@ func (m *MemoryStore) ApplyResolution(ctx context.Context, tenantID, jobID, item
 			// Append rather than overwrite — mirrors PgStore exactly. See its
 			// comment: the machine's rationale must survive a human's
 			// empty-note approval.
+			now := time.Now()
 			j.UnmatchedItems[i].SuggestionStatus = status
+			j.UnmatchedItems[i].ResolutionStatus = status
 			j.UnmatchedItems[i].ResolutionNotes = appendResolutionNote(j.UnmatchedItems[i].ResolutionNotes, notes)
 			j.UnmatchedItems[i].AuthoritativeRef = ref
-			j.UnmatchedItems[i].UpdatedAt = time.Now()
-			return &j.UnmatchedItems[i], nil
+			j.UnmatchedItems[i].UpdatedAt = now
+			j.UnmatchedItems[i].DecidedBy = actorID
+			j.UnmatchedItems[i].DecidedAt = &now
+			j.Version++
+			cp := j.UnmatchedItems[i]
+			return &cp, nil
 		}
 	}
 
 	return nil, domain.ErrItemNotFound
 }
 
-func (m *MemoryStore) ArchiveJob(ctx context.Context, tenantID, id string) error {
+func (m *MemoryStore) ArchiveJob(ctx context.Context, tenantID, id, actorID, correlationID string, expectedVersion int) (*domain.ReconciliationJob, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	j, exists := m.jobs[id]
 	if !exists || j.TenantID != tenantID {
-		return fmt.Errorf("reconciliation job not found")
+		return nil, domain.ErrJobNotFound
 	}
-
+	if err := domain.CheckJobCommand(j.Status, j.RequestedBy, j.Version, actorID, expectedVersion, false); err != nil {
+		return nil, err
+	}
+	now := time.Now()
 	j.Status = "ARCHIVED"
-	return nil
+	j.Version++
+	j.ArchivedAt = &now
+	j.ArchivedBy = actorID
+	cp := *j
+	cp.UnmatchedItems = nil
+	return &cp, nil
 }

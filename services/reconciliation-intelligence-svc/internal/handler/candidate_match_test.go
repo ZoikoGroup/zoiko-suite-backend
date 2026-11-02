@@ -191,16 +191,17 @@ func TestAutoMatchProposal_CannotBeExecutedAsAPosting(t *testing.T) {
 		req := httptest.NewRequest(http.MethodPost, "/v1/reconciliations/"+job.ID+"/resolutions/"+near.ID+"/apply", bytes.NewReader(raw))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Idempotency-Key", key)
+		req.Header.Set("X-Principal-Id", "reviewer-01") // not the analysis requester (SoD)
 		withEnvelope(req)
 		out := httptest.NewRecorder()
 		router.ServeHTTP(out, req)
 		return out
 	}
 	// A human approves the proposal first (RECOMMENDED -> APPROVED).
-	if out := apply(map[string]any{"suggestion_status": "APPROVED"}, "idem-approve"); out.Code != http.StatusOK {
+	if out := apply(map[string]any{"suggestion_status": "APPROVED", "resolution_notes": "proposal reviewed"}, "idem-approve"); out.Code != http.StatusOK {
 		t.Fatalf("approve: %d %s", out.Code, out.Body.String())
 	}
-	out := apply(map[string]any{"suggestion_status": "EXECUTED",
+	out := apply(map[string]any{"suggestion_status": "EXECUTED", "resolution_notes": "executed",
 		"authoritative_ref": map[string]string{"kind": "GL_JOURNAL", "journal_id": near.CounterpartJournalID}}, "idem-execute")
 	if out.Code < 400 || out.Code >= 500 {
 		t.Fatalf("expected a 4xx refusal, got %d: %s", out.Code, out.Body.String())

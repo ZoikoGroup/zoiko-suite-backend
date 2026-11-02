@@ -93,7 +93,7 @@ func TestAnalyzeAndLifecycleReconciliation(t *testing.T) {
 	withEnvelope(applyReq)
 	applyReq.Header.Set("X-Tenant-ID", "tenant-rec-88")
 	applyReq.Header.Set("Content-Type", "application/json")
-	applyReq.Header.Set("X-Principal-Id", "principal-01")
+	applyReq.Header.Set("X-Principal-Id", "principal-02") // not the analysis requester (SoD)
 	applyRec := httptest.NewRecorder()
 
 	router.ServeHTTP(applyRec, applyReq)

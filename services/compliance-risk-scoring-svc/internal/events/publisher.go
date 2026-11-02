@@ -39,9 +39,12 @@ const (
 // correlation ID, source service and payload. Jurisdiction is not carried:
 // a risk score has no jurisdiction of its own (see ROUTES.md gaps).
 type Event struct {
-	EventID       string      `json:"event_id"`
-	EventType     string      `json:"event_type"`
-	EventVersion  string      `json:"event_version"`
+	EventID      string `json:"event_id"`
+	EventType    string `json:"event_type"`
+	EventVersion string `json:"event_version"`
+	// SchemaVersion is the field the platform audit consumer (audit-event-store-svc)
+	// requires; EventVersion is kept for existing consumers. Same value.
+	SchemaVersion string      `json:"schema_version"`
 	SourceService string      `json:"source_service"`
 	SubjectID     string      `json:"subject_id"`
 	TenantID      string      `json:"tenant_id"`
@@ -72,6 +75,7 @@ func BuildEvent(params PublishParams, eventID string, occurredAt time.Time) Even
 		EventID:       eventID,
 		EventType:     params.EventType,
 		EventVersion:  "1.0",
+		SchemaVersion: "1.0",
 		SourceService: SourceService,
 		SubjectID:     params.SubjectID,
 		TenantID:      params.TenantID,

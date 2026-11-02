@@ -48,10 +48,12 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 		"000004_suggestion_counterpart_line.up.sql",
 		"000005_suggestion_score_provenance.up.sql",
 		"000006_suggestion_data_model_names.up.sql",
+		"000007_force_rls.up.sql",
 		"000007_suggestion_authoritative_ref.up.sql",
 		"000008_suggestion_candidate_match.up.sql",
 		"000009_rls_force_with_check.up.sql",
 		"000010_idempotency_keys.up.sql",
+		"000011_job_version_requester_decisions.up.sql",
 	} {
 		sql, err := os.ReadFile(filepath.Join(base, "../../deployments/migrations", migration))
 		if err != nil {
@@ -175,7 +177,7 @@ func TestPgStore_ApplyResolution_EnqueuesResolutionEvent(t *testing.T) {
 	}
 	itemID := job.UnmatchedItems[0].ID
 
-	if _, err := s.ApplyResolution(ctx, tenantID, job.ID, itemID, domain.StatusApproved, "looks fine", nil, job.LegalEntityID, "actor-2", "corr-2"); err != nil {
+	if _, err := s.ApplyResolution(ctx, tenantID, job.ID, itemID, domain.StatusApproved, "looks fine", nil, job.LegalEntityID, "actor-2", "corr-2", 0); err != nil {
 		t.Fatalf("ApplyResolution: %v", err)
 	}
 
@@ -232,7 +234,7 @@ func TestPgStore_AmountsRoundTripExactly(t *testing.T) {
 		t.Fatalf("GetJobByID amounts = %s / %s / %s, want 100.25 / 132.5 / 32.25", it.AmountA, it.AmountB, it.DiscrepancyAmount)
 	}
 
-	resolved, err := s.ApplyResolution(ctx, tenantID, job.ID, itemID, domain.StatusApproved, "", nil, job.LegalEntityID, "actor-2", "corr-2")
+	resolved, err := s.ApplyResolution(ctx, tenantID, job.ID, itemID, domain.StatusApproved, "", nil, job.LegalEntityID, "actor-2", "corr-2", 0)
 	if err != nil {
 		t.Fatalf("ApplyResolution: %v", err)
 	}
@@ -352,7 +354,7 @@ func TestPgStore_RunSourcedJob_TraceableAndUnmeasuredCountersStayNull(t *testing
 		t.Fatalf("ListJobs: %v %+v", err, listed)
 	}
 
-	resolved, err := s.ApplyResolution(ctx, tenantID, job.ID, it.ID, domain.StatusApproved, "", nil, job.LegalEntityID, "actor-2", "corr-2")
+	resolved, err := s.ApplyResolution(ctx, tenantID, job.ID, it.ID, domain.StatusApproved, "", nil, job.LegalEntityID, "actor-2", "corr-2", 0)
 	if err != nil {
 		t.Fatalf("ApplyResolution: %v", err)
 	}
@@ -445,7 +447,7 @@ func TestPgStore_DuplicateEntry_CounterpartRoundTrips(t *testing.T) {
 		}
 	}
 
-	resolved, err := s.ApplyResolution(ctx, tenantID, job.ID, dupID, domain.StatusApproved, "same BACS entry imported twice", nil, job.LegalEntityID, "actor-2", "corr-2")
+	resolved, err := s.ApplyResolution(ctx, tenantID, job.ID, dupID, domain.StatusApproved, "same BACS entry imported twice", nil, job.LegalEntityID, "actor-2", "corr-2", 0)
 	if err != nil {
 		t.Fatalf("ApplyResolution: %v", err)
 	}

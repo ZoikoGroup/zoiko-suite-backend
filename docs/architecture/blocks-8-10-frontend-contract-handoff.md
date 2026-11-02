@@ -369,4 +369,33 @@ Gateway prefix `/hris-connector-svc` · container port 8146 · host port 8198
 - reporting-orchestration: report runs are recorded `NOT_IMPLEMENTED` (no data sources wired).
 - key-management: metadata only — no cryptographic operations exist; do not present it as a KMS.
 - carta `/v1/carta/evaluate` needs only a tenant (no principal check, tracker row 84d).
-- reconciliation-intelligence: error bodies are `{error}` (not problem+json); list is paged `limit` 1..200 (default 50) + `offset`.
+- reconciliation-intelligence: list is paged `limit` 1..200 (default 50) + `offset`. Its contract changed in the acceptance pass; see §4.
+
+## 4. Contract changes from the end-to-end acceptance pass (2026-11-02, uncommitted)
+
+These change behaviour the UI may already rely on. All are pending owner review (see the acceptance report, `docs/audit_files/blocks-6-10-final-end-to-end-acceptance-report.md`).
+
+### reconciliation-intelligence-svc
+
+Routes are unchanged: `POST /v1/reconciliations/analyze`, `GET /v1/reconciliations`, `GET /v1/reconciliations/{id}`, `POST /v1/reconciliations/{id}/resolutions/{itemId}/apply`, `DELETE /v1/reconciliations/{id}`.
+
+| Change | Before | Now | UI action |
+|---|---|---|---|
+| Error body | `{error,message}` JSON | RFC 9457 `application/problem+json` with `type,title,status,detail,code,instance,request_id,correlation_id`; legacy `error` (= code) and `message` (= detail) kept | Read `status` + `code` |
+| Apply: `suggestion_status` | optional, defaulted to `APPROVED` | **required** (`APPROVED`/`REJECTED`/`EXECUTED`); missing → 400 | Always send it explicitly |
+| Apply: `resolution_notes` | optional | **required**, non-empty (ZS-SVC-Z-001 INV-18); missing → 400 | Collect a reason in the decision dialog |
+| Apply: unknown body fields | ignored | 400 | Send only `suggestion_status`, `resolution_status` (legacy alias, must agree), `resolution_notes`, `authoritative_ref` |
+| Segregation of duties | none | the user who ran the analysis (`requested_by`) gets **403 `segregation_of_duties`** on APPROVED/EXECUTED; REJECTED is allowed | Hide/disable approve/execute for the requester |
+| Concurrency | none | job has `version` (starts 1, +1 per decision/archive); GET/analyze/archive send `ETag: "N"`; optional `If-Match: "N"` on apply/archive → **412 `version_mismatch`** if stale, 400 `invalid_if_match` if malformed | Send `If-Match` from the last GET; on 412 reload |
+| Archive | 200 `{"message","id"}` | **200 with the archived job** (`status: ARCHIVED`, `archived_at`, `archived_by`); second archive or a decision on an archived job → 409 `job_archived` | Use the returned job |
+| New job fields | — | `requested_by`, `version`, `archived_at`, `archived_by` | Display read-only |
+| New suggestion fields | — | `decided_by`, `decided_at` | Display read-only |
+| List | rows could include `unmatched_items` (store-dependent) | list rows omit `unmatched_items`; fetch them with GET `/{id}` | Load detail on open |
+| Path ids | any string | must be UUIDs; otherwise 400 `invalid_id` | — |
+| Body `tenant_id` on analyze | ignored | optional; if present it must equal `X-Tenant-Id`, otherwise 403 `tenant_mismatch` | Omit it |
+| Idempotency-Key reused with a different body | 409 | 409 (unchanged; matches the platform standard §9/§11) | — |
+
+### Events (no UI impact)
+
+The outbox events of board-resolutions, tax-rules, vat-gst, withholding-tax, forecasting, compliance-risk-scoring, reporting-orchestration, hris-connector, tax-authority-interface, external-data-feed, anomaly-detection and esignature-integration now carry `schema_version: "1.0"`, which the audit-event-store consumer requires. This change only adds a field.
+
