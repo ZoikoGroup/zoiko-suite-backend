@@ -1,0 +1,451 @@
+asyncapi: "2.6.0"
+
+info:
+  title: Org Structure Service — Event Contract
+  version: "1.0.0"
+  description: |
+    The events org-structure-svc publishes. The ORG-05 (Organizational Unit)
+    events of ZS-SVC-I-001 s4.5 are new; the three older events are the
+    department, position and assignment events that existed before.
+
+    ## Spec names are not wire names
+
+    The specification names events in PascalCase (OrgUnitReparented). This
+    estate's wire convention is lower.dotted (`org.unit.reparented`), and
+    consumers subscribe to the wire name. Every message below records both, the
+    spec name in `x-spec-event` (null where the spec names no such event). The
+    mapping is asserted against the Go constants by internal/events/contract_test.go,
+    so the two cannot drift silently.
+
+    ## Delivery
+
+    The ORG-05 events (`org.unit.*`) are written to the `event_outbox` table in
+    the SAME transaction as the change they attest, and delivered by a relay.
+    Either the change and its event both happen, or neither does. Delivery is
+    AT-LEAST-ONCE: every consumer must dedupe on `event_id`, and order by
+    `object_version`.
+
+    The three older events (`org.structure.changed`, `position.created`,
+    `employee.assigned`) are still published directly after commit and are
+    best-effort: a broker failure at that moment loses the event. They are
+    marked `x-delivery: best-effort` and are not part of the ORG-05 contract.
+
+    ## Versions (ZS-SVC-I-001 s7)
+
+    Every ORG-05 payload carries `object_id`, `object_version`, `effective_at`
+    and `recorded_at`. `object_version` is the aggregate version the write left
+    behind (the `record_version` that `GET /v1/org/units/{id}` returns), so a
+    consumer can pin exactly the version it was told about. Change requests are
+    versioned 1 (proposed) and 2 (decided).
+
+    `effective_at` is the date the change applies from (YYYY-MM-DD). A status
+    change has no business date of its own, so it carries the recorded date.
+
+defaultContentType: application/json
+
+servers:
+  local:
+    url: localhost:9092
+    protocol: kafka
+    description: Local development broker (deployments/docker-compose.yml).
+
+channels:
+  zoiko.orgstructure.events:
+    description: |
+      Every event this service publishes, on one topic (KAFKA_EVENTS_TOPIC).
+
+      The message KEY is the org unit id for every `org.unit.*` event, including
+      the events of that unit's change requests. Kafka orders only within a
+      partition, so keying by unit is what stops a consumer seeing a unit's
+      reparent before its creation. The older events are keyed by their own
+      entity id.
+    subscribe:
+      summary: Consume org-structure domain events.
+      operationId: consumeOrgStructureEvents
+      message:
+        oneOf:
+          - $ref: "#/components/messages/OrgUnitCreated"
+          - $ref: "#/components/messages/OrgUnitActivated"
+          - $ref: "#/components/messages/OrgUnitDeactivated"
+          - $ref: "#/components/messages/OrgUnitReparented"
+          - $ref: "#/components/messages/OrgUnitManagerChanged"
+          - $ref: "#/components/messages/OrgUnitReparentRequested"
+          - $ref: "#/components/messages/OrgUnitReparentApproved"
+          - $ref: "#/components/messages/OrgUnitReparentRejected"
+          - $ref: "#/components/messages/OrgUnitReparentFailed"
+          - $ref: "#/components/messages/OrgStructureChanged"
+          - $ref: "#/components/messages/PositionCreated"
+          - $ref: "#/components/messages/EmployeeAssigned"
+
+components:
+  messages:
+    OrgUnitCreated:
+      name: org.unit.created
+      title: Org unit created
+      summary: A unit was created in DRAFT, placed in the hierarchy from effective_at.
+      x-spec-event: OrgUnitCreated
+      x-delivery: outbox
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/OrgEnvelope"
+          - type: object
+            properties:
+              payload:
+                allOf:
+                  - $ref: "#/components/schemas/OrgUnitPayload"
+                  - type: object
+                    properties:
+                      details:
+                        type: object
+                        required: [code, name, unit_type, status]
+                        properties:
+                          code: { type: string }
+                          name: { type: string }
+                          unit_type: { $ref: "#/components/schemas/UnitType" }
+                          status: { type: string, enum: [DRAFT] }
+                          parent_unit_id: { type: string, nullable: true }
+                          manager_employee_id: { type: string, nullable: true }
+                          cost_center_code: { type: string }
+                          profit_center_code: { type: string }
+                          location_ref: { type: string }
+                          reason: { type: string }
+
+    OrgUnitActivated:
+      name: org.unit.activated
+      title: Org unit activated
+      summary: A DRAFT unit became ACTIVE. The spec names no such event.
+      x-spec-event: null
+      x-delivery: outbox
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/OrgEnvelope"
+          - type: object
+            properties:
+              payload:
+                allOf:
+                  - $ref: "#/components/schemas/OrgUnitPayload"
+                  - $ref: "#/components/schemas/StatusChangeDetails"
+
+    OrgUnitDeactivated:
+      name: org.unit.deactivated
+      title: Org unit deactivated
+      summary: An ACTIVE unit was retired. It had no active child units.
+      x-spec-event: OrgUnitDeactivated
+      x-delivery: outbox
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/OrgEnvelope"
+          - type: object
+            properties:
+              payload:
+                allOf:
+                  - $ref: "#/components/schemas/OrgUnitPayload"
+                  - $ref: "#/components/schemas/StatusChangeDetails"
+
+    OrgUnitReparented:
+      name: org.unit.reparented
+      title: Org unit reparented
+      summary: |
+        A unit was placed under a new parent from effective_at. The previous
+        placement is closed, not edited. When the move needed independent
+        approval, `evidence_ref` is the approved change request.
+      x-spec-event: OrgUnitReparented
+      x-delivery: outbox
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/OrgEnvelope"
+          - type: object
+            properties:
+              payload:
+                allOf:
+                  - $ref: "#/components/schemas/OrgUnitPayload"
+                  - type: object
+                    properties:
+                      details:
+                        type: object
+                        required: [previous_parent_unit_id, new_parent_unit_id, reason]
+                        properties:
+                          previous_parent_unit_id: { type: string, nullable: true }
+                          new_parent_unit_id: { type: string, nullable: true }
+                          reason: { type: string }
+
+    OrgUnitManagerChanged:
+      name: org.unit.manager.changed
+      title: Org unit manager changed
+      summary: A new manager was named from effective_at. The previous manager stays in history.
+      x-spec-event: OrgUnitManagerChanged
+      x-delivery: outbox
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/OrgEnvelope"
+          - type: object
+            properties:
+              payload:
+                allOf:
+                  - $ref: "#/components/schemas/OrgUnitPayload"
+                  - type: object
+                    properties:
+                      details:
+                        type: object
+                        required: [previous_manager_employee_id, new_manager_employee_id, reason]
+                        properties:
+                          previous_manager_employee_id: { type: string, nullable: true }
+                          new_manager_employee_id: { type: string }
+                          reason: { type: string }
+
+    OrgUnitReparentRequested:
+      name: org.unit.reparent.requested
+      title: Org unit reparent proposed
+      summary: |
+        A reparent that carries financial mappings was proposed and awaits an
+        independent approver. Nothing has moved yet. object_id is the change
+        request; unit_id is the unit.
+      x-spec-event: null
+      x-delivery: outbox
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/OrgEnvelope"
+          - type: object
+            properties:
+              payload:
+                allOf:
+                  - $ref: "#/components/schemas/OrgUnitPayload"
+                  - type: object
+                    properties:
+                      object_type: { type: string, enum: [org_unit_change_request] }
+                      details:
+                        type: object
+                        required: [new_parent_unit_id, reason, unit_version, units_affected, mapped_unit_count, requires_approval]
+                        properties:
+                          new_parent_unit_id: { type: string, nullable: true }
+                          reason: { type: string }
+                          unit_version: { type: integer, description: The unit version the maker read. }
+                          units_affected: { type: integer }
+                          mapped_unit_count: { type: integer }
+                          requires_approval: { type: boolean }
+
+    OrgUnitReparentApproved:
+      name: org.unit.reparent.approved
+      title: Org unit reparent approved
+      summary: |
+        A different principal approved the proposal. The move itself is announced
+        by `org.unit.reparented`, written in the same transaction.
+      x-spec-event: null
+      x-delivery: outbox
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/OrgEnvelope"
+          - type: object
+            properties:
+              payload:
+                allOf:
+                  - $ref: "#/components/schemas/OrgUnitPayload"
+                  - type: object
+                    properties:
+                      object_type: { type: string, enum: [org_unit_change_request] }
+                      details:
+                        type: object
+                        required: [requested_by, reason]
+                        properties:
+                          requested_by: { type: string }
+                          reason: { type: string }
+
+    OrgUnitReparentRejected:
+      name: org.unit.reparent.rejected
+      title: Org unit reparent rejected
+      summary: The proposal was rejected. Nothing moved.
+      x-spec-event: null
+      x-delivery: outbox
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/OrgEnvelope"
+          - type: object
+            properties:
+              payload:
+                allOf:
+                  - $ref: "#/components/schemas/OrgUnitPayload"
+                  - type: object
+                    properties:
+                      object_type: { type: string, enum: [org_unit_change_request] }
+                      details:
+                        type: object
+                        required: [requested_by, decision_reason]
+                        properties:
+                          requested_by: { type: string }
+                          decision_reason: { type: string }
+
+    OrgUnitReparentFailed:
+      name: org.unit.reparent.failed
+      title: Org unit reparent failed
+      summary: |
+        Approval was attempted but the change could no longer be applied as
+        written (the unit changed since, a loop appeared, the parent was
+        retired). The request is closed; nothing moved.
+      x-spec-event: null
+      x-delivery: outbox
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/OrgEnvelope"
+          - type: object
+            properties:
+              payload:
+                allOf:
+                  - $ref: "#/components/schemas/OrgUnitPayload"
+                  - type: object
+                    properties:
+                      object_type: { type: string, enum: [org_unit_change_request] }
+                      details:
+                        type: object
+                        required: [requested_by, failure_code]
+                        properties:
+                          requested_by: { type: string }
+                          failure_code:
+                            type: string
+                            enum:
+                              [version_conflict, hierarchy_loop, parent_invalid, parent_not_active,
+                               invalid_effective_date, no_change, invalid_transition, org_unit_not_found, apply_failed]
+
+    OrgStructureChanged:
+      name: org.structure.changed
+      title: Org structure changed (legacy)
+      summary: Generic change notice for departments. Best-effort delivery.
+      x-spec-event: null
+      x-delivery: best-effort
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/LegacyEnvelope"
+          - type: object
+            properties:
+              payload:
+                type: object
+                required: [change_type, entity_id, changed_at]
+                properties:
+                  change_type: { type: string }
+                  entity_id: { type: string }
+                  changed_at: { type: string, format: date-time }
+
+    PositionCreated:
+      name: position.created
+      title: Position created (legacy)
+      summary: A position was created. Best-effort delivery.
+      x-spec-event: null
+      x-delivery: best-effort
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/LegacyEnvelope"
+          - type: object
+            properties:
+              payload:
+                type: object
+                required: [position_id, tenant_id, legal_entity_id, department_id, title, code]
+                properties:
+                  position_id: { type: string }
+                  tenant_id: { type: string }
+                  legal_entity_id: { type: string }
+                  department_id: { type: string }
+                  title: { type: string }
+                  code: { type: string }
+                  job_level: { type: string }
+                  max_headcount: { type: integer }
+                  created_at: { type: string, format: date-time }
+
+    EmployeeAssigned:
+      name: employee.assigned
+      title: Employee assigned (legacy)
+      summary: An employee was assigned to a department and position. Best-effort delivery.
+      x-spec-event: null
+      x-delivery: best-effort
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/LegacyEnvelope"
+          - type: object
+            properties:
+              payload:
+                type: object
+                required: [assignment_id, tenant_id, employee_id, department_id, position_id]
+                properties:
+                  assignment_id: { type: string }
+                  tenant_id: { type: string }
+                  employee_id: { type: string }
+                  department_id: { type: string }
+                  position_id: { type: string }
+                  manager_employee_id: { type: string, nullable: true }
+                  effective_from: { type: string }
+                  assigned_at: { type: string, format: date-time }
+
+  schemas:
+    UnitType:
+      type: string
+      enum: [DEPARTMENT, BUSINESS_UNIT, FUNCTION, DIVISION, TEAM]
+
+    LegacyEnvelope:
+      type: object
+      required: [event_id, event_type, event_version, emitted_at, schema_version, source_service, correlation_id, payload]
+      properties:
+        event_id: { type: string }
+        event_type: { type: string }
+        event_version: { type: string }
+        emitted_at: { type: string, format: date-time }
+        schema_version: { type: string }
+        source_service: { type: string, enum: [org-structure-svc] }
+        tenant_id: { type: string }
+        legal_entity_id: { type: string }
+        actor_id: { type: string }
+        correlation_id: { type: string }
+        payload: { type: object }
+
+    OrgEnvelope:
+      description: The platform envelope every ORG-05 event is wrapped in.
+      type: object
+      required: [event_id, event_type, event_version, emitted_at, schema_version, source_service, tenant_id, legal_entity_id, correlation_id, payload]
+      properties:
+        event_id:
+          type: string
+          description: "`evt-` followed by the outbox id. The value consumers dedupe on."
+        event_type: { type: string }
+        event_version: { type: string, enum: ["1.0"] }
+        emitted_at:
+          type: string
+          format: date-time
+          description: The same instant as the payload's recorded_at.
+        schema_version: { type: string, enum: ["1.0"] }
+        source_service: { type: string, enum: [org-structure-svc] }
+        tenant_id: { type: string }
+        legal_entity_id: { type: string }
+        actor_id: { type: string }
+        correlation_id: { type: string }
+        payload: { type: object }
+
+    OrgUnitPayload:
+      description: |
+        The payload common to every ORG-05 event. These are the fields the spec
+        requires of every event (s7): tenant_id, object_id, object_version,
+        effective_at, recorded_at, actor, correlation_id and, where material,
+        evidence_ref.
+      type: object
+      required: [tenant_id, legal_entity_id, object_type, object_id, object_version, unit_id, effective_at, recorded_at, actor, correlation_id, details]
+      properties:
+        tenant_id: { type: string }
+        legal_entity_id: { type: string }
+        object_type: { type: string, enum: [org_unit, org_unit_change_request] }
+        object_id: { type: string, description: The unit id, or the change request id for change-request events. }
+        object_version: { type: integer, minimum: 1 }
+        unit_id: { type: string, description: The unit the event is about; also the Kafka message key. }
+        effective_at: { type: string, format: date }
+        recorded_at: { type: string, format: date-time }
+        actor: { type: string }
+        correlation_id: { type: string }
+        evidence_ref:
+          type: string
+          description: Present where material, for example the approved change request behind a reparent.
+        details: { type: object }
+
+    StatusChangeDetails:
+      type: object
+      properties:
+        details:
+          type: object
+          required: [from_status, to_status]
+          properties:
+            from_status: { type: string, enum: [DRAFT, ACTIVE, INACTIVE] }
+            to_status: { type: string, enum: [DRAFT, ACTIVE, INACTIVE] }

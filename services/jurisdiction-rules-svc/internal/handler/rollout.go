@@ -8,6 +8,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"zoiko.io/jurisdiction-rules-svc/internal/domain"
+	"zoiko.io/jurisdiction-rules-svc/internal/events"
 	"zoiko.io/jurisdiction-rules-svc/internal/store"
 )
 
@@ -94,6 +95,8 @@ func (h *Handler) CreateRollout(w http.ResponseWriter, r *http.Request) {
 		h.writeRolloutError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
+	h.emitRegistry(r, events.EventRolloutCreated, rec.RolloutID, actor, map[string]any{"rollout_id": rec.RolloutID, "family_ref": rec.FamilyRef,
+		"layer": rec.Layer, "jurisdiction_code": rec.JurisdictionCode, "status": rec.Status})
 	writeJSON(w, http.StatusCreated, rec)
 }
 
@@ -234,6 +237,8 @@ func (h *Handler) AttestRollout(w http.ResponseWriter, r *http.Request) {
 		h.writeRolloutError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
+	h.emitRegistry(r, events.EventRolloutAttested, chi.URLParam(r, "rollout_id"), actor, map[string]any{"rollout_id": chi.URLParam(r, "rollout_id"),
+		"checklist": req.Checklist, "item_code": req.ItemCode, "met": req.Met})
 	writeJSON(w, http.StatusCreated, map[string]any{"checklist": req.Checklist, "item_code": req.ItemCode, "met": req.Met, "attested_by": actor})
 }
 
@@ -266,6 +271,8 @@ func (h *Handler) ExpertApproveRollout(w http.ResponseWriter, r *http.Request) {
 		h.writeRolloutError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
+	h.emitRegistry(r, events.EventRolloutExpertDecided, chi.URLParam(r, "rollout_id"), actor, map[string]any{"rollout_id": chi.URLParam(r, "rollout_id"),
+		"decision": req.Decision, "scope": strings.TrimSpace(req.Scope)})
 	writeJSON(w, http.StatusCreated, map[string]any{"expert": actor, "decision": req.Decision})
 }
 
@@ -293,6 +300,7 @@ func (h *Handler) TransitionRollout(w http.ResponseWriter, r *http.Request) {
 		h.writeRolloutError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
+	h.emitRolloutTransition(r, rec, actor, strings.TrimSpace(req.Reason))
 	writeJSON(w, http.StatusOK, rec)
 }
 
@@ -323,3 +331,14 @@ func (h *Handler) JurisdictionSupport(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, v)
 }
 
+// emitRolloutTransition publishes the status change and, when the move enters or
+// leaves LAUNCHED, jurisdiction.support-changed (s26): LAUNCHED is the only status
+// from which a jurisdiction can be reported SUPPORTED.
+func (h *Handler) emitRolloutTransition(r *http.Request, rec *store.RolloutRecord, actor, reason string) {
+	payload := map[string]any{"rollout_id": rec.RolloutID, "family_ref": rec.FamilyRef, "jurisdiction_code": rec.JurisdictionCode,
+		"from_status": rec.PreviousStatus, "to_status": rec.Status, "reason": reason}
+	h.emitRegistry(r, events.EventRolloutStatusChanged, rec.RolloutID, actor, payload)
+	if rec.PreviousStatus == domain.RolloutLaunched || rec.Status == domain.RolloutLaunched {
+		h.emitRegistry(r, events.EventJurisdictionSupportChange, rec.RolloutID, actor, payload)
+	}
+}

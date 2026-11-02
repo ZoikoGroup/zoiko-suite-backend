@@ -907,6 +907,157 @@ paths:
         '409':
           $ref: '#/components/responses/Conflict'
 
+  /v1/admin/role-assignments/as-of:
+    get:
+      tags: [Role Assignments]
+      summary: GetAssignmentsAsOf, the assignments that were authorizing at an instant (ORG-06)
+      description: |
+        `iam.assignment.read`. Reconstructs which assignments were AUTHORIZING
+        at `as_of`: approved by then, inside their effective window and not
+        suspended. An assignment counts from the moment it was approved, not from
+        a backdated `effective_from`, because the question is what the principal
+        could do and nothing was granted before the grant existed. PENDING,
+        REJECTED and EXPIRED assignments never authorized, so never appear.
+        A suspended period is excluded; a revoked assignment is shown up to the
+        moment it was revoked.
+      parameters:
+        - name: as_of
+          in: query
+          required: false
+          description: RFC 3339 timestamp or a YYYY-MM-DD date (read as midnight UTC). Defaults to now.
+          schema: { type: string }
+        - name: principal_id
+          in: query
+          required: false
+          description: Limit to one principal. Omit for every principal in the tenant.
+          schema: { type: string }
+      responses:
+        '200':
+          description: The assignments in force at as_of.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AssignmentsAsOf'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /v1/admin/role-assignments/{assignment_id}/suspend:
+    post:
+      tags: [Role Assignments]
+      summary: SuspendAssignment, withhold an approved assignment without ending it (ORG-06)
+      description: |
+        `iam.assignment.suspend` (*platform* for a platform-scope assignment).
+        The assignment grants nothing from this moment on every decision path
+        and on every replica, and anything delegated from it stops flowing. It
+        is still held: it can be resumed, revoked or expire. Only an APPROVED
+        assignment that has not ended can be suspended. A reason is always
+        required. Emits `iam.assignment.suspended`.
+      parameters:
+        - name: assignment_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason_code: { type: string }
+                purpose: { type: string }
+              additionalProperties: true
+      responses:
+        '200':
+          description: Assignment suspended.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoleAssignment'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /v1/admin/role-assignments/{assignment_id}/resume:
+    post:
+      tags: [Role Assignments]
+      summary: Resume a suspended assignment (ORG-06)
+      description: |
+        `iam.assignment.resume` (*platform* for a platform-scope assignment).
+        Restores access, so the principal who holds the assignment cannot be the
+        one resuming it (`403 self_resume_not_allowed`), and a suspended
+        assignment whose window has since closed cannot be resumed (`409
+        assignment_ended`). Emits `iam.assignment.resumed`, not a second grant.
+      parameters:
+        - name: assignment_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason_code: { type: string }
+                purpose: { type: string }
+              additionalProperties: true
+      responses:
+        '200':
+          description: Assignment resumed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoleAssignment'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /v1/admin/role-assignments/{assignment_id}/suspensions:
+    get:
+      tags: [Role Assignments]
+      summary: List an assignment's suspensions, oldest first, including lifted ones (ORG-06)
+      description: '`iam.assignment.read`. The append-only evidence of who suspended it, when and why, and who lifted it.'
+      parameters:
+        - name: assignment_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: The suspensions.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AssignmentSuspension'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
   /v1/admin/delegated-authorities:
     post:
       tags: [Delegations]
@@ -3236,11 +3387,34 @@ components:
         org_unit_id: { type: string }
         effective_from: { type: string, format: date-time }
         effective_to: { type: string, format: date-time }
-        approval_status: { type: string, enum: [APPROVED, PENDING_APPROVAL, REJECTED, EXPIRED] }
+        approval_status: { type: string, enum: [APPROVED, PENDING_APPROVAL, REJECTED, EXPIRED, SUSPENDED] }
         approved_by: { type: string }
         approval_reference: { type: string }
         version: { type: integer }
       additionalProperties: true
+
+    AssignmentSuspension:
+      type: object
+      required: [suspension_id, principal_role_assignment_id, suspended_by, suspended_at, suspension_reason]
+      properties:
+        suspension_id: { type: string, format: uuid }
+        principal_role_assignment_id: { type: string, format: uuid }
+        suspended_by: { type: string }
+        suspended_at: { type: string, format: date-time }
+        suspension_reason: { type: string }
+        resumed_by: { type: string }
+        resumed_at: { type: string, format: date-time }
+        resume_reason: { type: string }
+
+    AssignmentsAsOf:
+      type: object
+      required: [as_of, assignments]
+      properties:
+        as_of: { type: string, format: date-time }
+        assignments:
+          type: array
+          items:
+            $ref: '#/components/schemas/RoleAssignment'
 
     CreateRoleAssignmentRequest:
       type: object

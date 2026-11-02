@@ -91,6 +91,12 @@ type RuleParameters struct {
 
 	// Wave 5: EINVOICE_PROFILE and FILING_PROFILE families (submission.go).
 	Profile *SubmissionProfile `json:"profile,omitempty"`
+
+	// s16: REGISTRATION_TYPE, LICENCE_TYPE, SCHEME and THRESHOLD_MONITOR families (registrations.go).
+	Registration *RegistrationType `json:"registration,omitempty"`
+	Licence      *LicenceType      `json:"licence,omitempty"`
+	Scheme       *SchemeType       `json:"scheme,omitempty"`
+	Monitor      *ThresholdMonitor `json:"monitor,omitempty"`
 }
 
 var decimalRe = regexp.MustCompile(`^(0|[1-9][0-9]{0,14})(\.[0-9]{1,12})?$`)
@@ -122,6 +128,12 @@ func ParseRuleParameters(raw []byte) (RuleParameters, error) {
 func (p RuleParameters) Validate() error {
 	if p.Class != "" && !ValidParameterClass(p.Class) {
 		return paramBad("class must be one of %s", strings.Join(ParameterClasses, ", "))
+	}
+	if registrationFamily(p.Family) {
+		return p.validateRegistrationFamily()
+	}
+	if p.hasRegistrationFields() {
+		return paramBad("registration, licence, scheme and monitor belong to the REGISTRATION_TYPE, LICENCE_TYPE, SCHEME and THRESHOLD_MONITOR families")
 	}
 	switch p.Family {
 	case FamilyAmount:

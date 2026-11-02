@@ -11,6 +11,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"zoiko.io/jurisdiction-rules-svc/internal/domain"
+	"zoiko.io/jurisdiction-rules-svc/internal/events"
 	"zoiko.io/jurisdiction-rules-svc/internal/resolver"
 	"zoiko.io/jurisdiction-rules-svc/internal/store"
 )
@@ -238,6 +239,10 @@ func (h *Handler) RegisterSubmission(w http.ResponseWriter, r *http.Request) {
 	if replayed {
 		status = http.StatusOK
 	}
+	if !replayed {
+		h.emitRegistry(r, events.SubmissionRegisteredEventType(rec.Kind), rec.SubmissionID, actor, map[string]any{"submission_id": rec.SubmissionID,
+			"jurisdiction_code": rec.JurisdictionCode, "profile_code": rec.ProfileCode, "status": rec.Status, "pack_version_id": rec.PackVersionID})
+	}
 	writeJSON(w, status, map[string]any{"replayed": replayed, "submission": rec})
 }
 
@@ -325,6 +330,11 @@ func (h *Handler) RecordSubmissionEvent(w http.ResponseWriter, r *http.Request) 
 	if err != nil {
 		h.writeSubmissionError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
+	}
+	if !res.Replayed && res.Event.Disposition == domain.DispApplied {
+		h.emitRegistry(r, events.SubmissionEventType(res.Submission.Kind, res.Submission.Status), res.Submission.SubmissionID, actor, map[string]any{
+			"submission_id": res.Submission.SubmissionID, "jurisdiction_code": res.Submission.JurisdictionCode, "profile_code": res.Submission.ProfileCode,
+			"status": res.Submission.Status, "is_terminal": res.Submission.IsTerminal, "receipt_id": req.ReceiptID})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"replayed": res.Replayed, "applied": res.Event.Disposition == domain.DispApplied, "disposition": res.Event.Disposition,

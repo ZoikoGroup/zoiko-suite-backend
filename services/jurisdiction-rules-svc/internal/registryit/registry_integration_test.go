@@ -554,10 +554,10 @@ func TestRegistryRoutesAbsentWithoutRegistry(t *testing.T) {
 
 // ── migration round trip ────────────────────────────────────────────────────
 
-func TestMigrations000005To000015_DownThenUp(t *testing.T) {
+func TestMigrations000005To000026_DownThenUp(t *testing.T) {
 	// Each migration depends on the earlier ones: down newest-first, up oldest-first.
 	names := []string{"000005_jurisdiction_pack_registries", "000006_pack_artifacts_and_signing_keys", "000007_pack_certification", "000008_rule_decision_evidence",
-		"000009_pack_release_operations", "000010_calendars_and_obligations", "000011_rule_parameters", "000012_payroll_parameter_evidence", "000013_records_evidence", "000014_regulatory_submissions", "000015_jurisdiction_rollout"}
+		"000009_pack_release_operations", "000010_calendars_and_obligations", "000011_rule_parameters", "000012_payroll_parameter_evidence", "000013_records_evidence", "000014_regulatory_submissions", "000015_jurisdiction_rollout", "000021_registration_evidence", "000022_jurisdiction_decision_evidence", "000023_applicability_evidence", "000024_pack_supersede_event", "000025_resolver_change_notify", "000026_remediation_cases"}
 	var downs, ups []string
 	for i := len(names) - 1; i >= 0; i-- {
 		downs = append(downs, migrations(t, names[i]+".down.sql")...)
@@ -576,6 +576,13 @@ func TestMigrations000005To000015_DownThenUp(t *testing.T) {
 		WHERE table_name='jurisdiction_rules' AND column_name IN ('regime_id','precedence','interpretation_id')`).Scan(&n))
 	assert.Equal(t, 0, n, "down removes the provenance columns")
 	require.NoError(t, applyAll(ctx, ups), "up again")
+	var kindDef string
+	require.NoError(t, pool.QueryRow(ctx, `SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname='ck_decision_kind'`).Scan(&kindDef))
+	assert.Contains(t, kindDef, "THRESHOLD", "up again restores the s16 evidence kinds")
+	assert.Contains(t, kindDef, "PROFILE", "and keeps every earlier kind")
+	var actionDef string
+	require.NoError(t, pool.QueryRow(ctx, `SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname='ck_release_action'`).Scan(&actionDef))
+	assert.Contains(t, actionDef, "SUPERSEDE", "000024 up again allows the supersede release event")
 }
 
 // The original lifecycle (activate, drift, supersede) must keep working with
@@ -604,4 +611,33 @@ func TestOriginalRuleLifecycleUnaffectedByProvenanceTriggers(t *testing.T) {
 
 	_, _, err = st.DeactivateJurisdiction(ctx, j.JurisdictionID, "admin")
 	require.NoError(t, err)
+}
+
+// 000023 on its own (the newest evidence-kind migration): reverting it refuses the APPLICABILITY kind for new rows but keeps every earlier kind, and
+// applying it again restores it. (An older evidence migration cannot be reverted and re-applied alone once newer-kind evidence exists: that evidence is
+// append-only and the older, narrower constraint could not validate it. The migrations are reverted and applied as a chain, which
+// TestMigrations000005To000026_DownThenUp covers.)
+func TestMigration000023_DownThenUp(t *testing.T) {
+	kinds := func() string {
+		var def string
+		require.NoError(t, pool.QueryRow(ctx, `SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname='ck_decision_kind'`).Scan(&def))
+		return def
+	}
+	insert := func(kind string) error {
+		_, err := pool.Exec(ctx, `INSERT INTO rule_decision_evidence (requested_by, request_digest, request, effective_at, outcome, response, decision_kind)
+			VALUES ('x','sha256:`+strings.Repeat("0", 64)+`','{}'::jsonb,NOW(),'NO_RULE','{}'::jsonb,$1)`, kind)
+		return err
+	}
+	require.NoError(t, applyAll(ctx, migrations(t, "000023_applicability_evidence.down.sql")), "down")
+	def := kinds()
+	assert.NotContains(t, def, "APPLICABILITY")
+	for _, k := range []string{"JURISDICTION", "THRESHOLD", "PROFILE", "RETENTION"} {
+		assert.Contains(t, def, k, "every earlier kind survives")
+	}
+	require.Error(t, insert("APPLICABILITY"), "refused while 000023 is reverted")
+	require.NoError(t, insert("JURISDICTION"), "an s9 row is still accepted")
+
+	require.NoError(t, applyAll(ctx, migrations(t, "000023_applicability_evidence.up.sql")), "up again")
+	assert.Contains(t, kinds(), "APPLICABILITY")
+	require.NoError(t, insert("APPLICABILITY"))
 }

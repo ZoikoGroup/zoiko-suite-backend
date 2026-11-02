@@ -86,3 +86,68 @@ const (
 	EventCalendarChanged         = "jurisdiction.calendar.changed"
 	EventObligationRulePublished = "regulatory-obligation-rule.published"
 )
+
+// ZS-JUR-001 s26 events for Waves 4, 5 and 8. jurisdiction.support-changed is
+// the registry family name s26 gives; the filing and einvoice names are the s26
+// "External compliance" family. The obligation events s26 also lists, `created`
+// and `overdue`, need per-entity obligation instances (not built) and are not
+// emitted: only `due-date-calculated` is a fact this service produces.
+const (
+	EventRolloutCreated            = "jurisdiction-rollout.created"
+	EventRolloutStatusChanged      = "jurisdiction-rollout.status-changed"
+	EventRolloutAttested           = "jurisdiction-rollout.attested"
+	EventRolloutExpertDecided      = "jurisdiction-rollout.expert-decided"
+	EventJurisdictionSupportChange = "jurisdiction.support-changed"
+
+	EventFilingSubmitted    = "filing.submitted"
+	EventFilingAccepted     = "filing.accepted"
+	EventFilingRejected     = "filing.rejected"
+	EventFilingStatus       = "filing.status-changed"
+	EventEInvoiceSubmitted  = "einvoice.submitted"
+	EventEInvoiceAccepted   = "einvoice.accepted"
+	EventEInvoiceRejected   = "einvoice.rejected"
+	EventEInvoiceStatus     = "einvoice.status-changed"
+	EventObligationDueDated = "regulatory-obligation.due-date-calculated"
+)
+
+// SubmissionEventType names the s26 event for a submission of the given kind
+// (FILING or EINVOICE) that has just reached status. Lifecycles are data on the
+// profile, so only the conventional receipt states map to accepted/rejected;
+// every other applied status is reported as status-changed.
+func SubmissionEventType(kind, status string) string {
+	filing := kind == "FILING"
+	pick := func(f, e string) string {
+		if filing {
+			return f
+		}
+		return e
+	}
+	switch status {
+	case "ACCEPTED", "CLEARED", "FILED":
+		return pick(EventFilingAccepted, EventEInvoiceAccepted)
+	case "REJECTED":
+		return pick(EventFilingRejected, EventEInvoiceRejected)
+	}
+	return pick(EventFilingStatus, EventEInvoiceStatus)
+}
+
+// SubmissionRegisteredEventType is the s26 event for a newly registered submission.
+func SubmissionRegisteredEventType(kind string) string {
+	if kind == "FILING" {
+		return EventFilingSubmitted
+	}
+	return EventEInvoiceSubmitted
+}
+
+// ZS-JUR-001 s26 "Runtime decisions" family: a jurisdiction determination was made (s9).
+const EventJurisdictionDecisionResolved = "jurisdiction-decision.resolved"
+
+// ZS-JUR-001 s23: a RELEASED version was marked SUPERSEDED by a newer one (historical resolution stays permitted).
+const EventPackSuperseded = "jurisdiction-pack.superseded"
+
+// ZS-JUR-001 s23, s31: a remediation case was opened for decisions made with a withdrawn or rolled-back pack version, or closed once every one was
+// answered for. Opened is announced for automatic cases (withdrawal, rollback) as well as manual ones.
+const (
+	EventRemediationOpened = "jurisdiction-remediation.opened"
+	EventRemediationClosed = "jurisdiction-remediation.closed"
+)

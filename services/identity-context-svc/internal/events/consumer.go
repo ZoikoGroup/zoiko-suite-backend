@@ -370,7 +370,7 @@ func (c *Consumer) Handle(ctx context.Context, raw []byte) error {
 
 	switch ev.EventType {
 	case "authority.revoked", "authority.expired", "authority.suspended", "role.updated", "entity.updated",
-		"iam.assignment.revoked":
+		"iam.assignment.revoked", "iam.assignment.suspended":
 		if c.stale(ev) {
 			return nil
 		}
@@ -390,6 +390,13 @@ func (c *Consumer) Handle(ctx context.Context, raw []byte) error {
 		return c.handleAssignmentRevoked(ctx, ev)
 	case "iam.assignment.granted":
 		return c.handleAssignmentGranted(ctx, ev)
+	// A suspended assignment confers nothing until it is resumed (ORG-06), so
+	// the subject's sessions end as on a revocation; a resume only ADDS access,
+	// like a grant, and ends nothing.
+	case "iam.assignment.suspended":
+		return c.handleAssignmentSuspended(ctx, ev)
+	case "iam.assignment.resumed":
+		return c.handleAssignmentResumed(ctx, ev)
 	case "entity.updated":
 		return c.handleEntityUpdated(ctx, ev)
 	case "session.risk.changed", "risk.signal.updated":

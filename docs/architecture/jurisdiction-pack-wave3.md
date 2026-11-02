@@ -82,7 +82,7 @@ Real environments must give them to different roles. Events: `jurisdiction-pack.
 
 Release, withdrawal and rollback of CERTIFIED versions (Wave 7); the runtime resolver and its use of verified artifacts (Wave 2);
 test classes listed above; calculation tests; cross-pack regression; CI gating of pack changes (the `internal/registryit` suite
-is not in the repository's CI matrix, and `ci.yml` was not changed).
+is now in CI: `ci.yml` runs it as a step for `jurisdiction-rules-svc` (embedded Postgres, no service container).
 
 ## Verification
 
