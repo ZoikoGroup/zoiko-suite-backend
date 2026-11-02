@@ -3,6 +3,7 @@ package outbox_test
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,6 +15,9 @@ import (
 // fakeStore is an in-memory RelayStore: it lets the drain logic be tested
 // without Postgres (the SQL is covered by the store integration tests).
 type fakeStore struct {
+	// mu guards the fields below: TestRelay_RunStopsWhenTheContextIsCancelled
+	// reads them from the test goroutine while Run mutates them.
+	mu        sync.Mutex
 	pending   []outbox.Record
 	published []string
 	failed    map[string]int
@@ -29,12 +33,16 @@ func newFakeStore(ids ...string) *fakeStore {
 }
 
 func (s *fakeStore) Claim(_ context.Context, _, batch int) ([]outbox.Record, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if len(s.pending) < batch {
 		batch = len(s.pending)
 	}
 	return append([]outbox.Record(nil), s.pending[:batch]...), nil
 }
 func (s *fakeStore) MarkPublished(_ context.Context, id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.published = append(s.published, id)
 	for i, r := range s.pending {
 		if r.EventID == id {
@@ -45,11 +53,23 @@ func (s *fakeStore) MarkPublished(_ context.Context, id string) error {
 	return nil
 }
 func (s *fakeStore) MarkFailed(_ context.Context, id string, _ int, retryIn time.Duration, _ error) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.failed[id]++
 	s.retryIn[id] = retryIn
 	return nil
 }
-func (s *fakeStore) PendingCount(context.Context) (int, error)         { return len(s.pending), nil }
+func (s *fakeStore) PendingCount(context.Context) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.pending), nil
+}
+
+func (s *fakeStore) publishedCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.published)
+}
 func (s *fakeStore) DeadLetterCount(context.Context, int) (int, error) { return 0, nil }
 
 type fakeWriter struct {
@@ -155,7 +175,7 @@ func TestRelay_RunStopsWhenTheContextIsCancelled(t *testing.T) {
 	go func() { r.Run(ctx); close(done) }()
 
 	deadline := time.After(2 * time.Second)
-	for len(s.published) == 0 {
+	for s.publishedCount() == 0 {
 		select {
 		case <-deadline:
 			t.Fatal("Run must publish pending events")
