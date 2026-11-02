@@ -346,8 +346,15 @@ type OwnershipStore interface {
 	// GetOwnershipRelationship returns (nil, nil) when absent in the caller's tenant.
 	GetOwnershipRelationship(ctx context.Context, relationshipID string) (*domain.OwnershipRelationship, error)
 	// DecideOwnershipRelationship moves a PROPOSED relationship to ACTIVE or
-	// REJECTED in one guarded write. ErrNotFound, ErrInvalidTransition (already
-	// decided), ErrVersionConflict and ErrSelfApproval are its refusals.
+	// REJECTED. Approval re-runs the graph rules and, for a supersession, retires
+	// the replaced relationship in the same transaction. ErrNotFound,
+	// ErrInvalidTransition (already decided), ErrVersionConflict, ErrSelfApproval
+	// and ErrOwnershipConflict (cycle, overlap, total above 100%) are its refusals.
 	DecideOwnershipRelationship(ctx context.Context, relationshipID string, expectedVersion int64,
 		status domain.OwnershipStatus, decidedBy, note, correlationID string) (*domain.OwnershipRelationship, error)
+	// EndOwnershipRelationship ends an ACTIVE relationship on endDate. Refusals:
+	// ErrNotFound, ErrInvalidTransition (not ACTIVE), ErrVersionConflict and
+	// ErrInvalidInput (a date outside the relationship's own interval).
+	EndOwnershipRelationship(ctx context.Context, relationshipID string, expectedVersion int64,
+		endDate time.Time, endedBy, reason, evidenceRef, correlationID string) (*domain.OwnershipRelationship, error)
 }

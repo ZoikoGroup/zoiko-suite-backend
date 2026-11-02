@@ -28,3 +28,13 @@ func (s *stubSvc) GetOwnershipRelationship(_ context.Context, id string) (*domai
 	s.gotID = id
 	return &domain.OwnershipRelationship{RelationshipID: id}, s.err
 }
+
+func (s *stubSvc) SupersedeOwnershipRelationship(_ context.Context, id string, req domain.SupersedeOwnershipRequest) (*domain.OwnershipRelationship, error) {
+	s.gotID, s.gotCorrID = id, req.CorrelationID
+	return &domain.OwnershipRelationship{RelationshipID: relID, Status: domain.OwnershipProposed}, s.err
+}
+
+func (s *stubSvc) EndOwnershipRelationship(_ context.Context, id string, req domain.EndOwnershipRequest) (*domain.OwnershipRelationship, error) {
+	s.gotID, s.gotCorrID = id, req.CorrelationID
+	return &domain.OwnershipRelationship{RelationshipID: id, Status: domain.OwnershipEnded}, s.err
+}

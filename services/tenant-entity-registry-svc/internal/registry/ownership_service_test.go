@@ -217,3 +217,154 @@ func TestOwnership_GetIsNotFoundForAnUnknownId(t *testing.T) {
 	_, err := svc.GetOwnershipRelationship(as("anyone", "tenant-001"), uuid.New().String())
 	require.ErrorIs(t, err, registry.ErrNotFound)
 }
+
+func (m *memStore) EndOwnershipRelationship(_ context.Context, id string, expected int64, endDate time.Time,
+	by, reason, evidence, _ string) (*domain.OwnershipRelationship, error) {
+	r, ok := m.ownership[id]
+	if !ok {
+		return nil, registry.ErrNotFound
+	}
+	if r.Status != domain.OwnershipActive {
+		return nil, registry.ErrInvalidTransition
+	}
+	if r.RecordVersion != expected {
+		return nil, registry.ErrVersionConflict
+	}
+	now := time.Now().UTC()
+	r.Status, r.ValidTo, r.EndedByPrincipalID, r.EndedAt = domain.OwnershipEnded, &endDate, &by, &now
+	r.EndReason, r.EndEvidenceRef = &reason, &evidence
+	r.RecordVersion++
+	c := *r
+	return &c, nil
+}
+
+// activeRelationship proposes and approves one, returning it as stored.
+func activeRelationship(t *testing.T, svc *registry.Service, parent, child string) *domain.OwnershipRelationship {
+	t.Helper()
+	r, err := svc.ProposeOwnershipRelationship(as("maker", "tenant-001"), proposeReq(parent, child))
+	require.NoError(t, err)
+	out, err := svc.ApproveOwnershipRelationship(as("checker", "tenant-001"), r.RelationshipID, domain.OwnershipDecisionRequest{ExpectedVersion: 1})
+	require.NoError(t, err)
+	return out
+}
+
+func supersedeReq(version int64) domain.SupersedeOwnershipRequest {
+	pct := 80.0
+	return domain.SupersedeOwnershipRequest{
+		ExpectedVersion: version, OwnershipPct: &pct,
+		ValidFrom:   time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC),
+		EvidenceRef: "filing-2", Reason: "increased stake",
+	}
+}
+
+func TestOwnership_SupersedeFilesALinkedProposalAndChangesNothingYet(t *testing.T) {
+	svc, ms, parent, child := ownershipSvc(t)
+	old := activeRelationship(t, svc, parent, child)
+
+	n, err := svc.SupersedeOwnershipRelationship(as("maker", "tenant-001"), old.RelationshipID, supersedeReq(old.RecordVersion))
+	require.NoError(t, err)
+	assert.Equal(t, domain.OwnershipProposed, n.Status)
+	require.NotNil(t, n.SupersedesRelationshipID)
+	assert.Equal(t, old.RelationshipID, *n.SupersedesRelationshipID)
+	assert.Equal(t, parent, n.ParentLegalEntityID, "parent, child and kind come from the original")
+	assert.Equal(t, child, n.ChildLegalEntityID)
+	assert.InDelta(t, 80, *n.OwnershipPct, 0.0001)
+	assert.Equal(t, domain.OwnershipActive, ms.ownership[old.RelationshipID].Status, "the original applies until approval")
+}
+
+func TestOwnership_SupersedeRefusals(t *testing.T) {
+	svc, ms, parent, child := ownershipSvc(t)
+	old := activeRelationship(t, svc, parent, child)
+	maker := as("maker", "tenant-001")
+
+	t.Run("stale version", func(t *testing.T) {
+		_, err := svc.SupersedeOwnershipRelationship(maker, old.RelationshipID, supersedeReq(9))
+		require.ErrorIs(t, err, registry.ErrVersionConflict)
+	})
+	t.Run("not after the original starts", func(t *testing.T) {
+		req := supersedeReq(old.RecordVersion)
+		req.ValidFrom = old.ValidFrom
+		_, err := svc.SupersedeOwnershipRelationship(maker, old.RelationshipID, req)
+		require.ErrorIs(t, err, registry.ErrInvalidInput)
+	})
+	t.Run("no evidence", func(t *testing.T) {
+		req := supersedeReq(old.RecordVersion)
+		req.EvidenceRef = ""
+		_, err := svc.SupersedeOwnershipRelationship(maker, old.RelationshipID, req)
+		require.ErrorIs(t, err, registry.ErrInvalidInput)
+	})
+	t.Run("unknown relationship", func(t *testing.T) {
+		_, err := svc.SupersedeOwnershipRelationship(maker, uuid.New().String(), supersedeReq(1))
+		require.ErrorIs(t, err, registry.ErrNotFound)
+	})
+	t.Run("not authorized", func(t *testing.T) {
+		denied := newSvc(t, ms, denyAllAuthZ{}, acceptAllJurisd{})
+		_, err := denied.SupersedeOwnershipRelationship(maker, old.RelationshipID, supersedeReq(old.RecordVersion))
+		require.ErrorIs(t, err, registry.ErrUnauthorized)
+	})
+	t.Run("a PROPOSED relationship cannot be superseded", func(t *testing.T) {
+		p, err := svc.ProposeOwnershipRelationship(maker, proposeReq(child, seedOperationalEntity(ms, "tenant-001")))
+		require.NoError(t, err)
+		_, err = svc.SupersedeOwnershipRelationship(maker, p.RelationshipID, supersedeReq(1))
+		require.ErrorIs(t, err, registry.ErrInvalidTransition)
+	})
+}
+
+func endReq(version int64) domain.EndOwnershipRequest {
+	return domain.EndOwnershipRequest{
+		ExpectedVersion: version, EndDate: time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC),
+		EvidenceRef: "disposal-agreement", Reason: "stake sold",
+	}
+}
+
+func TestOwnership_EndRecordsWhoWhenWhyAndEvidence(t *testing.T) {
+	svc, _, parent, child := ownershipSvc(t)
+	r := activeRelationship(t, svc, parent, child)
+
+	out, err := svc.EndOwnershipRelationship(as("ender", "tenant-001"), r.RelationshipID, endReq(r.RecordVersion))
+	require.NoError(t, err)
+	assert.Equal(t, domain.OwnershipEnded, out.Status)
+	assert.Equal(t, "ender", *out.EndedByPrincipalID)
+	assert.Equal(t, "stake sold", *out.EndReason)
+	assert.Equal(t, "disposal-agreement", *out.EndEvidenceRef)
+	require.NotNil(t, out.ValidTo)
+	assert.True(t, out.ValidTo.Equal(time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)))
+}
+
+func TestOwnership_EndRefusals(t *testing.T) {
+	svc, ms, parent, child := ownershipSvc(t)
+	r := activeRelationship(t, svc, parent, child)
+	ender := as("ender", "tenant-001")
+
+	t.Run("no evidence", func(t *testing.T) {
+		req := endReq(r.RecordVersion)
+		req.EvidenceRef = " "
+		_, err := svc.EndOwnershipRelationship(ender, r.RelationshipID, req)
+		require.ErrorIs(t, err, registry.ErrInvalidInput)
+	})
+	t.Run("no reason", func(t *testing.T) {
+		req := endReq(r.RecordVersion)
+		req.Reason = ""
+		_, err := svc.EndOwnershipRelationship(ender, r.RelationshipID, req)
+		require.ErrorIs(t, err, registry.ErrInvalidInput)
+	})
+	t.Run("stale version", func(t *testing.T) {
+		_, err := svc.EndOwnershipRelationship(ender, r.RelationshipID, endReq(7))
+		require.ErrorIs(t, err, registry.ErrVersionConflict)
+	})
+	t.Run("not authorized", func(t *testing.T) {
+		denied := newSvc(t, ms, denyAllAuthZ{}, acceptAllJurisd{})
+		_, err := denied.EndOwnershipRelationship(ender, r.RelationshipID, endReq(r.RecordVersion))
+		require.ErrorIs(t, err, registry.ErrUnauthorized)
+	})
+	t.Run("unknown relationship", func(t *testing.T) {
+		_, err := svc.EndOwnershipRelationship(ender, uuid.New().String(), endReq(1))
+		require.ErrorIs(t, err, registry.ErrNotFound)
+	})
+	t.Run("already ended", func(t *testing.T) {
+		_, err := svc.EndOwnershipRelationship(ender, r.RelationshipID, endReq(r.RecordVersion))
+		require.NoError(t, err)
+		_, err = svc.EndOwnershipRelationship(ender, r.RelationshipID, endReq(r.RecordVersion+1))
+		require.ErrorIs(t, err, registry.ErrInvalidTransition)
+	})
+}

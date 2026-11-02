@@ -1599,6 +1599,76 @@ paths:
         "409": { description: "Stale expected_version", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
         "422": { description: "The relationship is not PROPOSED", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
 
+  /v1/ownership-relationships/{relationshipID}/supersession:
+    post:
+      operationId: supersedeOwnershipRelationship
+      summary: ORG-04 SupersedeRelationship, new terms for an ACTIVE relationship
+      description: |
+        Files a PROPOSED replacement that names the relationship it replaces. The
+        original keeps applying until a different principal approves the
+        replacement (POST .../approval on the NEW relationship's id); on approval
+        the original becomes SUPERSEDED with its valid_to cut to the
+        replacement's valid_from, in one transaction. Parent, child and kind
+        stay the same.
+      tags: [Ownership]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/RelationshipID"
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SupersedeOwnershipRequest"
+      responses:
+        "201":
+          description: The PROPOSED replacement
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OwnershipRelationship"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_version, a replacement is already pending, or the new terms contradict the active structure (cycle, overlap, owners above 100%)", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "422": { description: "The relationship is not ACTIVE", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/ownership-relationships/{relationshipID}/end:
+    post:
+      operationId: endOwnershipRelationship
+      summary: ORG-04 EndRelationship (ACTIVE → ENDED)
+      description: |
+        Records that an ACTIVE relationship stopped on end_date, which must fall
+        after its valid_from and not after its current valid_to. Takes effect at
+        once, so it needs its own HIGH-tier permission, and it records who ended
+        it, why and on what evidence.
+      tags: [Ownership]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/RelationshipID"
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EndOwnershipRequest"
+      responses:
+        "200":
+          description: Relationship ended
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OwnershipRelationship"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_version", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "422": { description: "The relationship is not ACTIVE", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
   # ── Workspaces ─────────────────────────────────────────────────────────────
   #
   # These five routes have existed since migration 000005 and were absent from
@@ -2313,6 +2383,11 @@ components:
         decision_note:            { type: string }
         correlation_id:           { type: string }
         record_version:           { type: integer, format: int64, minimum: 1 }
+        supersedes_relationship_id: { type: string, format: uuid, description: "The ACTIVE relationship this one replaces once approved." }
+        ended_by_principal_id:    { type: string }
+        ended_at:                 { type: string, format: date-time }
+        end_reason:               { type: string }
+        end_evidence_ref:         { type: string }
 
     ProposeOwnershipRequest:
       type: object
@@ -2334,6 +2409,34 @@ components:
         evidence_ref:           { type: string }
         reason:                 { type: string }
         correlation_id:         { type: string }
+
+    SupersedeOwnershipRequest:
+      type: object
+      required: [expected_version, valid_from, evidence_ref, reason]
+      description: |
+        New terms for the relationship named in the path. expected_version is the
+        record_version of THAT (current) relationship.
+      properties:
+        expected_version: { type: integer, format: int64, minimum: 1 }
+        ownership_pct:    { type: number, exclusiveMinimum: 0, maximum: 100 }
+        voting_pct:       { type: number, exclusiveMinimum: 0, maximum: 100 }
+        control_type:     { type: string, enum: [VOTING, BOARD, CONTRACTUAL, OTHER] }
+        beneficial_notes: { type: string }
+        valid_from:       { type: string, format: date-time }
+        valid_to:         { type: string, format: date-time }
+        evidence_ref:     { type: string }
+        reason:           { type: string }
+        correlation_id:   { type: string }
+
+    EndOwnershipRequest:
+      type: object
+      required: [expected_version, end_date, evidence_ref, reason]
+      properties:
+        expected_version: { type: integer, format: int64, minimum: 1 }
+        end_date:         { type: string, format: date-time }
+        evidence_ref:     { type: string }
+        reason:           { type: string }
+        correlation_id:   { type: string }
 
     OwnershipDecisionRequest:
       type: object

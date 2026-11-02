@@ -73,6 +73,16 @@ type OwnershipRelationship struct {
 	DecisionNote          *string    `json:"decision_note,omitempty"`
 	CorrelationID         string     `json:"correlation_id,omitempty"`
 
+	// SupersedesRelationshipID names the ACTIVE relationship this one replaces
+	// when it is approved (SupersedeRelationship).
+	SupersedesRelationshipID *string `json:"supersedes_relationship_id,omitempty"`
+
+	// Set only on an ENDED relationship (EndRelationship).
+	EndedByPrincipalID *string    `json:"ended_by_principal_id,omitempty"`
+	EndedAt            *time.Time `json:"ended_at,omitempty"`
+	EndReason          *string    `json:"end_reason,omitempty"`
+	EndEvidenceRef     *string    `json:"end_evidence_ref,omitempty"`
+
 	// RecordVersion is the optimistic-concurrency version; events carry it as
 	// object_version (ORG s7).
 	RecordVersion int64 `json:"record_version"`
@@ -158,4 +168,54 @@ func (r ProposeOwnershipRequest) Validate() error {
 		return invalidOwnership("reason is required")
 	}
 	return nil
+}
+
+// SupersedeOwnershipRequest is the SupersedeRelationship command: new terms for
+// an ACTIVE relationship, effective from valid_from. Parent, child and kind
+// cannot change (that would be a different relationship, proposed afresh).
+type SupersedeOwnershipRequest struct {
+	ExpectedVersion int64        `json:"expected_version"`
+	OwnershipPct    *float64     `json:"ownership_pct,omitempty"`
+	VotingPct       *float64     `json:"voting_pct,omitempty"`
+	ControlType     *ControlType `json:"control_type,omitempty"`
+	BeneficialNotes string       `json:"beneficial_notes,omitempty"`
+	ValidFrom       time.Time    `json:"valid_from"`
+	ValidTo         *time.Time   `json:"valid_to,omitempty"`
+	EvidenceRef     string       `json:"evidence_ref"`
+	Reason          string       `json:"reason"`
+	CorrelationID   string       `json:"correlation_id,omitempty"`
+}
+
+// EndOwnershipRequest is the EndRelationship command.
+type EndOwnershipRequest struct {
+	ExpectedVersion int64     `json:"expected_version"`
+	EndDate         time.Time `json:"end_date"`
+	EvidenceRef     string    `json:"evidence_ref"`
+	Reason          string    `json:"reason"`
+	CorrelationID   string    `json:"correlation_id,omitempty"`
+}
+
+// Validate checks what can be decided from the request alone.
+func (r EndOwnershipRequest) Validate() error {
+	if r.EndDate.IsZero() {
+		return invalidOwnership("end_date is required")
+	}
+	if strings.TrimSpace(r.EvidenceRef) == "" {
+		return invalidOwnership("evidence_ref is required: an end needs its source as much as a start does")
+	}
+	if strings.TrimSpace(r.Reason) == "" {
+		return invalidOwnership("reason is required")
+	}
+	return nil
+}
+
+// AsProposal is the superseding relationship expressed as the proposal it is,
+// given the relationship it replaces. Parent, child and kind come from old.
+func (r SupersedeOwnershipRequest) AsProposal(old OwnershipRelationship) ProposeOwnershipRequest {
+	return ProposeOwnershipRequest{
+		ParentLegalEntityID: old.ParentLegalEntityID, ChildLegalEntityID: old.ChildLegalEntityID,
+		RelationshipKind: old.RelationshipKind, OwnershipPct: r.OwnershipPct, VotingPct: r.VotingPct,
+		ControlType: r.ControlType, BeneficialNotes: r.BeneficialNotes, ValidFrom: r.ValidFrom, ValidTo: r.ValidTo,
+		EvidenceRef: r.EvidenceRef, Reason: r.Reason, CorrelationID: r.CorrelationID,
+	}
 }

@@ -37,8 +37,18 @@ func (s *Service) ProposeOwnershipRelationship(ctx context.Context, req domain.P
 		}
 	}
 
+	r := s.newOwnershipRow(ctx, req)
+	if err := s.store.CreateOwnershipRelationship(ctx, r); err != nil {
+		return nil, fmt.Errorf("store.CreateOwnershipRelationship: %w", err)
+	}
+	return r, nil
+}
+
+// newOwnershipRow builds the PROPOSED row for a validated request, stamped with
+// the verified tenant and caller.
+func (s *Service) newOwnershipRow(ctx context.Context, req domain.ProposeOwnershipRequest) *domain.OwnershipRelationship {
 	now := time.Now().UTC()
-	r := &domain.OwnershipRelationship{
+	return &domain.OwnershipRelationship{
 		RelationshipID:        newID(),
 		TenantID:              domain.TenantFromContext(ctx),
 		ParentLegalEntityID:   req.ParentLegalEntityID,
@@ -59,10 +69,6 @@ func (s *Service) ProposeOwnershipRelationship(ctx context.Context, req domain.P
 		CorrelationID:         req.CorrelationID,
 		RecordVersion:         1,
 	}
-	if err := s.store.CreateOwnershipRelationship(ctx, r); err != nil {
-		return nil, fmt.Errorf("store.CreateOwnershipRelationship: %w", err)
-	}
-	return r, nil
 }
 
 // ApproveOwnershipRelationship activates a PROPOSED relationship.
@@ -136,4 +142,97 @@ func (s *Service) GetOwnershipRelationship(ctx context.Context, relationshipID s
 		return nil, ErrNotFound
 	}
 	return rel, nil
+}
+
+// ErrOwnershipConflict — the relationship contradicts the active group
+// structure: it would close a cycle, overlap an identical relationship, or take
+// an entity's owners above 100%. Wraps ErrConflict so it is a 409; the wrapped
+// domain error names which rule.
+var ErrOwnershipConflict error = &kindError{"ownership conflict", ErrConflict}
+
+// SupersedeOwnershipRelationship proposes new terms for an ACTIVE relationship.
+//
+// It files a PROPOSED replacement that names the relationship it replaces. Until
+// a different principal approves it nothing changes; on approval the replacement
+// becomes ACTIVE and the original SUPERSEDED, with its valid_to cut to the
+// replacement's valid_from. The original stays retrievable.
+func (s *Service) SupersedeOwnershipRelationship(ctx context.Context, relationshipID string, req domain.SupersedeOwnershipRequest) (*domain.OwnershipRelationship, error) {
+	old, err := s.store.GetOwnershipRelationship(ctx, relationshipID)
+	if err != nil {
+		return nil, fmt.Errorf("store.GetOwnershipRelationship: %w", err)
+	}
+	if old == nil {
+		if err := s.authorize(ctx, "entity.ownership", "supersede"); err != nil {
+			return nil, err
+		}
+		return nil, ErrNotFound
+	}
+	if err := s.authorizeEntities(ctx, "entity.ownership", "supersede", old.ChildLegalEntityID, old.ParentLegalEntityID); err != nil {
+		return nil, err
+	}
+	if err := s.assertTenantMayTransact(ctx, ""); err != nil {
+		return nil, err
+	}
+	if old.Status != domain.OwnershipActive {
+		return nil, fmt.Errorf("%w: only an ACTIVE relationship can be superseded; this one is %s", ErrInvalidTransition, old.Status)
+	}
+	if _, err := s.checkExpected(req.ExpectedVersion, old.RecordVersion, "ownership relationship"); err != nil {
+		return nil, err
+	}
+	proposal := req.AsProposal(*old)
+	if err := proposal.Validate(); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidInput, err)
+	}
+	if !req.ValidFrom.After(old.ValidFrom) {
+		return nil, fmt.Errorf("%w: a supersession must take effect after the relationship it replaces starts (%s)",
+			ErrInvalidInput, old.ValidFrom.UTC().Format("2006-01-02"))
+	}
+	for _, id := range []string{old.ParentLegalEntityID, old.ChildLegalEntityID} {
+		if err := s.assertEntityOperational(ctx, id); err != nil {
+			return nil, err
+		}
+	}
+
+	r := s.newOwnershipRow(ctx, proposal)
+	r.SupersedesRelationshipID = &old.RelationshipID
+	if err := s.store.CreateOwnershipRelationship(ctx, r); err != nil {
+		return nil, fmt.Errorf("store.CreateOwnershipRelationship: %w", err)
+	}
+	return r, nil
+}
+
+// EndOwnershipRelationship records that an ACTIVE relationship stopped.
+//
+// It takes effect at once, so it is a HIGH-tier action of its own
+// (ENTITY_OWNERSHIP_END) and requires the evidence and reason that a start does.
+func (s *Service) EndOwnershipRelationship(ctx context.Context, relationshipID string, req domain.EndOwnershipRequest) (*domain.OwnershipRelationship, error) {
+	if err := req.Validate(); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidInput, err)
+	}
+	rel, err := s.store.GetOwnershipRelationship(ctx, relationshipID)
+	if err != nil {
+		return nil, fmt.Errorf("store.GetOwnershipRelationship: %w", err)
+	}
+	if rel == nil {
+		if err := s.authorize(ctx, "entity.ownership", "end"); err != nil {
+			return nil, err
+		}
+		return nil, ErrNotFound
+	}
+	if err := s.authorizeEntities(ctx, "entity.ownership", "end", rel.ChildLegalEntityID, rel.ParentLegalEntityID); err != nil {
+		return nil, err
+	}
+	if err := s.assertTenantMayTransact(ctx, ""); err != nil {
+		return nil, err
+	}
+	version, err := s.checkExpected(req.ExpectedVersion, rel.RecordVersion, "ownership relationship")
+	if err != nil {
+		return nil, err
+	}
+	out, err := s.store.EndOwnershipRelationship(ctx, relationshipID, version, req.EndDate.UTC(),
+		domain.PrincipalFromContext(ctx), req.Reason, req.EvidenceRef, req.CorrelationID)
+	if err != nil {
+		return nil, fmt.Errorf("store.EndOwnershipRelationship: %w", err)
+	}
+	return out, nil
 }

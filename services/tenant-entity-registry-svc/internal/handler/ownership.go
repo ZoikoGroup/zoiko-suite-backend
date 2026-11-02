@@ -6,6 +6,8 @@ package handler
 //	GET  /v1/ownership-relationships/{relationshipID}   one relationship
 //	POST /v1/ownership-relationships/{relationshipID}/approval   ApproveOwnershipRelationship
 //	POST /v1/ownership-relationships/{relationshipID}/rejection  RejectOwnershipRelationship
+//	POST /v1/ownership-relationships/{relationshipID}/supersession  SupersedeRelationship (201, a new PROPOSED row)
+//	POST /v1/ownership-relationships/{relationshipID}/end        EndRelationship
 //
 // A relationship is proposed, then decided by a DIFFERENT principal. The decider
 // is the verified caller; no body field names it.
@@ -24,6 +26,8 @@ type OwnershipService interface {
 	ProposeOwnershipRelationship(ctx context.Context, req domain.ProposeOwnershipRequest) (*domain.OwnershipRelationship, error)
 	ApproveOwnershipRelationship(ctx context.Context, relationshipID string, req domain.OwnershipDecisionRequest) (*domain.OwnershipRelationship, error)
 	RejectOwnershipRelationship(ctx context.Context, relationshipID string, req domain.OwnershipDecisionRequest) (*domain.OwnershipRelationship, error)
+	SupersedeOwnershipRelationship(ctx context.Context, relationshipID string, req domain.SupersedeOwnershipRequest) (*domain.OwnershipRelationship, error)
+	EndOwnershipRelationship(ctx context.Context, relationshipID string, req domain.EndOwnershipRequest) (*domain.OwnershipRelationship, error)
 	GetOwnershipRelationship(ctx context.Context, relationshipID string) (*domain.OwnershipRelationship, error)
 }
 
@@ -32,6 +36,8 @@ func registerOwnershipRoutes(r chi.Router, h *Handler) {
 	r.Get("/ownership-relationships/{relationshipID}", h.GetOwnershipRelationship)
 	r.Post("/ownership-relationships/{relationshipID}/approval", h.ApproveOwnershipRelationship)
 	r.Post("/ownership-relationships/{relationshipID}/rejection", h.RejectOwnershipRelationship)
+	r.Post("/ownership-relationships/{relationshipID}/supersession", h.SupersedeOwnershipRelationship)
+	r.Post("/ownership-relationships/{relationshipID}/end", h.EndOwnershipRelationship)
 }
 
 // ProposeOwnershipRelationship files a PROPOSED relationship.
@@ -81,6 +87,41 @@ func (h *Handler) decideOwnership(w http.ResponseWriter, r *http.Request,
 		req.CorrelationID = correlationID(r)
 	}
 	rel, err := decide(r.Context(), chi.URLParam(r, "relationshipID"), req)
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, rel)
+}
+
+// SupersedeOwnershipRelationship proposes new terms for an ACTIVE relationship;
+// the replacement is a new PROPOSED row, decided like any other.
+func (h *Handler) SupersedeOwnershipRelationship(w http.ResponseWriter, r *http.Request) {
+	var req domain.SupersedeOwnershipRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	if req.CorrelationID == "" {
+		req.CorrelationID = correlationID(r)
+	}
+	rel, err := h.svc.SupersedeOwnershipRelationship(r.Context(), chi.URLParam(r, "relationshipID"), req)
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, rel)
+}
+
+// EndOwnershipRelationship records that an ACTIVE relationship stopped.
+func (h *Handler) EndOwnershipRelationship(w http.ResponseWriter, r *http.Request) {
+	var req domain.EndOwnershipRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	if req.CorrelationID == "" {
+		req.CorrelationID = correlationID(r)
+	}
+	rel, err := h.svc.EndOwnershipRelationship(r.Context(), chi.URLParam(r, "relationshipID"), req)
 	if err != nil {
 		h.writeErr(w, r, err)
 		return
