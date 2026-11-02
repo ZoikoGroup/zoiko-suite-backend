@@ -157,6 +157,70 @@ paths:
         "404": { $ref: '#/components/responses/NotFound' }
         "503": { $ref: '#/components/responses/StoreUnavailable' }
 
+  /v1/jurisdictions/{jurisdiction_id}/as-of:
+    get:
+      tags: [Jurisdictions]
+      summary: GetJurisdictionAsOf, a jurisdiction as it was at an instant (REF-01)
+      description: |
+        Answers from the effective-dated version history, so a rename, a move or a
+        retirement since `as_of` does not change the answer. A jurisdiction retired
+        since is still readable as of any time it was in force, and says so
+        (`retired`, `retired_at`, `superseded_by_jurisdiction_id`).
+
+        A jurisdiction that exists but was not in force at `as_of` (before it began,
+        or after it was retired) answers `404 jurisdiction_not_effective` with the
+        dates, which is a different fact from `404 jurisdiction_not_found`: the code
+        was real. Never guesses from the current state.
+      operationId: getJurisdictionAsOf
+      parameters:
+        - $ref: '#/components/parameters/JurisdictionID'
+        - $ref: '#/components/parameters/AsOf'
+        - $ref: '#/components/parameters/CorrelationID'
+      responses:
+        "200":
+          description: The jurisdiction as it was at as_of.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/JurisdictionAsOf' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "503": { $ref: '#/components/responses/StoreUnavailable' }
+
+  /v1/jurisdictions/{jurisdiction_id}/hierarchy:
+    get:
+      tags: [Jurisdictions]
+      summary: GetHierarchy, the tree below a jurisdiction at an instant (REF-01)
+      description: |
+        The jurisdictions below this one as they stood at `as_of`, nested, to at most
+        `depth` levels (default 5, maximum 10). Parentage is read from the versions in
+        force at `as_of`, so a jurisdiction that was moved appears under its parent of
+        that date, and one retired since still appears if it was then in force. Ordered
+        deterministically by code. The root must itself have been in force at `as_of`.
+      operationId: getJurisdictionHierarchy
+      parameters:
+        - $ref: '#/components/parameters/JurisdictionID'
+        - $ref: '#/components/parameters/AsOf'
+        - name: depth
+          in: query
+          required: false
+          description: Levels below the root to include. 0 is the root alone.
+          schema: { type: integer, minimum: 0, maximum: 10, default: 5 }
+        - $ref: '#/components/parameters/CorrelationID'
+      responses:
+        "200":
+          description: The tree.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/JurisdictionHierarchy' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "422":
+          description: The tree is too large for one answer (more than 5000 jurisdictions); ask for a smaller depth or a deeper root.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        "503": { $ref: '#/components/responses/StoreUnavailable' }
+
   # ── Rules (public read) ────────────────────────────────────────────────────
 
   /v1/jurisdictions/{jurisdiction_id}/rules:
@@ -455,6 +519,17 @@ paths:
         Publishes `jurisdiction.deactivated`.
       operationId: deactivateJurisdiction
       security: [{ principalHeader: [] }]
+      requestBody:
+        required: false
+        description: |
+          REF-01 RetireJurisdiction evidence, all optional: the reason, the source that
+          withdrew the jurisdiction and the active jurisdiction that takes over. The
+          retired jurisdiction stays readable as of any time it was in force
+          (`GET /v1/jurisdictions/{id}/as-of`) and is refused for anything new. A replay
+          of an already-retired jurisdiction changes nothing and keeps the original evidence.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RetireJurisdictionRequest' }
       parameters:
         - $ref: '#/components/parameters/RequestID'
         - $ref: '#/components/parameters/TenantID'
@@ -469,6 +544,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Jurisdiction' }
+        "400": { $ref: '#/components/responses/BadRequest' }
         "401": { $ref: '#/components/responses/MissingPrincipal' }
         "403": { $ref: '#/components/responses/Forbidden' }
         "404": { $ref: '#/components/responses/NotFound' }
@@ -1989,6 +2065,12 @@ components:
         rejected with `401 missing_principal` rather than attributed to the platform.
 
   parameters:
+    AsOf:
+      name: as_of
+      in: query
+      required: false
+      description: Business time, an RFC 3339 timestamp or a YYYY-MM-DD date (read as midnight UTC). Defaults to now. A malformed value answers 400.
+      schema: { type: string }
     JurisdictionID:
       name: jurisdiction_id
       in: path
@@ -2229,6 +2311,60 @@ components:
           type: integer
           format: int64
 
+    JurisdictionAsOf:
+      type: object
+      required: [jurisdiction_id, jurisdiction_code, jurisdiction_name, jurisdiction_type, authority_type, as_of, version_no, valid_from, retired]
+      properties:
+        jurisdiction_id: { type: string, format: uuid }
+        jurisdiction_code: { type: string }
+        jurisdiction_name: { type: string }
+        jurisdiction_type: { type: string }
+        parent_jurisdiction_id: { type: string, format: uuid, nullable: true }
+        authority_type: { type: string }
+        as_of: { type: string, format: date-time }
+        version_no: { type: integer, minimum: 1 }
+        valid_from: { type: string, format: date-time }
+        valid_to: { type: string, format: date-time, nullable: true }
+        retired:
+          type: boolean
+          description: True when the jurisdiction has SINCE been retired. It was in force at as_of.
+        retired_at: { type: string, format: date-time }
+        retirement_reason: { type: string }
+        superseded_by_jurisdiction_id: { type: string, format: uuid }
+
+    HierarchyNode:
+      type: object
+      required: [jurisdiction_id, jurisdiction_code, jurisdiction_name, jurisdiction_type, authority_type, depth, children]
+      properties:
+        jurisdiction_id: { type: string, format: uuid }
+        jurisdiction_code: { type: string }
+        jurisdiction_name: { type: string }
+        jurisdiction_type: { type: string }
+        authority_type: { type: string }
+        depth: { type: integer, minimum: 0 }
+        children:
+          type: array
+          items: { $ref: '#/components/schemas/HierarchyNode' }
+
+    JurisdictionHierarchy:
+      type: object
+      required: [as_of, root, count]
+      properties:
+        as_of: { type: string, format: date-time }
+        root: { $ref: '#/components/schemas/HierarchyNode' }
+        count: { type: integer, minimum: 1, description: "Jurisdictions in the tree, root included." }
+
+    RetireJurisdictionRequest:
+      type: object
+      description: The optional retirement evidence (REF-01 RetireJurisdiction). Every field is optional.
+      properties:
+        reason: { type: string, maxLength: 2000 }
+        evidence_ref: { type: string, maxLength: 2000, description: "The source that says the jurisdiction was withdrawn, for example an ISO 3166 newsletter." }
+        superseded_by_jurisdiction_id:
+          type: string
+          format: uuid
+          description: The active jurisdiction that takes over. Must be a different, active jurisdiction.
+
     Jurisdiction:
       type: object
       description: |
@@ -2282,6 +2418,9 @@ components:
         row_version:
           type: integer
           description: Increases on every change; the ETag and the If-Match value, and the events' aggregate_version.
+        retirement_reason: { type: string, description: Why it was retired. Present only on a retired jurisdiction that was given one. }
+        retirement_evidence_ref: { type: string, description: The source that withdrew it. }
+        superseded_by_jurisdiction_id: { type: string, format: uuid, description: The active jurisdiction that took over. }
 
     JurisdictionRule:
       type: object
