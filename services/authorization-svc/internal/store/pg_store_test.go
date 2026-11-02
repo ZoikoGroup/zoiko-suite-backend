@@ -134,6 +134,8 @@ func setupTestDB(t *testing.T, pool *pgxpool.Pool) {
 		"000034_break_glass_approval_and_session_evidence.up.sql",
 		"000035_authority_limit_governance.up.sql",
 		"000036_rule_publication_approval.up.sql",
+		"000037_assignment_suspension.up.sql",
+		"000038_assignment_expiry.up.sql",
 	}
 	// Three migrations have now been missed from this list. Refuse to run
 	// against a schema the list does not fully describe.
