@@ -138,6 +138,8 @@ channels:
         oneOf:
           - $ref: "#/components/messages/RoleUpdated"
           - $ref: "#/components/messages/AssignmentRevoked"
+          - $ref: "#/components/messages/AssignmentSuspended"
+          - $ref: "#/components/messages/AssignmentResumed"
           - $ref: "#/components/messages/AssignmentGranted"
 
   zoiko.entity.events:
@@ -909,6 +911,34 @@ components:
         The subject is read from `payload.principal_id`, never from
         `actor_id` (the revoker). Every session of the subject is revoked;
         events older than the envelope TTL plus one minute are skipped.
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    AssignmentSuspended:
+      name: iam.assignment.suspended
+      title: An access assignment was suspended
+      summary: |
+        Emitted by authorization-svc (ORG-06 SuspendAssignment). The assignment
+        is withheld, not ended: it can be resumed. Handled like a revocation for
+        the subject's sessions, which are all revoked, because a live session may
+        still assert the role. The projection is held back FIRST (suspended_at)
+        so the re-resolve the eviction forces does not frame the role again.
+        Nothing is tombstoned, since a suspension is reversible. The subject is
+        `payload.principal_id`, never `actor_id` (the administrator); the
+        assignment is `payload.principal_role_assignment_id` (or `assignment_id`
+        from access-control-svc). The state is derived from the producer's
+        emitted_at, so redelivery and reordering cannot leave it wrong.
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    AssignmentResumed:
+      name: iam.assignment.resumed
+      title: A suspended access assignment was resumed
+      summary: |
+        Emitted by authorization-svc. Lifts the hold (resumed_at); revokes
+        nothing, because a resume only adds access, and the next resolve frames
+        the role again. It cannot reopen an assignment that ended while
+        suspended: effective_to is untouched.
       payload:
         $ref: "#/components/schemas/Envelope"
 
