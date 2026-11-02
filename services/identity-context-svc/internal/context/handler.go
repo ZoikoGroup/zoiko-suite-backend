@@ -744,19 +744,24 @@ func (h *Handler) UpdatePrincipalStatus(w http.ResponseWriter, r *http.Request) 
 	principalID := chi.URLParam(r, "principalID")
 	correlationID := r.Header.Get("X-Correlation-ID")
 
-	// Check If-Match for mutations of existing aggregates
 	p, err := h.principals.FindByID(r.Context(), principalID, tenantID)
 	if err != nil || p == nil {
 		writeError(w, r, http.StatusNotFound, "principal not found")
 		return
 	}
+
+	// Authorization (including the no-self-exemption rule) is decided before
+	// the version precondition: a caller who may not touch the aggregate at
+	// all hears 403, never 428. The If-Match check only matters once the
+	// caller is cleared to act.
+	if !h.authorize(w, r, callerPrincipalID, tenantID, IdentityPrincipalStatus) {
+		return
+	}
+
 	if !h.requireIfMatch(w, r, p.RecordVersion) {
 		return
 	}
 
-	if !h.authorize(w, r, callerPrincipalID, tenantID, IdentityPrincipalStatus) {
-		return
-	}
 	if h.status == nil {
 		// An unconfigured privileged command is unavailable, not silently a
 		// row update that tells nobody (see StatusChanger).

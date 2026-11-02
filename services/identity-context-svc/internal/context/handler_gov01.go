@@ -310,6 +310,20 @@ func (h *Handler) ApproveSupportContext(w http.ResponseWriter, r *http.Request) 
 		writeCoded(w, r, http.StatusNotFound, domain.ErrCodeBreakGlassRequired, "support context not found")
 		return
 	}
+	// Refusal checks before the version precondition: a caller who may not
+	// approve hears 403, never 428. These mirror SupportService.Approve so the
+	// handler and the service agree on who may approve; the service re-checks
+	// them before the write.
+	if sc.RequestedByPrincipalID == callerPrincipalID || sc.SupportPrincipalID == callerPrincipalID {
+		writeCoded(w, r, http.StatusForbidden, domain.ErrCodeSoDConflict,
+			"a support context may not be approved by its requester or grantee")
+		return
+	}
+	if sc.ApproverPrincipalID != callerPrincipalID {
+		writeCoded(w, r, http.StatusForbidden, domain.ErrCodeAuthorizationDenied,
+			"only the named approver may approve")
+		return
+	}
 	if !h.requireIfMatch(w, r, sc.RecordVersion) {
 		return
 	}
