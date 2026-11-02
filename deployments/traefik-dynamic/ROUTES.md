@@ -3,71 +3,116 @@
 # Every service is reachable on the single gateway port at its path prefix.
 # The direct port still works and is useful when the gateway itself is suspect.
 
-| Path prefix | Service | Direct port |
-| --- | --- | --- |
-| `/access-control-svc` | access-control-svc | 8137 |
-| `/accounts-payable-svc` | accounts-payable-svc | 8099 |
-| `/accounts-receivable-svc` | accounts-receivable-svc | 8101 |
-| `/ai-governance-svc` | ai-governance-svc | 8146 |
-| `/audit-event-store-svc` | audit-event-store-svc | 8084 |
-| `/authorization-svc` | authorization-svc | 8089 |
-| `/bank-reconciliation-svc` | bank-reconciliation-svc | 8102 |
-| `/benefits-svc` | benefits-svc | 8112 |
-| `/board-resolutions-svc` | board-resolutions-svc | 8122 |
-| `/capability-registry-svc` | capability-registry-svc | 8145 |
-| `/clause-template-svc` | clause-template-svc | 8120 |
-| `/commercial-account-svc` | commercial-account-svc | 8144 |
-| `/compensation-svc` | compensation-svc | 8111 |
-| `/configuration-feature-flag-svc` | configuration-feature-flag-svc | 8086 |
-| `/consolidation-svc` | consolidation-svc | 8106 |
-| `/contract-lifecycle-svc` | contract-lifecycle-svc | 8119 |
-| `/corporate-actions-svc` | corporate-actions-svc | 8123 |
-| `/corporate-tax-svc` | corporate-tax-svc | 8128 |
-| `/counterparty-management-svc` | counterparty-management-svc | 8124 |
-| `/decision-support-svc` | decision-support-svc | 8138 |
-| `/delegated-authority-svc` | delegated-authority-svc | 8136 |
-| `/document-vault-svc` | document-vault-svc | 8094 |
-| `/employee-master-svc` | employee-master-svc | 8108 |
-| `/employment-contracts-svc` | employment-contracts-svc | 8109 |
-| `/evidence-manifest-svc` | evidence-manifest-svc | 8095 |
-| `/evidence-requirements-svc` | evidence-requirements-svc | 8130 |
-| `/financial-close-svc` | financial-close-svc | 8104 |
-| `/gateway-auth-svc` | gateway-auth-svc | 8092 |
-| `/general-ledger-svc` | general-ledger-svc | 8098 |
-| `/governance-decision-log-svc` | governance-decision-log-svc | 8083 |
-| `/identity-context-svc` | identity-context-svc | 8080 |
-| `/intercompany-accounting-svc` | intercompany-accounting-svc | 8105 |
-| `/invoice-approval-svc` | invoice-approval-svc | 8107 |
-| `/jurisdiction-rules-svc` | jurisdiction-rules-svc | 8082 |
-| `/kill-switch-registry-svc` | kill-switch-registry-svc | 8147 |
-| `/leave-absence-svc` | leave-absence-svc | 8115 |
-| `/metric-registry-svc` | metric-registry-svc | 8149 |
-| `/mtls-management-svc` | mtls-management-svc | 8140 |
-| `/notification-svc` | notification-svc | 8133 |
-| `/obligation-tracking-svc` | obligation-tracking-svc | 8121 |
-| `/obligations-svc` | obligations-svc | 8088 |
-| `/offboarding-severance-svc` | offboarding-severance-svc | 8117 |
-| `/org-structure-svc` | org-structure-svc | 8116 |
-| `/payroll-exceptions-svc` | payroll-exceptions-svc | 8114 |
-| `/payroll-run-svc` | payroll-run-svc | 8110 |
-| `/payroll-tax-svc` | payroll-tax-svc | 8113 |
-| `/performance-review-svc` | performance-review-svc | 8139 |
-| `/policy-svc` | policy-svc | 8085 |
-| `/procurement-workflow-svc` | procurement-workflow-svc | 8134 |
-| `/purchase-order-svc` | purchase-order-svc | 8129 |
-| `/purchase-request-svc` | purchase-request-svc | 8100 |
-| `/retention-registry-svc` | retention-registry-svc | 8148 |
-| `/schema-registry-svc` | schema-registry-svc | 8093 |
-| `/search-indexer-svc` | search-indexer-svc | 8096 |
-| `/secret-vault-integration-svc` | secret-vault-integration-svc | 8087 |
-| `/source-authority-svc` | source-authority-svc | 8150 |
-| `/spend-controls-svc` | spend-controls-svc | 8131 |
-| `/tax-determination-svc` | tax-determination-svc | 8126 |
-| `/tax-rules-svc` | tax-rules-svc | 8125 |
-| `/tenant-entity-registry-svc` | tenant-entity-registry-svc | 8081 |
-| `/treasury-svc` | treasury-svc | 8103 |
-| `/vat-gst-svc` | vat-gst-svc | 8127 |
-| `/vendor-due-diligence-svc` | vendor-due-diligence-svc | 8135 |
-| `/workflow-history-svc` | workflow-history-svc | 8097 |
-| `/workflow-svc` | workflow-svc | 8090 |
-| `/workforce-compliance-svc` | workforce-compliance-svc | 8118 |
+| Path prefix | Service | Container port | Host port |
+| --- | --- | --- | --- |
+| `/access-control-svc` | access-control-svc | 8137 | 8137 |
+| `/accounting-period-svc` | accounting-period-svc | 8174 | 8174 |
+| `/accounts-payable-svc` | accounts-payable-svc | 8099 | 8099 |
+| `/accounts-receivable-svc` | accounts-receivable-svc | 8101 | 8101 |
+| `/ai-governance-svc` | ai-governance-svc | 8146 | 8146 |
+| `/anomaly-detection-svc` | anomaly-detection-svc | 8134 | 8190 |
+| `/asset-management-svc` | asset-management-svc | 8167 | 8167 |
+| `/audit-event-store-svc` | audit-event-store-svc | 8084 | 8084 |
+| `/authorization-svc` | authorization-svc | 8089 | 8089 |
+| `/bank-reconciliation-svc` | bank-reconciliation-svc | 8102 | 8102 |
+| `/banking-connector-svc` | banking-connector-svc | 8145 | 8197 |
+| `/benefits-svc` | benefits-svc | 8112 | 8112 |
+| `/board-resolutions-svc` | board-resolutions-svc | 8122 | 8122 |
+| `/capability-registry-svc` | capability-registry-svc | 8145 | 8145 |
+| `/carta-svc` | carta-svc | 8142 | 8142 |
+| `/clause-template-svc` | clause-template-svc | 8120 | 8120 |
+| `/comments-collaboration-svc` | comments-collaboration-svc | 8170 | 8170 |
+| `/commercial-account-svc` | commercial-account-svc | 8144 | 8144 |
+| `/compensation-svc` | compensation-svc | 8111 | 8111 |
+| `/compliance-risk-scoring-svc` | compliance-risk-scoring-svc | 8177 | 8177 |
+| `/compliance-status-svc` | compliance-status-svc | 8132 | 8132 |
+| `/configuration-feature-flag-svc` | configuration-feature-flag-svc | 8086 | 8086 |
+| `/connectivity-api-bridge-svc` | connectivity-api-bridge-svc | 8144 | 8196 |
+| `/consolidation-svc` | consolidation-svc | 8106 | 8106 |
+| `/contract-lifecycle-svc` | contract-lifecycle-svc | 8119 | 8119 |
+| `/corporate-actions-svc` | corporate-actions-svc | 8123 | 8123 |
+| `/corporate-tax-svc` | corporate-tax-svc | 8128 | 8128 |
+| `/counterparty-management-svc` | counterparty-management-svc | 8124 | 8124 |
+| `/currency-registry-svc` | currency-registry-svc | 8172 | 8172 |
+| `/decision-support-svc` | decision-support-svc | 8138 | 8138 |
+| `/delegated-authority-svc` | delegated-authority-svc | 8136 | 8136 |
+| `/document-vault-svc` | document-vault-svc | 8094 | 8094 |
+| `/employee-master-svc` | employee-master-svc | 8108 | 8108 |
+| `/employment-contracts-svc` | employment-contracts-svc | 8109 | 8109 |
+| `/esignature-integration-svc` | esignature-integration-svc | 8148 | 8200 |
+| `/evidence-manifest-svc` | evidence-manifest-svc | 8095 | 8095 |
+| `/evidence-requirements-svc` | evidence-requirements-svc | 8130 | 8130 |
+| `/exception-escalation-svc` | exception-escalation-svc | 8133 | 8205 |
+| `/expense-claim-svc` | expense-claim-svc | 8158 | 8158 |
+| `/external-data-feed-svc` | external-data-feed-svc | 8149 | 8201 |
+| `/filing-preparation-svc` | filing-preparation-svc | 8176 | 8176 |
+| `/filing-tracker-svc` | filing-tracker-svc | 8131 | 8204 |
+| `/financial-close-svc` | financial-close-svc | 8104 | 8104 |
+| `/financial-control-svc` | financial-control-svc | 8171 | 8171 |
+| `/financial-statements-svc` | financial-statements-svc | 8175 | 8175 |
+| `/fiscal-calendar-svc` | fiscal-calendar-svc | 8173 | 8173 |
+| `/forecasting-svc` | forecasting-svc | 8135 | 8191 |
+| `/gateway-auth-svc` | gateway-auth-svc | 8092 | 8092 |
+| `/general-ledger-svc` | general-ledger-svc | 8098 | 8098 |
+| `/goods-service-receipt-svc` | goods-service-receipt-svc | 8157 | 8157 |
+| `/governance-decision-log-svc` | governance-decision-log-svc | 8083 | 8083 |
+| `/hris-connector-svc` | hris-connector-svc | 8146 | 8198 |
+| `/identity-context-svc` | identity-context-svc | 8080 | 8080 |
+| `/intercompany-accounting-svc` | intercompany-accounting-svc | 8105 | 8105 |
+| `/inventory-management-svc` | inventory-management-svc | 8168 | 8168 |
+| `/invoice-approval-svc` | invoice-approval-svc | 8107 | 8107 |
+| `/jurisdiction-rules-svc` | jurisdiction-rules-svc | 8082 | 8082 |
+| `/key-management-svc` | key-management-svc | 8143 | 8143 |
+| `/kill-switch-registry-svc` | kill-switch-registry-svc | 8147 | 8147 |
+| `/leave-absence-svc` | leave-absence-svc | 8115 | 8115 |
+| `/metric-registry-svc` | metric-registry-svc | 8149 | 8149 |
+| `/migration-integrity-svc` | migration-integrity-svc | 8139 | 8195 |
+| `/mtls-management-svc` | mtls-management-svc | 8140 | 8140 |
+| `/notification-svc` | notification-svc | 8133 | 8133 |
+| `/obligation-tracking-svc` | obligation-tracking-svc | 8121 | 8121 |
+| `/obligations-svc` | obligations-svc | 8088 | 8088 |
+| `/offboarding-severance-svc` | offboarding-severance-svc | 8117 | 8117 |
+| `/org-structure-svc` | org-structure-svc | 8116 | 8116 |
+| `/payable-open-item-svc` | payable-open-item-svc | 8164 | 8164 |
+| `/payee-banking-identity-svc` | payee-banking-identity-svc | 8166 | 8166 |
+| `/payment-authorization-svc` | payment-authorization-svc | 8160 | 8160 |
+| `/payment-initiation-adapter-svc` | payment-initiation-adapter-svc | 8162 | 8162 |
+| `/payment-proposal-svc` | payment-proposal-svc | 8159 | 8159 |
+| `/payment-run-svc` | payment-run-svc | 8161 | 8161 |
+| `/payment-status-svc` | payment-status-svc | 8163 | 8163 |
+| `/payroll-exceptions-svc` | payroll-exceptions-svc | 8114 | 8114 |
+| `/payroll-run-svc` | payroll-run-svc | 8110 | 8110 |
+| `/payroll-tax-svc` | payroll-tax-svc | 8113 | 8113 |
+| `/performance-review-svc` | performance-review-svc | 8139 | 8139 |
+| `/policy-svc` | policy-svc | 8085 | 8085 |
+| `/privacy-consent-svc` | privacy-consent-svc | 8152 | 8152 |
+| `/privacy-decision-svc` | privacy-decision-svc | 8153 | 8153 |
+| `/privacy-purpose-registry-svc` | privacy-purpose-registry-svc | 8151 | 8151 |
+| `/privacy-rights-svc` | privacy-rights-svc | 8154 | 8154 |
+| `/privacy-transfer-svc` | privacy-transfer-svc | 8155 | 8155 |
+| `/procurement-workflow-svc` | procurement-workflow-svc | 8134 | 8134 |
+| `/project-accounting-svc` | project-accounting-svc | 8169 | 8169 |
+| `/purchase-order-svc` | purchase-order-svc | 8129 | 8129 |
+| `/purchase-request-svc` | purchase-request-svc | 8100 | 8100 |
+| `/reconciliation-intelligence-svc` | reconciliation-intelligence-svc | 8137 | 8193 |
+| `/reporting-orchestration-svc` | reporting-orchestration-svc | 8138 | 8194 |
+| `/retention-registry-svc` | retention-registry-svc | 8148 | 8148 |
+| `/schema-registry-svc` | schema-registry-svc | 8093 | 8093 |
+| `/search-indexer-svc` | search-indexer-svc | 8096 | 8096 |
+| `/secret-vault-integration-svc` | secret-vault-integration-svc | 8087 | 8087 |
+| `/siem-integration-svc` | siem-integration-svc | 8141 | 8141 |
+| `/source-authority-svc` | source-authority-svc | 8150 | 8150 |
+| `/spend-controls-svc` | spend-controls-svc | 8131 | 8131 |
+| `/supplier-financial-profile-svc` | supplier-financial-profile-svc | 8156 | 8156 |
+| `/supplier-recovery-svc` | supplier-recovery-svc | 8165 | 8165 |
+| `/tax-authority-interface-svc` | tax-authority-interface-svc | 8147 | 8199 |
+| `/tax-determination-svc` | tax-determination-svc | 8126 | 8126 |
+| `/tax-rules-svc` | tax-rules-svc | 8125 | 8125 |
+| `/tenant-entity-registry-svc` | tenant-entity-registry-svc | 8081 | 8081 |
+| `/treasury-svc` | treasury-svc | 8103 | 8103 |
+| `/vat-gst-svc` | vat-gst-svc | 8127 | 8127 |
+| `/vendor-due-diligence-svc` | vendor-due-diligence-svc | 8135 | 8135 |
+| `/withholding-tax-svc` | withholding-tax-svc | 8129 | 8202 |
+| `/workflow-history-svc` | workflow-history-svc | 8097 | 8097 |
+| `/workflow-svc` | workflow-svc | 8090 | 8090 |
+| `/workforce-compliance-svc` | workforce-compliance-svc | 8118 | 8118 |

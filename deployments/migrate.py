@@ -68,7 +68,9 @@ TRACK = """CREATE TABLE IF NOT EXISTS schema_migrations (
 
 
 def files(d):
-    return sorted(f for f in os.listdir(d) if f.endswith(".up.sql"))
+    # Every forward migration: NNN_name.up.sql, and the plain NNN_name.sql
+    # some services use (e.g. the phase-7 connectors). Same set as init-db.sh.
+    return sorted(f for f in os.listdir(d) if f.endswith(".sql") and not f.endswith(".down.sql"))
 
 
 def checksum(path):

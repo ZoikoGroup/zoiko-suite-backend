@@ -78,6 +78,27 @@ services:
       - ../services/financial-statements-svc/deployments/migrations:/migrations/financial-statements:ro
       - ../services/access-control-svc/deployments/migrations:/migrations/access-control:ro
       - ../services/decision-support-svc/deployments/migrations:/migrations/decision-support:ro
+      - ../services/anomaly-detection-svc/deployments/migrations:/migrations/anomaly-detection:ro
+      - ../services/forecasting-svc/deployments/migrations:/migrations/forecasting:ro
+      - ../services/compliance-risk-scoring-svc/deployments/migrations:/migrations/compliance-risk-scoring:ro
+      - ../services/reconciliation-intelligence-svc/deployments/migrations:/migrations/reconciliation-intelligence:ro
+      - ../services/reporting-orchestration-svc/deployments/migrations:/migrations/reporting-orchestration:ro
+      - ../services/migration-integrity-svc/deployments/migrations:/migrations/migration-integrity:ro
+      - ../services/siem-integration-svc/deployments/migrations:/migrations/siem-integration:ro
+      - ../services/carta-svc/deployments/migrations:/migrations/carta:ro
+      - ../services/key-management-svc/deployments/migrations:/migrations/key-management:ro
+      - ../services/connectivity-api-bridge-svc/deployments/migrations:/migrations/connectivity-api-bridge:ro
+      - ../services/banking-connector-svc/deployments/migrations:/migrations/banking-connector:ro
+      - ../services/hris-connector-svc/deployments/migrations:/migrations/hris-connector:ro
+      - ../services/tax-authority-interface-svc/deployments/migrations:/migrations/tax-authority-interface:ro
+      - ../services/esignature-integration-svc/deployments/migrations:/migrations/esignature-integration:ro
+      - ../services/external-data-feed-svc/deployments/migrations:/migrations/external-data-feed:ro
+      - ../services/withholding-tax-svc/deployments/migrations:/migrations/withholding-tax:ro
+      - ../services/filing-preparation-svc/deployments/migrations:/migrations/filing-preparation:ro
+      - ../services/filing-tracker-svc/deployments/migrations:/migrations/filing-tracker:ro
+      - ../services/compliance-status-svc/deployments/migrations:/migrations/compliance-status:ro
+      - ../services/exception-escalation-svc/deployments/migrations:/migrations/exception-escalation:ro
+      - ../services/mtls-management-svc/deployments/migrations:/migrations/mtls-management:ro
       - ../services/treasury-svc/deployments/migrations:/migrations/treasury:ro
       - ../services/financial-close-svc/deployments/migrations:/migrations/financial-close:ro
       - ../services/bank-reconciliation-svc/deployments/migrations:/migrations/bank-reconciliation:ro
@@ -2099,8 +2120,11 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: purchase_request
-      DB_USER: zoiko_app
-      DB_PASSWORD: zoiko_app_password
+      # create-app-roles.sh gives purchase_request its own NOSUPERUSER role and
+      # revokes CONNECT from PUBLIC, so the shared zoiko_app cannot connect on a
+      # fresh volume (found by the 2026-11-02 real-container run).
+      DB_USER: "${DB_USER_PURCHASE_REQUEST:-app_purchase_request}"
+      DB_PASSWORD: "${APP_DB_PASSWORD:-postgres}"
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.purchase-request.events"
@@ -2890,6 +2914,9 @@ services:
     environment:
       PORT: "8140"
       CA_DATA_DIR: "/data/ca"
+      # Certificate records (identity, serials, validity, status) live in
+      # Postgres; the CA key and the CRL ledger stay on the CA volume.
+      DATABASE_URL: "postgres://${DB_USER_MTLS_MANAGEMENT:-app_mtls_management}:${APP_DB_PASSWORD:-postgres}@postgres:5432/mtls_management?sslmode=disable"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       # Authorization decisions over mTLS, presenting a client certificate
       # this service issues itself (it is the CA, so it needs no bootstrap
@@ -2909,6 +2936,8 @@ services:
     depends_on:
       mtls-bootstrap-keygen:
         condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "/app/healthcheck"]
       interval: 10s
@@ -4022,7 +4051,7 @@ services:
       - "8119:8119"
     environment:
       PORT: "8119"
-      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/contract_lifecycle?sslmode=disable"
+      DATABASE_URL: "postgres://${DB_USER_CONTRACT_LIFECYCLE:-app_contract_lifecycle}:${DB_PASSWORD:-postgres}@postgres:5432/contract_lifecycle?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.contract.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -4056,7 +4085,7 @@ services:
       - "8120:8120"
     environment:
       PORT: "8120"
-      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/clause_template?sslmode=disable"
+      DATABASE_URL: "postgres://${DB_USER_CLAUSE_TEMPLATE:-app_clause_template}:${DB_PASSWORD:-postgres}@postgres:5432/clause_template?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.clause.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -4087,7 +4116,7 @@ services:
       - "8121:8121"
     environment:
       PORT: "8121"
-      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/obligation_tracking?sslmode=disable"
+      DATABASE_URL: "postgres://${DB_USER_OBLIGATION_TRACKING:-app_obligation_tracking}:${DB_PASSWORD:-postgres}@postgres:5432/obligation_tracking?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.obligation-tracking.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -4154,7 +4183,7 @@ services:
       - "8123:8123"
     environment:
       PORT: "8123"
-      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/corporate_actions?sslmode=disable"
+      DATABASE_URL: "postgres://${DB_USER_CORPORATE_ACTIONS:-app_corporate_actions}:${DB_PASSWORD:-postgres}@postgres:5432/corporate_actions?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.corporate-actions.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -4188,7 +4217,7 @@ services:
       - "8124:8124"
     environment:
       PORT: "8124"
-      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/counterparty_management?sslmode=disable"
+      DATABASE_URL: "postgres://${DB_USER_COUNTERPARTY_MANAGEMENT:-app_counterparty_management}:${DB_PASSWORD:-postgres}@postgres:5432/counterparty_management?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.counterparty.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -4278,7 +4307,7 @@ services:
       - "8125:8125"
     environment:
       PORT: "8125"
-      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/tax_rules?sslmode=disable"
+      DATABASE_URL: "postgres://${DB_USER_TAX_RULES:-app_tax_rules}:${DB_PASSWORD:-postgres}@postgres:5432/tax_rules?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.tax-rules.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -4309,7 +4338,7 @@ services:
       - "8126:8126"
     environment:
       PORT: "8126"
-      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/tax_determination?sslmode=disable"
+      DATABASE_URL: "postgres://${DB_USER_TAX_DETERMINATION:-app_tax_determination}:${DB_PASSWORD:-postgres}@postgres:5432/tax_determination?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.tax-determination.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -4343,7 +4372,7 @@ services:
       - "8127:8127"
     environment:
       PORT: "8127"
-      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/vat_gst?sslmode=disable"
+      DATABASE_URL: "postgres://${DB_USER_VAT_GST:-app_vat_gst}:${DB_PASSWORD:-postgres}@postgres:5432/vat_gst?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.vat-gst.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -4378,13 +4407,13 @@ services:
       - "8128:8128"
     environment:
       PORT: "8128"
-      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/corporate_tax?sslmode=disable"
+      DATABASE_URL: "postgres://${DB_USER_CORPORATE_TAX:-app_corporate_tax}:${DB_PASSWORD:-postgres}@postgres:5432/corporate_tax?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.corporate-tax.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       TAX_RULES_SERVICE_URL: "http://tax-rules-svc:8125"
       JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8082"
-      GENERAL_LEDGER_URL: "http://general-ledger-svc:8091"
+      GENERAL_LEDGER_URL: "http://general-ledger-svc:8098"
       EVIDENCE_REQUIREMENTS_URL: "http://evidence-requirements-svc:8130"
     depends_on:
       postgres:
@@ -5607,6 +5636,664 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
+    restart: on-failure
+
+
+  # ── Blocks 8-10: services previously defined only in the standalone
+  # phase6/phase7 stacks; added so the gateway generator routes them. ──
+  anomaly-detection-svc:
+    build:
+      context: ../services/anomaly-detection-svc
+      dockerfile: Dockerfile
+    container_name: anomaly-detection-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    # Host 8190 -> container 8134: 8134 is published by another main-stack
+    # service. In-network callers still use anomaly-detection-svc:8134; gateway prefix /anomaly-detection-svc.
+    ports:
+      - "8190:8134"
+    environment:
+      # config default is localhost:8125
+      JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8082"
+      PORT: "8134"
+      DATABASE_URL: "postgres://${DB_USER_ANOMALY_DETECTION:-app_anomaly_detection}:${APP_DB_PASSWORD:-postgres}@postgres:5432/anomaly_detection?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_TOPIC: "zoiko.anomaly-detection.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: on-failure
+
+  forecasting-svc:
+    build:
+      context: ../services/forecasting-svc
+      dockerfile: Dockerfile
+    container_name: forecasting-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    # Host 8191 -> container 8135: 8135 is published by another main-stack
+    # service. In-network callers still use forecasting-svc:8135; gateway prefix /forecasting-svc.
+    ports:
+      - "8191:8135"
+    environment:
+      PORT: "8135"
+      DATABASE_URL: "postgres://${DB_USER_FORECASTING:-app_forecasting}:${APP_DB_PASSWORD:-postgres}@postgres:5432/forecasting?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_TOPIC: "zoiko.forecasting.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: on-failure
+
+  compliance-risk-scoring-svc:
+    build:
+      context: ../services/compliance-risk-scoring-svc
+      dockerfile: Dockerfile
+    container_name: compliance-risk-scoring-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8177:8177"
+    environment:
+      PORT: "8177"
+      DATABASE_URL: "postgres://${DB_USER_COMPLIANCE_RISK_SCORING:-app_compliance_risk_scoring}:${APP_DB_PASSWORD:-postgres}@postgres:5432/compliance_risk_scoring?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_TOPIC: "zoiko.compliance-risk-scoring.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: on-failure
+
+  reconciliation-intelligence-svc:
+    build:
+      # Context is services/: go.mod replaces zoiko.io/eventing => ../eventing.
+      context: ../services
+      dockerfile: reconciliation-intelligence-svc/Dockerfile
+    container_name: reconciliation-intelligence-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    # Host 8193 -> container 8137: 8137 is published by another main-stack
+    # service. In-network callers still use reconciliation-intelligence-svc:8137; gateway prefix /reconciliation-intelligence-svc.
+    ports:
+      - "8193:8137"
+    environment:
+      FINANCIAL_CONTROL_SERVICE_URL: "http://financial-control-svc:8171"
+      BANK_RECONCILIATION_SERVICE_URL: "http://bank-reconciliation-svc:8102"
+      GENERAL_LEDGER_SERVICE_URL: "http://general-ledger-svc:8098"
+      # Required at startup: every emitted event carries its residency region.
+      EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"
+      PORT: "8137"
+      DATABASE_URL: "postgres://${DB_USER_RECONCILIATION_INTELLIGENCE:-app_reconciliation_intelligence}:${APP_DB_PASSWORD:-postgres}@postgres:5432/reconciliation_intelligence?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_TOPIC: "zoiko.reconciliation-intelligence.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: on-failure
+
+  reporting-orchestration-svc:
+    build:
+      context: ../services/reporting-orchestration-svc
+      dockerfile: Dockerfile
+    container_name: reporting-orchestration-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    # Host 8194 -> container 8138: 8138 is published by another main-stack
+    # service. In-network callers still use reporting-orchestration-svc:8138; gateway prefix /reporting-orchestration-svc.
+    ports:
+      - "8194:8138"
+    environment:
+      # config default is :8080; audit-event-store listens on 8084
+      AUDIT_EVENT_STORE_SERVICE_URL: "http://audit-event-store-svc:8084"
+      RETENTION_REGISTRY_SERVICE_URL: "http://retention-registry-svc:8148"
+      PORT: "8138"
+      DATABASE_URL: "postgres://${DB_USER_REPORTING_ORCHESTRATION:-app_reporting_orchestration}:${APP_DB_PASSWORD:-postgres}@postgres:5432/reporting_orchestration?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_TOPIC: "zoiko.reporting-orchestration.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: on-failure
+
+  migration-integrity-svc:
+    build:
+      # Context is services/: go.mod replaces zoiko.io/eventing => ../eventing.
+      context: ../services
+      dockerfile: migration-integrity-svc/Dockerfile
+    container_name: migration-integrity-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    # Host 8195 -> container 8139: 8139 is published by another main-stack
+    # service. In-network callers still use migration-integrity-svc:8139; gateway prefix /migration-integrity-svc.
+    ports:
+      - "8195:8139"
+    environment:
+      PORT: "8139"
+      DATABASE_URL: "postgres://${DB_USER_MIGRATION_INTEGRITY:-app_migration_integrity}:${APP_DB_PASSWORD:-postgres}@postgres:5432/migration_integrity?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_TOPIC: "zoiko.migration-integrity.events"
+      EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: on-failure
+
+  siem-integration-svc:
+    build:
+      context: ..
+      dockerfile: services/siem-integration-svc/Dockerfile
+    container_name: siem-integration-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8141:8141"
+    environment:
+      # AES-256-GCM key (base64, 32 bytes) sealing exporter auth tokens at rest.
+      # Supply from the secret store; unset = token-bearing exporters are refused (503).
+      SIEM_CREDENTIAL_KEY: "${SIEM_CREDENTIAL_KEY:-}"
+      SIEM_CREDENTIAL_KEY_ID: "${SIEM_CREDENTIAL_KEY_ID:-k1}"
+      PORT: "8141"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      DATABASE_URL: "postgres://${DB_USER_SIEM_INTEGRATION:-app_siem_integration}:${APP_DB_PASSWORD:-postgres}@postgres:5432/siem_integration?sslmode=disable"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: on-failure
+
+  carta-svc:
+    build:
+      context: ..
+      dockerfile: services/carta-svc/Dockerfile
+    container_name: carta-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8142:8142"
+    environment:
+      PORT: "8142"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      DATABASE_URL: "postgres://${DB_USER_CARTA:-app_carta}:${APP_DB_PASSWORD:-postgres}@postgres:5432/carta?sslmode=disable"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: on-failure
+
+  key-management-svc:
+    build:
+      context: ..
+      dockerfile: services/key-management-svc/Dockerfile
+    container_name: key-management-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8143:8143"
+    environment:
+      PORT: "8143"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      SIEM_SERVICE_URL: "http://siem-integration-svc:8141"
+      DATABASE_URL: "postgres://${DB_USER_KEY_MANAGEMENT:-app_key_management}:${APP_DB_PASSWORD:-postgres}@postgres:5432/key_management?sslmode=disable"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: on-failure
+
+  connectivity-api-bridge-svc:
+    build:
+      context: ../services
+      dockerfile: connectivity-api-bridge-svc/Dockerfile
+    container_name: connectivity-api-bridge-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    # Host 8196 -> container 8144: 8144 is published by another main-stack
+    # service. In-network callers still use connectivity-api-bridge-svc:8144; gateway prefix /connectivity-api-bridge-svc.
+    ports:
+      - "8196:8144"
+    environment:
+      PORT: "8144"
+      DATABASE_URL: "postgres://${DB_USER_CONNECTIVITY_API_BRIDGE:-app_connectivity_api_bridge}:${APP_DB_PASSWORD:-postgres}@postgres:5432/connectivity_api_bridge?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.connectivity.api.bridge.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      EVENT_RESIDENCY_REGION: "uk"
+      EGRESS_ALLOWED_REGIONS: "uk"
+      SECRET_VAULT_URL: "http://secret-vault-integration-svc:8087"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: on-failure
+
+  banking-connector-svc:
+    build:
+      # Context is services/: go.mod replaces zoiko.io/eventing => ../eventing.
+      context: ../services
+      dockerfile: banking-connector-svc/Dockerfile
+    container_name: banking-connector-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    # Host 8197 -> container 8145: 8145 is published by another main-stack
+    # service. In-network callers still use banking-connector-svc:8145; gateway prefix /banking-connector-svc.
+    ports:
+      - "8197:8145"
+    environment:
+      # every emitted event carries its residency region; unset made every create a 500
+      EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"
+      PORT: "8145"
+      DATABASE_URL: "postgres://${DB_USER_BANKING_CONNECTOR:-app_banking_connector}:${APP_DB_PASSWORD:-postgres}@postgres:5432/banking_connector?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.banking.connector.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: on-failure
+
+  hris-connector-svc:
+    build:
+      context: ../services/hris-connector-svc
+      dockerfile: Dockerfile
+    container_name: hris-connector-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    # Host 8198 -> container 8146: 8146 is published by another main-stack
+    # service. In-network callers still use hris-connector-svc:8146; gateway prefix /hris-connector-svc.
+    ports:
+      - "8198:8146"
+    environment:
+      PORT: "8146"
+      DATABASE_URL: "postgres://${DB_USER_HRIS_CONNECTOR:-app_hris_connector}:${APP_DB_PASSWORD:-postgres}@postgres:5432/hris_connector?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.hris.connector.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: on-failure
+
+  tax-authority-interface-svc:
+    build:
+      context: ../services
+      dockerfile: tax-authority-interface-svc/Dockerfile
+    container_name: tax-authority-interface-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    # Host 8199 -> container 8147: 8147 is published by another main-stack
+    # service. In-network callers still use tax-authority-interface-svc:8147; gateway prefix /tax-authority-interface-svc.
+    ports:
+      - "8199:8147"
+    environment:
+      # every emitted event carries its residency region
+      EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"
+      PORT: "8147"
+      DATABASE_URL: "postgres://${DB_USER_TAX_AUTHORITY_INTERFACE:-app_tax_authority_interface}:${APP_DB_PASSWORD:-postgres}@postgres:5432/tax_authority_interface?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.tax.authority.interface.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: on-failure
+
+  esignature-integration-svc:
+    build:
+      context: ../services/esignature-integration-svc
+      dockerfile: Dockerfile
+    container_name: esignature-integration-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    # Host 8200 -> container 8148: 8148 is published by another main-stack
+    # service. In-network callers still use esignature-integration-svc:8148; gateway prefix /esignature-integration-svc.
+    ports:
+      - "8200:8148"
+    environment:
+      PORT: "8148"
+      DATABASE_URL: "postgres://${DB_USER_ESIGNATURE_INTEGRATION:-app_esignature_integration}:${APP_DB_PASSWORD:-postgres}@postgres:5432/esignature_integration?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.esignature.integration.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: on-failure
+
+  external-data-feed-svc:
+    build:
+      context: ../services/external-data-feed-svc
+      dockerfile: Dockerfile
+    container_name: external-data-feed-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    # Host 8201 -> container 8149: 8149 is published by another main-stack
+    # service. In-network callers still use external-data-feed-svc:8149; gateway prefix /external-data-feed-svc.
+    ports:
+      - "8201:8149"
+    environment:
+      PORT: "8149"
+      DATABASE_URL: "postgres://${DB_USER_EXTERNAL_DATA_FEED:-app_external_data_feed}:${APP_DB_PASSWORD:-postgres}@postgres:5432/external_data_feed?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.external.data.feed.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: on-failure
+
+  withholding-tax-svc:
+    build:
+      context: ../services/withholding-tax-svc
+      dockerfile: Dockerfile
+    container_name: withholding-tax-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    # Host 8202 -> container 8129: 8129 is published by another main-stack
+    # service. In-network callers still use withholding-tax-svc:8129; gateway prefix /withholding-tax-svc.
+    ports:
+      - "8202:8129"
+    environment:
+      PORT: "8129"
+      DATABASE_URL: "postgres://${DB_USER_WITHHOLDING_TAX:-app_withholding_tax}:${APP_DB_PASSWORD:-postgres}@postgres:5432/withholding_tax?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.withholding-tax.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      TAX_RULES_SERVICE_URL: "http://tax-rules-svc:8125"
+      JURISDICTION_RULES_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: on-failure
+
+  filing-preparation-svc:
+    build:
+      context: ../services/filing-preparation-svc
+      dockerfile: Dockerfile
+    container_name: filing-preparation-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8176:8176"
+    environment:
+      PORT: "8176"
+      DATABASE_URL: "postgres://${DB_USER_FILING_PREPARATION:-app_filing_preparation}:${APP_DB_PASSWORD:-postgres}@postgres:5432/filing_preparation?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.filing-prep.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      EVIDENCE_MANIFEST_URL: "http://authorization-svc:8089"
+      JURISDICTION_RULES_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: on-failure
+
+  filing-tracker-svc:
+    build:
+      context: ../services/filing-tracker-svc
+      dockerfile: Dockerfile
+    container_name: filing-tracker-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    # Host 8204 -> container 8131: 8131 is published by another main-stack
+    # service. In-network callers still use filing-tracker-svc:8131; gateway prefix /filing-tracker-svc.
+    ports:
+      - "8204:8131"
+    environment:
+      PORT: "8131"
+      DATABASE_URL: "postgres://${DB_USER_FILING_TRACKER:-app_filing_tracker}:${APP_DB_PASSWORD:-postgres}@postgres:5432/filing_tracker?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.filing-tracker.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      JURISDICTION_RULES_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: on-failure
+
+  compliance-status-svc:
+    build:
+      context: ../services/compliance-status-svc
+      dockerfile: Dockerfile
+    container_name: compliance-status-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8132:8132"
+    environment:
+      PORT: "8132"
+      DATABASE_URL: "postgres://${DB_USER_COMPLIANCE_STATUS:-app_compliance_status}:${APP_DB_PASSWORD:-postgres}@postgres:5432/compliance_status?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.compliance-status.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      JURISDICTION_RULES_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: on-failure
+
+  exception-escalation-svc:
+    build:
+      context: ../services/exception-escalation-svc
+      dockerfile: Dockerfile
+    container_name: exception-escalation-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    # Host 8205 -> container 8133: 8133 is published by another main-stack
+    # service. In-network callers still use exception-escalation-svc:8133; gateway prefix /exception-escalation-svc.
+    ports:
+      - "8205:8133"
+    environment:
+      PORT: "8133"
+      DATABASE_URL: "postgres://${DB_USER_EXCEPTION_ESCALATION:-app_exception_escalation}:${APP_DB_PASSWORD:-postgres}@postgres:5432/exception_escalation?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.exception-escalation.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      JURISDICTION_RULES_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
     restart: on-failure
 
 volumes:
