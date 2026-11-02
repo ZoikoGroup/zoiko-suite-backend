@@ -466,6 +466,10 @@ func TestOutbox_RowLevelSecurityPolicy(t *testing.T) {
 	END $$`); err != nil {
 		t.Fatal(err)
 	}
+	// CI authenticates every connection with a password, so the role needs one.
+	if _, err := admin.Exec(bg, `ALTER ROLE org_rls_test PASSWORD 'rls'`); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := admin.Exec(bg, `GRANT SELECT, INSERT, UPDATE ON event_outbox TO org_rls_test`); err != nil {
 		t.Fatal(err)
 	}
@@ -475,6 +479,7 @@ func TestOutbox_RowLevelSecurityPolicy(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg.ConnConfig.User = "org_rls_test"
+	cfg.ConnConfig.Password = "rls"
 	app, err := pgxpool.NewWithConfig(bg, cfg)
 	if err != nil {
 		t.Fatal(err)
