@@ -858,6 +858,48 @@ func (s *Store) DecideRoleAssignment(ctx context.Context, assignmentID, tenantID
 	return a, err
 }
 
+// SuspendRoleAssignment and ResumeRoleAssignment stop and restart a grant
+// (000038), so cached grant sources are dropped like any revoke or approval.
+func (s *Store) SuspendRoleAssignment(ctx context.Context, assignmentID, tenantID, suspendedBy, reason string) (*domain.PrincipalRoleAssignment, error) {
+	f, ok := s.inner.(interface {
+		SuspendRoleAssignment(ctx context.Context, assignmentID, tenantID, suspendedBy, reason string) (*domain.PrincipalRoleAssignment, error)
+	})
+	if !ok {
+		return nil, domain.ErrStoreUnavailable
+	}
+	a, err := f.SuspendRoleAssignment(ctx, assignmentID, tenantID, suspendedBy, reason)
+	if err == nil {
+		s.invalidateGrantSources(tenantID)
+	}
+	return a, err
+}
+
+func (s *Store) ResumeRoleAssignment(ctx context.Context, assignmentID, tenantID string) (*domain.PrincipalRoleAssignment, error) {
+	f, ok := s.inner.(interface {
+		ResumeRoleAssignment(ctx context.Context, assignmentID, tenantID string) (*domain.PrincipalRoleAssignment, error)
+	})
+	if !ok {
+		return nil, domain.ErrStoreUnavailable
+	}
+	a, err := f.ResumeRoleAssignment(ctx, assignmentID, tenantID)
+	if err == nil {
+		s.invalidateGrantSources(tenantID)
+	}
+	return a, err
+}
+
+// FindRoleAssignmentsAsOf is a history read for audit, never a decision:
+// forwarded uncached.
+func (s *Store) FindRoleAssignmentsAsOf(ctx context.Context, tenantID, principalID string, asOf time.Time) ([]domain.PrincipalRoleAssignment, error) {
+	f, ok := s.inner.(interface {
+		FindRoleAssignmentsAsOf(ctx context.Context, tenantID, principalID string, asOf time.Time) ([]domain.PrincipalRoleAssignment, error)
+	})
+	if !ok {
+		return nil, domain.ErrStoreUnavailable
+	}
+	return f.FindRoleAssignmentsAsOf(ctx, tenantID, principalID, asOf)
+}
+
 // The GOV-04 exception lifecycle and its evaluation read are forwarded
 // uncached: an exception must stop applying the instant it is revoked or
 // expires, and FindActiveSoDException evaluates the time itself.

@@ -57,9 +57,11 @@ func TestCacheWiring_CapabilityRoutesWork(t *testing.T) {
 			rbacActions:   stubAdminActions, // the cache reads grants through the scoped lookup
 			bundleActive:  &domain.PermissionBundle{PermissionBundleID: "b-1", RoleID: "r-1"},
 			revokedAssign: &domain.PrincipalRoleAssignment{PrincipalRoleAssignmentID: "a-1", RoleID: "r-1"},
+			// The revoke route checks If-Match against this read (000038).
+			findAssignment: &domain.PrincipalRoleAssignment{PrincipalRoleAssignmentID: "a-1", RoleID: "r-1", Version: 1},
 		}
 		req := httptest.NewRequest(http.MethodPost, path, bytes.NewBufferString(`{}`))
-		req.Header.Set("If-Match", `"v1"`) // API-3; ignored by the route that is not versioned
+		req.Header.Set("If-Match", `"v1"`) // API-3
 		req.Header.Set("X-Principal-Id", "admin-1")
 		req.Header.Set("X-Tenant-Id", ownRoleTenant)
 		w := httptest.NewRecorder()

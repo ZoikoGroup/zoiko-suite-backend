@@ -80,6 +80,14 @@ type PrincipalRoleAssignment struct {
 	ApprovalDecidedAt *time.Time `json:"approval_decided_at,omitempty"`
 	ApprovalExpiresAt *time.Time `json:"approval_expires_at,omitempty"`
 
+	// Suspension (000038, ORG-06 SuspendAssignment). A suspended assignment
+	// grants nothing until it is resumed; it stays on record either way.
+	SuspendedAt      *time.Time `json:"suspended_at,omitempty"`
+	SuspendedBy      *string    `json:"suspended_by,omitempty"`
+	SuspensionReason *string    `json:"suspension_reason,omitempty"`
+	// Version is bumped on every real change (000038, API-3).
+	Version int64 `json:"version"`
+
 	// Filled only when a list asks for usage (include_usage=true), for access
 	// reviews (Authorization Standard §24 "Dormancy", "Orphan detection").
 	// LastGrantedAt is the latest GRANTED decision whose basis names this
@@ -1073,20 +1081,23 @@ var ErrWorkloadBindingNotFound = errorString("workload binding not found")
 // AuthorityLimit defines the foundational approval and signing limit for a principal
 // or role within an optional legal entity, book, or org-unit scope (ZS-IAM-001 §12, §21, §22).
 type AuthorityLimit struct {
-	AuthorityLimitID string     `json:"authority_limit_id"`
-	TenantID         string     `json:"tenant_id"`
-	PrincipalID      *string    `json:"principal_id,omitempty"`
-	RoleID           *string    `json:"role_id,omitempty"`
-	AuthorityType    string     `json:"authority_type"`
-	LegalEntityID    *string    `json:"legal_entity_id,omitempty"`
-	BookID           *string    `json:"book_id,omitempty"`
-	OrgUnitID        *string    `json:"org_unit_id,omitempty"`
-	Currency         string     `json:"currency"`
-	LowerLimit       string     `json:"lower_limit"`
-	UpperLimit       string     `json:"upper_limit"`
-	EffectiveFrom    time.Time  `json:"effective_from"`
-	EffectiveTo      *time.Time `json:"effective_to,omitempty"`
-	CreatedAt        time.Time  `json:"created_at"`
+	AuthorityLimitID string  `json:"authority_limit_id"`
+	TenantID         string  `json:"tenant_id"`
+	PrincipalID      *string `json:"principal_id,omitempty"`
+	RoleID           *string `json:"role_id,omitempty"`
+	AuthorityType    string  `json:"authority_type"`
+	LegalEntityID    *string `json:"legal_entity_id,omitempty"`
+	BookID           *string `json:"book_id,omitempty"`
+	OrgUnitID        *string `json:"org_unit_id,omitempty"`
+	// LimitKind is MONETARY (an amount in Currency) or QUANTITY (a whole
+	// count, no currency) — 000040, decision S8-D1.
+	LimitKind     string     `json:"limit_kind"`
+	Currency      string     `json:"currency,omitempty"`
+	LowerLimit    string     `json:"lower_limit"`
+	UpperLimit    string     `json:"upper_limit"`
+	EffectiveFrom time.Time  `json:"effective_from"`
+	EffectiveTo   *time.Time `json:"effective_to,omitempty"`
+	CreatedAt     time.Time  `json:"created_at"`
 
 	// Governance (000035, AU-03). Only an ACTIVE limit limits anything.
 	Status        string     `json:"status"`
@@ -1110,6 +1121,7 @@ type CreateAuthorityLimitParams struct {
 	LegalEntityID    *string
 	BookID           *string
 	OrgUnitID        *string
+	LimitKind        string // empty means MONETARY
 	Currency         string
 	LowerLimit       string
 	UpperLimit       string
@@ -1265,6 +1277,7 @@ type WorkloadBinding struct {
 	AllowedActions  []string  `json:"allowed_actions"`
 	ActiveFlag      bool      `json:"active_flag"`
 	CreatedAt       time.Time `json:"created_at"`
+	Version         int64     `json:"version"`
 }
 
 type errorString string

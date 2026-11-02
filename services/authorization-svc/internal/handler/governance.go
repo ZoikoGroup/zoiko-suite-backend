@@ -333,7 +333,12 @@ func (h *Handler) decideRoleAssignment(w http.ResponseWriter, r *http.Request, d
 	if !ok {
 		return
 	}
-	if _, ok := h.readCommand(w, &r); !ok {
+	bodyVersion, ok := h.readCommand(w, &r)
+	if !ok {
+		return
+	}
+	expected, ok := optionalExpectedVersion(w, r, bodyVersion)
+	if !ok {
 		return
 	}
 
@@ -350,6 +355,10 @@ func (h *Handler) decideRoleAssignment(w http.ResponseWriter, r *http.Request, d
 			return
 		}
 		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "", nil)
+		return
+	}
+	if expected > 0 && expected != pending.Version {
+		writeVersionConflict(w, r)
 		return
 	}
 	if pending.ApprovalStatus != domain.ApprovalPending {
@@ -412,5 +421,5 @@ func (h *Handler) decideRoleAssignment(w http.ResponseWriter, r *http.Request, d
 		zap.String("assignment_id", assignmentID), zap.String("decision", decision),
 		zap.String("checker", principalID), zap.String("maker", pending.AssignedBy),
 		zap.String("correlation_id", correlationID))
-	writeJSON(w, http.StatusOK, decided)
+	writeJSONWithETag(w, http.StatusOK, decided, decided.Version)
 }

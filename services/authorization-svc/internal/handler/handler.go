@@ -256,6 +256,9 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	// Maker-checker on privileged assignments (GOV-12; ZS-IAM-001 §9, A20).
 	r.Post("/v1/admin/role-assignments/{assignment_id}/approve", h.ApproveRoleAssignment)
 	r.Post("/v1/admin/role-assignments/{assignment_id}/reject", h.RejectRoleAssignment)
+	// ORG-06 SuspendAssignment (IAM-13; 000038).
+	r.Post("/v1/admin/role-assignments/{assignment_id}/suspend", h.SuspendRoleAssignment)
+	r.Post("/v1/admin/role-assignments/{assignment_id}/resume", h.ResumeRoleAssignment)
 
 	// GOV-03 commands (and the spec's illustrative contract surface).
 	r.Post("/v1/admin/authorization-cache/invalidate", h.InvalidateAuthorizationCache)
@@ -1322,7 +1325,7 @@ func (h *Handler) CreateRoleAssignment(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusAccepted, assignment)
 		return
 	}
-	writeJSON(w, http.StatusCreated, assignment)
+	writeJSONWithETag(w, http.StatusCreated, assignment, assignment.Version)
 }
 
 // assignmentSoDConflicts returns the static SoD conflicts assigning roleID to
@@ -1466,24 +1469,22 @@ func (h *Handler) RevokeRoleAssignment(w http.ResponseWriter, r *http.Request) {
 	if !h.applyReason(w, &r, body.reason()) {
 		return
 	}
+	if body.ExpectedVersion < 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_expected_version", "message": "expected_version must be positive"})
+		return
+	}
+	expected, ok := optionalExpectedVersion(w, r, body.ExpectedVersion)
+	if !ok {
+		return
+	}
 
 	// Ending a platform-scope assignment withdraws platform authority, so it
 	// is a platform act too — otherwise any tenant administrator could strip
-	// the platform's own rule authors.
-	if h.platformScopeEntityID != "" {
-		finder, ok := h.store.(roleAssignmentFinder)
+	// the platform's own rule authors. The same read checks a version the
+	// caller sent.
+	if h.platformScopeEntityID != "" || expected > 0 {
+		existing, ok := h.assignmentForMutation(w, r, assignmentID, tenantScope, expected)
 		if !ok {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
-			return
-		}
-		existing, err := finder.FindRoleAssignmentByID(r.Context(), assignmentID, tenantScope)
-		if err != nil {
-			if errors.Is(err, domain.ErrRoleAssignmentNotFound) {
-				writeJSON(w, http.StatusNotFound, map[string]string{"error": "role_assignment_not_found"})
-				return
-			}
-			h.log.Error("RevokeRoleAssignment: assignment lookup failed", zap.String("correlation_id", correlationID), zap.Error(err))
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
 			return
 		}
 		if existing.LegalEntityID != nil && h.isPlatformScopeEntity(*existing.LegalEntityID) &&
@@ -1515,7 +1516,7 @@ func (h *Handler) RevokeRoleAssignment(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
 			return
 		}
-		writeJSON(w, http.StatusOK, assignment)
+		writeJSONWithETag(w, http.StatusOK, assignment, assignment.Version)
 		return
 	}
 
@@ -1533,7 +1534,7 @@ func (h *Handler) RevokeRoleAssignment(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
 		return
 	}
-	writeJSON(w, http.StatusOK, assignment)
+	writeJSONWithETag(w, http.StatusOK, assignment, assignment.Version)
 }
 
 // ── POST /v1/admin/delegated-authorities ─────────────────────────────────────
@@ -3154,6 +3155,13 @@ func (h *Handler) ListRoleAssignments(w http.ResponseWriter, r *http.Request) {
 	principalFilter := strings.TrimSpace(r.URL.Query().Get("principal_id"))
 	roleFilter := strings.TrimSpace(r.URL.Query().Get("role_id"))
 	activeOnly := r.URL.Query().Get("include_expired") != "true"
+
+	// as_of: what granted at that instant, from the history (ORG-06
+	// GetAssignmentsAsOf) rather than the current rows.
+	if asOf := strings.TrimSpace(r.URL.Query().Get("as_of")); asOf != "" {
+		h.listRoleAssignmentsAsOf(w, r, tenantScope, principalFilter, roleFilter, asOf)
+		return
+	}
 
 	// Paged / usage form: limit, offset, include_usage=true. The plain form
 	// stops at 500 rows without saying so; a caller that must see every

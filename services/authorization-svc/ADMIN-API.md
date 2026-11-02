@@ -40,7 +40,7 @@ until 7 Oct 2026 existed only in code. For the evaluation endpoints see
   SoD and ABAC rule carries `version`.
 - **Events.** Every change below is announced through the transactional outbox
   on `zoiko.authorization.events` (ZS-IAM-001 §23 names): `iam.role.published`,
-  `iam.assignment.granted` / `.revoked`, `iam.delegation.granted` / `.revoked`,
+  `iam.assignment.granted` / `.revoked` / `.suspended` / `.resumed`, `iam.delegation.granted` / `.revoked`,
   `iam.sod_policy.published`, `iam.policy_set.published`,
   `sod.compensating_control.approved` / `.revoked`, `sod.exception.expired`,
   `authorization.cache.invalidated`.
@@ -61,7 +61,9 @@ until 7 Oct 2026 existed only in code. For the evaluation endpoints see
 | Route | Permission | Notes |
 |---|---|---|
 | `POST /v1/admin/role-assignments` | `iam.assignment.grant` (*platform* for `legal_entity_id` = the platform scope) | Body: `principal_id`, `role_id`, `legal_entity_id?`, `book_id?`, `org_unit_id?`, `effective_from`, `effective_to?`, `approval_reference?`. Self-assignment `403`; SoD conflict at the assignment's scope `409`. A **privileged** role (one granting any `iam.*` or protected platform action) or a platform-scope assignment by a caller without `iam.assignment.approve_privileged` is recorded `PENDING_APPROVAL` (`202`) and grants nothing until approved; with it, `201` `APPROVED`, `approved_by` = caller. |
-| `GET /v1/admin/role-assignments` | `iam.assignment.read` | Shows `approval_status`. |
+| `GET /v1/admin/role-assignments` | `iam.assignment.read` | Shows `approval_status` and `suspended_at`. `?principal_id=` is ORG-06 ListPrincipalAssignments. `?as_of=<RFC 3339>` is ORG-06 GetAssignmentsAsOf: the assignments that granted at that instant (approved, not suspended, within their dates), rebuilt from the append-only history (000038); a future or malformed `as_of` is `400 invalid_as_of`. |
+| `POST /v1/admin/role-assignments/{id}/suspend` | `iam.assignment.revoke` (*platform* for a platform-scope assignment) | **R**. ORG-06 SuspendAssignment: the assignment stops granting at once and stays on record. Only an `APPROVED` assignment that has not ended or been suspended (`409 invalid_transition`). The reason is kept as `suspension_reason`. |
+| `POST /v1/admin/role-assignments/{id}/resume` | `iam.assignment.grant` (*platform* for a platform-scope assignment) | **R**. Lifts a suspension. Never on one's own assignment (`403 self_grant_not_allowed`); a privileged role also needs `iam.assignment.approve_privileged`; re-runs the SoD check (`409 sod_conflict`). |
 | `POST /v1/admin/role-assignments/{id}/approve` · `/reject` | `iam.assignment.approve_privileged` (*platform* for a platform-scope assignment) | **R**. The checker must be neither the requester nor the target (`403 checker_not_independent`). Approval re-runs the SoD check. Pending requests expire after 72 h (`409 approval_expired`). |
 | `POST /v1/admin/role-assignments/{id}/revoke` | `iam.assignment.revoke` (*platform* for a platform-scope assignment) | **R**. `{"effective_to": ...}` schedules the end instead of ending now. |
 
@@ -283,3 +285,29 @@ to the list.
   refuses too, so a caller that skips the handler cannot be clamped.
 - **access-control-svc** forwards the person's envelope when its call acts in that person's
   name, and calls over mTLS (when enabled) so it can be admitted as a delegate otherwise.
+
+## Changes of 2 Nov 2026 (IAM-13, S8-D1, API-3 on assignments and bindings)
+
+- **ORG-06 role half (IAM-13).** AssignBusinessRole is `POST /v1/admin/role-assignments` and
+  ListPrincipalAssignments is its `GET` with `principal_id`. New: `/suspend` and `/resume`
+  (SuspendAssignment) and `GET ...?as_of=` (GetAssignmentsAsOf); see *Role assignments*.
+  Migration **000038**: `suspended_at` / `suspended_by` / `suspension_reason` (every grant
+  query requires `suspended_at IS NULL`), `version`, and `principal_role_assignment_history`
+  — append-only, one row per insert and real change, with actor, correlation id and reason.
+  Rows that predate it are backfilled from `created_at` (pending until `approval_decided_at`
+  where decided later). Events `iam.assignment.suspended` / `.resumed`.
+- **Quantity authority limits (S8-D1).** Migration **000040**: `limit_kind` `MONETARY` (every
+  existing row, the default) or `QUANTITY`. A QUANTITY limit has no `currency` and whole-number
+  bounds (both held by CHECKs); it is judged against the request's `quantity` attribute — the
+  one the delegation ceiling reads — beside, not instead of, the monetary limit on `amount`.
+  Denials: `authority_limit:quantity_exceeded`, `:quantity_below_lower_limit`,
+  `:invalid_quantity`, and `:quantity_required` when `authority_limit_required=true`. A
+  delegator's own QUANTITY limit caps what their delegation confers
+  (`delegation_limit:delegator_quantity_exceeded`). `POST /v1/admin/authority-limits` takes
+  `limit_kind`; a change keeps the kind (`400` if a different one is sent).
+- **If-Match on assignments and workload bindings (API-3).** Assignment approve / reject /
+  revoke / suspend / resume and binding deactivate / reactivate honour `If-Match` (or body
+  `expected_version`): stale is `412 stale_version`, and responses carry the new `ETag`.
+  Unlike roles, bundles, rules and limits it is **not yet required** (no `428`): the console
+  and access-control-svc's revocation call send none. Migration **000039** adds
+  `workload_bindings.version`. Making it mandatory is a change to those two callers first.

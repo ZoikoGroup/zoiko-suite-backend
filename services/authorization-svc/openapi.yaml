@@ -793,14 +793,27 @@ paths:
               schema: { $ref: '#/components/schemas/Problem' }
     get:
       tags: [Role Assignments]
-      summary: List role assignments
-      description: '`iam.assignment.read`. Shows `approval_status`.'
+      summary: List role assignments (ListPrincipalAssignments, GetAssignmentsAsOf)
+      description: |
+        `iam.assignment.read`. Shows `approval_status` and `suspended_at`.
+        ORG-06 ListPrincipalAssignments is this list with `principal_id`.
+        With `as_of`, ORG-06 GetAssignmentsAsOf: the assignments that granted
+        at that instant (approved, not suspended, within their dates),
+        reconstructed from the append-only history (000038) rather than the
+        current rows; a future `as_of` is `400 invalid_as_of`.
       parameters:
         - $ref: '#/components/parameters/TenantHeader'
         - $ref: '#/components/parameters/LegalEntityHeader'
         - name: principal_id
           in: query
           schema: { type: string }
+        - name: role_id
+          in: query
+          schema: { type: string }
+        - name: as_of
+          in: query
+          schema: { type: string, format: date-time }
+          description: RFC 3339 instant, not in the future.
       responses:
         '200':
           description: The tenant's assignments.
@@ -831,6 +844,7 @@ paths:
           in: path
           required: true
           schema: { type: string }
+        - $ref: '#/components/parameters/IfMatchOptional'
       requestBody:
         $ref: '#/components/requestBodies/CommandBody'
       responses:
@@ -851,6 +865,8 @@ paths:
               schema: { $ref: '#/components/schemas/Problem' }
         '404':
           $ref: '#/components/responses/NotFound'
+        '412':
+          $ref: '#/components/responses/StaleVersion'
         '409':
           description: 'Conflict — `approval_expired`, or `sod_conflict` after re-check.'
           content:
@@ -867,6 +883,7 @@ paths:
           in: path
           required: true
           schema: { type: string }
+        - $ref: '#/components/parameters/IfMatchOptional'
       requestBody:
         $ref: '#/components/requestBodies/CommandBody'
       responses:
@@ -884,6 +901,8 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '412':
+          $ref: '#/components/responses/StaleVersion'
         '409':
           $ref: '#/components/responses/Conflict'
 
@@ -897,6 +916,7 @@ paths:
           in: path
           required: true
           schema: { type: string }
+        - $ref: '#/components/parameters/IfMatchOptional'
       requestBody:
         required: true
         content:
@@ -926,8 +946,94 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '412':
+          $ref: '#/components/responses/StaleVersion'
         '409':
           $ref: '#/components/responses/Conflict'
+
+  /v1/admin/role-assignments/{assignment_id}/suspend:
+    post:
+      tags: [Role Assignments]
+      summary: Suspend an assignment (R) — ORG-06 SuspendAssignment
+      description: |
+        `iam.assignment.revoke` (*platform* for a platform-scope assignment).
+        The assignment stops granting at once and stays on record; `/resume`
+        lifts it. Only an `APPROVED` assignment that has not ended and is not
+        already suspended (`409 invalid_transition`). The §16 reason is
+        recorded as `suspension_reason`. Emits `iam.assignment.suspended`.
+      parameters:
+        - name: assignment_id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/IfMatchOptional'
+      requestBody:
+        $ref: '#/components/requestBodies/CommandBody'
+      responses:
+        '200':
+          description: Assignment suspended.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoleAssignment'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '412':
+          $ref: '#/components/responses/StaleVersion'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /v1/admin/role-assignments/{assignment_id}/resume:
+    post:
+      tags: [Role Assignments]
+      summary: Resume a suspended assignment (R)
+      description: |
+        Restores access, so it takes what granting takes: `iam.assignment.grant`
+        (*platform* for a platform-scope assignment), never on one's own
+        assignment (`403 self_grant_not_allowed`),
+        `iam.assignment.approve_privileged` for a privileged role, and no SoD
+        conflict with what the principal holds now (`409 sod_conflict`). Not
+        suspended, or ended meanwhile: `409 invalid_transition`. Emits
+        `iam.assignment.resumed`.
+      parameters:
+        - name: assignment_id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/IfMatchOptional'
+      requestBody:
+        $ref: '#/components/requestBodies/CommandBody'
+      responses:
+        '200':
+          description: Assignment resumed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoleAssignment'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: 'Forbidden — including `self_grant_not_allowed`.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '412':
+          $ref: '#/components/responses/StaleVersion'
+        '409':
+          description: 'Conflict — `invalid_transition`, or `sod_conflict`.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
 
   /v1/admin/delegated-authorities:
     post:
@@ -1527,6 +1633,7 @@ paths:
           in: path
           required: true
           schema: { type: string }
+        - $ref: '#/components/parameters/IfMatchOptional'
       requestBody:
         $ref: '#/components/requestBodies/CommandBody'
       responses:
@@ -1544,6 +1651,8 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '412':
+          $ref: '#/components/responses/StaleVersion'
 
   /v1/admin/workload-bindings/{workload_id}/reactivate:
     post:
@@ -1555,6 +1664,7 @@ paths:
           in: path
           required: true
           schema: { type: string }
+        - $ref: '#/components/parameters/IfMatchOptional'
       requestBody:
         $ref: '#/components/requestBodies/CommandBody'
       responses:
@@ -1572,6 +1682,8 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '412':
+          $ref: '#/components/responses/StaleVersion'
 
   /admin/v1/privileged-sessions:
     post:
@@ -3035,6 +3147,13 @@ components:
       schema: { type: string }
       description: 'The ETag ("v<version>") of the representation the change was made against (API-3). expected_version in the body is accepted in its place; * makes the change unconditional. Missing is 428 precondition_required; stale is 412 stale_version.'
 
+    IfMatchOptional:
+      name: If-Match
+      in: header
+      required: false
+      schema: { type: string }
+      description: 'The ETag ("v<version>") of the representation the change was made against (API-3). Honoured when sent — expected_version in the body is accepted in its place, * is unconditional, stale is 412 stale_version — but not yet required on these routes: the console and access-control-svc send none.'
+
   requestBodies:
     CommandBody:
       required: true
@@ -3310,7 +3429,10 @@ components:
         approval_status: { type: string, enum: [APPROVED, PENDING_APPROVAL, REJECTED, EXPIRED] }
         approved_by: { type: string }
         approval_reference: { type: string }
-        version: { type: integer }
+        suspended_at: { type: string, format: date-time, description: Set while suspended; a suspended assignment grants nothing. }
+        suspended_by: { type: string }
+        suspension_reason: { type: string }
+        version: { type: integer, description: Bumped on every change; the response ETag is "v<version>". }
       additionalProperties: true
 
     CreateRoleAssignmentRequest:
@@ -3452,6 +3574,7 @@ components:
         allowed_audience: { type: string }
         allowed_actions: { type: array, items: { type: string } }
         active: { type: boolean }
+        version: { type: integer }
       additionalProperties: true
 
     PrivilegedSession:
@@ -3649,7 +3772,8 @@ components:
         legal_entity_id: { type: string, nullable: true }
         book_id: { type: string, nullable: true }
         org_unit_id: { type: string, nullable: true }
-        currency: { type: string }
+        limit_kind: { type: string, enum: [MONETARY, QUANTITY], description: 'MONETARY bounds the request''s `amount` in `currency`; QUANTITY bounds its `quantity` attribute (a whole count, no currency).' }
+        currency: { type: string, description: Absent on a QUANTITY limit. }
         lower_limit: { type: string }
         upper_limit: { type: string }
         effective_from: { type: string, format: date-time }
@@ -3679,7 +3803,8 @@ components:
         legal_entity_id: { type: string }
         book_id: { type: string }
         org_unit_id: { type: string }
-        currency: { type: string, enum: [GBP, USD, EUR, CAD, AUD, JPY, CHF] }
+        limit_kind: { type: string, enum: [MONETARY, QUANTITY], default: MONETARY, description: Create only; a change keeps the kind. }
+        currency: { type: string, enum: [GBP, USD, EUR, CAD, AUD, JPY, CHF], description: MONETARY only (default GBP); must be absent on QUANTITY. }
         lower_limit: { type: string, example: '0' }
         upper_limit: { type: string, example: '25000.00' }
         effective_from: { type: string, format: date-time }
