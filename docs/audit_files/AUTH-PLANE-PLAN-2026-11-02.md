@@ -404,7 +404,7 @@ Every service runs these stages; the task lists below fill them in.
   `TestS3D1_OrgUnitFromEnvelopeOnly`.
 
 ### GW-4 · Admin read surface for the console
-- Compose: `GATEWAY_ADMIN_ADDR=:9092` bound to `127.0.0.1` on the host only, token file from a
+- Compose: `GATEWAY_ADMIN_ADDR=:8192` bound to `127.0.0.1:8192` on the host only (host 9092 is Kafka), token file from a
   compose secret (≥ 24 chars). Never published through Traefik.
 - New reads in `internal/admin/admin.go`: `GET /internal/v1/gateway/decisions?outcome&tenant_id&limit`
   (recent window, all outcomes), `GET /internal/v1/gateway/usage` (all tenants on this replica),
