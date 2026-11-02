@@ -254,7 +254,9 @@ func TestRun_TolerancePinned_NewVersionOnlyAffectsNewRuns(t *testing.T) {
 
 	t1, err := testStore.CreateTolerancePolicy(ctx, tenant, "maker", domain.CreateTolerancePolicyRequest{
 		LegalEntityID: entity, Metric: "FIN-CTRL-001", AbsoluteTolerance: "0.01", Currency: "USD",
-		Rationale: "cent rounding", EffectiveFrom: "2026-01-01", ApprovedBy: "policy-owner"})
+		Rationale: "cent rounding", EffectiveFrom: "2026-01-01"})
+	require.NoError(t, err)
+	t1, err = testStore.ApproveTolerancePolicy(ctx, tenant, entity, t1.ToleranceID, "policy-owner")
 	require.NoError(t, err)
 	assert.Equal(t, 1, t1.ToleranceVersion)
 	assert.Equal(t, "0.010000000000", t1.AbsoluteTolerance, "exact decimal, no float artefacts")
@@ -270,7 +272,9 @@ func TestRun_TolerancePinned_NewVersionOnlyAffectsNewRuns(t *testing.T) {
 
 	t2, err := testStore.CreateTolerancePolicy(ctx, tenant, "maker", domain.CreateTolerancePolicyRequest{
 		LegalEntityID: entity, Metric: "FIN-CTRL-001", AbsoluteTolerance: "50", Currency: "USD",
-		Rationale: "widened", EffectiveFrom: "2026-01-01", ApprovedBy: "policy-owner"})
+		Rationale: "widened", EffectiveFrom: "2026-01-01"})
+	require.NoError(t, err)
+	t2, err = testStore.ApproveTolerancePolicy(ctx, tenant, entity, t2.ToleranceID, "policy-owner")
 	require.NoError(t, err)
 	assert.Equal(t, 2, t2.ToleranceVersion)
 
@@ -287,7 +291,9 @@ func TestRun_NamedPolicyMustBelongToTheEntity(t *testing.T) {
 	d := approvedDef(t, tenant, "FIN-CTRL-001")
 	tol, err := testStore.CreateTolerancePolicy(ctx, tenant, "maker", domain.CreateTolerancePolicyRequest{
 		LegalEntityID: entityA, Metric: "FIN-CTRL-001", AbsoluteTolerance: "1", Currency: "USD",
-		Rationale: "r", EffectiveFrom: "2026-01-01", ApprovedBy: "owner"})
+		Rationale: "r", EffectiveFrom: "2026-01-01"})
+	require.NoError(t, err)
+	tol, err = testStore.ApproveTolerancePolicy(ctx, tenant, entityA, tol.ToleranceID, "owner")
 	require.NoError(t, err)
 
 	req := runReq(d.ControlDefinitionID, entityB)

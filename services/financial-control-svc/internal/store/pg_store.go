@@ -280,12 +280,13 @@ func (s *PgStore) ListRuleVersions(ctx context.Context, tenantID, definitionID s
 
 const tolColumns = `tolerance_id, tenant_id, legal_entity_id, metric, tolerance_version, absolute_tolerance::text,
 	percentage_tolerance::text, percentage_base, date_tolerance_days, date_basis, currency, permitted_contexts,
-	rationale, to_char(effective_from,'YYYY-MM-DD'), approved_by, created_by, created_at`
+	rationale, to_char(effective_from,'YYYY-MM-DD'), approved_by, approved_at, created_by, created_at`
 
 func scanTol(row pgx.Row, t *domain.TolerancePolicy) error {
 	return row.Scan(&t.ToleranceID, &t.TenantID, &t.LegalEntityID, &t.Metric, &t.ToleranceVersion,
 		&t.AbsoluteTolerance, &t.PercentageTolerance, &t.PercentageBase, &t.DateToleranceDays, &t.DateBasis,
-		&t.Currency, &t.PermittedContexts, &t.Rationale, &t.EffectiveFrom, &t.ApprovedBy, &t.CreatedBy, &t.CreatedAt)
+		&t.Currency, &t.PermittedContexts, &t.Rationale, &t.EffectiveFrom, &t.ApprovedBy, &t.ApprovedAt,
+		&t.CreatedBy, &t.CreatedAt)
 }
 
 func defaultDecimal(s string) string {
@@ -307,13 +308,47 @@ func (s *PgStore) CreateTolerancePolicy(ctx context.Context, tenantID, actor str
 		return scanTol(tx.QueryRow(ctx, `
 			INSERT INTO tolerance_policies (tenant_id, legal_entity_id, metric, tolerance_version, absolute_tolerance,
 				percentage_tolerance, percentage_base, date_tolerance_days, date_basis, currency, permitted_contexts,
-				rationale, effective_from, approved_by, created_by)
-			SELECT $1::uuid,$2::uuid,$3::varchar, COALESCE(MAX(tolerance_version),0)+1, $4::numeric,$5::numeric,$6::varchar,$7::int,$8::varchar,$9::varchar,$10::text[],$11::text,$12::date,$13::varchar,$14::varchar
+				rationale, effective_from, created_by)
+			SELECT $1::uuid,$2::uuid,$3::varchar, COALESCE(MAX(tolerance_version),0)+1, $4::numeric,$5::numeric,$6::varchar,$7::int,$8::varchar,$9::varchar,$10::text[],$11::text,$12::date,$13::varchar
 			FROM tolerance_policies WHERE tenant_id = $1 AND legal_entity_id = $2 AND metric = $3
 			RETURNING `+tolColumns,
 			tenantID, req.LegalEntityID, req.Metric, defaultDecimal(req.AbsoluteTolerance),
 			defaultDecimal(req.PercentageTolerance), req.PercentageBase, req.DateToleranceDays, req.DateBasis,
-			req.Currency, nonNilStrings(req.PermittedContexts), req.Rationale, req.EffectiveFrom, req.ApprovedBy, actor), &out)
+			req.Currency, nonNilStrings(req.PermittedContexts), req.Rationale, req.EffectiveFrom, actor), &out)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// ApproveTolerancePolicy records the independent approval of a pending
+// tolerance policy (SPEC_DEVIATIONS A4). Mirrors ApproveRuleVersion: the
+// approver must differ from the creator, and an already-approved policy
+// cannot be re-approved.
+func (s *PgStore) ApproveTolerancePolicy(ctx context.Context, tenantID, legalEntityID, toleranceID, approver string) (*domain.TolerancePolicy, error) {
+	var out domain.TolerancePolicy
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		var creator string
+		var approved *string
+		err := tx.QueryRow(ctx, `SELECT created_by, approved_by FROM tolerance_policies
+			WHERE tenant_id = $1 AND legal_entity_id = $2 AND tolerance_id = $3 FOR UPDATE`,
+			tenantID, legalEntityID, toleranceID).Scan(&creator, &approved)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if approver == creator {
+			return domain.ErrSelfApproval
+		}
+		if approved != nil {
+			return fmt.Errorf("%w: tolerance policy already approved", domain.ErrInvalidTransition)
+		}
+		return scanTol(tx.QueryRow(ctx, `UPDATE tolerance_policies SET approved_by = $4, approved_at = now()
+			WHERE tenant_id = $1 AND legal_entity_id = $2 AND tolerance_id = $3
+			RETURNING `+tolColumns, tenantID, legalEntityID, toleranceID, approver), &out)
 	})
 	if err != nil {
 		return nil, err
@@ -345,12 +380,12 @@ func (s *PgStore) ListTolerancePolicies(ctx context.Context, tenantID, legalEnti
 
 const matColumns = `materiality_id, tenant_id, legal_entity_id, reporting_basis, materiality_version,
 	amount_threshold::text, aggregate_threshold::text, currency, qualitative_triggers, aggregation_basis,
-	to_char(effective_from,'YYYY-MM-DD'), approved_by, created_by, created_at`
+	to_char(effective_from,'YYYY-MM-DD'), approved_by, approved_at, created_by, created_at`
 
 func scanMat(row pgx.Row, m *domain.MaterialityPolicy) error {
 	return row.Scan(&m.MaterialityID, &m.TenantID, &m.LegalEntityID, &m.ReportingBasis, &m.MaterialityVersion,
 		&m.AmountThreshold, &m.AggregateThreshold, &m.Currency, &m.QualitativeTriggers, &m.AggregationBasis,
-		&m.EffectiveFrom, &m.ApprovedBy, &m.CreatedBy, &m.CreatedAt)
+		&m.EffectiveFrom, &m.ApprovedBy, &m.ApprovedAt, &m.CreatedBy, &m.CreatedAt)
 }
 
 func (s *PgStore) CreateMaterialityPolicy(ctx context.Context, tenantID, actor string, req domain.CreateMaterialityPolicyRequest) (*domain.MaterialityPolicy, error) {
@@ -362,13 +397,68 @@ func (s *PgStore) CreateMaterialityPolicy(ctx context.Context, tenantID, actor s
 		return scanMat(tx.QueryRow(ctx, `
 			INSERT INTO materiality_policies (tenant_id, legal_entity_id, reporting_basis, materiality_version,
 				amount_threshold, aggregate_threshold, currency, qualitative_triggers, aggregation_basis,
-				effective_from, approved_by, created_by)
-			SELECT $1::uuid,$2::uuid,$3::varchar, COALESCE(MAX(materiality_version),0)+1, $4::numeric,$5::numeric,$6::varchar,$7::text[],$8::varchar,$9::date,$10::varchar,$11::varchar
+				effective_from, created_by)
+			SELECT $1::uuid,$2::uuid,$3::varchar, COALESCE(MAX(materiality_version),0)+1, $4::numeric,$5::numeric,$6::varchar,$7::text[],$8::varchar,$9::date,$10::varchar
 			FROM materiality_policies WHERE tenant_id = $1 AND legal_entity_id = $2 AND reporting_basis = $3
 			RETURNING `+matColumns,
 			tenantID, req.LegalEntityID, req.ReportingBasis, defaultDecimal(req.AmountThreshold),
 			defaultDecimal(req.AggregateThreshold), req.Currency, nonNilStrings(req.QualitativeTriggers),
-			req.AggregationBasis, req.EffectiveFrom, req.ApprovedBy, actor), &out)
+			req.AggregationBasis, req.EffectiveFrom, actor), &out)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// ListMaterialityPolicies: previously had no read endpoint at all (create
+// only), noted as a gap in SPEC_DEVIATIONS A4.
+func (s *PgStore) ListMaterialityPolicies(ctx context.Context, tenantID, legalEntityID, reportingBasis string) ([]domain.MaterialityPolicy, error) {
+	var out []domain.MaterialityPolicy
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `SELECT `+matColumns+` FROM materiality_policies
+			WHERE tenant_id = $1 AND legal_entity_id = $2 AND ($3 = '' OR reporting_basis = $3)
+			ORDER BY reporting_basis, materiality_version`, tenantID, legalEntityID, reportingBasis)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var m domain.MaterialityPolicy
+			if err := scanMat(rows, &m); err != nil {
+				return err
+			}
+			out = append(out, m)
+		}
+		return rows.Err()
+	})
+	return out, err
+}
+
+// ApproveMaterialityPolicy: see ApproveTolerancePolicy's doc comment.
+func (s *PgStore) ApproveMaterialityPolicy(ctx context.Context, tenantID, legalEntityID, materialityID, approver string) (*domain.MaterialityPolicy, error) {
+	var out domain.MaterialityPolicy
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		var creator string
+		var approved *string
+		err := tx.QueryRow(ctx, `SELECT created_by, approved_by FROM materiality_policies
+			WHERE tenant_id = $1 AND legal_entity_id = $2 AND materiality_id = $3 FOR UPDATE`,
+			tenantID, legalEntityID, materialityID).Scan(&creator, &approved)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if approver == creator {
+			return domain.ErrSelfApproval
+		}
+		if approved != nil {
+			return fmt.Errorf("%w: materiality policy already approved", domain.ErrInvalidTransition)
+		}
+		return scanMat(tx.QueryRow(ctx, `UPDATE materiality_policies SET approved_by = $4, approved_at = now()
+			WHERE tenant_id = $1 AND legal_entity_id = $2 AND materiality_id = $3
+			RETURNING `+matColumns, tenantID, legalEntityID, materialityID, approver), &out)
 	})
 	if err != nil {
 		return nil, err
@@ -440,11 +530,14 @@ func (s *PgStore) CreateRun(ctx context.Context, tenantID, actor, correlationID,
 		var tolID, matID *string
 		if req.ToleranceID != "" {
 			var id string
+			// SPEC_DEVIATIONS A4: only an APPROVED policy can ever be pinned to a
+			// run, mirroring the rule-version resolution above — an unapproved
+			// (pending) tolerance must never widen what a run is measured against.
 			if err := tx.QueryRow(ctx, `SELECT tolerance_id FROM tolerance_policies
-				WHERE tenant_id = $1 AND legal_entity_id = $2 AND tolerance_id = $3`,
+				WHERE tenant_id = $1 AND legal_entity_id = $2 AND tolerance_id = $3 AND approved_by IS NOT NULL`,
 				tenantID, req.LegalEntityID, req.ToleranceID).Scan(&id); err != nil {
 				if errors.Is(err, pgx.ErrNoRows) {
-					return fmt.Errorf("%w: tolerance_id not found for this legal entity", domain.ErrInvalidArgument)
+					return fmt.Errorf("%w: tolerance_id not found, not approved, or not for this legal entity", domain.ErrInvalidArgument)
 				}
 				return err
 			}
@@ -453,6 +546,7 @@ func (s *PgStore) CreateRun(ctx context.Context, tenantID, actor, correlationID,
 			var id string
 			err := tx.QueryRow(ctx, `SELECT tolerance_id FROM tolerance_policies
 				WHERE tenant_id = $1 AND legal_entity_id = $2 AND metric = $3 AND effective_from <= CURRENT_DATE
+				  AND approved_by IS NOT NULL
 				ORDER BY tolerance_version DESC LIMIT 1`, tenantID, req.LegalEntityID, code).Scan(&id)
 			if err == nil {
 				tolID = &id
@@ -463,10 +557,10 @@ func (s *PgStore) CreateRun(ctx context.Context, tenantID, actor, correlationID,
 		if req.MaterialityID != "" {
 			var id string
 			if err := tx.QueryRow(ctx, `SELECT materiality_id FROM materiality_policies
-				WHERE tenant_id = $1 AND legal_entity_id = $2 AND materiality_id = $3`,
+				WHERE tenant_id = $1 AND legal_entity_id = $2 AND materiality_id = $3 AND approved_by IS NOT NULL`,
 				tenantID, req.LegalEntityID, req.MaterialityID).Scan(&id); err != nil {
 				if errors.Is(err, pgx.ErrNoRows) {
-					return fmt.Errorf("%w: materiality_id not found for this legal entity", domain.ErrInvalidArgument)
+					return fmt.Errorf("%w: materiality_id not found, not approved, or not for this legal entity", domain.ErrInvalidArgument)
 				}
 				return err
 			}
@@ -475,6 +569,7 @@ func (s *PgStore) CreateRun(ctx context.Context, tenantID, actor, correlationID,
 			var id string
 			err := tx.QueryRow(ctx, `SELECT materiality_id FROM materiality_policies
 				WHERE tenant_id = $1 AND legal_entity_id = $2 AND effective_from <= CURRENT_DATE
+				  AND approved_by IS NOT NULL
 				ORDER BY materiality_version DESC LIMIT 1`, tenantID, req.LegalEntityID).Scan(&id)
 			if err == nil {
 				matID = &id

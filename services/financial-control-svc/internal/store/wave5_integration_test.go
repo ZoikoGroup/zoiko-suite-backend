@@ -222,9 +222,11 @@ func TestWave5_ExceptionSummary_AggregatesLatestRunsAgainstAggregateThreshold(t 
 	assert.Empty(t, s.Currencies)
 	assert.Nil(t, s.AggregateMaterial, "no materiality policy => not assessable")
 
-	_, err = testStore.CreateMaterialityPolicy(ctx, w.tenant, "maker", domain.CreateMaterialityPolicyRequest{
+	mat, err := testStore.CreateMaterialityPolicy(ctx, w.tenant, "maker", domain.CreateMaterialityPolicyRequest{
 		LegalEntityID: w.entity, ReportingBasis: "US_GAAP", AmountThreshold: "1000", AggregateThreshold: "300",
-		Currency: "USD", EffectiveFrom: "2026-01-01", ApprovedBy: "cfo"})
+		Currency: "USD", EffectiveFrom: "2026-01-01"})
+	require.NoError(t, err)
+	_, err = testStore.ApproveMaterialityPolicy(ctx, w.tenant, w.entity, mat.MaterialityID, "cfo")
 	require.NoError(t, err)
 
 	// An older run's findings must not be double counted once a newer run exists.

@@ -56,17 +56,26 @@ policies a run pins.
   the target as it now stands) instead of a 409/412. The same key used for
   another target or decision is a 409. Migration 000008 adds the
   `exception_id` an exception transition needs, and widens `command`.
-- **A4. Tolerance and materiality approval is self-declared.**
-  `CreateTolerancePolicy` / `CreateMaterialityPolicy` take `approved_by` as a
-  free-text body field; the only check is `approved_by != caller`. No second
-  authenticated actor ever approves, so one principal can create and "approve"
-  a wider tolerance by typing a colleague's id. §11 ("policy change requires
-  governed configuration change") and §27 ("Finance Control Policy authority")
-  require a real approval; rule versions already do it properly
-  (`…/rule-versions/{version}/approve`). Scope: create policies in a pending
-  state, add an approve endpoint with its own action, and make run creation
-  resolve only approved versions. Also missing: any read endpoint for
-  materiality policies (create only).
+- **A4. Tolerance and materiality approval is self-declared. — Closed (B10).**
+  `CreateTolerancePolicy` / `CreateMaterialityPolicy` no longer accept
+  `approved_by` at all: a policy is created pending (`approved_by`/
+  `approved_at` both NULL) and independently approved through
+  `POST …/tolerance-policies/{id}/approve` and
+  `…/materiality-policies/{id}/approve`, gated by a new `FINCTRL_APPROVE_POLICY`
+  action (migration 000010 here; access-control-svc migration 000023 registers
+  it, the same deployment prerequisite A1/B6 needed for `FINCTRL_REVOKE`). The
+  creator cannot approve their own policy (`ErrSelfApproval`, mirroring
+  `ApproveRuleVersion`), an approved policy cannot be re-approved, and the
+  approval triggers (`trg_immutable_tolerance`/`trg_immutable_materiality`,
+  previously blanket-append-only) were replaced with
+  `guard_tolerance_policy`/`guard_materiality_policy`, mirroring
+  `control_rule_versions`' own `guard_rule_version`: only an unapproved row
+  may be updated, and only its approval columns may change. `CreateRun`'s
+  tolerance/materiality resolution — both the named-id path and the
+  latest-effective fallback — now requires `approved_by IS NOT NULL`, the
+  same condition the rule-version resolution already enforced; a pending
+  policy is never pinned to a run, named or not. `ListMaterialityPolicies`
+  (`GET /controls/v1/materiality-policies`) closes the missing read endpoint.
 - **A5. No manual match (§10).** Matching is fully automatic; there is no
   command to pair two records manually with permission, reason and evidence.
   Consequences: an unmatched pair that a human can explain can only be

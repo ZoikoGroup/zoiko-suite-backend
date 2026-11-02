@@ -17,9 +17,11 @@ import (
 func TestWave8_RootCause_RequiredForHighSeverityAndRecurrence(t *testing.T) {
 	w := newWave5(t)
 	// Materiality pins HIGH at 100, so the 250.00 finding is individually material.
-	_, err := testStore.CreateMaterialityPolicy(ctx, w.tenant, "maker", domain.CreateMaterialityPolicyRequest{
+	mat, err := testStore.CreateMaterialityPolicy(ctx, w.tenant, "maker", domain.CreateMaterialityPolicyRequest{
 		LegalEntityID: w.entity, ReportingBasis: "US_GAAP", AmountThreshold: "100", AggregateThreshold: "1000",
-		Currency: "USD", EffectiveFrom: "2026-01-01", ApprovedBy: "cfo"})
+		Currency: "USD", EffectiveFrom: "2026-01-01"})
+	require.NoError(t, err)
+	_, err = testStore.ApproveMaterialityPolicy(ctx, w.tenant, w.entity, mat.MaterialityID, "cfo")
 	require.NoError(t, err)
 
 	_, exc := failedRunWithTwoExceptions(t, w) // e1=250.00 (HIGH), e2=40.00 (LOW)

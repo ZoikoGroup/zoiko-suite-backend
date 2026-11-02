@@ -32,10 +32,13 @@ type Store interface {
 	ListDefinitions(ctx context.Context, tenantID string, limit int) ([]domain.ControlDefinition, error)
 	CreateRuleVersion(ctx context.Context, tenantID, definitionID, actor string, req domain.CreateRuleVersionRequest) (*domain.ControlRuleVersion, error)
 	ApproveRuleVersion(ctx context.Context, tenantID, definitionID string, version int, approver string) (*domain.ControlRuleVersion, error)
+	ApproveTolerancePolicy(ctx context.Context, tenantID, legalEntityID, toleranceID, approver string) (*domain.TolerancePolicy, error)
+	ApproveMaterialityPolicy(ctx context.Context, tenantID, legalEntityID, materialityID, approver string) (*domain.MaterialityPolicy, error)
 	ListRuleVersions(ctx context.Context, tenantID, definitionID string) ([]domain.ControlRuleVersion, error)
 	CreateTolerancePolicy(ctx context.Context, tenantID, actor string, req domain.CreateTolerancePolicyRequest) (*domain.TolerancePolicy, error)
 	ListTolerancePolicies(ctx context.Context, tenantID, legalEntityID, metric string) ([]domain.TolerancePolicy, error)
 	CreateMaterialityPolicy(ctx context.Context, tenantID, actor string, req domain.CreateMaterialityPolicyRequest) (*domain.MaterialityPolicy, error)
+	ListMaterialityPolicies(ctx context.Context, tenantID, legalEntityID, reportingBasis string) ([]domain.MaterialityPolicy, error)
 	CreateRun(ctx context.Context, tenantID, actor, correlationID, idempotencyKey string, req domain.CreateRunRequest) (*domain.ControlRun, bool, error)
 	GetRun(ctx context.Context, tenantID, runID string) (*domain.ControlRun, error)
 	ListRuns(ctx context.Context, tenantID string, f domain.ListRunsFilter) ([]domain.ControlRun, error)
@@ -81,9 +84,10 @@ type AuthZClient interface {
 
 // Action types checked against authorization-svc.
 const (
-	ActionDefine       = "FINCTRL_DEFINE"
-	ActionApproveRule  = "FINCTRL_APPROVE_RULE"
-	ActionPolicyManage = "FINCTRL_POLICY_MANAGE"
+	ActionDefine        = "FINCTRL_DEFINE"
+	ActionApproveRule   = "FINCTRL_APPROVE_RULE"
+	ActionPolicyManage  = "FINCTRL_POLICY_MANAGE"
+	ActionApprovePolicy = "FINCTRL_APPROVE_POLICY"
 	ActionRunCreate    = "FINCTRL_RUN_CREATE"
 	ActionRead         = "FINCTRL_READ"
 	ActionExecute      = "FINCTRL_EXECUTE"
@@ -120,8 +124,13 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Route("/tolerance-policies", func(r chi.Router) {
 			r.Post("/", h.CreateTolerancePolicy)
 			r.Get("/", h.ListTolerancePolicies)
+			r.Post("/{tolerance_id}/approve", h.ApproveTolerancePolicy)
 		})
-		r.Post("/materiality-policies", h.CreateMaterialityPolicy)
+		r.Route("/materiality-policies", func(r chi.Router) {
+			r.Post("/", h.CreateMaterialityPolicy)
+			r.Get("/", h.ListMaterialityPolicies)
+			r.Post("/{materiality_id}/approve", h.ApproveMaterialityPolicy)
+		})
 		r.Route("/runs", func(r chi.Router) {
 			r.Post("/", h.CreateRun)
 			r.Get("/", h.ListRuns)
@@ -283,7 +292,7 @@ func (h *Handler) CreateTolerancePolicy(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "missing_field", "legal_entity_id")
 		return
 	}
-	if err := req.Validate(principal); err != nil {
+	if err := req.Validate(); err != nil {
 		h.writeErr(w, "create tolerance policy", err)
 		return
 	}
@@ -319,6 +328,32 @@ func (h *Handler) ListTolerancePolicies(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusOK, map[string]any{"items": nonNil(list)})
 }
 
+// ApproveTolerancePolicy independently approves a pending tolerance policy
+// (SPEC_DEVIATIONS A4): the creator cannot approve their own policy, and
+// only an approved version is ever resolved onto a run (CreateRun).
+// Authority is re-evaluated at the moment of approval, same as
+// ApproveRuleVersion (Invariant 11).
+func (h *Handler) ApproveTolerancePolicy(w http.ResponseWriter, r *http.Request) {
+	tenantID, principal, ok := h.caller(w, r)
+	if !ok {
+		return
+	}
+	entity := r.URL.Query().Get("legal_entity_id")
+	if entity == "" {
+		writeError(w, http.StatusBadRequest, "missing_field", "legal_entity_id")
+		return
+	}
+	if !h.authorize(w, r, principal, entity, ActionApprovePolicy) {
+		return
+	}
+	p, err := h.store.ApproveTolerancePolicy(r.Context(), tenantID, entity, chi.URLParam(r, "tolerance_id"), principal)
+	if err != nil {
+		h.writeErr(w, "approve tolerance policy", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, p)
+}
+
 func (h *Handler) CreateMaterialityPolicy(w http.ResponseWriter, r *http.Request) {
 	tenantID, principal, ok := h.caller(w, r)
 	if !ok {
@@ -332,7 +367,7 @@ func (h *Handler) CreateMaterialityPolicy(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadRequest, "missing_field", "legal_entity_id")
 		return
 	}
-	if err := req.Validate(principal); err != nil {
+	if err := req.Validate(); err != nil {
 		h.writeErr(w, "create materiality policy", err)
 		return
 	}
@@ -345,6 +380,50 @@ func (h *Handler) CreateMaterialityPolicy(w http.ResponseWriter, r *http.Request
 		return
 	}
 	writeJSON(w, http.StatusCreated, p)
+}
+
+func (h *Handler) ListMaterialityPolicies(w http.ResponseWriter, r *http.Request) {
+	tenantID, principal, ok := h.caller(w, r)
+	if !ok {
+		return
+	}
+	entity := r.URL.Query().Get("legal_entity_id")
+	if entity == "" {
+		writeError(w, http.StatusBadRequest, "missing_field", "legal_entity_id")
+		return
+	}
+	if !h.authorize(w, r, principal, entity, ActionRead) {
+		return
+	}
+	list, err := h.store.ListMaterialityPolicies(r.Context(), tenantID, entity, r.URL.Query().Get("reporting_basis"))
+	if err != nil {
+		h.writeErr(w, "list materiality policies", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": nonNil(list)})
+}
+
+// ApproveMaterialityPolicy independently approves a pending materiality
+// policy (SPEC_DEVIATIONS A4): see ApproveTolerancePolicy's doc comment.
+func (h *Handler) ApproveMaterialityPolicy(w http.ResponseWriter, r *http.Request) {
+	tenantID, principal, ok := h.caller(w, r)
+	if !ok {
+		return
+	}
+	entity := r.URL.Query().Get("legal_entity_id")
+	if entity == "" {
+		writeError(w, http.StatusBadRequest, "missing_field", "legal_entity_id")
+		return
+	}
+	if !h.authorize(w, r, principal, entity, ActionApprovePolicy) {
+		return
+	}
+	p, err := h.store.ApproveMaterialityPolicy(r.Context(), tenantID, entity, chi.URLParam(r, "materiality_id"), principal)
+	if err != nil {
+		h.writeErr(w, "approve materiality policy", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, p)
 }
 
 // ─── Runs ────────────────────────────────────────────────────────────────────
