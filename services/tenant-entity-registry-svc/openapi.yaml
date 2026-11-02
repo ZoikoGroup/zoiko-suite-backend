@@ -40,6 +40,8 @@ tags:
     description: Legal entity CRUD, status probe, and status transitions
   - name: Hierarchies
     description: Effective-dated parent-child entity relationships
+  - name: Ownership
+    description: ORG-04 effective-dated ownership and control relationships between legal entities
   - name: Jurisdictions
     description: Effective-dated jurisdiction assignments for entities
   - name: ResidencyPolicies
@@ -1483,6 +1485,120 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { description: "Not pending, or expired", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
 
+  # ── ORG-04 Corporate Group & Ownership ──────────────────────────────────────
+  #
+  # A relationship is proposed, then decided by a DIFFERENT principal. The
+  # decider is the verified caller; no body field names it, and the database
+  # refuses a decision by the proposer as well (or_no_self_approval).
+
+  /v1/ownership-relationships:
+    post:
+      operationId: proposeOwnershipRelationship
+      summary: ORG-04 ProposeOwnershipRelationship
+      description: |
+        Files a PROPOSED ownership or control relationship between two
+        operational legal entities of the caller's tenant. It has no effect on
+        the group structure until another principal approves it.
+      tags: [Ownership]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProposeOwnershipRequest"
+      responses:
+        "201":
+          description: Relationship proposed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OwnershipRelationship"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "The relationship is already proposed or active from that date, an entity is not operational, or the tenant may not transact", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/ownership-relationships/{relationshipID}:
+    get:
+      operationId: getOwnershipRelationship
+      summary: Get one ownership relationship
+      tags: [Ownership]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/RelationshipID"
+        - $ref: "#/components/parameters/CorrelationID"
+      responses:
+        "200":
+          description: The relationship
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OwnershipRelationship"
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/ownership-relationships/{relationshipID}/approval:
+    post:
+      operationId: approveOwnershipRelationship
+      summary: ORG-04 ApproveOwnershipRelationship (PROPOSED → ACTIVE)
+      tags: [Ownership]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/RelationshipID"
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OwnershipDecisionRequest"
+      responses:
+        "200":
+          description: Relationship approved
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OwnershipRelationship"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { description: "The caller proposed this relationship, or lacks the approve permission", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_version, or an entity is no longer operational", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "422": { description: "The relationship is not PROPOSED", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/ownership-relationships/{relationshipID}/rejection:
+    post:
+      operationId: rejectOwnershipRelationship
+      summary: Reject a proposed ownership relationship (PROPOSED → REJECTED)
+      tags: [Ownership]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/RelationshipID"
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OwnershipDecisionRequest"
+      responses:
+        "200":
+          description: Relationship rejected
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OwnershipRelationship"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { description: "The caller proposed this relationship, or lacks the approve permission", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "Stale expected_version", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+        "422": { description: "The relationship is not PROPOSED", content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
   # ── Workspaces ─────────────────────────────────────────────────────────────
   #
   # These five routes have existed since migration 000005 and were absent from
@@ -1653,6 +1769,11 @@ components:
         Verified by the Authorization Service on every material action.
 
   parameters:
+    RelationshipID:
+      name: relationshipID
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
     ApprovalRequestID:
       name: approvalRequestID
       in: path
@@ -2165,6 +2286,63 @@ components:
         unmerge_approval_request_id:      { type: string, format: uuid, nullable: true }
         unmerged_at:                      { type: string, format: date-time, nullable: true }
         unmerge_reason:                   { type: string, nullable: true }
+
+    OwnershipRelationship:
+      type: object
+      required: [relationship_id, tenant_id, parent_legal_entity_id, child_legal_entity_id, relationship_kind, valid_from, status, evidence_ref, reason, proposed_by_principal_id, record_version]
+      properties:
+        relationship_id:          { type: string, format: uuid }
+        tenant_id:                { type: string }
+        parent_legal_entity_id:   { type: string }
+        child_legal_entity_id:    { type: string }
+        relationship_kind:        { type: string, enum: [OWNERSHIP, CONTROL] }
+        ownership_pct:            { type: number, exclusiveMinimum: 0, maximum: 100 }
+        voting_pct:               { type: number, exclusiveMinimum: 0, maximum: 100 }
+        control_type:             { type: string, enum: [VOTING, BOARD, CONTRACTUAL, OTHER] }
+        beneficial_notes:         { type: string }
+        valid_from:               { type: string, format: date-time }
+        valid_to:                 { type: string, format: date-time, nullable: true }
+        recorded_at:              { type: string, format: date-time }
+        status:                   { type: string, enum: [PROPOSED, ACTIVE, SUPERSEDED, ENDED, REJECTED] }
+        evidence_ref:             { type: string }
+        reason:                   { type: string }
+        proposed_by_principal_id: { type: string }
+        proposed_at:              { type: string, format: date-time }
+        decided_by_principal_id:  { type: string }
+        decided_at:               { type: string, format: date-time }
+        decision_note:            { type: string }
+        correlation_id:           { type: string }
+        record_version:           { type: integer, format: int64, minimum: 1 }
+
+    ProposeOwnershipRequest:
+      type: object
+      required: [parent_legal_entity_id, child_legal_entity_id, relationship_kind, valid_from, evidence_ref, reason]
+      description: |
+        An OWNERSHIP relationship requires ownership_pct; a CONTROL relationship
+        requires control_type. evidence_ref (the source filing or contract) and
+        reason are always required.
+      properties:
+        parent_legal_entity_id: { type: string }
+        child_legal_entity_id:  { type: string }
+        relationship_kind:      { type: string, enum: [OWNERSHIP, CONTROL] }
+        ownership_pct:          { type: number, exclusiveMinimum: 0, maximum: 100 }
+        voting_pct:             { type: number, exclusiveMinimum: 0, maximum: 100 }
+        control_type:           { type: string, enum: [VOTING, BOARD, CONTRACTUAL, OTHER] }
+        beneficial_notes:       { type: string }
+        valid_from:             { type: string, format: date-time }
+        valid_to:               { type: string, format: date-time }
+        evidence_ref:           { type: string }
+        reason:                 { type: string }
+        correlation_id:         { type: string }
+
+    OwnershipDecisionRequest:
+      type: object
+      required: [expected_version]
+      description: The decider is the verified caller and is never named in the body.
+      properties:
+        expected_version: { type: integer, format: int64, minimum: 1 }
+        decision_note:    { type: string }
+        correlation_id:   { type: string }
 
     ApprovalRequest:
       type: object

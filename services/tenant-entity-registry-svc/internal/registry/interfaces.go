@@ -106,6 +106,7 @@ type Store interface {
 	ORGStore
 	ApprovalStore
 	ORGGapStore
+	OwnershipStore
 }
 
 // ---------------------------------------------------------------------------
@@ -336,4 +337,17 @@ type ORGGapStore interface {
 	MergeEntities(ctx context.Context, m *domain.EntityMergeRecord, d domain.ApprovalDecision, expectedVersion int64, ev *outbox.Record) error
 	UnmergeEntity(ctx context.Context, duplicateID, unmergedBy, reason string, d domain.ApprovalDecision, expectedVersion int64, ev *outbox.Record) error
 	ListEntityMergeRecords(ctx context.Context, legalEntityID string) ([]*domain.EntityMergeRecord, error)
+}
+
+// OwnershipStore is the data-access contract for ORG-04 ownership and control
+// relationships (migration 000014).
+type OwnershipStore interface {
+	CreateOwnershipRelationship(ctx context.Context, r *domain.OwnershipRelationship) error
+	// GetOwnershipRelationship returns (nil, nil) when absent in the caller's tenant.
+	GetOwnershipRelationship(ctx context.Context, relationshipID string) (*domain.OwnershipRelationship, error)
+	// DecideOwnershipRelationship moves a PROPOSED relationship to ACTIVE or
+	// REJECTED in one guarded write. ErrNotFound, ErrInvalidTransition (already
+	// decided), ErrVersionConflict and ErrSelfApproval are its refusals.
+	DecideOwnershipRelationship(ctx context.Context, relationshipID string, expectedVersion int64,
+		status domain.OwnershipStatus, decidedBy, note, correlationID string) (*domain.OwnershipRelationship, error)
 }
