@@ -101,7 +101,7 @@ func TestOwnRole_ReactivateHeldRoleRefused(t *testing.T) {
 
 // Retiring narrows access, so a holder may retire their own role.
 func TestOwnRole_RetireHeldRoleAllowed(t *testing.T) {
-	if w := postAsAdmin(ownRoleStore(held(nil)), "/v1/admin/roles/r-1/retire", `{}`); w.Code != http.StatusOK {
+	if w := postAsAdmin(ownRoleStore(held(nil)), "/v1/admin/roles/r-1/retire", `{"expected_version":1}`); w.Code != http.StatusOK {
 		t.Fatalf("retire own role: want 200, got %d: %s", w.Code, w.Body.String())
 	}
 }
@@ -120,7 +120,7 @@ func TestOwnRole_ReactivateBundleOfHeldRoleRefused(t *testing.T) {
 }
 
 func TestOwnRole_RetireBundleOfHeldRoleAllowed(t *testing.T) {
-	if w := postAsAdmin(ownRoleStore(held(nil)), "/v1/admin/permission-bundles/b-1/retire", `{}`); w.Code != http.StatusOK {
+	if w := postAsAdmin(ownRoleStore(held(nil)), "/v1/admin/permission-bundles/b-1/retire", `{"expected_version":1}`); w.Code != http.StatusOK {
 		t.Fatalf("retire own role's bundle: want 200, got %d: %s", w.Code, w.Body.String())
 	}
 }

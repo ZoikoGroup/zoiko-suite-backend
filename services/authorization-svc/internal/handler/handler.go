@@ -787,14 +787,14 @@ func (h *Handler) setRoleActive(w http.ResponseWriter, r *http.Request, active b
 		}
 	}
 
-	expectedVersion, ok := h.readCommand(w, &r)
+	expectedVersion, ok := h.readVersionedCommand(w, &r)
 	if !ok {
 		return
 	}
 	role, err = h.store.SetRoleActive(r.Context(), roleID, tenantScope, active, expectedVersion)
 	if err != nil {
 		if errors.Is(err, domain.ErrVersionConflict) {
-			writeVersionConflict(w)
+			writeVersionConflict(w, r)
 			return
 		}
 		if errors.Is(err, domain.ErrRoleNotFound) {
@@ -820,7 +820,7 @@ func (h *Handler) setRoleActive(w http.ResponseWriter, r *http.Request, active b
 		zap.String("tenant_id", role.TenantID),
 		zap.Bool("active_flag", role.ActiveFlag))
 
-	writeJSON(w, http.StatusOK, role)
+	writeJSONWithETag(w, http.StatusOK, role, role.Version)
 }
 
 // ── POST /v1/admin/roles/{role_id}/permission-bundles ───────────────────────
@@ -908,7 +908,7 @@ func (h *Handler) CreatePermissionBundle(w http.ResponseWriter, r *http.Request)
 	})
 	if err != nil {
 		if errors.Is(err, domain.ErrVersionConflict) {
-			writeVersionConflict(w)
+			writeVersionConflict(w, r)
 			return
 		}
 		if errors.Is(err, domain.ErrRoleNotFound) {
@@ -1095,14 +1095,14 @@ func (h *Handler) setPermissionBundleActive(w http.ResponseWriter, r *http.Reque
 		}
 	}
 
-	expectedVersion, ok := h.readCommand(w, &r)
+	expectedVersion, ok := h.readVersionedCommand(w, &r)
 	if !ok {
 		return
 	}
 	bundle, err := h.store.SetPermissionBundleActive(r.Context(), bundleID, tenantScope, active, expectedVersion)
 	if err != nil {
 		if errors.Is(err, domain.ErrVersionConflict) {
-			writeVersionConflict(w)
+			writeVersionConflict(w, r)
 			return
 		}
 		if errors.Is(err, domain.ErrPermissionBundleNotFound) {
@@ -1126,7 +1126,7 @@ func (h *Handler) setPermissionBundleActive(w http.ResponseWriter, r *http.Reque
 		zap.Bool("active", bundle.ActiveFlag),
 		zap.String("correlation_id", correlationID),
 	)
-	writeJSON(w, http.StatusOK, bundle)
+	writeJSONWithETag(w, http.StatusOK, bundle, bundle.Version)
 }
 
 // ── POST /v1/admin/role-assignments ──────────────────────────────────────────
@@ -1389,11 +1389,13 @@ func (h *Handler) assignmentSoDConflicts(w http.ResponseWriter, r *http.Request,
 	return conflicts, true
 }
 
-func writeVersionConflict(w http.ResponseWriter) {
-	writeJSON(w, http.StatusConflict, map[string]string{
-		"error":   "version_conflict",
-		"message": "the object has changed since expected_version; re-read it and retry",
-	})
+// writeVersionConflict answers a mutation whose expected version (If-Match or
+// expected_version) is no longer current: 412 stale_version (API-3). The
+// stores check the version in the UPDATE itself, so the race between a read
+// and the write cannot slip a stale change through.
+func writeVersionConflict(w http.ResponseWriter, r *http.Request) {
+	apicontract.WriteProblem(w, r, apicontract.ProblemFor(http.StatusPreconditionFailed, "stale_version",
+		"the object has changed since the version you sent; re-read it and retry"))
 }
 
 // roleAssignmentFinder is the store capability behind the platform-scope check
@@ -2045,7 +2047,7 @@ func (h *Handler) setSoDRuleActive(w http.ResponseWriter, r *http.Request, activ
 		return
 	}
 
-	expectedVersion, ok := h.readCommand(w, &r)
+	expectedVersion, ok := h.readVersionedCommand(w, &r)
 	if !ok {
 		return
 	}
@@ -2087,7 +2089,7 @@ func (h *Handler) setSoDRuleActive(w http.ResponseWriter, r *http.Request, activ
 	if requested {
 		status = http.StatusAccepted
 	}
-	writeJSON(w, status, rule)
+	writeJSONWithETag(w, status, rule, rule.Version)
 }
 
 // ── /v1/admin/abac-rules ─────────────────────────────────────────────────────
@@ -2341,7 +2343,7 @@ func (h *Handler) setABACRuleActive(w http.ResponseWriter, r *http.Request, acti
 	// PLATFORM-WIDE rule answers 404 here rather than being retired from one
 	// tenant's console. That is deliberate and is the point: a rule binding
 	// every tenant must not be disableable by any one of them.
-	expectedVersion, ok := h.readCommand(w, &r)
+	expectedVersion, ok := h.readVersionedCommand(w, &r)
 	if !ok {
 		return
 	}
@@ -2376,7 +2378,7 @@ func (h *Handler) setABACRuleActive(w http.ResponseWriter, r *http.Request, acti
 	if requested {
 		status = http.StatusAccepted
 	}
-	writeJSON(w, status, rule)
+	writeJSONWithETag(w, status, rule, rule.Version)
 }
 
 // supportedOperators renders domain.ABACOperators for a 400 body, sorted so
@@ -4071,13 +4073,13 @@ func (h *Handler) GetSupportSession(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
 			return
 		}
-if !allowed {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "support_session_not_found", "session_id": sessionID})
-		return
+		if !allowed {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "support_session_not_found", "session_id": sessionID})
+			return
+		}
 	}
-}
 
-writeJSONWithETag(w, http.StatusOK, ss, ss.RecordVersion)
+	writeJSONWithETag(w, http.StatusOK, ss, ss.RecordVersion)
 }
 
 func (h *Handler) ListSupportSessions(w http.ResponseWriter, r *http.Request) {

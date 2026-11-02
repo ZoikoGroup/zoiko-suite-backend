@@ -677,7 +677,7 @@ Blocked / limits: Need to implement across all 20 services.
 - tenant-entity-registry-svc: DONE (already had ETag/If-Match with tests for Tenant, Entity, Workspace, Hierarchy, JurisdictionAssignment, ResidencyPolicy, TaxIdentityBundle)
 - identity-context-svc: DONE (added ETag/If-Match tests for Principal and SupportContext aggregates)
 - notification-svc: DONE (has ETag/If-Match on Notification (cancel), Template (retire), TemplateVersion (validate, approve, publish) - all with tests)
-- configuration-feature-flag-svc: PARTIAL (ETag on FindConfigDefinition, If-Match on PublishConfigDefinition - needs ConfigChange, EmergencyChange, ReleasePlan, KillSwitch GETs and mutations; requires store interface changes for GetChange/GetEmergencyChange)
+- configuration-feature-flag-svc: PARTIAL. 2 Nov (159ee017): build restored, 000014 repaired (it altered a table that does not exist) and given a BEFORE UPDATE version-bump trigger; GET change / emergency change return ETag; activate change / emergency change require If-Match after authorization (428/412/200 tested). Still to do: config definitions (FindConfigDefinition has no ETag, PublishConfigDefinition no If-Match), release plans, kill switches, flag retirements.
 - jurisdiction-rules-svc: DONE (ETag/If-Match on Jurisdiction (GET, Create, Deactivate) and JurisdictionRule (GET, Create, Transition, Drift) - all with tests)
 - policy-svc: DONE (ETag/If-Match on Policy (GET), PolicyVersion (GET, Create, Activate, List) - all with tests)
 - obligations-svc: DONE (ETag/If-Match on Obligation (GET, Create, Patch, Submit) and ObligationDefinition (GET, Create Version) - all with tests)
@@ -685,7 +685,7 @@ Blocked / limits: Need to implement across all 20 services.
 - access-control-svc: DONE (ETag/If-Match on Role (GET, Create, Update) and Bundle (GET, Create, Update, Detach) - all with tests)
 - search-indexer-svc: DONE (ETag/If-Match on Contract (GET, Create, Transition) and Generation (GET, Create, Transition) - all with tests)
 - delegated-authority-svc: DONE (ETag/If-Match on Delegation (GET, Create, Transition) - all with tests)
-- authorization-svc: PARTIAL (ETag/If-Match on PrivilegedSession, BreakGlassSession, SupportSession GETs and Revoke mutations - all with tests)
+- authorization-svc: PARTIAL. Sessions: ETag/If-Match on PrivilegedSession, BreakGlassSession, SupportSession GETs and revoke. 2 Nov: roles, permission bundles, SoD rules, ABAC rules (retire / reactivate) and authority limits (change / retire) now require the version (If-Match, or legacy body expected_version), 428 when missing, 412 stale_version when stale (was optional + 409); the store checks it inside the UPDATE (000022/000035 trigger-bumped `version`); responses carry the new ETag; openapi documents IfMatch / 412 / 428. Still to do: role assignments, delegated authorities, SoD exceptions and workload bindings (no version column yet), the approve/reject commands, and a version bump on session approve/review paths.
 - gateway-auth-svc: DONE (no mutable aggregates - ForwardAuth /verify endpoint only)
 - workflow-svc: DONE (ETag/If-Match on WorkflowInstance (GET, Create, SubmitAction, SubmitQuorumVote, EscalateWorkflow, EscalateToWorkflow, RevokeWorkflow, CancelWorkflow, InvalidateWorkflow, VerifyRelease) and WorkflowDefinition (GET, Create, Supersede, Activate, Suspend, Retire) - all with tests)
 - evidence-requirements-svc: DONE (no mutable aggregates with RecordVersion - EvidenceRequirement domain type has no version field)

@@ -91,7 +91,7 @@ func (h *Handler) writeGovernedErr(w http.ResponseWriter, r *http.Request, op st
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "rule_rejected",
 			"message": "this rule was rejected when it was proposed and can never take effect; propose a new one"})
 	case errors.Is(err, domain.ErrVersionConflict):
-		writeVersionConflict(w)
+		writeVersionConflict(w, r)
 	case errors.Is(err, domain.ErrInvalidTransition):
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "invalid_transition",
 			"message": "only a limit in force can be retired"})
@@ -654,7 +654,7 @@ func (h *Handler) CreateAuthorityLimit(w http.ResponseWriter, r *http.Request) {
 		h.writeGovernedErr(w, r, "CreateAuthorityLimit", err)
 		return
 	}
-	writeJSON(w, http.StatusAccepted, al)
+	writeJSONWithETag(w, http.StatusAccepted, al, al.Version)
 }
 
 // ChangeAuthorityLimit — POST /v1/admin/authority-limits/{authority_limit_id}/change.
@@ -682,13 +682,17 @@ func (h *Handler) ChangeAuthorityLimit(w http.ResponseWriter, r *http.Request) {
 	if !h.applyReason(w, &r, req.reason()) {
 		return
 	}
+	expected, ok := expectedVersion(w, r, req.ExpectedVersion)
+	if !ok {
+		return
+	}
 	cur, err := h.store.FindAuthorityLimitByID(r.Context(), chi.URLParam(r, "authority_limit_id"), tenantScope)
 	if err != nil {
 		h.writeGovernedErr(w, r, "ChangeAuthorityLimit", err)
 		return
 	}
-	if req.ExpectedVersion > 0 && req.ExpectedVersion != cur.Version {
-		writeVersionConflict(w)
+	if expected > 0 && expected != cur.Version {
+		writeVersionConflict(w, r)
 		return
 	}
 	if cur.Status != domain.AuthorityLimitActive {
@@ -726,7 +730,7 @@ func (h *Handler) ChangeAuthorityLimit(w http.ResponseWriter, r *http.Request) {
 		h.writeGovernedErr(w, r, "ChangeAuthorityLimit", err)
 		return
 	}
-	writeJSON(w, http.StatusAccepted, al)
+	writeJSONWithETag(w, http.StatusAccepted, al, al.Version)
 }
 
 // RetireAuthorityLimit — POST /v1/admin/authority-limits/{authority_limit_id}/retire.
@@ -743,7 +747,7 @@ func (h *Handler) RetireAuthorityLimit(w http.ResponseWriter, r *http.Request) {
 	if !h.requirePermission(w, r, maker, tenantScope, domain.PermissionAuthorityLimitManage) {
 		return
 	}
-	expectedVersion, ok := h.readCommand(w, &r)
+	expectedVersion, ok := h.readVersionedCommand(w, &r)
 	if !ok {
 		return
 	}
@@ -757,7 +761,7 @@ func (h *Handler) RetireAuthorityLimit(w http.ResponseWriter, r *http.Request) {
 		h.writeGovernedErr(w, r, "RetireAuthorityLimit", err)
 		return
 	}
-	writeJSON(w, http.StatusAccepted, al)
+	writeJSONWithETag(w, http.StatusAccepted, al, al.Version)
 }
 
 // ApproveAuthorityLimit — POST /v1/admin/authority-limits/{authority_limit_id}/approve.

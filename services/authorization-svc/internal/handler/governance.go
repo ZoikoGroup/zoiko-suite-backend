@@ -11,6 +11,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
+	"zoiko.io/identity-envelope/apicontract"
 
 	"zoiko.io/authorization-svc/internal/domain"
 )
@@ -114,6 +115,45 @@ func (h *Handler) readCommand(w http.ResponseWriter, r **http.Request) (int64, b
 		return 0, false
 	}
 	return body.ExpectedVersion, true
+}
+
+// readVersionedCommand is readCommand for a mutation of an existing,
+// versioned aggregate, where the expected version is mandatory (API-3; P-09).
+func (h *Handler) readVersionedCommand(w http.ResponseWriter, r **http.Request) (int64, bool) {
+	bodyVersion, ok := h.readCommand(w, r)
+	if !ok {
+		return 0, false
+	}
+	return expectedVersion(w, *r, bodyVersion)
+}
+
+// expectedVersion settles the version a mutation is conditional on. It comes
+// from If-Match (the ETag of the caller's last read) or, for callers written
+// before API-3, the body's expected_version. Neither → 428; a malformed
+// If-Match, or one that disagrees with the body → 400. "If-Match: *" opts out
+// of the check and returns 0, which the stores read as "unconditional".
+func expectedVersion(w http.ResponseWriter, r *http.Request, bodyVersion int64) (int64, bool) {
+	v, wildcard, present, err := apicontract.IfMatchVersion(r)
+	switch {
+	case err != nil:
+		apicontract.WriteProblem(w, r, apicontract.ProblemFor(http.StatusBadRequest, "invalid_if_match",
+			"If-Match must be a single ETag from the latest representation"))
+		return 0, false
+	case wildcard:
+		return 0, true
+	case present && bodyVersion > 0 && bodyVersion != v:
+		apicontract.WriteProblem(w, r, apicontract.ProblemFor(http.StatusBadRequest, "conflicting_expected_version",
+			"If-Match and expected_version name different versions; send one"))
+		return 0, false
+	case present:
+		return v, true
+	case bodyVersion > 0:
+		return bodyVersion, true
+	default:
+		apicontract.WriteProblem(w, r, apicontract.ProblemFor(http.StatusPreconditionRequired, "precondition_required",
+			"If-Match is required for a mutation of an existing aggregate"))
+		return 0, false
+	}
 }
 
 // applyReason enforces §16's "purpose / reason_code required for privileged,

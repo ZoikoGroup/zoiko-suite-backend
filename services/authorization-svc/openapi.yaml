@@ -56,8 +56,10 @@ info:
     missing_field`. With `warn` it is admitted and marked
     `X-Command-Contract: violated`.
 
-    **Optimistic concurrency.** Commands marked **V** take an optional
-    `expected_version`; a stale one is `409 version_conflict`.
+    **Optimistic concurrency (API-3).** Commands marked **V** need the version
+    they were made against: `If-Match: "v<version>"` (the ETag of the last read),
+    or `expected_version` in the body. Missing is `428 precondition_required`;
+    stale is `412 stale_version`.
 
     **Tenant resolution.** The tenant of an evaluation is resolved on the
     server, from `X-Tenant-Id` / body `tenant_id` and
@@ -522,6 +524,7 @@ paths:
       summary: Retire a role (R, V)
       description: '`iam.role.manage`. Takes `reason_code` or `purpose` and optional `expected_version`.'
       parameters:
+        - $ref: '#/components/parameters/IfMatch'
         - name: role_id
           in: path
           required: true
@@ -529,6 +532,10 @@ paths:
       requestBody:
         $ref: '#/components/requestBodies/CommandBody'
       responses:
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+        '412':
+          $ref: '#/components/responses/StaleVersion'
         '200':
           description: Role retired.
           content:
@@ -547,7 +554,7 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
-          description: 'Conflict — `version_conflict`, or `sod_conflict` naming the holders.'
+          description: 'Conflict — `sod_conflict` naming the holders.'
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
@@ -558,6 +565,7 @@ paths:
       summary: Reactivate a role (R, V)
       description: '`iam.role.manage`. Reactivating a role you hold is `403 self_grant_not_allowed`; reactivating one that would give a holder an SoD conflict is `409 sod_conflict` listing the holders.'
       parameters:
+        - $ref: '#/components/parameters/IfMatch'
         - name: role_id
           in: path
           required: true
@@ -565,6 +573,10 @@ paths:
       requestBody:
         $ref: '#/components/requestBodies/CommandBody'
       responses:
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+        '412':
+          $ref: '#/components/responses/StaleVersion'
         '200':
           description: Role reactivated.
           content:
@@ -583,7 +595,7 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
-          description: 'Conflict — `version_conflict` or `sod_conflict`.'
+          description: 'Conflict — `sod_conflict`.'
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
@@ -665,6 +677,7 @@ paths:
       summary: Retire a permission bundle (R, V)
       description: '`iam.permission_bundle.manage`.'
       parameters:
+        - $ref: '#/components/parameters/IfMatch'
         - name: permission_bundle_id
           in: path
           required: true
@@ -672,6 +685,10 @@ paths:
       requestBody:
         $ref: '#/components/requestBodies/CommandBody'
       responses:
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+        '412':
+          $ref: '#/components/responses/StaleVersion'
         '200':
           description: Bundle retired.
           content:
@@ -695,6 +712,7 @@ paths:
       summary: Reactivate a permission bundle (R, V)
       description: '`iam.permission_bundle.manage`. Reactivation checks self-grant and SoD as creation does.'
       parameters:
+        - $ref: '#/components/parameters/IfMatch'
         - name: permission_bundle_id
           in: path
           required: true
@@ -702,6 +720,10 @@ paths:
       requestBody:
         $ref: '#/components/requestBodies/CommandBody'
       responses:
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+        '412':
+          $ref: '#/components/responses/StaleVersion'
         '200':
           description: Bundle reactivated.
           content:
@@ -830,7 +852,7 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
-          description: 'Conflict — `approval_expired`, `sod_conflict` after re-check, or `version_conflict`.'
+          description: 'Conflict — `approval_expired`, or `sod_conflict` after re-check.'
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
@@ -1058,6 +1080,7 @@ paths:
       summary: Retire a SoD rule (R, V)
       description: '`iam.sod_rule.manage`. A principal holding either action of the rule cannot retire it (`403 sod_self_interest`).'
       parameters:
+        - $ref: '#/components/parameters/IfMatch'
         - name: sod_rule_id
           in: path
           required: true
@@ -1065,6 +1088,10 @@ paths:
       requestBody:
         $ref: '#/components/requestBodies/CommandBody'
       responses:
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+        '412':
+          $ref: '#/components/responses/StaleVersion'
         '202':
           description: Change requested; the rule is unchanged until published by someone else (AU-17). 200 when already in that state.
           content:
@@ -1091,6 +1118,7 @@ paths:
       summary: Reactivate a SoD rule (R, V)
       description: '`iam.sod_rule.manage`.'
       parameters:
+        - $ref: '#/components/parameters/IfMatch'
         - name: sod_rule_id
           in: path
           required: true
@@ -1098,6 +1126,10 @@ paths:
       requestBody:
         $ref: '#/components/requestBodies/CommandBody'
       responses:
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+        '412':
+          $ref: '#/components/responses/StaleVersion'
         '202':
           description: Change requested; the rule is unchanged until published by someone else (AU-17). 200 when already in that state.
           content:
@@ -1357,6 +1389,7 @@ paths:
       summary: Retire an ABAC rule (R, V)
       description: '`iam.abac_rule.manage`.'
       parameters:
+        - $ref: '#/components/parameters/IfMatch'
         - name: abac_rule_id
           in: path
           required: true
@@ -1364,6 +1397,10 @@ paths:
       requestBody:
         $ref: '#/components/requestBodies/CommandBody'
       responses:
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+        '412':
+          $ref: '#/components/responses/StaleVersion'
         '202':
           description: Change requested; the rule is unchanged until published by someone else (AU-17). 200 when already in that state.
           content:
@@ -1387,6 +1424,7 @@ paths:
       summary: Reactivate an ABAC rule (R, V)
       description: '`iam.abac_rule.manage`.'
       parameters:
+        - $ref: '#/components/parameters/IfMatch'
         - name: abac_rule_id
           in: path
           required: true
@@ -1394,6 +1432,10 @@ paths:
       requestBody:
         $ref: '#/components/requestBodies/CommandBody'
       responses:
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+        '412':
+          $ref: '#/components/responses/StaleVersion'
         '202':
           description: Change requested; the rule is unchanged until published by someone else (AU-17). 200 when already in that state.
           content:
@@ -2700,6 +2742,7 @@ paths:
       summary: Request a change to a limit in force
       description: '`iam.authority_limit.manage`. Proposes new amounts or dates as a new PENDING_APPROVAL version naming the one it supersedes; the current limit applies until the change is approved. Who and where it applies to cannot change. One open change per limit (409 `change_pending`).'
       parameters:
+        - $ref: '#/components/parameters/IfMatch'
         - name: authority_limit_id
           in: path
           required: true
@@ -2711,6 +2754,10 @@ paths:
             schema:
               $ref: '#/components/schemas/CreateAuthorityLimitRequest'
       responses:
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+        '412':
+          $ref: '#/components/responses/StaleVersion'
         '202':
           description: Change requested.
           content:
@@ -2734,6 +2781,7 @@ paths:
       summary: Request a limit''s retirement
       description: '`iam.authority_limit.manage` and a §16 reason. Marks the ACTIVE limit `pending_action: RETIRE`; it keeps applying until the retirement is approved.'
       parameters:
+        - $ref: '#/components/parameters/IfMatch'
         - name: authority_limit_id
           in: path
           required: true
@@ -2741,6 +2789,10 @@ paths:
       requestBody:
         $ref: '#/components/requestBodies/CommandBody'
       responses:
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+        '412':
+          $ref: '#/components/responses/StaleVersion'
         '202':
           description: Retirement requested.
           content:
@@ -2976,6 +3028,13 @@ components:
       schema: { type: integer }
       description: Age of the caller's last authentication; required for step-up-gated actions under `AUTHZ_STEP_UP_UNKNOWN_AGE=step_up`.
 
+    IfMatch:
+      name: If-Match
+      in: header
+      required: true
+      schema: { type: string }
+      description: 'The ETag ("v<version>") of the representation the change was made against (API-3). expected_version in the body is accepted in its place; * makes the change unconditional. Missing is 428 precondition_required; stale is 412 stale_version.'
+
   requestBodies:
     CommandBody:
       required: true
@@ -2991,6 +3050,18 @@ components:
       description: A16 command fields; `reason_code` or `purpose` required where the route is marked R, `expected_version` honoured where marked V.
 
   responses:
+    PreconditionRequired:
+      description: 'Precondition required — 428 precondition_required: a mutation of an existing aggregate needs If-Match (or expected_version).'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    StaleVersion:
+      description: 'Precondition failed — 412 stale_version: the object changed since the version sent. Re-read it and retry.'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
     BadRequest:
       description: 'Bad request — `400`. Codes include `missing_field`, `envelope_incomplete`, `invalid_json`, `duration_exceeds_maximum`, `protected_privilege_not_delegable`, `missing_tenant_scope`.'
       content:
@@ -3016,7 +3087,7 @@ components:
           schema:
             $ref: '#/components/schemas/Problem'
     Conflict:
-      description: 'Conflict — `409`. Codes include `sod_conflict`, `version_conflict`, `idempotency_mismatch`, `approval_expired`.'
+      description: 'Conflict — `409`. Codes include `sod_conflict`, `idempotency_mismatch`, `approval_expired`.'
       content:
         application/problem+json:
           schema:
